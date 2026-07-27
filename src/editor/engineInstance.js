@@ -14,12 +14,29 @@ async function loadEngine() {
   if (!loaderPromise) {
     loaderPromise = (async () => {
       const [
-        { Engine, THREE, setAssetResolver, setScriptLoader, setAssetMetaLoader, registerBuiltInComponents },
-        { toBlobUrl, loadScriptModule, readAssetMeta },
-      ] = await Promise.all([import("../engine/index.js"), import("./assetLoader.js")]);
-      // Expose the three namespace under a stable global so the script-
-      // runtime data URLs (which can't `import` anything themselves) can
-      // pull three classes from it. Must be set before any user script runs.
+        {
+          Engine,
+          THREE,
+          setAssetResolver,
+          setScriptLoader,
+          setAssetMetaLoader,
+          setAssetBinarySaver,
+          setDerivedDataRootProvider,
+          registerBuiltInComponents,
+        },
+        { toBlobUrl, loadScriptModule, readAssetMeta, writeAssetBinary, onAssetInvalidated },
+        { useProjectStore },
+        { invalidateGeometryAsset },
+      ] = await Promise.all([
+        import("../engine/index.js"),
+        import("./assetLoader.js"),
+        import("./store/projectStore.js"),
+        import("../engine/geometryAsset.js"),
+      ]);
+      // Debugging convenience only: reach the engine's three instance from a
+      // console or a test harness. User scripts no longer need it — the
+      // script-runtime proxies are real modules that import three themselves
+      // (see scriptRuntime.js), so there is no boot-order requirement here.
       globalThis.__ENGINE_THREE__ = THREE;
       // Built-in components must be on the registry before any scene is
       // deserialized; calling explicitly also survives bundler tree-shaking
@@ -33,7 +50,27 @@ async function loadEngine() {
       setAssetResolver(toBlobUrl);
       setScriptLoader(loadScriptModule);
       setAssetMetaLoader(readAssetMeta);
+      setAssetBinarySaver(writeAssetBinary);
+      // `.geom` files are also cached as decoded, SHARED BufferGeometry
+      // instances. Every in-place asset overwrite goes through
+      // `invalidateBlobUrl`, so hanging the geometry cache off that keeps a
+      // re-saved mesh from rendering stale. Wired here (rather than imported
+      // by assetLoader.js) so the lightweight asset modules stay free of
+      // `three/webgpu`.
+      onAssetInvalidated(invalidateGeometryAsset);
+      // Derived data (hash-keyed baked SDFs etc.) lives in `<project>/Library`
+      // — read lazily so it tracks whichever project is currently open.
+      setDerivedDataRootProvider(() => {
+        const root = useProjectStore.getState().rootPath;
+        return root ? `${root}/Library` : null;
+      });
       engineInstance = inst;
+      // The Editor API publishes itself to the script runtime and starts the
+      // gizmo pass, both of which need a live engine — hence here rather than
+      // at module scope. Dynamically imported so the command bus and the React
+      // stores it pulls in stay out of the boot chunk.
+      const { installEditorApi } = await import("./api/index.js");
+      installEditorApi();
       return inst;
     })();
   }

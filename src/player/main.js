@@ -16,9 +16,10 @@ import "../modules/index.js"; // registers the built-in module catalog
 // tries to deserialize (the editor does the same in `engineInstance.js`).
 registerBuiltInComponents();
 
-// Expose the three namespace under a stable global so the script-runtime
-// data URLs (which can't `import` anything themselves) can pull three
-// classes from it. Must be set before any user script runs.
+// Debugging convenience only: reach the engine's three instance from a
+// console. User scripts no longer need it — the script-runtime proxies are
+// real modules that import three themselves (see scriptRuntime.js), so there
+// is no boot-order requirement here.
 globalThis.__ENGINE_THREE__ = THREE;
 
 // Exported scenes reference assets by relative URL ("assets/foo.glb").
@@ -76,6 +77,39 @@ function findSceneCamera(entities) {
   return null;
 }
 
+/**
+ * Preload phase: assets the author marked "Preload" in the editor are fetched
+ * before the scene deserializes, so they're in the browser's cache the moment
+ * anything asks for them. Everything else stays on demand.
+ *
+ * Fetching (rather than fully decoding through each type's loader) is the
+ * right level here: it removes the network round-trip, which is the part that
+ * shows up as a hitch, without needing a decoder registry the player would
+ * otherwise not have. Failures are logged and ignored — a missing preload
+ * must not stop the game from starting.
+ */
+async function preloadAssets(paths) {
+  if (!paths?.length) return;
+  const started = performance.now();
+  const results = await Promise.allSettled(
+    paths.map(async (path) => {
+      const res = await fetch(path);
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      await res.arrayBuffer();
+    }),
+  );
+  const failed = results.filter((r) => r.status === "rejected");
+  for (const [index, result] of results.entries()) {
+    if (result.status === "rejected") {
+      console.warn(`Preload failed for ${paths[index]}: ${result.reason?.message ?? result.reason}`);
+    }
+  }
+  console.log(
+    `Preloaded ${paths.length - failed.length}/${paths.length} assets in ` +
+      `${Math.round(performance.now() - started)}ms`,
+  );
+}
+
 async function boot() {
   const engine = new Engine();
   await engine.init(document.getElementById("game"));
@@ -89,6 +123,9 @@ async function boot() {
   // Rapier's setup now returns a placeholder and finishes its WASM init in
   // the background, so this await no longer blocks on the heavy work.
   await applyEngineModules(engine, scene.modules ?? []);
+  // Preload before deserializing: components resolve their assets during
+  // attach, and by then the bytes are already local.
+  await preloadAssets(scene.preload);
   // Input config next — the manager is attached during init(), so swapping
   // the snapshot detaches/re-attaches to keep listeners consistent.
   if (scene.input) engine.applyInput(scene.input);

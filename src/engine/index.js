@@ -87,7 +87,13 @@ export {
   disposeAudioAsset,
   AUDIO_ASSET_DEFAULTS,
 } from "./audio/AudioAsset.js";
-export { serializeScene, deserializeScene, serializeEntity, instantiateEntity } from "./serialize.js";
+export {
+  serializeScene,
+  deserializeScene,
+  reconcileScene,
+  serializeEntity,
+  instantiateEntity,
+} from "./serialize.js";
 export {
   PREFAB_EXT,
   LEGACY_PREFAB_EXT,
@@ -120,8 +126,31 @@ export {
   defWithInstanceApplied,
   defFromStageRoot,
 } from "./prefab/index.js";
-export { setAssetResolver, resolveAssetUrl, setScriptLoader, loadScriptModule, setAssetMetaLoader, loadAssetMeta } from "./assetResolver.js";
+export {
+  setAssetResolver,
+  resolveAssetUrl,
+  setScriptLoader,
+  loadScriptModule,
+  setAssetMetaLoader,
+  loadAssetMeta,
+  setAssetBinarySaver,
+  saveAssetBinary,
+  setDerivedDataRootProvider,
+  getDerivedDataPath,
+} from "./assetResolver.js";
 export { SCENE_SETTINGS_DEFAULTS, TONE_MAPPINGS } from "./sceneSettings.js";
+export {
+  CUBEMAP_EXT,
+  CUBEMAP_FACES,
+  CUBEMAP_DEFAULTS,
+  normalizeCubemapDef,
+  cubemapFacePaths,
+  isCubemapComplete,
+  guessCubemapFaces,
+  loadCubemapAsset,
+  getLoadedCubemap,
+  invalidateCubemapAsset,
+} from "./cubemapAsset.js";
 export { EDITOR_LAYER } from "./editorLayers.js";
 export { UI_LAYER, getUiSystem } from "./ui/UiSystem.js";
 export { ANCHOR_PRESETS, applyAnchorPreset } from "./ui/layout.js";

@@ -15,7 +15,8 @@
     "experimentalDecorators": true,
     "useDefineForClassFields": false,
     "paths": {
-      "engine": ["./src/engine/script-types/engine.d.ts"]
+      "engine": ["./src/engine/script-types/engine.d.ts"],
+      "editor": ["./src/engine/script-types/editor.d.ts"]
     }
   },
   "include": [

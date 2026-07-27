@@ -1,60 +1,159 @@
 import { useEffect, useRef, useState } from "react";
-import { Box, Circle, Crosshair, Eye, Layers, Magnet, Move, Rotate3d, Scale3d, Scissors, Square, Triangle, Undo2, X } from "lucide-react";
+import { Box, Circle, Crosshair, Eye, Layers, Magnet, Move, Rotate3d, Scale3d, Scissors, Square, Triangle, Undo2, Redo2, X } from "lucide-react";
 import * as THREE from "three/webgpu";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { engine } from "../engineInstance.js";
 import { useSelectionStore } from "../store/selectionStore.js";
-import { invalidateBlobUrl } from "../assetLoader.js";
-import { ensureGeometryAsset, saveNewGeometryAsset } from "../geometryEditing.js";
+import { invalidateBlobUrl, writeBinaryFile } from "../assetLoader.js";
+import { disposeOrReleaseGeometry } from "../../engine/geometryAsset.js";
+import { authoredGeometry, ensureGeometryAsset, saveNewGeometryAsset } from "../geometryEditing.js";
+import { invalidateVirtualGeometryAsset } from "../../modules/virtual-geometry/index.js";
 import { CreateEntityCommand } from "../commands/entityCommands.js";
-import { AddComponentCommand, SetComponentPropCommand } from "../commands/componentCommands.js";
 import { AxisViewGizmo } from "../helpers/AxisViewGizmo.jsx";
+
+import { copyMesh, createMesh } from "../mesh/bmesh.js";
+import { assetFromMesh, bufferGeometryFromMesh, meshFromBufferGeometry } from "../mesh/io.js";
 import {
-  bufferGeometryFromEditable,
-  beginExtrudeEdges,
-  beginExtrudeFaces,
-  beginExtrudeVertices,
-  assignFaceMaterial,
-  bevelEdges,
-  bridgeEdgeLoops,
-  cloneEditable,
-  coplanarHiddenEdges,
-  cutMeshByEdgeRing,
-  deleteFaces,
-  editableFromBufferGeometry,
-  editableFromFaces,
-  expandLogicalVertices,
-  flipFaces,
-  geometryAssetFromEditable,
-  gridFillEdges,
+  SIMILAR_TYPES,
+  checkerDeselect,
+  clearSelection,
+  convertSelection,
+  edgeLoop,
+  edgeRing,
+  faceLoop,
+  flushSelection,
+  growSelection,
+  invertSelection,
+  linkedElements,
+  selectAll,
+  selectByTrait,
+  selectRandom,
+  selectSimilar,
+  selected,
+  selectedVerts,
+  selectionCount,
+  shortestPath,
+  shrinkSelection,
+} from "../mesh/select.js";
+import {
+  DELETE_MODES,
+  MERGE_MODES,
+  connectVertPath,
+  deleteLoose,
+  deleteSelection,
+  dissolveEdges,
+  dissolveFaces,
+  dissolveVerts,
+  duplicateSelection,
+  limitedDissolve,
+  makeEdgeFace,
+  mergeByDistance,
+  mergeSelection,
+  ripVerts,
+  separateSelection,
+  splitSelection,
+} from "../mesh/ops/edit.js";
+import {
+  extrudeAlongNormals,
+  extrudeEdges,
+  extrudeFaceRegion,
+  extrudeFacesIndividual,
+  extrudeVerts,
   insetFaces,
-  mergeVerticesAtCenter,
-  mirrorVertices,
-  subdivideFaces,
-  updateExtrudeUVs,
-  MAX_SUBDIVISION_CUTS,
-  unwrapBox,
-  unwrapPlanar,
-} from "../editableGeometry.js";
+  shrinkFattenOffsets,
+  updateCapUVs,
+  updateSideUVs,
+} from "../mesh/ops/extrude.js";
+import { bevelEdges, knifeCut, loopCut, offsetEdgeLoop, subdivideFaces } from "../mesh/ops/topology.js";
 import {
-  attachCursor,
-  detachCursor,
-  refreshCursor3D,
-  setCursor3DPosition,
-  getCursor3D,
-} from "../threeDCursor.js";
+  bridgeEdgeLoops,
+  fillHoles,
+  flipNormals,
+  gridFill,
+  markEdges,
+  markSharpByAngle,
+  meshStatistics,
+  pokeFaces,
+  recalculateNormals,
+  setShading,
+  smoothVerts,
+  spinEdges,
+  symmetrize,
+  triangulateFaces,
+  trisToQuads,
+} from "../mesh/ops/cleanup.js";
+import {
+  FALLOFFS,
+  ORIENTATIONS,
+  PIVOTS,
+  SNAP_MODES,
+  applySlide,
+  constrainTranslation,
+  constraintAxes,
+  edgeSlideRails,
+  falloffWeight,
+  individualPivots,
+  orientationBasis,
+  proportionalDistances,
+  snapTarget,
+  transformPivot,
+  vertSlideRails,
+} from "../mesh/transform.js";
+import {
+  SELECT_COLOR,
+  applyXray,
+  cameraBasis,
+  elementsInRegion,
+  framingDistance,
+  frameSphere,
+  meshBoundingSphere,
+  nearestEdgeOnFace,
+  pickElement,
+  pickFace,
+  rebuildRenderMesh,
+  refreshOverlays,
+  refreshRenderPositions,
+  refreshVertexMarkerScales,
+  resizeGeometryCamera,
+  selectionBoundingSphere,
+} from "../mesh/viewport.js";
+import { unwrapBox, unwrapPlanar } from "../mesh/ops/uv.js";
+import {
+  BRUSHES,
+  DIRECTIONAL_BRUSHES,
+  applyStrokeDab,
+  averageEdgeLength,
+  beginStroke,
+  captureGrabWeights,
+  refreshStroke,
+  strokeDabPositions,
+  surfaceNormalAt,
+} from "../mesh/sculpt.js";
+import { dyntopoStep } from "../mesh/ops/dyntopo.js";
+import { suggestedVoxelSize, voxelRemesh } from "../mesh/ops/voxelRemesh.js";
+import {
+  PAINT_BLEND_MODES,
+  createPaintLayer,
+  dilateEdges,
+  facesNearBrush,
+  layerToDataURL,
+  paintDab,
+} from "../mesh/paint.js";
+import { vertsInSphere } from "../mesh/sculpt.js";
+import { useProjectStore } from "../store/projectStore.js";
+import { attachCursor, detachCursor, getCursor3D, refreshCursor3D, setCursor3DPosition } from "../threeDCursor.js";
 import { SetCursor3DCommand } from "../commands/cursorCommands.js";
 
-const MODES = ["vertex", "edge", "face"];
-const MODE_LABELS = { vertex: "Vertex", edge: "Edge", face: "Face" };
-const WIRE_COLOR = 0x22272b;
-const SELECT_COLOR = 0xff9b42;
-// Blender draws unselected vertices as small dark dots; selected ones barely larger.
-const VERTEX_PIXEL_RADIUS = 1.5;
-const SELECTED_VERTEX_PIXEL_RADIUS = 2;
-const positionKey = (point) => point.map((value) => Math.round(value * 1e5)).join(",");
-const edgeKey = (editable, a, b) => [positionKey(editable.positions[a]), positionKey(editable.positions[b])].sort().join("|");
-const indexEdgeKey = (a, b) => (a < b ? `${a}|${b}` : `${b}|${a}`);
+const MODES = ["vert", "edge", "face"];
+const SHADING_MODES = [
+  { id: "wireframe", label: "Wireframe", hint: "Edges only; select through the surface" },
+  { id: "solid", label: "Solid", hint: "Neutral studio material" },
+  { id: "material", label: "Material Preview", hint: "Real materials with the scene environment" },
+  { id: "rendered", label: "Rendered", hint: "Real materials lit by the scene's own lights" },
+];
+const MODE_LABELS = { vert: "Vertex", edge: "Edge", face: "Face" };
+const UNDO_DEPTH = 64;
+
 const materialSlotLabel = (path, index) => {
   const filename = String(path ?? "").split(/[\\/]/).pop()?.replace(/\.mat$/i, "");
   return `Slot ${index + 1} · ${filename || "Unassigned"}`;
@@ -67,304 +166,16 @@ function reloadGeometryUsers(path) {
   }
 }
 
-/**
- * The render mesh is necessarily triangulated, but the edit topology is not: a
- * quad is two triangles whose shared diagonal is an implementation detail.
- *
- * Which edges are such artefacts is *remembered* — session.hiddenEdges, keyed by
- * vertex-index pair so it survives vertex moves — rather than re-derived from
- * coplanarity, because bending a quad must not make its diagonal pop into view.
- */
-function logicalEdges(session) {
-  const { editable, hiddenEdges } = session;
-  const edges = new Map();
-  editable.faces.forEach((face) => {
-    for (let i = 0; i < 3; i++) {
-      const a = face[i];
-      const b = face[(i + 1) % 3];
-      const key = edgeKey(editable, a, b);
-      const entry = edges.get(key) ?? { a, b, hiddenDiagonal: true };
-      // Seams duplicate vertices, so one logical edge can have several index
-      // pairs. It only stays hidden while every one of them is an artefact.
-      entry.hiddenDiagonal = entry.hiddenDiagonal && hiddenEdges.has(indexEdgeKey(a, b));
-      edges.set(key, entry);
-    }
-  });
-  (editable.looseEdges ?? []).forEach(([a, b]) => {
-    if (!editable.positions[a] || !editable.positions[b]) return;
-    edges.set(edgeKey(editable, a, b), { a, b, hiddenDiagonal: false, loose: true });
-  });
-  return edges;
-}
-
-const sessionEdges = (session) => session.cachedEdges ?? logicalEdges(session);
-
-function visibleLogicalEdges(session) {
-  if (!session.cachedVisibleEdges) {
-    session.cachedVisibleEdges = new Map([...sessionEdges(session)].filter(([, edge]) => !edge.hiddenDiagonal));
+function hasEditorOnlyAncestor(object) {
+  for (let current = object; current; current = current.parent) {
+    if (current.userData?.editorOnly) return true;
   }
-  return session.cachedVisibleEdges;
+  return false;
 }
 
-function logicalEdgeIncidence(session) {
-  if (session.cachedEdgeIncidence) return session.cachedEdgeIncidence;
-  const incidence = new Map();
-  visibleLogicalEdges(session).forEach((edge, key) => {
-    for (const index of [edge.a, edge.b]) {
-      const vertex = positionKey(session.editable.positions[index]);
-      if (!incidence.has(vertex)) incidence.set(vertex, []);
-      incidence.get(vertex).push({ key, edge });
-    }
-  });
-  session.cachedEdgeIncidence = incidence;
-  return incidence;
-}
-
-/** Snapshots the edge set and its hidden flags in position space, before an operation. */
-function topologySnapshot(session) {
-  const { editable, hiddenEdges } = session;
-  const edges = new Set();
-  const hidden = new Set();
-  editable.faces.forEach((face) => {
-    for (let i = 0; i < 3; i++) {
-      const a = face[i];
-      const b = face[(i + 1) % 3];
-      const key = edgeKey(editable, a, b);
-      edges.add(key);
-      if (hiddenEdges.has(indexEdgeKey(a, b))) hidden.add(key);
-    }
-  });
-  return { edges, hidden };
-}
-
-/**
- * Re-keys the hidden set after an operation rebuilt the topology. Surviving edges
- * keep the flag they had; edges the operation invented are artefacts when they
- * are coplanar and the operation did not declare them visible. An operation that
- * knows its own answer (subdivision) hands the whole set over as `hidden`.
- */
-function applyTopology(session, before, result = {}) {
-  const { editable } = session;
-  const coplanar = result.hidden ? null : coplanarHiddenEdges(editable);
-  const hidden = new Set();
-  editable.faces.forEach((face) => {
-    for (let i = 0; i < 3; i++) {
-      const a = face[i];
-      const b = face[(i + 1) % 3];
-      const key = edgeKey(editable, a, b);
-      const isHidden = result.hidden ? result.hidden.has(key)
-        : before.edges.has(key) ? before.hidden.has(key)
-          : !result.visible?.has(key) && !result.visiblePairs?.has(indexEdgeKey(a, b)) && coplanar.has(key);
-      if (isHidden) hidden.add(indexEdgeKey(a, b));
-    }
-  });
-  session.hiddenEdges = hidden;
-  syncEditableTopology(session);
-}
-
-function syncEditableTopology(session) {
-  session.editable.hiddenEdges = [...session.hiddenEdges].map((key) => key.split("|").map(Number));
-}
-
-function logicalEdgeLoop(session, seedKey) {
-  const { editable } = session;
-  const edges = visibleLogicalEdges(session);
-  const seed = edges.get(seedKey);
-  if (!seed) return new Set();
-  const adjacency = logicalEdgeIncidence(session);
-  const selected = new Set([seedKey]);
-  const walk = (previousIndex, currentIndex) => {
-    // Non-manifold meshes can branch back through positional welds. Keep a
-    // strict topology-sized budget so modifier loop selection (Shift+Alt) can
-    // never spin forever on malformed/imported geometry.
-    for (let step = 0; step < edges.size; step++) {
-      const currentKey = positionKey(editable.positions[currentIndex]);
-      const incoming = new THREE.Vector3(...editable.positions[currentIndex]).sub(new THREE.Vector3(...editable.positions[previousIndex])).normalize();
-      const candidates = (adjacency.get(currentKey) ?? []).filter(({ key }) => !selected.has(key)).map(({ key, edge }) => {
-        const nextIndex = positionKey(editable.positions[edge.a]) === currentKey ? edge.b : edge.a;
-        const outgoing = new THREE.Vector3(...editable.positions[nextIndex]).sub(new THREE.Vector3(...editable.positions[currentIndex])).normalize();
-        return { key, nextIndex, score: incoming.dot(outgoing) };
-      }).sort((a, b) => b.score - a.score);
-      if (!candidates.length || candidates[0].score < 0.35) break;
-      selected.add(candidates[0].key);
-      previousIndex = currentIndex;
-      currentIndex = candidates[0].nextIndex;
-    }
-  };
-  walk(seed.a, seed.b);
-  walk(seed.b, seed.a);
-  return selected;
-}
-
-function setPositions(geometry, positions) {
-  geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
-  geometry.computeBoundingSphere();
-}
-
-function setVertexMarkers(markers, points, session, pixelRadius) {
-  const matrix = new THREE.Matrix4();
-  const scale = new THREE.Vector3();
-  const rotation = new THREE.Quaternion();
-  const viewportHeight = Math.max(session.canvas.clientHeight, 1);
-  const pixelScale = session.camera.isOrthographicCamera
-    ? (session.camera.top - session.camera.bottom) / Math.max(session.camera.zoom, 1e-6) / viewportHeight
-    : null;
-  const perspectiveScale = session.camera.isPerspectiveCamera
-    ? 2 * Math.tan(THREE.MathUtils.degToRad(session.camera.fov * 0.5)) / viewportHeight
-    : 0;
-  markers.userData.markerPoints = points;
-  markers.userData.pixelRadius = pixelRadius;
-  markers.count = Math.min(points.length, markers.instanceMatrix.count);
-  for (let index = 0; index < markers.count; index++) {
-    const point = new THREE.Vector3(...points[index]);
-    const size = Math.max(
-      (pixelScale ?? session.camera.position.distanceTo(point) * perspectiveScale) * pixelRadius,
-      0.00001,
-    );
-    scale.setScalar(size);
-    matrix.compose(point, rotation, scale);
-    markers.setMatrixAt(index, matrix);
-  }
-  markers.instanceMatrix.needsUpdate = true;
-  markers.computeBoundingSphere();
-}
-
-function refreshVertexMarkerScales(session) {
-  [session.basePoints, session.vertexOverlay].forEach((markers) => {
-    setVertexMarkers(markers, markers.userData.markerPoints ?? [], session, markers.userData.pixelRadius ?? VERTEX_PIXEL_RADIUS);
-  });
-}
-
-/**
- * Camera distance required so a sphere of `radius` fits comfortably inside the
- * viewport along its narrowest axis. A 1.6× margin keeps the gizmo, axis view,
- * and selection overlays from hugging the geometry against the canvas edge.
- */
-function framingDistance(camera, radius) {
-  const fov = THREE.MathUtils.degToRad((camera.fov || 50) * 0.5);
-  return Math.max(radius / Math.max(Math.sin(fov), 0.05), 0.5) * 1.6;
-}
-
-function resizeGeometryCamera(camera, width, height, orthographicHeight = 10) {
-  const aspect = Math.max(width, 1) / Math.max(height, 1);
-  if (camera.isOrthographicCamera) {
-    const halfHeight = orthographicHeight * 0.5;
-    camera.left = -halfHeight * aspect;
-    camera.right = halfHeight * aspect;
-    camera.top = halfHeight;
-    camera.bottom = -halfHeight;
-  } else {
-    camera.aspect = aspect;
-  }
-  camera.updateProjectionMatrix();
-}
-
-/** Bounding sphere around the *current* editable mesh, in the editor's local
- *  space. Recomputing each call lets focus track geometry that was extruded
- *  or subdivided since the panel opened. */
-function editableBoundingSphere(session) {
-  const points = session.editable.positions.map((position) => new THREE.Vector3(...position));
-  if (!points.length) return new THREE.Sphere();
-  const box = new THREE.Box3().setFromPoints(points);
-  return box.getBoundingSphere(new THREE.Sphere());
-}
-
-/**
- * Re-frames the orbit camera around the geometry's current bounding sphere.
- * Used both for the initial "focus on the geometry first" pose and as the
- * snapshot callback for axis snapping.
- */
-function frameGeometry(session, { direction = null } = {}) {
-  const { camera, controls } = session;
-  const sphere = editableBoundingSphere(session);
-  // A zero-radius mesh (a single vertex, an empty cut) would otherwise leave
-  // the camera pinned on top of the geometry; fall back to a minimum radius.
-  const radius = Math.max(sphere.radius, 0.25);
-  if (!sphere.center) sphere.center = new THREE.Vector3();
-  controls.target.copy(sphere.center);
-  // Preserve current orbit direction when no explicit axis was requested;
-  // otherwise look from the requested cardinal direction.
-  const currentDirection = direction ?? camera.position.clone().sub(controls.target).normalize();
-  if (currentDirection.lengthSq() < 1e-6) currentDirection.set(0.6, 0.5, 0.7).normalize();
-  const distance = framingDistance(camera, radius);
-  camera.position.copy(sphere.center).addScaledVector(currentDirection, distance);
-  camera.near = Math.max(distance / 1000, 0.001);
-  camera.far = Math.max(distance * 200, 100);
-  camera.updateProjectionMatrix();
-  controls.update();
-}
-
-/** Smoothly tweens the orbit camera to a cardinal-axis view of the geometry. */
-function animateToAxis(session, axis, sign) {
-  if (session.snapAnimation) cancelAnimationFrame(session.snapAnimation);
-  const { controls } = session;
-  const source = session.camera;
-  const sphere = editableBoundingSphere(session);
-  const radius = Math.max(sphere.radius, 0.25);
-  const target = sphere.center.clone();
-  const endDirection = new THREE.Vector3(
-    axis === "x" ? sign : 0,
-    axis === "y" ? sign : 0,
-    axis === "z" ? sign : 0,
-  );
-  if (endDirection.lengthSq() < 1e-6) endDirection.set(0, 1, 0);
-  endDirection.normalize();
-  const endDistance = framingDistance(session.perspectiveCamera, radius);
-  const startTarget = controls.target.clone();
-  const startDirection = source.position.clone().sub(startTarget);
-  const startDistance = startDirection.length() || endDistance;
-  startDirection.normalize();
-  const visibleHeight = source.isPerspectiveCamera
-    ? 2 * startDistance * Math.tan(THREE.MathUtils.degToRad(source.fov * 0.5)) / source.zoom
-    : session.orthographicHeight;
-  session.orthographicHeight = Math.max(visibleHeight, radius * 2.2, 0.01);
-  const camera = session.orthographicCamera ?? new THREE.OrthographicCamera(-1, 1, 1, -1, 0.001, 1000);
-  session.orthographicCamera = camera;
-  camera.position.copy(source.position);
-  camera.quaternion.copy(source.quaternion);
-  camera.up.copy(source.up);
-  camera.near = source.near;
-  camera.far = source.far;
-  resizeGeometryCamera(camera, session.canvas.clientWidth, session.canvas.clientHeight, session.orthographicHeight);
-  session.useCamera(camera);
-  const startQuaternion = camera.quaternion.clone();
-  const endUp = axis === "y"
-    ? new THREE.Vector3(0, 0, sign > 0 ? -1 : 1)
-    : new THREE.Vector3(0, 1, 0);
-  const endPosition = target.clone().addScaledVector(endDirection, endDistance);
-  const endQuaternion = new THREE.Quaternion().setFromRotationMatrix(
-    new THREE.Matrix4().lookAt(endPosition, target, endUp),
-  );
-  // Pick the shorter of the two great-circle arcs to the new direction so
-  // flipping from -X to +X doesn't whip through the back of the model.
-  if (startDirection.dot(endDirection) < -0.999) {
-    startDirection.set(endDirection.z, endDirection.x, -endDirection.y);
-  }
-  const duration = 220;
-  const startTime = performance.now();
-  const tick = (now) => {
-    const t = THREE.MathUtils.clamp((now - startTime) / duration, 0, 1);
-    // Ease-out cubic — fast then settle, matches the main viewport's axis snap.
-    const eased = 1 - Math.pow(1 - t, 3);
-    const direction = startDirection.clone().lerp(endDirection, eased).normalize();
-    const distance = THREE.MathUtils.lerp(startDistance, endDistance, eased);
-    controls.target.copy(startTarget).lerp(target, eased);
-    camera.position.copy(controls.target).addScaledVector(direction, distance);
-    camera.quaternion.slerpQuaternions(startQuaternion, endQuaternion, eased);
-    controls.dispatchEvent({ type: "change" });
-    if (t < 1) {
-      session.snapAnimation = requestAnimationFrame(tick);
-    } else {
-      camera.position.copy(endPosition);
-      camera.quaternion.copy(endQuaternion);
-      camera.up.copy(endUp);
-      session.snapAnimation = 0;
-      session.orbitStartQuaternion = camera.quaternion.clone();
-      session.useCamera(camera);
-    }
-  };
-  session.snapAnimation = requestAnimationFrame(tick);
-}
+/* -------------------------------------------------------------------------- */
+/* Camera views                                                                */
+/* -------------------------------------------------------------------------- */
 
 function usePerspectiveGeometryView(session) {
   const source = session.camera;
@@ -380,696 +191,307 @@ function usePerspectiveGeometryView(session) {
   session.controls.update();
 }
 
-/** Rebuilds the wireframe line list and caches its edge order for recolouring. */
-function refreshWire(session) {
-  const { editable, wire } = session;
-  session.wireEdges = [...sessionEdges(session).values()].filter((edge) => !edge.hiddenDiagonal);
-  setPositions(wire.geometry, session.wireEdges.flatMap((edge) => [...editable.positions[edge.a], ...editable.positions[edge.b]]));
-  refreshWireColors(session);
+/** Smoothly tweens the orbit camera to a cardinal-axis orthographic view. */
+function animateToAxis(session, axis, sign) {
+  if (session.snapAnimation) cancelAnimationFrame(session.snapAnimation);
+  const { controls } = session;
+  const source = session.camera;
+  // Local bounds, world camera: the object keeps its transform in edit mode.
+  const sphere = meshBoundingSphere(session.mesh).applyMatrix4(session.meshObject.matrixWorld);
+  const radius = Math.max(sphere.radius, 0.25);
+  const target = sphere.center.clone();
+  const endDirection = new THREE.Vector3(axis === "x" ? sign : 0, axis === "y" ? sign : 0, axis === "z" ? sign : 0).normalize();
+  const endDistance = framingDistance(session.perspectiveCamera, radius);
+  const startTarget = controls.target.clone();
+  const startDirection = source.position.clone().sub(startTarget);
+  const startDistance = startDirection.length() || endDistance;
+  startDirection.normalize();
+  const visibleHeight = source.isPerspectiveCamera
+    ? (2 * startDistance * Math.tan(THREE.MathUtils.degToRad(source.fov * 0.5))) / source.zoom
+    : session.orthographicHeight;
+  session.orthographicHeight = Math.max(visibleHeight, radius * 2.2, 0.01);
+  const camera = session.orthographicCamera ?? new THREE.OrthographicCamera(-1, 1, 1, -1, 0.001, 1000);
+  session.orthographicCamera = camera;
+  camera.position.copy(source.position);
+  camera.quaternion.copy(source.quaternion);
+  camera.up.copy(source.up);
+  camera.near = source.near;
+  camera.far = source.far;
+  resizeGeometryCamera(camera, session.canvas.clientWidth, session.canvas.clientHeight, session.orthographicHeight);
+  session.useCamera(camera);
+  const startQuaternion = camera.quaternion.clone();
+  const endUp = axis === "y" ? new THREE.Vector3(0, 0, sign > 0 ? -1 : 1) : new THREE.Vector3(0, 1, 0);
+  const endPosition = target.clone().addScaledVector(endDirection, endDistance);
+  const endQuaternion = new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().lookAt(endPosition, target, endUp));
+  // Pick the shorter arc so flipping from -X to +X does not whip through the
+  // back of the model.
+  if (startDirection.dot(endDirection) < -0.999) startDirection.set(endDirection.z, endDirection.x, -endDirection.y);
+  const duration = 220;
+  const startTime = performance.now();
+  const tick = (now) => {
+    const t = THREE.MathUtils.clamp((now - startTime) / duration, 0, 1);
+    const eased = 1 - (1 - t) ** 3;
+    const direction = startDirection.clone().lerp(endDirection, eased).normalize();
+    const distance = THREE.MathUtils.lerp(startDistance, endDistance, eased);
+    controls.target.copy(startTarget).lerp(target, eased);
+    camera.position.copy(controls.target).addScaledVector(direction, distance);
+    camera.quaternion.slerpQuaternions(startQuaternion, endQuaternion, eased);
+    controls.dispatchEvent({ type: "change" });
+    if (t < 1) {
+      session.snapAnimation = requestAnimationFrame(tick);
+      return;
+    }
+    camera.position.copy(endPosition);
+    camera.quaternion.copy(endQuaternion);
+    camera.up.copy(endUp);
+    session.snapAnimation = 0;
+    session.orbitStartQuaternion = camera.quaternion.clone();
+    session.useCamera(camera);
+  };
+  session.snapAnimation = requestAnimationFrame(tick);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Interactive macros                                                          */
+/* -------------------------------------------------------------------------- */
+
+const vec = (array) => new THREE.Vector3(array[0], array[1], array[2]);
+
+/** Where a mesh-local point lands on screen, in client coordinates. */
+function screenPointOf(session, point, camera, rect) {
+  if (!point) return null;
+  const projected = vec(point).applyMatrix4(session.meshObject.matrixWorld).project(camera);
+  if (!Number.isFinite(projected.x) || !Number.isFinite(projected.y)) return null;
+  return {
+    x: (projected.x + 1) * rect.width * 0.5 + rect.left,
+    y: (-projected.y + 1) * rect.height * 0.5 + rect.top,
+  };
 }
 
 /**
- * Blender fades an edge from the selection colour at a selected vertex to the
- * plain wire colour at the far end, so a vertex selection reads at a glance.
+ * Recomputes a macro's effect from its snapshot.
+ *
+ * Macros come in two families. Most only *move* vertices, so the topology is
+ * created once and each frame just repositions from the recorded origins.
+ * Bevel and loop cut change topology as their parameter changes, so they
+ * re-run the operator against an untouched snapshot every frame — which is why
+ * `macro.source` is never mutated.
  */
-function refreshWireColors(session) {
-  const { editable, wire, selections, mode } = session;
-  const edges = session.wireEdges ?? [];
-  const colors = new Float32Array(edges.length * 6);
-  const base = new THREE.Color(WIRE_COLOR);
-  const selected = new THREE.Color(SELECT_COLOR);
-  edges.forEach((edge, index) => {
-    const endpoints = mode === "vertex"
-      ? [edge.a, edge.b].map((vertex) => (selections.vertex.has(positionKey(editable.positions[vertex])) ? selected : base))
-      : [base, base];
-    endpoints.forEach((color, side) => color.toArray(colors, index * 6 + side * 3));
-  });
-  wire.geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
-}
-
-function updateTopologyCache(session) {
-  session.cachedEdges = logicalEdges(session);
-  session.cachedVertices = new Map(session.editable.positions.map((position) => [positionKey(position), position]));
-  session.cachedVisibleEdges = null;
-  session.cachedEdgeIncidence = null;
-  session.cachedFaceTopology = null;
-  session.cachedPathGraphs = null;
-}
-
-function applyXray(session) {
-  const materials = Array.isArray(session.mesh.material) ? session.mesh.material : [session.mesh.material];
-  materials.forEach((material) => {
-    material.transparent = session.xray;
-    material.opacity = session.xray ? 0.38 : 1;
-    material.depthWrite = !session.xray;
-    material.needsUpdate = true;
-  });
-  [session.basePoints, session.vertexOverlay].forEach((markers) => {
-    if (!markers?.material) return;
-    markers.material.depthTest = !session.xray;
-    markers.material.needsUpdate = true;
-  });
-}
-
-function screenPosition(point, camera, rect) {
-  const projected = point.clone().project(camera);
-  return new THREE.Vector2(
-    (projected.x + 1) * rect.width * 0.5 + rect.left,
-    (-projected.y + 1) * rect.height * 0.5 + rect.top,
-  );
-}
-
-function pointInSelectionRegion(point, gesture) {
-  if (gesture.kind === "circle") return point.distanceToSquared(new THREE.Vector2(gesture.current.x, gesture.current.y)) <= gesture.radius ** 2;
-  const left = Math.min(gesture.start.x, gesture.current.x);
-  const right = Math.max(gesture.start.x, gesture.current.x);
-  const top = Math.min(gesture.start.y, gesture.current.y);
-  const bottom = Math.max(gesture.start.y, gesture.current.y);
-  return point.x >= left && point.x <= right && point.y >= top && point.y <= bottom;
-}
-
-function selectionPointVisible(session, localPoint) {
-  if (session.xray) return true;
-  const worldPoint = session.mesh.localToWorld(localPoint.clone());
-  const projected = worldPoint.clone().project(session.camera);
-  if (projected.z < -1 || projected.z > 1) return false;
-  const raycaster = session.selectionRaycaster ??= new THREE.Raycaster();
-  raycaster.setFromCamera(new THREE.Vector2(projected.x, projected.y), session.camera);
-  const hit = raycaster.intersectObject(session.mesh, false)[0];
-  if (!hit) return true;
-  const targetDistance = raycaster.ray.origin.distanceTo(worldPoint);
-  const tolerance = Math.max(targetDistance * 1e-4, 1e-5);
-  return hit.distance + tolerance >= targetDistance;
-}
-
-/**
- * The triangles making up one logical polygon: flood fill across hidden diagonals
- * only. Coplanarity would split a quad in two the moment it is bent.
- */
-function logicalFaceGroup(session, faceIndex) {
-  const topology = logicalFaceTopology(session);
-  const group = topology.groupOf.get(faceIndex);
-  return group === undefined ? [] : topology.groups[group].faces;
-}
-
-function nearestVisibleFaceEdge(session, faceIndex, point) {
-  const face = session.editable.faces[faceIndex];
-  if (!face) return null;
-  return face.map((a, index) => [a, face[(index + 1) % 3]])
-    .map(([a, b]) => ({ a, b, key: edgeKey(session.editable, a, b), edge: sessionEdges(session).get(edgeKey(session.editable, a, b)) }))
-    .filter(({ edge }) => edge && !edge.hiddenDiagonal)
-    .map((entry) => ({ ...entry, distance: new THREE.Line3(
-      new THREE.Vector3(...session.editable.positions[entry.a]),
-      new THREE.Vector3(...session.editable.positions[entry.b]),
-    ).closestPointToPoint(point, true, new THREE.Vector3()).distanceToSquared(point) }))
-    .sort((a, b) => a.distance - b.distance)[0] ?? null;
-}
-
-function logicalFaceTopology(session) {
-  if (session.cachedFaceTopology) return session.cachedFaceTopology;
-  const { editable } = session;
-  const edges = sessionEdges(session);
-  const edgeFaces = new Map();
-  editable.faces.forEach((face, faceIndex) => {
-    for (let edge = 0; edge < 3; edge++) {
-      const key = edgeKey(editable, face[edge], face[(edge + 1) % 3]);
-      if (!edgeFaces.has(key)) edgeFaces.set(key, []);
-      edgeFaces.get(key).push(faceIndex);
-    }
-  });
-  const groupOf = new Map();
-  const groups = [];
-  editable.faces.forEach((_, faceIndex) => {
-    if (groupOf.has(faceIndex)) return;
-    const id = groups.length;
-    const faces = [];
-    const queue = [faceIndex];
-    groupOf.set(faceIndex, id);
-    while (queue.length) {
-      const current = queue.pop();
-      faces.push(current);
-      const face = editable.faces[current];
-      for (let edge = 0; edge < 3; edge++) {
-        const key = edgeKey(editable, face[edge], face[(edge + 1) % 3]);
-        if (!edges.get(key)?.hiddenDiagonal) continue;
-        for (const neighbour of edgeFaces.get(key) ?? []) {
-          if (groupOf.has(neighbour)) continue;
-          groupOf.set(neighbour, id);
-          queue.push(neighbour);
-        }
-      }
-    }
-    groups.push({ faces, edges: [] });
-  });
-  const edgeGroups = new Map();
-  groups.forEach((group, groupId) => {
-    const keys = new Set();
-    group.faces.forEach((faceIndex) => {
-      const face = editable.faces[faceIndex];
-      face.forEach((a, edge) => {
-        const key = edgeKey(editable, a, face[(edge + 1) % 3]);
-        if (!edges.get(key)?.hiddenDiagonal) keys.add(key);
-      });
-    });
-    group.edges = [...keys];
-    group.edges.forEach((key) => {
-      if (!edgeGroups.has(key)) edgeGroups.set(key, []);
-      edgeGroups.get(key).push(groupId);
-    });
-  });
-  session.cachedFaceTopology = { groupOf, groups, edgeGroups };
-  return session.cachedFaceTopology;
-}
-
-function logicalFaceLoop(session, faceIndex, seedEdgeKey) {
-  const topology = logicalFaceTopology(session);
-  const seedGroup = topology.groupOf.get(faceIndex);
-  if (seedGroup === undefined) return new Set();
-  const selected = new Set([seedGroup]);
-  const opposite = (groupId, incoming) => {
-    const edges = topology.groups[groupId].edges;
-    if (edges.length !== 4) return null;
-    const incomingEdge = sessionEdges(session).get(incoming);
-    if (!incomingEdge) return null;
-    const endpoints = new Set([positionKey(session.editable.positions[incomingEdge.a]), positionKey(session.editable.positions[incomingEdge.b])]);
-    return edges.find((key) => {
-      if (key === incoming) return false;
-      const edge = sessionEdges(session).get(key);
-      return edge && !endpoints.has(positionKey(session.editable.positions[edge.a])) && !endpoints.has(positionKey(session.editable.positions[edge.b]));
-    }) ?? null;
-  };
-  const walkAcross = (edgeKeyValue) => {
-    let previous = seedGroup;
-    let edge = edgeKeyValue;
-    for (let step = 0; step < topology.groups.length; step++) {
-      const next = (topology.edgeGroups.get(edge) ?? []).find((id) => id !== previous);
-      if (next === undefined || selected.has(next)) break;
-      selected.add(next);
-      const nextEdge = opposite(next, edge);
-      if (!nextEdge) break;
-      previous = next;
-      edge = nextEdge;
-    }
-  };
-  walkAcross(seedEdgeKey);
-  const other = opposite(seedGroup, seedEdgeKey);
-  if (other) walkAcross(other);
-  return new Set([...selected].flatMap((id) => topology.groups[id].faces));
-}
-
-function loopSelectionAtHit(session, hit) {
-  const nearest = nearestVisibleFaceEdge(session, hit.faceIndex, hit.point);
-  if (!nearest) return new Set();
-  if (session.mode === "edge") return logicalEdgeLoop(session, nearest.key);
-  if (session.mode === "vertex") {
-    const vertices = new Set();
-    logicalEdgeLoop(session, nearest.key).forEach((key) => {
-      const edge = sessionEdges(session).get(key);
-      if (edge) { vertices.add(positionKey(session.editable.positions[edge.a])); vertices.add(positionKey(session.editable.positions[edge.b])); }
-    });
-    return vertices;
-  }
-  return logicalFaceLoop(session, hit.faceIndex, nearest.key);
-}
-
-function shortestPathGraph(session, mode) {
-  session.cachedPathGraphs ??= {};
-  if (session.cachedPathGraphs[mode]) return session.cachedPathGraphs[mode];
-  const adjacency = new Map();
-  const connect = (a, b) => {
-    if (a === b) return;
-    if (!adjacency.has(a)) adjacency.set(a, new Set());
-    if (!adjacency.has(b)) adjacency.set(b, new Set());
-    adjacency.get(a).add(b);
-    adjacency.get(b).add(a);
-  };
-  let nodes;
-  if (mode === "vertex") {
-    nodes = new Set(session.editable.positions.map(positionKey));
-    visibleLogicalEdges(session).forEach((edge) => connect(
-      positionKey(session.editable.positions[edge.a]),
-      positionKey(session.editable.positions[edge.b]),
-    ));
-  } else if (mode === "edge") {
-    nodes = new Set(visibleLogicalEdges(session).keys());
-    logicalEdgeIncidence(session).forEach((entries) => {
-      for (let first = 0; first < entries.length; first++) {
-        for (let second = first + 1; second < entries.length; second++) connect(entries[first].key, entries[second].key);
-      }
-    });
-  } else {
-    const topology = logicalFaceTopology(session);
-    nodes = new Set(topology.groups.map((_, id) => id));
-    topology.edgeGroups.forEach((groups) => {
-      for (let first = 0; first < groups.length; first++) {
-        for (let second = first + 1; second < groups.length; second++) connect(groups[first], groups[second]);
-      }
-    });
-  }
-  session.cachedPathGraphs[mode] = { nodes, adjacency };
-  return session.cachedPathGraphs[mode];
-}
-
-function shortestSelectionPath(session, targets) {
-  const selected = session.selections[session.mode];
-  if (!selected.size || !targets.length) return new Set(targets);
-  const { nodes, adjacency } = shortestPathGraph(session, session.mode);
-  let normalizeTarget = (value) => value;
-  let expandResult = (values) => values;
-  if (session.mode === "face") {
-    const topology = logicalFaceTopology(session);
-    normalizeTarget = (faceIndex) => topology.groupOf.get(faceIndex);
-    expandResult = (values) => values.flatMap((id) => topology.groups[id]?.faces ?? []);
-  }
-  const starts = [...selected].map(normalizeTarget).filter((value) => value !== undefined);
-  const goal = normalizeTarget(targets[0]);
-  if (goal === undefined) return new Set(targets);
-  const queue = [...new Set(starts)];
-  const previous = new Map(queue.map((value) => [value, null]));
-  for (let head = 0; head < queue.length && !previous.has(goal); head++) {
-    const current = queue[head];
-    for (const next of adjacency.get(current) ?? []) {
-      if (!nodes.has(next) || previous.has(next)) continue;
-      previous.set(next, current);
-      queue.push(next);
-    }
-  }
-  if (!previous.has(goal)) return new Set(targets);
-  const path = [];
-  for (let current = goal; current !== null; current = previous.get(current)) path.push(current);
-  return new Set(expandResult(path));
-}
-
-function pickRegion(session, gesture) {
-  const rect = session.canvas.getBoundingClientRect();
-  const selected = new Set();
-  if (session.mode === "vertex") {
-    const unique = new Map(session.editable.positions.map((position) => [positionKey(position), position]));
-    unique.forEach((position, key) => {
-      const point = new THREE.Vector3(...position);
-      if (selectionPointVisible(session, point) && pointInSelectionRegion(screenPosition(point, session.camera, rect), gesture)) selected.add(key);
-    });
-  } else if (session.mode === "edge") {
-    sessionEdges(session).forEach((edge, key) => {
-      if (edge.hiddenDiagonal) return;
-      const midpoint = new THREE.Vector3(...session.editable.positions[edge.a]).add(new THREE.Vector3(...session.editable.positions[edge.b])).multiplyScalar(0.5);
-      if (selectionPointVisible(session, midpoint) && pointInSelectionRegion(screenPosition(midpoint, session.camera, rect), gesture)) selected.add(key);
-    });
-  } else {
-    session.editable.faces.forEach((face, index) => {
-      const center = face.reduce((sum, vertex) => sum.add(new THREE.Vector3(...session.editable.positions[vertex])), new THREE.Vector3()).multiplyScalar(1 / face.length);
-      if (selectionPointVisible(session, center) && pointInSelectionRegion(screenPosition(center, session.camera, rect), gesture)) {
-        logicalFaceGroup(session, index).forEach((faceIndex) => selected.add(faceIndex));
-      }
-    });
-  }
-  return selected;
-}
-
-function applyRegionSelection(session, gesture) {
-  const selected = pickRegion(session, gesture);
-  const selection = session.selections[session.mode];
-  selected.forEach((key) => {
-    if (gesture.subtractive) selection.delete(key);
-    else selection.add(key);
-  });
-  refreshOverlays(session);
-}
-
-function refreshOverlays(session) {
-  const { editable, selections, faceOverlay, edgeOverlay, vertexOverlay, basePoints } = session;
-  const facePositions = [...selections.face].flatMap((index) =>
-    editable.faces[index]?.flatMap((vertex) => editable.positions[vertex]) ?? [],
-  );
-  setPositions(faceOverlay.geometry, facePositions);
-  faceOverlay.visible = session.mode === "face" && facePositions.length > 0;
-
-  const edges = sessionEdges(session);
-  const edgePositions = [...selections.edge].flatMap((key) => {
-    const edge = edges.get(key);
-    return edge ? [...editable.positions[edge.a], ...editable.positions[edge.b]] : [];
-  });
-  setPositions(edgeOverlay.geometry, edgePositions);
-  edgeOverlay.visible = session.mode === "edge" && edgePositions.length > 0;
-
-  const uniquePositions = session.cachedVertices ?? new Map(editable.positions.map((position) => [positionKey(position), position]));
-  setVertexMarkers(basePoints, [...uniquePositions.values()], session, VERTEX_PIXEL_RADIUS);
-  const vertexPositions = [...selections.vertex].map((key) => uniquePositions.get(key)).filter(Boolean);
-  setVertexMarkers(vertexOverlay, vertexPositions, session, SELECTED_VERTEX_PIXEL_RADIUS);
-  vertexOverlay.visible = session.mode === "vertex" && vertexPositions.length > 0;
-  basePoints.visible = session.mode === "vertex";
-  refreshWireColors(session);
-}
-
-function pickElement(session, hit) {
-  const { editable, mode } = session;
-  const faceIndex = hit.faceIndex;
-  const face = editable.faces[faceIndex];
-  if (!face) return [];
-  if (mode === "face") return logicalFaceGroup(session, faceIndex);
-  if (mode === "vertex") {
-    const closest = face.reduce((best, index) => {
-      const distance = hit.point.distanceToSquared(new THREE.Vector3(...editable.positions[index]));
-      return distance < best.distance ? { index, distance } : best;
-    }, { index: face[0], distance: Infinity });
-    return [positionKey(editable.positions[closest.index])];
-  }
-  const closest = face.map((a, i) => [a, face[(i + 1) % 3]])
-    .filter(([a, b]) => !sessionEdges(session).get(edgeKey(editable, a, b))?.hiddenDiagonal)
-    .map(([a, b]) => {
-      const line = new THREE.Line3(new THREE.Vector3(...editable.positions[a]), new THREE.Vector3(...editable.positions[b]));
-      return { key: edgeKey(editable, a, b), distance: line.closestPointToPoint(hit.point, true, new THREE.Vector3()).distanceToSquared(hit.point) };
-    }).sort((a, b) => a.distance - b.distance)[0];
-  return closest ? [closest.key] : [];
-}
-
-function cloneSelections(selections) {
-  return { vertex: new Set(selections.vertex), edge: new Set(selections.edge), face: new Set(selections.face) };
-}
-
-function previewLoopCut(session) {
-  const macro = session.macro;
-  const rect = session.canvas.getBoundingClientRect();
-  const toScreen = (point) => {
-    const projected = point.clone().project(session.camera);
-    return new THREE.Vector2((projected.x + 1) * rect.width * 0.5 + rect.left, (-projected.y + 1) * rect.height * 0.5 + rect.top);
-  };
-  const a2 = toScreen(macro.edgeStart);
-  const b2 = toScreen(macro.edgeEnd);
-  const edge2 = b2.clone().sub(a2);
-  const pointer = new THREE.Vector2(macro.current.x, macro.current.y);
-  const t = THREE.MathUtils.clamp(pointer.sub(a2).dot(edge2) / Math.max(edge2.lengthSq(), 1), 0.02, 0.98);
-  // Placement phase is always evenly spaced. The first click establishes the
-  // edge-slide origin; only subsequent pointer movement offsets the cuts.
-  const slide = macro.locked ? t - (macro.lockT ?? t) : 0;
-  Object.assign(session.editable, cloneEditable(macro.before));
-  session.hiddenEdges = new Set(macro.beforeHidden);
-  const segments = Math.max(1, macro.segments ?? 1);
-  const cutFactors = [];
-  for (let index = 0; index < segments; index++) {
-    const evenlySpaced = (index + 1) / (segments + 1);
-    const cutT = THREE.MathUtils.clamp(evenlySpaced + slide, 0.02, 0.98);
-    cutFactors.push(cutT);
-  }
-  const result = cutMeshByEdgeRing(
-    session.editable,
-    [macro.edgeStart.toArray(), macro.edgeEnd.toArray()],
-    cutFactors,
-    macro.beforeTopology.hidden,
-  );
-  // A cut ring lies flat in the face it crosses: it is a real edge only because
-  // the cut says so, never because of geometry.
-  applyTopology(session, macro.beforeTopology, { hidden: new Set(result.hiddenKeys) });
-  session.selections.edge = new Set(result.edgeKeys);
-  macro.t = t;
-  session.rebuild();
-}
-
-function selectedVertexIndices(session, mode = session.mode) {
-  const { editable, selections } = session;
-  const indices = new Set();
-  if (mode === "face") {
-    for (const faceIndex of selections.face) editable.faces[faceIndex]?.forEach((index) => indices.add(index));
-  } else if (mode === "vertex") {
-    editable.positions.forEach((position, index) => {
-      if (selections.vertex.has(positionKey(position))) indices.add(index);
-    });
-  } else {
-    sessionEdges(session).forEach((edge, key) => {
-      if (selections.edge.has(key)) { indices.add(edge.a); indices.add(edge.b); }
-    });
-  }
-  return expandLogicalVertices(editable, [...indices]);
-}
-
-function transformPivot(session, indices, mode = session.pivotMode) {
-  if (mode === "origin") return new THREE.Vector3();
-  const unique = new Map(indices.map((index) => [
-    positionKey(session.editable.positions[index]),
-    new THREE.Vector3(...session.editable.positions[index]),
-  ]));
-  const points = [...unique.values()];
-  if (!points.length) return new THREE.Vector3();
-  if (mode === "bounds") return new THREE.Box3().setFromPoints(points).getCenter(new THREE.Vector3());
-  return points.reduce((sum, point) => sum.add(point), new THREE.Vector3()).multiplyScalar(1 / points.length);
-}
-
-function individualTransformPivots(session, indices, fallback) {
-  if (session.pivotMode !== "individual") return null;
-  const accumulators = new Map();
-  const add = (vertex, center) => {
-    const key = positionKey(session.editable.positions[vertex]);
-    const entry = accumulators.get(key) ?? { sum: new THREE.Vector3(), count: 0 };
-    entry.sum.add(center);
-    entry.count++;
-    accumulators.set(key, entry);
-  };
-  if (session.mode === "face") {
-    const visited = new Set();
-    session.selections.face.forEach((faceIndex) => {
-      const group = logicalFaceGroup(session, faceIndex);
-      const groupKey = group.slice().sort((a, b) => a - b).join("|");
-      if (visited.has(groupKey)) return;
-      visited.add(groupKey);
-      const vertices = [...new Set(group.flatMap((index) => session.editable.faces[index] ?? []))];
-      const points = new Map(vertices.map((index) => [positionKey(session.editable.positions[index]), index]));
-      const center = [...points.values()].reduce(
-        (sum, index) => sum.add(new THREE.Vector3(...session.editable.positions[index])),
-        new THREE.Vector3(),
-      ).multiplyScalar(1 / Math.max(points.size, 1));
-      vertices.forEach((index) => add(index, center));
-    });
-  } else if (session.mode === "edge") {
-    session.selections.edge.forEach((key) => {
-      const edge = sessionEdges(session).get(key);
-      if (!edge) return;
-      const center = new THREE.Vector3(...session.editable.positions[edge.a])
-        .add(new THREE.Vector3(...session.editable.positions[edge.b])).multiplyScalar(0.5);
-      add(edge.a, center);
-      add(edge.b, center);
-    });
-  }
-  const pivots = new Map();
-  indices.forEach((index) => {
-    const key = positionKey(session.editable.positions[index]);
-    const entry = accumulators.get(key);
-    pivots.set(index, session.mode === "vertex"
-      ? new THREE.Vector3(...session.editable.positions[index])
-      : entry ? entry.sum.clone().multiplyScalar(1 / entry.count) : fallback.clone());
-  });
-  return pivots;
-}
-
-function proportionalTopologyDistances(session, selectedIndices) {
-  const adjacency = new Map();
-  const connect = (a, b, distance) => {
-    if (!adjacency.has(a)) adjacency.set(a, []);
-    if (!adjacency.has(b)) adjacency.set(b, []);
-    adjacency.get(a).push([b, distance]);
-    adjacency.get(b).push([a, distance]);
-  };
-  visibleLogicalEdges(session).forEach((edge) => {
-    const a = positionKey(session.editable.positions[edge.a]);
-    const b = positionKey(session.editable.positions[edge.b]);
-    const distance = new THREE.Vector3(...session.editable.positions[edge.a])
-      .distanceTo(new THREE.Vector3(...session.editable.positions[edge.b]));
-    connect(a, b, distance);
-  });
-  const distances = new Map();
-  const queue = [];
-  new Set(selectedIndices.map((index) => positionKey(session.editable.positions[index]))).forEach((key) => {
-    distances.set(key, 0);
-    queue.push([0, key]);
-  });
-  // Binary min-heap keeps connected proportional editing usable on imported
-  // meshes where a quadratic shortest-path walk would stall interaction.
-  const push = (entry) => {
-    queue.push(entry);
-    for (let index = queue.length - 1; index > 0;) {
-      const parent = Math.floor((index - 1) / 2);
-      if (queue[parent][0] <= queue[index][0]) break;
-      [queue[parent], queue[index]] = [queue[index], queue[parent]];
-      index = parent;
-    }
-  };
-  const pop = () => {
-    const first = queue[0];
-    const last = queue.pop();
-    if (queue.length && last) {
-      queue[0] = last;
-      for (let index = 0;;) {
-        const left = index * 2 + 1;
-        const right = left + 1;
-        let smallest = index;
-        if (left < queue.length && queue[left][0] < queue[smallest][0]) smallest = left;
-        if (right < queue.length && queue[right][0] < queue[smallest][0]) smallest = right;
-        if (smallest === index) break;
-        [queue[index], queue[smallest]] = [queue[smallest], queue[index]];
-        index = smallest;
-      }
-    }
-    return first;
-  };
-  while (queue.length) {
-    const [distance, key] = pop();
-    if (distance !== distances.get(key)) continue;
-    for (const [next, cost] of adjacency.get(key) ?? []) {
-      const nextDistance = distance + cost;
-      if (nextDistance >= (distances.get(next) ?? Infinity)) continue;
-      distances.set(next, nextDistance);
-      push([nextDistance, next]);
-    }
-  }
-  return distances;
-}
-
-function proportionalFalloff(normalized, falloff) {
-  const t = THREE.MathUtils.clamp(normalized, 0, 1);
-  if (t >= 1) return 0;
-  if (falloff === "constant") return 1;
-  if (falloff === "linear") return 1 - t;
-  if (falloff === "sharp") return (1 - t) ** 2;
-  if (falloff === "root") return Math.sqrt(1 - t);
-  if (falloff === "sphere") return Math.sqrt(Math.max(0, 1 - t * t));
-  return 0.5 + 0.5 * Math.cos(Math.PI * t);
-}
-
-function syncTransformedSelection(session, macro) {
-  if (session.mode === "vertex") {
-    session.selections.vertex = new Set(macro.indices.map((index) => positionKey(session.editable.positions[index])));
-  } else if (session.mode === "edge") {
-    session.selections.edge = new Set(macro.edges.map(([a, b]) => edgeKey(session.editable, a, b)));
-  }
-}
-
-function applyTransformMacro(session) {
+function applyMacro(session) {
   const macro = session.macro;
   if (!macro) return;
-  if (macro.kind === "loopcut") { previewLoopCut(session); return; }
-  if (macro.kind === "inset") {
-    const dx = macro.current.x - macro.start.x;
-    const dy = macro.current.y - macro.start.y;
-    const numeric = macro.buffer && macro.buffer !== "." ? Number(macro.buffer) : null;
-    const amount = numeric !== null && Number.isFinite(numeric)
-      ? THREE.MathUtils.clamp(Math.abs(numeric), 0.001, 0.999)
-      : THREE.MathUtils.clamp((dx - dy) * 0.005, 0.001, 0.999);
-    Object.assign(session.editable, cloneEditable(macro.before));
-    session.hiddenEdges = new Set(macro.beforeHidden);
-    const inner = insetFaces(session.editable, macro.faceIndices, amount);
-    session.selections.face = new Set(inner);
-    applyTopology(session, macro.beforeTopology, { visible: new Set(inner.visibleEdgeKeys ?? []) });
-    macro.amount = amount;
-    session.rebuild();
+  const dx = macro.current.x - macro.start.x;
+  const dy = macro.current.y - macro.start.y;
+  const numeric = macro.buffer && !"-.".includes(macro.buffer) ? Number(macro.buffer) : null;
+  const typed = numeric !== null && Number.isFinite(numeric) ? numeric : null;
+  const fine = macro.fine ? 0.1 : 1;
+
+  if (macro.kind === "bevel" || macro.kind === "loopcut") {
+    rerunTopologyMacro(session, macro, dx, dy, typed, fine);
     return;
   }
-  if (macro.kind === "bevel") {
-    const dx = macro.current.x - macro.start.x;
-    const dy = macro.current.y - macro.start.y;
-    const numeric = macro.buffer && macro.buffer !== "-" && macro.buffer !== "." ? Number(macro.buffer) : null;
-    const amount = numeric !== null && Number.isFinite(numeric)
-      ? THREE.MathUtils.clamp(Math.abs(numeric), 0.001, 0.45)
-      : THREE.MathUtils.clamp(macro.initialAmount + (dx - dy) * 0.0015, 0.001, 0.45);
-    Object.assign(session.editable, cloneEditable(macro.before));
-    session.hiddenEdges = new Set(macro.beforeHidden);
-    bevelEdges(session.editable, macro.edgeKeys, amount, macro.segments);
-    applyTopology(session, macro.beforeTopology);
-    session.selections.edge.clear();
-    macro.amount = amount;
-    session.rebuild();
+  if (macro.kind === "edgeslide" || macro.kind === "vertslide") {
+    const factor = typed ?? THREE.MathUtils.clamp((dx - dy) * 0.004 * fine, -1, 1);
+    macro.factor = factor;
+    applySlide(macro.rails, factor);
+    session.preview();
     return;
   }
-  const { kind, axis, buffer, start, current, pivot, indices, positions } = macro;
-  const numeric = buffer && buffer !== "-" && buffer !== "." ? Number(buffer) : null;
-  const dx = current.x - start.x;
-  const dy = current.y - start.y;
+
   const camera = session.camera;
-  const right = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 0);
-  const up = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 1);
-  const viewAxis = camera.getWorldDirection(new THREE.Vector3()).normalize();
-  const axisVector = axis ? new THREE.Vector3(axis === "x" ? 1 : 0, axis === "y" ? 1 : 0, axis === "z" ? 1 : 0) : null;
-  const worldPerPixel = Math.max(camera.position.distanceTo(session.controls.target), 0.1) / 800;
+  // Vertex positions are mesh-local, so the camera's world axes are converted
+  // into the local displacement that produces a movement along them. Skipping
+  // this drags a rotated object's vertices off along the world axes instead of
+  // the ones under the cursor.
+  const toLocalDirection = session.toLocalDirection ?? ((vector) => vector);
+  // Kept unit-length so the pixels-to-units factor below is the only thing that
+  // sets the distance travelled.
+  const right = toLocalDirection(new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 0)).normalize();
+  const up = toLocalDirection(new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 1)).normalize();
+  const viewAxis = toLocalDirection(camera.getWorldDirection(new THREE.Vector3())).normalize();
+  const rect = session.canvas.getBoundingClientRect();
+  // How much world a pixel covers at the depth being edited. Derived from the
+  // real viewport height and lens rather than a fixed 800px, so a drag means
+  // the same thing whichever way the panel has been resized — then expressed in
+  // local units, so a scaled object moves with the mouse rather than by its
+  // scale factor times the mouse.
+  const viewportHeight = Math.max(rect.height, 1);
+  const depth = Math.max(camera.position.distanceTo(session.controls.target), 0.1);
+  const worldPerPixel = (camera.isOrthographicCamera
+    ? (camera.top - camera.bottom) / Math.max(camera.zoom, 1e-6) / viewportHeight
+    : (2 * depth * Math.tan(THREE.MathUtils.degToRad(camera.fov * 0.5))) / viewportHeight) * fine
+    * (session.localPerWorld ?? 1);
+  const directions = constraintAxes(macro.basis, macro.axis);
+
   let translation = new THREE.Vector3();
   let angle = 0;
   let factor = 1;
-  if (kind === "translate") {
-    if (numeric !== null && Number.isFinite(numeric)) translation.copy(axisVector ?? right).multiplyScalar(numeric);
-    else if (axisVector) translation.copy(axisVector).multiplyScalar((dx - dy) * worldPerPixel);
-    else translation.copy(right).multiplyScalar(dx * worldPerPixel).addScaledVector(up, -dy * worldPerPixel);
-  } else if (kind === "rotate") {
-    angle = numeric !== null && Number.isFinite(numeric) ? THREE.MathUtils.degToRad(numeric) : (dx - dy) * 0.01;
-  } else if (kind === "extrude") {
-    const extrusionAxis = axisVector ?? (macro.free ? null : new THREE.Vector3(...macro.normal));
-    if (numeric !== null && Number.isFinite(numeric)) {
-      translation.copy(extrusionAxis ?? right).multiplyScalar(numeric);
-    } else if (!extrusionAxis) {
-      translation.copy(right).multiplyScalar(dx * worldPerPixel).addScaledVector(up, -dy * worldPerPixel);
+  let distance = 0;
+
+  if (macro.kind === "translate" || macro.kind === "extrude" || macro.kind === "inset" || macro.kind === "shrinkfatten") {
+    if (macro.offsets) {
+      // Each vertex travels along its own direction (inset, shrink/fatten,
+      // extrude along normals), so the drag resolves to a single scalar.
+      if (macro.kind === "inset") {
+        // Blender measures an inset from how far the pointer sits from the
+        // centre of the selection, not from how far it has travelled. That
+        // difference matters: with travelled distance every direction thickens
+        // and nothing thins, so the only way back is to overshoot and the
+        // collapse point sits barely a hundred pixels from the start — one
+        // ordinary flick of the mouse and the face was gone. Measured from the
+        // centre, moving out thickens and moving back in thins, and the
+        // thickness is wherever you are pointing rather than an accumulated
+        // total.
+        const centre = screenPointOf(session, macro.pivot, camera, rect);
+        const reach = centre
+          ? Math.hypot(macro.current.x - centre.x, macro.current.y - centre.y)
+            - Math.hypot(macro.start.x - centre.x, macro.start.y - centre.y)
+          : Math.hypot(dx, dy);
+        distance = typed ?? reach * worldPerPixel;
+        const ceiling = macro.maxThickness ?? Infinity;
+        // Clamped to just inside where the inset ring collapses; past that the
+        // cap inverts and grows back mirrored, which reads as the face vanishing.
+        distance = Math.min(Math.max(distance, 0), ceiling);
+      } else {
+        distance = typed ?? (dx - dy) * worldPerPixel;
+      }
+      macro.amount = distance;
+    } else if (typed !== null) {
+      const axis = directions?.[0] ?? macro.normal ?? [right.x, right.y, right.z];
+      translation.copy(vec(axis)).multiplyScalar(typed);
+    } else if (macro.kind === "extrude" && !macro.free && !macro.axis) {
+      // A face extrude defaults to travelling along the region normal.
+      const axis = vec(macro.normal);
+      const projected = dx * axis.dot(right) - dy * axis.dot(up);
+      const screenAligned = Math.abs(axis.dot(right)) + Math.abs(axis.dot(up)) > 0.08 ? projected : dx - dy;
+      translation.copy(axis).multiplyScalar(screenAligned * worldPerPixel);
     } else {
-      const projected = dx * extrusionAxis.dot(right) - dy * extrusionAxis.dot(up);
-      const screenDistance = Math.abs(extrusionAxis.dot(right)) + Math.abs(extrusionAxis.dot(up)) > 0.08
-        ? projected
-        : dx - dy;
-      translation.copy(extrusionAxis).multiplyScalar(screenDistance * worldPerPixel);
+      translation.copy(right).multiplyScalar(dx * worldPerPixel).addScaledVector(up, -dy * worldPerPixel);
+      const constrained = constrainTranslation([translation.x, translation.y, translation.z], directions);
+      translation.set(constrained[0], constrained[1], constrained[2]);
     }
-  } else {
-    factor = numeric !== null && Number.isFinite(numeric) ? numeric : Math.max(0.001, 1 + (dx - dy) * 0.01);
+  } else if (macro.kind === "rotate") {
+    angle = typed !== null ? THREE.MathUtils.degToRad(typed) : (dx - dy) * 0.01 * fine;
+  } else if (macro.kind === "scale") {
+    factor = typed !== null ? typed : Math.max(0.001, 1 + (dx - dy) * 0.01 * fine);
   }
-  const rotationAxis = axisVector ?? viewAxis;
+
+  const rotationAxis = directions?.length === 1 ? vec(directions[0]) : viewAxis;
   const quaternion = new THREE.Quaternion().setFromAxisAngle(rotationAxis, angle);
-  const selectedKeys = new Set(indices.map((index) => positionKey(macro.allPositions[index])));
-  const transformIndices = macro.proportional ? macro.allPositions.map((_, index) => index) : indices;
-  transformIndices.forEach((index, i) => {
-    const point = (macro.proportional ? new THREE.Vector3(...macro.allPositions[index]) : positions[i]).clone();
-    let weight = 1;
-    if (macro.proportional && !selectedKeys.has(positionKey(macro.allPositions[index]))) {
-      const distance = macro.connected
-        ? (macro.topologyDistances.get(positionKey(macro.allPositions[index])) ?? Infinity)
-        : Math.min(...indices.map((selectedIndex) => point.distanceTo(new THREE.Vector3(...macro.allPositions[selectedIndex]))));
-      const normalized = THREE.MathUtils.clamp(distance / Math.max(macro.radius, 0.0001), 0, 1);
-      weight = proportionalFalloff(normalized, macro.falloff);
+  const scaleAxes = directions;
+
+  for (const [vert, origin] of macro.origins) {
+    const point = vec(origin);
+    // Recomputed rather than cached so the scroll wheel can resize the
+    // influence circle mid-drag, as it does in Blender.
+    //
+    // Named `reach`, not `distance`: it used to shadow the drag distance
+    // computed above, and the per-vertex-offset branch below then multiplied by
+    // *this* instead. With proportional editing off there are no recorded
+    // distances, so it was `undefined * 1` — every vertex an inset, a
+    // shrink/fatten or an extrude-along-normals moved went NaN, the faces
+    // vanished, and the NaN was then written into the `.geom` (where it lands
+    // as `null` and reloads as UV 0,0 — the zeroed UVs on disk).
+    const reach = macro.distances?.get(vert);
+    const weight = reach === undefined ? 1 : falloffWeight(reach / Math.max(macro.radius, 1e-6), macro.falloff);
+    if (weight <= 0) {
+      vert.co = [...origin];
+      continue;
     }
-    const elementPivot = macro.individualPivots?.get(index) ?? pivot;
-    if (kind === "translate") point.add(translation);
-    if (kind === "extrude") point.add(translation);
-    if (kind === "rotate") point.sub(elementPivot).applyQuaternion(quaternion).add(elementPivot);
-    if (kind === "scale") {
-      point.sub(elementPivot);
-      const weightedFactor = THREE.MathUtils.lerp(1, factor, weight);
-      if (axis) {
-        if (axis === "x") point.x *= weightedFactor;
-        if (axis === "y") point.y *= weightedFactor;
-        if (axis === "z") point.z *= weightedFactor;
-      } else point.multiplyScalar(weightedFactor);
-      point.add(elementPivot);
+    const pivot = vec(macro.pivots?.get(vert) ?? macro.pivot);
+    if (macro.offsets) {
+      const offset = macro.offsets.get(vert);
+      if (offset) point.addScaledVector(vec(offset), distance * weight);
+    } else if (macro.kind === "rotate") {
+      const weighted = new THREE.Quaternion().setFromAxisAngle(rotationAxis, angle * weight);
+      point.sub(pivot).applyQuaternion(weight === 1 ? quaternion : weighted).add(pivot);
+    } else if (macro.kind === "scale") {
+      point.sub(pivot);
+      const amount = THREE.MathUtils.lerp(1, factor, weight);
+      if (scaleAxes) {
+        for (const axis of scaleAxes) {
+          const along = vec(axis);
+          const projected = point.dot(along);
+          point.addScaledVector(along, projected * (amount - 1));
+        }
+      } else point.multiplyScalar(amount);
+      point.add(pivot);
+    } else {
+      point.addScaledVector(translation, weight);
     }
-    if (weight !== 1 && (kind === "translate" || kind === "extrude")) point.sub(translation).addScaledVector(translation, weight);
-    if (weight !== 1 && kind === "rotate") {
-      const weightedQuaternion = new THREE.Quaternion().setFromAxisAngle(rotationAxis, angle * weight);
-      point.copy((macro.proportional ? new THREE.Vector3(...macro.allPositions[index]) : positions[i]))
-        .sub(elementPivot).applyQuaternion(weightedQuaternion).add(elementPivot);
+    vert.co = [point.x, point.y, point.z];
+  }
+
+  // The side strips of an extrude or inset grow as the drag proceeds, so their
+  // UVs are re-measured each frame rather than baked at zero size — and an
+  // inset's cap keeps shrinking under a fixed mapping, so it is re-read from
+  // that mapping for the same reason.
+  if (macro.sides?.length) updateSideUVs(macro.sides);
+  if (macro.reprojected?.length) updateCapUVs(macro.reprojected);
+
+  // Snapping runs after the drag so it corrects the final position, and only
+  // for an unweighted single-target move where a snap is meaningful.
+  if (session.snapEnabled && macro.kind !== "rotate" && macro.kind !== "scale" && macro.origins.size) {
+    const moving = new Set(macro.origins.keys());
+    const anchor = macro.snapAnchor ?? [...moving][0];
+    const target = snapTarget(session.mesh, anchor.co, {
+      mode: session.snapMode,
+      radius: session.snapRadius,
+      increment: session.snapIncrement,
+      moving,
+    });
+    if (target) {
+      const delta = [target.point[0] - anchor.co[0], target.point[1] - anchor.co[1], target.point[2] - anchor.co[2]];
+      for (const vert of moving) vert.co = [vert.co[0] + delta[0], vert.co[1] + delta[1], vert.co[2] + delta[2]];
     }
-    session.editable.positions[index] = point.toArray();
-  });
-  if (kind === "extrude") updateExtrudeUVs(session.editable, macro);
-  syncTransformedSelection(session, macro);
+  }
   session.preview();
 }
 
-function hasEditorOnlyAncestor(object) {
-  let current = object;
-  while (current) {
-    if (current.userData?.editorOnly) return true;
-    current = current.parent;
+/** Bevel and loop cut: rebuild the whole result from the untouched snapshot. */
+function rerunTopologyMacro(session, macro, dx, dy, typed, fine) {
+  const { mesh } = copyMesh(macro.source);
+  session.mesh = mesh;
+  session.active = null;
+  if (macro.kind === "bevel") {
+    // Radial, for the same reason as inset: a bevel width cannot be negative,
+    // so a signed diagonal drag left half the directions doing nothing.
+    const width = typed ?? Math.max(0.0001, macro.initialWidth + Math.hypot(dx, dy) * 0.002 * fine);
+    macro.amount = width;
+    bevelEdges(mesh, selected(mesh, "edge"), { width, segments: macro.segments });
+  } else {
+    const seed = [...mesh.edges].find((edge) => edge.id === macro.seedId);
+    if (seed) {
+      const slide = macro.locked ? THREE.MathUtils.clamp((dx - dy) * 0.003 * fine, -0.95, 0.95) : 0;
+      macro.slide = slide;
+      loopCut(mesh, seed, { cuts: macro.segments, slide });
+    }
   }
-  return false;
+  session.rebuild();
 }
 
-export function GeometryEditorPanel({ embedded = false, entityIdOverride = null, initialView = null, onClose = null } = {}) {
+/* -------------------------------------------------------------------------- */
+/* Component                                                                   */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * `initialViewRef` is a *ref* holding `{ position, target }`, not a plain prop.
+ * The scene below is built in a passive effect, which runs after the commit
+ * that mounted this panel; a pose passed as state from the parent's layout
+ * effect only arrives on the next render, one render too late to be read. A ref
+ * is already filled in by then, so the viewport's pose transfers verbatim and
+ * entering edit mode does not move the camera.
+ */
+export function GeometryEditorPanel({ embedded = false, entityIdOverride = null, initialViewRef = null, onClose = null } = {}) {
   const selectedEntityId = useSelectionStore((state) => state.ids[0] ?? null);
   const entityId = entityIdOverride ?? selectedEntityId;
   const rootRef = useRef(null);
   const hostRef = useRef(null);
+  const toolbarRef = useRef(null);
+  const toolbarScrollRef = useRef(null);
   const sessionRef = useRef(null);
   const saveQueueRef = useRef(Promise.resolve());
+
   const [mode, setMode] = useState("face");
   const [revision, setRevision] = useState(0);
   const [status, setStatus] = useState("");
@@ -1077,14 +499,41 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
   const [showSceneContext, setShowSceneContext] = useState(embedded);
   const [proportional, setProportional] = useState(false);
   const [proportionalConnected, setProportionalConnected] = useState(true);
-  const [proportionalFalloffMode, setProportionalFalloffMode] = useState("smooth");
-  const [pivotMode, setPivotMode] = useState("median");
+  const [falloff, setFalloff] = useState("smooth");
+  const [pivot, setPivot] = useState("median");
+  const [orientation, setOrientation] = useState("global");
+  const [snapEnabled, setSnapEnabled] = useState(false);
+  const [snapMode, setSnapMode] = useState("increment");
+  const [snapIncrement, setSnapIncrement] = useState(0.25);
   const [xray, setXray] = useState(false);
   const [selectionTool, setSelectionTool] = useState(null);
   const [selectionGesture, setSelectionGesture] = useState(null);
   const [faceMaterial, setFaceMaterial] = useState(0);
   const [cuts, setCuts] = useState(1);
   const [snapView, setSnapView] = useState(null);
+  const [pendingChord, setPendingChord] = useState(null);
+  const [stats, setStats] = useState(null);
+  const [knifePoints, setKnifePoints] = useState(null);
+
+  // Sculpt mode
+  const [editorMode, setEditorMode] = useState("edit");
+  const [brush, setBrush] = useState("draw");
+  const [brushRadius, setBrushRadius] = useState(0.25);
+  const [brushStrength, setBrushStrength] = useState(0.4);
+  const [brushFalloff, setBrushFalloff] = useState("smooth");
+  const [symmetry, setSymmetry] = useState({ x: false, y: false, z: false });
+  const [dyntopo, setDyntopo] = useState(true);
+  const [detailSize, setDetailSize] = useState(0.08);
+  const [dyntopoMode, setDyntopoMode] = useState("both");
+  const [brushCursor, setBrushCursor] = useState(null);
+  const [showHelp, setShowHelp] = useState(false);
+  const [remeshDetail, setRemeshDetail] = useState(0);
+  const [paintColor, setPaintColor] = useState("#d84a3f");
+  const [paintBlend, setPaintBlend] = useState("mix");
+  const [paintResolution, setPaintResolution] = useState(1024);
+  const [busy, setBusy] = useState(false);
+  const [shading, setShading] = useState("solid");
+
   const entity = entityId ? engine.getEntity(entityId) : null;
   const component = entity?.getComponent("mesh");
 
@@ -1092,43 +541,1350 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
     if (sessionRef.current?.context) sessionRef.current.context.visible = showSceneContext;
   }, [showSceneContext]);
 
+  /* ---------------------------------------------------------------------- */
+  /* Session plumbing                                                        */
+  /* ---------------------------------------------------------------------- */
+
+  const touch = () => setRevision((value) => value + 1);
+
+  const refreshStats = (session) => setStats(meshStatistics(session.mesh));
+
+  const autosave = (session = sessionRef.current) => {
+    if (!session || !entityId) return;
+    let contents;
+    try {
+      // `assetFromMesh` refuses a mesh carrying non-finite coordinates. Better
+      // to leave the last good file on disk and say so than to overwrite it
+      // with one that will not reopen.
+      contents = JSON.stringify(assetFromMesh(session.mesh), null, 2);
+    } catch (error) {
+      setStatus(`Not saved: ${error.message}`);
+      console.error(error);
+      return;
+    }
+    // Update Object Mode immediately; the disk write can land afterwards
+    // without making a Tab-out look like it discarded the edit.
+    const liveMesh = engine.getEntity(entityId)?.getComponent("mesh")?.mesh;
+    if (liveMesh) {
+      const previous = liveMesh.geometry;
+      liveMesh.geometry = bufferGeometryFromMesh(session.mesh);
+      // `previous` may be the shared `.geom` instance (geometryAsset.js) that
+      // other meshes are still rendering — release rather than dispose.
+      disposeOrReleaseGeometry(previous);
+    }
+    setStatus("Autosaving geometry...");
+    saveQueueRef.current = saveQueueRef.current.catch(() => {}).then(async () => {
+      const path = await ensureGeometryAsset(entityId);
+      if (!path) throw new Error("Geometry asset is unavailable");
+      const { invoke } = await import("@tauri-apps/api/core");
+      await invoke("save_scene", { path, contents });
+      invalidateBlobUrl(path);
+      // The cluster DAG cached for this asset indexes the triangles that were
+      // just replaced; drop it before the reload re-virtualizes from the new
+      // ones, or the mesh renders a LOD cut of the mesh it used to be.
+      invalidateVirtualGeometryAsset(path);
+      reloadGeometryUsers(path);
+      if (rootRef.current) setStatus(`Autosaved ${path.split(/[\\/]/).pop()}`);
+    }).catch((error) => {
+      if (rootRef.current) setStatus(`Autosave failed: ${error}`);
+    });
+  };
+
+  const pushUndo = (session, label) => {
+    session.history.push({ mesh: copyMesh(session.mesh).mesh, mode: session.mode, label });
+    if (session.history.length > UNDO_DEPTH) session.history.shift();
+    session.future.length = 0;
+  };
+
+  /** Runs a mesh operator as one undoable step. */
+  const runOperator = (label, operation) => {
+    const session = sessionRef.current;
+    if (!session || session.macro) return;
+    pushUndo(session, label);
+    const result = operation(session) ?? {};
+    if (result.error) {
+      // Nothing changed, so the undo entry would be a no-op step.
+      session.history.pop();
+      setStatus(result.error);
+      return;
+    }
+    session.active = session.mesh.verts.has(session.active) || session.mesh.edges.has(session.active) || session.mesh.faces.has(session.active)
+      ? session.active
+      : null;
+    session.rebuild();
+    autosave(session);
+    if (result.message) setStatus(result.message);
+    else setStatus(label);
+  };
+
+  const undo = () => {
+    const session = sessionRef.current;
+    const previous = session?.history.pop();
+    if (!previous) return;
+    session.future.push({ mesh: copyMesh(session.mesh).mesh, mode: session.mode, label: previous.label });
+    session.mesh = previous.mesh;
+    session.mode = previous.mode;
+    session.active = null;
+    setMode(previous.mode);
+    session.rebuild();
+    autosave(session);
+    setStatus(`Undo: ${previous.label}`);
+  };
+
+  const redo = () => {
+    const session = sessionRef.current;
+    const next = session?.future.pop();
+    if (!next) return;
+    session.history.push({ mesh: copyMesh(session.mesh).mesh, mode: session.mode, label: next.label });
+    session.mesh = next.mesh;
+    session.mode = next.mode;
+    session.active = null;
+    setMode(next.mode);
+    session.rebuild();
+    autosave(session);
+    setStatus(`Redo: ${next.label}`);
+  };
+
+  /* ---------------------------------------------------------------------- */
+  /* Modes and selection                                                     */
+  /* ---------------------------------------------------------------------- */
+
   const changeMode = (next) => {
     const session = sessionRef.current;
-    if (session) {
-      const selectedVertices = new Set(selectedVertexIndices(session).map((index) => positionKey(session.editable.positions[index])));
-      const nextSelection = new Set();
-      if (next === "vertex") {
-        selectedVertices.forEach((key) => nextSelection.add(key));
-      } else if (next === "edge") {
-        visibleLogicalEdges(session).forEach((edge, key) => {
-          if (selectedVertices.has(positionKey(session.editable.positions[edge.a])) && selectedVertices.has(positionKey(session.editable.positions[edge.b]))) nextSelection.add(key);
-        });
-      } else {
-        session.editable.faces.forEach((face, index) => {
-          if (face.every((vertex) => selectedVertices.has(positionKey(session.editable.positions[vertex])))) nextSelection.add(index);
-        });
-      }
-      session.selections[next] = nextSelection;
+    if (session && session.mode !== next) {
+      convertSelection(session.mesh, session.mode, next);
       session.mode = next;
+      session.active = null;
       refreshOverlays(session);
     }
     setMode(next);
-    setRevision((value) => value + 1);
+    touch();
   };
 
-  const clearSelection = () => {
+  const withSelection = (label, operation) => runOperator(label, (session) => {
+    const result = operation(session);
+    refreshOverlays(session);
+    return result;
+  });
+
+  /** Selection edits are undoable but never dirty the asset. */
+  const runSelection = (label, operation) => {
+    const session = sessionRef.current;
+    if (!session || session.macro) return;
+    operation(session);
+    refreshOverlays(session);
+    setStatus(label);
+    touch();
+  };
+
+  const doSelectAll = () => runSelection("Select All", (session) => selectAll(session.mesh, session.mode));
+  const doSelectNone = () => runSelection("Deselect All", (session) => {
+    clearSelection(session.mesh);
+    session.active = null;
+  });
+  const doInvert = () => runSelection("Invert Selection", (session) => invertSelection(session.mesh, session.mode));
+  const doGrow = () => runSelection("Select More", (session) => growSelection(session.mesh, session.mode));
+  const doShrink = () => runSelection("Select Less", (session) => shrinkSelection(session.mesh, session.mode));
+  const doSelectLinkedAll = () => runSelection("Select Linked", (session) => {
+    const seeds = session.mode === "face" ? selected(session.mesh, "face")
+      : session.mode === "edge" ? selected(session.mesh, "edge")
+        : selectedVerts(session.mesh, "vert");
+    for (const seed of seeds) {
+      for (const element of linkedElements(session.mesh, seed, session.mode)) element.select = true;
+    }
+    flushSelection(session.mesh, session.mode);
+  });
+  const doSelectSimilar = (type) => runSelection(`Select Similar`, (session) => selectSimilar(session.mesh, session.mode, type));
+  const doSelectTrait = (trait, options) => runSelection(`Select ${trait}`, (session) => selectByTrait(session.mesh, session.mode, trait, options));
+  const doCheckerDeselect = () => runSelection("Checker Deselect", (session) => checkerDeselect(session.mesh, session.mode));
+  const doSelectRandom = () => runSelection("Select Random", (session) => selectRandom(session.mesh, session.mode, 0.5));
+
+  /* ---------------------------------------------------------------------- */
+  /* Macros                                                                  */
+  /* ---------------------------------------------------------------------- */
+
+  const publishMacro = (session) => {
+    const macro = session.macro;
+    setMacroState(macro && {
+      kind: macro.kind,
+      label: macro.label,
+      axis: macro.axis,
+      buffer: macro.buffer,
+      amount: macro.amount,
+      segments: macro.segments,
+      factor: macro.factor,
+      locked: macro.locked,
+      free: macro.free,
+      orientation: session.orientation,
+      proportional: macro.proportional,
+      radius: macro.radius,
+    });
+  };
+
+  /**
+   * Starts an interactive transform. `topology` optionally runs an operator
+   * first (extrude, inset) and reports which vertices should follow the mouse.
+   */
+  const startMacro = (kind, label, options = {}) => {
+    const session = sessionRef.current;
+    if (!session || session.macro) return;
+    const snapshot = copyMesh(session.mesh).mesh;
+    let moving = options.verts ?? null;
+    let offsets = options.offsets ?? null;
+    let normal = options.normal ?? [0, 0, 1];
+    let sides = null;
+    let reprojected = null;
+    let maxThickness = null;
+
+    if (options.topology) {
+      const result = options.topology(session);
+      if (!result || result.error) {
+        setStatus(result?.error ?? "Nothing to do");
+        return;
+      }
+      moving = result.verts;
+      offsets = result.perVertexOffsets ?? result.individualNormals ?? null;
+      normal = result.normal ?? normal;
+      sides = result.sides ?? null;
+      reprojected = result.reprojected ?? null;
+      maxThickness = result.maxThickness ?? null;
+      session.rebuild();
+    }
+    if (!moving) moving = selectedVerts(session.mesh, session.mode);
+    if (!moving.length) {
+      setStatus("Nothing selected");
+      return;
+    }
+
+    const origins = new Map(moving.map((vert) => [vert, [...vert.co]]));
+    let distances = null;
+    let radius = 1;
+    if (session.proportional && !offsets) {
+      const sphere = meshBoundingSphere(session.mesh);
+      radius = Math.max(sphere.radius * 0.6, 0.25);
+      // Every vertex that could *ever* come under the influence circle is
+      // recorded now, because the radius is live: scrolling during the drag
+      // changes it, and a vertex that was not in `origins` could never start
+      // moving. Weights themselves are recomputed each frame from the radius.
+      distances = proportionalDistances(session.mesh, moving, { connected: session.proportionalConnected });
+      for (const vert of distances.keys()) {
+        if (!origins.has(vert)) origins.set(vert, [...vert.co]);
+      }
+      for (const vert of moving) distances.set(vert, 0);
+    }
+
+    const pointer = session.lastPointer ?? { x: 0, y: 0 };
+    session.macro = {
+      kind,
+      label,
+      source: snapshot,
+      origins,
+      distances,
+      radius,
+      falloff: session.falloff,
+      proportional: session.proportional && !offsets,
+      offsets,
+      normal,
+      free: options.free ?? false,
+      axis: "",
+      buffer: "",
+      fine: false,
+      basis: orientationBasis(session.mesh, session.mode, session.orientation, { viewBasis: cameraBasis(session.camera, session) }),
+      pivot: transformPivot(session.mesh, session.mode, session.pivot, { cursor: localCursor(), active: session.active }),
+      pivots: session.pivot === "individual" ? individualPivots(session.mesh, session.mode) : null,
+      sides,
+      reprojected,
+      maxThickness,
+      snapAnchor: session.active && origins.has(session.active) ? session.active : moving[0],
+      beforeMode: session.mode,
+      segments: options.segments ?? 1,
+      initialWidth: options.width ?? 0.05,
+      amount: 0,
+      rails: options.rails ?? null,
+      seedId: options.seedId ?? null,
+      locked: options.locked ?? false,
+      start: { ...pointer },
+      current: { ...pointer },
+    };
+    session.controls.enabled = false;
+    if (kind === "bevel" || kind === "loopcut") applyMacro(session);
+    publishMacro(session);
+    touch();
+  };
+
+  const commitMacro = () => {
+    const session = sessionRef.current;
+    if (!session?.macro) return;
+    session.history.push({ mesh: session.macro.source, mode: session.macro.beforeMode, label: session.macro.label });
+    if (session.history.length > UNDO_DEPTH) session.history.shift();
+    session.future.length = 0;
+    session.macro = null;
+    session.controls.enabled = true;
+    session.rebuild();
+    setMacroState(null);
+    autosave(session);
+  };
+
+  const cancelMacro = () => {
+    const session = sessionRef.current;
+    if (!session?.macro) return;
+    session.mesh = session.macro.source;
+    session.mode = session.macro.beforeMode;
+    session.active = null;
+    setMode(session.mode);
+    session.macro = null;
+    session.controls.enabled = true;
+    session.rebuild();
+    setMacroState(null);
+  };
+
+  /* ---------------------------------------------------------------------- */
+  /* Operator bindings                                                       */
+  /* ---------------------------------------------------------------------- */
+
+  const localCursor = () => {
+    const owner = engine.getEntity(entityId);
+    if (!owner?.object3D) return [0, 0, 0];
+    owner.object3D.updateWorldMatrix(true, false);
+    const point = new THREE.Vector3().fromArray(getCursor3D().position).applyMatrix4(owner.object3D.matrixWorld.clone().invert());
+    return [point.x, point.y, point.z];
+  };
+
+  const startExtrude = (variant = "region") => {
     const session = sessionRef.current;
     if (!session) return;
-    session.selections[session.mode].clear();
-    refreshOverlays(session);
-    setRevision((value) => value + 1);
+    const mode = session.mode;
+    startMacro("extrude", `Extrude ${MODE_LABELS[mode]}`, {
+      free: mode !== "face" || variant === "free",
+      topology: (value) => {
+        if (mode === "face") {
+          if (variant === "individual") return extrudeFacesIndividual(value.mesh);
+          if (variant === "normals") return extrudeAlongNormals(value.mesh);
+          return extrudeFaceRegion(value.mesh);
+        }
+        if (mode === "edge") return extrudeEdges(value.mesh);
+        return extrudeVerts(value.mesh);
+      },
+    });
   };
 
-  const toggleProportional = () => {
-    const next = !sessionRef.current?.proportional;
-    if (sessionRef.current) sessionRef.current.proportional = next;
-    setProportional(next);
+  const startInset = (individual = false) => startMacro("inset", individual ? "Inset Individual" : "Inset Faces", {
+    topology: (session) => (session.mode === "face" ? insetFaces(session.mesh, selected(session.mesh, "face"), { individual }) : { error: "Inset needs a face selection" }),
+  });
+
+  const startShrinkFatten = () => {
+    const session = sessionRef.current;
+    if (!session) return;
+    startMacro("shrinkfatten", "Shrink/Fatten", { offsets: shrinkFattenOffsets(session.mesh, session.mode) });
   };
+
+  const startBevel = () => {
+    const session = sessionRef.current;
+    if (!session) return;
+    if (session.mode !== "edge" || !selectionCount(session.mesh, "edge")) {
+      setStatus("Bevel needs an edge selection");
+      return;
+    }
+    startMacro("bevel", "Bevel Edges", { width: 0.05, segments: 1, verts: selectedVerts(session.mesh, "edge") });
+  };
+
+  const startLoopCut = () => {
+    const session = sessionRef.current;
+    const hit = session?.raycastAtLast?.();
+    if (!session || !hit) {
+      setStatus("Hover an edge ring to loop cut");
+      return;
+    }
+    const face = pickFace(session, hit);
+    const seed = face && nearestEdgeOnFace(face, hit.point);
+    if (!seed) return;
+    session.mode = "edge";
+    setMode("edge");
+    startMacro("loopcut", "Loop Cut", { seedId: seed.id, segments: 1, verts: [seed.v1, seed.v2], locked: false });
+  };
+
+  const startEdgeSlide = () => {
+    const session = sessionRef.current;
+    if (!session) return;
+    const rails = edgeSlideRails(session.mesh, selected(session.mesh, "edge"));
+    if (rails.error) {
+      setStatus(rails.error);
+      return;
+    }
+    startMacro("edgeslide", "Edge Slide", { verts: [...rails.rails.keys()], rails: rails.rails });
+  };
+
+  /**
+   * Vertex Slide: each selected vertex travels along the edges it sits on.
+   *
+   * The two rails are the first two connected edges; the drag direction then
+   * chooses between them via the slide factor's sign, which is the same
+   * -1..1 convention edge slide uses.
+   */
+  const startVertSlide = () => {
+    const session = sessionRef.current;
+    if (!session) return;
+    const rails = new Map();
+    for (const vert of selectedVerts(session.mesh, session.mode)) {
+      const result = vertSlideRails(vert);
+      if (result.error || result.rails.length < 1) continue;
+      rails.set(vert, {
+        origin: [...vert.co],
+        a: result.rails[0].target,
+        b: (result.rails[1] ?? result.rails[0]).target,
+      });
+    }
+    if (!rails.size) {
+      setStatus("Those vertices have no edges to slide along");
+      return;
+    }
+    startMacro("vertslide", "Vertex Slide", { verts: [...rails.keys()], rails });
+  };
+
+  /** Blender's G G: a second G within the double-tap window starts a slide. */
+  const startMoveOrSlide = () => {
+    const session = sessionRef.current;
+    if (!session) return;
+    const now = performance.now();
+    const isDoubleTap = session.lastMoveKey && now - session.lastMoveKey < 400;
+    session.lastMoveKey = now;
+    if (!isDoubleTap) {
+      startMacro("translate", "Move");
+      return;
+    }
+    session.lastMoveKey = 0;
+    if (session.mode === "edge") startEdgeSlide();
+    else startVertSlide();
+  };
+
+  const doDelete = (kind) => runOperator(`Delete ${kind}`, (session) => {
+    const removed = deleteSelection(session.mesh, session.mode, kind);
+    session.active = null;
+    return { message: `Deleted ${removed} ${kind}` };
+  });
+
+  const doDissolve = (kind) => runOperator(`Dissolve ${kind}`, (session) => {
+    if (kind === "verts") return { message: `Dissolved ${dissolveVerts(session.mesh)} vertices` };
+    if (kind === "edges") return { message: `Dissolved ${dissolveEdges(session.mesh)} edges` };
+    if (kind === "faces") return { message: `Dissolved ${dissolveFaces(session.mesh)} regions` };
+    return { message: `Limited dissolve removed ${limitedDissolve(session.mesh, { selectionOnly: selectionCount(session.mesh, session.mode) > 0 })} edges` };
+  });
+
+  const doMerge = (kind) => runOperator(`Merge ${kind}`, (session) => {
+    const result = mergeSelection(session.mesh, session.mode, kind, { cursor: localCursor(), active: session.active });
+    if (result.error) return result;
+    session.active = null;
+    session.mode = "vert";
+    setMode("vert");
+    return { message: `Merged ${result.merged ?? 0} vertices` };
+  });
+
+  const doMergeByDistance = () => runOperator("Merge by Distance", (session) => ({
+    message: `Removed ${mergeByDistance(session.mesh, 0.0001, { mode: session.mode, selectionOnly: selectionCount(session.mesh, session.mode) > 0 })} doubles`,
+  }));
+
+  const doMakeEdgeFace = () => runOperator("Make Edge/Face", (session) => {
+    const result = makeEdgeFace(session.mesh, session.mode);
+    if (result.error) return result;
+    if (result.created === "face") {
+      session.mode = "face";
+      setMode("face");
+    } else {
+      session.mode = "edge";
+      setMode("edge");
+    }
+    return { message: `Created ${result.created}` };
+  });
+
+  const doSubdivide = () => runOperator("Subdivide", (session) => {
+    const faces = selected(session.mesh, "face");
+    const result = subdivideFaces(session.mesh, faces, cuts);
+    return result.error ? result : { message: `Subdivided ${result.faces} faces` };
+  });
+
+  const doRip = (fill) => runOperator(fill ? "Rip Fill" : "Rip", (session) => {
+    const camera = session.camera;
+    const right = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 0);
+    const created = ripVerts(session.mesh, selectedVerts(session.mesh, session.mode), [right.x, right.y, right.z], { fill });
+    if (!created.length) return { error: "Nothing to rip there" };
+    session.mode = "vert";
+    setMode("vert");
+    return { message: `Ripped ${created.length} vertices` };
+  });
+
+  /**
+   * Separate by Selection (P). The extracted faces leave this mesh and become a
+   * sibling entity carrying its own `.geom` asset, matching Blender's P >
+   * Selection. The asset write is asynchronous, so the entity is created once
+   * the file exists and the source edit is saved independently.
+   */
+  const doSeparate = () => {
+    const session = sessionRef.current;
+    if (!session || session.macro) return;
+    const owner = engine.getEntity(entityId);
+    if (!owner) return;
+    const probe = separateSelection(copyMesh(session.mesh).mesh, createMesh);
+    if (probe.error) {
+      setStatus(probe.error);
+      return;
+    }
+    runOperator("Separate", (value) => {
+      const result = separateSelection(value.mesh, createMesh);
+      if (result.error) return result;
+      value.separated = result.mesh;
+      return { message: `Separated ${result.faces} faces` };
+    });
+    const extracted = session.separated;
+    session.separated = null;
+    if (!extracted) return;
+    (async () => {
+      try {
+        const path = await saveNewGeometryAsset(`${owner.name} Part`, extracted);
+        const { commandBus } = await import("../commands/CommandBus.js");
+        commandBus.execute(new CreateEntityCommand({
+          name: `${owner.name} Part`,
+          parentId: owner.parent?.id ?? null,
+          transform: owner.getTransform(),
+          components: [{ type: "mesh", props: { geometryAsset: path, material: component.props.material ?? "" } }],
+        }));
+        setStatus(`Separated into ${path.split(/[\\/]/).pop()}`);
+      } catch (error) {
+        setStatus(`Separate failed: ${error}`);
+      }
+    })();
+  };
+
+  const doDuplicate = () => {
+    const session = sessionRef.current;
+    if (!session || session.macro) return;
+    const snapshot = copyMesh(session.mesh).mesh;
+    const result = duplicateSelection(session.mesh, session.mode);
+    if (result.error) {
+      setStatus(result.error);
+      return;
+    }
+    session.rebuild();
+    // Blender hands a duplicate straight to a move, so it can be placed at once.
+    startMacro("translate", "Duplicate", { verts: result.verts });
+    if (session.macro) session.macro.source = snapshot;
+  };
+
+  const doUnwrap = (kind) => runOperator(`Unwrap ${kind}`, (session) => {
+    if (kind === "planar") unwrapPlanar(session.mesh, "z");
+    else unwrapBox(session.mesh);
+    return { message: `Unwrapped (${kind})` };
+  });
+
+  const doAssignMaterial = () => runOperator("Assign Material", (session) => {
+    let count = 0;
+    for (const face of selected(session.mesh, "face")) {
+      face.material = faceMaterial;
+      count++;
+    }
+    return count ? { message: `Assigned slot ${faceMaterial + 1} to ${count} faces` } : { error: "Select faces first" };
+  });
+
+  const doMark = (property, value, label) => runOperator(label, (session) => ({
+    message: `${label}: ${markEdges(session.mesh, property, value, selected(session.mesh, "edge"))} edges`,
+  }));
+
+  const doShading = (smooth) => runOperator(smooth ? "Shade Smooth" : "Shade Flat", (session) => ({
+    message: `${smooth ? "Smooth" : "Flat"} on ${setShading(session.mesh, smooth, selected(session.mesh, "face"))} faces`,
+  }));
+
+  const doRecalculate = (inside) => runOperator(inside ? "Recalculate Inside" : "Recalculate Outside", (session) => {
+    const faces = selected(session.mesh, "face");
+    return { message: `Recalculated ${recalculateNormals(session.mesh, { inside, faces: faces.length ? faces : null })} faces` };
+  });
+
+  const doSmooth = () => runOperator("Smooth Vertices", (session) => ({
+    message: `Smoothed ${smoothVerts(session.mesh, selectedVerts(session.mesh, session.mode), { factor: 0.5, repeat: 1 })} vertices`,
+  }));
+
+  const doSymmetrize = (direction) => runOperator("Symmetrize", (session) => ({
+    message: `Mirrored ${symmetrize(session.mesh, direction)} vertices`,
+  }));
+
+  /* ---------------------------------------------------------------------- */
+  /* Keymap                                                                  */
+  /* ---------------------------------------------------------------------- */
+
+  const handleKeyDown = (event) => {
+    const session = sessionRef.current;
+    if (!session) return;
+    if (event.target.closest("input, textarea, select")) return;
+    // Edit mode owns its grammar; stop scene-level Delete/duplicate/undo too.
+    event.stopPropagation();
+    const key = event.key.toLowerCase();
+    const ctrl = event.ctrlKey || event.metaKey;
+    const consume = () => event.preventDefault();
+
+    // --- Chord follow-ups (Ctrl+E, Ctrl+V, Ctrl+F, M, Shift+S ...) ---------
+    if (pendingChord) {
+      consume();
+      const chord = pendingChord;
+      setPendingChord(null);
+      runChord(chord, key, event);
+      return;
+    }
+
+    // --- Active macro -----------------------------------------------------
+    if (session.macro) {
+      const macro = session.macro;
+      if (key === "escape") { consume(); cancelMacro(); return; }
+      if (key === "enter" || key === " ") { consume(); commitMacro(); return; }
+      if (event.shiftKey && !"xyz".includes(key)) macro.fine = true;
+      if ("xyz".includes(key)) {
+        consume();
+        // Shift+X is "every axis but X" — Blender's plane constraint.
+        const plane = { x: "yz", y: "xz", z: "xy" }[key];
+        const wanted = event.shiftKey ? plane : key;
+        macro.axis = macro.axis === wanted ? "" : wanted;
+        applyMacro(session);
+        publishMacro(session);
+        return;
+      }
+      if (key === "o") {
+        consume();
+        macro.proportional = !macro.proportional;
+        session.proportional = macro.proportional;
+        setProportional(macro.proportional);
+        return;
+      }
+      if (key === "backspace") {
+        consume();
+        macro.buffer = macro.buffer.slice(0, -1);
+        applyMacro(session);
+        publishMacro(session);
+        return;
+      }
+      if (/^[0-9.-]$/.test(key)) {
+        if (key === "-" && macro.buffer) return;
+        if (key === "." && macro.buffer.includes(".")) return;
+        consume();
+        macro.buffer += key;
+        applyMacro(session);
+        publishMacro(session);
+      }
+      return;
+    }
+
+    // --- Paint ------------------------------------------------------------
+    if (session.painting) {
+      if (key === "tab" && embedded && onClose) { consume(); onClose(); return; }
+      if (key === "[") { consume(); setBrushRadius((value) => Math.max(value * 0.85, 0.001)); return; }
+      if (key === "]") { consume(); setBrushRadius((value) => Math.min(value * 1.18, 100)); return; }
+      if (ctrl && key === "z") { consume(); undoPaintStroke(); return; }
+      if (key === "z" && !ctrl) { consume(); cycleShading(event.shiftKey); return; }
+      if (key === ".") { consume(); focusGeometry(); return; }
+      return;
+    }
+
+    // --- Sculpt -----------------------------------------------------------
+    if (session.sculpting) {
+      if (key === "tab" && embedded && onClose) { consume(); onClose(); return; }
+      if (key === "[") { consume(); setBrushRadius((value) => Math.max(value * 0.85, 0.001)); return; }
+      if (key === "]") { consume(); setBrushRadius((value) => Math.min(value * 1.18, 100)); return; }
+      if (key === "{") { consume(); setBrushStrength((value) => Math.max(value - 0.05, 0.01)); return; }
+      if (key === "}") { consume(); setBrushStrength((value) => Math.min(value + 0.05, 2)); return; }
+      if (ctrl && key === "z" && event.shiftKey) { consume(); redo(); return; }
+      if (ctrl && key === "z") { consume(); undo(); return; }
+      if (key === "." ) { consume(); focusGeometry(); return; }
+      if (key === "d") { consume(); setDyntopo((value) => !value); return; }
+      if (key === "z" && !ctrl) { consume(); cycleShading(event.shiftKey); return; }
+      // Blender's brush hotkeys, as far as they do not collide.
+      const byKey = { x: "draw", c: "clay", i: "inflate", s: "smooth", f: "flatten", r: "scrape", p: "pinch", g: "grab", n: "nudge" };
+      if (!ctrl && !event.altKey && byKey[key]) { consume(); setBrush(byKey[key]); return; }
+      return;
+    }
+
+    // --- Knife ------------------------------------------------------------
+    if (session.knife) {
+      if (key === "escape") { consume(); cancelKnife(); return; }
+      if (key === "enter") { consume(); confirmKnife(); return; }
+      return;
+    }
+    if (key === "k" && !ctrl) { consume(); startKnife(); return; }
+
+    // --- Selection tools --------------------------------------------------
+    if (key === "escape" && (session.selectionTool || session.selectionGesture)) { consume(); cancelSelectionTool(); return; }
+
+    // --- Chord starters ---------------------------------------------------
+    if (ctrl && key === "e") { consume(); setPendingChord("edge"); setStatus("Edge menu: B bevel · R loop cut · S mark seam · Shift+S clear seam · H mark sharp · Shift+H clear sharp · G slide · B bridge · F grid fill"); return; }
+    if (ctrl && key === "v") { consume(); setPendingChord("vertex"); setStatus("Vertex menu: M merge · S smooth · R rip · F rip fill · Y split · C connect"); return; }
+    if (ctrl && key === "f") { consume(); setPendingChord("face"); setStatus("Face menu: I inset · E extrude · P poke · T triangulate · J tris to quads · S shade smooth · Shift+S shade flat"); return; }
+    if (!ctrl && event.altKey && key === "e") { consume(); setPendingChord("extrude"); setStatus("Extrude: E region · I individual · N along normals · V vertices"); return; }
+    if (!ctrl && event.shiftKey && key === "s") { consume(); setPendingChord("snap"); setStatus("Snap: C cursor to selection · S selection to cursor · O cursor to origin"); return; }
+    if (!ctrl && event.shiftKey && key === "g") { consume(); setPendingChord("similar"); setStatus("Select Similar: pick a trait from the Select menu"); return; }
+    if (!ctrl && key === "m" && !event.shiftKey) { consume(); setPendingChord("merge"); setStatus("Merge: C center · U cursor · L collapse · F first · A last · D by distance"); return; }
+    if (!ctrl && (key === "x" || key === "delete" || key === "backspace")) { consume(); setPendingChord("delete"); setStatus("Delete: V vertices · E edges · F faces · O only faces · D dissolve verts · G dissolve edges · S dissolve faces · L limited dissolve"); return; }
+
+    // --- Modes ------------------------------------------------------------
+    if (["1", "2", "3"].includes(event.key) && !ctrl) { consume(); changeMode(MODES[Number(event.key) - 1]); return; }
+
+    // --- Undo / redo ------------------------------------------------------
+    if (ctrl && key === "z" && event.shiftKey) { consume(); redo(); return; }
+    if (ctrl && key === "y") { consume(); redo(); return; }
+    if (ctrl && key === "z") { consume(); undo(); return; }
+
+    // --- Selection --------------------------------------------------------
+    if (ctrl && key === "i") { consume(); doInvert(); return; }
+    if (ctrl && key === "l") { consume(); doSelectLinkedAll(); return; }
+    if (ctrl && (event.code === "NumpadAdd" || event.code === "Equal" || event.key === "+")) { consume(); doGrow(); return; }
+    if (ctrl && (event.code === "NumpadSubtract" || event.code === "Minus" || event.key === "-")) { consume(); doShrink(); return; }
+    if (ctrl && key === "r") { consume(); startLoopCut(); return; }
+    if (key === "a" && !ctrl) { consume(); event.altKey ? doSelectNone() : doSelectAll(); return; }
+    if (key === "l" && !ctrl) { consume(); selectLinkedUnderCursor(); return; }
+    if (key === "b" && !ctrl) { consume(); armSelectionTool("box"); return; }
+    if (key === "c" && !ctrl) { consume(); armSelectionTool("circle"); return; }
+
+    // --- Transforms -------------------------------------------------------
+    if (key === "g" && !ctrl) { consume(); startMoveOrSlide(); return; }
+    if (key === "r" && !ctrl) { consume(); startMacro("rotate", "Rotate"); return; }
+    if (key === "s" && event.altKey) { consume(); startShrinkFatten(); return; }
+    if (key === "s" && !ctrl) { consume(); startMacro("scale", "Scale"); return; }
+    if (key === "e" && !ctrl && !event.altKey) { consume(); startExtrude("region"); return; }
+    if (key === "i" && !ctrl) { consume(); startInset(event.shiftKey); return; }
+    if (key === "v" && !ctrl) { consume(); doRip(false); return; }
+    if (key === "y" && !ctrl) { consume(); withSelection("Split", (value) => splitSelection(value.mesh, value.mode)); return; }
+    if (key === "p" && !ctrl) { consume(); doSeparate(); return; }
+    if (key === "f" && !ctrl && !event.altKey) { consume(); doMakeEdgeFace(); return; }
+    if (key === "j" && !ctrl) { consume(); withSelection("Connect Vertex Path", (value) => connectVertPath(value.mesh)); return; }
+    if (event.shiftKey && key === "d") { consume(); doDuplicate(); return; }
+    if (event.shiftKey && key === "n") { consume(); doRecalculate(event.ctrlKey); return; }
+    if (event.altKey && key === "n") { consume(); runOperator("Flip Normals", (value) => ({ message: `Flipped ${flipNormals(value.mesh, selected(value.mesh, "face"))} faces` })); return; }
+    if (ctrl && key === "t") { consume(); runOperator("Triangulate", (value) => ({ message: `Triangulated ${triangulateFaces(value.mesh, selected(value.mesh, "face"))} faces` })); return; }
+    if (event.altKey && key === "j") { consume(); runOperator("Tris to Quads", (value) => ({ message: `Merged ${trisToQuads(value.mesh, { faces: selected(value.mesh, "face") })} quads` })); return; }
+    if (ctrl && event.shiftKey && key === "r") { consume(); startOffsetLoop(); return; }
+    if (ctrl && key === "b") { consume(); startBevel(); return; }
+
+    // --- View -------------------------------------------------------------
+    if (event.altKey && key === "z") { consume(); toggleXray(); return; }
+    if (key === "z" && !ctrl && !event.altKey) { consume(); cycleShading(event.shiftKey); return; }
+    if (key === "f" && event.altKey) { consume(); runOperator("Fill Holes", (value) => ({ message: `Filled ${fillHoles(value.mesh).filled} holes` })); return; }
+    if (key === "." && !ctrl) { consume(); focusSelection(); return; }
+    if (key === "home") { consume(); focusGeometry(); return; }
+    if (!ctrl && !event.altKey && ["Numpad1", "Numpad3", "Numpad7", "Numpad4", "Numpad6", "Numpad9"].includes(event.code)) {
+      consume();
+      const map = { Numpad1: ["z", 1], Numpad9: ["z", -1], Numpad3: ["x", 1], Numpad7: ["x", -1], Numpad6: ["y", 1], Numpad4: ["y", -1] };
+      const [axis, sign] = map[event.code];
+      handleAxisSnap(axis, sign);
+      return;
+    }
+    if (event.key === "Tab" && embedded && onClose) { consume(); onClose(); }
+  };
+
+  /** Second key of a two-key chord. */
+  const runChord = (chord, key, event) => {
+    const shift = event.shiftKey;
+    if (chord === "delete") {
+      if (key === "v") return doDelete("verts");
+      if (key === "e") return doDelete("edges");
+      if (key === "f") return doDelete("faces");
+      if (key === "o") return doDelete("onlyFaces");
+      if (key === "d") return doDissolve("verts");
+      if (key === "g") return doDissolve("edges");
+      if (key === "s") return doDissolve("faces");
+      if (key === "l") return doDissolve("limited");
+      return setStatus("");
+    }
+    if (chord === "merge") {
+      if (key === "c") return doMerge("center");
+      if (key === "u") return doMerge("cursor");
+      if (key === "l") return doMerge("collapse");
+      if (key === "f") return doMerge("first");
+      if (key === "a") return doMerge("last");
+      if (key === "d") return doMergeByDistance();
+      return setStatus("");
+    }
+    if (chord === "extrude") {
+      if (key === "e") return startExtrude("region");
+      if (key === "i") return startExtrude("individual");
+      if (key === "n") return startExtrude("normals");
+      if (key === "v") return startExtrude("free");
+      return setStatus("");
+    }
+    if (chord === "edge") {
+      if (key === "b" && !shift) return startBevel();
+      if (key === "r") return startLoopCut();
+      if (key === "s") return doMark("seam", !shift, shift ? "Clear Seam" : "Mark Seam");
+      if (key === "h") return doMark("sharp", !shift, shift ? "Clear Sharp" : "Mark Sharp");
+      if (key === "g") return startEdgeSlide();
+      if (key === "f") return withSelection("Grid Fill", (value) => gridFill(value.mesh, selected(value.mesh, "edge")));
+      if (key === "j") return withSelection("Bridge Edge Loops", (value) => bridgeEdgeLoops(value.mesh, selected(value.mesh, "edge")));
+      return setStatus("");
+    }
+    if (chord === "vertex") {
+      if (key === "m") return doMerge("center");
+      if (key === "s") return doSmooth();
+      if (key === "r") return doRip(false);
+      if (key === "f") return doRip(true);
+      if (key === "y") return withSelection("Split", (value) => splitSelection(value.mesh, value.mode));
+      if (key === "c") return withSelection("Connect Vertex Path", (value) => connectVertPath(value.mesh));
+      return setStatus("");
+    }
+    if (chord === "face") {
+      if (key === "i") return startInset(false);
+      if (key === "e") return startExtrude("region");
+      if (key === "p") return runOperator("Poke Faces", (value) => ({ message: `Poked ${pokeFaces(value.mesh, selected(value.mesh, "face"))} faces` }));
+      if (key === "t") return runOperator("Triangulate", (value) => ({ message: `Triangulated ${triangulateFaces(value.mesh, selected(value.mesh, "face"))} faces` }));
+      if (key === "j") return runOperator("Tris to Quads", (value) => ({ message: `Merged ${trisToQuads(value.mesh, { faces: selected(value.mesh, "face") })} quads` }));
+      if (key === "s") return doShading(!shift);
+      return setStatus("");
+    }
+    if (chord === "snap") {
+      if (key === "c") return snapCursorToSelection();
+      if (key === "s") return snapSelectionToCursor();
+      if (key === "o") return resetCursorToOrigin();
+      return setStatus("");
+    }
+    if (chord === "similar") {
+      const types = SIMILAR_TYPES[sessionRef.current?.mode ?? "face"];
+      const match = types.find((entry) => entry.id[0] === key);
+      if (match) return doSelectSimilar(match.id);
+      return setStatus("");
+    }
+    return setStatus("");
+  };
+
+  const startOffsetLoop = () => {
+    const session = sessionRef.current;
+    const hit = session?.raycastAtLast?.();
+    if (!session || !hit) return;
+    const face = pickFace(session, hit);
+    const seed = face && nearestEdgeOnFace(face, hit.point);
+    if (!seed) return;
+    runOperator("Offset Edge Loop", (value) => {
+      const target = [...value.mesh.edges].find((edge) => edge.id === seed.id);
+      return target ? offsetEdgeLoop(value.mesh, target, { factor: 0.5 }) : { error: "Lost the seed edge" };
+    });
+  };
+
+  const selectLinkedUnderCursor = () => {
+    const session = sessionRef.current;
+    const hit = session?.raycastAtLast?.();
+    if (!session || !hit) return;
+    const element = pickElement(session, hit);
+    if (!element) return;
+    runSelection("Select Linked", (value) => {
+      for (const linked of linkedElements(value.mesh, element, value.mode)) linked.select = true;
+      flushSelection(value.mesh, value.mode);
+    });
+  };
+
+  /* ---------------------------------------------------------------------- */
+  /* 3D cursor                                                               */
+  /* ---------------------------------------------------------------------- */
+
+  const snapSelectionToCursor = () => runOperator("Selection to Cursor", (session) => {
+    const verts = selectedVerts(session.mesh, session.mode);
+    if (!verts.length) return { error: "Nothing selected" };
+    const target = localCursor();
+    const center = verts.reduce((sum, vert) => [sum[0] + vert.co[0], sum[1] + vert.co[1], sum[2] + vert.co[2]], [0, 0, 0]).map((value) => value / verts.length);
+    const delta = [target[0] - center[0], target[1] - center[1], target[2] - center[2]];
+    for (const vert of verts) vert.co = [vert.co[0] + delta[0], vert.co[1] + delta[1], vert.co[2] + delta[2]];
+    return { message: "Selection moved to the 3D cursor" };
+  });
+
+  const snapCursorToSelection = async () => {
+    const session = sessionRef.current;
+    if (!session) return;
+    const verts = selectedVerts(session.mesh, session.mode);
+    if (!verts.length) {
+      setStatus("Nothing selected");
+      return;
+    }
+    const center = verts.reduce((sum, vert) => [sum[0] + vert.co[0], sum[1] + vert.co[1], sum[2] + vert.co[2]], [0, 0, 0]).map((value) => value / verts.length);
+    const owner = engine.getEntity(entityId);
+    if (!owner?.object3D) return;
+    owner.object3D.updateWorldMatrix(true, false);
+    const world = new THREE.Vector3(center[0], center[1], center[2]).applyMatrix4(owner.object3D.matrixWorld);
+    setCursor3DPosition(world);
+    setStatus("3D cursor moved to the selection");
+  };
+
+  const resetCursorToOrigin = async () => {
+    const before = getCursor3D().position;
+    if (!before[0] && !before[1] && !before[2]) return;
+    const { commandBus } = await import("../commands/CommandBus.js");
+    commandBus.execute(new SetCursor3DCommand([0, 0, 0], before));
+    setStatus("3D cursor reset");
+  };
+
+  /* ---------------------------------------------------------------------- */
+  /* Texture painting                                                        */
+  /* ---------------------------------------------------------------------- */
+
+  const hexToRGB = (hex) => {
+    const value = Number.parseInt(hex.replace("#", ""), 16);
+    return [(value >> 16) & 255, (value >> 8) & 255, value & 255];
+  };
+
+  /**
+   * Creates the paint target on demand and shows it on the mesh.
+   *
+   * The layer is a plain RGBA buffer wrapped in a DataTexture, so painting
+   * writes straight into the texture's own memory and an upload is one
+   * `needsUpdate` rather than a re-encode.
+   */
+  const ensurePaintLayer = (session) => {
+    const size = session.paintResolution ?? paintResolution;
+    if (session.paintLayer && session.paintLayer.size === size) return session.paintLayer;
+    const layer = createPaintLayer(size, [230, 230, 230, 255]);
+    const texture = new THREE.DataTexture(layer.data, layer.size, layer.size, THREE.RGBAFormat);
+    texture.colorSpace = THREE.SRGBColorSpace;
+    // Left un-flipped: `flipY` on a data texture costs a full-texture blit pass
+    // on every upload, and a stroke uploads per pointer move. `paint.js` writes
+    // in texture order to match.
+    texture.flipY = false;
+    texture.needsUpdate = true;
+    session.paintTexture?.dispose?.();
+    session.paintMaterial?.dispose?.();
+    session.paintLayer = layer;
+    session.paintTexture = texture;
+    session.paintMaterial = new THREE.MeshStandardMaterial({ map: texture, roughness: 0.85, metalness: 0 });
+    // Changing the resolution mid-session builds a fresh layer, texture and
+    // material; without this the surface would keep showing the disposed one.
+    if (session.painting) session.meshObject.material = session.paintMaterial;
+    return layer;
+  };
+
+  /** Faces the brush can reach, narrowed through the sculpt spatial index. */
+  const paintFaces = (session, center) => {
+    const stroke = session.stroke;
+    const radius = session.brushRadius;
+    if (stroke?.index) {
+      const faces = new Set();
+      for (const { vert } of vertsInSphere(stroke.index, center, radius)) {
+        for (const edge of vert.edges) for (const loop of edge.loops) faces.add(loop.f);
+      }
+      // A brush smaller than the face it sits on reaches no vertex at all.
+      if (faces.size) return [...faces];
+    }
+    return facesNearBrush(session.mesh, center, radius);
+  };
+
+  const beginPaintStroke = (session, hit, modifiers) => {
+    ensurePaintLayer(session);
+    session.paintUndo = session.paintLayer.data.slice();
+    session.stroke = beginStroke(session.mesh, { radius: session.brushRadius, brush: "paint", spacing: 0.2 });
+    session.stroke.brush = "paint";
+    session.stroke.erase = modifiers.ctrl;
+    session.controls.enabled = false;
+    applyPaintAt(session, [hit.point.x, hit.point.y, hit.point.z]);
+  };
+
+  const applyPaintAt = (session, point) => {
+    const stroke = session.stroke;
+    if (!stroke) return;
+    let touched = false;
+    for (const center of strokeDabPositions(stroke, point, session.brushRadius)) {
+      const result = paintDab(session.paintLayer, paintFaces(session, center), {
+        center,
+        radius: session.brushRadius,
+        color: hexToRGB(session.paintColor ?? paintColor),
+        strength: session.brushStrength,
+        falloff: session.brushFalloff,
+        mode: stroke.erase ? "erase" : session.paintBlend ?? paintBlend,
+        baseColor: [230, 230, 230],
+      });
+      if (result.painted) touched = true;
+    }
+    if (touched) {
+      session.paintTexture.needsUpdate = true;
+      touch();
+    }
+  };
+
+  const endPaintStroke = (session) => {
+    if (!session.stroke) return;
+    session.stroke = null;
+    session.controls.enabled = true;
+    // One texel of bleed past each island, so bilinear sampling at a seam does
+    // not pull in the unpainted gutter and draw a dark line.
+    dilateEdges(session.paintLayer, 1);
+    session.paintTexture.needsUpdate = true;
+    if (session.paintUndo) {
+      session.paintHistory.push(session.paintUndo);
+      if (session.paintHistory.length > UNDO_DEPTH) session.paintHistory.shift();
+      session.paintUndo = null;
+    }
+    touch();
+  };
+
+  const undoPaintStroke = () => {
+    const session = sessionRef.current;
+    const previous = session?.paintHistory?.pop();
+    if (!previous) {
+      setStatus("Nothing to undo");
+      return;
+    }
+    session.paintLayer.data.set(previous);
+    session.paintTexture.needsUpdate = true;
+    setStatus("Undo: paint stroke");
+    touch();
+  };
+
+  /**
+   * Writes the painted layer out as a PNG beside the project's textures.
+   *
+   * It is not assigned to the material automatically: which slot it belongs in
+   * (base colour, roughness, a mask) is the user's call, and silently rewiring
+   * a shared material asset from the geometry editor would be a surprise.
+   */
+  const savePaintTexture = async () => {
+    const session = sessionRef.current;
+    if (!session?.paintLayer) {
+      setStatus("Nothing painted yet");
+      return;
+    }
+    const root = useProjectStore.getState().rootPath;
+    if (!root) {
+      setStatus("Open a project before saving a texture");
+      return;
+    }
+    try {
+      const dataURL = layerToDataURL(session.paintLayer, document);
+      const binary = atob(dataURL.split(",")[1]);
+      const bytes = new Uint8Array(binary.length);
+      for (let at = 0; at < binary.length; at++) bytes[at] = binary.charCodeAt(at);
+      const stem = (engine.getEntity(entityId)?.name ?? "Paint").replace(/[^a-z0-9 _-]/gi, "").trim() || "Paint";
+      const path = `${root}/textures/${stem} Paint.png`;
+      const { invoke } = await import("@tauri-apps/api/core");
+      await writeBinaryFile(path, bytes);
+      invalidateBlobUrl(path);
+      await useProjectStore.getState().refresh();
+      setStatus(`Saved ${path.split(/[\\/]/).pop()} — assign it in the material to use it`);
+    } catch (error) {
+      setStatus(`Could not save the texture: ${error}`);
+    }
+  };
+
+  /* ---------------------------------------------------------------------- */
+  /* Remesh                                                                  */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Rebuilds the surface at an even triangle density.
+   *
+   * Asynchronous, unlike every other operator here, because the remesher is
+   * loaded on demand and can run for a while on a dense mesh — so it takes the
+   * undo snapshot itself rather than going through `runOperator`.
+   *
+   * The remesher discards UVs and per-face materials, which is normal for a
+   * remesher but is destructive enough that the status line says so outright.
+   */
+  const doRemesh = async () => {
+    const session = sessionRef.current;
+    if (!session || session.macro || session.stroke || busy) return;
+    setBusy(true);
+    setStatus("Remeshing…");
+    try {
+      // Yield a frame first so the "Remeshing…" status actually paints before
+      // the grid work takes the thread.
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      const result = voxelRemesh(session.mesh, {
+        voxelSize: remeshDetail > 0 ? remeshDetail : suggestedVoxelSize(session.mesh),
+      });
+      if (result.error) {
+        setStatus(result.error);
+        return;
+      }
+      // Taken only once the remesh has actually succeeded, so a failure leaves
+      // no empty step in the history.
+      session.history.push({ mesh: session.mesh, mode: session.mode, label: "Remesh" });
+      if (session.history.length > UNDO_DEPTH) session.history.shift();
+      session.future.length = 0;
+      session.mesh = result.mesh;
+      session.active = null;
+      session.rebuild();
+      autosave(session);
+      setStatus(`Remeshed to ${result.faces} faces at a voxel size of ${result.voxelSize.toPrecision(3)} — UVs and material slots were reset, re-unwrap if you need them`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /* ---------------------------------------------------------------------- */
+  /* Viewport shading                                                        */
+  /* ---------------------------------------------------------------------- */
+
+  /** Blender's Z: cycle the viewport shading. */
+  const cycleShading = (backwards = false) => {
+    const order = SHADING_MODES.map((entry) => entry.id);
+    const at = order.indexOf(shading);
+    const next = order[(at + (backwards ? -1 : 1) + order.length) % order.length];
+    setShading(next);
+    setStatus(`Shading: ${SHADING_MODES.find((entry) => entry.id === next).label}`);
+  };
+
+
+  /**
+   * Blender's four viewport shading modes.
+   *
+   *   Wireframe  edges only, and you can select straight through the surface.
+   *   Solid      one neutral studio material, so topology reads clearly. This
+   *              is the edit-mode default for the same reason it is in Blender:
+   *              a dark or busy texture hides the selection overlays.
+   *   Material   the entity's real materials, lit by the editor's studio rig
+   *              plus the scene environment if one is set.
+   *   Rendered   the same materials lit by the scene's own lights.
+   *
+   * Wireframe hides the surface with a transparent material rather than
+   * `visible = false`, so raycast picking keeps working exactly as it does in
+   * the other modes.
+   */
+  const applyShading = (session, mode) => {
+    if (!session?.meshObject) return;
+    const wireframeMode = mode === "wireframe";
+    // Paint mode owns the surface: it shows the paint target, not the shading
+    // material. This effect runs after the mode effect, so without the guard it
+    // would immediately overwrite the paint material and the strokes would
+    // vanish from the viewport.
+    if (session.painting) {
+      session.shading = mode;
+      return;
+    }
+    session.meshObject.material = wireframeMode
+      ? session.wireframeMaterial
+      : mode === "solid"
+        ? session.editMaterials
+        : session.realMaterials ?? session.editMaterials;
+
+    // In wireframe the surface is invisible, so the edges have to carry the
+    // whole read of the shape and need to be brighter than the usual dark wire.
+    session.wire.material.vertexColors = !wireframeMode;
+    session.wire.material.color.setHex(wireframeMode ? 0x9aa4ad : 0xffffff);
+    session.wire.material.needsUpdate = true;
+    session.wireframeShading = wireframeMode;
+    if (wireframeMode) session.wire.visible = !session.sculpting;
+
+    session.editorLights.visible = mode !== "rendered";
+    session.sceneLights.visible = mode === "rendered";
+    // A studio environment only helps where real materials are shown; on the
+    // neutral solid material it would just wash out the shading.
+    session.scene.environment = mode === "material" || mode === "rendered" ? engine.scene.environment ?? null : null;
+    session.shading = mode;
+    refreshOverlays(session);
+  };
+
+  useEffect(() => {
+    const session = sessionRef.current;
+    if (!session) return;
+    applyShading(session, shading);
+    touch();
+  }, [shading, component, editorMode]);
+
+  /* ---------------------------------------------------------------------- */
+  /* Sculpting                                                               */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Begins a sculpt stroke. The whole drag is one undo step — Blender treats a
+   * stroke as a single action, and with dyntopo running per dab an entry per dab
+   * would both bury the history and hold a copy of the mesh for each one.
+   */
+  const beginSculptStroke = (session, hit, modifiers) => {
+    const active = modifiers.shift ? "smooth" : session.brush;
+    session.history.push({ mesh: copyMesh(session.mesh).mesh, mode: session.mode, label: `Sculpt: ${active}` });
+    if (session.history.length > UNDO_DEPTH) session.history.shift();
+    session.future.length = 0;
+    session.stroke = beginStroke(session.mesh, {
+      radius: session.brushRadius,
+      brush: active,
+      spacing: 0.3,
+    });
+    session.stroke.brush = active;
+    session.stroke.invert = modifiers.ctrl;
+    session.stroke.anchor = [hit.point.x, hit.point.y, hit.point.z];
+    session.stroke.lastPoint = [...session.stroke.anchor];
+    if (active === "grab") {
+      captureGrabWeights(session.stroke, session.stroke.anchor, session.brushRadius, session.brushFalloff);
+    }
+    session.controls.enabled = false;
+    applySculptAt(session, session.stroke.anchor);
+  };
+
+  /**
+   * Applies the dabs between the last sample and `point`.
+   *
+   * Grab is the exception to the dab model: it is one continuous pull from the
+   * stroke's anchor rather than a series of stamps, so it is applied directly
+   * with the accumulated delta instead of being interpolated along the path.
+   */
+  const applySculptAt = (session, point) => {
+    const stroke = session.stroke;
+    if (!stroke) return;
+    const kind = stroke.brush;
+    const sign = stroke.invert;
+
+    if (kind === "grab") {
+      const direction = [
+        point[0] - stroke.anchor[0],
+        point[1] - stroke.anchor[1],
+        point[2] - stroke.anchor[2],
+      ];
+      applyStrokeDab(session.mesh, {
+        type: "grab",
+        center: stroke.anchor,
+        normal: surfaceNormalAt(stroke.index, stroke.anchor, session.brushRadius) ?? [0, 0, 1],
+        radius: session.brushRadius,
+        strength: session.brushStrength,
+        falloff: session.brushFalloff,
+        invert: sign,
+        direction,
+        index: stroke.index,
+        originals: stroke.originals,
+        weights: stroke.weights,
+        symmetry: session.symmetry,
+      });
+      session.preview();
+      return;
+    }
+
+    const positions = strokeDabPositions(stroke, point, session.brushRadius);
+    if (!positions.length) return;
+    let topologyChanged = false;
+    for (const center of positions) {
+      if (session.dyntopo && kind !== "smooth") {
+        const result = dyntopoStep(session.mesh, center, session.brushRadius, session.detailSize, {
+          mode: session.dyntopoMode,
+          budget: 120,
+        });
+        if (result.changed) {
+          topologyChanged = true;
+          // Splitting and collapsing invalidates the vertex buckets.
+          refreshStroke(stroke, session.mesh, session.brushRadius);
+        }
+      }
+      const direction = [
+        center[0] - (stroke.lastPoint?.[0] ?? center[0]),
+        center[1] - (stroke.lastPoint?.[1] ?? center[1]),
+        center[2] - (stroke.lastPoint?.[2] ?? center[2]),
+      ];
+      applyStrokeDab(session.mesh, {
+        type: kind,
+        center,
+        normal: surfaceNormalAt(stroke.index, center, session.brushRadius) ?? [0, 0, 1],
+        radius: session.brushRadius,
+        strength: session.brushStrength,
+        falloff: session.brushFalloff,
+        invert: sign,
+        direction,
+        index: stroke.index,
+        symmetry: session.symmetry,
+      });
+      stroke.lastPoint = [...center];
+    }
+    // A dab that only moved vertices can take the cheap position-only refresh;
+    // dyntopo changed the index buffer, so that needs a full rebuild.
+    if (topologyChanged) session.rebuild();
+    else session.preview();
+  };
+
+  const endSculptStroke = (session) => {
+    if (!session.stroke) return;
+    session.stroke = null;
+    session.controls.enabled = true;
+    session.rebuild();
+    autosave(session);
+  };
+
+  /**
+   * Where the pointer lands on the plane through the stroke anchor facing the
+   * camera. A Grab drag routinely pulls the surface out from under the cursor,
+   * and without this the stroke would stall the moment the ray missed.
+   */
+  const pointerOnAnchorPlane = (session, event) => {
+    const stroke = session.stroke;
+    if (!stroke) return null;
+    const rect = session.canvas.getBoundingClientRect();
+    const ndc = new THREE.Vector2(
+      ((event.clientX - rect.left) / rect.width) * 2 - 1,
+      -((event.clientY - rect.top) / rect.height) * 2 + 1,
+    );
+    const raycaster = new THREE.Raycaster();
+    raycaster.setFromCamera(ndc, session.camera);
+    // The ray and the plane are world-space; the anchor and the answer are not.
+    const anchor = session.toWorldPoint(stroke.anchor);
+    const normal = session.camera.getWorldDirection(new THREE.Vector3()).negate();
+    const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(normal, anchor);
+    const point = raycaster.ray.intersectPlane(plane, new THREE.Vector3());
+    if (!point) return null;
+    const local = session.toLocalPoint(point);
+    return [local.x, local.y, local.z];
+  };
+
+  /** Projected pixel radius of the brush, for the on-screen cursor ring. */
+  const projectedBrushRadius = (session, localPoint) => {
+    const camera = session.camera;
+    const rect = session.canvas.getBoundingClientRect();
+    // The brush radius is a local-space length, so it is measured out in local
+    // space and only then projected — on a scaled object the ring would
+    // otherwise be the wrong size on screen.
+    const center = session.toWorldPoint(localPoint);
+    const right = session.toLocalDirection(new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 0)).normalize();
+    const edge = session.toWorldPoint(
+      new THREE.Vector3(localPoint[0], localPoint[1], localPoint[2]).addScaledVector(right, session.brushRadius),
+    );
+    const toScreen = (point) => {
+      const projected = point.clone().project(camera);
+      return [(projected.x + 1) * rect.width * 0.5, (-projected.y + 1) * rect.height * 0.5];
+    };
+    const [cx, cy] = toScreen(center);
+    const [ex, ey] = toScreen(edge);
+    return Math.max(Math.hypot(ex - cx, ey - cy), 3);
+  };
+
+  /* ---------------------------------------------------------------------- */
+  /* Knife                                                                   */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * The knife is modal rather than a drag macro: clicks drop points onto the
+   * surface, Enter cuts along them, Esc abandons. Points are raycast onto the
+   * mesh so each one already lies on the geometry it is going to cut.
+   */
+  const startKnife = () => {
+    const session = sessionRef.current;
+    if (!session || session.macro) return;
+    session.knife = { points: [] };
+    session.controls.enabled = false;
+    setKnifePoints([]);
+    setStatus("Knife: click to place cuts · Enter to confirm · Esc to cancel");
+  };
+
+  const cancelKnife = () => {
+    const session = sessionRef.current;
+    if (!session?.knife) return;
+    session.knife = null;
+    session.controls.enabled = true;
+    setKnifePoints(null);
+    setStatus("Knife cancelled");
+  };
+
+  const confirmKnife = () => {
+    const session = sessionRef.current;
+    const points = session?.knife?.points ?? [];
+    session.knife = null;
+    session.controls.enabled = true;
+    setKnifePoints(null);
+    if (points.length < 2) {
+      setStatus("The knife needs at least two points");
+      return;
+    }
+    runOperator("Knife", (value) => {
+      const result = knifeCut(value.mesh, points);
+      if (result.error) return result;
+      value.mode = "edge";
+      setMode("edge");
+      return { message: `Knife created ${result.edges.length} edges` };
+    });
+  };
+
+  /* ---------------------------------------------------------------------- */
+  /* View controls                                                           */
+  /* ---------------------------------------------------------------------- */
 
   const toggleXray = () => {
     const session = sessionRef.current;
@@ -1141,9 +1897,6 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
   const handleAxisSnap = (axis, sign) => {
     const session = sessionRef.current;
     if (!session) return;
-    // Toggle the snap: clicking the currently active axis returns to the
-    // free orbit so the user can always escape the snap without hunting for
-    // a separate "reset" control.
     const view = `${sign > 0 ? "+" : "-"}${axis.toUpperCase()}`;
     if (snapView === view) {
       usePerspectiveGeometryView(session);
@@ -1157,7 +1910,14 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
   const focusGeometry = () => {
     const session = sessionRef.current;
     if (!session) return;
-    frameGeometry(session);
+    frameSphere(session, meshBoundingSphere(session.mesh));
+    setSnapView(null);
+  };
+
+  const focusSelection = () => {
+    const session = sessionRef.current;
+    if (!session) return;
+    frameSphere(session, selectionBoundingSphere(session) ?? meshBoundingSphere(session.mesh));
     setSnapView(null);
   };
 
@@ -1179,844 +1939,164 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
     setSelectionGesture(null);
   };
 
-  const autosaveGeometry = (session = sessionRef.current) => {
-    if (!session || !entityId) return;
-    // Snapshot now, then serialize writes. A quick sequence of edits must not
-    // let an older asynchronous write finish after a newer one.
-    const contents = JSON.stringify(geometryAssetFromEditable(session.editable), null, 2);
-    // Update Object Mode immediately. Disk persistence and shared-asset reloads
-    // can finish afterward without making Tab-out appear to discard the edit.
-    const liveMesh = engine.getEntity(entityId)?.getComponent("mesh")?.mesh;
-    if (liveMesh) {
-      const previous = liveMesh.geometry;
-      liveMesh.geometry = bufferGeometryFromEditable(session.editable);
-      previous?.dispose?.();
-    }
-    setStatus("Autosaving geometry...");
-    saveQueueRef.current = saveQueueRef.current.catch(() => {}).then(async () => {
-      const path = await ensureGeometryAsset(entityId);
-      if (!path) throw new Error("Geometry asset is unavailable");
-      const { invoke } = await import("@tauri-apps/api/core");
-      await invoke("save_scene", { path, contents });
-      invalidateBlobUrl(path);
-      reloadGeometryUsers(path);
-      if (rootRef.current) setStatus(`Autosaved ${path.split(/[\\/]/).pop()}`);
-    }).catch((error) => {
-      if (rootRef.current) setStatus(`Autosave failed: ${error}`);
-    });
-  };
+  /* ---------------------------------------------------------------------- */
+  /* Keep session mirrors of React state                                     */
+  /* ---------------------------------------------------------------------- */
 
-  const mutate = (operation) => {
-    const session = sessionRef.current;
-    if (!session) return;
-    session.history.push({ editable: cloneEditable(session.editable), selections: cloneSelections(session.selections), hiddenEdges: new Set(session.hiddenEdges) });
-    const before = topologySnapshot(session);
-    const result = operation(session, before) ?? {};
-    applyTopology(session, before, result);
-    session.rebuild();
-    autosaveGeometry(session);
-  };
-
-  /**
-   * Blender-style "Selection to 3D Cursor" inside Edit Mode. Translates
-   * every selected vertex so that the selection's local-space centroid
-   * (or all-vertex union centroid) lands on the entity-local cursor
-   * position. The entity-local cursor is computed by inverting the
-   * entity's world matrix onto the global cursor — this matches the
-   * proxy the cursor module renders in this scene, so the visual and
-   * the math agree.
-   */
-  const snapVerticesToCursor = (geometryEditorSession) => {
-    const indices = selectedVertexIndices(geometryEditorSession);
-    if (!indices.length) return false;
-    const entity = engine.getEntity(entityId);
-    if (!entity?.object3D) return false;
-    entity.object3D.updateWorldMatrix(true, false);
-    const inverse = entity.object3D.matrixWorld.clone().invert();
-    const localTarget = new THREE.Vector3().fromArray(getCursor3D().position).applyMatrix4(inverse);
-    mutate((session) => {
-      const delta = new THREE.Vector3().copy(localTarget);
-      // Compute centroid of the indices so the entire selection lands
-      // on the cursor (matches Blender's "Selection to Cursor" — the
-      // centre of the selection lands on the cursor, not each vertex).
-      const points = indices.map((i) => new THREE.Vector3(...session.editable.positions[i]));
-      const centroid = points.reduce((sum, p) => sum.add(p), new THREE.Vector3()).multiplyScalar(1 / points.length);
-      delta.sub(centroid);
-      indices.forEach((index) => {
-        const p = session.editable.positions[index];
-        p[0] += delta.x;
-        p[1] += delta.y;
-        p[2] += delta.z;
-      });
-      session.editable.hiddenEdges = [...session.hiddenEdges].map((key) => key.split("|").map(Number));
-    });
-    return true;
-  };
-
-  /**
-   * "3D Cursor → Selected" inside Edit Mode. The cursor (local) jumps to
-   * the centroid of the current selection, both for the visual proxy and
-   * for any future "snap to cursor" operation the user queues.
-   */
-  const snapCursorToSelectedVertices = () => {
-    const session = sessionRef.current;
-    if (!session) return false;
-    const indices = selectedVertexIndices(session);
-    if (!indices.length) return false;
-    const points = indices.map((i) => new THREE.Vector3(...session.editable.positions[i]));
-    const centroid = points.reduce((sum, p) => sum.add(p), new THREE.Vector3()).multiplyScalar(1 / points.length);
-    const entity = engine.getEntity(entityId);
-    if (!entity?.object3D) return false;
-    entity.object3D.updateWorldMatrix(true, false);
-    const worldCentroid = centroid.clone().applyMatrix4(entity.object3D.matrixWorld);
-    setCursor3DPosition(worldCentroid);
-    return true;
-  };
-
-  /**
-   * "3D Cursor → Edge Midpoint" — in Edit Mode with one or more edges
-   * selected, move the cursor to the midpoint of the first selected
-   * edge. The operation is undoable so users can quickly reposition
-   * the cursor while iterating on extrude / loop-cut work.
-   */
-  const snapCursorToSelectedEdge = async () => {
-    const session = sessionRef.current;
-    if (!session) return false;
-    const edgeKeys = [...session.selections.edge];
-    if (!edgeKeys.length) return false;
-    const edges = sessionEdges(session);
-    const before = getCursor3D().position;
-    // Prefer the most-recently-added selection (Set iteration order is
-    // insertion order) so a Ctrl-click sequence picks up the last edge
-    // the user actually selected, matching how Blender treats a fresh
-    // selection after a Ctrl+click toggle.
-    const lastKey = edgeKeys[edgeKeys.length - 1];
-    const edge = edges.get(lastKey);
-    if (!edge) return false;
-    const a = session.editable.positions[edge.a];
-    const b = session.editable.positions[edge.b];
-    if (!a || !b) return false;
-    const localMid = new THREE.Vector3(
-      (a[0] + b[0]) * 0.5,
-      (a[1] + b[1]) * 0.5,
-      (a[2] + b[2]) * 0.5,
-    );
-    const entity = engine.getEntity(entityId);
-    if (!entity?.object3D) return false;
-    entity.object3D.updateWorldMatrix(true, false);
-    const world = localMid.clone().applyMatrix4(entity.object3D.matrixWorld);
-    const { commandBus } = await import("../commands/CommandBus.js");
-    commandBus.execute(new SetCursor3DCommand(world, before));
-    return true;
-  };
-
-  /**
-   * "3D Cursor → Face Center" — in Edit Mode with one or more faces
-   * selected, move the cursor to the centroid (vertex-mean) of all
-   * selected faces. Faces are summed via their vertex positions so the
-   * result follows Blender's "3D Cursor → Selected" semantics even on
-   * irregular polygons.
-   */
-  const snapCursorToSelectedFace = async () => {
-    const session = sessionRef.current;
-    if (!session) return false;
-    const faceIdxs = [...session.selections.face];
-    if (!faceIdxs.length) return false;
-    const before = getCursor3D().position;
-    let sum = new THREE.Vector3();
-    let count = 0;
-    for (const faceIndex of faceIdxs) {
-      const face = session.editable.faces[faceIndex];
-      if (!face) continue;
-      for (const vertexIndex of face) {
-        const p = session.editable.positions[vertexIndex];
-        if (!p) continue;
-        sum.x += p[0];
-        sum.y += p[1];
-        sum.z += p[2];
-        count++;
-      }
-    }
-    if (!count) return false;
-    const localCenter = sum.multiplyScalar(1 / count);
-    const entity = engine.getEntity(entityId);
-    if (!entity?.object3D) return false;
-    entity.object3D.updateWorldMatrix(true, false);
-    const world = localCenter.clone().applyMatrix4(entity.object3D.matrixWorld);
-    const { commandBus } = await import("../commands/CommandBus.js");
-    commandBus.execute(new SetCursor3DCommand(world, before));
-    return true;
-  };
-
-  /**
-   * "3D Cursor → World Origin" — shortcut for the menu entry that
-   * resets the cursor to (0,0,0). Implemented as an undoable command
-   * so Ctrl+Z brings the cursor back exactly where it was.
-   */
-  const resetCursorToWorldOrigin = async () => {
-    const before = getCursor3D().position;
-    if (before[0] === 0 && before[1] === 0 && before[2] === 0) return false;
-    const { commandBus } = await import("../commands/CommandBus.js");
-    commandBus.execute(new SetCursor3DCommand([0, 0, 0], before));
-    return true;
-  };
-
-  /**
-   * "Origin to 3D Cursor" inside Edit Mode — Blender's "Geometry to Origin"
-   * in reverse. Re-positions the entity in world space so the entity's
-   * origin lands at the 3D cursor; the editable geometry stays untouched
-   * (it's defined in local space, so the entity's transform absorbs the
-   * shift). This produces the same world-space result as moving every
-   * vertex, with a cheaper command (one transform change vs. N vertex
-   * edits).
-   */
-  const moveEntityOriginToCursor = async () => {
-    const entity = engine.getEntity(entityId);
-    if (!entity) return false;
-    const cursor = getCursor3D().position;
-    const next = {
-      ...entity.getTransform(),
-      position: [cursor[0], cursor[1], cursor[2]],
-    };
-    const [{ SetTransformCommand }, { commandBus }] = await Promise.all([
-      import("../commands/transformCommands.js"),
-      import("../commands/CommandBus.js"),
-    ]);
-    commandBus.execute(new SetTransformCommand(entity.id, next));
-    return true;
-  };
-
-  /**
-   * Add a single vertex at the (local-space) 3D cursor and select it. The
-   * user wires it up later as part of a face by switching into Edge or
-   * Face mode — the geometry editor doesn't auto-create faces from a
-   * stray vertex, matching Blender's own behaviour for "Add Vertex".
-   */
-  const addVertexAtCursor = () => {
-    const session = sessionRef.current;
-    if (!session) return false;
-    const entity = engine.getEntity(entityId);
-    if (!entity?.object3D) return false;
-    entity.object3D.updateWorldMatrix(true, false);
-    const inverse = entity.object3D.matrixWorld.clone().invert();
-    const localTarget = new THREE.Vector3().fromArray(getCursor3D().position).applyMatrix4(inverse);
-    mutate(() => {
-      const { editable } = session;
-      const newIndex = editable.positions.length;
-      editable.positions.push([localTarget.x, localTarget.y, localTarget.z]);
-      // Keep `uvs` length-aligned with `positions` so subsequent edits
-      // don't trip the (uvs.length === positions.length) invariants used
-      // by bufferGeometryFromEditable and friends. A zero-length UV is a
-      // safe default — UV unwrap repopulates it later.
-      while (editable.uvs.length < newIndex + 1) editable.uvs.push([0, 0]);
-      const key = positionKey(editable.positions[newIndex]);
-      session.selections.vertex.add(key);
-      session.selections.edge.clear();
-      session.selections.face.clear();
-    });
-    return true;
-  };
-
-  const undo = () => {
-    const session = sessionRef.current;
-    const previous = session?.history.pop();
-    if (!previous) return;
-    Object.assign(session.editable, previous.editable);
-    session.selections = previous.selections;
-    session.hiddenEdges = new Set(previous.hiddenEdges ?? []);
-    session.rebuild();
-    autosaveGeometry(session);
-  };
-
-  const startExtrude = () => {
-    const session = sessionRef.current;
-    if (!session || !session.selections[session.mode].size || session.macro) return;
-    const before = cloneEditable(session.editable);
-    const beforeSelections = cloneSelections(session.selections);
-    const beforeHidden = new Set(session.hiddenEdges);
-    const beforeTopology = topologySnapshot(session);
-    let result;
-    if (session.mode === "face") {
-      result = beginExtrudeFaces(session.editable, [...session.selections.face], session.hiddenEdges);
-      session.selections.face = new Set(result.faceIndices);
-    } else if (session.mode === "edge") {
-      const pairs = [...session.selections.edge].flatMap((key) => {
-        const edge = sessionEdges(session).get(key);
-        return edge ? [[edge.a, edge.b]] : [];
-      });
-      result = beginExtrudeEdges(session.editable, pairs);
-      session.selections.edge = new Set(result.edges.map(([a, b]) => edgeKey(session.editable, a, b)));
-    } else {
-      result = beginExtrudeVertices(session.editable, selectedVertexIndices(session));
-      session.selections.vertex = new Set(result.vertexIndices.map((index) => positionKey(session.editable.positions[index])));
-    }
-    if (!result.vertexIndices.length) return;
-    const pointer = session.lastPointer ?? { x: 0, y: 0 };
-    const positions = result.vertexIndices.map((index) => new THREE.Vector3(...session.editable.positions[index]));
-    const pivot = positions.reduce((sum, point) => sum.add(point), new THREE.Vector3()).multiplyScalar(1 / positions.length);
-    session.macro = {
-      kind: "extrude", axis: null, buffer: "", indices: result.vertexIndices, positions,
-      allPositions: session.editable.positions.map((value) => [...value]), proportional: false, radius: 1,
-      pivot,
-      normal: result.normal, edges: result.edges ?? [], free: session.mode !== "face", before, beforeSelections,
-      walls: result.walls, visiblePairs: result.visiblePairs,
-      beforeHidden, beforeTopology, beforeMode: session.mode,
-      start: { ...pointer }, current: { ...pointer },
-    };
-    session.controls.enabled = false;
-    // The extruded walls are degenerate until the drag moves them, so their
-    // hidden flags are re-derived on every preview frame, not just here.
-    applyTopology(session, beforeTopology, { visiblePairs: result.visiblePairs });
-    session.rebuild();
-    setMacroState({ kind: "extrude", axis: null, buffer: "", free: session.mode !== "face" });
-  };
-
-  const startLoopCut = () => {
-    const session = sessionRef.current;
-    const hit = session?.raycastAtLast?.();
-    if (!session || !hit || session.macro) return;
-    const face = session.editable.faces[hit.faceIndex];
-    const visible = visibleLogicalEdges(session);
-    const candidates = face.map((a, index) => [a, face[(index + 1) % 3]])
-      .filter(([a, b]) => visible.has(edgeKey(session.editable, a, b)))
-      .map(([a, b]) => {
-        const start = new THREE.Vector3(...session.editable.positions[a]);
-        const end = new THREE.Vector3(...session.editable.positions[b]);
-        const closest = new THREE.Line3(start, end).closestPointToPoint(hit.point, true, new THREE.Vector3());
-        return { start, end, distance: closest.distanceToSquared(hit.point) };
-      }).sort((a, b) => a.distance - b.distance);
-    const edge = candidates[0];
-    if (!edge) return;
-    const pointer = session.lastPointer ?? { x: 0, y: 0 };
-    const beforeMode = session.mode;
-    session.mode = "edge";
-    setMode("edge");
-    session.macro = {
-      kind: "loopcut", axis: null, buffer: "", indices: [], positions: [], edges: [],
-      edgeStart: edge.start, edgeEnd: edge.end,
-      edgeDirection: edge.end.clone().sub(edge.start).normalize(), seedFace: hit.faceIndex,
-      segments: 1, locked: false,
-      before: cloneEditable(session.editable), beforeSelections: cloneSelections(session.selections),
-      beforeHidden: new Set(session.hiddenEdges), beforeTopology: topologySnapshot(session), beforeMode,
-      pivot: new THREE.Vector3(), start: { ...pointer }, current: { ...pointer },
-    };
-    session.controls.enabled = false;
-    applyTransformMacro(session);
-    setMacroState({ kind: "loopcut", axis: null, buffer: "", segments: 1, locked: false });
-  };
-
-  const startTransform = (kind, options = {}) => {
-    const session = sessionRef.current;
-    const indices = session ? (options.indices ?? selectedVertexIndices(session)) : [];
-    if (!session || !indices.length || session.macro) return;
-    const pointer = session.lastPointer ?? { x: 0, y: 0 };
-    const positions = indices.map((index) => new THREE.Vector3(...session.editable.positions[index]));
-    const pivot = transformPivot(session, indices);
-    const edges = options.edges ?? (session.mode === "edge"
-      ? [...session.selections.edge].map((key) => {
-          const edge = sessionEdges(session).get(key);
-          return edge ? [edge.a, edge.b] : null;
-        }).filter(Boolean)
-      : []);
-    const allPositions = session.editable.positions.map((value) => [...value]);
-    const bounds = new THREE.Box3().setFromPoints(session.editable.positions.map((point) => new THREE.Vector3(...point)));
-    const radius = Math.max(bounds.getSize(new THREE.Vector3()).length() * 0.3, 0.25);
-    session.macro = {
-      kind, axis: null, buffer: "", indices, positions, allPositions, pivot, edges,
-      proportional: session.proportional, radius,
-      connected: session.proportionalConnected,
-      falloff: session.proportionalFalloff,
-      topologyDistances: proportionalTopologyDistances(session, indices),
-      individualPivots: individualTransformPivots(session, indices, pivot),
-      before: options.before ?? cloneEditable(session.editable),
-      beforeSelections: options.beforeSelections ?? cloneSelections(session.selections),
-      beforeHidden: options.beforeHidden ?? new Set(session.hiddenEdges),
-      beforeTopology: options.beforeTopology ?? topologySnapshot(session), beforeMode: session.mode,
-      start: { ...pointer }, current: { ...pointer },
-    };
-    session.controls.enabled = false;
-    setMacroState({ kind, axis: null, buffer: "", proportional: session.proportional, radius, connected: session.proportionalConnected, falloff: session.proportionalFalloff });
-  };
-
-  const duplicateGeometrySelection = () => {
-    const session = sessionRef.current;
-    if (!session || session.macro || !session.selections[session.mode].size) return;
-    const before = cloneEditable(session.editable);
-    const beforeSelections = cloneSelections(session.selections);
-    const beforeHidden = new Set(session.hiddenEdges);
-    const beforeTopology = topologySnapshot(session);
-    const selectedFaces = new Set();
-    if (session.mode === "face") {
-      session.selections.face.forEach((faceIndex) => selectedFaces.add(faceIndex));
-    } else if (session.mode === "vertex") {
-      session.editable.faces.forEach((face, faceIndex) => {
-        if (face.every((index) => session.selections.vertex.has(positionKey(session.editable.positions[index])))) selectedFaces.add(faceIndex);
-      });
-    } else {
-      // Duplicate a logical polygon when all of its visible boundary edges are selected.
-      const topology = logicalFaceTopology(session);
-      topology.groups.forEach((group) => {
-        if (group.edges.length && group.edges.every((key) => session.selections.edge.has(key))) {
-          group.faces.forEach((faceIndex) => selectedFaces.add(faceIndex));
-        }
-      });
-    }
-    const sourceIndices = new Set([...selectedFaces].flatMap((faceIndex) => session.editable.faces[faceIndex] ?? []));
-    if (session.mode === "edge") {
-      session.selections.edge.forEach((key) => {
-        const edge = sessionEdges(session).get(key);
-        if (edge) { sourceIndices.add(edge.a); sourceIndices.add(edge.b); }
-      });
-    }
-    // Vertex mode can duplicate loose vertices too; the geometry asset retains
-    // them even when no face currently references them.
-    if (!sourceIndices.size && session.mode === "vertex") {
-      session.editable.positions.forEach((position, index) => {
-        if (session.selections.vertex.has(positionKey(position))) sourceIndices.add(index);
-      });
-    }
-    if (!sourceIndices.size) return;
-    const remap = new Map();
-    sourceIndices.forEach((oldIndex) => {
-      const next = session.editable.positions.length;
-      remap.set(oldIndex, next);
-      session.editable.positions.push([...session.editable.positions[oldIndex]]);
-      if (session.editable.uvs.length) session.editable.uvs.push([...(session.editable.uvs[oldIndex] ?? [0, 0])]);
-    });
-    const duplicateFaces = [];
-    selectedFaces.forEach((faceIndex) => {
-      const face = session.editable.faces[faceIndex];
-      if (!face?.every((index) => remap.has(index))) return;
-      duplicateFaces.push(session.editable.faces.length);
-      session.editable.faces.push(face.map((index) => remap.get(index)));
-      session.editable.faceMaterials.push(session.editable.faceMaterials[faceIndex] ?? 0);
-      face.forEach((a, edge) => {
-        const b = face[(edge + 1) % 3];
-        if (beforeHidden.has(indexEdgeKey(a, b))) session.hiddenEdges.add(indexEdgeKey(remap.get(a), remap.get(b)));
-      });
-    });
-    const duplicateIndices = [...remap.values()];
-    if (session.mode === "face") session.selections.face = new Set(duplicateFaces);
-    if (session.mode === "vertex") session.selections.vertex = new Set(duplicateIndices.map((index) => positionKey(session.editable.positions[index])));
-    let duplicateEdges = [];
-    if (session.mode === "edge") {
-      duplicateEdges = [...session.selections.edge].flatMap((key) => {
-        const edge = sessionEdges(session).get(key);
-        return edge && remap.has(edge.a) && remap.has(edge.b) ? [[remap.get(edge.a), remap.get(edge.b)]] : [];
-      });
-      session.selections.edge = new Set(duplicateEdges.map(([a, b]) => edgeKey(session.editable, a, b)));
-      const faceEdgeKeys = new Set(duplicateFaces.flatMap((faceIndex) => {
-        const face = session.editable.faces[faceIndex];
-        return face.map((a, edge) => edgeKey(session.editable, a, face[(edge + 1) % 3]));
-      }));
-      session.editable.looseEdges ??= [];
-      duplicateEdges.forEach(([a, b]) => {
-        if (!faceEdgeKeys.has(edgeKey(session.editable, a, b))) session.editable.looseEdges.push([a, b]);
-      });
-    }
-    session.rebuild();
-    startTransform("translate", {
-      indices: duplicateIndices,
-      edges: duplicateEdges,
-      before,
-      beforeSelections,
-      beforeHidden,
-      beforeTopology,
-    });
-  };
-
-  const cancelTransform = () => {
-    const session = sessionRef.current;
-    if (!session?.macro) return;
-    Object.assign(session.editable, cloneEditable(session.macro.before));
-    session.selections = cloneSelections(session.macro.beforeSelections);
-    session.hiddenEdges = new Set(session.macro.beforeHidden ?? []);
-    session.mode = session.macro.beforeMode ?? session.mode;
-    setMode(session.mode);
-    session.macro = null;
-    session.controls.enabled = true;
-    session.rebuild();
-    setMacroState(null);
-  };
-
-  const commitTransform = () => {
-    const session = sessionRef.current;
-    if (!session?.macro) return;
-    session.history.push({ editable: session.macro.before, selections: session.macro.beforeSelections, hiddenEdges: session.macro.beforeHidden ?? new Set() });
-    session.macro = null;
-    session.controls.enabled = true;
-    session.rebuild();
-    setMacroState(null);
-    autosaveGeometry(session);
-  };
-
-  const selectAll = () => {
-    const session = sessionRef.current;
-    if (!session) return;
-    if (session.mode === "face") session.selections.face = new Set(session.editable.faces.map((_, index) => index));
-    if (session.mode === "edge") session.selections.edge = new Set(visibleLogicalEdges(session).keys());
-    if (session.mode === "vertex") session.selections.vertex = new Set(session.editable.positions.map(positionKey));
-    refreshOverlays(session);
-    setRevision((value) => value + 1);
-  };
-
-  const allSelection = (session) => {
-    if (session.mode === 'face') return new Set(session.editable.faces.map((_, index) => index));
-    if (session.mode === 'edge') return new Set(visibleLogicalEdges(session).keys());
-    return new Set((session.cachedVertices ?? new Map(session.editable.positions.map((position) => [positionKey(position), position]))).keys());
-  };
-
-  const expandedSelection = (session, source) => {
-    const expanded = new Set(source);
-    const edges = sessionEdges(session);
-    if (session.mode === 'vertex') {
-      edges.forEach((edge) => {
-        const a = positionKey(session.editable.positions[edge.a]);
-        const b = positionKey(session.editable.positions[edge.b]);
-        if (source.has(a) || source.has(b)) { expanded.add(a); expanded.add(b); }
-      });
-    } else if (session.mode === 'edge') {
-      const vertices = new Set();
-      source.forEach((key) => {
-        const edge = edges.get(key);
-        if (edge) { vertices.add(positionKey(session.editable.positions[edge.a])); vertices.add(positionKey(session.editable.positions[edge.b])); }
-      });
-      edges.forEach((edge, key) => {
-        if (edge.hiddenDiagonal) return;
-        if (vertices.has(positionKey(session.editable.positions[edge.a])) || vertices.has(positionKey(session.editable.positions[edge.b]))) expanded.add(key);
-      });
-    } else {
-      const selectedEdges = new Set();
-      source.forEach((faceIndex) => {
-        const face = session.editable.faces[faceIndex];
-        if (!face) return;
-        for (let edge = 0; edge < 3; edge++) selectedEdges.add(edgeKey(session.editable, face[edge], face[(edge + 1) % 3]));
-      });
-      session.editable.faces.forEach((face, faceIndex) => {
-        if (source.has(faceIndex)) return;
-        const adjacent = face.some((vertex, edge) => selectedEdges.has(edgeKey(session.editable, vertex, face[(edge + 1) % 3])));
-        if (adjacent) logicalFaceGroup(session, faceIndex).forEach((index) => expanded.add(index));
-      });
-    }
-    return expanded;
-  };
-
-  const selectMore = () => {
-    const session = sessionRef.current;
-    if (!session) return;
-    session.selections[session.mode] = expandedSelection(session, session.selections[session.mode]);
-    refreshOverlays(session);
-    setRevision((value) => value + 1);
-  };
-
-  const selectLess = () => {
-    const session = sessionRef.current;
-    if (!session) return;
-    const all = allSelection(session);
-    const unselected = new Set([...all].filter((key) => !session.selections[session.mode].has(key)));
-    const expandedUnselected = expandedSelection(session, unselected);
-    session.selections[session.mode] = new Set([...all].filter((key) => !expandedUnselected.has(key)));
-    refreshOverlays(session);
-    setRevision((value) => value + 1);
-  };
-
-  const invertSelection = () => {
-    const session = sessionRef.current;
-    if (!session) return;
-    const selection = session.selections[session.mode];
-    session.selections[session.mode] = new Set([...allSelection(session)].filter((key) => !selection.has(key)));
-    refreshOverlays(session);
-    setRevision((value) => value + 1);
-  };
-
-  const deleteSelection = () => mutate((session) => {
-    const remove = new Set();
-    if (session.mode === "face") session.selections.face.forEach((index) => remove.add(index));
-    session.editable.faces.forEach((face, faceIndex) => {
-      if (session.mode === "vertex" && face.some((index) => session.selections.vertex.has(positionKey(session.editable.positions[index])))) remove.add(faceIndex);
-      if (session.mode === "edge") {
-        for (let edge = 0; edge < 3; edge++) {
-          if (session.selections.edge.has(edgeKey(session.editable, face[edge], face[(edge + 1) % 3]))) remove.add(faceIndex);
-        }
-      }
-    });
-    if (session.mode === "edge") {
-      session.editable.looseEdges = (session.editable.looseEdges ?? []).filter(([a, b]) => !session.selections.edge.has(edgeKey(session.editable, a, b)));
-    }
-    deleteFaces(session.editable, [...remove]);
-    session.selections = { vertex: new Set(), edge: new Set(), face: new Set() };
-  });
-
-  const mergeSelection = () => mutate((session) => {
-    const indices = selectedVertexIndices(session);
-    mergeVerticesAtCenter(session.editable, indices);
-    session.selections = { vertex: new Set(), edge: new Set(), face: new Set() };
-    if (indices.length) session.selections.vertex.add(positionKey(session.editable.positions[indices[0]]));
-    session.mode = 'vertex';
-    setMode('vertex');
-  });
-
-  const startBevel = () => {
-    const session = sessionRef.current;
-    if (!session || session.mode !== "edge" || !session.selections.edge.size || session.macro) return;
-    const pointer = session.lastPointer ?? { x: 0, y: 0 };
-    session.macro = {
-      kind: "bevel", axis: null, buffer: "", edgeKeys: [...session.selections.edge], segments: 1,
-      initialAmount: 0.08, amount: 0.08,
-      before: cloneEditable(session.editable), beforeSelections: cloneSelections(session.selections),
-      beforeHidden: new Set(session.hiddenEdges), beforeTopology: topologySnapshot(session), beforeMode: session.mode,
-      start: { ...pointer }, current: { ...pointer },
-    };
-    session.controls.enabled = false;
-    applyTransformMacro(session);
-    setMacroState({ kind: "bevel", axis: null, buffer: "", amount: 0.08, segments: 1 });
-  };
-
-  const subdivideSelection = () => mutate((session, before) => {
-    const selectedFaces = new Set();
-    const selection = session.selections[session.mode];
-    const wasFaceMode = session.mode === "face";
-    if (selection.size) {
-      session.editable.faces.forEach((face, faceIndex) => {
-        if (session.mode === "face" && selection.has(faceIndex)) selectedFaces.add(faceIndex);
-        if (session.mode === "vertex" && face.some((index) => selection.has(positionKey(session.editable.positions[index])))) selectedFaces.add(faceIndex);
-        if (session.mode === "edge" && face.some((a, edge) => selection.has(edgeKey(session.editable, a, face[(edge + 1) % 3])))) selectedFaces.add(faceIndex);
-      });
-    }
-    const result = subdivideFaces(session.editable, [...selectedFaces], before.hidden, cuts);
-    // Blender leaves the subdivided region selected so cuts can be stacked.
-    session.selections = { vertex: new Set(), edge: new Set(), face: new Set() };
-    if (wasFaceMode && selectedFaces.size) session.selections.face = new Set(result.faceIndices);
-    setStatus(`Subdivided ${selectedFaces.size ? `${result.faceCount} selected faces` : "whole mesh"}${cuts > 1 ? ` (${cuts} cuts)` : ""}`);
-    return { hidden: new Set(result.hiddenKeys) };
-  });
-
-  const startInset = () => {
-    const session = sessionRef.current;
-    if (!session || session.mode !== "face" || !session.selections.face.size || session.macro) return;
-    const pointer = session.lastPointer ?? { x: 0, y: 0 };
-    session.macro = {
-      kind: "inset", axis: null, buffer: "", amount: 0.001,
-      faceIndices: [...session.selections.face],
-      before: cloneEditable(session.editable), beforeSelections: cloneSelections(session.selections),
-      beforeHidden: new Set(session.hiddenEdges), beforeTopology: topologySnapshot(session), beforeMode: session.mode,
-      start: { ...pointer }, current: { ...pointer },
-    };
-    session.controls.enabled = false;
-    applyTransformMacro(session);
-    setMacroState({ kind: "inset", axis: null, buffer: "", amount: session.macro.amount });
-  };
-
-  const assignMaterial = () => mutate((session) => {
-    if (session.mode !== 'face' || !session.selections.face.size) return;
-    assignFaceMaterial(session.editable, [...session.selections.face], faceMaterial);
-  });
-
-  const flipSelectedFaceNormals = () => {
-    const session = sessionRef.current;
-    if (!session || session.mode !== "face" || !session.selections.face.size || session.macro) return;
-    const count = session.selections.face.size;
-    mutate((value) => flipFaces(value.editable, value.selections.face));
-    setStatus(`Flipped ${count} face${count === 1 ? "" : "s"}`);
-  };
-
-  const selectedEdgePairs = (session) => [...session.selections.edge].flatMap((key) => {
-    const edge = sessionEdges(session).get(key);
-    return edge ? [[edge.a, edge.b]] : [];
-  });
-
-  const bridgeSelectedEdges = () => {
-    const session = sessionRef.current;
-    if (!session || session.mode !== "edge" || !session.selections.edge.size || session.macro) return;
-    const candidate = cloneEditable(session.editable);
-    const result = bridgeEdgeLoops(candidate, selectedEdgePairs(session));
-    if (result.error) { setStatus(result.error); return; }
-    mutate((value, before) => {
-      Object.assign(value.editable, candidate);
-      return { hidden: new Set([...before.hidden, ...result.hiddenKeys]) };
-    });
-    setStatus(`Bridged edge loops with ${result.faceIndices.length / 2} quads`);
-  };
-
-  const gridFillSelectedEdges = () => {
-    const session = sessionRef.current;
-    if (!session || session.mode !== "edge" || !session.selections.edge.size || session.macro) return;
-    const candidate = cloneEditable(session.editable);
-    const result = gridFillEdges(candidate, selectedEdgePairs(session));
-    if (result.error) { setStatus(result.error); return; }
-    mutate((value, before) => {
-      Object.assign(value.editable, candidate);
-      return { hidden: new Set([...before.hidden, ...result.hiddenKeys]) };
-    });
-    setStatus(`Grid filled boundary with ${result.faceIndices.length / 2} quads`);
-  };
-
-  const mirrorSelection = (axis) => mutate((session) => {
-    const indices = selectedVertexIndices(session);
-    if (!indices.length) return;
-    const logicalPoints = new Map(indices.map((index) => [positionKey(session.editable.positions[index]), session.editable.positions[index]]));
-    const pivot = [...logicalPoints.values()].reduce((sum, point) => sum.add(new THREE.Vector3(...point)), new THREE.Vector3())
-      .multiplyScalar(1 / logicalPoints.size).toArray();
-    mirrorVertices(session.editable, indices, axis, pivot);
-    session.selections = { vertex: new Set(), edge: new Set(), face: new Set() };
-  });
-
-  const handleKeyDown = (event) => {
-    if (!sessionRef.current?.macro && event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey && event.key.toLowerCase() === "d") {
-      event.preventDefault();
-      duplicateGeometrySelection();
-      return;
-    }
-    if (event.target.closest("input, textarea, select")) return;
-    // Edit mode owns its keyboard grammar. Prevent scene-level Delete,
-    // duplicate, visibility and undo shortcuts from running as well.
-    event.stopPropagation();
-    if (sessionRef.current?.awaitingMirror) {
-      const axis = event.key.toLowerCase();
-      event.preventDefault();
-      sessionRef.current.awaitingMirror = false;
-      setStatus('');
-      if (['x', 'y', 'z'].includes(axis)) mirrorSelection(axis);
-      return;
-    }
-    if (!sessionRef.current?.macro && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'm') {
-      event.preventDefault();
-      if (sessionRef.current) sessionRef.current.awaitingMirror = true;
-      setStatus('Mirror: choose X, Y, or Z');
-      return;
-    }
-    if (!sessionRef.current?.macro && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'b') {
-      event.preventDefault();
-      startBevel();
-      return;
-    }
-    if (!sessionRef.current?.macro && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'i') {
-      event.preventDefault();
-      invertSelection();
-      return;
-    }
-    if (!sessionRef.current?.macro && (event.ctrlKey || event.metaKey) && (event.code === 'NumpadAdd' || event.code === 'Equal' || event.key === '+')) {
-      event.preventDefault();
-      selectMore();
-      return;
-    }
-    if (!sessionRef.current?.macro && (event.ctrlKey || event.metaKey) && (event.code === 'NumpadSubtract' || event.code === 'Minus' || event.key === '-')) {
-      event.preventDefault();
-      selectLess();
-      return;
-    }
-    if (!sessionRef.current?.macro && !event.ctrlKey && !event.metaKey && event.key.toLowerCase() === 'i' && mode === 'face') {
-      event.preventDefault();
-      startInset();
-      return;
-    }
-    if (!sessionRef.current?.macro && event.altKey && !event.ctrlKey && !event.metaKey && event.key.toLowerCase() === "n" && mode === "face") {
-      event.preventDefault();
-      flipSelectedFaceNormals();
-      return;
-    }
-    if (!sessionRef.current?.macro && event.key.toLowerCase() === 'm') {
-      event.preventDefault();
-      mergeSelection();
-      return;
-    }
-    // Shift+S in Edit Mode → 3D-cursor snap menu (selection → cursor
-    // and cursor → selection, but applied to the editable mesh rather
-    // than world-space entities). Falls through to the global snap menu
-    // when the editor isn't focused so plain Shift+S still reaches the
-    // viewport handlers, but inside the editor we use the local-space
-    // variants instead.
-    if (!sessionRef.current?.macro && event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey && event.key.toLowerCase() === "s") {
-      event.preventDefault();
-      setStatus("Shift+S: use the Cursor menu in the toolbar.");
-      return;
-    }
-    const activeMacro = sessionRef.current?.macro;
-    if (activeMacro) {
-      const key = event.key.toLowerCase();
-      if (key === "escape") { event.preventDefault(); cancelTransform(); return; }
-      if (key === "enter" || key === " ") { event.preventDefault(); commitTransform(); return; }
-      if (activeMacro.kind === "loopcut") return;
-      if (["bevel", "inset"].includes(activeMacro.kind) && !/^[0-9.]$/.test(key) && key !== "backspace") return;
-      if (key === "o") {
-        event.preventDefault();
-        activeMacro.proportional = !activeMacro.proportional;
-        sessionRef.current.proportional = activeMacro.proportional;
-        setProportional(activeMacro.proportional);
-        applyTransformMacro(sessionRef.current);
-        setMacroState({ kind: activeMacro.kind, axis: activeMacro.axis, buffer: activeMacro.buffer, free: activeMacro.free, proportional: activeMacro.proportional, radius: activeMacro.radius });
-        return;
-      }
-      if (["x", "y", "z"].includes(key)) {
-        event.preventDefault();
-        activeMacro.axis = activeMacro.axis === key ? null : key;
-        applyTransformMacro(sessionRef.current);
-        setMacroState({ kind: activeMacro.kind, axis: activeMacro.axis, buffer: activeMacro.buffer, free: activeMacro.free, amount: activeMacro.amount, segments: activeMacro.segments });
-        return;
-      }
-      if (key === "backspace") {
-        event.preventDefault();
-        activeMacro.buffer = activeMacro.buffer.slice(0, -1);
-        applyTransformMacro(sessionRef.current);
-        setMacroState({ kind: activeMacro.kind, axis: activeMacro.axis, buffer: activeMacro.buffer, free: activeMacro.free, amount: activeMacro.amount, segments: activeMacro.segments });
-        return;
-      }
-      if (/^[0-9.-]$/.test(key)) {
-        if (key === "-" && activeMacro.buffer) return;
-        if (key === "." && activeMacro.buffer.includes(".")) return;
-        event.preventDefault();
-        activeMacro.buffer += key;
-        applyTransformMacro(sessionRef.current);
-        setMacroState({ kind: activeMacro.kind, axis: activeMacro.axis, buffer: activeMacro.buffer, free: activeMacro.free, amount: activeMacro.amount, segments: activeMacro.segments });
-      }
-      return;
-    }
-    if (event.key.toLowerCase() === "escape" && (sessionRef.current?.selectionTool || sessionRef.current?.selectionGesture)) { event.preventDefault(); cancelSelectionTool(); return; }
-    if (event.key.toLowerCase() === "b") { event.preventDefault(); armSelectionTool("box"); return; }
-    if (event.key.toLowerCase() === "c") { event.preventDefault(); armSelectionTool("circle"); return; }
-    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "r") { event.preventDefault(); startLoopCut(); return; }
-    if (event.ctrlKey && event.key.toLowerCase() === "z") { event.preventDefault(); undo(); return; }
-    if (["1", "2", "3"].includes(event.key)) { event.preventDefault(); changeMode(MODES[Number(event.key) - 1]); return; }
-    if (event.key.toLowerCase() === "a") { event.preventDefault(); event.altKey ? clearSelection() : selectAll(); return; }
-    if (event.key.toLowerCase() === "o") { event.preventDefault(); toggleProportional(); return; }
-    if (event.altKey && event.key.toLowerCase() === "z") { event.preventDefault(); toggleXray(); return; }
-    if (event.key.toLowerCase() === "f" && !event.ctrlKey && !event.metaKey && !event.altKey) { event.preventDefault(); focusGeometry(); return; }
-    // Numpad axis views. The number keys (1/2/3) already select modes, so
-    // Numpad1/3/7 give a non-conflicting bind. Clicking the same axis again
-    // exits the snap back to free orbit.
-    if (!event.ctrlKey && !event.metaKey && !event.altKey && (event.code === "Numpad1" || event.code === "Numpad3" || event.code === "Numpad7" || event.code === "Numpad4" || event.code === "Numpad6" || event.code === "Numpad9")) {
-      event.preventDefault();
-      const map = {
-        Numpad1: ["z", 1], Numpad9: ["z", -1],
-        Numpad3: ["x", 1], Numpad7: ["x", -1],
-        Numpad6: ["y", 1], Numpad4: ["y", -1],
-      };
-      const [axis, sign] = map[event.code];
-      handleAxisSnap(axis, sign);
-      return;
-    }
-    if (event.key === "Tab" && embedded && onClose) { event.preventDefault(); onClose(); return; }
-    if (event.key.toLowerCase() === "e") { event.preventDefault(); startExtrude(); return; }
-    if (event.key.toLowerCase() === "u") { event.preventDefault(); mutate((session) => unwrapBox(session.editable)); }
-    if (event.key.toLowerCase() === "g") { event.preventDefault(); startTransform("translate"); }
-    if (event.key.toLowerCase() === "r") { event.preventDefault(); startTransform("rotate"); }
-    if (event.key.toLowerCase() === "s") { event.preventDefault(); startTransform("scale"); }
-    if (event.key.toLowerCase() === "x") { event.preventDefault(); deleteSelection(); }
-    if (event.key === "Delete" || event.key === "Backspace") { event.preventDefault(); deleteSelection(); }
-  };
-
-  // Consume Ctrl+R in the native capture phase. This runs before the webview's
-  // reload shortcut and before React bubbling, so Edit Mode always owns it.
   useEffect(() => {
-    const captureGeometryShortcuts = (event) => {
+    const session = sessionRef.current;
+    if (!session) return;
+    Object.assign(session, {
+      proportional,
+      proportionalConnected,
+      falloff,
+      pivot,
+      orientation,
+      snapEnabled,
+      snapMode,
+      snapIncrement,
+      snapRadius: Math.max(snapIncrement * 2, 0.2),
+      brush,
+      brushRadius,
+      brushStrength,
+      brushFalloff,
+      symmetry,
+      dyntopo,
+      detailSize,
+      dyntopoMode,
+      // The pointer handlers are bound once, on mount, so they hold the very
+      // first render's closures. Anything a stroke reads has to come through
+      // the session or it is frozen at its initial value — which is why the
+      // brush painted the default red whatever the colour swatch said.
+      paintColor,
+      paintBlend,
+      paintResolution,
+    });
+  }, [proportional, proportionalConnected, falloff, pivot, orientation, snapEnabled, snapMode, snapIncrement,
+    brush, brushRadius, brushStrength, brushFalloff, symmetry, dyntopo, detailSize, dyntopoMode,
+    paintColor, paintBlend, paintResolution]);
+
+  /** Sculpting hides the edit overlays, so the session needs to know the mode. */
+  useEffect(() => {
+    const session = sessionRef.current;
+    if (!session) return;
+    session.painting = editorMode === "paint";
+    // Paint mode hides the edit overlays for the same reason sculpt does, and
+    // shows the paint target instead of whatever shading mode is selected.
+    session.sculpting = editorMode === "sculpt" || editorMode === "paint";
+    if (session.painting) {
+      ensurePaintLayer(session);
+      session.meshObject.material = session.paintMaterial;
+    } else if (session.paintMaterial) {
+      applyShading(session, shading);
+    }
+    if (session.sculpting) {
+      session.macro = null;
+      session.knife = null;
+      setMacroState(null);
+      setKnifePoints(null);
+      // A sensible detail size depends on the model, not on a fixed number.
+      const average = averageEdgeLength(session.mesh);
+      if (average > 0) {
+        setDetailSize((current) => (current > average * 2 || current < average * 0.05 ? +(average * 0.5).toFixed(4) : current));
+      }
+    } else {
+      setBrushCursor(null);
+    }
+    refreshOverlays(session);
+    touch();
+  }, [editorMode, component, paintResolution]);
+
+  /**
+   * Publishes the toolbar's measured height so the axis gizmo can sit below it.
+   * The toolbar is a floating overlay that wraps to more rows on a narrow
+   * panel, so its height is not something CSS can assume.
+   */
+  useEffect(() => {
+    const toolbar = toolbarRef.current;
+    const root = rootRef.current;
+    if (!toolbar || !root) return undefined;
+    const observer = new ResizeObserver(([entry]) => {
+      root.style.setProperty("--geometry-toolbar-height", `${Math.round(entry.contentRect.height)}px`);
+    });
+    observer.observe(toolbar);
+    return () => observer.disconnect();
+  }, [component, mode]);
+
+  /**
+   * Makes the scrolling header behave: a wheel over it scrolls sideways (as it
+   * does over Blender's), and the menus are placed as fixed-position elements.
+   *
+   * The placement is not cosmetic. A `position: absolute` popover inside an
+   * `overflow-x: auto` box is clipped by it — and because CSS refuses to
+   * scroll one axis while overflowing the other, `overflow-y` resolves to auto
+   * too, so every dropdown would be cut off a few pixels below its button. A
+   * `toggle` event does not bubble, but it is still seen by a CAPTURING
+   * listener on the way down, so one handler here covers every menu.
+   */
+  useEffect(() => {
+    const toolbar = toolbarRef.current;
+    const scroller = toolbarScrollRef.current;
+    if (!toolbar || !scroller) return undefined;
+
+    const place = (details) => {
+      const popover = details.querySelector(".geometry-toolbar-popover");
+      const summary = details.querySelector("summary");
+      if (!popover || !summary) return;
+      const anchor = summary.getBoundingClientRect();
+      // Measured at the origin first: reading a size while the element still
+      // carries the previous open's coordinates can push it off-screen and
+      // shrink it against the viewport edge.
+      popover.style.left = "0px";
+      popover.style.top = "0px";
+      const size = popover.getBoundingClientRect();
+      popover.style.left = `${Math.max(6, Math.min(anchor.left, window.innerWidth - size.width - 6))}px`;
+      popover.style.top = `${Math.min(anchor.bottom + 6, window.innerHeight - size.height - 6)}px`;
+    };
+    const reposition = () => {
+      for (const details of toolbar.querySelectorAll(".geometry-toolbar-menu[open]")) place(details);
+    };
+    const onToggle = (event) => {
+      const details = event.target;
+      if (details?.matches?.(".geometry-toolbar-menu") && details.open) place(details);
+    };
+    const onWheel = (event) => {
+      if (scroller.scrollWidth <= scroller.clientWidth) return;
+      const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
+      if (!delta) return;
+      scroller.scrollLeft += delta;
+      event.preventDefault();
+    };
+
+    toolbar.addEventListener("toggle", onToggle, true);
+    scroller.addEventListener("scroll", reposition);
+    scroller.addEventListener("wheel", onWheel, { passive: false });
+    window.addEventListener("resize", reposition);
+    return () => {
+      toolbar.removeEventListener("toggle", onToggle, true);
+      scroller.removeEventListener("scroll", reposition);
+      scroller.removeEventListener("wheel", onWheel);
+      window.removeEventListener("resize", reposition);
+    };
+  }, []);
+
+  // Ctrl+R must be claimed in the capture phase, ahead of the webview's reload.
+  useEffect(() => {
+    const capture = (event) => {
       if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== "r") return;
+      if (!sessionRef.current) return;
       event.preventDefault();
       event.stopImmediatePropagation();
-      startLoopCut();
+      if (event.shiftKey) startOffsetLoop();
+      else startLoopCut();
     };
-    window.addEventListener("keydown", captureGeometryShortcuts, true);
-    return () => window.removeEventListener("keydown", captureGeometryShortcuts, true);
+    window.addEventListener("keydown", capture, true);
+    return () => window.removeEventListener("keydown", capture, true);
   }, [entityId]);
+
+  /* ---------------------------------------------------------------------- */
+  /* Scene setup                                                             */
+  /* ---------------------------------------------------------------------- */
 
   useEffect(() => {
     const host = hostRef.current;
@@ -2025,104 +2105,168 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
     let renderer;
     let frame = 0;
     let resizeObserver;
+
     const canvas = document.createElement("canvas");
     canvas.className = "geometry-editor-canvas";
     canvas.tabIndex = 0;
     host.replaceChildren(canvas);
+
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x282828);
     let camera = new THREE.PerspectiveCamera(50, 1, 0.01, 1000);
     const perspectiveCamera = camera;
     const controls = new OrbitControls(camera, canvas);
     controls.enableDamping = true;
-    // Match the main editor viewport. Geometry editing changes the mesh
-    // interaction, but camera navigation must remain consistent everywhere.
     controls.dampingFactor = 0.12;
-    scene.add(new THREE.HemisphereLight(0xdcecff, 0x26301f, 2.2));
-    const light = new THREE.DirectionalLight(0xffffff, 2.5);
-    light.position.set(3, 5, 4);
-    scene.add(light);
+    // Two lighting rigs: the neutral studio pair used by Solid and Material
+    // Preview, and clones of the scene's own lights used by Rendered.
+    const editorLights = new THREE.Group();
+    editorLights.add(new THREE.HemisphereLight(0xdcecff, 0x26301f, 2.2));
+    const keyLight = new THREE.DirectionalLight(0xffffff, 2.5);
+    keyLight.position.set(3, 5, 4);
+    editorLights.add(keyLight);
+    scene.add(editorLights);
+
+    const sceneLights = new THREE.Group();
+    sceneLights.visible = false;
+    scene.add(sceneLights);
+    // The grid is the world's ground plane, not something under the object.
     const grid = new THREE.GridHelper(10, 20, 0x4a5965, 0x283039);
-    grid.position.y = -0.501;
+    grid.position.y = -0.001;
     scene.add(grid);
 
+    // Edit mode leaves the object where it is, as Blender does.
+    //
+    // This scene used to be built in the entity's *local* space: every light
+    // and every surrounding mesh was multiplied by the inverse of the entity's
+    // world matrix so the edited object could sit at the origin, axis-aligned.
+    // Geometrically that is the same picture, but it is the wrong one to show —
+    // rotate an object and the entire world appeared to swing around it, the
+    // ground tilting under your feet, because the object was being forced back
+    // into the standard position instead of the camera staying put.
+    //
+    // Now the object is drawn at its own world transform and everything around
+    // it is left alone. The kernel still works in local coordinates, so world
+    // and local are converted between at the boundaries — see `toLocalPoint`
+    // and friends below.
     const context = new THREE.Group();
     context.visible = showSceneContext;
     context.userData.sceneContext = true;
     scene.add(context);
     engine.scene.updateMatrixWorld(true);
     entity.object3D.updateWorldMatrix(true, false);
-    const toLocal = entity.object3D.matrixWorld.clone().invert();
     engine.scene.traverse((source) => {
+      if (source.isLight && !hasEditorOnlyAncestor(source)) {
+        const clone = source.clone();
+        clone.matrixAutoUpdate = false;
+        clone.matrix.copy(source.matrixWorld);
+        sceneLights.add(clone);
+        return;
+      }
       if (!source.isMesh || source === component.mesh || !source.visible || hasEditorOnlyAncestor(source)) return;
-      const material = new THREE.MeshStandardMaterial({
-        color: 0x687078,
-        roughness: 0.9,
-        metalness: 0,
-        transparent: true,
-        opacity: 0.38,
-        depthWrite: true,
-      });
+      const material = new THREE.MeshStandardMaterial({ color: 0x687078, roughness: 0.9, metalness: 0, transparent: true, opacity: 0.38, depthWrite: true });
       const clone = new THREE.Mesh(source.geometry, material);
       clone.userData.sharedGeometry = true;
       clone.matrixAutoUpdate = false;
-      clone.matrix.copy(toLocal).multiply(source.matrixWorld);
+      clone.matrix.copy(source.matrixWorld);
       context.add(clone);
     });
 
-    // 3D cursor (world → entity-local). The cursor's *world* position is
-    // managed by the editor's primary proxy; here we mirror it into the
-    // detached scene so the user sees the cursor inside Edit Mode too.
-    // The mapping uses the entity's inverse world matrix so that working
-    // on a parented mesh still places the cursor relative to the mesh's
-    // own origin, matching Blender's behaviour in object-mode previews.
-    const localCursorTarget = new THREE.Vector3();
-    attachCursor(scene, {
-      localTransform: () => {
-        entity.object3D.updateWorldMatrix(true, false);
-        localCursorTarget.fromArray(getCursor3D().position).applyMatrix4(entity.object3D.matrixWorld.clone().invert());
-        return localCursorTarget;
-      },
-    });
+    // The editor's scene is world-space now, so the cursor proxy mirrors the
+    // world position straight through instead of being pulled into the
+    // entity's local frame.
+    const cursorWorld = new THREE.Vector3();
+    attachCursor(scene, { localTransform: () => cursorWorld.fromArray(getCursor3D().position) });
 
-    const original = editableFromBufferGeometry(component.mesh.geometry);
-    const editable = cloneEditable(original);
-    // Blender's Edit Mode uses a neutral solid viewport independent of the
-    // object's material. Keep the topology readable while editing UVs and
-    // geometry, and never let a runtime texture obscure the selection cues.
-    // Material slots remain intact, but Edit Mode uses one neutral surface
-    // colour. Selection overlays, rather than material groups, communicate
-    // which logical polygon is active.
+    // NOT `component.mesh.geometry` — see `authoredGeometry`. A virtual-geometry
+    // mesh is rendering this frame's LOD cut, and a modified one is rendering
+    // the modifier stack's output; both are derivations, not the model.
+    const mesh = meshFromBufferGeometry(authoredGeometry(entity));
+    // Edit mode uses one neutral surface, as Blender does: selection overlays,
+    // not material colours, are what communicate the current selection.
     const editMaterials = Array.from({ length: 8 }, () => new THREE.MeshStandardMaterial({ color: 0x92979d, roughness: 0.78, metalness: 0 }));
-    const mesh = new THREE.Mesh(bufferGeometryFromEditable(editable), editMaterials);
-    scene.add(mesh);
+    // Fully transparent rather than hidden: Wireframe must still be pickable.
+    const wireframeMaterial = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false });
+    // The entity's real materials, shared with Object Mode — never disposed here.
+    const sourceMaterial = component.mesh.material;
+    const realMaterials = Array.isArray(sourceMaterial) ? [...sourceMaterial] : sourceMaterial;
+    const meshObject = new THREE.Mesh(bufferGeometryFromMesh(mesh), editMaterials);
+    meshObject.userData.sharedMaterial = false;
+    // Drawn at the entity's own transform. Overlays are children of it, so the
+    // wireframe, vertex dots and selection highlights follow for free.
+    meshObject.matrixAutoUpdate = false;
+    meshObject.matrix.copy(entity.object3D.matrixWorld);
+    meshObject.updateMatrixWorld(true);
+    scene.add(meshObject);
+
     const wire = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ vertexColors: true }));
-    const markerCapacity = Math.max(4096, Math.ceil(editable.positions.length * 1.5));
+    const markerCapacity = Math.max(8192, Math.ceil(mesh.verts.size * 2));
     const markerGeometry = new THREE.SphereGeometry(1, 8, 6);
-    const basePoints = new THREE.InstancedMesh(markerGeometry, new THREE.MeshBasicMaterial({ color: 0x111820, depthTest: true, depthWrite: false }), markerCapacity);
+    const basePoints = new THREE.InstancedMesh(markerGeometry, new THREE.MeshBasicMaterial({ color: 0x111820, depthWrite: false }), markerCapacity);
     basePoints.count = 0;
-    const faceOverlay = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshBasicMaterial({ color: 0xf28b30, transparent: true, opacity: 0.55, side: THREE.DoubleSide, depthTest: true, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1 }));
-    // Selected/cut edges sit exactly on the rebuilt surface. WebGPU depth
-    // precision can otherwise reject the whole overlay as coplanar, making a
-    // successful loop cut look like it did nothing. Blender likewise keeps
-    // active edit edges readable over the solid surface.
+    const faceOverlay = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshBasicMaterial({
+      color: 0xf28b30, transparent: true, opacity: 0.55, side: THREE.DoubleSide, depthWrite: false,
+      polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1,
+    }));
+    // Selected edges sit exactly on the surface; WebGPU depth precision would
+    // otherwise reject the overlay as coplanar and make a successful cut look
+    // like it did nothing.
     const edgeOverlay = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: SELECT_COLOR, depthTest: false, depthWrite: false }));
-    const vertexOverlay = new THREE.InstancedMesh(markerGeometry, new THREE.MeshBasicMaterial({ color: 0xffa23f, depthTest: true, depthWrite: false }), markerCapacity);
+    const vertexOverlay = new THREE.InstancedMesh(markerGeometry, new THREE.MeshBasicMaterial({ color: 0xffa23f, depthWrite: false }), markerCapacity);
     vertexOverlay.count = 0;
-    [wire, basePoints, faceOverlay, edgeOverlay, vertexOverlay].forEach((object, index) => { object.renderOrder = 5 + index; mesh.add(object); });
-    [basePoints, edgeOverlay, vertexOverlay].forEach((object) => { object.frustumCulled = false; });
+    const activeOverlay = new THREE.InstancedMesh(markerGeometry, new THREE.MeshBasicMaterial({ color: 0xffffff, depthWrite: false, depthTest: false }), 8);
+    activeOverlay.count = 0;
+    for (const [index, object] of [wire, basePoints, faceOverlay, edgeOverlay, vertexOverlay, activeOverlay].entries()) {
+      object.renderOrder = 5 + index;
+      meshObject.add(object);
+    }
+    for (const object of [basePoints, edgeOverlay, vertexOverlay, activeOverlay]) object.frustumCulled = false;
 
     const session = {
-      editable, original, mesh, wire, basePoints, faceOverlay, edgeOverlay, vertexOverlay, context,
+      mesh, meshObject, wire, basePoints, faceOverlay, edgeOverlay, vertexOverlay, activeOverlay, context,
+      scene, editMaterials, realMaterials, wireframeMaterial, editorLights, sceneLights, shading,
       camera, perspectiveCamera, orthographicCamera: null, orthographicHeight: 10,
       controls, canvas,
-      hiddenEdges: new Set((editable.hiddenEdges ?? []).map(([a, b]) => indexEdgeKey(a, b))),
       mode: "face",
-      selections: { vertex: new Set(), edge: new Set(), face: new Set() },
-      wireEdges: [], history: [], macro: null,
-      proportional: false, xray: false,
+      active: null,
+      history: [], future: [], macro: null,
+      proportional, proportionalConnected, falloff, pivot, orientation,
+      snapEnabled, snapMode, snapIncrement, snapRadius: 0.5,
+      // Seeded here as well as in the mirroring effect below: effects run in
+      // declaration order, and that one is declared first, so on mount it sees
+      // a null session and bails. Without these the first sculpt stroke after
+      // opening the panel would silently fall back to the operator defaults
+      // instead of the values the toolbar is showing.
+      brush, brushRadius, brushStrength, brushFalloff, symmetry, dyntopo, detailSize, dyntopoMode,
+      sculpting: false, painting: false, stroke: null,
+      paintLayer: null, paintTexture: null, paintMaterial: null, paintHistory: [], paintUndo: null,
+      paintColor, paintBlend, paintResolution,
+      xray: false,
       selectionTool: null, selectionGesture: null, circleRadius: 32,
     };
+    // Boundary conversions between the world the camera lives in and the local
+    // coordinates every vertex, operator and UV is expressed in.
+    //
+    // Directions go through the matrix's linear part rather than being rotated,
+    // so a scaled object converts a screen-space drag into the right *length*
+    // of local movement as well as the right heading.
+    const worldFromLocal = meshObject.matrixWorld;
+    const localFromWorld = new THREE.Matrix4().copy(worldFromLocal).invert();
+    const linearToLocal = new THREE.Matrix3().setFromMatrix4(worldFromLocal).invert();
+    const meshScale = new THREE.Vector3().setFromMatrixScale(worldFromLocal);
+    session.worldFromLocal = worldFromLocal;
+    session.localFromWorld = localFromWorld;
+    /** A world-space point, in mesh-local coordinates. Mutates nothing. */
+    session.toLocalPoint = (point) => point.clone().applyMatrix4(localFromWorld);
+    /** A mesh-local point (array or Vector3) in world space. */
+    session.toWorldPoint = (point) => (Array.isArray(point)
+      ? new THREE.Vector3(point[0], point[1], point[2])
+      : point.clone()).applyMatrix4(worldFromLocal);
+    /** A world-space direction as the local displacement that produces it. */
+    session.toLocalDirection = (direction) => direction.clone().applyMatrix3(linearToLocal);
+    /** How many local units one world unit spans, averaged over the axes. */
+    session.localPerWorld = 3 / Math.max(meshScale.x + meshScale.y + meshScale.z, 1e-6);
+
     session.useCamera = (nextCamera) => {
       camera = nextCamera;
       session.camera = nextCamera;
@@ -2136,76 +2280,58 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
       controls.zoom0 = nextCamera.zoom;
       controls.target0.copy(controls.target);
       refreshVertexMarkerScales(session);
-      setRevision((value) => value + 1);
-    };
-    // Persisted .geom topology is authoritative. Re-inferring all coplanar
-    // diagonals here hid subdivision/grid edges every time Edit Mode reopened.
-    if (!Array.isArray(editable.hiddenEdges)) {
-      applyTopology(session, { edges: new Set(), hidden: new Set() });
-    } else {
-      syncEditableTopology(session);
-    }
-    session.preview = () => {
-      const attribute = mesh.geometry.getAttribute("position");
-      editable.positions.forEach((position, index) => attribute.setXYZ(index, ...position));
-      attribute.needsUpdate = true;
-      mesh.geometry.computeVertexNormals();
-      mesh.geometry.computeBoundingBox();
-      mesh.geometry.computeBoundingSphere();
-      // Extrusion walls start degenerate and only take shape as the drag runs, so
-      // their hidden flags follow the geometry. Plain moves must not re-derive:
-      // that is what used to make a bent quad show its diagonal.
-      if (session.macro?.kind === "extrude") {
-        applyTopology(session, session.macro.beforeTopology, {
-          visiblePairs: session.macro.visiblePairs,
-        });
-      }
-      updateTopologyCache(session);
-      refreshWire(session);
-      refreshOverlays(session);
-      setRevision((value) => value + 1);
+      touch();
     };
     session.rebuild = () => {
-      const old = mesh.geometry;
-      mesh.geometry = bufferGeometryFromEditable(editable);
-      old.dispose();
-      updateTopologyCache(session);
-      refreshWire(session);
+      rebuildRenderMesh(session);
       refreshOverlays(session);
-      setRevision((value) => value + 1);
+      refreshStats(session);
+      touch();
+    };
+    session.preview = () => {
+      // Topology is unchanged mid-drag, so only the positions are rewritten.
+      refreshRenderPositions(session);
+      refreshOverlays(session);
+      touch();
     };
     sessionRef.current = session;
+    // Same hatch as `globalThis.__viewport`: headless harnesses need to read
+    // the camera and the mesh the panel is actually driving.
+    if (import.meta.env?.DEV) globalThis.__geometrySession = session;
     applyXray(session);
+    applyShading(session, shading);
     session.rebuild();
 
-    const sphere = editableBoundingSphere(session);
+    const initialView = initialViewRef?.current ?? null;
     if (initialView) {
-      // Embedded Edit-in-Scene: preserve the editor's orbit *direction* but
-      // snap the target onto the geometry's center and pull the camera back
-      // to a comfortable framing distance. Otherwise the local-space camera
-      // pose (a) might sit inside the geometry or (b) hug the corner the
-      // editor was looking at before — both feel disorienting.
-      const preservedDirection = new THREE.Vector3(...initialView.position).sub(new THREE.Vector3(...initialView.target));
-      controls.target.copy(sphere.center);
-      const radius = Math.max(sphere.radius, 0.25);
-      if (preservedDirection.lengthSq() < 1e-6) preservedDirection.set(0.6, 0.5, 0.7);
-      const distance = framingDistance(camera, radius);
-      camera.position.copy(sphere.center).addScaledVector(preservedDirection.normalize(), distance);
+      // Edit-in-scene: adopt the viewport's camera verbatim. Both scenes are in
+      // world space now, so the handover is exact and entering edit mode does
+      // not move the camera at all — which is what Blender does and what makes
+      // it feel like the same scene rather than a different one.
+      camera.position.fromArray(initialView.position);
+      // The PIVOT, though, moves onto the geometry. The viewport's own orbit
+      // target is wherever the user last left it — commonly the world origin,
+      // or a point far behind the object — and orbiting about that throws the
+      // thing being edited across the screen instead of turning it in place,
+      // which is what makes the camera feel unusable in Edit Mode. Only the
+      // pivot changes; the camera does not move, so the view is handed over
+      // intact and orbiting now turns the model.
+      controls.target.copy(meshBoundingSphere(mesh).applyMatrix4(meshObject.matrixWorld).center);
+      const span = camera.position.distanceTo(controls.target) || 1;
+      camera.near = Math.max(span / 1000, 0.001);
+      camera.far = Math.max(span * 200, 100);
+      camera.updateProjectionMatrix();
+      controls.update();
     } else {
-      frameGeometry(session);
+      // Opened standalone, with no view to inherit: frame the geometry.
+      frameSphere(session, meshBoundingSphere(mesh));
     }
-    camera.near = Math.max(sphere.radius / 100, 0.001);
-    camera.far = Math.max(sphere.radius * 100, 100);
-    camera.updateProjectionMatrix();
     refreshVertexMarkerScales(session);
-    const onControlsStart = () => {
-      session.orbitStartQuaternion = session.camera.quaternion.clone();
-    };
+
+    const onControlsStart = () => { session.orbitStartQuaternion = session.camera.quaternion.clone(); };
     const onControlsChange = () => {
       if (
-        session.camera.isOrthographicCamera &&
-        !session.snapAnimation &&
-        session.orbitStartQuaternion &&
+        session.camera.isOrthographicCamera && !session.snapAnimation && session.orbitStartQuaternion &&
         Math.abs(session.camera.quaternion.dot(session.orbitStartQuaternion)) < 0.999999
       ) {
         session.orbitStartQuaternion = null;
@@ -2219,13 +2345,20 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
 
     const raycaster = new THREE.Raycaster();
     const pointer = new THREE.Vector2();
-    session.raycastAtLast = () => {
-      if (!session.lastPointer) return null;
+    const castAt = (clientX, clientY) => {
       const rect = canvas.getBoundingClientRect();
-      pointer.set(((session.lastPointer.x - rect.left) / rect.width) * 2 - 1, -((session.lastPointer.y - rect.top) / rect.height) * 2 + 1);
-      raycaster.setFromCamera(pointer, camera);
-      return raycaster.intersectObject(mesh, false)[0] ?? null;
+      pointer.set(((clientX - rect.left) / rect.width) * 2 - 1, -((clientY - rect.top) / rect.height) * 2 + 1);
+      raycaster.setFromCamera(pointer, session.camera);
+      const hit = raycaster.intersectObject(session.meshObject, false)[0] ?? null;
+      // Handed back in mesh-local coordinates. Picking, sculpt and paint dabs,
+      // knife points and edge-nearest tests all compare against vertex
+      // positions, which are local; converting once here keeps every one of
+      // them written the way it was when local and world happened to agree.
+      if (hit) hit.point = session.toLocalPoint(hit.point);
+      return hit;
     };
+    session.raycastAtLast = () => (session.lastPointer ? castAt(session.lastPointer.x, session.lastPointer.y) : null);
+
     let down = null;
     const onPointerDown = (event) => {
       if (event.button !== 0) return;
@@ -2233,88 +2366,159 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
       down = [event.clientX, event.clientY];
       session.lastPointer = { x: event.clientX, y: event.clientY };
       canvas.focus();
+      if (session.sculpting && !event.altKey) {
+        const hit = castAt(event.clientX, event.clientY);
+        if (hit) {
+          const modifiers = { ctrl: event.ctrlKey || event.metaKey, shift: event.shiftKey };
+          if (session.painting) beginPaintStroke(session, hit, modifiers);
+          else beginSculptStroke(session, hit, modifiers);
+          event.preventDefault();
+        }
+      }
     };
     const onPointerUp = (event) => {
       if (event.button !== 0 || !down) return;
       const moved = Math.hypot(event.clientX - down[0], event.clientY - down[1]) > 4;
       down = null;
+      if (session.stroke) {
+        if (session.painting) endPaintStroke(session);
+        else endSculptStroke(session);
+        return;
+      }
+      if (session.sculpting) return;
       if (moved) return;
-      const rect = canvas.getBoundingClientRect();
-      pointer.set(((event.clientX - rect.left) / rect.width) * 2 - 1, -((event.clientY - rect.top) / rect.height) * 2 + 1);
-      raycaster.setFromCamera(pointer, camera);
-      const hit = raycaster.intersectObject(mesh, false)[0];
-      const selection = session.selections[session.mode];
-      const pathSelect = event.ctrlKey || event.metaKey;
-      if (!event.shiftKey && !pathSelect) selection.clear();
+      const hit = castAt(event.clientX, event.clientY);
+      if (session.knife) {
+        if (hit) {
+          session.knife.points.push([hit.point.x, hit.point.y, hit.point.z]);
+          setKnifePoints([...session.knife.points]);
+        }
+        return;
+      }
+      const additive = event.shiftKey;
+      if (!additive && !event.ctrlKey && !event.metaKey) {
+        clearSelection(session.mesh);
+        session.active = null;
+      }
       if (hit) {
-        const picked = pickElement(session, hit);
-        if (pathSelect && picked[0] !== undefined) {
-          shortestSelectionPath(session, picked).forEach((key) => selection.add(key));
-          refreshOverlays(session);
-          setRevision((value) => value + 1);
-          return;
+        const element = pickElement(session, hit);
+        if (element) {
+          // Alt is tested before Ctrl: Blender's ring select is Ctrl+Alt+Click,
+          // so checking Ctrl first would swallow it into the path branch and
+          // make ring select unreachable.
+          if (event.altKey) {
+            const face = pickFace(session, hit);
+            const seed = face && nearestEdgeOnFace(face, hit.point);
+            if (seed) {
+              const ring = event.ctrlKey || event.metaKey;
+              const group = ring
+                ? edgeRing(seed)
+                : session.mode === "face"
+                  ? faceLoop(face, seed)
+                  : edgeLoop(seed, face);
+              const members = session.mode === "vert"
+                ? [...group].flatMap((edge) => [edge.v1, edge.v2])
+                : session.mode === "face" && !ring
+                  ? [...group]
+                  : [...group];
+              const allSelected = additive && members.length > 0 && members.every((member) => member.select);
+              for (const member of members) member.select = !allSelected;
+              session.active = element;
+            }
+          } else if (event.ctrlKey || event.metaKey) {
+            for (const step of shortestPath(session.mesh, session.mode, element)) step.select = true;
+            session.active = element;
+          } else {
+            const remove = additive && element.select;
+            element.select = !remove;
+            session.active = remove ? null : element;
+          }
+          flushSelection(session.mesh, session.mode);
         }
-        if (event.altKey && picked[0] !== undefined) {
-          const loop = loopSelectionAtHit(session, hit);
-          if (!(loop instanceof Set) || !loop.size) return;
-          const removeLoop = event.shiftKey && [...loop].every((key) => selection.has(key));
-          loop.forEach((key) => removeLoop ? selection.delete(key) : selection.add(key));
-          refreshOverlays(session);
-          setRevision((value) => value + 1);
-          return;
-        }
-        const remove = event.shiftKey && picked.every((key) => selection.has(key));
-        picked.forEach((key) => remove ? selection.delete(key) : selection.add(key));
       }
       refreshOverlays(session);
-      setRevision((value) => value + 1);
+      touch();
     };
     canvas.addEventListener("pointerdown", onPointerDown);
     canvas.addEventListener("pointerup", onPointerUp);
-    const scheduleLoopCutPreview = () => {
+
+    const scheduleMacroFrame = () => {
       if (session.macroFrame) return;
-      const runPreview = (now) => {
-        if (now - (session.loopPreviewLast ?? 0) < 40) {
-          session.macroFrame = requestAnimationFrame(runPreview);
-          return;
-        }
+      session.macroFrame = requestAnimationFrame(() => {
         session.macroFrame = 0;
-        if (session.macro?.kind !== "loopcut") return;
-        session.loopPreviewLast = now;
-        applyTransformMacro(session);
-        setMacroState({ kind: "loopcut", axis: null, buffer: "", segments: session.macro.segments, locked: session.macro.locked });
-      };
-      session.macroFrame = requestAnimationFrame(runPreview);
+        if (!session.macro) return;
+        applyMacro(session);
+        publishMacro(session);
+      });
     };
     const onWindowPointerMove = (event) => {
       session.lastPointer = { x: event.clientX, y: event.clientY };
+      if (session.sculpting) {
+        const rect = canvas.getBoundingClientRect();
+        const inside = event.clientX >= rect.left && event.clientX <= rect.right && event.clientY >= rect.top && event.clientY <= rect.bottom;
+        if (session.stroke) {
+          const hit = castAt(event.clientX, event.clientY);
+          // Grab keeps pulling from the anchor even once the pointer leaves the
+          // surface, so it projects onto the anchor's view plane instead.
+          const point = hit
+            ? [hit.point.x, hit.point.y, hit.point.z]
+            : session.stroke.brush === "grab" ? pointerOnAnchorPlane(session, event) : null;
+          if (point) {
+            if (session.painting) applyPaintAt(session, point);
+            else applySculptAt(session, point);
+          }
+          setBrushCursor({ x: event.clientX - rect.left, y: event.clientY - rect.top, radius: projectedBrushRadius(session, point ?? session.stroke.anchor) });
+          return;
+        }
+        if (!inside) {
+          setBrushCursor(null);
+          return;
+        }
+        const hover = castAt(event.clientX, event.clientY);
+        setBrushCursor({
+          x: event.clientX - rect.left,
+          y: event.clientY - rect.top,
+          radius: hover ? projectedBrushRadius(session, [hover.point.x, hover.point.y, hover.point.z]) : null,
+          off: !hover,
+        });
+        return;
+      }
       if (session.selectionGesture) {
-        session.selectionGesture.current = { x: event.clientX, y: event.clientY };
-        if (session.selectionGesture.kind === "circle") applyRegionSelection(session, session.selectionGesture);
-        setSelectionGesture({ ...session.selectionGesture });
-        setRevision((value) => value + 1);
+        const gesture = session.selectionGesture;
+        gesture.current = { x: event.clientX, y: event.clientY };
+        if (gesture.kind === "lasso") gesture.path.push({ x: event.clientX, y: event.clientY });
+        if (gesture.kind === "circle") applyRegionSelection(session, gesture);
+        setSelectionGesture({ ...gesture, path: gesture.path ? [...gesture.path] : undefined });
+        touch();
         return;
       }
       if (!session.macro) return;
       session.macro.current = { x: event.clientX, y: event.clientY };
-      if (session.macro.kind === "loopcut") {
-        // Pointer events can arrive much faster than a large mesh can be
-        // retriangulated. Coalesce loop-cut previews to one rebuild per frame.
-        scheduleLoopCutPreview();
-      } else if (!session.macro.buffer) {
-        applyTransformMacro(session);
-        if (session.macro?.kind === "bevel") setMacroState({ kind: "bevel", axis: null, buffer: "", amount: session.macro.amount, segments: session.macro.segments });
-        if (session.macro?.kind === "inset") setMacroState({ kind: "inset", axis: null, buffer: "", amount: session.macro.amount });
+      session.macro.fine = event.shiftKey;
+      if (session.macro.buffer) return;
+      // Bevel and loop cut rebuild topology, so they are coalesced to a frame.
+      if (session.macro.kind === "bevel" || session.macro.kind === "loopcut") scheduleMacroFrame();
+      else {
+        applyMacro(session);
+        publishMacro(session);
       }
     };
+    const applyRegionSelection = (value, gesture) => {
+      const found = elementsInRegion(value, gesture);
+      for (const element of found) element.select = !gesture.subtractive;
+      flushSelection(value.mesh, value.mode);
+      refreshOverlays(value);
+    };
     const onWindowPointerDown = (event) => {
+      if (session.sculpting) return;
       if (!session.macro && session.selectionTool && event.target === canvas && event.button === 0) {
         const subtractive = event.ctrlKey || event.metaKey;
-        if (!event.shiftKey && !subtractive) session.selections[session.mode].clear();
+        if (!event.shiftKey && !subtractive) clearSelection(session.mesh);
         session.selectionGesture = {
           kind: session.selectionTool,
           start: { x: event.clientX, y: event.clientY },
           current: { x: event.clientX, y: event.clientY },
+          path: session.selectionTool === "lasso" ? [{ x: event.clientX, y: event.clientY }] : undefined,
           radius: session.circleRadius ?? 32,
           subtractive,
         };
@@ -2323,61 +2527,54 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
         setSelectionTool(null);
         setSelectionGesture({ ...session.selectionGesture });
         if (session.selectionGesture.kind === "circle") applyRegionSelection(session, session.selectionGesture);
-        setRevision((value) => value + 1);
+        touch();
         event.preventDefault();
         event.stopPropagation();
         return;
       }
       if (!session.macro) return;
       if (event.button === 0 && session.macro.kind === "loopcut" && !session.macro.locked) {
+        // First click locks the cut count and hands over to edge slide.
         session.macro.locked = true;
-        session.macro.lockT = session.macro.t;
-        cancelAnimationFrame(session.macroFrame);
-        session.macroFrame = 0;
-        applyTransformMacro(session);
-        setMacroState({ kind: "loopcut", axis: null, buffer: "", segments: session.macro.segments, locked: true });
-      } else if (event.button === 0) commitTransform();
+        session.macro.start = { x: event.clientX, y: event.clientY };
+        publishMacro(session);
+      } else if (event.button === 0) commitMacro();
       else if (event.button === 2) {
         session.preventContextOnce = true;
-        cancelTransform();
-      }
-      else return;
+        cancelMacro();
+      } else return;
       event.preventDefault();
       event.stopPropagation();
     };
     const onWindowPointerUp = (event) => {
+      if (session.stroke && event.button === 0) {
+        if (session.painting) endPaintStroke(session);
+        else endSculptStroke(session);
+        return;
+      }
       if (!session.selectionGesture || event.button !== 0) return;
       applyRegionSelection(session, session.selectionGesture);
       session.selectionGesture = null;
       session.controls.enabled = true;
       setSelectionGesture(null);
-      setRevision((value) => value + 1);
+      touch();
       event.preventDefault();
       event.stopPropagation();
     };
     const onWindowWheel = (event) => {
       if (session.selectionGesture?.kind === "circle") {
-        session.circleRadius = THREE.MathUtils.clamp((session.circleRadius ?? 32) * Math.pow(1.08, -event.deltaY / 100), 8, 240);
+        session.circleRadius = THREE.MathUtils.clamp((session.circleRadius ?? 32) * 1.08 ** (-event.deltaY / 100), 8, 240);
         session.selectionGesture.radius = session.circleRadius;
         setSelectionGesture({ ...session.selectionGesture });
-        event.preventDefault();
-        event.stopPropagation();
-        return;
-      }
-      if (!session.macro) return;
-      if (session.macro.kind === "loopcut") {
-        session.macro.segments = THREE.MathUtils.clamp(session.macro.segments + (event.deltaY < 0 ? 1 : -1), 1, 32);
-        scheduleLoopCutPreview();
-      } else if (session.macro.kind === "bevel") {
-        session.macro.segments = THREE.MathUtils.clamp(session.macro.segments + (event.deltaY < 0 ? 1 : -1), 1, 12);
-        applyTransformMacro(session);
-        setMacroState({ kind: "bevel", axis: null, buffer: session.macro.buffer, amount: session.macro.amount, segments: session.macro.segments });
-      } else if (session.macro.proportional) {
-        // Blender's wheel direction: scroll up tightens the influence circle,
-        // scroll down expands it.
-        session.macro.radius = THREE.MathUtils.clamp(session.macro.radius * Math.pow(1.08, event.deltaY / 100), 0.001, 100000);
-        applyTransformMacro(session);
-        setMacroState({ kind: session.macro.kind, axis: session.macro.axis, buffer: session.macro.buffer, proportional: true, radius: session.macro.radius, connected: session.macro.connected, falloff: session.macro.falloff });
+      } else if (session.macro?.kind === "loopcut" || session.macro?.kind === "bevel") {
+        const limit = session.macro.kind === "loopcut" ? 64 : 16;
+        session.macro.segments = THREE.MathUtils.clamp(session.macro.segments + (event.deltaY < 0 ? 1 : -1), 1, limit);
+        scheduleMacroFrame();
+      } else if (session.macro?.proportional) {
+        // Blender's direction: scroll up tightens the influence circle.
+        session.macro.radius = THREE.MathUtils.clamp(session.macro.radius * 1.08 ** (event.deltaY / 100), 0.001, 1e5);
+        applyMacro(session);
+        publishMacro(session);
       } else return;
       event.preventDefault();
       event.stopPropagation();
@@ -2388,7 +2585,14 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
         session.preventContextOnce = false;
       }
     };
-    const onBlur = () => { cancelTransform(); cancelSelectionTool(); };
+    const onBlur = () => {
+      cancelMacro();
+      cancelSelectionTool();
+      if (session.stroke) {
+        if (session.painting) endPaintStroke(session);
+        else endSculptStroke(session);
+      }
+    };
     window.addEventListener("pointermove", onWindowPointerMove, true);
     window.addEventListener("pointerdown", onWindowPointerDown, true);
     window.addEventListener("pointerup", onWindowPointerUp, true);
@@ -2405,7 +2609,7 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
         const { width, height } = host.getBoundingClientRect();
         if (!width || !height) return;
         renderer.setSize(width, height, false);
-        resizeGeometryCamera(camera, width, height, session.orthographicHeight);
+        resizeGeometryCamera(session.camera, width, height, session.orthographicHeight);
       };
       resizeObserver = new ResizeObserver(resize);
       resizeObserver.observe(host);
@@ -2415,21 +2619,17 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
         const rect = host.getBoundingClientRect();
         if (canvas.isConnected && rect.width >= 1 && rect.height >= 1) {
           controls.update();
-          // Mirror the world 3D cursor into the local scene so the user
-          // sees it in Edit Mode too. Without this the cursor only
-          // refreshes when the user manipulates it from the main
-          // viewport, which is jarring when the cursor lives in world
-          // space but the editor view is local.
           refreshCursor3D();
-          renderer.render(scene, camera);
+          renderer.render(scene, session.camera);
         }
         frame = requestAnimationFrame(render);
       };
       render();
-    })().catch((err) => setStatus(`Renderer failed: ${err}`));
+    })().catch((error) => setStatus(`Renderer failed: ${error}`));
 
     return () => {
       disposed = true;
+      if (globalThis.__geometrySession === session) delete globalThis.__geometrySession;
       cancelAnimationFrame(frame);
       cancelAnimationFrame(session.macroFrame);
       if (session.snapAnimation) cancelAnimationFrame(session.snapAnimation);
@@ -2445,148 +2645,450 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
       controls.removeEventListener("start", onControlsStart);
       controls.removeEventListener("change", onControlsChange);
       controls.dispose();
+      const borrowed = new Set(Array.isArray(realMaterials) ? realMaterials : [realMaterials]);
       scene.traverse((object) => {
         if (!object.userData?.sharedGeometry) object.geometry?.dispose?.();
-        if (!object.userData?.sharedMaterial) {
-          const materials = Array.isArray(object.material) ? object.material : [object.material];
-          materials.forEach((material) => material?.dispose?.());
-        }
+        if (object.userData?.sharedMaterial) return;
+        const materials = Array.isArray(object.material) ? object.material : [object.material];
+        // The entity's own materials are shared with Object Mode; disposing them
+        // here would blank the mesh in the main viewport.
+        for (const material of materials) if (!borrowed.has(material)) material?.dispose?.();
       });
+      for (const material of [...editMaterials, wireframeMaterial]) material.dispose();
+      session.paintTexture?.dispose?.();
+      session.paintMaterial?.dispose?.();
       renderer?.dispose();
-      // Drop the local cursor proxy we added in attachCursor — without
-      // this the additionalProxies list accumulates a stale entry every
-      // time the user switches the entity being edited, and the detached
-      // proxy gets left behind in the disposed scene.
       detachCursor();
       sessionRef.current = null;
     };
   }, [entityId, component]);
 
+  /* ---------------------------------------------------------------------- */
+  /* Render                                                                  */
+  /* ---------------------------------------------------------------------- */
+
   if (!component) return <div className="geometry-editor-empty">Select an entity with a Mesh component.</div>;
   const session = sessionRef.current;
-  const selectionCount = session?.selections[mode].size ?? 0;
+  const count = session ? selectionCount(session.mesh, mode) : 0;
   const materialSlots = Array.from({ length: 8 }, (_, index) => component.props[index ? `material${index + 1}` : "material"] ?? "");
-  const runMenuAction = (event, action) => {
+  const run = (event, action) => {
     event.currentTarget.closest("details")?.removeAttribute("open");
     action();
   };
+  const similarTypes = SIMILAR_TYPES[mode] ?? [];
+
   return (
     <div className={`geometry-editor ${embedded ? "embedded" : ""}`} ref={rootRef} onKeyDown={handleKeyDown}>
-      <div className="geometry-editor-toolbar">
+      <div className="geometry-editor-toolbar" ref={toolbarRef}>
+        {/* Blender's header: ONE row that scrolls sideways. Wrapping stranded
+            the trailing controls on a second row and grew the bar downwards
+            over the viewport as the panel narrowed. */}
+        <div className="geometry-editor-toolbar-scroll" ref={toolbarScrollRef}>
         <div className="geometry-mode-group">
-          {MODES.map((item, index) => {
-            const Icon = item === "vertex" ? Circle : item === "edge" ? Square : Triangle;
-            return <button key={item} className={`toolbar-btn icon-only ${mode === item ? "active" : ""}`} title={`${MODE_LABELS[item]} select (${index + 1})`} onClick={() => changeMode(item)}><Icon size={14} /></button>;
-          })}
+          <button className={`toolbar-btn ${editorMode === "edit" ? "active" : ""}`} title="Edit Mode" onClick={() => setEditorMode("edit")}>Edit</button>
+          <button className={`toolbar-btn ${editorMode === "sculpt" ? "active" : ""}`} title="Sculpt Mode" onClick={() => setEditorMode("sculpt")}>Sculpt</button>
+          <button className={`toolbar-btn ${editorMode === "paint" ? "active" : ""}`} title="Texture Paint Mode" onClick={() => setEditorMode("paint")}>Paint</button>
         </div>
-        <span className="geometry-editor-stat geometry-selection-count" title={`${selectionCount} selected`}>{selectionCount}</span>
+        {editorMode === "edit" && (
+          <div className="geometry-mode-group">
+            {MODES.map((item, index) => {
+              const Icon = item === "vert" ? Circle : item === "edge" ? Square : Triangle;
+              return (
+                <button key={item} className={`toolbar-btn icon-only ${mode === item ? "active" : ""}`} title={`${MODE_LABELS[item]} select (${index + 1})`} onClick={() => changeMode(item)}>
+                  <Icon size={14} />
+                </button>
+              );
+            })}
+          </div>
+        )}
+        {editorMode === "edit" && <span className="geometry-editor-stat geometry-selection-count" title={`${count} selected`}>{count}</span>}
+
+        {editorMode === "edit" && (<>
         <details className="geometry-toolbar-menu">
           <summary>Select</summary>
           <div className="geometry-toolbar-popover">
-            <button className={selectionTool === "box" ? "active" : ""} onClick={(event) => runMenuAction(event, () => armSelectionTool("box"))}>Box Select <kbd>B</kbd></button>
-            <button className={selectionTool === "circle" ? "active" : ""} onClick={(event) => runMenuAction(event, () => armSelectionTool("circle"))}>Circle Select <kbd>C</kbd></button>
-            <button onClick={(event) => runMenuAction(event, selectMore)}>Select More <kbd>Ctrl++</kbd></button>
-            <button onClick={(event) => runMenuAction(event, selectLess)}>Select Less <kbd>Ctrl+−</kbd></button>
-            <button onClick={(event) => runMenuAction(event, invertSelection)}>Invert <kbd>Ctrl+I</kbd></button>
+            <button onClick={(e) => run(e, doSelectAll)}>All <kbd>A</kbd></button>
+            <button onClick={(e) => run(e, doSelectNone)}>None <kbd>Alt+A</kbd></button>
+            <button onClick={(e) => run(e, doInvert)}>Invert <kbd>Ctrl+I</kbd></button>
+            <hr />
+            <button className={selectionTool === "box" ? "active" : ""} onClick={(e) => run(e, () => armSelectionTool("box"))}>Box Select <kbd>B</kbd></button>
+            <button className={selectionTool === "circle" ? "active" : ""} onClick={(e) => run(e, () => armSelectionTool("circle"))}>Circle Select <kbd>C</kbd></button>
+            <button className={selectionTool === "lasso" ? "active" : ""} onClick={(e) => run(e, () => armSelectionTool("lasso"))}>Lasso Select</button>
+            <hr />
+            <button onClick={(e) => run(e, doGrow)}>Select More <kbd>Ctrl++</kbd></button>
+            <button onClick={(e) => run(e, doShrink)}>Select Less <kbd>Ctrl+−</kbd></button>
+            <button onClick={(e) => run(e, doSelectLinkedAll)}>Select Linked <kbd>Ctrl+L</kbd></button>
+            <button onClick={(e) => run(e, doCheckerDeselect)}>Checker Deselect</button>
+            <button onClick={(e) => run(e, doSelectRandom)}>Select Random</button>
+            <hr />
+            <span className="geometry-menu-heading">Select Similar</span>
+            {similarTypes.map((entry) => (
+              <button key={entry.id} onClick={(e) => run(e, () => doSelectSimilar(entry.id))}>{entry.label}</button>
+            ))}
+            <hr />
+            <span className="geometry-menu-heading">All by Trait</span>
+            <button onClick={(e) => run(e, () => doSelectTrait("nonManifold"))}>Non Manifold</button>
+            <button onClick={(e) => run(e, () => doSelectTrait("loose"))}>Loose Geometry</button>
+            <button onClick={(e) => run(e, () => doSelectTrait("interior"))}>Interior Faces</button>
+            <button onClick={(e) => run(e, () => doSelectTrait("boundary"))}>Boundary Loop</button>
+            <button onClick={(e) => run(e, () => doSelectTrait("sharp", { angle: Math.PI / 6 }))}>Sharp Edges</button>
+            <button onClick={(e) => run(e, () => doSelectTrait("sides", { sides: 3 }))}>Faces by Sides (Tris)</button>
+            <button onClick={(e) => run(e, () => doSelectTrait("sides", { sides: 4, comparison: "greater" }))}>Faces by Sides (N-gons)</button>
           </div>
         </details>
+
         <details className="geometry-toolbar-menu">
           <summary>Transform</summary>
           <div className="geometry-toolbar-popover">
-            <button disabled={!selectionCount} onClick={(event) => runMenuAction(event, () => startTransform("translate"))}><Move size={13} /> Move <kbd>G</kbd></button>
-            <button disabled={!selectionCount} onClick={(event) => runMenuAction(event, () => startTransform("rotate"))}><Rotate3d size={13} /> Rotate <kbd>R</kbd></button>
-            <button disabled={!selectionCount} onClick={(event) => runMenuAction(event, () => startTransform("scale"))}><Scale3d size={13} /> Scale <kbd>S</kbd></button>
-            <button className={proportional ? "active" : ""} onClick={(event) => runMenuAction(event, toggleProportional)}><Magnet size={13} /> Proportional <kbd>O</kbd></button>
+            <button disabled={!count} onClick={(e) => run(e, () => startMacro("translate", "Move"))}><Move size={13} /> Move <kbd>G</kbd></button>
+            <button disabled={!count} onClick={(e) => run(e, () => startMacro("rotate", "Rotate"))}><Rotate3d size={13} /> Rotate <kbd>R</kbd></button>
+            <button disabled={!count} onClick={(e) => run(e, () => startMacro("scale", "Scale"))}><Scale3d size={13} /> Scale <kbd>S</kbd></button>
+            <button disabled={!count} onClick={(e) => run(e, startShrinkFatten)}>Shrink/Fatten <kbd>Alt+S</kbd></button>
+            <button disabled={mode !== "edge" || !count} onClick={(e) => run(e, startEdgeSlide)}>Edge Slide <kbd>G G</kbd></button>
+            <button disabled={mode === "face" || !count} onClick={(e) => run(e, startVertSlide)}>Vertex Slide <kbd>G G</kbd></button>
+            <hr />
+            <label className="geometry-menu-field">Orientation
+              <select value={orientation} onChange={(event) => setOrientation(event.target.value)}>
+                {ORIENTATIONS.map((entry) => <option key={entry.id} value={entry.id}>{entry.label}</option>)}
+              </select>
+            </label>
+            <label className="geometry-menu-field">Pivot
+              <select value={pivot} onChange={(event) => setPivot(event.target.value)}>
+                {PIVOTS.map((entry) => <option key={entry.id} value={entry.id}>{entry.label}</option>)}
+              </select>
+            </label>
+            <hr />
+            <button className={snapEnabled ? "active" : ""} onClick={(e) => run(e, () => setSnapEnabled((value) => !value))}><Magnet size={13} /> Snap</button>
+            <label className="geometry-menu-field">Snap To
+              <select value={snapMode} onChange={(event) => setSnapMode(event.target.value)}>
+                {SNAP_MODES.map((entry) => <option key={entry.id} value={entry.id}>{entry.label}</option>)}
+              </select>
+            </label>
+            <label className="geometry-menu-field">Increment
+              <input type="number" min={0.001} step={0.05} value={snapIncrement} onChange={(event) => setSnapIncrement(Math.max(0.001, Number(event.target.value) || 0.25))} />
+            </label>
+            <hr />
+            <button className={proportional ? "active" : ""} onClick={(e) => run(e, () => setProportional((value) => !value))}>Proportional Editing <kbd>O</kbd></button>
+            <button className={proportionalConnected ? "active" : ""} onClick={(e) => run(e, () => setProportionalConnected((value) => !value))}>Connected Only</button>
+            <label className="geometry-menu-field">Falloff
+              <select value={falloff} onChange={(event) => setFalloff(event.target.value)}>
+                {FALLOFFS.map((entry) => <option key={entry.id} value={entry.id}>{entry.label}</option>)}
+              </select>
+            </label>
+            <hr />
+            <span className="geometry-menu-heading">3D Cursor <kbd>Shift+S</kbd></span>
+            <button disabled={!count} onClick={(e) => run(e, snapSelectionToCursor)}><Crosshair size={13} /> Selection → Cursor</button>
+            <button disabled={!count} onClick={(e) => run(e, snapCursorToSelection)}>Cursor → Selection</button>
+            <button onClick={(e) => run(e, resetCursorToOrigin)}>Cursor → World Origin</button>
+            <button disabled={!count} onClick={(e) => run(e, () => doMerge("cursor"))}>Merge at Cursor <kbd>M U</kbd></button>
           </div>
         </details>
-        <details className="geometry-toolbar-menu">
-          <summary>Cursor</summary>
-          <div className="geometry-toolbar-popover">
-            <button disabled={!selectionCount} onClick={(event) => runMenuAction(event, () => snapVerticesToCursor(sessionRef.current))}><Crosshair size={13} /> Selection → 3D Cursor</button>
-            <button disabled={!selectionCount} onClick={(event) => runMenuAction(event, snapCursorToSelectedVertices)}>3D Cursor → Selection</button>
-            <button disabled={mode !== "edge" || !selectionCount} onClick={(event) => runMenuAction(event, snapCursorToSelectedEdge)}>3D Cursor → Edge Midpoint</button>
-            <button disabled={mode !== "face" || !selectionCount} onClick={(event) => runMenuAction(event, snapCursorToSelectedFace)}>3D Cursor → Face Center</button>
-            <button onClick={(event) => runMenuAction(event, resetCursorToWorldOrigin)}>3D Cursor → World Origin</button>
-            <button onClick={(event) => runMenuAction(event, moveEntityOriginToCursor)}>Origin → 3D Cursor</button>
-            {mode === "vertex" && (
-              <button onClick={(event) => runMenuAction(event, addVertexAtCursor)}>
-                <Crosshair size={13} /> Add Vertex at 3D Cursor
-              </button>
-            )}
-          </div>
-        </details>
+
         <details className="geometry-toolbar-menu">
           <summary>Mesh</summary>
           <div className="geometry-toolbar-popover">
-            <button disabled={!selectionCount} onClick={(event) => runMenuAction(event, startExtrude)}>Extrude {MODE_LABELS[mode]} <kbd>E</kbd></button>
-            <button disabled={mode !== "face" || !selectionCount} onClick={(event) => runMenuAction(event, startInset)}>Inset Faces <kbd>I</kbd></button>
-            <button disabled={mode !== "face" || !selectionCount} onClick={(event) => runMenuAction(event, flipSelectedFaceNormals)}>Flip Normals <kbd>Alt+N</kbd></button>
-            <button disabled={mode !== "edge" || !selectionCount} onClick={(event) => runMenuAction(event, startBevel)}>Bevel Edges <kbd>Ctrl+B</kbd></button>
-            <button disabled={mode !== "edge" || !selectionCount} onClick={(event) => runMenuAction(event, bridgeSelectedEdges)}>Bridge Edge Loops</button>
-            <button disabled={mode !== "edge" || !selectionCount} onClick={(event) => runMenuAction(event, gridFillSelectedEdges)}>Grid Fill</button>
+            <button disabled={!count} onClick={(e) => run(e, doDuplicate)}>Duplicate <kbd>Shift+D</kbd></button>
+            <button disabled={!count} onClick={(e) => run(e, () => withSelection("Split", (s) => splitSelection(s.mesh, s.mode)))}>Split <kbd>Y</kbd></button>
+            <button disabled={mode !== "face" || !count} onClick={(e) => run(e, doSeparate)}>Separate <kbd>P</kbd></button>
+            <hr />
             <label className="geometry-menu-field">Cuts
+              <input type="number" min={1} max={10} value={cuts} onChange={(event) => setCuts(THREE.MathUtils.clamp(Math.round(Number(event.target.value)) || 1, 1, 10))} />
+            </label>
+            <button onClick={(e) => run(e, doSubdivide)}>Subdivide {cuts > 1 ? `${cuts}×` : ""}</button>
+            <button onClick={(e) => run(e, startLoopCut)}><Scissors size={13} /> Loop Cut <kbd>Ctrl+R</kbd></button>
+            <button onClick={(e) => run(e, startOffsetLoop)}>Offset Edge Loop <kbd>Ctrl+Shift+R</kbd></button>
+            <button onClick={(e) => run(e, startKnife)}><Scissors size={13} /> Knife <kbd>K</kbd></button>
+            <hr />
+            <button onClick={(e) => run(e, () => doMergeByDistance())}>Merge by Distance <kbd>M D</kbd></button>
+            <button onClick={(e) => run(e, () => doDissolve("limited"))}>Limited Dissolve <kbd>X L</kbd></button>
+            <button onClick={(e) => run(e, () => runOperator("Delete Loose", (s) => ({ message: `Removed ${deleteLoose(s.mesh)} loose elements` })))}>Delete Loose</button>
+            <button onClick={(e) => run(e, () => runOperator("Fill Holes", (s) => ({ message: `Filled ${fillHoles(s.mesh).filled} holes` })))}>Fill Holes</button>
+            <hr />
+            <span className="geometry-menu-heading">Remesh</span>
+            <label className="geometry-menu-field">Voxel Size
               <input
                 type="number"
-                min={1}
-                max={MAX_SUBDIVISION_CUTS}
-                value={cuts}
-                onChange={(event) => setCuts(THREE.MathUtils.clamp(Math.round(Number(event.target.value)) || 1, 1, MAX_SUBDIVISION_CUTS))}
+                min={0}
+                step={0.01}
+                value={remeshDetail}
+                title="Voxel size in local units, as in Blender: halve it for four times the faces. 0 picks one to match the current density."
+                onChange={(event) => setRemeshDetail(Math.max(0, Number(event.target.value) || 0))}
               />
             </label>
-            <button onClick={(event) => runMenuAction(event, subdivideSelection)}>Subdivide {cuts > 1 ? `${cuts}×` : ""}</button>
-            <button disabled={!selectionCount} onClick={(event) => runMenuAction(event, mergeSelection)}>Merge at Center <kbd>M</kbd></button>
-            <button onClick={(event) => runMenuAction(event, startLoopCut)}><Scissors size={13} /> Loop Cut <kbd>Ctrl+R</kbd></button>
+            <button disabled={busy} onClick={(e) => run(e, doRemesh)}>{busy ? "Remeshing…" : "Voxel Remesh (resets UVs)"}</button>
+            <hr />
+            <button onClick={(e) => run(e, () => doSymmetrize("+x"))}>Symmetrize +X → −X</button>
+            <button onClick={(e) => run(e, () => doSymmetrize("-x"))}>Symmetrize −X → +X</button>
+            <button disabled={mode !== "edge" || !count} onClick={(e) => run(e, () => runOperator("Spin", (s) => spinEdges(s.mesh, selected(s.mesh, "edge"), { steps: 12 })))}>Spin</button>
+            <hr />
+            <span className="geometry-menu-heading">Delete <kbd>X</kbd></span>
+            {DELETE_MODES.map((entry) => (
+              <button key={entry.id} disabled={!count} onClick={(e) => run(e, () => doDelete(entry.id))}>{entry.label}</button>
+            ))}
+            <hr />
+            <span className="geometry-menu-heading">Dissolve</span>
+            <button disabled={!count} onClick={(e) => run(e, () => doDissolve("verts"))}>Vertices <kbd>X D</kbd></button>
+            <button disabled={!count} onClick={(e) => run(e, () => doDissolve("edges"))}>Edges <kbd>X G</kbd></button>
+            <button disabled={!count} onClick={(e) => run(e, () => doDissolve("faces"))}>Faces <kbd>X S</kbd></button>
           </div>
         </details>
+
+        <details className="geometry-toolbar-menu">
+          <summary>Vertex</summary>
+          <div className="geometry-toolbar-popover">
+            <button disabled={!count} onClick={(e) => run(e, () => startExtrude("free"))}>Extrude Vertices <kbd>E</kbd></button>
+            <button disabled={!count} onClick={(e) => run(e, () => doMakeEdgeFace())}>New Edge/Face from Vertices <kbd>F</kbd></button>
+            <button disabled={!count} onClick={(e) => run(e, () => withSelection("Connect Vertex Path", (s) => connectVertPath(s.mesh)))}>Connect Vertex Path <kbd>J</kbd></button>
+            <button disabled={!count} onClick={(e) => run(e, () => doRip(false))}>Rip Vertices <kbd>V</kbd></button>
+            <button disabled={!count} onClick={(e) => run(e, () => doRip(true))}>Rip Vertices and Fill</button>
+            <button disabled={!count} onClick={(e) => run(e, doSmooth)}>Smooth Vertices</button>
+            <hr />
+            <span className="geometry-menu-heading">Merge <kbd>M</kbd></span>
+            {MERGE_MODES.map((entry) => (
+              <button key={entry.id} disabled={!count} onClick={(e) => run(e, () => doMerge(entry.id))}>{entry.label}</button>
+            ))}
+            <button onClick={(e) => run(e, doMergeByDistance)}>By Distance</button>
+          </div>
+        </details>
+
+        <details className="geometry-toolbar-menu">
+          <summary>Edge</summary>
+          <div className="geometry-toolbar-popover">
+            <button disabled={mode !== "edge" || !count} onClick={(e) => run(e, () => startExtrude("region"))}>Extrude Edges <kbd>E</kbd></button>
+            <button disabled={mode !== "edge" || !count} onClick={(e) => run(e, startBevel)}>Bevel Edges <kbd>Ctrl+B</kbd></button>
+            <button disabled={mode !== "edge" || !count} onClick={(e) => run(e, () => withSelection("Bridge Edge Loops", (s) => bridgeEdgeLoops(s.mesh, selected(s.mesh, "edge"))))}>Bridge Edge Loops</button>
+            <button disabled={mode !== "edge" || !count} onClick={(e) => run(e, () => withSelection("Grid Fill", (s) => gridFill(s.mesh, selected(s.mesh, "edge"))))}>Grid Fill</button>
+            <button disabled={mode !== "edge" || !count} onClick={(e) => run(e, startEdgeSlide)}>Edge Slide</button>
+            <hr />
+            <button disabled={mode !== "edge" || !count} onClick={(e) => run(e, () => doMark("seam", true, "Mark Seam"))}>Mark Seam</button>
+            <button disabled={mode !== "edge" || !count} onClick={(e) => run(e, () => doMark("seam", false, "Clear Seam"))}>Clear Seam</button>
+            <button disabled={mode !== "edge" || !count} onClick={(e) => run(e, () => doMark("sharp", true, "Mark Sharp"))}>Mark Sharp</button>
+            <button disabled={mode !== "edge" || !count} onClick={(e) => run(e, () => doMark("sharp", false, "Clear Sharp"))}>Clear Sharp</button>
+            <button onClick={(e) => run(e, () => runOperator("Mark Sharp by Angle", (s) => ({ message: `Updated ${markSharpByAngle(s.mesh)} edges` })))}>Mark Sharp by Angle</button>
+          </div>
+        </details>
+
+        <details className="geometry-toolbar-menu">
+          <summary>Face</summary>
+          <div className="geometry-toolbar-popover">
+            <button disabled={mode !== "face" || !count} onClick={(e) => run(e, () => startExtrude("region"))}>Extrude Region <kbd>E</kbd></button>
+            <button disabled={mode !== "face" || !count} onClick={(e) => run(e, () => startExtrude("individual"))}>Extrude Individual <kbd>Alt+E I</kbd></button>
+            <button disabled={mode !== "face" || !count} onClick={(e) => run(e, () => startExtrude("normals"))}>Extrude Along Normals <kbd>Alt+E N</kbd></button>
+            <button disabled={mode !== "face" || !count} onClick={(e) => run(e, () => startInset(false))}>Inset Faces <kbd>I</kbd></button>
+            <button disabled={mode !== "face" || !count} onClick={(e) => run(e, () => startInset(true))}>Inset Individual <kbd>Shift+I</kbd></button>
+            <button disabled={mode !== "face" || !count} onClick={(e) => run(e, () => runOperator("Poke Faces", (s) => ({ message: `Poked ${pokeFaces(s.mesh, selected(s.mesh, "face"))} faces` })))}>Poke Faces</button>
+            <hr />
+            <button onClick={(e) => run(e, () => runOperator("Triangulate", (s) => ({ message: `Triangulated ${triangulateFaces(s.mesh, selected(s.mesh, "face"))} faces` })))}>Triangulate <kbd>Ctrl+T</kbd></button>
+            <button onClick={(e) => run(e, () => runOperator("Tris to Quads", (s) => ({ message: `Merged ${trisToQuads(s.mesh, { faces: selected(s.mesh, "face") })} quads` })))}>Tris to Quads <kbd>Alt+J</kbd></button>
+            <hr />
+            <button onClick={(e) => run(e, () => doShading(true))}>Shade Smooth</button>
+            <button onClick={(e) => run(e, () => doShading(false))}>Shade Flat</button>
+            <hr />
+            <span className="geometry-menu-heading">Normals</span>
+            <button onClick={(e) => run(e, () => doRecalculate(false))}>Recalculate Outside <kbd>Shift+N</kbd></button>
+            <button onClick={(e) => run(e, () => doRecalculate(true))}>Recalculate Inside <kbd>Ctrl+Shift+N</kbd></button>
+            <button disabled={mode !== "face" || !count} onClick={(e) => run(e, () => runOperator("Flip Normals", (s) => ({ message: `Flipped ${flipNormals(s.mesh, selected(s.mesh, "face"))} faces` })))}>Flip <kbd>Alt+N</kbd></button>
+          </div>
+        </details>
+
         <details className="geometry-toolbar-menu">
           <summary>UV</summary>
           <div className="geometry-toolbar-popover">
-            <button onClick={(event) => runMenuAction(event, () => mutate((value) => unwrapPlanar(value.editable, "z")))}><Triangle size={13} /> Planar</button>
-            <button onClick={(event) => runMenuAction(event, () => mutate((value) => unwrapBox(value.editable)))}><Box size={13} /> Box</button>
+            <button onClick={(e) => run(e, () => doUnwrap("planar"))}><Triangle size={13} /> Planar</button>
+            <button onClick={(e) => run(e, () => doUnwrap("box"))}><Box size={13} /> Box</button>
           </div>
         </details>
-        {mode === "face" && <details className="geometry-toolbar-menu">
-          <summary>Material</summary>
-          <div className="geometry-toolbar-popover geometry-material-popover">
-            <label>Face slot
-              <select value={faceMaterial} onChange={(event) => setFaceMaterial(Number(event.target.value))}>
-                {materialSlots.map((path, index) => <option key={index} value={index}>{materialSlotLabel(path, index)}</option>)}
-              </select>
-            </label>
-            <button disabled={!selectionCount} onClick={(event) => runMenuAction(event, assignMaterial)}>Assign to Selection</button>
-          </div>
-        </details>}
+
+        {mode === "face" && (
+          <details className="geometry-toolbar-menu">
+            <summary>Material</summary>
+            <div className="geometry-toolbar-popover geometry-material-popover">
+              <label>Face slot
+                <select value={faceMaterial} onChange={(event) => setFaceMaterial(Number(event.target.value))}>
+                  {materialSlots.map((path, index) => <option key={index} value={index}>{materialSlotLabel(path, index)}</option>)}
+                </select>
+              </label>
+              <button disabled={!count} onClick={(e) => run(e, doAssignMaterial)}>Assign to Selection</button>
+            </div>
+          </details>
+        )}
+
         <details className="geometry-toolbar-menu">
           <summary>View</summary>
           <div className="geometry-toolbar-popover">
-            <button className={xray ? "active" : ""} onClick={(event) => runMenuAction(event, toggleXray)}><Eye size={13} /> X-Ray <kbd>Alt+Z</kbd></button>
-            <button className={showSceneContext ? "active" : ""} onClick={(event) => runMenuAction(event, () => setShowSceneContext((value) => !value))}><Layers size={13} /> Scene Context</button>
-            <button onClick={(event) => runMenuAction(event, focusGeometry)}>Focus Geometry</button>
+            <span className="geometry-menu-heading">Shading <kbd>Z</kbd></span>
+            {SHADING_MODES.map((entry) => (
+              <button key={entry.id} className={shading === entry.id ? "active" : ""} title={entry.hint} onClick={(e) => run(e, () => setShading(entry.id))}>
+                {entry.label}
+              </button>
+            ))}
+            <hr />
+            <button className={xray ? "active" : ""} onClick={(e) => run(e, toggleXray)}><Eye size={13} /> X-Ray <kbd>Alt+Z</kbd></button>
+            <button className={showSceneContext ? "active" : ""} onClick={(e) => run(e, () => setShowSceneContext((value) => !value))}><Layers size={13} /> Scene Context</button>
+            <button onClick={(e) => run(e, focusSelection)}>Frame Selected <kbd>.</kbd></button>
+            <button onClick={(e) => run(e, focusGeometry)}>Frame All <kbd>Home</kbd></button>
           </div>
         </details>
-        <button className="toolbar-btn icon-only" title="Undo (Ctrl+Z)" disabled={!session?.history.length} onClick={undo}><Undo2 size={14} /></button>
-        <span className="geometry-editor-spacer" />
-        <span className="geometry-editor-stat geometry-topology-count" key={revision} title={`${session?.editable.positions.length ?? 0} vertices / ${session?.editable.faces.length ?? 0} triangles`}>{session?.editable.positions.length ?? 0}v · {session?.editable.faces.length ?? 0}t</span>
-        {embedded && <button className="toolbar-btn icon-only" title="Cancel scene edit" onClick={onClose}><X size={14} /></button>}
+
+        </>)}
+
+        {editorMode === "sculpt" && (<>
+          <details className="geometry-toolbar-menu">
+            <summary>Brush</summary>
+            <div className="geometry-toolbar-popover">
+              {BRUSHES.map((entry) => (
+                <button key={entry.id} className={brush === entry.id ? "active" : ""} title={entry.hint} onClick={(e) => run(e, () => setBrush(entry.id))}>
+                  {entry.label}
+                </button>
+              ))}
+            </div>
+          </details>
+          <label className="geometry-brush-field" title="Brush radius ( [ and ] )">R
+            <input type="range" min={0.005} max={2} step={0.005} value={brushRadius} onChange={(event) => setBrushRadius(Number(event.target.value))} />
+            <span>{brushRadius.toFixed(3)}</span>
+          </label>
+          <label className="geometry-brush-field" title="Brush strength">S
+            <input type="range" min={0.01} max={1} step={0.01} value={brushStrength} onChange={(event) => setBrushStrength(Number(event.target.value))} />
+            <span>{brushStrength.toFixed(2)}</span>
+          </label>
+          <details className="geometry-toolbar-menu">
+            <summary>Dyntopo</summary>
+            <div className="geometry-toolbar-popover">
+              <button className={dyntopo ? "active" : ""} onClick={(e) => run(e, () => setDyntopo((value) => !value))}>
+                {dyntopo ? "Enabled" : "Disabled"} <kbd>D</kbd>
+              </button>
+              <label className="geometry-menu-field">Detail
+                <input type="number" min={0.002} step={0.01} value={detailSize} onChange={(event) => setDetailSize(Math.max(0.002, Number(event.target.value) || 0.05))} />
+              </label>
+              <label className="geometry-menu-field">Mode
+                <select value={dyntopoMode} onChange={(event) => setDyntopoMode(event.target.value)}>
+                  <option value="both">Subdivide &amp; Collapse</option>
+                  <option value="subdivide">Subdivide Only</option>
+                  <option value="collapse">Collapse Only</option>
+                </select>
+              </label>
+              <hr />
+              <span className="geometry-menu-note">Dyntopo triangulates the area under the brush, as it does in Blender.</span>
+              <hr />
+              <span className="geometry-menu-heading">Remesh</span>
+              <label className="geometry-menu-field">Voxel Size
+                <input
+                  type="number"
+                  min={0}
+                  step={0.01}
+                  value={remeshDetail}
+                  title="Voxel size in local units, as in Blender. 0 picks one to match the current density."
+                  onChange={(event) => setRemeshDetail(Math.max(0, Number(event.target.value) || 0))}
+                />
+              </label>
+              <button disabled={busy} onClick={(e) => run(e, doRemesh)}>{busy ? "Remeshing…" : "Voxel Remesh"}</button>
+              <span className="geometry-menu-note">Rebuilds the surface as uniform quads at the voxel size, as Blender's Remesh does. Resets UVs.</span>
+            </div>
+          </details>
+          <details className="geometry-toolbar-menu">
+            <summary>Symmetry</summary>
+            <div className="geometry-toolbar-popover">
+              {["x", "y", "z"].map((axis) => (
+                <button key={axis} className={symmetry[axis] ? "active" : ""} onClick={(e) => run(e, () => setSymmetry((value) => ({ ...value, [axis]: !value[axis] })))}>
+                  Mirror {axis.toUpperCase()}
+                </button>
+              ))}
+              <hr />
+              <label className="geometry-menu-field">Falloff
+                <select value={brushFalloff} onChange={(event) => setBrushFalloff(event.target.value)}>
+                  {FALLOFFS.map((entry) => <option key={entry.id} value={entry.id}>{entry.label}</option>)}
+                </select>
+              </label>
+            </div>
+          </details>
+          <details className="geometry-toolbar-menu">
+            <summary>View</summary>
+            <div className="geometry-toolbar-popover">
+              <span className="geometry-menu-heading">Shading <kbd>Z</kbd></span>
+              {SHADING_MODES.map((entry) => (
+                <button key={entry.id} className={shading === entry.id ? "active" : ""} title={entry.hint} onClick={(e) => run(e, () => setShading(entry.id))}>
+                  {entry.label}
+                </button>
+              ))}
+              <hr />
+              <button className={showSceneContext ? "active" : ""} onClick={(e) => run(e, () => setShowSceneContext((value) => !value))}><Layers size={13} /> Scene Context</button>
+              <button onClick={(e) => run(e, focusGeometry)}>Frame All <kbd>Home</kbd></button>
+            </div>
+          </details>
+        </>)}
+
+        {editorMode === "paint" && (<>
+          <label className="geometry-brush-field" title="Brush colour">C
+            <input type="color" value={paintColor} onChange={(event) => setPaintColor(event.target.value)} />
+          </label>
+          <label className="geometry-brush-field" title="Brush radius ( [ and ] )">R
+            <input type="range" min={0.005} max={2} step={0.005} value={brushRadius} onChange={(event) => setBrushRadius(Number(event.target.value))} />
+            <span>{brushRadius.toFixed(3)}</span>
+          </label>
+          <label className="geometry-brush-field" title="Brush strength">S
+            <input type="range" min={0.01} max={1} step={0.01} value={brushStrength} onChange={(event) => setBrushStrength(Number(event.target.value))} />
+            <span>{brushStrength.toFixed(2)}</span>
+          </label>
+          <details className="geometry-toolbar-menu">
+            <summary>Paint</summary>
+            <div className="geometry-toolbar-popover">
+              <span className="geometry-menu-heading">Blend</span>
+              {PAINT_BLEND_MODES.map((entry) => (
+                <button key={entry.id} className={paintBlend === entry.id ? "active" : ""} onClick={(e) => run(e, () => setPaintBlend(entry.id))}>
+                  {entry.label}
+                </button>
+              ))}
+              <hr />
+              <label className="geometry-menu-field">Falloff
+                <select value={brushFalloff} onChange={(event) => setBrushFalloff(event.target.value)}>
+                  {FALLOFFS.map((entry) => <option key={entry.id} value={entry.id}>{entry.label}</option>)}
+                </select>
+              </label>
+              <label className="geometry-menu-field">Resolution
+                <select value={paintResolution} onChange={(event) => setPaintResolution(Number(event.target.value))}>
+                  {[256, 512, 1024, 2048].map((size) => <option key={size} value={size}>{size}</option>)}
+                </select>
+              </label>
+              <span className="geometry-menu-note">Changing the resolution starts a new blank layer.</span>
+              <hr />
+              <button onClick={(e) => run(e, undoPaintStroke)}>Undo Stroke <kbd>Ctrl+Z</kbd></button>
+              <button onClick={(e) => run(e, savePaintTexture)}>Save as PNG</button>
+              <span className="geometry-menu-note">Saved to the project's textures folder. Assign it in the material to use it.</span>
+            </div>
+          </details>
+          <details className="geometry-toolbar-menu">
+            <summary>View</summary>
+            <div className="geometry-toolbar-popover">
+              <button className={showSceneContext ? "active" : ""} onClick={(e) => run(e, () => setShowSceneContext((value) => !value))}><Layers size={13} /> Scene Context</button>
+              <button onClick={(e) => run(e, focusGeometry)}>Frame All <kbd>Home</kbd></button>
+            </div>
+          </details>
+        </>)}
+
+        </div>
+
+        {/* Pinned: undo/redo, the topology readout and the way out of Edit Mode
+            must stay reachable at any width, so they sit outside the scroller. */}
+        <div className="geometry-editor-toolbar-pinned">
+          <button className="toolbar-btn icon-only" title="Undo (Ctrl+Z)" disabled={!session?.history.length} onClick={undo}><Undo2 size={14} /></button>
+          <button className="toolbar-btn icon-only" title="Redo (Ctrl+Shift+Z)" disabled={!session?.future.length} onClick={redo}><Redo2 size={14} /></button>
+          <span className="geometry-editor-stat geometry-topology-count" key={revision} title={stats ? `${stats.verts} verts · ${stats.edges} edges · ${stats.faces} faces (${stats.triangles} tris, ${stats.quads} quads, ${stats.ngons} n-gons)${stats.nonManifold ? ` · ${stats.nonManifold} non-manifold edges` : ""}` : ""}>
+            {stats ? `${stats.verts}v · ${stats.edges}e · ${stats.faces}f` : ""}
+          </span>
+          {embedded && <button className="toolbar-btn icon-only" title="Cancel scene edit" onClick={onClose}><X size={14} /></button>}
+        </div>
       </div>
+
       <div className="geometry-editor-viewport" ref={hostRef}>
-        {session && (
-          <AxisViewGizmo
-            camera={session.camera}
-            controls={session.controls}
-            activeView={snapView}
-            onSnap={handleAxisSnap}
-          />
-        )}
+        {session && <AxisViewGizmo camera={session.camera} controls={session.controls} activeView={snapView} onSnap={handleAxisSnap} />}
       </div>
+
       {selectionGesture?.kind === "box" && (() => {
         const rect = rootRef.current?.getBoundingClientRect();
         if (!rect) return null;
         const left = Math.min(selectionGesture.start.x, selectionGesture.current.x) - rect.left;
         const top = Math.min(selectionGesture.start.y, selectionGesture.current.y) - rect.top;
-        const width = Math.abs(selectionGesture.current.x - selectionGesture.start.x);
-        const height = Math.abs(selectionGesture.current.y - selectionGesture.start.y);
-        return <div className="geometry-selection-rect" style={{ left, top, width, height }} />;
+        return <div className="geometry-selection-rect" style={{ left, top, width: Math.abs(selectionGesture.current.x - selectionGesture.start.x), height: Math.abs(selectionGesture.current.y - selectionGesture.start.y) }} />;
       })()}
       {selectionGesture?.kind === "circle" && (() => {
         const rect = rootRef.current?.getBoundingClientRect();
@@ -2594,16 +3096,80 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
         const radius = selectionGesture.radius;
         return <div className="geometry-selection-circle" style={{ left: selectionGesture.current.x - rect.left - radius, top: selectionGesture.current.y - rect.top - radius, width: radius * 2, height: radius * 2 }} />;
       })()}
-      {macroState && (
+      {selectionGesture?.kind === "lasso" && (() => {
+        const rect = rootRef.current?.getBoundingClientRect();
+        if (!rect || !selectionGesture.path?.length) return null;
+        const points = selectionGesture.path.map((point) => `${point.x - rect.left},${point.y - rect.top}`).join(" ");
+        return (
+          <svg className="geometry-selection-lasso" width={rect.width} height={rect.height}>
+            <polygon points={points} />
+          </svg>
+        );
+      })()}
+
+      {(editorMode === "sculpt" || editorMode === "paint") && brushCursor && (
+        <div
+          className={`geometry-brush-cursor ${brushCursor.off ? "off-surface" : ""}`}
+          style={{
+            left: brushCursor.x - (brushCursor.radius ?? 24),
+            top: brushCursor.y - (brushCursor.radius ?? 24),
+            width: (brushCursor.radius ?? 24) * 2,
+            height: (brushCursor.radius ?? 24) * 2,
+          }}
+        />
+      )}
+      {knifePoints && (
         <div className="geometry-transform-hud">
-          <strong>{macroState.kind === "translate" ? "Move" : macroState.kind === "rotate" ? "Rotate" : macroState.kind === "extrude" ? "Extrude" : macroState.kind === "loopcut" ? "Loop Cut" : macroState.kind === "bevel" ? "Bevel" : macroState.kind === "inset" ? "Inset" : "Scale"}</strong>
-          {(macroState.kind === "loopcut" || macroState.kind === "bevel") && <span className="geometry-transform-value">{macroState.segments ?? 1}×</span>}
-          <span>{macroState.kind === "loopcut" ? (macroState.locked ? "Edge Slide" : "Even Spacing") : macroState.kind === "bevel" ? `${Math.round((macroState.amount ?? 0) * 1000) / 1000} width` : macroState.kind === "inset" ? `${Math.round((macroState.amount ?? 0) * 1000) / 1000} factor` : macroState.axis ? macroState.axis.toUpperCase() : macroState.kind === "rotate" ? "View" : macroState.kind === "extrude" && !macroState.free ? "Normal" : "Free"}</span>
-          {macroState.buffer && <span className="geometry-transform-value">{macroState.buffer}{macroState.kind === "rotate" ? "°" : ""}</span>}
-          <small>{macroState.kind === "loopcut" && macroState.locked ? "Slide · LMB confirm · Esc cancel" : macroState.kind === "loopcut" ? "Scroll cuts · LMB set · Esc cancel" : macroState.kind === "bevel" ? "Move width · Scroll segments · LMB confirm · Esc cancel" : "LMB / Enter confirm · Esc / RMB cancel"}</small>
+          <strong>Knife</strong>
+          <span className="geometry-transform-value">{knifePoints.length} point{knifePoints.length === 1 ? "" : "s"}</span>
+          <small>Click to place · Enter to cut · Esc cancel</small>
         </div>
       )}
-      <div className="geometry-editor-shortcuts"><kbd>1/2/3</kbd> modes <kbd>F</kbd> focus <kbd>Numpad</kbd> axis view <kbd>Alt+Click</kbd> loop <kbd>Ctrl+Click</kbd> path <kbd>Shift+D</kbd> duplicate <kbd>Esc</kbd> cancel</div>
+      {macroState && (
+        <div className="geometry-transform-hud">
+          <strong>{macroState.label}</strong>
+          {(macroState.kind === "loopcut" || macroState.kind === "bevel") && <span className="geometry-transform-value">{macroState.segments ?? 1}×</span>}
+          <span>
+            {macroState.kind === "loopcut"
+              ? (macroState.locked ? "Edge Slide" : "Scroll for cuts")
+              : macroState.kind === "bevel"
+                ? `${Math.round((macroState.amount ?? 0) * 1000) / 1000} width`
+                : macroState.kind === "inset"
+                  ? `${Math.round((macroState.amount ?? 0) * 1000) / 1000} thickness`
+                  : macroState.axis
+                    ? `${macroState.axis.toUpperCase()} · ${macroState.orientation}`
+                    : macroState.kind === "extrude" && !macroState.free ? "Normal" : "Free"}
+          </span>
+          {macroState.buffer && <span className="geometry-transform-value">{macroState.buffer}{macroState.kind === "rotate" ? "°" : ""}</span>}
+          {macroState.proportional && <span className="geometry-transform-value">O {Math.round((macroState.radius ?? 0) * 100) / 100}</span>}
+          <small>
+            {macroState.kind === "loopcut" && !macroState.locked
+              ? "Scroll cuts · LMB to slide · Esc cancel"
+              : "LMB / Enter confirm · Esc / RMB cancel · X/Y/Z axis · Shift+axis plane · Shift precision"}
+          </small>
+        </div>
+      )}
+
+      <button
+        className={`geometry-help-toggle ${showHelp ? "active" : ""}`}
+        title={showHelp ? "Hide shortcuts" : "Show shortcuts"}
+        onClick={() => setShowHelp((value) => !value)}
+      >
+        ?
+      </button>
+      {showHelp && (editorMode === "paint" ? (
+        <div className="geometry-editor-shortcuts">
+          <kbd>LMB</kbd> paint <kbd>Ctrl</kbd> erase <kbd>[ ]</kbd> radius <kbd>Ctrl+Z</kbd> undo stroke <kbd>Z</kbd> shading
+        </div>
+      ) : editorMode === "sculpt" ? (
+        <div className="geometry-editor-shortcuts">
+          <kbd>LMB</kbd> sculpt <kbd>Ctrl</kbd> invert <kbd>Shift</kbd> smooth <kbd>[ ]</kbd> radius <kbd>D</kbd> dyntopo <kbd>X C I S F G</kbd> brushes
+        </div>
+      ) : (
+        <div className="geometry-editor-shortcuts">
+          <kbd>1/2/3</kbd> modes <kbd>E</kbd> extrude <kbd>I</kbd> inset <kbd>Ctrl+R</kbd> loop cut <kbd>Ctrl+B</kbd> bevel <kbd>K</kbd> knife <kbd>F</kbd> make face <kbd>X</kbd> delete <kbd>M</kbd> merge <kbd>Alt+Click</kbd> loop <kbd>Ctrl+Click</kbd> path
+        </div>
+      ))}
       {status && <div className="geometry-editor-status">{status}</div>}
     </div>
   );

@@ -16,7 +16,7 @@
 // per-direction loop inside the trace shader — a prior GI attempt hit
 // multi-second pipeline-compile stalls from JS-unrolled direction loops, and
 // per-ray threads sidestep the whole class.
-import { Fn, If, Loop, float, floor, instanceIndex, instancedArray, max, mod, step, vec2, vec3, vec4 } from "three/tsl";
+import { Fn, If, Loop, float, floor, instanceIndex, instancedArray, max, mod, step, uniform, vec2, vec3, vec4 } from "three/tsl";
 
 /**
  * Octahedral texel-center direction for a dirIdx in a res×res tile.
@@ -71,25 +71,22 @@ export function octahedralTexelIndex(dir, res) {
 
 /**
  * Cell-centered probe position for a probeIdx in a gx×gy×gz lattice spanning
- * `bounds` ({min: Vector3, max: Vector3} in world units). Cell-centered (not
- * corner-anchored) so coarser cascades interleave between finer probes and
- * no axis degenerates when its count reaches 1.
+ * the volume described by `world` ({min, size} UNIFORM vec3 nodes — see
+ * createSdfScene's world bundle; uniforms so an auto-fit refit moves the
+ * lattice without a shader recompile). Cell-centered (not corner-anchored)
+ * so coarser cascades interleave between finer probes and no axis
+ * degenerates when its count reaches 1.
  */
-export function probeLatticePosition(probeIdxF, grid, bounds) {
+export function probeLatticePosition(probeIdxF, grid, world) {
   const gx = float(grid.x);
   const gy = float(grid.y);
   const ix = mod(probeIdxF, gx).floor();
   const iy = mod(floor(probeIdxF.div(gx)), gy).floor();
   const iz = floor(probeIdxF.div(gx.mul(gy)));
-  const span = {
-    x: bounds.max.x - bounds.min.x,
-    y: bounds.max.y - bounds.min.y,
-    z: bounds.max.z - bounds.min.z,
-  };
   return vec3(
-    float(bounds.min.x).add(ix.add(0.5).mul(span.x / grid.x)),
-    float(bounds.min.y).add(iy.add(0.5).mul(span.y / grid.y)),
-    float(bounds.min.z).add(iz.add(0.5).mul(span.z / grid.z)),
+    world.min.x.add(ix.add(0.5).mul(world.size.x.div(grid.x))),
+    world.min.y.add(iy.add(0.5).mul(world.size.y.div(grid.y))),
+    world.min.z.add(iz.add(0.5).mul(world.size.z.div(grid.z))),
   );
 }
 
@@ -106,8 +103,13 @@ export function probeLatticePosition(probeIdxF, grid, bounds) {
  * @param {number} opts.farT max distance for the outermost cascade
  * @param {Function} opts.sceneTrace (origin, dir) → { rad: vec3, t: float (<0 miss) }
  */
-export function createRadianceCascades({ bounds, cascadeCount, c0Grid, c0DirRes, t0, farT = 1e4, sceneTrace }) {
+export function createRadianceCascades({ world, cascadeCount, c0Grid, c0DirRes, t0, farT = 1e4, sceneTrace }) {
   const cascades = [];
+  // Interval parameterization as UNIFORMS (world-space lengths derived from
+  // the volume size) — an auto-fit refit rescales the intervals in place,
+  // matching the probe lattice the world uniforms already moved.
+  const t0U = uniform(t0);
+  const farTU = uniform(farT);
 
   for (let level = 0; level < cascadeCount; level++) {
     const div = 2 ** level;
@@ -119,9 +121,9 @@ export function createRadianceCascades({ bounds, cascadeCount, c0Grid, c0DirRes,
     const dirRes = c0DirRes * div;
     const dirCount = dirRes * dirRes;
     const probeCount = grid.x * grid.y * grid.z;
-    const tMin = t0 * (div - 1);
+    const tMin = t0U.mul(div - 1);
     const isLast = level === cascadeCount - 1;
-    const intervalLen = isLast ? farT : t0 * (2 ** (level + 1) - 1) - tMin;
+    const intervalLen = isLast ? float(farTU) : t0U.mul(2 ** (level + 1) - 1).sub(tMin);
 
     // Ray payload: rgb = interval radiance, w = hit distance from the PROBE
     // (not the interval start; the merge's visibility weighting wants the
@@ -130,7 +132,7 @@ export function createRadianceCascades({ bounds, cascadeCount, c0Grid, c0DirRes,
     // Per-probe mean of own-interval radiance — debug-gizmo food.
     const averages = instancedArray(probeCount, "vec3");
 
-    const probePositionOf = (probeIdxF) => probeLatticePosition(probeIdxF, grid, bounds);
+    const probePositionOf = (probeIdxF) => probeLatticePosition(probeIdxF, grid, world);
     const directionOf = (dirIdxF) => octahedralDirection(dirIdxF, dirRes);
 
     const traceCompute = Fn(() => {
@@ -167,7 +169,7 @@ export function createRadianceCascades({ bounds, cascadeCount, c0Grid, c0DirRes,
 
     cascades.push({
       level,
-      bounds,
+      world,
       grid,
       dirRes,
       dirCount,
@@ -183,5 +185,5 @@ export function createRadianceCascades({ bounds, cascadeCount, c0Grid, c0DirRes,
     });
   }
 
-  return { cascades };
+  return { cascades, intervals: { t0: t0U, farT: farTU } };
 }

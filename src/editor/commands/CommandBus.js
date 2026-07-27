@@ -3,6 +3,7 @@ import { engine } from "../engineInstance.js";
 import { useSceneStore } from "../store/sceneStore.js";
 import { useSelectionStore } from "../store/selectionStore.js";
 import { usePrefabStore } from "../store/prefabStore.js";
+import { vmSingleton } from "../singleton.js";
 
 const MAX_HISTORY = 100;
 
@@ -67,11 +68,19 @@ class CommandBus {
 }
 
 /** UI-facing mirror of history state (menu enablement). */
-export const useHistoryStore = create(() => ({
-  canUndo: false,
-  canRedo: false,
-  undoLabel: null,
-  redoLabel: null,
-}));
+export const useHistoryStore = vmSingleton("historyStore", () =>
+  create(() => ({
+    canUndo: false,
+    canRedo: false,
+    undoLabel: null,
+    redoLabel: null,
+  })),
+);
 
-export const commandBus = new CommandBus();
+/**
+ * VM-wide, not merely module-wide. A second CommandBus (from an HMR
+ * re-evaluation, or Vite's `?t=` URL duplicate) splits the editor in half: the
+ * newer bus mutates the engine and refreshes a store the mounted UI is not
+ * watching, so edits land on disk but never on screen. See `singleton.js`.
+ */
+export const commandBus = vmSingleton("commandBus", () => new CommandBus());

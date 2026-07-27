@@ -43,6 +43,15 @@ export class Component {
   // `MyComponent.tags` is always safe even for subclasses that don't set it.
   static tags = [];
 
+  // Leaving Play mode restores the scene by diffing the snapshot against the
+  // live tree (see serialize.js `reconcileScene`), so components normally
+  // survive it untouched — that's what keeps loaded models and the GI bake
+  // alive across a stop. Components whose runtime state is NOT in `props` (a
+  // playing sound, an animation state machine's position, a script instance's
+  // fields) set this to true and get detached + re-attached instead, so the
+  // next Play starts from a clean slate.
+  static resetOnStop = false;
+
   constructor(entity, props = {}) {
     this.entity = entity;
     // `enabled` lives outside the subclass `defaults` spread so it's always
@@ -60,6 +69,30 @@ export class Component {
     // Cached viewOnly boolean (resolved against the entity's own flag once
     // per `setProp` cycle). Avoids re-reading the entity every frame.
     this._viewOnlyActive = !!this.props.viewOnly || !!this.entity?.viewOnly;
+  }
+
+  /**
+   * Whether this component participates in per-frame frustum gating.
+   *
+   * Backed by an accessor rather than a plain field so that flipping it keeps
+   * `engine.viewOnlyComponents` in sync. The engine's main loop iterates that
+   * registry instead of walking every entity's component map each frame —
+   * view-only components are a small minority, but the walk to find them cost
+   * a nested Map iteration over the WHOLE scene every frame, which is exactly
+   * the kind of per-frame O(scene) work that makes a 10k-entity scene stutter.
+   */
+  get _viewOnlyActive() {
+    return this.__viewOnlyActive === true;
+  }
+
+  set _viewOnlyActive(value) {
+    const next = !!value;
+    if (next === this.__viewOnlyActive) return;
+    this.__viewOnlyActive = next;
+    const registry = this.entity?.engine?.viewOnlyComponents;
+    if (!registry) return;
+    if (next) registry.add(this);
+    else registry.delete(this);
   }
 
   get type() {

@@ -1,10 +1,18 @@
 import { useEffect, useRef, useState } from "react";
-import { ExternalLink, Workflow, Package } from "lucide-react";
+import { ExternalLink, Globe, Workflow, Package, Tag } from "lucide-react";
 import * as THREE from "three/webgpu";
 import { createGltfLoader } from "../../engine/gltfLoader.js";
 import { useSelectionStore } from "../store/selectionStore.js";
 import { useProjectStore } from "../store/projectStore.js";
 import { toBlobUrl, extOf, readAssetMeta, TEXTURE_EXTENSIONS } from "../assetLoader.js";
+import {
+  CUBEMAP_DEFAULTS,
+  CUBEMAP_FACES,
+  invalidateCubemapAsset,
+  isCubemapComplete,
+  normalizeCubemapDef,
+} from "../../engine/cubemapAsset.js";
+import { AssetField } from "../fields/AssetField.jsx";
 import { TEXTURE_META_DEFAULTS } from "../../engine/textureMeta.js";
 import {
   MATERIAL_PIPELINE_DEFAULTS,
@@ -15,9 +23,19 @@ import {
 } from "../../engine/materialAsset.js";
 import { openPanel } from "../EditorShell.jsx";
 import { syncScriptClassNameAfterRename } from "../scriptClassSync.js";
+import { openInIDE } from "../openInIde.js";
+import { TagField } from "../fields/TagField.jsx";
+import {
+  ASSET_FLAG_DEFAULTS,
+  allAssetTags,
+  readAssetFlags,
+  setAssetFlags,
+  useAssetFlagsStore,
+} from "../assetFlags.js";
 import { openPrefabMode } from "../prefab.js";
 import { useModulesStore } from "../modules.js";
 import { prefabRegistry, resolvePrefab, isPrefabDef } from "../../engine/index.js";
+import { throttlePreviewFrame } from "../previewLoop.js";
 
 const fileName = (p) => p?.split(/[\\/]/).pop() ?? "";
 const stemOf = (name) => name.replace(/\.[^.]+$/, "");
@@ -48,6 +66,7 @@ const TYPE_LABELS = {
   glb: "Model",
   geom: "Geometry",
   mat: "Material",
+  cubemap: "Cube Map",
   anim: "Animator",
   prefab: "Prefab",
   entity: "Prefab (legacy)",
@@ -345,10 +364,13 @@ function MultiAssetInspector({ paths }) {
           <span className="asset-type-badge">{allTextures ? "Textures" : sameType ? (TYPE_LABELS[extensions[0]] ?? extensions[0].toUpperCase()) : "Mixed"}</span>
         </div>
       </div>
+      {/* Tags and build flags apply to any asset, so they batch-edit even for
+          a mixed selection — which is exactly when you want them. */}
+      <AssetSettingsSection paths={paths} />
       {allTextures ? <MultiTextureSettings paths={paths} /> : allVirtualGeometry ? (
         <MultiVirtualGeometrySettings paths={paths} />
       ) : (
-        <div className="asset-hint">Batch editing is available when the selected assets share editable import settings.</div>
+        <div className="asset-hint">Batch editing of import settings is available when the selected assets share a type.</div>
       )}
     </div>
   );
@@ -421,8 +443,8 @@ function ModelPreview({ path }) {
 
         const timer = new THREE.Timer();
         let angle = 0.7;
-        renderer.setAnimationLoop(() => {
-          if (!canvas.isConnected || canvas.clientWidth < 1 || canvas.clientHeight < 1) return;
+        // Capped at PREVIEW_FPS and skipped while hidden — see previewLoop.js.
+        renderer.setAnimationLoop(throttlePreviewFrame(canvas, () => {
           timer.update();
           const dt = timer.getDelta();
           angle += dt * 0.5;
@@ -434,7 +456,7 @@ function ModelPreview({ path }) {
           );
           camera.lookAt(center);
           renderer.render(scene, camera);
-        });
+        }));
       } catch (err) {
         if (!disposed) setError(String(err.message ?? err));
       }
@@ -508,6 +530,7 @@ function VirtualGeometrySettings({ path }) {
         ...VIRTUAL_GEOMETRY_META_DEFAULTS,
         enabled: stored.enabled === true,
         pixelError: stored.pixelError ?? VIRTUAL_GEOMETRY_META_DEFAULTS.pixelError,
+        hysteresis: stored.hysteresis ?? VIRTUAL_GEOMETRY_META_DEFAULTS.hysteresis,
       };
       if (live) setVg(merged);
     })();
@@ -552,10 +575,23 @@ function VirtualGeometrySettings({ path }) {
               onChange={(e) => patch({ pixelError: Math.max(0.05, parseFloat(e.target.value) || 1) })}
             />
           </div>
+          <div className="field-row" title="How far the camera moves (fraction of its distance) before this mesh recomputes its LOD. Higher = less CPU, slightly laggier switches.">
+            <span className="field-label">Update Dead-band</span>
+            <input
+              className="number-field"
+              type="number"
+              min={0}
+              max={0.5}
+              step={0.01}
+              value={vg.hysteresis}
+              onChange={(e) => patch({ hysteresis: Math.min(0.5, Math.max(0, parseFloat(e.target.value) || 0)) })}
+            />
+          </div>
           <div className="asset-hint">
             Renders static meshes through Nanite-style cluster LOD wherever this asset is used. Pixel Error is the
-            screen-space error budget — higher is faster, lower is sharper. Use the viewport's Virtual Geometry
-            layer to color every triangle in the live LOD cut.
+            screen-space error budget — higher is faster, lower is sharper. Update Dead-band trades a touch of LOD
+            lag for fewer per-frame recomputes. Use the viewport's Virtual Geometry layer to color every triangle in
+            the live LOD cut.
           </div>
         </>
       )}
@@ -578,6 +614,7 @@ function MultiVirtualGeometrySettings({ paths }) {
           ...VIRTUAL_GEOMETRY_META_DEFAULTS,
           enabled: stored.enabled === true,
           pixelError: stored.pixelError ?? VIRTUAL_GEOMETRY_META_DEFAULTS.pixelError,
+          hysteresis: stored.hysteresis ?? VIRTUAL_GEOMETRY_META_DEFAULTS.hysteresis,
         };
         return { path, meta, vg };
       }));
@@ -645,6 +682,175 @@ function MultiVirtualGeometrySettings({ paths }) {
       )}
       <div className="asset-hint">Changes apply to all {paths.length} selected geometry assets.</div>
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Cube map (.cubemap): six face slots + "use as the scene's skybox"
+// ---------------------------------------------------------------------------
+
+/** Where each face sits in the unfolded-cube preview (row/col in a 3×4 grid). */
+const CUBEMAP_CROSS_CELL = {
+  py: { row: 1, col: 2 },
+  nx: { row: 2, col: 1 },
+  pz: { row: 2, col: 2 },
+  px: { row: 2, col: 3 },
+  nz: { row: 2, col: 4 },
+  ny: { row: 3, col: 2 },
+};
+
+/** Unfolded-cube preview — the fastest way to spot a face in the wrong slot. */
+function CubemapCross({ faces }) {
+  const [urls, setUrls] = useState({});
+  const signature = CUBEMAP_FACES.map((face) => faces[face.key]).join("|");
+  useEffect(() => {
+    let live = true;
+    (async () => {
+      const entries = await Promise.all(
+        CUBEMAP_FACES.map(async ({ key }) => {
+          const path = faces[key];
+          return [key, path ? await toBlobUrl(path).catch(() => null) : null];
+        }),
+      );
+      if (live) setUrls(Object.fromEntries(entries));
+    })();
+    return () => {
+      live = false;
+    };
+  }, [signature]);
+
+  return (
+    <div className="asset-preview cubemap-cross">
+      {CUBEMAP_FACES.map(({ key, label, hint }) => (
+        <div
+          key={key}
+          className={`cubemap-cross-cell${urls[key] ? "" : " empty"}`}
+          style={{ gridRow: CUBEMAP_CROSS_CELL[key].row, gridColumn: CUBEMAP_CROSS_CELL[key].col }}
+          title={`${label} · ${hint}`}
+        >
+          {urls[key] ? <img src={urls[key]} alt="" draggable={false} /> : <span>{label}</span>}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function CubemapEditor({ path }) {
+  const [def, setDef] = useState(null);
+  const [activeSkybox, setActiveSkybox] = useState(null); // engine's current cubemap path
+  const saveQueue = useRef(Promise.resolve());
+
+  useEffect(() => {
+    let live = true;
+    setDef(null);
+    (async () => {
+      let parsed = null;
+      try {
+        parsed = JSON.parse(await invoke("read_text_file", { path }));
+      } catch (err) {
+        console.error(`Failed to read cube map "${path}": ${err}`);
+      }
+      if (live) setDef(normalizeCubemapDef(parsed ?? CUBEMAP_DEFAULTS));
+    })();
+    return () => {
+      live = false;
+    };
+  }, [path]);
+
+  // Track which cube map the open scene uses, so the button reads as a toggle.
+  useEffect(() => {
+    let live = true;
+    let unsub = null;
+    import("../engineInstance.js").then(({ ensureEngine }) =>
+      ensureEngine().then((engine) => {
+        if (!live) return;
+        const read = (settings) => setActiveSkybox(settings?.environment?.cubemap ?? "");
+        read(engine.settings);
+        unsub = engine.on("settings-changed", read);
+      }),
+    );
+    return () => {
+      live = false;
+      unsub?.();
+    };
+  }, []);
+
+  if (!def) return null;
+  const samePath = (a, b) => !!a && !!b && a.replaceAll("\\", "/") === b.replaceAll("\\", "/");
+  const isActive = samePath(activeSkybox, path);
+  const complete = isCubemapComplete(def);
+
+  const setFace = (key, value) => {
+    const next = { ...def, faces: { ...def.faces, [key]: value || "" } };
+    setDef(next);
+    saveQueue.current = saveQueue.current
+      .catch(() => {})
+      .then(async () => {
+        await invoke("save_scene", { path, contents: JSON.stringify(next, null, 2) });
+        // Drop the decoded texture and re-apply scene settings so a skybox
+        // built from this asset picks up the new face immediately. Resolve the
+        // engine BEFORE disposing: an await between dispose and re-apply would
+        // leave a rendered frame pointing at a destroyed GPU texture.
+        const { ensureEngine } = await import("../engineInstance.js");
+        const engine = await ensureEngine();
+        invalidateCubemapAsset(path);
+        await engine.applySettings({});
+      })
+      .catch((err) => console.error(`Failed to save cube map: ${err}`));
+  };
+
+  const useAsSkybox = async (enable) => {
+    const { commandBus } = await import("../commands/CommandBus.js");
+    const { SetSceneSettingsCommand } = await import("../commands/settingsCommands.js");
+    commandBus.execute(
+      new SetSceneSettingsCommand(
+        { environment: { cubemap: enable ? path : "" } },
+        enable ? "Set scene skybox" : "Clear scene skybox",
+      ),
+    );
+  };
+
+  return (
+    <>
+      <CubemapCross faces={def.faces} />
+      <div className="inspector-section">
+        <div className="section-header">Faces</div>
+        {CUBEMAP_FACES.map(({ key, label, hint }) => (
+          <div className="field-row" key={key}>
+            <span className="field-label" title={`${label} (${hint})`}>
+              {label} {hint}
+            </span>
+            <AssetField
+              descriptor={{ exts: TEXTURE_EXTENSIONS, emptyLabel: "None" }}
+              value={def.faces[key]}
+              onCommit={(value) => setFace(key, value)}
+            />
+          </div>
+        ))}
+        {!complete && (
+          <div className="asset-hint">
+            All six faces are required before the cube map can be used. Drop textures onto the slots
+            or pick them from the dropdowns.
+          </div>
+        )}
+      </div>
+      <div className="inspector-section">
+        <div className="section-header">Scene</div>
+        <button
+          className="toolbar-btn wide"
+          disabled={!complete && !isActive}
+          onClick={() => useAsSkybox(!isActive)}
+        >
+          <Globe size={13} />
+          {isActive ? "Remove from Scene Environment" : "Set as Scene Environment"}
+        </button>
+        <div className="asset-hint">
+          {isActive
+            ? "This cube map is the scene's skybox and image-based lighting source. Tune intensity, rotation and blur in Scene Settings → Environment."
+            : "Sets Scene Settings → Environment → Cube Map, which drives both the skybox and image-based lighting."}
+        </div>
+      </div>
+    </>
   );
 }
 
@@ -885,6 +1091,108 @@ function PrefabSummary({ path }) {
 // ---------------------------------------------------------------------------
 
 /** Shown when an Assets-panel file is selected instead of an entity. */
+/**
+ * Tags + build behaviour for one or more assets.
+ *
+ * The three load modes are the whole story of how an asset reaches the game:
+ * preloaded (resident before the first frame), on-demand (the default —
+ * fetched when the scene first asks for it), or excluded (present in the
+ * project, absent from the build). Presenting them as two toggles with an
+ * explicit "on demand" resting state keeps that legible instead of hiding it
+ * behind a pair of unrelated checkboxes.
+ */
+function AssetSettingsSection({ paths }) {
+  // Select the map, not a derived array: a selector that builds a new array on
+  // every call gives useSyncExternalStore a different snapshot each render and
+  // spins.
+  const flagMap = useAssetFlagsStore((s) => s.flags);
+  const key = paths.join("|");
+  useEffect(() => {
+    // Read straight from disk rather than going through the folder-listing
+    // loader: the inspector can be showing an asset the grid never listed, and
+    // one read per selected asset is nothing at inspector scale.
+    let live = true;
+    (async () => {
+      const patch = {};
+      for (const path of paths) patch[path] = await readAssetFlags(path);
+      if (live) useAssetFlagsStore.getState().merge(patch);
+    })();
+    return () => {
+      live = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key]);
+
+  const values = paths.map((path) => flagMap[path] ?? ASSET_FLAG_DEFAULTS);
+  const every = (read) => values.length > 0 && values.every(read);
+  const preload = every((entry) => entry.preload);
+  const exclude = every((entry) => entry.exclude);
+  const mixed = (read) => !values.every((entry) => read(entry) === read(values[0]));
+
+  // Only tags shared by every selected asset are editable together.
+  const tagLists = values.map((entry) => entry.tags ?? []);
+  const sharedTags = (tagLists[0] ?? []).filter((tag) => tagLists.every((list) => list.includes(tag)));
+
+  const commitTags = (next) => {
+    const added = next.filter((tag) => !sharedTags.includes(tag));
+    const removed = sharedTags.filter((tag) => !next.includes(tag));
+    // Per-asset merge, so an asset's own extra tags survive a multi-edit.
+    Promise.all(
+      paths.map((path, index) => {
+        const own = tagLists[index] ?? [];
+        const merged = [...new Set([...own.filter((tag) => !removed.includes(tag)), ...added])];
+        return setAssetFlags([path], { tags: merged });
+      }),
+    ).catch((err) => console.error(`Couldn't update tags: ${err}`));
+  };
+
+  const mode = exclude ? "exclude" : preload ? "preload" : "demand";
+
+  return (
+    <div className="inspector-section">
+      <div className="section-header">
+        <span className="section-title">
+          <Tag size={13} style={{ color: "#3fd0c9" }} />
+          Tags &amp; Build
+        </span>
+      </div>
+      <div className="field-row tags-row">
+        <span className="field-label">Tags</span>
+        <TagField tags={sharedTags} suggestions={allAssetTags()} onChange={commitTags} />
+      </div>
+      <div className="field-row">
+        <span className="field-label" title="Load during the boot phase so this is ready before the first frame">
+          Preload
+        </span>
+        <input
+          type="checkbox"
+          checked={preload}
+          ref={(el) => el && (el.indeterminate = mixed((entry) => entry.preload))}
+          onChange={(e) => setAssetFlags(paths, { preload: e.target.checked })}
+        />
+      </div>
+      <div className="field-row">
+        <span className="field-label" title="Keep the file in the project, but leave it out of exported games">
+          Exclude
+        </span>
+        <input
+          type="checkbox"
+          checked={exclude}
+          ref={(el) => el && (el.indeterminate = mixed((entry) => entry.exclude))}
+          onChange={(e) => setAssetFlags(paths, { exclude: e.target.checked })}
+        />
+      </div>
+      <div className="asset-hint">
+        {mode === "exclude"
+          ? "Stays in the project; never ships in a build."
+          : mode === "preload"
+            ? "Loaded up front — ready the moment the game starts."
+            : "Loaded on demand, the first time the scene needs it."}
+      </div>
+    </div>
+  );
+}
+
 export function AssetInspector({ path }) {
   const assetPaths = useSelectionStore((state) => state.assetPaths);
   if (assetPaths.length > 1) return <MultiAssetInspector paths={assetPaths} />;
@@ -915,16 +1223,14 @@ export function AssetInspector({ path }) {
         {["js", "ts"].includes(ext) && (
           <button
             className="toolbar-btn wide"
-            onClick={async () => {
-              const { openPath } = await import("@tauri-apps/plugin-opener");
-              openPath(path).catch((err) => console.error(String(err)));
-            }}
+            onClick={() => openInIDE(path)}
           >
             <ExternalLink size={13} />
             Open in IDE
           </button>
         )}
       </div>
+      <AssetSettingsSection paths={[path]} />
       {isTexture && (
         <>
           <TexturePreview path={path} />
@@ -939,6 +1245,7 @@ export function AssetInspector({ path }) {
       )}
       {ext === "geom" && <VirtualGeometrySettings path={path} />}
       {ext === "mat" && <MaterialSummary path={path} />}
+      {ext === "cubemap" && <CubemapEditor path={path} />}
       {ext === "anim" && <AnimatorSummary path={path} />}
       {(ext === "prefab" || ext === "entity") && <PrefabSummary path={path} />}
     </div>

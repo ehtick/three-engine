@@ -1,6 +1,7 @@
 import * as THREE from "three/webgpu";
 import { Component } from "./Component.js";
 import { evaluateGeometryModifiers } from "../geometryModifiers.js";
+import { disposeOrReleaseGeometry } from "../geometryAsset.js";
 
 const matrixSignature = (matrix) => matrix.elements.map((value) => Math.round(value * 1e5)).join(",");
 
@@ -50,7 +51,8 @@ export class GeometryModifiersComponent extends Component {
     this._tickUnsub = null;
     const mesh = this.meshComponent?.mesh;
     if (mesh && this.sourceGeometry) {
-      mesh.geometry?.dispose?.();
+      // May still be the shared `.geom` instance other meshes render.
+      disposeOrReleaseGeometry(mesh.geometry);
       mesh.geometry = this.sourceGeometry.clone();
     }
     this.sourceGeometry?.dispose?.();
@@ -60,7 +62,7 @@ export class GeometryModifiersComponent extends Component {
   onDisable() {
     const mesh = this.meshComponent?.mesh;
     if (!mesh || !this.sourceGeometry) return;
-    mesh.geometry?.dispose?.();
+    disposeOrReleaseGeometry(mesh.geometry);
     mesh.geometry = this.sourceGeometry.clone();
   }
 
@@ -140,7 +142,8 @@ export class GeometryModifiersComponent extends Component {
     try {
       const context = this.#booleanContext();
       const evaluated = evaluateGeometryModifiers(this.sourceGeometry, this.props, context);
-      mesh.geometry?.dispose?.();
+      // May still be the shared `.geom` instance other meshes render.
+      disposeOrReleaseGeometry(mesh.geometry);
       mesh.geometry = evaluated;
       this.lastError = "";
       this._booleanSignature = context.booleanMatrix ? matrixSignature(context.booleanMatrix) : "missing";
@@ -148,7 +151,8 @@ export class GeometryModifiersComponent extends Component {
     } catch (error) {
       this.lastError = String(error?.message ?? error);
       console.warn(`Geometry modifiers on "${this.entity.name}" failed: ${this.lastError}`);
-      mesh.geometry?.dispose?.();
+      // May still be the shared `.geom` instance other meshes render.
+      disposeOrReleaseGeometry(mesh.geometry);
       mesh.geometry = this.sourceGeometry.clone();
     }
   }

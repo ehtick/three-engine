@@ -1,10 +1,31 @@
-import { useEffect, useRef, useState } from "react";
-import { X, Plus, Crosshair, Eye, EyeOff, ScanEye, Package, ChevronRight, Sparkles } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useShallow } from "zustand/react/shallow";
+import {
+  X,
+  Plus,
+  Crosshair,
+  Eye,
+  EyeOff,
+  ScanEye,
+  Package,
+  ChevronRight,
+  ChevronUp,
+  ChevronDown,
+  Sparkles,
+  Link,
+  Link2Off,
+  Search,
+  Pencil,
+  PanelsTopLeft,
+  Waypoints,
+  Layers2,
+  FilePlus,
+} from "lucide-react";
 import { useSceneStore } from "../store/sceneStore.js";
 import { useSelectionStore } from "../store/selectionStore.js";
 import { getComponentClass, getComponentTypes } from "../../engine/index.js";
 import { commandBus } from "../commands/CommandBus.js";
-import { RenameEntityCommand, BatchCommand, SetEntityViewOnlyCommand, SetEntityEnabledInEditorCommand, SetEntityEnabledInGameCommand } from "../commands/entityCommands.js";
+import { RenameEntityCommand, BatchCommand, SetEntityViewOnlyCommand, SetEntityEnabledInEditorCommand, SetEntityEnabledInGameCommand, SetEntityTagsCommand } from "../commands/entityCommands.js";
 import { ANCHOR_PRESETS, applyAnchorPreset } from "../../engine/ui/layout.js";
 import { SetTransformCommand } from "../commands/transformCommands.js";
 import {
@@ -28,6 +49,14 @@ import { ListenerSection } from "../components/ListenerSection.jsx";
 import { TerrainSection } from "../components/TerrainSection.jsx";
 import { useGeometryEditStore } from "../store/geometryEditStore.js";
 import { assignTerrainAssets, createTerrainAssets } from "../terrainAssetSetup.js";
+import { NumberField } from "../fields/NumberField.jsx";
+import { componentIcon, groupComponentTypes } from "../componentIcons.js";
+import { TagField } from "../fields/TagField.jsx";
+import { PopoverMenu } from "../fields/PopoverMenu.jsx";
+import { ContextMenu, useContextMenu } from "../ContextMenu.jsx";
+import { createScriptFile } from "../scriptAsset.js";
+import { stemToClassName } from "../scriptClassSync.js";
+import { openInIDE } from "../openInIde.js";
 
 /**
  * Returns the live engine entity referenced by `targetId` (the value stored
@@ -104,65 +133,34 @@ export function isInsideUiScreen(entityId) {
 const RAD2DEG = 180 / Math.PI;
 const DEG2RAD = Math.PI / 180;
 
-/** Number input that keeps local text while typing; commits on Enter/blur. */
-function NumberField({ value, onCommit, min, max, step = 0.1, mixed = false }) {
-  // `draft` is non-null only while the field is actively edited; otherwise the
-  // displayed text derives DIRECTLY from `value`. The previous version synced
-  // via a useEffect+setState on every `value` change, which React flags as a
-  // "Cascading Update" — a ~25ms Inspector re-render on every frame of a gizmo
-  // drag (the "spike when I move an object"). Deriving avoids the extra render.
-  const [draft, setDraft] = useState(null);
-  const text = draft !== null ? draft : mixed ? "" : formatNumber(value);
+const AXES = ["x", "y", "z"];
 
-  const commit = () => {
-    const parsed = parseFloat(text);
-    if (!Number.isNaN(parsed) && (mixed || parsed !== value)) {
-      let v = parsed;
-      if (min !== undefined) v = Math.max(min, v);
-      if (max !== undefined) v = Math.min(max, v);
-      onCommit(v);
-    }
-    // Invalid/unchanged: text reverts to `value` automatically when draft clears.
-  };
-
+/**
+ * One axis cell: a coloured X/Y/Z tag welded to its number field. The tag is
+ * the standard DCC convention (red/green/blue = X/Y/Z) and does the work three
+ * unlabelled boxes in a row can't — you can tell at a glance which one is Z
+ * without counting from the left.
+ */
+function AxisField({ axis, value, mixed, onCommit, step }) {
   return (
-    <input
-      className="number-field"
-      type="number"
-      step={step}
-      value={text}
-      placeholder={mixed ? "—" : undefined}
-      onChange={(e) => setDraft(e.target.value)}
-      onFocus={() => setDraft(mixed ? "" : formatNumber(value))}
-      onBlur={() => {
-        commit();
-        setDraft(null);
-      }}
-      onKeyDown={(e) => {
-        if (e.key === "Enter") e.target.blur();
-        if (e.key === "Escape") {
-          setDraft(null);
-          e.target.blur();
-        }
-      }}
-    />
+    <div className={`axis-field axis-${axis}`}>
+      <span className="axis-tag">{axis.toUpperCase()}</span>
+      <NumberField value={value} mixed={mixed} step={step} onCommit={onCommit} />
+    </div>
   );
 }
 
-function formatNumber(v) {
-  if (typeof v !== "number" || Number.isNaN(v)) return "0";
-  return String(Math.round(v * 1000) / 1000);
-}
-
-function Vector3Row({ label, values, onCommit }) {
+function Vector3Row({ label, values, onCommit, step }) {
   return (
     <div className="field-row">
       <span className="field-label">{label}</span>
       <div className="vector-fields">
-        {["x", "y", "z"].map((axis, i) => (
-          <NumberField
+        {AXES.map((axis, i) => (
+          <AxisField
             key={axis}
+            axis={axis}
             value={values[i]}
+            step={step}
             onCommit={(v) => {
               const next = [...values];
               next[i] = v;
@@ -171,6 +169,64 @@ function Vector3Row({ label, values, onCommit }) {
           />
         ))}
       </div>
+    </div>
+  );
+}
+
+const UNIFORM_SCALE_KEY = "engine.inspector.uniformScale.v1";
+
+/**
+ * "Constrain proportions" for the Scale row. Editing one axis drives the other
+ * two by the same ratio, so scaling a model up stays a scale rather than a
+ * squash. Persisted because it's a working preference, not scene data — the
+ * user who wants it on wants it on for every object they touch that session.
+ */
+function useUniformScale() {
+  const [locked, setLocked] = useState(() => localStorage.getItem(UNIFORM_SCALE_KEY) === "1");
+  const toggle = () =>
+    setLocked((prev) => {
+      localStorage.setItem(UNIFORM_SCALE_KEY, prev ? "0" : "1");
+      return !prev;
+    });
+  return [locked, toggle];
+}
+
+/** Applies a single-axis scale edit to all three axes, preserving ratios. */
+function uniformScale(previous, axis, value) {
+  const from = previous[axis];
+  // A zero (or absent) source axis has no ratio to preserve — the only sane
+  // reading of "make X 3 while locked" is a cube scale of 3.
+  if (!from) return [value, value, value];
+  const ratio = value / from;
+  return previous.map((v) => parseFloat((v * ratio).toPrecision(7)));
+}
+
+function ScaleRow({ values, onCommit, locked, onToggleLock }) {
+  return (
+    <div className="field-row">
+      <span className="field-label">Scale</span>
+      <div className="vector-fields">
+        {AXES.map((axis, i) => (
+          <AxisField
+            key={axis}
+            axis={axis}
+            value={values[i]}
+            onCommit={(v) => {
+              if (locked) return onCommit(uniformScale(values, i, v));
+              const next = [...values];
+              next[i] = v;
+              onCommit(next);
+            }}
+          />
+        ))}
+      </div>
+      <button
+        className={`icon-btn lock-btn ${locked ? "active-toggle" : ""}`}
+        title={locked ? "Proportions locked — click to scale axes independently" : "Scale axes independently — click to lock proportions"}
+        onClick={onToggleLock}
+      >
+        {locked ? <Link size={12} /> : <Link2Off size={12} />}
+      </button>
     </div>
   );
 }
@@ -186,17 +242,42 @@ function isDirectionalLightEntity(entity) {
   return !!component && component.props?.kind === "directional";
 }
 
+/** Session-only transform copy buffer — the Transform section's Copy/Paste. */
+let transformClipboard = null;
+
+const IDENTITY_TRANSFORM = { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] };
+
 function TransformSection({ entity }) {
   const { position, rotation, scale } = entity.transform;
   const rotationDeg = rotation.map((r) => r * RAD2DEG);
   const lockNonRotation = isDirectionalLightEntity(entity);
+  const [uniform, toggleUniform] = useUniformScale();
 
   const commit = (patch) => {
     commandBus.execute(new SetTransformCommand(entity.id, { ...entity.transform, ...patch }));
   };
 
+  const { menu, open: openMenu, close: closeMenu } = useContextMenu();
+  const menuItems = [
+    { label: "Reset Position", action: () => commit({ position: [...IDENTITY_TRANSFORM.position] }) },
+    { label: "Reset Rotation", action: () => commit({ rotation: [...IDENTITY_TRANSFORM.rotation] }) },
+    { label: "Reset Scale", action: () => commit({ scale: [...IDENTITY_TRANSFORM.scale] }) },
+    { label: "Reset Transform", action: () => commit(structuredClone(IDENTITY_TRANSFORM)) },
+    { separator: true },
+    {
+      label: "Copy Transform",
+      action: () => (transformClipboard = structuredClone(entity.transform)),
+    },
+    {
+      label: "Paste Transform",
+      disabled: !transformClipboard,
+      action: () => commit(structuredClone(transformClipboard)),
+    },
+  ];
+
   return (
-    <div className="inspector-section">
+    <div className="inspector-section" onContextMenu={openMenu}>
+      {menu && <ContextMenu x={menu.x} y={menu.y} items={menuItems} onClose={closeMenu} />}
       <div className="section-header">Transform</div>
       {!lockNonRotation && (
         <Vector3Row label="Position" values={position} onCommit={(v) => commit({ position: v })} />
@@ -204,10 +285,16 @@ function TransformSection({ entity }) {
       <Vector3Row
         label="Rotation"
         values={rotationDeg}
+        step={1}
         onCommit={(v) => commit({ rotation: v.map((d) => d * DEG2RAD) })}
       />
       {!lockNonRotation && (
-        <Vector3Row label="Scale" values={scale} onCommit={(v) => commit({ scale: v })} />
+        <ScaleRow
+          values={scale}
+          locked={uniform}
+          onToggleLock={toggleUniform}
+          onCommit={(v) => commit({ scale: v })}
+        />
       )}
     </div>
   );
@@ -243,8 +330,9 @@ function Vec3PropField({ value, onCommit, mixed = [] }) {
   return (
     <div className="vector-fields">
       {[0, 1, 2].map((i) => (
-        <NumberField
+        <AxisField
           key={i}
+          axis={AXES[i]}
           value={values[i] ?? 0}
           mixed={!!mixed[i]}
           onCommit={(v) => {
@@ -285,6 +373,7 @@ function MultiTransformSection({ entities }) {
   // changes their behaviour. If every selected entity is a directional light
   // we collapse the transform panel to a single Rotation row.
   const allDirectional = entities.every(isDirectionalLightEntity);
+  const [uniform, toggleUniform] = useUniformScale();
   const rows = allDirectional
     ? [["Rotation", "rotation", RAD2DEG]]
     : [
@@ -297,7 +386,11 @@ function MultiTransformSection({ entities }) {
     const commands = entities.map((entity) => {
       const before = engine.getEntity(entity.id)?.getTransform() ?? entity.transform;
       const next = { ...before, [key]: [...before[key]] };
-      next[key][axis] = value;
+      // Locked proportions apply per entity against that entity's own scale,
+      // so a mixed selection keeps each object's shape instead of snapping
+      // them all to the primary's ratios.
+      if (key === "scale" && uniform) next[key] = uniformScale(before[key], axis, value);
+      else next[key][axis] = value;
       return new SetTransformCommand(entity.id, next, before);
     });
     commandBus.execute(new BatchCommand(commands, `Transform ${entities.length} entities`));
@@ -313,8 +406,10 @@ function MultiTransformSection({ entities }) {
             {[0, 1, 2].map((axis) => {
               const values = entities.map((entity) => entity.transform[key][axis]);
               return (
-                <NumberField
+                <AxisField
                   key={axis}
+                  axis={AXES[axis]}
+                  step={key === "rotation" ? 1 : 0.1}
                   value={primary.transform[key][axis] * displayScale}
                   mixed={!values.every((value) => Object.is(value, values[0]))}
                   onCommit={(value) => commitAxis(key, axis, value, displayScale)}
@@ -322,6 +417,15 @@ function MultiTransformSection({ entities }) {
               );
             })}
           </div>
+          {key === "scale" && (
+            <button
+              className={`icon-btn lock-btn ${uniform ? "active-toggle" : ""}`}
+              title={uniform ? "Proportions locked — click to scale axes independently" : "Scale axes independently — click to lock proportions"}
+              onClick={toggleUniform}
+            >
+              {uniform ? <Link size={12} /> : <Link2Off size={12} />}
+            </button>
+          )}
         </div>
       ))}
     </div>
@@ -384,31 +488,213 @@ function PropField({ descriptor, value, onCommit, mixed = false, mixedAxes = [] 
   }
 }
 
-/** Fields for @attribute-decorated script properties (schema lives on the loaded module). */
-function ScriptAttributeFields({ entityId, props }) {
+const SCRIPT_FILE_EXTS = ["js", "ts"];
+
+/** An empty slot, so "Add Script" and a file drop agree on the shape. */
+const emptyScriptSlot = () => ({ path: "", enabled: true, attributes: {} });
+
+/**
+ * The Scripts section: a reorderable list of script slots, each with its own
+ * file, enable toggle and `@attribute` fields.
+ *
+ * One entity holds many scripts (see `ScriptComponent`), so this replaces what
+ * used to be a single "File" field plus one flat attribute list. Every edit
+ * rewrites the whole `scripts` array through `SetComponentPropCommand`, which
+ * keeps undo/redo and prefab-override derivation working without any
+ * script-specific plumbing in either.
+ */
+/**
+ * The "New" button on a script slot: names the file inline, then creates it in
+ * `<root>/scripts` and assigns it to that slot. Authoring a behaviour otherwise
+ * meant leaving the inspector for the Assets panel, making the file there, and
+ * coming back to point the slot at it.
+ */
+function NewScriptButton({ defaultName, onCreated }) {
+  const [naming, setNaming] = useState(false);
+  const [name, setName] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const create = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const path = await createScriptFile({ name: name.trim() || defaultName });
+      onCreated(path);
+      setNaming(false);
+      setName("");
+    } catch (err) {
+      console.error(`Could not create script: ${err.message ?? err}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (naming) {
+    return (
+      <input
+        className="text-field script-name-input"
+        autoFocus
+        spellCheck={false}
+        placeholder={defaultName}
+        value={name}
+        onChange={(e) => setName(e.target.value)}
+        onBlur={() => setNaming(false)}
+        onKeyDown={(e) => {
+          e.stopPropagation();
+          if (e.key === "Enter") create();
+          else if (e.key === "Escape") setNaming(false);
+        }}
+      />
+    );
+  }
+  return (
+    <button
+      className="icon-btn"
+      title="Create a new script and assign it to this slot"
+      onClick={() => setNaming(true)}
+    >
+      <FilePlus size={12} />
+    </button>
+  );
+}
+
+function ScriptsSection({ entityId, props }) {
   const [, bump] = useState(0);
+  // Attribute descriptors only exist once a module has loaded, so re-render on
+  // load. Also covers hot reload adding or removing an @attribute.
   useEffect(() => engine.on("script-loaded", () => bump((v) => v + 1)), []);
 
   const component = engine.getEntity(entityId)?.getComponent("script");
-  const defs = component?.getAttributeDefs() ?? {};
+  const slots = props.scripts ?? [];
+  // Name the file after the entity by default — "PlayerController.ts" beats
+  // "NewScript 3.ts" when you come back to the project a week later.
+  const defaultScriptName = `${stemToClassName(engine.getEntity(entityId)?.name ?? "New") || "New"}Script.ts`;
 
-  return Object.entries(defs).map(([key, def]) => (
-    <div className="field-row" key={key}>
-      <span className="field-label">{key}</span>
-      <PropField
-        descriptor={{ key, label: key, type: def.type ?? "number", ...def }}
-        value={props.attributes?.[key] ?? def.default}
-        onCommit={(v) =>
-          commandBus.execute(
-            new SetComponentPropCommand(entityId, "script", "attributes", {
-              ...props.attributes,
-              [key]: v,
-            }),
-          )
-        }
-      />
-    </div>
-  ));
+  const commit = (next, label) =>
+    commandBus.execute(new SetComponentPropCommand(entityId, "script", "scripts", next, label));
+
+  const updateSlot = (index, patch, label) =>
+    commit(
+      slots.map((slot, i) => (i === index ? { ...slot, ...patch } : slot)),
+      label,
+    );
+
+  const move = (index, delta) => {
+    const target = index + delta;
+    if (target < 0 || target >= slots.length) return;
+    const next = [...slots];
+    [next[index], next[target]] = [next[target], next[index]];
+    commit(next, "Reorder scripts");
+  };
+
+  return (
+    <>
+      {slots.map((slot, index) => {
+        const defs = component?.getAttributeDefs(index) ?? {};
+        const enabled = slot.enabled !== false;
+        return (
+          <div className="script-slot" key={index}>
+            <div className="field-row">
+              <AssetField
+                descriptor={{ key: `script-${index}`, label: "File", exts: SCRIPT_FILE_EXTS }}
+                value={slot.path ?? ""}
+                onCommit={(path) => updateSlot(index, { path }, "Set script")}
+              />
+              <button
+                className="icon-btn"
+                title={
+                  slot.path
+                    ? `Edit ${slot.path.split(/[\\/]/).pop()} in your IDE`
+                    : "Assign a script first"
+                }
+                disabled={!slot.path}
+                onClick={() => openInIDE(slot.path)}
+              >
+                <Pencil size={12} />
+              </button>
+              <NewScriptButton
+                defaultName={defaultScriptName}
+                onCreated={(path) => updateSlot(index, { path }, "Create script")}
+              />
+              <button
+                className="icon-btn"
+                title={enabled ? "Disable this script" : "Enable this script"}
+                onClick={() => updateSlot(index, { enabled: !enabled }, "Toggle script")}
+              >
+                {enabled ? <Eye size={12} /> : <EyeOff size={12} />}
+              </button>
+              <button
+                className="icon-btn"
+                title="Move up (runs earlier)"
+                disabled={index === 0}
+                onClick={() => move(index, -1)}
+              >
+                <ChevronUp size={12} />
+              </button>
+              <button
+                className="icon-btn"
+                title="Move down (runs later)"
+                disabled={index === slots.length - 1}
+                onClick={() => move(index, 1)}
+              >
+                <ChevronDown size={12} />
+              </button>
+              <button
+                className="icon-btn"
+                title="Remove this script"
+                onClick={() =>
+                  commit(
+                    slots.filter((_, i) => i !== index),
+                    "Remove script",
+                  )
+                }
+              >
+                <X size={12} />
+              </button>
+            </div>
+            {Object.entries(defs).map(([key, def]) => (
+              <div className="field-row" key={key}>
+                <span className="field-label indented">{def.label ?? key}</span>
+                <PropField
+                  descriptor={{ key, label: key, type: def.type ?? "number", ...def }}
+                  value={slot.attributes?.[key] ?? def.default}
+                  onCommit={(v) =>
+                    updateSlot(
+                      index,
+                      { attributes: { ...slot.attributes, [key]: v } },
+                      `Set ${key}`,
+                    )
+                  }
+                />
+              </div>
+            ))}
+          </div>
+        );
+      })}
+      <div className="script-add-row">
+        <button
+          className="toolbar-btn wide"
+          onClick={() => commit([...slots, emptyScriptSlot()], "Add script")}
+        >
+          <Plus size={12} /> Add Script
+        </button>
+        <button
+          className="toolbar-btn"
+          title={`Create ${defaultScriptName} in scripts/ and attach it`}
+          onClick={async () => {
+            try {
+              const path = await createScriptFile({ name: defaultScriptName });
+              commit([...slots, { ...emptyScriptSlot(), path }], "Add script");
+            } catch (err) {
+              console.error(`Could not create script: ${err.message ?? err}`);
+            }
+          }}
+        >
+          <FilePlus size={12} /> New
+        </button>
+      </div>
+    </>
+  );
 }
 
 /**
@@ -718,6 +1004,190 @@ function UiElementSection({ entityId, props }) {
   );
 }
 
+const MATERIAL_SLOT_KEYS = [
+  "material",
+  "material2",
+  "material3",
+  "material4",
+  "material5",
+  "material6",
+  "material7",
+  "material8",
+];
+
+/**
+ * The Mesh component's material list.
+ *
+ * A mesh has eight slots in its data model (one per geometry group), but
+ * almost every mesh uses exactly one. Showing all eight pickers made the Mesh
+ * inspector seven rows of noise; this renders only the slots in use plus an
+ * "Add Material Slot" button, so the extra capacity is there when authored
+ * multi-group geometry needs it and invisible when it doesn't.
+ *
+ * Removing a slot shifts the ones below it up, because slot index *is* the
+ * geometry group index — leaving a hole would silently repaint a different
+ * part of the mesh.
+ */
+function MaterialSlotsSection({ entityId, props }) {
+  const filled = MATERIAL_SLOT_KEYS.reduce(
+    (last, key, index) => (props[key] ? index + 1 : last),
+    0,
+  );
+  const [shown, setShown] = useState(filled);
+  // A different entity (or one whose slots changed underneath us, e.g. undo)
+  // resets the manual "show one more empty slot" state.
+  useEffect(() => setShown(filled), [entityId, filled]);
+  const count = Math.max(1, shown, filled);
+
+  const values = MATERIAL_SLOT_KEYS.map((key) => props[key] ?? "");
+
+  const commitSlots = (next, label) => {
+    // Only the slots that actually moved become commands — a slot removal
+    // renumbers the tail, and writing all eight every time would put seven
+    // no-op prop changes into the undo entry.
+    const commands = [];
+    MATERIAL_SLOT_KEYS.forEach((key, index) => {
+      const value = next[index] ?? "";
+      if (value !== values[index]) {
+        commands.push(new SetComponentPropCommand(entityId, "mesh", key, value));
+      }
+    });
+    if (!commands.length) return;
+    commandBus.execute(new BatchCommand(commands, label));
+  };
+
+  const setSlot = (index, value) => {
+    const next = [...values];
+    next[index] = value;
+    commitSlots(next, index === 0 ? "Set material" : `Set material slot ${index + 1}`);
+  };
+
+  const removeSlot = (index) => {
+    const next = [...values];
+    next.splice(index, 1);
+    next.push("");
+    commitSlots(next, `Remove material slot ${index + 1}`);
+    setShown(Math.max(1, count - 1));
+  };
+
+  return (
+    <>
+      {Array.from({ length: count }, (_, index) => (
+        <div className="field-row" key={MATERIAL_SLOT_KEYS[index]}>
+          <span className="field-label">{count === 1 ? "Material" : `Material ${index + 1}`}</span>
+          <AssetField
+            descriptor={{
+              key: MATERIAL_SLOT_KEYS[index],
+              label: "Material",
+              exts: ["mat"],
+              emptyLabel: index === 0 ? "Default" : "None",
+            }}
+            value={values[index]}
+            onCommit={(value) => setSlot(index, value)}
+          />
+          {count > 1 && (
+            <button
+              className="icon-btn"
+              title={`Remove slot ${index + 1} (later slots shift up)`}
+              onClick={() => removeSlot(index)}
+            >
+              <X size={12} />
+            </button>
+          )}
+        </div>
+      ))}
+      {count < MATERIAL_SLOT_KEYS.length && (
+        <button
+          className="toolbar-btn subtle wide"
+          title="Add another material slot — used by geometry with multiple groups"
+          onClick={() => setShown(count + 1)}
+        >
+          <Plus size={12} /> Add Material Slot
+        </button>
+      )}
+    </>
+  );
+}
+
+/**
+ * The Mesh section's editor shortcuts. Three full-width text buttons stacked
+ * with no spacing read as one grey slab and give no hint which is which;
+ * colour-coded icons in a row are scannable, take one line instead of three,
+ * and put the wording in a tooltip where it isn't competing for attention.
+ */
+function EditorActionRow({ actions }) {
+  return (
+    <div className="editor-action-row">
+      {actions.map(({ label, hint, Icon, color, onClick }) => (
+        <button
+          key={label}
+          className="editor-action"
+          style={{ "--action-color": color }}
+          title={hint ? `${label} — ${hint}` : label}
+          onClick={onClick}
+        >
+          <Icon size={15} />
+          <span className="editor-action-label">{label}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * Entity tags row. Suggestions come from every tag already used anywhere in
+ * the scene, so the second entity you tag "enemy" gets it from the list rather
+ * than from your memory of how you spelled it.
+ */
+function EntityTagsRow({ entityIds, tags, mixed = false }) {
+  const suggestions = engine.allTags?.() ?? [];
+  const commit = (next) => {
+    if (entityIds.length === 1) {
+      commandBus.execute(new SetEntityTagsCommand(entityIds[0], next));
+      return;
+    }
+    // Multi-selection shows only the tags every entity shares, so a write has
+    // to be expressed as a delta — replacing each list with `next` wholesale
+    // would silently delete the tags that made an entity distinct.
+    const added = next.filter((tag) => !tags.includes(tag));
+    const removed = tags.filter((tag) => !next.includes(tag));
+    const commands = entityIds.map((id) => {
+      const own = engine.getEntity(id)?.tags ?? [];
+      const merged = [...new Set([...own.filter((tag) => !removed.includes(tag)), ...added])].sort();
+      return new SetEntityTagsCommand(id, merged);
+    });
+    commandBus.execute(new BatchCommand(commands, `Set tags on ${entityIds.length} entities`));
+  };
+  return (
+    <div className="field-row tags-row">
+      <span className="field-label">Tags</span>
+      <TagField
+        tags={tags}
+        suggestions={suggestions}
+        placeholder={mixed ? "— Mixed —" : "Add tag…"}
+        onChange={commit}
+      />
+    </div>
+  );
+}
+
+/**
+ * Copied component values, so "set up one light exactly right, then give the
+ * other four the same settings" doesn't mean retyping every field. Deliberately
+ * module-level and session-only — pasting into a different component type is
+ * meaningless, so the type is stored alongside and checked before offering it.
+ */
+let componentClipboard = null;
+
+/** Props worth copying: the schema's, minus the ones that identify an instance. */
+function copyableProps(cls, props) {
+  const out = {};
+  for (const descriptor of cls?.schema ?? []) {
+    if (descriptor.key in props) out[descriptor.key] = props[descriptor.key];
+  }
+  return out;
+}
+
 function ComponentSection({ entityId, type, props }) {
   const cls = getComponentClass(type);
   // Mirror the live `enabled` flag into local state so the eye icon
@@ -749,6 +1219,40 @@ function ComponentSection({ entityId, type, props }) {
     commandBus.execute(new SetComponentPropCommand(entityId, type, "viewOnly", !viewOnly));
   };
 
+  const { menu, open: openMenu, close: closeMenu } = useContextMenu();
+  const setProps = (values, label) =>
+    commandBus.execute(
+      new BatchCommand(
+        Object.entries(values).map(([key, value]) => new SetComponentPropCommand(entityId, type, key, value)),
+        label,
+      ),
+    );
+  const menuItems = [
+    { label: enabled ? "Disable Component" : "Enable Component", action: toggleEnabled },
+    { label: viewOnly ? "Clear View-Only" : "Set View-Only", action: toggleViewOnly },
+    { separator: true },
+    {
+      label: "Copy Component Values",
+      action: () => (componentClipboard = { type, props: copyableProps(cls, props) }),
+    },
+    {
+      label: "Paste Component Values",
+      disabled: componentClipboard?.type !== type,
+      action: () => setProps(componentClipboard.props, `Paste ${cls?.label ?? type} values`),
+    },
+    {
+      label: "Reset to Defaults",
+      disabled: !cls?.defaults,
+      action: () => setProps({ ...cls.defaults }, `Reset ${cls.label}`),
+    },
+    { separator: true },
+    {
+      label: "Remove Component",
+      danger: true,
+      action: () => commandBus.execute(new RemoveComponentCommand(entityId, type)),
+    },
+  ];
+
   // Unknown type: its module is disabled. The data survives — say so.
   if (!cls) {
     return (
@@ -772,40 +1276,51 @@ function ComponentSection({ entityId, type, props }) {
     );
   }
 
+  const { Icon, color } = componentIcon(type);
   return (
-    <div className={`inspector-section ${enabled ? "" : "disabled"}`}>
+    <div className={`inspector-section ${enabled ? "" : "disabled"}`} onContextMenu={openMenu}>
+      {menu && <ContextMenu x={menu.x} y={menu.y} items={menuItems} onClose={closeMenu} />}
       <div className="section-header">
-        {cls.label}
-        <button
-          className={`icon-btn ${viewOnly ? "active-toggle" : ""}`}
-          title={
-            viewOnly
-              ? entityViewOnly && !props.viewOnly
-                ? "View-Only (inherited from entity)"
-                : "Disable view-only gating"
-              : "Pause while off-camera"
-          }
-          onClick={toggleViewOnly}
-        >
-          <ScanEye size={12} />
-        </button>
-        <button
-          className="icon-btn"
-          title={enabled ? "Disable component" : "Enable component"}
-          onClick={toggleEnabled}
-        >
-          {enabled ? <Eye size={12} /> : <EyeOff size={12} />}
-        </button>
-        <button
-          className="icon-btn"
-          title="Remove component"
-          onClick={() => commandBus.execute(new RemoveComponentCommand(entityId, type))}
-        >
-          <X size={12} />
-        </button>
+        <span className="section-title">
+          <Icon size={13} style={{ color }} />
+          {cls.label}
+        </span>
+        <span className="section-actions">
+          <button
+            className={`icon-btn ${viewOnly ? "active-toggle" : ""}`}
+            title={
+              viewOnly
+                ? entityViewOnly && !props.viewOnly
+                  ? "View-Only (inherited from entity)"
+                  : "Disable view-only gating"
+                : "Pause while off-camera"
+            }
+            onClick={toggleViewOnly}
+          >
+            <ScanEye size={12} />
+          </button>
+          <button
+            className="icon-btn"
+            title={enabled ? "Disable component" : "Enable component"}
+            onClick={toggleEnabled}
+          >
+            {enabled ? <Eye size={12} /> : <EyeOff size={12} />}
+          </button>
+          <button
+            className="icon-btn"
+            title="Remove component"
+            onClick={() => commandBus.execute(new RemoveComponentCommand(entityId, type))}
+          >
+            <X size={12} />
+          </button>
+        </span>
       </div>
       {cls.schema.map((descriptor) => {
+        if (descriptor.hidden) return null;
         if (descriptor.showIf && !descriptor.showIf(props)) return null;
+        // Mesh materials render through MaterialSlotsSection below, which owns
+        // the whole slot list (add / remove / renumber) rather than one row.
+        if (type === "mesh" && descriptor.key === "material") return null;
         return (
           <div className="field-row" key={descriptor.key}>
             <span className="field-label">{descriptor.label}</span>
@@ -827,24 +1342,38 @@ function ComponentSection({ entityId, type, props }) {
         );
       })}
       {type === "uielement" && <UiElementSection entityId={entityId} props={props} />}
-      {type === "script" && <ScriptAttributeFields entityId={entityId} props={props} />}
+      {type === "script" && <ScriptsSection entityId={entityId} props={props} />}
       {type === "mesh" && (
         <>
-          <button
-            className="toolbar-btn wide"
-            onClick={() => {
-              useGeometryEditStore.getState().enter(entityId);
-              openPanel("viewport");
-            }}
-          >
-            Edit Geometry in Scene
-          </button>
-          <button className="toolbar-btn wide" onClick={() => openPanel("geometryEditor")}>
-            Open Separate Geometry Editor
-          </button>
-          <button className="toolbar-btn wide" onClick={() => openPanel("shaderGraph")}>
-            Edit Shader Graph
-          </button>
+          <MaterialSlotsSection entityId={entityId} props={props} />
+          <EditorActionRow
+            actions={[
+              {
+                label: "Edit Geometry",
+                hint: "edit this mesh in place, in the viewport",
+                Icon: Pencil,
+                color: "#4fd475",
+                onClick: () => {
+                  useGeometryEditStore.getState().enter(entityId);
+                  openPanel("viewport");
+                },
+              },
+              {
+                label: "Geometry Editor",
+                hint: "open the full geometry editor panel",
+                Icon: PanelsTopLeft,
+                color: "#4da3ff",
+                onClick: () => openPanel("geometryEditor"),
+              },
+              {
+                label: "Shader Graph",
+                hint: "edit this mesh's material graph",
+                Icon: Waypoints,
+                color: "#b784f5",
+                onClick: () => openPanel("shaderGraph"),
+              },
+            ]}
+          />
         </>
       )}
       {type === "camera" && (
@@ -854,47 +1383,65 @@ function ComponentSection({ entityId, type, props }) {
         <InstancerSurfaceSection entityId={entityId} props={props} />
       )}
       {type === "camera" && (
-        <button
-          className="toolbar-btn wide"
-          title="Copy the editor viewport's pose onto this camera"
-          onClick={() => {
-            const view = getEditorCameraView();
-            if (!view) return;
-            const entity = engine.getEntity(entityId);
-            const before = entity?.getTransform();
-            if (!before) return;
-            commandBus.execute(
-              new SetTransformCommand(entityId, {
-                position: view.position,
-                rotation: view.rotation,
-                scale: before.scale,
-              }, before),
-            );
-          }}
-        >
-          <Crosshair size={12} />
-          Adjust to View
-        </button>
-      )}
-      {type === "camera" && engine.getEntity(entityId)?.getComponent?.("postprocess") && (
-        <button
-          className="toolbar-btn wide"
-          title="Open the post-process graph editor for this camera"
-          onClick={() => openPanel("postprocess")}
-        >
-          <Sparkles size={12} />
-          Open Post Process Editor
-        </button>
+        <EditorActionRow
+          actions={[
+            {
+              label: "Adjust to View",
+              hint: "copy the editor viewport's pose onto this camera",
+              Icon: Crosshair,
+              color: "#4da3ff",
+              onClick: () => {
+                const view = getEditorCameraView();
+                if (!view) return;
+                const entity = engine.getEntity(entityId);
+                const before = entity?.getTransform();
+                if (!before) return;
+                commandBus.execute(
+                  new SetTransformCommand(entityId, {
+                    position: view.position,
+                    rotation: view.rotation,
+                    scale: before.scale,
+                  }, before),
+                );
+              },
+            },
+            ...(engine.getEntity(entityId)?.getComponent?.("postprocess")
+              ? [{
+                  label: "Post Process",
+                  hint: "open the post-process graph for this camera",
+                  Icon: Sparkles,
+                  color: "#b784f5",
+                  onClick: () => openPanel("postprocess"),
+                }]
+              : []),
+          ]}
+        />
       )}
       {type === "particles" && (
-        <button className="toolbar-btn wide" onClick={() => openPanel("particles")}>
-          Open Particle Editor
-        </button>
+        <EditorActionRow
+          actions={[
+            {
+              label: "Particle Editor",
+              hint: "edit this emitter's node graph",
+              Icon: Waypoints,
+              color: "#b784f5",
+              onClick: () => openPanel("particles"),
+            },
+          ]}
+        />
       )}
       {type === "animation" && props.controller && (
-        <button className="toolbar-btn wide" onClick={() => openPanel("animator")}>
-          Edit Animator
-        </button>
+        <EditorActionRow
+          actions={[
+            {
+              label: "Animator",
+              hint: "edit this controller's state machine",
+              Icon: Layers2,
+              color: "#4fd475",
+              onClick: () => openPanel("animator"),
+            },
+          ]}
+        />
       )}
       {type === "sound" && <SoundSection entityId={entityId} props={props} />}
       {type === "listener" && <ListenerSection entityId={entityId} />}
@@ -910,41 +1457,86 @@ function ComponentSection({ entityId, type, props }) {
   );
 }
 
+/**
+ * Multi-entity selection: edit attributes shared across the selection.
+ *
+ * "Shared" means the same script file at the same slot index on every selected
+ * entity. Matching by index as well as path keeps the write side unambiguous —
+ * editing a value maps to one known slot per entity rather than guessing which
+ * of several copies of the same script was meant. Selections whose script
+ * lists differ simply show fewer rows.
+ */
 function MultiScriptAttributeFields({ entities }) {
   const components = entities.map((entity) => engine.getEntity(entity.id)?.getComponent("script"));
-  const definitions = components.map((component) => component?.getAttributeDefs?.() ?? {});
-  const sharedKeys = Object.keys(definitions[0] ?? {}).filter((key) => definitions.every((defs) => key in defs));
-  return sharedKeys.map((key) => {
-    const def = definitions[0][key];
-    const values = entities.map((entity, index) => entity.components.script.attributes?.[key] ?? definitions[index][key].default);
-    const isMixed = !values.every((value) => valuesEqual(value, values[0]));
-    const mixedAxes = def.type === "vec3"
-      ? [0, 1, 2].map((axis) => !values.every((value) => value?.[axis] === values[0]?.[axis]))
-      : [];
-    return (
-      <div className="field-row" key={key}>
-        <span className="field-label">{key}</span>
-        <PropField
-          descriptor={{ key, label: key, type: def.type ?? "number", ...def }}
-          value={values[0]}
-          mixed={isMixed}
-          mixedAxes={mixedAxes}
-          onCommit={(value, changedAxis) => {
-            const commands = entities.map((entity) => {
-              const attributes = { ...(entity.components.script.attributes ?? {}) };
-              if (def.type === "vec3" && Number.isInteger(changedAxis)) {
-                const next = [...(attributes[key] ?? def.default ?? [0, 0, 0])];
-                next[changedAxis] = value[changedAxis];
-                attributes[key] = next;
-              } else attributes[key] = value;
-              return new SetComponentPropCommand(entity.id, "script", "attributes", attributes);
-            });
-            commandBus.execute(new BatchCommand(commands, `Set ${key} on ${entities.length} scripts`));
-          }}
-        />
-      </div>
+  const slotLists = entities.map((entity) => entity.components.script?.scripts ?? []);
+  const slotCount = Math.min(...slotLists.map((list) => list.length), Infinity);
+  if (!Number.isFinite(slotCount) || slotCount === 0) return null;
+
+  const rows = [];
+  for (let index = 0; index < slotCount; index++) {
+    const paths = slotLists.map((list) => list[index]?.path ?? "");
+    // Different files at this position — nothing meaningful to co-edit.
+    if (!paths.every((path) => path === paths[0]) || !paths[0]) continue;
+
+    const definitions = components.map((component) => component?.getAttributeDefs?.(index) ?? {});
+    const sharedKeys = Object.keys(definitions[0] ?? {}).filter((key) =>
+      definitions.every((defs) => key in defs),
     );
-  });
+    if (!sharedKeys.length) continue;
+
+    const stem = paths[0].split(/[\\/]/).pop();
+    rows.push(
+      <div className="inspector-subheader" key={`h-${index}`}>
+        {stem}
+      </div>,
+    );
+
+    for (const key of sharedKeys) {
+      const def = definitions[0][key];
+      const values = slotLists.map(
+        (list, i) => list[index]?.attributes?.[key] ?? definitions[i][key].default,
+      );
+      const isMixed = !values.every((value) => valuesEqual(value, values[0]));
+      const mixedAxes =
+        def.type === "vec3"
+          ? [0, 1, 2].map((axis) => !values.every((value) => value?.[axis] === values[0]?.[axis]))
+          : [];
+      rows.push(
+        <div className="field-row" key={`${index}-${key}`}>
+          <span className="field-label indented">{def.label ?? key}</span>
+          <PropField
+            descriptor={{ key, label: key, type: def.type ?? "number", ...def }}
+            value={values[0]}
+            mixed={isMixed}
+            mixedAxes={mixedAxes}
+            onCommit={(value, changedAxis) => {
+              const commands = entities.map((entity, i) => {
+                const list = slotLists[i];
+                const attributes = { ...(list[index]?.attributes ?? {}) };
+                if (def.type === "vec3" && Number.isInteger(changedAxis)) {
+                  const next = [...(attributes[key] ?? def.default ?? [0, 0, 0])];
+                  next[changedAxis] = value[changedAxis];
+                  attributes[key] = next;
+                } else attributes[key] = value;
+                const scripts = list.map((slot, s) => (s === index ? { ...slot, attributes } : slot));
+                return new SetComponentPropCommand(
+                  entity.id,
+                  "script",
+                  "scripts",
+                  scripts,
+                  `Set ${key}`,
+                );
+              });
+              commandBus.execute(
+                new BatchCommand(commands, `Set ${key} on ${entities.length} scripts`),
+              );
+            }}
+          />
+        </div>,
+      );
+    }
+  }
+  return rows;
 }
 
 function MultiComponentSection({ entities, type }) {
@@ -990,29 +1582,36 @@ function MultiComponentSection({ entities, type }) {
 
   const enabledMixed = !enabledValues.every((value) => value === enabledValues[0]);
   const viewOnlyMixed = !viewOnlyValues.every((value) => value === viewOnlyValues[0]);
+  const { Icon, color } = componentIcon(type);
   return (
     <div className={`inspector-section ${!enabledMixed && !enabledValues[0] ? "disabled" : ""}`}>
       <div className="section-header">
-        {cls.label}
-        <button
-          className={`icon-btn ${!viewOnlyMixed && viewOnlyValues[0] ? "active-toggle" : ""}`}
-          title={viewOnlyMixed ? "Mixed view-only state; click to enable all" : "Toggle view-only for selection"}
-          onClick={() => batchProps("viewOnly", viewOnlyMixed ? true : !viewOnlyValues[0])}
-        >
-          <ScanEye size={12} />
-        </button>
-        <button
-          className="icon-btn"
-          title={enabledMixed ? "Mixed enabled state; click to enable all" : "Toggle component for selection"}
-          onClick={() => batchProps("enabled", enabledMixed ? true : !enabledValues[0])}
-        >
-          {enabledMixed || enabledValues[0] ? <Eye size={12} /> : <EyeOff size={12} />}
-        </button>
-        <button className="icon-btn" title="Remove component from selection" onClick={removeAll}>
-          <X size={12} />
-        </button>
+        <span className="section-title">
+          <Icon size={13} style={{ color }} />
+          {cls.label}
+        </span>
+        <span className="section-actions">
+          <button
+            className={`icon-btn ${!viewOnlyMixed && viewOnlyValues[0] ? "active-toggle" : ""}`}
+            title={viewOnlyMixed ? "Mixed view-only state; click to enable all" : "Toggle view-only for selection"}
+            onClick={() => batchProps("viewOnly", viewOnlyMixed ? true : !viewOnlyValues[0])}
+          >
+            <ScanEye size={12} />
+          </button>
+          <button
+            className="icon-btn"
+            title={enabledMixed ? "Mixed enabled state; click to enable all" : "Toggle component for selection"}
+            onClick={() => batchProps("enabled", enabledMixed ? true : !enabledValues[0])}
+          >
+            {enabledMixed || enabledValues[0] ? <Eye size={12} /> : <EyeOff size={12} />}
+          </button>
+          <button className="icon-btn" title="Remove component from selection" onClick={removeAll}>
+            <X size={12} />
+          </button>
+        </span>
       </div>
       {cls.schema.map((descriptor) => {
+        if (descriptor.hidden) return null;
         if (descriptor.showIf && !propsList.every((props) => descriptor.showIf(props))) return null;
         const values = propsList.map((props) => props[descriptor.key]);
         const mixed = !values.every((value) => valuesEqual(value, values[0]));
@@ -1084,6 +1683,8 @@ function describeOverride(root, override) {
       return `${target} › name`;
     case "flag":
       return `${target} › ${override.key}`;
+    case "tags":
+      return `${target} › tags`;
     case "addComponent":
       return `${target} › added ${getComponentClass(override.c)?.label ?? override.c}`;
     case "removeComponent":
@@ -1115,7 +1716,10 @@ function findEntityByFidPath(root, path) {
 function PrefabSection({ entityId }) {
   const [overridesOpen, setOverridesOpen] = useState(false);
   usePrefabStore((s) => s.version);
-  useSceneStore((s) => s.entities); // re-derive after any scene mutation
+  // Re-derive the override diff when THIS entity's mirror changes (its own
+  // edits, and full refreshes rebuild every mirror). Subscribing to the
+  // whole map re-ran diffInstance() on every gizmo-drag frame of ANY entity.
+  useSceneStore((s) => s.entities[entityId]);
 
   const live = engine.getEntity(entityId);
   const root = live ? getPrefabRoot(live) : null;
@@ -1211,8 +1815,88 @@ function PrefabSection({ entityId }) {
   );
 }
 
+/**
+ * The Add Component picker: grouped, icon-led, and filterable.
+ *
+ * The flat alphabetical text list it replaces meant reading ~25 grey labels to
+ * find one. Grouping puts related components together, the coloured glyph lets
+ * you recognise a component without reading it, and the search box turns "I
+ * know it's called something like rigid…" into two keystrokes. The field
+ * autofocuses so the menu is keyboard-first: open, type, Enter.
+ */
+function AddComponentMenu({ types, disabledReason, suffix, onPick, onClose, anchorRef }) {
+  const [query, setQuery] = useState("");
+  const needle = query.trim().toLowerCase();
+  const label = (type) => getComponentClass(type)?.label ?? type;
+
+  const matches = useMemo(
+    () => (needle ? types.filter((type) => `${label(type)} ${type}`.toLowerCase().includes(needle)) : types),
+    [types, needle],
+  );
+  const groups = useMemo(() => groupComponentTypes(matches), [matches]);
+  // A search narrows to a flat, ranked-by-nothing list — grouping headers over
+  // one or two hits is just noise.
+  const flat = !!needle;
+
+  const pickFirst = () => {
+    const first = matches.find((type) => !disabledReason?.(type));
+    if (first) onPick(first);
+  };
+
+  const renderItem = (type) => {
+    const reason = disabledReason?.(type);
+    const { Icon, color } = componentIcon(type);
+    return (
+      <button
+        key={type}
+        className="dropdown-item component-item"
+        disabled={!!reason}
+        title={reason ?? undefined}
+        onClick={() => !reason && onPick(type)}
+      >
+        <Icon size={14} style={{ color }} className="component-item-icon" />
+        <span className="component-item-label">{label(type)}</span>
+        {suffix?.(type) && <span className="component-item-suffix">{suffix(type)}</span>}
+      </button>
+    );
+  };
+
+  return (
+    <PopoverMenu anchorRef={anchorRef} className="component-menu" minWidth={232} onClose={onClose}>
+      <div className="component-menu-search">
+        <Search size={12} />
+        <input
+          autoFocus
+          type="text"
+          placeholder="Search components…"
+          value={query}
+          spellCheck={false}
+          onChange={(e) => setQuery(e.target.value)}
+          onKeyDown={(e) => {
+            e.stopPropagation();
+            if (e.key === "Enter") pickFirst();
+            else if (e.key === "Escape") onClose();
+          }}
+        />
+      </div>
+      <div className="component-menu-list">
+        {flat
+          ? matches.map(renderItem)
+          : groups.map((group) => (
+              <div key={group.label}>
+                <div className="dropdown-section-label">{group.label}</div>
+                {group.types.map(renderItem)}
+              </div>
+            ))}
+        {!matches.length && <div className="asset-hint">No matching components</div>}
+      </div>
+    </PopoverMenu>
+  );
+}
+
 function MultiEntityInspector({ entities }) {
   const [addOpen, setAddOpen] = useState(false);
+  const addButtonRef = useRef(null);
   const entityIds = entities.map((entity) => entity.id);
   const liveEntities = entityIds.map((id) => engine.getEntity(id)).filter(Boolean);
   const commonTypes = Object.keys(entities[0].components).filter(
@@ -1255,6 +1939,14 @@ function MultiEntityInspector({ entities }) {
             onKeyDown={(event) => event.key === "Enter" && event.currentTarget.blur()}
           />
         </div>
+        {(() => {
+          // Only tags every selected entity carries are editable together;
+          // adding one adds it to all of them, removing removes it from all.
+          const lists = entities.map((entity) => entity.tags ?? []);
+          const shared = lists[0].filter((tag) => lists.every((list) => list.includes(tag)));
+          const mixed = lists.some((list) => list.length !== shared.length);
+          return <EntityTagsRow entityIds={entityIds} tags={shared} mixed={mixed} />;
+        })()}
         <div className="field-row">
           <span className="field-label">View Only</span>
           <MixedCheckbox
@@ -1292,39 +1984,42 @@ function MultiEntityInspector({ entities }) {
 
       <div className="add-component-wrap">
         <div className="dropdown-wrap">
-          <button className="toolbar-btn wide" disabled={!availableTypes.length} onClick={() => setAddOpen((value) => !value)}>
+          <button
+            ref={addButtonRef}
+            className="toolbar-btn wide"
+            disabled={!availableTypes.length}
+            onClick={() => setAddOpen((value) => !value)}
+          >
             <Plus size={14} /> Add Component to Selection
           </button>
           {addOpen && (
-            <>
-              <div className="dropdown-overlay" onClick={() => setAddOpen(false)} />
-              <div className="dropdown-menu up">
-                {availableTypes.map((type) => {
-                  const requirements = componentRequires[type];
-                  const targets = entities.filter((entity) => !(type in entity.components));
-                  const missingRequirement = requirements && targets.some(
-                    (entity) => !requirements.some((required) => required in entity.components),
-                  );
-                  return (
-                    <button
-                      key={type}
-                      className="dropdown-item"
-                      disabled={missingRequirement}
-                      title={missingRequirement ? `Some selected entities are missing ${requirements.join(" or ")}` : undefined}
-                      onClick={() => {
-                        setAddOpen(false);
-                        commandBus.execute(new BatchCommand(
-                          targets.map((entity) => new AddComponentCommand(entity.id, type)),
-                          `Add ${getComponentClass(type)?.label ?? type} to ${targets.length} entities`,
-                        ));
-                      }}
-                    >
-                      {getComponentClass(type)?.label ?? type} ({targets.length})
-                    </button>
-                  );
-                })}
-              </div>
-            </>
+            <AddComponentMenu
+              anchorRef={addButtonRef}
+              types={availableTypes}
+              onClose={() => setAddOpen(false)}
+              suffix={(type) => `${entities.filter((entity) => !(type in entity.components)).length}`}
+              disabledReason={(type) => {
+                const requirements = componentRequires[type];
+                if (!requirements) return null;
+                const targets = entities.filter((entity) => !(type in entity.components));
+                const missing = targets.some(
+                  (entity) => !requirements.some((required) => required in entity.components),
+                );
+                return missing
+                  ? `Some selected entities are missing ${requirements
+                      .map((t) => getComponentClass(t)?.label ?? t)
+                      .join(" or ")}`
+                  : null;
+              }}
+              onPick={(type) => {
+                setAddOpen(false);
+                const targets = entities.filter((entity) => !(type in entity.components));
+                commandBus.execute(new BatchCommand(
+                  targets.map((entity) => new AddComponentCommand(entity.id, type)),
+                  `Add ${getComponentClass(type)?.label ?? type} to ${targets.length} entities`,
+                ));
+              }}
+            />
           )}
         </div>
       </div>
@@ -1336,13 +2031,16 @@ export function InspectorPanel() {
   const selectedIds = useSelectionStore((s) => s.ids);
   const selectedId = selectedIds[0] ?? null;
   const assetPath = useSelectionStore((s) => s.assetPath);
-  const entitiesById = useSceneStore((s) => s.entities);
-  const entities = selectedIds.map((id) => entitiesById[id]).filter(Boolean);
+  // Narrow subscription: only the SELECTED entities' mirror objects. The
+  // whole-map version re-rendered the full inspector (every component
+  // section and field) on every gizmo-drag frame of ANY entity —
+  // updateTransform replaces the map object per pointermove.
+  const entities = useSceneStore(
+    useShallow((s) => selectedIds.map((id) => s.entities[id]).filter(Boolean)),
+  );
   const entity = entities[0] ?? null;
   const [addMenuOpen, setAddMenuOpen] = useState(false);
-  const [addMenuUp, setAddMenuUp] = useState(false);
   const addButtonRef = useRef(null);
-  const addMenuRef = useRef(null);
   // Toggling a module (un)registers component types — re-render for the list.
   useModulesStore((s) => s.enabled);
 
@@ -1358,23 +2056,8 @@ export function InspectorPanel() {
     return () => window.removeEventListener("keydown", onKey);
   }, [addMenuOpen]);
 
-  /**
-   * When opening the Add Component menu, pick the direction at runtime: open
-   * upward only if there's not enough room below the trigger AND there's more
-   * room above than below. The menu caps itself at 60vh via CSS, so the
-   * correct check is which side has more room at the moment of opening —
-   * that way it never spills off-screen in either direction.
-   */
-  const openAddMenu = () => {
-    const btn = addButtonRef.current;
-    if (btn) {
-      const rect = btn.getBoundingClientRect();
-      const spaceAbove = rect.top;
-      const spaceBelow = window.innerHeight - rect.bottom;
-      setAddMenuUp(spaceBelow < spaceAbove);
-    }
-    setAddMenuOpen(true);
-  };
+  // Flip-up-when-tight is PopoverMenu's job now — it measures the real menu
+  // height against the viewport instead of guessing from the 60vh cap.
 
   if (!entity && assetPath) return <AssetInspector path={assetPath} />;
   if (!entity) {
@@ -1442,6 +2125,7 @@ export function InspectorPanel() {
             onKeyDown={(e) => e.key === "Enter" && e.target.blur()}
           />
         </div>
+        <EntityTagsRow entityIds={[entity.id]} tags={entity.tags ?? []} />
         <div className="field-row">
           <span className="field-label">View Only</span>
           <label className="field-row inline" title="Pause this entity's components while it is outside the camera frustum">
@@ -1505,60 +2189,45 @@ export function InspectorPanel() {
             ref={addButtonRef}
             className="toolbar-btn wide"
             disabled={!availableTypes.length}
-            onClick={() => (addMenuOpen ? setAddMenuOpen(false) : openAddMenu())}
+            onClick={() => setAddMenuOpen((open) => !open)}
           >
             <Plus size={14} />
             Add Component
           </button>
           {addMenuOpen && (
-            <>
-              <div className="dropdown-overlay" onClick={() => setAddMenuOpen(false)} />
-              <div ref={addMenuRef} className={`dropdown-menu${addMenuUp ? " up" : ""}`}>
-                {availableTypes.map((type) => {
-                  const requiredTypes = componentRequires[type];
-                  const missingRequirement = requiredTypes && !requiredTypes.some((t) => t in entity.components);
-                  const Cls = getComponentClass(type);
-                  const label = Cls?.label ?? type;
-                  const requiredLabel = requiredTypes
-                    ?.map((t) => getComponentClass(t)?.label ?? t)
-                    .join(" or ");
-                  return (
-                    <button
-                      key={type}
-                      className="dropdown-item"
-                      disabled={missingRequirement}
-                      title={
-                        missingRequirement
-                          ? `${label} requires a ${requiredLabel} component on this entity`
-                          : undefined
-                      }
-                      onClick={async () => {
-                        if (missingRequirement) return;
-                        setAddMenuOpen(false);
-                        if (type === "terrain") {
-                          const mesh = entity.getComponent("mesh");
-                          const needsAssets = !mesh?.props.geometryAsset || !mesh?.props.material;
-                          let assets = null;
-                          if (needsAssets) {
-                            try {
-                              assets = await createTerrainAssets();
-                            } catch (err) {
-                              console.error(`Could not create terrain assets: ${err}`);
-                            }
-                          }
-                          commandBus.execute(new AddComponentCommand(entity.id, type));
-                          assignTerrainAssets(entity, assets);
-                        } else {
-                          commandBus.execute(new AddComponentCommand(entity.id, type));
-                        }
-                      }}
-                    >
-                      {label}
-                    </button>
-                  );
-                })}
-              </div>
-            </>
+            <AddComponentMenu
+              anchorRef={addButtonRef}
+              types={availableTypes}
+              onClose={() => setAddMenuOpen(false)}
+              disabledReason={(type) => {
+                const requiredTypes = componentRequires[type];
+                if (!requiredTypes || requiredTypes.some((t) => t in entity.components)) return null;
+                const label = getComponentClass(type)?.label ?? type;
+                const requiredLabel = requiredTypes
+                  .map((t) => getComponentClass(t)?.label ?? t)
+                  .join(" or ");
+                return `${label} requires a ${requiredLabel} component on this entity`;
+              }}
+              onPick={async (type) => {
+                setAddMenuOpen(false);
+                if (type === "terrain") {
+                  const mesh = entity.getComponent("mesh");
+                  const needsAssets = !mesh?.props.geometryAsset || !mesh?.props.material;
+                  let assets = null;
+                  if (needsAssets) {
+                    try {
+                      assets = await createTerrainAssets();
+                    } catch (err) {
+                      console.error(`Could not create terrain assets: ${err}`);
+                    }
+                  }
+                  commandBus.execute(new AddComponentCommand(entity.id, type));
+                  assignTerrainAssets(entity, assets);
+                } else {
+                  commandBus.execute(new AddComponentCommand(entity.id, type));
+                }
+              }}
+            />
           )}
         </div>
       </div>

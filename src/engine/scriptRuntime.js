@@ -1,113 +1,69 @@
 /**
- * Runtime support for user scripts. Scripts import from the bare specifier
- * "engine" (e.g. `import { Script, attribute, Vector3 } from "engine"`),
- * which blob-URL / data-URL module imports can't resolve to anything — so
- * loaders rewrite it to the absolute URL of `./scriptRuntime/runtime.js`
- * via linkEngineImports() before importing.
+ * Resolves the bare specifiers user scripts import.
  *
- * `runtime.js` is a real ES module that:
- *   - Defines `Script` (empty base class for typed `this` access) and
- *     the `attribute` decorator. ScriptComponent injects `entity` /
- *     `engine` / `THREE` / `input` on every script instance regardless
- *     of base class, so the runtime base exists only to make
- *     `extends Script` a typed no-op.
- *   - Re-exports three.js classes (Vector2 / Vector3 / Quaternion /
- *     Euler / Matrix4 / Color / Object3D / Camera / MathUtils) so user
- *     scripts can `import { Vector3 } from "engine"` and get the same
- *     constructor the engine itself uses — real instances with full
- *     methods, not just a type alias.
+ * A script is loaded by fetching its source, transpiling it, and importing it
+ * from a `blob:` URL. Bare specifiers (`"engine"`, `"three"`) mean nothing to
+ * the browser in that context, and `blob:` is a non-hierarchical scheme, so
+ * relative and root-absolute paths cannot be resolved against it either
+ * ("Invalid relative url or base scheme isn't hierarchical"). `linkEngineImports`
+ * therefore rewrites each supported specifier to a fully-qualified URL before
+ * the import.
  *
- * ## Why an absolute URL (not a relative path)
+ * ## How the target URLs are discovered
  *
- * Users import scripts via `import(blobUrl)` from a blob or data URL,
- * which is a non-hierarchical scheme. Import specifiers inside such
- * scripts are resolved against the blob's URL — but a relative path
- * ("./runtime.js") can't be resolved against a non-hierarchical base,
- * and an absolute path ("/src/engine/.../runtime.js") looks like a
- * scheme-relative URL which the browser tries to resolve against the
- * blob's (nonexistent) scheme. Either way the browser refuses with
- * "Invalid relative url or base scheme isn't hierarchical".
+ * Each specifier maps to a small proxy module under `./scriptRuntime/`. We
+ * learn a proxy's URL by importing it and reading the `__SELF_URL__` it
+ * exports — i.e. its own `import.meta.url`, evaluated inside the module.
  *
- * `new URL('…', import.meta.url).href` produces an absolute http(s)
- * URL — fully qualified, no base needed — in both dev (Vite serves
- * `scriptRuntime.js` from a real origin) and prod (Vite emits chunks
- * under the same origin as `index.html`). The resulting `from "http…"`
- * inside a blob/data URL resolves directly against the absolute URL
- * the browser already knows about.
+ * That indirection is the whole trick, and it is worth understanding before
+ * changing it. The obvious alternative,
  *
- * ## Lazy resolution
+ *     new URL('./scriptRuntime/threeRuntime.js', import.meta.url)
  *
- * `import.meta.url` is the URL of THIS file. Once scriptRuntime.js is
- * loaded, that URL is fixed for the lifetime of the runtime, so we cache
- * the resolved runtime URL on first call. Asynchronous so callers
- * (assetLoader, player/main) can `await linkEngineImports(...)` without
- * re-engineering existing promise-based flows.
+ * is a build-time asset reference: Vite statically analyses that form and in a
+ * production build inlines the target as a base64 `data:` URL. A `data:` URL
+ * has no module-resolution base, so the proxy could not `import` three — which
+ * is precisely why this file used to ship a hand-written allowlist of ~28
+ * three classes read off a global, and why `import { InstancedMesh }` from a
+ * user script silently produced `undefined`.
+ *
+ * Importing the proxy normally instead makes it a real chunk that the bundler
+ * resolves like any other module. Its `import.meta.url` is then the dev server
+ * URL (dev) or the emitted chunk's hashed URL (build) — absolute in both
+ * cases, so a `blob:`-hosted script can import it. And because the proxy and
+ * the engine both import the same bare `"three/webgpu"` specifier, they share
+ * one module instance: script-side classes are the engine's constructors.
+ *
+ * The imports are lazy — nothing is fetched until the first user script is
+ * linked, so projects with no scripts pay nothing.
  */
-// `import.meta.url` is `undefined` in classic scripts but always present
-// in ES modules. `scriptRuntime.js` is imported as ESM from the editor
-// shell and from the player entry, so the URL is reliably available.
-//
-// Vite/Rollup statically analyze `new URL(..., import.meta.url)` calls and
-// resolve them at build time — in production the runtime is inlined as a
-// base64 data URL into scriptRuntime.js's chunk; in dev the dev server
-// URL is used directly. We pass that absolute URL through to user scripts
-// (which load from blob URLs) so it bypasses any base-URL resolution.
-const RUNTIME_URL =
-  typeof import.meta.url === "string" && import.meta.url
-    ? new URL("./scriptRuntime/runtime.js", import.meta.url).href
-    : null;
-const THREE_RUNTIME_URL =
-  typeof import.meta.url === "string" && import.meta.url
-    ? new URL("./scriptRuntime/threeRuntime.js", import.meta.url).href
-    : null;
 
-// Synchronous helper: when `import.meta.url` is known (the production /
-// dev browser case), the URL is computable up-front. Synchronous callers
-// (e.g. tests, hot reload) can read this without awaiting anything.
-export function getRuntimeUrlSync() {
-  if (RUNTIME_URL) return RUNTIME_URL;
-  throw new Error(
-    "getRuntimeUrlSync() called outside an ES module context; " +
-      "import.meta.url is not available. Use getRuntimeUrl() instead."
-  );
-}
+/**
+ * Specifier → proxy module loader. Every entry resolves to a module exporting
+ * `__SELF_URL__`.
+ *
+ * `"three"` and `"three/webgpu"` intentionally share one proxy. They are
+ * distinct module instances with distinct class identities; if a script
+ * imported the plain `three` build while the engine ran on `three/webgpu`,
+ * its `Vector3` would not be the engine's `Vector3` and `instanceof` checks
+ * would quietly fail. The webgpu build is a superset, so routing both here is
+ * safe and keeps exactly one three in the bundle.
+ */
+const PROXY_LOADERS = {
+  engine: () => import("./scriptRuntime/runtime.js"),
+  editor: () => import("./scriptRuntime/editorRuntime.js"),
+  three: () => import("./scriptRuntime/threeRuntime.js"),
+  "three/webgpu": () => import("./scriptRuntime/threeRuntime.js"),
+  "three/tsl": () => import("./scriptRuntime/tslRuntime.js"),
+};
 
-/** Absolute URL of the `three/webgpu` proxy for user-script imports. */
-export function getThreeRuntimeUrlSync() {
-  if (THREE_RUNTIME_URL) return THREE_RUNTIME_URL;
-  throw new Error(
-    "getThreeRuntimeUrlSync() called outside an ES module context; " +
-      "import.meta.url is not available.",
-  );
-}
-
-let cachedRuntimeUrl = null;
-let runtimeUrlPromise = null;
-let cachedThreeRuntimeUrl = null;
-
-/** Asynchronously resolves the runtime module URL. In Vite-bundled code
- *  (editor + player) this is just the cached absolute URL — the promise
- *  exists for API symmetry with the prior blob-fallback design and for
- *  tests running in plain Node, where there is no `import.meta.url`.
- *  In that case we emit a small data: URL that hardcodes `Script` and
- *  `attribute` (math classes aren't reachable from any URL here; tests
- *  that need them import them directly from three/webgpu). */
-export async function getRuntimeUrl() {
-  if (cachedRuntimeUrl) return cachedRuntimeUrl;
-  if (runtimeUrlPromise) return runtimeUrlPromise;
-
-  if (RUNTIME_URL) {
-    cachedRuntimeUrl = RUNTIME_URL;
-    return cachedRuntimeUrl;
-  }
-
-  runtimeUrlPromise = (async () => {
-    // No `import.meta.url` (plain Node tests) — fall back to a data URL
-    // that hardcodes just `Script` and `attribute`. Math classes can't
-    // be reached through a URL on Node (blob: is rejected, and there's
-    // no portable way to embed three.js in a data URL); tests that need
-    // them import them directly from "three/webgpu".
-    const fallback = encodeURIComponent(`
+/**
+ * Minimal stand-in for the `"engine"` module, used only when the real proxy
+ * cannot be imported — plain Node (no DOM, and `three/webgpu` touches browser
+ * globals at module scope). Covers `Script` and `attribute`, which is what
+ * non-browser callers exercise; tests needing math import three directly.
+ */
+const NODE_FALLBACK_ENGINE = `data:text/javascript;charset=utf-8,${encodeURIComponent(`
 export class Script {}
 export function attribute(options = {}) {
   return function (target, key) {
@@ -118,56 +74,75 @@ export function attribute(options = {}) {
     ctor.attributes[key] = options;
   };
 }
-`);
-    cachedRuntimeUrl = `data:text/javascript;charset=utf-8,${fallback}`;
-    return cachedRuntimeUrl;
-  })();
-  return runtimeUrlPromise;
-}
+`)}`;
 
-/** Absolute URL of the `three/webgpu` proxy for user scripts. Resolves
- *  against `import.meta.url` in the browser; no Node fallback exists
- *  (Node tests import three directly). */
-export function getThreeRuntimeUrl() {
-  if (cachedThreeRuntimeUrl) return cachedThreeRuntimeUrl;
-  if (THREE_RUNTIME_URL) {
-    cachedThreeRuntimeUrl = THREE_RUNTIME_URL;
-    return cachedThreeRuntimeUrl;
-  }
-  throw new Error(
-    "getThreeRuntimeUrl() called outside an ES module context; " +
-      "import.meta.url is not available.",
-  );
-}
+let urlsPromise = null;
 
-/** Rewrites bare specifiers a user script imports to absolute URLs the
- *  blob/data URL import can resolve:
- *    - `"engine"`        → the engine runtime module (Script / attribute /
- *                          re-exported three classes)
- *    - `"three/webgpu"`  → the three-proxy module (re-exports the whole
- *                          `three/webgpu` surface, including a default
- *                          namespace, so both `import * as THREE` and
- *                          `import { Vector3 }` work from user scripts)
- *  Async because the URL resolution is potentially async (data URL fallback
- *  in tests). Browser callers (assetLoader, player main) already work with
- *  promises. If you need a sync entry point, see `getRuntimeUrlSync`.
+/**
+ * Maps every supported specifier to the absolute URL a user script should
+ * import instead. Cached — the proxies' URLs are fixed for the lifetime of the
+ * page.
  *
- *  When called outside a browser (e.g. plain Node tests, no `import.meta.url`)
- *  the `"three/webgpu"` rewrite is skipped — tests don't run user scripts
- *  through this path and rewriting would throw. The `"engine"` rewrite
- *  still falls back to its own data URL. */
-export async function linkEngineImports(code) {
-  const url = await getRuntimeUrl();
-  let out = code.replace(
-    /((?:from|import)\s*)(["'])engine\2/g,
-    (_, lead, q) => `${lead}${q}${url}${q}`,
-  );
-  if (THREE_RUNTIME_URL) {
-    const threeUrl = THREE_RUNTIME_URL;
-    out = out.replace(
-      /((?:from|import)\s*)(["'])three\/webgpu\2/g,
-      (_, lead, q) => `${lead}${q}${threeUrl}${q}`,
+ * A proxy that fails to import is omitted rather than fatal, so one
+ * unavailable surface (e.g. `three/tsl` in a non-browser context) does not
+ * take down script loading entirely. `"engine"` additionally falls back to a
+ * data URL so `Script` / `attribute` always resolve.
+ */
+export function resolveRuntimeUrls() {
+  urlsPromise ??= (async () => {
+    const entries = await Promise.all(
+      Object.entries(PROXY_LOADERS).map(async ([specifier, load]) => {
+        try {
+          const mod = await load();
+          return [specifier, mod.__SELF_URL__ ?? null];
+        } catch (err) {
+          if (specifier === "engine") return [specifier, NODE_FALLBACK_ENGINE];
+          console.warn(
+            `[scripts] "${specifier}" is unavailable to user scripts: ${err?.message ?? err}`,
+          );
+          return [specifier, null];
+        }
+      }),
     );
+    return Object.fromEntries(entries.filter(([, url]) => url));
+  })();
+  return urlsPromise;
+}
+
+/** Escapes a specifier for literal use inside a RegExp. */
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
+
+/**
+ * Builds a matcher for one specifier. Covers every form a script can use it
+ * in: `import x from "s"`, `import "s"`, `export { x } from "s"`, and the
+ * dynamic `import("s")` (hence the optional paren — the previous version of
+ * this regex missed dynamic imports entirely).
+ *
+ * The closing quote is back-referenced, so `"three"` cannot match inside
+ * `"three/webgpu"` and the rewrite order between specifiers does not matter.
+ */
+const matcherFor = (specifier) =>
+  new RegExp(`((?:from|import)\\s*\\(?\\s*)(["'])${escapeRe(specifier)}\\2`, "g");
+
+/**
+ * Rewrites the bare specifiers in a user script to absolute proxy URLs:
+ *
+ *   "engine"       → Script / attribute / three's math types
+ *   "editor"       → the Editor API + @executeInEditMode / @menuItem
+ *   "three"        → the full three/webgpu surface (same instance as the engine)
+ *   "three/webgpu" → ditto
+ *   "three/tsl"    → the full TSL surface (same instance as the engine)
+ *
+ * Anything else is left alone. Note that `"three/addons/*"` is NOT rewritten:
+ * each addon is its own module and would need its own resolvable URL, so an
+ * addon import still fails at load time with the browser's own "failed to
+ * resolve module specifier" error rather than silently yielding `undefined`.
+ */
+export async function linkEngineImports(code) {
+  const urls = await resolveRuntimeUrls();
+  let out = code;
+  for (const [specifier, url] of Object.entries(urls)) {
+    out = out.replace(matcherFor(specifier), (_, lead, quote) => `${lead}${quote}${url}${quote}`);
   }
   return out;
 }

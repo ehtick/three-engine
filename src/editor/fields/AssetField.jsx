@@ -1,9 +1,15 @@
-import { useEffect, useState } from "react";
-import { ChevronDown } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { ChevronDown, Search } from "lucide-react";
 import { useProjectStore } from "../store/projectStore.js";
 import { listProjectAssets, toBlobUrl, extOf, TEXTURE_EXTENSIONS, MATERIAL_EXTENSIONS } from "../assetLoader.js";
 import { MATERIAL_DEFAULTS } from "../../engine/materialAsset.js";
 import { useAssetDrop } from "../assetDrag.js";
+import { revealAssetInPanel } from "../assetReveal.js";
+import { PopoverMenu } from "./PopoverMenu.jsx";
+import { ContextMenu, useContextMenu } from "../ContextMenu.jsx";
+import { openAssetPath } from "../openAsset.js";
+import { openPanel } from "../EditorShell.jsx";
+import { useSelectionStore } from "../store/selectionStore.js";
 
 const fileName = (p) => p?.split(/[\\/]/).pop() ?? "";
 
@@ -102,27 +108,83 @@ function OptionThumb({ path }) {
 export function AssetField({ descriptor, value, onCommit }) {
   const [open, setOpen] = useState(false);
   const [options, setOptions] = useState(null);
+  const [query, setQuery] = useState("");
+  const triggerRef = useRef(null);
 
   const exts = descriptor.exts ?? [];
   const emptyLabel = descriptor.emptyLabel ?? "None";
   const showThumb = value && [...TEXTURE_EXTENSIONS, ...MATERIAL_EXTENSIONS].includes(extOf(value));
 
   const dropRef = useAssetDrop({ accepts: exts, onDrop: onCommit });
+  // One element is both the drop target and the popover's anchor.
+  const setTriggerRef = useCallback(
+    (el) => {
+      triggerRef.current = el;
+      dropRef(el);
+    },
+    [dropRef],
+  );
 
   const browse = async () => {
+    // Clicking a filled slot also points the Assets panel at the file, so
+    // "which material is this?" is answered without leaving the inspector.
+    if (value) revealAssetInPanel(value).catch(() => {});
     setOpen(true);
     setOptions(null);
+    setQuery("");
     const root = useProjectStore.getState().rootPath;
     setOptions(await listProjectAssets(root, exts));
   };
+
+  // Left-click has to stay the picker (that's what the field is for), so
+  // everything that acts on the asset ALREADY in the slot lives here. Without
+  // it there is no way to say "show me this file" without also opening a
+  // dropdown over the thing you wanted to look at.
+  const { menu, open: openMenu, close: closeMenu } = useContextMenu();
+  const menuItems = value
+    ? [
+        {
+          label: "Show in Assets Panel",
+          action: async () => {
+            // Unlike the click-reveal, an explicit request opens the panel if
+            // it's closed — the user asked for it by name.
+            openPanel("assets");
+            // Let Dockview mount/activate the panel before it is asked to
+            // browse; revealing into a panel that doesn't exist yet is a no-op.
+            await new Promise((resolve) => requestAnimationFrame(resolve));
+            revealAssetInPanel(value).catch(() => {});
+          },
+        },
+        { label: "Open", action: () => openAssetPath(value) },
+        {
+          label: "Select Asset",
+          hint: "Show this asset's own import settings in the Inspector",
+          action: () => useSelectionStore.getState().selectAsset(value),
+        },
+        { separator: true },
+        { label: "Copy Path", action: () => navigator.clipboard.writeText(value).catch(() => {}) },
+        { label: "Replace…", action: browse },
+        { label: "Clear", danger: true, action: () => onCommit("") },
+      ]
+    : [{ label: "Browse…", action: browse }];
+
+  // A project with forty materials makes an unfiltered picker a scroll hunt.
+  // Matching on the full path (not just the filename) means the folder a user
+  // organised by is also a way to find things: typing "props" narrows to
+  // everything under Props/.
+  const needle = query.trim().toLowerCase();
+  const matches = needle
+    ? (options ?? []).filter((path) => path.toLowerCase().includes(needle))
+    : options;
 
   return (
     <div className="dropdown-wrap asset-field-wrap">
       <div
         className={`asset-field ${value ? "" : "empty"}`}
         title={value || `${emptyLabel} — drop an asset here or browse`}
-        ref={dropRef}
+        ref={setTriggerRef}
         onClick={browse}
+        onContextMenu={openMenu}
       >
         {showThumb && <OptionThumb path={value} />}
         <span className="asset-field-name">{value ? fileName(value) : emptyLabel}</span>
@@ -131,9 +193,32 @@ export function AssetField({ descriptor, value, onCommit }) {
         </span>
       </div>
       {open && (
-        <>
-          <div className="dropdown-overlay" onClick={() => setOpen(false)} />
-          <div className="dropdown-menu asset-options">
+        <PopoverMenu
+          anchorRef={triggerRef}
+          className="asset-options component-menu"
+          minWidth={250}
+          onClose={() => setOpen(false)}
+        >
+          <div className="component-menu-search">
+            <Search size={12} />
+            <input
+              autoFocus
+              type="text"
+              placeholder="Search assets…"
+              value={query}
+              spellCheck={false}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => {
+                e.stopPropagation();
+                if (e.key === "Escape") setOpen(false);
+                else if (e.key === "Enter" && matches?.length) {
+                  setOpen(false);
+                  onCommit(matches[0]);
+                }
+              }}
+            />
+          </div>
+          <div className="component-menu-list">
             <button
               className="dropdown-item"
               onClick={() => {
@@ -144,7 +229,7 @@ export function AssetField({ descriptor, value, onCommit }) {
               {emptyLabel}
             </button>
             {options === null && <div className="dropdown-item">Loading…</div>}
-            {options?.map((path) => (
+            {matches?.map((path) => (
               <button
                 key={path}
                 className="dropdown-item asset-option"
@@ -159,10 +244,13 @@ export function AssetField({ descriptor, value, onCommit }) {
                 <span className="asset-option-path">{relativeToRoot(path)}</span>
               </button>
             ))}
-            {options?.length === 0 && <div className="dropdown-item">No assets found</div>}
+            {matches?.length === 0 && (
+              <div className="dropdown-item">{needle ? "No matches" : "No assets found"}</div>
+            )}
           </div>
-        </>
+        </PopoverMenu>
       )}
+      {menu && <ContextMenu x={menu.x} y={menu.y} items={menuItems} onClose={closeMenu} />}
     </div>
   );
 }

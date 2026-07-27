@@ -52,6 +52,12 @@ export class ModelComponent extends Component {
         if (obj.isMesh) {
           obj.castShadow = this.props.castShadow !== false;
           obj.receiveShadow = this.props.receiveShadow !== false;
+          // Provenance for derived-data sidecars (e.g. baked mesh SDFs):
+          // GLB-internal geometries have no asset path of their own, so
+          // consumers key persisted artifacts off the model file instead.
+          if (obj.geometry && !obj.geometry.userData.sourceModelPath) {
+            obj.geometry.userData.sourceModelPath = path;
+          }
         }
       });
       this.entity.object3D.add(this.root);

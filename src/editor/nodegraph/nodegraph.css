@@ -1,0 +1,419 @@
+/* =====================================================================
+ * Node-graph toolkit styling (src/editor/nodegraph/).
+ *
+ * The node *chrome* (.shader-node, .shader-node-row, .shader-handle,
+ * .node-palette, category --cat colors) still lives in theme.css, shared with
+ * the animator graph. This file holds only what the toolkit introduced:
+ * scrubbable fields, curve/gradient widgets, comment frames, reroute pins,
+ * palette chrome and the minimap. Imported by GraphEditor.jsx.
+ * ===================================================================== */
+
+/* ---------- toolbar in a narrow panel ---------- */
+
+/* A graph panel is often docked into a narrow column. Without this the toolbar
+ * buttons squash and their labels break mid-button ("+ Node" over two lines,
+ * blowing the toolbar to double height). Keep every control at its natural
+ * size and let the ROW wrap instead.
+ *
+ * Deliberately NOT `overflow-x: auto` — a scrolling strip looks tidier, but
+ * `overflow` on the toolbar CLIPS its absolutely-positioned descendants, and
+ * the Presets/Node dropdowns are exactly that: they'd be sliced off at the
+ * toolbar's bottom edge and appear not to open at all. */
+.shader-graph-panel .panel-toolbar {
+  flex-wrap: wrap;
+  row-gap: 4px;
+}
+
+.shader-graph-panel .panel-toolbar > * {
+  flex: none;
+}
+
+.shader-graph-panel .toolbar-btn {
+  white-space: nowrap;
+}
+
+/* ---------- collapse + error badge ---------- */
+
+.graph-node-collapse {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+  margin-left: -4px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  flex: none;
+}
+
+.graph-node-collapse:hover {
+  color: var(--text);
+  background: var(--fill-1);
+}
+
+.shader-node.collapsed {
+  min-width: 120px;
+}
+
+.graph-node-error {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  margin-left: auto;
+  border-radius: 50%;
+  background: var(--danger);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  flex: none;
+  cursor: help;
+}
+
+/* ---------- scrubbable number field ---------- */
+
+.gf-number {
+  display: flex;
+  align-items: center;
+  height: 20px;
+  min-width: 54px;
+  margin-left: auto;
+  border-radius: var(--r-input);
+  background: var(--fill-1);
+  overflow: hidden;
+  transition: background-color 0.1s var(--ease), box-shadow 0.1s var(--ease);
+}
+
+.gf-number:hover {
+  background: var(--fill-2);
+}
+
+.gf-number:focus-within {
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+
+/* The grip is the drag surface. `ew-resize` is the honest cursor: it tells the
+ * user the control scrubs horizontally before they try it. */
+.gf-number-grip {
+  width: 11px;
+  align-self: stretch;
+  flex: none;
+  cursor: ew-resize;
+  opacity: 0.4;
+  background-image:
+    linear-gradient(var(--text-dim), var(--text-dim)),
+    linear-gradient(var(--text-dim), var(--text-dim)),
+    linear-gradient(var(--text-dim), var(--text-dim));
+  background-size: 1px 8px;
+  background-repeat: no-repeat;
+  background-position: calc(50% - 3px) center, center, calc(50% + 3px) center;
+}
+
+.gf-number-grip:hover {
+  opacity: 0.9;
+}
+
+.gf-number-input {
+  flex: 1;
+  min-width: 0;
+  width: 100%;
+  height: 100%;
+  padding: 0 6px 0 2px;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  outline: none;
+}
+
+/* ---------- vec3 ---------- */
+
+.gf-vec3 {
+  display: flex;
+  gap: 3px;
+  margin-left: auto;
+}
+
+.gf-vec3-axis {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.gf-vec3-axis > span {
+  font-size: 9px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.gf-vec3-axis.axis-x > span { color: #e06c6c; }
+.gf-vec3-axis.axis-y > span { color: #7fd493; }
+.gf-vec3-axis.axis-z > span { color: #6ba3e8; }
+
+.gf-vec3 .gf-number {
+  min-width: 46px;
+  width: 46px;
+}
+
+/* ---------- color ---------- */
+
+.gf-color {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.gf-color-swatch {
+  width: 26px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: 5px;
+  background: none;
+  cursor: pointer;
+  flex: none;
+}
+
+.gf-color-swatch::-webkit-color-swatch-wrapper { padding: 2px; }
+.gf-color-swatch::-webkit-color-swatch { border: none; border-radius: 3px; }
+
+.gf-color-hex {
+  width: 62px;
+  height: 20px;
+  padding: 0 5px;
+  border: none;
+  border-radius: var(--r-input);
+  background: var(--fill-1);
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 10px;
+  outline: none;
+}
+
+.gf-color-hex:focus {
+  box-shadow: 0 0 0 2px var(--accent-ring);
+  color: var(--text);
+}
+
+/* ---------- select / toggle ---------- */
+
+.gf-select {
+  height: 20px;
+  margin-left: auto;
+  padding: 0 4px;
+  border: none;
+  border-radius: var(--r-input);
+  background: var(--fill-1);
+  color: var(--text);
+  font: inherit;
+  font-size: 11px;
+  outline: none;
+  cursor: pointer;
+}
+
+.gf-select:hover { background: var(--fill-2); }
+
+.gf-toggle {
+  position: relative;
+  width: 30px;
+  height: 17px;
+  margin-left: auto;
+  padding: 0;
+  border: none;
+  border-radius: 999px;
+  background: var(--fill-2);
+  cursor: pointer;
+  flex: none;
+  transition: background-color 0.13s var(--ease);
+}
+
+.gf-toggle.on { background: var(--accent); }
+
+.gf-toggle-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: #fff;
+  transition: transform 0.13s var(--ease);
+}
+
+.gf-toggle.on .gf-toggle-knob { transform: translateX(13px); }
+
+/* ---------- curve + gradient ---------- */
+
+.gf-curve {
+  display: block;
+  margin: 2px auto 3px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: crosshair;
+}
+
+.gf-gradient {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  align-items: center;
+  margin: 2px 0 3px;
+}
+
+.gf-gradient-bar {
+  position: relative;
+  border: 1px solid var(--border-strong);
+  border-radius: 5px;
+  cursor: copy;
+}
+
+.gf-gradient-stop {
+  position: absolute;
+  top: 50%;
+  width: 11px;
+  height: 11px;
+  margin-left: -5.5px;
+  border: 2px solid #fff;
+  border-radius: 50%;
+  transform: translateY(-50%);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
+  cursor: grab;
+}
+
+.gf-gradient-stop.selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+
+.gf-gradient .gf-color { margin-left: 0; }
+
+/* ---------- code + asset params ---------- */
+
+.gf-code {
+  width: 100%;
+  min-height: 54px;
+  padding: 5px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-0);
+  color: var(--text);
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 10.5px;
+  line-height: 1.45;
+  resize: vertical;
+  outline: none;
+}
+
+.gf-code:focus { box-shadow: 0 0 0 2px var(--accent-ring); }
+
+.gf-asset { flex: 1; min-width: 0; margin-left: auto; }
+.gf-asset .asset-field-wrap { width: 100%; }
+
+/* ---------- comment frames ---------- */
+
+.graph-frame {
+  width: 100%;
+  height: 100%;
+  border: 1.5px dashed;
+  border-radius: 12px;
+  /* Tinted from the frame's own border color so a frame reads as a region
+   * without hiding the dot grid or the wires that cross it. */
+  background: color-mix(in srgb, currentColor 7%, transparent);
+  pointer-events: all;
+}
+
+.graph-frame-title {
+  position: absolute;
+  top: -10px;
+  left: 12px;
+  max-width: calc(100% - 24px);
+  padding: 1px 7px;
+  border: none;
+  border-radius: 5px;
+  background: var(--bg-1);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  outline: none;
+}
+
+.graph-frame-title:focus { box-shadow: 0 0 0 2px var(--accent-ring); }
+
+.graph-frame-resize { border-color: var(--accent) !important; }
+
+/* ---------- reroute pin ---------- */
+
+.graph-reroute {
+  width: 14px;
+  height: 14px;
+  border: 2px solid;
+  border-radius: 50%;
+  background: var(--bg-0);
+}
+
+.graph-reroute.selected {
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+
+.graph-reroute .react-flow__handle {
+  width: 8px;
+  height: 8px;
+  border: none;
+  opacity: 0;
+}
+
+.graph-reroute:hover .react-flow__handle { opacity: 1; }
+
+/* ---------- palette chrome ---------- */
+
+.node-palette-cats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 6px 8px 2px;
+  border-bottom: 1px solid var(--border);
+}
+
+.node-palette-cat {
+  padding: 2px 8px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: var(--fill-1);
+  color: var(--text-dim);
+  font-size: 10px;
+  cursor: pointer;
+  transition: background-color 0.1s var(--ease), color 0.1s var(--ease);
+}
+
+.node-palette-cat:hover { background: var(--fill-2); color: var(--text); }
+
+.node-palette-cat.active {
+  background: color-mix(in srgb, var(--cat, var(--accent)) 22%, transparent);
+  border-color: color-mix(in srgb, var(--cat, var(--accent)) 45%, transparent);
+  color: var(--text);
+}
+
+.node-palette-item { cursor: grab; }
+.node-palette-item:active { cursor: grabbing; }
+
+/* ---------- minimap ---------- */
+
+.react-flow__minimap.graph-minimap {
+  background: var(--bg-0);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.react-flow__minimap.graph-minimap .react-flow__minimap-node {
+  fill: var(--bg-3);
+  stroke: var(--border-strong);
+}

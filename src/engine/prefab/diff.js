@@ -1,7 +1,24 @@
 import { prefabRegistry } from "./registry.js";
 import { resolvePrefab, findByPath } from "./resolve.js";
 import { liveTree } from "./expand.js";
+import { getComponentClass } from "../components/registry.js";
 import { deepEqual, clone, isInstanceNode, isVariant, nodeFromSnapshot, TRANSFORM_KEYS, FLAG_KEYS } from "./format.js";
+
+/**
+ * Brings a def's saved component props up to the shape the live component
+ * uses, so a props-format migration doesn't read as an override.
+ *
+ * A live component normalizes its props in its constructor; a prefab def is
+ * raw JSON that never passes through one. Without this, every instance of
+ * every prefab saved before the migration would diff dirty on the old keys
+ * *and* the new ones — see `ScriptComponent.normalizeProps`, which moved a
+ * single `{ path, attributes }` script into a `{ scripts: [...] }` list.
+ *
+ * Components without a migration (nearly all of them) return their props
+ * untouched, so this costs a lookup per component per diff.
+ */
+const normalizeProps = (type, props) =>
+  getComponentClass(type)?.normalizeProps?.(props) ?? props;
 
 /**
  * Overrides are *derived*, never recorded.
@@ -36,6 +53,12 @@ function diffNode(expected, live, path, out, { isRoot }) {
     if (a !== b) out.push({ t: path, k: "flag", key, v: b });
   }
 
+  // Tags are a whole-list value, not per-item: "this instance is tagged
+  // [boss, elite]" is one override the user can apply or revert as a unit.
+  if (!deepEqual(live.tags ?? [], expected.tags ?? [])) {
+    out.push({ t: path, k: "tags", v: clone(live.tags ?? []) });
+  }
+
   // --- components ---------------------------------------------------------
   const expectedByType = new Map((expected.components ?? []).map((c) => [c.type, c]));
   const liveByType = new Map((live.components ?? []).map((c) => [c.type, c]));
@@ -46,10 +69,12 @@ function diffNode(expected, live, path, out, { isRoot }) {
       out.push({ t: path, k: "addComponent", c: type, v: clone(liveComponent.props) });
       continue;
     }
-    const keys = new Set([...Object.keys(expectedComponent.props ?? {}), ...Object.keys(liveComponent.props ?? {})]);
+    const liveProps = normalizeProps(type, liveComponent.props ?? {});
+    const expectedProps = normalizeProps(type, expectedComponent.props ?? {});
+    const keys = new Set([...Object.keys(expectedProps), ...Object.keys(liveProps)]);
     for (const key of keys) {
-      if (!deepEqual(liveComponent.props?.[key], expectedComponent.props?.[key])) {
-        out.push({ t: path, k: "prop", c: type, key, v: clone(liveComponent.props?.[key]) });
+      if (!deepEqual(liveProps[key], expectedProps[key])) {
+        out.push({ t: path, k: "prop", c: type, key, v: clone(liveProps[key]) });
       }
     }
   }
@@ -207,6 +232,9 @@ function applyToDefNode(node, ov) {
       break;
     case "flag":
       node[ov.key] = ov.v;
+      break;
+    case "tags":
+      node.tags = clone(ov.v) ?? [];
       break;
     case "prop": {
       const component = (node.components ??= []).find((c) => c.type === ov.c);

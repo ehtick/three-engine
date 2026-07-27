@@ -8,6 +8,7 @@ import { MATERIAL_EXTENSIONS, MODEL_EXTENSIONS, TEXTURE_EXTENSIONS } from "../as
 import { engine } from "../engineInstance.js";
 import { ensureTerrainAssets } from "../terrainAssetSetup.js";
 import { SCULPT_TOOLS, MAX_TERRAIN_LAYERS, makeTerrainLayer, makeTerrainScatterLayer } from "../../modules/terrain/TerrainComponent.js";
+import { FALLOFF_CURVES } from "../brush.js";
 import {
   armTerrainBrush,
   armTerrainScatterSourcePick,
@@ -26,6 +27,8 @@ const TOOL_HINTS = {
   smooth: "Average out bumps and noise",
   flatten: "Level toward the height where the stroke started",
   sharpen: "Amplify detail — accent ridges and creases",
+  contrast: "Push away from the local average — the inverse of Smooth",
+  pinch: "Pull the surface toward the height under the brush centre",
   erode: "Carve downhill — weathered valleys and channels",
   noise: "Add coherent random bumps for natural variation",
 };
@@ -416,6 +419,18 @@ export function TerrainSection({ entityId, props }) {
           </PropRow>
           <PropRow label="Hardness">
             <NumberInput value={settings.hardness} min={0} max={1} step={0.05} onCommit={(v) => setTerrainBrushSetting("hardness", v)} />
+          </PropRow>
+          <PropRow label="Falloff">
+            <select
+              value={settings.falloff ?? ""}
+              title="Shared with the mesh sculptor. Hardness keeps the original terrain curve."
+              onChange={(e) => setTerrainBrushSetting("falloff", e.target.value || null)}
+            >
+              <option value="">Hardness</option>
+              {FALLOFF_CURVES.map((curve) => (
+                <option key={curve.id} value={curve.id}>{curve.label}</option>
+              ))}
+            </select>
           </PropRow>
         </>
       )}

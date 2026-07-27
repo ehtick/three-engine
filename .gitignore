@@ -33,3 +33,13 @@ dist-ssr
 /dist-player
 
 package-lock.json
+
+# Diagnostic output written by the harnesses in scripts/ (screenshots, probe
+# dumps, perf traces). Always regenerable by re-running the harness, so it is
+# never committed. `npm run clean:artifacts` deletes it.
+scripts/*.png
+scripts/*.jpg
+scripts/*.jpeg
+scripts/*.webp
+scripts/*.gif
+/artifacts/

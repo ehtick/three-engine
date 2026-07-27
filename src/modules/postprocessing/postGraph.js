@@ -103,7 +103,10 @@ export const PP_NODE_TYPES = {
     // assigns it directly. Defaults match the addon's own.
     params: [
       // --- Quality / sampling ---
-      resScale("1"),
+      // Half res by default: SSGI is a low-frequency signal and full-res
+      // tracing was the single biggest chunk of the "post doubles my frame
+      // time" report. Existing graphs keep whatever they saved.
+      resScale("0.5"),
       num("sliceCount", "Slice Count", 2, { min: 1, max: 4, step: 1 }),
       num("stepCount", "Step Count", 8, { min: 1, max: 32, step: 1 }),
       num("radius", "Radius", 12, { min: 1, max: 25, step: 0.5 }),
@@ -130,7 +133,8 @@ export const PP_NODE_TYPES = {
     ],
     outputs: [{ key: "out", kind: "vec4" }],
     params: [
-      resScale("1"),
+      // Half res by default — same rationale as SSGI.
+      resScale("0.5"),
       bool("stochastic", "Stochastic", false),
       num("intensity", "Intensity", 1.0, { min: 0, max: 4, step: 0.05 }),
       bool("reflectNonMetals", "Reflect Non-metals", false),
@@ -1599,6 +1603,52 @@ export function compilePostGraph(graph, ctx) {
     signature: postGraphSignature(graph),
     updateParams: () => {},
   };
+}
+
+/**
+ * Which auxiliary scene-pass MRT attachments a graph actually consumes.
+ * Every extra attachment is written by EVERY material's fragment shader,
+ * and `velocity` additionally forces per-object previous-frame matrix
+ * tracking — an Input→Output passthrough carrying the full 4-target MRT
+ * measured ~2× total frame time vs the plain canvas render. Only nodes
+ * REACHABLE from the Output node count (orphans never compile).
+ */
+export function postGraphSceneNeeds(graph) {
+  const nodes = graph?.nodes ?? [];
+  const edges = graph?.edges ?? [];
+  const needs = { normal: false, velocity: false, matParams: false };
+  const nodeById = new Map(nodes.map((n) => [n.id, n]));
+  const out = nodes.find((n) => n.type === "output");
+  if (!out) return needs;
+  const incoming = new Map();
+  for (const e of edges) {
+    if (!incoming.has(e.target)) incoming.set(e.target, []);
+    incoming.get(e.target).push(e);
+  }
+  const seen = new Set([out.id]);
+  const stack = [out.id];
+  while (stack.length) {
+    const node = nodeById.get(stack.pop());
+    if (!node) continue;
+    if (node.type === "ssgi" || node.type === "denoise") needs.normal = true;
+    if (node.type === "ssr") {
+      needs.normal = true;
+      needs.matParams = true;
+    }
+    if (node.type === "traa" || node.type === "motionBlur") needs.velocity = true;
+    for (const e of incoming.get(node.id) ?? []) {
+      // Manual wires off the Input node's aux sockets count too.
+      if (nodeById.get(e.source)?.type === "input") {
+        if (e.sourceHandle === "normal") needs.normal = true;
+        if (e.sourceHandle === "velocity") needs.velocity = true;
+      }
+      if (!seen.has(e.source)) {
+        seen.add(e.source);
+        stack.push(e.source);
+      }
+    }
+  }
+  return needs;
 }
 
 /**

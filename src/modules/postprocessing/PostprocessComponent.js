@@ -5,6 +5,7 @@ import { EDITOR_LAYER } from "../../engine/editorLayers.js";
 import {
   compilePostGraph,
   DEFAULT_POST_GRAPH,
+  postGraphSceneNeeds,
   postGraphSignature,
   loadSSGI,
   loadSSR,
@@ -383,6 +384,24 @@ export class PostprocessComponent extends Component {
     ]);
     if (myGen !== this.generation) return;
 
+    // Only attach the MRT slots the graph actually consumes. Every extra
+    // attachment is written by EVERY material in the scene pass, and
+    // `velocity` additionally makes three track previous-frame matrices
+    // per object — a passthrough graph with the full 4-target MRT measured
+    // ~2× total frame time vs the plain canvas render ("post-processing
+    // doubles the lag"). The attachment set is structural: changing it
+    // needs a fresh PassNode (and new material variants for its context).
+    const needs = postGraphSceneNeeds(graph);
+    const needsKey = `${needs.normal}|${needs.velocity}|${needs.matParams}`;
+    if (this.scenePass && this._passNeedsKey !== needsKey) {
+      try {
+        this.scenePass.dispose();
+      } catch (err) {
+        console.warn(`PostprocessComponent: PassNode dispose failed: ${err?.message ?? err}`);
+      }
+      this.scenePass = null;
+    }
+
     // Build the PassNode once. PassNode owns its color + depth render
     // targets and renders the scene through them when the RenderPipeline
     // walks the output graph. Rebuild on camera/scene swap — otherwise
@@ -406,6 +425,7 @@ export class PostprocessComponent extends Component {
       // cameras still go through the renderer's default path) and produces
       // a standard `texture_depth_2d` that SSGINode's shader expects.
       this.scenePass = TSL.pass(engine.scene, this.renderCamera, { samples: 1 });
+      this._passNeedsKey = needsKey;
       this.postprocessLayers = new THREE.Layers();
       this.postprocessLayers.mask = this.renderCamera.layers.mask;
       this.postprocessLayers.disable(EDITOR_LAYER);
@@ -421,35 +441,35 @@ export class PostprocessComponent extends Component {
       // and slow at high tessellation.
       //
       // Keep diffuseColor out for now because the graph still approximates
-      // diffuse albedo with beauty.rgb. Velocity is required by TRAA and is
-      // generated alongside color/depth/normal so reprojection stays aligned.
-      this.scenePass.setMRT(
-        TSL.mrt({
-          output: TSL.output,
-          normal: TSL.packNormalToRGB(TSL.normalView),
-          // Motion vectors consumed by TRAA. This must be produced by the
-          // same scene pass as color/depth so temporal reprojection aligns.
-          velocity: TSL.velocity,
-          // Material params for screen-space reflections: metalness in R,
-          // roughness in G. `metalness`/`roughness` are MaterialNode accessors
-          // that resolve to each material's own value during its fragment
-          // shader (defaulting to 0 / 1 for materials without the property),
-          // so the pass writes a per-pixel material buffer alongside colour.
-          // The hybrid SSR path reads it to tell metal from dielectric and to
-          // pick the reflection blur mip; without it SSR reflects everything
-          // or nothing.
-          matParams: TSL.vec4(TSL.metalness, TSL.roughness, 0, 1),
-        }),
-      );
+      // diffuse albedo with beauty.rgb.
+      const mrtSlots = { output: TSL.output };
+      // Packed view-space normal — SSGI/SSR/denoise read it instead of
+      // reconstructing normals from depth in-shader.
+      if (needs.normal) mrtSlots.normal = TSL.packNormalToRGB(TSL.normalView);
+      // Motion vectors consumed by TRAA/motion blur. Must be produced by the
+      // same scene pass as color/depth so temporal reprojection aligns.
+      if (needs.velocity) mrtSlots.velocity = TSL.velocity;
+      // Material params for screen-space reflections: metalness in R,
+      // roughness in G. `metalness`/`roughness` are MaterialNode accessors
+      // that resolve to each material's own value during its fragment
+      // shader (defaulting to 0 / 1 for materials without the property),
+      // so the pass writes a per-pixel material buffer alongside colour.
+      // The hybrid SSR path reads it to tell metal from dielectric and to
+      // pick the reflection blur mip; without it SSR reflects everything
+      // or nothing.
+      if (needs.matParams) mrtSlots.matParams = TSL.vec4(TSL.metalness, TSL.roughness, 0, 1);
+      // A graph that consumes only color/depth gets NO MRT at all — the
+      // pass renders exactly like the plain canvas path, single attachment.
+      this.scenePass.setMRT(Object.keys(mrtSlots).length > 1 ? TSL.mrt(mrtSlots) : null);
       // Narrow the normal texture to UnsignedByteType (8-bit/channel RGBA)
       // for bandwidth. Per three's example, the default HalfFloatType is
       // overkill for a packed unit-length normal — the bits of precision
       // lost at 8-bit aren't visible at typical screen-space raytracing
       // step counts.
-      const normalTexture = this.scenePass.getTexture("normal");
+      const normalTexture = needs.normal ? this.scenePass.getTexture("normal") : null;
       if (normalTexture) normalTexture.type = THREE.UnsignedByteType;
       // metalness/roughness are 0..1 scalars — 8-bit is plenty.
-      const matTexture = this.scenePass.getTexture("matParams");
+      const matTexture = needs.matParams ? this.scenePass.getTexture("matParams") : null;
       if (matTexture) matTexture.type = THREE.UnsignedByteType;
     }
 
@@ -467,8 +487,10 @@ export class PostprocessComponent extends Component {
     // traces against smooth interpolated normals instead.
     let normalNode = null;
     try {
-      const normalTex = this.scenePass.getTextureNode("normal");
-      normalNode = TSL.sample((uv) => TSL.unpackRGBToNormal(normalTex.sample(uv)));
+      if (needs.normal) {
+        const normalTex = this.scenePass.getTextureNode("normal");
+        normalNode = TSL.sample((uv) => TSL.unpackRGBToNormal(normalTex.sample(uv)));
+      }
     } catch (err) {
       // If the engine's three build doesn't expose the 'normal' MRT
       // slot, we degrade to null (depth reconstruction). This makes the
@@ -484,7 +506,7 @@ export class PostprocessComponent extends Component {
     // and reads the XY motion vector itself.
     let velocityNode = null;
     try {
-      velocityNode = this.scenePass.getTextureNode("velocity");
+      if (needs.velocity) velocityNode = this.scenePass.getTextureNode("velocity");
     } catch (err) {
       console.warn(
         `PostprocessComponent: could not wire velocity MRT (${err?.message ?? err}) — TRAA will be a passthrough.`,
@@ -498,9 +520,11 @@ export class PostprocessComponent extends Component {
     let metalnessNode = null;
     let roughnessNode = null;
     try {
-      const matTex = this.scenePass.getTextureNode("matParams");
-      metalnessNode = TSL.sample((uv) => matTex.sample(uv).r);
-      roughnessNode = TSL.sample((uv) => matTex.sample(uv).g);
+      if (needs.matParams) {
+        const matTex = this.scenePass.getTextureNode("matParams");
+        metalnessNode = TSL.sample((uv) => matTex.sample(uv).r);
+        roughnessNode = TSL.sample((uv) => matTex.sample(uv).g);
+      }
     } catch (err) {
       console.warn(
         `PostprocessComponent: could not wire material-params MRT (${err?.message ?? err}) — SSR will treat surfaces as non-metallic.`,
@@ -597,6 +621,7 @@ export class PostprocessComponent extends Component {
       }
     }
     this.scenePass = null;
+    this._passNeedsKey = null;
     this.postprocessLayers = null;
     this.scene = null;
     this.signature = null;

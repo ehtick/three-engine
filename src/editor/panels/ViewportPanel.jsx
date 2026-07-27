@@ -27,9 +27,25 @@ import {
   snapSelectionToOrigin,
 } from "../threeDCursorOps.js";
 import { CursorHUD } from "../helpers/CursorHUD.jsx";
+import { ContextMenu } from "../ContextMenu.jsx";
+import {
+  clipboardHasEntities,
+  copyEntities,
+  deleteSelection,
+  duplicateSelection,
+  pasteEntities,
+} from "../clipboard.js";
 import { commandBus } from "../commands/CommandBus.js";
 import { SetTransformCommand } from "../commands/transformCommands.js";
 import { SetCursor3DCommand } from "../commands/cursorCommands.js";
+import {
+  macroPivot,
+  numericDelta,
+  parseMacroNumber,
+  pointerDelta,
+  toggleBufferSign,
+  worldPerPixelAt,
+} from "../transformMacroMath.js";
 import { BatchCommand, topMostIds } from "../commands/entityCommands.js";
 import { getUiSystem } from "../../engine/ui/UiSystem.js";
 import { AddComponentCommand, SetComponentPropCommand } from "../commands/componentCommands.js";
@@ -50,6 +66,7 @@ import {
   setTerrainBrushSetting,
   subscribeTerrainBrush,
 } from "../terrainBrush.js";
+import { createStroke, resetStroke, strokeDabs } from "../brush.js";
 import { SetTerrainHeightsCommand, SetTerrainScatterCommand, SetTerrainSplatmapCommand } from "../commands/terrainCommands.js";
 import { GeometryEditorPanel } from "./GeometryEditorPanel.jsx";
 import { useGeometryEditStore } from "../store/geometryEditStore.js";
@@ -195,6 +212,13 @@ async function ensureViewport() {
       viewport.pivot = pivot;
 
       viewport.orbit = new OrbitControls(viewport.camera, canvas);
+      // DEV-ONLY handle for automated harnesses. `engine.camera` IS this
+      // camera, but OrbitControls re-aims it at `orbit.target` on every
+      // update — so a script that sets position+lookAt gets its orientation
+      // silently overwritten and ends up photographing empty space. Aiming
+      // the viewport from a script means moving the ORBIT TARGET, which
+      // needs the controls object.
+      if (import.meta.env?.DEV) globalThis.__viewport = viewport;
       viewport.orbit.enableDamping = true;
       viewport.orbit.dampingFactor = 0.12;
       viewport.orbit.addEventListener("start", () => {
@@ -390,9 +414,9 @@ function setupGizmo(canvas) {
     // so Ctrl+Z pops it back to where it was.
     if (isCursorSelectionTarget(gizmo.object)) {
       if (e.value) {
-        beforeCursorPos = [...getCursor3D()];
+        beforeCursorPos = [...getCursor3D().position];
       } else if (beforeCursorPos) {
-        const after = getCursor3D();
+        const after = getCursor3D().position;
         // Skip no-op drags (e.g. clicks on the gizmo's centre handle
         // without movement) so the undo stack stays clean.
         const moved = beforeCursorPos.some((v, i) => Math.abs(v - after[i]) > 1e-6);
@@ -1601,6 +1625,33 @@ function detachLightHelper() {
   viewport.lightHelper = null;
 }
 
+// How close (in pixels) a click has to land to a line/point helper to count
+// as a hit on it. three's default Line threshold is 1 *world* unit, which
+// wraps the selection outline in an invisible slab a metre thick around the
+// object's bounding box — at normal scene scale that slab swallows clicks
+// meant for whatever sits behind or inside the box, which is why picking felt
+// like it was aiming at bounding boxes instead of geometry.
+const LINE_PICK_PX = 5;
+
+/** True when `object` and every ancestor is visible. three's raycaster
+ *  dropped its `visible` check years ago, so hidden entities stay clickable
+ *  unless we filter them here. */
+function isPickVisible(object) {
+  for (let node = object; node; node = node.parent) {
+    if (node.visible === false) return false;
+  }
+  return true;
+}
+
+/** Solid geometry beats wireframe helpers regardless of depth. The selection
+ *  outline is a LineSegments cage sitting on the *outside* of the object it
+ *  brackets, so by distance it always beats the mesh it belongs to — letting
+ *  it win on distance alone makes an already-selected object impossible to
+ *  click through to anything inside or behind it. */
+function isSolidPick(object) {
+  return !object.isLine && !object.isPoints;
+}
+
 function setupPicking(canvas) {
   const raycaster = new THREE.Raycaster();
   // Pick against every layer so the camera model (EDITOR_LAYER), gizmo
@@ -1610,6 +1661,11 @@ function setupPicking(canvas) {
   raycaster.layers.enableAll();
   const pointer = new THREE.Vector2();
   let downPos = null;
+
+  // Keep the last cursor position on hand for the G/R/S macros, which anchor
+  // their drag where the cursor was when the key was pressed. Re-adding the
+  // same function reference on remount is a no-op, so this never stacks up.
+  window.addEventListener("pointermove", trackCursor, true);
 
   canvas.addEventListener("pointerdown", (e) => {
     if (e.button === 0 && !getTerrainBrushMode()) downPos = { x: e.clientX, y: e.clientY };
@@ -1626,37 +1682,59 @@ function setupPicking(canvas) {
       -((e.clientY - rect.top) / rect.height) * 2 + 1,
     );
     raycaster.setFromCamera(pointer, viewport.camera);
+    // Re-derive the line/point pick radius in world units each click so it
+    // stays a constant handful of pixels no matter how far the camera is.
+    const wpp = worldPerPixelAt(
+      viewport.orbit?.target ?? viewport.camera.position,
+      rect,
+      viewport.camera,
+    );
+    raycaster.params.Line.threshold = wpp * LINE_PICK_PX;
+    raycaster.params.Points.threshold = wpp * LINE_PICK_PX;
+
     const hits = raycaster.intersectObjects(engine.scene.children, true);
+    // Nearest solid hit wins; a helper-line hit is only a fallback for when
+    // nothing solid was under the cursor (clicking the bare selection cage of
+    // an object whose geometry you missed still re-selects it).
+    let entityId = null;
+    let lineFallbackId = null;
     for (const hit of hits) {
-      const entityId = findEntityId(hit.object);
-      if (entityId) {
-        const selection = useSelectionStore.getState();
-        if (e.ctrlKey || e.metaKey) {
-          // Ctrl/Cmd: toggle this entity in/out of the current selection.
-          selection.toggle(entityId);
-        } else if (e.shiftKey && selection.anchorId) {
-          // Shift: extend the selection from the anchor to this entity
-          // along the depth-first engine tree (same ordering the
-          // HierarchyPanel uses). Falls back to a plain select if either
-          // end isn't in the live tree (entity got deleted mid-drag).
-          const order = flattenEngineTree();
-          const a = order.indexOf(selection.anchorId);
-          const b = order.indexOf(entityId);
-          if (a !== -1 && b !== -1) {
-            selection.select(
-              order.slice(Math.min(a, b), Math.max(a, b) + 1),
-              selection.anchorId,
-            );
-          } else {
-            selection.select(entityId);
-          }
-        } else {
-          selection.select(entityId);
-        }
-        return;
+      if (!isPickVisible(hit.object)) continue;
+      const id = findEntityId(hit.object);
+      if (!id) continue;
+      if (isSolidPick(hit.object)) {
+        entityId = id;
+        break;
       }
+      lineFallbackId ??= id;
     }
-    if (!e.ctrlKey && !e.metaKey && !e.shiftKey) useSelectionStore.getState().clear();
+    entityId ??= lineFallbackId;
+
+    if (!entityId) {
+      if (!e.ctrlKey && !e.metaKey && !e.shiftKey) useSelectionStore.getState().clear();
+      return;
+    }
+
+    const selection = useSelectionStore.getState();
+    if (e.ctrlKey || e.metaKey) {
+      // Ctrl/Cmd: toggle this entity in/out of the current selection.
+      selection.toggle(entityId);
+    } else if (e.shiftKey && selection.anchorId) {
+      // Shift: extend the selection from the anchor to this entity
+      // along the depth-first engine tree (same ordering the
+      // HierarchyPanel uses). Falls back to a plain select if either
+      // end isn't in the live tree (entity got deleted mid-drag).
+      const order = flattenEngineTree();
+      const a = order.indexOf(selection.anchorId);
+      const b = order.indexOf(entityId);
+      if (a !== -1 && b !== -1) {
+        selection.select(order.slice(Math.min(a, b), Math.max(a, b) + 1), selection.anchorId);
+      } else {
+        selection.select(entityId);
+      }
+    } else {
+      selection.select(entityId);
+    }
   });
 }
 
@@ -2092,6 +2170,23 @@ function setupTerrainBrush(canvas) {
     };
   };
 
+  /**
+   * Lays every dab between the previous pointer sample and this one.
+   *
+   * The heightfield is sampled on the XZ plane, so the stroke path is tracked
+   * in 2D; the brush itself only ever uses X and Z.
+   */
+  const applyStrokeAt = (component, local) => {
+    if (!stroke?.path) {
+      applyBrush(component, local);
+      return;
+    }
+    const settings = getTerrainBrushSettings();
+    for (const [x, z] of strokeDabs(stroke.path, [local.x, local.z], settings.radius)) {
+      applyBrush(component, new THREE.Vector3(x, local.y, z));
+    }
+  };
+
   const applyBrush = (component, local) => {
     const settings = getTerrainBrushSettings();
     if (stroke.mode === "sculpt") {
@@ -2100,6 +2195,7 @@ function setupTerrainBrush(canvas) {
         radius: settings.radius,
         strength: settings.strength * 0.15,
         hardness: settings.hardness,
+        falloff: settings.falloff,
         flattenHeight: stroke.flattenHeight,
         seed: stroke.seed,
       });
@@ -2111,6 +2207,7 @@ function setupTerrainBrush(canvas) {
         radius: settings.radius,
         strength: settings.strength,
         hardness: settings.hardness,
+        falloff: settings.falloff,
         erase: stroke.mode === "erase",
       });
     } else if (stroke.mode === "scatter") {
@@ -2167,8 +2264,13 @@ function setupTerrainBrush(canvas) {
       seed: strokeSeed++,
       dab: 0,
       erase: mode === "scatter" && e.ctrlKey,
+      // Shared with the mesh sculptor: pointer events arrive far apart during a
+      // quick drag, and applying one dab per event left a dotted trail rather
+      // than a stroke. Scatter keeps its own spacing rule, which is about how
+      // far apart the instances sit, not about sampling the pointer.
+      path: mode === "scatter" ? null : createStroke({ spacing: 0.25 }),
     };
-    applyBrush(sel.component, local);
+    applyStrokeAt(sel.component, local);
   }, true);
 
   canvas.addEventListener("pointermove", (e) => {
@@ -2206,12 +2308,13 @@ function setupTerrainBrush(canvas) {
     setNdc(e);
     if (!stroke) return;
     const local = localHit(stroke.component);
-    if (local) applyBrush(stroke.component, local);
+    if (local) applyStrokeAt(stroke.component, local);
   });
 
   window.addEventListener("pointerup", () => {
     if (!stroke) return;
     const { component, entityId, mode, before } = stroke;
+    if (stroke.path) resetStroke(stroke.path);
     stroke = null;
     viewport.terrainBrushing = false;
     viewport.orbit.enabled = true;
@@ -2368,10 +2471,18 @@ function handleAssetDrop(path, point) {
       const entityId = findEntityId(hit.object);
       const entity = entityId && engine.getEntity(entityId);
       if (!entity) continue;
-      if (entity.getComponent("script")) {
-        commandBus.execute(new SetComponentPropCommand(entityId, "script", "path", path));
+      // Dropping a second script onto an entity APPENDS it rather than
+      // replacing what's there — an entity is expected to carry several.
+      const existing = entity.getComponent("script");
+      if (existing) {
+        const scripts = [...(existing.props.scripts ?? []), { path, enabled: true, attributes: {} }];
+        commandBus.execute(new SetComponentPropCommand(entityId, "script", "scripts", scripts));
       } else {
-        commandBus.execute(new AddComponentCommand(entityId, "script", { path }));
+        commandBus.execute(
+          new AddComponentCommand(entityId, "script", {
+            scripts: [{ path, enabled: true, attributes: {} }],
+          }),
+        );
       }
       useSelectionStore.getState().select(entityId);
       return;
@@ -2679,26 +2790,50 @@ function setGizmoMode(mode) {
 //
 // Grammar:
 //   G | R | S                       → start macro (translate / rotate / scale).
-//                                     The macro opens in *interactive* mode:
-//                                     mouse delta drives the transform. The
-//                                     cursor delta is projected through the
-//                                     camera's right/up basis so each active
-//                                     world axis picks up the motion that
-//                                     lies along its screen direction. With
-//                                     no axis lock, this is a free 3-axis
-//                                     tumble / move / scale around the view.
+//                                     The macro opens in *interactive* mode,
+//                                     anchored at the cursor position at the
+//                                     moment the key was pressed. Mouse motion
+//                                     then drives the transform exactly the way
+//                                     Blender does it:
+//                                       move   — the object tracks the cursor
+//                                                in the view plane (1:1 at the
+//                                                pivot's depth), or slides
+//                                                along the locked axis by the
+//                                                cursor's projection onto that
+//                                                axis' screen direction
+//                                       rotate — the *angle* the cursor sweeps
+//                                                around the on-screen pivot,
+//                                                about the view axis (or the
+//                                                locked world axis)
+//                                       scale  — the *ratio* of the cursor's
+//                                                distance from the on-screen
+//                                                pivot to its distance at
+//                                                macro start. Moving toward
+//                                                the pivot shrinks, away grows.
 //   X | Y | Z                        → toggle that axis in `macro.axes`. Each
-//                                     press also re-captures `origin` so the
-//                                     "prev rotation is cancelled" — successive
-//                                     axis presses are cumulative (R Y Z = YZ).
-//                                     Toggling the only remaining axis resets
-//                                     to all-three.
-//   <digits> [.<digits>] [-]         → enter numeric mode. Mouse is ignored
-//                                     while a value is buffered; the value is
-//                                     applied to each active axis (units for
-//                                     G, degrees for R, multiplier for S).
-//                                     Backspace clears the buffer first, then
-//                                     removes the last locked axis.
+//                                     press re-baselines the macro, so the
+//                                     previous drag is cancelled and the new
+//                                     constraint starts from the current pose.
+//                                     Presses are cumulative (R Y Z = YZ);
+//                                     toggling the last one back resets to
+//                                     all-three.
+//   <digits> [.<digits>]             → enter numeric mode. Mouse is ignored
+//                                     while a value is buffered:
+//                                       G 2      → +2 along world X
+//                                       G Z 2    → +2 along world Z
+//                                       R 90     → 90° about the view axis
+//                                       R X 90   → 90° about world X
+//                                       S 0.5    → uniform 0.5×
+//                                       S X 0.5  → 0.5× on world X only
+//                                     Only the *first* keystroke re-baselines;
+//                                     the rest edit the same buffer against a
+//                                     fixed origin, so "0.5" reads as 0.5 and
+//                                     "90" as 90 (not 0 and 99).
+//   -                                → toggle the sign of the buffered value at
+//                                     any point, Blender-style. "90" then "-"
+//                                     becomes "-90"; pressing it again undoes.
+//   Backspace                        → trim the buffer first, then pop the most
+//                                     recent axis lock.
 //   Enter | Space | left-click       → commit. Left-click mimics Blender's
 //                                     "click anywhere to confirm" gesture.
 //   right-click                      → cancel. (Blender's RMB convention.)
@@ -2706,46 +2841,73 @@ function setGizmoMode(mode) {
 //
 // A macro acts on every selected entity — the gizmo also drives the whole
 // selection, so the macro grammar matches what the rest of the editor does.
+// Rotate and scale pivot around the selection's median world origin (Blender's
+// default "Median Point" pivot), which for a single entity is its own origin —
+// so a lone object spins/scales in place.
 // ---------------------------------------------------------------------------
 
 const AXIS_KEYS = { x: "x", y: "y", z: "z" };
 
-// Unit increment rate per pixel of cursor motion. Translate, rotate, and
-// scale all share the same base rate so the macros feel consistent —
-// one pixel of cursor motion means the same "size of nudge" no matter
-// which mode you're in.
-//
-//   translate: 1 px → 0.01 world-units per active axis (matching the
-//              1:1 world-cursor feel Blender uses at a typical zoom)
-//   rotate:    1 px → 0.01 rad per active axis (~0.57°/px, ~57°/100px)
-//   scale:     1 px → +1% of current scale per active axis (additive,
-//              so 100 px doubles the scale)
-//
-// The world delta is the camera-projected (dx, dy), so each active axis
-// only picks up motion that lies along its screen direction — e.g.
-// pressing Z while the camera looks down the Z axis makes the entity
-// spin around Z no matter where you drag, because all motion projects
-// onto the world-Z basis.
-const UNIT_PER_PIXEL = 0.01;
-
-// Translate-only distance-aware scale. `worldPerPixel` is derived from the
-// camera's distance to the orbit target so that 1 pixel of cursor motion
-// corresponds to the same number of world units regardless of zoom — i.e.
-// ~PIXEL_REFERENCE pixels of drag equals the camera distance worth of
-// world translation, matching Blender's translate feel. Rotate and scale
-// use the fixed `UNIT_PER_PIXEL` rate above (they operate in screen-space
-// units, not world units, so distance scaling doesn't apply).
-const PIXEL_REFERENCE = 800;
+/** Last cursor position seen anywhere in the window. The macro anchors its
+ *  drag here at G/R/S time rather than waiting for the first pointermove:
+ *  radial scale and angular rotate measure *relative to the anchor*, so an
+ *  anchor that lands wherever the cursor happened to jump next would make
+ *  the first frame of the gesture jump with it. */
+let cursorClientX = null;
+let cursorClientY = null;
+function trackCursor(e) {
+  cursorClientX = e.clientX;
+  cursorClientY = e.clientY;
+}
 
 /** Per-entity snapshot of the transform the macro is currently offset from.
+ *
+ *  `transform` (local) is what cancel restores and what the undo command
+ *  records. The world pose is what the macro math runs on: rotate and scale
+ *  happen about a shared world pivot, and "rotate 90° about world Y" has no
+ *  meaningful local-axis answer for a child of a rotated parent.
+ *
  *  Re-captured whenever the user changes the axis set so the "cancelled prev
  *  rotation" effect matches Blender's lock-on-press behavior. */
 function captureMacroOrigin() {
   const ids = useSelectionStore.getState().ids;
-  return ids
-    .map((id) => engine.getEntity(id))
-    .filter(Boolean)
-    .map((entity) => ({ entity, transform: entity.getTransform() }));
+  const out = [];
+  for (const id of ids) {
+    const entity = engine.getEntity(id);
+    if (!entity) continue;
+    entity.object3D.updateMatrixWorld(true);
+    out.push({
+      entity,
+      transform: entity.getTransform(),
+      object3D: entity.object3D,
+      // The three.js parent, used for the world→local conversion. Root
+      // entities sit under engine.scene, so this is never null.
+      parent: entity.object3D.parent,
+      worldPos: entity.object3D.getWorldPosition(new THREE.Vector3()),
+      worldQuat: entity.object3D.getWorldQuaternion(new THREE.Quaternion()),
+      worldScale: entity.object3D.getWorldScale(new THREE.Vector3()),
+    });
+  }
+  return out;
+}
+
+/** Anchor a fresh drag at the current cursor position. Falls back to the
+ *  viewport centre if the pointer has never been over the window. */
+function freshMacroPointer() {
+  const rect = viewport.canvas?.getBoundingClientRect();
+  const x = cursorClientX ?? (rect ? rect.left + rect.width / 2 : 0);
+  const y = cursorClientY ?? (rect ? rect.top + rect.height / 2 : 0);
+  return { startX: x, startY: y, x, y, dx: 0, dy: 0, angle: 0, lastAngle: null };
+}
+
+/** Re-zero the macro against the entities' current pose: new baseline, new
+ *  pivot, drag restarted from where the cursor is now. Used whenever the
+ *  meaning of the gesture changes mid-macro (axis toggled, numeric mode
+ *  entered) so nothing the user already did gets re-applied on top of itself. */
+function rebaselineMacro() {
+  macro.origin = captureMacroOrigin();
+  macro.pivot = macroPivot(macro.origin.map((o) => o.worldPos));
+  macro.pointer = freshMacroPointer();
 }
 
 /**
@@ -2756,10 +2918,12 @@ function captureMacroOrigin() {
  *              axes are the only ones affected.
  *   buffer     Numeric input buffer (raw text). Non-empty = "numeric mode"
  *              where mouse is disabled.
- *   value      Parsed `buffer` (`null` while interactive or buffer empty).
- *   origin     Per-entity baseline. Re-captured on axis toggle.
- *   pointer    { startX, startY, lastX, lastY, lastAppliedX, lastAppliedY }
- *              used to convert pointer delta → transform delta.
+ *   value      Parsed `buffer` (`null` while interactive, or while the buffer
+ *              holds only a partial token like "-" or ".").
+ *   origin     Per-entity baseline (local + world pose).
+ *   pivot      World-space rotate/scale pivot for `origin`.
+ *   pointer    { startX, startY, x, y, dx, dy, angle, lastAngle } — the drag
+ *              anchor plus the accumulated sweep angle for rotate.
  */
 let macro = null;
 let installedMacroPointer = false;
@@ -2783,7 +2947,15 @@ function describeMacro() {
   if (!macro) return null;
   const { kind, axes, buffer, value } = macro;
   const allAxes = ["x", "y", "z"];
-  const activeAxes = axes.size === 0 ? allAxes : [...axes];
+  // Numeric translate with no lock goes down world X (Blender fills the
+  // first of the x/y/z fields), so show that in the HUD rather than
+  // implying the value lands on all three.
+  const activeAxes =
+    axes.size > 0
+      ? [...axes]
+      : kind === "translate" && buffer !== ""
+        ? ["x"]
+        : allAxes;
   // Blank when fully open so the HUD doesn't echo "XYZ" on every keystroke;
   // show explicit lock only when the user has narrowed it down.
   const axisStr =
@@ -2812,7 +2984,8 @@ function startMacro(kind) {
     buffer: "",
     value: null,
     origin,
-    pointer: null, // populated lazily on first pointermove
+    pivot: macroPivot(origin.map((o) => o.worldPos)),
+    pointer: freshMacroPointer(),
   };
   notifyMacro();
 }
@@ -2827,17 +3000,10 @@ function cancelMacro() {
 
 /** Commit: build one SetTransformCommand per selected entity.
  *
- *  In *interactive* mode the live three.js object already reflects every
- *  drag the user made — we read the current transform back out of the
- *  entity and use that as `after`, with the captured `origin` as `before`.
- *  Recomputing from the origin (the old behavior) would re-apply the
- *  default numeric value (1u / 15° / 1.1×) on top of the origin and
- *  silently snap the entity to a different transform than the one the
- *  user actually saw while dragging.
- *
- *  In *numeric* mode the transform was driven by `computeAfter` on every
- *  preview, so the live entity matches the most recent preview and we
- *  can read it back the same way. */
+ *  Both modes preview by writing straight to the live three.js object, so
+ *  `after` is simply whatever the entity holds right now — no recomputing
+ *  from the baseline, which is what used to let the committed transform
+ *  differ from the one the user was looking at. */
 function commitMacro() {
   if (!macro) return;
   const cmds = [];
@@ -2854,225 +3020,123 @@ function commitMacro() {
 }
 
 /**
- * Compute the post-macro transform given a baseline transform + axis set.
- * - translate: add `value` (default 1 unit) to each active axis.
- * - rotate:    add `value` degrees (default 15°) to each active axis.
- * - scale:     multiply each active axis by `value` (default 1.1).
- * Empty `axes` set means "every axis" — Blender's unlocked default.
- */
-function computeAfter(transform, kind, axes, value) {
-  const v = value ?? (kind === "scale" ? 1.1 : kind === "rotate" ? 15 : 1);
-  const active = (a) => axes.size === 0 || axes.has(a);
-  const [px, py, pz] = transform.position;
-  const [rx, ry, rz] = transform.rotation;
-  const [sx, sy, sz] = transform.scale;
-  if (kind === "translate") {
-    return {
-      position: [active("x") ? px + v : px, active("y") ? py + v : py, active("z") ? pz + v : pz],
-      rotation: transform.rotation,
-      scale: transform.scale,
-    };
-  }
-  if (kind === "rotate") {
-    const rad = THREE.MathUtils.degToRad(v);
-    return {
-      position: transform.position,
-      rotation: [
-        active("x") ? rx + rad : rx,
-        active("y") ? ry + rad : ry,
-        active("z") ? rz + rad : rz,
-      ],
-      scale: transform.scale,
-    };
-  }
-  return {
-    position: transform.position,
-    rotation: transform.rotation,
-    scale: [active("x") ? sx * v : sx, active("y") ? sy * v : sy, active("z") ? sz * v : sz],
-  };
-}
-
-/**
  * Apply the current macro state. Two modes:
- *  - Interactive (buffer empty): write the cursor delta on top of each
- *    entity's `origin` baseline, mutating `object3D` directly so the matrix
- *    update is fast and avoids the cost of re-snapping rotations back into
- *    Euler arrays.
- *  - Numeric (buffer filled): compute the new transform from each entity's
- *    `origin` plus the typed value × active axes. Mouse is ignored here.
+ *  - Interactive (buffer empty): turn the cursor gesture into a world-space
+ *    delta on top of each entity's `origin` baseline.
+ *  - Numeric (buffer filled): build the same kind of world-space delta from
+ *    the typed value + active axes. Mouse is ignored here.
+ * Both write through `applyWorldDelta`, so the two modes stay consistent: the
+ * same pivot, the same axis handling, the same world→local conversion.
  */
 function previewMacro() {
   if (!macro) return;
-  const { buffer, pointer } = macro;
-  if (buffer === "") {
-    if (pointer) applyPointerDelta(pointer);
-  } else {
-    const { origin, kind, axes, value } = macro;
-    for (const { entity, transform } of origin) {
-      const next = computeAfter(transform, kind, axes, value);
-      entity.setTransform(next);
-      useSceneStore.getState().updateTransform(entity.id);
-    }
-  }
-}
-
-// --- Interactive pointer mode -----------------------------------------------
-
-// Reused per-frame to avoid garbage during drag.
-const _camRight = new THREE.Vector3();
-const _camUp = new THREE.Vector3();
-const _camToTarget = new THREE.Vector3();
-let _worldPerPixel = 0.01;
-
-/** Camera-aligned basis + a screen→world scale, refreshed once per pointer
- *  event. The 2D drag delta `(dx, dy)` is interpreted as a 3D vector in
- *  world space:
- *    worldDelta = (dx, dy) * worldPerPixel, then projected onto each axis
- *       via dot(worldDelta, axisUnit)
- *  The `worldPerPixel` factor scales the cursor motion so that ~PIXEL_REFERENCE
- *  pixels of dominant drag equals `camToTarget` world units — the Blender
- *  convention that "moving the cursor by N pixels moves the object by the
- *  same world distance at the object's depth". Translate uses this scale
- *  so it stays distance-aware; rotate and scale apply a fixed
- *  `UNIT_PER_PIXEL` rate after the projection (see `applyPointerDelta`).
- *  Returns false if the viewport hasn't initialized yet. */
-function captureCameraBasis() {
+  const { kind, axes, buffer, value, origin, pivot, pointer } = macro;
   const cam = viewport.camera;
-  const orbit = viewport.orbit;
-  if (!cam || !orbit) return false;
-  _camRight.setFromMatrixColumn(cam.matrixWorld, 0);
-  _camUp.setFromMatrixColumn(cam.matrixWorld, 1);
-  _camToTarget.copy(orbit.target).sub(cam.position);
-  const dist = _camToTarget.length();
-  _worldPerPixel = dist > 0.0001 ? dist / PIXEL_REFERENCE : 0.01;
-  return true;
+  if (!cam) return;
+  if (buffer !== "" && value === null) {
+    // Buffer holds only a partial token ("-" or "."). Sit on the baseline
+    // rather than inventing a placeholder value that would visibly jump the
+    // entity for one keystroke and then jump back.
+    restoreMacroOrigin();
+    return;
+  }
+  let delta;
+  if (buffer === "") {
+    const rect = viewport.canvas?.getBoundingClientRect();
+    if (!rect || !pointer || rect.width < 1 || rect.height < 1) return;
+    cam.updateMatrixWorld();
+    delta = pointerDelta(kind, axes, pointer, pivot, rect, cam);
+  } else {
+    cam.updateMatrixWorld();
+    delta = numericDelta(kind, axes, value, pivot, cam);
+  }
+  applyWorldDelta(origin, pivot, delta.pos, delta.quat, delta.scale);
 }
 
-/** Convert accumulated cursor delta into per-axis offsets.
- *
- *  All three modes use the same `UNIT_PER_PIXEL` rate (0.01) so the
- *  macros feel consistent: one pixel of cursor motion means roughly the
- *  same "size of nudge" no matter which mode you're in.
- *
- *  The cursor delta is first projected through the camera's right/up
- *  basis to a 3D world-aligned vector (using `worldPerPixel` for translate
- *  so it stays distance-aware, plain pixels for rotate/scale). Each world
- *  axis then receives the projection of that vector onto its own unit
- *  direction, scaled by `UNIT_PER_PIXEL` (or `worldPerPixel` for translate).
- *  This means locking only Z, for example, makes the entity only react to
- *  cursor motion that lies along the world-Z direction in screen space.
- *
- *  - translate: 1 px → 0.01 world-units per active axis (distance-aware).
- *  - rotate:    1 px → 0.01 rad per active axis (~0.57°/px, ~57°/100px).
- *  - scale:     with no axes pressed, Blender scales uniformly — every
- *               axis multiplies by `1 + pxDelta * UNIT_PER_PIXEL` where
- *               `pxDelta` is the cursor's screen-projection magnitude.
- *               With axes pressed, each active axis scales independently
- *               by `1 + perAxisProj * UNIT_PER_PIXEL`. Additive (1+px*rate)
- *               rather than exponential so the rate matches translate/rotate. */
-function applyPointerDelta(pointer) {
-  if (!pointer || !macro) return;
-  if (!captureCameraBasis()) return;
-  const { dx, dy } = pointer;
-  const { kind } = macro;
-  const { axes, origin } = macro;
+/** Put every entity back on its baseline without ending the macro. */
+function restoreMacroOrigin() {
+  for (const { entity, transform } of macro.origin) entity.setTransform(transform);
+  useSceneStore.getState().updateTransform(macro.origin.map((o) => o.entity.id));
+}
 
-  // Camera-projected cursor delta. Translate multiplies by `worldPerPixel`
-  // to stay distance-aware; rotate/scale use the raw pixel delta because
-  // they operate in screen-space units (radians, ratio) rather than
-  // world units, so a fixed per-pixel rate gives a consistent feel at any
-  // zoom.
-  const tdx = (dx * _camRight.x - dy * _camUp.x) * _worldPerPixel;
-  const tdy = (dx * _camRight.y - dy * _camUp.y) * _worldPerPixel;
-  const tdz = (dx * _camRight.z - dy * _camUp.z) * _worldPerPixel;
-  const pdx = dx * _camRight.x - dy * _camUp.x;
-  const pdy = dx * _camRight.y - dy * _camUp.y;
-  const pdz = dx * _camRight.z - dy * _camUp.z;
+// --- World-space delta application ------------------------------------------
 
-  if (kind === "translate") {
-    applyTranslation(origin, axes, tdx, tdy, tdz);
-  } else if (kind === "rotate") {
-    applyRotation(
-      origin,
-      axes,
-      pdx * UNIT_PER_PIXEL,
-      pdy * UNIT_PER_PIXEL,
-      pdz * UNIT_PER_PIXEL,
-    );
-  } else {
-    // Scale. With no axes pressed, Blender uses uniform scale — every
-    // axis multiplies by the same additive factor driven by the cursor's
-    // screen-projection magnitude. With axes pressed, each active axis
-    // scales independently by its own per-axis projection.
-    if (axes.size === 0) {
-      const mag = Math.hypot(pdx, pdy, pdz);
-      const f = 1 + mag * UNIT_PER_PIXEL;
-      applyScale(origin, axes, f, f, f);
+// Reused per-event to keep the drag loop allocation-free.
+const _macroOffset = new THREE.Vector3();
+const _macroWorldPos = new THREE.Vector3();
+const _macroWorldQuat = new THREE.Quaternion();
+const _macroParentInv = new THREE.Matrix4();
+const _macroMatrix = new THREE.Matrix4();
+const _macroDecPos = new THREE.Vector3();
+const _macroDecQuat = new THREE.Quaternion();
+const _macroDecScale = new THREE.Vector3();
+
+/**
+ * Write one world-space delta onto every entity in `origin`. Any argument
+ * may be null to mean "no change on that channel".
+ *   posDelta    world-space translation
+ *   quatDelta   rotation about `pivot`
+ *   scaleDelta  per-axis multiplier; fans the entity's offset from `pivot`
+ *               out/in and multiplies its own scale
+ *
+ * Scale is applied to the entity's *local* scale rather than being folded
+ * through the world matrix: a world-axis scale on a rotated object is a shear,
+ * which a position/quaternion/scale triple cannot represent, and the decompose
+ * would silently mangle the rotation. Local application matches what the
+ * Inspector shows and what the gizmo's scale handles do.
+ *
+ * Mutates object3D directly — the macro is a live preview, and `commitMacro`
+ * reads the result back out via `getTransform()`.
+ */
+function applyWorldDelta(origin, pivot, posDelta, quatDelta, scaleDelta) {
+  for (const o of origin) {
+    // Offset from the pivot, fanned by scale then swung by rotation. For a
+    // single entity the offset is zero, so rotate/scale leave position alone.
+    _macroOffset.copy(o.worldPos).sub(pivot);
+    if (scaleDelta) _macroOffset.multiply(scaleDelta);
+    if (quatDelta) _macroOffset.applyQuaternion(quatDelta);
+    _macroWorldPos.copy(pivot).add(_macroOffset);
+    if (posDelta) _macroWorldPos.add(posDelta);
+
+    if (quatDelta) _macroWorldQuat.copy(quatDelta).multiply(o.worldQuat);
+    else _macroWorldQuat.copy(o.worldQuat);
+
+    const parent = o.parent;
+    if (!parent || parent === engine.scene) {
+      // Root entity — world space is local space.
+      o.object3D.position.copy(_macroWorldPos);
+      o.object3D.quaternion.copy(_macroWorldQuat);
     } else {
-      applyScale(
-        origin,
-        axes,
-        1 + pdx * UNIT_PER_PIXEL,
-        1 + pdy * UNIT_PER_PIXEL,
-        1 + pdz * UNIT_PER_PIXEL,
-      );
+      // Child of a transformed parent: convert the new world pose back into
+      // local space through the parent's inverse world matrix. The original
+      // world scale goes in so the decomposed local scale comes back out
+      // unchanged — `scaleDelta` is applied locally, below.
+      _macroParentInv.copy(parent.matrixWorld).invert();
+      _macroMatrix
+        .compose(_macroWorldPos, _macroWorldQuat, o.worldScale)
+        .premultiply(_macroParentInv);
+      _macroMatrix.decompose(_macroDecPos, _macroDecQuat, _macroDecScale);
+      o.object3D.position.copy(_macroDecPos);
+      o.object3D.quaternion.copy(_macroDecQuat);
+    }
+
+    const [lsx, lsy, lsz] = o.transform.scale;
+    if (scaleDelta) {
+      o.object3D.scale.set(lsx * scaleDelta.x, lsy * scaleDelta.y, lsz * scaleDelta.z);
+    } else {
+      o.object3D.scale.set(lsx, lsy, lsz);
     }
   }
-}
-
-function applyTranslation(origin, axes, dx, dy, dz) {
-  const active = (a) => axes.size === 0 || axes.has(a);
-  for (const { entity, transform } of origin) {
-    const [px, py, pz] = transform.position;
-    entity.object3D.position.set(
-      active("x") ? px + dx : px,
-      active("y") ? py + dy : py,
-      active("z") ? pz + dz : pz,
-    );
-    useSceneStore.getState().updateTransform(entity.id);
-  }
-}
-
-function applyRotation(origin, axes, ax, ay, az) {
-  // ax/ay/az are signed rotation offsets (radians) around world X/Y/Z.
-  // Sign convention: positive rotation around an axis follows the right-hand
-  // rule (Three.js Euler order). The screen-projected rate naturally gives
-  // reasonable signs for the typical orbit camera.
-  const active = (a) => axes.size === 0 || axes.has(a);
-  for (const { entity, transform } of origin) {
-    const [rx, ry, rz] = transform.rotation;
-    entity.object3D.rotation.set(
-      active("x") ? rx + ax : rx,
-      active("y") ? ry + ay : ry,
-      active("z") ? rz + az : rz,
-    );
-    useSceneStore.getState().updateTransform(entity.id);
-  }
-}
-
-function applyScale(origin, axes, fx, fy, fz) {
-  const active = (a) => axes.size === 0 || axes.has(a);
-  for (const { entity, transform } of origin) {
-    const [sx, sy, sz] = transform.scale;
-    entity.object3D.scale.set(
-      active("x") ? sx * fx : sx,
-      active("y") ? sy * fy : sy,
-      active("z") ? sz * fz : sz,
-    );
-    useSceneStore.getState().updateTransform(entity.id);
-  }
+  // One batched store write for the whole selection — see updateTransform.
+  useSceneStore.getState().updateTransform(origin.map((o) => o.entity.id));
 }
 
 /** Pointermove handler — only active while the macro is in interactive mode. */
 function onMacroPointerMove(e) {
-  if (!macro || macro.buffer !== "") return;
+  if (!macro || macro.buffer !== "" || !macro.pointer) return;
   const p = macro.pointer;
-  if (!p) {
-    macro.pointer = { startX: e.clientX, startY: e.clientY, lastX: e.clientX, lastY: e.clientY };
-    return;
-  }
-  p.lastX = e.clientX;
-  p.lastY = e.clientY;
+  p.x = e.clientX;
+  p.y = e.clientY;
   p.dx = e.clientX - p.startX;
   p.dy = e.clientY - p.startY;
   previewMacro();
@@ -3170,10 +3234,9 @@ function handleMacroInput(e) {
     const axis = AXIS_KEYS[k];
     if (macro.axes.has(axis)) macro.axes.delete(axis);
     else macro.axes.add(axis);
-    // Re-baseline origin to the entity's *current* transform so the visible
-    // pose becomes the new zero-point for subsequent moves/drags.
-    macro.origin = captureMacroOrigin();
-    macro.pointer = null;
+    // Re-baseline to the entity's *current* transform so the visible pose
+    // becomes the new zero-point for subsequent moves/drags.
+    rebaselineMacro();
     previewMacro();
     notifyMacro();
     return true;
@@ -3194,8 +3257,7 @@ function handleMacroInput(e) {
       // Pop the most recently added axis. `Set` preserves insertion order.
       const last = [...macro.axes].at(-1);
       macro.axes.delete(last);
-      macro.origin = captureMacroOrigin();
-      macro.pointer = null;
+      rebaselineMacro();
       previewMacro();
       notifyMacro();
       return true;
@@ -3203,19 +3265,33 @@ function handleMacroInput(e) {
     return true;
   }
 
-  // Numeric / sign input. Once a digit/sign lands, the macro enters numeric
-  // mode (mouse disabled, value drives each active axis on commit).
-  if (/^[0-9.\-]$/.test(k)) {
+  // Sign toggle. Blender lets you hit "-" at any point in the gesture to flip
+  // the value you already typed, so "90" then "-" reads as -90 — no need to
+  // backspace the digits and retype them behind a leading minus.
+  if (k === "-") {
     e.preventDefault();
-    if (k === "-" && (macro.buffer.includes("-") || macro.buffer.length > 0)) return true;
+    if (macro.buffer === "") rebaselineMacro();
+    macro.buffer = toggleBufferSign(macro.buffer);
+    macro.value = parseMacroNumber(macro.buffer);
+    previewMacro();
+    notifyMacro();
+    return true;
+  }
+
+  // Numeric input. The value drives each active axis against a *fixed*
+  // baseline, so every keystroke re-reads the whole buffer from the same
+  // origin.
+  if (/^[0-9.]$/.test(k)) {
+    e.preventDefault();
     if (k === "." && macro.buffer.includes(".")) return true;
+    // Only the first keystroke transitions interactive→numeric. Re-baselining
+    // on every keystroke (the old behavior) made each digit stack on top of
+    // the partially-typed value that was already previewed: "9" then "0" read
+    // as 9° followed by another 90° (99° total), and "0" then "." then "5"
+    // pinned scale to 0 because the 0× preview became the new baseline.
+    if (macro.buffer === "") rebaselineMacro();
     macro.buffer += k;
     macro.value = parseMacroNumber(macro.buffer);
-    // First digit transitions interactive→numeric. Re-baseline origin so the
-    // typed value adds on top of whatever the cursor had already moved the
-    // entity to, not on top of the pre-macro transform.
-    macro.origin = captureMacroOrigin();
-    macro.pointer = null;
     previewMacro();
     notifyMacro();
     return true;
@@ -3223,12 +3299,6 @@ function handleMacroInput(e) {
 
   // Unhandled keys fall through (Tab, function keys, arrows, etc.).
   return false;
-}
-
-function parseMacroNumber(buf) {
-  if (buf === "" || buf === "-" || buf === ".") return null;
-  const n = Number(buf);
-  return Number.isFinite(n) ? n : null;
 }
 
 /** Install / remove the window-level pointer listeners that the macro needs
@@ -3376,8 +3446,35 @@ function AxisViewGizmo({ playing }) {
   );
 }
 
+/**
+ * Right-click-in-the-viewport menu. Deliberately short: the things you reach
+ * for with an object under the cursor, plus the 3D-cursor snaps that otherwise
+ * only exist behind the Shift+S chord.
+ */
+function viewportMenuItems() {
+  const ids = useSelectionStore.getState().ids;
+  const has = ids.length > 0;
+  return [
+    { label: "Focus Selected", shortcut: "F", disabled: !has, action: () => focusSelection() },
+    { separator: true },
+    { label: "Duplicate", shortcut: "Ctrl+D", disabled: !has, action: () => duplicateSelection() },
+    { label: "Copy", shortcut: "Ctrl+C", disabled: !has, action: () => copyEntities(ids) },
+    { label: "Paste", shortcut: "Ctrl+V", disabled: !clipboardHasEntities(), action: () => pasteEntities(null) },
+    { separator: true },
+    { label: "Selection → 3D Cursor", disabled: !has, action: () => snapSelectionToCursor() },
+    { label: "3D Cursor → Selection", disabled: !has, action: () => snapCursorToSelection() },
+    { label: "3D Cursor → World Origin", action: () => snapCursorToWorldOrigin() },
+    { separator: true },
+    { label: "Delete", shortcut: "Del", danger: true, disabled: !has, action: () => deleteSelection() },
+  ];
+}
+
 export function ViewportPanel() {
   const containerRef = useRef(null);
+  // Where the right button went down, so a right-DRAG (orbit/pan) can be told
+  // apart from a right-CLICK (open the menu).
+  const rmbDownRef = useRef(null);
+  const [viewportMenu, setViewportMenu] = useState(null);
   const [backend, setBackend] = useState(viewport.backend);
   const [mode, setMode] = useState("translate");
   const [macroState, setMacroState] = useState(null);
@@ -3392,12 +3489,17 @@ export function ViewportPanel() {
   const sceneName = useSceneStore((s) => s.sceneName);
   const scenePath = useSceneStore((s) => s.scenePath);
   const geometryEntityId = useGeometryEditStore((s) => s.entityId);
-  // Captured pose for the embedded geometry editor. Recomputed whenever the
-  // entity being edited changes — first we focus the editor camera on the
-  // geometry's world-space bounding box, then sample the orbit pose and
-  // transform it into the geometry's local space so the standalone panel
-  // inherits the same view direction.
-  const [geometryInitialView, setGeometryInitialView] = useState(null);
+  // Captured pose for the embedded geometry editor, handed over so entering
+  // edit mode does not move the camera.
+  //
+  // A ref, not state, and that is the whole point. The panel reads this once,
+  // while building its scene, from a passive effect — and a passive effect runs
+  // AFTER the commit that mounted it. State set from this layout effect only
+  // reaches the panel as a prop on the following render, by which time the
+  // panel has already set its scene up, seen no view to inherit and framed the
+  // geometry itself. That is the camera jump: the handover was always computed,
+  // just one render too late to be used.
+  const geometryInitialView = useRef(null);
   // Mirrors viewport.layers — kept here because React owns the toggle UI.
   // The Panel re-reads this any time something else (e.g. another viewport
   // instance in a future split-pane setup) mutates layer state via the
@@ -3440,7 +3542,7 @@ export function ViewportPanel() {
   // would carry whatever the user happened to be looking at elsewhere in
   // the scene, not the mesh being edited.
   useLayoutEffect(() => {
-    setGeometryInitialView(null);
+    geometryInitialView.current = null;
     if (!geometryEntityId) return;
     // The viewport camera may not be initialized yet on the first paint after
     // project load. Wait for `ensureViewport()` so we focus the real camera
@@ -3452,33 +3554,21 @@ export function ViewportPanel() {
       const entity = engine.getEntity(geometryEntityId);
       if (!entity?.object3D) return;
       entity.object3D.updateWorldMatrix(true, false);
-      const bounds = new THREE.Box3().setFromObject(entity.object3D);
-      // Even an empty bounding box (e.g. a single-point mesh) shouldn't leave
-      // the camera at its previous target — pull it onto the entity origin so
-      // the embedded editor starts off looking at the geometry.
-      const center = bounds.isEmpty()
-        ? entity.object3D.getWorldPosition(new THREE.Vector3())
-        : bounds.getCenter(new THREE.Vector3());
-      const size = bounds.isEmpty() ? 1 : bounds.getSize(new THREE.Vector3()).length() || 1;
-      // FOV-derived distance so the geometry fills roughly 60% of the viewport.
-      const fov = THREE.MathUtils.degToRad((viewport.camera.fov || 60) * 0.5);
-      const distance = (size * 0.5) / Math.max(Math.sin(fov), 0.05) * 1.6;
-      const offset = viewport.camera.position.clone().sub(viewport.orbit.target);
-      if (offset.lengthSq() < 1e-6) offset.set(0.6, 0.5, 0.7);
-      offset.normalize();
-      viewport.orbit.target.copy(center);
-      viewport.camera.position.copy(center).addScaledVector(offset, distance);
-      viewport.camera.updateProjectionMatrix();
-      viewport.orbit.update();
-      viewport.orbit.dispatchEvent({ type: "change" });
-      // Sample the focused pose and transform it into the entity's local space
-      // so the embedded editor's detached mesh inherits the same view direction.
-      const inverse = entity.object3D.matrixWorld.clone().invert();
-      setGeometryInitialView({
-        position: viewport.camera.position.clone().applyMatrix4(inverse).toArray(),
-        target: viewport.orbit.target.clone().applyMatrix4(inverse).toArray(),
-      });
+      // The view is handed over exactly as it is. Entering edit mode in Blender
+      // does not move the viewport, and it should not here either: re-framing
+      // on the way in threw away whatever the user had lined up, and combined
+      // with the editor drawing the object at the origin it made entering edit
+      // mode look like the whole scene had swung around.
+      //
+      // Nothing is transformed into the entity's local space any more — the
+      // editor's scene is world-space, so the pose transfers straight across.
+      geometryInitialView.current = {
+        position: viewport.camera.position.toArray(),
+        target: viewport.orbit.target.toArray(),
+      };
     };
+    // Synchronously when the viewport is up, which is every real case: the
+    // panel mounts in the same commit and must find the pose already there.
     if (viewport.camera && viewport.orbit) focusAndCapture();
     else ensureViewport().then(focusAndCapture);
     return () => { cancelled = true; };
@@ -3599,7 +3689,34 @@ export function ViewportPanel() {
         containerRef.current = el;
         dropRef(el);
       }}
+      onPointerDown={(e) => {
+        if (e.button === 2) rmbDownRef.current = { x: e.clientX, y: e.clientY };
+      }}
+      onContextMenu={(e) => {
+        // The right button is also OrbitControls' pan/orbit gesture, so only a
+        // right-click that didn't turn into a drag counts as "open the menu".
+        // Either way the browser's own menu is suppressed.
+        e.preventDefault();
+        e.stopPropagation();
+        const down = rmbDownRef.current;
+        const dragged =
+          down && Math.hypot(e.clientX - down.x, e.clientY - down.y) > 4;
+        // Shift+RMB is "place the 3D cursor" — already handled on pointerdown.
+        // Edit/sculpt mode and the terrain brush own the viewport while active
+        // and have their own gestures on the right button.
+        if (dragged || e.shiftKey || playing) return;
+        if (getTerrainBrushMode() || useGeometryEditStore.getState().entityId) return;
+        setViewportMenu({ x: e.clientX, y: e.clientY });
+      }}
     >
+      {viewportMenu && (
+        <ContextMenu
+          x={viewportMenu.x}
+          y={viewportMenu.y}
+          items={viewportMenuItems()}
+          onClose={() => setViewportMenu(null)}
+        />
+      )}
       <div className="viewport-toolbar">
         <button
           className={`toolbar-btn play-btn ${playing ? "active" : ""}`}
@@ -3703,7 +3820,7 @@ export function ViewportPanel() {
           <GeometryEditorPanel
             embedded
             entityIdOverride={geometryEntityId}
-            initialView={geometryInitialView}
+            initialViewRef={geometryInitialView}
             onClose={() => useGeometryEditStore.getState().exit()}
           />
         </div>

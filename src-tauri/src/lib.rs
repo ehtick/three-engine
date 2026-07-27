@@ -4,6 +4,9 @@ use std::io::Read;
 use std::path::Path;
 use tauri::Manager;
 
+mod mcp_clients;
+mod pty;
+
 #[derive(Serialize)]
 struct BasisCompressionInfo {
     original: u64,
@@ -194,18 +197,52 @@ fn stat_file(path: String) -> Result<f64, String> {
     Ok(duration.as_secs_f64())
 }
 
-fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
+/// Recursively copies `src` into `dst`, returning the number of files written.
+fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<u64> {
     fs::create_dir_all(dst)?;
+    let mut copied = 0;
     for entry in fs::read_dir(src)? {
         let entry = entry?;
         let dest = dst.join(entry.file_name());
         if entry.file_type()?.is_dir() {
-            copy_dir(&entry.path(), &dest)?;
+            copied += copy_dir(&entry.path(), &dest)?;
         } else {
             fs::copy(entry.path(), &dest)?;
+            copied += 1;
         }
     }
-    Ok(())
+    Ok(copied)
+}
+
+/// Copies the bundled three.js type declarations (`@types/three`) into
+/// `dest_dir`, so a project's IDE can resolve `import * as THREE from "three"`
+/// while editing gameplay scripts. Returns the number of files written.
+///
+/// The declarations are a bundle resource rather than something generated or
+/// downloaded: scripting has to work in a packaged app with no Node toolchain
+/// and no network. `@types/three` is version-locked to the engine's `three` in
+/// package.json, so what a script sees while editing is what the runtime
+/// actually exposes.
+///
+/// Resolution order mirrors `compress_texture_basis`: the packaged resource
+/// directory first, then the two dev-time `node_modules` locations (the Tauri
+/// dev cwd is `src-tauri`, so both `../node_modules` and `node_modules` are
+/// worth trying). Callers version-gate this — it is ~1000 small files, cheap
+/// but not free, and only changes when the engine's three version does.
+#[tauri::command]
+fn scaffold_three_types(app: tauri::AppHandle, dest_dir: String) -> Result<u64, String> {
+    let mut candidates = vec![
+        Path::new("../node_modules/@types/three").to_path_buf(),
+        Path::new("node_modules/@types/three").to_path_buf(),
+    ];
+    if let Ok(resources) = app.path().resource_dir() {
+        candidates.insert(0, resources.join("engine-types/three"));
+    }
+    let src = candidates
+        .into_iter()
+        .find(|candidate| candidate.join("package.json").exists())
+        .ok_or("Bundled three.js type declarations not found")?;
+    copy_dir(&src, Path::new(&dest_dir)).map_err(|e| e.to_string())
 }
 
 /// Copies the prebuilt player template into `out_dir`, writes scene.json,
@@ -312,6 +349,61 @@ fn import_files(paths: Vec<String>, dest_dir: String) -> Result<Vec<String>, Str
 /// output is otherwise invisible during `tauri dev`).
 #[tauri::command]
 fn write_binary_file(path: String, contents: Vec<u8>) -> Result<(), String> {
+    if let Some(parent) = Path::new(&path).parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    fs::write(&path, contents).map_err(|e| e.to_string())
+}
+
+/// Decodes `%XX` escapes produced by JavaScript's `encodeURIComponent`.
+///
+/// The destination path travels as an IPC *header*, which may only contain
+/// visible ASCII — project paths routinely hold spaces and non-ASCII
+/// characters, so the frontend percent-encodes it and we reverse that here.
+fn percent_decode(value: &str) -> Result<String, String> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = bytes
+                .get(i + 1..i + 3)
+                .ok_or_else(|| "truncated percent escape in path".to_string())?;
+            let hex = std::str::from_utf8(hex).map_err(|e| e.to_string())?;
+            out.push(u8::from_str_radix(hex, 16).map_err(|e| e.to_string())?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).map_err(|e| e.to_string())
+}
+
+/// Writes raw bytes taken straight off the IPC channel.
+///
+/// The sibling `write_binary_file` takes `contents: Vec<u8>`, which Tauri
+/// serializes as a JSON array of numbers — roughly 4 bytes of text per payload
+/// byte, plus a full JSON parse on the Rust side. For the things that actually
+/// need this command (extracted textures, binary `.geom` buffers) that turned a
+/// 40MB write into hundreds of megabytes of JSON and many seconds of stall.
+///
+/// A `Request` with a raw body skips the encoding entirely: the frontend calls
+/// `invoke(cmd, uint8Array, { headers: { path: encodeURIComponent(path) } })`
+/// and the bytes arrive as-is. Mirrors `read_binary_file`, which already
+/// returns `tauri::ipc::Response` for the same reason.
+#[tauri::command]
+fn write_binary_file_raw(request: tauri::ipc::Request<'_>) -> Result<(), String> {
+    let path = request
+        .headers()
+        .get("path")
+        .ok_or_else(|| "write_binary_file_raw: missing `path` header".to_string())?
+        .to_str()
+        .map_err(|e| e.to_string())?;
+    let path = percent_decode(path)?;
+    let tauri::ipc::InvokeBody::Raw(contents) = request.body() else {
+        return Err("write_binary_file_raw: expected a raw byte body".to_string());
+    };
     if let Some(parent) = Path::new(&path).parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -451,11 +543,31 @@ async fn fetch_sketchfab_text(url: String, token: Option<String>) -> Result<Stri
     .map_err(|e| e.to_string())?
 }
 
+#[cfg(test)]
+mod tests {
+    use super::percent_decode;
+
+    #[test]
+    fn decodes_paths_the_frontend_encodes() {
+        // What `encodeURIComponent` produces for a Windows project path with a
+        // space and a non-ASCII character — the reason the path is encoded at
+        // all is that IPC headers may only carry visible ASCII.
+        assert_eq!(
+            percent_decode("C%3A%2FUsers%2FA%20B%2FCaf%C3%A9%2Fmesh.geom").unwrap(),
+            "C:/Users/A B/Café/mesh.geom"
+        );
+        assert_eq!(percent_decode("plain.png").unwrap(), "plain.png");
+        assert!(percent_decode("truncated%2").is_err());
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        // Live PTY sessions for the terminal panel, keyed by panel id.
+        .manage(pty::PtyState::default())
         .invoke_handler(tauri::generate_handler![
             save_scene,
             load_scene,
@@ -470,12 +582,23 @@ pub fn run() {
             delete_path,
             import_files,
             export_game,
+            scaffold_three_types,
             write_binary_file,
+            write_binary_file_raw,
             compress_texture_basis,
             frontend_log,
             fetch_text,
             fetch_bytes,
-            fetch_sketchfab_text
+            fetch_sketchfab_text,
+            pty::pty_spawn,
+            pty::pty_write,
+            pty::pty_resize,
+            pty::pty_kill,
+            pty::pty_alive,
+            mcp_clients::mcp_client_status,
+            mcp_clients::mcp_client_register,
+            mcp_clients::mcp_client_unregister,
+            mcp_clients::detect_terminal_programs
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -6,9 +6,15 @@
 //   5. `entity.position / rotation / scale / etc` aliases work (no .object3D needed)
 //   6. The InputManager types are complete and discriminate on action type
 //   7. `addActionMap(def)` accepts the documented plain-object shape
+//   8. The wide three + TSL surface is typed, matching what the runtime exposes
 //
 // Not a runtime artifact — the file's existence means any breakage surfaces
-// during `tsc --noEmit`.
+// during `npm run check:types`.
+//
+// This fixture is the *type* half of a pair. `scripts/run-script-runtime-smoke.mjs`
+// is the runtime half, asserting the same imports actually resolve in a browser.
+// Both are needed: for a long time the types described nine three classes while
+// the runtime exposed twenty-eight, and neither check existed to notice.
 
 import { Script, attribute } from "engine";
 import * as THREE from "three/webgpu";
@@ -289,3 +295,51 @@ const _v3: Vector3 = new Vector3(1, 2, 3);
 const _q: Quaternion = new Quaternion();
 const _o3d: EngineObject3D | null = null;
 void _v3; void _q; void _o3d;
+// 6. The wide three surface is typed, not a nine-symbol subset. Every symbol
+//    below was `undefined` at runtime AND absent from the types before the
+//    script runtime switched to re-exporting three wholesale. These lines are
+//    the regression guard: reintroducing an allowlist in either place breaks
+//    them.
+const _im = new THREE.InstancedMesh(
+  new THREE.BoxGeometry(1, 1, 1),
+  new THREE.MeshStandardNodeMaterial(),
+  16,
+);
+_im.setMatrixAt(0, new THREE.Matrix4());
+const _mixer = new THREE.AnimationMixer(new THREE.Object3D());
+const _loader = new THREE.TextureLoader();
+const _skinned = new THREE.SkinnedMesh(new THREE.BoxGeometry(), new THREE.MeshBasicNodeMaterial());
+void _im; void _mixer; void _loader; void _skinned;
+
+// 7. TSL — the material pipeline is TSL-native, so a script driving materials
+//    needs `three/tsl` to resolve to the same graph library the engine uses.
+import { Fn, uniform, vec3, float } from "three/tsl";
+const _speed = uniform(1.5);
+const _tint = Fn(() => vec3(1, 0, 0).mul(float(0.5)));
+void _speed; void _tint;
+
+// 8. The wider math surface newly re-exported from "engine". `Spherical` /
+//    `Raycaster` / `Box3` are the ones gameplay code reaches for most (orbit
+//    math, picking, trigger volumes) and none of them used to exist here.
+import { Spherical, Raycaster, Box3, Frustum, MathUtils, Clock } from "engine";
+const _sph = new Spherical().setFromVector3(new Vector3(1, 2, 3));
+const _ray = new Raycaster(new Vector3(), new Vector3(0, 0, -1));
+const _box = new Box3().setFromCenterAndSize(new Vector3(), new Vector3(2, 2, 2));
+const _frustum = new Frustum();
+const _clamped: number = MathUtils.clamp(5, 0, 1);
+const _clock = new Clock();
+void _sph; void _ray; void _box; void _frustum; void _clamped; void _clock;
+
+// 9. `this.THREE` is the whole three namespace, not a 12-entry object type.
+//    (It used to declare `Object3D: unknown`.)
+class UsesInjectedThree extends Script {
+  onStart() {
+    const mesh = new this.THREE.InstancedMesh(
+      new this.THREE.SphereGeometry(1),
+      new this.THREE.MeshStandardNodeMaterial(),
+      4,
+    );
+    this.entity.object3D.add(mesh);
+  }
+}
+void UsesInjectedThree;

@@ -1,22 +1,8 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { Plus, Check, RotateCcw, Sparkles, Zap } from "lucide-react";
-import {
-  ReactFlow,
-  ReactFlowProvider,
-  Background,
-  BackgroundVariant,
-  Controls,
-  Handle,
-  Position,
-  addEdge,
-  useNodesState,
-  useEdgesState,
-  useReactFlow,
-} from "@xyflow/react";
-import "@xyflow/react/dist/style.css";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Check, RotateCcw, Sparkles, Zap } from "lucide-react";
+import { ReactFlowProvider } from "@xyflow/react";
 import { useSelectionStore } from "../store/selectionStore.js";
 import { useSceneStore } from "../store/sceneStore.js";
-import { setGraphHovered } from "../nodegraph/graphContext.js";
 import { engine } from "../engineInstance.js";
 import { commandBus } from "../commands/CommandBus.js";
 import { AddComponentCommand, SetComponentPropCommand } from "../commands/componentCommands.js";
@@ -28,7 +14,8 @@ import {
   DEFAULT_PARTICLE_GRAPH,
 } from "../../engine/particleGraph.js";
 import { PARTICLE_PRESETS } from "../particlePresets.js";
-import { AssetField } from "../fields/AssetField.jsx";
+import { GraphEditor } from "../nodegraph/GraphEditor.jsx";
+import { stripHelpers } from "../nodegraph/graphUtils.js";
 
 const CATEGORY_LABELS = {
   emitter: "Emitters",
@@ -37,182 +24,64 @@ const CATEGORY_LABELS = {
   math: "Math",
   noise: "Noise",
   force: "Forces",
-  system: "Emitters (System)",
+  system: "System",
 };
 
-const PALETTE = Object.entries(CATEGORY_LABELS).map(([category, group]) => ({
-  group,
-  types: Object.entries(P_NODE_TYPES)
-    .filter(([, meta]) => meta.category === category)
-    .map(([type]) => type),
-}));
-
-function graphToFlow(graph) {
-  const nodes = graph.nodes.map((n) => ({
-    id: n.id,
-    type: "particleNode",
-    position: n.position ?? { x: 0, y: 0 },
-    data: { nodeType: n.type, props: n.props ?? {} },
-  }));
-  const edges = (graph.edges ?? []).map((e, i) => ({
-    id: e.id ?? `e${i}-${e.source}-${e.sourceHandle}-${e.target}-${e.targetHandle}`,
-    source: e.source,
-    sourceHandle: e.sourceHandle ?? "out",
-    target: e.target,
-    targetHandle: e.targetHandle,
-  }));
-  return { nodes, edges };
-}
-
-function flowToGraph(nodes, edges) {
-  return {
-    nodes: nodes.map((n) => ({ id: n.id, type: n.data.nodeType, props: n.data.props, position: n.position })),
-    edges: edges.map((e) => ({
-      id: e.id,
-      source: e.source,
-      sourceHandle: e.sourceHandle ?? "out",
-      target: e.target,
-      targetHandle: e.targetHandle,
-    })),
-  };
-}
-
-/** One param row; every editor is `nodrag` so tweaking doesn't move the node. */
-function ParamField({ param, value, onChange }) {
-  const v = value ?? param.default;
-  switch (param.type) {
-    case "number":
-      return (
-        <input
-          className="number-field nodrag"
-          type="number"
-          step={param.step ?? 0.1}
-          min={param.min}
-          max={param.max}
-          value={v}
-          onChange={(e) => {
-            const parsed = parseFloat(e.target.value);
-            if (!Number.isNaN(parsed)) onChange(parsed);
-          }}
-        />
-      );
-    case "vec3":
-      return (
-        <div className="vec3-mini nodrag">
-          {[0, 1, 2].map((i) => (
-            <input
-              key={i}
-              className="number-field"
-              type="number"
-              step={0.1}
-              value={v?.[i] ?? 0}
-              onChange={(e) => {
-                const parsed = parseFloat(e.target.value);
-                if (Number.isNaN(parsed)) return;
-                const next = [...(v ?? [0, 0, 0])];
-                next[i] = parsed;
-                onChange(next);
-              }}
-            />
-          ))}
-        </div>
-      );
-    case "color":
-      return (
-        <input className="color-field nodrag" type="color" value={v} onChange={(e) => onChange(e.target.value)} />
-      );
-    case "boolean":
-      return <input className="nodrag" type="checkbox" checked={!!v} onChange={(e) => onChange(e.target.checked)} />;
-    case "select":
-      return (
-        <select className="select-field nodrag" value={v} onChange={(e) => onChange(e.target.value)}>
-          {param.options.map((opt) => (
-            <option key={opt} value={opt}>
-              {opt}
-            </option>
-          ))}
-        </select>
-      );
-    case "asset":
-      return (
-        <div className="nodrag nopan particle-asset">
-          <AssetField descriptor={{ exts: param.exts }} value={v} onCommit={onChange} />
-        </div>
-      );
-    default:
-      return null;
-  }
-}
-
-function ParticleNode({ id, data, selected }) {
-  const meta = P_NODE_TYPES[data.nodeType];
-  if (!meta) return null;
-  const category = meta.category === "system" ? "output" : meta.category;
-
-  return (
-    <div className={`shader-node particle-node cat-${category} ${selected ? "selected" : ""}`}>
-      <div className="shader-node-header">
-        <span className="shader-node-dot" />
-        <span className="shader-node-label">{meta.label}</span>
-      </div>
-      <div className="shader-node-body">
-        {meta.inputs.map((input) => (
-          <div className="shader-node-row" key={input.key}>
-            <Handle type="target" position={Position.Left} id={input.key} className="shader-handle" />
-            <span className="shader-port-label">{input.label}</span>
-          </div>
-        ))}
-        {meta.params.map((param) => (
-          <div className="shader-node-row field" key={param.key}>
-            <span className="shader-port-label param-label">{param.label}</span>
-            <ParamField
-              param={param}
-              value={data.props[param.key]}
-              onChange={(value) => data.onPropsChange(id, { [param.key]: value })}
-            />
-          </div>
-        ))}
-        {meta.outputs.map((output) => (
-          <div className="shader-node-row out-row" key={output.key}>
-            <span className="shader-port-label">{output.label}</span>
-            <Handle type="source" position={Position.Right} id={output.key} className="shader-handle" />
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-const nodeTypes = { particleNode: ParticleNode };
-
-function NodePalette({ style, onPick, onClose }) {
-  return (
-    <>
-      <div className="dropdown-overlay" onClick={onClose} onContextMenu={(e) => { e.preventDefault(); onClose(); }} />
-      <div className={`dropdown-menu node-palette ${style ? "context-menu" : ""}`} style={style}>
-        {PALETTE.map(({ group, types }) => (
-          <div key={group}>
-            <div className="node-palette-group">{group}</div>
-            {types.map((type) => (
-              <button key={type} className="dropdown-item node-palette-item" onClick={() => onPick(type)}>
-                <span className={`shader-node-dot cat-${P_NODE_TYPES[type].category}`} />
-                {P_NODE_TYPES[type].label}
-              </button>
-            ))}
-          </div>
-        ))}
-      </div>
-    </>
-  );
-}
+/**
+ * Adapter from the particle node registry (`P_NODE_TYPES`) to the shape the
+ * shared graph toolkit renders. The registry keeps its own vocabulary
+ * (`category`, `{key,label,type}` ports, params-only editing) — this is the
+ * translation layer, so the compiler never has to care how the editor draws.
+ */
+const particleRegistry = {
+  describe(type) {
+    const meta = P_NODE_TYPES[type];
+    if (!meta) return null;
+    return {
+      label: meta.label,
+      // The System node is the graph's terminus; it borrows the "output"
+      // category colour so it reads like one at a glance.
+      cat: meta.category === "system" ? "output" : meta.category,
+      inputs: (meta.inputs ?? []).map((i) => ({ key: i.key, label: i.label, type: i.type ?? "any" })),
+      outputs: (meta.outputs ?? []).map((o) => ({ key: o.key, label: o.label, type: o.type ?? "any" })),
+      params: meta.params ?? [],
+      // Particle values are per-particle GPU state; there is nothing a
+      // fullscreen-quad thumbnail could meaningfully show.
+      noPreview: true,
+    };
+  },
+  items: Object.entries(P_NODE_TYPES).map(([type, meta]) => ({
+    type,
+    label: meta.label,
+    cat: meta.category,
+    catLabel: CATEGORY_LABELS[meta.category] ?? meta.category,
+    inputTypes: (meta.inputs ?? []).map((i) => i.type ?? "any"),
+    outputTypes: (meta.outputs ?? []).map((o) => o.type ?? "any"),
+  })),
+  defaults: nodeDefaults,
+  protectedTypes: [],
+  /**
+   * A graph needs at least one System node to compile. Multiple System nodes
+   * (multi-emitter graphs) can be freely added and removed otherwise, so this
+   * only ever vetoes the removal that would take the count to zero.
+   */
+  guardRemove(nodes, removeIds) {
+    let systems = nodes.reduce((n, node) => n + (node.data.nodeType === "system" ? 1 : 0), 0);
+    const blocked = [];
+    for (const id of removeIds) {
+      if (nodes.find((n) => n.id === id)?.data.nodeType !== "system") continue;
+      if (systems <= 1) blocked.push(id);
+      else systems--;
+    }
+    return blocked;
+  },
+};
 
 function ParticleGraphEditor({ entityId, initialGraph }) {
-  const [nodes, setNodes, onNodesChange] = useNodesState([]);
-  const [edges, setEdges, onEdgesChange] = useEdgesState([]);
+  const editorRef = useRef(null);
+  const graphRef = useRef(initialGraph);
   const [dirty, setDirty] = useState(false);
-  const [menuOpen, setMenuOpen] = useState(false);
   const [presetOpen, setPresetOpen] = useState(false);
-  const [canvasMenu, setCanvasMenu] = useState(null);
   const [autosave, setAutosave] = useState(() => {
     try {
       return localStorage.getItem("engine.autosave.particles") === "1";
@@ -220,6 +89,7 @@ function ParticleGraphEditor({ entityId, initialGraph }) {
       return false;
     }
   });
+
   const toggleAutosave = () => {
     setAutosave((cur) => {
       const next = !cur;
@@ -229,88 +99,20 @@ function ParticleGraphEditor({ entityId, initialGraph }) {
       return next;
     });
   };
-  const { screenToFlowPosition } = useReactFlow();
 
-  const loadGraph = useCallback(
-    (graph) => {
-      const flow = graphToFlow(graph);
-      setNodes(flow.nodes);
-      setEdges(flow.edges);
-    },
-    [setNodes, setEdges],
-  );
+  const onChange = useCallback((graph, meta) => {
+    graphRef.current = graph;
+    // A load (initial or preset) is not a user edit; marking it dirty would
+    // arm autosave the instant the panel opens.
+    if (meta?.reason !== "load") setDirty(true);
+  }, []);
 
-  useEffect(() => {
-    loadGraph(initialGraph);
-    setDirty(false);
-  }, [entityId]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  const handlePropsChange = useCallback(
-    (nodeId, patch) => {
-      setDirty(true);
-      setNodes((nds) =>
-        nds.map((n) => (n.id === nodeId ? { ...n, data: { ...n.data, props: { ...n.data.props, ...patch } } } : n)),
-      );
-    },
-    [setNodes],
-  );
-
-  const nodesWithHandlers = useMemo(
-    () => nodes.map((n) => ({ ...n, data: { ...n.data, onPropsChange: handlePropsChange } })),
-    [nodes, handlePropsChange],
-  );
-
-  const onConnect = useCallback(
-    (connection) => {
-      setDirty(true);
-      // Only one wire per input handle.
-      setEdges((eds) =>
-        addEdge(
-          connection,
-          eds.filter((e) => !(e.target === connection.target && e.targetHandle === connection.targetHandle)),
-        ),
-      );
-    },
-    [setEdges],
-  );
-
-  const guardedNodesChange = useCallback(
-    (changes) => {
-      // A graph needs at least one System node to compile — block deleting
-      // the last one, but multiple System nodes (multi-emitter graphs) can
-      // be freely added/removed otherwise.
-      let systemCount = nodes.reduce((n, node) => n + (node.data.nodeType === "system" ? 1 : 0), 0);
-      const guarded = changes.filter((c) => {
-        if (c.type !== "remove") return true;
-        const isSystem = nodes.find((n) => n.id === c.id)?.data.nodeType === "system";
-        if (isSystem && systemCount <= 1) return false;
-        if (isSystem) systemCount--;
-        return true;
-      });
-      if (guarded.some((c) => c.type !== "select" && c.type !== "dimensions")) setDirty(true);
-      onNodesChange(guarded);
-    },
-    [nodes, onNodesChange],
-  );
-
-  const addNode = (type, screenPos) => {
-    setMenuOpen(false);
-    setCanvasMenu(null);
-    setDirty(true);
-    const position = screenPos
-      ? screenToFlowPosition(screenPos)
-      : { x: 60 + Math.random() * 160, y: 60 + Math.random() * 160 };
-    const id = `${type}-${Math.random().toString(36).slice(2, 8)}`;
-    setNodes((nds) => [
-      ...nds,
-      { id, type: "particleNode", position, data: { nodeType: type, props: nodeDefaults(type) } },
-    ]);
-  };
-
-  const apply = async () => {
-    const graph = flowToGraph(nodes, edges);
-    // Value-only edits (same structural signature as the committed graph)
-    // are applied live via uniforms in the component — skip the redundant
+  const apply = useCallback(async () => {
+    // Frames and reroute pins are authoring aids — the compiler never sees
+    // them, but they stay in the graph that gets saved so the layout survives.
+    const graph = stripHelpers(graphRef.current);
+    // Value-only edits (same structural signature as the committed graph) are
+    // applied live via uniforms in the component — skip the redundant
     // validation compile so slider drags stay cheap.
     const committed = engine.getEntity(entityId)?.getComponent?.("particles")?.props?.graph;
     if (!committed || particleGraphSignature(committed) !== particleGraphSignature(graph)) {
@@ -321,129 +123,81 @@ function ParticleGraphEditor({ entityId, initialGraph }) {
         return;
       }
     }
-    commandBus.execute(new SetComponentPropCommand(entityId, "particles", "graph", graph));
+    // The FULL graph (helpers included) is what gets stored, so reopening the
+    // editor restores comments and reroutes; ParticleComponent tolerates the
+    // extra nodes because nothing in a compiled branch reaches them.
+    commandBus.execute(new SetComponentPropCommand(entityId, "particles", "graph", graphRef.current));
     setDirty(false);
-  };
+  }, [entityId]);
 
   // Autosave: when enabled, commit every change. Debounced so transient
-  // mutations (e.g. dragging a node, which fires onNodesChange on every
-  // intermediate position) collapse into a single write at the end of the
-  // gesture. Selection-only updates and the initial load keep `dirty` false
-  // and never reach the timer.
+  // mutations (dragging a node fires a change per intermediate position)
+  // collapse into a single write at the end of the gesture.
   useEffect(() => {
-    if (!autosave) return;
-    if (!dirty) return;
+    if (!autosave || !dirty) return;
     const id = setTimeout(apply, 150);
     return () => clearTimeout(id);
-  }, [autosave, nodes, edges, dirty]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [autosave, dirty, apply]);
 
-  const restart = () => {
-    engine.getEntity(entityId)?.getComponent("particles")?.restart();
-  };
+  const restart = () => engine.getEntity(entityId)?.getComponent("particles")?.restart();
 
-  const onEdgeDoubleClick = useCallback((_event, edge) => {
-    setDirty(true);
-    setEdges((eds) => eds.filter((e) => e.id !== edge.id));
-  }, [setEdges]);
-
-  // The global keyboard shortcut handler defers to a graph editor whenever
-  // the pointer is over its canvas, so Delete/Backspace remove the selected
-  // node instead of the selected entity in the hierarchy.
-  useEffect(() => () => setGraphHovered(false), []);
-
-  return (
-    <div className="shader-graph-panel">
-      <div className="panel-toolbar">
-        <div className="dropdown-wrap">
-          <button className="toolbar-btn" onClick={() => setMenuOpen((v) => !v)}>
-            <Plus size={14} />
-            Node
-          </button>
-          {menuOpen && <NodePalette onPick={(type) => addNode(type)} onClose={() => setMenuOpen(false)} />}
-        </div>
-        <div className="dropdown-wrap">
-          <button className="toolbar-btn" onClick={() => setPresetOpen((v) => !v)}>
-            <Sparkles size={13} />
-            Presets
-          </button>
-          {presetOpen && (
-            <>
-              <div className="dropdown-overlay" onClick={() => setPresetOpen(false)} />
-              <div className="dropdown-menu">
-                {Object.keys(PARTICLE_PRESETS).map((name) => (
-                  <button
-                    key={name}
-                    className="dropdown-item"
-                    onClick={() => {
-                      setPresetOpen(false);
-                      loadGraph(PARTICLE_PRESETS[name]);
-                      setDirty(true);
-                    }}
-                  >
-                    {name}
-                  </button>
-                ))}
-              </div>
-            </>
-          )}
-        </div>
-        <button className="toolbar-btn icon-only" title="Restart simulation" onClick={restart}>
-          <RotateCcw size={14} />
+  const toolbar = (
+    <>
+      <div className="dropdown-wrap">
+        <button className="toolbar-btn" onClick={() => setPresetOpen((v) => !v)}>
+          <Sparkles size={13} />
+          Presets
         </button>
-        <button
-          className={`toolbar-btn icon-only${autosave ? " active" : ""}`}
-          title={autosave ? "Autosave on — changes apply instantly" : "Autosave off — click Apply to commit"}
-          onClick={toggleAutosave}
-        >
-          <Zap size={14} />
-        </button>
-        <button className="toolbar-btn" disabled={!dirty || autosave} onClick={apply}>
-          <Check size={13} />
-          Apply{dirty ? " •" : ""}
-        </button>
-      </div>
-      <div
-        className="shader-graph-canvas"
-        onMouseEnter={() => setGraphHovered(true)}
-        onMouseLeave={() => setGraphHovered(false)}
-      >
-        <ReactFlow
-          nodes={nodesWithHandlers}
-          edges={edges}
-          nodeTypes={nodeTypes}
-          onNodesChange={guardedNodesChange}
-          onEdgesChange={(changes) => {
-            if (changes.some((c) => c.type === "remove")) setDirty(true);
-            onEdgesChange(changes);
-          }}
-          onConnect={onConnect}
-          onEdgeDoubleClick={onEdgeDoubleClick}
-          onPaneContextMenu={(e) => {
-            e.preventDefault();
-            setCanvasMenu({ x: e.clientX, y: e.clientY });
-          }}
-          deleteKeyCode={["Delete", "Backspace"]}
-          colorMode="dark"
-          fitView
-          fitViewOptions={{ padding: 0.2, maxZoom: 1 }}
-          minZoom={0.15}
-        >
-          <Background variant={BackgroundVariant.Dots} gap={22} size={1.2} />
-          <Controls showInteractive={false} />
-        </ReactFlow>
-        {canvasMenu && (
-          <NodePalette
-            style={{ left: canvasMenu.x, top: canvasMenu.y }}
-            onPick={(type) => addNode(type, canvasMenu)}
-            onClose={() => setCanvasMenu(null)}
-          />
+        {presetOpen && (
+          <>
+            <div className="dropdown-overlay" onClick={() => setPresetOpen(false)} />
+            <div className="dropdown-menu">
+              {Object.keys(PARTICLE_PRESETS).map((name) => (
+                <button
+                  key={name}
+                  className="dropdown-item"
+                  onClick={() => {
+                    setPresetOpen(false);
+                    // `record` makes the preset load one undoable step, so a
+                    // mis-click doesn't destroy the graph the user was building.
+                    editorRef.current?.load(PARTICLE_PRESETS[name], { record: true });
+                    setDirty(true);
+                  }}
+                >
+                  {name}
+                </button>
+              ))}
+            </div>
+          </>
         )}
       </div>
-      <div className="shader-graph-hint">
-        Wire emitters/forces into the Particle System node · right-click canvas to add nodes · Apply rebuilds the
-        effect · Restart re-seeds
-      </div>
-    </div>
+      <button className="toolbar-btn icon-only" title="Restart simulation" onClick={restart}>
+        <RotateCcw size={14} />
+      </button>
+      <button
+        className={`toolbar-btn icon-only${autosave ? " active" : ""}`}
+        title={autosave ? "Autosave on — changes apply instantly" : "Autosave off — click Apply to commit"}
+        onClick={toggleAutosave}
+      >
+        <Zap size={14} />
+      </button>
+      <button className="toolbar-btn" disabled={!dirty || autosave} onClick={apply}>
+        <Check size={13} />
+        Apply{dirty ? " •" : ""}
+      </button>
+    </>
+  );
+
+  return (
+    <GraphEditor
+      ref={editorRef}
+      kind="particles"
+      registry={particleRegistry}
+      initialGraph={initialGraph}
+      onChange={onChange}
+      toolbar={toolbar}
+      hint="Wire emitters and forces into the Particle System node · right-click the canvas or drop a wire on it to add nodes · double-click a wire for a reroute pin · Ctrl+Z undoes"
+    />
   );
 }
 
@@ -452,6 +206,10 @@ export function ParticlesPanel() {
   const entity = useSceneStore((s) => (selectedId ? s.entities[selectedId] : null));
   const graph = entity?.components?.particles?.graph;
   const hasParticles = !!entity?.components?.particles;
+  // Frozen at mount: the editor owns its working copy from here, and letting a
+  // committed-graph identity change flow back in would reload the canvas (and
+  // lose selection/undo) on every Apply.
+  const initialGraph = useMemo(() => graph ?? DEFAULT_PARTICLE_GRAPH, [entity?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (!entity) {
     return <div className="shader-graph-panel empty">Select an entity to edit its particle system.</div>;
@@ -475,11 +233,7 @@ export function ParticlesPanel() {
 
   return (
     <ReactFlowProvider>
-      <ParticleGraphEditor
-        key={entity.id}
-        entityId={entity.id}
-        initialGraph={graph ?? DEFAULT_PARTICLE_GRAPH}
-      />
+      <ParticleGraphEditor key={entity.id} entityId={entity.id} initialGraph={initialGraph} />
     </ReactFlowProvider>
   );
 }

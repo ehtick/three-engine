@@ -159,6 +159,7 @@ function nodeFromEntity(entity, isRoot = false) {
     viewOnly: !!entity.viewOnly,
     enabledInEditor: entity.enabledInEditor !== false,
     enabledInGame: entity.enabledInGame !== false,
+    tags: [...(entity.tags ?? [])],
     components: [...entity.components.values()].map((c) => {
       const { type, props } = c.toJSON();
       return { type, props: clone(props) ?? {} };

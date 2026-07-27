@@ -1,6 +1,7 @@
 /** Official Sketchfab Data API v3 client and authenticated GLTF importer. */
 import JSZip from "jszip";
 import { packGlb } from "./polyhaven.js";
+import { writeBinaryFile } from "./assetLoader.js";
 
 const API = "https://api.sketchfab.com/v3";
 const TOKEN_KEY = "engine.sketchfabToken.v1";
@@ -137,7 +138,7 @@ export async function downloadModel(model, onProgress) {
   const importDir = `${root}/Sketchfab`;
   await invoke("create_dir", { path: importDir }).catch(() => {});
   const glbPath = `${importDir}/${safeName(model.name)}.glb`;
-  await invoke("write_binary_file", { path: glbPath, contents: Array.from(glb) });
+  await writeBinaryFile(glbPath, glb);
 
   onProgress?.({ label: "Importing model…", loaded: zipBytes.byteLength, total: zipBytes.byteLength });
   const { unpackGlb } = await import("./glbImport.js");

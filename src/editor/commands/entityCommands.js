@@ -92,6 +92,28 @@ export class RenameEntityCommand {
 }
 
 /**
+ * Replaces an entity's tag list. Tags are a whole-list value rather than a
+ * per-tag toggle, so one add or remove is one undo step — which is what the
+ * user perceives ("I added the boss tag"), and keeps the command trivial.
+ */
+export class SetEntityTagsCommand {
+  constructor(entityId, tags) {
+    this.entityId = entityId;
+    this.tags = [...tags];
+    this.oldTags = [...(engine.getEntity(entityId)?.tags ?? [])];
+    this.label = "Set tags";
+  }
+
+  do() {
+    engine.getEntity(this.entityId)?.setTags(this.tags);
+  }
+
+  undo() {
+    engine.getEntity(this.entityId)?.setTags(this.oldTags);
+  }
+}
+
+/**
  * Toggles the entity-wide `viewOnly` flag. When true, every component on
  * the entity opts into frustum-gated ticking (the per-component `viewOnly`
  * is an OR with this — see `Entity.setViewOnly`).

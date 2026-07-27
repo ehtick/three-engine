@@ -16,6 +16,9 @@ const settings = {
   radius: 4,
   strength: 0.5,
   hardness: 0.5,
+  // null keeps the classic hardness-exponent falloff; naming one of the shared
+  // curves (see editor/brush.js) switches to the same set the mesh sculptor uses.
+  falloff: null,
   activeLayer: 0, // paint: which of the up-to-4 layers to paint
   activeScatterLayer: 0,
   // Only the *brush gesture* lives here. How an instance is oriented, scaled and

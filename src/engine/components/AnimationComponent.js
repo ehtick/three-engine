@@ -12,6 +12,10 @@ import { AnimatorRuntime } from "../animGraph.js";
 export class AnimationComponent extends Component {
   static type = "animation";
   static label = "Animation";
+  // The state machine's current state/time is runtime state, not props —
+  // leaving Play mode rebuilds this component so the next Play starts at the
+  // controller's entry state.
+  static resetOnStop = true;
   static defaults = { controller: "", playInEditor: true };
   static schema = [
     { key: "controller", label: "Controller", type: "asset", exts: ["anim"] },

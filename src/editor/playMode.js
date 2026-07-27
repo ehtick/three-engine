@@ -38,11 +38,15 @@ export async function stop() {
 
 async function doStop() {
   const engine = await ensureEngine();
-  const { deserializeScene } = await import("../engine/index.js");
+  const { reconcileScene } = await import("../engine/index.js");
   if (!engine.playing) return;
   engine.setPlaying(false);
   if (snapshot) {
-    await deserializeScene(engine, snapshot);
+    // Restores the snapshot ONTO the live scene rather than clearing and
+    // rebuilding it. A full rebuild re-attaches every component, and the GI
+    // component's re-attach alone froze the main thread for ~2s on a real
+    // project. See serialize.js `reconcileScene`.
+    await reconcileScene(engine, snapshot);
     snapshot = null;
   }
   commandBus.clearHistory();

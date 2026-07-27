@@ -423,8 +423,11 @@ export class PhysicsSystem {
       const hook = sensor
         ? (started ? "onTriggerEnter" : "onTriggerExit")
         : (started ? "onCollisionEnter" : "onCollisionExit");
-      e1.getComponent("script")?.instance?.[hook]?.(e2);
-      e2.getComponent("script")?.instance?.[hook]?.(e1);
+      // `dispatch` reaches EVERY script on the entity, not just the first one.
+      // This used to read `.instance?.[hook]`, which silently delivered
+      // collisions to whichever script happened to be listed first.
+      e1.getComponent("script")?.dispatch(hook, e2);
+      e2.getComponent("script")?.dispatch(hook, e1);
       this.engine.emit(sensor ? "trigger" : "collision", { a: e1, b: e2, started });
     });
   }

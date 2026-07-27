@@ -47,7 +47,7 @@ export class UiButtonComponent extends Component {
     this.state = state;
     this.#applyTint();
     const hook = state === "hover" ? "onPointerEnter" : state === "normal" ? "onPointerExit" : null;
-    if (hook) this.entity.getComponent("script")?.instance?.[hook]?.();
+    if (hook) this.entity.getComponent("script")?.dispatch(hook);
   }
 
   #applyTint() {
@@ -67,7 +67,7 @@ export class UiButtonComponent extends Component {
 
   click() {
     if (this.props.interactable === false) return;
-    this.entity.getComponent("script")?.instance?.onClick?.();
+    this.entity.getComponent("script")?.dispatch("onClick");
     this.entity.engine.emit("ui-click", this.entity);
   }
 }

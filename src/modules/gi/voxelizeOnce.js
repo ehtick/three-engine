@@ -14,8 +14,8 @@
 // (`createSceneTrace`) + an SDF sphere-trace (`createSoftShadowTrace`) over
 // a trilinear-filtered Data3DTexture distance field.
 import * as THREE from "three/webgpu";
-import { Break, If, Loop, float, floor, instancedArray, step, texture3D, vec3 } from "three/tsl";
-import { allocateBakeArrays, runBake } from "./bakeCore.js";
+import { Break, If, Loop, float, floor, instancedArray, step, texture3D, vec3, vec4 } from "three/tsl";
+import { allocateBakeArrays, bakeMeshSdf, runBake } from "./bakeCore.js";
 
 /**
  * Evaluates a TSL node subtree to a constant RGB if possible, else null.
@@ -289,10 +289,68 @@ export function voxelizeOnce(meshes, bounds, res, light) {
         color: r.color,
         emissive: r.emissive,
         emissiveIntensity: r.emissiveIntensity,
+        excludeFromDistanceField: r.excludeFromDistanceField === true,
         geometry: known ? null : { positions: r.positions, index: r.index },
       };
     });
     worker.postMessage({ jobId, records: wire, bounds: plainBounds, res, cell: plainCell, lights });
+  };
+
+  // ---------------------------------------------------- per-mesh SDF bakes
+  // DEDICATED worker: a dense mesh's SDF bake can run seconds, and sharing
+  // the scene-bake worker would stall incremental rebakes behind it.
+  // Geometry ships inline (requests are rare, one per geometry version).
+  let sdfWorker = null;
+  let sdfWorkerBroken = false;
+  let sdfRequestId = 0;
+  const sdfRequests = new Map(); // requestId → { resolve, reject }
+
+  const ensureSdfWorker = () => {
+    if (sdfWorker || sdfWorkerBroken) return sdfWorker;
+    try {
+      sdfWorker = new Worker(new URL("./bakeWorker.js", import.meta.url), { type: "module" });
+      sdfWorker.onmessage = (event) => {
+        const message = event.data;
+        if (message.type !== "meshSdf") return;
+        const request = sdfRequests.get(message.requestId);
+        sdfRequests.delete(message.requestId);
+        if (request) {
+          if (message.error) request.reject(new Error(message.error));
+          else request.resolve(message.sdf);
+        }
+      };
+      sdfWorker.onerror = (error) => {
+        console.warn("[gi] SDF worker failed, mesh SDFs will bake on the main thread:", error.message ?? error);
+        for (const request of sdfRequests.values()) request.reject(new Error("SDF worker died"));
+        sdfRequests.clear();
+        sdfWorkerBroken = true;
+        sdfWorker?.terminate();
+        sdfWorker = null;
+      };
+    } catch {
+      sdfWorkerBroken = true;
+    }
+    return sdfWorker;
+  };
+
+  /**
+   * Bakes a high-res LOCAL-space SDF for one record's geometry in a
+   * dedicated worker. Falls back to a synchronous main-thread bake.
+   */
+  const requestMeshSdf = (record) => {
+    if (!ensureSdfWorker()) {
+      return Promise.resolve(bakeMeshSdf(record.positions, record.index));
+    }
+    return new Promise((resolve, reject) => {
+      sdfRequestId++;
+      sdfRequests.set(sdfRequestId, { resolve, reject });
+      sdfWorker.postMessage({
+        type: "meshSdf",
+        requestId: sdfRequestId,
+        geometryKey: record.geometryKey ?? `sdf:${sdfRequestId}`,
+        geometry: { positions: record.positions, index: record.index },
+      });
+    });
   };
 
   return {
@@ -352,18 +410,31 @@ export function voxelizeOnce(meshes, bounds, res, light) {
     dispose() {
       worker?.terminate();
       worker = null;
+      sdfWorker?.terminate();
+      sdfWorker = null;
     },
 
+    requestMeshSdf,
     createSceneTrace: () => createVoxelSceneTrace(radianceBuffer, bounds, res, cell),
-    createSoftShadowTrace: (lift) => createSDFShadowTrace(distanceTexture, bounds, res, cell, lift),
+    createSoftShadowTrace: (lift, meshSdf) => createSDFShadowTrace(distanceTexture, bounds, res, cell, lift, meshSdf),
+    createRadianceSampler: () => createTrilinearRadianceSampler(radianceBuffer, bounds, res, cell),
   };
 }
 
 /**
  * TSL DDA over the baked grid: (origin, dir, tMaxWorld) → { rad, t }, t < 0
  * = miss. tMaxWorld is a JS number — it bounds the step count at build time.
+ * (Exported for sdfScene.js — the voxel-free medium reuses the exact same
+ * cascade-ray DDA and trilinear radiance sampler over its own buffers.)
+ *
+ * `normalBuffer` (optional) makes hits DIRECTION-AWARE: a cell stores ONE
+ * outgoing radiance but a thin wall has two faces — a ray arriving from the
+ * cell normal's own side (front) reads the radiance, a ray arriving from
+ * behind reads BLACK (the far side's energy is not visible through matter).
+ * Without this, single-cell-thin roofs/walls showed the bright interior as
+ * blotchy patches when viewed from OUTSIDE.
  */
-function createVoxelSceneTrace(radianceBuffer, bounds, res, cell) {
+export function createVoxelSceneTrace(radianceBuffer, bounds, res, cell, normalBuffer = null) {
   const minCell = Math.min(cell.x, cell.y, cell.z);
 
   return (origin, dir, tMaxWorld) => {
@@ -410,7 +481,13 @@ function createVoxelSceneTrace(radianceBuffer, bounds, res, cell) {
       const cellIdx = iz.mul(res.y).add(iy).mul(res.x).add(ix);
       const voxel = radianceBuffer.element(cellIdx.toInt()).toVar();
       If(voxel.w.greaterThan(0.5), () => {
-        rad.assign(voxel.xyz);
+        if (normalBuffer) {
+          // Back-side hit → the cell blocks but emits nothing this way.
+          const n = normalBuffer.element(cellIdx.toInt()).xyz;
+          rad.assign(voxel.xyz.mul(step(dir.dot(n), 0)));
+        } else {
+          rad.assign(voxel.xyz);
+        }
         t.assign(travelled.max(1e-4));
         Break();
       });
@@ -437,6 +514,62 @@ function createVoxelSceneTrace(radianceBuffer, bounds, res, cell) {
 }
 
 /**
+ * Occupancy-weighted trilinear sample of the live radiance field:
+ * (p) → { rad: vec3, coverage: float }. Used to shade MIRROR ray hits —
+ * the DDA's single-cell radiance paints flat voxel-sized patches; sampling
+ * the 8 surrounding occupied cells makes reflected surfaces shade smoothly
+ * (the reference's mirrors read its continuous probe field the same way).
+ * Empty cells carry no radiance and are excluded by weight; `coverage` → 0
+ * means the neighborhood is degenerate and the caller should fall back.
+ */
+export function createTrilinearRadianceSampler(radianceBuffer, bounds, res, cell, normalBuffer = null) {
+  return (p, sideNormal = null) => {
+    const fx = p.x.sub(bounds.min.x).div(cell.x).sub(0.5).toVar();
+    const fy = p.y.sub(bounds.min.y).div(cell.y).sub(0.5).toVar();
+    const fz = p.z.sub(bounds.min.z).div(cell.z).sub(0.5).toVar();
+    const bx = floor(fx).toVar();
+    const by = floor(fy).toVar();
+    const bz = floor(fz).toVar();
+    const wx = fx.sub(bx);
+    const wy = fy.sub(by);
+    const wz = fz.sub(bz);
+    const acc = vec3(0).toVar();
+    const weightAcc = float(0).toVar();
+    Loop({ start: 0, end: 8, name: "radTri" }, ({ radTri }) => {
+      const cf = radTri.toFloat();
+      const cx = cf.mod(2);
+      const cy = floor(cf.div(2)).mod(2);
+      const cz = floor(cf.div(4));
+      const ix = bx.add(cx).clamp(0, res.x - 1);
+      const iy = by.add(cy).clamp(0, res.y - 1);
+      const iz = bz.add(cz).clamp(0, res.z - 1);
+      const w = cx
+        .mul(wx)
+        .add(cx.oneMinus().mul(wx.oneMinus()))
+        .mul(cy.mul(wy).add(cy.oneMinus().mul(wy.oneMinus())))
+        .mul(cz.mul(wz).add(cz.oneMinus().mul(wz.oneMinus())));
+      const cellIdx = iz.mul(res.y).add(iy).mul(res.x).add(ix);
+      const voxel = radianceBuffer.element(cellIdx.toInt()).toVar();
+      If(voxel.w.greaterThan(0.5), () => {
+        // SIDE-AWARE weighting: a sub-cell-thick wall keeps one shell
+        // layer per side, each carrying its own side's radiance. A plain
+        // trilinear at a hit on side A averages in side B's (possibly
+        // brightly lit) cells — light "shines through" thin partitions in
+        // the transport. Cells whose stored normal opposes the hit side
+        // are the OTHER face: weight them out.
+        const side =
+          normalBuffer && sideNormal
+            ? normalBuffer.element(cellIdx.toInt()).xyz.dot(sideNormal).max(0)
+            : float(1);
+        acc.addAssign(voxel.xyz.mul(w).mul(side));
+        weightAcc.addAssign(w.mul(side));
+      });
+    });
+    return { rad: acc.div(weightAcc.max(1e-4)), coverage: weightAcc };
+  };
+}
+
+/**
  * SDF sphere-traced soft shadow: (origin, dir, maxT, k, cosRayNormal) →
  * float penumbra in [0, 1]. Tracks the closest approach via the trilinear
  * distance field: penumbra = min(k·d/t) — smooth area shadows, zero noise.
@@ -459,10 +592,18 @@ function createVoxelSceneTrace(radianceBuffer, bounds, res, cell) {
  * compared the 0.85-scaled d — with exact distances that made every
  * receiver's own plane an "occluder" past t·cos ≈ 1.5 voxels → false
  * radial shadow rings across open floors/ceilings.)
+ *
+ * `meshSdf` (optional) = a MeshSdfAtlas: per-mesh high-res local distance
+ * fields min()ed against the scene field each step. Promoted meshes are
+ * excluded from the scene field's seeds, so near them the crisp local data
+ * is the only (and correct) contributor — this is what turns a thin-winged
+ * character's blocky voxel shadow into a clean one.
  */
-function createSDFShadowTrace(distanceTexture, bounds, res, cell, lift) {
+function createSDFShadowTrace(distanceTexture, bounds, res, cell, lift, meshSdf = null) {
   const minCell = Math.min(cell.x, cell.y, cell.z);
   const liftWorld = typeof lift === "number" ? lift : minCell * 2;
+  const slotSize = meshSdf ? meshSdf.texture.image.width : 0;
+  const atlasDepth = meshSdf ? meshSdf.texture.image.depth : 1;
   const sizeX = bounds.max.x - bounds.min.x;
   const sizeY = bounds.max.y - bounds.min.y;
   const sizeZ = bounds.max.z - bounds.min.z;
@@ -497,6 +638,34 @@ function createSDFShadowTrace(distanceTexture, bounds, res, cell, lift) {
       // the penumbra estimate (the field is exact near surfaces now); the
       // 0.85 safety factor applies to STEPPING only.
       const dRaw = texture3D(distanceTexture, uvw).level(0).r.mul(minCell).toVar();
+      // Per-mesh SDFs: min() the crisp local fields in. Clamped sampling +
+      // distance-to-slot-box keeps the value a valid lower bound everywhere,
+      // and slots that can't improve dRaw skip their texture fetch.
+      if (meshSdf) {
+        for (let s = 0; s < meshSdf.slots.length; s++) {
+          const slot = meshSdf.slots[s];
+          If(slot.active.greaterThan(0.5), () => {
+            const local = slot.worldToLocal.mul(vec4(p, 1)).xyz.toVar();
+            const cellF = local.sub(slot.boundsMin).mul(slot.cellsPerLocal).toVar();
+            const clamped = cellF.clamp(vec3(0.5), vec3(slot.dims).sub(0.5)).toVar();
+            const outsideWorld = cellF
+              .sub(clamped)
+              .div(slot.cellsPerLocal)
+              .length()
+              .mul(slot.localToWorldScale)
+              .toVar();
+            If(outsideWorld.lessThan(dRaw), () => {
+              const atlasUvw = vec3(
+                clamped.x.div(slotSize),
+                clamped.y.div(slotSize),
+                clamped.z.add(s * slotSize).div(atlasDepth),
+              );
+              const dLocal = texture3D(meshSdf.texture, atlasUvw).level(0).r.mul(slot.distScale);
+              dRaw.assign(dRaw.min(dLocal.add(outsideWorld)));
+            });
+          });
+        }
+      }
       const planeHeight = float(liftWorld).add(t.mul(cosRayNormal));
       const isRealOccluder = dRaw.lessThan(planeHeight.sub(minCell * 0.75));
       // Contact cut kept small (0.25·voxel) and only as an early-exit — the

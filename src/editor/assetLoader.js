@@ -15,6 +15,9 @@ export const MODEL_IMPORT_EXTENSIONS = ["glb", "fbx"];
 export const TEXTURE_EXTENSIONS = ["png", "jpg", "jpeg", "webp"];
 export const SCRIPT_EXTENSIONS = ["js", "ts"];
 export const MATERIAL_EXTENSIONS = ["mat"];
+// Six-face cube map descriptor (JSON naming the face textures) — used as a
+// scene skybox / IBL source. See src/engine/cubemapAsset.js.
+export const CUBEMAP_EXTENSIONS = ["cubemap"];
 // `.prefab` is the real thing (a linked, override-aware prefab asset).
 // `.entity` is the legacy bare snapshot — still readable (it's upgraded to a
 // prefab def on load), so old assets keep working.
@@ -75,6 +78,42 @@ export async function listProjectAssets(rootPath, exts, depth = 4) {
   return out;
 }
 
+/**
+ * Recursively lists every project entry (files *and* folders) as the full
+ * `list_dir` records, not just paths — the Assets panel needs size/date/type
+ * to render its rows. Used for project-wide search, where "search" has to mean
+ * the whole project and not just the folder that happens to be open.
+ *
+ * Sidecars (`.meta`, `.basis`) are included: callers hide them from the grid,
+ * but the asset-flag loader reads the listing to learn which assets even have
+ * a sidecar worth opening. Skips the scaffolded `engine-types/` directory,
+ * which holds no project assets.
+ */
+export async function listProjectEntries(rootPath, depth = 8) {
+  const { invoke } = await import("@tauri-apps/api/core");
+  const out = [];
+  async function walk(path, d) {
+    if (d < 0) return;
+    let entries;
+    try {
+      entries = await invoke("list_dir", { path });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (isEngineTypesPath(entry.path)) continue;
+      out.push(entry);
+      if (entry.is_dir) await walk(entry.path, d - 1);
+    }
+  }
+  if (rootPath) await walk(rootPath, depth);
+  return out;
+}
+
+/** Drops generated sidecars from a listing — they're managed via their asset. */
+export const withoutSidecars = (entries) =>
+  entries.filter((entry) => !entry.name.endsWith(".meta") && !entry.name.endsWith(".basis"));
+
 // esbuild-wasm's `initialize()` throws "Cannot call 'initialize' more than
 // once" if called twice in the same VM. Vite's HMR can re-evaluate this
 // module on dependency changes (e.g. when scriptRuntime.js gains a new
@@ -122,15 +161,71 @@ export async function transpileScript(code) {
 
 const blobUrlCache = new Map(); // path -> object URL
 
+// Downstream caches that also key on asset path — currently the engine's
+// decoded-geometry cache. Registered by engineInstance.js rather than imported
+// here on purpose: this module is pulled in by lightweight editor code (the
+// Assets panel, asset flags) and must NOT drag `three/webgpu` in behind it.
+const invalidationListeners = new Set();
+
+/** Subscribes `fn(path)` to every in-place asset overwrite. Returns an unsubscribe. */
+export function onAssetInvalidated(fn) {
+  invalidationListeners.add(fn);
+  return () => invalidationListeners.delete(fn);
+}
+
 /** Drops a cached file URL after an editor overwrites an asset in place. */
 export function invalidateBlobUrl(path) {
   const url = blobUrlCache.get(path);
   if (url) URL.revokeObjectURL(url);
   blobUrlCache.delete(path);
+  for (const fn of invalidationListeners) fn(path);
 }
 
 export function extOf(path) {
   return path.split(".").pop()?.toLowerCase() ?? "";
+}
+
+/**
+ * Writes bytes to a project file over the RAW IPC channel.
+ *
+ * The obvious `invoke("write_binary_file", { path, contents: Array.from(bytes) })`
+ * ships every byte as a JSON number — roughly 4 characters of text per byte,
+ * built by a JS loop, serialized, then parsed again in Rust. A 40MB texture or
+ * geometry buffer becomes ~160MB of JSON and many seconds of frozen UI.
+ *
+ * `write_binary_file_raw` takes the payload as the request body instead, so the
+ * bytes are handed to the OS unchanged. The destination path travels as a
+ * header, which may only hold visible ASCII — hence the percent-encoding, which
+ * the Rust side reverses.
+ */
+let rawWriteSupported = true;
+
+export async function writeBinaryFile(path, bytes) {
+  const { invoke } = await import("@tauri-apps/api/core");
+  const payload = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  if (rawWriteSupported) {
+    try {
+      await invoke("write_binary_file_raw", payload, {
+        headers: { path: encodeURIComponent(path) },
+      });
+      invalidateBlobUrl(path);
+      return;
+    } catch (error) {
+      // A *write* failure (bad path, disk full) must surface. Only fall back
+      // when the command itself is unavailable — an app binary older than this
+      // frontend, which happens whenever the web layer reloads without a
+      // `cargo build`. Latch it so one probe covers the whole session.
+      const message = String(error?.message ?? error);
+      if (!/not (?:found|allowed)|unknown command|missing .*command/i.test(message)) throw error;
+      console.warn(
+        `write_binary_file_raw unavailable (${message}) — falling back to the ` +
+          "slower JSON-array write. Rebuild the Tauri app to restore fast binary writes.",
+      );
+      rawWriteSupported = false;
+    }
+  }
+  await invoke("write_binary_file", { path, contents: Array.from(payload) });
+  invalidateBlobUrl(path);
 }
 
 /**
@@ -155,6 +250,12 @@ export async function toBlobUrl(path) {
 }
 
 /** Reads a sidecar .meta JSON file; null when absent/invalid. */
+/** Writes derived binary data (e.g. baked mesh SDFs) next to its asset. */
+export async function writeAssetBinary(path, bytes) {
+  await writeBinaryFile(path, bytes);
+  return true;
+}
+
 export async function readAssetMeta(metaPath) {
   const { invoke } = await import("@tauri-apps/api/core");
   try {

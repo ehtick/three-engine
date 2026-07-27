@@ -325,6 +325,12 @@ export function rasterizeRecords(records, ctx, clip = null) {
       }
 
       // ------------------------------------------- exact-distance narrow band
+      // Meshes with a per-mesh SDF are EXCLUDED from the scene distance
+      // field (their crisp local field replaces the coarse voxel one via
+      // min() in the shadow trace — keeping their coarse seeds would drag
+      // the min back down to voxel dirt). They still rasterize occupancy/
+      // albedo above: the radiance DDA and bounce cache need them.
+      if (record.excludeFromDistanceField) continue;
       // Sub-half-voxel triangles: distance-to-centroid (error ≤ edge/2, far
       // below the band's purpose) at a fraction of the exact test's cost —
       // this is what keeps 100k-tri characters affordable.
@@ -638,6 +644,107 @@ export function computeDistanceFieldRegion(seed, distance, res, cell, writeRegio
       }
     }
   }
+}
+
+// ----------------------------------------------------------- per-mesh SDF
+
+// Per-mesh SDF resolution: longest local axis gets this many cells, other
+// axes scale by aspect (min 8). 64³ of a character ≈ 10× finer effective
+// detail than the runtime scene grid can afford.
+export const MESH_SDF_MAX_AXIS = 64;
+// Distance cap in CELL units (same convention as the scene field).
+export const MESH_SDF_CAP = 16;
+
+/**
+ * Bakes an UNSIGNED narrow-band-exact distance field for one geometry in
+ * its LOCAL space — same math as the scene field (exact point-to-triangle
+ * band + seeded Felzenszwalb EDT), just much denser. Quantized to Uint8
+ * (d/cap · 255): the shadow tracer's min() only needs ~0.06-cell precision.
+ *
+ * Returns { data: Uint8Array, dims: {x,y,z}, boundsMin: [x,y,z],
+ * cellSize: [x,y,z] } — distances decode as value/255 · MESH_SDF_CAP ·
+ * min(cellSize) world(local) units.
+ */
+export function bakeMeshSdf(positions, index, maxAxisRes = MESH_SDF_MAX_AXIS) {
+  // Local AABB + one band of padding so surface cells never clip.
+  let minX = Infinity;
+  let minY = Infinity;
+  let minZ = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  let maxZ = -Infinity;
+  for (let i = 0; i < positions.length; i += 3) {
+    if (positions[i] < minX) minX = positions[i];
+    if (positions[i] > maxX) maxX = positions[i];
+    if (positions[i + 1] < minY) minY = positions[i + 1];
+    if (positions[i + 1] > maxY) maxY = positions[i + 1];
+    if (positions[i + 2] < minZ) minZ = positions[i + 2];
+    if (positions[i + 2] > maxZ) maxZ = positions[i + 2];
+  }
+  const spanX = Math.max(1e-4, maxX - minX);
+  const spanY = Math.max(1e-4, maxY - minY);
+  const spanZ = Math.max(1e-4, maxZ - minZ);
+  const maxSpan = Math.max(spanX, spanY, spanZ);
+  const cellLen = maxSpan / (maxAxisRes - 4);
+  const pad = cellLen * 2;
+  const bounds = {
+    min: { x: minX - pad, y: minY - pad, z: minZ - pad },
+    max: { x: maxX + pad, y: maxY + pad, z: maxZ + pad },
+  };
+  const res = {
+    x: Math.max(8, Math.min(maxAxisRes, Math.round((spanX + pad * 2) / cellLen))),
+    y: Math.max(8, Math.min(maxAxisRes, Math.round((spanY + pad * 2) / cellLen))),
+    z: Math.max(8, Math.min(maxAxisRes, Math.round((spanZ + pad * 2) / cellLen))),
+  };
+  const cell = {
+    x: (bounds.max.x - bounds.min.x) / res.x,
+    y: (bounds.max.y - bounds.min.y) / res.y,
+    z: (bounds.max.z - bounds.min.z) / res.z,
+  };
+  const cellCount = res.x * res.y * res.z;
+  const minCell = Math.min(cell.x, cell.y, cell.z);
+
+  // Seed pass: reuse the scene rasterizer's band machinery via a minimal
+  // arrays shim (only occupancy/seed matter here; the color fields are a
+  // single shared scratch — rasterizeRecords writes them per-cell, nothing
+  // reads them back).
+  const seed = new Float32Array(cellCount).fill(1e6);
+  const scratch3 = new Float32Array(cellCount * 3);
+  const arrays = {
+    albedo: scratch3,
+    emissive: scratch3,
+    normalAcc: new Float32Array(cellCount * 3),
+    sampleCount: new Uint32Array(cellCount),
+    occupied: new Uint8Array(cellCount),
+    seed,
+  };
+  const record = {
+    positions,
+    index,
+    matrix: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+    color: { r: 1, g: 1, b: 1 },
+    emissive: { r: 0, g: 0, b: 0 },
+    emissiveIntensity: 0,
+  };
+  rasterizeRecords([record], { bounds, res, cell, arrays }, null);
+
+  const distance = new Float32Array(cellCount);
+  computeDistanceField(seed, distance, res, cell);
+
+  // Quantize: distance is in minCell units capped at SDF_CAP (16); rescale
+  // to MESH_SDF_CAP just in case the constants ever diverge.
+  const data = new Uint8Array(cellCount);
+  const scale = 255 / MESH_SDF_CAP;
+  for (let i = 0; i < cellCount; i++) {
+    data[i] = Math.min(255, Math.round(Math.min(MESH_SDF_CAP, distance[i]) * scale));
+  }
+  return {
+    data,
+    dims: res,
+    boundsMin: [bounds.min.x, bounds.min.y, bounds.min.z],
+    boundsSize: [bounds.max.x - bounds.min.x, bounds.max.y - bounds.min.y, bounds.max.z - bounds.min.z],
+    minCell,
+  };
 }
 
 // -------------------------------------------------------------- orchestration

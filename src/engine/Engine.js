@@ -16,6 +16,8 @@ import { prefabRegistry } from "./prefab/registry.js";
 import { instantiatePrefabNode } from "./prefab/expand.js";
 import { StatsSystem } from "./StatsSystem.js";
 import { configureTextureAssetLoader } from "./textureAsset.js";
+import { installOutputDither } from "./outputDither.js";
+import { BatchSystem } from "./batching.js";
 
 /**
  * Runtime core: owns the renderer, the three.js scene (source of truth)
@@ -97,6 +99,13 @@ export class Engine extends EventEmitter {
     // view*projection matrix is multiplied exactly once per frame (and even
     // then only when the active camera actually moved). See viewFrustum.js.
     this.viewFrustum = new ViewFrustum();
+    // Components that opted into frustum gating, maintained incrementally by
+    // `Component._viewOnlyActive`. The main loop ticks this set directly
+    // rather than scanning every entity's component map each frame.
+    this.viewOnlyComponents = new Set();
+    // Merges repeated (geometry, material) pairs into instanced draw calls.
+    // Driven from #tick's pre-render phase, gated by settings.performance.
+    this.batching = new BatchSystem(this);
     // Built-in per-frame telemetry sampler. Lives on the engine — every
     // engine has one, no module registry involved. The editor's viewport
     // overlay reads `engine.stats.readout`; built games can ignore it.
@@ -138,6 +147,91 @@ export class Engine extends EventEmitter {
     this.ambientLight.userData.engineOwned = true;
     this.scene.add(this.ambientLight);
     applySettingsToScene(this.settings, this.scene, this.ambientLight, null);
+
+    // Batching reads `settings`, so it can only be armed once those exist.
+    // applySettings() re-applies this whenever the scene changes it.
+    this.batching.setEnabled(this.settings.performance?.autoBatching !== false);
+
+    // Set to true by `emit("hierarchy-changed")` while a coalescing microtask
+    // is pending. See the `emit` override below.
+    this._hierarchyDirty = false;
+  }
+
+  /**
+   * "hierarchy-changed" is a coarse "the entity tree moved, re-read it" signal.
+   * Every listener responds by rebuilding something proportional to scene size
+   * — the editor's React mirror walks all entities, GI queues a rebake check,
+   * terrain rescans scatter parents. Emitting it once per entity (which
+   * `createEntity` / `destroyEntity` / `addComponent` all do) therefore makes
+   * bulk operations quadratic: loading a 5k-entity scene fired ~10k events,
+   * each triggering a 5k-entity mirror rebuild.
+   *
+   * Coalescing to a microtask collapses any synchronous burst into a single
+   * emit while keeping the event's meaning intact — scene load, `clear()`, and
+   * prefab expansion are all synchronous loops, so they now notify once. Use
+   * `flushHierarchyChanged()` when a caller genuinely needs listeners to have
+   * run before it continues.
+   */
+  emit(event, ...args) {
+    if (event !== "hierarchy-changed") {
+      super.emit(event, ...args);
+      return;
+    }
+    this._hierarchyDirty = true;
+    // An explicit batchHierarchy() owns the flush — it spans `await`s, which a
+    // microtask would fire straight through.
+    if (this._hierarchyBatchDepth > 0 || this._hierarchyScheduled) return;
+    this._hierarchyScheduled = true;
+    queueMicrotask(() => {
+      this._hierarchyScheduled = false;
+      this.flushHierarchyChanged();
+    });
+  }
+
+  /** Delivers a pending coalesced "hierarchy-changed" immediately (no-op if none). */
+  flushHierarchyChanged() {
+    if (!this._hierarchyDirty || this._hierarchyBatchDepth > 0) return;
+    this._hierarchyDirty = false;
+    super.emit("hierarchy-changed");
+  }
+
+  /**
+   * Holds the coalesced "hierarchy-changed" until `fn` finishes, even across
+   * `await`s — the microtask above would otherwise flush at the first one.
+   * Restoring a play snapshot and loading a scene both await settings before
+   * touching the tree, and neither should notify twice.
+   *
+   * Re-entrant, and works for both synchronous and async callbacks.
+   * Deliberately NOT declared `async`: `clear()` calls it from synchronous
+   * code that must stay synchronous, so the result is passed through unwrapped.
+   */
+  batchHierarchy(fn) {
+    this._hierarchyBatchDepth = (this._hierarchyBatchDepth ?? 0) + 1;
+    const finish = () => {
+      this._hierarchyBatchDepth--;
+      if (this._hierarchyBatchDepth === 0) this.flushHierarchyChanged();
+    };
+    let result;
+    try {
+      result = fn();
+    } catch (err) {
+      finish();
+      throw err;
+    }
+    if (result && typeof result.then === "function") {
+      return result.then(
+        (value) => {
+          finish();
+          return value;
+        },
+        (err) => {
+          finish();
+          throw err;
+        },
+      );
+    }
+    finish();
+    return result;
   }
 
   /** Merges + applies a scene-settings patch; emits "settings-changed". */
@@ -193,6 +287,7 @@ export class Engine extends EventEmitter {
     if (!recreatedRenderer && (prevScale !== nextScale || prevDpr !== nextDpr)) {
       this.#scheduleRendererResize();
     }
+    this.batching.setEnabled(this.settings.performance?.autoBatching !== false);
     this.emit("settings-changed", this.settings);
     return recreatedRenderer;
   }
@@ -224,6 +319,9 @@ export class Engine extends EventEmitter {
         // animation loop against a renderer that isn't ours yet.
         if (token !== this._rendererRebuildSeq) return;
         configureTextureAssetLoader(this.renderer);
+    // Sub-LSB dither on the output transform — without it every smooth GI
+    // gradient bands into hard-edged contour rings on the 8-bit canvas.
+    installOutputDither(this.renderer);
         applySettingsToScene(this.settings, this.scene, this.ambientLight, this.renderer);
         // Lazy-loaded SSGI/SSR addon handles from the previous renderer are
         // renderer-agnostic factories in r185, but invalidating them on a
@@ -322,6 +420,9 @@ export class Engine extends EventEmitter {
     this.#applyRendererSize();
     await this.renderer.init();
     configureTextureAssetLoader(this.renderer);
+    // Sub-LSB dither on the output transform — without it every smooth GI
+    // gradient bands into hard-edged contour rings on the 8-bit canvas.
+    installOutputDither(this.renderer);
     // Renderer-side settings (tone mapping, shadows) couldn't apply earlier.
     applySettingsToScene(this.settings, this.scene, this.ambientLight, this.renderer);
     this.rendererReady = true;
@@ -362,18 +463,13 @@ export class Engine extends EventEmitter {
     // no-ops when the camera hasn't moved, so this is one cheap
     // matrix-multiply hash check on a static-camera frame.
     this.viewFrustum.refresh(this.camera);
-    // Update `_inView` on every view-only component. Components that opted
-    // in (their `viewOnly` getter returns true) get one sphere/plane test
-    // each; the rest are skipped entirely. We don't track this in a Set
-    // because the walk is linear in the entity tree (cheap, and avoids
-    // bookkeeping on every component add/remove/prop change).
+    // Update `_inView` on every view-only component: one sphere/plane test
+    // each. The registry is maintained incrementally as components opt in and
+    // out (see Component._viewOnlyActive), so this costs nothing on a scene
+    // that uses no frustum gating — where the previous nested walk over every
+    // entity and every component still ran in full, every frame.
     if (this.viewFrustum.isReady()) {
-      for (const entity of this.entities.values()) {
-        for (const c of entity.components.values()) {
-          if (!c.viewOnly) continue;
-          c.updateViewVisibility(this.viewFrustum);
-        }
-      }
+      for (const c of this.viewOnlyComponents) c.updateViewVisibility(this.viewFrustum);
     }
     // Resolve per-mode visibility onto every entity's Object3D. We write
     // only when the desired value differs from the current one so a stable
@@ -397,10 +493,23 @@ export class Engine extends EventEmitter {
       // submitted GPU work. If it was requested from inside an update
       // callback, do not encode another frame after the drain was scheduled.
       if (this._resizeInFlight) return;
+      // Systems may briefly suspend scene rendering while an async pipeline
+      // compile wave fills the cache (GI rebuilds): the viewport holds its
+      // last frame but the app stays interactive, instead of the render
+      // call blocking the main thread for the whole wave.
+      if (this.renderSuspended) return;
       // Final-transform passes (e.g. GI deferred prepass) run here: after
       // physics/scripts have written this frame's transforms, before the
       // main draw that samples their output.
+      // Refresh instanced batches before any pre-render pass reads the
+      // scene, so a GI/postprocess prepass and the main draw agree on what
+      // is on screen.
+      this.batching.sync();
       for (const fn of this.preRenderCallbacks) fn();
+      // Re-check: a preRender callback (GI rebuild) may have suspended
+      // rendering THIS frame — rendering now would sync-compile the whole
+      // material wave in this frame, the exact freeze suspension prevents.
+      if (this.renderSuspended) return;
       // Wall-clock the GPU-submit portion of the frame so the stats
       // overlay's "GPU" reading reflects only the render call, not the
       // script tick. WebGPU dispatches the actual GPU work asynchronously,
@@ -725,8 +834,47 @@ export class Engine extends EventEmitter {
     return this.entities.get(id);
   }
 
+  /**
+   * Every entity in the scene carrying the given tags. Arguments are OR'd and
+   * arrays within an argument are AND'd, matching PlayCanvas:
+   *
+   *     engine.findByTag("enemy")                 // all enemies
+   *     engine.findByTag("enemy", "hazard")       // enemy OR hazard
+   *     engine.findByTag(["enemy", "flying"])     // enemy AND flying
+   *
+   * Iterates the flat entity map rather than walking the tree, so cost is
+   * linear in scene size regardless of nesting depth.
+   */
+  findByTag(...query) {
+    if (!query.length) return [];
+    const out = [];
+    for (const entity of this.entities.values()) {
+      if (entity.hasTag(...query)) out.push(entity);
+    }
+    return out;
+  }
+
+  /** The first entity matching `findByTag`, or null. */
+  findOneByTag(...query) {
+    for (const entity of this.entities.values()) {
+      if (entity.hasTag(...query)) return entity;
+    }
+    return null;
+  }
+
+  /** Every distinct tag currently in use, sorted — powers editor autocomplete. */
+  allTags() {
+    const tags = new Set();
+    for (const entity of this.entities.values()) {
+      for (const tag of entity.tags ?? []) tags.add(tag);
+    }
+    return [...tags].sort();
+  }
+
   clear({ resetSettings = true } = {}) {
-    for (const entity of [...this.rootEntities]) this.destroyEntity(entity);
+    this.batchHierarchy(() => {
+      for (const entity of [...this.rootEntities]) this.destroyEntity(entity);
+    });
     this.sceneName = "Untitled";
     if (resetSettings) this.applySettings(structuredClone(SCENE_SETTINGS_DEFAULTS));
     this.emit("hierarchy-changed");
@@ -740,6 +888,7 @@ export class Engine extends EventEmitter {
     this.input.detach();
     this.audio.dispose?.();
     this.stats.dispose();
+    this.batching.dispose();
     this.renderOverrides.clear();
     this.rendererReady = false;
     // Bump the rebuild token so any in-flight #rebuildRenderer awaiting

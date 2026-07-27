@@ -3,12 +3,16 @@ import {
   ArrowUp,
   Box,
   Braces,
+  ChevronDown,
+  Download,
+  EyeOff,
   File,
   FileCode2,
   Folder,
   FolderOpen,
   FolderPlus,
   Grid2x2,
+  Globe,
   Grid3x3,
   Image,
   Layers,
@@ -17,12 +21,16 @@ import {
   Package,
   Palette,
   PanelLeft,
+  Search,
   Shapes,
+  Tag,
+  Target,
   Trash2,
+  Volume2,
   Workflow,
+  X,
 } from "lucide-react";
 import { useProjectStore, basename } from "../store/projectStore.js";
-import { useSceneStore } from "../store/sceneStore.js";
 import { useSelectionStore } from "../store/selectionStore.js";
 import { useAssetProcessingStore } from "../store/assetProcessingStore.js";
 import {
@@ -34,29 +42,42 @@ import {
   TEXTURE_EXTENSIONS,
   SCRIPT_EXTENSIONS,
   MATERIAL_EXTENSIONS,
+  CUBEMAP_EXTENSIONS,
   PREFAB_EXTENSIONS,
   ANIMATOR_EXTENSIONS,
   GEOMETRY_EXTENSIONS,
 } from "../assetLoader.js";
 import { MATERIAL_DEFAULTS } from "../../engine/materialAsset.js";
-import { openScenePath } from "../sceneIO.js";
-import { openPrefabMode } from "../prefab.js";
+import {
+  CUBEMAP_DEFAULTS,
+  CUBEMAP_FACES,
+  guessCubemapFaces,
+  normalizeCubemapDef,
+} from "../../engine/cubemapAsset.js";
 import { armAssetDrag, useAssetDrop, consumeAssetDragClick } from "../assetDrag.js";
-import { stemToClassName } from "../scriptClassSync.js";
+import { createScriptFile } from "../scriptAsset.js";
+import { openInIDE } from "../openInIde.js";
 import { scaffoldProjectTypes } from "../projectTypes.js";
 import { FolderTree } from "../components/FolderTree.jsx";
 import { clickSelect, pathsInBox } from "../assetSelection.js";
 import {
   invoke,
-  uniqueName,
   createAssetFile,
   createFolder,
   deleteEntries,
   renameEntry,
   moveDraggedIntoFolder,
+  groupIntoFolder,
   formatBytes,
   formatDate,
 } from "../assetOps.js";
+import { listProjectEntries, withoutSidecars } from "../assetLoader.js";
+import { ASSET_TYPES, assetType, filterEntries } from "../assetFilter.js";
+import { loadAssetFlags, setAssetFlags, useAssetFlagsStore } from "../assetFlags.js";
+import { collectUsedAssets } from "../assetUsage.js";
+import { samePath, useAssetRevealStore } from "../assetReveal.js";
+import { openAssetPath } from "../openAsset.js";
+import { ContextMenu, isTextEditTarget } from "../ContextMenu.jsx";
 
 const ICON_BY_EXT = {
   glb: Box,
@@ -67,6 +88,7 @@ const ICON_BY_EXT = {
   js: FileCode2,
   ts: FileCode2,
   mat: Palette,
+  cubemap: Globe,
   png: Image,
   jpg: Image,
   jpeg: Image,
@@ -86,6 +108,7 @@ const TYPE_LABEL = {
   js: "Script",
   ts: "Script",
   mat: "Material",
+  cubemap: "Cube Map",
   png: "Texture",
   jpg: "Texture",
   jpeg: "Texture",
@@ -110,40 +133,24 @@ const VIEW_MODES = [
 const VIEW_KEY = "engine.assets.viewMode.v1";
 const TREE_KEY = "engine.assets.showTree.v1";
 
-/** Template with a placeholder for the class name; filled in by createScript(). */
-const SCRIPT_TEMPLATE = (className) => `import { Script, attribute } from "engine";
-
-// this.entity, this.engine, this.THREE and this.input are injected before
-// any hook runs. Extending Script gives them full TypeScript autocomplete.
-export default class ${className} extends Script {
-  @attribute({ type: "number", default: 1, min: 0, max: 10, step: 0.1 })
-  speed = 1;
-
-  onStart() {}
-
-  onUpdate(dt) {}
-
-  onDestroy() {}
-
-  // Optional: called instead of onStart when the file is hot-reloaded while
-  // playing. Copy state from the previous instance to continue seamlessly.
-  // onHotReload(oldInstance) { Object.assign(this, oldInstance); }
-}
-`;
-
-const createScript = () => {
-  const { entries } = useProjectStore.getState();
-  // Reserve a unique filename first so we can derive a matching class name
-  // (the filename's stem drives the class name on disk + in autocomplete).
-  const baseStem = "NewScript";
-  const baseName = `${baseStem}.ts`;
-  const finalName = uniqueName(baseName, entries);
-  const stem = finalName.replace(/\.(ts|js)$/i, "");
-  const className = stemToClassName(stem);
-  return createAssetFile(baseName, SCRIPT_TEMPLATE(className));
-};
+/** New Script lands in the folder the user is browsing (the inspector's
+ *  inline version writes to `<root>/scripts` instead — see scriptAsset.js). */
+const createScript = () =>
+  createScriptFile({ directory: useProjectStore.getState().currentPath });
 const createMaterial = () =>
   createAssetFile("NewMaterial.mat", JSON.stringify(MATERIAL_DEFAULTS, null, 2));
+
+/** Empty six-face cube map; faces are assigned in the asset inspector. */
+const createCubemap = (faces = null) =>
+  createAssetFile(
+    "NewCubemap.cubemap",
+    JSON.stringify(faces ? { ...CUBEMAP_DEFAULTS, faces } : CUBEMAP_DEFAULTS, null, 2),
+  );
+
+/** "New Cube Map from Selection": fills the slots by filename convention
+ *  (px/nx/…, posx/negx/…, right/left/top/…) so a downloaded 6-file skybox
+ *  becomes a usable asset in one step. Unmatched slots stay empty. */
+const createCubemapFromTextures = (paths) => createCubemap(guessCubemapFaces(paths));
 
 const ANIMATOR_TEMPLATE = {
   version: 1,
@@ -154,16 +161,6 @@ const ANIMATOR_TEMPLATE = {
 };
 const createAnimator = () =>
   createAssetFile("NewAnimator.anim", JSON.stringify(ANIMATOR_TEMPLATE, null, 2));
-
-/** Opens the file in the OS-default editor for its type. */
-async function openInIDE(path) {
-  try {
-    const { openPath } = await import("@tauri-apps/plugin-opener");
-    await openPath(path);
-  } catch (err) {
-    console.error(`Failed to open "${path}": ${err}`);
-  }
-}
 
 /** Texture image thumbnail (blob URL over Tauri fs). */
 function TextureThumb({ path, size }) {
@@ -254,6 +251,41 @@ function MaterialThumb({ path, size }) {
   );
 }
 
+/** Cube map preview: its +Z face (or the first assigned one) with a cube badge,
+ *  so an incomplete asset is visibly different from a finished one. */
+function CubemapThumb({ path, size }) {
+  const [state, setState] = useState(null); // { url, complete } | null
+  useEffect(() => {
+    let live = true;
+    setState(null);
+    (async () => {
+      try {
+        const def = normalizeCubemapDef(JSON.parse(await invoke("read_text_file", { path })));
+        const assigned = CUBEMAP_FACES.map((face) => def.faces[face.key]).filter(Boolean);
+        const front = def.faces.pz || assigned[0] || "";
+        const url = front ? await toBlobUrl(front).catch(() => null) : null;
+        if (live) setState({ url, complete: assigned.length === CUBEMAP_FACES.length });
+      } catch {
+        if (live) setState({ url: null, complete: false });
+      }
+    })();
+    return () => (live = false);
+  }, [path]);
+  return (
+    <div
+      className={`asset-icon cubemap-thumb${state && !state.complete ? " cubemap-thumb--incomplete" : ""}`}
+      style={{ width: size, height: size }}
+      title={state && !state.complete ? "Incomplete cube map — assign all six faces" : undefined}
+    >
+      {state?.url ? (
+        <img src={state.url} alt="" draggable={false} style={{ width: size, height: size }} />
+      ) : (
+        <Globe size={size * 0.65} strokeWidth={1.5} />
+      )}
+    </div>
+  );
+}
+
 function Thumb({ entry, size }) {
   if (entry.is_dir)
     return (
@@ -263,6 +295,7 @@ function Thumb({ entry, size }) {
     );
   if (TEXTURE_EXTENSIONS.includes(entry.ext)) return <TextureThumb path={entry.path} size={size} />;
   if (entry.ext === "mat") return <MaterialThumb path={entry.path} size={size} />;
+  if (entry.ext === "cubemap") return <CubemapThumb path={entry.path} size={size} />;
   const Icon = ICON_BY_EXT[entry.ext] ?? File;
   return (
     <div className="asset-icon" style={{ width: size, height: size }}>
@@ -300,54 +333,13 @@ const DRAGGABLE_EXTENSIONS = [
   ...TEXTURE_EXTENSIONS,
   ...SCRIPT_EXTENSIONS,
   ...MATERIAL_EXTENSIONS,
+  ...CUBEMAP_EXTENSIONS,
   ...PREFAB_EXTENSIONS,
   ...ANIMATOR_EXTENSIONS,
   ...GEOMETRY_EXTENSIONS,
 ];
 
-function openEntry(entry) {
-  if (entry.is_dir) {
-    useProjectStore.getState().navigate(entry.path);
-  } else if (SCRIPT_EXTENSIONS.includes(entry.ext)) {
-    openInIDE(entry.path);
-  } else if (entry.ext === "scene") {
-    openScenePath(entry.path).catch((err) => console.error(String(err)));
-  } else if (PREFAB_EXTENSIONS.includes(entry.ext)) {
-    // Double-click opens the prefab in isolation, like Unity's Prefab Mode.
-    openPrefabMode(entry.path).catch((err) => console.error(String(err)));
-  } else if (ANIMATOR_EXTENSIONS.includes(entry.ext)) {
-    useSelectionStore.getState().selectAsset(entry.path);
-    import("../EditorShell.jsx").then((m) => m.openPanel("animator"));
-  } else if (MATERIAL_EXTENSIONS.includes(entry.ext)) {
-    // A material *is* its shader graph — that's the only editor for it.
-    useSelectionStore.getState().selectAsset(entry.path);
-    import("../EditorShell.jsx").then((m) => m.openPanel("shaderGraph"));
-  } else if (GEOMETRY_EXTENSIONS.includes(entry.ext)) {
-    openGeometryAsset(entry.path);
-  }
-}
-
-/**
- * The Geometry Editor edits a live mesh on an entity, not a file — so opening a
- * .geom means finding an entity that uses it and editing that. Selecting the
- * asset itself would leave the editor with nothing to act on.
- */
-function openGeometryAsset(path) {
-  const key = (p) => String(p ?? "").replaceAll("\\", "/");
-  const entities = useSceneStore.getState().entities;
-  const match = Object.values(entities).find(
-    (entity) => key(entity?.components?.mesh?.geometryAsset) === key(path),
-  );
-  if (!match) {
-    console.warn(
-      `No entity in the scene uses "${basename(path)}" — ` +
-        `drag it onto an entity's Mesh (or into the scene) to edit it.`,
-    );
-    return;
-  }
-  useSelectionStore.getState().select(match.id);
-  import("../EditorShell.jsx").then((m) => m.openPanel("geometryEditor"));
-}
+const openEntry = (entry) => openAssetPath(entry.path, { isDir: entry.is_dir });
 
 function RenameInput({ entry, setRenamingPath }) {
   const commit = (value) => {
@@ -373,9 +365,39 @@ function RenameInput({ entry, setRenamingPath }) {
   );
 }
 
-function AssetItem({ entry, view, visible, renaming, setRenamingPath, onContextMenu }) {
+/**
+ * Corner badges for the build flags. Excluded assets read as dimmed with a
+ * struck-through eye; preloaded ones get a download arrow. Both are visible at
+ * a glance from the grid, which is the point — build behaviour you can only
+ * discover by clicking each asset in turn isn't discoverable at all.
+ */
+function FlagBadges({ path }) {
+  const flags = useAssetFlagsStore((s) => s.flags[path]);
+  if (!flags?.preload && !flags?.exclude) return null;
+  return (
+    <div className="asset-flag-badges">
+      {flags.exclude && (
+        <span className="asset-flag-badge exclude" title="Excluded from game builds">
+          <EyeOff size={9} />
+        </span>
+      )}
+      {flags.preload && (
+        <span className="asset-flag-badge preload" title="Loaded during the preload phase">
+          <Download size={9} />
+        </span>
+      )}
+    </div>
+  );
+}
+
+function AssetItem({ entry, view, visible, renaming, setRenamingPath, onContextMenu, subtitle }) {
   const draggable = entry.is_dir || DRAGGABLE_EXTENSIONS.includes(entry.ext);
   const selected = useSelectionStore((s) => s.assetPaths.includes(entry.path));
+  // "Revealed" is the inspector pointing at this file (see assetReveal.js) —
+  // a highlight, not a selection, so the entity stays selected behind it.
+  const revealed = useAssetRevealStore((s) => samePath(s.path, entry.path));
+  const excluded = useAssetFlagsStore((s) => s.flags[entry.path]?.exclude === true);
+  const tags = useAssetFlagsStore((s) => s.flags[entry.path]?.tags);
   const details = view.id === "details";
 
   // Folders accept asset drops (move into folder).
@@ -393,6 +415,8 @@ function AssetItem({ entry, view, visible, renaming, setRenamingPath, onContextM
       // unselected tile carries that tile, and a drag on a multi-selection
       // keeps it intact.
       if (renaming || e.target.closest("input") || e.button !== 0) return;
+      // Any real click supersedes an inspector reveal.
+      useAssetRevealStore.getState().clear();
       const sel = useSelectionStore.getState();
       const inSelection = sel.assetPaths.includes(entry.path);
       if (!inSelection || e.shiftKey || e.ctrlKey || e.metaKey) clickSelect(e, entry, visible);
@@ -415,13 +439,25 @@ function AssetItem({ entry, view, visible, renaming, setRenamingPath, onContextM
 
   if (details) {
     return (
-      <div className={`asset-row ${selected ? "selected" : ""}`} {...handlers}>
+      <div
+        className={`asset-row ${selected ? "selected" : ""} ${revealed ? "revealed" : ""} ${excluded ? "excluded" : ""}`}
+        {...handlers}
+      >
         <div className="asset-row-name">
           <Thumb entry={entry} size={view.thumb} />
           {renaming ? (
             <RenameInput entry={entry} setRenamingPath={setRenamingPath} />
           ) : (
-            <span className="asset-row-label">{entry.name}</span>
+            <>
+              <span className="asset-row-label">{entry.name}</span>
+              {subtitle && <span className="asset-row-path">{subtitle}</span>}
+              {tags?.length > 0 && (
+                <span className="asset-row-tags" title={tags.join(", ")}>
+                  <Tag size={9} />
+                  {tags.join(", ")}
+                </span>
+              )}
+            </>
           )}
         </div>
         <div className="asset-col">{entry.is_dir ? "Folder" : (TYPE_LABEL[entry.ext] ?? entry.ext.toUpperCase())}</div>
@@ -433,15 +469,19 @@ function AssetItem({ entry, view, visible, renaming, setRenamingPath, onContextM
 
   return (
     <div
-      className={`asset-tile ${entry.is_dir ? "dir" : ""} ${selected ? "selected" : ""}`}
+      className={`asset-tile ${entry.is_dir ? "dir" : ""} ${selected ? "selected" : ""} ${revealed ? "revealed" : ""} ${excluded ? "excluded" : ""}`}
       {...handlers}
     >
       <Thumb entry={entry} size={view.thumb} />
       {entry.ext === "glb" && <DracoBadge path={entry.path} />}
+      <FlagBadges path={entry.path} />
       {renaming ? (
         <RenameInput entry={entry} setRenamingPath={setRenamingPath} />
       ) : (
-        <div className="asset-name">{entry.name}</div>
+        <>
+          <div className="asset-name">{entry.name}</div>
+          {subtitle && <div className="asset-subpath">{subtitle}</div>}
+        </>
       )}
     </div>
   );
@@ -453,12 +493,57 @@ function AssetContextMenu({ menu, close, setRenamingPath, selectedEntries }) {
   const multi = entry && selectedEntries.length > 1 && selectedEntries.some((s) => s.path === entry.path);
   const targets = multi ? selectedEntries : entry ? [entry] : [];
 
+  // Six selected face textures are one "New Cube Map from Selection" away from
+  // a usable skybox — offer it whenever the selection is all textures.
+  const textureTargets = targets.filter((t) => !t.is_dir && TEXTURE_EXTENSIONS.includes(t.ext));
+  const canMakeCubemap = targets.length > 1 && textureTargets.length === targets.length;
+
+  // Build flags act on files; a folder has nothing of its own to ship.
+  const fileTargets = targets.filter((target) => !target.is_dir);
+  const flagsOf = (target) => useAssetFlagsStore.getState().flags[target.path] ?? {};
+  const allPreload = fileTargets.length > 0 && fileTargets.every((t) => flagsOf(t).preload);
+  const allExclude = fileTargets.length > 0 && fileTargets.every((t) => flagsOf(t).exclude);
+
   const items = entry
     ? [
+        // "Open" first: it's what a double-click does, and a menu that doesn't
+        // offer the primary action reads as incomplete.
+        !multi && { label: "Open", action: () => openEntry(entry) },
+        !multi && !entry.is_dir && {
+          label: "Copy Path",
+          action: () => navigator.clipboard.writeText(entry.path).catch(() => {}),
+        },
+        { separator: true },
         ...(multi
           ? []
           : [{ label: "Rename", action: () => setRenamingPath(entry.path) }]),
-        { label: multi ? `Delete ${targets.length} items` : "Delete", action: () => deleteEntries(targets) },
+        {
+          label: multi ? `Group ${targets.length} into Folder` : "Group into Folder",
+          shortcut: "Ctrl+G",
+          action: () => groupIntoFolder(targets),
+        },
+        ...(fileTargets.length
+          ? [
+              {
+                label: allPreload ? "Don't Preload" : "Preload",
+                hint: "Load during the boot phase so it's ready before the first frame",
+                action: () => setAssetFlags(fileTargets.map((t) => t.path), { preload: !allPreload }),
+              },
+              {
+                label: allExclude ? "Include in Builds" : "Exclude from Builds",
+                hint: "Keep the file in the project but leave it out of exported games",
+                action: () => setAssetFlags(fileTargets.map((t) => t.path), { exclude: !allExclude }),
+              },
+            ]
+          : []),
+        ...(canMakeCubemap
+          ? [
+              {
+                label: "New Cube Map from Selection",
+                action: () => createCubemapFromTextures(textureTargets.map((t) => t.path)),
+              },
+            ]
+          : []),
         ...(!multi && MODEL_IMPORT_EXTENSIONS.includes(entry.ext)
           ? [
               { label: "Unpack Model", action: () => unpackModel(entry.path) },
@@ -470,34 +555,26 @@ function AssetContextMenu({ menu, close, setRenamingPath, selectedEntries }) {
         ...(!multi && !entry.is_dir
           ? [{ label: "Open in Default App", action: () => openInIDE(entry.path) }]
           : []),
+        { separator: true },
+        {
+          label: multi ? `Delete ${targets.length} items` : "Delete",
+          shortcut: "Del",
+          danger: true,
+          action: () => deleteEntries(targets),
+        },
       ]
     : [
+        { header: "Create" },
         { label: "New Folder", action: createFolder },
         { label: "New Script", action: createScript },
         { label: "New Material", action: createMaterial },
+        { label: "New Cube Map", action: () => createCubemap() },
         { label: "New Animator", action: createAnimator },
+        { separator: true },
         { label: "Refresh", action: () => useProjectStore.getState().refresh() },
       ];
 
-  return (
-    <>
-      <div className="dropdown-overlay" onClick={close} onContextMenu={(e) => { e.preventDefault(); close(); }} />
-      <div className="dropdown-menu context-menu" style={{ left: menu.x, top: menu.y }}>
-        {items.map((item) => (
-          <button
-            key={item.label}
-            className="dropdown-item"
-            onClick={() => {
-              close();
-              item.action();
-            }}
-          >
-            {item.label}
-          </button>
-        ))}
-      </div>
-    </>
-  );
+  return <ContextMenu x={menu.x} y={menu.y} items={items} onClose={close} />;
 }
 
 /** Copies OS-dropped files into the folder currently open in the panel. */
@@ -639,19 +716,103 @@ export function AssetsPanel() {
   const [fileDropActive, setFileDropActive] = useState(false);
   const [viewId, setViewId] = useState(() => localStorage.getItem(VIEW_KEY) ?? "medium");
   const [showTree, setShowTree] = useState(() => localStorage.getItem(TREE_KEY) !== "0");
+  const [query, setQuery] = useState("");
+  const [typeId, setTypeId] = useState("all");
+  const [typeMenuOpen, setTypeMenuOpen] = useState(false);
+  const [usedOnly, setUsedOnly] = useState(false);
+  const [usedPaths, setUsedPaths] = useState(null); // Set of normalised paths
+  const [projectEntries, setProjectEntries] = useState(null); // whole-project search pool
+  const [scanning, setScanning] = useState(false);
+  const selectedEntityIds = useSelectionStore((s) => s.ids);
+  // Tag edits change what a tag: query matches, so re-filter when they land.
+  const flagVersion = useAssetFlagsStore((s) => s.flags);
   const panelRef = useRef(null);
   const gridRef = useRef(null);
 
   const view = VIEW_MODES.find((v) => v.id === viewId) ?? VIEW_MODES[2];
-  // Generated sidecars are managed through their source asset, not shown as tiles.
+  // A search or a "used by selection" filter is a question about the project,
+  // not about the folder that happens to be open — so both widen the pool to
+  // every asset and show where each hit lives.
+  const searching = query.trim().length > 0 || usedOnly || typeId !== "all";
+  // An empty scan means it failed, not that the project is empty — a project
+  // with an open folder always has at least that folder's contents. Falling
+  // back to the folder listing keeps a failed scan showing *something*
+  // filterable instead of a blank grid that reads as "no matches".
+  const projectWide = searching && projectEntries !== null && projectEntries.length > 0;
+
+  // Generated sidecars are managed through their source asset, not shown as
+  // tiles — but the raw listing (which has them) is what the flag loader needs.
+  const folderEntries = useMemo(() => withoutSidecars(entries), [entries]);
+  const projectAssets = useMemo(
+    () => (projectEntries ? withoutSidecars(projectEntries) : null),
+    [projectEntries],
+  );
+  const pool = projectWide ? projectAssets : folderEntries;
   const visible = useMemo(
-    () => entries.filter((e) => !e.name.endsWith(".meta") && !e.name.endsWith(".basis")),
-    [entries],
+    () => (searching ? filterEntries(pool, { typeId, query, usedPaths: usedOnly ? usedPaths : null }) : pool),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [pool, searching, typeId, query, usedOnly, usedPaths, flagVersion],
   );
   const selectedEntries = useMemo(
     () => visible.filter((e) => assetPaths.includes(e.path)),
     [visible, assetPaths],
   );
+  const activeType = assetType(typeId);
+  const filtersActive = query.trim().length > 0 || typeId !== "all" || usedOnly;
+
+  const clearFilters = () => {
+    setQuery("");
+    setTypeId("all");
+    setUsedOnly(false);
+  };
+
+  /** Folder of an entry, relative to the project root — the search subtitle. */
+  const relativeFolder = (entry) => {
+    if (!projectWide || !rootPath) return null;
+    const dir = entry.path.slice(0, entry.path.length - entry.name.length - 1);
+    const rel = dir.slice(rootPath.length + 1).replaceAll("\\", "/");
+    return rel || basename(rootPath);
+  };
+
+  // Load the whole-project pool the first time a filter is switched on, and
+  // refresh it whenever the project tree changes underneath us.
+  const changeCounter = useProjectStore((s) => s.changeCounter);
+  useEffect(() => {
+    if (!searching || !rootPath) return;
+    let live = true;
+    setScanning(true);
+    listProjectEntries(rootPath)
+      .then((all) => {
+        if (!live) return;
+        setProjectEntries(all);
+        return loadAssetFlags(all);
+      })
+      .catch((err) => console.warn(`Asset scan failed: ${err}`))
+      .finally(() => live && setScanning(false));
+    return () => {
+      live = false;
+    };
+  }, [searching, rootPath, changeCounter]);
+
+  // Which assets the selected entities reference. Recomputed on selection
+  // change so the filter tracks what the user is looking at in the viewport.
+  useEffect(() => {
+    if (!usedOnly) return;
+    let live = true;
+    collectUsedAssets(selectedEntityIds)
+      .then((paths) => live && setUsedPaths(paths))
+      .catch((err) => console.warn(`Couldn't resolve used assets: ${err}`));
+    return () => {
+      live = false;
+    };
+  }, [usedOnly, selectedEntityIds]);
+
+  // Build flags for whatever is on screen, so badges render without each tile
+  // doing its own read. Feeds the RAW listing — the `.meta` entries in it are
+  // how the loader knows which assets have a sidecar to open.
+  useEffect(() => {
+    if (entries.length) loadAssetFlags(entries).catch(() => {});
+  }, [entries]);
 
   const { box, onPointerDown: onGridPointerDown } = useBoxSelect(gridRef);
 
@@ -680,10 +841,31 @@ export function AssetsPanel() {
   }, [rootPath]);
 
   // Leaving a folder drops its selection — the paths aren't on screen any more.
+  // Only the asset half: the entity selection is not this panel's to discard.
   useEffect(() => {
-    useSelectionStore.getState().clear();
+    useSelectionStore.getState().clearAssets();
     setRenamingPath(null);
   }, [currentPath]);
+
+  // Scroll to whatever the inspector last pointed at. Keyed on the token (not
+  // the path) so clicking the same field twice re-scrolls; keyed on `visible`
+  // too because the reveal usually arrives one folder-listing before the tile
+  // it wants exists. A filter that hides the tile is cleared first — otherwise
+  // "reveal" silently does nothing.
+  const revealToken = useAssetRevealStore((s) => s.token);
+  const revealPath = useAssetRevealStore((s) => s.path);
+  useEffect(() => {
+    if (!revealPath) return;
+    if (filtersActive && !visible.some((entry) => samePath(entry.path, revealPath))) {
+      clearFilters();
+      return;
+    }
+    const match = visible.find((entry) => samePath(entry.path, revealPath));
+    if (!match) return;
+    const el = gridRef.current?.querySelector(`[data-asset-path="${CSS.escape(match.path)}"]`);
+    el?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [revealToken, revealPath, visible]);
 
   // Ensure the engine's .d.ts files are present in the project root so the
   // user's IDE provides `this.entity` / `this.engine` autocomplete when they
@@ -756,6 +938,8 @@ export function AssetsPanel() {
   }
 
   const onTileContextMenu = (e, entry) => {
+    // A tile mid-rename is a text field; let the edit menu win.
+    if (isTextEditTarget(e.target)) return;
     e.preventDefault();
     e.stopPropagation();
     // Right-clicking outside the selection reselects the clicked entry, so the
@@ -783,6 +967,12 @@ export function AssetsPanel() {
     } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a") {
       e.preventDefault();
       sel.selectAssets(visible.map((v) => v.path));
+    } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "g" && sel.assetPaths.length) {
+      // Ctrl+G — same gesture the hierarchy uses to group entities.
+      e.preventDefault();
+      e.stopPropagation();
+      const targets = visible.filter((v) => sel.assetPaths.includes(v.path));
+      groupIntoFolder(targets).then((path) => path && setRenamingPath(path));
     }
   };
 
@@ -850,6 +1040,76 @@ export function AssetsPanel() {
           <FolderOpen size={14} />
         </button>
       </div>
+      <div className="assets-filterbar">
+        <div className="assets-search">
+          <Search size={12} className="assets-search-icon" />
+          <input
+            className="assets-search-input"
+            type="text"
+            placeholder="Search assets… (tag:name to match tags)"
+            value={query}
+            spellCheck={false}
+            onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={(e) => {
+              e.stopPropagation();
+              if (e.key === "Escape" && query) setQuery("");
+            }}
+          />
+          {query && (
+            <button className="assets-search-clear" title="Clear search" onClick={() => setQuery("")}>
+              <X size={11} />
+            </button>
+          )}
+        </div>
+        <div className="dropdown-wrap">
+          <button
+            className={`toolbar-btn filter-btn ${typeId !== "all" ? "active" : ""}`}
+            title="Filter by asset type"
+            onClick={() => setTypeMenuOpen((v) => !v)}
+          >
+            <activeType.Icon size={13} />
+            <span className="filter-btn-label">{activeType.label}</span>
+            <ChevronDown size={11} />
+          </button>
+          {typeMenuOpen && (
+            <>
+              <div className="dropdown-overlay" onClick={() => setTypeMenuOpen(false)} />
+              <div className="dropdown-menu component-menu align-right">
+                {ASSET_TYPES.map(({ id, label, Icon }) => (
+                  <button
+                    key={id}
+                    className={`dropdown-item component-item ${typeId === id ? "checked" : ""}`}
+                    onClick={() => {
+                      setTypeId(id);
+                      setTypeMenuOpen(false);
+                    }}
+                  >
+                    <Icon size={14} className="component-item-icon" />
+                    <span className="component-item-label">{label}</span>
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+        <button
+          className={`toolbar-btn icon-only ${usedOnly ? "active" : ""}`}
+          title={
+            selectedEntityIds.length
+              ? `Show only assets used by the ${selectedEntityIds.length === 1 ? "selected object" : `${selectedEntityIds.length} selected objects`}`
+              : "Show only assets used by the selected objects (nothing selected)"
+          }
+          disabled={!selectedEntityIds.length && !usedOnly}
+          onClick={() => setUsedOnly((v) => !v)}
+        >
+          <Target size={14} />
+        </button>
+        {filtersActive && (
+          <button className="toolbar-btn icon-only" title="Clear filters" onClick={clearFilters}>
+            <X size={14} />
+          </button>
+        )}
+      </div>
       {error && <div className="asset-error">{error}</div>}
       <div className="assets-body">
         {showTree && (
@@ -865,12 +1125,30 @@ export function AssetsPanel() {
           onPointerDown={onGridPointerDown}
           onContextMenu={(e) => {
             e.preventDefault();
+            e.stopPropagation();
             useSelectionStore.getState().clear();
             setContextMenu({ x: e.clientX, y: e.clientY, entry: null });
           }}
         >
-          {loading && <div className="asset-hint">Loading…</div>}
-          {!loading && visible.length === 0 && <div className="asset-hint">Empty folder</div>}
+          {(loading || (searching && scanning && !projectEntries)) && (
+            <div className="asset-hint">{scanning ? "Searching project…" : "Loading…"}</div>
+          )}
+          {!loading && visible.length === 0 && (
+            <div className="asset-hint">
+              {searching
+                ? usedOnly && !selectedEntityIds.length
+                  ? "Select an object to see the assets it uses"
+                  : "No assets match these filters"
+                : "Empty folder"}
+            </div>
+          )}
+          {searching && visible.length > 0 && (
+            <div className="asset-result-bar">
+              {visible.length} {visible.length === 1 ? "result" : "results"}
+              {projectWide ? " across the project" : ""}
+              {usedOnly ? " · used by selection" : ""}
+            </div>
+          )}
           {view.id === "details" && visible.length > 0 && (
             <div className="asset-row header">
               <div className="asset-row-name">Name</div>
@@ -888,6 +1166,7 @@ export function AssetsPanel() {
               renaming={renamingPath === entry.path}
               setRenamingPath={setRenamingPath}
               onContextMenu={onTileContextMenu}
+              subtitle={relativeFolder(entry)}
             />
           ))}
           {box && (

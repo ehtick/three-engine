@@ -51,6 +51,74 @@ export class Entity {
     this.prefab = null;
     this.fid = null;
     this.fidPath = null;
+    // Free-form labels for finding entities without hard-coding names or
+    // walking the tree: `engine.findByTag("enemy")`. Kept as a plain sorted
+    // array so it serialises directly and compares cheaply; the set semantics
+    // (no duplicates) are enforced by addTag.
+    this.tags = [];
+  }
+
+  // ---- Tags --------------------------------------------------------------
+
+  /** Adds one or more tags. Duplicates and blanks are ignored. */
+  addTag(...tags) {
+    let changed = false;
+    for (const tag of tags.flat()) {
+      const value = String(tag ?? "").trim();
+      if (!value || this.tags.includes(value)) continue;
+      this.tags.push(value);
+      changed = true;
+    }
+    if (changed) {
+      this.tags.sort();
+      this.engine?.emit?.("entity-tags-changed", { entityId: this.id });
+    }
+    return this;
+  }
+
+  /** Removes one or more tags. */
+  removeTag(...tags) {
+    const drop = new Set(tags.flat().map((tag) => String(tag ?? "").trim()));
+    const next = this.tags.filter((tag) => !drop.has(tag));
+    if (next.length === this.tags.length) return this;
+    this.tags = next;
+    this.engine?.emit?.("entity-tags-changed", { entityId: this.id });
+    return this;
+  }
+
+  /**
+   * PlayCanvas tag semantics: arguments are OR'd, arrays within an argument
+   * are AND'd.
+   *
+   *     entity.hasTag("enemy", "boss")     // enemy OR boss
+   *     entity.hasTag(["enemy", "flying"]) // enemy AND flying
+   */
+  hasTag(...query) {
+    if (!query.length) return false;
+    return query.some((clause) =>
+      Array.isArray(clause)
+        ? clause.every((tag) => this.tags.includes(tag))
+        : this.tags.includes(clause),
+    );
+  }
+
+  /** Replaces the whole tag list (editor / deserialisation path). */
+  setTags(tags) {
+    const next = [...new Set((tags ?? []).map((tag) => String(tag ?? "").trim()).filter(Boolean))].sort();
+    if (next.length === this.tags.length && next.every((tag, i) => tag === this.tags[i])) return;
+    this.tags = next;
+    this.engine?.emit?.("entity-tags-changed", { entityId: this.id });
+  }
+
+  /** This entity and every descendant matching `hasTag`'s query semantics. */
+  findByTag(...query) {
+    const out = [];
+    const walk = (entity) => {
+      if (entity.hasTag(...query)) out.push(entity);
+      for (const child of entity.children) walk(child);
+    };
+    walk(this);
+    return out;
   }
 
   // ---- Transform aliases (delegate to object3D) --------------------------
@@ -245,10 +313,38 @@ export class Entity {
     if (!component) return;
     component.onDetach();
     this.components.delete(type);
+    // Drop it from the engine's per-frame frustum-gating registry (see
+    // Component._viewOnlyActive) so a destroyed component can't be ticked.
+    this.engine?.viewOnlyComponents?.delete(component);
   }
 
   getComponent(type) {
     return this.components.get(type);
+  }
+
+  /**
+   * A script instance on this entity by class name, file stem, or asset path:
+   *
+   *     const health = this.entity.getScript("Health");
+   *     health?.damage(10);
+   *
+   * Shorthand for `getComponent("script")?.getScript(name)`, which is the
+   * common way one behaviour talks to another now that an entity can carry
+   * several. Returns null when there is no script component or no match.
+   */
+  getScript(name) {
+    return this.components.get("script")?.getScript(name) ?? null;
+  }
+
+  /**
+   * Calls `hook` on every script attached to this entity, returning true if
+   * any of them handled it. Scripts can use this to signal each other without
+   * knowing what else is attached:
+   *
+   *     this.entity.dispatch("onDamaged", amount);
+   */
+  dispatch(hook, ...args) {
+    return this.components.get("script")?.dispatch(hook, ...args) ?? false;
   }
 
   setParent(parent) {

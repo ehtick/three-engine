@@ -8,7 +8,7 @@ import {
   isMaterialRenderable,
   subscribeMaterial,
 } from "../materialAsset.js";
-import { loadGeometryAsset } from "../geometryAsset.js";
+import { acquireGeometryAsset, disposeOrReleaseGeometry } from "../geometryAsset.js";
 
 const geometryFactories = {
   box: () => new THREE.BoxGeometry(1, 1, 1),
@@ -45,14 +45,18 @@ export class MeshComponent extends Component {
   static schema = [
     { key: "geometry", label: "Primitive", type: "select", options: Object.keys(geometryFactories), showIf: (props) => !props.geometryAsset },
     { key: "geometryAsset", label: "Geometry", type: "asset", exts: ["geom"] },
-    { key: "material", label: "Material 1", type: "asset", exts: ["mat"], emptyLabel: "Default" },
-    { key: "material2", label: "Material 2", type: "asset", exts: ["mat"] },
-    { key: "material3", label: "Material 3", type: "asset", exts: ["mat"] },
-    { key: "material4", label: "Material 4", type: "asset", exts: ["mat"] },
-    { key: "material5", label: "Material 5", type: "asset", exts: ["mat"] },
-    { key: "material6", label: "Material 6", type: "asset", exts: ["mat"] },
-    { key: "material7", label: "Material 7", type: "asset", exts: ["mat"] },
-    { key: "material8", label: "Material 8", type: "asset", exts: ["mat"] },
+    { key: "material", label: "Material", type: "asset", exts: ["mat"], emptyLabel: "Default" },
+    // Slots 2-8 exist for multi-material geometry, but a mesh starts with one.
+    // `hidden` keeps them out of the generic schema-driven inspector rows; the
+    // Mesh section renders a dedicated slot list that grows on demand instead
+    // of showing eight mostly-empty pickers on every mesh in the scene.
+    { key: "material2", label: "Material 2", type: "asset", exts: ["mat"], hidden: true },
+    { key: "material3", label: "Material 3", type: "asset", exts: ["mat"], hidden: true },
+    { key: "material4", label: "Material 4", type: "asset", exts: ["mat"], hidden: true },
+    { key: "material5", label: "Material 5", type: "asset", exts: ["mat"], hidden: true },
+    { key: "material6", label: "Material 6", type: "asset", exts: ["mat"], hidden: true },
+    { key: "material7", label: "Material 7", type: "asset", exts: ["mat"], hidden: true },
+    { key: "material8", label: "Material 8", type: "asset", exts: ["mat"], hidden: true },
     { key: "castShadow", label: "Cast Shadow", type: "boolean" },
     { key: "receiveShadow", label: "Receive Shadow", type: "boolean" },
   ];
@@ -80,8 +84,19 @@ export class MeshComponent extends Component {
     this.extraMaterialUnsubs?.forEach((unsubscribe) => unsubscribe());
     this.extraMaterialUnsubs = [];
     this.entity.object3D.remove(this.mesh);
-    this.mesh.geometry.dispose();
+    this.#releaseGeometry(this.mesh.geometry);
     this.mesh = null;
+  }
+
+  /**
+   * Drops this mesh's claim on `geometry`. Geometry loaded from a `.geom` is a
+   * SHARED instance (see geometryAsset.js) that other meshes may still be
+   * rendering, so it must be refcount-released rather than disposed outright;
+   * anything else (a primitive we built, an evaluated modifier result) is ours
+   * alone and is disposed.
+   */
+  #releaseGeometry(geometry) {
+    disposeOrReleaseGeometry(geometry);
   }
 
   onDisable() {
@@ -138,18 +153,18 @@ export class MeshComponent extends Component {
   async #loadGeometry(path) {
     const generation = (this.geometryGeneration = (this.geometryGeneration ?? 0) + 1);
     try {
-      const geometry = await loadGeometryAsset(path);
+      const geometry = await acquireGeometryAsset(path);
       if (generation !== this.geometryGeneration || !this.mesh) {
-        geometry.dispose();
+        this.#releaseGeometry(geometry);
         return;
       }
       const terrain = this.entity.getComponent("terrain");
       if (terrain?.mesh === this.mesh) {
         // Terrain owns the live deformable geometry; the .geom remains the
         // persistent base asset shown in this component input.
-        geometry.dispose();
+        this.#releaseGeometry(geometry);
       } else {
-        this.mesh.geometry.dispose();
+        this.#releaseGeometry(this.mesh.geometry);
         this.mesh.geometry = geometry;
         // Material binding depends on whether the newly-loaded geometry has
         // groups. The placeholder box does, while many imported GLTF
@@ -173,7 +188,7 @@ export class MeshComponent extends Component {
     if (!terrainManaged && isVolumeMaterial(path) && (this.props.geometry !== "box" || this.props.geometryAsset)) {
       this.geometryGeneration = (this.geometryGeneration ?? 0) + 1;
       console.warn(`Mesh "${this.entity?.name ?? this.entity?.id}" uses a volume .mat — snapping geometry to box for correct raymarch bounds.`);
-      this.mesh.geometry.dispose();
+      this.#releaseGeometry(this.mesh.geometry);
       this.mesh.geometry = new THREE.BoxGeometry(1, 1, 1);
       this.props.geometry = "box";
       this.props.geometryAsset = "";
@@ -205,7 +220,7 @@ export class MeshComponent extends Component {
       if (this.props.geometryAsset) {
         this.#loadGeometry(this.props.geometryAsset);
       } else {
-        this.mesh.geometry.dispose();
+        this.#releaseGeometry(this.mesh.geometry);
         const makeGeometry = geometryFactories[this.props.geometry] ?? geometryFactories.box;
         this.mesh.geometry = makeGeometry();
       }

@@ -28,6 +28,44 @@ export async function loadAssetMeta(path) {
   }
 }
 
+// Sidecar binary WRITER (derived data like baked mesh SDFs). Editor wires
+// this to Tauri fs; the player has no writer — derived data is load-only
+// there, and callers must treat a false return as "not persisted".
+let saveBinary = async () => false;
+
+export function setAssetBinarySaver(fn) {
+  saveBinary = fn;
+}
+
+export async function saveAssetBinary(path, bytes) {
+  try {
+    return await saveBinary(path, bytes);
+  } catch (error) {
+    console.warn(`[assets] binary save failed (${path}):`, error?.message ?? error);
+    return false;
+  }
+}
+
+// Project-level DERIVED DATA directory (e.g. `<project>/Library`). Content-
+// hash-keyed artifacts that belong to no single asset file — baked SDFs of
+// primitive/GLB-internal geometries — live under it. The editor wires a
+// synchronous provider reading the open project's root; the player wires
+// its export layout. Null = no project open → callers keep session caches.
+let derivedDataRoot = () => null;
+
+export function setDerivedDataRootProvider(fn) {
+  derivedDataRoot = fn;
+}
+
+export function getDerivedDataPath(relativeKey) {
+  try {
+    const root = derivedDataRoot();
+    return root ? `${String(root).replace(/[\\/]$/, "")}/${relativeKey}` : null;
+  } catch {
+    return null;
+  }
+}
+
 // Same idea for script components: the editor supplies a loader that reads
 // a script file, wraps it as an ES module, and reports a version so callers
 // can tell whether the file changed since the last load (hot reload).

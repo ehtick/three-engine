@@ -1,5 +1,6 @@
 import { Suspense, lazy } from "react";
 import { DockviewReact, themeAbyss } from "dockview-react";
+import { vmSingleton } from "./singleton.js";
 
 // Bumped to v2 when the "material" panel was removed (materials are edited only
 // through the Shader Graph now). A v1 layout can still contain a Material tab,
@@ -28,6 +29,8 @@ const PostprocessPanel = lazy(() => import("./panels/PostprocessPanel.jsx").then
 const PolyHavenPanel = lazy(() => import("./panels/PolyHavenPanel.jsx").then((m) => ({ default: m.PolyHavenPanel })));
 const AmbientCGPanel = lazy(() => import("./panels/AmbientCGPanel.jsx").then((m) => ({ default: m.AmbientCGPanel })));
 const SketchfabPanel = lazy(() => import("./panels/SketchfabPanel.jsx").then((m) => ({ default: m.SketchfabPanel })));
+const TerminalPanel = lazy(() => import("./panels/TerminalPanel.jsx").then((m) => ({ default: m.TerminalPanel })));
+const McpPanel = lazy(() => import("./panels/McpPanel.jsx").then((m) => ({ default: m.McpPanel })));
 
 /** Keep lazy loading local to one Dockview portal. A shared boundary around
  * Dockview would hide the entire editor whenever any heavy panel suspends. */
@@ -59,6 +62,8 @@ const panelComponents = {
   polyhaven: withPanelSuspense(PolyHavenPanel),
   ambientcg: withPanelSuspense(AmbientCGPanel),
   sketchfab: withPanelSuspense(SketchfabPanel),
+  terminal: withPanelSuspense(TerminalPanel),
+  mcp: withPanelSuspense(McpPanel),
 };
 const tabComponents = {
   console: withPanelSuspense(ConsoleTab, <span className="tab-loading">Console</span>),
@@ -82,7 +87,10 @@ export const PANEL_SPECS = {
   assets: { title: "Assets", position: { referencePanel: "viewport", direction: "below" }, initialHeight: 200 },
   console: { title: "Console", position: { referencePanel: "assets", direction: "within" } },
   shaderGraph: { title: "Shader Graph", position: { referencePanel: "assets", direction: "within" } },
-  particles: { title: "Particles", position: { referencePanel: "inspector", direction: "within" } },
+  // Node editors dock with Assets (the full-width strip under the viewport),
+  // NOT with the Inspector: the Inspector column is ~320px, and a graph fitted
+  // into 320px renders every node as an unreadable postage stamp.
+  particles: { title: "Particles", position: { referencePanel: "assets", direction: "within" } },
   animator: { title: "Animator", position: { referencePanel: "assets", direction: "within" } },
   sceneSettings: { title: "Scene Settings", position: { referencePanel: "inspector", direction: "within" } },
   projectSettings: { title: "Project Settings", position: { referencePanel: "inspector", direction: "within" } },
@@ -93,18 +101,38 @@ export const PANEL_SPECS = {
   polyhaven: { title: "Poly Haven", position: { referencePanel: "assets", direction: "within" } },
   ambientcg: { title: "AmbientCG", position: { referencePanel: "assets", direction: "within" } },
   sketchfab: { title: "Sketchfab", position: { referencePanel: "assets", direction: "within" } },
+  // Docks with the Assets strip: a terminal wants width for wrapped output and
+  // the CLIs draw full-width boxes, so the 320px Inspector column would render
+  // Claude unusable.
+  terminal: { title: "Terminal", position: { referencePanel: "assets", direction: "within" } },
+  // Docks with the Inspector column: it's a narrow status/settings surface,
+  // read at a glance rather than worked in.
+  mcp: { title: "Assistant (MCP)", position: { referencePanel: "inspector", direction: "within" } },
 };
 
-let dockApi = null;
-// Calls to `openPanel` made before Dockview fires `onReady` would otherwise
-// be silently dropped (and the user would see "panel didn't open" with no
-// obvious cause). We queue them here and flush in onDockReady, so clicking
-// an "Open Particle Editor" / "Edit Material" / "Edit Shader Graph" button
-// during the first paint still opens the panel once Dockview is ready.
-// Using a Set dedupes a flurry of clicks aimed at the same panel — the panel
-// only needs to be opened once, after which Dockview's "focus existing"
-// branch in openPanel handles subsequent toggles.
-const pendingOpenPanels = new Set();
+/**
+ * Dockview's API handle and the queue of opens made before it exists.
+ *
+ * VM-wide, and that is load-bearing rather than tidiness. These used to be
+ * module-scope `let`/`const`, which made them per-module-INSTANCE — and Vite
+ * evaluates this file more than once (an HMR update, or its `?t=<mtime>` URL
+ * twin). When that happened, the MenuBar imported a copy whose `api` was still
+ * null while the mounted Dockview had set it on the other copy. `openPanel`
+ * then took its "not ready yet" branch, parked the request in the queue and
+ * returned — so every View-menu click did NOTHING, with no error anywhere.
+ *
+ * That is the worst possible shape for a bug: silent, intermittent, and it
+ * looks like the menu is broken rather than like a stale module. See
+ * `singleton.js`; this is the same failure as the duplicated command bus.
+ */
+const dock = vmSingleton("dockState", () => ({
+  api: null,
+  // Calls to `openPanel` made before Dockview fires `onReady` would otherwise
+  // be silently dropped. We queue them here and flush in onDockReady, so
+  // clicking "Edit Material" / "Edit Shader Graph" during the first paint still
+  // opens the panel once Dockview is ready. A Set dedupes a flurry of clicks.
+  pending: new Set(),
+}));
 
 /**
  * Finds the id of a currently visible panel to use as a positioning
@@ -125,31 +153,106 @@ function isUsableAnchor(panel) {
   }
 }
 
+/** A group thinner/shorter than this is effectively invisible — a splitter
+ *  dragged shut, or a group restored at zero from a saved layout. */
+const MIN_GROUP_PX = 40;
+
+/**
+ * Brings `panel` genuinely into view.
+ *
+ * `setActive()` alone is not enough, and each of these states produces the
+ * exact same symptom the user sees — the click does nothing, silently, with no
+ * error — because activating a panel that cannot be painted is a legal no-op:
+ *
+ *   1. **Another group is maximized.** Dockview hides every other group while
+ *      one is maximized (double-clicking a tab does this, so it's easy to hit
+ *      by accident). The panel becomes active behind the maximized group.
+ *   2. **The group is a collapsed edge group.**
+ *   3. **The group is hidden.**
+ *   4. **The group has been sized to ~0** by dragging a splitter shut, or by a
+ *      saved layout that restored it that way.
+ *
+ * Each is checked and undone before activating.
+ */
 function revealPanel(panel) {
   const groupApi = panel?.group?.api;
-  if (groupApi && !groupApi.isVisible) groupApi.setVisible(true);
+  if (!groupApi) {
+    panel?.api?.setActive();
+    return;
+  }
+  try {
+    // (1) — exit someone else's maximized group, but never un-maximize the
+    // group we were asked to reveal.
+    if (dock.api?.hasMaximizedGroup?.() && !groupApi.isMaximized?.()) {
+      dock.api.exitMaximizedGroup();
+    }
+    if (groupApi.isCollapsed?.()) groupApi.expand?.(); // (2)
+    if (!groupApi.isVisible) groupApi.setVisible(true); // (3)
+  } catch (err) {
+    // Dockview throws from some of these when a group is in an odd location
+    // (popout windows, mid-drag). Activating is still worth attempting.
+    console.warn(`revealPanel(${panel.id}): ${err.message}`);
+  }
   panel.api.setActive();
+
+  // (4) — measured after activation, on the next frame, because the group's
+  // box is only meaningful once the layout has run.
+  requestAnimationFrame(() => {
+    try {
+      const box = panel.group?.api?.boundingBox;
+      if (!box) return;
+      const width = box.width < MIN_GROUP_PX ? Math.round(window.innerWidth * 0.3) : undefined;
+      const height = box.height < MIN_GROUP_PX ? Math.round(window.innerHeight * 0.35) : undefined;
+      if (width || height) panel.group.api.setSize({ width, height });
+    } catch {}
+  });
 }
 
 function pickVisibleAnchor() {
-  const active = dockApi.activePanel;
+  const active = dock.api.activePanel;
   if (isUsableAnchor(active)) return active;
-  for (const panel of dockApi.panels) {
+  for (const panel of dock.api.panels) {
     if (isUsableAnchor(panel)) return panel;
   }
   return null;
 }
 
+/**
+ * Is `id` a panel the user can currently see? True only when the panel exists,
+ * its group is on screen, and it is the active tab of that group — a panel
+ * sitting behind another tab is "open" to Dockview but invisible to the user,
+ * and revealing something in it would be a silent no-op.
+ *
+ * Used by features that want to *follow* the user's attention without stealing
+ * it (see assetReveal.js): they act when the panel is visible and do nothing
+ * when it isn't, rather than popping a panel open unasked.
+ */
+export function isPanelVisible(id) {
+  const panel = dock.api?.getPanel(id);
+  if (!panel) return false;
+  try {
+    if (dock.api.hasMaximizedGroup?.() && !panel.group?.api?.isMaximized?.()) return false;
+    if (!panel.group?.api?.isVisible) return false;
+    if (panel.group.api.isCollapsed?.()) return false;
+    if (panel.group.activePanel && panel.group.activePanel.id !== id) return false;
+    const box = panel.group.api.boundingBox;
+    if (box && (box.width < MIN_GROUP_PX || box.height < MIN_GROUP_PX)) return false;
+  } catch {
+    return false;
+  }
+  return true;
+}
+
 /** Opens any panel (focuses it if already present), even after it was closed. */
 export function openPanel(id) {
-  if (!dockApi) {
+  if (!dock.api) {
     // Dockview not yet mounted (typical during the first paint: heavy panels
     // like Viewport lazy-load three.js/WebGPU behind Suspense). Park the
     // request and flush it from onDockReady so the click isn't lost.
-    pendingOpenPanels.add(id);
+    dock.pending.add(id);
     return;
   }
-  const existing = dockApi.getPanel(id);
+  const existing = dock.api.getPanel(id);
   if (existing) {
     revealPanel(existing);
     return;
@@ -157,6 +260,18 @@ export function openPanel(id) {
   const spec = PANEL_SPECS[id];
   if (!spec) {
     console.warn(`openPanel(${id}) called with no matching PANEL_SPECS entry`);
+    return;
+  }
+  // The mounted Dockview holds whatever `panelComponents` existed when it was
+  // created. After a hot reload that ADDS a panel, the running instance has
+  // never heard of it and `addPanel` fails deep inside Dockview with a message
+  // that doesn't name the cause. Say the actual thing, since the fix is a
+  // reload and nothing else will hint at that.
+  if (!panelComponents[id]) {
+    console.error(
+      `openPanel(${id}): no panel component is registered under that id. ` +
+        "If this panel was added since the editor started, reload the window.",
+    );
     return;
   }
   const { position, ...rest } = spec;
@@ -175,7 +290,7 @@ export function openPanel(id) {
   //   (d) Spec position's anchor is hidden/missing → fall back to any
   //       currently visible panel as a "within" anchor so the panel still
   //       appears instead of silently failing. (This is the bugfix: the
-  //       old logic picked `dockApi.panels[0]`, which is the first panel
+  //       old logic picked `dock.api.panels[0]`, which is the first panel
   //       in serialization order and is often the very same hidden
   //       anchor the spec wanted — addPanel then no-ops without logging.)
   //   (e) No visible panels at all → leave options.position unset so
@@ -184,12 +299,12 @@ export function openPanel(id) {
     // (a)
   } else if (!position.referencePanel) {
     options.position = position; // (b)
-  } else if (isUsableAnchor(dockApi.getPanel(position.referencePanel))) {
+  } else if (isUsableAnchor(dock.api.getPanel(position.referencePanel))) {
     // Pass the live object. String ids restored from an older layout can point
     // at a hidden/stale group even though getPanel briefly resolves them.
     options.position = {
       ...position,
-      referencePanel: dockApi.getPanel(position.referencePanel),
+      referencePanel: dock.api.getPanel(position.referencePanel),
     }; // (c)
   } else if (pickVisibleAnchor()) {
     // (d) — log so future layout-fallback surprises are debuggable.
@@ -202,16 +317,33 @@ export function openPanel(id) {
     };
   }
   // (e) — no `options.position` set: addPanel docks to container edge.
-  const panel = dockApi.addPanel(options);
+  let panel;
+  try {
+    panel = dock.api.addPanel(options);
+  } catch (err) {
+    console.warn(`openPanel(${id}): addPanel with a position failed (${err.message}); docking to the container edge.`);
+  }
+  // Last resort: an anchor that looked usable can still be rejected (a group
+  // mid-drag, a popout window that has since closed). Retrying WITHOUT a
+  // position always docks to the container edge, which is ugly but visible —
+  // strictly better than the click appearing to do nothing.
+  if (!panel) {
+    try {
+      panel = dock.api.addPanel({ id, component: id, ...(options.tabComponent ? { tabComponent: options.tabComponent } : {}), title: spec.title });
+    } catch (err) {
+      console.error(`openPanel(${id}) failed: ${err.message}`);
+      return;
+    }
+  }
   revealPanel(panel);
 }
 
 /** Wipes the saved layout and rebuilds the default one. */
 export function resetLayout() {
-  if (!dockApi) return;
+  if (!dock.api) return;
   localStorage.removeItem(LAYOUT_KEY);
-  dockApi.clear();
-  buildDefaultLayout(dockApi);
+  dock.api.clear();
+  buildDefaultLayout(dock.api);
 }
 
 function buildDefaultLayout(api) {
@@ -249,7 +381,11 @@ function buildDefaultLayout(api) {
 
 function onDockReady(event) {
   const { api } = event;
-  dockApi = api;
+  dock.api = api;
+  // Same escape hatch ViewportPanel provides via `globalThis.__viewport`:
+  // layout bugs ("the panel didn't open") are only diagnosable from the live
+  // dock API, and harnesses need it to reproduce maximized/collapsed groups.
+  if (import.meta.env?.DEV) globalThis.__dockApi = api;
   let restored = false;
   try {
     const saved = localStorage.getItem(LAYOUT_KEY);
@@ -274,14 +410,14 @@ function onDockReady(event) {
   });
 
   // Flush any openPanel requests that came in while the dock was mounting.
-  // We copy first because openPanel itself is read-only on `dockApi` (it's
+  // We copy first because openPanel itself is read-only on `dock.api` (it's
   // set by the time we get here), but adding to a Set we're iterating over
   // would still be surprising — capturing the planned ids up-front and
   // clearing the queue keeps things deterministic if more clicks land during
   // the flush.
-  if (pendingOpenPanels.size > 0) {
-    const queued = [...pendingOpenPanels];
-    pendingOpenPanels.clear();
+  if (dock.pending.size > 0) {
+    const queued = [...dock.pending];
+    dock.pending.clear();
     for (const id of queued) openPanel(id);
   }
 }

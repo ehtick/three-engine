@@ -71,6 +71,7 @@ function buildEntities(engine, node, parent, idFor) {
   if (node.viewOnly) entity.setViewOnly(true);
   if (node.enabledInEditor === false) entity.setEnabledInEditor(false);
   if (node.enabledInGame === false) entity.setEnabledInGame(false);
+  if (node.tags?.length) entity.setTags(node.tags);
   tag(entity, node);
   for (const { type, props } of node.components ?? []) {
     try {
@@ -144,6 +145,7 @@ export function liveTree(entity, parentPath = null) {
     viewOnly: !!entity.viewOnly,
     enabledInEditor: entity.enabledInEditor !== false,
     enabledInGame: entity.enabledInGame !== false,
+    tags: [...(entity.tags ?? [])],
     instanceOf: entity.prefabSourceGuid,
     components: [...entity.components.values()].map((c) => {
       const { type, props } = c.toJSON();

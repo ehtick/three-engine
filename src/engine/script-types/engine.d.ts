@@ -1,31 +1,97 @@
 /**
  * Type declarations for the `engine` bare specifier. Scripts import from this
  * specifier (e.g. `import { attribute } from "engine"`); at runtime the editor
- * rewrites it to a blob URL exporting the actual implementation (see
- * `scriptRuntime.js`). This file makes the same surface visible to the TS
- * language service so editor autocomplete / type-checking works.
+ * rewrites it to the runtime proxy module's URL (see `scriptRuntime.js`). This
+ * file makes the same surface visible to the TS language service so editor
+ * autocomplete / type-checking works.
+ *
+ * ## three's types are re-exported, never redeclared
+ *
+ * Everything three owns — `Vector3`, `Object3D`, `Color`, … — is re-exported
+ * from `three/webgpu` below rather than described by hand. That is not a
+ * stylistic preference: this file used to hand-declare ~170 lines of three's
+ * math API, and it had silently drifted. It declared `Quaternion.inverse()`,
+ * which three renamed to `invert()` years ago, so anyone following
+ * autocomplete got a runtime crash. It also declared `Object3D` as a
+ * 14-member subset, which lies to the type system exactly when a script
+ * reaches for the three escape hatch.
+ *
+ * A re-export cannot drift. If three renames something, the error surfaces at
+ * `tsc` time against the real definition instead of in a user's game. Add
+ * nothing here that three already defines.
  */
 declare module "engine" {
   /**
-   * Subset of `three`'s Object3D that scripts typically use.
+   * three's real types, re-exported so `import { Vector3 } from "engine"`
+   * gives the identical type the engine itself uses. Mirrors the runtime
+   * exports in `scriptRuntime/runtime.js` — keep the two lists in sync.
+   *
+   * Scene-graph and rendering types are deliberately NOT re-exported here:
+   * entities own the scene graph, and wanting `Mesh` / `InstancedMesh` /
+   * materials / loaders means you want the escape hatch, which is a
+   * first-class option and fully typed:
+   *
+   *     import * as THREE from "three";
+   *     import { Fn, uniform } from "three/tsl";
+   *
+   * `Object3D` and `Camera` are exceptions, kept because `Entity.object3D`
+   * and the camera component expose them directly.
    */
-  export interface Object3D {
-    name: string;
-    position: Vector3;
-    rotation: Euler;
-    quaternion: Quaternion;
-    scale: Vector3;
-    visible: boolean;
-    userData: Record<string, unknown>;
-    parent: Object3D | null;
-    children: Object3D[];
-    layers: { mask: number; enable(index: number): void };
-    lookAt(target: Vector3 | Object3D): void;
-    getWorldPosition(target: Vector3): Vector3;
-    getWorldQuaternion(target: Quaternion): Quaternion;
-    getWorldScale(target: Vector3): Vector3;
-    traverse(fn: (obj: Object3D) => void): void;
-  }
+  // Imported (not just re-exported) so the declarations further down this file
+  // can reference the real types: `export ... from` creates no local binding.
+  import {
+    Vector2,
+    Vector3,
+    Vector4,
+    Quaternion,
+    Euler,
+    Matrix3,
+    Matrix4,
+    Color,
+    Box2,
+    Box3,
+    Sphere,
+    Plane,
+    Ray,
+    Raycaster,
+    Frustum,
+    Line3,
+    Triangle,
+    Spherical,
+    Cylindrical,
+    MathUtils,
+    Clock,
+    Layers,
+    Object3D,
+    Camera,
+  } from "three/webgpu";
+
+  export {
+    Vector2,
+    Vector3,
+    Vector4,
+    Quaternion,
+    Euler,
+    Matrix3,
+    Matrix4,
+    Color,
+    Box2,
+    Box3,
+    Sphere,
+    Plane,
+    Ray,
+    Raycaster,
+    Frustum,
+    Line3,
+    Triangle,
+    Spherical,
+    Cylindrical,
+    MathUtils,
+    Clock,
+    Layers,
+    Object3D,
+    Camera,
+  };
 
   /**
    * Subset of the runtime `Entity` class. Transform properties and the most
@@ -70,6 +136,24 @@ declare module "engine" {
     getComponent<K extends keyof ComponentMap>(type: K): ComponentMap[K] | undefined;
     getComponent<T = unknown>(type: string): T | undefined;
     removeComponent(type: string): void;
+
+    /**
+     * A script on this entity by class name, file stem, or asset path — the
+     * usual way one behaviour talks to another:
+     *
+     *     const health = this.entity.getScript<Health>("Health");
+     *     health?.damage(10);
+     */
+    getScript<T = Script>(name: string): T | null;
+
+    /**
+     * Calls `hook` on every script attached to this entity, returning true if
+     * any handled it. Lets scripts signal each other without knowing what else
+     * is attached:
+     *
+     *     this.entity.dispatch("onDamaged", amount);
+     */
+    dispatch(hook: string, ...args: unknown[]): boolean;
     setParent(parent: Entity | null): void;
     traverse(fn: (entity: Entity) => void): void;
     getTransform(): {
@@ -260,6 +344,40 @@ declare module "engine" {
     rigidbody: RigidbodyComponent;
     collider: ColliderComponent;
     character: CharacterControllerComponent;
+    script: ScriptComponent;
+  }
+
+  /** One entry in a script component's list. */
+  export interface ScriptSlot {
+    /** Project-relative path to the `.js` / `.ts` file. */
+    path: string;
+    /** Per-script toggle. A disabled script keeps its attribute values. */
+    enabled?: boolean;
+    /** Saved `@attribute` values, keyed by field name. */
+    attributes?: Record<string, unknown>;
+  }
+
+  /**
+   * Holds the list of scripts attached to an entity. Array order is execution
+   * order.
+   *
+   * Reach a sibling script through `getScript` rather than by index — indices
+   * shift when someone reorders the list in the inspector:
+   *
+   *     const health = this.entity.getScript("Health");
+   */
+  export interface ScriptComponent extends ComponentBase {
+    props: { scripts: ScriptSlot[]; enabled?: boolean; viewOnly?: boolean };
+    /** Live instances, in execution order. Includes disabled scripts. */
+    readonly instances: Script[];
+    /** First instance. Prefer `getScript` when several are attached. */
+    readonly instance: Script | null;
+    /** By class name, file stem, or full asset path; null when absent. */
+    getScript<T = Script>(name: string): T | null;
+    /** Calls `hook` on every running script that defines it. */
+    dispatch(hook: string, ...args: unknown[]): boolean;
+    /** `@attribute` descriptors declared by the script at `index`. */
+    getAttributeDefs(index?: number): Record<string, AttributeOptions>;
   }
 
   /** Union of every value shape an action can carry, for callers that don't
@@ -574,126 +692,17 @@ declare module "engine" {
     ): Entity | null;
   }
 
-  // Minimal three.js surface scripts reach into. Mirrors the subset of the
-  // three/webgpu build actually used by `engine/Engine.js` and scripts.
-  export class Vector2 {
-    constructor(x?: number, y?: number);
-    x: number; y: number;
-    set(x: number, y: number): this;
-    copy(v: Vector2): this;
-    clone(): Vector2;
-    add(v: Vector2): this;
-    sub(v: Vector2): this;
-    multiplyScalar(s: number): this;
-    divideScalar(s: number): this;
-    length(): number;
-    lengthSq(): number;
-    normalize(): this;
-    dot(v: Vector2): number;
-    distanceTo(v: Vector2): number;
-    lerp(v: Vector2, alpha: number): this;
-    toArray(): [number, number];
-    fromArray(arr: ArrayLike<number>): this;
-    equals(v: Vector2): boolean;
-    static distance(a: Vector2, b: Vector2): number;
-  }
-  export class Vector3 {
-    constructor(x?: number, y?: number, z?: number);
-    x: number; y: number; z: number;
-    set(x: number, y: number, z: number): this;
-    copy(v: Vector3): this;
-    clone(): Vector3;
-    add(v: Vector3): this;
-    sub(v: Vector3): this;
-    multiplyScalar(s: number): this;
-    divideScalar(s: number): this;
-    length(): number;
-    lengthSq(): number;
-    normalize(): this;
-    dot(v: Vector3): number;
-    cross(v: Vector3): this;
-    distanceTo(v: Vector3): number;
-    lerp(v: Vector3, alpha: number): this;
-    applyEuler(e: Euler): this;
-    applyQuaternion(q: Quaternion): this;
-    toArray(): [number, number, number];
-    fromArray(arr: ArrayLike<number>): this;
-    equals(v: Vector3): boolean;
-    static distance(a: Vector3, b: Vector3): number;
-  }
-  export class Euler {
-    constructor(x?: number, y?: number, z?: number, order?: string);
-    x: number; y: number; z: number; order: string;
-    set(x: number, y: number, z: number, order?: string): this;
-    toArray(): [number, number, number];
-  }
-  export class Quaternion {
-    constructor(x?: number, y?: number, z?: number, w?: number);
-    x: number; y: number; z: number; w: number;
-    set(x: number, y: number, z: number, w: number): this;
-    identity(): this;
-    copy(q: Quaternion): this;
-    clone(): Quaternion;
-    setFromAxisAngle(axis: Vector3, angle: number): this;
-    setFromEuler(euler: Euler): this;
-    inverse(): this;
-    multiply(q: Quaternion): this;
-    slerp(qb: Quaternion, t: number): this;
-    toArray(): [number, number, number, number];
-  }
-  export class Matrix4 {
-    constructor();
-    identity(): this;
-    copy(m: Matrix4): this;
-    clone(): Matrix4;
-    compose(position: Vector3, quaternion: Quaternion, scale: Vector3): this;
-    decompose(position: Vector3, quaternion: Quaternion, scale: Vector3): this;
-    invert(): this;
-    multiply(m: Matrix4): this;
-    elements: number[];
-  }
-  export class Color {
-    constructor(color?: string | number | Color);
-    r: number; g: number; b: number;
-    set(value: string | number | Color): this;
-    copy(c: Color): this;
-    setRGB(r: number, g: number, b: number): this;
-    multiplyScalar(s: number): this;
-    lerp(c: Color, alpha: number): this;
-    getHex(): number;
-    getHexString(): string;
-  }
-  export class Camera {
-    isPerspectiveCamera: boolean;
-    aspect: number;
-    near: number; far: number;
-    updateProjectionMatrix(): void;
-  }
-  export const MathUtils: {
-    clamp(v: number, min: number, max: number): number;
-    lerp(x: number, y: number, t: number): number;
-    degToRad(d: number): number;
-    radToDeg(r: number): number;
-    randFloat(low: number, high: number): number;
-    randInt(low: number, high: number): number;
-  };
-
-  /** Three namespace surface scripts reach into (aliases the engine's three import). */
-  export const THREE: {
-    Vector2: typeof Vector2;
-    Vector3: typeof Vector3;
-    Euler: typeof Euler;
-    Quaternion: typeof Quaternion;
-    Matrix4: typeof Matrix4;
-    Color: typeof Color;
-    /** Object3D is interface-only in this declaration file — we don't ship a
-     *  concrete class for it. Scripts typically use the typed accessors on
-     *  `Entity` (`.position`, `.rotation`, …) instead. */
-    Object3D: unknown;
-    Camera: typeof Camera;
-    MathUtils: typeof MathUtils;
-    REVISION: string;
-  };
+  /**
+   * The three namespace as `this.THREE` exposes it — the real thing, not a
+   * subset. `ScriptComponent` injects the engine's own three import, so this
+   * is typed as that entire module.
+   *
+   * This used to be a 12-entry object type with `Object3D: unknown` in it.
+   * Prefer a top-level `import * as THREE from "three"` in new scripts;
+   * `this.THREE` predates the runtime being able to resolve bare specifiers
+   * and is kept because existing scripts use it.
+   */
+  export const THREE: typeof import("three/webgpu");
 
   /**
    * Schema for an `@attribute`-decorated field. The editor reads this off the
@@ -737,9 +746,35 @@ declare module "engine" {
     THREE: typeof THREE;
     input: InputManager | null;
 
+    /** Called when play starts (or when this script is enabled during play). */
     onStart?(): void;
+    /** Called once per frame while playing. `dt` is in seconds. */
     onUpdate?(dt: number): void;
+    /** Called when play stops, the script is disabled, or it is removed. */
     onDestroy?(): void;
+    /**
+     * Called instead of destroy/start when the file changes while playing.
+     * Copy state across from `oldInstance` to survive the reload.
+     */
     onHotReload?(oldInstance: Script): void;
+
+    // --- hooks other systems dispatch -------------------------------------
+    // These reach every script on the entity (see ScriptComponent.dispatch),
+    // so several scripts can react to the same collision or click.
+
+    /** Physics module: a non-sensor collider began touching `other`. */
+    onCollisionEnter?(other: Entity): void;
+    /** Physics module: a non-sensor collider stopped touching `other`. */
+    onCollisionExit?(other: Entity): void;
+    /** Physics module: `other` entered a sensor collider on this entity. */
+    onTriggerEnter?(other: Entity): void;
+    /** Physics module: `other` left a sensor collider on this entity. */
+    onTriggerExit?(other: Entity): void;
+    /** UI button on this entity was clicked. */
+    onClick?(): void;
+    /** Pointer entered this entity's UI button. */
+    onPointerEnter?(): void;
+    /** Pointer left this entity's UI button. */
+    onPointerExit?(): void;
   }
 }

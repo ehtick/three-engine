@@ -21,6 +21,7 @@
  */
 import JSZip from "jszip";
 import { buildPbrGraph } from "./pbrMaterialGraph.js";
+import { writeBinaryFile } from "./assetLoader.js";
 
 export { buildPbrGraph };
 
@@ -262,7 +263,7 @@ async function ensureDownloadDir() {
 }
 
 async function writeBinary(path, bytes) {
-  await invoke("write_binary_file", { path, contents: Array.from(bytes) });
+  await writeBinaryFile(path, bytes);
 }
 
 async function writeText(path, contents) {

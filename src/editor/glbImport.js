@@ -1,8 +1,8 @@
-import { toBlobUrl } from "./assetLoader.js";
+import { toBlobUrl, writeBinaryFile } from "./assetLoader.js";
 import { useProjectStore, basename } from "./store/projectStore.js";
 import { useAssetProcessingStore } from "./store/assetProcessingStore.js";
 import { MATERIAL_DEFAULTS } from "../engine/materialAsset.js";
-import { GEOMETRY_ASSET_VERSION } from "../engine/geometryAsset.js";
+import { GEOMETRY_BINARY_VERSION, encodeGeometryAsset } from "../engine/geometryAsset.js";
 import { createGltfLoader } from "../engine/gltfLoader.js";
 import { buildPbrGraph } from "./pbrMaterialGraph.js";
 import { buildMeshEntities, buildBoneEntities } from "./rigPrefab.js";
@@ -35,9 +35,60 @@ async function invoke(cmd, args) {
   return invoke(cmd, args);
 }
 
+/**
+ * How many asset writes may be in flight at once.
+ *
+ * Each write is one IPC round-trip that spends nearly all its time waiting on
+ * the Rust side, so issuing them one at a time made a several-hundred-mesh
+ * import latency-bound. The cap keeps peak memory (each in-flight write holds
+ * its encoded payload) and Basis' CPU use bounded.
+ */
+const WRITE_CONCURRENCY = 8;
+
+/** `Promise.all(items.map(fn))` with at most `limit` running concurrently. */
+async function mapLimit(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const index = next++;
+      results[index] = await fn(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 const stemOf = (name) => name.replace(/\.[^.]+$/, "");
 const safeName = (name) => name.replace(/[^\w\- ]+/g, "_").trim() || "Unnamed";
 const round6 = (v) => Math.round(v * 1e6) / 1e6;
+
+/**
+ * Writes a `virtualGeometry` .meta sidecar for a freshly-imported .geom when
+ * the Virtual Geometry module is enabled and configured to auto-enable — so
+ * dense meshes render through cluster LOD without a manual trip to the asset
+ * inspector. Light meshes (below the module's triangle threshold) are left
+ * alone: cluster LOD is pure overhead on them. Best-effort; never blocks import.
+ */
+async function maybeAutoEnableVirtualGeometry(geomPath, triangleCount) {
+  try {
+    const { useModulesStore, getModuleSettings } = await import("./modules.js");
+    if (!useModulesStore.getState().enabled.includes("virtual-geometry")) return;
+    const s = await getModuleSettings("virtual-geometry");
+    if (!s.autoEnableOnImport) return;
+    if (triangleCount < (s.minTriangles ?? 0)) return;
+    const meta = {
+      virtualGeometry: {
+        enabled: true,
+        pixelError: s.pixelError ?? 1,
+        hysteresis: s.hysteresis ?? 0.02,
+      },
+    };
+    await invoke("save_scene", { path: `${geomPath}.meta`, contents: JSON.stringify(meta, null, 2) });
+  } catch (err) {
+    console.warn(`Virtual geometry auto-enable skipped for ${geomPath}: ${err.message ?? err}`);
+  }
+}
 
 /** First "name", "name 1", … not present in the directory listing. */
 async function uniqueChildName(dir, name) {
@@ -72,40 +123,68 @@ async function textureToPng(texture) {
 
 const colorHex = (color) => `#${color?.getHexString?.() ?? "ffffff"}`;
 
-/** Serializes a BufferGeometry to the .geom JSON shape (authored normals kept). */
+/**
+ * Copies a BufferAttribute's values into a tightly packed typed array.
+ *
+ * glTF optimizers commonly interleave tangent/color/skin attributes.
+ * InterleavedBufferAttribute exposes its storage through `.data.array`, not
+ * `.array`, and its values are strided — reading the raw array would pick up
+ * neighbouring attributes' bytes.
+ *
+ * Values are copied verbatim. The previous writer rounded every component to
+ * six decimals, which existed purely to keep the JSON text smaller; the binary
+ * container has no such pressure, so imported meshes now keep the exact floats
+ * the artist exported.
+ */
+function attributeArray(attribute, ArrayType) {
+  const source = attribute.array ?? attribute.data?.array;
+  if (!source) throw new Error("Unsupported vertex attribute storage");
+  const { itemSize, count } = attribute;
+  const interleaved = !!attribute.isInterleavedBufferAttribute;
+  // Already exactly what we want: hand the buffer straight through.
+  if (!interleaved && source instanceof ArrayType && source.length === count * itemSize) {
+    return source;
+  }
+  const stride = interleaved ? attribute.data.stride : itemSize;
+  const offset = interleaved ? attribute.offset : 0;
+  const out = new ArrayType(count * itemSize);
+  for (let i = 0; i < count; i++) {
+    const from = i * stride + offset;
+    const to = i * itemSize;
+    for (let component = 0; component < itemSize; component++) {
+      out[to + component] = source[from + component];
+    }
+  }
+  return out;
+}
+
+/** Serializes a BufferGeometry to the .geom definition shape (authored normals kept). */
 function geometryAssetFromMesh(geometry) {
   const position = geometry.getAttribute("position");
   const normal = geometry.getAttribute("normal");
   const uv = geometry.getAttribute("uv");
-  const read = (attr, components) => {
-    const out = new Array(attr.count * components);
-    for (let i = 0; i < attr.count; i++) {
-      out[i * components] = round6(attr.getX(i));
-      if (components > 1) out[i * components + 1] = round6(attr.getY(i));
-      if (components > 2) out[i * components + 2] = round6(attr.getZ(i));
-    }
-    return out;
-  };
+  const vertexCount = position.count;
+  const IndexType = vertexCount > 65535 ? Uint32Array : Uint16Array;
+
+  let indices;
+  if (geometry.index) {
+    indices = attributeArray(geometry.index, IndexType);
+  } else {
+    // Non-indexed primitive: the .geom shape is always indexed, so emit the
+    // trivial 0..n-1 index run.
+    indices = new IndexType(vertexCount);
+    for (let i = 0; i < vertexCount; i++) indices[i] = i;
+  }
+
   const attributeAsset = (attribute) => {
-    // glTF optimizers commonly interleave tangent/color/skin attributes.
-    // InterleavedBufferAttribute exposes its storage through `.data.array`,
-    // not `.array`; serializing the latter aborted the entire import after
-    // materials/textures had already been written.
     const source = attribute.array ?? attribute.data?.array;
     if (!source) throw new Error("Unsupported vertex attribute storage");
-    const stride = attribute.isInterleavedBufferAttribute ? attribute.data.stride : attribute.itemSize;
-    const offset = attribute.isInterleavedBufferAttribute ? attribute.offset : 0;
-    const array = new Array(attribute.count * attribute.itemSize);
-    for (let i = 0; i < attribute.count; i++) {
-      for (let component = 0; component < attribute.itemSize; component++) {
-        array[i * attribute.itemSize + component] = round6(source[i * stride + offset + component]);
-      }
-    }
+    const ArrayType = source.constructor;
     return {
       itemSize: attribute.itemSize,
       normalized: !!attribute.normalized,
-      arrayType: source.constructor.name,
-      array,
+      arrayType: ArrayType.name,
+      array: attributeArray(attribute, ArrayType),
     };
   };
   const attributes = {};
@@ -119,13 +198,11 @@ function geometryAssetFromMesh(geometry) {
     morphAttributes[name] = targets.map(attributeAsset);
   }
   return {
-    version: GEOMETRY_ASSET_VERSION,
-    positions: read(position, 3),
-    indices: geometry.index
-      ? Array.from(geometry.index.array)
-      : Array.from({ length: position.count }, (_, i) => i),
-    uvs: uv ? read(uv, 2) : [],
-    normals: normal ? read(normal, 3) : [],
+    version: GEOMETRY_BINARY_VERSION,
+    positions: attributeArray(position, Float32Array),
+    indices,
+    uvs: uv ? attributeArray(uv, Float32Array) : null,
+    normals: normal ? attributeArray(normal, Float32Array) : null,
     attributes,
     morphAttributes,
     morphTargetsRelative: !!geometry.morphTargetsRelative,
@@ -173,26 +250,34 @@ async function unpackGlbImpl(glbPath, { assetStem = null, cleanupPaths = [] } = 
     }
   });
 
-  const textureFiles = new Map(); // texture uuid -> project path
-  const writeTexture = async (texture, fallbackName, { srgb = false } = {}) => {
-    if (textureFiles.has(texture.uuid)) return textureFiles.get(texture.uuid);
-    const bytes = await textureToPng(texture);
-    if (!bytes) return "";
-    const name = safeName(texture.name || texture.image?.name || fallbackName);
-    const path = `${folder}/Textures/${name}.png`;
-    await invoke("write_binary_file", { path, contents: Array.from(bytes) });
-    // glTF UVs have a top-left origin; loaders must not flip these images.
-    // Data maps (normal/rough/metal/AO) must not be sRGB-decoded either.
-    await invoke("save_scene", {
-      path: `${path}.meta`,
-      contents: JSON.stringify({ flipY: false, colorSpace: srgb ? "srgb" : "linear" }, null, 2),
-    });
-    const { autoCompressTexture } = await import("./basisCompress.js");
-    await autoCompressTexture(path).catch((err) =>
-      console.warn(`Basis compression skipped for ${name}: ${err.message ?? err}`),
-    );
-    textureFiles.set(texture.uuid, path);
-    return path;
+  // uuid -> in-flight-or-settled promise of the written path. Memoizing the
+  // PROMISE (not the resolved path) is what makes it safe to extract several
+  // materials concurrently: two materials sharing an image await the same
+  // single write instead of racing to produce the same file twice.
+  const textureFiles = new Map();
+  const writeTexture = (texture, fallbackName, { srgb = false } = {}) => {
+    const cached = textureFiles.get(texture.uuid);
+    if (cached) return cached;
+    const pending = (async () => {
+      const bytes = await textureToPng(texture);
+      if (!bytes) return "";
+      const name = safeName(texture.name || texture.image?.name || fallbackName);
+      const path = `${folder}/Textures/${name}.png`;
+      await writeBinaryFile(path, bytes);
+      // glTF UVs have a top-left origin; loaders must not flip these images.
+      // Data maps (normal/rough/metal/AO) must not be sRGB-decoded either.
+      await invoke("save_scene", {
+        path: `${path}.meta`,
+        contents: JSON.stringify({ flipY: false, colorSpace: srgb ? "srgb" : "linear" }, null, 2),
+      });
+      const { autoCompressTexture } = await import("./basisCompress.js");
+      await autoCompressTexture(path).catch((err) =>
+        console.warn(`Basis compression skipped for ${name}: ${err.message ?? err}`),
+      );
+      return path;
+    })();
+    textureFiles.set(texture.uuid, pending);
+    return pending;
   };
 
   // One .mat per GLTF material, with every extractable PBR map wired into a
@@ -200,7 +285,11 @@ async function unpackGlbImpl(glbPath, { assetStem = null, cleanupPaths = [] } = 
   // image — same layout as an `arm` map; its R channel is occlusion only when
   // the material's own aoMap points at the same image.
   const materialPaths = new Map(); // material -> .mat path
-  for (const [mat, name] of materials) {
+  // Materials are independent of each other, and each one spends its time
+  // waiting on image encodes and file writes rather than on CPU. Running them
+  // concurrently (shared textures deduped by the promise cache above) turns the
+  // slowest part of a texture-heavy import from a sum into a max.
+  await mapLimit([...materials], WRITE_CONCURRENCY, async ([mat, name]) => {
     const maps = {};
     if (mat.map) maps.diffuse = await writeTexture(mat.map, `${name} diffuse`, { srgb: true });
     if (mat.normalMap) maps.normal = await writeTexture(mat.normalMap, `${name} normal`);
@@ -262,7 +351,7 @@ async function unpackGlbImpl(glbPath, { assetStem = null, cleanupPaths = [] } = 
     const matPath = `${folder}/Materials/${name}.mat`;
     await invoke("save_scene", { path: matPath, contents: JSON.stringify(def, null, 2) });
     materialPaths.set(mat, matPath);
-  }
+  });
 
   const { makeDef, newFid } = await import("../engine/index.js");
   let prefabRoot;
@@ -272,19 +361,23 @@ async function unpackGlbImpl(glbPath, { assetStem = null, cleanupPaths = [] } = 
   // Geometry is extracted for both static and skeletal meshes. Skeletal
   // models retain the GLB only as the owner of their skeleton and clips.
   const geomNames = new Set();
-  const geometryFor = async (mesh) => {
+  /** Reserves this mesh's unique `.geom` path. Synchronous, so it stays correct
+   *  when the writes below run concurrently. */
+  const geometryPathFor = (mesh) => {
     const base = safeName(mesh.name || "Mesh");
     let name = base;
     for (let i = 1; geomNames.has(name); i++) name = `${base} ${i}`;
     geomNames.add(name);
-    const path = `${folder}/Geometry/${name}.geom`;
+    return `${folder}/Geometry/${name}.geom`;
+  };
+  const geometryFor = async (mesh, path = geometryPathFor(mesh)) => {
     let definition;
     try {
       definition = geometryAssetFromMesh(mesh.geometry);
     } catch (error) {
       throw new Error(`Could not extract geometry "${mesh.name || "Mesh"}": ${error.message ?? error}`);
     }
-    await invoke("save_scene", { path, contents: JSON.stringify(definition) });
+    await writeBinaryFile(path, encodeGeometryAsset(definition));
     geometryCount++;
     return path;
   };
@@ -295,16 +388,27 @@ async function unpackGlbImpl(glbPath, { assetStem = null, cleanupPaths = [] } = 
     const meshAssets = new Map(); // mesh -> { geometryAsset, material }
     const meshes = [];
     gltf.scene.traverse((obj) => obj.isMesh && meshes.push(obj));
+    // Names/paths are reserved up front (synchronously, so they stay unique and
+    // deterministic), then the writes run concurrently. A dense model is
+    // hundreds of meshes, and doing one IPC round-trip at a time made the
+    // import latency-bound rather than work-bound.
     for (const mesh of meshes) {
       const mat = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
       if (Array.isArray(mesh.material) && mesh.material.length > 1) {
         console.warn(`"${mesh.name}": multi-material mesh — using "${mat?.name}" for all faces`);
       }
       meshAssets.set(mesh, {
-        geometryAsset: await geometryFor(mesh),
+        geometryAsset: geometryPathFor(mesh),
         material: materialPaths.get(mat) ?? "",
       });
     }
+    await mapLimit(meshes, WRITE_CONCURRENCY, async (mesh) => {
+      const { geometryAsset } = meshAssets.get(mesh);
+      await geometryFor(mesh, geometryAsset);
+      const geo = mesh.geometry;
+      const tris = (geo.index?.count ?? geo.getAttribute("position")?.count ?? 0) / 3;
+      await maybeAutoEnableVirtualGeometry(geometryAsset, tris);
+    });
 
     const nodeFor = (obj) => {
       const children = obj.children.map(nodeFor).filter(Boolean);
@@ -366,7 +470,10 @@ async function unpackGlbImpl(glbPath, { assetStem = null, cleanupPaths = [] } = 
     const geometryPaths = new Map();
     const rigMeshes = [];
     gltf.scene.traverse((object) => object.isMesh && rigMeshes.push(object));
-    for (const mesh of rigMeshes) geometryPaths.set(mesh, await geometryFor(mesh));
+    for (const mesh of rigMeshes) geometryPaths.set(mesh, geometryPathFor(mesh));
+    await mapLimit(rigMeshes, WRITE_CONCURRENCY, (mesh) =>
+      geometryFor(mesh, geometryPaths.get(mesh)),
+    );
 
     const meshNodes = buildMeshEntities(
       gltf.scene,

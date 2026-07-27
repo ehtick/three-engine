@@ -1,6 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
-import { Boxes, ChevronDown, Search, Tag } from "lucide-react";
-import { useModulesStore, listModuleDefinitions, setModuleEnabled } from "../modules.js";
+import { Boxes, ChevronDown, Search, Sliders, Tag } from "lucide-react";
+import {
+  useModulesStore,
+  listModuleDefinitions,
+  setModuleEnabled,
+  getModuleSettings,
+  saveModuleSettings,
+} from "../modules.js";
 import { usePlayStore } from "../store/playStore.js";
 import { useProjectStore } from "../store/projectStore.js";
 
@@ -267,6 +273,79 @@ export function ModulesPanel() {
   );
 }
 
+/**
+ * Editable project-level defaults for a module that declares a `settings`
+ * schema (see the module definition). Persists into project.json and pushes
+ * runtime-affecting values onto the live engine via the module's
+ * applySettings(). Field descriptors carry type/min/max/step/help.
+ */
+function ModuleSettings({ def }) {
+  const hasProject = useProjectStore((s) => !!s.rootPath);
+  const [values, setValues] = useState(null);
+
+  useEffect(() => {
+    let live = true;
+    setValues(null);
+    getModuleSettings(def.id)
+      .then((v) => live && setValues(v))
+      .catch((err) => console.error(`Module settings: ${err.message ?? err}`));
+    return () => { live = false; };
+  }, [def.id]);
+
+  if (!values) return null;
+
+  const patch = (p) => {
+    setValues((v) => ({ ...v, ...p }));
+    saveModuleSettings(def.id, p).catch((err) => console.error(`Module settings: ${err.message ?? err}`));
+  };
+
+  const commitNumber = (field, raw) => {
+    let value = field.type === "int" ? parseInt(raw, 10) : parseFloat(raw);
+    if (!Number.isFinite(value)) return;
+    if (field.min != null) value = Math.max(field.min, value);
+    if (field.max != null) value = Math.min(field.max, value);
+    if (value !== values[field.key]) patch({ [field.key]: value });
+  };
+
+  return (
+    <section className="modules-detail-section">
+      <div className="modules-detail-section-label">
+        <Sliders size={11} />
+        <span>Default settings</span>
+      </div>
+      {def.settings.map((field) => (
+        <div className="field-row" key={field.key} title={field.help}>
+          <span className="field-label">{field.label}</span>
+          {field.type === "bool" ? (
+            <input
+              type="checkbox"
+              checked={!!values[field.key]}
+              onChange={(e) => patch({ [field.key]: e.target.checked })}
+            />
+          ) : (
+            <input
+              className="number-field"
+              type="number"
+              min={field.min}
+              max={field.max}
+              step={field.step ?? 1}
+              key={`${field.key}-${values[field.key]}`}
+              defaultValue={values[field.key]}
+              onBlur={(e) => commitNumber(field, e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()}
+            />
+          )}
+        </div>
+      ))}
+      <div className="asset-hint">
+        {hasProject
+          ? "Defaults apply to newly imported assets and this project's runtime."
+          : "Open a project for these defaults to persist."}
+      </div>
+    </section>
+  );
+}
+
 function ModuleDetail({ def, on, busy, disabledReason, onToggle }) {
   const components = def.components ?? [];
   // Aggregate every tag from the components on this module so the user can
@@ -306,6 +385,8 @@ function ModuleDetail({ def, on, busy, disabledReason, onToggle }) {
       </header>
 
       <p className="modules-detail-desc">{def.description}</p>
+
+      {def.settings?.length > 0 && <ModuleSettings def={def} />}
 
       {def.tags?.length > 0 && (
         <section className="modules-detail-section">

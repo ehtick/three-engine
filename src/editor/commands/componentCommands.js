@@ -37,13 +37,16 @@ export class RemoveComponentCommand {
 }
 
 export class SetComponentPropCommand {
-  constructor(entityId, type, key, value) {
+  /** `label` overrides the undo-history entry — useful when one prop backs
+   *  several distinct user actions (the scripts list is added to, reordered,
+   *  toggled and removed from, all by writing `scripts`). */
+  constructor(entityId, type, key, value, label) {
     this.entityId = entityId;
     this.type = type;
     this.key = key;
     this.value = value;
     this.oldValue = engine.getEntity(entityId)?.getComponent(type)?.props[key];
-    this.label = `Set ${key}`;
+    this.label = label ?? `Set ${key}`;
   }
 
   do() {

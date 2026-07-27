@@ -1,55 +1,61 @@
 /**
- * Pass-through proxy for `three/webgpu` reachable from user scripts loaded
- * via blob URL.
+ * The `three/webgpu` surface as user scripts see it.
  *
- * The runtime is shipped as a `data:` URL (Vite inlines `new URL(...)`
- * references at build time). A `data:` URL has no module-resolution base,
- * so this file CANNOT use `import ... from "three/webgpu"` itself — the
- * inner imports would fail when the blob is loaded. Instead we read the
- * three.js surface from `globalThis.__ENGINE_THREE__`, which the engine
- * populates once at startup. The result is identical to the real
- * `three/webgpu` (same constructors, same singletons).
+ * `linkEngineImports` rewrites `"three"`, `"three/webgpu"` and `"three/webgpu"`
+ * imports in user scripts to this module's URL. It is a plain re-export, so
+ * scripts get the WHOLE three surface — every class, every helper, whatever
+ * version the engine is built against — with no allowlist to maintain.
  *
- * User scripts that want the namespace idiom can keep writing
- * `import * as THREE from "three/webgpu"` — `linkEngineImports` rewrites
- * that to `from "<this-file-data-url>"`. Both `import { Vector3 }` and
- * `import * as THREE` resolve to the same three instance the engine uses.
+ * ## Why a re-export and not a hand-written list
+ *
+ * This file used to enumerate ~28 classes read off `globalThis.__ENGINE_THREE__`,
+ * because the module was shipped as a `data:` URL (Vite inlines
+ * `new URL('./x.js', import.meta.url)` at build time) and a data URL has no
+ * module-resolution base — so it could not `import` three itself.
+ *
+ * The consequence was that `import { InstancedMesh } from "three/webgpu"` in a
+ * user script silently evaluated to `undefined`, while
+ * `import THREE from "three/webgpu"` (the default) handed back the entire
+ * namespace. A 1%-complete wrapper that disagreed with itself.
+ *
+ * `scriptRuntime.js` now resolves this module's URL by dynamically importing
+ * it and reading `__SELF_URL__` below, which makes it a real chunk at a real
+ * http(s) URL with working module resolution. See that file for the details.
+ *
+ * ## Single instance
+ *
+ * Both this module and the engine import the bare `"three/webgpu"` specifier,
+ * so the bundler (or Vite's dep pre-bundling in dev) hands both the same
+ * module instance. User-script classes are therefore the same constructors the
+ * engine uses — `instanceof` works across the boundary and there is no
+ * duplicate three in the bundle.
+ *
+ * `"three"` is deliberately mapped here too rather than to the plain three
+ * build. `three` and `three/webgpu` are separate module instances with
+ * separate class identities; letting a script import the former would produce
+ * a second copy of three whose `Vector3` is not the engine's `Vector3`. The
+ * webgpu build is a superset, so pointing both specifiers here is both safe
+ * and the only way to keep one instance.
  */
-const T = globalThis.__ENGINE_THREE__;
-if (!T) {
-  throw new Error(
-    "threeRuntime: globalThis.__ENGINE_THREE__ is not set. " +
-      "The engine must finish booting before user scripts run.",
-  );
-}
+export * from "three/webgpu";
 
-export const Vector2 = T.Vector2;
-export const Vector3 = T.Vector3;
-export const Euler = T.Euler;
-export const Quaternion = T.Quaternion;
-export const Matrix4 = T.Matrix4;
-export const Color = T.Color;
-export const Object3D = T.Object3D;
-export const Camera = T.Camera;
-export const MathUtils = T.MathUtils;
-export const Mesh = T.Mesh;
-export const Group = T.Group;
-export const Scene = T.Scene;
-export const PerspectiveCamera = T.PerspectiveCamera;
-export const OrthographicCamera = T.OrthographicCamera;
-export const DirectionalLight = T.DirectionalLight;
-export const AmbientLight = T.AmbientLight;
-export const PointLight = T.PointLight;
-export const SpotLight = T.SpotLight;
-export const HemisphereLight = T.HemisphereLight;
-export const Box3 = T.Box3;
-export const Sphere = T.Sphere;
-export const Raycaster = T.Raycaster;
-export const Ray = T.Ray;
-export const Plane = T.Plane;
-export const Frustum = T.Frustum;
-export const Clock = T.Clock;
-export const WebGLRenderer = T.WebGLRenderer;
-export const WebGPURenderer = T.WebGPURenderer;
+// `export *` deliberately skips `default`. Scripts written in the namespace
+// idiom (`import THREE from "three/webgpu"`) got the whole namespace as the
+// default export from the previous implementation, so keep that working.
+import * as THREE_NS from "three/webgpu";
+export default THREE_NS;
 
-export default T;
+/**
+ * This module's own absolute URL.
+ *
+ * In dev that is the Vite-served source URL; in a production build it is the
+ * emitted chunk's hashed URL. Either way it is fully qualified, which is what
+ * lets a user script loaded from a `blob:` URL import it — a relative or
+ * root-absolute specifier cannot be resolved against a non-hierarchical base.
+ *
+ * `scriptRuntime.js` reads this instead of computing
+ * `new URL('./threeRuntime.js', import.meta.url)` from the outside, because
+ * that form is a build-time asset reference that Vite inlines as a `data:`
+ * URL — which is exactly what forced the old allowlist.
+ */
+export const __SELF_URL__ = import.meta.url;

@@ -7,6 +7,18 @@ const host = process.env.TAURI_DEV_HOST;
 export default defineConfig(async () => ({
   plugins: [react()],
 
+  // The repo root, baked in at config-load time.
+  //
+  // The "Connect Claude / Codex" buttons register `node <repo>/mcp/server.mjs`
+  // with the local CLIs, so they need an absolute path to a file in this
+  // checkout. Nothing inside the webview can derive that: `import.meta.url` is
+  // an http:// URL in dev, and Tauri's path APIs describe the app's install and
+  // data directories, not the source tree it happens to be served from. The
+  // build system is the only layer that knows, so it says so.
+  define: {
+    __ENGINE_REPO_ROOT__: JSON.stringify(process.cwd().replaceAll("\\", "/")),
+  },
+
   // The `three` npm package's `package.json` only declares explicit
   // export-map entries for `./webgpu` and `./tsl` — bare `three/addons/*`
   // subpaths are NOT in the export map, so Vite's runtime module

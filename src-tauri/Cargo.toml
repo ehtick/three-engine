@@ -12,7 +12,12 @@ edition = "2021"
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "tauri_app_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# `staticlib` is only needed to link into an iOS app. On Windows it produces a
+# ~760 MB `tauri_app_lib.lib` archive (and Cargo keeps a second copy under
+# `deps/`), so it cost 1.5 GB of build cache for an artifact nothing consumes.
+# Re-add it if `tauri ios init` is ever run. `cdylib` (Android) is ~0.4 MB, so
+# it stays.
+crate-type = ["cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -25,6 +30,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "2", features = ["tls"] }
 url = "2"
+# Real pseudo-terminals for the in-editor terminal panel: claude and codex are
+# full TUI programs and will not run over plain pipes. ConPTY on Windows,
+# forkpty elsewhere.
+portable-pty = "0.9"
+# PTY output is arbitrary bytes that can split a UTF-8 sequence across reads, so
+# it crosses to the webview base64-encoded rather than lossily stringified.
+base64 = "0.22"
 
 # `tauri dev` rebuilds on every restart even when nothing changed. Keep the
 # debug profile lean so the per-restart link cost stays small.
@@ -33,3 +45,10 @@ url = "2"
 [profile.dev]
 incremental = true
 opt-level = 0
+
+# Debug info for the dependency tree is what makes `target/debug` enormous
+# (~590 MB for the `windows` crate alone). We never step into third-party code,
+# so drop it there and keep full symbols for our own crates. This also shortens
+# the per-restart link.
+[profile.dev.package."*"]
+debug = false

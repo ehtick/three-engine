@@ -629,6 +629,19 @@ body,
   bottom: calc(100% + 4px);
 }
 
+/* Portalled menus (see fields/PopoverMenu.jsx): positioned against the viewport
+   from <body>, so a menu wider than the panel that opened it can overhang
+   instead of growing that panel's scroll width and shoving the layout
+   sideways. Inline left/top come from the measurement pass. */
+.dropdown-menu.portal-menu {
+  position: fixed;
+  bottom: auto;
+  right: auto;
+  max-width: calc(100vw - 16px);
+  max-height: min(60vh, calc(100vh - 16px));
+  z-index: 200;
+}
+
 /* Anchor to the trigger's right edge so a menu opened by a button sitting at
  * the right of a narrow panel (e.g. the animator's Parameters "+") opens
  * inward instead of spilling past the panel edge. */
@@ -771,22 +784,20 @@ select:focus-visible {
   outline: none;
 }
 
+/* Bottom-right in every viewport.
+   The top edge belongs to the toolbars: the main viewport has its own bar and
+   the telemetry overlay there, and the geometry editor's bar spans the full
+   width and wraps. Sharing that edge is what made the gizmo overlap the
+   geometry editor's toolbar and swallow clicks on the UV and View menus.
+   The bottom-right is free in both (the cursor HUD is bottom-left). */
 .axis-view-gizmo {
   position: absolute;
-  z-index: 9;
-  top: 46px;
-  right: 12px;
+  z-index: 13;
+  bottom: 14px;
+  right: 14px;
   width: 76px;
   height: 76px;
   user-select: none;
-}
-
-/* Expanded telemetry occupies the same top-right corner. Keep the orientation
-   control beside it instead of hiding either overlay; collapsed stats ends
-   above the gizmo, so the compact default position remains unchanged. */
-.viewport-panel:has(.stats-overlay.expanded) .axis-view-gizmo {
-  top: 10px;
-  right: 204px;
 }
 
 .axis-view-lines {
@@ -868,12 +879,17 @@ select:focus-visible {
 
 .geometry-editor-toolbar {
   position: absolute;
-  z-index: 2;
+  z-index: 12;
   top: 10px;
   left: 10px;
   right: 10px;
   display: flex;
   align-items: center;
+  /* One row, always. Wrapping put the trailing controls on a second row and
+     made the bar grow downwards over the viewport as the panel narrowed; the
+     menus scroll sideways instead, as Blender's header does, and the controls
+     that must always be reachable are pinned outside the scroller. */
+  flex-wrap: nowrap;
   gap: 3px;
   padding: 4px;
   border: 1px solid var(--border);
@@ -884,7 +900,36 @@ select:focus-visible {
   overflow: visible;
 }
 
-.geometry-editor-toolbar::-webkit-scrollbar { display: none; }
+.geometry-editor-toolbar-scroll {
+  display: flex;
+  align-items: center;
+  flex: 1 1 auto;
+  gap: 3px;
+  /* `min-width: 0` is what actually lets a flex item shrink below its content
+     and therefore scroll at all; without it the bar just grows instead. */
+  min-width: 0;
+  overflow-x: auto;
+  /* CSS will not scroll one axis while leaving the other visible — this
+     resolves to `auto` whatever we write — which is exactly why the dropdowns
+     are positioned as fixed from the panel rather than absolutely from here. */
+  overflow-y: hidden;
+  scrollbar-width: none;
+  scroll-behavior: smooth;
+  overscroll-behavior-x: contain;
+}
+
+.geometry-editor-toolbar-pinned {
+  display: flex;
+  align-items: center;
+  flex: none;
+  gap: 3px;
+  padding-left: 5px;
+  margin-left: 2px;
+  border-left: 1px solid var(--border);
+}
+
+.geometry-editor-toolbar::-webkit-scrollbar,
+.geometry-editor-toolbar-scroll::-webkit-scrollbar { display: none; }
 
 .geometry-mode-group {
   display: flex;
@@ -930,10 +975,12 @@ select:focus-visible {
   background: rgba(255, 255, 255, 0.08);
 }
 
+/* Fixed, not absolute: the header scrolls horizontally, and an absolutely
+   positioned child of an overflow box is clipped by it. Coordinates are set
+   from GeometryEditorPanel when the menu opens. */
 .geometry-toolbar-popover {
-  position: absolute;
-  top: calc(100% + 6px);
-  left: 0;
+  position: fixed;
+  z-index: 40;
   display: grid;
   min-width: 178px;
   padding: 4px;
@@ -1003,6 +1050,36 @@ select:focus-visible {
   width: 52px;
   height: 24px;
   margin-left: auto;
+}
+
+.geometry-menu-field select {
+  height: 24px;
+  margin-left: auto;
+  max-width: 108px;
+}
+
+/* Menus grew long enough (Select, Mesh, Face) to need grouping. */
+.geometry-toolbar-popover hr {
+  height: 1px;
+  margin: 4px 6px;
+  border: 0;
+  background: var(--border);
+}
+
+.geometry-menu-heading {
+  padding: 6px 7px 2px;
+  color: var(--text-dim);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  opacity: 0.75;
+}
+
+/* The taller menus must scroll rather than run off the bottom of the panel. */
+.geometry-toolbar-popover {
+  max-height: min(70vh, 560px);
+  overflow-y: auto;
 }
 
 .geometry-transform-buttons {
@@ -1084,7 +1161,8 @@ select:focus-visible {
 .geometry-editor-status {
   position: absolute;
   left: 12px;
-  bottom: 40px;
+  bottom: 44px;
+  max-width: calc(100% - 160px);
   padding: 5px 9px;
   border-radius: 4px;
   color: var(--text-dim);
@@ -1095,11 +1173,14 @@ select:focus-visible {
 .geometry-editor-shortcuts {
   position: absolute;
   z-index: 2;
-  left: 12px;
+  left: 44px;
   bottom: 12px;
+  /* Stop well short of the gizmo's corner and wrap instead of running under it. */
+  max-width: calc(100% - 160px);
   display: flex;
   align-items: center;
-  gap: 5px;
+  flex-wrap: wrap;
+  gap: 5px 6px;
   padding: 5px 9px;
   border-radius: 5px;
   color: var(--text-dim);
@@ -1110,6 +1191,83 @@ select:focus-visible {
 
 .geometry-editor-toolbar kbd {
   display: none;
+}
+
+/* Sculpt brush ring. Sized in pixels from the projected world radius, so it
+   shows the actual reach of the brush rather than a fixed-size decoration. */
+/* The [?] toggle for the shortcut strip. */
+.geometry-help-toggle {
+  position: absolute;
+  z-index: 3;
+  left: 12px;
+  bottom: 12px;
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--text-dim);
+  background: rgba(15, 17, 19, 0.82);
+  font: 11px/1 var(--font, inherit);
+  cursor: pointer;
+}
+
+.geometry-help-toggle:hover,
+.geometry-help-toggle.active {
+  color: var(--text);
+  border-color: rgba(242, 139, 48, 0.5);
+  background: rgba(242, 139, 48, 0.16);
+}
+
+.geometry-brush-cursor {
+  position: absolute;
+  z-index: 6;
+  border: 1.5px solid rgba(255, 255, 255, 0.75);
+  border-radius: 999px;
+  pointer-events: none;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.45) inset;
+}
+
+/* Off the surface there is nothing to sculpt, so the ring goes dim and dashed
+   rather than disappearing — otherwise the cursor looks broken near an edge. */
+.geometry-brush-cursor.off-surface {
+  border-style: dashed;
+  border-color: rgba(255, 255, 255, 0.3);
+  box-shadow: none;
+}
+
+.geometry-brush-field {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 6px;
+  color: var(--text-dim);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.geometry-brush-field input[type="range"] {
+  width: 74px;
+  height: 16px;
+  accent-color: #f28b30;
+}
+
+.geometry-brush-field span {
+  min-width: 34px;
+  color: var(--text);
+  font: 10px/1.2 monospace;
+  text-align: right;
+}
+
+.geometry-menu-note {
+  padding: 2px 7px 6px;
+  color: var(--text-dim);
+  font-size: 10px;
+  line-height: 1.4;
+  max-width: 210px;
+  opacity: 0.8;
 }
 
 .geometry-editor-canvas {
@@ -1148,6 +1306,20 @@ select:focus-visible {
 
 .geometry-transform-hud small {
   color: var(--text-dim);
+}
+
+.geometry-selection-lasso {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 5;
+}
+
+.geometry-selection-lasso polygon {
+  fill: rgba(242, 139, 48, 0.12);
+  stroke: rgba(242, 139, 48, 0.85);
+  stroke-width: 1;
+  stroke-dasharray: 4 3;
 }
 
 .geometry-selection-rect,
@@ -1495,26 +1667,30 @@ body.macro-active .viewport-canvas {
   flex-shrink: 0;
 }
 
-/* 3D Cursor HUD readout — sits in the bottom-left next to the
-   terrain-brush HUD. Glass pill, monospace numbers, RGB axis tint. */
+/* 3D Cursor HUD readout — a small chip in the bottom-left next to the
+   terrain-brush HUD. Sized to the numbers it shows and shaped like the rest of
+   the editor's chrome (same radius/border as toolbars) rather than a wide
+   floating pill that ate a corner of the viewport. */
 .cursor-hud {
   position: absolute;
-  bottom: 14px;
-  left: 14px;
+  bottom: 10px;
+  left: 10px;
   z-index: 11;
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 7px 12px;
-  border-radius: 999px;
-  background: rgba(20, 21, 25, 0.78);
+  gap: 6px;
+  padding: 2px 7px;
+  height: 20px;
+  border-radius: 6px;
+  background: rgba(20, 21, 25, 0.72);
   backdrop-filter: blur(16px);
   -webkit-backdrop-filter: blur(16px);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  box-shadow: 0 2px 14px rgba(0, 0, 0, 0.32);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.28);
   color: #fff;
-  font-size: 12px;
+  font-size: 10.5px;
   font-variant-numeric: tabular-nums;
+  line-height: 1;
   user-select: none;
   pointer-events: none;
 }
@@ -1524,37 +1700,25 @@ body.macro-active .viewport-canvas {
 }
 
 .cursor-hud-icon {
-  font-size: 13px;
+  font-size: 11px;
   color: #f9ec4d;
-}
-
-.cursor-hud-pos {
-  display: inline-flex;
-  gap: 10px;
+  opacity: 0.9;
 }
 
 .cursor-hud-axis {
   display: inline-flex;
-  align-items: baseline;
-  gap: 4px;
+  align-items: center;
+  gap: 2px;
 }
 
 .cursor-hud-axis .cursor-hud-key {
   font-weight: 600;
-  opacity: 0.7;
+  opacity: 0.65;
 }
 
 .cursor-hud-x { color: #f06a73; }
 .cursor-hud-y { color: #67c77a; }
 .cursor-hud-z { color: #5d9df5; }
-
-.cursor-hud-hint {
-  font-size: 10.5px;
-  color: var(--text-dim);
-  padding-left: 8px;
-  margin-left: 4px;
-  border-left: 1px solid rgba(255, 255, 255, 0.12);
-}
 
 /* When the cursor is the active selection the HUD adopts a blue tint
    and a hairline accent ring to match the on-screen proxy's blue
@@ -1565,7 +1729,7 @@ body.macro-active .viewport-canvas {
   box-shadow: 0 0 0 1px rgba(108, 182, 255, 0.35), 0 2px 10px rgba(0, 0, 0, 0.45);
   background: linear-gradient(180deg, rgba(108, 182, 255, 0.14), rgba(108, 182, 255, 0.04));
 }
-.cursor-hud-selected .cursor-hud-hint {
+.cursor-hud-selected .cursor-hud-icon {
   color: #9ec5ff;
 }
 
@@ -1747,12 +1911,41 @@ body.macro-active .viewport-canvas {
   margin-right: 2px;
 }
 
-/* Right-click menu: fixed at the cursor, not anchored to a dropdown-wrap. */
+/* Right-click menu: fixed at the cursor, not anchored to a dropdown-wrap.
+   Rendered into <body> by ContextMenu.jsx, which measures it and clamps the
+   inline left/top so it never runs off an edge. */
 .dropdown-menu.context-menu {
   position: fixed;
-  top: auto;
-  left: auto;
+  bottom: auto;
+  right: auto;
   z-index: 200;
+  min-width: 190px;
+  max-height: min(70vh, calc(100vh - 12px));
+}
+
+/* Label + optional leading icon; the shortcut column is pushed right by the
+   .dropdown-item flex row. */
+.menu-item-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+
+.menu-item-icon {
+  flex: none;
+  opacity: 0.75;
+}
+
+/* Destructive entries (Delete, Remove Component, Clear) read as such without
+   needing a confirmation dialog for something undo already covers. */
+.dropdown-item.danger {
+  color: var(--danger);
+}
+
+.dropdown-item.danger:hover:not(:disabled) {
+  background: var(--danger);
+  color: #fff;
 }
 
 .entity-icon {
@@ -1923,12 +2116,30 @@ body.macro-active .viewport-canvas {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 8px;
   font-weight: 600;
   font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 0.06em;
   color: var(--text-dim);
   margin-bottom: 9px;
+}
+
+/* Component header buttons (view-only / enable / remove) travel as one cluster
+   pinned to the right. Left as bare flex children they were spread across the
+   whole header by `space-between`, which read as three unrelated controls
+   floating in the title row. */
+.section-actions {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  flex: none;
+  margin-left: auto;
+}
+
+.section-header .section-title {
+  min-width: 0;
+  overflow: hidden;
 }
 
 /* Sub-header inside an inspector section — smaller / less prominent than
@@ -2023,6 +2234,45 @@ body.macro-active .viewport-canvas {
   flex-shrink: 0;
   color: var(--text-dim);
   font-size: 12px;
+}
+
+/* An @attribute field belonging to a script slot, indented so it reads as
+   nested under that slot's file row rather than as a sibling of it. */
+.field-label.indented {
+  padding-left: 10px;
+  width: 66px;
+}
+
+/* One script in the Scripts section's list. An entity can hold several, so
+   each gets a boxed group: its file row (with enable / reorder / remove) plus
+   its own @attribute fields. The left border is what visually ties the
+   indented attribute rows to their script. */
+.script-slot {
+  border-left: 2px solid var(--border);
+  padding-left: 8px;
+  margin-bottom: 10px;
+}
+
+.script-slot .icon-btn:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+
+/* Inline "name your new script" field: replaces the New button in place, so
+   creating a behaviour never leaves the component panel. */
+.script-name-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.script-add-row {
+  display: flex;
+  gap: 6px;
+  align-items: stretch;
+}
+
+.script-add-row .toolbar-btn.wide {
+  flex: 1;
 }
 
 .vector-fields {
@@ -2504,6 +2754,25 @@ input[type="checkbox"]:checked::after {
   border-color: rgba(10, 132, 255, 0.35);
 }
 
+/* "Revealed" — the inspector pointing at this file. Deliberately distinct from
+   `.selected`: the entity is still what's selected, this tile is only being
+   pointed at, so it gets a ring and a one-shot pulse rather than a fill. */
+.asset-tile.revealed,
+.asset-row.revealed {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent), 0 0 14px rgba(10, 132, 255, 0.35);
+  animation: asset-reveal-pulse 0.9s var(--ease);
+}
+
+@keyframes asset-reveal-pulse {
+  0% {
+    box-shadow: 0 0 0 3px rgba(10, 132, 255, 0.55), 0 0 22px rgba(10, 132, 255, 0.6);
+  }
+  100% {
+    box-shadow: 0 0 0 1px var(--accent), 0 0 14px rgba(10, 132, 255, 0.35);
+  }
+}
+
 .asset-icon {
   line-height: 1;
   display: flex;
@@ -2591,7 +2860,12 @@ input[type="checkbox"]:checked::after {
 .dropdown-menu.asset-options {
   min-width: 250px;
   max-height: 280px;
-  overflow-y: auto;
+}
+
+/* The picker's search box is pinned; only the option list scrolls, so the
+   field stays reachable once the user has scrolled into a long list. */
+.dropdown-menu.asset-options .component-menu-list {
+  max-height: 232px;
 }
 
 .dropdown-item.asset-option {
@@ -2697,6 +2971,55 @@ input[type="checkbox"]:checked::after {
   background: radial-gradient(ellipse at 50% 40%, #1c1f26 0%, #101216 100%);
 }
 
+/* Unfolded-cube layout for a .cubemap asset: +Y on top, the equator strip
+ * (−X +Z +X −Z) across the middle, −Y below. Makes a mis-slotted face obvious. */
+.cubemap-cross {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  grid-template-rows: repeat(3, auto);
+  gap: 2px;
+  padding: 6px;
+  background: radial-gradient(ellipse at 50% 40%, #1c1f26 0%, #101216 100%);
+}
+
+.cubemap-cross-cell {
+  aspect-ratio: 1;
+  border-radius: 3px;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  color: var(--text-3, #6b7280);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.cubemap-cross-cell.empty {
+  border: 1px dashed rgba(255, 255, 255, 0.12);
+}
+
+.cubemap-cross-cell img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+/* Asset-grid tile for a .cubemap: its front face, dashed while incomplete. */
+.cubemap-thumb {
+  overflow: hidden;
+  border-radius: 4px;
+}
+
+.cubemap-thumb img {
+  object-fit: cover;
+}
+
+.cubemap-thumb--incomplete {
+  outline: 1px dashed rgba(255, 165, 0, 0.6);
+  outline-offset: 1px;
+}
+
 .model-preview canvas {
   display: block;
   width: 100%;
@@ -2792,6 +3115,20 @@ input[type="checkbox"]:checked::after {
   flex: 1;
   min-height: 0;
   position: relative;
+  /* Establishes a stacking context so React Flow's internal z-indexes stay
+   * INSIDE the canvas. Without it (position:relative + z-index:auto does NOT
+   * create one) React Flow's own layers — `.react-flow__connectionline` is
+   * z-index 1001 — join the root stacking context and paint over the panel
+   * toolbar's dropdowns (z-index 100), so the Presets and Node menus opened
+   * from the toolbar were drawn underneath the graph. */
+  z-index: 0;
+}
+
+/* …and the toolbar (with its dropdowns) sits above that context. */
+.shader-graph-panel .panel-toolbar,
+.animator-panel .panel-toolbar {
+  position: relative;
+  z-index: 1;
 }
 
 /* Node category colors (shader + particle graphs) */
@@ -3257,11 +3594,23 @@ input[type="checkbox"]:checked::after {
 }
 
 /* Node palette (toolbar dropdown + canvas right-click) */
+/* ONE scroll container, not two. The palette used to scroll (max-height 340px,
+ * overflow-y auto) AND so did `.node-palette-list` inside it (max-height 320px),
+ * so the search box plus category chips pushed the inner list past the outer
+ * box and the user got two scrollbars side by side. Now the palette clips and
+ * lays out as a column: search and chips stay pinned, only the list scrolls. */
 .node-palette {
+  display: flex;
+  flex-direction: column;
   min-width: 180px;
   max-height: 340px;
-  overflow-y: auto;
+  overflow: hidden;
   padding-bottom: 5px;
+}
+
+.node-palette > .node-palette-search,
+.node-palette > .node-palette-cats {
+  flex: none;
 }
 
 .node-palette-group {
@@ -4788,7 +5137,11 @@ input[type="checkbox"]:checked::after {
   outline: none;
 }
 .node-palette-search:focus { box-shadow: 0 0 0 2px var(--accent-ring); }
-.node-palette-list { max-height: 320px; overflow-y: auto; }
+/* The only scrolling element in the palette — it takes whatever height the
+ * pinned search box and category chips leave. `min-height: 0` is required:
+ * a flex item defaults to `min-height: auto`, which refuses to shrink below
+ * its content and would push the scrollbar back onto the parent. */
+.node-palette-list { flex: 1; min-height: 0; overflow-y: auto; }
 .node-palette-item.active { background: var(--accent-soft); }
 
 /* Save-state chip */
@@ -6113,4 +6466,904 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
 .acg-error {
   color: #e46a6a;
   font-size: 11px;
+}
+
+/* =========================================================================
+   Editor polish pass â€” scrub fields, axis tags, tags, asset filters,
+   icon-led menus. Grouped here so the vocabulary these controls share is
+   visible in one place rather than scattered by the panel that first
+   needed it.
+   ========================================================================= */
+
+/* ---------- Number fields: drag to scrub ---------- */
+
+/* The cursor is the only affordance that says "you can drag this", so it has
+   to be there before the pointer goes down. It reverts to a text caret once
+   the field is focused, because at that point the field really is a text box. */
+.number-field {
+  cursor: ew-resize;
+}
+
+.number-field:focus {
+  cursor: text;
+}
+
+.number-field.scrubbing {
+  background: var(--bg-0);
+  box-shadow: 0 0 0 1px var(--accent-ring);
+  cursor: ew-resize;
+}
+
+/* ---------- Axis-tagged vector fields ---------- */
+
+.axis-field {
+  position: relative;
+  display: flex;
+  align-items: center;
+  flex: 1;
+  min-width: 0;
+  background: var(--fill-1);
+  border-radius: var(--r-input);
+  transition: background-color 0.12s var(--ease), box-shadow 0.12s var(--ease);
+}
+
+.axis-field:hover {
+  background: var(--fill-2);
+}
+
+.axis-field:focus-within {
+  background: var(--bg-0);
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+
+/* The tag labels the cell and gives the eye an anchor; the field behind it
+   is what you drag. */
+.axis-tag {
+  flex: none;
+  width: 15px;
+  padding-left: 6px;
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--axis-color, var(--text-dim));
+  pointer-events: none;
+  user-select: none;
+}
+
+.axis-field .number-field {
+  background: transparent;
+  padding-left: 2px;
+}
+
+.axis-field .number-field:hover,
+.axis-field .number-field:focus,
+.axis-field .number-field.scrubbing {
+  background: transparent;
+  box-shadow: none;
+}
+
+/* Red / green / blue for X / Y / Z â€” the convention every DCC tool shares,
+   muted here so three of them in a row do not shout. */
+.axis-x { --axis-color: #ff6b6b; }
+.axis-y { --axis-color: #6bd88a; }
+.axis-z { --axis-color: #5aa9ff; }
+
+.lock-btn {
+  flex: none;
+  padding: 3px 4px;
+}
+
+.lock-btn:hover {
+  color: var(--accent);
+  background: var(--fill-1);
+}
+
+.icon-btn.active-toggle {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+/* ---------- Inspector section headers with icons ---------- */
+
+.section-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.section-title svg {
+  flex: none;
+}
+
+/* ---------- Editor action row (Edit Geometry / Shader Graph / ...) ---------- */
+
+/* Replaces a stack of full-width grey buttons: one line, colour-coded, with
+   the label kept but quiet. Buttons flex so two or three fit the inspector
+   width without wrapping. */
+.editor-action-row {
+  display: flex;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.editor-action {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+  padding: 9px 4px 7px;
+  background: var(--fill-1);
+  border: 1px solid transparent;
+  border-radius: var(--r-card);
+  color: var(--action-color, var(--text));
+  cursor: pointer;
+  transition: background-color 0.12s var(--ease), border-color 0.12s var(--ease),
+    transform 0.12s var(--ease);
+}
+
+.editor-action:hover {
+  background: color-mix(in srgb, var(--action-color) 14%, transparent);
+  border-color: color-mix(in srgb, var(--action-color) 40%, transparent);
+}
+
+.editor-action:active {
+  transform: translateY(1px);
+}
+
+.editor-action-label {
+  font-size: 10.5px;
+  font-weight: 500;
+  line-height: 1.2;
+  text-align: center;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+.editor-action:hover .editor-action-label {
+  color: var(--text);
+}
+
+/* ---------- Icon-led dropdown items (Add Component, Add Object) ---------- */
+
+.component-menu {
+  min-width: 232px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  max-height: 60vh;
+}
+
+.component-menu .dropdown-section-label:first-child {
+  border-top: none;
+  margin-top: 0;
+}
+
+/* Sticky search: the list scrolls under it so the field stays reachable
+   after the user has scrolled past the first group. */
+.component-menu-search {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 9px 11px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-dim);
+  flex: none;
+}
+
+.component-menu-search input {
+  flex: 1;
+  min-width: 0;
+  background: none;
+  border: none;
+  outline: none;
+  color: var(--text);
+  font-size: 12.5px;
+}
+
+.component-menu-search input::placeholder {
+  color: var(--text-dim);
+}
+
+.component-menu-list {
+  overflow-y: auto;
+  padding: 5px;
+  min-height: 0;
+}
+
+.component-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  justify-content: flex-start;
+}
+
+.component-item-icon {
+  flex: none;
+  opacity: 0.9;
+}
+
+.component-item-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Count of entities that will receive the component, in the multi-select
+   Add menu. Quiet â€” a footnote to the label, not a second label. */
+.component-item-suffix {
+  flex: none;
+  font-size: 10.5px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.dropdown-item:hover:not(:disabled) .component-item-suffix {
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.dropdown-item.checked {
+  background: var(--accent-soft);
+}
+
+/* ---------- Tags ---------- */
+
+.tags-row {
+  align-items: flex-start;
+}
+
+.tags-row .field-label {
+  padding-top: 4px;
+}
+
+.tag-field {
+  flex: 1;
+  min-width: 0;
+}
+
+.tag-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+  padding: 3px 4px;
+  min-height: 24px;
+  background: var(--fill-1);
+  border-radius: var(--r-input);
+  transition: background-color 0.12s var(--ease), box-shadow 0.12s var(--ease);
+}
+
+.tag-chips:focus-within {
+  background: var(--bg-0);
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+
+.tag-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 3px 1px 7px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: #9dcbff;
+  font-size: 10.5px;
+  font-weight: 500;
+  line-height: 16px;
+  white-space: nowrap;
+}
+
+.tag-chip-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 13px;
+  height: 13px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: none;
+  color: inherit;
+  opacity: 0.65;
+  cursor: pointer;
+}
+
+.tag-chip-remove:hover {
+  opacity: 1;
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.tag-input-wrap {
+  position: relative;
+  flex: 1;
+  min-width: 56px;
+}
+
+.tag-input {
+  width: 100%;
+  min-width: 0;
+  background: none;
+  border: none;
+  outline: none;
+  color: var(--text);
+  font-size: 11.5px;
+  height: 18px;
+}
+
+.tag-input::placeholder {
+  color: var(--text-dim);
+}
+
+.tag-suggestions {
+  position: absolute;
+  z-index: 100;
+  top: calc(100% + 4px);
+  left: 0;
+  min-width: 140px;
+  max-height: 180px;
+  overflow-y: auto;
+  padding: 4px;
+  background: var(--menu-bg);
+  backdrop-filter: blur(24px) saturate(1.4);
+  -webkit-backdrop-filter: blur(24px) saturate(1.4);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-menu);
+  box-shadow: var(--shadow-menu);
+}
+
+.tag-suggestion {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 4px 9px;
+  border: none;
+  border-radius: 6px;
+  background: none;
+  color: var(--text);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.tag-suggestion:hover {
+  background: var(--accent);
+  color: #fff;
+}
+
+/* ---------- Assets panel: filter bar ---------- */
+
+.assets-filterbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-1);
+  flex-shrink: 0;
+}
+
+.assets-search {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex: 1;
+  min-width: 0;
+  height: 25px;
+  padding: 0 6px 0 8px;
+  background: var(--fill-1);
+  border-radius: var(--r-input);
+  color: var(--text-dim);
+  box-sizing: border-box;
+}
+
+.assets-search:focus-within {
+  background: var(--bg-0);
+  box-shadow: 0 0 0 2px var(--accent-ring);
+  color: var(--text);
+}
+
+.assets-search-icon {
+  flex: none;
+}
+
+.assets-search-input {
+  flex: 1;
+  min-width: 0;
+  background: none;
+  border: none;
+  outline: none;
+  color: var(--text);
+  font-size: 12px;
+}
+
+.assets-search-input::placeholder {
+  color: var(--text-dim);
+}
+
+.assets-search-clear {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: none;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.assets-search-clear:hover {
+  background: var(--fill-2);
+  color: var(--text);
+}
+
+.filter-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+  max-width: 150px;
+}
+
+.filter-btn-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Result count for an active search â€” a quiet strip above the grid so the
+   user knows the view is filtered and by how much. */
+.asset-result-bar {
+  width: 100%;
+  padding: 2px 4px 8px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+/* ---------- Assets panel: build-flag badges + tags ---------- */
+
+.asset-flag-badges {
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  display: flex;
+  gap: 3px;
+}
+
+.asset-flag-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  color: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.45);
+}
+
+.asset-flag-badge.preload {
+  background: var(--accent);
+}
+
+.asset-flag-badge.exclude {
+  background: #6b6f78;
+}
+
+/* An excluded asset is still in the project â€” dim it rather than hide it, so
+   it reads as "present but not shipping" instead of missing. */
+.asset-tile.excluded .asset-thumb,
+.asset-tile.excluded .asset-icon,
+.asset-tile.excluded .asset-name,
+.asset-row.excluded .asset-row-name {
+  opacity: 0.42;
+}
+
+.asset-subpath {
+  margin-top: 1px;
+  font-size: 9.5px;
+  color: var(--text-dim);
+  text-align: center;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+.asset-row-path {
+  margin-left: 8px;
+  font-size: 10.5px;
+  color: var(--text-dim);
+}
+
+.asset-row-tags {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: 8px;
+  font-size: 10px;
+  color: #9dcbff;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 180px;
+}
+
+
+/* Explanatory line under a settings row (MCP bridge status, etc.). Sits at
+   field-label weight so it reads as annotation, not as another control, and
+   wraps freely — these carry a sentence, not a value. */
+.settings-hint {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-dim);
+  padding: 2px 0 6px;
+}
+.settings-hint code {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 10.5px;
+  background: var(--bg-raised, rgba(255, 255, 255, 0.06));
+  border-radius: 3px;
+  padding: 1px 4px;
+  /* A `claude mcp add …` line is longer than the panel is wide; let it break
+     rather than forcing the whole panel to scroll sideways. */
+  word-break: break-word;
+}
+.link-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent, #4aa3ff);
+  font: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+}
+.link-btn:hover {
+  filter: brightness(1.2);
+}
+
+/* MCP bridge chip in the menu bar. Only rendered while MCP is enabled, so it
+   is an at-a-glance answer to "is something outside this window editing my
+   scene?" rather than permanent chrome. */
+.mcp-chip {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  height: 20px;
+  padding: 0 8px;
+  margin-right: 6px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 10.5px;
+  letter-spacing: 0.3px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.mcp-chip:hover {
+  color: var(--text);
+  border-color: var(--text-dim);
+}
+.mcp-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--text-dim);
+}
+.mcp-chip.connected .mcp-dot {
+  background: #3ecf6a;
+  /* A live remote-control session is worth a glow; "waiting" deliberately is
+     not, since that is the resting state whenever no assistant is running. */
+  box-shadow: 0 0 5px rgba(62, 207, 106, 0.8);
+}
+.mcp-chip.connected {
+  color: var(--text);
+  border-color: rgba(62, 207, 106, 0.45);
+}
+
+/* Terminal panel: xterm fills the panel below a compact toolbar. */
+.terminal-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: #101114;
+}
+.terminal-panel .panel-toolbar {
+  flex: 0 0 auto;
+}
+.terminal-host {
+  /* min-height:0 is what lets the flex child actually shrink; without it the
+     xterm viewport grows past the panel and the toolbar scrolls away. */
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 4px 6px;
+  overflow: hidden;
+}
+.terminal-host .xterm {
+  height: 100%;
+}
+.terminal-status {
+  font-size: 10px;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-right: 4px;
+}
+.terminal-status.running {
+  color: #3ecf6a;
+}
+.terminal-status.exited,
+.terminal-status.error,
+.terminal-status.missing {
+  color: #ff6b6b;
+}
+
+/* ---------------------------------------------------------------------------
+   Assistant (MCP) panel.
+
+   Replaces a settings section that answered "is it connected?" with three
+   paragraphs of prose. The rule here is that state is carried by position and
+   colour, and words are only spent on things a glance can't convey — anything
+   explanatory lives in a title attribute.
+   --------------------------------------------------------------------------- */
+.mcp-panel {
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* Status header: dot, two lines, switch. The one element that should be
+   readable from across the room. */
+.mcp-hero {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-raised, rgba(255, 255, 255, 0.03));
+}
+.mcp-hero-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  background: var(--text-dim);
+}
+.mcp-hero.ok {
+  border-color: rgba(62, 207, 106, 0.35);
+}
+.mcp-hero.ok .mcp-hero-dot {
+  background: #3ecf6a;
+  box-shadow: 0 0 6px rgba(62, 207, 106, 0.75);
+}
+.mcp-hero.wait .mcp-hero-dot {
+  background: #e0a33c;
+}
+.mcp-hero-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.mcp-hero-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+.mcp-hero-sub {
+  font-size: 10.5px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* iOS-style switch. The panel has exactly one on/off decision, so it gets a
+   control that reads as one rather than a checkbox in a label row. */
+.mcp-switch {
+  flex: 0 0 auto;
+  cursor: pointer;
+  display: inline-flex;
+}
+.mcp-switch input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+.mcp-switch-track {
+  width: 32px;
+  height: 18px;
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.14);
+  position: relative;
+  transition: background 0.15s ease;
+}
+.mcp-switch-track::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  transition: transform 0.15s ease;
+}
+.mcp-switch input:checked + .mcp-switch-track {
+  background: var(--accent);
+}
+.mcp-switch input:checked + .mcp-switch-track::after {
+  transform: translateX(14px);
+}
+.mcp-switch input:focus-visible + .mcp-switch-track {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.mcp-section-label {
+  font-size: 9.5px;
+  letter-spacing: 0.9px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin: 10px 2px 2px;
+}
+
+/* One row per CLI: mark, name + resolved path, action. Two of these occupy
+   less height than the single wide button they replaced. */
+.mcp-client {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  margin-bottom: 4px;
+}
+.mcp-client.linked {
+  border-color: rgba(62, 207, 106, 0.3);
+}
+.mcp-client-mark {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  flex: 0 0 auto;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text);
+}
+.mcp-client.linked .mcp-client-mark {
+  color: #3ecf6a;
+}
+.mcp-client-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.mcp-client-name {
+  font-size: 11.5px;
+  color: var(--text);
+}
+/* The resolved binary path is long and only interesting on hover, so it is
+   clipped rather than allowed to wrap the row to three lines. */
+.mcp-client-sub {
+  font-size: 10px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  direction: rtl;
+  text-align: left;
+}
+.mcp-client-action {
+  flex: 0 0 auto;
+  min-width: 62px;
+  height: 24px;
+  padding: 0 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border-strong);
+  background: transparent;
+  color: var(--text);
+  font-size: 11px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.mcp-client-action:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.06);
+}
+.mcp-client-action.connect {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.mcp-client-action.disconnect {
+  border-color: rgba(62, 207, 106, 0.45);
+  color: #3ecf6a;
+  min-width: 34px;
+}
+.mcp-client-badge.muted {
+  color: var(--text-dim);
+  font-size: 11px;
+  min-width: 62px;
+  text-align: center;
+}
+
+.mcp-empty,
+.mcp-message {
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--text-dim);
+  padding: 6px 2px;
+}
+.mcp-empty code {
+  display: block;
+  margin-top: 4px;
+  word-break: break-all;
+}
+
+.mcp-actions {
+  display: flex;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+.mcp-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 9px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  font-size: 11px;
+  cursor: pointer;
+}
+.mcp-action:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.06);
+}
+.mcp-action:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.mcp-port-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  font-size: 10.5px;
+  color: var(--text-dim);
+}
+.mcp-port-row .number-field {
+  width: 78px;
+}
+.mcp-port-note {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: #e0a33c;
+}
+
+/* Menu-bar chip is now always present, so the "off" state must be quiet. */
+.mcp-chip.off {
+  opacity: 0.55;
+}
+.mcp-chip.off:hover {
+  opacity: 1;
 }

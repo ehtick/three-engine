@@ -29,6 +29,10 @@ export const PROJECT_SETTINGS_DEFAULTS = {
     hotReload: true,
     reloadIntervalMs: 750,
   },
+  // NOTE: MCP settings deliberately do NOT live here. The server is registered
+  // with the user's CLIs machine-wide, so enabling the bridge is a fact about
+  // the person, not the project — and storing it per-project meant every new
+  // project came up disabled. See `mcpPrefs.js`.
   rendering: {
     pixelRatioCap: 2, // upper bound on devicePixelRatio
   },

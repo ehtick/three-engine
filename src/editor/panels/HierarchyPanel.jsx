@@ -47,6 +47,7 @@ import { engine } from "../engineInstance.js";
 import { newScene } from "../sceneIO.js";
 import { createTerrainAssets } from "../terrainAssetSetup.js";
 import { getCursor3DPosition } from "../threeDCursor.js";
+import { ContextMenu as SharedContextMenu, isTextEditTarget } from "../ContextMenu.jsx";
 
 const DROPPABLE_ASSET_EXTENSIONS = [...PREFAB_EXTENSIONS, ...MODEL_EXTENSIONS];
 
@@ -70,20 +71,26 @@ function dropAssetOnEntity(path, parentId) {
 
 // Common base entities that live directly in the world. Always shown.
 const COMMON_PRESETS = [
-  { label: "Empty", spec: { name: "Entity", components: [] } },
+  { label: "Empty", Icon: Circle, color: "#8ea0b5", spec: { name: "Entity", components: [] } },
   // Mesh defaults to a box; the inspector's Geometry dropdown still exposes
   // sphere/plane/cylinder/cone/torus so users can pick the shape there.
-  { label: "Mesh", spec: { name: "Mesh", components: [{ type: "mesh", props: { geometry: "box" } }] } },
+  { label: "Mesh", Icon: Box, color: "#4da3ff", spec: { name: "Mesh", components: [{ type: "mesh", props: { geometry: "box" } }] } },
   // Light defaults to directional; the inspector's kind dropdown exposes
   // point/spot/ambient so users can pick the type there.
-  { label: "Light", spec: { name: "Light", components: [{ type: "light", props: { kind: "directional" } }] } },
-  { label: "Camera", spec: { name: "Camera", components: [{ type: "camera" }] } },
+  { label: "Light", Icon: Lightbulb, color: "#f5c451", spec: { name: "Light", components: [{ type: "light", props: { kind: "directional" } }] } },
+  { label: "Camera", Icon: Video, color: "#4da3ff", spec: { name: "Camera", components: [{ type: "camera" }] } },
+  // Particles ship as a first-class object rather than "add an empty, then
+  // remember which component makes it emit" — an emitter is a thing you place,
+  // not a behaviour you bolt on. The component's own defaults drive the graph.
+  { label: "Particles", Icon: Sparkles, color: "#b784f5", spec: { name: "Particles", components: [{ type: "particles", props: {} }] } },
 ];
 
 // Terrain lives in the optional `terrain` module — only offered in the Add
 // menu when that module is enabled (mirrors how UI presets are gated).
 const TERRAIN_PRESET = {
   label: "Terrain",
+  Icon: Mountain,
+  color: "#8ea0b5",
   spec: { name: "Terrain", components: [{ type: "terrain", props: {} }] },
 };
 
@@ -91,6 +98,8 @@ const TERRAIN_PRESET = {
 // from anywhere in the scene.
 const UI_SCREEN_PRESET = {
   label: "UI Screen",
+  Icon: Monitor,
+  color: "#3fd0c9",
   spec: { name: "UI Screen", components: [{ type: "uiscreen" }] },
 };
 
@@ -102,6 +111,8 @@ const UI_SCREEN_PRESET = {
 const UI_ELEMENT_PRESETS = [
   {
     label: "UI Panel",
+    Icon: Square,
+    color: "#3fd0c9",
     spec: {
       name: "Panel",
       components: [
@@ -112,6 +123,8 @@ const UI_ELEMENT_PRESETS = [
   },
   {
     label: "UI Image",
+    Icon: ImageIcon,
+    color: "#3fd0c9",
     spec: {
       name: "Image",
       components: [{ type: "uielement", props: { size: [128, 128] } }, { type: "uiimage" }],
@@ -119,6 +132,8 @@ const UI_ELEMENT_PRESETS = [
   },
   {
     label: "UI Text",
+    Icon: Type,
+    color: "#3fd0c9",
     spec: {
       name: "Text",
       components: [
@@ -129,6 +144,8 @@ const UI_ELEMENT_PRESETS = [
   },
   {
     label: "UI Button",
+    Icon: MousePointerClick,
+    color: "#3fd0c9",
     spec: {
       name: "Button",
       components: [
@@ -152,6 +169,8 @@ const UI_ELEMENT_PRESETS = [
   },
   {
     label: "UI Layout (Column)",
+    Icon: Rows3,
+    color: "#3fd0c9",
     spec: {
       name: "Layout",
       components: [
@@ -162,6 +181,8 @@ const UI_ELEMENT_PRESETS = [
   },
   {
     label: "UI Scroll View",
+    Icon: ScrollText,
+    color: "#3fd0c9",
     spec: {
       name: "Scroll View",
       components: [
@@ -184,6 +205,18 @@ const UI_ELEMENT_PRESETS = [
     },
   },
 ];
+
+/** One row in the Add menu: coloured glyph + label, so the list can be
+ *  scanned by shape instead of read word by word. */
+function PresetItem({ preset, onPick }) {
+  const Icon = preset.Icon ?? Circle;
+  return (
+    <button className="dropdown-item component-item" onClick={() => onPick(preset.spec)}>
+      <Icon size={14} style={{ color: preset.color ?? "#8ea0b5" }} className="component-item-icon" />
+      <span className="component-item-label">{preset.label}</span>
+    </button>
+  );
+}
 
 /** True iff `parentId` refers to a UI Screen entity (or is null — the scene
  *  root, which is *not* a UI Screen). Used to gate UI element presets so
@@ -299,12 +332,23 @@ function collectDescendants(id, entities) {
  *   1 — name contains query
  *   2 — entity has a component whose type starts with query
  *   3 — entity has a component whose type contains query
+ *   4 — entity carries a tag containing the query
  *
  * Both the name and every component type are checked in this priority, so
  * "can" jumps to the top for entities literally named "can" AND for any
  * entity carrying a `camera` component.
+ *
+ * A `tag:` prefix searches tags exclusively — "tag:enemy" finds every tagged
+ * enemy without also dragging in the entity someone named "Enemy spawn note".
  */
 function matchTier(entity, q) {
+  const tags = (entity.tags ?? []).map((tag) => tag.toLowerCase());
+  if (q.startsWith("tag:")) {
+    const needle = q.slice(4).trim();
+    if (!needle) return tags.length ? 0 : Infinity;
+    if (tags.some((tag) => tag === needle)) return 0;
+    return tags.some((tag) => tag.includes(needle)) ? 1 : Infinity;
+  }
   const name = (entity.name ?? "").toLowerCase();
   if (name.startsWith(q)) return 0;
   if (name.includes(q)) return 1;
@@ -317,6 +361,7 @@ function matchTier(entity, q) {
     const t = type.toLowerCase();
     if (t.includes(q)) return 3;
   }
+  if (tags.some((tag) => tag.includes(q))) return 4;
   return Infinity;
 }
 
@@ -788,55 +833,47 @@ function prefabMenuItems(single) {
   ];
 }
 
-function ContextMenu({ menu, close, setRenamingId }) {
+function ContextMenu({ menu, close, setRenamingId, onCreate, onNewScene, terrainEnabled }) {
   const selection = useSelectionStore.getState().ids;
   const single = selection.length === 1 ? selection[0] : null;
   const canPaste = clipboardHasEntities();
 
-  const items = [
-    { label: "Copy", shortcut: "Ctrl+C", action: () => copyEntities(selection) },
-    { label: "Cut", shortcut: "Ctrl+X", action: () => cutEntities(selection) },
-    {
-      label: "Paste",
-      shortcut: "Ctrl+V",
-      disabled: !canPaste,
-      action: () => pasteEntities(single ? useSceneStore.getState().entities[single]?.parentId : null),
-    },
-    { label: "Paste as Child", disabled: !canPaste || !single, action: () => pasteEntities(single) },
-    { separator: true },
-    { label: "Duplicate", shortcut: "Ctrl+D", action: duplicateSelection },
-    { label: "Group Selection", shortcut: "Ctrl+G", disabled: selection.length < 2, action: groupSelection },
-    { label: "Rename", disabled: !single, action: () => setRenamingId(single) },
-    ...prefabMenuItems(single),
-    { separator: true },
-    { label: "Delete", shortcut: "Del", action: deleteSelection },
-  ];
+  // Right-click on empty tree space is a "create here" gesture, not an
+  // "operate on the selection" one — offering Delete/Rename for whatever
+  // happened to be selected elsewhere would act on something off-screen.
+  const items = menu.empty
+    ? [
+        { header: "Create" },
+        ...[...COMMON_PRESETS, ...(terrainEnabled ? [TERRAIN_PRESET] : [])].map((preset) => ({
+          label: preset.label,
+          icon: preset.Icon,
+          action: () => onCreate(preset.spec),
+        })),
+        { label: UI_SCREEN_PRESET.label, icon: UI_SCREEN_PRESET.Icon, action: () => onCreate(UI_SCREEN_PRESET.spec) },
+        { separator: true },
+        { label: "Paste", shortcut: "Ctrl+V", disabled: !canPaste, action: () => pasteEntities(null) },
+        { label: "New Scene", action: onNewScene },
+      ]
+    : [
+        { label: "Copy", shortcut: "Ctrl+C", action: () => copyEntities(selection) },
+        { label: "Cut", shortcut: "Ctrl+X", action: () => cutEntities(selection) },
+        {
+          label: "Paste",
+          shortcut: "Ctrl+V",
+          disabled: !canPaste,
+          action: () => pasteEntities(single ? useSceneStore.getState().entities[single]?.parentId : null),
+        },
+        { label: "Paste as Child", disabled: !canPaste || !single, action: () => pasteEntities(single) },
+        { separator: true },
+        { label: "Duplicate", shortcut: "Ctrl+D", action: duplicateSelection },
+        { label: "Group Selection", shortcut: "Ctrl+G", disabled: selection.length < 2, action: groupSelection },
+        { label: "Rename", disabled: !single, action: () => setRenamingId(single) },
+        ...prefabMenuItems(single),
+        { separator: true },
+        { label: "Delete", shortcut: "Del", danger: true, action: deleteSelection },
+      ];
 
-  return (
-    <>
-      <div className="dropdown-overlay" onClick={close} onContextMenu={(e) => { e.preventDefault(); close(); }} />
-      <div className="dropdown-menu context-menu" style={{ left: menu.x, top: menu.y }}>
-        {items.map((item, i) =>
-          item.separator ? (
-            <div key={i} className="menu-separator" />
-          ) : (
-            <button
-              key={item.label}
-              className="dropdown-item"
-              disabled={item.disabled}
-              onClick={() => {
-                close();
-                item.action();
-              }}
-            >
-              <span>{item.label}</span>
-              {item.shortcut && <span className="menu-shortcut">{item.shortcut}</span>}
-            </button>
-          ),
-        )}
-      </div>
-    </>
-  );
+  return <SharedContextMenu x={menu.x} y={menu.y} items={items} onClose={close} />;
 }
 
 export function HierarchyPanel() {
@@ -1045,7 +1082,15 @@ export function HierarchyPanel() {
   // Search → match index. Recomputed only when the query or scene changes;
   // empty query short-circuits to `null` so the tree falls back to normal
   // (unfiltered) rendering.
-  const entities = useSceneStore((s) => s.entities);
+  //
+  // Subscribe to the entities map ONLY while a query is active: rows track
+  // their own entity via per-id selectors, but a whole-map subscription
+  // here re-rendered the entire panel (every un-memoized row, its prefab
+  // diff, its visibility icons) on EVERY gizmo-drag frame — sceneStore's
+  // updateTransform replaces the map object per pointermove. With no
+  // query the selector returns a stable null and drag frames skip React
+  // entirely.
+  const entities = useSceneStore((s) => (searchQuery.trim() ? s.entities : null));
   const searchMatches = useMemo(() => buildSearchIndex(rootIds, entities, searchQuery), [rootIds, entities, searchQuery]);
   // No more ancestor-aware collapse overlay: in search mode the row hides
   // anything that isn't a match, so the user's saved `collapsedIds` is
@@ -1123,6 +1168,8 @@ export function HierarchyPanel() {
   };
 
   const onRowContextMenu = (e, id) => {
+    // A row mid-rename is a text field; let the edit menu win.
+    if (isTextEditTarget(e.target)) return;
     e.preventDefault();
     e.stopPropagation();
     if (!useSelectionStore.getState().ids.includes(id)) {
@@ -1155,39 +1202,21 @@ export function HierarchyPanel() {
           {menuOpen && (
             <>
               <div className="dropdown-overlay" onClick={() => setMenuOpen(false)} />
-              <div className="dropdown-menu">
+              <div className="dropdown-menu component-menu">
                 <div className="dropdown-section-label">Scene</div>
-                <button key="New Scene" className="dropdown-item" onClick={createScene}>
-                  New Scene
+                <button key="New Scene" className="dropdown-item component-item" onClick={createScene}>
+                  <FileCode2 size={14} style={{ color: "#8ea0b5" }} className="component-item-icon" />
+                  <span className="component-item-label">New Scene</span>
                 </button>
                 <div className="dropdown-section-label">Entity</div>
-                {COMMON_PRESETS.map((p) => (
-                  <button key={p.label} className="dropdown-item" onClick={() => createEntity(p.spec)}>
-                    {p.label}
-                  </button>
+                {[...COMMON_PRESETS, ...(terrainEnabled ? [TERRAIN_PRESET] : [])].map((p) => (
+                  <PresetItem key={p.label} preset={p} onPick={createEntity} />
                 ))}
-                {terrainEnabled && (
-                  <button
-                    key={TERRAIN_PRESET.label}
-                    className="dropdown-item"
-                    onClick={() => createEntity(TERRAIN_PRESET.spec)}
-                  >
-                    {TERRAIN_PRESET.label}
-                  </button>
-                )}
                 <div className="dropdown-section-label">UI</div>
-                <button
-                  key={UI_SCREEN_PRESET.label}
-                  className="dropdown-item"
-                  onClick={() => createEntity(UI_SCREEN_PRESET.spec)}
-                >
-                  {UI_SCREEN_PRESET.label}
-                </button>
+                <PresetItem preset={UI_SCREEN_PRESET} onPick={createEntity} />
                 {isParentUiScreen(useSelectionStore.getState().ids[0] ?? null) &&
                   UI_ELEMENT_PRESETS.map((p) => (
-                    <button key={p.label} className="dropdown-item" onClick={() => createEntity(p.spec)}>
-                      {p.label}
-                    </button>
+                    <PresetItem key={p.label} preset={p} onPick={createEntity} />
                   ))}
               </div>
             </>
@@ -1206,7 +1235,8 @@ export function HierarchyPanel() {
           <input
             className="hierarchy-search-input"
             type="text"
-            placeholder="Search hierarchy…"
+            placeholder="Search name, component, tag:…"
+            title="Search by name or component type. Prefix with tag: to search tags only."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             onKeyDown={(e) => {
@@ -1267,6 +1297,12 @@ export function HierarchyPanel() {
           }
           if (e.target === e.currentTarget) useSelectionStore.getState().clear();
         }}
+        onContextMenu={(e) => {
+          // Rows stop propagation, so anything reaching here is empty space.
+          e.preventDefault();
+          e.stopPropagation();
+          setContextMenu({ x: e.clientX, y: e.clientY, empty: true });
+        }}
       >
         {(searchMatches ? sortedMatchIds : rootIds).map((id) => (
           <EntityRow
@@ -1294,7 +1330,14 @@ export function HierarchyPanel() {
         )}
       </div>
       {contextMenu && (
-        <ContextMenu menu={contextMenu} close={() => setContextMenu(null)} setRenamingId={setRenamingId} />
+        <ContextMenu
+          menu={contextMenu}
+          close={() => setContextMenu(null)}
+          setRenamingId={setRenamingId}
+          onCreate={createEntity}
+          onNewScene={createScene}
+          terrainEnabled={terrainEnabled}
+        />
       )}
       {ghostPos && draggingIds.length > 0 && (
         <div className="hierarchy-drag-ghost" style={{ left: ghostPos.x, top: ghostPos.y }}>

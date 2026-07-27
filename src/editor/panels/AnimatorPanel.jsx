@@ -24,6 +24,7 @@ import { useSceneStore } from "../store/sceneStore.js";
 import { engine } from "../engineInstance.js";
 import { ANY_STATE, START_STATE } from "../../engine/animGraph.js";
 import { setGraphHovered } from "../nodegraph/graphContext.js";
+import { ContextMenu } from "../ContextMenu.jsx";
 
 /**
  * Node-graph editor for .anim animation-controller assets (Unity-style):
@@ -852,20 +853,30 @@ function AnimatorEditor({ animPath }) {
     return () => cancelAnimationFrame(raf);
   }, [nodes, updateNodeInternals]);
 
-  // Re-scan the scene every frame so the param-values playground tracks adds
-  // and removes of Animation components referencing this controller.
+  // Track adds/removes of Animation components referencing this controller.
+  // Event-driven: the old per-frame RAF re-scan walked every entity AND
+  // returned a fresh array each frame — a guaranteed full panel re-render
+  // at 60Hz for as long as the Animator was open. The scene only changes
+  // through commands, which emit these events.
   const [boundComponents, setBoundComponents] = useState([]);
   useEffect(() => {
-    let alive = true;
     const refresh = () => {
-      if (!alive) return;
-      setBoundComponents(componentsUsing(animPath));
-      requestAnimationFrame(refresh);
+      setBoundComponents((prev) => {
+        const next = componentsUsing(animPath);
+        // Keep the previous array identity when nothing changed so React
+        // bails out of the re-render entirely.
+        if (prev.length === next.length && prev.every((c, i) => c === next[i])) return prev;
+        return next;
+      });
     };
-    const id = requestAnimationFrame(refresh);
+    refresh();
+    const unsubs = [
+      engine.on?.("hierarchy-changed", refresh),
+      engine.on?.("component-changed", refresh),
+      engine.on?.("model-loaded", refresh),
+    ];
     return () => {
-      alive = false;
-      cancelAnimationFrame(id);
+      for (const un of unsubs) un?.();
     };
   }, [animPath]);
 
@@ -884,9 +895,16 @@ function AnimatorEditor({ animPath }) {
   useEffect(() => {
     if (!playMode) return;
     let alive = true;
-    const loop = () => {
+    let last = 0;
+    // 10Hz readout refresh (same cadence as the stats overlay) — it's a
+    // parameter READOUT, and a full panel re-render every frame during
+    // play mode was a measurable FPS cost.
+    const loop = (t) => {
       if (!alive) return;
-      setLiveTick((t) => (t + 1) & 0xffff);
+      if (t - last >= 100) {
+        last = t;
+        setLiveTick((v) => (v + 1) & 0xffff);
+      }
       requestAnimationFrame(loop);
     };
     const id = requestAnimationFrame(loop);
@@ -1164,6 +1182,7 @@ function AnimatorEditor({ animPath }) {
             }}
             onPaneContextMenu={(e) => {
               e.preventDefault();
+              e.stopPropagation();
               setCanvasMenu({ x: e.clientX, y: e.clientY });
             }}
             deleteKeyCode={["Delete", "Backspace"]}
@@ -1176,14 +1195,12 @@ function AnimatorEditor({ animPath }) {
             <Controls showInteractive={false} />
           </ReactFlow>
           {canvasMenu && (
-            <>
-              <div className="dropdown-overlay" onClick={() => setCanvasMenu(null)} />
-              <div className="dropdown-menu context-menu" style={{ left: canvasMenu.x, top: canvasMenu.y }}>
-                <button className="dropdown-item" onClick={() => addState(canvasMenu)}>
-                  New State
-                </button>
-              </div>
-            </>
+            <ContextMenu
+              x={canvasMenu.x}
+              y={canvasMenu.y}
+              items={[{ label: "New State", action: () => addState(canvasMenu) }]}
+              onClose={() => setCanvasMenu(null)}
+            />
           )}
         </div>
       </div>

@@ -5,6 +5,7 @@ import { getDracoWasm } from "./dracoWasm.js";
 import { useModulesStore } from "./modules.js";
 import { useAssetProcessingStore } from "./store/assetProcessingStore.js";
 import { basename } from "./store/projectStore.js";
+import { writeBinaryFile } from "./assetLoader.js";
 
 /**
  * Editor-side Draco compression of imported models (enabled by the "draco"
@@ -85,7 +86,7 @@ async function compressGlbInPlaceImpl(glbPath) {
   // Keep the compressed result only if it actually saved space; some already
   // lean or point-cloud-free models can grow.
   if (out.byteLength < originalBytes.byteLength) {
-    await invoke("write_binary_file", { path: glbPath, contents: Array.from(out) });
+    await writeBinaryFile(glbPath, out);
     const info = { original: originalBytes.byteLength, compressed: out.byteLength };
     await writeDracoMeta(glbPath, info);
     return info;

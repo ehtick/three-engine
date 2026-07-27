@@ -51,48 +51,59 @@ const num = (key, label, def, extra = {}) => ({ key, label, type: "number", defa
 const v3 = (key, label, def) => ({ key, label, type: "vec3", default: def });
 const col = (key, label, def) => ({ key, label, type: "color", default: def });
 
+// Port helpers. The `type` drives the editor's socket colours and its
+// connection validation (src/editor/nodegraph/socketTypes.js); the compiler
+// ignores it, and TSL broadcasting means float/vec3 mixes stay legal.
+const port = (key, label, type = "any") => ({ key, label, type });
+const pv3 = (key, label) => port(key, label, "vec3");
+const pf = (key, label) => port(key, label, "float");
+const pcol = (key, label) => port(key, label, "color");
+
+/** Emitters all expose the same two typed outputs. */
+const EMIT_OUT = (dirLabel = "dir") => [pv3("pos", "pos"), pv3("dir", dirLabel)];
+
 export const P_NODE_TYPES = {
   // --- Emitters: where particles are born. Outputs: pos + dir. -------------
   emitPoint: {
     label: "Point",
     category: "emitter",
     inputs: [],
-    outputs: [{ key: "pos", label: "pos" }, { key: "dir", label: "dir" }],
+    outputs: EMIT_OUT(),
     params: [v3("offset", "Offset", [0, 0, 0])],
   },
   emitSphere: {
     label: "Sphere",
     category: "emitter",
     inputs: [],
-    outputs: [{ key: "pos", label: "pos" }, { key: "dir", label: "dir" }],
+    outputs: EMIT_OUT(),
     params: [num("radius", "Radius", 0.5, { min: 0, step: 0.05 }), { key: "shell", label: "Shell only", type: "boolean", default: false }],
   },
   emitBox: {
     label: "Box",
     category: "emitter",
     inputs: [],
-    outputs: [{ key: "pos", label: "pos" }, { key: "dir", label: "dir" }],
+    outputs: EMIT_OUT(),
     params: [v3("size", "Size", [1, 1, 1])],
   },
   emitCone: {
     label: "Cone",
     category: "emitter",
     inputs: [],
-    outputs: [{ key: "pos", label: "pos" }, { key: "dir", label: "dir" }],
+    outputs: EMIT_OUT(),
     params: [num("radius", "Radius", 0.25, { min: 0, step: 0.05 }), num("angle", "Angle °", 25, { min: 0, max: 89 })],
   },
   emitCircle: {
     label: "Ring",
     category: "emitter",
     inputs: [],
-    outputs: [{ key: "pos", label: "pos" }, { key: "dir", label: "dir" }],
+    outputs: EMIT_OUT(),
     params: [num("radius", "Radius", 1, { min: 0, step: 0.05 })],
   },
   emitMesh: {
     label: "Mesh Surface",
     category: "emitter",
     inputs: [],
-    outputs: [{ key: "pos", label: "pos" }, { key: "dir", label: "normal" }],
+    outputs: EMIT_OUT("normal"),
     params: [
       { key: "path", label: "Model", type: "asset", exts: ["glb"], default: "" },
       num("scale", "Scale", 1, { min: 0.01, step: 0.1 }),
@@ -102,7 +113,7 @@ export const P_NODE_TYPES = {
     label: "This Mesh",
     category: "emitter",
     inputs: [],
-    outputs: [{ key: "pos", label: "pos" }, { key: "dir", label: "normal" }],
+    outputs: EMIT_OUT("normal"),
     params: [
       { key: "mode", label: "Mode", type: "select", options: ["surface", "volume"], default: "surface" },
       num("scale", "Scale", 1, { min: 0.01, step: 0.1 }),
@@ -110,28 +121,28 @@ export const P_NODE_TYPES = {
   },
 
   // --- Particle attributes (context-dependent reads) -----------------------
-  pAge: { label: "Age", category: "attribute", inputs: [], outputs: [{ key: "out", label: "s" }], params: [] },
-  pLife: { label: "Life 0–1", category: "attribute", inputs: [], outputs: [{ key: "out", label: "t" }], params: [] },
-  pPosition: { label: "Position", category: "attribute", inputs: [], outputs: [{ key: "out", label: "xyz" }], params: [] },
-  pVelocity: { label: "Velocity", category: "attribute", inputs: [], outputs: [{ key: "out", label: "xyz" }], params: [] },
+  pAge: { label: "Age", category: "attribute", inputs: [], outputs: [pf("out", "s")], params: [] },
+  pLife: { label: "Life 0–1", category: "attribute", inputs: [], outputs: [pf("out", "t")], params: [] },
+  pPosition: { label: "Position", category: "attribute", inputs: [], outputs: [pv3("out", "xyz")], params: [] },
+  pVelocity: { label: "Velocity", category: "attribute", inputs: [], outputs: [pv3("out", "xyz")], params: [] },
   pRandom: {
     label: "Random",
     category: "attribute",
     inputs: [],
-    outputs: [{ key: "out", label: "f" }],
+    outputs: [pf("out", "f")],
     params: [num("seed", "Seed", 1), num("min", "Min", 0), num("max", "Max", 1)],
   },
-  simTime: { label: "Time", category: "attribute", inputs: [], outputs: [{ key: "out", label: "s" }], params: [] },
+  simTime: { label: "Time", category: "attribute", inputs: [], outputs: [pf("out", "s")], params: [] },
 
   // --- Values ---------------------------------------------------------------
-  float: { label: "Float", category: "value", inputs: [], outputs: [{ key: "out", label: "f" }], params: [num("value", "Value", 1)] },
-  vec3: { label: "Vec3", category: "value", inputs: [], outputs: [{ key: "out", label: "xyz" }], params: [v3("value", "Value", [0, 1, 0])] },
-  color: { label: "Color", category: "value", inputs: [], outputs: [{ key: "out", label: "rgb" }], params: [col("value", "Color", "#ffffff")] },
+  float: { label: "Float", category: "value", inputs: [], outputs: [pf("out", "f")], params: [num("value", "Value", 1)] },
+  vec3: { label: "Vec3", category: "value", inputs: [], outputs: [pv3("out", "xyz")], params: [v3("value", "Value", [0, 1, 0])] },
+  color: { label: "Color", category: "value", inputs: [], outputs: [pcol("out", "rgb")], params: [col("value", "Color", "#ffffff")] },
   gradient: {
     label: "Gradient",
     category: "value",
-    inputs: [{ key: "t", label: "t (life)" }],
-    outputs: [{ key: "out", label: "rgb" }],
+    inputs: [pf("t", "t (life)")],
+    outputs: [pcol("out", "rgb")],
     params: [col("from", "From", "#ffd27f"), col("to", "To", "#ff3300")],
   },
   blackbody: {
@@ -139,49 +150,49 @@ export const P_NODE_TYPES = {
     category: "value",
     // Fire-spectrum ramp: t (heat, 0..1) → dark → ember red → orange →
     // yellow → white-hot. Reads more like flame than a two-colour gradient.
-    inputs: [{ key: "t", label: "t (heat)" }],
-    outputs: [{ key: "out", label: "rgb" }],
+    inputs: [pf("t", "t (heat)")],
+    outputs: [pcol("out", "rgb")],
     params: [num("intensity", "Intensity", 1, { min: 0, step: 0.1 })],
   },
 
   // --- Math -------------------------------------------------------------------
-  add: { label: "Add", category: "math", inputs: [{ key: "a", label: "a" }, { key: "b", label: "b" }], outputs: [{ key: "out", label: "=" }], params: [] },
-  multiply: { label: "Multiply", category: "math", inputs: [{ key: "a", label: "a" }, { key: "b", label: "b" }], outputs: [{ key: "out", label: "=" }], params: [] },
+  add: { label: "Add", category: "math", inputs: [port("a", "a"), port("b", "b")], outputs: [port("out", "=")], params: [] },
+  multiply: { label: "Multiply", category: "math", inputs: [port("a", "a"), port("b", "b")], outputs: [port("out", "=")], params: [] },
   mix: {
     label: "Mix",
     category: "math",
-    inputs: [{ key: "a", label: "a" }, { key: "b", label: "b" }, { key: "t", label: "t" }],
-    outputs: [{ key: "out", label: "=" }],
+    inputs: [port("a", "a"), port("b", "b"), pf("t", "t")],
+    outputs: [port("out", "=")],
     params: [],
   },
   remap: {
     label: "Remap",
     category: "math",
-    inputs: [{ key: "v", label: "v" }],
-    outputs: [{ key: "out", label: "=" }],
+    inputs: [port("v", "v")],
+    outputs: [port("out", "=")],
     params: [num("inMin", "In min", 0), num("inMax", "In max", 1), num("outMin", "Out min", 0), num("outMax", "Out max", 1)],
   },
   sine: {
     label: "Sine",
     category: "math",
-    inputs: [{ key: "t", label: "t" }],
-    outputs: [{ key: "out", label: "=" }],
+    inputs: [pf("t", "t")],
+    outputs: [pf("out", "=")],
     params: [num("frequency", "Frequency", 1), num("amplitude", "Amplitude", 1), num("phase", "Phase", 0)],
   },
-  normalizeV: { label: "Normalize", category: "math", inputs: [{ key: "v", label: "v" }], outputs: [{ key: "out", label: "n̂" }], params: [] },
-  lengthV: { label: "Length", category: "math", inputs: [{ key: "v", label: "v" }], outputs: [{ key: "out", label: "f" }], params: [] },
+  normalizeV: { label: "Normalize", category: "math", inputs: [pv3("v", "v")], outputs: [pv3("out", "n̂")], params: [] },
+  lengthV: { label: "Length", category: "math", inputs: [pv3("v", "v")], outputs: [pf("out", "f")], params: [] },
   combine: {
     label: "Combine XYZ",
     category: "math",
-    inputs: [{ key: "x", label: "x" }, { key: "y", label: "y" }, { key: "z", label: "z" }],
-    outputs: [{ key: "out", label: "xyz" }],
+    inputs: [pf("x", "x"), pf("y", "y"), pf("z", "z")],
+    outputs: [pv3("out", "xyz")],
     params: [],
   },
   split: {
     label: "Split XYZ",
     category: "math",
-    inputs: [{ key: "v", label: "v" }],
-    outputs: [{ key: "x", label: "x" }, { key: "y", label: "y" }, { key: "z", label: "z" }],
+    inputs: [pv3("v", "v")],
+    outputs: [pf("x", "x"), pf("y", "y"), pf("z", "z")],
     params: [],
   },
 
@@ -189,75 +200,75 @@ export const P_NODE_TYPES = {
   noise: {
     label: "Noise",
     category: "noise",
-    inputs: [{ key: "p", label: "p" }],
-    outputs: [{ key: "out", label: "f" }],
+    inputs: [pv3("p", "p")],
+    outputs: [pf("out", "f")],
     params: [num("frequency", "Frequency", 1), num("speed", "Scroll", 0.3), num("amplitude", "Amplitude", 1)],
   },
   noiseField: {
     label: "Noise Field",
     category: "noise",
-    inputs: [{ key: "p", label: "p" }],
-    outputs: [{ key: "out", label: "xyz" }],
+    inputs: [pv3("p", "p")],
+    outputs: [pv3("out", "xyz")],
     params: [num("frequency", "Frequency", 1), num("speed", "Scroll", 0.3), num("amplitude", "Amplitude", 1)],
   },
   curl: {
     label: "Curl Noise",
     category: "noise",
-    inputs: [{ key: "p", label: "p" }],
-    outputs: [{ key: "out", label: "xyz" }],
+    inputs: [pv3("p", "p")],
+    outputs: [pv3("out", "xyz")],
     params: [num("frequency", "Frequency", 0.6), num("speed", "Scroll", 0.25), num("amplitude", "Amplitude", 1)],
   },
   worley: {
     label: "Worley",
     category: "noise",
-    inputs: [{ key: "p", label: "p" }],
-    outputs: [{ key: "out", label: "f" }],
+    inputs: [pv3("p", "p")],
+    outputs: [pf("out", "f")],
     params: [num("frequency", "Frequency", 1), num("speed", "Scroll", 0.2), num("amplitude", "Amplitude", 1)],
   },
   fractal: {
     label: "Fractal Noise",
     category: "noise",
-    inputs: [{ key: "p", label: "p" }],
-    outputs: [{ key: "out", label: "f" }],
+    inputs: [pv3("p", "p")],
+    outputs: [pf("out", "f")],
     params: [num("frequency", "Frequency", 1), num("octaves", "Octaves", 3, { min: 1, max: 6, step: 1 }), num("speed", "Scroll", 0.2), num("amplitude", "Amplitude", 1)],
   },
 
   // --- Forces: vec3 accelerations wired (usually via Add) into System.force ---
-  gravity: { label: "Gravity", category: "force", inputs: [], outputs: [{ key: "out", label: "F" }], params: [v3("vector", "m/s²", [0, -9.8, 0])] },
-  drag: { label: "Drag", category: "force", inputs: [], outputs: [{ key: "out", label: "F" }], params: [num("amount", "Amount", 1, { min: 0 })] },
+  gravity: { label: "Gravity", category: "force", inputs: [], outputs: [pv3("out", "F")], params: [v3("vector", "m/s²", [0, -9.8, 0])] },
+  drag: { label: "Drag", category: "force", inputs: [], outputs: [pv3("out", "F")], params: [num("amount", "Amount", 1, { min: 0 })] },
   turbulence: {
     label: "Turbulence",
     category: "force",
     inputs: [],
-    outputs: [{ key: "out", label: "F" }],
+    outputs: [pv3("out", "F")],
     params: [num("frequency", "Frequency", 0.6), num("strength", "Strength", 2), num("speed", "Scroll", 0.3)],
   },
   vortex: {
     label: "Vortex",
     category: "force",
     inputs: [],
-    outputs: [{ key: "out", label: "F" }],
+    outputs: [pv3("out", "F")],
     params: [v3("center", "Center", [0, 0, 0]), v3("axis", "Axis", [0, 1, 0]), num("strength", "Swirl", 5), num("pull", "Pull in", 0.5)],
   },
   attract: {
     label: "Attractor",
     category: "force",
     inputs: [],
-    outputs: [{ key: "out", label: "F" }],
+    outputs: [pv3("out", "F")],
     params: [v3("point", "Point", [0, 2, 0]), num("strength", "Strength", 5), num("falloff", "Falloff", 1, { min: 0 })],
   },
   buoyancy: {
     label: "Buoyancy",
     category: "force",
     inputs: [],
-    outputs: [{ key: "out", label: "F" }],
+    outputs: [pv3("out", "F")],
     params: [num("strength", "Heat", 3), num("flicker", "Flicker", 0.5)],
   },
   wind: {
     label: "Wind",
     category: "force",
     inputs: [],
-    outputs: [{ key: "out", label: "F" }],
+    outputs: [pv3("out", "F")],
     params: [v3("direction", "Direction", [1, 0, 0]), num("strength", "Strength", 1), num("gustiness", "Gustiness", 0.5), num("gustFrequency", "Gust freq", 0.5)],
   },
 
@@ -266,12 +277,12 @@ export const P_NODE_TYPES = {
     label: "Particle System",
     category: "system",
     inputs: [
-      { key: "position", label: "spawn position" },
-      { key: "velocity", label: "spawn velocity" },
-      { key: "force", label: "force" },
-      { key: "size", label: "size" },
-      { key: "color", label: "color" },
-      { key: "opacity", label: "opacity" },
+      pv3("position", "spawn position"),
+      pv3("velocity", "spawn velocity"),
+      pv3("force", "force"),
+      pf("size", "size"),
+      pcol("color", "color"),
+      pf("opacity", "opacity"),
     ],
     outputs: [],
     params: [
@@ -300,6 +311,17 @@ export const P_NODE_TYPES = {
       { key: "selfCollision", label: "Self Collision", type: "boolean", default: false },
       num("collisionRadius", "Coll. Radius", 0.1, { min: 0.001, step: 0.01 }),
       num("collisionElasticity", "Coll. Elasticity", 0.5, { min: 0, max: 1, step: 0.05 }),
+
+      // --- GI integration ---------------------------------------------------
+      // Promotes the particle cloud to a DYNAMIC GI emitter: the same GPU
+      // cluster readback that drives the point lights below is published to the
+      // GI module's per-frame emitter slots instead. That makes the particles
+      // real light sources in the radiance field — they bounce colour onto
+      // nearby surfaces, cast the GI emissive shadow, and show up in mirrors —
+      // rather than faking it with a PointLight that GI only sees second-hand.
+      // No-op when the GI module isn't installed.
+      { key: "giEmission", label: "GI Emission", type: "boolean", default: false },
+      num("giEmissionStrength", "GI Emission Power", 1, { min: 0, step: 0.1 }),
 
       // --- Lighting integration: particles drive real point lights ---------
       num("lightCount", "Lights", 0, { min: 0, max: 8, step: 1 }),

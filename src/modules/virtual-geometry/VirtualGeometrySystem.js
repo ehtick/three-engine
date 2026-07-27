@@ -1,7 +1,7 @@
 import * as THREE from "three/webgpu";
 import { loadAssetMeta } from "../../engine/assetResolver.js";
 import { EDITOR_LAYER } from "../../engine/editorLayers.js";
-import { buildClusterDAG, selectClusters } from "./clusterBuilder.js";
+import { buildClusterDAG, selectClusterIds, gatherClusterIndices } from "./clusterBuilder.js";
 
 /**
  * Per-engine virtual-geometry runtime (installed by the module's setup()).
@@ -101,9 +101,41 @@ export function refreshVirtualGeometryAsset(path) {
   for (const sys of activeSystems) sys.refreshAsset(path);
 }
 
+/**
+ * Editor hook: the asset's TRIANGLES changed, not just its meta — the geometry
+ * editor saved over it.
+ *
+ * A cluster DAG is a set of indices into one specific triangle list, cached per
+ * asset path because every instance and every reload of that asset shares it.
+ * Once the file has been re-authored those indices point at different
+ * triangles, so the cache has to go or the mesh renders a LOD cut of the mesh
+ * it used to be.
+ *
+ * The swapped geometry is deliberately NOT put back: by the time this runs the
+ * caller has already placed the edited geometry on the mesh, and restoring the
+ * pre-edit one would visibly undo the save. Dropping the records is enough —
+ * the reload that follows fires `component-changed`, and `applyEntity`
+ * re-virtualizes from the geometry that is on the mesh by then.
+ */
+export function invalidateVirtualGeometryAsset(path) {
+  const np = normPath(path);
+  for (const key of [...dagCache.keys()]) {
+    // Keys are `${path}#${meshIndex}`.
+    if (normPath(key.slice(0, key.lastIndexOf("#"))) === np) dagCache.delete(key);
+  }
+  for (const sys of activeSystems) sys.forgetAsset(path);
+}
+
 export const VIRTUAL_GEOMETRY_META_DEFAULTS = {
   enabled: false,
   pixelError: 1,
+  // Camera-movement dead-band as a fraction of the distance to the mesh: the
+  // camera must move this fraction of its distance before the mesh recomputes
+  // its LOD cut. Because projected error scales as 1/distance, a fraction f of
+  // movement shifts the error budget by ~f, so f = 0.02 lags the LOD by at
+  // most ~2% of a pixel-error boundary (invisible) while skipping the vast
+  // majority of per-frame re-selections during smooth camera motion.
+  hysteresis: 0.02,
 };
 
 /** Ignores retired per-asset debug settings while normalizing stored meta. */
@@ -112,7 +144,18 @@ function resolveVgMeta(raw) {
   return {
     enabled: raw.enabled === true,
     pixelError: raw.pixelError ?? VIRTUAL_GEOMETRY_META_DEFAULTS.pixelError,
+    hysteresis: raw.hysteresis ?? VIRTUAL_GEOMETRY_META_DEFAULTS.hysteresis,
   };
+}
+
+// Runtime perf knob (project/module default; see index.js applySettings). Caps
+// how many meshes may rebuild their cut in a single frame so a dense scene
+// with a moving camera spreads the cost across frames instead of spiking.
+let maxUpdatesPerFrame = 8;
+
+/** Editor/host hook: pushes the module's runtime settings onto every engine. */
+export function setVirtualGeometryRuntimeConfig({ maxUpdatesPerFrame: m } = {}) {
+  if (Number.isFinite(m) && m > 0) maxUpdatesPerFrame = Math.floor(m);
 }
 
 // Debug visualization belongs to the editor viewport, not individual assets.
@@ -149,6 +192,7 @@ const normPath = (p) => (p ?? "").replace(/\\/g, "/");
 const _inv = new THREE.Matrix4();
 const _camWorld = new THREE.Vector3();
 const _camLocal = new THREE.Vector3();
+const _center = new THREE.Vector3();
 const _rgb = [0, 0, 0];
 
 export class VirtualGeometrySystem {
@@ -162,6 +206,8 @@ export class VirtualGeometrySystem {
     this.stats = { drawnTriangles: 0, totalTriangles: 0, drawnClusters: 0 };
     this.debugVisible = debugTrianglesVisible;
     this._pruneNeeded = false;
+    // Round-robin cursor into `records` for the per-frame update budget.
+    this._scanStart = 0;
     this._offModel = engine.on("model-loaded", (entity) => this.applyEntity(entity));
     this._offComponent = engine.on("component-changed", ({ entityId, componentType, key }) => {
       // MeshComponent emits this after its asynchronous .geom load completes.
@@ -181,7 +227,9 @@ export class VirtualGeometrySystem {
     visible = !!visible;
     if (this.debugVisible === visible) return;
     this.debugVisible = visible;
-    for (const r of this.records) r.hash = null;
+    // Force every record dirty so the debug overlay rebuilds/tears down on the
+    // next tick (debugVisible is folded into the discrete hash).
+    for (const r of this.records) r.discreteHash = null;
   }
 
   dispose() {
@@ -252,6 +300,12 @@ export class VirtualGeometrySystem {
 
     mesh.geometry = geometry;
     if (Array.isArray(mesh.material)) mesh.material = mesh.material[0]; // no group ranges
+    // This mesh's index buffer is now rewritten per frame to the selected
+    // cluster cut, so it can never share a draw with anything else. Opt it out
+    // of automatic batching (see engine/batching.js), which would otherwise
+    // freeze it at whatever LOD it held when the batch was built.
+    mesh.userData.noBatch = true;
+    this.engine.batching?.invalidate();
 
     const record = {
       mesh,
@@ -262,7 +316,16 @@ export class VirtualGeometrySystem {
       original: src,
       selClusters: new Uint32Array(dag.clusterCount),
       drawn: 0,
-      hash: null,
+      // Selection cache. selSig = FNV hash of the selected cluster SET; null
+      // until the first selection. discreteHash = hash of the non-continuous
+      // inputs (projection, viewport, mesh matrix, pixelError, debug). selCam*
+      // / selDist gate re-selection against smooth camera translation.
+      selSig: null,
+      discreteHash: null,
+      selCamX: 0,
+      selCamY: 0,
+      selCamZ: 0,
+      selDist: 0,
       debug: null,
     };
     virtualized.set(mesh, record);
@@ -270,10 +333,30 @@ export class VirtualGeometrySystem {
     this.engine.emit("virtual-geometry-ready", { mesh, path, dag });
   }
 
+  /**
+   * Stops tracking every mesh built from `path`, leaving whatever geometry is
+   * on them alone. See `invalidateVirtualGeometryAsset`.
+   */
+  forgetAsset(path) {
+    const np = normPath(path);
+    const dead = this.records.filter((r) => normPath(r.path) === np);
+    if (!dead.length) return;
+    this.records = this.records.filter((r) => normPath(r.path) !== np);
+    for (const r of dead) {
+      if (virtualized.get(r.mesh) === r) virtualized.delete(r.mesh);
+      this.#dropDebug(r);
+      // Only ours to free if the mesh has already moved on to something else.
+      if (r.mesh.geometry !== r.geometry) r.geometry.dispose();
+    }
+    this.engine.batching?.invalidate();
+  }
+
   /** Puts the original geometry back and drops per-record GPU state. */
   #restore(r) {
     if (virtualized.get(r.mesh) === r) {
       r.mesh.geometry = r.original;
+      r.mesh.userData.noBatch = false;
+      this.engine.batching?.invalidate();
       virtualized.delete(r.mesh);
     }
     this.#dropDebug(r);
@@ -309,7 +392,7 @@ export class VirtualGeometrySystem {
         // The tick looks settings up by the record's own path string, which
         // may differ from the editor's in slash direction — refresh it too.
         this.settings.set(r.path, vg);
-        r.hash = null;
+        r.discreteHash = null; // pixelError changes are folded into it
         matched++;
       }
     }
@@ -343,24 +426,15 @@ export class VirtualGeometrySystem {
 
   #tick() {
     if (this._pruneNeeded) this.#prune();
-    if (!this.records.length) return;
+    const records = this.records;
+    const n = records.length;
+    if (!n) return;
     const engine = this.engine;
     const camera = engine.camera;
     const renderer = engine.renderer;
     if (!camera || !renderer) return;
 
     const heightPx = renderer.domElement?.height || 1080;
-    // Camera part of the dirty hash. The cut depends only on the camera
-    // POSITION (plus projection/viewport for the pixel budget) — rotation is
-    // irrelevant by design, so orbiting/panning in place re-uploads nothing.
-    let camHash = 2166136261;
-    const mixCam = (v) => (camHash = ((camHash ^ Math.fround(v)) * 16777619) >>> 0);
-    const p = camera.projectionMatrix.elements;
-    mixCam(p[0]); mixCam(p[5]);
-    const cm = camera.matrixWorld.elements;
-    mixCam(cm[12]); mixCam(cm[13]); mixCam(cm[14]);
-    mixCam(heightPx);
-
     const isOrtho = !!camera.isOrthographicCamera;
     // Perspective: pxError = worldError * k / distance. Ortho: * k directly.
     const k = isOrtho
@@ -368,51 +442,111 @@ export class VirtualGeometrySystem {
       : heightPx / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov ?? 50) / 2));
     _camWorld.setFromMatrixPosition(camera.matrixWorld);
 
-    this.stats.drawnTriangles = 0;
-    this.stats.totalTriangles = 0;
-    this.stats.drawnClusters = 0;
-    for (const r of this.records) {
-      const vg = this.settings.get(r.path) ?? VIRTUAL_GEOMETRY_META_DEFAULTS;
-      this.stats.totalTriangles += r.dag.lod0IndexCount / 3;
+    // Base of the discrete (non-continuous) hash, shared by every record:
+    // projection scale, viewport height, debug toggle. A change here (resize,
+    // zoom, debug on/off) dirties all records at once.
+    let base = 2166136261;
+    const mixB = (v) => (base = ((base ^ Math.fround(v)) * 16777619) >>> 0);
+    const p = camera.projectionMatrix.elements;
+    mixB(p[0]); mixB(p[5]); mixB(heightPx); mixB(this.debugVisible ? 1 : 0);
 
-      let h = camHash;
-      const mix = (v) => (h = ((h ^ Math.fround(v)) * 16777619) >>> 0);
+    // Pass 1: refresh world matrices, fold in the per-record discrete inputs,
+    // and decide which records are dirty. Dirty = first selection, a discrete
+    // change, or the camera translated past this record's movement dead-band
+    // (perspective only — an ortho pan never changes projected error).
+    for (let i = 0; i < n; i++) {
+      const r = records[i];
+      r.mesh.updateWorldMatrix(true, false);
+      const vg = this.settings.get(r.path) ?? VIRTUAL_GEOMETRY_META_DEFAULTS;
+      r._vg = vg;
       const em = r.mesh.matrixWorld.elements;
+      let h = base;
+      const mix = (v) => (h = ((h ^ Math.fround(v)) * 16777619) >>> 0);
       mix(em[0]); mix(em[5]); mix(em[10]); mix(em[12]); mix(em[13]); mix(em[14]);
-      mix(vg.pixelError);
-      mix(this.debugVisible ? 1 : 0);
-      if (h !== r.hash) {
-        r.hash = h;
-        this.#select(r, vg, k, isOrtho);
+      mix(vg.pixelError ?? 1);
+      r._dHash = h;
+
+      let dirty = r.selSig === null || h !== r.discreteHash;
+      if (!dirty && !isOrtho) {
+        const dx = _camWorld.x - r.selCamX, dy = _camWorld.y - r.selCamY, dz = _camWorld.z - r.selCamZ;
+        const tol = (vg.hysteresis ?? VIRTUAL_GEOMETRY_META_DEFAULTS.hysteresis) * r.selDist;
+        if (dx * dx + dy * dy + dz * dz > tol * tol) dirty = true;
       }
-      this.stats.drawnTriangles += r.drawn / 3;
-      this.stats.drawnClusters += r._selStats?.drawnClusters ?? 0;
+      r._dirty = dirty;
     }
+
+    // Pass 2: process dirty records up to the per-frame budget, resuming from
+    // last frame's cursor so no mesh is starved when the scene has more moving
+    // virtual meshes than the budget allows.
+    let budget = maxUpdatesPerFrame > 0 ? maxUpdatesPerFrame : n;
+    let scanned = 0;
+    const start = this._scanStart % n;
+    while (scanned < n && budget > 0) {
+      const i = (start + scanned) % n;
+      scanned++;
+      const r = records[i];
+      if (!r._dirty) continue;
+      r.discreteHash = r._dHash;
+      // Distance to the mesh's bounding-sphere centre (world space) seeds the
+      // next frame's movement dead-band.
+      _center.set(r.dag.bounds[0], r.dag.bounds[1], r.dag.bounds[2]).applyMatrix4(r.mesh.matrixWorld);
+      r.selDist = _camWorld.distanceTo(_center);
+      r.selCamX = _camWorld.x; r.selCamY = _camWorld.y; r.selCamZ = _camWorld.z;
+      this.#select(r, r._vg, k, isOrtho);
+      budget--;
+    }
+    this._scanStart = (start + scanned) % n;
+
+    // Pass 3: aggregate stats over every record (processed or not).
+    let drawn = 0, total = 0, clusters = 0;
+    for (let i = 0; i < n; i++) {
+      const r = records[i];
+      total += r.dag.lod0IndexCount / 3;
+      drawn += r.drawn / 3;
+      clusters += r._selStats?.drawnClusters ?? 0;
+    }
+    this.stats.drawnTriangles = drawn;
+    this.stats.totalTriangles = total;
+    this.stats.drawnClusters = clusters;
   }
 
   #select(r, vg, k, isOrtho) {
     const mesh = r.mesh;
-    mesh.updateWorldMatrix(true, false);
+    // World matrix already refreshed in the tick's pass 1.
     _inv.copy(mesh.matrixWorld).invert();
     _camLocal.copy(_camWorld).applyMatrix4(_inv);
 
     const tau = Math.max(0.05, vg.pixelError ?? 1);
     const stats = (r._selStats ??= {});
-    const count = selectClusters(
-      r.dag, _camLocal.x, _camLocal.y, _camLocal.z,
-      k, isOrtho, tau, null, r.index.array, r.selClusters, stats,
+    const clusterCount = selectClusterIds(
+      r.dag, _camLocal.x, _camLocal.y, _camLocal.z, k, isOrtho, tau, r.selClusters, stats,
     );
-    r.drawn = count;
 
-    r.index.clearUpdateRanges();
-    if (count > 0) r.index.addUpdateRange(0, count);
-    r.index.needsUpdate = true;
-    r.geometry.setDrawRange(0, count);
+    // Signature of the selected cluster SET. The expensive part — rebuilding
+    // the index buffer and re-uploading it to the GPU — only runs when the set
+    // actually changed, which during smooth motion is far rarer than the
+    // per-frame re-selection itself.
+    let sig = 2166136261;
+    for (let s = 0; s < clusterCount; s++) sig = ((sig ^ r.selClusters[s]) * 16777619) >>> 0;
+    sig = ((sig ^ clusterCount) * 16777619) >>> 0;
+    const changed = sig !== r.selSig;
+
+    if (changed) {
+      r.selSig = sig;
+      const count = gatherClusterIndices(r.dag, r.selClusters, clusterCount, r.index.array);
+      r.drawn = count;
+      r.index.clearUpdateRanges();
+      if (count > 0) r.index.addUpdateRange(0, count);
+      r.index.needsUpdate = true;
+      r.geometry.setDrawRange(0, count);
+    }
 
     if (this.debugVisible) {
-      this.#updateDebug(r, count, stats.drawnClusters);
+      if (changed || !r.debug) this.#updateDebug(r, r.drawn, clusterCount);
       r.debug.mesh.visible = true;
-    } else if (r.debug) r.debug.mesh.visible = false;
+    } else if (r.debug) {
+      r.debug.mesh.visible = false;
+    }
   }
 
   /**

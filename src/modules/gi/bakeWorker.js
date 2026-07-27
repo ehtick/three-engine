@@ -8,7 +8,7 @@
 //     or FULL bake itself — so latest-wins job coalescing stays correct
 //   - results go back as changed-range SLICES (transferred), so the arrays
 //     persist here and the main thread applies cheap partial GPU uploads.
-import { allocateBakeArrays, recordWorldAabb, runBake, runIncrementalBake } from "./bakeCore.js";
+import { allocateBakeArrays, bakeMeshSdf, recordWorldAabb, runBake, runIncrementalBake } from "./bakeCore.js";
 
 let arrays = null;
 let prev = null; // persistent copy of the last result, diff baseline
@@ -37,11 +37,32 @@ const recordChanged = (old, next) =>
   !old ||
   old.geometryKey !== next.geometryKey ||
   old.emissiveIntensity !== next.emissiveIntensity ||
+  old.excludeFromDistanceField !== next.excludeFromDistanceField ||
   !colorsEqual(old.color, next.color) ||
   !colorsEqual(old.emissive, next.emissive) ||
   !matricesEqual(old.matrix, next.matrix);
 
 self.onmessage = (event) => {
+  // Per-mesh SDF bake requests share the worker (and its geometry cache).
+  if (event.data.type === "meshSdf") {
+    const { requestId, geometryKey, geometry, maxAxisRes } = event.data;
+    if (geometry) {
+      geometries.set(geometryKey, { positions: geometry.positions, index: geometry.index, localAabb: null });
+    }
+    const cached = geometries.get(geometryKey);
+    if (!cached) {
+      self.postMessage({ type: "meshSdf", requestId, error: `unknown geometry ${geometryKey}` });
+      return;
+    }
+    const started = performance.now();
+    const sdf = bakeMeshSdf(cached.positions, cached.index, maxAxisRes || undefined);
+    self.postMessage(
+      { type: "meshSdf", requestId, geometryKey, sdf, elapsed: performance.now() - started },
+      [sdf.data.buffer],
+    );
+    return;
+  }
+
   const { jobId, records: wire, bounds, res, cell, lights } = event.data;
   const cellCount = res.x * res.y * res.z;
   if (cellCount !== allocatedCellCount) {

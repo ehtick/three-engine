@@ -28,6 +28,9 @@ import {
 export class SoundComponent extends Component {
   static type = "sound";
   static label = "Sound";
+  // A sound a script started during Play would otherwise keep playing after
+  // the user pressed Stop — onDetach is what silences live sources.
+  static resetOnStop = true;
   static defaults = SOUND_COMPONENT_DEFAULTS;
   static schema = [
     { key: "occlusionEnabled", label: "Occlusion", type: "boolean", section: "Sound" },

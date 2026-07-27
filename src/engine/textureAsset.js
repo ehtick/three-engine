@@ -15,15 +15,46 @@ let basisCompressionEnabled = false;
 // such task leaves the material permanently white. The editable source image is
 // always retained specifically as a safe fallback; do not wait forever.
 //
-// A warm worker transcodes in well under a second, so anything past a few
-// seconds is a broken worker, not a slow one — don't budget for the hang.
-const BASIS_LOAD_TIMEOUT_MS = 5000;
+// The timeout only guards a genuine HANG. It is deliberately not tight: a real
+// transcode of a large (2K–4K) texture on a cold worker can take a second or
+// two, and it only ever runs while this task actually holds a worker (see the
+// concurrency gate below), so a busy queue never eats into the budget.
+const BASIS_LOAD_TIMEOUT_MS = 12000;
 
-// A hung/broken transcoder fails the same way for every texture. Without this
-// latch each one independently burns the full timeout, turning a single fault
-// into minutes of white geometry on startup. First failure disables Basis for
-// the session; the source images load in ~400ms.
+// KTX2Loader transcodes on a small worker pool. Firing dozens of loads at once
+// (a multi-material GLB import does exactly this) means most sit queued behind
+// the few in flight — and because each load's timeout starts when it is
+// REQUESTED, the queued ones blow the deadline before a worker ever reaches
+// them, misreporting a healthy transcoder as broken. Gate submissions to the
+// pool size so every started transcode is measured, not its wait in line.
+const BASIS_MAX_CONCURRENT = 4;
+
+// Distinguish a transient overload (some timeouts, but the transcoder works)
+// from a genuinely dead transcoder. A single timeout falls back for that one
+// texture only; the whole session is disabled only after this many consecutive
+// timeouts with zero successes between them, or immediately on a worker error.
+const BASIS_TIMEOUT_GIVEUP = 4;
+
+// Latched off for the rest of the session once the transcoder is proven broken
+// (worker error, or repeated hangs). Source images load in ~400ms as fallback.
 let basisDisabledForSession = false;
+let basisConsecutiveTimeouts = 0;
+
+// Simple counting semaphore bounding concurrent transcodes to the pool size.
+let basisInFlight = 0;
+const basisWaiters = [];
+function acquireBasisSlot() {
+  if (basisInFlight < BASIS_MAX_CONCURRENT) {
+    basisInFlight++;
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => basisWaiters.push(resolve));
+}
+function releaseBasisSlot() {
+  const next = basisWaiters.shift();
+  if (next) next(); // hand the slot straight to the next waiter
+  else basisInFlight--;
+}
 
 async function loadBasisWithTimeout(loader, url) {
   let timer = null;
@@ -79,17 +110,26 @@ async function getBasisLoader() {
       // WorkerPool ignores worker errors) never replies at all. Every texture
       // then hangs until the timeout below. See git history for the 20s
       // white-geometry startup this caused.
-      const loader = new KTX2Loader().setTranscoderPath("basis/").detectSupport(textureRenderer);
+      const loader = new KTX2Loader()
+        .setTranscoderPath("basis/")
+        .setWorkerLimit(BASIS_MAX_CONCURRENT) // keep the pool and our gate in lock-step
+        .detectSupport(textureRenderer);
       await loader.init();
 
       // WorkerPool has no 'error' handling, so without this a broken worker is
-      // completely silent. Keep the failure loud.
+      // completely silent. A worker error means the transcoder itself is dead
+      // (bad build/path) — every transcode will hang — so latch Basis off for
+      // the session immediately instead of waiting out timeouts one by one.
       const createWorker = loader.workerPool.workerCreator;
       loader.workerPool.setWorkerCreator(() => {
         const worker = createWorker();
-        worker.addEventListener("error", (e) =>
-          console.error(`Basis transcode worker failed: ${e.message} (${e.filename}:${e.lineno})`),
-        );
+        worker.addEventListener("error", (e) => {
+          basisDisabledForSession = true;
+          console.error(
+            `Basis transcode worker failed (${e.message} @ ${e.filename}:${e.lineno}); ` +
+              `using source images for the rest of this session.`,
+          );
+        });
         return worker;
       });
 
@@ -110,20 +150,34 @@ export async function loadTextureAsset(path, { colorSpace = null } = {}) {
   let texture = null;
 
   if (basisCompressionEnabled && meta?.basis?.enabled && !basisDisabledForSession) {
+    await acquireBasisSlot();
     try {
-      const loader = await getBasisLoader();
-      if (loader) {
-        texture = await loadBasisWithTimeout(loader, await resolveAssetUrl(`${path}.basis`));
+      // A peer that failed while we waited in the queue may have latched Basis
+      // off — don't start a transcode we already know will be wasted.
+      if (!basisDisabledForSession) {
+        const loader = await getBasisLoader();
+        if (loader) {
+          texture = await loadBasisWithTimeout(loader, await resolveAssetUrl(`${path}.basis`));
+          basisConsecutiveTimeouts = 0; // a success clears the strike count
+        }
       }
     } catch (err) {
-      // The source image is always retained, so this is recoverable — but a
-      // transcoder that fails once fails for everything, so stop paying the
-      // timeout per texture and take the fallback for the rest of the session.
-      basisDisabledForSession = true;
-      console.warn(
-        `Basis transcoding failed; using source images for the rest of this session. ` +
-          `First failure: "${path}" — ${err.message ?? err}`,
-      );
+      // The source image is always retained, so this is recoverable. A lone
+      // timeout (a big texture, a momentarily overloaded pool) falls back for
+      // this texture only; the session is disabled only once hangs pile up with
+      // no success between them, i.e. the transcoder is genuinely stuck.
+      const isTimeout = /timed out/.test(err.message ?? "");
+      if (isTimeout && ++basisConsecutiveTimeouts < BASIS_TIMEOUT_GIVEUP) {
+        console.warn(`Basis transcode fell back to source for "${path}" — ${err.message ?? err}`);
+      } else {
+        basisDisabledForSession = true;
+        console.warn(
+          `Basis transcoding failed; using source images for the rest of this session. ` +
+            `Last failure: "${path}" — ${err.message ?? err}`,
+        );
+      }
+    } finally {
+      releaseBasisSlot();
     }
   }
 

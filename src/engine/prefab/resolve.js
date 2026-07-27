@@ -100,6 +100,11 @@ export function applyOverrides(tree, overrides = [], seen) {
         if (node && FLAG_KEYS.includes(ov.key)) node[ov.key] = ov.v;
         break;
       }
+      case "tags": {
+        const node = findByPath(tree, path);
+        if (node) node.tags = clone(ov.v) ?? [];
+        break;
+      }
       case "name": {
         const node = findByPath(tree, path);
         if (node) node.name = ov.v;
@@ -151,6 +156,7 @@ function resolveNode(node, seen) {
     viewOnly: node.viewOnly ?? false,
     enabledInEditor: node.enabledInEditor !== false,
     enabledInGame: node.enabledInGame !== false,
+    tags: clone(node.tags) ?? [],
     components: (node.components ?? []).map((c) => ({ type: c.type, props: clone(c.props) ?? {} })),
     children: (node.children ?? []).map((c) => resolveNode(c, seen)).filter(Boolean),
   };

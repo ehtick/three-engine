@@ -27,6 +27,7 @@ import { isGraphHovered } from "./nodegraph/graphContext.js";
 import { dispatchVisibilityKeyAction } from "./keybindings.js";
 import { dispatchTerrainKeyAction } from "./terrainBrush.js";
 import { useGeometryEditStore } from "./store/geometryEditStore.js";
+import { GlobalContextMenu } from "./nativeContextMenu.jsx";
 
 /**
  * Editor "chrome": the menu bar, scene restore on first mount, keyboard
@@ -200,7 +201,12 @@ export function EditorChrome() {
     return () => window.removeEventListener("keydown", blockGeometryReload, true);
   }, []);
 
-  return <MenuBar />;
+  return (
+    <>
+      <MenuBar />
+      <GlobalContextMenu />
+    </>
+  );
 }
 
 // Tracks the project key (see useProjectStore selector above) the boot

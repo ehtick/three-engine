@@ -538,3 +538,73 @@ export function selectClusters(dag, camX, camY, camZ, k, isOrtho, tau, planes, o
   }
   return cursor;
 }
+
+/**
+ * The selection test WITHOUT the index gather: writes the ids of the clusters
+ * that belong in the cut into `outClusters` and returns how many. Same flat,
+ * order-independent test as selectClusters (see that function's docstring) —
+ * split out so the runtime can compare the selected SET against last frame's
+ * and skip the (comparatively expensive) index buffer rebuild + GPU re-upload
+ * whenever the cut didn't actually change. Allocation-free; MESH-LOCAL space.
+ */
+export function selectClusterIds(dag, camX, camY, camZ, k, isOrtho, tau, outClusters, stats = null) {
+  const meta = dag.clusterMeta;
+  const n = dag.clusterCount;
+  let drawn = 0;
+  for (let i = 0; i < n; i++) {
+    const o = i * CLUSTER_STRIDE;
+
+    const selfErr = meta[o + 8];
+    if (selfErr > 0) {
+      let px;
+      if (isOrtho) {
+        px = selfErr * k;
+      } else {
+        const dx = meta[o + 4] - camX, dy = meta[o + 5] - camY, dz = meta[o + 6] - camZ;
+        const d = Math.sqrt(dx * dx + dy * dy + dz * dz) - meta[o + 7];
+        px = d > 0 ? (selfErr * k) / d : Infinity;
+      }
+      if (px > tau) continue;
+    }
+
+    const parentErr = meta[o + 13];
+    if (parentErr !== Infinity) {
+      let px;
+      if (isOrtho) {
+        px = parentErr * k;
+      } else {
+        const dx = meta[o + 9] - camX, dy = meta[o + 10] - camY, dz = meta[o + 11] - camZ;
+        const d = Math.sqrt(dx * dx + dy * dy + dz * dz) - meta[o + 12];
+        px = d > 0 ? (parentErr * k) / d : Infinity;
+      }
+      if (px <= tau) continue;
+    }
+
+    outClusters[drawn++] = i;
+  }
+  if (stats) {
+    stats.drawnClusters = drawn;
+    stats.testedClusters = n;
+  }
+  return drawn;
+}
+
+/**
+ * Gathers the triangle indices of an already-selected cluster set (produced by
+ * selectClusterIds) into `outIndices` (must hold dag.lod0IndexCount). Returns
+ * the number of indices written. This is the O(drawn triangles) memcpy that
+ * feeds the dynamic index buffer, so the runtime only calls it when the set
+ * changed.
+ */
+export function gatherClusterIndices(dag, clusterIds, clusterCount, outIndices) {
+  const ranges = dag.clusterRanges;
+  const src = dag.indexData;
+  let cursor = 0;
+  for (let s = 0; s < clusterCount; s++) {
+    const i = clusterIds[s];
+    const off = ranges[i * 2], cnt = ranges[i * 2 + 1];
+    outIndices.set(src.subarray(off, off + cnt), cursor);
+    cursor += cnt;
+  }
+  return cursor;
+}

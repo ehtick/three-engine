@@ -18,8 +18,13 @@ export class GlobalIlluminationComponent extends Component {
   static type = "global-illumination";
   static label = "Global Illumination (RC)";
   static tags = ["rendering", "lighting", "gi", "radiance-cascades"];
+  // ZERO-SETUP BY DEFAULT: a freshly added component auto-fits the scene
+  // and derives every density from the quality preset — enable and done.
+  // (Saved scenes carry their own explicit props, so existing setups are
+  // untouched by this default.)
   static defaults = {
-    autoFit: false,
+    autoFit: true,
+    quality: "high",
     sizeX: 40,
     sizeY: 12,
     sizeZ: 40,
@@ -31,33 +36,42 @@ export class GlobalIlluminationComponent extends Component {
     bounce: 1,
     temporalBlend: 0.25,
     reflections: true,
+    // Per-hit direct lighting inside reflections (Lumen-style). OPT-IN:
+    // roughly doubles the shader compile wave and adds several ms of GPU
+    // at editor resolutions, for a subtle reflection sharpening.
+    hitLighting: false,
     emissiveShadows: true,
     autoRebake: true,
     debugProbes: "off",
   };
   static schema = [
-    // Auto-fit wraps the volume around the scene's GI meshes with headroom
-    // and derives voxel/probe density from fixed budgets (size props become
-    // irrelevant; voxelSize/probeSpacing act as quality floors). Refits
-    // automatically when content outgrows the volume.
-    { key: "autoFit", label: "Auto Fit Scene", type: "boolean" },
-    { key: "sizeX", label: "Size X", type: "number", min: 4, max: 200, step: 1 },
-    { key: "sizeY", label: "Size Y", type: "number", min: 2, max: 100, step: 1 },
-    { key: "sizeZ", label: "Size Z", type: "number", min: 4, max: 200, step: 1 },
-    { key: "voxelSize", label: "Voxel Size", type: "number", min: 0.1, max: 2, step: 0.05 },
-    { key: "probeSpacing", label: "Probe Spacing", type: "number", min: 0.25, max: 8, step: 0.25 },
+    // ZERO-SETUP MODE: Auto Fit derives the volume from THIS component's
+    // entity — a mesh entity uses its own bounding box (×1.05, so probes
+    // sit just behind the walls); an empty entity uses the union of its
+    // children's boxes (childless → the parent's). The Quality preset
+    // derives ALL densities. When Auto Fit is on, the manual size/voxel/
+    // probe fields below are ignored entirely.
+    { key: "autoFit", label: "Auto Fit (entity bounds)", type: "boolean" },
+    { key: "quality", label: "Quality", type: "select", options: ["low", "medium", "high", "ultra"] },
+    { key: "sizeX", label: "Size X (manual mode)", type: "number", min: 4, max: 200, step: 1 },
+    { key: "sizeY", label: "Size Y (manual mode)", type: "number", min: 2, max: 100, step: 1 },
+    { key: "sizeZ", label: "Size Z (manual mode)", type: "number", min: 4, max: 200, step: 1 },
+    { key: "voxelSize", label: "Voxel Size (manual mode)", type: "number", min: 0.1, max: 2, step: 0.05 },
+    { key: "probeSpacing", label: "Probe Spacing (manual mode)", type: "number", min: 0.25, max: 8, step: 0.25 },
     { key: "cascadeCount", label: "Cascades", type: "number", min: 2, max: 6, step: 1 },
     { key: "c0DirRes", label: "C0 Dir Res", type: "select", options: [2, 4] },
     { key: "intensity", label: "Intensity", type: "number", min: 0, max: 10, step: 0.1 },
     // Fraction of secondary energy retained per pass — the pass itself is
     // an infinite-bounce feedback loop; values > 1 would diverge.
     { key: "bounce", label: "Bounce Energy", type: "number", min: 0, max: 1, step: 0.05 },
-    // How fast streamed re-bakes blend into the live field (1 = instant).
-    { key: "temporalBlend", label: "Temporal Blend", type: "number", min: 0.02, max: 1, step: 0.01 },
+    // How fast streamed re-bakes blend into the live field. 1 = instant
+    // snap (DISABLES the anti-flicker smoothing); 0.2-0.3 is the sweet spot.
+    { key: "temporalBlend", label: "Bake Smoothing (1=off)", type: "number", min: 0.02, max: 1, step: 0.01 },
     { key: "reflections", label: "GI Reflections", type: "boolean" },
+    { key: "hitLighting", label: "Reflection Hit Lighting (slow)", type: "boolean" },
     { key: "emissiveShadows", label: "Emissive Shadows", type: "boolean" },
     { key: "autoRebake", label: "Auto Re-bake", type: "boolean" },
-    { key: "debugProbes", label: "Debug Probes", type: "select", options: ["off", "raw", "merged"] },
+    { key: "debugProbes", label: "Debug View", type: "select", options: ["off", "raw", "merged", "sdf"] },
   ];
 
   get #system() {

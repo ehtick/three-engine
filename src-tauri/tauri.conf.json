@@ -29,7 +29,8 @@
     "active": true,
     "targets": "all",
     "resources": {
-      "../node_modules/@gpu-tex-enc/basis/bin/": "basisu/bin/"
+      "../node_modules/@gpu-tex-enc/basis/bin/": "basisu/bin/",
+      "../node_modules/@types/three/": "engine-types/three/"
     },
     "icon": [
       "icons/32x32.png",

@@ -48,6 +48,41 @@ export async function createFolder() {
 }
 
 /**
+ * Ctrl+G in the Assets panel: makes a new folder next to the selection and
+ * moves everything selected into it, then opens it for renaming.
+ *
+ * Tidying a folder otherwise means "new folder, rename it, select the files
+ * again, drag them in" — four steps for something the hierarchy has done with
+ * one keystroke since day one.
+ *
+ * The folder is created as a sibling of the selection rather than inside the
+ * browsed folder, so grouping a selection that came from a project-wide search
+ * still lands somewhere sensible.
+ */
+export async function groupIntoFolder(entries, { name = "New Folder" } = {}) {
+  const list = entries.filter(Boolean);
+  if (!list.length) return null;
+  const { currentPath, entries: siblings, refresh } = useProjectStore.getState();
+  const parent = list[0].path.slice(0, list[0].path.length - list[0].name.length - 1) || currentPath;
+  if (!parent) return null;
+  // A folder can't be moved into itself; drop any selected folder that would
+  // become its own ancestor (only possible when the name collides).
+  const folderName = uniqueName(name, siblings);
+  const dest = `${parent}/${folderName}`;
+  try {
+    await invoke("create_dir", { path: dest });
+  } catch (err) {
+    console.error(`Couldn't create "${folderName}": ${err}`);
+    return null;
+  }
+  await movePathsIntoFolder(list.map((entry) => entry.path), dest);
+  await refresh();
+  useSelectionStore.getState().selectAsset(dest);
+  console.log(`Grouped ${list.length} ${list.length === 1 ? "asset" : "assets"} into ${folderName}`);
+  return dest;
+}
+
+/**
  * Deletes one or more entries after a single confirmation. Each asset's
  * `.meta` sidecar goes with it.
  */

@@ -20,7 +20,7 @@
 // than the child, that parent is behind a wall and its weight is zeroed.
 // Approximate on purpose (a parent's annular interval doesn't cover its own
 // near field), same spirit as the reference's "flatland assumption" note.
-import { Fn, If, Loop, float, floor, instanceIndex, instancedArray, max, mod, vec3, vec4 } from "three/tsl";
+import { Fn, If, Loop, float, floor, instanceIndex, instancedArray, max, mod, smoothstep, vec3, vec4 } from "three/tsl";
 import { octahedralTexelIndex } from "./cascadeTrace.js";
 
 /**
@@ -34,13 +34,24 @@ import { octahedralTexelIndex } from "./cascadeTrace.js";
  *   the outermost cascade. Default black — the spike's sealed-room checks
  *   depend on escapes contributing nothing.
  */
+// Blocker penetration (in FIELD voxels) over which a parent probe fades out of
+// the merge. Matches the final gather's tolerance — see the long note at the
+// use site for why a binary cut is what produced the lattice artifact.
+// `globalThis.__giMergeVisTol` overrides it for harness A/Bs (read per build,
+// not at module load — the harness sets it after the module is imported).
+const DEFAULT_MERGE_VIS_TOLERANCE = 1.75;
+
 export function createCascadeMerge(cascades, { sky = [0, 0, 0] } = {}) {
+  const MERGE_VIS_TOLERANCE = Number(globalThis.__giMergeVisTol) || DEFAULT_MERGE_VIS_TOLERANCE;
   for (const cascade of cascades) {
     cascade.merged = instancedArray(cascade.probeCount * cascade.dirCount, "vec4");
     cascade.mergedAverages = instancedArray(cascade.probeCount, "vec3");
   }
 
   const mergeComputes = [];
+  // Per-probe means of the merged field — read ONLY by the debug gizmos,
+  // so the caller dispatches them only while a probe debug view is open.
+  const averageComputes = [];
 
   for (let level = cascades.length - 1; level >= 0; level--) {
     const cascade = cascades[level];
@@ -70,14 +81,15 @@ export function createCascadeMerge(cascades, { sky = [0, 0, 0] } = {}) {
           const parentDirBase = v.mul(2).mul(parent.dirRes).add(u.mul(2));
 
           // Continuous coords of the child position in the parent's
-          // cell-centered lattice.
-          const bounds = cascade.bounds;
-          const cellX = (bounds.max.x - bounds.min.x) / parent.grid.x;
-          const cellY = (bounds.max.y - bounds.min.y) / parent.grid.y;
-          const cellZ = (bounds.max.z - bounds.min.z) / parent.grid.z;
-          const fcX = childPos.x.sub(bounds.min.x).div(cellX).sub(0.5);
-          const fcY = childPos.y.sub(bounds.min.y).div(cellY).sub(0.5);
-          const fcZ = childPos.z.sub(bounds.min.z).div(cellZ).sub(0.5);
+          // cell-centered lattice. World params are UNIFORMS (see the
+          // world bundle) so a refit re-maps the lattice with no recompile.
+          const world = cascade.world;
+          const cellX = world.size.x.div(parent.grid.x);
+          const cellY = world.size.y.div(parent.grid.y);
+          const cellZ = world.size.z.div(parent.grid.z);
+          const fcX = childPos.x.sub(world.min.x).div(cellX).sub(0.5);
+          const fcY = childPos.y.sub(world.min.y).div(cellY).sub(0.5);
+          const fcZ = childPos.z.sub(world.min.z).div(cellZ).sub(0.5);
           const baseX = floor(fcX).toVar();
           const baseY = floor(fcY).toVar();
           const baseZ = floor(fcZ).toVar();
@@ -105,16 +117,52 @@ export function createCascadeMerge(cascades, { sky = [0, 0, 0] } = {}) {
             const weight = wx.mul(wy).mul(wz).toVar();
 
             // Visibility proxy: the parent's own ray toward the child.
+            //
+            // SOFT, NOT BINARY — this is the fix for the "dotted grid / quilted
+            // lattice on flat walls" artifact (measured with
+            // scripts/run-gi-rc-lattice.mjs). The old rule was
+            // `if (parentRay.w < dist) weight = 0`, a hard flip, and the value
+            // it flips on is QUANTIZED TWICE: the parent's hit distance is
+            // stored per OCTAHEDRAL TEXEL, so the ray "toward the child" is
+            // really the ray toward the nearest of dirCount coarse directions,
+            // and the parent lattice itself is 2x coarser than the child's. On
+            // a flat wall the parent probes' rays graze the wall, so which
+            // parents get rejected flips per child probe in a pattern locked to
+            // the PARENT lattice — the c0 field came out modulated at exactly
+            // 2x the probe spacing, which is the grid of dots the user sees
+            // (measured period 1.01m at ultra, where c0 spacing is 0.50m).
+            // Fading over [tol, 2*tol] of blocker penetration turns that flip
+            // into a ramp and the lattice disappears (interleaved A/B on the
+            // user's scene at ultra: bandRMS 0.678 -> 0.223 and the residual's
+            // period drops to the probe spacing, i.e. the ordinary trilinear
+            // blend; wall brightness and GPU cost both unchanged),
+            // while a genuinely occluded parent — one whose blocker is a real
+            // wall, not a grazing quantization artifact — still reaches zero.
+            // This is the SAME correction the final gather already had
+            // (cascadeGather.js: "the hard zero produced visible blotch/scallop
+            // boundaries"); the merge was simply never given it.
+            // Tolerance tracks the FIELD's voxel quantization, as in the
+            // gather — that is the actual error in `parentRay.w`.
             const rel = childPos.sub(parentPos).toVar();
             const dist = rel.length().toVar();
+            const visTol = float(cascade.world.cellMax).mul(MERGE_VIS_TOLERANCE);
             If(dist.greaterThan(1e-4), () => {
               const towardChild = octahedralTexelIndex(rel.div(dist), parent.dirRes);
               const parentRay = parent.rays.element(
                 parentProbeIdx.mul(parent.dirCount).add(towardChild).toInt(),
               );
-              If(parentRay.w.greaterThanEqual(0).and(parentRay.w.lessThan(dist.sub(0.01))), () => {
-                weight.assign(0);
-              });
+              // `globalThis.__giHardMergeVis` restores the old binary cut for an
+              // A/B (scripts/run-gi-rc-lattice.mjs HARDMERGE=1).
+              if (globalThis.__giHardMergeVis) {
+                If(parentRay.w.greaterThanEqual(0).and(parentRay.w.lessThan(dist.sub(0.01))), () => {
+                  weight.assign(0);
+                });
+              } else {
+                If(parentRay.w.greaterThanEqual(0), () => {
+                  const penetration = dist.sub(parentRay.w);
+                  weight.mulAssign(smoothstep(visTol, visTol.mul(2), penetration).oneMinus());
+                });
+              }
             });
 
             // Mean of the 4 angular children from the parent's MERGED field
@@ -146,8 +194,9 @@ export function createCascadeMerge(cascades, { sky = [0, 0, 0] } = {}) {
       cascade.mergedAverages.element(instanceIndex).assign(sum.div(dirCount));
     })().compute(probeCount);
 
-    mergeComputes.push(merge, average);
+    mergeComputes.push(merge);
+    averageComputes.push(average);
   }
 
-  return { mergeComputes };
+  return { mergeComputes, averageComputes };
 }

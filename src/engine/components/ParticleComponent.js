@@ -31,6 +31,7 @@ import {
   DEFAULT_PARTICLE_GRAPH,
 } from "../particleGraph.js";
 import { ParticleColliderField } from "../particleColliders.js";
+import { registerGiEmitter } from "../giEmitters.js";
 
 const MAX_CAPACITY = 200_000;
 const GRID_SLOTS = 4;
@@ -38,6 +39,10 @@ const MAX_LIGHTS = 8;
 const LIGHT_SAMPLES = 128; // particles read back per frame to place the lights
 
 const unitQuad = new THREE.PlaneGeometry(1, 1);
+
+// Scratch reused by the GI-emitter aggregation (runs per readback, not per frame).
+const _giCenter = new THREE.Vector3();
+const _giScale = new THREE.Vector3();
 
 // Built-in particle geometries, shared across all systems (never disposed).
 const builtinGeometryCache = new Map();
@@ -367,6 +372,14 @@ export class ParticleComponent extends Component {
     // Optional lighting integration: a handful of real point lights follow
     // clusters of live particles (see #buildLightRig / #updateLights).
     const lightRig = this.#buildLightRig(sys, s, capacity, { positions, velocities, ages }, lifetimeOf);
+    // Publish the cloud to the GI module as a dynamic emitter. The provider is
+    // pulled once per frame by GISystem#refreshEmitterSlots and returns null
+    // until the first cluster readback lands, so an unbuilt or empty system
+    // simply parks its slot at radius 0.
+    let unregisterGiEmitter = null;
+    if (lightRig?.giEmission) {
+      unregisterGiEmitter = registerGiEmitter(this.entity.engine, () => lightRig.giShape);
+    }
 
     return {
       sysProps: s,
@@ -383,6 +396,7 @@ export class ParticleComponent extends Component {
       colliderField,
       collisionMatrices,
       lightRig,
+      unregisterGiEmitter,
       initialized: false,
     };
   }
@@ -517,7 +531,13 @@ export class ParticleComponent extends Component {
    */
   #buildLightRig(sys, s, capacity, buffers, lifetimeOf) {
     const count = Math.min(MAX_LIGHTS, Math.max(0, Math.floor(s.lightCount ?? 0)));
-    if (!count) return null;
+    const giEmission = !!s.giEmission;
+    // GI emission needs the same sampled positions/colours as the point-light
+    // clusters, so the rig is built for either feature. With `lightCount: 0`
+    // and GI emission on, the sampling runs but no PointLight is created —
+    // which is the point: the light comes from the radiance field, not from a
+    // stand-in light.
+    if (!count && !giEmission) return null;
 
     const samples = Math.min(LIGHT_SAMPLES, capacity);
     const sampleBuffer = instancedArray(samples * 2, "vec4");
@@ -562,8 +582,15 @@ export class ParticleComponent extends Component {
       sampleCompute,
       lights,
       readPending: false,
+      giEmission,
+      giStrength: Math.max(0, s.giEmissionStrength ?? 1),
+      // Published to the GI module's per-frame emitter slot. Null until the
+      // first readback lands, and back to null whenever the cloud has no live
+      // particles — a slot showing a stale sphere would keep lighting the room
+      // after the effect ended.
+      giShape: null,
       // scratch accumulators reused every frame (no per-frame allocation)
-      accum: new Float32Array(count * 7), // x,y,z,r,g,b,weight per cluster
+      accum: new Float32Array(Math.max(1, count) * 7), // x,y,z,r,g,b,weight per cluster
     };
   }
 
@@ -583,6 +610,19 @@ export class ParticleComponent extends Component {
         const { count, lights, accum } = rig;
         accum.fill(0);
 
+        // Aggregate the whole cloud into ONE emitter shape for GI: weighted
+        // centroid, weighted mean colour, and a radius that covers the spread.
+        // GI emitter slots are scarce (MAX_EMITTERS) and model an emissive
+        // *sphere*, so one sphere per system is the honest mapping — the
+        // k-means clusters below stay dedicated to the point-light path.
+        let gx = 0;
+        let gy = 0;
+        let gz = 0;
+        let gr = 0;
+        let gg = 0;
+        let gb = 0;
+        let gw = 0;
+
         let total = 0;
         for (let i = 0; i < rig.samples; i++) {
           const o = i * 8;
@@ -591,6 +631,15 @@ export class ParticleComponent extends Component {
           const x = data[o];
           const y = data[o + 1];
           const z = data[o + 2];
+          if (rig.giEmission) {
+            gx += x * alpha;
+            gy += y * alpha;
+            gz += z * alpha;
+            gr += data[o + 4] * alpha;
+            gg += data[o + 5] * alpha;
+            gb += data[o + 6] * alpha;
+            gw += alpha;
+          }
           // assign to the nearest light (seeds = last frame's positions)
           let best = 0;
           let bestDist = Infinity;
@@ -616,6 +665,43 @@ export class ParticleComponent extends Component {
           total += alpha;
         }
 
+        if (rig.giEmission) {
+          if (gw <= 1e-4) {
+            rig.giShape = null;
+          } else {
+            const inv = 1 / gw;
+            _giCenter.set(gx * inv, gy * inv, gz * inv);
+            // Second pass for the spread. Particles simulate in ENTITY-LOCAL
+            // space; GI emitter slots are world-space, so the centre is
+            // transformed and the radius scaled by the entity's largest axis.
+            let spread = 0;
+            for (let i = 0; i < rig.samples; i++) {
+              const o = i * 8;
+              if (data[o + 3] < 0.05) continue;
+              const dx = data[o] - _giCenter.x;
+              const dy = data[o + 1] - _giCenter.y;
+              const dz = data[o + 2] - _giCenter.z;
+              spread = Math.max(spread, Math.sqrt(dx * dx + dy * dy + dz * dz));
+            }
+            const object = this.entity.object3D;
+            object.updateWorldMatrix(true, false);
+            object.getWorldScale(_giScale);
+            _giCenter.applyMatrix4(object.matrixWorld);
+            const scale = Math.max(Math.abs(_giScale.x), Math.abs(_giScale.y), Math.abs(_giScale.z));
+            const k = rig.giStrength * inv;
+            rig.giShape = {
+              center: _giCenter.clone(),
+              // A zero-radius emitter contributes nothing, and a cloud of
+              // co-located particles legitimately measures ~0 spread.
+              radius: Math.max(0.05, spread * scale),
+              r: gr * k,
+              g: gg * k,
+              b: gb * k,
+            };
+          }
+        }
+
+        if (!rig.count) return; // GI-emission-only rig: no point lights to drive
         const baseIntensity = s.lightIntensity ?? 5;
         for (let k = 0; k < count; k++) {
           const a = k * 7;
@@ -655,6 +741,9 @@ export class ParticleComponent extends Component {
       // Geometry (default quad, built-in shape, or a cached custom-geometry
       // asset) is shared across subsystems/components — never disposed here.
       sub.colliderField?.removeUser();
+      // Drops this system's GI emitter slot; without it a destroyed effect
+      // keeps lighting the scene from a provider closure nothing can reach.
+      sub.unregisterGiEmitter?.();
       for (const light of sub.lightRig?.lights ?? []) {
         this.entity.object3D.remove(light);
         light.dispose();

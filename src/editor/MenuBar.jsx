@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { commandBus, useHistoryStore } from "./commands/CommandBus.js";
 import { useSelectionStore } from "./store/selectionStore.js";
 import { useSceneStore } from "./store/sceneStore.js";
@@ -27,10 +27,86 @@ import {
   snapSelectionToCursor,
   snapSelectionToOrigin,
 } from "./threeDCursorOps.js";
+import { subscribeMenuItems } from "../engine/editorBridge.js";
+import { useMcpStore } from "./api/mcpBridge.js";
+
+/**
+ * Merges script-contributed entries (`@menuItem` / `Editor.menu.add`) into the
+ * static menu definition.
+ *
+ * Entries whose top-level name matches an existing menu are appended to it
+ * behind a separator, so a script extending "Edit" lands where the user would
+ * look. Everything else creates its own top-level menu — which is how "Tools"
+ * (the default) appears only once a project actually has tool scripts, rather
+ * than sitting there empty in every project.
+ */
+function withScriptMenus(menus, scriptItems) {
+  if (!scriptItems.length) return menus;
+  const merged = { ...menus };
+  for (const entry of scriptItems) {
+    const item = { label: entry.label, action: entry.run };
+    if (merged[entry.menu]) merged[entry.menu] = [...merged[entry.menu], item];
+    else merged[entry.menu] = [item];
+  }
+  // The separator has to go in after the fact: the loop above appends one item
+  // at a time and would otherwise emit a separator per entry.
+  for (const name of Object.keys(merged)) {
+    const added = scriptItems.filter((entry) => entry.menu === name).length;
+    if (!added || !menus[name]) continue;
+    const at = merged[name].length - added;
+    merged[name] = [...merged[name].slice(0, at), { separator: true }, ...merged[name].slice(at)];
+  }
+  return merged;
+}
+
+/**
+ * Bridge state in the menu bar — always present, which is the point.
+ *
+ * The first version hid itself while MCP was off, which made the feature
+ * findable only by someone who already knew it existed and where its settings
+ * lived (three levels into Project Settings). "Hard to find" was the reported
+ * problem, and a permanent one-word chip is the cheapest honest fix: it is the
+ * entry point when off, and a live indicator when on — including a call counter,
+ * because when something outside the window is editing your scene you should be
+ * able to see it happening.
+ */
+function McpIndicator() {
+  const status = useMcpStore((s) => s.status);
+  const toolCount = useMcpStore((s) => s.toolCount);
+  const callCount = useMcpStore((s) => s.callCount);
+  const port = useMcpStore((s) => s.port);
+  const tone = status === "connected" ? "connected" : status === "disabled" ? "off" : "waiting";
+  return (
+    <button
+      className={`mcp-chip ${tone}`}
+      title={
+        status === "connected"
+          ? `Assistant connected on port ${port} — ${toolCount} tools, ${callCount} call${callCount === 1 ? "" : "s"} served. Click for details.`
+          : status === "disabled"
+            ? "Assistant access is off. Click to open the MCP panel and turn it on."
+            : `Waiting for an assistant on port ${port}. Click for details.`
+      }
+      onClick={() => openPanel("mcp")}
+    >
+      <span className="mcp-dot" />
+      MCP{status === "connected" && callCount > 0 ? ` ${callCount}` : ""}
+    </button>
+  );
+}
 
 export function MenuBar() {
   const [openMenu, setOpenMenu] = useState(null);
-  const history = useHistoryStore();
+  const [scriptItems, setScriptItems] = useState([]);
+  // Fires immediately with the current list, then on every register/unregister
+  // (including the ones a hot-reloading script triggers).
+  useEffect(() => subscribeMenuItems(setScriptItems), []);
+  // Narrow selectors — subscribing to the whole store re-rendered the menu
+  // bar on every command-history mutation.
+  const undoLabel = useHistoryStore((s) => s.undoLabel);
+  const redoLabel = useHistoryStore((s) => s.redoLabel);
+  const canUndo = useHistoryStore((s) => s.canUndo);
+  const canRedo = useHistoryStore((s) => s.canRedo);
+  const history = { undoLabel, redoLabel, canUndo, canRedo };
   const selection = useSelectionStore((s) => s.ids);
   const sceneName = useSceneStore((s) => s.sceneName);
   const dirty = useSceneStore((s) => s.dirty);
@@ -135,6 +211,8 @@ export function MenuBar() {
       { label: "Poly Haven", action: () => openPanel("polyhaven") },
       { label: "AmbientCG", action: () => openPanel("ambientcg") },
       { label: "Sketchfab", action: () => openPanel("sketchfab") },
+      { label: "Terminal", action: () => openPanel("terminal") },
+      { label: "Assistant (MCP)", action: () => openPanel("mcp") },
       { separator: true },
       { label: "Reset Layout", action: () => resetLayout() },
     ],
@@ -203,7 +281,7 @@ export function MenuBar() {
 
   return (
     <div className="menu-bar">
-      {Object.entries(menus).map(([name, items]) => (
+      {Object.entries(withScriptMenus(menus, scriptItems)).map(([name, items]) => (
         <div key={name} className="menu-wrap">
           <button
             className={`menu-btn ${openMenu === name ? "open" : ""}`}
@@ -219,7 +297,10 @@ export function MenuBar() {
                   <div key={i} className="menu-separator" />
                 ) : (
                   <button
-                    key={item.label}
+                    // Index-suffixed because script-contributed entries can
+                    // legitimately repeat a label (two entities running the
+                    // same tool script), and a duplicate key drops one of them.
+                    key={`${item.label}-${i}`}
                     className="dropdown-item"
                     disabled={item.disabled}
                     onClick={() => runItem(item)}
@@ -235,6 +316,7 @@ export function MenuBar() {
       ))}
       {openMenu && <div className="dropdown-overlay" onClick={() => setOpenMenu(null)} />}
       <div className="menu-spacer" />
+      <McpIndicator />
       <ProcessingIndicator />
       <div className="menu-title">
         {sceneName}

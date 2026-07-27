@@ -1,4 +1,5 @@
 import * as THREE from "three/webgpu";
+import { brushWeight } from "../../editor/brush.js";
 import { texture as tslTexture, uv, float, vec3, normalMap, normalView } from "three/tsl";
 import { Component } from "../../engine/components/Component.js";
 import { resolveAssetUrl } from "../../engine/assetResolver.js";
@@ -12,7 +13,7 @@ import {
 import { getGltfLoader } from "../../engine/gltfLoader.js";
 
 export const MAX_TERRAIN_LAYERS = 4;
-export const SCULPT_TOOLS = ["raise", "lower", "smooth", "flatten", "sharpen", "erode", "noise"];
+export const SCULPT_TOOLS = ["raise", "lower", "smooth", "flatten", "sharpen", "contrast", "pinch", "erode", "noise"];
 const scatterLoader = getGltfLoader();
 
 /** A fresh terrain layer — a full PBR surface (rock, grass, …), not just a
@@ -1131,16 +1132,15 @@ export class TerrainComponent extends Component {
    */
   applyHeightBrush(local, opts) {
     if (!this.geometry) return;
-    const { tool, radius, strength, hardness = 0.5, flattenHeight = 0, seed = 0 } = opts;
+    const { tool, radius, strength, hardness = 0.5, falloff = null, flattenHeight = 0, seed = 0 } = opts;
     const cols = this.resolution + 1;
     const heights = this.heightsArray;
     const half = (this.props.size ?? 50) / 2;
     const step = (half * 2) / this.resolution;
-    const exp = THREE.MathUtils.lerp(0.4, 4, hardness);
 
     // Neighbor-reading tools work off a snapshot so one pass isn't biased by
     // its own in-progress writes.
-    const needsSnapshot = tool === "smooth" || tool === "sharpen" || tool === "erode";
+    const needsSnapshot = tool === "smooth" || tool === "sharpen" || tool === "erode" || tool === "pinch" || tool === "contrast";
     const src = needsSnapshot ? heights.slice() : heights;
 
     // Only touch vertices inside the brush's bounding box.
@@ -1155,8 +1155,10 @@ export class TerrainComponent extends Component {
         const z = -half + r * step;
         const dist = Math.hypot(x - local.x, z - local.z);
         if (dist > radius) continue;
-        const falloff = Math.pow(1 - dist / radius, exp);
-        const amt = strength * falloff;
+        // Shared with the mesh sculptor: with no named curve this is the
+        // hardness exponent terrain has always used, so existing strokes are
+        // unchanged, and naming one opts into the same curves Blender offers.
+        const amt = strength * brushWeight(dist / radius, { curve: falloff, hardness });
         const idx = r * cols + c;
         switch (tool) {
           case "raise":
@@ -1186,6 +1188,18 @@ export class TerrainComponent extends Component {
           case "noise":
             heights[idx] += (valueNoise(x * 0.5, z * 0.5, seed) * 2 - 1) * amt;
             break;
+          case "pinch": {
+            // Pull the surface towards the brush centre's height, tightening a
+            // ridge instead of raising or lowering it.
+            const target = this.heightAtLocal(local.x, local.z);
+            heights[idx] += (target - src[idx]) * Math.min(1, amt);
+            break;
+          }
+          case "contrast":
+            // Push away from the local average: the inverse of smooth, and the
+            // heightfield equivalent of the mesh sculptor's Crease.
+            heights[idx] = src[idx] + (src[idx] - neighborAvg(src, cols, r, c, this.resolution)) * amt * 2;
+            break;
           default:
             break;
         }
@@ -1210,11 +1224,10 @@ export class TerrainComponent extends Component {
    */
   applySplatBrush(local, opts) {
     if (!this.splatData) return;
-    const { layerIndex, radius, strength, hardness = 0.5, erase = false } = opts;
+    const { layerIndex, radius, strength, hardness = 0.5, falloff = null, erase = false } = opts;
     const layer = THREE.MathUtils.clamp(layerIndex | 0, 0, 3);
     const half = (this.props.size ?? 50) / 2;
     const res = this.splatResolution;
-    const exp = THREE.MathUtils.lerp(0.4, 4, hardness);
 
     // Texel <-> world mapping matches the material's uv() sampling:
     //   world x = -half + u*size,  world z =  half - v*size   (see PlaneGeometry
@@ -1234,8 +1247,7 @@ export class TerrainComponent extends Component {
         const wz = half - v * half * 2;
         const dist = Math.hypot(wx - local.x, wz - local.z);
         if (dist > radius) continue;
-        const falloff = Math.pow(1 - dist / radius, exp);
-        const delta = Math.min(1, strength * falloff) * 255;
+        const delta = Math.min(1, strength * brushWeight(dist / radius, { curve: falloff, hardness })) * 255;
         const base = (y * res + x) * 4;
         const cur = [this.splatData[base], this.splatData[base + 1], this.splatData[base + 2], this.splatData[base + 3]];
         const amount = delta / 255;

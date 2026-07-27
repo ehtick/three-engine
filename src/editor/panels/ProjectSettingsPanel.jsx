@@ -1,7 +1,11 @@
 import { useEffect, useState } from "react";
 import { Save, X, RotateCcw } from "lucide-react";
 import { useProjectStore, basename } from "../store/projectStore.js";
-import { getProjectSettings, saveProjectSettings } from "../projectSettings.js";
+import {
+  getProjectSettings,
+  saveProjectSettings,
+  PROJECT_SETTINGS_DEFAULTS,
+} from "../projectSettings.js";
 import { currentScenePath } from "../sceneIO.js";
 import { KEY_BINDING_ACTIONS, describeBinding } from "../keybindings.js";
 

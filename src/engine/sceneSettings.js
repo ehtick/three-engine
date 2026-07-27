@@ -1,4 +1,5 @@
 import * as THREE from "three/webgpu";
+import { getLoadedCubemap, loadCubemapAsset } from "./cubemapAsset.js";
 
 /**
  * Per-scene environment/rendering settings, serialized inside the scene JSON
@@ -9,6 +10,17 @@ export const SCENE_SETTINGS_DEFAULTS = {
   background: "#202329",
   ambientColor: "#ffffff",
   ambientIntensity: 0.3,
+  // Scene-wide image-based environment. `cubemap` points at a `.cubemap`
+  // asset (six face images); it drives the skybox and/or the IBL that lights
+  // every material. Empty = flat `background` color, as before.
+  environment: {
+    cubemap: "",
+    background: true, // draw it as the skybox
+    lighting: true, // use it as scene.environment (image-based lighting)
+    intensity: 1,
+    rotation: 0, // degrees around Y
+    blur: 0, // background-only blurriness (0…1)
+  },
   fog: {
     type: "none", // "none" | "linear" | "exp2"
     color: "#202329",
@@ -52,6 +64,12 @@ export const SCENE_SETTINGS_DEFAULTS = {
     // Multiplies every volumetric material's raymarch step count. 0.5 halves
     // the per-pixel loop iterations of all volumes (biggest volume cost).
     volumeStepScale: 1, // 0.1 … 1
+    // Merges meshes that share a geometry AND a material into one instanced
+    // draw call each (see engine/batching.js). The win scales with how
+    // repetitive a scene is — an imported model dropped in a thousand times
+    // goes from a thousand draw calls to one. Off only makes sense when
+    // debugging a suspected batching artifact.
+    autoBatching: true,
   },
 };
 
@@ -107,6 +125,11 @@ export function mergeSettings(current, patch) {
   const next = {
     ...current,
     ...patch,
+    environment: {
+      ...SCENE_SETTINGS_DEFAULTS.environment,
+      ...(current.environment ?? {}),
+      ...(patch?.environment ?? {}),
+    },
     fog: { ...current.fog, ...(patch?.fog ?? {}) },
     renderer: { ...current.renderer, ...(patch?.renderer ?? {}) },
     shadow: { ...current.shadow, ...(patch?.shadow ?? {}) },
@@ -149,9 +172,75 @@ export function rendererConstructorOptions(settings) {
   };
 }
 
+/** True for a texture this module put on the scene (vs. one a component owns). */
+const isSceneEnvTexture = (value) => value?.isTexture === true && value.userData?.sceneEnvironment === true;
+/** A texture some *other* owner (e.g. the HDRI EnvironmentComponent) installed. */
+const isForeignTexture = (value) => value?.isTexture === true && !isSceneEnvTexture(value);
+
+// Bumped on every environment apply so a slow cube-map decode that lands after
+// the user has already picked a different skybox (or cleared it) is discarded
+// instead of overwriting the newer choice.
+let environmentSeq = 0;
+
+/** Flat background color + no scene-owned IBL. Leaves component-owned textures
+ *  (the HDRI EnvironmentComponent) alone — those have their own lifecycle. */
+function clearSceneEnvironment(settings, scene) {
+  if (isSceneEnvTexture(scene.environment)) scene.environment = null;
+  if (!isForeignTexture(scene.background)) {
+    scene.background = new THREE.Color(settings.background);
+    scene.backgroundBlurriness = 0;
+  }
+}
+
+function pushSceneEnvironment(settings, scene, texture, env) {
+  texture.userData.sceneEnvironment = true;
+  const rad = THREE.MathUtils.degToRad(env.rotation ?? 0);
+  const intensity = env.intensity ?? 1;
+  if (env.lighting !== false) {
+    scene.environment = texture;
+    scene.environmentIntensity = intensity;
+    scene.environmentRotation.set(0, rad, 0);
+  } else if (isSceneEnvTexture(scene.environment)) {
+    scene.environment = null;
+  }
+  if (env.background !== false) {
+    scene.background = texture;
+    scene.backgroundIntensity = intensity;
+    scene.backgroundBlurriness = env.blur ?? 0;
+    scene.backgroundRotation.set(0, rad, 0);
+  } else if (!isForeignTexture(scene.background)) {
+    scene.background = new THREE.Color(settings.background);
+    scene.backgroundBlurriness = 0;
+  }
+}
+
+/**
+ * Background + image-based lighting. Decoding a cube map is async, but this
+ * runs on *every* settings change (dragging a quality slider re-applies
+ * everything), so a cached texture is installed synchronously — otherwise the
+ * sky would flash back to the clear color on each unrelated edit.
+ */
+function applySceneEnvironment(settings, scene) {
+  const env = { ...SCENE_SETTINGS_DEFAULTS.environment, ...(settings.environment ?? {}) };
+  const seq = ++environmentSeq;
+  const path = env.cubemap;
+  const cached = path ? getLoadedCubemap(path) : null;
+  if (cached) {
+    pushSceneEnvironment(settings, scene, cached, env);
+    return;
+  }
+  clearSceneEnvironment(settings, scene);
+  if (!path) return;
+  loadCubemapAsset(path).then((texture) => {
+    // A newer apply already decided what the environment should be.
+    if (seq !== environmentSeq || !texture) return;
+    pushSceneEnvironment(settings, scene, texture, env);
+  });
+}
+
 /** Pushes settings onto a scene + renderer. Renderer may be null (pre-init). */
 export function applySettingsToScene(settings, scene, ambientLight, renderer) {
-  scene.background = new THREE.Color(settings.background);
+  applySceneEnvironment(settings, scene);
 
   // Live quality knobs — copied into the mutable runtimeQuality object that
   // shader onRenderUpdate closures read every frame (see volumetricLightingModel).

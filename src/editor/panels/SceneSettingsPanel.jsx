@@ -3,7 +3,11 @@ import { ensureEngine } from "../engineInstance.js";
 import { commandBus } from "../commands/CommandBus.js";
 import { SetSceneSettingsCommand } from "../commands/settingsCommands.js";
 import { useSceneStore } from "../store/sceneStore.js";
-import { MSAA_SAMPLES, SHADOW_TYPES } from "../../engine/sceneSettings.js";
+import { MSAA_SAMPLES, SHADOW_TYPES, SCENE_SETTINGS_DEFAULTS } from "../../engine/sceneSettings.js";
+import { CUBEMAP_EXTENSIONS } from "../assetLoader.js";
+import { AssetField } from "../fields/AssetField.jsx";
+import { useSelectionStore } from "../store/selectionStore.js";
+import { openPanel } from "../EditorShell.jsx";
 
 const TONE_MAPPING_OPTIONS = [
   ["neutral", "Neutral (Khronos)"],
@@ -93,6 +97,9 @@ export function SceneSettingsPanel() {
       { performance: { ...settings.performance, ...perfPatch } },
       label ?? "Change performance settings",
     );
+  const env = { ...SCENE_SETTINGS_DEFAULTS.environment, ...(settings.environment ?? {}) };
+  const commitEnv = (envPatch, label) =>
+    commit({ environment: { ...env, ...envPatch } }, label ?? "Change environment settings");
 
   const perf = settings.performance ?? {
     maxDevicePixelRatio: 2,
@@ -136,6 +143,70 @@ export function SceneSettingsPanel() {
             onCommit={(v) => commit({ ambientIntensity: v }, "Change ambient intensity")}
           />
         </Row>
+        <Row label="Cube Map">
+          <AssetField
+            descriptor={{ exts: CUBEMAP_EXTENSIONS, emptyLabel: "None" }}
+            value={env.cubemap}
+            onCommit={(value) => commitEnv({ cubemap: value }, "Change scene cube map")}
+          />
+        </Row>
+        {env.cubemap && (
+          <>
+            <Row label="Show as Sky">
+              <input
+                type="checkbox"
+                checked={env.background !== false}
+                onChange={(e) => commitEnv({ background: e.target.checked }, "Toggle skybox")}
+              />
+            </Row>
+            <Row label="Use for Lighting">
+              <input
+                type="checkbox"
+                checked={env.lighting !== false}
+                onChange={(e) => commitEnv({ lighting: e.target.checked }, "Toggle environment lighting")}
+              />
+            </Row>
+            <Row label="Intensity">
+              <NumberInput
+                value={env.intensity ?? 1}
+                min={0}
+                step={0.05}
+                onCommit={(v) => commitEnv({ intensity: v }, "Change environment intensity")}
+              />
+            </Row>
+            <Row label="Rotation°">
+              <NumberInput
+                value={env.rotation ?? 0}
+                min={0}
+                max={360}
+                step={1}
+                onCommit={(v) => commitEnv({ rotation: v }, "Change environment rotation")}
+              />
+            </Row>
+            <Row label="Sky Blur">
+              <NumberInput
+                value={env.blur ?? 0}
+                min={0}
+                max={1}
+                step={0.05}
+                onCommit={(v) => commitEnv({ blur: v }, "Change sky blur")}
+              />
+            </Row>
+            <button
+              className="toolbar-btn wide"
+              onClick={() => {
+                useSelectionStore.getState().selectAsset(env.cubemap);
+                openPanel("inspector");
+              }}
+            >
+              Edit Cube Map Faces
+            </button>
+          </>
+        )}
+        <div className="asset-hint" style={{ padding: "4px 4px 0" }}>
+          A cube map drives both the skybox and image-based lighting. Background color still shows
+          wherever the sky is off.
+        </div>
       </div>
 
       <div className="inspector-section">

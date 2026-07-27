@@ -39,6 +39,7 @@ export async function exportGame() {
   const assets = new Map(); // absolute source -> relative dest
   const scriptPaths = new Set(); // scripts ship transpiled, not copied
   const materialPaths = new Set(); // .mat files ship with rewritten texture paths
+  const cubemapPaths = new Set(); // .cubemap files ship with rewritten face paths
   const audioSidecarPaths = new Set(); // .audio JSON files copied verbatim with path rewrites
   const claim = (p) => {
     if (!p || typeof p !== "string") return p;
@@ -85,9 +86,18 @@ export async function exportGame() {
       c.props.hdri = claim(c.props.hdri);
     } else if (c.type === "animation" && c.props.controller) {
       c.props.controller = claim(c.props.controller);
-    } else if (c.type === "script" && c.props.path) {
-      scriptPaths.add(c.props.path);
-      c.props.path = `assets/${basename(c.props.path).replace(/\.ts$/i, ".js")}`;
+    } else if (c.type === "script") {
+      // Every slot in the list ships, not just the first. Legacy `{ path }`
+      // components are still readable here: normalizeProps folds them into
+      // `scripts` when the component loads, but an unopened scene on disk may
+      // not have been through that yet.
+      const slots = c.props.scripts ?? (c.props.path ? [{ path: c.props.path }] : []);
+      for (const slot of slots) {
+        if (!slot?.path) continue;
+        scriptPaths.add(slot.path);
+        slot.path = `assets/${basename(slot.path).replace(/\.ts$/i, ".js")}`;
+      }
+      if (c.props.scripts) delete c.props.path;
     } else if (c.type === "sound") {
       // Each entry's audioAsset is the sidecar path. Ship the sidecar JSON
       // (with its inner `path` rewritten to the assets folder) and the raw
@@ -127,6 +137,14 @@ export async function exportGame() {
     (node.children ?? []).forEach(visit);
   };
 
+  // Scene settings can reference a .cubemap (skybox / image-based lighting).
+  // It ships like a .mat: the descriptor is rewritten, its faces are copied.
+  if (scene.settings?.environment?.cubemap) {
+    const src = scene.settings.environment.cubemap;
+    cubemapPaths.add(src);
+    scene.settings.environment.cubemap = `assets/${basename(src)}`;
+  }
+
   scene.entities.forEach(visit);
   for (const def of scene.prefabs ?? []) {
     if (def.root) visit(def.root);
@@ -150,6 +168,14 @@ export async function exportGame() {
       if (def.map) def.map = claim(def.map);
       for (const n of def.shaderGraph?.nodes ?? []) {
         if (n.type === "texture" && n.props?.path) n.props.path = claim(n.props.path);
+      }
+      files.push([`assets/${basename(src)}`, JSON.stringify(def)]);
+    }
+    const { normalizeCubemapDef, CUBEMAP_FACES } = await import("../engine/cubemapAsset.js");
+    for (const src of cubemapPaths) {
+      const def = normalizeCubemapDef(JSON.parse(await invoke("read_text_file", { path: src })));
+      for (const { key } of CUBEMAP_FACES) {
+        if (def.faces[key]) def.faces[key] = claim(def.faces[key]);
       }
       files.push([`assets/${basename(src)}`, JSON.stringify(def)]);
     }
@@ -200,13 +226,54 @@ export async function exportGame() {
         // No sidecar — defaults apply.
       }
     }
+    // Per-asset build flags decide what actually ships and what the player
+    // loads up front. Read once here, at the end, rather than in `claim` —
+    // `claim` is called from a synchronous walk and the flags live on disk.
+    const { readAssetFlags } = await import("./assetFlags.js");
+    const preload = [];
+    const excluded = [];
+    const flagTargets = [
+      ...[...assets.keys()].filter((src) => !/\.(meta|basis)$/i.test(src)),
+      ...materialPaths,
+    ];
+    for (const src of flagTargets) {
+      const flags = await readAssetFlags(src);
+      if (flags.exclude) {
+        excluded.push(basename(src));
+        // Sidecars follow the asset out of the build.
+        assets.delete(src);
+        assets.delete(`${src}.meta`);
+        assets.delete(`${src}.basis`);
+        materialPaths.delete(src);
+      } else if (flags.preload) {
+        preload.push(assets.get(src) ?? `assets/${basename(src)}`);
+      }
+    }
+    // The player fetches these before the first frame; everything else streams
+    // in when the scene first asks for it.
+    if (preload.length) scene.preload = [...new Set(preload)];
+    if (excluded.length) {
+      console.warn(
+        `Excluded from build: ${excluded.join(", ")}. Anything in the scene that ` +
+          `references them will fail to load at runtime.`,
+      );
+    }
+    // Materials dropped by exclusion mustn't still be written into assets/.
+    const shippedFiles = files.filter(([rel]) => {
+      const stem = rel.replace(/^assets\//, "");
+      return !excluded.includes(stem);
+    });
+
     await invoke("export_game", {
       outDir,
       sceneJson: JSON.stringify(scene, null, 2),
       assets: [...assets.entries()],
-      files,
+      files: shippedFiles,
     });
-    console.log(`Game exported to ${outDir} (${assets.size + files.length} asset(s))`);
+    console.log(
+      `Game exported to ${outDir} (${assets.size + shippedFiles.length} asset(s)` +
+        `${preload.length ? `, ${preload.length} preloaded` : ""})`,
+    );
   } catch (err) {
     console.error(`Export failed: ${err}`);
   }
