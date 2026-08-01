@@ -33,6 +33,12 @@ export class GlobalIlluminationComponent extends Component {
     cascadeCount: 5,
     c0DirRes: 4,
     intensity: 1,
+    // Sky light — the radiance a GI ray brings back when it escapes the
+    // volume without hitting anything (see cascadeMerge's `sky`). Intensity 0
+    // is the historical behaviour (escapes contribute black); it stays the
+    // default so no existing scene changes until this is dialled up.
+    skyColor: "#ffffff",
+    skyIntensity: 0,
     bounce: 1,
     temporalBlend: 0.25,
     reflections: true,
@@ -41,6 +47,25 @@ export class GlobalIlluminationComponent extends Component {
     // sample its cached result, so imported scenes no longer pay the old
     // per-material reflection-ray cost.
     exactReflections: false,
+    // SPARSE FINE FIELD. The composited field is one cell per ~voxelSize, which
+    // on a building-sized volume is decimetres — wider than the columns and
+    // walls it has to occlude, so indirect light walks through them. This adds
+    // a fp16 brick per surface-adjacent cell, giving traces sub-cell occlusion
+    // for one extra texture fetch. Costs VRAM (the pool scales with quality),
+    // which is why it is opt-in rather than always on.
+    // TRACING BACKEND. "sdf-legacy" sphere-traces the composited per-mesh SDF
+    // field; "occupancy" hit-tests a conservative triangle-occupancy pyramid at
+    // ~0.125m with a hierarchical DDA (docs/rc-gi-implementation-spec.md
+    // phases 1+4, src/modules/gi/occupancyField.js).
+    //
+    // WHY IT EXISTS: the composited field is ~0.33m on a building-sized volume,
+    // so a 0.5m column is one and a half cells wide and diffuse transport walks
+    // through it. Occupancy is rasterized straight from triangles, so sub-cell
+    // geometry is PRESENT rather than melted — which is what stops light
+    // passing through walls. Costs a voxelization dispatch per geometry change
+    // and ~2MB of VRAM; opt-in until it has been proven on real scenes.
+    backend: "sdf-legacy",
+    sparseField: false,
     emissiveShadows: true,
     autoRebake: true,
     debugProbes: "off",
@@ -73,6 +98,13 @@ export class GlobalIlluminationComponent extends Component {
     { key: "cascadeCount", label: "Cascades", type: "number", min: 2, max: 6, step: 1, advanced: true, flipsToCustom: "quality" },
     { key: "c0DirRes", label: "C0 Dir Res", type: "select", options: [2, 4], advanced: true, flipsToCustom: "quality" },
     { key: "intensity", label: "Intensity", type: "number", min: 0, max: 10, step: 0.1 },
+    // Deliberately NOT `advanced`/`flipsToCustom`: sky light is a LOOK control
+    // like Intensity, not a quality/performance one, and in an open scene it
+    // is usually the largest single contributor to how the shadows read —
+    // burying it in Advanced is how you end up with a courtyard whose shadows
+    // are black because nothing told you a sky existed to turn on.
+    { key: "skyIntensity", label: "Sky Light", type: "number", min: 0, max: 20, step: 0.1 },
+    { key: "skyColor", label: "Sky Color", type: "color" },
     // Fraction of secondary energy retained per pass — the pass itself is
     // an infinite-bounce feedback loop; values > 1 would diverge.
     { key: "bounce", label: "Bounce Energy", type: "number", min: 0, max: 1, step: 0.05, advanced: true, flipsToCustom: "quality" },
@@ -81,9 +113,14 @@ export class GlobalIlluminationComponent extends Component {
     { key: "temporalBlend", label: "Bake Smoothing (1=off)", type: "number", min: 0.02, max: 1, step: 0.01, advanced: true, flipsToCustom: "quality" },
     { key: "reflections", label: "GI Reflections", type: "boolean", advanced: true, flipsToCustom: "quality" },
     { key: "exactReflections", label: "Exact Reflections (High/Ultra)", type: "boolean", advanced: true, flipsToCustom: "quality" },
+    { key: "backend", label: "Tracing Backend", type: "select", options: ["sdf-legacy", "occupancy"], advanced: true, flipsToCustom: "quality" },
+    { key: "sparseField", label: "Sparse Fine Field (sub-cell occlusion)", type: "boolean", advanced: true, flipsToCustom: "quality" },
     { key: "emissiveShadows", label: "Emissive Shadows", type: "boolean", advanced: true, flipsToCustom: "quality" },
     { key: "autoRebake", label: "Auto Re-bake", type: "boolean", advanced: true, flipsToCustom: "quality" },
-    { key: "debugProbes", label: "Debug View", type: "select", options: ["off", "raw", "merged", "sdf"], advanced: true, flipsToCustom: "quality" },
+    // "occupancy" renders only when `backend` is "occupancy" — it marches the
+    // pyramid with the SAME hierarchical DDA the transport rays use, so it is
+    // the instrument for "is this column actually in the field".
+    { key: "debugProbes", label: "Debug View", type: "select", options: ["off", "raw", "merged", "sdf", "occupancy"], advanced: true, flipsToCustom: "quality" },
   ];
 
   get #system() {

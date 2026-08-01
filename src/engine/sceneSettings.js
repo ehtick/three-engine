@@ -264,6 +264,41 @@ export function rendererConstructorOptions(settings) {
   };
 }
 
+/**
+ * Device limits worth asking for above the WebGPU baseline, resolved against
+ * what the adapter actually offers.
+ *
+ * WHY THIS EXISTS: the baseline `maxStorageBuffersPerShaderStage` is **8**, and
+ * that ceiling has shaped GI's architecture more than once — it is why the old
+ * ReSTIR reservoirs had to be interleaved into fewer buffers, and it is what a
+ * compute stage hits the moment the cascade trace needs one more field
+ * alongside the six per-cell buffers it already binds. Most desktop adapters
+ * report 16 or more; asking for it costs nothing and removes a whole class of
+ * "the compute batch silently failed" bugs.
+ *
+ * REQUESTING BLIND WOULD BE WORSE THAN NOT ASKING. `requiredLimits` is a hard
+ * requirement — `requestDevice` REJECTS if the adapter cannot meet it, which
+ * would turn a renderer that works today into no renderer at all on weaker
+ * hardware. So this queries the adapter first and only ever asks for what it
+ * already advertises. An adapter that offers exactly the baseline gets an empty
+ * object, i.e. today's behaviour unchanged.
+ *
+ * @returns {Promise<{requiredLimits?: Record<string, number>}>}
+ */
+export async function resolveRendererLimits() {
+  try {
+    const adapter = await navigator.gpu?.requestAdapter?.();
+    const available = adapter?.limits?.maxStorageBuffersPerShaderStage ?? 0;
+    if (available > 8) {
+      return { requiredLimits: { maxStorageBuffersPerShaderStage: Math.min(16, available) } };
+    }
+  } catch {
+    // No WebGPU, or the adapter query failed — fall through to the baseline.
+    // The renderer's own init() will report the real problem if there is one.
+  }
+  return {};
+}
+
 /** True for a texture this module put on the scene (vs. one a component owns). */
 const isSceneEnvTexture = (value) => value?.isTexture === true && value.userData?.sceneEnvironment === true;
 /** A texture some *other* owner (e.g. the HDRI EnvironmentComponent) installed. */

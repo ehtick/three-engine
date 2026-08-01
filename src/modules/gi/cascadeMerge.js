@@ -30,9 +30,21 @@ import { octahedralTexelIndex } from "./cascadeTrace.js";
  *
  * @param {Array} cascades from createRadianceCascades
  * @param {object} [opts]
- * @param {[number, number, number]} [opts.sky] radiance for rays that escape
- *   the outermost cascade. Default black — the spike's sealed-room checks
- *   depend on escapes contributing nothing.
+ * @param {[number, number, number]|object} [opts.sky] radiance for rays that
+ *   escape the outermost cascade — a literal triple, or a TSL node (GISystem
+ *   passes a uniform so the sky is a live control, not a rebuild). Default
+ *   black; the sealed-room checks depend on escapes contributing nothing.
+ *
+ *   THIS IS THE SCENE'S SKY LIGHT, and it is the only way any enters GI.
+ *   A ray only reaches here by leaving the volume without hitting anything —
+ *   i.e. it found its way out to open air — so a CONSTANT radiance here is
+ *   already correctly occluded: an interior gets sky only through whatever
+ *   openings actually see it, at the solid angle they actually subtend. With
+ *   it at black, the only thing that can light a shadowed surface is
+ *   multi-bounce off directly-lit ones, and since each bounce loses a factor
+ *   of albedo, shadows in an open scene (Sponza's courtyard) collapse to
+ *   near-black while a reference renderer with an ordinary world colour keeps
+ *   them open. That was the whole visible gap in the side-by-side.
  */
 // Blocker penetration (in FIELD voxels) over which a parent probe fades out of
 // the merge. Matches the final gather's tolerance — see the long note at the
@@ -43,6 +55,8 @@ const DEFAULT_MERGE_VIS_TOLERANCE = 1.75;
 
 export function createCascadeMerge(cascades, { sky = [0, 0, 0] } = {}) {
   const MERGE_VIS_TOLERANCE = Number(globalThis.__giMergeVisTol) || DEFAULT_MERGE_VIS_TOLERANCE;
+  // Accepts a literal triple (tests, defaults) or a node/uniform (GISystem).
+  const skyNode = Array.isArray(sky) ? vec3(sky[0], sky[1], sky[2]) : vec3(sky);
   for (const cascade of cascades) {
     cascade.merged = instancedArray(cascade.probeCount * cascade.dirCount, "vec4");
     cascade.mergedAverages = instancedArray(cascade.probeCount, "vec3");
@@ -66,7 +80,10 @@ export function createCascadeMerge(cascades, { sky = [0, 0, 0] } = {}) {
         out.assign(own);
       }).Else(() => {
         if (!parent) {
-          out.assign(vec4(sky[0], sky[1], sky[2], -1));
+          // Escaped the outermost cascade without hitting anything: it got
+          // out to open air, so it brings the sky back. w stays -1 (miss), so
+          // nothing downstream treats this as a surface hit.
+          out.assign(vec4(skyNode, -1));
         } else {
           const rayIdx = instanceIndex.toFloat();
           const probeIdx = floor(rayIdx.div(dirCount));

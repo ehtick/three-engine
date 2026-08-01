@@ -71,7 +71,14 @@
     "test:pool": "node scripts/run-pool-test.mjs",
     "test:spline": "node scripts/run-spline-test.mjs",
     "smoke:spline": "node scripts/run-spline-smoke.mjs",
-    "test:applytransform": "node scripts/run-apply-transform-test.mjs"
+    "test:applytransform": "node scripts/run-apply-transform-test.mjs",
+    "test:gi-lightvis": "node scripts/run-gi-light-visibility.mjs",
+    "test:gi-sunleak": "node scripts/run-gi-sun-leak.mjs",
+    "test:gi-primfit": "node scripts/run-gi-primitive-fit-test.mjs",
+    "test:gi-instanced": "node scripts/run-gi-instanced-sdf.mjs",
+    "test:gi-sparse": "node scripts/run-gi-sparse-field.mjs",
+    "test:gi-coverage": "node scripts/run-gi-sdf-coverage.mjs",
+    "test:gi-occupancy": "node scripts/run-gi-occupancy.mjs"
   },
   "dependencies": {
     "@dimforge/rapier3d-compat": "^0.19.3",

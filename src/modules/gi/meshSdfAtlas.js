@@ -21,6 +21,35 @@ const TILES_XY = 4; // 4×4 tiles per Z-layer → 16 slots per 64-deep layer
 export const SLOTS_PER_LAYER = TILES_XY * TILES_XY;
 export const MAX_ATLAS_LAYERS = 8; // 256×256×512 fp16 = 64MB ceiling
 export const MAX_MESH_SDF_SLOTS = SLOTS_PER_LAYER * MAX_ATLAS_LAYERS; // 128
+
+// ------------------------------------------------- tiles vs. INSTANCES
+// A tile is a chunk of the atlas TEXTURE (64³ or a 2×2×2 128³ block); an
+// instance is one placement of some geometry in the world (transform +
+// surface + a tile reference). They used to be the same index — slot i
+// owned tile i — which meant the scene's object budget was the VRAM
+// budget: 128 objects, full stop, and 60 copies of one crate burned 60
+// tiles holding 60 byte-identical distance grids.
+//
+// They are now separate pools. Tiles are refcounted and keyed by the SAME
+// content key the bake cache uses (`contentKey` — asset path + version, or
+// a geometry hash, plus the resolution tag), so N instances of a geometry
+// upload ONE tile and share it. Instances are pure uniform-array state, so
+// their ceiling is a uniform-buffer size rather than texture memory.
+//
+// The shader needs no changes for any of this: `#sampleSlotBody` already
+// reads the tile origin from a per-slot uniform (`tileOrigin`, added for
+// hi-res blocks), so two slots pointing at one tile is already expressible.
+//
+// 512 mat4s = 32KB, the largest of the per-slot arrays and half of
+// WebGPU's guaranteed 64KB `maxUniformBufferBindingSize`. Every other
+// per-slot array is a vec4 (8KB at this count).
+export const MAX_INSTANCE_SLOTS = 512;
+/** Instance capacity for a placement count: whole layers of 16, ≥ tiles. */
+export const instanceCapacityFor = (placements, tileCapacity = SLOTS_PER_LAYER) =>
+  Math.min(
+    MAX_INSTANCE_SLOTS,
+    Math.max(tileCapacity, Math.ceil(Math.max(1, placements) / SLOTS_PER_LAYER) * SLOTS_PER_LAYER),
+  );
 // HI-RES slots: a 2×2×2 block of tiles = 128³ cells for meshes whose
 // silhouettes drive shadow quality (characters, large organic props). At
 // 64³ a 4m winged character bakes at ~6cm cells — thin wings fall below a
@@ -147,10 +176,27 @@ export function geometryContentHash(geometry) {
   return result;
 }
 
+/**
+ * Identity of one PLACEMENT. A plain mesh is identified by itself; an
+ * InstancedMesh contributes one placement per instance, so it needs the
+ * instance index too. Used to match live scene entries against seated slots.
+ */
+export const slotKeyOf = (mesh, instanceId = null) =>
+  instanceId == null ? mesh : `${mesh.uuid}#${instanceId}`;
+
 export class MeshSdfAtlas {
-  constructor(capacity = SLOTS_PER_LAYER) {
-    this.capacity = Math.min(MAX_MESH_SDF_SLOTS, Math.max(SLOTS_PER_LAYER, capacity));
-    const layers = Math.ceil(this.capacity / SLOTS_PER_LAYER);
+  /**
+   * @param {number} tileCapacity physical 64³ tiles in the texture (VRAM).
+   * @param {number} [instanceCapacity] world placements (uniform arrays).
+   *   Defaults to the tile capacity, which reproduces the old 1:1 behaviour.
+   */
+  constructor(tileCapacity = SLOTS_PER_LAYER, instanceCapacity = 0) {
+    this.tileCapacity = Math.min(MAX_MESH_SDF_SLOTS, Math.max(SLOTS_PER_LAYER, tileCapacity));
+    this.capacity = Math.min(
+      MAX_INSTANCE_SLOTS,
+      Math.max(this.tileCapacity, instanceCapacity || this.tileCapacity),
+    );
+    const layers = Math.ceil(this.tileCapacity / SLOTS_PER_LAYER);
     this.width = SLOT * TILES_XY;
     this.height = SLOT * TILES_XY;
     this.depth = SLOT * layers;
@@ -188,9 +234,23 @@ export class MeshSdfAtlas {
     // to the legacy index-derived origins so a slot seated without
     // allocateSlot behaves exactly as before.
     this.tileOrigin = makeVec4Array();
-    for (let i = 0; i < n; i++) this.tileOrigin.array[i].set(...this.#tileOriginOf(i), 1);
+    for (let i = 0; i < n; i++) this.tileOrigin.array[i].set(0, 0, 0, 1);
     // Detail-slot indices (float, -1 = off) for the in-trace refinement.
+    // Kept as the FALLBACK path: when no instance grid is attached (or it is
+    // disabled via __giNoInstanceGrid) the traces refine against these
+    // globally-chosen slots exactly as before.
     this.detailSlots = uniformArray(Array.from({ length: DETAIL_SLOTS }, () => -1), "float");
+    // Two-level acceleration structure (instanceGrid.js), attached by the
+    // volume once world bounds are known. Null = flat behaviour everywhere.
+    this.grid = null;
+    // Fine level (sparseField.js), same ownership story as `grid`: attached by
+    // the volume, invalidated from here. Both MUST be invalidated together —
+    // they are two views of the same slot state, and a stale one is not merely
+    // out of date, it points at geometry that has moved.
+    this.sparse = null;
+    // Per-slot rank the grid uses to decide which candidates a crowded cell
+    // keeps (higher wins) — published by GISystem alongside the detail slots.
+    this.slotPriority = null;
     // Bumped whenever any slot uniform changes — sdfScene watches it to
     // re-run the composite pass.
     this.revision = 1;
@@ -201,13 +261,24 @@ export class MeshSdfAtlas {
     this._dirtyMin = new THREE.Vector3(Infinity, Infinity, Infinity);
     this._dirtyMax = new THREE.Vector3(-Infinity, -Infinity, -Infinity);
 
-    // CPU-side bookkeeping: which mesh occupies which slot.
-    this.assignments = new Array(this.capacity).fill(null); // { mesh, sdf, capLocal, matrixCache }
+    // CPU-side bookkeeping: which placement occupies which INSTANCE slot.
+    // { mesh, instanceId, key, sdf, capLocal, matrixCache, tileKey, analytic }
+    this.assignments = new Array(this.capacity).fill(null);
+    this._freeSlots = [];
+    for (let i = this.capacity - 1; i >= 0; i--) this._freeSlots.push(i);
+    // TILE POOL — physical texture tiles, independent of instance slots.
+    // `_tileOwners[t]` is the content key holding tile t (a hi-res block
+    // stamps its key on all 8 members); `_tiles` maps that key to the shared
+    // handle every instance of the geometry points at.
+    this._tileOwners = new Array(this.tileCapacity).fill(null);
+    this._tiles = new Map(); // contentKey → { origin: [x,y,z], block, refs }
+    this._privateTileSeq = 0; // unique keys for unshareable ("null key") tiles
     this._scratch = {
       v: new THREE.Vector3(),
       q: new THREE.Quaternion(),
       s: new THREE.Vector3(),
       corner: new THREE.Vector3(),
+      m: new THREE.Matrix4(),
     };
     // World-space reach the AABBs are expanded by (set by sdfScene to the
     // global field's cap distance so AABB-rejected cells legitimately read
@@ -232,49 +303,79 @@ export class MeshSdfAtlas {
     return z * SLOTS_PER_LAYER + y * TILES_XY + x;
   }
 
+  /** Claims a free INSTANCE slot (no tile). -1 = instance capacity full. */
+  allocateSlot() {
+    return this._freeSlots.length ? this._freeSlots.pop() : -1;
+  }
+
+  /** Returns an instance slot claimed by allocateSlot but never seated. */
+  releaseSlot(i) {
+    if (i >= 0 && !this.assignments[i] && !this._freeSlots.includes(i)) this._freeSlots.push(i);
+  }
+
   /**
-   * Claims a free slot and stamps its tile-block origin. hiRes = a 2×2×2
-   * aligned block of free tiles (one 128³ grid): the 7 non-primary tiles
-   * are marked `{ reservedBy: primary }` so nothing else seats in them, and
-   * clearSlot(primary) frees the whole block. Returns the slot index or -1
-   * (callers treat -1 as capacity overflow, same as before).
+   * Claims physical TILES for content `key`, or returns the handle already
+   * held for it (refcounted — this is what makes N instances of a geometry
+   * cost one tile). hiRes = a 2×2×2 aligned block of free tiles, i.e. one
+   * 128³ grid; all 8 members record the key so nothing else seats in them.
+   * Returns `{ origin, block, refs }` or null when the pool is full.
    */
-  allocateSlot(hiRes = false) {
-    if (hiRes) {
-      const layers = Math.ceil(this.capacity / SLOTS_PER_LAYER);
-      for (let z = 0; z + 1 < layers; z += 2) {
-        for (let y = 0; y + 1 < TILES_XY; y += 2) {
-          for (let x = 0; x + 1 < TILES_XY; x += 2) {
-            const members = [];
-            for (let dz = 0; dz < 2; dz++)
-              for (let dy = 0; dy < 2; dy++)
-                for (let dx = 0; dx < 2; dx++) members.push(this.#tileIndexOf(x + dx, y + dy, z + dz));
-            if (members.some((m) => m >= this.capacity || this.assignments[m])) continue;
-            const primary = this.#tileIndexOf(x, y, z);
-            for (const m of members) {
-              if (m !== primary) this.assignments[m] = { reservedBy: primary };
-            }
-            this.tileOrigin.array[primary].set(x * SLOT, y * SLOT, z * SLOT, 2);
-            return primary;
-          }
+  acquireTile(key, hiRes = false) {
+    const existing = this._tiles.get(key);
+    if (existing) {
+      // A geometry that first seated at 64³ and is later wanted at 128³ (or
+      // vice versa) keeps the tile it has — the resolution is baked into the
+      // SDF payload that was uploaded, and re-tiling live instances mid-frame
+      // would tear. A rebuild re-seats everything at the wanted resolution.
+      existing.refs++;
+      return existing;
+    }
+    const found = hiRes ? this.#findTileBlock() : this.#findTileSingle();
+    if (!found) return null;
+    const handle = { origin: found.origin, block: hiRes ? 2 : 1, refs: 1 };
+    for (const t of found.members) this._tileOwners[t] = key;
+    this._tiles.set(key, handle);
+    return handle;
+  }
+
+  /** Drops one reference to `key`'s tile, freeing it at zero. */
+  releaseTile(key) {
+    const handle = this._tiles.get(key);
+    if (!handle) return;
+    if (--handle.refs > 0) return;
+    this._tiles.delete(key);
+    for (let t = 0; t < this._tileOwners.length; t++) {
+      if (this._tileOwners[t] === key) this._tileOwners[t] = null;
+    }
+  }
+
+  #findTileBlock() {
+    const layers = Math.ceil(this.tileCapacity / SLOTS_PER_LAYER);
+    for (let z = 0; z + 1 < layers; z += 2) {
+      for (let y = 0; y + 1 < TILES_XY; y += 2) {
+        for (let x = 0; x + 1 < TILES_XY; x += 2) {
+          const members = [];
+          for (let dz = 0; dz < 2; dz++)
+            for (let dy = 0; dy < 2; dy++)
+              for (let dx = 0; dx < 2; dx++) members.push(this.#tileIndexOf(x + dx, y + dy, z + dz));
+          if (members.some((m) => m >= this.tileCapacity || this._tileOwners[m])) continue;
+          return { origin: [x * SLOT, y * SLOT, z * SLOT], members };
         }
       }
-      return -1;
     }
+    return null;
+  }
+
+  #findTileSingle() {
     // Singles allocate from the TAIL. First-free-from-zero fragmented every
     // 2×2×2-aligned region as soon as a handful of walls seated, so a
     // hi-res block could NEVER allocate afterwards — seat, overflow,
     // rebuild, identical packing, overflow again: the editor's infinite
     // "[gi] built …" loop.
-    let i = -1;
-    for (let k = this.assignments.length - 1; k >= 0; k--) {
-      if (!this.assignments[k]) {
-        i = k;
-        break;
-      }
+    for (let t = this._tileOwners.length - 1; t >= 0; t--) {
+      if (!this._tileOwners[t]) return { origin: this.#tileOriginOf(t), members: [t] };
     }
-    if (i >= 0) this.tileOrigin.array[i].set(...this.#tileOriginOf(i), 1);
-    return i;
+    return null;
   }
 
   /**
@@ -286,7 +387,7 @@ export class MeshSdfAtlas {
    * and solid-interior, so walls seal regardless of thinness. This is the
    * reference demo's analytic-geometry path, kept alongside baked grids.
    */
-  setAnalyticSlot(i, mesh, shape, surface) {
+  setAnalyticSlot(i, mesh, shape, surface, instanceId = null) {
     const { center, half } = shape;
     // localMin.xyz doubles as the shape CENTER for analytic slots.
     this.localMin.array[i].set(center[0], center[1], center[2], 1);
@@ -303,10 +404,16 @@ export class MeshSdfAtlas {
     // sphere lamp is an ELLIPSOID, not a min-scale shrunken sphere whose
     // 4.5×-underestimated distances over-darkened every shadow around it.
     this.dims.array[i].set(1, 1, 1, (shape.type === "sphere" ? 2 : 1) + (shape.hollow ? 2 : 0));
+    // Analytic slots hold no tile — their distance is evaluated in closed
+    // form, so instancing them is free and needs no dedup at all.
+    this.tileOrigin.array[i].set(0, 0, 0, 1);
     this.assignments[i] = {
       analytic: true,
       analyticHalf: [half[0], half[1], half[2]], // TRUE local half-extents
       mesh,
+      instanceId,
+      key: slotKeyOf(mesh, instanceId),
+      tileKey: null,
       sdf: {
         boundsMin: [center[0] - half[0], center[1] - half[1], center[2] - half[2]],
         boundsSize: [half[0] * 2, half[1] * 2, half[2] * 2],
@@ -321,30 +428,47 @@ export class MeshSdfAtlas {
     this.revision++;
   }
 
-  /** Uploads a baked grid into slot `i` and wires its static uniforms. */
-  setSlot(i, mesh, sdf, surface) {
+  /**
+   * Seats a baked grid in instance slot `i`, sharing (or claiming) the tile
+   * that holds `tileKey`'s distance grid. Returns false when the TILE pool is
+   * full — the caller frees the instance slot and treats it as overflow.
+   *
+   * The pixel upload happens only on the first instance of a content key;
+   * every later instance is uniform writes alone. That is the whole reason a
+   * forest of 300 identical trees is now affordable: 300 transforms, one 64³
+   * grid, and — because the tile is byte-identical anyway — no visible
+   * difference from having baked each of them separately.
+   */
+  setSlot(i, mesh, sdf, surface, options = {}) {
     const { data, dims, boundsMin, boundsSize, minCell } = sdf;
-    // Tile-block origin inside the atlas texture (stamped by allocateSlot;
-    // legacy index-derived for slots seated without it). Hi-res slots span
-    // a 2×2×2 tile block = 128 cells per axis.
+    const { tileKey = null, hiRes = false, instanceId = null } = options;
+    // A null key means "never share" — give this slot a private tile under a
+    // unique key so the refcount bookkeeping stays uniform.
+    const key = tileKey ?? `slot#${i}#${++this._privateTileSeq}`;
+    const tile = this.acquireTile(key, hiRes);
+    if (!tile) return false;
     const origin = this.tileOrigin.array[i];
-    const block = SLOT * (origin.w > 1.5 ? 2 : 1);
-    const tx = origin.x;
-    const ty = origin.y;
-    const tz = origin.z;
-    for (let z = 0; z < block; z++) {
-      for (let y = 0; y < block; y++) {
-        const dst = ((tz + z) * this.height + ty + y) * this.width + tx;
-        if (z < dims.z && y < dims.y) {
-          const src = (z * dims.y + y) * dims.x;
-          this.data.set(data.subarray(src, src + dims.x), dst);
-          if (dims.x < block) this.data.fill(HALF_ONE, dst + dims.x, dst + block);
-        } else {
-          this.data.fill(HALF_ONE, dst, dst + block);
+    origin.set(tile.origin[0], tile.origin[1], tile.origin[2], tile.block);
+    // First reference uploads the grid; later ones read the same texels.
+    if (tile.refs === 1) {
+      const block = SLOT * tile.block;
+      const tx = tile.origin[0];
+      const ty = tile.origin[1];
+      const tz = tile.origin[2];
+      for (let z = 0; z < block; z++) {
+        for (let y = 0; y < block; y++) {
+          const dst = ((tz + z) * this.height + ty + y) * this.width + tx;
+          if (z < dims.z && y < dims.y) {
+            const src = (z * dims.y + y) * dims.x;
+            this.data.set(data.subarray(src, src + dims.x), dst);
+            if (dims.x < block) this.data.fill(HALF_ONE, dst + dims.x, dst + block);
+          } else {
+            this.data.fill(HALF_ONE, dst, dst + block);
+          }
         }
       }
+      this.texture.needsUpdate = true;
     }
-    this.texture.needsUpdate = true;
 
     this.localMin.array[i].set(boundsMin[0], boundsMin[1], boundsMin[2], 1);
     this.cellsPerLocal.array[i].set(
@@ -356,6 +480,9 @@ export class MeshSdfAtlas {
     this.dims.array[i].set(dims.x, dims.y, dims.z, 0);
     this.assignments[i] = {
       mesh,
+      instanceId,
+      key: slotKeyOf(mesh, instanceId),
+      tileKey: key,
       sdf,
       capLocal: MESH_SDF_CAP * minCell,
       matrixCache: new Float32Array(16).fill(Number.NaN),
@@ -364,6 +491,7 @@ export class MeshSdfAtlas {
     this.aabbMin.array[i].w = 1; // active
     this.refreshSlotTransform(i);
     this.revision++;
+    return true;
   }
 
   /** Live surface update (material edits) — no texture churn. */
@@ -389,27 +517,17 @@ export class MeshSdfAtlas {
   clearSlot(i) {
     const assignment = this.assignments[i];
     if (!assignment) return;
-    // Reserved members of a hi-res block are freed by their PRIMARY's clear,
-    // never directly (GISystem's stale-slot sweep sees their mesh as
-    // undefined and would otherwise dissolve live blocks).
-    if (assignment.reservedBy != null) return;
-    const origin = this.tileOrigin.array[i];
-    if (origin.w > 1.5) {
-      const x = origin.x / SLOT, y = origin.y / SLOT, z = origin.z / SLOT;
-      for (let dz = 0; dz < 2; dz++)
-        for (let dy = 0; dy < 2; dy++)
-          for (let dx = 0; dx < 2; dx++) {
-            const m = this.#tileIndexOf(x + dx, y + dy, z + dz);
-            if (this.assignments[m]?.reservedBy === i) this.assignments[m] = null;
-          }
-      origin.w = 1;
-    }
     // Mark the slot's box dirty BEFORE deactivating it — that box is about
     // to stop influencing the composite, so the cells it used to cover must
     // be recomputed too.
     this.#markSlotDirty(i);
+    // The TILE only frees when the last instance sharing it goes; the other
+    // 299 trees still need those texels.
+    if (assignment.tileKey) this.releaseTile(assignment.tileKey);
     this.aabbMin.array[i].w = 0;
+    this.tileOrigin.array[i].set(0, 0, 0, 1);
     this.assignments[i] = null;
+    this._freeSlots.push(i);
     this.revision++;
   }
 
@@ -427,6 +545,10 @@ export class MeshSdfAtlas {
    * overlaps. No-op for an inactive slot — nothing to invalidate.
    */
   #markSlotDirty(i) {
+    // Any change to a slot's box changes which grid cells list it — and which
+    // coarse cells need a brick.
+    this.grid?.invalidate();
+    this.sparse?.invalidate();
     if (this.aabbMin.array[i].w > 0.5) {
       const bmin = this.aabbMin.array[i];
       const bmax = this.aabbMax.array[i];
@@ -462,10 +584,24 @@ export class MeshSdfAtlas {
     return result;
   }
 
+  /**
+   * World matrix of a placement. A plain mesh IS its `matrixWorld`; an
+   * InstancedMesh placement is that matrix composed with the instance's own
+   * (three keeps instance matrices in the mesh's LOCAL space). Returns a
+   * scratch matrix in the instanced case — copy it before the next call.
+   */
+  worldMatrixOf(assignment) {
+    const { mesh, instanceId } = assignment;
+    if (instanceId == null || !mesh.isInstancedMesh) return mesh.matrixWorld;
+    const m = this._scratch.m;
+    mesh.getMatrixAt(instanceId, m);
+    return m.premultiply(mesh.matrixWorld);
+  }
+
   /** True when slot `i`'s cached world matrix differs from the live one. */
-  #matrixChanged(assignment, mesh) {
+  #matrixChanged(assignment) {
     const cache = assignment.matrixCache;
-    const e = mesh.matrixWorld.elements;
+    const e = this.worldMatrixOf(assignment).elements;
     for (let k = 0; k < 16; k++) {
       if (Math.abs(cache[k] - e[k]) > 1e-7 || Number.isNaN(cache[k])) return true;
     }
@@ -475,18 +611,20 @@ export class MeshSdfAtlas {
   /** Recomputes slot `i`'s transform-derived uniforms from the live matrix. */
   refreshSlotTransform(i) {
     const assignment = this.assignments[i];
-    // Reserved hi-res block members carry no mesh — only their primary has
-    // transform state.
-    if (!assignment || assignment.reservedBy != null) return;
+    if (!assignment) return;
     // Dirty the OLD box before it's overwritten below; the second call at
     // the end of this method dirties the NEW box — together a moved slot
     // invalidates both where it was and where it is.
     this.#markSlotDirty(i);
-    const { mesh, sdf, capLocal } = assignment;
-    assignment.matrixCache.set(mesh.matrixWorld.elements);
-    this.worldToLocal.array[i].copy(mesh.matrixWorld).invert();
+    const { sdf, capLocal } = assignment;
+    // Copied, not aliased: for an InstancedMesh placement this is the shared
+    // scratch matrix, which the very next slot's refresh overwrites.
+    const world = this._scratch.world ??= new THREE.Matrix4();
+    world.copy(this.worldMatrixOf(assignment));
+    assignment.matrixCache.set(world.elements);
+    this.worldToLocal.array[i].copy(world).invert();
     const { v, q, s, corner } = this._scratch;
-    mesh.matrixWorld.decompose(v, q, s);
+    world.decompose(v, q, s);
     const minScale = Math.max(1e-4, Math.min(Math.abs(s.x), Math.abs(s.y), Math.abs(s.z)));
     this.aabbMax.array[i].w = capLocal * minScale; // distScale
     this.localMin.array[i].w = minScale; // localToWorldScale
@@ -528,7 +666,7 @@ export class MeshSdfAtlas {
         bm[1] + (c & 2 ? bs[1] : 0),
         bm[2] + (c & 4 ? bs[2] : 0),
       );
-      corner.applyMatrix4(mesh.matrixWorld);
+      corner.applyMatrix4(world);
       if (corner.x < minX) minX = corner.x;
       if (corner.y < minY) minY = corner.y;
       if (corner.z < minZ) minZ = corner.z;
@@ -569,19 +707,23 @@ export class MeshSdfAtlas {
     let changed = false;
     for (let i = 0; i < this.assignments.length; i++) {
       const assignment = this.assignments[i];
-      if (!assignment || assignment.reservedBy != null) continue;
+      if (!assignment) continue;
       const { mesh } = assignment;
       if (!mesh.parent && !mesh.isMesh) {
         this.clearSlot(i);
         changed = true;
         continue;
       }
-      if (this.#matrixChanged(assignment, mesh)) {
+      if (this.#matrixChanged(assignment)) {
         this.refreshSlotTransform(i);
         changed = true;
       }
     }
-    if (changed) this.revision++;
+    if (changed) {
+      this.revision++;
+      this.grid?.invalidate();
+      this.sparse?.invalidate();
+    }
     return changed;
   }
 
@@ -710,23 +852,45 @@ export class MeshSdfAtlas {
         // build) — unused iterations would still cost shader code size.
         const budget = Math.min(DETAIL_SLOTS, this.detailBudget ?? DETAIL_SLOTS);
         const out = float(dIn).toVar();
+        const refineAgainst = (si) => {
+          const bmin = this.aabbMin.element(si);
+          const bmax = this.aabbMax.element(si);
+          const inside = pw.x.greaterThan(bmin.x)
+            .and(pw.y.greaterThan(bmin.y))
+            .and(pw.z.greaterThan(bmin.z))
+            .and(pw.x.lessThan(bmax.x))
+            .and(pw.y.lessThan(bmax.y))
+            .and(pw.z.lessThan(bmax.z))
+            .and(bmin.w.greaterThan(0.5));
+          If(inside, () => {
+            out.assign(out.min(this.sampleSlot(si, pw)));
+          });
+        };
+        if (this.grid) {
+          // SPATIAL candidates: the budget is spent on slots near THIS point
+          // instead of on one globally-ranked list. Same instruction count —
+          // the lanes unroll exactly like the fixed list below — but a wall
+          // on the far side of the level no longer occupies a slot that the
+          // geometry actually being traced needs.
+          const cell = this.grid.cellIndex(pw).toVar();
+          const groups = Math.ceil(budget / 4);
+          for (let g = 0; g < groups; g++) {
+            const packed = this.grid.groupAt(cell, g).toVar();
+            for (const lane of ["x", "y", "z", "w"]) {
+              const s = packed[lane].toVar();
+              // Negative = padding (or an overflowed cell, whose list is
+              // still valid for the first CELL_STRIDE entries — the scan-all
+              // sentinel only concerns the composite, which must be exact;
+              // refinement is a min() against an already-correct distance,
+              // so missing a candidate softens an edge, never leaks light).
+              If(s.greaterThanEqual(0), () => refineAgainst(s.toInt()));
+            }
+          }
+          return out;
+        }
         for (let k = 0; k < budget; k++) {
           const s = this.detailSlots.element(k).toVar();
-          If(s.greaterThanEqual(0), () => {
-            const si = s.toInt();
-            const bmin = this.aabbMin.element(si);
-            const bmax = this.aabbMax.element(si);
-            const inside = pw.x.greaterThan(bmin.x)
-              .and(pw.y.greaterThan(bmin.y))
-              .and(pw.z.greaterThan(bmin.z))
-              .and(pw.x.lessThan(bmax.x))
-              .and(pw.y.lessThan(bmax.y))
-              .and(pw.z.lessThan(bmax.z))
-              .and(bmin.w.greaterThan(0.5));
-            If(inside, () => {
-              out.assign(out.min(this.sampleSlot(si, pw)));
-            });
-          });
+          If(s.greaterThanEqual(0), () => refineAgainst(s.toInt()));
         }
         return out;
       },

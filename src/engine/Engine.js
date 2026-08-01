@@ -6,6 +6,7 @@ import {
   mergeSettings,
   applySettingsToScene,
   rendererConstructorOptions,
+  resolveRendererLimits,
   rendererNeedsRebuild,
   applyQualityCeiling,
 } from "./sceneSettings.js";
@@ -415,7 +416,11 @@ export class Engine extends EventEmitter {
     const work = (async () => {
       try {
         const opts = rendererConstructorOptions(this.settings);
-        this.renderer = new THREE.WebGPURenderer({ canvas, ...opts });
+        // Adapter-clamped limit bump — see resolveRendererLimits. Awaited
+        // BEFORE construction because `requiredLimits` is a constructor
+        // parameter three forwards straight to requestDevice.
+        const limits = await resolveRendererLimits();
+        this.renderer = new THREE.WebGPURenderer({ canvas, ...opts, ...limits });
         this.#applyRendererSize();
         await this.renderer.init();
         // Another rebuild started while we were awaiting init(). It owns
@@ -597,6 +602,7 @@ export class Engine extends EventEmitter {
     this.renderer = new THREE.WebGPURenderer({
       canvas,
       ...rendererConstructorOptions(this.settings),
+      ...(await resolveRendererLimits()),
     });
     this.#applyRendererSize();
     await this.renderer.init();

@@ -17,6 +17,8 @@ import * as THREE from "three/webgpu";
 import { Break, Discard, Fn, If, Loop, cameraPosition, float, floor, instanceIndex, instancedArray, ivec3, mod, positionWorld, select, step, texture3D, textureStore, uniform, vec3, vec4 } from "three/tsl";
 import { SDF_CAP, bakeMeshSdf } from "./bakeCore.js";
 import { sharedFn } from "./giFn.js";
+import { createInstanceGrid, loopCandidates } from "./instanceGrid.js";
+import { createSparseField } from "./sparseField.js";
 import { createTrilinearRadianceSampler } from "./voxelizeOnce.js";
 
 
@@ -93,7 +95,7 @@ export function createSdfBaker() {
  * @param {{x,y,z}} res global grid cells per axis
  * @param {import("./meshSdfAtlas.js").MeshSdfAtlas} atlas
  */
-export function createSdfScene(bounds, res, atlas) {
+export function createSdfScene(bounds, res, atlas, options = {}) {
   const cellCount = res.x * res.y * res.z;
   const size = new THREE.Vector3().subVectors(bounds.max, bounds.min);
   const cell = new THREE.Vector3(size.x / res.x, size.y / res.y, size.z / res.z);
@@ -102,6 +104,14 @@ export function createSdfScene(bounds, res, atlas) {
   // slot AABBs by this so AABB-rejected cells are legitimately far.
   const capWorld = SDF_CAP * minCell;
   atlas.aabbExpand = capWorld;
+
+  // TOP-LEVEL traversal structure. Attached to the atlas so its TSL helpers
+  // (`refineDetail`) can reach it, and consulted by every pass that used to
+  // sweep the whole slot list. `__giNoInstanceGrid` restores the flat scans
+  // for A/B — the two paths must produce the SAME field, so any difference
+  // between them is a bug in here, not a quality setting.
+  const grid = globalThis.__giNoInstanceGrid ? null : createInstanceGrid(atlas);
+  atlas.grid = grid;
 
   // WORLD PARAMETERIZATION AS UNIFORMS. Every world-space constant the GI
   // shaders need (volume origin/size, cell size, distance cap) lives in
@@ -158,6 +168,52 @@ export function createSdfScene(bounds, res, atlas) {
   distanceTexture.minFilter = THREE.LinearFilter;
   distanceTexture.magFilter = THREE.LinearFilter;
 
+  // ------------------------------------------------ FINE level (sparse bricks)
+  // The coarse field above is ~0.33m on a real scene, which is wider than the
+  // columns and walls it is supposed to occlude — measured, see sparseField.js.
+  // The sparse level puts a fp16 brick in every coarse cell a surface passes
+  // through, so a transport ray pays ONE extra texture fetch (not a per-slot
+  // loop) to get sub-decimetre occlusion. Off by default until it is proven on
+  // the user's own scene: `__giSparseField = true`, or the component prop.
+  const sparse = options.sparseField
+    ? createSparseField(
+        { res, world, cell, distanceTexture },
+        atlas,
+        { brickAxis: options.brickAxis, maxBricks: options.maxBricks },
+      )
+    : null;
+  // Registered so slot edits invalidate the page table through the same path
+  // that invalidates the grid — the atlas is the only thing that knows when a
+  // slot moved, and it must not have to know what a brick is.
+  atlas.sparse = sparse;
+
+  // Conservative triangle occupancy, supplied by GISystem at build time (it
+  // owns the mesh list). Null until then, and null forever when disabled.
+  let occupancy = options.occupancy ?? null;
+
+  // ─────────────────────────────────────── OCCUPANCY BACKEND (spec phases 1+4)
+  // The conservative triangle-occupancy pyramid (occupancyField.js). When
+  // present it becomes the HIT TEST for diffuse transport and the hard block
+  // for shadow rays; the composited SDF above stays as the RADIANCE/albedo
+  // carrier and as the distance source for the tuned soft-shadow penumbra
+  // estimator, which needs a continuous distance that a bitset cannot provide.
+  //
+  // See createSceneTrace's note for exactly which rays moved and which did not.
+  const occField = options.occupancyField ?? null;
+  // Pyramid level whose voxel is at least one coarse cell across. The composite
+  // uses it to force `occupied` where triangles pass, so sub-cell geometry gets
+  // a radiance/albedo shell instead of vanishing. CONSERVATIVE on purpose (a
+  // level finer than the coarse cell would test only the cell's middle and miss
+  // exactly the thin features this exists for) — and it is a genuine build
+  // constant, because a refit rescales both grids from the same bounds and
+  // leaves their RATIO untouched.
+  const coarseLevel = occField
+    ? Math.max(0, Math.min(
+        occField.levels.length - 1,
+        Math.ceil(Math.log2(Math.max(1, occField.res.x / res.x))),
+      ))
+    : 0;
+
   // ------------------------------------------------------------- composite
   // One thread per global cell: min all slot SDFs → distance + nearest-slot
   // surface. Runs only when atlas.revision changed (move/edit/SDF arrival).
@@ -182,7 +238,9 @@ export function createSdfScene(bounds, res, atlas) {
     If(inDirty, () => {
       const minD = float(world.capWorld).toVar();
       const best = float(-1).toVar();
-      Loop({ start: 0, end: atlas.capacity, name: "slot" }, ({ slot }) => {
+      // Only the slots the grid lists for this cell — the AABB test below
+      // still runs, so a conservative list costs nothing but time.
+      loopCandidates(grid, atlas.capacity, p, (slot) => {
         const bmin = atlas.aabbMin.element(slot).toVar();
         If(bmin.w.greaterThan(0.5), () => {
           const bmax = atlas.aabbMax.element(slot);
@@ -202,6 +260,30 @@ export function createSdfScene(bounds, res, atlas) {
         });
       });
 
+      // CONSERVATIVE TRIANGLE OCCUPANCY (occupancyGrid.js). The slot SDFs
+      // above are per-mesh grids whose cells are 0.4–0.6m on a real building,
+      // so anything smaller than that — a column, a curtain, a moulding — is
+      // already gone from `minD` before this line. The occupancy bitset is
+      // rasterized straight from triangles, so it still has them.
+      //
+      // Where it says "solid", the distance is FORCED to zero. That cannot
+      // make the field leak more (zero is the smallest a distance can be, so
+      // every sphere-traced step gets shorter, never longer) and it puts back
+      // exactly the geometry the resampling chain dropped.
+      if (occupancy) {
+        const occ = texture3D(
+          occupancy.texture,
+          vec3(ix.add(0.5).div(res.x), iy.add(0.5).div(res.y), iz.add(0.5).div(res.z)),
+        ).level(0).r;
+        minD.assign(select(occ.greaterThan(0.5), float(0), minD));
+      }
+      // Same clamp, from the SAT-conservative pyramid rather than the CPU
+      // prototype's point-sampled grid. This is what gives a sub-cell column a
+      // radiance/albedo shell in the coarse field: without it the column would
+      // BLOCK light (the DDA sees it) while emitting nothing and reading black.
+      if (occField) {
+        minD.assign(select(occField.occupiedAtWorld(p, coarseLevel).greaterThan(0.5), float(0), minD));
+      }
       const occupied = step(minD, occThreshold).toVar();
       const albedo = vec3(0).toVar();
       const emissive = vec3(0).toVar();
@@ -243,6 +325,30 @@ export function createSdfScene(bounds, res, atlas) {
     capWorld,
     world,
     atlas,
+    grid,
+    sparse,
+    occupancy,
+    occupancyField: occField,
+    coarseLevel,
+
+    /**
+     * Re-pages the fine level if any slot moved. Returns true when the page
+     * table changed, which is the caller's signal that `sparse.fillCompute`
+     * has to run before anything traces.
+     */
+    updateSparse() {
+      return sparse ? sparse.allocate() : false;
+    },
+
+    /**
+     * Refreshes the top-level candidate lists if any slot moved. MUST run
+     * before the composite dispatch — the composite reads the lists to decide
+     * what it is allowed to skip, so a stale list is a stale field.
+     * Returns true when the lists actually changed.
+     */
+    updateGrid() {
+      return grid ? grid.update(bounds) : false;
+    },
 
     /**
      * In-place volume refit: rescales the SAME cell grid to new world
@@ -265,6 +371,17 @@ export function createSdfScene(bounds, res, atlas) {
       world.minCell.value = this.minCell;
       world.cellMax.value = Math.max(cell.x, cell.y, cell.z);
       world.capWorld.value = this.capWorld;
+      // Every cell of the top-level grid just changed world size, and the
+      // slot AABBs are about to be re-expanded by the new cap.
+      grid?.invalidate();
+      // Same for the fine level: its bricks are indexed BY COARSE CELL, and
+      // every coarse cell just moved and resized.
+      sparse?.invalidate();
+      if (sparse) sparse.params.band.value = this.minCell * 1.5;
+      // The occupancy pyramid shares `world.min`/`world.size`, so its shaders
+      // need no touching — but its voxel SIZE is derived, not uniform-shared,
+      // and every bit in it was rasterized against the old bounds.
+      occField?.refit();
     },
     stats: { occupiedCells: -1, emissiveCells: -1, cellCount },
     stagingBuffer,
@@ -294,25 +411,47 @@ export function createSdfScene(bounds, res, atlas) {
     dispose() {
       distanceTexture.dispose();
       atlas.texture.dispose();
+      sparse?.dispose();
+      occupancy?.dispose();
     },
 
-    // Cascade rays SPHERE-TRACE the composited SDF (+ detail slots) — no
-    // voxel DDA anywhere in the transport anymore. Hits shade from the
-    // occupancy-weighted trilinear radiance field instead of a single cell
-    // (SIDE-AWARE via the normal buffer: a thin wall's two shell layers
-    // never mix, or the bright side would shine through the dark one).
-    createSceneTrace: () =>
-      createSdfSceneTrace(
-        distanceTexture, world, res, atlas,
-        createTrilinearRadianceSampler(radianceBuffer, { min: world.min }, res, world.cell, normalBuffer),
-      ),
+    // TRANSPORT RAYS — the ones the leak lives on.
+    //
+    // With the occupancy backend these are a HIERARCHICAL DDA over conservative
+    // triangle occupancy: hits come from a level-0 bit and nothing else, so a
+    // 0.5m column in a 0.33m field is present instead of melted, and the
+    // 0.125m voxel resolves the two faces of a 0.2m wall. This is the path that
+    // deliberately did NO detail refinement (6 extra SDF fetches per step
+    // quadrupled the frame, 8.3 → 33ms), which is precisely why diffuse GI saw
+    // only the coarse blobs while shadows and mirrors saw sub-cell geometry.
+    //
+    // Without it, the legacy sphere trace of the composited SDF (+ sparse
+    // bricks) — unchanged.
+    createSceneTrace: () => {
+      const sampler = createTrilinearRadianceSampler(
+        radianceBuffer, { min: world.min }, res, world.cell, normalBuffer,
+      );
+      return occField
+        ? createOccupancySceneTrace(occField, world, sampler)
+        : createSdfSceneTrace(distanceTexture, world, res, atlas, sampler, sparse);
+    },
     createRadianceSampler: () => createTrilinearRadianceSampler(radianceBuffer, { min: world.min }, res, world.cell),
     createIndirectSampler: () => createTrilinearRadianceSampler(indirectBuffer, { min: world.min }, res, world.cell),
     // `name` only labels the emitted WGSL function (readability in dumps) —
     // every instance gets a layout now, per shader (giFn.js).
+    // SHADOW RAYS keep the distance-based penumbra estimator — min(k·d/t) with
+    // closest-approach interpolation needs a CONTINUOUS distance, and a bitset
+    // has none. What the occupancy field replaces here is only the HARD BLOCK:
+    // the safety net for walls thinner than a coarse cell, which used to test
+    // the coarse `stagingBuffer` occupancy (same 0.33m cells that lost the wall
+    // in the first place) and now tests a 0.125m conservative voxel.
     createSoftShadowTrace: (lift, steps, name = undefined) =>
-      createShadowTrace(distanceTexture, world, res, lift, atlas, steps, stagingBuffer, name),
-    createMirrorTrace: (steps) => createMirrorTrace(distanceTexture, world, res, atlas, steps),
+      createShadowTrace(distanceTexture, world, res, lift, atlas, steps, stagingBuffer, name, sparse, occField),
+    // MIRROR RAYS stay on the sphere trace deliberately. They were a voxel DDA
+    // once and moved OFF it because binary cells give stair-stepped hit
+    // silhouettes where continuous distance gives smooth ones — and the spec's
+    // own non-goals exclude sharp reflections through the voxel field.
+    createMirrorTrace: (steps) => createMirrorTrace(distanceTexture, world, res, atlas, steps, sparse),
     createHitSurfaceFn: () => createHitSurfaceFn(atlas, world.minCell),
   };
 }
@@ -328,7 +467,7 @@ function createHitSurfaceFn(atlas, minCellNode) {
   return (p) => {
     const bestD = float(1e5).toVar();
     const best = float(-1).toVar();
-    Loop({ start: 0, end: atlas.capacity, name: "hitSlot" }, ({ hitSlot }) => {
+    loopCandidates(atlas.grid, atlas.capacity, p, (hitSlot) => {
       const bmin = atlas.aabbMin.element(hitSlot).toVar();
       If(bmin.w.greaterThan(0.5), () => {
         const bmax = atlas.aabbMax.element(hitSlot);
@@ -374,7 +513,7 @@ function createHitSurfaceFn(atlas, minCellNode) {
  * CPU-baked field (plane-aware self-exclusion, small contact cut, stepping
  * safety factor) — only the field source changed.
  */
-function createShadowTrace(distanceTexture, world, res, lift, atlas, steps = 56, occupancy = null, name = "giShadowTrace") {
+function createShadowTrace(distanceTexture, world, res, lift, atlas, steps = 56, occupancy = null, name = "giShadowTrace", sparse = null, occField = null) {
   const minCell = world.minCell;
   const capWorld = world.capWorld;
   // `lift` may be a plain number or a TSL node (GISystem passes uniform-
@@ -477,6 +616,16 @@ function createShadowTrace(distanceTexture, world, res, lift, atlas, steps = 56,
         // Hardware trilinear over the composited field; explicit level —
         // implicit-derivative sampling inside loops is illegal WGSL.
         const dRaw = texture3D(distanceTexture, uvw).level(0).r.mul(capWorldV).toVar();
+        // Fine level first (one fetch, whole-scene coverage), then the detail
+        // slots on top. They are not redundant: the bricks resample the same
+        // per-mesh SDFs onto a fixed lattice, so they carry every mesh but at
+        // brick resolution, while refineDetail reads a handful of per-mesh
+        // SDFs at their own NATIVE resolution (0.02–0.15m — finer than any
+        // brick). Sparse fixes coverage; detail slots keep the sharpest edges.
+        if (sparse) {
+          const fine = sparse.sample(p);
+          dRaw.assign(select(fine.valid.and(dRaw.lessThan(sparse.params.band)), fine.d, dRaw));
+        }
         // Detail slots: crisp local fields min()ed in near dense/important
         // meshes — sub-scene-cell silhouettes (thin wings, fine props).
         dRaw.assign(atlas.refineDetail(dRaw, p));
@@ -541,7 +690,22 @@ function createShadowTrace(distanceTexture, world, res, lift, atlas, steps = 56,
         // block is only the safety net for thin walls beyond the detail
         // budget, and 0.3·cell catches those while leaving the soft band
         // (est ≥ 0.3·cell) untouched.
-        if (occupancy) {
+        //
+        // The occupancy FIELD supersedes the coarse cell test when present:
+        // same net, at 0.125m conservative voxels instead of the 0.33m cells
+        // that lost the wall to begin with. Its gate is the CONTACT cut rather
+        // than `occCut`, because a level-0 bit is unambiguous — the reason the
+        // old gate had to be conservative (0.3·cell) was that a coarse
+        // "occupied" cell could be half empty space, and zeroing on it
+        // bottom-clipped the penumbra ramp into hard-edged shadows.
+        if (occField) {
+          If(isRealOccluder.and(dRaw.lessThan(contactCut.mul(2))), () => {
+            If(occField.occupiedAtWorld(p, 0).greaterThan(0.5), () => {
+              penumbra.assign(0);
+              Break();
+            });
+          });
+        } else if (occupancy) {
           If(isRealOccluder.and(dRaw.lessThan(occCut)), () => {
             const cx = p.x.sub(minV.x).div(cellV.x).floor().clamp(0, res.x - 1);
             const cy = p.y.sub(minV.y).div(cellV.y).floor().clamp(0, res.y - 1);
@@ -601,7 +765,7 @@ function createShadowTrace(distanceTexture, world, res, lift, atlas, steps = 56,
  * Applied to a camera-facing volume box rendered from the inside.
  */
 export function createSdfDebugMaterial(volume) {
-  const { world, distanceTexture, atlas } = volume;
+  const { world, distanceTexture, atlas, sparse } = volume;
   const minCell = world.minCell;
   const capWorld = world.capWorld;
 
@@ -640,8 +804,26 @@ export function createSdfDebugMaterial(volume) {
       const uvw = p.sub(minV).div(sizeV).clamp(0, 1).toVar();
       const sample = texture3D(distanceTexture, uvw).level(0).toVar();
       const d = sample.r.mul(capWorldV).toVar();
+      // The debug view must march the SAME field the traces do, fine level
+      // included — otherwise it keeps showing the coarse blobs while the GI
+      // has stopped using them, and the one instrument for "is my SDF any
+      // good" lies about the thing it exists to show.
+      if (sparse) {
+        const fine = sparse.sample(p);
+        d.assign(select(fine.valid.and(d.lessThan(sparse.params.band)), fine.d, d));
+      }
       d.assign(atlas.refineDetail(d, p));
-      If(d.lessThan(minCellV.mul(0.4)), () => {
+      // HIT CUT AND STEP FLOOR AND ITERATION BUDGET ARE A TRIPLE, not a pair.
+      // Scaling the cut down to the fine cell (÷ brickAxis-1) and the floor
+      // with it left the 128-step budget untouched, so every grazing ray ran
+      // out of iterations before reaching its surface: the colonnade rendered
+      // as vertical shreds with the floor intact, which reads as "the sparse
+      // field is broken" when the field was fine and the MARCHER was starved.
+      // Held identical to the coarse path on purpose — then any difference in
+      // this view is the field's accuracy, which is the thing being judged.
+      // Sharpening the contact is a separate change with its own budget.
+      const hitCut = minCellV.mul(0.4);
+      If(d.lessThan(hitCut), () => {
         const n = sample.gba.mul(2).sub(1).toVar();
         // Normal-colored surface with a headlight lambert — a missing,
         // misplaced, or garbage mesh SDF is immediately visible.
@@ -649,6 +831,8 @@ export function createSdfDebugMaterial(volume) {
         out.assign(vec4(n.mul(0.5).add(0.5).mul(lambert), 1));
         Break();
       });
+      // Floor stays paired with the cut above (a ray whose distance lands
+      // between them steps clean over the hit band and punches a hole).
       t.addAssign(d.mul(0.9).clamp(minCellV.mul(0.3), capWorldV));
     });
     If(out.w.lessThan(0.5), () => {
@@ -667,7 +851,7 @@ export function createSdfDebugMaterial(volume) {
  * Back-side hits block but emit nothing (the composite's per-side gradient
  * normal decides), matching the DDA's convention.
  */
-function createSdfSceneTrace(distanceTexture, world, res, atlas, radianceSampler) {
+function createSdfSceneTrace(distanceTexture, world, res, atlas, radianceSampler, sparse) {
   const minCell = world.minCell;
   const capWorld = world.capWorld;
 
@@ -706,6 +890,20 @@ function createSdfSceneTrace(distanceTexture, world, res, atlas, radianceSampler
       // the hundreds of thousands per frame — 6 extra SDF fetches per step
       // quadrupled the whole frame (harness-measured 8.3 → 33ms). Shadows
       // and mirrors keep sub-cell detail; diffuse transport doesn't need it.
+      //
+      // THE SPARSE LEVEL IS WHAT LETS THAT CHANGE. It costs ONE page fetch
+      // plus one brick fetch — a constant, not a loop over slots — so the
+      // rays that decide GI occlusion finally see sub-cell geometry. This is
+      // the path the leak lives on: at 0.33m cells a 0.5m column is one and a
+      // half cells wide and transport walks straight through it.
+      //
+      // Consumed as PURE DATAFLOW (nested select, no If gate around the
+      // fetch). An `If()` around a `.toVar()`ed texture read is the idiom
+      // that rendered the BVH mirror pass black — see giLight's note.
+      if (sparse) {
+        const fine = sparse.sample(p);
+        d.assign(select(fine.valid.and(d.lessThan(sparse.params.band)), fine.d, d));
+      }
       If(d.lessThan(hitCut), () => {
         const n = sample.gba.mul(2).sub(1).toVar();
         // Side-aware sample: only cells facing the hit side contribute.
@@ -722,13 +920,106 @@ function createSdfSceneTrace(distanceTexture, world, res, atlas, radianceSampler
 }
 
 /**
+ * OCCUPANCY transport ray: (origin, dir, tMaxWorld) → { rad, t }, t < 0 = miss.
+ * The spec's `traceInterval`, phase 4 — hierarchical DDA over the conservative
+ * occupancy pyramid, with the hit shaded from the existing coarse radiance
+ * field.
+ *
+ * WHY THE RADIANCE STAYS COARSE (spec phase 3 is not this change). The leak is
+ * an OCCLUSION failure, not a radiance one: a 0.5m column melted out of a 0.33m
+ * distance field lets light through, and no amount of radiance resolution fixes
+ * that. Occlusion is now 0.125m and conservative; radiance is still probe-scale,
+ * which is where diffuse GI wants it anyway. Per-voxel radiance is the separate,
+ * later upgrade.
+ *
+ * TWO DETAILS THAT ARE NOT ARBITRARY:
+ *  · The hit is pushed OUT along the voxel face normal by half a coarse cell
+ *    before sampling radiance. The DDA stops exactly ON the surface, which in
+ *    coarse-cell terms is inside the wall; the shell cell carrying that face's
+ *    lighting is half a cell outside it.
+ *  · No `step(dot(dir, n), 0)` front-face gate, unlike the SDF trace. That gate
+ *    existed because an SDF-gradient normal is the SURFACE's outward normal, so
+ *    a back-side hit had to be detected and silenced. A DDA face normal always
+ *    points back along the ray, i.e. at the side the ray can actually see, and
+ *    feeding it to the SIDE-AWARE sampler already selects that side's shell —
+ *    a wall's dark face returns dark because its cells are dark, not because a
+ *    gate zeroed it.
+ */
+function createOccupancySceneTrace(occField, world, radianceSampler, steps = 64) {
+  return (origin, dir, tMaxWorld) => {
+    const o = vec3(origin).toVar();
+    const d = vec3(dir).toVar();
+    // Self-bias (spec §5.3): start a quarter of a coarse cell out so a probe
+    // sitting on a surface does not instantly hit the voxel it lives in.
+    const tMin = float(world.minCell).mul(0.25).toVar();
+    const r = occField.traceOccupancy(o, d, tMin, float(tMaxWorld), { steps });
+    const p = o.add(d.mul(r.t)).add(r.normal.mul(float(world.minCell).mul(0.5))).toVar();
+    const shaded = radianceSampler(p, r.normal);
+    const rad = vec3(shaded.rad).mul(r.hit).toVar();
+    const hitT = select(r.hit.greaterThan(0.5), r.t.max(1e-4), float(-1)).toVar();
+    return { rad, t: hitT };
+  };
+}
+
+/**
+ * Debug material for the "Occupancy" view: hierarchical-DDA the pyramid from
+ * the camera and shade hits by voxel face normal, tinted by which pyramid level
+ * the ray was on when it descended. This is the instrument for "is a column
+ * actually in the field" — the one question every leak in this module has come
+ * down to — and it marches EXACTLY what the transport rays march, because a
+ * debug view that renders a different field than the traces lies about the
+ * thing it exists to show.
+ */
+export function createOccupancyDebugMaterial(volume) {
+  const occField = volume.occupancyField;
+  const { world } = volume;
+
+  const material = new THREE.MeshBasicNodeMaterial();
+  material.side = THREE.BackSide;
+  material.depthTest = false;
+  material.depthWrite = false;
+  material.fragmentNode = Fn(() => {
+    const minV = vec3(world.min).toVar();
+    const sizeV = vec3(world.size).toVar();
+    const dir = positionWorld.sub(cameraPosition).normalize().toVar();
+    // Slab entry so an outside camera starts marching AT the volume.
+    const invEps = (component) => component.sign().mul(component.abs().max(1e-6));
+    const bmax = minV.add(sizeV).toVar();
+    const t1x = minV.x.sub(cameraPosition.x).div(invEps(dir.x));
+    const t2x = bmax.x.sub(cameraPosition.x).div(invEps(dir.x));
+    const t1y = minV.y.sub(cameraPosition.y).div(invEps(dir.y));
+    const t2y = bmax.y.sub(cameraPosition.y).div(invEps(dir.y));
+    const t1z = minV.z.sub(cameraPosition.z).div(invEps(dir.z));
+    const t2z = bmax.z.sub(cameraPosition.z).div(invEps(dir.z));
+    const tEnter = t1x.min(t2x).max(t1y.min(t2y)).max(t1z.min(t2z));
+    const tExit = t1x.max(t2x).min(t1y.max(t2y)).min(t1z.max(t2z));
+
+    // A generous budget: this view exists to show what IS there, so it must not
+    // report a hole the transport rays would not see just because it ran out of
+    // iterations (the failure that made the sparse field look broken when the
+    // MARCHER was starved).
+    const r = occField.traceOccupancy(
+      cameraPosition, dir, tEnter.max(0), tExit.max(0), { steps: 256 },
+    );
+    If(r.hit.lessThan(0.5), () => {
+      Discard();
+    });
+    // Normal-coloured with a headlight lambert — a missing, misplaced or
+    // one-voxel-thin piece of geometry is immediately readable.
+    const lambert = r.normal.dot(dir.negate()).abs().mul(0.6).add(0.4);
+    return vec4(r.normal.mul(0.5).add(0.5).mul(lambert), 1);
+  })();
+  return material;
+}
+
+/**
  * Mirror ray: sphere trace of the composited field (+ detail slots) —
  * (origin, dir, maxTWorld) → { t } with t < 0 = miss. Much smoother hit
  * silhouettes than the old occupancy DDA (continuous distances vs binary
  * cells), and cheaper in open space (steps grow with distance from
  * geometry). The caller shades the hit via the trilinear radiance sampler.
  */
-function createMirrorTrace(distanceTexture, world, res, atlas, steps = 64) {
+function createMirrorTrace(distanceTexture, world, res, atlas, steps = 64, sparse = null) {
   const minCell = world.minCell;
   const capWorld = world.capWorld;
 
@@ -772,6 +1063,10 @@ function createMirrorTrace(distanceTexture, world, res, atlas, steps = 64) {
           },
         );
         const d = texture3D(distanceTexture, uvw).level(0).r.mul(capWorldV).toVar();
+        if (sparse) {
+          const fine = sparse.sample(p);
+          d.assign(select(fine.valid.and(d.lessThan(sparse.params.band)), fine.d, d));
+        }
         d.assign(atlas.refineDetail(d, p));
         If(d.lessThan(hitCut), () => {
           hitT.assign(t);
