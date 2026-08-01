@@ -47,6 +47,19 @@ class CommandBus {
     this.#syncHistoryState();
   }
 
+  /**
+   * Re-publishes history state to the UI after something has rewritten the
+   * stack behind the bus's back.
+   *
+   * Exactly one caller: the `batch` op, which collapses the entries its steps
+   * pushed into a single labelled step. Without this the stack is right but the
+   * Edit menu still offers "Undo Add Mesh" — the label of the last inner step —
+   * so the user is told the wrong thing about what Ctrl+Z will do.
+   */
+  syncHistory() {
+    this.#syncHistoryState();
+  }
+
   #afterMutation() {
     useSceneStore.getState().refresh();
     useSceneStore.getState().markDirty();

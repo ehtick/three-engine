@@ -10,3 +10,34 @@
  * tests all layers by default (see ViewportPanel.jsx `setupPicking`).
  */
 export const EDITOR_LAYER = 31;
+
+/**
+ * Layer for runtime debug drawing (`engine.debug`).
+ *
+ * Deliberately NOT `EDITOR_LAYER`: debug draw is a gameplay-debugging tool, so
+ * it has to be visible in Play mode and the Game view, which are exactly the
+ * views that disable the editor layer. Giving it a layer of its own also means
+ * a camera can switch all of it off at once — and keeps it out of any pass that
+ * renders a filtered layer set.
+ *
+ * Cameras start with only layer 0 enabled, so every camera that should show
+ * debug drawing enables this explicitly (`CameraComponent` and the editor's
+ * orbit camera both do).
+ */
+export const DEBUG_LAYER = 30;
+
+/**
+ * Layer for objects large enough to be worth drawing into the occlusion
+ * culling depth pass (`culling/OcclusionSystem.js`).
+ *
+ * A layer rather than a list, because the point is for the pass to SKIP the
+ * rest of the scene without walking it: `camera.layers.set(OCCLUDER_LAYER)`
+ * makes three's projection step reject everything else at the object level.
+ *
+ * It is an ADDITIONAL bit, never a replacement — an occluder still has layer 0
+ * enabled and renders normally. The one thing to know about it is that
+ * `mesh.layers.mask` is part of the static batching key, so the tag is written
+ * on a dirty flag and not per frame; flipping it every frame would rebuild
+ * every batch in the scene, every frame.
+ */
+export const OCCLUDER_LAYER = 29;

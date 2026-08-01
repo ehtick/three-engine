@@ -70,8 +70,100 @@ export const SCENE_SETTINGS_DEFAULTS = {
     // goes from a thousand draw calls to one. Off only makes sense when
     // debugging a suspected batching artifact.
     autoBatching: true,
+    // Hides objects the depth buffer says are behind something else (see
+    // culling/OcclusionSystem.js). OFF by default and deliberately so: it costs
+    // a low-resolution depth pass over the scene's big geometry every frame,
+    // which is a straight loss in an open landscape with nothing to hide behind
+    // and a large win indoors. It is a property of the LEVEL, not of the
+    // project, which is why it lives here.
+    occlusionCulling: false,
   },
 };
+
+/**
+ * Build-wide quality presets, chosen in Build Settings and shipped in the
+ * build's config. They are a **ceiling, not an override**: every knob is taken
+ * as the cheaper of what the scene authored and what the preset allows.
+ *
+ * That asymmetry is the whole design. A scene deliberately dropped to
+ * `renderScale: 0.5` because it is fill-bound must not be *raised* to 1 by
+ * picking "High" in a dialog nobody associated with that scene — a preset that
+ * can push a scene past what it was tuned for turns one global dropdown into a
+ * silent regression across every level. So a preset can only ever make a build
+ * cheaper than authored, and `ultra` applies no ceiling at all (ship what each
+ * scene says).
+ *
+ * `null` on a key means "no ceiling for this knob".
+ */
+export const QUALITY_PRESETS = {
+  low: {
+    label: "Low",
+    maxDevicePixelRatio: 1,
+    renderScale: 0.65,
+    volumeStepScale: 0.4,
+    // Forced ON, not clamped: dynamic resolution can only lower resolution
+    // further, so enabling it never exceeds the scene's own budget.
+    dynamicResolution: true,
+    // Forced OFF. The only preset that touches shadows — "low" on a laptop
+    // integrated GPU is usually shadow-bound before it is anything else.
+    shadows: false,
+  },
+  medium: {
+    label: "Medium",
+    maxDevicePixelRatio: 1.5,
+    renderScale: 0.85,
+    volumeStepScale: 0.7,
+    dynamicResolution: true,
+    shadows: null,
+  },
+  high: {
+    label: "High",
+    maxDevicePixelRatio: 2,
+    renderScale: 1,
+    volumeStepScale: 1,
+    dynamicResolution: null,
+    shadows: null,
+  },
+  ultra: {
+    label: "Ultra (as authored)",
+    maxDevicePixelRatio: null,
+    renderScale: null,
+    volumeStepScale: null,
+    dynamicResolution: null,
+    shadows: null,
+  },
+};
+
+/** Cheaper of two numbers, tolerating a missing/`null` ceiling. */
+const floorAt = (authored, ceiling, fallback) => {
+  const a = Number.isFinite(authored) ? authored : fallback;
+  return Number.isFinite(ceiling) ? Math.min(a, ceiling) : a;
+};
+
+/**
+ * Returns `settings` with the named quality preset applied as a ceiling.
+ * Pure — takes and returns plain objects, so both the player's boot path and
+ * the headless build test can call it. An unknown or missing preset name is
+ * a no-op rather than an error: a build made by a newer editor should still
+ * run rather than refuse.
+ */
+export function applyQualityCeiling(settings, quality) {
+  const preset = QUALITY_PRESETS[quality];
+  if (!preset || quality === "ultra") return settings;
+  const authored = { ...SCENE_SETTINGS_DEFAULTS.performance, ...(settings?.performance ?? {}) };
+  const performance = {
+    ...authored,
+    maxDevicePixelRatio: floorAt(authored.maxDevicePixelRatio, preset.maxDevicePixelRatio, 2),
+    renderScale: floorAt(authored.renderScale, preset.renderScale, 1),
+    volumeStepScale: floorAt(authored.volumeStepScale, preset.volumeStepScale, 1),
+    dynamicResolution: preset.dynamicResolution === true ? true : authored.dynamicResolution === true,
+  };
+  return {
+    ...settings,
+    performance,
+    shadows: preset.shadows === false ? false : settings?.shadows !== false,
+  };
+}
 
 /**
  * Live quality knobs read by hot shader-update callbacks (e.g. the

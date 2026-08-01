@@ -655,14 +655,51 @@ export const MESH_SDF_MAX_AXIS = 64;
 // Distance cap in CELL units (same convention as the scene field).
 export const MESH_SDF_CAP = 16;
 
+// Shared view pair for the float32 → half-float bit conversion below —
+// bakeCore stays dependency-free (no THREE import), so this can't reuse
+// THREE.DataUtils.toHalfFloat().
+const _f32 = new Float32Array(1);
+const _u32 = new Uint32Array(_f32.buffer);
+
+/**
+ * Converts a float32 value to IEEE 754 half-float (fp16) bits, round-to-
+ * nearest. Standard bit-twiddling conversion (sign/exponent/mantissa
+ * re-bias + round); callers here only ever pass normalized [0, 1] values so
+ * overflow/NaN handling is minimal.
+ */
+function float32ToHalfBits(value) {
+  _f32[0] = value;
+  const x = _u32[0];
+  let bits = (x >> 16) & 0x8000; // sign
+  let m = (x >> 12) & 0x07ff; // mantissa
+  const e = (x >> 23) & 0xff; // exponent
+  if (e < 103) return bits; // underflows to zero
+  if (e > 142) {
+    bits |= 0x7c00; // overflow → infinity (unreachable for [0,1] inputs)
+    bits |= (e === 255 ? 0 : 1) && (x & 0x007fffff);
+    return bits;
+  }
+  if (e < 113) {
+    // Denormalized half.
+    m |= 0x0800;
+    bits |= (m >> (114 - e)) + ((m >> (113 - e)) & 1);
+    return bits;
+  }
+  // Normalized half, round-to-nearest-even.
+  bits |= ((e - 112) << 10) | (m >> 1);
+  bits += m & 1;
+  return bits;
+}
+
 /**
  * Bakes an UNSIGNED narrow-band-exact distance field for one geometry in
  * its LOCAL space — same math as the scene field (exact point-to-triangle
- * band + seeded Felzenszwalb EDT), just much denser. Quantized to Uint8
- * (d/cap · 255): the shadow tracer's min() only needs ~0.06-cell precision.
+ * band + seeded Felzenszwalb EDT), just much denser. Quantized to u16
+ * IEEE-754 half-float bits of (d/cap): the shadow tracer's min() only needs
+ * ~0.06-cell precision.
  *
- * Returns { data: Uint8Array, dims: {x,y,z}, boundsMin: [x,y,z],
- * cellSize: [x,y,z] } — distances decode as value/255 · MESH_SDF_CAP ·
+ * Returns { data: Uint16Array, dims: {x,y,z}, boundsMin: [x,y,z],
+ * cellSize: [x,y,z] } — distances decode as value · MESH_SDF_CAP ·
  * min(cellSize) world(local) units.
  */
 export function bakeMeshSdf(positions, index, maxAxisRes = MESH_SDF_MAX_AXIS) {
@@ -731,12 +768,12 @@ export function bakeMeshSdf(positions, index, maxAxisRes = MESH_SDF_MAX_AXIS) {
   const distance = new Float32Array(cellCount);
   computeDistanceField(seed, distance, res, cell);
 
-  // Quantize: distance is in minCell units capped at SDF_CAP (16); rescale
-  // to MESH_SDF_CAP just in case the constants ever diverge.
-  const data = new Uint8Array(cellCount);
-  const scale = 255 / MESH_SDF_CAP;
+  // Normalize to [0,1] (distance is in minCell units capped at SDF_CAP==16;
+  // divide by MESH_SDF_CAP just in case the constants ever diverge) and
+  // quantize to fp16 half-bits.
+  const data = new Uint16Array(cellCount);
   for (let i = 0; i < cellCount; i++) {
-    data[i] = Math.min(255, Math.round(Math.min(MESH_SDF_CAP, distance[i]) * scale));
+    data[i] = float32ToHalfBits(Math.min(1, distance[i] / MESH_SDF_CAP));
   }
   return {
     data,

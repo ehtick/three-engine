@@ -90,12 +90,15 @@ export class ModelComponent extends Component {
     });
     this.skeletonBindings = bindings;
 
-    // This subscription is deliberately created after the GLB finishes
-    // loading. AnimationComponent has already subscribed during prefab
-    // expansion, so its mixer advances first and attachment entities receive
-    // the pose from the same frame rather than one frame behind.
+    // Late stage, at the END of the pose pipeline: the animator writes bones
+    // during onUpdate and IK solvers bend them at late-order 0, so reading the
+    // pose at order 100 gets the FINAL bone transforms. Ordering this by
+    // subscription time instead (which is what it used to do, relying on the
+    // GLB finishing after AnimationComponent attached) left an attached weapon
+    // holding the pre-IK pose — one frame of lag that only shows up on the
+    // hand that IK actually moved.
     if (bindings.length && !this.unsubSkeletonSync) {
-      this.unsubSkeletonSync = this.entity.engine.onUpdate(() => this.#syncSkeletonEntities());
+      this.unsubSkeletonSync = this.entity.engine.onLateUpdate(() => this.#syncSkeletonEntities(), 100);
     }
     if (!bindings.length) {
       this.unsubSkeletonSync?.();

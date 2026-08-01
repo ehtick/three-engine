@@ -233,9 +233,26 @@ export const GraphEditor = forwardRef(function GraphEditor(
 
   const handlePropsChange = useCallback(
     (nodeId, patch, meta = {}) => {
-      const next = live.current.nodes.map((n) =>
-        n.id === nodeId ? { ...n, data: { ...n.data, props: { ...n.data.props, ...patch } } } : n,
-      );
+      // Preview / collapse change the node's natural box. Drop any explicit
+      // width/height React Flow may have stamped on so the wrapper can
+      // shrink-wrap again (otherwise Texture keeps a hollow shell).
+      const relayout = patch.__thumb !== undefined || patch.__collapsed !== undefined;
+      const next = live.current.nodes.map((n) => {
+        if (n.id !== nodeId) return n;
+        const updated = {
+          ...n,
+          data: { ...n.data, props: { ...n.data.props, ...patch } },
+        };
+        if (relayout) {
+          delete updated.width;
+          delete updated.height;
+          if (updated.style) {
+            const { width: _w, height: _h, ...rest } = updated.style;
+            updated.style = Object.keys(rest).length ? rest : undefined;
+          }
+        }
+        return updated;
+      });
       commit(next, live.current.edges, { kind: "props", nodeId, patch, ...meta });
     },
     [commit],

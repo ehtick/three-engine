@@ -1,8 +1,9 @@
 import { toBlobUrl, writeBinaryFile } from "./assetLoader.js";
+import * as THREE from "three/webgpu";
 import { useProjectStore, basename } from "./store/projectStore.js";
 import { useAssetProcessingStore } from "./store/assetProcessingStore.js";
-import { MATERIAL_DEFAULTS } from "../engine/materialAsset.js";
-import { GEOMETRY_BINARY_VERSION, encodeGeometryAsset } from "../engine/geometryAsset.js";
+import { MATERIAL_DEFAULTS, MATERIAL_PIPELINE_DEFAULTS } from "../engine/materialAsset.js";
+import { encodeGeometryAsset, geometryAssetFromBufferGeometry } from "../engine/geometryAsset.js";
 import { createGltfLoader } from "../engine/gltfLoader.js";
 import { buildPbrGraph } from "./pbrMaterialGraph.js";
 import { buildMeshEntities, buildBoneEntities } from "./rigPrefab.js";
@@ -122,93 +123,11 @@ async function textureToPng(texture) {
 }
 
 const colorHex = (color) => `#${color?.getHexString?.() ?? "ffffff"}`;
-
-/**
- * Copies a BufferAttribute's values into a tightly packed typed array.
- *
- * glTF optimizers commonly interleave tangent/color/skin attributes.
- * InterleavedBufferAttribute exposes its storage through `.data.array`, not
- * `.array`, and its values are strided — reading the raw array would pick up
- * neighbouring attributes' bytes.
- *
- * Values are copied verbatim. The previous writer rounded every component to
- * six decimals, which existed purely to keep the JSON text smaller; the binary
- * container has no such pressure, so imported meshes now keep the exact floats
- * the artist exported.
- */
-function attributeArray(attribute, ArrayType) {
-  const source = attribute.array ?? attribute.data?.array;
-  if (!source) throw new Error("Unsupported vertex attribute storage");
-  const { itemSize, count } = attribute;
-  const interleaved = !!attribute.isInterleavedBufferAttribute;
-  // Already exactly what we want: hand the buffer straight through.
-  if (!interleaved && source instanceof ArrayType && source.length === count * itemSize) {
-    return source;
-  }
-  const stride = interleaved ? attribute.data.stride : itemSize;
-  const offset = interleaved ? attribute.offset : 0;
-  const out = new ArrayType(count * itemSize);
-  for (let i = 0; i < count; i++) {
-    const from = i * stride + offset;
-    const to = i * itemSize;
-    for (let component = 0; component < itemSize; component++) {
-      out[to + component] = source[from + component];
-    }
-  }
-  return out;
-}
-
-/** Serializes a BufferGeometry to the .geom definition shape (authored normals kept). */
-function geometryAssetFromMesh(geometry) {
-  const position = geometry.getAttribute("position");
-  const normal = geometry.getAttribute("normal");
-  const uv = geometry.getAttribute("uv");
-  const vertexCount = position.count;
-  const IndexType = vertexCount > 65535 ? Uint32Array : Uint16Array;
-
-  let indices;
-  if (geometry.index) {
-    indices = attributeArray(geometry.index, IndexType);
-  } else {
-    // Non-indexed primitive: the .geom shape is always indexed, so emit the
-    // trivial 0..n-1 index run.
-    indices = new IndexType(vertexCount);
-    for (let i = 0; i < vertexCount; i++) indices[i] = i;
-  }
-
-  const attributeAsset = (attribute) => {
-    const source = attribute.array ?? attribute.data?.array;
-    if (!source) throw new Error("Unsupported vertex attribute storage");
-    const ArrayType = source.constructor;
-    return {
-      itemSize: attribute.itemSize,
-      normalized: !!attribute.normalized,
-      arrayType: ArrayType.name,
-      array: attributeArray(attribute, ArrayType),
-    };
-  };
-  const attributes = {};
-  for (const [name, attribute] of Object.entries(geometry.attributes)) {
-    if (name !== "position" && name !== "normal" && name !== "uv") {
-      attributes[name] = attributeAsset(attribute);
-    }
-  }
-  const morphAttributes = {};
-  for (const [name, targets] of Object.entries(geometry.morphAttributes)) {
-    morphAttributes[name] = targets.map(attributeAsset);
-  }
-  return {
-    version: GEOMETRY_BINARY_VERSION,
-    positions: attributeArray(position, Float32Array),
-    indices,
-    uvs: uv ? attributeArray(uv, Float32Array) : null,
-    normals: normal ? attributeArray(normal, Float32Array) : null,
-    attributes,
-    morphAttributes,
-    morphTargetsRelative: !!geometry.morphTargetsRelative,
-    groups: geometry.groups.map(({ start, count, materialIndex }) => ({ start, count, materialIndex })),
-  };
-}
+const wrapName = (value) => value === THREE.ClampToEdgeWrapping
+  ? "clamp"
+  : value === THREE.MirroredRepeatWrapping
+    ? "mirror"
+    : "repeat";
 
 /** Unpacks a .glb in place; returns the created folder path (or null). */
 export async function unpackGlb(glbPath, { assetStem = null, cleanupPaths = [] } = {}) {
@@ -261,14 +180,27 @@ async function unpackGlbImpl(glbPath, { assetStem = null, cleanupPaths = [] } = 
     const pending = (async () => {
       const bytes = await textureToPng(texture);
       if (!bytes) return "";
-      const name = safeName(texture.name || texture.image?.name || fallbackName);
+      // Role-derived names prevent one source image used by both an sRGB
+      // color slot and a linear data slot from racing onto the same .png.meta
+      // path and silently changing the other's color space/UV transform.
+      const name = safeName(fallbackName);
       const path = `${folder}/Textures/${name}.png`;
       await writeBinaryFile(path, bytes);
       // glTF UVs have a top-left origin; loaders must not flip these images.
       // Data maps (normal/rough/metal/AO) must not be sRGB-decoded either.
       await invoke("save_scene", {
         path: `${path}.meta`,
-        contents: JSON.stringify({ flipY: false, colorSpace: srgb ? "srgb" : "linear" }, null, 2),
+        contents: JSON.stringify({
+          flipY: false,
+          colorSpace: srgb ? "srgb" : "linear",
+          wrapS: wrapName(texture.wrapS),
+          wrapT: wrapName(texture.wrapT),
+          repeat: texture.repeat?.toArray?.() ?? [1, 1],
+          offset: texture.offset?.toArray?.() ?? [0, 0],
+          center: texture.center?.toArray?.() ?? [0, 0],
+          rotation: Number(texture.rotation) || 0,
+          channel: Number(texture.channel) || 0,
+        }, null, 2),
       });
       const { autoCompressTexture } = await import("./basisCompress.js");
       await autoCompressTexture(path).catch((err) =>
@@ -312,9 +244,12 @@ async function unpackGlbImpl(glbPath, { assetStem = null, cleanupPaths = [] } = 
     if (mat.sheenRoughnessMap) maps.sheenRoughness = await writeTexture(mat.sheenRoughnessMap, `${name} sheen roughness`);
     if (mat.specularIntensityMap) maps.specularIntensity = await writeTexture(mat.specularIntensityMap, `${name} specular intensity`);
     if (mat.specularColorMap) maps.specularColor = await writeTexture(mat.specularColorMap, `${name} specular color`, { srgb: true });
+    const legacySpecGloss = mat.userData?.gltfLegacySpecGloss;
+    if (legacySpecGloss?.hasSpecularGlossinessTexture && mat.specularColorMap) {
+      maps.glossiness = await writeTexture(mat.specularColorMap, `${name} specular glossiness`);
+    }
     if (mat.anisotropyMap) maps.anisotropy = await writeTexture(mat.anisotropyMap, `${name} anisotropy`);
 
-    const hasGraphMaps = Object.values(maps).some(Boolean);
     const factors = {
       color: colorHex(mat.color),
       roughness: typeof mat.roughness === "number" ? mat.roughness : MATERIAL_DEFAULTS.roughness,
@@ -322,6 +257,7 @@ async function unpackGlbImpl(glbPath, { assetStem = null, cleanupPaths = [] } = 
       ior: typeof mat.ior === "number" ? mat.ior : 1.5,
       specularIntensity: typeof mat.specularIntensity === "number" ? mat.specularIntensity : 0.5,
       specularColor: colorHex(mat.specularColor),
+      glossiness: legacySpecGloss?.glossinessFactor,
       emissive: colorHex(mat.emissive),
       emissiveStrength: typeof mat.emissiveIntensity === "number" ? mat.emissiveIntensity : 1,
       opacity: typeof mat.opacity === "number" ? mat.opacity : 1,
@@ -336,6 +272,41 @@ async function unpackGlbImpl(glbPath, { assetStem = null, cleanupPaths = [] } = 
       thickness: typeof mat.thickness === "number" ? mat.thickness : null,
       useDiffuseAlpha: !!mat.map && (mat.transparent || mat.alphaTest > 0 || mat.opacity < 1),
     };
+    const hasGraphMaps = Object.values(maps).some(Boolean);
+    const hasAdvancedFactors =
+      factors.emissive !== "#000000" || factors.emissiveStrength !== 1 || factors.opacity !== 1 ||
+      factors.ior !== 1.5 || factors.specularIntensity !== 0.5 || factors.specularColor !== "#ffffff" ||
+      factors.anisotropy != null || factors.clearcoat != null || factors.clearcoatRoughness != null ||
+      factors.sheen != null || factors.sheenRoughness != null || factors.transmission != null ||
+      factors.thickness != null;
+    const cullMode = mat.side === THREE.DoubleSide ? "none" : mat.side === THREE.BackSide ? "front" : "back";
+    const blendMode = mat.blending === THREE.AdditiveBlending
+      ? "additive"
+      : mat.blending === THREE.SubtractiveBlending
+        ? "subtractive"
+        : mat.blending === THREE.MultiplyBlending
+          ? "multiply"
+          : mat.blending === THREE.NoBlending
+            ? "none"
+            : "normal";
+    const pipeline = {
+      ...MATERIAL_PIPELINE_DEFAULTS,
+      cullMode,
+      depthTest: mat.depthTest !== false,
+      depthWrite: mat.depthWrite !== false,
+      colorWrite: mat.colorWrite !== false,
+      transparent: mat.transparent === true,
+      blendMode,
+      alphaTest: Number(mat.alphaTest) || 0,
+      alphaHash: mat.alphaHash === true,
+      premultipliedAlpha: mat.premultipliedAlpha === true,
+      polygonOffset: mat.polygonOffset === true,
+      polygonOffsetFactor: Number(mat.polygonOffsetFactor) || 0,
+      polygonOffsetUnits: Number(mat.polygonOffsetUnits) || 0,
+      wireframe: mat.wireframe === true,
+      toneMapped: mat.toneMapped !== false,
+      fog: mat.fog !== false,
+    };
     const def = {
       ...MATERIAL_DEFAULTS,
       color: factors.color,
@@ -344,9 +315,10 @@ async function unpackGlbImpl(glbPath, { assetStem = null, cleanupPaths = [] } = 
       map: maps.diffuse ?? "",
       // Diffuse-only materials stay plain scalar .mat files; the graph only
       // appears when there's something for it to wire.
-      shaderGraph: hasGraphMaps
+      shaderGraph: hasGraphMaps || hasAdvancedFactors
         ? buildPbrGraph(maps, { armHasAo: !!sharedOrm && mat.aoMap === sharedOrm, factors })
         : null,
+      pipeline,
     };
     const matPath = `${folder}/Materials/${name}.mat`;
     await invoke("save_scene", { path: matPath, contents: JSON.stringify(def, null, 2) });
@@ -373,7 +345,7 @@ async function unpackGlbImpl(glbPath, { assetStem = null, cleanupPaths = [] } = 
   const geometryFor = async (mesh, path = geometryPathFor(mesh)) => {
     let definition;
     try {
-      definition = geometryAssetFromMesh(mesh.geometry);
+      definition = geometryAssetFromBufferGeometry(mesh.geometry);
     } catch (error) {
       throw new Error(`Could not extract geometry "${mesh.name || "Mesh"}": ${error.message ?? error}`);
     }
@@ -393,13 +365,17 @@ async function unpackGlbImpl(glbPath, { assetStem = null, cleanupPaths = [] } = 
     // hundreds of meshes, and doing one IPC round-trip at a time made the
     // import latency-bound rather than work-bound.
     for (const mesh of meshes) {
-      const mat = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
-      if (Array.isArray(mesh.material) && mesh.material.length > 1) {
-        console.warn(`"${mesh.name}": multi-material mesh — using "${mat?.name}" for all faces`);
+      const meshMaterials = (Array.isArray(mesh.material) ? mesh.material : [mesh.material]).slice(0, 8);
+      if (Array.isArray(mesh.material) && mesh.material.length > 8) {
+        console.warn(`"${mesh.name}": ${mesh.material.length} materials — the engine supports the first 8 slots`);
       }
+      const materialProps = {};
+      meshMaterials.forEach((mat, index) => {
+        materialProps[index === 0 ? "material" : `material${index + 1}`] = materialPaths.get(mat) ?? "";
+      });
       meshAssets.set(mesh, {
         geometryAsset: geometryPathFor(mesh),
-        material: materialPaths.get(mat) ?? "",
+        ...materialProps,
       });
     }
     await mapLimit(meshes, WRITE_CONCURRENCY, async (mesh) => {

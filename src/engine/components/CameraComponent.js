@@ -1,7 +1,17 @@
 import * as THREE from "three/webgpu";
 import { Component } from "./Component.js";
-import { EDITOR_LAYER } from "../editorLayers.js";
+import { DEBUG_LAYER, EDITOR_LAYER } from "../editorLayers.js";
+import { BLEND_STYLES, CameraPose, blendCurve } from "../camera/rigMath.js";
 
+/**
+ * The real camera — and, when the scene has any Virtual Cameras, the "brain"
+ * that decides which of them is live and blends between them.
+ *
+ * The brain is folded into this component rather than being a separate one
+ * because there is exactly one active camera per frame, and a scene where the
+ * camera silently does nothing until you remember to add a second component is
+ * worse than one extra prop here.
+ */
 export class CameraComponent extends Component {
   static type = "camera";
   static label = "Camera";
@@ -9,6 +19,11 @@ export class CameraComponent extends Component {
     fov: 60,
     near: 0.1,
     far: 1000,
+    // --- virtual camera brain ---
+    blendTime: 0.6,
+    blendStyle: "easeInOut",
+    shake: 1,
+    previewRigInEditor: false,
     // Preview / follow state travels with the camera component so it
     // stays attached to the entity that owns it (the user picks the
     // camera, the follow target lives on that camera). `showPreview`
@@ -25,24 +40,45 @@ export class CameraComponent extends Component {
     { key: "fov", label: "FOV", type: "number", min: 1, max: 179, step: 1 },
     { key: "near", label: "Near", type: "number", min: 0.001, step: 0.1 },
     { key: "far", label: "Far", type: "number", min: 1, step: 10 },
+    { key: "blendTime", label: "Blend (s)", type: "number", min: 0, step: 0.05 },
+    { key: "blendStyle", label: "Blend Curve", type: "select", options: BLEND_STYLES },
+    { key: "shake", label: "Shake Scale", type: "number", min: 0, max: 4, step: 0.1 },
+    { key: "previewRigInEditor", label: "Preview Rig", type: "boolean" },
   ];
 
   onAttach() {
     const { fov, near, far } = this.props;
     this.camera = new THREE.PerspectiveCamera(fov, 16 / 9, near, far);
+    // Game cameras see runtime debug drawing. A camera starts with only layer 0
+    // enabled, so without this `engine.debug` would draw into Play mode and the
+    // Game view and render nothing — the two views it exists for.
+    this.camera.layers.enable(DEBUG_LAYER);
     this.camera.userData.entityId = this.entity.id;
     this.entity.object3D.add(this.camera);
     this.model = buildCameraModel();
     this.model.traverse((child) => child.layers.set(EDITOR_LAYER));
     this.model.visible = this._enabled;
     this.entity.object3D.add(this.model);
-    this.unsubUpdate = this.entity.engine.onUpdate(() => {
-      if (!this.entity.engine.playing) return;
-      this.applyLookAt(!!this.props.followInGame, this.entity.engine);
+
+    // Brain state.
+    this.live = null; // the vcam currently driving the camera
+    this.blendFrom = null; // the one being blended out of, if it still exists
+    this._blendPose = new CameraPose(); // frozen fallback for a departed vcam
+    this._pose = new CameraPose();
+    this._blendElapsed = 0;
+    this._blendDuration = 0;
+    this._previewPose = null; // entity transform to restore when preview stops
+
+    this.unsubUpdate = this.entity.engine.onUpdate((dt) => {
+      const engine = this.entity.engine;
+      if (this.#tickRig(dt, engine)) return;
+      if (!engine.playing) return;
+      this.applyLookAt(!!this.props.followInGame, engine);
     });
   }
 
   onDetach() {
+    this.#restorePreviewPose();
     if (!this.camera) return;
     this.entity.object3D.remove(this.camera);
     this.camera = null;
@@ -81,6 +117,184 @@ export class CameraComponent extends Component {
     // consumed by the editor (preview toggle) and by the per-frame follow
     // tick; no three.js camera property to push.
   }
+
+  // --- virtual camera brain --------------------------------------------------
+
+  /**
+   * The virtual camera that should be live: the highest priority among the
+   * enabled ones, with ties going to the most recently attached.
+   *
+   * `solo` short-circuits everything. It is an editor affordance — click Solo
+   * on a shot to see it now — and giving it its own channel rather than
+   * "temporarily raise the priority" means it can't be confused with, or
+   * accidentally saved as, an authored priority.
+   */
+  pickVirtualCamera(engine) {
+    let best = null;
+    let bestPriority = -Infinity;
+    // A timeline camera-shot track outranks every authored priority while its
+    // clip is under the playhead. A cutscene that cuts to a shot is stating
+    // what the audience sees; losing that fight to whichever gameplay camera
+    // happens to sit at priority 100 would make shot tracks unusable in exactly
+    // the scenes they exist for.
+    let shot = null;
+    for (const vcam of engine.virtualCameras ?? []) {
+      if (vcam.solo) return vcam;
+      if (vcam.timelineShot) shot = vcam;
+      if (!vcam.enabled) continue;
+      if (vcam.entity?.enabledInGame === false && engine.playing) continue;
+      const priority = vcam.props.priority ?? 0;
+      if (priority >= bestPriority) {
+        bestPriority = priority;
+        best = vcam;
+      }
+    }
+    return shot ?? best;
+  }
+
+  /**
+   * Runs one frame of the rig. Returns true when it took over the camera, so
+   * the caller knows to skip the legacy look-at follow.
+   */
+  #tickRig(dt, engine) {
+    const vcams = engine.virtualCameras;
+    if (!vcams?.size) {
+      this.#restorePreviewPose();
+      return false;
+    }
+    // `timelinePreview` is set transiently by a bound TimelineRuntime that owns
+    // a camera-shot track, and cleared when it unbinds. Without it the brain
+    // sits idle in the editor and scrubbing a shot track does nothing visible —
+    // which reads as the track being broken.
+    const previewing = !engine.playing && (this.props.previewRigInEditor || this.timelinePreview);
+    if (!engine.playing && !previewing) {
+      this.#restorePreviewPose();
+      return false;
+    }
+    if (previewing) this.#capturePreviewPose();
+
+    const next = this.pickVirtualCamera(engine);
+    if (!next) return false;
+
+    if (next !== this.live) {
+      // Freeze the current result before switching, so a blend has something
+      // to start from even if the outgoing shot is deleted mid-blend.
+      if (this.live) {
+        this._blendPose.copy(this._pose);
+        this.blendFrom = this.live;
+      } else {
+        this.blendFrom = null;
+      }
+      // The incoming shot's own blend time wins when set: "how long to ease
+      // into THIS shot" is a property of the shot, not of the camera. -1 means
+      // "use the camera's default".
+      // A timeline shot's blend is a property of the cut, not of the shot: the
+      // same vcam can be cut to hard in one sequence and eased into in another.
+      const requested = next.timelineShot && next.timelineBlend >= 0
+        ? next.timelineBlend
+        : next.props.blendTime;
+      this._blendDuration = this.live ? (requested >= 0 ? requested : this.props.blendTime ?? 0) : 0;
+      this._blendElapsed = 0;
+      this.live = next;
+      // Snap the incoming shot onto its target before it is seen. Without this
+      // it evaluates from wherever its damped state was left — often across the
+      // level — and the blend films the trip.
+      next.evaluate(0, { snap: true });
+    }
+
+    const target = this.live.evaluate(dt);
+    if (this.blendFrom && this._blendDuration > 0 && this._blendElapsed < this._blendDuration) {
+      this._blendElapsed += dt;
+      const t = blendCurve(this._blendElapsed / this._blendDuration, this.props.blendStyle);
+      // Keep evaluating the outgoing shot while it exists — a follow camera
+      // that freezes the moment you cut away from it drags a stationary ghost
+      // through the blend.
+      const from = this.blendFrom.entity ? this.blendFrom.evaluate(dt) : this._blendPose;
+      this._pose.lerpPoses(from, target, t);
+      if (this._blendElapsed >= this._blendDuration) this.blendFrom = null;
+    } else {
+      this._pose.copy(target);
+      this.blendFrom = null;
+    }
+
+    this.#applyPose(engine);
+    return true;
+  }
+
+  /** Writes the blended pose (plus shake) onto the camera entity. */
+  #applyPose(engine) {
+    const object = this.entity.object3D;
+    _worldPos.copy(this._pose.position);
+    _worldQuat.copy(this._pose.quaternion);
+
+    const shakeScale = this.props.shake ?? 1;
+    if (shakeScale > 0 && engine.cameraImpulse?.count) {
+      engine.cameraImpulse.sample(_worldPos, _shakePos, _shakeEuler);
+      // Shake is applied in the camera's OWN space: a horizontal rattle has to
+      // mean "left/right of frame", not "along world X", or the same explosion
+      // shakes sideways or into the lens depending on which way you happened to
+      // be facing.
+      _worldPos.add(_shakePos.multiplyScalar(shakeScale).applyQuaternion(_worldQuat));
+      _shakeEuler.x *= shakeScale;
+      _shakeEuler.y *= shakeScale;
+      _shakeEuler.z *= shakeScale;
+      _worldQuat.multiply(_shakeQuat.setFromEuler(_shakeEuler));
+    }
+
+    // The pose is world-space; the entity's transform is relative to its
+    // parent. A camera parented under anything (a vehicle, a UI root) would
+    // otherwise be offset by that parent's transform, twice.
+    const parent = object.parent;
+    if (parent && parent !== engine.scene) {
+      parent.updateMatrixWorld(true);
+      _m.copy(parent.matrixWorld).invert();
+      object.position.copy(_worldPos).applyMatrix4(_m);
+      parent.getWorldQuaternion(_parentQuat);
+      object.quaternion.copy(_parentQuat.invert()).multiply(_worldQuat);
+    } else {
+      object.position.copy(_worldPos);
+      object.quaternion.copy(_worldQuat);
+    }
+
+    const fov = this._pose.fov > 0 ? this._pose.fov : this.props.fov;
+    if (this.camera && Math.abs(this.camera.fov - fov) > 1e-4) {
+      this.camera.fov = fov;
+      this.camera.updateProjectionMatrix();
+    }
+  }
+
+  /**
+   * Remembers the authored transform the first time an editor preview moves
+   * the camera, so turning the preview off puts it back.
+   *
+   * Play mode doesn't need this — leaving Play restores the scene from its
+   * snapshot — but the editor has no such safety net, and a preview that
+   * quietly rewrites the camera's saved position is a preview nobody can
+   * afford to leave on.
+   */
+  #capturePreviewPose() {
+    if (this._previewPose) return;
+    this._previewPose = {
+      position: this.entity.object3D.position.clone(),
+      quaternion: this.entity.object3D.quaternion.clone(),
+      fov: this.camera?.fov ?? this.props.fov,
+    };
+  }
+
+  #restorePreviewPose() {
+    if (!this._previewPose) return;
+    this.entity.object3D.position.copy(this._previewPose.position);
+    this.entity.object3D.quaternion.copy(this._previewPose.quaternion);
+    if (this.camera) {
+      this.camera.fov = this._previewPose.fov;
+      this.camera.updateProjectionMatrix();
+    }
+    this._previewPose = null;
+    this.live = null;
+    this.blendFrom = null;
+  }
+
+  // ---------------------------------------------------------------------------
 
   /**
    * Returns the engine entity this camera should currently follow, or null
@@ -123,6 +337,13 @@ export class CameraComponent extends Component {
 }
 
 const _scratchTargetPos = new THREE.Vector3();
+const _worldPos = new THREE.Vector3();
+const _worldQuat = new THREE.Quaternion();
+const _parentQuat = new THREE.Quaternion();
+const _shakePos = new THREE.Vector3();
+const _shakeEuler = new THREE.Euler();
+const _shakeQuat = new THREE.Quaternion();
+const _m = new THREE.Matrix4();
 
 /**
  * Procedural camera mesh: a small boxy body with a cylindrical lens and a

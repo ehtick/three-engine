@@ -1,5 +1,6 @@
 import * as THREE from "three/webgpu";
 import { EDITOR_LAYER } from "../engine/editorLayers.js";
+import { DebugBuffer } from "../engine/debugDraw.js";
 import { engine } from "./engineInstance.js";
 import { useSelectionStore } from "./store/selectionStore.js";
 
@@ -38,180 +39,13 @@ import { useSelectionStore } from "./store/selectionStore.js";
  * the game view and in a build without any extra gating.
  */
 
-const INITIAL_VERTICES = 2048;
-
-/** Reused across conversions so `gizmos.box(entity.position, …)` allocates nothing. */
-const _a = new THREE.Vector3();
-const _b = new THREE.Vector3();
-const _c = new THREE.Vector3();
-
-/** Accepts a Vector3, a [x,y,z] tuple or three numbers, into `out`. */
-function toVec(out, x, y, z) {
-  if (typeof x === "number") return out.set(x, y ?? 0, z ?? 0);
-  if (Array.isArray(x)) return out.set(x[0] ?? 0, x[1] ?? 0, x[2] ?? 0);
-  if (x && typeof x === "object") return out.set(x.x ?? 0, x.y ?? 0, x.z ?? 0);
-  return out.set(0, 0, 0);
-}
-
 /**
- * The drawing surface handed to `onDrawGizmos`. Holds the vertex/colour arrays
- * and the current colour + transform, in the style of an immediate-mode API
- * (`setColor` then draw, like Unity's `Gizmos.color`).
+ * The drawing surface handed to `onDrawGizmos` is the engine's shared
+ * `DebugBuffer` — the same shapes, the same one-draw-call buffer, and one place
+ * to fix a bug in the circle maths. What differs between the two surfaces is
+ * only lifetime and layer, which is what this module and `DebugDraw` each own.
  */
-class GizmoBuffer {
-  constructor() {
-    this.positions = new Float32Array(INITIAL_VERTICES * 3);
-    this.colors = new Float32Array(INITIAL_VERTICES * 3);
-    this.count = 0; // vertices written this frame
-    this._color = new THREE.Color(0x44ff88);
-    this._matrix = null;
-  }
-
-  begin() {
-    this.count = 0;
-    this._color.setHex(0x44ff88);
-    this._matrix = null;
-  }
-
-  /** Doubles capacity until `needed` vertices fit, preserving what's written. */
-  #ensure(needed) {
-    const capacity = this.positions.length / 3;
-    if (this.count + needed <= capacity) return;
-    let next = capacity || INITIAL_VERTICES;
-    while (next < this.count + needed) next *= 2;
-    const positions = new Float32Array(next * 3);
-    const colors = new Float32Array(next * 3);
-    positions.set(this.positions.subarray(0, this.count * 3));
-    colors.set(this.colors.subarray(0, this.count * 3));
-    this.positions = positions;
-    this.colors = colors;
-  }
-
-  #vertex(v) {
-    if (this._matrix) v.applyMatrix4(this._matrix);
-    const i = this.count * 3;
-    this.positions[i] = v.x;
-    this.positions[i + 1] = v.y;
-    this.positions[i + 2] = v.z;
-    this.colors[i] = this._color.r;
-    this.colors[i + 1] = this._color.g;
-    this.colors[i + 2] = this._color.b;
-    this.count++;
-  }
-
-  // ---- public drawing API (this is what scripts see) ------------------------
-
-  /** Colour for subsequent draws: `"#ff0"`, `0xff0000`, a Color, or r,g,b in 0..1. */
-  color(value, g, b) {
-    if (typeof value === "number" && typeof g === "number") this._color.setRGB(value, g, b ?? 0);
-    else this._color.set(value);
-    return this;
-  }
-
-  /** Transform applied to every subsequent vertex. Pass null to clear it.
-   *  `gizmos.transform(entity.object3D.matrixWorld)` draws in local space. */
-  transform(matrix) {
-    this._matrix = matrix ?? null;
-    return this;
-  }
-
-  line(from, to) {
-    this.#ensure(2);
-    this.#vertex(toVec(_a, from));
-    this.#vertex(toVec(_b, to));
-    return this;
-  }
-
-  /** A line from `origin` along `direction` (scaled by `length`). */
-  ray(origin, direction, length = 1) {
-    toVec(_a, origin);
-    toVec(_b, direction).multiplyScalar(length).add(_a);
-    return this.line(_a.clone(), _b);
-  }
-
-  /** Axis-aligned wire box. `size` is the full extent, not the half-extent. */
-  box(center, size = 1) {
-    toVec(_a, center);
-    const s = typeof size === "number" ? _b.set(size, size, size) : toVec(_b, size);
-    const hx = s.x / 2;
-    const hy = s.y / 2;
-    const hz = s.z / 2;
-    const { x, y, z } = _a;
-    const corners = [
-      [x - hx, y - hy, z - hz], [x + hx, y - hy, z - hz],
-      [x + hx, y - hy, z + hz], [x - hx, y - hy, z + hz],
-      [x - hx, y + hy, z - hz], [x + hx, y + hy, z - hz],
-      [x + hx, y + hy, z + hz], [x - hx, y + hy, z + hz],
-    ];
-    const edges = [
-      [0, 1], [1, 2], [2, 3], [3, 0],
-      [4, 5], [5, 6], [6, 7], [7, 4],
-      [0, 4], [1, 5], [2, 6], [3, 7],
-    ];
-    this.#ensure(edges.length * 2);
-    for (const [i, j] of edges) {
-      this.#vertex(_c.fromArray(corners[i]));
-      this.#vertex(_c.fromArray(corners[j]));
-    }
-    return this;
-  }
-
-  /** Wire circle in the plane whose normal is `normal` (default +Y). */
-  circle(center, radius = 1, normal = [0, 1, 0], segments = 32) {
-    toVec(_a, center);
-    toVec(_b, normal).normalize();
-    // Any vector not parallel to the normal gives a valid in-plane basis.
-    const up = Math.abs(_b.y) > 0.99 ? _c.set(1, 0, 0) : _c.set(0, 1, 0);
-    const right = new THREE.Vector3().crossVectors(up, _b).normalize().multiplyScalar(radius);
-    const forward = new THREE.Vector3().crossVectors(_b, right).normalize().multiplyScalar(radius);
-    const point = new THREE.Vector3();
-    this.#ensure(segments * 2);
-    for (let i = 0; i < segments; i++) {
-      for (const step of [i, i + 1]) {
-        const t = (step / segments) * Math.PI * 2;
-        point
-          .copy(_a)
-          .addScaledVector(right, Math.cos(t))
-          .addScaledVector(forward, Math.sin(t));
-        this.#vertex(point);
-      }
-    }
-    return this;
-  }
-
-  /** Wire sphere drawn as three great circles — the standard editor idiom;
-   *  a full wireframe sphere is visual noise at gizmo scale. */
-  sphere(center, radius = 1, segments = 32) {
-    this.circle(center, radius, [0, 1, 0], segments);
-    this.circle(center, radius, [1, 0, 0], segments);
-    this.circle(center, radius, [0, 0, 1], segments);
-    return this;
-  }
-
-  /** Small three-axis cross marking a position. */
-  point(position, size = 0.1) {
-    toVec(_a, position);
-    const { x, y, z } = _a;
-    this.#ensure(6);
-    this.#vertex(_c.set(x - size, y, z));
-    this.#vertex(_c.set(x + size, y, z));
-    this.#vertex(_c.set(x, y - size, z));
-    this.#vertex(_c.set(x, y + size, z));
-    this.#vertex(_c.set(x, y, z - size));
-    this.#vertex(_c.set(x, y, z + size));
-    return this;
-  }
-
-  /** Open polyline through `points`. */
-  polyline(points, closed = false) {
-    if (!points?.length) return this;
-    for (let i = 0; i < points.length - 1; i++) this.line(points[i], points[i + 1]);
-    if (closed && points.length > 2) this.line(points[points.length - 1], points[0]);
-    return this;
-  }
-}
-
-const buffer = new GizmoBuffer();
+const buffer = new DebugBuffer();
 
 let mesh = null;
 let geometry = null;
@@ -262,6 +96,7 @@ let hosts = null;
 
 function invalidateHosts() {
   hosts = null;
+  gizmoComponents = null;
 }
 
 function scriptHosts() {
@@ -274,6 +109,30 @@ function scriptHosts() {
   return hosts;
 }
 
+/**
+ * Components that draw their own gizmo, cached like the script hosts.
+ *
+ * The same hook names, deliberately: a decal projector's box and a line
+ * renderer's control points are the same kind of thing a script draws with
+ * `onDrawGizmos` — invisible data made visible while authoring — and giving
+ * them a second mechanism would mean a second buffer, a second layer and a
+ * second set of shape functions to keep in step.
+ */
+let gizmoComponents = null;
+
+function componentHosts() {
+  if (gizmoComponents) return gizmoComponents;
+  gizmoComponents = [];
+  for (const entity of engine.entities.values()) {
+    for (const component of entity.components.values()) {
+      if (component.onDrawGizmos || component.onDrawGizmosSelected) {
+        gizmoComponents.push([entity.id, component]);
+      }
+    }
+  }
+  return gizmoComponents;
+}
+
 function drawFrame() {
   buffer.begin();
   const selected = useSelectionStore.getState().ids;
@@ -283,6 +142,17 @@ function drawFrame() {
     // stopped, which is when authoring actually happens.
     if (script.dispatchEditor("onDrawGizmos", buffer)) drew = true;
     if (selected.includes(entityId) && script.dispatchEditor("onDrawGizmosSelected", buffer)) {
+      drew = true;
+    }
+  }
+  for (const [entityId, component] of componentHosts()) {
+    if (component.enabled === false) continue;
+    if (component.onDrawGizmos) {
+      component.onDrawGizmos(buffer);
+      drew = true;
+    }
+    if (component.onDrawGizmosSelected && selected.includes(entityId)) {
+      component.onDrawGizmosSelected(buffer);
       drew = true;
     }
   }
@@ -315,6 +185,7 @@ export function startGizmoPass() {
     unsubscribe = null;
     stopPass = null;
     hosts = null;
+    gizmoComponents = null;
     if (mesh) {
       engine.scene.remove(mesh);
       mesh.geometry.dispose();

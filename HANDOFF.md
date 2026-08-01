@@ -1,5 +1,120 @@
 # Handoff — Game Engine (Phases 1–6 complete)
 
+> ⚠️ **Most of this file is stale** — it stops around 2026-07-05 and predates GI, terrain,
+> the geometry editor, audio, input, the UI system, MCP and virtual geometry. For what to
+> build next, read **`docs/ROADMAP.md`**: game-development features ranked by value, with
+> status markers. Work it top-down.
+
+## Game view panel (2026-07-27 — roadmap item 5)
+
+`src/editor/panels/GamePanel.jsx` (Window → Game), tabbed with the Viewport.
+
+- **One renderer, shared** — `src/editor/viewportCanvas.js` arbitrates who owns the single
+  canvas by ranked claim (`claimCanvas` / `releaseCanvas` / `resizeSharedCanvas`). The Game
+  panel claims at priority 1 only while playing. A second `WebGPURenderer` was deliberately
+  not built.
+- Aspect/resolution presets resize the **renderer**, not just the CSS box, so a 9:16 preset
+  really renders portrait. Fixed resolutions never scale above 1:1.
+- Stats overlay forced on (`<StatsOverlay forceVisible />`), maximize-on-play
+  (`maximizePanel` in EditorShell), mute, Play/Pause/Step.
+- **DOCKVIEW TRAP — read before touching any panel that owns DOM.** Dockview
+  **detaches an inactive tab's element without unmounting its React component**. So:
+  mount effects do NOT re-run when a tab becomes visible again, `containerRef.current` is a
+  live node that is simply not in the document, and `document.querySelector` cannot see it
+  (which makes "the panel is gone" a misleading read). Anything that must re-run on
+  re-attach needs a DOM observer — `viewportCanvas.js` installs a `MutationObserver` only
+  while unresolved. A frame-budget retry was tried first and is wrong: a hidden tab stays
+  detached for minutes.
+  Two smaller ones from the same session: appending into a detached container makes the
+  canvas vanish editor-wide (filter claims on `isConnected`), and a stale unmount cleanup
+  deletes the *incoming* instance's claim when both use a fixed id — hence
+  `releaseCanvas(id, container)` being identity-aware.
+- Test: `npm run smoke:gameview` (22 checks against the real editor).
+
+## Save/load + persistent data (2026-07-27 — roadmap item 4)
+
+`src/engine/saveSystem.js`. Two stores on the engine, deliberately separate:
+`engine.saves` (one playthrough, written on demand) and `engine.prefs` (settings —
+written through on every change, coalesced, and untouched by deleting every slot).
+
+- **Scripts opt in** via `onSave()` / `onLoad(data)`. An entity whose script defines
+  `onSave` is captured with its transform + `enabledInGame`. `onLoad` runs AFTER the
+  transform is applied, which is the documented escape hatch for a script that wants
+  different placement. Per-script keys are the **file stem**, not the slot index, so
+  reordering scripts in the inspector can't scramble existing saves.
+- **Runtime prefab spawns** are recorded with their prefab link and respawned under
+  their saved id; save-participating spawns absent from the save are pruned.
+- Slots: `save/load/has/delete/list` + `capture/restore`. `registerMigration(n, fn)`
+  chains from `engine.config.saveVersion`; **a save with no path to the current version
+  is refused, not loaded.**
+- Storage is a swappable backend (`setSaveBackend`), default localStorage → memory
+  fallback, `saves.durable` says which. Namespaced by `game.saveId` (Project Settings →
+  Saves; empty = title). The editor (`applyProjectSettings`) and `exportGame` derive the
+  namespace identically on purpose.
+- Two engine bugs found and fixed on the way:
+  - `ScriptComponent.#reconcileSlotRunning` called the OPTIONAL `onStart`/`onDestroy`
+    unconditionally → a script defining only `onUpdate` threw a TypeError every Play and
+    `MAX_ERRORS` latched it off on the third. `dispatch()` and `#stopSlot` already guarded;
+    this path didn't.
+  - Script modules load async, so `onLoad` dispatched right after `engine.instantiate`
+    hit a slot with no instance and the saved state vanished. New
+    `ScriptComponent.whenReady()` (tracks in-flight slot loads) — useful to anything that
+    spawns an entity and then talks to its scripts.
+- Tests: `npm run test:saves` (35 headless) + `npm run smoke:saves` (16 checks that save
+  in a real built player, **reload the page**, and load it back through real localStorage).
+
+## Physics gameplay layer (2026-07-27 — roadmap item 3)
+
+Rapier was integrated but exposed almost nothing gameplay needs. Now:
+
+- **Layers** — `src/modules/physics-rapier/layers.js` + `layerConfig.js`. Named layers and a
+  symmetric collision matrix, edited in Project Settings → Physics Layers, persisted in
+  `project.json`, applied live via `engine.physics.setLayers()`. Packed into Rapier's
+  membership/filter groups. Unknown names fall back to `Default`.
+- **Queries** — `raycast`, `raycastAll`, `shapecast`/`spherecast`/`boxcast`/`capsulecast`,
+  `overlap*`. All take `{ layers, exclude }`. **Query layers are independent of the collision
+  matrix on purpose**; `exclude` covers the entity's whole subtree.
+- **`JointComponent`** — fixed/hinge/ball/slider/spring/rope. Empty Connected Body = pinned to
+  the world at the current pose. Hinge limits + motor speeds are in **degrees** (converted in
+  `PhysicsSystem.#buildJoints`); slider units are metres.
+- **Character controller** — moving-platform carry (`getPlatform()`), `pushDynamicBodies`.
+- `npm run test:physics` — 24 checks against the real Rapier world in Node.
+  **The headless trap** (documented at the top of `scripts/run-physics-test.mjs`): Rapier's
+  wasm-bindgen glue takes a browser path as soon as `window` exists and calls
+  `window.performance.now()`. A stub `window` without `performance` traps the wasm with a bare
+  "unreachable", and every later call fails with "recursive use of an object detected" —
+  which sends you hunting a re-entrancy bug that doesn't exist. Forward the real `performance`
+  and `crypto`.
+- `npm run test:scripttypes` — guards `engine.d.ts`'s `ComponentMap`. Its keys must be
+  registered `static type` strings; a near-miss (`character` for `charactercontroller`, which
+  had shipped) is NOT a type error — `getComponent`'s `<T = unknown>(type: string)` fallback
+  swallows it and silently drops autocomplete.
+
+## Runtime scene management + game time (2026-07-27 — roadmap items 1 & 2)
+
+The two things that stood between "a scene renders" and "a game runs".
+
+- **`src/engine/sceneManager.js`** — `engine.loadScene(path, { mode, preload, onProgress,
+  setCamera })`, `unloadScene`, `engine.scenes.{loaded, active, isLoading, isLoaded}`.
+  Scenes are addressed by **project-relative path** (`"scenes/Level2.scene"`); the editor
+  resolves it against the open project (new `setSceneLoader` resolver hook, wired in
+  `engineInstance.js` → `assetLoader.readSceneJson`) and a build fetches it as a relative
+  URL, because `exportGame` now ships every project scene at the same relative path.
+  Loads are cancellable (a superseded one resolves to `null`), report progress across five
+  phases for a loading screen, and auto-preload the scene's assets — discovered from
+  component *schemas* (`type: "asset"`), so a new component is covered the day it is added.
+  Persistent entities (`entity.persistent`, Inspector toggle, `engine.dontDestroyOnLoad`)
+  survive a single-mode load; a persistent child of a doomed parent is re-rooted.
+  Additive loads remap colliding entity ids.
+  Tests: `npm run test:scenes`, `npm run smoke:player-scenes` (drives a real built player).
+- **Game time** — `engine.setTimeScale/setPaused/step` + `deltaTime`/`unscaledDeltaTime`.
+  Paused freezes game time while rendering continues. Both reset on Stop so a paused game
+  can't freeze the editor. Input, audio and script hot-reload polling deliberately run on
+  the UNSCALED delta. The GPU particle sim moved off TSL's built-in `deltaTime` onto a
+  uniform fed from `engine.deltaTime`, so pause and bullet time reach it.
+  Editor: Pause/Step in the viewport toolbar, `Ctrl+Shift+P` / `Ctrl+.`.
+  Test: `npm run test:gametime`.
+
 ## Context
 Implementing the plan at `~/.cursor/plans/game_engine_groundwork_plan_8f148e4f.plan.md`
 (do NOT edit its prose; todo statuses live in its frontmatter). Tauri 2 + React (plain

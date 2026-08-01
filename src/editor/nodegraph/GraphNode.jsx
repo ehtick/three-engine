@@ -1,5 +1,5 @@
-import { memo } from "react";
-import { Handle, Position, NodeResizer } from "@xyflow/react";
+import { memo, useEffect } from "react";
+import { Handle, Position, NodeResizer, useUpdateNodeInternals } from "@xyflow/react";
 import { ChevronDown, ChevronRight, Eye } from "lucide-react";
 import { AssetField } from "../fields/AssetField.jsx";
 import { socketColor } from "./socketTypes.js";
@@ -75,24 +75,54 @@ function Widget({ spec, value, onChange }) {
 
 function GraphNodeInner({ id, data, selected }) {
   const def = data.describe(data.nodeType);
-  if (!def) return null;
+  const updateNodeInternals = useUpdateNodeInternals();
 
   const props = data.props ?? {};
   const collapsed = !!props.__collapsed;
   const thumb = !!props.__thumb;
   const wired = data.connectedHandles;
-  const inputs = def.inputs ?? [];
-  const outputs = def.outputs ?? [];
-  const params = def.params ?? [];
+  const inputs = def?.inputs ?? [];
+  const outputs = def?.outputs ?? [];
+  const params = def?.params ?? [];
   const set = (key, value, gesture) => data.onPropsChange(id, { [key]: value }, { gesture, param: key });
+  const multiOut = outputs.length > 1;
+
+  // Preview / collapse remounts content and moves handles — RF only remeasures
+  // when asked, otherwise the wrapper keeps the previous box and the node
+  // looks like a hollow shell (Texture with the eye off is the usual case).
+  useEffect(() => {
+    const raf = requestAnimationFrame(() => updateNodeInternals(id));
+    return () => cancelAnimationFrame(raf);
+  }, [id, thumb, collapsed, updateNodeInternals]);
+
+  if (!def) return null;
 
   // Collapsed nodes keep every handle mounted but stack them on the header
   // edge. React Flow drops edges whose handle element has unmounted, so
   // hiding them outright would silently delete the user's wiring.
   const handleStyle = collapsed ? { top: 14 } : undefined;
 
+  const outputPorts = multiOut && (
+    <div className="node-output-ports">
+      {outputs.map((o) => (
+        <div className="shader-node-row out-row" key={`out-${o.key}`}>
+          <span className="shader-port-label out">{o.label ?? o.key}</span>
+          <Handle
+            type="source"
+            position={Position.Right}
+            id={o.key}
+            className="shader-handle"
+            style={{ background: socketColor(o.type) }}
+          />
+        </div>
+      ))}
+    </div>
+  );
+
   return (
-    <div className={`shader-node graph-node cat-${def.cat}${selected ? " selected" : ""}${collapsed ? " collapsed" : ""}`}>
+    <div
+      className={`shader-node graph-node cat-${def.cat}${selected ? " selected" : ""}${collapsed ? " collapsed" : ""}${thumb ? " has-thumb" : ""}`}
+    >
       <div className="shader-node-header">
         <button
           className="graph-node-collapse nodrag"
@@ -142,7 +172,7 @@ function GraphNodeInner({ id, data, selected }) {
               style={{ top: 14 + k * 0.001, background: socketColor(spec.type) }}
             />
           ))}
-          {outputs.length > 1 &&
+          {multiOut &&
             outputs.map((o, k) => (
               <Handle
                 key={o.key}
@@ -157,77 +187,63 @@ function GraphNodeInner({ id, data, selected }) {
       )}
 
       {!collapsed && (
-        <>
-          {thumb && outputs.length <= 1 && (
+        <div className="shader-node-body">
+          {/* Single-output preview stacks above the body. Multi-output
+              (Texture / Split) puts it in the same rows as the sockets so
+              eye-on grows the node and eye-off leaves only the port stack. */}
+          {thumb && !multiOut && (
             <div className="node-thumb nodrag">
               <canvas width={96} height={96} ref={(el) => data.registerThumb?.(id, el)} />
             </div>
           )}
-          <div className="shader-node-body">
-            {/* A multi-output node (Texture: out/r/g/b/a; Split: x/y/z) sits its
-                preview BESIDE the socket column — stacked, the node would grow to
-                preview height plus five rows and tower over the graph. */}
-            {outputs.length > 1 && (
-              <div className="node-output-group">
-                {thumb && (
-                  <div className="node-thumb inline nodrag">
-                    <canvas width={96} height={96} ref={(el) => data.registerThumb?.(id, el)} />
-                  </div>
-                )}
-                <div className="node-output-ports">
-                  {outputs.map((o) => (
-                    <div className="shader-node-row out-row" key={`out-${o.key}`}>
-                      <span className="shader-port-label out">{o.label ?? o.key}</span>
-                      <Handle
-                        type="source"
-                        position={Position.Right}
-                        id={o.key}
-                        className="shader-handle"
-                        style={{ background: socketColor(o.type) }}
-                      />
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
 
-            {inputs.map((spec) => {
-              const isWired = wired?.has(spec.key) ?? false;
-              return (
-                <div className="shader-node-row" key={spec.key} data-wired={isWired || undefined}>
-                  <Handle
-                    type="target"
-                    position={Position.Left}
-                    id={spec.key}
-                    className="shader-handle"
-                    style={{ background: socketColor(spec.type) }}
+          {multiOut && thumb ? (
+            <div className="node-output-group">
+              <div className="node-thumb inline nodrag">
+                <canvas width={96} height={96} ref={(el) => data.registerThumb?.(id, el)} />
+              </div>
+              {outputPorts}
+            </div>
+          ) : (
+            outputPorts
+          )}
+
+          {inputs.map((spec) => {
+            const isWired = wired?.has(spec.key) ?? false;
+            return (
+              <div className="shader-node-row" key={spec.key} data-wired={isWired || undefined}>
+                <Handle
+                  type="target"
+                  position={Position.Left}
+                  id={spec.key}
+                  className="shader-handle"
+                  style={{ background: socketColor(spec.type) }}
+                />
+                <span className="shader-port-label">{spec.label ?? spec.key}</span>
+                {/* An input's inline editor disappears the moment it's wired:
+                    the value would be ignored, and leaving a live-looking
+                    control that does nothing is worse than showing none. */}
+                {spec.editable && !isWired && (
+                  // `widget` overrides `type` for rendering: a socket typed
+                  // `any` can still need a colour picker, and the shader
+                  // registry infers that from the input's default value.
+                  <Widget
+                    spec={{ ...spec, type: spec.widget ?? spec.type }}
+                    value={props[spec.key]}
+                    onChange={(v, g) => set(spec.key, v, g)}
                   />
-                  <span className="shader-port-label">{spec.label ?? spec.key}</span>
-                  {/* An input's inline editor disappears the moment it's wired:
-                      the value would be ignored, and leaving a live-looking
-                      control that does nothing is worse than showing none. */}
-                  {spec.editable && !isWired && (
-                    // `widget` overrides `type` for rendering: a socket typed
-                    // `any` can still need a colour picker, and the shader
-                    // registry infers that from the input's default value.
-                    <Widget
-                      spec={{ ...spec, type: spec.widget ?? spec.type }}
-                      value={props[spec.key]}
-                      onChange={(v, g) => set(spec.key, v, g)}
-                    />
-                  )}
-                </div>
-              );
-            })}
-
-            {params.map((p) => (
-              <div className={`shader-node-row field nodrag${p.type === "code" ? " code-field" : ""}`} key={p.key}>
-                {p.label && p.type !== "code" && <span className="shader-port-label param-label">{p.label}</span>}
-                <Widget spec={p} value={props[p.key]} onChange={(v, g) => set(p.key, v, g)} />
+                )}
               </div>
-            ))}
-          </div>
-        </>
+            );
+          })}
+
+          {params.map((p) => (
+            <div className={`shader-node-row field nodrag${p.type === "code" ? " code-field" : ""}`} key={p.key}>
+              {p.label && p.type !== "code" && <span className="shader-port-label param-label">{p.label}</span>}
+              <Widget spec={p} value={props[p.key]} onChange={(v, g) => set(p.key, v, g)} />
+            </div>
+          ))}
+        </div>
       )}
     </div>
   );

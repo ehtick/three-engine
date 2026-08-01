@@ -3,7 +3,7 @@ import { instantiatePrefabNode } from "./prefab/expand.js";
 import { instanceNodeOf } from "./prefab/sync.js";
 import { SCENE_SETTINGS_DEFAULTS } from "./sceneSettings.js";
 
-const SCENE_VERSION = 1;
+export const SCENE_VERSION = 1;
 
 /**
  * A prefab instance serializes as a *link*, not as a tree: the entities under
@@ -21,6 +21,8 @@ export function serializeEntity(entity) {
     // Omitted entirely when empty — the overwhelmingly common case, and a
     // `"tags": []` on every entity would bloat every scene file for nothing.
     ...(entity.tags?.length ? { tags: [...entity.tags] } : {}),
+    // Same reasoning: only the rare entity that survives a scene load says so.
+    ...(entity.persistent ? { persistent: true } : {}),
     // Newer scenes may include entities without these flags — defaults are
     // booleans, but we still defensively normalise on read.
     enabledInEditor: entity.enabledInEditor !== false,
@@ -56,6 +58,7 @@ export function instantiateEntity(engine, data, parent) {
   // their initial `_viewOnlyActive` cache picks up the inherited state.
   if (data.viewOnly) entity.setViewOnly(true);
   if (data.tags?.length) entity.setTags(data.tags);
+  if (data.persistent) entity.setPersistent(true);
   // Per-mode enabled flags. Older scenes omit them — default to true so
   // existing scenes keep their current behaviour.
   if (data.enabledInEditor === false) entity.setEnabledInEditor(false);
@@ -186,6 +189,7 @@ function applyEntityData(entity, data) {
   entity.setTransform(data);
   entity.setViewOnly(!!data.viewOnly);
   entity.setTags(data.tags ?? []);
+  entity.setPersistent(!!data.persistent);
   entity.setEnabledInEditor(data.enabledInEditor !== false);
   entity.setEnabledInGame(data.enabledInGame !== false);
 }

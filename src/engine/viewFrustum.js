@@ -157,8 +157,13 @@ export function computeEntityBoundingSphere(entity, out) {
   for (const mesh of meshes) {
     const geom = mesh.geometry;
     if (!geom) continue;
-    if (!geom.boundingSphere) geom.computeBoundingSphere();
-    const local = geom.boundingSphere;
+    // `Object3D.boundingSphere` wins when present — three's own per-object
+    // override, and the only correct answer for a mesh whose vertex shader
+    // moves it off its buffer (an impostor billboard draws `size` across from a
+    // shared unit quad, so its geometry's bounds describe something else
+    // entirely).
+    if (!mesh.boundingSphere && !geom.boundingSphere) geom.computeBoundingSphere();
+    const local = mesh.boundingSphere ?? geom.boundingSphere;
     if (!local) continue;
     tmp.center.copy(local.center);
     tmp.radius = local.radius;

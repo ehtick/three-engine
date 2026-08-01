@@ -20,11 +20,12 @@ async function loadEngine() {
           setAssetResolver,
           setScriptLoader,
           setAssetMetaLoader,
+          setSceneLoader,
           setAssetBinarySaver,
           setDerivedDataRootProvider,
           registerBuiltInComponents,
         },
-        { toBlobUrl, loadScriptModule, readAssetMeta, writeAssetBinary, onAssetInvalidated },
+        { toBlobUrl, loadScriptModule, readAssetMeta, readSceneJson, writeAssetBinary, onAssetInvalidated },
         { useProjectStore },
         { invalidateGeometryAsset },
       ] = await Promise.all([
@@ -50,6 +51,9 @@ async function loadEngine() {
       setAssetResolver(toBlobUrl);
       setScriptLoader(loadScriptModule);
       setAssetMetaLoader(readAssetMeta);
+      // Runtime `engine.loadScene("scenes/X.scene")` — resolved against the
+      // open project so a script behaves identically here and in a build.
+      setSceneLoader(readSceneJson);
       setAssetBinarySaver(writeAssetBinary);
       // `.geom` files are also cached as decoded, SHARED BufferGeometry
       // instances. Every in-place asset overwrite goes through

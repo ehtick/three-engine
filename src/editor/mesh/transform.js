@@ -221,37 +221,106 @@ function closestOnSegment(p, a, b) {
   return add3(a, scale3(along, t));
 }
 
+/** Distance in pixels from `pointer` to the projected polygon `ring`. */
+function screenDistanceToPolygon(ring, pointer) {
+  let inside = false;
+  let best = Infinity;
+  for (let index = 0; index < ring.length; index++) {
+    const a = ring[index];
+    const b = ring[(index + 1) % ring.length];
+    if ((a.y > pointer.y) !== (b.y > pointer.y)
+      && pointer.x < ((b.x - a.x) * (pointer.y - a.y)) / (b.y - a.y) + a.x) inside = !inside;
+    const along = { x: b.x - a.x, y: b.y - a.y };
+    const lengthSquared = along.x * along.x + along.y * along.y;
+    const t = lengthSquared < 1e-9 ? 0
+      : Math.max(0, Math.min(1, ((pointer.x - a.x) * along.x + (pointer.y - a.y) * along.y) / lengthSquared));
+    best = Math.min(best, Math.hypot(a.x + along.x * t - pointer.x, a.y + along.y * t - pointer.y));
+  }
+  return inside ? 0 : best;
+}
+
 /**
- * Finds the nearest snap target to `point`.
+ * Finds the snap target for a transform whose anchor has reached `point`.
  *
- * `moving` is the set of vertices currently being dragged; they are excluded so
- * a selection never snaps to itself. Returns null when nothing is within
- * `radius`, which lets the caller fall back to the free position.
+ * Element snapping is ranked in SCREEN space, against the mouse — because that
+ * is what Blender's magnet does, and it is the only ranking that behaves the
+ * same on a 0.1-unit trinket and a 400-unit terrain. The previous version
+ * ranked by 3D distance inside a fixed 0.5-local-unit radius, which meant that
+ * on the default two-unit cube — corners a full unit apart — vertex, edge and
+ * face snapping could not reach a single target and silently did nothing.
+ * `project` maps a mesh-local point to client coordinates and returns null for
+ * anything behind the camera; without one, the old 3D ranking is used so the
+ * kernel stays testable headlessly.
+ *
+ * `moving` is the set of vertices being dragged; they are excluded so a
+ * selection never snaps to itself. Returns null when nothing is in reach, which
+ * lets the caller fall back to the free position.
+ *
+ * Increment snapping rounds the *travelled distance*, as Blender does — the
+ * grid follows wherever the transform started rather than the world origin.
+ * `absolute` is Blender's "Absolute Grid Snap", which rounds the position.
  */
-export function snapTarget(mesh, point, { mode = "vertex", radius = 0.25, increment = 0.25, moving = null } = {}) {
+export function snapTarget(mesh, point, {
+  mode = "vertex",
+  radius = Infinity,
+  pixelRadius = 28,
+  increment = 0.25,
+  absolute = false,
+  origin = null,
+  moving = null,
+  project = null,
+  pointer = null,
+} = {}) {
   if (mode === "increment") {
     const step = Math.max(increment, 1e-6);
-    return { point: point.map((value) => Math.round(value / step) * step), kind: "increment" };
+    const round = (value) => Math.round(value / step) * step;
+    if (absolute || !origin) return { point: point.map(round), kind: "increment" };
+    return { point: point.map((value, axis) => origin[axis] + round(value - origin[axis])), kind: "increment" };
   }
   const skip = moving instanceof Set ? moving : new Set(moving ?? []);
+  const screen = project && pointer ? project : null;
   let best = null;
-  const consider = (candidate, kind, element) => {
-    const distance = length3(sub3(candidate, point));
-    if (distance > radius) return;
+  /** `ring` is the element's screen outline; a vertex is a degenerate one. */
+  const consider = (candidate, kind, element, ring = null) => {
+    let distance;
+    if (screen) {
+      if (!ring) return;
+      distance = ring.length === 1
+        ? Math.hypot(ring[0].x - pointer.x, ring[0].y - pointer.y)
+        : screenDistanceToPolygon(ring, pointer);
+      if (distance > pixelRadius) return;
+    } else {
+      distance = length3(sub3(candidate, point));
+      if (distance > radius) return;
+    }
     if (!best || distance < best.distance) best = { point: candidate, distance, kind, element };
   };
+  /** Projects a whole ring, or null if any corner is off-camera. */
+  const outline = (points) => {
+    if (!screen) return null;
+    const projected = [];
+    for (const co of points) {
+      const at = screen(co);
+      if (!at) return null;
+      projected.push(at);
+    }
+    return projected;
+  };
+
   if (mode === "vertex") {
     for (const vert of mesh.verts) {
       if (skip.has(vert) || vert.hide) continue;
-      consider([...vert.co], "vertex", vert);
+      consider([...vert.co], "vertex", vert, outline([vert.co]));
     }
   } else if (mode === "edge" || mode === "edgeCenter") {
     for (const edge of mesh.edges) {
       if (edge.hide || skip.has(edge.v1) || skip.has(edge.v2)) continue;
+      const middle = mode === "edgeCenter";
       consider(
-        mode === "edgeCenter" ? lerp3(edge.v1.co, edge.v2.co, 0.5) : closestOnSegment(point, edge.v1.co, edge.v2.co),
+        middle ? lerp3(edge.v1.co, edge.v2.co, 0.5) : closestOnSegment(point, edge.v1.co, edge.v2.co),
         mode,
         edge,
+        middle ? outline([lerp3(edge.v1.co, edge.v2.co, 0.5)]) : outline([edge.v1.co, edge.v2.co]),
       );
     }
   } else if (mode === "face") {
@@ -274,7 +343,7 @@ export function snapTarget(mesh, point, { mode = "vertex", radius = 0.25, increm
         }
         candidate = nearest.point;
       }
-      consider(candidate, "face", face);
+      consider(candidate, "face", face, outline(ring.map((vert) => vert.co)));
     }
   }
   return best;

@@ -21,6 +21,74 @@ import { DRACOLoader } from "three/addons/loaders/DRACOLoader.js";
  * "/draco/" there.
  */
 let dracoLoader = null;
+const LEGACY_SPEC_GLOSS = "KHR_materials_pbrSpecularGlossiness";
+
+/**
+ * Three removed the legacy specular/glossiness workflow in r146. Sketchfab
+ * still serves older assets that declare it as required, which otherwise
+ * produces an "Unknown extension" warning and silently uses unrelated core
+ * PBR defaults. Convert it before material dependencies are created:
+ * diffuse -> base color, glossiness -> roughness, and specular RGB -> the
+ * modern KHR_materials_specular extension. A combined spec/gloss texture can
+ * preserve its RGB specular channels; its alpha gloss channel has no direct
+ * modern texture slot, so the scalar glossiness factor remains authoritative.
+ */
+class LegacySpecGlossExtension {
+  constructor(parser) {
+    this.parser = parser;
+    this.name = LEGACY_SPEC_GLOSS;
+    this.legacyByMaterial = new Map();
+  }
+
+  beforeRoot() {
+    let usesModernSpecular = false;
+    for (const [materialIndex, material] of (this.parser.json.materials ?? []).entries()) {
+      const legacy = material.extensions?.[LEGACY_SPEC_GLOSS];
+      if (!legacy) continue;
+      this.legacyByMaterial.set(materialIndex, {
+        glossinessFactor: legacy.glossinessFactor ?? 1,
+        hasSpecularGlossinessTexture: !!legacy.specularGlossinessTexture,
+      });
+      const pbr = (material.pbrMetallicRoughness ??= {});
+      if (legacy.diffuseFactor) pbr.baseColorFactor ??= legacy.diffuseFactor;
+      if (legacy.diffuseTexture) pbr.baseColorTexture ??= legacy.diffuseTexture;
+      pbr.metallicFactor ??= 0;
+      pbr.roughnessFactor ??= 1 - (legacy.glossinessFactor ?? 1);
+
+      if (legacy.specularFactor || legacy.specularGlossinessTexture) {
+        const modern = (material.extensions.KHR_materials_specular ??= {});
+        if (legacy.specularFactor) modern.specularColorFactor ??= legacy.specularFactor;
+        if (legacy.specularGlossinessTexture) {
+          modern.specularColorTexture ??= legacy.specularGlossinessTexture;
+        }
+        usesModernSpecular = true;
+      }
+      delete material.extensions[LEGACY_SPEC_GLOSS];
+      if (Object.keys(material.extensions).length === 0) delete material.extensions;
+    }
+    const json = this.parser.json;
+    json.extensionsUsed = (json.extensionsUsed ?? []).filter((name) => name !== LEGACY_SPEC_GLOSS);
+    json.extensionsRequired = (json.extensionsRequired ?? []).filter((name) => name !== LEGACY_SPEC_GLOSS);
+    if (usesModernSpecular && !json.extensionsUsed.includes("KHR_materials_specular")) {
+      json.extensionsUsed.push("KHR_materials_specular");
+    }
+  }
+
+  afterRoot(result) {
+    // Alpha of the legacy combined texture is glossiness. The modern
+    // specular extension has no place for that channel, so retain enough
+    // source metadata for the editor unpacker to reconstruct
+    // roughness = 1 - alpha * glossinessFactor in its editable graph.
+    result?.scene?.traverse?.((object) => {
+      if (!object.isMesh) return;
+      for (const material of Array.isArray(object.material) ? object.material : [object.material]) {
+        const materialIndex = this.parser.associations.get(material)?.materials;
+        const legacy = this.legacyByMaterial.get(materialIndex);
+        if (legacy) material.userData.gltfLegacySpecGloss = { ...legacy };
+      }
+    });
+  }
+}
 
 function getDracoLoader() {
   if (!dracoLoader) {
@@ -31,7 +99,9 @@ function getDracoLoader() {
 
 /** A fresh GLTFLoader with Draco decoding attached. */
 export function createGltfLoader() {
-  return new GLTFLoader().setDRACOLoader(getDracoLoader());
+  return new GLTFLoader()
+    .register((parser) => new LegacySpecGlossExtension(parser))
+    .setDRACOLoader(getDracoLoader());
 }
 
 let shared = null;

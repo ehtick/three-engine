@@ -20,6 +20,7 @@ const ConsoleTab = lazy(() => import("./panels/ConsoleTab.jsx").then((m) => ({ d
 const ShaderGraphPanel = lazy(() => import("./panels/ShaderGraphPanel.jsx").then((m) => ({ default: m.ShaderGraphPanel })));
 const ParticlesPanel = lazy(() => import("./panels/ParticlesPanel.jsx").then((m) => ({ default: m.ParticlesPanel })));
 const AnimatorPanel = lazy(() => import("./panels/AnimatorPanel.jsx").then((m) => ({ default: m.AnimatorPanel })));
+const TimelinePanel = lazy(() => import("./panels/TimelinePanel.jsx").then((m) => ({ default: m.TimelinePanel })));
 const SceneSettingsPanel = lazy(() => import("./panels/SceneSettingsPanel.jsx").then((m) => ({ default: m.SceneSettingsPanel })));
 const ProjectSettingsPanel = lazy(() => import("./panels/ProjectSettingsPanel.jsx").then((m) => ({ default: m.ProjectSettingsPanel })));
 const ModulesPanel = lazy(() => import("./panels/ModulesPanel.jsx").then((m) => ({ default: m.ModulesPanel })));
@@ -31,6 +32,8 @@ const AmbientCGPanel = lazy(() => import("./panels/AmbientCGPanel.jsx").then((m)
 const SketchfabPanel = lazy(() => import("./panels/SketchfabPanel.jsx").then((m) => ({ default: m.SketchfabPanel })));
 const TerminalPanel = lazy(() => import("./panels/TerminalPanel.jsx").then((m) => ({ default: m.TerminalPanel })));
 const McpPanel = lazy(() => import("./panels/McpPanel.jsx").then((m) => ({ default: m.McpPanel })));
+const GamePanel = lazy(() => import("./panels/GamePanel.jsx").then((m) => ({ default: m.GamePanel })));
+const BuildPanel = lazy(() => import("./panels/BuildPanel.jsx").then((m) => ({ default: m.BuildPanel })));
 
 /** Keep lazy loading local to one Dockview portal. A shared boundary around
  * Dockview would hide the entire editor whenever any heavy panel suspends. */
@@ -46,6 +49,7 @@ function withPanelSuspense(LazyPanel, fallback = <PanelFallback />) {
 
 const panelComponents = {
   viewport: withPanelSuspense(ViewportPanel),
+  game: withPanelSuspense(GamePanel),
   hierarchy: withPanelSuspense(HierarchyPanel),
   inspector: withPanelSuspense(InspectorPanel),
   assets: withPanelSuspense(AssetsPanel),
@@ -53,8 +57,10 @@ const panelComponents = {
   shaderGraph: withPanelSuspense(ShaderGraphPanel),
   particles: withPanelSuspense(ParticlesPanel),
   animator: withPanelSuspense(AnimatorPanel),
+  timeline: withPanelSuspense(TimelinePanel),
   sceneSettings: withPanelSuspense(SceneSettingsPanel),
   projectSettings: withPanelSuspense(ProjectSettingsPanel),
+  build: withPanelSuspense(BuildPanel),
   modules: withPanelSuspense(ModulesPanel),
   input: withPanelSuspense(InputPanel),
   geometryEditor: withPanelSuspense(GeometryEditorPanel),
@@ -82,6 +88,10 @@ function PanelFallback() {
 /** Where each panel prefers to (re)open. referencePanel falls back if closed too. */
 export const PANEL_SPECS = {
   viewport: { title: "Viewport" },
+  // Tabbed WITH the viewport, not beside it: they show the same renderer canvas
+  // (only one exists — see viewportCanvas.js), so side-by-side would mean one of
+  // them is always a placeholder taking up half the screen.
+  game: { title: "Game", position: { referencePanel: "viewport", direction: "within" } },
   hierarchy: { title: "Hierarchy", position: { referencePanel: "viewport", direction: "left" }, initialWidth: 260 },
   inspector: { title: "Inspector", position: { referencePanel: "viewport", direction: "right" }, initialWidth: 320 },
   assets: { title: "Assets", position: { referencePanel: "viewport", direction: "below" }, initialHeight: 200 },
@@ -92,8 +102,12 @@ export const PANEL_SPECS = {
   // into 320px renders every node as an unreadable postage stamp.
   particles: { title: "Particles", position: { referencePanel: "assets", direction: "within" } },
   animator: { title: "Animator", position: { referencePanel: "assets", direction: "within" } },
+  // Same reasoning as the node editors: a dope sheet is a wide, short surface —
+  // it needs the full-width strip under the viewport, not the 320px column.
+  timeline: { title: "Timeline", position: { referencePanel: "assets", direction: "within" }, initialHeight: 260 },
   sceneSettings: { title: "Scene Settings", position: { referencePanel: "inspector", direction: "within" } },
   projectSettings: { title: "Project Settings", position: { referencePanel: "inspector", direction: "within" } },
+  build: { title: "Build", position: { referencePanel: "inspector", direction: "within" } },
   modules: { title: "Modules", position: { referencePanel: "inspector", direction: "within" } },
   input: { title: "Input", position: { referencePanel: "viewport", direction: "below" }, initialHeight: 280 },
   geometryEditor: { title: "Geometry Editor", position: { referencePanel: "viewport", direction: "within" } },
@@ -241,6 +255,42 @@ export function isPanelVisible(id) {
     return false;
   }
   return true;
+}
+
+/** Closes `id` if it is open. No-op otherwise. */
+export function closePanel(id) {
+  const panel = dock.api?.getPanel(id);
+  if (!panel) return false;
+  panel.api.close();
+  return true;
+}
+
+/**
+ * Maximizes (or restores) the group holding `id` — the Game panel's
+ * "maximize on play", which is the one case where the editor is allowed to
+ * rearrange the layout on its own.
+ *
+ * Restoring only exits the maximized group when it is still OURS. Blindly
+ * calling `exitMaximizedGroup` on Stop would also un-maximize a group the user
+ * maximized themselves while the game ran, which reads as the editor
+ * scrambling their layout for no reason.
+ */
+export function maximizePanel(id, maximized = true) {
+  const panel = dock.api?.getPanel(id);
+  const groupApi = panel?.group?.api;
+  if (!groupApi) return false;
+  try {
+    if (maximized) {
+      revealPanel(panel);
+      if (!groupApi.isMaximized?.()) groupApi.maximize?.();
+    } else if (groupApi.isMaximized?.()) {
+      dock.api.exitMaximizedGroup?.();
+    }
+    return true;
+  } catch (err) {
+    console.warn(`maximizePanel(${id}): ${err.message}`);
+    return false;
+  }
 }
 
 /** Opens any panel (focuses it if already present), even after it was closed. */

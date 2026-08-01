@@ -28,6 +28,7 @@ import {
   Trash2,
   Volume2,
   Workflow,
+  Film,
   X,
 } from "lucide-react";
 import { useProjectStore, basename } from "../store/projectStore.js";
@@ -37,6 +38,9 @@ import {
   extOf,
   toBlobUrl,
   readAssetMeta,
+  listProjectEntries,
+  withoutSidecars,
+  onAssetInvalidated,
   MODEL_EXTENSIONS,
   MODEL_IMPORT_EXTENSIONS,
   TEXTURE_EXTENSIONS,
@@ -48,6 +52,7 @@ import {
   GEOMETRY_EXTENSIONS,
 } from "../assetLoader.js";
 import { MATERIAL_DEFAULTS } from "../../engine/materialAsset.js";
+import { createDefaultTimeline } from "../../engine/timeline/timelineAsset.js";
 import {
   CUBEMAP_DEFAULTS,
   CUBEMAP_FACES,
@@ -71,13 +76,13 @@ import {
   formatBytes,
   formatDate,
 } from "../assetOps.js";
-import { listProjectEntries, withoutSidecars } from "../assetLoader.js";
 import { ASSET_TYPES, assetType, filterEntries } from "../assetFilter.js";
 import { loadAssetFlags, setAssetFlags, useAssetFlagsStore } from "../assetFlags.js";
 import { collectUsedAssets } from "../assetUsage.js";
 import { samePath, useAssetRevealStore } from "../assetReveal.js";
 import { openAssetPath } from "../openAsset.js";
 import { ContextMenu, isTextEditTarget } from "../ContextMenu.jsx";
+import { requestGeometryThumb } from "../geometryThumb.js";
 
 const ICON_BY_EXT = {
   glb: Box,
@@ -97,6 +102,7 @@ const ICON_BY_EXT = {
   entity: Package, // legacy prefab snapshots
   anim: Workflow,
   geom: Shapes,
+  timeline: Film,
 };
 
 const TYPE_LABEL = {
@@ -116,6 +122,7 @@ const TYPE_LABEL = {
   entity: "Prefab",
   anim: "Animator",
   geom: "Geometry",
+  timeline: "Timeline",
 };
 
 /**
@@ -161,6 +168,9 @@ const ANIMATOR_TEMPLATE = {
 };
 const createAnimator = () =>
   createAssetFile("NewAnimator.anim", JSON.stringify(ANIMATOR_TEMPLATE, null, 2));
+
+const createSequence = () =>
+  createAssetFile("NewTimeline.timeline", JSON.stringify(createDefaultTimeline(), null, 2));
 
 /** Texture image thumbnail (blob URL over Tauri fs). */
 function TextureThumb({ path, size }) {
@@ -251,6 +261,58 @@ function MaterialThumb({ path, size }) {
   );
 }
 
+/** Geometry preview: offscreen lit mesh snapshot (shared renderer + cache).
+ *  Below ~32px the silhouette is unreadable, so details/small views keep the
+ *  type icon and skip the GPU work. */
+function GeometryThumb({ path, size }) {
+  const [url, setUrl] = useState(null);
+  useEffect(() => {
+    if (size < 32) {
+      setUrl(null);
+      return;
+    }
+    let live = true;
+    let gen = 0;
+    setUrl(null);
+    const load = () => {
+      const my = ++gen;
+      requestGeometryThumb(path)
+        .then((next) => {
+          if (live && my === gen) setUrl(next);
+        })
+        .catch(() => {
+          if (live && my === gen) setUrl(null);
+        });
+    };
+    load();
+    const unsub = onAssetInvalidated((changed) => {
+      if (!samePath(changed, path)) return;
+      if (live) setUrl(null);
+      load();
+    });
+    return () => {
+      live = false;
+      unsub();
+    };
+  }, [path, size]);
+  if (!url) {
+    return (
+      <div className="asset-icon" style={{ width: size, height: size }}>
+        <Shapes size={size * 0.65} strokeWidth={1.5} />
+      </div>
+    );
+  }
+  return (
+    <img
+      className="asset-thumb geom-thumb"
+      style={{ width: size, height: size }}
+      src={url}
+      alt=""
+      draggable={false}
+    />
+  );
+}
+
 /** Cube map preview: its +Z face (or the first assigned one) with a cube badge,
  *  so an incomplete asset is visibly different from a finished one. */
 function CubemapThumb({ path, size }) {
@@ -296,6 +358,7 @@ function Thumb({ entry, size }) {
   if (TEXTURE_EXTENSIONS.includes(entry.ext)) return <TextureThumb path={entry.path} size={size} />;
   if (entry.ext === "mat") return <MaterialThumb path={entry.path} size={size} />;
   if (entry.ext === "cubemap") return <CubemapThumb path={entry.path} size={size} />;
+  if (entry.ext === "geom") return <GeometryThumb path={entry.path} size={size} />;
   const Icon = ICON_BY_EXT[entry.ext] ?? File;
   return (
     <div className="asset-icon" style={{ width: size, height: size }}>
@@ -570,6 +633,7 @@ function AssetContextMenu({ menu, close, setRenamingPath, selectedEntries }) {
         { label: "New Material", action: createMaterial },
         { label: "New Cube Map", action: () => createCubemap() },
         { label: "New Animator", action: createAnimator },
+        { label: "New Timeline", action: createSequence },
         { separator: true },
         { label: "Refresh", action: () => useProjectStore.getState().refresh() },
       ];

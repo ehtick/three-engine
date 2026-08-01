@@ -120,6 +120,9 @@ export async function deleteEntries(entries) {
       if (!entry.is_dir) {
         await invoke("delete_path", { path: `${entry.path}.meta` }).catch(() => {});
         await invoke("delete_path", { path: `${entry.path}.basis` }).catch(() => {});
+        // Legacy GI mesh-SDF sidecars (pre-Library). New bakes live under
+        // `<project>/Library/gi-sdf/`; this just sweeps the old neighbour files.
+        await invoke("delete_path", { path: `${entry.path}.sdf` }).catch(() => {});
       }
       deleted.push(entry.path);
     } catch (err) {

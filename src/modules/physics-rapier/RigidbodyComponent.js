@@ -38,10 +38,21 @@ export class RigidbodyComponent extends Component {
 
   onAttach() {
     this.body = null; // assigned by PhysicsSystem while playing
+    // While playing, the world is already built — say so, or an entity spawned
+    // mid-game (every bullet, every enemy) keeps a null body forever. Whole
+    // subtree: a rigidbody appearing above existing child colliders changes
+    // which body those colliders belong to.
+    this.entity.engine?.physics?.markDirty(this.entity);
   }
 
   onDetach() {
     this.body = null;
+    const physics = this.entity.engine?.physics;
+    // Immediate, not deferred: the entity is usually being destroyed, and a
+    // dirty flush skips entities that are no longer in the scene — which would
+    // leave this body simulating in a world nothing references.
+    physics?.removeEntity(this.entity, { subtree: false });
+    physics?.markDirty(this.entity);
   }
 
   onPropChanged(key, value) {

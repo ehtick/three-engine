@@ -170,7 +170,11 @@ function connect() {
     const wasConnected = useMcpStore.getState().status === "connected";
     useMcpStore.setState({ status: state.config.enabled ? "connecting" : "disabled", toolCount: 0 });
     if (wasConnected) console.log("MCP bridge disconnected");
-    scheduleReconnect();
+    // A browser always prints its own console error for ECONNREFUSED; JS
+    // cannot suppress it. Do not create an endless stream when the optional
+    // assistant server has never been present. Once a real connection has
+    // existed, automatic reconnect remains useful for server restarts.
+    if (state.hadConnection) scheduleReconnect();
   };
 
   ws.onerror = () => {

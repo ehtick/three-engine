@@ -20,13 +20,15 @@ import {
   Waypoints,
   Layers2,
   FilePlus,
+  Axis3d,
 } from "lucide-react";
 import { useSceneStore } from "../store/sceneStore.js";
 import { useSelectionStore } from "../store/selectionStore.js";
 import { getComponentClass, getComponentTypes } from "../../engine/index.js";
 import { commandBus } from "../commands/CommandBus.js";
-import { RenameEntityCommand, BatchCommand, SetEntityViewOnlyCommand, SetEntityEnabledInEditorCommand, SetEntityEnabledInGameCommand, SetEntityTagsCommand } from "../commands/entityCommands.js";
+import { RenameEntityCommand, BatchCommand, SetEntityViewOnlyCommand, SetEntityPersistentCommand, SetEntityEnabledInEditorCommand, SetEntityEnabledInGameCommand, SetEntityTagsCommand } from "../commands/entityCommands.js";
 import { ANCHOR_PRESETS, applyAnchorPreset } from "../../engine/ui/layout.js";
+import { collectBoneNames } from "../../engine/anim/mask.js";
 import { SetTransformCommand } from "../commands/transformCommands.js";
 import {
   AddComponentCommand,
@@ -47,7 +49,18 @@ import { applyPrefab, revertPrefab, unpackPrefab, openPrefabMode, createVariantF
 import { SoundSection } from "../components/SoundSection.jsx";
 import { ListenerSection } from "../components/ListenerSection.jsx";
 import { TerrainSection } from "../components/TerrainSection.jsx";
+import { TimelineSection } from "../components/TimelineSection.jsx";
+import { LinePointsSection, DecalSection, TrailSection } from "../components/VfxSections.jsx";
+import { LodSection } from "../components/LodSection.jsx";
+import { ImpostorSection } from "../components/ImpostorSection.jsx";
+import { SplineSection, SplineMeshSection, SplineFollowerSection } from "../components/SplineSection.jsx";
 import { useGeometryEditStore } from "../store/geometryEditStore.js";
+import {
+  APPLY_MODES,
+  APPLY_MODE_LABELS,
+  applyTransformStatus,
+  applyTransformToGeometry,
+} from "../applyTransform.js";
 import { assignTerrainAssets, createTerrainAssets } from "../terrainAssetSetup.js";
 import { NumberField } from "../fields/NumberField.jsx";
 import { componentIcon, groupComponentTypes } from "../componentIcons.js";
@@ -57,6 +70,8 @@ import { ContextMenu, useContextMenu } from "../ContextMenu.jsx";
 import { createScriptFile } from "../scriptAsset.js";
 import { stemToClassName } from "../scriptClassSync.js";
 import { openInIDE } from "../openInIde.js";
+import { GEOMETRY_MODIFIER_DEFINITIONS, createGeometryModifier } from "../../engine/geometryModifiers.js";
+import { applyGeometryModifier } from "../geometryModifierEditing.js";
 
 /**
  * Returns the live engine entity referenced by `targetId` (the value stored
@@ -432,6 +447,38 @@ function MultiTransformSection({ entities }) {
   );
 }
 
+/**
+ * Picks another entity in the scene. The value stored is the entity id, so it
+ * survives renames; the dropdown shows names, disambiguated by their parent
+ * when two siblings share one (which is common — "Door", "Door").
+ *
+ * Known limitation: an id reference authored INSIDE a prefab does not survive
+ * instantiation (prefab expansion mints fresh ids and does not rewrite props),
+ * so inside a prefab, reference an ancestor or leave it empty for "the world".
+ */
+function EntityRefField({ descriptor, value, onCommit }) {
+  const entities = useSceneStore((s) => s.entities);
+  const options = Object.values(entities ?? {})
+    .filter((e) => !descriptor.filter || descriptor.filter(e))
+    .map((e) => {
+      const parent = e.parentId ? entities[e.parentId]?.name : null;
+      return { id: e.id, label: parent ? `${e.name}  ·  ${parent}` : e.name };
+    })
+    .sort((a, b) => a.label.localeCompare(b.label));
+  const missing = value && !entities?.[value];
+  return (
+    <select className="select-field" value={value ?? ""} onChange={(e) => onCommit(e.target.value)}>
+      <option value="">{descriptor.emptyLabel ?? "— None —"}</option>
+      {missing && <option value={value}>— Missing —</option>}
+      {options.map((opt) => (
+        <option key={opt.id} value={opt.id}>
+          {opt.label}
+        </option>
+      ))}
+    </select>
+  );
+}
+
 function PropField({ descriptor, value, onCommit, mixed = false, mixedAxes = [] }) {
   switch (descriptor.type) {
     case "asset":
@@ -468,17 +515,33 @@ function PropField({ descriptor, value, onCommit, mixed = false, mixedAxes = [] 
           onChange={(e) => onCommit(e.target.value)}
         />
       );
-    case "select":
+    // Entity reference — a joint's connected body, a camera's follow target.
+    // Stores the entity id; empty means "none" (which several components read
+    // as "the world" or "no target").
+    case "entity":
+      return <EntityRefField descriptor={descriptor} value={mixed ? "" : value} onCommit={onCommit} />;
+    case "select": {
+      // `options` may be a function so a schema can offer choices that are
+      // only known at runtime — the physics Layer dropdown reads the project's
+      // layer names, which load long after the component class does.
+      const options =
+        typeof descriptor.options === "function" ? descriptor.options() ?? [] : descriptor.options ?? [];
+      // A value saved before the option list changed (a renamed layer) would
+      // otherwise render as a blank select that silently rewrites the prop on
+      // the next change. Show it, marked, until the user picks something.
+      const stale = !mixed && value != null && value !== "" && !options.includes(value);
       return (
         <select className="select-field" value={mixed ? "" : value} onChange={(e) => onCommit(e.target.value)}>
           {mixed && <option value="">— Mixed —</option>}
-          {descriptor.options.map((opt) => (
+          {stale && <option value={value}>{`${value} (missing)`}</option>}
+          {options.map((opt) => (
             <option key={opt} value={opt}>
               {opt}
             </option>
           ))}
         </select>
       );
+    }
     case "boolean":
       return (
         <MixedCheckbox checked={value} mixed={mixed} onChange={(e) => onCommit(e.target.checked)} />
@@ -1188,6 +1251,406 @@ function copyableProps(cls, props) {
   return out;
 }
 
+/**
+ * Tip-bone picker for the IK component.
+ *
+ * A dropdown of the sibling Model's real bone names, because the alternative is
+ * typing "mixamorig:LeftFoot" from memory and getting a warning three frames
+ * later. The chain is derived from the tip (two bones up), so the hint spells
+ * out which bones that resolves to — picking a thigh instead of a foot is the
+ * mistake this component invites.
+ */
+function IKBoneField({ entityId, props }) {
+  const [bones, setBones] = useState([]);
+  useEffect(() => {
+    const refresh = () => {
+      const root = engine.getEntity(entityId)?.getComponent("model")?.root;
+      setBones(root ? collectBoneNames(root) : []);
+    };
+    refresh();
+    // The GLB loads asynchronously; without this the list is empty exactly when
+    // you first add the component, which is when you need it.
+    const unsub = engine.on?.("model-loaded", refresh);
+    return () => unsub?.();
+  }, [entityId]);
+
+  const chain = useMemo(() => {
+    const root = engine.getEntity(entityId)?.getComponent("model")?.root;
+    const tip = props.tipBone ? root?.getObjectByName(props.tipBone) : null;
+    const mid = tip?.parent;
+    const upper = mid?.parent;
+    return mid?.isBone && upper?.isBone ? `${upper.name} → ${mid.name} → ${tip.name}` : null;
+  }, [entityId, props.tipBone, bones]);
+
+  return (
+    <>
+      <div className="field-row">
+        <span className="field-label">Tip Bone</span>
+        {bones.length ? (
+          <select
+            className="select-field"
+            value={props.tipBone ?? ""}
+            onChange={(e) =>
+              commandBus.execute(new SetComponentPropCommand(entityId, "ik", "tipBone", e.target.value))
+            }
+          >
+            <option value="">None</option>
+            {bones.map((b) => (
+              <option key={b.name} value={b.name}>
+                {" ".repeat(b.depth * 2) + b.name}
+              </option>
+            ))}
+          </select>
+        ) : (
+          <input
+            className="text-field"
+            key={props.tipBone}
+            defaultValue={props.tipBone ?? ""}
+            placeholder="bone name"
+            onBlur={(e) =>
+              commandBus.execute(
+                new SetComponentPropCommand(entityId, "ik", "tipBone", e.target.value.trim()),
+              )
+            }
+          />
+        )}
+      </div>
+      {props.tipBone && (
+        <div className="field-row">
+          <span className="field-label" style={{ opacity: 0.6 }}>
+            {chain ?? "no two-bone chain above this bone"}
+          </span>
+        </div>
+      )}
+    </>
+  );
+}
+
+/**
+ * Solo for a virtual camera — "show me this shot now", without editing the
+ * priority you actually shipped.
+ *
+ * Deliberately NOT undoable and NOT saved: it is a viewfinder, not a scene
+ * edit. Soloing one shot releases every other, because two solos is not a
+ * question the brain can answer and the second click would silently do nothing.
+ */
+function VirtualCameraActions({ entityId }) {
+  const [solo, setSolo] = useState(
+    () => !!engine.getEntity(entityId)?.getComponent("vcam")?.solo,
+  );
+  const toggle = () => {
+    const next = !solo;
+    for (const vcam of engine.virtualCameras ?? []) vcam.setSolo(false);
+    engine.getEntity(entityId)?.getComponent("vcam")?.setSolo(next);
+    setSolo(next);
+  };
+  const brain = [...(engine.entities?.values() ?? [])]
+    .map((e) => e.getComponent("camera"))
+    .find(Boolean);
+  return (
+    <>
+      <EditorActionRow
+        actions={[
+          {
+            label: solo ? "Unsolo" : "Solo",
+            hint: "make this shot live, ignoring priority",
+            Icon: ScanEye,
+            color: solo ? "#ffb347" : "#4fd475",
+            onClick: toggle,
+          },
+        ]}
+      />
+      {solo && !engine.playing && !brain?.props?.previewRigInEditor && (
+        <div className="field-row">
+          <span className="field-label" style={{ opacity: 0.6 }}>
+            Turn on the Camera's "Preview Rig" to see it in the editor
+          </span>
+        </div>
+      )}
+    </>
+  );
+}
+
+/**
+ * Bake the entity's transform into its mesh geometry (Blender's Ctrl+A).
+ *
+ * Lives on the Mesh section rather than Transform because it only exists when
+ * there is geometry to write into, and because its side effect is a `.geom`
+ * rewrite or fork — a Transform-section control would be grey noise on lights,
+ * cameras and empties. The hierarchy context menu keeps the same modes for
+ * the Blender-muscle-memory path.
+ */
+function ApplyTransformSection({ entityId }) {
+  const status = applyTransformStatus(entityId);
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState(null);
+  const anchorRef = useRef(null);
+
+  useEffect(() => {
+    setResult(null);
+    setOpen(false);
+  }, [entityId]);
+
+  if (!status.ok) return null;
+
+  const run = async (mode) => {
+    setOpen(false);
+    setBusy(true);
+    try {
+      const next = await applyTransformToGeometry(entityId, mode);
+      setResult(next);
+      if (next.ok) console.log(next.message);
+      else console.warn(`Apply Transform: ${next.message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="apply-transform-section">
+      <button
+        ref={anchorRef}
+        type="button"
+        className="apply-transform-trigger"
+        disabled={busy}
+        title={
+          status.fork
+            ? "Bake transform into mesh geometry — saves a new .geom (primitive or shared asset)"
+            : "Bake transform into mesh geometry and clear the applied axes"
+        }
+        onClick={() => setOpen((value) => !value)}
+      >
+        <Axis3d size={14} />
+        <span className="apply-transform-label">{busy ? "Applying…" : "Apply Transform"}</span>
+        {status.fork && <span className="apply-transform-hint">new .geom</span>}
+        <ChevronDown size={12} className="apply-transform-chevron" />
+      </button>
+      {open && (
+        <PopoverMenu
+          anchorRef={anchorRef}
+          className="apply-transform-menu"
+          minWidth={200}
+          onClose={() => setOpen(false)}
+        >
+          {APPLY_MODES.map((mode) => (
+            <button
+              key={mode}
+              type="button"
+              className="dropdown-item"
+              onClick={() => run(mode)}
+            >
+              {APPLY_MODE_LABELS[mode]}
+            </button>
+          ))}
+        </PopoverMenu>
+      )}
+      {result && (
+        <div
+          className={`apply-transform-result${result.ok ? "" : " apply-transform-result--error"}`}
+          title={result.message}
+        >
+          {result.message}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Bake button for the scene's navmesh, with a readout of what it produced.
+ *
+ * Reporting the result matters more here than for most actions: a bake that
+ * finds no walkable geometry, or produces a navmesh that covers nothing,
+ * leaves the viewport looking exactly like a bake that never ran.
+ */
+function NavMeshActions({ entityId }) {
+  const [status, setStatus] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const scenePath = useSceneStore((s) => s.scenePath);
+
+  const bake = async () => {
+    const component = engine.getEntity(entityId)?.getComponent("navmesh");
+    if (!component) return;
+    setBusy(true);
+    try {
+      // Named after the scene, so two levels in one project don't overwrite
+      // each other's navmesh — the failure mode of a fixed filename is that
+      // level 2 works and level 1 silently gets level 2's mesh.
+      const sceneName = (scenePath?.split(/[\\/]/).pop() ?? "Scene").replace(/\.scene$/i, "");
+      const result = await component.bakeAndSave(`navmesh/${sceneName}.navmesh`);
+      if (!result.success) setStatus({ error: result.error });
+      else {
+        const s = result.stats ?? {};
+        setStatus({
+          text: `${s.triangles ?? 0} tris · ${s.links ?? 0} links · ${s.ms ?? 0}ms`,
+        });
+      }
+    } catch (error) {
+      setStatus({ error: String(error?.message ?? error) });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <>
+      <EditorActionRow
+        actions={[
+          {
+            label: busy ? "Baking…" : "Bake NavMesh",
+            hint: "rebuild the navmesh from the scene and save it",
+            Icon: Waypoints,
+            color: "#4da3ff",
+            onClick: busy ? () => {} : bake,
+          },
+        ]}
+      />
+      {status && (
+        <div className="field-row">
+          <span className="field-label" style={{ opacity: 0.7, color: status.error ? "#ff8080" : undefined }}>
+            {status.error ?? status.text}
+          </span>
+        </div>
+      )}
+    </>
+  );
+}
+
+/** Fire button for an impulse source — tuning shake by numbers alone is hopeless. */
+function ImpulseSourceActions({ entityId }) {
+  return (
+    <EditorActionRow
+      actions={[
+        {
+          label: "Fire",
+          hint: "emit this shake once, right now",
+          Icon: Sparkles,
+          color: "#ff8080",
+          onClick: () => engine.getEntity(entityId)?.getComponent("impulsesource")?.fire(),
+        },
+      ]}
+    />
+  );
+}
+
+/** Blender-style ordered modifier cards for the Geometry Modifiers component. */
+function GeometryModifiersSection({ entityId, props }) {
+  const [busyId, setBusyId] = useState(null);
+  const [message, setMessage] = useState("");
+  const modifiers = props.modifiers ?? [];
+  const commit = (next, label) =>
+    commandBus.execute(new SetComponentPropCommand(entityId, "geometryModifiers", "modifiers", next, label));
+  const update = (index, patch, label = "Edit modifier") => commit(
+    modifiers.map((modifier, current) => current === index ? { ...modifier, ...patch } : modifier),
+    label,
+  );
+  const move = (index, delta) => {
+    const target = index + delta;
+    if (target < 0 || target >= modifiers.length) return;
+    const next = [...modifiers];
+    [next[index], next[target]] = [next[target], next[index]];
+    commit(next, "Reorder modifiers");
+  };
+  const apply = async (modifier) => {
+    if (busyId) return;
+    setBusyId(modifier.id);
+    setMessage("");
+    const result = await applyGeometryModifier(entityId, modifier.id);
+    setMessage(result.message);
+    setBusyId(null);
+  };
+
+  return (
+    <div className="modifier-stack-editor">
+      <select
+        className="select-field modifier-add"
+        value=""
+        onChange={(event) => {
+          const modifier = createGeometryModifier(event.target.value);
+          if (modifier) commit([...modifiers, modifier], `Add ${GEOMETRY_MODIFIER_DEFINITIONS.find((entry) => entry.type === modifier.type)?.label ?? "modifier"}`);
+        }}
+      >
+        <option value="">Add Modifier…</option>
+        {GEOMETRY_MODIFIER_DEFINITIONS.map((definition) => (
+          <option key={definition.type} value={definition.type}>{definition.label}</option>
+        ))}
+      </select>
+      {!modifiers.length && <div className="modifier-stack-empty">No modifiers</div>}
+      {modifiers.map((modifier, index) => {
+        const definition = GEOMETRY_MODIFIER_DEFINITIONS.find((entry) => entry.type === modifier.type);
+        if (!definition) return null;
+        const expanded = modifier.expanded !== false;
+        const enabled = modifier.enabled !== false;
+        return (
+          <div className={`modifier-card ${enabled ? "" : "disabled"}`} key={modifier.id}>
+            <div className="modifier-card-header">
+              <button className="modifier-disclosure" title={expanded ? "Collapse" : "Expand"} onClick={() => update(index, { expanded: !expanded }, "Toggle modifier panel") }>
+                <ChevronRight size={13} className={expanded ? "expanded" : ""} />
+                <span>{definition.label}</span>
+              </button>
+              <span className="modifier-card-actions">
+                <button className="modifier-apply" disabled={!!busyId || !enabled} title="Bake this modifier into the geometry" onClick={() => apply(modifier)}>
+                  {busyId === modifier.id ? "Applying…" : "Apply"}
+                </button>
+                <button className="icon-btn" title={enabled ? "Disable modifier" : "Enable modifier"} onClick={() => update(index, { enabled: !enabled }, "Toggle modifier") }>
+                  {enabled ? <Eye size={12} /> : <EyeOff size={12} />}
+                </button>
+                <button className="icon-btn" title="Move modifier up" disabled={index === 0} onClick={() => move(index, -1)}><ChevronUp size={12} /></button>
+                <button className="icon-btn" title="Move modifier down" disabled={index === modifiers.length - 1} onClick={() => move(index, 1)}><ChevronDown size={12} /></button>
+                <button className="icon-btn" title="Remove modifier" onClick={() => commit(modifiers.filter((_, current) => current !== index), `Remove ${definition.label}`)}><X size={12} /></button>
+              </span>
+            </div>
+            {expanded && (
+              <div className="modifier-card-body">
+                {definition.fields.filter((descriptor) => !descriptor.showIf || descriptor.showIf(modifier)).map((descriptor) => (
+                  <div className="field-row" key={descriptor.key}>
+                    <span className="field-label">{descriptor.label}</span>
+                    <PropField descriptor={descriptor} value={modifier[descriptor.key]} onCommit={(value) => update(index, { [descriptor.key]: value }, `Set ${definition.label} ${descriptor.label}`)} />
+                  </div>
+                ))}
+                {!definition.fields.length && <div className="modifier-card-note">Area-weighted vertex normals</div>}
+              </div>
+            )}
+          </div>
+        );
+      })}
+      {message && <div className="modifier-stack-message">{message}</div>}
+    </div>
+  );
+}
+
+/**
+ * Collapsible "Advanced" group for schema fields marked `advanced: true`.
+ * Collapsed by default — the point is to keep a component's inspector down
+ * to the handful of properties people actually touch day to day (GI's
+ * Quality + Intensity), with the rest one click away instead of a wall of
+ * rows. Any component can opt individual fields in; nothing here knows what
+ * GI (or any other component) actually is.
+ *
+ * Local `useState`, not persisted — the toggle is keyed by the component
+ * type's position in the schema list (`key={type}` on ComponentSection), so
+ * it stays open while you tweak values on one entity but starts collapsed
+ * again for a component you haven't opened this session.
+ */
+function AdvancedFieldsSection({ children }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="advanced-fields">
+      <button
+        type="button"
+        className="advanced-fields-toggle"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+      >
+        <ChevronDown size={12} className={`advanced-fields-chevron${open ? "" : " collapsed"}`} />
+        <span>Advanced</span>
+      </button>
+      {open && <div className="advanced-fields-body">{children}</div>}
+    </div>
+  );
+}
+
 function ComponentSection({ entityId, type, props }) {
   const cls = getComponentClass(type);
   // Mirror the live `enabled` flag into local state so the eye icon
@@ -1315,13 +1778,19 @@ function ComponentSection({ entityId, type, props }) {
           </button>
         </span>
       </div>
-      {cls.schema.map((descriptor) => {
-        if (descriptor.hidden) return null;
-        if (descriptor.showIf && !descriptor.showIf(props)) return null;
-        // Mesh materials render through MaterialSlotsSection below, which owns
-        // the whole slot list (add / remove / renumber) rather than one row.
-        if (type === "mesh" && descriptor.key === "material") return null;
-        return (
+      {(() => {
+        const visible = cls.schema.filter((descriptor) => {
+          if (descriptor.hidden) return false;
+          if (descriptor.showIf && !descriptor.showIf(props)) return false;
+          // Mesh materials render through MaterialSlotsSection below, which owns
+          // the whole slot list (add / remove / renumber) rather than one row.
+          if (type === "mesh" && descriptor.key === "material") return false;
+          // The tip bone gets a dropdown of the rig's actual bones instead of a
+          // text field — typing "mixamorig:LeftFoot" from memory is a coin flip.
+          if (type === "ik" && descriptor.key === "tipBone") return false;
+          return true;
+        });
+        const renderField = (descriptor) => (
           <div className="field-row" key={descriptor.key}>
             <span className="field-label">{descriptor.label}</span>
             <PropField
@@ -1335,14 +1804,36 @@ function ComponentSection({ entityId, type, props }) {
                   ], "Use primitive geometry"));
                   return;
                 }
+                // A schema field may declare `flipsToCustom: "otherKey"` so
+                // editing it also flips a sibling preset selector to
+                // "custom" in the SAME undo step (e.g. GI's advanced fields
+                // flip `quality`) — skipped once the preset already reads
+                // "custom" so repeated edits don't keep rewriting it.
+                if (descriptor.flipsToCustom && props[descriptor.flipsToCustom] !== "custom") {
+                  commandBus.execute(new BatchCommand([
+                    new SetComponentPropCommand(entityId, type, descriptor.key, v),
+                    new SetComponentPropCommand(entityId, type, descriptor.flipsToCustom, "custom"),
+                  ], `Set ${descriptor.label}`));
+                  return;
+                }
                 commandBus.execute(new SetComponentPropCommand(entityId, type, descriptor.key, v));
               }}
             />
           </div>
         );
-      })}
+        const advanced = visible.filter((descriptor) => descriptor.advanced);
+        return (
+          <>
+            {visible.filter((descriptor) => !descriptor.advanced).map(renderField)}
+            {advanced.length > 0 && (
+              <AdvancedFieldsSection>{advanced.map(renderField)}</AdvancedFieldsSection>
+            )}
+          </>
+        );
+      })()}
       {type === "uielement" && <UiElementSection entityId={entityId} props={props} />}
       {type === "script" && <ScriptsSection entityId={entityId} props={props} />}
+      {type === "geometryModifiers" && <GeometryModifiersSection entityId={entityId} props={props} />}
       {type === "mesh" && (
         <>
           <MaterialSlotsSection entityId={entityId} props={props} />
@@ -1374,6 +1865,7 @@ function ComponentSection({ entityId, type, props }) {
               },
             ]}
           />
+          <ApplyTransformSection entityId={entityId} />
         </>
       )}
       {type === "camera" && (
@@ -1443,8 +1935,21 @@ function ComponentSection({ entityId, type, props }) {
           ]}
         />
       )}
+      {type === "ik" && <IKBoneField entityId={entityId} props={props} />}
+      {type === "vcam" && <VirtualCameraActions entityId={entityId} />}
+      {type === "navmesh" && <NavMeshActions entityId={entityId} />}
+      {type === "impulsesource" && <ImpulseSourceActions entityId={entityId} />}
       {type === "sound" && <SoundSection entityId={entityId} props={props} />}
       {type === "listener" && <ListenerSection entityId={entityId} />}
+      {type === "timeline" && <TimelineSection entityId={entityId} props={props} />}
+      {type === "line" && <LinePointsSection entityId={entityId} props={props} />}
+      {type === "trail" && <TrailSection entityId={entityId} />}
+      {type === "decal" && <DecalSection entityId={entityId} />}
+      {type === "lod" && <LodSection entityId={entityId} props={props} />}
+      {type === "impostor" && <ImpostorSection entityId={entityId} />}
+      {type === "spline" && <SplineSection entityId={entityId} props={props} />}
+      {type === "splineMesh" && <SplineMeshSection entityId={entityId} />}
+      {type === "splineFollower" && <SplineFollowerSection entityId={entityId} />}
       {type === "terrain" && <TerrainSection entityId={entityId} props={props} />}
       {type === "collider" && props.shape === "heightfield" && !engine.getEntity(entityId)?.getComponent("terrain") && (
         <div className="field-row">
@@ -1610,42 +2115,62 @@ function MultiComponentSection({ entities, type }) {
           </button>
         </span>
       </div>
-      {cls.schema.map((descriptor) => {
-        if (descriptor.hidden) return null;
-        if (descriptor.showIf && !propsList.every((props) => descriptor.showIf(props))) return null;
-        const values = propsList.map((props) => props[descriptor.key]);
-        const mixed = !values.every((value) => valuesEqual(value, values[0]));
-        const mixedAxes = descriptor.type === "vec3"
-          ? [0, 1, 2].map((axis) => !values.every((value) => value?.[axis] === values[0]?.[axis]))
-          : [];
+      {(() => {
+        const visible = cls.schema.filter((descriptor) => {
+          if (descriptor.hidden) return false;
+          if (descriptor.showIf && !propsList.every((props) => descriptor.showIf(props))) return false;
+          return true;
+        });
+        const renderField = (descriptor) => {
+          const values = propsList.map((props) => props[descriptor.key]);
+          const mixed = !values.every((value) => valuesEqual(value, values[0]));
+          const mixedAxes = descriptor.type === "vec3"
+            ? [0, 1, 2].map((axis) => !values.every((value) => value?.[axis] === values[0]?.[axis]))
+            : [];
+          return (
+            <div className="field-row" key={descriptor.key}>
+              <span className="field-label">{descriptor.label}</span>
+              <PropField
+                descriptor={descriptor}
+                value={values[0]}
+                mixed={mixed}
+                mixedAxes={mixedAxes}
+                onCommit={(value, changedAxis) => {
+                  const commands = [];
+                  for (const entity of entities) {
+                    const props = entity.components[type];
+                    if (type === "mesh" && descriptor.key === "geometry" && props.geometryAsset) {
+                      commands.push(new SetComponentPropCommand(entity.id, type, "geometryAsset", ""));
+                    }
+                    let entityValue = value;
+                    if (descriptor.type === "vec3" && Number.isInteger(changedAxis)) {
+                      entityValue = [...(props[descriptor.key] ?? [0, 0, 0])];
+                      entityValue[changedAxis] = value[changedAxis];
+                    }
+                    commands.push(new SetComponentPropCommand(entity.id, type, descriptor.key, entityValue));
+                    // See the single-entity ComponentSection for what
+                    // `flipsToCustom` means — applied per-entity here so a
+                    // mixed selection still gets one undo step overall.
+                    if (descriptor.flipsToCustom && props[descriptor.flipsToCustom] !== "custom") {
+                      commands.push(new SetComponentPropCommand(entity.id, type, descriptor.flipsToCustom, "custom"));
+                    }
+                  }
+                  commandBus.execute(new BatchCommand(commands, `Set ${descriptor.label} on ${entities.length} entities`));
+                }}
+              />
+            </div>
+          );
+        };
+        const advanced = visible.filter((descriptor) => descriptor.advanced);
         return (
-          <div className="field-row" key={descriptor.key}>
-            <span className="field-label">{descriptor.label}</span>
-            <PropField
-              descriptor={descriptor}
-              value={values[0]}
-              mixed={mixed}
-              mixedAxes={mixedAxes}
-              onCommit={(value, changedAxis) => {
-                const commands = [];
-                for (const entity of entities) {
-                  const props = entity.components[type];
-                  if (type === "mesh" && descriptor.key === "geometry" && props.geometryAsset) {
-                    commands.push(new SetComponentPropCommand(entity.id, type, "geometryAsset", ""));
-                  }
-                  let entityValue = value;
-                  if (descriptor.type === "vec3" && Number.isInteger(changedAxis)) {
-                    entityValue = [...(props[descriptor.key] ?? [0, 0, 0])];
-                    entityValue[changedAxis] = value[changedAxis];
-                  }
-                  commands.push(new SetComponentPropCommand(entity.id, type, descriptor.key, entityValue));
-                }
-                commandBus.execute(new BatchCommand(commands, `Set ${descriptor.label} on ${entities.length} entities`));
-              }}
-            />
-          </div>
+          <>
+            {visible.filter((descriptor) => !descriptor.advanced).map(renderField)}
+            {advanced.length > 0 && (
+              <AdvancedFieldsSection>{advanced.map(renderField)}</AdvancedFieldsSection>
+            )}
+          </>
         );
-      })}
+      })()}
       {type === "script" && <MultiScriptAttributeFields entities={entities} />}
       <div className="asset-hint">Editing shared values on {entities.length} selected entities.</div>
     </div>
@@ -1906,6 +2431,7 @@ function MultiEntityInspector({ entities }) {
   const editorValues = liveEntities.map((entity) => entity.enabledInEditor !== false);
   const gameValues = liveEntities.map((entity) => entity.enabledInGame !== false);
   const viewOnlyValues = flagValues("viewOnly", false).map(Boolean);
+  const persistentValues = flagValues("persistent", false).map(Boolean);
   const mixed = (values) => !values.every((value) => value === values[0]);
   const executeForAll = (Command, value, label) => commandBus.execute(
     new BatchCommand(entityIds.map((id) => new Command(id, value)), label),
@@ -1953,6 +2479,14 @@ function MultiEntityInspector({ entities }) {
             checked={viewOnlyValues[0]}
             mixed={mixed(viewOnlyValues)}
             onChange={(event) => executeForAll(SetEntityViewOnlyCommand, event.target.checked, `Set View Only on ${entities.length} entities`)}
+          />
+        </div>
+        <div className="field-row">
+          <span className="field-label">Persistent</span>
+          <MixedCheckbox
+            checked={persistentValues[0]}
+            mixed={mixed(persistentValues)}
+            onChange={(event) => executeForAll(SetEntityPersistentCommand, event.target.checked, `Set Persistent on ${entities.length} entities`)}
           />
         </div>
         <div className="field-row visibility-row">
@@ -2134,6 +2668,21 @@ export function InspectorPanel() {
               checked={!!engine.getEntity(entity.id)?.viewOnly}
               onChange={(e) =>
                 commandBus.execute(new SetEntityViewOnlyCommand(entity.id, e.target.checked))
+              }
+            />
+          </label>
+        </div>
+        <div className="field-row">
+          <span className="field-label">Persistent</span>
+          <label
+            className="field-row inline"
+            title="Survive engine.loadScene — for game managers, the audio listener, or a player that carries between levels"
+          >
+            <input
+              type="checkbox"
+              checked={!!liveEntity?.persistent}
+              onChange={(e) =>
+                commandBus.execute(new SetEntityPersistentCommand(entity.id, e.target.checked))
               }
             />
           </label>

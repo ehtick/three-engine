@@ -41,7 +41,7 @@ export function renderNodeThumb(tslNode, target) {
       // are rare and 64×64, so the recompile is not worth optimizing around.
       s.material.dispose();
       s.material.needsUpdate = true;
-      await s.renderer.renderAsync(s.scene, s.camera);
+      s.renderer.render(s.scene, s.camera);
       const ctx = target.getContext("2d");
       ctx.clearRect(0, 0, target.width, target.height);
       ctx.drawImage(s.renderer.domElement, 0, 0, target.width, target.height);

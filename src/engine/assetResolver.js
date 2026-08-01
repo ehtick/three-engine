@@ -47,10 +47,10 @@ export async function saveAssetBinary(path, bytes) {
 }
 
 // Project-level DERIVED DATA directory (e.g. `<project>/Library`). Content-
-// hash-keyed artifacts that belong to no single asset file — baked SDFs of
-// primitive/GLB-internal geometries — live under it. The editor wires a
-// synchronous provider reading the open project's root; the player wires
-// its export layout. Null = no project open → callers keep session caches.
+// hash-keyed artifacts that belong to no authored asset file — baked mesh
+// SDFs for GI — live under it. The editor wires a synchronous provider
+// reading the open project's root; the player wires its export layout.
+// Null = no project open → callers keep session caches.
 let derivedDataRoot = () => null;
 
 export function setDerivedDataRootProvider(fn) {
@@ -64,6 +64,25 @@ export function getDerivedDataPath(relativeKey) {
   } catch {
     return null;
   }
+}
+
+// Scene files, for runtime scene loading (engine.loadScene). The default
+// fetches the path as a relative URL, which is exactly right for an exported
+// build — the exporter copies scene files across at their project-relative
+// paths, so the same string works in both. The editor swaps in a loader that
+// reads through Tauri and resolves against the open project root.
+let loadScene = async (path) => {
+  const res = await fetch(path);
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return res.json();
+};
+
+export function setSceneLoader(fn) {
+  loadScene = fn;
+}
+
+export function loadSceneJson(path) {
+  return loadScene(path);
 }
 
 // Same idea for script components: the editor supplies a loader that reads

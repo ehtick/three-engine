@@ -1,5 +1,4 @@
 import * as THREE from "three/webgpu";
-import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { MeshSurfaceSampler } from "three/addons/math/MeshSurfaceSampler.js";
 import {
   Fn,
@@ -22,6 +21,7 @@ import {
 } from "three/tsl";
 import { resolveAssetUrl } from "./assetResolver.js";
 import { loadTextureAsset } from "./textureAsset.js";
+import { getGltfLoader } from "./gltfLoader.js";
 import { sampleSurfacePoints, sampleVolumePoints } from "./meshSampling.js";
 
 /**
@@ -375,7 +375,7 @@ const curlNoise = /*@__PURE__*/ Fn(([p]) => {
 // Async asset preparation (mesh samples, sprite texture)
 // ---------------------------------------------------------------------------
 
-const gltfLoader = new GLTFLoader();
+const gltfLoader = getGltfLoader();
 const meshSampleCache = new Map(); // path -> Promise<{positions: Float32Array, normals: Float32Array}>
 
 function sampleMeshSurface(path) {

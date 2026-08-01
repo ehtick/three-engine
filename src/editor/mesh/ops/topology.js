@@ -744,14 +744,16 @@ export function bevelEdges(mesh, edges = selected(mesh, "edge"), { width = 0.1, 
       // rounded bevel's is not: capping the arcs with a single flat polygon
       // leaves a visible facet cutting the corner off exactly where the whole
       // point was to round it. Past one segment the corner is domed onto the
-      // same sphere the arcs follow and fanned, as Blender's corner patch is.
+      // same sphere the arcs follow. Three-edge corners use a triangular grid
+      // so the segment loops continue through the intersection without a
+      // high-valence fan pole; unusual valences retain the generic fallback.
       // The patch continues the mapping of the strips around it. A fresh 0..1
       // tile (what `planarRingUVs` gives) puts the whole texture on a corner a
       // few millimetres across — tens of times the density of the surface it
       // sits in, and the most visible part of "bevel ruins the UVs".
       const cornerUVs = ringUVsFromNeighbour(oriented);
       const caps = segments > 1
-        ? fanDomedCorner(mesh, oriented, vert, cornerUVs)
+        ? gridDomedCorner(mesh, oriented, vert, cornerUVs, segments)
         : [addFace(mesh, oriented, { uvs: cornerUVs ?? planarRingUVs(oriented) })];
       for (const cap of caps) if (cap) created.push(cap);
     }
@@ -762,6 +764,172 @@ export function bevelEdges(mesh, edges = selected(mesh, "edge"), { width = 0.1, 
   for (const face of created) if (mesh.faces.has(face)) face.select = true;
   flushSelection(mesh, "face");
   return { faces: created, width: amount, segments };
+}
+
+/**
+ * Fills the common three-edge bevel corner as a uniformly subdivided spherical
+ * triangle. The boundary contains three chains of `segments` edges created by
+ * the adjacent bevel strips. Reusing those vertices makes every strip loop
+ * continue into the cap, while the barycentric interior avoids the single
+ * many-spoked hub produced by the old fan.
+ */
+function gridDomedCorner(mesh, ring, vert, inheritedUVs, segments) {
+  const steps = Math.max(1, Math.min(Math.round(segments) || 1, 16));
+  if (ring.length !== steps * 3) return fanDomedCorner(mesh, ring, vert, inheritedUVs);
+
+  // Blender's special three-edge M_ADJ pattern uses three m×m quad patches
+  // when the profile has 2m segments. This is the topology visible on a
+  // normally beveled cube: profile loops enter the corner, turn onto one of
+  // three radial seams, and meet at a low-valence shared center.
+  if (steps % 2 === 0) return quadDomedTriCorner(mesh, ring, vert, inheritedUVs, steps);
+
+  const points = ring.map((corner) => corner.co);
+  const sphere = fitSphere(points) ?? {
+    center: vert.co,
+    radius: points.reduce((sum, point) => sum + length3(sub3(point, vert.co)), 0) / points.length,
+  };
+  const corners = [ring[0], ring[steps], ring[steps * 2]];
+  const directions = corners.map((corner) => normalize3(sub3(corner.co, sphere.center)));
+  const ringUVs = inheritedUVs ?? projectRingUVs(points, normalize3(sub3(
+    points.reduce((sum, point) => add3(sum, point), [0, 0, 0]).map((value) => value / points.length),
+    sphere.center,
+  ))) ?? planarRingUVs(ring);
+  const cornerUVs = [ringUVs[0], ringUVs[steps], ringUVs[steps * 2]];
+  const vertices = new Map();
+  const uvs = new Map();
+  const key = (a, b) => `${a}:${b}`;
+
+  const boundaryIndex = (a, b, c) => {
+    if (c === 0) return b; // A -> B
+    if (a === 0) return steps + c; // B -> C
+    if (b === 0) return (steps * 2 + a) % ring.length; // C -> A
+    return -1;
+  };
+  for (let a = 0; a <= steps; a++) for (let b = 0; b <= steps - a; b++) {
+    const c = steps - a - b;
+    const boundary = boundaryIndex(a, b, c);
+    let point;
+    let uv;
+    if (boundary >= 0) {
+      point = ring[boundary];
+      uv = ringUVs[boundary];
+    } else {
+      const direction = normalize3(add3(add3(scale3(directions[0], a), scale3(directions[1], b)), scale3(directions[2], c)));
+      point = addVert(mesh, add3(sphere.center, scale3(direction, sphere.radius)));
+      uv = [
+        (cornerUVs[0][0] * a + cornerUVs[1][0] * b + cornerUVs[2][0] * c) / steps,
+        (cornerUVs[0][1] * a + cornerUVs[1][1] * b + cornerUVs[2][1] * c) / steps,
+      ];
+    }
+    vertices.set(key(a, b), point);
+    uvs.set(key(a, b), uv);
+  }
+
+  const faces = [];
+  const addTriangle = (coordinates) => {
+    const triangle = coordinates.map(([a, b]) => vertices.get(key(a, b)));
+    const triangleUVs = coordinates.map(([a, b]) => uvs.get(key(a, b)));
+    const face = addFace(mesh, triangle, { uvs: triangleUVs });
+    if (face) faces.push(face);
+  };
+  for (let a = 0; a < steps; a++) for (let b = 0; b < steps - a; b++) {
+    addTriangle([[a + 1, b], [a, b + 1], [a, b]]);
+    if (a + b < steps - 1) addTriangle([[a + 1, b], [a + 1, b + 1], [a, b + 1]]);
+  }
+  return faces;
+}
+
+function quadDomedTriCorner(mesh, ring, vert, inheritedUVs, steps) {
+  const half = steps / 2;
+  const points = ring.map((corner) => corner.co);
+  const sphere = fitSphere(points) ?? {
+    center: vert.co,
+    radius: points.reduce((sum, point) => sum + length3(sub3(point, vert.co)), 0) / points.length,
+  };
+  const outward = normalize3(sub3(
+    points.reduce((sum, point) => add3(sum, point), [0, 0, 0]).map((value) => value / points.length),
+    sphere.center,
+  ));
+  const center = addVert(mesh, add3(sphere.center, scale3(outward, sphere.radius)));
+  const ringUVs = inheritedUVs ?? projectRingUVs(points, outward) ?? planarRingUVs(ring);
+  const centerUV = ringUVs.reduce(
+    (sum, uv) => [sum[0] + uv[0] / ringUVs.length, sum[1] + uv[1] / ringUVs.length],
+    [0, 0],
+  );
+
+  // One radial seam per profile arc midpoint. Adjacent patches reuse these
+  // exact vertices, which is the essential difference from three unrelated
+  // face insets or a triangle fan.
+  const seams = Array.from({ length: 3 }, (_, side) => {
+    const midpointIndex = side * steps + half;
+    const midpoint = ring[midpointIndex];
+    const midpointDirection = normalize3(sub3(midpoint.co, sphere.center));
+    return Array.from({ length: half + 1 }, (_, index) => {
+      if (index === 0) return midpoint;
+      if (index === half) return center;
+      const t = index / half;
+      const direction = normalize3(lerp3(midpointDirection, outward, t));
+      return addVert(mesh, add3(sphere.center, scale3(direction, sphere.radius)));
+    });
+  });
+
+  const seamUVs = Array.from({ length: 3 }, (_, side) => {
+    const midpointUV = ringUVs[side * steps + half];
+    return Array.from({ length: half + 1 }, (_, index) => lerp2(midpointUV, centerUV, index / half));
+  });
+  const faces = [];
+  const wrap = (index) => (index % ring.length + ring.length) % ring.length;
+
+  for (let side = 0; side < 3; side++) {
+    const previous = (side + 2) % 3;
+    const patch = Array.from({ length: half + 1 }, () => Array(half + 1));
+    const patchUV = Array.from({ length: half + 1 }, () => Array(half + 1));
+
+    // Patch boundary: original corner -> forward midpoint, original corner ->
+    // backward midpoint, and the two shared midpoint-to-center seams.
+    for (let u = 0; u <= half; u++) {
+      patch[u][0] = ring[side * steps + u];
+      patchUV[u][0] = ringUVs[side * steps + u];
+      patch[u][half] = seams[previous][u];
+      patchUV[u][half] = seamUVs[previous][u];
+    }
+    for (let v = 0; v <= half; v++) {
+      patch[0][v] = ring[wrap(side * steps - v)];
+      patchUV[0][v] = ringUVs[wrap(side * steps - v)];
+      patch[half][v] = seams[side][v];
+      patchUV[half][v] = seamUVs[side][v];
+    }
+
+    // Coons interpolation respects all four curved boundaries. Interior points
+    // are projected back onto the fitted corner sphere to continue the round
+    // bevel profile rather than flattening each quad patch.
+    const p00 = patch[0][0].co;
+    const p10 = patch[half][0].co;
+    const p01 = patch[0][half].co;
+    const p11 = patch[half][half].co;
+    for (let u = 1; u < half; u++) for (let v = 1; v < half; v++) {
+      const fu = u / half;
+      const fv = v / half;
+      const horizontal = lerp3(patch[0][v].co, patch[half][v].co, fu);
+      const vertical = lerp3(patch[u][0].co, patch[u][half].co, fv);
+      const bilinear = add3(
+        add3(scale3(p00, (1 - fu) * (1 - fv)), scale3(p10, fu * (1 - fv))),
+        add3(scale3(p01, (1 - fu) * fv), scale3(p11, fu * fv)),
+      );
+      const coons = sub3(add3(horizontal, vertical), bilinear);
+      const direction = normalize3(sub3(coons, sphere.center));
+      patch[u][v] = addVert(mesh, add3(sphere.center, scale3(direction, sphere.radius)));
+      patchUV[u][v] = lerp2(lerp2(patchUV[0][v], patchUV[half][v], fu), lerp2(patchUV[u][0], patchUV[u][half], fv), 0.5);
+    }
+
+    for (let u = 0; u < half; u++) for (let v = 0; v < half; v++) {
+      const corners = [patch[u][v], patch[u + 1][v], patch[u + 1][v + 1], patch[u][v + 1]];
+      const uvs = [patchUV[u][v], patchUV[u + 1][v], patchUV[u + 1][v + 1], patchUV[u][v + 1]];
+      const face = addFace(mesh, corners, { uvs });
+      if (face) faces.push(face);
+    }
+  }
+  return faces;
 }
 
 /**
@@ -776,6 +944,7 @@ export function bevelEdges(mesh, edges = selected(mesh, "edge"), { width = 0.1, 
 function buildBevelStrip(mesh, atStart, atEnd, pivotStart, pivotEnd, segments) {
   const steps = Math.max(1, Math.min(Math.round(segments) || 1, 16));
   const faces = [];
+  const edgeDirection = normalize3(sub3(pivotEnd.co, pivotStart.co));
   // The profile circle is centred on the *offset* corner, not on the original
   // vertex. Sweeping around the vertex looks superficially right — it passes
   // through both endpoints — but it is the wrong circle: on a right-angled edge
@@ -787,7 +956,19 @@ function buildBevelStrip(mesh, atStart, atEnd, pivotStart, pivotEnd, segments) {
   // which is the centre a bevel is defined about and is exact wherever the two
   // faces meet at a right angle.
   const arcPoint = (from, to, pivot, t) => {
-    const center = sub3(add3(from.co, to.co), pivot.co);
+    // `from` and `to` both include the same displacement along the original
+    // edge (the neighbouring selected edges shortened this end of the strip).
+    // The parallelogram sum includes that component twice, so remove one copy.
+    // Without this correction every profile arc at a fully beveled corner has
+    // a different centre and the cap pinches/balloons instead of lying on one
+    // common corner sphere.
+    const fromEdgeOffset = dot3(sub3(from.co, pivot.co), edgeDirection);
+    const toEdgeOffset = dot3(sub3(to.co, pivot.co), edgeDirection);
+    const sharedEdgeOffset = (fromEdgeOffset + toEdgeOffset) * 0.5;
+    const center = sub3(
+      sub3(add3(from.co, to.co), pivot.co),
+      scale3(edgeDirection, sharedEdgeOffset),
+    );
     const fromDirection = sub3(from.co, center);
     const toDirection = sub3(to.co, center);
     const blended = normalize3(lerp3(normalize3(fromDirection), normalize3(toDirection), t));

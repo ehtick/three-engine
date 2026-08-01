@@ -5,6 +5,7 @@ use std::path::Path;
 use tauri::Manager;
 
 mod mcp_clients;
+mod preview;
 mod pty;
 
 #[derive(Serialize)]
@@ -245,23 +246,54 @@ fn scaffold_three_types(app: tauri::AppHandle, dest_dir: String) -> Result<u64, 
     copy_dir(&src, Path::new(&dest_dir)).map_err(|e| e.to_string())
 }
 
+/// Locates the prebuilt player template (`dist-player/`).
+///
+/// The packaged resource directory comes first: in a shipped editor there is
+/// no repo checkout and no `npm run build:player` to run, so the template has
+/// to travel inside the app bundle. The two `dist-player` entries are the
+/// dev-time fallbacks — `tauri dev` runs with cwd `src-tauri`, so the sibling
+/// path is the one that usually hits, and the bare one covers running the
+/// binary from the repo root.
+fn player_template_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    let mut candidates = vec![
+        Path::new("../dist-player").to_path_buf(),
+        Path::new("dist-player").to_path_buf(),
+    ];
+    if let Ok(resources) = app.path().resource_dir() {
+        candidates.insert(0, resources.join("dist-player"));
+    }
+    candidates
+        .into_iter()
+        .find(|p| p.join("index.html").exists())
+        .ok_or_else(|| "Player template not found — run `npm run build:player` first".into())
+}
+
+/// Reads one file out of the player template (the exporter rewrites
+/// `index.html` for the game's title, icon and loading-screen colours).
+#[tauri::command]
+fn read_player_template(app: tauri::AppHandle, rel: String) -> Result<String, String> {
+    // Refuse anything that could climb out of the template directory: this
+    // takes a path from the frontend and the answer is handed straight back.
+    if rel.contains("..") || Path::new(&rel).is_absolute() {
+        return Err(format!("invalid template path: {rel}"));
+    }
+    let dir = player_template_dir(&app)?;
+    fs::read_to_string(dir.join(&rel)).map_err(|e| format!("read {rel}: {e}"))
+}
+
 /// Copies the prebuilt player template into `out_dir`, writes scene.json,
 /// and copies referenced assets to their relative destinations.
 #[tauri::command]
 fn export_game(
+    app: tauri::AppHandle,
     out_dir: String,
     scene_json: String,
     assets: Vec<(String, String)>,
     files: Vec<(String, String)>,
 ) -> Result<(), String> {
-    // Dev cwd is src-tauri; packaged builds would need a resource path (debt).
-    let player = ["../dist-player", "dist-player"]
-        .iter()
-        .map(Path::new)
-        .find(|p| p.join("index.html").exists())
-        .ok_or("Player template not found — run `npm run build:player` first")?;
+    let player = player_template_dir(&app)?;
     let out = Path::new(&out_dir);
-    copy_dir(player, out).map_err(|e| e.to_string())?;
+    copy_dir(&player, out).map_err(|e| e.to_string())?;
     fs::write(out.join("scene.json"), scene_json).map_err(|e| e.to_string())?;
     for (src, rel) in assets {
         let dest = out.join(&rel);
@@ -278,6 +310,58 @@ fn export_game(
         fs::write(&dest, contents).map_err(|e| format!("write {rel}: {e}"))?;
     }
     Ok(())
+}
+
+/// Zips a directory's contents with the directory itself as the *root* of the
+/// archive, not as a folder inside it.
+///
+/// That distinction is the whole reason this exists: itch.io serves
+/// `index.html` from the top level of the uploaded zip and shows a blank page
+/// (with no diagnosis) when it finds `MyGame/index.html` instead. Every
+/// "my HTML5 game doesn't work on itch" thread ends here.
+#[tauri::command]
+fn zip_dir(dir: String, dest: String) -> Result<u64, String> {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    let root = Path::new(&dir);
+    if !root.is_dir() {
+        return Err(format!("{dir} is not a directory"));
+    }
+    let file = fs::File::create(&dest).map_err(|e| format!("create {dest}: {e}"))?;
+    // The archive is created before the walk, so an archive written *into* the
+    // directory being archived would otherwise add itself — a zip containing a
+    // half-written copy of itself, growing as it goes. Callers put the archive
+    // beside the build, but this is cheap insurance against the day one
+    // doesn't.
+    let dest_canonical = fs::canonicalize(&dest).ok();
+    let mut zip = zip::ZipWriter::new(file);
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let mut written = 0u64;
+
+    for entry in walkdir::WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+        let path = entry.path();
+        let Ok(rel) = path.strip_prefix(root) else { continue };
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+        // Zip entries always use forward slashes, whatever the host OS does.
+        let name = rel.to_string_lossy().replace('\\', "/");
+        if entry.file_type().is_dir() {
+            zip.add_directory(format!("{name}/"), options)
+                .map_err(|e| e.to_string())?;
+            continue;
+        }
+        if dest_canonical.is_some() && fs::canonicalize(path).ok() == dest_canonical {
+            continue;
+        }
+        let bytes = fs::read(path).map_err(|e| format!("read {name}: {e}"))?;
+        zip.start_file(&name, options).map_err(|e| e.to_string())?;
+        zip.write_all(&bytes).map_err(|e| e.to_string())?;
+        written += bytes.len() as u64;
+    }
+    zip.finish().map_err(|e| e.to_string())?;
+    Ok(written)
 }
 
 /// Creates a directory (and any missing parents).
@@ -545,7 +629,8 @@ async fn fetch_sketchfab_text(url: String, token: Option<String>) -> Result<Stri
 
 #[cfg(test)]
 mod tests {
-    use super::percent_decode;
+    use super::{percent_decode, zip_dir};
+    use std::fs;
 
     #[test]
     fn decodes_paths_the_frontend_encodes() {
@@ -559,6 +644,42 @@ mod tests {
         assert_eq!(percent_decode("plain.png").unwrap(), "plain.png");
         assert!(percent_decode("truncated%2").is_err());
     }
+
+    /// itch.io serves whatever sits at the top of the uploaded archive. A zip
+    /// containing `MyGame/index.html` produces a blank page with no error, and
+    /// it is the single most common way an HTML5 upload fails — so the entries
+    /// must be relative to the directory, not include it.
+    #[test]
+    fn zips_with_the_build_at_the_archive_root() {
+        let base = std::env::temp_dir().join("three-engine-zip-test");
+        let _ = fs::remove_dir_all(&base);
+        let src = base.join("MyGame");
+        fs::create_dir_all(src.join("assets")).unwrap();
+        fs::write(src.join("index.html"), "<!doctype html>").unwrap();
+        fs::write(src.join("assets").join("a.png"), [1u8, 2, 3]).unwrap();
+        let dest = base.join("out.zip");
+
+        let written = zip_dir(
+            src.to_string_lossy().into_owned(),
+            dest.to_string_lossy().into_owned(),
+        )
+        .unwrap();
+        assert_eq!(written, 15 + 3);
+
+        let file = fs::File::open(&dest).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let names: Vec<String> = (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .collect();
+        assert!(names.contains(&"index.html".to_string()), "{names:?}");
+        assert!(names.contains(&"assets/a.png".to_string()), "{names:?}");
+        assert!(
+            !names.iter().any(|n| n.starts_with("MyGame")),
+            "the directory itself must not be in the archive: {names:?}"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -568,6 +689,8 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         // Live PTY sessions for the terminal panel, keyed by panel id.
         .manage(pty::PtyState::default())
+        // Loopback static servers for previewing exported builds.
+        .manage(preview::PreviewState::default())
         .invoke_handler(tauri::generate_handler![
             save_scene,
             load_scene,
@@ -582,6 +705,9 @@ pub fn run() {
             delete_path,
             import_files,
             export_game,
+            read_player_template,
+            zip_dir,
+            preview::serve_build,
             scaffold_three_types,
             write_binary_file,
             write_binary_file_raw,

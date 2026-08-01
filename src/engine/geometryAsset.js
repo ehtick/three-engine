@@ -182,6 +182,103 @@ function defaultTypeFor(key, values, vertexCount) {
 }
 
 /**
+ * Copies a BufferAttribute's values into a tightly packed typed array.
+ *
+ * glTF optimizers commonly interleave tangent/color/skin attributes.
+ * InterleavedBufferAttribute exposes its storage through `.data.array`, not
+ * `.array`, and its values are strided — reading the raw array would pick up
+ * neighbouring attributes' bytes.
+ *
+ * Values are copied verbatim. The previous writer rounded every component to
+ * six decimals, which existed purely to keep the JSON text smaller; the binary
+ * container has no such pressure, so imported meshes now keep the exact floats
+ * the artist exported.
+ */
+function attributeArray(attribute, ArrayType) {
+  const source = attribute.array ?? attribute.data?.array;
+  if (!source) throw new Error("Unsupported vertex attribute storage");
+  const { itemSize, count } = attribute;
+  const interleaved = !!attribute.isInterleavedBufferAttribute;
+  // Already exactly what we want: hand the buffer straight through.
+  if (!interleaved && source instanceof ArrayType && source.length === count * itemSize) {
+    return source;
+  }
+  const stride = interleaved ? attribute.data.stride : itemSize;
+  const offset = interleaved ? attribute.offset : 0;
+  const out = new ArrayType(count * itemSize);
+  for (let i = 0; i < count; i++) {
+    const from = i * stride + offset;
+    const to = i * itemSize;
+    for (let component = 0; component < itemSize; component++) {
+      out[to + component] = source[from + component];
+    }
+  }
+  return out;
+}
+
+/**
+ * Serializes a BufferGeometry to the `.geom` definition shape, losslessly —
+ * authored normals, every custom attribute, morph targets and material groups.
+ *
+ * Lives here rather than in the GLB importer (which is where it was born)
+ * because it is the inverse of `geometryFromAsset`, and anything that REWRITES
+ * a geometry asset needs it: the alternative round trip through the polygon
+ * kernel (`meshFromBufferGeometry`) is right for hand-edited meshes and lossy
+ * for imported ones — it welds vertices and knows nothing about tangents,
+ * vertex colours or skin weights.
+ */
+export function geometryAssetFromBufferGeometry(geometry) {
+  const position = geometry.getAttribute("position");
+  const normal = geometry.getAttribute("normal");
+  const uv = geometry.getAttribute("uv");
+  const vertexCount = position.count;
+  const IndexType = vertexCount > 65535 ? Uint32Array : Uint16Array;
+
+  let indices;
+  if (geometry.index) {
+    indices = attributeArray(geometry.index, IndexType);
+  } else {
+    // Non-indexed primitive: the .geom shape is always indexed, so emit the
+    // trivial 0..n-1 index run.
+    indices = new IndexType(vertexCount);
+    for (let i = 0; i < vertexCount; i++) indices[i] = i;
+  }
+
+  const attributeAsset = (attribute) => {
+    const source = attribute.array ?? attribute.data?.array;
+    if (!source) throw new Error("Unsupported vertex attribute storage");
+    const ArrayType = source.constructor;
+    return {
+      itemSize: attribute.itemSize,
+      normalized: !!attribute.normalized,
+      arrayType: ArrayType.name,
+      array: attributeArray(attribute, ArrayType),
+    };
+  };
+  const attributes = {};
+  for (const [name, attribute] of Object.entries(geometry.attributes)) {
+    if (name !== "position" && name !== "normal" && name !== "uv") {
+      attributes[name] = attributeAsset(attribute);
+    }
+  }
+  const morphAttributes = {};
+  for (const [name, targets] of Object.entries(geometry.morphAttributes)) {
+    morphAttributes[name] = targets.map(attributeAsset);
+  }
+  return {
+    version: GEOMETRY_BINARY_VERSION,
+    positions: attributeArray(position, Float32Array),
+    indices,
+    uvs: uv ? attributeArray(uv, Float32Array) : null,
+    normals: normal ? attributeArray(normal, Float32Array) : null,
+    attributes,
+    morphAttributes,
+    morphTargetsRelative: !!geometry.morphTargetsRelative,
+    groups: geometry.groups.map(({ start, count, materialIndex }) => ({ start, count, materialIndex })),
+  };
+}
+
+/**
  * Serializes a geometry definition (the plain shape `geometryFromAsset` reads)
  * into the v2 binary container. Accepts plain arrays or typed arrays for the
  * numeric fields; typed arrays are written without any per-element work, which

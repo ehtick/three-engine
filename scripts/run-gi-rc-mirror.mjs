@@ -3,10 +3,13 @@
 // sphere must show crisp red/green wall regions (left/right of its
 // silhouette) and the lamp glint; the rough sphere should be stable (no
 // banding) but softer. Samples pixel colors on both spheres.
+// Env: BVH=0 forces the SDF fallback path (globalThis.__giNoBvhReflections)
+// for GI Phase 3 v1's exact-reflection A/B — see run-gi-bvh-reflect.mjs.
 import puppeteer from "puppeteer-core";
 import sharp from "sharp";
 
 const url = process.argv[2] ?? "http://localhost:5201/";
+const NO_BVH = process.env.BVH === "0";
 const browser = await puppeteer.launch({
   executablePath: "C:/Program Files/Google/Chrome/Application/chrome.exe",
   headless: process.env.HEADED ? false : "new",
@@ -28,7 +31,8 @@ await page.evaluate(() => {
 });
 await new Promise((resolve) => setTimeout(resolve, 5000));
 
-await page.evaluate(async () => {
+await page.evaluate(async ({ NO_BVH }) => {
+  if (NO_BVH) globalThis.__giNoBvhReflections = true;
   const { THREE } = await import("/src/engine/index.js");
   await import("/src/modules/index.js");
   const { enableEngineModule } = await import("/src/engine/modules.js");
@@ -83,7 +87,7 @@ await page.evaluate(async () => {
   engine.camera.lookAt(0, 1.4, 0);
   engine.camera.updateMatrixWorld(true);
   console.log("GI-MR scene ready");
-});
+}, { NO_BVH });
 
 const settle = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const waitForWave = async (extra = 1500) => {
@@ -122,12 +126,14 @@ const points = await page.evaluate(() => {
     project(new THREE.Vector3(1.8, 0.7, 1.35), "roughRight"),
   ];
 });
-const shot = await page.screenshot({ path: "scripts/gi-diag-mirror.png" });
+const shotPath = `scripts/gi-diag-mirror${NO_BVH ? "-sdf" : ""}.png`;
+const shot = await page.screenshot({ path: shotPath });
 const { data, info } = await sharp(shot).raw().toBuffer({ resolveWithObject: true });
+console.log(`arm: ${NO_BVH ? "SDF (BVH=0)" : "BVH (default)"}`);
 for (const point of points) {
   const idx = (point.py * info.width + point.px) * info.channels;
   console.log(`${point.tag}: rgb(${data[idx]}, ${data[idx + 1]}, ${data[idx + 2]})`);
 }
-console.log("SHOT scripts/gi-diag-mirror.png");
+console.log(`SHOT ${shotPath}`);
 await browser.close();
 process.exit(0);

@@ -56,6 +56,17 @@ export class Entity {
     // array so it serialises directly and compares cheaply; the set semantics
     // (no duplicates) are enforced by addTag.
     this.tags = [];
+    // Survives a "single"-mode scene load (Unity's DontDestroyOnLoad). This
+    // is how a game manager, the audio listener, or the player character
+    // carries across a level transition. Only roots survive as-is; a
+    // persistent entity nested under a non-persistent one is re-rooted at
+    // unload time rather than dying with its parent. See sceneManager.js.
+    this.persistent = false;
+    // True while this entity is parked in an object pool: out of the scene,
+    // out of `engine.entities`, components disabled, but not destroyed. A
+    // script holding a reference across a despawn can check this rather than
+    // acting on an entity the world no longer contains. See pool.js.
+    this.pooled = false;
   }
 
   // ---- Tags --------------------------------------------------------------
@@ -298,6 +309,18 @@ export class Entity {
     if (next === this.enabledInEditor) return;
     this.enabledInEditor = next;
     this.engine.emit("hierarchy-changed");
+  }
+
+  /**
+   * Marks the entity (and its subtree) as surviving scene loads. Serialised,
+   * so an author can tick it in the inspector on the scene's manager object
+   * instead of writing a script that calls it in `onStart`.
+   */
+  setPersistent(value) {
+    const next = !!value;
+    if (next === this.persistent) return;
+    this.persistent = next;
+    this.engine?.emit?.("hierarchy-changed");
   }
 
   /** Sets the "enabled in game" flag (mirrors setEnabledInEditor). */

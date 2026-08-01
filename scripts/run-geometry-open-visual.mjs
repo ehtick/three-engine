@@ -365,23 +365,31 @@ for (const subject of subjects.filter((s) => !only || only.some((n) => s.name.to
       pinnedVisible: !!document.querySelector(".geometry-editor-toolbar-pinned .geometry-topology-count"),
     };
   });
-  // A dropdown inside a scrolling box gets clipped unless it is positioned as
-  // fixed; open one and confirm it is whole and on screen.
+  // A dropdown inside a scrolling box gets clipped unless it escapes the box;
+  // open one and confirm it is whole, on screen, and under its own button.
+  // Clicked, not driven from script: the menus are React state now, and
+  // poking the DOM would prove nothing about what a user gets.
+  const firstMenu = await page.$(".geometry-toolbar-menu-summary");
+  await firstMenu?.click();
+  await settle(250);
   const menu = await page.evaluate(() => {
-    const details = document.querySelector(".geometry-toolbar-menu");
-    if (!details) return { error: "no menu" };
-    details.open = true;
-    details.dispatchEvent(new Event("toggle"));
-    const popover = details.querySelector(".geometry-toolbar-popover");
+    const summary = document.querySelector(".geometry-toolbar-menu-summary");
+    const popover = document.querySelector(".geometry-toolbar-popover");
+    if (!summary || !popover) return { error: "no menu" };
     const rect = popover.getBoundingClientRect();
-    const summary = details.querySelector("summary").getBoundingClientRect();
-    details.open = false;
+    const anchor = summary.getBoundingClientRect();
     return {
       height: Math.round(rect.height),
       onScreen: rect.left >= 0 && rect.top >= 0 && rect.right <= window.innerWidth && rect.bottom <= window.innerHeight,
-      belowButton: rect.top >= summary.bottom - 1,
+      belowButton: rect.top >= anchor.bottom - 1,
+      // The bug this harness now guards: a `backdrop-filter` on the header
+      // makes it the containing block for a fixed child, so a popover that is
+      // not portalled lands hundreds of pixels away from its own button.
+      anchored: Math.abs(rect.left - anchor.left) <= 1,
     };
   });
+  await firstMenu?.click();
+  await settle(150);
   if (process.env.SHOTS) {
     // Scrolled and CLICKED, not toggled from script: the point is that a menu
     // opened by hand out of a scrolled header lands somewhere usable.
@@ -389,10 +397,10 @@ for (const subject of subjects.filter((s) => !only || only.some((n) => s.name.to
     await settle(500);
     const summary = await page.evaluate(() => {
       const scroll = document.querySelector(".geometry-editor-toolbar-scroll").getBoundingClientRect();
-      for (const details of document.querySelectorAll(".geometry-toolbar-menu")) {
-        const rect = details.querySelector("summary").getBoundingClientRect();
+      for (const button of document.querySelectorAll(".geometry-toolbar-menu-summary")) {
+        const rect = button.getBoundingClientRect();
         if (rect.left >= scroll.left && rect.right <= scroll.right) {
-          return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, label: details.querySelector("summary").textContent };
+          return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, label: button.textContent };
         }
       }
       return null;
@@ -407,10 +415,10 @@ for (const subject of subjects.filter((s) => !only || only.some((n) => s.name.to
     }
   }
   const headerOk = !header.error && header.rows === 1 && header.pinnedVisible
-    && !menu.error && menu.height > 20 && menu.onScreen && menu.belowButton;
+    && !menu.error && menu.height > 20 && menu.onScreen && menu.belowButton && menu.anchored;
   if (!headerOk) failures++;
   console.log(`    header      : ${header.rows} row(s), ${header.height}px tall, ${header.overflow}px scrollable,`
-    + ` pinned=${header.pinnedVisible} | menu ${menu.height}px onScreen=${menu.onScreen} below=${menu.belowButton}`
+    + ` pinned=${header.pinnedVisible} | menu ${menu.height}px onScreen=${menu.onScreen} below=${menu.belowButton} anchored=${menu.anchored}`
     + ` ${headerOk ? "" : "  <-- BROKEN"}`);
   await page.setViewport({ width: 1280, height: 820, deviceScaleFactor: 1 });
   await settle(600);

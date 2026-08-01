@@ -14,7 +14,7 @@
 //                     gba = normal·0.5+0.5; written by the composite pass,
 //                     sampled with HARDWARE TRILINEAR by the traces.
 import * as THREE from "three/webgpu";
-import { Break, Discard, Fn, If, Loop, cameraPosition, float, floor, instanceIndex, instancedArray, ivec3, mod, positionWorld, step, texture3D, textureStore, uniform, vec3, vec4 } from "three/tsl";
+import { Break, Discard, Fn, If, Loop, cameraPosition, float, floor, instanceIndex, instancedArray, ivec3, mod, positionWorld, select, step, texture3D, textureStore, uniform, vec3, vec4 } from "three/tsl";
 import { SDF_CAP, bakeMeshSdf } from "./bakeCore.js";
 import { sharedFn } from "./giFn.js";
 import { createTrilinearRadianceSampler } from "./voxelizeOnce.js";
@@ -63,9 +63,9 @@ export function createSdfBaker() {
   };
 
   return {
-    request(record) {
+    request(record, maxAxisRes = undefined) {
       if (!ensureWorker()) {
-        return Promise.resolve(bakeMeshSdf(record.positions, record.index));
+        return Promise.resolve(bakeMeshSdf(record.positions, record.index, maxAxisRes || undefined));
       }
       return new Promise((resolve, reject) => {
         requestId++;
@@ -73,6 +73,7 @@ export function createSdfBaker() {
         worker.postMessage({
           type: "meshSdf",
           requestId,
+          maxAxisRes: maxAxisRes || 0,
           geometryKey: record.geometryKey ?? `sdf:${requestId}`,
           geometry: { positions: record.positions, index: record.index },
         });
@@ -120,6 +121,11 @@ export function createSdfScene(bounds, res, atlas) {
     minCell: uniform(minCell),
     cellMax: uniform(Math.max(cell.x, cell.y, cell.z)),
     capWorld: uniform(capWorld),
+    // Composite dirty-brick bounds — permissive defaults mean any composite
+    // that doesn't set them recomputes everything (always correct, never
+    // stale).
+    dirtyMin: uniform(new THREE.Vector3(-1e9, -1e9, -1e9)),
+    dirtyMax: uniform(new THREE.Vector3(1e9, 1e9, 1e9)),
   };
   // Occupancy: cell centers within ~half a cell diagonal of a surface. Too
   // tight → thin slabs get single-sided shells (their one cell carries the
@@ -142,7 +148,13 @@ export function createSdfScene(bounds, res, atlas) {
 
   const distanceTexture = new THREE.Storage3DTexture(res.x, res.y, res.z);
   distanceTexture.format = THREE.RGBAFormat;
-  distanceTexture.type = THREE.UnsignedByteType;
+  // HALF FLOAT, not u8: the shadow trace turns distance error into penumbra
+  // error amplified by k/t, so 8-bit distance (capWorld/255 ≈ millimetres)
+  // painted visible marble/terrace bands into every soft shadow ("dirty
+  // shadows"). fp16 is densest near zero — exactly where the shadow math
+  // lives — and rgba16float is base-WebGPU storage-capable AND filterable.
+  // ~2× texture memory (a few MB) for quantization-free traces.
+  distanceTexture.type = THREE.HalfFloatType;
   distanceTexture.minFilter = THREE.LinearFilter;
   distanceTexture.magFilter = THREE.LinearFilter;
 
@@ -160,58 +172,67 @@ export function createSdfScene(bounds, res, atlas) {
       iz.add(0.5).mul(world.cell.z).add(world.min.z),
     ).toVar();
 
-    const minD = float(world.capWorld).toVar();
-    const best = float(-1).toVar();
-    Loop({ start: 0, end: atlas.capacity, name: "slot" }, ({ slot }) => {
-      const bmin = atlas.aabbMin.element(slot).toVar();
-      If(bmin.w.greaterThan(0.5), () => {
-        const bmax = atlas.aabbMax.element(slot);
-        const inside = p.x.greaterThan(bmin.x)
-          .and(p.y.greaterThan(bmin.y))
-          .and(p.z.greaterThan(bmin.z))
-          .and(p.x.lessThan(bmax.x))
-          .and(p.y.lessThan(bmax.y))
-          .and(p.z.lessThan(bmax.z));
-        If(inside, () => {
-          const d = atlas.sampleSlot(slot, p).toVar();
-          If(d.lessThan(minD), () => {
-            minD.assign(d);
-            best.assign(slot.toFloat());
+    const inDirty = p.x.greaterThanEqual(world.dirtyMin.x)
+      .and(p.y.greaterThanEqual(world.dirtyMin.y))
+      .and(p.z.greaterThanEqual(world.dirtyMin.z))
+      .and(p.x.lessThanEqual(world.dirtyMax.x))
+      .and(p.y.lessThanEqual(world.dirtyMax.y))
+      .and(p.z.lessThanEqual(world.dirtyMax.z));
+
+    If(inDirty, () => {
+      const minD = float(world.capWorld).toVar();
+      const best = float(-1).toVar();
+      Loop({ start: 0, end: atlas.capacity, name: "slot" }, ({ slot }) => {
+        const bmin = atlas.aabbMin.element(slot).toVar();
+        If(bmin.w.greaterThan(0.5), () => {
+          const bmax = atlas.aabbMax.element(slot);
+          const inside = p.x.greaterThan(bmin.x)
+            .and(p.y.greaterThan(bmin.y))
+            .and(p.z.greaterThan(bmin.z))
+            .and(p.x.lessThan(bmax.x))
+            .and(p.y.lessThan(bmax.y))
+            .and(p.z.lessThan(bmax.z));
+          If(inside, () => {
+            const d = atlas.sampleSlot(slot, p).toVar();
+            If(d.lessThan(minD), () => {
+              minD.assign(d);
+              best.assign(slot.toFloat());
+            });
           });
         });
       });
-    });
 
-    const occupied = step(minD, occThreshold).toVar();
-    const albedo = vec3(0).toVar();
-    const emissive = vec3(0).toVar();
-    const normal = vec3(0, 1, 0).toVar();
-    If(best.greaterThanEqual(0), () => {
-      const s = best.toInt();
-      albedo.assign(atlas.albedo.element(s).xyz);
-      emissive.assign(atlas.emissive.element(s).xyz);
-      // SDF-gradient normal of the winning slot (6 taps) — only where the
-      // cell is occupied; empty cells never feed the bounce gather.
-      If(occupied.greaterThan(0.5), () => {
-        const h = world.minCell.mul(0.5);
-        const gx = atlas.sampleSlot(s, p.add(vec3(h, 0, 0))).sub(atlas.sampleSlot(s, p.sub(vec3(h, 0, 0))));
-        const gy = atlas.sampleSlot(s, p.add(vec3(0, h, 0))).sub(atlas.sampleSlot(s, p.sub(vec3(0, h, 0))));
-        const gz = atlas.sampleSlot(s, p.add(vec3(0, 0, h))).sub(atlas.sampleSlot(s, p.sub(vec3(0, 0, h))));
-        const g = vec3(gx, gy, gz).toVar();
-        If(g.length().greaterThan(1e-5), () => {
-          normal.assign(g.normalize());
+      const occupied = step(minD, occThreshold).toVar();
+      const albedo = vec3(0).toVar();
+      const emissive = vec3(0).toVar();
+      const normal = vec3(0, 1, 0).toVar();
+      If(best.greaterThanEqual(0), () => {
+        const s = best.toInt();
+        albedo.assign(atlas.albedo.element(s).xyz);
+        emissive.assign(atlas.emissive.element(s).xyz);
+        // SDF-gradient normal of the winning slot (6 taps) — only where the
+        // cell is occupied; empty cells never feed the bounce gather.
+        If(occupied.greaterThan(0.5), () => {
+          const h = world.minCell.mul(0.5);
+          const gx = atlas.sampleSlot(s, p.add(vec3(h, 0, 0))).sub(atlas.sampleSlot(s, p.sub(vec3(h, 0, 0))));
+          const gy = atlas.sampleSlot(s, p.add(vec3(0, h, 0))).sub(atlas.sampleSlot(s, p.sub(vec3(0, h, 0))));
+          const gz = atlas.sampleSlot(s, p.add(vec3(0, 0, h))).sub(atlas.sampleSlot(s, p.sub(vec3(0, 0, h))));
+          const g = vec3(gx, gy, gz).toVar();
+          If(g.length().greaterThan(1e-5), () => {
+            normal.assign(g.normalize());
+          });
         });
       });
-    });
 
-    stagingBuffer.element(instanceIndex).assign(vec4(emissive.mul(occupied), occupied));
-    surfaceBuffer.element(instanceIndex).assign(vec4(albedo, occupied));
-    normalBuffer.element(instanceIndex).assign(vec4(normal, 0));
-    textureStore(
-      distanceTexture,
-      ivec3(ix.toInt(), iy.toInt(), iz.toInt()),
-      vec4(minD.div(world.capWorld).clamp(0, 1), normal.mul(0.5).add(0.5)),
-    );
+      stagingBuffer.element(instanceIndex).assign(vec4(emissive.mul(occupied), occupied));
+      surfaceBuffer.element(instanceIndex).assign(vec4(albedo, occupied));
+      normalBuffer.element(instanceIndex).assign(vec4(normal, 0));
+      textureStore(
+        distanceTexture,
+        ivec3(ix.toInt(), iy.toInt(), iz.toInt()),
+        vec4(minD.div(world.capWorld).clamp(0, 1), normal.mul(0.5).add(0.5)),
+      );
+    });
   })().compute(cellCount);
 
   return {
@@ -367,6 +388,12 @@ function createShadowTrace(distanceTexture, world, res, lift, atlas, steps = 56,
   // the dominant cost of the seconds-long compile waves on init/rebuild.
   // excludeRadius < 0 disables the light-source self-exclusion (the length
   // test is then trivially true).
+  // excludeHalf.x >= 0 switches the exclusion region from the sphere to an
+  // ORIENTED BOX (the lamp's OBB dilated by excludeRadius). A big panel
+  // lamp's bounding SPHERE swallowed every wall within ~1.5× its radius —
+  // those walls stopped occluding, pouring a circular spot of light through
+  // ceilings into the room above, and the sphere's boundary painted a
+  // visible ring into the lamp's own pool ("dirty shadows").
   const traceFn = sharedFn({
     name,
     type: "float",
@@ -378,8 +405,12 @@ function createShadowTrace(distanceTexture, world, res, lift, atlas, steps = 56,
       { name: "cosRayNormal", type: "float" },
       { name: "excludeCenter", type: "vec3" },
       { name: "excludeRadius", type: "float" },
+      { name: "excludeHalf", type: "vec3" },
+      { name: "excludeBx", type: "vec3" },
+      { name: "excludeBy", type: "vec3" },
+      { name: "excludeBz", type: "vec3" },
     ],
-    body: (origin, dir, maxT, k, cosRayNormal, excludeCenter, excludeRadius) => {
+    body: (origin, dir, maxT, k, cosRayNormal, excludeCenter, excludeRadius, excludeHalf, excludeBx, excludeBy, excludeBz) => {
       // HOIST all uniform-derived scalars into locals BEFORE the loop. The
       // D3D shader compiler is drastically slower optimizing a long sphere-
       // trace loop whose operands are uniform-buffer loads than one reading
@@ -431,14 +462,6 @@ function createShadowTrace(distanceTexture, world, res, lift, atlas, steps = 56,
           Break();
         });
         const p = origin.add(dir.mul(t)).toVar();
-        // LIGHT-SOURCE SELF-EXCLUSION: samples inside the emitter's own
-        // neighborhood are the lamp's body/field — a ray aimed AT the light
-        // must not be occluded by the light itself. Without this, rays
-        // skimming the emitter's SDF near arrival painted its bounding-box
-        // shadow onto every receiver ("+"-shaped dark bands under disc
-        // lamps). A real blocker this close to the lamp is an accepted miss.
-        // (excludeRadius < 0 → the test is always true: no exclusion.)
-        const outsideLight = p.sub(excludeCenter).length().greaterThan(excludeRadius);
         const uvw = p.sub(minV).mul(sizeInvV).toVar();
         If(
           uvw.x.lessThan(0)
@@ -457,6 +480,34 @@ function createShadowTrace(distanceTexture, world, res, lift, atlas, steps = 56,
         // Detail slots: crisp local fields min()ed in near dense/important
         // meshes — sub-scene-cell silhouettes (thin wings, fine props).
         dRaw.assign(atlas.refineDetail(dRaw, p));
+        // LIGHT-SOURCE SELF-EXCLUSION: a ray aimed AT the light must not be
+        // occluded by the light's own body/field shell. Without this, rays
+        // skimming the emitter's SDF near arrival painted its bounding-box
+        // shadow onto every receiver ("+"-shaped dark bands under disc
+        // lamps).
+        // SPHERE lamps: legacy region test — samples within excludeRadius
+        // (1.5R + margin) never occlude; the 0.5R shell left outside keeps
+        // min(k·d/t) ≥ ~1 for the lamp's own field, so it can't self-shadow.
+        // (excludeRadius < 0 → always true: no exclusion.)
+        // BOX lamps (excludeHalf.x ≥ 0): COMPARATIVE test — the sample may
+        // occlude only when the field reads DECISIVELY closer than the
+        // lamp's own analytic SDF explains. A region the size of a big
+        // panel's bounding sphere swallowed nearby ceilings (light poured
+        // through into the room above as a circle) and its boundary ringed
+        // the pool with dirt; a small fixed region instead lets the lamp's
+        // own shell darken its light (min(k·d/t) with d capped at the
+        // dilation ≈ heavy false self-shadow on any large lamp). Comparing
+        // against the exact lamp SDF excludes exactly the lamp, at any
+        // size — a wall two cells from the face still seals.
+        const relEx = p.sub(excludeCenter).toVar();
+        const localEx = vec3(relEx.dot(excludeBx), relEx.dot(excludeBy), relEx.dot(excludeBz));
+        const lampDist = localEx.abs().sub(excludeHalf).max(vec3(0)).length().toVar();
+        const slack = minCellV.mul(1.5).max(lampDist.mul(0.25));
+        const outsideLight = select(
+          excludeHalf.x.greaterThanEqual(0),
+          dRaw.lessThan(lampDist.sub(slack)),
+          relEx.length().greaterThan(excludeRadius),
+        );
         const planeHeight = liftV.add(t.mul(cosRayNormal));
         // A sample only counts as an occluder if it is BOTH under the
         // receiver-plane exclusion threshold AND not SATURATED at the field
@@ -525,7 +576,7 @@ function createShadowTrace(distanceTexture, world, res, lift, atlas, steps = 56,
     },
   });
 
-  return (origin, dir, maxT, k, cosRayNormal, excludeCenter = null, excludeRadius = null) =>
+  return (origin, dir, maxT, k, cosRayNormal, excludeCenter = null, excludeRadius = null, excludeBox = null) =>
     traceFn(
       vec3(origin),
       vec3(dir),
@@ -534,6 +585,11 @@ function createShadowTrace(distanceTexture, world, res, lift, atlas, steps = 56,
       float(cosRayNormal),
       excludeCenter ? vec3(excludeCenter) : vec3(0, 0, 0),
       excludeRadius ? float(excludeRadius) : float(-1),
+      // excludeBox = { half, bx, by, bz } node bundle; x < 0 → sphere mode.
+      excludeBox ? vec3(excludeBox.half) : vec3(-1, -1, -1),
+      excludeBox ? vec3(excludeBox.bx) : vec3(1, 0, 0),
+      excludeBox ? vec3(excludeBox.by) : vec3(0, 1, 0),
+      excludeBox ? vec3(excludeBox.bz) : vec3(0, 0, 1),
     );
 }
 

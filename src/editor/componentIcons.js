@@ -2,24 +2,34 @@ import {
   Activity,
   Bone,
   Box,
+  Boxes,
   Camera,
   CircleDot,
+  Clapperboard,
   Cloud,
   Cpu,
   FileCode2,
+  Film,
   Footprints,
   Image,
   Layers,
+  Layers3,
+  Images,
+  Link,
   LayoutGrid,
   Lightbulb,
+  Milestone,
   Mountain,
   MousePointerClick,
   Move3d,
+  Route,
   Package,
   Radio,
   ScrollText,
   Shapes,
   Sparkles,
+  Spline,
+  Stamp,
   SquareDashed,
   SquareStack,
   Sun,
@@ -27,6 +37,8 @@ import {
   Volume2,
   Wand2,
   Waves,
+  Waypoints,
+  Wind,
 } from "lucide-react";
 
 /**
@@ -40,7 +52,7 @@ import {
  *
  * Colours are grouped by family rather than assigned per type, so the palette
  * stays legible: rendering = blue, lighting = amber, physics = green,
- * logic/scripting = purple, audio = pink, UI = teal.
+ * logic/scripting = purple, audio = pink, UI = teal, AI/navigation = orange.
  */
 const RENDER = "#4da3ff";
 const LIGHT = "#f5c451";
@@ -48,6 +60,9 @@ const PHYSICS = "#4fd475";
 const LOGIC = "#b784f5";
 const AUDIO = "#ff7ac6";
 const UI = "#3fd0c9";
+// AI/navigation gets its own hue: a nav agent is neither physics nor logic,
+// and colouring it as either makes the Add Component menu harder to scan.
+const AI = "#ff9f45";
 const WORLD = "#8ea0b5";
 
 const ICONS = {
@@ -57,13 +72,24 @@ const ICONS = {
   objModel: [Package, RENDER],
   instancer: [SquareStack, RENDER],
   geometryModifiers: [Shapes, RENDER],
+  lod: [Layers3, RENDER],
+  impostor: [Images, RENDER],
   camera: [Camera, RENDER],
+  vcam: [Clapperboard, RENDER],
+  impulsesource: [Waves, RENDER],
   postprocess: [Sparkles, RENDER],
   particles: [Wand2, RENDER],
+  line: [Spline, RENDER],
+  trail: [Wind, RENDER],
+  decal: [Stamp, RENDER],
 
   light: [Lightbulb, LIGHT],
   environment: [Cloud, LIGHT],
   "global-illumination": [Sun, LIGHT],
+
+  navmesh: [Waypoints, AI],
+  navagent: [Footprints, AI],
+  navlink: [Link, AI],
 
   rigidbody: [Move3d, PHYSICS],
   collider: [SquareDashed, PHYSICS],
@@ -71,6 +97,9 @@ const ICONS = {
 
   script: [FileCode2, LOGIC],
   animation: [Activity, LOGIC],
+  timeline: [Film, LOGIC],
+  ik: [Footprints, LOGIC],
+  pool: [Boxes, LOGIC],
   bone: [Bone, LOGIC],
 
   sound: [Volume2, AUDIO],
@@ -87,6 +116,9 @@ const ICONS = {
 
   terrain: [Mountain, WORLD],
   water: [Waves, WORLD],
+  spline: [Spline, WORLD],
+  splineFollower: [Route, WORLD],
+  splineMesh: [Milestone, WORLD],
 };
 
 /** `{ Icon, color }` for a component type; a neutral chip for unknown ones. */
@@ -101,14 +133,15 @@ export function componentIcon(type) {
  * doesn't get a curated home until someone adds one.
  */
 export const COMPONENT_GROUPS = [
-  { label: "Rendering", types: ["mesh", "model", "skinnedmesh", "objModel", "instancer", "geometryModifiers", "particles"] },
+  { label: "Rendering", types: ["mesh", "model", "skinnedmesh", "objModel", "instancer", "geometryModifiers", "lod", "impostor"] },
+  { label: "Effects", types: ["particles", "line", "trail", "decal"] },
   { label: "Camera", types: ["camera", "postprocess"] },
   { label: "Lighting", types: ["light", "environment", "global-illumination"] },
   { label: "Physics", types: ["rigidbody", "collider", "charactercontroller"] },
-  { label: "Logic", types: ["script", "animation", "bone"] },
+  { label: "Logic", types: ["script", "animation", "bone", "pool"] },
   { label: "Audio", types: ["sound", "listener"] },
   { label: "UI", types: ["uiscreen", "uielement", "uiimage", "uitext", "uibutton", "uilayout", "uiscroll", "uimask"] },
-  { label: "World", types: ["terrain", "water"] },
+  { label: "World", types: ["terrain", "water", "spline", "splineMesh", "splineFollower"] },
 ];
 
 /**

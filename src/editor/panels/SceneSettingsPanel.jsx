@@ -354,6 +354,22 @@ export function SceneSettingsPanel() {
             onCommit={(v) => commitPerf({ volumeStepScale: v }, "Change volume quality")}
           />
         </Row>
+        <Row label="Occlusion culling">
+          <input
+            type="checkbox"
+            checked={perf.occlusionCulling === true}
+            onChange={(e) =>
+              commitPerf({ occlusionCulling: e.target.checked }, "Toggle occlusion culling")
+            }
+          />
+        </Row>
+        <div className="asset-hint" style={{ padding: "0 4px 6px" }}>
+          Hides objects the depth buffer says are behind something else. It costs a
+          low-resolution depth pass over the scene's big geometry every frame, so it is a
+          win indoors and in dense cities, and a small loss in an open landscape with
+          nothing to hide behind. Watch Draw calls in the viewport stats while you toggle
+          it — that is the number it is trying to move.
+        </div>
       </div>
 
       <div className="inspector-section">

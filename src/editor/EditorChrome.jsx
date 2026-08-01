@@ -20,10 +20,10 @@ import { useSceneStore } from "./store/sceneStore.js";
 import { useSelectionStore } from "./store/selectionStore.js";
 import { useProjectStore } from "./store/projectStore.js";
 import { engine, ensureEngine } from "./engineInstance.js";
-import { toggle as togglePlay } from "./playMode.js";
+import { toggle as togglePlay, togglePaused, stepFrame } from "./playMode.js";
 import { commandBus } from "./commands/CommandBus.js";
 import { getProjectSettings, applyProjectSettings } from "./projectSettings.js";
-import { isGraphHovered } from "./nodegraph/graphContext.js";
+import { isGraphHovered, isPointerInside } from "./nodegraph/graphContext.js";
 import { dispatchVisibilityKeyAction } from "./keybindings.js";
 import { dispatchTerrainKeyAction } from "./terrainBrush.js";
 import { useGeometryEditStore } from "./store/geometryEditStore.js";
@@ -121,7 +121,20 @@ export function EditorChrome() {
       }
       if (ctrl && e.key.toLowerCase() === "p") {
         e.preventDefault();
-        togglePlay();
+        // Shift pauses game time instead of leaving Play — the scene stays as
+        // the game left it, and the viewport keeps rendering it.
+        if (e.shiftKey) togglePaused();
+        else togglePlay();
+        return;
+      }
+      if (ctrl && e.key === ".") {
+        e.preventDefault();
+        stepFrame();
+        return;
+      }
+      if (ctrl && !e.shiftKey && e.key.toLowerCase() === "b") {
+        e.preventDefault();
+        import("./exportGame.js").then((m) => m.exportGame());
         return;
       }
       if (ctrl && e.shiftKey && e.key.toLowerCase() === "w") {
@@ -138,6 +151,13 @@ export function EditorChrome() {
       // but SVG edges/nodes don't always move `document.activeElement`, so
       // hover state is the reliable signal that a graph "owns" the keypress.
       if (e.target.closest?.(".react-flow") || isGraphHovered()) return;
+      // The timeline's dope sheet owns Delete / Ctrl+Z / Space / arrows over its
+      // own surface. Hover, not focus: clicking a keyframe diamond does not move
+      // `document.activeElement`, exactly like the graph editors' SVG edges.
+      if (e.target.closest?.(".timeline-panel")) return;
+      for (const el of document.querySelectorAll(".timeline-panel")) {
+        if (isPointerInside(el)) return;
+      }
 
       const selection = useSelectionStore.getState().ids;
       if (e.shiftKey && !ctrl && !e.altKey && e.key.toLowerCase() === "d") {

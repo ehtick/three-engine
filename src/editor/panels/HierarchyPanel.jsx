@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Plus, Trash2, Box, Video, Lightbulb, Sparkles, FileCode2, Package, Circle, ChevronRight, Monitor, Type, Image as ImageIcon, MousePointerClick, Rows3, ScrollText, Square, Eye, EyeOff, Play, Pause, Mountain, Search, X } from "lucide-react";
+import { Plus, Trash2, Box, Video, Lightbulb, Sparkles, FileCode2, Package, Circle, ChevronRight, Monitor, Type, Image as ImageIcon, MousePointerClick, Rows3, ScrollText, Square, Eye, EyeOff, Play, Pause, Mountain, Spline, Search, X } from "lucide-react";
 import { useSceneStore } from "../store/sceneStore.js";
 import { useSelectionStore } from "../store/selectionStore.js";
 import { useModulesStore } from "../modules.js";
@@ -15,6 +15,12 @@ import {
   topMostIds,
 } from "../commands/entityCommands.js";
 import { AddComponentCommand, SetComponentPropCommand } from "../commands/componentCommands.js";
+import {
+  APPLY_MODES,
+  APPLY_MODE_LABELS,
+  applyTransformStatus,
+  applyTransformToGeometry,
+} from "../applyTransform.js";
 import {
   copyEntities,
   cutEntities,
@@ -83,6 +89,10 @@ const COMMON_PRESETS = [
   // remember which component makes it emit" — an emitter is a thing you place,
   // not a behaviour you bolt on. The component's own defaults drive the graph.
   { label: "Particles", Icon: Sparkles, color: "#b784f5", spec: { name: "Particles", components: [{ type: "particles", props: {} }] } },
+  // A path is a placeable object, not a behaviour bolted onto an empty — the
+  // same argument as Particles. Roads, patrol routes and camera rails all
+  // start here and differ only in what you point at it afterwards.
+  { label: "Path", Icon: Spline, color: "#8ea0b5", spec: { name: "Path", components: [{ type: "spline", props: {} }] } },
 ];
 
 // Terrain lives in the optional `terrain` module — only offered in the Add
@@ -284,7 +294,13 @@ function EntityIcon({ components }) {
       ? { Icon: Lightbulb, color: "icon-light" }
       : components.particles
         ? { Icon: Sparkles, color: "icon-particles" }
-        : components.terrain
+        : components.spline
+          ? // Before `mesh`, because a road carries both a path and the mesh
+            // swept from it and the path is what the entity IS. The accent is
+            // the same green the curve is drawn in, so the hierarchy row and
+            // the thing in the viewport are recognisably one object.
+            { Icon: Spline, color: "icon-path" }
+          : components.terrain
           ? { Icon: Mountain, color: "icon-model" }
           : components.mesh
           ? { Icon: Box, color: "icon-mesh" }
@@ -805,6 +821,37 @@ function EntityRow({
  * the row is a prefab instance (apply / revert / unpack / open) or a plain
  * entity (create a prefab out of it).
  */
+/**
+ * Blender's Object → Apply submenu, flattened (this menu has no submenus).
+ *
+ * Only offered on a row that has geometry to bake into — on anything else the
+ * five entries would be five greyed-out lines of noise in the menu everyone
+ * uses for Duplicate and Delete.
+ */
+function applyTransformMenuItems(single) {
+  if (!single) return [];
+  const status = applyTransformStatus(single);
+  if (!status.ok) return [];
+  return [
+    { separator: true },
+    { header: "Apply Transform" },
+    ...APPLY_MODES.map((mode) => ({
+      label: APPLY_MODE_LABELS[mode],
+      // The fork is the part a user needs warning about, because it creates a
+      // file and quietly stops sharing one.
+      hint: status.fork ? "saves a new .geom" : undefined,
+      action: async () => {
+        const result = await applyTransformToGeometry(single, mode);
+        // Success and refusal both end up in the console: the hierarchy has no
+        // status line, and silently doing nothing is the worst outcome for an
+        // operation whose whole point is that the numbers change.
+        if (result.ok) console.log(result.message);
+        else console.warn(`Apply Transform: ${result.message}`);
+      },
+    })),
+  ];
+}
+
 function prefabMenuItems(single) {
   if (!single) return [];
   const live = engine.getEntity(single);
@@ -868,6 +915,7 @@ function ContextMenu({ menu, close, setRenamingId, onCreate, onNewScene, terrain
         { label: "Duplicate", shortcut: "Ctrl+D", action: duplicateSelection },
         { label: "Group Selection", shortcut: "Ctrl+G", disabled: selection.length < 2, action: groupSelection },
         { label: "Rename", disabled: !single, action: () => setRenamingId(single) },
+        ...applyTransformMenuItems(single),
         ...prefabMenuItems(single),
         { separator: true },
         { label: "Delete", shortcut: "Del", danger: true, action: deleteSelection },

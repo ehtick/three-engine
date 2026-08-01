@@ -79,13 +79,36 @@ real failure. Everything else is generated from the registry:
 
 | Group | Tools |
 |---|---|
+| **Sight** | `viewport_screenshot` `viewport_getCamera` `viewport_setCamera` `viewport_focus` `entity_getBounds` `console_read` |
+| **Batching** | `batch` |
 | Entities | `entity_list` `entity_get` `entity_create` `entity_delete` `entity_rename` `entity_reparent` `entity_duplicate` `entity_setTransform` `entity_setTags` |
 | Components | `component_types` `component_add` `component_remove` `component_setProp` |
+| Materials | `material_create` `material_get` `material_set` |
+| Prefabs | `prefab_list` `prefab_instantiate` `prefab_createFromEntity` |
 | Selection | `selection_get` `selection_set` `selection_selectAssets` |
 | History | `history_get` `history_undo` `history_redo` |
 | Play mode | `play_get` `play_set` |
-| Scene / project | `scene_get` `scene_save` `scene_open` `project_get` |
-| Assets | `asset_list` `asset_read` `asset_write` `asset_createScript` `asset_openInIDE` `asset_reveal` |
+| Scene / project | `scene_get` `scene_save` `scene_open` `scene_getSettings` `scene_setSettings` `project_get` |
+| Assets | `asset_list` `asset_read` `asset_write` `asset_import` `asset_createScript` `asset_openInIDE` `asset_reveal` |
+| Modules | `module_list` `module_setEnabled` |
+
+### The two that change how you work
+
+**`viewport_screenshot` returns a real image.** Without it an assistant builds
+3D scenes blind — it can read transforms but cannot tell that a wall is inside
+another wall, that a light is buried in geometry, or that a material came out
+black. Take one after anything visual, and use `viewport_focus` /
+`viewport_setCamera` to aim first. `entity_getBounds` is its companion: sizes
+are not inferable from transforms, because a mesh's real extent depends on its
+geometry as well as its scale.
+
+**`batch` runs many ops as one undo step.** Building a room is a dozen calls;
+one at a time that is a dozen round trips and a dozen separate entries on the
+undo stack, so a user who dislikes the result has to press Ctrl+Z twelve times
+and guess when to stop. Inside a batch, `"$0"` in a later step's arguments
+resolves to the id returned by step 0 — that is how you attach a component to an
+entity you just created. It is not atomic: if step 7 fails, steps 1–6 happened,
+and the response says exactly which — but one undo still removes all of them.
 
 MCP forbids dots in tool names, so `entity.create` is advertised as
 `entity_create`; the server maps it back.
@@ -117,11 +140,13 @@ are not using it.
 ## Testing
 
 ```sh
-npm run test:mcp        # server + protocol, against a fake editor — no browser
-npm run smoke:mcp       # end-to-end: real server, real editor, real scene edits
-npm run smoke:mcp-ui    # the Assistant panel, DOM-only (incl. survives-a-reload)
-npm run smoke:terminal  # the terminal panel's frontend, against a shimmed PTY
-npm run test:rust       # the Rust half: a real PTY, and CLI resolution
+npm run test:mcp         # server + protocol, against a fake editor — no browser
+npm run smoke:mcp        # end-to-end: real server, real editor, real scene edits
+npm run smoke:editor-api # the ops themselves, incl. screenshot + batch (HEADED)
+npm run smoke:authoring  # materials, scene look, prefabs, import, modules
+npm run smoke:mcp-ui     # the Assistant panel, DOM-only (incl. survives-a-reload)
+npm run smoke:terminal   # the terminal panel's frontend, against a shimmed PTY
+npm run test:rust        # the Rust half: a real PTY, and CLI resolution
 ```
 
 The terminal is the one feature no single test covers end to end: the PTY lives

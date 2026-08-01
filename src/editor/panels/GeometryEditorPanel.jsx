@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Box, Circle, Crosshair, Eye, Layers, Magnet, Move, Rotate3d, Scale3d, Scissors, Square, Triangle, Undo2, Redo2, X } from "lucide-react";
+import { Box, Circle, CircleDot, Crosshair, Eye, Layers, Magnet, Move, Rotate3d, Scale3d, Scissors, Shapes, Square, Triangle, Undo2, Redo2, X } from "lucide-react";
 import * as THREE from "three/webgpu";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { engine } from "../engineInstance.js";
@@ -9,7 +9,10 @@ import { disposeOrReleaseGeometry } from "../../engine/geometryAsset.js";
 import { authoredGeometry, ensureGeometryAsset, saveNewGeometryAsset } from "../geometryEditing.js";
 import { invalidateVirtualGeometryAsset } from "../../modules/virtual-geometry/index.js";
 import { CreateEntityCommand } from "../commands/entityCommands.js";
+import { AddComponentCommand, RemoveComponentCommand, SetComponentPropCommand } from "../commands/componentCommands.js";
 import { AxisViewGizmo } from "../helpers/AxisViewGizmo.jsx";
+import { GEOMETRY_MODIFIER_DEFINITIONS, createGeometryModifier } from "../../engine/geometryModifiers.js";
+import { applyGeometryModifier } from "../geometryModifierEditing.js";
 
 import { copyMesh, createMesh } from "../mesh/bmesh.js";
 import { assetFromMesh, bufferGeometryFromMesh, meshFromBufferGeometry } from "../mesh/io.js";
@@ -118,6 +121,8 @@ import {
   selectionBoundingSphere,
 } from "../mesh/viewport.js";
 import { unwrapBox, unwrapPlanar } from "../mesh/ops/uv.js";
+import { PRIMITIVES, addPrimitive } from "../mesh/ops/primitives.js";
+import { ToolbarMenu, ToolbarMenuProvider } from "./GeometryToolbarMenu.jsx";
 import {
   BRUSHES,
   DIRECTIONAL_BRUSHES,
@@ -269,6 +274,34 @@ function screenPointOf(session, point, camera, rect) {
 }
 
 /**
+ * How much of the transform a vertex receives.
+ *
+ * Recomputed per frame rather than cached so the scroll wheel can resize the
+ * influence circle mid-drag, as it does in Blender, and so `O` mid-drag turns
+ * the falloff on and off — gated on `macro.proportional`, not merely on whether
+ * distances were recorded, because the recorded distances outlive the toggle.
+ *
+ * Named `reach`, not `distance`: it used to shadow the drag distance in
+ * `applyMacro`, and the per-vertex-offset branch multiplied by *this* instead.
+ * With proportional editing off there are no recorded distances, so it was
+ * `undefined * 1` — every vertex an inset, a shrink/fatten or an
+ * extrude-along-normals moved went NaN, the faces vanished, and the NaN was
+ * then written into the `.geom` (where it lands as `null` and reloads as UV
+ * 0,0 — the zeroed UVs on disk).
+ */
+function macroWeight(macro, vert) {
+  // Once proportional editing has run, `origins` also holds every vertex the
+  // falloff reached. Those must go back to weight 0 — and so, via `applyMacro`,
+  // back to their recorded origin — the instant it is switched off mid-drag,
+  // or turning it off would leave the neighbourhood stuck where it was.
+  const picked = !macro.movingVerts || macro.movingVerts.has(vert);
+  if (!macro.proportional) return picked ? 1 : 0;
+  const reach = macro.distances?.get(vert);
+  if (reach === undefined) return picked ? 1 : 0;
+  return falloffWeight(reach / Math.max(macro.radius, 1e-6), macro.falloff);
+}
+
+/**
  * Recomputes a macro's effect from its snapshot.
  *
  * Macros come in two families. Most only *move* vertices, so the topology is
@@ -382,18 +415,7 @@ function applyMacro(session) {
 
   for (const [vert, origin] of macro.origins) {
     const point = vec(origin);
-    // Recomputed rather than cached so the scroll wheel can resize the
-    // influence circle mid-drag, as it does in Blender.
-    //
-    // Named `reach`, not `distance`: it used to shadow the drag distance
-    // computed above, and the per-vertex-offset branch below then multiplied by
-    // *this* instead. With proportional editing off there are no recorded
-    // distances, so it was `undefined * 1` — every vertex an inset, a
-    // shrink/fatten or an extrude-along-normals moved went NaN, the faces
-    // vanished, and the NaN was then written into the `.geom` (where it lands
-    // as `null` and reloads as UV 0,0 — the zeroed UVs on disk).
-    const reach = macro.distances?.get(vert);
-    const weight = reach === undefined ? 1 : falloffWeight(reach / Math.max(macro.radius, 1e-6), macro.falloff);
+    const weight = macroWeight(macro, vert);
     if (weight <= 0) {
       vert.co = [...origin];
       continue;
@@ -429,20 +451,36 @@ function applyMacro(session) {
   if (macro.sides?.length) updateSideUVs(macro.sides);
   if (macro.reprojected?.length) updateCapUVs(macro.reprojected);
 
-  // Snapping runs after the drag so it corrects the final position, and only
-  // for an unweighted single-target move where a snap is meaningful.
+  // Snapping runs after the drag so it corrects the final position.
+  macro.snapPoint = null;
   if (session.snapEnabled && macro.kind !== "rotate" && macro.kind !== "scale" && macro.origins.size) {
-    const moving = new Set(macro.origins.keys());
-    const anchor = macro.snapAnchor ?? [...moving][0];
+    const anchor = macro.snapAnchor ?? [...macro.origins.keys()][0];
     const target = snapTarget(session.mesh, anchor.co, {
       mode: session.snapMode,
-      radius: session.snapRadius,
       increment: session.snapIncrement,
-      moving,
+      absolute: session.snapAbsolute,
+      pixelRadius: session.snapPixelRadius ?? 28,
+      origin: macro.origins.get(anchor),
+      // Only the elements the user is actually dragging are excluded. With
+      // proportional editing on, `origins` also holds every vertex inside the
+      // influence circle, and excluding all of those would leave a wide
+      // transform with nothing left to snap to.
+      moving: macro.movingVerts ?? new Set(macro.origins.keys()),
+      // Ranked against the mouse in screen space, as Blender's magnet is.
+      pointer: macro.current,
+      project: (co) => screenPointOf(session, co, camera, rect),
     });
     if (target) {
       const delta = [target.point[0] - anchor.co[0], target.point[1] - anchor.co[1], target.point[2] - anchor.co[2]];
-      for (const vert of moving) vert.co = [vert.co[0] + delta[0], vert.co[1] + delta[1], vert.co[2] + delta[2]];
+      // Weighted, so a snap under proportional editing drags the falloff with
+      // it instead of shunting the whole influenced region rigidly.
+      for (const vert of macro.origins.keys()) {
+        const weight = macroWeight(macro, vert);
+        if (weight <= 0) continue;
+        vert.co = [vert.co[0] + delta[0] * weight, vert.co[1] + delta[1] * weight, vert.co[2] + delta[2] * weight];
+      }
+      macro.snapPoint = target.point;
+      macro.snapKind = target.kind;
     }
   }
   session.preview();
@@ -505,6 +543,9 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
   const [snapEnabled, setSnapEnabled] = useState(false);
   const [snapMode, setSnapMode] = useState("increment");
   const [snapIncrement, setSnapIncrement] = useState(0.25);
+  // Blender's "Absolute Grid Snap": off by default, where increment snapping
+  // rounds how far you have travelled rather than where you have ended up.
+  const [snapAbsolute, setSnapAbsolute] = useState(false);
   const [xray, setXray] = useState(false);
   const [selectionTool, setSelectionTool] = useState(null);
   const [selectionGesture, setSelectionGesture] = useState(null);
@@ -514,6 +555,12 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
   const [pendingChord, setPendingChord] = useState(null);
   const [stats, setStats] = useState(null);
   const [knifePoints, setKnifePoints] = useState(null);
+  // Blender's Shift+A: a primitive menu that opens where the mouse is.
+  const [addMenu, setAddMenu] = useState(null);
+  // Which single header menu is open. One `<details>` per menu could not do
+  // this: the element has no notion of a menu bar, so opening one never closed
+  // the others and the header ended up with six overlapping popovers.
+  const [openMenu, setOpenMenu] = useState(null);
 
   // Sculpt mode
   const [editorMode, setEditorMode] = useState("edit");
@@ -540,6 +587,14 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
   useEffect(() => {
     if (sessionRef.current?.context) sessionRef.current.context.visible = showSceneContext;
   }, [showSceneContext]);
+
+  // The Add menu dismisses on any click that is not one of its own entries.
+  useEffect(() => {
+    if (!addMenu) return undefined;
+    const dismiss = () => setAddMenu(null);
+    window.addEventListener("pointerdown", dismiss);
+    return () => window.removeEventListener("pointerdown", dismiss);
+  }, [addMenu]);
 
   /* ---------------------------------------------------------------------- */
   /* Session plumbing                                                        */
@@ -703,6 +758,29 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
   /* Macros                                                                  */
   /* ---------------------------------------------------------------------- */
 
+  /**
+   * Blender's proportional influence circle, in client coordinates: a ring
+   * around the transform centre whose radius is the proportional size. Without
+   * it the only clue that proportional editing is on at all is a number in the
+   * corner, and the wheel appears to do nothing.
+   */
+  const proportionalCircle = (session, macro) => {
+    if (!macro?.proportional || !session.canvas) return null;
+    const rect = session.canvas.getBoundingClientRect();
+    const centre = screenPointOf(session, macro.pivot, session.camera, rect);
+    if (!centre) return null;
+    const right = session.toLocalDirection
+      ? session.toLocalDirection(new THREE.Vector3().setFromMatrixColumn(session.camera.matrixWorld, 0)).normalize()
+      : new THREE.Vector3(1, 0, 0);
+    const rim = screenPointOf(session, [
+      macro.pivot[0] + right.x * macro.radius,
+      macro.pivot[1] + right.y * macro.radius,
+      macro.pivot[2] + right.z * macro.radius,
+    ], session.camera, rect);
+    if (!rim) return null;
+    return { x: centre.x, y: centre.y, r: Math.hypot(rim.x - centre.x, rim.y - centre.y) };
+  };
+
   const publishMacro = (session) => {
     const macro = session.macro;
     setMacroState(macro && {
@@ -718,7 +796,37 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
       orientation: session.orientation,
       proportional: macro.proportional,
       radius: macro.radius,
+      circle: proportionalCircle(session, macro),
+      snapKind: macro.snapPoint ? macro.snapKind : null,
+      snapAt: macro.snapPoint && session.canvas
+        ? screenPointOf(session, macro.snapPoint, session.camera, session.canvas.getBoundingClientRect())
+        : null,
     });
+  };
+
+  /**
+   * `O` during a transform, as in Blender. Turning it on part-way needs the
+   * distance field built right then — the vertices it will reach were never
+   * recorded, and a vertex that is not in `origins` can never move.
+   */
+  const toggleMacroProportional = (session) => {
+    const macro = session.macro;
+    // Inset, shrink/fatten and extrude-along-normals give every vertex its own
+    // direction; there is no single displacement for a falloff to scale.
+    if (!macro || macro.offsets) return;
+    macro.proportional = !macro.proportional;
+    session.proportional = macro.proportional;
+    setProportional(macro.proportional);
+    if (macro.proportional && !macro.distances) {
+      const seeds = [...(macro.movingVerts ?? macro.origins.keys())];
+      macro.distances = proportionalDistances(session.mesh, seeds, { connected: session.proportionalConnected });
+      for (const vert of macro.distances.keys()) {
+        if (!macro.origins.has(vert)) macro.origins.set(vert, [...vert.co]);
+      }
+      for (const vert of seeds) macro.distances.set(vert, 0);
+    }
+    applyMacro(session);
+    publishMacro(session);
   };
 
   /**
@@ -758,10 +866,13 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
 
     const origins = new Map(moving.map((vert) => [vert, [...vert.co]]));
     let distances = null;
-    let radius = 1;
+    // Blender carries the proportional size from one transform to the next
+    // rather than re-deriving it, so a size you dialled in with the wheel is
+    // still there on the following move. Only the very first one is seeded
+    // from the mesh, so it is sane on a trinket and on a terrain alike.
+    if (!session.proportionalSize) session.proportionalSize = Math.max(meshBoundingSphere(session.mesh).radius * 0.6, 0.25);
+    const radius = session.proportionalSize;
     if (session.proportional && !offsets) {
-      const sphere = meshBoundingSphere(session.mesh);
-      radius = Math.max(sphere.radius * 0.6, 0.25);
       // Every vertex that could *ever* come under the influence circle is
       // recorded now, because the radius is live: scrolling during the drag
       // changes it, and a vertex that was not in `origins` could never start
@@ -795,6 +906,9 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
       sides,
       reprojected,
       maxThickness,
+      // The vertices the user actually picked, as distinct from `origins`,
+      // which proportional editing widens to the whole influence region.
+      movingVerts: new Set(moving),
       snapAnchor: session.active && origins.has(session.active) ? session.active : moving[0],
       beforeMode: session.mode,
       segments: options.segments ?? 1,
@@ -850,6 +964,117 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
     return [point.x, point.y, point.z];
   };
 
+  /**
+   * Blender's Add Mesh: the primitive lands at the 3D cursor, arrives as the
+   * only selection, and switches the header to whichever select mode it has
+   * elements in (a circle has no faces).
+   */
+  const doAddPrimitive = (kind) => {
+    setAddMenu(null);
+    sessionRef.current?.canvas?.focus();
+    const entry = PRIMITIVES.find((item) => item.id === kind);
+    runOperator(`Add ${entry?.label ?? kind}`, (session) => {
+      const result = addPrimitive(session.mesh, kind, { at: localCursor(), material: faceMaterial });
+      if (result.error) return result;
+      if (result.mode !== session.mode) {
+        session.mode = result.mode;
+        setMode(result.mode);
+      }
+      session.active = null;
+      return { message: `Added ${entry?.label ?? kind} · ${result.added.verts}v ${result.added.edges}e ${result.added.faces}f` };
+    });
+  };
+
+  /* ---------------------------------------------------------------------- */
+  /* Modifier stack                                                          */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * The non-destructive stack — Blender's wrench tab — surfaced in the header.
+   *
+   * It is a component (`geometryModifiers`) and has always been reachable from
+   * the Inspector, but nothing in the modelling workspace said so, which is
+   * exactly where you go looking for it. Editing the stack from here matters
+   * for a second reason too: the modifiers evaluate *on top of* what this panel
+   * edits, so being able to see a subdivision or an array while cutting the
+   * cage is the whole point of them being non-destructive.
+   */
+  const modifiers = entity?.getComponent?.("geometryModifiers") ?? null;
+
+  const addModifiers = async () => {
+    const { commandBus } = await import("../commands/CommandBus.js");
+    commandBus.execute(new AddComponentCommand(entityId, "geometryModifiers"));
+    sessionRef.current?.refreshModifierPreview?.();
+    touch();
+    setStatus("Added a modifier stack");
+  };
+
+  const removeModifiers = async () => {
+    const { commandBus } = await import("../commands/CommandBus.js");
+    commandBus.execute(new RemoveComponentCommand(entityId, "geometryModifiers"));
+    sessionRef.current?.refreshModifierPreview?.();
+    touch();
+    setStatus("Removed the modifier stack");
+  };
+
+  const setModifierStack = async (value, label = "Edit modifiers") => {
+    const { commandBus } = await import("../commands/CommandBus.js");
+    commandBus.execute(new SetComponentPropCommand(entityId, "geometryModifiers", "modifiers", value, label));
+    sessionRef.current?.refreshModifierPreview?.();
+    touch();
+  };
+
+  const updateModifier = (index, patch, label = "Edit modifier") => setModifierStack(
+    (modifiers?.props.modifiers ?? []).map((modifier, current) => current === index ? { ...modifier, ...patch } : modifier),
+    label,
+  );
+
+  const moveModifier = (index, delta) => {
+    const stack = [...(modifiers?.props.modifiers ?? [])];
+    const target = index + delta;
+    if (target < 0 || target >= stack.length) return;
+    [stack[index], stack[target]] = [stack[target], stack[index]];
+    setModifierStack(stack, "Reorder modifiers");
+  };
+
+  const applyModifier = async (modifier) => {
+    // Capture the exact baked cage before the command removes the selected
+    // stack prefix. Edit Mode owns an in-memory BMesh, so leaving it on the old
+    // authored cage would make the remaining modifier preview jump backwards
+    // until the newly written asset finished reloading.
+    const session = sessionRef.current;
+    let bakedMesh = null;
+    let bakedGeometry = null;
+    let currentCage = null;
+    try {
+      currentCage = session ? bufferGeometryFromMesh(session.mesh) : null;
+      bakedGeometry = modifiers?.evaluateThroughModifier?.(modifier, currentCage ?? undefined) ?? null;
+      if (bakedGeometry) bakedMesh = meshFromBufferGeometry(bakedGeometry);
+    } catch {
+      // `applyGeometryModifier` owns the user-facing error path. This snapshot
+      // only keeps the editor cage synchronized after a successful bake.
+      bakedMesh = null;
+    } finally {
+      bakedGeometry?.dispose?.();
+    }
+    const result = await applyGeometryModifier(entityId, modifier.id, { sourceGeometry: currentCage });
+    currentCage?.dispose?.();
+    if (result.ok && session && bakedMesh) {
+      session.history.push({ mesh: copyMesh(session.mesh).mesh, mode: session.mode, label: `Apply ${modifier.type}` });
+      session.future.length = 0;
+      session.mesh = bakedMesh;
+      session.active = null;
+      session.rebuild();
+    }
+    setStatus(result.message);
+    touch();
+  };
+
+  /** Entity references serve both mesh operands and transform-only controls. */
+  const modifierEntityCandidates = (meshOnly = false) => [...engine.entities.values()]
+    .filter((candidate) => candidate.id !== entityId && (!meshOnly || candidate.getComponent?.("mesh")))
+    .map((candidate) => ({ id: candidate.id, name: candidate.name }));
+
   const startExtrude = (variant = "region") => {
     const session = sessionRef.current;
     if (!session) return;
@@ -885,7 +1110,17 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
       setStatus("Bevel needs an edge selection");
       return;
     }
-    startMacro("bevel", "Bevel Edges", { width: 0.05, segments: 1, verts: selectedVerts(session.mesh, "edge") });
+    // A one-segment bevel is a plain chamfer and necessarily uses the old
+    // single-polygon corner cap. Starting every Ctrl+B there made the rounded
+    // corner-grid topology in topology.js look as though it was never used.
+    // Keep Blender's "last operator setting" behaviour, with four segments as
+    // the first-use default so a rounded bevel exposes the distributed quad
+    // corner immediately.
+    startMacro("bevel", "Bevel Edges", {
+      width: 0.05,
+      segments: session.bevelSegments ?? 4,
+      verts: selectedVerts(session.mesh, "edge"),
+    });
   };
 
   const startLoopCut = () => {
@@ -1113,6 +1348,12 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
     const session = sessionRef.current;
     if (!session) return;
     if (event.target.closest("input, textarea, select")) return;
+    if (addMenu) {
+      event.preventDefault();
+      event.stopPropagation();
+      setAddMenu(null);
+      return;
+    }
     // Edit mode owns its grammar; stop scene-level Delete/duplicate/undo too.
     event.stopPropagation();
     const key = event.key.toLowerCase();
@@ -1146,11 +1387,21 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
       }
       if (key === "o") {
         consume();
-        macro.proportional = !macro.proportional;
-        session.proportional = macro.proportional;
-        setProportional(macro.proportional);
+        if (event.altKey) {
+          // Written straight onto the session as well: the React state only
+          // reaches it through an effect, and the distance field is rebuilt
+          // on this line, before that effect has run.
+          session.proportionalConnected = !session.proportionalConnected;
+          setProportionalConnected(session.proportionalConnected);
+          macro.distances = null;
+          if (macro.proportional) {
+            macro.proportional = false;
+            toggleMacroProportional(session);
+          }
+        } else toggleMacroProportional(session);
         return;
       }
+      if (key === "tab" && event.shiftKey) { consume(); setSnapEnabled((value) => !value); return; }
       if (key === "backspace") {
         consume();
         macro.buffer = macro.buffer.slice(0, -1);
@@ -1216,6 +1467,13 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
     if (!ctrl && event.altKey && key === "e") { consume(); setPendingChord("extrude"); setStatus("Extrude: E region · I individual · N along normals · V vertices"); return; }
     if (!ctrl && event.shiftKey && key === "s") { consume(); setPendingChord("snap"); setStatus("Snap: C cursor to selection · S selection to cursor · O cursor to origin"); return; }
     if (!ctrl && event.shiftKey && key === "g") { consume(); setPendingChord("similar"); setStatus("Select Similar: pick a trait from the Select menu"); return; }
+    // Blender opens Add as a menu at the mouse, not as a chord.
+    if (!ctrl && event.shiftKey && key === "a") {
+      consume();
+      const at = session.lastPointer ?? { x: 0, y: 0 };
+      setAddMenu({ x: at.x, y: at.y });
+      return;
+    }
     if (!ctrl && key === "m" && !event.shiftKey) { consume(); setPendingChord("merge"); setStatus("Merge: C center · U cursor · L collapse · F first · A last · D by distance"); return; }
     if (!ctrl && (key === "x" || key === "delete" || key === "backspace")) { consume(); setPendingChord("delete"); setStatus("Delete: V vertices · E edges · F faces · O only faces · D dissolve verts · G dissolve edges · S dissolve faces · L limited dissolve"); return; }
 
@@ -1257,6 +1515,15 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
     if (event.altKey && key === "j") { consume(); runOperator("Tris to Quads", (value) => ({ message: `Merged ${trisToQuads(value.mesh, { faces: selected(value.mesh, "face") })} quads` })); return; }
     if (ctrl && event.shiftKey && key === "r") { consume(); startOffsetLoop(); return; }
     if (ctrl && key === "b") { consume(); startBevel(); return; }
+
+    // --- Transform options (Blender's header toggles) ----------------------
+    if (key === "o" && !ctrl) {
+      consume();
+      if (event.altKey) setProportionalConnected((value) => !value);
+      else setProportional((value) => !value);
+      return;
+    }
+    if (event.key === "Tab" && event.shiftKey) { consume(); setSnapEnabled((value) => !value); return; }
 
     // --- View -------------------------------------------------------------
     if (event.altKey && key === "z") { consume(); toggleXray(); return; }
@@ -1645,11 +1912,18 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
       session.shading = mode;
       return;
     }
-    session.meshObject.material = wireframeMode
+    const surfaceMaterial = wireframeMode
       ? session.wireframeMaterial
       : mode === "solid"
         ? session.editMaterials
         : session.realMaterials ?? session.editMaterials;
+    const previewVisible = !!session.modifierPreviewObject?.visible;
+    session.meshObject.material = previewVisible ? session.modifierCageMaterial : surfaceMaterial;
+    if (session.modifierPreviewObject) {
+      session.modifierPreviewObject.material = wireframeMode
+        ? session.modifierWireframeMaterial
+        : surfaceMaterial;
+    }
 
     // In wireframe the surface is invisible, so the edges have to carry the
     // whole read of the shape and need to be brighter than the usual dark wire.
@@ -1955,7 +2229,7 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
       snapEnabled,
       snapMode,
       snapIncrement,
-      snapRadius: Math.max(snapIncrement * 2, 0.2),
+      snapAbsolute,
       brush,
       brushRadius,
       brushStrength,
@@ -1972,7 +2246,7 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
       paintBlend,
       paintResolution,
     });
-  }, [proportional, proportionalConnected, falloff, pivot, orientation, snapEnabled, snapMode, snapIncrement,
+  }, [proportional, proportionalConnected, falloff, pivot, orientation, snapEnabled, snapMode, snapIncrement, snapAbsolute,
     brush, brushRadius, brushStrength, brushFalloff, symmetry, dyntopo, detailSize, dyntopoMode,
     paintColor, paintBlend, paintResolution]);
 
@@ -2024,61 +2298,33 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
   }, [component, mode]);
 
   /**
-   * Makes the scrolling header behave: a wheel over it scrolls sideways (as it
-   * does over Blender's), and the menus are placed as fixed-position elements.
+   * A wheel over the header scrolls it sideways, as it does over Blender's.
+   * (Placing the menus is `ToolbarMenu`'s job — they are portalled onto
+   * `<body>` so neither this scroller's clipping nor the toolbar's
+   * `backdrop-filter` can reach them.)
    *
-   * The placement is not cosmetic. A `position: absolute` popover inside an
-   * `overflow-x: auto` box is clipped by it — and because CSS refuses to
-   * scroll one axis while overflowing the other, `overflow-y` resolves to auto
-   * too, so every dropdown would be cut off a few pixels below its button. A
-   * `toggle` event does not bubble, but it is still seen by a CAPTURING
-   * listener on the way down, so one handler here covers every menu.
+   * Bound in an effect that re-runs on `component`, not once on mount: the
+   * panel renders an empty placeholder until an entity with a mesh is
+   * selected, so on the first pass there is no header to bind to.
    */
   useEffect(() => {
-    const toolbar = toolbarRef.current;
     const scroller = toolbarScrollRef.current;
-    if (!toolbar || !scroller) return undefined;
-
-    const place = (details) => {
-      const popover = details.querySelector(".geometry-toolbar-popover");
-      const summary = details.querySelector("summary");
-      if (!popover || !summary) return;
-      const anchor = summary.getBoundingClientRect();
-      // Measured at the origin first: reading a size while the element still
-      // carries the previous open's coordinates can push it off-screen and
-      // shrink it against the viewport edge.
-      popover.style.left = "0px";
-      popover.style.top = "0px";
-      const size = popover.getBoundingClientRect();
-      popover.style.left = `${Math.max(6, Math.min(anchor.left, window.innerWidth - size.width - 6))}px`;
-      popover.style.top = `${Math.min(anchor.bottom + 6, window.innerHeight - size.height - 6)}px`;
-    };
-    const reposition = () => {
-      for (const details of toolbar.querySelectorAll(".geometry-toolbar-menu[open]")) place(details);
-    };
-    const onToggle = (event) => {
-      const details = event.target;
-      if (details?.matches?.(".geometry-toolbar-menu") && details.open) place(details);
-    };
+    if (!scroller) return undefined;
     const onWheel = (event) => {
       if (scroller.scrollWidth <= scroller.clientWidth) return;
-      const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
+      const rawDelta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
+      // Most trackpads report pixels, but traditional mouse wheels can report
+      // lines (or, rarely, pages). Treating those values as pixels made a
+      // three-line wheel notch move the header by only three pixels.
+      const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? scroller.clientWidth : 1;
+      const delta = rawDelta * unit;
       if (!delta) return;
       scroller.scrollLeft += delta;
       event.preventDefault();
     };
-
-    toolbar.addEventListener("toggle", onToggle, true);
-    scroller.addEventListener("scroll", reposition);
     scroller.addEventListener("wheel", onWheel, { passive: false });
-    window.addEventListener("resize", reposition);
-    return () => {
-      toolbar.removeEventListener("toggle", onToggle, true);
-      scroller.removeEventListener("scroll", reposition);
-      scroller.removeEventListener("wheel", onWheel);
-      window.removeEventListener("resize", reposition);
-    };
-  }, []);
+    return () => scroller.removeEventListener("wheel", onWheel);
+  }, [component]);
 
   // Ctrl+R must be claimed in the capture phase, ahead of the webview's reload.
   useEffect(() => {
@@ -2199,6 +2445,19 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
     meshObject.updateMatrixWorld(true);
     scene.add(meshObject);
 
+    // The editable cage and the evaluated modifier result are deliberately two
+    // objects. Picking and overlays stay attached to `meshObject`, while this
+    // sibling shows Array/Mirror/Subdivision/etc. without turning generated
+    // vertices into editable source topology or baking them on save.
+    const modifierCageMaterial = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false });
+    const modifierWireframeMaterial = new THREE.MeshBasicMaterial({ color: 0x9aa4ad, wireframe: true });
+    const modifierPreviewObject = new THREE.Mesh(new THREE.BufferGeometry(), editMaterials);
+    modifierPreviewObject.visible = false;
+    modifierPreviewObject.matrixAutoUpdate = false;
+    modifierPreviewObject.matrix.copy(entity.object3D.matrixWorld);
+    modifierPreviewObject.updateMatrixWorld(true);
+    scene.add(modifierPreviewObject);
+
     const wire = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ vertexColors: true }));
     const markerCapacity = Math.max(8192, Math.ceil(mesh.verts.size * 2));
     const markerGeometry = new THREE.SphereGeometry(1, 8, 6);
@@ -2224,6 +2483,7 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
 
     const session = {
       mesh, meshObject, wire, basePoints, faceOverlay, edgeOverlay, vertexOverlay, activeOverlay, context,
+      modifierPreviewObject, modifierCageMaterial, modifierWireframeMaterial,
       scene, editMaterials, realMaterials, wireframeMaterial, editorLights, sceneLights, shading,
       camera, perspectiveCamera, orthographicCamera: null, orthographicHeight: 10,
       controls, canvas,
@@ -2231,7 +2491,12 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
       active: null,
       history: [], future: [], macro: null,
       proportional, proportionalConnected, falloff, pivot, orientation,
-      snapEnabled, snapMode, snapIncrement, snapRadius: 0.5,
+      snapEnabled, snapMode, snapIncrement, snapAbsolute,
+      // How close to the mouse an element has to project to be snapped to, in
+      // pixels. Blender's magnet works the same way, which is why it does not
+      // need a world-space reach and behaves identically on a trinket and on a
+      // terrain.
+      snapPixelRadius: 28,
       // Seeded here as well as in the mirroring effect below: effects run in
       // declaration order, and that one is declared first, so on mount it sees
       // a null session and bails. Without these the first sculpt stroke after
@@ -2267,6 +2532,36 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
     /** How many local units one world unit spans, averaged over the axes. */
     session.localPerWorld = 3 / Math.max(meshScale.x + meshScale.y + meshScale.z, 1e-6);
 
+    session.refreshModifierPreview = () => {
+      const stack = engine.getEntity(entityId)?.getComponent?.("geometryModifiers");
+      const active = !!stack?.enabled && (stack.props.modifiers ?? []).some((modifier) => modifier.enabled !== false);
+      if (!active) {
+        modifierPreviewObject.visible = false;
+        applyShading(session, session.shading);
+        applyXray(session);
+        return;
+      }
+
+      const cage = bufferGeometryFromMesh(session.mesh);
+      let evaluated = null;
+      try {
+        evaluated = stack.evaluateGeometry(cage);
+        if (!evaluated?.getAttribute("position")) throw new Error("Modifier stack produced no geometry");
+        const previous = modifierPreviewObject.geometry;
+        modifierPreviewObject.geometry = evaluated;
+        modifierPreviewObject.visible = true;
+        previous?.dispose?.();
+      } catch (error) {
+        evaluated?.dispose?.();
+        modifierPreviewObject.visible = false;
+        stack.lastError = String(error?.message ?? error);
+      } finally {
+        cage.dispose();
+      }
+      applyShading(session, session.shading);
+      applyXray(session);
+    };
+
     session.useCamera = (nextCamera) => {
       camera = nextCamera;
       session.camera = nextCamera;
@@ -2295,6 +2590,11 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
       touch();
     };
     sessionRef.current = session;
+    const modifierPreviewUnsub = engine.on?.("component-changed", (event) => {
+      if (event?.entityId === entityId && event.componentType === "geometryModifiers") {
+        session.refreshModifierPreview();
+      }
+    });
     // Same hatch as `globalThis.__viewport`: headless harnesses need to read
     // the camera and the mesh the panel is actually driving.
     if (import.meta.env?.DEV) globalThis.__geometrySession = session;
@@ -2569,10 +2869,14 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
       } else if (session.macro?.kind === "loopcut" || session.macro?.kind === "bevel") {
         const limit = session.macro.kind === "loopcut" ? 64 : 16;
         session.macro.segments = THREE.MathUtils.clamp(session.macro.segments + (event.deltaY < 0 ? 1 : -1), 1, limit);
+        if (session.macro.kind === "bevel") session.bevelSegments = session.macro.segments;
         scheduleMacroFrame();
       } else if (session.macro?.proportional) {
-        // Blender's direction: scroll up tightens the influence circle.
+        // Blender's direction: scroll up tightens the influence circle. The
+        // size is kept on the session so the next transform starts where this
+        // one left off, as Blender's does.
         session.macro.radius = THREE.MathUtils.clamp(session.macro.radius * 1.08 ** (event.deltaY / 100), 0.001, 1e5);
+        session.proportionalSize = session.macro.radius;
         applyMacro(session);
         publishMacro(session);
       } else return;
@@ -2644,6 +2948,7 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
       window.removeEventListener("blur", onBlur);
       controls.removeEventListener("start", onControlsStart);
       controls.removeEventListener("change", onControlsChange);
+      modifierPreviewUnsub?.();
       controls.dispose();
       const borrowed = new Set(Array.isArray(realMaterials) ? realMaterials : [realMaterials]);
       scene.traverse((object) => {
@@ -2672,13 +2977,17 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
   const count = session ? selectionCount(session.mesh, mode) : 0;
   const materialSlots = Array.from({ length: 8 }, (_, index) => component.props[index ? `material${index + 1}` : "material"] ?? "");
   const run = (event, action) => {
-    event.currentTarget.closest("details")?.removeAttribute("open");
+    setOpenMenu(null);
+    // Back to the viewport, so the keymap keeps working after a menu action —
+    // key events reach the panel only while focus is inside it.
+    sessionRef.current?.canvas?.focus();
     action();
   };
   const similarTypes = SIMILAR_TYPES[mode] ?? [];
 
   return (
     <div className={`geometry-editor ${embedded ? "embedded" : ""}`} ref={rootRef} onKeyDown={handleKeyDown}>
+      <ToolbarMenuProvider openId={openMenu} onOpenChange={setOpenMenu}>
       <div className="geometry-editor-toolbar" ref={toolbarRef}>
         {/* Blender's header: ONE row that scrolls sideways. Wrapping stranded
             the trailing controls on a second row and grew the bar downwards
@@ -2703,10 +3012,38 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
         )}
         {editorMode === "edit" && <span className="geometry-editor-stat geometry-selection-count" title={`${count} selected`}>{count}</span>}
 
+        {/* Snap and proportional editing live in Blender's header, not inside a
+            menu — they are modes you flip constantly while modelling, and their
+            state has to be visible without opening anything. */}
+        {editorMode === "edit" && (
+          <div className="geometry-mode-group geometry-transform-options">
+            <button
+              className={`toolbar-btn icon-only ${snapEnabled ? "active" : ""}`}
+              title={`Snap ${snapEnabled ? "on" : "off"} (Shift+Tab) — snaps to the element under the mouse`}
+              onClick={() => setSnapEnabled((value) => !value)}
+            >
+              <Magnet size={14} />
+            </button>
+            <select className="geometry-header-select" title="Snap to" value={snapMode} onChange={(event) => setSnapMode(event.target.value)}>
+              {SNAP_MODES.map((entry) => <option key={entry.id} value={entry.id}>{entry.label}</option>)}
+            </select>
+            <button
+              className={`toolbar-btn icon-only ${proportional ? "active" : ""}`}
+              title={`Proportional editing ${proportional ? "on" : "off"} (O) — Alt+O for connected only, scroll during a transform to resize`}
+              onClick={() => setProportional((value) => !value)}
+            >
+              <CircleDot size={14} />
+            </button>
+            {proportional && (
+              <select className="geometry-header-select" title="Proportional falloff" value={falloff} onChange={(event) => setFalloff(event.target.value)}>
+                {FALLOFFS.map((entry) => <option key={entry.id} value={entry.id}>{entry.label}</option>)}
+              </select>
+            )}
+          </div>
+        )}
+
         {editorMode === "edit" && (<>
-        <details className="geometry-toolbar-menu">
-          <summary>Select</summary>
-          <div className="geometry-toolbar-popover">
+        <ToolbarMenu label="Select">
             <button onClick={(e) => run(e, doSelectAll)}>All <kbd>A</kbd></button>
             <button onClick={(e) => run(e, doSelectNone)}>None <kbd>Alt+A</kbd></button>
             <button onClick={(e) => run(e, doInvert)}>Invert <kbd>Ctrl+I</kbd></button>
@@ -2734,12 +3071,17 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
             <button onClick={(e) => run(e, () => doSelectTrait("sharp", { angle: Math.PI / 6 }))}>Sharp Edges</button>
             <button onClick={(e) => run(e, () => doSelectTrait("sides", { sides: 3 }))}>Faces by Sides (Tris)</button>
             <button onClick={(e) => run(e, () => doSelectTrait("sides", { sides: 4, comparison: "greater" }))}>Faces by Sides (N-gons)</button>
-          </div>
-        </details>
+          </ToolbarMenu>
 
-        <details className="geometry-toolbar-menu">
-          <summary>Transform</summary>
-          <div className="geometry-toolbar-popover">
+        <ToolbarMenu label="Add" title="Add a primitive at the 3D cursor (Shift+A)">
+            <span className="geometry-menu-heading">Mesh <kbd>Shift+A</kbd></span>
+            {PRIMITIVES.map((entry) => (
+              <button key={entry.id} onClick={(e) => run(e, () => doAddPrimitive(entry.id))}>{entry.label}</button>
+            ))}
+            <span className="geometry-menu-note">Arrives at the 3D cursor. Move it with Shift+S.</span>
+          </ToolbarMenu>
+
+        <ToolbarMenu label="Transform">
             <button disabled={!count} onClick={(e) => run(e, () => startMacro("translate", "Move"))}><Move size={13} /> Move <kbd>G</kbd></button>
             <button disabled={!count} onClick={(e) => run(e, () => startMacro("rotate", "Rotate"))}><Rotate3d size={13} /> Rotate <kbd>R</kbd></button>
             <button disabled={!count} onClick={(e) => run(e, () => startMacro("scale", "Scale"))}><Scale3d size={13} /> Scale <kbd>S</kbd></button>
@@ -2758,7 +3100,7 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
               </select>
             </label>
             <hr />
-            <button className={snapEnabled ? "active" : ""} onClick={(e) => run(e, () => setSnapEnabled((value) => !value))}><Magnet size={13} /> Snap</button>
+            <button className={snapEnabled ? "active" : ""} onClick={(e) => run(e, () => setSnapEnabled((value) => !value))}><Magnet size={13} /> Snap <kbd>Shift+Tab</kbd></button>
             <label className="geometry-menu-field">Snap To
               <select value={snapMode} onChange={(event) => setSnapMode(event.target.value)}>
                 {SNAP_MODES.map((entry) => <option key={entry.id} value={entry.id}>{entry.label}</option>)}
@@ -2767,9 +3109,11 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
             <label className="geometry-menu-field">Increment
               <input type="number" min={0.001} step={0.05} value={snapIncrement} onChange={(event) => setSnapIncrement(Math.max(0.001, Number(event.target.value) || 0.25))} />
             </label>
+            <button className={snapAbsolute ? "active" : ""} title="Round the position to the grid instead of the distance travelled" onClick={(e) => run(e, () => setSnapAbsolute((value) => !value))}>Absolute Grid Snap</button>
+            <span className="geometry-menu-note">Vertex, edge and face snapping catch the element under the mouse.</span>
             <hr />
             <button className={proportional ? "active" : ""} onClick={(e) => run(e, () => setProportional((value) => !value))}>Proportional Editing <kbd>O</kbd></button>
-            <button className={proportionalConnected ? "active" : ""} onClick={(e) => run(e, () => setProportionalConnected((value) => !value))}>Connected Only</button>
+            <button className={proportionalConnected ? "active" : ""} onClick={(e) => run(e, () => setProportionalConnected((value) => !value))}>Connected Only <kbd>Alt+O</kbd></button>
             <label className="geometry-menu-field">Falloff
               <select value={falloff} onChange={(event) => setFalloff(event.target.value)}>
                 {FALLOFFS.map((entry) => <option key={entry.id} value={entry.id}>{entry.label}</option>)}
@@ -2781,12 +3125,9 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
             <button disabled={!count} onClick={(e) => run(e, snapCursorToSelection)}>Cursor → Selection</button>
             <button onClick={(e) => run(e, resetCursorToOrigin)}>Cursor → World Origin</button>
             <button disabled={!count} onClick={(e) => run(e, () => doMerge("cursor"))}>Merge at Cursor <kbd>M U</kbd></button>
-          </div>
-        </details>
+          </ToolbarMenu>
 
-        <details className="geometry-toolbar-menu">
-          <summary>Mesh</summary>
-          <div className="geometry-toolbar-popover">
+        <ToolbarMenu label="Mesh">
             <button disabled={!count} onClick={(e) => run(e, doDuplicate)}>Duplicate <kbd>Shift+D</kbd></button>
             <button disabled={!count} onClick={(e) => run(e, () => withSelection("Split", (s) => splitSelection(s.mesh, s.mode)))}>Split <kbd>Y</kbd></button>
             <button disabled={mode !== "face" || !count} onClick={(e) => run(e, doSeparate)}>Separate <kbd>P</kbd></button>
@@ -2830,12 +3171,9 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
             <button disabled={!count} onClick={(e) => run(e, () => doDissolve("verts"))}>Vertices <kbd>X D</kbd></button>
             <button disabled={!count} onClick={(e) => run(e, () => doDissolve("edges"))}>Edges <kbd>X G</kbd></button>
             <button disabled={!count} onClick={(e) => run(e, () => doDissolve("faces"))}>Faces <kbd>X S</kbd></button>
-          </div>
-        </details>
+          </ToolbarMenu>
 
-        <details className="geometry-toolbar-menu">
-          <summary>Vertex</summary>
-          <div className="geometry-toolbar-popover">
+        <ToolbarMenu label="Vertex">
             <button disabled={!count} onClick={(e) => run(e, () => startExtrude("free"))}>Extrude Vertices <kbd>E</kbd></button>
             <button disabled={!count} onClick={(e) => run(e, () => doMakeEdgeFace())}>New Edge/Face from Vertices <kbd>F</kbd></button>
             <button disabled={!count} onClick={(e) => run(e, () => withSelection("Connect Vertex Path", (s) => connectVertPath(s.mesh)))}>Connect Vertex Path <kbd>J</kbd></button>
@@ -2848,12 +3186,9 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
               <button key={entry.id} disabled={!count} onClick={(e) => run(e, () => doMerge(entry.id))}>{entry.label}</button>
             ))}
             <button onClick={(e) => run(e, doMergeByDistance)}>By Distance</button>
-          </div>
-        </details>
+          </ToolbarMenu>
 
-        <details className="geometry-toolbar-menu">
-          <summary>Edge</summary>
-          <div className="geometry-toolbar-popover">
+        <ToolbarMenu label="Edge">
             <button disabled={mode !== "edge" || !count} onClick={(e) => run(e, () => startExtrude("region"))}>Extrude Edges <kbd>E</kbd></button>
             <button disabled={mode !== "edge" || !count} onClick={(e) => run(e, startBevel)}>Bevel Edges <kbd>Ctrl+B</kbd></button>
             <button disabled={mode !== "edge" || !count} onClick={(e) => run(e, () => withSelection("Bridge Edge Loops", (s) => bridgeEdgeLoops(s.mesh, selected(s.mesh, "edge"))))}>Bridge Edge Loops</button>
@@ -2865,12 +3200,9 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
             <button disabled={mode !== "edge" || !count} onClick={(e) => run(e, () => doMark("sharp", true, "Mark Sharp"))}>Mark Sharp</button>
             <button disabled={mode !== "edge" || !count} onClick={(e) => run(e, () => doMark("sharp", false, "Clear Sharp"))}>Clear Sharp</button>
             <button onClick={(e) => run(e, () => runOperator("Mark Sharp by Angle", (s) => ({ message: `Updated ${markSharpByAngle(s.mesh)} edges` })))}>Mark Sharp by Angle</button>
-          </div>
-        </details>
+          </ToolbarMenu>
 
-        <details className="geometry-toolbar-menu">
-          <summary>Face</summary>
-          <div className="geometry-toolbar-popover">
+        <ToolbarMenu label="Face">
             <button disabled={mode !== "face" || !count} onClick={(e) => run(e, () => startExtrude("region"))}>Extrude Region <kbd>E</kbd></button>
             <button disabled={mode !== "face" || !count} onClick={(e) => run(e, () => startExtrude("individual"))}>Extrude Individual <kbd>Alt+E I</kbd></button>
             <button disabled={mode !== "face" || !count} onClick={(e) => run(e, () => startExtrude("normals"))}>Extrude Along Normals <kbd>Alt+E N</kbd></button>
@@ -2888,34 +3220,114 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
             <button onClick={(e) => run(e, () => doRecalculate(false))}>Recalculate Outside <kbd>Shift+N</kbd></button>
             <button onClick={(e) => run(e, () => doRecalculate(true))}>Recalculate Inside <kbd>Ctrl+Shift+N</kbd></button>
             <button disabled={mode !== "face" || !count} onClick={(e) => run(e, () => runOperator("Flip Normals", (s) => ({ message: `Flipped ${flipNormals(s.mesh, selected(s.mesh, "face"))} faces` })))}>Flip <kbd>Alt+N</kbd></button>
-          </div>
-        </details>
+          </ToolbarMenu>
 
-        <details className="geometry-toolbar-menu">
-          <summary>UV</summary>
-          <div className="geometry-toolbar-popover">
+        <ToolbarMenu label="UV">
             <button onClick={(e) => run(e, () => doUnwrap("planar"))}><Triangle size={13} /> Planar</button>
             <button onClick={(e) => run(e, () => doUnwrap("box"))}><Box size={13} /> Box</button>
-          </div>
-        </details>
+          </ToolbarMenu>
 
         {mode === "face" && (
-          <details className="geometry-toolbar-menu">
-            <summary>Material</summary>
-            <div className="geometry-toolbar-popover geometry-material-popover">
+          <ToolbarMenu label="Material" popoverClassName="geometry-material-popover">
               <label>Face slot
                 <select value={faceMaterial} onChange={(event) => setFaceMaterial(Number(event.target.value))}>
                   {materialSlots.map((path, index) => <option key={index} value={index}>{materialSlotLabel(path, index)}</option>)}
                 </select>
               </label>
               <button disabled={!count} onClick={(e) => run(e, doAssignMaterial)}>Assign to Selection</button>
-            </div>
-          </details>
+            </ToolbarMenu>
         )}
 
-        <details className="geometry-toolbar-menu">
-          <summary>View</summary>
-          <div className="geometry-toolbar-popover">
+        <ToolbarMenu label="Modifier" title="Non-destructive modifier stack — evaluated on top of the cage you are editing">
+            {!modifiers ? (<>
+              <span className="geometry-menu-note">
+                A modifier stack evaluates on top of this mesh without changing it, so Edit Mode always keeps the cage.
+              </span>
+              <button onClick={(e) => run(e, addModifiers)}><Shapes size={13} /> Add Modifier Stack</button>
+            </>) : (<>
+              <label className="geometry-menu-field">Add Modifier
+                <select value="" onChange={(event) => {
+                  const modifier = createGeometryModifier(event.target.value);
+                  if (modifier) setModifierStack([...(modifiers.props.modifiers ?? []), modifier], `Add ${GEOMETRY_MODIFIER_DEFINITIONS.find((entry) => entry.type === modifier.type)?.label ?? "modifier"}`);
+                }}>
+                  <option value="">Choose…</option>
+                  {GEOMETRY_MODIFIER_DEFINITIONS.map((definition) => <option key={definition.type} value={definition.type}>{definition.label}</option>)}
+                </select>
+              </label>
+              {!(modifiers.props.modifiers ?? []).length && <span className="geometry-menu-note">No modifiers</span>}
+              {(modifiers.props.modifiers ?? []).map((modifier, index) => {
+                const definition = GEOMETRY_MODIFIER_DEFINITIONS.find((entry) => entry.type === modifier.type);
+                if (!definition) return null;
+                const expanded = modifier.expanded !== false;
+                return (
+                  <div className={`geometry-modifier-panel ${modifier.enabled === false ? "disabled" : ""}`} key={modifier.id}>
+                    <div className="geometry-modifier-header">
+                      <button onClick={() => updateModifier(index, { expanded: !expanded }, "Toggle modifier panel")}>{expanded ? "▾" : "▸"} {definition.label}</button>
+                      <div className="geometry-modifier-actions">
+                        <button title="Apply" disabled={modifier.enabled === false} onClick={() => applyModifier(modifier)}>Apply</button>
+                        <button title={modifier.enabled === false ? "Enable" : "Disable"} onClick={() => updateModifier(index, { enabled: modifier.enabled === false }, "Toggle modifier")}>{modifier.enabled === false ? "○" : "●"}</button>
+                        <button title="Move up" disabled={index === 0} onClick={() => moveModifier(index, -1)}>↑</button>
+                        <button title="Move down" disabled={index === modifiers.props.modifiers.length - 1} onClick={() => moveModifier(index, 1)}>↓</button>
+                        <button title="Remove" onClick={() => setModifierStack(modifiers.props.modifiers.filter((_, current) => current !== index), `Remove ${definition.label}`)}>×</button>
+                      </div>
+                    </div>
+                    {expanded && definition.fields.filter((field) => !field.showIf || field.showIf(modifier)).map((field) => {
+                      if (field.type === "vec3") return ["X", "Y", "Z"].map((axis, axisIndex) => (
+                        <label className="geometry-menu-field" key={`${field.key}-${axis}`}>{field.label} {axis}
+                          <input type="number" step={field.step ?? 0.1} value={modifier[field.key]?.[axisIndex] ?? 0} onChange={(event) => {
+                            const value = [...(modifier[field.key] ?? [0, 0, 0])];
+                            value[axisIndex] = Number(event.target.value) || 0;
+                            updateModifier(index, { [field.key]: value }, `Set ${definition.label} ${field.label}`);
+                          }} />
+                        </label>
+                      ));
+                      if (field.type === "select") return (
+                        <label className="geometry-menu-field" key={field.key}>{field.label}
+                          <select value={modifier[field.key]} onChange={(event) => updateModifier(index, { [field.key]: event.target.value }, `Set ${definition.label} ${field.label}`)}>
+                            {field.options.map((option) => <option key={option} value={option}>{option}</option>)}
+                          </select>
+                        </label>
+                      );
+                      if (field.type === "entity") return (
+                        <label className="geometry-menu-field" key={field.key}>{field.label}
+                          <select value={modifier[field.key] ?? ""} onChange={(event) => updateModifier(index, { [field.key]: event.target.value }, `Set ${definition.label} ${field.label}`)}>
+                            <option value="">(none)</option>
+                            {modifierEntityCandidates(!!field.meshOnly).map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.name}</option>)}
+                          </select>
+                        </label>
+                      );
+                      if (field.type === "boolean") return (
+                        <label className="geometry-menu-field" key={field.key}>{field.label}
+                          <input type="checkbox" checked={modifier[field.key] !== false} onChange={(event) => updateModifier(index, { [field.key]: event.target.checked }, `Set ${definition.label} ${field.label}`)} />
+                        </label>
+                      );
+                      if (field.type === "text" || field.type === "asset") return (
+                        <label className="geometry-menu-field" key={field.key}>{field.label}
+                          <input type="text" value={modifier[field.key] ?? ""} onChange={(event) => updateModifier(index, { [field.key]: event.target.value }, `Set ${definition.label} ${field.label}`)} />
+                        </label>
+                      );
+                      return (
+                        <label className="geometry-menu-field" key={field.key}>{field.label}
+                          <input type="number" min={field.min} max={field.max} step={field.step ?? 0.1} value={modifier[field.key] ?? 0} onChange={(event) => {
+                            let value = Number(event.target.value) || 0;
+                            if (field.min != null) value = Math.max(field.min, value);
+                            if (field.max != null) value = Math.min(field.max, value);
+                            updateModifier(index, { [field.key]: value }, `Set ${definition.label} ${field.label}`);
+                          }} />
+                        </label>
+                      );
+                    })}
+                  </div>
+                );
+              })}
+              {modifiers.lastError && <span className="geometry-menu-note">Failed: {modifiers.lastError}</span>}
+              <hr />
+              <button onClick={(e) => run(e, removeModifiers)}>Remove Modifier Stack</button>
+              <span className="geometry-menu-note">Also editable in the Inspector, under Geometry Modifiers.</span>
+            </>)}
+          </ToolbarMenu>
+
+        <ToolbarMenu label="View">
             <span className="geometry-menu-heading">Shading <kbd>Z</kbd></span>
             {SHADING_MODES.map((entry) => (
               <button key={entry.id} className={shading === entry.id ? "active" : ""} title={entry.hint} onClick={(e) => run(e, () => setShading(entry.id))}>
@@ -2927,22 +3339,18 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
             <button className={showSceneContext ? "active" : ""} onClick={(e) => run(e, () => setShowSceneContext((value) => !value))}><Layers size={13} /> Scene Context</button>
             <button onClick={(e) => run(e, focusSelection)}>Frame Selected <kbd>.</kbd></button>
             <button onClick={(e) => run(e, focusGeometry)}>Frame All <kbd>Home</kbd></button>
-          </div>
-        </details>
+          </ToolbarMenu>
 
         </>)}
 
         {editorMode === "sculpt" && (<>
-          <details className="geometry-toolbar-menu">
-            <summary>Brush</summary>
-            <div className="geometry-toolbar-popover">
+          <ToolbarMenu label="Brush">
               {BRUSHES.map((entry) => (
                 <button key={entry.id} className={brush === entry.id ? "active" : ""} title={entry.hint} onClick={(e) => run(e, () => setBrush(entry.id))}>
                   {entry.label}
                 </button>
               ))}
-            </div>
-          </details>
+            </ToolbarMenu>
           <label className="geometry-brush-field" title="Brush radius ( [ and ] )">R
             <input type="range" min={0.005} max={2} step={0.005} value={brushRadius} onChange={(event) => setBrushRadius(Number(event.target.value))} />
             <span>{brushRadius.toFixed(3)}</span>
@@ -2951,9 +3359,7 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
             <input type="range" min={0.01} max={1} step={0.01} value={brushStrength} onChange={(event) => setBrushStrength(Number(event.target.value))} />
             <span>{brushStrength.toFixed(2)}</span>
           </label>
-          <details className="geometry-toolbar-menu">
-            <summary>Dyntopo</summary>
-            <div className="geometry-toolbar-popover">
+          <ToolbarMenu label="Dyntopo">
               <button className={dyntopo ? "active" : ""} onClick={(e) => run(e, () => setDyntopo((value) => !value))}>
                 {dyntopo ? "Enabled" : "Disabled"} <kbd>D</kbd>
               </button>
@@ -2983,11 +3389,8 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
               </label>
               <button disabled={busy} onClick={(e) => run(e, doRemesh)}>{busy ? "Remeshing…" : "Voxel Remesh"}</button>
               <span className="geometry-menu-note">Rebuilds the surface as uniform quads at the voxel size, as Blender's Remesh does. Resets UVs.</span>
-            </div>
-          </details>
-          <details className="geometry-toolbar-menu">
-            <summary>Symmetry</summary>
-            <div className="geometry-toolbar-popover">
+            </ToolbarMenu>
+          <ToolbarMenu label="Symmetry">
               {["x", "y", "z"].map((axis) => (
                 <button key={axis} className={symmetry[axis] ? "active" : ""} onClick={(e) => run(e, () => setSymmetry((value) => ({ ...value, [axis]: !value[axis] })))}>
                   Mirror {axis.toUpperCase()}
@@ -2999,11 +3402,8 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
                   {FALLOFFS.map((entry) => <option key={entry.id} value={entry.id}>{entry.label}</option>)}
                 </select>
               </label>
-            </div>
-          </details>
-          <details className="geometry-toolbar-menu">
-            <summary>View</summary>
-            <div className="geometry-toolbar-popover">
+            </ToolbarMenu>
+          <ToolbarMenu label="View">
               <span className="geometry-menu-heading">Shading <kbd>Z</kbd></span>
               {SHADING_MODES.map((entry) => (
                 <button key={entry.id} className={shading === entry.id ? "active" : ""} title={entry.hint} onClick={(e) => run(e, () => setShading(entry.id))}>
@@ -3013,8 +3413,7 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
               <hr />
               <button className={showSceneContext ? "active" : ""} onClick={(e) => run(e, () => setShowSceneContext((value) => !value))}><Layers size={13} /> Scene Context</button>
               <button onClick={(e) => run(e, focusGeometry)}>Frame All <kbd>Home</kbd></button>
-            </div>
-          </details>
+            </ToolbarMenu>
         </>)}
 
         {editorMode === "paint" && (<>
@@ -3029,9 +3428,7 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
             <input type="range" min={0.01} max={1} step={0.01} value={brushStrength} onChange={(event) => setBrushStrength(Number(event.target.value))} />
             <span>{brushStrength.toFixed(2)}</span>
           </label>
-          <details className="geometry-toolbar-menu">
-            <summary>Paint</summary>
-            <div className="geometry-toolbar-popover">
+          <ToolbarMenu label="Paint">
               <span className="geometry-menu-heading">Blend</span>
               {PAINT_BLEND_MODES.map((entry) => (
                 <button key={entry.id} className={paintBlend === entry.id ? "active" : ""} onClick={(e) => run(e, () => setPaintBlend(entry.id))}>
@@ -3054,15 +3451,11 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
               <button onClick={(e) => run(e, undoPaintStroke)}>Undo Stroke <kbd>Ctrl+Z</kbd></button>
               <button onClick={(e) => run(e, savePaintTexture)}>Save as PNG</button>
               <span className="geometry-menu-note">Saved to the project's textures folder. Assign it in the material to use it.</span>
-            </div>
-          </details>
-          <details className="geometry-toolbar-menu">
-            <summary>View</summary>
-            <div className="geometry-toolbar-popover">
+            </ToolbarMenu>
+          <ToolbarMenu label="View">
               <button className={showSceneContext ? "active" : ""} onClick={(e) => run(e, () => setShowSceneContext((value) => !value))}><Layers size={13} /> Scene Context</button>
               <button onClick={(e) => run(e, focusGeometry)}>Frame All <kbd>Home</kbd></button>
-            </div>
-          </details>
+            </ToolbarMenu>
         </>)}
 
         </div>
@@ -3078,6 +3471,7 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
           {embedded && <button className="toolbar-btn icon-only" title="Cancel scene edit" onClick={onClose}><X size={14} /></button>}
         </div>
       </div>
+      </ToolbarMenuProvider>
 
       <div className="geometry-editor-viewport" ref={hostRef}>
         {session && <AxisViewGizmo camera={session.camera} controls={session.controls} activeView={snapView} onSnap={handleAxisSnap} />}
@@ -3118,6 +3512,54 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
           }}
         />
       )}
+      {/* Blender draws the proportional influence as a circle around the
+          transform centre. Without it the wheel appears to do nothing and the
+          only sign the mode is on at all is a number in the corner. */}
+      {macroState?.circle && (() => {
+        const rect = rootRef.current?.getBoundingClientRect();
+        if (!rect) return null;
+        return (
+          <div
+            className="geometry-proportional-circle"
+            style={{
+              left: macroState.circle.x - rect.left - macroState.circle.r,
+              top: macroState.circle.y - rect.top - macroState.circle.r,
+              width: macroState.circle.r * 2,
+              height: macroState.circle.r * 2,
+            }}
+          />
+        );
+      })()}
+
+      {/* Where the magnet actually caught, so a snap is something you can see
+          rather than something you infer from the numbers afterwards. */}
+      {macroState?.snapAt && (() => {
+        const rect = rootRef.current?.getBoundingClientRect();
+        if (!rect) return null;
+        return <div className="geometry-snap-marker" style={{ left: macroState.snapAt.x - rect.left, top: macroState.snapAt.y - rect.top }} />;
+      })()}
+
+      {addMenu && (() => {
+        const rect = rootRef.current?.getBoundingClientRect();
+        if (!rect) return null;
+        return (
+          <div
+            className="geometry-add-menu"
+            style={{
+              left: Math.min(addMenu.x - rect.left, Math.max(rect.width - 190, 0)),
+              top: Math.min(addMenu.y - rect.top, Math.max(rect.height - 300, 0)),
+            }}
+            onPointerDown={(event) => event.stopPropagation()}
+            onMouseDown={(event) => event.preventDefault()}
+          >
+            <span className="geometry-menu-heading">Add Mesh</span>
+            {PRIMITIVES.map((entry) => (
+              <button key={entry.id} onClick={() => doAddPrimitive(entry.id)}>{entry.label}</button>
+            ))}
+          </div>
+        );
+      })()}
+
       {knifePoints && (
         <div className="geometry-transform-hud">
           <strong>Knife</strong>
@@ -3142,6 +3584,7 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
           </span>
           {macroState.buffer && <span className="geometry-transform-value">{macroState.buffer}{macroState.kind === "rotate" ? "°" : ""}</span>}
           {macroState.proportional && <span className="geometry-transform-value">O {Math.round((macroState.radius ?? 0) * 100) / 100}</span>}
+          {macroState.snapKind && <span className="geometry-transform-value">⌖ {macroState.snapKind}</span>}
           <small>
             {macroState.kind === "loopcut" && !macroState.locked
               ? "Scroll cuts · LMB to slide · Esc cancel"

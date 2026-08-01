@@ -37,6 +37,11 @@ portable-pty = "0.9"
 # PTY output is arbitrary bytes that can split a UTF-8 sequence across reads, so
 # it crosses to the webview base64-encoded rather than lossily stringified.
 base64 = "0.22"
+# Zipping an exported web build (the layout itch.io wants). `default-features
+# = false` keeps this to deflate — the full feature set drags in bzip2, zstd
+# and AES, none of which a game bundle needs.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+walkdir = "2"
 
 # `tauri dev` rebuilds on every restart even when nothing changed. Keep the
 # debug profile lean so the per-restart link cost stays small.

@@ -7,6 +7,7 @@ import {
   applySettingsToScene,
   rendererConstructorOptions,
   rendererNeedsRebuild,
+  applyQualityCeiling,
 } from "./sceneSettings.js";
 import { InputManager } from "./input/index.js";
 import { createDefaultMaps } from "./input/defaultMaps.js";
@@ -15,9 +16,20 @@ import { AudioSystem } from "./audio/AudioSystem.js";
 import { prefabRegistry } from "./prefab/registry.js";
 import { instantiatePrefabNode } from "./prefab/expand.js";
 import { StatsSystem } from "./StatsSystem.js";
+import { SaveSystem, PreferenceStore } from "./saveSystem.js";
+import { Tween, TweenSystem } from "./tween.js";
 import { configureTextureAssetLoader } from "./textureAsset.js";
 import { installOutputDither } from "./outputDither.js";
 import { BatchSystem } from "./batching.js";
+import { LodSystem } from "./lod/LodSystem.js";
+import { ImpostorSystem } from "./lod/ImpostorSystem.js";
+import { OcclusionSystem } from "./culling/OcclusionSystem.js";
+import { SceneManager } from "./sceneManager.js";
+import { PoolSystem } from "./pool.js";
+import { PathSystem } from "./spline/PathSystem.js";
+import { ImpulseSystem } from "./camera/impulse.js";
+import { DebugDraw } from "./debugDraw.js";
+import { DecalSystem } from "./vfx/DecalSystem.js";
 
 /**
  * Runtime core: owns the renderer, the three.js scene (source of truth)
@@ -41,6 +53,14 @@ export class Engine extends EventEmitter {
     this.rootEntities = [];
     this.timer = new THREE.Timer();
     this.updateCallbacks = new Set();
+    // Ordered post-update stage, for work that must observe the *final* pose of
+    // the frame. Unlike `updateCallbacks` (a Set, so ordered only by when each
+    // subscriber happened to attach) these carry an explicit `order`, because
+    // the pose pipeline has a required sequence: the animator writes bones,
+    // then IK bends them, then bone-attachment entities copy the result. Getting
+    // that wrong doesn't crash — it just puts the sword one frame behind the
+    // hand, which is exactly the kind of bug nobody can name.
+    this.lateUpdateCallbacks = [];
     // Callbacks fired after all update callbacks but BEFORE the main render,
     // once per frame. Use these for passes that must see the frame's final
     // transforms (post-physics, post-script) yet run ahead of the main draw —
@@ -54,9 +74,58 @@ export class Engine extends EventEmitter {
     // editor's camera-preview PIP), without the main render's
     // auto-clear wiping the PIP pixels.
     this.postRenderCallbacks = new Set();
+    // Virtual cameras register themselves here on attach. Held on the ENGINE,
+    // not in module state, because module-level registries silently duplicate
+    // under Vite's `?t=` reload twins — see the long history in the notes on
+    // `vmSingleton`. One engine, one list.
+    this.virtualCameras = new Set();
+    // Camera shake. Owned here so it survives whichever camera happens to be
+    // active: an explosion's rumble must not stop because the shot cut.
+    this.cameraImpulse = new ImpulseSystem();
+    // `engine.debug.line(...)` etc. Owned by the engine rather than the editor
+    // because its whole purpose is debugging GAMEPLAY — it has to work in Play
+    // mode and in a build, not only while the editor is stopped.
+    this.debug = new DebugDraw(this);
+    // `engine.decals.spawn(...)` — bullet holes, blood, scorch marks. Owned by
+    // the engine for the same reason as the impulse system: the decals a fight
+    // leaves behind belong to the world, not to whichever entity fired.
+    this.decals = new DecalSystem(this);
+    // `engine.spawn(...)` / `engine.despawn(...)` — prefab pooling, plus the
+    // budgeted queue behind `instantiateAsync` and `pool.prewarm`. See pool.js.
+    this.pool = new PoolSystem(this);
+    // Everything riding a spline (patrol routes, elevators, camera carts).
+    // Ticked from #tick ahead of the update callbacks so a moving platform is
+    // already in position when physics steps — see spline/PathSystem.js.
+    this.paths = new PathSystem(this);
     this.sceneName = "Untitled";
     this.playing = false;
     this.rendererReady = false;
+    // ---- Game time --------------------------------------------------------
+    // Everything a pause menu, a slow-motion effect, hitstop, or a debugger's
+    // frame-step needs. `timeScale` multiplies the delta handed to update
+    // callbacks (scripts, physics, particles, animation); `paused` freezes it
+    // entirely while rendering continues, so a paused game still draws and its
+    // UI still responds. Both reset on Stop — a script that paused the game
+    // must not leave the editor frozen (see setPlaying).
+    this.timeScale = 1;
+    this.paused = false;
+    // Wall-clock seconds since the last frame, ignoring timeScale/paused. Use
+    // it for anything that must keep moving while the game is paused: menu
+    // animations, a pause-screen camera drift, network keepalives.
+    this.unscaledDeltaTime = 0;
+    // The delta update callbacks actually received this frame (== their `dt`).
+    this.deltaTime = 0;
+    this.elapsedTime = 0; // scaled — game time
+    this.unscaledElapsedTime = 0; // wall clock since start()
+    // A backgrounded tab, a long shader-compile wave, or a breakpoint hands
+    // the next frame a delta measured in seconds. Physics would tunnel and
+    // animation would jump; clamping trades a slow-motion blip for both.
+    this.maxDeltaTime = 0.25;
+    // Frames queued by `step()`, consumed one per tick while paused.
+    this._stepFrames = 0;
+    // Fixed delta used per stepped frame — a debugger's step should advance a
+    // predictable slice, not however long the user waited before clicking.
+    this.stepDeltaTime = 1 / 60;
     // True between start() and stop(); used by the renderer-rebuild path so
     // the animation loop re-attaches to a freshly-recreated renderer.
     this.loopActive = false;
@@ -106,14 +175,43 @@ export class Engine extends EventEmitter {
     // Merges repeated (geometry, material) pairs into instanced draw calls.
     // Driven from #tick's pre-render phase, gated by settings.performance.
     this.batching = new BatchSystem(this);
+    // Picks a detail level per LOD group each frame. Ordered after batching so
+    // it can invalidate it (a hidden member still draws through its proxy).
+    this.lod = new LodSystem(this);
+    // Bakes and draws billboard impostors — the level past the last mesh level.
+    // Owns its own instanced draw rather than going through `batching`, whose
+    // grouping is per (geometry, material) on entity meshes. See ImpostorSystem.
+    this.impostors = new ImpostorSystem(this);
+    // Hides what the depth buffer says is behind something else. Off by
+    // default: it costs a low-res depth pass, which only pays for itself in a
+    // scene with real occluders (see culling/OcclusionSystem.js).
+    this.occlusion = new OcclusionSystem(this);
     // Built-in per-frame telemetry sampler. Lives on the engine — every
     // engine has one, no module registry involved. The editor's viewport
     // overlay reads `engine.stats.readout`; built games can ignore it.
     this.stats = new StatsSystem(this);
     this.stats.start();
 
+    // Runtime scene loading (menu → level 1 → level 2, additive streaming,
+    // persistent entities). See sceneManager.js; `loadScene` below is the
+    // shorthand scripts actually use.
+    this.scenes = new SceneManager(this);
+
     // Host-tunable runtime behavior (the editor writes project settings here).
-    this.config = { scriptHotReload: true, scriptReloadIntervalMs: 750 };
+    // `quality` is the build's preset name (see QUALITY_PRESETS); null in the
+    // editor, where scenes are shown exactly as authored.
+    this.config = { scriptHotReload: true, scriptReloadIntervalMs: 750, saveVersion: 1, quality: null };
+
+    // Save slots (a playthrough) and preferences (settings, cross-run flags).
+    // Deliberately separate: deleting every save must not reset the volume.
+    // See saveSystem.js — scripts opt in via `onSave`/`onLoad`.
+    // Property tweening on game time (see tween.js). `engine.tween(...)` is
+    // the shorthand scripts use.
+    this.tweens = new TweenSystem();
+
+    this.saves = new SaveSystem(this);
+    this.prefs = new PreferenceStore(this);
+    this.prefs.hydrate();
 
     // Audio runtime: shared AudioContext + listener + sound registry. Lazily
     // materialises the context once the first SoundComponent attaches or
@@ -151,6 +249,7 @@ export class Engine extends EventEmitter {
     // Batching reads `settings`, so it can only be armed once those exist.
     // applySettings() re-applies this whenever the scene changes it.
     this.batching.setEnabled(this.settings.performance?.autoBatching !== false);
+    this.occlusion.setEnabled(this.settings.performance?.occlusionCulling === true);
 
     // Set to true by `emit("hierarchy-changed")` while a coalescing microtask
     // is pending. See the `emit` override below.
@@ -237,7 +336,12 @@ export class Engine extends EventEmitter {
   /** Merges + applies a scene-settings patch; emits "settings-changed". */
   async applySettings(patch) {
     const before = this.settings;
-    this.settings = mergeSettings(before, patch ?? {});
+    // The build's quality preset is a ceiling over whatever each scene
+    // authored, and it has to be re-applied on every settings change — not
+    // once at boot — because loading level 2 brings that level's own
+    // `performance` block with it. Clamping here is the one place every path
+    // (boot, `loadScene`, a script tweaking exposure) funnels through.
+    this.settings = applyQualityCeiling(mergeSettings(before, patch ?? {}), this.config?.quality);
     // Renderer-construction options (antialias / samples / transparent) are
     // frozen at WebGPURenderer creation time. If any of them just changed,
     // tear the renderer down and rebuild it on the same canvas. The new
@@ -288,6 +392,7 @@ export class Engine extends EventEmitter {
       this.#scheduleRendererResize();
     }
     this.batching.setEnabled(this.settings.performance?.autoBatching !== false);
+    this.occlusion.setEnabled(this.settings.performance?.occlusionCulling === true);
     this.emit("settings-changed", this.settings);
     return recreatedRenderer;
   }
@@ -355,8 +460,82 @@ export class Engine extends EventEmitter {
   setPlaying(playing) {
     if (playing === this.playing) return;
     this.playing = playing;
-    if (!playing) this.input.reset();
+    if (!playing) {
+      this.input.reset();
+      // Game time is game state. A script that paused the game or slowed it to
+      // 0.1 for a death effect must not leave the editor viewport frozen or
+      // crawling after Stop.
+      this.setTimeScale(1);
+      this.setPaused(false);
+      this.elapsedTime = 0;
+      // Same reasoning as the time scale: an explosion mid-Stop must not leave
+      // the editor viewport rattling, and a two-second debug line drawn on the
+      // last frame of Play must not outlive the run that drew it.
+      this.cameraImpulse.clear();
+      this.debug.clear();
+      // Every decal, including the authored ones — those come back by way of
+      // DecalComponent's `resetOnStop`, which re-projects them against the
+      // restored scene rather than leaving a bake of the played-through one.
+      this.decals.clear();
+      // A tween left running past Stop would keep writing to entities the
+      // scene snapshot has already restored — the editor's copy of the scene
+      // would drift for as long as the tween had left to run.
+      this.tweens.clear();
+    }
     this.emit("play-changed", playing);
+  }
+
+  /**
+   * Animates numeric properties of `target` toward `to` over `duration`
+   * seconds. Dotted paths work, so the usual targets are reachable directly:
+   *
+   *     this.engine.tween(this.entity.object3D, { "position.y": 3 },
+   *                       { duration: 0.4, ease: "backOut" });
+   *     await this.engine.tween(fade, { alpha: 0 }, { duration: 0.3 });
+   *
+   * Returns a Tween: `cancel()`, `complete()`, and awaitable. On game time by
+   * default — pass `unscaled: true` for anything that must keep running while
+   * the game is paused (a pause menu's own animation).
+   */
+  tween(target, to, options) {
+    return this.tweens.add(new Tween(this.tweens, target, to, options));
+  }
+
+  /**
+   * Multiplies the delta handed to update callbacks. 0.5 = half speed, 2 =
+   * double, 0 = frozen (rendering continues either way). Reset to 1 on Stop.
+   *
+   *     this.engine.setTimeScale(0.15);            // bullet time
+   *     setTimeout(() => this.engine.setTimeScale(1), 800);
+   */
+  setTimeScale(value) {
+    const next = Math.max(0, Number(value) || 0);
+    if (next === this.timeScale) return;
+    this.timeScale = next;
+    this.emit("time-scale-changed", next);
+  }
+
+  /**
+   * Freezes game time while leaving the render loop running — what a pause
+   * menu wants. UI built on `unscaledDeltaTime` keeps animating; anything
+   * driven by the update delta stops.
+   */
+  setPaused(paused) {
+    const next = !!paused;
+    if (next === this.paused) return;
+    this.paused = next;
+    this._stepFrames = 0;
+    this.emit("paused-changed", next);
+  }
+
+  /**
+   * Advances `frames` frames of game time while paused, each worth a fixed
+   * `stepDeltaTime`. The frame-step button of a debugger; a no-op when not
+   * paused (time is already advancing).
+   */
+  step(frames = 1) {
+    if (!this.paused) return;
+    this._stepFrames += Math.max(1, Math.floor(frames));
   }
 
   /**
@@ -386,7 +565,9 @@ export class Engine extends EventEmitter {
       for (const name of next.stack) next.enableMap(name);
     }
     next.attach(this.renderer?.domElement ?? this.canvas);
-    this._inputTickUnsub = this.onUpdate((dt) => next.tick(dt));
+    // Unscaled: input is wall clock, not game time. A pause menu has to stay
+    // navigable while the game it paused is frozen.
+    this._inputTickUnsub = this.onUpdate(() => next.tick(this.unscaledDeltaTime));
     this.input = next;
     this.emit("input-changed", next);
   }
@@ -429,7 +610,8 @@ export class Engine extends EventEmitter {
     // Wire input once the canvas exists (the manager listens on it directly).
     if (!this.input.attached) {
       this.input.attach(canvas);
-      this._inputTickUnsub = this.onUpdate((dt) => this.input.tick(dt));
+      // Unscaled — see applyInput: input must survive a paused game.
+      this._inputTickUnsub = this.onUpdate(() => this.input.tick(this.unscaledDeltaTime));
     }
     return this.getBackendName();
   }
@@ -457,7 +639,24 @@ export class Engine extends EventEmitter {
 
   #tick() {
     this.timer.update();
-    const dt = this.timer.getDelta();
+    // Wall-clock delta, clamped: a backgrounded tab or a compile stall would
+    // otherwise hand physics a multi-second step to tunnel through.
+    const unscaled = Math.min(this.timer.getDelta(), this.maxDeltaTime);
+    let dt = unscaled * this.timeScale;
+    if (this.paused) {
+      // Paused: game time stops but the frame still renders, so the pause menu
+      // draws and stays interactive. `step()` releases a fixed slice at a time.
+      if (this._stepFrames > 0) {
+        this._stepFrames--;
+        dt = this.stepDeltaTime;
+      } else {
+        dt = 0;
+      }
+    }
+    this.unscaledDeltaTime = unscaled;
+    this.deltaTime = dt;
+    this.elapsedTime += dt;
+    this.unscaledElapsedTime += unscaled;
     // Refresh the shared frustum before update callbacks run so per-entity
     // culling decisions see the current frame. The frustum internally
     // no-ops when the camera hasn't moved, so this is one cheap
@@ -477,15 +676,63 @@ export class Engine extends EventEmitter {
     // back to the same value is technically a no-op in three.js — but
     // avoiding the property assignment entirely keeps the code path
     // side-effect free and easier to reason about.)
+    // Ahead of the resolve below, and after the frustum refresh above, because
+    // it decides which LOD level each group wants and the resolve is the single
+    // place that writes `visible`. An LOD group setting `object3D.visible`
+    // itself would simply be overwritten a few lines later, every frame.
+    this.lod.update();
+    // After the LOD pass, because an entity the LOD system already hid is not
+    // worth an occlusion test, and before the resolve for the same reason the
+    // LOD pass is: `_occluded` is a veto the resolve reads, not a write to
+    // `visible`. The buffer it tests against was captured a frame or two ago
+    // (see OcclusionSystem) — this is where that latency lands.
+    this.occlusion.apply();
     const modeFlag = this.playing ? "enabledInGame" : "enabledInEditor";
     for (const entity of this.entities.values()) {
-      const next = entity[modeFlag] !== false;
+      // `_lodHidden` and `_occluded` are vetoes, not overrides: a level the
+      // author disabled stays hidden even when the camera asks for it, and
+      // nothing either system does can make a disabled entity draw.
+      const next =
+        entity[modeFlag] !== false && entity._lodHidden !== true && entity._occluded !== true;
       if (entity.object3D.visible !== next) entity.object3D.visible = next;
     }
+    // Ahead of the update callbacks so a shake fired by a script this frame is
+    // sampled by the camera brain in the SAME frame — a one-frame delay is
+    // exactly long enough for a hit to feel disconnected from its impact.
+    this.cameraImpulse.update(dt);
+    // Before the update callbacks, so a script reading a tweened value this
+    // frame sees the value for this frame rather than the previous one.
+    this.tweens.update(dt, unscaled);
+    // Unscaled: a debug line's `duration` is a real-world "let me see it for
+    // two seconds", so bullet time must not stretch it to thirteen and a
+    // paused game must not freeze it on screen forever.
+    this.debug.tick(unscaled);
+    // Scaled, unlike debug draw: a decal is part of the world, so bullet time
+    // slows its fade and a pause freezes it mid-fade.
+    this.decals.update(dt);
+    // Timed despawns run on game time (a corpse fading out is part of the
+    // world); the queue drains on WALL CLOCK, because prewarming happens behind
+    // a loading screen with the game paused — see pool.js. Ahead of the update
+    // callbacks so an entity queued last frame is live for this one.
+    this.pool.update(dt);
+    this.pool.drain();
+    // Ahead of the update callbacks — and therefore ahead of the physics
+    // module, which registers one — so a kinematic platform riding a spline is
+    // already at this frame's position when the step that carries its riders
+    // runs. See spline/PathSystem.js.
+    this.paths.update(dt);
     for (const fn of this.updateCallbacks) fn(dt);
+    // Snapshot: a late callback that unsubscribes itself (an IK component
+    // detaching on the frame its target is destroyed) would otherwise mutate
+    // the array being iterated.
+    if (this.lateUpdateCallbacks.length) {
+      for (const entry of [...this.lateUpdateCallbacks]) entry.fn(dt);
+    }
     // Audio updates go after the script tick so per-frame transforms are
-    // up to date (sound positions + listener pose).
-    this.audio.update?.(dt);
+    // up to date (sound positions + listener pose). Deliberately UNSCALED:
+    // this is bookkeeping (listener pose, fades), not simulation, and a
+    // pause menu's music should not stop ramping because the game froze.
+    this.audio.update?.(unscaled);
     // rendererReady guards the re-init window (init() swaps the renderer
     // asynchronously; rendering before its backend resolves throws).
     if (this.camera && this.rendererReady) {
@@ -505,7 +752,21 @@ export class Engine extends EventEmitter {
       // scene, so a GI/postprocess prepass and the main draw agree on what
       // is on screen.
       this.batching.sync();
+      // Impostor bakes are nested renders, so they belong here — after the
+      // scene's transforms are final and before the main draw. At most one
+      // atlas is baked per frame; the rest of this call just refreshes the
+      // instance buffers.
+      this.impostors.update();
+      // The occluder depth pass reads the same finished transforms the main
+      // draw is about to. It renders and starts an async readback; the result
+      // is applied at the top of a later tick, which is what keeps this off the
+      // critical path.
+      this.occlusion.render();
       for (const fn of this.preRenderCallbacks) fn();
+      // After the preRender callbacks, so the editor's own gizmo pass — which
+      // runs there and may itself draw through `engine.debug` — is included in
+      // this frame's upload rather than the next one's.
+      this.debug.flush();
       // Re-check: a preRender callback (GI rebuild) may have suspended
       // rendering THIS frame — rendering now would sync-compile the whole
       // material wave in this frame, the exact freeze suspension prevents.
@@ -629,6 +890,32 @@ export class Engine extends EventEmitter {
   onUpdate(fn) {
     this.updateCallbacks.add(fn);
     return () => this.updateCallbacks.delete(fn);
+  }
+
+  /**
+   * Register a callback that fires after every `onUpdate` callback, in
+   * ascending `order`. This is the pose pipeline's stage list — the animator
+   * runs in `onUpdate`, then IK solvers (order 0), then bone-attachment sync
+   * (order 100). Returns an unsubscribe function.
+   *
+   * Ties keep insertion order, so equal-order callbacks behave like `onUpdate`.
+   */
+  onLateUpdate(fn, order = 0) {
+    const entry = { fn, order };
+    // Stable insert: scan to the first entry that sorts after this one rather
+    // than push-then-sort, which Array#sort would leave unstable for ties.
+    let index = this.lateUpdateCallbacks.length;
+    for (let i = 0; i < this.lateUpdateCallbacks.length; i++) {
+      if (this.lateUpdateCallbacks[i].order > order) {
+        index = i;
+        break;
+      }
+    }
+    this.lateUpdateCallbacks.splice(index, 0, entry);
+    return () => {
+      const at = this.lateUpdateCallbacks.indexOf(entry);
+      if (at >= 0) this.lateUpdateCallbacks.splice(at, 1);
+    };
   }
 
   /**
@@ -805,15 +1092,93 @@ export class Engine extends EventEmitter {
       console.warn(`instantiate: prefab not found (${typeof ref === "string" ? ref : JSON.stringify(ref)})`);
       return null;
     }
-    const entity = instantiatePrefabNode(this, { prefab: { guid, path: prefabRegistry.pathOf(guid) } }, parent);
-    if (position) entity.position = position;
-    if (rotation) entity.rotation = rotation;
-    if (scale) entity.scale = scale;
-    if (name) entity.name = name;
+    const entity = this.batchHierarchy(() => {
+      const created = instantiatePrefabNode(this, { prefab: { guid, path: prefabRegistry.pathOf(guid) } }, parent);
+      if (position) created.position = position;
+      if (rotation) created.rotation = rotation;
+      if (scale) created.scale = scale;
+      if (name) created.name = name;
+      return created;
+    });
+    // Announced once the subtree is complete AND placed. Systems that build
+    // from the entity tree (physics bodies) need both: half a subtree has no
+    // ancestor body to attach a child collider to, and a body created before
+    // the spawn position is applied puts the bullet back at the muzzle's
+    // authored origin.
+    this.emit("entity-spawned", entity);
     return entity;
   }
 
+  /**
+   * `instantiate` spread over frames. Identical result, but the work waits for
+   * room in the spawn budget (`engine.pool.budgetMs`, wall clock) instead of
+   * landing entirely in the frame that asked for it:
+   *
+   *   const boss = await this.engine.instantiateAsync(this.bossPrefab);
+   *
+   * For anything spawned repeatedly, prefer `engine.spawn` — a pool makes the
+   * cost disappear rather than merely spreading it.
+   */
+  instantiateAsync(ref, options) {
+    return this.pool.enqueue(() => this.instantiate(ref, options));
+  }
+
+  /**
+   * Pooled spawn: reuses a parked instance of this prefab when there is one,
+   * otherwise instantiates. Interchangeable with `instantiate` — a recycled
+   * instance is restored to its prefab state and its scripts get a fresh
+   * `onStart`, so gameplay code cannot tell the two apart. See pool.js.
+   *
+   *   const bullet = this.engine.spawn(this.bulletPrefab, { position: muzzle });
+   */
+  spawn(ref, options) {
+    return this.pool.spawn(ref, options);
+  }
+
+  /**
+   * Returns a pooled instance to its pool (or destroys an entity that never
+   * came from one). `delay` is in seconds of game time.
+   *
+   *   this.engine.despawn(this.entity);        // now
+   *   this.engine.despawn(this.entity, 3);     // in three seconds
+   */
+  despawn(entity, delay) {
+    const target = typeof entity === "string" ? this.getEntity(entity) : entity;
+    return target ? this.pool.despawn(target, delay) : false;
+  }
+
+  /**
+   * Loads a scene by project-relative path. The workhorse of game flow:
+   *
+   *   await this.engine.loadScene("scenes/Level2.scene");
+   *   await this.engine.loadScene("scenes/Hud.scene", { mode: "additive" });
+   *
+   * The same path works in the editor and in an exported build. See
+   * sceneManager.js for load modes, progress reporting and persistence.
+   */
+  loadScene(ref, options) {
+    return this.scenes.load(ref, options);
+  }
+
+  /** Removes an additively-loaded scene. */
+  unloadScene(ref) {
+    return this.scenes.unload(ref);
+  }
+
+  /**
+   * Marks an entity as surviving `loadScene` (Unity's DontDestroyOnLoad) —
+   * game managers, the audio listener, a player that carries between levels.
+   */
+  dontDestroyOnLoad(entity) {
+    const target = typeof entity === "string" ? this.getEntity(entity) : entity;
+    target?.setPersistent(true);
+    return target ?? null;
+  }
+
   destroyEntity(entity) {
+    // A pooled instance can also be destroyed outright (a level unload, or
+    // gameplay that just wants it gone); its bucket has to stop counting it.
+    if (entity._poolGuid) this.pool.forget(entity);
     // Remove children first (bottom-up) so component teardown sees a live tree.
     for (const child of [...entity.children]) this.destroyEntity(child);
     entity.dispose();
@@ -873,8 +1238,19 @@ export class Engine extends EventEmitter {
 
   clear({ resetSettings = true } = {}) {
     this.batchHierarchy(() => {
+      // Parked instances are not roots and not in `entities`, so the sweep
+      // below cannot see them — without this they are the one thing `clear()`
+      // leaves behind, holding their geometry and materials alive.
+      this.pool.reset();
       for (const entity of [...this.rootEntities]) this.destroyEntity(entity);
     });
+    // Decals are world geometry cut out of entities that no longer exist —
+    // without this, level 2 opens wearing level 1's bullet holes.
+    this.decals.clear();
+    // `clear` destroys persistent entities too — it means "there is no scene",
+    // not "load the next level" — so the manager must stop claiming one is
+    // loaded, and cancel any load still in flight.
+    this.scenes.reset();
     this.sceneName = "Untitled";
     if (resetSettings) this.applySettings(structuredClone(SCENE_SETTINGS_DEFAULTS));
     this.emit("hierarchy-changed");
@@ -889,6 +1265,12 @@ export class Engine extends EventEmitter {
     this.audio.dispose?.();
     this.stats.dispose();
     this.batching.dispose();
+    this.lod.dispose();
+    this.impostors.dispose();
+    this.occlusion.dispose();
+    this.decals.dispose();
+    this.pool.dispose();
+    this.paths.dispose();
     this.renderOverrides.clear();
     this.rendererReady = false;
     // Bump the rebuild token so any in-flight #rebuildRenderer awaiting

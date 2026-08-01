@@ -5,6 +5,7 @@ import {
   CUBEMAP_EXTENSIONS,
   PREFAB_EXTENSIONS,
   ANIMATOR_EXTENSIONS,
+  TIMELINE_EXTENSIONS,
   GEOMETRY_EXTENSIONS,
 } from "./assetLoader.js";
 import { useProjectStore, basename } from "./store/projectStore.js";
@@ -52,6 +53,7 @@ export function hasAssetEditor(path) {
     SCRIPT_EXTENSIONS.includes(ext) ||
     PREFAB_EXTENSIONS.includes(ext) ||
     ANIMATOR_EXTENSIONS.includes(ext) ||
+    TIMELINE_EXTENSIONS.includes(ext) ||
     CUBEMAP_EXTENSIONS.includes(ext) ||
     MATERIAL_EXTENSIONS.includes(ext) ||
     GEOMETRY_EXTENSIONS.includes(ext)
@@ -75,6 +77,9 @@ export function openAssetPath(path, { isDir = false } = {}) {
   } else if (ANIMATOR_EXTENSIONS.includes(ext)) {
     useSelectionStore.getState().selectAsset(path);
     import("./EditorShell.jsx").then((m) => m.openPanel("animator"));
+  } else if (TIMELINE_EXTENSIONS.includes(ext)) {
+    useSelectionStore.getState().selectAsset(path);
+    import("./EditorShell.jsx").then((m) => m.openPanel("timeline"));
   } else if (CUBEMAP_EXTENSIONS.includes(ext)) {
     // Face slots live in the Inspector — there's no separate cube map editor.
     useSelectionStore.getState().selectAsset(path);

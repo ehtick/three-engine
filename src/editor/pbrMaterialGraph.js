@@ -92,6 +92,25 @@ export function buildPbrGraph(maps, { armHasAo = true, factors = {} } = {}) {
     if (!maps.roughness) factoredWire("roughness", id, "g", "roughness", factors.roughness ?? 1);
     if (!maps.metalness) factoredWire("metalness", id, "b", "metalness", factors.metalness ?? 1);
   }
+  if (maps.glossiness) {
+    const tex = texNode("glossiness", maps.glossiness);
+    let source = tex;
+    let sourceHandle = "a";
+    if (factors.glossiness != null && factors.glossiness !== 1) {
+      const factor = "factor_glossiness";
+      const multiply = "mul_glossiness";
+      nodes.push({ id: factor, type: "float", props: { value: factors.glossiness }, position: { x: 330, y: row * 160 } });
+      nodes.push({ id: multiply, type: "multiply", props: {}, position: { x: 450, y: row * 160 } });
+      edges.push({ source: tex, sourceHandle: "a", target: multiply, targetHandle: "a" });
+      edges.push({ source: factor, sourceHandle: "out", target: multiply, targetHandle: "b" });
+      source = multiply;
+      sourceHandle = "out";
+    }
+    const invert = "invert_glossiness";
+    nodes.push({ id: invert, type: "oneMinus", props: {}, position: { x: 530, y: row * 160 } });
+    edges.push({ source, sourceHandle, target: invert, targetHandle: "x" });
+    wire(invert, "out", "roughness");
+  }
   if (maps.normal) {
     const tex = texNode("normal", maps.normal);
     nodes.push({ id: "nmap", type: "normalMap", props: { scale: factors.normalScale ?? 1 }, position: { x: 400, y: 420 } });

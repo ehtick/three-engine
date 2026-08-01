@@ -136,6 +136,28 @@ export class SetEntityViewOnlyCommand {
 }
 
 /**
+ * Toggles whether an entity survives `engine.loadScene` — the game manager,
+ * the audio listener, a player that carries between levels. Only matters at
+ * runtime, but it is authored here so a level transition needs no boot script.
+ */
+export class SetEntityPersistentCommand {
+  constructor(entityId, value) {
+    this.entityId = entityId;
+    this.value = !!value;
+    this.oldValue = !!engine.getEntity(entityId)?.persistent;
+    this.label = this.value ? "Keep Across Scenes" : "Destroy On Load";
+  }
+
+  do() {
+    engine.getEntity(this.entityId)?.setPersistent(this.value);
+  }
+
+  undo() {
+    engine.getEntity(this.entityId)?.setPersistent(this.oldValue);
+  }
+}
+
+/**
  * Toggles the "enabled in editor" flag on a single entity. Visible in the
  * editor (i.e. when `!engine.playing`) when true. The engine applies this
  * to `entity.object3D.visible` on every frame so changing it doesn't

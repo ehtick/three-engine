@@ -381,8 +381,12 @@ export class ScriptComponent extends Component {
     const should = live && this.#slotEnabled(index) && !slot.off;
     if (should === slot.running) return;
     slot.running = should;
-    if (should) this.#safeCall(slot, "onStart");
-    else this.#safeCall(slot, "onDestroy");
+    // Both hooks are OPTIONAL. Calling one that isn't there throws a TypeError
+    // inside #safeCall, which counts toward MAX_ERRORS — so a script defining
+    // only `onUpdate` used to log an error every Play and latch itself off on
+    // the third one. Guard here the way `dispatch()` and `#stopSlot` already do.
+    const hook = should ? "onStart" : "onDestroy";
+    if (typeof slot.instance[hook] === "function") this.#safeCall(slot, hook);
   }
 
   /** Runs onDestroy if needed and clears the instance. */
@@ -395,7 +399,36 @@ export class ScriptComponent extends Component {
     slot.moduleVersion = null;
   }
 
+  /**
+   * Resolves once every slot has finished importing and been reconciled.
+   *
+   * Script modules load asynchronously, so an entity created *right now*
+   * (`engine.instantiate` of a prefab carrying scripts) has slots but no
+   * instances for a tick or two. Anything that spawns an entity and then wants
+   * to talk to its scripts has to wait for this — the save system respawning a
+   * prefab from a slot is the motivating case: dispatching `onLoad` before the
+   * import landed silently dropped the saved state on the floor and left a
+   * default-constructed enemy standing there.
+   *
+   * Loops rather than awaiting a single snapshot because settling one slot can
+   * queue another (a reload swapping a module mid-flight).
+   */
+  async whenReady() {
+    for (let guard = 0; guard < 100 && this._pending?.size; guard++) {
+      await Promise.allSettled([...this._pending]);
+    }
+    return this;
+  }
+
   async #loadSlot(index) {
+    this._pending ??= new Set();
+    const tracked = this.#loadSlotInner(index);
+    this._pending.add(tracked);
+    tracked.finally(() => this._pending.delete(tracked));
+    return tracked;
+  }
+
+  async #loadSlotInner(index) {
     const generation = this.generation;
     const slot = this.slots?.[index];
     if (!slot?.path) return;
@@ -447,7 +480,10 @@ export class ScriptComponent extends Component {
   #tick(dt) {
     const config = this.entity.engine.config ?? {};
     const interval = (config.scriptReloadIntervalMs ?? RELOAD_CHECK_INTERVAL * 1000) / 1000;
-    this.reloadTimer += dt;
+    // Wall clock, not game time: hot reload is editor tooling. Timing it off
+    // `dt` meant pausing the game (or setting timeScale to 0) also froze the
+    // reload poll, so saving a script while paused did nothing until resume.
+    this.reloadTimer += this.entity.engine.unscaledDeltaTime ?? dt;
     if (this.reloadTimer >= interval) {
       this.reloadTimer = 0;
       if (config.scriptHotReload !== false) {

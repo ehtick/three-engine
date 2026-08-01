@@ -61,6 +61,24 @@ export class MeshComponent extends Component {
     { key: "receiveShadow", label: "Receive Shadow", type: "boolean" },
   ];
 
+  constructor(entity, props = {}) {
+    super(entity, props);
+    // Scene-wide systems must not measure the placeholder box installed by
+    // onAttach() while authored assets are still streaming in. Each flag
+    // describes only the current request generation; a superseded promise
+    // cannot clear a newer request's flag.
+    this._geometryAssetLoading = false;
+    this._materialAssetLoading = false;
+    this._extraMaterialAssetsLoading = false;
+  }
+
+  /** True while this mesh still renders any async asset placeholder state. */
+  get assetLoadsPending() {
+    return this._geometryAssetLoading ||
+      this._materialAssetLoading ||
+      this._extraMaterialAssetsLoading;
+  }
+
   onAttach() {
     const makeGeometry = geometryFactories[this.props.geometry] ?? geometryFactories.box;
     this.mesh = new THREE.Mesh(makeGeometry(), getDefaultMaterial());
@@ -79,6 +97,10 @@ export class MeshComponent extends Component {
     if (!this.mesh) return;
     this.geometryGeneration = (this.geometryGeneration ?? 0) + 1;
     this.sharedGeneration = (this.sharedGeneration ?? 0) + 1;
+    this.extraMaterialGeneration = (this.extraMaterialGeneration ?? 0) + 1;
+    this._geometryAssetLoading = false;
+    this._materialAssetLoading = false;
+    this._extraMaterialAssetsLoading = false;
     this.materialUnsub?.();
     this.materialUnsub = null;
     this.extraMaterialUnsubs?.forEach((unsubscribe) => unsubscribe());
@@ -111,24 +133,34 @@ export class MeshComponent extends Component {
 
   async #loadSharedMaterial(path) {
     const generation = (this.sharedGeneration = (this.sharedGeneration ?? 0) + 1);
-    await loadMaterialAsset(path);
-    if (generation !== this.sharedGeneration || !this.mesh) return;
-    // Re-adopt on every change: the shared instance is swapped when the .mat
-    // flips surface ↔ volume, and its renderable state flips when the graph's
-    // Surface/Volume wiring changes.
-    this.materialUnsub?.();
-    this.materialUnsub = subscribeMaterial(path, () => this.#applySharedMaterial(path));
-    this.#applySharedMaterial(path);
+    this._materialAssetLoading = true;
+    try {
+      await loadMaterialAsset(path);
+      if (generation !== this.sharedGeneration || !this.mesh) return;
+      // Re-adopt on every change: the shared instance is swapped when the .mat
+      // flips surface ↔ volume, and its renderable state flips when the graph's
+      // Surface/Volume wiring changes.
+      this.materialUnsub?.();
+      this.materialUnsub = subscribeMaterial(path, () => this.#applySharedMaterial(path));
+      this.#applySharedMaterial(path);
+    } finally {
+      if (generation === this.sharedGeneration) this._materialAssetLoading = false;
+    }
   }
 
   async #loadExtraMaterials() {
     const generation = (this.extraMaterialGeneration = (this.extraMaterialGeneration ?? 0) + 1);
     const paths = Array.from({ length: 7 }, (_, index) => this.props[`material${index + 2}`] ?? '');
-    await Promise.all(paths.filter(Boolean).map((path) => loadMaterialAsset(path)));
-    if (generation !== this.extraMaterialGeneration || !this.mesh) return;
-    this.extraMaterialUnsubs?.forEach((unsubscribe) => unsubscribe());
-    this.extraMaterialUnsubs = paths.filter(Boolean).map((path) => subscribeMaterial(path, () => this.#applyMaterialSlots()));
-    this.#applyMaterialSlots();
+    this._extraMaterialAssetsLoading = paths.some(Boolean);
+    try {
+      await Promise.all(paths.filter(Boolean).map((path) => loadMaterialAsset(path)));
+      if (generation !== this.extraMaterialGeneration || !this.mesh) return;
+      this.extraMaterialUnsubs?.forEach((unsubscribe) => unsubscribe());
+      this.extraMaterialUnsubs = paths.filter(Boolean).map((path) => subscribeMaterial(path, () => this.#applyMaterialSlots()));
+      this.#applyMaterialSlots();
+    } finally {
+      if (generation === this.extraMaterialGeneration) this._extraMaterialAssetsLoading = false;
+    }
   }
 
   #applyMaterialSlots() {
@@ -152,6 +184,7 @@ export class MeshComponent extends Component {
 
   async #loadGeometry(path) {
     const generation = (this.geometryGeneration = (this.geometryGeneration ?? 0) + 1);
+    this._geometryAssetLoading = true;
     try {
       const geometry = await acquireGeometryAsset(path);
       if (generation !== this.geometryGeneration || !this.mesh) {
@@ -174,6 +207,8 @@ export class MeshComponent extends Component {
       this.#announceSwap("geometryAsset"); // same stale-reference problem as material
     } catch (err) {
       console.warn(`Couldn't load geometry asset "${path}": ${err}`);
+    } finally {
+      if (generation === this.geometryGeneration) this._geometryAssetLoading = false;
     }
   }
 
@@ -220,6 +255,7 @@ export class MeshComponent extends Component {
       if (this.props.geometryAsset) {
         this.#loadGeometry(this.props.geometryAsset);
       } else {
+        this._geometryAssetLoading = false;
         this.#releaseGeometry(this.mesh.geometry);
         const makeGeometry = geometryFactories[this.props.geometry] ?? geometryFactories.box;
         this.mesh.geometry = makeGeometry();
@@ -247,6 +283,7 @@ export class MeshComponent extends Component {
         }
         this.#loadSharedMaterial(this.props.material);
       } else {
+        this._materialAssetLoading = false;
         this.#applyMaterialSlots();
         this.materialRenderable = true;
         this.mesh.visible = this.enabled;

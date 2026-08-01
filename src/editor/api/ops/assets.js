@@ -54,8 +54,13 @@ defineOp({
       const wanted = ext.replace(/^\./, "").toLowerCase();
       entries = entries.filter((entry) => !entry.is_dir && extOf(entry.name) === wanted);
     }
+    // Forward slashes, always. Directory listings come back from the OS with
+    // native separators while every path the API *accepts* and every path
+    // stored in a component prop uses forward slashes — so a caller that
+    // compared a listed path against one it got from `entity.get` would find
+    // they never match on Windows, for a reason nothing in the output hints at.
     return entries.map((entry) => ({
-      path: entry.path,
+      path: entry.path.replaceAll("\\", "/"),
       name: entry.name,
       isDir: !!entry.is_dir,
       size: entry.size ?? null,

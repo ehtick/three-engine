@@ -278,10 +278,31 @@ async function describeStatus() {
   };
 }
 
-/** MCP wants text content; JSON is the most useful shape for structured ops. */
-const asContent = (value) => ({
-  content: [{ type: "text", text: JSON.stringify(value ?? null, null, 2) }],
-});
+/**
+ * MCP content for an op result.
+ *
+ * JSON text for structured ops, but an op that produces a picture must come
+ * back as an image block or the whole point is lost — a base64 PNG rendered as
+ * a wall of text is worse than useless, since it burns the context window and
+ * still cannot be seen. `viewport.screenshot` marks its result with `__image`;
+ * that key is the contract between the editor and this file.
+ *
+ * The remaining fields still travel as text alongside the image, so the caller
+ * knows what it is looking at (which camera, what size).
+ */
+const asContent = (value) => {
+  if (value && typeof value === "object" && value.__image?.base64) {
+    const { __image, ...rest } = value;
+    const content = [
+      { type: "image", data: __image.base64, mimeType: __image.mimeType ?? "image/png" },
+    ];
+    if (Object.keys(rest).length) {
+      content.push({ type: "text", text: JSON.stringify(rest, null, 2) });
+    }
+    return { content };
+  }
+  return { content: [{ type: "text", text: JSON.stringify(value ?? null, null, 2) }] };
+};
 
 const asError = (message) => ({
   content: [{ type: "text", text: message }],

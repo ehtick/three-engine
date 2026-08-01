@@ -81,6 +81,10 @@ function handle(cmd, args = {}, writableRoot = null) {
         fs.mkdirSync(path.dirname(args.path), { recursive: true });
         fs.writeFileSync(args.path, args.contents ?? "", "utf8");
         return null;
+      case "write_binary_file":
+        fs.mkdirSync(path.dirname(args.path), { recursive: true });
+        fs.writeFileSync(args.path, Buffer.from(args.contents ?? []));
+        return null;
       case "create_dir":
         fs.mkdirSync(args.path, { recursive: true });
         return null;

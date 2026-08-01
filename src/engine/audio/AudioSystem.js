@@ -214,6 +214,58 @@ export class AudioSystem {
     return null;
   }
 
+  /**
+   * Fires a decoded buffer through the master bus and hands back a handle that
+   * can stop it. Non-spatial and un-pooled: this is for sound that belongs to
+   * the *presentation* rather than to an object in the world — a timeline's
+   * dialogue and stings, a UI click — where a SoundComponent on an entity would
+   * be an entity invented purely to hold a sound.
+   *
+   * `offset` starts playback partway in, which is what lets a timeline seek into
+   * the middle of a clip and hear the right moment rather than the start.
+   */
+  playOneShot(buffer, { volume = 1, offset = 0, loop = false, playbackRate = 1 } = {}) {
+    if (!buffer || !this.context || !this.masterGain) return null;
+    const context = this.context;
+    let source;
+    try {
+      source = context.createBufferSource();
+    } catch {
+      return null;
+    }
+    source.buffer = buffer;
+    source.loop = !!loop;
+    source.playbackRate.value = playbackRate;
+    const gain = context.createGain();
+    gain.gain.value = Math.max(0, volume);
+    source.connect(gain);
+    gain.connect(this.masterGain);
+    let stopped = false;
+    const cleanup = () => {
+      if (stopped) return;
+      stopped = true;
+      try { source.disconnect(); } catch {}
+      try { gain.disconnect(); } catch {}
+    };
+    source.onended = cleanup;
+    const start = Math.max(0, offset);
+    try {
+      source.start(0, loop ? start % buffer.duration : Math.min(start, buffer.duration));
+    } catch {
+      cleanup();
+      return null;
+    }
+    return {
+      source,
+      gain,
+      stop() {
+        if (stopped) return;
+        try { source.stop(); } catch {}
+        cleanup();
+      },
+    };
+  }
+
   setMasterVolume(value) {
     this.masterVolume = Math.max(0, Math.min(1, value));
     if (this.masterGain && this.context) {

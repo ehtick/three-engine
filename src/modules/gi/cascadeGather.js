@@ -22,7 +22,7 @@
 import { Fn, If, Loop, Return, float, floor, instanceIndex, instancedArray, max, mix, mod, select, smoothstep, step, vec3, vec4 } from "three/tsl";
 import { octahedralTexelIndex, octahedralUV } from "./cascadeTrace.js";
 import { sharedFn } from "./giFn.js";
-import { sphereLightFactor } from "./giLight.js";
+import { emitterAngularRadius, emitterSlotFactor, emitterSurfaceT } from "./giLight.js";
 
 
 
@@ -237,15 +237,29 @@ export function createIrradianceGather(cascades, probeIrradiance = null, fieldCe
         }
       });
 
+      // OUTSIDE-VOLUME FADE. Probe coordinates clamp at the lattice edge, so
+      // a receiver beyond the volume read the BOUNDARY probes' values smeared
+      // to infinity — a large floor plane extending past the volume showed
+      // the boundary cells as giant streaks/stripes across everything outside
+      // it (the "GI goes in weird stripes" report). Fade the gather out over
+      // ~1.25 probe cells past the box instead: an honest "the field ends
+      // here". Analytic emitter/light terms are volume-independent and keep
+      // lighting those receivers.
+      const sizeVec = probeCellVec.mul(vec3(grid.x, grid.y, grid.z));
+      const rel0 = P.sub(minVec);
+      const outsideVec = rel0.negate().max(rel0.sub(sizeVec)).max(vec3(0));
+      const fadeDist = probeCellVec.x.max(probeCellVec.y).max(probeCellVec.z).mul(1.25);
+      const edgeFade = smoothstep(float(0), fadeDist, outsideVec.length()).oneMinus();
+
       // Fast path: acc already carries per-probe irradiance E — normalize by
       // the probe weights. Legacy path: E = π · (Σ L·cos / Σ cos), the
       // cosine-weighted AVERAGE radiance times π — exact for uniform L at any
       // direction count and bounded E ≤ π·max(L), so the feedback loop's gain
       // stays ≤ albedo < 1 (always convergent). All-probes-rejected → 0.
       if (probeIrradiance) {
-        return acc.div(max(cosAcc, 1e-3));
+        return acc.div(max(cosAcc, 1e-3)).mul(edgeFade);
       }
-      return acc.div(max(cosAcc, 1e-3)).mul(Math.PI);
+      return acc.div(max(cosAcc, 1e-3)).mul(Math.PI).mul(edgeFade);
     },
   });
   return (P, N) => gatherFn(vec3(P), vec3(N));
@@ -318,7 +332,16 @@ export function createRadianceLookup(cascades, level = 2) {
         .add(s11.mul(fu.mul(fv)));
       acc.addAssign(filtered.mul(weight));
     });
-    return acc;
+    // Same outside-volume fade as the gather (see createIrradianceGather):
+    // glossy surfaces beyond the volume otherwise streak the clamped
+    // boundary probes' radiance across their whole extent.
+    const cellVec = vec3(cellX, cellY, cellZ);
+    const sizeVec = cellVec.mul(vec3(grid.x, grid.y, grid.z));
+    const rel0 = P.sub(vec3(world.min));
+    const outsideVec = rel0.negate().max(rel0.sub(sizeVec)).max(vec3(0));
+    const fadeDist = cellVec.x.max(cellVec.y).max(cellVec.z).mul(1.25);
+    const edgeFade = smoothstep(float(0), fadeDist, outsideVec.length()).oneMinus();
+    return acc.mul(edgeFade);
   });
 }
 
@@ -459,9 +482,11 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
         }
       }
 
-      // Promoted emitters: sphere-area direct, E = color·min(π, πr²/d²)·cos,
-      // SDF-shadowed with k from the emitter's angular size (same model the
-      // receiver-side material term uses — the two stay in agreement).
+      // Promoted emitters: analytic area direct — sphere slots use the
+      // horizon-aware sphere factor, box slots the exact per-face form
+      // factor — SDF-shadowed with k from the emitter's angular size (the
+      // SAME emitterSlotFactor the receiver-side material term uses, so the
+      // two stay in agreement).
       if (emitterSlots?.length && shadowTrace) {
         const rawAlbedo = surface.xyz;
         for (const slot of emitterSlots) {
@@ -472,34 +497,44 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
             // ONE-SIDED (see the analytic-slot note above) — the outside
             // shell of a wall must never take the inside lamp's light.
             // Raw cosθ feeds the HORIZON-aware sphere factor: a lamp
-            // resting on a surface still lights the cells around it (the
-            // factor is ~0 for cosθ ≤ −sinR, so wall backs stay dark).
+            // resting on a surface still lights the cells around it. Box
+            // slots are one-sided by construction (receiver-facing faces
+            // integrate against the cell's own normal, horizon-clamped).
             const cosTheta = dir.dot(normal).toVar();
             const sinR = float(slot.radius).div(dist).clamp(0, 1).toVar();
-            const factor = sphereLightFactor(cosTheta, sinR).toVar();
-            const solidAngle = float(Math.PI).mul(sinR).mul(sinR);
+            const factor = emitterSlotFactor(slot, cellCenter, normal, cosTheta, sinR).toVar();
             // Dim-cell cutoff with the same SMOOTH fade as the analytic
             // gate above (a binary skip rings at the iso-luminance edge).
-            const emitterEnergy = vec3(slot.color).mul(solidAngle).mul(factor);
+            const emitterEnergy = vec3(slot.color).mul(factor);
             const emitterCellLum = emitterEnergy.dot(vec3(0.2126, 0.7152, 0.0722)).toVar();
-            If(factor.greaterThan(1e-4).and(emitterCellLum.greaterThan(0.002)), () => {
+            If(factor.greaterThan(1e-6).and(emitterCellLum.greaterThan(0.002)), () => {
               const origin = cellCenter.add(normal.mul(normalLiftV));
-              const k = dist.div(float(slot.radius).max(0.05)).clamp(1.2, 48);
-              const maxT = dist.sub(float(slot.radius)).sub(normalLiftV).max(0);
+              const k = dist.div(float(emitterAngularRadius(slot)).max(0.05)).clamp(1.2, 48);
+              const maxT = emitterSurfaceT(slot, origin, dir, dist).sub(normalLiftV).max(0);
               const shadow = float(1).toVar();
               If(maxT.greaterThan(normalLiftV), () => {
+                // Exclusion = lamp body + ~2 cells, NOT a fixed 2m — a
+                // fixed radius exempted nearby walls from occluding. Box
+                // slots dilate their OBB instead of the bounding sphere
+                // (a panel's sphere swallowed the ceiling above it → the
+                // field itself carried light into the next room).
+                const kindF = slot.kind ? float(slot.kind) : null;
+                const exRadius = kindF
+                  ? mix(float(slot.radius).mul(1.5).add(normalLiftV.mul(2)), normalLiftV.mul(2), kindF)
+                  : float(slot.radius).mul(1.5).add(normalLiftV.mul(2));
+                const exBox = kindF
+                  ? { half: mix(vec3(-1), vec3(slot.half), kindF), bx: slot.bx, by: slot.by, bz: slot.bz }
+                  : null;
                 shadow.assign(
                   shadowTrace(
                     origin, dir, maxT, k, cosTheta.max(0),
-                    // Exclusion = lamp body + ~2 cells, NOT a fixed 2m — a
-                    // fixed radius exempted nearby walls from occluding.
-                    vec3(slot.center), float(slot.radius).mul(1.5).add(normalLiftV.mul(2)),
+                    vec3(slot.center), exRadius, exBox,
                   ),
                 );
               });
               const direct = rawAlbedo
                 .mul(vec3(slot.color))
-                .mul(solidAngle.mul(factor).mul(1 / Math.PI))
+                .mul(factor.mul(1 / Math.PI))
                 .mul(shadow)
                 .mul(smoothstep(0.002, 0.006, emitterCellLum));
               out.assign(vec4(out.xyz.add(direct), out.w));

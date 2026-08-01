@@ -30,20 +30,26 @@ import * as THREE from "three/webgpu";
 import {
   Fn,
   If,
+  abs,
   float,
   instanceIndex,
   ivec2,
   mrt,
   normalWorld,
   positionWorld,
+  reflect,
+  select,
+  step,
   texture,
   textureStore,
   uniform,
+  vec2,
   vec3,
   vec4,
 } from "three/tsl";
 import { MAX_EMITTERS, emitterDirectAt } from "./giLight.js";
 import { EDITOR_LAYER } from "../../engine/editorLayers.js";
+import { ALBEDO_ATLAS_GRID, ALBEDO_ATLAS_SIZE, ALBEDO_ATLAS_TILE } from "./bvh/bvhScene.js";
 
 /**
  * Gbuffer for the GI resolve: world position (+ valid mask) and world normal,
@@ -158,11 +164,11 @@ export function renderGiGBuffer(renderer, scene, camera, gbuffer) {
  * glossy materials would have to re-trace shadows per pixel, which is
  * exactly the per-material cost this pass exists to remove.
  */
-export function createGiResolve({ gbuffer, targets, width, height, gather, normalOffset, intensity, emitter }) {
+export function createGiResolve({ gbuffer, targets, width, height, gather, normalOffset, intensity, emitter, radiance }) {
   // The TARGETS are owned by the caller and outlive every rebuild: materials
   // sample them through persistent texture nodes, so recreating them here
   // would silently leave already-compiled materials bound to dead textures.
-  const { irradiance, emitterShadow } = targets;
+  const { irradiance, emitterShadow, radiance: radianceTarget } = targets;
 
   // Size lives in a uniform so a viewport resize is a uniform write, not a
   // shader rebuild (the WGSL stays byte-identical → three's node cache and
@@ -179,15 +185,23 @@ export function createGiResolve({ gbuffer, targets, width, height, gather, norma
     const g0 = positionNode.load(coord).toVar();
     const g1 = normalNode.load(coord).toVar();
     const out = vec3(0).toVar();
+    const reflectedOut = vec3(0).toVar();
     // One var per emitter slot: TSL can't assign INTO a vec4 var's components,
     // and the values are produced inside the If below, so they have to be
     // declared outside it and packed afterwards.
     const shadowVars = Array.from({ length: MAX_EMITTERS }, () => float(1).toVar());
     If(g0.w.greaterThan(0.5), () => {
       const P = g0.xyz.toVar();
-      const N = g1.xyz.normalize().toVar();
+      const rawN = g1.xyz.normalize().toVar();
+      const facing = step(0, rawN.dot(radiance?.cameraPosition?.sub(P) ?? rawN)).mul(2).sub(1);
+      const N = rawN.mul(facing).toVar();
       const samplePoint = P.add(N.mul(normalOffset)).toVar();
       out.assign(vec3(gather(samplePoint, N)).mul(intensity));
+      if (radiance) {
+        const incident = P.sub(radiance.cameraPosition).normalize().toVar();
+        const reflected = reflect(incident, N).toVar();
+        reflectedOut.assign(vec3(radiance.lookup(samplePoint, reflected)).mul(intensity));
+      }
       if (emitter) {
         const direct = emitterDirectAt(emitter, P, N, samplePoint);
         out.addAssign(direct.irradiance.mul(intensity));
@@ -198,6 +212,120 @@ export function createGiResolve({ gbuffer, targets, width, height, gather, norma
     });
     textureStore(irradiance, coord, vec4(out, 1));
     textureStore(emitterShadow, coord, vec4(shadowVars[0], shadowVars[1], shadowVars[2], shadowVars[3]));
+    textureStore(radianceTarget, coord, vec4(reflectedOut, 1));
+  })().compute(width * height);
+
+  return { compute, widthU };
+}
+
+/**
+ * Octahedral-encodes a unit vector into 2 floats in [-1,1] (Cigolle et al.,
+ * "A Survey of Efficient Representations for Independent Unit Vectors") —
+ * how createGiBvhReflect packs the BVH hit's exact face normal into the
+ * t-target's otherwise-unused .zw (see that function's STRIPING FIX
+ * comment below). The HalfFloatType target stores signed components
+ * directly, so unlike a u8-texture oct encoding there is no extra
+ * ×0.5+0.5 remap here. Decoded in giLight.js with the matching closed-form
+ * inverse — no `.toVar()`/`If()` there, that consumption path is PURE
+ * DATAFLOW by design (see its own comment).
+ */
+function octEncodeNormal(n) {
+  const denom = abs(n.x).add(abs(n.y)).add(abs(n.z)).max(1e-8).toVar();
+  const p = n.xy.div(denom).toVar();
+  const signNotZero = vec2(
+    select(p.x.greaterThanEqual(0), 1, -1),
+    select(p.y.greaterThanEqual(0), 1, -1),
+  ).toVar();
+  const folded = float(1).sub(abs(p.yx)).mul(signNotZero).toVar();
+  return select(n.z.lessThan(0), folded, p);
+}
+
+/**
+ * Half-res BVH exact-reflection prepass (GI Phase 3 v1 — see
+ * docs/GI_PLAN.md). Reads the SAME gbuffer the irradiance resolve reads
+ * (position + normal), fires ONE reflection ray per pixel through the
+ * multi-mesh BVH (src/modules/gi/bvh/bvhScene.js), and stores the hit
+ * distance (miss = -1) into a screen texture. giLight's mirror block
+ * samples this by screen UV INSTEAD OF calling the SDF `mirrorTraceFn` when
+ * `light.bvhReflectTexture` is set — everything downstream of the hit
+ * distance (hit shading, per-hit shadows) is unchanged; only the t SOURCE
+ * moves from a per-material SDF trace to this shared compute pass.
+ *
+ * BVH tracing happens ONLY here (a compute pass), never inside a material:
+ * the traversal needs 4 storage buffers plus a per-mesh uniform table, and
+ * materials already sit at the 8-storage-buffer fragment-stage limit (see
+ * docs/GI_PLAN.md Phase 3 and the dead 2026-07-16 ReSTIR attempt that first
+ * hit that ceiling).
+ */
+export function createGiBvhReflect({ gbuffer, target, colorTarget, width, height, bvhScene, cameraPosition, normalOffset, maxDistance }) {
+  const widthU = uniform(width, "uint");
+  const positionNode = texture(gbuffer.position);
+  const normalNode = texture(gbuffer.normal);
+  // `colorTarget` (GI Phase 3 v2 — texture-at-hit) is a second StorageTexture
+  // (createGiBvhTarget's `bvhColor`) this pass writes alongside `target`:
+  // rgb = the hit's ACTUAL texture-sampled albedo (bvhScene.js `firstHit`'s
+  // atlas lookup), a = 1 on a hit, 0 on a miss. giLight.js reads both at the
+  // same screen UV to substitute real per-pixel texture detail for the
+  // mean-color mesh-SDF albedo, on pixels the BVH actually resolved.
+  //
+  // STRIPING FIX (GI Phase 3 v3). This pass USED TO back the stored t off
+  // along the RAY direction (`hit.t.sub(standoff)`) so the shading sample
+  // landed just inside the composited field's occupancy shell, matching
+  // where the SDF mirror trace this replaces always lands (it undershoots
+  // the surface by `hitCut ≈ 0.45·cell` — see sdfScene.js
+  // createMirrorTrace). That works head-on, but at a GRAZING reflection
+  // angle the ray direction is nearly tangent to the surface, so backing
+  // off a fixed t barely moves the sample off the surface at all — it
+  // keeps skimming the occupancy shell, and the trilinear gather taps
+  // alternate inside/outside voxels: banded/striped shading across an
+  // otherwise-flat reflected face (user report). The fix has to depend on
+  // the SURFACE's orientation, not the ray's: store the RAW hit t (no
+  // standoff at all) plus the hit's EXACT face normal — bvhScene.js
+  // `firstHit`'s new `normal` return, octahedral-encoded (see
+  // octEncodeNormal above) into this texture's otherwise-unused .zw
+  // (t stays .r, dynFlag .g) — and let the consumer (giLight.js) offset
+  // the reconstructed hitPoint along THAT normal instead of along the ray.
+  const compute = Fn(() => {
+    const px = instanceIndex.mod(widthU);
+    const py = instanceIndex.div(widthU);
+    const coord = ivec2(px.toInt(), py.toInt());
+    const g0 = positionNode.load(coord).toVar();
+    const g1 = normalNode.load(coord).toVar();
+    const t = float(-1).toVar();
+    // g channel: 1 when the ray could cross a BVH-excluded mesh (skinned…)
+    // EARLIER than the BVH hit — the consumer must union in the SDF trace
+    // there (and ONLY there: a global union re-seals every silhouette with
+    // the SDF's melted phantom hits, measured as the harness delta
+    // collapsing 20 → 0).
+    const dynFlag = float(0).toVar();
+    // Hit albedo (GI Phase 3 v2) — stays (0,0,0,0) on every thread that
+    // never reaches a hit (no gbuffer geometry, or the BVH trace missed),
+    // matching `t`'s own miss default.
+    const albedo = vec3(0).toVar();
+    const hasAlbedo = float(0).toVar();
+    // Oct-encoded hit normal (GI Phase 3 v3) — stays (0,0) on a miss;
+    // giLight.js only trusts it when the SAME pixel's hasAlbedo (bvhCol.a)
+    // is also set, so an undecoded miss value is never shaded with.
+    const octXY = vec2(0).toVar();
+    If(g0.w.greaterThan(0.5), () => {
+      const P = g0.xyz.toVar();
+      const N = g1.xyz.normalize().toVar();
+      const incident = P.sub(cameraPosition).normalize().toVar();
+      const R = reflect(incident, N).toVar();
+      const origin = P.add(N.mul(normalOffset)).toVar();
+      const hit = bvhScene.firstHit(origin, R, float(maxDistance));
+      If(hit.t.greaterThanEqual(0), () => {
+        t.assign(hit.t);
+        albedo.assign(hit.albedo);
+        hasAlbedo.assign(hit.hasAlbedo);
+        octXY.assign(octEncodeNormal(hit.normal));
+      });
+      if (!globalThis.__giBvhV1) {
+        dynFlag.assign(bvhScene.dynamicBlocked(origin, R, t, float(maxDistance)));
+      }
+    });
+    textureStore(target, coord, vec4(t, dynFlag, octXY.x, octXY.y));
+    if (colorTarget) textureStore(colorTarget, coord, vec4(albedo, hasAlbedo));
   })().compute(width * height);
 
   return { compute, widthU };
@@ -234,13 +362,210 @@ export function createGiTargets(width, height) {
   const emitterShadow = new THREE.StorageTexture(width, height);
   emitterShadow.name = "giEmitterShadow";
   emitterShadow.version = version;
+  const radiance = new THREE.StorageTexture(width, height);
+  radiance.type = THREE.HalfFloatType;
+  radiance.name = "giRadiance";
+  radiance.version = version;
   if (import.meta.env?.DEV) globalThis.__giLastTargetVersion = version;
   return {
     irradiance,
     emitterShadow,
+    radiance,
     dispose() {
       irradiance.dispose();
       emitterShadow.dispose();
+      radiance.dispose();
     },
   };
+}
+
+/**
+ * Sibling of createGiTargets for the BVH reflect pass's output (see
+ * createGiBvhReflect above) — created/retired separately because it is
+ * OPTIONAL (quality-gated, runtime-hatchable — see GISystem's
+ * `#bvhReflectionsEnabled`), unlike irradiance/emitterShadow which every
+ * build needs. Same forced-version trick as createGiTargets (read that
+ * function's comment — it is load-bearing on resize, not decorative).
+ *
+ * Format: a single signed float (hit distance, miss = -1) needs a float
+ * type — HalfFloatType on the default RGBAFormat (rgba16float) matches
+ * `irradiance`'s own convention and is a base-WebGPU storage-capable format
+ * (r16float, notably, is NOT a valid storage-texture format — only r32float
+ * is among single-channel floats). Only the R channel carries data.
+ *
+ * FILTERING IS THE ONE DELIBERATE DEPARTURE from irradiance/emitterShadow's
+ * convention: those hold smooth radiance/shadow-factor values where
+ * StorageTexture's default LinearFilter blends half-res texels into a
+ * softer full-res look — desirable. `t` is a hit DISTANCE, not a color —
+ * bilinear-blending two valid t's from adjacent pixels either side of a
+ * silhouette (say t=2 hitting a sphere, t=5 hitting the wall behind it)
+ * yields t=3.5, which is not on ANY real surface along that ray. Sampling
+ * that corrupted t then computes `hitPoint` off in empty space, and
+ * whatever `hitSurfaceFn`/`mirrorSampleFn` finds nearest to THAT reads
+ * dimmer/wrong — measured as run-gi-rc-mirror's mirrorLeft (sampled right
+ * at the mirror sphere's silhouette) landing at rgb(26,0,0) instead of the
+ * SDF arm's exact rgb(39,1,0). NearestFilter fixes it: every sample reads
+ * one pixel's real, unblended trace result.
+ *
+ * `bvhColor` (GI Phase 3 v2 — texture-at-hit) is `bvhReflect`'s sibling: the
+ * hit's real texture-sampled albedo (rgb) + a hit flag (a). Same NearestFilter
+ * reasoning applies even more directly here — it holds a COLOR sampled at a
+ * specific triangle, so blending two different hits' colors across a
+ * silhouette is exactly as wrong as blending two different t's. Same
+ * forced-version trick, created/disposed together with `bvhReflect` (one
+ * `createGiBvhTarget()` call, one version, one lifetime).
+ */
+export function createGiBvhTarget(width, height) {
+  const version = globalThis.__giNoTargetVersion ? 0 : ++targetGeneration;
+  const bvhReflect = new THREE.StorageTexture(width, height);
+  bvhReflect.type = THREE.HalfFloatType;
+  bvhReflect.minFilter = THREE.NearestFilter;
+  bvhReflect.magFilter = THREE.NearestFilter;
+  bvhReflect.name = "giBvhReflect";
+  bvhReflect.version = version;
+  const bvhColor = new THREE.StorageTexture(width, height);
+  bvhColor.type = THREE.HalfFloatType;
+  bvhColor.minFilter = THREE.NearestFilter;
+  bvhColor.magFilter = THREE.NearestFilter;
+  bvhColor.name = "giBvhColor";
+  bvhColor.version = version;
+  return {
+    bvhReflect,
+    bvhColor,
+    dispose() {
+      bvhReflect.dispose();
+      bvhColor.dispose();
+    },
+  };
+}
+
+/**
+ * GPU-blits atlas tiles the canvas 2D path in bvhScene.js's buildAlbedoAtlas
+ * could not draw — overwhelmingly KTX2/Basis-compressed material maps, which
+ * have no CPU-readable `.image` for `ctx.drawImage` to sample (see that
+ * function's own comment). The compute shader that actually SAMPLES the
+ * atlas (bvhScene.js `firstHit`) has no such limitation: a compressed
+ * texture is real, native GPU data, decoded by the sampler hardware exactly
+ * like any other texture — the only reason those tiles were ever a flat
+ * mean color is that the CANVAS couldn't see the pixels, not that the GPU
+ * can't.
+ *
+ * One-shot per bvhScene build, entirely self-guarding: a no-op whenever
+ * `bvhScene.pendingGpuTiles` is empty, which is true both BEFORE the first
+ * call that has real work to do and forever AFTER that call finishes (it
+ * clears the list). Callers (GISystem's `#tick`) can therefore call this
+ * every frame unconditionally — see that call site's own comment.
+ *
+ * MECHANISM: two kinds of ordinary textured-quad passes (three's own
+ * QuadMesh — the exact idiom every postprocessing pass in this three.js
+ * build uses to relay one texture into another render target) into a fresh
+ * 2048x2048 target: first the EXISTING canvas atlas whole (so every
+ * already-drawn/solid-filled tile survives unchanged), then one quad per
+ * pending tile with the viewport+scissor restricted to that tile's 256x256
+ * rect, sampling the compressed map directly. Renderer state is saved and
+ * restored via three's own RendererUtils — the same helper three's
+ * postprocessing nodes use for exactly this "nested render mid-frame" shape
+ * (renderGiGBuffer above hand-rolls the same idea for a narrower, scene/
+ * camera-specific set of fields; this pass only ever touches the renderer).
+ *
+ * COLOR SPACE: the destination target is declared LINEAR colorSpace
+ * (HalfFloatType has no `-srgb` GPU format variant to begin with, so this
+ * is belt-and-braces, not load-bearing, for THAT type specifically — but it
+ * is the semantically correct label and keeps the invariant explicit).
+ * `texture(atlasTexture)`/`texture(map)` sampling auto-decodes each SOURCE
+ * (both declared SRGBColorSpace, like any authored color texture) to linear
+ * exactly once, at the GPU-format level — this renderer never bakes a
+ * second, shader-side color-space conversion on top (see TextureNode's
+ * `needsToWorkingColorSpace` callers: always format/hardware-driven here,
+ * never WGSL-codegen-driven), so the linear value sampled is exactly the
+ * linear value stored, and exactly the linear value read back later with no
+ * further decode. A solid-fill tile therefore reads the SAME color before
+ * and after this pass runs (old atlas, sRGB-decoded once → stored linear →
+ * new target, read with no decode) — that equivalence is the whole
+ * color-space correctness bar for this function, and is what makes swapping
+ * `atlasTextureNode.value` afterward safe without rebuilding bvhScene's
+ * already-compiled compute graph.
+ *
+ * @param {import("three/webgpu").Renderer} renderer
+ * @param {ReturnType<typeof import("./bvh/bvhScene.js").buildBvhScene>} bvhScene
+ * @return {number} Tiles actually blitted this call (0 = no-op).
+ */
+export function blitBvhAtlasTiles(renderer, bvhScene) {
+  const pending = bvhScene?.pendingGpuTiles;
+  if (!pending || pending.length === 0) return 0;
+
+  const rt = new THREE.RenderTarget(ALBEDO_ATLAS_SIZE, ALBEDO_ATLAS_SIZE, {
+    depthBuffer: false,
+    stencilBuffer: false,
+    generateMipmaps: false,
+    minFilter: THREE.LinearFilter,
+    magFilter: THREE.LinearFilter,
+  });
+  rt.texture.name = "giBvhAtlasBlit";
+  rt.texture.type = THREE.HalfFloatType;
+  // Belt-and-braces label — see the COLOR SPACE note above for why this
+  // isn't actually load-bearing for a HalfFloatType target in this renderer.
+  rt.texture.colorSpace = THREE.LinearSRGBColorSpace;
+  rt.texture.wrapS = THREE.ClampToEdgeWrapping;
+  rt.texture.wrapT = THREE.ClampToEdgeWrapping;
+  // Forced-unique version — see createGiTargets' own comment on
+  // `targetGeneration`: a freshly constructed texture defaults to version 0,
+  // invisible to the bind-group-invalidation check three does when
+  // `atlasTextureNode.value` is repointed below unless the new version is
+  // guaranteed different from whatever was bound (the canvas atlas) before.
+  rt.texture.version = ++targetGeneration;
+
+  const rendererState = THREE.RendererUtils.saveRendererState(renderer);
+  const quad = new THREE.QuadMesh();
+  let blitted = 0;
+  try {
+    renderer.setRenderTarget(rt);
+    renderer.setScissorTest(false);
+    rt.viewport.set(0, 0, ALBEDO_ATLAS_SIZE, ALBEDO_ATLAS_SIZE);
+    rt.scissor.set(0, 0, ALBEDO_ATLAS_SIZE, ALBEDO_ATLAS_SIZE);
+
+    // Pass 1: relay the existing canvas atlas forward whole, so every tile
+    // the CPU path already drew or solid-filled survives unchanged.
+    const copyMaterial = new THREE.NodeMaterial();
+    copyMaterial.colorNode = texture(bvhScene.atlasTexture);
+    copyMaterial.transparent = false;
+    copyMaterial.depthTest = false;
+    copyMaterial.depthWrite = false;
+    copyMaterial.fog = false;
+    quad.material = copyMaterial;
+    quad.render(renderer);
+    copyMaterial.dispose();
+
+    // Pass 2+: one quad per pending tile, viewport+scissor restricted to
+    // that tile's rect, sampling the compressed map directly — the GPU can
+    // decode it even though the canvas never could.
+    renderer.setScissorTest(true);
+    for (const { map, tileIndex } of pending) {
+      const tileX = (tileIndex % ALBEDO_ATLAS_GRID) * ALBEDO_ATLAS_TILE;
+      const tileY = Math.floor(tileIndex / ALBEDO_ATLAS_GRID) * ALBEDO_ATLAS_TILE;
+      rt.viewport.set(tileX, tileY, ALBEDO_ATLAS_TILE, ALBEDO_ATLAS_TILE);
+      rt.scissor.set(tileX, tileY, ALBEDO_ATLAS_TILE, ALBEDO_ATLAS_TILE);
+      const tileMaterial = new THREE.NodeMaterial();
+      tileMaterial.colorNode = texture(map);
+      tileMaterial.transparent = false;
+      tileMaterial.depthTest = false;
+      tileMaterial.depthWrite = false;
+      tileMaterial.fog = false;
+      quad.material = tileMaterial;
+      quad.render(renderer);
+      tileMaterial.dispose();
+      blitted++;
+    }
+  } finally {
+    THREE.RendererUtils.restoreRendererState(renderer, rendererState);
+  }
+
+  // Repoint the PERSISTENT atlas texture node (see bvhScene.js's own
+  // comment on `atlasTextureNode`) at the blitted target — the already-
+  // compiled bvhReflect compute graph picks this up next dispatch with no
+  // rebuild, exactly like GISystem's own `_giBvhReflectNode.value` swaps.
+  bvhScene.atlasTextureNode.value = rt.texture;
+  bvhScene.blitTarget = rt;
+  pending.length = 0;
+  return blitted;
 }

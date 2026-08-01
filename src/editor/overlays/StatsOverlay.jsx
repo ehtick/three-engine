@@ -49,6 +49,11 @@ const EMPTY_READOUT = {
   drawCalls: 0,
   triangles: 0,
   textureMem: 0,
+  occlusionCulled: 0,
+  occlusionTested: 0,
+  impostors: 0,
+  pooled: 0,
+  spawnQueue: 0,
 };
 
 function readStats() {
@@ -61,7 +66,19 @@ function readStats() {
   // The StatsSystem mutates its readout in place every frame; React's
   // useState bails out on identical references, so we shallow-clone to
   // guarantee every 10 Hz poll triggers a render.
-  return { ...stats.readout };
+  //
+  // Culling counters are read straight off their systems rather than routed
+  // through the StatsSystem: they are per-frame decisions those systems already
+  // hold, and copying them into a second place every frame would be work whose
+  // only purpose is to be read ten times a second.
+  return {
+    ...stats.readout,
+    occlusionCulled: engine.occlusion?.culledLastFrame ?? 0,
+    occlusionTested: engine.occlusion?.testedLastFrame ?? 0,
+    impostors: engine.impostors?.visibleCount ?? 0,
+    pooled: engine.pool?.size ?? 0,
+    spawnQueue: engine.pool?.pending ?? 0,
+  };
 }
 
 function readCollapsed() {
@@ -81,7 +98,13 @@ function writeCollapsed(v) {
   }
 }
 
-export function StatsOverlay() {
+/**
+ * `forceVisible` opts out of the viewport's Layers toggle. The Game panel uses
+ * it: telemetry is the point of that view, and its overlay must not be
+ * switched off by a dropdown that lives in a different panel and doesn't
+ * mention it.
+ */
+export function StatsOverlay({ forceVisible = false }) {
   const [r, setR] = useState(EMPTY_READOUT);
   const [visible, setVisible] = useState(true);
   const [collapsed, setCollapsed] = useState(readCollapsed);
@@ -90,7 +113,10 @@ export function StatsOverlay() {
   // Mirror viewport.layers.stats so the Layers-dropdown toggle controls
   // mounting. (The "Stats" entry sits alongside Gizmos/Colliders/Grid in
   // the dropdown; turning it off hides the overlay entirely.)
-  useEffect(() => subscribeLayers((l) => setVisible(!!l.stats)), []);
+  useEffect(() => {
+    if (forceVisible) return undefined;
+    return subscribeLayers((l) => setVisible(!!l.stats));
+  }, [forceVisible]);
 
   // 10 Hz poll. RAF-driven (not the engine tick) so React stays out of
   // the engine's hot path. We always advance state to a fresh object so
@@ -114,7 +140,7 @@ export function StatsOverlay() {
     };
   }, []);
 
-  if (!visible) return null;
+  if (!visible && !forceVisible) return null;
 
   const toggleCollapsed = () => {
     setCollapsed((v) => {
@@ -179,6 +205,22 @@ export function StatsOverlay() {
           <Row label="Textures" value={formatBytes(r.textureMem)} tone={memTone(r.textureMem)} />
           <Row label="Draw calls" value={formatCount(r.drawCalls)} />
           <Row label="Triangles" value={formatCount(r.triangles)} />
+          {/* Both are zero on a scene that uses neither, and a row that reads
+              zero forever is a row that trains people to stop looking. */}
+          {r.occlusionTested > 0 && (
+            <Row
+              label="Occluded"
+              value={`${formatCount(r.occlusionCulled)} / ${formatCount(r.occlusionTested)}`}
+            />
+          )}
+          {r.impostors > 0 && <Row label="Impostors" value={formatCount(r.impostors)} />}
+          {/* "Pooled" is stock waiting to be spawned, not objects on screen —
+              a number that stays flat while a shooter fires is a pool that is
+              being refilled as fast as it is drained, which is the point. */}
+          {r.pooled > 0 && <Row label="Pooled" value={formatCount(r.pooled)} />}
+          {r.spawnQueue > 0 && (
+            <Row label="Spawn queue" value={formatCount(r.spawnQueue)} tone="warm" />
+          )}
         </>
       )}
     </div>

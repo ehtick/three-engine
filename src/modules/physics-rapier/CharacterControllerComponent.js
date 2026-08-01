@@ -1,6 +1,7 @@
 import * as THREE from "three/webgpu";
 import { Component } from "../../engine/components/Component.js";
 import { EDITOR_LAYER } from "../../engine/editorLayers.js";
+import { physicsLayerNames } from "./layerConfig.js";
 
 const GIZMO_COLOR = 0x2d8bf0;
 
@@ -45,8 +46,10 @@ export class CharacterControllerComponent extends Component {
     gravityScale: 1,
     pushDynamicBodies: false,
     skinWidth: 0.02,
+    layer: "Player",
   };
   static schema = [
+    { key: "layer", label: "Layer", type: "select", options: physicsLayerNames },
     { key: "radius", label: "Radius", type: "number", min: 0.01, step: 0.05 },
     { key: "height", label: "Height", type: "number", min: 0.01, step: 0.05 },
     { key: "offset", label: "Offset", type: "vec3" },
@@ -70,6 +73,9 @@ export class CharacterControllerComponent extends Component {
     this.controller = null;
     this.velocity = [0, 0, 0]; // units/second (world space)
     this.grounded = false;
+    // A character spawned mid-play (a respawn, a second player joining) needs
+    // its body built now — the world is long since built. See PhysicsSystem.
+    this.entity.engine?.physics?.markDirty(this.entity, { subtree: false });
     this.#buildGizmo();
   }
 
@@ -114,6 +120,15 @@ export class CharacterControllerComponent extends Component {
 
   isGrounded() {
     return this.grounded;
+  }
+
+  /**
+   * The moving platform the character is standing on, or null. The controller
+   * already carries the character along with it — this is for gameplay that
+   * needs to know (parenting an effect, "you are on the lift" triggers).
+   */
+  getPlatform() {
+    return this.platformEntity ?? null;
   }
 
   /** Instantly repositions the character (world space) and clears fall speed. */

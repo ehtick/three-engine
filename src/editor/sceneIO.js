@@ -44,7 +44,7 @@ export async function resetEditorScene() {
   engine.clear();
   currentPath = null;
   resetSceneBooted();
-  afterSceneSwap();
+  afterSceneSwap(engine);
 }
 
 const projectRoot = () => useProjectStore.getState().rootPath;
@@ -131,7 +131,7 @@ export async function restoreLastScene() {
     await deserializeScene(engine, JSON.parse(contents));
     engine.sceneName = sceneNameFromPath(path);
     currentPath = path;
-    afterSceneSwap();
+    afterSceneSwap(engine);
     console.log(`Restored scene: ${path}`);
     return true;
   } catch (err) {
@@ -140,11 +140,15 @@ export async function restoreLastScene() {
   }
 }
 
-function afterSceneSwap() {
+function afterSceneSwap(engine = null) {
   commandBus.clearHistory();
   useSelectionStore.getState().clear();
   useSceneStore.getState().refresh(currentPath);
   useSceneStore.getState().markDirty(false);
+  // Keep the runtime scene manager's idea of "the scene you are in" aligned
+  // with the editor's, so `engine.scenes.active` is meaningful while stopped
+  // and Play starts from the right record.
+  engine?.scenes?.reset({ path: currentPath, name: engine.sceneName });
 }
 
 /** Prefab Mode holds the scene suspended in memory. Any operation that swaps
@@ -183,7 +187,7 @@ export async function newScene() {
   box.addComponent("mesh", { geometry: "box" });
   box.object3D.position.set(0, 0.5, 0);
 
-  afterSceneSwap();
+  afterSceneSwap(engine);
 
   // With a project open the scene gets a real file immediately — edits are
   // never held only in memory / localStorage.
@@ -262,7 +266,7 @@ export async function openScenePath(path) {
   await deserializeScene(engine, JSON.parse(contents));
   engine.sceneName = sceneNameFromPath(path);
   rememberScene(path);
-  afterSceneSwap();
+  afterSceneSwap(engine);
   console.log(`Scene loaded: ${path}`);
   return true;
 }

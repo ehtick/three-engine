@@ -121,7 +121,7 @@ console.log("\n--- inset one face of a 2x2x2 cube ---");
 /* -------------------------------------------------------------------------- */
 
 console.log("\n--- bevel all 12 edges of a 2x2x2 cube ---");
-for (const segments of [1, 3]) {
+for (const segments of [1, 3, 4]) {
   const mesh = cube();
   for (const edge of mesh.edges) edge.select = true;
   const before = meshVolume(mesh);
@@ -165,6 +165,15 @@ for (const segments of [1, 3]) {
   check(`bevel(${segments}) follows a round profile, not an inward scoop`, -deepest <= ideal * 1.5, `${(-deepest).toFixed(3)} vs ${(ideal * 1.5).toFixed(3)} ceiling`);
 
   check(`bevel(${segments}) keeps UVs on every face`, facesWithoutUVs(mesh) === 0, `${facesWithoutUVs(mesh)} faces with degenerate UVs`);
+
+  if (segments === 4) {
+    check("four-segment bevel uses quad corner-grid topology",
+      [...mesh.faces].every((face) => face.loops.length === 4),
+      `${[...mesh.faces].filter((face) => face.loops.length !== 4).length} non-quad faces`);
+    check("four-segment bevel avoids the old high-valence corner fan",
+      Math.max(...[...mesh.verts].map((vert) => vert.edges.size)) <= 6,
+      `max valence ${Math.max(...[...mesh.verts].map((vert) => vert.edges.size))}`);
+  }
 }
 
 console.log("\n--- bevel a single edge (partial selection must not cap anything shut) ---");

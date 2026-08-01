@@ -169,6 +169,91 @@ function KeybindingsTable({ keybindings, onChange }) {
  * hot reload, performance, export metadata. Not undoable — these are
  * preferences, not scene edits. Save writes the file and applies live.
  */
+/**
+ * Layer names + the collision matrix, Unity-style. The matrix is symmetric, so
+ * only the lower triangle is editable — showing both halves invites the user to
+ * set two contradictory values for one pair.
+ *
+ * `matrix[i]` is a bitmask of the layers layer `i` collides with; `null` (the
+ * default) means everything collides, which is what projects had before layers
+ * existed. The first edit materialises a real matrix.
+ */
+function CollisionMatrixSection({ layers, matrix, onChange }) {
+  const names = layers ?? [];
+  const rows = matrix ?? names.map(() => 0xffff);
+  const collides = (i, j) => !!(rows[i] & (1 << j));
+
+  const toggle = (i, j) => {
+    const next = names.map((_, k) => rows[k] ?? 0xffff);
+    const on = !collides(i, j);
+    if (on) {
+      next[i] |= 1 << j;
+      next[j] |= 1 << i;
+    } else {
+      next[i] &= ~(1 << j);
+      next[j] &= ~(1 << i);
+    }
+    onChange({ matrix: next });
+  };
+
+  const rename = (index, value) => {
+    const next = [...names];
+    next[index] = value;
+    onChange({ layers: next });
+  };
+
+  return (
+    <div className="inspector-section">
+      <div className="section-header">Physics Layers</div>
+      <div className="asset-hint" style={{ padding: "0 2px 6px" }}>
+        A collider is on one layer; this matrix decides which layers touch. Queries
+        (raycast, overlap) are not filtered by it — they take their own layer list.
+      </div>
+      {names.map((name, index) => (
+        <Row key={index} label={`Layer ${index}`}>
+          <input
+            className="text-field"
+            value={name}
+            onChange={(e) => rename(index, e.target.value)}
+            // Layer 0 is the fallback for any collider whose layer went
+            // missing, so it always has to exist under some name.
+            placeholder={index === 0 ? "Default" : `Layer ${index}`}
+          />
+        </Row>
+      ))}
+      <div className="collision-matrix">
+        {names.map((rowName, i) => (
+          <div className="collision-matrix-row" key={i}>
+            <span className="collision-matrix-label" title={rowName}>
+              {rowName}
+            </span>
+            {/* Lower triangle including the diagonal: pair {i, j} appears
+                exactly once, and the diagonal is a layer against itself
+                (debris that should not collide with other debris). */}
+            {names.slice(0, i + 1).map((colName, j) => (
+              <label
+                key={j}
+                className="collision-matrix-cell"
+                title={`${rowName} ↔ ${colName}`}
+              >
+                <input type="checkbox" checked={collides(i, j)} onChange={() => toggle(i, j)} />
+              </label>
+            ))}
+          </div>
+        ))}
+        <div className="collision-matrix-row collision-matrix-footer">
+          <span className="collision-matrix-label" />
+          {names.map((name, i) => (
+            <span className="collision-matrix-vlabel" key={i} title={name}>
+              {name}
+            </span>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function ProjectSettingsPanel() {
   const rootPath = useProjectStore((s) => s.rootPath);
   const projectName = useProjectStore((s) => s.projectMeta?.name);
@@ -265,7 +350,7 @@ export function ProjectSettingsPanel() {
     }
   };
 
-  const { editor, scripts, rendering, game } = settings;
+  const { editor, scripts, rendering, game, physics } = settings;
   const mainValue = normalizeMainPath(mainDirty ? mainDraft : mainScene);
   const mainHint = !mainValue
     ? "No main scene set — boot will fall back to the last-edited scene."
@@ -402,6 +487,43 @@ export function ProjectSettingsPanel() {
           </div>
         </Row>
       </div>
+
+      <div className="inspector-section">
+        <div className="section-header">Saves</div>
+        <div className="asset-hint" style={{ padding: "0 2px 6px" }}>
+          Save slots and preferences are stored under this id, so two games served from
+          the same origin can't read each other's saves. Empty = the title above — which
+          means renaming the game orphans existing saves; pin an id to keep them.
+        </div>
+        <Row label="Save id">
+          <input
+            className="text-field"
+            type="text"
+            value={game.saveId ?? ""}
+            placeholder={game.title || projectName || basename(rootPath)}
+            onChange={(e) => patch("game", { saveId: e.target.value })}
+          />
+        </Row>
+        <Row label="Save version">
+          <Num
+            value={game.saveVersion ?? 1}
+            min={1}
+            step={1}
+            onChange={(v) => patch("game", { saveVersion: Math.max(1, Math.round(v)) })}
+          />
+        </Row>
+        <div className="asset-hint" style={{ padding: "6px 2px 0" }}>
+          Bump the version when what your scripts write in <code>onSave</code> changes, and
+          register a migration with <code>engine.saves.registerMigration(n, fn)</code>. A
+          save with no path to the current version is refused rather than loaded wrong.
+        </div>
+      </div>
+
+      <CollisionMatrixSection
+        layers={physics.layers}
+        matrix={physics.matrix}
+        onChange={(next) => patch("physics", next)}
+      />
 
       <div className="asset-hint" style={{ padding: "4px 10px" }}>
         Stored in project.json. Scene look (background, fog, tone mapping…) lives in Scene Settings.

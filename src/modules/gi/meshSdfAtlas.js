@@ -1,6 +1,6 @@
 // Per-mesh SDF atlas — the authored scene representation of the voxel-free
 // GI pipeline. EVERY GI-relevant mesh gets one 64³ slot in a single tiled
-// Data3DTexture (8-bit normalized local distances), plus uniform-array state
+// Data3DTexture (fp16 normalized local distances), plus uniform-array state
 // that maps world-space sample points into its LOCAL grid and carries its
 // surface color/emissive. The GPU composite pass (sdfScene.js) min()s all
 // slots into the global scene field; the shadow/mirror traces additionally
@@ -14,19 +14,31 @@ import { If, float, int, texture3D, uniform, uniformArray, vec3, vec4 } from "th
 import { MESH_SDF_CAP, MESH_SDF_MAX_AXIS } from "./bakeCore.js";
 import { sharedFn } from "./giFn.js";
 
+const HALF_ONE = 0x3c00; // 1.0 as IEEE 754 half bits — atlas "far" fill
 
 const SLOT = MESH_SDF_MAX_AXIS; // 64 cells per tile axis
 const TILES_XY = 4; // 4×4 tiles per Z-layer → 16 slots per 64-deep layer
 export const SLOTS_PER_LAYER = TILES_XY * TILES_XY;
-export const MAX_ATLAS_LAYERS = 8; // 256×256×512 u8 = 32MB ceiling
+export const MAX_ATLAS_LAYERS = 8; // 256×256×512 fp16 = 64MB ceiling
 export const MAX_MESH_SDF_SLOTS = SLOTS_PER_LAYER * MAX_ATLAS_LAYERS; // 128
+// HI-RES slots: a 2×2×2 block of tiles = 128³ cells for meshes whose
+// silhouettes drive shadow quality (characters, large organic props). At
+// 64³ a 4m winged character bakes at ~6cm cells — thin wings fall below a
+// cell and the SDF melts into detached blobs, which shadows and reflection
+// hits then reproduce ("dirty shadows / bad SDFs"). 128³ halves the cell
+// (the distance cap scales with the cell).
+export const MESH_SDF_HIRES_AXIS = SLOT * 2; // 128
 // Slots min()ed PER STEP inside shadow/mirror traces (beyond the composited
-// global field). Small fixed count — every step pays for these. 10, not 6:
-// THIN ANALYTIC slots (plane walls, partitions, inverted-room shells) are
+// global field). Small fixed count — every step pays for these. THIN
+// ANALYTIC slots (plane walls, partitions, inverted-room shells) are
 // prioritized into these so shadow rays see their EXACT distances — a
 // 0.1m wall in a 0.5m-cell field is otherwise steppable-over (light through
-// the partition), and analytic evaluation costs no texture fetch.
-export const DETAIL_SLOTS = 10;
+// the partition), and analytic evaluation costs no texture fetch. 12, not
+// 10: a Cornell-style room (floor + slabs + walls + a thin panel lamp)
+// filled the whole budget with walls, leaving DENSE baked meshes (the
+// character) zero refinement — their hi-res SDFs existed but nothing ever
+// sampled them, so shadows stayed exactly as coarse as before.
+export const DETAIL_SLOTS = 12;
 // Floor for the half-thickness, in WORLD METRES, given to an analytic
 // primitive that is flat on one axis (a plane). The live value is set per
 // build from the field's cell size (`atlas.minAnalyticHalfWorld`) — a wall
@@ -39,12 +51,14 @@ const MIN_ANALYTIC_HALF_WORLD = 0.01;
 export const atlasCapacityFor = (meshCount) =>
   Math.min(MAX_ATLAS_LAYERS, Math.max(1, Math.ceil(meshCount / SLOTS_PER_LAYER))) * SLOTS_PER_LAYER;
 
-// ------------------------------------------------- .sdf sidecar file format
-// "GSDF" magic + u32 version + u32 jsonLength + JSON header + u8 grid.
-// The header carries a cheap geometry fingerprint (vertex/index counts) so
-// stale files rebake instead of shading with an outdated field.
+// ------------------------------------------------- mesh SDF file format
+// "GSDF" magic + u32 version + u32 jsonLength + JSON header + u16 half-bits
+// grid. Persisted under `<project>/Library/gi-sdf/<contentHash>.sdf`
+// (derived data — not next to authored assets). The header carries a cheap
+// geometry fingerprint (vertex/index counts) so stale files rebake instead
+// of shading with an outdated field.
 const SDF_MAGIC = 0x46445347; // "GSDF" little-endian
-const SDF_VERSION = 1;
+const SDF_VERSION = 2; // bumped: fp16 payload (was u8) — see decodeMeshSdf
 
 export function encodeMeshSdf(sdf, geometryFingerprint) {
   const header = JSON.stringify({
@@ -55,25 +69,36 @@ export function encodeMeshSdf(sdf, geometryFingerprint) {
     fingerprint: geometryFingerprint,
   });
   const headerBytes = new TextEncoder().encode(header);
-  const out = new Uint8Array(12 + headerBytes.length + sdf.data.length);
+  // sdf.data is a Uint16Array (fp16 half-bits) — view its bytes to copy them
+  // into the (byte-oriented) output buffer.
+  const payloadBytes = new Uint8Array(sdf.data.buffer, sdf.data.byteOffset, sdf.data.byteLength);
+  const out = new Uint8Array(12 + headerBytes.length + sdf.data.byteLength);
   const view = new DataView(out.buffer);
   view.setUint32(0, SDF_MAGIC, true);
   view.setUint32(4, SDF_VERSION, true);
   view.setUint32(8, headerBytes.length, true);
   out.set(headerBytes, 12);
-  out.set(sdf.data, 12 + headerBytes.length);
+  out.set(payloadBytes, 12 + headerBytes.length);
   return out;
 }
 
 export function decodeMeshSdf(buffer, expectedFingerprint) {
   try {
     const view = new DataView(buffer);
+    // Version mismatch — including a pre-existing v1 (u8) file on disk —
+    // returns null here. The caller treats a null decode exactly like a
+    // missing bake and rebakes from scratch, which is the designed
+    // migration path off the old u8 format; no explicit upgrade step needed.
     if (view.getUint32(0, true) !== SDF_MAGIC || view.getUint32(4, true) !== SDF_VERSION) return null;
     const headerLength = view.getUint32(8, true);
     const header = JSON.parse(new TextDecoder().decode(new Uint8Array(buffer, 12, headerLength)));
     if (expectedFingerprint && header.fingerprint !== expectedFingerprint) return null; // stale
-    const data = new Uint8Array(buffer, 12 + headerLength).slice();
-    if (data.length !== header.dims.x * header.dims.y * header.dims.z) return null;
+    // .slice() copies the payload onto a fresh, offset-0 ArrayBuffer so the
+    // Uint16Array view below is always 2-byte aligned, regardless of where
+    // (odd or even) the payload happened to land in the source buffer.
+    const bytes = new Uint8Array(buffer, 12 + headerLength).slice();
+    if (bytes.byteLength !== header.dims.x * header.dims.y * header.dims.z * 2) return null;
+    const data = new Uint16Array(bytes.buffer, 0, bytes.byteLength / 2);
     return {
       data,
       dims: header.dims,
@@ -91,9 +116,8 @@ export const geometryFingerprintOf = (record) =>
 
 /**
  * Content hash of a geometry (strided FNV-1a over positions + index) — the
- * persistence key for GLB-internal geometries that have no asset path of
- * their own: `${sourceModelPath}.${hash}.sdf`. Cached per geometry object,
- * invalidated by position.version (geometry edits rebake).
+ * Library persistence key: `Library/gi-sdf/${hash}.sdf`. Cached per geometry
+ * object, invalidated by position.version (geometry edits rebake).
  */
 const hashCache = new WeakMap(); // geometry → { version, hash }
 
@@ -130,10 +154,10 @@ export class MeshSdfAtlas {
     this.width = SLOT * TILES_XY;
     this.height = SLOT * TILES_XY;
     this.depth = SLOT * layers;
-    this.data = new Uint8Array(this.width * this.height * this.depth).fill(255);
+    this.data = new Uint16Array(this.width * this.height * this.depth).fill(HALF_ONE);
     this.texture = new THREE.Data3DTexture(this.data, this.width, this.height, this.depth);
     this.texture.format = THREE.RedFormat;
-    this.texture.type = THREE.UnsignedByteType;
+    this.texture.type = THREE.HalfFloatType;
     this.texture.minFilter = THREE.LinearFilter;
     this.texture.magFilter = THREE.LinearFilter;
     this.texture.unpackAlignment = 1;
@@ -159,11 +183,23 @@ export class MeshSdfAtlas {
     this.dims = makeVec4Array();
     this.albedo = makeVec4Array();
     this.emissive = makeVec4Array();
+    // Texel origin of the slot's tile block in the atlas texture (w = block
+    // size in tiles: 1 = 64³, 2 = a 2×2×2 hi-res 128³ block). Initialized
+    // to the legacy index-derived origins so a slot seated without
+    // allocateSlot behaves exactly as before.
+    this.tileOrigin = makeVec4Array();
+    for (let i = 0; i < n; i++) this.tileOrigin.array[i].set(...this.#tileOriginOf(i), 1);
     // Detail-slot indices (float, -1 = off) for the in-trace refinement.
     this.detailSlots = uniformArray(Array.from({ length: DETAIL_SLOTS }, () => -1), "float");
     // Bumped whenever any slot uniform changes — sdfScene watches it to
     // re-run the composite pass.
     this.revision = 1;
+    // Dirty-bounds accumulation for the composite pass (see #markSlotDirty /
+    // consumeDirtyBounds below). _dirtyAll starts true — the first composite
+    // must cover the whole volume.
+    this._dirtyAll = true;
+    this._dirtyMin = new THREE.Vector3(Infinity, Infinity, Infinity);
+    this._dirtyMax = new THREE.Vector3(-Infinity, -Infinity, -Infinity);
 
     // CPU-side bookkeeping: which mesh occupies which slot.
     this.assignments = new Array(this.capacity).fill(null); // { mesh, sdf, capLocal, matrixCache }
@@ -180,6 +216,65 @@ export class MeshSdfAtlas {
     // Minimum world half-thickness for flat analytic primitives; GISystem
     // raises this to a fraction of the field's cell size per build.
     this.minAnalyticHalfWorld = MIN_ANALYTIC_HALF_WORLD;
+  }
+
+  /** Texel origin of tile index `i` under the legacy 1-tile-per-slot layout. */
+  #tileOriginOf(i) {
+    return [
+      (i % TILES_XY) * SLOT,
+      (Math.floor(i / TILES_XY) % TILES_XY) * SLOT,
+      Math.floor(i / SLOTS_PER_LAYER) * SLOT,
+    ];
+  }
+
+  /** Tile index at tile coordinates (x, y, z). */
+  #tileIndexOf(x, y, z) {
+    return z * SLOTS_PER_LAYER + y * TILES_XY + x;
+  }
+
+  /**
+   * Claims a free slot and stamps its tile-block origin. hiRes = a 2×2×2
+   * aligned block of free tiles (one 128³ grid): the 7 non-primary tiles
+   * are marked `{ reservedBy: primary }` so nothing else seats in them, and
+   * clearSlot(primary) frees the whole block. Returns the slot index or -1
+   * (callers treat -1 as capacity overflow, same as before).
+   */
+  allocateSlot(hiRes = false) {
+    if (hiRes) {
+      const layers = Math.ceil(this.capacity / SLOTS_PER_LAYER);
+      for (let z = 0; z + 1 < layers; z += 2) {
+        for (let y = 0; y + 1 < TILES_XY; y += 2) {
+          for (let x = 0; x + 1 < TILES_XY; x += 2) {
+            const members = [];
+            for (let dz = 0; dz < 2; dz++)
+              for (let dy = 0; dy < 2; dy++)
+                for (let dx = 0; dx < 2; dx++) members.push(this.#tileIndexOf(x + dx, y + dy, z + dz));
+            if (members.some((m) => m >= this.capacity || this.assignments[m])) continue;
+            const primary = this.#tileIndexOf(x, y, z);
+            for (const m of members) {
+              if (m !== primary) this.assignments[m] = { reservedBy: primary };
+            }
+            this.tileOrigin.array[primary].set(x * SLOT, y * SLOT, z * SLOT, 2);
+            return primary;
+          }
+        }
+      }
+      return -1;
+    }
+    // Singles allocate from the TAIL. First-free-from-zero fragmented every
+    // 2×2×2-aligned region as soon as a handful of walls seated, so a
+    // hi-res block could NEVER allocate afterwards — seat, overflow,
+    // rebuild, identical packing, overflow again: the editor's infinite
+    // "[gi] built …" loop.
+    let i = -1;
+    for (let k = this.assignments.length - 1; k >= 0; k--) {
+      if (!this.assignments[k]) {
+        i = k;
+        break;
+      }
+    }
+    if (i >= 0) this.tileOrigin.array[i].set(...this.#tileOriginOf(i), 1);
+    return i;
   }
 
   /**
@@ -229,19 +324,23 @@ export class MeshSdfAtlas {
   /** Uploads a baked grid into slot `i` and wires its static uniforms. */
   setSlot(i, mesh, sdf, surface) {
     const { data, dims, boundsMin, boundsSize, minCell } = sdf;
-    // Tile origin inside the atlas texture.
-    const tx = (i % TILES_XY) * SLOT;
-    const ty = (Math.floor(i / TILES_XY) % TILES_XY) * SLOT;
-    const tz = Math.floor(i / SLOTS_PER_LAYER) * SLOT;
-    for (let z = 0; z < SLOT; z++) {
-      for (let y = 0; y < SLOT; y++) {
+    // Tile-block origin inside the atlas texture (stamped by allocateSlot;
+    // legacy index-derived for slots seated without it). Hi-res slots span
+    // a 2×2×2 tile block = 128 cells per axis.
+    const origin = this.tileOrigin.array[i];
+    const block = SLOT * (origin.w > 1.5 ? 2 : 1);
+    const tx = origin.x;
+    const ty = origin.y;
+    const tz = origin.z;
+    for (let z = 0; z < block; z++) {
+      for (let y = 0; y < block; y++) {
         const dst = ((tz + z) * this.height + ty + y) * this.width + tx;
         if (z < dims.z && y < dims.y) {
           const src = (z * dims.y + y) * dims.x;
           this.data.set(data.subarray(src, src + dims.x), dst);
-          if (dims.x < SLOT) this.data.fill(255, dst + dims.x, dst + SLOT);
+          if (dims.x < block) this.data.fill(HALF_ONE, dst + dims.x, dst + block);
         } else {
-          this.data.fill(255, dst, dst + SLOT);
+          this.data.fill(HALF_ONE, dst, dst + block);
         }
       }
     }
@@ -281,11 +380,34 @@ export class MeshSdfAtlas {
       Math.abs(emissive.z - surface.emissive.b) > 1e-4;
     albedo.set(surface.color.r, surface.color.g, surface.color.b, 1);
     emissive.set(surface.emissive.r, surface.emissive.g, surface.emissive.b, 0);
-    if (changed) this.revision++;
+    if (changed) {
+      this.revision++;
+      this.#markSlotDirty(i);
+    }
   }
 
   clearSlot(i) {
-    if (!this.assignments[i]) return;
+    const assignment = this.assignments[i];
+    if (!assignment) return;
+    // Reserved members of a hi-res block are freed by their PRIMARY's clear,
+    // never directly (GISystem's stale-slot sweep sees their mesh as
+    // undefined and would otherwise dissolve live blocks).
+    if (assignment.reservedBy != null) return;
+    const origin = this.tileOrigin.array[i];
+    if (origin.w > 1.5) {
+      const x = origin.x / SLOT, y = origin.y / SLOT, z = origin.z / SLOT;
+      for (let dz = 0; dz < 2; dz++)
+        for (let dy = 0; dy < 2; dy++)
+          for (let dx = 0; dx < 2; dx++) {
+            const m = this.#tileIndexOf(x + dx, y + dy, z + dz);
+            if (this.assignments[m]?.reservedBy === i) this.assignments[m] = null;
+          }
+      origin.w = 1;
+    }
+    // Mark the slot's box dirty BEFORE deactivating it — that box is about
+    // to stop influencing the composite, so the cells it used to cover must
+    // be recomputed too.
+    this.#markSlotDirty(i);
     this.aabbMin.array[i].w = 0;
     this.assignments[i] = null;
     this.revision++;
@@ -295,6 +417,49 @@ export class MeshSdfAtlas {
     for (let k = 0; k < DETAIL_SLOTS; k++) {
       this.detailSlots.array[k] = k < indices.length ? indices[k] : -1;
     }
+  }
+
+  /**
+   * Expands the dirty-bounds accumulator by slot `i`'s CURRENT world AABB.
+   * The box already includes the `aabbExpand` cap reach (refreshSlotTransform
+   * expands it by `this.aabbExpand`), which is why this union covers every
+   * cell a slot can possibly influence, not just the cells it geometrically
+   * overlaps. No-op for an inactive slot — nothing to invalidate.
+   */
+  #markSlotDirty(i) {
+    if (this.aabbMin.array[i].w > 0.5) {
+      const bmin = this.aabbMin.array[i];
+      const bmax = this.aabbMax.array[i];
+      if (bmin.x < this._dirtyMin.x) this._dirtyMin.x = bmin.x;
+      if (bmin.y < this._dirtyMin.y) this._dirtyMin.y = bmin.y;
+      if (bmin.z < this._dirtyMin.z) this._dirtyMin.z = bmin.z;
+      if (bmax.x > this._dirtyMax.x) this._dirtyMax.x = bmax.x;
+      if (bmax.y > this._dirtyMax.y) this._dirtyMax.y = bmax.y;
+      if (bmax.z > this._dirtyMax.z) this._dirtyMax.z = bmax.z;
+    }
+  }
+
+  /** Forces the next consumeDirtyBounds() to report "composite everything". */
+  markAllDirty() {
+    this._dirtyAll = true;
+  }
+
+  /**
+   * Drains the dirty-bounds accumulator. Returns null to mean "composite the
+   * whole volume" — either _dirtyAll was set (e.g. refreshAllSlots after a
+   * refit) or nothing was accumulated at all (_dirtyMin.x still +Infinity),
+   * which is the fail-safe for any revision bump that forgot to mark a slot
+   * dirty. Otherwise returns the accumulated `{ min, max }` AABB. Always
+   * resets the accumulator before returning, so bounds never leak into the
+   * next accumulation window.
+   */
+  consumeDirtyBounds() {
+    const whole = this._dirtyAll || this._dirtyMin.x === Infinity;
+    const result = whole ? null : { min: this._dirtyMin.clone(), max: this._dirtyMax.clone() };
+    this._dirtyAll = false;
+    this._dirtyMin.set(Infinity, Infinity, Infinity);
+    this._dirtyMax.set(-Infinity, -Infinity, -Infinity);
+    return result;
   }
 
   /** True when slot `i`'s cached world matrix differs from the live one. */
@@ -310,7 +475,13 @@ export class MeshSdfAtlas {
   /** Recomputes slot `i`'s transform-derived uniforms from the live matrix. */
   refreshSlotTransform(i) {
     const assignment = this.assignments[i];
-    if (!assignment) return;
+    // Reserved hi-res block members carry no mesh — only their primary has
+    // transform state.
+    if (!assignment || assignment.reservedBy != null) return;
+    // Dirty the OLD box before it's overwritten below; the second call at
+    // the end of this method dirties the NEW box — together a moved slot
+    // invalidates both where it was and where it is.
+    this.#markSlotDirty(i);
     const { mesh, sdf, capLocal } = assignment;
     assignment.matrixCache.set(mesh.matrixWorld.elements);
     this.worldToLocal.array[i].copy(mesh.matrixWorld).invert();
@@ -369,6 +540,8 @@ export class MeshSdfAtlas {
     this.aabbMin.array[i].set(minX - r, minY - r, minZ - r, this.aabbMin.array[i].w);
     const dw = this.aabbMax.array[i].w;
     this.aabbMax.array[i].set(maxX + r, maxY + r, maxZ + r, dw);
+    // Dirty the NEW box — see the comment at the top of this method.
+    this.#markSlotDirty(i);
   }
 
   /**
@@ -379,6 +552,9 @@ export class MeshSdfAtlas {
    * AABBs expanded by the stale cap.
    */
   refreshAllSlots() {
+    // A refit changes volume bounds/capWorld — every cell is invalid, slot
+    // unions are NOT enough.
+    this.markAllDirty();
     for (let i = 0; i < this.assignments.length; i++) {
       if (this.assignments[i]) this.refreshSlotTransform(i);
     }
@@ -393,7 +569,7 @@ export class MeshSdfAtlas {
     let changed = false;
     for (let i = 0; i < this.assignments.length; i++) {
       const assignment = this.assignments[i];
-      if (!assignment) continue;
+      if (!assignment || assignment.reservedBy != null) continue;
       const { mesh } = assignment;
       if (!mesh.parent && !mesh.isMesh) {
         this.clearSlot(i);
@@ -451,15 +627,13 @@ export class MeshSdfAtlas {
       const cellF = local.sub(lm.xyz).mul(cpl).toVar();
       const clamped = cellF.clamp(vec3(0.5), dims4.xyz.sub(0.5)).toVar();
       const outsideWorld = cellF.sub(clamped).div(cpl).length().mul(lm.w).toVar();
-      // Tile origin from the slot index (compile-time tiling constants).
-      const sf = s.toFloat().toVar();
-      const tileX = sf.mod(TILES_XY).mul(SLOT);
-      const tileY = sf.div(TILES_XY).floor().mod(TILES_XY).mul(SLOT);
-      const tileZ = sf.div(SLOTS_PER_LAYER).floor().mul(SLOT);
+      // Tile-block origin from the per-slot uniform — hi-res slots occupy a
+      // 2×2×2 tile block, so origins are no longer derivable from the index.
+      const tile = this.tileOrigin.element(s).toVar();
       const uvw = vec3(
-        tileX.add(clamped.x).div(this.width),
-        tileY.add(clamped.y).div(this.height),
-        tileZ.add(clamped.z).div(this.depth),
+        tile.x.add(clamped.x).div(this.width),
+        tile.y.add(clamped.y).div(this.height),
+        tile.z.add(clamped.z).div(this.depth),
       );
       const dLocal = texture3D(this.texture, uvw).level(0).r.mul(this.aabbMax.element(s).w);
       // Outside the grid box: √(d(q)² + |p−q|²), the TIGHT valid lower

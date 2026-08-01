@@ -1,6 +1,7 @@
 import * as THREE from "three/webgpu";
 import { Component } from "../../engine/components/Component.js";
 import { EDITOR_LAYER } from "../../engine/editorLayers.js";
+import { physicsLayerNames } from "./layerConfig.js";
 
 const GIZMO_COLOR = 0x2df098;
 
@@ -29,9 +30,14 @@ export class ColliderComponent extends Component {
     friction: 0.5,
     restitution: 0,
     isSensor: false,
+    // Which collision layer this collider is on. The project's layer matrix
+    // (Project Settings → Physics) decides which layers actually interact —
+    // that is how a projectile stops hitting the player who fired it.
+    layer: "Default",
   };
   static schema = [
     { key: "shape", label: "Shape", type: "select", options: ["box", "sphere", "capsule", "mesh", "heightfield"] },
+    { key: "layer", label: "Layer", type: "select", options: physicsLayerNames },
     { key: "size", label: "Size", type: "vec3", showIf: (p) => p.shape === "box" },
     { key: "radius", label: "Radius", type: "number", min: 0.01, step: 0.05, showIf: (p) => p.shape === "sphere" || p.shape === "capsule" },
     { key: "height", label: "Height", type: "number", min: 0.01, step: 0.05, showIf: (p) => p.shape === "capsule" },
@@ -43,6 +49,9 @@ export class ColliderComponent extends Component {
 
   onAttach() {
     this.collider = null; // assigned by PhysicsSystem while playing
+    // See RigidbodyComponent.onAttach: entities arrive after the world is
+    // built, and nothing else tells the world they did.
+    this.entity.engine?.physics?.markDirty(this.entity, { subtree: false });
     this.#buildGizmo();
     // Heightfield gizmo mirrors the sibling terrain's surface — rebuild it
     // whenever that terrain's heights (or size/resolution) change so the
@@ -55,6 +64,10 @@ export class ColliderComponent extends Component {
   }
 
   onDetach() {
+    const physics = this.entity.engine?.physics;
+    // Before clearing the handle — that is what the world removes it by.
+    physics?.removeEntity(this.entity, { subtree: false });
+    physics?.markDirty(this.entity, { subtree: false });
     this.collider = null;
     this._terrainUnsub?.();
     this._terrainUnsub = null;

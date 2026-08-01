@@ -97,6 +97,31 @@ async function compressGlbInPlaceImpl(glbPath) {
   return info;
 }
 
+/**
+ * Draco-compresses .glb bytes and returns the result, touching no files.
+ *
+ * This is the build path's entry point. The in-place variant above is right at
+ * import time (the project keeps one representation of each model, and the
+ * .meta records what happened to it), but a *build* must not rewrite the
+ * source art it was handed — a build is a snapshot, not an edit. So the bytes
+ * come back here and are written over the copy already sitting in the output.
+ *
+ * Returns null when the model is already Draco-compressed (nothing to do) or
+ * when compression made it bigger, which some lean meshes do.
+ */
+export async function compressGlbBuffer(bytes) {
+  const io = await getIO();
+  const doc = await io.readBinary(bytes);
+  const alreadyDraco = doc
+    .getRoot()
+    .listExtensionsUsed()
+    .some((ext) => ext.extensionName === "KHR_draco_mesh_compression");
+  if (alreadyDraco) return null;
+  await doc.transform(draco());
+  const out = await io.writeBinary(doc);
+  return out.byteLength < bytes.byteLength ? out : null;
+}
+
 /** Human-readable byte size, e.g. "2.4 MB". */
 export function formatBytes(n) {
   if (!Number.isFinite(n)) return "";

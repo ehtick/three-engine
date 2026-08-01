@@ -25,7 +25,14 @@ import { registerComponent, unregisterComponent } from "./components/registry.js
  * the exported scene.json's `modules` list). Heavy dependencies (wasm…)
  * belong inside setup() as dynamic imports so disabled modules cost nothing.
  */
-const definitions = new Map();
+// NOT a bare module-level Map. Vite can serve this file under BOTH the
+// `/src/…` and `/@fs/C:/…` URL forms (plus `?t=` HMR twins) — each importer
+// then gets its OWN module instance, and a per-instance registry means
+// modules registered through one URL are "Unknown module" through the other
+// (bit a puppeteer harness whose absolute `/src/…` imports sat beside the
+// editor graph's `/@fs/…` form). globalThis-keyed, same as the editor's
+// vmSingleton pattern (which engine code must not import).
+const definitions = (globalThis.__engineModuleDefinitions ??= new Map());
 
 export function registerModuleDefinition(def) {
   if (!def?.id) throw new Error("Module definition needs an `id`");

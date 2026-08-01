@@ -1,10 +1,10 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { Play, Square, Move, Rotate3d, Scale3d, Layers as LayersIcon, Crosshair } from "lucide-react";
+import { Play, Square, Pause, StepForward, Move, Rotate3d, Scale3d, Layers as LayersIcon, Crosshair } from "lucide-react";
 import * as THREE from "three/webgpu";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
 import { ensureEngine, engine } from "../engineInstance.js";
-import { EDITOR_LAYER } from "../../engine/editorLayers.js";
+import { DEBUG_LAYER, EDITOR_LAYER } from "../../engine/editorLayers.js";
 import { StatsOverlay } from "../overlays/StatsOverlay.jsx";
 import { useSelectionStore } from "../store/selectionStore.js";
 import { useSceneStore } from "../store/sceneStore.js";
@@ -53,10 +53,19 @@ import { extOf, MODEL_EXTENSIONS, TEXTURE_EXTENSIONS, SCRIPT_EXTENSIONS, MATERIA
 import { basename, useProjectStore } from "../store/projectStore.js";
 import { getEditorCameraStorageKey, loadEditorCamera, saveEditorCamera } from "../cameraPrefs.js";
 import { usePlayStore } from "../store/playStore.js";
-import { toggle as togglePlay } from "../playMode.js";
+import { toggle as togglePlay, togglePaused, stepFrame } from "../playMode.js";
 import { useAssetDrop } from "../assetDrag.js";
 import { instantiatePrefab } from "../prefab.js";
 import { getProjectSettings, onProjectSettingsApplied, applyProjectSettings } from "../projectSettings.js";
+import { setViewportHandle } from "../viewportHandle.js";
+import {
+  setSharedCanvas,
+  claimCanvas,
+  releaseCanvas,
+  onCanvasOwnerChanged,
+  setCanvasResizer,
+  resizeSharedCanvas,
+} from "../viewportCanvas.js";
 import {
   finishTerrainBrushAdjustment,
   dispatchTerrainKeyAction,
@@ -73,6 +82,24 @@ import { useGeometryEditStore } from "../store/geometryEditStore.js";
 import { ensureGeometryAsset } from "../geometryEditing.js";
 import { setVirtualGeometryDebugVisible } from "../../modules/virtual-geometry/index.js";
 import { DirectionalLightGizmo } from "../helpers/DirectionalLightGizmo.js";
+import {
+  activeSpline,
+  appendKnot,
+  beginSplineDrag,
+  applySplineDrag,
+  commitSplineDrag,
+  deleteSelectedKnot,
+  getSplineEdit,
+  insertKnotAt,
+  isSplineHandleTarget,
+  pickCurve,
+  pickSplineHandle,
+  selectKnot,
+  setBreakTangent,
+  splineHandleProxy,
+  subscribeSplineEdit,
+  updateSplineHandles,
+} from "../splineEditing.js";
 
 /** Sets `layers.set(EDITOR_LAYER)` on every Object3D in the subtree —
  *  layers in three.js are not inherited, so this has to walk explicitly. */
@@ -93,6 +120,11 @@ const LAYER_TOGGLES = [
   { key: "colliders", label: "Colliders" },
   { key: "grid", label: "Grid" },
   { key: "stats", label: "Stats" },
+  { key: "debugDraw", label: "Debug Draw" },
+  // Off by default: a screen-space UI screen renders as a plane in the world
+  // while editing (so it doesn't cover the scene), and this puts it back over
+  // the viewport the way the player will see it — without entering Play.
+  { key: "uiOverlay", label: "UI Overlay" },
   { key: "virtualGeometry", label: "Virtual Geometry" },
 ];
 
@@ -132,7 +164,7 @@ const viewport = {
   // Toggles from the Layers dropdown. Mirrored in React state; mutations
   // here apply live so a hot-reload of the panel keeps the current layer
   // set. Default to "all on" so the viewport starts in its full visual state.
-  layers: { gizmos: true, cursor3D: true, colliders: true, grid: true, stats: true, virtualGeometry: false },
+  layers: { gizmos: true, cursor3D: true, colliders: true, grid: true, stats: true, debugDraw: true, uiOverlay: false, virtualGeometry: false },
   layersListeners: new Set(),
 };
 
@@ -166,6 +198,9 @@ async function ensureViewport() {
     const canvas = document.createElement("canvas");
     canvas.className = "viewport-canvas";
     viewport.canvas = canvas;
+    // Published to the arbiter rather than appended here: the Game panel shows
+    // this same canvas while playing. See viewportCanvas.js.
+    setSharedCanvas(canvas);
 
     try {
       viewport.perspectiveCamera = new THREE.PerspectiveCamera(60, 1, 0.1, 2000);
@@ -175,6 +210,9 @@ async function ensureViewport() {
       // grid, selection box, frustum helper). Without this, those objects
       // wouldn't render even though they live in the scene tree.
       viewport.camera.layers.enable(EDITOR_LAYER);
+      // ...and runtime debug drawing, which lives on its own layer so it can
+      // also reach the Play/Game views that switch the editor layer off.
+      viewport.camera.layers.enable(DEBUG_LAYER);
 
       viewport.backend = await engine.init(canvas);
       engine.camera = viewport.camera;
@@ -219,6 +257,11 @@ async function ensureViewport() {
       // the viewport from a script means moving the ORBIT TARGET, which
       // needs the controls object.
       if (import.meta.env?.DEV) globalThis.__viewport = viewport;
+      // Publish it properly too: the editor API's viewport ops (screenshot,
+      // aim, frame) need this in a PACKAGED build, where the DEV global above
+      // does not exist. See viewportHandle.js for why they don't import this
+      // module directly.
+      setViewportHandle(viewport);
       viewport.orbit.enableDamping = true;
       viewport.orbit.dampingFactor = 0.12;
       viewport.orbit.addEventListener("start", () => {
@@ -245,6 +288,7 @@ async function ensureViewport() {
       );
 
       setupGizmo(canvas);
+      setupSplineEditing(canvas);
       setupPicking(canvas);
       setupTerrainBrush(canvas);
       setupKeyboard(canvas);
@@ -408,6 +452,15 @@ function setupGizmo(canvas) {
       else commitPivotDrag();
       return;
     }
+    // Spline knot drag: the gizmo is attached to the knot proxy. The knot is
+    // written live for feedback and committed as ONE command on release —
+    // a command per pointermove would turn Ctrl+Z into a frame-by-frame
+    // rewind of the drag.
+    if (isSplineHandleTarget(gizmo.object)) {
+      if (e.value) beginSplineDrag();
+      else commitSplineDrag();
+      return;
+    }
     // Cursor drag: the gizmo is attached to the cursor's proxy (a
     // sentinel selection), so the user can grab and move the cursor
     // like any other object. Drag commits a single SetCursor3DCommand
@@ -446,6 +499,10 @@ function setupGizmo(canvas) {
       // entity and refresh the inspector numbers.
       if (viewport.pivotDrag) applyPivotDrag();
       engine.emit("transform-changed");
+      return;
+    }
+    if (isSplineHandleTarget(gizmo.object)) {
+      applySplineDrag();
       return;
     }
     // Cursor drag: read the proxy's world position back into cursor
@@ -556,6 +613,13 @@ function setupPlayCamera() {
     resizeActiveCamera();
   });
 }
+
+// The Game panel drives the same resize path (through the canvas arbiter) so
+// there is exactly one place that knows how to re-fit the active camera.
+setCanvasResizer((width, height) => {
+  engine.setSize(width, height);
+  resizeActiveCamera();
+});
 
 function resizeActiveCamera() {
   if (!viewport.canvas || !engine.camera) return;
@@ -1041,7 +1105,12 @@ function setCollidersVisible(visible) {
  * controlled directly; colliders are per-component so we walk.
  */
 function applyLayerVisibility() {
-  const { gizmos, cursor3D, colliders, grid, virtualGeometry } = viewport.layers;
+  const { gizmos, cursor3D, colliders, grid, virtualGeometry, debugDraw, uiOverlay } = viewport.layers;
+  engine.uiSystem?.setOverlayPreview?.(uiOverlay === true);
+  // Turned off at the SOURCE, not by hiding the mesh: a script drawing a
+  // thousand shapes a frame should stop paying for them when you switch the
+  // layer off, and this also stops them reaching the Game view's camera.
+  engine.debug?.setEnabled(debugDraw !== false);
   const gizmoHelper = viewport.gizmo?.getHelper();
   // `viewport.gizmo.object` is null when nothing is attached (no selection,
   // UI-only entity, or a directional light which uses the dedicated sun-dial
@@ -1216,6 +1285,21 @@ function attachSelection(ids) {
   const skipGizmo = engine.playing || (!hasCursor && (!entities.length || entities.some(isUiEntity)));
   if (skipGizmo) {
     viewport.gizmo.detach();
+    viewport.cameraPreview?.setCamera(null);
+    applyLayerVisibility();
+    return;
+  }
+
+  // A selected spline knot outranks the entity: while you are editing a path,
+  // the thing the arrows should move is the control point under them, not the
+  // whole road. Leaving edit mode (or deselecting the knot) hands it straight
+  // back, because this is re-evaluated on every selection change.
+  const splineEdit = getSplineEdit();
+  if (splineEdit.armed && splineEdit.selection && activeSpline()) {
+    const proxy = splineHandleProxy();
+    proxy.updateMatrixWorld(true);
+    viewport.gizmo.attach(proxy);
+    viewport.gizmo.getHelper().updateMatrixWorld(true);
     viewport.cameraPreview?.setCamera(null);
     applyLayerVisibility();
     return;
@@ -1709,6 +1793,18 @@ function setupPicking(canvas) {
       lineFallbackId ??= id;
     }
     entityId ??= lineFallbackId;
+
+    // UI elements are not raycast targets (their meshes live at pixel-scale
+    // coordinates and would swamp normal picking), so they are picked through
+    // the UI system's own rect test — but only after the 3D pick has come up
+    // empty. A UI screen shown as a plane in the world would otherwise swallow
+    // every click on whatever sits behind it, which is the opposite of the
+    // reason it is a plane at all.
+    if (!entityId) {
+      const uiSystem = getUiSystem(engine, { create: false });
+      const uiHit = uiSystem?.hitTest?.(e.clientX, e.clientY, { interactiveOnly: false });
+      if (uiHit?.entity) entityId = uiHit.entity.id;
+    }
 
     if (!entityId) {
       if (!e.ctrlKey && !e.metaKey && !e.shiftKey) useSelectionStore.getState().clear();
@@ -2402,6 +2498,105 @@ function setupTerrainBrush(canvas) {
     } else {
       hideScatterSilhouette();
     }
+  });
+}
+
+/**
+ * Spline knot editing in the viewport (roadmap item 16).
+ *
+ * The pointer handler runs in the CAPTURE phase so it sits ahead of
+ * `setupPicking`: clicking a knot must not also re-run entity selection, and
+ * Ctrl+click on the curve must not be read as "toggle this entity out of the
+ * selection". Everything it does is gated on edit mode being armed, so with the
+ * mode off this is one boolean per click.
+ */
+function setupSplineEditing(canvas) {
+  // Handles are refreshed every frame rather than on a change event: they have
+  // to track the camera (they are sized in pixels) as well as the knots, and
+  // "sized correctly only until you orbit" is not a usable handle.
+  engine.onPreRender(() => {
+    updateSplineHandles(viewport.camera, canvas?.clientHeight || canvas?.height || 1);
+  });
+
+  // Arming, disarming or picking a different knot all change what the transform
+  // gizmo should be attached to.
+  subscribeSplineEdit(() => attachSelection(useSelectionStore.getState().ids));
+
+  canvas.addEventListener(
+    "pointerdown",
+    (e) => {
+      if (e.button !== 0 || engine.playing) return;
+      const component = activeSpline();
+      if (!component) return;
+
+      const raycaster = raycastFromEvent(e, canvas);
+      // The handles live on EDITOR_LAYER and a fresh Raycaster tests layer 0
+      // only, so without this the pick silently finds nothing — the handles are
+      // drawn, clickable-looking, and completely inert.
+      raycaster.layers.enableAll();
+      const hit = pickSplineHandle(raycaster);
+      if (hit) {
+        selectKnot(hit.knot, hit.handle);
+        // Stop here: the click has been consumed by the handle, and letting it
+        // through would re-select the path entity and detach the gizmo from
+        // the very knot that was just grabbed.
+        e.stopImmediatePropagation();
+        return;
+      }
+      const rect = canvas.getBoundingClientRect();
+      if (e.ctrlKey || e.metaKey) {
+        const curve = pickCurve(e.clientX, e.clientY, rect, viewport.camera);
+        if (curve && insertKnotAt(curve.distance)) {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+        }
+        return;
+      }
+
+      if (e.shiftKey) {
+        // Extend the path to whatever is under the cursor — a surface if there
+        // is one, the ground plane otherwise. Snapping to geometry is what
+        // makes laying a road over terrain a click per corner.
+        const point = new THREE.Vector3();
+        const hits = raycaster.intersectObjects(engine.scene.children, true);
+        const solid = hits.find((h) => isPickVisible(h.object) && isSolidPick(h.object));
+        if (solid) point.copy(solid.point);
+        else if (!raycaster.ray.intersectPlane(GROUND_PLANE, point)) return;
+        if (appendKnot(point)) {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+        }
+        return;
+      }
+
+      // Nothing spline-shaped under an unmodified click. If a gizmo arrow is
+      // there, the drag belongs to the gizmo — checked HERE rather than at the
+      // top, because the gizmo is parked on the selected knot and its arrows
+      // lie right along the curve, so an early bail makes the neighbouring
+      // knots unselectable and Ctrl+click-to-insert dead along three lines
+      // through the path.
+      if (viewport.gizmo?.axis) return;
+
+      // Otherwise drop the knot selection and leave the click alone: swallowing
+      // it would make every other object in the scene unclickable for as long
+      // as edit mode is armed, which is a trap with no visible cause. Ordinary
+      // picking runs and does the ordinary thing.
+      selectKnot(-1);
+    },
+    true,
+  );
+
+  window.addEventListener("keydown", (e) => {
+    if (e.altKey) setBreakTangent(true);
+    if (!getSplineEdit().armed || engine.playing) return;
+    const target = e.target;
+    if (target?.tagName === "INPUT" || target?.tagName === "TEXTAREA" || target?.isContentEditable) return;
+    if (e.key === "Delete" || e.key === "x" || e.key === "X") {
+      if (deleteSelectedKnot()) e.preventDefault();
+    }
+  });
+  window.addEventListener("keyup", (e) => {
+    if (!e.altKey) setBreakTangent(false);
   });
 }
 
@@ -3484,7 +3679,10 @@ export function ViewportPanel() {
     adjustment: getTerrainBrushAdjustment(),
   }));
   const [previewEntityName, setPreviewEntityName] = useState(null);
+  // True while the Game panel is holding the shared renderer canvas.
+  const [canvasElsewhere, setCanvasElsewhere] = useState(false);
   const playing = usePlayStore((s) => s.playing);
+  const paused = usePlayStore((s) => s.paused);
   const rootPath = useProjectStore((s) => s.rootPath);
   const sceneName = useSceneStore((s) => s.sceneName);
   const scenePath = useSceneStore((s) => s.scenePath);
@@ -3596,9 +3794,11 @@ export function ViewportPanel() {
       resizeActiveCamera();
     });
 
+    // Routed through the arbiter so it no-ops while the Game panel owns the
+    // canvas — dockview keeps resizing a hidden tab's element, and two
+    // observers feeding engine.setSize different numbers thrash the renderer.
     const observer = new ResizeObserver(([entry]) => {
-      engine.setSize(entry.contentRect.width, entry.contentRect.height);
-      resizeActiveCamera();
+      resizeSharedCanvas("viewport", entry.contentRect.width, entry.contentRect.height);
     });
     observer.observe(container);
 
@@ -3652,14 +3852,26 @@ export function ViewportPanel() {
       refreshPreviewLabel();
     });
 
-    // Canvas is created async on first mount; append when ready.
-    const appendCanvas = () => {
-      if (!disposed && viewport.canvas && viewport.canvas.parentElement !== container) {
-        container.appendChild(viewport.canvas);
-      }
-    };
-    if (viewport.canvas) appendCanvas();
-    else ensureViewport().then(appendCanvas);
+    // The canvas is shared with the Game panel, so claim it rather than
+    // appending it — the arbiter hands it back automatically when the Game
+    // panel drops its higher-priority claim on Stop. Claiming is safe before
+    // the canvas exists (it is created async on first mount).
+    claimCanvas("viewport", container, 0);
+    if (!viewport.canvas) ensureViewport();
+    // Show a placeholder while the Game panel has the picture, so the viewport
+    // tab reads as "deliberately empty" rather than broken.
+    const unsubOwner = onCanvasOwnerChanged((owner) => {
+      if (disposed) return;
+      setCanvasElsewhere(owner !== null && owner !== "viewport");
+      if (owner !== "viewport" || !viewport.canvas) return;
+      // The Game panel letterboxes by writing inline width/height. Clear those
+      // on the way back or the viewport keeps the game's aspect box forever —
+      // the CSS class alone can't win against an inline style.
+      viewport.canvas.style.width = "";
+      viewport.canvas.style.height = "";
+      const rect = container.getBoundingClientRect();
+      resizeSharedCanvas("viewport", rect.width, rect.height);
+    });
 
     const flushCameraPrefs = () => {
       clearTimeout(viewport.cameraPrefsSaveTimer);
@@ -3676,9 +3888,14 @@ export function ViewportPanel() {
       unsubSel();
       unsubPlay();
       unsubProp();
+      unsubOwner();
       window.removeEventListener("beforeunload", flushCameraPrefs);
       flushCameraPrefs();
-      viewport.canvas?.remove();
+      // Drop the claim instead of removing the node: if the Game panel is
+      // holding it, yanking the canvas out of ITS container would blank the
+      // running game just because the viewport tab was closed. Scoped to THIS
+      // container so a late cleanup can't delete the next instance's claim.
+      releaseCanvas("viewport", container);
     };
   }, []);
 
@@ -3725,6 +3942,26 @@ export function ViewportPanel() {
         >
           {playing ? <Square size={13} /> : <Play size={13} />}
         </button>
+        {/* Pause freezes game time, not the render loop — the paused frame
+            stays inspectable and Step advances it one slice at a time. */}
+        {playing && (
+          <>
+            <button
+              className={`toolbar-btn icon-only ${paused ? "active" : ""}`}
+              title={paused ? "Resume (Ctrl+Shift+P)" : "Pause (Ctrl+Shift+P)"}
+              onClick={() => togglePaused()}
+            >
+              <Pause size={13} />
+            </button>
+            <button
+              className="toolbar-btn icon-only"
+              title="Step one frame (Ctrl+.)"
+              onClick={() => stepFrame()}
+            >
+              <StepForward size={13} />
+            </button>
+          </>
+        )}
         {[
           ["translate", "Move (G)", Move],
           ["rotate", "Rotate (R)", Rotate3d],
@@ -3774,6 +4011,12 @@ export function ViewportPanel() {
         {playing && <span className="backend-badge playing">Playing</span>}
         {backend && <span className={`backend-badge ${backend === "WebGPU" ? "webgpu" : "webgl"}`}>{backend}</span>}
       </div>
+      {canvasElsewhere && (
+        <div className="viewport-canvas-moved">
+          The Game panel is showing the running game — there is one renderer, shared.
+          Stop, or close the Game tab, to get the viewport back.
+        </div>
+      )}
       {!playing && <AxisViewGizmo playing={playing} />}
       {macroState && (
         <div className="macro-hud">

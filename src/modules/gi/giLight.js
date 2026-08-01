@@ -16,6 +16,8 @@
 import * as THREE from "three/webgpu";
 import {
   If,
+  abs,
+  acos,
   cameraPosition,
   float,
   materialRoughness,
@@ -24,12 +26,15 @@ import {
   positionWorld,
   reflect,
   screenUV,
+  select,
   smoothstep,
   step,
   cross,
   uniform,
+  vec2,
   vec3,
 } from "three/tsl";
+import { sharedFn } from "./giFn.js";
 
 // Fixed emitter slot count: slots are compiled into the material shader, so
 // a constant count means emitter add/remove within the budget needs no
@@ -125,8 +130,179 @@ export function sphereLightFactor(cosTheta, sinR) {
 }
 
 /**
- * Promoted emissive emitters as analytic sphere area lights, with SDF
- * sphere-traced penumbrae: E = color · πsin²R · horizonFactor · shadow.
+ * Exact Lambert form factor of an ORIENTED-BOX area light: E = radiance · F,
+ * F ∈ [0, π]. Each receiver-facing face is integrated with the classic
+ * contour formula for a diffuse polygon (Baum et al.): Σ over edges of
+ * acos(u_i·u_j) · (normalize(u_i×u_j) · N), halved. This is what makes an
+ * emissive CUBE light its surroundings like a cube — the sphere model gave
+ * every emitter circular iso-lux contours and a round "reflection", which
+ * users read as "my box lamp reflects as a sphere". Exact for unoccluded
+ * faces; the part of a face below the receiver's horizon integrates
+ * negatively (an under-estimate, smooth), so each face clamps at zero
+ * rather than paying for true horizon clipping.
+ *
+ * Also exact for PLANES (a box with one zero half-extent: the degenerate
+ * face pair has zero area and the facing check culls the back face), which
+ * turns emissive panels into real area lights.
+ */
+export const boxLightFactor = sharedFn({
+  name: "giBoxLightFactor",
+  type: "float",
+  inputs: [
+    { name: "P", type: "vec3" },
+    { name: "N", type: "vec3" },
+    { name: "center", type: "vec3" },
+    { name: "halfExt", type: "vec3" },
+    { name: "bx", type: "vec3" },
+    { name: "by", type: "vec3" },
+    { name: "bz", type: "vec3" },
+  ],
+  body: (P, N, center, halfExt, bx, by, bz) => {
+    const F = float(0).toVar();
+    // (outward axis, half along it, in-plane u·halfU, in-plane v·halfV) with
+    // u×v = outward for every face of the right-handed basis.
+    const faces = [
+      [bx, halfExt.x, by.mul(halfExt.y), bz.mul(halfExt.z)],
+      [bx.negate(), halfExt.x, bz.mul(halfExt.z), by.mul(halfExt.y)],
+      [by, halfExt.y, bz.mul(halfExt.z), bx.mul(halfExt.x)],
+      [by.negate(), halfExt.y, bx.mul(halfExt.x), bz.mul(halfExt.z)],
+      [bz, halfExt.z, bx.mul(halfExt.x), by.mul(halfExt.y)],
+      [bz.negate(), halfExt.z, by.mul(halfExt.y), bx.mul(halfExt.x)],
+    ];
+    for (const [w, hw, eu, ev] of faces) {
+      const faceCenter = center.add(w.mul(hw)).toVar();
+      // Only faces whose outward normal points at the receiver emit toward it.
+      If(P.sub(faceCenter).dot(w).greaterThan(1e-4), () => {
+        // Winding chosen so the contour sum is POSITIVE for a receiver the
+        // face shines on (verified against the closed-form square patch).
+        const u0 = faceCenter.add(eu).add(ev).sub(P).normalize().toVar();
+        const u1 = faceCenter.add(eu).sub(ev).sub(P).normalize().toVar();
+        const u2 = faceCenter.sub(eu).sub(ev).sub(P).normalize().toVar();
+        const u3 = faceCenter.sub(eu).add(ev).sub(P).normalize().toVar();
+        const edge = (a, b) => {
+          const c = cross(a, b);
+          return acos(a.dot(b).clamp(-1, 1)).mul(c.div(c.length().max(1e-6)).dot(N));
+        };
+        const faceSum = edge(u0, u1).add(edge(u1, u2)).add(edge(u2, u3)).add(edge(u3, u0)).mul(0.5);
+        F.addAssign(faceSum.max(0));
+      });
+    }
+    return F;
+  },
+});
+
+/**
+ * Angular miss distance (≈ sine of the angle) between a reflection ray and
+ * an oriented box's silhouette: 0 when the ray hits the box, growing with
+ * how far it passes by. The specular glow shapes its highlight with this,
+ * so a box emitter's reflection IS a box (a rotated cube reads as a rotated
+ * cube), where the sphere cone test drew a disc for every emitter.
+ * Evaluated at the ray's closest approach to the box center — exact inside
+ * the silhouette, slightly loose at grazing corners, which only softens the
+ * rim by a pixel or two.
+ */
+export const boxGlowMiss = sharedFn({
+  name: "giBoxGlowMiss",
+  type: "float",
+  inputs: [
+    { name: "P", type: "vec3" },
+    { name: "R", type: "vec3" },
+    { name: "center", type: "vec3" },
+    { name: "halfExt", type: "vec3" },
+    { name: "bx", type: "vec3" },
+    { name: "by", type: "vec3" },
+    { name: "bz", type: "vec3" },
+  ],
+  body: (P, R, center, halfExt, bx, by, bz) => {
+    const rel = P.sub(center);
+    const ro = vec3(rel.dot(bx), rel.dot(by), rel.dot(bz)).toVar();
+    const rd = vec3(R.dot(bx), R.dot(by), R.dot(bz)).toVar();
+    const tStar = ro.negate().dot(rd).clamp(0.05, 1e5).toVar();
+    const p = ro.add(rd.mul(tStar));
+    const q = p.abs().sub(halfExt).max(0);
+    return q.length().div(tStar);
+  },
+});
+
+/**
+ * Distance along `dir` (unit, from P) at which the ray ENTERS the oriented
+ * box — the slab test's tNear. Replaces `dist − boundingRadius` as the
+ * shadow-ray cap for box emitters: the bounding sphere of an elongated box
+ * stopped the ray well short of the face, so geometry hugging a big lamp
+ * never occluded it.
+ */
+export const boxRayEnter = sharedFn({
+  name: "giBoxRayEnter",
+  type: "float",
+  inputs: [
+    { name: "P", type: "vec3" },
+    { name: "dir", type: "vec3" },
+    { name: "center", type: "vec3" },
+    { name: "halfExt", type: "vec3" },
+    { name: "bx", type: "vec3" },
+    { name: "by", type: "vec3" },
+    { name: "bz", type: "vec3" },
+  ],
+  body: (P, dir, center, halfExt, bx, by, bz) => {
+    const rel = P.sub(center);
+    const ro = vec3(rel.dot(bx), rel.dot(by), rel.dot(bz));
+    const rd = vec3(dir.dot(bx), dir.dot(by), dir.dot(bz));
+    // Slab-parallel components get a large finite stand-in — WGSL's 1/0 is
+    // indeterminate, not a portable +inf.
+    const safe = (c) => select(c.greaterThanEqual(0), c.max(1e-6), c.min(-1e-6));
+    const inv = vec3(float(1).div(safe(rd.x)), float(1).div(safe(rd.y)), float(1).div(safe(rd.z))).toVar();
+    const t1 = halfExt.negate().sub(ro).mul(inv);
+    const t2 = halfExt.sub(ro).mul(inv);
+    const tmin = t1.min(t2);
+    return tmin.x.max(tmin.y).max(tmin.z);
+  },
+});
+
+/**
+ * Geometric irradiance factor of one emitter slot (E = slot.color · factor):
+ * the sphere-area model for sphere slots, the exact box form factor for box
+ * slots. ONE function used by the receiver direct term, the voxel feedback
+ * inject, and reflection-hit lighting — divergence between those three shows
+ * up as light that changes when a lamp is viewed via a different path.
+ */
+export function emitterSlotFactor(slot, P, N, cosTheta, sinR) {
+  const sphereF = float(Math.PI).mul(sinR).mul(sinR).mul(sphereLightFactor(cosTheta, sinR));
+  if (!slot.kind) return sphereF;
+  const factor = sphereF.toVar();
+  If(float(slot.kind).greaterThan(0.5), () => {
+    factor.assign(
+      boxLightFactor(P, N, vec3(slot.center), vec3(slot.half), vec3(slot.bx), vec3(slot.by), vec3(slot.bz)),
+    );
+  });
+  return factor;
+}
+
+/**
+ * The shadow ray's reach toward a slot: to the sphere surface, or to the
+ * box's actual face (slab entry) for box slots.
+ */
+export function emitterSurfaceT(slot, P, dirToEmitter, dist) {
+  const sphereT = dist.sub(slot.radius);
+  if (!slot.kind) return sphereT;
+  const t = sphereT.toVar();
+  If(float(slot.kind).greaterThan(0.5), () => {
+    t.assign(
+      boxRayEnter(P, dirToEmitter, vec3(slot.center), vec3(slot.half), vec3(slot.bx), vec3(slot.by), vec3(slot.bz)),
+    );
+  });
+  return t;
+}
+
+/** Angular-size radius of a slot: exact for spheres, mean-projected-area
+ *  equivalent for boxes (set CPU-side — see GISystem's slot refresh). */
+export function emitterAngularRadius(slot) {
+  return slot.reff ?? slot.radius;
+}
+
+/**
+ * Promoted emissive emitters as analytic AREA lights (sphere or oriented
+ * box, per slot), with SDF sphere-traced penumbrae:
+ * E = color · geometricFactor · shadow (see emitterSlotFactor).
  *
  * Lives here (rather than inline in the light node) because BOTH callers need
  * exactly this math: the deferred resolve pass evaluates it once per screen
@@ -151,12 +327,11 @@ export function emitterDirectAt(params, P, N, samplePoint) {
     const dirToEmitter = toEmitter.div(dist).toVar();
     const cosTheta = dirToEmitter.dot(N).toVar();
     const sinR = float(slot.radius).div(dist).clamp(0, 1).toVar();
-    const solidAngle = float(Math.PI).mul(sinR).mul(sinR);
-    // Horizon-aware factor (see sphereLightFactor): a floor-hugging lamp
-    // still lights the floor around it smoothly.
+    // Sphere slots: horizon-aware πsin²R·factor (a floor-hugging lamp still
+    // lights the floor around it smoothly). Box slots: the exact per-face
+    // form factor — a cube lamp pools light like a cube, not a circle.
     const emitterDirect = vec3(slot.color)
-      .mul(solidAngle)
-      .mul(sphereLightFactor(cosTheta, sinR))
+      .mul(emitterSlotFactor(slot, P, N, cosTheta, sinR))
       .toVar();
 
     const shadow = float(1).toVar();
@@ -175,18 +350,31 @@ export function emitterDirectAt(params, P, N, samplePoint) {
         .and(emitterLum.greaterThan(0.0015)),
       () => {
         // SDF sphere-traced penumbra: ONE ray, smooth by construction.
-        // k = distance / emitter radius encodes the light's angular size:
-        // bigger/closer emitter → softer. Floor 1.2 so a large area lamp
-        // close to the receiver keeps a wide, soft penumbra.
-        const k = dist.div(slot.radius.max(0.05)).clamp(1.2, 48);
-        const maxT = dist.sub(slot.radius).sub(params.shadowMargin).max(0);
+        // k = distance / emitter angular radius encodes the light's angular
+        // size: bigger/closer emitter → softer. Floor 1.2 so a large area
+        // lamp close to the receiver keeps a wide, soft penumbra.
+        const k = dist.div(float(emitterAngularRadius(slot)).max(0.05)).clamp(1.2, 48);
+        // Ray cap at the emitter's actual SURFACE (slab entry for boxes —
+        // the bounding sphere of an elongated lamp stopped the ray well
+        // short of its face, exempting anything hugging it from occluding).
+        const maxT = emitterSurfaceT(slot, samplePoint, dirToEmitter, dist).sub(params.shadowMargin).max(0);
         If(maxT.greaterThan(params.shadowMargin), () => {
           // Self-exclusion covers ONLY the lamp's own body + a couple of
-          // field cells — a fixed larger radius would exempt any wall near
-          // the lamp from occluding and pour light through it.
+          // field cells. Sphere slots: the bounding sphere ×1.5 (their body
+          // IS the sphere). Box slots: the OBB dilated by the margin — the
+          // bounding sphere of a big panel swallowed nearby ceilings/walls,
+          // which then stopped occluding (light poured through into the
+          // next room as a circle) and its boundary ringed the pool.
+          const kindF = slot.kind ? float(slot.kind) : null;
+          const exRadius = kindF
+            ? mix(slot.radius.mul(1.5).add(params.shadowMargin), float(params.shadowMargin), kindF)
+            : slot.radius.mul(1.5).add(params.shadowMargin);
+          const exBox = kindF
+            ? { half: mix(vec3(-1), vec3(slot.half), kindF), bx: slot.bx, by: slot.by, bz: slot.bz }
+            : null;
           const traced = params.shadowTraceFn(
             samplePoint, dirToEmitter, maxT, k, cosTheta,
-            center, slot.radius.mul(1.5).add(params.shadowMargin),
+            center, exRadius, exBox,
           );
           // Grazing fade: with the ray nearly parallel to the receiver plane
           // the trace hugs the surface's own field and flickers in terraced
@@ -218,18 +406,29 @@ export class GICascadeLight extends THREE.Light {
     // across GI rebuilds and never recompile.
     this.giIrradianceNode = null;
     this.giEmitterShadowNode = null;
+    this.giRadianceNode = null;
     // Set by GISystem after construction: (P, N) => vec3 irradiance.
     // Still used by the legacy in-material path (no gbuffer) and by the
     // resolve pass itself.
     this.gatherFn = null;
     // Optional: (P, R) => vec3 radiance along R — feeds indirect specular.
     // `radianceFn` = mid-angular cascade (soft gloss), `radianceSharpFn` =
-    // finest-angular cascade (low-roughness reflections).
+    // finest-angular cascade (low-roughness reflections), `radianceRoughFn`
+    // = densest-probe cascade (rough gloss — lattice stripes, not direction
+    // bins, are what a wide lobe resolves).
     this.radianceFn = null;
     this.radianceSharpFn = null;
+    this.radianceRoughFn = null;
+    // Fast non-exact reflections reuse the deferred irradiance texture as a
+    // broad specular radiance term. This deliberately trades directionality
+    // for a tiny, stable material graph; exact reflections opt into the
+    // directional cascade/BVH machinery below.
+    this.approximateReflections = false;
     // Optional emissive-area-shadow inputs (see GISystem #updateEmitters):
-    // emitterSlots = MAX_EMITTERS × {center, radius, color} uniforms;
-    // shadowTraceFn = voxel DDA (origin, dir, maxT) => { rad, t }.
+    // emitterSlots = MAX_EMITTERS × {center, radius, color, kind, half,
+    // bx/by/bz, reff} uniforms (kind 0 = sphere, 1 = oriented box — see
+    // emitterSlotFactor); shadowTraceFn = voxel DDA (origin, dir, maxT)
+    // => { rad, t }.
     this.emitterSlots = null;
     this.shadowTraceFn = null;
     this.shadowMargin = 0.3;
@@ -241,6 +440,30 @@ export class GICascadeLight extends THREE.Light {
     // World-units reach of the per-pixel mirror ray (set by GISystem from
     // the volume size; the DDA's step cap bounds shader cost).
     this.mirrorRange = 24;
+    // Optional exact-reflection hit-t source (GI Phase 3 v1 — see
+    // docs/GI_PLAN.md and giScreen.js's createGiBvhReflect): a persistent
+    // screen texture written by a half-res BVH compute prepass, sampled at
+    // the SAME screen UV as giIrradianceNode. When set, the mirror block
+    // below reads t from here INSTEAD OF calling `mirrorTraceFn` — a
+    // compile-time switch (mirrorTraceFn is simply never invoked, so its
+    // SDF trace is not compiled into the shader at all). Miss is still
+    // t < 0, so everything downstream (hitPoint, hitSurfaceFn, per-hit
+    // shadows) is unchanged. Set by GISystem only at quality high/ultra
+    // (`exactReflections`) and cleared by the `globalThis.__giNoBvhReflections`
+    // hatch, which keeps this SDF mirrorTraceFn path as the always-working
+    // fallback/A-B baseline.
+    this.bvhReflectTexture = null;
+    // Optional sibling of bvhReflectTexture (GI Phase 3 v2 — texture-at-hit):
+    // rgb = the BVH hit's ACTUAL texture-sampled albedo (bvhScene.js
+    // `firstHit`'s atlas lookup), a = 1 on a hit else 0 (giScreen.js
+    // `createGiBvhReflect`'s `colorTarget`). Same screen UV as
+    // bvhReflectTexture/giIrradianceNode. When set, the mirror block below
+    // substitutes this for `hitSurface.albedo` (the mean-color mesh-SDF
+    // approximation) wherever the BVH t-source was actually used for this
+    // pixel — same PURE DATAFLOW consumption discipline as bvhReflectTexture
+    // (direct sub-node reads + select(), never hoisted/gated — see that
+    // block's comment).
+    this.bvhReflectColorTexture = null;
     // Optional: (p) => { rad, coverage } trilinear INDIRECT-field sample —
     // diffuse remainder for mirror hits (set by GISystem).
     this.mirrorSampleFn = null;
@@ -262,6 +485,25 @@ export class GICascadeLight extends THREE.Light {
     this.intensityUniform = uniform(1);
     this.normalOffset = 0.35;
   }
+}
+
+/**
+ * Inverse of giScreen.js's `octEncodeNormal` (see that function's comment):
+ * decodes 2 floats in [-1,1] back to a unit vector. Written as a CLOSED-FORM
+ * expression — no `.toVar()`, no `If()` — on purpose: this only ever gets
+ * called from the mirror block's PURE DATAFLOW branch below, which is a
+ * verified-by-incident correctness requirement (see that branch's own
+ * comment: hoisting a texture sample through `.toVar()` and branching on it
+ * with `If()` rendered the whole mirror black; direct reads + `select()`
+ * chains are the only proven-safe idiom there), so this helper must never
+ * introduce either.
+ */
+function decodeOctNormal(e) {
+  const vz = float(1).sub(abs(e.x)).sub(abs(e.y));
+  const t = vz.negate().max(0);
+  const vx = select(e.x.greaterThanEqual(0), e.x.sub(t), e.x.add(t));
+  const vy = select(e.y.greaterThanEqual(0), e.y.sub(t), e.y.add(t));
+  return vec3(vx, vy, vz).normalize();
 }
 
 export class GICascadeLightNode extends THREE.AnalyticLightNode {
@@ -346,11 +588,19 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
       emitterData.push(...direct.perSlot);
     }
 
+    // The default glossy-GI path must remain cheap on imported scenes. The
+    // deferred texture was already computed once per screen pixel, so this
+    // adds one texture-derived radiance term instead of embedding the volume
+    // cascade lookup graph in every reflective material.
+    if (deferred && light.approximateReflections && !light.giRadianceNode && builder.context.radiance) {
+      builder.context.radiance.addAssign(irradiance.div(Math.PI));
+    }
+
     // Glossy GI reflections: cascade radiance along the reflection vector →
     // context.radiance, which PhysicalLightingModel consumes as indirect
     // specular with full Fresnel/roughness weighting. Coexists with SSR
     // (SSR wins where it hits; this fills everything else).
-    if (light.radianceFn && builder.context.radiance) {
+    if ((light.radianceFn || light.giRadianceNode) && builder.context.radiance) {
       const bucket = giRoughnessBucketOf(builder.material);
       const fullyRough = bucket === 2;
       const canMirror = bucket === 0 || bucket === 3;
@@ -381,14 +631,34 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
       // was compiled out or gated out. Mirror setupVariants exactly.
       const materialRoughnessNode = builder.material?.roughnessNode;
       const roughness = (materialRoughnessNode ? float(materialRoughnessNode) : materialRoughness).clamp(0, 1);
-      const softLookup = vec3(light.radianceFn(samplePoint, reflected));
+      const softLookup = light.giRadianceNode
+        ? vec3(light.giRadianceNode.sample(screenUV))
+        : vec3(light.radianceFn(samplePoint, reflected));
       // Low roughness → the finest-angular cascade (sharpest reflection the
       // field can express); mid roughness → the mid cascade; high roughness
-      // → cosine-average radiance (no directional structure at all).
+      // → the DENSEST-probe cascade (wide lobes don't resolve fine direction
+      // bins, but they do resolve the sparse lattice as stripes), then the
+      // cosine-average collapse below.
       let directional = softLookup;
       if (light.radianceSharpFn) {
         const sharpLookup = vec3(light.radianceSharpFn(samplePoint, reflected));
         directional = mix(sharpLookup, softLookup, smoothstep(0.02, 0.3, roughness));
+      }
+      if (light.radianceRoughFn) {
+        const roughLookup = vec3(light.radianceRoughFn(samplePoint, reflected));
+        directional = mix(directional, roughLookup, smoothstep(0.32, 0.55, roughness));
+      }
+      // FAST EXACT PATH. The shared BVH pass already traced the reflected
+      // ray and texture-sampled the hit triangle. Blend that cached hit color
+      // over the deferred directional cascade result for mirror-ish pixels.
+      // This replaces the old per-material hit reconstruction/SDF/shadow
+      // graph (tens of seconds to compile) with two texture reads and a mix.
+      if (light.bvhReflectColorTexture && canMirror) {
+        const exactHit = light.bvhReflectColorTexture.sample(screenUV);
+        const exactLighting = irradiance.div(Math.PI).add(vec3(0.06));
+        const exactRadiance = exactHit.rgb.mul(exactLighting);
+        const exactWeight = exactHit.a.mul(smoothstep(0.45, 0.15, roughness));
+        directional = mix(directional, exactRadiance, exactWeight);
       }
       // TRUE mirror reflections for low-roughness materials: one SDF
       // sphere-traced ray through the composited global field (cascade bins
@@ -401,7 +671,7 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
       // from smearing into cell-sized blobs (the reference does exactly
       // this with its analytic sun at reflection hits). Miss (t < 0) or a
       // degenerate neighborhood keeps the cascade lookup.
-      if (light.mirrorTraceFn && light.mirrorSampleFn && canMirror) {
+      if ((light.mirrorTraceFn || light.bvhReflectTexture) && light.mirrorSampleFn && canMirror) {
         // Wider roughness range than the old 0.08-0.3: mid-roughness metals
         // otherwise fall back to the cascade probe lookup, whose sparse
         // probe lattice banded visibly (vertical stripes on metallic
@@ -411,14 +681,115 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
         const mirrorOut = vec3(0).toVar();
         const mirrorWeight = float(0).toVar();
         If(mirrorGate.greaterThan(0.001), () => {
-          const mirror = light.mirrorTraceFn(samplePoint, reflected, light.mirrorRange ?? 24);
-          const hitPoint = samplePoint.add(reflected.mul(mirror.t.max(0))).toVar();
+          // t source: BVH (exact, static meshes) is AUTHORITATIVE except on
+          // pixels whose ray can cross a BVH-excluded mesh — skinned
+          // characters etc., flagged in the texture's g channel — where the
+          // SDF trace joins via nearest-positive union (the SDF field still
+          // carries those meshes, so they stay visible in mirrors).
+          // An UNCONDITIONAL union was tried and REVERTED: the SDF's
+          // melted-blob phantom hits sit IN FRONT of the true surface, so a
+          // global min() re-sealed every silhouette the BVH fixed (the
+          // harness contrast delta collapsed 20 → 0). Misses stay t < 0 →
+          // cascade lookup, both paths; the BVH texture samples at the SAME
+          // screen UV as irradiance.
+          let mirrorT;
+          // Texture-at-hit (GI Phase 3 v2) / exact-normal (GI Phase 3 v3):
+          // set ONLY by the PURE DATAFLOW branch below, consumed at the
+          // `hitPoint` offset and the `hitSurface.albedo`/`hitN` use sites
+          // further down with the identical no-toVar/no-If discipline.
+          // Every other branch (v1, BVH-only, SDF-only) leaves these null,
+          // so hit shading there is byte-identical to before — unchanged.
+          let bvhCol = null;
+          let usedBvh = null;
+          let nHit = null;
+          if (light.bvhReflectTexture && (globalThis.__giBvhV1 || globalThis.__giBvhV1Light)) {
+            // Exact v1 consumption (bisect hatch): direct .r, no toVar, no
+            // coverage branch — the executor-verified build.
+            mirrorT = light.bvhReflectTexture.sample(screenUV).r;
+          } else if (light.bvhReflectTexture && light.mirrorTraceFn) {
+            // PURE DATAFLOW, deliberately: the first version of this branch
+            // hoisted the sample through `.toVar()` and gated the SDF trace
+            // behind `If(flag)` — and rendered BLACK (bisected 2026-08-01:
+            // v1-style direct-sample consumption + the SAME pass passes, so
+            // the fault was in this branch's toVar/If structure, root cause
+            // in three's codegen not chased). Direct sub-node reads + selects
+            // are the v1 idiom that verifiably works. The unconditional SDF
+            // trace costs what it cost before BVH existed.
+            const tBvh = light.bvhReflectTexture.sample(screenUV).r;
+            const dynFlag = light.bvhReflectTexture.sample(screenUV).g;
+            const tSdf = light.mirrorTraceFn(samplePoint, reflected, light.mirrorRange ?? 24).t;
+            const union = select(tBvh.lessThan(0), tSdf, select(tSdf.lessThan(0), tBvh, tBvh.min(tSdf)));
+            mirrorT = select(dynFlag.greaterThan(0.5), union, tBvh);
+            if (light.bvhReflectColorTexture) {
+              // Same pure-dataflow rule as mirrorT above: direct sub-node
+              // reads only, no `.toVar()`, no `If()`. `usedBvh` mirrors
+              // mirrorT's own dynFlag/tBvh/tSdf selection (1 exactly when
+              // mirrorT resolved to tBvh rather than the SDF/union), so the
+              // real-texture substitution at the albedo use site below only
+              // applies where the BVH actually supplied this pixel's hit.
+              bvhCol = light.bvhReflectColorTexture.sample(screenUV);
+              usedBvh = dynFlag.lessThanEqual(0.5).or(tBvh.greaterThanEqual(0).and(tSdf.lessThan(0).or(tBvh.lessThanEqual(tSdf))));
+              // Exact hit normal (GI Phase 3 v3 — striping fix): octahedral-
+              // decoded from bvhReflectTexture's OWN .zw (same texture as
+              // t/dynFlag — see giScreen.js createGiBvhReflect's STRIPING
+              // FIX comment). Direct texel read; decodeOctNormal is itself
+              // a closed-form select() chain, no toVar/If anywhere in it.
+              nHit = decodeOctNormal(light.bvhReflectTexture.sample(screenUV).zw);
+            }
+          } else if (light.bvhReflectTexture) {
+            mirrorT = light.bvhReflectTexture.sample(screenUV).r;
+          } else {
+            mirrorT = light.mirrorTraceFn(samplePoint, reflected, light.mirrorRange ?? 24).t;
+          }
+          // STRIPING FIX (GI Phase 3 v3, see giScreen.js's comment on
+          // createGiBvhReflect): a BVH-sourced hit (usedBvh) now stores the
+          // RAW t (no ray-direction standoff), so this offsets along the
+          // decoded EXACT FACE NORMAL instead — a distance perpendicular to
+          // the surface regardless of the ray's grazing angle, unlike
+          // offsetting along `reflected` (which barely moves the sample at
+          // grazing angles — the root cause of the reported banded/striped
+          // reflections). The SDF/union-sourced case is UNCHANGED: its own
+          // march already undershoots the surface by ~0.45 cells
+          // (sdfScene.js createMirrorTrace) — that is its standoff,
+          // offsetting it again would double up.
+          //
+          // Magnitude: 0.15x light.normalOffset — smaller than the OLD ray
+          // standoff's own budget (`normalOffset·0.5`), tuned down in two
+          // measured steps. (1) The FULL normalOffset regressed
+          // run-gi-bvh-reflect (contrast 60.1 → 17.6): the torus-knot
+          // regression scene's tube radius (0.28) is only ~2-3x
+          // normalOffset, so that big a lift measurably blurred its fine
+          // curved gaps. (2) Half-magnitude fixed that (contrast ~61, back
+          // to baseline) but a SEPARATE supplementary check — a large flat
+          // rough box, sampled with a 12-point luminance line across its
+          // floor reflection — showed the offset ITSELF introducing a fine
+          // speckle/moiré pattern on a TILTED flat face (6 direction
+          // reversals) that a bisect (offset forced to zero) did not show
+          // (2 reversals, ~monotonic): stepping a FIXED distance along a
+          // normal that is not axis-aligned with the field's voxel grid
+          // beats against the grid at fine (half-res-pixel) sampling
+          // intervals. 0.15x keeps the fix's core property (offsetting
+          // along the SURFACE normal, not the grazing-dependent ray) while
+          // shrinking the step small enough to stay inside the same voxel
+          // neighbourhood far more often — re-verified against both the
+          // knot contrast test and the flat-box speckle test (see
+          // docs/GI_PLAN.md verification notes for both rounds' numbers).
+          const hitPointRay = samplePoint.add(reflected.mul(mirrorT.max(0)));
+          const hitPoint = (
+            nHit ? select(usedBvh, hitPointRay.add(nHit.mul(light.normalOffset.mul(0.15))), hitPointRay) : hitPointRay
+          ).toVar();
           const sampled = light.mirrorSampleFn(hitPoint);
           const hitRad = vec3(sampled.rad).toVar();
           if (light.hitSurfaceFn && light.mirrorShadowFn && light.hitLighting) {
             const hitSurface = light.hitSurfaceFn(hitPoint);
             If(hitSurface.valid.greaterThan(0.5), () => {
-              const hitN = hitSurface.normal;
+              // Exact BVH face normal where it actually fed this hit (same
+              // condition as the albedo substitution below) — sharper than
+              // the SDF-gradient normal hitSurfaceFn falls back to, and the
+              // one the STRIPING FIX above already offset hitPoint along.
+              const hitN = bvhCol
+                ? select(bvhCol.a.greaterThan(0.5).and(usedBvh), nHit, hitSurface.normal)
+                : hitSurface.normal;
               const hitOrigin = hitPoint.add(hitN.mul(light.normalOffset)).toVar();
               const direct = vec3(0).toVar();
               if (light.emitterSlots?.length) {
@@ -427,24 +798,32 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
                     const rel = vec3(slot.center).sub(hitPoint).toVar();
                     const dist = rel.length().max(1e-3).toVar();
                     const dirTo = rel.div(dist).toVar();
-                    // |cos| both sides — thin geometry has arbitrary facing
-                    // (same convention as the feedback's voxel direct).
+                    // Both sides — thin geometry has arbitrary facing (same
+                    // convention as the feedback's voxel direct): flip the
+                    // hit normal toward the emitter and use |cos|.
                     const cosH = dirTo.dot(hitN).abs().toVar();
+                    const NhFlipped = select(dirTo.dot(hitN).greaterThanEqual(0), hitN, vec3(hitN).negate());
                     const sinRH = float(slot.radius).div(dist).clamp(0, 1).toVar();
-                    const solidAngle = float(Math.PI).mul(sinRH).mul(sinRH);
                     const shadowH = float(1).toVar();
-                    const k = dist.div(slot.radius.max(0.05)).clamp(1.2, 48);
-                    const maxT = dist.sub(slot.radius).sub(light.shadowMargin).max(0);
+                    const k = dist.div(float(emitterAngularRadius(slot)).max(0.05)).clamp(1.2, 48);
+                    const maxT = emitterSurfaceT(slot, hitOrigin, dirTo, dist).sub(light.shadowMargin).max(0);
                     If(maxT.greaterThan(light.shadowMargin), () => {
+                      const kindF = slot.kind ? float(slot.kind) : null;
+                      const exRadius = kindF
+                        ? mix(slot.radius.mul(1.5).add(light.shadowMargin), float(light.shadowMargin), kindF)
+                        : slot.radius.mul(1.5).add(light.shadowMargin);
+                      const exBox = kindF
+                        ? { half: mix(vec3(-1), vec3(slot.half), kindF), bx: slot.bx, by: slot.by, bz: slot.bz }
+                        : null;
                       shadowH.assign(
                         light.mirrorShadowFn(
                           hitOrigin, dirTo, maxT, k, cosH,
-                          vec3(slot.center), slot.radius.mul(1.5).add(light.shadowMargin),
+                          vec3(slot.center), exRadius, exBox,
                         ),
                       );
                     });
                     direct.addAssign(
-                      vec3(slot.color).mul(solidAngle).mul(sphereLightFactor(cosH, sinRH)).mul(shadowH),
+                      vec3(slot.color).mul(emitterSlotFactor(slot, hitPoint, NhFlipped, cosH, sinRH)).mul(shadowH),
                     );
                   });
                 }
@@ -476,31 +855,57 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
                   });
                 }
               }
-              hitRad.assign(sampled.rad.add(hitSurface.albedo.mul(direct).div(Math.PI)));
+              // Real texture detail at the hit (GI Phase 3 v2) where the BVH
+              // supplied it; the mean-color mesh-SDF albedo everywhere else
+              // (a miss, the SDF-fallback union, or no color texture at
+              // all) — inline select, nothing hoisted (see bvhCol's PURE
+              // DATAFLOW note above).
+              const hitAlbedo = bvhCol
+                ? select(bvhCol.a.greaterThan(0.5).and(usedBvh), bvhCol.rgb, hitSurface.albedo)
+                : hitSurface.albedo;
+              hitRad.assign(sampled.rad.add(hitAlbedo.mul(direct).div(Math.PI)));
             });
           }
           mirrorOut.assign(hitRad);
-          mirrorWeight.assign(mirrorGate.mul(step(0, mirror.t)).mul(sampled.coverage.clamp(0, 1)));
+          mirrorWeight.assign(mirrorGate.mul(step(0, mirrorT)).mul(sampled.coverage.clamp(0, 1)));
         });
         light._mirrorOut = mirrorOut;
         light._mirrorWeight = mirrorWeight;
       }
 
-      // Emitter SPECULAR: sphere light vs the roughness-widened reflection
-      // cone, energy-conserving (Karis representative-sphere ratio),
-      // occluded by the slot's diffuse-direction penumbra. Added to the
-      // FIELD path (inside the roughness collapse below — on rough
+      // Emitter SPECULAR: the slot's area shape vs the roughness-widened
+      // reflection lobe, energy-conserving (Karis representative-area
+      // ratio), occluded by the slot's diffuse-direction penumbra. Added to
+      // the FIELD path (inside the roughness collapse below — on rough
       // surfaces the widened-cone glow otherwise washes out diffuse
       // shadows entirely) AND to the mirror path (mirror pixels are
       // low-roughness, where the glow is sharp and correct).
       let glow = vec3(0);
       for (const { slot, shadow, dist, dirToEmitter, active } of emitterData) {
         const cosAng = dirToEmitter.dot(reflected);
-        const sinR = float(slot.radius).div(dist).clamp(0, 1).toVar();
+        // Angular size from the slot's effective radius (exact for spheres,
+        // mean-projected-area for boxes) — drives softness and energy.
+        const sinR = float(emitterAngularRadius(slot)).div(dist).clamp(0, 1).toVar();
         // GGX-ish lobe widening: alpha = roughness², small floor for AA.
-        const effSin = sinR.add(roughness.mul(roughness)).add(0.015).min(1).toVar();
+        const spread = roughness.mul(roughness).add(0.015).toVar();
+        const effSin = sinR.add(spread).min(1).toVar();
         const cosEff = effSin.mul(effSin).oneMinus().max(0).sqrt().toVar();
-        const inCone = smoothstep(cosEff, mix(cosEff, 1, 0.35), cosAng);
+        // Sphere slots: cone test around the direction to center (a disc
+        // highlight is CORRECT for a sphere). Box slots: angular distance
+        // from the reflected ray to the box's actual silhouette — the
+        // reflection of a cube lamp is a cube, tilted the way the lamp is
+        // tilted, not the disc the sphere model drew ("reflections from
+        // emissives look like a sphere" report).
+        const inCone = float(smoothstep(cosEff, mix(cosEff, 1, 0.35), cosAng)).toVar();
+        if (slot.kind) {
+          If(float(slot.kind).greaterThan(0.5), () => {
+            const miss = boxGlowMiss(
+              positionWorld, reflected,
+              vec3(slot.center), vec3(slot.half), vec3(slot.bx), vec3(slot.by), vec3(slot.bz),
+            );
+            inCone.assign(smoothstep(0.0, spread, miss).oneMinus());
+          });
+        }
         const energy = sinR.mul(sinR).div(effSin.mul(effSin).max(1e-6));
         glow = glow.add(vec3(slot.color).mul(inCone).mul(energy).mul(shadow).mul(active));
       }

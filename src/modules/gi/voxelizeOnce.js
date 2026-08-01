@@ -43,27 +43,101 @@ function constantColorOf(node, depth = 0) {
   return null;
 }
 
+/** First THREE.Texture found in a node subtree (the shader graph's albedo
+ *  sample), or null. Same bounded wrapper-walk as constantColorOf. */
+function textureValueOf(node, depth = 0) {
+  if (!node || depth > 8) return null;
+  if (node.value?.isTexture) return node.value;
+  for (const child of [node.aNode, node.bNode, node.node]) {
+    const found = child ? textureValueOf(child, depth + 1) : null;
+    if (found) return found;
+  }
+  return null;
+}
+
+/**
+ * Mean LINEAR color of a texture, from an 8×8 downsample of its source
+ * image. This is what keeps a TEXTURED mesh from baking into the field —
+ * and reflecting — as flat WHITE: the SDF slot carries one albedo, and
+ * `material.color` for a textured model is white ("the reflection from a
+ * model is white" report). GPU-compressed sources (KTX2) have no drawable
+ * image → cached null → the scalar color fallback stands.
+ */
+const textureAverageCache = new WeakMap(); // texture -> {r,g,b} | null (tried, undrawable)
+// Fingerprint scans revisit the same materials for the lifetime of a scene.
+// A diagnostic that cannot change until the material graph changes should not
+// flood the editor console/store on every scan.
+const warnedUnresolvedEmissive = new WeakSet();
+function textureAverageColor(texture) {
+  if (!texture) return null;
+  if (textureAverageCache.has(texture)) return textureAverageCache.get(texture);
+  const image = texture.image;
+  if (!image || !(image.width > 0) || !(image.height > 0)) return null; // not loaded yet — retry next scan
+  if (image.complete === false) return null;
+  try {
+    const size = 8;
+    const canvas =
+      typeof OffscreenCanvas !== "undefined"
+        ? new OffscreenCanvas(size, size)
+        : Object.assign(document.createElement("canvas"), { width: size, height: size });
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    ctx.drawImage(image, 0, 0, size, size);
+    const data = ctx.getImageData(0, 0, size, size).data;
+    let r = 0, g = 0, b = 0, w = 0;
+    for (let i = 0; i < data.length; i += 4) {
+      const a = data[i + 3] / 255;
+      // Albedo images are sRGB-encoded — average in LINEAR, alpha-weighted.
+      r += Math.pow(data[i] / 255, 2.2) * a;
+      g += Math.pow(data[i + 1] / 255, 2.2) * a;
+      b += Math.pow(data[i + 2] / 255, 2.2) * a;
+      w += a;
+    }
+    const result = w > 1e-3 ? { r: r / w, g: g / w, b: b / w } : null;
+    textureAverageCache.set(texture, result);
+    return result;
+  } catch {
+    textureAverageCache.set(texture, null); // undrawable source — permanent
+    return null;
+  }
+}
+
 /**
  * Resolves the bake-relevant surface of a material. Engine material assets
  * carry their real color/emissive in colorNode/emissiveNode (top-level
  * `.color` can sit at stale white, `.emissive` at black) — same reason the
- * editor swatch walks colorNode. Texture-driven nodes resolve to null →
- * fall back to the scalar fields (texture-average bake = future work).
+ * editor swatch walks colorNode. Texture-driven color multiplies in the
+ * texture's MEAN color (see textureAverageColor).
  */
 export function resolveMaterialSurface(materialInput, meshName = "") {
   const material = Array.isArray(materialInput) ? materialInput[0] : materialInput;
   const white = { r: 1, g: 1, b: 1 };
   const black = { r: 0, g: 0, b: 0 };
-  const color = constantColorOf(material?.colorNode) ?? material?.color ?? white;
-  const emissiveResolved = constantColorOf(material?.emissiveNode);
+  let color = constantColorOf(material?.colorNode) ?? material?.color ?? white;
+  // A/B escape hatch, dev/harness only.
+  const mapAverage = globalThis.__giNoTextureTint
+    ? null
+    : textureAverageColor(material?.map ?? textureValueOf(material?.colorNode));
+  if (mapAverage) {
+    color = { r: color.r * mapAverage.r, g: color.g * mapAverage.g, b: color.b * mapAverage.b };
+  }
+  const emissiveTexture = textureValueOf(material?.emissiveNode);
+  // An SDF slot stores ONE emissive color for the whole mesh. Replacing a
+  // spatial mask with its average turns a building/room mesh into a giant
+  // area light and washes every material toward white. Keep imported
+  // texture-masked emission in the raster material only; GI emission remains
+  // available for constant-color nodes and dedicated emissive geometry.
+  const emissiveResolved = emissiveTexture ? null : constantColorOf(material?.emissiveNode);
   const emissive = emissiveResolved ?? material?.emissive ?? black;
   const emissiveIntensity = emissiveResolved ? 1 : (material?.emissiveIntensity ?? 1);
-  if (material?.emissiveNode && !emissiveResolved) {
+  // A texture-backed expression may simply be waiting for its image. Retry on
+  // the next fingerprint scan without claiming that it is unsupported.
+  if (material?.emissiveNode && !emissiveResolved && !emissiveTexture) {
     const fallbackDark =
       (emissive.r ?? 0) * emissiveIntensity < 0.01 &&
       (emissive.g ?? 0) * emissiveIntensity < 0.01 &&
       (emissive.b ?? 0) * emissiveIntensity < 0.01;
-    if (fallbackDark) {
+    if (fallbackDark && material && !warnedUnresolvedEmissive.has(material)) {
+      warnedUnresolvedEmissive.add(material);
       console.warn(
         `[gi] "${meshName || "mesh"}": emissiveNode is not a constant color×intensity expression — ` +
           `this emitter bakes BLACK and won't light the GI. Use a flat emissive color/intensity, ` +

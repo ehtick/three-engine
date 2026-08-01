@@ -23,6 +23,9 @@ export const CUBEMAP_EXTENSIONS = ["cubemap"];
 // prefab def on load), so old assets keep working.
 export const PREFAB_EXTENSIONS = ["prefab", "entity"];
 export const ANIMATOR_EXTENSIONS = ["anim"];
+// Sequencer assets (.timeline) — keyframed properties plus animation, audio,
+// event, activation and camera-shot tracks. See src/engine/timeline/.
+export const TIMELINE_EXTENSIONS = ["timeline"];
 export const GEOMETRY_EXTENSIONS = ["geom"];
 // `.audio` is the JSON sidecar; the others are raw audio files the engine
 // can decode straight away. AssetField filters both sidecars and raw files
@@ -110,9 +113,15 @@ export async function listProjectEntries(rootPath, depth = 8) {
   return out;
 }
 
-/** Drops generated sidecars from a listing — they're managed via their asset. */
+/** Drops generated sidecars from a listing — they're managed via their asset
+ *  (`.meta` / `.basis`) or live under Library as derived GI bake caches (`.sdf`). */
 export const withoutSidecars = (entries) =>
-  entries.filter((entry) => !entry.name.endsWith(".meta") && !entry.name.endsWith(".basis"));
+  entries.filter(
+    (entry) =>
+      !entry.name.endsWith(".meta") &&
+      !entry.name.endsWith(".basis") &&
+      !entry.name.endsWith(".sdf"),
+  );
 
 // esbuild-wasm's `initialize()` throws "Cannot call 'initialize' more than
 // once" if called twice in the same VM. Vite's HMR can re-evaluate this
@@ -203,6 +212,14 @@ let rawWriteSupported = true;
 export async function writeBinaryFile(path, bytes) {
   const { invoke } = await import("@tauri-apps/api/core");
   const payload = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  // The Puppeteer Tauri shim implements the legacy JSON command, not Tauri's
+  // raw IPC request body. Calling the raw form there cannot be represented by
+  // `exposeFunction` and never resolves, so use the compatible route directly.
+  if (globalThis.__tauriShimInvoke) {
+    await invoke("write_binary_file", { path, contents: Array.from(payload) });
+    invalidateBlobUrl(path);
+    return;
+  }
   if (rawWriteSupported) {
     try {
       await invoke("write_binary_file_raw", payload, {
@@ -216,7 +233,7 @@ export async function writeBinaryFile(path, bytes) {
       // frontend, which happens whenever the web layer reloads without a
       // `cargo build`. Latch it so one probe covers the whole session.
       const message = String(error?.message ?? error);
-      if (!/not (?:found|allowed)|unknown command|missing .*command/i.test(message)) throw error;
+      if (!/not (?:found|allowed)|unknown command|unhandled command|missing .*command/i.test(message)) throw error;
       console.warn(
         `write_binary_file_raw unavailable (${message}) — falling back to the ` +
           "slower JSON-array write. Rebuild the Tauri app to restore fast binary writes.",
@@ -263,6 +280,22 @@ export async function readAssetMeta(metaPath) {
   } catch {
     return null;
   }
+}
+
+/**
+ * Reads a scene file for `engine.loadScene`. Scenes are addressed by
+ * PROJECT-RELATIVE path ("scenes/Level2.scene") so the exact same string a
+ * script passes here also works in an exported build, where it is fetched as
+ * a relative URL. An absolute path is accepted too — the editor's own
+ * open-scene flow already has one in hand.
+ */
+export async function readSceneJson(path) {
+  const { invoke } = await import("@tauri-apps/api/core");
+  const { useProjectStore } = await import("./store/projectStore.js");
+  const root = useProjectStore.getState().rootPath;
+  const isAbsolute = /^([a-zA-Z]:[\\/]|\/)/.test(path);
+  const full = isAbsolute || !root ? path : `${root}/${path}`;
+  return JSON.parse(await invoke("load_scene", { path: full }));
 }
 
 const scriptModuleCache = new Map(); // path -> { version, default }

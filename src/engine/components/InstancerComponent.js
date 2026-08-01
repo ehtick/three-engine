@@ -1,6 +1,9 @@
 import * as THREE from "three/webgpu";
 import { Component } from "./Component.js";
 import { loadMaterialAsset, getDefaultMaterial } from "../materialAsset.js";
+import { resolveSpline } from "./SplineComponent.js";
+import { SplineFrame } from "../spline/splineMath.js";
+import { bakeMatrixIntoGeometry, relativeMatrix } from "../geometryTransform.js";
 
 /**
  * Hardware-instanced duplicates of a source mesh (Blender Array modifier +
@@ -17,6 +20,13 @@ import { loadMaterialAsset, getDefaultMaterial } from "../materialAsset.js";
  *                      (position/rotation/scale). With just three offset vec3s
  *                      and a count you can build linear stacks, grids,
  *                      circles, spirals, helices, etc. Seeded RNG mixes jitter.
+ *
+ *   mode = "path"    — Copies distributed along a Spline: fence posts, railway
+ *                      sleepers, street lights, bollards, a hedge, rocks down a
+ *                      riverbank. Either a fixed count spread evenly by ARC
+ *                      LENGTH, or one every N units. Instances can be oriented
+ *                      by the path's frame, so a fence follows its corners and
+ *                      a banked guardrail leans with the road.
  *
  *   mode = "scatter" — Hair-particle-style random scattering inside a shape:
  *                      sphere, box, circle, disc, or on the surface of a mesh
@@ -43,7 +53,7 @@ import { loadMaterialAsset, getDefaultMaterial } from "../materialAsset.js";
  * Material is the source mesh's material by default, or a .mat asset if the
  * `material` prop is set. Materials are shared — never disposed by us.
  */
-const MODES = ["array", "scatter"];
+const MODES = ["array", "path", "scatter"];
 const SCATTER_SHAPES = ["sphere", "box", "circle", "disc", "onMesh"];
 
 export class InstancerComponent extends Component {
@@ -59,6 +69,18 @@ export class InstancerComponent extends Component {
     arrayOffsetPosition: [1, 0, 0],
     arrayOffsetRotation: [0, 0, 0], // degrees (Euler XYZ), converted to radians on use
     arrayOffsetScale: [0, 0, 0], // additive, e.g. -0.05 = shrink 5% per step
+
+    // Path-mode: distribute along a Spline component's curve.
+    pathEntity: "", // empty = the Spline on this entity
+    // "count": `count` copies spread evenly by arc length.
+    // "spacing": one copy every `pathSpacing` units — the mode a fence wants,
+    // because adding a corner should add posts, not respace the existing ones.
+    pathDistribution: "count",
+    pathSpacing: 2,
+    pathAlign: "tangent", // "none" | "tangent" | "frame"
+    pathForward: "-Z",
+    pathOffset: [0, 0, 0], // in the path's frame: [across, up, along]
+    pathJitter: [0, 0, 0], // ± random offset in the same frame
 
     // Scatter-mode: random distribution shape.
     scatterShape: "sphere", // "sphere" | "box" | "circle" | "disc" | "onMesh"
@@ -81,6 +103,10 @@ export class InstancerComponent extends Component {
     rotationJitter: 0, // 0 = none, 1 = full random orientation, 0..1 blends with Y-only random
     scaleJitter: 0, // ± fraction (e.g. 0.2 = ±20% random scale)
 
+    // Bake the source mesh's own transform (its matrix relative to this
+    // entity) into the instanced geometry. See #resolveGeometry.
+    bakeSourceTransform: false,
+
     // Material override. Empty string means "use the source mesh's material".
     material: "",
 
@@ -90,8 +116,21 @@ export class InstancerComponent extends Component {
 
   static schema = [
     { key: "mode", label: "Mode", type: "select", options: MODES },
+    // In path/spacing mode this doubles as the allocation ceiling rather than
+    // the number placed: the InstancedMesh is sized once at attach, and a path
+    // someone later stretches to ten times its length must not be able to run
+    // past its own buffer.
     { key: "count", label: "Count", type: "number", min: 1, max: 1_000_000, step: 1 },
     { key: "seed", label: "Seed", type: "number", min: 0, step: 1 },
+
+    // Path-mode fields.
+    { key: "pathEntity", label: "Path", type: "entity", showIf: (p) => p.mode === "path" },
+    { key: "pathDistribution", label: "Distribution", type: "select", options: ["count", "spacing"], showIf: (p) => p.mode === "path" },
+    { key: "pathSpacing", label: "Spacing", type: "number", min: 0.01, step: 0.1, showIf: (p) => p.mode === "path" && p.pathDistribution === "spacing" },
+    { key: "pathAlign", label: "Align", type: "select", options: ["none", "tangent", "frame"], showIf: (p) => p.mode === "path" },
+    { key: "pathForward", label: "Forward Axis", type: "select", options: ["-Z", "+Z"], showIf: (p) => p.mode === "path" && p.pathAlign !== "none" },
+    { key: "pathOffset", label: "Offset", type: "vec3", showIf: (p) => p.mode === "path" },
+    { key: "pathJitter", label: "Offset Jitter", type: "vec3", showIf: (p) => p.mode === "path" },
 
     // Array-mode fields (showIf: mode === "array").
     { key: "arrayOffsetPosition", label: "Offset Position", type: "vec3", showIf: (p) => p.mode === "array" },
@@ -113,6 +152,7 @@ export class InstancerComponent extends Component {
     // Both modes.
     { key: "rotationJitter", label: "Rotation Jitter", type: "number", min: 0, max: 1, step: 0.05 },
     { key: "scaleJitter", label: "Scale Jitter", type: "number", min: 0, max: 1, step: 0.05 },
+    { key: "bakeSourceTransform", label: "Bake Source Transform", type: "boolean" },
     { key: "material", label: "Material Override", type: "asset", exts: ["mat"] },
     { key: "castShadow", label: "Cast Shadow", type: "boolean" },
     { key: "receiveShadow", label: "Receive Shadow", type: "boolean" },
@@ -148,23 +188,40 @@ export class InstancerComponent extends Component {
 
     const maxCount = Math.max(1, Math.floor(this.props.count));
 
-    this.instancedMesh = new THREE.InstancedMesh(sourceMesh.geometry, sourceMesh.material, maxCount);
+    const { geometry, owned } = this.#resolveGeometry(sourceMesh);
+    this.instancedMesh = new THREE.InstancedMesh(geometry, sourceMesh.material, maxCount);
     this.instancedMesh.userData.entityId = this.entity.id;
     this.instancedMesh.castShadow = !!this.props.castShadow;
     this.instancedMesh.receiveShadow = !!this.props.receiveShadow;
-    // We own a clone of the geometry only if the source has already disposed.
-    // To be safe and predictable we never dispose the source's geometry here;
-    // we share its geometry (the source mesh component owns disposal of it).
-    this._ownsGeometry = false;
+    // We never dispose the SOURCE's geometry — the mesh component owns that.
+    // A baked copy, on the other hand, is ours alone and must be released.
+    this._ownsGeometry = owned;
 
-    // When the surface target is a different entity, instances must live in
-    // world space (so they follow the target's transform). We park the
-    // InstancedMesh directly under the engine scene in that case. Self-scatter
-    // and non-surface modes keep the original parent so the Instancer entity's
-    // transform still moves the instances.
-    const targetEntityId = this.props.scatterSurfaceEntity;
-    const targetEntity = targetEntityId ? this.entity?.engine?.getEntity?.(targetEntityId) : null;
-    this._parent = targetEntity && targetEntity !== this.entity ? this.entity.engine.scene : this.entity.object3D;
+    // When the thing being distributed over lives on a different entity —
+    // a scatter target, or a path — instances must live in world space so they
+    // follow THAT entity's transform. We park the InstancedMesh directly under
+    // the engine scene in those cases. Self-targeted and untargeted modes keep
+    // the original parent so the Instancer entity's transform still moves the
+    // instances.
+    let foreign = null;
+    if (this.props.mode === "path") {
+      const path = resolveSpline(this.entity, this.props.pathEntity);
+      foreign = path && path.entity !== this.entity ? path.entity : null;
+    } else {
+      const targetEntityId = this.props.scatterSurfaceEntity;
+      const targetEntity = targetEntityId ? this.entity?.engine?.getEntity?.(targetEntityId) : null;
+      foreign = targetEntity && targetEntity !== this.entity ? targetEntity : null;
+    }
+    this._parent = foreign ? this.entity.engine.scene : this.entity.object3D;
+
+    // Dragging a knot must move the fence posts with the fence. Coalesced to
+    // the next frame, so a drag re-lays them once per frame rather than once
+    // per pointer event.
+    this._unsubSpline?.();
+    this._unsubSpline =
+      this.props.mode === "path"
+        ? this.entity.engine?.on?.("spline-changed", () => this.#invalidateLayout())
+        : null;
 
     this.#fillMatrices(maxCount);
 
@@ -178,7 +235,27 @@ export class InstancerComponent extends Component {
   onDetach() {
     this._unsubModelLoaded?.();
     this._unsubModelLoaded = null;
+    this._unsubSpline?.();
+    this._unsubSpline = null;
+    this._unsubRelayout?.();
+    this._unsubRelayout = null;
     this.#teardownMesh();
+  }
+
+  /**
+   * Re-lays the instances next frame, without rebuilding the InstancedMesh.
+   *
+   * A full detach/attach would re-allocate the buffer and re-resolve the
+   * material on every frame of a knot drag; the layout is the only thing a
+   * path edit changes, and the allocation is already sized for the ceiling.
+   */
+  #invalidateLayout() {
+    if (this._unsubRelayout || !this.instancedMesh || !this.entity?.engine) return;
+    this._unsubRelayout = this.entity.engine.onPreRender(() => {
+      this._unsubRelayout?.();
+      this._unsubRelayout = null;
+      if (this.instancedMesh) this.#fillMatrices(Math.max(1, Math.floor(this.props.count)));
+    });
   }
 
   #teardownMesh() {
@@ -196,6 +273,36 @@ export class InstancerComponent extends Component {
 
   onEnable() {
     if (this.instancedMesh) this.instancedMesh.visible = true;
+  }
+
+  /**
+   * The geometry the instances are drawn from.
+   *
+   * By default it is the source mesh's raw geometry, which is right for a Mesh
+   * component (its mesh sits at the entity's origin) and WRONG for a Model: a
+   * glTF's meshes are nodes in a hierarchy, routinely carrying a rotation, a
+   * scale and an offset of their own — the +Z/+Y axis conversion alone puts one
+   * on most imported models. Instancing the raw buffer throws all of that away,
+   * so every copy comes out rotated, mis-sized or displaced relative to the
+   * model standing right next to it, with nothing in the inspector to explain
+   * why. `bakeSourceTransform` folds that matrix into a private copy of the
+   * geometry instead.
+   *
+   * It is a copy, not a mutation: the source mesh is still being rendered from
+   * the same buffer, and baking in place would move the model itself.
+   */
+  #resolveGeometry(sourceMesh) {
+    if (!this.props.bakeSourceTransform) return { geometry: sourceMesh.geometry, owned: false };
+    // The matrix RELATIVE to this entity, not the world one: the InstancedMesh
+    // is parented under the entity (or, for a foreign target, under the scene
+    // with the same conversion applied per instance), so folding in the
+    // entity's own transform would apply it twice.
+    const relative = relativeMatrix(sourceMesh, this.entity.object3D);
+    if (!relative) return { geometry: sourceMesh.geometry, owned: false };
+    // Shared with Apply Transform, winding flip included: a mirrored source
+    // (negative scale on a glTF node is common) keeps its winding through
+    // `applyMatrix4` and renders inside-out with perfectly good normals.
+    return { geometry: bakeMatrixIntoGeometry(sourceMesh.geometry, relative), owned: true };
   }
 
   /**
@@ -226,11 +333,13 @@ export class InstancerComponent extends Component {
       // No source mesh yet — re-attaching will rebuild once a Mesh/Model component appears.
       if (key === "mode" || key === "count" || key === "seed" ||
           key === "arrayOffsetPosition" || key === "arrayOffsetRotation" || key === "arrayOffsetScale" ||
+          key === "pathEntity" || key === "pathDistribution" || key === "pathSpacing" ||
+          key === "pathAlign" || key === "pathForward" || key === "pathOffset" || key === "pathJitter" ||
           key === "scatterShape" || key === "scatterSize" || key === "scatterAlignToNormal" ||
           key === "scatterSurfaceEntity" || key === "scatterSurfaceMode" ||
           key === "scatterProjectedShape" || key === "scatterProjectedAxis" ||
           key === "scatterProjectedSize" || key === "scatterSurfaceCenter" ||
-          key === "rotationJitter" || key === "scaleJitter") {
+          key === "rotationJitter" || key === "scaleJitter" || key === "bakeSourceTransform") {
         this.onAttach();
         return;
       }
@@ -306,6 +415,9 @@ export class InstancerComponent extends Component {
           scale.z += offScale.z;
         }
       }
+    } else if (this.props.mode === "path") {
+      this.#fillPathMatrices(mesh, count, rng);
+      return;
     } else if (this.props.scatterShape === "onMesh") {
       // Surface scatter: sample points on a target mesh (Mesh or Model
       // component, own or foreign entity). Sampling always happens in world
@@ -385,7 +497,125 @@ export class InstancerComponent extends Component {
     mesh.computeBoundingSphere();
     mesh.frustumCulled = true;
   }
+
+  /**
+   * Distributes instances along a Spline (roadmap item 16).
+   *
+   * Positions are spaced by ARC LENGTH, never by the curve's parameter — the
+   * whole point of a fence is that its posts are evenly spaced, and parameter
+   * spacing bunches them up wherever a segment happens to be short.
+   *
+   * `count` distribution divides the path into equal shares; `spacing` places
+   * one every N units and lets the number follow the length. The second is what
+   * a fence actually wants: adding a corner should add posts, not respace every
+   * post already placed.
+   */
+  #fillPathMatrices(mesh, maxCount, rng) {
+    const path = resolveSpline(this.entity, this.props.pathEntity);
+    if (!path?.spline?.valid) {
+      // Half-wired (no path yet, or one knot) draws nothing rather than piling
+      // every instance on the origin, which looks like a broken source mesh.
+      mesh.count = 0;
+      mesh.instanceMatrix.needsUpdate = true;
+      return;
+    }
+    const foreign = path.entity !== this.entity;
+    const length = path.length;
+    const closed = path.closed;
+
+    const distances = [];
+    if (this.props.pathDistribution === "spacing") {
+      const spacing = Math.max(0.01, this.props.pathSpacing ?? 1);
+      const n = Math.min(maxCount, Math.floor(length / spacing) + 1);
+      for (let i = 0; i < n; i++) distances.push(i * spacing);
+    } else {
+      const n = Math.max(1, maxCount);
+      // A closed path divides by n, not n-1: its last position would otherwise
+      // land exactly on top of the first, giving a fence with two posts in one
+      // hole and a visible gap opposite.
+      const divisor = closed ? n : Math.max(1, n - 1);
+      for (let i = 0; i < n; i++) distances.push((i / divisor) * length);
+    }
+
+    let parentInverse = null;
+    let parentQuat = null;
+    if (foreign) {
+      this._parent.updateWorldMatrix(true, false);
+      parentInverse = _matrix.copy(this._parent.matrixWorld).invert();
+      parentQuat = new THREE.Quaternion().setFromRotationMatrix(parentInverse);
+    }
+
+    const align = this.props.pathAlign ?? "tangent";
+    const offset = vec3From(this.props.pathOffset, 0, 0, 0);
+    const jitter = vec3From(this.props.pathJitter, 0, 0, 0);
+    const tmp = new THREE.Matrix4();
+    const pos = new THREE.Vector3();
+    const quat = new THREE.Quaternion();
+    const scale = new THREE.Vector3(1, 1, 1);
+    const dir = new THREE.Vector3();
+    const up = new THREE.Vector3();
+    const right = new THREE.Vector3();
+    const back = new THREE.Vector3();
+
+    for (let i = 0; i < distances.length; i++) {
+      // The frame is asked for in the space the instances will live in: the
+      // path's own when it is this entity's, world when it is somebody else's.
+      const frame = foreign ? path.worldFrameAt(distances[i], _frame) : path.frameAt(distances[i], _frame);
+      // Jitter is drawn per instance in the FRAME's axes, so "spread these
+      // rocks two metres either side of the river" stays two metres either side
+      // of the river round every bend.
+      pos
+        .copy(frame.position)
+        .addScaledVector(frame.binormal, offset[0] + (rng() * 2 - 1) * jitter[0])
+        .addScaledVector(frame.normal, offset[1] + (rng() * 2 - 1) * jitter[1])
+        .addScaledVector(frame.tangent, offset[2] + (rng() * 2 - 1) * jitter[2]);
+
+      if (align === "none") {
+        quat.identity();
+      } else {
+        if (align === "tangent") {
+          // Yaw only: a fence post follows the corners and stays vertical even
+          // where the path climbs. `frame` is the one that leans with a banked
+          // road, which is what a guardrail wants and a lamp post does not.
+          dir.copy(frame.tangent);
+          dir.y = 0;
+          if (dir.lengthSq() < 1e-8) dir.copy(frame.binormal).setY(0);
+          if (dir.lengthSq() < 1e-8) dir.set(0, 0, 1);
+          dir.normalize();
+          up.set(0, 1, 0);
+        } else {
+          dir.copy(frame.tangent);
+          up.copy(frame.normal);
+        }
+        if (this.props.pathForward === "+Z") {
+          right.copy(up).cross(dir).normalize();
+          tmp.makeBasis(right, up, dir);
+        } else {
+          right.copy(dir).cross(up).normalize();
+          tmp.makeBasis(right, up, back.copy(dir).negate());
+        }
+        quat.setFromRotationMatrix(tmp);
+      }
+
+      if (foreign) {
+        pos.applyMatrix4(parentInverse);
+        quat.premultiply(parentQuat);
+      }
+      scale.set(1, 1, 1);
+      composeInto(tmp, pos, quat, scale);
+      applyJitter(tmp, this.props, rng);
+      mesh.setMatrixAt(i, tmp);
+    }
+
+    mesh.count = distances.length;
+    mesh.instanceMatrix.needsUpdate = true;
+    mesh.computeBoundingSphere();
+    mesh.frustumCulled = true;
+  }
 }
+
+const _frame = new SplineFrame();
+const _matrix = new THREE.Matrix4();
 
 // -----------------------------------------------------------------------------
 // Helpers (module-private)

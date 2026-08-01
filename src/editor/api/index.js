@@ -39,6 +39,9 @@ import { startGizmoPass } from "../gizmos.js";
 import "./ops/entities.js";
 import "./ops/editorState.js";
 import "./ops/assets.js";
+import "./ops/viewport.js";
+import "./ops/authoring.js";
+import "./ops/batch.js";
 
 /** Runs an op synchronously, asserting it isn't one of the async ones. Used by
  *  the sync accessors below, where returning a promise would be a footgun. */
@@ -168,6 +171,46 @@ export const EditorApi = {
     openInIDE: (path) => callOp("asset.openInIDE", { path }),
     reveal: (path) => callOp("asset.reveal", { path }),
   },
+
+  // ---- viewport -------------------------------------------------------------
+
+  viewport: {
+    /** Resolves to `{ __image, width, height }`; `__image.base64` is a PNG. */
+    screenshot: (options = {}) => callOp("viewport.screenshot", options),
+    getCamera: () => sync("viewport.getCamera"),
+    setCamera: (position, target) => sync("viewport.setCamera", { position, target }),
+    focus: (id, distance) => sync("viewport.focus", { id, distance }),
+  },
+
+  /** Recent editor console output — how a script's own errors are read back. */
+  console: {
+    read: (options = {}) => sync("console.read", options),
+  },
+
+  // ---- authoring ------------------------------------------------------------
+
+  materials: {
+    create: (name, fields = {}) => callOp("material.create", { name, ...fields }),
+    get: (path) => callOp("material.get", { path }),
+    set: (path, patch) => callOp("material.set", { path, patch }),
+  },
+
+  prefabs: {
+    list: () => callOp("prefab.list"),
+    instantiate: (path, options = {}) => callOp("prefab.instantiate", { path, ...options }),
+    createFrom: (id, folder) => callOp("prefab.createFromEntity", { id, folder }),
+  },
+
+  modules: {
+    list: () => callOp("module.list"),
+    setEnabled: (id, enabled) => callOp("module.setEnabled", { id, enabled }),
+  },
+
+  /**
+   * Runs several ops as one undo step. Takes `[{ op, args }]`; `"$0"` inside a
+   * later step's args resolves to the id returned by step 0.
+   */
+  batch: (label, steps, options = {}) => callOp("batch", { label, steps, ...options }),
 
   // ---- editor chrome --------------------------------------------------------
 

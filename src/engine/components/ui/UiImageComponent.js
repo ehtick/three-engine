@@ -29,11 +29,28 @@ export class UiImageComponent extends Component {
     borderColor: "#000000",
     fillMode: "none", // none | horizontal | vertical
     fillAmount: 1,
+    // How a texture maps onto the quad:
+    //   simple — stretch the whole image (the old, only, behaviour)
+    //   sliced — nine-slice: corners keep their pixel size, edges stretch
+    //   tiled  — nine-slice with the middle repeated instead of stretched
+    imageType: "simple",
+    // Nine-slice insets, in TEXTURE pixels. They are a property of the
+    // artwork, not of the element, so they stay in texture space and survive
+    // the element being resized.
+    sliceLeft: 0,
+    sliceRight: 0,
+    sliceTop: 0,
+    sliceBottom: 0,
   };
   static schema = [
     { key: "color", label: "Color", type: "color" },
     { key: "opacity", label: "Opacity", type: "number", min: 0, max: 1, step: 0.05 },
     { key: "texture", label: "Texture", type: "asset", exts: ["png", "jpg", "jpeg", "webp"] },
+    { key: "imageType", label: "Image Type", type: "select", options: ["simple", "sliced", "tiled"] },
+    { key: "sliceLeft", label: "Slice L", type: "number", min: 0, step: 1 },
+    { key: "sliceRight", label: "Slice R", type: "number", min: 0, step: 1 },
+    { key: "sliceTop", label: "Slice T", type: "number", min: 0, step: 1 },
+    { key: "sliceBottom", label: "Slice B", type: "number", min: 0, step: 1 },
     { key: "cornerRadius", label: "Corner Radius", type: "number", min: 0, step: 1 },
     { key: "borderWidth", label: "Border Width", type: "number", min: 0, step: 1 },
     { key: "borderColor", label: "Border Color", type: "color" },
@@ -75,7 +92,7 @@ export class UiImageComponent extends Component {
       this.texture = null;
       if (this.props.texture) this.#loadTexture(this.props.texture);
       else this.#rebuildMaterial();
-    } else if (key === "fillMode") {
+    } else if (key === "fillMode" || key === "imageType") {
       this.#rebuildMaterial();
     }
     // Everything else is a uniform, written on the next layout pass.
@@ -87,6 +104,7 @@ export class UiImageComponent extends Component {
     this.mesh.material = createUiImageMaterial({
       texture: this.texture,
       fillMode: this.props.fillMode,
+      imageType: this.props.imageType,
     });
   }
 
@@ -111,23 +129,45 @@ export class UiImageComponent extends Component {
   }
 
   /** Called by the UiSystem layout pass with the computed frame. */
-  onUiLayout({ rect, clipRect, alpha, k, feather, order, spec }) {
+  onUiLayout({ rect, clipRect, alpha, k, order, spec, unit = 1, depthTest = false }) {
     const mesh = this.mesh;
     if (!mesh) return;
     const { w, h } = rect;
-    mesh.scale.set(Math.max(w, 1e-4), Math.max(h, 1e-4), 1);
-    mesh.position.set((0.5 - spec.pivot[0]) * w, -(0.5 - spec.pivot[1]) * h, 0);
+    // `unit` is world units per UI px — 1 for a screen overlay, small for a
+    // world-space panel. The rect stays in UI px so the SDF, the slice insets
+    // and hit testing all keep working in one coordinate system.
+    mesh.scale.set(Math.max(w, 1e-4) * unit, Math.max(h, 1e-4) * unit, 1);
+    mesh.position.set((0.5 - spec.pivot[0]) * w * unit, -(0.5 - spec.pivot[1]) * h * unit, 0);
     mesh.renderOrder = order;
 
+    const p = this.props;
     const u = mesh.material.userData.uiUniforms;
     u.size.value.set(w, h);
-    u.radius.value = Math.min(this.props.cornerRadius, Math.min(w, h) / 2);
-    u.borderWidth.value = this.props.borderWidth;
-    u.borderColor.value.set(this.props.borderColor);
-    u.color.value.set(this.props.color);
+    u.radius.value = Math.min(p.cornerRadius, Math.min(w, h) / 2);
+    u.borderWidth.value = p.borderWidth;
+    u.borderColor.value.set(p.borderColor);
+    u.color.value.set(p.color);
     u.tint.value.copy(this.tint);
-    u.fillAmount.value = this.props.fillAmount;
-    u.feather.value = feather;
-    applyElementUniforms(mesh.material, { clipRect, alpha: alpha * (this.props.opacity ?? 1), k });
+    u.fillAmount.value = p.fillAmount;
+    const image = this.texture?.image;
+    if (image?.width) {
+      u.texSize.value.set(image.width, image.height);
+      // Insets are clamped to the texture so a typo can't invert the middle
+      // region (which shows up as the panel's centre sampling backwards).
+      const maxX = image.width / 2;
+      const maxY = image.height / 2;
+      u.slice.value.set(
+        Math.min(p.sliceLeft ?? 0, maxX),
+        Math.min(p.sliceRight ?? 0, maxX),
+        Math.min(p.sliceTop ?? 0, maxY),
+        Math.min(p.sliceBottom ?? 0, maxY),
+      );
+    }
+    applyElementUniforms(mesh.material, {
+      clipRect,
+      alpha: alpha * (p.opacity ?? 1),
+      k,
+      depthTest,
+    });
   }
 }

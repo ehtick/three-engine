@@ -154,6 +154,22 @@ declare module "engine" {
      *     this.entity.dispatch("onDamaged", amount);
      */
     dispatch(hook: string, ...args: unknown[]): boolean;
+
+    /**
+     * True when this entity survives `engine.loadScene` — game managers, the
+     * audio listener, a player that carries between levels. Serialised, so it
+     * can also be ticked on the entity in the editor.
+     */
+    persistent: boolean;
+    setPersistent(value: boolean): void;
+
+    /**
+     * True while this entity is parked in an object pool: out of the scene and
+     * out of every query, but not destroyed. Check it before acting on a
+     * reference you held across a despawn.
+     */
+    readonly pooled: boolean;
+
     setParent(parent: Entity | null): void;
     traverse(fn: (entity: Entity) => void): void;
     getTransform(): {
@@ -226,20 +242,512 @@ declare module "engine" {
     setBool(name: string, value: boolean): void;
     setTrigger(name: string): void;
     getParam(name: string): unknown;
-    /** Transitions to `stateName`, cross-fading over `fade` seconds (default 0.2). */
-    play(stateName: string, fade?: number): void;
+    /** Transitions to `stateName` on `layer`, cross-fading over `fade` seconds (default 0.2). */
+    play(stateName: string, fade?: number, layer?: number | string): void;
+    /**
+     * Blends an override/additive layer in or out (0..1). Layer 0 is the base
+     * layer and is always at full weight — setting it is ignored.
+     *
+     *     anim.setLayerWeight("Aim", this.aiming ? 1 : 0);
+     */
+    setLayerWeight(layer: number | string, weight: number): void;
+    getLayerWeight(layer: number | string): number;
+    /** Current state name per layer, base first. */
+    getLayerStates(): (string | null)[];
+    /**
+     * Root motion accumulated since the last call, in the entity's local space.
+     * For `rootMotionTarget: "script"`, where a character controller consumes
+     * the motion instead of it being written to the transform:
+     *
+     *     const { position, yaw } = anim.consumeRootMotion();
+     *     this.entity.rotateY(yaw);
+     *     controller.move(position.applyQuaternion(this.entity.quaternion));
+     */
+    consumeRootMotion(): { position: Vector3; yaw: number };
+    /** This frame's root motion delta, without consuming it. */
+    readonly rootMotionDelta: Vector3 | null;
   }
+
+  /**
+   * `entity.getComponent("timeline")`. The director for a `.timeline` asset —
+   * keyframed properties plus animation, audio, event, activation and
+   * camera-shot tracks.
+   *
+   *     const cutscene = this.entity.getComponent("timeline");
+   *     cutscene.play();
+   *     this.engine.on("timeline-event", ({ method }) => { ... });
+   */
+  export interface TimelineComponent extends ComponentBase {
+    /** Length of the loaded timeline in seconds (0 before it loads). */
+    readonly duration: number;
+    /** Playhead position in seconds. */
+    readonly time: number;
+    readonly isPlaying: boolean;
+    readonly isPaused: boolean;
+    /** Starts (or restarts) playback; `from` defaults to the authored start time. */
+    play(from?: number): void;
+    pause(): void;
+    resume(): void;
+    /**
+     * Stops and reverts everything the timeline animated. `{ hold: true }`
+     * leaves the last sampled frame standing instead.
+     */
+    stop(options?: { hold?: boolean }): void;
+    /** Moves the playhead and poses the scene there, without playing. */
+    setTime(t: number): void;
+    /** Alias of `setTime` — poses the scene at `t`. */
+    evaluate(t: number): void;
+  }
+
+  /**
+   * `entity.getComponent("ik")`. Two-bone IK correcting the sibling Model's
+   * pose after the animator runs. Configure via `props` (see `static schema`);
+   * drive it from a script by animating `props.weight`:
+   *
+   *     this.entity.getComponent("ik").setProp("weight", grounded ? 1 : 0);
+   */
+  export interface IKComponent extends ComponentBase {}
 
   /** `entity.getComponent("mesh")`. Geometry/material are data-driven via `props` — see `static schema`. */
   export interface MeshComponent extends ComponentBase {}
 
-  /** `entity.getComponent("camera")`. */
+  /**
+   * `entity.getComponent("camera")`. Also the virtual-camera "brain": when the
+   * scene contains any `vcam`, this picks the highest-priority one and blends
+   * the real camera onto it.
+   */
   export interface CameraComponent extends ComponentBase {
     camera: Camera | null;
+    /** The virtual camera currently driving this one, or null. */
+    readonly live: VirtualCameraComponent | null;
+    /** The highest-priority (or soloed) virtual camera right now. */
+    pickVirtualCamera(engine: Engine): VirtualCameraComponent | null;
     /** Resolves `props.followTarget` (an entity id) against the live engine. */
     resolveFollowTarget(engine: Engine): Entity | null;
     /** Rotates the entity so -Z faces the follow target, when `enabled` and a target is configured. */
     applyLookAt(enabled: boolean, engine: Engine): void;
+  }
+
+  /**
+   * `entity.getComponent("vcam")`. A *shot* — where a camera should be and what
+   * it should look at. The Camera component blends between them by priority.
+   *
+   *     const cam = this.entity.getComponent("vcam");
+   *     cam.addOrbit(dx * 2, dy * 2);     // boom arm, degrees
+   *     cam.setProp("priority", 100);     // make this shot live
+   */
+  export interface VirtualCameraComponent extends ComponentBase {
+    /** Set the boom arm's angles, in degrees. Pitch is clamped to the props. */
+    setOrbit(yawDeg: number, pitchDeg: number): void;
+    addOrbit(yawDeg: number, pitchDeg: number): void;
+    getOrbit(): { yaw: number; pitch: number };
+    /**
+     * Snaps to the target pose on the next frame, skipping the damping. Call
+     * after teleporting the follow target, or the camera films the trip.
+     */
+    warp(): void;
+    /** Overrides priority entirely while set — the editor's Solo. */
+    setSolo(value: boolean): void;
+    readonly followTarget: Entity | null;
+    readonly lookTarget: Entity | null;
+  }
+
+  /**
+   * `entity.getComponent("impulsesource")`. An authored camera shake living on
+   * the thing that causes it.
+   *
+   *     this.entity.getComponent("impulsesource").fire({ magnitude: 0.8 });
+   */
+  export interface ImpulseSourceComponent extends ComponentBase {
+    fire(overrides?: Record<string, unknown>): unknown;
+  }
+
+  /** A position: a `Vector3`, an `[x, y, z]` tuple, or anything with x/y/z. */
+  export type PointLike = Vector3 | number[] | { x: number; y: number; z: number };
+
+  /**
+   * `engine.debug` — immediate-mode debug drawing, from gameplay code.
+   *
+   *     this.engine.debug.ray(muzzle, forward, 50, "#ff0", 1);
+   *     this.engine.debug.sphere(target.position, 0.5, "#f0f");
+   *     this.engine.debug.text(this.entity.position, this.state);
+   *
+   * With no `duration` a shape lasts one frame, so drawing every frame needs no
+   * cleanup. A `duration` (seconds, real time) is how you see a one-shot event:
+   * a raycast fired inside a collision handler exists for a single frame, and
+   * one frame of a red line at 120fps is not something a human can see.
+   */
+  /** Easing curve names accepted by `engine.tween`. */
+  export type EasingName =
+    | "linear"
+    | "quadIn" | "quadOut" | "quadInOut"
+    | "cubicIn" | "cubicOut" | "cubicInOut"
+    | "quartIn" | "quartOut" | "quartInOut"
+    | "sineIn" | "sineOut" | "sineInOut"
+    | "expoIn" | "expoOut" | "expoInOut"
+    | "backIn" | "backOut" | "backInOut"
+    | "elasticOut" | "bounceOut";
+
+  export interface TweenOptions {
+    /** Seconds. Default 0.25. */
+    duration?: number;
+    /** Seconds to wait before starting. */
+    delay?: number;
+    ease?: EasingName | ((t: number) => number);
+    /** Start values; defaults to whatever the target holds when it begins. */
+    from?: Record<string, number>;
+    /** Extra repeats. -1 loops forever. */
+    loop?: number;
+    /** Reverse on every repeat. */
+    yoyo?: boolean;
+    /**
+     * Run on wall-clock time instead of game time, so the tween keeps going
+     * while the game is paused — what a pause menu's own animation needs.
+     */
+    unscaled?: boolean;
+    onUpdate?: (t: number, target: any) => void;
+    onComplete?: (target: any) => void;
+  }
+
+  /** Handle returned by `engine.tween`. Awaitable. */
+  export interface Tween extends PromiseLike<any> {
+    readonly done: boolean;
+    /** Stop here; the target keeps the value it reached. */
+    cancel(): void;
+    /** Jump to the end and fire `onComplete`. */
+    complete(): void;
+  }
+
+  export interface DebugDraw {
+    enabled: boolean;
+    line(from: PointLike, to: PointLike, color?: string | number, duration?: number): DebugDraw;
+    ray(origin: PointLike, direction: PointLike, length?: number, color?: string | number, duration?: number): DebugDraw;
+    /** A line with a head, so which end is which is readable. */
+    arrow(from: PointLike, to: PointLike, color?: string | number, duration?: number, headSize?: number): DebugDraw;
+    /** `size` is the full extent, not the half-extent. */
+    box(center: PointLike, size?: number | PointLike, color?: string | number, duration?: number, quaternion?: unknown): DebugDraw;
+    sphere(center: PointLike, radius?: number, color?: string | number, duration?: number, segments?: number): DebugDraw;
+    circle(center: PointLike, radius?: number, normal?: PointLike, color?: string | number, duration?: number, segments?: number): DebugDraw;
+    /** Upright capsule — the shape a character controller actually is. */
+    capsule(center: PointLike, radius?: number, height?: number, color?: string | number, duration?: number): DebugDraw;
+    point(position: PointLike, size?: number, color?: string | number, duration?: number): DebugDraw;
+    polyline(points: PointLike[], color?: string | number, duration?: number, closed?: boolean): DebugDraw;
+    /** Red/green/blue triad for an Object3D or a Matrix4 — which way is it facing? */
+    axes(target: unknown, size?: number, duration?: number): DebugDraw;
+    /** Screen-facing label at a world position. */
+    text(position: PointLike, message: unknown, color?: string, duration?: number, size?: number): DebugDraw;
+    /** Drops every timed shape. */
+    clear(): void;
+    setEnabled(value: boolean): void;
+  }
+
+  /**
+   * `engine.navigation` — recast/detour navmesh queries. Present only when the
+   * Navigation module is enabled, and only usable once something has baked.
+   */
+  export interface NavigationSystem {
+    /** False until a navmesh has been baked or loaded. */
+    readonly isReady: boolean;
+    /**
+     * Corners of a path between two world points, or `[]` when there is no
+     * route. An empty result usually means one END is off the navmesh — check
+     * with `isOnNavMesh` before blaming the pathfinder.
+     */
+    findPath(from: PointLike, to: PointLike): Vector3[];
+    /** Nearest point ON the navmesh, or null if nothing is in range. */
+    sample(point: PointLike, halfExtents?: PointLike): Vector3 | null;
+    /**
+     * Whether `point` is standing on walkable ground, within `tolerance` metres
+     * horizontally. Not the same question as `sample()` — that one always finds
+     * the nearest walkable spot, so it answers "yes" for a point inside a wall
+     * with a corridor next door.
+     */
+    isOnNavMesh(point: PointLike, tolerance?: number): boolean;
+    /** A random walkable point within `radius` — patrol targets, spawns. */
+    randomPoint(center: PointLike, radius?: number): Vector3 | null;
+    /** Slides along the navmesh toward `to`, stopping at the first wall. */
+    moveAlongSurface(from: PointLike, to: PointLike): Vector3 | null;
+    /** Rebuilds from the current scene. Prefer the NavMesh component's Bake. */
+    bake(settings?: Record<string, unknown>): { success: boolean; error?: string; stats?: unknown };
+  }
+
+  /**
+   * `entity.getComponent("navagent")`. Pathfinding with local avoidance.
+   *
+   *     const agent = this.entity.getComponent("navagent");
+   *     agent.setDestination(player.position);
+   *     if (agent.isAtDestination) this.attack();
+   */
+  export interface NavAgentComponent extends ComponentBase {
+    /**
+     * Sends the agent to a world position, snapped to the nearest walkable
+     * spot. Returns false when there is no navmesh, or nothing walkable near
+     * the target.
+     */
+    setDestination(point: PointLike): boolean;
+    /** Decelerates to a halt, keeping the destination for `resume()`. */
+    stop(): void;
+    resume(): void;
+    /** Teleports without walking — respawns, doors, cutscenes. */
+    warp(point: PointLike): boolean;
+    readonly isStopped: boolean;
+    readonly hasPath: boolean;
+    /** Straight-line distance to the destination (not path length). */
+    readonly remainingDistance: number;
+    readonly isAtDestination: boolean;
+    readonly velocity: Vector3;
+    readonly isOnNavMesh: boolean;
+    /** The corners the agent is currently steering through. */
+    readonly path: Vector3[];
+  }
+
+  /** `entity.getComponent("navmesh")`. The scene's navmesh and bake settings. */
+  export interface NavMeshComponent extends ComponentBase {
+    bake(): { success: boolean; error?: string; stats?: unknown };
+  }
+
+  /** `entity.getComponent("navlink")`. An off-mesh link — a jump, ladder or drop. */
+  export interface NavLinkComponent extends ComponentBase {
+    endpoints(): { start: Vector3; end: Vector3 };
+  }
+
+  /** A placed decal. Returned by `engine.decals.spawn`, or null when the
+   *  projector found no geometry to cut. */
+  export interface DecalHandle {
+    /** Vertices this decal contributed to its batch. */
+    readonly vertexCount: number;
+    /** Seconds this decal has existed (game time). */
+    readonly age: number;
+    /** Takes it off the wall immediately. */
+    remove(): void;
+  }
+
+  export interface DecalSpawnOptions {
+    /** Surface point — what a raycast hit gives you. */
+    position?: PointLike;
+    /** Surface normal. The decal is oriented to project back down it. */
+    normal?: PointLike;
+    /** Explicit orientation instead of `normal`. */
+    rotation?: { x: number; y: number; z: number; w: number };
+    /** Explicit world matrix instead of position/normal. */
+    matrix?: unknown;
+    /** Spin around the projection axis — randomise it so repeated hits don't
+     *  read as the same sprite stamped twice. */
+    roll?: number;
+    /** A number for a cube, or `[x, y, z]`: the texture spans x/y and z is how
+     *  deep the projector reaches into the surface. */
+    size?: number | PointLike;
+    /** Project-relative texture path. */
+    texture?: string;
+    color?: string | number;
+    opacity?: number;
+    /** Lit decals take scene lighting; unlit ones are drawn flat. */
+    lit?: boolean;
+    blending?: "alpha" | "additive";
+    /** Faces angled further than this from the projector are skipped, so a
+     *  decal on a thin wall doesn't also appear on the far side. */
+    maxAngle?: number;
+    /** Lift off the surface, in metres, to beat z-fighting. */
+    offset?: number;
+    /** Seconds before it disappears. 0 = permanent (until the cap evicts it). */
+    lifetime?: number;
+    /** Seconds of fade-out at the end of `lifetime`. */
+    fadeTime?: number;
+    /** Only project onto entities carrying this tag. */
+    tag?: string;
+  }
+
+  /**
+   * `engine.decals` — bullet holes, blood, scorch marks, footprints.
+   *
+   *     const hit = this.engine.physics.raycast(origin, direction, 50);
+   *     if (hit) this.engine.decals.spawn({
+   *       position: hit.point, normal: hit.normal,
+   *       texture: "textures/bullet_hole.png", size: 0.15, lifetime: 20, fadeTime: 3 });
+   *
+   * Decals sharing a texture and blend mode are merged into one draw call, and
+   * `maxDecals` evicts the oldest — a level must not get slower the longer the
+   * fight goes on.
+   */
+  export interface DecalSystem {
+    /** Places a decal, or returns null if the projector hit nothing. */
+    spawn(options: DecalSpawnOptions): DecalHandle | null;
+    remove(handle: DecalHandle): void;
+    /** Drops every decal (also done automatically on Stop and scene change). */
+    clear(): void;
+    /** Hard cap; the oldest is evicted past it. Default 256. */
+    maxDecals: number;
+    readonly decals: DecalHandle[];
+  }
+
+  /** `entity.getComponent("line")`. A polyline with width — beams, ropes, aim
+   *  indicators. Styling lives in `props`; the points are the API. */
+  export interface LineRendererComponent extends ComponentBase {
+    readonly pointCount: number;
+    getPoint(index: number): Vector3 | null;
+    /** Replaces every point. Accepts Vector3s, `[x,y,z]` or `{x,y,z}`. */
+    setPoints(points: PointLike[]): LineRendererComponent;
+    setPoint(index: number, point: PointLike): LineRendererComponent;
+    addPoint(point: PointLike): LineRendererComponent;
+    clearPoints(): LineRendererComponent;
+    /** Rebuilds the strip. Only needed after mutating `props.points` directly. */
+    rebuild(): void;
+  }
+
+  /** `entity.getComponent("trail")`. A ribbon that follows the entity and fades
+   *  behind it. Points are recorded in world space, on game time. */
+  export interface TrailRendererComponent extends ComponentBase {
+    /** Recorded points currently alive. */
+    readonly pointCount: number;
+    /** Drops the history — call this after a teleport, or the trail draws a
+     *  streak across the level. */
+    clear(): TrailRendererComponent;
+    setEmitting(value: boolean): TrailRendererComponent;
+  }
+
+  /** `entity.getComponent("decal")`. An authored projector; see `props` for its
+   *  box, texture and filters. */
+  export interface DecalComponent extends ComponentBase {
+    /** Re-projects against the current geometry. Needed after changing the
+     *  surface in a way nothing announces (a terrain sculpt, a mesh edit). */
+    project(): DecalHandle | null;
+    /** Triangles the last projection produced; 0 means it hit nothing. */
+    readonly triangleCount: number;
+  }
+
+  /** `entity.getComponent("lod")`. Picks which child entity draws, by how much
+   *  of the frame's height the group covers. Level 0 is the finest child. */
+  export interface LodGroupComponent extends ComponentBase {
+    /** Level currently drawn; -1 when culled, null before the first frame. */
+    readonly activeLevel: number | null;
+    /** Share of the viewport's height the group covered on the last update. */
+    readonly coverage: number;
+    /** The child entities acting as levels, finest first. */
+    readonly levelEntities: Entity[];
+    /** Thresholds, always as long as the child list. */
+    readonly thresholds: number[];
+    /** Puts every level back under the ordinary visibility rules. */
+    releaseLevels(): void;
+  }
+
+  /** An orthonormal frame on a path: where it is, which way it heads, and
+   *  which way is "up" for it at that point (after any authored bank). */
+  export interface SplineFrame {
+    position: Vector3;
+    tangent: Vector3;
+    normal: Vector3;
+    binormal: Vector3;
+    distance: number;
+  }
+
+  /** One authored control point. Handles are relative to `position` and are
+   *  only read in `bezier` mode; `roll` banks the frame, in degrees. */
+  export interface SplineKnot {
+    position: number[];
+    handleIn: number[];
+    handleOut: number[];
+    roll: number;
+  }
+
+  /** Result of projecting a point onto a path. */
+  export interface SplineHit {
+    /** Arc length along the path, in the path's own units. */
+    distance: number;
+    /** 0..1 along the path. */
+    t: number;
+    point: Vector3;
+    sqDistance: number;
+  }
+
+  /**
+   * `entity.getComponent("spline")`. A path in the scene — a road, a patrol
+   * route, a camera rail. Knots are LOCAL to the entity, so moving the path
+   * entity moves the whole path; use the `world*` queries for world space.
+   *
+   *     const path = this.engine.findEntity("Patrol").getComponent("spline");
+   *     const target = path.worldPointAt(this.distance);
+   */
+  export interface SplineComponent extends ComponentBase {
+    /** Total arc length, in the path's own (local) units. */
+    readonly length: number;
+    /** Length scaled by the entity's world scale. */
+    readonly worldLength: number;
+    readonly knotCount: number;
+    readonly closed: boolean;
+    /** Bumped on every rebuild; cache derived data against it. */
+    readonly version: number;
+    pointAt(distance: number, out?: Vector3): Vector3;
+    tangentAt(distance: number, out?: Vector3): Vector3;
+    frameAt(distance: number, out?: SplineFrame): SplineFrame;
+    worldPointAt(distance: number, out?: Vector3): Vector3;
+    worldFrameAt(distance: number, out?: SplineFrame): SplineFrame;
+    /** Nearest point on the path to a WORLD position. */
+    closestPoint(worldPoint: Vector3, out?: SplineHit): SplineHit;
+    getKnot(index: number): SplineKnot | null;
+    setKnot(index: number, knot: Partial<SplineKnot>): SplineComponent;
+    addKnot(position: PointLike, index?: number): SplineComponent;
+    removeKnot(index: number): SplineComponent;
+    setKnots(knots: Partial<SplineKnot>[]): SplineComponent;
+  }
+
+  /** `entity.getComponent("splineFollower")`. Moves its entity along a path.
+   *  `position` is a plain prop, so a timeline can key it. */
+  export interface SplineFollowerComponent extends ComponentBase {
+    /** The path being followed, or null while it is unwired. */
+    readonly path: SplineComponent | null;
+    readonly pathLength: number;
+    /** 0..1 along the path — what a progress bar wants. */
+    readonly progress: number;
+    /** True once a `once`/`clamp` path has reached its end. */
+    readonly finished: boolean;
+    /** Distance travelled, in the path's own units. */
+    position: number;
+    play(): SplineFollowerComponent;
+    pause(): SplineFollowerComponent;
+    /** Jumps to a distance and clears the finished latch. */
+    seek(distance?: number): SplineFollowerComponent;
+    /** Re-applies the pose from the current `position`. */
+    apply(): void;
+  }
+
+  /** `entity.getComponent("splineMesh")`. Geometry swept along a path. */
+  export interface SplineMeshComponent extends ComponentBase {
+    readonly triangleCount: number;
+    /** Queues a re-sweep for the next frame. Safe to call per pointer event. */
+    invalidate(): void;
+    /** Re-sweeps immediately. */
+    rebuild(): void;
+  }
+
+  /** `engine.lod` — drives every LOD group once per frame. */
+  export interface LodSystem {
+    enabled: boolean;
+    setEnabled(value: boolean): void;
+    readonly stats: { groups: number; culled: number; switches: number };
+  }
+
+  /** `engine.cameraImpulse` — camera shake, decoupled from which camera is live. */
+  export interface ImpulseSystem {
+    /**
+     * Fires a shake. `position` + `radius` make it fall off with distance;
+     * omit them for a global rumble.
+     *
+     *     this.engine.cameraImpulse.emit({
+     *       position: this.entity.position, magnitude: 0.4, duration: 0.5, radius: 20 });
+     */
+    emit(options: {
+      position?: Vector3 | number[] | null;
+      magnitude?: number;
+      duration?: number;
+      frequency?: number;
+      radius?: number;
+      direction?: Vector3 | number[] | null;
+      rotation?: number;
+      attack?: number;
+    }): unknown;
+    /** Drops every live impulse. */
+    clear(): void;
+    readonly count: number;
   }
 
   /** `entity.getComponent("light")`. Light kind/color/shadow params live in `props` — see `static schema`. */
@@ -312,8 +820,30 @@ declare module "engine" {
     getVelocity(): [number, number, number];
     /** Touching the floor after the last physics step? */
     isGrounded(): boolean;
+    /** The moving platform the character is standing on, or null. The controller
+     *  already carries the character along — this is for gameplay that needs to
+     *  know (parenting an effect, "you are on the lift" triggers). */
+    getPlatform(): Entity | null;
     /** Instantly repositions the character (world space) and clears fall speed. */
     teleport(v: [number, number, number]): void;
+  }
+
+  /**
+   * `entity.getComponent("joint")`. A constraint between this entity's
+   * Rigidbody and another one (requires the `physics-rapier` module) — doors,
+   * ropes, swings, suspension. The joint only exists while playing, so these
+   * methods no-op in the editor. Kind/anchors/limits live in `props`.
+   *
+   * Hinge angles are in DEGREES, slider offsets in metres — the same units the
+   * Inspector shows.
+   */
+  export interface JointComponent extends ComponentBase {
+    /** Drives the joint like a motor — an automatic door, a winch, a powered
+     *  wheel. Hinge and slider only. */
+    setMotorVelocity(speed: number, maxForce?: number): void;
+    /** Drives the joint toward an angle (hinge) or offset (slider). */
+    setMotorTarget(target: number, stiffness?: number, damping?: number): void;
+    setLimits(min: number, max: number): void;
   }
 
   /**
@@ -323,10 +853,15 @@ declare module "engine" {
    * {@link CharacterControllerComponent} automatically, with full
    * autocomplete on its methods — no cast needed.
    *
-   * Physics types (`rigidbody`, `collider`, `charactercontroller`) are only
-   * actually attachable when the project has the `physics-rapier` module
-   * enabled; typing them here is safe either way since `getComponent`
+   * Physics types (`rigidbody`, `collider`, `charactercontroller`, `joint`)
+   * are only actually attachable when the project has the `physics-rapier`
+   * module enabled; typing them here is safe either way since `getComponent`
    * already returns `| undefined`.
+   *
+   * Every key here MUST be the component's registered `static type` string —
+   * a near-miss (`character` for `charactercontroller`) doesn't error, it
+   * silently falls through to the `getComponent<T = unknown>` overload and
+   * quietly costs the autocomplete this map exists to provide.
    *
    * Custom components registered by other modules aren't in this map — use
    * the explicit generic form (`getComponent<MyType>("mytype")`) for those.
@@ -334,16 +869,31 @@ declare module "engine" {
   export interface ComponentMap {
     model: ModelComponent;
     animation: AnimationComponent;
+    timeline: TimelineComponent;
+    ik: IKComponent;
     mesh: MeshComponent;
     camera: CameraComponent;
+    vcam: VirtualCameraComponent;
+    impulsesource: ImpulseSourceComponent;
+    navmesh: NavMeshComponent;
+    navagent: NavAgentComponent;
+    navlink: NavLinkComponent;
     light: LightComponent;
     listener: ListenerComponent;
     sound: SoundComponent;
     instancer: InstancerComponent;
     particles: ParticleComponent;
+    line: LineRendererComponent;
+    trail: TrailRendererComponent;
+    decal: DecalComponent;
+    lod: LodGroupComponent;
+    spline: SplineComponent;
+    splineFollower: SplineFollowerComponent;
+    splineMesh: SplineMeshComponent;
     rigidbody: RigidbodyComponent;
     collider: ColliderComponent;
-    character: CharacterControllerComponent;
+    charactercontroller: CharacterControllerComponent;
+    joint: JointComponent;
     script: ScriptComponent;
   }
 
@@ -631,17 +1181,105 @@ declare module "engine" {
   }
 
   export interface PhysicsHandle {
+    /**
+     * Closest hit along a ray, or null.
+     *
+     *     const hit = this.engine.physics.raycast(
+     *       muzzle, forward, 100,
+     *       { layers: ["Enemy", "Ground"], exclude: this.entity });
+     */
     raycast(
-      origin: Vector3,
-      direction: Vector3,
-      maxDist: number,
-    ): {
-      entity: Entity | null;
-      point: Vector3;
-      normal: Vector3;
-      distance: number;
-    } | null;
+      origin: [number, number, number] | Vector3,
+      direction: [number, number, number] | Vector3,
+      maxDistance?: number,
+      options?: PhysicsQueryOptions,
+    ): PhysicsHit | null;
+
+    /** Every hit along the ray, nearest first. */
+    raycastAll(
+      origin: [number, number, number] | Vector3,
+      direction: [number, number, number] | Vector3,
+      maxDistance?: number,
+      options?: PhysicsQueryOptions,
+    ): PhysicsHit[];
+
+    /**
+     * Sweeps a shape and returns the first thing it would hit. Unlike a ray it
+     * has thickness, so it cannot slip through a gap the character can't.
+     */
+    shapecast(
+      shape: PhysicsQueryShape,
+      origin: [number, number, number] | Vector3,
+      direction: [number, number, number] | Vector3,
+      maxDistance?: number,
+      options?: PhysicsQueryOptions,
+    ): PhysicsHit | null;
+    spherecast(
+      origin: [number, number, number] | Vector3,
+      radius: number,
+      direction: [number, number, number] | Vector3,
+      maxDistance?: number,
+      options?: PhysicsQueryOptions,
+    ): PhysicsHit | null;
+    boxcast(
+      origin: [number, number, number] | Vector3,
+      halfExtents: [number, number, number],
+      direction: [number, number, number] | Vector3,
+      maxDistance?: number,
+      options?: PhysicsQueryOptions,
+    ): PhysicsHit | null;
+    capsulecast(
+      origin: [number, number, number] | Vector3,
+      radius: number,
+      halfHeight: number,
+      direction: [number, number, number] | Vector3,
+      maxDistance?: number,
+      options?: PhysicsQueryOptions,
+    ): PhysicsHit | null;
+
+    /**
+     * Every entity overlapping a shape — explosion damage, interaction
+     * prompts, "who is in this room". De-duplicated per entity.
+     */
+    overlap(shape: PhysicsQueryShape, center: [number, number, number] | Vector3, options?: PhysicsQueryOptions): Entity[];
+    overlapSphere(center: [number, number, number] | Vector3, radius: number, options?: PhysicsQueryOptions): Entity[];
+    overlapBox(center: [number, number, number] | Vector3, halfExtents: [number, number, number], options?: PhysicsQueryOptions): Entity[];
+    overlapCapsule(center: [number, number, number] | Vector3, radius: number, halfHeight: number, options?: PhysicsQueryOptions): Entity[];
+
     setGravity(v: [number, number, number]): void;
+    /** Replaces the layer names + collision matrix, applied live. */
+    setLayers(config: { names?: string[]; matrix?: number[] }): void;
+  }
+
+  /**
+   * Shared options for every physics query.
+   *
+   * `layers` is deliberately independent of the project's collision matrix: a
+   * layer that collides with nothing is still queryable when you ask for it.
+   * `exclude` is the "don't shoot yourself" argument — it covers the entity's
+   * whole subtree, so a weapon parented under the player is excluded too.
+   */
+  export interface PhysicsQueryOptions {
+    layers?: string | string[];
+    exclude?: Entity | string | Array<Entity | string>;
+    /** Count shapes the origin starts inside as hits. Default true. */
+    solid?: boolean;
+    /** Quaternion [x, y, z, w] for shape queries. Default identity. */
+    rotation?: [number, number, number, number];
+  }
+
+  export interface PhysicsHit {
+    entity: Entity | null;
+    point: [number, number, number];
+    normal: [number, number, number];
+    distance: number;
+  }
+
+  export interface PhysicsQueryShape {
+    kind: "sphere" | "box" | "capsule";
+    radius?: number;
+    halfExtents?: [number, number, number];
+    halfHeight?: number;
   }
 
   export interface Engine {
@@ -651,11 +1289,80 @@ declare module "engine" {
     entities: Map<string, Entity>;
     rootEntities: Entity[];
     playing: boolean;
+
+    // ---- Game time ---------------------------------------------------------
+    /**
+     * Multiplier on the delta every update callback receives. 0.5 = half
+     * speed, 2 = double, 0 = frozen. Rendering continues either way. Reset to
+     * 1 when the game stops, so a bullet-time effect cannot leak into the
+     * editor. Set it via `setTimeScale`.
+     */
+    readonly timeScale: number;
+    setTimeScale(value: number): void;
+
+    /**
+     * Freezes game time while the render loop keeps running — what a pause
+     * menu wants. UI driven by `unscaledDeltaTime` keeps animating.
+     */
+    readonly paused: boolean;
+    setPaused(paused: boolean): void;
+
+    /** Advances `frames` fixed slices of game time while paused. */
+    step(frames?: number): void;
+
+    /** The delta update callbacks received this frame (== their `dt`). */
+    readonly deltaTime: number;
+    /**
+     * Wall-clock seconds since the last frame, ignoring timeScale and paused.
+     * Use it for anything that must keep moving while the game is paused:
+     *
+     *     onUpdate() {
+     *       this.menuSpin += this.engine.unscaledDeltaTime;
+     *     }
+     */
+    readonly unscaledDeltaTime: number;
+    /** Game-time seconds since play started (scaled, stops while paused). */
+    readonly elapsedTime: number;
+    /** Wall-clock seconds since the engine started. */
+    readonly unscaledElapsedTime: number;
+    /** Upper bound on a single frame's delta (default 0.25s). */
+    maxDeltaTime: number;
+    /** Delta used per `step()` frame (default 1/60). */
+    stepDeltaTime: number;
+
     config: EngineConfig;
     settings: SceneSettings;
     input: InputManager;
     physics?: PhysicsHandle;
+    /** Camera shake. Lives on the engine so a rumble survives a shot change. */
+    cameraImpulse: ImpulseSystem;
+    /**
+     * Animates numeric properties toward `to` over `options.duration` seconds.
+     * Dotted paths reach into nested objects:
+     *
+     *     this.engine.tween(this.entity.object3D, { "position.y": 3 },
+     *                       { duration: 0.4, ease: "backOut" });
+     *     await this.engine.tween(hud, { alpha: 0 }, { duration: 0.3 });
+     *
+     * On game time — a pause freezes it and bullet time slows it. Cleared on
+     * Stop.
+     */
+    tween(target: object, to: Record<string, number>, options?: TweenOptions): Tween;
+    /** Runtime debug drawing, visible in the viewport AND in Play/Game views. */
+    debug: DebugDraw;
+    /** Projected decals — bullet holes, blood, scorch marks. Cleared on Stop. */
+    decals: DecalSystem;
+    /** Detail-level selection for LOD groups. */
+    lod: LodSystem;
+    /** Navmesh queries. Only present when the Navigation module is enabled. */
+    navigation?: NavigationSystem;
     onUpdate(fn: (dt: number) => void): Unsub;
+    /**
+     * Runs after every `onUpdate`, in ascending `order` (default 0). The pose
+     * pipeline's stage list: IK solvers run at 0, bone-attachment sync at 100.
+     * Use it when your work must observe the frame's FINAL bone transforms.
+     */
+    onLateUpdate(fn: (dt: number) => void, order?: number): Unsub;
     onPostRender(fn: () => void): Unsub;
     on(event: string, fn: (...args: any[]) => void): Unsub;
     off(event: string, fn: (...args: any[]) => void): void;
@@ -690,6 +1397,259 @@ declare module "engine" {
         name?: string;
       },
     ): Entity | null;
+
+    /**
+     * `instantiate` spread across frames, under the spawn budget
+     * (`engine.pool.budgetMs`). Use it for one-off heavy prefabs; for anything
+     * spawned repeatedly, `spawn` is better — a pool removes the cost rather
+     * than spreading it.
+     *
+     *   const boss = await this.engine.instantiateAsync(this.bossPrefab);
+     */
+    instantiateAsync(
+      ref: string | { guid?: string; path?: string },
+      opts?: {
+        parent?: Entity | null;
+        position?: Vector3 | [number, number, number];
+        rotation?: Vector3 | [number, number, number];
+        scale?: Vector3 | [number, number, number];
+        name?: string;
+      },
+    ): Promise<Entity | null>;
+
+    /**
+     * Pooled spawn: reuses a parked instance of this prefab when there is one,
+     * otherwise instantiates. Interchangeable with `instantiate` — a recycled
+     * instance is restored to its prefab state and its scripts get a fresh
+     * `onStart`, so `onStart` / `onDestroy` are the spawn / despawn hooks.
+     *
+     *   const b = this.engine.spawn(this.bullet, { position: muzzle });
+     *   this.engine.despawn(b, 3);   // back to the pool in three seconds
+     */
+    spawn(
+      ref: string | { guid?: string; path?: string },
+      opts?: {
+        parent?: Entity | null;
+        position?: Vector3 | [number, number, number];
+        rotation?: Vector3 | [number, number, number];
+        scale?: Vector3 | [number, number, number];
+        name?: string;
+      },
+    ): Entity | null;
+
+    /**
+     * Returns a pooled instance to its pool, or destroys an entity that never
+     * came from one — so gameplay code can despawn uniformly. `delay` is in
+     * seconds of game time.
+     */
+    despawn(entity: Entity | string, delay?: number): boolean;
+
+    /** Prefab pools + the spawn budget. See {@link PoolHandle}. */
+    pool: PoolHandle;
+
+    /** Runtime scene loading. `engine.loadScene` is the shorthand. */
+    scenes: SceneManagerHandle;
+
+    /**
+     * Loads a scene by project-relative path — the same string works in the
+     * editor and in an exported build.
+     *
+     *   await this.engine.loadScene("scenes/Level2.scene");
+     *   await this.engine.loadScene("scenes/Hud.scene", { mode: "additive" });
+     *
+     * Entities marked persistent (see `entity.setPersistent`) survive a
+     * "single"-mode load; everything else in the outgoing scene is destroyed.
+     * Resolves to the loaded scene, or null if another load superseded this
+     * one before it finished.
+     */
+    loadScene(path: string, opts?: SceneLoadOptions): Promise<LoadedScene | null>;
+
+    /** Removes an additively-loaded scene. True when it was loaded. */
+    unloadScene(path: string): boolean;
+
+    /** Marks an entity as surviving scene loads (Unity's DontDestroyOnLoad). */
+    dontDestroyOnLoad(entity: Entity | string): Entity | null;
+
+    /** Save slots — a snapshot of one playthrough. See {@link SaveHandle}. */
+    saves: SaveHandle;
+
+    /**
+     * Preferences: volume, difficulty, keybinds, "seen the intro". Written
+     * through to storage on every change and NOT touched by loading or
+     * deleting a save slot — deleting every save must not reset the volume.
+     *
+     *     this.engine.prefs.set("volume", 0.5);
+     *     const volume = this.engine.prefs.get("volume", 1);
+     */
+    prefs: KeyValueHandle;
+  }
+
+  /** A small persisted key/value bag (`engine.prefs`, `engine.saves.state`). */
+  export interface KeyValueHandle {
+    get(key: string, fallback?: any): any;
+    set(key: string, value: any): any;
+    has(key: string): boolean;
+    delete(key: string): boolean;
+    keys(): string[];
+    clear(): void;
+    /** Adds `amount` to a numeric key (missing = 0) — score, coins, kills. */
+    increment(key: string, amount?: number): number;
+    toJSON(): Record<string, any>;
+  }
+
+  /** One entry from `engine.saves.list()` — enough to draw a load menu. */
+  export interface SaveHeader {
+    slot: string;
+    /** `Date.now()` when it was written. */
+    savedAt: number;
+    /** The scene the save belongs to, restored before its entity state. */
+    scene: string | null;
+    playTime: number;
+    version: number;
+    meta?: any;
+    /** Present and true when the slot could not be parsed. */
+    corrupt?: boolean;
+  }
+
+  /**
+   * `engine.saves` — save slots.
+   *
+   * A save is NOT the whole scene. Scripts opt in with `onSave`/`onLoad`
+   * (see {@link Script}); an entity whose script defines `onSave` is captured
+   * along with its transform and enabled flag. Prefab instances spawned at
+   * runtime are recorded with their prefab link and respawned on load, and
+   * ones the save doesn't contain are removed — so an enemy killed before
+   * saving is not standing there after loading.
+   */
+  export interface SaveHandle {
+    /** Game progress captured into whichever slot is written next. */
+    state: KeyValueHandle;
+    /** False when storage is memory-only (blocked/absent localStorage). */
+    readonly durable: boolean;
+    /** The game's own save version (project setting `game.saveVersion`). */
+    readonly version: number;
+    namespace: string;
+
+    /** Captures the live scene and writes it to `slot`. */
+    save(slot: string | number, meta?: any): Promise<any>;
+    /** Reads `slot` and applies it. False when missing, corrupt, or refused. */
+    load(slot: string | number, opts?: { loadScene?: boolean; prune?: boolean }): Promise<boolean>;
+    has(slot: string | number): Promise<boolean>;
+    delete(slot: string | number): Promise<void>;
+    /** Every written slot, newest first — headers only. */
+    list(): Promise<SaveHeader[]>;
+
+    /** Builds the payload without writing it (checkpoints, custom slot UI). */
+    capture(meta?: any): any;
+    /** Applies a payload from `capture()` / `read()`. */
+    restore(data: any, opts?: { loadScene?: boolean; prune?: boolean }): Promise<boolean>;
+    read(slot: string | number, opts?: { migrate?: boolean }): Promise<any>;
+    write(slot: string | number, data: any): Promise<void>;
+
+    /**
+     * Registers an upgrade from version `toVersion - 1` to `toVersion`.
+     * Migrations chain, so each one handles a single step. A save with no
+     * path to the current version is REFUSED — silently feeding old data to
+     * new scripts corrupts a playthrough hours before the player notices.
+     */
+    registerMigration(toVersion: number, fn: (data: any) => any): void;
+  }
+
+  export interface SceneLoadOptions {
+    /** "single" replaces the current scene (default); "additive" adds to it. */
+    mode?: "single" | "additive";
+    /**
+     * Prefetch the scene's assets before building it, so the level does not
+     * pop in over the first seconds of play. Default true. Pass an array to
+     * preload exactly those paths instead, or false to skip.
+     */
+    preload?: boolean | string[];
+    /** Progress for a loading screen; also emitted as "scene-load-progress". */
+    onProgress?: (p: SceneLoadProgress) => void;
+    /**
+     * Repoint `engine.camera` at the loaded scene's camera. Defaults to
+     * "auto" — only while playing, so loading a scene in the editor never
+     * steals the viewport camera.
+     */
+    setCamera?: boolean | "auto";
+  }
+
+  export interface SceneLoadProgress {
+    path: string;
+    mode: "single" | "additive";
+    phase: "fetch" | "modules" | "preload" | "unload" | "instantiate";
+    loaded: number;
+    total: number;
+    /** 0..1 across every phase. */
+    progress: number;
+  }
+
+  export interface LoadedScene {
+    path: string;
+    name: string;
+    mode: "single" | "additive";
+    /** Ids of the roots this scene created. */
+    rootIds: string[];
+  }
+
+  /** Per-prefab pool counters, keyed by prefab path. */
+  export interface PoolStats {
+    [prefab: string]: { free: number; active: number; created: number; reused: number; peak: number };
+  }
+
+  /**
+   * `engine.pool` — prefab pooling and the spawn budget.
+   *
+   * Pools are keyed by prefab and only prefabs can be pooled: a recycled
+   * instance is restored to its prefab, and there is nothing to restore an
+   * arbitrary entity to.
+   */
+  export interface PoolHandle {
+    /** Wall-clock milliseconds per frame the spawn queue may spend (default 2). */
+    budgetMs: number;
+
+    /** Parked instances across every pool. */
+    readonly size: number;
+
+    /** Queued spawns still waiting for room in the budget. */
+    readonly pending: number;
+
+    /** Pooled spawn. `engine.spawn` is the shorthand. */
+    spawn(ref: string | { guid?: string; path?: string }, opts?: object): Entity | null;
+
+    /** Queued pooled spawn — resolves when the budget gets to it. */
+    spawnAsync(ref: string | { guid?: string; path?: string }, opts?: object): Promise<Entity | null>;
+
+    /** Returns an instance to its pool. `engine.despawn` is the shorthand. */
+    despawn(entity: Entity, delay?: number): boolean;
+
+    /**
+     * Fills a pool ahead of time, spread across frames. Tops up to `count`
+     * rather than adding `count` more, so calling it twice is not a doubling.
+     *
+     *   await this.engine.pool.prewarm(this.enemyPrefab, 40);
+     */
+    prewarm(ref: string | { guid?: string; path?: string }, count?: number, opts?: object): Promise<number>;
+
+    /** Instances of this prefab currently parked and ready. */
+    free(ref: string | { guid?: string; path?: string }): number;
+
+    /** Destroys parked instances (of one prefab, or all), leaving live ones. */
+    clear(ref?: string | { guid?: string; path?: string } | null): void;
+
+    /** Per-prefab counters — what a spawn-heavy scene is actually doing. */
+    stats(): PoolStats;
+  }
+
+  export interface SceneManagerHandle {
+    /** Loaded scenes, in load order. */
+    loaded: LoadedScene[];
+    /** The most recent "single"-mode scene — the level you are in. */
+    active: LoadedScene | null;
+    isLoading: boolean;
+    isLoaded(path: string): boolean;
+    load(path: string, opts?: SceneLoadOptions): Promise<LoadedScene | null>;
+    unload(path: string): boolean;
   }
 
   /**
@@ -776,5 +1736,27 @@ declare module "engine" {
     onPointerEnter?(): void;
     /** Pointer left this entity's UI button. */
     onPointerExit?(): void;
+
+    // --- save/load ---------------------------------------------------------
+
+    /**
+     * Return the state this script needs restored later. Defining this hook is
+     * what OPTS THE ENTITY IN to saves — its transform and enabled flag come
+     * along automatically, so a script that only needs those can return
+     * nothing:
+     *
+     *     onSave() { return { opened: this.opened }; }
+     *
+     * Return plain JSON-safe data (no entities, no three.js objects). Runs
+     * whenever the game calls `engine.saves.save()` / `capture()`.
+     */
+    onSave?(): unknown;
+
+    /**
+     * Restores what `onSave` returned (or `null` if it returned nothing).
+     * Runs AFTER the saved transform is applied, so setting a position here
+     * has the last word.
+     */
+    onLoad?(data: any): void;
   }
 }

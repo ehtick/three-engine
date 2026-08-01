@@ -56,7 +56,9 @@
 }
 
 .shader-node.collapsed {
+  width: auto;
   min-width: 120px;
+  max-width: none;
 }
 
 .graph-node-error {

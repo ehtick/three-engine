@@ -135,7 +135,10 @@ export function MenuBar() {
         action: () => useProjectStore.getState().closeProject(),
       },
       { separator: true },
-      { label: "Export Game…", action: () => import("./exportGame.js").then((m) => m.exportGame()) },
+      // The panel is where a build is *configured*; this is the one-click path
+      // for someone who has already configured it (or is happy with defaults).
+      { label: "Build Settings…", action: () => openPanel("build") },
+      { label: "Build Game…", shortcut: "Ctrl+B", action: () => import("./exportGame.js").then((m) => m.exportGame()) },
     ],
     Edit: [
       {
@@ -195,6 +198,7 @@ export function MenuBar() {
     ],
     Window: [
       { label: "Viewport", action: () => openPanel("viewport") },
+      { label: "Game", action: () => openPanel("game") },
       { label: "Hierarchy", action: () => openPanel("hierarchy") },
       { label: "Inspector", action: () => openPanel("inspector") },
       { label: "Assets", action: () => openPanel("assets") },
@@ -203,9 +207,11 @@ export function MenuBar() {
       { label: "Shader Graph", action: () => openPanel("shaderGraph") },
       { label: "Particles", action: () => openPanel("particles") },
       { label: "Animator", action: () => openPanel("animator") },
+      { label: "Timeline", action: () => openPanel("timeline") },
       { separator: true },
       { label: "Scene Settings", action: () => openPanel("sceneSettings") },
       { label: "Project Settings", action: () => openPanel("projectSettings") },
+      { label: "Build Settings", action: () => openPanel("build") },
       { label: "Modules", action: () => openPanel("modules") },
       { label: "Input", action: () => openPanel("input") },
       { label: "Poly Haven", action: () => openPanel("polyhaven") },

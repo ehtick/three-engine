@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Plus, Save, Play, Trash2, Zap } from "lucide-react";
+import { Plus, Save, Play, Trash2, Zap, ChevronUp, ChevronDown, Layers, X } from "lucide-react";
 import {
   ReactFlow,
   ReactFlowProvider,
@@ -22,7 +22,8 @@ import "@xyflow/react/dist/style.css";
 import { useSelectionStore } from "../store/selectionStore.js";
 import { useSceneStore } from "../store/sceneStore.js";
 import { engine } from "../engineInstance.js";
-import { ANY_STATE, START_STATE } from "../../engine/animGraph.js";
+import { ANY_STATE, START_STATE, createLayer, normalizeGraph } from "../../engine/animGraph.js";
+import { collectBoneNames } from "../../engine/anim/mask.js";
 import { setGraphHovered } from "../nodegraph/graphContext.js";
 import { ContextMenu } from "../ContextMenu.jsx";
 
@@ -31,10 +32,25 @@ import { ContextMenu } from "../ContextMenu.jsx";
  * state nodes wired by transition edges, a parameters sidebar, per-transition
  * conditions/blend settings. Save writes the file and live-applies the graph
  * to every Animation component referencing it.
+ *
+ * The canvas shows ONE layer at a time, picked in the Layers list. Layers are
+ * independent state machines over the same parameters, so showing them stacked
+ * on one canvas would only invite wiring a transition across a boundary that
+ * cannot carry it.
+ *
+ * A state is either a clip or a blend tree; the State section switches between
+ * the two and, for a 2D tree, offers a draggable sample pad — laying strafe
+ * clips out on a diagram is the whole reason 2D trees are easier to reason
+ * about than a wall of numbers.
  */
 
 const PARAM_TYPES = ["number", "boolean", "trigger"];
 const NUMBER_OPS = [">", "<", ">=", "<=", "==", "!="];
+const STATE_KINDS = [
+  { value: "clip", label: "Clip" },
+  { value: "blend1d", label: "Blend Tree 1D" },
+  { value: "blend2d", label: "Blend Tree 2D" },
+];
 
 const uid = (prefix) => `${prefix}-${Math.random().toString(36).slice(2, 8)}`;
 
@@ -52,11 +68,11 @@ function conditionSummary(data, paramTypes) {
     .join(" · ");
 }
 
-function graphToFlow(graph) {
+function layerToFlow(layer) {
   const startNode = {
     id: START_STATE,
     type: "startState",
-    position: graph.startPosition ?? { x: 40, y: 200 },
+    position: layer?.startPosition ?? { x: 40, y: 200 },
     data: {},
     deletable: false,
     draggable: false,
@@ -66,18 +82,18 @@ function graphToFlow(graph) {
     {
       id: ANY_STATE,
       type: "anyState",
-      position: graph.anyPosition ?? { x: 40, y: 40 },
+      position: layer?.anyPosition ?? { x: 40, y: 40 },
       data: {},
       deletable: false,
     },
-    ...(graph.states ?? []).map((s) => ({
+    ...(layer?.states ?? []).map((s) => ({
       id: s.id,
       type: "animState",
       position: { x: s.x ?? 0, y: s.y ?? 0 },
       data: { state: { ...s } },
     })),
   ];
-  const startEdges = (graph.startTransitions ?? []).map((t) => ({
+  const startEdges = (layer?.startTransitions ?? []).map((t) => ({
     id: t.id ?? uid("st"),
     source: START_STATE,
     target: t.to,
@@ -90,7 +106,7 @@ function graphToFlow(graph) {
   }));
   const edges = [
     ...startEdges,
-    ...(graph.transitions ?? []).map((t) => ({
+    ...(layer?.transitions ?? []).map((t) => ({
       id: t.id ?? uid("t"),
       source: t.from,
       target: t.to,
@@ -98,6 +114,7 @@ function graphToFlow(graph) {
         conditions: t.conditions ?? [],
         duration: t.duration ?? 0.25,
         exitTime: t.exitTime ?? null,
+        offset: t.offset ?? 0,
         kind: "state",
         sourceAnchor: t.sourceAnchor,
         targetAnchor: t.targetAnchor,
@@ -107,7 +124,8 @@ function graphToFlow(graph) {
   return { nodes, edges };
 }
 
-function flowToGraph(nodes, edges, parameters) {
+/** The canvas's half of a layer — merged over the layer's own settings. */
+function flowToLayer(nodes, edges) {
   const startNode = nodes.find((n) => n.id === START_STATE);
   const anyNode = nodes.find((n) => n.id === ANY_STATE);
   const states = nodes
@@ -131,12 +149,11 @@ function flowToGraph(nodes, edges, parameters) {
       conditions: e.data?.conditions ?? [],
       duration: e.data?.duration ?? 0.25,
       exitTime: e.data?.exitTime ?? null,
+      offset: e.data?.offset ?? 0,
       sourceAnchor: e.data?.sourceAnchor,
       targetAnchor: e.data?.targetAnchor,
     }));
   return {
-    version: 1,
-    parameters,
     states,
     startTransitions,
     transitions,
@@ -198,17 +215,29 @@ function EdgeHandles() {
   );
 }
 
+function stateSummary(state) {
+  if (state.kind === "blend1d") {
+    return `${state.blendParam || "?"} · ${(state.children ?? []).length} clips`;
+  }
+  if (state.kind === "blend2d") {
+    return `${state.blendParam || "?"}/${state.blendParamY || "?"} · ${(state.children ?? []).length} clips`;
+  }
+  return state.clip || "no clip";
+}
+
 function StateNode({ data, selected }) {
+  const isTree = data.state.kind === "blend1d" || data.state.kind === "blend2d";
   return (
     <div className={`shader-node cat-anim ${selected ? "selected" : ""}`}>
       <EdgeHandles />
       <div className="shader-node-header">
         <span className="shader-node-dot" />
         <span className="shader-node-label">{data.state.name}</span>
+        {isTree && <span className="anim-node-badge">{data.state.kind === "blend2d" ? "2D" : "1D"}</span>}
       </div>
       <div className="shader-node-body">
         <div className="shader-node-row">
-          <span className="shader-port-label">{data.state.clip || "no clip"}</span>
+          <span className="shader-port-label">{stateSummary(data.state)}</span>
         </div>
       </div>
     </div>
@@ -536,8 +565,236 @@ function ParamAddButton({ onPick }) {
   );
 }
 
-function StateSection({ node, clipNames, onPatch, onPreview }) {
+/** Clip picker: a dropdown when a model is bound, free text when it isn't. */
+function ClipField({ value, clipNames, onChange, fieldKey }) {
+  if (!clipNames.length) {
+    return (
+      <input
+        className="text-field"
+        key={fieldKey}
+        defaultValue={value ?? ""}
+        placeholder="clip name"
+        onBlur={(e) => onChange(e.target.value.trim())}
+      />
+    );
+  }
+  return (
+    <select className="select-field" value={value ?? ""} onChange={(e) => onChange(e.target.value)}>
+      <option value="">None</option>
+      {clipNames.map((c) => (
+        <option key={c} value={c}>
+          {c}
+        </option>
+      ))}
+    </select>
+  );
+}
+
+/**
+ * Draggable sample pad for a 2D blend tree.
+ *
+ * The numbers alone are hard to reason about — "is (0.7, -0.7) the back-right
+ * strafe or the front-left one?" — and the answer depends on the rig's
+ * convention. Drawing them shows the layout at a glance, and dragging a sample
+ * is how you fix one that's in the wrong quadrant.
+ */
+function Blend2DPad({ children, range, onMove, live }) {
+  const ref = useRef(null);
+  const [dragging, setDragging] = useState(null);
+  const size = 150;
+  const span = Math.max(range, 0.001);
+  const toPixels = (x, y) => [size / 2 + (x / span) * (size / 2 - 12), size / 2 - (y / span) * (size / 2 - 12)];
+  const toValue = (px, py) => [
+    ((px - size / 2) / (size / 2 - 12)) * span,
+    ((size / 2 - py) / (size / 2 - 12)) * span,
+  ];
+
+  const pointerMove = (event) => {
+    if (dragging == null || !ref.current) return;
+    const rect = ref.current.getBoundingClientRect();
+    const [x, y] = toValue(event.clientX - rect.left, event.clientY - rect.top);
+    // Snap to a tenth: hand-dragged 0.7071 values read as noise in the file and
+    // make two samples that should be symmetric look like they aren't.
+    onMove(dragging, Math.round(x * 10) / 10, Math.round(y * 10) / 10);
+  };
+
+  return (
+    <svg
+      ref={ref}
+      className="anim-blend-pad"
+      width={size}
+      height={size}
+      viewBox={`0 0 ${size} ${size}`}
+      onPointerMove={pointerMove}
+      onPointerUp={(e) => {
+        setDragging(null);
+        e.currentTarget.releasePointerCapture?.(e.pointerId);
+      }}
+      onPointerLeave={() => setDragging(null)}
+    >
+      <rect x={0} y={0} width={size} height={size} className="anim-blend-pad-bg" />
+      <line x1={size / 2} y1={4} x2={size / 2} y2={size - 4} className="anim-blend-pad-axis" />
+      <line x1={4} y1={size / 2} x2={size - 4} y2={size / 2} className="anim-blend-pad-axis" />
+      {live && (
+        <circle cx={toPixels(live[0], live[1])[0]} cy={toPixels(live[0], live[1])[1]} r={5} className="anim-blend-pad-live" />
+      )}
+      {children.map((child, i) => {
+        const [cx, cy] = toPixels(child.px ?? 0, child.py ?? 0);
+        return (
+          <g key={i}>
+            <circle
+              cx={cx}
+              cy={cy}
+              r={6}
+              className={`anim-blend-pad-dot${dragging === i ? " dragging" : ""}`}
+              onPointerDown={(e) => {
+                setDragging(i);
+                e.currentTarget.ownerSVGElement?.setPointerCapture?.(e.pointerId);
+              }}
+            />
+            <text x={cx + 9} y={cy + 4} className="anim-blend-pad-label">
+              {child.clip || "?"}
+            </text>
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
+
+function BlendTreeEditor({ state, clipNames, parameters, onPatch, live }) {
+  const children = state.children ?? [];
+  const is2d = state.kind === "blend2d";
+  const numbers = parameters.filter((p) => p.type === "number");
+
+  const patchChild = (index, patch) =>
+    onPatch({ children: children.map((c, i) => (i === index ? { ...c, ...patch } : c)) });
+  const addChild = () =>
+    onPatch({
+      children: [
+        ...children,
+        {
+          clip: clipNames[0] ?? "",
+          // Stack new 1D children past the current maximum so a fresh child is
+          // never born on top of an existing threshold (which blends to nothing).
+          threshold: children.length ? Math.max(...children.map((c) => c.threshold ?? 0)) + 1 : 0,
+          px: 0,
+          py: 0,
+          speed: 1,
+        },
+      ],
+    });
+  const removeChild = (index) => onPatch({ children: children.filter((_, i) => i !== index) });
+
+  const paramSelect = (key, label) => (
+    <div className="field-row">
+      <span className="field-label">{label}</span>
+      {numbers.length ? (
+        <select className="select-field" value={state[key] ?? ""} onChange={(e) => onPatch({ [key]: e.target.value })}>
+          <option value="">None</option>
+          {numbers.map((p) => (
+            <option key={p.name} value={p.name}>
+              {p.name}
+            </option>
+          ))}
+        </select>
+      ) : (
+        <span className="field-hint">add a number parameter first</span>
+      )}
+    </div>
+  );
+
+  const range = Math.max(
+    1,
+    ...children.map((c) => Math.max(Math.abs(c.px ?? 0), Math.abs(c.py ?? 0))),
+  );
+
+  return (
+    <>
+      {paramSelect("blendParam", is2d ? "Param X" : "Parameter")}
+      {is2d && paramSelect("blendParamY", "Param Y")}
+      {is2d && (
+        <div className="field-row">
+          <span className="field-label">Metric</span>
+          <select
+            className="select-field"
+            value={state.blendMode ?? "cartesian"}
+            onChange={(e) => onPatch({ blendMode: e.target.value })}
+            title="Directional treats each sample as a heading + speed — right for strafe sets, where forward and backward are 180° apart rather than merely far apart."
+          >
+            <option value="cartesian">Cartesian</option>
+            <option value="directional">Directional</option>
+          </select>
+        </div>
+      )}
+      <div className="field-row">
+        <span className="field-label" title="Retimes every clip so they complete a stride together — what stops blended locomotion from foot-skating.">
+          Sync Cycles
+        </span>
+        <input
+          type="checkbox"
+          checked={state.syncTime !== false}
+          onChange={(e) => onPatch({ syncTime: e.target.checked })}
+        />
+      </div>
+      {is2d && children.length > 0 && (
+        <Blend2DPad children={children} range={range} live={live} onMove={(i, px, py) => patchChild(i, { px, py })} />
+      )}
+      <div className="anim-tree-children">
+        {children.map((child, i) => (
+          <div className="anim-tree-child" key={i}>
+            <ClipField
+              value={child.clip}
+              clipNames={clipNames}
+              fieldKey={`${state.id}-child-${i}`}
+              onChange={(clip) => patchChild(i, { clip })}
+            />
+            {is2d ? (
+              <>
+                <input
+                  className="number-field tiny"
+                  type="number"
+                  step={0.1}
+                  title="X"
+                  value={child.px ?? 0}
+                  onChange={(e) => patchChild(i, { px: parseFloat(e.target.value) || 0 })}
+                />
+                <input
+                  className="number-field tiny"
+                  type="number"
+                  step={0.1}
+                  title="Y"
+                  value={child.py ?? 0}
+                  onChange={(e) => patchChild(i, { py: parseFloat(e.target.value) || 0 })}
+                />
+              </>
+            ) : (
+              <input
+                className="number-field tiny"
+                type="number"
+                step={0.1}
+                title="Threshold"
+                value={child.threshold ?? 0}
+                onChange={(e) => patchChild(i, { threshold: parseFloat(e.target.value) || 0 })}
+              />
+            )}
+            <button className="icon-btn" title="Remove clip" onClick={() => removeChild(i)}>
+              <Trash2 size={12} />
+            </button>
+          </div>
+        ))}
+      </div>
+      <button className="toolbar-btn wide" onClick={addChild}>
+        <Plus size={12} />
+        Clip
+      </button>
+    </>
+  );
+}
+
+function StateSection({ node, clipNames, parameters, onPatch, onPreview, live }) {
   const state = node.data.state;
+  const kind = state.kind ?? "clip";
   return (
     <div className="inspector-section">
       <div className="section-header">State</div>
@@ -554,26 +811,48 @@ function StateSection({ node, clipNames, onPatch, onPreview }) {
         />
       </div>
       <div className="field-row">
-        <span className="field-label">Clip</span>
-        {clipNames.length ? (
-          <select className="select-field" value={state.clip ?? ""} onChange={(e) => onPatch({ clip: e.target.value })}>
-            <option value="">None</option>
-            {clipNames.map((c) => (
-              <option key={c} value={c}>
-                {c}
-              </option>
-            ))}
-          </select>
-        ) : (
-          <input
-            className="text-field"
-            key={node.id + (state.clip ?? "")}
-            defaultValue={state.clip ?? ""}
-            placeholder="clip name"
-            onBlur={(e) => onPatch({ clip: e.target.value.trim() })}
-          />
-        )}
+        <span className="field-label">Type</span>
+        <select
+          className="select-field"
+          value={kind}
+          onChange={(e) => {
+            const next = e.target.value;
+            // Seed a fresh tree from the clip the state already had, so
+            // switching a working Walk state to a blend tree starts with Walk
+            // in it rather than empty.
+            const patch = { kind: next };
+            if (next !== "clip" && !(state.children ?? []).length && state.clip) {
+              patch.children = [{ clip: state.clip, threshold: 0, px: 0, py: 0, speed: 1 }];
+            }
+            onPatch(patch);
+          }}
+        >
+          {STATE_KINDS.map((k) => (
+            <option key={k.value} value={k.value}>
+              {k.label}
+            </option>
+          ))}
+        </select>
       </div>
+      {kind === "clip" ? (
+        <div className="field-row">
+          <span className="field-label">Clip</span>
+          <ClipField
+            value={state.clip}
+            clipNames={clipNames}
+            fieldKey={node.id + (state.clip ?? "")}
+            onChange={(clip) => onPatch({ clip })}
+          />
+        </div>
+      ) : (
+        <BlendTreeEditor
+          state={state}
+          clipNames={clipNames}
+          parameters={parameters}
+          onPatch={onPatch}
+          live={live}
+        />
+      )}
       <div className="field-row">
         <span className="field-label">Speed</span>
         <input
@@ -592,6 +871,180 @@ function StateSection({ node, clipNames, onPatch, onPreview }) {
         <Play size={12} />
         Preview
       </button>
+    </div>
+  );
+}
+
+/**
+ * Bone checklist for an avatar mask.
+ *
+ * Indented by skeleton depth, with an "include children" toggle, because that
+ * is how masks are actually authored: you pick "Spine" and mean everything
+ * above the waist, not the single vertebra.
+ */
+function MaskEditor({ mask, bones, onChange, onClose }) {
+  const [filter, setFilter] = useState("");
+  const selected = new Set(mask?.bones ?? []);
+  const visible = filter
+    ? bones.filter((b) => b.name.toLowerCase().includes(filter.toLowerCase()))
+    : bones;
+
+  const toggle = (name) => {
+    const next = new Set(selected);
+    if (next.has(name)) next.delete(name);
+    else next.add(name);
+    onChange(next.size ? { ...(mask ?? {}), bones: [...next] } : null);
+  };
+
+  return (
+    <div className="inspector-section anim-mask-editor">
+      <div className="section-header">
+        Avatar Mask
+        <button className="icon-btn" title="Close" onClick={onClose}>
+          <X size={12} />
+        </button>
+      </div>
+      {!bones.length ? (
+        <div className="field-hint">
+          No skeleton in the scene yet — add an Animation component on a rigged model to list its bones.
+        </div>
+      ) : (
+        <>
+          <div className="field-row">
+            <span className="field-label">Children</span>
+            <input
+              type="checkbox"
+              checked={mask?.includeChildren !== false}
+              onChange={(e) => onChange({ ...(mask ?? { bones: [] }), includeChildren: e.target.checked })}
+              disabled={!mask}
+            />
+          </div>
+          <div className="field-row">
+            <span className="field-label">Invert</span>
+            <input
+              type="checkbox"
+              checked={!!mask?.invert}
+              onChange={(e) => onChange({ ...(mask ?? { bones: [] }), invert: e.target.checked })}
+              disabled={!mask}
+            />
+          </div>
+          <input
+            className="text-field"
+            placeholder="filter bones…"
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+          />
+          <div className="anim-bone-list">
+            {visible.map((bone) => (
+              <label key={bone.name} className="anim-bone-row" style={{ paddingLeft: 4 + bone.depth * 10 }}>
+                <input type="checkbox" checked={selected.has(bone.name)} onChange={() => toggle(bone.name)} />
+                <span>{bone.name}</span>
+              </label>
+            ))}
+          </div>
+          <button className="toolbar-btn wide" disabled={!mask} onClick={() => onChange(null)}>
+            Clear mask (full body)
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
+function LayersSection({ layers, active, onSelect, onChange, onAdd, onRemove, onMove, onEditMask, liveWeights }) {
+  return (
+    <div className="inspector-section">
+      <div className="section-header">
+        Layers
+        <button className="icon-btn" title="Add layer" onClick={onAdd}>
+          <Plus size={12} />
+        </button>
+      </div>
+      <div className="anim-layer-list">
+        {layers.map((layer, i) => (
+          <div
+            key={layer.id}
+            className={`anim-layer-row${i === active ? " active" : ""}`}
+            onClick={() => onSelect(i)}
+          >
+            <div className="anim-layer-head">
+              <Layers size={11} />
+              <input
+                className="text-field flush"
+                key={`${layer.id}-name`}
+                defaultValue={layer.name}
+                onClick={(e) => e.stopPropagation()}
+                onBlur={(e) => {
+                  const name = e.target.value.trim();
+                  if (name && name !== layer.name) onChange(i, { name });
+                }}
+              />
+              {liveWeights?.[i] != null && <span className="anim-layer-live">{liveWeights[i].toFixed(2)}</span>}
+              <button
+                className="icon-btn"
+                title="Move up"
+                disabled={i <= 1}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onMove(i, -1);
+                }}
+              >
+                <ChevronUp size={11} />
+              </button>
+              <button
+                className="icon-btn"
+                title="Move down"
+                disabled={i === 0 || i === layers.length - 1}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onMove(i, 1);
+                }}
+              >
+                <ChevronDown size={11} />
+              </button>
+              <button
+                className="icon-btn"
+                title={i === 0 ? "The base layer can't be removed" : "Remove layer"}
+                disabled={i === 0}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onRemove(i);
+                }}
+              >
+                <Trash2 size={11} />
+              </button>
+            </div>
+            {i > 0 && (
+              <div className="anim-layer-controls" onClick={(e) => e.stopPropagation()}>
+                <select
+                  className="select-field"
+                  value={layer.blend ?? "override"}
+                  onChange={(e) => onChange(i, { blend: e.target.value })}
+                  title="Override replaces the layers below within the mask; Additive adds an offset on top of them."
+                >
+                  <option value="override">Override</option>
+                  <option value="additive">Additive</option>
+                </select>
+                <input
+                  type="range"
+                  min={0}
+                  max={1}
+                  step={0.01}
+                  value={layer.weight ?? 1}
+                  title="Default weight — scripts drive this with setLayerWeight()"
+                  onChange={(e) => onChange(i, { weight: parseFloat(e.target.value) })}
+                />
+                <button className="toolbar-btn" onClick={() => onEditMask(i)}>
+                  {layer.mask?.bones?.length ? `Mask (${layer.mask.bones.length})` : "Mask"}
+                </button>
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+      <div className="field-hint">
+        Layers higher in this list win. The base layer is always at full weight.
+      </div>
     </div>
   );
 }
@@ -734,6 +1187,23 @@ function TransitionSection({ edge, parameters, stateNames, onPatch }) {
               }}
             />
           </div>
+          <div className="field-row">
+            <span
+              className="field-label"
+              title="Where in the destination clip to start, 0..1. A jump landing that starts at 0.3 skips the wind-up you already played."
+            >
+              Offset
+            </span>
+            <input
+              className="number-field"
+              type="number"
+              step={0.05}
+              min={0}
+              max={1}
+              value={data.offset ?? 0}
+              onChange={(e) => onPatch({ offset: Math.min(1, Math.max(0, parseFloat(e.target.value) || 0)) })}
+            />
+          </div>
         </>
       )}
     </div>
@@ -776,10 +1246,46 @@ function collectClipNames(animPath) {
   return [...names];
 }
 
+/** Where the live parameters put a blend tree's sample point, for the 2D pad. */
+function liveBlendPoint(state, component) {
+  if (state?.kind !== "blend2d" || !component?.runtime) return null;
+  const x = component.getParam(state.blendParam);
+  const y = component.getParam(state.blendParamY);
+  return typeof x === "number" && typeof y === "number" ? [x, y] : null;
+}
+
+/** Bones of the rig this controller drives — the mask editor's checklist. */
+function collectSkeletonBones(animPath) {
+  try {
+    for (const comp of componentsUsing(animPath)) {
+      const root = comp.getModelRoot?.();
+      if (root) return collectBoneNames(root);
+    }
+    // Not bound to anything yet: fall back to any rigged model in the scene, so
+    // a mask can be authored before the Animation component is wired up.
+    for (const entity of engine.entities.values()) {
+      const root = entity.getComponent("model")?.root;
+      if (!root) continue;
+      const bones = collectBoneNames(root);
+      if (bones.length) return bones;
+    }
+  } catch {
+    // Engine not booted yet.
+  }
+  return [];
+}
+
 function AnimatorEditor({ animPath }) {
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
   const [parameters, setParameters] = useState([]);
+  // Every layer's data. The ACTIVE layer's states/transitions live in
+  // nodes/edges while it is on the canvas and are folded back in on switch or
+  // save — keeping two copies in sync every keystroke is what turns a graph
+  // editor into a bug farm.
+  const [layers, setLayers] = useState([]);
+  const [active, setActive] = useState(0);
+  const [maskLayer, setMaskLayer] = useState(null);
   const [dirty, setDirty] = useState(false);
   const { screenToFlowPosition, getInternalNode } = useReactFlow();
   const updateNodeInternals = useUpdateNodeInternals();
@@ -814,10 +1320,17 @@ function AnimatorEditor({ animPath }) {
         return;
       }
       if (!live) return;
-      const flow = graphToFlow(graph);
+      // v1 controllers (flat, no layers) are folded into a single Base Layer
+      // here, so the editor only ever deals with the current shape. Saving
+      // writes v2 back — the upgrade happens the first time you touch the file.
+      const normalized = normalizeGraph(graph);
+      const flow = layerToFlow(normalized.layers[0]);
       setNodes(flow.nodes);
       setEdges(flow.edges);
-      setParameters(graph.parameters ?? []);
+      setParameters(normalized.parameters ?? []);
+      setLayers(normalized.layers);
+      setActive(0);
+      setMaskLayer(null);
       setDirty(false);
     })();
     return () => (live = false);
@@ -829,6 +1342,7 @@ function AnimatorEditor({ animPath }) {
     [nodes],
   );
   const clipNames = useMemo(() => collectClipNames(animPath), [animPath, nodes.length]); // eslint-disable-line react-hooks/exhaustive-deps
+  const boneNames = useMemo(() => collectSkeletonBones(animPath), [animPath, nodes.length]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const selectedNode = nodes.find((n) => n.selected && n.type === "animState");
   const selectedEdge = !selectedNode && edges.find((e) => e.selected);
@@ -935,6 +1449,13 @@ function AnimatorEditor({ animPath }) {
     [boundComponents],
   );
 
+  // Live readouts while playing: the weight a script has actually driven each
+  // layer to, and where the selected blend tree's parameters currently sit.
+  // Re-read on the same 10Hz tick as the parameter readout above.
+  const liveLayerWeights = playMode
+    ? (drivenComponent?.runtime?.layers ?? []).map((l) => l.weight)
+    : null;
+
   // Refresh derived node/edge data on every change.
   const decoratedNodes = useMemo(() => {
     const startHasWires = edges.some((e) => e.source === START_STATE);
@@ -978,7 +1499,9 @@ function AnimatorEditor({ animPath }) {
         id,
         type: "animState",
         position,
-        data: { state: { id, name: `State ${i}`, clip: clipNames[0] ?? "", speed: 1, loop: true } },
+        data: {
+          state: { id, name: `State ${i}`, kind: "clip", clip: clipNames[0] ?? "", speed: 1, loop: true },
+        },
       },
     ]);
   };
@@ -1018,7 +1541,7 @@ function AnimatorEditor({ animPath }) {
       const isStart = connection.source === START_STATE;
       const data = isStart
         ? { conditions: [], kind: "start" }
-        : { conditions: [], duration: 0.25, exitTime: null, kind: "state" };
+        : { conditions: [], duration: 0.25, exitTime: null, offset: 0, kind: "state" };
       // Anchor the endpoints to the exact border points the user grabbed and
       // dropped, stored normalised so they follow the nodes. Falls back to a
       // floating centre-line endpoint if a point couldn't be captured.
@@ -1055,7 +1578,70 @@ function AnimatorEditor({ animPath }) {
     [onNodesChange],
   );
 
-  const buildGraph = () => flowToGraph(nodes, edges, parameters);
+  // --- layers ---------------------------------------------------------------
+  /** Folds the canvas back into the layer array — the single merge point. */
+  const withCanvas = (list = layers, index = active) =>
+    list.map((layer, i) => (i === index ? { ...layer, ...flowToLayer(nodes, edges) } : layer));
+
+  const selectLayer = (index) => {
+    if (index === active) return;
+    const merged = withCanvas();
+    const flow = layerToFlow(merged[index]);
+    setLayers(merged);
+    setNodes(flow.nodes);
+    setEdges(flow.edges);
+    setActive(index);
+    setMaskLayer(null);
+    // Node internals are re-registered by the existing seenNodeIds effect only
+    // for ids it hasn't seen. Switching back to a layer re-mounts nodes it HAS
+    // seen, so clear the ledger or their border handles stay unmeasured and you
+    // can't draw a transition from them.
+    seenNodeIds.current.clear();
+  };
+
+  const patchLayer = (index, patch) => {
+    setDirty(true);
+    setLayers((ls) => ls.map((l, i) => (i === index ? { ...l, ...patch } : l)));
+  };
+
+  const addLayer = () => {
+    setDirty(true);
+    const merged = withCanvas();
+    const layer = { ...createLayer(`Layer ${merged.length}`), weight: 0 };
+    setLayers([...merged, layer]);
+    setNodes(layerToFlow(layer).nodes);
+    setEdges([]);
+    setActive(merged.length);
+    seenNodeIds.current.clear();
+  };
+
+  const removeLayer = (index) => {
+    if (index === 0) return; // the base layer is the animation itself
+    setDirty(true);
+    const merged = withCanvas().filter((_, i) => i !== index);
+    const nextActive = Math.min(active >= index ? active - 1 : active, merged.length - 1);
+    const flow = layerToFlow(merged[Math.max(nextActive, 0)]);
+    setLayers(merged);
+    setNodes(flow.nodes);
+    setEdges(flow.edges);
+    setActive(Math.max(nextActive, 0));
+    setMaskLayer(null);
+    seenNodeIds.current.clear();
+  };
+
+  const moveLayer = (index, delta) => {
+    const target = index + delta;
+    // Index 0 is structural — nothing may be reordered into or out of it.
+    if (index === 0 || target <= 0 || target >= layers.length) return;
+    setDirty(true);
+    const merged = withCanvas();
+    const [moved] = merged.splice(index, 1);
+    merged.splice(target, 0, moved);
+    setLayers(merged);
+    setActive(active === index ? target : active === target ? index : active);
+  };
+
+  const buildGraph = () => ({ version: 2, parameters, layers: withCanvas() });
 
   const save = async () => {
     const graph = buildGraph();
@@ -1127,12 +1713,33 @@ function AnimatorEditor({ animPath }) {
             drivenOptions={drivenOptions}
             onPickDriven={setPickedEntityId}
           />
+          <LayersSection
+            layers={layers}
+            active={active}
+            onSelect={selectLayer}
+            onChange={patchLayer}
+            onAdd={addLayer}
+            onRemove={removeLayer}
+            onMove={moveLayer}
+            onEditMask={setMaskLayer}
+            liveWeights={liveLayerWeights}
+          />
+          {maskLayer != null && layers[maskLayer] && (
+            <MaskEditor
+              mask={layers[maskLayer].mask}
+              bones={boneNames}
+              onChange={(mask) => patchLayer(maskLayer, { mask })}
+              onClose={() => setMaskLayer(null)}
+            />
+          )}
           {selectedNode && (
             <StateSection
               node={selectedNode}
               clipNames={clipNames}
+              parameters={parameters}
               onPatch={(patch) => patchState(selectedNode.id, patch)}
               onPreview={() => preview(selectedNode.data.state.name)}
+              live={liveBlendPoint(selectedNode.data.state, drivenComponent)}
             />
           )}
           {selectedEdge && (

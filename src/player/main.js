@@ -1,7 +1,6 @@
 import * as THREE from "three/webgpu";
 import {
   Engine,
-  deserializeScene,
   setAssetResolver,
   setScriptLoader,
   setAssetMetaLoader,
@@ -67,79 +66,98 @@ setScriptLoader(async (path) => {
   return entry;
 });
 
-function findSceneCamera(entities) {
-  for (const entity of entities) {
-    const cam = entity.getComponent("camera")?.camera;
-    if (cam) return cam;
-    const child = findSceneCamera(entity.children);
-    if (child) return child;
-  }
-  return null;
+/**
+ * The loading screen. Scenes now load at runtime (menu → level 1 → level 2),
+ * so this is not just a boot splash: it reappears for every `loadScene` the
+ * game performs and disappears when that scene is ready.
+ */
+function createLoadingScreen(engine) {
+  const root = document.getElementById("loading");
+  if (!root) return;
+  const bar = root.querySelector(".loading-bar-fill");
+  const label = root.querySelector(".loading-label");
+  const show = (visible) => root.classList.toggle("is-hidden", !visible);
+  const PHASE_LABELS = {
+    fetch: "Loading scene",
+    modules: "Starting systems",
+    preload: "Loading assets",
+    unload: "Clearing",
+    instantiate: "Building scene",
+  };
+
+  engine.on("scene-load-start", () => {
+    if (bar) bar.style.width = "0%";
+    show(true);
+  });
+  engine.on("scene-load-progress", ({ phase, progress, loaded, total }) => {
+    if (bar) bar.style.width = `${Math.round(progress * 100)}%`;
+    if (label) {
+      const counted = phase === "preload" && total > 1 ? ` ${loaded}/${total}` : "";
+      label.textContent = `${PHASE_LABELS[phase] ?? phase}${counted}`;
+    }
+  });
+  // One frame of grace so the scene's first render lands before the overlay
+  // lifts — otherwise the player sees a black flash between the two.
+  engine.on("scene-loaded", () => requestAnimationFrame(() => requestAnimationFrame(() => show(false))));
+  engine.on("scene-load-error", ({ path, error }) => {
+    if (label) label.textContent = `Failed to load ${path}: ${error?.message ?? error}`;
+  });
 }
 
-/**
- * Preload phase: assets the author marked "Preload" in the editor are fetched
- * before the scene deserializes, so they're in the browser's cache the moment
- * anything asks for them. Everything else stays on demand.
- *
- * Fetching (rather than fully decoding through each type's loader) is the
- * right level here: it removes the network round-trip, which is the part that
- * shows up as a hitch, without needing a decoder registry the player would
- * otherwise not have. Failures are logged and ignored — a missing preload
- * must not stop the game from starting.
- */
-async function preloadAssets(paths) {
-  if (!paths?.length) return;
-  const started = performance.now();
-  const results = await Promise.allSettled(
-    paths.map(async (path) => {
-      const res = await fetch(path);
-      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-      await res.arrayBuffer();
-    }),
-  );
-  const failed = results.filter((r) => r.status === "rejected");
-  for (const [index, result] of results.entries()) {
-    if (result.status === "rejected") {
-      console.warn(`Preload failed for ${paths[index]}: ${result.reason?.message ?? result.reason}`);
-    }
-  }
-  console.log(
-    `Preloaded ${paths.length - failed.length}/${paths.length} assets in ` +
-      `${Math.round(performance.now() - started)}ms`,
-  );
-}
+// The scene the build boots into. Also readable at its project-relative path
+// (the exporter ships both), so a script can reload the starting level.
+const START_SCENE = "scene.json";
 
 async function boot() {
   const engine = new Engine();
+  // Debugging convenience, and the handle test harnesses drive the build
+  // through: `__engine.loadScene("scenes/Level2.scene")` from a console is
+  // the fastest way to check a level transition in a real build.
+  globalThis.__engine = engine;
   await engine.init(document.getElementById("game"));
   // Start the render loop early so the canvas paints the background colour
   // immediately, instead of staying black until the scene is deserialized.
   // The loop is harmless on an empty scene — it just renders nothing.
   engine.start();
+  createLoadingScreen(engine);
 
-  const scene = await (await fetch("scene.json")).json();
+  // Build-level config rides along in the start scene: modules, the input
+  // snapshot and the exported page settings. The scene manager only cares
+  // about entities, so read these here (the fetch is served from cache when
+  // it loads the same file a moment later).
+  const config = await (await fetch(START_SCENE)).json();
+  // Collision layers before modules: the physics module reads this blob when
+  // it sets up, and every collider's layer resolves against it.
+  if (config.physics) engine.config.physicsLayers = config.physics;
   // Modules first: their components must exist before entities instantiate.
   // Rapier's setup now returns a placeholder and finishes its WASM init in
   // the background, so this await no longer blocks on the heavy work.
-  await applyEngineModules(engine, scene.modules ?? []);
-  // Preload before deserializing: components resolve their assets during
-  // attach, and by then the bytes are already local.
-  await preloadAssets(scene.preload);
+  await applyEngineModules(engine, config.modules ?? []);
   // Input config next — the manager is attached during init(), so swapping
   // the snapshot detaches/re-attaches to keep listeners consistent.
-  if (scene.input) engine.applyInput(scene.input);
-  await deserializeScene(engine, scene);
+  if (config.input) engine.applyInput(config.input);
 
   // Project settings embedded at export time.
-  if (scene.player?.title) document.title = scene.player.title;
-  if (scene.player?.pixelRatioCap) {
-    engine.setPixelRatio(Math.min(window.devicePixelRatio ?? 1, scene.player.pixelRatioCap));
+  if (config.player?.title) document.title = config.player.title;
+  // The build's quality preset. Set before the first scene loads so its
+  // `performance` block is clamped on the way in rather than applied at full
+  // cost for a frame and then lowered. `Engine.applySettings` re-applies the
+  // ceiling on every later scene load.
+  engine.config.quality = config.player?.quality ?? null;
+  // Saves: namespace + version before anything can call `engine.saves`, and
+  // hydrate preferences so a title screen can read the saved volume on frame 1.
+  engine.config.saveVersion = config.player?.saveVersion ?? 1;
+  engine.saves.setNamespace(config.player?.saveId || config.player?.title || "default");
+  await engine.prefs.hydrate();
+  if (config.player?.pixelRatioCap) {
+    engine.setPixelRatio(Math.min(window.devicePixelRatio ?? 1, config.player.pixelRatioCap));
   }
 
-  engine.camera =
-    findSceneCamera(engine.rootEntities) ??
-    new THREE.PerspectiveCamera(60, 1, 0.1, 1000);
+  // Everything past here goes through the same path a mid-game level change
+  // does — the boot scene is not a special case, which is what keeps
+  // `loadScene` honest.
+  await engine.loadScene(START_SCENE, { setCamera: true });
+  if (!engine.camera) engine.camera = new THREE.PerspectiveCamera(60, 1, 0.1, 1000);
 
   const resize = () => engine.setSize(window.innerWidth, window.innerHeight);
   window.addEventListener("resize", resize);

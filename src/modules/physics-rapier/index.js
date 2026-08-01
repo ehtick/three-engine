@@ -1,7 +1,9 @@
 import { RigidbodyComponent } from "./RigidbodyComponent.js";
 import { ColliderComponent } from "./ColliderComponent.js";
 import { CharacterControllerComponent } from "./CharacterControllerComponent.js";
+import { JointComponent } from "./JointComponent.js";
 import { PhysicsSystem } from "./PhysicsSystem.js";
+import { setPhysicsLayerConfig } from "./layerConfig.js";
 
 /** Filters the one-shot deprecation warning from `@dimforge/rapier3d-compat`
  *  that fires every time `RAPIER.init()` is called. Installed once per VM
@@ -38,12 +40,16 @@ export const physicsRapierModule = {
   category: "Physics",
   tags: ["physics", "rapier", "wasm", "3d", "rigidbody", "collider"],
   description:
-    "Rigid-body physics powered by Rapier: Rigidbody, Collider + Character " +
-    "Controller components, fixed-step simulation in play mode, collision/" +
-    "trigger script hooks, and raycasts.",
-  components: [RigidbodyComponent, ColliderComponent, CharacterControllerComponent],
+    "Rigid-body physics powered by Rapier: Rigidbody, Collider, Character " +
+    "Controller and Joint components, collision layers with a project-wide " +
+    "matrix, fixed-step simulation in play mode, collision/trigger script " +
+    "hooks, and ray/shape/overlap queries.",
+  components: [RigidbodyComponent, ColliderComponent, CharacterControllerComponent, JointComponent],
 
   setup(engine) {
+    // Layer names have to be readable by component schemas (the Inspector's
+    // Layer dropdown) before — and independently of — the Rapier world.
+    setPhysicsLayerConfig(engine.config?.physicsLayers);
     const ready = (async () => {
       const mod = await import("@dimforge/rapier3d-compat");
       const RAPIER = mod.default ?? mod;

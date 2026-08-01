@@ -299,6 +299,156 @@ const out = await page.evaluate(async () => {
     if (entity) engine.destroyEntity(entity);
   }
 
+  // === 8. sight: screenshot, camera, bounds, console =======================
+  //
+  // The renderer is live here (this harness runs headed on purpose), so these
+  // exercise the real capture path rather than a stub.
+  const probe = Editor.entities.create({
+    name: "SightProbe",
+    transform: { position: [0, 0, 0], scale: [2, 2, 2] },
+    components: [{ type: "mesh", props: { geometry: "box" } }],
+  });
+  await settle(600);
+
+  const resolvedBounds = await Editor.call("entity.getBounds", { id: probe.id });
+  report.bounds = {
+    empty: resolvedBounds?.empty,
+    // A unit box scaled 2x spans roughly -1..1 per axis; assert the order of
+    // magnitude, not an exact number, since the extent depends on the geometry
+    // the mesh component builds.
+    plausibleSize: Array.isArray(resolvedBounds?.size) && resolvedBounds.size.every((v) => v > 0.5 && v < 12),
+    hasCenter: Array.isArray(resolvedBounds?.center),
+  };
+
+  const camBefore = Editor.viewport.getCamera();
+  await Editor.call("viewport.focus", { id: probe.id });
+  const framed = Editor.viewport.getCamera();
+  report.focus = {
+    moved: JSON.stringify(camBefore.position) !== JSON.stringify(framed.position),
+    targetsProbe: framed.target.every((v) => Math.abs(v) < 0.5),
+  };
+
+  await Editor.call("viewport.setCamera", { position: [6, 5, 6], target: [0, 0, 0] });
+  const aimed = Editor.viewport.getCamera();
+  report.setCamera = { applied: aimed.position.map((v) => Math.round(v)).join(",") === "6,5,6" };
+
+  const shot = await Editor.viewport.screenshot({ width: 200, height: 120 });
+  const decoded = shot.__image?.base64 ? atob(shot.__image.base64) : "";
+  report.screenshot = {
+    hasImage: !!shot.__image?.base64,
+    mime: shot.__image?.mimeType,
+    size: `${shot.width}x${shot.height}`,
+    // A PNG opens with a fixed 8-byte signature; anything else means we
+    // captured something that is not an image.
+    isPng: decoded.slice(1, 4) === "PNG",
+    bytes: decoded.length,
+  };
+
+  /** Decodes a PNG data URL back to raw pixels so we can inspect the frame. */
+  const decodePng = async (base64) => {
+    const img = new Image();
+    await new Promise((resolve, reject) => {
+      img.onload = resolve;
+      img.onerror = reject;
+      img.src = `data:image/png;base64,${base64}`;
+    });
+    const canvas = document.createElement("canvas");
+    canvas.width = img.width;
+    canvas.height = img.height;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(img, 0, 0);
+    return { w: img.width, h: img.height, data: ctx.getImageData(0, 0, img.width, img.height).data };
+  };
+
+  /** How many distinct colours a row contains — 1 means a clean flat band. */
+  const rowColours = ({ w, data }, y) => {
+    const seen = new Set();
+    for (let x = 0; x < w; x++) {
+      const i = (y * w + x) * 4;
+      seen.add(`${data[i]},${data[i + 1]},${data[i + 2]}`);
+    }
+    return seen.size;
+  };
+
+  const frame = await decodePng(shot.__image.base64);
+  const allColours = new Set();
+  for (let i = 0; i < frame.data.length; i += 4) {
+    allColours.add(`${frame.data[i]},${frame.data[i + 1]},${frame.data[i + 2]}`);
+    if (allColours.size > 8) break;
+  }
+  // A lit box in front of the camera must not render as one flat colour —
+  // that is what an empty or failed capture looks like.
+  report.screenshotHasContent = allColours.size;
+
+  // WebGPU pads each readback row to a 256-byte boundary. If that padding is
+  // not stripped, the image is still a valid PNG of the right size with plenty
+  // of colours — it is just progressively sheared, and the error grows with
+  // each row. So check the LAST row: at 200px wide the padding is 224 bytes per
+  // row, and by row 119 a tight read would be ~26k bytes adrift, dragging the
+  // box into a band that should be pure background.
+  //
+  // 200 is chosen deliberately: 200*4 = 800 bytes, which pads to 1024. A width
+  // that happened to be a multiple of 64 would need no padding and the test
+  // would prove nothing.
+  report.screenshotBands = {
+    width: frame.w,
+    padded: (frame.w * 4) % 256 !== 0,
+    firstRowColours: rowColours(frame, 0),
+    lastRowColours: rowColours(frame, frame.h - 1),
+    midRowColours: rowColours(frame, Math.floor(frame.h / 2)),
+  };
+
+  globalThis.console.error("api-smoke console probe");
+  await settle(200);
+  const logs = Editor.console.read({ level: "error", limit: 30 });
+  report.consoleRead = {
+    isArray: Array.isArray(logs),
+    sawProbe: logs.some((entry) => /api-smoke console probe/.test(entry.message ?? "")),
+    shaped: logs.every((entry) => typeof entry.level === "string" && typeof entry.time === "string"),
+  };
+
+  Editor.entities.delete(probe.id);
+
+  // === 9. batch: many ops, one undo step ===================================
+  const undoBefore = Editor.history.get();
+  const batch = await Editor.batch("Build test rig", [
+    { op: "entity.create", args: { name: "BatchRoot" } },
+    { op: "entity.create", args: { name: "BatchChild", parentId: "$0" } },
+    { op: "component.add", args: { id: "$0", type: "mesh", props: { geometry: "box" } } },
+  ]);
+  const rootId = batch.results[0]?.id;
+  report.batch = {
+    ran: batch.ran,
+    noFailure: batch.failure === null,
+    collapsed: batch.undoSteps,
+    // "$0" must resolve to the id step 0 created, and the child must really be
+    // parented to it — that reference is the whole point of the op.
+    refResolved: Editor.entities.get(batch.results[1]?.id)?.parentId === rootId,
+    componentAttached: Editor.entities.get(rootId)?.components.some((c) => c.type === "mesh"),
+    label: Editor.history.get().undoLabel,
+  };
+
+  Editor.history.undo();
+  report.batchUndo = {
+    rootGone: !Editor.entities.live(rootId),
+    childGone: !Editor.entities.live(batch.results[1]?.id),
+    backToStart: Editor.history.get().undoLabel === undoBefore.undoLabel,
+  };
+
+  const failing = await Editor.batch("Half-broken", [
+    { op: "entity.create", args: { name: "BatchOk" } },
+    { op: "entity.create", args: { name: "BatchBad", parentId: "nope-not-an-id" } },
+    { op: "entity.create", args: { name: "BatchNeverRuns" } },
+  ]);
+  report.batchFailure = {
+    reported: failing.failure?.step === 1,
+    stopped: failing.ran === 2,
+    namesTheOp: failing.failure?.op === "entity.create",
+  };
+  Editor.history.undo();
+  report.batchPartialUndone = Editor.entities.all({ nameContains: "BatchOk" }).length === 0;
+
+
   // === 7. scene / project / play read-only ops =============================
   report.readers = {
     scene: typeof Editor.scene.get().name === "string",
@@ -382,6 +532,44 @@ check("onDrawGizmos is called while stopped", out.gizmos.hookCalled === true);
 check("the batched gizmo mesh exists", out.gizmos.meshExists === true);
 check("gizmo vertices reach the buffer", out.gizmos.verticesDrawn >= 192, `${out.gizmos.verticesDrawn} vertices`);
 
+// --- sight -------------------------------------------------------------------
+check("entity.getBounds returns real extents", out.bounds.empty === false && out.bounds.plausibleSize && out.bounds.hasCenter, JSON.stringify(out.bounds));
+check("viewport.focus moves the camera", out.focus.moved === true);
+check("…and centres on the entity", out.focus.targetsProbe === true);
+check("viewport.setCamera applies exactly", out.setCamera.applied === true);
+check("viewport.screenshot returns an image", out.screenshot.hasImage === true, `${out.screenshot.mime} ${out.screenshot.size}`);
+check("…that is really a PNG", out.screenshot.isPng === true, `${out.screenshot.bytes} bytes`);
+check("…at the requested size", out.screenshot.size === "200x120");
+check("…with scene content, not a flat fill", out.screenshotHasContent >= 2, `${out.screenshotHasContent} distinct colours (background + the probe box)`);
+check(
+  "…at a width whose rows DO need unpadding (or the next check is vacuous)",
+  out.screenshotBands.padded === true,
+  `${out.screenshotBands.width}px`,
+);
+check(
+  "…and is not sheared by WebGPU row padding",
+  // Top and bottom bands are empty background; the middle holds the box.
+  out.screenshotBands.firstRowColours <= 2 &&
+    out.screenshotBands.lastRowColours <= 2 &&
+    out.screenshotBands.midRowColours >= 2,
+  JSON.stringify(out.screenshotBands),
+);
+check("console.read returns shaped entries", out.consoleRead.isArray && out.consoleRead.shaped);
+check("…including errors the editor just logged", out.consoleRead.sawProbe === true);
+
+// --- batch -------------------------------------------------------------------
+check("batch runs every step", out.batch.ran === 3 && out.batch.noFailure, JSON.stringify(out.batch));
+check("…collapsing them into ONE undo entry", out.batch.collapsed === 3);
+check("…labelled for the user", out.batch.label === "Build test rig", out.batch.label);
+check("$N references resolve to earlier steps' ids", out.batch.refResolved === true);
+check("…so components land on the referenced entity", out.batch.componentAttached === true);
+check("one undo removes the whole batch", out.batchUndo.rootGone && out.batchUndo.childGone, JSON.stringify(out.batchUndo));
+check("…leaving history where it started", out.batchUndo.backToStart === true);
+check("a failing step is reported with its index", out.batchFailure.reported === true);
+check("…stops the rest by default", out.batchFailure.stopped === true);
+check("…and names the op that failed", out.batchFailure.namesTheOp === true);
+check("a partial batch is still undone in one step", out.batchPartialUndone === true);
+
 // --- read-only ops -----------------------------------------------------------
 check("scene.get reads the open scene", out.readers.scene === true);
 check("project.get reads the open project", out.readers.project === true);
@@ -389,7 +577,12 @@ check("play.get reports stopped", out.readers.play === true);
 check("history.get reports availability", out.readers.historyShape === true);
 
 // ---------------------------------------------------------------------------
-const hard = errors.filter((e) => !/WebGPU|GPUAdapter|deprecat|Failed to load resource/i.test(e));
+// "api-smoke console probe" is logged BY this harness, on purpose, to prove
+// console.read sees editor errors. Counting our own bait as a failure would
+// make the suite permanently red.
+const hard = errors.filter(
+  (e) => !/WebGPU|GPUAdapter|deprecat|Failed to load resource|api-smoke console probe/i.test(e),
+);
 if (hard.length) {
   console.log("\nconsole errors:");
   for (const e of hard.slice(0, 10)) console.log(`  ${e}`);

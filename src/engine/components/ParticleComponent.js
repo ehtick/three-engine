@@ -3,7 +3,6 @@ import {
   Fn,
   If,
   Loop,
-  deltaTime,
   float,
   hash,
   instanceIndex,
@@ -183,6 +182,13 @@ export class ParticleComponent extends Component {
       };
     }
 
+    // Simulation delta. NOT TSL's built-in `deltaTime`, which is the
+    // renderer's own frame time and knows nothing about `engine.timeScale` or
+    // `engine.paused` — particles would keep erupting through a pause menu and
+    // ignore bullet time. `#tick` writes `engine.deltaTime` into this each
+    // frame, so the GPU sim runs on game time like everything else.
+    const simDelta = uniform(0);
+
     const updateCompute = Fn(() => {
       const index = instanceIndex.toFloat();
       const position = positions.element(instanceIndex);
@@ -190,10 +196,10 @@ export class ParticleComponent extends Component {
       const age = ages.element(instanceIndex);
       const life = lifetimeOf(index);
 
-      age.addAssign(deltaTime);
+      age.addAssign(simDelta);
       // Respawn on death — or on birth (age just crossed 0), so a not-yet-born
       // particle that drifted while hidden snaps back to its spawn point.
-      const justBorn = age.greaterThanEqual(0).and(age.sub(deltaTime).lessThan(0));
+      const justBorn = age.greaterThanEqual(0).and(age.sub(simDelta).lessThan(0));
       If(age.greaterThanEqual(life).or(justBorn), () => {
         // time-derived salt → fresh randoms every respawn cycle
         const ctx = makeComputeCtx("spawn", time.mul(1e3));
@@ -204,9 +210,9 @@ export class ParticleComponent extends Component {
 
       if (sys.force) {
         const ctx = makeComputeCtx("update", float(77.7));
-        velocity.addAssign(sys.force(ctx).mul(deltaTime));
+        velocity.addAssign(sys.force(ctx).mul(simDelta));
       }
-      position.addAssign(velocity.mul(deltaTime));
+      position.addAssign(velocity.mul(simDelta));
 
       if (s.floor === "bounce") {
         If(position.y.lessThan(u.floorY).and(velocity.y.lessThan(0)), () => {
@@ -395,6 +401,7 @@ export class ParticleComponent extends Component {
       material,
       colliderField,
       collisionMatrices,
+      simDelta,
       lightRig,
       unregisterGiEmitter,
       initialized: false,
@@ -808,8 +815,12 @@ export class ParticleComponent extends Component {
     // command encoder / compute pass instead of one submit per dispatch.
     const queue = (this._computeQueue ??= []);
     queue.length = 0;
+    // Game time, so pause/slow-mo reach the GPU sim. Clamped: the first frame
+    // after a stall would otherwise teleport every particle along its velocity.
+    const simDt = Math.min(this.entity.engine.deltaTime ?? 0, 0.1);
     for (const sub of this.subsystems ?? []) {
       if (!sub.updateCompute) continue;
+      if (sub.simDelta) sub.simDelta.value = simDt;
       if (sub.collisionMatrices) {
         this.entity.object3D.updateWorldMatrix(true, false);
         const m = this.entity.object3D.matrixWorld;

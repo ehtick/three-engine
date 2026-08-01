@@ -30,6 +30,7 @@ export function rebuildRenderMesh(session) {
   session.meshObject.geometry = bufferGeometryFromMesh(session.mesh, tessellation);
   previous?.dispose?.();
   session.tessellation = tessellation;
+  session.refreshModifierPreview?.();
 }
 
 /**
@@ -50,6 +51,7 @@ export function refreshRenderPositions(session) {
   position.needsUpdate = true;
   meshObject.geometry.computeVertexNormals();
   meshObject.geometry.computeBoundingSphere();
+  session.refreshModifierPreview?.();
 }
 
 function setLinePositions(line, positions) {
@@ -192,10 +194,14 @@ export function refreshOverlays(session) {
 /** Applies the X-ray toggle to the surface and to depth testing on the dots. */
 export function applyXray(session) {
   const materials = Array.isArray(session.meshObject.material) ? session.meshObject.material : [session.meshObject.material];
+  const modifierCage = !!session.modifierPreviewObject?.visible;
   for (const material of materials) {
-    material.transparent = session.xray;
-    material.opacity = session.xray ? 0.38 : 1;
-    material.depthWrite = !session.xray;
+    // With a modifier preview the editable object is a pickable, invisible
+    // cage; the separate evaluated object supplies the surface. Making this
+    // material visible in X-ray would cover the evaluated result again.
+    material.transparent = modifierCage || session.xray;
+    material.opacity = modifierCage ? 0 : session.xray ? 0.38 : 1;
+    material.depthWrite = !modifierCage && !session.xray;
     material.needsUpdate = true;
   }
   for (const markers of [session.basePoints, session.vertexOverlay, session.activeOverlay]) {

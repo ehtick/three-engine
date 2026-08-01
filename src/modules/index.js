@@ -9,6 +9,7 @@ import { polyhavenModule } from "./polyhaven/index.js";
 import { ambientcgModule } from "./ambientcg/index.js";
 import { sketchfabModule } from "./sketchfab/index.js";
 import { giModule } from "./gi/index.js";
+import { navigationModule } from "./navigation/index.js";
 /**
  * Built-in module catalog. Importing this file registers every definition;
  * nothing runs until a host enables a module on an engine (editor: Modules
@@ -27,5 +28,6 @@ registerModuleDefinition(polyhavenModule);
 registerModuleDefinition(ambientcgModule);
 registerModuleDefinition(sketchfabModule);
 registerModuleDefinition(giModule);
+registerModuleDefinition(navigationModule);
 
-export { physicsRapierModule, dracoModule, basisModule, terrainModule, virtualGeometryModule, postprocessingModule, polyhavenModule, ambientcgModule, sketchfabModule, giModule };
+export { physicsRapierModule, dracoModule, basisModule, terrainModule, virtualGeometryModule, postprocessingModule, polyhavenModule, ambientcgModule, sketchfabModule, giModule, navigationModule };

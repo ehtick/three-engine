@@ -474,6 +474,88 @@ const failed = results.filter((r) => !r.ok);
 // the favicon does not — filtering the console text alone can't tell them
 // apart, and blanket-ignoring "Failed to load resource" would hide a genuinely
 // missing module.
+// --- Build Settings panel ----------------------------------------------------
+//
+// A throw anywhere in this panel blanks the whole thing (React unmounts the
+// subtree), and the panel is the only place several build decisions can be
+// made — so "it renders and its controls act" is worth a check that no
+// headless test can make. The seeded project root above is what makes it
+// render at all; without one it is a placeholder.
+await page.evaluate(async () => {
+  const { openPanel } = await globalThis.__importLive("/src/editor/EditorShell.jsx");
+  openPanel("build");
+});
+await wait(1500);
+const buildPanel = await page.evaluate(() => {
+  const headers = [...document.querySelectorAll(".scene-settings-panel .section-header")].map((h) =>
+    h.textContent.trim(),
+  );
+  const panel = [...document.querySelectorAll(".scene-settings-panel")].find((p) =>
+    [...p.querySelectorAll(".section-header")].some((h) => h.textContent.trim() === "Target"),
+  );
+  if (!panel) return { headers, found: false };
+  const selects = [...panel.querySelectorAll("select")];
+  return {
+    found: true,
+    headers: [...panel.querySelectorAll(".section-header")].map((h) => h.textContent.trim()),
+    targets: [...(selects[0]?.options ?? [])].map((o) => o.value),
+    qualityOptions: [...(selects.find((s) => [...s.options].some((o) => o.value === "ultra"))?.options ?? [])].map(
+      (o) => o.value,
+    ),
+    buttons: [...panel.querySelectorAll(".panel-toolbar button")].map((b) => b.textContent.trim()),
+    colorFields: panel.querySelectorAll('input[type="color"]').length,
+    // Compression toggles are disabled while their module is off — the
+    // alternative (an enabled checkbox that silently does nothing) is the bug
+    // this asserts against.
+    disabledToggles: panel.querySelectorAll('input[type="checkbox"]:disabled').length,
+  };
+});
+check("the Build panel renders", buildPanel.found, JSON.stringify(buildPanel.headers));
+if (buildPanel.found) {
+  check(
+    "it has every section",
+    ["Target", "Scenes", "Quality", "Presentation", "Compression"].every((h) => buildPanel.headers.includes(h)),
+    buildPanel.headers.join(", "),
+  );
+  check(
+    "all three targets are offered",
+    ["web", "zip", "desktop"].every((t) => buildPanel.targets.includes(t)),
+    buildPanel.targets.join(","),
+  );
+  check(
+    "the quality presets are offered",
+    buildPanel.qualityOptions.includes("low") && buildPanel.qualityOptions.includes("ultra"),
+    buildPanel.qualityOptions.join(","),
+  );
+  check(
+    "Build and Build & Run are both reachable",
+    buildPanel.buttons.some((b) => /^Build/.test(b)) && buildPanel.buttons.some((b) => /Run/.test(b)),
+    buildPanel.buttons.join(" | "),
+  );
+  check("the loading screen has its colour pickers", buildPanel.colorFields === 2, String(buildPanel.colorFields));
+  check(
+    "compression toggles are disabled while their modules are off",
+    buildPanel.disabledToggles === 2,
+    String(buildPanel.disabledToggles),
+  );
+
+  // Changing the target must not throw — each one takes a different branch in
+  // the report/preview wiring.
+  const switched = await page.evaluate(async () => {
+    const panel = [...document.querySelectorAll(".scene-settings-panel")].find((p) =>
+      [...p.querySelectorAll(".section-header")].some((h) => h.textContent.trim() === "Target"),
+    );
+    const select = panel.querySelector("select");
+    for (const value of ["zip", "desktop", "web"]) {
+      select.value = value;
+      select.dispatchEvent(new Event("change", { bubbles: true }));
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    return !!panel.querySelector("select");
+  });
+  check("switching between targets keeps the panel alive", switched === true);
+}
+
 // --- opening panels must work from ANY copy of EditorShell -------------------
 //
 // Regression for a bug that presented as "clicking View -> <panel> does

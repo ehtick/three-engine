@@ -108,6 +108,14 @@ defineOp({
     },
   },
   run({ name = "Entity", parentId, transform, components = [] }) {
+    // `CreateEntityCommand` resolves an unknown parentId to null and silently
+    // creates a root entity. That is fine for the inspector, which can only
+    // pass ids it just read, and wrong for an automated caller: a stale or
+    // mistyped id produces an entity in the wrong place with nothing to
+    // indicate it. Fail loudly instead.
+    if (parentId && !engine.getEntity(parentId)) {
+      throw new Error(`No entity with id "${parentId}" to parent to.`);
+    }
     const command = new CreateEntityCommand({ name, parentId, transform, components });
     commandBus.execute(command);
     return describeEntity(mustGet(command.entityId));
