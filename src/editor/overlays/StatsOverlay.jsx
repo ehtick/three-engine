@@ -40,6 +40,7 @@ const COLLAPSED_STORAGE_KEY = "engine.viewport.stats.collapsed";
 const EMPTY_READOUT = {
   fps: 0,
   frameMs: 0,
+  workMs: 0,
   cpuLoadPct: 0,
   renderMs: 0,
   gpuLoadPct: 0,
@@ -180,8 +181,8 @@ export function StatsOverlay({ forceVisible = false }) {
           <Section title="Performance" />
           <Row
             label="CPU"
-            value={formatMs(r.frameMs)}
-            tone={loadClass(r.frameMs)}
+            value={formatMs(r.workMs || r.frameMs)}
+            tone={loadClass(r.workMs || r.frameMs)}
           />
           {/* Real GPU frame time when WebGPU timestamp queries are
               available (gpuMs > 0); CPU-side submit time otherwise. The

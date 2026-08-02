@@ -1987,6 +1987,7 @@ body.macro-active .viewport-canvas {
   flex-direction: column;
   height: 100%;
   background: var(--bg-1);
+  contain: layout paint style;
 }
 
 .scene-label {
@@ -2299,6 +2300,107 @@ body.macro-active .viewport-canvas {
   overflow-y: auto;
   padding-bottom: 12px;
   background: var(--bg-1);
+  contain: layout paint style;
+}
+
+.browser-preview-launcher {
+  position: relative;
+  display: flex;
+  flex: 0 0 auto;
+  z-index: 12;
+}
+
+.browser-preview-endpoints {
+  position: absolute;
+  left: calc(100% - 1px);
+  top: 0;
+  box-sizing: border-box;
+  height: 25px;
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  padding: 0 6px 0 5px;
+  border: 1px solid var(--border);
+  border-left: 0;
+  border-radius: 0 var(--r-input) var(--r-input) 0;
+  background: rgba(20, 21, 25, 0.88);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  box-shadow: 3px 2px 8px rgba(0, 0, 0, 0.25);
+  opacity: 0;
+  transform: translateX(-8px);
+  pointer-events: none;
+  transition: opacity 120ms ease, transform 150ms ease;
+}
+
+.browser-preview-launcher.is-active:hover > .toolbar-btn.active,
+.browser-preview-launcher.is-active:focus-within > .toolbar-btn.active {
+  border-radius: var(--r-input) 0 0 var(--r-input);
+  background: rgba(20, 21, 25, 0.88);
+  border-color: var(--border);
+}
+
+.browser-preview-launcher.is-active:hover .browser-preview-endpoints,
+.browser-preview-launcher.is-active:focus-within .browser-preview-endpoints {
+  opacity: 1;
+  transform: translateX(0);
+  pointer-events: auto;
+}
+
+.browser-preview-endpoint {
+  width: 25px;
+  height: 25px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: color 100ms ease, background 100ms ease;
+}
+
+.browser-preview-endpoint:hover,
+.browser-preview-endpoint:focus-visible {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.09);
+  outline: none;
+}
+
+.browser-preview-qr-popover {
+  position: absolute;
+  top: calc(100% + 7px);
+  right: 0;
+  width: 108px;
+  padding: 6px;
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.48);
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(-5px) scale(0.96);
+  transform-origin: top right;
+  pointer-events: none;
+  transition: opacity 100ms ease, transform 130ms ease, visibility 0s linear 130ms;
+}
+
+.browser-preview-qr-popover img {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.browser-preview-qr:hover .browser-preview-qr-popover,
+.browser-preview-qr:focus .browser-preview-qr-popover {
+  opacity: 1;
+  visibility: visible;
+  transform: translateY(0) scale(1);
+  transition-delay: 0s;
+}
+
+/* Large inspectors can contain hundreds of fields. Sections below the scroll
+   viewport do not need layout or paint until the user approaches them. */
+.inspector-panel > .inspector-section {
+  content-visibility: auto;
+  contain-intrinsic-block-size: 180px;
 }
 
 .inspector-panel.empty,

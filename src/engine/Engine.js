@@ -130,6 +130,11 @@ export class Engine extends EventEmitter {
     // True between start() and stop(); used by the renderer-rebuild path so
     // the animation loop re-attaches to a freshly-recreated renderer.
     this.loopActive = false;
+    // Optional host-side pacing. Runtime games leave this at zero; the editor
+    // uses it only while not playing to leave main-thread slices for React and
+    // pointer/keyboard events when a viewport frame becomes expensive.
+    this.frameRateLimit = 0;
+    this._lastFrameStart = -Infinity;
     // Bumped every time a renderer rebuild is requested. Each in-flight
     // #rebuildRenderer captures the token at entry; if a newer rebuild
     // superseded it while `init()` was awaiting, the older one aborts
@@ -631,11 +636,17 @@ export class Engine extends EventEmitter {
   start() {
     this.loopActive = true;
     this.renderer.setAnimationLoop(() => this.#tick());
-    // Best-effort: kick the AudioContext on play start so audio is ready
-    // by the first tick. If a user gesture is required and absent, the
-    // context's `state === "suspended"` status will hold; the system
-    // installs a one-shot pointer listener to resume it.
-    this.audio.ensureContext?.().then(() => this.audio.resumeIfNeeded?.());
+    // AudioContext creation stays behind AudioSystem's first-gesture handler.
+    // Eager creation here violates browser autoplay policy on a freshly
+    // opened preview and produces a warning even when the scene is silent.
+  }
+
+  setFrameRateLimit(fps = 0) {
+    const next = Number.isFinite(fps) && fps > 0 ? Math.max(1, fps) : 0;
+    if (next === this.frameRateLimit) return;
+    this.frameRateLimit = next;
+    // Let the next frame through immediately after a policy change.
+    this._lastFrameStart = -Infinity;
   }
 
   stop() {
@@ -644,6 +655,14 @@ export class Engine extends EventEmitter {
   }
 
   #tick() {
+    const frameStarted = performance.now();
+    if (this.frameRateLimit > 0) {
+      const interval = 1000 / this.frameRateLimit;
+      // A small tolerance avoids a nominal 30 fps cap becoming 20 fps because
+      // two 16.6 ms RAF intervals land just below 33.333 due to timer jitter.
+      if (frameStarted - this._lastFrameStart + 0.75 < interval) return;
+      this._lastFrameStart = frameStarted;
+    }
     this.timer.update();
     // Wall-clock delta, clamped: a backgrounded tab or a compile stall would
     // otherwise hand physics a multi-second step to tunnel through.
@@ -812,6 +831,7 @@ export class Engine extends EventEmitter {
     // must temporarily disable `autoClear` (and re-enable it) to preserve
     // the main scene underneath.
     for (const fn of this.postRenderCallbacks) fn();
+    this.stats.recordFrameWorkMs(performance.now() - frameStarted);
   }
 
   /**

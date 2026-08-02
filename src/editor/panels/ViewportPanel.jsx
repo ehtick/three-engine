@@ -1,9 +1,12 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { Play, Square, Pause, StepForward, Move, Rotate3d, Scale3d, Layers as LayersIcon, Crosshair } from "lucide-react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Play, Square, Pause, StepForward, Move, Rotate3d, Scale3d, Layers as LayersIcon, Crosshair, Globe2, Monitor, Wifi, QrCode } from "lucide-react";
+import qrcode from "qrcode-generator";
 import * as THREE from "three/webgpu";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
-import { ensureEngine, engine } from "../engineInstance.js";
+import { ensureEngine, engine, isEngineReady } from "../engineInstance.js";
+import { installEditorFramePacing } from "../editorFramePacing.js";
+import { openBrowserPreview, openBrowserPreviewUrl, stopBrowserPreview } from "../browserPreview.js";
 import { DEBUG_LAYER, EDITOR_LAYER } from "../../engine/editorLayers.js";
 import { StatsOverlay } from "../overlays/StatsOverlay.jsx";
 import { useSelectionStore } from "../store/selectionStore.js";
@@ -53,7 +56,7 @@ import { extOf, MODEL_EXTENSIONS, TEXTURE_EXTENSIONS, SCRIPT_EXTENSIONS, MATERIA
 import { basename, useProjectStore } from "../store/projectStore.js";
 import { getEditorCameraStorageKey, loadEditorCamera, saveEditorCamera } from "../cameraPrefs.js";
 import { usePlayStore } from "../store/playStore.js";
-import { toggle as togglePlay, togglePaused, stepFrame } from "../playMode.js";
+import { toggle as togglePlay, stop as stopPlay, togglePaused, stepFrame } from "../playMode.js";
 import { useAssetDrop } from "../assetDrag.js";
 import { instantiatePrefab } from "../prefab.js";
 import { getProjectSettings, onProjectSettingsApplied, applyProjectSettings } from "../projectSettings.js";
@@ -392,6 +395,7 @@ async function ensureViewport() {
       });
 
       engine.start();
+      installEditorFramePacing();
       // Renderer-side project settings (pixel ratio cap) can only apply now.
       applyProjectSettings().catch(() => {});
       return viewport.backend;
@@ -893,8 +897,7 @@ const PREVIEW_ASPECT = 16 / 9;
 const PREVIEW_MARGIN = 18; // px from the corner
 
 class CameraPreview {
-  constructor(renderer) {
-    this.renderer = renderer;
+  constructor() {
     this.camera = null;
     this.component = null; // CameraComponent reference — drives showPreview flag
     this.visible = false;
@@ -921,6 +924,25 @@ class CameraPreview {
   dispose() {
     this.disposed = true;
     if (this.frame) this.frame.remove();
+  }
+
+  /**
+   * ALWAYS the engine's CURRENT renderer, never a captured one.
+   *
+   * `Engine.#rebuildRenderer` disposes the WebGPURenderer and constructs a new
+   * one whenever a construction-time option changes (MSAA/antialias/alpha are
+   * frozen at init). A captured reference survives that as a DISPOSED renderer,
+   * and the first symptom is neither a blank preview nor a clear error — it is
+   * an exception from deep inside the backend on every single frame:
+   *
+   *   Failed to read the 'querySet' property from 'GPURenderPassTimestampWrites'
+   *
+   * because disposing the renderer nulls its timestamp query pool's `querySet`
+   * while this pass keeps asking it to bracket a render pass. Reading the
+   * renderer per frame costs a property lookup and cannot go stale.
+   */
+  get renderer() {
+    return isEngineReady() ? engine.renderer : null;
   }
 
   renderFrame() {
@@ -1046,7 +1068,7 @@ function restoreHidden(hidden) {
 function setupCameraPreview() {
   if (!engine.renderer || !viewport.canvas) return;
   if (viewport.cameraPreview) return;
-  viewport.cameraPreview = new CameraPreview(engine.renderer);
+  viewport.cameraPreview = new CameraPreview();
 
   engine.onPostRender(() => {
     viewport.cameraPreview?.renderFrame();
@@ -3704,6 +3726,77 @@ export function ViewportPanel() {
   // subscribeLayers pub-sub.
   const [layers, setLayers] = useState(viewport.layers);
   const [layersOpen, setLayersOpen] = useState(false);
+  const [browserPreview, setBrowserPreview] = useState({ busy: false, message: "", urls: null });
+  const browserPreviewQr = useMemo(() => {
+    const url = browserPreview.urls?.lanUrl;
+    if (!url) return "";
+    const qr = qrcode(0, "M");
+    qr.addData(url);
+    qr.make();
+    const svg = qr.createSvgTag({ cellSize: 3, margin: 2, scalable: true });
+    return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+  }, [browserPreview.urls?.lanUrl]);
+
+  const launchBrowserPreview = async () => {
+    if (browserPreview.busy) return;
+    if (browserPreview.urls) {
+      setBrowserPreview((state) => ({ ...state, busy: true, message: "Stopping browser preview…" }));
+      try {
+        await stopBrowserPreview(browserPreview.urls.report?.contentDir);
+        setBrowserPreview({ busy: false, message: "", urls: null });
+      } catch (error) {
+        console.error(`Could not stop browser preview: ${error?.message ?? error}`);
+        setBrowserPreview((state) => ({
+          ...state,
+          busy: false,
+          message: `Could not stop preview: ${error?.message ?? error}`,
+        }));
+      }
+      return;
+    }
+    setBrowserPreview({ busy: true, message: "Building browser preview…", urls: null });
+    try {
+      // Export the authored snapshot, never a scene after gameplay scripts or
+      // physics have mutated it. This also makes the button useful while the
+      // user is already testing in the viewport.
+      if (playing) {
+        setBrowserPreview({ busy: true, message: "Stopping Play mode…", urls: null });
+        await stopPlay();
+      }
+      const result = await openBrowserPreview({
+        onProgress: ({ message }) => setBrowserPreview((state) => ({ ...state, message })),
+      });
+      if (result) {
+        setBrowserPreview({
+          busy: false,
+          message: result.openError
+            ? `Live: ${result.localUrl} (browser launch failed; click to copy)`
+            : result.lanUrl
+              ? `Live Wi-Fi (HTTPS; accept certificate once): ${result.lanUrl}`
+              : `Live: ${result.localUrl}`,
+          urls: result,
+        });
+      } else {
+        setBrowserPreview({ busy: false, message: "", urls: null });
+      }
+    } catch (error) {
+      console.error(`Browser preview failed: ${error?.message ?? error}`);
+      setBrowserPreview({ busy: false, message: `Preview failed: ${error?.message ?? error}`, urls: null });
+    }
+  };
+
+  const openPreviewEndpoint = async (url) => {
+    try {
+      await openBrowserPreviewUrl(url);
+    } catch (error) {
+      console.error(`Could not open preview URL ${url}: ${error?.message ?? error}`);
+      navigator.clipboard?.writeText(url).catch(() => {});
+      setBrowserPreview((state) => ({
+        ...state,
+        message: `Could not open URL; copied to clipboard: ${url}`,
+      }));
+    }
+  };
 
   const dropRef = useAssetDrop({
     accepts: [...MODEL_EXTENSIONS, ...TEXTURE_EXTENSIONS, ...SCRIPT_EXTENSIONS, ...MATERIAL_EXTENSIONS, ...PREFAB_EXTENSIONS],
@@ -3813,6 +3906,14 @@ export function ViewportPanel() {
     // camera component's own "show preview" flag — the label is the visible
     // counterpart of the PIP, so they appear/disappear together.
     const refreshPreviewLabel = () => {
+      // The engine resolves asynchronously and this panel's mount effect can
+      // beat it (reliably so after a page reload with a persisted dockview
+      // layout). The `engine` proxy THROWS during that window, and a throw
+      // inside a mount effect unmounts the whole React tree — so the symptom
+      // is not an error banner but a viewport whose canvas never appears.
+      // Bail quietly; the deferred subscribe below re-runs this the moment
+      // the engine is up, so the label is never left stale.
+      if (!isEngineReady()) return;
       if (engine.playing) {
         setPreviewEntityName(null);
         return;
@@ -3840,15 +3941,27 @@ export function ViewportPanel() {
     };
     refreshPreviewLabel();
     const unsubSel = useSelectionStore.subscribe(refreshPreviewLabel);
-    const unsubPlay = engine.on("play-changed", refreshPreviewLabel);
+    // Engine-bound subscriptions are DEFERRED for the same reason the guard
+    // above exists: `engine.on(...)` would throw if the engine hasn't resolved,
+    // and here that throw is unrecoverable (it happens during the effect body,
+    // so React tears the tree down instead of retrying).
+    //
     // Re-evaluate preview visibility/label when any camera component prop
     // changes (the user toggled "Show preview" / follow checkboxes in the
     // inspector). The mirror in sceneStore doesn't refresh on prop
     // changes, so the only way to update the React-side label and the
     // hidden DOM frame is to listen for the engine's component-changed
     // signal emitted from Component.setProp.
-    const unsubProp = engine.on("component-changed", (info) => {
-      if (info.componentType !== "camera") return;
+    let unsubPlay = null;
+    let unsubProp = null;
+    let previewSubsCancelled = false;
+    ensureEngine().then((eng) => {
+      if (previewSubsCancelled) return;
+      unsubPlay = eng.on("play-changed", refreshPreviewLabel);
+      unsubProp = eng.on("component-changed", (info) => {
+        if (info.componentType !== "camera") return;
+        refreshPreviewLabel();
+      });
       refreshPreviewLabel();
     });
 
@@ -3886,8 +3999,11 @@ export function ViewportPanel() {
       modeListeners.delete(onMode);
       macroListeners.delete(onMacro);
       unsubSel();
-      unsubPlay();
-      unsubProp();
+      // Null when the effect is torn down before the engine resolved — the
+      // flag stops the pending `.then` from subscribing after unmount.
+      previewSubsCancelled = true;
+      unsubPlay?.();
+      unsubProp?.();
       unsubOwner();
       window.removeEventListener("beforeunload", flushCameraPrefs);
       flushCameraPrefs();
@@ -3962,6 +4078,65 @@ export function ViewportPanel() {
             </button>
           </>
         )}
+        <div className={`browser-preview-launcher ${browserPreview.urls ? "is-active" : ""}`}>
+          <button
+            className={`toolbar-btn icon-only ${browserPreview.urls ? "active" : ""}`}
+            disabled={!rootPath || browserPreview.busy}
+            title={browserPreview.urls
+              ? "Stop browser preview server"
+              : browserPreview.message || (playing
+                ? "Stop Play mode, then build and open in the browser"
+                : "Build and serve on localhost and local Wi-Fi over HTTPS")}
+            onClick={launchBrowserPreview}
+          >
+            <Globe2 size={13} />
+          </button>
+          {browserPreview.urls && (
+            <div className="browser-preview-endpoints" aria-label="Browser preview links">
+              {browserPreview.urls.lanUrl && (
+                <span
+                  className="browser-preview-endpoint"
+                  role="button"
+                  tabIndex={0}
+                  title={`Open Wi-Fi HTTPS preview\n${browserPreview.urls.lanUrl}\nAccept the local certificate once on this device.`}
+                  onClick={() => openPreviewEndpoint(browserPreview.urls.lanUrl)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") openPreviewEndpoint(browserPreview.urls.lanUrl);
+                  }}
+                >
+                  <Wifi size={13} />
+                </span>
+              )}
+              {browserPreview.urls.localUrl && (
+                <span
+                  className="browser-preview-endpoint"
+                  role="button"
+                  tabIndex={0}
+                  title={`Open localhost\n${browserPreview.urls.localUrl}`}
+                  onClick={() => openPreviewEndpoint(browserPreview.urls.localUrl)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") openPreviewEndpoint(browserPreview.urls.localUrl);
+                  }}
+                >
+                  <Monitor size={13} />
+                </span>
+              )}
+              {browserPreviewQr && (
+                <span
+                  className="browser-preview-endpoint browser-preview-qr"
+                  tabIndex={0}
+                  title="Show Wi-Fi QR code"
+                  aria-label="Show Wi-Fi preview QR code"
+                >
+                  <QrCode size={13} />
+                  <span className="browser-preview-qr-popover">
+                    <img src={browserPreviewQr} alt={`QR code for ${browserPreview.urls.lanUrl}`} />
+                  </span>
+                </span>
+              )}
+            </div>
+          )}
+        </div>
         {[
           ["translate", "Move (G)", Move],
           ["rotate", "Rotate (R)", Rotate3d],

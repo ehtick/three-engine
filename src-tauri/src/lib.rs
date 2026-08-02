@@ -23,7 +23,11 @@ async fn compress_texture_basis(
     path: String,
 ) -> Result<BasisCompressionInfo, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let exe_name = if cfg!(windows) { "basisu.exe" } else { "basisu" };
+        let exe_name = if cfg!(windows) {
+            "basisu.exe"
+        } else {
+            "basisu"
+        };
         let platform_dir = match (std::env::consts::OS, std::env::consts::ARCH) {
             ("windows", "x86_64") => "win32-x64",
             ("linux", "x86_64") => "linux-x64",
@@ -43,7 +47,10 @@ async fn compress_texture_basis(
         if let Ok(resources) = app.path().resource_dir() {
             candidates.insert(
                 0,
-                resources.join("basisu/bin").join(platform_dir).join(exe_name),
+                resources
+                    .join("basisu/bin")
+                    .join(platform_dir)
+                    .join(exe_name),
             );
         }
         let encoder = candidates
@@ -208,11 +215,28 @@ fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<u64> {
         if entry.file_type()?.is_dir() {
             copied += copy_dir(&entry.path(), &dest)?;
         } else {
-            fs::copy(entry.path(), &dest)?;
-            copied += 1;
+            copied += copy_file_if_changed(&entry.path(), &dest)? as u64;
         }
     }
     Ok(copied)
+}
+
+/// Copies one file unless the destination is already at least as new and has
+/// the same byte length. Browser preview rebuilds run frequently; avoiding
+/// unchanged multi-megabyte geometry/texture copies is what keeps them quick.
+fn copy_file_if_changed(src: &Path, dest: &Path) -> std::io::Result<bool> {
+    let source_meta = fs::metadata(src)?;
+    if let Ok(dest_meta) = fs::metadata(dest) {
+        let source_modified = source_meta.modified().ok();
+        let dest_modified = dest_meta.modified().ok();
+        if source_meta.len() == dest_meta.len()
+            && matches!((source_modified, dest_modified), (Some(s), Some(d)) if d >= s)
+        {
+            return Ok(false);
+        }
+    }
+    fs::copy(src, dest)?;
+    Ok(true)
 }
 
 /// Copies the bundled three.js type declarations (`@types/three`) into
@@ -262,10 +286,16 @@ fn player_template_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, Str
     if let Ok(resources) = app.path().resource_dir() {
         candidates.insert(0, resources.join("dist-player"));
     }
-    candidates
+    let candidate = candidates
         .into_iter()
         .find(|p| p.join("index.html").exists())
-        .ok_or_else(|| "Player template not found — run `npm run build:player` first".into())
+        .ok_or_else(|| {
+            "Player template not found — run `npm run build:player` first".to_string()
+        })?;
+    // Native dialogs and plugins may change the process working directory.
+    // Resolve the dev fallback now so the later recursive copy cannot lose it.
+    fs::canonicalize(&candidate)
+        .map_err(|e| format!("resolve player template {}: {e}", candidate.display()))
 }
 
 /// Reads one file out of the player template (the exporter rewrites
@@ -293,21 +323,34 @@ fn export_game(
 ) -> Result<(), String> {
     let player = player_template_dir(&app)?;
     let out = Path::new(&out_dir);
-    copy_dir(&player, out).map_err(|e| e.to_string())?;
-    fs::write(out.join("scene.json"), scene_json).map_err(|e| e.to_string())?;
+    copy_dir(&player, out).map_err(|e| {
+        format!(
+            "copy player template {} to {}: {e}",
+            player.display(),
+            out.display()
+        )
+    })?;
+    let scene_path = out.join("scene.json");
+    fs::write(&scene_path, scene_json)
+        .map_err(|e| format!("write {}: {e}", scene_path.display()))?;
     for (src, rel) in assets {
         let dest = out.join(&rel);
         if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("create asset directory {}: {e}", parent.display()))?;
         }
-        fs::copy(&src, &dest).map_err(|e| format!("copy {src}: {e}"))?;
+        copy_file_if_changed(Path::new(&src), &dest)
+            .map_err(|e| format!("copy asset {src} to {}: {e}", dest.display()))?;
     }
     for (rel, contents) in files {
         let dest = out.join(&rel);
         if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            fs::create_dir_all(parent).map_err(|e| {
+                format!("create generated-file directory {}: {e}", parent.display())
+            })?;
         }
-        fs::write(&dest, contents).map_err(|e| format!("write {rel}: {e}"))?;
+        fs::write(&dest, contents)
+            .map_err(|e| format!("write generated file {}: {e}", dest.display()))?;
     }
     Ok(())
 }
@@ -339,9 +382,14 @@ fn zip_dir(dir: String, dest: String) -> Result<u64, String> {
     let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
     let mut written = 0u64;
 
-    for entry in walkdir::WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+    for entry in walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
         let path = entry.path();
-        let Ok(rel) = path.strip_prefix(root) else { continue };
+        let Ok(rel) = path.strip_prefix(root) else {
+            continue;
+        };
         if rel.as_os_str().is_empty() {
             continue;
         }
@@ -499,6 +547,40 @@ fn frontend_log(message: String) {
     println!("[frontend] {message}");
 }
 
+/// Fallback for Windows machines where the opener plugin cannot resolve the
+/// default-browser association (it reports os error 3 even for a valid URL).
+/// Restricted to the preview server on localhost so this is not a general
+/// frontend-controlled process launcher.
+#[tauri::command]
+fn open_browser_url(url: String) -> Result<(), String> {
+    validate_browser_preview_url(&url)?;
+
+    #[cfg(target_os = "windows")]
+    let mut command = std::process::Command::new("explorer.exe");
+    #[cfg(target_os = "macos")]
+    let mut command = std::process::Command::new("open");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = std::process::Command::new("xdg-open");
+
+    command
+        .arg(&url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("could not launch the system browser: {e}"))
+}
+
+fn validate_browser_preview_url(value: &str) -> Result<(), String> {
+    let parsed = url::Url::parse(value).map_err(|e| format!("invalid preview URL: {e}"))?;
+    if parsed.scheme() == "http"
+        && parsed.host_str() == Some("localhost")
+        && parsed.port().is_some()
+    {
+        Ok(())
+    } else {
+        Err("browser fallback only opens the localhost preview server".to_string())
+    }
+}
+
 /// Proxies a GET request to `url` and returns the response body as UTF-8 text.
 /// Used by the AmbientCG asset browser: `ambientcg.com`'s API and download
 /// endpoints don't send CORS headers, so a direct `fetch` from the webview
@@ -561,7 +643,10 @@ async fn fetch_bytes(url: String) -> Result<tauri::ipc::Response, String> {
         let mut current = url;
         for _ in 0..5 {
             let resp = ureq::get(&current)
-                .set("User-Agent", "three-engine/0.1 (+https://github.com/three-engine)")
+                .set(
+                    "User-Agent",
+                    "three-engine/0.1 (+https://github.com/three-engine)",
+                )
                 .call()
                 .map_err(|e| format!("fetch {current}: {e}"))?;
             if resp.status() >= 300 && resp.status() < 400 {
@@ -571,8 +656,8 @@ async fn fetch_bytes(url: String) -> Result<tauri::ipc::Response, String> {
                 current = if loc.starts_with("http://") || loc.starts_with("https://") {
                     loc.to_string()
                 } else {
-                    let base = url::Url::parse(&current)
-                        .map_err(|e| format!("bad url {current}: {e}"))?;
+                    let base =
+                        url::Url::parse(&current).map_err(|e| format!("bad url {current}: {e}"))?;
                     base.join(&loc)
                         .map_err(|e| format!("resolve {loc}: {e}"))?
                         .to_string()
@@ -629,7 +714,7 @@ async fn fetch_sketchfab_text(url: String, token: Option<String>) -> Result<Stri
 
 #[cfg(test)]
 mod tests {
-    use super::{percent_decode, zip_dir};
+    use super::{percent_decode, validate_browser_preview_url, zip_dir};
     use std::fs;
 
     #[test]
@@ -643,6 +728,14 @@ mod tests {
         );
         assert_eq!(percent_decode("plain.png").unwrap(), "plain.png");
         assert!(percent_decode("truncated%2").is_err());
+    }
+
+    #[test]
+    fn browser_fallback_only_accepts_local_preview_urls() {
+        assert!(validate_browser_preview_url("http://localhost:41234/").is_ok());
+        assert!(validate_browser_preview_url("https://localhost:41234/").is_err());
+        assert!(validate_browser_preview_url("http://example.com:41234/").is_err());
+        assert!(validate_browser_preview_url("C:/preview/index.html").is_err());
     }
 
     /// itch.io serves whatever sits at the top of the uploaded archive. A zip
@@ -708,11 +801,15 @@ pub fn run() {
             read_player_template,
             zip_dir,
             preview::serve_build,
+            preview::serve_build_lan,
+            preview::stop_build_lan,
+            preview::prepare_browser_preview,
             scaffold_three_types,
             write_binary_file,
             write_binary_file_raw,
             compress_texture_basis,
             frontend_log,
+            open_browser_url,
             fetch_text,
             fetch_bytes,
             fetch_sketchfab_text,

@@ -102,7 +102,10 @@ export class AudioSystem {
   #installGestureUnlock() {
     if (this._gestureUnsub || typeof window === "undefined") return;
     const handler = () => {
-      this.resumeIfNeeded();
+      // Creation itself must happen inside the gesture callback. Creating the
+      // context during engine.start() and only resuming it here still triggers
+      // Chromium's autoplay warning and can leave early sounds muted.
+      this.ensureContext().then(() => this.resumeIfNeeded());
       window.removeEventListener("pointerdown", handler, true);
       window.removeEventListener("keydown", handler, true);
       this._gestureUnsub = null;

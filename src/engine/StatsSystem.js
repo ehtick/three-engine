@@ -73,6 +73,11 @@ export class StatsSystem {
     this.readout = {
       fps: 0,
       frameMs: 0,
+      // Main-thread time actually spent executing one engine frame. Unlike
+      // frameMs this excludes time deliberately yielded by a host-side frame
+      // limiter, so editors can make pacing decisions without the limiter
+      // feeding back into its own load signal.
+      workMs: 0,
       cpuLoadPct: 0,
       renderMs: 0,
       gpuLoadPct: 0,
@@ -121,6 +126,11 @@ export class StatsSystem {
    */
   recordRenderMs(ms) {
     this._lastRenderMs = ms;
+  }
+
+  recordFrameWorkMs(ms) {
+    const previous = this.readout.workMs;
+    this.readout.workMs = previous === 0 ? ms : 0.1 * ms + 0.9 * previous;
   }
 
   /**

@@ -169,7 +169,11 @@ pub fn pty_spawn(
 /// Sends keystrokes to a session. `data` is UTF-8 text from xterm's `onData`,
 /// which already encodes control keys as the escape sequences a tty expects.
 #[tauri::command]
-pub fn pty_write(state: tauri::State<'_, PtyState>, id: String, data: String) -> Result<(), String> {
+pub fn pty_write(
+    state: tauri::State<'_, PtyState>,
+    id: String,
+    data: String,
+) -> Result<(), String> {
     let mut sessions = state.sessions.lock().map_err(|_| "pty state poisoned")?;
     let session = sessions
         .get_mut(&id)

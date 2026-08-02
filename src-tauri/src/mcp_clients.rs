@@ -249,10 +249,7 @@ pub async fn mcp_client_register(
 
 /// Removes the server from one client, for the UI's "Disconnect".
 #[tauri::command]
-pub async fn mcp_client_unregister(
-    client: String,
-    name: String,
-) -> Result<RegisterResult, String> {
+pub async fn mcp_client_unregister(client: String, name: String) -> Result<RegisterResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let Some(bin) = resolve_cli(&client) else {
             return Ok(RegisterResult {
@@ -303,7 +300,10 @@ mod tests {
         // `node` is a hard dependency of this project, so if PATH resolution
         // works at all it finds this. Guards the fallback-search logic against
         // a typo that would only show up as "claude is not installed".
-        assert!(resolve_cli("node").is_some(), "expected to resolve node from PATH");
+        assert!(
+            resolve_cli("node").is_some(),
+            "expected to resolve node from PATH"
+        );
     }
 
     #[test]

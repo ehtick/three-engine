@@ -47,7 +47,7 @@ export function formatBytes(n) {
 
 const noop = () => {};
 
-async function runExport({ outDir: presetOut, onProgress = noop } = {}) {
+async function runExport({ outDir: presetOut, onProgress = noop, buildOverride = {} } = {}) {
   const warnings = [];
   const fail = (error) => ({ ok: false, error, warnings });
 
@@ -55,6 +55,35 @@ async function runExport({ outDir: presetOut, onProgress = noop } = {}) {
   if (!outDir) return { ok: false, cancelled: true, warnings };
 
   const { invoke } = await import("@tauri-apps/api/core");
+  const readRequiredText = async (path, kind) => {
+    try {
+      return await invoke("read_text_file", { path });
+    } catch (error) {
+      // Older preview attempts could leak the generated `assets/Foo.js` path
+      // into a live script slot. Recover that one known shape from the normal
+      // authoring location without hiding arbitrary missing-file mistakes.
+      if (kind === "script" && root) {
+        const normalized = String(path).replaceAll("\\", "/");
+        const generated = normalized.match(/\/assets\/([^/]+)\.js$/i);
+        if (generated) {
+          for (const ext of ["ts", "js"]) {
+            const candidate = joinPath(root, `scripts/${generated[1]}.${ext}`);
+            try {
+              const contents = await invoke("read_text_file", { path: candidate });
+              warnings.push(`Recovered stale script reference ${path} from ${candidate}.`);
+              return contents;
+            } catch {
+              // Try the other authoring extension before reporting the
+              // original, more useful missing-path error below.
+            }
+          }
+        }
+      }
+      throw new Error(
+        `Could not read referenced ${kind} at ${path}: ${error?.message ?? String(error)}`,
+      );
+    }
+  };
   const engine = await ensureEngine();
   const { serializeScene, prefabRegistry } = await import("../engine/index.js");
   const { getProjectSettings } = await import("./projectSettings.js");
@@ -64,7 +93,7 @@ async function runExport({ outDir: presetOut, onProgress = noop } = {}) {
   const { currentScenePath } = await import("./sceneIO.js");
 
   const projectSettings = getProjectSettings();
-  const build = { ...BUILD_DEFAULTS, ...(projectSettings.build ?? {}) };
+  const build = { ...BUILD_DEFAULTS, ...(projectSettings.build ?? {}), ...buildOverride };
   const meta = useProjectStore.getState();
   const root = meta.rootPath;
   const title =
@@ -109,7 +138,13 @@ async function runExport({ outDir: presetOut, onProgress = noop } = {}) {
    * unforgivable, and unsaved edits are the normal state of an editor.
    */
   const readScene = async (rel, { embedPrefabs = false } = {}) => {
-    if (samePath(rel, openRel)) return serializeScene(engine, { embedPrefabs });
+    if (samePath(rel, openRel)) {
+      // Component.toJSON() intentionally makes a cheap shallow props copy, but
+      // build rewriting changes nested values such as script slot paths. Give
+      // the exporter a fully detached snapshot so generated `assets/*.js`
+      // paths can never leak back into the live editor scene.
+      return structuredClone(serializeScene(engine, { embedPrefabs }));
+    }
     const json = JSON.parse(await invoke("load_scene", { path: joinPath(root, rel) }));
     // Prefab definitions live in the registry, not in each scene file. The
     // start scene carries them for the whole build, so a level that isn't open
@@ -125,9 +160,17 @@ async function runExport({ outDir: presetOut, onProgress = noop } = {}) {
   const cubemapPaths = new Set(); // .cubemap files ship with rewritten face paths
   const audioSidecarPaths = new Set(); // .audio JSON, copied with path rewrites
   const timelinePaths = new Set(); // .timeline files ship with rewritten clip paths
-  const claim = (p) => names.claim(p);
+  // Saved scenes deliberately use project-relative paths so projects remain
+  // portable. Runtime asset loading resolves those paths against `root`; the
+  // exporter must do the same before handing sources to native filesystem IPC.
+  const sourcePath = (p) => {
+    if (!p || typeof p !== "string") return p;
+    return /^([a-zA-Z]:[\\/]|[\\/]{2}|\/)/.test(p) || !root ? p : joinPath(root, p);
+  };
+  const claim = (p) => names.claim(sourcePath(p));
   /** Documents we re-emit rather than copy still need a unique destination. */
-  const claimDoc = (p, rename) => names.claimGenerated(p, rename ? { rename } : undefined);
+  const claimDoc = (p, rename) =>
+    names.claimGenerated(sourcePath(p), rename ? { rename } : undefined);
 
   /**
    * A script can hold a prefab reference as a plain path string (that's what
@@ -150,17 +193,17 @@ async function runExport({ outDir: presetOut, onProgress = noop } = {}) {
     if (c.type === "mesh") {
       if (c.props.geometryAsset) c.props.geometryAsset = claim(c.props.geometryAsset);
       if (c.props.material) {
-        materialPaths.add(c.props.material);
+        materialPaths.add(sourcePath(c.props.material));
         c.props.material = claimDoc(c.props.material);
       }
     } else if (c.type === "model") {
       c.props.path = claim(c.props.path) || c.props.path;
       for (const [name, matPath] of Object.entries(c.props.materials ?? {})) {
-        materialPaths.add(matPath);
+        materialPaths.add(sourcePath(matPath));
         c.props.materials[name] = claimDoc(matPath);
       }
     } else if (c.type === "skinnedmesh" && c.props.material) {
-      materialPaths.add(c.props.material);
+      materialPaths.add(sourcePath(c.props.material));
       c.props.material = claimDoc(c.props.material);
     } else if (c.type === "environment" && c.props.hdri) {
       c.props.hdri = claim(c.props.hdri);
@@ -170,7 +213,7 @@ async function runExport({ outDir: presetOut, onProgress = noop } = {}) {
       // Like a .mat: the document itself is rewritten and re-emitted below,
       // because the clips its audio tracks name are separate files that have to
       // ship too.
-      timelinePaths.add(c.props.asset);
+      timelinePaths.add(sourcePath(c.props.asset));
       c.props.asset = claimDoc(c.props.asset);
     } else if (c.type === "script") {
       // Every slot in the list ships, not just the first. Legacy `{ path }`
@@ -180,7 +223,7 @@ async function runExport({ outDir: presetOut, onProgress = noop } = {}) {
       const slots = c.props.scripts ?? (c.props.path ? [{ path: c.props.path }] : []);
       for (const slot of slots) {
         if (!slot?.path) continue;
-        scriptPaths.add(slot.path);
+        scriptPaths.add(sourcePath(slot.path));
         slot.path = claimDoc(slot.path, (name) => name.replace(/\.ts$/i, ".js"));
       }
       if (c.props.scripts) delete c.props.path;
@@ -190,7 +233,7 @@ async function runExport({ outDir: presetOut, onProgress = noop } = {}) {
       // audio file it points to.
       for (const entry of c.props.entries ?? []) {
         if (!entry.audioAsset) continue;
-        audioSidecarPaths.add(entry.audioAsset);
+        audioSidecarPaths.add(sourcePath(entry.audioAsset));
         entry.audioAsset = claimDoc(entry.audioAsset);
       }
     }
@@ -227,7 +270,7 @@ async function runExport({ outDir: presetOut, onProgress = noop } = {}) {
     // It ships like a .mat: the descriptor is rewritten, its faces are copied.
     if (sceneJson.settings?.environment?.cubemap) {
       const src = sceneJson.settings.environment.cubemap;
-      cubemapPaths.add(src);
+      cubemapPaths.add(sourcePath(src));
       sceneJson.settings.environment.cubemap = claimDoc(src);
     }
     (sceneJson.entities ?? []).forEach(visit);
@@ -258,6 +301,9 @@ async function runExport({ outDir: presetOut, onProgress = noop } = {}) {
       // Which project-relative path scene.json is a copy of, so a script can
       // tell "am I in the first level" without hard-coding the name.
       startScene: plan.startScene,
+      // Browser preview polls this token and refreshes after a debounced live
+      // rebuild. Release builds omit it and perform no polling.
+      ...(build.livePreview ? { previewRevision: Date.now() } : {}),
     };
     scene.modules = [...useModulesStore.getState().enabled];
     scene.input = engine.input.toJSON();
@@ -294,11 +340,13 @@ async function runExport({ outDir: presetOut, onProgress = noop } = {}) {
     // --- Referenced documents ------------------------------------------------
     onProgress({ phase: "assets", message: "Rewriting asset references…" });
     for (const src of scriptPaths) {
-      const raw = await invoke("read_text_file", { path: src });
+      onProgress({ phase: "assets", message: `Reading script ${basename(src)}…` });
+      const raw = await readRequiredText(src, "script");
       files.push([claimDoc(src, (name) => name.replace(/\.ts$/i, ".js")), await transpileScript(raw)]);
     }
     for (const src of materialPaths) {
-      const def = JSON.parse(await invoke("read_text_file", { path: src }));
+      onProgress({ phase: "assets", message: `Reading material ${basename(src)}…` });
+      const def = JSON.parse(await readRequiredText(src, "material"));
       if (def.map) def.map = claim(def.map);
       for (const n of def.shaderGraph?.nodes ?? []) {
         if (n.type === "texture" && n.props?.path) n.props.path = claim(n.props.path);
@@ -307,14 +355,16 @@ async function runExport({ outDir: presetOut, onProgress = noop } = {}) {
     }
     const { normalizeCubemapDef, CUBEMAP_FACES } = await import("../engine/cubemapAsset.js");
     for (const src of cubemapPaths) {
-      const def = normalizeCubemapDef(JSON.parse(await invoke("read_text_file", { path: src })));
+      onProgress({ phase: "assets", message: `Reading cubemap ${basename(src)}…` });
+      const def = normalizeCubemapDef(JSON.parse(await readRequiredText(src, "cubemap")));
       for (const { key } of CUBEMAP_FACES) {
         if (def.faces[key]) def.faces[key] = claim(def.faces[key]);
       }
       files.push([claimDoc(src), JSON.stringify(def)]);
     }
     for (const src of timelinePaths) {
-      const def = JSON.parse(await invoke("read_text_file", { path: src }));
+      onProgress({ phase: "assets", message: `Reading timeline ${basename(src)}…` });
+      const def = JSON.parse(await readRequiredText(src, "timeline"));
       for (const track of def.tracks ?? []) {
         if (track.kind !== "audio") continue;
         for (const clip of track.clips ?? []) {
@@ -322,7 +372,7 @@ async function runExport({ outDir: presetOut, onProgress = noop } = {}) {
           // A clip may name the `.audio` sidecar or a raw file; sidecars go
           // through the same rewrite the Sound component's entries do.
           if (/\.audio$/i.test(clip.asset)) {
-            audioSidecarPaths.add(clip.asset);
+            audioSidecarPaths.add(sourcePath(clip.asset));
             clip.asset = claimDoc(clip.asset);
           } else {
             clip.asset = claim(clip.asset);
@@ -342,7 +392,7 @@ async function runExport({ outDir: presetOut, onProgress = noop } = {}) {
       } catch {
         def = null;
       }
-      const rawPath = def?.path ?? src.replace(/\.audio$/i, "");
+      const rawPath = sourcePath(def?.path ?? src.replace(/\.audio$/i, ""));
       let rawRel = null;
       try {
         await invoke("stat_file", { path: rawPath });
@@ -373,6 +423,7 @@ async function runExport({ outDir: presetOut, onProgress = noop } = {}) {
     // the asset's *renamed* destination — two `color.png` from different
     // folders no longer land on one name, and neither do their metas.
     const sidecarCopies = [];
+    const generatedSidecarFiles = [];
     for (const [src] of names.copyEntries()) {
       if (!/\.(png|jpe?g|webp|glb|geom)$/i.test(src)) continue;
       try {
@@ -386,7 +437,12 @@ async function runExport({ outDir: presetOut, onProgress = noop } = {}) {
           }
         }
       } catch {
-        // No sidecar — defaults apply.
+        // Geometry loading probes its optional import metadata unconditionally.
+        // Ship an empty object so browser previews apply defaults without a
+        // noisy 404 for every mesh in a large scene.
+        if (/\.geom$/i.test(src)) {
+          generatedSidecarFiles.push([names.claimSidecar(src, ".meta"), "{}"]);
+        }
       }
     }
 
@@ -418,6 +474,9 @@ async function runExport({ outDir: presetOut, onProgress = noop } = {}) {
     }
     const excludedRel = new Set(excluded.filter(Boolean));
     const shippedFiles = files.filter(([rel]) => !excludedRel.has(rel));
+    shippedFiles.push(...generatedSidecarFiles.filter(
+      ([rel]) => !excludedRel.has(rel.replace(/\.meta$/i, "")),
+    ));
     const shippedSidecars = sidecarCopies.filter(
       ([, rel]) => !excludedRel.has(rel.replace(/\.(meta|basis)$/i, "")),
     );
@@ -435,6 +494,15 @@ async function runExport({ outDir: presetOut, onProgress = noop } = {}) {
       // A template we can't read is not fatal — the copied one still boots,
       // it just wears the engine's default title and colours.
       warnings.push(`Loading screen not customised: ${err?.message ?? err}`);
+    }
+    if (scene.player.previewRevision) {
+      // `files` are written after the template, scene, and copied assets. Keep
+      // this marker last so the browser never refreshes into a half-published
+      // live rebuild.
+      shippedFiles.push([
+        "__preview_revision.json",
+        JSON.stringify({ revision: scene.player.previewRevision }),
+      ]);
     }
 
     await invoke("export_game", {

@@ -42,6 +42,10 @@ base64 = "0.22"
 # and AES, none of which a game bundle needs.
 zip = { version = "2", default-features = false, features = ["deflate"] }
 walkdir = "2"
+# LAN browser previews need a secure context for WebGPU. The editor generates
+# an ephemeral certificate and terminates TLS itself; localhost stays HTTP.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring"] }
 
 # `tauri dev` rebuilds on every restart even when nothing changed. Keep the
 # debug profile lean so the per-restart link cost stays small.

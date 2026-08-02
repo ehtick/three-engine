@@ -30,6 +30,7 @@ setAssetMetaLoader(async (path) => {
   return res.ok ? res.json() : null;
 });
 
+
 // Scripts ship as plain files; import once via blob URL (version never
 // changes, so ScriptComponent's hot-reload poll is a cheap cache hit).
 const scriptCache = new Map();
@@ -109,6 +110,13 @@ function createLoadingScreen(engine) {
 const START_SCENE = "scene.json";
 
 async function boot() {
+  if (!globalThis.isSecureContext) {
+    const host = globalThis.location?.hostname || "this address";
+    throw new Error(
+      `WebGPU requires a secure HTTPS origin. http://${host} is a plain-HTTP LAN address; ` +
+        "open the localhost preview on this computer, or serve the LAN preview with a certificate trusted by this device.",
+    );
+  }
   const engine = new Engine();
   // Debugging convenience, and the handle test harnesses drive the build
   // through: `__engine.loadScene("scenes/Level2.scene")` from a console is
@@ -126,6 +134,25 @@ async function boot() {
   // about entities, so read these here (the fetch is served from cache when
   // it loads the same file a moment later).
   const config = await (await fetch(START_SCENE)).json();
+  if (config.player?.previewRevision) {
+    const initialRevision = config.player.previewRevision;
+    let checking = false;
+    setInterval(async () => {
+      if (checking || document.hidden) return;
+      checking = true;
+      try {
+        const next = await fetch(`__preview_revision.json?preview=${Date.now()}`, { cache: "no-store" });
+        if (!next.ok) return;
+        const revision = (await next.json()).revision;
+        if (revision && revision !== initialRevision) location.reload();
+      } catch {
+        // A rebuild replaces files non-atomically; a transient read failure is
+        // expected and the next poll will retry.
+      } finally {
+        checking = false;
+      }
+    }, 500);
+  }
   // Collision layers before modules: the physics module reads this blob when
   // it sets up, and every collider's layer resolves against it.
   if (config.physics) engine.config.physicsLayers = config.physics;

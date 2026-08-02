@@ -87,6 +87,18 @@ export function ensureEngine() {
 }
 
 /**
+ * True once the singleton Engine exists — i.e. once touching the `engine`
+ * proxy below is safe. For code that legitimately runs during the load window
+ * (a panel's mount effect can beat `ensureEngine()`, most reliably after a page
+ * reload with a persisted dockview layout) and needs to no-op rather than
+ * throw. A throw inside a React mount effect unmounts the whole tree, so the
+ * visible symptom is not an error message but a viewport that never appears.
+ */
+export function isEngineReady() {
+  return engineInstance !== null && engineInstance !== undefined;
+}
+
+/**
  * Backwards-compatible shim. The Proxy returns `engineInstance` once it's
  * resolved and throws a helpful error during the load window — that window
  * is short (the engine is awaited in `EditorShell`'s mount effect before any

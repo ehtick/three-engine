@@ -16,6 +16,7 @@ import { InstancerComponent } from "./components/InstancerComponent.js";
 import { LineRendererComponent } from "./components/LineRendererComponent.js";
 import { TrailRendererComponent } from "./components/TrailRendererComponent.js";
 import { DecalComponent } from "./components/DecalComponent.js";
+import { PlanarReflectionComponent } from "./components/PlanarReflectionComponent.js";
 import { SplineComponent } from "./components/SplineComponent.js";
 import { SplineFollowerComponent } from "./components/SplineFollowerComponent.js";
 import { SplineMeshComponent } from "./components/SplineMeshComponent.js";
@@ -59,6 +60,7 @@ const BUILT_IN_COMPONENTS = [
   LineRendererComponent,
   TrailRendererComponent,
   DecalComponent,
+  PlanarReflectionComponent,
   SplineComponent,
   SplineFollowerComponent,
   SplineMeshComponent,
