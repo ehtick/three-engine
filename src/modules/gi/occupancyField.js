@@ -66,7 +66,7 @@
 // else reads. 1.6 MB for zero risk.
 import * as THREE from "three/webgpu";
 import {
-  Break, Fn, If, Loop, atomicLoad, atomicOr, atomicStore, bitAnd, bitOr, float, floor, instanceIndex,
+  Break, Fn, If, Loop, atomicLoad, atomicMax, atomicOr, atomicStore, bitAnd, bitOr, float, floor, instanceIndex,
   instancedArray, int, mod, select, shiftLeft, shiftRight, uint, uniform, uniformArray, vec3, vec4,
 } from "three/tsl";
 import { sharedFn } from "./giFn.js";
@@ -180,9 +180,16 @@ export function createOccupancyField(bounds, res0, options = {}) {
   // cell's radiance, not to shade a silhouette. Racing stores cost nothing and
   // an atomic would serialise the hot loop of the whole voxelizer.
   //
-  // `cellAttr` packs: x = slot + 1 (0 = "no surface"), yzw = the face normal.
+  // `cellAttr`: ATLAS slot + 1 per coarse cell (the slotAtlas remap is applied
+  // at write time; 0 = "no surface" or unseated slot). ATOMIC u32, written
+  // with atomicMax so the winner in a shared cell is DETERMINISTIC (highest
+  // atlas slot): the old last-write-wins vec4 re-rolled the winner by GPU
+  // scheduling on EVERY dispatch, and a moving object re-voxelizes every
+  // frame — so all multi-mesh seam cells re-rolled their colour per frame,
+  // which the bounce amplified into visible flicker. (The vec4's yzw face
+  // normal was never read by anything — deleted with the conversion.)
   let coarseRes = { x: 1, y: 1, z: 1 };
-  let cellAttr = instancedArray(new Float32Array(4), "vec4");
+  let cellAttr = instancedArray(new Uint32Array(1), "uint").toAtomic();
   const coarseResU = uniform(new THREE.Vector3(1, 1, 1));
   /**
    * Points the attribute grid at the composite's cell resolution. Called by
@@ -192,8 +199,30 @@ export function createOccupancyField(bounds, res0, options = {}) {
   const setCoarseRes = (res) => {
     coarseRes = { x: res.x, y: res.y, z: res.z };
     coarseResU.value.set(res.x, res.y, res.z);
-    cellAttr = instancedArray(new Float32Array(res.x * res.y * res.z * 4), "vec4");
+    cellAttr = instancedArray(new Uint32Array(res.x * res.y * res.z), "uint").toAtomic();
     computesRevision = -1; // the voxelize kernel closes over this buffer
+    dirty = true;
+  };
+
+  // Occupancy slot → ATLAS slot bridge, uploaded by GISystem. The two
+  // numberings are independent (placements by mesh-walk order, atlas slots by
+  // #syncSlots priority), which is the crossed-numbering bug that got
+  // cellAttr's colours disabled in the composite. -1 = no atlas slot
+  // (unseated/overflow) — writes as cellAttr.x = 0, "no surface", so the
+  // composite keeps its nearest-slot answer there.
+  //
+  // THE REMAP IS APPLIED HERE, IN THE VOXELIZER — NOT READ IN THE COMPOSITE.
+  // Binding this array in the composite kernel was one uniform buffer too
+  // many: that kernel already sits at the user GPU's 12-uniform-buffer
+  // per-stage limit, and buffer 13 fails CreateBindGroupLayout, which drops
+  // the WHOLE compute batch (the documented over-limit failure shape). The
+  // voxelizer binds ~3, so the remap rides here for free; a remap change
+  // marks the field dirty so the attribution re-bakes on the next dispatch.
+  const slotAtlas = uniformArray(Array.from({ length: slotCapacity }, () => -1), "float");
+  const setSlotAtlas = (slot, atlasSlot) => {
+    if (slot < 0 || slot >= slotCapacity) return;
+    if (slotAtlas.array[slot] === atlasSlot) return;
+    slotAtlas.array[slot] = atlasSlot;
     dirty = true;
   };
 
@@ -376,6 +405,17 @@ export function createOccupancyField(bounds, res0, options = {}) {
   })().compute(level0.words);
 
   /**
+   * Zeroes the surface-attribution grid. Without this a mesh that moved or
+   * left keeps colouring its old cells forever — nothing overwrites a cell no
+   * triangle touches any more. A BUILDER (like buildVoxelizeCompute): it
+   * closes over the current `cellAttr` allocation, which `setCoarseRes`
+   * replaces, and the dispatch size is that allocation's cell count.
+   */
+  const buildClearAttrCompute = () => Fn(() => {
+    atomicStore(cellAttr.element(instanceIndex), uint(0));
+  })().compute(Math.max(1, coarseRes.x * coarseRes.y * coarseRes.z));
+
+  /**
    * One thread per WORK ITEM = (slot, triangle, chunk). Rebuilt whenever the
    * geometry buffers change, because the body closes over them and the
    * dispatch size is the work-item count.
@@ -439,15 +479,13 @@ export function createOccupancyField(bounds, res0, options = {}) {
           const cy = vy.add(0.5).mul(coarseResU.y).div(float(level0.res.y)).floor().clamp(0, coarseResU.y.sub(1));
           const cz = vz.add(0.5).mul(coarseResU.z).div(float(level0.res.z)).floor().clamp(0, coarseResU.z.sub(1));
           const cell = cz.mul(coarseResU.y).add(cy).mul(coarseResU.x).add(cx).toUint();
-          // World face normal of THIS triangle. `p0..p2` are already in level-0
-          // voxel space, which is an anisotropic scaling of world space, so the
-          // cross product is rescaled by the voxel size before normalising —
-          // otherwise a non-cubic volume tilts every normal it stores.
-          const e1 = p1.sub(p0);
-          const e2 = p2.sub(p0);
-          const nVox = e1.cross(e2);
-          const nWorld = vec3(nVox.x, nVox.y, nVox.z).mul(vec3(voxel)).normalize().toVar();
-          cellAttr.element(cell).assign(vec4(slot.toFloat().add(1), nWorld));
+          // ATLAS slot + 1, not occupancy slot + 1: slotAtlas applies the
+          // numbering bridge right here so the composite can read the value
+          // with no extra binding (it has none to spare — see slotAtlas's
+          // comment). An unseated slot (-1) writes 0 = "no surface".
+          // atomicMax = deterministic winner in shared cells (see cellAttr's
+          // comment; last-write-wins re-rolled per dispatch = motion flicker).
+          atomicMax(cellAttr.element(cell), slotAtlas.element(slot.toInt()).add(1).toUint());
         });
       });
     });
@@ -1097,6 +1135,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
 
   let computes = null;
   let computesRevision = -1;
+  let jitterFrame = 0;
 
   return {
     levels,
@@ -1108,6 +1147,8 @@ export function createOccupancyField(bounds, res0, options = {}) {
     get cellAttr() {
       return cellAttr;
     },
+    slotAtlas,
+    setSlotAtlas,
     setCoarseRes,
     bits,
     stats,
@@ -1145,15 +1186,40 @@ export function createOccupancyField(bounds, res0, options = {}) {
     },
 
     /**
-     * The dispatch chain, in order: clear → voxelize → copy → downsample×4.
+     * The dispatch chain, in order: clear → clearAttr → voxelize → copy → downsample×4.
      * Returns null when there is no geometry, so an empty scene costs nothing
      * and cannot dispatch the voxelizer against a placeholder work item.
      */
     passes() {
       dirty = false;
       if (pairCount === 0) return null;
+      // TEMPORAL ANTI-ALIASING OF THE FOOTPRINT (opt-in, `__giVoxelJitter` =
+      // amplitude in voxels, sensible range 0.25–0.5, 0/off = today). A
+      // moving object re-voxelizes every frame and its footprint SNAPS in
+      // whole voxels — the root of the object-motion flicker (every shadow
+      // ray, DDA hit and probe interval downstream pulses in lockstep with
+      // those snaps). Offsetting the WHOLE grid by a sub-voxel R3 sequence
+      // per re-dispatch dithers the snap; the probe EMA then integrates the
+      // dither into fractional coverage. Every consumer (voxelizer, DDA,
+      // oracle, CPU stats) reads the same `gridOrigin` uniform, so the shift
+      // is globally consistent — and when nothing moves, passes() stops
+      // running, the origin freezes, and the static image stays bit-stable
+      // (the 15c zero-flicker-when-static rule holds).
+      const jitterAmp = globalThis.__giVoxelJitter ?? 0;
+      if (jitterAmp > 0) {
+        jitterFrame = (jitterFrame + 1) % 4096;
+        // R3 low-discrepancy offsets in [-0.5, 0.5).
+        const jx = ((jitterFrame * 0.8191725133961645) % 1) - 0.5;
+        const jy = ((jitterFrame * 0.6710436067037893) % 1) - 0.5;
+        const jz = ((jitterFrame * 0.5497004779019703) % 1) - 0.5;
+        gridOrigin.value.set(
+          bounds.min.x + jx * jitterAmp * voxel.value.x,
+          bounds.min.y + jy * jitterAmp * voxel.value.y,
+          bounds.min.z + jz * jitterAmp * voxel.value.z,
+        );
+      }
       if (computesRevision !== geometryRevision) {
-        computes = [clearCompute, buildVoxelizeCompute(), copyCompute, ...downsampleComputes];
+        computes = [clearCompute, buildClearAttrCompute(), buildVoxelizeCompute(), copyCompute, ...downsampleComputes];
         computesRevision = geometryRevision;
       }
       stats.dispatches++;

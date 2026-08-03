@@ -15,7 +15,7 @@
 //                     gba = normal·0.5+0.5; written by the composite pass,
 //                     sampled with HARDWARE TRILINEAR by the traces.
 import * as THREE from "three/webgpu";
-import { Break, Discard, Fn, If, Loop, cameraPosition, float, floor, instanceIndex, instancedArray, ivec3, mix, mod, positionWorld, select, smoothstep, step, texture3D, textureStore, uniform, vec3, vec4 } from "three/tsl";
+import { Break, Discard, Fn, If, Loop, atomicLoad, cameraPosition, float, floor, instanceIndex, instancedArray, ivec3, mix, mod, positionWorld, select, smoothstep, step, texture3D, textureStore, uint, uniform, vec3, vec4 } from "three/tsl";
 import { sharedFn } from "./giFn.js";
 import { createInstanceGrid, loopCandidates } from "./instanceGrid.js";
 import { createSparseField } from "./sparseField.js";
@@ -251,6 +251,10 @@ export function createGiField(bounds, res, atlas, options = {}) {
             });
           });
         });
+
+        // (Exact cellAttr attribution overrides this scan's answer below,
+        // after the oracle-gradient normal is known — the shell-inheritance
+        // step needs that normal.)
       } else {
         // Only the slots the grid lists for this cell — the AABB test below
         // still runs, so a conservative list costs nothing but time.
@@ -303,78 +307,13 @@ export function createGiField(bounds, res, atlas, options = {}) {
       const albedo = vec3(0).toVar();
       const emissive = vec3(0).toVar();
       const normal = vec3(0, 1, 0).toVar();
-      // SURFACE ATTRIBUTION FROM OCCUPANCY, when the field can supply it.
-      //
-      // This is the step that lets the mesh-SDF atlas be deleted. The atlas was
-      // never consulted here for its DISTANCE — `best` is just "which slot is
-      // nearest", used to look up that slot's MEAN albedo/emissive, and the six
-      // extra taps below are a gradient normal. The occupancy voxelizer already
-      // knows both exactly (it visits every triangle/voxel pair and has the
-      // face normal), so it writes them per coarse cell and this reads them.
-      //
-      // It also answers a question the SDF answered badly: a slot whose blurred
-      // field happens to be nearest is not necessarily the surface IN the cell,
-      // whereas an attributed cell was written by a triangle that provably
-      // overlaps it.
-      //
-      // `attr.x` is slot + 1, so 0 means "no triangle touched this cell" and
-      // the SDF path below still supplies the colours.
-      //
-      // COLOURS ONLY — NOT THE NORMAL, and this is the important part.
-      // `cellAttr` is written by the voxelizer as LAST WRITE WINS with no
-      // atomics, which is harmless for a per-slot MEAN colour (any triangle in
-      // the cell gives the same answer) and actively wrong for a face normal.
-      // A floor slab's top face (+Y) and bottom face (−Y) land in the SAME
-      // coarse cell, so the stored normal is whichever triangle won a race —
-      // and the bounce gather is deliberately ONE-SIDED (`dot(dir, normal)`
-      // clamped at 0, see cascadeGather's note) precisely so a wall's outside
-      // shell cannot be lit from inside the room. A cell that raced to −Y takes
-      // light from a sun BELOW the floor: the floor glows from underneath, and
-      // it flips whenever the voxelizer redispatches and re-runs the race.
-      // Coarser cells hold both faces more often, which is why it worsens at
-      // the lower quality tiers.
-      // `cellAttr` IS NOT READ HERE AT ALL ANY MORE — neither for colours nor
-      // for the normal. Both were bugs, and both are worth naming so this is
-      // never re-wired:
-      //   · COLOURS crossed two slot numberings. `cellAttr.x` is
-      //     `occupancySlot + 1`, an index into the OCCUPANCY field's
-      //     `placements` (numbered over the mesh walk), while `atlas.albedo` is
-      //     indexed by ATLAS slot, which `#syncSlots` assigns independently by
-      //     capacity and priority. It read a different mesh's colour, or an
-      //     inactive slot's black. Colours come from `best` — atlas space,
-      //     correct by construction.
-      //   · THE NORMAL was written last-write-wins with no atomics, so a floor
-      //     slab's cell holds whichever of its +Y top face and -Y bottom face
-      //     won a race, and a cell that raced to -Y takes light from a sun
-      //     BELOW the floor. Both modes take the normal from a GRADIENT instead
-      //     (the SDF slot field, or the occupancy distance oracle).
-      If(best.greaterThanEqual(0), () => {
-        const s = best.toInt();
-        albedo.assign(atlas.albedo.element(s).xyz);
-        emissive.assign(atlas.emissive.element(s).xyz);
-        // SDF-gradient normal of the winning slot (6 taps) — only where the
-        // cell is occupied; empty cells never feed the bounce gather. Runs
-        // whether or not occupancy attributed the colours: a gradient is a
-        // property of the FIELD around the cell, so a thin slab gets an
-        // outward-facing shell on each side instead of one coin-flip normal.
-        if (!killSdf) {
-          If(occupied.greaterThan(0.5), () => {
-            const h = world.minCell.mul(0.5);
-            const gx = atlas.sampleSlot(s, p.add(vec3(h, 0, 0))).sub(atlas.sampleSlot(s, p.sub(vec3(h, 0, 0))));
-            const gy = atlas.sampleSlot(s, p.add(vec3(0, h, 0))).sub(atlas.sampleSlot(s, p.sub(vec3(0, h, 0))));
-            const gz = atlas.sampleSlot(s, p.add(vec3(0, 0, h))).sub(atlas.sampleSlot(s, p.sub(vec3(0, 0, h))));
-            const g = vec3(gx, gy, gz).toVar();
-            If(g.length().greaterThan(1e-5), () => {
-              normal.assign(g.normalize());
-            });
-          });
-        }
-      });
       // SDF-FREE: no slot field to take a gradient of, so use the DISTANCE
       // ORACLE's gradient instead. It is a real continuous distance now (see
       // freeRadiusAtWorld's near field), so its gradient points AWAY from the
       // surface exactly like the SDF's did — deterministic, and two-sided by
       // construction rather than a coin flip between a slab's two faces.
+      // Runs BEFORE the attribution override below, which walks one cell
+      // along −normal to find the surface a SHELL cell belongs to.
       //
       // STEP SIZE IS A FULL COARSE CELL, not half. Sampling a binary occupancy
       // indicator at ±½ cell put both taps inside the same voxel wherever the
@@ -416,7 +355,120 @@ export function createGiField(bounds, res, atlas, options = {}) {
           });
         });
       }
-
+      // EXACT ATTRIBUTION OVERRIDE — COLOURS ONLY, killSdf mode. The nearest-
+      // slot scan above ties at 0 for every slot whose analytic box CONTAINS
+      // the cell (box distance is clamped to 0 inside, see #sampleSlotBody),
+      // and a building-scale mesh's box contains nearly every cell — so
+      // `best` degenerated to candidate order, the whole field took one
+      // mesh's mean albedo, and colour bleed died (the post-occupancy "no
+      // colour bleed" report). `cellAttr.x` is an ATLAS slot + 1 — the
+      // voxelizer applies the occupancy→atlas numbering bridge (slotAtlas,
+      // GISystem-maintained) at WRITE time, because binding the remap array
+      // here was one uniform buffer past this kernel's 12-per-stage device
+      // limit and dropped the whole compute batch.
+      //
+      // SHELL CELLS INHERIT THE SURFACE THEY SHELL. A cell with no triangle
+      // (attr 0) can still be occupied: anything within occThreshold of a
+      // surface is a per-side SHELL layer, and the shells are what actually
+      // BOUNCE — a sheet's own cells read a zero oracle gradient, take no
+      // direct light, and re-emit nothing (by design, see the normal note
+      // above). Left to the scan, a shell took the nearest analytic BOX's
+      // mean albedo — so the sunlit shell of a red curtain bounced BEIGE,
+      // which is why fixing in-cell attribution alone doubled measured
+      // chroma yet left the curtain→floor pools missing. The surface a shell
+      // belongs to sits one cell along −normal (the oracle gradient points
+      // away from geometry); inherit that cell's attribution.
+      // The NORMAL never comes from cellAttr (last-write-wins race — see the
+      // block comment below).
+      // Build-time hatch: __giNoAttrColors (evaluateOnNewDocument / HATCH=
+      // only — a console set after load does nothing, Round 11 rule).
+      if (killSdf && occField && !globalThis.__giNoAttrColors) {
+        // `cellAttr` is an ATOMIC u32 buffer (deterministic atomicMax winner
+        // — see occupancyField); an atomic binding read without atomicLoad is
+        // a WGSL type error that silently drops the whole compute batch.
+        const attr = atomicLoad(occField.cellAttr.element(instanceIndex)).toVar();
+        If(attr.greaterThan(uint(0)), () => {
+          best.assign(attr.toFloat().sub(1));
+        }).ElseIf(occupied.greaterThan(0.5).and(normal.length().greaterThan(1e-5)), () => {
+          const q = p.sub(normal.mul(vec3(world.cell.x, world.cell.y, world.cell.z)));
+          const qx = q.x.sub(world.min.x).div(world.cell.x).floor().clamp(0, res.x - 1);
+          const qy = q.y.sub(world.min.y).div(world.cell.y).floor().clamp(0, res.y - 1);
+          const qz = q.z.sub(world.min.z).div(world.cell.z).floor().clamp(0, res.z - 1);
+          const attrNear = atomicLoad(
+            occField.cellAttr.element(qz.mul(res.y).add(qy).mul(res.x).add(qx).toInt()),
+          ).toVar();
+          If(attrNear.greaterThan(uint(0)), () => {
+            best.assign(attrNear.toFloat().sub(1));
+          });
+        });
+      }
+      // SURFACE ATTRIBUTION FROM OCCUPANCY, when the field can supply it.
+      //
+      // This is the step that lets the mesh-SDF atlas be deleted. The atlas was
+      // never consulted here for its DISTANCE — `best` is just "which slot is
+      // nearest", used to look up that slot's MEAN albedo/emissive, and the six
+      // extra taps below are a gradient normal. The occupancy voxelizer already
+      // knows both exactly (it visits every triangle/voxel pair and has the
+      // face normal), so it writes them per coarse cell and this reads them.
+      //
+      // It also answers a question the SDF answered badly: a slot whose blurred
+      // field happens to be nearest is not necessarily the surface IN the cell,
+      // whereas an attributed cell was written by a triangle that provably
+      // overlaps it.
+      //
+      // `attr.x` is slot + 1, so 0 means "no triangle touched this cell" and
+      // the SDF path below still supplies the colours.
+      //
+      // COLOURS ONLY — NOT THE NORMAL, and this is the important part.
+      // `cellAttr` is written by the voxelizer as LAST WRITE WINS with no
+      // atomics, which is harmless for a per-slot MEAN colour (any triangle in
+      // the cell gives the same answer) and actively wrong for a face normal.
+      // A floor slab's top face (+Y) and bottom face (−Y) land in the SAME
+      // coarse cell, so the stored normal is whichever triangle won a race —
+      // and the bounce gather is deliberately ONE-SIDED (`dot(dir, normal)`
+      // clamped at 0, see cascadeGather's note) precisely so a wall's outside
+      // shell cannot be lit from inside the room. A cell that raced to −Y takes
+      // light from a sun BELOW the floor: the floor glows from underneath, and
+      // it flips whenever the voxelizer redispatches and re-runs the race.
+      // Coarser cells hold both faces more often, which is why it worsens at
+      // the lower quality tiers.
+      // `cellAttr` colours are back in use ABOVE via the slotAtlas remap
+      // (killSdf mode only); the normal is still never read from it. Both were
+      // bugs, and both are worth naming so this is never re-wired:
+      //   · COLOURS crossed two slot numberings. `cellAttr.x` is
+      //     `occupancySlot + 1`, an index into the OCCUPANCY field's
+      //     `placements` (numbered over the mesh walk), while `atlas.albedo` is
+      //     indexed by ATLAS slot, which `#syncSlots` assigns independently by
+      //     capacity and priority. It read a different mesh's colour, or an
+      //     inactive slot's black. Colours come from `best` — atlas space,
+      //     correct by construction.
+      //   · THE NORMAL was written last-write-wins with no atomics, so a floor
+      //     slab's cell holds whichever of its +Y top face and -Y bottom face
+      //     won a race, and a cell that raced to -Y takes light from a sun
+      //     BELOW the floor. Both modes take the normal from a GRADIENT instead
+      //     (the SDF slot field, or the occupancy distance oracle).
+      If(best.greaterThanEqual(0), () => {
+        const s = best.toInt();
+        albedo.assign(atlas.albedo.element(s).xyz);
+        emissive.assign(atlas.emissive.element(s).xyz);
+        // SDF-gradient normal of the winning slot (6 taps) — only where the
+        // cell is occupied; empty cells never feed the bounce gather. Runs
+        // whether or not occupancy attributed the colours: a gradient is a
+        // property of the FIELD around the cell, so a thin slab gets an
+        // outward-facing shell on each side instead of one coin-flip normal.
+        if (!killSdf) {
+          If(occupied.greaterThan(0.5), () => {
+            const h = world.minCell.mul(0.5);
+            const gx = atlas.sampleSlot(s, p.add(vec3(h, 0, 0))).sub(atlas.sampleSlot(s, p.sub(vec3(h, 0, 0))));
+            const gy = atlas.sampleSlot(s, p.add(vec3(0, h, 0))).sub(atlas.sampleSlot(s, p.sub(vec3(0, h, 0))));
+            const gz = atlas.sampleSlot(s, p.add(vec3(0, 0, h))).sub(atlas.sampleSlot(s, p.sub(vec3(0, 0, h))));
+            const g = vec3(gx, gy, gz).toVar();
+            If(g.length().greaterThan(1e-5), () => {
+              normal.assign(g.normalize());
+            });
+          });
+        }
+      });
       stagingBuffer.element(instanceIndex).assign(vec4(emissive.mul(occupied), occupied));
       surfaceBuffer.element(instanceIndex).assign(vec4(albedo, occupied));
       normalBuffer.element(instanceIndex).assign(vec4(normal, 0));

@@ -128,14 +128,43 @@ declare module "engine" {
     updateMatrix(): void;
     updateMatrixWorld(force?: boolean): void;
 
-    addComponent(type: string, props?: Record<string, unknown>): unknown;
-    /** Known component types (e.g. `"charactercontroller"`, `"model"`) resolve to
-     *  their typed interface automatically — no cast or generic needed. Unknown
-     *  strings fall back to `T` (defaulting to `unknown`) for custom/module
-     *  component types not in {@link ComponentMap}. */
+    /**
+     * Attach a component by registered type string or component class:
+     *
+     *     import { MeshComponent } from "engine";
+     *     this.entity.addComponent(MeshComponent);
+     *     this.entity.addComponent("mesh", { geometry: "sphere" });
+     */
+    addComponent<C extends { readonly type: keyof ComponentMap }>(
+      ctor: C,
+      props?: Record<string, unknown>,
+    ): ComponentMap[C["type"]];
+    addComponent<K extends keyof ComponentMap>(
+      type: K,
+      props?: Record<string, unknown>,
+    ): ComponentMap[K];
+    addComponent(type: string | { readonly type: string }, props?: Record<string, unknown>): unknown;
+
+    /**
+     * Component on this entity by registered type string or class token.
+     * Prefer the class form so typos fail at compile time and the return
+     * type resolves automatically:
+     *
+     *     import { MeshComponent, CharacterControllerComponent } from "engine";
+     *     const mesh = this.entity.getComponent(MeshComponent);
+     *     const cc = this.entity.getComponent(CharacterControllerComponent);
+     *
+     * Known type strings (e.g. `"charactercontroller"`, `"model"`) still
+     * resolve via {@link ComponentMap}. Unknown strings fall back to `T`
+     * (defaulting to `unknown`) for custom/module component types.
+     */
+    getComponent<C extends { readonly type: keyof ComponentMap }>(
+      ctor: C,
+    ): ComponentMap[C["type"]] | undefined;
     getComponent<K extends keyof ComponentMap>(type: K): ComponentMap[K] | undefined;
-    getComponent<T = unknown>(type: string): T | undefined;
-    removeComponent(type: string): void;
+    getComponent<T = unknown>(type: string | { readonly type: string }): T | undefined;
+
+    removeComponent(type: string | { readonly type: string }): void;
 
     /**
      * A script on this entity by class name, file stem, or asset path — the
@@ -199,14 +228,20 @@ declare module "engine" {
      * `arr.length === 0` as a clean "not found" check.
      *
      * Compare against `getComponent(type)` if you only want this entity
-     * itself.
+     * itself. Prefer a class token exported from `"engine"`:
+     *
+     *     import { CameraComponent } from "engine";
+     *     const cams = this.entity.findComponents(CameraComponent);
      *
      * Known component types (see {@link ComponentMap}) resolve to their
      * typed interface automatically, same as `getComponent`. Pass an explicit
      * `T` to override for custom/module component types not in the map.
      */
+    findComponents<C extends { readonly type: keyof ComponentMap }>(
+      ctor: C,
+    ): ComponentMap[C["type"]][];
     findComponents<K extends keyof ComponentMap>(type: K): ComponentMap[K][];
-    findComponents<T = unknown>(type: string): T[];
+    findComponents<T = unknown>(type: string | { readonly type: string }): T[];
   }
 
   /**
@@ -864,7 +899,12 @@ declare module "engine" {
    * quietly costs the autocomplete this map exists to provide.
    *
    * Custom components registered by other modules aren't in this map — use
-   * the explicit generic form (`getComponent<MyType>("mytype")`) for those.
+   * the explicit generic form (`getComponent<MyType>("mytype")`) or pass a
+   * class/token with `static type` for those.
+   *
+   * Prefer `import { MeshComponent } from "engine"` and
+   * `entity.getComponent(MeshComponent)` over bare strings when the type is
+   * listed here — the class token's `type` literal selects the same entry.
    */
   export interface ComponentMap {
     model: ModelComponent;
@@ -896,6 +936,53 @@ declare module "engine" {
     joint: JointComponent;
     script: ScriptComponent;
   }
+
+  /**
+   * Lookup tokens for `getComponent` / `findComponents` / `addComponent` /
+   * `removeComponent`. Each shares its name with the instance interface above
+   * (value + type merge): import the const, pass it to `getComponent`, and
+   * IntelliSense on the result comes from the matching interface.
+   *
+   *     import { MeshComponent } from "engine";
+   *     const mesh = this.entity.getComponent(MeshComponent);
+   *
+   * Keep the `type` literals in sync with {@link ComponentMap} and the
+   * re-exports in `scriptRuntime/runtime.js`.
+   */
+  interface ComponentClass<T extends string> {
+    readonly type: T;
+  }
+
+  export const MeshComponent: ComponentClass<"mesh">;
+  export const ModelComponent: ComponentClass<"model">;
+  export const AnimationComponent: ComponentClass<"animation">;
+  export const TimelineComponent: ComponentClass<"timeline">;
+  export const IKComponent: ComponentClass<"ik">;
+  export const CameraComponent: ComponentClass<"camera">;
+  export const VirtualCameraComponent: ComponentClass<"vcam">;
+  export const ImpulseSourceComponent: ComponentClass<"impulsesource">;
+  export const LightComponent: ComponentClass<"light">;
+  export const ListenerComponent: ComponentClass<"listener">;
+  export const SoundComponent: ComponentClass<"sound">;
+  export const InstancerComponent: ComponentClass<"instancer">;
+  export const ParticleComponent: ComponentClass<"particles">;
+  export const LineRendererComponent: ComponentClass<"line">;
+  export const TrailRendererComponent: ComponentClass<"trail">;
+  export const DecalComponent: ComponentClass<"decal">;
+  export const LodGroupComponent: ComponentClass<"lod">;
+  export const SplineComponent: ComponentClass<"spline">;
+  export const SplineFollowerComponent: ComponentClass<"splineFollower">;
+  export const SplineMeshComponent: ComponentClass<"splineMesh">;
+  export const ScriptComponent: ComponentClass<"script">;
+
+  export const RigidbodyComponent: ComponentClass<"rigidbody">;
+  export const ColliderComponent: ComponentClass<"collider">;
+  export const CharacterControllerComponent: ComponentClass<"charactercontroller">;
+  export const JointComponent: ComponentClass<"joint">;
+
+  export const NavMeshComponent: ComponentClass<"navmesh">;
+  export const NavAgentComponent: ComponentClass<"navagent">;
+  export const NavLinkComponent: ComponentClass<"navlink">;
 
   /** One entry in a script component's list. */
   export interface ScriptSlot {

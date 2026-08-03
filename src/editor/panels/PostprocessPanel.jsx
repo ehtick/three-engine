@@ -216,17 +216,19 @@ function NodePalette({ style, onPick, onClose }) {
     <>
       <div className="dropdown-overlay" onClick={onClose} onContextMenu={(e) => { e.preventDefault(); onClose(); }} />
       <div className={`dropdown-menu node-palette ${style ? "context-menu" : ""}`} style={style}>
-        {PALETTE.map(({ group, types }) => (
-          <div key={group}>
-            <div className="node-palette-group">{group}</div>
-            {types.map((type) => (
-              <button key={type} className="dropdown-item node-palette-item" onClick={() => onPick(type)}>
-                <span className={`shader-node-dot cat-${PP_NODE_TYPES[type].category}`} />
-                {PP_NODE_TYPES[type].label}
-              </button>
-            ))}
-          </div>
-        ))}
+        <div className="node-palette-list">
+          {PALETTE.map(({ group, types }) => (
+            <div key={group}>
+              <div className="node-palette-group">{group}</div>
+              {types.map((type) => (
+                <button key={type} className="dropdown-item node-palette-item" onClick={() => onPick(type)}>
+                  <span className={`shader-node-dot cat-${PP_NODE_TYPES[type].category}`} />
+                  {PP_NODE_TYPES[type].label}
+                </button>
+              ))}
+            </div>
+          ))}
+        </div>
       </div>
     </>
   );

@@ -16,7 +16,7 @@
 // Both are needed: for a long time the types described nine three classes while
 // the runtime exposed twenty-eight, and neither check existed to notice.
 
-import { Script, attribute } from "engine";
+import { Script, attribute, MeshComponent, CameraComponent, CharacterControllerComponent } from "engine";
 import * as THREE from "three/webgpu";
 
 // 1. extends Script
@@ -45,6 +45,14 @@ export default class Player extends Script {
     const ent = this.engine.createEntity({ name: "Bullet" });
     const meshComp = ent.getComponent<{ mesh: unknown }>("mesh");
     void meshComp;
+
+    // Class-token lookup — preferred over strings; return type comes from ComponentMap.
+    const meshByClass = this.entity.getComponent(MeshComponent);
+    const ccByClass = this.entity.getComponent(CharacterControllerComponent);
+    meshByClass?.setProp("geometry", "box");
+    ccByClass?.move([0, 0, 0]);
+    const camsByClass = this.entity.findComponents(CameraComponent);
+    void camsByClass;
 
     // Transform aliases — no .object3D needed.
     this.entity.position.set(0, 1, 0);

@@ -263,7 +263,13 @@ export function createGiResolve({ gbuffer, targets, width, height, gather, norma
       const facing = step(0, rawN.dot(radiance?.cameraPosition?.sub(P) ?? rawN)).mul(2).sub(1);
       const N = rawN.mul(facing).toVar();
       const samplePoint = P.add(N.mul(normalOffset)).toVar();
-      out.assign(vec3(gather(samplePoint, N)).mul(intensity));
+      // Unit toward-camera vector for the gather's view-bias component
+      // (silhouette fix — see cascadeGather.gatherViewBias). Zero when the
+      // resolve has no camera (radiance null), which disables it exactly.
+      const viewDir = radiance?.cameraPosition
+        ? vec3(radiance.cameraPosition).sub(P).normalize().toVar()
+        : vec3(0);
+      out.assign(vec3(gather(samplePoint, N, viewDir)).mul(intensity));
       if (radiance) {
         const incident = P.sub(radiance.cameraPosition).normalize().toVar();
         const reflected = reflect(incident, N).toVar();
@@ -302,7 +308,7 @@ export function createGiResolve({ gbuffer, targets, width, height, gather, norma
           const nRaw = decodeOctNormal(hitTexel.zw).toVar();
           const nFace = select(nRaw.dot(R).lessThan(0), nRaw, nRaw.negate()).toVar();
           const shadePoint = hitP.add(nFace.mul(normalOffset)).toVar();
-          const hitE = vec3(gather(shadePoint, nFace)).toVar();
+          const hitE = vec3(gather(shadePoint, nFace, vec3(0))).toVar();
           if (emitter) {
             hitE.addAssign(emitterDirectAt(emitter, hitP, nFace, shadePoint).irradiance);
           }

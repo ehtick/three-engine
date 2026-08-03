@@ -19,7 +19,7 @@ import * as THREE from "three/webgpu";
 import { float, instanceIndex, positionLocal, texture, uniform } from "three/tsl";
 import { createRadianceCascades } from "./cascadeTrace.js";
 import { createCascadeMerge } from "./cascadeMerge.js";
-import { createBounceFeedback, createIrradianceGather, createProbeIrradiance, createRadianceLookup } from "./cascadeGather.js";
+import { createBounceFeedback, createIrradianceGather, createProbeIrradiance, createRadianceLookup, gatherBias, gatherViewBias, probeSnapAlpha } from "./cascadeGather.js";
 import { blitBvhAtlasTiles, createGiBvhReflect, createGiBvhTarget, createGiGBuffer, createGiResolve, createGiTargets, renderGiGBuffer } from "./giScreen.js";
 import { resolveMaterialSurface, serializeMeshForBake } from "./voxelizeOnce.js";
 import { createOccupancyDebugMaterial, createSdfDebugMaterial, createGiField } from "./giField.js";
@@ -794,6 +794,20 @@ export class GISystem {
         globalThis.__giNoJitter === true ? 0 : globalThis.__giSunJitter ?? 0;
       state.shadowJitter.penAngle.value = globalThis.__giSunAngle ?? 0.025;
     }
+    // Receiver-gather surface bias (fractions of a probe cell — normal and
+    // toward-camera components, see cascadeGather.gatherBias). Defaults
+    // 0.5/0.5: user-eye-tuned on their Sponza (2026-08-03) as the closest
+    // match to the Blender reference for curved receivers. `__giGatherBias`
+    // / `__giGatherViewBias` remain live console overrides; 0/0 restores the
+    // unbiased cage.
+    gatherBias.value = globalThis.__giGatherBias ?? 0.5;
+    gatherViewBias.value = globalThis.__giGatherViewBias ?? 0.5;
+    // Adaptive-hysteresis snap alpha (cascadeGather.probeSnapAlpha); 0 = the
+    // old fixed-alpha EMA.
+    probeSnapAlpha.value = globalThis.__giProbeSnap ?? 0.35;
+    // Field-side radiance EMA retain weight (GI_FLICKER_PLAN.md Phase 1);
+    // default 0.95, user-confirmed live; 0 = off (pre-Phase-1 behaviour).
+    if (state.fieldSmoothing) state.fieldSmoothing.value = globalThis.__giFieldSmoothing ?? 0.95;
     // Checker parity: which half of the cells this frame's feedback updates.
     if (state.feedbackParity) state.feedbackParity.value = this._frame % 2;
     this.#refreshEmitterSlots();
@@ -936,6 +950,15 @@ export class GISystem {
         else if (this._occGeometrySeen !== occGeometryRevision) this._compositeWhy.occ++;
         else this._compositeWhy.first++;
       }
+      // Whole-volume triggers, decided BEFORE the gates are consumed: a
+      // re-voxelized pyramid (occ revision) invalidates EVERY cell, and so
+      // does a first composite or a retry after skipped dispatches — see the
+      // dirty-consumption note below.
+      const wholeVolume =
+        this._occGeometrySeen !== occGeometryRevision ||
+        !this._compositedOnce ||
+        this._forceWholeComposite === true;
+      this._forceWholeComposite = false;
       this._atlasRevisionSeen = state.atlas.revision;
       this._occGeometrySeen = occGeometryRevision;
       this._compositedOnce = true;
@@ -948,7 +971,21 @@ export class GISystem {
       // any bump without a mark — the fail-safe), mapped to the permissive
       // ±1e9 defaults. __giNoDirtyBrick forces whole-volume (A/B hatch);
       // still consume so stale bounds can't accumulate.
-      const dirty = state.atlas.consumeDirtyBounds();
+      // A DIRTY-BRICK COMPOSITE CAN PERMANENTLY MISS THE PYRAMID ARRIVING.
+      // The boot sequence that shipped as "GI is dark until I move the
+      // model": the first composite ran whole-volume against a pyramid whose
+      // voxelize dispatches were still skipped (async pipeline compiles), so
+      // every cell read empty — and every LATER composite was atlas-bumped
+      // with a small dirty AABB, recompositing only that region. The rest of
+      // the volume kept the empty boot result forever; moving the building
+      // marked its whole AABB dirty, which is why a nudge "fixed" it
+      // (probe-measured: 0.021 lum settled boot → 0.105 after a 1cm nudge).
+      // So: consume the marks ALWAYS (stale bounds must not accumulate), but
+      // ignore them in favour of whole-volume whenever the pyramid's content
+      // changed, this is the first composite, or the previous batch had
+      // skipped dispatches.
+      const consumedDirty = state.atlas.consumeDirtyBounds();
+      const dirty = wholeVolume ? null : consumedDirty;
       // TOP-LEVEL lists first: the composite reads them to decide which
       // slots a cell is allowed to skip, so they have to describe the same
       // slot state the composite is about to sample. Rebuilds only when a
@@ -1014,6 +1051,10 @@ export class GISystem {
         // costs nothing and keeps the stages in order.
         this._compositedOnce = false;
         state.volume.occupancyField?.invalidate();
+        // The retry must NOT be narrowed by whatever small dirty AABB an
+        // unrelated atlas touch queues meanwhile — see the dirty-consumption
+        // note above.
+        this._forceWholeComposite = true;
       }
       this.#maybeLogStats(renderer);
     } else {
@@ -2144,10 +2185,17 @@ export class GISystem {
     // off — user-confirmed ("it flickers even when the light is not
     // moving"). Kept as an opt-in (`__giSunJitter`) for A/B only.
     const shadowJitter = { frame: uniform(0), angle: uniform(0), penAngle: uniform(0.025) };
+    // GI_FLICKER_PLAN.md Phase 1 — field-side radiance EMA (see
+    // cascadeGather's fieldSmoothing note). Retain weight; DEFAULT 0.95
+    // (user-confirmed live, 2026-08-03 — kills the object-motion flicker
+    // without visibly hurting light response). `__giFieldSmoothing` stays as
+    // a live override for further A/B (0 = pre-Phase-1 behaviour).
+    const fieldSmoothing = uniform(globalThis.__giFieldSmoothing ?? 0.95);
     const feedbackCompute = createBounceFeedback(cascades, volume, bounceGain, temporalBlend, {
       lightSlots,
       emitterSlots,
       probeIrradiance: probeIrradiance.buffer,
+      fieldSmoothing,
       // Private to the feedback compute (see createShadowTrace's layout note).
       // STABLE mode — the moving-light flicker fix (see createShadowTrace's
       // stable-mode note): this is the one trace re-evaluated for every field
@@ -2320,6 +2368,7 @@ export class GISystem {
       bounceGain,
       temporalBlend,
       probeSmoothing,
+      fieldSmoothing,
       fieldShadowOff,
       shadowJitter,
       feedbackParity,
@@ -3026,6 +3075,7 @@ export class GISystem {
               : ""),
       );
     }
+    this.#refreshOccupancySlotRemap();
   }
 
   /**
@@ -3531,8 +3581,29 @@ export class GISystem {
    * allocate — the same contract the SDF field's own auto-fit densities use.
    */
   #buildOccupancyField(props, meshes, bounds, size, quality) {
+    // A SAVED `backend` OTHER THAN "occupancy" IS COERCED, NOT HONOURED. The
+    // sdf-legacy transport backend was deleted (session 15b) but scenes saved
+    // before that still carry `backend: "sdf-legacy"` — and honouring it
+    // means returning null here, which with the bake pipeline also deleted
+    // leaves NO transport at all: GI builds, logs happily, and contributes
+    // exactly zero light. That state shipped — the user's own Sponza scene
+    // had the stale value saved, and every harness measurement against it
+    // quietly measured an empty field ("intensity 100 changes nothing", the
+    // failed-CONTROL signature). Same trap as the exactReflections
+    // structural-signature fix: a stored value under a changed control is a
+    // behaviour change. `__giBackend` stays only as a diagnostic kill switch
+    // ("none" disables the field explicitly and owns the consequences).
     const backend = globalThis.__giBackend ?? props.backend ?? "occupancy";
-    if (backend !== "occupancy") return null;
+    if (backend !== "occupancy") {
+      if (globalThis.__giBackend !== undefined && backend !== "occupancy") {
+        console.warn(`[gi] __giBackend="${backend}" — occupancy field disabled by hatch, GI transport will be EMPTY`);
+        return null;
+      }
+      console.warn(
+        `[gi] saved backend "${backend}" no longer exists (sdf-legacy was removed) — using occupancy. ` +
+          "Re-save the scene to clear this.",
+      );
+    }
 
     // STORAGE-BUFFER HEADROOM GATE. The pyramid is one more storage binding in
     // the cascade trace, which already binds the six per-cell field buffers —
@@ -3648,6 +3719,30 @@ export class GISystem {
     for (const p of placements) field.setSlotMatrix(p.slot, p.matrix);
     field.setGeometry(geometries, placements);
     field.placements = placements;
+    this.#refreshOccupancySlotRemap();
+  }
+
+  /**
+   * Uploads the occupancy-slot → atlas-slot bridge (occupancyField.slotAtlas).
+   * The two numberings are assigned independently — placements by mesh-walk
+   * order, atlas slots by #syncSlots capacity/priority — which is exactly the
+   * crossed-numbering bug that once fed the composite a different mesh's
+   * colour and got cellAttr disabled there. Runs after every #syncSlots and
+   * after every occupancy content refresh: the two points where either
+   * numbering can change.
+   */
+  #refreshOccupancySlotRemap() {
+    const field = this.state?.volume?.occupancyField;
+    const atlas = this.state?.atlas;
+    if (!field?.placements || !atlas?.assignments || !field.setSlotAtlas) return;
+    const slotOfKey = new Map();
+    for (let i = 0; i < atlas.assignments.length; i++) {
+      const a = atlas.assignments[i];
+      if (a?.key != null) slotOfKey.set(a.key, i);
+    }
+    for (const p of field.placements) {
+      field.setSlotAtlas(p.slot, slotOfKey.get(slotKeyOf(p.mesh, p.instanceId)) ?? -1);
+    }
   }
 
   /**

@@ -1,7 +1,7 @@
 /**
  * Runtime module exposed to user scripts as `import ... from "engine"`.
  *
- * Two kinds of exports live here:
+ * Three kinds of exports live here:
  *   1. Engine-specific surface — `Script` (base class) and the `attribute`
  *      decorator. `ScriptComponent` injects `entity` / `engine` / `THREE` /
  *      `input` on every script instance regardless of base class, so
@@ -10,6 +10,9 @@
  *      `Vector3` here IS three's `Vector3`, the same constructor the engine
  *      itself uses, so vectors cross the script boundary without conversion
  *      and `instanceof` works.
+ *   3. Component classes — the same constructors the engine registers — so
+ *      scripts can write `entity.getComponent(MeshComponent)` without
+ *      stringly-typed keys.
  *
  * ## What belongs here vs. in `"three"`
  *
@@ -68,6 +71,48 @@ export {
   Object3D,
   Camera,
 } from "three/webgpu";
+
+/**
+ * Component classes for typed lookup. Same constructors the engine registers.
+ * Physics / navigation are included even when those modules are disabled —
+ * the class is only a type token; attaching still needs the module enabled.
+ *
+ * Keep in sync with `ComponentMap` and the `ComponentClass<"…">` consts in
+ * `script-types/engine.d.ts`.
+ *
+ *     import { Script, MeshComponent } from "engine";
+ *     const mesh = this.entity.getComponent(MeshComponent);
+ */
+export { MeshComponent } from "../components/MeshComponent.js";
+export { ModelComponent } from "../components/ModelComponent.js";
+export { AnimationComponent } from "../components/AnimationComponent.js";
+export { TimelineComponent } from "../components/TimelineComponent.js";
+export { IKComponent } from "../components/IKComponent.js";
+export { CameraComponent } from "../components/CameraComponent.js";
+export { VirtualCameraComponent } from "../components/VirtualCameraComponent.js";
+export { ImpulseSourceComponent } from "../components/ImpulseSourceComponent.js";
+export { LightComponent } from "../components/LightComponent.js";
+export { ListenerComponent } from "../components/ListenerComponent.js";
+export { SoundComponent } from "../components/SoundComponent.js";
+export { InstancerComponent } from "../components/InstancerComponent.js";
+export { ParticleComponent } from "../components/ParticleComponent.js";
+export { LineRendererComponent } from "../components/LineRendererComponent.js";
+export { TrailRendererComponent } from "../components/TrailRendererComponent.js";
+export { DecalComponent } from "../components/DecalComponent.js";
+export { LodGroupComponent } from "../components/LodGroupComponent.js";
+export { SplineComponent } from "../components/SplineComponent.js";
+export { SplineFollowerComponent } from "../components/SplineFollowerComponent.js";
+export { SplineMeshComponent } from "../components/SplineMeshComponent.js";
+export { ScriptComponent } from "../components/ScriptComponent.js";
+
+export { RigidbodyComponent } from "../../modules/physics-rapier/RigidbodyComponent.js";
+export { ColliderComponent } from "../../modules/physics-rapier/ColliderComponent.js";
+export { CharacterControllerComponent } from "../../modules/physics-rapier/CharacterControllerComponent.js";
+export { JointComponent } from "../../modules/physics-rapier/JointComponent.js";
+
+export { NavMeshComponent } from "../../modules/navigation/NavMeshComponent.js";
+export { NavAgentComponent } from "../../modules/navigation/NavAgentComponent.js";
+export { NavLinkComponent } from "../../modules/navigation/NavLinkComponent.js";
 
 /**
  * Base class scripts extend for full IntelliSense on `this.entity`,

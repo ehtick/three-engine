@@ -3,6 +3,19 @@ import { createId } from "../shared/ids.js";
 import { createComponent, getComponentClass } from "./components/registry.js";
 
 /**
+ * Accepts either a registered type string (`"mesh"`) or a component class /
+ * token with `static type` (`MeshComponent`). Scripts prefer the class form
+ * so typos fail at compile time: `entity.getComponent(MeshComponent)`.
+ */
+function resolveComponentType(typeOrCtor) {
+  if (typeof typeOrCtor === "string") return typeOrCtor;
+  if (typeOrCtor && typeof typeOrCtor.type === "string") return typeOrCtor.type;
+  throw new TypeError(
+    `Expected a component type string or class with static type, got ${typeof typeOrCtor}`,
+  );
+}
+
+/**
  * PlayCanvas-style entity: a scene-graph node wrapping an Object3D,
  * with components attached for rendering/behavior.
  *
@@ -216,15 +229,17 @@ export class Entity {
    *
    * Lookup matches `Component.type` (the static `type` string on the
    * Component subclass, e.g. "camera", "script", "model"), NOT the entity
-   * name. Compare against `getComponent(type)` if you only want this
-   * entity itself.
+   * name. `type` may be that string or the component class itself
+   * (`CameraComponent`). Compare against `getComponent(type)` if you only
+   * want this entity itself.
    *
    * "find*" returning an array (not the first hit) matches the
    * `querySelectorAll` convention. Generic over `T` in the TS surface so
    * callers can ask for a specific component shape; the runtime returns
    * whatever `Component` instance is in the map.
    */
-  findComponents(type) {
+  findComponents(typeOrCtor) {
+    const type = resolveComponentType(typeOrCtor);
     const out = [];
     if (this.components.has(type)) out.push(this.components.get(type));
     for (const child of this.children) {
@@ -266,7 +281,8 @@ export class Entity {
 
   // ---- Entity tree (distinct from the scene-graph children/parent) -----
 
-  addComponent(type, props) {
+  addComponent(typeOrCtor, props) {
+    const type = resolveComponentType(typeOrCtor);
     if (this.components.has(type)) throw new Error(`Entity already has a "${type}" component`);
     const ComponentClass = getComponentClass(type);
     for (const requirement of ComponentClass?.requiredComponents ?? []) {
@@ -331,7 +347,8 @@ export class Entity {
     this.engine.emit("hierarchy-changed");
   }
 
-  removeComponent(type) {
+  removeComponent(typeOrCtor) {
+    const type = resolveComponentType(typeOrCtor);
     const component = this.components.get(type);
     if (!component) return;
     component.onDetach();
@@ -341,8 +358,16 @@ export class Entity {
     this.engine?.viewOnlyComponents?.delete(component);
   }
 
-  getComponent(type) {
-    return this.components.get(type);
+  /**
+   * Component on this entity by registered type string or component class:
+   *
+   *     import { MeshComponent } from "engine";
+   *     const mesh = this.entity.getComponent(MeshComponent);
+   *
+   * Strings still work (`getComponent("mesh")`) for custom/module types.
+   */
+  getComponent(typeOrCtor) {
+    return this.components.get(resolveComponentType(typeOrCtor));
   }
 
   /**

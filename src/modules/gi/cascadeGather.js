@@ -19,7 +19,7 @@
 // second transport implementation. Direct material shading here deliberately
 // bypasses any G-buffer/deferred-resolve layer (where the prior attempt's
 // never-root-caused stripe bug lived).
-import { Fn, If, Loop, Return, cos, float, floor, fract, instanceIndex, instancedArray, max, mix, mod, select, sin, smoothstep, sqrt, step, vec3, vec4 } from "three/tsl";
+import { Fn, If, Loop, Return, cos, float, floor, fract, instanceIndex, instancedArray, max, mix, mod, select, sin, smoothstep, sqrt, step, uniform, vec3, vec4 } from "three/tsl";
 import { octahedralTexelIndex, octahedralUV } from "./cascadeTrace.js";
 import { sharedFn } from "./giFn.js";
 import { emitterAngularRadius, emitterSlotFactor, emitterSurfaceT } from "./giLight.js";
@@ -89,21 +89,63 @@ export function createProbeIrradiance(cascades, options = {}) {
     });
     const irradiance = sumL.div(max(sumCos, 1e-3)).mul(Math.PI);
 
-    // OPENNESS — "is this probe inside geometry", one level-0 occupancy bit.
+    // OPENNESS — "is this probe inside geometry". CONTINUOUS, not a bit:
+    // the binary cut made a MOVING object pop as it swallowed each probe —
+    // the whole trilinear neighbourhood lost that probe in one frame, and a
+    // sweeping sphere read as banded patches snapping at every lattice
+    // crossing. Fade over the probe's last level-0 voxel of clearance
+    // instead (the near-field oracle is continuous by design): the ramp is
+    // narrow enough that a legitimate probe half a cell off a floor keeps
+    // ~full weight, while a probe about to be swallowed ramps out over
+    // ~0.16m of object travel. Fully buried still lands on
+    // BURIED_PROBE_WEIGHT exactly as before.
     const openness = float(1).toVar();
     if (occupancy?.occupiedAtWorld && !globalThis.__giNoBuriedProbeCut) {
       const probePos = c0.probePositionOf(probe.toFloat());
-      openness.assign(
-        mix(float(1), float(BURIED_PROBE_WEIGHT), occupancy.occupiedAtWorld(probePos, 0)),
-      );
+      if (occupancy.freeRadiusAtWorld && occupancy.voxel) {
+        // `voxel` is the field's live UNIFORM (a TSL node, not a Vector3 —
+        // Math.max on it emits NaN into the WGSL), so take the max GPU-side;
+        // it also keeps the fade width correct across refits.
+        const vox = vec3(occupancy.voxel);
+        const fadeR = vox.x.max(vox.y).max(vox.z);
+        openness.assign(
+          mix(
+            float(BURIED_PROBE_WEIGHT),
+            float(1),
+            smoothstep(float(0), fadeR, occupancy.freeRadiusAtWorld(probePos, 1)),
+          ),
+        );
+      } else {
+        openness.assign(
+          mix(float(1), float(BURIED_PROBE_WEIGHT), occupancy.occupiedAtWorld(probePos, 0)),
+        );
+      }
     }
 
     const value = vec3(irradiance).toVar();
     if (smoothing) {
       const prev = buffer.element(instanceIndex).toVar();
+      // ADAPTIVE HYSTERESIS (the DDGI recipe for "smoothing hides flicker but
+      // lighting reacts too slowly"): the EMA's alpha is not one number. For
+      // SMALL relative changes — voxel-quantization popping, ray-set churn as
+      // things cross cell boundaries — keep the user's heavy smoothing. For
+      // LARGE relative changes — a light or object actually moved — ramp the
+      // alpha up toward `probeSnapAlpha` so the probe converges in a few
+      // frames instead of ~1/alpha. The ramp runs over relative luminance
+      // delta [15%, 60%]: below it is noise (checker cadence and per-cell
+      // churn measure well under 15% per frame at probe scale), above it is
+      // signal. `__giProbeSnap = 0` restores the fixed-alpha EMA live.
+      const base = float(smoothing).clamp(0.02, 1);
+      const delta = irradiance.sub(prev.xyz).abs();
+      const mag = prev.x.max(prev.y).max(prev.z)
+        .max(irradiance.x.max(irradiance.y).max(irradiance.z))
+        .max(1e-4);
+      const rel = delta.x.max(delta.y).max(delta.z).div(mag);
+      const boost = smoothstep(0.15, 0.6, rel);
+      const adaptive = mix(base, float(probeSnapAlpha).max(base), boost);
       // prev.w == 0 ⇒ this slot has never been written (fresh build/refit):
       // take the integral outright rather than lerping up from black.
-      const alpha = select(prev.w.lessThan(1e-3), float(1), float(smoothing).clamp(0.02, 1));
+      const alpha = select(prev.w.lessThan(1e-3), float(1), adaptive);
       value.assign(mix(prev.xyz, irradiance, alpha));
     }
     buffer.element(instanceIndex).assign(vec4(value, openness));
@@ -111,6 +153,48 @@ export function createProbeIrradiance(cascades, options = {}) {
 
   return { buffer, compute };
 }
+
+/**
+ * LIVE RECEIVER-GATHER SURFACE BIAS, as a fraction of a probe cell along the
+ * receiver's normal. Default 0.5 — user-eye-tuned against their Blender
+ * reference (2026-08-03); `__giGatherBias = 0` in the console restores the
+ * unbiased cage. GISystem copies the override into it every tick (the
+ * hatch-must-be-a-uniform rule), so it is tunable live.
+ *
+ * WHY IT EXISTS: on a CURVED receiver (the test-sphere report: "weird colour
+ * transitions that depend on the probe positions") the visibility cuts below
+ * change which of the 8 cage probes survive as the surface normal rotates
+ * through the lattice — flat surfaces are immune (coplanar probes keep full
+ * weight), curved ones show the surviving-set switching as banded patches.
+ * Biasing the TRILINEAR CAGE POSITION off the surface (the standard DDGI
+ * surface bias) moves the cage toward open space so the surviving set changes
+ * less abruptly. ONLY the cage/tent coordinates use the biased point — every
+ * visibility cut still measures the TRUE receiver position and normal, so the
+ * leak defences (plane cut, angle cut, proxy, buried-probe) are unchanged.
+ */
+export const gatherBias = uniform(0.5);
+
+/**
+ * ADAPTIVE-HYSTERESIS SNAP ALPHA (see createProbeIrradiance's EMA): the
+ * per-frame blend a probe ramps TOWARD when its irradiance changes a lot in
+ * one frame. 0.35 ≈ converged in ~4 frames. Live via `__giProbeSnap`
+ * (0 disables adaptivity — the EMA becomes the old fixed-alpha one).
+ */
+export const probeSnapAlpha = uniform(0.35);
+
+/**
+ * VIEW-DIRECTION component of the same bias (fraction of a probe cell toward
+ * the CAMERA), live via `__giGatherViewBias`, default 0.5 (eye-tuned with
+ * the normal component above). Normal bias alone
+ * fails at SILHOUETTES: grazing pixels have a normal pointing sideways, the
+ * cage still lands inside the object, and a curved receiver shows a dark
+ * blob just inside its outline that no reasonable normal bias removes —
+ * while cranking the normal bias instead trades accuracy (the cage samples
+ * open air). Pulling the cage toward the viewer is the standard DDGI split.
+ * Only the screen resolve passes a real view vector; field-cell and
+ * reflection-hit gathers pass vec3(0) (a zero V = normal-bias only).
+ */
+export const gatherViewBias = uniform(0.5);
 
 /**
  * @param {Array} cascades from createRadianceCascades (uses cascades[0])
@@ -180,8 +264,9 @@ export function createIrradianceGather(cascades, probeIrradiance = null, fieldCe
     inputs: [
       { name: "P", type: "vec3" },
       { name: "N", type: "vec3" },
+      { name: "V", type: "vec3" },
     ],
-    body: (P, N) => {
+    body: (P, N, V) => {
       // Uniform-derived values hoisted into locals BEFORE the 8-corner loop —
       // uniform-buffer loads inside loops multiply driver pipeline-compile
       // time (see giField's shadow-trace note).
@@ -190,9 +275,14 @@ export function createIrradianceGather(cascades, probeIrradiance = null, fieldCe
       const minProbeCellV = float(minProbeCell).toVar();
       const geomScaleV = float(geometryScale).toVar();
       const visTolV = float(visTolerance).toVar();
-      const fcX = P.x.sub(minVec.x).div(probeCellVec.x).sub(0.5);
-      const fcY = P.y.sub(minVec.y).div(probeCellVec.y).sub(0.5);
-      const fcZ = P.z.sub(minVec.z).div(probeCellVec.z).sub(0.5);
+      // Cage position, optionally biased along the normal and toward the
+      // viewer (see gatherBias/gatherViewBias above). The cuts below
+      // intentionally keep using the TRUE P/N.
+      const cageOffset = N.mul(float(gatherBias)).add(V.mul(float(gatherViewBias)));
+      const Pb = P.add(cageOffset.mul(minProbeCellV)).toVar();
+      const fcX = Pb.x.sub(minVec.x).div(probeCellVec.x).sub(0.5);
+      const fcY = Pb.y.sub(minVec.y).div(probeCellVec.y).sub(0.5);
+      const fcZ = Pb.z.sub(minVec.z).div(probeCellVec.z).sub(0.5);
       const baseX = floor(fcX).toVar();
       const baseY = floor(fcY).toVar();
       const baseZ = floor(fcZ).toVar();
@@ -246,9 +336,25 @@ export function createIrradianceGather(cascades, probeIrradiance = null, fieldCe
         // pyramid walk per corner per shaded pixel. Only the legacy path (no
         // precomputed irradiance) still asks the field directly.
         if (!probeIrradiance && occupancy?.occupiedAtWorld && !globalThis.__giNoBuriedProbeCut) {
-          weight.mulAssign(
-            mix(float(1), float(BURIED_PROBE_WEIGHT), occupancy.occupiedAtWorld(probePos, 0)),
-          );
+          // Continuous burial ramp, matching createProbeIrradiance's fast
+          // path (see the openness comment there — a moving object popped
+          // as it swallowed each probe under the binary bit).
+          if (occupancy.freeRadiusAtWorld && occupancy.voxel) {
+            // GPU-side max — `voxel` is a uniform node, see the fast path.
+            const vox = vec3(occupancy.voxel);
+            const fadeR = vox.x.max(vox.y).max(vox.z);
+            weight.mulAssign(
+              mix(
+                float(BURIED_PROBE_WEIGHT),
+                float(1),
+                smoothstep(float(0), fadeR, occupancy.freeRadiusAtWorld(probePos, 1)),
+              ),
+            );
+          } else {
+            weight.mulAssign(
+              mix(float(1), float(BURIED_PROBE_WEIGHT), occupancy.occupiedAtWorld(probePos, 0)),
+            );
+          }
         }
         // Distance-visibility proxy: the probe's own raw c0 ray toward P.
         const rel = P.sub(probePos).toVar();
@@ -380,7 +486,9 @@ export function createIrradianceGather(cascades, probeIrradiance = null, fieldCe
       return acc.div(max(cosAcc, 1e-3)).mul(Math.PI).mul(edgeFade);
     },
   });
-  return (P, N) => gatherFn(vec3(P), vec3(N));
+  // V (unit toward-camera) is optional — omitted = vec3(0) = no view bias,
+  // for callers with no meaningful viewer (field cells, reflection hits).
+  return (P, N, V = null) => gatherFn(vec3(P), vec3(N), V ? vec3(V) : vec3(0, 0, 0));
 }
 
 /**
@@ -539,6 +647,19 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
   // a small disc is ~its center value, and stable `If` gates must not churn.
   // `jitter.angle` is a LIVE uniform (radians; 0 disables — the A/B hatch).
   const jitter = options.jitter ?? null;
+  // FIELD-SIDE TEMPORAL EMA (GI_FLICKER_PLAN.md Phase 1) — the freeze
+  // bisect's majority arm: the field had NO integrator of its own, so every
+  // binary flip born in THIS pass (a shadow ray grazing a voxel edge, the
+  // DDA's oracle re-picking samples as a mover re-voxelizes) stepped the
+  // whole downstream pipeline in one frame; the probe EMA downstream is the
+  // only accumulator and cannot absorb field-scale churn without lagging
+  // light response badly (probeSmoothing low = flicker, high = slow — the
+  // user's exact complaint). Blending AT THE SOURCE turns that flip into an
+  // integrable signal. `fieldSmoothing` is the RETAIN weight (0 = off, this
+  // frame's value outright — the pre-Phase-1 behaviour byte-for-byte; 1 =
+  // frozen). GISystem defaults its uniform to 0.95 (user-confirmed live,
+  // 2026-08-03) via `__giFieldSmoothing`.
+  const fieldSmoothing = options.fieldSmoothing ?? null;
 
   return Fn(() => {
     // Temporal ingest of streamed bakes: staging holds the latest CPU bake
@@ -549,6 +670,15 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
     // leading edge would blend up from black and dim.
     const staging = volume.stagingBuffer.element(instanceIndex).toVar();
     const prev = volume.baseBuffer.element(instanceIndex).toVar();
+    // Read BEFORE this frame's write (same thread, same cell — no race):
+    // last frame's radiance/indirect, for the EMA below. `prev.w` (the
+    // BASE buffer's occupancy flag, read a line above) doubles as "was this
+    // cell occupied last frame" — the same signal the base-ingest hysteresis
+    // above already keys on.
+    const prevRadiance = fieldSmoothing ? volume.radianceBuffer.element(instanceIndex).toVar() : null;
+    const prevIndirect =
+      fieldSmoothing && volume.indirectBuffer ? volume.indirectBuffer.element(instanceIndex).toVar() : null;
+    const wasEmpty = prev.w.lessThan(0.5);
     const alpha = float(1).toVar();
     If(staging.w.sub(prev.w).abs().lessThan(0.5), () => {
       alpha.assign(blendUniform);
@@ -762,7 +892,7 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
       // both-sides rule made every wall's OUTSIDE shell re-radiate the
       // room's energy (glowing wall backs, light pools outside). max/min:
       // WGSL min/max return the non-NaN operand → NaN scrub for the loop.
-      const irradiance = gather(cellCenter.add(normal.mul(normalLiftV)), normal).max(vec3(0)).min(vec3(1e4));
+      const irradiance = gather(cellCenter.add(normal.mul(normalLiftV)), normal, vec3(0)).max(vec3(0)).min(vec3(1e4));
       // Albedo clamped to 0.9: a pure-white (albedo 1.0) enclosed room makes
       // the feedback series diverge even at gain 1 — real surfaces never
       // reflect 100%, and the clamp guarantees loop gain ≤ 0.9·gainUniform.
@@ -772,6 +902,18 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
       out.assign(vec4(out.xyz.add(bounceTerm), 1));
       indirect.addAssign(bounceTerm);
     });
+    if (fieldSmoothing) {
+      // Retain weight 0 for a cell that just went empty→occupied (the
+      // `wasEmpty` test from the top) — takes `out`/`indirect` outright, no
+      // fade-in from black through half-lit. Every other occupied cell
+      // blends toward last frame's value at the source, which is what makes
+      // a shadow-ray/DDA-oracle flip an integrable ramp instead of a step
+      // the whole downstream (probe EMA, screen resolve) inherits.
+      const fieldAlpha = float(fieldSmoothing).toVar();
+      If(wasEmpty, () => { fieldAlpha.assign(0); });
+      out.assign(vec4(mix(out.xyz, prevRadiance.xyz, fieldAlpha), out.w));
+      if (prevIndirect) indirect.assign(mix(indirect, prevIndirect.xyz, fieldAlpha));
+    }
     volume.radianceBuffer.element(instanceIndex).assign(out);
     if (volume.indirectBuffer) {
       volume.indirectBuffer.element(instanceIndex).assign(vec4(indirect, base.w));

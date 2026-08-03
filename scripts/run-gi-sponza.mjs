@@ -52,7 +52,15 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 const browser = await puppeteer.launch({
   executablePath: "C:/Program Files/Google/Chrome/Application/chrome.exe",
   headless: process.env.HEADED ? false : "new",
-  args: ["--enable-unsafe-webgpu", "--enable-features=WebGPU", "--no-sandbox", "--disable-dev-shm-usage"],
+  // The three --disable-background* flags are MANDATORY (see gi-module Round
+  // 15): an occluded/headless window gets ~1/s timer throttling, which
+  // starves the async compute-pipeline compiles — the GI field never
+  // populates and every GI toggle measures a frame whose indirect term is
+  // zero (on == off byte-identical, the failed-CONTROL signature).
+  args: [
+    "--enable-unsafe-webgpu", "--enable-features=WebGPU", "--no-sandbox", "--disable-dev-shm-usage",
+    "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding",
+  ],
 });
 const page = await browser.newPage();
 await page.setViewport({ width: 1400, height: 900, deviceScaleFactor: 1 });
@@ -184,20 +192,50 @@ await must("viewport.focus", { id: sponza.id });
 await wait(1200);
 const framed = await call("viewport.getCamera", {});
 if (framed.ok && framed.value?.position && framed.value?.target) {
-  const p0 = framed.value.position;
   const t0 = framed.value.target;
-  // DOLLY ALONG THE FOCUS RAY. Two attempts to compute a "standing in the nave
-  // at eye height" pose from bounds both put the eye BELOW the model (y=-11,
-  // then y=-3.2) and measured black frames; this one is verified good — 0.45
-  // frame luminance with all 84 sample tiles non-black. Do not replace it with
-  // another height heuristic without checking the tile count in the output.
-  const pos = [0, 1, 2].map((i) => t0[i] + (p0[i] - t0[i]) * 0.18);
-  await must("viewport.setCamera", { position: pos, target: t0 });
-  console.log(`  camera ${pos.map((v) => v.toFixed(1))} → ${t0.map((v) => v.toFixed(1))} (focus ray, dollied to 18%)`);
+  // STAND INSIDE THE NAVE — run-gi-shot's verified pose. The old 18%-dolly
+  // along the focus ray was "verified good" once, but `viewport.focus` on this
+  // scene now lands on the ROOF (the documented run-gi-shot trap), so the
+  // dolly parked the camera in the rafters staring at blown-out roof tiles —
+  // and every chroma/leak number measured the roof: an attribution change
+  // that visibly recoloured the atrium live measured BYTE-IDENTICAL here.
+  // Focus target = model centre; drop near floor level and look down the
+  // long (x) axis, straight at the curtain colonnade.
+  // THE USER'S OWN GAME-CAMERA POSE, hardcoded from scenes/Main.scene: their
+  // Camera entity stands at (10.59, 0.64, -0.35) at the nave's east end
+  // looking down -x past the test sphere at (6.81, 1.49) — the exact view of
+  // every screenshot they judge GI by (floor + curtain colonnade + sphere).
+  // Every t0-derived heuristic failed here: `viewport.focus` targets the
+  // COMBINED bounds centre (y=11.2 — mid-air), "-7.2" landed the eye inside
+  // second-floor masonry (0.07 lum, 0/84 tiles), and the scene centre holds
+  // the sphere itself (0.00 lum). If the user moves the building, re-derive
+  // from their Camera entity, not from focus.
+  // POSE FROM THE TEST SPHERE, verified by probe (run-gi-campose-probe):
+  // 5m east of it at eye height looking west down the colonnade — interior,
+  // curtains left and right, floor filling the lower frame. Every t0-derived
+  // heuristic failed on this scene (focus targets the combined bounds centre
+  // in mid-air; the scene centre holds the sphere; "-7.2" landed inside
+  // second-floor masonry).
+  const pos = [11.8, 2.2, 0.73];
+  const look = [-3.2, 1.0, -1.47];
+  await must("viewport.setCamera", { position: pos, target: look });
+  console.log(`  camera ${pos.map((v) => v.toFixed(1))} → ${look.map((v) => v.toFixed(1))} (inside nave, -x)`);
 }
 
+// SUN ANGLES ARE DELTAS FROM THE SAVED ROTATION, NOT ABSOLUTE. The scene's
+// sun is saved at rotation [-1.863, 0, 0.02] (intensity 50) and that is the
+// lighting every user screenshot is judged under; the old absolute
+// [pitch, 0.35, 0] family lit the ROOF nicely and left the interior almost
+// black at every pitch tried (probe-verified), so interior chroma/leak
+// numbers measured nothing. delta 0 = the user's lighting; delta 180 flips
+// the sun to the opposite hemisphere for the leak's dark frame.
+const sunRot0 = (await must("entity.get", { id: sun.id }))?.rotation ?? [-1.863, 0, 0.02];
+console.log(`  sun saved rotation: [${sunRot0.map((v) => (+v).toFixed(3))}]`);
 const setSunPitch = (deg) =>
-  must("entity.setTransform", { id: sun.id, rotation: [(deg * Math.PI) / 180, 0.35, 0] });
+  must("entity.setTransform", {
+    id: sun.id,
+    rotation: [sunRot0[0] + (deg * Math.PI) / 180, sunRot0[1], sunRot0[2]],
+  });
 
 // SOME PROPS REBUILD. Setting `enabled` (or `killSdf`, or `quality`) tears down
 // and rebuilds the GI state, and the viewport is SUSPENDED through the compile
@@ -297,8 +335,11 @@ async function report(modeLabel) {
   // +X rotation turned out to be the DARK direction, so the first run reported
   // the lit case as "sun below" and vice versa. Whichever pitch renders brighter
   // with GI off is the lit one, by definition — no convention to get wrong.
-  const s1 = await sample(-25, `${modeLabel}-p-25`);
-  const s2 = await sample(55, `${modeLabel}-p55`);
+  // Delta 0 = the user's saved lighting (the lit case by construction);
+  // delta 180 flips the sun to the opposite hemisphere (the leak's dark
+  // frame). The brighter-off-frame auto-selection below stays as the guard.
+  const s1 = await sample(0, `${modeLabel}-p0`);
+  const s2 = await sample(180, `${modeLabel}-p180`);
   const lit = s1.off.lum >= s2.off.lum ? s1 : s2;
   const dark = lit === s1 ? s2 : s1;
   console.log(`  LIT  frame  GI on ${lit.on.lum.toFixed(5)}  off ${lit.off.lum.toFixed(5)}  ADDED ${lit.added.toFixed(5)}   chroma added ${lit.addedChroma.toFixed(4)}`);

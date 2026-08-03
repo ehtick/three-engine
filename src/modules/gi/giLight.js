@@ -608,7 +608,7 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
     const deferred = light.giIrradianceNode != null;
     const irradiance = deferred
       ? vec3(light.giIrradianceNode.sample(screenUV)).toVar()
-      : vec3(light.gatherFn(samplePoint, N)).mul(light.intensityUniform);
+      : vec3(light.gatherFn(samplePoint, N, cameraPosition.sub(positionWorld).normalize())).mul(light.intensityUniform);
     builder.context.irradiance.addAssign(irradiance);
 
     // Promoted emissive emitters = analytic sphere area lights, evaluated

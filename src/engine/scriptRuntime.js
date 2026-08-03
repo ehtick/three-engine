@@ -127,7 +127,7 @@ const matcherFor = (specifier) =>
 /**
  * Rewrites the bare specifiers in a user script to absolute proxy URLs:
  *
- *   "engine"       → Script / attribute / three's math types
+ *   "engine"       → Script / attribute / math / component class tokens
  *   "editor"       → the Editor API + @executeInEditMode / @menuItem
  *   "three"        → the full three/webgpu surface (same instance as the engine)
  *   "three/webgpu" → ditto

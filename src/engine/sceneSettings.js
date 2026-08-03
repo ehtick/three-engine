@@ -303,10 +303,18 @@ export async function resolveRendererLimits() {
     if (storage > 8) requiredLimits.maxStorageBuffersPerShaderStage = Math.min(16, storage);
     const uniforms = adapter?.limits?.maxUniformBuffersPerShaderStage ?? 0;
     if (uniforms > 12) requiredLimits.maxUniformBuffersPerShaderStage = Math.min(24, uniforms);
+    // One line, always: when GI later refuses the occupancy backend ("device
+    // gate"), THIS is the first thing to check — a null adapter here means the
+    // device was created at baseline limits and every >8-storage /
+    // >12-uniform pipeline will silently drop.
+    console.info(
+      `[engine] webgpu adapter ${adapter ? "ok" : "NULL"} — limits ask: ${JSON.stringify(requiredLimits)}`,
+    );
     if (Object.keys(requiredLimits).length > 0) return { requiredLimits };
-  } catch {
+  } catch (err) {
     // No WebGPU, or the adapter query failed — fall through to the baseline.
     // The renderer's own init() will report the real problem if there is one.
+    console.info(`[engine] webgpu limits query threw: ${err?.message ?? err}`);
   }
   return {};
 }

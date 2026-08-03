@@ -59,7 +59,7 @@ await new Promise((r) => setTimeout(r, 6000));
 // through a global rather than returning, because it is imported as a module.
 // ---------------------------------------------------------------------------
 const USER_SCRIPT = `
-import { Script, attribute, Vector3, Quaternion, MathUtils, Spherical } from "engine";
+import { Script, attribute, Vector3, Quaternion, MathUtils, Spherical, MeshComponent, LightComponent } from "engine";
 import * as THREE from "three";
 import { InstancedMesh, MeshStandardNodeMaterial, BoxGeometry, AnimationMixer } from "three/webgpu";
 import { Fn, uniform, vec3 } from "three/tsl";
@@ -79,6 +79,12 @@ export default class Turret extends Script {
         quaternionInvert: typeof new Quaternion().invert === "function",
         mathUtilsLerp: MathUtils.lerp(0, 10, 0.5),
         spherical: typeof new Spherical().setFromVector3 === "function",
+      },
+      // Component class tokens — same constructors the engine registers.
+      components: {
+        meshType: MeshComponent.type,
+        lightType: LightComponent.type,
+        meshIsFunction: typeof MeshComponent === "function",
       },
       // The three surface a script can reach. Every one of these was
       // \`undefined\` under the old 28-symbol allowlist except Mesh/Group.
@@ -188,6 +194,11 @@ check("Vector3 is a real class with real methods", out.engineMath.vector3 === Ma
 check("Quaternion has invert() (not the phantom inverse())", out.engineMath.quaternionInvert === true);
 check("MathUtils.lerp works", out.engineMath.mathUtilsLerp === 5);
 check("Spherical is exported (new to the engine surface)", out.engineMath.spherical === true);
+
+// --- component class tokens on "engine" -------------------------------------
+check('MeshComponent.type is "mesh"', out.components.meshType === "mesh", `type=${out.components.meshType}`);
+check('LightComponent.type is "light"', out.components.lightType === "light", `type=${out.components.lightType}`);
+check("MeshComponent is the real class", out.components.meshIsFunction === true);
 
 // --- the three surface ------------------------------------------------------
 for (const [name, key] of [
