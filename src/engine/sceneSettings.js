@@ -276,6 +276,16 @@ export function rendererConstructorOptions(settings) {
  * report 16 or more; asking for it costs nothing and removes a whole class of
  * "the compute batch silently failed" bugs.
  *
+ * The same applies to `maxUniformBuffersPerShaderStage`, baseline **12**. GI's
+ * uniform-slot design (analytic light slots, emitter slots, per-mesh transform
+ * tables — all deliberately uniforms so that moving a light or a mesh costs a
+ * uniform write and never a rebuild) means a compute stage that combines two of
+ * those systems runs out: shading a BVH reflection hit with the cascade gather
+ * plus emitters plus lights asks for 16. The failure mode is identical to the
+ * storage-buffer one and just as opaque — "The number of uniform buffers (16)
+ * in the Compute stage exceeds the maximum per-stage limit (12)", after which
+ * the pipeline is invalid and EVERY compute submitted with it is dropped.
+ *
  * REQUESTING BLIND WOULD BE WORSE THAN NOT ASKING. `requiredLimits` is a hard
  * requirement — `requestDevice` REJECTS if the adapter cannot meet it, which
  * would turn a renderer that works today into no renderer at all on weaker
@@ -288,10 +298,12 @@ export function rendererConstructorOptions(settings) {
 export async function resolveRendererLimits() {
   try {
     const adapter = await navigator.gpu?.requestAdapter?.();
-    const available = adapter?.limits?.maxStorageBuffersPerShaderStage ?? 0;
-    if (available > 8) {
-      return { requiredLimits: { maxStorageBuffersPerShaderStage: Math.min(16, available) } };
-    }
+    const requiredLimits = {};
+    const storage = adapter?.limits?.maxStorageBuffersPerShaderStage ?? 0;
+    if (storage > 8) requiredLimits.maxStorageBuffersPerShaderStage = Math.min(16, storage);
+    const uniforms = adapter?.limits?.maxUniformBuffersPerShaderStage ?? 0;
+    if (uniforms > 12) requiredLimits.maxUniformBuffersPerShaderStage = Math.min(24, uniforms);
+    if (Object.keys(requiredLimits).length > 0) return { requiredLimits };
   } catch {
     // No WebGPU, or the adapter query failed — fall through to the baseline.
     // The renderer's own init() will report the real problem if there is one.

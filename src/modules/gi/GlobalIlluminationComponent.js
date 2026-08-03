@@ -16,7 +16,7 @@ import { Component } from "../../engine/components/Component.js";
  */
 export class GlobalIlluminationComponent extends Component {
   static type = "global-illumination";
-  static label = "Global Illumination (RC)";
+  static label = "Global Illumination";
   static tags = ["rendering", "lighting", "gi", "radiance-cascades"];
   // ZERO-SETUP BY DEFAULT: a freshly added component auto-fits the scene
   // and derives every density from the quality preset — enable and done.
@@ -24,7 +24,7 @@ export class GlobalIlluminationComponent extends Component {
   // untouched by this default.)
   static defaults = {
     autoFit: true,
-    quality: "high",
+    quality: "medium",
     sizeX: 40,
     sizeY: 12,
     sizeZ: 40,
@@ -41,6 +41,20 @@ export class GlobalIlluminationComponent extends Component {
     skyIntensity: 0,
     bounce: 1,
     temporalBlend: 0.25,
+    // Per-probe temporal smoothing of the gathered irradiance (1 = off). The
+    // scene's geometry never moves, so a settled image is bit-identical at any
+    // setting — this only damps the frame-to-frame wobble of the field under a
+    // moving light. Lower = steadier but laggier.
+    //
+    // 0.02 — THE USER'S OWN FINDING (2026-08-02), on their Sponza, after the
+    // discrete cliffs were removed from the feedback trace: bounce 1 +
+    // smoothing 0.02 = "no flicker". That is a ~50-frame EMA, i.e. DDGI's
+    // standard ~0.98 hysteresis — the industry answer to exactly this
+    // problem. It could not work earlier because an EMA damps smooth jitter,
+    // not binary square-waves; with the cliffs gone it is the right tool.
+    // Cost: indirect light trails a fast-moving light by up to ~1s. Direct
+    // light and shadows are three's own and stay instant.
+    probeSmoothing: 0.02,
     reflections: true,
     // Per-triangle BVH reflections are an explicit High/Ultra opt-in. The
     // trace is shared by the half-resolution screen resolve; materials only
@@ -53,18 +67,32 @@ export class GlobalIlluminationComponent extends Component {
     // a fp16 brick per surface-adjacent cell, giving traces sub-cell occlusion
     // for one extra texture fetch. Costs VRAM (the pool scales with quality),
     // which is why it is opt-in rather than always on.
-    // TRACING BACKEND. "sdf-legacy" sphere-traces the composited per-mesh SDF
-    // field; "occupancy" hit-tests a conservative triangle-occupancy pyramid at
-    // ~0.125m with a hierarchical DDA (docs/rc-gi-implementation-spec.md
-    // phases 1+4, src/modules/gi/occupancyField.js).
+    // TRACING BACKEND. "occupancy" hit-tests a conservative triangle-occupancy
+    // pyramid with a hierarchical DDA (occupancyField.js); "sdf-legacy" sphere-
+    // traces the composited per-mesh SDF field.
     //
-    // WHY IT EXISTS: the composited field is ~0.33m on a building-sized volume,
-    // so a 0.5m column is one and a half cells wide and diffuse transport walks
-    // through it. Occupancy is rasterized straight from triangles, so sub-cell
-    // geometry is PRESENT rather than melted — which is what stops light
-    // passing through walls. Costs a voxelization dispatch per geometry change
-    // and ~2MB of VRAM; opt-in until it has been proven on real scenes.
-    backend: "sdf-legacy",
+    // OCCUPANCY IS THE DEFAULT because it is the one that does not leak: the
+    // composited field is ~0.33m on a building-sized volume, so a 0.5m column
+    // is one and a half cells wide and diffuse transport walks through it,
+    // while occupancy is rasterized straight from triangles.
+    //
+    // "sdf-legacy" IS KEPT ON PURPOSE, and this is the honest reason: occupancy
+    // costs a voxelization dispatch on every geometry change and a longer DDA
+    // on every transport ray, and on a large real scene that has been enough to
+    // hang a GPU outright (DXGI_ERROR_DEVICE_HUNG). It was deleted once, on the
+    // grounds that one transport path is better than two — which is true right
+    // up until the one path is the expensive one and there is nothing to fall
+    // back to. Delete it again when occupancy has been measured on a
+    // building-sized scene at every quality tier, not before.
+    backend: "occupancy",
+    // (`killSdf` lived here 2026-08-01 → 2026-08-02. SDF-free won on
+    // measurement — the baked-SDF path put 207% of a lit frame's indirect into
+    // a frame with NO direct light (the under-floor glow; the "colour bleed"
+    // was the leak's own chroma) while SDF-free measured 0% at 86% of the
+    // legitimate indirect (scripts/run-gi-sponza.mjs). The whole bake pipeline
+    // — bakeCore.js, bakeWorker.js, the Library/gi-sdf cache, export
+    // packaging, runtime browser bakes — is deleted; there is no SDF mode to
+    // toggle back to. Saved scenes carrying the old prop are ignored.)
     sparseField: false,
     emissiveShadows: true,
     autoRebake: true,
@@ -111,15 +139,19 @@ export class GlobalIlluminationComponent extends Component {
     // How fast streamed re-bakes blend into the live field. 1 = instant
     // snap (DISABLES the anti-flicker smoothing); 0.2-0.3 is the sweet spot.
     { key: "temporalBlend", label: "Bake Smoothing (1=off)", type: "number", min: 0.02, max: 1, step: 0.01, advanced: true, flipsToCustom: "quality" },
+    // Deliberately NOT `flipsToCustom` — it is a stability knob, not a quality
+    // level, and switching preset must not silently reset it.
+    { key: "probeSmoothing", label: "Light Smoothing (1=off)", type: "number", min: 0.02, max: 1, step: 0.01, advanced: true },
     { key: "reflections", label: "GI Reflections", type: "boolean", advanced: true, flipsToCustom: "quality" },
     { key: "exactReflections", label: "Exact Reflections (High/Ultra)", type: "boolean", advanced: true, flipsToCustom: "quality" },
-    { key: "backend", label: "Tracing Backend", type: "select", options: ["sdf-legacy", "occupancy"], advanced: true, flipsToCustom: "quality" },
+    { key: "backend", label: "Tracing Backend", type: "select", options: ["occupancy", "sdf-legacy"], advanced: true, flipsToCustom: "quality" },
     { key: "sparseField", label: "Sparse Fine Field (sub-cell occlusion)", type: "boolean", advanced: true, flipsToCustom: "quality" },
     { key: "emissiveShadows", label: "Emissive Shadows", type: "boolean", advanced: true, flipsToCustom: "quality" },
     { key: "autoRebake", label: "Auto Re-bake", type: "boolean", advanced: true, flipsToCustom: "quality" },
-    // "occupancy" renders only when `backend` is "occupancy" — it marches the
-    // pyramid with the SAME hierarchical DDA the transport rays use, so it is
-    // the instrument for "is this column actually in the field".
+    // "occupancy" marches the pyramid with the SAME hierarchical DDA the
+    // transport rays use, so it is the instrument for "is this column
+    // actually in the field". "sdf" shows the composited distance field the
+    // shadow and mirror traces still read.
     { key: "debugProbes", label: "Debug View", type: "select", options: ["off", "raw", "merged", "sdf", "occupancy"], advanced: true, flipsToCustom: "quality" },
   ];
 

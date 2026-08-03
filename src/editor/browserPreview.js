@@ -68,7 +68,7 @@ async function startLivePreview({ root, outDir, onProgress }) {
   const schedule = (assetPath = "") => {
     if (stopped) return;
     dirty = true;
-    if (/[/\\]Library[/\\]gi-sdf[/\\]/i.test(assetPath)) derivedDirty = true;
+    // (gi-sdf derived-data tracking removed with the SDF bake pipeline.)
     clearTimeout(timer);
     timer = setTimeout(flush, 250);
   };

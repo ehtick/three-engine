@@ -1,6 +1,7 @@
-// Voxel-free GI medium: the global scene field is COMPOSITED ON THE GPU
-// from per-mesh SDFs (meshSdfAtlas.js) — there is no CPU voxelizer, no bake
-// worker for scene changes, and no incremental region math. Moving a mesh
+// THE GI FIELD (formerly sdfScene.js — renamed 2026-08-02 when the mesh-SDF
+// bake pipeline was deleted): the global scene field, composited on the GPU
+// from the occupancy pyramid's distance oracle + the slot registry's
+// analytic shapes and per-slot albedo/emissive (slotRegistry.js). Moving a mesh
 // updates its slot uniforms and re-runs one compute pass (~1-2ms for the
 // whole grid); the cascade transport on top is unchanged.
 //
@@ -14,88 +15,27 @@
 //                     gba = normal·0.5+0.5; written by the composite pass,
 //                     sampled with HARDWARE TRILINEAR by the traces.
 import * as THREE from "three/webgpu";
-import { Break, Discard, Fn, If, Loop, cameraPosition, float, floor, instanceIndex, instancedArray, ivec3, mod, positionWorld, select, step, texture3D, textureStore, uniform, vec3, vec4 } from "three/tsl";
-import { SDF_CAP, bakeMeshSdf } from "./bakeCore.js";
+import { Break, Discard, Fn, If, Loop, cameraPosition, float, floor, instanceIndex, instancedArray, ivec3, mix, mod, positionWorld, select, smoothstep, step, texture3D, textureStore, uniform, vec3, vec4 } from "three/tsl";
 import { sharedFn } from "./giFn.js";
 import { createInstanceGrid, loopCandidates } from "./instanceGrid.js";
 import { createSparseField } from "./sparseField.js";
 import { createTrilinearRadianceSampler } from "./voxelizeOnce.js";
 
 
-/**
- * Session-lifetime mesh-SDF baker: a dedicated worker (a dense mesh bake
- * can run seconds; nothing shares this worker so it can't stall anything).
- * OWNED BY THE SYSTEM, not the per-build medium — volume rebuilds (auto-fit
- * refits, structural prop edits) must never kill in-flight bakes, or their
- * cache entries would stay "pending" forever and the meshes would silently
- * never enter the GI field.
- */
-export function createSdfBaker() {
-  let worker = null;
-  let workerBroken = false;
-  let requestId = 0;
-  const requests = new Map(); // requestId → { resolve, reject }
-
-  const ensureWorker = () => {
-    if (worker || workerBroken) return worker;
-    try {
-      worker = new Worker(new URL("./bakeWorker.js", import.meta.url), { type: "module" });
-      worker.onmessage = (event) => {
-        const message = event.data;
-        if (message.type !== "meshSdf") return;
-        const request = requests.get(message.requestId);
-        requests.delete(message.requestId);
-        if (request) {
-          if (message.error) request.reject(new Error(message.error));
-          else request.resolve(message.sdf);
-        }
-      };
-      worker.onerror = (error) => {
-        console.warn("[gi] SDF worker failed, mesh SDFs will bake on the main thread:", error.message ?? error);
-        for (const request of requests.values()) request.reject(new Error("SDF worker died"));
-        requests.clear();
-        workerBroken = true;
-        worker?.terminate();
-        worker = null;
-      };
-    } catch {
-      workerBroken = true;
-    }
-    return worker;
-  };
-
-  return {
-    request(record, maxAxisRes = undefined) {
-      if (!ensureWorker()) {
-        return Promise.resolve(bakeMeshSdf(record.positions, record.index, maxAxisRes || undefined));
-      }
-      return new Promise((resolve, reject) => {
-        requestId++;
-        requests.set(requestId, { resolve, reject });
-        worker.postMessage({
-          type: "meshSdf",
-          requestId,
-          maxAxisRes: maxAxisRes || 0,
-          geometryKey: record.geometryKey ?? `sdf:${requestId}`,
-          geometry: { positions: record.positions, index: record.index },
-        });
-      });
-    },
-    dispose() {
-      for (const request of requests.values()) request.reject(new Error("SDF baker disposed"));
-      requests.clear();
-      worker?.terminate();
-      worker = null;
-    },
-  };
-}
+// The mesh-SDF baker (a dedicated worker running bakeCore) lived here until
+// 2026-08-02. SDF-free mode shipped, measured better on the real scene (see
+// GlobalIlluminationComponent killSdf notes), and the bake pipeline was
+// deleted: bakeCore.js, bakeWorker.js, the Library/gi-sdf cache and the
+// runtime-bake path are gone. The occupancy pyramid is the only geometry
+// medium.
+const SDF_CAP = 16;
 
 /**
  * @param {{min: THREE.Vector3, max: THREE.Vector3}} bounds world AABB
  * @param {{x,y,z}} res global grid cells per axis
- * @param {import("./meshSdfAtlas.js").MeshSdfAtlas} atlas
+ * @param {import("./slotRegistry.js").SlotRegistry} atlas
  */
-export function createSdfScene(bounds, res, atlas, options = {}) {
+export function createGiField(bounds, res, atlas, options = {}) {
   const cellCount = res.x * res.y * res.z;
   const size = new THREE.Vector3().subVectors(bounds.max, bounds.min);
   const cell = new THREE.Vector3(size.x / res.x, size.y / res.y, size.z / res.z);
@@ -200,6 +140,12 @@ export function createSdfScene(bounds, res, atlas, options = {}) {
   //
   // See createSceneTrace's note for exactly which rays moved and which did not.
   const occField = options.occupancyField ?? null;
+  // The composite's cell grid is chosen HERE, not by the pyramid (whose level-0
+  // resolution is picked for tracing and is deliberately finer). Telling the
+  // field about it before any graph is built is what lets the voxelizer write
+  // surface attribution straight into cells this pass indexes by
+  // `instanceIndex` — no resampling, no second coordinate system.
+  occField?.setCoarseRes(res);
   // Pyramid level whose voxel is at least one coarse cell across. The composite
   // uses it to force `occupied` where triangles pass, so sub-cell geometry gets
   // a radiance/albedo shell instead of vanishing. CONSERVATIVE on purpose (a
@@ -213,6 +159,21 @@ export function createSdfScene(bounds, res, atlas, options = {}) {
         Math.ceil(Math.log2(Math.max(1, occField.res.x / res.x))),
       ))
     : 0;
+  // ───────────────────────────────────────────────── SDF-FREE DISTANCE SOURCE
+  // With this on, NOTHING in the lighting path reads a baked mesh SDF: the
+  // composited distance comes from the occupancy pyramid's distance oracle
+  // (`freeRadiusAtWorld`) instead of min-ing the per-mesh atlas slots, and the
+  // shadow/mirror traces sharpen against the same oracle instead of
+  // `atlas.refineDetail`. That retires the 40 MB atlas, the bake worker and the
+  // `.sdf` cache — the download-size and hosted-build blockers — in one switch.
+  //
+  // Requires an occupancy field by construction: without one there is no other
+  // distance source at all, so this silently stays off.
+  // SDF-free is no longer a mode — the bake pipeline is deleted. The only
+  // reason this flag survives is the (never-observed) device without an
+  // occupancy field, which degrades to the legacy branches with an empty
+  // atlas rather than crashing.
+  const killSdf = !!occField;
 
   // ------------------------------------------------------------- composite
   // One thread per global cell: min all slot SDFs → distance + nearest-slot
@@ -238,27 +199,81 @@ export function createSdfScene(bounds, res, atlas, options = {}) {
     If(inDirty, () => {
       const minD = float(world.capWorld).toVar();
       const best = float(-1).toVar();
-      // Only the slots the grid lists for this cell — the AABB test below
-      // still runs, so a conservative list costs nothing but time.
-      loopCandidates(grid, atlas.capacity, p, (slot) => {
-        const bmin = atlas.aabbMin.element(slot).toVar();
-        If(bmin.w.greaterThan(0.5), () => {
-          const bmax = atlas.aabbMax.element(slot);
-          const inside = p.x.greaterThan(bmin.x)
-            .and(p.y.greaterThan(bmin.y))
-            .and(p.z.greaterThan(bmin.z))
-            .and(p.x.lessThan(bmax.x))
-            .and(p.y.lessThan(bmax.y))
-            .and(p.z.lessThan(bmax.z));
-          If(inside, () => {
-            const d = atlas.sampleSlot(slot, p).toVar();
-            If(d.lessThan(minD), () => {
-              minD.assign(d);
-              best.assign(slot.toFloat());
+      if (killSdf) {
+        // THE PYRAMID IS THE DISTANCE (see `killSdf`). Every level, because
+        // this is the only distance source in the build — the bound saturates
+        // at `2^(levels-1) · voxel`, which the cap clamps anyway, and the
+        // composite runs on change rather than per ray so it can afford them.
+        // `capWorld` saturation: consumers test `d < 0.85·capWorld` to mean
+        // "not open space", so the oracle has to top out where they expect.
+        // See freeRadiusAtWorld's saturation note.
+        minD.assign(occField.freeRadiusAtWorld(p, undefined, true, world.capWorld).min(minD));
+        // ...BUT `best` STILL HAS TO BE FOUND, and it does not need an SDF.
+        //
+        // `best` names the slot whose mean albedo/emissive this cell carries,
+        // and INDIRECT LIGHT IS ALBEDO — a cell with no albedo reflects
+        // nothing, so leaving `best` at -1 here (on the theory that `cellAttr`
+        // would answer it instead) produced a scene with direct light and no
+        // bounce at all. `cellAttr` is a good answer when it has one, but it is
+        // one unverified mechanism and this is the whole indirect term; it must
+        // not be the only source.
+        //
+        // ATTRIBUTION IS BY NEAREST SLOT, exactly as on the SDF path — and it
+        // needs no baked grid here, because in this mode EVERY slot is analytic
+        // (`#buildEntries` gives any mesh without a fitted primitive a bounding
+        // box), so `sampleSlot` is closed form.
+        //
+        // A "smallest containing AABB" heuristic was tried instead and was
+        // badly wrong: `atlas.aabbExpand = capWorld` inflates every slot box by
+        // ~5.6 m, so a cell in the middle of a room is inside DOZENS of them
+        // and the smallest is just whichever small prop happens to be nearby.
+        // On Sponza that meant the curtains and banners won almost everywhere
+        // and the entire indirect term took their colour — the "all indirect
+        // looks very red" report. Containment says which boxes are in range;
+        // only a DISTANCE says which surface a cell belongs to.
+        const bestD = float(1e30).toVar();
+        loopCandidates(grid, atlas.capacity, p, (slot) => {
+          const bmin = atlas.aabbMin.element(slot).toVar();
+          If(bmin.w.greaterThan(0.5), () => {
+            const bmax = atlas.aabbMax.element(slot);
+            const inside = p.x.greaterThan(bmin.x)
+              .and(p.y.greaterThan(bmin.y))
+              .and(p.z.greaterThan(bmin.z))
+              .and(p.x.lessThan(bmax.x))
+              .and(p.y.lessThan(bmax.y))
+              .and(p.z.lessThan(bmax.z));
+            If(inside, () => {
+              const d = atlas.sampleSlot(slot, p).toVar();
+              If(d.lessThan(bestD), () => {
+                bestD.assign(d);
+                best.assign(slot.toFloat());
+              });
             });
           });
         });
-      });
+      } else {
+        // Only the slots the grid lists for this cell — the AABB test below
+        // still runs, so a conservative list costs nothing but time.
+        loopCandidates(grid, atlas.capacity, p, (slot) => {
+          const bmin = atlas.aabbMin.element(slot).toVar();
+          If(bmin.w.greaterThan(0.5), () => {
+            const bmax = atlas.aabbMax.element(slot);
+            const inside = p.x.greaterThan(bmin.x)
+              .and(p.y.greaterThan(bmin.y))
+              .and(p.z.greaterThan(bmin.z))
+              .and(p.x.lessThan(bmax.x))
+              .and(p.y.lessThan(bmax.y))
+              .and(p.z.lessThan(bmax.z));
+            If(inside, () => {
+              const d = atlas.sampleSlot(slot, p).toVar();
+              If(d.lessThan(minD), () => {
+                minD.assign(d);
+                best.assign(slot.toFloat());
+              });
+            });
+          });
+        });
+      }
 
       // CONSERVATIVE TRIANGLE OCCUPANCY (occupancyGrid.js). The slot SDFs
       // above are per-mesh grids whose cells are 0.4–0.6m on a real building,
@@ -288,23 +303,119 @@ export function createSdfScene(bounds, res, atlas, options = {}) {
       const albedo = vec3(0).toVar();
       const emissive = vec3(0).toVar();
       const normal = vec3(0, 1, 0).toVar();
+      // SURFACE ATTRIBUTION FROM OCCUPANCY, when the field can supply it.
+      //
+      // This is the step that lets the mesh-SDF atlas be deleted. The atlas was
+      // never consulted here for its DISTANCE — `best` is just "which slot is
+      // nearest", used to look up that slot's MEAN albedo/emissive, and the six
+      // extra taps below are a gradient normal. The occupancy voxelizer already
+      // knows both exactly (it visits every triangle/voxel pair and has the
+      // face normal), so it writes them per coarse cell and this reads them.
+      //
+      // It also answers a question the SDF answered badly: a slot whose blurred
+      // field happens to be nearest is not necessarily the surface IN the cell,
+      // whereas an attributed cell was written by a triangle that provably
+      // overlaps it.
+      //
+      // `attr.x` is slot + 1, so 0 means "no triangle touched this cell" and
+      // the SDF path below still supplies the colours.
+      //
+      // COLOURS ONLY — NOT THE NORMAL, and this is the important part.
+      // `cellAttr` is written by the voxelizer as LAST WRITE WINS with no
+      // atomics, which is harmless for a per-slot MEAN colour (any triangle in
+      // the cell gives the same answer) and actively wrong for a face normal.
+      // A floor slab's top face (+Y) and bottom face (−Y) land in the SAME
+      // coarse cell, so the stored normal is whichever triangle won a race —
+      // and the bounce gather is deliberately ONE-SIDED (`dot(dir, normal)`
+      // clamped at 0, see cascadeGather's note) precisely so a wall's outside
+      // shell cannot be lit from inside the room. A cell that raced to −Y takes
+      // light from a sun BELOW the floor: the floor glows from underneath, and
+      // it flips whenever the voxelizer redispatches and re-runs the race.
+      // Coarser cells hold both faces more often, which is why it worsens at
+      // the lower quality tiers.
+      // `cellAttr` IS NOT READ HERE AT ALL ANY MORE — neither for colours nor
+      // for the normal. Both were bugs, and both are worth naming so this is
+      // never re-wired:
+      //   · COLOURS crossed two slot numberings. `cellAttr.x` is
+      //     `occupancySlot + 1`, an index into the OCCUPANCY field's
+      //     `placements` (numbered over the mesh walk), while `atlas.albedo` is
+      //     indexed by ATLAS slot, which `#syncSlots` assigns independently by
+      //     capacity and priority. It read a different mesh's colour, or an
+      //     inactive slot's black. Colours come from `best` — atlas space,
+      //     correct by construction.
+      //   · THE NORMAL was written last-write-wins with no atomics, so a floor
+      //     slab's cell holds whichever of its +Y top face and -Y bottom face
+      //     won a race, and a cell that raced to -Y takes light from a sun
+      //     BELOW the floor. Both modes take the normal from a GRADIENT instead
+      //     (the SDF slot field, or the occupancy distance oracle).
       If(best.greaterThanEqual(0), () => {
         const s = best.toInt();
         albedo.assign(atlas.albedo.element(s).xyz);
         emissive.assign(atlas.emissive.element(s).xyz);
         // SDF-gradient normal of the winning slot (6 taps) — only where the
-        // cell is occupied; empty cells never feed the bounce gather.
+        // cell is occupied; empty cells never feed the bounce gather. Runs
+        // whether or not occupancy attributed the colours: a gradient is a
+        // property of the FIELD around the cell, so a thin slab gets an
+        // outward-facing shell on each side instead of one coin-flip normal.
+        if (!killSdf) {
+          If(occupied.greaterThan(0.5), () => {
+            const h = world.minCell.mul(0.5);
+            const gx = atlas.sampleSlot(s, p.add(vec3(h, 0, 0))).sub(atlas.sampleSlot(s, p.sub(vec3(h, 0, 0))));
+            const gy = atlas.sampleSlot(s, p.add(vec3(0, h, 0))).sub(atlas.sampleSlot(s, p.sub(vec3(0, h, 0))));
+            const gz = atlas.sampleSlot(s, p.add(vec3(0, 0, h))).sub(atlas.sampleSlot(s, p.sub(vec3(0, 0, h))));
+            const g = vec3(gx, gy, gz).toVar();
+            If(g.length().greaterThan(1e-5), () => {
+              normal.assign(g.normalize());
+            });
+          });
+        }
+      });
+      // SDF-FREE: no slot field to take a gradient of, so use the DISTANCE
+      // ORACLE's gradient instead. It is a real continuous distance now (see
+      // freeRadiusAtWorld's near field), so its gradient points AWAY from the
+      // surface exactly like the SDF's did — deterministic, and two-sided by
+      // construction rather than a coin flip between a slab's two faces.
+      //
+      // STEP SIZE IS A FULL COARSE CELL, not half. Sampling a binary occupancy
+      // indicator at ±½ cell put both taps inside the same voxel wherever the
+      // occupancy voxel was coarser than that (0.25 m at the low tier against a
+      // 0.175 m half-cell), so the gradient read ZERO, every cell fell back to
+      // the (0,1,0) default, and the one-sided bounce gather lit almost nothing
+      // — a scene with direct light and no indirect at all.
+      if (killSdf && occField) {
         If(occupied.greaterThan(0.5), () => {
-          const h = world.minCell.mul(0.5);
-          const gx = atlas.sampleSlot(s, p.add(vec3(h, 0, 0))).sub(atlas.sampleSlot(s, p.sub(vec3(h, 0, 0))));
-          const gy = atlas.sampleSlot(s, p.add(vec3(0, h, 0))).sub(atlas.sampleSlot(s, p.sub(vec3(0, h, 0))));
-          const gz = atlas.sampleSlot(s, p.add(vec3(0, 0, h))).sub(atlas.sampleSlot(s, p.sub(vec3(0, 0, h))));
-          const g = vec3(gx, gy, gz).toVar();
+          const h = world.minCell;
+          // maxLevel 2 so the oracle can report up to ~4 voxels: at maxLevel 1
+          // it tops out around 0.25 m, and BOTH taps of a ±0.35 m stencil
+          // saturate there, which is a zero gradient for a perfectly ordinary
+          // cell.
+          const at = (o) => occField.freeRadiusAtWorld(p.add(o), 2);
+          const g = vec3(
+            at(vec3(h, 0, 0)).sub(at(vec3(h.negate(), 0, 0))),
+            at(vec3(0, h, 0)).sub(at(vec3(0, h.negate(), 0))),
+            at(vec3(0, 0, h)).sub(at(vec3(0, 0, h.negate()))),
+          ).toVar();
+          // AMBIGUOUS ⇒ NO DIRECT LIGHT, rather than a guessed normal.
+          //
+          // A zero gradient means the cell is deep enough inside geometry that
+          // both taps read the same — a slab INTERIOR cell. There is no right
+          // normal for it, and every wrong answer is a light source: the
+          // voxelizer's own face normal (the obvious fallback) races between a
+          // slab's two faces, so a floor's interior cells take -Y half the time
+          // and the floor lights up from a sun BELOW it. A constant up-vector
+          // is the same bug pointing the other way.
+          //
+          // A zero normal makes `dot(dir, normal).max(0)` zero in the bounce
+          // gather, so the cell takes no direct light at all while still
+          // carrying its albedo for bounce. That is the honest answer for a
+          // point inside a wall.
           If(g.length().greaterThan(1e-5), () => {
             normal.assign(g.normalize());
+          }).Else(() => {
+            normal.assign(vec3(0));
           });
         });
-      });
+      }
 
       stagingBuffer.element(instanceIndex).assign(vec4(emissive.mul(occupied), occupied));
       surfaceBuffer.element(instanceIndex).assign(vec4(albedo, occupied));
@@ -433,7 +544,7 @@ export function createSdfScene(bounds, res, atlas, options = {}) {
       );
       return occField
         ? createOccupancySceneTrace(occField, world, sampler)
-        : createSdfSceneTrace(distanceTexture, world, res, atlas, sampler, sparse);
+        : createGiFieldTrace(distanceTexture, world, res, atlas, sampler, sparse);
     },
     createRadianceSampler: () => createTrilinearRadianceSampler(radianceBuffer, { min: world.min }, res, world.cell),
     createIndirectSampler: () => createTrilinearRadianceSampler(indirectBuffer, { min: world.min }, res, world.cell),
@@ -445,13 +556,13 @@ export function createSdfScene(bounds, res, atlas, options = {}) {
     // the safety net for walls thinner than a coarse cell, which used to test
     // the coarse `stagingBuffer` occupancy (same 0.33m cells that lost the wall
     // in the first place) and now tests a 0.125m conservative voxel.
-    createSoftShadowTrace: (lift, steps, name = undefined) =>
-      createShadowTrace(distanceTexture, world, res, lift, atlas, steps, stagingBuffer, name, sparse, occField),
+    createSoftShadowTrace: (lift, steps, name = undefined, stable = false) =>
+      createShadowTrace(distanceTexture, world, res, lift, atlas, steps, stagingBuffer, name, sparse, occField, killSdf, stable),
     // MIRROR RAYS stay on the sphere trace deliberately. They were a voxel DDA
     // once and moved OFF it because binary cells give stair-stepped hit
     // silhouettes where continuous distance gives smooth ones — and the spec's
     // own non-goals exclude sharp reflections through the voxel field.
-    createMirrorTrace: (steps) => createMirrorTrace(distanceTexture, world, res, atlas, steps, sparse),
+    createMirrorTrace: (steps) => createMirrorTrace(distanceTexture, world, res, atlas, steps, sparse, killSdf ? occField : null),
     createHitSurfaceFn: () => createHitSurfaceFn(atlas, world.minCell),
   };
 }
@@ -513,7 +624,27 @@ function createHitSurfaceFn(atlas, minCellNode) {
  * CPU-baked field (plane-aware self-exclusion, small contact cut, stepping
  * safety factor) — only the field source changed.
  */
-function createShadowTrace(distanceTexture, world, res, lift, atlas, steps = 56, occupancy = null, name = "giShadowTrace", sparse = null, occField = null) {
+// `stable = true` — THE MOVING-LIGHT FLICKER FIX (2026-08-02), used by the
+// FEEDBACK trace only. The field injection re-evaluates this trace for every
+// occupied cell every frame with a smoothly rotating sun, and the standard
+// estimator is DISCONTINUOUS in the ray direction in three places: the binary
+// contact break (`penumbra = 0` the moment a sample dips under contactCut), the
+// binary occupancy hard block, and the oracle refinement — whose far-field
+// ladder is quantized to `2^L·voxel` values and whose on/off gate is a hard
+// threshold. Groups of cells whose rays graze the same occluder edge (the
+// skylight rim, an arch) cross those thresholds together as the sun turns, so
+// whole regions of indirect light stepped bright↔dark over a few frames —
+// user-confirmed as THE flicker (forcing shadows fully open stopped it dead).
+// Stable mode replaces every one of those verdicts with a continuous ramp:
+//   · refinement = smooth blend toward the oracle's NEAR FIELD ONLY, which is
+//     genuinely continuous (distance to voxel AABBs — see freeRadiusAtWorld);
+//     the quantized far ladder is never consulted;
+//   · occlusion = min over samples of k·d/t weighted by smooth own-plane and
+//     cap-saturation ramps — the same exclusions isRealOccluder encodes, made
+//     continuous — reaching an exact 0 where geometry truly is.
+// Receiver-side traces (emitter shadows, mirror hits) keep the sharp estimator:
+// they are visually direct and their inputs don't sweep every frame.
+function createShadowTrace(distanceTexture, world, res, lift, atlas, steps = 56, occupancy = null, name = "giShadowTrace", sparse = null, occField = null, killSdf = false, stable = false) {
   const minCell = world.minCell;
   const capWorld = world.capWorld;
   // `lift` may be a plain number or a TSL node (GISystem passes uniform-
@@ -595,9 +726,23 @@ function createShadowTrace(distanceTexture, world, res, lift, atlas, steps = 56,
       // estimator paints when step size ≈ feature size (the "rough shadows"
       // report; the u8-quantized field makes plain-estimator bands worse).
       const prevD = float(1e10).toVar();
+      // Stable mode: the previous sample's OCCLUDER WEIGHT (see the stable
+      // estimator below) — 0 disables the closest-approach pairing smoothly,
+      // replacing the binary prevD reset.
+      const prevW = float(0).toVar();
+      // DID THE MARCH REACH A VERDICT? Set only where we KNOW why the loop
+      // stopped: the ray reached its end, left the volume, or hit something.
+      // Running out of iterations is none of those — see the fail-closed
+      // clamp after the loop.
+      const resolved = float(0).toVar();
+      // Last sampled field distance — the "was I still near a surface when the
+      // budget ran out?" discriminator for the fail-closed clamp below. Starts
+      // large so a ray that never sampled anything reads as open space.
+      const lastD = float(1e10).toVar();
 
       Loop({ start: 0, end: steps, name: "sdfShadow" }, () => {
         If(t.greaterThanEqual(maxT).or(t.greaterThan(tEnd)), () => {
+          resolved.assign(1);
           Break();
         });
         const p = origin.add(dir.mul(t)).toVar();
@@ -610,6 +755,7 @@ function createShadowTrace(distanceTexture, world, res, lift, atlas, steps = 56,
             .or(uvw.y.greaterThan(1))
             .or(uvw.z.greaterThan(1)),
           () => {
+            resolved.assign(1);
             Break();
           },
         );
@@ -626,9 +772,37 @@ function createShadowTrace(distanceTexture, world, res, lift, atlas, steps = 56,
           const fine = sparse.sample(p);
           dRaw.assign(select(fine.valid.and(dRaw.lessThan(sparse.params.band)), fine.d, dRaw));
         }
-        // Detail slots: crisp local fields min()ed in near dense/important
-        // meshes — sub-scene-cell silhouettes (thin wings, fine props).
-        dRaw.assign(atlas.refineDetail(dRaw, p));
+        if (killSdf) {
+          // THE OCCUPANCY ORACLE REPLACES `refineDetail`, doing the same job
+          // from data that needs no bake: sharpen the coarse composited
+          // distance where sub-cell geometry lives. Three levels, so the bound
+          // reaches ~4 voxels (≈0.5 m at the high tier) — enough to bracket a
+          // coarse cell, which is exactly where the trilinear far-field
+          // distance takes over and paying for more levels buys nothing.
+          //
+          // GATED, and this is a pure optimisation rather than a behaviour
+          // change: the oracle can only LOWER `dRaw`, and it cannot return
+          // more than ~4 voxels, so where the coarse distance is already
+          // larger than that the call could not have changed anything. Worth
+          // gating because the near field is 27 buffer reads and most steps of
+          // most rays are in open space.
+          // (A stable-mode near-field-only variant of this refine was tried and
+          // REVERTED: its ~1-voxel reach is half of maxLevel 2's, and the
+          // under-floor leak reopened at the low preset. The far ladder's
+          // quantization jitter is absorbed by the field EMA instead — see
+          // createBounceFeedback's radiance blend.)
+          If(dRaw.lessThan(minCellV.mul(2)), () => {
+            // Saturating at `capWorld` matters here too: without it a sample
+            // whose neighbourhood is simply empty reports the oracle's own
+            // ~4-voxel ceiling, which would pull `dRaw` DOWN and make open
+            // space read as an occluder to `isRealOccluder`'s cap test.
+            dRaw.assign(dRaw.min(occField.freeRadiusAtWorld(p, 2, true, capWorldV)));
+          });
+        } else {
+          // Detail slots: crisp local fields min()ed in near dense/important
+          // meshes — sub-scene-cell silhouettes (thin wings, fine props).
+          dRaw.assign(atlas.refineDetail(dRaw, p));
+        }
         // LIGHT-SOURCE SELF-EXCLUSION: a ray aimed AT the light must not be
         // occluded by the light's own body/field shell. Without this, rays
         // skimming the emitter's SDF near arrival painted its bounding-box
@@ -672,6 +846,7 @@ function createShadowTrace(distanceTexture, world, res, lift, atlas, steps = 56,
           .toVar();
         If(isRealOccluder.and(dRaw.lessThan(contactCut)), () => {
           penumbra.assign(0);
+          resolved.assign(1);
           Break();
         });
         // OCCUPANCY HARD BLOCK: a wall thinner than a field cell keeps its
@@ -698,14 +873,44 @@ function createShadowTrace(distanceTexture, world, res, lift, atlas, steps = 56,
         // old gate had to be conservative (0.3·cell) was that a coarse
         // "occupied" cell could be half empty space, and zeroing on it
         // bottom-clipped the penumbra ramp into hard-edged shadows.
-        if (occField) {
-          If(isRealOccluder.and(dRaw.lessThan(contactCut.mul(2))), () => {
+        // NOT IN SDF-FREE MODE — the oracle already subsumes it, and keeping it
+        // costs the shadow edges.
+        //
+        // This block zeroes the penumbra OUTRIGHT the moment a level-0 bit is
+        // set, which is a binary decision at voxel resolution: shadow
+        // boundaries come out stair-stepped in voxel-sized blocks, and as the
+        // light moves each voxel flips at a different moment, so the steps
+        // crawl. That is the "squarish light changes / jumpy light spots"
+        // report, and it is the same hard-edged-shadow failure this file's own
+        // comment records from the previous 0.6·cell version.
+        //
+        // It exists because a BLURRED distance loses sub-cell geometry. In
+        // SDF-free mode the distance is the occupancy oracle — derived from the
+        // very same bits, with a real continuous near field — so a thin wall
+        // already produces a small `dRaw` and the estimator ramps down to it
+        // smoothly. There is nothing left for a hard override to catch.
+        if (occField && !killSdf && !stable) {
+          // UNGATED (2026-08-02). This used to only consult occupancy where
+          // `dRaw < contactCut*2` — i.e. where the SDF ALREADY thought a
+          // surface was near. That voids the safety net for exactly the
+          // geometry it exists to catch: a floor or wall thinner than a coarse
+          // cell keeps its trilinear distance ABOVE the cut (the surface sits
+          // between cell centres), so the check never ran and the ray walked
+          // straight through. The user's report is the visible form of it —
+          // a sun below the floor lighting the room through it, worst at
+          // grazing angles where the ray spends the longest inside the slab.
+          //
+          // A level-0 bit is unambiguous, so `isRealOccluder` (own-plane,
+          // cap-saturation and lamp-body exclusion) is the only gate it needs.
+          // Cost is one pyramid fetch per shadow step.
+          If(isRealOccluder, () => {
             If(occField.occupiedAtWorld(p, 0).greaterThan(0.5), () => {
               penumbra.assign(0);
+              resolved.assign(1);
               Break();
             });
           });
-        } else if (occupancy) {
+        } else if (occupancy && !stable) {
           If(isRealOccluder.and(dRaw.lessThan(occCut)), () => {
             const cx = p.x.sub(minV.x).div(cellV.x).floor().clamp(0, res.x - 1);
             const cy = p.y.sub(minV.y).div(cellV.y).floor().clamp(0, res.y - 1);
@@ -717,24 +922,112 @@ function createShadowTrace(distanceTexture, world, res, lift, atlas, steps = 56,
             });
           });
         }
-        If(isRealOccluder, () => {
-          // Closest-approach interpolation: y = where between the previous
-          // and current sample the ray passed nearest the occluder, est = the
-          // interpolated distance there. Exact for a straight silhouette,
-          // and MUCH smoother than min(k·d/t) at coarse step counts.
-          const y = dRaw.mul(dRaw).div(prevD.mul(2)).min(dRaw).toVar();
+        if (stable) {
+          // THE SAME closest-approach estimator, admitted CONTINUOUSLY.
+          //
+          // (v1 of stable mode replaced the estimator outright with plain
+          // min(k·d/t) under smooth weights and was REVERTED the same day:
+          // shadows went visibly loose and the under-floor leak reopened. The
+          // estimator's SHAPE was never the problem — its ADMISSION was: a
+          // sample is either in the min or absent, decided by the boolean
+          // isRealOccluder, and near opening rims — where the sun streams in
+          // and half the samples hover at the own-plane/cap thresholds — that
+          // membership churns as the light turns. If the churning sample would
+          // have been the minimum, the whole penumbra jumps. That is the
+          // "flickers like hell when the light comes in", on every preset.)
+          //
+          // `w` is isRealOccluder's three tests as ramps; a sample's candidate
+          // fades toward 1 (a no-op in the min) as it approaches exclusion
+          // instead of vanishing. `prevW` weights the pairing the same way —
+          // the old binary prevD reset switched a sample between the paired
+          // and unpaired estimates in one frame; scaling `y` by the previous
+          // sample's weight makes that handoff a fade too (prevW → 0 gives
+          // y → 0, which IS the unpaired estimator). `prox` folds in the
+          // contact-proximity ramp so a ray reaches the hard Break above
+          // already ~0 — the Break stays, it is the leak seal.
+          const planeW = smoothstep(planeHeight.sub(planeCut.mul(1.25)), planeHeight.sub(planeCut.mul(0.75)), dRaw)
+            .oneMinus()
+            .toVar();
+          const capW = smoothstep(capCut.mul(0.9), capCut, dRaw).oneMinus();
+          const w = planeW.mul(capW).mul(select(outsideLight, float(1), float(0))).toVar();
+          const y = dRaw.mul(dRaw).div(prevD.mul(2)).min(dRaw).mul(prevW).toVar();
           const est = dRaw.mul(dRaw).sub(y.mul(y)).max(0).sqrt();
-          penumbra.assign(penumbra.min(est.mul(k).div(t.sub(y).max(1e-4))));
+          // (A `prox` proximity ramp was min'd in here for one build and
+          // REVERTED: it dragged EVERY ray passing within a cell of geometry
+          // toward dark regardless of what k·d/t said — visibly over-dark
+          // shadows, and its slope steepens as cells shrink, so it JITTERED
+          // hardest at ultra. The temporal edge it existed to cushion is the
+          // probe EMA's job — see probeSmoothing.)
+          const cand = est.mul(k).div(t.sub(y).max(1e-4)).clamp(0, 1);
+          penumbra.assign(penumbra.min(mix(float(1), cand, w)));
           prevD.assign(dRaw);
-        }).Else(() => {
-          // Non-occluder samples (own plane, cap-saturated, lamp body) must
-          // not feed the interpolation — their distances describe excluded
-          // geometry, and pairing them with a real sample fabricates a
-          // closest approach that never existed.
-          prevD.assign(1e10);
-        });
+          prevW.assign(w);
+        } else {
+          If(isRealOccluder, () => {
+            // Closest-approach interpolation: y = where between the previous
+            // and current sample the ray passed nearest the occluder, est = the
+            // interpolated distance there. Exact for a straight silhouette,
+            // and MUCH smoother than min(k·d/t) at coarse step counts.
+            const y = dRaw.mul(dRaw).div(prevD.mul(2)).min(dRaw).toVar();
+            const est = dRaw.mul(dRaw).sub(y.mul(y)).max(0).sqrt();
+            penumbra.assign(penumbra.min(est.mul(k).div(t.sub(y).max(1e-4))));
+            prevD.assign(dRaw);
+          }).Else(() => {
+            // Non-occluder samples (own plane, cap-saturated, lamp body) must
+            // not feed the interpolation — their distances describe excluded
+            // geometry, and pairing them with a real sample fabricates a
+            // closest approach that never existed.
+            prevD.assign(1e10);
+          });
+        }
+        lastD.assign(dRaw);
         t.addAssign(dRaw.mul(0.85).clamp(stepMin, stepMax));
       });
+
+      // FAIL CLOSED ON STEP EXHAUSTION — BUT ONLY WHERE THE RAY WAS HUGGING
+      // GEOMETRY WHEN IT RAN OUT.
+      //
+      // Why fail closed at all: falling out of the loop with no verdict leaves
+      // `penumbra` at its running minimum — in practice 1, i.e. FULLY LIT. That
+      // is a light leak, and a direction-dependent one, because whether a ray
+      // runs out depends on how many SMALL steps it took and steps are small
+      // exactly where the ray hugs a surface. A sun at a grazing or below-floor
+      // angle sends rays skimming along a slab for their whole length, so they
+      // exhaust and report "nothing blocked me" and the floor lights up; as the
+      // light moves, each ray crosses the budget boundary at a different
+      // moment, which is the flicker on top of the glow.
+      //
+      // WHY IT CANNOT BE UNCONDITIONAL, learned the expensive way: a ray can
+      // also run out simply because the volume is bigger than
+      // `budget × maxStep`. A directional light makes every ray cross the whole
+      // scene, and those rays exhaust in OPEN SPACE, where "occluded" is
+      // exactly wrong. Failing them closed put the scene in shadow with only
+      // the cells near the roof openings — whose rays exit the volume in a few
+      // steps — still lit. That is a black room with a lit ceiling, and it is
+      // what the last build did.
+      //
+      // The discriminator is the last sample's distance: still close to a
+      // surface ⇒ the ray was threading geometry and probably blocked; out in
+      // the open ⇒ the budget was just too short for the distance, and the
+      // honest answer is the unshadowed one.
+      // `__giShadowFailOpen` disables the clamp entirely (A/B arm).
+      // CONTINUOUS, not a hard zero. `select(..., penumbra, 0)` is a binary
+      // flip on a per-ray condition, and a per-ray binary flip under a moving
+      // light is a flickering pixel. Scaling by how deep in geometry the march
+      // was when it ran out keeps the leak closed while varying smoothly with
+      // both the ray and the light.
+      // (A stable-mode "progress-smooth" variant — trusting a ray by how far
+      // its march got instead of the binary `resolved` — was tried and
+      // REVERTED: a ray can be 90% of the way through and still be about to
+      // hit the floor slab, and trusting it reopened the under-floor leak at
+      // the low preset, whose 18-step budget exhausts rays constantly. The
+      // binary clamp SEALS; its temporal flip is damped by the probe EMA
+      // (probeSmoothing), which is the layer that owns temporal smoothness.)
+      if (!globalThis.__giShadowFailOpen && !globalThis.__giNoFailClosed) {
+        const exhausted = resolved.oneMinus();
+        const inGeometry = smoothstep(planeCut.mul(4), planeCut, lastD);
+        penumbra.mulAssign(exhausted.mul(inGeometry).oneMinus());
+      }
 
       return penumbra.clamp(0, 1);
     },
@@ -851,7 +1144,7 @@ export function createSdfDebugMaterial(volume) {
  * Back-side hits block but emit nothing (the composite's per-side gradient
  * normal decides), matching the DDA's convention.
  */
-function createSdfSceneTrace(distanceTexture, world, res, atlas, radianceSampler, sparse) {
+function createGiFieldTrace(distanceTexture, world, res, atlas, radianceSampler, sparse) {
   const minCell = world.minCell;
   const capWorld = world.capWorld;
 
@@ -1019,7 +1312,7 @@ export function createOccupancyDebugMaterial(volume) {
  * cells), and cheaper in open space (steps grow with distance from
  * geometry). The caller shades the hit via the trilinear radiance sampler.
  */
-function createMirrorTrace(distanceTexture, world, res, atlas, steps = 64, sparse = null) {
+function createMirrorTrace(distanceTexture, world, res, atlas, steps = 64, sparse = null, occField = null) {
   const minCell = world.minCell;
   const capWorld = world.capWorld;
 
@@ -1067,7 +1360,14 @@ function createMirrorTrace(distanceTexture, world, res, atlas, steps = 64, spars
           const fine = sparse.sample(p);
           d.assign(select(fine.valid.and(d.lessThan(sparse.params.band)), fine.d, d));
         }
-        d.assign(atlas.refineDetail(d, p));
+        // Same substitution as the shadow trace, and gated for the same reason.
+        if (occField) {
+          If(d.lessThan(minCellV.mul(2)), () => {
+            d.assign(d.min(occField.freeRadiusAtWorld(p, 2, true, capWorldV)));
+          });
+        } else {
+          d.assign(atlas.refineDetail(d, p));
+        }
         If(d.lessThan(hitCut), () => {
           hitT.assign(t);
           Break();

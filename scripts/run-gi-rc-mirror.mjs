@@ -5,11 +5,18 @@
 // banding) but softer. Samples pixel colors on both spheres.
 // Env: BVH=0 forces the SDF fallback path (globalThis.__giNoBvhReflections)
 // for GI Phase 3 v1's exact-reflection A/B — see run-gi-bvh-reflect.mjs.
+//      MASK=0 forces the exact prepass back to DENSE full-screen tracing
+// (globalThis.__giNoBvhMask), the A/B arm for the 2026-08-02 sparse work.
 import puppeteer from "puppeteer-core";
 import sharp from "sharp";
 
 const url = process.argv[2] ?? "http://localhost:5201/";
 const NO_BVH = process.env.BVH === "0";
+const NO_MASK = process.env.MASK === "0";
+// EXACT=1 turns on the BVH exact-reflection path (component prop
+// `exactReflections`, default FALSE) — without it every BVH/mask/hit-shading
+// hatch below is a no-op and this harness measures the SDF mirror trace only.
+const EXACT = process.env.EXACT === "1";
 const browser = await puppeteer.launch({
   executablePath: "C:/Program Files/Google/Chrome/Application/chrome.exe",
   headless: process.env.HEADED ? false : "new",
@@ -31,8 +38,9 @@ await page.evaluate(() => {
 });
 await new Promise((resolve) => setTimeout(resolve, 5000));
 
-await page.evaluate(async ({ NO_BVH }) => {
+await page.evaluate(async ({ NO_BVH, NO_MASK, EXACT }) => {
   if (NO_BVH) globalThis.__giNoBvhReflections = true;
+  if (NO_MASK) globalThis.__giNoBvhMask = true;
   const { THREE } = await import("/src/engine/index.js");
   await import("/src/modules/index.js");
   const { enableEngineModule } = await import("/src/engine/modules.js");
@@ -81,13 +89,13 @@ await page.evaluate(async ({ NO_BVH }) => {
   engine.scene.add(roughMetal);
 
   const giEntity = engine.createEntity({ name: "GI" });
-  giEntity.addComponent("global-illumination", { autoFit: true, quality: "high", intensity: 1 });
+  giEntity.addComponent("global-illumination", { autoFit: true, quality: "high", intensity: 1, exactReflections: EXACT });
 
   engine.camera.position.set(0.1, 1.9, 5.6);
   engine.camera.lookAt(0, 1.4, 0);
   engine.camera.updateMatrixWorld(true);
   console.log("GI-MR scene ready");
-}, { NO_BVH });
+}, { NO_BVH, NO_MASK, EXACT });
 
 const settle = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const waitForWave = async (extra = 1500) => {
@@ -129,7 +137,7 @@ const points = await page.evaluate(() => {
 const shotPath = `scripts/gi-diag-mirror${NO_BVH ? "-sdf" : ""}.png`;
 const shot = await page.screenshot({ path: shotPath });
 const { data, info } = await sharp(shot).raw().toBuffer({ resolveWithObject: true });
-console.log(`arm: ${NO_BVH ? "SDF (BVH=0)" : "BVH (default)"}`);
+console.log(`arm: ${NO_BVH ? "SDF (BVH=0)" : EXACT ? "BVH exact" : "SDF (exactReflections off)"}${EXACT && NO_MASK ? " dense" : EXACT ? " sparse" : ""}`);
 for (const point of points) {
   const idx = (point.py * info.width + point.px) * info.channels;
   console.log(`${point.tag}: rgb(${data[idx]}, ${data[idx + 1]}, ${data[idx + 2]})`);

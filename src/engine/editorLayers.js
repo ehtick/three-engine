@@ -41,3 +41,20 @@ export const DEBUG_LAYER = 30;
  * every batch in the scene, every frame.
  */
 export const OCCLUDER_LAYER = 29;
+
+/**
+ * Layer for meshes whose material sits in GI's MIRROR roughness bucket
+ * (`giRoughnessBucketOf` 0 or 3 — see `src/modules/gi/giLight.js`).
+ *
+ * Exists so the exact-reflection BVH prepass can be SPARSE. That pass used to
+ * fire one BVH ray for every gbuffer pixel, whether or not any reflective
+ * surface was on screen; tagging the mirror meshes lets a second, tiny gbuffer
+ * render mark exactly the pixels that will ever consume a reflection, and the
+ * compute pass skips the rest (`giScreen.js` `createGiBvhReflect`).
+ *
+ * Same rules as `OCCLUDER_LAYER`, and for the same reason: it is an ADDITIONAL
+ * bit (the mesh keeps layer 0 and renders normally), and `mesh.layers.mask` is
+ * part of the static batching key — so GISystem writes it only when a
+ * material's bucket actually changes, never per frame.
+ */
+export const GI_MIRROR_LAYER = 28;

@@ -235,8 +235,42 @@ fn copy_file_if_changed(src: &Path, dest: &Path) -> std::io::Result<bool> {
             return Ok(false);
         }
     }
-    fs::copy(src, dest)?;
+    replace_atomically(dest, |staging| {
+        fs::copy(src, staging).map(|_| ())
+    })?;
     Ok(true)
+}
+
+/// Produces `dest` via a sibling temporary file and a rename, so a reader never
+/// observes a half-written file.
+///
+/// THIS MATTERS BECAUSE THE BUILD OUTPUT IS SERVED WHILE IT IS BEING WRITTEN.
+/// Browser preview keeps a live-rebuild loop pointed at the same directory the
+/// preview server hands to the browser (and to a phone over Wi-Fi), so an
+/// in-place `fs::copy`/`fs::write` is a window in which a fetch can read a
+/// truncated texture — or, far worse, a truncated `scene.json`, which every
+/// client fetches and which fails the whole boot rather than one asset.
+/// A rename on the same volume is atomic on both Windows and Unix.
+fn replace_atomically(
+    dest: &Path,
+    write: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let staging = dest.with_extension(format!(
+        "{}tmp-{}",
+        dest.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| format!("{e}."))
+            .unwrap_or_default(),
+        std::process::id()
+    ));
+    write(&staging)?;
+    match fs::rename(&staging, dest) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = fs::remove_file(&staging);
+            Err(error)
+        }
+    }
 }
 
 /// Copies the bundled three.js type declarations (`@types/three`) into
@@ -331,7 +365,9 @@ fn export_game(
         )
     })?;
     let scene_path = out.join("scene.json");
-    fs::write(&scene_path, scene_json)
+    // Atomic: a live browser preview is serving this exact file while the
+    // rebuild runs (see replace_atomically).
+    replace_atomically(&scene_path, |staging| fs::write(staging, &scene_json))
         .map_err(|e| format!("write {}: {e}", scene_path.display()))?;
     for (src, rel) in assets {
         let dest = out.join(&rel);
@@ -349,7 +385,7 @@ fn export_game(
                 format!("create generated-file directory {}: {e}", parent.display())
             })?;
         }
-        fs::write(&dest, contents)
+        replace_atomically(&dest, |staging| fs::write(staging, &contents))
             .map_err(|e| format!("write generated file {}: {e}", dest.display()))?;
     }
     Ok(())

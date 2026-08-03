@@ -392,6 +392,58 @@ export function emitterDirectAt(params, P, N, samplePoint) {
   return { irradiance: total, shadows, perSlot };
 }
 
+/**
+ * Analytic (point/directional) direct irradiance at an arbitrary world point,
+ * from the shared GI light slots. UNSHADOWED by design.
+ *
+ * This exists for shading a REFLECTION HIT. A primary surface never needs it —
+ * three's own lighting already evaluates the scene's real lights there, with
+ * real shadow maps. But a point seen only in a mirror is not shaded by anyone:
+ * without this, a reflected sunlit wall shows nothing but its indirect bounce
+ * and reads several stops too dark, which is most of why exact reflections
+ * looked wrong even when the geometry they resolved was exactly right.
+ *
+ * Unshadowed is the same trade the (now retired) per-material hit path made:
+ * shadowing these costs up to MAX_GI_LIGHTS extra SDF marches per mirror pixel
+ * to fix a subtle error INSIDE a reflection. Emitters — usually the dominant
+ * light in a GI scene — stay shadowed via `emitterDirectAt`.
+ *
+ * `|N·L|`, not `max(0, N·L)`: the same both-sides convention the feedback
+ * inject and the retired hit path use, because a BVH hit can land on a
+ * single-sided wall whose winding faces away from the light.
+ *
+ * @param {Array} lightSlots uniform slots (see GISystem's `lightSlots`)
+ * @param {*} P world position of the hit
+ * @param {*} N unit normal at the hit
+ * @returns irradiance (a TSL vec3 var)
+ */
+export function analyticDirectAt(lightSlots, P, N) {
+  const total = vec3(0).toVar();
+  for (const slot of lightSlots) {
+    If(slot.active.greaterThan(0.5), () => {
+      const isDir = float(slot.kind).toVar();
+      const rel = vec3(slot.vector).sub(P).toVar();
+      const pointDist = rel.length().max(1e-4).toVar();
+      // `vector` holds: point → world position, directional → the normalized
+      // direction TOWARD the light (cascadeGather.js uses the same convention).
+      const dirTo = mix(rel.div(pointDist), vec3(slot.vector), isDir).toVar();
+      let atten = mix(float(1).div(pointDist.mul(pointDist).max(1)), float(1), isDir);
+      // three's PointLight `distance` cutoff (0 = infinite) — GI must die
+      // where the renderer's own direct light does.
+      if (slot.range) {
+        const range = float(slot.range);
+        const ratio = pointDist.div(range.max(1e-4)).clamp(0, 1);
+        const r2 = ratio.mul(ratio);
+        const win = r2.mul(r2).oneMinus().clamp(0, 1);
+        atten = atten.mul(mix(float(1), win.mul(win), step(1e-3, range).mul(isDir.oneMinus())));
+      }
+      const cosH = dirTo.dot(N).abs().toVar();
+      total.addAssign(vec3(slot.color).mul(atten).mul(cosH));
+    });
+  }
+  return total;
+}
+
 export class GICascadeLight extends THREE.Light {
   constructor() {
     super(0xffffff, 1);
@@ -464,6 +516,13 @@ export class GICascadeLight extends THREE.Light {
     // (direct sub-node reads + select(), never hoisted/gated — see that
     // block's comment).
     this.bvhReflectColorTexture = null;
+    // What bvhReflectColorTexture's rgb MEANS (2026-08-02). True = the
+    // reflected point's outgoing RADIANCE, already shaded inside the prepass
+    // with the cascade gather + emitters + analytic lights AT THE HIT. False
+    // (the legacy contract) = the hit's raw ALBEDO, which left the consumer
+    // with no lighting for it and drove the receiver-irradiance approximation
+    // documented at that use site.
+    this.bvhReflectShaded = false;
     // Optional: (p) => { rad, coverage } trilinear INDIRECT-field sample —
     // diffuse remainder for mirror hits (set by GISystem).
     this.mirrorSampleFn = null;
@@ -498,7 +557,7 @@ export class GICascadeLight extends THREE.Light {
  * chains are the only proven-safe idiom there), so this helper must never
  * introduce either.
  */
-function decodeOctNormal(e) {
+export function decodeOctNormal(e) {
   const vz = float(1).sub(abs(e.x)).sub(abs(e.y));
   const t = vz.negate().max(0);
   const vx = select(e.x.greaterThanEqual(0), e.x.sub(t), e.x.add(t));
@@ -601,6 +660,18 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
     // specular with full Fresnel/roughness weighting. Coexists with SSR
     // (SSR wins where it hits; this fills everything else).
     if ((light.radianceFn || light.giRadianceNode) && builder.context.radiance) {
+      // ARBITRATION: a surface that owns a planar reflection (see
+      // PlanarReflectionComponent) already shows the real scene mirrored
+      // through its plane. Adding a traced reflection on top would be two
+      // reflections of the same thing blended by nothing in particular, and
+      // the traced one is strictly the worse of the two on a flat surface.
+      // Compile only the diffuse limit there — the same end state a fully
+      // rough material gets, and for the same reason: the directional path
+      // would be discarded anyway, so do not pay to compile it.
+      if (builder.material?.userData?.planarReflection === true) {
+        builder.context.radiance.addAssign(irradiance.div(Math.PI));
+        return;
+      }
       const bucket = giRoughnessBucketOf(builder.material);
       const fullyRough = bucket === 2;
       const canMirror = bucket === 0 || bucket === 3;
@@ -655,8 +726,23 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
       // graph (tens of seconds to compile) with two texture reads and a mix.
       if (light.bvhReflectColorTexture && canMirror) {
         const exactHit = light.bvhReflectColorTexture.sample(screenUV);
-        const exactLighting = irradiance.div(Math.PI).add(vec3(0.06));
-        const exactRadiance = exactHit.rgb.mul(exactLighting);
+        // THE HIT IS SHADED WHERE IT IS TRACED (see giScreen.js
+        // createGiBvhReflect's SHADING note): the texture already holds the
+        // reflected point's outgoing radiance, so there is nothing to apply
+        // here — just blend it in.
+        //
+        // The legacy branch below is what that replaced, and it was wrong in
+        // a way worth naming so it never comes back: `irradiance` is THIS
+        // pixel's own irradiance — the RECEIVER's, not the hit's. Lighting a
+        // reflected surface with the light falling on the mirror means a
+        // mirror in shadow shows a darkened copy of a sunlit object, a mirror
+        // in sunlight over-brightens everything it reflects, and the +0.06
+        // floor existed only to stop reflections going fully black in a dark
+        // corner. It survives solely for the (shade-less) fallback where the
+        // resolve isn't up and the pass can only publish raw albedo.
+        const exactRadiance = light.bvhReflectShaded
+          ? exactHit.rgb
+          : exactHit.rgb.mul(irradiance.div(Math.PI).add(vec3(0.06)));
         const exactWeight = exactHit.a.mul(smoothstep(0.45, 0.15, roughness));
         directional = mix(directional, exactRadiance, exactWeight);
       }
@@ -750,7 +836,7 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
           // grazing angles — the root cause of the reported banded/striped
           // reflections). The SDF/union-sourced case is UNCHANGED: its own
           // march already undershoots the surface by ~0.45 cells
-          // (sdfScene.js createMirrorTrace) — that is its standoff,
+          // (giField.js createMirrorTrace) — that is its standoff,
           // offsetting it again would double up.
           //
           // Magnitude: 0.15x light.normalOffset — smaller than the OLD ray

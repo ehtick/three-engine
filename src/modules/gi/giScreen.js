@@ -47,8 +47,8 @@ import {
   vec3,
   vec4,
 } from "three/tsl";
-import { MAX_EMITTERS, emitterDirectAt } from "./giLight.js";
-import { EDITOR_LAYER } from "../../engine/editorLayers.js";
+import { MAX_EMITTERS, analyticDirectAt, decodeOctNormal, emitterDirectAt } from "./giLight.js";
+import { EDITOR_LAYER, GI_MIRROR_LAYER } from "../../engine/editorLayers.js";
 import { ALBEDO_ATLAS_GRID, ALBEDO_ATLAS_SIZE, ALBEDO_ATLAS_TILE } from "./bvh/bvhScene.js";
 
 /**
@@ -96,10 +96,33 @@ export function createGiGBuffer(width, height) {
     giNormal: vec4(normalWorld, 0),
   });
 
+  // THE MIRROR MASK (sparse exact reflections). The normal target's w channel
+  // was unused (always 0); it now carries "a reflective material shades this
+  // pixel", which is what lets createGiBvhReflect skip the BVH trace on the
+  // ~95% of the screen that will never consume a reflection.
+  //
+  // It has to be a SECOND render rather than a channel of the first, because
+  // `scene.overrideMaterial` gives every mesh the same node graph — the
+  // prepass cannot see any individual material's roughness. So the mirror
+  // meshes (tagged with GI_MIRROR_LAYER by GISystem's collect walk) are simply
+  // drawn again, by layer, with a graph identical to the one above except for
+  // the w. Rewriting position/normal with the same values at the same depth is
+  // deliberate: it keeps this pass a pure superset-free overwrite, so a
+  // half-covered pixel can never end up with one attachment from each pass.
+  const maskMaterial = new THREE.MeshBasicNodeMaterial();
+  maskMaterial.name = "GI gbuffer mirror mask";
+  maskMaterial.lights = false;
+  const maskMrtNode = mrt({
+    output: vec4(positionWorld, 1),
+    giNormal: vec4(normalWorld, 1),
+  });
+
   return {
     rt,
     material,
     mrtNode,
+    maskMaterial,
+    maskMrtNode,
     get position() {
       return rt.textures[0];
     },
@@ -112,6 +135,7 @@ export function createGiGBuffer(width, height) {
     dispose() {
       rt.dispose();
       material.dispose();
+      maskMaterial.dispose();
     },
   };
 }
@@ -122,12 +146,13 @@ export function createGiGBuffer(width, height) {
  * found it — a leaked render target or MRT would redirect the main scene
  * render into our half-res buffer.
  */
-export function renderGiGBuffer(renderer, scene, camera, gbuffer) {
+export function renderGiGBuffer(renderer, scene, camera, gbuffer, { mirrorMask = false } = {}) {
   const previousTarget = renderer.getRenderTarget();
   const previousMRT = renderer.getMRT();
   const previousOverride = scene.overrideMaterial;
   const previousMask = camera.layers.mask;
   const previousTransparent = renderer.transparent;
+  const previousAutoClear = renderer.autoClear;
   // OPAQUE ONLY. `scene.overrideMaterial` replaces the material of everything
   // that renders, so a transparent object — a glass pane, or a VolumeNodeMaterial
   // fog box — would be drawn as a solid surface into the gbuffer and every
@@ -142,7 +167,25 @@ export function renderGiGBuffer(renderer, scene, camera, gbuffer) {
   renderer.setMRT(gbuffer.mrtNode);
   try {
     renderer.render(scene, camera);
+    // Pass 2 — the mirror mask (see createGiGBuffer's maskMrtNode). Only the
+    // GI_MIRROR_LAYER meshes, drawn over the same attachments and the same
+    // depth buffer, so this costs one projection walk plus the reflective
+    // meshes' own rasterisation (a handful of draws in any real scene).
+    //
+    // autoClear MUST be off: the point is to keep pass 1's colour AND depth.
+    // Depth is why the layer set alone is not enough — a mirror that is
+    // OCCLUDED must not mark the pixels it hides behind, and the default
+    // LessEqualDepth against the retained depth handles both that and the
+    // coplanar re-draw of a visible mirror in one test.
+    if (mirrorMask) {
+      camera.layers.set(GI_MIRROR_LAYER);
+      scene.overrideMaterial = gbuffer.maskMaterial;
+      renderer.setMRT(gbuffer.maskMrtNode);
+      renderer.autoClear = false;
+      renderer.render(scene, camera);
+    }
   } finally {
+    renderer.autoClear = previousAutoClear;
     renderer.setMRT(previousMRT);
     renderer.setRenderTarget(previousTarget);
     renderer.transparent = previousTransparent;
@@ -163,8 +206,27 @@ export function renderGiGBuffer(renderer, scene, camera, gbuffer) {
  * MAX_EMITTERS = 4) that the in-material specular glow needs. Without it,
  * glossy materials would have to re-trace shadows per pixel, which is
  * exactly the per-material cost this pass exists to remove.
+ *
+ * `bvhShade` (optional, 2026-08-02) — LIGHTS THE EXACT-REFLECTION HITS the
+ * BVH prepass traced earlier this frame: `{ hit, albedo, target, lightSlots,
+ * cameraPosition }`. It reads that pass's hit distance + face normal + albedo,
+ * reconstructs the hit point, and writes the reflected surface's outgoing
+ * radiance to `target`, which the mirror materials then sample directly.
+ *
+ * WHY HERE and not in the prepass that traced it: shading a hit needs the
+ * cascade gather, the emitter slots (with their shadow traces) and the light
+ * slots. This pass already binds all three, so the marginal cost is two
+ * texture reads and one storage write. Binding them in the BVH pass instead
+ * asks for 16 uniform buffers in one compute stage against a WebGPU baseline
+ * of 12 — over which the pipeline is INVALID and every compute submitted with
+ * it is silently dropped.
+ *
+ * WHY IT IS AFFORDABLE AT ALL: the work is inside `t >= 0`, and the prepass
+ * writes t = -1 on every pixel its mirror mask skipped. So the second gather
+ * runs only on pixels that a reflective material will actually read — the mask
+ * is what makes this a mirror-pixel cost instead of a whole-screen one.
  */
-export function createGiResolve({ gbuffer, targets, width, height, gather, normalOffset, intensity, emitter, radiance }) {
+export function createGiResolve({ gbuffer, targets, width, height, gather, normalOffset, intensity, emitter, radiance, bvhShade = null }) {
   // The TARGETS are owned by the caller and outlive every rebuild: materials
   // sample them through persistent texture nodes, so recreating them here
   // would silently leave already-compiled materials bound to dead textures.
@@ -177,6 +239,8 @@ export function createGiResolve({ gbuffer, targets, width, height, gather, norma
 
   const positionNode = texture(gbuffer.position);
   const normalNode = texture(gbuffer.normal);
+  const bvhTNode = bvhShade ? texture(bvhShade.hit) : null;
+  const bvhAlbedoNode = bvhShade ? texture(bvhShade.albedo) : null;
 
   const compute = Fn(() => {
     const px = instanceIndex.mod(widthU);
@@ -186,6 +250,9 @@ export function createGiResolve({ gbuffer, targets, width, height, gather, norma
     const g1 = normalNode.load(coord).toVar();
     const out = vec3(0).toVar();
     const reflectedOut = vec3(0).toVar();
+    // Exact-reflection hit radiance (see bvhShade's doc on this function).
+    const bvhOut = vec3(0).toVar();
+    const bvhValid = float(0).toVar();
     // One var per emitter slot: TSL can't assign INTO a vec4 var's components,
     // and the values are produced inside the If below, so they have to be
     // declared outside it and packed afterwards.
@@ -209,10 +276,53 @@ export function createGiResolve({ gbuffer, targets, width, height, gather, norma
           if (index < MAX_EMITTERS) shadowVars[index].assign(shadow);
         });
       }
+      if (bvhShade) {
+        const hitTexel = bvhTNode.load(coord).toVar();
+        const albedoTexel = bvhAlbedoNode.load(coord).toVar();
+        // A traced hit (t >= 0) that also resolved an albedo. Both conditions
+        // matter: the prepass writes t = -1 on a miss AND on every pixel the
+        // mirror mask skipped, so this is already restricted to the pixels a
+        // reflective material will actually read.
+        If(hitTexel.x.greaterThanEqual(0).and(albedoTexel.w.greaterThan(0.5)), () => {
+          // Reconstruct the hit EXACTLY as the prepass traced it: same
+          // unflipped gbuffer normal (the `facing` flip above is a
+          // resolve-only convention the prepass does not share), same
+          // normal-lifted origin, same reflected direction. A mismatch here
+          // does not fail loudly — it shades a point slightly off the
+          // surface, which reads as dim or striped reflections.
+          const rawN = g1.xyz.normalize().toVar();
+          const incident = P.sub(bvhShade.cameraPosition).normalize().toVar();
+          const R = reflect(incident, rawN).toVar();
+          const hitP = P.add(rawN.mul(normalOffset)).add(R.mul(hitTexel.x)).toVar();
+          // The hit's true face normal, flipped to face the incoming ray: a
+          // BVH hit routinely lands on single-sided geometry whose winding
+          // points away, and gathering with a back-facing normal samples the
+          // probe field on the far side of the wall — which is exactly the
+          // "reflected surface is black" failure.
+          const nRaw = decodeOctNormal(hitTexel.zw).toVar();
+          const nFace = select(nRaw.dot(R).lessThan(0), nRaw, nRaw.negate()).toVar();
+          const shadePoint = hitP.add(nFace.mul(normalOffset)).toVar();
+          const hitE = vec3(gather(shadePoint, nFace)).toVar();
+          if (emitter) {
+            hitE.addAssign(emitterDirectAt(emitter, hitP, nFace, shadePoint).irradiance);
+          }
+          if (bvhShade.lightSlots?.length) {
+            hitE.addAssign(analyticDirectAt(bvhShade.lightSlots, hitP, nFace));
+          }
+          // ×intensity to match the convention of the term this is mixed WITH
+          // on the material side: `reflectedOut` (the cascade radiance lookup)
+          // is stored pre-multiplied too. Mixing two terms on different
+          // intensity conventions would make the GI intensity slider change
+          // reflections' BLEND, not just their level.
+          bvhOut.assign(albedoTexel.xyz.mul(hitE).div(Math.PI).mul(intensity));
+          bvhValid.assign(1);
+        });
+      }
     });
     textureStore(irradiance, coord, vec4(out, 1));
     textureStore(emitterShadow, coord, vec4(shadowVars[0], shadowVars[1], shadowVars[2], shadowVars[3]));
     textureStore(radianceTarget, coord, vec4(reflectedOut, 1));
+    if (bvhShade) textureStore(bvhShade.target, coord, vec4(bvhOut, bvhValid));
   })().compute(width * height);
 
   return { compute, widthU };
@@ -256,8 +366,29 @@ function octEncodeNormal(n) {
  * materials already sit at the 8-storage-buffer fragment-stage limit (see
  * docs/GI_PLAN.md Phase 3 and the dead 2026-07-16 ReSTIR attempt that first
  * hit that ceiling).
+ *
+ * SPARSE (2026-08-02). This used to trace EVERY gbuffer pixel — a full-screen
+ * BVH traversal every frame whether or not a single reflective surface was
+ * visible, which is the whole of the "exact reflections are super expensive"
+ * report. The gbuffer's second attachment now carries a mirror mask in its w
+ * (see createGiGBuffer's `maskMrtNode`), and non-mirror threads exit before
+ * `firstHit`. They still WRITE, with t = -1 / hasAlbedo = 0, so a material
+ * that samples a masked-off texel gets the ordinary miss semantics and falls
+ * back to the cascade lookup — the output is identical, only the cost moves.
+ * `mask: false` restores the dense behaviour (the A/B arm).
+ *
+ * This pass TRACES ONLY — it writes geometry (hit t, face normal, hit albedo),
+ * never light. Shading the hit needs the cascade gather, the emitter slots and
+ * the analytic light slots, and binding those HERE asks for 16 uniform buffers
+ * in one compute stage against a WebGPU baseline of 12 (measured, and the
+ * emitter bundle is the part that blows it). The resolve pass already binds all
+ * three, so that is where a reflection hit gets lit — see createGiResolve's
+ * `bvhShade`.
  */
-export function createGiBvhReflect({ gbuffer, target, colorTarget, width, height, bvhScene, cameraPosition, normalOffset, maxDistance }) {
+export function createGiBvhReflect({
+  gbuffer, target, colorTarget, width, height, bvhScene,
+  cameraPosition, normalOffset, maxDistance, mask = true,
+}) {
   const widthU = uniform(width, "uint");
   const positionNode = texture(gbuffer.position);
   const normalNode = texture(gbuffer.normal);
@@ -272,7 +403,7 @@ export function createGiBvhReflect({ gbuffer, target, colorTarget, width, height
   // along the RAY direction (`hit.t.sub(standoff)`) so the shading sample
   // landed just inside the composited field's occupancy shell, matching
   // where the SDF mirror trace this replaces always lands (it undershoots
-  // the surface by `hitCut ≈ 0.45·cell` — see sdfScene.js
+  // the surface by `hitCut ≈ 0.45·cell` — see giField.js
   // createMirrorTrace). That works head-on, but at a GRAZING reflection
   // angle the ray direction is nearly tangent to the surface, so backing
   // off a fixed t barely moves the sample off the surface at all — it
@@ -307,7 +438,10 @@ export function createGiBvhReflect({ gbuffer, target, colorTarget, width, height
     // giLight.js only trusts it when the SAME pixel's hasAlbedo (bvhCol.a)
     // is also set, so an undecoded miss value is never shaded with.
     const octXY = vec2(0).toVar();
-    If(g0.w.greaterThan(0.5), () => {
+    // Geometry here (g0.w) AND a reflective material shades it (g1.w — the
+    // mirror mask). Everything else exits with the miss defaults above.
+    const live = mask ? g0.w.greaterThan(0.5).and(g1.w.greaterThan(0.5)) : g0.w.greaterThan(0.5);
+    If(live, () => {
       const P = g0.xyz.toVar();
       const N = g1.xyz.normalize().toVar();
       const incident = P.sub(cameraPosition).normalize().toVar();
@@ -429,12 +563,26 @@ export function createGiBvhTarget(width, height) {
   bvhColor.magFilter = THREE.NearestFilter;
   bvhColor.name = "giBvhColor";
   bvhColor.version = version;
+  // `bvhRadiance` (2026-08-02) holds what the material actually wants: the
+  // reflected point's outgoing RADIANCE (rgb) + a valid flag (a), written by
+  // the RESOLVE pass from `bvhColor`'s albedo and `bvhReflect`'s hit geometry
+  // (see createGiResolve's `bvhShade`). It is a third texture rather than an
+  // overwrite of `bvhColor` because a pass cannot bind the same texture as
+  // both a sampled input and a writable storage output.
+  const bvhRadiance = new THREE.StorageTexture(width, height);
+  bvhRadiance.type = THREE.HalfFloatType;
+  bvhRadiance.minFilter = THREE.NearestFilter;
+  bvhRadiance.magFilter = THREE.NearestFilter;
+  bvhRadiance.name = "giBvhRadiance";
+  bvhRadiance.version = version;
   return {
+    bvhRadiance,
     bvhReflect,
     bvhColor,
     dispose() {
       bvhReflect.dispose();
       bvhColor.dispose();
+      bvhRadiance.dispose();
     },
   };
 }

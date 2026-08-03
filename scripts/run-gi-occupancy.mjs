@@ -110,7 +110,7 @@ const result = await page.evaluate(async () => {
 
   const gi = engine.createEntity({ name: "GI" });
   gi.addComponent("global-illumination", {
-    autoFit: true, quality: "high", intensity: 1, backend: "occupancy",
+    autoFit: true, quality: "high", intensity: 1,
   });
 
   let system = null;
@@ -124,7 +124,7 @@ const result = await page.evaluate(async () => {
 
   const { volume } = system.state;
   const field = volume.occupancyField;
-  if (!field) return { error: "occupancy backend not active — volume.occupancyField is null" };
+  if (!field) return { error: "occupancy field missing — volume.occupancyField is null (storage-buffer gate?)" };
 
   const reader = await field.readbackBits(engine.renderer);
   const L0 = reader.levels[0];

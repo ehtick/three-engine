@@ -72,7 +72,7 @@ export function octahedralTexelIndex(dir, res) {
 /**
  * Cell-centered probe position for a probeIdx in a gx×gy×gz lattice spanning
  * the volume described by `world` ({min, size} UNIFORM vec3 nodes — see
- * createSdfScene's world bundle; uniforms so an auto-fit refit moves the
+ * createGiField's world bundle; uniforms so an auto-fit refit moves the
  * lattice without a shader recompile). Cell-centered (not corner-anchored)
  * so coarser cascades interleave between finer probes and no axis
  * degenerates when its count reaches 1.

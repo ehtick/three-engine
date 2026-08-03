@@ -38,6 +38,14 @@
 
 Implement in phases 1→7 below, **in order**. Each phase has acceptance criteria; do not proceed until they pass. Keep the old SDF path behind a flag (`gi.backend = "sdf-legacy" | "occupancy"`) until Phase 6 passes, then delete it.
 
+> **Done 2026-08-02.** Occupancy is the only transport backend: the `backend`
+> prop, its Inspector dropdown, the `__giBackend` hatch and `createSdfSceneTrace`
+> are all deleted. The composited SDF field itself STAYS — shadows need a
+> continuous distance for the penumbra estimator and the mirror sphere trace
+> needs a surface to march to. One behaviour change: a device that fails the
+> `maxStorageBuffersPerShaderStage ≥ 10` gate used to fall back to the SDF
+> trace and now gets no GI at all.
+
 ---
 
 ## Phase 1 — Conservative Occupancy Voxelization (GPU)

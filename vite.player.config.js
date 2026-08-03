@@ -25,5 +25,14 @@ export default defineConfig({
       name: "rename-entry-to-index",
       closeBundle: () => renameSync("dist-player/player.html", "dist-player/index.html"),
     },
+    {
+      // The template is PREBUILT: exports/browser previews copy dist-player
+      // as-is, so after engine-source changes a dev checkout silently ships
+      // day-old runtime code (cost a debugging session: the browser preview
+      // ran the deleted SDF bake pipeline for a day). Stamp the build time
+      // where exportGame can read and report it.
+      name: "stamp-build-time",
+      transformIndexHtml: (html) => html.replace("<head>", `<head>\n  <!-- player-template-built ${new Date().toISOString()} -->`),
+    },
   ],
 });

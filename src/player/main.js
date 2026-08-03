@@ -4,6 +4,7 @@ import {
   setAssetResolver,
   setScriptLoader,
   setAssetMetaLoader,
+  setDerivedDataRootProvider,
   applyEngineModules,
   registerBuiltInComponents,
 } from "../engine/index.js";
@@ -30,6 +31,9 @@ setAssetMetaLoader(async (path) => {
   return res.ok ? res.json() : null;
 });
 
+// Exported derived data is read-only and content-addressed. GI resolves the
+// same `gi-sdf/<geometry-hash>.sdf` keys as the editor, beneath this folder.
+setDerivedDataRootProvider(() => "Library");
 
 // Scripts ship as plain files; import once via blob URL (version never
 // changes, so ScriptComponent's hot-reload poll is a cheap cache hit).
@@ -118,6 +122,8 @@ async function boot() {
     );
   }
   const engine = new Engine();
+  // (allowRuntimeSdfBake used to be forced off here — the SDF bake pipeline
+  // was deleted 2026-08-02; GI voxelizes occupancy on the GPU at load.)
   // Debugging convenience, and the handle test harnesses drive the build
   // through: `__engine.loadScene("scenes/Level2.scene")` from a console is
   // the fastest way to check a level transition in a real build.

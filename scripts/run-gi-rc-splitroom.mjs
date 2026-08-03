@@ -25,7 +25,7 @@ await page.evaluate(() => {
 });
 await new Promise((resolve) => setTimeout(resolve, 5000));
 
-await page.evaluate(async () => {
+await page.evaluate(async ({ QUALITY, SPREAD, THIN, LAMPY }) => {
   const { THREE } = await import("/src/engine/index.js");
   await import("/src/modules/index.js");
   const { enableEngineModule } = await import("/src/engine/modules.js");
@@ -53,12 +53,24 @@ await page.evaluate(async () => {
   lampMaterial.emissive = new THREE.Color(0xffffff);
   lampMaterial.emissiveIntensity = 10;
   const lamp = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.4, 0.4), lampMaterial);
-  lamp.position.set(0, 3.3, 0.3);
+  lamp.position.set(0, LAMPY, 0.3);
   lamp.name = "lamp";
   engine.scene.add(lamp);
 
+  // SPREAD inflates the AUTO-FIT VOLUME without changing the room, by parking
+  // a small marker far away. That is the user's real situation and the one this
+  // rig could never reproduce before: their scene is 42m across, so occupancy
+  // voxels are coarse (0.25m at low, 0.175m at medium) while the walls that
+  // have to seal stay thin. A small room seals at every tier precisely because
+  // its voxels are fine — which is why "splitroom passes" was never evidence
+  // that a BIG scene seals.
+  if (SPREAD > 0) {
+    const marker = addBox([0.4, 0.4, 0.4], [SPREAD, 0, SPREAD], 0x404040, "farMarker");
+    marker.name = "farMarker";
+  }
+
   // Thick slab splitting the room, 0.8m below the lamp (like the user's).
-  const slab = new THREE.Mesh(new THREE.BoxGeometry(4.8, 0.6, 4.8), material(0xd0d0d0));
+  const slab = new THREE.Mesh(new THREE.BoxGeometry(4.8, THIN, 4.8), material(0xd0d0d0));
   slab.position.set(0, 2.2, 0);
   slab.name = "slab";
   engine.scene.add(slab);
@@ -67,13 +79,21 @@ await page.evaluate(async () => {
   const giEntity = engine.createEntity({ name: "GI" });
   giEntity.object3D.position.set(0, 2, 0);
   giEntity.addComponent("global-illumination", {
-    autoFit: true, quality: "medium", intensity: 1,
+    autoFit: true, quality: QUALITY, intensity: 1,
   });
 
   engine.camera.position.set(0.4, 1.2, 4.6);
   engine.camera.lookAt(-0.2, 0.9, -0.5);
   engine.camera.updateMatrixWorld(true);
   console.log("GI-SR scene ready");
+}, {
+  QUALITY: process.env.QUALITY ?? "medium",
+  SPREAD: Number(process.env.SPREAD ?? 0),
+  THIN: Number(process.env.THIN ?? 0.6),
+  // Clearance between the lamp and the slab. Exists to test whether a leak is
+  // the light's own SELF-EXCLUSION region reaching the occluder: that region
+  // scales with the SDF cell size, so it grows on a big volume at a low tier.
+  LAMPY: Number(process.env.LAMPY ?? 3.3),
 });
 
 const settle = (ms) => new Promise((resolve) => setTimeout(resolve, ms));

@@ -5,7 +5,7 @@
 // baked ONCE in a worker (seconds for dense meshes, ms for props) and
 // persisted under `<project>/Library/gi-sdf/` keyed by geometry content hash,
 // so subsequent loads are instant and the Assets panel never sees bake
-// caches next to authored `.geom` files. A GPU composite pass (sdfScene.js)
+// caches next to authored `.geom` files. A GPU composite pass (giField.js)
 // min()s all mesh SDFs into the global distance + surface field the cascades
 // trace; moving a mesh only updates its slot uniforms and re-runs that one
 // pass. There is no CPU voxelizer, no scene-bake worker, and no incremental
@@ -22,12 +22,11 @@ import { createCascadeMerge } from "./cascadeMerge.js";
 import { createBounceFeedback, createIrradianceGather, createProbeIrradiance, createRadianceLookup } from "./cascadeGather.js";
 import { blitBvhAtlasTiles, createGiBvhReflect, createGiBvhTarget, createGiGBuffer, createGiResolve, createGiTargets, renderGiGBuffer } from "./giScreen.js";
 import { resolveMaterialSurface, serializeMeshForBake } from "./voxelizeOnce.js";
-import { createOccupancyDebugMaterial, createSdfBaker, createSdfDebugMaterial, createSdfScene } from "./sdfScene.js";
+import { createOccupancyDebugMaterial, createSdfDebugMaterial, createGiField } from "./giField.js";
 import { createOccupancyField, describeOccupancyField, quantizeOccupancyRes } from "./occupancyField.js";
 import { fitPrimitive } from "./primitiveFit.js";
 import { describeGrid } from "./instanceGrid.js";
 import { BRICK_AXIS_BY_QUALITY, describeSparseField } from "./sparseField.js";
-import { buildOccupancyGrid, describeOccupancy } from "./occupancyGrid.js";
 import { GICascadeLight, MAX_EMITTERS, giRoughnessBucketOf, registerGILight } from "./giLight.js";
 import { buildBvhScene } from "./bvh/bvhScene.js";
 import {
@@ -35,18 +34,12 @@ import {
   MAX_ATLAS_LAYERS,
   MAX_INSTANCE_SLOTS,
   MAX_MESH_SDF_SLOTS,
-  MESH_SDF_HIRES_AXIS,
-  MeshSdfAtlas,
+  SlotRegistry,
   SLOTS_PER_LAYER,
-  decodeMeshSdf,
-  encodeMeshSdf,
   geometryContentHash,
-  geometryFingerprintOf,
   instanceCapacityFor,
   slotKeyOf,
-} from "./meshSdfAtlas.js";
-import { getDerivedDataPath, resolveAssetUrl, saveAssetBinary } from "../../engine/assetResolver.js";
-
+} from "./slotRegistry.js";
 const FINGERPRINT_INTERVAL_FRAMES = 5;
 // Hard floor between scene-sync scans. Editor drags emit change events every
 // frame, and each poke used to force a full scan (mesh traverse + material
@@ -64,6 +57,87 @@ const ASSET_LOAD_TIMEOUT_MS = 30_000;
 // (see #retireTargets). Two would do — the third is slack for a frame that is
 // dropped or re-encoded.
 const RETIRED_TARGET_FRAMES = 3;
+
+// ── ASYNC COMPUTE PIPELINES — the computes' missing `isReady` ────────────────
+// three creates every compute pipeline with the SYNC device call, and Chrome's
+// GPU process serves creates and submits on ONE wire thread — so a single big
+// kernel stalls every submit and every in-flight async material compile behind
+// it. Harness-measured 2026-08-02: the 782kB composite kernel cost ~27s of DXC
+// on the wire, and the whole "materials preparation" startup hang was
+// everything else queueing behind it. The render path already has the answer
+// (Pipelines.isReady → skip the draw until the async compile lands); this
+// installs the same semantics for computes:
+//   · creation is redirected to createComputePipelineAsync (driver threads);
+//   · a dispatch whose pipeline hasn't resolved is SKIPPED, not crashed into;
+//   · skipped GI dispatches are re-run in order by GISystem (`giCompute`
+//     marks them — the composite chain is order-dependent, so GISystem
+//     re-queues the WHOLE batch via its dirty flags);
+//   · skipped non-GI dispatches (a particles INIT pass is a one-shot — losing
+//     it breaks the sim) are replayed per node when their pipeline resolves.
+let giDispatchDepth = 0;
+const giSkippedComputes = new Set();
+const giPendingComputePipelines = new Set();
+
+/** Dispatch wrapper for GISystem's own renderer.compute calls — marks skips
+ *  as GI-owned so they take the ordered-retry path, not the replay path. */
+function giCompute(renderer, nodes) {
+  giDispatchDepth++;
+  try {
+    renderer.compute(nodes);
+  } finally {
+    giDispatchDepth--;
+  }
+}
+
+function installAsyncComputePipelines(renderer) {
+  const backend = renderer?.backend;
+  const device = backend?.device;
+  if (!backend || typeof device?.createComputePipelineAsync !== "function") return;
+  if (backend.__giAsyncComputePipelines) return;
+  backend.__giAsyncComputePipelines = true;
+  const rawCreate = backend.createComputePipeline;
+  const rawCompute = backend.compute;
+  backend.createComputePipeline = function (computePipeline, bindings) {
+    // three's pipeline-utils body does all the descriptor/layout work and ends
+    // in `device.createComputePipeline(desc)` — intercept just that call.
+    const rawDeviceCreate = device.createComputePipeline;
+    device.createComputePipeline = (descriptor) => {
+      const promise = device.createComputePipelineAsync(descriptor).then(
+        (pipelineGPU) => {
+          const data = backend.get(computePipeline);
+          data.pipeline = pipelineGPU;
+          const replay = data.giReplayNodes;
+          if (replay?.size) {
+            data.giReplayNodes = null;
+            for (const node of replay) renderer.compute(node);
+          }
+        },
+        (error) =>
+          console.warn(
+            `[gi] compute pipeline "${descriptor?.label ?? ""}" failed to compile:`,
+            error?.message ?? error,
+          ),
+      );
+      const tracked = promise.finally(() => giPendingComputePipelines.delete(tracked));
+      giPendingComputePipelines.add(tracked);
+      return null; // not ready — the dispatch guard below skips it meanwhile
+    };
+    try {
+      rawCreate.call(this, computePipeline, bindings);
+    } finally {
+      device.createComputePipeline = rawDeviceCreate;
+    }
+  };
+  backend.compute = function (computeGroup, computeNode, bindings, pipeline, dispatchSize) {
+    const data = this.get(pipeline);
+    if (!data.pipeline) {
+      if (giDispatchDepth > 0) giSkippedComputes.add(computeNode);
+      else (data.giReplayNodes ??= new Set()).add(computeNode);
+      return;
+    }
+    return rawCompute.call(this, computeGroup, computeNode, bindings, pipeline, dispatchSize);
+  };
+}
 
 /**
  * Exact-SDF shapes for primitive geometries. Boxes/planes/spheres get
@@ -254,6 +328,15 @@ const QUALITY_BUDGETS = {
 };
 const QUALITY_TIERS = new Set(["low", "medium", "high", "ultra"]);
 
+// Per-probe temporal EMA toward each frame's freshly integrated irradiance
+// (createProbeIrradiance). 1 = off. Geometry is static and only light moves, so
+// this changes NOTHING about a settled image — it only stops the probe lattice
+// from popping in blocks while a light sweeps, which is the "flickers like a
+// bulb shorting out" report. Lag at 0.35 is ~5 frames.
+const DEFAULT_PROBE_SMOOTHING = 0.35;
+const clampProbeSmoothing = (value) =>
+  Math.min(1, Math.max(0.02, Number.isFinite(value) ? value : DEFAULT_PROBE_SMOOTHING));
+
 /**
  * The TIER a quality preset selects for — every lookup keyed by preset name
  * (budget tables, trace-step budgets, the mesh-SDF detail-slot budget, the
@@ -308,8 +391,6 @@ export class GISystem {
     // Baked mesh SDFs by CONTENT key (asset path or geometry hash) — shared
     // across mesh instances and across rebuilds. Session-lifetime, as is the
     // bake worker (a rebuild must never kill an in-flight bake).
-    this._meshSdfCache = new Map(); // contentKey → { pending, sdf }
-    this._sdfBaker = createSdfBaker();
     // material → compile-time roughness bucket (see #refreshMirrorBucket).
     this._mirrorBuckets = new WeakMap();
     // Resolve targets replaced by a resize, awaiting a safe disposal frame.
@@ -341,6 +422,7 @@ export class GISystem {
       key === "intensity" ||
       key === "bounce" ||
       key === "temporalBlend" ||
+      key === "probeSmoothing" ||
       key === "skyColor" ||
       key === "skyIntensity" ||
       key === "enabled"
@@ -383,9 +465,18 @@ export class GISystem {
       // `exactReflections` bug: the Inspector toggle appears to do nothing
       // until some unrelated edit happens to force a rebuild.
       p.sparseField,
-      // Same reason, and more so: the backend decides which trace graph every
-      // GI shader compiles. It cannot change without a rebuild, and leaving it
-      // out would make the Inspector's backend dropdown a no-op.
+      // `exactReflections` decides whether `light.bvhReflectTexture` /
+      // `bvhReflectColorTexture` are set, and giLight compiles a DIFFERENT
+      // mirror path depending on that — so it is structural in exactly the
+      // same way `sparseField` is. This was the actual `exactReflections`
+      // bug the comment above names: the toggle flipped the prop, nothing
+      // rebuilt, and the Inspector switch silently did nothing until some
+      // unrelated edit happened to force a rebuild — which also made every
+      // A/B evaluation of exact reflections untrustworthy.
+      p.exactReflections,
+      // The backend decides which trace graph every GI shader compiles, so it
+      // cannot change without a rebuild. (`killSdf` used to sit beside it —
+      // the prop is gone; SDF-free is the only mode.)
       p.backend,
     ]);
   }
@@ -644,7 +735,6 @@ export class GISystem {
     for (const unsub of this._unsubs) unsub?.();
     this._unsubs = [];
     this.#dispose();
-    this._sdfBaker?.dispose();
     this.component = null;
   }
 
@@ -656,6 +746,9 @@ export class GISystem {
     const renderer = this.engine.renderer;
     if (!renderer) return;
     registerGILight(renderer);
+    // Must be live before the FIRST build's dispatches — the build happens
+    // inside this tick, and its kernels are the big ones.
+    installAsyncComputePipelines(renderer);
     // Runs before every early-out below: a retired target must be freed even
     // while a compile wave holds the rest of this tick.
     this.#drainRetiredTargets();
@@ -687,6 +780,22 @@ export class GISystem {
     // Analytic lights AND promoted emissive emitters are per-frame uniforms
     // — moving either re-lights the field this same frame, no bake involved.
     this.#updateLightUniforms();
+    // Live hatch: console-set flag → uniform, effective the same frame.
+    if (state.fieldShadowOff) {
+      state.fieldShadowOff.value = globalThis.__giNoFieldShadows === true ? 1 : 0;
+    }
+    // Shadow-ray uniforms, live: `__giSunAngle` tunes the ANALYTIC penumbra
+    // softness (radians, default 0.025); `__giSunJitter` (radians, default 0
+    // = OFF) enables the stochastic dither cone — off because any stochastic
+    // term flickers under a static light unless Light Smoothing integrates it.
+    if (state.shadowJitter) {
+      state.shadowJitter.frame.value = this._frame % 4096;
+      state.shadowJitter.angle.value =
+        globalThis.__giNoJitter === true ? 0 : globalThis.__giSunJitter ?? 0;
+      state.shadowJitter.penAngle.value = globalThis.__giSunAngle ?? 0.025;
+    }
+    // Checker parity: which half of the cells this frame's feedback updates.
+    if (state.feedbackParity) state.feedbackParity.value = this._frame % 2;
     this.#refreshEmitterSlots();
     // Slot transforms track live matrices — dragging a mesh updates its
     // uniforms here, which bumps the atlas revision and re-runs the
@@ -707,7 +816,14 @@ export class GISystem {
       if (state.screen.radiance?.cameraPosition) {
         this.engine.camera.getWorldPosition(state.screen.radiance.cameraPosition.value);
       }
-      renderGiGBuffer(renderer, this.engine.scene, this.engine.camera, state.screen.gbuffer);
+      // The mirror-mask second pass is only worth its projection walk when
+      // something will actually read the mask — i.e. when the sparse exact
+      // prepass is about to run. Without exact reflections the gbuffer's
+      // normal.w stays 0 everywhere, exactly as before this existed.
+      const wantsMirrorMask = !!state.screen.bvhReflect && this.#bvhReflectionsEnabled() && this.#bvhMaskEnabled();
+      renderGiGBuffer(renderer, this.engine.scene, this.engine.camera, state.screen.gbuffer, {
+        mirrorMask: wantsMirrorMask,
+      });
       // BVH exact-reflection prepass: dispatched right after the gbuffer,
       // EVERY frame it's enabled — independent of the atlas-revision
       // composite gating above/below (that gating is about the SDF field
@@ -719,7 +835,7 @@ export class GISystem {
       // effect on the next rebuild/sync (see `#syncBvhScene`).
       if (state.screen.bvhReflect && this.#bvhReflectionsEnabled()) {
         this.engine.camera.getWorldPosition(this._bvhCameraPosition.value);
-        renderer.compute(state.screen.bvhReflect.compute);
+        giCompute(renderer, state.screen.bvhReflect.compute);
       }
       // GPU atlas blit for tiles the CPU canvas path in bvhScene.js could
       // never draw (KTX2/Basis-compressed material maps — see
@@ -737,18 +853,92 @@ export class GISystem {
         }
       }
     }
-    // Feedback runs every frame at high/ultra, every other frame below —
-    // it's a converging quantity and the priciest per-frame compute.
-    const runFeedback = state.feedbackEveryFrame || this._frame % 2 === 0;
-    let frameQueue = runFeedback ? state.queue : state.queueNoFeedback;
+    // FEEDBACK RATE — REGULAR, NOT MERELY "AT MOST EVERY FRAME".
+    //
+    // The bounce feedback is a fixed-point iteration: each run reads the last
+    // merged field and folds one more bounce of energy into the radiance the
+    // cascades trace. So the level you SEE depends on how many iterations ran
+    // since the light last changed, and a jittering iteration rate is a
+    // jittering brightness.
+    //
+    // It used to be `feedbackEveryFrame || frame % 2 === 0`, decided against a
+    // free-running counter, while the composite branch below ran the FULL
+    // queue (feedback included) unconditionally. At low/medium that produced
+    // an IRREGULAR cadence the moment anything moved — a composite frame ran
+    // feedback, and if the next frame was even it ran feedback again, then a
+    // quiet frame ran none: 2 iterations, then 0, then 1. With `bounce`
+    // defaulting to 1 each iteration adds a visible amount of indirect light,
+    // so the scene pulsed in step with that pattern for as long as the light
+    // kept moving — and only at low/medium, because high/ultra iterate exactly
+    // once per frame by construction.
+    //
+    // The fix is to gate on frames since the LAST ACTUAL RUN, and to let the
+    // composite branch honour the same decision, so the cadence is exactly
+    // 1-in-1 or exactly 1-in-2 and never alternates between them.
+    const legacyRate = globalThis.__giLegacyFeedbackRate === true;
+    const everyFrame = state.feedbackEveryFrame || globalThis.__giFeedbackEveryFrame === true;
+    const runFeedback = legacyRate
+      ? state.feedbackEveryFrame || this._frame % 2 === 0
+      : everyFrame || (this._framesSinceFeedback ?? 1) >= 1;
+    this._framesSinceFeedback = runFeedback ? 0 : (this._framesSinceFeedback ?? 0) + 1;
+    let rateQueue = runFeedback ? state.queue : state.queueNoFeedback;
+    // STAGE FREEZE (`__giFreeze`) — bisects the GI pipeline when every
+    // individual term has been ruled out and the flicker is still there.
+    // The pipeline is: feedback (writes the radiance field) → cascade traces →
+    // merges → probe irradiance → screen resolve. Freezing a prefix means
+    // everything upstream of the cut stops updating, so the image goes STATIC
+    // with respect to the light — that is expected and not the thing to judge.
+    // The only question is whether the FLICKER survives the cut:
+    //   "field"     — field frozen, transport + resolve live.
+    //   "transport" — field, cascades and probes frozen; only the resolve runs.
+    //   "all"       — nothing recomputes; the GI texture is whatever it was.
+    // Flicker that survives "all" is not GI compute at all (look at the
+    // gbuffer/resolve targets); flicker that dies at "field" is the direct
+    // injection; flicker that dies at "transport" is the cascades or the merge.
+    const freeze = globalThis.__giFreeze;
+    if (freeze === "field") rateQueue = state.queueNoFeedback;
+    else if (freeze === "transport") rateQueue = state.screen?.resolve?.compute ? [state.screen.resolve.compute] : [];
+    else if (freeze === "all") rateQueue = [];
     // Probe-average computes exist for the gizmos alone — only pay for
     // them while a probe debug view is actually open.
     const debugMode = component.props.debugProbes;
-    if (debugMode === "raw" || debugMode === "merged") {
-      frameQueue = [...frameQueue, ...state.debugComputes];
-    }
-    if (this._atlasRevisionSeen !== state.atlas.revision) {
+    const debugExtra =
+      debugMode === "raw" || debugMode === "merged" ? state.debugComputes : [];
+    const frameQueue = debugExtra.length ? [...rateQueue, ...debugExtra] : rateQueue;
+    // WHAT MAKES THE FIELD STALE — three signals, not one.
+    //
+    // The atlas revision alone was enough only while every scene change also
+    // produced a mesh-SDF arrival. It does not cover:
+    //   · the occupancy pyramid being re-voxelized (a changed MESH SET — see
+    //     #refreshOccupancyContent; `geometryRevision` deliberately ignores
+    //     per-frame transform updates, which the revision path already covers);
+    //   · the very first frame after a build, when SDF-free means no bake will
+    //     ever arrive to bump anything. That case is the reported "relaunch
+    //     with SDF-free and there is no GI at all, just black": the composite
+    //     never ran, so no cell was ever marked occupied, so nothing bounced.
+    const occGeometryRevision = state.volume.occupancyField?.geometryRevision ?? 0;
+    if (
+      this._atlasRevisionSeen !== state.atlas.revision ||
+      this._occGeometrySeen !== occGeometryRevision ||
+      !this._compositedOnce
+    ) {
+      // FLICKER DIAGNOSTIC (`__giLogComposite`). A composite is supposed to be
+      // RARE — it runs when geometry changed, and it has a one-frame window
+      // where the pyramid is stale (see the OCCUPANCY FIRST note below), which
+      // the module's own comment describes as reading like flicker. If this
+      // reports a steady non-zero rate on a scene where only a LIGHT moves,
+      // something is bumping a revision it shouldn't and that cadence IS the
+      // flicker. Also records WHICH of the three triggers fired.
+      if (globalThis.__giLogComposite) {
+        this._compositeCount = (this._compositeCount ?? 0) + 1;
+        this._compositeWhy = this._compositeWhy ?? { atlas: 0, occ: 0, first: 0 };
+        if (this._atlasRevisionSeen !== state.atlas.revision) this._compositeWhy.atlas++;
+        else if (this._occGeometrySeen !== occGeometryRevision) this._compositeWhy.occ++;
+        else this._compositeWhy.first++;
+      }
       this._atlasRevisionSeen = state.atlas.revision;
+      this._occGeometrySeen = occGeometryRevision;
+      this._compositedOnce = true;
       // Dirty-brick: recomposite only the union AABB of changed slots — the
       // SAME frame as the change. An every-3rd-frame throttle was tried here
       // and REVERTED: on heavy scenes it staggered moving shadows into a
@@ -778,8 +968,14 @@ export class GISystem {
         world.dirtyMin.value.set(-1e9, -1e9, -1e9);
         world.dirtyMax.value.set(1e9, 1e9, 1e9);
       }
-      // A fresh composite always runs the FULL queue (feedback included) —
-      // the field just changed and must re-converge without a frame of lag.
+      // The composite frame runs the SAME queue the rate decision above chose.
+      // It used to force `state.queue` here on the grounds that a changed field
+      // must re-converge without a frame of lag — but "one extra bounce
+      // iteration, on the frames where something moved" is precisely the
+      // irregular cadence that pulses the lighting (see the rate comment).
+      // Trading one frame of bounce latency for a stable level is the right
+      // way round: the DIRECT term is unaffected either way, and direct is what
+      // the eye tracks when a light moves.
       // OCCUPANCY FIRST, and it has to be: the composite reads the pyramid to
       // force `occupied` where triangles pass, and every trace downstream reads
       // it as the hit test. A stale pyramid is not a stale distance — it is
@@ -788,25 +984,59 @@ export class GISystem {
       const occPasses = state.volume.occupancyField?.isDirty
         ? state.volume.occupancyField.passes()
         : null;
-      renderer.compute([
+      const skippedBefore = giSkippedComputes.size;
+      giCompute(renderer, [
         ...(occPasses ?? []),
+        // Inter-probe visibility (cascadeMerge's parent blind-annulus fix).
+        // Pure geometry × lattice, so it belongs HERE and not in the per-frame
+        // queue: it is recomputed exactly when the pyramid or the volume can
+        // have changed, which is the same condition that got us into this
+        // branch. Reads the pyramid, so it must follow occPasses.
+        ...(state.visComputes ?? []),
         state.volume.compositeCompute,
         // Fine level AFTER the coarse composite and BEFORE anything traces:
         // the bricks are the same min-over-candidates function at a sixth of
         // the cell size, so they depend on nothing the composite writes, but
         // every consumer downstream reads them.
         ...(state.volume.sparse?.computes ?? []),
-        ...state.queue,
-        ...(frameQueue === state.queue || frameQueue === state.queueNoFeedback ? [] : state.debugComputes),
+        // `rateQueue` here, not `state.queue`, so a __giFreeze cut still holds
+        // on a composite frame — otherwise the bisect silently leaks the very
+        // stage it is meant to hold still.
+        ...(legacyRate && !freeze ? state.queue : rateQueue),
+        ...debugExtra,
       ]);
+      if (giSkippedComputes.size > skippedBefore) {
+        // Some of this batch's pipelines were still compiling on driver
+        // threads (installAsyncComputePipelines), so part of the ordered
+        // occupancy → visibility → composite chain did no work. Re-arm the
+        // dirty flags and re-run the WHOLE batch next tick — skipped
+        // dispatches are near-free, so retrying until the pipelines land
+        // costs nothing and keeps the stages in order.
+        this._compositedOnce = false;
+        state.volume.occupancyField?.invalidate();
+      }
       this.#maybeLogStats(renderer);
     } else {
       // Cascades re-trace + re-merge EVERY frame — 1-frame response to any
       // field change, no temporal accumulation to converge.
-      renderer.compute(frameQueue);
+      // Guard the empty case: `__giFreeze = "all"` produces no computes, and
+      // three's renderer.compute([]) throws "expects a ComputeNode".
+      if (frameQueue.length) giCompute(renderer, frameQueue);
     }
+    giSkippedComputes.clear();
 
     this._frame++;
+    if (globalThis.__giLogComposite && this._frame % 120 === 0) {
+      const why = this._compositeWhy ?? { atlas: 0, occ: 0, first: 0 };
+      console.log(
+        `[gi] per 120 frames — composites ${this._compositeCount ?? 0} ` +
+          `(atlas ${why.atlas}, occupancy ${why.occ}, other ${why.first}), ` +
+          `resolve resizes ${this._resolveResizes ?? 0} — both should be 0 when only a light moves`,
+      );
+      this._compositeCount = 0;
+      this._resolveResizes = 0;
+      this._compositeWhy = { atlas: 0, occ: 0, first: 0 };
+    }
     // NOT gated by autoRebake anymore: there are no bakes to re-run — this
     // scan is what brings LATE-LOADING meshes (GLB models finish after the
     // first build) into the field at all. Gating it made a freshly opened
@@ -973,7 +1203,33 @@ export class GISystem {
     // browser interleave frames/input between compile chunks.
     const scheduler = globalThis.scheduler;
     const originalYield = scheduler?.yield;
-    if (originalYield) scheduler.yield = () => new Promise((resolve) => setTimeout(resolve, 0));
+    // TIME-BUDGETED YIELD — the whole wave cost lived here (harness-measured
+    // 2026-08-02): three yields after every crumb of build work (per shader
+    // stage per object), and every real macrotask yield waits out a full
+    // frame of whatever else startup is doing (asset decodes, the chunked
+    // field composite). 262 yields × ~230ms startup frames = 60s of a 62s
+    // wave WAITING, on ~2s of actual JS build work. So: run the build in
+    // ~40ms uninterrupted slices and only take a real macrotask yield
+    // between slices — frames/input still interleave, but the wave stops
+    // queueing behind itself a couple hundred times.
+    const yieldStats = { count: 0, waited: 0, skipped: 0 };
+    let lastRealYield = performance.now();
+    if (originalYield)
+      scheduler.yield = () => {
+        if (performance.now() - lastRealYield < 40) {
+          yieldStats.skipped++;
+          return Promise.resolve();
+        }
+        return new Promise((resolve) => {
+          const tY = performance.now();
+          setTimeout(() => {
+            yieldStats.count++;
+            yieldStats.waited += performance.now() - tY;
+            lastRealYield = performance.now();
+            resolve();
+          }, 0);
+        });
+      };
     // PIPELINE COMPILES RUN CONCURRENTLY, not one at a time. three's
     // compileAsync walks render objects sequentially and awaits each
     // `createRenderPipelineAsync` before starting the next ("process
@@ -988,12 +1244,19 @@ export class GISystem {
     const pipelines = renderer._pipelines;
     const originalGetForRender = pipelines?.getForRender;
     const inflight = [];
-    // The promise interception is safe only while rendering is suspended.
-    // In live-background mode compileAsync and render intentionally
-    // interleave on one renderer; let Three process its work items in the
-    // supported sequential/yielding path so render-object state cannot be
-    // mutated underneath concurrently compiling pipelines.
-    if (originalGetForRender && !backgroundCompile) {
+    // BACKGROUND MODE TOO (2026-08-02, was suspended-only). Without the
+    // interception, background mode awaited each object's pipeline promise
+    // PER OBJECT — and those promises can only resolve when the GPU
+    // process's completions get main-thread time, so the wave serialized
+    // against its own busyness (harness-measured: a 42s wave whose driver
+    // work overlapped into the last seconds). It is safe live because the
+    // pipelines created here belong to the compile-target variants (GI
+    // lights hash → different cache keys than anything the live scene
+    // draws), and a live draw that DOES land on a still-compiling cache
+    // entry is skipped by Pipelines.isReady — the same semantics as any
+    // async compile. Only the compile path passes a promises array, so the
+    // wrapper is inert for normal rendering.
+    if (originalGetForRender) {
       pipelines.getForRender = function (renderObject, promises) {
         if (promises == null) return originalGetForRender.call(this, renderObject, promises);
         const collected = [];
@@ -1014,10 +1277,16 @@ export class GISystem {
       // default context then left every material to sync-recompile on the
       // first resumed frame — user-confirmed as ~HALF their startup freeze
       // (disabling the Post Processing module halved startup).
+      const objTimings = [];
       if (!(await this.#warmOverridePass(renderer))) {
         if (backgroundCompile) {
           for (const object of compileObjects) {
+            const tObj = performance.now();
             await renderer.compileAsync(object, engine.camera, compileTarget);
+            objTimings.push({
+              name: object.material?.name || object.material?.type || object.name || "?",
+              ms: performance.now() - tObj,
+            });
           }
         } else {
           await renderer.compileAsync(engine.scene, engine.camera);
@@ -1035,11 +1304,12 @@ export class GISystem {
           : `[gi] compile wave: materials done in ${(t1 - t0).toFixed(0)}ms ` +
             `(node builds ${(tQueued - t0).toFixed(0)}ms, ${queued} pipelines compiled concurrently in ${(t1 - tQueued).toFixed(0)}ms)`,
       );
-      // Compute pipelines have NO async path in three (computeAsync ≡
-      // compute) and would otherwise all compile synchronously inside the
-      // first resumed frame — a multi-second freeze right after the wave
-      // "finished". Prewarm them here, one dispatch per macrotask. The
-      // dispatches do a normal frame's field work, so they're not wasted.
+      // Prewarm every GI kernel. Creation is ASYNC (installAsyncComputePipelines
+      // — driver threads, wire never stalls, frames keep flowing) and a
+      // dispatch whose pipeline hasn't landed is skipped, so this loop's job
+      // is to force creation early, wait out the compiles, then dispatch for
+      // real so the first resumed frame finds everything warm AND the field
+      // composited.
       if (state && this.state === state) {
         state.volume.updateGrid();
         state.volume.updateSparse();
@@ -1048,10 +1318,43 @@ export class GISystem {
           ...(state.volume.sparse?.computes ?? []),
           ...state.queue,
         ];
+        const kernelSizes = [];
         for (const node of computeNodes) {
           await new Promise((resolve) => setTimeout(resolve, 0));
           if (this.state !== state) break;
-          renderer.compute(node);
+          giCompute(renderer, node);
+          try {
+            const wgsl = renderer._nodes?.getForCompute?.(node)?.computeShader;
+            if (wgsl) kernelSizes.push(Math.round(wgsl.length / 1024));
+          } catch {
+            /* diagnostics only */
+          }
+        }
+        // Ticks may have started compiles before this loop did — wait for the
+        // whole in-flight set, including anything that joins meanwhile.
+        if (giPendingComputePipelines.size) {
+          const tPipe = performance.now();
+          let waited = 0;
+          while (giPendingComputePipelines.size) {
+            waited += giPendingComputePipelines.size;
+            await Promise.all([...giPendingComputePipelines]);
+          }
+          console.log(
+            `[gi] ${waited} compute pipelines compiled concurrently in ` +
+              `${(performance.now() - tPipe).toFixed(0)}ms (frames kept flowing)`,
+          );
+        }
+        // The guarded dispatches above did no field work where a pipeline was
+        // still compiling — dispatch each node for real now that every
+        // pipeline resolved (all cache hits, no creates).
+        if (this.state === state) {
+          for (const node of computeNodes) giCompute(renderer, node);
+        }
+        if (kernelSizes.length) {
+          console.log(
+            `[gi] compute kernels: ${kernelSizes.length} totaling ${kernelSizes.reduce((s, n) => s + n, 0)}kB WGSL ` +
+              `(sizes ${kernelSizes.join("/")}kB — [0] composite, then sparse, then the frame queue)`,
+          );
         }
       }
       // The postprocess pipeline builds asynchronously (addon imports + graph
@@ -1071,12 +1374,25 @@ export class GISystem {
         `[gi] compile wave: materials ${(t1 - t0).toFixed(0)}ms, computes ${(performance.now() - t1).toFixed(0)}ms ` +
           `(${backgroundCompile ? "viewport remained live" : "render suspended, app interactive"})`,
       );
+      // A slow wave earns a breakdown in the log: how much was real JS work
+      // vs waiting on the macrotask yields, and which objects paid the most.
+      if (t1 - t0 > 3000) {
+        console.log(
+          `[gi] wave breakdown: ${yieldStats.count} real yields waited ${yieldStats.waited.toFixed(0)}ms ` +
+            `(${yieldStats.skipped} skipped by the 40ms budget); ` +
+            `slowest objects: ${objTimings
+              .sort((a, b) => b.ms - a.ms)
+              .slice(0, 6)
+              .map((o) => `${o.name} ${o.ms.toFixed(0)}ms`)
+              .join(", ") || "(single scene compile)"}`,
+        );
+      }
       compileSucceeded = true;
     } catch (error) {
       console.warn("[gi] async compile wave failed; GI was not committed:", error?.stack ?? error?.message ?? error);
     } finally {
       if (originalYield) scheduler.yield = originalYield;
-      if (originalGetForRender && !backgroundCompile) pipelines.getForRender = originalGetForRender;
+      if (originalGetForRender) pipelines.getForRender = originalGetForRender;
       if (this._compileToken === token) {
         // Moving the already-compiled light from the temporary scene to the
         // live scene is the commit point. The next render observes the new
@@ -1113,7 +1429,7 @@ export class GISystem {
    * rebuild, its shader stays in the pipeline cache, and a quality change or
    * an auto-fit refit no longer triggers a material recompile wave.
    */
-  #buildScreenResolve({ gather, light, emitterSlots, radianceLookup = null }) {
+  #buildScreenResolve({ gather, light, emitterSlots, radianceLookup = null, lightSlots = null }) {
     const renderer = this.engine.renderer;
     if (!renderer?.backend?.device) return null;
     const { width, height } = this.#screenResolveSize();
@@ -1143,6 +1459,19 @@ export class GISystem {
           }
         : null;
       inputs.radiance = radiance;
+      // Exact-reflection hit shading rides along in this pass (see
+      // createGiResolve's `bvhShade`). The BVH targets are created HERE, ahead
+      // of `#syncBvhScene`, because the resolve has to bind them at build time
+      // while the BVH scene itself only arrives once the mesh list is walked —
+      // they are system-lifetime anyway (same reasoning as `_giTargets`), so
+      // creating them early costs one half-res texture set and nothing else.
+      inputs.bvhShade = this.#bvhReflectionsEnabled()
+        ? {
+            ...this.#ensureBvhTargets(width, height),
+            lightSlots,
+            cameraPosition: radiance?.cameraPosition ?? uniform(new THREE.Vector3()),
+          }
+        : null;
       const resolve = createGiResolve({ gbuffer, targets, width, height, ...inputs });
       light.giIrradianceNode = this._giIrradianceNode;
       light.giEmitterShadowNode = emitterSlots ? this._giEmitterShadowNode : null;
@@ -1167,6 +1496,17 @@ export class GISystem {
     const screen = state.screen;
     const { width, height } = this.#screenResolveSize();
     if (width === screen.width && height === screen.height) return;
+    // A RESIZE IS SUPPOSED TO BE RARE. It recreates every GI target, retires
+    // the old ones 3 frames later, and REBUILDS + sync-compiles the resolve
+    // pipeline. If this fires repeatedly on a static viewport (a size that
+    // oscillates by a pixel, a render scale that chases frame time), the GI
+    // texture is being torn down and rebuilt while the scene renders — which
+    // is GI-only, independent of every lighting term, and looks exactly like a
+    // global flicker. Counted under `__giLogComposite`.
+    if (globalThis.__giLogComposite) {
+      this._resolveResizes = (this._resolveResizes ?? 0) + 1;
+      console.log(`[gi] resolve target resized to ${width}x${height} (was ${screen.width}x${screen.height})`);
+    }
     screen.width = width;
     screen.height = height;
     screen.gbuffer.setSize(width, height);
@@ -1181,6 +1521,26 @@ export class GISystem {
     this._giIrradianceNode.value = screen.targets.irradiance;
     this._giEmitterShadowNode.value = screen.targets.emitterShadow;
     this._giRadianceNode.value = screen.targets.radiance;
+    // THE BVH TARGETS ARE REPLACED BEFORE THE RESOLVE IS REBUILT, not after.
+    // The resolve now BINDS them (it shades the reflection hits — see
+    // createGiResolve's `bvhShade`), so rebuilding it against the old,
+    // about-to-be-retired textures would hand it dead bindings and the pass
+    // would start failing a few frames later, when the retire timer fires.
+    let previousBvhTarget = null;
+    if (screen.bvhShade) {
+      previousBvhTarget = this._giBvhTarget;
+      this._giBvhTarget = createGiBvhTarget(width, height);
+      this._giBvhTargetSize = { width, height };
+      this._giBvhReflectNode.value = this._giBvhTarget.bvhReflect;
+      this._giBvhColorNode.value = this._giBvhTarget.bvhColor;
+      this._giBvhRadianceNode.value = this._giBvhTarget.bvhRadiance;
+      screen.bvhShade = {
+        ...screen.bvhShade,
+        hit: this._giBvhTarget.bvhReflect,
+        albedo: this._giBvhTarget.bvhColor,
+        target: this._giBvhTarget.bvhRadiance,
+      };
+    }
     const index = state.queue.indexOf(screen.resolve.compute);
     const indexNoFeedback = state.queueNoFeedback.indexOf(screen.resolve.compute);
     screen.resolve = createGiResolve({
@@ -1193,19 +1553,25 @@ export class GISystem {
       intensity: screen.intensity,
       emitter: screen.emitter,
       radiance: screen.radiance,
+      bvhShade: screen.bvhShade,
     });
     if (index >= 0) state.queue[index] = screen.resolve.compute;
     if (indexNoFeedback >= 0) state.queueNoFeedback[indexNoFeedback] = screen.resolve.compute;
     this.#retireTargets(previousTargets);
-    // Same follow-up for the BVH reflect target/compute (GI Phase 3 v1),
-    // when it exists — it is NOT part of state.queue/queueNoFeedback (see
-    // #tick's dispatch comment), so there is no index-splice step for it.
+    // Same follow-up for the BVH reflect compute (GI Phase 3 v1) — it is NOT
+    // part of state.queue/queueNoFeedback (see #tick's dispatch comment), so
+    // there is no index-splice step for it.
     if (screen.bvhReflect) {
-      const previousBvhTarget = this._giBvhTarget;
-      this._giBvhTarget = createGiBvhTarget(width, height);
-      this._giBvhTargetSize = { width, height };
-      this._giBvhReflectNode.value = this._giBvhTarget.bvhReflect;
-      this._giBvhColorNode.value = this._giBvhTarget.bvhColor;
+      if (!previousBvhTarget) {
+        // Exact reflections without the shading bundle (an unshaded build):
+        // the targets were not swapped above, so do it here.
+        previousBvhTarget = this._giBvhTarget;
+        this._giBvhTarget = createGiBvhTarget(width, height);
+        this._giBvhTargetSize = { width, height };
+        this._giBvhReflectNode.value = this._giBvhTarget.bvhReflect;
+        this._giBvhColorNode.value = this._giBvhTarget.bvhColor;
+        this._giBvhRadianceNode.value = this._giBvhTarget.bvhRadiance;
+      }
       const { compute } = createGiBvhReflect({
         gbuffer: screen.gbuffer,
         target: this._giBvhTarget.bvhReflect,
@@ -1216,10 +1582,11 @@ export class GISystem {
         cameraPosition: this._bvhCameraPosition,
         normalOffset: state.light.normalOffset,
         maxDistance: state.light.mirrorRange ?? 24,
+        mask: this.#bvhMaskEnabled(),
       });
       screen.bvhReflect = { compute, bvhScene: screen.bvhReflect.bvhScene };
-      this.#retireTargets(previousBvhTarget);
     }
+    this.#retireTargets(previousBvhTarget);
   }
 
   /**
@@ -1241,6 +1608,31 @@ export class GISystem {
     const quality = qualityTierOf(props);
     if (quality !== "high" && quality !== "ultra") return false;
     return props.exactReflections === true;
+  }
+
+  /**
+   * The exact-reflection screen targets + the persistent texture nodes over
+   * them, created on first use and kept for the SYSTEM's lifetime — never per
+   * build. Materials and the resolve compile against these NODES and hold them
+   * across rebuilds, so a node may only ever have its `.value` re-pointed (see
+   * createGiTargets' comment; this is the same contract).
+   *
+   * Returns the plain textures the resolve binds: `hit`/`albedo` are what the
+   * BVH prepass writes, `target` is where the shaded radiance goes.
+   */
+  #ensureBvhTargets(width, height) {
+    if (!this._giBvhTarget) {
+      this._giBvhTarget = createGiBvhTarget(width, height);
+      this._giBvhTargetSize = { width, height };
+      this._giBvhReflectNode = texture(this._giBvhTarget.bvhReflect);
+      this._giBvhColorNode = texture(this._giBvhTarget.bvhColor);
+      this._giBvhRadianceNode = texture(this._giBvhTarget.bvhRadiance);
+    }
+    return {
+      hit: this._giBvhTarget.bvhReflect,
+      albedo: this._giBvhTarget.bvhColor,
+      target: this._giBvhTarget.bvhRadiance,
+    };
   }
 
   /**
@@ -1276,6 +1668,7 @@ export class GISystem {
       if (light) {
         light.bvhReflectTexture = null;
         light.bvhReflectColorTexture = null;
+        light.bvhReflectShaded = false;
       }
       return;
     }
@@ -1291,16 +1684,10 @@ export class GISystem {
     const bvhScene = buildBvhScene(meshes);
     state.bvhScene = bvhScene;
     const { width, height } = state.screen;
-    // Lazy, SYSTEM-lifetime (not per-build) — same reasoning as `_giTargets`
-    // (see createGiTargets' comment): materials/the light's compiled shader
-    // hold this texture NODE across rebuilds, so the node must never be
-    // replaced, only its `.value` (see the resize path above).
-    if (!this._giBvhTarget) {
-      this._giBvhTarget = createGiBvhTarget(width, height);
-      this._giBvhTargetSize = { width, height };
-      this._giBvhReflectNode = texture(this._giBvhTarget.bvhReflect);
-      this._giBvhColorNode = texture(this._giBvhTarget.bvhColor);
-    }
+    // Usually already created by #buildScreenResolve (the resolve has to bind
+    // these to shade hits); this covers the incremental-sync path reaching
+    // here first. Lazy + SYSTEM-lifetime either way — see #ensureBvhTargets.
+    this.#ensureBvhTargets(width, height);
     if (!this._bvhCameraPosition) this._bvhCameraPosition = uniform(new THREE.Vector3());
     const { compute } = createGiBvhReflect({
       gbuffer: state.screen.gbuffer,
@@ -1312,11 +1699,24 @@ export class GISystem {
       cameraPosition: this._bvhCameraPosition,
       normalOffset: light.normalOffset,
       maxDistance: light.mirrorRange ?? 24,
+      mask: this.#bvhMaskEnabled(),
     });
     state.screen.bvhReflect = { compute, bvhScene };
+    // The resolve pass shades hits when it was built with a `bvhShade` bundle
+    // (see #buildScreenResolve) — that is the single source of truth for which
+    // texture carries the value materials should read.
+    const shaded = !!state.screen.bvhShade;
     if (light) {
       light.bvhReflectTexture = this._giBvhReflectNode;
-      light.bvhReflectColorTexture = this._giBvhColorNode;
+      // WHICH texture the material samples for reflection colour, and what it
+      // means, move together. Shaded: the resolve's radiance target, consumed
+      // as-is. Unshaded: the prepass's raw albedo, which the consumer then has
+      // to light with the wrong thing (its own irradiance — see giLight's use
+      // site). Both are compile-time, and both are safe to switch here because
+      // the flag is derived from the screen resolve, which only ever changes
+      // on a rebuild.
+      light.bvhReflectColorTexture = shaded ? this._giBvhRadianceNode : this._giBvhColorNode;
+      light.bvhReflectShaded = shaded;
     }
     // Affirmative ground truth for users/harnesses: absence of this line
     // means exact reflections are NOT running, whatever else seems true
@@ -1325,8 +1725,46 @@ export class GISystem {
     console.log(
       `[gi] bvh: exact reflections ON — ${bvhScene.meshCount} meshes, ${bvhScene.triCount} tris` +
         (bvhScene.meshes.length < (state.entries?.length ?? 0) ? " (some meshes SDF-only via coverage flag)" : "") +
-        (bvhScene.texturedCount > 0 ? ", textured atlas" : ""),
+        (bvhScene.texturedCount > 0 ? ", textured atlas" : "") +
+        (this.#bvhMaskEnabled() ? ", sparse (mirror-masked)" : ", DENSE (full-screen)") +
+        (shaded ? ", hit-shaded" : ", albedo-only"),
     );
+  }
+
+  /**
+   * Whether the exact-reflection prepass restricts itself to mirror pixels.
+   * On by default — the dense arm exists only as the A/B for the harness and
+   * as an escape hatch if a scene's mirror tagging ever proves wrong (the
+   * failure mode would be a reflective surface whose material bucket the
+   * collect walk didn't classify: it loses its exact reflection and falls
+   * back to the cascade lookup, rather than rendering wrong).
+   */
+  #bvhMaskEnabled() {
+    return globalThis.__giBvhMask === true;
+  }
+
+  /**
+   * SDF-FREE MODE: no baked mesh SDF is read anywhere in the lighting path.
+   * The occupancy pyramid supplies the composited distance and the near-field
+   * refinement both traces used the per-mesh atlas for (see giField's
+   * `killSdf`), which is what retires the 40 MB atlas, the bake worker and the
+   * `.sdf` Library cache.
+   *
+   * WHY IT ALSO MATTERS FOR SHIPPING, not just VRAM: those caches live in the
+   * Tauri-only project `Library/`, so a hosted build either ships them or bakes
+   * every mesh from scratch in the browser. Occupancy voxelizes from triangles
+   * on the GPU at load, so an SDF-free build has nothing to ship and nothing to
+   * bake.
+   *
+   * Structural (it changes which graph every GI shader compiles) — see
+   * `#structuralSignature`.
+   */
+  #killSdfEnabled() {
+    // ALWAYS. The bake pipeline is deleted (2026-08-02) — there is no SDF path
+    // to fall back to, and the prop is gone from the component. Kept as a
+    // method because a dozen call sites read it, and the giField fallback for
+    // a device without an occupancy field still keys off it structurally.
+    return true;
   }
 
   /**
@@ -1491,6 +1929,14 @@ export class GISystem {
         high: { shadow: 44, mirror: 56, feedback: 32 },
         ultra: { shadow: 56, mirror: 64, feedback: 40 } }[quality]
       ?? { shadow: 44, mirror: 56, feedback: 32 };
+    // Low/medium's feedback cost halving, restructured: instead of the whole
+    // pass running every OTHER frame (which stair-steps the entire field at
+    // half the light's rate — flicker on exactly the presets meant to be
+    // cheap), the pass runs EVERY frame on alternating halves of the cells
+    // (index parity × this flipping uniform). Same average cost, and the
+    // field as a whole now moves every frame.
+    const feedbackChecker = !(quality === "high" || quality === "ultra");
+    const feedbackParity = feedbackChecker ? uniform(0) : null;
 
     // The authored representation: one atlas TILE per unique baked geometry,
     // one INSTANCE SLOT per world placement. Sizing them apart is the point —
@@ -1539,7 +1985,7 @@ export class GISystem {
     // instance. Uniform-array length only — no texture memory rides on it.
     let placements = 0;
     for (const mesh of meshes) placements += this.#placementsOf(mesh).length;
-    const atlas = new MeshSdfAtlas(
+    const atlas = new SlotRegistry(
       Math.min(MAX_ATLAS_LAYERS, blockLayers + singleLayers) * SLOTS_PER_LAYER,
       instanceCapacityFor(placements),
     );
@@ -1551,26 +1997,34 @@ export class GISystem {
     // touching the component. Brick size and pool budget scale with quality —
     // the pool is real VRAM, and at ultra it is the largest single allocation
     // the module makes.
-    const sparseField = props.sparseField === true || globalThis.__giSparseField === true;
-    // CONSERVATIVE TRIANGLE OCCUPANCY. Built here because this is where the
-    // mesh list lives, and BEFORE the volume because the composite graph binds
-    // its texture. CPU-side and cheap — the rasterizer walks a half-voxel
-    // lattice per triangle, which for a 0.35m grid is one sample for almost
-    // every triangle in a real scene.
-    // OPT-IN, per the spec's flag discipline (`gi.backend` stays legacy until
-    // the occupancy backend passes its phase gates). This is a PROTOTYPE of
-    // spec Phase 1 — CPU, point-sampled, dense, single-level — not the SAT
-    // brickmap it calls for, so it must not become anyone's default yet.
-    const occupancyOn = props.triangleOcclusion === true || globalThis.__giOccupancy === true;
-    const occupancy = occupancyOn ? buildOccupancyGrid(meshes, bounds, res) : null;
-    // THE OCCUPANCY BACKEND (spec phases 1+4). Built here for the same reason
-    // the prototype above is — this is where the mesh list lives — and BEFORE
-    // the volume, because the composite graph and every trace close over it.
-    // `backend` is in #structuralSignature, so flipping it rebuilds.
+    // MUTUALLY EXCLUSIVE WITH SDF-FREE MODE, and this is a correctness gate,
+    // not a preference: the sparse bricks are a RESAMPLING of the per-mesh SDF
+    // grids, and both traces trust a valid brick OVER the coarse distance. With
+    // no grids to fill them the bricks would hold cap distances and would
+    // silently overwrite the occupancy oracle's good answer with a blank one.
+    const sparseField =
+      !this.#killSdfEnabled() &&
+      (props.sparseField === true || globalThis.__giSparseField === true);
+    // (The CPU point-sampled occupancy PROTOTYPE that used to be buildable
+    // here — `triangleOcclusion` opt-in, occupancyGrid.js — was deleted
+    // 2026-08-02 with the bake pipeline it depended on. The SAT-conservative
+    // pyramid below is its successor and the only occupancy.)
+    const occupancy = null;
+    // THE OCCUPANCY BACKEND (spec phases 1+4) — since 2026-08-02 the ONLY
+    // transport backend; the `backend` prop and the legacy SDF sphere trace it
+    // selected are gone. Built here for the same reason the prototype above is
+    // (this is where the mesh list lives) and BEFORE the volume, because the
+    // composite graph and every trace close over it. Null only means the
+    // device failed the storage-buffer gate, which now disables GI outright.
     const occField = this.#buildOccupancyField(props, meshes, bounds, { sizeX, sizeY, sizeZ }, quality);
-    const volume = createSdfScene(bounds, res, atlas, {
+    const killSdf = this.#killSdfEnabled();
+    if (killSdf && !occField) {
+      console.warn("[gi] killSdf ignored — no occupancy field (device gate), falling back to baked mesh SDFs");
+    }
+    const volume = createGiField(bounds, res, atlas, {
       occupancy,
       occupancyField: occField,
+      killSdf,
       sparseField,
       brickAxis: BRICK_AXIS_BY_QUALITY[quality] ?? 6,
       // Budgets sized from a MEASURED scene, not guessed: their Sponza wants
@@ -1605,15 +2059,34 @@ export class GISystem {
     // and intensity are live controls — changing them re-lights the scene on
     // the next frame with no rebuild and no material recompile.
     const skyRadiance = uniform(new THREE.Color(0, 0, 0));
-    const { mergeComputes, averageComputes } = createCascadeMerge(cascades, { sky: skyRadiance });
+    const { mergeComputes, averageComputes, visComputes } = createCascadeMerge(cascades, {
+      sky: skyRadiance,
+      occupancyVoxel: volume.occupancyField?.voxel ?? null,
+      // The whole field, for the buried-PARENT cut (see that use site): the
+      // coarse cascades are where a probe inside a floor is metres from the
+      // children it feeds.
+      occupancy: volume.occupancyField ?? null,
+    });
     // Per-probe ambient-cube irradiance, integrated once per frame — the
     // per-pixel/per-cell gather then reads 2 fetches per probe instead of
-    // dirCount radiance reads (the dominant per-pixel GPU cost).
-    const probeIrradiance = createProbeIrradiance(cascades);
+    // dirCount radiance reads (the dominant per-pixel GPU cost). It also owns
+    // the per-probe openness (buried-probe cut) and the per-probe temporal EMA
+    // that keeps a sweeping light from popping the lattice.
+    const probeSmoothing = uniform(clampProbeSmoothing(props.probeSmoothing));
+    const probeIrradiance = createProbeIrradiance(cascades, {
+      occupancy: volume.occupancyField ?? null,
+      smoothing: probeSmoothing,
+    });
     // This gather instance feeds ONLY the deferred resolve compute (materials
     // read its result from a texture now), so it can be a real WGSL function
     // — see createShadowTrace's note on why that is unsafe for shared ones.
-    const gather = createIrradianceGather(cascades, probeIrradiance.buffer, volume.world.cellMax, "giResolveGather");
+    const gather = createIrradianceGather(
+      cascades, probeIrradiance.buffer, volume.world.cellMax, "giResolveGather",
+      // The FIELD, not a captured number: the gather needs both its voxel size
+      // (a uniform, so an in-place refit rescales it) and its point test, for
+      // the buried-probe cut.
+      volume.occupancyField ?? null,
+    );
     // Volume diagonal as a uniform: shadow/mirror reach rescales with an
     // in-place refit (all world-scale shader inputs must be uniforms — a
     // baked one would pin part of the old volume after a refit).
@@ -1660,13 +2133,59 @@ export class GISystem {
           }))
         : null;
     const normalLift = volume.world.minCell.mul(1.2);
+    // Live A/B hatch for the field's shadow traces (see createBounceFeedback's
+    // note on why this must be a UNIFORM, not a globalThis read).
+    const fieldShadowOff = uniform(0);
+    // Shadow-ray uniforms. `penAngle` = the sun's angular radius driving the
+    // ANALYTIC penumbra (k = 1/penAngle in the DDA — the flicker fix; smooth,
+    // deterministic). `angle` = the STOCHASTIC dither cone, DEFAULT 0: with
+    // the analytic penumbra the signal is already continuous, and any
+    // stochastic term flickers by construction whenever Light Smoothing is
+    // off — user-confirmed ("it flickers even when the light is not
+    // moving"). Kept as an opt-in (`__giSunJitter`) for A/B only.
+    const shadowJitter = { frame: uniform(0), angle: uniform(0), penAngle: uniform(0.025) };
     const feedbackCompute = createBounceFeedback(cascades, volume, bounceGain, temporalBlend, {
       lightSlots,
       emitterSlots,
       probeIrradiance: probeIrradiance.buffer,
       // Private to the feedback compute (see createShadowTrace's layout note).
-      shadowTrace: volume.createSoftShadowTrace(normalLift, traceBudget.feedback, "giFeedbackShadowTrace"),
+      // STABLE mode — the moving-light flicker fix (see createShadowTrace's
+      // stable-mode note): this is the one trace re-evaluated for every field
+      // cell every frame under a sweeping sun, so its binary verdicts were the
+      // regional bright↔dark stepping. `__giStableFieldShadows = false`
+      // restores the sharp estimator for an A/B (build-time — needs a rebuild).
+      shadowTrace: volume.createSoftShadowTrace(
+        normalLift, traceBudget.feedback, "giFeedbackShadowTrace",
+        globalThis.__giStableFieldShadows !== false,
+      ),
       gridDiagonal: diagU,
+      fieldShadowOff,
+      jitter: shadowJitter,
+      checkerParity: feedbackParity,
+      // Sun/point shadows in the FIELD go through the hierarchical occupancy
+      // DDA — the same medium the transport rays march, which is why transport
+      // never leaked while these sphere-traced rays tunnelled through the
+      // floor at every preset whose cells are coarser than the slab (see
+      // cascadeGather's `lightShadow` note). The verdict is hit × ANALYTIC
+      // PENUMBRA (traceOccupancy's `penumbraK` — cone occlusion accumulated
+      // during the march): a grazing ray fades continuously toward 0 before
+      // the binary hit ever flips, which is what removes the last flicker —
+      // with the sun on the far side of a building, the whole dark side's
+      // bounce is amplified from a FEW sunlit cells near openings, and a
+      // binary (or Bernoulli-jittered) verdict there swung the entire room
+      // (user's 14-frame capture, 2026-08-03). k = 1/sunAngle: one knob is
+      // both the jitter cone and the penumbra softness, live.
+      // `__giFieldDdaShadows = false` (build-time) restores the sphere trace.
+      lightShadow:
+        volume.occupancyField && globalThis.__giFieldDdaShadows !== false
+          ? (origin, dir, maxT) => {
+              const r = volume.occupancyField.traceOccupancy(
+                origin, dir, volume.world.minCell.mul(0.25), maxT,
+                { steps: 64, penumbraK: float(1).div(shadowJitter.penAngle.max(0.005)) },
+              );
+              return r.hit.oneMinus().mul(r.pen);
+            }
+          : null,
     });
 
     const queue = [feedbackCompute];
@@ -1675,11 +2194,12 @@ export class GISystem {
     // Integrate probe irradiance AFTER the merge so receivers read
     // this frame's field.
     queue.push(probeIrradiance.compute);
-    // At low/medium the feedback (per-occupied-cell gather + shadow traces)
-    // runs every OTHER frame — it's a converging quantity, and halving its
-    // rate halves the largest per-frame compute at those presets.
+    // The feedback pass now runs EVERY frame at every preset — low/medium get
+    // their cost halving from the checker (half the cells per frame, see
+    // feedbackChecker above) instead of from skipping frames. queueNoFeedback
+    // survives for the legacy-rate hatch and the __giFreeze bisect.
     const queueNoFeedback = queue.slice(1);
-    const feedbackEveryFrame = quality === "high" || quality === "ultra";
+    const feedbackEveryFrame = true;
     // Per-probe averages feed ONLY the debug gizmos — appended to the frame
     // queue while a probe debug view is open, skipped otherwise.
     const debugComputes = [...cascades.map((cascade) => cascade.averageCompute), ...averageComputes];
@@ -1777,6 +2297,7 @@ export class GISystem {
       diagU,
       queue,
       queueNoFeedback,
+      visComputes,
       debugComputes,
       feedbackEveryFrame,
       light,
@@ -1798,6 +2319,10 @@ export class GISystem {
       c0Grid,
       bounceGain,
       temporalBlend,
+      probeSmoothing,
+      fieldShadowOff,
+      shadowJitter,
+      feedbackParity,
       skyRadiance,
       autoFit,
       lightSlots,
@@ -1805,6 +2330,8 @@ export class GISystem {
       statsLogged: false,
     };
     this._atlasRevisionSeen = -1; // force a first composite
+    this._occGeometrySeen = -1;
+    this._compositedOnce = false;
     this._pendingFit = null; // refit debounce restarts against fresh bounds
     this.#syncSlots(entries);
     this.#syncBvhScene(entries);
@@ -1851,8 +2378,15 @@ export class GISystem {
           `(composite clamps from level ${volume.coarseLevel})`,
       );
     }
-    if (volume.occupancy) {
-      console.log(`[gi] triangle occupancy: ${describeOccupancy(volume.occupancy)}`);
+    // Affirmative ground truth, same discipline as the BVH line: the ABSENCE
+    // of "SDF-free" means baked mesh SDFs are still being read, whatever the
+    // Inspector checkbox appears to say.
+    if (this.#killSdfEnabled()) {
+      console.log(
+        volume.occupancyField
+          ? "[gi] SDF-free: ON — distance from the occupancy pyramid, no mesh SDF bakes, no atlas"
+          : "[gi] SDF-free: requested but INACTIVE — no occupancy field to take the distance from",
+      );
     }
     if (volume.sparse) {
       volume.updateSparse();
@@ -1957,6 +2491,22 @@ export class GISystem {
   #updateLightUniforms() {
     const state = this.state;
     if (!state?.lightSlots) return;
+    // `__giFreezeLightInput` — the bisect that separates the only two things
+    // left once every lighting TERM has been ruled out (bounce 0, shadows
+    // forced open, probe smoothing off, zero composites, zero resizes):
+    //   · GI's INPUT jitters — the light direction it reads differs frame to
+    //     frame from the one three renders with, so a perfectly smooth GI
+    //     oscillates because its argument does.
+    //   · GI is NONDETERMINISTIC — same input, different output, i.e. a
+    //     read/write hazard between the compute dispatches (the feedback pass
+    //     writes `radianceBuffer` while the cascade traces read it, all inside
+    //     one submit).
+    // Freezing these uniforms holds GI's input EXACTLY constant while three's
+    // own direct lighting keeps following the light. GI's contribution then
+    // stops responding to the light — expected, ignore it. If it still
+    // flickers, the input is innocent and it is a hazard.
+    if (globalThis.__giFreezeLightInput && this._lightInputFrozen) return;
+    this._lightInputFrozen = !!globalThis.__giFreezeLightInput;
     const lights = this._lightObjects ?? [];
     if (lights.length > MAX_GI_LIGHTS && !this._warnedLightBudget) {
       this._warnedLightBudget = true;
@@ -1990,6 +2540,52 @@ export class GISystem {
       slot.range.value = light.isPointLight ? Math.max(0, light.distance || 0) : 0;
       slot.color.value.copy(light.color).multiplyScalar(light.intensity);
     }
+    this.#logLightInput();
+  }
+
+  /**
+   * `__giLogLight` — per-FRAME record of the light direction GI actually used,
+   * with nothing frozen. This is the test that survives the mistake made twice
+   * above: GI's only light-dependent input is this uniform, so any hatch that
+   * holds it still also freezes GI's output, and "no flicker" becomes trivially
+   * true. Measuring it instead of freezing it keeps the whole pipeline live.
+   *
+   * With `bounce` 0, shadows forced open, zero composites and zero target
+   * resizes, GI's output is a SMOOTH function of this direction — so if the
+   * per-frame angular steps are smooth and monotonic, GI cannot be producing a
+   * flicker from them and the artifact is downstream of everything measured so
+   * far. Steps that jitter in size, or REVERSE sign while the light turns one
+   * way, mean GI is being fed a direction that disagrees with the one three
+   * renders with, and the smooth function is simply reporting a jittery input.
+   */
+  #logLightInput() {
+    if (!globalThis.__giLogLight) return;
+    const slot = this.state?.lightSlots?.find((s) => s.active.value > 0.5);
+    if (!slot) return;
+    const v = slot.vector.value;
+    const prev = this._lightLogPrev;
+    this._lightLogPrev = { x: v.x, y: v.y, z: v.z };
+    if (!prev) { this._lightLogSteps = []; return; }
+    const dot = Math.min(1, Math.max(-1, prev.x * v.x + prev.y * v.y + prev.z * v.z));
+    const step = (Math.acos(dot) * 180) / Math.PI;
+    // Signed by the turn direction about the dominant rotation axis, so a
+    // genuine reversal is distinguishable from ordinary magnitude noise.
+    const cross = prev.y * v.z - prev.z * v.y;
+    (this._lightLogSteps ??= []).push(cross >= 0 ? step : -step);
+    if (this._lightLogSteps.length < 120) return;
+    const s = this._lightLogSteps;
+    this._lightLogSteps = [];
+    const mag = s.map(Math.abs);
+    const mean = mag.reduce((a, b) => a + b, 0) / mag.length;
+    let reversals = 0;
+    for (let i = 1; i < s.length; i++) if (s[i] * s[i - 1] < 0 && mag[i] > mean * 0.1) reversals++;
+    const still = mag.filter((m) => m < mean * 0.05).length;
+    console.log(
+      `[gi] light step over 120 frames: mean ${mean.toFixed(4)}deg, ` +
+        `min ${Math.min(...mag).toFixed(4)}, max ${Math.max(...mag).toFixed(4)}, ` +
+        `reversals ${reversals}, near-zero steps ${still} — ` +
+        `a smoothly turning light gives a steady mean, 0 reversals and 0 near-zero steps`,
+    );
   }
 
   #dispose() {
@@ -2024,6 +2620,7 @@ export class GISystem {
     // belongs to `intensity`, which sits OUTSIDE the loop.
     state.bounceGain.value = Math.min(1, Math.max(0, this.component?.props.bounce ?? 1));
     state.temporalBlend.value = Math.min(1, Math.max(0.02, this.component?.props.temporalBlend ?? 0.25));
+    state.probeSmoothing.value = clampProbeSmoothing(this.component?.props.probeSmoothing);
     // Sky radiance = colour x intensity, in the same linear units as an
     // emitter's. Default intensity 0 means "no sky", which is byte-identical
     // to the behaviour before this existed — every sealed-room baseline is
@@ -2087,7 +2684,10 @@ export class GISystem {
     }
     candidates.sort((a, b) => b.tris - a.tris);
     for (const candidate of candidates.slice(0, 12)) granted.add(candidate.mesh);
-    if (granted.size) {
+    if (granted.size && globalThis.__giVerbose) {
+      // Legacy wording from the bake era — the grant now only prioritises
+      // detail slots, no 128³ texture exists. Verbose-only until the
+      // detail-slot machinery is retired with the emissive-shadow rework.
       const names = [...granted].map((m) => m.name || "mesh").join(", ");
       console.log(`[gi] hi-res 128³ SDFs (${granted.size}): ${names}`);
     }
@@ -2126,10 +2726,39 @@ export class GISystem {
       const geometry = mesh.geometry;
       const position = geometry.attributes.position;
       const tris = (geometry.index?.count ?? position.count) / 3;
-      const analytic = analyticShapeOf(
+      let analytic = analyticShapeOf(
         geometry,
         Array.isArray(mesh.material) ? mesh.material[0] : mesh.material,
       );
+      // SDF-FREE: EVERY MESH STILL NEEDS A SLOT, and a slot only becomes ACTIVE
+      // (`aabbMin.w = 1`) when it receives a baked grid or an analytic shape.
+      // With no bakes, a scene of ordinary meshes ends up with ZERO active
+      // slots — which costs far more than a distance field, because an inactive
+      // slot has no AABB for the composite to attribute a cell to and carries
+      // no mean albedo. **Indirect light is albedo**, so the whole bounce term
+      // goes to zero: direct light, and nothing else. That is exactly the
+      // reported "almost pitch black, no indirect".
+      //
+      // A bounding BOX is the right stand-in. It costs no bake, gives the
+      // composite a real AABB and the slot's colours, and its DISTANCE — the
+      // one part that would be a crude lie — is never sampled in this mode:
+      // the composite takes distance from the occupancy oracle and both traces
+      // do too (see giField's `killSdf`), so nothing ever calls `sampleSlot`.
+      if (!analytic && this.#killSdfEnabled()) {
+        if (!geometry.boundingBox) geometry.computeBoundingBox();
+        const bb = geometry.boundingBox;
+        if (bb) {
+          analytic = {
+            type: "box",
+            center: [(bb.min.x + bb.max.x) / 2, (bb.min.y + bb.max.y) / 2, (bb.min.z + bb.max.z) / 2],
+            half: [
+              Math.max((bb.max.x - bb.min.x) / 2, 1e-4),
+              Math.max((bb.max.y - bb.min.y) / 2, 1e-4),
+              Math.max((bb.max.z - bb.min.z) / 2, 1e-4),
+            ],
+          };
+        }
+      }
       if (analytic) {
         for (const instanceId of placements) {
           entries.push({
@@ -2140,30 +2769,18 @@ export class GISystem {
         }
         continue;
       }
-      const assetPath = geometry.userData?.assetPath ?? null;
-      const hash = geometryContentHash(geometry);
-      // HI-RES (128³) SDF grant — decided once per rebuild for the whole
-      // scene (#selectHiResMeshes). Content keys carry the res so a cached
-      // 64³ grid never satisfies a 128³ want (and vice versa).
+      // No bake pipeline any more — a mesh that reaches here (no fitted
+      // primitive) gets nothing extra; #buildEntries' killSdf path above
+      // synthesizes an analytic bounding box for it, so this branch exists
+      // only for the no-occupancy-device fallback. contentKey remains the
+      // instances-share-a-slot identity.
       const hiRes = this._hiResMeshes?.has(mesh) === true;
-      // Persistence: ALL mesh SDFs (including `.geom` assets) live in the
-      // project's content-addressed Library cache — bake once, reuse across
-      // sessions, scenes, and mesh instances. Authored assets stay free of
-      // bake sidecars. Legacy `${assetPath}.sdf` neighbours are still read
-      // (and migrated) so old projects don't rebake cold. Null (no project
-      // open / exported player without the cache) → session cache only.
       const contentKey = contentKeyOf(geometry, hiRes);
-      const sdfPath = hash ? getDerivedDataPath(`gi-sdf/${hash}${hiRes ? "-r128" : ""}.sdf`) : null;
-      const legacySdfPath = assetPath && !hiRes ? `${assetPath}.sdf` : null;
-      // ONE entry per placement, all carrying the SAME contentKey — which is
-      // exactly what makes them share a tile: the key is the atlas's tile
-      // identity as well as the bake cache's, so 200 instances bake once,
-      // upload once, and differ only by their transform uniforms.
       for (const instanceId of placements) {
         entries.push({
           mesh, instanceId, key: slotKeyOf(mesh, instanceId),
           surface, tris, luminance, r, g, b, hiRes,
-          contentKey, sdfPath, legacySdfPath, promoted: false,
+          contentKey, promoted: false,
         });
       }
     }
@@ -2280,32 +2897,14 @@ export class GISystem {
         slotOfKey.set(entry.key, free);
         continue;
       }
-      const cached = this._meshSdfCache.get(entry.contentKey);
-      if (!cached?.sdf) {
-        this.#ensureMeshSdf(entry);
-        continue;
-      }
-      const free = atlas.allocateSlot();
-      if (free < 0) {
-        overflow++;
-        continue;
-      }
-      // Hi-res grids NEED a 2×2×2 tile block — seating a 128³ grid in a
-      // single tile would write into its neighbours. Tile exhaustion is
-      // reported separately from instance exhaustion: they have different
-      // fixes (a bigger atlas tier vs. fewer placements), and conflating
-      // them is what produced the old build/overflow/build loop.
-      const seated = atlas.setSlot(free, entry.mesh, cached.sdf, this.#slotSurface(entry), {
-        tileKey: entry.contentKey,
-        hiRes: entry.hiRes === true,
-        instanceId: entry.instanceId,
-      });
-      if (!seated) {
-        atlas.releaseSlot(free);
-        tileOverflow++;
-        continue;
-      }
-      slotOfKey.set(entry.key, free);
+      // No bakes exist (the SDF pipeline is deleted): a non-analytic entry
+      // never seats a grid. Under the occupancy backend #buildEntries gives
+      // every such mesh an analytic box, so this is the no-occupancy-device
+      // fallback only — the mesh stays out of the composite rather than
+      // waiting for a bake that will never arrive. (The tile-seating path —
+      // atlas.setSlot with a baked grid, hi-res 2×2×2 tile blocks, tile
+      // overflow accounting — was deleted with the pipeline.)
+      continue;
     }
     if (tileOverflow > 0) overflow += tileOverflow;
     if (overflow > 0) {
@@ -2410,7 +3009,7 @@ export class GISystem {
     const pickedNames = picked
       .map((d) => `${d.entry.mesh.name || "mesh"}${d.entry.hiRes ? "*" : ""}`)
       .join(", ");
-    if (pickedNames !== this._lastDetailLog) {
+    if (pickedNames !== this._lastDetailLog && globalThis.__giVerbose) {
       this._lastDetailLog = pickedNames;
       // With the instance grid live the budget is spent PER CELL, so the
       // scene-wide "over budget" count is not a shortfall any more — the
@@ -2427,87 +3026,6 @@ export class GISystem {
               : ""),
       );
     }
-  }
-
-  /**
-   * Load-or-bake one entry's SDF (keyed by content, shared across
-   * instances): try the Library cache, then a legacy `${asset}.sdf`
-   * neighbour (stale/corrupt files rebake), else bake in the dedicated
-   * worker and persist under Library. Bake once, reuse forever — including
-   * across sessions.
-   */
-  #ensureMeshSdf(entry) {
-    const cache = this._meshSdfCache;
-    if (cache.get(entry.contentKey)?.pending || cache.get(entry.contentKey)?.sdf) return;
-    const cacheEntry = { pending: true, sdf: null };
-    cache.set(entry.contentKey, cacheEntry);
-    const name = entry.mesh.name || entry.contentKey;
-    const record = serializeMeshForBake(entry.mesh);
-    if (!record) {
-      cache.delete(entry.contentKey);
-      return;
-    }
-    const fingerprint = geometryFingerprintOf(record);
-    const finish = (sdf, how) => {
-      cacheEntry.pending = false;
-      cacheEntry.sdf = sdf;
-      console.log(`[gi] mesh SDF ${how} (${name}): ${sdf.dims.x}x${sdf.dims.y}x${sdf.dims.z}`);
-      // Seat it into WHATEVER build is current by then — SDFs are keyed by
-      // content, so they remain valid across rebuilds/refits (an auto-fit
-      // refit mid-bake must not orphan the result).
-      if (this.state) this.#syncSlots(this.state.entries);
-    };
-    const tryLoad = async (path) => {
-      if (!path) return null;
-      try {
-        const response = await fetch(await resolveAssetUrl(path));
-        if (!response.ok) return null;
-        return decodeMeshSdf(await response.arrayBuffer(), fingerprint);
-      } catch {
-        return null;
-      }
-    };
-    const persist = async (sdf) => {
-      if (!entry.sdfPath) {
-        console.warn(`[gi] mesh SDF session-only (${name}) — no project Library, will rebake next start`);
-        return;
-      }
-      if (await saveAssetBinary(entry.sdfPath, encodeMeshSdf(sdf, fingerprint))) {
-        console.log(`[gi] mesh SDF saved: ${entry.sdfPath}`);
-      } else {
-        console.warn(`[gi] mesh SDF NOT saved (${name}) — write failed or writer unavailable: ${entry.sdfPath}`);
-      }
-    };
-    const bake = () => {
-      const t0 = performance.now();
-      this._sdfBaker
-        .request(record, entry.hiRes ? MESH_SDF_HIRES_AXIS : undefined)
-        .then(async (sdf) => {
-          finish(sdf, `baked in ${(performance.now() - t0).toFixed(0)}ms (${entry.hiRes ? "128³ hi-res" : "64³"})`);
-          // Persist loudly: a silent save failure looks identical to working
-          // persistence until the next editor start rebakes everything.
-          await persist(sdf);
-        })
-        .catch((error) => {
-          cache.delete(entry.contentKey);
-          console.warn(`[gi] mesh SDF bake failed (${name}):`, error?.message ?? error);
-        });
-    };
-    (async () => {
-      const fromLibrary = await tryLoad(entry.sdfPath);
-      if (fromLibrary) {
-        finish(fromLibrary, "loaded from Library");
-        return;
-      }
-      const fromLegacy = await tryLoad(entry.legacySdfPath);
-      if (fromLegacy) {
-        finish(fromLegacy, "loaded from legacy sidecar");
-        // Copy into Library so the next session never needs the neighbour file.
-        await persist(fromLegacy);
-        return;
-      }
-      bake();
-    })();
   }
 
   /**
@@ -2645,9 +3163,10 @@ export class GISystem {
           if (m?.isVolumeNodeMaterial || m?.userData?.isVolumeMaterial) continue;
           this.#markObservedMaterial(m);
           this.#refreshMirrorBucket(m);
+          const bucket = m ? giRoughnessBucketOf(m) : 2;
           if (m && !seenMaterials.has(m)) {
             seenMaterials.add(m);
-            tally[giRoughnessBucketOf(m)]++;
+            tally[bucket]++;
           }
         }
         // A volume's bounding box is a participating medium, not a surface —
@@ -2814,11 +3333,14 @@ export class GISystem {
     state.entries = entries;
     this.#syncSlots(entries);
     this.#syncBvhScene(entries);
+    // And the occupancy pyramid, which is what transport rays actually
+    // intersect — see #refreshOccupancyContent for why this was missing.
+    this.#refreshOccupancyContent(meshes);
   }
 
   /**
    * Applies new auto-fit bounds WITHOUT a rebuild: every world-space shader
-   * input is a uniform (see createSdfScene's world bundle), so a refit is a
+   * input is a uniform (see createGiField's world bundle), so a refit is a
    * uniform update + a full-slot AABB refresh + one recomposite — the
    * viewport never freezes. This is what makes MOVING OBJECTS safe in
    * scenes that live under the GI entity: before, any move that shifted the
@@ -3009,7 +3531,7 @@ export class GISystem {
    * allocate — the same contract the SDF field's own auto-fit densities use.
    */
   #buildOccupancyField(props, meshes, bounds, size, quality) {
-    const backend = globalThis.__giBackend ?? props.backend ?? "sdf-legacy";
+    const backend = globalThis.__giBackend ?? props.backend ?? "occupancy";
     if (backend !== "occupancy") return null;
 
     // STORAGE-BUFFER HEADROOM GATE. The pyramid is one more storage binding in
@@ -3018,8 +3540,11 @@ export class GISystem {
     // the pipeline is rejected and the WHOLE compute batch is dropped, which
     // presents as "GI stopped working" with a validation error that names no
     // line of anyone's code. The engine asks for the adapter's real limit at
-    // device creation (resolveRendererLimits); this refuses the backend rather
+    // device creation (resolveRendererLimits); this refuses to build rather
     // than shipping that failure when the ask could not be granted.
+    //
+    // Refusing the backend is a DOWNGRADE, not a failure: `createSceneTrace`
+    // falls back to the legacy SDF sphere trace when there is no field.
     const limit = this.engine.renderer?.backend?.device?.limits?.maxStorageBuffersPerShaderStage ?? 8;
     if (limit < 10) {
       console.warn(
@@ -3041,8 +3566,32 @@ export class GISystem {
       z: Math.max(16, Math.round(size.sizeZ / voxelSize)),
     });
 
-    // Unique geometries (deduped by content identity, so 200 crates ship one
-    // triangle range) + one placement per world instance.
+    const { geometries, placements } = this.#occupancyContentOf(meshes);
+
+    // `bounds` is the SAME object createGiField will hold and mutate in
+    // `setBounds`, which is what makes `field.refit()` able to re-derive the
+    // pyramid's origin and voxel size from it after an in-place refit.
+    //
+    // HEADROOM ON THE SLOT CAPACITY, because the mesh set GROWS after this
+    // runs: GLB models finish loading seconds later and arrive through the
+    // fingerprint scan, and `#refreshOccupancyContent` re-uploads them into
+    // this same field. Sizing the capacity exactly to the meshes present at
+    // build time would leave every late arrival with nowhere to go.
+    const field = createOccupancyField(bounds, res, {
+      slotCapacity: Math.min(MAX_INSTANCE_SLOTS, Math.max(64, placements.length * 2)),
+      traceSteps: { low: 48, medium: 64, high: 96, ultra: 128 }[quality] ?? 96,
+    });
+    for (const p of placements) field.setSlotMatrix(p.slot, p.matrix);
+    field.setGeometry(geometries, placements);
+    field.placements = placements;
+    return field;
+  }
+
+  /**
+   * Unique geometries (deduped by content identity, so 200 crates ship one
+   * triangle range) + one placement per world instance.
+   */
+  #occupancyContentOf(meshes) {
     const geometries = [];
     const seen = new Set();
     const placements = [];
@@ -3066,18 +3615,39 @@ export class GISystem {
         placements.push({ slot: placements.length, geometryKey: record.geometryKey, matrix, mesh, instanceId });
       }
     }
+    return { geometries, placements };
+  }
 
-    // `bounds` is the SAME object createSdfScene will hold and mutate in
-    // `setBounds`, which is what makes `field.refit()` able to re-derive the
-    // pyramid's origin and voxel size from it after an in-place refit.
-    const field = createOccupancyField(bounds, res, {
-      slotCapacity: Math.max(1, placements.length),
-      traceSteps: { low: 48, medium: 64, high: 96, ultra: 128 }[quality] ?? 96,
-    });
+  /**
+   * Re-voxelizes the pyramid for a CHANGED MESH SET (not a changed transform —
+   * that is `#refreshOccupancyTransforms`).
+   *
+   * WITHOUT THIS, LATE-LOADING MESHES NEVER ENTER THE TRANSPORT FIELD AT ALL.
+   * Occupancy geometry was uploaded once, inside `#buildOccupancyField`, i.e.
+   * only on a full rebuild — while the mesh-SDF path picks up new meshes every
+   * fingerprint scan. So a GLB that finished loading after the build was in the
+   * SDF atlas and absent from the pyramid, which is the thing every transport
+   * ray actually intersects.
+   *
+   * It was survivable while the composited SDF still carried a distance. In
+   * SDF-free mode the pyramid is the ONLY source of both distance and
+   * occupancy, so the same gap presents as **no GI at all on a fresh launch** —
+   * the field is empty, so nothing is occupied, so nothing bounces.
+   */
+  #refreshOccupancyContent(meshes) {
+    const field = this.state?.volume?.occupancyField;
+    if (!field) return;
+    const { geometries, placements } = this.#occupancyContentOf(meshes);
+    if (placements.length > field.slotCapacity) {
+      // Capacity is a buffer size fixed at creation — growing past it is one of
+      // the few things that genuinely needs the rebuild.
+      console.log(`[gi] occupancy: ${placements.length} placements exceeds capacity ${field.slotCapacity} — rebuilding`);
+      this.requestRebuild();
+      return;
+    }
     for (const p of placements) field.setSlotMatrix(p.slot, p.matrix);
     field.setGeometry(geometries, placements);
     field.placements = placements;
-    return field;
   }
 
   /**

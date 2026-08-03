@@ -4,8 +4,8 @@
 // concatenating EVERY eligible mesh's BLAS into 4 shared flat storage
 // buffers, plus a per-mesh uniform table (world→local transform, world
 // AABB, buffer offsets) refreshed every frame from matrixWorld — a moving
-// mesh is a uniform update, the same "refit is free" contract sdfScene's
-// world bundle already keeps (see createSdfScene's header comment).
+// mesh is a uniform update, the same "refit is free" contract giField's
+// world bundle already keeps (see createGiField's header comment).
 //
 // TWO-LEVEL STRUCTURE: per-mesh BLAS (built once per geometry, cached) +
 // a per-frame-updated transform/AABB table walked by a runtime loop
@@ -13,7 +13,7 @@
 // deliberately NOT the "single wgslFn takes every per-mesh array as a raw
 // ptr parameter" shape: the outer mesh loop, the world-AABB reject, and the
 // worldToLocal transform are all plain TSL (`Loop`/`If`/mat4 math) — the
-// SAME proven idiom meshSdfAtlas.js already uses for its own per-slot
+// SAME proven idiom slotRegistry.js already uses for its own per-slot
 // uniform arrays (`this.worldToLocal.element(s)` etc.) — and only the
 // expensive part (the actual BLAS stack traversal) stays hand-written WGSL,
 // faithfully ported from the spike with 4 added offsets. This sidesteps any
@@ -346,7 +346,7 @@ export const ALBEDO_ATLAS_SIZE = ALBEDO_ATLAS_TILE * ALBEDO_ATLAS_GRID; // 2048
  * index === the mesh's table index. A mesh whose material carries a
  * drawable `.map` gets its actual texture image drawn into its tile — this
  * is what retires the old "one mean color per mesh" approximation
- * (`sdfScene.js`'s `hitSurfaceFn`/`atlas.albedo`) for BVH reflection hits.
+ * (`giField.js`'s `hitSurfaceFn`/`atlas.albedo`) for BVH reflection hits.
  * Anything else — no map, or the source image fails to draw (a KTX2/Basis-
  * compressed texture has no CPU-readable pixels: its `.image` is a
  * `{data,width,height}` record, not a CanvasImageSource, so `ctx.drawImage`
@@ -540,7 +540,7 @@ export function buildBvhScene(meshes) {
   // misalign a tightly-packed (8-byte-stride) JS Float32Array here too.
   const uvBuffer = attributeArray(uvData, "float").toReadOnly();
 
-  // Per-mesh table, capacity-fixed at MAX_BVH_MESHES (like meshSdfAtlas's
+  // Per-mesh table, capacity-fixed at MAX_BVH_MESHES (like slotRegistry's
   // capacity padding): the shader loop bound is the LIVE `meshCountUniform`
   // node, not a JS constant, so seating fewer/more meshes on a later sync
   // never changes the compute's WGSL — only the buffers above (rebuilt
@@ -800,7 +800,7 @@ export function buildBvhScene(meshes) {
       const hasAlbedo = float(0).toVar();
       // Exact hit normal (GI Phase 3 v3 — striping fix, see giScreen.js's
       // "STRIPING FIX" comment on createGiBvhReflect): default matches
-      // sdfScene.js createHitSurfaceFn's own miss default (world up).
+      // giField.js createHitSurfaceFn's own miss default (world up).
       const normal = vec3(0, 1, 0).toVar();
       If(bestT.greaterThanEqual(0), () => {
         const meshIdx = bestMesh.toInt().toVar();

@@ -1,21 +1,15 @@
-// 3D Radiance Cascades — deliberately minimal voxel medium.
+// GI shared helpers that survived the SDF/voxel-bake deletion (2026-08-02).
 //
-// ONE fixed-resolution grid. The CPU bake (triangle rasterize + direct
-// light + exact EDT) lives in bakeCore.js and runs in two contexts:
-// synchronously here for the initial build, and inside bakeWorker.js for
-// re-bakes — `rebakeAsync()` streams worker results into the same GPU
-// buffers with zero main-thread hitching (drag a wall → lighting follows at
-// worker cadence while rendering stays at full frame rate). In-flight jobs
-// coalesce: while the worker is busy, only the LATEST pending request is
-// kept, so continuous edits can't queue up a backlog.
-//
-// Cell payload (vec4): rgb = OUTGOING radiance (albedo·E/π + emissive),
-// w = 1 occupied / 0 empty. The GPU side is a TSL Amanatides-Woo DDA
-// (`createSceneTrace`) + an SDF sphere-trace (`createSoftShadowTrace`) over
-// a trilinear-filtered Data3DTexture distance field.
+// This file used to be the legacy CPU voxel medium (bakeCore rasterize + EDT
+// + streaming bake worker). That pipeline is gone; what remains are the pure
+// pieces the occupancy backend still consumes:
+//   · resolveMaterialSurface / serializeMeshForBake — material → albedo/
+//     emissive resolution and mesh serialization (GISystem, occupancy field);
+//   · createVoxelSceneTrace — the TSL Amanatides-Woo DDA;
+//   · createTrilinearRadianceSampler — the side-aware trilinear field read
+//     every transport hit shades through (giField).
 import * as THREE from "three/webgpu";
 import { Break, If, Loop, float, floor, instancedArray, step, texture3D, vec3, vec4 } from "three/tsl";
-import { allocateBakeArrays, bakeMeshSdf, runBake } from "./bakeCore.js";
 
 /**
  * Evaluates a TSL node subtree to a constant RGB if possible, else null.
@@ -208,297 +202,16 @@ const toPlainLights = (light) => {
  * @param {{x: number, y: number, z: number}} res grid cells per axis
  * @param {object|Array} light light(s) for the direct bake
  */
-export function voxelizeOnce(meshes, bounds, res, light) {
-  const cellCount = res.x * res.y * res.z;
-  const size = new THREE.Vector3().subVectors(bounds.max, bounds.min);
-  const cell = new THREE.Vector3(size.x / res.x, size.y / res.y, size.z / res.z);
-  const plainBounds = {
-    min: { x: bounds.min.x, y: bounds.min.y, z: bounds.min.z },
-    max: { x: bounds.max.x, y: bounds.max.y, z: bounds.max.z },
-  };
-  const plainCell = { x: cell.x, y: cell.y, z: cell.z };
-
-  const arrays = allocateBakeArrays(cellCount);
-  const stats = { triangles: 0, occupiedCells: 0, litCells: 0, emissiveCells: 0, cellCount };
-
-  // Initial bake: synchronous (startup — nothing to hitch yet).
-  Object.assign(
-    stats,
-    runBake({ records: toRecords(meshes), bounds: plainBounds, res, cell: plainCell, lights: toPlainLights(light), arrays }),
-  );
-
-  const { radiance, surface, normals, distance } = arrays;
-  // Buffer roles for temporal streaming (flicker-free moving objects):
-  //   stagingBuffer  — the LATEST CPU bake, partial-uploaded at worker cadence
-  //   baseBuffer     — blended direct+emissive state; the per-frame bounce-
-  //                    feedback pass lerps it toward staging (~100ms settle)
-  //   radianceBuffer — live field the cascade rays trace (base + bounce)
-  // Only staging is written from the CPU during streaming, so a 10-15Hz bake
-  // cadence no longer hard-snaps the field the lighting reads.
-  const stagingBuffer = instancedArray(radiance, "vec4");
-  const radianceBuffer = instancedArray(radiance.slice(), "vec4");
-  const baseBuffer = instancedArray(radiance.slice(), "vec4");
-  const surfaceBuffer = instancedArray(surface, "vec4");
-  const normalBuffer = instancedArray(normals, "vec4");
-  // 3D texture (not a storage buffer) ON PURPOSE: hardware trilinear makes
-  // the sampled distance CONTINUOUS between cells — nearest-cell sampling
-  // quantizes d and the penumbra min(k·d/t) turns each step into a terrace.
-  const distanceTexture = new THREE.Data3DTexture(distance, res.x, res.y, res.z);
-  distanceTexture.format = THREE.RedFormat;
-  distanceTexture.type = THREE.FloatType;
-  distanceTexture.minFilter = THREE.LinearFilter;
-  distanceTexture.magFilter = THREE.LinearFilter;
-  distanceTexture.unpackAlignment = 1;
-  distanceTexture.needsUpdate = true;
-
-  const upload = () => {
-    // Sync path (initial build / harness rebake): full snap of every buffer —
-    // deterministic harnesses want the new state immediately, no blend-in.
-    baseBuffer.value?.array?.set(radiance);
-    radianceBuffer.value?.array?.set(radiance);
-    for (const buffer of [stagingBuffer, radianceBuffer, baseBuffer, surfaceBuffer, normalBuffer]) {
-      const attribute = buffer.value;
-      if (attribute) {
-        // Full upload: clear any stale PARTIAL ranges first or the whole-
-        // buffer update gets silently truncated to the old range.
-        attribute.clearUpdateRanges?.();
-        attribute.needsUpdate = true;
-      }
-    }
-    distanceTexture.needsUpdate = true;
-  };
-
-  // ------------------------------------------------------------ bake worker
-  let worker = null;
-  let workerBroken = false;
-  let jobId = 0;
-  let inFlight = null; // { id, resolve }
-  let pending = null; // latest superseding request { records, lights, resolve }
-  // Geometry payloads the worker already caches — ship each (geometry,
-  // version) exactly once; drags then send only ids + matrices + colors.
-  const shippedGeometry = new Set();
-
-  const ensureWorker = () => {
-    if (worker || workerBroken) return worker;
-    try {
-      shippedGeometry.clear();
-      worker = new Worker(new URL("./bakeWorker.js", import.meta.url), { type: "module" });
-      console.log("[gi] bake worker active — re-bakes run off the main thread");
-      worker.onmessage = (event) => {
-        const message = event.data;
-        const current = inFlight;
-        inFlight = null;
-        if (current && message.jobId === current.id) {
-          // PARTIAL apply: the worker sends changed-range SLICES (its full
-          // arrays never leave the worker). Full re-uploads of every buffer
-          // were a 30-60ms main-thread writeBuffer stall per rebake at fine
-          // voxel sizes; moving one object touches a tiny fraction of the grid.
-          const applyRange = (target, slice, buffer, range) => {
-            if (!range || !slice) return;
-            target.set(slice, range[0]);
-            const attribute = buffer.value;
-            if (attribute) {
-              attribute.addUpdateRange(range[0], slice.length);
-              attribute.needsUpdate = true;
-            }
-          };
-          // Streaming path: only STAGING gets the new radiance — the per-
-          // frame feedback pass blends base/radiance toward it (temporal
-          // smoothing of incoming bakes; hard swaps were the flicker).
-          applyRange(radiance, message.radiance, stagingBuffer, message.ranges.radiance);
-          applyRange(surface, message.surface, surfaceBuffer, message.ranges.surface);
-          applyRange(normals, message.normals, normalBuffer, message.ranges.normals);
-          if (message.ranges.distance && message.distance) {
-            distance.set(message.distance, message.ranges.distance[0]);
-            // Data3DTexture has no partial-upload path in three — full
-            // texture re-upload, but only when the field actually changed.
-            distanceTexture.needsUpdate = true;
-          }
-          if (message.stats) Object.assign(stats, message.stats);
-          current.resolve({ stats, elapsed: message.elapsed, mode: message.mode ?? "noop" });
-        } else {
-          current?.resolve(null);
-        }
-        if (pending) {
-          const next = pending;
-          pending = null;
-          post(next.records, next.lights, next.resolve);
-        }
-      };
-      worker.onerror = (error) => {
-        console.warn("[gi] bake worker failed, falling back to main-thread rebakes:", error.message ?? error);
-        workerBroken = true;
-        worker?.terminate();
-        worker = null;
-        const current = inFlight;
-        inFlight = null;
-        current?.resolve(null);
-        if (pending) {
-          const next = pending;
-          pending = null;
-          next.resolve(null);
-        }
-      };
-    } catch (error) {
-      console.warn("[gi] no Worker support, rebakes stay on the main thread:", error?.message ?? error);
-      workerBroken = true;
-    }
-    return worker;
-  };
-
-  const post = (records, lights, resolve) => {
-    jobId++;
-    inFlight = { id: jobId, resolve };
-    const wire = records.map((r, i) => {
-      const hasKey = !!r.geometryKey;
-      const key = r.geometryKey ?? `anon:${i}`;
-      // Keyless records (non-standard callers) re-ship every job — the
-      // cache entry is overwritten in place, so no growth and no staleness.
-      const known = hasKey && shippedGeometry.has(key);
-      if (hasKey && !known) shippedGeometry.add(key);
-      return {
-        id: r.id ?? `idx:${i}`,
-        geometryKey: key,
-        matrix: r.matrix,
-        color: r.color,
-        emissive: r.emissive,
-        emissiveIntensity: r.emissiveIntensity,
-        excludeFromDistanceField: r.excludeFromDistanceField === true,
-        geometry: known ? null : { positions: r.positions, index: r.index },
-      };
-    });
-    worker.postMessage({ jobId, records: wire, bounds: plainBounds, res, cell: plainCell, lights });
-  };
-
-  // ---------------------------------------------------- per-mesh SDF bakes
-  // DEDICATED worker: a dense mesh's SDF bake can run seconds, and sharing
-  // the scene-bake worker would stall incremental rebakes behind it.
-  // Geometry ships inline (requests are rare, one per geometry version).
-  let sdfWorker = null;
-  let sdfWorkerBroken = false;
-  let sdfRequestId = 0;
-  const sdfRequests = new Map(); // requestId → { resolve, reject }
-
-  const ensureSdfWorker = () => {
-    if (sdfWorker || sdfWorkerBroken) return sdfWorker;
-    try {
-      sdfWorker = new Worker(new URL("./bakeWorker.js", import.meta.url), { type: "module" });
-      sdfWorker.onmessage = (event) => {
-        const message = event.data;
-        if (message.type !== "meshSdf") return;
-        const request = sdfRequests.get(message.requestId);
-        sdfRequests.delete(message.requestId);
-        if (request) {
-          if (message.error) request.reject(new Error(message.error));
-          else request.resolve(message.sdf);
-        }
-      };
-      sdfWorker.onerror = (error) => {
-        console.warn("[gi] SDF worker failed, mesh SDFs will bake on the main thread:", error.message ?? error);
-        for (const request of sdfRequests.values()) request.reject(new Error("SDF worker died"));
-        sdfRequests.clear();
-        sdfWorkerBroken = true;
-        sdfWorker?.terminate();
-        sdfWorker = null;
-      };
-    } catch {
-      sdfWorkerBroken = true;
-    }
-    return sdfWorker;
-  };
-
-  /**
-   * Bakes a high-res LOCAL-space SDF for one record's geometry in a
-   * dedicated worker. Falls back to a synchronous main-thread bake.
-   */
-  const requestMeshSdf = (record) => {
-    if (!ensureSdfWorker()) {
-      return Promise.resolve(bakeMeshSdf(record.positions, record.index));
-    }
-    return new Promise((resolve, reject) => {
-      sdfRequestId++;
-      sdfRequests.set(sdfRequestId, { resolve, reject });
-      sdfWorker.postMessage({
-        type: "meshSdf",
-        requestId: sdfRequestId,
-        geometryKey: record.geometryKey ?? `sdf:${sdfRequestId}`,
-        geometry: { positions: record.positions, index: record.index },
-      });
-    });
-  };
-
-  return {
-    res,
-    bounds,
-    cell,
-    stats,
-    radianceBuffer,
-    baseBuffer,
-    stagingBuffer,
-    surfaceBuffer,
-    normalBuffer,
-    distanceTexture,
-
-    /** Synchronous full re-bake (harness/back-compat path). */
-    rebake(bakeMeshes, bakeLight) {
-      Object.assign(
-        stats,
-        runBake({
-          records: toRecords(bakeMeshes),
-          bounds: plainBounds,
-          res,
-          cell: plainCell,
-          lights: toPlainLights(bakeLight),
-          arrays,
-        }),
-      );
-      upload();
-    },
-
-    /**
-     * Worker re-bake: resolves { stats, elapsed } when THIS request's result
-     * was applied, or null when it was superseded by a newer request (or the
-     * worker is unavailable — in which case a sync rebake ran instead).
-     * While a job is in flight, only the latest pending request is kept —
-     * continuous edits stream at worker cadence with no backlog.
-     */
-    rebakeAsync(meshesOrRecords, bakeLight) {
-      const records = toRecords(meshesOrRecords);
-      const lights = toPlainLights(bakeLight);
-      if (!ensureWorker()) {
-        console.warn("[gi] SYNC rebake on main thread (worker unavailable) — this WILL hitch");
-        this.rebake(records, lights);
-        return Promise.resolve({ stats, elapsed: 0 });
-      }
-      return new Promise((resolve) => {
-        if (inFlight) {
-          // Latest wins; the superseded waiter resolves null.
-          pending?.resolve(null);
-          pending = { records, lights, resolve };
-        } else {
-          post(records, lights, resolve);
-        }
-      });
-    },
-
-    dispose() {
-      worker?.terminate();
-      worker = null;
-      sdfWorker?.terminate();
-      sdfWorker = null;
-    },
-
-    requestMeshSdf,
-    createSceneTrace: () => createVoxelSceneTrace(radianceBuffer, bounds, res, cell),
-    createSoftShadowTrace: (lift, meshSdf) => createSDFShadowTrace(distanceTexture, bounds, res, cell, lift, meshSdf),
-    createRadianceSampler: () => createTrilinearRadianceSampler(radianceBuffer, bounds, res, cell),
-  };
-}
+// (voxelizeOnce — the legacy CPU whole-field voxel baker, its streaming
+// bake worker and the mesh-SDF request worker — was deleted 2026-08-02 with
+// the rest of the SDF pipeline. The pure helpers around it stay: material
+// surface resolution, mesh serialization, the voxel DDA and the trilinear
+// radiance sampler are all consumed by the occupancy backend.)
 
 /**
  * TSL DDA over the baked grid: (origin, dir, tMaxWorld) → { rad, t }, t < 0
  * = miss. tMaxWorld is a JS number — it bounds the step count at build time.
- * (Exported for sdfScene.js — the voxel-free medium reuses the exact same
+ * (Exported for giField.js — the voxel-free medium reuses the exact same
  * cascade-ray DDA and trilinear radiance sampler over its own buffers.)
  *
  * `normalBuffer` (optional) makes hits DIRECTION-AWARE: a cell stores ONE
@@ -667,97 +380,11 @@ export function createTrilinearRadianceSampler(radianceBuffer, bounds, res, cell
  * receiver's own plane an "occluder" past t·cos ≈ 1.5 voxels → false
  * radial shadow rings across open floors/ceilings.)
  *
- * `meshSdf` (optional) = a MeshSdfAtlas: per-mesh high-res local distance
+ * `meshSdf` (optional) = a SlotRegistry: per-mesh high-res local distance
  * fields min()ed against the scene field each step. Promoted meshes are
  * excluded from the scene field's seeds, so near them the crisp local data
  * is the only (and correct) contributor — this is what turns a thin-winged
  * character's blocky voxel shadow into a clean one.
  */
-function createSDFShadowTrace(distanceTexture, bounds, res, cell, lift, meshSdf = null) {
-  const minCell = Math.min(cell.x, cell.y, cell.z);
-  const liftWorld = typeof lift === "number" ? lift : minCell * 2;
-  const slotSize = meshSdf ? meshSdf.texture.image.width : 0;
-  const atlasDepth = meshSdf ? meshSdf.texture.image.depth : 1;
-  const sizeX = bounds.max.x - bounds.min.x;
-  const sizeY = bounds.max.y - bounds.min.y;
-  const sizeZ = bounds.max.z - bounds.min.z;
-
-  return (origin, dir, maxT, k, cosRayNormal) => {
-    const penumbra = float(1).toVar();
-    const t = float(minCell * 2).toVar();
-
-    Loop({ start: 0, end: 56, name: "sdfShadow" }, () => {
-      If(t.greaterThanEqual(maxT), () => {
-        Break();
-      });
-      const p = origin.add(dir.mul(t));
-      const uvw = vec3(
-        p.x.sub(bounds.min.x).div(sizeX),
-        p.y.sub(bounds.min.y).div(sizeY),
-        p.z.sub(bounds.min.z).div(sizeZ),
-      ).toVar();
-      If(
-        uvw.x.lessThan(0)
-          .or(uvw.y.lessThan(0))
-          .or(uvw.z.lessThan(0))
-          .or(uvw.x.greaterThan(1))
-          .or(uvw.y.greaterThan(1))
-          .or(uvw.z.greaterThan(1)),
-        () => {
-          Break();
-        },
-      );
-      // Hardware trilinear; explicit level — implicit-derivative sampling
-      // inside loops is illegal WGSL. RAW distance for classification and
-      // the penumbra estimate (the field is exact near surfaces now); the
-      // 0.85 safety factor applies to STEPPING only.
-      const dRaw = texture3D(distanceTexture, uvw).level(0).r.mul(minCell).toVar();
-      // Per-mesh SDFs: min() the crisp local fields in. Clamped sampling +
-      // distance-to-slot-box keeps the value a valid lower bound everywhere,
-      // and slots that can't improve dRaw skip their texture fetch.
-      if (meshSdf) {
-        for (let s = 0; s < meshSdf.slots.length; s++) {
-          const slot = meshSdf.slots[s];
-          If(slot.active.greaterThan(0.5), () => {
-            const local = slot.worldToLocal.mul(vec4(p, 1)).xyz.toVar();
-            const cellF = local.sub(slot.boundsMin).mul(slot.cellsPerLocal).toVar();
-            const clamped = cellF.clamp(vec3(0.5), vec3(slot.dims).sub(0.5)).toVar();
-            const outsideWorld = cellF
-              .sub(clamped)
-              .div(slot.cellsPerLocal)
-              .length()
-              .mul(slot.localToWorldScale)
-              .toVar();
-            If(outsideWorld.lessThan(dRaw), () => {
-              const atlasUvw = vec3(
-                clamped.x.div(slotSize),
-                clamped.y.div(slotSize),
-                clamped.z.add(s * slotSize).div(atlasDepth),
-              );
-              const dLocal = texture3D(meshSdf.texture, atlasUvw).level(0).r.mul(slot.distScale);
-              dRaw.assign(dRaw.min(dLocal.add(outsideWorld)));
-            });
-          });
-        }
-      }
-      const planeHeight = float(liftWorld).add(t.mul(cosRayNormal));
-      const isRealOccluder = dRaw.lessThan(planeHeight.sub(minCell * 0.75));
-      // Contact cut kept small (0.25·voxel) and only as an early-exit — the
-      // graded part of the transition comes entirely from min(k·d/t) over the
-      // exact near field. The old 0.6·voxel binary cut painted a hard inner
-      // edge straight through every penumbra.
-      If(isRealOccluder.and(dRaw.lessThan(minCell * 0.25)), () => {
-        penumbra.assign(0);
-        Break();
-      });
-      If(isRealOccluder, () => {
-        penumbra.assign(penumbra.min(dRaw.mul(k).div(t)));
-      });
-      t.addAssign(dRaw.mul(0.85).clamp(minCell * 0.35, minCell * 8));
-    });
-
-    // Plain clamp — the estimator's own ramp is the penumbra. The previous
-    // extra smoothstep(0,1,·) steepened every transition a second time.
-    return penumbra.clamp(0, 1);
-  };
-}
+// (createSDFShadowTrace — the legacy per-mesh-atlas soft shadow — deleted
+// 2026-08-02 with the bake pipeline; giField.js owns the live shadow trace.)

@@ -20,8 +20,9 @@
 // than the child, that parent is behind a wall and its weight is zeroed.
 // Approximate on purpose (a parent's annular interval doesn't cover its own
 // near field), same spirit as the reference's "flatland assumption" note.
-import { Fn, If, Loop, float, floor, instanceIndex, instancedArray, max, mod, smoothstep, vec3, vec4 } from "three/tsl";
+import { Fn, If, Loop, float, floor, instanceIndex, instancedArray, max, mix, mod, smoothstep, vec3, vec4 } from "three/tsl";
 import { octahedralTexelIndex } from "./cascadeTrace.js";
+import { BURIED_PROBE_WEIGHT } from "./cascadeGather.js";
 
 /**
  * Builds merged-result buffers + merge computes for a cascade array made by
@@ -53,8 +54,14 @@ import { octahedralTexelIndex } from "./cascadeTrace.js";
 // not at module load — the harness sets it after the module is imported).
 const DEFAULT_MERGE_VIS_TOLERANCE = 1.75;
 
-export function createCascadeMerge(cascades, { sky = [0, 0, 0] } = {}) {
+export function createCascadeMerge(cascades, { sky = [0, 0, 0], occupancyVoxel = null, occupancy = null } = {}) {
   const MERGE_VIS_TOLERANCE = Number(globalThis.__giMergeVisTol) || DEFAULT_MERGE_VIS_TOLERANCE;
+  // See the use site: the visibility proxy's tolerance must track whatever the
+  // rays actually traced. `min` with the field cell keeps it a tightening.
+  const traceQuantization = occupancyVoxel
+    ? vec3(occupancyVoxel).x.max(vec3(occupancyVoxel).y).max(vec3(occupancyVoxel).z)
+        .min(float(cascades[0].world.cellMax))
+    : float(cascades[0].world.cellMax);
   // Accepts a literal triple (tests, defaults) or a node/uniform (GISystem).
   const skyNode = Array.isArray(sky) ? vec3(sky[0], sky[1], sky[2]) : vec3(sky);
   for (const cascade of cascades) {
@@ -67,10 +74,102 @@ export function createCascadeMerge(cascades, { sky = [0, 0, 0] } = {}) {
   // so the caller dispatches them only while a probe debug view is open.
   const averageComputes = [];
 
+  // ── THE PARENT'S RAY IS BLIND EXACTLY WHERE THE MERGE NEEDS IT MOST ───────
+  //
+  // Cascade i's rays start at `tMin = t0·(2^i − 1)` — the interval is an
+  // ANNULUS, and everything nearer than tMin is a hole the parent never traced.
+  // A parent whose ray toward the child found nothing stores w = -1, and the
+  // proxy below treats w < 0 as "no blocker", i.e. FULL WEIGHT. That is absence
+  // of evidence read as evidence of absence.
+  //
+  // Now put numbers on it (t0 IS the c0 probe spacing here — GISystem passes
+  // `t0: probeSpacing`). Merging level L from its parent L+1:
+  //     parent blind radius = t0·(2^(L+1) − 1)
+  //     parent spacing      = t0·2^(L+1)
+  // so the 8 corner parents sit at 0 … √3·2^(L+1)·t0 while the blind radius is
+  // one whole t0 short of the spacing. At L=1 that is a 3·t0 hole against a
+  // 4·t0 lattice: **every corner parent nearer than 3·t0 is invisible to the
+  // proxy — and those are precisely the ones carrying the highest trilinear
+  // weight.** The nearest, heaviest taps are the least verified ones, at every
+  // level ≥ 1. A parent under a floor merges straight up into a child standing
+  // in the room above, which is the reported "floor glows when the sun is
+  // underneath", arriving in coarse-cascade-sized blocks that pop as the light
+  // sweeps ("jumpy, squarish"), worst at `low` where the lattice is coarsest.
+  //
+  // Fix: ask the OCCUPANCY FIELD directly — march the segment child→parent and
+  // record whether anything is in the way. Two properties make this cheap:
+  //   · it depends only on the two POSITIONS, not on the ray direction, so it
+  //     is hoisted out of the per-ray loop and costs one trace per (probe,
+  //     corner) instead of one per (ray, corner) — dirCount× fewer, 16× at c0
+  //     and 1024× at c5;
+  //   · it depends only on GEOMETRY, so the caller re-runs these only on
+  //     composite frames (when the pyramid changed), not every frame.
+  // One shared buffer across all levels, because storage-buffer bindings are a
+  // scarce resource in this module (see the 8-binding wall in the notes).
+  const visOffsets = [];
+  let visTotal = 0;
+  for (let level = 0; level < cascades.length - 1; level++) {
+    visOffsets.push(visTotal);
+    visTotal += cascades[level].probeCount * 8;
+  }
+  const useParentVis = !!occupancy?.traceOccupancy && !globalThis.__giNoParentVis;
+  const parentVis = useParentVis ? instancedArray(Math.max(1, visTotal), "float") : null;
+  const visComputes = [];
+
   for (let level = cascades.length - 1; level >= 0; level--) {
     const cascade = cascades[level];
     const parent = cascades[level + 1] ?? null;
     const { dirCount, dirRes, probeCount, rays, merged } = cascade;
+    const visBase = parent && parentVis ? visOffsets[level] : 0;
+
+    // Parent lattice mapping, shared by the visibility prepass and the merge —
+    // they MUST agree corner-for-corner or the prepass answers about a
+    // different probe than the one being weighted.
+    const parentCellOf = (world) => ({
+      x: world.size.x.div(parent.grid.x),
+      y: world.size.y.div(parent.grid.y),
+      z: world.size.z.div(parent.grid.z),
+    });
+    const cornerAxes = (cf) => ({
+      bx: mod(cf, 2),
+      by: mod(floor(cf.div(2)), 2),
+      bz: floor(cf.div(4)),
+    });
+
+    if (parent && parentVis) {
+      const world = cascade.world;
+      const pCell = parentCellOf(world);
+      const visCompute = Fn(() => {
+        const probeIdxF = instanceIndex.div(8).toFloat().toVar();
+        const cf = instanceIndex.mod(8).toFloat().toVar();
+        const childPos = cascade.probePositionOf(probeIdxF).toVar();
+        const { bx, by, bz } = cornerAxes(cf);
+        const px = floor(childPos.x.sub(world.min.x).div(pCell.x).sub(0.5))
+          .add(bx).clamp(0, parent.grid.x - 1);
+        const py = floor(childPos.y.sub(world.min.y).div(pCell.y).sub(0.5))
+          .add(by).clamp(0, parent.grid.y - 1);
+        const pz = floor(childPos.z.sub(world.min.z).div(pCell.z).sub(0.5))
+          .add(bz).clamp(0, parent.grid.z - 1);
+        const parentProbeIdx = pz.mul(parent.grid.y).add(py).mul(parent.grid.x).add(px);
+        const parentPos = parent.probePositionOf(parentProbeIdx).toVar();
+        const rel = parentPos.sub(childPos).toVar();
+        const dist = rel.length().toVar();
+        // Same self-bias as the transport rays (createOccupancySceneTrace): a
+        // probe resting on a surface must not instantly hit the voxel it lives
+        // in. If the child IS buried, every corner comes back blocked and the
+        // epsilon cancels in the merge's normalization — no blackout.
+        const bias = float(cascade.world.minCell).mul(0.25).toVar();
+        const blocked = float(0).toVar();
+        If(dist.greaterThan(bias.mul(4)), () => {
+          const r = occupancy.traceOccupancy(
+            childPos, rel.div(dist), bias, dist.sub(bias), { steps: 48 },
+          );
+          blocked.assign(r.hit);
+        });
+        parentVis.element(instanceIndex.add(visBase).toInt()).assign(blocked);
+      })().compute(probeCount * 8);
+      visComputes.push(visCompute);
+    }
 
     const merge = Fn(() => {
       const own = rays.element(instanceIndex).toVar();
@@ -133,6 +232,49 @@ export function createCascadeMerge(cascades, { sky = [0, 0, 0] } = {}) {
             const wz = mod(bz.add(1), 2).mul(fracZ.oneMinus()).add(bz.mul(fracZ));
             const weight = wx.mul(wy).mul(wz).toVar();
 
+            // BURIED PARENTS CONTRIBUTE (almost) NOTHING — the merge's half of
+            // the cut the final gather already got. A parent probe inside
+            // geometry carries that geometry's own radiance, and the visibility
+            // proxy below CANNOT catch it: the proxy asks "did the parent's ray
+            // toward the child hit something first", and a probe buried in a
+            // 0.2 m slab has an unobstructed ray out of the slab in most
+            // directions, so it reports no blocker and keeps full weight.
+            //
+            // This path matters more than the gather's, not less. Coarse
+            // cascades are where the probe lattice is metres wide, so a parent
+            // buried in a floor is merged into children several metres away —
+            // it is the mechanism by which a sun UNDER the floor reaches probes
+            // standing in the room above, which the receiver-side plane cut
+            // never sees because by then the light is already IN the fine
+            // cascade's own radiance. Epsilon, not zero: `weightSum` below
+            // normalizes, so an all-buried neighbourhood behaves exactly as it
+            // did before (see BURIED_PROBE_WEIGHT).
+            //
+            // Combined with the inter-probe occlusion prepass by MIN, not by
+            // product: "the worst evidence wins" keeps the floor at exactly
+            // BURIED_PROBE_WEIGHT, which is what makes an all-rejected corner
+            // set cancel cleanly in the normalization. Two multiplied epsilons
+            // would not.
+            const openness = float(1).toVar();
+            if (occupancy?.occupiedAtWorld && !globalThis.__giNoBuriedProbeCut) {
+              openness.assign(
+                mix(float(1), float(BURIED_PROBE_WEIGHT), occupancy.occupiedAtWorld(parentPos, 0)),
+              );
+            }
+            if (parentVis) {
+              // Is there geometry BETWEEN this child and this parent — the
+              // question the parent's own blind annulus cannot answer.
+              // Precomputed per (probe, corner), refreshed only when geometry
+              // changes, so this is one buffer read.
+              const blockedTap = parentVis.element(
+                probeIdx.toInt().mul(8).add(corner).add(visBase).toInt(),
+              );
+              openness.assign(
+                openness.min(mix(float(1), float(BURIED_PROBE_WEIGHT), blockedTap)),
+              );
+            }
+            weight.mulAssign(openness);
+
             // Visibility proxy: the parent's own ray toward the child.
             //
             // SOFT, NOT BINARY — this is the fix for the "dotted grid / quilted
@@ -158,11 +300,17 @@ export function createCascadeMerge(cascades, { sky = [0, 0, 0] } = {}) {
             // This is the SAME correction the final gather already had
             // (cascadeGather.js: "the hard zero produced visible blotch/scallop
             // boundaries"); the merge was simply never given it.
-            // Tolerance tracks the FIELD's voxel quantization, as in the
-            // gather — that is the actual error in `parentRay.w`.
+            // Tolerance tracks the TRACE MEDIUM's quantization, as in the
+            // gather — that is the actual error in `parentRay.w`. With the
+            // occupancy backend that medium is the pyramid, so it is a level-0
+            // VOXEL (0.125–0.25 m) and not the 0.35 m composited field cell:
+            // sized off the coarser number, this proxy cannot reject a parent
+            // probe hidden behind anything thinner than ~0.6 m, which is most
+            // floors — so a sun UNDER the floor merged its light straight up
+            // into the room above.
             const rel = childPos.sub(parentPos).toVar();
             const dist = rel.length().toVar();
-            const visTol = float(cascade.world.cellMax).mul(MERGE_VIS_TOLERANCE);
+            const visTol = float(traceQuantization).mul(MERGE_VIS_TOLERANCE);
             If(dist.greaterThan(1e-4), () => {
               const towardChild = octahedralTexelIndex(rel.div(dist), parent.dirRes);
               const parentRay = parent.rays.element(
@@ -215,5 +363,7 @@ export function createCascadeMerge(cascades, { sky = [0, 0, 0] } = {}) {
     averageComputes.push(average);
   }
 
-  return { mergeComputes, averageComputes };
+  // visComputes depend ONLY on geometry + the probe lattice, so the caller
+  // dispatches them on composite frames (and the first frame), not per frame.
+  return { mergeComputes, averageComputes, visComputes };
 }

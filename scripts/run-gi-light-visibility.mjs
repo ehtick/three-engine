@@ -45,6 +45,14 @@ const result = await page.evaluate(async () => {
   const { enableEngineModule } = await import("/src/engine/modules.js");
   const { ensureEngine } = await import("/src/editor/engineInstance.js");
   const engine = await ensureEngine();
+  if (!engine.renderer) {
+    const canvas = document.createElement("canvas");
+    canvas.width = 640;
+    canvas.height = 360;
+    await engine.init(canvas);
+    engine.setSize(640, 360);
+  }
+  engine.start();
   await enableEngineModule(engine, "gi");
   globalThis.__engine = engine;
 
@@ -71,6 +79,9 @@ const result = await page.evaluate(async () => {
 
   const giEntity = engine.createEntity({ name: "GI" });
   giEntity.addComponent("global-illumination", { autoFit: true, quality: "medium", intensity: 1 });
+  // A clean editor boot can have no authored/viewport camera yet. Keep this
+  // GPU harness independent of dock layout and project restoration state.
+  if (!engine.camera) engine.camera = new THREE.PerspectiveCamera(60, 1, 0.1, 1000);
   engine.camera.position.set(0, 2.5, 7);
   engine.camera.lookAt(0, 2, 0);
 

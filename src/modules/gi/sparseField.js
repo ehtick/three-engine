@@ -9,7 +9,7 @@
 // SDF debug view shows the melted blobs that started this.
 //
 // WHY NOT JUST A FINER DENSE FIELD. The field is not only the distance
-// texture: `sdfScene.js` also carries six per-cell rgba32f storage buffers
+// texture: `giField.js` also carries six per-cell rgba32f storage buffers
 // (staging, base, radiance, surface, normal, indirect) at 16 B each, so a cell
 // costs **104 B**. 128³ is already 218 MB; 256³ would be 1.75 GB. Dense is
 // finished as a strategy. But only DISTANCE needs to be fine — radiance and
@@ -57,7 +57,7 @@ const MAX_TEXTURE_3D = 2048;
 
 /**
  * @param {{res: {x,y,z}, distanceTexture: THREE.Storage3DTexture, world: any, cell: THREE.Vector3}} volume
- * @param {import("./meshSdfAtlas.js").MeshSdfAtlas} atlas
+ * @param {import("./slotRegistry.js").SlotRegistry} atlas
  * @param {{brickAxis?: number, maxBricks?: number}} [options]
  */
 export function createSparseField(volume, atlas, options = {}) {

@@ -3,13 +3,13 @@
 //
 // WHAT IT REPLACES. Two places used to consider EVERY slot:
 //
-//   * `sdfScene.js`'s composite pass — one thread per field cell, each
+//   * `giField.js`'s composite pass — one thread per field cell, each
 //     looping the full slot capacity and AABB-testing its way out. That is
 //     `cells × capacity` AABB tests per composite (~1M × 32 today), and it
 //     is why raising the object budget was never just a matter of making the
 //     uniform arrays longer: at 512 slots the composite would have cost 16×
 //     what it does at 32.
-//   * `meshSdfAtlas.js`'s `refineDetail` — the per-STEP refinement inside
+//   * `slotRegistry.js`'s `refineDetail` — the per-STEP refinement inside
 //     shadow and mirror traces. Every trace step pays for it, so it can only
 //     afford a handful of slots, and those were picked GLOBALLY: one ranked
 //     list of ~12 for the whole scene. A wall-heavy room spent the entire
@@ -56,7 +56,7 @@ export const CELL_GROUPS = CELL_STRIDE / 4; // vec4s per cell
 const SCAN_ALL = -1;
 
 /**
- * @param {import("./meshSdfAtlas.js").MeshSdfAtlas} atlas
+ * @param {import("./slotRegistry.js").SlotRegistry} atlas
  */
 export function createInstanceGrid(atlas) {
   // World → grid parameterization, uniforms for the same reason the volume's

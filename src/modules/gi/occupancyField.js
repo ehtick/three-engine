@@ -69,6 +69,7 @@ import {
   Break, Fn, If, Loop, atomicLoad, atomicOr, atomicStore, bitAnd, bitOr, float, floor, instanceIndex,
   instancedArray, int, mod, select, shiftLeft, shiftRight, uint, uniform, uniformArray, vec3, vec4,
 } from "three/tsl";
+import { sharedFn } from "./giFn.js";
 
 /** Pyramid depth. Level L voxels are 2^L × the level-0 voxel. */
 export const OCC_LEVELS = 5;
@@ -136,7 +137,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
   // Origin and level-0 voxel size as uniforms, OWNED HERE rather than borrowed
   // from the SDF volume's `world` bundle. They describe the same box, but they
   // must be independently re-derivable from `bounds`: the volume's bundle is
-  // built by createSdfScene AFTER this field exists, so borrowing it would have
+  // built by createGiField AFTER this field exists, so borrowing it would have
   // left the pyramid pointing at a uniform nobody updates on a refit — the
   // whole field silently offset from the geometry it was rasterized from.
   //
@@ -157,6 +158,44 @@ export function createOccupancyField(bounds, res0, options = {}) {
   // ────────────────────────────────────────────────────────────── the bitsets
   const bits = instancedArray(new Uint32Array(totalWords), "uint");
   const atomicBits = instancedArray(new Uint32Array(level0.words), "uint").toAtomic();
+
+  // ─────────────────────────────────────────── COARSE-CELL SURFACE ATTRIBUTES
+  //
+  // WHY THIS EXISTS: to delete the mesh-SDF atlas. The composite does not use
+  // the per-mesh SDFs for their DISTANCE alone — it uses them to answer "which
+  // slot owns this cell" (so it can read that slot's mean albedo/emissive) and
+  // "which way does the surface face". Those two answers are the atlas's real
+  // job in the lighting path, and this pass produces both without a bake:
+  // the voxelizer already visits every (slot, triangle, voxel), so it knows the
+  // owning slot and the exact face normal at the moment it sets a bit.
+  //
+  // AT THE COARSE CELL RESOLUTION, not level-0. The composite is per coarse
+  // cell, and per-level-0 attributes would cost more than the atlas they
+  // replace (12.6M voxels × 8 B = 100 MB). A coarse grid is a few MB.
+  //
+  // LAST WRITE WINS, deliberately, with no atomics. Several triangles land in
+  // one coarse cell and any of them is a correct answer: albedo/emissive are
+  // per-slot MEAN colours (the atlas's own approximation, unchanged), and the
+  // normal only has to be representative — the cascades sample it to orient a
+  // cell's radiance, not to shade a silhouette. Racing stores cost nothing and
+  // an atomic would serialise the hot loop of the whole voxelizer.
+  //
+  // `cellAttr` packs: x = slot + 1 (0 = "no surface"), yzw = the face normal.
+  let coarseRes = { x: 1, y: 1, z: 1 };
+  let cellAttr = instancedArray(new Float32Array(4), "vec4");
+  const coarseResU = uniform(new THREE.Vector3(1, 1, 1));
+  /**
+   * Points the attribute grid at the composite's cell resolution. Called by
+   * createGiField, which owns that resolution — the pyramid's own level-0 res
+   * is chosen for tracing and is deliberately finer.
+   */
+  const setCoarseRes = (res) => {
+    coarseRes = { x: res.x, y: res.y, z: res.z };
+    coarseResU.value.set(res.x, res.y, res.z);
+    cellAttr = instancedArray(new Float32Array(res.x * res.y * res.z * 4), "vec4");
+    computesRevision = -1; // the voxelize kernel closes over this buffer
+    dirty = true;
+  };
 
   // ───────────────────────────────────────────────────────── geometry buffers
   // Triangle soup for every UNIQUE geometry, concatenated, in LOCAL space —
@@ -236,6 +275,29 @@ export function createOccupancyField(bounds, res0, options = {}) {
     const zi = v.z.max(0).min(rz.sub(1)).toUint().toVar();
     const word = off.toUint()
       .add(zi.mul(ry.toUint()).add(yi).mul(wpr.toUint()))
+      .add(shiftRight(xi, uint(5)));
+    const raw = bitAnd(shiftRight(bits.element(word), bitAnd(xi, uint(31))), uint(1)).toFloat();
+    return select(inside, raw, float(0));
+  };
+
+  /**
+   * `occupiedAt` specialised to level 0, with every dimension a JS constant.
+   *
+   * Worth its own copy because the distance oracle's near field calls it 27
+   * times per sample: the general version resolves five `levelSelect` chains
+   * (one per level dimension) against a runtime `level`, and paying that 27
+   * times for a level that is known at compile time is the difference between
+   * an affordable oracle and an unaffordable one.
+   */
+  const occupiedAtLevel0 = (v) => {
+    const l0 = levels[0];
+    const inside = v.x.greaterThanEqual(0).and(v.y.greaterThanEqual(0)).and(v.z.greaterThanEqual(0))
+      .and(v.x.lessThan(l0.res.x)).and(v.y.lessThan(l0.res.y)).and(v.z.lessThan(l0.res.z));
+    const xi = v.x.max(0).min(l0.res.x - 1).toUint().toVar();
+    const yi = v.y.max(0).min(l0.res.y - 1).toUint().toVar();
+    const zi = v.z.max(0).min(l0.res.z - 1).toUint().toVar();
+    const word = uint(l0.offset)
+      .add(zi.mul(uint(l0.res.y)).add(yi).mul(uint(l0.wordsPerRow)))
       .add(shiftRight(xi, uint(5)));
     const raw = bitAnd(shiftRight(bits.element(word), bitAnd(xi, uint(31))), uint(1)).toFloat();
     return select(inside, raw, float(0));
@@ -370,6 +432,22 @@ export function createOccupancyField(bounds, res0, options = {}) {
           const word = vz.toUint().mul(uint(level0.res.y)).add(vy.toUint()).mul(uint(level0.wordsPerRow))
             .add(shiftRight(xi, uint(5)));
           atomicOr(atomicBits.element(word), shiftLeft(uint(1), bitAnd(xi, uint(31))));
+          // Surface attribution for the composite (see cellAttr's comment).
+          // The level-0 voxel maps into the coarse grid by ratio, which needs
+          // no extra state: both grids span the same world box.
+          const cx = vx.add(0.5).mul(coarseResU.x).div(float(level0.res.x)).floor().clamp(0, coarseResU.x.sub(1));
+          const cy = vy.add(0.5).mul(coarseResU.y).div(float(level0.res.y)).floor().clamp(0, coarseResU.y.sub(1));
+          const cz = vz.add(0.5).mul(coarseResU.z).div(float(level0.res.z)).floor().clamp(0, coarseResU.z.sub(1));
+          const cell = cz.mul(coarseResU.y).add(cy).mul(coarseResU.x).add(cx).toUint();
+          // World face normal of THIS triangle. `p0..p2` are already in level-0
+          // voxel space, which is an anisotropic scaling of world space, so the
+          // cross product is rescaled by the voxel size before normalising —
+          // otherwise a non-cubic volume tilts every normal it stores.
+          const e1 = p1.sub(p0);
+          const e2 = p2.sub(p0);
+          const nVox = e1.cross(e2);
+          const nWorld = vec3(nVox.x, nVox.y, nVox.z).mul(vec3(voxel)).normalize().toVar();
+          cellAttr.element(cell).assign(vec4(slot.toFloat().add(1), nWorld));
         });
       });
     });
@@ -477,10 +555,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
    *          which is better than the SDF-gradient normals it replaces
    *   voxel  level-0 integer voxel coords of the hit (for radiance lookups)
    */
-  const traceOccupancy = (origin, dir, tMin, tMax, opts = {}) => {
-    const steps = Math.max(16, opts.steps ?? traceSteps);
-    const topLevel = Math.min(OCC_LEVELS - 1, Math.max(0, opts.topLevel ?? OCC_LEVELS - 1));
-
+  const traceBody = (origin, dir, tMin, tMax, steps, topLevel, penK = null) => {
     const inv = vec3(voxelInv).toVar();
     const q0 = vec3(origin).sub(vec3(gridOrigin)).mul(inv).toVar();
     const dq = vec3(dir).mul(inv).toVar();
@@ -489,7 +564,6 @@ export function createOccupancyField(bounds, res0, options = {}) {
     // instead of poisoning the per-axis min.
     const safe = (c) => select(c.abs().lessThan(1e-8), select(c.lessThan(0), float(-1e-8), float(1e-8)), c);
     const rd = vec3(float(1).div(safe(dq.x)), float(1).div(safe(dq.y)), float(1).div(safe(dq.z))).toVar();
-    const stepSign = vec3(dq.x.sign(), dq.y.sign(), dq.z.sign()).toVar();
     // Which face of a voxel the ray leaves through, as 0/1 per axis.
     const face = vec3(
       select(dq.x.greaterThanEqual(0), float(1), float(0)),
@@ -502,10 +576,31 @@ export function createOccupancyField(bounds, res0, options = {}) {
     const hit = float(0).toVar();
     const hitT = float(-1).toVar();
     const axis = float(-1).toVar(); // last crossed axis: 0/1/2, −1 = none yet
-    const hitVoxel = vec3(0).toVar();
+    // See the fail-closed clamp after the loop: set only where we KNOW why the
+    // march stopped (reached tMax, left the volume, or hit a level-0 voxel).
+    const resolved = float(0).toVar();
+    // ── ANALYTIC PENUMBRA (opt-in, `penK`) ──────────────────────────────────
+    // A binary hit/miss verdict makes light through an opening a coin flip
+    // for every grazing ray — under a moving light that is the flicker, and
+    // no temporal filter fixes a square wave. This accumulates the classic
+    // cone-occlusion factor min(k · clearance / t) DURING the march: inside
+    // an EMPTY level-L voxel, the ray's lateral clearance to the voxel's own
+    // faces is a conservative lower bound on the distance to any geometry
+    // (a triangle inside the voxel would have set its bit — the same proof
+    // freeRadiusAtWorld rests on). It is continuous in both the ray origin
+    // and direction, so a grazing ray fades smoothly toward 0 BEFORE the
+    // binary hit flips — the flip itself then costs nothing visually.
+    // Ignored near the origin (t < ~2 voxels): the march starts beside its
+    // own surface, and the surface's neighbouring voxels would clamp every
+    // ray at birth (the sphere-trace estimator's own-plane problem).
+    const pen = float(1).toVar();
+    const penGate = penK
+      ? vec3(voxel).x.max(vec3(voxel).y).max(vec3(voxel).z).mul(2).toVar()
+      : null;
 
     Loop({ start: 0, end: steps, name: "occDda" }, () => {
       If(t.greaterThanEqual(tMax), () => {
+        resolved.assign(1);
         Break();
       });
       const q = q0.add(dq.mul(t)).toVar();
@@ -517,6 +612,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
           .or(q.y.greaterThanEqual(level0.res.y))
           .or(q.z.greaterThanEqual(level0.res.z)),
         () => {
+          resolved.assign(1);
           Break();
         },
       );
@@ -528,7 +624,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
         If(level.lessThanEqual(int(0)), () => {
           hit.assign(1);
           hitT.assign(t);
-          hitVoxel.assign(q.floor());
+          resolved.assign(1);
           Break();
         });
         // Occupied parent → look closer. Deliberately no advance: the finer
@@ -542,6 +638,32 @@ export function createOccupancyField(bounds, res0, options = {}) {
         const ty = bound.y.sub(q.y).mul(rd.y).toVar();
         const tz = bound.z.sub(q.z).mul(rd.z).toVar();
         const tNext = tx.min(ty).min(tz).toVar();
+        if (penK) {
+          // Sampled at the SEGMENT MIDPOINT — never at `q`: the DDA lands
+          // each step epsilon past the face it just crossed, so any
+          // clearance measured AT `q` reads ~0 on the crossed axis for every
+          // step of every ray, which zeroed the whole field's direct light
+          // ("indirect gone completely black"). And the distance comes from
+          // the NEAR-FIELD ORACLE, not this voxel's own faces: a face
+          // between two EMPTY voxels bounds nothing, and counting it would
+          // falsely dim every ray that runs near a grid plane in open space.
+          // `freeRadiusAtWorld`'s 3×3×3 block is continuous by construction
+          // and measures distance to actual set bits.
+          // Only while the march is DESCENDED (level ≤ 1): those are the
+          // steps that graze geometry — open-space strides at high levels
+          // contribute ~1 anyway and would pay 27 fetches each for it.
+          If(level.lessThanEqual(int(1)), () => {
+            const tm = t.add(tNext.max(0).mul(0.5)).toVar();
+            const qm = q0.add(dq.mul(tm));
+            const pWorld = qm.mul(vec3(voxel)).add(vec3(gridOrigin));
+            const d = freeRadiusAtWorld(pWorld, 0, true, null);
+            const cand = float(penK).mul(d).div(tm.max(1e-4)).clamp(0, 1);
+            // Gated: not before ~2 voxels of travel (the surface's own
+            // neighbourhood must not clamp rays at birth) and not past tMax
+            // (geometry behind a point light must not darken it).
+            pen.assign(pen.min(select(tm.greaterThan(penGate).and(tm.lessThan(tMax)), cand, float(1))));
+          });
+        }
         axis.assign(select(tNext.equal(tx), float(0), select(tNext.equal(ty), float(1), float(2))));
         // A hair past the plane. Too small and the ray re-tests the voxel it
         // just left (the budget drains and the trace reads as a hole in the
@@ -555,9 +677,86 @@ export function createOccupancyField(bounds, res0, options = {}) {
       });
     });
 
-    // Face normal from the last crossed axis, pointing back along the ray.
-    // Before any crossing (a hit in the very first voxel) fall back to the
-    // ray's own direction — the caller is inside geometry there anyway.
+    // FAIL CLOSED ON STEP EXHAUSTION — BUT ONLY FROM DOWN IN THE FINE LEVELS.
+    //
+    // Falling out of the loop leaves `hit = 0 / t = -1`, which every caller
+    // reads as "nothing blocked this ray", so a transport ray that merely ran
+    // out of iterations becomes a hole in the geometry. Which rays run out is a
+    // function of how much geometry they graze, so it leaks worst exactly where
+    // the DDA descends most — a light raking along a floor or wall.
+    //
+    // BUT AN UNCONDITIONAL CLAMP IS WORSE THAN THE LEAK. A ray can also run out
+    // because the volume is simply longer than `budget × stride`, and those
+    // rays exhaust in OPEN SPACE where "blocked" is the wrong answer. Calling
+    // them hits walls the whole field off from its own light.
+    //
+    // The DDA's own `level` is the discriminator, for free: a ray crossing open
+    // space sits at the top level taking 2 m strides, while one threading
+    // geometry has descended. Exhausting at a fine level means the march was
+    // inside detail and probably blocked; exhausting at a coarse level means it
+    // simply ran out of road.
+    // `level <= 0`, not `<= 1`: this is a BINARY per-ray verdict, so every ray
+    // it catches is a potential flickering pixel under a moving light. Level 0
+    // is the narrowest honest reading of "the march was inside detail when it
+    // gave up" and it fires on far fewer rays than level 1 did.
+    // `__giNoFailClosed` disables BOTH this and the shadow trace's clamp, so a
+    // single flag answers "is the flicker something I introduced?" in one test.
+    if (!globalThis.__giNoFailClosed) {
+      const ranOutInDetail = resolved.lessThan(0.5).and(level.lessThanEqual(int(0)));
+      hit.assign(select(ranOutInDetail, float(1), hit));
+      hitT.assign(select(ranOutInDetail, t, hitT));
+    }
+
+    return vec4(hit, hitT, axis, pen);
+  };
+
+  // ONE WGSL FUNCTION PER SHADER PER (steps, topLevel) VARIANT. The DDA body
+  // is several kB of WGSL per expansion and the feedback kernel stamps it once
+  // per analytic light slot — see freeRadiusAtWorld's note for why these
+  // helpers are laid-out functions now. The struct return can't cross a
+  // layout boundary, so the fn returns vec4(hit, t, axis, 0) and this wrapper
+  // reconstructs what callers actually consume:
+  //   normal — the crossed voxel FACE normal, from `axis` + the ray's per-axis
+  //            sign (exactly the DDA's own formula, hoisted out of the body);
+  //            axis < 0 (a hit in the very first voxel) falls back to −dir —
+  //            the caller is inside geometry there anyway.
+  //   voxel  — level-0 integer coords of the hit: floor(q0 + dq·t), the same
+  //            expression the body used to store at the hit.
+  const traceVariants = new Map();
+  const traceOccupancy = (origin, dir, tMin, tMax, opts = {}) => {
+    const steps = Math.max(16, opts.steps ?? traceSteps);
+    const topLevel = Math.min(OCC_LEVELS - 1, Math.max(0, opts.topLevel ?? OCC_LEVELS - 1));
+    // `penumbraK` (a float node, usually uniform-derived): enables the
+    // analytic cone-occlusion accumulator (see traceBody's penumbra note) and
+    // returns it as `.pen` — 1 = clear, →0 as the ray grazes geometry.
+    const penumbra = opts.penumbraK != null;
+    const key = `${steps}|${topLevel}|${penumbra ? 1 : 0}`;
+    let fn = traceVariants.get(key);
+    if (fn === undefined) {
+      fn = sharedFn({
+        name: `giOccTrace${steps}_${topLevel}${penumbra ? "p" : ""}`,
+        type: "vec4",
+        inputs: [
+          { name: "origin", type: "vec3" },
+          { name: "dir", type: "vec3" },
+          { name: "tMin", type: "float" },
+          { name: "tMax", type: "float" },
+          ...(penumbra ? [{ name: "penK", type: "float" }] : []),
+        ],
+        body: penumbra
+          ? (o, d, t0, t1, k) => traceBody(o, d, t0, t1, steps, topLevel, k)
+          : (o, d, t0, t1) => traceBody(o, d, t0, t1, steps, topLevel),
+      });
+      traceVariants.set(key, fn);
+    }
+    const packed = penumbra
+      ? fn(vec3(origin), vec3(dir), float(tMin), float(tMax), float(opts.penumbraK)).toVar()
+      : fn(vec3(origin), vec3(dir), float(tMin), float(tMax)).toVar();
+    const hit = packed.x;
+    const hitT = packed.y;
+    const axis = packed.z;
+    const dq = vec3(dir).mul(vec3(voxelInv)).toVar();
+    const stepSign = vec3(dq.x.sign(), dq.y.sign(), dq.z.sign());
     const normal = select(
       axis.lessThan(0),
       vec3(dir).negate().normalize(),
@@ -567,8 +766,9 @@ export function createOccupancyField(bounds, res0, options = {}) {
         select(axis.equal(2), stepSign.z.negate(), float(0)),
       ),
     ).toVar();
-
-    return { hit, t: hitT, normal, voxel: hitVoxel };
+    const q0 = vec3(origin).sub(vec3(gridOrigin)).mul(vec3(voxelInv));
+    const voxelAtHit = q0.add(dq.mul(hitT)).floor();
+    return { hit, t: hitT, normal, voxel: voxelAtHit, pen: packed.w };
   };
 
   /**
@@ -576,9 +776,204 @@ export function createOccupancyField(bounds, res0, options = {}) {
    * the composite to force its coarse occupied/distance flags from the fine
    * truth — the coarse SDF has already lost the columns by the time it runs.
    */
+  // ONE WGSL FUNCTION PER SHADER PER LEVEL (sharedFn), not inline: the bit
+  // fetch expands to ~20 lines of index math, and callers stamp this several
+  // times per kernel. `level` is always a JS constant, so it is a variant key
+  // rather than a parameter.
+  const occupiedAtWorldVariants = new Map();
   const occupiedAtWorld = (p, level = 0) => {
-    const q = vec3(p).sub(vec3(gridOrigin)).mul(vec3(voxelInv)).toVar();
-    return occupiedAt(q.div(float(1 << level)).floor(), int(level));
+    let fn = occupiedAtWorldVariants.get(level);
+    if (fn === undefined) {
+      fn = sharedFn({
+        name: `giOccupiedL${level}`,
+        type: "float",
+        inputs: [{ name: "p", type: "vec3" }],
+        body: (pp) => {
+          const q = vec3(pp).sub(vec3(gridOrigin)).mul(vec3(voxelInv)).toVar();
+          return occupiedAt(q.div(float(1 << level)).floor(), int(level));
+        },
+      });
+      occupiedAtWorldVariants.set(level, fn);
+    }
+    return fn(p);
+  };
+
+  /**
+   * THE PYRAMID AS A DISTANCE ORACLE — a conservative lower bound on the
+   * distance from world point `p` to the nearest occupied geometry.
+   *
+   * This is what lets the mesh-SDF atlas be deleted. Soft shadows need a
+   * CONTINUOUS distance (the penumbra estimator is `min(k·d/t)`), and a bitset
+   * appears to have none — which is why the 40 MB per-mesh atlas survived every
+   * other round of SDF removal. But the pyramid already carries one for free:
+   * a level-L voxel is `2^L` voxels wide and an OR-downsampled parent is empty
+   * only if ALL its children are, so an empty level-L neighbourhood is a proof
+   * of emptiness over its whole extent.
+   *
+   * Concretely, per level: take the 2×2×2 block of level-L voxels nearest `p`
+   * (the 8 whose corners bracket it). If every one is empty, nothing occupied
+   * lies inside a box that extends at least half a level-L voxel from `p` in
+   * every direction, so the true distance is at least `p`'s distance to that
+   * box's boundary. The coarsest level that passes gives the largest bound.
+   *
+   * IT IS CONTINUOUS, which is the property that matters and the one a naive
+   * bitset lookup lacks: the returned value is a distance to a BOX FACE, so it
+   * varies smoothly as `p` moves, rather than snapping between powers of two.
+   * The bound itself is a step function of the level, but the value within a
+   * level is not, and the penumbra estimator only ever sees the value.
+   *
+   * PURE DATAFLOW, no `If` around the fetches, no early exit — the idiom that
+   * rendered the BVH mirror pass black (see `occupiedAt`'s note). Occupancy is
+   * monotone across levels (coarse-empty implies fine-empty), so `max` over all
+   * levels is exactly "the coarsest level that passed" anyway.
+   *
+   * @param {*} p world position
+   * @param {number} maxLevel highest pyramid level to consult. Each level costs
+   *   8 buffer reads, and the bound saturates at `2^maxLevel · voxel`, so a
+   *   caller that only needs to sharpen a coarse distance near surfaces (the
+   *   traces) passes a small number and lets its existing far-field distance
+   *   cover the rest. The composite, which HAS no other source, passes them all.
+   */
+  const freeRadiusBody = (p, top, nearField, cap) => {
+    const q0 = vec3(p).sub(vec3(gridOrigin)).mul(vec3(voxelInv)).toVar();
+    const voxelWorld = vec3(voxel).toVar();
+    const best = float(0).toVar();
+
+    // ── NEAR FIELD: a real distance, not a block flag ────────────────────────
+    //
+    // THE MISTAKE THIS REPLACES, because it is an easy one to make again: the
+    // first version used the same 2×2×2 all-empty test at level 0 as at every
+    // other level, so it returned **0** for any point within a voxel of
+    // geometry (a block counts as occupied if ANY of its 8 voxels is). Sphere
+    // tracing on that inflates every occluder by a voxel — it sealed the leak
+    // beautifully and made the whole scene visibly darker, which is exactly
+    // what was reported.
+    //
+    // The fix is to measure instead of test. For each occupied voxel in the
+    // 3×3×3 neighbourhood, the distance from `p` to that voxel's AABB is a
+    // conservative lower bound on the distance to whatever triangle set the
+    // bit (the triangle is somewhere inside the box, so it can only be
+    // farther). Geometry OUTSIDE the neighbourhood is at least as far as the
+    // block's boundary. So the smaller of those two is a valid bound, and —
+    // unlike a block flag — it varies smoothly from 0 at the surface.
+    // RUNTIME LOOPS, NOT JS UNROLLS, in both blocks below — and that is a
+    // DRIVER-TIME decision, not a GPU-time one. Unrolled, this body is a
+    // 27-fetch + 8×levels straight-line fetch storm; DXC's optimizer scales
+    // superlinearly on that shape, and the kernels carrying it took tens of
+    // seconds EACH to compile (the startup hang). As `Loop()`s the WGSL is a
+    // few hundred bytes per block, the fetch count is identical, and the
+    // extra loop arithmetic is noise next to the memory latency it interleaves.
+    if (nearField) {
+      const cell = q0.floor().toVar();
+      const nearest = float(1e9).toVar();
+      // NOTE `name:` is the WGSL iterator's NAME (LoopNode.getProperties), not
+      // a label — the callback destructures by it, and nested loops need
+      // distinct names so the inner counter can't shadow the outer.
+      Loop({ start: 0, end: 27, name: "nf" }, ({ nf }) => {
+        const dx = nf.mod(int(3)).sub(int(1)).toFloat();
+        const dy = nf.div(int(3)).mod(int(3)).sub(int(1)).toFloat();
+        const dz = nf.div(int(9)).sub(int(1)).toFloat();
+        const v = cell.add(vec3(dx, dy, dz)).toVar();
+        const occ = occupiedAtLevel0(v).toVar();
+        // Componentwise gap between `q0` and the voxel box [v, v+1]; zero
+        // on an axis where `q0` is already inside the slab.
+        const gap = v.sub(q0).max(q0.sub(v.add(1))).max(vec3(0)).mul(voxelWorld).toVar();
+        const d = gap.length();
+        nearest.assign(nearest.min(select(occ.greaterThan(0.5), d, float(1e9))));
+      });
+      // Distance from `q0` to the boundary of the 3×3×3 block, per axis:
+      // `q0 - cell` is in [0, 1), so this is at least one voxel.
+      const local = q0.sub(cell).toVar();
+      const inset = local.add(1).min(vec3(2).sub(local)).mul(voxelWorld).toVar();
+      best.assign(nearest.min(inset.x.min(inset.y).min(inset.z)));
+    }
+
+    // ── FAR FIELD: the level ladder ──────────────────────────────────────────
+    // Only useful above whatever the near field already proved, so it starts at
+    // level 1 — and it is skipped entirely when the near field found geometry
+    // (every coarser level containing that voxel reads occupied anyway).
+    // `maxLevel`/`nearField` still pick a VARIANT (they bound the loop), but
+    // within the variant the level is a runtime value resolved through the
+    // same levelSelect chains the DDA uses.
+    const topEmpty = float(0).toVar();
+    const startLevel = nearField ? 1 : 0;
+    if (top >= startLevel) {
+      Loop({ start: startLevel, end: top + 1, name: "lv" }, ({ lv: L }) => {
+        const scale = levelSelect(L, (l) => l.scale).toVar();
+        const q = q0.div(scale).toVar();
+        // Low corner of the 2×2×2 block whose centre `q` sits in.
+        const base = q.sub(0.5).floor().toVar();
+        const occupied = float(0).toVar();
+        Loop({ start: 0, end: 8, name: "cr" }, ({ cr }) => {
+          const cx = bitAnd(cr, int(1)).toFloat();
+          const cy = bitAnd(shiftRight(cr, int(1)), int(1)).toFloat();
+          const cz = bitAnd(shiftRight(cr, int(2)), int(1)).toFloat();
+          occupied.addAssign(occupiedAt(base.add(vec3(cx, cy, cz)), L));
+        });
+        // `q - base` lands in [0.5, 1.5), so this lands in [0.5, 1] level-L voxels.
+        const local = q.sub(base).toVar();
+        const inset = local.min(vec3(2).sub(local)).mul(voxelWorld).mul(scale).toVar();
+        const bound = inset.x.min(inset.y).min(inset.z);
+        best.assign(select(occupied.lessThan(0.5), best.max(bound), best));
+        If(L.equal(int(top)), () => {
+          topEmpty.assign(select(occupied.lessThan(0.5), float(1), float(0)));
+        });
+      });
+    }
+
+    // SATURATE LIKE A DISTANCE FIELD DOES, and this is not cosmetic.
+    //
+    // The oracle's ceiling is its own geometry: `voxel · 2^(levels-1)`, about
+    // 2 m. A baked SDF's ceiling is `capWorld = 16 · minCell`, about 5.6 m. Both
+    // mean "far away", but consumers do not read them that way — the shadow
+    // trace's `isRealOccluder` has an explicit `d < capCut` (0.85·capWorld) test
+    // whose whole job is to recognise a CAP-SATURATED sample as open space and
+    // refuse to treat it as an occluder. A distance that tops out at 2 m never
+    // reaches a 4.76 m cut, so that test silently inverted: every open-space
+    // sample past a couple of metres counted as a real occluder, `min(k·d/t)`
+    // drove the penumbra down everywhere, and the direct light injected into
+    // the field came out several times too dim. The symptom is a scene that
+    // looks correct in shape but needs GI intensity ~10 to read at all.
+    //
+    // An empty 2×2×2 at the COARSEST level is a proof of emptiness over ~4 m,
+    // which is what "cap" has always meant here. Reporting `capWorld` there is
+    // the same overestimate the SDF makes, bounded by the same `stepMax` clamp
+    // and backstopped by the same occupancy hard block.
+    if (cap != null) {
+      return select(topEmpty.greaterThan(0.5), float(cap), best);
+    }
+    return best;
+  };
+
+  // ONE WGSL FUNCTION PER SHADER PER VARIANT (sharedFn — see giFn.js). The
+  // body above expands to 27 near-field bit fetches plus 8 per ladder level,
+  // and the composite alone used to stamp it SEVEN times (once for the
+  // distance, six for the normal gradient) — the single biggest reason its
+  // kernel reached 782kB of WGSL, which the driver took ~27 SECONDS to
+  // compile while every other pipeline queued behind it (harness-measured
+  // 2026-08-02; that queue WAS the "materials preparation" startup hang).
+  // `maxLevel`/`nearField` change the UNROLLING, so they select a variant;
+  // only `p` and the saturation cap are runtime parameters.
+  const freeRadiusVariants = new Map();
+  const freeRadiusAtWorld = (p, maxLevel = OCC_LEVELS - 1, nearField = true, saturateValue = null) => {
+    const top = Math.max(0, Math.min(OCC_LEVELS - 1, maxLevel));
+    const sat = saturateValue != null;
+    const key = `${top}|${nearField ? 1 : 0}|${sat ? 1 : 0}`;
+    let fn = freeRadiusVariants.get(key);
+    if (fn === undefined) {
+      fn = sharedFn({
+        name: `giFreeRadius${top}${nearField ? "n" : ""}${sat ? "s" : ""}`,
+        type: "float",
+        inputs: sat
+          ? [{ name: "p", type: "vec3" }, { name: "cap", type: "float" }]
+          : [{ name: "p", type: "vec3" }],
+        body: sat
+          ? (pp, cap) => freeRadiusBody(pp, top, nearField, cap)
+          : (pp) => freeRadiusBody(pp, top, nearField, null),
+      });
+      freeRadiusVariants.set(key, fn);
+    }
+    return sat ? fn(p, saturateValue) : fn(p);
   };
 
   // ═══════════════════════════════════════════════════════════ CPU: geometry
@@ -706,6 +1101,14 @@ export function createOccupancyField(bounds, res0, options = {}) {
   return {
     levels,
     res: res0,
+    // Surface attribution for the composite — see `cellAttr`'s comment. The
+    // getter matters: `setCoarseRes` REPLACES the buffer, so a consumer that
+    // captured the property at module scope would hold the 1-element
+    // placeholder forever.
+    get cellAttr() {
+      return cellAttr;
+    },
+    setCoarseRes,
     bits,
     stats,
     voxel,
@@ -722,6 +1125,17 @@ export function createOccupancyField(bounds, res0, options = {}) {
 
     setGeometry,
     setSlotMatrix,
+    slotCapacity,
+    /**
+     * Bumped by `setGeometry` only — NOT by `setSlotMatrix`. Consumers use it
+     * to answer "has the pyramid's CONTENT changed", which a per-frame
+     * transform update has not. GISystem drives the composite off it, because
+     * with no mesh-SDF bakes arriving there is nothing else to signal that the
+     * field the composite reads has just been repopulated.
+     */
+    get geometryRevision() {
+      return geometryRevision;
+    },
 
     /** Re-derives world voxel size after an in-place volume refit. */
     refit() {
@@ -748,6 +1162,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
 
     traceOccupancy,
     occupiedAtWorld,
+    freeRadiusAtWorld,
     occupiedAt,
 
     /**

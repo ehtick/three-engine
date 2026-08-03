@@ -19,12 +19,23 @@
 // second transport implementation. Direct material shading here deliberately
 // bypasses any G-buffer/deferred-resolve layer (where the prior attempt's
 // never-root-caused stripe bug lived).
-import { Fn, If, Loop, Return, float, floor, instanceIndex, instancedArray, max, mix, mod, select, smoothstep, step, vec3, vec4 } from "three/tsl";
+import { Fn, If, Loop, Return, cos, float, floor, fract, instanceIndex, instancedArray, max, mix, mod, select, sin, smoothstep, sqrt, step, vec3, vec4 } from "three/tsl";
 import { octahedralTexelIndex, octahedralUV } from "./cascadeTrace.js";
 import { sharedFn } from "./giFn.js";
 import { emitterAngularRadius, emitterSlotFactor, emitterSurfaceT } from "./giLight.js";
 
 
+
+// RELATIVE weight a BURIED probe keeps (one inside geometry — see the gather's
+// buried-probe note). Deliberately a small epsilon and NOT zero: every consumer
+// of these weights divides by their sum, so when at least one open probe is in
+// the neighbourhood a buried one is ~50x down and effectively gone, and when
+// EVERY probe is buried the epsilon cancels in the normalization and the result
+// is exactly what it was before this cut existed. That is the whole
+// all-rejected safety net, for free — no second accumulator, no branch. A hard
+// zero would have blacked out receivers deep inside thick geometry at the low
+// preset, where probes are ~2 m apart.
+export const BURIED_PROBE_WEIGHT = 0.02;
 
 /**
  * Per-probe AMBIENT-CUBE irradiance, precomputed once per frame from the
@@ -34,12 +45,27 @@ import { emitterAngularRadius, emitterSlotFactor, emitterSurfaceT } from "./giLi
  * then pay 8 probes × (1 irradiance fetch + 1 visibility fetch) instead of
  * 8 × dirCount radiance reads — ~5× fewer reads per pixel AND per feedback
  * cell, with an identical integral (it's the same sum, hoisted).
+ *
+ * `w` carries the probe's OPENNESS (see BURIED_PROBE_WEIGHT), computed here
+ * rather than at the receiver on purpose: it is a property of the probe, so
+ * paying for it once per probe instead of 8× per shaded pixel makes the cut
+ * free at the point of use — the gather already fetches this vec4.
+ *
+ * `smoothing` (0..1, 1 = off) is a per-probe EMA toward this frame's integral.
+ * GEOMETRY IS STATIC AND ONLY LIGHT MOVES, so the fixed point is unchanged: a
+ * still scene converges to exactly the unsmoothed answer within a few frames
+ * and looks identical. What it removes is the frame-to-frame POPPING while a
+ * light sweeps, which is what the probe lattice quantizes into blocks. A zero
+ * `w` means "never written" (the buffer is zero-initialised and openness is
+ * never 0), so a fresh build snaps instead of fading up from black.
  */
-export function createProbeIrradiance(cascades) {
+export function createProbeIrradiance(cascades, options = {}) {
   const c0 = cascades[0];
   const { dirCount } = c0;
   const probeCount = c0.probeCount;
   const buffer = instancedArray(new Float32Array(probeCount * 6 * 4), "vec4");
+  const occupancy = options.occupancy ?? null;
+  const smoothing = options.smoothing ?? null;
 
   const compute = Fn(() => {
     const probe = instanceIndex.div(6).toVar();
@@ -62,7 +88,25 @@ export function createProbeIrradiance(cascades) {
       sumCos.addAssign(cosTheta);
     });
     const irradiance = sumL.div(max(sumCos, 1e-3)).mul(Math.PI);
-    buffer.element(instanceIndex).assign(vec4(irradiance, 1));
+
+    // OPENNESS — "is this probe inside geometry", one level-0 occupancy bit.
+    const openness = float(1).toVar();
+    if (occupancy?.occupiedAtWorld && !globalThis.__giNoBuriedProbeCut) {
+      const probePos = c0.probePositionOf(probe.toFloat());
+      openness.assign(
+        mix(float(1), float(BURIED_PROBE_WEIGHT), occupancy.occupiedAtWorld(probePos, 0)),
+      );
+    }
+
+    const value = vec3(irradiance).toVar();
+    if (smoothing) {
+      const prev = buffer.element(instanceIndex).toVar();
+      // prev.w == 0 ⇒ this slot has never been written (fresh build/refit):
+      // take the integral outright rather than lerping up from black.
+      const alpha = select(prev.w.lessThan(1e-3), float(1), float(smoothing).clamp(0.02, 1));
+      value.assign(mix(prev.xyz, irradiance, alpha));
+    }
+    buffer.element(instanceIndex).assign(vec4(value, openness));
   })().compute(probeCount * 6);
 
   return { buffer, compute };
@@ -72,7 +116,8 @@ export function createProbeIrradiance(cascades) {
  * @param {Array} cascades from createRadianceCascades (uses cascades[0])
  * @returns {(P, N) => vec3} TSL irradiance sampler
  */
-export function createIrradianceGather(cascades, probeIrradiance = null, fieldCellMax = null, name = "giGather") {
+export function createIrradianceGather(cascades, probeIrradiance = null, fieldCellMax = null, name = "giGather", occupancy = null) {
+  const occupancyVoxel = occupancy?.voxel ?? null;
   const c0 = cascades[0];
   const { world, grid, dirCount, dirRes } = c0;
   // All world-space quantities are UNIFORM-derived nodes (world bundle) —
@@ -90,8 +135,44 @@ export function createIrradianceGather(cascades, probeIrradiance = null, fieldCe
   // (their ray's hit at the partition read as "within tolerance") → rooms
   // lit through thin walls at fine field resolutions.
   const quantization = fieldCellMax != null ? float(fieldCellMax) : cellX.max(cellY).max(cellZ);
-  const visTolerance = quantization.mul(1.75);
   const minProbeCell = cellX.min(cellY).min(cellZ);
+  // The tolerance has to absorb the TRACE MEDIUM's quantization, and with the
+  // occupancy backend that medium is the pyramid, not the composited field: a
+  // c0 ray's recorded hit comes from a level-0 VOXEL (0.125–0.25 m), not from a
+  // 0.35 m field cell. Sizing it off the coarser number made the proxy unable
+  // to reject a probe hidden behind anything thinner than 0.61 m — which is
+  // most floors — so it never fired where it was needed most.
+  const traceQuantization = occupancyVoxel
+    ? vec3(occupancyVoxel).x.max(vec3(occupancyVoxel).y).max(vec3(occupancyVoxel).z).min(quantization)
+    : quantization;
+  const visTolerance = traceQuantization.mul(1.75);
+  // GEOMETRY SCALE vs PROBE SCALE — the distinction the leak turned on.
+  //
+  // "How far behind my surface's plane can a probe sit and still be on MY side
+  // of the geometry?" is a question about how THICK the geometry is. It is not
+  // a question about how coarse the probe lattice is. The plane cut below used
+  // `minProbeCell`, so on a 40 m volume at `low` (probeAxis 20 → 2 m probes) it
+  // kept full-strength probes up to **1.2 m below a floor** — and a probe below
+  // the floor is looking straight at a sun that is under the floor. That is the
+  // reported "floor glows when the light comes from below", and it arrives in
+  // probe-cell-sized blocks ("flickers in large squares") because the rejection
+  // state flips per probe octet. It scales with the probe lattice, which is
+  // exactly why it is dramatically worse at the low preset.
+  //
+  // The same lesson is already written above for `visTolerance` — that one was
+  // moved onto the field cell and these two were not.
+  //
+  // THE OCCUPANCY VOXEL IS THE RIGHT SCALE when there is one, finer still than
+  // the field cell: it is literally "the thinnest geometry the transport can
+  // resolve", which is exactly the question this cut asks. On the user's scene
+  // that is 0.125–0.25 m against a 0.35 m field cell and a 1.25 m probe
+  // spacing, so a probe under a floor is rejected roughly ten times sooner than
+  // the original probe-scaled cut managed. It matters because the OTHER defence
+  // — the distance-visibility proxy below — cannot see a floor thinner than its
+  // own tolerance, so for thin geometry this cut is the only one that fires.
+  //
+  // Never LOOSER than the old behaviour: `min` keeps this a tightening.
+  const geometryScale = traceQuantization.min(minProbeCell);
 
   const gatherFn = sharedFn({
     name,
@@ -103,10 +184,11 @@ export function createIrradianceGather(cascades, probeIrradiance = null, fieldCe
     body: (P, N) => {
       // Uniform-derived values hoisted into locals BEFORE the 8-corner loop —
       // uniform-buffer loads inside loops multiply driver pipeline-compile
-      // time (see sdfScene's shadow-trace note).
+      // time (see giField's shadow-trace note).
       const minVec = vec3(world.min).toVar();
       const probeCellVec = vec3(cellX, cellY, cellZ).toVar();
       const minProbeCellV = float(minProbeCell).toVar();
+      const geomScaleV = float(geometryScale).toVar();
       const visTolV = float(visTolerance).toVar();
       const fcX = P.x.sub(minVec.x).div(probeCellVec.x).sub(0.5);
       const fcY = P.y.sub(minVec.y).div(probeCellVec.y).sub(0.5);
@@ -140,6 +222,34 @@ export function createIrradianceGather(cascades, probeIrradiance = null, fieldCe
         const wz = bz.add(1).mod(2).mul(fracZ.oneMinus()).add(bz.mul(fracZ));
         const weight = wx.mul(wy).mul(wz).toVar();
 
+        // BURIED PROBES CONTRIBUTE NOTHING. A probe that lands INSIDE geometry
+        // — and with a 1.25 m lattice against a 0.2 m floor slab, plenty do —
+        // sees that geometry's own radiance in every direction at once, so it
+        // reads uniformly bright and it sits right in the trilinear
+        // neighbourhood of every surface receiver near it.
+        //
+        // Neither existing cut catches this, because both ask the SAME
+        // question and it is a different one: the distance proxy and the plane
+        // cut both test whether the probe is BEHIND geometry *relative to the
+        // receiver*. Neither asks whether the probe is inside geometry at all.
+        //
+        // It is worst with a light UNDER the floor, which is how it was found:
+        // the floor slab's underside cells are then the brightest thing in the
+        // scene, the probes buried in that slab inherit it, and the floor above
+        // — plus everything bouncing off it — glows. A level-0 occupancy bit at
+        // the probe's own position is an exact answer to "is this probe inside
+        // something". `__giNoBuriedProbeCut` is the A/B arm.
+        //
+        // WHERE IT IS EVALUATED: on the fast path, once per probe in
+        // createProbeIrradiance, carried in `w` of a vec4 this loop already
+        // fetches — so the cut costs one multiply per corner here instead of a
+        // pyramid walk per corner per shaded pixel. Only the legacy path (no
+        // precomputed irradiance) still asks the field directly.
+        if (!probeIrradiance && occupancy?.occupiedAtWorld && !globalThis.__giNoBuriedProbeCut) {
+          weight.mulAssign(
+            mix(float(1), float(BURIED_PROBE_WEIGHT), occupancy.occupiedAtWorld(probePos, 0)),
+          );
+        }
         // Distance-visibility proxy: the probe's own raw c0 ray toward P.
         const rel = P.sub(probePos).toVar();
         const dist = rel.length().toVar();
@@ -198,7 +308,12 @@ export function createIrradianceGather(cascades, probeIrradiance = null, fieldCe
           // valid probes keep full weight from both.
           const planeDist = rel.negate().dot(N);
           if (!globalThis.__giNoPlaneCut) {
-            weight.mulAssign(smoothstep(minProbeCellV.mul(-0.6), minProbeCellV.mul(-0.05), planeDist));
+            // Scaled by the GEOMETRY scale, not the probe lattice — see
+            // `geometryScale`. `__giPlaneCutProbeScale` restores the old
+            // probe-scaled cut (the A/B arm: if the floor stops glowing but
+            // tight interiors gain dark patches, this is the knob).
+            const cut = globalThis.__giPlaneCutProbeScale ? minProbeCellV : geomScaleV;
+            weight.mulAssign(smoothstep(cut.mul(-0.6), cut.mul(-0.05), planeDist));
           }
           if (!globalThis.__giNoAngleCut) {
             weight.mulAssign(smoothstep(-0.45, 0.0, rel.negate().div(dist).dot(N)));
@@ -211,16 +326,19 @@ export function createIrradianceGather(cascades, probeIrradiance = null, fieldCe
           // hoisted per probe per frame). Basis blend by N² is the standard
           // HL2 ambient-cube evaluation.
           const base6 = probeIdx.mul(6).toVar();
+          // Full vec4 for the x axis: .w is this probe's OPENNESS (the
+          // buried-probe cut, precomputed per probe — see createProbeIrradiance).
           const ex = probeIrradiance
-            .element(base6.add(select(N.x.greaterThanEqual(0), float(0), float(1))).toInt()).xyz;
+            .element(base6.add(select(N.x.greaterThanEqual(0), float(0), float(1))).toInt()).toVar();
           const ey = probeIrradiance
             .element(base6.add(2).add(select(N.y.greaterThanEqual(0), float(0), float(1))).toInt()).xyz;
           const ez = probeIrradiance
             .element(base6.add(4).add(select(N.z.greaterThanEqual(0), float(0), float(1))).toInt()).xyz;
           const nn = N.mul(N);
-          const probeE = ex.mul(nn.x).add(ey.mul(nn.y)).add(ez.mul(nn.z));
-          acc.addAssign(probeE.mul(weight));
-          cosAcc.addAssign(weight);
+          const probeE = ex.xyz.mul(nn.x).add(ey.mul(nn.y)).add(ez.mul(nn.z));
+          const probeW = weight.mul(ex.w).toVar();
+          acc.addAssign(probeE.mul(probeW));
+          cosAcc.addAssign(probeW);
         } else {
           // Cosine-weighted radiance sum + cosine total for this probe.
           const probeE = vec3(0).toVar();
@@ -364,7 +482,10 @@ export function createRadianceLookup(cascades, level = 2) {
 export function createBounceFeedback(cascades, volume, gainUniform, blendUniform, options = {}) {
   const world = volume.world;
   // Private to the feedback compute — safe to emit as a WGSL function.
-  const gather = createIrradianceGather(cascades, options.probeIrradiance ?? null, world.cellMax, "giFeedbackGather");
+  const gather = createIrradianceGather(
+    cascades, options.probeIrradiance ?? null, world.cellMax, "giFeedbackGather",
+    volume.occupancyField ?? null,
+  );
   const { res } = volume;
   const cellCount = res.x * res.y * res.z;
   const normalLift = world.minCell.mul(1.2);
@@ -377,7 +498,47 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
   // the baked field, injected here per frame instead.
   const emitterSlots = options.emitterSlots ?? null;
   const shadowTrace = options.shadowTrace ?? null;
+  // ANALYTIC-LIGHT shadows may use a different tracer than emitter shadows.
+  // GISystem passes the hierarchical occupancy DDA here: the sphere march over
+  // the trilinear field TUNNELS through thin slabs at coarse presets — the
+  // interpolated distance is not a true lower bound, so a step can leap a
+  // 0.2 m floor and land in the open air beneath it, which was the
+  // "sun below the floor leaks on every preset except ultra" report. The DDA
+  // walks every voxel it crosses, so it cannot tunnel at any preset. Its
+  // verdict is binary; the probe EMA (probeSmoothing) owns the smoothness.
+  // Emitters stay on `shadowTrace` — they need the lamp-body exclusion and
+  // their soft penumbrae, and they are not the leak path.
+  const lightShadow = options.lightShadow ?? shadowTrace;
   const gridDiagonal = options.gridDiagonal ?? 1e4;
+  // Low/medium cost halving, restructured (see GISystem's feedback-rate note):
+  // when set (a 0/1 uniform flipping per frame), each dispatch updates only the
+  // cells whose index parity matches — half the work per frame, every frame,
+  // instead of all of it every other frame. Skipped cells keep last frame's
+  // radiance (their buffers simply aren't rewritten), and adjacent cells are on
+  // opposite parities, so the trilinear/probe averaging downstream always sees
+  // a half-fresh neighbourhood — the field as a whole moves EVERY frame. The
+  // old whole-pass skip stair-stepped the entire field at half the light's
+  // rate, which read as flicker on exactly the presets meant to be cheap.
+  const checkerParity = options.checkerParity ?? null;
+  // RUNTIME uniform (0 or 1): 1 blends every field shadow to fully open.
+  // A `globalThis` ternary was tried here first and it silently tested
+  // NOTHING: this function body runs at shader BUILD time, so a flag set in
+  // the console after load never reached the compiled pipeline. GISystem owns
+  // the uniform and copies `__giNoFieldShadows` into it every tick.
+  const fieldShadowOff = options.fieldShadowOff ?? null;
+  // STOCHASTIC AREA-LIGHT VISIBILITY — the residual-flicker fix (2026-08-03).
+  // The DDA/trace verdict per cell is deterministic per frame, so a sweeping
+  // sun makes each cell's visibility a SQUARE WAVE (it flips at one exact
+  // angle) and the probe EMA can only stretch that flip into a slow, very
+  // visible fade — "smoothed but still there", the user's exact report.
+  // Jittering ONLY the shadow-ray direction over the light's angular disc
+  // (R2 sequence per cell per frame) makes the EMA integrate a true
+  // fractional disc visibility: a real penumbra whose value moves
+  // CONTINUOUSLY with the light, so there is no step left to smooth. The
+  // energy/cos/gate terms stay on the UNJITTERED direction — irradiance from
+  // a small disc is ~its center value, and stable `If` gates must not churn.
+  // `jitter.angle` is a LIVE uniform (radians; 0 disables — the A/B hatch).
+  const jitter = options.jitter ?? null;
 
   return Fn(() => {
     // Temporal ingest of streamed bakes: staging holds the latest CPU bake
@@ -403,6 +564,15 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
       }
       Return();
     });
+    // Checker skip AFTER the ingest and the empty-clear (both stay full-rate:
+    // ingest is cheap and geometry disappearance must clear the same frame),
+    // BEFORE everything expensive. A skipped cell's radiance/indirect buffers
+    // are left untouched — that is the whole mechanism.
+    if (checkerParity) {
+      If(instanceIndex.toFloat().mod(2).sub(checkerParity).abs().greaterThan(0.5), () => {
+        Return();
+      });
+    }
     const surface = volume.surfaceBuffer.element(instanceIndex).toVar();
     // Hoisted local (see the uniform-loads-in-loops notes elsewhere).
     const normalLiftV = float(normalLift).toVar();
@@ -424,6 +594,27 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
         iy.add(0.5).mul(world.cell.y).add(world.min.y),
         iz.add(0.5).mul(world.cell.z).add(world.min.z),
       );
+      // Per-cell R2 low-discrepancy channels, advanced per frame (see the
+      // `jitter` note above): under the probe EMA (~50 frames) these
+      // integrate to the disc average with far less residual variance than
+      // white noise would leave.
+      const jitterU1 = jitter
+        ? fract(fract(sin(idx.mul(12.9898)).mul(43758.5453)).add(jitter.frame.mul(0.7548776662))).toVar()
+        : null;
+      const jitterU2 = jitter
+        ? fract(fract(sin(idx.mul(78.233)).mul(24634.6345)).add(jitter.frame.mul(0.5698402909))).toVar()
+        : null;
+      // Perturbs `dir` inside a cone of half-angle `angle` (radians; small-
+      // angle disc offset in the tangent plane). Exactly `dir` at angle 0,
+      // which is what makes the angle uniform a live kill switch.
+      const jitterDir = (dir, angle) => {
+        const r = sqrt(jitterU1).mul(angle).toVar();
+        const phi = jitterU2.mul(Math.PI * 2).toVar();
+        const up = select(dir.y.abs().greaterThan(0.9), vec3(1, 0, 0), vec3(0, 1, 0));
+        const t1 = dir.cross(up).normalize().toVar();
+        const t2 = dir.cross(t1).toVar();
+        return dir.add(t1.mul(r.mul(cos(phi)))).add(t2.mul(r.mul(sin(phi)))).normalize();
+      };
 
       // Analytic direct light, evaluated fresh EVERY FRAME from uniform
       // slots (never baked): |ndotl| both-sides like the CPU bake, SDF-
@@ -470,7 +661,20 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
             If(ndotl.greaterThan(1e-4).and(lum.greaterThan(0.002)), () => {
               const origin = cellCenter.add(normal.mul(normalLiftV));
               const maxT = dist.sub(normalLiftV).max(0);
-              const shadow = shadowTrace(origin, dir, maxT, float(20), ndotl);
+              // A/B HATCH FOR THE FLICKER (`__giNoFieldShadows`, live uniform).
+              // This trace is the only light-direction-dependent term in the
+              // field that can jump discontinuously once `bounce` is 0:
+              // `min(k·d/t)` over an ADAPTIVE-step march of a VOXEL-QUANTIZED
+              // distance oracle re-picks its sample set when the ray direction
+              // moves, so a smooth light rotation gives a non-smooth penumbra.
+              // Its step budget is 18 at `low` and 32 at `high`, which is why
+              // the artifact would track the quality preset. Toggling on makes
+              // the field unshadowed — leaks are expected; the only question is
+              // whether the FLICKER stops.
+              // Trace direction only — energy/gates stay on the exact dir.
+              const traceDir = jitter ? jitterDir(dir, jitter.angle) : dir;
+              let shadow = lightShadow(origin, traceDir, maxT, float(20), ndotl);
+              if (fieldShadowOff) shadow = mix(shadow, float(1), fieldShadowOff);
               const direct = rawAlbedo
                 .mul(energy)
                 .mul(shadow)
@@ -525,13 +729,23 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
                 const exBox = kindF
                   ? { half: mix(vec3(-1), vec3(slot.half), kindF), bx: slot.bx, by: slot.by, bz: slot.bz }
                   : null;
+                // The emitter's own disc is the jitter cone (sinR = its
+                // angular radius from this cell) — the estimator still
+                // shapes each ray's penumbra; the jitter is what removes
+                // the sample-admission churn as the geometry/light moves.
+                const eAngle = jitter
+                  ? select(jitter.angle.greaterThan(1e-6), sinR.min(0.4), float(0))
+                  : null;
+                const traceDirE = jitter ? jitterDir(dir, eAngle) : dir;
                 shadow.assign(
                   shadowTrace(
-                    origin, dir, maxT, k, cosTheta.max(0),
+                    origin, traceDirE, maxT, k, cosTheta.max(0),
                     vec3(slot.center), exRadius, exBox,
                   ),
                 );
               });
+              // Same live hatch as the analytic block above.
+              if (fieldShadowOff) shadow.assign(mix(shadow, float(1), fieldShadowOff));
               const direct = rawAlbedo
                 .mul(vec3(slot.color))
                 .mul(factor.mul(1 / Math.PI))

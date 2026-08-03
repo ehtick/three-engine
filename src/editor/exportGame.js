@@ -305,7 +305,8 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
       // rebuild. Release builds omit it and perform no polling.
       ...(build.livePreview ? { previewRevision: Date.now() } : {}),
     };
-    scene.modules = [...useModulesStore.getState().enabled];
+    const enabledModules = [...useModulesStore.getState().enabled];
+    scene.modules = enabledModules;
     scene.input = engine.input.toJSON();
     // The collision-layer matrix is project-wide, and a build with the wrong
     // matrix has every bullet hitting the player who fired it.
@@ -481,11 +482,32 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
       ([, rel]) => !excludedRel.has(rel.replace(/\.(meta|basis)$/i, "")),
     );
 
+    // (GI used to package Library/gi-sdf prebuilt bakes here. The SDF bake
+    // pipeline was deleted 2026-08-02 — the occupancy backend voxelizes from
+    // triangles on the GPU at load, so a build ships nothing and bakes
+    // nothing.)
+    const derivedCopies = [];
+
     // --- The player template, themed for this game --------------------------
     onProgress({ phase: "write", message: "Writing build…" });
     const iconRel = build.icon ? await stageIcon({ build, root, invoke, names, warnings }) : "";
     try {
       const template = await invoke("read_player_template", { rel: "index.html" });
+      // The template is PREBUILT (dist-player/, from `npm run build:player`)
+      // — a dev checkout can silently ship day-old runtime code with the
+      // freshest scene, which reads as "the browser build behaves nothing
+      // like the editor" (it once ran a deleted GI pipeline for a day). Say
+      // how old the runtime is, loudly when it's old.
+      const stamp = template.match(/player-template-built ([0-9T:.Z-]+)/)?.[1];
+      if (stamp) {
+        const ageDays = (Date.now() - Date.parse(stamp)) / 86_400_000;
+        const note = `player runtime built ${stamp}`;
+        if (ageDays > 1) {
+          warnings.push(`${note} — ${ageDays.toFixed(1)} days old; run \`npm run build:player\` if engine code changed since`);
+        } else {
+          console.log(`[export] ${note}`);
+        }
+      }
       shippedFiles.push([
         "index.html",
         themePlayerHtml(template, { title, icon: iconRel, loading: build.loading ?? {} }),
@@ -508,7 +530,7 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
     await invoke("export_game", {
       outDir: contentDir,
       sceneJson: JSON.stringify(scene, null, 2),
-      assets: [...names.copyEntries(), ...shippedSidecars],
+      assets: [...names.copyEntries(), ...shippedSidecars, ...derivedCopies],
       files: shippedFiles,
     });
 
@@ -556,7 +578,8 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
       target: build.target,
       startScene: plan.startScene,
       sceneCount: plan.scenes.length,
-      assetCount: names.copyEntries().length + shippedSidecars.length + shippedFiles.length,
+      assetCount:
+        names.copyEntries().length + shippedSidecars.length + derivedCopies.length + shippedFiles.length,
       preloadCount: preload.length,
       excluded,
       savedBytes: compression.savedBytes,

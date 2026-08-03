@@ -2,7 +2,7 @@
 // GI pipeline. EVERY GI-relevant mesh gets one 64³ slot in a single tiled
 // Data3DTexture (fp16 normalized local distances), plus uniform-array state
 // that maps world-space sample points into its LOCAL grid and carries its
-// surface color/emissive. The GPU composite pass (sdfScene.js) min()s all
+// surface color/emissive. The GPU composite pass (giField.js) min()s all
 // slots into the global scene field; the shadow/mirror traces additionally
 // min() a few DETAIL slots per step for sub-scene-cell crispness.
 //
@@ -11,7 +11,12 @@
 // shader. Only a change in slot CAPACITY (mesh count tier) rebuilds.
 import * as THREE from "three/webgpu";
 import { If, float, int, texture3D, uniform, uniformArray, vec3, vec4 } from "three/tsl";
-import { MESH_SDF_CAP, MESH_SDF_MAX_AXIS } from "./bakeCore.js";
+// Grid constants inherited from the (deleted) bakeCore.js. The atlas no longer
+// stores baked grids — every slot is analytic under the occupancy backend —
+// but its slot bookkeeping, AABBs and per-slot surface uniforms are still the
+// spine of the composite, so the class and its addressing constants stay.
+export const MESH_SDF_CAP = 16;
+export const MESH_SDF_MAX_AXIS = 64;
 import { sharedFn } from "./giFn.js";
 
 const HALF_ONE = 0x3c00; // 1.0 as IEEE 754 half bits — atlas "far" fill
@@ -184,7 +189,7 @@ export function geometryContentHash(geometry) {
 export const slotKeyOf = (mesh, instanceId = null) =>
   instanceId == null ? mesh : `${mesh.uuid}#${instanceId}`;
 
-export class MeshSdfAtlas {
+export class SlotRegistry {
   /**
    * @param {number} tileCapacity physical 64³ tiles in the texture (VRAM).
    * @param {number} [instanceCapacity] world placements (uniform arrays).
@@ -196,10 +201,16 @@ export class MeshSdfAtlas {
       MAX_INSTANCE_SLOTS,
       Math.max(this.tileCapacity, instanceCapacity || this.tileCapacity),
     );
+    // TOKEN TEXTURE, not the old 40 MB+ tile atlas. No bake can ever arrive
+    // (the pipeline is deleted; setSlot with a real grid is never called), so
+    // the 3D texture exists only to satisfy residual legacy bindings — 4³ of
+    // "far" (1.0) reads as open space on any path that still samples it.
+    // Their scene allocated 7 layers = ~58 MB of VRAM for data nothing wrote.
     const layers = Math.ceil(this.tileCapacity / SLOTS_PER_LAYER);
-    this.width = SLOT * TILES_XY;
-    this.height = SLOT * TILES_XY;
-    this.depth = SLOT * layers;
+    void layers;
+    this.width = 4;
+    this.height = 4;
+    this.depth = 4;
     this.data = new Uint16Array(this.width * this.height * this.depth).fill(HALF_ONE);
     this.texture = new THREE.Data3DTexture(this.data, this.width, this.height, this.depth);
     this.texture.format = THREE.RedFormat;
@@ -251,7 +262,7 @@ export class MeshSdfAtlas {
     // Per-slot rank the grid uses to decide which candidates a crowded cell
     // keeps (higher wins) — published by GISystem alongside the detail slots.
     this.slotPriority = null;
-    // Bumped whenever any slot uniform changes — sdfScene watches it to
+    // Bumped whenever any slot uniform changes — giField watches it to
     // re-run the composite pass.
     this.revision = 1;
     // Dirty-bounds accumulation for the composite pass (see #markSlotDirty /
@@ -280,7 +291,7 @@ export class MeshSdfAtlas {
       corner: new THREE.Vector3(),
       m: new THREE.Matrix4(),
     };
-    // World-space reach the AABBs are expanded by (set by sdfScene to the
+    // World-space reach the AABBs are expanded by (set by giField to the
     // global field's cap distance so AABB-rejected cells legitimately read
     // "far" — anything nearer would leak through the composite).
     this.aabbExpand = 0.5;
