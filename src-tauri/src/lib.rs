@@ -318,7 +318,18 @@ fn player_template_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, Str
         Path::new("dist-player").to_path_buf(),
     ];
     if let Ok(resources) = app.path().resource_dir() {
-        candidates.insert(0, resources.join("dist-player"));
+        // In a packaged app the bundled resource is the only copy, so it wins.
+        // In `tauri dev` the resource dir ALSO exists (target/debug/, filled by
+        // tauri-build at the last cargo relink) — and letting it win there
+        // means `npm run build:player` updates ../dist-player while the editor
+        // keeps serving the stale relink-time copy until the app restarts.
+        // Dev must read the checkout it lives in.
+        let index = if cfg!(debug_assertions) {
+            candidates.len()
+        } else {
+            0
+        };
+        candidates.insert(index, resources.join("dist-player"));
     }
     let candidate = candidates
         .into_iter()
@@ -343,6 +354,158 @@ fn read_player_template(app: tauri::AppHandle, rel: String) -> Result<String, St
     }
     let dir = player_template_dir(&app)?;
     fs::read_to_string(dir.join(&rel)).map_err(|e| format!("read {rel}: {e}"))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlayerTemplateStatus {
+    template_dir: String,
+    /// Epoch ms of the template's index.html — vite rewrites it every build,
+    /// so its mtime IS the build time (no ISO-stamp parsing needed).
+    built_at_ms: u64,
+    /// Epoch ms of the newest file among the player bundle's inputs. 0 when
+    /// there is no dev checkout to compare against.
+    newest_source_ms: u64,
+    /// The file that made the template stale, for diagnostics.
+    newest_source_path: String,
+    /// True when a dev checkout is reachable, i.e. `rebuild_player_template`
+    /// can work. A packaged editor has no checkout and no npm.
+    can_rebuild: bool,
+    stale: bool,
+}
+
+fn epoch_ms(time: std::time::SystemTime) -> u64 {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The repo checkout this editor is running from, if any. `tauri dev` runs
+/// with cwd `src-tauri`; running the binary from the repo root is the other
+/// dev shape. A packaged app matches neither.
+fn player_checkout_root() -> Option<std::path::PathBuf> {
+    ["..", "."]
+        .iter()
+        .map(Path::new)
+        .find(|root| root.join("vite.player.config.js").exists() && root.join("src/player").exists())
+        .and_then(|root| fs::canonicalize(root).ok())
+}
+
+/// Compares the prebuilt player template (dist-player/) against the source
+/// that produces it. The template is what every export and browser preview
+/// actually RUNS — engine edits that never make it into the template read as
+/// "the served build behaves nothing like the editor" (it once ran a deleted
+/// GI pipeline for a day). The preview flow polls this and rebuilds instead
+/// of asking the user to remember `npm run build:player`.
+#[tauri::command]
+fn player_template_status(app: tauri::AppHandle) -> Result<PlayerTemplateStatus, String> {
+    let template = player_template_dir(&app)?;
+    let built_at_ms = fs::metadata(template.join("index.html"))
+        .and_then(|m| m.modified())
+        .map(epoch_ms)
+        .unwrap_or(0);
+    let Some(root) = player_checkout_root() else {
+        return Ok(PlayerTemplateStatus {
+            template_dir: template.to_string_lossy().into_owned(),
+            built_at_ms,
+            newest_source_ms: 0,
+            newest_source_path: String::new(),
+            can_rebuild: false,
+            stale: false,
+        });
+    };
+    let (newest_source_ms, newest_source_path) = newest_player_source(&root);
+    Ok(PlayerTemplateStatus {
+        template_dir: template.to_string_lossy().into_owned(),
+        built_at_ms,
+        newest_source_ms,
+        newest_source_path,
+        can_rebuild: true,
+        stale: newest_source_ms > built_at_ms,
+    })
+}
+
+/// Newest mtime (epoch ms) and path among the files the player bundle is
+/// built from — deliberately NOT src/editor: the player ships no editor code,
+/// and editor churn must not trigger a multi-second runtime rebuild.
+fn newest_player_source(root: &Path) -> (u64, String) {
+    let mut newest_ms = 0u64;
+    let mut newest_path = String::new();
+    let mut consider = |path: &Path| {
+        let Ok(modified) = fs::metadata(path).and_then(|m| m.modified()) else {
+            return;
+        };
+        let ms = epoch_ms(modified);
+        if ms > newest_ms {
+            newest_ms = ms;
+            newest_path = path.to_string_lossy().into_owned();
+        }
+    };
+    for file in ["player.html", "vite.player.config.js", "package.json"] {
+        consider(&root.join(file));
+    }
+    for dir in ["src/engine", "src/player", "src/modules", "src/shared"] {
+        for entry in walkdir::WalkDir::new(root.join(dir))
+            .into_iter()
+            .flatten()
+            .filter(|e| e.file_type().is_file())
+        {
+            consider(entry.path());
+        }
+    }
+    (newest_ms, newest_path)
+}
+
+/// Runs `npm run build:player` in the dev checkout so the served preview runs
+/// runtime code as fresh as the engine source. Long (a full vite build) by
+/// nature; callers surface progress text and await completion before
+/// exporting, because vite empties dist-player/ mid-build and a concurrent
+/// template copy would ship a half-written runtime.
+#[tauri::command]
+async fn rebuild_player_template() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let root = player_checkout_root().ok_or(
+            "No dev checkout found — a packaged editor cannot rebuild its player template",
+        )?;
+        let mut command = if cfg!(windows) {
+            // npm on Windows is npm.cmd; cmd /C resolves it like a shell would.
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/C", "npm", "run", "build:player"]);
+            c
+        } else {
+            let mut c = std::process::Command::new("npm");
+            c.args(["run", "build:player"]);
+            c
+        };
+        #[cfg(windows)]
+        {
+            // CREATE_NO_WINDOW: never flash a console over the editor.
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000);
+        }
+        let output = command
+            .current_dir(&root)
+            .output()
+            .map_err(|e| format!("run npm run build:player: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let detail = if stderr.trim().is_empty() { stdout } else { stderr };
+            let tail = detail
+                .lines()
+                .rev()
+                .take(12)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err(format!("npm run build:player failed:\n{tail}"));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Copies the prebuilt player template into `out_dir`, writes scene.json,
@@ -750,8 +913,44 @@ async fn fetch_sketchfab_text(url: String, token: Option<String>) -> Result<Stri
 
 #[cfg(test)]
 mod tests {
-    use super::{percent_decode, validate_browser_preview_url, zip_dir};
+    use super::{
+        newest_player_source, percent_decode, player_checkout_root, validate_browser_preview_url,
+        zip_dir,
+    };
     use std::fs;
+
+    #[test]
+    fn finds_the_dev_checkout_from_the_crate_dir() {
+        // cargo test runs with cwd src-tauri, the same shape `tauri dev` has.
+        // The freshness commands are dev-only conveniences, but if this stops
+        // resolving they silently degrade to "never stale" — which is exactly
+        // the day-long stale-template failure they exist to prevent.
+        let root = player_checkout_root().expect("checkout root");
+        assert!(root.join("src/player").is_dir());
+        assert!(root.join("src/engine").is_dir());
+        assert!(root.join("vite.player.config.js").is_file());
+    }
+
+    #[test]
+    fn the_staleness_walk_sees_engine_source() {
+        let root = player_checkout_root().expect("checkout root");
+        let (ms, path) = newest_player_source(&root);
+        // If the walk silently stops matching anything, staleness becomes
+        // "never" and stale runtimes ship again. A wrong-dir walk shows up
+        // here as ms == 0.
+        assert!(ms > 0, "no player source files found");
+        assert!(!path.is_empty());
+        // A freshly-touched engine file must win the walk.
+        let probe = root.join("src/engine/.staleness-probe.tmp");
+        fs::write(&probe, "x").unwrap();
+        let (after, winner) = newest_player_source(&root);
+        let _ = fs::remove_file(&probe);
+        assert!(after >= ms);
+        assert!(
+            winner.contains("staleness-probe") || after > ms,
+            "a just-written engine file did not advance the walk: {winner}"
+        );
+    }
 
     #[test]
     fn decodes_paths_the_frontend_encodes() {
@@ -835,6 +1034,8 @@ pub fn run() {
             import_files,
             export_game,
             read_player_template,
+            player_template_status,
+            rebuild_player_template,
             zip_dir,
             preview::serve_build,
             preview::serve_build_lan,

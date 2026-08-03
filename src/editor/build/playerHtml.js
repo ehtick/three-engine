@@ -103,3 +103,58 @@ export function themePlayerHtml(html, { title = "", icon = "", loading = {} } = 
 
   return out;
 }
+
+/** The build-relative marker both sides of the live-reload handshake agree
+ *  on: the exporter writes it LAST, so a changed revision means "a complete
+ *  new build is on disk". */
+export const PREVIEW_REVISION_PATH = "__preview_revision.json";
+
+/**
+ * Injects the live-reload client into a LIVE PREVIEW build's index.html.
+ *
+ * The rebuild loop keeps the served files fresh, but a browser (worst of all
+ * a phone across the room) runs whatever it loaded until someone remembers to
+ * refresh — which reads as "the hosted build is outdated". A reload poll used
+ * to live inside the player bundle itself, but that put the staleness fix
+ * inside the very artifact that goes stale: a build made from an old
+ * dist-player template shipped an old (or no) poll. index.html is regenerated
+ * by the exporter on EVERY build, so a client injected here — with the
+ * build's own revision baked in — works no matter how old the template is.
+ *
+ * Deliberately dumb: no SSE, no sockets, nothing added to the Rust server.
+ * One tiny same-origin fetch per second over the existing keep-alive
+ * connection, `no-store` so the poll itself can never be cached. Fetch
+ * failures are tolerated silently — the server dies with the editor, and when
+ * it comes back with a fresh build the next successful poll reloads into it.
+ * Hidden tabs don't poll; a phone reloads when it is next looked at.
+ *
+ * Published builds never see this: the exporter only injects it when
+ * `livePreview` is set, so a shipped game contains no polling loop.
+ */
+export function injectLivePreviewClient(html, revision) {
+  const initial = JSON.stringify(revision ?? null);
+  const client =
+    `<script id="live-preview-client">(() => {\n` +
+    `  const initial = ${initial};\n` +
+    `  let checking = false;\n` +
+    `  const tick = async () => {\n` +
+    `    if (checking || document.hidden) return;\n` +
+    `    checking = true;\n` +
+    `    try {\n` +
+    `      const res = await fetch("${PREVIEW_REVISION_PATH}", { cache: "no-store" });\n` +
+    `      if (res.ok) {\n` +
+    `        const { revision } = await res.json();\n` +
+    `        if (revision && revision !== initial) location.reload();\n` +
+    `      }\n` +
+    `    } catch {}\n` +
+    `    checking = false;\n` +
+    `  };\n` +
+    `  setInterval(tick, 1000);\n` +
+    `})();</script>`;
+  const out = String(html);
+  // Before </body> when the template has one; appended otherwise, which every
+  // browser still executes.
+  return /<\/body>/i.test(out)
+    ? out.replace(/<\/body>/i, `  ${client}\n  </body>`)
+    : `${out}\n${client}\n`;
+}

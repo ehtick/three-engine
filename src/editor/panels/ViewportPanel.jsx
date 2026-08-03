@@ -6,7 +6,13 @@ import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
 import { ensureEngine, engine, isEngineReady } from "../engineInstance.js";
 import { installEditorFramePacing } from "../editorFramePacing.js";
-import { openBrowserPreview, openBrowserPreviewUrl, stopBrowserPreview } from "../browserPreview.js";
+import {
+  openBrowserPreview,
+  openBrowserPreviewUrl,
+  stopBrowserPreview,
+  getActiveBrowserPreview,
+  shouldResumeBrowserPreview,
+} from "../browserPreview.js";
 import { DEBUG_LAYER, EDITOR_LAYER } from "../../engine/editorLayers.js";
 import { StatsOverlay } from "../overlays/StatsOverlay.jsx";
 import { useSelectionStore } from "../store/selectionStore.js";
@@ -3726,7 +3732,43 @@ export function ViewportPanel() {
   // subscribeLayers pub-sub.
   const [layers, setLayers] = useState(viewport.layers);
   const [layersOpen, setLayersOpen] = useState(false);
-  const [browserPreview, setBrowserPreview] = useState({ busy: false, message: "", urls: null });
+  // Seeded from the singleton: dockview remounts this panel on tab moves, and
+  // a remounted toolbar must show (and be able to stop) the server that is
+  // already running, not offer to start a second one.
+  const [browserPreview, setBrowserPreview] = useState(() => ({
+    busy: false,
+    message: "",
+    urls: getActiveBrowserPreview(),
+  }));
+  // The preview outlived the last editor session (the user closed the editor
+  // with it running): bring the hosting back up without being asked, so the
+  // localhost/Wi-Fi URL is simply always current. Silent — no browser tab is
+  // opened; the already-open page reloads itself via the injected client the
+  // moment the fresh build lands.
+  useEffect(() => {
+    if (!rootPath || !shouldResumeBrowserPreview(rootPath) || getActiveBrowserPreview()) return;
+    let cancelled = false;
+    (async () => {
+      setBrowserPreview({ busy: true, message: "Resuming browser preview…", urls: null });
+      try {
+        const result = await openBrowserPreview({
+          openBrowser: false,
+          onProgress: ({ message }) => {
+            if (!cancelled) setBrowserPreview((state) => ({ ...state, message }));
+          },
+        });
+        // `null` also means "another mount's resume beat us to it" — in that
+        // case the singleton has (or will shortly have) the running preview.
+        if (!cancelled) setBrowserPreview({ busy: false, message: "", urls: result ?? getActiveBrowserPreview() });
+      } catch (error) {
+        console.warn(`Browser preview auto-resume failed: ${error?.message ?? error}`);
+        if (!cancelled) setBrowserPreview({ busy: false, message: "", urls: null });
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [rootPath]);
   const browserPreviewQr = useMemo(() => {
     const url = browserPreview.urls?.lanUrl;
     if (!url) return "";

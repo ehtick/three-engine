@@ -1,7 +1,7 @@
 import { ensureEngine } from "./engineInstance.js";
 import { createAssetNames, basename } from "./build/assetNames.js";
 import { BUILD_DEFAULTS, resolveBuildScenes, normalizeRelPath, toProjectRelative } from "./build/buildSettings.js";
-import { themePlayerHtml } from "./build/playerHtml.js";
+import { themePlayerHtml, injectLivePreviewClient, PREVIEW_REVISION_PATH } from "./build/playerHtml.js";
 import { desktopScaffoldFiles } from "./build/desktopScaffold.js";
 
 /**
@@ -508,10 +508,16 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
           console.log(`[export] ${note}`);
         }
       }
-      shippedFiles.push([
-        "index.html",
-        themePlayerHtml(template, { title, icon: iconRel, loading: build.loading ?? {} }),
-      ]);
+      let themed = themePlayerHtml(template, { title, icon: iconRel, loading: build.loading ?? {} });
+      // Live previews reload themselves when the marker below changes. The
+      // client is injected into the FRESHLY GENERATED index.html rather than
+      // living in the player bundle, so it works even when the prebuilt
+      // template is out of date — the exact situation live preview is in the
+      // business of surviving.
+      if (scene.player.previewRevision) {
+        themed = injectLivePreviewClient(themed, scene.player.previewRevision);
+      }
+      shippedFiles.push(["index.html", themed]);
     } catch (err) {
       // A template we can't read is not fatal — the copied one still boots,
       // it just wears the engine's default title and colours.
@@ -522,7 +528,7 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
       // this marker last so the browser never refreshes into a half-published
       // live rebuild.
       shippedFiles.push([
-        "__preview_revision.json",
+        PREVIEW_REVISION_PATH,
         JSON.stringify({ revision: scene.player.previewRevision }),
       ]);
     }

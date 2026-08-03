@@ -121,7 +121,10 @@ const browser = await puppeteer.launch({
 const page = await browser.newPage();
 await page.setViewport({ width: 1400, height: 900, deviceScaleFactor: 1 });
 const pageErrors = [];
-page.on("pageerror", (e) => pageErrors.push(e.message));
+page.on("pageerror", (e) => {
+  if (process.env.STACKS) console.error(`---- PAGE ERROR ----\n${e.stack ?? e.message}`);
+  pageErrors.push(e.message);
+});
 
 /** Whatever the exporter asked the Rust side to write. */
 let manifest = null;

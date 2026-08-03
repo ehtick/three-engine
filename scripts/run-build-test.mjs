@@ -21,6 +21,8 @@ import {
   readableForeground,
   safeColor,
   hexToRgb,
+  injectLivePreviewClient,
+  PREVIEW_REVISION_PATH,
 } from "../src/editor/build/playerHtml.js";
 import {
   cargoName,
@@ -262,6 +264,38 @@ console.log("\nLoading screen");
   });
   check("a template without markers still gets its colours", noMarkers.includes("--loading-bg:#123456"));
   check("and does not throw", noMarkers.includes("<title>Game</title>"));
+}
+
+// --- Live-preview reload client ----------------------------------------------
+// The client is injected into the exporter-generated index.html precisely so
+// it works with a STALE player template — if these drift, "the hosted preview
+// is outdated" comes back as a silent failure.
+console.log("\nLive-preview reload client");
+{
+  const themed = themePlayerHtml(
+    "<html><head><title>x</title></head><body><div id=\"game\"></div></body></html>",
+    { title: "Game" },
+  );
+  const revision = 1754200000000;
+  const out = injectLivePreviewClient(themed, revision);
+  check("the client is injected before </body>", /live-preview-client[\s\S]*<\/body>/.test(out));
+  check("the game markup survives", out.includes('<div id="game">'));
+  check(
+    "it polls the marker the exporter writes last",
+    out.includes(`fetch("${PREVIEW_REVISION_PATH}"`),
+  );
+  eq("the marker path matches the exporter contract", PREVIEW_REVISION_PATH, "__preview_revision.json");
+  check("the build's own revision is baked in", out.includes(`const initial = ${revision};`));
+  check("polls bypass every cache", out.includes('cache: "no-store"'));
+  check("hidden tabs don't poll", out.includes("document.hidden"));
+  check("a changed revision reloads", out.includes("location.reload()"));
+
+  const headless = injectLivePreviewClient("<html><head></head></html>", 42);
+  check("a template without </body> still gets the client", headless.includes("live-preview-client"));
+
+  // The injection is exporter-conditional (livePreview only), but double-check
+  // the theming path alone never smuggles it into a release build.
+  check("theming alone does not inject the client", !themed.includes("live-preview-client"));
 }
 
 // --- Desktop scaffold --------------------------------------------------------

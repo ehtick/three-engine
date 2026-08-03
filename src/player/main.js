@@ -140,25 +140,13 @@ async function boot() {
   // about entities, so read these here (the fetch is served from cache when
   // it loads the same file a moment later).
   const config = await (await fetch(START_SCENE)).json();
-  if (config.player?.previewRevision) {
-    const initialRevision = config.player.previewRevision;
-    let checking = false;
-    setInterval(async () => {
-      if (checking || document.hidden) return;
-      checking = true;
-      try {
-        const next = await fetch(`__preview_revision.json?preview=${Date.now()}`, { cache: "no-store" });
-        if (!next.ok) return;
-        const revision = (await next.json()).revision;
-        if (revision && revision !== initialRevision) location.reload();
-      } catch {
-        // A rebuild replaces files non-atomically; a transient read failure is
-        // expected and the next poll will retry.
-      } finally {
-        checking = false;
-      }
-    }, 500);
-  }
+  // (Live-preview reload polling used to live here, keyed off
+  // `config.player.previewRevision`. It moved into the exporter —
+  // `injectLivePreviewClient` in src/editor/build/playerHtml.js — because a
+  // poll inside the prebuilt player bundle disappears exactly when the
+  // template is stale, which is the situation live preview exists to survive.
+  // index.html is regenerated every build, so the injected client always
+  // matches the build it ships with.)
   // Collision layers before modules: the physics module reads this blob when
   // it sets up, and every collider's layer resolves against it.
   if (config.physics) engine.config.physicsLayers = config.physics;

@@ -11,8 +11,9 @@
  * with no message. So this harness serves the build from `/games/demo/` and
  * refuses to pass if anything is fetched from the server root.
  *
- * Also covers: the themed loading screen, and the build quality preset actually
- * reaching the running engine as a ceiling.
+ * Also covers: the themed loading screen, the build quality preset actually
+ * reaching the running engine as a ceiling, and the live-preview reload
+ * client noticing a finished rebuild.
  *
  * Usage: npm run smoke:build   (needs `npm run build:player` first)
  */
@@ -22,7 +23,11 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import puppeteer from "puppeteer-core";
-import { themePlayerHtml } from "../src/editor/build/playerHtml.js";
+import {
+  themePlayerHtml,
+  injectLivePreviewClient,
+  PREVIEW_REVISION_PATH,
+} from "../src/editor/build/playerHtml.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const template = path.join(root, "dist-player");
@@ -237,6 +242,31 @@ try {
 
   const fatal = pageErrors.filter((m) => !/Preload failed|preload failed|icon\.png/i.test(m));
   check("no page errors", fatal.length === 0, fatal.slice(0, 2).join(" | "));
+
+  // --- Live-preview reload client -------------------------------------------
+  // The editor's rebuild loop rewrites the served files, but the open tab
+  // (worst of all a phone across the room) keeps running the old build until
+  // it reloads itself. Stage the same build the way a `livePreview` export
+  // ships it and prove the injected client notices a finished rebuild.
+  check("a release build carries no reload client", !rawHtml.includes("live-preview-client"));
+  const REV_A = 1111;
+  const REV_B = 2222;
+  await writeFile(path.join(out, "index.html"), injectLivePreviewClient(themed, REV_A));
+  await writeFile(path.join(out, PREVIEW_REVISION_PATH), JSON.stringify({ revision: REV_A }));
+  const previewHtml = await (await fetch(url)).text();
+  check("a live-preview build carries the client", previewHtml.includes("live-preview-client"));
+  await page.goto(url, { waitUntil: "load", timeout: 60000 });
+  const navigated = page
+    .waitForNavigation({ waitUntil: "load", timeout: 15000 })
+    .then(() => true)
+    .catch(() => false);
+  // What the live rebuild loop does last on every export.
+  await writeFile(path.join(out, PREVIEW_REVISION_PATH), JSON.stringify({ revision: REV_B }));
+  check("a finished rebuild reloads the open page", await navigated);
+  check(
+    "the reloaded page is the served build",
+    await page.evaluate(() => !!document.getElementById("live-preview-client")),
+  );
 } catch (error) {
   check("harness completed", false, error.message);
 } finally {
