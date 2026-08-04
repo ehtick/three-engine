@@ -1,3 +1,4 @@
+// @ts-check
 import * as THREE from "three/webgpu";
 import { Component } from "../../engine/components/Component.js";
 import { resolveAssetUrl, saveAssetBinary } from "../../engine/assetResolver.js";
@@ -167,8 +168,8 @@ export class NavMeshComponent extends Component {
     if (!this.overlay) return;
     this.entity.engine.scene.remove(this.overlay);
     this.overlay.traverse((child) => {
-      child.geometry?.dispose();
-      child.material?.dispose();
+      /** @type {any} */ (child).geometry?.dispose();
+      /** @type {any} */ (child).material?.dispose();
     });
     this.overlay = null;
   }

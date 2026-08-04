@@ -1,3 +1,4 @@
+// @ts-check
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Plus, Save, Play, Trash2, Zap, ChevronUp, ChevronDown, Layers, X } from "lucide-react";
 import {
@@ -6,7 +7,6 @@ import {
   Background,
   BackgroundVariant,
   Controls,
-  Handle,
   Position,
   addEdge,
   useNodesState,
@@ -18,6 +18,11 @@ import {
   EdgeLabelRenderer,
   useStore,
 } from "@xyflow/react";
+// `@xyflow/react`'s own types re-export a same-named `type Handle` alongside
+// the component, which reads as type-only under isolatedModules in a .js
+// file (TS2018042) — importing it off the namespace sidesteps the collision.
+import * as ReactFlowLib from "@xyflow/react";
+const Handle = ReactFlowLib.Handle;
 import "@xyflow/react/dist/style.css";
 import { useSelectionStore } from "../store/selectionStore.js";
 import { useSceneStore } from "../store/sceneStore.js";
@@ -189,6 +194,7 @@ const EDGE_HANDLE_STYLE = {
   transform: "none",
   pointerEvents: "all", // override RF's default `none` so the perimeter is grabbable
 };
+/** @type {[string, any, Record<string, string | number>][]} */
 const EDGE_HANDLE_SIDES = [
   ["l", Position.Left, { width: 12, height: "100%", top: 0, left: -6 }],
   ["r", Position.Right, { width: 12, height: "100%", top: 0, right: -6 }],
@@ -1237,7 +1243,7 @@ function collectClipNames(animPath) {
       for (const comp of bound) for (const n of comp.getClipNames()) names.add(n);
     } else {
       for (const entity of engine.entities.values()) {
-        for (const clip of entity.getComponent("model")?.clips ?? []) names.add(clip.name);
+        for (const clip of /** @type {any[]} */ (entity.getComponent("model")?.clips ?? [])) names.add(clip.name);
       }
     }
   } catch {
@@ -1836,6 +1842,7 @@ export function AnimatorPanel() {
 
   return (
     <ReactFlowProvider>
+      {/* @ts-expect-error `key` is React's reserved remount prop, not a real AnimatorEditor prop. */}
       <AnimatorEditor key={animPath} animPath={animPath} />
     </ReactFlowProvider>
   );

@@ -1,3 +1,4 @@
+// @ts-check
 import { engine } from "../engineInstance.js";
 import { serializeEntity, instantiateEntity } from "../../engine/index.js";
 
@@ -231,7 +232,9 @@ export class ReparentEntityCommand {
     const entity = engine.getEntity(this.entityId);
     const parent = parentId ? engine.getEntity(parentId) : null;
     // attach() keeps the world transform while re-computing the local one.
-    (parent ? parent.object3D : engine.scene).attach(entity.object3D);
+    // `scene` is deliberately typed narrow for scripts (see the note atop
+    // engine.d.ts) — editor internals still need the real THREE.Scene.
+    (parent ? parent.object3D : /** @type {import("three/webgpu").Scene} */ (engine.scene)).attach(entity.object3D);
     entity.setParent(parent); // appends to the sibling list
     if (index != null) {
       const siblings = parent ? parent.children : engine.rootEntities;

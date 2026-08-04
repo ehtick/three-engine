@@ -1,3 +1,4 @@
+// @ts-check
 import { prefabRegistry } from "./prefab/registry.js";
 import { instantiatePrefabNode } from "./prefab/expand.js";
 import { instanceNodeOf } from "./prefab/sync.js";

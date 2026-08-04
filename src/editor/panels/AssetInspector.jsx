@@ -1,3 +1,4 @@
+// @ts-check
 import { useEffect, useRef, useState } from "react";
 import { ExternalLink, Globe, Workflow, Package, Tag } from "lucide-react";
 import * as THREE from "three/webgpu";
@@ -398,9 +399,10 @@ function ModelPreview({ path }) {
         let meshes = 0;
         let tris = 0;
         gltf.scene.traverse((o) => {
-          if (o.isMesh) {
+          const mesh = /** @type {import("three/webgpu").Mesh} */ (o);
+          if (mesh.isMesh) {
             meshes++;
-            tris += (o.geometry.index?.count ?? o.geometry.attributes.position?.count ?? 0) / 3;
+            tris += (mesh.geometry.index?.count ?? mesh.geometry.attributes.position?.count ?? 0) / 3;
           }
         });
         const draco = (await readAssetMeta(`${path}.meta`))?.draco ?? null;
@@ -919,6 +921,7 @@ function MaterialSummary({ path }) {
     </div>
   );
 
+  /** @type {(key: string, label: string, opts?: { min?: number, max?: number, step?: number }) => any} */
   const number = (key, label, { min, max, step = 0.1 } = {}) => (
     <div className="field-row">
       <span className="field-label">{label}</span>

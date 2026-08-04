@@ -1,3 +1,4 @@
+// @ts-check
 import * as THREE from "three/webgpu";
 import { EDITOR_LAYER, DEBUG_LAYER } from "../../engine/editorLayers.js";
 
@@ -154,6 +155,7 @@ export class NavigationSystem {
   /**
    * Bakes a navmesh from the current scene.
    *
+   * @param {Partial<typeof BAKE_DEFAULTS> & { bounds?: unknown }} [settings]
    * @returns `{ success, error?, stats }`
    */
   bake(settings = {}) {

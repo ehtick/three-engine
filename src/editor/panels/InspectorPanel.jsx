@@ -1,3 +1,6 @@
+// NOTE: strict type-checking intentionally not enabled here — ~25 pre-existing
+// errors unrelated to events (JSX field prop-shape mismatches, missing
+// Entity/Engine properties like tags/viewOnly/virtualCameras), a follow-up.
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import {

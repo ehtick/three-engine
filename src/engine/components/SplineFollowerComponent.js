@@ -1,3 +1,4 @@
+// @ts-check
 import * as THREE from "three/webgpu";
 import { Component } from "./Component.js";
 import { resolveSpline } from "./SplineComponent.js";
@@ -193,7 +194,7 @@ export class SplineFollowerComponent extends Component {
         if (result.finished && !this._finished) {
           this._finished = true;
           if (this.props.wrap === "once") this.moving = false;
-          engine.emit?.("path-completed", { entityId: this.entity.id });
+          engine.emit("path-completed", { entityId: this.entity.id });
         } else if (!result.finished) {
           this._finished = false;
         }

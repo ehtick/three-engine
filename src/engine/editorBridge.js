@@ -162,6 +162,9 @@ function notifyMenus() {
  * Returns an unregister function. Passing an explicit `id` makes the
  * registration idempotent — re-registering the same id replaces it, which is
  * how hot reload avoids duplicates.
+ * @param {string} path
+ * @param {() => void} run
+ * @param {{ id?: string, order?: number }} [options]
  */
 export function registerMenuItem(path, run, { id, order = 0 } = {}) {
   if (typeof run !== "function") throw new Error("registerMenuItem needs a function");

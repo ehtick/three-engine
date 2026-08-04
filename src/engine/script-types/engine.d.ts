@@ -135,12 +135,28 @@ declare module "engine" {
     updateMatrixWorld(force?: boolean): void;
 
     /**
-     * Attach a component by registered type string or component class:
+     * Attach a component. Prefer constructing it directly — full IntelliSense
+     * on `props`, wrong keys/types are compile errors:
      *
      *     import { MeshComponent } from "engine";
+     *     this.entity.addComponent(new MeshComponent({ geometry: "sphere" }));
+     *
+     * The type string / bare class forms still work as shorthand (untyped
+     * `props`), restricted to registered types in {@link ComponentMap} — a
+     * typo'd or made-up type string is a compile error, not `unknown`:
+     *
      *     this.entity.addComponent(MeshComponent);
      *     this.entity.addComponent("mesh", { geometry: "sphere" });
+     *
+     * A brand-new (e.g. third-party module) component type not yet in
+     * {@link ComponentMap} is added to it via interface merging in that
+     * module's own `.d.ts`:
+     *
+     *     declare module "engine" {
+     *       interface ComponentMap { mytype: MyTypeComponent; }
+     *     }
      */
+    addComponent<T extends ComponentBase>(instance: T): T;
     addComponent<C extends { readonly type: keyof ComponentMap }>(
       ctor: C,
       props?: Record<string, unknown>,
@@ -149,7 +165,6 @@ declare module "engine" {
       type: K,
       props?: Record<string, unknown>,
     ): ComponentMap[K];
-    addComponent(type: string | { readonly type: string }, props?: Record<string, unknown>): unknown;
 
     /**
      * Component on this entity by registered type string or class token.
@@ -160,17 +175,16 @@ declare module "engine" {
      *     const mesh = this.entity.getComponent(MeshComponent);
      *     const cc = this.entity.getComponent(CharacterControllerComponent);
      *
-     * Known type strings (e.g. `"charactercontroller"`, `"model"`) still
-     * resolve via {@link ComponentMap}. Unknown strings fall back to `T`
-     * (defaulting to `unknown`) for custom/module component types.
+     * The string form is restricted to {@link ComponentMap} keys too — see
+     * `addComponent`'s doc for how an unregistered type gets added.
      */
     getComponent<C extends { readonly type: keyof ComponentMap }>(
       ctor: C,
     ): ComponentMap[C["type"]] | undefined;
     getComponent<K extends keyof ComponentMap>(type: K): ComponentMap[K] | undefined;
-    getComponent<T = unknown>(type: string | { readonly type: string }): T | undefined;
 
-    removeComponent(type: string | { readonly type: string }): void;
+    removeComponent<C extends { readonly type: keyof ComponentMap }>(ctor: C): void;
+    removeComponent<K extends keyof ComponentMap>(type: K): void;
 
     /**
      * A script on this entity by class name, file stem, or asset path — the
@@ -204,6 +218,48 @@ declare module "engine" {
      * reference you held across a despawn.
      */
     readonly pooled: boolean;
+
+    /** Free-form labels — `engine.findByTag`/`entity.findByTag`/`hasTag` query against these. */
+    tags: string[];
+    /** Adds one or more tags. Duplicates and blanks are ignored. Returns `this` for chaining. */
+    addTag(...tags: string[]): this;
+    /** Removes one or more tags. Returns `this` for chaining. */
+    removeTag(...tags: string[]): this;
+    /**
+     * PlayCanvas tag semantics: arguments are OR'd, arrays within an argument
+     * are AND'd — `hasTag("enemy", "boss")` is enemy OR boss,
+     * `hasTag(["enemy", "flying"])` is enemy AND flying.
+     */
+    hasTag(...query: (string | string[])[]): boolean;
+    /** Replaces the whole tag list. */
+    setTags(tags: string[]): void;
+    /** This entity and every descendant matching `hasTag`'s query semantics. */
+    findByTag(...query: (string | string[])[]): Entity[];
+
+    /**
+     * Entity-wide frustum-gating toggle. When true, every component on this
+     * entity opts into view-frustum culling unless it has `props.viewOnly`
+     * explicitly set `false` (an OR, not an override).
+     */
+    viewOnly: boolean;
+    setViewOnly(value: boolean): void;
+    /**
+     * Contributes to the scene while not in Play mode. Toggling `false` hides
+     * the entity's `object3D` subtree; the entity itself stays in the tree and
+     * scripts/inspectors can still read and write it. Inherits to descendants
+     * unless a child has its own override.
+     */
+    enabledInEditor: boolean;
+    setEnabledInEditor(value: boolean): void;
+    /** Same as `enabledInEditor`, but for Play mode. */
+    enabledInGame: boolean;
+    setEnabledInGame(value: boolean): void;
+
+    /**
+     * Set only on the root of a prefab instance — this, plus a matching
+     * registry entry, is what makes it one. `null` on ordinary entities.
+     */
+    prefab: { guid: string; path: string | null } | null;
 
     setParent(parent: Entity | null): void;
     traverse(fn: (entity: Entity) => void): void;
@@ -240,14 +296,12 @@ declare module "engine" {
      *     const cams = this.entity.findComponents(CameraComponent);
      *
      * Known component types (see {@link ComponentMap}) resolve to their
-     * typed interface automatically, same as `getComponent`. Pass an explicit
-     * `T` to override for custom/module component types not in the map.
+     * typed interface automatically, same as `getComponent`.
      */
     findComponents<C extends { readonly type: keyof ComponentMap }>(
       ctor: C,
     ): ComponentMap[C["type"]][];
     findComponents<K extends keyof ComponentMap>(type: K): ComponentMap[K][];
-    findComponents<T = unknown>(type: string | { readonly type: string }): T[];
   }
 
   /**
@@ -303,6 +357,10 @@ declare module "engine" {
     readonly currentState: string | null;
     /** Names of the clips available on the sibling `ModelComponent`. */
     getClipNames(): string[];
+    /** The loaded model root (sibling `ModelComponent.root`), for bone pickers and similar tooling. `null` before it loads. */
+    getModelRoot(): Object3D | null;
+    /** Editor hook: runs an in-memory graph — live preview of unsaved `.anim` graph edits, bypassing the saved asset. */
+    applyGraph(graph: unknown): void;
     setNumber(name: string, value: number): void;
     setBool(name: string, value: boolean): void;
     setTrigger(name: string): void;
@@ -1416,16 +1474,22 @@ declare module "engine" {
    * Lookup tokens for `getComponent` / `findComponents` / `addComponent` /
    * `removeComponent`. Each shares its name with the instance interface above
    * (value + type merge): import the const, pass it to `getComponent`, and
-   * IntelliSense on the result comes from the matching interface.
+   * IntelliSense on the result comes from the matching interface. The same
+   * merge also gives each const a real, typed constructor — `new
+   * MeshComponent(props)` type-checks `props` against that component's own
+   * schema and returns the matching instance interface:
    *
    *     import { MeshComponent } from "engine";
    *     const mesh = this.entity.getComponent(MeshComponent);
+   *     const other = this.entity.addComponent(new MeshComponent({ geometry: "sphere" }));
    *
    * Keep the `type` literals in sync with {@link ComponentMap} and the
    * re-exports in `scriptRuntime/runtime.js`.
    */
-  interface ComponentClass<T extends string> {
+  interface ComponentClass<T extends keyof ComponentMap> {
     readonly type: T;
+    /** Builds a detached instance — attach it with `entity.addComponent(...)`. */
+    new (props?: Partial<ComponentMap[T]["props"]>): ComponentMap[T];
   }
 
   export const MeshComponent: ComponentClass<"mesh">;
@@ -1685,7 +1749,53 @@ declare module "engine" {
 
   export type Unsub = () => void;
 
-  export interface InputManager {
+  /**
+   * Shared shape behind every typed pub/sub object in the engine (`Engine`,
+   * `InputManager`, and any future emitter) — one generic instead of
+   * hand-duplicating `on`/`off`/`emit` per class. `EventMap` is a
+   * `{ "event-name": [arg1, arg2, ...] }` map; the name AND the handler's
+   * arguments are checked against it.
+   *
+   * Beyond plain `on`/`off`/`emit`, listeners can return values and the
+   * emitter can be awaited:
+   *
+   *     const off = engine.once("entity-spawned", (entity) => { ... });
+   *     await engine.emitAsync("some-event", payload);
+   *     const results = engine.callAll<boolean>("some-event", payload);
+   *     const first = await engine.callFirstAsync<boolean>("some-event", payload);
+   *
+   * `callAll`/`callFirst` are synchronous and throw if a listener returns a
+   * `Promise` — use the `*Async` variant when any listener is `async`.
+   */
+  export interface TypedEmitter<EventMap> {
+    on<K extends keyof EventMap>(event: K, fn: (...args: EventMap[K]) => void): Unsub;
+    once<K extends keyof EventMap>(event: K, fn: (...args: EventMap[K]) => void): Unsub;
+    off<K extends keyof EventMap>(event: K, fn: (...args: EventMap[K]) => void): void;
+    emit<K extends keyof EventMap>(event: K, ...args: EventMap[K]): void;
+    emitAsync<K extends keyof EventMap>(event: K, ...args: EventMap[K]): Promise<void>;
+    callAll<K extends keyof EventMap, R = unknown>(event: K, ...args: EventMap[K]): R[];
+    callAllAsync<K extends keyof EventMap, R = unknown>(event: K, ...args: EventMap[K]): Promise<R[]>;
+    callFirst<K extends keyof EventMap, R = unknown>(event: K, ...args: EventMap[K]): R | undefined;
+    callFirstAsync<K extends keyof EventMap, R = unknown>(event: K, ...args: EventMap[K]): Promise<R | undefined>;
+    clear(event?: keyof EventMap): void;
+  }
+
+  /**
+   * Events fired on `input` (i.e. `engine.input`), not on `engine` itself —
+   * a separate `TypedEmitter` from `EngineEventMap` because they're a
+   * different object with different lifetime (per-InputManager, not
+   * per-Engine).
+   */
+  export interface InputEventMap {
+    "map-added": [map: ActionMap];
+    "map-removed": [name: string];
+    "stack-changed": [stack: string[]];
+    "scheme-changed": [scheme: string];
+    "action-pressed": [name: string, value: number];
+    "action-released": [name: string];
+  }
+
+  export interface InputManager extends TypedEmitter<InputEventMap> {
     /** Currently active device group ("KeyboardMouse" | "Gamepad" | "Touch"). */
     activeScheme: string;
     /** Device groups the manager is configured to track. */
@@ -1866,7 +1976,93 @@ declare module "engine" {
     halfHeight?: number;
   }
 
-  export interface Engine {
+  /**
+   * Every event `engine.on`/`off`/`emit` carries, keyed by name, with its
+   * exact argument list — same value+type-merge idea as {@link ComponentClass}.
+   * Handling or emitting one of these is fully checked (name AND payload);
+   * an unlisted name is a compile error, not a silent no-op. A module that
+   * defines its own engine-level event contributes to this map via
+   * interface merging instead of hand-editing this file — see the example
+   * on {@link Engine.on} — which is how the physics, navigation, and
+   * virtual-geometry modules register their own events.
+   *
+   * Note this only covers events fired on `engine` itself. `engine.input`
+   * is a separate {@link TypedEmitter} over {@link InputEventMap}.
+   */
+  export interface EngineEventMap {
+    "hierarchy-changed": [];
+    "renderer-rebuilt": [];
+    "modules-changed": [];
+    "settings-changed": [settings: SceneSettings];
+    "play-changed": [playing: boolean];
+    "time-scale-changed": [timeScale: number];
+    "paused-changed": [paused: boolean];
+    "input-changed": [input: InputManager];
+    "entity-spawned": [entity: Entity];
+    "entity-despawned": [entity: Entity];
+    "component-changed": [event: { entityId: string | undefined; componentType: string; key: string }];
+    "script-loaded": [script: Script];
+    "model-loaded": [entity: Entity];
+    "timeline-finished": [event: { entity: Entity; name: string }];
+    "timeline-event": [
+      event: {
+        timeline: unknown;
+        name: string;
+        track: string;
+        entity: Entity | undefined;
+        method: string | undefined;
+        arg: unknown;
+      },
+    ];
+    "ui-click": [entity: Entity];
+    "ui-focus-changed": [entity: Entity | null];
+    "ui-cancel": [entity: Entity | null];
+    "scene-load-start": [event: { path: string; mode: "single" | "additive" }];
+    "scene-load-progress": [
+      event: {
+        path: string;
+        mode: "single" | "additive";
+        phase: "fetch" | "modules" | "preload" | "unload" | "instantiate";
+        loaded: number;
+        total: number;
+        progress: number;
+      },
+    ];
+    "scene-loaded": [event: { path: string; mode: "single" | "additive"; name: string; rootIds: string[] }];
+    "scene-load-error": [event: { path: string; mode: "single" | "additive"; error: unknown }];
+    "scene-unloaded": [event: { path: string; name: string }];
+    "prefabs-changed": [guid: string];
+    /** Viewport gizmo drag: no payload for a multi-select pivot drag, `{ entityId }` for a single selection. */
+    "transform-changed": [event?: { entityId: string }];
+    /** Fires whenever the audio listener/master state changes (mute, volume, active listener entity). */
+    "audio-changed": [];
+    /** A `SplineFollowerComponent` reached the end of its path (non-looping). */
+    "path-completed": [event: { entityId: string }];
+    /** `entity.addTag`/`removeTag`/`setTags` changed the entity's tag list. */
+    "entity-tags-changed": [event: { entityId: string }];
+  }
+
+  /**
+   * `on`/`once`/`off`/`emit`/`emitAsync`/`callAll`/`callAllAsync`/
+   * `callFirst`/`callFirstAsync`/`clear` come from {@link TypedEmitter}. The
+   * name AND the handler's arguments are checked against
+   * {@link EngineEventMap} — a typo'd or made-up event name is a compile
+   * error, not a silent no-op:
+   *
+   *     this.engine.on("play-changed", (playing) => { ... }); // playing: boolean
+   *     this.engine.once("entity-spawned", (entity) => { ... }); // entity: Entity
+   *     await this.engine.emitAsync("play-changed", true);
+   *     const results = this.engine.callAll<boolean>("play-changed", true);
+   *
+   * A module that defines its own engine-level event contributes to the
+   * map via interface merging (same pattern as {@link ComponentMap}) — see
+   * `src/modules/physics-rapier/physics-rapier.d.ts` for a real example:
+   *
+   *     declare module "engine" {
+   *       interface EngineEventMap { "my-event": [payload: MyPayload]; }
+   *     }
+   */
+  export interface Engine extends TypedEmitter<EngineEventMap> {
     scene: { children: unknown[]; background: unknown; environment: unknown; fog: unknown };
     camera: Camera | null;
     renderer: unknown;
@@ -1948,9 +2144,19 @@ declare module "engine" {
      */
     onLateUpdate(fn: (dt: number) => void, order?: number): Unsub;
     onPostRender(fn: () => void): Unsub;
-    on(event: string, fn: (...args: any[]) => void): Unsub;
-    off(event: string, fn: (...args: any[]) => void): void;
-    emit(event: string, ...args: any[]): void;
+    /** Runs immediately before the frame's render call, after every `onUpdate`/`onLateUpdate`. */
+    onPreRender(fn: () => void): Unsub;
+    /** Name of the currently loaded scene, or `"Untitled"` before one's loaded. */
+    sceneName: string;
+    /** Caps editor/game frame rate; `0` (default) removes the cap. Never applies during Play. */
+    setFrameRateLimit(fps?: number): void;
+    /**
+     * Rolling perf counters an overlay reads at ~10 Hz. Debug/tuning data —
+     * built games can ignore it entirely.
+     */
+    readonly stats: { readonly readout: Record<string, number> };
+    /** Spatial-audio system. `listenerEntity` is the entity currently supplying the listener pose (`null` falls back to the active camera). */
+    readonly audio: { readonly listenerEntity: Entity | null };
     getEntity(id: string): Entity | null;
     createEntity(opts?: { id?: string; name?: string; parent?: Entity | null }): Entity;
     destroyEntity(entity: Entity): void;
@@ -2366,6 +2572,8 @@ declare module "engine" {
     step?: number;
     options?: Array<string | number>;
     label?: string;
+    /** `asset`-type fields only: extensions the picker offers, e.g. `["mat"]`. */
+    exts?: string[];
   }
 
   /**

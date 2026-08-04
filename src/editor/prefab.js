@@ -1,3 +1,4 @@
+// @ts-check
 import { engine } from "./engineInstance.js";
 import { commandBus } from "./commands/CommandBus.js";
 import { useSelectionStore } from "./store/selectionStore.js";

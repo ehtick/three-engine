@@ -1,3 +1,4 @@
+// @ts-check
 import * as THREE from "three/webgpu";
 import { positionView, vec4 } from "three/tsl";
 import { DepthPyramid, createBounds, isOccluded, projectSphere } from "./occlusionMath.js";

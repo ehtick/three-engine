@@ -1,3 +1,6 @@
+// NOTE: strict type-checking intentionally not enabled here — ~70 pre-existing
+// errors unrelated to events (Camera/Engine.scene typing too narrow, import.meta.env),
+// a follow-up outside the events-system pass.
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Play, Square, Pause, StepForward, Move, Rotate3d, Scale3d, Layers as LayersIcon, Crosshair, Monitor, Wifi, Smartphone, QrCode, Share2, Link2, Loader2, Sparkles } from "lucide-react";
 import qrcode from "qrcode-generator";

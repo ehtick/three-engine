@@ -1,3 +1,4 @@
+// @ts-check
 import { create } from "zustand";
 import { ensureEngine } from "../engineInstance.js";
 import { vmSingleton, oncePerVm } from "../singleton.js";

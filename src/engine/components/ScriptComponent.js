@@ -1,3 +1,4 @@
+// @ts-check
 import * as THREE from "three/webgpu";
 import { Component } from "./Component.js";
 import { loadScriptModule } from "../assetResolver.js";
@@ -102,8 +103,8 @@ export class ScriptComponent extends Component {
     return { ...rest, scripts: rest.scripts?.length ? rest.scripts : scripts };
   }
 
-  constructor(entity, props = {}) {
-    super(entity, ScriptComponent.normalizeProps(props));
+  constructor(props = {}) {
+    super(ScriptComponent.normalizeProps(props));
   }
 
   onAttach() {
@@ -113,6 +114,8 @@ export class ScriptComponent extends Component {
     // `off` latches a script that threw too often; `errors` counts throws.
     this.slots = [];
     this.reloadTimer = 0;
+    /** In-flight `#loadSlot` promises — see `whenReady`. @type {Set<Promise<unknown>> | undefined} */
+    this._pending = undefined;
     // Namespace for this component's `@menuItem` registrations, so detaching
     // retires exactly its own entries (see `#registerSlotMenuItems`).
     this._menuPrefix = `script:${++menuInstanceSeq}:`;

@@ -1,3 +1,4 @@
+// @ts-check
 import * as THREE from "three/webgpu";
 import { Component } from "../../engine/components/Component.js";
 import { DEBUG_LAYER } from "../../engine/editorLayers.js";
@@ -107,8 +108,8 @@ export class NavLinkComponent extends Component {
     if (!this.gizmo) return;
     this.entity.engine.scene.remove(this.gizmo);
     this.gizmo.traverse((child) => {
-      child.geometry?.dispose();
-      child.material?.dispose();
+      /** @type {any} */ (child).geometry?.dispose();
+      /** @type {any} */ (child).material?.dispose();
     });
     this.gizmo = null;
   }

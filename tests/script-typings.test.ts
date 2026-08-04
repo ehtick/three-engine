@@ -39,11 +39,16 @@ export default class Player extends Script {
   private velocity = new this.THREE.Vector3();
   private _offMove: (() => void) | null = null;
   private _offFire: (() => void) | null = null;
+  private _offPlayChanged: (() => void) | null = null;
+  private _offActionPressed: (() => void) | null = null;
 
   onStart() {
     // this.entity — typed as Entity with transform aliases.
     const ent = this.engine.createEntity({ name: "Bullet" });
-    const meshComp = ent.getComponent<{ mesh: unknown }>("mesh");
+    // String-token lookup resolves to the real MeshComponent shape via
+    // ComponentMap — no cast needed, and an unregistered/typo'd string is a
+    // compile error rather than silently returning `unknown`.
+    const meshComp = ent.getComponent("mesh");
     void meshComp;
 
     // Class-token lookup — preferred over strings; return type comes from ComponentMap.
@@ -88,15 +93,10 @@ export default class Player extends Script {
 
     // findComponents — recursive component lookup. Returns an array (empty
     // when nothing matches), so callers can use `arr.length` instead of
-    // null-checks. Generic over T for typed access by component shape —
-    // cast at the call site since component classes live in modules
-    // outside the engine ambient surface.
-    interface CameraComponentLike {
-      camera: import("engine").Object3D;
-      fov: number;
-    }
-    const cams = this.entity.findComponents<CameraComponentLike>("camera");
-    const camerasByType: CameraComponentLike[] = cams;
+    // null-checks. The string-token form resolves via ComponentMap same as
+    // the class-token form above — both give the real component shape.
+    const cams = this.entity.findComponents("camera");
+    const camerasByType: CameraComponent[] = cams;
     void camerasByType;
 
     // this.input — typed as InputManager | null
@@ -249,6 +249,45 @@ export default class Player extends Script {
     // different camera than `engine.camera` (e.g. a security-camera minimap).
     this.input?.setCameraProvider(() => this.engine.camera);
     void active;
+
+    // 8. engine.on/once/off/emit — checked against EngineEventMap (name AND
+    //    payload). A typo'd or made-up event name is a compile error.
+    const offPlay = this.engine.on("play-changed", (playing) => {
+      const p: boolean = playing;
+      void p;
+    });
+    this._offPlayChanged = offPlay;
+    this.engine.once("entity-spawned", (entity) => {
+      const e: import("engine").Entity = entity;
+      void e;
+    });
+    this.engine.emit("hierarchy-changed");
+    this.engine.emit("component-changed", {
+      entityId: this.entity.id,
+      componentType: "mesh",
+      key: "geometry",
+    });
+
+    // 8a. emitAsync/callAll/callFirst — the super-events-style additions.
+    //     callAll/callFirst are generic over the listener's return type.
+    void this.engine.emitAsync("play-changed", true);
+    const results: boolean[] = this.engine.callAll<"play-changed", boolean>("play-changed", true);
+    void results;
+    void this.engine
+      .callFirstAsync<"entity-spawned", boolean>("entity-spawned", this.entity)
+      .then((first) => {
+        const f: boolean | undefined = first;
+        void f;
+      });
+
+    // 8b. engine.input is a SEPARATE TypedEmitter over InputEventMap — these
+    //     event names never fire on `engine` itself (a real bug this fixed:
+    //     they used to live in EngineEventMap by mistake).
+    this._offActionPressed = this.input?.on("action-pressed", (name, value) => {
+      const n: string = name;
+      const v: number = value;
+      void n; void v;
+    }) ?? null;
   }
 
   onUpdate(dt: number) {
@@ -263,6 +302,10 @@ export default class Player extends Script {
     this._offFire?.();
     this._offMove = null;
     this._offFire = null;
+    this._offPlayChanged?.();
+    this._offActionPressed?.();
+    this._offPlayChanged = null;
+    this._offActionPressed = null;
   }
 
   onHotReload(oldInstance: Script) {

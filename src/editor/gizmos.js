@@ -1,3 +1,4 @@
+// @ts-check
 import * as THREE from "three/webgpu";
 import { EDITOR_LAYER } from "../engine/editorLayers.js";
 import { DebugBuffer } from "../engine/debugDraw.js";
@@ -67,7 +68,9 @@ function ensureMesh() {
   mesh.frustumCulled = false; // the buffer's bounds change every frame
   mesh.renderOrder = 999;
   mesh.layers.set(EDITOR_LAYER);
-  engine.scene.add(mesh);
+  // `scene` is deliberately typed narrow for scripts (see the note atop
+  // engine.d.ts) — editor internals still need the real THREE.Scene.
+  /** @type {THREE.Scene} */ (engine.scene).add(mesh);
   return mesh;
 }
 
@@ -103,7 +106,9 @@ function scriptHosts() {
   if (hosts) return hosts;
   hosts = [];
   for (const entity of engine.entities.values()) {
-    const script = entity.components.get("script");
+    // `.components` is the internal Map, deliberately absent from the public
+    // Entity surface (scripts use getComponent/findComponents instead).
+    const script = /** @type {any} */ (entity).components.get("script");
     if (script?.dispatchEditor) hosts.push([entity.id, script]);
   }
   return hosts;
@@ -124,7 +129,7 @@ function componentHosts() {
   if (gizmoComponents) return gizmoComponents;
   gizmoComponents = [];
   for (const entity of engine.entities.values()) {
-    for (const component of entity.components.values()) {
+    for (const component of /** @type {any} */ (entity).components.values()) {
       if (component.onDrawGizmos || component.onDrawGizmosSelected) {
         gizmoComponents.push([entity.id, component]);
       }
@@ -187,7 +192,7 @@ export function startGizmoPass() {
     hosts = null;
     gizmoComponents = null;
     if (mesh) {
-      engine.scene.remove(mesh);
+      /** @type {THREE.Scene} */ (engine.scene).remove(mesh);
       mesh.geometry.dispose();
       mesh.material.dispose();
       mesh = null;

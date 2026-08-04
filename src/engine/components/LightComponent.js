@@ -1,3 +1,6 @@
+// NOTE: strict type-checking intentionally not enabled here — ~35 pre-existing
+// errors unrelated to events (the light union type doesn't narrow to
+// SpotLight/DirectionalLight members), a follow-up.
 import * as THREE from "three/webgpu";
 import { PCFShadowFilter } from "three/tsl";
 import { CSMShadowNode } from "three/addons/csm/CSMShadowNode.js";
@@ -38,6 +41,14 @@ export class LightComponent extends Component {
     decay: 2, // physical light decay (point/spot). 0 = classic inverse-square-free.
     penumbra: 0, // spot: 0..1 softness at the cone edge
     castShadow: false,
+    // map = three.js shadow maps (+CSM); gi = the GI module traces shadows from
+    // the occupancy field (no shadow map allocated; falls back to maps
+    // automatically if the GI module is absent).
+    shadowMode: "map",
+    // Angular DIAMETER of the source in degrees — Blender's sun "Angle" parity
+    // (0.53° ≈ the real sun). Drives the GI penumbra softness for this light;
+    // also used by gi shadow mode.
+    sourceAngle: 0.53,
     // Shadow-map settings (per-light). Mirrors three.js Light.shadow.* fields.
     shadowMapType: "PCFSoftShadowMap",
     shadowMapWidth: 2048,
@@ -74,25 +85,32 @@ export class LightComponent extends Component {
     { key: "angle", label: "Angle°", type: "number", min: 1, max: 90, step: 1, showIf: (p) => p.kind === "spot" },
     { key: "penumbra", label: "Penumbra", type: "number", min: 0, max: 1, step: 0.05, showIf: (p) => p.kind === "spot" },
     { key: "castShadow", label: "Cast Shadow", type: "boolean", showIf: (p) => p.kind !== "ambient" },
+    { key: "shadowMode", label: "Shadow Source", type: "select", options: ["map", "gi"], showIf: (p) => p.kind !== "ambient" && p.castShadow, section: "Shadow" },
+    // Angular size shapes the GI penumbra in BOTH modes (gi traces it directly;
+    // map mode still feeds it to the GI bounce), so it is never gated on mode.
+    { key: "sourceAngle", label: "Source Angle°", type: "number", min: 0, max: 20, step: 0.05, showIf: (p) => p.kind === "directional", section: "Shadow" },
     // Shadow-map controls. Master switch (castShadow) gates the rest via showIf
-    // so the inspector stays tidy when shadows are off.
-    { key: "shadowMapType", label: "Map Type", type: "select", options: SHADOW_TYPE_OPTIONS, showIf: (p) => p.kind !== "ambient" && p.castShadow, section: "Shadow" },
-    { key: "shadowMapWidth", label: "Map Width", type: "number", min: 16, step: 256, showIf: (p) => (p.kind !== "ambient" && p.castShadow), section: "Shadow" },
-    { key: "shadowMapHeight", label: "Map Height", type: "number", min: 16, step: 256, showIf: (p) => (p.kind !== "ambient" && p.castShadow), section: "Shadow" },
-    { key: "shadowBias", label: "Bias", type: "number", step: 0.0005, showIf: (p) => (p.kind !== "ambient" && p.castShadow), section: "Shadow" },
-    { key: "shadowNormalBias", label: "Normal Bias", type: "number", step: 0.005, showIf: (p) => (p.kind !== "ambient" && p.castShadow), section: "Shadow" },
-    { key: "shadowRadius", label: "Radius / Light Size", type: "number", min: 0, step: 0.25, showIf: (p) => p.kind !== "ambient" && p.castShadow, section: "Shadow" },
-    { key: "shadowCamNear", label: "Cam Near", type: "number", min: 0, step: 0.1, showIf: (p) => ((p.kind === "directional" || p.kind === "spot" || p.kind === "point") && p.castShadow), section: "Shadow" },
-    { key: "shadowCamFar", label: "Cam Far", type: "number", min: 0, step: 1, showIf: (p) => ((p.kind === "directional" || p.kind === "spot" || p.kind === "point") && p.castShadow), section: "Shadow" },
-    { key: "shadowCamSize", label: "Frustum Size", type: "number", min: 0.1, step: 1, showIf: (p) => ((p.kind === "directional" || p.kind === "spot") && p.castShadow && !p.csm), section: "Shadow" },
-    { key: "shadowCamFov", label: "Face FOV°", type: "number", min: 1, max: 179, step: 1, showIf: (p) => (p.kind === "point" && p.castShadow), section: "Shadow" },
-    { key: "csm", label: "Cascaded Shadows", type: "boolean", showIf: (p) => p.kind === "directional" && p.castShadow, section: "Shadow" },
-    { key: "csmCascades", label: "Cascades", type: "number", min: 2, max: 4, step: 1, showIf: (p) => p.kind === "directional" && p.castShadow && p.csm, section: "CSM" },
-    { key: "csmMaxFar", label: "CSM Max Far", type: "number", min: 1, step: 10, showIf: (p) => p.kind === "directional" && p.castShadow && p.csm, section: "CSM" },
-    { key: "csmMode", label: "Split Mode", type: "select", options: ["practical", "uniform", "logarithmic"], showIf: (p) => p.kind === "directional" && p.castShadow && p.csm, section: "CSM" },
-    { key: "csmSplitLambda", label: "Near Detail", type: "number", min: 0, max: 1, step: 0.05, showIf: (p) => p.kind === "directional" && p.castShadow && p.csm && p.csmMode === "practical", section: "CSM" },
-    { key: "csmLightMargin", label: "Light Margin", type: "number", min: 0, step: 10, showIf: (p) => p.kind === "directional" && p.castShadow && p.csm, section: "CSM" },
-    { key: "csmFade", label: "Cascade Fade", type: "boolean", showIf: (p) => p.kind === "directional" && p.castShadow && p.csm, section: "CSM" },
+    // so the inspector stays tidy when shadows are off; `shadowMode === "gi"`
+    // hides them too because no shadow map is rendered in that mode.
+    { key: "shadowMapType", label: "Map Type", type: "select", options: SHADOW_TYPE_OPTIONS, showIf: (p) => p.kind !== "ambient" && p.castShadow && p.shadowMode !== "gi", section: "Shadow" },
+    { key: "shadowMapWidth", label: "Map Width", type: "number", min: 16, step: 256, showIf: (p) => (p.kind !== "ambient" && p.castShadow && p.shadowMode !== "gi"), section: "Shadow" },
+    { key: "shadowMapHeight", label: "Map Height", type: "number", min: 16, step: 256, showIf: (p) => (p.kind !== "ambient" && p.castShadow && p.shadowMode !== "gi"), section: "Shadow" },
+    { key: "shadowBias", label: "Bias", type: "number", step: 0.0005, showIf: (p) => (p.kind !== "ambient" && p.castShadow && p.shadowMode !== "gi"), section: "Shadow" },
+    { key: "shadowNormalBias", label: "Normal Bias", type: "number", step: 0.005, showIf: (p) => (p.kind !== "ambient" && p.castShadow && p.shadowMode !== "gi"), section: "Shadow" },
+    // Point lights keep this row in gi mode: the GI side reuses it as the
+    // point light's source RADIUS (its directional twin is `sourceAngle`).
+    { key: "shadowRadius", label: "Radius / Light Size", type: "number", min: 0, step: 0.25, showIf: (p) => p.kind !== "ambient" && p.castShadow && (p.shadowMode !== "gi" || p.kind === "point"), section: "Shadow" },
+    { key: "shadowCamNear", label: "Cam Near", type: "number", min: 0, step: 0.1, showIf: (p) => ((p.kind === "directional" || p.kind === "spot" || p.kind === "point") && p.castShadow && p.shadowMode !== "gi"), section: "Shadow" },
+    { key: "shadowCamFar", label: "Cam Far", type: "number", min: 0, step: 1, showIf: (p) => ((p.kind === "directional" || p.kind === "spot" || p.kind === "point") && p.castShadow && p.shadowMode !== "gi"), section: "Shadow" },
+    { key: "shadowCamSize", label: "Frustum Size", type: "number", min: 0.1, step: 1, showIf: (p) => ((p.kind === "directional" || p.kind === "spot") && p.castShadow && !p.csm && p.shadowMode !== "gi"), section: "Shadow" },
+    { key: "shadowCamFov", label: "Face FOV°", type: "number", min: 1, max: 179, step: 1, showIf: (p) => (p.kind === "point" && p.castShadow && p.shadowMode !== "gi"), section: "Shadow" },
+    { key: "csm", label: "Cascaded Shadows", type: "boolean", showIf: (p) => p.kind === "directional" && p.castShadow && p.shadowMode !== "gi", section: "Shadow" },
+    { key: "csmCascades", label: "Cascades", type: "number", min: 2, max: 4, step: 1, showIf: (p) => p.kind === "directional" && p.castShadow && p.csm && p.shadowMode !== "gi", section: "CSM" },
+    { key: "csmMaxFar", label: "CSM Max Far", type: "number", min: 1, step: 10, showIf: (p) => p.kind === "directional" && p.castShadow && p.csm && p.shadowMode !== "gi", section: "CSM" },
+    { key: "csmMode", label: "Split Mode", type: "select", options: ["practical", "uniform", "logarithmic"], showIf: (p) => p.kind === "directional" && p.castShadow && p.csm && p.shadowMode !== "gi", section: "CSM" },
+    { key: "csmSplitLambda", label: "Near Detail", type: "number", min: 0, max: 1, step: 0.05, showIf: (p) => p.kind === "directional" && p.castShadow && p.csm && p.csmMode === "practical" && p.shadowMode !== "gi", section: "CSM" },
+    { key: "csmLightMargin", label: "Light Margin", type: "number", min: 0, step: 10, showIf: (p) => p.kind === "directional" && p.castShadow && p.csm && p.shadowMode !== "gi", section: "CSM" },
+    { key: "csmFade", label: "Cascade Fade", type: "boolean", showIf: (p) => p.kind === "directional" && p.castShadow && p.csm && p.shadowMode !== "gi", section: "CSM" },
   ];
 
   onAttach() {
@@ -104,6 +122,11 @@ export class LightComponent extends Component {
     this.unsubPreRender = null;
     this.unsubRendererRebuilt?.();
     this.unsubRendererRebuilt = null;
+    // Clears shadow.shadowNode only when it is OUR CSM node. A gi-mode light
+    // carries the GI module's node in that slot; blanking it here would be
+    // meddling with another module's state, and it is unnecessary — the light
+    // itself is discarded below, and the GI module drops nodes for lights that
+    // stop appearing in its per-frame scan.
     this.#disposeCSM();
     if (!this.light) return;
     if (this.light.target) this.entity.object3D.remove(this.light.target);
@@ -131,6 +154,7 @@ export class LightComponent extends Component {
       key === "kind" ||
       key === "shadowMapType" ||
       key === "castShadow" ||
+      key === "shadowMode" ||
       key === "csm" ||
       key === "csmCascades" ||
       key === "csmFade" ||
@@ -155,7 +179,17 @@ export class LightComponent extends Component {
       this.#updateCSMFrustums(true);
       return;
     }
+    // Angular size is pure GI-contract data: nothing in three.js reads it, so
+    // republishing userData IS the whole update. Rebuilding the light for a
+    // slider drag would drop the compiled shadow branch for no reason.
+    if (key === "sourceAngle") {
+      this.#publishGIShadowContract();
+      return;
+    }
     this.#applyShadowProp(key);
+    // shadowRadius doubles as the point light's GI source radius — republish
+    // after every non-rebuild change so the contract can never go stale.
+    this.#publishGIShadowContract();
     this.#syncCSMCascadeShadows();
     if (key === "color") this.light.color.set(this.props.color);
     else if (key === "intensity") this.light.intensity = this.props.intensity;
@@ -213,6 +247,9 @@ export class LightComponent extends Component {
         break;
     }
     this.light.userData.entityId = this.entity.id;
+    // Publish before anything reads it: #isCSMUsable and the gi-mode shadow
+    // config below both branch on userData.giShadowMode.
+    this.#publishGIShadowContract();
     if (this.light.shadow) {
       this.#configureShadow({
         shadowMapWidth,
@@ -223,6 +260,20 @@ export class LightComponent extends Component {
         shadowCamFov,
       });
       this.light.castShadow = !!castShadow;
+      if (this.light.userData.giShadowMode === "gi") {
+        // castShadow STAYS true — three only compiles a shadow branch for
+        // shadow-casting lights, and the GI module's custom shadowNode
+        // replaces the map lookup inside that branch (same mechanism as CSM
+        // above, which also renders no map of its own).
+        //
+        // Belt-and-braces on the map itself: with a custom shadowNode three
+        // skips map rendering entirely, but if the GI module is absent (or
+        // hasn't claimed this light yet) three falls back to REAL shadow maps.
+        // A frozen 16×16 map keeps that fallback nearly free and visibly soft
+        // rather than silently shadowless.
+        this.light.shadow.autoUpdate = false;
+        this.light.shadow.mapSize.set(16, 16);
+      }
     }
     this.entity.object3D.add(this.light);
     // Directional/spot lights aim at their target; keep the target with the entity
@@ -254,6 +305,29 @@ export class LightComponent extends Component {
     }
     // Honour the enabled flag at attach time.
     this.light.visible = this._enabled;
+  }
+
+  /**
+   * The ENTIRE contract with the GI module: three fields on `light.userData`.
+   * The GI module scans the scene's lights, honours `giShadowMode === "gi"` by
+   * assigning its own `shadow.shadowNode`, and shapes the penumbra from the
+   * angle/radius. This component never imports the GI module and the GI module
+   * never imports this one — if it isn't installed the flags are simply inert
+   * and three renders the (tiny) fallback map.
+   */
+  #publishGIShadowContract() {
+    if (!this.light) return;
+    const d = this.light.userData;
+    d.giShadowMode =
+      this.props.shadowMode === "gi" && this.props.castShadow && this.props.kind !== "ambient"
+        ? "gi"
+        : "map";
+    // Authored as an angular DIAMETER in degrees (Blender's sun "Angle");
+    // consumers want the half-angle in radians, so halve it here once.
+    d.giSourceAngle = THREE.MathUtils.degToRad(Math.max(0, this.props.sourceAngle ?? 0.53)) / 2;
+    // Point/spot sources have a world-space radius instead of an angular size,
+    // and shadowRadius is the row the inspector already keeps visible for them.
+    d.giSourceRadius = Math.max(0, this.props.shadowRadius ?? 0);
   }
 
   #syncDirectionalTransform() {
@@ -332,6 +406,11 @@ export class LightComponent extends Component {
       this.light?.isDirectionalLight === true &&
       this.props.csm === true &&
       this.props.castShadow === true &&
+      // gi mode owns shadow.shadowNode; there is exactly one slot, so a CSM
+      // node would fight the GI module's for it. Gating here (rather than at
+      // the construction site) also stops the per-frame onPreRender resync
+      // from building one behind our back.
+      this.light.userData.giShadowMode !== "gi" &&
       this.entity.engine.renderer?.backend?.isWebGPUBackend === true
     );
   }

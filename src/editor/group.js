@@ -1,3 +1,4 @@
+// @ts-check
 import { ensureEngine } from "./engineInstance.js";
 import { commandBus } from "./commands/CommandBus.js";
 import { topMostIds } from "./commands/entityCommands.js";

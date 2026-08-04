@@ -1,6 +1,8 @@
+// @ts-check
 import * as THREE from "three/webgpu";
 import { createId } from "../shared/ids.js";
-import { createComponent, getComponentClass } from "./components/registry.js";
+import { createComponent } from "./components/registry.js";
+import { Component } from "./components/Component.js";
 
 /**
  * Accepts either a registered type string (`"mesh"`) or a component class /
@@ -32,6 +34,10 @@ function resolveComponentType(typeOrCtor) {
  * not raw three nodes.
  */
 export class Entity {
+  /**
+   * @param {import("engine").Engine} engine
+   * @param {{ id?: string, name?: string }} [opts]
+   */
   constructor(engine, { id, name = "Entity" } = {}) {
     this.engine = engine;
     this.id = id ?? createId();
@@ -95,7 +101,7 @@ export class Entity {
     }
     if (changed) {
       this.tags.sort();
-      this.engine?.emit?.("entity-tags-changed", { entityId: this.id });
+      this.engine.emit("entity-tags-changed", { entityId: this.id });
     }
     return this;
   }
@@ -106,7 +112,7 @@ export class Entity {
     const next = this.tags.filter((tag) => !drop.has(tag));
     if (next.length === this.tags.length) return this;
     this.tags = next;
-    this.engine?.emit?.("entity-tags-changed", { entityId: this.id });
+    this.engine.emit("entity-tags-changed", { entityId: this.id });
     return this;
   }
 
@@ -131,7 +137,7 @@ export class Entity {
     const next = [...new Set((tags ?? []).map((tag) => String(tag ?? "").trim()).filter(Boolean))].sort();
     if (next.length === this.tags.length && next.every((tag, i) => tag === this.tags[i])) return;
     this.tags = next;
-    this.engine?.emit?.("entity-tags-changed", { entityId: this.id });
+    this.engine.emit("entity-tags-changed", { entityId: this.id });
   }
 
   /** This entity and every descendant matching `hasTag`'s query semantics. */
@@ -281,16 +287,28 @@ export class Entity {
 
   // ---- Entity tree (distinct from the scene-graph children/parent) -----
 
-  addComponent(typeOrCtor, props) {
-    const type = resolveComponentType(typeOrCtor);
+  /**
+   * Attaches a component. Two forms:
+   *
+   *     entity.addComponent(new MeshComponent({ geometry: "sphere" })); // pre-built instance
+   *     entity.addComponent("mesh", { geometry: "sphere" });            // type string / class token
+   *
+   * `requiredComponents` (e.g. `GeometryModifiersComponent` needs `mesh`) is
+   * satisfied from the component's own class either way, since a pre-built
+   * instance's `constructor` is the same class the registry would have used.
+   */
+  addComponent(typeOrCtorOrInstance, props) {
+    const component = typeOrCtorOrInstance instanceof Component
+      ? typeOrCtorOrInstance
+      : createComponent(resolveComponentType(typeOrCtorOrInstance), props);
+    const type = component.type;
     if (this.components.has(type)) throw new Error(`Entity already has a "${type}" component`);
-    const ComponentClass = getComponentClass(type);
-    for (const requirement of ComponentClass?.requiredComponents ?? []) {
+    for (const requirement of component.constructor.requiredComponents ?? []) {
       const requiredType = typeof requirement === "string" ? requirement : requirement.type;
       if (!requiredType || this.components.has(requiredType)) continue;
       this.addComponent(requiredType, typeof requirement === "string" ? {} : requirement.props ?? {});
     }
-    const component = createComponent(type, this, props);
+    component.entity = this;
     this.components.set(type, component);
     component.onAttach();
     return component;
@@ -336,7 +354,7 @@ export class Entity {
     const next = !!value;
     if (next === this.persistent) return;
     this.persistent = next;
-    this.engine?.emit?.("hierarchy-changed");
+    this.engine.emit("hierarchy-changed");
   }
 
   /** Sets the "enabled in game" flag (mirrors setEnabledInEditor). */
@@ -355,7 +373,9 @@ export class Entity {
     this.components.delete(type);
     // Drop it from the engine's per-frame frustum-gating registry (see
     // Component._viewOnlyActive) so a destroyed component can't be ticked.
-    this.engine?.viewOnlyComponents?.delete(component);
+    // Internal-only bookkeeping, deliberately absent from the public Engine
+    // surface in engine.d.ts.
+    /** @type {any} */ (this.engine).viewOnlyComponents?.delete(component);
   }
 
   /**
@@ -400,7 +420,7 @@ export class Entity {
       const idx = this.parent.children.indexOf(this);
       if (idx !== -1) this.parent.children.splice(idx, 1);
     } else {
-      const idx = this.engine.rootEntities.indexOf(this);
+      const idx = this.engine.rootEntities.indexOf(/** @type {any} */ (this));
       if (idx !== -1) this.engine.rootEntities.splice(idx, 1);
     }
     this.parent = parent ?? null;
@@ -408,8 +428,10 @@ export class Entity {
       parent.children.push(this);
       parent.object3D.add(this.object3D);
     } else {
-      this.engine.rootEntities.push(this);
-      this.engine.scene.add(this.object3D);
+      this.engine.rootEntities.push(/** @type {any} */ (this));
+      // `scene` is deliberately typed narrow for scripts (see the note atop
+      // engine.d.ts) — the engine itself still needs the real THREE.Scene.
+      /** @type {THREE.Scene} */ (this.engine.scene).add(this.object3D);
     }
   }
 

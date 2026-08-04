@@ -1,3 +1,4 @@
+// @ts-check
 import * as THREE from "three/webgpu";
 import {
   Engine,
@@ -79,7 +80,7 @@ setScriptLoader(async (path) => {
 function createLoadingScreen(engine) {
   const root = document.getElementById("loading");
   if (!root) return;
-  const bar = root.querySelector(".loading-bar-fill");
+  const bar = /** @type {HTMLElement | null} */ (root.querySelector(".loading-bar-fill"));
   const label = root.querySelector(".loading-label");
   const show = (visible) => root.classList.toggle("is-hidden", !visible);
   const PHASE_LABELS = {

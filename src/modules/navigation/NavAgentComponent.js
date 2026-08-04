@@ -1,3 +1,4 @@
+// @ts-check
 import * as THREE from "three/webgpu";
 import { Component } from "../../engine/components/Component.js";
 import { CROWD_FLAGS } from "./NavigationSystem.js";

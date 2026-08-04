@@ -1,3 +1,4 @@
+// @ts-check
 import { engine } from "./engineInstance.js";
 import { oncePerVm } from "./singleton.js";
 

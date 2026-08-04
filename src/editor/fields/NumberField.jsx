@@ -36,6 +36,11 @@ export function formatNumber(v) {
 /** Movement in px before a press counts as a scrub instead of a click. */
 const DRAG_SLOP = 3;
 
+/**
+ * @param {{ value: number, onCommit: (value: number) => void, min?: number,
+ *           max?: number, step?: number, mixed?: boolean, className?: string,
+ *           title?: string }} props
+ */
 export function NumberField({
   value,
   onCommit,

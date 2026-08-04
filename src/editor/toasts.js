@@ -35,6 +35,10 @@ const shared = vmSingleton("toastStore", () => {
 
 export const useToastStore = shared.store;
 
+/**
+ * @param {{ level?: "info" | "warn" | "error", title?: string, detail?: string,
+ *           key?: string | null, timeoutMs?: number }} [opts]
+ */
 export function pushToast({ level = "info", title, detail = "", key = null, timeoutMs } = {}) {
   const id = shared.nextIdRef();
   if (key && shared.timers.has(key)) clearTimeout(shared.timers.get(key));

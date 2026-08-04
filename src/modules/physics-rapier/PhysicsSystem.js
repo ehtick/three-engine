@@ -1,3 +1,4 @@
+// @ts-check
 import * as THREE from "three/webgpu";
 import { EDITOR_LAYER } from "../../engine/editorLayers.js";
 import { PhysicsLayers } from "./layers.js";

@@ -1,3 +1,4 @@
+// @ts-check
 import { exportGame } from "./exportGame.js";
 import { useProjectStore } from "./store/projectStore.js";
 import { vmSingleton } from "./singleton.js";
@@ -56,6 +57,7 @@ export function getActiveShareTunnel() {
  * people outside the local network. The link serves the same live-updating
  * build as the LAN preview and dies with the tunnel, the preview, or the
  * editor. Returns null if a start is already in flight.
+ * @param {{ onProgress?: (info: { phase?: string, message?: string }) => void }} [opts]
  */
 export async function startShareTunnel({ onProgress } = {}) {
   if (state.share) return state.share;
@@ -175,6 +177,7 @@ async function startLivePreview({ outDir, onProgress }) {
     let failure = "";
     try {
       await ensurePlayerTemplateFresh(invoke, onProgress);
+      /** @type {any} */
       const report = await exportGame({
         outDir,
         onProgress,
@@ -273,7 +276,9 @@ async function startLivePreview({ outDir, onProgress }) {
 /** Builds the authored scene into a disposable project-local preview and
  * exposes it on localhost plus the current LAN for phone/tablet testing.
  * `openBrowser: false` starts the hosting silently without stealing focus to
- * a new tab. */
+ * a new tab.
+ * @param {{ onProgress?: (info: { phase?: string, message?: string }) => void, openBrowser?: boolean }} [opts]
+ */
 export async function openBrowserPreview({ onProgress, openBrowser = true } = {}) {
   const root = useProjectStore.getState().rootPath;
   if (!root) throw new Error("Open a project before starting a browser preview.");
@@ -300,6 +305,7 @@ async function runOpenBrowserPreview({ root, onProgress, openBrowser }) {
   // the browser execute a different engine than the editor.
   await ensurePlayerTemplateFresh(invoke, onProgress, { force: true });
   let buildStage = "Starting browser build…";
+  /** @type {any} */
   const report = await exportGame({
     outDir,
     onProgress: (progress) => {

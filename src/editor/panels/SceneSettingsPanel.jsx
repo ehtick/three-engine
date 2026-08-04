@@ -1,3 +1,4 @@
+// @ts-check
 import { useEffect, useState } from "react";
 import { ensureEngine } from "../engineInstance.js";
 import { commandBus } from "../commands/CommandBus.js";
@@ -30,6 +31,10 @@ function Row({ label, children }) {
   );
 }
 
+/**
+ * @param {{ value: number, onCommit: (value: number) => void, min?: number,
+ *           max?: number, step?: number }} props
+ */
 function NumberInput({ value, onCommit, min, max, step = 0.1 }) {
   const [text, setText] = useState(String(value));
   useEffect(() => setText(String(Math.round(value * 1000) / 1000)), [value]);

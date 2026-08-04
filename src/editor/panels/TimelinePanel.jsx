@@ -1,3 +1,6 @@
+// NOTE: strict type-checking intentionally not enabled here — ~17 pre-existing
+// errors unrelated to events (JSX prop-shape mismatches on field components,
+// `KeyItem`/`ClipItem` element typing), a follow-up.
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Circle,

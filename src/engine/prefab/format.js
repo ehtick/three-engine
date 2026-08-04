@@ -133,12 +133,20 @@ export function parsePrefabFile(text, { name } = {}) {
   return upgradeLegacyEntity(json, { name });
 }
 
-/** Builds an empty def around a root node. */
+/**
+ * Builds an empty def around a root node.
+ * @param {unknown} root
+ * @param {{ guid?: string, name?: string }} [opts]
+ */
 export function makeDef(root, { guid = newGuid(), name } = {}) {
   return { prefab: PREFAB_FORMAT_VERSION, guid, name: name ?? root?.name ?? "Prefab", root };
 }
 
-/** Builds a variant def: no tree of its own, only a base + overrides. */
+/**
+ * Builds a variant def: no tree of its own, only a base + overrides.
+ * @param {{ guid: string, name?: string, path?: string | null }} base
+ * @param {{ guid?: string, name?: string, overrides?: unknown[] }} [opts]
+ */
 export function makeVariantDef(base, { guid = newGuid(), name, overrides = [] } = {}) {
   return {
     prefab: PREFAB_FORMAT_VERSION,

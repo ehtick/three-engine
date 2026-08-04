@@ -1,3 +1,4 @@
+// @ts-check
 /**
  * Directional focus navigation — the thing that makes a menu playable without
  * a mouse.

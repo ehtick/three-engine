@@ -105,6 +105,7 @@ export function isEngineReady() {
  * UI interaction is possible), and the throw makes any forgotten `await`
  * obvious instead of silently returning undefined.
  */
+/** @type {import("engine").Engine} */
 export const engine = new Proxy(function () {}, {
   get(_target, prop) {
     if (prop === "then") return undefined; // not a thenable

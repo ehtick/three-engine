@@ -1,3 +1,4 @@
+// @ts-check
 import { prefabRegistry } from "./registry.js";
 import { resolvePrefab } from "./resolve.js";
 import { diffInstance, applyInstanceToDef } from "./diff.js";
@@ -169,7 +170,11 @@ function nodeFromEntity(entity, isRoot = false) {
   return node;
 }
 
-/** Builds a prefab def from a live entity tree (Create Prefab). */
+/**
+ * Builds a prefab def from a live entity tree (Create Prefab).
+ * @param {import("engine").Entity} entity
+ * @param {{ name?: string, guid?: string }} [opts]
+ */
 export function createDefFromEntity(entity, { name, guid } = {}) {
   return makeDef(nodeFromEntity(entity, true), { name: name ?? entity.name, guid });
 }
@@ -219,8 +224,12 @@ export function bindEntityToPrefab(engine, entity, def, path = null) {
   return next;
 }
 
-/** Builds a *variant* def from a live instance (Create Variant): the instance's
- *  current overrides become the variant's own. */
+/**
+ * Builds a *variant* def from a live instance (Create Variant): the instance's
+ * current overrides become the variant's own.
+ * @param {import("engine").Entity} entity
+ * @param {{ name?: string, guid?: string }} [opts]
+ */
 export function createVariantDefFromInstance(entity, { name, guid } = {}) {
   const baseGuid = prefabRegistry.resolveLink(entity.prefab);
   if (!baseGuid) throw new Error("Entity is not a prefab instance");

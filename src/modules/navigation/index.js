@@ -1,3 +1,4 @@
+// @ts-check
 import { NavMeshComponent } from "./NavMeshComponent.js";
 import { NavAgentComponent } from "./NavAgentComponent.js";
 import { NavLinkComponent } from "./NavLinkComponent.js";

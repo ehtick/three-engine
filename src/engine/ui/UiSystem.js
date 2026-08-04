@@ -1,3 +1,4 @@
+// @ts-check
 import * as THREE from "three/webgpu";
 import {
   ELEMENT_DEFAULTS,

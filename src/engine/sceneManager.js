@@ -1,3 +1,4 @@
+// @ts-check
 import { instantiateEntity, SCENE_VERSION } from "./serialize.js";
 import { prefabRegistry } from "./prefab/registry.js";
 import { assetCatalog } from "./assets/catalog.js";

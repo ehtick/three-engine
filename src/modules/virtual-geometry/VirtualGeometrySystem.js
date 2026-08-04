@@ -1,3 +1,4 @@
+// @ts-check
 import * as THREE from "three/webgpu";
 import { loadAssetMeta } from "../../engine/assetResolver.js";
 import { EDITOR_LAYER } from "../../engine/editorLayers.js";
@@ -153,7 +154,10 @@ function resolveVgMeta(raw) {
 // with a moving camera spreads the cost across frames instead of spiking.
 let maxUpdatesPerFrame = 8;
 
-/** Editor/host hook: pushes the module's runtime settings onto every engine. */
+/**
+ * Editor/host hook: pushes the module's runtime settings onto every engine.
+ * @param {{ maxUpdatesPerFrame?: number }} [opts]
+ */
 export function setVirtualGeometryRuntimeConfig({ maxUpdatesPerFrame: m } = {}) {
   if (Number.isFinite(m) && m > 0) maxUpdatesPerFrame = Math.floor(m);
 }

@@ -1,3 +1,7 @@
+// NOTE: strict type-checking intentionally not enabled here — ~22 pre-existing
+// errors unrelated to events (the device union type doesn't narrow per-device,
+// e.g. `.id`/`.buttons` on KeyboardDevice|MouseDevice|...), a follow-up. Fixed the
+// one real bug it caught along the way: a duplicate `getMap` implementation.
 import { EventEmitter } from "../EventEmitter.js";
 import { ActionMap } from "./ActionMap.js";
 import { KeyboardDevice } from "./devices/KeyboardDevice.js";
@@ -189,6 +193,7 @@ export class InputManager extends EventEmitter {
     return this.stack.includes(name);
   }
 
+  // Looks up a live action map by name. Returns null if the map isn't loaded.
   getMap(name) {
     return this.maps.get(name) ?? null;
   }
@@ -517,11 +522,6 @@ export class InputManager extends EventEmitter {
   // `number` for value actions — TypeScript narrows on the `.type` field.
   getAction(name) {
     return this.#findAction(name);
-  }
-
-  // Looks up a live action map by name. Returns null if the map isn't loaded.
-  getMap(name) {
-    return this.maps.get(name) ?? null;
   }
 
   // Returns the live value the manager resolved this tick. For vec2 actions

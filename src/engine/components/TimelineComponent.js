@@ -1,3 +1,4 @@
+// @ts-check
 import { Component } from "./Component.js";
 import { resolveAssetUrl } from "../assetResolver.js";
 import { TimelineRuntime } from "../timeline/TimelineRuntime.js";

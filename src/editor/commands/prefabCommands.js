@@ -1,3 +1,4 @@
+// @ts-check
 import { engine } from "../engineInstance.js";
 import {
   prefabRegistry,
@@ -103,6 +104,11 @@ export class InstantiatePrefabCommand {
  * elsewhere is not something an undo should do silently.
  */
 export class CreatePrefabCommand {
+  /**
+   * @param {string} entityId
+   * @param {string} path
+   * @param {{ name?: string }} [opts]
+   */
   constructor(entityId, path, { name } = {}) {
     const entity = engine.getEntity(entityId);
     this.entityId = entityId;

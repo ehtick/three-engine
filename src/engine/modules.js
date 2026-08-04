@@ -1,3 +1,4 @@
+// @ts-check
 import { registerComponent, unregisterComponent } from "./components/registry.js";
 
 /**

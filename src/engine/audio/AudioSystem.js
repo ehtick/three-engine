@@ -1,3 +1,4 @@
+// @ts-check
 import * as THREE from "three/webgpu";
 import { worldForward, worldPosition, worldUp, safeNormalize } from "./Spatial.js";
 import { raycastOcclusion } from "./occlusion.js";
@@ -61,7 +62,7 @@ export class AudioSystem {
       }
       return null;
     }
-    const Ctor = window.AudioContext ?? window.webkitAudioContext;
+    const Ctor = window.AudioContext ?? /** @type {any} */ (window).webkitAudioContext;
     if (!Ctor) return null;
     try {
       this.context = new Ctor();
@@ -201,7 +202,7 @@ export class AudioSystem {
   /** Sets the active ListenerComponent entity (or null to fall back to camera). */
   setListenerEntity(entity) {
     this.listenerEntity = entity;
-    this.engine.emit?.("audio-changed");
+    this.engine.emit("audio-changed");
   }
 
   /** Resolves the active listener entity, preferring the explicit one. */

@@ -1,3 +1,4 @@
+// @ts-check
 import * as THREE from "three/webgpu";
 import { brushWeight } from "../../editor/brush.js";
 import { texture as tslTexture, uv, float, vec3, normalMap, normalView } from "three/tsl";
