@@ -33,6 +33,7 @@ import {
   uniform,
   vec2,
   vec3,
+  vec4,
 } from "three/tsl";
 import { sharedFn } from "./giFn.js";
 
@@ -606,8 +607,37 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
     // shaders small enough for the driver to compile quickly, and what makes
     // a GI rebuild leave material code untouched (no recompile wave).
     const deferred = light.giIrradianceNode != null;
+    // POSITION-VALIDATED BILATERAL over the half-res resolve textures. A
+    // plain bilinear `sample(screenUV)` blends the 4 nearest half-res texels
+    // regardless of WHOSE surface each was resolved for — at silhouettes a
+    // bright texel (sunlit wall, emitter-lit floor) smears its full
+    // irradiance onto the dark foliage/prop in front of it, which is the
+    // white-dot artifact that survived every fix aimed at the SHADOW
+    // channel (it was never the shadow channel). Each tap is validated
+    // against the half-res gbuffer POSITION (Nearest-filtered, per-texel
+    // exact): wrong-surface taps are rejected, valid ones blend distance-
+    // weighted, and with no valid tap the DARKEST tap wins — for additive
+    // light a dark error is a dim pixel, a bright error is the dot.
+    const bilateral =
+      light.giPositionNode && light.giScreenTexel
+        ? (texNode) => {
+            const threshold = positionWorld.sub(cameraPosition).length().mul(0.02).max(0.15);
+            const taps = [[-0.5, -0.5], [0.5, -0.5], [-0.5, 0.5], [0.5, 0.5]].map(([dx, dy]) => {
+              const uv = screenUV.add(vec2(light.giScreenTexel).mul(vec2(dx, dy)));
+              const v = vec4(texNode.sample(uv)).toVar();
+              const g = light.giPositionNode.sample(uv);
+              const d = g.xyz.sub(positionWorld).length();
+              const w = select(g.w.greaterThan(0.5).and(d.lessThan(threshold)), float(1).div(d.add(0.02)), float(0)).toVar();
+              return { v, w };
+            });
+            const wSum = taps.reduce((a, t) => a.add(t.w), float(0));
+            const blend = taps.reduce((a, t) => a.add(t.v.mul(t.w)), vec4(0)).div(wSum.max(1e-4));
+            const darkest = taps.reduce((a, t) => a.min(t.v), vec4(1e9));
+            return select(wSum.greaterThan(1e-4), blend, darkest);
+          }
+        : null;
     const irradiance = deferred
-      ? vec3(light.giIrradianceNode.sample(screenUV)).toVar()
+      ? vec3(bilateral ? bilateral(light.giIrradianceNode) : light.giIrradianceNode.sample(screenUV)).toVar()
       : vec3(light.gatherFn(samplePoint, N, cameraPosition.sub(positionWorld).normalize())).mul(light.intensityUniform);
     builder.context.irradiance.addAssign(irradiance);
 
@@ -627,7 +657,10 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
       // shadow factor, so the resolve pass packs the four shadows into one
       // RGBA texture — a fetch instead of up to four sphere traces per pixel.
       if (light.emitterSlots?.length && light.giEmitterShadowNode) {
-        const packed = light.giEmitterShadowNode.sample(screenUV).toVar();
+        // Same bilateral as the irradiance above — packed per-emitter shadow
+        // factors smear across silhouettes identically, and min-per-channel
+        // as the no-tap fallback is exactly "darkest shadow wins".
+        const packed = (bilateral ? bilateral(light.giEmitterShadowNode) : light.giEmitterShadowNode.sample(screenUV)).toVar();
         const channels = [packed.x, packed.y, packed.z, packed.w];
         light.emitterSlots.forEach((slot, index) => {
           const toEmitter = vec3(slot.center).sub(positionWorld).toVar();

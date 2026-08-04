@@ -1821,8 +1821,11 @@ export class GISystem {
       // #acquireLightShadowNode). The gbuffer is per-build, so the persistent
       // node re-points here every time; a resize reuses the same render
       // target object (setSize), so no hook is needed there.
-      if (lightShadow && !this._giShadowPosNode) this._giShadowPosNode = texture(gbuffer.position);
-      else if (this._giShadowPosNode) this._giShadowPosNode.value = gbuffer.position;
+      // Unconditional: giLight's irradiance bilateral needs it even when the
+      // light-shadow bundle declined (the smear it guards is a property of
+      // EVERY screen-space GI term, not of the shadow feature).
+      if (!this._giShadowPosNode) this._giShadowPosNode = texture(gbuffer.position);
+      else this._giShadowPosNode.value = gbuffer.position;
       const emitter = emitterSlots
         ? {
             emitterSlots,
@@ -1860,6 +1863,13 @@ export class GISystem {
       light.giIrradianceNode = this._giIrradianceNode;
       light.giEmitterShadowNode = emitterSlots ? this._giEmitterShadowNode : null;
       light.giRadianceNode = radianceLookup ? this._giRadianceNode : null;
+      // Silhouette-validity inputs for giLight's bilateral screen sampling
+      // (same machinery as the shadowNode's — see #acquireLightShadowNode):
+      // the half-res gbuffer POSITION says which surface each texel's GI was
+      // resolved FOR, which is what stops a bright texel's irradiance from
+      // smearing white dots across the dark silhouette in front of it.
+      light.giPositionNode = this._giShadowPosNode;
+      light.giScreenTexel = this._giLightShadowTexel;
       return { gbuffer, resolve, targets, width, height, ...inputs };
     } catch (error) {
       // Falling back to the in-material path keeps GI working (slowly) rather
