@@ -1,5 +1,6 @@
 import {
   extOf,
+  TEXTURE_EXTENSIONS,
   SCRIPT_EXTENSIONS,
   MATERIAL_EXTENSIONS,
   CUBEMAP_EXTENSIONS,
@@ -50,6 +51,7 @@ export function hasAssetEditor(path) {
   const ext = extOf(path);
   return (
     ext === "scene" ||
+    TEXTURE_EXTENSIONS.includes(ext) ||
     SCRIPT_EXTENSIONS.includes(ext) ||
     PREFAB_EXTENSIONS.includes(ext) ||
     ANIMATOR_EXTENSIONS.includes(ext) ||
@@ -88,6 +90,12 @@ export function openAssetPath(path, { isDir = false } = {}) {
     // A material *is* its shader graph — that's the only editor for it.
     useSelectionStore.getState().selectAsset(path);
     import("./EditorShell.jsx").then((m) => m.openPanel("shaderGraph"));
+  } else if (TEXTURE_EXTENSIONS.includes(ext)) {
+    // Images open in the Texture Editor rather than the OS image viewer. The
+    // panel gates itself on the `texture-editor` module, so a project that has
+    // not enabled it gets an explanation and a button rather than nothing.
+    useSelectionStore.getState().selectAsset(path);
+    import("./EditorShell.jsx").then((m) => m.openPanel("textureEditor"));
   } else if (GEOMETRY_EXTENSIONS.includes(ext)) {
     openGeometryAsset(path);
   } else {

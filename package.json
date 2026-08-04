@@ -89,6 +89,8 @@
     "test:gi-sparse": "node scripts/run-gi-sparse-field.mjs",
     "test:gi-coverage": "node scripts/run-gi-sdf-coverage.mjs",
     "test:gi-occupancy": "node scripts/run-gi-occupancy.mjs",
+    "test:texture": "node scripts/run-texture-test.mjs",
+    "smoke:texture": "node scripts/run-texture-smoke.mjs",
     "test:planar": "node scripts/run-planar-reflection.mjs"
   },
   "dependencies": {

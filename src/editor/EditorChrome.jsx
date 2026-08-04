@@ -163,6 +163,13 @@ export function EditorChrome() {
       for (const el of document.querySelectorAll(".timeline-panel")) {
         if (isPointerInside(el)) return;
       }
+      // The texture editor owns Ctrl+Z / Ctrl+S / Delete / single-letter tool
+      // keys over its own surface, for the same reason and by the same test:
+      // clicking on a paint canvas never moves `document.activeElement`.
+      if (e.target.closest?.(".texture-editor")) return;
+      for (const el of document.querySelectorAll(".texture-editor")) {
+        if (isPointerInside(el)) return;
+      }
 
       const selection = useSelectionStore.getState().ids;
       if (e.shiftKey && !ctrl && !e.altKey && e.key.toLowerCase() === "d") {

@@ -120,6 +120,10 @@ export const withoutSidecars = (entries) =>
     (entry) =>
       !entry.name.endsWith(".meta") &&
       !entry.name.endsWith(".basis") &&
+      // The texture editor's layer stack, stored beside the image it belongs
+      // to (see textureFile.js). Like `.meta`, it is an implementation detail
+      // of an asset the user already sees, not an asset of its own.
+      !entry.name.endsWith(".tex") &&
       !entry.name.endsWith(".sdf"),
   );
 

@@ -81,6 +81,7 @@ import { loadAssetFlags, setAssetFlags, useAssetFlagsStore } from "../assetFlags
 import { collectUsedAssets } from "../assetUsage.js";
 import { samePath, useAssetRevealStore } from "../assetReveal.js";
 import { openAssetPath } from "../openAsset.js";
+import { requestNewTexture } from "../textureEditorRequest.js";
 import { ContextMenu, isTextEditTarget } from "../ContextMenu.jsx";
 import { requestGeometryThumb } from "../geometryThumb.js";
 
@@ -171,6 +172,14 @@ const createAnimator = () =>
 
 const createSequence = () =>
   createAssetFile("NewTimeline.timeline", JSON.stringify(createDefaultTimeline(), null, 2));
+
+/** A new image is not a JSON template — it needs a size and a background, and
+ *  those live in the Texture Editor's own dialog so there is one place that
+ *  knows how to make one. */
+const createTexture = () => {
+  requestNewTexture();
+  import("../EditorShell.jsx").then((m) => m.openPanel("textureEditor"));
+};
 
 /** Texture image thumbnail (blob URL over Tauri fs). */
 function TextureThumb({ path, size }) {
@@ -607,6 +616,9 @@ function AssetContextMenu({ menu, close, setRenamingPath, selectedEntries }) {
               },
             ]
           : []),
+        ...(!multi && !entry.is_dir && TEXTURE_EXTENSIONS.includes(entry.ext)
+          ? [{ label: "Edit Texture", action: () => openAssetPath(entry.path) }]
+          : []),
         ...(!multi && MODEL_IMPORT_EXTENSIONS.includes(entry.ext)
           ? [
               { label: "Unpack Model", action: () => unpackModel(entry.path) },
@@ -631,6 +643,7 @@ function AssetContextMenu({ menu, close, setRenamingPath, selectedEntries }) {
         { label: "New Folder", action: createFolder },
         { label: "New Script", action: createScript },
         { label: "New Material", action: createMaterial },
+        { label: "New Texture", action: createTexture },
         { label: "New Cube Map", action: () => createCubemap() },
         { label: "New Animator", action: createAnimator },
         { label: "New Timeline", action: createSequence },

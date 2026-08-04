@@ -120,6 +120,7 @@ export async function deleteEntries(entries) {
       if (!entry.is_dir) {
         await invoke("delete_path", { path: `${entry.path}.meta` }).catch(() => {});
         await invoke("delete_path", { path: `${entry.path}.basis` }).catch(() => {});
+        await invoke("delete_path", { path: `${entry.path}.tex` }).catch(() => {});
         // Legacy GI mesh-SDF sidecars (pre-Library). New bakes live under
         // `<project>/Library/gi-sdf/`; this just sweeps the old neighbour files.
         await invoke("delete_path", { path: `${entry.path}.sdf` }).catch(() => {});
@@ -187,6 +188,7 @@ export async function renameEntry(entry, newName) {
     // Keep texture import settings attached across the rename.
     await invoke("rename_path", { from: `${entry.path}.meta`, to: `${newPath}.meta` }).catch(() => {});
     await invoke("rename_path", { from: `${entry.path}.basis`, to: `${newPath}.basis` }).catch(() => {});
+    await invoke("rename_path", { from: `${entry.path}.tex`, to: `${newPath}.tex` }).catch(() => {});
 
     // Scripts: rewrite the default-exported class name to match the new
     // filename stem, and inject `extends Script` if the script predates the
@@ -221,6 +223,7 @@ export async function movePathsIntoFolder(sourcePaths, destDir) {
       await invoke("rename_path", { from: sourcePath, to: dest });
       await invoke("rename_path", { from: `${sourcePath}.meta`, to: `${dest}.meta` }).catch(() => {});
       await invoke("rename_path", { from: `${sourcePath}.basis`, to: `${dest}.basis` }).catch(() => {});
+      await invoke("rename_path", { from: `${sourcePath}.tex`, to: `${dest}.tex` }).catch(() => {});
       moved++;
     } catch (err) {
       console.error(`Move failed for ${name}: ${err}`);

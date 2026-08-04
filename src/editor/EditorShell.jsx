@@ -37,6 +37,7 @@ const McpPanel = lazy(() => import("./panels/McpPanel.jsx").then((m) => ({ defau
 const AiPanel = lazy(() => import("./panels/AiPanel.jsx").then((m) => ({ default: m.AiPanel })));
 const GamePanel = lazy(() => import("./panels/GamePanel.jsx").then((m) => ({ default: m.GamePanel })));
 const BuildPanel = lazy(() => import("./panels/BuildPanel.jsx").then((m) => ({ default: m.BuildPanel })));
+const TextureEditorPanel = lazy(() => import("./panels/TextureEditorPanel.jsx").then((m) => ({ default: m.TextureEditorPanel })));
 
 /** Keep lazy loading local to one Dockview portal. A shared boundary around
  * Dockview would hide the entire editor whenever any heavy panel suspends. */
@@ -74,6 +75,7 @@ const panelComponents = {
   terminal: withPanelSuspense(TerminalPanel),
   mcp: withPanelSuspense(McpPanel),
   ai: withPanelSuspense(AiPanel),
+  textureEditor: withPanelSuspense(TextureEditorPanel),
 };
 const tabComponents = {
   console: withPanelSuspense(ConsoleTab, <span className="tab-loading">Console</span>),
@@ -119,6 +121,10 @@ export const PANEL_SPECS = {
   polyhaven: { title: "Poly Haven", position: { referencePanel: "assets", direction: "within" } },
   ambientcg: { title: "AmbientCG", position: { referencePanel: "assets", direction: "within" } },
   sketchfab: { title: "Sketchfab", position: { referencePanel: "assets", direction: "within" } },
+  // Docks with the Assets strip like the other wide authoring surfaces: a
+  // paint canvas plus a tool column plus a layer column does not fit the
+  // 320px Inspector column, and the canvas is the point of the panel.
+  textureEditor: { title: "Texture Editor", position: { referencePanel: "assets", direction: "within" }, initialHeight: 420 },
   // Docks with the Assets strip: a terminal wants width for wrapped output and
   // the CLIs draw full-width boxes, so the 320px Inspector column would render
   // Claude unusable.

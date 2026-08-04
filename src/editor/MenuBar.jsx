@@ -214,6 +214,7 @@ export function MenuBar() {
       { label: "Build Settings", action: () => openPanel("build") },
       { label: "Modules", action: () => openPanel("modules") },
       { label: "Input", action: () => openPanel("input") },
+      { label: "Texture Editor", action: () => openPanel("textureEditor") },
       { label: "Poly Haven", action: () => openPanel("polyhaven") },
       { label: "AmbientCG", action: () => openPanel("ambientcg") },
       { label: "Sketchfab", action: () => openPanel("sketchfab") },
