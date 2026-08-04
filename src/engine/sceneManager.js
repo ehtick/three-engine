@@ -1,5 +1,6 @@
 import { instantiateEntity, SCENE_VERSION } from "./serialize.js";
 import { prefabRegistry } from "./prefab/registry.js";
+import { assetCatalog } from "./assets/catalog.js";
 import { resolveInstance } from "./prefab/resolve.js";
 import { SCENE_SETTINGS_DEFAULTS } from "./sceneSettings.js";
 import { loadSceneJson, resolveAssetUrl } from "./assetResolver.js";
@@ -180,6 +181,11 @@ export class SceneManager {
       // registry cannot expand.
       for (const def of json.prefabs ?? []) {
         if (def?.guid) prefabRegistry.register(def, def.path ?? null);
+      }
+      // Name/tag catalog for `engine.assets.findByName`/`byTag`. Embedded once,
+      // on the start scene, alongside prefabs — see exportGame.js.
+      for (const def of json.assetIndex ?? []) {
+        if (def?.path) assetCatalog.register(def);
       }
 
       let assets = preload === false ? [] : Array.isArray(preload) ? preload : collectSceneAssets(json);

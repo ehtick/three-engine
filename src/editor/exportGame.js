@@ -502,6 +502,11 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
     const { readAssetFlags } = await import("./assetFlags.js");
     const preload = [];
     const excluded = [];
+    // `engine.assets.findByName`/`byTag` at runtime — one entry per shipped
+    // asset, name = the AUTHORING basename (stable across a collision rename,
+    // so `wood/color.png` and `stone/color.png` both search as "color.png"
+    // even though only one of them keeps that exact build filename).
+    const assetDefs = [];
     const flagTargets = [...names.copyEntries().map(([source]) => source), ...materialPaths];
     for (const src of flagTargets) {
       const flags = await readAssetFlags(src);
@@ -510,14 +515,19 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
         // Sidecars follow the asset out of the build.
         names.release(src);
         materialPaths.delete(src);
-      } else if (flags.preload && (startAssets.has(src) || startMaterials.has(src))) {
+        continue;
+      }
+      const rel = names.peek(src);
+      if (!rel) continue;
+      assetDefs.push({ path: rel, name: basename(src), tags: flags.tags });
+      if (flags.preload && (startAssets.has(src) || startMaterials.has(src))) {
         // Boot preload stays scoped to the start scene: a "Preload" flag on a
         // texture only level 5 uses must not sit in front of the main menu.
-        const rel = names.peek(src);
-        if (rel) preload.push(rel);
+        preload.push(rel);
       }
     }
     if (preload.length) scene.preload = [...new Set(preload)];
+    if (assetDefs.length) scene.assetIndex = assetDefs;
     if (excluded.length) {
       warnings.push(
         `Excluded from the build: ${excluded.filter(Boolean).map(basename).join(", ")}. ` +

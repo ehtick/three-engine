@@ -66,6 +66,12 @@ declare module "engine" {
     Camera,
   } from "three/webgpu";
 
+  // Imported (types only) so `AssetsHandle` below can be precise about what
+  // each accessor hands back — the same "you want the escape hatch, and it's
+  // fully typed" exception `Object3D`/`Camera` already get, extended to the
+  // handful of scene-graph types an asset actually resolves to.
+  import type { Texture, Material, BufferGeometry, CubeTexture } from "three/webgpu";
+
   export {
     Vector2,
     Vector3,
@@ -2029,6 +2035,13 @@ declare module "engine" {
     scenes: SceneManagerHandle;
 
     /**
+     * Texture / material / geometry / audio / cubemap access by project
+     * path — the same string an `@attribute({ type: "asset" })` field gives
+     * you. See {@link AssetsHandle}.
+     */
+    assets: AssetsHandle;
+
+    /**
      * Loads a scene by project-relative path — the same string works in the
      * editor and in an exported build.
      *
@@ -2219,6 +2232,86 @@ declare module "engine" {
     stats(): PoolStats;
   }
 
+  /**
+   * `engine.assets` — texture / material / geometry / audio / cubemap access
+   * by project path, the same string an `@attribute({ type: "asset" })`
+   * field gives you. Every accessor returns the SHARED instance other
+   * systems (components, the editor) are also using — don't mutate or
+   * dispose it, `geometry()` excepted (see below).
+   *
+   * Prefabs use `engine.instantiate()` / `engine.spawn()` instead — they are
+   * the one asset kind identified by guid rather than path.
+   */
+  export interface AssetsHandle {
+    /**
+     * Loads (or returns the already-loading/loaded) texture at `path`.
+     * Repeat calls with the same path + colorSpace share one texture.
+     *
+     *   const icon = await this.engine.assets.texture(this.iconPath);
+     */
+    texture(path: string, options?: { colorSpace?: string }): Promise<Texture>;
+
+    /** The shared `.mat` material for `path`, loading its def on first use. */
+    material(path: string): Promise<Material>;
+    /** The live material instance for `path`, or null if not loaded yet. */
+    getMaterial(path: string): Material | null;
+
+    /**
+     * Borrows the shared geometry for a `.geom` path, incrementing its
+     * refcount. Pair every call with `releaseGeometry` (e.g. in
+     * `onDestroy`) once you are done with the instance.
+     */
+    geometry(path: string): Promise<BufferGeometry>;
+    /** Returns a geometry borrowed via `geometry()`. */
+    releaseGeometry(geometry: BufferGeometry): boolean;
+
+    /**
+     * Decoded audio buffer for an asset path. Ensures the shared
+     * AudioContext exists first — safe to call before any user gesture, the
+     * buffer just won't be ready (resolves null) until one arrives.
+     */
+    audio(path: string): Promise<AudioBuffer | null>;
+    /** The already-decoded buffer for `path`, or null if not loaded yet. */
+    getAudioBuffer(path: string): AudioBuffer | null;
+
+    /** The shared `CubeTexture` for a `.cubemap` path. */
+    cubemap(path: string): Promise<CubeTexture | null>;
+    /** The already-loaded cube texture for `path`, or null if not loaded yet. */
+    getCubemap(path: string): CubeTexture | null;
+
+    /**
+     * The path of the asset named `name` (case-insensitive, exact match), or
+     * null if none is known. Two assets can legitimately share a basename —
+     * this returns the first in path order; prefer `findAllByName` when
+     * that's a real possibility for your project.
+     *
+     * Coverage follows the catalog, not the filesystem: in the editor
+     * that's whatever project-wide scan has run (populated automatically on
+     * project open); in a build it's only assets a shipped scene actually
+     * references — an asset tagged but never placed in any scene never
+     * ships, so it's never found here either.
+     *
+     *   const path = this.engine.assets.findByName("explosion.png");
+     *   if (path) await this.engine.assets.texture(path);
+     */
+    findByName(name: string): string | null;
+    /** Every known asset path named `name` (case-insensitive, exact match). */
+    findAllByName(name: string): string[];
+
+    /**
+     * Every known asset path tagged `tag` — set via the Assets panel's Tags
+     * field (Inspector → asset → Tags).
+     *
+     *   const decal = pickRandom(this.engine.assets.byTag("blood"));
+     */
+    byTag(tag: string): string[];
+    /**
+     * Every known asset path carrying at least one (`mode: "any"`, default)
+     * or every one (`mode: "all"`) of `tags`.
+     */
+    byTags(tags: string[], mode?: "any" | "all"): string[];
+  }
+
   export interface SceneManagerHandle {
     /** Loaded scenes, in load order. */
     loaded: LoadedScene[];
@@ -2246,15 +2339,27 @@ declare module "engine" {
    * Schema for an `@attribute`-decorated field. The editor reads this off the
    * loaded class (`static attributes`) and renders an Inspector field of the
    * matching kind (`number` / `text` / `boolean` / `select` / `vec3` /
-   * `prefab`).
+   * `prefab` / `asset`).
    *
    * Constraints on `min`/`max`/`step` only apply to numeric fields. The
    * `options` array supplies values for `select` fields. A `prefab` field
    * renders a prefab picker and holds the asset path — pass it straight to
-   * `engine.instantiate()`.
+   * `engine.instantiate()`. An `asset` field renders a generic asset picker
+   * (filtered by `exts`, e.g. `["mat"]` or `["geom"]`) and holds the asset
+   * path — pass it straight to `engine.assets.texture()` / `.material()` /
+   * `.geometry()` / `.audio()` / `.cubemap()`, whichever matches:
+   *
+   *   @attribute({ type: "asset", exts: ["mat"] }) glowMaterial!: string;
+   *
+   *   async onHit() {
+   *     // The Inspector field just holds the path — resolve it to the live,
+   *     // shared material instance (hand it to a three object you manage
+   *     // yourself via the "three" escape hatch) when you actually need it.
+   *     const material = await this.engine.assets.material(this.glowMaterial);
+   *   }
    */
   export interface AttributeOptions {
-    type?: "number" | "text" | "boolean" | "select" | "vec3" | "prefab";
+    type?: "number" | "text" | "boolean" | "select" | "vec3" | "prefab" | "asset";
     default?: unknown;
     min?: number;
     max?: number;

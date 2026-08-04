@@ -71,6 +71,11 @@ export function EditorChrome() {
         // stores instances as links, and a link with no def can't expand.
         const { loadProjectPrefabs } = await import("./prefab.js");
         await loadProjectPrefabs().catch((err) => console.error(`Prefabs: ${err.message ?? err}`));
+        // engine.assets' name/tag catalog — not load-bearing for the scene
+        // itself, so it doesn't block boot, but scripts should find it
+        // populated by the time Play actually starts running them.
+        const { loadProjectAssetCatalog } = await import("./assetCatalog.js");
+        loadProjectAssetCatalog().catch((err) => console.error(`Asset catalog: ${err.message ?? err}`));
         const restored = await restoreLastScene();
         // If nothing can be restored, the engine stays empty — `openProject`
         // wiped it for us. The user picks the opening scene via File →

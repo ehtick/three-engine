@@ -290,6 +290,8 @@ export { DepthPyramid, projectSphere, isOccluded, createBounds } from "./culling
 export { OcclusionSystem } from "./culling/OcclusionSystem.js";
 export { ImpulseSystem } from "./camera/impulse.js";
 export { PoolSystem } from "./pool.js";
+export { AssetRegistry } from "./assets/AssetRegistry.js";
+export { assetCatalog, registerAssetDefs } from "./assets/catalog.js";
 export {
   BLEND_STYLES,
   CameraPose,

@@ -31,6 +31,7 @@ import { PathSystem } from "./spline/PathSystem.js";
 import { ImpulseSystem } from "./camera/impulse.js";
 import { DebugDraw } from "./debugDraw.js";
 import { DecalSystem } from "./vfx/DecalSystem.js";
+import { AssetRegistry } from "./assets/AssetRegistry.js";
 
 /**
  * Runtime core: owns the renderer, the three.js scene (source of truth)
@@ -223,6 +224,10 @@ export class Engine extends EventEmitter {
     // materialises the context once the first SoundComponent attaches or
     // engine.start() fires — browsers require a user gesture otherwise.
     this.audio = new AudioSystem(this);
+
+    // `engine.assets` — script-facing texture/material/geometry/audio/cubemap
+    // access, wrapping the same path-keyed caches components load through.
+    this.assets = new AssetRegistry(this);
 
     // Input: built by default with the Player/UI maps enabled; an editor-
     // provided snapshot (applyInput) replaces it. Attached once the canvas

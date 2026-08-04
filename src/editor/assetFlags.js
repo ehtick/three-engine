@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { invoke } from "./assetOps.js";
 import { readAssetMeta } from "./assetLoader.js";
+import { assetCatalog } from "../engine/assets/catalog.js";
 
 /**
  * Per-asset build flags, stored in the asset's existing `.meta` sidecar under
@@ -28,7 +29,16 @@ export const ASSET_FLAG_DEFAULTS = { preload: false, exclude: false, tags: [] };
  */
 export const useAssetFlagsStore = create((set) => ({
   flags: {}, // path -> { preload, exclude }
-  merge: (entries) => set((state) => ({ flags: { ...state.flags, ...entries } })),
+  merge: (entries) =>
+    set((state) => {
+      // Every flags read/write (a project-wide scan, an Inspector tag edit)
+      // funnels through here — the one place that keeps `engine.assets`'
+      // name/tag catalog in step with `.meta`, without a separate scan pass.
+      for (const [path, flags] of Object.entries(entries)) {
+        assetCatalog.register({ path, tags: flags.tags });
+      }
+      return { flags: { ...state.flags, ...entries } };
+    }),
 }));
 
 export function getAssetFlags(path) {

@@ -71,6 +71,7 @@
     "test:occlusion": "node scripts/run-occlusion-test.mjs",
     "smoke:occlusion": "node scripts/run-occlusion-smoke.mjs",
     "test:pool": "node scripts/run-pool-test.mjs",
+    "test:assets": "node scripts/run-asset-registry-test.mjs",
     "test:spline": "node scripts/run-spline-test.mjs",
     "smoke:spline": "node scripts/run-spline-smoke.mjs",
     "test:applytransform": "node scripts/run-apply-transform-test.mjs",
