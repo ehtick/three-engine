@@ -717,8 +717,21 @@ export class Engine extends EventEmitter {
       // `_lodHidden` and `_occluded` are vetoes, not overrides: a level the
       // author disabled stays hidden even when the camera asks for it, and
       // nothing either system does can make a disabled entity draw.
-      const next =
-        entity[modeFlag] !== false && entity._lodHidden !== true && entity._occluded !== true;
+      const authored = entity[modeFlag] !== false;
+      const next = authored && entity._lodHidden !== true && entity._occluded !== true;
+      // CAMERA-HIDDEN ≠ ABSENT. `_lodHidden`/`_occluded` are VIEW decisions,
+      // so `visible === false` alone cannot tell a world-space consumer
+      // whether the author disabled this entity or the camera merely cannot
+      // see it right now. GI's mesh collect read it as absent, which made the
+      // GI mesh set a function of the CAMERA: every camera move changed the
+      // set, bumped the occupancy geometry revision, forced a composite and
+      // reset the converged-idle counter — the reported "GI re-runs whenever
+      // I move the camera" (120→60 fps). It is also wrong on its own terms:
+      // a prop culled behind the viewer still bounces light onto what is in
+      // front of them, and dropping it opens a hole the cascades trace
+      // through. Marked here because this loop is the only writer of
+      // `visible` and the only place both terms are known.
+      entity.object3D.userData.cameraHidden = authored && !next;
       if (entity.object3D.visible !== next) entity.object3D.visible = next;
     }
     // Ahead of the update callbacks so a shake fired by a script this frame is

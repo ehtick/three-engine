@@ -19,7 +19,7 @@ import * as THREE from "three/webgpu";
 import { float, instanceIndex, positionLocal, texture, uniform } from "three/tsl";
 import { createRadianceCascades } from "./cascadeTrace.js";
 import { createCascadeMerge } from "./cascadeMerge.js";
-import { createBounceFeedback, createIrradianceGather, createProbeIrradiance, createRadianceLookup, gatherBias, gatherViewBias, probeSnapAlpha } from "./cascadeGather.js";
+import { createBounceFeedback, createIrradianceGather, createProbeDepthMoments, createProbeIrradiance, createRadianceLookup, depthMomentsAlpha, gatherBias, gatherViewBias, probeSnapAlpha } from "./cascadeGather.js";
 import { blitBvhAtlasTiles, createGiBvhReflect, createGiBvhTarget, createGiGBuffer, createGiResolve, createGiTargets, renderGiGBuffer } from "./giScreen.js";
 import { resolveMaterialSurface, serializeMeshForBake } from "./voxelizeOnce.js";
 import { createOccupancyDebugMaterial, createSdfDebugMaterial, createGiField } from "./giField.js";
@@ -27,6 +27,7 @@ import { createOccupancyField, describeOccupancyField, quantizeOccupancyRes } fr
 import { fitPrimitive } from "./primitiveFit.js";
 import { describeGrid } from "./instanceGrid.js";
 import { BRICK_AXIS_BY_QUALITY, describeSparseField } from "./sparseField.js";
+import { UI_LAYER } from "../../engine/editorLayers.js";
 import { GICascadeLight, MAX_EMITTERS, giRoughnessBucketOf, registerGILight } from "./giLight.js";
 import { buildBvhScene } from "./bvh/bvhScene.js";
 import {
@@ -57,6 +58,38 @@ const ASSET_LOAD_TIMEOUT_MS = 30_000;
 // (see #retireTargets). Two would do — the third is slack for a frame that is
 // dropped or re-encoded.
 const RETIRED_TARGET_FRAMES = 3;
+/**
+ * Frames a mover's occupancy slot stays DYNAMIC after its last transform
+ * change before demoting back to STATIC (see occupancyField's split note).
+ * Each promotion/demotion costs one full re-voxelize (the snapshot must be
+ * retaken), so this is hysteresis against stop-start animations — ~1.5s at
+ * 60fps. While dynamic-but-still the slot costs nothing (no dirty marks →
+ * passes() doesn't run).
+ */
+const OCC_DYNAMIC_QUIET_FRAMES = 90;
+/**
+ * CONVERGED-IDLE SLEEP (run-gi-perf.mjs, 2026-08-03: the full pipeline at
+ * rest is ~2.3ms GPU at ultra — feedback ~1.4, transport ~0.8 — recomputing
+ * a field that converged long ago). When every FIELD input has been
+ * bit-identical for GI_IDLE_AFTER_FRAMES (no composite, no light/emitter/sky
+ * change — see #fieldInputHash), the per-frame queue drops to the RESOLVE
+ * alone (which is camera-dependent and stays live, ~0.07ms). Any input
+ * change wakes the full queue the SAME tick — zero added latency — and a
+ * 1-in-GI_IDLE_HEARTBEAT_FRAMES full run backstops changes the hash cannot
+ * see (e.g. an animated emissive texture's content). 180 frames ≈ well past
+ * probe-EMA convergence at the default smoothing, so nothing visible moves
+ * at the moment sleep begins. `__giNoIdleSleep = true` disables (A/B).
+ */
+const GI_IDLE_AFTER_FRAMES = 180;
+const GI_IDLE_HEARTBEAT_FRAMES = 30;
+/**
+ * Frames after a build during which the feedback/trace CHECKERBOARDS are
+ * suspended (see #tick). A checker's skipped half keeps whatever its buffer
+ * already holds, and a fresh buffer holds zeros — for a cascade ray that
+ * decodes as "hit at distance 0, radiance black", so half the lattice would
+ * read as solid dark until its parity came round.
+ */
+const CHECKER_WARMUP_FRAMES = 8;
 
 // ── ASYNC COMPUTE PIPELINES — the computes' missing `isReady` ────────────────
 // three creates every compute pipeline with the SYNC device call, and Chrome's
@@ -421,6 +454,7 @@ export class GISystem {
     if (
       key === "intensity" ||
       key === "bounce" ||
+      key === "bleedSaturation" ||
       key === "temporalBlend" ||
       key === "probeSmoothing" ||
       key === "skyColor" ||
@@ -478,6 +512,9 @@ export class GISystem {
       // cannot change without a rebuild. (`killSdf` used to sit beside it —
       // the prop is gone; SDF-free is the only mode.)
       p.backend,
+      // AO compiles the resolve's obscurance block (and its pyramid binding)
+      // in or out — structural for the same reason exactReflections is.
+      p.ao !== false,
     ]);
   }
 
@@ -618,11 +655,14 @@ export class GISystem {
         // A mesh folded into an automatic batch is hidden but still renders (as
         // an instance of a scene-root proxy GI deliberately skips), so its own
         // `visible` flag must not exclude it here — see engine/batching.js.
-        if (child.visible === false && !child.userData.batchedInto) return;
+        // Same camera-independence rule as #collectMeshes: auto-fit bounds
+        // must not breathe as LOD/occlusion hide things off-screen.
+        if (child.visible === false && !child.userData.batchedInto && !child.userData.cameraHidden) return;
         const skip =
           !child.isMesh ||
           child.userData.__giDebug ||
           ((child.layers.mask >>> 0) & 0x80000000) !== 0 || // editor-only helpers
+          child.layers.isEnabled(UI_LAYER) || // HUD quads are not world geometry
           !child.geometry?.attributes?.position;
         if (!skip && meshWorldBox(child, scratch)) union.union(scratch);
         for (const grandchild of child.children) visit(grandchild);
@@ -777,6 +817,10 @@ export class GISystem {
       if (this._lightsRefreshTicks === 0) this.#purgeLightsHashMemo();
     }
 
+    // Re-read LIVE, not captured at build: the prop is not structural (nothing
+    // in a shader depends on it), so toggling it in the inspector must take
+    // effect without a rebuild.
+    state.peakSplit = component.props.peakSplit !== false;
     // Analytic lights AND promoted emissive emitters are per-frame uniforms
     // — moving either re-lights the field this same frame, no bake involved.
     this.#updateLightUniforms();
@@ -805,11 +849,39 @@ export class GISystem {
     // Adaptive-hysteresis snap alpha (cascadeGather.probeSnapAlpha); 0 = the
     // old fixed-alpha EMA.
     probeSnapAlpha.value = globalThis.__giProbeSnap ?? 0.35;
+    // Visibility-integrator blend (depth moments + openness EMA — Phase 2);
+    // 1 = no temporal integration (this frame only), the churn A/B arm.
+    depthMomentsAlpha.value = globalThis.__giDepthAlpha ?? 0.12;
     // Field-side radiance EMA retain weight (GI_FLICKER_PLAN.md Phase 1);
     // default 0.95, user-confirmed live; 0 = off (pre-Phase-1 behaviour).
-    if (state.fieldSmoothing) state.fieldSmoothing.value = globalThis.__giFieldSmoothing ?? 0.95;
-    // Checker parity: which half of the cells this frame's feedback updates.
-    if (state.feedbackParity) state.feedbackParity.value = this._frame % 2;
+    // Squared under the peak split — the feedback runs every other frame there,
+    // so the per-RUN retain has to cover two frames to leave the time constant
+    // (and therefore the light response) where it was. See #peakSplitActive.
+    if (state.fieldSmoothing) {
+      const baseSmoothing = globalThis.__giFieldSmoothing ?? 0.95;
+      state.fieldSmoothing.value = this.#peakSplitActive(state) ? baseSmoothing * baseSmoothing : baseSmoothing;
+    }
+    // Checker parity: which half of the cells this frame's feedback updates,
+    // or -1 for "every cell". Default follows the preset (on at low/medium);
+    // `__giFeedbackChecker` true/false overrides it live — the A/B that
+    // decides whether high/ultra should adopt it too.
+    // WARM-UP: both checkers leave the untouched half holding whatever the
+    // buffer already had, and a freshly built buffer holds ZEROS — which for
+    // a cascade ray reads as "hit at t=0, black", not as "no data". So run
+    // every row for the first few frames after a build, then start
+    // alternating. (Cheap: it is a handful of frames, once per rebuild.)
+    this._framesSinceBuild = (this._framesSinceBuild ?? 0) + 1;
+    const checkersWarm = this._framesSinceBuild > CHECKER_WARMUP_FRAMES;
+    if (state.feedbackParity) {
+      const want = (globalThis.__giFeedbackChecker ?? this._feedbackCheckerDefault) && checkersWarm;
+      state.feedbackParity.value = want ? this._frame % 2 : -1;
+    }
+    // Cascade-trace checkerboard — same mechanism, applied to the other half
+    // of the awake cost. Opt-in (`__giTraceChecker`) until it has an eye-check.
+    if (state.traceParity) {
+      const want = globalThis.__giTraceChecker === true && checkersWarm;
+      state.traceParity.value = want ? this._frame % 2 : -1;
+    }
     this.#refreshEmitterSlots();
     // Slot transforms track live matrices — dragging a mesh updates its
     // uniforms here, which bumps the atlas revision and re-runs the
@@ -895,7 +967,14 @@ export class GISystem {
       ? state.feedbackEveryFrame || this._frame % 2 === 0
       : everyFrame || (this._framesSinceFeedback ?? 1) >= 1;
     this._framesSinceFeedback = runFeedback ? 0 : (this._framesSinceFeedback ?? 0) + 1;
+    // PEAK SPLIT (see the queueFeedbackOnly note in #build): the awake cost is
+    // two independent halves of a ping-pong, so alternate them by FRAME PARITY
+    // — peak per frame becomes the larger half instead of the sum, and the
+    // average halves with it. Off under the legacy-rate hatch, which owns the
+    // cadence for diagnostic purposes.
+    const peakSplit = this.#peakSplitActive(state);
     let rateQueue = runFeedback ? state.queue : state.queueNoFeedback;
+    if (peakSplit) rateQueue = this._frame % 2 === 0 ? state.queueFeedbackOnly : state.queueNoFeedback;
     // STAGE FREEZE (`__giFreeze`) — bisects the GI pipeline when every
     // individual term has been ruled out and the flicker is still there.
     // The pipeline is: feedback (writes the radiance field) → cascade traces →
@@ -909,16 +988,36 @@ export class GISystem {
     // Flicker that survives "all" is not GI compute at all (look at the
     // gbuffer/resolve targets); flicker that dies at "field" is the direct
     // injection; flicker that dies at "transport" is the cascades or the merge.
+    //   "traces"    — feedback + cascade traces only (merges/probes frozen).
+    //   "merges"    — the above + the merges (probe integration frozen).
+    // Those two split the transport bucket, which the 2026-08-03 perf run
+    // showed is the LARGEST part of the awake cost — "transport" as one
+    // number could not say whether to attack rays, merges or probes.
     const freeze = globalThis.__giFreeze;
+    const resolveCompute = state.screen?.resolve?.compute ?? null;
+    const upTo = (mark) =>
+      resolveCompute ? [...state.queue.slice(0, mark), resolveCompute] : state.queue.slice(0, mark);
     if (freeze === "field") rateQueue = state.queueNoFeedback;
-    else if (freeze === "transport") rateQueue = state.screen?.resolve?.compute ? [state.screen.resolve.compute] : [];
+    else if (freeze === "transport") rateQueue = resolveCompute ? [resolveCompute] : [];
+    else if (freeze === "traces" && state.queueMarks) rateQueue = upTo(state.queueMarks.tracesEnd);
+    else if (freeze === "merges" && state.queueMarks) rateQueue = upTo(state.queueMarks.mergesEnd);
     else if (freeze === "all") rateQueue = [];
     // Probe-average computes exist for the gizmos alone — only pay for
     // them while a probe debug view is actually open.
     const debugMode = component.props.debugProbes;
     const debugExtra =
       debugMode === "raw" || debugMode === "merged" ? state.debugComputes : [];
-    const frameQueue = debugExtra.length ? [...rateQueue, ...debugExtra] : rateQueue;
+    let frameQueue = debugExtra.length ? [...rateQueue, ...debugExtra] : rateQueue;
+    // Converged-idle sleep (see GI_IDLE_AFTER_FRAMES): count frames of
+    // bit-identical field input. The composite branch below resets the count
+    // — any geometry/atlas change is by definition not quiet.
+    const inputHash = this.#fieldInputHash();
+    if (inputHash !== this._fieldInputSeen) {
+      this._fieldInputSeen = inputHash;
+      this._fieldQuietFrames = 0;
+    } else {
+      this._fieldQuietFrames = (this._fieldQuietFrames ?? 0) + 1;
+    }
     // WHAT MAKES THE FIELD STALE — three signals, not one.
     //
     // The atlas revision alone was enough only while every scene change also
@@ -954,6 +1053,8 @@ export class GISystem {
       // re-voxelized pyramid (occ revision) invalidates EVERY cell, and so
       // does a first composite or a retry after skipped dispatches — see the
       // dirty-consumption note below.
+      // A composite frame is never quiet — geometry or the atlas moved.
+      this._fieldQuietFrames = 0;
       const wholeVolume =
         this._occGeometrySeen !== occGeometryRevision ||
         !this._compositedOnce ||
@@ -1029,7 +1130,11 @@ export class GISystem {
         // queue: it is recomputed exactly when the pyramid or the volume can
         // have changed, which is the same condition that got us into this
         // branch. Reads the pyramid, so it must follow occPasses.
-        ...(state.visComputes ?? []),
+        // `__giNoVisUpdate` (live) stops DISPATCHING it while keeping the
+        // buffer and every merge that reads it — the cost A/B that says how
+        // much of a moving object's surcharge is this pass. Values go stale,
+        // which is exactly what a throttle would do.
+        ...(globalThis.__giNoVisUpdate === true ? [] : state.visComputes ?? []),
         state.volume.compositeCompute,
         // Fine level AFTER the coarse composite and BEFORE anything traces:
         // the bricks are the same min-over-candidates function at a sixth of
@@ -1060,6 +1165,24 @@ export class GISystem {
     } else {
       // Cascades re-trace + re-merge EVERY frame — 1-frame response to any
       // field change, no temporal accumulation to converge.
+      // IDLE SLEEP: with the field input quiet past the threshold, only the
+      // camera-dependent resolve runs (plus any open debug view — its
+      // computes read the frozen field, still correct). The heartbeat frame
+      // runs the full queue. Not while a freeze bisect or the legacy-rate
+      // hatch is active — those own the queue for diagnostic purposes.
+      const idle =
+        !freeze && !legacyRate &&
+        globalThis.__giNoIdleSleep !== true &&
+        // The opt-in stochastic dither needs per-frame integration — a
+        // frozen field would hold one noise sample as a permanent pattern.
+        !(state.shadowJitter?.angle?.value > 0) &&
+        (this._fieldQuietFrames ?? 0) > GI_IDLE_AFTER_FRAMES &&
+        this._frame % GI_IDLE_HEARTBEAT_FRAMES !== 0;
+      if (idle) {
+        frameQueue = state.screen?.resolve?.compute
+          ? [state.screen.resolve.compute, ...debugExtra]
+          : debugExtra;
+      }
       // Guard the empty case: `__giFreeze = "all"` produces no computes, and
       // three's renderer.compute([]) throws "expects a ComputeNode".
       if (frameQueue.length) giCompute(renderer, frameQueue);
@@ -1470,7 +1593,7 @@ export class GISystem {
    * rebuild, its shader stays in the pipeline cache, and a quality change or
    * an auto-fit refit no longer triggers a material recompile wave.
    */
-  #buildScreenResolve({ gather, light, emitterSlots, radianceLookup = null, lightSlots = null }) {
+  #buildScreenResolve({ gather, light, emitterSlots, radianceLookup = null, lightSlots = null, ao = null }) {
     const renderer = this.engine.renderer;
     if (!renderer?.backend?.device) return null;
     const { width, height } = this.#screenResolveSize();
@@ -1492,7 +1615,7 @@ export class GISystem {
             shadowRange: light.shadowRange,
           }
         : null;
-      const inputs = { gather, normalOffset: light.normalOffset, intensity: light.intensityUniform, emitter };
+      const inputs = { gather, normalOffset: light.normalOffset, intensity: light.intensityUniform, emitter, ao };
       const radiance = radianceLookup
         ? {
             lookup: radianceLookup,
@@ -1584,6 +1707,7 @@ export class GISystem {
     }
     const index = state.queue.indexOf(screen.resolve.compute);
     const indexNoFeedback = state.queueNoFeedback.indexOf(screen.resolve.compute);
+    const indexFeedbackOnly = state.queueFeedbackOnly?.indexOf(screen.resolve.compute) ?? -1;
     screen.resolve = createGiResolve({
       gbuffer: screen.gbuffer,
       targets: screen.targets,
@@ -1595,9 +1719,11 @@ export class GISystem {
       emitter: screen.emitter,
       radiance: screen.radiance,
       bvhShade: screen.bvhShade,
+      ao: screen.ao,
     });
     if (index >= 0) state.queue[index] = screen.resolve.compute;
     if (indexNoFeedback >= 0) state.queueNoFeedback[indexNoFeedback] = screen.resolve.compute;
+    if (indexFeedbackOnly >= 0) state.queueFeedbackOnly[indexFeedbackOnly] = screen.resolve.compute;
     this.#retireTargets(previousTargets);
     // Same follow-up for the BVH reflect compute (GI Phase 3 v1) — it is NOT
     // part of state.queue/queueNoFeedback (see #tick's dispatch comment), so
@@ -1872,6 +1998,9 @@ export class GISystem {
 
   #rebuild() {
     this.#dispose();
+    // Re-arm the checker warm-up: the cascade/radiance buffers below are
+    // brand new and zero-filled (see CHECKER_WARMUP_FRAMES).
+    this._framesSinceBuild = 0;
     const component = this.component;
     const engine = this.engine;
     if (!component || !engine.scene) return;
@@ -1976,8 +2105,16 @@ export class GISystem {
     // cheap), the pass runs EVERY frame on alternating halves of the cells
     // (index parity × this flipping uniform). Same average cost, and the
     // field as a whole now moves every frame.
-    const feedbackChecker = !(quality === "high" || quality === "ultra");
-    const feedbackParity = feedbackChecker ? uniform(0) : null;
+    //
+    // The uniform is now built at EVERY tier and the on/off decision is made
+    // per tick (#tick writes -1 to disable), for two reasons: the feedback is
+    // the single largest term in the awake pipeline at high/ultra, so this is
+    // the cheapest peak-frame-cost lever there is; and a build-time switch
+    // cannot be A/B'd inside one measurement run, which is the only kind of
+    // A/B this module trusts. One `parity >= 0` compare per thread is the
+    // whole cost of making it live.
+    this._feedbackCheckerDefault = !(quality === "high" || quality === "ultra");
+    const feedbackParity = uniform(-1);
 
     // The authored representation: one atlas TILE per unique baked geometry,
     // one INSTANCE SLOT per world placement. Sizing them apart is the point —
@@ -2086,6 +2223,10 @@ export class GISystem {
     // Entries + slot assignment + emitter promotion + SDF load-or-bake.
     const entries = this.#buildEntries(meshes);
 
+    // Cascade-trace checkerboard parity (see cascadeTrace's note). -1 = off;
+    // #tick writes the frame parity when enabled. Built at every tier so the
+    // switch is live — one compare per thread when it is off.
+    const traceParity = uniform(-1);
     const { cascades, intervals } = createRadianceCascades({
       world: volume.world,
       cascadeCount: Math.min(6, Math.max(2, props.cascadeCount || 5)),
@@ -2094,6 +2235,7 @@ export class GISystem {
       t0: probeSpacing,
       farT: Math.max(sizeX, sizeY, sizeZ) * 2,
       sceneTrace: volume.createSceneTrace(),
+      traceParity,
     });
     // Sky light: the radiance a cascade ray brings back when it escapes the
     // volume without hitting anything. A uniform, not a constant, so colour
@@ -2118,6 +2260,10 @@ export class GISystem {
       occupancy: volume.occupancyField ?? null,
       smoothing: probeSmoothing,
     });
+    // Per-probe depth moments (Phase 2 — chebyshev gather visibility, see
+    // createProbeDepthMoments). Binding-neutral in the gather kernels: they
+    // read this buffer INSTEAD of c0.rays.
+    const probeDepth = createProbeDepthMoments(cascades);
     // This gather instance feeds ONLY the deferred resolve compute (materials
     // read its result from a texture now), so it can be a real WGSL function
     // — see createShadowTrace's note on why that is unsafe for shared ones.
@@ -2127,6 +2273,7 @@ export class GISystem {
       // (a uniform, so an in-place refit rescales it) and its point test, for
       // the buried-probe cut.
       volume.occupancyField ?? null,
+      probeDepth.buffer,
     );
     // Volume diagonal as a uniform: shadow/mirror reach rescales with an
     // in-place refit (all world-scale shader inputs must be uniforms — a
@@ -2136,6 +2283,9 @@ export class GISystem {
     // FIRST (reads last frame's merged field) so this frame's trace sees
     // bounced energy — this is what makes emissive-only scenes bleed.
     const bounceGain = uniform(Math.min(1, Math.max(0, props.bounce ?? 1)));
+    // Chroma of the bounced light (1 = physical, see createBounceFeedback's
+    // bleedSaturation note) — live look control, Blender-parity calibration.
+    const bleedSaturation = uniform(Math.min(1, Math.max(0, props.bleedSaturation ?? 1)));
     // Per-frame lerp pulling the base field toward the latest composite —
     // spreads occupancy/lighting swaps over ~10 frames instead of popping.
     const temporalBlend = uniform(Math.min(1, Math.max(0.02, props.temporalBlend ?? 0.25)));
@@ -2194,7 +2344,9 @@ export class GISystem {
     const feedbackCompute = createBounceFeedback(cascades, volume, bounceGain, temporalBlend, {
       lightSlots,
       emitterSlots,
+      bleedSaturation,
       probeIrradiance: probeIrradiance.buffer,
+      depthMoments: probeDepth.buffer,
       fieldSmoothing,
       // Private to the feedback compute (see createShadowTrace's layout note).
       // STABLE mode — the moving-light flicker fix (see createShadowTrace's
@@ -2238,15 +2390,50 @@ export class GISystem {
 
     const queue = [feedbackCompute];
     for (const cascade of cascades) queue.push(cascade.traceCompute);
+    // Stage boundaries, for the `__giFreeze` bisect's finer cuts ("traces",
+    // "merges"). The awake pipeline's cost is dominated by this transport
+    // half, and "transport" as one bucket was too coarse to optimize against.
+    const queueMarks = { tracesEnd: queue.length };
     queue.push(...mergeComputes);
+    queueMarks.mergesEnd = queue.length;
     // Integrate probe irradiance AFTER the merge so receivers read
     // this frame's field.
     queue.push(probeIrradiance.compute);
+    // Depth moments read the RAW c0 rays (written by the trace above) — any
+    // position after the traces works; beside the probe integral for clarity.
+    queue.push(probeDepth.compute);
     // The feedback pass now runs EVERY frame at every preset — low/medium get
     // their cost halving from the checker (half the cells per frame, see
     // feedbackChecker above) instead of from skipping frames. queueNoFeedback
     // survives for the legacy-rate hatch and the __giFreeze bisect.
     const queueNoFeedback = queue.slice(1);
+    // PEAK SPLIT — the awake pipeline as two alternating halves.
+    //
+    // Measured on the user's Sponza at ultra (2026-08-04, run-gi-perf.mjs):
+    // waking the field costs 6.3ms of GPU compute per frame, of which the
+    // feedback pass is 3.86 and the cascade traces+merges+probes are 2.44.
+    // Both run EVERY frame while a light moves, and 6.3ms + the rest of the
+    // frame crosses a 120Hz budget — at which point the compositor halves the
+    // presented rate in one step. That cliff is the user's "FPS drops 2x".
+    //
+    // The two halves are a PING-PONG: feedback reads the merged cascades and
+    // writes the radiance field; the traces read the radiance field and write
+    // the cascades. Neither reads its own output within a frame, so running
+    // one per frame converges to the same fixed point at half the rate —
+    // it does not change WHAT the pipeline computes, only how often each half
+    // re-runs. Peak per frame becomes max(3.86, 2.44) instead of their sum,
+    // and the average halves too.
+    //
+    // The cadence is STRICTLY frame parity, deliberately: an irregular
+    // feedback rate pulses the lighting (see the feedback-rate note in #tick,
+    // which is a bug this module already shipped once). Even frames feed back,
+    // odd frames transport, whatever else the frame is doing.
+    //
+    // The temporal cost is paid back on the field EMA: running the feedback
+    // half as often would double its time constant, so `fieldSmoothing` is
+    // squared when the split is on (retain r per run over 2 frames == r² per
+    // run at half rate). Light response is then unchanged to first order.
+    const queueFeedbackOnly = [feedbackCompute];
     const feedbackEveryFrame = true;
     // Per-probe averages feed ONLY the debug gizmos — appended to the frame
     // queue while a probe debug view is open, skipped otherwise.
@@ -2311,14 +2498,29 @@ export class GISystem {
       light.shadowRange = diagU.clamp(12, 64);
       light.emitterSlots = emitterSlots;
     }
+    // Indirect-light ambient occlusion (giScreen's obscurance ladder). The
+    // uniforms are live (aoStrength/aoRadius edit without a rebuild); the
+    // `ao` prop itself is structural — off compiles the block out entirely.
+    const ao =
+      props.ao !== false && volume.occupancyField
+        ? {
+            occupancy: volume.occupancyField,
+            strength: uniform(Math.min(1, Math.max(0, props.aoStrength ?? 0.6))),
+            radius: uniform(Math.min(3, Math.max(0.1, props.aoRadius ?? 0.6))),
+          }
+        : null;
     // DEFERRED RESOLVE: evaluate the gather + emitter shadows once per screen
     // pixel instead of inside every material (see giScreen.js). This is what
     // keeps material shaders small — the driver compile of a 200kB+ GI
     // fragment shader, once per material, was the whole startup cost.
-    const screen = this.#buildScreenResolve({ gather, light, emitterSlots, radianceLookup: deferredRadianceLookup });
+    const screen = this.#buildScreenResolve({ gather, light, emitterSlots, radianceLookup: deferredRadianceLookup, ao });
     if (screen) {
       queue.push(screen.resolve.compute);
       queueNoFeedback.push(screen.resolve.compute);
+      // The resolve is camera-dependent, so it runs on BOTH halves of the
+      // split — it is 0.1ms and skipping it would stall GI against camera
+      // motion, which is the one thing measurement says is currently free.
+      queueFeedbackOnly.push(screen.resolve.compute);
     }
     // Purge three's lights-hash memo — without this the FIRST build of a
     // session renders with the GI light silently inert (see #purgeLightsHashMemo).
@@ -2345,6 +2547,13 @@ export class GISystem {
       diagU,
       queue,
       queueNoFeedback,
+      queueFeedbackOnly,
+      // Authored default ON: it is a straight 2x cut of the awake cost whose
+      // only cost is halving each half's update rate, and the field EMA is
+      // rate-compensated for exactly that. `peakSplit: false` (prop) or
+      // `__giPeakSplit = false` (live) restores every-frame dispatch.
+      peakSplit: props.peakSplit !== false,
+      queueMarks,
       visComputes,
       debugComputes,
       feedbackEveryFrame,
@@ -2366,12 +2575,14 @@ export class GISystem {
       probeSpacing,
       c0Grid,
       bounceGain,
+      bleedSaturation,
       temporalBlend,
       probeSmoothing,
       fieldSmoothing,
       fieldShadowOff,
       shadowJitter,
       feedbackParity,
+      traceParity,
       skyRadiance,
       autoFit,
       lightSlots,
@@ -2408,7 +2619,12 @@ export class GISystem {
       `[gi] built (voxel-free): ${sizeX.toFixed(1)}x${sizeY.toFixed(1)}x${sizeZ.toFixed(1)}m` +
         `${autoFit ? ` (auto-fit ${props.quality ?? "high"}, voxel ${voxelSize.toFixed(2)}, probes ${probeSpacing.toFixed(2)})` : ""}, ` +
         `${res.x}x${res.y}x${res.z} cells, c0 ${c0Grid.x}x${c0Grid.y}x${c0Grid.z}, ` +
-        `${cascades.length} cascades, ${meshes.length} meshes / ${entries.length} placements → ` +
+        // Branch factor is BUILD-TIME (cascadeTrace's BRANCH). Printed because
+        // "I set the global and nothing changed" is indistinguishable from
+        // "the setting does nothing" without it — and that ambiguity cost a
+        // round trip.
+        `${cascades.length} cascades (branch ${Number(globalThis.__giCascadeBranch ?? 2) || 2}), ` +
+        `${meshes.length} meshes / ${entries.length} placements → ` +
         `${atlas.capacity} instance slots over ${atlas.tileCapacity} tiles ` +
         `(${resident} resident, ${entries.length - resident} pending, ` +
         `${tilesUsed} unique tile${tilesUsed === 1 ? "" : "s"}), ` +
@@ -2537,6 +2753,79 @@ export class GISystem {
    * The light LIST is refreshed at fingerprint cadence; positions/colors
    * are read live off the cached objects here.
    */
+  /**
+   * Order-sensitive numeric digest of every FIELD input that can change
+   * without a composite: analytic light slots, emitter slots, sky radiance,
+   * and the live field knobs. Bit-identical hash across frames ⇒ the
+   * feedback/trace/merge/probe passes would recompute exactly what they
+   * already hold ⇒ safe to idle (see GI_IDLE_AFTER_FRAMES). Runs AFTER
+   * #updateLightUniforms/#refreshEmitterSlots each tick, so it digests what
+   * the GPU is actually about to read. Cheap: ~100 muls on plain numbers.
+   */
+  /**
+   * Is the awake pipeline running as two alternating halves this frame?
+   * Read in two places that must agree — the queue choice and the field EMA's
+   * rate compensation — so it lives here rather than being derived twice.
+   * `__giPeakSplit` is the live A/B hatch; `state.peakSplit` is the authored
+   * prop. Never while the legacy-rate hatch owns the cadence.
+   */
+  #peakSplitActive(state) {
+    if (globalThis.__giLegacyFeedbackRate === true) return false;
+    if (!state?.queueFeedbackOnly) return false;
+    // `__giNoPeakSplit` (set-to-true) exists alongside `__giPeakSplit` because
+    // the harnesses' `HATCH=` mechanism can only set flags TRUE, and the
+    // control arm of every A/B needs to turn this OFF.
+    if (globalThis.__giNoPeakSplit === true) return false;
+    return (globalThis.__giPeakSplit ?? state.peakSplit) === true;
+  }
+
+  #fieldInputHash() {
+    const state = this.state;
+    if (!state) return 0;
+    let h = 0;
+    let k = 1;
+    const mix = (v) => {
+      // Golden-ratio spread keeps permuted values from cancelling.
+      k = (k * 1.6180339887) % 1024;
+      h += v * (k + 1);
+    };
+    for (const slot of state.lightSlots ?? []) {
+      mix(slot.active.value);
+      if (slot.active.value < 0.5) continue;
+      mix(slot.kind.value);
+      const v = slot.vector.value;
+      mix(v.x); mix(v.y); mix(v.z);
+      const c = slot.color.value;
+      mix(c.r); mix(c.g); mix(c.b);
+      mix(slot.range.value);
+    }
+    for (const slot of state.emitterSlots ?? []) {
+      mix(slot.radius.value);
+      if (slot.radius.value <= 0.001) continue;
+      const p = slot.center.value;
+      mix(p.x); mix(p.y); mix(p.z);
+      const c = slot.color.value;
+      mix(c.r); mix(c.g); mix(c.b);
+      mix(slot.kind.value);
+      const half = slot.half.value;
+      mix(half.x); mix(half.y); mix(half.z);
+    }
+    const sky = state.skyRadiance?.value;
+    if (sky) { mix(sky.r); mix(sky.g); mix(sky.b); }
+    mix(state.bounceGain?.value ?? 0);
+    mix(state.temporalBlend?.value ?? 0);
+    mix(state.probeSmoothing?.value ?? 0);
+    mix(state.fieldSmoothing?.value ?? 0);
+    mix(state.fieldShadowOff?.value ?? 0);
+    mix(state.shadowJitter?.penAngle?.value ?? 0);
+    mix(state.shadowJitter?.angle?.value ?? 0);
+    mix(gatherBias.value);
+    mix(gatherViewBias.value);
+    mix(probeSnapAlpha.value);
+    mix(depthMomentsAlpha.value);
+    return h;
+  }
+
   #updateLightUniforms() {
     const state = this.state;
     if (!state?.lightSlots) return;
@@ -2668,6 +2957,9 @@ export class GISystem {
     // carry values up to 4 from the earlier schema. Artistic exaggeration
     // belongs to `intensity`, which sits OUTSIDE the loop.
     state.bounceGain.value = Math.min(1, Math.max(0, this.component?.props.bounce ?? 1));
+    if (state.bleedSaturation) {
+      state.bleedSaturation.value = Math.min(1, Math.max(0, this.component?.props.bleedSaturation ?? 1));
+    }
     state.temporalBlend.value = Math.min(1, Math.max(0.02, this.component?.props.temporalBlend ?? 0.25));
     state.probeSmoothing.value = clampProbeSmoothing(this.component?.props.probeSmoothing);
     // Sky radiance = colour x intensity, in the same linear units as an
@@ -2678,6 +2970,13 @@ export class GISystem {
       const props = this.component?.props;
       const intensity = Math.max(0, props?.skyIntensity ?? 0);
       state.skyRadiance.value.set(props?.skyColor ?? "#ffffff").multiplyScalar(intensity);
+    }
+    // Indirect-AO knobs (giScreen's obscurance ladder) — live uniforms; the
+    // resolve runs every frame (even in idle sleep), so edits land next frame.
+    if (state.screen?.ao) {
+      const props = this.component?.props;
+      state.screen.ao.strength.value = Math.min(1, Math.max(0, props?.aoStrength ?? 0.6));
+      state.screen.ao.radius.value = Math.min(3, Math.max(0.1, props?.aoRadius ?? 0.6));
     }
   }
 
@@ -3187,7 +3486,10 @@ export class GISystem {
     const tally = [0, 0, 0, 0];
     const visit = (object) => {
       // Batched members are hidden yet still drawn (engine/batching.js).
-      if (object.visible === false && !object.userData.batchedInto) return;
+      // `cameraHidden` = hidden by LOD/occlusion only (see Engine's visibility
+      // resolve): the mesh is still part of the world, so it must stay in the
+      // field or the GI mesh set becomes a function of the camera.
+      if (object.visible === false && !object.userData.batchedInto && !object.userData.cameraHidden) return;
       // InstancedMesh IS collected now — it contributes one atlas instance
       // slot per live instance, all sharing a single baked tile (see
       // #buildEntries). It used to be skipped outright, which meant every
@@ -3199,8 +3501,13 @@ export class GISystem {
         const material = Array.isArray(object.material) ? object.material[0] : object.material;
         const triCount = (object.geometry?.index?.count ?? position?.count ?? 0) / 3;
         // Editor-only helpers live on layer 31 (mask compared unsigned —
-        // 1<<31 is negative in JS int32).
-        const editorOnly = ((object.layers.mask >>> 0) & 0x80000000) !== 0 && (object.layers.mask >>> 0) === 0x80000000;
+        // 1<<31 is negative in JS int32). UI quads are excluded for the same
+        // reason: they are screen furniture, and a screen-space one sits at
+        // the world origin at pixel scale, so voxelizing it would blow the
+        // field's bounds out to hundreds of metres of empty air.
+        const editorOnly =
+          (((object.layers.mask >>> 0) & 0x80000000) !== 0 && (object.layers.mask >>> 0) === 0x80000000) ||
+          object.layers.isEnabled(UI_LAYER);
         // EVERY lit material must be visible to three's NodeMaterialObserver
         // as "node-driven" — see #markObservedMaterial. GI light receivers
         // include meshes the FIELD skips (transparent etc.), so mark all.
@@ -3766,7 +4073,24 @@ export class GISystem {
         changed = !p.matrix.equals(scratch);
         if (changed) p.matrix.copy(scratch);
       }
-      if (changed) field.setSlotMatrix(p.slot, p.matrix);
+      if (changed) {
+        // Static/dynamic split (occupancyField.staticBits): flag the mover
+        // DYNAMIC *before* the matrix write — the flag flip re-snapshots the
+        // static side once, and every further frame of this motion replays
+        // that snapshot + re-voxelizes only this slot (the measured
+        // +3.3/+5.2ms-per-frame full-scene pass gone). Demotion below has a
+        // quiet-period hysteresis so a stop-start animation doesn't thrash
+        // full re-voxelizes.
+        field.setSlotDynamic?.(p.slot, true);
+        field.setSlotMatrix(p.slot, p.matrix);
+        p._lastMovedFrame = this._frame;
+      } else if (
+        p._lastMovedFrame != null &&
+        this._frame - p._lastMovedFrame > OCC_DYNAMIC_QUIET_FRAMES
+      ) {
+        field.setSlotDynamic?.(p.slot, false);
+        p._lastMovedFrame = null;
+      }
     }
   }
 

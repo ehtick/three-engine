@@ -216,6 +216,15 @@ export class SceneManager {
       });
       if (!alive()) return null;
 
+      // Entity construction is synchronous, but model parsing and script
+      // modules continue asynchronously after their components attach. Do not
+      // publish scene-loaded (or let the player start physics) until every
+      // component that exposes readiness has settled. Otherwise dynamic
+      // bodies can fall while a large model is still being parsed and the
+      // first visible frame is not the authored scene.
+      await this.#waitForEntityReadiness(alive);
+      if (!alive()) return null;
+
       const record = { path, name: engine.sceneName, mode, rootIds };
       if (mode === "single") this.loaded = [record];
       else this.loaded.push(record);
@@ -238,6 +247,16 @@ export class SceneManager {
     } finally {
       if (this._token === token) this.pending = null;
     }
+  }
+
+  async #waitForEntityReadiness(alive) {
+    const pending = [];
+    for (const entity of this.engine.entities.values()) {
+      for (const component of entity.components.values()) {
+        if (typeof component.whenReady === "function") pending.push(component.whenReady());
+      }
+    }
+    await Promise.allSettled(pending);
   }
 
   /**

@@ -1,0 +1,1935 @@
+diff --git a/src/engine/Engine.js b/src/engine/Engine.js
+index fe75102..390b760 100644
+--- a/src/engine/Engine.js
++++ b/src/engine/Engine.js
+@@ -717,8 +717,21 @@ export class Engine extends EventEmitter {
+       // `_lodHidden` and `_occluded` are vetoes, not overrides: a level the
+       // author disabled stays hidden even when the camera asks for it, and
+       // nothing either system does can make a disabled entity draw.
+-      const next =
+-        entity[modeFlag] !== false && entity._lodHidden !== true && entity._occluded !== true;
++      const authored = entity[modeFlag] !== false;
++      const next = authored && entity._lodHidden !== true && entity._occluded !== true;
++      // CAMERA-HIDDEN ≠ ABSENT. `_lodHidden`/`_occluded` are VIEW decisions,
++      // so `visible === false` alone cannot tell a world-space consumer
++      // whether the author disabled this entity or the camera merely cannot
++      // see it right now. GI's mesh collect read it as absent, which made the
++      // GI mesh set a function of the CAMERA: every camera move changed the
++      // set, bumped the occupancy geometry revision, forced a composite and
++      // reset the converged-idle counter — the reported "GI re-runs whenever
++      // I move the camera" (120→60 fps). It is also wrong on its own terms:
++      // a prop culled behind the viewer still bounces light onto what is in
++      // front of them, and dropping it opens a hole the cascades trace
++      // through. Marked here because this loop is the only writer of
++      // `visible` and the only place both terms are known.
++      entity.object3D.userData.cameraHidden = authored && !next;
+       if (entity.object3D.visible !== next) entity.object3D.visible = next;
+     }
+     // Ahead of the update callbacks so a shake fired by a script this frame is
+diff --git a/src/engine/components/LightComponent.js b/src/engine/components/LightComponent.js
+index 2f36a09..a17d47f 100644
+--- a/src/engine/components/LightComponent.js
++++ b/src/engine/components/LightComponent.js
+@@ -24,6 +24,9 @@ const _shadowUp = new THREE.Vector3();
+ const _worldUp = new THREE.Vector3(0, 1, 0);
+ 
+ export class LightComponent extends Component {
++  /** Runtime CSMShadowNode — distinct from the authored boolean `props.csm`. */
++  #csm = null;
++
+   static type = "light";
+   static label = "Light";
+   static defaults = {
+@@ -34,6 +37,12 @@ export class LightComponent extends Component {
+     angle: 45, // spot cone angle, degrees
+     decay: 2, // physical light decay (point/spot). 0 = classic inverse-square-free.
+     penumbra: 0, // spot: 0..1 softness at the cone edge
++    // Blender's sun "Angle": the source's angular DIAMETER in degrees.
++    // Widens the emission cone so the GI field's BOUNCE shadows soften with
++    // distance like a real sun. 0.53° is the physical sun; Blender-parity
++    // default. (Direct shadows come from the shadow map — see the note in
++    // GISystem on why GI-traced direct shadows were removed.)
++    sourceAngle: 0.53,
+     castShadow: false,
+     // Shadow-map settings (per-light). Mirrors three.js Light.shadow.* fields.
+     shadowMapType: "PCFSoftShadowMap",
+@@ -70,19 +79,20 @@ export class LightComponent extends Component {
+     { key: "decay", label: "Decay", type: "number", min: 0, max: 5, step: 0.1, showIf: (p) => p.kind === "point" || p.kind === "spot" },
+     { key: "angle", label: "Angle°", type: "number", min: 1, max: 90, step: 1, showIf: (p) => p.kind === "spot" },
+     { key: "penumbra", label: "Penumbra", type: "number", min: 0, max: 1, step: 0.05, showIf: (p) => p.kind === "spot" },
++    { key: "sourceAngle", label: "Source Angle°", type: "number", min: 0, max: 90, step: 0.1, showIf: (p) => p.kind === "directional" },
+     { key: "castShadow", label: "Cast Shadow", type: "boolean", showIf: (p) => p.kind !== "ambient" },
+     // Shadow-map controls. Master switch (castShadow) gates the rest via showIf
+     // so the inspector stays tidy when shadows are off.
+     { key: "shadowMapType", label: "Map Type", type: "select", options: SHADOW_TYPE_OPTIONS, showIf: (p) => p.kind !== "ambient" && p.castShadow, section: "Shadow" },
+-    { key: "shadowMapWidth", label: "Map Width", type: "number", min: 16, step: 256, showIf: (p) => p.kind !== "ambient" && p.castShadow, section: "Shadow" },
+-    { key: "shadowMapHeight", label: "Map Height", type: "number", min: 16, step: 256, showIf: (p) => p.kind !== "ambient" && p.castShadow, section: "Shadow" },
+-    { key: "shadowBias", label: "Bias", type: "number", step: 0.0005, showIf: (p) => p.kind !== "ambient" && p.castShadow, section: "Shadow" },
+-    { key: "shadowNormalBias", label: "Normal Bias", type: "number", step: 0.005, showIf: (p) => p.kind !== "ambient" && p.castShadow, section: "Shadow" },
++    { key: "shadowMapWidth", label: "Map Width", type: "number", min: 16, step: 256, showIf: (p) => (p.kind !== "ambient" && p.castShadow), section: "Shadow" },
++    { key: "shadowMapHeight", label: "Map Height", type: "number", min: 16, step: 256, showIf: (p) => (p.kind !== "ambient" && p.castShadow), section: "Shadow" },
++    { key: "shadowBias", label: "Bias", type: "number", step: 0.0005, showIf: (p) => (p.kind !== "ambient" && p.castShadow), section: "Shadow" },
++    { key: "shadowNormalBias", label: "Normal Bias", type: "number", step: 0.005, showIf: (p) => (p.kind !== "ambient" && p.castShadow), section: "Shadow" },
+     { key: "shadowRadius", label: "Radius / Light Size", type: "number", min: 0, step: 0.25, showIf: (p) => p.kind !== "ambient" && p.castShadow, section: "Shadow" },
+-    { key: "shadowCamNear", label: "Cam Near", type: "number", min: 0, step: 0.1, showIf: (p) => (p.kind === "directional" || p.kind === "spot" || p.kind === "point") && p.castShadow, section: "Shadow" },
+-    { key: "shadowCamFar", label: "Cam Far", type: "number", min: 0, step: 1, showIf: (p) => (p.kind === "directional" || p.kind === "spot" || p.kind === "point") && p.castShadow, section: "Shadow" },
+-    { key: "shadowCamSize", label: "Frustum Size", type: "number", min: 0.1, step: 1, showIf: (p) => (p.kind === "directional" || p.kind === "spot") && p.castShadow && !p.csm, section: "Shadow" },
+-    { key: "shadowCamFov", label: "Face FOV°", type: "number", min: 1, max: 179, step: 1, showIf: (p) => p.kind === "point" && p.castShadow, section: "Shadow" },
++    { key: "shadowCamNear", label: "Cam Near", type: "number", min: 0, step: 0.1, showIf: (p) => ((p.kind === "directional" || p.kind === "spot" || p.kind === "point") && p.castShadow), section: "Shadow" },
++    { key: "shadowCamFar", label: "Cam Far", type: "number", min: 0, step: 1, showIf: (p) => ((p.kind === "directional" || p.kind === "spot" || p.kind === "point") && p.castShadow), section: "Shadow" },
++    { key: "shadowCamSize", label: "Frustum Size", type: "number", min: 0.1, step: 1, showIf: (p) => ((p.kind === "directional" || p.kind === "spot") && p.castShadow && !p.csm), section: "Shadow" },
++    { key: "shadowCamFov", label: "Face FOV°", type: "number", min: 1, max: 179, step: 1, showIf: (p) => (p.kind === "point" && p.castShadow), section: "Shadow" },
+     { key: "csm", label: "Cascaded Shadows", type: "boolean", showIf: (p) => p.kind === "directional" && p.castShadow, section: "Shadow" },
+     { key: "csmCascades", label: "Cascades", type: "number", min: 2, max: 4, step: 1, showIf: (p) => p.kind === "directional" && p.castShadow && p.csm, section: "CSM" },
+     { key: "csmMaxFar", label: "CSM Max Far", type: "number", min: 1, step: 10, showIf: (p) => p.kind === "directional" && p.castShadow && p.csm, section: "CSM" },
+@@ -96,6 +106,19 @@ export class LightComponent extends Component {
+     this.#buildLight();
+   }
+ 
++  /**
++   * Per-light hints the GI module reads every frame (#updateLightUniforms):
++   * angular radius for directional (sourceAngle is a Blender-style DIAMETER
++   * in degrees) and world source radius for point (the Shadow "Radius /
++   * Light Size" prop). These size the field's soft bounce shadows only.
++   */
++  #stampGiHints() {
++    if (!this.light) return;
++    this.light.userData.giSourceAngle =
++      THREE.MathUtils.degToRad(Math.max(0, this.props.sourceAngle ?? 0.53)) / 2;
++    this.light.userData.giSourceRadius = Math.max(0.01, this.props.shadowRadius ?? 0.05);
++  }
++
+   onDetach() {
+     this.unsubPreRender?.();
+     this.unsubPreRender = null;
+@@ -137,9 +160,15 @@ export class LightComponent extends Component {
+       this.#buildLight();
+       return;
+     }
++    if (key === "sourceAngle" || key === "shadowRadius") {
++      // GI source size — read per frame by the GI module (see #stampGiHints);
++      // no rebuild, softness changes land next frame.
++      this.#stampGiHints();
++      if (key === "sourceAngle") return;
++    }
+     if (key === "csmMode" || key === "csmMaxFar" || key === "csmSplitLambda") {
+-      if (this.csm) {
+-        this.csm.maxFar = Math.max(1, this.props.csmMaxFar);
++      if (this.#csm) {
++        this.#csm.maxFar = Math.max(1, this.props.csmMaxFar);
+         this.#configureCSMSplits();
+       }
+       this.#syncCSMShadowDepth();
+@@ -147,7 +176,7 @@ export class LightComponent extends Component {
+       return;
+     }
+     if (key === "csmLightMargin") {
+-      if (this.csm) this.csm.lightMargin = Math.max(0, this.props.csmLightMargin);
++      if (this.#csm) this.#csm.lightMargin = Math.max(0, this.props.csmLightMargin);
+       this.#syncCSMShadowDepth();
+       this.#updateCSMFrustums(true);
+       return;
+@@ -210,6 +239,7 @@ export class LightComponent extends Component {
+         break;
+     }
+     this.light.userData.entityId = this.entity.id;
++    this.#stampGiHints();
+     if (this.light.shadow) {
+       this.#configureShadow({
+         shadowMapWidth,
+@@ -236,7 +266,7 @@ export class LightComponent extends Component {
+     if (this.light.isDirectionalLight) {
+       this.unsubPreRender = this.entity.engine.onPreRender(() => {
+         this.#syncDirectionalTransform();
+-        if (!this.csm && this.#isCSMUsable()) this.#syncCSM();
++        if (!this.#csm && this.#isCSMUsable()) this.#syncCSM();
+         this.#updateCSMFrustums();
+       });
+       this.unsubRendererRebuilt = this.entity.engine.on("renderer-rebuilt", () => {
+@@ -344,7 +374,7 @@ export class LightComponent extends Component {
+       : this.props.shadowCamFar;
+     const shadows = [
+       this.light.shadow,
+-      ...(this.csm?.lights?.map((cascadeLight) => cascadeLight.shadow) ?? []),
++      ...(this.#csm?.lights?.map((cascadeLight) => cascadeLight.shadow) ?? []),
+     ];
+     for (const shadow of shadows) {
+       if (shadow.camera.far === far) continue;
+@@ -367,7 +397,7 @@ export class LightComponent extends Component {
+     // its covered volume, so cloning the normal 100-unit camera here would
+     // clip every caster with the default 200-unit margin and yield blank maps.
+     this.#syncCSMShadowDepth();
+-    if (!this.csm) {
++    if (!this.#csm) {
+       if (
+         this.props.shadowMapType === "PCFShadowMap" ||
+         this.props.shadowMapType === "PCFSoftShadowMap"
+@@ -377,16 +407,16 @@ export class LightComponent extends Component {
+         // after its ShadowNode has compiled would leave the old filter cached.
+         this.light.shadow.filterNode = PCFShadowFilter;
+       }
+-      this.csm = new CSMShadowNode(this.light, {
++      this.#csm = new CSMShadowNode(this.light, {
+         cascades: Math.min(4, Math.max(2, Math.round(this.props.csmCascades))),
+         maxFar: Math.max(1, this.props.csmMaxFar),
+         mode: this.props.csmMode === "practical" ? "custom" : this.props.csmMode,
+         lightMargin: Math.max(0, this.props.csmLightMargin),
+       });
+-      this.csm.fade = this.props.csmFade === true;
++      this.#csm.fade = this.props.csmFade === true;
+       this.#configureCSMSplits();
+     }
+-    this.light.shadow.shadowNode = this.csm;
++    this.light.shadow.shadowNode = this.#csm;
+     this.light.shadow.needsUpdate = true;
+     // CSMShadowNode initializes its internal frustum lazily during shader
+     // setup. Until then, updateFrustums() would dereference mainFrustum=null.
+@@ -394,19 +424,19 @@ export class LightComponent extends Component {
+   }
+ 
+   #disposeCSM() {
+-    if (!this.csm) return;
+-    if (this.light?.shadow?.shadowNode === this.csm) {
++    if (!this.#csm) return;
++    if (this.light?.shadow?.shadowNode === this.#csm) {
+       this.light.shadow.shadowNode = undefined;
+       this.light.shadow.needsUpdate = true;
+     }
+-    this.csm.dispose?.();
+-    this.csm = null;
++    this.#csm.dispose?.();
++    this.#csm = null;
+   }
+ 
+   #configureCSMSplits() {
+-    if (!this.csm) return;
++    if (!this.#csm) return;
+     if (this.props.csmMode !== "practical") {
+-      this.csm.mode = this.props.csmMode;
++      this.#csm.mode = this.props.csmMode;
+       return;
+     }
+     // Three's fixed 0.5 practical split gives a 1000-unit, four-cascade CSM
+@@ -414,8 +444,8 @@ export class LightComponent extends Component {
+     // empty distance and makes indoor contact shadows look uniformly soft.
+     // Keep the practical blend adjustable, but bias its default much closer
+     // to logarithmic so resolution is concentrated around the viewer.
+-    this.csm.mode = "custom";
+-    this.csm.customSplitsCallback = (cascades, near, far, target) => {
++    this.#csm.mode = "custom";
++    this.#csm.customSplitsCallback = (cascades, near, far, target) => {
+       const lambda = THREE.MathUtils.clamp(this.props.csmSplitLambda, 0, 1);
+       for (let i = 1; i <= cascades; i++) {
+         const p = i / cascades;
+@@ -427,13 +457,13 @@ export class LightComponent extends Component {
+   }
+ 
+   #syncCSMCascadeShadows() {
+-    if (!this.csm?.lights?.length) return;
+-    const last = Math.max(1, this.csm.lights.length - 1);
++    if (!this.#csm?.lights?.length) return;
++    const last = Math.max(1, this.#csm.lights.length - 1);
+     const baseRadius = Math.max(0, this.props.shadowRadius);
+     const baseBias = this.props.shadowBias;
+     const baseNormalBias = Math.max(0, this.props.shadowNormalBias);
+-    for (let i = 0; i < this.csm.lights.length; i++) {
+-      const shadow = this.csm.lights[i].shadow;
++    for (let i = 0; i < this.#csm.lights.length; i++) {
++      const shadow = this.#csm.lights[i].shadow;
+       const t = i / last;
+       let changed = false;
+ 
+@@ -474,18 +504,18 @@ export class LightComponent extends Component {
+   }
+ 
+   #updateCSMFrustums(force = false) {
+-    if (!this.#isCSMUsable() || !this.csm) return;
++    if (!this.#isCSMUsable() || !this.#csm) return;
+     const camera = this.entity.engine.camera;
+     if (!camera) return;
+     camera.updateMatrixWorld(true);
+-    if (this.csm.mainFrustum === null) return;
+-    if (this.csm.camera !== camera) {
+-      this.csm.camera = camera;
++    if (this.#csm.mainFrustum === null) return;
++    if (this.#csm.camera !== camera) {
++      this.#csm.camera = camera;
+       force = true;
+     }
+-    this.csm.lightMargin = Math.max(0, this.props.csmLightMargin);
++    this.#csm.lightMargin = Math.max(0, this.props.csmLightMargin);
+     this.#syncCSMCascadeShadows();
+-    if (force || this.csm.camera === camera) this.csm.updateFrustums();
++    if (force || this.#csm.camera === camera) this.#csm.updateFrustums();
+   }
+ 
+   #configureShadow({ shadowMapWidth, shadowMapHeight, shadowCamNear, shadowCamFar, shadowCamSize, shadowCamFov }) {
+diff --git a/src/modules/gi/GISystem.js b/src/modules/gi/GISystem.js
+index 5def2bf..418933d 100644
+--- a/src/modules/gi/GISystem.js
++++ b/src/modules/gi/GISystem.js
+@@ -16,10 +16,10 @@
+ // lights + promoted emissive emitters (uniform slots, zero rebakes), and
+ // the GICascadeLight material injection.
+ import * as THREE from "three/webgpu";
+-import { float, instanceIndex, positionLocal, texture, uniform } from "three/tsl";
++import { float, instanceIndex, mix, positionLocal, step, texture, uniform } from "three/tsl";
+ import { createRadianceCascades } from "./cascadeTrace.js";
+ import { createCascadeMerge } from "./cascadeMerge.js";
+-import { createBounceFeedback, createIrradianceGather, createProbeIrradiance, createRadianceLookup, gatherBias, gatherViewBias, probeSnapAlpha } from "./cascadeGather.js";
++import { createBounceFeedback, createIrradianceGather, createProbeDepthMoments, createProbeIrradiance, createRadianceLookup, depthMomentsAlpha, gatherBias, gatherViewBias, probeSnapAlpha } from "./cascadeGather.js";
+ import { blitBvhAtlasTiles, createGiBvhReflect, createGiBvhTarget, createGiGBuffer, createGiResolve, createGiTargets, renderGiGBuffer } from "./giScreen.js";
+ import { resolveMaterialSurface, serializeMeshForBake } from "./voxelizeOnce.js";
+ import { createOccupancyDebugMaterial, createSdfDebugMaterial, createGiField } from "./giField.js";
+@@ -27,6 +27,7 @@ import { createOccupancyField, describeOccupancyField, quantizeOccupancyRes } fr
+ import { fitPrimitive } from "./primitiveFit.js";
+ import { describeGrid } from "./instanceGrid.js";
+ import { BRICK_AXIS_BY_QUALITY, describeSparseField } from "./sparseField.js";
++import { UI_LAYER } from "../../engine/editorLayers.js";
+ import { GICascadeLight, MAX_EMITTERS, giRoughnessBucketOf, registerGILight } from "./giLight.js";
+ import { buildBvhScene } from "./bvh/bvhScene.js";
+ import {
+@@ -57,6 +58,38 @@ const ASSET_LOAD_TIMEOUT_MS = 30_000;
+ // (see #retireTargets). Two would do — the third is slack for a frame that is
+ // dropped or re-encoded.
+ const RETIRED_TARGET_FRAMES = 3;
++/**
++ * Frames a mover's occupancy slot stays DYNAMIC after its last transform
++ * change before demoting back to STATIC (see occupancyField's split note).
++ * Each promotion/demotion costs one full re-voxelize (the snapshot must be
++ * retaken), so this is hysteresis against stop-start animations — ~1.5s at
++ * 60fps. While dynamic-but-still the slot costs nothing (no dirty marks →
++ * passes() doesn't run).
++ */
++const OCC_DYNAMIC_QUIET_FRAMES = 90;
++/**
++ * CONVERGED-IDLE SLEEP (run-gi-perf.mjs, 2026-08-03: the full pipeline at
++ * rest is ~2.3ms GPU at ultra — feedback ~1.4, transport ~0.8 — recomputing
++ * a field that converged long ago). When every FIELD input has been
++ * bit-identical for GI_IDLE_AFTER_FRAMES (no composite, no light/emitter/sky
++ * change — see #fieldInputHash), the per-frame queue drops to the RESOLVE
++ * alone (which is camera-dependent and stays live, ~0.07ms). Any input
++ * change wakes the full queue the SAME tick — zero added latency — and a
++ * 1-in-GI_IDLE_HEARTBEAT_FRAMES full run backstops changes the hash cannot
++ * see (e.g. an animated emissive texture's content). 180 frames ≈ well past
++ * probe-EMA convergence at the default smoothing, so nothing visible moves
++ * at the moment sleep begins. `__giNoIdleSleep = true` disables (A/B).
++ */
++const GI_IDLE_AFTER_FRAMES = 180;
++const GI_IDLE_HEARTBEAT_FRAMES = 30;
++/**
++ * Frames after a build during which the feedback/trace CHECKERBOARDS are
++ * suspended (see #tick). A checker's skipped half keeps whatever its buffer
++ * already holds, and a fresh buffer holds zeros — for a cascade ray that
++ * decodes as "hit at distance 0, radiance black", so half the lattice would
++ * read as solid dark until its parity came round.
++ */
++const CHECKER_WARMUP_FRAMES = 8;
+ 
+ // ── ASYNC COMPUTE PIPELINES — the computes' missing `isReady` ────────────────
+ // three creates every compute pipeline with the SYNC device call, and Chrome's
+@@ -478,6 +511,9 @@ export class GISystem {
+       // cannot change without a rebuild. (`killSdf` used to sit beside it —
+       // the prop is gone; SDF-free is the only mode.)
+       p.backend,
++      // AO compiles the resolve's obscurance block (and its pyramid binding)
++      // in or out — structural for the same reason exactReflections is.
++      p.ao !== false,
+     ]);
+   }
+ 
+@@ -618,11 +654,14 @@ export class GISystem {
+         // A mesh folded into an automatic batch is hidden but still renders (as
+         // an instance of a scene-root proxy GI deliberately skips), so its own
+         // `visible` flag must not exclude it here — see engine/batching.js.
+-        if (child.visible === false && !child.userData.batchedInto) return;
++        // Same camera-independence rule as #collectMeshes: auto-fit bounds
++        // must not breathe as LOD/occlusion hide things off-screen.
++        if (child.visible === false && !child.userData.batchedInto && !child.userData.cameraHidden) return;
+         const skip =
+           !child.isMesh ||
+           child.userData.__giDebug ||
+           ((child.layers.mask >>> 0) & 0x80000000) !== 0 || // editor-only helpers
++          child.layers.isEnabled(UI_LAYER) || // HUD quads are not world geometry
+           !child.geometry?.attributes?.position;
+         if (!skip && meshWorldBox(child, scratch)) union.union(scratch);
+         for (const grandchild of child.children) visit(grandchild);
+@@ -784,6 +823,12 @@ export class GISystem {
+     if (state.fieldShadowOff) {
+       state.fieldShadowOff.value = globalThis.__giNoFieldShadows === true ? 1 : 0;
+     }
++    // Its receiver-side twin (`__giNoEmitterShadows`) — the resolve pass's
++    // emitter shadow. The two together answer "is this a shadow-trace artifact
++    // at all, or the emitter's geometric term?" in one frame.
++    if (this._emitterShadowOff) {
++      this._emitterShadowOff.value = globalThis.__giNoEmitterShadows === true ? 1 : 0;
++    }
+     // Shadow-ray uniforms, live: `__giSunAngle` tunes the ANALYTIC penumbra
+     // softness (radians, default 0.025); `__giSunJitter` (radians, default 0
+     // = OFF) enables the stochastic dither cone — off because any stochastic
+@@ -805,11 +850,33 @@ export class GISystem {
+     // Adaptive-hysteresis snap alpha (cascadeGather.probeSnapAlpha); 0 = the
+     // old fixed-alpha EMA.
+     probeSnapAlpha.value = globalThis.__giProbeSnap ?? 0.35;
++    // Visibility-integrator blend (depth moments + openness EMA — Phase 2);
++    // 1 = no temporal integration (this frame only), the churn A/B arm.
++    depthMomentsAlpha.value = globalThis.__giDepthAlpha ?? 0.12;
+     // Field-side radiance EMA retain weight (GI_FLICKER_PLAN.md Phase 1);
+     // default 0.95, user-confirmed live; 0 = off (pre-Phase-1 behaviour).
+     if (state.fieldSmoothing) state.fieldSmoothing.value = globalThis.__giFieldSmoothing ?? 0.95;
+-    // Checker parity: which half of the cells this frame's feedback updates.
+-    if (state.feedbackParity) state.feedbackParity.value = this._frame % 2;
++    // Checker parity: which half of the cells this frame's feedback updates,
++    // or -1 for "every cell". Default follows the preset (on at low/medium);
++    // `__giFeedbackChecker` true/false overrides it live — the A/B that
++    // decides whether high/ultra should adopt it too.
++    // WARM-UP: both checkers leave the untouched half holding whatever the
++    // buffer already had, and a freshly built buffer holds ZEROS — which for
++    // a cascade ray reads as "hit at t=0, black", not as "no data". So run
++    // every row for the first few frames after a build, then start
++    // alternating. (Cheap: it is a handful of frames, once per rebuild.)
++    this._framesSinceBuild = (this._framesSinceBuild ?? 0) + 1;
++    const checkersWarm = this._framesSinceBuild > CHECKER_WARMUP_FRAMES;
++    if (state.feedbackParity) {
++      const want = (globalThis.__giFeedbackChecker ?? this._feedbackCheckerDefault) && checkersWarm;
++      state.feedbackParity.value = want ? this._frame % 2 : -1;
++    }
++    // Cascade-trace checkerboard — same mechanism, applied to the other half
++    // of the awake cost. Opt-in (`__giTraceChecker`) until it has an eye-check.
++    if (state.traceParity) {
++      const want = globalThis.__giTraceChecker === true && checkersWarm;
++      state.traceParity.value = want ? this._frame % 2 : -1;
++    }
+     this.#refreshEmitterSlots();
+     // Slot transforms track live matrices — dragging a mesh updates its
+     // uniforms here, which bumps the atlas revision and re-runs the
+@@ -909,16 +976,36 @@ export class GISystem {
+     // Flicker that survives "all" is not GI compute at all (look at the
+     // gbuffer/resolve targets); flicker that dies at "field" is the direct
+     // injection; flicker that dies at "transport" is the cascades or the merge.
++    //   "traces"    — feedback + cascade traces only (merges/probes frozen).
++    //   "merges"    — the above + the merges (probe integration frozen).
++    // Those two split the transport bucket, which the 2026-08-03 perf run
++    // showed is the LARGEST part of the awake cost — "transport" as one
++    // number could not say whether to attack rays, merges or probes.
+     const freeze = globalThis.__giFreeze;
++    const resolveCompute = state.screen?.resolve?.compute ?? null;
++    const upTo = (mark) =>
++      resolveCompute ? [...state.queue.slice(0, mark), resolveCompute] : state.queue.slice(0, mark);
+     if (freeze === "field") rateQueue = state.queueNoFeedback;
+-    else if (freeze === "transport") rateQueue = state.screen?.resolve?.compute ? [state.screen.resolve.compute] : [];
++    else if (freeze === "transport") rateQueue = resolveCompute ? [resolveCompute] : [];
++    else if (freeze === "traces" && state.queueMarks) rateQueue = upTo(state.queueMarks.tracesEnd);
++    else if (freeze === "merges" && state.queueMarks) rateQueue = upTo(state.queueMarks.mergesEnd);
+     else if (freeze === "all") rateQueue = [];
+     // Probe-average computes exist for the gizmos alone — only pay for
+     // them while a probe debug view is actually open.
+     const debugMode = component.props.debugProbes;
+     const debugExtra =
+       debugMode === "raw" || debugMode === "merged" ? state.debugComputes : [];
+-    const frameQueue = debugExtra.length ? [...rateQueue, ...debugExtra] : rateQueue;
++    let frameQueue = debugExtra.length ? [...rateQueue, ...debugExtra] : rateQueue;
++    // Converged-idle sleep (see GI_IDLE_AFTER_FRAMES): count frames of
++    // bit-identical field input. The composite branch below resets the count
++    // — any geometry/atlas change is by definition not quiet.
++    const inputHash = this.#fieldInputHash();
++    if (inputHash !== this._fieldInputSeen) {
++      this._fieldInputSeen = inputHash;
++      this._fieldQuietFrames = 0;
++    } else {
++      this._fieldQuietFrames = (this._fieldQuietFrames ?? 0) + 1;
++    }
+     // WHAT MAKES THE FIELD STALE — three signals, not one.
+     //
+     // The atlas revision alone was enough only while every scene change also
+@@ -954,6 +1041,8 @@ export class GISystem {
+       // re-voxelized pyramid (occ revision) invalidates EVERY cell, and so
+       // does a first composite or a retry after skipped dispatches — see the
+       // dirty-consumption note below.
++      // A composite frame is never quiet — geometry or the atlas moved.
++      this._fieldQuietFrames = 0;
+       const wholeVolume =
+         this._occGeometrySeen !== occGeometryRevision ||
+         !this._compositedOnce ||
+@@ -1029,7 +1118,11 @@ export class GISystem {
+         // queue: it is recomputed exactly when the pyramid or the volume can
+         // have changed, which is the same condition that got us into this
+         // branch. Reads the pyramid, so it must follow occPasses.
+-        ...(state.visComputes ?? []),
++        // `__giNoVisUpdate` (live) stops DISPATCHING it while keeping the
++        // buffer and every merge that reads it — the cost A/B that says how
++        // much of a moving object's surcharge is this pass. Values go stale,
++        // which is exactly what a throttle would do.
++        ...(globalThis.__giNoVisUpdate === true ? [] : state.visComputes ?? []),
+         state.volume.compositeCompute,
+         // Fine level AFTER the coarse composite and BEFORE anything traces:
+         // the bricks are the same min-over-candidates function at a sixth of
+@@ -1060,6 +1153,24 @@ export class GISystem {
+     } else {
+       // Cascades re-trace + re-merge EVERY frame — 1-frame response to any
+       // field change, no temporal accumulation to converge.
++      // IDLE SLEEP: with the field input quiet past the threshold, only the
++      // camera-dependent resolve runs (plus any open debug view — its
++      // computes read the frozen field, still correct). The heartbeat frame
++      // runs the full queue. Not while a freeze bisect or the legacy-rate
++      // hatch is active — those own the queue for diagnostic purposes.
++      const idle =
++        !freeze && !legacyRate &&
++        globalThis.__giNoIdleSleep !== true &&
++        // The opt-in stochastic dither needs per-frame integration — a
++        // frozen field would hold one noise sample as a permanent pattern.
++        !(state.shadowJitter?.angle?.value > 0) &&
++        (this._fieldQuietFrames ?? 0) > GI_IDLE_AFTER_FRAMES &&
++        this._frame % GI_IDLE_HEARTBEAT_FRAMES !== 0;
++      if (idle) {
++        frameQueue = state.screen?.resolve?.compute
++          ? [state.screen.resolve.compute, ...debugExtra]
++          : debugExtra;
++      }
+       // Guard the empty case: `__giFreeze = "all"` produces no computes, and
+       // three's renderer.compute([]) throws "expects a ComputeNode".
+       if (frameQueue.length) giCompute(renderer, frameQueue);
+@@ -1470,7 +1581,18 @@ export class GISystem {
+    * rebuild, its shader stays in the pipeline cache, and a quality change or
+    * an auto-fit refit no longer triggers a material recompile wave.
+    */
+-  #buildScreenResolve({ gather, light, emitterSlots, radianceLookup = null, lightSlots = null }) {
++  /**
++   * Persistent live-A/B uniform for the RECEIVER-side emitter shadow
++   * (`__giNoEmitterShadows`). Created once and reused across rebuilds for the
++   * same reason the GI targets are: materials bind it through the resolve, so
++   * minting a new one per build would leave compiled shaders on a dead uniform.
++   */
++  #emitterShadowOff() {
++    this._emitterShadowOff ??= uniform(0);
++    return this._emitterShadowOff;
++  }
++
++  #buildScreenResolve({ gather, light, emitterSlots, radianceLookup = null, lightSlots = null, ao = null }) {
+     const renderer = this.engine.renderer;
+     if (!renderer?.backend?.device) return null;
+     const { width, height } = this.#screenResolveSize();
+@@ -1490,9 +1612,10 @@ export class GISystem {
+             shadowTraceFn: light.shadowTraceFn,
+             shadowMargin: light.shadowMargin,
+             shadowRange: light.shadowRange,
++            shadowOff: this.#emitterShadowOff(),
+           }
+         : null;
+-      const inputs = { gather, normalOffset: light.normalOffset, intensity: light.intensityUniform, emitter };
++      const inputs = { gather, normalOffset: light.normalOffset, intensity: light.intensityUniform, emitter, ao };
+       const radiance = radianceLookup
+         ? {
+             lookup: radianceLookup,
+@@ -1595,6 +1718,7 @@ export class GISystem {
+       emitter: screen.emitter,
+       radiance: screen.radiance,
+       bvhShade: screen.bvhShade,
++      ao: screen.ao,
+     });
+     if (index >= 0) state.queue[index] = screen.resolve.compute;
+     if (indexNoFeedback >= 0) state.queueNoFeedback[indexNoFeedback] = screen.resolve.compute;
+@@ -1872,6 +1996,9 @@ export class GISystem {
+ 
+   #rebuild() {
+     this.#dispose();
++    // Re-arm the checker warm-up: the cascade/radiance buffers below are
++    // brand new and zero-filled (see CHECKER_WARMUP_FRAMES).
++    this._framesSinceBuild = 0;
+     const component = this.component;
+     const engine = this.engine;
+     if (!component || !engine.scene) return;
+@@ -1976,8 +2103,16 @@ export class GISystem {
+     // cheap), the pass runs EVERY frame on alternating halves of the cells
+     // (index parity × this flipping uniform). Same average cost, and the
+     // field as a whole now moves every frame.
+-    const feedbackChecker = !(quality === "high" || quality === "ultra");
+-    const feedbackParity = feedbackChecker ? uniform(0) : null;
++    //
++    // The uniform is now built at EVERY tier and the on/off decision is made
++    // per tick (#tick writes -1 to disable), for two reasons: the feedback is
++    // the single largest term in the awake pipeline at high/ultra, so this is
++    // the cheapest peak-frame-cost lever there is; and a build-time switch
++    // cannot be A/B'd inside one measurement run, which is the only kind of
++    // A/B this module trusts. One `parity >= 0` compare per thread is the
++    // whole cost of making it live.
++    this._feedbackCheckerDefault = !(quality === "high" || quality === "ultra");
++    const feedbackParity = uniform(-1);
+ 
+     // The authored representation: one atlas TILE per unique baked geometry,
+     // one INSTANCE SLOT per world placement. Sizing them apart is the point —
+@@ -2086,6 +2221,10 @@ export class GISystem {
+     // Entries + slot assignment + emitter promotion + SDF load-or-bake.
+     const entries = this.#buildEntries(meshes);
+ 
++    // Cascade-trace checkerboard parity (see cascadeTrace's note). -1 = off;
++    // #tick writes the frame parity when enabled. Built at every tier so the
++    // switch is live — one compare per thread when it is off.
++    const traceParity = uniform(-1);
+     const { cascades, intervals } = createRadianceCascades({
+       world: volume.world,
+       cascadeCount: Math.min(6, Math.max(2, props.cascadeCount || 5)),
+@@ -2094,6 +2233,7 @@ export class GISystem {
+       t0: probeSpacing,
+       farT: Math.max(sizeX, sizeY, sizeZ) * 2,
+       sceneTrace: volume.createSceneTrace(),
++      traceParity,
+     });
+     // Sky light: the radiance a cascade ray brings back when it escapes the
+     // volume without hitting anything. A uniform, not a constant, so colour
+@@ -2118,6 +2258,10 @@ export class GISystem {
+       occupancy: volume.occupancyField ?? null,
+       smoothing: probeSmoothing,
+     });
++    // Per-probe depth moments (Phase 2 — chebyshev gather visibility, see
++    // createProbeDepthMoments). Binding-neutral in the gather kernels: they
++    // read this buffer INSTEAD of c0.rays.
++    const probeDepth = createProbeDepthMoments(cascades);
+     // This gather instance feeds ONLY the deferred resolve compute (materials
+     // read its result from a texture now), so it can be a real WGSL function
+     // — see createShadowTrace's note on why that is unsafe for shared ones.
+@@ -2127,6 +2271,7 @@ export class GISystem {
+       // (a uniform, so an in-place refit rescales it) and its point test, for
+       // the buried-probe cut.
+       volume.occupancyField ?? null,
++      probeDepth.buffer,
+     );
+     // Volume diagonal as a uniform: shadow/mirror reach rescales with an
+     // in-place refit (all world-scale shader inputs must be uniforms — a
+@@ -2150,6 +2295,12 @@ export class GISystem {
+       // where the renderer's own direct light does, or the mismatch reads
+       // as light being "cut" at a circle.
+       range: uniform(0),
++      // SOURCE SIZE (Blender's Angle/Radius): directional → angular RADIUS
++      // in radians (LightComponent's sourceAngle/2), point → world source
++      // radius in metres (shadowRadius). Drives the analytic cone penumbra of
++      // the FIELD's light shadows (bounce). Default = the real sun's ~0.53°
++      // diameter.
++      soft: uniform(0.0046),
+     }));
+     // Emitter slots (promoted emissive meshes) are shared by the feedback
+     // compute (voxel direct inject), the material light node (receiver
+@@ -2185,6 +2336,12 @@ export class GISystem {
+     // off — user-confirmed ("it flickers even when the light is not
+     // moving"). Kept as an opt-in (`__giSunJitter`) for A/B only.
+     const shadowJitter = { frame: uniform(0), angle: uniform(0), penAngle: uniform(0.025) };
++    const fieldShadowTrace = volume.createSoftShadowTrace(
++      normalLift,
++      traceBudget.feedback,
++      "giFeedbackShadowTrace",
++      globalThis.__giStableFieldShadows !== false,
++    );
+     // GI_FLICKER_PLAN.md Phase 1 — field-side radiance EMA (see
+     // cascadeGather's fieldSmoothing note). Retain weight; DEFAULT 0.95
+     // (user-confirmed live, 2026-08-03 — kills the object-motion flicker
+@@ -2195,6 +2352,7 @@ export class GISystem {
+       lightSlots,
+       emitterSlots,
+       probeIrradiance: probeIrradiance.buffer,
++      depthMoments: probeDepth.buffer,
+       fieldSmoothing,
+       // Private to the feedback compute (see createShadowTrace's layout note).
+       // STABLE mode — the moving-light flicker fix (see createShadowTrace's
+@@ -2202,10 +2360,7 @@ export class GISystem {
+       // cell every frame under a sweeping sun, so its binary verdicts were the
+       // regional bright↔dark stepping. `__giStableFieldShadows = false`
+       // restores the sharp estimator for an A/B (build-time — needs a rebuild).
+-      shadowTrace: volume.createSoftShadowTrace(
+-        normalLift, traceBudget.feedback, "giFeedbackShadowTrace",
+-        globalThis.__giStableFieldShadows !== false,
+-      ),
++      shadowTrace: fieldShadowTrace,
+       gridDiagonal: diagU,
+       fieldShadowOff,
+       jitter: shadowJitter,
+@@ -2225,23 +2380,34 @@ export class GISystem {
+       // both the jitter cone and the penumbra softness, live.
+       // `__giFieldDdaShadows = false` (build-time) restores the sphere trace.
+       lightShadow:
+-        volume.occupancyField && globalThis.__giFieldDdaShadows !== false
+-          ? (origin, dir, maxT) => {
+-              const r = volume.occupancyField.traceOccupancy(
+-                origin, dir, volume.world.minCell.mul(0.25), maxT,
+-                { steps: 64, penumbraK: float(1).div(shadowJitter.penAngle.max(0.005)) },
++        fieldShadowTrace
++          ? (origin, dir, maxT, _k, cosRayNormal, penK) => {
++              return fieldShadowTrace(
++                origin, dir, maxT,
++                penK ?? float(1).div(shadowJitter.penAngle.max(0.005)),
++                cosRayNormal,
++                // Per-light cone softness when the slot loop provides it
++                // (slot.soft — Blender's Angle/Radius); the global
++                // `__giSunAngle`-driven penAngle stays as the fallback.
+               );
+-              return r.hit.oneMinus().mul(r.pen);
+             }
+           : null,
+     });
+ 
+     const queue = [feedbackCompute];
+     for (const cascade of cascades) queue.push(cascade.traceCompute);
++    // Stage boundaries, for the `__giFreeze` bisect's finer cuts ("traces",
++    // "merges"). The awake pipeline's cost is dominated by this transport
++    // half, and "transport" as one bucket was too coarse to optimize against.
++    const queueMarks = { tracesEnd: queue.length };
+     queue.push(...mergeComputes);
++    queueMarks.mergesEnd = queue.length;
+     // Integrate probe irradiance AFTER the merge so receivers read
+     // this frame's field.
+     queue.push(probeIrradiance.compute);
++    // Depth moments read the RAW c0 rays (written by the trace above) — any
++    // position after the traces works; beside the probe integral for clarity.
++    queue.push(probeDepth.compute);
+     // The feedback pass now runs EVERY frame at every preset — low/medium get
+     // their cost halving from the checker (half the cells per frame, see
+     // feedbackChecker above) instead of from skipping frames. queueNoFeedback
+@@ -2304,18 +2470,96 @@ export class GISystem {
+       // slot) — a layout collapses those four inlined 56-step loops into one
+       // function, which is what keeps this SYNCHRONOUSLY compiled compute
+       // pipeline small enough not to freeze a frame on rebuild.
+-      light.shadowTraceFn = volume.createSoftShadowTrace(light.normalOffset, traceBudget.shadow, "giResolveShadowTrace");
++      // EMITTER SHADOWS MARCH THE OCCUPANCY DDA WITH THE ANALYTIC CONE
++      // PENUMBRA — the same transport the FIELD's analytic lights moved to in
++      // round 13/15c. Emitters were the last consumer of the sphere trace, and
++      // under the occupancy backend that trace has no continuous distance left
++      // to march: `dRaw` is the oracle, i.e. distance to occupied VOXEL AABBs,
++      // so the estimator's `min(k·d/t)` varies with the LATTICE and prints it.
++      // Measured on scripts/run-gi-emissive.mjs (Cornell box, one emissive
++      // cube): turning `emissiveShadows` on made the room 54-73% darker with
++      // 7-12x the high-frequency energy, and forcing THIS trace open
++      // (__giNoEmitterShadows) collapsed green-wall blotch 0.104 → 0.003 while
++      // the already-stable FIELD trace contributed none of it. Making the
++      // sphere trace's admission continuous (stable mode) changed nothing,
++      // which is what ruled the boolean out and named `dRaw` itself.
++      //
++      // The DDA's cone penumbra is continuous in origin AND direction by
++      // construction, cannot tunnel, and its `penGate` (~2 voxels of travel)
++      // is exactly the self-neighbourhood exclusion the sphere trace was
++      // faking with plane cuts. k = dist/angularRadius is already what the
++      // sphere trace's `k` encodes, so softness is unchanged.
++      //
++      // The lamp-body exclusion args are DROPPED deliberately: `maxT` already
++      // stops the ray at the lamp's own surface (emitterSurfaceT), so a march
++      // that walks voxels never reaches the lamp. The sphere trace needed the
++      // exclusion only because it sampled a FIELD that still carried the
++      // lamp's distance shell after the ray had stopped short of it.
++      // `__giEmitterDdaShadows = false` restores the sphere trace (build-time).
++      const emitterDda = volume.occupancyField && globalThis.__giEmitterDdaShadows !== false;
++      light.shadowTraceFn = emitterDda
++        ? (origin, dir, maxT, k) => {
++            const r = volume.occupancyField.traceOccupancy(
++              origin, dir, volume.world.minCell.mul(0.25), maxT,
++              {
++                steps: Math.max(64, traceBudget.shadow),
++                penumbraK: k,
++                // An area emitter is a SOFT light: k = dist/angularRadius is
++                // single digits, so the cone needs clearance out to ~t/k
++                // metres before it stops reading open space as occlusion.
++                // 3 levels = 8 voxels of reach, with the cap as the
++                // "nothing near at all" escape (see traceBody's penLevels
++                // note — at the default 0 this printed the voxel lattice as
++                // grout lines across the floor).
++                penLevels: 3,
++                penCap: 64,
++                // `penMaxLevel` deliberately left at its default 1. Raising it
++                // to 3 was tried and MEASURED WORSE overall: the floor's
++                // penumbra banding improved (blotch 0.061 → 0.031) but the
++                // ceiling regressed 7x (0.003 → 0.022) and the room lost
++                // another 16% of its light, because a coarse stride's
++                // clearance under-estimates badly close to the emitter. The
++                // option stays plumbed for the next attempt at the residual.
++              },
++            );
++            return r.hit.oneMinus().mul(r.pen);
++          }
++        : volume.createSoftShadowTrace(light.normalOffset, traceBudget.shadow, "giResolveShadowTrace");
+       light.shadowMargin = volume.world.cellMax.mul(2.5).max(0.2);
+       // Shadow reach must cover the whole volume: any receiver inside the
+       // cap-but-unshadowed band takes emitter light THROUGH walls.
+       light.shadowRange = diagU.clamp(12, 64);
+       light.emitterSlots = emitterSlots;
+     }
++    // Indirect-light ambient occlusion (giScreen's obscurance ladder). The
++    // uniforms are live (aoStrength/aoRadius edit without a rebuild); the
++    // `ao` prop itself is structural — off compiles the block out entirely.
++    const ao =
++      props.ao !== false && volume.occupancyField
++        ? {
++            occupancy: volume.occupancyField,
++            strength: uniform(Math.min(1, Math.max(0, props.aoStrength ?? 0.6))),
++            radius: uniform(Math.min(3, Math.max(0.1, props.aoRadius ?? 0.6))),
++          }
++        : null;
++    // NOTE: there is deliberately NO GI-traced DIRECT shadow path here.
++    // It was tried (screen-space half-res occupancy cone trace feeding a
++    // custom `light.shadow.shadowNode`) and REMOVED 2026-08-03: 8 disk
++    // samples × ~192 DDA steps × two traces per half-res pixel cost ~2/3 of
++    // the frame, and upsampling a half-res visibility factor onto a DIRECT
++    // light blew out white fringes along every depth discontinuity. Direct
++    // sun is the highest-frequency term in the frame; a conservative voxel
++    // hull (which bulges outward a voxel, so it needs a lift, so thin
++    // curtains leak) cannot resolve it, and it can never shadow skinned
++    // meshes — so shadow maps are required regardless. If distance-varying
++    // softness is wanted, the right instrument is PCSS on the EXISTING
++    // shadow map with `sourceAngle` as the light size. Do not re-propose
++    // the screen-space voxel version.
+     // DEFERRED RESOLVE: evaluate the gather + emitter shadows once per screen
+     // pixel instead of inside every material (see giScreen.js). This is what
+     // keeps material shaders small — the driver compile of a 200kB+ GI
+     // fragment shader, once per material, was the whole startup cost.
+-    const screen = this.#buildScreenResolve({ gather, light, emitterSlots, radianceLookup: deferredRadianceLookup });
++    const screen = this.#buildScreenResolve({ gather, light, emitterSlots, radianceLookup: deferredRadianceLookup, ao });
+     if (screen) {
+       queue.push(screen.resolve.compute);
+       queueNoFeedback.push(screen.resolve.compute);
+@@ -2345,6 +2589,7 @@ export class GISystem {
+       diagU,
+       queue,
+       queueNoFeedback,
++      queueMarks,
+       visComputes,
+       debugComputes,
+       feedbackEveryFrame,
+@@ -2372,6 +2617,7 @@ export class GISystem {
+       fieldShadowOff,
+       shadowJitter,
+       feedbackParity,
++      traceParity,
+       skyRadiance,
+       autoFit,
+       lightSlots,
+@@ -2537,6 +2783,63 @@ export class GISystem {
+    * The light LIST is refreshed at fingerprint cadence; positions/colors
+    * are read live off the cached objects here.
+    */
++  /**
++   * Order-sensitive numeric digest of every FIELD input that can change
++   * without a composite: analytic light slots, emitter slots, sky radiance,
++   * and the live field knobs. Bit-identical hash across frames ⇒ the
++   * feedback/trace/merge/probe passes would recompute exactly what they
++   * already hold ⇒ safe to idle (see GI_IDLE_AFTER_FRAMES). Runs AFTER
++   * #updateLightUniforms/#refreshEmitterSlots each tick, so it digests what
++   * the GPU is actually about to read. Cheap: ~100 muls on plain numbers.
++   */
++  #fieldInputHash() {
++    const state = this.state;
++    if (!state) return 0;
++    let h = 0;
++    let k = 1;
++    const mix = (v) => {
++      // Golden-ratio spread keeps permuted values from cancelling.
++      k = (k * 1.6180339887) % 1024;
++      h += v * (k + 1);
++    };
++    for (const slot of state.lightSlots ?? []) {
++      mix(slot.active.value);
++      if (slot.active.value < 0.5) continue;
++      mix(slot.kind.value);
++      const v = slot.vector.value;
++      mix(v.x); mix(v.y); mix(v.z);
++      const c = slot.color.value;
++      mix(c.r); mix(c.g); mix(c.b);
++      mix(slot.range.value);
++      mix(slot.soft?.value ?? 0);
++    }
++    for (const slot of state.emitterSlots ?? []) {
++      mix(slot.radius.value);
++      if (slot.radius.value <= 0.001) continue;
++      const p = slot.center.value;
++      mix(p.x); mix(p.y); mix(p.z);
++      const c = slot.color.value;
++      mix(c.r); mix(c.g); mix(c.b);
++      mix(slot.kind.value);
++      const half = slot.half.value;
++      mix(half.x); mix(half.y); mix(half.z);
++    }
++    const sky = state.skyRadiance?.value;
++    if (sky) { mix(sky.r); mix(sky.g); mix(sky.b); }
++    mix(state.bounceGain?.value ?? 0);
++    mix(state.temporalBlend?.value ?? 0);
++    mix(state.probeSmoothing?.value ?? 0);
++    mix(state.fieldSmoothing?.value ?? 0);
++    mix(state.fieldShadowOff?.value ?? 0);
++    mix(state.shadowJitter?.penAngle?.value ?? 0);
++    mix(state.shadowJitter?.angle?.value ?? 0);
++    mix(gatherBias.value);
++    mix(gatherViewBias.value);
++    mix(probeSnapAlpha.value);
++    mix(depthMomentsAlpha.value);
++    return h;
++  }
++
+   #updateLightUniforms() {
+     const state = this.state;
+     if (!state?.lightSlots) return;
+@@ -2588,6 +2891,12 @@ export class GISystem {
+       }
+       slot.range.value = light.isPointLight ? Math.max(0, light.distance || 0) : 0;
+       slot.color.value.copy(light.color).multiplyScalar(light.intensity);
++      // Source size (LightComponent stamps userData — see its sourceAngle
++      // prop). Drives the FIELD's own soft bounce shadows; `__giSunAngle`
++      // stays the harness override for directional softness.
++      slot.soft.value = light.isDirectionalLight
++        ? (globalThis.__giSunAngle ?? light.userData.giSourceAngle ?? 0.0046)
++        : (light.userData.giSourceRadius ?? 0.05);
+     }
+     this.#logLightInput();
+   }
+@@ -2679,6 +2988,13 @@ export class GISystem {
+       const intensity = Math.max(0, props?.skyIntensity ?? 0);
+       state.skyRadiance.value.set(props?.skyColor ?? "#ffffff").multiplyScalar(intensity);
+     }
++    // Indirect-AO knobs (giScreen's obscurance ladder) — live uniforms; the
++    // resolve runs every frame (even in idle sleep), so edits land next frame.
++    if (state.screen?.ao) {
++      const props = this.component?.props;
++      state.screen.ao.strength.value = Math.min(1, Math.max(0, props?.aoStrength ?? 0.6));
++      state.screen.ao.radius.value = Math.min(3, Math.max(0.1, props?.aoRadius ?? 0.6));
++    }
+   }
+ 
+   #applyDebugVisibility() {
+@@ -3187,7 +3503,10 @@ export class GISystem {
+     const tally = [0, 0, 0, 0];
+     const visit = (object) => {
+       // Batched members are hidden yet still drawn (engine/batching.js).
+-      if (object.visible === false && !object.userData.batchedInto) return;
++      // `cameraHidden` = hidden by LOD/occlusion only (see Engine's visibility
++      // resolve): the mesh is still part of the world, so it must stay in the
++      // field or the GI mesh set becomes a function of the camera.
++      if (object.visible === false && !object.userData.batchedInto && !object.userData.cameraHidden) return;
+       // InstancedMesh IS collected now — it contributes one atlas instance
+       // slot per live instance, all sharing a single baked tile (see
+       // #buildEntries). It used to be skipped outright, which meant every
+@@ -3199,8 +3518,13 @@ export class GISystem {
+         const material = Array.isArray(object.material) ? object.material[0] : object.material;
+         const triCount = (object.geometry?.index?.count ?? position?.count ?? 0) / 3;
+         // Editor-only helpers live on layer 31 (mask compared unsigned —
+-        // 1<<31 is negative in JS int32).
+-        const editorOnly = ((object.layers.mask >>> 0) & 0x80000000) !== 0 && (object.layers.mask >>> 0) === 0x80000000;
++        // 1<<31 is negative in JS int32). UI quads are excluded for the same
++        // reason: they are screen furniture, and a screen-space one sits at
++        // the world origin at pixel scale, so voxelizing it would blow the
++        // field's bounds out to hundreds of metres of empty air.
++        const editorOnly =
++          (((object.layers.mask >>> 0) & 0x80000000) !== 0 && (object.layers.mask >>> 0) === 0x80000000) ||
++          object.layers.isEnabled(UI_LAYER);
+         // EVERY lit material must be visible to three's NodeMaterialObserver
+         // as "node-driven" — see #markObservedMaterial. GI light receivers
+         // include meshes the FIELD skips (transparent etc.), so mark all.
+@@ -3766,7 +4090,24 @@ export class GISystem {
+         changed = !p.matrix.equals(scratch);
+         if (changed) p.matrix.copy(scratch);
+       }
+-      if (changed) field.setSlotMatrix(p.slot, p.matrix);
++      if (changed) {
++        // Static/dynamic split (occupancyField.staticBits): flag the mover
++        // DYNAMIC *before* the matrix write — the flag flip re-snapshots the
++        // static side once, and every further frame of this motion replays
++        // that snapshot + re-voxelizes only this slot (the measured
++        // +3.3/+5.2ms-per-frame full-scene pass gone). Demotion below has a
++        // quiet-period hysteresis so a stop-start animation doesn't thrash
++        // full re-voxelizes.
++        field.setSlotDynamic?.(p.slot, true);
++        field.setSlotMatrix(p.slot, p.matrix);
++        p._lastMovedFrame = this._frame;
++      } else if (
++        p._lastMovedFrame != null &&
++        this._frame - p._lastMovedFrame > OCC_DYNAMIC_QUIET_FRAMES
++      ) {
++        field.setSlotDynamic?.(p.slot, false);
++        p._lastMovedFrame = null;
++      }
+     }
+   }
+ 
+diff --git a/src/modules/gi/GlobalIlluminationComponent.js b/src/modules/gi/GlobalIlluminationComponent.js
+index 611b62f..1ed211a 100644
+--- a/src/modules/gi/GlobalIlluminationComponent.js
++++ b/src/modules/gi/GlobalIlluminationComponent.js
+@@ -95,6 +95,24 @@ export class GlobalIlluminationComponent extends Component {
+     // toggle back to. Saved scenes carrying the old prop are ignored.)
+     sparseField: false,
+     emissiveShadows: true,
++    // AMBIENT OCCLUSION ON INDIRECT LIGHT (world-space, from the occupancy
++    // pyramid's distance oracle — see giScreen's obscurance ladder). The
++    // probe lattice is ~1m, so without this indirect light has no contact
++    // darkening under props, corners or crevices. Applied to the gathered
++    // irradiance only — emitter/analytic direct keep their traced shadows.
++    // DEFAULT OFF: it is a look choice that only ever removes light, and it
++    // shipped default-on in the same change that darkened the whole module
++    // (see the vis³ note in cascadeGather) — which made it impossible to
++    // tell the two apart. Opt in per scene.
++    ao: false,
++    aoStrength: 0.6,
++    aoRadius: 0.6,
++    // Screen-resolve resolution as a fraction of the drawing buffer. 0.5 is
++    // the cost sweet spot; the GI-TRACED LIGHT SHADOWS and AO are computed
++    // at this resolution, so their edges blend across silhouettes when
++    // upsampled — "bad corners" under a bright sun. 1.0 removes that at
++    // roughly 4× the resolve cost (still small next to the render).
++    resolveScale: 0.5,
+     autoRebake: true,
+     debugProbes: "off",
+   };
+@@ -147,6 +165,15 @@ export class GlobalIlluminationComponent extends Component {
+     { key: "backend", label: "Tracing Backend", type: "select", options: ["occupancy", "sdf-legacy"], advanced: true, flipsToCustom: "quality" },
+     { key: "sparseField", label: "Sparse Fine Field (sub-cell occlusion)", type: "boolean", advanced: true, flipsToCustom: "quality" },
+     { key: "emissiveShadows", label: "Emissive Shadows", type: "boolean", advanced: true, flipsToCustom: "quality" },
++    // A LOOK control like Sky Light, deliberately not advanced/flipsToCustom:
++    // contact darkening is the single most visible realism knob after
++    // intensity, and it costs a few bitset fetches at half res.
++    { key: "ao", label: "Ambient Occlusion", type: "boolean" },
++    { key: "aoStrength", label: "AO Strength", type: "number", min: 0, max: 1, step: 0.05, advanced: true },
++    { key: "aoRadius", label: "AO Radius (m)", type: "number", min: 0.1, max: 3, step: 0.1, advanced: true },
++    // Live (a resize rebuilds only the resolve compute): raise to 1.0 when
++    // GI light shadows / AO fringe at silhouettes ("bad corners").
++    { key: "resolveScale", label: "Resolve Scale", type: "number", min: 0.25, max: 1, step: 0.05, advanced: true },
+     { key: "autoRebake", label: "Auto Re-bake", type: "boolean", advanced: true, flipsToCustom: "quality" },
+     // "occupancy" marches the pyramid with the SAME hierarchical DDA the
+     // transport rays use, so it is the instrument for "is this column
+diff --git a/src/modules/gi/cascadeGather.js b/src/modules/gi/cascadeGather.js
+index 1e995a4..87e362b 100644
+--- a/src/modules/gi/cascadeGather.js
++++ b/src/modules/gi/cascadeGather.js
+@@ -19,7 +19,7 @@
+ // second transport implementation. Direct material shading here deliberately
+ // bypasses any G-buffer/deferred-resolve layer (where the prior attempt's
+ // never-root-caused stripe bug lived).
+-import { Fn, If, Loop, Return, cos, float, floor, fract, instanceIndex, instancedArray, max, mix, mod, select, sin, smoothstep, sqrt, step, uniform, vec3, vec4 } from "three/tsl";
++import { Fn, If, Loop, Return, cos, float, floor, fract, instanceIndex, instancedArray, max, mix, mod, select, sin, smoothstep, sqrt, step, uniform, vec2, vec3, vec4 } from "three/tsl";
+ import { octahedralTexelIndex, octahedralUV } from "./cascadeTrace.js";
+ import { sharedFn } from "./giFn.js";
+ import { emitterAngularRadius, emitterSlotFactor, emitterSurfaceT } from "./giLight.js";
+@@ -123,8 +123,26 @@ export function createProbeIrradiance(cascades, options = {}) {
+     }
+ 
+     const value = vec3(irradiance).toVar();
++    const opennessOut = float(openness).toVar();
+     if (smoothing) {
+       const prev = buffer.element(instanceIndex).toVar();
++      // OPENNESS EMA — always integrating, INDEPENDENT of probeSmoothing's
++      // value (which the user's scene sets to 1 = off): openness is a
++      // visibility WEIGHT recomputed fresh from the occupancy bits every
++      // frame, so a mover's whole-voxel footprint snaps stepped it per frame
++      // — part of the measured object-motion flicker (Phase 2). The shared
++      // depthMomentsAlpha (~8 frames) integrates the churn; a real burial
++      // change converges in ~150ms, invisible next to the burial ramp
++      // itself. prev.w < 1e-3 = never written (openness is floored at
++      // BURIED_PROBE_WEIGHT = 0.02, so a real value can't hit the sentinel)
++      // → snap, the fresh-build rule.
++      opennessOut.assign(
++        select(
++          prev.w.lessThan(1e-3),
++          openness,
++          mix(prev.w, openness, float(depthMomentsAlpha).clamp(0.01, 1)),
++        ),
++      );
+       // ADAPTIVE HYSTERESIS (the DDGI recipe for "smoothing hides flicker but
+       // lighting reacts too slowly"): the EMA's alpha is not one number. For
+       // SMALL relative changes — voxel-quantization popping, ray-set churn as
+@@ -142,18 +160,95 @@ export function createProbeIrradiance(cascades, options = {}) {
+         .max(1e-4);
+       const rel = delta.x.max(delta.y).max(delta.z).div(mag);
+       const boost = smoothstep(0.15, 0.6, rel);
+-      const adaptive = mix(base, float(probeSnapAlpha).max(base), boost);
++      // ALWAYS-ON NOISE-BAND INTEGRATION (2026-08-03, per-frame instrument
++      // run-gi-flicker-frame.mjs): with the user's Light Smoothing OFF
++      // (probeSmoothing 1 — their scene's saved value), the probe EMA was a
++      // straight passthrough and every voxel-snap pop landed raw on screen —
++      // measured 2.38 reversals/px vs 0.29 with the EMA active, i.e. THE
++      // object-motion flicker. But Light Smoothing is the LIGHT-RESPONSE
++      // knob; it must not double as "let churn through". Split the bands:
++      // small relative deltas (below the 15% noise threshold — voxel
++      // quantization, ray-set churn) integrate at ≤ probeNoiseAlpha (~4
++      // frames) REGARDLESS of the knob; large deltas (a light or object
++      // actually moved) keep the user's alpha — instant at 1. Nothing the
++      // eye should follow is slowed; only sub-threshold oscillation is
++      // refused. `__giProbeNoise = 0` restores the raw passthrough (A/B).
++      const noiseFloor = select(
++        float(probeNoiseAlpha).greaterThan(1e-3),
++        base.min(float(probeNoiseAlpha)),
++        base,
++      );
++      const adaptive = mix(noiseFloor, float(probeSnapAlpha).max(base), boost);
+       // prev.w == 0 ⇒ this slot has never been written (fresh build/refit):
+       // take the integral outright rather than lerping up from black.
+       const alpha = select(prev.w.lessThan(1e-3), float(1), adaptive);
+       value.assign(mix(prev.xyz, irradiance, alpha));
+     }
+-    buffer.element(instanceIndex).assign(vec4(value, openness));
++    buffer.element(instanceIndex).assign(vec4(value, opennessOut));
+   })().compute(probeCount * 6);
+ 
+   return { buffer, compute };
+ }
+ 
++/**
++ * PER-FRAME BLEND of the probe depth moments toward this frame's trace
++ * (createProbeDepthMoments): ~0.12 ≈ an 8-frame time constant. Deliberately
++ * INDEPENDENT of probeSmoothing — the moments smooth visibility WEIGHTS
++ * (which of 8 cage probes a receiver trusts, renormalized), not radiance, so
++ * they must keep integrating even when the user turns Light Smoothing off —
++ * which the user's own scene does (probeSmoothing 1), and which is exactly
++ * the configuration whose object-motion flicker this exists to fix.
++ * Live via `__giDepthAlpha` (1 = no temporal integration, this frame only).
++ */
++export const depthMomentsAlpha = uniform(0.12);
++
++/**
++ * DDGI-STYLE PER-PROBE DEPTH MOMENTS (GI_FLICKER_PLAN.md Phase 2 — the
++ * gather-side residual of the object-motion flicker).
++ *
++ * THE PROBLEM WITH THE RAW PROXY IT REPLACES: the gather weighted each cage
++ * probe by comparing |probe→P| against the probe's own c0 ray hit distance
++ * — read RAW from this frame's trace. A moving object re-voxelizes per
++ * frame and its footprint snaps in whole voxels, so that hit distance
++ * STEPS; near the tolerance boundary the probe's weight flips per frame,
++ * and a receiver's surviving-probe set churns — flicker that no radiance
++ * smoothing can touch, because it lives in the WEIGHTS. Measured 2026-08-03
++ * (run-gi-flicker.mjs, ultra, probeSmoothing off): 98% of tiles popping.
++ *
++ * THE FIX: per (probe, c0 direction), integrate the mean and second moment
++ * of the hit distance over time (EMA, `depthMomentsAlpha`), and let the
++ * gather weight probes by a Chebyshev visibility test against (μ, σ²)
++ * instead of a smoothstep against one raw sample. Temporal churn ENTERS the
++ * moments as variance — which SOFTENS the cut exactly where the geometry is
++ * churning — instead of flipping a binary verdict. One thread per ray-texel;
++ * two MACs more than the old proxy per gather corner.
++ *
++ * A miss (w < 0) integrates as the c0 interval end, NOT a huge constant:
++ * the proxy only ever saw occluders within c0's interval, and a mostly-miss
++ * direction must read as "no occluder in reach" (the gather gates on
++ * μ < 0.95·interval), not blow up σ². First write (μ=μ²=0 sentinel — a real
++ * depth² is always > 0) snaps to this frame outright, fresh-build rule.
++ */
++export function createProbeDepthMoments(cascades) {
++  const c0 = cascades[0];
++  const { dirCount } = c0;
++  const buffer = instancedArray(new Float32Array(c0.probeCount * dirCount * 2), "vec2");
++  const compute = Fn(() => {
++    const ray = c0.rays.element(instanceIndex).toVar();
++    const reach = float(c0.intervalLen).toVar();
++    const depth = select(ray.w.greaterThanEqual(0), ray.w.min(reach), reach).toVar();
++    const fresh = vec2(depth, depth.mul(depth)).toVar();
++    const prev = buffer.element(instanceIndex).toVar();
++    const alpha = select(
++      prev.x.add(prev.y).lessThan(1e-8),
++      float(1),
++      float(depthMomentsAlpha).clamp(0.01, 1),
++    );
++    buffer.element(instanceIndex).assign(mix(prev, fresh, alpha));
++  })().compute(c0.probeCount * dirCount);
++  return { buffer, compute };
++}
++
+ /**
+  * LIVE RECEIVER-GATHER SURFACE BIAS, as a fraction of a probe cell along the
+  * receiver's normal. Default 0.5 — user-eye-tuned against their Blender
+@@ -182,6 +277,15 @@ export const gatherBias = uniform(0.5);
+  */
+ export const probeSnapAlpha = uniform(0.35);
+ 
++/**
++ * NOISE-BAND alpha ceiling for the probe EMA (see the noiseFloor note in
++ * createProbeIrradiance): sub-15%-relative irradiance wiggles integrate at
++ * most this fast even when Light Smoothing is off. ~0.25 ≈ 4-frame ramp —
++ * kills pop-and-return churn, invisible as lag. Live via `__giProbeNoise`
++ * (0 disables — raw passthrough, the flicker A/B arm).
++ */
++export const probeNoiseAlpha = uniform(0.25);
++
+ /**
+  * VIEW-DIRECTION component of the same bias (fraction of a probe cell toward
+  * the CAMERA), live via `__giGatherViewBias`, default 0.5 (eye-tuned with
+@@ -200,7 +304,7 @@ export const gatherViewBias = uniform(0.5);
+  * @param {Array} cascades from createRadianceCascades (uses cascades[0])
+  * @returns {(P, N) => vec3} TSL irradiance sampler
+  */
+-export function createIrradianceGather(cascades, probeIrradiance = null, fieldCellMax = null, name = "giGather", occupancy = null) {
++export function createIrradianceGather(cascades, probeIrradiance = null, fieldCellMax = null, name = "giGather", occupancy = null, depthMoments = null) {
+   const occupancyVoxel = occupancy?.voxel ?? null;
+   const c0 = cascades[0];
+   const { world, grid, dirCount, dirRes } = c0;
+@@ -356,12 +460,17 @@ export function createIrradianceGather(cascades, probeIrradiance = null, fieldCe
+             );
+           }
+         }
+-        // Distance-visibility proxy: the probe's own raw c0 ray toward P.
++        // Distance-visibility: the probe's own c0 direction toward P — via
++        // the temporally-integrated depth moments when available (Chebyshev,
++        // see createProbeDepthMoments), else the raw ray (legacy/hatch).
++        const useChebyshev = depthMoments && !globalThis.__giNoChebyshev;
+         const rel = P.sub(probePos).toVar();
+         const dist = rel.length().toVar();
+         If(dist.greaterThan(1e-4), () => {
+           const towardP = octahedralTexelIndex(rel.div(dist), dirRes);
+-          const probeRay = c0.rays.element(probeIdx.mul(dirCount).add(towardP).toInt());
++          const probeRay = useChebyshev
++            ? null
++            : c0.rays.element(probeIdx.mul(dirCount).add(towardP).toInt());
+           // Soft rejection: fade the probe out over [tol, 2·tol] of blocker
+           // penetration instead of a binary cut — the hard zero produced
+           // visible blotch/scallop boundaries where the rejection state
+@@ -383,15 +492,64 @@ export function createIrradianceGather(cascades, probeIrradiance = null, fieldCe
+           const behindPlane = rel.dot(N).greaterThan(0.02);
+           // A/B escape hatches, dev/harness only (scripts/run-gi-rc-lattice.mjs).
+           if (!globalThis.__giNoVisProxy) {
+-            If(
+-              probeRay.w
+-                .greaterThanEqual(0)
+-                .and(dist.greaterThan(minProbeCellV.mul(2)).or(behindPlane)),
+-              () => {
+-                const penetration = dist.sub(probeRay.w);
+-                weight.mulAssign(smoothstep(visTolV, visTolV.mul(2), penetration).oneMinus());
+-              },
+-            );
++            if (useChebyshev) {
++              // CHEBYSHEV VISIBILITY over the integrated (μ, μ²) — the
++              // object-motion flicker fix at the weights (Phase 2). The
++              // spatial envelope deliberately tracks the old proxy's: the
++              // tolerance is a DEAD ZONE subtracted from the penetration
++              // first (a probe ray on a surface legitimately records its hit
++              // up to ~a voxel early — see visTolerance), and the variance
++              // floor of (visTol/2)² makes a converged static scene fall off
++              // over the old [tol, 2tol] band. Work the arithmetic at the
++              // floor (σ² = 0.25·tol²): penetration tol → vis 1.0 (old 1.0),
++              // 1.5·tol → 0.474 (old 0.5), 2·tol → 0.158 (old 0). That is the
++              // old envelope, with a small tail the DDGI 0.05 trim above
++              // already clips.
++              //
++              // NO CUBE HERE. `vis³` was tried (2026-08-03) to force the
++              // 2·tol endpoint to ~0, and it DID — by crushing the whole
++              // band with it: ×0.106 instead of ×0.5 at 1.5·tol, ~5× the
++              // rejection everywhere the test is partially engaged. The
++              // gather renormalizes by surviving weight, so in dense
++              // geometry (columns, curtains) whole receivers lost every cage
++              // probe and read 0 — the user's Sponza went from ambient-lit
++              // to a black hall outside the sunbeam. Optimize the ENVELOPE,
++              // not the endpoint.
++              //
++              // What changes vs the raw proxy is the TEMPORAL
++              // behaviour: a churning mover raises σ² for exactly the
++              // directions it churns, softening the cut there instead of
++              // flipping it per frame. Gates: μ near the c0 interval end =
++              // a mostly-miss direction = no occluder in reach (the smooth
++              // version of the old `ray.w >= 0` hit gate); the short-range
++              // coplanar exemption is unchanged.
++              const m = depthMoments.element(probeIdx.mul(dirCount).add(towardP).toInt()).toVar();
++              const mu = m.x;
++              const nearGate = float(c0.intervalLen).mul(0.95);
++              If(
++                mu.lessThan(nearGate)
++                  .and(dist.greaterThan(minProbeCellV.mul(2)).or(behindPlane)),
++                () => {
++                  const halfTol = visTolV.mul(0.5);
++                  const sigma2 = m.y.sub(mu.mul(mu)).max(halfTol.mul(halfTol)).toVar();
++                  const gap = dist.sub(mu).sub(visTolV).max(0).toVar();
++                  const cheb = sigma2.div(sigma2.add(gap.mul(gap)));
++                  // DDGI light-leak trim (cut the tail, sharpen with a cube).
++                  const vis = cheb.sub(0.05).div(0.95).clamp(0, 1).toVar();
++                  weight.mulAssign(vis);
++                },
++              );
++            } else {
++              If(
++                probeRay.w
++                  .greaterThanEqual(0)
++                  .and(dist.greaterThan(minProbeCellV.mul(2)).or(behindPlane)),
++                () => {
++                  const penetration = dist.sub(probeRay.w);
++                  weight.mulAssign(smoothstep(visTolV, visTolV.mul(2), penetration).oneMinus());
++                },
++              );
++            }
+           }
+           // BACKFACE rejection, METRIC not angular: a probe on the far side
+           // of a thin wall/slab/ceiling carries the other side's light, and
+@@ -593,6 +751,7 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
+   const gather = createIrradianceGather(
+     cascades, options.probeIrradiance ?? null, world.cellMax, "giFeedbackGather",
+     volume.occupancyField ?? null,
++    options.depthMoments ?? null,
+   );
+   const { res } = volume;
+   const cellCount = res.x * res.y * res.z;
+@@ -699,9 +858,29 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
+     // BEFORE everything expensive. A skipped cell's radiance/indirect buffers
+     // are left untouched — that is the whole mechanism.
+     if (checkerParity) {
+-      If(instanceIndex.toFloat().mod(2).sub(checkerParity).abs().greaterThan(0.5), () => {
+-        Return();
+-      });
++      // parity < 0 = checker OFF (every cell every frame) — GISystem writes
++      // the sentinel per tick, which is what makes this A/B-able live.
++      //
++      // PARITY IS PER ROW, NOT PER CELL, and that is the whole difference
++      // between a 25% saving and a 50% one. `instanceIndex % 2` alternates
++      // individual LANES, and a GPU wave costs the max over its active lanes
++      // — so a half-idle wave still takes a full wave's time and only the
++      // memory traffic drops (measured: halving the cells bought 0.4ms of a
++      // 1.7ms pass). Cell index is x-major, so `floor(idx / res.x)` is
++      // constant along the whole x row: a wave's 32 consecutive threads share
++      // one decision and an idle wave exits outright. Spatially this
++      // alternates ROWS in (y, z) instead of cells in x — every cell still
++      // has fresh neighbours on two axes, which is all the downstream
++      // trilinear/probe averaging asks for.
++      const rowParity = floor(instanceIndex.toFloat().div(res.x)).mod(2);
++      If(
++        float(checkerParity).greaterThanEqual(0).and(
++          rowParity.sub(checkerParity).abs().greaterThan(0.5),
++        ),
++        () => {
++          Return();
++        },
++      );
+     }
+     const surface = volume.surfaceBuffer.element(instanceIndex).toVar();
+     // Hoisted local (see the uniform-loads-in-loops notes elsewhere).
+@@ -712,6 +891,12 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
+     // pixel at the exact hit, which is what keeps mirror images crisp
+     // instead of cell-blurred. Kept in lockstep with `out` below.
+     const indirect = vec3(base.xyz).toVar();
++    // Direct irradiance is used to generate the next diffuse bounce, but is
++    // not written into the final radiance field. The regular analytic light
++    // contributes that term at the receiver (with the GI shadow node), so
++    // storing it here as well would double-count direct light and clip bright
++    // shadow boundaries to white.
++    const directIrradiance = vec3(0).toVar();
+     // Reliability gate matches the CPU direct bake's 0.35 threshold.
+     If(surface.w.greaterThan(0.35), () => {
+       const idx = instanceIndex.toFloat();
+@@ -751,7 +936,6 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
+       // traced occlusion (smooth as the light moves — no voxel popping),
+       // Lambert /π. The CPU bake now carries emissive only.
+       if (lightSlots?.length && shadowTrace) {
+-        const rawAlbedo = surface.xyz;
+         for (const slot of lightSlots) {
+           If(slot.active.greaterThan(0.5), () => {
+             const isDir = float(slot.kind).toVar();
+@@ -803,14 +987,24 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
+               // whether the FLICKER stops.
+               // Trace direction only — energy/gates stay on the exact dir.
+               const traceDir = jitter ? jitterDir(dir, jitter.angle) : dir;
+-              let shadow = lightShadow(origin, traceDir, maxT, float(20), ndotl);
++              // Per-light cone softness (slot.soft — Blender's Angle for
++              // directional, source Radius for point; see GISystem's slot
++              // comment). Point angular size = radius/distance, so its
++              // shadows sharpen toward contact like a real area light.
++              const penK = slot.soft
++                ? float(1).div(
++                    mix(
++                      float(slot.soft).div(pointDist.max(0.25)).clamp(0.005, 0.6),
++                      float(slot.soft).max(0.001),
++                      isDir,
++                    ),
++                  )
++                : undefined;
++              let shadow = lightShadow(origin, traceDir, maxT, float(20), ndotl, penK);
+               if (fieldShadowOff) shadow = mix(shadow, float(1), fieldShadowOff);
+-              const direct = rawAlbedo
+-                .mul(energy)
+-                .mul(shadow)
+-                .mul(smoothstep(0.002, 0.006, lum))
+-                .mul(1 / Math.PI);
+-              out.assign(vec4(out.xyz.add(direct), out.w));
++              directIrradiance.addAssign(
++                energy.mul(shadow).mul(smoothstep(0.002, 0.006, lum)),
++              );
+             });
+           });
+         }
+@@ -822,7 +1016,6 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
+       // SAME emitterSlotFactor the receiver-side material term uses, so the
+       // two stay in agreement).
+       if (emitterSlots?.length && shadowTrace) {
+-        const rawAlbedo = surface.xyz;
+         for (const slot of emitterSlots) {
+           If(slot.radius.greaterThan(0.001), () => {
+             const rel = vec3(slot.center).sub(cellCenter).toVar();
+@@ -876,12 +1069,12 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
+               });
+               // Same live hatch as the analytic block above.
+               if (fieldShadowOff) shadow.assign(mix(shadow, float(1), fieldShadowOff));
+-              const direct = rawAlbedo
+-                .mul(vec3(slot.color))
+-                .mul(factor.mul(1 / Math.PI))
+-                .mul(shadow)
+-                .mul(smoothstep(0.002, 0.006, emitterCellLum));
+-              out.assign(vec4(out.xyz.add(direct), out.w));
++              directIrradiance.addAssign(
++                vec3(slot.color)
++                  .mul(factor)
++                  .mul(shadow)
++                  .mul(smoothstep(0.002, 0.006, emitterCellLum)),
++              );
+             });
+           });
+         }
+@@ -892,11 +1085,15 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
+       // both-sides rule made every wall's OUTSIDE shell re-radiate the
+       // room's energy (glowing wall backs, light pools outside). max/min:
+       // WGSL min/max return the non-NaN operand → NaN scrub for the loop.
+-      const irradiance = gather(cellCenter.add(normal.mul(normalLiftV)), normal, vec3(0)).max(vec3(0)).min(vec3(1e4));
++      const irradiance = gather(cellCenter.add(normal.mul(normalLiftV)), normal, vec3(0))
++        .add(directIrradiance)
++        .max(vec3(0))
++        .min(vec3(1e4));
+       // Albedo clamped to 0.9: a pure-white (albedo 1.0) enclosed room makes
+       // the feedback series diverge even at gain 1 — real surfaces never
+       // reflect 100%, and the clamp guarantees loop gain ≤ 0.9·gainUniform.
+-      // Accumulates onto `out` (which already carries base + analytic direct).
++      // Accumulates onto `out` (base + indirect bounce only). Direct light is
++      // kept separate above so it is not emitted twice at the receiver.
+       const albedo = surface.xyz.min(vec3(0.9));
+       const bounceTerm = albedo.mul(irradiance).div(Math.PI).mul(gainUniform);
+       out.assign(vec4(out.xyz.add(bounceTerm), 1));
+diff --git a/src/modules/gi/cascadeTrace.js b/src/modules/gi/cascadeTrace.js
+index c8321db..7c78d37 100644
+--- a/src/modules/gi/cascadeTrace.js
++++ b/src/modules/gi/cascadeTrace.js
+@@ -16,7 +16,7 @@
+ // per-direction loop inside the trace shader — a prior GI attempt hit
+ // multi-second pipeline-compile stalls from JS-unrolled direction loops, and
+ // per-ray threads sidestep the whole class.
+-import { Fn, If, Loop, float, floor, instanceIndex, instancedArray, max, mod, step, uniform, vec2, vec3, vec4 } from "three/tsl";
++import { Fn, If, Loop, Return, float, floor, instanceIndex, instancedArray, max, mod, step, uniform, vec2, vec3, vec4 } from "three/tsl";
+ 
+ /**
+  * Octahedral texel-center direction for a dirIdx in a res×res tile.
+@@ -103,7 +103,7 @@ export function probeLatticePosition(probeIdxF, grid, world) {
+  * @param {number} opts.farT max distance for the outermost cascade
+  * @param {Function} opts.sceneTrace (origin, dir) → { rad: vec3, t: float (<0 miss) }
+  */
+-export function createRadianceCascades({ world, cascadeCount, c0Grid, c0DirRes, t0, farT = 1e4, sceneTrace }) {
++export function createRadianceCascades({ world, cascadeCount, c0Grid, c0DirRes, t0, farT = 1e4, sceneTrace, traceParity = null }) {
+   const cascades = [];
+   // Interval parameterization as UNIFORMS (world-space lengths derived from
+   // the volume size) — an auto-fit refit rescales the intervals in place,
+@@ -139,6 +139,31 @@ export function createRadianceCascades({ world, cascadeCount, c0Grid, c0DirRes,
+       const rayIdx = instanceIndex.toFloat();
+       const probeIdx = floor(rayIdx.div(dirCount));
+       const dirIdx = mod(rayIdx, dirCount);
++      // TEMPORAL RAY REUSE (the cascade half of the feedback checkerboard).
++      // The march is the expensive part of a cascade — ~1.6ms of a 3.8ms
++      // awake frame on a 262k-tri scene — and it is re-run every frame even
++      // when only a LIGHT moved. Tracing alternate probe ROWS per frame
++      // halves it: a skipped thread simply doesn't write, so its ray keeps
++      // last frame's value, and the merge/gather downstream sees a cage whose
++      // 8 probes are at most one frame apart — the same argument the feedback
++      // checker makes at cell level.
++      //
++      // Parity is per probe ROW (constant along x) so a whole 32-thread wave
++      // shares the decision and an idle wave exits outright; a per-probe or
++      // per-ray parity leaves every wave half-active, which costs a full wave
++      // and saves only memory traffic. `parity < 0` = off (the sentinel
++      // GISystem writes), which is what keeps this A/B-able live.
++      if (traceParity) {
++        const row = floor(probeIdx.div(grid.x));
++        If(
++          float(traceParity).greaterThanEqual(0).and(
++            mod(row, 2).sub(traceParity).abs().greaterThan(0.5),
++          ),
++          () => {
++            Return();
++          },
++        );
++      }
+       const origin = probePositionOf(probeIdx).toVar();
+       const dir = directionOf(dirIdx).toVar();
+ 
+diff --git a/src/modules/gi/giField.js b/src/modules/gi/giField.js
+index c65c094..a2e40fa 100644
+--- a/src/modules/gi/giField.js
++++ b/src/modules/gi/giField.js
+@@ -744,9 +744,35 @@ function createShadowTrace(distanceTexture, world, res, lift, atlas, steps = 56,
+       const minV = vec3(world.min).toVar();
+       const sizeInvV = vec3(1).div(world.size).toVar();
+       const cellV = vec3(world.cell).toVar();
++      // ── SELF-EXCLUSION MUST TRACK THE MEDIUM THAT TRACES THE RAY ────────────
++      // Round 6's rule, applied to the one trace that never got it: "a
++      // visibility proxy's tolerance must track the QUANTIZATION OF WHATEVER
++      // ACTUALLY TRACED THE RAY." Under the occupancy backend `dRaw` comes from
++      // the oracle (`freeRadiusAtWorld` below), which measures distance to
++      // occupied VOXEL AABBs and therefore reads exactly 0 anywhere inside an
++      // occupied voxel — and conservative voxelization marks every voxel a
++      // triangle touches, so a receiver standing ON a surface is INSIDE one.
++      // These cuts were still sized off the composited FIELD cell (0.05m on the
++      // Cornell repro) while the oracle quantizes at the OCCUPANCY VOXEL
++      // (0.122m) — 2.4x coarser. The own-plane test then read the receiver's
++      // own floor as an occluder wherever the shaded point fell in the voxel
++      // lattice, zeroing the emitter's direct light in GRID-ALIGNED BLOTCHES:
++      // measured 54-73% darker and 7-12x blotchier the moment `emissiveShadows`
++      // promoted an emissive mesh onto this trace (scripts/run-gi-emissive.mjs).
++      // Same failure family as session 19's AO trap, which needed 2 voxels of
++      // self-surface allowance for exactly this reason.
++      // `__giNoOccSelfCut` restores the old sizing (BUILD-TIME — set it via
++      // evaluateOnNewDocument before load, per the hatch rule).
++      const occVox = occField && killSdf && occField.voxel && !globalThis.__giNoOccSelfCut
++        ? vec3(occField.voxel).x.max(vec3(occField.voxel).y).max(vec3(occField.voxel).z).toVar()
++        : null;
++      // `liftV` stays the TRUE ray-origin lift and must not be inflated with
++      // it: `planeHeight = liftV + t·cos` is the height being tested, so
++      // raising it LOWERS the bar for calling a sample an occluder — the exact
++      // opposite of the intent. The tolerance is the only term that moves.
+       const liftV = float(liftWorld).toVar();
+       const contactCut = minCellV.mul(0.25).toVar();
+-      const planeCut = minCellV.mul(0.75).toVar();
++      const planeCut = (occVox ? minCellV.mul(0.75).max(occVox.mul(1.5)) : minCellV.mul(0.75)).toVar();
+       const capCut = capWorldV.mul(0.85).toVar();
+       const occCut = minCellV.mul(0.3).toVar();
+       const stepMin = minCellV.mul(0.35).toVar();
+diff --git a/src/modules/gi/giLight.js b/src/modules/gi/giLight.js
+index 00e4603..6ba90ec 100644
+--- a/src/modules/gi/giLight.js
++++ b/src/modules/gi/giLight.js
+@@ -384,6 +384,14 @@ export function emitterDirectAt(params, P, N, samplePoint) {
+         });
+       },
+     );
++    // LIVE A/B hatch for the RECEIVER-side emitter shadow, the twin of the
++    // field's `fieldShadowOff`. Without it there was no way to separate "the
++    // emitter's shadow trace is wrong" from "the emitter's geometric factor is
++    // wrong": the only existing hatch (__giNoFieldShadows) covers the field
++    // inject alone, so a receiver-side artifact survived it and looked like a
++    // field bug. Uniform, not a globalThis read — this body runs at shader
++    // BUILD time (see the module's hatch rule).
++    if (params.shadowOff) shadow.assign(mix(shadow, float(1), params.shadowOff));
+     const active = step(0.001, slot.radius);
+     total.addAssign(emitterDirect.mul(shadow).mul(active));
+     shadows.push(shadow);
+diff --git a/src/modules/gi/giScreen.js b/src/modules/gi/giScreen.js
+index fed1f1a..c54973f 100644
+--- a/src/modules/gi/giScreen.js
++++ b/src/modules/gi/giScreen.js
+@@ -48,7 +48,7 @@ import {
+   vec4,
+ } from "three/tsl";
+ import { MAX_EMITTERS, analyticDirectAt, decodeOctNormal, emitterDirectAt } from "./giLight.js";
+-import { EDITOR_LAYER, GI_MIRROR_LAYER } from "../../engine/editorLayers.js";
++import { DEBUG_LAYER, EDITOR_LAYER, GI_MIRROR_LAYER, UI_LAYER } from "../../engine/editorLayers.js";
+ import { ALBEDO_ATLAS_GRID, ALBEDO_ATLAS_SIZE, ALBEDO_ATLAS_TILE } from "./bvh/bvhScene.js";
+ 
+ /**
+@@ -162,6 +162,12 @@ export function renderGiGBuffer(renderer, scene, camera, gbuffer, { mirrorMask =
+   // Editor gizmos/grid would write geometry into the gbuffer and shadow the
+   // scene with objects that are not really there.
+   camera.layers.disable(EDITOR_LAYER);
++  // Same for UI and runtime debug draw. Neither is world geometry, and a
++  // screen-space HUD is laid out in UI pixels at the world origin — as gbuffer
++  // geometry that is a wall metres across sitting on the camera, so every pixel
++  // behind it would resolve GI for the HUD instead of the scene.
++  camera.layers.disable(UI_LAYER);
++  camera.layers.disable(DEBUG_LAYER);
+   scene.overrideMaterial = gbuffer.material;
+   renderer.setRenderTarget(gbuffer.rt);
+   renderer.setMRT(gbuffer.mrtNode);
+@@ -226,7 +232,7 @@ export function renderGiGBuffer(renderer, scene, camera, gbuffer, { mirrorMask =
+  * runs only on pixels that a reflective material will actually read — the mask
+  * is what makes this a mirror-pixel cost instead of a whole-screen one.
+  */
+-export function createGiResolve({ gbuffer, targets, width, height, gather, normalOffset, intensity, emitter, radiance, bvhShade = null }) {
++export function createGiResolve({ gbuffer, targets, width, height, gather, normalOffset, intensity, emitter, radiance, bvhShade = null, ao = null }) {
+   // The TARGETS are owned by the caller and outlive every rebuild: materials
+   // sample them through persistent texture nodes, so recreating them here
+   // would silently leave already-compiled materials bound to dead textures.
+@@ -270,6 +276,57 @@ export function createGiResolve({ gbuffer, targets, width, height, gather, norma
+         ? vec3(radiance.cameraPosition).sub(P).normalize().toVar()
+         : vec3(0);
+       out.assign(vec3(gather(samplePoint, N, viewDir)).mul(intensity));
++      // AMBIENT OCCLUSION ON THE INDIRECT TERM (occupancy-oracle obscurance).
++      //
++      // The probe lattice is ~1m — indirect light arrives with NO small-scale
++      // occlusion: no contact darkening under props, no corner/crevice
++      // shading ("no AO or shadows from indirect light"). The occupancy
++      // pyramid's free-radius oracle is a conservative distance bound, i.e.
++      // exactly the ingredient of the classic SDF ambient-obscurance ladder
++      // (IQ): at heights d_i along the normal, an unoccluded point has
++      // free radius ≥ d_i; the shortfall, distance-weighted, integrates to
++      // an obscurance estimate. World-space (no screen-space halo/edge
++      // artifacts), a few bitset fetches per tap at HALF RES, and it rides
++      // the pyramid the resolve's field traces already conceptually own.
++      //
++      // Applied to the GATHER term only: emitter/analytic direct have real
++      // traced shadows (penumbra estimator) — obscuring them twice reads as
++      // dirt. Reflections keep their own visibility. `strength`/`radius`
++      // are live uniforms (aoStrength/aoRadius props); the whole block is
++      // compiled out when the component's `ao` prop is off (structural).
++      if (ao?.occupancy?.freeRadiusAtWorld) {
++        const occAcc = float(0).toVar();
++        // 4 taps, linear spacing (¼..1 × radius), falloff halving per tap —
++        // the standard 4-tap SDF-AO ladder against the oracle. Two voxel-
++        // specific corrections vs the SDF original:
++        //   · SELF-SURFACE ALLOWANCE: the pixel's own surface is SET VOXELS,
++        //     and on a CURVED receiver the error is bigger than one voxel —
++        //     conservative SAT voxelization bulges up to a full voxel
++        //     OUTSIDE the true surface (every touched voxel is set), and the
++        //     gbuffer P sits anywhere inside its surface voxel, so the
++        //     oracle can read ~2 voxels of false self-occlusion. One voxel
++        //     of allowance was enough for flat floors but painted
++        //     grid-aligned grey blotches over spheres (user screenshot,
++        //     2026-08-03). Two voxels zeroes the unoccluded baseline on
++        //     curved geometry too, at the cost of slightly later contact
++        //     onset — AO now starts biting ~0.2m from a wall instead of
++        //     ~0.1m at ultra's voxel size.
++        //   · maxLevel 3 (27 near + 24 ladder fetches/tap): the oracle's
++        //     bound saturates at ~8 level-0 voxels, which covers the default
++        //     0.6m radius at every preset — capping shy of the last tap
++        //     would read open sky as occlusion.
++        const radius = float(ao.radius).max(0.05).toVar();
++        const voxN = vec3(ao.occupancy.voxel);
++        const allowance = voxN.x.max(voxN.y).max(voxN.z).mul(2).toVar();
++        for (let i = 1; i <= 4; i++) {
++          const d = radius.mul(i / 4);
++          const free = float(ao.occupancy.freeRadiusAtWorld(P.add(N.mul(d)), 3, true, null));
++          occAcc.addAssign(d.sub(allowance).sub(free).max(0).div(d).mul(1 / 2 ** (i - 1)));
++        }
++        // Normalize by Σ falloff (1+½+¼+⅛), scale, floor at 0.
++        const obscurance = occAcc.mul(float(ao.strength).div(1.875)).clamp(0, 1);
++        out.mulAssign(obscurance.oneMinus());
++      }
+       if (radiance) {
+         const incident = P.sub(radiance.cameraPosition).normalize().toVar();
+         const reflected = reflect(incident, N).toVar();
+diff --git a/src/modules/gi/occupancyField.js b/src/modules/gi/occupancyField.js
+index 55eb214..8144279 100644
+--- a/src/modules/gi/occupancyField.js
++++ b/src/modules/gi/occupancyField.js
+@@ -66,8 +66,8 @@
+ // else reads. 1.6 MB for zero risk.
+ import * as THREE from "three/webgpu";
+ import {
+-  Break, Fn, If, Loop, atomicLoad, atomicMax, atomicOr, atomicStore, bitAnd, bitOr, float, floor, instanceIndex,
+-  instancedArray, int, mod, select, shiftLeft, shiftRight, uint, uniform, uniformArray, vec3, vec4,
++  Break, Fn, If, Loop, Return, atomicLoad, atomicMax, atomicOr, atomicStore, bitAnd, bitOr, float, floor,
++  instanceIndex, instancedArray, int, mod, select, shiftLeft, shiftRight, uint, uniform, uniformArray, vec3, vec4,
+ } from "three/tsl";
+ import { sharedFn } from "./giFn.js";
+ 
+@@ -159,6 +159,46 @@ export function createOccupancyField(bounds, res0, options = {}) {
+   const bits = instancedArray(new Uint32Array(totalWords), "uint");
+   const atomicBits = instancedArray(new Uint32Array(level0.words), "uint").toAtomic();
+ 
++  // ── STATIC/DYNAMIC SPLIT ──────────────────────────────────────────────────
++  //
++  // THE MEASUREMENT THIS EXISTS FOR (run-gi-perf.mjs, user's Sponza,
++  // 2026-08-03): one animated 1m sphere cost +3.3ms (high) / +5.2ms (ultra)
++  // of GPU compute PER FRAME, because any transform change re-voxelized the
++  // ENTIRE scene — 6.25M (slot, tri, chunk) SAT work items at ultra for a
++  // mover that owns ~2k of them. In a game something always moves, so that
++  // was the steady-state cost, not a transient.
++  //
++  // The split: slots are STATIC by default; GISystem promotes a slot to
++  // DYNAMIC when its matrix changes and demotes it after a quiet period.
++  // Static slots voxelize ONCE into a level-0 snapshot (`staticBits`, plus
++  // `staticAttr` for the attribution grid); a frame where only dynamic slots
++  // moved replays the snapshot (2 buffer copies) and voxelizes ONLY the
++  // dynamic slots on top. Bit-identical to the full pass by construction:
++  // OR is commutative and the attribution uses atomicMax (deterministic
++  // winner), so static ∪ dynamic in two passes is the same set of bits as
++  // one pass over everything.
++  //
++  // A slot CHANGING SETS (static↔dynamic) marks `staticDirty`, which forces
++  // one full re-voxelize with a fresh snapshot — the snapshot must never
++  // contain a dynamic slot's footprint, or restoring it would leave the
++  // mover's stale geometry behind (`setSlotMatrix` also self-defends: a
++  // matrix write on a slot still flagged static forces the full pass).
++  // `__giNoStaticSplit = true` (live, checked per dispatch) restores the
++  // old full-re-voxelize-every-frame behaviour as the A/B arm.
++  const staticBits = instancedArray(new Uint32Array(level0.words), "uint");
++  const slotDynamic = uniformArray(Array.from({ length: slotCapacity }, () => 0), "float");
++  let dynamicCount = 0;
++  let staticDirty = true;
++  const setSlotDynamic = (slot, dyn) => {
++    if (slot < 0 || slot >= slotCapacity) return;
++    const v = dyn ? 1 : 0;
++    if (slotDynamic.array[slot] === v) return;
++    slotDynamic.array[slot] = v;
++    dynamicCount += v ? 1 : -1;
++    staticDirty = true;
++    dirty = true;
++  };
++
+   // ─────────────────────────────────────────── COARSE-CELL SURFACE ATTRIBUTES
+   //
+   // WHY THIS EXISTS: to delete the mesh-SDF atlas. The composite does not use
+@@ -200,7 +240,9 @@ export function createOccupancyField(bounds, res0, options = {}) {
+     coarseRes = { x: res.x, y: res.y, z: res.z };
+     coarseResU.value.set(res.x, res.y, res.z);
+     cellAttr = instancedArray(new Uint32Array(res.x * res.y * res.z), "uint").toAtomic();
++    staticAttr = instancedArray(new Uint32Array(res.x * res.y * res.z), "uint");
+     computesRevision = -1; // the voxelize kernel closes over this buffer
++    staticDirty = true;
+     dirty = true;
+   };
+ 
+@@ -223,6 +265,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
+     if (slot < 0 || slot >= slotCapacity) return;
+     if (slotAtlas.array[slot] === atlasSlot) return;
+     slotAtlas.array[slot] = atlasSlot;
++    staticDirty = true; // attribution numbering changed → the snapshot's attr is stale
+     dirty = true;
+   };
+ 
+@@ -419,9 +462,23 @@ export function createOccupancyField(bounds, res0, options = {}) {
+    * One thread per WORK ITEM = (slot, triangle, chunk). Rebuilt whenever the
+    * geometry buffers change, because the body closes over them and the
+    * dispatch size is the work-item count.
++   *
++   * `filter` ("static" | "dynamic" | null) makes the pass cover only one
++   * side of the static/dynamic split. Both variants still DISPATCH the full
++   * work-item count — a thread whose slot is on the other side exits after
++   * two reads. That trade is deliberate: per-slot work-item ranges would
++   * need a CPU work-list rebuild every time the dynamic SET changes, while
++   * the exit-only threads cost well under 0.1ms even at ultra's 6.25M items
++   * and the set membership is a uniform write.
+    */
+-  const buildVoxelizeCompute = () => Fn(() => {
++  const buildVoxelizeCompute = (filter = null) => Fn(() => {
+     const slot = pairSlot.element(instanceIndex).toVar();
++    if (filter) {
++      const want = filter === "dynamic" ? 1 : 0;
++      If(slotDynamic.element(slot.toInt()).notEqual(float(want)), () => {
++        Return();
++      });
++    }
+     const tri = pairTri.element(instanceIndex).toVar();
+     const chunk = pairChunk.element(instanceIndex).toVar();
+ 
+@@ -505,6 +562,25 @@ export function createOccupancyField(bounds, res0, options = {}) {
+     bits.element(instanceIndex.add(uint(level0.offset))).assign(atomicLoad(atomicBits.element(instanceIndex)));
+   })().compute(level0.words);
+ 
++  // Static/dynamic split (see staticBits above): snapshot the level-0 scratch
++  // right after the STATIC-only voxelize pass, and replay it in place of
++  // clear+static-voxelize on frames where only dynamic slots moved. The attr
++  // pair are BUILDERS like buildClearAttrCompute — they close over the
++  // current cellAttr/staticAttr allocations, which setCoarseRes replaces.
++  const snapStaticBitsCompute = Fn(() => {
++    staticBits.element(instanceIndex).assign(atomicLoad(atomicBits.element(instanceIndex)));
++  })().compute(level0.words);
++  const restoreStaticBitsCompute = Fn(() => {
++    atomicStore(atomicBits.element(instanceIndex), staticBits.element(instanceIndex));
++  })().compute(level0.words);
++  let staticAttr = instancedArray(new Uint32Array(1), "uint");
++  const buildSnapStaticAttrCompute = () => Fn(() => {
++    staticAttr.element(instanceIndex).assign(atomicLoad(cellAttr.element(instanceIndex)));
++  })().compute(Math.max(1, coarseRes.x * coarseRes.y * coarseRes.z));
++  const buildRestoreStaticAttrCompute = () => Fn(() => {
++    atomicStore(cellAttr.element(instanceIndex), staticAttr.element(instanceIndex));
++  })().compute(Math.max(1, coarseRes.x * coarseRes.y * coarseRes.z));
++
+   // ══════════════════════════════════════════════════════ SHADER: downsample
+   // One thread per PARENT WORD. A parent word is 32 voxels along x, whose
+   // children are 64 child voxels = 2 child words, for each of 2 y and 2 z —
+@@ -593,7 +669,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
+    *          which is better than the SDF-gradient normals it replaces
+    *   voxel  level-0 integer voxel coords of the hit (for radiance lookups)
+    */
+-  const traceBody = (origin, dir, tMin, tMax, steps, topLevel, penK = null) => {
++  const traceBody = (origin, dir, tMin, tMax, steps, topLevel, penK = null, penLevels = 0, penCap = null, penMaxLevel = 1, failClosed = false) => {
+     const inv = vec3(voxelInv).toVar();
+     const q0 = vec3(origin).sub(vec3(gridOrigin)).mul(inv).toVar();
+     const dq = vec3(dir).mul(inv).toVar();
+@@ -687,14 +763,42 @@ export function createOccupancyField(bounds, res0, options = {}) {
+           // falsely dim every ray that runs near a grid plane in open space.
+           // `freeRadiusAtWorld`'s 3×3×3 block is continuous by construction
+           // and measures distance to actual set bits.
+-          // Only while the march is DESCENDED (level ≤ 1): those are the
+-          // steps that graze geometry — open-space strides at high levels
+-          // contribute ~1 anyway and would pay 27 fetches each for it.
+-          If(level.lessThanEqual(int(1)), () => {
++          // Only while the march is DESCENDED (level ≤ `penMaxLevel`): those
++          // are the steps that graze geometry — open-space strides at high
++          // levels contribute ~1 anyway and would pay 27 fetches each for it.
++          //
++          // "CONTRIBUTE ~1 ANYWAY" IS A HARD-LIGHT ASSUMPTION. `cand` is
++          // k·d/t, so a coarse stride is a no-op only when k is large (the
++          // sun: k = 40). For a soft area emitter (k ≈ 5) a coarse step's
++          // real contribution is well below 1, and skipping it means the
++          // penumbra is accumulated on SOME steps and not others — decided by
++          // where the ray sits in the pyramid, which is the voxel lattice.
++          // That prints as a grid of dark lines across the floor inside an
++          // occluder's penumbra (measured: floor blotch 0.018 → 0.065 when
++          // emitter shadows moved onto this DDA, and unchanged by widening
++          // the clearance reach — the samples were never being TAKEN).
++          // Default 1 keeps the sun byte-identical.
++          If(level.lessThanEqual(int(penMaxLevel)), () => {
+             const tm = t.add(tNext.max(0).mul(0.5)).toVar();
+             const qm = q0.add(dq.mul(tm));
+             const pWorld = qm.mul(vec3(voxel)).add(vec3(gridOrigin));
+-            const d = freeRadiusAtWorld(pWorld, 0, true, null);
++            // REACH MUST COVER `t/k`, OR OPEN SPACE READS AS OCCLUSION.
++            // At `penLevels = 0` the far-field ladder is skipped entirely
++            // (`startLevel` is 1 when the near field ran), so an empty
++            // neighbourhood returns the 3×3×3 BLOCK INSET — a value in
++            // [1, 1.5] voxels that is PERIODIC IN THE LATTICE. `cand` only
++            // clamps below 1 when `k·d < t`, so for a hard, distant light
++            // (the sun: k = 1/0.025 = 40) that never happens and the
++            // periodicity is invisible. For a SOFT AREA EMITTER k is tiny
++            // (k = dist/angularRadius ≈ 5 for a 1.2m cube at 3m), so
++            // `0.15·5/t` clamps for every t past ~0.75m and the lattice
++            // period prints straight onto the floor as grout lines — the
++            // exact artifact measured when emitter shadows moved onto this
++            // DDA (floor blotch 0.018 → 0.065, scripts/run-gi-emissive.mjs).
++            // Callers that need a soft cone pass `penLevels` (ladder reach
++            // 2^L·voxel) plus `penCap`, which returns "far" outright when the
++            // top level's 2×2×2 is empty. Defaults keep the sun byte-identical.
++            const d = freeRadiusAtWorld(pWorld, penLevels, true, penCap);
+             const cand = float(penK).mul(d).div(tm.max(1e-4)).clamp(0, 1);
+             // Gated: not before ~2 voxels of travel (the surface's own
+             // neighbourhood must not clamp rays at birth) and not past tMax
+@@ -739,7 +843,14 @@ export function createOccupancyField(bounds, res0, options = {}) {
+     // gave up" and it fires on far fewer rays than level 1 did.
+     // `__giNoFailClosed` disables BOTH this and the shadow trace's clamp, so a
+     // single flag answers "is the flicker something I introduced?" in one test.
+-    if (!globalThis.__giNoFailClosed) {
++    if (failClosed) {
++      // Direct visibility must never turn an unresolved traversal into a
++      // bright leak. A resolved volume exit is still a miss; only a march
++      // which actually consumed its budget is conservatively blocked.
++      const ranOut = resolved.lessThan(0.5);
++      hit.assign(select(ranOut, float(1), hit));
++      hitT.assign(select(ranOut, t, hitT));
++    } else if (!globalThis.__giNoFailClosed) {
+       const ranOutInDetail = resolved.lessThan(0.5).and(level.lessThanEqual(int(0)));
+       hit.assign(select(ranOutInDetail, float(1), hit));
+       hitT.assign(select(ranOutInDetail, t, hitT));
+@@ -768,11 +879,25 @@ export function createOccupancyField(bounds, res0, options = {}) {
+     // analytic cone-occlusion accumulator (see traceBody's penumbra note) and
+     // returns it as `.pen` — 1 = clear, →0 as the ray grazes geometry.
+     const penumbra = opts.penumbraK != null;
+-    const key = `${steps}|${topLevel}|${penumbra ? 1 : 0}`;
++    // Cone reach for the penumbra's clearance samples. 0 = near field only
++    // (the sun's setting — a hard light never clamps, so the block inset it
++    // returns is invisible); a SOFT light must pass enough levels to cover
++    // `t/k` or open space reads as occlusion. `penCap` is a plain number, the
++    // "nothing within the top level" escape value. Both are part of the
++    // VARIANT KEY: they change the emitted WGSL, and reusing a cached fn
++    // across different values would silently serve the wrong reach.
++    const penLevels = Math.min(OCC_LEVELS - 1, Math.max(0, opts.penLevels ?? 0));
++    const penCap = opts.penCap ?? null;
++    const penMaxLevel = Math.min(OCC_LEVELS - 1, Math.max(0, opts.penMaxLevel ?? 1));
++    const failClosed = opts.failClosed === true;
++    const key = `${steps}|${topLevel}|${penumbra ? 1 : 0}|${penLevels}|${penCap ?? "n"}|${penMaxLevel}|${failClosed ? 1 : 0}`;
+     let fn = traceVariants.get(key);
+     if (fn === undefined) {
+       fn = sharedFn({
+-        name: `giOccTrace${steps}_${topLevel}${penumbra ? "p" : ""}`,
++        // The NAME must separate every variant the KEY does — sharedFn emits
++        // one WGSL function per name, so two configs sharing a name would have
++        // the first one's body serve both.
++        name: `giOccTrace${steps}_${topLevel}${penumbra ? `p${penLevels}g${penMaxLevel}c${penCap == null ? "n" : String(penCap).replace(/[^0-9]/g, "")}` : ""}${failClosed ? "f" : ""}`,
+         type: "vec4",
+         inputs: [
+           { name: "origin", type: "vec3" },
+@@ -782,8 +907,8 @@ export function createOccupancyField(bounds, res0, options = {}) {
+           ...(penumbra ? [{ name: "penK", type: "float" }] : []),
+         ],
+         body: penumbra
+-          ? (o, d, t0, t1, k) => traceBody(o, d, t0, t1, steps, topLevel, k)
+-          : (o, d, t0, t1) => traceBody(o, d, t0, t1, steps, topLevel),
++          ? (o, d, t0, t1, k) => traceBody(o, d, t0, t1, steps, topLevel, k, penLevels, penCap, penMaxLevel, failClosed)
++          : (o, d, t0, t1) => traceBody(o, d, t0, t1, steps, topLevel, null, 0, null, 1, failClosed),
+       });
+       traceVariants.set(key, fn);
+     }
+@@ -1123,6 +1248,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
+     stats.pairs = pairCount;
+     stats.slots = placements.length;
+     stats.buildMs = performance.now() - t0;
++    staticDirty = true;
+     dirty = true;
+   };
+ 
+@@ -1130,6 +1256,11 @@ export function createOccupancyField(bounds, res0, options = {}) {
+   const setSlotMatrix = (slot, matrix) => {
+     if (slot < 0 || slot >= slotCapacity) return;
+     localToWorld.array[slot].copy(matrix);
++    // Self-defence for the split: a matrix write on a slot still flagged
++    // STATIC invalidates the snapshot (its baked footprint moved). GISystem
++    // flags movers dynamic before writing, so this fires only on the first
++    // frame of an unannounced move — one full pass, then fast ones.
++    if (slotDynamic.array[slot] === 0) staticDirty = true;
+     dirty = true;
+   };
+ 
+@@ -1161,11 +1292,18 @@ export function createOccupancyField(bounds, res0, options = {}) {
+       return dirty;
+     },
+     invalidate() {
++      // Conservative by design: invalidate is the async-pipeline retry path
++      // (GISystem re-arms after skipped dispatches), and a skipped FULL chain
++      // may have skipped the snapshot writes — a fast replay of that
++      // snapshot would restore garbage. Forcing the full chain costs one
++      // extra full voxelize during pipeline warmup only.
++      staticDirty = true;
+       dirty = true;
+     },
+ 
+     setGeometry,
+     setSlotMatrix,
++    setSlotDynamic,
+     slotCapacity,
+     /**
+      * Bumped by `setGeometry` only — NOT by `setSlotMatrix`. Consumers use it
+@@ -1182,6 +1320,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
+     refit() {
+       syncVoxel();
+       syncStats();
++      staticDirty = true; // a refit re-scales voxel space — every baked bit moved
+       dirty = true;
+     },
+ 
+@@ -1207,6 +1346,10 @@ export function createOccupancyField(bounds, res0, options = {}) {
+       // (the 15c zero-flicker-when-static rule holds).
+       const jitterAmp = globalThis.__giVoxelJitter ?? 0;
+       if (jitterAmp > 0) {
++        // The static snapshot was voxelized at a specific grid origin — a
++        // jittered origin invalidates it every dispatch, so the split and the
++        // (default-off, do-not-enable) grid jitter are mutually exclusive.
++        staticDirty = true;
+         jitterFrame = (jitterFrame + 1) % 4096;
+         // R3 low-discrepancy offsets in [-0.5, 0.5).
+         const jx = ((jitterFrame * 0.8191725133961645) % 1) - 0.5;
+@@ -1219,11 +1362,38 @@ export function createOccupancyField(bounds, res0, options = {}) {
+         );
+       }
+       if (computesRevision !== geometryRevision) {
+-        computes = [clearCompute, buildClearAttrCompute(), buildVoxelizeCompute(), copyCompute, ...downsampleComputes];
++        // Two chains, both cached until the geometry buffers change:
++        //   FULL — clear, voxelize the static side, snapshot it, then add the
++        //          dynamic side. With no dynamic slots the static pass covers
++        //          everything and the snapshot is simply the whole scene.
++        //   FAST — replay the snapshot (2 copies) + dynamic side only. Runs
++        //          on every frame where only dynamic transforms changed —
++        //          the game steady state this split exists for.
++        const voxStatic = buildVoxelizeCompute("static");
++        const voxDynamic = buildVoxelizeCompute("dynamic");
++        computes = {
++          full: [
++            clearCompute, buildClearAttrCompute(),
++            voxStatic, snapStaticBitsCompute, buildSnapStaticAttrCompute(),
++            voxDynamic, copyCompute, ...downsampleComputes,
++          ],
++          fast: [
++            restoreStaticBitsCompute, buildRestoreStaticAttrCompute(),
++            voxDynamic, copyCompute, ...downsampleComputes,
++          ],
++        };
+         computesRevision = geometryRevision;
++        staticDirty = true; // fresh kernels → fresh snapshot before any fast replay
+       }
+       stats.dispatches++;
+-      return computes;
++      const canFast =
++        !staticDirty && dynamicCount > 0 && globalThis.__giNoStaticSplit !== true;
++      if (canFast) {
++        stats.fastDispatches = (stats.fastDispatches ?? 0) + 1;
++        return computes.fast;
++      }
++      staticDirty = false;
++      return computes.full;
+     },
+ 
+     traceOccupancy,

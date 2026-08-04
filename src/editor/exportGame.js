@@ -47,6 +47,35 @@ export function formatBytes(n) {
 
 const noop = () => {};
 
+/**
+ * Build for the menu / Ctrl+B path, which has no panel to render a result
+ * into. Toasts are that path's only feedback — without them a failed build
+ * is invisible anywhere but the Console.
+ */
+export async function exportGameWithToasts() {
+  const { pushToast, dismissToastKey } = await import("./toasts.js");
+  const report = await exportGame({
+    onProgress: ({ message }) =>
+      pushToast({ level: "info", title: "Building…", detail: message, key: "menu-build", timeoutMs: 60000 }),
+  });
+  if (report.cancelled) {
+    dismissToastKey("menu-build");
+  } else if (!report.ok) {
+    pushToast({ level: "error", title: "Build failed", detail: report.error, key: "menu-build" });
+  } else {
+    const warned = report.warnings?.length
+      ? ` (${report.warnings.length} warning${report.warnings.length === 1 ? "" : "s"} — see Console)`
+      : "";
+    pushToast({
+      level: "info",
+      title: `Build finished${warned}`,
+      detail: report.zipPath ?? report.outDir,
+      key: "menu-build",
+    });
+  }
+  return report;
+}
+
 async function runExport({ outDir: presetOut, onProgress = noop, buildOverride = {} } = {}) {
   const warnings = [];
   const fail = (error) => ({ ok: false, error, warnings });
@@ -115,6 +144,7 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
 
   onProgress({ phase: "scenes", message: "Resolving scenes…" });
   const openScenePath = currentScenePath();
+  const openRel = root && openScenePath ? toProjectRelative(root, openScenePath) : "";
   const available = root
     ? (await listProjectAssets(root, ["scene"], 8)).map((abs) => toProjectRelative(root, abs))
     : [];
@@ -122,15 +152,13 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
     available,
     build,
     mainScene: meta.projectMeta?.mainScene ?? "",
-    openScene: root && openScenePath ? toProjectRelative(root, openScenePath) : "",
+    openScene: openRel,
   });
   warnings.push(...plan.warnings);
   if (!plan.startScene) return fail("No scene to build — save a scene first.");
 
   const samePath = (a, b) =>
     !!a && !!b && normalizeRelPath(a).toLowerCase() === normalizeRelPath(b).toLowerCase();
-  const openRel = root && openScenePath ? toProjectRelative(root, openScenePath) : "";
-
   /**
    * The scene JSON to ship for one project-relative path. The scene open in
    * the editor is serialized live rather than read off disk: exporting is the
@@ -340,32 +368,55 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
 
     // --- Referenced documents ------------------------------------------------
     onProgress({ phase: "assets", message: "Rewriting asset references…" });
+    // A referenced document that no longer exists (an asset deleted after a
+    // scene started referencing it) is a warning, not a failed build — same
+    // policy as the scene loop above. The runtime already tolerates the
+    // resulting 404 with a default material/skipped script, and "I deleted an
+    // asset and now nothing builds" is worse than either.
     for (const src of scriptPaths) {
       onProgress({ phase: "assets", message: `Reading script ${basename(src)}…` });
-      const raw = await readRequiredText(src, "script");
-      files.push([claimDoc(src, (name) => name.replace(/\.ts$/i, ".js")), await transpileScript(raw)]);
+      try {
+        const raw = await readRequiredText(src, "script");
+        files.push([claimDoc(src, (name) => name.replace(/\.ts$/i, ".js")), await transpileScript(raw)]);
+      } catch (err) {
+        warnings.push(`Skipped script ${src}: ${err?.message ?? err}`);
+      }
     }
     for (const src of materialPaths) {
       onProgress({ phase: "assets", message: `Reading material ${basename(src)}…` });
-      const def = JSON.parse(await readRequiredText(src, "material"));
-      if (def.map) def.map = claim(def.map);
-      for (const n of def.shaderGraph?.nodes ?? []) {
-        if (n.type === "texture" && n.props?.path) n.props.path = claim(n.props.path);
+      try {
+        const def = JSON.parse(await readRequiredText(src, "material"));
+        if (def.map) def.map = claim(def.map);
+        for (const n of def.shaderGraph?.nodes ?? []) {
+          if (n.type === "texture" && n.props?.path) n.props.path = claim(n.props.path);
+        }
+        files.push([claimDoc(src), JSON.stringify(def)]);
+      } catch (err) {
+        warnings.push(`Skipped material ${src}: ${err?.message ?? err}`);
       }
-      files.push([claimDoc(src), JSON.stringify(def)]);
     }
     const { normalizeCubemapDef, CUBEMAP_FACES } = await import("../engine/cubemapAsset.js");
     for (const src of cubemapPaths) {
       onProgress({ phase: "assets", message: `Reading cubemap ${basename(src)}…` });
-      const def = normalizeCubemapDef(JSON.parse(await readRequiredText(src, "cubemap")));
-      for (const { key } of CUBEMAP_FACES) {
-        if (def.faces[key]) def.faces[key] = claim(def.faces[key]);
+      try {
+        const def = normalizeCubemapDef(JSON.parse(await readRequiredText(src, "cubemap")));
+        for (const { key } of CUBEMAP_FACES) {
+          if (def.faces[key]) def.faces[key] = claim(def.faces[key]);
+        }
+        files.push([claimDoc(src), JSON.stringify(def)]);
+      } catch (err) {
+        warnings.push(`Skipped cubemap ${src}: ${err?.message ?? err}`);
       }
-      files.push([claimDoc(src), JSON.stringify(def)]);
     }
     for (const src of timelinePaths) {
       onProgress({ phase: "assets", message: `Reading timeline ${basename(src)}…` });
-      const def = JSON.parse(await readRequiredText(src, "timeline"));
+      let def;
+      try {
+        def = JSON.parse(await readRequiredText(src, "timeline"));
+      } catch (err) {
+        warnings.push(`Skipped timeline ${src}: ${err?.message ?? err}`);
+        continue;
+      }
       for (const track of def.tracks ?? []) {
         if (track.kind !== "audio") continue;
         for (const clip of track.clips ?? []) {
@@ -533,12 +584,15 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
       ]);
     }
 
-    await invoke("export_game", {
+    const missingAssets = await invoke("export_game", {
       outDir: contentDir,
       sceneJson: JSON.stringify(scene, null, 2),
       assets: [...names.copyEntries(), ...shippedSidecars, ...derivedCopies],
       files: shippedFiles,
     });
+    for (const src of missingAssets ?? []) {
+      warnings.push(`Skipped missing asset ${src} — a scene or material still references it.`);
+    }
 
     // Compressed model bytes overwrite the copies that were just made, so the
     // project's own .glb files are never touched. (Basis works the other way

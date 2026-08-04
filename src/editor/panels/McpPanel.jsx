@@ -1,7 +1,9 @@
-import { useEffect } from "react";
-import { Check, Plug, RefreshCw, TerminalSquare, X } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { AlertTriangle, Check, ChevronDown, Plug, RefreshCw, TerminalSquare, X } from "lucide-react";
 import { useMcpStore, retryMcpBridge } from "../api/mcpBridge.js";
 import { useMcpPrefs, setMcpPrefs } from "../mcpPrefs.js";
+import { useAiPrefs, setAiPrefs } from "../aiPrefs.js";
+import { PROVIDERS, getActiveProvider } from "../ai/providers/index.js";
 import {
   useMcpClientStore,
   refreshMcpClients,
@@ -11,6 +13,7 @@ import {
 } from "../mcpClients.js";
 import { ClaudeIcon, CodexIcon } from "../icons/BrandIcons.jsx";
 import { openPanel } from "../EditorShell.jsx";
+import { PopoverMenu } from "../fields/PopoverMenu.jsx";
 
 /**
  * Assistant access, as its own panel.
@@ -87,6 +90,166 @@ function ClientRow({ client }) {
   );
 }
 
+async function invoke(cmd, args) {
+  const { invoke: call } = await import("@tauri-apps/api/core");
+  return call(cmd, args);
+}
+
+/**
+ * "Test connection" for the active provider. Two completely different checks
+ * behind one button, because the two provider kinds have nothing in common to
+ * probe: a tool-loop provider is a URL (`GET {baseUrl}/models`, the
+ * OpenAI-compatible listing endpoint every such server exposes — Ollama
+ * included), the CLI provider is a binary on PATH (the same
+ * `detect_terminal_programs` call TerminalPanel.jsx already makes to find
+ * `claude`, so "is it installed" is answered identically in both places).
+ *
+ * For a tool-loop provider, a reachable server is necessary but not
+ * sufficient: the model configured in settings still has to actually be
+ * pulled. That failure mode only otherwise surfaces mid-run as an opaque
+ * "model not found" from the chat endpoint, so when the listing succeeds we
+ * cross-check the configured model against it here, where the user is
+ * already looking.
+ */
+async function testProviderConnection(provider, prefs) {
+  if (provider.id === "claude-cli") {
+    const pairs = await invoke("detect_terminal_programs");
+    const path = Object.fromEntries(pairs ?? [])?.claude ?? null;
+    return path ? { ok: true, message: `Found at ${path}` } : { ok: false, message: "claude was not found on PATH" };
+  }
+
+  // Tool-loop provider: only Ollama has settings today, but this reads the
+  // generic pair so a future OpenAI-compatible provider needs no new code here.
+  // A direct browser `fetch` here has the identical CORS problem `ai_chat`
+  // exists to solve for the actual chat requests (see toolLoop.js) — reuse
+  // the existing `fetch_text` proxy command rather than inventing a second one.
+  const baseUrl = prefs.ollamaBaseUrl;
+  let text;
+  try {
+    text = await invoke("fetch_text", { url: `${baseUrl}/models` });
+  } catch (err) {
+    return { ok: false, message: `Server responded ${err?.message ?? err}` };
+  }
+  let body = null;
+  try {
+    body = JSON.parse(text ?? "null");
+  } catch {
+    // fall through with body === null, same as the old res.json().catch(() => null)
+  }
+  const models = Array.isArray(body?.data) ? body.data.map((m) => m.id).filter(Boolean) : null;
+  if (!models) return { ok: true, message: "Reachable" };
+  const configured = prefs.ollamaModel;
+  const hasModel = models.includes(configured);
+  return {
+    ok: true,
+    message: hasModel
+      ? `Reachable · ${configured} is available`
+      : `Reachable, but "${configured}" is not pulled (have: ${models.slice(0, 4).join(", ") || "none"})`,
+  };
+}
+
+/** Provider dropdown + the active provider's own fields, disclosure, and test button. */
+function ProviderSection() {
+  const providerId = useAiPrefs((s) => s.providerId);
+  const ollamaBaseUrl = useAiPrefs((s) => s.ollamaBaseUrl);
+  const ollamaModel = useAiPrefs((s) => s.ollamaModel);
+  const provider = getActiveProvider();
+
+  const [open, setOpen] = useState(false);
+  const [test, setTest] = useState(null); // null | { pending } | { ok, message }
+  const triggerRef = useRef(null);
+
+  // Switching providers invalidates whatever the last test said.
+  useEffect(() => setTest(null), [providerId]);
+
+  const runTest = async () => {
+    setTest({ pending: true });
+    try {
+      const result = await testProviderConnection(provider, useAiPrefs.getState());
+      setTest(result);
+    } catch (err) {
+      setTest({ ok: false, message: err?.message || "Test failed" });
+    }
+  };
+
+  return (
+    <>
+      <div className="mcp-section-label">Provider</div>
+      <div className="dropdown-wrap ai-provider-wrap">
+        <button className="ai-provider-trigger" ref={triggerRef} onClick={() => setOpen((v) => !v)}>
+          <span>{provider.label}</span>
+          <ChevronDown size={12} />
+        </button>
+        {open && (
+          <PopoverMenu anchorRef={triggerRef} minWidth={220} onClose={() => setOpen(false)}>
+            {PROVIDERS.map((p) => (
+              <button
+                key={p.id}
+                className={`dropdown-item ${p.id === providerId ? "checked" : ""}`}
+                onClick={() => {
+                  setOpen(false);
+                  setAiPrefs({ providerId: p.id });
+                }}
+              >
+                {p.label}
+              </button>
+            ))}
+          </PopoverMenu>
+        )}
+      </div>
+
+      {provider.id === "ollama" ? (
+        <div className="ai-provider-fields">
+          <label className="ai-provider-field">
+            <span>Base URL</span>
+            <input
+              type="text"
+              spellCheck={false}
+              value={ollamaBaseUrl}
+              onChange={(e) => setAiPrefs({ ollamaBaseUrl: e.target.value })}
+            />
+          </label>
+          <label className="ai-provider-field">
+            <span>Model</span>
+            <input
+              type="text"
+              spellCheck={false}
+              value={ollamaModel}
+              onChange={(e) => setAiPrefs({ ollamaModel: e.target.value })}
+            />
+          </label>
+        </div>
+      ) : (
+        provider.disclosure && (
+          <div className="ai-provider-disclosure">
+            <AlertTriangle size={13} />
+            <span>{provider.disclosure}</span>
+          </div>
+        )
+      )}
+
+      <div className="ai-provider-capability">
+        {provider.capabilities.scopedTools
+          ? "Tools are limited to each workflow's allowlist."
+          : "Runs with full CLI permissions — not scoped to a workflow."}
+      </div>
+
+      <div className="mcp-actions">
+        <button className="mcp-action" disabled={test?.pending} onClick={runTest}>
+          <RefreshCw size={13} className={test?.pending ? "spin" : ""} />
+          {test?.pending ? "Testing…" : "Test connection"}
+        </button>
+      </div>
+      {test && !test.pending && (
+        <div className={`ai-provider-test ${test.ok ? "ok" : "error"}`}>
+          {test.ok ? <Check size={12} /> : <X size={12} />}
+          {test.message}
+        </div>
+      )}
+    </>
+  );
+}
+
 export function McpPanel() {
   const status = useMcpStore((s) => s.status);
   const toolCount = useMcpStore((s) => s.toolCount);
@@ -125,6 +288,8 @@ export function McpPanel() {
           <span className="mcp-switch-track" />
         </label>
       </div>
+
+      <ProviderSection />
 
       <div className="mcp-section-label">Clients</div>
       {clients === null ? (

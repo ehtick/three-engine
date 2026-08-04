@@ -1,6 +1,6 @@
 import * as THREE from "three/webgpu";
 import { Component } from "./Component.js";
-import { DEBUG_LAYER, EDITOR_LAYER } from "../editorLayers.js";
+import { DEBUG_LAYER, EDITOR_LAYER, UI_LAYER } from "../editorLayers.js";
 import { BLEND_STYLES, CameraPose, blendCurve } from "../camera/rigMath.js";
 
 /**
@@ -53,6 +53,9 @@ export class CameraComponent extends Component {
     // enabled, so without this `engine.debug` would draw into Play mode and the
     // Game view and render nothing — the two views it exists for.
     this.camera.layers.enable(DEBUG_LAYER);
+    // ...and UI, which renders in this camera's own pass rather than a second
+    // one of its own (see engine/ui/UiSystem.js).
+    this.camera.layers.enable(UI_LAYER);
     this.camera.userData.entityId = this.entity.id;
     this.entity.object3D.add(this.camera);
     this.model = buildCameraModel();

@@ -1,0 +1,41 @@
+{
+  "color": "#ffffff",
+  "roughness": 0.7,
+  "metalness": 0,
+  "map": "",
+  "shaderGraph": {
+    "nodes": [
+      {
+        "id": "em",
+        "type": "emission",
+        "props": {
+          "color": "#ffffff",
+          "emissionStrength": 5
+        },
+        "position": {
+          "x": 228,
+          "y": 176
+        }
+      },
+      {
+        "id": "output",
+        "type": "output",
+        "props": {},
+        "position": {
+          "x": 560,
+          "y": 150
+        }
+      }
+    ],
+    "edges": [
+      {
+        "id": "e1",
+        "source": "em",
+        "sourceHandle": "out",
+        "target": "output",
+        "targetHandle": "surface"
+      }
+    ]
+  },
+  "pipeline": null
+}

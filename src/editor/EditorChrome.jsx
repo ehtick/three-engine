@@ -134,7 +134,7 @@ export function EditorChrome() {
       }
       if (ctrl && !e.shiftKey && e.key.toLowerCase() === "b") {
         e.preventDefault();
-        import("./exportGame.js").then((m) => m.exportGame());
+        import("./exportGame.js").then((m) => m.exportGameWithToasts());
         return;
       }
       if (ctrl && e.shiftKey && e.key.toLowerCase() === "w") {

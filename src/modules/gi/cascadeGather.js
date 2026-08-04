@@ -19,7 +19,7 @@
 // second transport implementation. Direct material shading here deliberately
 // bypasses any G-buffer/deferred-resolve layer (where the prior attempt's
 // never-root-caused stripe bug lived).
-import { Fn, If, Loop, Return, cos, float, floor, fract, instanceIndex, instancedArray, max, mix, mod, select, sin, smoothstep, sqrt, step, uniform, vec3, vec4 } from "three/tsl";
+import { Fn, If, Loop, Return, cos, float, floor, fract, instanceIndex, instancedArray, max, mix, mod, select, sin, smoothstep, sqrt, step, uniform, vec2, vec3, vec4 } from "three/tsl";
 import { octahedralTexelIndex, octahedralUV } from "./cascadeTrace.js";
 import { sharedFn } from "./giFn.js";
 import { emitterAngularRadius, emitterSlotFactor, emitterSurfaceT } from "./giLight.js";
@@ -123,8 +123,26 @@ export function createProbeIrradiance(cascades, options = {}) {
     }
 
     const value = vec3(irradiance).toVar();
+    const opennessOut = float(openness).toVar();
     if (smoothing) {
       const prev = buffer.element(instanceIndex).toVar();
+      // OPENNESS EMA — always integrating, INDEPENDENT of probeSmoothing's
+      // value (which the user's scene sets to 1 = off): openness is a
+      // visibility WEIGHT recomputed fresh from the occupancy bits every
+      // frame, so a mover's whole-voxel footprint snaps stepped it per frame
+      // — part of the measured object-motion flicker (Phase 2). The shared
+      // depthMomentsAlpha (~8 frames) integrates the churn; a real burial
+      // change converges in ~150ms, invisible next to the burial ramp
+      // itself. prev.w < 1e-3 = never written (openness is floored at
+      // BURIED_PROBE_WEIGHT = 0.02, so a real value can't hit the sentinel)
+      // → snap, the fresh-build rule.
+      opennessOut.assign(
+        select(
+          prev.w.lessThan(1e-3),
+          openness,
+          mix(prev.w, openness, float(depthMomentsAlpha).clamp(0.01, 1)),
+        ),
+      );
       // ADAPTIVE HYSTERESIS (the DDGI recipe for "smoothing hides flicker but
       // lighting reacts too slowly"): the EMA's alpha is not one number. For
       // SMALL relative changes — voxel-quantization popping, ray-set churn as
@@ -142,15 +160,92 @@ export function createProbeIrradiance(cascades, options = {}) {
         .max(1e-4);
       const rel = delta.x.max(delta.y).max(delta.z).div(mag);
       const boost = smoothstep(0.15, 0.6, rel);
-      const adaptive = mix(base, float(probeSnapAlpha).max(base), boost);
+      // ALWAYS-ON NOISE-BAND INTEGRATION (2026-08-03, per-frame instrument
+      // run-gi-flicker-frame.mjs): with the user's Light Smoothing OFF
+      // (probeSmoothing 1 — their scene's saved value), the probe EMA was a
+      // straight passthrough and every voxel-snap pop landed raw on screen —
+      // measured 2.38 reversals/px vs 0.29 with the EMA active, i.e. THE
+      // object-motion flicker. But Light Smoothing is the LIGHT-RESPONSE
+      // knob; it must not double as "let churn through". Split the bands:
+      // small relative deltas (below the 15% noise threshold — voxel
+      // quantization, ray-set churn) integrate at ≤ probeNoiseAlpha (~4
+      // frames) REGARDLESS of the knob; large deltas (a light or object
+      // actually moved) keep the user's alpha — instant at 1. Nothing the
+      // eye should follow is slowed; only sub-threshold oscillation is
+      // refused. `__giProbeNoise = 0` restores the raw passthrough (A/B).
+      const noiseFloor = select(
+        float(probeNoiseAlpha).greaterThan(1e-3),
+        base.min(float(probeNoiseAlpha)),
+        base,
+      );
+      const adaptive = mix(noiseFloor, float(probeSnapAlpha).max(base), boost);
       // prev.w == 0 ⇒ this slot has never been written (fresh build/refit):
       // take the integral outright rather than lerping up from black.
       const alpha = select(prev.w.lessThan(1e-3), float(1), adaptive);
       value.assign(mix(prev.xyz, irradiance, alpha));
     }
-    buffer.element(instanceIndex).assign(vec4(value, openness));
+    buffer.element(instanceIndex).assign(vec4(value, opennessOut));
   })().compute(probeCount * 6);
 
+  return { buffer, compute };
+}
+
+/**
+ * PER-FRAME BLEND of the probe depth moments toward this frame's trace
+ * (createProbeDepthMoments): ~0.12 ≈ an 8-frame time constant. Deliberately
+ * INDEPENDENT of probeSmoothing — the moments smooth visibility WEIGHTS
+ * (which of 8 cage probes a receiver trusts, renormalized), not radiance, so
+ * they must keep integrating even when the user turns Light Smoothing off —
+ * which the user's own scene does (probeSmoothing 1), and which is exactly
+ * the configuration whose object-motion flicker this exists to fix.
+ * Live via `__giDepthAlpha` (1 = no temporal integration, this frame only).
+ */
+export const depthMomentsAlpha = uniform(0.12);
+
+/**
+ * DDGI-STYLE PER-PROBE DEPTH MOMENTS (GI_FLICKER_PLAN.md Phase 2 — the
+ * gather-side residual of the object-motion flicker).
+ *
+ * THE PROBLEM WITH THE RAW PROXY IT REPLACES: the gather weighted each cage
+ * probe by comparing |probe→P| against the probe's own c0 ray hit distance
+ * — read RAW from this frame's trace. A moving object re-voxelizes per
+ * frame and its footprint snaps in whole voxels, so that hit distance
+ * STEPS; near the tolerance boundary the probe's weight flips per frame,
+ * and a receiver's surviving-probe set churns — flicker that no radiance
+ * smoothing can touch, because it lives in the WEIGHTS. Measured 2026-08-03
+ * (run-gi-flicker.mjs, ultra, probeSmoothing off): 98% of tiles popping.
+ *
+ * THE FIX: per (probe, c0 direction), integrate the mean and second moment
+ * of the hit distance over time (EMA, `depthMomentsAlpha`), and let the
+ * gather weight probes by a Chebyshev visibility test against (μ, σ²)
+ * instead of a smoothstep against one raw sample. Temporal churn ENTERS the
+ * moments as variance — which SOFTENS the cut exactly where the geometry is
+ * churning — instead of flipping a binary verdict. One thread per ray-texel;
+ * two MACs more than the old proxy per gather corner.
+ *
+ * A miss (w < 0) integrates as the c0 interval end, NOT a huge constant:
+ * the proxy only ever saw occluders within c0's interval, and a mostly-miss
+ * direction must read as "no occluder in reach" (the gather gates on
+ * μ < 0.95·interval), not blow up σ². First write (μ=μ²=0 sentinel — a real
+ * depth² is always > 0) snaps to this frame outright, fresh-build rule.
+ */
+export function createProbeDepthMoments(cascades) {
+  const c0 = cascades[0];
+  const { dirCount } = c0;
+  const buffer = instancedArray(new Float32Array(c0.probeCount * dirCount * 2), "vec2");
+  const compute = Fn(() => {
+    const ray = c0.rays.element(instanceIndex).toVar();
+    const reach = float(c0.intervalLen).toVar();
+    const depth = select(ray.w.greaterThanEqual(0), ray.w.min(reach), reach).toVar();
+    const fresh = vec2(depth, depth.mul(depth)).toVar();
+    const prev = buffer.element(instanceIndex).toVar();
+    const alpha = select(
+      prev.x.add(prev.y).lessThan(1e-8),
+      float(1),
+      float(depthMomentsAlpha).clamp(0.01, 1),
+    );
+    buffer.element(instanceIndex).assign(mix(prev, fresh, alpha));
+  })().compute(c0.probeCount * dirCount);
   return { buffer, compute };
 }
 
@@ -183,6 +278,15 @@ export const gatherBias = uniform(0.5);
 export const probeSnapAlpha = uniform(0.35);
 
 /**
+ * NOISE-BAND alpha ceiling for the probe EMA (see the noiseFloor note in
+ * createProbeIrradiance): sub-15%-relative irradiance wiggles integrate at
+ * most this fast even when Light Smoothing is off. ~0.25 ≈ 4-frame ramp —
+ * kills pop-and-return churn, invisible as lag. Live via `__giProbeNoise`
+ * (0 disables — raw passthrough, the flicker A/B arm).
+ */
+export const probeNoiseAlpha = uniform(0.25);
+
+/**
  * VIEW-DIRECTION component of the same bias (fraction of a probe cell toward
  * the CAMERA), live via `__giGatherViewBias`, default 0.5 (eye-tuned with
  * the normal component above). Normal bias alone
@@ -200,7 +304,7 @@ export const gatherViewBias = uniform(0.5);
  * @param {Array} cascades from createRadianceCascades (uses cascades[0])
  * @returns {(P, N) => vec3} TSL irradiance sampler
  */
-export function createIrradianceGather(cascades, probeIrradiance = null, fieldCellMax = null, name = "giGather", occupancy = null) {
+export function createIrradianceGather(cascades, probeIrradiance = null, fieldCellMax = null, name = "giGather", occupancy = null, depthMoments = null) {
   const occupancyVoxel = occupancy?.voxel ?? null;
   const c0 = cascades[0];
   const { world, grid, dirCount, dirRes } = c0;
@@ -356,12 +460,17 @@ export function createIrradianceGather(cascades, probeIrradiance = null, fieldCe
             );
           }
         }
-        // Distance-visibility proxy: the probe's own raw c0 ray toward P.
+        // Distance-visibility: the probe's own c0 direction toward P — via
+        // the temporally-integrated depth moments when available (Chebyshev,
+        // see createProbeDepthMoments), else the raw ray (legacy/hatch).
+        const useChebyshev = depthMoments && !globalThis.__giNoChebyshev;
         const rel = P.sub(probePos).toVar();
         const dist = rel.length().toVar();
         If(dist.greaterThan(1e-4), () => {
           const towardP = octahedralTexelIndex(rel.div(dist), dirRes);
-          const probeRay = c0.rays.element(probeIdx.mul(dirCount).add(towardP).toInt());
+          const probeRay = useChebyshev
+            ? null
+            : c0.rays.element(probeIdx.mul(dirCount).add(towardP).toInt());
           // Soft rejection: fade the probe out over [tol, 2·tol] of blocker
           // penetration instead of a binary cut — the hard zero produced
           // visible blotch/scallop boundaries where the rejection state
@@ -383,15 +492,64 @@ export function createIrradianceGather(cascades, probeIrradiance = null, fieldCe
           const behindPlane = rel.dot(N).greaterThan(0.02);
           // A/B escape hatches, dev/harness only (scripts/run-gi-rc-lattice.mjs).
           if (!globalThis.__giNoVisProxy) {
-            If(
-              probeRay.w
-                .greaterThanEqual(0)
-                .and(dist.greaterThan(minProbeCellV.mul(2)).or(behindPlane)),
-              () => {
-                const penetration = dist.sub(probeRay.w);
-                weight.mulAssign(smoothstep(visTolV, visTolV.mul(2), penetration).oneMinus());
-              },
-            );
+            if (useChebyshev) {
+              // CHEBYSHEV VISIBILITY over the integrated (μ, μ²) — the
+              // object-motion flicker fix at the weights (Phase 2). The
+              // spatial envelope deliberately tracks the old proxy's: the
+              // tolerance is a DEAD ZONE subtracted from the penetration
+              // first (a probe ray on a surface legitimately records its hit
+              // up to ~a voxel early — see visTolerance), and the variance
+              // floor of (visTol/2)² makes a converged static scene fall off
+              // over the old [tol, 2tol] band. Work the arithmetic at the
+              // floor (σ² = 0.25·tol²): penetration tol → vis 1.0 (old 1.0),
+              // 1.5·tol → 0.474 (old 0.5), 2·tol → 0.158 (old 0). That is the
+              // old envelope, with a small tail the DDGI 0.05 trim above
+              // already clips.
+              //
+              // NO CUBE HERE. `vis³` was tried (2026-08-03) to force the
+              // 2·tol endpoint to ~0, and it DID — by crushing the whole
+              // band with it: ×0.106 instead of ×0.5 at 1.5·tol, ~5× the
+              // rejection everywhere the test is partially engaged. The
+              // gather renormalizes by surviving weight, so in dense
+              // geometry (columns, curtains) whole receivers lost every cage
+              // probe and read 0 — the user's Sponza went from ambient-lit
+              // to a black hall outside the sunbeam. Optimize the ENVELOPE,
+              // not the endpoint.
+              //
+              // What changes vs the raw proxy is the TEMPORAL
+              // behaviour: a churning mover raises σ² for exactly the
+              // directions it churns, softening the cut there instead of
+              // flipping it per frame. Gates: μ near the c0 interval end =
+              // a mostly-miss direction = no occluder in reach (the smooth
+              // version of the old `ray.w >= 0` hit gate); the short-range
+              // coplanar exemption is unchanged.
+              const m = depthMoments.element(probeIdx.mul(dirCount).add(towardP).toInt()).toVar();
+              const mu = m.x;
+              const nearGate = float(c0.intervalLen).mul(0.95);
+              If(
+                mu.lessThan(nearGate)
+                  .and(dist.greaterThan(minProbeCellV.mul(2)).or(behindPlane)),
+                () => {
+                  const halfTol = visTolV.mul(0.5);
+                  const sigma2 = m.y.sub(mu.mul(mu)).max(halfTol.mul(halfTol)).toVar();
+                  const gap = dist.sub(mu).sub(visTolV).max(0).toVar();
+                  const cheb = sigma2.div(sigma2.add(gap.mul(gap)));
+                  // DDGI light-leak trim (cut the tail, sharpen with a cube).
+                  const vis = cheb.sub(0.05).div(0.95).clamp(0, 1).toVar();
+                  weight.mulAssign(vis);
+                },
+              );
+            } else {
+              If(
+                probeRay.w
+                  .greaterThanEqual(0)
+                  .and(dist.greaterThan(minProbeCellV.mul(2)).or(behindPlane)),
+                () => {
+                  const penetration = dist.sub(probeRay.w);
+                  weight.mulAssign(smoothstep(visTolV, visTolV.mul(2), penetration).oneMinus());
+                },
+              );
+            }
           }
           // BACKFACE rejection, METRIC not angular: a probe on the far side
           // of a thin wall/slab/ceiling carries the other side's light, and
@@ -593,6 +751,7 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
   const gather = createIrradianceGather(
     cascades, options.probeIrradiance ?? null, world.cellMax, "giFeedbackGather",
     volume.occupancyField ?? null,
+    options.depthMoments ?? null,
   );
   const { res } = volume;
   const cellCount = res.x * res.y * res.z;
@@ -617,6 +776,14 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
   // Emitters stay on `shadowTrace` — they need the lamp-body exclusion and
   // their soft penumbrae, and they are not the leak path.
   const lightShadow = options.lightShadow ?? shadowTrace;
+  // LIVE look control (uniform, 1 = physical): desaturates the FIELD-SIDE
+  // albedo — the color bounced light carries — toward its own luminance.
+  // Energy is preserved, only chroma drops, so dialling it down turns
+  // oversaturated color bleed into neutral fill without dimming the room.
+  // Receiver-side tint (the pixel's own texture in the screen resolve) is
+  // deliberately untouched — surfaces keep their color; their REFLECTION is
+  // what desaturates. Blender-parity calibration knob (2026-08-04).
+  const bleedSaturation = options.bleedSaturation ?? null;
   const gridDiagonal = options.gridDiagonal ?? 1e4;
   // Low/medium cost halving, restructured (see GISystem's feedback-rate note):
   // when set (a 0/1 uniform flipping per frame), each dispatch updates only the
@@ -699,9 +866,29 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
     // BEFORE everything expensive. A skipped cell's radiance/indirect buffers
     // are left untouched — that is the whole mechanism.
     if (checkerParity) {
-      If(instanceIndex.toFloat().mod(2).sub(checkerParity).abs().greaterThan(0.5), () => {
-        Return();
-      });
+      // parity < 0 = checker OFF (every cell every frame) — GISystem writes
+      // the sentinel per tick, which is what makes this A/B-able live.
+      //
+      // PARITY IS PER ROW, NOT PER CELL, and that is the whole difference
+      // between a 25% saving and a 50% one. `instanceIndex % 2` alternates
+      // individual LANES, and a GPU wave costs the max over its active lanes
+      // — so a half-idle wave still takes a full wave's time and only the
+      // memory traffic drops (measured: halving the cells bought 0.4ms of a
+      // 1.7ms pass). Cell index is x-major, so `floor(idx / res.x)` is
+      // constant along the whole x row: a wave's 32 consecutive threads share
+      // one decision and an idle wave exits outright. Spatially this
+      // alternates ROWS in (y, z) instead of cells in x — every cell still
+      // has fresh neighbours on two axes, which is all the downstream
+      // trilinear/probe averaging asks for.
+      const rowParity = floor(instanceIndex.toFloat().div(res.x)).mod(2);
+      If(
+        float(checkerParity).greaterThanEqual(0).and(
+          rowParity.sub(checkerParity).abs().greaterThan(0.5),
+        ),
+        () => {
+          Return();
+        },
+      );
     }
     const surface = volume.surfaceBuffer.element(instanceIndex).toVar();
     // Hoisted local (see the uniform-loads-in-loops notes elsewhere).
@@ -719,6 +906,16 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
       const iy = mod(floor(idx.div(res.x)), res.y);
       const iz = floor(idx.div(res.x * res.y));
       const normal = volume.normalBuffer.element(instanceIndex).xyz;
+      // One desaturated field albedo for ALL bounce-color sites below (the
+      // two direct injections and the feedback term) — see bleedSaturation's
+      // note above. Null uniform → plain surface albedo, byte-identical.
+      const fieldAlbedo = bleedSaturation
+        ? mix(
+            vec3(surface.xyz.dot(vec3(0.2126, 0.7152, 0.0722))),
+            surface.xyz,
+            float(bleedSaturation),
+          ).toVar()
+        : surface.xyz;
       const cellCenter = vec3(
         ix.add(0.5).mul(world.cell.x).add(world.min.x),
         iy.add(0.5).mul(world.cell.y).add(world.min.y),
@@ -751,7 +948,7 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
       // traced occlusion (smooth as the light moves — no voxel popping),
       // Lambert /π. The CPU bake now carries emissive only.
       if (lightSlots?.length && shadowTrace) {
-        const rawAlbedo = surface.xyz;
+        const rawAlbedo = fieldAlbedo;
         for (const slot of lightSlots) {
           If(slot.active.greaterThan(0.5), () => {
             const isDir = float(slot.kind).toVar();
@@ -822,7 +1019,7 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
       // SAME emitterSlotFactor the receiver-side material term uses, so the
       // two stay in agreement).
       if (emitterSlots?.length && shadowTrace) {
-        const rawAlbedo = surface.xyz;
+        const rawAlbedo = fieldAlbedo;
         for (const slot of emitterSlots) {
           If(slot.radius.greaterThan(0.001), () => {
             const rel = vec3(slot.center).sub(cellCenter).toVar();
@@ -897,7 +1094,7 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
       // the feedback series diverge even at gain 1 — real surfaces never
       // reflect 100%, and the clamp guarantees loop gain ≤ 0.9·gainUniform.
       // Accumulates onto `out` (which already carries base + analytic direct).
-      const albedo = surface.xyz.min(vec3(0.9));
+      const albedo = fieldAlbedo.min(vec3(0.9));
       const bounceTerm = albedo.mul(irradiance).div(Math.PI).mul(gainUniform);
       out.assign(vec4(out.xyz.add(bounceTerm), 1));
       indirect.addAssign(bounceTerm);

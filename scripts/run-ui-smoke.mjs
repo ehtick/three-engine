@@ -292,7 +292,10 @@ try {
     tex.needsUpdate = true;
 
     const image = e.getEntity(globalThis.__ids.panel).getComponent("uiimage");
-    image.texture = tex;
+    // `textureMap`, not `texture`: `props.texture` is an asset path and
+    // Component mirrors it as an accessor, so assigning a THREE.Texture to
+    // `image.texture` routes into setProp and recurses (see UiImageComponent).
+    image.textureMap = tex;
     image.props.imageType = "sliced";
     image.props.sliceLeft = 4;
     image.props.sliceRight = 4;

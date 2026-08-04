@@ -54,6 +54,10 @@ import { newScene } from "../sceneIO.js";
 import { createTerrainAssets } from "../terrainAssetSetup.js";
 import { getCursor3DPosition } from "../threeDCursor.js";
 import { ContextMenu as SharedContextMenu, isTextEditTarget } from "../ContextMenu.jsx";
+import { openPanel } from "../EditorShell.jsx";
+import { runWorkflow } from "../store/aiStore.js";
+import { getWorkflow } from "../ai/workflows.js";
+import { getActiveProvider } from "../ai/providers/index.js";
 
 const DROPPABLE_ASSET_EXTENSIONS = [...PREFAB_EXTENSIONS, ...MODEL_EXTENSIONS];
 
@@ -885,6 +889,16 @@ function ContextMenu({ menu, close, setRenamingId, onCreate, onNewScene, terrain
   const single = selection.length === 1 ? selection[0] : null;
   const canPaste = clipboardHasEntities();
 
+  // A mutating workflow may only run on a provider that can close its own
+  // tool set (see aiStore.runWorkflow — this mirrors that check so the menu
+  // item is disabled rather than offered-then-refused).
+  const diagnoseWorkflow = getWorkflow("diagnose-selected");
+  const aiProvider = getActiveProvider();
+  const aiBlockedHint =
+    diagnoseWorkflow?.mutates && !aiProvider?.capabilities?.scopedTools
+      ? `${aiProvider?.label ?? "This provider"} cannot limit itself to this workflow's tools. Switch to a scoped provider (e.g. Ollama).`
+      : undefined;
+
   // Right-click on empty tree space is a "create here" gesture, not an
   // "operate on the selection" one — offering Delete/Rename for whatever
   // happened to be selected elsewhere would act on something off-screen.
@@ -917,6 +931,17 @@ function ContextMenu({ menu, close, setRenamingId, onCreate, onNewScene, terrain
         { label: "Rename", disabled: !single, action: () => setRenamingId(single) },
         ...applyTransformMenuItems(single),
         ...prefabMenuItems(single),
+        { separator: true },
+        {
+          label: "AI: Diagnose this",
+          icon: Sparkles,
+          disabled: !single || !!aiBlockedHint,
+          hint: aiBlockedHint,
+          action: () => {
+            openPanel("ai");
+            runWorkflow("diagnose-selected", single);
+          },
+        },
         { separator: true },
         { label: "Delete", shortcut: "Del", danger: true, action: deleteSelection },
       ];

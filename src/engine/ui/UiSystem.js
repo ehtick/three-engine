@@ -12,17 +12,33 @@ import {
 } from "./layout.js";
 import { isEditor } from "../editorBridge.js";
 import { FocusNavigator } from "./uiFocus.js";
+import { UI_LAYER } from "../editorLayers.js";
+import { applyElementUniforms, createUiHighlightMaterial } from "./uiMaterial.js";
 
 /**
- * Dedicated three.js layer for UI meshes. Scene cameras never enable it, so
- * UI quads (which live in the scene tree at pixel-scale coordinates) are
- * invisible to the 3D render; the UiSystem renders this layer itself, either
- * through its own orthographic camera (screen overlay) or through the scene
- * camera (world-space panels).
+ * Dedicated three.js layer for UI meshes — re-exported here because that is
+ * where every UI consumer already imports it from. It is DEFINED in
+ * editorLayers.js alongside the other reserved bits, which is what stopped it
+ * silently sharing bit 30 with the debug-draw layer.
+ *
+ * UI renders in the main scene pass: a camera that should show UI enables this
+ * bit (`CameraComponent`, the editor orbit camera) and every auxiliary pass
+ * leaves it off.
  */
-export const UI_LAYER = 30;
+export { UI_LAYER };
 
 const CLICK_SLOP_PX = 5;
+
+/**
+ * Base renderOrder for UI. UI is transparent and draws after opaque geometry
+ * anyway, but scene content is free to use renderOrder for its own sorting, so
+ * UI starts far above anything a scene would plausibly pick — a HUD that a
+ * transparent water plane can draw over is not a HUD.
+ */
+const UI_ORDER_BASE = 1_000_000;
+
+/** Spacing between screens in renderOrder, so `sortOrder` separates them. */
+const UI_ORDER_PER_SCREEN = 10_000;
 
 /**
  * How a screen is presented on a given frame.
@@ -52,19 +68,22 @@ export function screenMode(screen, engine, { overlayPreview = false } = {}) {
  *  - Layout: every frame, walk each screen's entity subtree, compute element
  *    rects from anchors/layout containers/scroll offsets, write positions into
  *    the entities' Object3Ds and push uniforms into visual components.
- *  - Render: an overlay pass with an orthographic camera for screen-space
- *    screens (0..w, 0..-h — UI y-down maps to negative three.js y), and a pass
- *    through the scene camera for world panels.
  *  - Input: pointer/wheel on the canvas → hover/press/click and scrolling, plus
  *    directional focus navigation from the UI action map.
  *  - Editor services: hitTest() for viewport picking and a selection highlight.
+ *
+ * It does NOT render. UI meshes live on {@link UI_LAYER} and are drawn by the
+ * main scene pass like any other object; a screen-space overlay gets there via
+ * a screen-space vertex transform in the material (see `uiMaterial.js`) rather
+ * than a camera of its own. This system used to issue its own
+ * `renderer.render()` per screen group, which cost about as much as the whole
+ * rest of the frame — one small label halved the frame rate. The instruments
+ * that measured it are `scripts/run-ui-perf.mjs` and `run-ui-bisect.mjs`.
  */
 export class UiSystem {
   constructor(engine) {
     this.engine = engine;
     this.screens = new Set(); // UiScreenComponent instances
-    this.camera = new THREE.OrthographicCamera(0, 100, 0, -100, -1000, 1000);
-    this.camera.layers.set(UI_LAYER);
     this.boundCanvas = null;
     this.pointer = { downButton: null, downX: 0, downY: 0, hover: null, scrollDrag: null };
     this.highlight = null; // { entityId } — editor selection outline
@@ -73,7 +92,6 @@ export class UiSystem {
     this.overlayPreview = false;
     this.focus = new FocusNavigator(this);
     this.unsubUpdate = engine.onUpdate(() => this.update());
-    this.unsubPost = engine.onPostRender(() => this.render());
     this.onPlayChanged = (playing) => {
       if (!playing) {
         this.#clearInteraction();
@@ -161,7 +179,21 @@ export class UiSystem {
     screen.k = mode === "overlay" ? s * dpr : 2;
     screen.hitList = [];
 
-    const ctx = { k: screen.k, order: 1, screen, unit, mode, depthTest: mode === "world" && p.occluded === true };
+    const ctx = {
+      k: screen.k,
+      // Painter's order within the main scene pass. Screens are separated by
+      // sortOrder; elements within a screen by layout order.
+      order: UI_ORDER_BASE + (p.sortOrder ?? 0) * UI_ORDER_PER_SCREEN + 1,
+      screen,
+      unit,
+      mode,
+      depthTest: mode === "world" && p.occluded === true,
+      // An overlay bypasses the camera entirely in the vertex stage; a panel
+      // (and the editor's plane preview) is a real object in the world.
+      screenSpace: mode === "overlay",
+      uiWidth: w,
+      uiHeight: h,
+    };
     // Overlay: UI (0,0) is the root, which sits at the camera window's top
     // left. Panel: the root is the panel's *centre*, which is what a transform
     // gizmo on a floating health bar should grab.
@@ -269,6 +301,9 @@ export class UiSystem {
         spec,
         unit: ctx.unit,
         depthTest: ctx.depthTest,
+        screenSpace: ctx.screenSpace,
+        uiWidth: ctx.uiWidth,
+        uiHeight: ctx.uiHeight,
       };
       child.getComponent("uiimage")?.onUiLayout?.(frame);
       child.getComponent("uitext")?.onUiLayout?.(frame);
@@ -331,81 +366,6 @@ export class UiSystem {
     // here so the two callers agree on one contract.
     const k = ctx.k;
     return { x: minX / k, y: minY / k, w: (maxX - minX) / k, h: (maxY - minY) / k };
-  }
-
-  // -- Render pass -----------------------------------------------------------
-
-  render() {
-    const renderer = this.engine.renderer;
-    if (!renderer || !this.engine.rendererReady || this.screens.size === 0) return;
-
-    const all = [...this.screens].filter((s) => s.entity && s.entity.object3D.visible !== false);
-    // Panels are part of the scene and belong under the HUD; within each group,
-    // sortOrder decides.
-    const panels = all.filter((s) => s.mode !== "overlay").sort(bySortOrder);
-    const overlays = all.filter((s) => s.mode === "overlay").sort(bySortOrder);
-    if (!panels.length && !overlays.length) return;
-
-    const prevAutoClear = renderer.autoClear;
-    const prevAutoClearColor = renderer.autoClearColor;
-    const prevAutoClearDepth = renderer.autoClearDepth;
-    renderer.autoClear = false;
-    renderer.autoClearColor = false;
-    renderer.autoClearDepth = false;
-    try {
-      // Panels: one pass through the scene camera with the UI layer switched
-      // on. Borrowing the real camera (rather than cloning it) means the panel
-      // is guaranteed to use the exact projection the frame was drawn with —
-      // a clone that drifts by one frame shows up as UI that lags the world.
-      const camera = this.engine.camera;
-      if (panels.length && camera) {
-        const mask = camera.layers.mask;
-        camera.layers.set(UI_LAYER);
-        try {
-          this.#renderGroup(renderer, panels, camera, null);
-        } finally {
-          camera.layers.mask = mask;
-        }
-      }
-      for (const screen of overlays) {
-        if (!screen.uiWidth || !screen.uiHeight) continue;
-        this.camera.left = 0;
-        this.camera.right = screen.uiWidth;
-        this.camera.top = 0;
-        this.camera.bottom = -screen.uiHeight;
-        this.camera.updateProjectionMatrix();
-        this.#renderGroup(renderer, [screen], this.camera, all);
-      }
-    } finally {
-      renderer.autoClear = prevAutoClear;
-      renderer.autoClearColor = prevAutoClearColor;
-      renderer.autoClearDepth = prevAutoClearDepth;
-    }
-  }
-
-  /**
-   * Renders `visible` screens, hiding every other screen for the duration.
-   *
-   * Every UI mesh shares UI_LAYER and every screen may have a different scale,
-   * so an overlay pass has to see its own subtree and nothing else. Panels can
-   * all go in one pass — they share the scene camera and their own transforms
-   * keep them apart.
-   */
-  #renderGroup(renderer, visible, camera, allScreens) {
-    const hidden = [];
-    if (allScreens) {
-      for (const s of allScreens) {
-        if (!visible.includes(s) && s.entity?.object3D.visible) {
-          s.entity.object3D.visible = false;
-          hidden.push(s.entity.object3D);
-        }
-      }
-    }
-    try {
-      renderer.render(this.engine.scene, camera);
-    } finally {
-      for (const object3D of hidden) object3D.visible = true;
-    }
   }
 
   // -- Hit testing / picking -------------------------------------------------
@@ -668,10 +628,8 @@ export class UiSystem {
     if (!this.highlightMesh) {
       const geometry = new THREE.BufferGeometry();
       geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(15), 3));
-      const material = new THREE.LineBasicMaterial({ color: 0x4da3ff, depthTest: false, transparent: true });
-      this.highlightMesh = new THREE.Line(geometry, material);
+      this.highlightMesh = new THREE.Line(geometry, createUiHighlightMaterial());
       this.highlightMesh.layers.set(UI_LAYER);
-      this.highlightMesh.renderOrder = 100000;
       this.highlightMesh.frustumCulled = false;
       this.highlightMesh.userData.editorOnly = true;
       this.highlightMesh.raycast = () => {};
@@ -685,6 +643,19 @@ export class UiSystem {
     }
     const screen = this.#screenOf(entity);
     const unit = screen?.unit ?? 1;
+    // Above every element of the screen it outlines, but still inside that
+    // screen's own band so it never jumps in front of a higher-sortOrder HUD.
+    this.highlightMesh.renderOrder =
+      UI_ORDER_BASE + (screen?.props?.sortOrder ?? 0) * UI_ORDER_PER_SCREEN + UI_ORDER_PER_SCREEN - 1;
+    applyElementUniforms(this.highlightMesh.material, {
+      clipRect: null,
+      alpha: 1,
+      k: screen?.k ?? 1,
+      depthTest: false,
+      uiWidth: screen?.uiWidth ?? 1,
+      uiHeight: screen?.uiHeight ?? 1,
+      screenSpace: screen?.mode === "overlay",
+    });
     const spec = { ...ELEMENT_DEFAULTS, ...(el.props ?? {}) };
     // Local to the element: its pivot is at the origin.
     const ox = spec.pivot[0] * rect.w;
@@ -721,7 +692,6 @@ export class UiSystem {
 
   dispose() {
     this.unsubUpdate?.();
-    this.unsubPost?.();
     this.#unbindInput();
     this.engine.off?.("play-changed", this.onPlayChanged);
     if (this.highlightMesh) {
@@ -732,8 +702,6 @@ export class UiSystem {
     }
   }
 }
-
-const bySortOrder = (a, b) => (a.props.sortOrder ?? 0) - (b.props.sortOrder ?? 0);
 
 const _v2 = new THREE.Vector2();
 const _v2b = new THREE.Vector2();

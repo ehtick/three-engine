@@ -48,7 +48,7 @@ import {
   vec4,
 } from "three/tsl";
 import { MAX_EMITTERS, analyticDirectAt, decodeOctNormal, emitterDirectAt } from "./giLight.js";
-import { EDITOR_LAYER, GI_MIRROR_LAYER } from "../../engine/editorLayers.js";
+import { DEBUG_LAYER, EDITOR_LAYER, GI_MIRROR_LAYER, UI_LAYER } from "../../engine/editorLayers.js";
 import { ALBEDO_ATLAS_GRID, ALBEDO_ATLAS_SIZE, ALBEDO_ATLAS_TILE } from "./bvh/bvhScene.js";
 
 /**
@@ -162,6 +162,12 @@ export function renderGiGBuffer(renderer, scene, camera, gbuffer, { mirrorMask =
   // Editor gizmos/grid would write geometry into the gbuffer and shadow the
   // scene with objects that are not really there.
   camera.layers.disable(EDITOR_LAYER);
+  // Same for UI and runtime debug draw. Neither is world geometry, and a
+  // screen-space HUD is laid out in UI pixels at the world origin — as gbuffer
+  // geometry that is a wall metres across sitting on the camera, so every pixel
+  // behind it would resolve GI for the HUD instead of the scene.
+  camera.layers.disable(UI_LAYER);
+  camera.layers.disable(DEBUG_LAYER);
   scene.overrideMaterial = gbuffer.material;
   renderer.setRenderTarget(gbuffer.rt);
   renderer.setMRT(gbuffer.mrtNode);
@@ -226,7 +232,7 @@ export function renderGiGBuffer(renderer, scene, camera, gbuffer, { mirrorMask =
  * runs only on pixels that a reflective material will actually read — the mask
  * is what makes this a mirror-pixel cost instead of a whole-screen one.
  */
-export function createGiResolve({ gbuffer, targets, width, height, gather, normalOffset, intensity, emitter, radiance, bvhShade = null }) {
+export function createGiResolve({ gbuffer, targets, width, height, gather, normalOffset, intensity, emitter, radiance, bvhShade = null, ao = null }) {
   // The TARGETS are owned by the caller and outlive every rebuild: materials
   // sample them through persistent texture nodes, so recreating them here
   // would silently leave already-compiled materials bound to dead textures.
@@ -270,6 +276,57 @@ export function createGiResolve({ gbuffer, targets, width, height, gather, norma
         ? vec3(radiance.cameraPosition).sub(P).normalize().toVar()
         : vec3(0);
       out.assign(vec3(gather(samplePoint, N, viewDir)).mul(intensity));
+      // AMBIENT OCCLUSION ON THE INDIRECT TERM (occupancy-oracle obscurance).
+      //
+      // The probe lattice is ~1m — indirect light arrives with NO small-scale
+      // occlusion: no contact darkening under props, no corner/crevice
+      // shading ("no AO or shadows from indirect light"). The occupancy
+      // pyramid's free-radius oracle is a conservative distance bound, i.e.
+      // exactly the ingredient of the classic SDF ambient-obscurance ladder
+      // (IQ): at heights d_i along the normal, an unoccluded point has
+      // free radius ≥ d_i; the shortfall, distance-weighted, integrates to
+      // an obscurance estimate. World-space (no screen-space halo/edge
+      // artifacts), a few bitset fetches per tap at HALF RES, and it rides
+      // the pyramid the resolve's field traces already conceptually own.
+      //
+      // Applied to the GATHER term only: emitter/analytic direct have real
+      // traced shadows (penumbra estimator) — obscuring them twice reads as
+      // dirt. Reflections keep their own visibility. `strength`/`radius`
+      // are live uniforms (aoStrength/aoRadius props); the whole block is
+      // compiled out when the component's `ao` prop is off (structural).
+      if (ao?.occupancy?.freeRadiusAtWorld) {
+        const occAcc = float(0).toVar();
+        // 4 taps, linear spacing (¼..1 × radius), falloff halving per tap —
+        // the standard 4-tap SDF-AO ladder against the oracle. Two voxel-
+        // specific corrections vs the SDF original:
+        //   · SELF-SURFACE ALLOWANCE: the pixel's own surface is SET VOXELS,
+        //     and on a CURVED receiver the error is bigger than one voxel —
+        //     conservative SAT voxelization bulges up to a full voxel
+        //     OUTSIDE the true surface (every touched voxel is set), and the
+        //     gbuffer P sits anywhere inside its surface voxel, so the
+        //     oracle can read ~2 voxels of false self-occlusion. One voxel
+        //     of allowance was enough for flat floors but painted
+        //     grid-aligned grey blotches over spheres (user screenshot,
+        //     2026-08-03). Two voxels zeroes the unoccluded baseline on
+        //     curved geometry too, at the cost of slightly later contact
+        //     onset — AO now starts biting ~0.2m from a wall instead of
+        //     ~0.1m at ultra's voxel size.
+        //   · maxLevel 3 (27 near + 24 ladder fetches/tap): the oracle's
+        //     bound saturates at ~8 level-0 voxels, which covers the default
+        //     0.6m radius at every preset — capping shy of the last tap
+        //     would read open sky as occlusion.
+        const radius = float(ao.radius).max(0.05).toVar();
+        const voxN = vec3(ao.occupancy.voxel);
+        const allowance = voxN.x.max(voxN.y).max(voxN.z).mul(2).toVar();
+        for (let i = 1; i <= 4; i++) {
+          const d = radius.mul(i / 4);
+          const free = float(ao.occupancy.freeRadiusAtWorld(P.add(N.mul(d)), 3, true, null));
+          occAcc.addAssign(d.sub(allowance).sub(free).max(0).div(d).mul(1 / 2 ** (i - 1)));
+        }
+        // Normalize by Σ falloff (1+½+¼+⅛), scale, floor at 0.
+        const obscurance = occAcc.mul(float(ao.strength).div(1.875)).clamp(0, 1);
+        out.mulAssign(obscurance.oneMinus());
+      }
       if (radiance) {
         const incident = P.sub(radiance.cameraPosition).normalize().toVar();
         const reflected = reflect(incident, N).toVar();

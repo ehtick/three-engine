@@ -2,7 +2,7 @@ import * as THREE from "three/webgpu";
 import { positionView, vec4 } from "three/tsl";
 import { DepthPyramid, createBounds, isOccluded, projectSphere } from "./occlusionMath.js";
 import { getEntityBoundingSphere } from "../viewFrustum.js";
-import { OCCLUDER_LAYER } from "../editorLayers.js";
+import { OCCLUDER_LAYER, UI_LAYER } from "../editorLayers.js";
 
 /**
  * `engine.occlusion` — hides what the depth buffer says is already behind
@@ -218,6 +218,11 @@ export class OcclusionSystem {
       entity.object3D.traverse((object) => {
         if (!object.isMesh && !object.isInstancedMesh) return;
         if (object.userData?.engineOwned) return;
+        // A UI quad is not world geometry. A screen-space one is laid out in
+        // UI pixels at the world origin, so its bounding sphere is hundreds of
+        // units across — tag it and the HUD becomes the biggest occluder in
+        // the scene and culls everything behind it.
+        if (object.layers.isEnabled(UI_LAYER)) return;
         if (isOccluder) object.layers.enable(OCCLUDER_LAYER);
         else object.layers.disable(OCCLUDER_LAYER);
       });

@@ -34,7 +34,14 @@ export class ModelComponent extends Component {
     this.unsubSkeletonSync = null;
     this.sharedMaterials = new Set(); // .mat-backed materials we must not dispose
     this.generation = (this.generation ?? 0) + 1;
-    if (this.props.path) this.#load(this.props.path, this.generation);
+    this._readyPromise = this.props.path
+      ? this.#load(this.props.path, this.generation)
+      : Promise.resolve();
+  }
+
+  /** Resolves after the model and any material overrides are attached. */
+  whenReady() {
+    return this._readyPromise ?? Promise.resolve();
   }
 
   async #load(path, generation) {

@@ -77,11 +77,15 @@ page.on("console", (m) => {
 });
 page.on("pageerror", (e) => console.log(`  pageerror: ${(e.stack ?? e.message).slice(0, 400)}`));
 
-await page.evaluateOnNewDocument((PROJECT, DEBUG_FS) => {
+await page.evaluateOnNewDocument((PROJECT, DEBUG_FS, PRESET) => {
   localStorage.setItem("engine.projectRoot.v1", PROJECT);
   localStorage.setItem("engine.recentProjects.v1", JSON.stringify([PROJECT]));
   if (DEBUG_FS) globalThis.__giFieldSmoothingDebug = true;
-}, PROJECT, !!process.env.DEBUG_FS);
+  // PRESET_GLOBALS='{"__giNoChebyshev":true}' — BUILD-TIME hatches must be
+  // set before the first GI build, which is why this rides
+  // evaluateOnNewDocument rather than a live evaluate.
+  for (const [k, v] of Object.entries(PRESET)) globalThis[k] = v;
+}, PROJECT, !!process.env.DEBUG_FS, JSON.parse(process.env.PRESET_GLOBALS ?? "{}"));
 
 console.log(`Opening ${PROJECT} …`);
 await page.goto(url, { waitUntil: "load", timeout: 60000 });

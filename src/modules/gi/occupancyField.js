@@ -66,8 +66,8 @@
 // else reads. 1.6 MB for zero risk.
 import * as THREE from "three/webgpu";
 import {
-  Break, Fn, If, Loop, atomicLoad, atomicMax, atomicOr, atomicStore, bitAnd, bitOr, float, floor, instanceIndex,
-  instancedArray, int, mod, select, shiftLeft, shiftRight, uint, uniform, uniformArray, vec3, vec4,
+  Break, Fn, If, Loop, Return, atomicLoad, atomicMax, atomicOr, atomicStore, bitAnd, bitOr, float, floor,
+  instanceIndex, instancedArray, int, mod, select, shiftLeft, shiftRight, uint, uniform, uniformArray, vec3, vec4,
 } from "three/tsl";
 import { sharedFn } from "./giFn.js";
 
@@ -159,6 +159,46 @@ export function createOccupancyField(bounds, res0, options = {}) {
   const bits = instancedArray(new Uint32Array(totalWords), "uint");
   const atomicBits = instancedArray(new Uint32Array(level0.words), "uint").toAtomic();
 
+  // ── STATIC/DYNAMIC SPLIT ──────────────────────────────────────────────────
+  //
+  // THE MEASUREMENT THIS EXISTS FOR (run-gi-perf.mjs, user's Sponza,
+  // 2026-08-03): one animated 1m sphere cost +3.3ms (high) / +5.2ms (ultra)
+  // of GPU compute PER FRAME, because any transform change re-voxelized the
+  // ENTIRE scene — 6.25M (slot, tri, chunk) SAT work items at ultra for a
+  // mover that owns ~2k of them. In a game something always moves, so that
+  // was the steady-state cost, not a transient.
+  //
+  // The split: slots are STATIC by default; GISystem promotes a slot to
+  // DYNAMIC when its matrix changes and demotes it after a quiet period.
+  // Static slots voxelize ONCE into a level-0 snapshot (`staticBits`, plus
+  // `staticAttr` for the attribution grid); a frame where only dynamic slots
+  // moved replays the snapshot (2 buffer copies) and voxelizes ONLY the
+  // dynamic slots on top. Bit-identical to the full pass by construction:
+  // OR is commutative and the attribution uses atomicMax (deterministic
+  // winner), so static ∪ dynamic in two passes is the same set of bits as
+  // one pass over everything.
+  //
+  // A slot CHANGING SETS (static↔dynamic) marks `staticDirty`, which forces
+  // one full re-voxelize with a fresh snapshot — the snapshot must never
+  // contain a dynamic slot's footprint, or restoring it would leave the
+  // mover's stale geometry behind (`setSlotMatrix` also self-defends: a
+  // matrix write on a slot still flagged static forces the full pass).
+  // `__giNoStaticSplit = true` (live, checked per dispatch) restores the
+  // old full-re-voxelize-every-frame behaviour as the A/B arm.
+  const staticBits = instancedArray(new Uint32Array(level0.words), "uint");
+  const slotDynamic = uniformArray(Array.from({ length: slotCapacity }, () => 0), "float");
+  let dynamicCount = 0;
+  let staticDirty = true;
+  const setSlotDynamic = (slot, dyn) => {
+    if (slot < 0 || slot >= slotCapacity) return;
+    const v = dyn ? 1 : 0;
+    if (slotDynamic.array[slot] === v) return;
+    slotDynamic.array[slot] = v;
+    dynamicCount += v ? 1 : -1;
+    staticDirty = true;
+    dirty = true;
+  };
+
   // ─────────────────────────────────────────── COARSE-CELL SURFACE ATTRIBUTES
   //
   // WHY THIS EXISTS: to delete the mesh-SDF atlas. The composite does not use
@@ -200,7 +240,9 @@ export function createOccupancyField(bounds, res0, options = {}) {
     coarseRes = { x: res.x, y: res.y, z: res.z };
     coarseResU.value.set(res.x, res.y, res.z);
     cellAttr = instancedArray(new Uint32Array(res.x * res.y * res.z), "uint").toAtomic();
+    staticAttr = instancedArray(new Uint32Array(res.x * res.y * res.z), "uint");
     computesRevision = -1; // the voxelize kernel closes over this buffer
+    staticDirty = true;
     dirty = true;
   };
 
@@ -223,6 +265,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
     if (slot < 0 || slot >= slotCapacity) return;
     if (slotAtlas.array[slot] === atlasSlot) return;
     slotAtlas.array[slot] = atlasSlot;
+    staticDirty = true; // attribution numbering changed → the snapshot's attr is stale
     dirty = true;
   };
 
@@ -419,9 +462,23 @@ export function createOccupancyField(bounds, res0, options = {}) {
    * One thread per WORK ITEM = (slot, triangle, chunk). Rebuilt whenever the
    * geometry buffers change, because the body closes over them and the
    * dispatch size is the work-item count.
+   *
+   * `filter` ("static" | "dynamic" | null) makes the pass cover only one
+   * side of the static/dynamic split. Both variants still DISPATCH the full
+   * work-item count — a thread whose slot is on the other side exits after
+   * two reads. That trade is deliberate: per-slot work-item ranges would
+   * need a CPU work-list rebuild every time the dynamic SET changes, while
+   * the exit-only threads cost well under 0.1ms even at ultra's 6.25M items
+   * and the set membership is a uniform write.
    */
-  const buildVoxelizeCompute = () => Fn(() => {
+  const buildVoxelizeCompute = (filter = null) => Fn(() => {
     const slot = pairSlot.element(instanceIndex).toVar();
+    if (filter) {
+      const want = filter === "dynamic" ? 1 : 0;
+      If(slotDynamic.element(slot.toInt()).notEqual(float(want)), () => {
+        Return();
+      });
+    }
     const tri = pairTri.element(instanceIndex).toVar();
     const chunk = pairChunk.element(instanceIndex).toVar();
 
@@ -504,6 +561,25 @@ export function createOccupancyField(bounds, res0, options = {}) {
   const copyCompute = Fn(() => {
     bits.element(instanceIndex.add(uint(level0.offset))).assign(atomicLoad(atomicBits.element(instanceIndex)));
   })().compute(level0.words);
+
+  // Static/dynamic split (see staticBits above): snapshot the level-0 scratch
+  // right after the STATIC-only voxelize pass, and replay it in place of
+  // clear+static-voxelize on frames where only dynamic slots moved. The attr
+  // pair are BUILDERS like buildClearAttrCompute — they close over the
+  // current cellAttr/staticAttr allocations, which setCoarseRes replaces.
+  const snapStaticBitsCompute = Fn(() => {
+    staticBits.element(instanceIndex).assign(atomicLoad(atomicBits.element(instanceIndex)));
+  })().compute(level0.words);
+  const restoreStaticBitsCompute = Fn(() => {
+    atomicStore(atomicBits.element(instanceIndex), staticBits.element(instanceIndex));
+  })().compute(level0.words);
+  let staticAttr = instancedArray(new Uint32Array(1), "uint");
+  const buildSnapStaticAttrCompute = () => Fn(() => {
+    staticAttr.element(instanceIndex).assign(atomicLoad(cellAttr.element(instanceIndex)));
+  })().compute(Math.max(1, coarseRes.x * coarseRes.y * coarseRes.z));
+  const buildRestoreStaticAttrCompute = () => Fn(() => {
+    atomicStore(cellAttr.element(instanceIndex), staticAttr.element(instanceIndex));
+  })().compute(Math.max(1, coarseRes.x * coarseRes.y * coarseRes.z));
 
   // ══════════════════════════════════════════════════════ SHADER: downsample
   // One thread per PARENT WORD. A parent word is 32 voxels along x, whose
@@ -1123,6 +1199,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
     stats.pairs = pairCount;
     stats.slots = placements.length;
     stats.buildMs = performance.now() - t0;
+    staticDirty = true;
     dirty = true;
   };
 
@@ -1130,6 +1207,11 @@ export function createOccupancyField(bounds, res0, options = {}) {
   const setSlotMatrix = (slot, matrix) => {
     if (slot < 0 || slot >= slotCapacity) return;
     localToWorld.array[slot].copy(matrix);
+    // Self-defence for the split: a matrix write on a slot still flagged
+    // STATIC invalidates the snapshot (its baked footprint moved). GISystem
+    // flags movers dynamic before writing, so this fires only on the first
+    // frame of an unannounced move — one full pass, then fast ones.
+    if (slotDynamic.array[slot] === 0) staticDirty = true;
     dirty = true;
   };
 
@@ -1161,11 +1243,18 @@ export function createOccupancyField(bounds, res0, options = {}) {
       return dirty;
     },
     invalidate() {
+      // Conservative by design: invalidate is the async-pipeline retry path
+      // (GISystem re-arms after skipped dispatches), and a skipped FULL chain
+      // may have skipped the snapshot writes — a fast replay of that
+      // snapshot would restore garbage. Forcing the full chain costs one
+      // extra full voxelize during pipeline warmup only.
+      staticDirty = true;
       dirty = true;
     },
 
     setGeometry,
     setSlotMatrix,
+    setSlotDynamic,
     slotCapacity,
     /**
      * Bumped by `setGeometry` only — NOT by `setSlotMatrix`. Consumers use it
@@ -1182,6 +1271,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
     refit() {
       syncVoxel();
       syncStats();
+      staticDirty = true; // a refit re-scales voxel space — every baked bit moved
       dirty = true;
     },
 
@@ -1207,6 +1297,10 @@ export function createOccupancyField(bounds, res0, options = {}) {
       // (the 15c zero-flicker-when-static rule holds).
       const jitterAmp = globalThis.__giVoxelJitter ?? 0;
       if (jitterAmp > 0) {
+        // The static snapshot was voxelized at a specific grid origin — a
+        // jittered origin invalidates it every dispatch, so the split and the
+        // (default-off, do-not-enable) grid jitter are mutually exclusive.
+        staticDirty = true;
         jitterFrame = (jitterFrame + 1) % 4096;
         // R3 low-discrepancy offsets in [-0.5, 0.5).
         const jx = ((jitterFrame * 0.8191725133961645) % 1) - 0.5;
@@ -1219,11 +1313,38 @@ export function createOccupancyField(bounds, res0, options = {}) {
         );
       }
       if (computesRevision !== geometryRevision) {
-        computes = [clearCompute, buildClearAttrCompute(), buildVoxelizeCompute(), copyCompute, ...downsampleComputes];
+        // Two chains, both cached until the geometry buffers change:
+        //   FULL — clear, voxelize the static side, snapshot it, then add the
+        //          dynamic side. With no dynamic slots the static pass covers
+        //          everything and the snapshot is simply the whole scene.
+        //   FAST — replay the snapshot (2 copies) + dynamic side only. Runs
+        //          on every frame where only dynamic transforms changed —
+        //          the game steady state this split exists for.
+        const voxStatic = buildVoxelizeCompute("static");
+        const voxDynamic = buildVoxelizeCompute("dynamic");
+        computes = {
+          full: [
+            clearCompute, buildClearAttrCompute(),
+            voxStatic, snapStaticBitsCompute, buildSnapStaticAttrCompute(),
+            voxDynamic, copyCompute, ...downsampleComputes,
+          ],
+          fast: [
+            restoreStaticBitsCompute, buildRestoreStaticAttrCompute(),
+            voxDynamic, copyCompute, ...downsampleComputes,
+          ],
+        };
         computesRevision = geometryRevision;
+        staticDirty = true; // fresh kernels → fresh snapshot before any fast replay
       }
       stats.dispatches++;
-      return computes;
+      const canFast =
+        !staticDirty && dynamicCount > 0 && globalThis.__giNoStaticSplit !== true;
+      if (canFast) {
+        stats.fastDispatches = (stats.fastDispatches ?? 0) + 1;
+        return computes.fast;
+      }
+      staticDirty = false;
+      return computes.full;
     },
 
     traceOccupancy,

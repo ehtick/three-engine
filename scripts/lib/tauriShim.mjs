@@ -206,5 +206,19 @@ export async function installTauriShim(
       },
       convertFileSrc: (filePath) => filePath,
     };
+
+    // The installed @tauri-apps/api's `unlisten()` calls THIS global directly
+    // (chunk-*.js: `window.__TAURI_EVENT_PLUGIN_INTERNALS__.unregisterListener(...)`)
+    // as well as `invoke("plugin:event|unlisten")` above — both, not either/or.
+    // Found because no prior harness using this shim ever called `unlisten()`
+    // on a listener it registered; every feature they cover just left
+    // listeners attached for the panel's lifetime. A workflow run that
+    // starts, finishes, and detaches its listeners (see providers/claudeCli.js)
+    // is the first to exercise this path.
+    window.__TAURI_EVENT_PLUGIN_INTERNALS__ = {
+      unregisterListener(event, eventId) {
+        listeners.get(event)?.delete(eventId);
+      },
+    };
   }, extraNames);
 }

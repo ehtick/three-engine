@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { Play, Square, Pause, StepForward, Move, Rotate3d, Scale3d, Layers as LayersIcon, Crosshair, Globe2, Monitor, Wifi, QrCode } from "lucide-react";
+import { Play, Square, Pause, StepForward, Move, Rotate3d, Scale3d, Layers as LayersIcon, Crosshair, Monitor, Wifi, Smartphone, QrCode, Share2, Link2, Loader2, Sparkles } from "lucide-react";
 import qrcode from "qrcode-generator";
 import * as THREE from "three/webgpu";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
@@ -11,9 +11,12 @@ import {
   openBrowserPreviewUrl,
   stopBrowserPreview,
   getActiveBrowserPreview,
-  shouldResumeBrowserPreview,
+  startShareTunnel,
+  stopShareTunnel,
+  getActiveShareTunnel,
 } from "../browserPreview.js";
-import { DEBUG_LAYER, EDITOR_LAYER } from "../../engine/editorLayers.js";
+import { pushToast } from "../toasts.js";
+import { DEBUG_LAYER, EDITOR_LAYER, UI_LAYER } from "../../engine/editorLayers.js";
 import { StatsOverlay } from "../overlays/StatsOverlay.jsx";
 import { useSelectionStore } from "../store/selectionStore.js";
 import { useSceneStore } from "../store/sceneStore.js";
@@ -67,6 +70,10 @@ import { useAssetDrop } from "../assetDrag.js";
 import { instantiatePrefab } from "../prefab.js";
 import { getProjectSettings, onProjectSettingsApplied, applyProjectSettings } from "../projectSettings.js";
 import { setViewportHandle } from "../viewportHandle.js";
+import { openPanel } from "../EditorShell.jsx";
+import { runWorkflow } from "../store/aiStore.js";
+import { getWorkflow } from "../ai/workflows.js";
+import { getActiveProvider } from "../ai/providers/index.js";
 import {
   setSharedCanvas,
   claimCanvas,
@@ -222,6 +229,10 @@ async function ensureViewport() {
       // ...and runtime debug drawing, which lives on its own layer so it can
       // also reach the Play/Game views that switch the editor layer off.
       viewport.camera.layers.enable(DEBUG_LAYER);
+      // ...and UI, which draws in this pass rather than a second one of its
+      // own (see engine/ui/UiSystem.js). Screen-space screens are shown as
+      // world planes while authoring, so the editor camera needs them too.
+      viewport.camera.layers.enable(UI_LAYER);
 
       viewport.backend = await engine.init(canvas);
       engine.camera = viewport.camera;
@@ -1013,7 +1024,7 @@ class CameraPreview {
       this.renderer.setScissor(x, y, w, h);
       this.renderer.setScissorTest(true);
       this.renderer.autoClear = false;
-      this.renderer.autoClearColor = engine.renderer.autoClearColor;
+      this.renderer.autoClearColor = false;
       this.renderer.autoClearDepth = true;
       this.renderer.render(engine.scene, cam);
     } finally {
@@ -2965,6 +2976,9 @@ function setupKeyboard(canvas) {
   // "Cursor to Selected" / "Cursor to World Origin" / "Selection to
   // Cursor" / "Selection to World Origin" rows.
   window.addEventListener("keydown", (e) => {
+    // Let editable controls receive capital S instead of opening the cursor
+    // snap menu while the user is typing.
+    if (e.target.closest?.("input, textarea, select, [contenteditable]")) return;
     if (e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey && e.key.toLowerCase() === "s") {
       // Don't fight the geometry editor's "S" macro OR the global
       // "Save (Ctrl+S)" — those pre-conditions already filter the input
@@ -3677,6 +3691,14 @@ function AxisViewGizmo({ playing }) {
 function viewportMenuItems() {
   const ids = useSelectionStore.getState().ids;
   const has = ids.length > 0;
+  // Mirrors the same check in aiStore.runWorkflow — see HierarchyPanel.jsx's
+  // context menu for the longer version of this comment.
+  const diagnoseWorkflow = getWorkflow("diagnose-selected");
+  const aiProvider = getActiveProvider();
+  const aiBlockedHint =
+    diagnoseWorkflow?.mutates && !aiProvider?.capabilities?.scopedTools
+      ? `${aiProvider?.label ?? "This provider"} cannot limit itself to this workflow's tools. Switch to a scoped provider (e.g. Ollama).`
+      : undefined;
   return [
     { label: "Focus Selected", shortcut: "F", disabled: !has, action: () => focusSelection() },
     { separator: true },
@@ -3687,6 +3709,17 @@ function viewportMenuItems() {
     { label: "Selection → 3D Cursor", disabled: !has, action: () => snapSelectionToCursor() },
     { label: "3D Cursor → Selection", disabled: !has, action: () => snapCursorToSelection() },
     { label: "3D Cursor → World Origin", action: () => snapCursorToWorldOrigin() },
+    { separator: true },
+    {
+      label: "AI: Diagnose this",
+      icon: Sparkles,
+      disabled: ids.length !== 1 || !!aiBlockedHint,
+      hint: aiBlockedHint,
+      action: () => {
+        openPanel("ai");
+        runWorkflow("diagnose-selected", ids[0]);
+      },
+    },
     { separator: true },
     { label: "Delete", shortcut: "Del", danger: true, disabled: !has, action: () => deleteSelection() },
   ];
@@ -3739,53 +3772,31 @@ export function ViewportPanel() {
     busy: false,
     message: "",
     urls: getActiveBrowserPreview(),
+    share: getActiveShareTunnel(),
   }));
-  // The preview outlived the last editor session (the user closed the editor
-  // with it running): bring the hosting back up without being asked, so the
-  // localhost/Wi-Fi URL is simply always current. Silent — no browser tab is
-  // opened; the already-open page reloads itself via the injected client the
-  // moment the fresh build lands.
-  useEffect(() => {
-    if (!rootPath || !shouldResumeBrowserPreview(rootPath) || getActiveBrowserPreview()) return;
-    let cancelled = false;
-    (async () => {
-      setBrowserPreview({ busy: true, message: "Resuming browser preview…", urls: null });
-      try {
-        const result = await openBrowserPreview({
-          openBrowser: false,
-          onProgress: ({ message }) => {
-            if (!cancelled) setBrowserPreview((state) => ({ ...state, message }));
-          },
-        });
-        // `null` also means "another mount's resume beat us to it" — in that
-        // case the singleton has (or will shortly have) the running preview.
-        if (!cancelled) setBrowserPreview({ busy: false, message: "", urls: result ?? getActiveBrowserPreview() });
-      } catch (error) {
-        console.warn(`Browser preview auto-resume failed: ${error?.message ?? error}`);
-        if (!cancelled) setBrowserPreview({ busy: false, message: "", urls: null });
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [rootPath]);
+  // Separate from `busy`: only the share endpoint should spin while a tunnel
+  // starts, not while the preview itself builds.
+  const [shareBusy, setShareBusy] = useState(false);
+  // The public link wins the QR slot when it exists: it works from any phone
+  // with no certificate warning, which is what a scanned code is for.
+  const browserPreviewQrUrl = browserPreview.share?.url || browserPreview.urls?.lanUrl || "";
   const browserPreviewQr = useMemo(() => {
-    const url = browserPreview.urls?.lanUrl;
-    if (!url) return "";
+    if (!browserPreviewQrUrl) return "";
     const qr = qrcode(0, "M");
-    qr.addData(url);
+    qr.addData(browserPreviewQrUrl);
     qr.make();
     const svg = qr.createSvgTag({ cellSize: 3, margin: 2, scalable: true });
     return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
-  }, [browserPreview.urls?.lanUrl]);
+  }, [browserPreviewQrUrl]);
 
   const launchBrowserPreview = async () => {
     if (browserPreview.busy) return;
     if (browserPreview.urls) {
       setBrowserPreview((state) => ({ ...state, busy: true, message: "Stopping browser preview…" }));
       try {
+        // stopBrowserPreview also takes the share tunnel down with it.
         await stopBrowserPreview(browserPreview.urls.report?.contentDir);
-        setBrowserPreview({ busy: false, message: "", urls: null });
+        setBrowserPreview({ busy: false, message: "", urls: null, share: null });
       } catch (error) {
         console.error(`Could not stop browser preview: ${error?.message ?? error}`);
         setBrowserPreview((state) => ({
@@ -3796,34 +3807,82 @@ export function ViewportPanel() {
       }
       return;
     }
-    setBrowserPreview({ busy: true, message: "Building browser preview…", urls: null });
+    setBrowserPreview({ busy: true, message: "Building browser preview…", urls: null, share: null });
     try {
       // Export the authored snapshot, never a scene after gameplay scripts or
       // physics have mutated it. This also makes the button useful while the
       // user is already testing in the viewport.
       if (playing) {
-        setBrowserPreview({ busy: true, message: "Stopping Play mode…", urls: null });
+        setBrowserPreview({ busy: true, message: "Stopping Play mode…", urls: null, share: null });
         await stopPlay();
       }
+      // openBrowser: false — the endpoints appear in the toolbar instead of a
+      // tab stealing focus the moment the build lands.
       const result = await openBrowserPreview({
+        openBrowser: false,
         onProgress: ({ message }) => setBrowserPreview((state) => ({ ...state, message })),
       });
       if (result) {
         setBrowserPreview({
           busy: false,
-          message: result.openError
-            ? `Live: ${result.localUrl} (browser launch failed; click to copy)`
-            : result.lanUrl
-              ? `Live Wi-Fi (HTTPS; accept certificate once): ${result.lanUrl}`
-              : `Live: ${result.localUrl}`,
+          message: result.lanUrl
+            ? `Live: ${result.localUrl} · Wi-Fi: ${result.lanUrl}`
+            : `Live: ${result.localUrl}`,
           urls: result,
+          share: null,
         });
       } else {
-        setBrowserPreview({ busy: false, message: "", urls: null });
+        setBrowserPreview({ busy: false, message: "", urls: null, share: null });
       }
     } catch (error) {
       console.error(`Browser preview failed: ${error?.message ?? error}`);
-      setBrowserPreview({ busy: false, message: `Preview failed: ${error?.message ?? error}`, urls: null });
+      pushToast({ level: "error", title: "Browser preview failed", detail: `${error?.message ?? error}` });
+      setBrowserPreview({ busy: false, message: `Preview failed: ${error?.message ?? error}`, urls: null, share: null });
+    }
+  };
+
+  const toggleShareTunnel = async () => {
+    if (browserPreview.busy || shareBusy || !browserPreview.urls) return;
+    setShareBusy(true);
+    try {
+      if (browserPreview.share) {
+        setBrowserPreview((state) => ({ ...state, message: "Stopping public link…" }));
+        try {
+          await stopShareTunnel();
+          setBrowserPreview((state) => ({ ...state, message: "", share: null }));
+        } catch (error) {
+          console.error(`Could not stop share link: ${error?.message ?? error}`);
+          setBrowserPreview((state) => ({
+            ...state,
+            share: null,
+            message: `Could not stop share link: ${error?.message ?? error}`,
+          }));
+        }
+        return;
+      }
+      setBrowserPreview((state) => ({ ...state, message: "Creating public link…" }));
+      try {
+        const share = await startShareTunnel({
+          onProgress: ({ message }) => setBrowserPreview((state) => ({ ...state, message })),
+        });
+        if (!share) return;
+        // The first thing anyone does with a share link is paste it somewhere.
+        navigator.clipboard?.writeText(share.url).catch(() => {});
+        setBrowserPreview((state) => ({
+          ...state,
+          share,
+          message: `Public link (copied to clipboard): ${share.url}`,
+        }));
+      } catch (error) {
+        console.error(`Share link failed: ${error?.message ?? error}`);
+        pushToast({ level: "error", title: "Share link failed", detail: `${error?.message ?? error}` });
+        setBrowserPreview((state) => ({
+          ...state,
+          message: `Share link failed: ${error?.message ?? error}`,
+        }));
+      }
+    } finally {
+      setShareBusy(false);
     }
   };
 
@@ -4120,18 +4179,18 @@ export function ViewportPanel() {
             </button>
           </>
         )}
-        <div className={`browser-preview-launcher ${browserPreview.urls ? "is-active" : ""}`}>
+        <div className={`browser-preview-launcher ${browserPreview.urls ? "is-active" : ""} ${shareBusy ? "is-sharing" : ""}`}>
           <button
             className={`toolbar-btn icon-only ${browserPreview.urls ? "active" : ""}`}
             disabled={!rootPath || browserPreview.busy}
             title={browserPreview.urls
               ? "Stop browser preview server"
               : browserPreview.message || (playing
-                ? "Stop Play mode, then build and open in the browser"
+                ? "Stop Play mode, then build and serve it"
                 : "Build and serve on localhost and local Wi-Fi over HTTPS")}
             onClick={launchBrowserPreview}
           >
-            <Globe2 size={13} />
+            <Wifi size={13} />
           </button>
           {browserPreview.urls && (
             <div className="browser-preview-endpoints" aria-label="Browser preview links">
@@ -4140,13 +4199,13 @@ export function ViewportPanel() {
                   className="browser-preview-endpoint"
                   role="button"
                   tabIndex={0}
-                  title={`Open Wi-Fi HTTPS preview\n${browserPreview.urls.lanUrl}\nAccept the local certificate once on this device.`}
+                  title={`Open Wi-Fi HTTPS preview (phones/tablets)\n${browserPreview.urls.lanUrl}\nAccept the local certificate once on this device.`}
                   onClick={() => openPreviewEndpoint(browserPreview.urls.lanUrl)}
                   onKeyDown={(event) => {
                     if (event.key === "Enter" || event.key === " ") openPreviewEndpoint(browserPreview.urls.lanUrl);
                   }}
                 >
-                  <Wifi size={13} />
+                  <Smartphone size={13} />
                 </span>
               )}
               {browserPreview.urls.localUrl && (
@@ -4163,16 +4222,50 @@ export function ViewportPanel() {
                   <Monitor size={13} />
                 </span>
               )}
+              <span
+                className={`browser-preview-endpoint ${browserPreview.share ? "active" : ""}`}
+                role="button"
+                tabIndex={0}
+                title={shareBusy
+                  ? browserPreview.message || "Creating public link…"
+                  : browserPreview.share
+                    ? `Stop public share link\n${browserPreview.share.url}`
+                    : "Create a public share link anyone can open (Cloudflare quick tunnel)"}
+                aria-label={browserPreview.share ? "Stop public share link" : "Create public share link"}
+                onClick={toggleShareTunnel}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") toggleShareTunnel();
+                }}
+              >
+                {shareBusy ? <Loader2 size={13} className="endpoint-spin" /> : <Share2 size={13} />}
+              </span>
+              {browserPreview.share && (
+                <span
+                  className="browser-preview-endpoint"
+                  role="button"
+                  tabIndex={0}
+                  title={`Open public link (click also copies it)\n${browserPreview.share.url}`}
+                  onClick={() => {
+                    navigator.clipboard?.writeText(browserPreview.share.url).catch(() => {});
+                    openPreviewEndpoint(browserPreview.share.url);
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") openPreviewEndpoint(browserPreview.share.url);
+                  }}
+                >
+                  <Link2 size={13} />
+                </span>
+              )}
               {browserPreviewQr && (
                 <span
                   className="browser-preview-endpoint browser-preview-qr"
                   tabIndex={0}
-                  title="Show Wi-Fi QR code"
-                  aria-label="Show Wi-Fi preview QR code"
+                  title={browserPreview.share ? "Show public link QR code" : "Show Wi-Fi QR code"}
+                  aria-label="Show preview QR code"
                 >
                   <QrCode size={13} />
                   <span className="browser-preview-qr-popover">
-                    <img src={browserPreviewQr} alt={`QR code for ${browserPreview.urls.lanUrl}`} />
+                    <img src={browserPreviewQr} alt={`QR code for ${browserPreviewQrUrl}`} />
                   </span>
                 </span>
               )}

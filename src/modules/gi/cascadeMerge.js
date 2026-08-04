@@ -20,8 +20,8 @@
 // than the child, that parent is behind a wall and its weight is zeroed.
 // Approximate on purpose (a parent's annular interval doesn't cover its own
 // near field), same spirit as the reference's "flatland assumption" note.
-import { Fn, If, Loop, float, floor, instanceIndex, instancedArray, max, mix, mod, smoothstep, vec3, vec4 } from "three/tsl";
-import { octahedralTexelIndex } from "./cascadeTrace.js";
+import { Fn, If, Loop, float, floor, instanceIndex, instancedArray, max, mix, mod, select, smoothstep, vec3, vec4 } from "three/tsl";
+import { octahedralTexelIndex, octahedralUV } from "./cascadeTrace.js";
 import { BURIED_PROBE_WEIGHT } from "./cascadeGather.js";
 
 /**
@@ -330,14 +330,80 @@ export function createCascadeMerge(cascades, { sky = [0, 0, 0], occupancyVoxel =
               }
             });
 
-            // Mean of the 4 angular children from the parent's MERGED field
-            // (same-frame data — the parent merge already ran this submit).
+            // Parent angular taps — PARALLAX-CORRECTED BY DEFAULT since
+            // 2026-08-04 (`__giParallaxMerge = false`, BUILD-TIME, restores
+            // the naive taps for A/B).
+            //
+            // THE BUG THE CORRECTION FIXES: the naive lookup reads the 4
+            // angular children of the parent's MERGED field at the CHILD'S
+            // BIN INDEX — ignoring parallax. A corner parent sits up to a
+            // whole parent-spacing from the child, and at the level
+            // answering distance d the spacing IS ~d; solid angle
+            // ω(r) = A/r² is CONVEX in that displacement, so the trilinear
+            // average over 8 displaced parents OVERESTIMATES far energy
+            // (Jensen), one factor per merge level — while the near field
+            // (own-interval hits, no merge) stays correct. Measured
+            // (run-gi-bleed): d^-1.44 vs analytic d^-2.72 — the "colour
+            // bleed reaches metres too far while the room under-fills"
+            // Blender-parity gap.
+            //
+            // THE CORRECTION (v2, depth-guided): the naive block's `w` is
+            // set ONLY for the parent's OWN-interval hits — exactly the
+            // boundary-adjacent energy parallax distorts; far/inherited
+            // energy keeps w = -1. Resolved depth → re-aim at
+            // childPos + D·depth and take the TRANSLATED 2×2 box-mean (box
+            // width = the child's bin, so small-source dilution is
+            // preserved; snap to whole texels). No depth → the naive block
+            // stands (far field: parallax negligible by 1/d).
             const rowBase = parentProbeIdx.mul(parent.dirCount).add(parentDirBase);
-            const s0 = parent.merged.element(rowBase.toInt()).xyz;
-            const s1 = parent.merged.element(rowBase.add(1).toInt()).xyz;
-            const s2 = parent.merged.element(rowBase.add(parent.dirRes).toInt()).xyz;
-            const s3 = parent.merged.element(rowBase.add(parent.dirRes).add(1).toInt()).xyz;
-            const parentRad = s0.add(s1).add(s2).add(s3).mul(0.25);
+            const s0 = parent.merged.element(rowBase.toInt()).toVar();
+            const s1 = parent.merged.element(rowBase.add(1).toInt()).toVar();
+            const s2 = parent.merged.element(rowBase.add(parent.dirRes).toInt()).toVar();
+            const s3 = parent.merged.element(rowBase.add(parent.dirRes).add(1).toInt()).toVar();
+            const naiveRad = s0.xyz.add(s1.xyz).add(s2.xyz).add(s3.xyz).mul(0.25);
+            // Estimator selection was MEASURED on run-gi-bleed (2026-08-04),
+            // far-field exponent vs analytic -2.72 at shipped c0DirRes 4:
+            //   naive (pre-fix)              -1.44   (the falloff bug)
+            //   v1 endpoint + point-bilinear -2.35   (breaks dilution)
+            //   v2 min-depth block re-aim    -2.66   ← SHIPPED
+            //   v3 per-sub-bin re-aim        -3.77   (tap wobbles off small
+            //                                         sources — rejected)
+            // v2's known limit: at the DIAGNOSTIC c0DirRes 2 config it
+            // over-steepens (-5.38) — wide bins mix floor-graze and distant
+            // energy, and the block's min depth then over-corrects. No
+            // shipping preset uses c0DirRes 2 (GISystem: `props.c0DirRes
+            // === 2 ? 2 : 4`, presets never lower it), so the default stays
+            // on; revisit if that ever changes.
+            let parentRad;
+            if (globalThis.__giParallaxMerge !== false) {
+              const big = float(1e6);
+              const dHit = select(s0.w.greaterThan(0), s0.w, big)
+                .min(select(s1.w.greaterThan(0), s1.w, big))
+                .min(select(s2.w.greaterThan(0), s2.w, big))
+                .min(select(s3.w.greaterThan(0), s3.w, big))
+                .toVar();
+              const reproj = vec3(naiveRad).toVar();
+              If(dHit.lessThan(big), () => {
+                const target = childPos.add(cascade.directionOf(dirIdx).mul(dHit));
+                const relAim = target.sub(parentPos).toVar();
+                const lenAim = relAim.length().max(1e-4);
+                const { u: pu, v: pv } = octahedralUV(relAim.div(lenAim), parent.dirRes);
+                // Whole-texel-snapped 2×2 box centred on the re-aimed
+                // direction — box width = the child's bin, so small-source
+                // dilution is preserved; only the CENTER moves with parallax.
+                const bxA = pu.add(0.5).floor().sub(1).clamp(0, parent.dirRes - 2);
+                const byA = pv.add(0.5).floor().sub(1).clamp(0, parent.dirRes - 2);
+                const rowA = parentProbeIdx.mul(parent.dirCount).add(byA.mul(parent.dirRes)).add(bxA).toVar();
+                const r0 = parent.merged.element(rowA.toInt()).xyz;
+                const r1 = parent.merged.element(rowA.add(1).toInt()).xyz;
+                const r2 = parent.merged.element(rowA.add(parent.dirRes).toInt()).xyz;
+                const r3 = parent.merged.element(rowA.add(parent.dirRes).add(1).toInt()).xyz;
+                reproj.assign(r0.add(r1).add(r2).add(r3).mul(0.25));
+              });
+              parentRad = reproj;
+            } else {
+              parentRad = naiveRad;
+            }
 
             acc.addAssign(parentRad.mul(weight));
             weightSum.addAssign(weight);

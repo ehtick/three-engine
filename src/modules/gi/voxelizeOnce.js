@@ -69,7 +69,16 @@ function textureAverageColor(texture) {
   if (!image || !(image.width > 0) || !(image.height > 0)) return null; // not loaded yet — retry next scan
   if (image.complete === false) return null;
   try {
-    const size = 8;
+    // 128, not 8 (2026-08-04, Blender-parity): drawImage downsamples in sRGB
+    // space, and an sRGB block-average decoded to linear UNDERESTIMATES the
+    // true linear mean of the block (Jensen — a 50/50 black/white block reads
+    // 0.21 instead of 0.5). At 8×8 each "texel" averaged an enormous block of
+    // a contrasty texture, so every textured mesh's bounce albedo was biased
+    // DARK and GRAY — compounding per bounce, which is a whole-room fill
+    // deficit. At 128×128 the per-block variance (and so the bias) is small;
+    // the per-texel decode below is unchanged. One-time cost per texture
+    // (cached): a 64KB readback.
+    const size = 128;
     const canvas =
       typeof OffscreenCanvas !== "undefined"
         ? new OffscreenCanvas(size, size)

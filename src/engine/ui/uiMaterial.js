@@ -3,11 +3,16 @@ import {
   uniform,
   uv,
   vec2,
+  vec4,
   step,
   mix,
   fract,
   texture as tslTexture,
   screenCoordinate,
+  cameraProjectionMatrix,
+  modelViewMatrix,
+  modelWorldMatrix,
+  positionLocal,
 } from "three/tsl";
 import { SDF_EDGE } from "./sdfFont.js";
 
@@ -27,7 +32,50 @@ function makeBaseUniforms() {
   return {
     clip: uniform(new THREE.Vector4(...HUGE_CLIP)),
     alpha: uniform(1), // element opacity × inherited opacity
+    // Screen-space projection (see uiVertexNode). uiSize is the owning
+    // screen's UI-pixel extent; screenSpace is 1 for an overlay, 0 for a
+    // world panel.
+    uiSize: uniform(new THREE.Vector2(1, 1)),
+    screenSpace: uniform(0),
   };
+}
+
+/**
+ * Clip-space position for a UI vertex.
+ *
+ * A world-space panel is an ordinary object: camera projection, exactly like
+ * any other mesh. A screen-space overlay is not. Its vertices are laid out in
+ * UI pixels with the screen root pinned to the world origin, so the model
+ * matrix alone already yields UI-space coordinates (x right, y down carried as
+ * -y) and the answer is a direct map onto NDC with no camera involved.
+ *
+ * This is what lets UI render in the MAIN scene pass. It previously needed a
+ * second `renderer.render()` per screen through a dedicated orthographic
+ * camera, which measured at roughly the cost of the entire rest of the frame —
+ * one label halved the frame rate (`scripts/run-ui-perf.mjs`).
+ *
+ * The two projections are blended by a uniform rather than compiled as two
+ * materials because a screen changes mode at runtime: the editor draws a
+ * screen-space canvas as a world plane while you author it and as an overlay
+ * the moment you press Play. A graph-shape change there would rebuild every UI
+ * material on every Play press.
+ */
+function uiVertexNode(u) {
+  const local = vec4(positionLocal, 1);
+  const projected = cameraProjectionMatrix.mul(modelViewMatrix).mul(local);
+  const world = modelWorldMatrix.mul(local);
+  // UI (0,0) is the top-left of the screen and y grows downward, which the
+  // layout pass already carries as negative world y — so y = 0 maps to NDC +1
+  // and y = -uiSize.y to -1. z is fixed: UI ordering is painter's order via
+  // renderOrder, and depth testing is off for everything but an `occluded`
+  // panel, which takes the projected branch anyway.
+  const screen = vec4(
+    world.x.div(u.uiSize.x).mul(2).sub(1),
+    world.y.div(u.uiSize.y).mul(2).add(1),
+    0,
+    1,
+  );
+  return mix(projected, screen, u.screenSpace);
 }
 
 /** 1 where the fragment is inside the clip rect, 0 outside. */
@@ -39,12 +87,13 @@ function clipFactor(clipUniform) {
     .mul(step(sc.y, clipUniform.w));
 }
 
-function configureUiMaterial(material) {
+function configureUiMaterial(material, u) {
   material.transparent = true;
   material.depthTest = false;
   material.depthWrite = false;
   material.fog = false;
   material.toneMapped = false;
+  material.vertexNode = uiVertexNode(u);
 }
 
 /**
@@ -154,7 +203,7 @@ export function createUiImageMaterial(options = {}) {
   const material = new THREE.MeshBasicNodeMaterial();
   material.colorNode = rgb;
   material.opacityNode = alpha;
-  configureUiMaterial(material);
+  configureUiMaterial(material, u);
   material.userData.uiUniforms = u;
   return material;
 }
@@ -170,7 +219,7 @@ export function createUiTextMaterial(canvasTexture) {
   const material = new THREE.MeshBasicNodeMaterial();
   material.colorNode = texel.rgb;
   material.opacityNode = texel.a.mul(u.alpha).mul(clipFactor(u.clip));
-  configureUiMaterial(material);
+  configureUiMaterial(material, u);
   material.userData.uiUniforms = u;
   return material;
 }
@@ -212,13 +261,40 @@ export function createUiSdfTextMaterial(atlasTexture) {
   // `outer` is the silhouette including the outline; `fill` picks the colour
   // inside it. With outlineWidth 0 the two collapse to the same edge.
   material.opacityNode = outer.mul(u.alpha).mul(clipFactor(u.clip));
-  configureUiMaterial(material);
+  configureUiMaterial(material, u);
   material.userData.uiUniforms = u;
   return material;
 }
 
-/** Writes the shared per-element uniforms (clip in physical px, opacity). */
-export function applyElementUniforms(material, { clipRect, alpha, k, depthTest = false }) {
+/**
+ * Line material for the editor's UI selection outline.
+ *
+ * It needs the same vertex transform as the elements it outlines: an outline
+ * drawn through the scene camera while its element is drawn in screen space
+ * lands somewhere else entirely (visible the moment you tick Show UI Overlay
+ * and click an element). Uniforms are written through `applyElementUniforms`
+ * like any other UI material — the clip rect is left wide open.
+ */
+export function createUiHighlightMaterial(color = 0x4da3ff) {
+  const u = makeBaseUniforms();
+  const material = new THREE.LineBasicNodeMaterial({ color, transparent: true });
+  material.depthTest = false;
+  material.depthWrite = false;
+  material.fog = false;
+  material.toneMapped = false;
+  material.vertexNode = uiVertexNode(u);
+  material.userData.uiUniforms = u;
+  return material;
+}
+
+/**
+ * Writes the shared per-element uniforms: clip rect (physical px), opacity,
+ * and the screen's projection state (see uiVertexNode).
+ */
+export function applyElementUniforms(
+  material,
+  { clipRect, alpha, k, depthTest = false, uiWidth = 1, uiHeight = 1, screenSpace = false },
+) {
   const u = material.userData.uiUniforms;
   if (!u) return;
   if (clipRect) {
@@ -227,6 +303,10 @@ export function applyElementUniforms(material, { clipRect, alpha, k, depthTest =
     u.clip.value.set(...HUGE_CLIP);
   }
   u.alpha.value = alpha;
+  // Guarded against zero: the vertex shader divides by these, and a screen is
+  // laid out with 0×0 for the frame between attach and the first layout pass.
+  u.uiSize.value.set(Math.max(uiWidth, 1e-4), Math.max(uiHeight, 1e-4));
+  u.screenSpace.value = screenSpace ? 1 : 0;
   // World-space panels can be occluded by scene geometry; an overlay never is.
   // Assigning only on change keeps WebGPU from rebuilding the pipeline every
   // frame (the flag is part of the pipeline key).

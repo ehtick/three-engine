@@ -245,22 +245,38 @@ declare module "engine" {
   }
 
   /**
-   * Base shape every component exposes, regardless of type. Mirrors the
-   * runtime `Component` base class (`src/engine/components/Component.js`).
+   * Keys that belong to the Component API — never flattened from props onto
+   * the instance type (mirrors the runtime reserved list in Component.js).
+   * A prop that reuses one of these names (e.g. Spline's curve `type`) stays
+   * on `props` only.
    */
-  export interface ComponentBase {
+  type ComponentReservedKeys = "entity" | "type" | "props" | "enabled" | "viewOnly";
+
+  /**
+   * Base shape every component exposes. Authored props in `P` are mirrored on
+   * the instance for direct get/set (`light.intensity = 2`), matching the
+   * runtime accessors installed by `Component`. Writes go through `setProp`.
+   */
+  export type ComponentBase<P extends object = object> = {
     entity: Entity;
     /** The registered type string (e.g. `"mesh"`, `"charactercontroller"`). */
     type: string;
     /** Effective enabled state — composes `props.enabled` with any transient override. */
     enabled: boolean;
-    props: Record<string, unknown>;
+    /** Whether frustum gating is active for this component. */
+    readonly viewOnly: boolean;
+    props: P & { enabled?: boolean; viewOnly?: boolean };
     setEnabled(value: boolean): void;
     setProp(key: string, value: unknown): void;
-  }
+  } & Omit<P, ComponentReservedKeys>;
 
   /** `entity.getComponent("model")` / `findComponents("model")`. */
-  export interface ModelComponent extends ComponentBase {
+  export interface ModelComponent extends ComponentBase<{
+    path: string;
+    materials: Record<string, string>;
+    castShadow: boolean;
+    receiveShadow: boolean;
+  }> {
     /** Root of the loaded GLTF scene graph, or `null` before it finishes loading. */
     root: Object3D | null;
     /** Animation clips available on this model (drives the sibling `AnimationComponent`). */
@@ -268,7 +284,15 @@ declare module "engine" {
   }
 
   /** `entity.getComponent("animation")`. Drives a `.anim` state machine against the sibling Model component. */
-  export interface AnimationComponent extends ComponentBase {
+  export interface AnimationComponent extends ComponentBase<{
+    controller: string;
+    playInEditor: boolean;
+    rootMotion: boolean;
+    rootMotionTarget: "transform" | "script";
+    rootMotionY: boolean;
+    rootMotionRotation: boolean;
+    rootBone: string;
+  }> {
     /** Name of the currently playing state, or `null` if nothing is playing. */
     readonly currentState: string | null;
     /** Names of the clips available on the sibling `ModelComponent`. */
@@ -312,7 +336,16 @@ declare module "engine" {
    *     cutscene.play();
    *     this.engine.on("timeline-event", ({ method }) => { ... });
    */
-  export interface TimelineComponent extends ComponentBase {
+  export interface TimelineComponent extends ComponentBase<{
+    asset: string;
+    playOnStart: boolean;
+    wrapMode: string;
+    speed: number;
+    startTime: number;
+    audio: boolean;
+    updateMode: string;
+    bindings: Record<string, string>;
+  }> {
     /** Length of the loaded timeline in seconds (0 before it loads). */
     readonly duration: number;
     /** Playhead position in seconds. */
@@ -341,17 +374,54 @@ declare module "engine" {
    *
    *     this.entity.getComponent("ik").setProp("weight", grounded ? 1 : 0);
    */
-  export interface IKComponent extends ComponentBase {}
+  export interface IKComponent extends ComponentBase<{
+    tipBone: string;
+    target: string;
+    pole: string;
+    weight: number;
+    matchTipRotation: boolean;
+    groundProbe: boolean;
+    probeUp: number;
+    probeDown: number;
+    footOffset: number;
+    probeLayers: string;
+    softness: number;
+  }> {}
 
   /** `entity.getComponent("mesh")`. Geometry/material are data-driven via `props` — see `static schema`. */
-  export interface MeshComponent extends ComponentBase {}
+  export interface MeshComponent extends ComponentBase<{
+    geometry: string;
+    geometryAsset: string;
+    material: string;
+    material2: string;
+    material3: string;
+    material4: string;
+    material5: string;
+    material6: string;
+    material7: string;
+    material8: string;
+    castShadow: boolean;
+    receiveShadow: boolean;
+  }> {}
 
   /**
    * `entity.getComponent("camera")`. Also the virtual-camera "brain": when the
    * scene contains any `vcam`, this picks the highest-priority one and blends
    * the real camera onto it.
    */
-  export interface CameraComponent extends ComponentBase {
+  export interface CameraComponent extends ComponentBase<{
+    fov: number;
+    near: number;
+    far: number;
+    blendTime: number;
+    blendStyle: string;
+    shake: number;
+    previewRigInEditor: boolean;
+    showPreview: boolean;
+    followTarget: string | null;
+    followInViewport: boolean;
+    followInGame: boolean;
+  }> {
     camera: Camera | null;
     /** The virtual camera currently driving this one, or null. */
     readonly live: VirtualCameraComponent | null;
@@ -371,7 +441,37 @@ declare module "engine" {
    *     cam.addOrbit(dx * 2, dy * 2);     // boom arm, degrees
    *     cam.setProp("priority", 100);     // make this shot live
    */
-  export interface VirtualCameraComponent extends ComponentBase {
+  export interface VirtualCameraComponent extends ComponentBase<{
+    priority: number;
+    follow: string;
+    lookAt: string;
+    body: string;
+    bindingMode: string;
+    offset: [number, number, number];
+    distance: number;
+    yaw: number;
+    pitch: number;
+    minPitch: number;
+    maxPitch: number;
+    lookAction: string;
+    lookSensitivity: number;
+    invertY: boolean;
+    dollyPath: string;
+    dollyPosition: number;
+    autoDolly: boolean;
+    aim: string;
+    aimOffset: [number, number, number];
+    positionDamping: number;
+    verticalDamping: number;
+    aimDamping: number;
+    collision: boolean;
+    collisionRadius: number;
+    collisionPadding: number;
+    collisionLayers: string;
+    collisionRecovery: number;
+    fov: number;
+    blendTime: number;
+  }> {
     /** Set the boom arm's angles, in degrees. Pitch is clamped to the props. */
     setOrbit(yawDeg: number, pitchDeg: number): void;
     addOrbit(yawDeg: number, pitchDeg: number): void;
@@ -393,7 +493,17 @@ declare module "engine" {
    *
    *     this.entity.getComponent("impulsesource").fire({ magnitude: 0.8 });
    */
-  export interface ImpulseSourceComponent extends ComponentBase {
+  export interface ImpulseSourceComponent extends ComponentBase<{
+    magnitude: number;
+    duration: number;
+    frequency: number;
+    radius: number;
+    rotation: number;
+    attack: number;
+    directional: boolean;
+    direction: [number, number, number];
+    fireOnStart: boolean;
+  }> {
     fire(overrides?: Record<string, unknown>): unknown;
   }
 
@@ -513,7 +623,20 @@ declare module "engine" {
    *     agent.setDestination(player.position);
    *     if (agent.isAtDestination) this.attack();
    */
-  export interface NavAgentComponent extends ComponentBase {
+  export interface NavAgentComponent extends ComponentBase<{
+    radius: number;
+    height: number;
+    speed: number;
+    acceleration: number;
+    angularSpeed: number;
+    stoppingDistance: number;
+    separation: number;
+    avoidance: boolean;
+    avoidanceQuality: number;
+    autoRotate: boolean;
+    autoRepath: boolean;
+    drawPath: boolean;
+  }> {
     /**
      * Sends the agent to a world position, snapped to the nearest walkable
      * spot. Returns false when there is no navmesh, or nothing walkable near
@@ -537,12 +660,26 @@ declare module "engine" {
   }
 
   /** `entity.getComponent("navmesh")`. The scene's navmesh and bake settings. */
-  export interface NavMeshComponent extends ComponentBase {
+  export interface NavMeshComponent extends ComponentBase<{
+    data: string;
+    bakeOnLoad: boolean;
+    showOverlay: boolean;
+    useBounds: boolean;
+    boundsCenter: [number, number, number];
+    boundsSize: [number, number, number];
+    [key: string]: unknown;
+  }> {
     bake(): { success: boolean; error?: string; stats?: unknown };
   }
 
   /** `entity.getComponent("navlink")`. An off-mesh link — a jump, ladder or drop. */
-  export interface NavLinkComponent extends ComponentBase {
+  export interface NavLinkComponent extends ComponentBase<{
+    end: [number, number, number];
+    endEntity: string;
+    radius: number;
+    bidirectional: boolean;
+    showGizmo: boolean;
+  }> {
     endpoints(): { start: Vector3; end: Vector3 };
   }
 
@@ -617,7 +754,23 @@ declare module "engine" {
 
   /** `entity.getComponent("line")`. A polyline with width — beams, ropes, aim
    *  indicators. Styling lives in `props`; the points are the API. */
-  export interface LineRendererComponent extends ComponentBase {
+  export interface LineRendererComponent extends ComponentBase<{
+    points: [number, number, number][];
+    space: string;
+    loop: boolean;
+    smoothing: number;
+    startWidth: number;
+    endWidth: number;
+    startColor: string;
+    endColor: string;
+    startAlpha: number;
+    endAlpha: number;
+    texture: string;
+    textureMode: string;
+    tiling: number;
+    alignment: string;
+    blending: string;
+  }> {
     readonly pointCount: number;
     getPoint(index: number): Vector3 | null;
     /** Replaces every point. Accepts Vector3s, `[x,y,z]` or `{x,y,z}`. */
@@ -631,7 +784,22 @@ declare module "engine" {
 
   /** `entity.getComponent("trail")`. A ribbon that follows the entity and fades
    *  behind it. Points are recorded in world space, on game time. */
-  export interface TrailRendererComponent extends ComponentBase {
+  export interface TrailRendererComponent extends ComponentBase<{
+    time: number;
+    minVertexDistance: number;
+    emitting: boolean;
+    startWidth: number;
+    endWidth: number;
+    startColor: string;
+    endColor: string;
+    startAlpha: number;
+    endAlpha: number;
+    texture: string;
+    textureMode: string;
+    tiling: number;
+    alignment: string;
+    blending: string;
+  }> {
     /** Recorded points currently alive. */
     readonly pointCount: number;
     /** Drops the history — call this after a teleport, or the trail draws a
@@ -642,7 +810,17 @@ declare module "engine" {
 
   /** `entity.getComponent("decal")`. An authored projector; see `props` for its
    *  box, texture and filters. */
-  export interface DecalComponent extends ComponentBase {
+  export interface DecalComponent extends ComponentBase<{
+    texture: string;
+    color: string;
+    opacity: number;
+    size: [number, number, number];
+    maxAngle: number;
+    offset: number;
+    lit: boolean;
+    blending: string;
+    targetTag: string;
+  }> {
     /** Re-projects against the current geometry. Needed after changing the
      *  surface in a way nothing announces (a terrain sculpt, a mesh edit). */
     project(): DecalHandle | null;
@@ -652,7 +830,11 @@ declare module "engine" {
 
   /** `entity.getComponent("lod")`. Picks which child entity draws, by how much
    *  of the frame's height the group covers. Level 0 is the finest child. */
-  export interface LodGroupComponent extends ComponentBase {
+  export interface LodGroupComponent extends ComponentBase<{
+    levels: number[];
+    hysteresis: number;
+    forcedLevel: number;
+  }> {
     /** Level currently drawn; -1 when culled, null before the first frame. */
     readonly activeLevel: number | null;
     /** Share of the viewport's height the group covered on the last update. */
@@ -702,7 +884,16 @@ declare module "engine" {
    *     const path = this.engine.findEntity("Patrol").getComponent("spline");
    *     const target = path.worldPointAt(this.distance);
    */
-  export interface SplineComponent extends ComponentBase {
+  export interface SplineComponent extends ComponentBase<{
+    knots: unknown[];
+    /** Curve type — access via `props.type` (reserved name on the component). */
+    type: string;
+    closed: boolean;
+    tension: number;
+    resolution: number;
+    alwaysDraw: boolean;
+    color: string;
+  }> {
     /** Total arc length, in the path's own (local) units. */
     readonly length: number;
     /** Length scaled by the entity's world scale. */
@@ -727,7 +918,17 @@ declare module "engine" {
 
   /** `entity.getComponent("splineFollower")`. Moves its entity along a path.
    *  `position` is a plain prop, so a timeline can key it. */
-  export interface SplineFollowerComponent extends ComponentBase {
+  export interface SplineFollowerComponent extends ComponentBase<{
+    path: string;
+    position: number;
+    speed: number;
+    wrap: string;
+    align: string;
+    forward: string;
+    offset: [number, number, number];
+    autoPlay: boolean;
+    preview: boolean;
+  }> {
     /** The path being followed, or null while it is unwired. */
     readonly path: SplineComponent | null;
     readonly pathLength: number;
@@ -746,7 +947,20 @@ declare module "engine" {
   }
 
   /** `entity.getComponent("splineMesh")`. Geometry swept along a path. */
-  export interface SplineMeshComponent extends ComponentBase {
+  export interface SplineMeshComponent extends ComponentBase<{
+    path: string;
+    profile: string;
+    width: number;
+    height: number;
+    radius: number;
+    sides: number;
+    density: number;
+    uvScale: number;
+    capEnds: boolean;
+    material: string;
+    castShadow: boolean;
+    receiveShadow: boolean;
+  }> {
     readonly triangleCount: number;
     /** Queues a re-sweep for the next frame. Safe to call per pointer event. */
     invalidate(): void;
@@ -785,17 +999,54 @@ declare module "engine" {
     readonly count: number;
   }
 
-  /** `entity.getComponent("light")`. Light kind/color/shadow params live in `props` — see `static schema`. */
-  export interface LightComponent extends ComponentBase {
+  /**
+   * `entity.getComponent("light")` / `getComponent(LightComponent)`.
+   * Authored props are mirrored on the instance (`light.intensity = 2`).
+   */
+  export interface LightComponent extends ComponentBase<{
+    kind: "directional" | "point" | "spot" | "ambient";
+    color: string;
+    intensity: number;
+    distance: number;
+    angle: number;
+    decay: number;
+    penumbra: number;
+    castShadow: boolean;
+    shadowMapType: string;
+    shadowMapWidth: number;
+    shadowMapHeight: number;
+    shadowBias: number;
+    shadowNormalBias: number;
+    shadowRadius: number;
+    shadowCamNear: number;
+    shadowCamFar: number;
+    shadowCamSize: number;
+    shadowCamFov: number;
+    csm: boolean;
+    csmCascades: number;
+    csmMaxFar: number;
+    csmMode: string;
+    csmSplitLambda: number;
+    csmLightMargin: number;
+    csmFade: boolean;
+  }> {
     /** The underlying three.js light instance (`DirectionalLight` / `PointLight` / `SpotLight` / `AmbientLight`). */
     light: unknown;
   }
 
   /** `entity.getComponent("listener")`. One listener is active scene-wide; see the component's doc comment for claim rules. */
-  export interface ListenerComponent extends ComponentBase {}
+  export interface ListenerComponent extends ComponentBase<{
+    autoFromCamera: boolean;
+  }> {}
 
   /** `entity.getComponent("sound")`. Playback is driven by `engine.audio`; entries live in `props.entries`. */
-  export interface SoundComponent extends ComponentBase {
+  export interface SoundComponent extends ComponentBase<{
+    entries: unknown[];
+    occlusionEnabled: boolean;
+    occlusionAttenuation: number;
+    spatialPreset: string;
+    [key: string]: unknown;
+  }> {
     /** Plays one entry immediately (used by the inspector's Preview button). Returns a handle with `stop()`, or `null` if not ready. */
     previewEntry(entryId: string): { stop(): void } | null;
     /** Read-only slot list (one per active entry). */
@@ -803,13 +1054,20 @@ declare module "engine" {
   }
 
   /** `entity.getComponent("instancer")`. Hardware-instances the sibling `MeshComponent`/`ModelComponent`'s geometry; see `static schema`. */
-  export interface InstancerComponent extends ComponentBase {
+  export interface InstancerComponent extends ComponentBase<{
+    mode: string;
+    count: number;
+    seed: number;
+    [key: string]: unknown;
+  }> {
     /** Re-rolls the seeded RNG and rebuilds the instance transforms. */
     regenerate(): void;
   }
 
   /** `entity.getComponent("particles")`. Emission/shape/color-over-life are graph-driven via `props`. */
-  export interface ParticleComponent extends ComponentBase {
+  export interface ParticleComponent extends ComponentBase<{
+    graph: unknown;
+  }> {
     /** Resets the simulation (clears all live particles and restarts emission). */
     restart(): void;
   }
@@ -819,7 +1077,17 @@ declare module "engine" {
    * while playing (requires the `physics-rapier` module) — all methods no-op
    * outside play mode. `bodyType`/`mass`/damping/locks live in `props`.
    */
-  export interface RigidbodyComponent extends ComponentBase {
+  export interface RigidbodyComponent extends ComponentBase<{
+    bodyType: "dynamic" | "kinematic" | "fixed";
+    mass: number;
+    linearDamping: number;
+    angularDamping: number;
+    gravityScale: number;
+    ccd: boolean;
+    lockRotationX: boolean;
+    lockRotationY: boolean;
+    lockRotationZ: boolean;
+  }> {
     applyImpulse(v: [number, number, number]): void;
     applyForce(v: [number, number, number]): void;
     applyTorqueImpulse(v: [number, number, number]): void;
@@ -836,7 +1104,17 @@ declare module "engine" {
    * `physics-rapier` module); pairs with a Rigidbody on this entity or the
    * nearest ancestor. Shape/size/friction/etc. live in `props`.
    */
-  export interface ColliderComponent extends ComponentBase {}
+  export interface ColliderComponent extends ComponentBase<{
+    shape: string;
+    size: [number, number, number];
+    radius: number;
+    height: number;
+    offset: [number, number, number];
+    friction: number;
+    restitution: number;
+    isSensor: boolean;
+    layer: string;
+  }> {}
 
   /**
    * `entity.getComponent("charactercontroller")`. Kinematic character
@@ -845,7 +1123,23 @@ declare module "engine" {
    * Collider. Movement is velocity-based (units/second); gravity is applied
    * internally when `props.applyGravity` is on.
    */
-  export interface CharacterControllerComponent extends ComponentBase {
+  export interface CharacterControllerComponent extends ComponentBase<{
+    radius: number;
+    height: number;
+    offset: [number, number, number];
+    slopeClimbAngle: number;
+    slopeSlideAngle: number;
+    autostep: boolean;
+    autostepHeight: number;
+    autostepMinWidth: number;
+    snapToGround: boolean;
+    snapDistance: number;
+    applyGravity: boolean;
+    gravityScale: number;
+    pushDynamicBodies: boolean;
+    skinWidth: number;
+    layer: string;
+  }> {
     /** Sets desired horizontal velocity (units/s). `y` is ignored — gravity/jump own vertical motion. */
     move(v: [number, number, number]): void;
     /** Launches upward at `speed` (units/s) — only takes effect when grounded. */
@@ -872,7 +1166,23 @@ declare module "engine" {
    * Hinge angles are in DEGREES, slider offsets in metres — the same units the
    * Inspector shows.
    */
-  export interface JointComponent extends ComponentBase {
+  export interface JointComponent extends ComponentBase<{
+    kind: string;
+    connectedEntity: string;
+    anchor: [number, number, number];
+    connectedAnchor: [number, number, number];
+    axis: [number, number, number];
+    enableCollision: boolean;
+    limitsEnabled: boolean;
+    limitMin: number;
+    limitMax: number;
+    motorEnabled: boolean;
+    motorSpeed: number;
+    motorMaxForce: number;
+    restLength: number;
+    stiffness: number;
+    damping: number;
+  }> {
     /** Drives the joint like a motor — an automatic door, a winch, a powered
      *  wheel. Hinge and slider only. */
     setMotorVelocity(speed: number, maxForce?: number): void;
@@ -880,6 +1190,146 @@ declare module "engine" {
     setMotorTarget(target: number, stiffness?: number, damping?: number): void;
     setLimits(min: number, max: number): void;
   }
+
+  /** Import-created marker that mirrors one GLB bone onto an entity. */
+  export interface BoneComponent extends ComponentBase<{ path: string }> {}
+
+  /** Import-created skinned surface inside a Model hierarchy. */
+  export interface SkinnedMeshComponent extends ComponentBase<{
+    geometry: string;
+    path: string;
+    material: string;
+    castShadow: boolean;
+    receiveShadow: boolean;
+  }> {}
+
+  /** Exact planar reflection applied to the meshes on this entity. */
+  export interface PlanarReflectionComponent extends ComponentBase<{
+    normalAxis: "+Z" | "-Z" | "+Y" | "-Y" | "+X" | "-X";
+    resolution: number;
+    intensity: number;
+    tint: string;
+    fresnel: boolean;
+    fresnelPower: number;
+    blur: boolean;
+    bounces: boolean;
+  }> {}
+
+  /** Prewarms a prefab pool when play starts. */
+  export interface PoolComponent extends ComponentBase<{ prefab: string; count: number }> {}
+
+  /** Far-distance billboard level backed by the shared impostor atlas. */
+  export interface ImpostorComponent extends ComponentBase<{
+    source: string;
+    frames: number;
+    tile: number;
+    hemisphere: boolean;
+    alphaTest: number;
+    lit: boolean;
+    castShadow: boolean;
+    receiveShadow: boolean;
+  }> {
+    readonly bakeError: string | null;
+    bakeSettings(): Record<string, unknown>;
+  }
+
+  /** Non-destructive geometry modifier stack attached to a Mesh entity. */
+  export interface GeometryModifiersComponent extends ComponentBase<{
+    modifiers: unknown[];
+  }> {}
+
+  /** UI canvas root. Requires the UI system supplied by the engine. */
+  export interface UiScreenComponent extends ComponentBase<{
+    renderMode: "screen" | "world";
+    referenceWidth: number;
+    referenceHeight: number;
+    scaleMode: "none" | "fit" | "fill" | "width" | "height";
+    worldScale: number;
+    billboard: boolean;
+  }> {}
+
+  /** Anchors, pivot, position and size for one UI element. */
+  export interface UiElementComponent extends ComponentBase<Record<string, unknown>> {
+    readonly rect: { x: number; y: number; w: number; h: number } | null;
+    readonly clipRect: { x: number; y: number; w: number; h: number } | null;
+    readonly worldAlpha: number;
+  }
+
+  /** Styled UI rectangle, texture, border and progress fill. */
+  export interface UiImageComponent extends ComponentBase<{
+    color: string;
+    opacity: number;
+    texture: string;
+    cornerRadius: number;
+    borderWidth: number;
+    borderColor: string;
+    fillMode: "none" | "horizontal" | "vertical";
+    fillAmount: number;
+    [key: string]: unknown;
+  }> {}
+
+  /** Raster or SDF text rendered in a UI hierarchy. */
+  export interface UiTextComponent extends ComponentBase<{
+    text: string;
+    font: string;
+    fontSize: number;
+    color: string;
+    align: string;
+    [key: string]: unknown;
+  }> {}
+
+  /** Pointer- and gamepad-interactive UI button. */
+  export interface UiButtonComponent extends ComponentBase<{
+    interactable: boolean;
+    normalColor: string;
+    hoverColor: string;
+    pressedColor: string;
+    disabledColor: string;
+    focusColor: string;
+    navUp: string;
+    navDown: string;
+    navLeft: string;
+    navRight: string;
+  }> {}
+
+  /** Flex-style layout container for direct UI children. */
+  export interface UiLayoutComponent extends ComponentBase<{
+    direction: "column" | "row";
+    gap: number;
+    padding: number;
+    alignItems: "stretch" | "start" | "center" | "end";
+    justify: "start" | "center" | "end" | "space-between";
+    fitContent: boolean;
+  }> {}
+
+  /** Scrollable and clipped UI viewport. */
+  export interface UiScrollComponent extends ComponentBase<{
+    vertical: boolean;
+    horizontal: boolean;
+    dragScroll: boolean;
+    wheelSpeed: number;
+  }> {
+    readonly scrollX: number;
+    readonly scrollY: number;
+  }
+
+  /** Rectangular screen-space clip for descendant UI visuals. */
+  export interface UiMaskComponent extends ComponentBase<{ enabled: boolean }> {}
+
+  /** Heightmap, splatmap and scatter-painted terrain surface. */
+  export interface TerrainComponent extends ComponentBase<Record<string, unknown>> {}
+
+  /** TSL post-processing graph attached to a camera. */
+  export interface PostprocessComponent extends ComponentBase<Record<string, unknown>> {}
+
+  /** HDRI environment lighting and skybox. */
+  export interface EnvironmentComponent extends ComponentBase<Record<string, unknown>> {}
+
+  /** AmbientCG OBJ/MTL model loader. */
+  export interface ObjModelComponent extends ComponentBase<Record<string, unknown>> {}
+
+  /** Radiance-cascade global illumination settings and runtime state. */
+  export interface GlobalIlluminationComponent extends ComponentBase<Record<string, unknown>> {}
 
   /**
    * Maps every built-in registered component type string to its typed
@@ -934,6 +1384,25 @@ declare module "engine" {
     collider: ColliderComponent;
     charactercontroller: CharacterControllerComponent;
     joint: JointComponent;
+    bone: BoneComponent;
+    skinnedmesh: SkinnedMeshComponent;
+    "planar-reflection": PlanarReflectionComponent;
+    pool: PoolComponent;
+    impostor: ImpostorComponent;
+    geometryModifiers: GeometryModifiersComponent;
+    uiscreen: UiScreenComponent;
+    uielement: UiElementComponent;
+    uiimage: UiImageComponent;
+    uitext: UiTextComponent;
+    uibutton: UiButtonComponent;
+    uilayout: UiLayoutComponent;
+    uiscroll: UiScrollComponent;
+    uimask: UiMaskComponent;
+    terrain: TerrainComponent;
+    postprocess: PostprocessComponent;
+    environment: EnvironmentComponent;
+    objModel: ObjModelComponent;
+    "global-illumination": GlobalIlluminationComponent;
     script: ScriptComponent;
   }
 
@@ -975,6 +1444,21 @@ declare module "engine" {
   export const SplineMeshComponent: ComponentClass<"splineMesh">;
   export const ScriptComponent: ComponentClass<"script">;
 
+  export const BoneComponent: ComponentClass<"bone">;
+  export const SkinnedMeshComponent: ComponentClass<"skinnedmesh">;
+  export const PlanarReflectionComponent: ComponentClass<"planar-reflection">;
+  export const PoolComponent: ComponentClass<"pool">;
+  export const ImpostorComponent: ComponentClass<"impostor">;
+  export const GeometryModifiersComponent: ComponentClass<"geometryModifiers">;
+  export const UiScreenComponent: ComponentClass<"uiscreen">;
+  export const UiElementComponent: ComponentClass<"uielement">;
+  export const UiImageComponent: ComponentClass<"uiimage">;
+  export const UiTextComponent: ComponentClass<"uitext">;
+  export const UiButtonComponent: ComponentClass<"uibutton">;
+  export const UiLayoutComponent: ComponentClass<"uilayout">;
+  export const UiScrollComponent: ComponentClass<"uiscroll">;
+  export const UiMaskComponent: ComponentClass<"uimask">;
+
   export const RigidbodyComponent: ComponentClass<"rigidbody">;
   export const ColliderComponent: ComponentClass<"collider">;
   export const CharacterControllerComponent: ComponentClass<"charactercontroller">;
@@ -983,6 +1467,12 @@ declare module "engine" {
   export const NavMeshComponent: ComponentClass<"navmesh">;
   export const NavAgentComponent: ComponentClass<"navagent">;
   export const NavLinkComponent: ComponentClass<"navlink">;
+
+  export const TerrainComponent: ComponentClass<"terrain">;
+  export const PostprocessComponent: ComponentClass<"postprocess">;
+  export const EnvironmentComponent: ComponentClass<"environment">;
+  export const ObjModelComponent: ComponentClass<"objModel">;
+  export const GlobalIlluminationComponent: ComponentClass<"global-illumination">;
 
   /** One entry in a script component's list. */
   export interface ScriptSlot {
@@ -1003,8 +1493,9 @@ declare module "engine" {
    *
    *     const health = this.entity.getScript("Health");
    */
-  export interface ScriptComponent extends ComponentBase {
-    props: { scripts: ScriptSlot[]; enabled?: boolean; viewOnly?: boolean };
+  export interface ScriptComponent extends ComponentBase<{
+    scripts: ScriptSlot[];
+  }> {
     /** Live instances, in execution order. Includes disabled scripts. */
     readonly instances: Script[];
     /** First instance. Prefer `getScript` when several are attached. */

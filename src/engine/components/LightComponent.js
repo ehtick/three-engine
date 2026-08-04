@@ -24,6 +24,9 @@ const _shadowUp = new THREE.Vector3();
 const _worldUp = new THREE.Vector3(0, 1, 0);
 
 export class LightComponent extends Component {
+  /** Runtime CSMShadowNode — distinct from the authored boolean `props.csm`. */
+  #csm = null;
+
   static type = "light";
   static label = "Light";
   static defaults = {
@@ -74,15 +77,15 @@ export class LightComponent extends Component {
     // Shadow-map controls. Master switch (castShadow) gates the rest via showIf
     // so the inspector stays tidy when shadows are off.
     { key: "shadowMapType", label: "Map Type", type: "select", options: SHADOW_TYPE_OPTIONS, showIf: (p) => p.kind !== "ambient" && p.castShadow, section: "Shadow" },
-    { key: "shadowMapWidth", label: "Map Width", type: "number", min: 16, step: 256, showIf: (p) => p.kind !== "ambient" && p.castShadow, section: "Shadow" },
-    { key: "shadowMapHeight", label: "Map Height", type: "number", min: 16, step: 256, showIf: (p) => p.kind !== "ambient" && p.castShadow, section: "Shadow" },
-    { key: "shadowBias", label: "Bias", type: "number", step: 0.0005, showIf: (p) => p.kind !== "ambient" && p.castShadow, section: "Shadow" },
-    { key: "shadowNormalBias", label: "Normal Bias", type: "number", step: 0.005, showIf: (p) => p.kind !== "ambient" && p.castShadow, section: "Shadow" },
+    { key: "shadowMapWidth", label: "Map Width", type: "number", min: 16, step: 256, showIf: (p) => (p.kind !== "ambient" && p.castShadow), section: "Shadow" },
+    { key: "shadowMapHeight", label: "Map Height", type: "number", min: 16, step: 256, showIf: (p) => (p.kind !== "ambient" && p.castShadow), section: "Shadow" },
+    { key: "shadowBias", label: "Bias", type: "number", step: 0.0005, showIf: (p) => (p.kind !== "ambient" && p.castShadow), section: "Shadow" },
+    { key: "shadowNormalBias", label: "Normal Bias", type: "number", step: 0.005, showIf: (p) => (p.kind !== "ambient" && p.castShadow), section: "Shadow" },
     { key: "shadowRadius", label: "Radius / Light Size", type: "number", min: 0, step: 0.25, showIf: (p) => p.kind !== "ambient" && p.castShadow, section: "Shadow" },
-    { key: "shadowCamNear", label: "Cam Near", type: "number", min: 0, step: 0.1, showIf: (p) => (p.kind === "directional" || p.kind === "spot" || p.kind === "point") && p.castShadow, section: "Shadow" },
-    { key: "shadowCamFar", label: "Cam Far", type: "number", min: 0, step: 1, showIf: (p) => (p.kind === "directional" || p.kind === "spot" || p.kind === "point") && p.castShadow, section: "Shadow" },
-    { key: "shadowCamSize", label: "Frustum Size", type: "number", min: 0.1, step: 1, showIf: (p) => (p.kind === "directional" || p.kind === "spot") && p.castShadow && !p.csm, section: "Shadow" },
-    { key: "shadowCamFov", label: "Face FOV°", type: "number", min: 1, max: 179, step: 1, showIf: (p) => p.kind === "point" && p.castShadow, section: "Shadow" },
+    { key: "shadowCamNear", label: "Cam Near", type: "number", min: 0, step: 0.1, showIf: (p) => ((p.kind === "directional" || p.kind === "spot" || p.kind === "point") && p.castShadow), section: "Shadow" },
+    { key: "shadowCamFar", label: "Cam Far", type: "number", min: 0, step: 1, showIf: (p) => ((p.kind === "directional" || p.kind === "spot" || p.kind === "point") && p.castShadow), section: "Shadow" },
+    { key: "shadowCamSize", label: "Frustum Size", type: "number", min: 0.1, step: 1, showIf: (p) => ((p.kind === "directional" || p.kind === "spot") && p.castShadow && !p.csm), section: "Shadow" },
+    { key: "shadowCamFov", label: "Face FOV°", type: "number", min: 1, max: 179, step: 1, showIf: (p) => (p.kind === "point" && p.castShadow), section: "Shadow" },
     { key: "csm", label: "Cascaded Shadows", type: "boolean", showIf: (p) => p.kind === "directional" && p.castShadow, section: "Shadow" },
     { key: "csmCascades", label: "Cascades", type: "number", min: 2, max: 4, step: 1, showIf: (p) => p.kind === "directional" && p.castShadow && p.csm, section: "CSM" },
     { key: "csmMaxFar", label: "CSM Max Far", type: "number", min: 1, step: 10, showIf: (p) => p.kind === "directional" && p.castShadow && p.csm, section: "CSM" },
@@ -138,8 +141,8 @@ export class LightComponent extends Component {
       return;
     }
     if (key === "csmMode" || key === "csmMaxFar" || key === "csmSplitLambda") {
-      if (this.csm) {
-        this.csm.maxFar = Math.max(1, this.props.csmMaxFar);
+      if (this.#csm) {
+        this.#csm.maxFar = Math.max(1, this.props.csmMaxFar);
         this.#configureCSMSplits();
       }
       this.#syncCSMShadowDepth();
@@ -147,7 +150,7 @@ export class LightComponent extends Component {
       return;
     }
     if (key === "csmLightMargin") {
-      if (this.csm) this.csm.lightMargin = Math.max(0, this.props.csmLightMargin);
+      if (this.#csm) this.#csm.lightMargin = Math.max(0, this.props.csmLightMargin);
       this.#syncCSMShadowDepth();
       this.#updateCSMFrustums(true);
       return;
@@ -236,7 +239,7 @@ export class LightComponent extends Component {
     if (this.light.isDirectionalLight) {
       this.unsubPreRender = this.entity.engine.onPreRender(() => {
         this.#syncDirectionalTransform();
-        if (!this.csm && this.#isCSMUsable()) this.#syncCSM();
+        if (!this.#csm && this.#isCSMUsable()) this.#syncCSM();
         this.#updateCSMFrustums();
       });
       this.unsubRendererRebuilt = this.entity.engine.on("renderer-rebuilt", () => {
@@ -344,7 +347,7 @@ export class LightComponent extends Component {
       : this.props.shadowCamFar;
     const shadows = [
       this.light.shadow,
-      ...(this.csm?.lights?.map((cascadeLight) => cascadeLight.shadow) ?? []),
+      ...(this.#csm?.lights?.map((cascadeLight) => cascadeLight.shadow) ?? []),
     ];
     for (const shadow of shadows) {
       if (shadow.camera.far === far) continue;
@@ -367,7 +370,7 @@ export class LightComponent extends Component {
     // its covered volume, so cloning the normal 100-unit camera here would
     // clip every caster with the default 200-unit margin and yield blank maps.
     this.#syncCSMShadowDepth();
-    if (!this.csm) {
+    if (!this.#csm) {
       if (
         this.props.shadowMapType === "PCFShadowMap" ||
         this.props.shadowMapType === "PCFSoftShadowMap"
@@ -377,16 +380,16 @@ export class LightComponent extends Component {
         // after its ShadowNode has compiled would leave the old filter cached.
         this.light.shadow.filterNode = PCFShadowFilter;
       }
-      this.csm = new CSMShadowNode(this.light, {
+      this.#csm = new CSMShadowNode(this.light, {
         cascades: Math.min(4, Math.max(2, Math.round(this.props.csmCascades))),
         maxFar: Math.max(1, this.props.csmMaxFar),
         mode: this.props.csmMode === "practical" ? "custom" : this.props.csmMode,
         lightMargin: Math.max(0, this.props.csmLightMargin),
       });
-      this.csm.fade = this.props.csmFade === true;
+      this.#csm.fade = this.props.csmFade === true;
       this.#configureCSMSplits();
     }
-    this.light.shadow.shadowNode = this.csm;
+    this.light.shadow.shadowNode = this.#csm;
     this.light.shadow.needsUpdate = true;
     // CSMShadowNode initializes its internal frustum lazily during shader
     // setup. Until then, updateFrustums() would dereference mainFrustum=null.
@@ -394,19 +397,19 @@ export class LightComponent extends Component {
   }
 
   #disposeCSM() {
-    if (!this.csm) return;
-    if (this.light?.shadow?.shadowNode === this.csm) {
+    if (!this.#csm) return;
+    if (this.light?.shadow?.shadowNode === this.#csm) {
       this.light.shadow.shadowNode = undefined;
       this.light.shadow.needsUpdate = true;
     }
-    this.csm.dispose?.();
-    this.csm = null;
+    this.#csm.dispose?.();
+    this.#csm = null;
   }
 
   #configureCSMSplits() {
-    if (!this.csm) return;
+    if (!this.#csm) return;
     if (this.props.csmMode !== "practical") {
-      this.csm.mode = this.props.csmMode;
+      this.#csm.mode = this.props.csmMode;
       return;
     }
     // Three's fixed 0.5 practical split gives a 1000-unit, four-cascade CSM
@@ -414,8 +417,8 @@ export class LightComponent extends Component {
     // empty distance and makes indoor contact shadows look uniformly soft.
     // Keep the practical blend adjustable, but bias its default much closer
     // to logarithmic so resolution is concentrated around the viewer.
-    this.csm.mode = "custom";
-    this.csm.customSplitsCallback = (cascades, near, far, target) => {
+    this.#csm.mode = "custom";
+    this.#csm.customSplitsCallback = (cascades, near, far, target) => {
       const lambda = THREE.MathUtils.clamp(this.props.csmSplitLambda, 0, 1);
       for (let i = 1; i <= cascades; i++) {
         const p = i / cascades;
@@ -427,13 +430,13 @@ export class LightComponent extends Component {
   }
 
   #syncCSMCascadeShadows() {
-    if (!this.csm?.lights?.length) return;
-    const last = Math.max(1, this.csm.lights.length - 1);
+    if (!this.#csm?.lights?.length) return;
+    const last = Math.max(1, this.#csm.lights.length - 1);
     const baseRadius = Math.max(0, this.props.shadowRadius);
     const baseBias = this.props.shadowBias;
     const baseNormalBias = Math.max(0, this.props.shadowNormalBias);
-    for (let i = 0; i < this.csm.lights.length; i++) {
-      const shadow = this.csm.lights[i].shadow;
+    for (let i = 0; i < this.#csm.lights.length; i++) {
+      const shadow = this.#csm.lights[i].shadow;
       const t = i / last;
       let changed = false;
 
@@ -474,18 +477,18 @@ export class LightComponent extends Component {
   }
 
   #updateCSMFrustums(force = false) {
-    if (!this.#isCSMUsable() || !this.csm) return;
+    if (!this.#isCSMUsable() || !this.#csm) return;
     const camera = this.entity.engine.camera;
     if (!camera) return;
     camera.updateMatrixWorld(true);
-    if (this.csm.mainFrustum === null) return;
-    if (this.csm.camera !== camera) {
-      this.csm.camera = camera;
+    if (this.#csm.mainFrustum === null) return;
+    if (this.#csm.camera !== camera) {
+      this.#csm.camera = camera;
       force = true;
     }
-    this.csm.lightMargin = Math.max(0, this.props.csmLightMargin);
+    this.#csm.lightMargin = Math.max(0, this.props.csmLightMargin);
     this.#syncCSMCascadeShadows();
-    if (force || this.csm.camera === camera) this.csm.updateFrustums();
+    if (force || this.#csm.camera === camera) this.#csm.updateFrustums();
   }
 
   #configureShadow({ shadowMapWidth, shadowMapHeight, shadowCamNear, shadowCamFar, shadowCamSize, shadowCamFov }) {

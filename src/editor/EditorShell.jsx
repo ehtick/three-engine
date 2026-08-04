@@ -1,6 +1,8 @@
 import { Suspense, lazy } from "react";
 import { DockviewReact, themeAbyss } from "dockview-react";
 import { vmSingleton } from "./singleton.js";
+import { QuickSearch } from "./QuickSearch.jsx";
+import { Toasts } from "./Toasts.jsx";
 
 // Bumped to v2 when the "material" panel was removed (materials are edited only
 // through the Shader Graph now). A v1 layout can still contain a Material tab,
@@ -32,6 +34,7 @@ const AmbientCGPanel = lazy(() => import("./panels/AmbientCGPanel.jsx").then((m)
 const SketchfabPanel = lazy(() => import("./panels/SketchfabPanel.jsx").then((m) => ({ default: m.SketchfabPanel })));
 const TerminalPanel = lazy(() => import("./panels/TerminalPanel.jsx").then((m) => ({ default: m.TerminalPanel })));
 const McpPanel = lazy(() => import("./panels/McpPanel.jsx").then((m) => ({ default: m.McpPanel })));
+const AiPanel = lazy(() => import("./panels/AiPanel.jsx").then((m) => ({ default: m.AiPanel })));
 const GamePanel = lazy(() => import("./panels/GamePanel.jsx").then((m) => ({ default: m.GamePanel })));
 const BuildPanel = lazy(() => import("./panels/BuildPanel.jsx").then((m) => ({ default: m.BuildPanel })));
 
@@ -70,6 +73,7 @@ const panelComponents = {
   sketchfab: withPanelSuspense(SketchfabPanel),
   terminal: withPanelSuspense(TerminalPanel),
   mcp: withPanelSuspense(McpPanel),
+  ai: withPanelSuspense(AiPanel),
 };
 const tabComponents = {
   console: withPanelSuspense(ConsoleTab, <span className="tab-loading">Console</span>),
@@ -122,6 +126,9 @@ export const PANEL_SPECS = {
   // Docks with the Inspector column: it's a narrow status/settings surface,
   // read at a glance rather than worked in.
   mcp: { title: "Assistant (MCP)", position: { referencePanel: "inspector", direction: "within" } },
+  // Same column as the Assistant panel it runs through — opened by context-menu
+  // AI actions, not something a user finds by browsing first.
+  ai: { title: "AI", position: { referencePanel: "inspector", direction: "within" } },
 };
 
 /**
@@ -478,6 +485,8 @@ export function EditorShell() {
       <Suspense fallback={<PanelFallback />}>
         <EditorChrome />
       </Suspense>
+      <QuickSearch />
+      <Toasts />
       <div className="dock-container">
         <DockviewReact
           components={panelComponents}

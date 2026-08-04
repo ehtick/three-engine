@@ -56,14 +56,40 @@ pub struct PreviewUrls {
 /// opened through an extended/virtualized path. Returning a canonical native
 /// path also keeps the later exporter/server handoff unambiguous.
 #[tauri::command]
-pub fn prepare_browser_preview(project_root: String) -> Result<String, String> {
+pub fn prepare_browser_preview(
+    project_root: String,
+    purpose: Option<String>,
+    fresh: Option<bool>,
+) -> Result<String, String> {
     let root = std::fs::canonicalize(&project_root)
         .map_err(|e| format!("project path {project_root}: {e}"))?;
     let mut hasher = DefaultHasher::new();
     root.hash(&mut hasher);
+    // `purpose` separates outputs that must not clobber each other — a
+    // publish build landing in the live-preview directory would race the
+    // rebuild loop's exports. Sanitized because it becomes a folder name.
+    let purpose: String = purpose
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect();
+    let folder = if purpose.is_empty() {
+        "three-engine-browser-preview".to_string()
+    } else {
+        format!("three-engine-{purpose}")
+    };
     let dir = std::env::temp_dir()
-        .join("three-engine-browser-preview")
+        .join(folder)
         .join(format!("{:016x}", hasher.finish()));
+    // A reused output dir accumulates orphans: copies are incremental and
+    // nothing prunes what a previous build shipped. The live preview accepts
+    // that for rebuild speed (orphans are unreachable from the scene), but a
+    // publish walks the whole folder — deleted assets would be uploaded, and
+    // an oversized one kept failing the Pages size check after its asset was
+    // long gone from the project. `fresh` starts from nothing instead.
+    if fresh.unwrap_or(false) {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("create preview directory {}: {e}", dir.display()))?;
     std::fs::canonicalize(&dir)
@@ -695,7 +721,8 @@ mod tests {
     fn prepares_a_native_temporary_preview_directory() {
         let project = std::env::temp_dir().join("three-engine-preview-project-test");
         std::fs::create_dir_all(&project).unwrap();
-        let dir = prepare_browser_preview(project.to_string_lossy().into_owned()).unwrap();
+        let dir =
+            prepare_browser_preview(project.to_string_lossy().into_owned(), None, None).unwrap();
         let path = Path::new(&dir);
         assert!(path.is_dir());
         assert!(path.ends_with(format!("{:016x}", {
@@ -704,6 +731,41 @@ mod tests {
             root.hash(&mut hasher);
             hasher.finish()
         })));
+
+        // A publish output must never land in the live-preview directory —
+        // the rebuild loop's exports would race it.
+        let publish = prepare_browser_preview(
+            project.to_string_lossy().into_owned(),
+            Some("publish".into()),
+            None,
+        )
+        .unwrap();
+        assert_ne!(publish, dir);
+        assert!(publish.contains("three-engine-publish"));
+
+        // `fresh` wipes orphans of previous builds — a deleted asset must not
+        // survive into (and get uploaded by) the next publish.
+        let orphan = Path::new(&publish).join("assets").join("Room.glb");
+        std::fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+        std::fs::write(&orphan, b"stale").unwrap();
+        let wiped = prepare_browser_preview(
+            project.to_string_lossy().into_owned(),
+            Some("publish".into()),
+            Some(true),
+        )
+        .unwrap();
+        assert_eq!(wiped, publish);
+        assert!(!orphan.exists());
+
+        // A hostile purpose cannot traverse out of the temp dir.
+        let odd = prepare_browser_preview(
+            project.to_string_lossy().into_owned(),
+            Some("..\\..\\evil".into()),
+            None,
+        )
+        .unwrap();
+        assert!(odd.contains("three-engine-evil"));
+
         let _ = std::fs::remove_dir_all(project);
     }
 

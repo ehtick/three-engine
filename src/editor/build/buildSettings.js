@@ -49,7 +49,32 @@ export const BUILD_DEFAULTS = {
     showTitle: true,
     showLogo: true,
   },
+  // Cloudflare Pages project the Publish button uploads to; the game is served
+  // at https://<name>.pages.dev. Empty derives the name from the project name.
+  pagesProject: "",
 };
+
+/**
+ * A valid Cloudflare Pages project name, or "" if nothing survives:
+ * lowercase letters, digits and hyphens, no leading/trailing hyphen, at most
+ * 58 characters. The name is also the public subdomain (<name>.pages.dev),
+ * which is why it is derived rather than passed through — "My Game!" must
+ * become "my-game", not an API error at the end of a full build+upload.
+ */
+export function sanitizePagesProject(raw) {
+  return String(raw ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 58)
+    .replace(/-+$/g, "");
+}
+
+/** The Pages project name a publish will actually use. */
+export function resolvePagesProject({ build, projectName } = {}) {
+  return sanitizePagesProject(build?.pagesProject) || sanitizePagesProject(projectName) || "my-game";
+}
 
 /** Forward slashes, no leading `./` or `/`, no trailing slash. */
 export function normalizeRelPath(raw) {

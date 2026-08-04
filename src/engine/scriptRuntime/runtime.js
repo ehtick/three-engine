@@ -99,10 +99,24 @@ export { ParticleComponent } from "../components/ParticleComponent.js";
 export { LineRendererComponent } from "../components/LineRendererComponent.js";
 export { TrailRendererComponent } from "../components/TrailRendererComponent.js";
 export { DecalComponent } from "../components/DecalComponent.js";
+export { BoneComponent } from "../components/BoneComponent.js";
+export { SkinnedMeshComponent } from "../components/SkinnedMeshComponent.js";
+export { PlanarReflectionComponent } from "../components/PlanarReflectionComponent.js";
 export { LodGroupComponent } from "../components/LodGroupComponent.js";
+export { PoolComponent } from "../components/PoolComponent.js";
+export { ImpostorComponent } from "../components/ImpostorComponent.js";
+export { GeometryModifiersComponent } from "../components/GeometryModifiersComponent.js";
 export { SplineComponent } from "../components/SplineComponent.js";
 export { SplineFollowerComponent } from "../components/SplineFollowerComponent.js";
 export { SplineMeshComponent } from "../components/SplineMeshComponent.js";
+export { UiScreenComponent } from "../components/ui/UiScreenComponent.js";
+export { UiElementComponent } from "../components/ui/UiElementComponent.js";
+export { UiImageComponent } from "../components/ui/UiImageComponent.js";
+export { UiTextComponent } from "../components/ui/UiTextComponent.js";
+export { UiButtonComponent } from "../components/ui/UiButtonComponent.js";
+export { UiLayoutComponent } from "../components/ui/UiLayoutComponent.js";
+export { UiScrollComponent } from "../components/ui/UiScrollComponent.js";
+export { UiMaskComponent } from "../components/ui/UiMaskComponent.js";
 export { ScriptComponent } from "../components/ScriptComponent.js";
 
 export { RigidbodyComponent } from "../../modules/physics-rapier/RigidbodyComponent.js";
@@ -113,6 +127,12 @@ export { JointComponent } from "../../modules/physics-rapier/JointComponent.js";
 export { NavMeshComponent } from "../../modules/navigation/NavMeshComponent.js";
 export { NavAgentComponent } from "../../modules/navigation/NavAgentComponent.js";
 export { NavLinkComponent } from "../../modules/navigation/NavLinkComponent.js";
+
+export { TerrainComponent } from "../../modules/terrain/TerrainComponent.js";
+export { PostprocessComponent } from "../../modules/postprocessing/PostprocessComponent.js";
+export { EnvironmentComponent } from "../../modules/polyhaven/EnvironmentComponent.js";
+export { ObjModelComponent } from "../../modules/ambientcg/ObjModelComponent.js";
+export { GlobalIlluminationComponent } from "../../modules/gi/GlobalIlluminationComponent.js";
 
 /**
  * Base class scripts extend for full IntelliSense on `this.entity`,

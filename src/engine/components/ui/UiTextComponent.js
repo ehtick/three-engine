@@ -171,7 +171,10 @@ export class UiTextComponent extends Component {
     this.geometry.computeBoundingSphere();
   }
 
-  onUiLayout({ rect, clipRect, alpha, k, order, spec, unit = 1, depthTest = false }) {
+  onUiLayout({
+    rect, clipRect, alpha, k, order, spec, unit = 1, depthTest = false,
+    screenSpace = false, uiWidth = 1, uiHeight = 1,
+  }) {
     if (typeof document === "undefined") return;
     const wantSdf = this.props.sdf !== false;
     if (!this.mesh || this.mode !== (wantSdf ? "sdf" : "raster")) {
@@ -224,6 +227,9 @@ export class UiTextComponent extends Component {
       alpha: alpha * (p.opacity ?? 1),
       k,
       depthTest,
+      screenSpace,
+      uiWidth,
+      uiHeight,
     });
   }
 

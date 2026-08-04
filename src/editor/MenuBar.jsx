@@ -138,7 +138,7 @@ export function MenuBar() {
       // The panel is where a build is *configured*; this is the one-click path
       // for someone who has already configured it (or is happy with defaults).
       { label: "Build Settings…", action: () => openPanel("build") },
-      { label: "Build Game…", shortcut: "Ctrl+B", action: () => import("./exportGame.js").then((m) => m.exportGame()) },
+      { label: "Build Game…", shortcut: "Ctrl+B", action: () => import("./exportGame.js").then((m) => m.exportGameWithToasts()) },
     ],
     Edit: [
       {
@@ -219,6 +219,7 @@ export function MenuBar() {
       { label: "Sketchfab", action: () => openPanel("sketchfab") },
       { label: "Terminal", action: () => openPanel("terminal") },
       { label: "Assistant (MCP)", action: () => openPanel("mcp") },
+      { label: "AI", action: () => openPanel("ai") },
       { separator: true },
       { label: "Reset Layout", action: () => resetLayout() },
     ],

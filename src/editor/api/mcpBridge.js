@@ -170,11 +170,18 @@ function connect() {
     const wasConnected = useMcpStore.getState().status === "connected";
     useMcpStore.setState({ status: state.config.enabled ? "connecting" : "disabled", toolCount: 0 });
     if (wasConnected) console.log("MCP bridge disconnected");
-    // A browser always prints its own console error for ECONNREFUSED; JS
-    // cannot suppress it. Do not create an endless stream when the optional
-    // assistant server has never been present. Once a real connection has
-    // existed, automatic reconnect remains useful for server restarts.
-    if (state.hadConnection) scheduleReconnect();
+    // Always keep trying while enabled — `scheduleReconnect` itself already
+    // no-ops when disabled. This used to be gated on `state.hadConnection`,
+    // which was meant to keep a session with no assistant ever running quiet
+    // (see the log suppression in `onerror` below, which is the right place
+    // for that) but instead made it permanent: a bridge enabled a moment
+    // before anything is listening — the ordinary case for "enable the bridge
+    // and immediately spawn a scoped client", not an edge case — missed its
+    // first connect attempt and then never retried at all, silently stuck in
+    // "connecting" forever. Caught live: a fresh `runWorkflow` enabling the
+    // bridge and spawning `claude` within the same couple of seconds hit this
+    // every time.
+    scheduleReconnect();
   };
 
   ws.onerror = () => {

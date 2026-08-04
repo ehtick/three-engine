@@ -38,6 +38,11 @@ const { registerBuiltInComponents } = await import("../src/engine/index.js");
 const { getComponentTypes } = await import("../src/engine/components/registry.js");
 const { physicsRapierModule } = await import("../src/modules/physics-rapier/index.js");
 const { navigationModule } = await import("../src/modules/navigation/index.js");
+const { terrainModule } = await import("../src/modules/terrain/index.js");
+const { postprocessingModule } = await import("../src/modules/postprocessing/index.js");
+const { polyhavenModule } = await import("../src/modules/polyhaven/index.js");
+const { ambientcgModule } = await import("../src/modules/ambientcg/index.js");
+const { giModule } = await import("../src/modules/gi/index.js");
 
 registerBuiltInComponents();
 // Module components register only when their module is enabled, so pull their
@@ -48,6 +53,11 @@ const registered = new Set([
   ...getComponentTypes(),
   ...physicsRapierModule.components.map((c) => c.type),
   ...navigationModule.components.map((c) => c.type),
+  ...terrainModule.components.map((c) => c.type),
+  ...postprocessingModule.components.map((c) => c.type),
+  ...polyhavenModule.components.map((c) => c.type),
+  ...ambientcgModule.components.map((c) => c.type),
+  ...giModule.components.map((c) => c.type),
 ]);
 
 const source = readFileSync(DTS, "utf8");
@@ -59,7 +69,8 @@ check("ComponentMap is still declared in engine.d.ts", () => {
   assert.ok(body, "could not find `export interface ComponentMap { ... }`");
 });
 
-const keys = [...(body ?? "").matchAll(/^\s*([A-Za-z_$][\w$]*)\s*[?]?:/gm)].map((m) => m[1]);
+const keys = [...(body ?? "").matchAll(/^\s*(?:([A-Za-z_$][\w$]*)|"([^"]+)")\s*[?]?:/gm)]
+  .map((m) => m[1] ?? m[2]);
 check("ComponentMap has entries", () => assert.ok(keys.length > 5, `found ${keys.length}`));
 
 for (const key of keys) {

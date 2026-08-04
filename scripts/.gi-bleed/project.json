@@ -1,0 +1,46 @@
+{
+  "name": "GI-Bleed",
+  "version": 1,
+  "lastScene": "scenes/Main.scene",
+  "mainScene": "scenes/Main.scene",
+  "modules": [
+    "gi"
+  ],
+  "settings": {
+    "editor": {
+      "autosaveSeconds": 0,
+      "snapTranslate": 0.5,
+      "snapRotateDeg": 15,
+      "snapScale": 0.1,
+      "gridSize": 40,
+      "gridDivisions": 40,
+      "showGrid": false,
+      "layers": {
+        "gizmos": false,
+        "cursor3D": false,
+        "colliders": false,
+        "grid": false,
+        "stats": false,
+        "debugDraw": false,
+        "uiOverlay": false,
+        "virtualGeometry": false
+      },
+      "keybindings": {}
+    },
+    "scripts": {
+      "hotReload": false,
+      "reloadIntervalMs": 750
+    },
+    "rendering": {
+      "pixelRatioCap": 2
+    },
+    "build": {
+      "startScene": "",
+      "scenes": [
+        "scenes/Main.scene"
+      ],
+      "target": "web",
+      "quality": "high"
+    }
+  }
+}

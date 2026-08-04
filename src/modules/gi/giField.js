@@ -744,9 +744,35 @@ function createShadowTrace(distanceTexture, world, res, lift, atlas, steps = 56,
       const minV = vec3(world.min).toVar();
       const sizeInvV = vec3(1).div(world.size).toVar();
       const cellV = vec3(world.cell).toVar();
+      // ── SELF-EXCLUSION MUST TRACK THE MEDIUM THAT TRACES THE RAY ────────────
+      // Round 6's rule, applied to the one trace that never got it: "a
+      // visibility proxy's tolerance must track the QUANTIZATION OF WHATEVER
+      // ACTUALLY TRACED THE RAY." Under the occupancy backend `dRaw` comes from
+      // the oracle (`freeRadiusAtWorld` below), which measures distance to
+      // occupied VOXEL AABBs and therefore reads exactly 0 anywhere inside an
+      // occupied voxel — and conservative voxelization marks every voxel a
+      // triangle touches, so a receiver standing ON a surface is INSIDE one.
+      // These cuts were still sized off the composited FIELD cell (0.05m on the
+      // Cornell repro) while the oracle quantizes at the OCCUPANCY VOXEL
+      // (0.122m) — 2.4x coarser. The own-plane test then read the receiver's
+      // own floor as an occluder wherever the shaded point fell in the voxel
+      // lattice, zeroing the emitter's direct light in GRID-ALIGNED BLOTCHES:
+      // measured 54-73% darker and 7-12x blotchier the moment `emissiveShadows`
+      // promoted an emissive mesh onto this trace (scripts/run-gi-emissive.mjs).
+      // Same failure family as session 19's AO trap, which needed 2 voxels of
+      // self-surface allowance for exactly this reason.
+      // `__giNoOccSelfCut` restores the old sizing (BUILD-TIME — set it via
+      // evaluateOnNewDocument before load, per the hatch rule).
+      const occVox = occField && killSdf && occField.voxel && !globalThis.__giNoOccSelfCut
+        ? vec3(occField.voxel).x.max(vec3(occField.voxel).y).max(vec3(occField.voxel).z).toVar()
+        : null;
+      // `liftV` stays the TRUE ray-origin lift and must not be inflated with
+      // it: `planeHeight = liftV + t·cos` is the height being tested, so
+      // raising it LOWERS the bar for calling a sample an occluder — the exact
+      // opposite of the intent. The tolerance is the only term that moves.
       const liftV = float(liftWorld).toVar();
       const contactCut = minCellV.mul(0.25).toVar();
-      const planeCut = minCellV.mul(0.75).toVar();
+      const planeCut = (occVox ? minCellV.mul(0.75).max(occVox.mul(1.5)) : minCellV.mul(0.75)).toVar();
       const capCut = capWorldV.mul(0.85).toVar();
       const occCut = minCellV.mul(0.3).toVar();
       const stepMin = minCellV.mul(0.35).toVar();

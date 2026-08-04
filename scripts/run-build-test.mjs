@@ -13,6 +13,8 @@ import { createAssetNames, splitExtension } from "../src/editor/build/assetNames
 import {
   BUILD_DEFAULTS,
   resolveBuildScenes,
+  resolvePagesProject,
+  sanitizePagesProject,
   normalizeRelPath,
   toProjectRelative,
 } from "../src/editor/build/buildSettings.js";
@@ -324,6 +326,33 @@ console.log("\nDesktop scaffold");
 
   const noIcon = JSON.parse(desktopTauriConfig({ title: "X", identifier: "com.x.game", hasIcon: false }));
   check("no icon means no icon list to fail on", noIcon.bundle.icon === undefined);
+}
+
+// --- Cloudflare Pages project names -----------------------------------------
+console.log("\nPages project names");
+{
+  eq("a display name becomes a valid subdomain", sanitizePagesProject("My Game!"), "my-game");
+  eq("runs of junk collapse to one hyphen", sanitizePagesProject("Night  &  Day"), "night-day");
+  eq("leading/trailing hyphens are trimmed", sanitizePagesProject("--edgy--"), "edgy");
+  eq("pure punctuation yields nothing", sanitizePagesProject("!!!"), "");
+  check(
+    "long names are cut to the 58-char limit without a trailing hyphen",
+    (() => {
+      const cut = sanitizePagesProject(`${"a".repeat(57)}-b`);
+      return cut.length <= 58 && !cut.endsWith("-");
+    })(),
+  );
+  eq(
+    "an explicit setting wins over the project name",
+    resolvePagesProject({ build: { pagesProject: "Demo Build" }, projectName: "Other" }),
+    "demo-build",
+  );
+  eq(
+    "no setting falls back to the project name",
+    resolvePagesProject({ build: { pagesProject: "" }, projectName: "Space Runner" }),
+    "space-runner",
+  );
+  eq("nothing at all still yields a deployable name", resolvePagesProject({}), "my-game");
 }
 
 console.log(`\nBUILD-TEST ${fail ? "FAIL" : "PASS"} — ${pass}/${pass + fail} checks`);

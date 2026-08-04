@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { Hammer, Play, FolderOpen, RefreshCw, AlertTriangle } from "lucide-react";
+import { Hammer, Play, FolderOpen, RefreshCw, AlertTriangle, UploadCloud, Loader2, CheckCircle2, Circle, Copy, Check, ExternalLink } from "lucide-react";
 import { useProjectStore, basename } from "../store/projectStore.js";
 import { getProjectSettings, saveProjectSettings } from "../projectSettings.js";
 import {
@@ -7,6 +7,7 @@ import {
   BUILD_TARGETS,
   normalizeRelPath,
   resolveBuildScenes,
+  resolvePagesProject,
   toProjectRelative,
 } from "../build/buildSettings.js";
 import { QUALITY_PRESETS } from "../../engine/sceneSettings.js";
@@ -52,6 +53,9 @@ export function BuildPanel() {
   const [scenes, setScenes] = useState([]);
   const [busy, setBusy] = useState(null); // progress message while building
   const [report, setReport] = useState(null);
+  // { status: "build" | "upload" | "login" | "done" | "error", message?, url?, error? }
+  const [publish, setPublish] = useState(null);
+  const [copied, setCopied] = useState(false);
 
   useEffect(() => {
     if (rootPath) setBuild({ ...BUILD_DEFAULTS, ...(getProjectSettings().build ?? {}) });
@@ -111,6 +115,44 @@ export function BuildPanel() {
     }
   };
 
+  const runPublish = async () => {
+    if (dirty) await save();
+    setCopied(false);
+    setPublish({ status: "build", message: "Starting…" });
+    // `busy` only gates the buttons here — the publish card carries the
+    // detailed status so the two never show competing messages.
+    setBusy("Publishing…");
+    try {
+      const { publishToPages } = await import("../publishGame.js");
+      const result = await publishToPages({
+        onProgress: ({ phase, message }) => {
+          const status =
+            phase === "publish" ? (/log in/i.test(message ?? "") ? "login" : "upload") : "build";
+          setPublish({ status, message });
+        },
+      });
+      if (result) {
+        navigator.clipboard?.writeText(result.url).catch(() => {});
+        setPublish({ status: "done", url: result.url });
+      } else {
+        setPublish(null); // cancelled
+      }
+    } catch (error) {
+      console.error(`Publish failed: ${error?.message ?? error}`);
+      setPublish({ status: "error", error: `${error?.message ?? error}` });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const copyPublishUrl = () => {
+    if (!publish?.url) return;
+    navigator.clipboard?.writeText(publish.url).catch(() => {});
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  };
+
+  const pagesName = resolvePagesProject({ build, projectName });
   const basisOn = enabledModules.includes("basis");
   const dracoOn = enabledModules.includes("draco");
 
@@ -137,9 +179,23 @@ export function BuildPanel() {
           <Play size={13} />
           Build &amp; Run
         </button>
+        <button
+          className="toolbar-btn"
+          disabled={!!busy}
+          title={`Build the web target and upload it to Cloudflare Pages — the game goes live at https://${pagesName}.pages.dev`}
+          onClick={runPublish}
+        >
+          <UploadCloud size={13} />
+          Publish{dirty ? " •" : ""}
+        </button>
       </div>
 
-      {busy ? <div className="asset-hint" style={{ padding: "6px 10px" }}>{busy}</div> : null}
+      {busy ? (
+        <div className="build-busy">
+          <Loader2 size={12} className="spin" />
+          <span>{busy}</span>
+        </div>
+      ) : null}
 
       <div className="inspector-section">
         <div className="section-header">Target</div>
@@ -346,6 +402,26 @@ export function BuildPanel() {
         </Row>
       </div>
 
+      <div className="inspector-section">
+        <div className="section-header">Publish</div>
+        <Row
+          label="Pages project"
+          hint={
+            `Free hosting on Cloudflare Pages: Publish builds the web target and puts it live at ` +
+            `https://${pagesName}.pages.dev. The first publish opens a browser window to log in to a ` +
+            `free Cloudflare account; after that it is one click.`
+          }
+        >
+          <input
+            className="text-field"
+            value={build.pagesProject ?? ""}
+            placeholder={pagesName}
+            onChange={(e) => patch({ pagesProject: e.target.value })}
+          />
+        </Row>
+        {publish ? <PublishCard publish={publish} copied={copied} onCopy={copyPublishUrl} /> : null}
+      </div>
+
       {plan.warnings.length ? (
         <div className="inspector-section">
           <div className="section-header">Warnings</div>
@@ -362,6 +438,99 @@ export function BuildPanel() {
       <div className="asset-hint" style={{ padding: "4px 10px" }}>
         Stored in project.json under <code>settings.build</code>.
       </div>
+    </div>
+  );
+}
+
+const PUBLISH_STEPS = [
+  ["build", "Build"],
+  ["upload", "Upload"],
+  ["live", "Live"],
+];
+
+/**
+ * Publish progress as a three-step tracker (Build → Upload → Live) with an
+ * indeterminate bar underneath — neither the exporter nor wrangler reports
+ * percentages, so honest motion beats a fake number. `login` renders as the
+ * upload step waiting on the browser OAuth window.
+ */
+function PublishCard({ publish, copied, onCopy }) {
+  if (publish.status === "error") {
+    return (
+      <div className="publish-card is-error">
+        <div className="publish-card-head">
+          <AlertTriangle size={13} />
+          <span>Publish failed</span>
+        </div>
+        <div className="publish-error">{publish.error}</div>
+      </div>
+    );
+  }
+
+  const done = publish.status === "done";
+  const stepIndex = done ? PUBLISH_STEPS.length : publish.status === "build" ? 0 : 1;
+  return (
+    <div className="publish-card">
+      <div className="publish-steps">
+        {PUBLISH_STEPS.map(([key, label], i) => {
+          const state = i < stepIndex ? "done" : i === stepIndex ? "active" : "pending";
+          return (
+            <span key={key} style={{ display: "contents" }}>
+              <span className={`publish-step ${state}`}>
+                {state === "done" ? (
+                  <CheckCircle2 size={12} />
+                ) : state === "active" ? (
+                  <Loader2 size={12} className="spin" />
+                ) : (
+                  <Circle size={12} />
+                )}
+                {label}
+              </span>
+              {i < PUBLISH_STEPS.length - 1 ? <span className="publish-step-line" /> : null}
+            </span>
+          );
+        })}
+      </div>
+      {done ? (
+        <div className="publish-live">
+          <a
+            className="publish-url"
+            href={publish.url}
+            title={`Open ${publish.url}`}
+            onClick={async (e) => {
+              e.preventDefault();
+              const { openUrl } = await import("@tauri-apps/plugin-opener");
+              openUrl(publish.url);
+            }}
+          >
+            {publish.url.replace(/^https:\/\//, "")}
+          </a>
+          <button
+            className="toolbar-btn icon-only"
+            title={copied ? "Copied" : "Copy URL"}
+            onClick={onCopy}
+          >
+            {copied ? <Check size={12} /> : <Copy size={12} />}
+          </button>
+          <button
+            className="toolbar-btn icon-only"
+            title="Open in browser"
+            onClick={async () => {
+              const { openUrl } = await import("@tauri-apps/plugin-opener");
+              openUrl(publish.url);
+            }}
+          >
+            <ExternalLink size={12} />
+          </button>
+        </div>
+      ) : (
+        <>
+          <div className="publish-bar">
+            <span />
+          </div>
+          <div className="publish-status">{publish.message}</div>
+        </>
+      )}
     </div>
   );
 }

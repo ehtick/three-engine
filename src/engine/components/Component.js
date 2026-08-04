@@ -4,6 +4,65 @@ import { getEntityBoundingSphere } from "../viewFrustum.js";
 const _scratchSphere = new THREE.Sphere();
 
 /**
+ * Keys that are part of the Component API itself — never mirrored as prop
+ * accessors, even when a subclass also stores a prop of the same name
+ * (e.g. SplineComponent's curve `type` stays on `props.type` so it cannot
+ * shadow `component.type`, the registered id).
+ */
+const RESERVED_PROP_KEYS = new Set([
+  "entity",
+  "type",
+  "props",
+  "enabled",
+  "viewOnly",
+  "constructor",
+]);
+
+/**
+ * Install get/set mirrors for every authored prop so scripts can write
+ * `light.intensity = 2` instead of `light.setProp("intensity", 2)`. Sets
+ * go through `setProp` so `onPropChanged` still runs.
+ *
+ * Important: do not also store runtime objects under the same name as a prop
+ * (e.g. LightComponent keeps the CSM node in `#csm`, while `props.csm` is the
+ * authored boolean). An accessor on that name would intercept `this.csm = …`
+ * and shove the object into props.
+ */
+function installPropAccessors(component) {
+  const keys = new Set([
+    ...Object.keys(component.props ?? {}),
+    ...Object.keys(component.constructor.defaults ?? {}),
+    ...(component.constructor.schema ?? []).map((entry) => entry?.key).filter(Boolean),
+  ]);
+  for (const key of keys) {
+    if (RESERVED_PROP_KEYS.has(key)) continue;
+    // Don't shadow methods / accessors already defined on the prototype chain
+    // (e.g. AnimationComponent.play, CharacterControllerComponent.move).
+    let proto = Object.getPrototypeOf(component);
+    let shadowed = false;
+    while (proto && proto !== Object.prototype) {
+      if (Object.prototype.hasOwnProperty.call(proto, key)) {
+        shadowed = true;
+        break;
+      }
+      proto = Object.getPrototypeOf(proto);
+    }
+    if (shadowed) continue;
+    if (Object.prototype.hasOwnProperty.call(component, key)) continue;
+    Object.defineProperty(component, key, {
+      get() {
+        return this.props[key];
+      },
+      set(value) {
+        this.setProp(key, value);
+      },
+      enumerable: true,
+      configurable: true,
+    });
+  }
+}
+
+/**
  * Base class for all components. Subclasses must define:
  *   static type       — unique string id ("mesh", "light", ...)
  *   static label      — display name for the editor
@@ -69,6 +128,9 @@ export class Component {
     // Cached viewOnly boolean (resolved against the entity's own flag once
     // per `setProp` cycle). Avoids re-reading the entity every frame.
     this._viewOnlyActive = !!this.props.viewOnly || !!this.entity?.viewOnly;
+    // Mirror every authored prop as `comp.intensity` / `comp.intensity = 2`
+    // (routed through setProp). Scripts shouldn't have to dig into `.props`.
+    installPropAccessors(this);
   }
 
   /**

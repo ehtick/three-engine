@@ -59,7 +59,13 @@ export class UiImageComponent extends Component {
   ];
 
   onAttach() {
-    this.texture = null;
+    // NOT `this.texture` — `props.texture` is an authored asset path, and
+    // Component installs a prop accessor of that name in its constructor, so
+    // a same-named runtime field is intercepted: `this.texture = tex` becomes
+    // `setProp("texture", tex)`, which overwrites the path and re-enters
+    // onPropChanged until the stack overflows. The loaded THREE.Texture lives
+    // under its own name for that reason (see installPropAccessors).
+    this.textureMap = null;
     this.tint = new THREE.Color(1, 1, 1); // runtime-only (button states)
     this.generation = 0;
     this.mesh = new THREE.Mesh(getPlane(), createUiImageMaterial({ fillMode: this.props.fillMode }));
@@ -81,15 +87,15 @@ export class UiImageComponent extends Component {
       this.mesh.material.dispose();
       this.mesh = null;
     }
-    this.texture?.dispose();
-    this.texture = null;
+    this.textureMap?.dispose();
+    this.textureMap = null;
   }
 
   onPropChanged(key) {
     if (!this.mesh) return;
     if (key === "texture") {
-      this.texture?.dispose();
-      this.texture = null;
+      this.textureMap?.dispose();
+      this.textureMap = null;
       if (this.props.texture) this.#loadTexture(this.props.texture);
       else this.#rebuildMaterial();
     } else if (key === "fillMode" || key === "imageType") {
@@ -102,7 +108,7 @@ export class UiImageComponent extends Component {
     if (!this.mesh) return;
     this.mesh.material.dispose();
     this.mesh.material = createUiImageMaterial({
-      texture: this.texture,
+      texture: this.textureMap,
       fillMode: this.props.fillMode,
       imageType: this.props.imageType,
     });
@@ -116,7 +122,7 @@ export class UiImageComponent extends Component {
         tex.dispose();
         return;
       }
-      this.texture = tex;
+      this.textureMap = tex;
       this.#rebuildMaterial();
     } catch (err) {
       console.warn(`UI image texture failed to load: ${path}`, err);
@@ -129,7 +135,10 @@ export class UiImageComponent extends Component {
   }
 
   /** Called by the UiSystem layout pass with the computed frame. */
-  onUiLayout({ rect, clipRect, alpha, k, order, spec, unit = 1, depthTest = false }) {
+  onUiLayout({
+    rect, clipRect, alpha, k, order, spec, unit = 1, depthTest = false,
+    screenSpace = false, uiWidth = 1, uiHeight = 1,
+  }) {
     const mesh = this.mesh;
     if (!mesh) return;
     const { w, h } = rect;
@@ -149,7 +158,7 @@ export class UiImageComponent extends Component {
     u.color.value.set(p.color);
     u.tint.value.copy(this.tint);
     u.fillAmount.value = p.fillAmount;
-    const image = this.texture?.image;
+    const image = this.textureMap?.image;
     if (image?.width) {
       u.texSize.value.set(image.width, image.height);
       // Insets are clamped to the texture so a typo can't invert the middle
@@ -168,6 +177,9 @@ export class UiImageComponent extends Component {
       alpha: alpha * (p.opacity ?? 1),
       k,
       depthTest,
+      screenSpace,
+      uiWidth,
+      uiHeight,
     });
   }
 }

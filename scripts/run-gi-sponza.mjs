@@ -45,6 +45,7 @@ import { installTauriShim } from "./lib/tauriShim.mjs";
 const url = process.argv[2] ?? "http://localhost:5201/";
 const PROJECT = (process.env.PROJECT ?? "C:/Users/Khudiiash/Documents/GAME").replaceAll("\\", "/");
 const HATCHES = (process.env.HATCH ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+const GLOBALS = (process.env.GLOBALS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
 const QUALITY = process.env.QUALITY ?? "";
 const SHOT = process.env.SHOT ?? "";
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -75,12 +76,18 @@ page.on("console", (m) => {
 });
 page.on("pageerror", (e) => console.log(`  pageerror: ${(e.stack ?? e.message).slice(0, 400)}`));
 
-await page.evaluateOnNewDocument(({ PROJECT, HATCHES }) => {
+await page.evaluateOnNewDocument(({ PROJECT, HATCHES, GLOBALS }) => {
   // The editor's own boot path reads these; nothing here imports editor code.
   localStorage.setItem("engine.projectRoot.v1", PROJECT);
   localStorage.setItem("engine.recentProjects.v1", JSON.stringify([PROJECT]));
   for (const h of HATCHES) globalThis[h] = true;
-}, { PROJECT, HATCHES });
+  // GLOBALS='k=v' — numeric build-time knobs (e.g. __giCascadeBranch=4) that
+  // HATCH (true only) cannot express.
+  for (const g of GLOBALS) {
+    const [k, v] = g.split("=");
+    globalThis[k] = v === "true" ? true : v === "false" ? false : Number.isFinite(Number(v)) ? Number(v) : v;
+  }
+}, { PROJECT, HATCHES, GLOBALS });
 
 console.log(`Opening ${PROJECT} …${HATCHES.length ? `  [hatches: ${HATCHES.join(", ")}]` : ""}`);
 await page.goto(url, { waitUntil: "load", timeout: 60000 });

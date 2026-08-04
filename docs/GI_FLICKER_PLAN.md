@@ -1,4 +1,30 @@
-## STATUS 2026-08-03: Phase 1 SHIPPED, default fieldSmoothing=0.95
+## STATUS 2026-08-03 (LATER SESSION): SOLVED — but not where Phase 2 predicted.
+
+The per-frame instrument (`scripts/run-gi-flicker-frame.mjs` — a GPU
+accumulator counting per-pixel luminance reversals on the resolve texture
+every RENDERED frame with a sub-voxel in-page mover; built because the
+screenshot harness samples every ~17 frames and cannot see per-frame churn)
+localised the residual object-motion flicker: **the user's scene saves
+`probeSmoothing: 1` (Light Smoothing OFF), which made the probe EMA a raw
+passthrough** — 2.38 reversals/px vs 0.29 with the EMA on. Phase 2's
+chebyshev depth moments were implemented and are KEPT (spatially
+non-regressive — converged output matches the old proxy to 5 decimals;
+temporally they harden the gather weights), but their measured per-frame
+contribution was nil on this instrument.
+
+THE SHIPPED FIX: always-on NOISE-BAND integration in the probe EMA
+(`probeNoiseAlpha` 0.25, live `__giProbeNoise`): sub-15%-relative wiggles
+integrate over ~4 frames regardless of the Light Smoothing knob; larger
+deltas keep the user's chosen alpha (instant at 1). Measured at the user's
+own probeSmoothing=1: 2.38 → 0.587 reversals/px, popped 30.8% → 6.2%,
+with zero added latency on real lighting changes. Also shipped the same
+session: openness EMA + chebyshev (Phase 2), the static/dynamic voxelize
+split (motion cost −4.2ms GPU at ultra), converged-idle sleep (rest cost
+2.26 → 0.18ms), occupancy AO, per-light sourceAngle, and GI-traced direct
+shadows (LightComponent shadowMode "gi"). Sponza chroma 0.096 / leak 2%
+baselines hold with all of it on.
+
+## OLD STATUS 2026-08-03: Phase 1 SHIPPED, default fieldSmoothing=0.95
 
 Field-side radiance EMA implemented in `createBounceFeedback`
 (cascadeGather.js) exactly per Phase 1 below, wired through GISystem.js as a

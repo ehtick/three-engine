@@ -4,9 +4,12 @@ use std::io::Read;
 use std::path::Path;
 use tauri::Manager;
 
+mod agent;
 mod mcp_clients;
 mod preview;
 mod pty;
+mod publish;
+mod share;
 
 #[derive(Serialize)]
 struct BasisCompressionInfo {
@@ -509,7 +512,10 @@ async fn rebuild_player_template() -> Result<(), String> {
 }
 
 /// Copies the prebuilt player template into `out_dir`, writes scene.json,
-/// and copies referenced assets to their relative destinations.
+/// and copies referenced assets to their relative destinations. Returns the
+/// source paths of referenced assets that no longer exist on disk — a deleted
+/// asset a scene still points at is the caller's warning to surface, not a
+/// reason to refuse the whole build.
 #[tauri::command]
 fn export_game(
     app: tauri::AppHandle,
@@ -517,7 +523,7 @@ fn export_game(
     scene_json: String,
     assets: Vec<(String, String)>,
     files: Vec<(String, String)>,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     let player = player_template_dir(&app)?;
     let out = Path::new(&out_dir);
     copy_dir(&player, out).map_err(|e| {
@@ -532,14 +538,20 @@ fn export_game(
     // rebuild runs (see replace_atomically).
     replace_atomically(&scene_path, |staging| fs::write(staging, &scene_json))
         .map_err(|e| format!("write {}: {e}", scene_path.display()))?;
+    let mut missing = Vec::new();
     for (src, rel) in assets {
         let dest = out.join(&rel);
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("create asset directory {}: {e}", parent.display()))?;
         }
-        copy_file_if_changed(Path::new(&src), &dest)
-            .map_err(|e| format!("copy asset {src} to {}: {e}", dest.display()))?;
+        match copy_file_if_changed(Path::new(&src), &dest) {
+            Ok(_) => {}
+            // Only a vanished source is survivable. Permission and disk
+            // errors still fail: they would ship a silently incomplete build.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => missing.push(src),
+            Err(e) => return Err(format!("copy asset {src} to {}: {e}", dest.display())),
+        }
     }
     for (rel, contents) in files {
         let dest = out.join(&rel);
@@ -551,7 +563,7 @@ fn export_game(
         replace_atomically(&dest, |staging| fs::write(staging, &contents))
             .map_err(|e| format!("write generated file {}: {e}", dest.display()))?;
     }
-    Ok(())
+    Ok(missing)
 }
 
 /// Zips a directory's contents with the directory itself as the *root* of the
@@ -911,6 +923,55 @@ async fn fetch_sketchfab_text(url: String, token: Option<String>) -> Result<Stri
     .map_err(|e| e.to_string())?
 }
 
+/// Proxies a `chat/completions`-shaped POST to an OpenAI-compatible endpoint
+/// (Ollama by default, or any self-hosted server speaking the same API) for
+/// the in-editor AI panel's tool-loop provider. Ollama only answers
+/// cross-origin browser requests from origins listed in its `OLLAMA_ORIGINS`
+/// env var, and a packaged Tauri app's webview origin isn't among the
+/// defaults — a direct `fetch` from `toolLoop.js` fails with "Failed to
+/// fetch". Routing through Rust sidesteps that the same way `fetch_text`
+/// does, without asking every user to set an env var just to use the
+/// feature. Unlike `fetch_sketchfab_text` this has no host allowlist: the
+/// whole point is the user's own arbitrary local/self-hosted base URL, and
+/// `fetch_text` already proxies arbitrary URLs anyway, so this adds no new
+/// exposure.
+///
+/// `body` is already-serialized JSON from JS and is sent verbatim; the
+/// response body comes back verbatim too (JS parses it). A non-2xx response
+/// is NOT collapsed into a generic message — the status and response body
+/// are both surfaced, because e.g. a 404 from Ollama means "that model isn't
+/// pulled" and the user needs to see the actual text to know that.
+///
+/// The timeout is the run's only escape hatch from a wedged model server.
+/// `toolLoop.js` cancels BETWEEN round trips, not during one (the request
+/// lives here in Rust, so there is no `AbortController` to trip), which means
+/// a server that accepts the connection and then never answers would
+/// otherwise leave the AI panel stuck on "running" with no way back short of
+/// restarting the editor. Five minutes is far longer than any healthy
+/// `stream: false` completion — a local model that has produced nothing at
+/// all in that window is hung, not slow.
+#[tauri::command]
+async fn ai_chat(url: String, api_key: Option<String>, body: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut req = ureq::post(&url)
+            .timeout(std::time::Duration::from_secs(300))
+            .set("Content-Type", "application/json");
+        if let Some(key) = api_key.as_deref().filter(|k| !k.is_empty()) {
+            req = req.set("Authorization", &format!("Bearer {key}"));
+        }
+        match req.send_string(&body) {
+            Ok(resp) => resp.into_string().map_err(|e| format!("read response from {url}: {e}")),
+            Err(ureq::Error::Status(code, resp)) => {
+                let text = resp.into_string().unwrap_or_default();
+                Err(format!("{url} returned {code}: {text}"))
+            }
+            Err(e) => Err(format!("{url}: {e}")),
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1017,8 +1078,12 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         // Live PTY sessions for the terminal panel, keyed by panel id.
         .manage(pty::PtyState::default())
+        // Headless one-shot AI runs, keyed by run id.
+        .manage(agent::AgentState::default())
         // Loopback static servers for previewing exported builds.
         .manage(preview::PreviewState::default())
+        // The public share tunnel fronting the preview server, if one runs.
+        .manage(share::ShareState::default())
         .invoke_handler(tauri::generate_handler![
             save_scene,
             load_scene,
@@ -1041,6 +1106,11 @@ pub fn run() {
             preview::serve_build_lan,
             preview::stop_build_lan,
             preview::prepare_browser_preview,
+            share::share_binary_status,
+            share::start_share_tunnel,
+            share::stop_share_tunnel,
+            publish::pages_login,
+            publish::pages_deploy,
             scaffold_three_types,
             write_binary_file,
             write_binary_file_raw,
@@ -1050,6 +1120,7 @@ pub fn run() {
             fetch_text,
             fetch_bytes,
             fetch_sketchfab_text,
+            ai_chat,
             pty::pty_spawn,
             pty::pty_write,
             pty::pty_resize,
@@ -1058,8 +1129,18 @@ pub fn run() {
             mcp_clients::mcp_client_status,
             mcp_clients::mcp_client_register,
             mcp_clients::mcp_client_unregister,
-            mcp_clients::detect_terminal_programs
+            mcp_clients::detect_terminal_programs,
+            agent::agent_run,
+            agent::agent_cancel
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|app, event| {
+            // cloudflared is a child process, and on Windows children outlive
+            // a dead parent: without this, closing the editor would leave a
+            // public hostname forwarding to a port nothing listens on.
+            if let tauri::RunEvent::Exit = event {
+                share::shutdown(app);
+            }
+        });
 }

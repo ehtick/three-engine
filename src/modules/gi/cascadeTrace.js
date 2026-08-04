@@ -16,7 +16,7 @@
 // per-direction loop inside the trace shader — a prior GI attempt hit
 // multi-second pipeline-compile stalls from JS-unrolled direction loops, and
 // per-ray threads sidestep the whole class.
-import { Fn, If, Loop, float, floor, instanceIndex, instancedArray, max, mod, step, uniform, vec2, vec3, vec4 } from "three/tsl";
+import { Fn, If, Loop, Return, float, floor, instanceIndex, instancedArray, max, mod, step, uniform, vec2, vec3, vec4 } from "three/tsl";
 
 /**
  * Octahedral texel-center direction for a dirIdx in a res×res tile.
@@ -103,13 +103,46 @@ export function probeLatticePosition(probeIdxF, grid, world) {
  * @param {number} opts.farT max distance for the outermost cascade
  * @param {Function} opts.sceneTrace (origin, dir) → { rad: vec3, t: float (<0 miss) }
  */
-export function createRadianceCascades({ world, cascadeCount, c0Grid, c0DirRes, t0, farT = 1e4, sceneTrace }) {
+export function createRadianceCascades({ world, cascadeCount, c0Grid, c0DirRes, t0, farT = 1e4, sceneTrace, traceParity = null }) {
   const cascades = [];
   // Interval parameterization as UNIFORMS (world-space lengths derived from
   // the volume size) — an auto-fit refit rescales the intervals in place,
   // matching the probe lattice the world uniforms already moved.
   const t0U = uniform(t0);
   const farTU = uniform(farT);
+  // INTERVAL BRANCHING FACTOR — how much longer each cascade's ray interval is
+  // than its child's. This is the knob that decides whether the hierarchy is
+  // self-consistent, and it was silently pinned to 2.
+  //
+  // The RC invariant: a ray's angular FOOTPRINT at the far end of its interval
+  // (Δθ · t) must track the PROBE SPACING at that cascade, or a level resolves
+  // angular detail its lattice cannot carry (or vice versa). Per level here:
+  // angular resolution ×4 (dirRes ×2, dirCount = dirRes²), probe spacing ×2,
+  // interval ×BRANCH. Footprint/spacing therefore scales as BRANCH/(2·2) per
+  // level — CONSTANT only at BRANCH = 4. At the shipped BRANCH = 2 it halves
+  // every level, so every cascade is over-resolved angularly relative to its
+  // lattice, and a small distant source hit by one over-narrow ray gets
+  // trilinearly smeared across a probe lattice metres wide.
+  //
+  // MEASURED CONSEQUENCE (scripts/run-gi-bleed.mjs, 2026-08-04): indirect falls
+  // off as d^-1.44 against an analytic d^-2.72 — 3.2x too bright at 9m — and
+  // the error is not a sampling artifact but a bias: halving c0DirRes changes
+  // the ANSWER (exponent -1.44 → -2.03), which a convergent transport cannot
+  // do. That non-convergence under angular refinement is this ratio drifting.
+  //
+  // BUILD-TIME, NOT LIVE. This function runs once per GI build, so setting the
+  // global in the console does NOTHING until something forces a rebuild — the
+  // user tried exactly that and reported "no difference". Harnesses set it via
+  // evaluateOnNewDocument (before load); in the editor, set it and then toggle
+  // a STRUCTURAL prop (see #structuralSignature — quality, cascadeCount,
+  // reflections, …) to re-enter this function.
+  //
+  // DEFAULT STAYS 2 — BRANCH=4 was A/B'd on the bleed rig AND the user's
+  // Sponza (2026-08-04) and REJECTED: it only looks like a fix at c0DirRes 4
+  // (coincidence — at dirRes 2 it is WORSE than shipped), and on Sponza it
+  // made colour bleed ~23% worse. The falloff bias's real home is the
+  // gather/merge solid-angle normalization, not this ladder.
+  const BRANCH = Number(globalThis.__giCascadeBranch ?? 2) || 2;
 
   for (let level = 0; level < cascadeCount; level++) {
     const div = 2 ** level;
@@ -121,9 +154,13 @@ export function createRadianceCascades({ world, cascadeCount, c0Grid, c0DirRes, 
     const dirRes = c0DirRes * div;
     const dirCount = dirRes * dirRes;
     const probeCount = grid.x * grid.y * grid.z;
-    const tMin = t0U.mul(div - 1);
+    // Geometric ladder with ratio BRANCH: interval n has length t0·BRANCH^n and
+    // starts where its child ended, t0·(BRANCH^n − 1)/(BRANCH − 1). At
+    // BRANCH = 2 this reproduces the previous tMin = t0·(2^n − 1) and
+    // intervalLen = t0·2^n EXACTLY, so the default is byte-identical.
+    const tMin = t0U.mul((BRANCH ** level - 1) / (BRANCH - 1));
     const isLast = level === cascadeCount - 1;
-    const intervalLen = isLast ? float(farTU) : t0U.mul(2 ** (level + 1) - 1).sub(tMin);
+    const intervalLen = isLast ? float(farTU) : t0U.mul(BRANCH ** level);
 
     // Ray payload: rgb = interval radiance, w = hit distance from the PROBE
     // (not the interval start; the merge's visibility weighting wants the
@@ -139,6 +176,31 @@ export function createRadianceCascades({ world, cascadeCount, c0Grid, c0DirRes, 
       const rayIdx = instanceIndex.toFloat();
       const probeIdx = floor(rayIdx.div(dirCount));
       const dirIdx = mod(rayIdx, dirCount);
+      // TEMPORAL RAY REUSE (the cascade half of the feedback checkerboard).
+      // The march is the expensive part of a cascade — ~1.6ms of a 3.8ms
+      // awake frame on a 262k-tri scene — and it is re-run every frame even
+      // when only a LIGHT moved. Tracing alternate probe ROWS per frame
+      // halves it: a skipped thread simply doesn't write, so its ray keeps
+      // last frame's value, and the merge/gather downstream sees a cage whose
+      // 8 probes are at most one frame apart — the same argument the feedback
+      // checker makes at cell level.
+      //
+      // Parity is per probe ROW (constant along x) so a whole 32-thread wave
+      // shares the decision and an idle wave exits outright; a per-probe or
+      // per-ray parity leaves every wave half-active, which costs a full wave
+      // and saves only memory traffic. `parity < 0` = off (the sentinel
+      // GISystem writes), which is what keeps this A/B-able live.
+      if (traceParity) {
+        const row = floor(probeIdx.div(grid.x));
+        If(
+          float(traceParity).greaterThanEqual(0).and(
+            mod(row, 2).sub(traceParity).abs().greaterThan(0.5),
+          ),
+          () => {
+            Return();
+          },
+        );
+      }
       const origin = probePositionOf(probeIdx).toVar();
       const dir = directionOf(dirIdx).toVar();
 

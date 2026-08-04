@@ -182,6 +182,61 @@ const after = await page.evaluate(() => ({
 }));
 check("history_undo reverts the assistant's edits", after.spawners === 0 && after.total === before, JSON.stringify(after));
 
+// --- batch: many ops collapse into one undo step -------------------------------
+// Regression coverage: `batch`'s run() collapses everything it pushed onto the
+// undo stack via commandBus.markGroup()/collapseFrom() (CommandBus.js). Those
+// replaced an older private collapseUndo() that ops/batch.js kept its own copy
+// of — a copy that called a commandBus.syncHistory() method which no longer
+// existed, so any batch producing more than one undo entry threw. A fake
+// registry (run-mcp-test.mjs) can't catch that; it needs the real CommandBus.
+
+const beforeBatch = await page.evaluate(() => globalThis.__editorApi.entities.all().length);
+
+const batched = await client.callTool({
+  name: "batch",
+  arguments: {
+    label: "Batch smoke",
+    steps: [
+      { op: "entity.create", args: { name: "BatchA" } },
+      { op: "entity.create", args: { name: "BatchB" } },
+    ],
+  },
+});
+const batchedText = batched.content?.[0]?.text ?? "";
+check("batch with >1 step succeeds (no crash collapsing undo)", batched.isError !== true, batchedText.slice(0, 160));
+
+let batchedJson = {};
+try {
+  batchedJson = JSON.parse(batchedText);
+} catch {
+  // handled by the assertions below
+}
+check("…and reports both steps collapsed into the undo group", batchedJson.undoSteps === 2, JSON.stringify(batchedJson));
+
+const afterBatchCreate = await page.evaluate(() => ({
+  total: globalThis.__editorApi.entities.all().length,
+  a: globalThis.__editorApi.entities.all({ nameContains: "BatchA" }).length,
+  b: globalThis.__editorApi.entities.all({ nameContains: "BatchB" }).length,
+}));
+check(
+  "…and both entities really exist",
+  afterBatchCreate.a === 1 && afterBatchCreate.b === 1 && afterBatchCreate.total === beforeBatch + 2,
+  JSON.stringify(afterBatchCreate),
+);
+
+// The point of collapsing: ONE undo removes BOTH steps, not just the last one.
+await client.callTool({ name: "history_undo", arguments: {} });
+const afterBatchUndo = await page.evaluate(() => ({
+  total: globalThis.__editorApi.entities.all().length,
+  a: globalThis.__editorApi.entities.all({ nameContains: "BatchA" }).length,
+  b: globalThis.__editorApi.entities.all({ nameContains: "BatchB" }).length,
+}));
+check(
+  "a single history_undo reverts the whole batch",
+  afterBatchUndo.a === 0 && afterBatchUndo.b === 0 && afterBatchUndo.total === beforeBatch,
+  JSON.stringify(afterBatchUndo),
+);
+
 // --- error paths against the real registry -----------------------------------
 
 const badArgs = await client.callTool({ name: "entity_get", arguments: { id: "no-such-entity" } });

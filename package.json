@@ -44,6 +44,8 @@
     "smoke:geoui": "node scripts/run-geometry-ui-smoke.mjs",
     "smoke:geoopen": "node scripts/run-geometry-open-visual.mjs",
     "test:mcp": "node scripts/run-mcp-test.mjs",
+    "test:ai": "node scripts/run-ai-test.mjs",
+    "smoke:ai": "node scripts/run-ai-smoke.mjs",
     "mcp": "node mcp/server.mjs",
     "smoke:mcp": "node scripts/run-mcp-smoke.mjs",
     "smoke:mcp-ui": "node scripts/run-mcp-ui-smoke.mjs",

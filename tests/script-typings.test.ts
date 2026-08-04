@@ -50,6 +50,8 @@ export default class Player extends Script {
     const meshByClass = this.entity.getComponent(MeshComponent);
     const ccByClass = this.entity.getComponent(CharacterControllerComponent);
     meshByClass?.setProp("geometry", "box");
+    // Authored props are also direct fields (`comp.intensity`), mirrored at runtime.
+    if (meshByClass) meshByClass.geometry = "sphere";
     ccByClass?.move([0, 0, 0]);
     const camsByClass = this.entity.findComponents(CameraComponent);
     void camsByClass;

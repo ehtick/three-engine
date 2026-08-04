@@ -58,3 +58,24 @@ export const OCCLUDER_LAYER = 29;
  * material's bucket actually changes, never per frame.
  */
 export const GI_MIRROR_LAYER = 28;
+
+/**
+ * Layer for UI meshes (`components/ui/*`).
+ *
+ * UI used to share bit 30 with {@link DEBUG_LAYER}, which was a real bug rather
+ * than a tidy coincidence: every game camera and the editor camera enable the
+ * debug layer, so UI quads were already being drawn by the main scene pass —
+ * while `UiSystem` ALSO drew them in a second full `renderer.render()` of its
+ * own. That second pass roughly doubled frame time (see
+ * `scripts/run-ui-perf.mjs`) to produce pixels the main pass had already
+ * produced. It also meant UI leaked into every consumer that treats "not the
+ * editor layer" as "part of the world": GI voxelization and the occlusion
+ * depth pass both swallowed HUD quads sitting at pixel-scale world
+ * coordinates.
+ *
+ * UI now renders in the main pass and nowhere else. A camera that should show
+ * UI enables this bit explicitly (`CameraComponent`, the editor orbit camera);
+ * every auxiliary pass leaves it off, which is what keeps a HUD out of shadow
+ * maps, GI, occlusion and reflections.
+ */
+export const UI_LAYER = 27;

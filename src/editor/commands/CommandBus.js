@@ -48,16 +48,48 @@ class CommandBus {
   }
 
   /**
-   * Re-publishes history state to the UI after something has rewritten the
-   * stack behind the bus's back.
-   *
-   * Exactly one caller: the `batch` op, which collapses the entries its steps
-   * pushed into a single labelled step. Without this the stack is right but the
-   * Edit menu still offers "Undo Add Mesh" — the label of the last inner step —
-   * so the user is told the wrong thing about what Ctrl+Z will do.
+   * Marks a point on the undo stack, to later collapse everything pushed
+   * since it into one labelled entry with {@link collapseFrom}. Call this
+   * before starting a multi-step operation whose individual steps each push
+   * their own command (they still should — a partial failure must still be
+   * a real, undoable prefix of what happened).
    */
-  syncHistory() {
+  markGroup() {
+    return this.undoStack.length;
+  }
+
+  /**
+   * Replaces every entry pushed since `mark` with one entry that does/undoes
+   * them as a group, newest-first on undo. Two callers: the `batch` op
+   * (`ops/batch.js`, many ops in one MCP round trip) and an AI workflow run
+   * (`store/aiStore.js`, many tool calls across a multi-turn agent session) —
+   * both want "many mutations, one Ctrl+Z, one label in the Edit menu"
+   * instead of making the user press undo once per step or guess when to
+   * stop. No-ops (keeps the single inner entry's own label, which is more
+   * specific than a group label would be) when zero or one entries were
+   * pushed — a run that made one change, or none, has nothing to collapse.
+   * Returns how many entries were collapsed.
+   */
+  collapseFrom(mark, label) {
+    const taken = this.undoStack.splice(mark, this.undoStack.length - mark);
+    if (taken.length <= 1) {
+      this.undoStack.push(...taken);
+      return taken.length;
+    }
+    this.undoStack.push({
+      label,
+      do: () => {
+        for (const command of taken) command.do();
+      },
+      undo: () => {
+        for (let i = taken.length - 1; i >= 0; i--) taken[i].undo();
+      },
+    });
+    // The stack was rewritten directly, so the UI's mirror is stale — it
+    // would still offer "Undo <last inner step>", telling the user the wrong
+    // thing about what Ctrl+Z does.
     this.#syncHistoryState();
+    return taken.length;
   }
 
   #afterMutation() {

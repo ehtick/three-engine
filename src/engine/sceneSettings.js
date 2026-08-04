@@ -303,6 +303,13 @@ export async function resolveRendererLimits() {
     if (storage > 8) requiredLimits.maxStorageBuffersPerShaderStage = Math.min(16, storage);
     const uniforms = adapter?.limits?.maxUniformBuffersPerShaderStage ?? 0;
     if (uniforms > 12) requiredLimits.maxUniformBuffersPerShaderStage = Math.min(24, uniforms);
+    // Baseline maxStorageTexturesPerShaderStage is **4**, and the GI resolve
+    // already writes 4 (irradiance, emitter shadows, radiance, BVH hits) —
+    // the GI-traced light-shadow target is the 5th. Same adapter-clamped ask
+    // as above; a baseline-4 device simply doesn't get GI light shadows
+    // (GISystem gates on the DEVICE limit before binding).
+    const storageTex = adapter?.limits?.maxStorageTexturesPerShaderStage ?? 0;
+    if (storageTex > 4) requiredLimits.maxStorageTexturesPerShaderStage = Math.min(8, storageTex);
     // One line, always: when GI later refuses the occupancy backend ("device
     // gate"), THIS is the first thing to check — a null adapter here means the
     // device was created at baseline limits and every >8-storage /

@@ -38,6 +38,9 @@ package-lock.json
 # dumps, perf traces). Always regenerable by re-running the harness, so it is
 # never committed. `npm run clean:artifacts` deletes it.
 scripts/*.png
+# Generated repro project (scripts/lib/makeCornellProject.mjs) — rewritten on
+# every run-gi-emissive.mjs run, never hand-edited.
+scripts/.gi-cornell/
 scripts/*.jpg
 scripts/*.jpeg
 scripts/*.webp

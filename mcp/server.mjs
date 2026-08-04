@@ -349,6 +349,19 @@ const shutdown = () => {
 };
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
+// The MCP client (claude) closes its end of stdin when IT exits — the normal
+// end of a `-p` turn, not an error. Without this, nothing here ever reacts to
+// that: the WebSocketServer keeps a live handle open, which keeps the event
+// loop (and therefore the process) alive indefinitely even with a completely
+// dead stdio channel. The orphan then squats on PORT forever, so every
+// SUBSEQUENT invocation's freshly-spawned server fails to bind it and reports
+// itself "failed" to connect — which is exactly the "no MCP tools" symptom a
+// one-shot headless run (aiStore.js's runWorkflow) hits on a second run,
+// since each one spawns a fresh `claude -p` with its own fresh server. Same
+// leak, same fix, for a long-lived interactive session killed uncleanly
+// (closed terminal, task-killed `claude`) rather than a clean exit.
+process.stdin.on("end", shutdown);
+process.stdin.on("close", shutdown);
 
 await server.connect(new StdioServerTransport());
 mcpConnected = true;

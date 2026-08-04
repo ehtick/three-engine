@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { subscribeLayers } from "../panels/ViewportPanel.jsx";
-import { engine } from "../engineInstance.js";
+import { ensureEngine } from "../engineInstance.js";
 
 /**
  * Editor-only viewport overlay showing live engine telemetry:
@@ -57,12 +57,10 @@ const EMPTY_READOUT = {
   spawnQueue: 0,
 };
 
-function readStats() {
-  // `engine` is a Proxy that throws if accessed before `ensureEngine()`
-  // resolves. The overlay is rendered inside ViewportPanel, which awaits
-  // `ensureEngine()` first — so this is safe. Every engine has a built-in
-  // `stats` instance, so there's no module-installed / not-installed split.
-  const stats = engine.stats;
+function readStats(liveEngine) {
+  // The caller passes the resolved engine instance explicitly because this
+  // overlay can mount before the editor's asynchronous engine bootstrap ends.
+  const stats = liveEngine.stats;
   if (!stats) return { ...EMPTY_READOUT };
   // The StatsSystem mutates its readout in place every frame; React's
   // useState bails out on identical references, so we shallow-clone to
@@ -74,11 +72,11 @@ function readStats() {
   // only purpose is to be read ten times a second.
   return {
     ...stats.readout,
-    occlusionCulled: engine.occlusion?.culledLastFrame ?? 0,
-    occlusionTested: engine.occlusion?.testedLastFrame ?? 0,
-    impostors: engine.impostors?.visibleCount ?? 0,
-    pooled: engine.pool?.size ?? 0,
-    spawnQueue: engine.pool?.pending ?? 0,
+    occlusionCulled: liveEngine.occlusion?.culledLastFrame ?? 0,
+    occlusionTested: liveEngine.occlusion?.testedLastFrame ?? 0,
+    impostors: liveEngine.impostors?.visibleCount ?? 0,
+    pooled: liveEngine.pool?.size ?? 0,
+    spawnQueue: liveEngine.pool?.pending ?? 0,
   };
 }
 
@@ -124,17 +122,24 @@ export function StatsOverlay({ forceVisible = false }) {
   // React sees a new reference each tick — see readStats().
   useEffect(() => {
     let stopped = false;
-    let last = 0;
-    const interval = 1000 / REFRESH_HZ;
-    const loop = (now) => {
+    const start = async () => {
+      const liveEngine = await ensureEngine();
       if (stopped) return;
-      if (now - last >= interval) {
-        last = now;
-        setR(readStats());
-      }
+      let last = 0;
+      const interval = 1000 / REFRESH_HZ;
+      const loop = (now) => {
+        if (stopped) return;
+        if (now - last >= interval) {
+          last = now;
+          setR(readStats(liveEngine));
+        }
+        rafRef.current = requestAnimationFrame(loop);
+      };
       rafRef.current = requestAnimationFrame(loop);
     };
-    rafRef.current = requestAnimationFrame(loop);
+    start().catch((error) => {
+      if (!stopped) console.warn(`Stats overlay unavailable: ${error?.message ?? error}`);
+    });
     return () => {
       stopped = true;
       cancelAnimationFrame(rafRef.current);

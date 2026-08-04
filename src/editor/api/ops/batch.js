@@ -35,35 +35,6 @@
 import { defineOp, callOp } from "../registry.js";
 import { commandBus } from "../../commands/CommandBus.js";
 
-/**
- * Replaces the last `count` entries on the undo stack with one entry that
- * undoes/redoes them as a group, newest-first on undo.
- */
-function collapseUndo(fromLength, label) {
-  const stack = commandBus.undoStack;
-  const taken = stack.splice(fromLength, stack.length - fromLength);
-  if (taken.length <= 1) {
-    // Nothing to collapse — put it back and keep the op's own label, which is
-    // more specific than ours would be.
-    stack.push(...taken);
-    return taken.length;
-  }
-  stack.push({
-    label,
-    do() {
-      for (const command of taken) command.do();
-    },
-    undo() {
-      for (let i = taken.length - 1; i >= 0; i--) taken[i].undo();
-    },
-  });
-  // We rewrote the stack directly, so the UI's mirror is stale — it would still
-  // offer "Undo <last inner step>", telling the user the wrong thing about what
-  // Ctrl+Z does.
-  commandBus.syncHistory();
-  return taken.length;
-}
-
 defineOp({
   name: "batch",
   undoable: true,
@@ -89,7 +60,7 @@ defineOp({
     },
   },
   async run({ label = "Batch", steps, stopOnError = true }) {
-    const mark = commandBus.undoStack.length;
+    const mark = commandBus.markGroup();
     const results = [];
     const ids = [];
     let failure = null;
@@ -137,7 +108,7 @@ defineOp({
       }
     }
 
-    const collapsed = collapseUndo(mark, label);
+    const collapsed = commandBus.collapseFrom(mark, label);
     return {
       ran: results.length,
       requested: steps.length,

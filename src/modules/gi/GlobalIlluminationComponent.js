@@ -40,6 +40,12 @@ export class GlobalIlluminationComponent extends Component {
     skyColor: "#ffffff",
     skyIntensity: 0,
     bounce: 1,
+    // Chroma of bounced light (1 = physical). Bounce color comes from each
+    // mesh's MEAN albedo, which oversaturates patterned surfaces (a banner's
+    // mean is pure red; its real weave bounces duller light) — dialling this
+    // down desaturates the bleed toward its own luminance, energy preserved,
+    // so colored bleed drops and neutral fill rises in the same move.
+    bleedSaturation: 1,
     temporalBlend: 0.25,
     // Per-probe temporal smoothing of the gathered irradiance (1 = off). The
     // scene's geometry never moves, so a settled image is bit-identical at any
@@ -55,6 +61,16 @@ export class GlobalIlluminationComponent extends Component {
     // Cost: indirect light trails a fast-moving light by up to ~1s. Direct
     // light and shadows are three's own and stay instant.
     probeSmoothing: 0.02,
+    // PEAK SPLIT — alternate the two halves of the awake pipeline (field
+    // feedback on even frames, cascade transport on odd) instead of running
+    // both every frame. Measured on Sponza/ultra: 6.3ms of GPU compute per
+    // awake frame becomes a 3.9ms peak, which is the difference between
+    // holding and missing a 120Hz frame budget while a light moves. The halves
+    // are a ping-pong (each reads the other's output, never its own), so this
+    // converges to the same answer at half the rate per half; `fieldSmoothing`
+    // is rate-compensated so light response is unchanged. Turn OFF for the
+    // absolute fastest GI RESPONSE at double the awake cost.
+    peakSplit: true,
     reflections: true,
     // Per-triangle BVH reflections are an explicit High/Ultra opt-in. The
     // trace is shared by the half-resolution screen resolve; materials only
@@ -94,7 +110,25 @@ export class GlobalIlluminationComponent extends Component {
     // packaging, runtime browser bakes — is deleted; there is no SDF mode to
     // toggle back to. Saved scenes carrying the old prop are ignored.)
     sparseField: false,
-    emissiveShadows: true,
+    emissiveShadows: false,
+    // AMBIENT OCCLUSION ON INDIRECT LIGHT (world-space, from the occupancy
+    // pyramid's distance oracle — see giScreen's obscurance ladder). The
+    // probe lattice is ~1m, so without this indirect light has no contact
+    // darkening under props, corners or crevices. Applied to the gathered
+    // irradiance only — emitter/analytic direct keep their traced shadows.
+    // DEFAULT OFF: it is a look choice that only ever removes light, and it
+    // shipped default-on in the same change that darkened the whole module
+    // (see the vis³ note in cascadeGather) — which made it impossible to
+    // tell the two apart. Opt in per scene.
+    ao: false,
+    aoStrength: 0.6,
+    aoRadius: 0.6,
+    // Screen-resolve resolution as a fraction of the drawing buffer. 0.5 is
+    // the cost sweet spot; the GI-TRACED LIGHT SHADOWS and AO are computed
+    // at this resolution, so their edges blend across silhouettes when
+    // upsampled — "bad corners" under a bright sun. 1.0 removes that at
+    // roughly 4× the resolve cost (still small next to the render).
+    resolveScale: 0.5,
     autoRebake: true,
     debugProbes: "off",
   };
@@ -133,6 +167,9 @@ export class GlobalIlluminationComponent extends Component {
     // are black because nothing told you a sky existed to turn on.
     { key: "skyIntensity", label: "Sky Light", type: "number", min: 0, max: 20, step: 0.1 },
     { key: "skyColor", label: "Sky Color", type: "color" },
+    // A LOOK control like Sky Light (deliberately not advanced): live
+    // uniform, drag it while watching the scene. 1 = physical.
+    { key: "bleedSaturation", label: "Bleed Saturation", type: "number", min: 0, max: 1, step: 0.05 },
     // Fraction of secondary energy retained per pass — the pass itself is
     // an infinite-bounce feedback loop; values > 1 would diverge.
     { key: "bounce", label: "Bounce Energy", type: "number", min: 0, max: 1, step: 0.05, advanced: true, flipsToCustom: "quality" },
@@ -142,11 +179,21 @@ export class GlobalIlluminationComponent extends Component {
     // Deliberately NOT `flipsToCustom` — it is a stability knob, not a quality
     // level, and switching preset must not silently reset it.
     { key: "probeSmoothing", label: "Light Smoothing (1=off)", type: "number", min: 0.02, max: 1, step: 0.01, advanced: true },
+    { key: "peakSplit", label: "Split Update Across Frames", type: "boolean", advanced: true },
     { key: "reflections", label: "GI Reflections", type: "boolean", advanced: true, flipsToCustom: "quality" },
     { key: "exactReflections", label: "Exact Reflections (High/Ultra)", type: "boolean", advanced: true, flipsToCustom: "quality" },
     { key: "backend", label: "Tracing Backend", type: "select", options: ["occupancy", "sdf-legacy"], advanced: true, flipsToCustom: "quality" },
     { key: "sparseField", label: "Sparse Fine Field (sub-cell occlusion)", type: "boolean", advanced: true, flipsToCustom: "quality" },
     { key: "emissiveShadows", label: "Emissive Shadows", type: "boolean", advanced: true, flipsToCustom: "quality" },
+    // A LOOK control like Sky Light, deliberately not advanced/flipsToCustom:
+    // contact darkening is the single most visible realism knob after
+    // intensity, and it costs a few bitset fetches at half res.
+    { key: "ao", label: "Ambient Occlusion", type: "boolean" },
+    { key: "aoStrength", label: "AO Strength", type: "number", min: 0, max: 1, step: 0.05, advanced: true },
+    { key: "aoRadius", label: "AO Radius (m)", type: "number", min: 0.1, max: 3, step: 0.1, advanced: true },
+    // Live (a resize rebuilds only the resolve compute): raise to 1.0 when
+    // GI light shadows / AO fringe at silhouettes ("bad corners").
+    { key: "resolveScale", label: "Resolve Scale", type: "number", min: 0.25, max: 1, step: 0.05, advanced: true },
     { key: "autoRebake", label: "Auto Re-bake", type: "boolean", advanced: true, flipsToCustom: "quality" },
     // "occupancy" marches the pyramid with the SAME hierarchical DDA the
     // transport rays use, so it is the instrument for "is this column

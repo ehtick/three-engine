@@ -1,6 +1,7 @@
 import { exportGame } from "./exportGame.js";
 import { useProjectStore } from "./store/projectStore.js";
 import { vmSingleton } from "./singleton.js";
+import { pushToast, dismissToastKey } from "./toasts.js";
 
 // VM-wide, not module-level: a `?t=` HMR twin of this module would otherwise
 // see `stop === null`, conclude no preview is running, and let a second live
@@ -8,18 +9,20 @@ import { vmSingleton } from "./singleton.js";
 const state = vmSingleton("browserPreview", () => ({
   /** Teardown for the active live-rebuild loop, or null. */
   stop: null,
-  /** Latched after a failed player-runtime auto-rebuild so the loop doesn't
-   *  retry a broken `npm run build:player` every few seconds. Reset when a
-   *  new preview session starts. */
-  templateRebuildBroken: false,
   /** The result of the running preview ({ localUrl, lanUrl, report, … }) or
    *  null. Owned here, not in panel state: dockview remounts the viewport on
    *  tab moves, and a remounted toolbar must find the running server again
    *  instead of offering to start a second one. */
   active: null,
-  /** True while openBrowserPreview is mid-flight, so auto-resume and a
-   *  user click can't race two builds into the same output directory. */
+  /** True while openBrowserPreview is mid-flight, so duplicate user clicks
+   *  can't race two builds into the same output directory. */
   starting: false,
+  /** { url } for the running public share tunnel, or null. Owned here for
+   *  the same dockview-remount reason as `active`. */
+  share: null,
+  /** True while startShareTunnel is mid-flight — the first run downloads a
+   *  ~55 MB binary, which is plenty of time for a second click. */
+  sharing: false,
 }));
 
 /** The currently running preview's URLs/report, or null. */
@@ -27,43 +30,63 @@ export function getActiveBrowserPreview() {
   return state.active;
 }
 
-/** localStorage key holding the project root whose preview was live when the
- *  editor last ran — how a restart knows to bring the server back up without
- *  being asked, so a phone bookmark keeps working across editor restarts. */
-const RESUME_KEY = "three-engine.browser-preview-project";
-
-export function shouldResumeBrowserPreview(root) {
-  try {
-    return !!root && localStorage.getItem(RESUME_KEY) === root;
-  } catch {
-    return false;
-  }
-}
-
-function rememberBrowserPreview(root) {
-  try {
-    localStorage.setItem(RESUME_KEY, root);
-  } catch {
-    // Preview still works for this session; it just won't auto-resume.
-  }
-}
-
-function forgetBrowserPreview() {
-  try {
-    localStorage.removeItem(RESUME_KEY);
-  } catch {}
-}
-
 export async function stopBrowserPreview(outDir) {
-  // Forget FIRST: even if tearing the server down throws, an explicit stop
-  // must never come back as an auto-resume next session.
-  forgetBrowserPreview();
   state.active = null;
   state.stop?.();
   state.stop = null;
-  if (!outDir) return;
   const { invoke } = await import("@tauri-apps/api/core");
+  // The tunnel forwards to the server being stopped; left running it would
+  // keep a public URL alive that now serves connection errors.
+  if (state.share) {
+    state.share = null;
+    await invoke("stop_share_tunnel").catch(() => {});
+  }
+  if (!outDir) return;
   await invoke("stop_build_lan", { dir: outDir });
+}
+
+/** The running public share tunnel ({ url }) or null. */
+export function getActiveShareTunnel() {
+  return state.share;
+}
+
+/**
+ * Forwards the running browser preview to a public Cloudflare quick-tunnel
+ * URL (https://<random>.trycloudflare.com) so the build can be demoed to
+ * people outside the local network. The link serves the same live-updating
+ * build as the LAN preview and dies with the tunnel, the preview, or the
+ * editor. Returns null if a start is already in flight.
+ */
+export async function startShareTunnel({ onProgress } = {}) {
+  if (state.share) return state.share;
+  if (!state.active?.localUrl) {
+    throw new Error("Start the browser preview before creating a share link.");
+  }
+  if (state.sharing) return null;
+  state.sharing = true;
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    const port = Number(new URL(state.active.localUrl).port);
+    if (!port) throw new Error(`Preview URL has no port: ${state.active.localUrl}`);
+    const status = await invoke("share_binary_status").catch(() => null);
+    onProgress?.({
+      phase: "share",
+      message: status?.ready
+        ? "Creating public link…"
+        : "Downloading Cloudflare Tunnel (one time, ~55 MB)…",
+    });
+    const url = await invoke("start_share_tunnel", { port });
+    state.share = { url };
+    return state.share;
+  } finally {
+    state.sharing = false;
+  }
+}
+
+export async function stopShareTunnel() {
+  state.share = null;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("stop_share_tunnel");
 }
 
 /** Opens one of the trusted preview endpoints from a compact toolbar action. */
@@ -97,23 +120,24 @@ export async function openBrowserPreviewUrl(url) {
  * A missing template (fresh checkout, never built) also lands here: the
  * status call fails, the rebuild attempt builds it for the first time.
  */
-async function ensurePlayerTemplateFresh(invoke, onProgress) {
-  if (state.templateRebuildBroken) return;
-  const status = await invoke("player_template_status").catch(() => null);
-  if (status && (!status.stale || !status.canRebuild)) return;
-  try {
-    onProgress?.({
-      phase: "template",
-      message: "Engine source changed — rebuilding player runtime…",
-    });
-    await invoke("rebuild_player_template");
-  } catch (error) {
-    // npm missing or the build itself failing: warn once and keep previewing
-    // on the existing template rather than taking the preview down.
-    state.templateRebuildBroken = true;
-    console.warn(
-      `Player runtime auto-rebuild failed — preview continues on the existing template.\n${error?.message ?? error}`,
-    );
+async function ensurePlayerTemplateFresh(invoke, onProgress, { force = false } = {}) {
+  const status = await invoke("player_template_status");
+  if (!status) throw new Error("Could not determine player runtime freshness.");
+  if (!status.canRebuild) {
+    if (status.stale) {
+      throw new Error("The player runtime is stale and this editor cannot rebuild it.");
+    }
+    return;
+  }
+  if (!force && !status.stale) return;
+  onProgress?.({
+    phase: "template",
+    message: force ? "Building fresh player runtime…" : "Engine source changed — rebuilding player runtime…",
+  });
+  await invoke("rebuild_player_template");
+  const after = await invoke("player_template_status");
+  if (after?.stale) {
+    throw new Error("Player runtime rebuild completed, but the template is still stale.");
   }
 }
 
@@ -148,6 +172,7 @@ async function startLivePreview({ outDir, onProgress }) {
     const includeDerivedData = derivedDirty;
     derivedDirty = false;
     let failed = false;
+    let failure = "";
     try {
       await ensurePlayerTemplateFresh(invoke, onProgress);
       const report = await exportGame({
@@ -157,12 +182,25 @@ async function startLivePreview({ outDir, onProgress }) {
       });
       if (!report.ok && !report.cancelled) {
         failed = true;
-        console.error(`Live browser preview rebuild failed: ${report.error}`);
+        failure = `${report.error}`;
       }
     } catch (error) {
       failed = true;
-      console.error(`Live browser preview rebuild failed: ${error?.message ?? error}`);
+      failure = `${error?.message ?? error}`;
     } finally {
+      if (failed) {
+        console.error(`Live browser preview rebuild failed: ${failure}`);
+        // Keyed: the retry loop fires every 5s on a persistent failure — one
+        // toast that updates, not a pile. Cleared on the next good rebuild.
+        pushToast({
+          level: "warn",
+          title: "Live preview is stale — rebuild failed",
+          detail: failure,
+          key: "live-preview-rebuild",
+        });
+      } else {
+        dismissToastKey("live-preview-rebuild");
+      }
       building = false;
       if (failed && !stopped) {
         // A transient failure (a file locked mid-save, a script that doesn't
@@ -186,6 +224,9 @@ async function startLivePreview({ outDir, onProgress }) {
     engine.on("hierarchy-changed", schedule),
     engine.on("settings-changed", schedule),
     engine.on("script-loaded", schedule),
+    engine.on("component-changed", schedule),
+    engine.on("modules-changed", schedule),
+    engine.on("audio-changed", schedule),
     onAssetInvalidated(schedule),
     // Every undoable edit crosses the command bus, and some mutate nothing
     // that emits an engine event — moving an entity (SetTransformCommand →
@@ -213,7 +254,7 @@ async function startLivePreview({ outDir, onProgress }) {
   // dist-player/ mid-build; copying the template concurrently would ship a
   // half-written runtime).
   const templatePoll = setInterval(async () => {
-    if (stopped || building || dirty || state.templateRebuildBroken) return;
+    if (stopped || building || dirty) return;
     const status = await invoke("player_template_status").catch(() => null);
     if (!stopped && status?.stale && status.canRebuild) schedule();
   }, 5000);
@@ -231,8 +272,8 @@ async function startLivePreview({ outDir, onProgress }) {
 
 /** Builds the authored scene into a disposable project-local preview and
  * exposes it on localhost plus the current LAN for phone/tablet testing.
- * `openBrowser: false` restarts the hosting silently (the auto-resume path
- * after an editor restart) without stealing focus to a new tab. */
+ * `openBrowser: false` starts the hosting silently without stealing focus to
+ * a new tab. */
 export async function openBrowserPreview({ onProgress, openBrowser = true } = {}) {
   const root = useProjectStore.getState().rootPath;
   if (!root) throw new Error("Open a project before starting a browser preview.");
@@ -253,10 +294,11 @@ async function runOpenBrowserPreview({ root, onProgress, openBrowser }) {
   } catch (error) {
     throw new Error(`Could not prepare preview output: ${error?.message ?? error}`);
   }
-  // A fresh session gets a fresh chance: whatever broke the auto-rebuild last
-  // time (a syntax error mid-edit, npm hiccup) may be fixed by now.
-  state.templateRebuildBroken = false;
-  await ensurePlayerTemplateFresh(invoke, onProgress);
+  // Always rebuild the player runtime when a preview is explicitly started.
+  // The editor viewport may be running source through Vite while the player
+  // template is a prebuilt artifact; serving it without this step can make
+  // the browser execute a different engine than the editor.
+  await ensurePlayerTemplateFresh(invoke, onProgress, { force: true });
   let buildStage = "Starting browser build…";
   const report = await exportGame({
     outDir,
@@ -299,7 +341,6 @@ async function runOpenBrowserPreview({ root, onProgress, openBrowser }) {
       (openError ? `\nAutomatic browser launch failed: ${openError}` : ""),
   );
   await startLivePreview({ outDir, onProgress });
-  rememberBrowserPreview(root);
   state.active = { ...urls, openError, report };
   return state.active;
 }
