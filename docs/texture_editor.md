@@ -129,7 +129,7 @@ src/modules/texture-editor/index.js         the module definition
 Status is tracked per phase below as it lands.
 
 - [x] Phase 1 — **shipped 2026-08-05**
-- [ ] Phase 2
+- [x] Phase 2 — **shipped 2026-08-05**
 - [ ] Phase 3
 - [ ] Phase 4
 
@@ -170,8 +170,70 @@ Nothing was needed in `exportGame`: it ships assets *referenced by scenes* plus 
 `.meta`/`.basis` sidecars, and a `.tex` is neither. It is hidden from the Assets grid and
 follows its image through rename, move and delete, like `.meta`.
 
-Tests: `npm run test:texture` (56 headless checks over compositing, the PNG round trip,
-the container, layer ops, selections, the rasterizers and the undo stack) and
-`npm run smoke:texture` (26 checks driving the real panel — painting reaches the saved
-PNG, undo rewinds the *pixels*, and a two-layer document reopens as two layers rather
-than one flattened one, which is the failure that would cost a session's work).
+Tests: `npm run test:texture` and `npm run smoke:texture` (counts under phase 2).
+
+---
+
+## Phase 2 — what landed
+
+Four menus — **Image**, **Adjust**, **Filter**, **Channels** — over three new pure
+modules (`adjust.js`, `filters.js`, `channels.js`).
+
+- **Image**: Resize (bilinear or nearest, aspect lock, ½×/2× and power-of-two presets),
+  Canvas Size with a 3×3 anchor, Crop to Selection, Trim Transparent Edges, flip, and
+  90/180/270 rotation.
+- **Adjust**: Brightness/Contrast, Levels, Hue/Saturation/Lightness, Colorize, Threshold,
+  Posterize, Desaturate, Invert — all on the active layer, all honouring the selection.
+- **Filter**: Blur, Sharpen, Noise, **Offset**, **Normal from Height**, Edge Detect,
+  Emboss, Median.
+- **Channels**: **Pack Channels**, Swizzle, Split into Layers, Alpha from (Inverted)
+  Luminance, Make Opaque, **Bleed Colour into Transparency**, Premultiply/Unpremultiply.
+
+The four that earn their place by being *engine* features rather than editor features:
+
+- **Pack Channels** — four files in, one texture out, because a PBR set arrives as
+  separate roughness/metalness/AO/height files and ships as one RGB map. Sources of
+  different sizes are resampled rather than refused (a 2K albedo beside a 1K roughness is
+  the normal case), a slot with no file takes a constant (metalness is 0 everywhere
+  without anyone authoring a black image to say so), and the result is written as a **new
+  asset tagged `colorSpace: linear`** — a packed map read as sRGB is wrong everywhere it
+  is sampled, and the symptom points at the material rather than at the import setting.
+- **Offset** wraps the image, so a tiling texture can be shifted by half its size and the
+  seam that was at the edge is now in the middle where it can be painted out. Nothing else
+  in the editor can do this, and without it "make this tile" is guesswork.
+- **Normal from Height** is Sobel over luminance, **wrapping by default** (the input is
+  almost always a tiling surface, and clamping puts a seam in the normal map of a seamless
+  height map) with an Invert Y for DirectX-convention assets.
+- **Bleed Colour into Transparency** fills transparent texels with neighbouring colour and
+  leaves alpha at zero — the fix for the dark or white fringe every sprite atlas has,
+  caused by filtering averaging in RGB nobody can see.
+
+Decisions worth recording:
+
+- **Curves is deliberately not implemented.** It is a photo-retouching tool; everything a
+  texture needs from it, Levels does with five numbers that can be typed and reproduced.
+- **Adjustments never write alpha.** Brightening a sprite must not thicken its edge.
+- **A selection blends an operation, not clips it** — a feathered selection produces a
+  feathered adjustment, not a hard-edged one with soft sides.
+- **Anything that averages colour works premultiplied** (blur, resample), or a sprite on
+  transparency gets a dark halo.
+- **Noise is seeded, never `Math.random()`** — "a bit less noise" must not re-roll the
+  grain you already liked.
+- Resize and Canvas Size are two dialogs on purpose. Same two numbers, completely
+  different consequences; merging them is how someone eventually destroys artwork with a
+  radio button.
+- Dialogs preview by writing into the **live layer** and restoring from a snapshot on
+  every change and on Cancel — so what you see is literally what Apply commits. Apply
+  re-runs from the snapshot, not on top of the preview, or a blur previewed three times
+  would be applied three times.
+
+One bug this shipped with and then didn't: previewing re-renders the panel, which hands
+the dialog a fresh `onPreview` callback; with that callback as an effect dependency the
+dialog re-previews forever and burns a core for as long as it is open, with no symptom a
+screenshot would show. The smoke now samples the dialog's busy marker over a second and
+fails if an idle dialog is still scheduling work — verified by reintroducing the bug
+(8/10 samples busy) and removing it again (0/10).
+
+Tests: `npm run test:texture` (90 headless checks) and `npm run smoke:texture` (46 checks
+driving the real panel, including that Cancel restores the layer exactly, Resize really
+changes the file on disk, and a packed map lands with `colorSpace: linear` beside it).

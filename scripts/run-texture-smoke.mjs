@@ -390,6 +390,150 @@ console.log("\nnew texture");
 }
 
 /* -------------------------------------------------------------------------- */
+/* 8 — the processing menus (phase 2)                                           */
+/* -------------------------------------------------------------------------- */
+
+const BLUE = [10, 10, 200, 255];
+const readOther = async () => decodePng(new Uint8Array(fs.readFileSync(OTHER)));
+
+/** Opens one of the Image / Adjust / Filter / Channels menus and picks an item. */
+async function menuPick(menu, item) {
+  const opened = await clickText(".texture-toolbar .toolbar-btn", menu);
+  if (!opened) return false;
+  await settle(200);
+  const picked = await page.evaluate((needle) => {
+    const el = [...document.querySelectorAll(".dropdown-item")].find((e) =>
+      e.textContent.trim().startsWith(needle),
+    );
+    if (!el) return false;
+    el.click();
+    return true;
+  }, item);
+  await settle(400);
+  return picked;
+}
+
+console.log("\nprocessing menus");
+{
+  await openTexture(OTHER);
+  await settle(1400);
+  check("the flat blue texture is open", (await statusText()).includes("64 × 64"), await statusText());
+
+  // A zero-parameter adjustment applies straight away — no dialog to dismiss.
+  check("Adjust ▸ Invert is reachable", await menuPick("Adjust", "Invert"));
+  await save();
+  {
+    const buffer = await readOther();
+    const p = Array.from(buffer.data.subarray(0, 4));
+    check(
+      "invert really inverted the saved pixels",
+      Math.abs(p[0] - (255 - BLUE[0])) < 4 && Math.abs(p[2] - (255 - BLUE[2])) < 4,
+      p.join(),
+    );
+    check("and left alpha alone", p[3] === 255, String(p[3]));
+  }
+
+  // A parameterised filter opens a dialog; cancelling must put the pixels back.
+  check("Filter ▸ Blur opens its dialog", await menuPick("Filter", "Blur"));
+  const dialogUp = await page.evaluate(() => !!document.querySelector(".texture-dialog"));
+  check("the operation dialog rendered", dialogUp);
+  await settle(500); // let the debounced preview run
+
+  // An open dialog must go QUIET. Previewing writes to the document, which
+  // re-renders the panel, which hands the dialog a fresh callback — if that
+  // callback is an effect dependency, the dialog re-previews forever and burns
+  // a core for as long as it is open, with no symptom a screenshot would show.
+  // The busy marker is the tell: it is set on every scheduled preview.
+  let busySamples = 0;
+  for (let i = 0; i < 10; i++) {
+    await settle(100);
+    if (await page.evaluate(() => !!document.querySelector(".texture-dialog-busy"))) busySamples++;
+  }
+  check("an idle dialog is not re-previewing in a loop", busySamples === 0, `${busySamples}/10 samples busy`);
+
+  check("Cancel is offered", await clickText(".texture-dialog-actions .toolbar-btn", "Cancel"));
+  await settle(400);
+  await save();
+  {
+    const buffer = await readOther();
+    const p = Array.from(buffer.data.subarray(0, 4));
+    check(
+      "cancelling a previewed filter restores the layer exactly",
+      Math.abs(p[0] - (255 - BLUE[0])) < 4 && Math.abs(p[2] - (255 - BLUE[2])) < 4,
+      p.join(),
+    );
+  }
+
+  // Resize is a document operation: the file on disk must change size.
+  check("Image ▸ Resize opens its dialog", await menuPick("Image", "Resize Image"));
+  await page.evaluate(() => {
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+    const numbers = [...document.querySelectorAll(".texture-dialog input[type=number]")];
+    for (const input of numbers) {
+      setter.call(input, "32");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+  });
+  await settle(200);
+  check("Resize commits", await clickText(".texture-dialog-actions .toolbar-btn", "Resize"));
+  await settle(500);
+  check("the panel reports the new size", (await statusText()).includes("32 × 32"), await statusText());
+  await save();
+  {
+    const buffer = await readOther();
+    check("the saved PNG really is smaller", buffer.width === 32 && buffer.height === 32, `${buffer.width}×${buffer.height}`);
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* 9 — channel packing writes a new asset                                       */
+/* -------------------------------------------------------------------------- */
+
+console.log("\nchannel packing");
+{
+  check("Channels ▸ Pack opens its dialog", await menuPick("Channels", "Pack Channels"));
+  await page.waitForSelector(".texture-dialog.wide", { timeout: 10000 });
+
+  // Constants only — enough to prove the dialog, the packer and the asset write
+  // are wired together. The per-channel file pickers are the same AssetField the
+  // Inspector uses everywhere else.
+  const filled = await page.evaluate(() => {
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+    const rows = [...document.querySelectorAll(".texture-pack-row")];
+    const values = [64, 128, 192, 255];
+    rows.forEach((row, i) => {
+      const input = row.querySelector("input[type=number]");
+      if (!input) return;
+      setter.call(input, String(values[i]));
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    const name = [...document.querySelectorAll(".texture-dialog.wide label input")].find(
+      (i) => i.type !== "number",
+    );
+    setter.call(name, "Packed");
+    name.dispatchEvent(new Event("input", { bubbles: true }));
+    return rows.length;
+  });
+  check("the dialog offers one row per channel", filled === 4, String(filled));
+  await settle(200);
+  check("Pack commits", await clickText(".texture-dialog-actions .toolbar-btn", "Pack"));
+  await settle(2000);
+
+  const packed = `${ROOT}/textures/Packed.png`;
+  check("the packed texture was written", fs.existsSync(packed));
+  if (fs.existsSync(packed)) {
+    const buffer = await decodePng(new Uint8Array(fs.readFileSync(packed)));
+    const p = Array.from(buffer.data.subarray(0, 4));
+    check("each channel got its constant", p.join() === "64,128,192,255", p.join());
+  }
+  check("a packed map is tagged linear, not sRGB", fs.existsSync(`${packed}.meta`));
+  if (fs.existsSync(`${packed}.meta`)) {
+    const meta = JSON.parse(fs.readFileSync(`${packed}.meta`, "utf8"));
+    check("the .meta says colorSpace linear", meta.colorSpace === "linear", JSON.stringify(meta));
+  }
+}
+
+/* -------------------------------------------------------------------------- */
 
 check("no page errors during the run", pageErrors.length === 0, pageErrors.slice(0, 2).join(" | "));
 

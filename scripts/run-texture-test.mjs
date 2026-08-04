@@ -71,6 +71,40 @@ import {
   captureRegion,
   restoreRegion,
 } from "../src/editor/texture/history.js";
+import {
+  ADJUSTMENTS,
+  adjustmentById,
+  brightnessContrast,
+  colorize,
+  defaultParams,
+  grayscale,
+  hueSaturation,
+  invert as invertColors,
+  levels,
+  luminance,
+  posterize,
+  threshold,
+} from "../src/editor/texture/adjust.js";
+import {
+  FILTERS,
+  gaussianBlur,
+  median,
+  noise,
+  normalFromHeight,
+  offset,
+  sharpen,
+} from "../src/editor/texture/filters.js";
+import {
+  alphaFromLuminance,
+  bleedAlpha,
+  fillChannel,
+  packChannels,
+  premultiply,
+  splitChannels,
+  swizzle,
+  unpremultiply,
+} from "../src/editor/texture/channels.js";
+import { trimDocument } from "../src/editor/texture/layers.js";
 
 let failures = 0;
 let passes = 0;
@@ -676,6 +710,383 @@ check("a brush dab's undo cost is proportional to the dab, not the canvas", () =
   const before = captureRegion(buffer, rect);
   const entry = regionEntry(buffer, rect, before, "Brush");
   assert.ok(entry.bytes < 4000, `a 20² dab cost ${entry.bytes} bytes on a 1024² document`);
+});
+
+console.log("\nadjustments");
+
+check("every registered adjustment runs from its own defaults", () => {
+  for (const spec of ADJUSTMENTS) {
+    const b = createBuffer(4, 4, [90, 140, 200, 180]);
+    spec.apply(b, defaultParams(spec));
+    for (let i = 0; i < b.data.length; i++) assert.ok(Number.isFinite(b.data[i]), `${spec.id} produced NaN`);
+  }
+  assert.equal(adjustmentById("levels")?.label, "Levels");
+});
+
+check("adjustments never touch alpha (brightening must not thicken an edge)", () => {
+  const b = createBuffer(2, 2, [100, 100, 100, 77]);
+  brightnessContrast(b, { brightness: 0.5 });
+  hueSaturation(b, { saturation: 1 });
+  levels(b, { black: 20, white: 200, gamma: 0.6 });
+  assert.equal(px(b, 0, 0)[3], 77);
+});
+
+check("brightness raises, contrast pivots on mid-grey", () => {
+  const up = createBuffer(1, 1, [100, 100, 100, 255]);
+  brightnessContrast(up, { brightness: 0.2 });
+  assert.ok(px(up, 0, 0)[0] > 140, String(px(up, 0, 0)[0]));
+
+  const dark = createBuffer(1, 1, [64, 64, 64, 255]);
+  const light = createBuffer(1, 1, [192, 192, 192, 255]);
+  brightnessContrast(dark, { contrast: 0.5 });
+  brightnessContrast(light, { contrast: 0.5 });
+  assert.ok(px(dark, 0, 0)[0] < 64, "darks got darker");
+  assert.ok(px(light, 0, 0)[0] > 192, "lights got lighter");
+
+  const mid = createBuffer(1, 1, [128, 128, 128, 255]);
+  brightnessContrast(mid, { contrast: 0.8 });
+  assert.ok(Math.abs(px(mid, 0, 0)[0] - 128) <= 1, "mid-grey is the pivot");
+});
+
+check("levels remaps the input window onto the output window", () => {
+  const b = createBuffer(3, 1);
+  setPixel(b, 0, 0, [50, 50, 50, 255]);
+  setPixel(b, 1, 0, [150, 150, 150, 255]);
+  setPixel(b, 2, 0, [250, 250, 250, 255]);
+  levels(b, { black: 50, white: 250, gamma: 1 });
+  assert.ok(px(b, 0, 0)[0] <= 1, `black point mapped to 0 (${px(b, 0, 0)[0]})`);
+  assert.ok(px(b, 2, 0)[0] >= 254, `white point mapped to 255 (${px(b, 2, 0)[0]})`);
+  assert.ok(Math.abs(px(b, 1, 0)[0] - 128) <= 3, `midpoint stretched (${px(b, 1, 0)[0]})`);
+});
+
+check("levels gamma brightens without moving the endpoints", () => {
+  const b = createBuffer(3, 1);
+  setPixel(b, 0, 0, [0, 0, 0, 255]);
+  setPixel(b, 1, 0, [128, 128, 128, 255]);
+  setPixel(b, 2, 0, [255, 255, 255, 255]);
+  levels(b, { gamma: 2 });
+  assert.equal(px(b, 0, 0)[0], 0);
+  assert.equal(px(b, 2, 0)[0], 255);
+  assert.ok(px(b, 1, 0)[0] > 150, String(px(b, 1, 0)[0]));
+});
+
+check("hue rotation moves red toward green and keeps it saturated", () => {
+  const b = createBuffer(1, 1, [255, 0, 0, 255]);
+  hueSaturation(b, { hue: 120 });
+  const p = px(b, 0, 0);
+  assert.ok(p[1] > 240 && p[0] < 15 && p[2] < 15, p.join());
+});
+
+check("desaturating uses luma, not a channel average", () => {
+  // Pure green is far brighter than pure blue; an average would call them equal.
+  const green = createBuffer(1, 1, [0, 255, 0, 255]);
+  const blue = createBuffer(1, 1, [0, 0, 255, 255]);
+  grayscale(green, {});
+  grayscale(blue, {});
+  assert.ok(px(green, 0, 0)[0] > px(blue, 0, 0)[0] + 100, `${px(green, 0, 0)[0]} vs ${px(blue, 0, 0)[0]}`);
+  assert.ok(Math.abs(px(green, 0, 0)[0] - luminance(0, 255, 0)) <= 1);
+});
+
+check("colorize keeps the source's luminance structure", () => {
+  const b = createBuffer(2, 1);
+  setPixel(b, 0, 0, [40, 40, 40, 255]);
+  setPixel(b, 1, 0, [200, 200, 200, 255]);
+  colorize(b, { color: [255, 0, 0, 255], strength: 1 });
+  assert.ok(px(b, 1, 0)[0] > px(b, 0, 0)[0] + 100, "the bright texel stayed brighter");
+  assert.ok(px(b, 1, 0)[1] < 20 && px(b, 1, 0)[2] < 20, "and took the tint's hue");
+});
+
+check("threshold and posterize quantise as advertised", () => {
+  const b = createBuffer(2, 1);
+  setPixel(b, 0, 0, [10, 10, 10, 255]);
+  setPixel(b, 1, 0, [240, 240, 240, 255]);
+  threshold(b, { level: 128 });
+  assert.deepEqual(px(b, 0, 0).slice(0, 3), [0, 0, 0]);
+  assert.deepEqual(px(b, 1, 0).slice(0, 3), [255, 255, 255]);
+
+  const ramp = createBuffer(256, 1);
+  for (let x = 0; x < 256; x++) setPixel(ramp, x, 0, [x, x, x, 255]);
+  posterize(ramp, { steps: 4 });
+  const distinct = new Set();
+  for (let x = 0; x < 256; x++) distinct.add(px(ramp, x, 0)[0]);
+  assert.equal(distinct.size, 4, [...distinct].join());
+});
+
+check("invert is its own inverse", () => {
+  const b = createBuffer(4, 4, [12, 200, 77, 255]);
+  const before = Array.from(b.data);
+  invertColors(b);
+  invertColors(b);
+  assert.deepEqual(Array.from(b.data), before);
+});
+
+check("a selection blends an adjustment rather than clipping it", () => {
+  const b = createBuffer(3, 1, [100, 100, 100, 255]);
+  const mask = createSelection(3, 1);
+  mask[0] = 255;
+  mask[1] = 128;
+  mask[2] = 0;
+  brightnessContrast(b, { brightness: 0.5 }, mask);
+  const full = px(b, 0, 0)[0];
+  const half = px(b, 1, 0)[0];
+  const none = px(b, 2, 0)[0];
+  assert.equal(none, 100, "unselected is untouched");
+  assert.ok(full > half && half > none, `${full} > ${half} > ${none}`);
+});
+
+console.log("\nfilters");
+
+check("every registered filter runs from its own defaults", () => {
+  for (const spec of FILTERS) {
+    const b = createBuffer(8, 8, [90, 140, 200, 255]);
+    spec.apply(b, defaultParams(spec));
+    for (let i = 0; i < b.data.length; i++) assert.ok(Number.isFinite(b.data[i]), `${spec.id} produced NaN`);
+  }
+});
+
+check("blur spreads a dot and conserves roughly its energy", () => {
+  const b = createBuffer(17, 17);
+  setPixel(b, 8, 8, [255, 255, 255, 255]);
+  gaussianBlur(b, { radius: 3 });
+  assert.ok(px(b, 8, 8)[3] < 255, "the centre softened");
+  assert.ok(px(b, 8, 10)[3] > 0, "it reached its neighbours");
+  let sum = 0;
+  for (let i = 3; i < b.data.length; i += 4) sum += b.data[i];
+  assert.ok(sum > 200 && sum < 400, `alpha roughly conserved (${sum} vs 255)`);
+});
+
+check("blurring a sprite on transparency does NOT darken its edge", () => {
+  // The straight-alpha averaging bug again, in its other common disguise.
+  const b = createBuffer(16, 16);
+  for (let y = 4; y < 12; y++) for (let x = 4; x < 12; x++) setPixel(b, x, y, [255, 40, 40, 255]);
+  gaussianBlur(b, { radius: 3 });
+  let worstRed = 255;
+  for (let y = 0; y < 16; y++) {
+    for (let x = 0; x < 16; x++) {
+      const p = px(b, x, y);
+      if (p[3] > 30) worstRed = Math.min(worstRed, p[0]);
+    }
+  }
+  assert.ok(worstRed > 200, `the softened edge stayed red (darkest R ${worstRed})`);
+});
+
+check("sharpen raises local contrast at an edge", () => {
+  const b = createBuffer(16, 1);
+  for (let x = 0; x < 16; x++) setPixel(b, x, 0, x < 8 ? [90, 90, 90, 255] : [160, 160, 160, 255]);
+  const before = px(b, 8, 0)[0] - px(b, 7, 0)[0];
+  sharpen(b, { amount: 1.5, radius: 2 });
+  assert.ok(px(b, 8, 0)[0] - px(b, 7, 0)[0] > before, "the step got steeper");
+});
+
+check("offset wraps, and offsetting all the way round is a no-op", () => {
+  const b = createBuffer(8, 4);
+  setPixel(b, 0, 0, [1, 2, 3, 255]);
+  offset(b, { dx: 3, dy: 1 });
+  assert.deepEqual(px(b, 3, 1), [1, 2, 3, 255]);
+  offset(b, { dx: 5, dy: 3 });
+  assert.deepEqual(px(b, 0, 0), [1, 2, 3, 255], "back where it started");
+});
+
+check("offset by half the size puts the tiling seam in the middle", () => {
+  const b = createBuffer(8, 8, [10, 10, 10, 255]);
+  for (let y = 0; y < 8; y++) setPixel(b, 0, y, [250, 250, 250, 255]); // the seam column
+  offset(b, { dx: 4, dy: 0 });
+  assert.equal(px(b, 4, 3)[0], 250, "the edge column is now central and paintable");
+  assert.equal(px(b, 0, 3)[0], 10);
+});
+
+check("normal from height produces a unit-ish normal, flat where the height is flat", () => {
+  const flat = createBuffer(8, 8, [128, 128, 128, 255]);
+  normalFromHeight(flat, { strength: 2 });
+  const p = px(flat, 4, 4);
+  assert.ok(Math.abs(p[0] - 128) <= 2 && Math.abs(p[1] - 128) <= 2, `flat normal points up (${p.join()})`);
+  assert.ok(p[2] > 240, `and its Z is near +1 (${p[2]})`);
+  assert.equal(p[3], 255);
+
+  const ramp = createBuffer(16, 16);
+  for (let y = 0; y < 16; y++) for (let x = 0; x < 16; x++) setPixel(ramp, x, y, [x * 16, x * 16, x * 16, 255]);
+  normalFromHeight(ramp, { strength: 4, wrap: false });
+  assert.ok(px(ramp, 8, 8)[0] < 120, "a slope along X tilts the normal in X");
+});
+
+check("normal from height flips green for the DirectX convention", () => {
+  const make = () => {
+    const b = createBuffer(16, 16);
+    for (let y = 0; y < 16; y++) for (let x = 0; x < 16; x++) setPixel(b, x, y, [y * 16, y * 16, y * 16, 255]);
+    return b;
+  };
+  const gl = make();
+  const dx = make();
+  normalFromHeight(gl, { strength: 4, wrap: false, invertY: false });
+  normalFromHeight(dx, { strength: 4, wrap: false, invertY: true });
+  assert.ok(Math.abs(px(gl, 8, 8)[1] - 128) > 5, "the ramp really does tilt Y");
+  assert.ok((px(gl, 8, 8)[1] - 128) * (px(dx, 8, 8)[1] - 128) < 0, "and the two conventions disagree in sign");
+});
+
+check("noise is deterministic for a seed and different across seeds", () => {
+  const a = createBuffer(8, 8, [128, 128, 128, 255]);
+  const b = createBuffer(8, 8, [128, 128, 128, 255]);
+  const c = createBuffer(8, 8, [128, 128, 128, 255]);
+  noise(a, { amount: 0.5, seed: 7 });
+  noise(b, { amount: 0.5, seed: 7 });
+  noise(c, { amount: 0.5, seed: 8 });
+  assert.deepEqual(Array.from(a.data), Array.from(b.data), "same seed, same grain");
+  assert.notDeepEqual(Array.from(a.data), Array.from(c.data));
+});
+
+check("median removes a lone speckle but keeps a solid edge", () => {
+  const b = createBuffer(8, 8, [100, 100, 100, 255]);
+  setPixel(b, 4, 4, [255, 255, 255, 255]);
+  median(b, {});
+  assert.equal(px(b, 4, 4)[0], 100, "the speckle is gone");
+
+  const edge = createBuffer(8, 8, [0, 0, 0, 255]);
+  for (let y = 0; y < 8; y++) for (let x = 4; x < 8; x++) setPixel(edge, x, y, [255, 255, 255, 255]);
+  median(edge, {});
+  assert.equal(px(edge, 5, 4)[0], 255, "the edge survived");
+  assert.equal(px(edge, 2, 4)[0], 0);
+});
+
+console.log("\nchannels");
+
+check("swizzle rearranges channels and can invert them", () => {
+  const b = createBuffer(1, 1);
+  setPixel(b, 0, 0, [10, 20, 30, 40]);
+  swizzle(b, { r: "b", g: "r", b: "g", a: "a" });
+  assert.deepEqual(px(b, 0, 0), [30, 10, 20, 40]);
+  swizzle(b, {}, { invert: { r: true } });
+  assert.equal(px(b, 0, 0)[0], 225);
+});
+
+check("swizzle reads all four sources at once, not one at a time", () => {
+  // The trap: writing r first and then reading it back for g. Swapping two
+  // channels has to work.
+  const b = createBuffer(1, 1);
+  setPixel(b, 0, 0, [10, 200, 0, 255]);
+  swizzle(b, { r: "g", g: "r" });
+  assert.deepEqual(px(b, 0, 0).slice(0, 2), [200, 10]);
+});
+
+check("packChannels builds one map from four sources", () => {
+  const rough = createBuffer(4, 4, [60, 60, 60, 255]);
+  const metal = createBuffer(4, 4, [200, 200, 200, 255]);
+  const ao = createBuffer(4, 4, [30, 30, 30, 255]);
+  const packed = packChannels({
+    width: 4,
+    height: 4,
+    channels: {
+      r: { buffer: rough, source: "luminance" },
+      g: { buffer: metal, source: "luminance" },
+      b: { buffer: ao, source: "luminance" },
+      a: { constant: 255 },
+    },
+  });
+  const p = px(packed, 2, 2);
+  assert.ok(Math.abs(p[0] - 60) <= 1 && Math.abs(p[1] - 200) <= 1 && Math.abs(p[2] - 30) <= 1, p.join());
+  assert.equal(p[3], 255);
+});
+
+check("packChannels resamples mismatched sources instead of refusing them", () => {
+  const big = createBuffer(8, 8, [255, 255, 255, 255]);
+  const small = createBuffer(2, 2, [128, 128, 128, 255]);
+  const packed = packChannels({
+    width: 8,
+    height: 8,
+    channels: { r: { buffer: big, source: "luminance" }, g: { buffer: small, source: "luminance" } },
+  });
+  assert.equal(packed.width, 8);
+  assert.ok(Math.abs(px(packed, 6, 6)[1] - 128) <= 2, "the 2x2 source was scaled up");
+});
+
+check("packChannels uses a constant for an absent source", () => {
+  const packed = packChannels({ width: 2, height: 2, channels: { g: { constant: 90 } } });
+  assert.deepEqual(px(packed, 0, 0), [0, 90, 0, 255]);
+});
+
+check("splitChannels round-trips through packChannels", () => {
+  const source = createBuffer(4, 4);
+  for (let i = 0; i < 16; i++) {
+    source.data[i * 4] = i * 3;
+    source.data[i * 4 + 1] = 255 - i * 3;
+    source.data[i * 4 + 2] = i * 7;
+    source.data[i * 4 + 3] = 200;
+  }
+  const parts = splitChannels(source);
+  const rebuilt = packChannels({
+    width: 4,
+    height: 4,
+    channels: {
+      r: { buffer: parts.r, source: "r" },
+      g: { buffer: parts.g, source: "r" },
+      b: { buffer: parts.b, source: "r" },
+      a: { buffer: parts.a, source: "r" },
+    },
+  });
+  assert.deepEqual(Array.from(rebuilt.data), Array.from(source.data));
+});
+
+check("premultiply and unpremultiply invert each other away from alpha 0", () => {
+  const b = createBuffer(1, 1, [200, 100, 50, 128]);
+  premultiply(b);
+  assert.ok(px(b, 0, 0)[0] < 110, "colour was scaled down");
+  unpremultiply(b);
+  const p = px(b, 0, 0);
+  assert.ok(Math.abs(p[0] - 200) <= 3 && Math.abs(p[1] - 100) <= 3, p.join());
+});
+
+check("alphaFromLuminance turns a white background into transparency", () => {
+  const b = createBuffer(2, 1);
+  setPixel(b, 0, 0, [255, 255, 255, 255]);
+  setPixel(b, 1, 0, [0, 0, 0, 255]);
+  alphaFromLuminance(b, { invert: true });
+  assert.equal(px(b, 0, 0)[3], 0, "white became transparent");
+  assert.equal(px(b, 1, 0)[3], 255);
+});
+
+check("fillChannel can force a texture opaque", () => {
+  const b = createBuffer(2, 2, [10, 10, 10, 0]);
+  fillChannel(b, "a", 255);
+  assert.equal(px(b, 0, 0)[3], 255);
+});
+
+check("alpha bleed fills transparent texels with neighbouring colour, alpha untouched", () => {
+  const b = createBuffer(8, 8);
+  for (let y = 3; y < 5; y++) for (let x = 3; x < 5; x++) setPixel(b, x, y, [255, 40, 40, 255]);
+  bleedAlpha(b, { distance: 2 });
+  const p = px(b, 2, 3);
+  assert.ok(p[0] > 200 && p[1] < 80, `the border took the sprite's colour (${p.join()})`);
+  assert.equal(p[3], 0, "and stayed invisible");
+});
+
+console.log("\ndocument trimming");
+
+check("trim crops to the opaque content and reports the kept rectangle", () => {
+  const doc = createDocument({ width: 16, height: 16 });
+  for (let y = 4; y < 9; y++) for (let x = 5; x < 11; x++) setPixel(doc.layers[0].buffer, x, y, [1, 2, 3, 255]);
+  const kept = trimDocument(doc);
+  assert.deepEqual(kept, { x: 5, y: 4, width: 6, height: 5 });
+  assert.equal(doc.width, 6);
+  assert.equal(doc.height, 5);
+  assert.deepEqual(px(doc.layers[0].buffer, 0, 0), [1, 2, 3, 255]);
+});
+
+check("trim measures the FLATTENED document, not one layer", () => {
+  // Trimming to the active layer's extent would cut away everything below it.
+  const doc = createDocument({ width: 16, height: 16 });
+  setPixel(doc.layers[0].buffer, 1, 1, [9, 9, 9, 255]);
+  const top = addLayer(doc, { name: "Top" });
+  setPixel(top.buffer, 12, 12, [8, 8, 8, 255]);
+  const kept = trimDocument(doc);
+  assert.deepEqual(kept, { x: 1, y: 1, width: 12, height: 12 });
+});
+
+check("trim on a full or empty document does nothing rather than something odd", () => {
+  const full = createDocument({ width: 8, height: 8, background: [1, 1, 1, 255] });
+  assert.equal(trimDocument(full), null);
+  assert.equal(full.width, 8);
+  const empty = createDocument({ width: 8, height: 8 });
+  assert.equal(trimDocument(empty), null);
+  assert.equal(empty.width, 8, "an empty document is not collapsed to nothing");
 });
 
 console.log(`\n${passes} passed, ${failures} failed\n`);

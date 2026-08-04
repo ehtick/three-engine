@@ -154,6 +154,27 @@ export async function createTextureAsset(dirPath, fileName, {
   return { path, doc };
 }
 
+/**
+ * Merges keys into a texture's `.meta` sidecar, creating it if absent.
+ *
+ * Used to mark a generated map as linear-space data. A packed
+ * roughness/metal/AO texture read as sRGB is wrong everywhere it is sampled,
+ * and the symptom — "my roughness looks washed out" — points at the material,
+ * not at the import setting that caused it.
+ */
+export async function writeTextureMeta(path, patch) {
+  let existing = {};
+  try {
+    existing = JSON.parse(await invoke("read_text_file", { path: `${path}.meta` })) ?? {};
+  } catch {
+    existing = {};
+  }
+  await invoke("save_scene", {
+    path: `${path}.meta`,
+    contents: JSON.stringify({ ...existing, ...patch }, null, 2),
+  });
+}
+
 /** Reads an image into a PixelBuffer without any document machinery — used by
  *  the atlas builder and by "place image as a layer". */
 export async function readImageBuffer(path) {

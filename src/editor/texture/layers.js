@@ -18,8 +18,11 @@ import {
   cloneBuffer,
   createBuffer,
   cropBuffer,
+  flipBuffer,
+  opaqueBounds,
   resizeBuffer,
   resizeCanvas,
+  rotateBuffer,
 } from "./pixels.js";
 
 /**
@@ -235,6 +238,57 @@ export function cropDocument(doc, x, y, width, height) {
   doc.width = doc.layers[0].buffer.width;
   doc.height = doc.layers[0].buffer.height;
   return doc;
+}
+
+/**
+ * Bakes every layer's non-destructive offset into its pixels.
+ *
+ * Anything that changes the document's shape has to do this first: an offset is
+ * a vector in document space, and there is no correct way to carry "shifted 12
+ * right" through a 90° rotation without deciding whether it means 12 right or
+ * 12 down. Baking answers the question by making it moot.
+ */
+export function bakeOffsets(doc) {
+  for (const layer of doc.layers) {
+    const [x, y] = layer.offset;
+    if (!x && !y) continue;
+    layer.buffer = resizeCanvas(layer.buffer, doc.width, doc.height, x, y);
+    layer.offset = [0, 0];
+  }
+  return doc;
+}
+
+export function flipDocument(doc, axis) {
+  bakeOffsets(doc);
+  for (const layer of doc.layers) layer.buffer = flipBuffer(layer.buffer, axis);
+  return doc;
+}
+
+export function rotateDocument(doc, turns) {
+  bakeOffsets(doc);
+  for (const layer of doc.layers) layer.buffer = rotateBuffer(layer.buffer, turns);
+  doc.width = doc.layers[0].buffer.width;
+  doc.height = doc.layers[0].buffer.height;
+  return doc;
+}
+
+/**
+ * Crops away the fully transparent border.
+ *
+ * Measured against the FLATTENED document, not the active layer: trimming to
+ * one layer's extent would silently cut off everything the layers below it
+ * cover. Returns the rectangle that was kept, or null when there was nothing to
+ * trim (or nothing opaque at all — trimming an empty document to a 1×1 is not
+ * a useful interpretation of the request).
+ */
+export function trimDocument(doc, { threshold = 0 } = {}) {
+  const bounds = opaqueBounds(compositeLayers(doc.layers, doc.width, doc.height), threshold);
+  if (!bounds) return null;
+  if (bounds.x === 0 && bounds.y === 0 && bounds.width === doc.width && bounds.height === doc.height) {
+    return null;
+  }
+  cropDocument(doc, bounds.x, bounds.y, bounds.width, bounds.height);
+  return bounds;
 }
 
 /** Masks are a single channel, so they get their own tiny resamplers rather

@@ -40,8 +40,19 @@ import { NEW_TEXTURE_EVENT, consumeNewTextureRequest } from "../textureEditorReq
 import {
   createTextureAsset,
   openTextureDocument,
+  readImageBuffer,
   saveTextureDocument,
+  writeTextureMeta,
 } from "../textureFile.js";
+import {
+  CanvasSizeDialog,
+  OperationDialog,
+  OperationMenus,
+  PackChannelsDialog,
+  ResizeDialog,
+  SwizzleDialog,
+  anchorOffset,
+} from "./TextureOps.jsx";
 import { bufferToImageData } from "../texture/codecPng.js";
 import { BLEND_MODES, compositeLayers, blendInto } from "../texture/blend.js";
 import {
@@ -56,12 +67,31 @@ import {
   activeLayer as findActiveLayer,
   addLayer,
   cloneDocument,
+  cropDocument,
+  documentFromBuffer,
   duplicateLayer,
+  flipDocument,
   getLayer,
   mergeDown,
   removeLayer,
   reorderLayer,
+  resampleDocument,
+  resizeDocumentCanvas,
+  rotateDocument,
+  trimDocument,
 } from "../texture/layers.js";
+import { adjustmentById, defaultParams } from "../texture/adjust.js";
+import { filterById } from "../texture/filters.js";
+import {
+  alphaFromLuminance,
+  bleedAlpha,
+  fillChannel,
+  packChannels,
+  premultiply,
+  splitChannels,
+  swizzle,
+  unpremultiply,
+} from "../texture/channels.js";
 import {
   applyStroke,
   createStroke,
@@ -81,6 +111,7 @@ import {
   isSelectionEmpty,
   polygonSelection,
   rectSelection,
+  selectionBounds,
   wandSelection,
 } from "../texture/selection.js";
 import {
@@ -362,6 +393,71 @@ function TextureWorkspace({ path, onPathChange }) {
     }
   }, [path, saving]);
 
+  // --- operations (Image / Adjust / Filter / Channels) --------------------
+
+  /**
+   * Runs a pixel operation on the active layer as ONE undo step.
+   *
+   * The whole layer is captured rather than a rectangle, because an adjustment
+   * or a filter can touch anything — but only for these operations, which are
+   * occasional. Strokes must never take this path (see history.js).
+   */
+  const runOnLayer = useCallback(
+    (label, fn, { preview = false, base = null } = {}) => {
+      const d = docRef.current;
+      const target = d ? findActiveLayer(d) : null;
+      if (!target) return false;
+      if (target.locked) {
+        pushToast({ title: "That layer is locked" });
+        return false;
+      }
+      const rect = { x0: 0, y0: 0, x1: d.width, y1: d.height };
+      // Restore BEFORE capturing the undo state. A dialog has been writing
+      // previews into this layer; capturing first would record the last preview
+      // as the "before", so undo would return to a state the user never chose.
+      if (base) target.buffer.data.set(base.data);
+      const before = preview ? null : captureRegion(target.buffer, rect);
+      fn(target.buffer, selectionRef.current);
+      if (!preview) pushHistory(regionEntry(target.buffer, rect, before, label));
+      markEdited(null);
+      return true;
+    },
+    [pushHistory, markEdited],
+  );
+
+  // A dialog previews by writing into the live layer, so it holds the layer's
+  // pre-dialog pixels and restores them on every parameter change — and on
+  // Cancel. Previewing on a copy and swapping at the end would be tidier and
+  // would mean the preview isn't what gets applied.
+  const [operation, setOperation] = useState(null);
+
+  const openOperation = useCallback((next) => {
+    const d = docRef.current;
+    const target = d ? findActiveLayer(d) : null;
+    if (!target) return;
+    if (target.locked) {
+      pushToast({ title: "That layer is locked" });
+      return;
+    }
+    setOperation({ ...next, base: cloneBuffer(target.buffer) });
+  }, []);
+
+  const closeOperation = useCallback(
+    (restore) => {
+      setOperation((current) => {
+        if (current?.base && restore) {
+          const target = findActiveLayer(docRef.current);
+          if (target) {
+            target.buffer.data.set(current.base.data);
+            markEdited(null);
+          }
+        }
+        return null;
+      });
+    },
+    [markEdited],
+  );
+
   // --- selection ---------------------------------------------------------
   const setSelection = useCallback((mask) => {
     selectionRef.current = mask && isSelectionEmpty(mask) ? null : mask;
@@ -380,6 +476,138 @@ function TextureWorkspace({ path, onPathChange }) {
     if (!d) return;
     setSelection(invertSelection(selectionRef.current, d.width, d.height));
   }, [setSelection]);
+
+  // --- the operation menus -----------------------------------------------
+  const [dialog, setDialog] = useState(null);
+
+  const runCommand = useCallback(
+    (kind, payload) => {
+      const d = docRef.current;
+      if (!d) return;
+      switch (kind) {
+        case "resize":
+        case "canvas":
+        case "pack":
+        case "swizzle":
+          setDialog({ kind });
+          return;
+        case "adjust":
+        case "filter": {
+          const spec = kind === "adjust" ? adjustmentById(payload) : filterById(payload);
+          if (!spec) return;
+          if (!spec.params.length) {
+            runOnLayer(spec.label, (buffer, selection) =>
+              spec.apply(buffer, defaultParams(spec), spec.wholeLayer ? null : selection),
+            );
+            return;
+          }
+          openOperation({ kind, spec });
+          return;
+        }
+        case "flip":
+          withDocumentSnapshot(payload === "vertical" ? "Flip Vertical" : "Flip Horizontal", (doc) =>
+            flipDocument(doc, payload),
+          );
+          return;
+        case "rotate":
+          withDocumentSnapshot("Rotate", (doc) => rotateDocument(doc, payload));
+          deselect();
+          return;
+        case "trim": {
+          let kept = null;
+          withDocumentSnapshot("Trim", (doc) => {
+            kept = trimDocument(doc);
+          });
+          deselect();
+          pushToast({
+            title: kept ? `Trimmed to ${kept.width} × ${kept.height}` : "Nothing to trim",
+          });
+          return;
+        }
+        case "cropToSelection": {
+          const bounds = selectionRef.current
+            ? selectionBounds(selectionRef.current, d.width, d.height)
+            : null;
+          if (!bounds) {
+            pushToast({ title: "Make a selection first" });
+            return;
+          }
+          withDocumentSnapshot("Crop", (doc) => cropDocument(doc, bounds.x, bounds.y, bounds.width, bounds.height));
+          deselect();
+          return;
+        }
+        case "split":
+          withDocumentSnapshot("Split Channels", (doc) => {
+            const source = findActiveLayer(doc);
+            if (!source) return;
+            const parts = splitChannels(source.buffer);
+            // Only the first is left visible: four stacked opaque greyscale
+            // layers would show nothing but the top one, which reads as the
+            // command having done something wrong.
+            for (const name of ["r", "g", "b", "a"]) {
+              addLayer(doc, {
+                name: `${source.name} ${name.toUpperCase()}`,
+                buffer: parts[name],
+                visible: name === "r",
+              });
+            }
+          });
+          return;
+        case "alphaFromLuminance":
+          runOnLayer("Alpha from Luminance", (buffer) => alphaFromLuminance(buffer, { invert: !!payload }));
+          return;
+        case "makeOpaque":
+          runOnLayer("Make Opaque", (buffer) => fillChannel(buffer, "a", 255));
+          return;
+        case "bleed":
+          runOnLayer("Bleed Colour", (buffer) => bleedAlpha(buffer, { distance: 4 }));
+          return;
+        case "premultiply":
+          runOnLayer("Premultiply Alpha", (buffer) => premultiply(buffer));
+          return;
+        case "unpremultiply":
+          runOnLayer("Unpremultiply Alpha", (buffer) => unpremultiply(buffer));
+          return;
+        default:
+      }
+    },
+    [runOnLayer, openOperation, withDocumentSnapshot, deselect],
+  );
+
+  /** Pack Channels writes a NEW asset rather than replacing the open document:
+   *  the sources are usually four other files, and silently overwriting whatever
+   *  happened to be open would be the wrong side of destructive. */
+  const packChannelsToAsset = useCallback(
+    async ({ slots, name, width, height }) => {
+      const { currentPath, entries, refresh } = useProjectStore.getState();
+      if (!currentPath) return;
+      try {
+        const channels = {};
+        for (const key of ["r", "g", "b", "a"]) {
+          const slot = slots[key];
+          channels[key] = slot.path
+            ? { buffer: await readImageBuffer(slot.path), source: slot.source, invert: slot.invert }
+            : { constant: slot.constant };
+        }
+        const packed = packChannels({ width, height, channels });
+        const fileName = uniqueName(name.endsWith(".png") ? name : `${name}.png`, entries);
+        const target = `${currentPath.replace(/[\\/]$/, "")}/${fileName}`;
+        await saveTextureDocument(target, documentFromBuffer(packed), { writeSidecar: false });
+        // A packed map is data, not colour — tagging it linear here saves the
+        // "why is my roughness washed out" bug report later.
+        await writeTextureMeta(target, { colorSpace: "linear" });
+        await refresh();
+        setDialog(null);
+        pushToast({ title: `Packed ${fileName}` });
+        useSelectionStore.getState().selectAsset(target);
+        onPathChange(target);
+      } catch (error) {
+        console.error(error);
+        pushToast({ level: "error", title: "Pack failed", detail: String(error?.message ?? error) });
+      }
+    },
+    [onPathChange],
+  );
 
   // --- keyboard ----------------------------------------------------------
   const rootRef = useRef(null);
@@ -503,6 +731,12 @@ function TextureWorkspace({ path, onPathChange }) {
         <button className="toolbar-btn icon-only" title="Redo (Ctrl+Shift+Z)" onClick={redo}>
           <Redo2 size={14} />
         </button>
+        <span className="toolbar-sep" />
+        <OperationMenus
+          onCommand={runCommand}
+          hasSelection={!!selectionRef.current}
+          disabled={status !== "ready"}
+        />
         <span className="toolbar-sep" />
         <button
           className={`toolbar-btn icon-only ${tiling ? "active" : ""}`}
@@ -643,6 +877,70 @@ function TextureWorkspace({ path, onPathChange }) {
       <StatusBar doc={doc} historyRef={historyRef} version={version} />
 
       {showNew && <NewTextureDialog onCancel={() => setShowNew(false)} onCreate={createNew} />}
+
+      {operation && (
+        <OperationDialog
+          spec={operation.spec}
+          docSize={{ width: doc?.width ?? 0, height: doc?.height ?? 0 }}
+          onPreview={(params) =>
+            runOnLayer(operation.spec.label, (buffer, selection) =>
+              operation.spec.apply(buffer, params, operation.spec.wholeLayer ? null : selection),
+            { preview: true, base: operation.base })
+          }
+          onApply={(params) => {
+            // Applied from the ORIGINAL pixels, not on top of the preview —
+            // otherwise a blur previewed three times is applied three times.
+            runOnLayer(operation.spec.label, (buffer, selection) =>
+              operation.spec.apply(buffer, params, operation.spec.wholeLayer ? null : selection),
+            { base: operation.base });
+            closeOperation(false);
+          }}
+          onCancel={() => closeOperation(true)}
+        />
+      )}
+
+      {dialog?.kind === "resize" && (
+        <ResizeDialog
+          docSize={{ width: doc.width, height: doc.height }}
+          onCancel={() => setDialog(null)}
+          onApply={({ width, height, filter }) => {
+            withDocumentSnapshot("Resize Image", (d) => resampleDocument(d, width, height, { filter }));
+            deselect();
+            setDialog(null);
+          }}
+        />
+      )}
+
+      {dialog?.kind === "canvas" && (
+        <CanvasSizeDialog
+          docSize={{ width: doc.width, height: doc.height }}
+          onCancel={() => setDialog(null)}
+          onApply={({ width, height, anchor }) => {
+            const offset = anchorOffset(anchor, { width: doc.width, height: doc.height }, { width, height });
+            withDocumentSnapshot("Canvas Size", (d) => resizeDocumentCanvas(d, width, height, offset.x, offset.y));
+            deselect();
+            setDialog(null);
+          }}
+        />
+      )}
+
+      {dialog?.kind === "swizzle" && (
+        <SwizzleDialog
+          onCancel={() => setDialog(null)}
+          onApply={({ mapping, invert: inverted }) => {
+            runOnLayer("Swizzle Channels", (buffer) => swizzle(buffer, mapping, { invert: inverted }));
+            setDialog(null);
+          }}
+        />
+      )}
+
+      {dialog?.kind === "pack" && (
+        <PackChannelsDialog
+          docSize={{ width: doc.width, height: doc.height }}
+          onCancel={() => setDialog(null)}
+          onApply={packChannelsToAsset}
+        />
+      )}
     </div>
   );
 }

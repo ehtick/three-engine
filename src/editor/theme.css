@@ -9518,3 +9518,107 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
   gap: 6px;
   margin-top: 4px;
 }
+
+/* --- Texture Editor: operation dialogs (Image / Adjust / Filter / Channels) --- */
+
+.texture-dialog.wide {
+  width: 400px;
+}
+
+.texture-dialog-note {
+  margin: 0;
+  font-size: 11px;
+  color: var(--text-dim);
+  line-height: 1.45;
+}
+
+.texture-dialog-busy {
+  color: var(--text-dim);
+  font-weight: 400;
+}
+
+.texture-param {
+  display: grid;
+  grid-template-columns: 96px 1fr 62px;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.texture-param input[type="range"] {
+  width: 100%;
+}
+
+.texture-anchor-label {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.texture-anchor-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 26px);
+  gap: 3px;
+}
+
+.texture-anchor {
+  width: 26px;
+  height: 26px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--fill-1);
+  cursor: pointer;
+  transition: background-color 0.12s var(--ease), border-color 0.12s var(--ease);
+}
+
+.texture-anchor:hover {
+  background: var(--fill-2);
+}
+
+.texture-anchor.active {
+  background: var(--accent-soft);
+  border-color: var(--accent-ring);
+}
+
+.texture-pack-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.texture-pack-field {
+  flex: 1;
+  min-width: 0;
+}
+
+.texture-pack-row select {
+  width: 96px;
+  flex-shrink: 0;
+}
+
+.texture-pack-row input[type="number"] {
+  width: 64px;
+  flex-shrink: 0;
+}
+
+.texture-pack-row .texture-check {
+  flex-shrink: 0;
+}
+
+/* Channel chips: the colour IS the label, so a packing dialog can be read
+ * at a glance rather than by matching four rows of text. */
+.texture-pack-chip {
+  width: 54px;
+  flex-shrink: 0;
+  padding: 3px 6px;
+  border-radius: 5px;
+  font-size: 10.5px;
+  font-weight: 600;
+  text-align: center;
+  color: #0d0e11;
+}
+
+.texture-pack-chip.ch-r { background: #ff6b6b; }
+.texture-pack-chip.ch-g { background: #6bd97f; }
+.texture-pack-chip.ch-b { background: #6ba8ff; }
+.texture-pack-chip.ch-a { background: #cfd2d8; }
