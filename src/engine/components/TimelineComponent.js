@@ -319,6 +319,8 @@ export class TimelineComponent extends Component {
     }
     this._firstAdvance = false;
 
+    if (wrapped) this.emit("looped");
+
     if (finished) {
       // "once" reverts what it animated, "hold" leaves the last frame standing.
       // The distinction matters: a door that swings open wants hold, a camera
@@ -327,6 +329,7 @@ export class TimelineComponent extends Component {
       if (this.props.wrapMode !== "hold") this.runtime.unbind();
       engine.emit("timeline-finished", { entity: this.entity, name: this.props.asset });
       this.entity.getComponent("script")?.dispatch?.("onTimelineFinished", this.props.asset);
+      this.emit("finished");
     }
   }
 }

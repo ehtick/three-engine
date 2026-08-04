@@ -1,5 +1,6 @@
 import * as THREE from "three/webgpu";
 import { getEntityBoundingSphere } from "../viewFrustum.js";
+import { EventEmitter } from "../EventEmitter.js";
 
 const _scratchSphere = new THREE.Sphere();
 
@@ -72,6 +73,10 @@ function installPropAccessors(component) {
  *                          min?, max?, step?, options? }]
  * and may override onAttach/onDetach/onPropChanged.
  *
+ * Constructed with just `props` — `new MeshComponent({ geometry: "sphere" })`
+ * — and has no entity until `Entity.addComponent` attaches it (`onAttach()`
+ * runs at that point, not in the constructor).
+ *
  * Subclasses may also set:
  *   static tags       — short string array of free-form editor tags, used by
  *                       the Modules panel to filter / group components
@@ -94,8 +99,15 @@ function installPropAccessors(component) {
  * To opt into enabled, subclasses override `onDisable()` / `onEnable()`.
  * To opt into viewOnly, subclasses gate their `#tick` / per-frame work
  * behind `this.isInView()` (or `if (!this.viewOnly || this.isInView())`).
+ *
+ * Extends `EventEmitter` for local, per-instance pub-sub — every component
+ * gets `changed`/`destroyed` for free (see `ComponentEventMap` in
+ * engine.d.ts), fired from `setProp` and `Entity.removeComponent` below. A
+ * subclass with its own events (e.g. `TimelineComponent`'s `finished`)
+ * just calls `this.emit(...)`; its own `.d.ts` interface types the payload
+ * via `ComponentBase<Props, OwnEventMap>`.
  */
-export class Component {
+export class Component extends EventEmitter {
   // Default: no tags. Subclasses override with a string array (e.g.
   // `static tags = ["physics", "play-mode"]`). Pure editor metadata; the
   // runtime never reads this. Defined on the base class so reading
@@ -111,8 +123,12 @@ export class Component {
   // next Play starts from a clean slate.
   static resetOnStop = false;
 
-  constructor(entity, props = {}) {
-    this.entity = entity;
+  constructor(props = {}) {
+    super();
+    // Set by `Entity.addComponent` when this instance is attached — a
+    // component can now be constructed standalone (`new MeshComponent(props)`)
+    // before it has anywhere to live.
+    this.entity = null;
     // `enabled` lives outside the subclass `defaults` spread so it's always
     // present even if a subclass forgets to declare it. Subclasses that want
     // to hide it from the inspector schema simply don't add it to `schema`.
@@ -265,6 +281,7 @@ export class Component {
           key,
         });
         engine?.emit?.("hierarchy-changed");
+        this.emit("changed", key);
       }
       return;
     }
@@ -282,6 +299,7 @@ export class Component {
         componentType: this.type,
         key,
       });
+      this.emit("changed", key);
       return;
     }
     this.props[key] = value;
@@ -294,6 +312,8 @@ export class Component {
     //     so the React mirror re-reads the entity's props and controlled
     //     inputs (camera's follow checkboxes, show-preview toggle, …)
     //     reflect the latest value instead of going stale.
+    // "changed" is the local, per-instance equivalent for scripts/other
+    // components listening on THIS component specifically.
     const engine = this.entity?.engine;
     engine?.emit?.("component-changed", {
       entityId: this.entity?.id,
@@ -301,6 +321,7 @@ export class Component {
       key,
     });
     engine?.emit?.("hierarchy-changed");
+    this.emit("changed", key);
   }
 
   toJSON() {

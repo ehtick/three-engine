@@ -388,6 +388,9 @@ export class Entity extends EventEmitter {
     // Internal-only bookkeeping, deliberately absent from the public Engine
     // surface in engine.d.ts.
     /** @type {any} */ (this.engine).viewOnlyComponents?.delete(component);
+    // The ONE place a component is permanently gone (not the internal
+    // detach/attach a default onPropChanged rebuild does) — see Component.js.
+    component.emit("destroyed");
   }
 
   /**

@@ -16,7 +16,15 @@
 // Both are needed: for a long time the types described nine three classes while
 // the runtime exposed twenty-eight, and neither check existed to notice.
 
-import { Script, attribute, MeshComponent, CameraComponent, CharacterControllerComponent } from "engine";
+import {
+  Script,
+  attribute,
+  MeshComponent,
+  CameraComponent,
+  CharacterControllerComponent,
+  TimelineComponent,
+  AnimationComponent,
+} from "engine";
 import * as THREE from "three/webgpu";
 
 // `EntityEventMap` is empty out of the box (ad-hoc, game-authored events) —
@@ -52,6 +60,7 @@ export default class Player extends Script {
   private _offPlayChanged: (() => void) | null = null;
   private _offActionPressed: (() => void) | null = null;
   private _offDamaged: (() => void) | null = null;
+  private _offTimelineFinished: (() => void) | null = null;
 
   onStart() {
     // this.entity — typed as Entity with transform aliases.
@@ -316,6 +325,27 @@ export default class Player extends Script {
     const other = this.engine.createEntity({ name: "Other" });
     other.on("damaged", () => {});
     other.emit("damaged", 99);
+
+    // 10. Every component gets `changed`/`destroyed` for free via
+    //     ComponentEventMap, and a component with its own events (Timeline,
+    //     Animation) merges them in through ComponentBase's 2nd type param.
+    const timeline = this.entity.getComponent(TimelineComponent);
+    this._offTimelineFinished = timeline?.on("finished", () => {}) ?? null;
+    timeline?.on("looped", () => {});
+    // "changed"/"destroyed" also work on a component with its own map —
+    // ComponentEventMap and the component-specific map merge, not replace.
+    timeline?.on("changed", (key) => {
+      const k: string = key;
+      void k;
+    });
+    timeline?.on("destroyed", () => {});
+
+    const anim = this.entity.getComponent(AnimationComponent);
+    anim?.on("state-changed", (state, previous) => {
+      const s: string | null = state;
+      const p: string | null = previous;
+      void s; void p;
+    });
   }
 
   onUpdate(dt: number) {
@@ -333,9 +363,11 @@ export default class Player extends Script {
     this._offPlayChanged?.();
     this._offActionPressed?.();
     this._offDamaged?.();
+    this._offTimelineFinished?.();
     this._offPlayChanged = null;
     this._offActionPressed = null;
     this._offDamaged = null;
+    this._offTimelineFinished = null;
   }
 
   onHotReload(oldInstance: Script) {

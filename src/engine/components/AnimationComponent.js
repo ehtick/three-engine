@@ -233,6 +233,7 @@ export class AnimationComponent extends Component {
     if (!this.runtime) return;
     const playing = this.entity.engine.playing;
     if (!playing && !this.props.playInEditor) return;
+    const before = this.currentState;
     this.runtime.update(dt);
     // The extractor always runs (it is what keeps the pose in place), but the
     // entity only MOVES while playing. Otherwise scrubbing a walk cycle in the
@@ -240,5 +241,11 @@ export class AnimationComponent extends Component {
     if (playing && this.props.rootMotionTarget !== "script") {
       this.runtime.rootMotion?.applyTo(this.entity.object3D);
     }
+    // The state machine transitions inside `runtime.update` above — diffing
+    // before/after here (rather than hooking the graph itself) keeps this
+    // local to the component and covers every transition source (params,
+    // triggers, auto-transitions) uniformly.
+    const after = this.currentState;
+    if (after !== before) this.emit("state-changed", after, before);
   }
 }

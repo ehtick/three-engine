@@ -318,11 +318,30 @@ declare module "engine" {
   type ComponentReservedKeys = "entity" | "type" | "props" | "enabled" | "viewOnly";
 
   /**
+   * Events every component gets for free, fired by the base `Component`
+   * class itself (`src/engine/components/Component.js`) — local, per-
+   * instance pub-sub via `entity.getComponent(X).on("changed", ...)`,
+   * separate from the global `engine.on("component-changed", ...)`.
+   * A component with its OWN events (e.g. `TimelineComponent`'s `finished`)
+   * merges them in through `ComponentBase`'s second type param rather than
+   * touching this interface — see `TimelineComponent` for an example.
+   */
+  export interface ComponentEventMap {
+    /** A prop changed via `setProp` (includes the `enabled`/`viewOnly` meta-toggles). */
+    changed: [key: string];
+    /** Permanently removed from its entity — NOT fired by an internal `onPropChanged` rebuild (detach+attach), only by `Entity.removeComponent`. */
+    destroyed: [];
+  }
+
+  /**
    * Base shape every component exposes. Authored props in `P` are mirrored on
    * the instance for direct get/set (`light.intensity = 2`), matching the
    * runtime accessors installed by `Component`. Writes go through `setProp`.
+   * `on`/`once`/`off`/`emit`/... come from `TypedEmitter<ComponentEventMap
+   * & E>` — every component gets `changed`/`destroyed`; pass `E` for a
+   * component's own additional events.
    */
-  export type ComponentBase<P extends object = object> = {
+  export type ComponentBase<P extends object = object, E extends object = {}> = {
     entity: Entity;
     /** The registered type string (e.g. `"mesh"`, `"charactercontroller"`). */
     type: string;
@@ -333,7 +352,7 @@ declare module "engine" {
     props: P & { enabled?: boolean; viewOnly?: boolean };
     setEnabled(value: boolean): void;
     setProp(key: string, value: unknown): void;
-  } & Omit<P, ComponentReservedKeys>;
+  } & Omit<P, ComponentReservedKeys> & TypedEmitter<ComponentEventMap & E>;
 
   /** `entity.getComponent("model")` / `findComponents("model")`. */
   export interface ModelComponent extends ComponentBase<{
@@ -357,6 +376,9 @@ declare module "engine" {
     rootMotionY: boolean;
     rootMotionRotation: boolean;
     rootBone: string;
+  }, {
+    /** The base-layer (layer 0) state transitioned — from any source: `play()`, params, triggers, or an auto-transition. */
+    "state-changed": [state: string | null, previous: string | null];
   }> {
     /** Name of the currently playing state, or `null` if nothing is playing. */
     readonly currentState: string | null;
@@ -414,6 +436,11 @@ declare module "engine" {
     audio: boolean;
     updateMode: string;
     bindings: Record<string, string>;
+  }, {
+    /** Reached the end (`wrapMode` "once"/"clamp"/"hold"). Local counterpart of the global `engine.on("timeline-finished", ...)`. */
+    finished: [];
+    /** Wrapped around and kept playing (`wrapMode: "loop"`) — fires once per lap. */
+    looped: [];
   }> {
     /** Length of the loaded timeline in seconds (0 before it loads). */
     readonly duration: number;

@@ -8,6 +8,7 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "../src/engine/EventEmitter.js";
 import { Entity } from "../src/engine/Entity.js";
+import { Component } from "../src/engine/components/Component.js";
 
 let failures = 0;
 const check = (name, fn) => {
@@ -223,6 +224,36 @@ check("entity.callFirst works the same way as the base EventEmitter", () => {
   e.on("query", () => null);
   e.on("query", () => 7);
   assert.equal(e.callFirst("query"), 7);
+});
+
+// Component also extends EventEmitter (see the class doc comment in
+// Component.js) — every component gets `changed`/`destroyed` for free,
+// fired from Component.setProp and Entity.removeComponent respectively.
+// A bare, unattached component (entity: null) exercises this fine since
+// setProp's engine-emit calls are all optionally chained.
+check("component.setProp fires local 'changed' with the key", () => {
+  const c = new Component({ enabled: true });
+  const seen = [];
+  c.on("changed", (key) => seen.push(key));
+  c.setProp("enabled", false);
+  c.setProp("viewOnly", true);
+  c.setProp("someProp", 1);
+  assert.deepEqual(seen, ["enabled", "viewOnly", "someProp"]);
+});
+
+check("entity.removeComponent fires 'destroyed' exactly once, not on an internal rebuild", () => {
+  const e = new Entity({}, { name: "Test" });
+  const c = new Component({});
+  let destroyedCalls = 0;
+  c.on("destroyed", () => destroyedCalls++);
+  // Simulate attach without going through the type registry — removeComponent
+  // only needs the entity's `components` Map to hold it under a key.
+  e.components.set("mock", c);
+  // A default onPropChanged rebuild (detach+attach) must NOT fire "destroyed".
+  c.setProp("someProp", 1);
+  assert.equal(destroyedCalls, 0, "an internal rebuild is not a destroy");
+  e.removeComponent("mock");
+  assert.equal(destroyedCalls, 1);
 });
 
 console.log(failures ? `\n${failures} failing` : "\nall events checks passed");
