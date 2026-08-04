@@ -40,6 +40,7 @@ import {
   positionWorld,
   reflect,
   select,
+  smoothstep,
   step,
   texture,
   textureStore,
@@ -435,11 +436,28 @@ export function createGiResolve({ gbuffer, targets, width, height, gather, norma
               // for why), sphere trace as the hatched fallback. Trailing args
               // of the sphere arm default to "no lamp self-exclusion": an
               // analytic light has no body in the field to exclude.
-              lightShadowVars[index].assign(
-                lightShadow.traceDda
-                  ? lightShadow.traceDda(shadowOrigin, dir, maxT, float(1).div(angle))
-                  : lightShadow.trace(shadowOrigin, dir, maxT, float(1).div(angle), cosRayNormal),
-              );
+              const traced = lightShadow.traceDda
+                ? lightShadow.traceDda(shadowOrigin, dir, maxT, float(1).div(angle))
+                : lightShadow.trace(shadowOrigin, dir, maxT, float(1).div(angle), cosRayNormal);
+              if (lightShadow.freeRadius) {
+                // BURIAL GATE — the answer to the surviving white dots (user-
+                // diagnosed: flipped normals + sub-dead-zone leaks, both of
+                // which make a single ray's verdict a lie no upsample can
+                // launder). Ask the record-aware oracle how much free space
+                // the RAY ORIGIN actually has: a receiver buried inside a
+                // canopy (an inverted-normal leaf lifted into its neighbor, a
+                // leaf-on-leaf pocket under the march's protective skip) reads
+                // ~0 and cannot plausibly see the sun — force dark. An open
+                // receiver's lifted origin reads ≈ the full 1.5-voxel lift
+                // (the record-aware near field measures to the fitted plane,
+                // not the bulged voxel AABB) and passes untouched. One near-
+                // field oracle call against an already-bound buffer.
+                const free = float(lightShadow.freeRadius(shadowOrigin)).toVar();
+                const burial = smoothstep(lightShadow.voxMax.mul(0.5), lightShadow.voxMax.mul(1.25), free);
+                lightShadowVars[index].assign(traced.mul(burial));
+              } else {
+                lightShadowVars[index].assign(traced);
+              }
             });
           });
         });

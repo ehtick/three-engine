@@ -1714,12 +1714,26 @@ export class GISystem {
     // refit rescales it with the pyramid. See the resolve's own comment for
     // why the gather's normalOffset is the wrong scale here.
     const vox = vec3(occ.voxel);
-    const lift = vox.x.max(vox.y).max(vox.z).mul(1.5);
+    const voxMax = vox.x.max(vox.y).max(vox.z);
+    const lift = voxMax.mul(1.5);
     return {
       slots: lightSlots,
       lift,
+      voxMax,
       span,
       steps,
+      // BURIAL GATE INPUT (see the resolve's use). RECORD-AWARE is the load-
+      // bearing word: the plain AABB oracle reads ~0 at every lifted origin
+      // (the receiver's own surface voxels bulge up to a voxel above the true
+      // surface), which would dim every floor in the scene — the record-aware
+      // near field returns the TRUE distance to the fitted surface plane, so
+      // an open-ground origin measures ≈ the full lift and stays untouched.
+      // That is also why the gate only exists when records do: without them
+      // (brick-box / legacy modes) it is null and the resolve compiles it out.
+      freeRadius:
+        occ.hasSurfaceRecords === true && occ.freeRadiusAtWorld
+          ? (p) => occ.freeRadiusAtWorld(p, 1, true, null, true)
+          : null,
       // THE MARCHER IS THE TRANSPORT DDA, NOT THE SPHERE TRACE. This is the
       // same retreat the FIELD's sun shadows already made (see the field
       // `lightShadow` closure): sphere-tracing the blurred field tunnels
