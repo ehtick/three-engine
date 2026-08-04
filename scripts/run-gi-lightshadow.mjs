@@ -404,8 +404,13 @@ const checks = [
   ["the accumulator kernel actually dispatched", f.kernelRan > 0 && f.kernelRan % (f.samples || 1) === 0],
   ["the resolve is producing light at all (control)", (f.irradianceMean ?? 0) > 0],
   [
-    `channel ${f.channel} mean is a real shadow pattern (0.02 < mean < 0.98)`,
-    typeof f.mean === "number" && f.mean > 0.02 && f.mean < 0.98,
+    // Low bound 0.005, not 0.02: the terminator-dark fix (d48dec4) zeroes the
+    // skip band, and an interior view at a 2° sun is legitimately shadow-
+    // dominated (measured 0.013 on the reference camera). The check's job is
+    // the two degenerate poles — an all-lit march that never blocks, and the
+    // EXACTLY-0.0 texture of a broken lift/dropped dispatch.
+    `channel ${f.channel} mean is a real shadow pattern (0.005 < mean < 0.98)`,
+    typeof f.mean === "number" && f.mean > 0.005 && f.mean < 0.98,
   ],
 ];
 
@@ -430,6 +435,24 @@ for (const [label, ok] of checks) {
 // numbers above can't tell "real skylight dappling" from "lattice leaks".
 await page.screenshot({ path: "scripts/gi-lightshadow-view.png" }).catch(() => {});
 console.log("  viewport screenshot -> scripts/gi-lightshadow-view.png");
+
+// DIAG=1 — THE ATTRIBUTION EXPERIMENT. Three screenshots that name the term
+// an artifact lives in, with no interpretation left: (1) baseline is above;
+// (2) sun on MAP shadows — anything that survives is not the gi-shadow
+// channel; (3) GI COMPONENT OFF — anything that survives is not GI at all
+// (environment IBL, bloom, three's own terms). Ordered so each arm only
+// ever turns things OFF; everything is restored by restore().
+if (process.env.DIAG) {
+  await setProp("shadowMode", "map");
+  await wait(12000);
+  await page.screenshot({ path: "scripts/gi-diag-mapshadows.png" }).catch(() => {});
+  console.log("  DIAG arm 2 (map shadows) -> scripts/gi-diag-mapshadows.png");
+  await call("component.setProp", { id: giEntity.id, type: "global-illumination", key: "enabled", value: false });
+  await wait(8000);
+  await page.screenshot({ path: "scripts/gi-diag-gioff.png" }).catch(() => {});
+  console.log("  DIAG arm 3 (GI off) -> scripts/gi-diag-gioff.png");
+  await call("component.setProp", { id: giEntity.id, type: "global-illumination", key: "enabled", value: true });
+}
 
 // ALWAYS restore, pass or fail: this harness edits the user's real scene, and
 // leaving a sun in gi mode would silently change every later measurement.
