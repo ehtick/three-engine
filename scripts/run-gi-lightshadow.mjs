@@ -123,6 +123,11 @@ const restore = async () => {
   await setProp("shadowMode", originalShadowMode);
   await setProp("sourceAngle", sunProps.sourceAngle ?? 0.53);
   if (!originalCastShadow) await setProp("castShadow", false);
+  if (process.env.EMISSIVE_OFF) {
+    await call("component.setProp", {
+      id: giEntity.id, type: "global-illumination", key: "emissiveShadows", value: originalEmissive,
+    });
+  }
 };
 
 // castShadow first: three only compiles a shadow branch for a shadow-casting
@@ -134,6 +139,22 @@ if (!originalCastShadow) {
 const flip = await setProp("shadowMode", "gi");
 console.log(flip.ok ? "  shadowMode -> gi" : `  FATAL: shadowMode set failed (${flip.error})`);
 if (!flip.ok) { await browser.close(); process.exit(1); }
+
+// EMISSIVE_OFF=1 — the DECOUPLING arm: gi light shadows used to REQUIRE
+// Emissive Shadows (the sphere marcher could only share the emitter trace's
+// bindings). The DDA arm binds only the occupancy bits buffer, so it must
+// survive emissiveShadows=false. A dropped compute batch (the failure this
+// arm exists to catch) collapses the irradiance CONTROL, so the existing
+// checks already judge it.
+const giProps = componentOf(giEntity, "global-illumination")?.props ?? {};
+const originalEmissive = giProps.emissiveShadows !== false;
+if (process.env.EMISSIVE_OFF) {
+  const r = await call("component.setProp", {
+    id: giEntity.id, type: "global-illumination", key: "emissiveShadows", value: false,
+  });
+  console.log(r.ok ? "  emissiveShadows -> false (decoupling arm)" : `  emissiveShadows set failed: ${r.error}`);
+  await wait(15000);
+}
 
 // The light is REBUILT by the flip (new three.js instance → new uuid → the
 // lights hash changes → materials recompile), and GI only re-scans the light

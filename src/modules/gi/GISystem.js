@@ -1675,12 +1675,22 @@ export class GISystem {
     // through anything thinner than a field cell, which for a sun shadow is
     // every floor in the scene.
     if (!occ?.voxel) return null;
-    if (!hasEmitterTrace && globalThis.__giLightShadowIgnoreBudget !== true) {
+    // The emitter-trace requirement is a SPHERE-ARM rule: that marcher reads
+    // distanceTexture + atlas + staging + sparse and is only provably free
+    // when the emitter trace already bound the same family. The DDA arm
+    // reads ONLY the occupancy bits buffer — +1 storage buffer worst case,
+    // +0 whenever AO or the emitter oracle already binds it — so it stands
+    // alone. If a pathological config still over-commits the pass, the
+    // failure is loud in the harness (the irradiance CONTROL collapses when
+    // a batch drops) and `__giNoLightShadows` is the hatch.
+    const sphereArm = globalThis.__giLightShadowSphere === true;
+    if (!hasEmitterTrace && sphereArm && globalThis.__giLightShadowIgnoreBudget !== true) {
       if (!this._warnedLightShadowBudget) {
         this._warnedLightShadowBudget = true;
         console.warn(
-          "[gi] gi-traced light shadows are off: the resolve carries no shadow trace to share bindings with " +
-            "(Emissive Shadows is disabled). Re-enable it, or set __giLightShadowIgnoreBudget to measure anyway.",
+          "[gi] gi-traced light shadows are off: the sphere arm needs the emitter trace's bindings " +
+            "(Emissive Shadows is disabled). Re-enable it, drop __giLightShadowSphere, or set " +
+            "__giLightShadowIgnoreBudget to measure anyway.",
         );
       }
       return null;
