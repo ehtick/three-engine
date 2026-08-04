@@ -436,6 +436,26 @@ for (const [label, ok] of checks) {
 await page.screenshot({ path: "scripts/gi-lightshadow-view.png" }).catch(() => {});
 console.log("  viewport screenshot -> scripts/gi-lightshadow-view.png");
 
+// SWEEP=1 — SUN ELEVATION SWEEP (user-requested instrument): X rotations
+// from low morning to low evening, one settled screenshot per angle, so
+// artifact populations can be attributed by angle-dependence — terminator
+// residue moves with the grazing zones, dead-zone leaks stay put.
+if (process.env.SWEEP) {
+  for (const deg of [-30, -60, -90, -120, -145, -160]) {
+    await page.evaluate(({ sunId, deg }) => {
+      const obj = globalThis.__editorApi?.entities?.live(sunId)?.object3D;
+      if (!obj) return false;
+      obj.rotation.x = (deg * Math.PI) / 180;
+      obj.updateMatrixWorld(true);
+      return true;
+    }, { sunId: sunEntity.id, deg });
+    await wait(4500);
+    const name = `scripts/gi-sweep-x${Math.abs(deg)}.png`;
+    await page.screenshot({ path: name }).catch(() => {});
+    console.log(`  SWEEP x=${deg} -> ${name}`);
+  }
+}
+
 // DIAG=1 — THE ATTRIBUTION EXPERIMENT. Three screenshots that name the term
 // an artifact lives in, with no interpretation left: (1) baseline is above;
 // (2) sun on MAP shadows — anything that survives is not the gi-shadow
