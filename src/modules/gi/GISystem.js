@@ -16,7 +16,7 @@
 // lights + promoted emissive emitters (uniform slots, zero rebakes), and
 // the GICascadeLight material injection.
 import * as THREE from "three/webgpu";
-import { float, instanceIndex, mix, positionLocal, screenUV, texture, uniform, vec2, vec3, vec4 } from "three/tsl";
+import { cameraPosition, float, instanceIndex, mix, positionLocal, positionWorld, screenUV, select, texture, uniform, vec2, vec3, vec4 } from "three/tsl";
 import { createRadianceCascades } from "./cascadeTrace.js";
 import { createCascadeMerge } from "./cascadeMerge.js";
 import { createBounceFeedback, createIrradianceGather, createProbeDepthMoments, createProbeIrradiance, createRadianceLookup, depthMomentsAlpha, gatherBias, gatherViewBias, probeSnapAlpha } from "./cascadeGather.js";
@@ -1800,9 +1800,15 @@ export class GISystem {
       if (lightShadow && !this._giLightShadowNode) {
         this._giLightShadowNode = texture(targets.lightShadow);
       }
-      // The shadowNode's min-tap offsets are half-res texels; runs on every
-      // build INCLUDING the resize rebuild, which is what keeps it honest.
+      // The shadowNode's tap offsets are half-res texels; runs on every
+      // build (and #syncScreenResolveSize covers the resize path).
       (this._giLightShadowTexel ??= uniform(new THREE.Vector2())).value.set(1 / width, 1 / height);
+      // The gbuffer POSITION feeds the shadowNode's tap validity (see
+      // #acquireLightShadowNode). The gbuffer is per-build, so the persistent
+      // node re-points here every time; a resize reuses the same render
+      // target object (setSize), so no hook is needed there.
+      if (lightShadow && !this._giShadowPosNode) this._giShadowPosNode = texture(gbuffer.position);
+      else if (this._giShadowPosNode) this._giShadowPosNode.value = gbuffer.position;
       const emitter = emitterSlots
         ? {
             emitterSlots,
@@ -1885,6 +1891,9 @@ export class GISystem {
     this._giIrradianceNode.value = screen.targets.irradiance;
     this._giEmitterShadowNode.value = screen.targets.emitterShadow;
     this._giRadianceNode.value = screen.targets.radiance;
+    // The shadowNode's tap offsets are half-res texels — this path skips
+    // #buildScreenResolve, so the uniform must follow the size here too.
+    this._giLightShadowTexel?.value.set(1 / width, 1 / height);
     // Same swap for the gi light-shadow channel pack. The node is what every
     // gi light's compiled shadow branch holds, so re-pointing it (rather than
     // rebuilding it) is what keeps a viewport resize free of material
@@ -3270,21 +3279,37 @@ export class GISystem {
     if (existing) return existing;
     const active = uniform(0);
     const mask = uniform(new THREE.Vector4(1, 0, 0, 0));
-    // CONSERVATIVE MIN-TAP UPSAMPLE, not a plain LinearFilter sample. The
-    // resolve runs at HALF RES, and a silhouette texel's gbuffer P/N belong
-    // to whichever surface won the half-res rasterization — its traced value
-    // is right for THAT surface and garbage for the neighbor the bilinear
-    // upsample smears it onto. For most GI terms that error is a soft halo;
-    // for a SUN shadow it is a bright dotted rim on every dark silhouette
-    // (the harness screenshot's banner edges). A shadow term is
-    // multiplicative, so the safe direction is fixed: err DARK. Min over the
-    // four surrounding half-res texels (each tap still bilinear) keeps flat
-    // interiors byte-identical and turns lit edge leaks into a slightly
-    // fattened penumbra — the artifact swap you want for direct light.
+    // POSITION-VALIDATED BILATERAL UPSAMPLE. The resolve runs at HALF RES,
+    // and a silhouette texel's gbuffer P/N belong to whichever surface won
+    // the half-res rasterization — its traced value is right for THAT
+    // surface and garbage for the neighbor a plain bilinear upsample smears
+    // it onto. For a SUN shadow that error is a bright dotted rim on every
+    // dark silhouette (the user's "white artifacts"). v1 was a blind min
+    // over the 4 taps — right direction (a multiplicative shadow term must
+    // err DARK), but dots survived wherever ALL four taps traced a
+    // different surface. v2 checks each tap against the gbuffer POSITION at
+    // that texel: taps whose world position disagrees with the receiving
+    // pixel's own `positionWorld` by more than ~2 half-res texels' world
+    // footprint (2% of view distance, floored at 15cm) are REJECTED; the
+    // valid taps blend distance-weighted (that is the bilateral), and a
+    // pixel whose whole 2×2 neighborhood belongs to other surfaces — a
+    // sub-texel-thin banner edge — falls back to the MIN of the taps, dark
+    // by policy. The position texture is NearestFilter, so tap validity is
+    // per-texel exact, never interpolated across the very edges it guards.
     const texel = (this._giLightShadowTexel ??= uniform(new THREE.Vector2(1 / 512, 1 / 512)));
-    const tap = (dx, dy) =>
-      this._giLightShadowNode.sample(screenUV.add(vec2(texel).mul(vec2(dx, dy)))).dot(vec4(mask));
-    const shadow = tap(-0.5, -0.5).min(tap(0.5, -0.5)).min(tap(-0.5, 0.5)).min(tap(0.5, 0.5));
+    const threshold = positionWorld.sub(cameraPosition).length().mul(0.02).max(0.15);
+    const taps = [[-0.5, -0.5], [0.5, -0.5], [-0.5, 0.5], [0.5, 0.5]].map(([dx, dy]) => {
+      const uv = screenUV.add(vec2(texel).mul(vec2(dx, dy)));
+      const s = this._giLightShadowNode.sample(uv).dot(vec4(mask));
+      const g = this._giShadowPosNode.sample(uv);
+      const d = g.xyz.sub(positionWorld).length();
+      const w = select(g.w.greaterThan(0.5).and(d.lessThan(threshold)), float(1).div(d.add(0.02)), float(0));
+      return { s, w };
+    });
+    const wSum = taps.reduce((acc, t) => acc.add(t.w), float(0));
+    const sBlend = taps.reduce((acc, t) => acc.add(t.s.mul(t.w)), float(0)).div(wSum.max(1e-4));
+    const sMin = taps.reduce((acc, t) => acc.min(t.s), float(1));
+    const shadow = select(wSum.greaterThan(1e-4), sBlend, sMin);
     const entry = {
       active,
       mask,
