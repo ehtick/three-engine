@@ -3322,8 +3322,15 @@ export class GISystem {
     });
     const wSum = taps.reduce((acc, t) => acc.add(t.w), float(0));
     const sBlend = taps.reduce((acc, t) => acc.add(t.s.mul(t.w)), float(0)).div(wSum.max(1e-4));
-    const sMin = taps.reduce((acc, t) => acc.min(t.s), float(1));
-    const shadow = select(wSum.greaterThan(1e-4), sBlend, sMin);
+    // NO-VALID-TAP FALLBACK IS ZERO, not min-of-taps. When every tap belongs
+    // to some OTHER surface (thin features, object silhouettes — a spinning
+    // prop in front of a shadowed arch), min-of-foreign is only dark if the
+    // foreign surface happens to be dark: a SUNLIT foreground painted its
+    // full-lit values as a white fringe onto every shadowed silhouette
+    // behind it (user screenshot, the exact "still there" dots). A shadow
+    // term with no information must fail DARK; the cost is a half-res-thin
+    // darkened halo where lit meets lit, which reads as contact shading.
+    const shadow = select(wSum.greaterThan(1e-4), sBlend, float(0));
     const entry = {
       active,
       mask,
