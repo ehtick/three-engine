@@ -45,4 +45,6 @@ scripts/*.jpg
 scripts/*.jpeg
 scripts/*.webp
 scripts/*.gif
-/artifacts/
+/artifacts
+# HMR quiet-mode sentinel (see vite.config.js) — a local toggle, never shared.
+.no-hmr

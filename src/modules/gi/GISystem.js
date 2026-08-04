@@ -16,7 +16,7 @@
 // lights + promoted emissive emitters (uniform slots, zero rebakes), and
 // the GICascadeLight material injection.
 import * as THREE from "three/webgpu";
-import { float, instanceIndex, positionLocal, texture, uniform } from "three/tsl";
+import { float, instanceIndex, mix, positionLocal, screenUV, texture, uniform, vec2, vec3, vec4 } from "three/tsl";
 import { createRadianceCascades } from "./cascadeTrace.js";
 import { createCascadeMerge } from "./cascadeMerge.js";
 import { createBounceFeedback, createIrradianceGather, createProbeDepthMoments, createProbeIrradiance, createRadianceLookup, depthMomentsAlpha, gatherBias, gatherViewBias, probeSnapAlpha } from "./cascadeGather.js";
@@ -30,6 +30,7 @@ import { BRICK_AXIS_BY_QUALITY, describeSparseField } from "./sparseField.js";
 import { UI_LAYER } from "../../engine/editorLayers.js";
 import { GICascadeLight, MAX_EMITTERS, giRoughnessBucketOf, registerGILight } from "./giLight.js";
 import { buildBvhScene } from "./bvh/bvhScene.js";
+import { RayHitMode, rayHitModeName, resolveRayHitConfig } from "./rayHit/RayHitConfig.js";
 import {
   DETAIL_SLOTS,
   MAX_ATLAS_LAYERS,
@@ -512,6 +513,12 @@ export class GISystem {
       // cannot change without a rebuild. (`killSdf` used to sit beside it —
       // the prop is gone; SDF-free is the only mode.)
       p.backend,
+      p.rayHitMode,
+      p.rayHitProfiling === true,
+      // The Phase-5 coarse-skip A/B compiles different trace variants, so
+      // flipping it without a rebuild would silently do nothing (the
+      // exactReflections lesson above).
+      p.rayHitSkipDistance !== false,
       // AO compiles the resolve's obscurance block (and its pyramid binding)
       // in or out — structural for the same reason exactReflections is.
       p.ao !== false,
@@ -776,6 +783,12 @@ export class GISystem {
     this._unsubs = [];
     this.#dispose();
     this.component = null;
+  }
+
+  /** Explicit diagnostic readback; never called from the frame path. */
+  async readRayHitStats(renderer = this.engine.renderer) {
+    const debug = this.state?.volume?.occupancyField?.rayHitDebug;
+    return debug && renderer ? debug.readback(renderer) : null;
   }
 
   // -------------------------------------------------------------------------
@@ -1123,45 +1136,80 @@ export class GISystem {
         ? state.volume.occupancyField.passes()
         : null;
       const skippedBefore = giSkippedComputes.size;
-      giCompute(renderer, [
-        ...(occPasses ?? []),
-        // Inter-probe visibility (cascadeMerge's parent blind-annulus fix).
-        // Pure geometry × lattice, so it belongs HERE and not in the per-frame
-        // queue: it is recomputed exactly when the pyramid or the volume can
-        // have changed, which is the same condition that got us into this
-        // branch. Reads the pyramid, so it must follow occPasses.
-        // `__giNoVisUpdate` (live) stops DISPATCHING it while keeping the
-        // buffer and every merge that reads it — the cost A/B that says how
-        // much of a moving object's surcharge is this pass. Values go stale,
-        // which is exactly what a throttle would do.
-        ...(globalThis.__giNoVisUpdate === true ? [] : state.visComputes ?? []),
-        state.volume.compositeCompute,
-        // Fine level AFTER the coarse composite and BEFORE anything traces:
-        // the bricks are the same min-over-candidates function at a sixth of
-        // the cell size, so they depend on nothing the composite writes, but
-        // every consumer downstream reads them.
-        ...(state.volume.sparse?.computes ?? []),
-        // `rateQueue` here, not `state.queue`, so a __giFreeze cut still holds
-        // on a composite frame — otherwise the bisect silently leaks the very
-        // stage it is meant to hold still.
-        ...(legacyRate && !freeze ? state.queue : rateQueue),
-        ...debugExtra,
-      ]);
-      if (giSkippedComputes.size > skippedBefore) {
-        // Some of this batch's pipelines were still compiling on driver
-        // threads (installAsyncComputePipelines), so part of the ordered
-        // occupancy → visibility → composite chain did no work. Re-arm the
-        // dirty flags and re-run the WHOLE batch next tick — skipped
-        // dispatches are near-free, so retrying until the pipelines land
-        // costs nothing and keeps the stages in order.
+      // THE SPAWN-BLINK GUARD (2026-08-04, run-gi-spawn-blink measured it):
+      // a geometry change rebuilds the voxelizer's pair tables, so passes()
+      // mints FRESH compute nodes whose pipelines compile async for a few
+      // frames. Dispatching the ordered chain then executes the old,
+      // already-compiled CLEAR and skips the new voxelize — and a composite
+      // in the same batch reads that half-built pyramid as "empty
+      // everywhere", which makes the feedback's empty-clear zero the
+      // radiance field VOLUME-WIDE: the whole GI blinked black for ~6 frames
+      // (field probe read literal 0.0). Two rules fix it: while ANY compute
+      // pipeline is still compiling, do not dispatch the pyramid chain at
+      // all (its half-execution is the damage); and if a dispatch DID skip
+      // (the first tick is what triggers the new pipelines' compilation, so
+      // it cannot know in advance), bail out BEFORE the composite consumes
+      // the pyramid. Bail frames keep last-good staging/occupancy — the
+      // feedback sees unchanged flags, so radiance persists instead of
+      // clearing, and the EMA carries the couple of dim trace frames.
+      const occWait = occPasses !== null && giPendingComputePipelines.size > 0;
+      let occSkipped = false;
+      if (occPasses && !occWait) {
+        giCompute(renderer, occPasses);
+        occSkipped = giSkippedComputes.size > skippedBefore;
+      }
+      if (occWait || occSkipped) {
+        // Same re-arm the post-batch retry always used — but BEFORE anything
+        // consumed the pyramid, which is the whole fix. Skipped dispatches
+        // are near-free, so retrying until the pipelines land costs nothing.
         this._compositedOnce = false;
         state.volume.occupancyField?.invalidate();
         // The retry must NOT be narrowed by whatever small dirty AABB an
         // unrelated atlas touch queues meanwhile — see the dirty-consumption
         // note above.
         this._forceWholeComposite = true;
+        giCompute(renderer, [
+          ...(legacyRate && !freeze ? state.queue : rateQueue),
+          ...debugExtra,
+        ]);
+      } else {
+        giCompute(renderer, [
+          // Inter-probe visibility (cascadeMerge's parent blind-annulus fix).
+          // Pure geometry × lattice, so it belongs HERE and not in the
+          // per-frame queue: it is recomputed exactly when the pyramid or the
+          // volume can have changed, which is the same condition that got us
+          // into this branch. Ordered after occPasses (prior submit, same
+          // queue) because it reads the pyramid.
+          // `__giNoVisUpdate` (live) stops DISPATCHING it while keeping the
+          // buffer and every merge that reads it — the cost A/B that says how
+          // much of a moving object's surcharge is this pass. Values go
+          // stale, which is exactly what a throttle would do.
+          ...(globalThis.__giNoVisUpdate === true ? [] : state.visComputes ?? []),
+          state.volume.compositeCompute,
+          // Fine level AFTER the coarse composite and BEFORE anything traces:
+          // the bricks are the same min-over-candidates function at a sixth
+          // of the cell size, so they depend on nothing the composite writes,
+          // but every consumer downstream reads them.
+          ...(state.volume.sparse?.computes ?? []),
+          // `rateQueue` here, not `state.queue`, so a __giFreeze cut still
+          // holds on a composite frame — otherwise the bisect silently leaks
+          // the very stage it is meant to hold still.
+          ...(legacyRate && !freeze ? state.queue : rateQueue),
+          ...debugExtra,
+        ]);
+        if (giSkippedComputes.size > skippedBefore) {
+          // vis/composite/sparse pipelines can still be compiling on the very
+          // first builds — same re-arm, next tick retries the whole chain.
+          this._compositedOnce = false;
+          state.volume.occupancyField?.invalidate();
+          this._forceWholeComposite = true;
+        }
       }
-      this.#maybeLogStats(renderer);
+      // Only after a tick whose chain actually ran to completion: on bail/
+      // re-arm ticks (`_compositedOnce` false) the stats buffers may never
+      // have been dispatched, and reading them back throws from deep inside
+      // the frame loop (the user-reported "reading 'size'" uncaught promise).
+      if (this._compositedOnce) this.#maybeLogStats(renderer);
     } else {
       // Cascades re-trace + re-merge EVERY frame — 1-frame response to any
       // field change, no temporal accumulation to converge.
@@ -1583,6 +1631,125 @@ export class GISystem {
   }
 
   /**
+   * GI-TRACED DIRECT SHADOWS — the resolve-side bundle, or null when this
+   * build cannot afford them. Everything about the feature that needs the
+   * volume (the trace, its lift, its reach) is decided here, once.
+   *
+   * THE STEP BUDGET IS PER TIER, and this is not a tuning preference — it is
+   * the bug the lost implementation's smoke caught. A shadow ray from a
+   * receiver to the sun crosses the WHOLE volume, and the hierarchical march
+   * takes its smallest steps exactly where it hugs geometry, so a ray threading
+   * a building's interior burns its budget mid-wall. Running out is not
+   * "slightly wrong": the trace's fail-closed clamp only fires where the last
+   * sample was still near a surface, so an exhausted ray in a room reports
+   * NOTHING BLOCKED ME and the interior renders blown white. 64 steps did that;
+   * these budgets do not. (`__giDirectShadowSteps` overrides for an A/B.)
+   *
+   * TWO GATES, both about bindings rather than taste:
+   *
+   *  · STORAGE TEXTURES. The resolve already writes irradiance + emitterShadow
+   *    + radiance, plus the BVH radiance target when exact reflections are on.
+   *    This makes one more, which is the 4th or the 5th against a WebGPU
+   *    BASELINE OF 4. The engine asks the adapter for 8 (see
+   *    resolveRendererLimits), but the ask is adapter-clamped, so a
+   *    baseline-only device really does land at 4 and must simply not get the
+   *    feature — over the limit the pipeline is INVALID and every compute
+   *    submitted with it is silently dropped, taking all of GI with it.
+   *
+   *  · STORAGE BUFFERS. The trace reads the occupancy pyramid, the composited
+   *    distance texture and the atlas — the resolve is at the portable
+   *    8-storage-buffer baseline and cannot take new ones. It is only provably
+   *    free when the pass ALREADY carries a trace of the same family, i.e. when
+   *    emitter shadows built `light.shadowTraceFn`: same resources, so the bind
+   *    group is unchanged and only a second WGSL function appears. With
+   *    `emissiveShadows` off there is no such trace and this one would add its
+   *    own bindings to a pass whose real count we cannot measure without a GPU,
+   *    so the honest answer is to decline. `__giLightShadowIgnoreBudget` forces
+   *    it for a measurement run.
+   */
+  #buildLightShadow({ volume, lightSlots, quality, hasEmitterTrace, span }) {
+    if (globalThis.__giNoLightShadows === true) return null;
+    const occ = volume.occupancyField;
+    // No pyramid, no feature: the lift is sized in occupancy voxels and the
+    // trace's thin-wall block is the pyramid's. The SDF-only arm would leak
+    // through anything thinner than a field cell, which for a sun shadow is
+    // every floor in the scene.
+    if (!occ?.voxel) return null;
+    if (!hasEmitterTrace && globalThis.__giLightShadowIgnoreBudget !== true) {
+      if (!this._warnedLightShadowBudget) {
+        this._warnedLightShadowBudget = true;
+        console.warn(
+          "[gi] gi-traced light shadows are off: the resolve carries no shadow trace to share bindings with " +
+            "(Emissive Shadows is disabled). Re-enable it, or set __giLightShadowIgnoreBudget to measure anyway.",
+        );
+      }
+      return null;
+    }
+    const limit = this.engine.renderer?.backend?.device?.limits?.maxStorageTexturesPerShaderStage ?? 0;
+    const used = 3 + (this.#bvhReflectionsEnabled() ? 1 : 0);
+    if (limit < used + 1) {
+      if (!this._warnedLightShadowLimit) {
+        this._warnedLightShadowLimit = true;
+        console.warn(
+          `[gi] gi-traced light shadows are off: this device allows ${limit} storage textures per stage and the ` +
+            `resolve already writes ${used}. Lights with Shadow Source "gi" fall back to shadow maps.`,
+        );
+      }
+      return null;
+    }
+    const steps =
+      Number(globalThis.__giDirectShadowSteps) ||
+      ({ low: 96, medium: 128, high: 160, ultra: 192 }[quality] ?? 160);
+    // 1.5 OCCUPANCY VOXELS of ray lift — a node, not a number, so an in-place
+    // refit rescales it with the pyramid. See the resolve's own comment for
+    // why the gather's normalOffset is the wrong scale here.
+    const vox = vec3(occ.voxel);
+    const lift = vox.x.max(vox.y).max(vox.z).mul(1.5);
+    return {
+      slots: lightSlots,
+      lift,
+      span,
+      steps,
+      // THE MARCHER IS THE TRANSPORT DDA, NOT THE SPHERE TRACE. This is the
+      // same retreat the FIELD's sun shadows already made (see the field
+      // `lightShadow` closure): sphere-tracing the blurred field tunnels
+      // through thin geometry and its occluder-admission thresholds flip
+      // with voxel-lattice phase (rings, speckles, black states — three
+      // rounds of threshold tuning moved the artifacts without removing
+      // them), while the hierarchical DDA marches the SAME bits transport
+      // rays march — it cannot tunnel, has no admission thresholds at all,
+      // and its analytic cone accumulator (`pen`) fades a grazing ray
+      // continuously before the binary hit flips. 64 steps with coarse-skip
+      // crosses the volume; per-pixel cost beats 160 sphere steps.
+      // `__giLightShadowSphere = true` restores the sphere arm (build-time).
+      traceDda:
+        globalThis.__giLightShadowSphere === true
+          ? null
+          : (origin, dir, maxT, k) => {
+              // tMin one voxel: the lifted origin can still clip its own
+              // surface's SAT-bulged voxel on curved geometry, and a DDA
+              // first-voxel hit is a hard black dot. One voxel along the ray
+              // (on top of the 1.5-voxel normal lift) clears it; anything
+              // thinner than that near the receiver is below the medium's
+              // resolving power anyway.
+              const vox = vec3(occ.voxel);
+              const tMin = vox.x.max(vox.y).max(vox.z);
+              const r = occ.traceOccupancy(origin, dir, tMin, maxT, { steps: 64, penumbraK: k });
+              return r.hit.oneMinus().mul(r.pen);
+            },
+      // STABLE estimator, deliberately (the sharp one was tried first): the
+      // sharp arm's occluder admission is binary, and against a ~12cm-voxel
+      // medium those verdicts flip with lattice phase — white-speckle
+      // dithering along every silhouette and lit/black tearing that NO
+      // penumbra width smooths (the user's "no matter what the sun angle"
+      // report is the fingerprint: k-insensitive artifacts are admission
+      // artifacts). Stable turns the admissions into ramps; its leak-seal
+      // contact Break stays, reached smoothly.
+      trace: volume.createSoftShadowTrace(lift, steps, "giLightShadowTrace", true),
+    };
+  }
+
+  /**
    * Builds the deferred resolve for this GI state: a half-resolution gbuffer
    * plus the compute that turns it into the irradiance / emitter-shadow
    * textures materials sample.
@@ -1593,7 +1760,7 @@ export class GISystem {
    * rebuild, its shader stays in the pipeline cache, and a quality change or
    * an auto-fit refit no longer triggers a material recompile wave.
    */
-  #buildScreenResolve({ gather, light, emitterSlots, radianceLookup = null, lightSlots = null, ao = null }) {
+  #buildScreenResolve({ gather, light, emitterSlots, radianceLookup = null, lightSlots = null, ao = null, lightShadow = null }) {
     const renderer = this.engine.renderer;
     if (!renderer?.backend?.device) return null;
     const { width, height } = this.#screenResolveSize();
@@ -1607,6 +1774,17 @@ export class GISystem {
         this._giRadianceNode = texture(this._giTargets.radiance);
       }
       const targets = this._giTargets;
+      // PERSISTENT, created once per system and repointed on resize — exactly
+      // like its siblings above, and here it is not merely an optimisation:
+      // every gi light's `shadow.shadowNode` samples THIS node forever, and a
+      // node swap would mean rebuilding (and recompiling) that shadow branch
+      // in every material each time the viewport changes size.
+      if (lightShadow && !this._giLightShadowNode) {
+        this._giLightShadowNode = texture(targets.lightShadow);
+      }
+      // The shadowNode's min-tap offsets are half-res texels; runs on every
+      // build INCLUDING the resize rebuild, which is what keeps it honest.
+      (this._giLightShadowTexel ??= uniform(new THREE.Vector2())).value.set(1 / width, 1 / height);
       const emitter = emitterSlots
         ? {
             emitterSlots,
@@ -1616,6 +1794,10 @@ export class GISystem {
           }
         : null;
       const inputs = { gather, normalOffset: light.normalOffset, intensity: light.intensityUniform, emitter, ao };
+      // The bundle arrives target-less (the targets are created just above, and
+      // only the system knows when) — bind it here and keep the completed
+      // bundle on `screen` so the resize path can re-point it.
+      inputs.lightShadow = lightShadow ? { ...lightShadow, target: targets.lightShadow } : null;
       const radiance = radianceLookup
         ? {
             lookup: radianceLookup,
@@ -1685,6 +1867,16 @@ export class GISystem {
     this._giIrradianceNode.value = screen.targets.irradiance;
     this._giEmitterShadowNode.value = screen.targets.emitterShadow;
     this._giRadianceNode.value = screen.targets.radiance;
+    // Same swap for the gi light-shadow channel pack. The node is what every
+    // gi light's compiled shadow branch holds, so re-pointing it (rather than
+    // rebuilding it) is what keeps a viewport resize free of material
+    // recompiles — and the bundle has to carry the NEW texture into the
+    // resolve rebuild below, or the pass would write into the target that is
+    // about to be retired.
+    if (this._giLightShadowNode) this._giLightShadowNode.value = screen.targets.lightShadow;
+    if (screen.lightShadow) {
+      screen.lightShadow = { ...screen.lightShadow, target: screen.targets.lightShadow };
+    }
     // THE BVH TARGETS ARE REPLACED BEFORE THE RESOLVE IS REBUILT, not after.
     // The resolve now BINDS them (it shades the reflection hits — see
     // createGiResolve's `bvhShade`), so rebuilding it against the old,
@@ -1720,6 +1912,7 @@ export class GISystem {
       radiance: screen.radiance,
       bvhShade: screen.bvhShade,
       ao: screen.ao,
+      lightShadow: screen.lightShadow,
     });
     if (index >= 0) state.queue[index] = screen.resolve.compute;
     if (indexNoFeedback >= 0) state.queueNoFeedback[indexNoFeedback] = screen.resolve.compute;
@@ -2006,6 +2199,7 @@ export class GISystem {
     if (!component || !engine.scene) return;
 
     const props = component.props;
+    const rayHitConfig = resolveRayHitConfig(props);
     const meshes = this.#collectMeshes();
 
     // Volume placement: manual (entity-centered, size props) or AUTO-FIT —
@@ -2193,15 +2387,18 @@ export class GISystem {
     // selected are gone. Built here for the same reason the prototype above is
     // (this is where the mesh list lives) and BEFORE the volume, because the
     // composite graph and every trace close over it. Null only means the
-    // device failed the storage-buffer gate, which now disables GI outright.
-    const occField = this.#buildOccupancyField(props, meshes, bounds, { sizeX, sizeY, sizeZ }, quality);
+    // explicit diagnostic backend hatch disabled occupancy.
+    const occField = this.#buildOccupancyField(
+      props, meshes, bounds, { sizeX, sizeY, sizeZ }, quality, rayHitConfig,
+    );
     const killSdf = this.#killSdfEnabled();
     if (killSdf && !occField) {
-      console.warn("[gi] killSdf ignored — no occupancy field (device gate), falling back to baked mesh SDFs");
+      console.warn("[gi] occupancy was disabled by the diagnostic backend hatch; GI has no geometry transport");
     }
     const volume = createGiField(bounds, res, atlas, {
       occupancy,
       occupancyField: occField,
+      rayHitConfig,
       killSdf,
       sparseField,
       brickAxis: BRICK_AXIS_BY_QUALITY[quality] ?? 6,
@@ -2300,6 +2497,25 @@ export class GISystem {
       // where the renderer's own direct light does, or the mismatch reads
       // as light being "cut" at a circle.
       range: uniform(0),
+      // ── GI-TRACED DIRECT SHADOWS (LightComponent's `shadowMode: "gi"`) ──
+      // `soft` = the light's own angular RADIUS in radians (a sun's authored
+      // "Angle", halved by LightComponent). `srcRadius` = a point/spot source's
+      // world-space radius, whose angular size is radius/distance and therefore
+      // has to be resolved per pixel rather than stored as an angle. Exactly
+      // one of the two is meaningful per slot, chosen by `kind`.
+      //
+      // BOTH ARE 0 UNLESS THE LIGHT IS GI-FLAGGED, and that is deliberate: 0
+      // means "unset", which every consumer falls back from to the global sun
+      // angle. So a scene that never opts into gi shadows keeps byte-identical
+      // field behaviour, and the feature can only change lights that asked for
+      // it (see #updateLightUniforms and cascadeGather's per-slot k).
+      soft: uniform(0),
+      srcRadius: uniform(0),
+      // 1 only while the screen resolve should trace this slot's shadow cone:
+      // the light asked for gi shadows AND the device/binding gate passed AND
+      // the slot is live. A uniform rather than a build-time switch because
+      // flipping a light's Shadow Source must not need a GI rebuild.
+      giShadow: uniform(0),
     }));
     // Emitter slots (promoted emissive meshes) are shared by the feedback
     // compute (voxel direct inject), the material light node (receiver
@@ -2378,10 +2594,16 @@ export class GISystem {
       // `__giFieldDdaShadows = false` (build-time) restores the sphere trace.
       lightShadow:
         volume.occupancyField && globalThis.__giFieldDdaShadows !== false
-          ? (origin, dir, maxT) => {
+          ? // PER-LIGHT SOFTNESS: `k` is resolved by the caller, which is the
+            // only place that knows WHICH slot it is tracing — cascadeGather
+            // picks the slot's own angular radius when it has one (a gi-flagged
+            // light's authored sun Angle) and falls back to this global
+            // `penAngle` otherwise, so an un-flagged scene is unchanged. The
+            // `??` keeps any other caller on the old behaviour.
+            (origin, dir, maxT, k = null) => {
               const r = volume.occupancyField.traceOccupancy(
                 origin, dir, volume.world.minCell.mul(0.25), maxT,
-                { steps: 64, penumbraK: float(1).div(shadowJitter.penAngle.max(0.005)) },
+                { steps: 64, penumbraK: k ?? float(1).div(shadowJitter.penAngle.max(0.005)) },
               );
               return r.hit.oneMinus().mul(r.pen);
             }
@@ -2491,7 +2713,11 @@ export class GISystem {
       // slot) — a layout collapses those four inlined 56-step loops into one
       // function, which is what keeps this SYNCHRONOUSLY compiled compute
       // pipeline small enough not to freeze a frame on rebuild.
-      light.shadowTraceFn = volume.createSoftShadowTrace(light.normalOffset, traceBudget.shadow, "giResolveShadowTrace");
+      // Stable estimator here too (same reasoning as the gi-light trace in
+      // #buildLightShadow): the emitter cones' binary admissions painted
+      // lattice-phase moiré across floors the moment Emissive Shadows was
+      // re-enabled on a real scene.
+      light.shadowTraceFn = volume.createSoftShadowTrace(light.normalOffset, traceBudget.shadow, "giResolveShadowTrace", true);
       light.shadowMargin = volume.world.cellMax.mul(2.5).max(0.2);
       // Shadow reach must cover the whole volume: any receiver inside the
       // cap-but-unshadowed band takes emitter light THROUGH walls.
@@ -2513,7 +2739,19 @@ export class GISystem {
     // pixel instead of inside every material (see giScreen.js). This is what
     // keeps material shaders small — the driver compile of a 200kB+ GI
     // fragment shader, once per material, was the whole startup cost.
-    const screen = this.#buildScreenResolve({ gather, light, emitterSlots, radianceLookup: deferredRadianceLookup, ao });
+    // GI-traced direct shadows for lights flagged `shadowMode: "gi"` (see
+    // #buildLightShadow for the two binding gates). NOT structural: the bundle
+    // compiles the per-slot cone unconditionally and each slot's `giShadow`
+    // uniform decides per frame whether it marches, so flipping a light's
+    // Shadow Source is a uniform write, never a GI rebuild.
+    const lightShadow = this.#buildLightShadow({
+      volume,
+      lightSlots,
+      quality,
+      hasEmitterTrace: !!light.shadowTraceFn,
+      span: diagU,
+    });
+    const screen = this.#buildScreenResolve({ gather, light, emitterSlots, radianceLookup: deferredRadianceLookup, ao, lightShadow });
     if (screen) {
       queue.push(screen.resolve.compute);
       queueNoFeedback.push(screen.resolve.compute);
@@ -2588,6 +2826,7 @@ export class GISystem {
       lightSlots,
       emitterSlots,
       statsLogged: false,
+      rayHitConfig,
     };
     this._atlasRevisionSeen = -1; // force a first composite
     this._occGeometrySeen = -1;
@@ -2643,6 +2882,24 @@ export class GISystem {
           `(composite clamps from level ${volume.coarseLevel})`,
       );
     }
+    // Affirmative ground truth for the gi-shadow feature, same discipline as
+    // the ray-hit and SDF-free lines below: "I set Shadow Source to gi and
+    // nothing changed" is unreadable without knowing whether the resolve even
+    // built the trace, and at what step budget.
+    console.log(
+      screen?.lightShadow
+        ? `[gi] light shadows: gi-traced ON at ${screen.lightShadow.steps} steps (${quality}), ` +
+            `up to ${MAX_GI_LIGHTS} lights — flag a light with Shadow Source "gi"`
+        : "[gi] light shadows: gi-traced OFF — every light renders its own shadow map",
+    );
+    console.log(
+      `[gi] ray-hit: requested ${rayHitModeName(rayHitConfig.requestedMode)}, ` +
+        `active ${rayHitModeName(rayHitConfig.activeMode)}, profiling ${rayHitConfig.enableProfiling ? "ON" : "off"}` +
+        // Printed for the same reason the branch factor is: "I set the A/B
+        // global and nothing changed" is unreadable without the ground truth.
+        `, skip ${rayHitConfig.enableSkipDistance !== false ? "ON" : "off"}` +
+        (rayHitConfig.fallbackToLegacy ? " (requested phase not implemented; legacy fallback)" : ""),
+    );
     // Affirmative ground truth, same discipline as the BVH line: the ABSENCE
     // of "SDF-free" means baked mesh SDFs are still being read, whatever the
     // Inspector checkbox appears to say.
@@ -2798,6 +3055,13 @@ export class GISystem {
       const c = slot.color.value;
       mix(c.r); mix(c.g); mix(c.b);
       mix(slot.range.value);
+      // The field's own shadow k is derived from this (cascadeGather's
+      // per-slot angle), so dragging a sun's Angle slider has to WAKE the
+      // pipeline — otherwise the change lands only after something else
+      // happens to disturb the scene. `srcRadius`/`giShadow` are deliberately
+      // absent: they steer only the screen resolve, which runs every frame
+      // regardless of whether the field is asleep.
+      mix(slot.soft.value);
     }
     for (const slot of state.emitterSlots ?? []) {
       mix(slot.radius.value);
@@ -2858,6 +3122,10 @@ export class GISystem {
       // disabling the light's ENTITY counts as off too (see its comment).
       if (!light || !isRenderVisible(light) || light.intensity <= 0) {
         slot.active.value = 0;
+        // Cleared alongside, so an off/hidden light stops paying for a
+        // whole-screen shadow march the moment it goes dark rather than on
+        // the next light-list scan. Its channel then writes the inert 1.
+        slot.giShadow.value = 0;
         continue;
       }
       slot.active.value = 1;
@@ -2877,8 +3145,164 @@ export class GISystem {
       }
       slot.range.value = light.isPointLight ? Math.max(0, light.distance || 0) : 0;
       slot.color.value.copy(light.color).multiplyScalar(light.intensity);
+      // ── THE GI SHADOW CONTRACT (LightComponent's userData, nothing else) ──
+      // Read fresh every frame: the contract is republished on every relevant
+      // prop change and this module deliberately never imports LightComponent,
+      // so the userData IS the handshake. Absent flags simply read as "map".
+      const wantsGi = light.userData?.giShadowMode === "gi" && !!state.screen?.lightShadow;
+      slot.giShadow.value = wantsGi ? 1 : 0;
+      // ONLY GI-FLAGGED LIGHTS PUBLISH THEIR SIZE. `soft`/`srcRadius` at 0
+      // mean "unset", and every consumer falls back to the global sun angle
+      // there — which is how a scene that never opted in keeps byte-identical
+      // field shadows (see cascadeGather's per-slot k). Angles arrive as a
+      // half-angle in radians already (LightComponent halves the authored
+      // diameter); 0.0046 rad ≈ the real sun's 0.53° disc, the default a
+      // flagged light gets if the contract ever omits the field.
+      // FLOORED AT THE REAL SUN (0.0046 rad ≈ 0.53°), not at 0: an authored
+      // angle of 0 reaches the resolve as its 0.0005 clamp floor → k = 2000 —
+      // a razor ray through a ~12cm-voxel medium, whose verdict flips per
+      // voxel-lattice phase and paints white-speckle dithering along every
+      // silhouette (harness caught the scene's sun publishing exactly 0).
+      // No physical sun is sharper than the real one, so the floor is honest.
+      slot.soft.value = wantsGi && light.isDirectionalLight
+        ? Math.max(0.0046, light.userData.giSourceAngle ?? 0.0046)
+        : 0;
+      slot.srcRadius.value = wantsGi && !light.isDirectionalLight
+        ? Math.max(0, light.userData.giSourceRadius ?? 0)
+        : 0;
     }
+    this.#syncLightShadowNodes(lights);
     this.#logLightInput();
+  }
+
+  /**
+   * Hands every gi-flagged light a persistent `shadow.shadowNode` that samples
+   * its channel of the resolve's `lightShadow` texture. three's
+   * AnalyticLightNode multiplies the light by whatever sits in that slot AND
+   * renders no shadow map for it — the same hook LightComponent's CSM uses, so
+   * a gi light costs zero map passes.
+   *
+   * THREE INVARIANTS, each of them a bug that was paid for once:
+   *
+   *  · THE NODE IS BUILT ONCE PER LIGHT AND ASSIGNED ONLY WHEN IT CHANGES.
+   *    Re-assigning churns the light's shadow branch, and a changed shadow
+   *    branch means a material recompile wave — the exact cost this whole
+   *    deferred architecture exists to avoid.
+   *  · IT IS INERT AT 1, NEVER AT 0. GI absent, disabled, mid-rebuild, slot
+   *    dark — all of them must leave the light fully lit. A shadow term that
+   *    fails to black is a scene that goes black.
+   *  · THE CHANNEL IS A UNIFORM MASK, NOT A BAKED SWIZZLE. Slot indices follow
+   *    the collected light list, which reshuffles whenever a light is added,
+   *    hidden or dimmed; baking `.x`/`.y` into the node would mean rebuilding
+   *    (and recompiling) it on every reshuffle. A dot against a vec4 mask makes
+   *    the same change a uniform write.
+   */
+  #syncLightShadowNodes(lights) {
+    const state = this.state;
+    const nodes = (this._lightShadowNodes ??= new Map());
+    const live = !!state?.screen?.lightShadow && !!this._giLightShadowNode;
+    // Slot index === channel index === index into the collected light list, by
+    // construction — the resolve writes channel i from lightSlots[i], and
+    // lightSlots[i] is fed by lights[i] in the loop above.
+    const claimed = new Set();
+    // Hard-capped at the target's four channels. A slot past the 4th would get
+    // an all-zero mask, and an all-zero mask dots to 0 — i.e. a fully BLACK
+    // light rather than an unshadowed one. Bounding the loop is the guard.
+    const channels = Math.min(4, state?.lightSlots?.length ?? 0);
+    for (let i = 0; live && i < channels; i++) {
+      const light = lights[i];
+      if (!light?.shadow || light.userData?.giShadowMode !== "gi") continue;
+      claimed.add(light);
+      const entry = this.#acquireLightShadowNode(light);
+      entry.mask.value.set(i === 0 ? 1 : 0, i === 1 ? 1 : 0, i === 2 ? 1 : 0, i === 3 ? 1 : 0);
+      // Inert unless the slot is genuinely being traced this frame: a hidden
+      // or zero-intensity light keeps its (unwritten) channel, and reading it
+      // would shadow with whatever the last live light left there.
+      entry.active.value = state.lightSlots[i].giShadow.value > 0.5 ? 1 : 0;
+    }
+    // Everything else this system ever claimed: either it lost gi mode, or it
+    // left the scene. Both hand the light back to three's own shadow maps.
+    // A light that is merely HIDDEN or DIMMED is deliberately not in here —
+    // it keeps its node at active 0, so toggling visibility costs a uniform
+    // write instead of two shadow-branch rebuilds.
+    for (const [light, entry] of nodes) {
+      if (claimed.has(light)) continue;
+      const gone = light.parent === null || light.userData?.giShadowMode !== "gi";
+      if (!gone && live) {
+        entry.active.value = 0;
+        continue;
+      }
+      this.#releaseLightShadowNode(light, entry);
+      nodes.delete(light);
+    }
+    // Counted over the WHOLE collected list, not the channels above: the point
+    // of the warning is precisely the lights that fell off the end.
+    const asked = live ? lights.filter((l) => l?.userData?.giShadowMode === "gi").length : 0;
+    if (asked > channels && !this._warnedLightShadowCount) {
+      this._warnedLightShadowCount = true;
+      console.warn(
+        `[gi] ${asked} lights ask for gi-traced shadows; only the first ${channels} light slots carry a shadow ` +
+          "channel — the rest keep their shadow maps.",
+      );
+    }
+  }
+
+  #acquireLightShadowNode(light) {
+    const existing = this._lightShadowNodes.get(light);
+    if (existing) return existing;
+    const active = uniform(0);
+    const mask = uniform(new THREE.Vector4(1, 0, 0, 0));
+    // CONSERVATIVE MIN-TAP UPSAMPLE, not a plain LinearFilter sample. The
+    // resolve runs at HALF RES, and a silhouette texel's gbuffer P/N belong
+    // to whichever surface won the half-res rasterization — its traced value
+    // is right for THAT surface and garbage for the neighbor the bilinear
+    // upsample smears it onto. For most GI terms that error is a soft halo;
+    // for a SUN shadow it is a bright dotted rim on every dark silhouette
+    // (the harness screenshot's banner edges). A shadow term is
+    // multiplicative, so the safe direction is fixed: err DARK. Min over the
+    // four surrounding half-res texels (each tap still bilinear) keeps flat
+    // interiors byte-identical and turns lit edge leaks into a slightly
+    // fattened penumbra — the artifact swap you want for direct light.
+    const texel = (this._giLightShadowTexel ??= uniform(new THREE.Vector2(1 / 512, 1 / 512)));
+    const tap = (dx, dy) =>
+      this._giLightShadowNode.sample(screenUV.add(vec2(texel).mul(vec2(dx, dy)))).dot(vec4(mask));
+    const shadow = tap(-0.5, -0.5).min(tap(0.5, -0.5)).min(tap(-0.5, 0.5)).min(tap(0.5, 0.5));
+    const entry = {
+      active,
+      mask,
+      node: mix(float(1), shadow, active),
+    };
+    this._lightShadowNodes.set(light, entry);
+    light.shadow.shadowNode = entry.node;
+    light.shadow.needsUpdate = true;
+    // AnalyticLightNode CACHES the composed shadow branch (`shadowColorNode`)
+    // on the light node and only rebuilds it when the light dispatches
+    // 'dispose' — its hash is just the light's uuid, so neither a new
+    // shadowNode nor a lights-hash purge would ever be noticed. This is the
+    // same call LightComponent makes when it swaps a CSM node for the same
+    // reason. Fires once per light per transition, not per frame.
+    light.dispose?.();
+    return entry;
+  }
+
+  /** Hands a light back to three's own shadow maps (see #syncLightShadowNodes). */
+  #releaseLightShadowNode(light, entry) {
+    entry.active.value = 0;
+    // `undefined`, not null: three tests `shadow.shadowNode !== undefined` to
+    // decide whether a custom node overrides the map lookup, so null would
+    // leave the light with a shadow branch of literal null.
+    //
+    // EXCEPT for a light still FLAGGED gi (system disposed under it): its
+    // component froze `shadow.autoUpdate` with a never-rendered map, and a
+    // castShadow light with neither map nor custom node crashes three's
+    // `updateShadow` (`shadow.map.depthTexture` on null). Hand it the same
+    // inert 1 LightComponent boots gi lights with; leaving gi mode rebuilds
+    // the light anyway, which restores real maps.
+    if (light.shadow && light.shadow.shadowNode === entry.node) {
+      light.shadow.shadowNode = light.userData?.giShadowMode === "gi" ? float(1) : undefined;
+      light.shadow.needsUpdate = true;
+      light.dispose?.();
+    }
   }
 
   /**
@@ -2930,6 +3354,14 @@ export class GISystem {
     const state = this.state;
     if (!state) return;
     this.state = null;
+    // GI-traced shadows die WITH the system, and this cannot wait for the next
+    // light sync: that sync runs off `this.state`, which is now null, so a
+    // light left holding our shadowNode would sample a texture nothing writes
+    // any more — and would never be handed back to its own shadow map.
+    for (const [light, entry] of this._lightShadowNodes ?? []) {
+      this.#releaseLightShadowNode(light, entry);
+    }
+    this._lightShadowNodes?.clear();
     state.volume?.dispose?.();
     state.bvhScene?.dispose?.();
     // The gbuffer is per-build; the resolve TARGETS are not (see
@@ -3887,7 +4319,7 @@ export class GISystem {
    * ceiling, so a bigger world degrades to coarser voxels instead of failing to
    * allocate — the same contract the SDF field's own auto-fit densities use.
    */
-  #buildOccupancyField(props, meshes, bounds, size, quality) {
+  #buildOccupancyField(props, meshes, bounds, size, quality, rayHitConfig) {
     // A SAVED `backend` OTHER THAN "occupancy" IS COERCED, NOT HONOURED. The
     // sdf-legacy transport backend was deleted (session 15b) but scenes saved
     // before that still carry `backend: "sdf-legacy"` — and honouring it
@@ -3912,25 +4344,9 @@ export class GISystem {
       );
     }
 
-    // STORAGE-BUFFER HEADROOM GATE. The pyramid is one more storage binding in
-    // the cascade trace, which already binds the six per-cell field buffers —
-    // and WebGPU's BASELINE `maxStorageBuffersPerShaderStage` is 8. Over it,
-    // the pipeline is rejected and the WHOLE compute batch is dropped, which
-    // presents as "GI stopped working" with a validation error that names no
-    // line of anyone's code. The engine asks for the adapter's real limit at
-    // device creation (resolveRendererLimits); this refuses to build rather
-    // than shipping that failure when the ask could not be granted.
-    //
-    // Refusing the backend is a DOWNGRADE, not a failure: `createSceneTrace`
-    // falls back to the legacy SDF sphere trace when there is no field.
-    const limit = this.engine.renderer?.backend?.device?.limits?.maxStorageBuffersPerShaderStage ?? 8;
-    if (limit < 10) {
-      console.warn(
-        `[gi] occupancy backend needs maxStorageBuffersPerShaderStage ≥ 10, this device allows ${limit}. ` +
-          "Falling back to the SDF backend.",
-      );
-      return null;
-    }
+    // Portable WebGPU baseline only. The fully composed cascade graph is
+    // runtime-smoked at maxStorageBuffersPerShaderStage=8; never disable this
+    // path or request a larger device limit to hide a binding regression.
 
     // Spec §1.1: 0.10–0.15m, "not 0.35 — sub-voxel sheets were the root cause
     // of the blob/leak artifacts". Low/medium relax it for cost.
@@ -3958,6 +4374,23 @@ export class GISystem {
     const field = createOccupancyField(bounds, res, {
       slotCapacity: Math.min(MAX_INSTANCE_SLOTS, Math.max(64, placements.length * 2)),
       traceSteps: { low: 48, medium: 64, high: 96, ultra: 128 }[quality] ?? 96,
+      enableProfiling: rayHitConfig?.enableProfiling === true,
+      countLegacyFallbacks: rayHitConfig?.fallbackToLegacy === true,
+      enableHybridBrick: (rayHitConfig?.activeMode ?? RayHitMode.OccupancyLegacy) >= RayHitMode.HybridBrickBox &&
+        (rayHitConfig?.activeMode ?? RayHitMode.OccupancyLegacy) <= RayHitMode.HybridExactComplex,
+      // Phase 2/3: fitted simple-plane records (+ coverage masks) appended to
+      // the occupancy allocation. All plane-family modes build the same
+      // records; the coverage clip and the exact-triangle fallback are
+      // trace-time variants.
+      enableSurfaceRecords: (rayHitConfig?.activeMode ?? RayHitMode.OccupancyLegacy) >= RayHitMode.HybridPlane &&
+        (rayHitConfig?.activeMode ?? RayHitMode.OccupancyLegacy) <= RayHitMode.HybridExactComplex,
+      // Phase 4: complex cells store short exact triangle lists in the same
+      // allocation instead of degrading to occupied-box hits.
+      enableComplexTriangles: rayHitConfig?.activeMode === RayHitMode.HybridExactComplex,
+      // Phase 5: the conservative pyramid ride is the DEFAULT, so `!== false`
+      // (not `=== true`) — a caller with no rayHitConfig at all still gets the
+      // skip; only an explicit opt-out compiles the no-skip A/B arm.
+      rayHitCoarseSkip: rayHitConfig?.enableSkipDistance !== false,
     });
     for (const p of placements) field.setSlotMatrix(p.slot, p.matrix);
     field.setGeometry(geometries, placements);

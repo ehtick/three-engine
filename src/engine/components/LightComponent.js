@@ -2,7 +2,7 @@
 // errors unrelated to events (the light union type doesn't narrow to
 // SpotLight/DirectionalLight members), a follow-up.
 import * as THREE from "three/webgpu";
-import { PCFShadowFilter } from "three/tsl";
+import { PCFShadowFilter, float } from "three/tsl";
 import { CSMShadowNode } from "three/addons/csm/CSMShadowNode.js";
 import { Component } from "./Component.js";
 import { PCSSShadowFilter } from "../pcssShadowFilter.js";
@@ -273,6 +273,17 @@ export class LightComponent extends Component {
         // rather than silently shadowless.
         this.light.shadow.autoUpdate = false;
         this.light.shadow.mapSize.set(16, 16);
+        // INERT PLACEHOLDER, assigned from frame 1 — not left for the GI
+        // module's first light scan. A castShadow light with autoUpdate=false
+        // and NO rendered map crashes three's `updateShadow`
+        // (`shadow.map.depthTexture` on null) on every frame that renders it
+        // without a custom shadowNode — which is exactly the window between
+        // booting a scene SAVED with a gi-mode sun and the GI module's first
+        // 250ms scan. A custom node makes three skip the map path entirely,
+        // and `1` (unshadowed) is also the correct end state when the GI
+        // module never claims the light at all. The module replaces this node
+        // (and disposes the light's cached shadow branch) when it claims.
+        this.light.shadow.shadowNode = float(1);
       }
     }
     this.entity.object3D.add(this.light);

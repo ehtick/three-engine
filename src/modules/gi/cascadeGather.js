@@ -19,7 +19,7 @@
 // second transport implementation. Direct material shading here deliberately
 // bypasses any G-buffer/deferred-resolve layer (where the prior attempt's
 // never-root-caused stripe bug lived).
-import { Fn, If, Loop, Return, cos, float, floor, fract, instanceIndex, instancedArray, max, mix, mod, select, sin, smoothstep, sqrt, step, uniform, vec2, vec3, vec4 } from "three/tsl";
+import { Fn, If, Loop, Return, cos, float, floor, fract, instanceIndex, instancedArray, max, mix, mod, select, sin, smoothstep, sqrt, step, texture3D, uniform, vec2, vec3, vec4 } from "three/tsl";
 import { octahedralTexelIndex, octahedralUV } from "./cascadeTrace.js";
 import { sharedFn } from "./giFn.js";
 import { emitterAngularRadius, emitterSlotFactor, emitterSurfaceT } from "./giLight.js";
@@ -905,7 +905,14 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
       const ix = mod(idx, res.x);
       const iy = mod(floor(idx.div(res.x)), res.y);
       const iz = floor(idx.div(res.x * res.y));
-      const normal = volume.normalBuffer.element(instanceIndex).xyz;
+      // The composite already mirrors this normal into distanceTexture.gba.
+      // Sampling that existing texture removes normalBuffer from this fully
+      // composed feedback graph, keeping it within the portable 8-storage-
+      // buffer limit (and preserving the same normal, fp16-quantized).
+      const normal = texture3D(
+        volume.distanceTexture,
+        vec3(ix.add(0.5).div(res.x), iy.add(0.5).div(res.y), iz.add(0.5).div(res.z)),
+      ).level(0).gba.mul(2).sub(1).normalize();
       // One desaturated field albedo for ALL bounce-color sites below (the
       // two direct injections and the feedback term) — see bleedSaturation's
       // note above. Null uniform → plain surface albedo, byte-identical.
@@ -1000,7 +1007,27 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
               // whether the FLICKER stops.
               // Trace direction only — energy/gates stay on the exact dir.
               const traceDir = jitter ? jitterDir(dir, jitter.angle) : dir;
-              let shadow = lightShadow(origin, traceDir, maxT, float(20), ndotl);
+              // PER-LIGHT PENUMBRA (GI-traced direct shadows). `slot.soft` is
+              // this light's own angular RADIUS in radians — nonzero only for a
+              // light flagged `shadowMode: "gi"`, whose screen-space shadow
+              // cone is shaped by the same number (see giScreen's lightShadow
+              // block). Sharing it here is what keeps the field's bounce and
+              // the direct shadow agreeing about how big the sun is; an
+              // unflagged slot reads 0 and falls back to the global sun angle
+              // exactly as before. k = 1/angle throughout this module (see
+              // GISystem's penumbraK and giLight's emitter k), and both shadow
+              // paths take it as their 4th argument — the DDA closure now
+              // honours it, and the legacy sphere trace already did. (That
+              // legacy arm — `__giFieldDdaShadows = false`, or a build with no
+              // occupancy pyramid — used to receive a hardcoded k of 20, which
+              // predates `penAngle` existing; it now reads the same uniform the
+              // DDA path does, so the two A/B arms finally agree on the sun's
+              // size instead of differing by 2x.)
+              const fallbackAngle = jitter?.penAngle ? float(jitter.penAngle).max(0.005) : float(0.025);
+              const softAngle = slot.soft
+                ? select(float(slot.soft).greaterThan(1e-4), float(slot.soft).max(5e-4), fallbackAngle)
+                : fallbackAngle;
+              let shadow = lightShadow(origin, traceDir, maxT, float(1).div(softAngle), ndotl);
               if (fieldShadowOff) shadow = mix(shadow, float(1), fieldShadowOff);
               const direct = rawAlbedo
                 .mul(energy)

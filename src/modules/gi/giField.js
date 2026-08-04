@@ -20,6 +20,8 @@ import { sharedFn } from "./giFn.js";
 import { createInstanceGrid, loopCandidates } from "./instanceGrid.js";
 import { createSparseField } from "./sparseField.js";
 import { createTrilinearRadianceSampler } from "./voxelizeOnce.js";
+import { RayHitMode } from "./rayHit/RayHitConfig.js";
+import { MAX_MACRO_STEPS } from "./rayHit/RayHitPacking.js";
 
 
 // The mesh-SDF baker (a dedicated worker running bakeCore) lived here until
@@ -140,6 +142,7 @@ export function createGiField(bounds, res, atlas, options = {}) {
   //
   // See createSceneTrace's note for exactly which rays moved and which did not.
   const occField = options.occupancyField ?? null;
+  const rayHitMode = options.rayHitConfig?.activeMode ?? RayHitMode.OccupancyLegacy;
   // The composite's cell grid is chosen HERE, not by the pyramid (whose level-0
   // resolution is picked for tracing and is deliberately finer). Telling the
   // field about it before any graph is built is what lets the voxelizer write
@@ -552,13 +555,27 @@ export function createGiField(bounds, res, atlas, options = {}) {
     radianceBuffer,
     surfaceBuffer,
     normalBuffer,
+    rayHitMode,
     indirectBuffer,
     distanceTexture,
     compositeCompute,
 
     /** GPU→CPU occupancy count (diagnostics/harness only — one readback). */
     async readbackStats(renderer) {
-      const data = new Float32Array(await renderer.getArrayBufferAsync(stagingBuffer.value));
+      // A buffer that no dispatched compute has touched yet has NO GPU-side
+      // allocation, and three's getArrayBufferAsync throws "reading 'size'"
+      // on it (uncaught, it spams every tick). The spawn-blink guard made
+      // that state ordinary: bail ticks defer the composite chain while its
+      // fresh pipelines compile, so a diagnostics readback can outrun the
+      // first real dispatch. Diagnostics must never throw into the frame
+      // loop — report "not ready" instead.
+      let raw;
+      try {
+        raw = await renderer.getArrayBufferAsync(stagingBuffer.value);
+      } catch {
+        return this.stats;
+      }
+      const data = new Float32Array(raw);
       let occupiedCells = 0;
       let emissiveCells = 0;
       for (let i = 0; i < cellCount; i++) {
@@ -595,7 +612,7 @@ export function createGiField(bounds, res, atlas, options = {}) {
         radianceBuffer, { min: world.min }, res, world.cell, normalBuffer,
       );
       return occField
-        ? createOccupancySceneTrace(occField, world, sampler)
+        ? createOccupancySceneTrace(occField, world, sampler, 64, rayHitMode)
         : createGiFieldTrace(distanceTexture, world, res, atlas, sampler, sparse);
     },
     createRadianceSampler: () => createTrilinearRadianceSampler(radianceBuffer, { min: world.min }, res, world.cell),
@@ -608,8 +625,21 @@ export function createGiField(bounds, res, atlas, options = {}) {
     // the safety net for walls thinner than a coarse cell, which used to test
     // the coarse `stagingBuffer` occupancy (same 0.33m cells that lost the wall
     // in the first place) and now tests a 0.125m conservative voxel.
-    createSoftShadowTrace: (lift, steps, name = undefined, stable = false) =>
-      createShadowTrace(distanceTexture, world, res, lift, atlas, steps, stagingBuffer, name, sparse, occField, killSdf, stable),
+    // RECORD-AWARE SHADOW DISTANCE (Phase 5) is decided here, once, and folded
+    // into the trace's WGSL. `hasSurfaceRecords` is the correct signal rather
+    // than `rayHitMode`: records exist only under a plane-family mode anyway,
+    // and this is the property the oracle actually needs — whether there is
+    // anything in the `bits` tail to read.
+    // Both halves of the kill switch: `enableShadowRecords` carries the
+    // component prop (and the global, which resolveRayHitConfig already folds
+    // in), and the raw global is read again so a harness that flips it AFTER
+    // the config was resolved still takes effect. Default ON either way.
+    createSoftShadowTrace: (lift, steps, name = undefined, stable = false) => {
+      const recordAware = occField?.hasSurfaceRecords === true && killSdf &&
+        globalThis.__giRayHitShadowRecords !== false &&
+        options.rayHitConfig?.enableShadowRecords !== false;
+      return createShadowTrace(distanceTexture, world, res, lift, atlas, steps, stagingBuffer, name, sparse, occField, killSdf, stable, recordAware);
+    },
     // MIRROR RAYS stay on the sphere trace deliberately. They were a voxel DDA
     // once and moved OFF it because binary cells give stair-stepped hit
     // silhouettes where continuous distance gives smooth ones — and the spec's
@@ -696,7 +726,15 @@ function createHitSurfaceFn(atlas, minCellNode) {
 //     continuous — reaching an exact 0 where geometry truly is.
 // Receiver-side traces (emitter shadows, mirror hits) keep the sharp estimator:
 // they are visually direct and their inputs don't sweep every frame.
-function createShadowTrace(distanceTexture, world, res, lift, atlas, steps = 56, occupancy = null, name = "giShadowTrace", sparse = null, occField = null, killSdf = false, stable = false) {
+// `recordAware = true` — RECORD-AWARE SHADOW DISTANCE (2026-08-04). The oracle's
+// near field measures distance to occupied VOXEL AABBs, so its isosurface is a
+// staircase of boxes and the penumbra it feeds steps in voxel-sized blocks along
+// a shadow edge ("squarish light changes"). Where the occupied neighbour carries
+// a fitted SIMPLE plane record, the oracle reports the plane distance instead —
+// same bits buffer, no new binding, still conservative (see freeRadiusAtWorld).
+// Only the SHADOW oracle takes it: the composite, the AO taps and the mirror
+// trace keep the byte-identical pre-Phase-5 function.
+function createShadowTrace(distanceTexture, world, res, lift, atlas, steps = 56, occupancy = null, name = "giShadowTrace", sparse = null, occField = null, killSdf = false, stable = false, recordAware = false) {
   const minCell = world.minCell;
   const capWorld = world.capWorld;
   // `lift` may be a plain number or a TSL node (GISystem passes uniform-
@@ -772,7 +810,18 @@ function createShadowTrace(distanceTexture, world, res, lift, atlas, steps = 56,
       // opposite of the intent. The tolerance is the only term that moves.
       const liftV = float(liftWorld).toVar();
       const contactCut = minCellV.mul(0.25).toVar();
-      const planeCut = (occVox ? minCellV.mul(0.75).max(occVox.mul(1.5)) : minCellV.mul(0.75)).toVar();
+      // occVox·2.5 / minCell·1.0 (was 1.5 / 0.75): sized for the HUGGING-RAY
+      // case, not just the departure. A near-horizontal emitter ray skims a
+      // constant ~lift above its receiver's floor for tens of meters, so the
+      // own-plane test's margin is (planeCut − floorNoise) for the WHOLE
+      // march — and the floor's apparent distance carries up to one voxel of
+      // SAT bulge plus ~half a coarse cell of trilinear undershoot, ≈ 2.1
+      // voxels combined. The old 1.5-voxel cut sat inside that noise band, so
+      // admission flipped with lattice phase and painted concentric moiré
+      // rings of escaped emitter light across every floor (user screenshot,
+      // 2026-08-04). Real occluders lose only the sub-0.35m contact band,
+      // which soft emitter cones cannot resolve anyway.
+      const planeCut = (occVox ? minCellV.mul(1.0).max(occVox.mul(2.5)) : minCellV.mul(0.75)).toVar();
       const capCut = capWorldV.mul(0.85).toVar();
       const occCut = minCellV.mul(0.3).toVar();
       const stepMin = minCellV.mul(0.35).toVar();
@@ -874,7 +923,7 @@ function createShadowTrace(distanceTexture, world, res, lift, atlas, steps = 56,
             // whose neighbourhood is simply empty reports the oracle's own
             // ~4-voxel ceiling, which would pull `dRaw` DOWN and make open
             // space read as an occluder to `isRealOccluder`'s cap test.
-            dRaw.assign(dRaw.min(occField.freeRadiusAtWorld(p, 2, true, capWorldV)));
+            dRaw.assign(dRaw.min(occField.freeRadiusAtWorld(p, 2, true, capWorldV, recordAware)));
           });
         } else {
           // Detail slots: crisp local fields min()ed in near dense/important
@@ -1316,14 +1365,37 @@ function createGiFieldTrace(distanceTexture, world, res, atlas, radianceSampler,
  *    a wall's dark face returns dark because its cells are dark, not because a
  *    gate zeroed it.
  */
-function createOccupancySceneTrace(occField, world, radianceSampler, steps = 64) {
+function createOccupancySceneTrace(
+  occField,
+  world,
+  radianceSampler,
+  steps = 64,
+  rayHitMode = RayHitMode.OccupancyLegacy,
+) {
+  // The one place the ray-hit mode swaps implementations. Interval semantics,
+  // radiance lookup and the {rad, t} contract are identical across modes.
+  const planeMode = rayHitMode >= RayHitMode.HybridPlane &&
+    rayHitMode <= RayHitMode.HybridExactComplex && occField.traceHybridPlane;
+  const trace = planeMode
+    ? (o, d, t0, t1, opts) => occField.traceHybridPlane(o, d, t0, t1, {
+        ...opts,
+        coverage: rayHitMode >= RayHitMode.HybridPlaneCoverage,
+        exact: rayHitMode === RayHitMode.HybridExactComplex,
+      })
+    : rayHitMode === RayHitMode.HybridBrickBox && occField.traceHybridBrick
+      ? occField.traceHybridBrick
+      : occField.traceOccupancy;
   return (origin, dir, tMaxWorld) => {
     const o = vec3(origin).toVar();
     const d = vec3(dir).toVar();
     // Self-bias (spec §5.3): start a quarter of a coarse cell out so a probe
     // sitting on a surface does not instantly hit the voxel it lives in.
     const tMin = float(world.minCell).mul(0.25).toVar();
-    const r = occField.traceOccupancy(o, d, tMin, float(tMaxWorld), { steps });
+    const r = trace(o, d, tMin, float(tMaxWorld), {
+      steps,
+      macroSteps: MAX_MACRO_STEPS,
+      profile: true,
+    });
     const p = o.add(d.mul(r.t)).add(r.normal.mul(float(world.minCell).mul(0.5))).toVar();
     const shaded = radianceSampler(p, r.normal);
     const rad = vec3(shaded.rad).mul(r.hit).toVar();
@@ -1344,6 +1416,13 @@ function createOccupancySceneTrace(occField, world, radianceSampler, steps = 64)
 export function createOccupancyDebugMaterial(volume) {
   const occField = volume.occupancyField;
   const { world } = volume;
+  const hybrid = volume.rayHitMode === RayHitMode.HybridBrickBox && occField.traceHybridBrick;
+  // Plane modes shade by the DECODED record normal — the doc's required
+  // "plane-normal visualization". Flat surfaces render flat colour instead of
+  // the voxel-face quantization, which is exactly the Phase-2 acceptance look
+  // (and in exact-complex mode, curved silhouettes come from real triangles).
+  const plane = volume.rayHitMode >= RayHitMode.HybridPlane &&
+    volume.rayHitMode <= RayHitMode.HybridExactComplex && occField.traceHybridPlane;
 
   const material = new THREE.MeshBasicNodeMaterial();
   material.side = THREE.BackSide;
@@ -1369,15 +1448,49 @@ export function createOccupancyDebugMaterial(volume) {
     // report a hole the transport rays would not see just because it ran out of
     // iterations (the failure that made the sparse field look broken when the
     // MARCHER was starved).
-    const r = occField.traceOccupancy(
-      cameraPosition, dir, tEnter.max(0), tExit.max(0), { steps: 256 },
-    );
+    const r = plane
+      ? occField.traceHybridPlane(
+          cameraPosition,
+          dir,
+          tEnter.max(0),
+          tExit.max(0),
+          {
+            macroSteps: MAX_MACRO_STEPS,
+            coverage: volume.rayHitMode >= RayHitMode.HybridPlaneCoverage,
+            exact: volume.rayHitMode === RayHitMode.HybridExactComplex,
+          },
+        )
+      : hybrid
+        ? occField.traceHybridBrick(
+            cameraPosition,
+            dir,
+            tEnter.max(0),
+            tExit.max(0),
+            { macroSteps: MAX_MACRO_STEPS },
+          )
+        : occField.traceOccupancy(
+            cameraPosition, dir, tEnter.max(0), tExit.max(0), { steps: 256 },
+          );
     If(r.hit.lessThan(0.5), () => {
       Discard();
     });
     // Normal-coloured with a headlight lambert — a missing, misplaced or
     // one-voxel-thin piece of geometry is immediately readable.
     const lambert = r.normal.dot(dir.negate()).abs().mul(0.6).add(0.4);
+    if (hybrid) {
+      // Alternating macrocell tint + local 4^3 coordinates makes both levels
+      // of the Phase-1 hierarchy visible. Red rises with coarse traversal
+      // work, so bounded-step hot spots are apparent without GPU readback.
+      const macro = r.voxel.div(4).floor().toVar();
+      const parity = mod(macro.x.add(macro.y).add(macro.z), 2).toVar();
+      const local = vec3(
+        mod(r.voxel.x, 4), mod(r.voxel.y, 4), mod(r.voxel.z, 4),
+      ).div(3).toVar();
+      const base = mix(vec3(0.12, 0.32, 0.85), vec3(0.12, 0.75, 0.42), parity);
+      const heat = r.macroSteps.div(MAX_MACRO_STEPS).clamp(0, 1);
+      const color = mix(base, local, 0.35).add(vec3(heat.mul(0.7), 0, 0));
+      return vec4(color.mul(lambert), 1);
+    }
     return vec4(r.normal.mul(0.5).add(0.5).mul(lambert), 1);
   })();
   return material;

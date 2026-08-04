@@ -101,6 +101,13 @@ export class GlobalIlluminationComponent extends Component {
     // back to. Delete it again when occupancy has been measured on a
     // building-sized scene at every quality tier, not before.
     backend: "occupancy",
+    // Stable ray-hit switch. All hybrid phases are implemented (brick-box →
+    // exact-complex); unknown future values fall back to legacy.
+    rayHitMode: "occupancy-legacy",
+    rayHitProfiling: false,
+    // Phase-5 A/B kill switch for the hybrid traces' coarse pyramid ride.
+    // Default ON — off exists to measure, not to ship.
+    rayHitSkipDistance: true,
     // (`killSdf` lived here 2026-08-01 → 2026-08-02. SDF-free won on
     // measurement — the baked-SDF path put 207% of a lit frame's indirect into
     // a frame with NO direct light (the under-floor glow; the "colour bleed"
@@ -183,6 +190,9 @@ export class GlobalIlluminationComponent extends Component {
     { key: "reflections", label: "GI Reflections", type: "boolean", advanced: true, flipsToCustom: "quality" },
     { key: "exactReflections", label: "Exact Reflections (High/Ultra)", type: "boolean", advanced: true, flipsToCustom: "quality" },
     { key: "backend", label: "Tracing Backend", type: "select", options: ["occupancy", "sdf-legacy"], advanced: true, flipsToCustom: "quality" },
+    { key: "rayHitMode", label: "Ray Hit Mode", type: "select", options: ["occupancy-legacy", "hybrid-brick-box", "hybrid-plane", "hybrid-plane-coverage", "hybrid-exact-complex"], advanced: true },
+    { key: "rayHitProfiling", label: "Ray Hit Counters", type: "boolean", advanced: true },
+    { key: "rayHitSkipDistance", label: "Ray Hit Empty-Space Skip", type: "boolean", advanced: true },
     { key: "sparseField", label: "Sparse Fine Field (sub-cell occlusion)", type: "boolean", advanced: true, flipsToCustom: "quality" },
     { key: "emissiveShadows", label: "Emissive Shadows", type: "boolean", advanced: true, flipsToCustom: "quality" },
     // A LOOK control like Sky Light, deliberately not advanced/flipsToCustom:

@@ -28,3 +28,17 @@ export const giModule = {
 };
 
 export { GlobalIlluminationComponent };
+export { RayHitMode, RAY_HIT_MODE_OPTIONS, normalizeRayHitMode, rayHitModeName } from "./rayHit/RayHitConfig.js";
+export { intersectRayTriangle, buildWorldTriangles, traceTrianglesExact, validateRayHits } from "./rayHit/RayHitValidator.js";
+export {
+  BRICK_RESOLUTION,
+  BRICK_VOXEL_COUNT,
+  MAX_MACRO_STEPS,
+  MAX_BRICK_STEPS,
+  MacroCellType,
+  packMacroCellMetadata,
+  unpackMacroCellMetadata,
+  planHybridBrickLayout,
+  buildHybridBrickWords,
+  traceHybridBrickBoxesCpu,
+} from "./rayHit/RayHitPacking.js";

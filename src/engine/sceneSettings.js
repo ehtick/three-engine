@@ -268,15 +268,9 @@ export function rendererConstructorOptions(settings) {
  * Device limits worth asking for above the WebGPU baseline, resolved against
  * what the adapter actually offers.
  *
- * WHY THIS EXISTS: the baseline `maxStorageBuffersPerShaderStage` is **8**, and
- * that ceiling has shaped GI's architecture more than once — it is why the old
- * ReSTIR reservoirs had to be interleaved into fewer buffers, and it is what a
- * compute stage hits the moment the cascade trace needs one more field
- * alongside the six per-cell buffers it already binds. Most desktop adapters
- * report 16 or more; asking for it costs nothing and removes a whole class of
- * "the compute batch silently failed" bugs.
- *
- * The same applies to `maxUniformBuffersPerShaderStage`, baseline **12**. GI's
+ * GI storage-buffer graphs deliberately stay within WebGPU's portable limit
+ * of 8, so this function must never request a higher storage-buffer limit.
+ * The uniform-buffer limit is separate: baseline **12**. GI's
  * uniform-slot design (analytic light slots, emitter slots, per-mesh transform
  * tables — all deliberately uniforms so that moving a light or a mesh costs a
  * uniform write and never a rebuild) means a compute stage that combines two of
@@ -299,8 +293,6 @@ export async function resolveRendererLimits() {
   try {
     const adapter = await navigator.gpu?.requestAdapter?.();
     const requiredLimits = {};
-    const storage = adapter?.limits?.maxStorageBuffersPerShaderStage ?? 0;
-    if (storage > 8) requiredLimits.maxStorageBuffersPerShaderStage = Math.min(16, storage);
     const uniforms = adapter?.limits?.maxUniformBuffersPerShaderStage ?? 0;
     if (uniforms > 12) requiredLimits.maxUniformBuffersPerShaderStage = Math.min(24, uniforms);
     // Baseline maxStorageTexturesPerShaderStage is **4**, and the GI resolve
@@ -311,9 +303,8 @@ export async function resolveRendererLimits() {
     const storageTex = adapter?.limits?.maxStorageTexturesPerShaderStage ?? 0;
     if (storageTex > 4) requiredLimits.maxStorageTexturesPerShaderStage = Math.min(8, storageTex);
     // One line, always: when GI later refuses the occupancy backend ("device
-    // gate"), THIS is the first thing to check — a null adapter here means the
-    // device was created at baseline limits and every >8-storage /
-    // >12-uniform pipeline will silently drop.
+    // gate"), THIS is the first thing to check. Storage buffers intentionally
+    // remain at the portable baseline; only unrelated limits are raised.
     console.info(
       `[engine] webgpu adapter ${adapter ? "ok" : "NULL"} — limits ask: ${JSON.stringify(requiredLimits)}`,
     );

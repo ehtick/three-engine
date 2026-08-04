@@ -47,6 +47,8 @@ const AB = !!process.env.AB;
 const CAM = !!process.env.CAM;
 // SPLIT=1: the peak-split A/B — see the SPLIT block below.
 const SPLIT = !!process.env.SPLIT;
+// RAYHIT=1: hybrid ray-hit mode cost (Phases 2-5) — see the RAYHIT block below.
+const RAYHIT = !!process.env.RAYHIT;
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const browser = await puppeteer.launch({
@@ -76,7 +78,7 @@ page.on("console", (m) => {
   const t = m.text();
   // "per 120 frames" is the __giLogComposite line — it says whether a moving
   // LIGHT is triggering geometry composites, i.e. work that is pure waste.
-  if (/\[gi\] built|\[gi\] occupancy backend|webgpu adapter ok|per 120 frames/.test(t)) console.log(`  ${t.slice(0, 200)}`);
+  if (/\[gi\] built|\[gi\] occupancy backend|\[gi\] ray-hit|webgpu adapter ok|per 120 frames/.test(t)) console.log(`  ${t.slice(0, 200)}`);
   if (/\[gi\] built/.test(t)) built = true;
   if (m.type() === "error" && !/favicon/.test(t)) console.log(`  console.error: ${t.slice(0, 300)}`);
 });
@@ -514,6 +516,89 @@ for (const quality of QUALITIES) {
         `→ ${((r.objSplit.gpuCompute / r.objNoSplit.gpuCompute - 1) * 100).toFixed(0)}%`);
     }
     console.log(`    asleep ${r.rest?.gpuCompute?.toFixed(2)} (unchanged by this fix)`);
+    report[quality] = r;
+    continue;
+  }
+  if (RAYHIT) {
+    // HYBRID RAY-HIT COST (Phases 2-5) — what does plane/coverage/exact
+    // accuracy cost on the REAL scene vs legacy occupancy. `rayHitMode` is
+    // STRUCTURAL (GISystem #structuralSignature) so every mode change is a
+    // full GI rebuild — absolutes drift across rebuilds on this box, so
+    // legacy rebuilds are INTERLEAVED between the hybrid ones and each hybrid
+    // arm is judged against the mean of its legacy neighbours, same rule as
+    // the AB block. The driver is the light spin (wakes the field without
+    // re-voxelizing), i.e. the pure "awake trace cost" the hybrid leaf work
+    // adds to; rest arms confirm the idle sleep stays mode-independent.
+    const savedMode = gi.props?.rayHitMode ?? "occupancy-legacy";
+    const driver = sun ? { spin: { id: sun.id } } : sphere ? { mover: { id: sphere.id } } : null;
+    if (!driver) { console.log("  !! no sun and no mover — RAYHIT sweep needs an awake driver"); continue; }
+    const setMode = async (mode) => {
+      // The remount storm after ANY structural rebuild takes __editorApi with
+      // it for a stretch (this exact line killed a run: "Cannot read
+      // properties of undefined (reading 'call')"). Wait it out and retry the
+      // setProp — must() alone dies on the first dead-api beat.
+      built = false;
+      let set = { ok: false, error: "not attempted" };
+      for (let attempt = 0; attempt < 6 && !set.ok; attempt++) {
+        await page.waitForFunction(() => !!globalThis.__editorApi?.entities, { timeout: 120000 }).catch(() => {});
+        set = await call("component.setProp", { id: giEntity.id, type: "global-illumination", key: "rayHitMode", value: mode });
+        if (!set.ok) await wait(5000);
+      }
+      if (!set.ok) throw new Error(`setMode(${mode}) failed after retries: ${set.error}`);
+      for (let i = 0; i < 180 && !built; i++) await wait(500);
+      // The boot path settles 8s + 15s after `[gi] built` for a reason: the
+      // rebuild WAVE (second build + React remount) lands seconds later, and
+      // an arm that starts inside it measures a suspended GI (computes 0) —
+      // the first RAYHIT run lost 3 of 5 arms exactly that way, with each
+      // arm's build banner printing AFTER its measurement lines.
+      await wait(8000);
+      await waitForWave(5000);
+      await page.waitForFunction(() => !!globalThis.__editorApi?.entities, { timeout: 120000 }).catch(() => {});
+    };
+    // An awake arm that dispatched nothing measured a stalled rebuild, not
+    // the mode — re-settle and take it again rather than reporting a lie.
+    const awakeArm = async (key, tag, opts) => {
+      await arm(key, tag, opts);
+      if (r[key] && r[key].gpuCompute === 0 && r[key].computeCalls === 0) {
+        console.log(`  ${tag.padEnd(26)} dispatched no compute — re-settling and remeasuring`);
+        await wait(10000);
+        await waitForWave(3000);
+        await arm(key, `${tag} (retry)`, opts);
+      }
+    };
+    const modes = [
+      "occupancy-legacy", "hybrid-plane-coverage",
+      "occupancy-legacy", "hybrid-exact-complex",
+      "occupancy-legacy",
+    ];
+    const series = [];
+    for (let i = 0; i < modes.length; i++) {
+      const mode = modes[i];
+      await setMode(mode);
+      await awakeArm(`awake${i}`, `${mode} awake`, { ms: MEASURE_MS, ...driver });
+      await arm(`rest${i}`, `${mode} rest`, { ms: MEASURE_MS });
+      series.push([mode, r[`awake${i}`], r[`rest${i}`]]);
+    }
+    console.log(`\n  RAY-HIT MODE COST (${quality}) — GPU compute ms, ${sun ? "light changing" : "object moving"}:`);
+    for (let i = 0; i < series.length; i++) {
+      const [mode, awake, rest] = series[i];
+      if (!awake) continue;
+      if (mode === "occupancy-legacy") {
+        console.log(`    legacy                 awake ${awake.gpuCompute.toFixed(2)}  rest ${rest?.gpuCompute?.toFixed(2) ?? "?"}`);
+        continue;
+      }
+      const prev = series[i - 1]?.[1]?.gpuCompute;
+      const next = series[i + 1]?.[1]?.gpuCompute;
+      const neighbours = [prev, next].filter((v) => Number.isFinite(v));
+      const ref = neighbours.reduce((x, y) => x + y, 0) / Math.max(1, neighbours.length);
+      const pct = ref > 0 ? ((awake.gpuCompute / ref - 1) * 100).toFixed(0) : "?";
+      console.log(
+        `    ${mode.padEnd(22)} awake ${awake.gpuCompute.toFixed(2)}  rest ${rest?.gpuCompute?.toFixed(2) ?? "?"}  ` +
+        `vs legacy neighbours ${ref.toFixed(2)}  →  ${pct}%`,
+      );
+    }
+    await setMode(savedMode);
+    console.log(`  restored rayHitMode ${savedMode}`);
     report[quality] = r;
     continue;
   }

@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GI portable WebGPU smoke</title>
+    <style>html,body,canvas{margin:0;width:100%;height:100%;display:block;background:#111}</style>
+  </head>
+  <body>
+    <canvas id="view" width="320" height="240"></canvas>
+    <script type="module">
+      const fail = (error) => {
+        console.error("GI-SMOKE FAIL", error?.stack ?? error?.message ?? String(error));
+        globalThis.__GI_SMOKE_RESULT__ = { pass: false, error: error?.message ?? String(error) };
+      };
+      globalThis.addEventListener("error", (event) => fail(event.error ?? event.message));
+      globalThis.addEventListener("unhandledrejection", (event) => fail(event.reason));
+
+      try {
+        const rayHitMode = new URLSearchParams(location.search).get("mode") ?? "hybrid-brick-box";
+        const ACTIVE_MODES = {
+          "occupancy-legacy": 0,
+          "hybrid-brick-box": 1,
+          "hybrid-plane": 2,
+          "hybrid-plane-coverage": 3,
+          "hybrid-exact-complex": 4,
+        };
+        const expectedActiveMode = ACTIVE_MODES[rayHitMode] ?? 0;
+        const hybridMode = expectedActiveMode >= 1;
+        const planeMode = expectedActiveMode >= 2;
+        const exactMode = expectedActiveMode >= 4;
+        // Phase 5 A/B: `?skip=0` compiles the no-coarse-level arm. Default on,
+        // matching the runtime default, so the plain URL still smokes shipping
+        // behaviour.
+        const coarseSkip = new URLSearchParams(location.search).get("skip") !== "0";
+        // Force the Phase-1 hierarchy and its debug binding into the composed
+        // cascade shader. This is the binding-budget regression gate.
+        globalThis.__giRayHitProfiling = true;
+        globalThis.__giRayHitMode = rayHitMode;
+        globalThis.__giRayHitSkipDistance = coarseSkip;
+        const { Engine, THREE, registerBuiltInComponents } = await import("/src/engine/index.js");
+        await import("/src/modules/index.js");
+        const { enableEngineModule } = await import("/src/engine/modules.js");
+
+        registerBuiltInComponents();
+        const engine = new Engine();
+        globalThis.__GI_SMOKE_ENGINE__ = engine;
+        engine.setSize(320, 240);
+        await engine.init(document.querySelector("#view"));
+        if (engine.getBackendName() !== "WebGPU") throw new Error(`WebGPU unavailable (${engine.getBackendName()})`);
+        const device = engine.renderer.backend.device;
+        const validationErrors = [];
+        device.addEventListener?.("uncapturederror", (event) => {
+          validationErrors.push(event.error?.message ?? String(event.error));
+          console.error("WebGPU validation error:", validationErrors.at(-1));
+        });
+        if (device.limits.maxStorageBuffersPerShaderStage !== 8) {
+          throw new Error(`smoke device was not created at portable storage-buffer limit 8 (got ${device.limits.maxStorageBuffersPerShaderStage})`);
+        }
+
+        await enableEngineModule(engine, "gi");
+        const material = new THREE.MeshStandardNodeMaterial({ color: 0x888888, roughness: 0.9 });
+        const floor = new THREE.Mesh(new THREE.BoxGeometry(8, 0.2, 8).toNonIndexed(), material);
+        floor.position.y = -1;
+        const wall = new THREE.Mesh(new THREE.BoxGeometry(0.2, 3, 8).toNonIndexed(), material);
+        wall.position.x = -2;
+        floor.updateMatrixWorld(true);
+        wall.updateMatrixWorld(true);
+        engine.scene.add(floor, wall);
+        const sun = new THREE.DirectionalLight(0xffffff, 2);
+        sun.position.set(2, 4, 2);
+        engine.scene.add(sun);
+        const camera = new THREE.PerspectiveCamera(55, 320 / 240, 0.1, 50);
+        camera.position.set(5, 3, 5);
+        camera.lookAt(0, 0, 0);
+        engine.scene.add(camera);
+        engine.camera = camera;
+
+        const gi = engine.createEntity({ name: "GI Smoke" });
+        gi.addComponent("global-illumination", {
+          autoFit: true,
+          quality: "low",
+          cascadeCount: 2,
+          c0DirRes: 2,
+          reflections: false,
+          exactReflections: false,
+          ao: false,
+          debugProbes: hybridMode ? "occupancy" : "off",
+          rayHitMode,
+          rayHitProfiling: true,
+        });
+        engine.start();
+
+        const deadline = performance.now() + 60_000;
+        let stats = null;
+        while (performance.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          const system = engine.modules.get("gi")?.system;
+          if (!system?.state || engine.renderSuspended || validationErrors.length) continue;
+          stats = await system.readRayHitStats();
+          if (stats?.rays > 0 &&
+            (!hybridMode || stats.brickSteps > 0) &&
+            (!planeMode || stats.planeTests > 0) &&
+            (!exactMode || stats.complexTests > 0)) break;
+        }
+        engine.stop();
+        const bindingAudit = [];
+        const state = engine.modules.get("gi")?.system?.state;
+        if (state?.rayHitConfig?.activeMode !== expectedActiveMode) {
+          throw new Error(`ray-hit mode ${rayHitMode} did not activate (active=${state?.rayHitConfig?.activeMode})`);
+        }
+        for (const [index, node] of (state?.queue ?? []).entries()) {
+          const shader = engine.renderer._nodes?.getForCompute?.(node)?.computeShader ?? "";
+          const storageBindings = [...shader.matchAll(/var<storage[^>]*>/g)].length;
+          if (storageBindings >= 8) {
+            const names = shader.split("\n").filter((line) => line.includes("var<storage"));
+            bindingAudit.push({ index, storageBindings, bytes: shader.length, names });
+          }
+        }
+        console.log("GI-SMOKE BINDINGS", JSON.stringify(bindingAudit));
+        if (validationErrors.length) throw new Error(validationErrors.join(" | "));
+        if (!stats?.rays) throw new Error("GI traversal counters stayed at zero");
+        if (hybridMode && !stats.brickSteps) {
+          throw new Error("hybrid local-brick traversal counters stayed at zero");
+        }
+        if (planeMode && !stats.planeTests) {
+          throw new Error("plane-mode traversal never consulted a surface record");
+        }
+        if (planeMode && !stats.planeAccepts) {
+          throw new Error("plane-mode traversal never accepted a plane hit");
+        }
+        if (exactMode && !stats.complexTests) {
+          throw new Error("exact-complex traversal never entered a complex cell");
+        }
+        if (exactMode && !stats.triangleTests) {
+          throw new Error("exact-complex traversal never tested a triangle");
+        }
+        let surfaceAlloc = null;
+        if (planeMode) {
+          surfaceAlloc = await engine.modules.get("gi").system.state.volume
+            .occupancyField.readbackSurfaceAlloc(engine.renderer);
+          if (!surfaceAlloc?.allocated) throw new Error("surface-record pool allocated zero records");
+          if (surfaceAlloc.overflowBricks) {
+            throw new Error(`surface-record pool overflowed on ${surfaceAlloc.overflowBricks} bricks in a tiny scene`);
+          }
+        }
+        if (stats.stepLimitExits !== 0) throw new Error(`GI traversal exhausted its step limit ${stats.stepLimitExits} times`);
+        if (stats.macroStepLimitExits !== 0 || stats.brickStepLimitExits !== 0) {
+          throw new Error(`hybrid traversal limit detail macro=${stats.macroStepLimitExits} brick=${stats.brickStepLimitExits}`);
+        }
+        if (stats.invalidNumerics !== 0) throw new Error(`GI traversal produced ${stats.invalidNumerics} invalid numeric results`);
+        // The ride was always-on and never measured; these three make the A/B
+        // real — that the skip engages, that it actually advances through
+        // empty space (descend-only would be a ride that never pays), and
+        // that `skip=0` compiled the coarse levels OUT rather than predicating
+        // them away.
+        if (hybridMode && coarseSkip && !stats.coarseSteps) {
+          throw new Error("coarse pyramid ride never engaged");
+        }
+        if (hybridMode && coarseSkip && !(stats.coarseSkipsL3 + stats.coarseSkipsL4)) {
+          throw new Error("coarse skip never advanced through empty space");
+        }
+        if (hybridMode && !coarseSkip && stats.coarseSteps !== 0) {
+          throw new Error(`skip=0 arm still executed ${stats.coarseSteps} coarse levels`);
+        }
+        globalThis.__GI_SMOKE_RESULT__ = {
+          pass: true,
+          storageLimit: device.limits.maxStorageBuffersPerShaderStage,
+          aggregateGpuMs: engine.stats.readout.gpuMs,
+          stats,
+          surfaceAlloc,
+          bindingAudit,
+        };
+        console.log(
+          `GI-SMOKE PASS storage=8 mode=${rayHitMode} rays=${stats.rays} ` +
+          `avgMacro=${stats.averageMacroSteps.toFixed(2)} avgBrick=${stats.averageBrickSteps.toFixed(2)} ` +
+          `maxMacro=${stats.maxMacroSteps} maxBrick=${stats.maxBrickSteps} ` +
+          (hybridMode
+            ? `coarse=${stats.coarseSteps} skipL3=${stats.coarseSkipsL3} ` +
+              `skipL4=${stats.coarseSkipsL4} descends=${stats.coarseDescends} ` +
+              `skip=${coarseSkip ? "on" : "off"} `
+            : "") +
+          (planeMode
+            ? `planeTests=${stats.planeTests} planeAccepts=${stats.planeAccepts} ` +
+              `planeRejects=${stats.planeRejects} boxFallbacks=${stats.surfaceFallbacks} ` +
+              `surfRecords=${surfaceAlloc.allocated}/${surfaceAlloc.capacity} `
+            : "") +
+          (exactMode
+            ? `complexTests=${stats.complexTests} triTests=${stats.triangleTests} ` +
+              `complexAccepts=${stats.complexAccepts} complexMisses=${stats.complexMisses} ` +
+              `poolTris=${surfaceAlloc.triangles ?? 0} complexOverflow=${surfaceAlloc.complexOverflowCells ?? 0} `
+            : "") +
+          `limitExits=0 invalid=0 aggregateGpuMs=${engine.stats.readout.gpuMs.toFixed(2)}`,
+        );
+      } catch (error) {
+        fail(error);
+      }
+    </script>
+  </body>
+</html>

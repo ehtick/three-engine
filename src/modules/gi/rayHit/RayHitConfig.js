@@ -1,0 +1,84 @@
+/**
+ * Stable runtime identifiers for the GI ray/scene query.
+ *
+ * OccupancyLegacy and the Phase-1 HybridBrickBox path are implemented. Later
+ * modes deliberately resolve back to legacy until their GPU path is complete,
+ * so selecting an experimental mode can never silently turn GI off.
+ */
+export const RayHitMode = Object.freeze({
+  OccupancyLegacy: 0,
+  HybridBrickBox: 1,
+  HybridPlane: 2,
+  HybridPlaneCoverage: 3,
+  HybridExactComplex: 4,
+});
+
+export const RAY_HIT_MODE_OPTIONS = Object.freeze([
+  "occupancy-legacy",
+  "hybrid-brick-box",
+  "hybrid-plane",
+  "hybrid-plane-coverage",
+  "hybrid-exact-complex",
+]);
+
+const MODE_BY_NAME = Object.freeze({
+  "occupancy-legacy": RayHitMode.OccupancyLegacy,
+  "hybrid-brick-box": RayHitMode.HybridBrickBox,
+  "hybrid-plane": RayHitMode.HybridPlane,
+  "hybrid-plane-coverage": RayHitMode.HybridPlaneCoverage,
+  "hybrid-exact-complex": RayHitMode.HybridExactComplex,
+});
+
+export function normalizeRayHitMode(value) {
+  if (Number.isInteger(value) && value >= RayHitMode.OccupancyLegacy && value <= RayHitMode.HybridExactComplex) {
+    return value;
+  }
+  return MODE_BY_NAME[String(value ?? "").toLowerCase()] ?? RayHitMode.OccupancyLegacy;
+}
+
+export function rayHitModeName(mode) {
+  return RAY_HIT_MODE_OPTIONS[normalizeRayHitMode(mode)];
+}
+
+/**
+ * Resolves authoring properties and diagnostic globals into one immutable
+ * build configuration. All four hybrid phases are implemented: HybridBrickBox
+ * (Phase 1), HybridPlane (Phase 2), HybridPlaneCoverage (Phase 3) and
+ * HybridExactComplex (Phase 4). Unknown future values keep the explicit
+ * legacy fallback so a stale saved mode can never silently turn GI off.
+ *
+ * `enableSkipDistance` is an OPT-OUT, not an opt-in: the conservative coarse
+ * pyramid ride in the hybrid traces shipped always-on inside Phase 1, so this
+ * flag is only the Phase-5 A/B kill switch. It defaults ON; set
+ * `globalThis.__giRayHitSkipDistance = false` or the component prop
+ * `rayHitSkipDistance: false` to disable it for a comparison run.
+ *
+ * `enableShadowRecords` is the matching Phase-5 kill switch for RECORD-AWARE
+ * SHADOW DISTANCE: the soft-shadow oracle sharpening an occupied neighbour's
+ * voxel-AABB gap with that voxel's fitted SIMPLE plane, which is what unstairs
+ * the shadow silhouettes. It defaults ON too; `__giRayHitShadowRecords = false`
+ * or the prop `rayHitShadowRecords: false` reverts to the pure box gap, and the
+ * two arms differ in WGSL (a separate compiled oracle variant), not in a runtime
+ * predicate.
+ */
+export function resolveRayHitConfig(props = {}, runtime = globalThis) {
+  const requestedMode = normalizeRayHitMode(runtime.__giRayHitMode ?? props.rayHitMode);
+  const activeMode = requestedMode >= RayHitMode.HybridBrickBox &&
+    requestedMode <= RayHitMode.HybridExactComplex
+    ? requestedMode
+    : RayHitMode.OccupancyLegacy;
+  return Object.freeze({
+    requestedMode,
+    activeMode,
+    fallbackToLegacy: requestedMode !== activeMode,
+    enableProfiling: runtime.__giRayHitProfiling === true || props.rayHitProfiling === true,
+    enableSkipDistance: runtime.__giRayHitSkipDistance !== false && props.rayHitSkipDistance !== false,
+    enableShadowRecords: runtime.__giRayHitShadowRecords !== false && props.rayHitShadowRecords !== false,
+    enableRayConeLOD: runtime.__giRayHitConeLOD === true,
+    enableDynamicOverlay: runtime.__giRayHitDynamicOverlay === true,
+    enableComplexTriangles: runtime.__giRayHitComplexTriangles === true,
+    visualizeTraversal: runtime.__giRayHitVisualizeTraversal === true,
+    validateAgainstLegacy: runtime.__giRayHitValidateLegacy === true,
+    validateAgainstCPU: runtime.__giRayHitValidateCPU === true,
+  });
+}

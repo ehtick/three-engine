@@ -66,10 +66,57 @@
 // else reads. 1.6 MB for zero risk.
 import * as THREE from "three/webgpu";
 import {
-  Break, Fn, If, Loop, Return, atomicLoad, atomicMax, atomicOr, atomicStore, bitAnd, bitOr, float, floor,
-  instanceIndex, instancedArray, int, mod, select, shiftLeft, shiftRight, uint, uniform, uniformArray, vec3, vec4,
+  Break, Fn, If, Loop, Return, atomicAdd, atomicLoad, atomicMax, atomicOr, atomicStore, bitAnd, bitOr,
+  countOneBits, float, floatBitsToUint, floor, instanceIndex, instancedArray, int, mod, packSnorm2x16,
+  select, shiftLeft, shiftRight, uint, uintBitsToFloat, uniform, uniformArray, unpackSnorm2x16, vec2,
+  vec3, vec4,
 } from "three/tsl";
 import { sharedFn } from "./giFn.js";
+import { createRayHitDebugBuffer } from "./rayHit/RayHitDebug.js";
+import { octDecodeTSL, octEncodeTSL } from "./rayHit/rayHitTSL.js";
+import {
+  BRICK_COMPLEX_OFFSET_WORD,
+  BRICK_HEADER_WORDS,
+  BRICK_OCCUPANCY_HIGH_WORD,
+  BRICK_OCCUPANCY_LOW_WORD,
+  BRICK_RESOLUTION,
+  BRICK_SURFACE_OFFSET_WORD,
+  CELL_LOCAL_PLANE_OFFSET_RANGE,
+  COMPLEX_RANGE_COUNT_MASK,
+  COMPLEX_RANGE_COUNT_SHIFT,
+  COMPLEX_RANGE_OFFSET_MASK,
+  COMPLEX_TRIANGLE_WORDS,
+  COVERAGE_FLAGS_SHIFT,
+  COVERAGE_VALID_SHIFT,
+  INVALID_RAY_HIT_INDEX,
+  MACRO_CELL_BRICK_INDEX_WORD,
+  MACRO_CELL_COVERAGE_SHIFT,
+  MACRO_CELL_METADATA_WORD,
+  MACRO_CELL_TYPE_MASK,
+  MACRO_CELL_TYPE_SHIFT,
+  MACRO_CELL_WORDS,
+  MAX_BRICK_STEPS,
+  MAX_COMPLEX_TRIANGLES,
+  MAX_MACRO_STEPS,
+  MacroCellType,
+  PLANE_HIT_INTERVAL_EPSILON,
+  RAY_HIT_DDA_EPSILON,
+  RECORD_AWARE_PLANE_SLACK,
+  RAY_HIT_DIRECTION_EPSILON,
+  SIMPLE_MAX_PLANE_SIGMA,
+  SIMPLE_MAX_TRIANGLES,
+  SIMPLE_MIN_COHERENCE,
+  SIMPLE_PLANE_IN_CELL_EPSILON,
+  SURFACE_FIT_SCALE,
+  SURFACE_FLAG_COMPLEX,
+  SURFACE_FLAG_SIMPLE,
+  SURFACE_MAX_WEIGHT,
+  SURFACE_MIN_WEIGHT,
+  SURFACE_RECORD_WORDS,
+  SURFACE_SCRATCH_WORDS,
+  packMacroCellMetadata,
+  planHybridBrickLayout,
+} from "./rayHit/RayHitPacking.js";
 
 /** Pyramid depth. Level L voxels are 2^L × the level-0 voxel. */
 export const OCC_LEVELS = 5;
@@ -86,6 +133,21 @@ const RES_QUANTUM = 1 << (OCC_LEVELS - 1);
 const CHUNK_VOXELS = 512;
 /** Loop iterations the hierarchical DDA is allowed. Descents count. */
 const DEFAULT_TRACE_STEPS = 96;
+/**
+ * RECORD-AWARE SHADOW DISTANCE slack, in LEVEL-0 VOXEL UNITS (the same unit the
+ * record's plane offset is quantized in — see CELL_LOCAL_PLANE_OFFSET_RANGE).
+ *
+ * A record's fitted plane is not the geometry, it is a least-squares fit whose
+ * residual the classifier already bounds by `SIMPLE_MAX_PLANE_SIGMA`; the extra
+ * margin covers the snorm16 quantization of the offset and the octahedral
+ * normal. Subtracting it before the distance is used keeps the oracle
+ * CONSERVATIVE — the whole reason a shadow trace is allowed to sphere-step on
+ * this number. ONE definition, in RayHitPacking next to the sigma it rides on:
+ * the CPU property suite measured the true requirement at 0.0948 against this
+ * 0.12 — 1.27x headroom, all of it from the sigma ceiling, so the two must
+ * move together or the conservativeness proof breaks.
+ */
+const RECORD_PLANE_SLACK = RECORD_AWARE_PLANE_SLACK;
 
 // ───────────────────────────────────────────────────────────── level geometry
 
@@ -126,13 +188,52 @@ export function quantizeOccupancyRes(want) {
  * @param {{min: THREE.Vector3, max: THREE.Vector3}} bounds world AABB — the SAME OBJECT the SDF
  *   volume holds, so `setBounds` mutating it in place is what an in-place refit means here too
  * @param {{x,y,z}} res0 level-0 resolution — pass through `quantizeOccupancyRes` first
- * @param {{slotCapacity?: number, traceSteps?: number}} [options]
+ * @param {{slotCapacity?: number, traceSteps?: number, enableProfiling?: boolean,
+ *   countLegacyFallbacks?: boolean, enableHybridBrick?: boolean,
+ *   enableSurfaceRecords?: boolean, surfaceRecordCapacity?: number,
+ *   enableComplexTriangles?: boolean, complexTriangleCapacity?: number,
+ *   rayHitCoarseSkip?: boolean}} [options]
  */
 export function createOccupancyField(bounds, res0, options = {}) {
   const { levels, totalWords } = planLevels(res0);
   const level0 = levels[0];
   const slotCapacity = Math.max(1, options.slotCapacity ?? 512);
   const traceSteps = Math.max(16, options.traceSteps ?? DEFAULT_TRACE_STEPS);
+  const hybridLayout = planHybridBrickLayout(res0);
+  // Phase 2/3 imply the Phase-1 hierarchy: surface records are addressed by a
+  // voxel's rank inside its brick mask, so the plane path cannot exist without
+  // the macrocell/brick tail.
+  const hybridEnabled = options.enableHybridBrick === true || options.enableSurfaceRecords === true;
+  const surfaceEnabled = hybridEnabled && options.enableSurfaceRecords === true;
+  // Compact CAPPED pool (never dense): surfaces are ~2D, so occupied level-0
+  // voxels are a few percent of the grid. /16 covers the measured Sponza-class
+  // ratio with headroom; overflow degrades those bricks to occupied-box
+  // fallback and increments a diagnostic — it can never become a miss.
+  const level0VoxelCount = res0.x * res0.y * res0.z;
+  const surfaceCapacity = surfaceEnabled
+    ? Math.min(1 << 20, Math.max(1 << 14, options.surfaceRecordCapacity ?? Math.ceil(level0VoxelCount / 16)))
+    : 0;
+  // Phase 4: complex cells keep their SHORT exact triangle list instead of
+  // degrading to an occupied box. The pool is capped for the same reason the
+  // record pool is — overflow leaves the record zero (box fallback) and counts
+  // a diagnostic, never a miss. 2 triangles per record is the measured
+  // Sponza-class ratio for cells that fail the simple fit; each costs 36 B.
+  const complexEnabled = surfaceEnabled && options.enableComplexTriangles === true;
+  const complexTriangleCapacity = complexEnabled
+    ? Math.min(1 << 21, Math.max(1 << 12, options.complexTriangleCapacity ?? surfaceCapacity * 2))
+    : 0;
+  // Phase 5: the conservative pyramid ride (levels 3-4) has been ALWAYS-ON
+  // since Phase 1, so its cost/benefit was never isolable. This is the A/B
+  // kill switch, default on: disabled the traces start at level 2 and the
+  // coarse branch is not emitted at all, so the two arms differ in WGSL, not
+  // just in a runtime predicate.
+  const coarseSkipEnabled = options.rayHitCoarseSkip !== false;
+  // Opt-in so ordinary rendering keeps the exact pre-Phase-0 graph and cost.
+  // When enabled this is the ONE extra storage binding used by all ray-hit
+  // counters; do not split counters into per-cascade/per-kind buffers.
+  const rayHitDebug = options.enableProfiling
+    ? createRayHitDebugBuffer({ countLegacyFallbacks: options.countLegacyFallbacks === true })
+    : null;
 
   // Origin and level-0 voxel size as uniforms, OWNED HERE rather than borrowed
   // from the SDF volume's `world` bundle. They describe the same box, but they
@@ -156,8 +257,28 @@ export function createOccupancyField(bounds, res0, options = {}) {
   syncVoxel();
 
   // ────────────────────────────────────────────────────────────── the bitsets
-  const bits = instancedArray(new Uint32Array(totalWords), "uint");
+  const hybridWordOffset = totalWords;
+  const surfaceWordOffset = totalWords + (hybridEnabled ? hybridLayout.totalWords : 0);
+  const trianglePoolWordOffset = surfaceWordOffset + surfaceCapacity * SURFACE_RECORD_WORDS;
+  const bits = instancedArray(new Uint32Array(
+    trianglePoolWordOffset + complexTriangleCapacity * COMPLEX_TRIANGLE_WORDS,
+  ), "uint");
   const atomicBits = instancedArray(new Uint32Array(level0.words), "uint").toAtomic();
+  // Phase-1 macrocell/brick records, the Phase-2 surface-record pool and the
+  // Phase-4 triangle pool are appended to this same allocation, never exposed
+  // as a second storage binding: the composed cascade kernel already sits at
+  // the portable eight-storage-buffer stage limit. Legacy offsets remain
+  // unchanged and legacy-only builds allocate no tail at all.
+  // Build-only scratch for the surface fit (fixed-point atomic accumulators)
+  // and the pool allocator [recordNext, overflowBricks, triangleNext,
+  // complexOverflowCells]. Bound exclusively in build kernels, which sit far
+  // below the binding wall.
+  const surfScratch = surfaceEnabled
+    ? instancedArray(new Int32Array(surfaceCapacity * SURFACE_SCRATCH_WORDS), "int").toAtomic()
+    : null;
+  const surfAlloc = surfaceEnabled
+    ? instancedArray(new Uint32Array(4), "uint").toAtomic()
+    : null;
 
   // ── STATIC/DYNAMIC SPLIT ──────────────────────────────────────────────────
   //
@@ -294,7 +415,13 @@ export function createOccupancyField(bounds, res0, options = {}) {
     levels: levels.map((l) => ({ ...l.res })),
     voxelSize: 0,
     totalWords,
-    bytes: (totalWords + level0.words) * 4,
+    bytes: (
+      totalWords + level0.words + (hybridEnabled ? hybridLayout.totalWords : 0) +
+      surfaceCapacity * (SURFACE_RECORD_WORDS + SURFACE_SCRATCH_WORDS) +
+      complexTriangleCapacity * COMPLEX_TRIANGLE_WORDS
+    ) * 4,
+    surfaceCapacity,
+    complexTriangleCapacity,
     triangles: 0,
     pairs: 0,
     slots: 0,
@@ -442,8 +569,19 @@ export function createOccupancyField(bounds, res0, options = {}) {
     return ok;
   };
 
-  /** Zeroes the atomic level-0 scratch. One thread per word. */
-  const clearCompute = Fn(() => {
+  /**
+   * Zeroes the atomic level-0 scratch. One thread per word. A BUILDER, and
+   * that is load-bearing for the SPAWN-BLINK GUARD (GISystem #tick): the
+   * clear is the one DESTRUCTIVE stable node in the full chain, and a
+   * geometry change rebuilds the voxelize nodes — if the clear kept its
+   * old compiled pipeline it would EXECUTE in the same dispatch where the
+   * fresh voxelize nodes are skipped (async pipeline compiles), leaving an
+   * empty pyramid for every trace until the pipelines land. Rebuilding the
+   * clear WITH the voxelize nodes makes the whole trigger dispatch
+   * uncompiled-together, so the skip mechanism itself keeps the chain
+   * atomic: nothing of it runs until all of it can.
+   */
+  const buildClearCompute = () => Fn(() => {
     atomicStore(atomicBits.element(instanceIndex), uint(0));
   })().compute(level0.words);
 
@@ -669,7 +807,580 @@ export function createOccupancyField(bounds, res0, options = {}) {
    *          which is better than the SDF-gradient normals it replaces
    *   voxel  level-0 integer voxel coords of the hit (for radiance lookups)
    */
-  const traceBody = (origin, dir, tMin, tMax, steps, topLevel, penK = null) => {
+  // Phase-1 build pass: one invocation per 4^3 macrocell. It mirrors the
+  // current level-0 occupancy bits exactly into a dense 64-bit brick mask.
+  // Dense brick indices make rebuilds deterministic and eliminate allocation,
+  // atomics, and invalidation hazards; empty macrocells still carry an invalid
+  // brick reference and no leaf surface records.
+  //
+  // With surface records enabled the pass changes in exactly two ways:
+  //  · it never touches the surface/complex offset words — the allocator pass
+  //    owns them, and this kernel re-runs on every FAST (dynamic-only) chain,
+  //    where clobbering them would erase the static allocation;
+  //  · a brick whose mask contains any bit ABSENT from the static snapshot is
+  //    typed DynamicBrick. The plane path ignores records in such bricks (the
+  //    records were fitted and rank-addressed against the static mask), while
+  //    traversal still visits them with occupied-box semantics.
+  const hybridBuildCompute = hybridEnabled
+    ? Fn(() => {
+        const macroIndex = instanceIndex.toVar();
+        const mx = macroIndex.mod(uint(hybridLayout.macroResolution.x)).toVar();
+        const my = macroIndex.div(uint(hybridLayout.macroResolution.x))
+          .mod(uint(hybridLayout.macroResolution.y)).toVar();
+        const mz = macroIndex.div(uint(
+          hybridLayout.macroResolution.x * hybridLayout.macroResolution.y,
+        )).toVar();
+        const low = uint(0).toVar();
+        const high = uint(0).toVar();
+        const occupiedCount = uint(0).toVar();
+        const dynamicCount = surfaceEnabled ? uint(0).toVar() : null;
+
+        // Same bounds-checked layout as occupiedAtLevel0, over the static
+        // level-0 snapshot (whose word layout mirrors the pyramid's level 0).
+        const staticOccupiedAtLevel0 = (v) => {
+          const l0 = levels[0];
+          const inside = v.x.greaterThanEqual(0).and(v.y.greaterThanEqual(0)).and(v.z.greaterThanEqual(0))
+            .and(v.x.lessThan(l0.res.x)).and(v.y.lessThan(l0.res.y)).and(v.z.lessThan(l0.res.z));
+          const xi = v.x.max(0).min(l0.res.x - 1).toUint().toVar();
+          const yi = v.y.max(0).min(l0.res.y - 1).toUint().toVar();
+          const zi = v.z.max(0).min(l0.res.z - 1).toUint().toVar();
+          const word = zi.mul(uint(l0.res.y)).add(yi).mul(uint(l0.wordsPerRow))
+            .add(shiftRight(xi, uint(5)));
+          const raw = bitAnd(shiftRight(staticBits.element(word), bitAnd(xi, uint(31))), uint(1)).toFloat();
+          return select(inside, raw, float(0));
+        };
+
+        for (let z = 0; z < BRICK_RESOLUTION; z++) {
+          for (let y = 0; y < BRICK_RESOLUTION; y++) {
+            for (let x = 0; x < BRICK_RESOLUTION; x++) {
+              const gx = mx.mul(uint(BRICK_RESOLUTION)).add(uint(x));
+              const gy = my.mul(uint(BRICK_RESOLUTION)).add(uint(y));
+              const gz = mz.mul(uint(BRICK_RESOLUTION)).add(uint(z));
+              const occupied = occupiedAtLevel0(vec3(gx, gy, gz)).greaterThan(0.5);
+              const bit = x + y * BRICK_RESOLUTION + z * BRICK_RESOLUTION * BRICK_RESOLUTION;
+              if (bit < 32) {
+                low.assign(bitOr(low, select(occupied, shiftLeft(uint(1), uint(bit)), uint(0))));
+              } else {
+                high.assign(bitOr(high, select(occupied, shiftLeft(uint(1), uint(bit - 32)), uint(0))));
+              }
+              occupiedCount.addAssign(select(occupied, uint(1), uint(0)));
+              if (surfaceEnabled) {
+                const isStatic = staticOccupiedAtLevel0(vec3(gx, gy, gz)).greaterThan(0.5);
+                dynamicCount.addAssign(select(occupied.and(isStatic.not()), uint(1), uint(0)));
+              }
+            }
+          }
+        }
+
+        const hasBrick = occupiedCount.greaterThan(uint(0));
+        const macroBase = macroIndex.mul(uint(MACRO_CELL_WORDS));
+        const brickBase = uint(hybridLayout.brickHeaderOffset)
+          .add(macroIndex.mul(uint(BRICK_HEADER_WORDS)));
+        bits.element(uint(hybridWordOffset).add(macroBase).add(uint(MACRO_CELL_BRICK_INDEX_WORD))).assign(
+          select(hasBrick, macroIndex, uint(INVALID_RAY_HIT_INDEX)),
+        );
+        const coverage = occupiedCount.mul(uint(255)).div(uint(64)).min(uint(255));
+        const emptyMetadata = uint(packMacroCellMetadata({
+          type: MacroCellType.Empty,
+          generation: 1,
+        }));
+        let brickMetadata = bitOr(
+          uint(packMacroCellMetadata({ type: MacroCellType.Brick, generation: 1 })),
+          shiftLeft(coverage, uint(MACRO_CELL_COVERAGE_SHIFT)),
+        );
+        if (surfaceEnabled) {
+          const dynamicMetadata = bitOr(
+            uint(packMacroCellMetadata({ type: MacroCellType.DynamicBrick, generation: 1 })),
+            shiftLeft(coverage, uint(MACRO_CELL_COVERAGE_SHIFT)),
+          );
+          brickMetadata = select(dynamicCount.greaterThan(uint(0)), dynamicMetadata, brickMetadata);
+        }
+        bits.element(uint(hybridWordOffset).add(macroBase).add(uint(MACRO_CELL_METADATA_WORD))).assign(
+          select(hasBrick, brickMetadata, emptyMetadata),
+        );
+        bits.element(uint(hybridWordOffset).add(brickBase).add(uint(BRICK_OCCUPANCY_LOW_WORD))).assign(low);
+        bits.element(uint(hybridWordOffset).add(brickBase).add(uint(BRICK_OCCUPANCY_HIGH_WORD))).assign(high);
+        if (!surfaceEnabled) {
+          bits.element(uint(hybridWordOffset).add(brickBase).add(uint(BRICK_SURFACE_OFFSET_WORD))).assign(uint(INVALID_RAY_HIT_INDEX));
+          bits.element(uint(hybridWordOffset).add(brickBase).add(uint(BRICK_COMPLEX_OFFSET_WORD))).assign(uint(INVALID_RAY_HIT_INDEX));
+        }
+      })().compute(hybridLayout.macroCellCount)
+    : null;
+
+  // ══════════════════════════════════ SHADER: Phase-2 surface-record build
+  // Three passes, run on FULL chains only, against the STATIC-ONLY level-0
+  // state (they sit between the static-stage hybridBuild and the dynamic
+  // voxelize in passes()). Records are therefore fitted and rank-addressed
+  // against the static brick masks, which is what makes them remain valid on
+  // every FAST chain: static bits never change between full rebuilds, and
+  // bricks that gain dynamic bits are typed DynamicBrick, which the tracer
+  // reads as "ignore the records here".
+
+  /** Zero the fit scratch and the pool allocator. */
+  const surfClearCompute = surfaceEnabled
+    ? Fn(() => {
+        atomicStore(surfScratch.element(instanceIndex), int(0));
+        If(instanceIndex.lessThan(uint(4)), () => {
+          atomicStore(surfAlloc.element(instanceIndex), uint(0));
+        });
+      })().compute(surfaceCapacity * SURFACE_SCRATCH_WORDS)
+    : null;
+
+  /**
+   * One record per occupied voxel, per brick, addressed by the voxel's rank in
+   * the brick mask. Pool overflow leaves the brick INVALID (box fallback) and
+   * counts it in surfAlloc[1] — never a miss. Runs while the brick headers
+   * hold the STATIC masks.
+   */
+  const surfAllocCompute = surfaceEnabled
+    ? Fn(() => {
+        const macroIndex = instanceIndex.toVar();
+        const brickBase = uint(hybridWordOffset + hybridLayout.brickHeaderOffset)
+          .add(macroIndex.mul(uint(BRICK_HEADER_WORDS))).toVar();
+        const low = bits.element(brickBase.add(uint(BRICK_OCCUPANCY_LOW_WORD))).toVar();
+        const high = bits.element(brickBase.add(uint(BRICK_OCCUPANCY_HIGH_WORD))).toVar();
+        const count = countOneBits(low).add(countOneBits(high)).toVar();
+        const offset = uint(INVALID_RAY_HIT_INDEX).toVar();
+        If(count.greaterThan(uint(0)), () => {
+          const base = atomicAdd(surfAlloc.element(0), count).toVar();
+          If(base.add(count).lessThanEqual(uint(surfaceCapacity)), () => {
+            offset.assign(base);
+          }).Else(() => {
+            atomicAdd(surfAlloc.element(1), uint(1));
+          });
+        });
+        bits.element(brickBase.add(uint(BRICK_SURFACE_OFFSET_WORD))).assign(offset);
+        bits.element(brickBase.add(uint(BRICK_COMPLEX_OFFSET_WORD))).assign(uint(INVALID_RAY_HIT_INDEX));
+      })().compute(hybridLayout.macroCellCount)
+    : null;
+
+  /**
+   * Accumulation: the voxelizer's own (slot, triangle, chunk) work list and
+   * SAT test, STATIC slots only. Every conservative triangle/voxel overlap
+   * adds fixed-point area-weighted plane terms and three dominant-axis
+   * coverage projections to the voxel's record scratch. Integer atomics make
+   * the result order-independent, i.e. deterministic across dispatches.
+   * A BUILDER like buildVoxelizeCompute: closes over the geometry buffers.
+   */
+  const buildSurfAccumCompute = surfaceEnabled
+    ? () => Fn(() => {
+        const slot = pairSlot.element(instanceIndex).toVar();
+        If(slotDynamic.element(slot.toInt()).notEqual(float(0)), () => {
+          Return();
+        });
+        const tri = pairTri.element(instanceIndex).toVar();
+        const chunk = pairChunk.element(instanceIndex).toVar();
+
+        const base = tri.mul(uint(3)).toVar();
+        const i0 = indexBuffer.element(base).toVar();
+        const i1 = indexBuffer.element(base.add(uint(1))).toVar();
+        const i2 = indexBuffer.element(base.add(uint(2))).toVar();
+        const m = localToWorld.element(slot.toInt()).toVar();
+        const toVox = (i) => m.mul(vec4(vertexBuffer.element(i).xyz, 1)).xyz
+          .sub(vec3(gridOrigin)).mul(vec3(voxelInv));
+        const p0 = toVox(i0).toVar();
+        const p1 = toVox(i1).toVar();
+        const p2 = toVox(i2).toVar();
+
+        // Triangle plane data in level-0 voxel space, once per work item. A
+        // degenerate triangle carries no plane information; its occupancy bit
+        // (set by the voxelizer) then finalizes as complex → box fallback.
+        const nRaw = p1.sub(p0).cross(p2.sub(p0)).toVar();
+        const nLen = nRaw.length().toVar();
+        If(nLen.lessThanEqual(1e-12), () => {
+          Return();
+        });
+        const nHat = nRaw.div(nLen).toVar();
+        const wTri = nLen.mul(0.5).clamp(SURFACE_MIN_WEIGHT, SURFACE_MAX_WEIGHT).toVar();
+        const centroid = p0.add(p1).add(p2).div(3).toVar();
+        const fx = (value) => value.mul(SURFACE_FIT_SCALE).round().toInt();
+
+        const lo = p0.min(p1).min(p2).sub(0.5).floor().max(vec3(0)).toVar();
+        const hi = p0.max(p1).max(p2).add(0.5).floor()
+          .min(vec3(level0.res.x - 1, level0.res.y - 1, level0.res.z - 1)).toVar();
+
+        If(hi.x.greaterThanEqual(lo.x).and(hi.y.greaterThanEqual(lo.y)).and(hi.z.greaterThanEqual(lo.z)), () => {
+          const nx = hi.x.sub(lo.x).add(1).toVar();
+          const ny = hi.y.sub(lo.y).add(1).toVar();
+          const nz = hi.z.sub(lo.z).add(1).toVar();
+          const total = nx.mul(ny).mul(nz).toVar();
+          const start = chunk.toFloat().mul(CHUNK_VOXELS).toVar();
+          const h = vec3(0.5 + 1e-4).toVar();
+
+          Loop({ start: 0, end: CHUNK_VOXELS, name: "surfVox" }, ({ surfVox }) => {
+            const k = start.add(surfVox.toFloat()).toVar();
+            If(k.greaterThanEqual(total), () => {
+              Break();
+            });
+            const vx = lo.x.add(mod(k, nx)).toVar();
+            const vy = lo.y.add(mod(floor(k.div(nx)), ny)).toVar();
+            const vz = lo.z.add(floor(k.div(nx.mul(ny)))).toVar();
+
+            If(triBoxOverlap(vec3(vx.add(0.5), vy.add(0.5), vz.add(0.5)), h, p0, p1, p2).greaterThan(0.5), () => {
+              const mxq = vx.div(BRICK_RESOLUTION).floor().toUint().toVar();
+              const myq = vy.div(BRICK_RESOLUTION).floor().toUint().toVar();
+              const mzq = vz.div(BRICK_RESOLUTION).floor().toUint().toVar();
+              const macroIndex = mzq.mul(uint(hybridLayout.macroResolution.y)).add(myq)
+                .mul(uint(hybridLayout.macroResolution.x)).add(mxq).toVar();
+              const brickBase = uint(hybridWordOffset + hybridLayout.brickHeaderOffset)
+                .add(macroIndex.mul(uint(BRICK_HEADER_WORDS))).toVar();
+              const surfOffset = bits.element(brickBase.add(uint(BRICK_SURFACE_OFFSET_WORD))).toVar();
+              If(surfOffset.notEqual(uint(INVALID_RAY_HIT_INDEX)), () => {
+                const low = bits.element(brickBase.add(uint(BRICK_OCCUPANCY_LOW_WORD))).toVar();
+                const high = bits.element(brickBase.add(uint(BRICK_OCCUPANCY_HIGH_WORD))).toVar();
+                const lx = vx.toUint().bitAnd(uint(3));
+                const ly = vy.toUint().bitAnd(uint(3));
+                const lz = vz.toUint().bitAnd(uint(3));
+                const bitIdx = lz.mul(uint(16)).add(ly.mul(uint(4))).add(lx).toVar();
+                const inLow = bitIdx.lessThan(uint(32));
+                const word = select(inLow, low, high).toVar();
+                const bitSet = bitAnd(shiftRight(word, bitAnd(bitIdx, uint(31))), uint(1));
+                // Defensive: the voxelizer set this bit from the same SAT.
+                If(bitSet.notEqual(uint(0)), () => {
+                  const belowLow = select(inLow, shiftLeft(uint(1), bitAnd(bitIdx, uint(31))).sub(uint(1)), uint(0xffffffff));
+                  const belowHigh = select(inLow, uint(0), shiftLeft(uint(1), bitAnd(bitIdx, uint(31))).sub(uint(1)));
+                  const rank = countOneBits(bitAnd(low, belowLow)).add(countOneBits(bitAnd(high, belowHigh)));
+                  const record = surfOffset.add(rank).toVar();
+                  If(record.lessThan(uint(surfaceCapacity)), () => {
+                    const sBase = record.mul(uint(SURFACE_SCRATCH_WORDS)).toVar();
+                    const cellOrigin = vec3(vx, vy, vz).toVar();
+                    const dLocal = nHat.dot(centroid.sub(cellOrigin)).toVar();
+                    atomicAdd(surfScratch.element(sBase), fx(nHat.x.mul(wTri)));
+                    atomicAdd(surfScratch.element(sBase.add(uint(1))), fx(nHat.y.mul(wTri)));
+                    atomicAdd(surfScratch.element(sBase.add(uint(2))), fx(nHat.z.mul(wTri)));
+                    atomicAdd(surfScratch.element(sBase.add(uint(3))), fx(wTri));
+                    atomicAdd(surfScratch.element(sBase.add(uint(4))), fx(dLocal.mul(wTri)));
+                    atomicAdd(surfScratch.element(sBase.add(uint(5))), fx(dLocal.mul(dLocal).mul(wTri)));
+                    atomicAdd(surfScratch.element(sBase.add(uint(6))), int(1));
+                    // Conservative 4x4 coverage in all three dominant-axis
+                    // projections (16 bits each) — the finalize pass picks one
+                    // after the normal is known, so one geometry pass suffices.
+                    const la = p0.sub(cellOrigin).toVar();
+                    const lb = p1.sub(cellOrigin).toVar();
+                    const lc = p2.sub(cellOrigin).toVar();
+                    const proj = (p, axis) => axis === 0 ? vec2(p.y, p.z) : axis === 1 ? vec2(p.x, p.z) : vec2(p.x, p.y);
+                    for (let axis = 0; axis < 3; axis++) {
+                      const pa = proj(la, axis).toVar();
+                      const pb = proj(lb, axis).toVar();
+                      const pc = proj(lc, axis).toVar();
+                      // Edge functions offset by the texel's Minkowski radius:
+                      // exact-conservative rect/triangle overlap for convex
+                      // shapes; a degenerate (edge-on) projection falls back
+                      // to its AABB texels — over-covering, the safe side.
+                      const mask = uint(0).toVar();
+                      const area2 = pb.x.sub(pa.x).mul(pc.y.sub(pa.y))
+                        .sub(pb.y.sub(pa.y).mul(pc.x.sub(pa.x))).toVar();
+                      const orient = select(area2.lessThan(0), float(-1), float(1)).toVar();
+                      const degenerate = area2.abs().lessThan(1e-9).toVar();
+                      const texelHalf = float(1 / 8);
+                      const loU = pa.x.min(pb.x).min(pc.x).toVar();
+                      const loV = pa.y.min(pb.y).min(pc.y).toVar();
+                      const hiU = pa.x.max(pb.x).max(pc.x).toVar();
+                      const hiV = pa.y.max(pb.y).max(pc.y).toVar();
+                      Loop({ start: 0, end: 16, name: "covTexel" }, ({ covTexel }) => {
+                        const cx = covTexel.mod(int(4)).toFloat().add(0.5).mul(0.25).toVar();
+                        const cy = covTexel.div(int(4)).toFloat().add(0.5).mul(0.25).toVar();
+                        const inAabb = cx.greaterThanEqual(loU.sub(texelHalf)).and(cx.lessThanEqual(hiU.add(texelHalf)))
+                          .and(cy.greaterThanEqual(loV.sub(texelHalf))).and(cy.lessThanEqual(hiV.add(texelHalf)));
+                        const edge = (p, q) => {
+                          const ex = q.x.sub(p.x).toVar();
+                          const ey = q.y.sub(p.y).toVar();
+                          const value = ex.mul(cy.sub(p.y)).sub(ey.mul(cx.sub(p.x))).mul(orient);
+                          const offset = ex.abs().add(ey.abs()).mul(texelHalf);
+                          return value.greaterThanEqual(offset.negate());
+                        };
+                        const insideEdges = edge(pa, pb).and(edge(pb, pc)).and(edge(pc, pa));
+                        const covered = inAabb.and(degenerate.or(insideEdges));
+                        mask.assign(bitOr(mask, select(covered, shiftLeft(uint(1), covTexel.toUint()), uint(0))));
+                      });
+                      atomicOr(surfScratch.element(sBase.add(uint(7 + axis))), mask.toInt());
+                    }
+                  });
+                });
+              });
+            });
+          });
+        });
+      })().compute(Math.max(1, pairCount))
+    : null;
+
+  /**
+   * Finalize: classify each record simple vs complex and pack the four-word
+   * SurfaceRecord into the bits tail. Unallocated records stay all-zero — the
+   * tracer reads a missing SIMPLE/COMPLEX flag as occupied-box fallback, so
+   * classification can never turn into a miss.
+   *
+   * With Phase 4 on, a record that failed the simple fit reserves a triangle
+   * range in the same allocation (word 2 = packComplexRange, flags = COMPLEX,
+   * coverage-valid 0) and the write pass below fills it. The outer gate is
+   * `weight > 0` ALONE: a cell whose face normals cancel (opposing faces, the
+   * thin-wall case Phase 4 exists for) has `sumLen ≈ 0`, so gating the whole
+   * body on the normal would have hidden exactly those cells from the complex
+   * path.
+   */
+  const surfFinalizeCompute = surfaceEnabled
+    ? Fn(() => {
+        const record = instanceIndex.toVar();
+        const sBase = record.mul(uint(SURFACE_SCRATCH_WORDS)).toVar();
+        const rBase = uint(surfaceWordOffset).add(record.mul(uint(SURFACE_RECORD_WORDS))).toVar();
+        const inv = float(1 / SURFACE_FIT_SCALE);
+        const sumX = atomicLoad(surfScratch.element(sBase)).toFloat().mul(inv).toVar();
+        const sumY = atomicLoad(surfScratch.element(sBase.add(uint(1)))).toFloat().mul(inv).toVar();
+        const sumZ = atomicLoad(surfScratch.element(sBase.add(uint(2)))).toFloat().mul(inv).toVar();
+        const weight = atomicLoad(surfScratch.element(sBase.add(uint(3)))).toFloat().mul(inv).toVar();
+        const sumD = atomicLoad(surfScratch.element(sBase.add(uint(4)))).toFloat().mul(inv).toVar();
+        const sumD2 = atomicLoad(surfScratch.element(sBase.add(uint(5)))).toFloat().mul(inv).toVar();
+        const count = atomicLoad(surfScratch.element(sBase.add(uint(6)))).toVar();
+        const covX = atomicLoad(surfScratch.element(sBase.add(uint(7)))).toVar();
+        const covY = atomicLoad(surfScratch.element(sBase.add(uint(8)))).toVar();
+        const covZ = atomicLoad(surfScratch.element(sBase.add(uint(9)))).toVar();
+
+        const packedNormal = uint(0).toVar();
+        const packedPlane = uint(0).toVar();
+        const packedMaterial = uint(0).toVar();
+        const packedFlags = uint(0).toVar();
+        const simpleTaken = float(0).toVar();
+        const sumLen = vec3(sumX, sumY, sumZ).length().toVar();
+        If(weight.greaterThan(0), () => {
+          If(sumLen.greaterThan(1e-6), () => {
+            const nHat = vec3(sumX, sumY, sumZ).div(sumLen).toVar();
+            const coherence = sumLen.div(weight).toVar();
+            const dHat = sumD.div(weight).toVar();
+            const sigma = sumD2.div(weight).sub(dHat.mul(dHat)).max(0).sqrt().toVar();
+            const cornerRadius = nHat.abs().dot(vec3(0.5));
+            const centerProjection = nHat.dot(vec3(0.5));
+            const planeInCell = dHat.sub(centerProjection).abs()
+              .lessThanEqual(cornerRadius.add(SIMPLE_PLANE_IN_CELL_EPSILON));
+            const simple = count.lessThanEqual(int(SIMPLE_MAX_TRIANGLES))
+              .and(coherence.greaterThanEqual(SIMPLE_MIN_COHERENCE))
+              .and(sigma.lessThanEqual(SIMPLE_MAX_PLANE_SIGMA))
+              .and(planeInCell);
+            If(simple, () => {
+              const ax = nHat.x.abs().toVar();
+              const ay = nHat.y.abs().toVar();
+              const az = nHat.z.abs().toVar();
+              // Same tie-break as RayHitPacking.dominantAxis: X, then Y.
+              const axis = select(
+                ax.greaterThanEqual(ay).and(ax.greaterThanEqual(az)),
+                uint(0),
+                select(ay.greaterThanEqual(az), uint(1), uint(2)),
+              ).toVar();
+              const raw = bitAnd(
+                select(axis.equal(uint(0)), covX, select(axis.equal(uint(1)), covY, covZ)).toUint(),
+                uint(0xffff),
+              ).toVar();
+              // One-texel chebyshev dilation without row wrap: horizontal
+              // (nibble-masked shifts), then vertical.
+              const hMask = bitAnd(bitOr(raw, bitOr(
+                bitAnd(shiftLeft(raw, uint(1)), uint(0xeeee)),
+                bitAnd(shiftRight(raw, uint(1)), uint(0x7777)),
+              )), uint(0xffff)).toVar();
+              const dilated = bitAnd(bitOr(hMask, bitOr(
+                shiftLeft(hMask, uint(4)),
+                shiftRight(hMask, uint(4)),
+              )), uint(0xffff)).toVar();
+              packedNormal.assign(packSnorm2x16(octEncodeTSL(nHat)));
+              const offset16 = bitAnd(
+                packSnorm2x16(vec2(dHat.div(CELL_LOCAL_PLANE_OFFSET_RANGE).clamp(-1, 1), 0)),
+                uint(0xffff),
+              );
+              const coverageByte = countOneBits(dilated).mul(uint(255)).div(uint(16)).min(uint(255));
+              const confidenceByte = coherence.mul(255).clamp(0, 255).toUint();
+              packedPlane.assign(bitOr(offset16, bitOr(
+                shiftLeft(coverageByte, uint(16)),
+                shiftLeft(confidenceByte, uint(24)),
+              )));
+              packedFlags.assign(bitOr(dilated, bitOr(
+                shiftLeft(axis, uint(16)),
+                bitOr(
+                  shiftLeft(uint(1), uint(COVERAGE_VALID_SHIFT)),
+                  shiftLeft(uint(SURFACE_FLAG_SIMPLE), uint(COVERAGE_FLAGS_SHIFT)),
+                ),
+              )));
+              simpleTaken.assign(1);
+            });
+          });
+          if (complexEnabled) {
+            // Reserve, never write: the pool cursor is claimed here so the
+            // range is known before the geometry pass runs, and word 6 (the
+            // overlap count this thread just read) is reset to 0 so that pass
+            // can reuse it as this record's write cursor. Same thread, so the
+            // load/store pair cannot race its own reset.
+            If(simpleTaken.lessThan(0.5).and(count.greaterThan(int(0))), () => {
+              If(count.lessThanEqual(int(MAX_COMPLEX_TRIANGLES)), () => {
+                const triCount = count.toUint().toVar();
+                const base = atomicAdd(surfAlloc.element(2), triCount).toVar();
+                If(base.add(triCount).lessThanEqual(uint(complexTriangleCapacity)), () => {
+                  packedMaterial.assign(bitOr(
+                    bitAnd(base, uint(COMPLEX_RANGE_OFFSET_MASK)),
+                    shiftLeft(triCount, uint(COMPLEX_RANGE_COUNT_SHIFT)),
+                  ));
+                  packedFlags.assign(shiftLeft(uint(SURFACE_FLAG_COMPLEX), uint(COVERAGE_FLAGS_SHIFT)));
+                  atomicStore(surfScratch.element(sBase.add(uint(6))), int(0));
+                }).Else(() => {
+                  // Pool exhausted → the record stays zero, i.e. occupied box.
+                  atomicAdd(surfAlloc.element(3), uint(1));
+                });
+              }).Else(() => {
+                // More triangles than the packed count field can address —
+                // counted as an overflow cell like the CPU mirror does, so the
+                // two report the same "how many cells fell back" number.
+                atomicAdd(surfAlloc.element(3), uint(1));
+              });
+            });
+          }
+        });
+        bits.element(rBase).assign(packedNormal);
+        bits.element(rBase.add(uint(1))).assign(packedPlane);
+        bits.element(rBase.add(uint(2))).assign(packedMaterial);
+        bits.element(rBase.add(uint(3))).assign(packedFlags);
+      })().compute(surfaceCapacity)
+    : null;
+
+  /**
+   * Phase-4 geometry pass: fills every reserved triangle range with the
+   * CELL-LOCAL vertices of the triangles that overlap that cell, f32-bitcast,
+   * 9 words each. Structurally the accumulate pass — same static-slot filter,
+   * same degenerate-triangle rejection, same SAT and chunk loop — because the
+   * two must agree EXACTLY on which (triangle, cell) pairs exist: finalize
+   * sized the range from the accumulate pass's overlap count, so a pair that
+   * only one pass admits would either overrun the range or leave a stale
+   * triangle in it, and a short list reads as an exact MISS (the ray keeps
+   * marching) rather than a conservative hit.
+   *
+   * A BUILDER like buildSurfAccumCompute: it closes over the geometry buffers.
+   */
+  const buildComplexWriteCompute = complexEnabled
+    ? () => Fn(() => {
+        const slot = pairSlot.element(instanceIndex).toVar();
+        If(slotDynamic.element(slot.toInt()).notEqual(float(0)), () => {
+          Return();
+        });
+        const tri = pairTri.element(instanceIndex).toVar();
+        const chunk = pairChunk.element(instanceIndex).toVar();
+
+        const base = tri.mul(uint(3)).toVar();
+        const i0 = indexBuffer.element(base).toVar();
+        const i1 = indexBuffer.element(base.add(uint(1))).toVar();
+        const i2 = indexBuffer.element(base.add(uint(2))).toVar();
+        const m = localToWorld.element(slot.toInt()).toVar();
+        const toVox = (i) => m.mul(vec4(vertexBuffer.element(i).xyz, 1)).xyz
+          .sub(vec3(gridOrigin)).mul(vec3(voxelInv));
+        const p0 = toVox(i0).toVar();
+        const p1 = toVox(i1).toVar();
+        const p2 = toVox(i2).toVar();
+
+        // The accumulate pass drops degenerates before counting, so this one
+        // must drop them before claiming a cursor.
+        const nRaw = p1.sub(p0).cross(p2.sub(p0)).toVar();
+        If(nRaw.length().lessThanEqual(1e-12), () => {
+          Return();
+        });
+
+        const lo = p0.min(p1).min(p2).sub(0.5).floor().max(vec3(0)).toVar();
+        const hi = p0.max(p1).max(p2).add(0.5).floor()
+          .min(vec3(level0.res.x - 1, level0.res.y - 1, level0.res.z - 1)).toVar();
+
+        If(hi.x.greaterThanEqual(lo.x).and(hi.y.greaterThanEqual(lo.y)).and(hi.z.greaterThanEqual(lo.z)), () => {
+          const nx = hi.x.sub(lo.x).add(1).toVar();
+          const ny = hi.y.sub(lo.y).add(1).toVar();
+          const nz = hi.z.sub(lo.z).add(1).toVar();
+          const total = nx.mul(ny).mul(nz).toVar();
+          const start = chunk.toFloat().mul(CHUNK_VOXELS).toVar();
+          const h = vec3(0.5 + 1e-4).toVar();
+
+          Loop({ start: 0, end: CHUNK_VOXELS, name: "cplxVox" }, ({ cplxVox }) => {
+            const k = start.add(cplxVox.toFloat()).toVar();
+            If(k.greaterThanEqual(total), () => {
+              Break();
+            });
+            const vx = lo.x.add(mod(k, nx)).toVar();
+            const vy = lo.y.add(mod(floor(k.div(nx)), ny)).toVar();
+            const vz = lo.z.add(floor(k.div(nx.mul(ny)))).toVar();
+
+            If(triBoxOverlap(vec3(vx.add(0.5), vy.add(0.5), vz.add(0.5)), h, p0, p1, p2).greaterThan(0.5), () => {
+              const mxq = vx.div(BRICK_RESOLUTION).floor().toUint().toVar();
+              const myq = vy.div(BRICK_RESOLUTION).floor().toUint().toVar();
+              const mzq = vz.div(BRICK_RESOLUTION).floor().toUint().toVar();
+              const macroIndex = mzq.mul(uint(hybridLayout.macroResolution.y)).add(myq)
+                .mul(uint(hybridLayout.macroResolution.x)).add(mxq).toVar();
+              const brickBase = uint(hybridWordOffset + hybridLayout.brickHeaderOffset)
+                .add(macroIndex.mul(uint(BRICK_HEADER_WORDS))).toVar();
+              const surfOffset = bits.element(brickBase.add(uint(BRICK_SURFACE_OFFSET_WORD))).toVar();
+              If(surfOffset.notEqual(uint(INVALID_RAY_HIT_INDEX)), () => {
+                const low = bits.element(brickBase.add(uint(BRICK_OCCUPANCY_LOW_WORD))).toVar();
+                const high = bits.element(brickBase.add(uint(BRICK_OCCUPANCY_HIGH_WORD))).toVar();
+                const lx = vx.toUint().bitAnd(uint(3));
+                const ly = vy.toUint().bitAnd(uint(3));
+                const lz = vz.toUint().bitAnd(uint(3));
+                const bitIdx = lz.mul(uint(16)).add(ly.mul(uint(4))).add(lx).toVar();
+                const inLow = bitIdx.lessThan(uint(32));
+                const word = select(inLow, low, high).toVar();
+                const bitSet = bitAnd(shiftRight(word, bitAnd(bitIdx, uint(31))), uint(1));
+                If(bitSet.notEqual(uint(0)), () => {
+                  const belowLow = select(inLow, shiftLeft(uint(1), bitAnd(bitIdx, uint(31))).sub(uint(1)), uint(0xffffffff));
+                  const belowHigh = select(inLow, uint(0), shiftLeft(uint(1), bitAnd(bitIdx, uint(31))).sub(uint(1)));
+                  const rank = countOneBits(bitAnd(low, belowLow)).add(countOneBits(bitAnd(high, belowHigh)));
+                  const record = surfOffset.add(rank).toVar();
+                  If(record.lessThan(uint(surfaceCapacity)), () => {
+                    const rBase = uint(surfaceWordOffset)
+                      .add(record.mul(uint(SURFACE_RECORD_WORDS))).toVar();
+                    const flagsWord = bits.element(rBase.add(uint(3))).toVar();
+                    const isComplex = bitAnd(
+                      shiftRight(flagsWord, uint(COVERAGE_FLAGS_SHIFT)),
+                      uint(SURFACE_FLAG_COMPLEX),
+                    );
+                    If(isComplex.notEqual(uint(0)), () => {
+                      const sBase = record.mul(uint(SURFACE_SCRATCH_WORDS)).toVar();
+                      // .toVar() DIRECTLY on the atomic, then convert. A
+                      // ConvertNode as the atomic's only consumer does not
+                      // register as a value parent, so three emits the atomic
+                      // as a bare statement and substitutes a DEFAULT 0 for
+                      // the read ("TSL: Invalid generated code, expected an
+                      // int") — every triangle then wrote pool slot 0 and the
+                      // rest of each list read as exact misses, i.e. leaks.
+                      const cursorRaw = atomicAdd(
+                        surfScratch.element(sBase.add(uint(6))), int(1),
+                      ).toVar();
+                      const cursor = cursorRaw.toUint().toVar();
+                      const range = bits.element(rBase.add(uint(2))).toVar();
+                      const poolOffset = bitAnd(range, uint(COMPLEX_RANGE_OFFSET_MASK)).toVar();
+                      const triCount = bitAnd(
+                        shiftRight(range, uint(COMPLEX_RANGE_COUNT_SHIFT)),
+                        uint(COMPLEX_RANGE_COUNT_MASK),
+                      ).toVar();
+                      // The only bound needed: finalize refused any range whose
+                      // end passed the pool capacity, so cursor < count keeps
+                      // every word below the allocation.
+                      If(cursor.lessThan(triCount), () => {
+                        const cellOrigin = vec3(vx, vy, vz).toVar();
+                        const w = uint(trianglePoolWordOffset).add(
+                          poolOffset.add(cursor).mul(uint(COMPLEX_TRIANGLE_WORDS)),
+                        ).toVar();
+                        const a = p0.sub(cellOrigin).toVar();
+                        const b = p1.sub(cellOrigin).toVar();
+                        const c = p2.sub(cellOrigin).toVar();
+                        bits.element(w).assign(floatBitsToUint(a.x));
+                        bits.element(w.add(uint(1))).assign(floatBitsToUint(a.y));
+                        bits.element(w.add(uint(2))).assign(floatBitsToUint(a.z));
+                        bits.element(w.add(uint(3))).assign(floatBitsToUint(b.x));
+                        bits.element(w.add(uint(4))).assign(floatBitsToUint(b.y));
+                        bits.element(w.add(uint(5))).assign(floatBitsToUint(b.z));
+                        bits.element(w.add(uint(6))).assign(floatBitsToUint(c.x));
+                        bits.element(w.add(uint(7))).assign(floatBitsToUint(c.y));
+                        bits.element(w.add(uint(8))).assign(floatBitsToUint(c.z));
+                      });
+                    });
+                  });
+                });
+              });
+            });
+          });
+        });
+      })().compute(Math.max(1, pairCount))
+    : null;
+
+  const traceBody = (origin, dir, tMin, tMax, steps, topLevel, penK = null, profile = false) => {
     const inv = vec3(voxelInv).toVar();
     const q0 = vec3(origin).sub(vec3(gridOrigin)).mul(inv).toVar();
     const dq = vec3(dir).mul(inv).toVar();
@@ -693,6 +1404,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
     // See the fail-closed clamp after the loop: set only where we KNOW why the
     // march stopped (reached tMax, left the volume, or hit a level-0 voxel).
     const resolved = float(0).toVar();
+    const usedSteps = uint(0).toVar();
     // ── ANALYTIC PENUMBRA (opt-in, `penK`) ──────────────────────────────────
     // A binary hit/miss verdict makes light through an opening a coin flip
     // for every grazing ray — under a moving light that is the flicker, and
@@ -713,6 +1425,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
       : null;
 
     Loop({ start: 0, end: steps, name: "occDda" }, () => {
+      usedSteps.addAssign(uint(1));
       If(t.greaterThanEqual(tMax), () => {
         resolved.assign(1);
         Break();
@@ -821,6 +1534,13 @@ export function createOccupancyField(bounds, res0, options = {}) {
       hitT.assign(select(ranOutInDetail, t, hitT));
     }
 
+    if (rayHitDebug && profile) {
+      // WGSL NaN test without another helper/binding: NaN is the only float
+      // that is not equal to itself. Count it before it can reach lighting.
+      const invalid = t.notEqual(t).or(hitT.notEqual(hitT));
+      rayHitDebug.recordTrace({ hit, resolved, steps: usedSteps, invalid });
+    }
+
     return vec4(hit, hitT, axis, pen);
   };
 
@@ -844,7 +1564,11 @@ export function createOccupancyField(bounds, res0, options = {}) {
     // analytic cone-occlusion accumulator (see traceBody's penumbra note) and
     // returns it as `.pen` — 1 = clear, →0 as the ray grazes geometry.
     const penumbra = opts.penumbraK != null;
-    const key = `${steps}|${topLevel}|${penumbra ? 1 : 0}`;
+    // Profiling is a graph variant: only cascade transport rays bind the
+    // counter buffer. Shadow/AO callers must not inherit an otherwise-unused
+    // storage binding into already dense composed kernels.
+    const profile = rayHitDebug != null && opts.profile === true;
+    const key = `${steps}|${topLevel}|${penumbra ? 1 : 0}|${profile ? 1 : 0}`;
     let fn = traceVariants.get(key);
     if (fn === undefined) {
       fn = sharedFn({
@@ -858,8 +1582,8 @@ export function createOccupancyField(bounds, res0, options = {}) {
           ...(penumbra ? [{ name: "penK", type: "float" }] : []),
         ],
         body: penumbra
-          ? (o, d, t0, t1, k) => traceBody(o, d, t0, t1, steps, topLevel, k)
-          : (o, d, t0, t1) => traceBody(o, d, t0, t1, steps, topLevel),
+          ? (o, d, t0, t1, k) => traceBody(o, d, t0, t1, steps, topLevel, k, profile)
+          : (o, d, t0, t1) => traceBody(o, d, t0, t1, steps, topLevel, null, profile),
       });
       traceVariants.set(key, fn);
     }
@@ -884,6 +1608,854 @@ export function createOccupancyField(bounds, res0, options = {}) {
     const voxelAtHit = q0.add(dq.mul(hitT)).floor();
     return { hit, t: hitT, normal, voxel: voxelAtHit, pen: packed.w };
   };
+
+  /**
+   * Phase-1 macrocell + 4^3 brick traversal. The only leaf predicate is the
+   * level-0 occupancy bit copied into the brick mask, so hits retain legacy
+   * occupied-cell-box semantics. Both loops have compile-time hard limits.
+   */
+  const hybridTraceVariants = new Map();
+  const traceHybridBrick = hybridEnabled
+    ? (origin, dir, tMin, tMax, opts = {}) => {
+        const macroStepLimit = Math.min(
+          MAX_MACRO_STEPS,
+          Math.max(1, opts.macroSteps ?? MAX_MACRO_STEPS),
+        );
+        const profile = rayHitDebug != null && opts.profile === true;
+        const key = `${macroStepLimit}|${profile ? 1 : 0}|${coarseSkipEnabled ? 1 : 0}`;
+        let fn = hybridTraceVariants.get(key);
+        if (fn === undefined) {
+          fn = sharedFn({
+            // Suffixed ONLY when the skip is off: the default arm has to keep
+            // the exact WGSL function names it has always emitted, so an A/B
+            // run is the only thing that ever renames a trace function.
+            name: `giHybridBrickTrace${macroStepLimit}${coarseSkipEnabled ? "" : "s0"}`,
+            type: "vec4",
+            inputs: [
+              { name: "origin", type: "vec3" },
+              { name: "dir", type: "vec3" },
+              { name: "tMin", type: "float" },
+              { name: "tMax", type: "float" },
+            ],
+            body: (o, d, t0, t1) => {
+              const inv = vec3(voxelInv).toVar();
+              const q0 = vec3(o).sub(vec3(gridOrigin)).mul(inv).toVar();
+              const dq = vec3(d).mul(inv).toVar();
+              const safe = (c) => select(
+                c.abs().lessThan(RAY_HIT_DIRECTION_EPSILON),
+                select(c.lessThan(0), float(-RAY_HIT_DIRECTION_EPSILON), float(RAY_HIT_DIRECTION_EPSILON)),
+                c,
+              );
+              const rd = vec3(
+                float(1).div(safe(dq.x)),
+                float(1).div(safe(dq.y)),
+                float(1).div(safe(dq.z)),
+              ).toVar();
+              const face = vec3(
+                select(dq.x.greaterThanEqual(0), float(1), float(0)),
+                select(dq.y.greaterThanEqual(0), float(1), float(0)),
+                select(dq.z.greaterThanEqual(0), float(1), float(0)),
+              ).toVar();
+
+              const t = float(t0).toVar();
+              const hit = float(0).toVar();
+              const hitT = float(-1).toVar();
+              const axis = float(-1).toVar();
+              const resolved = float(0).toVar();
+              const invalidRef = float(0).toVar();
+              const brickLimit = float(0).toVar();
+              // Skip off starts AT the macro level, so the ride is not merely
+              // predicated away — levels 3-4 are never read.
+              const level = int(coarseSkipEnabled ? OCC_LEVELS - 1 : 2).toVar();
+              const usedMacroSteps = uint(0).toVar();
+              const usedBrickSteps = uint(0).toVar();
+              // Phase-5 skip instrumentation, declared only in the enabled
+              // variant so the A/B arm's WGSL stays free of coarse traffic.
+              const usedCoarseSteps = coarseSkipEnabled ? uint(0).toVar() : null;
+              const coarseSkipsL3 = coarseSkipEnabled ? uint(0).toVar() : null;
+              const coarseSkipsL4 = coarseSkipEnabled ? uint(0).toVar() : null;
+              const coarseDescends = coarseSkipEnabled ? uint(0).toVar() : null;
+
+              Loop({ start: 0, end: macroStepLimit, name: "hybridMacroDda" }, () => {
+                usedMacroSteps.addAssign(uint(1));
+                If(t.greaterThanEqual(t1), () => {
+                  resolved.assign(1);
+                  Break();
+                });
+
+                const q = q0.add(dq.mul(t)).toVar();
+                If(
+                  q.x.lessThan(0).or(q.y.lessThan(0)).or(q.z.lessThan(0))
+                    .or(q.x.greaterThanEqual(level0.res.x))
+                    .or(q.y.greaterThanEqual(level0.res.y))
+                    .or(q.z.greaterThanEqual(level0.res.z)),
+                  () => {
+                    resolved.assign(1);
+                    Break();
+                  },
+                );
+
+                // The macro+brick body is a JS closure so the coarse ride can
+                // be compiled OUT rather than predicated away: an A/B arm that
+                // still emits the level-3/4 reads measures the wrong thing.
+                const macroBody = () => {
+                const macro = q.div(float(BRICK_RESOLUTION)).floor().toVar();
+                const mx = macro.x.toUint().toVar();
+                const my = macro.y.toUint().toVar();
+                const mz = macro.z.toUint().toVar();
+                const macroIndex = mz.mul(uint(hybridLayout.macroResolution.y)).add(my)
+                  .mul(uint(hybridLayout.macroResolution.x)).add(mx).toVar();
+                const macroBase = uint(hybridWordOffset).add(
+                  macroIndex.mul(uint(MACRO_CELL_WORDS)),
+                ).toVar();
+                const brickIndex = bits.element(
+                  macroBase.add(uint(MACRO_CELL_BRICK_INDEX_WORD)),
+                ).toVar();
+                const metadata = bits.element(
+                  macroBase.add(uint(MACRO_CELL_METADATA_WORD)),
+                ).toVar();
+                const cellType = bitAnd(
+                  shiftRight(metadata, uint(MACRO_CELL_TYPE_SHIFT)),
+                  uint(MACRO_CELL_TYPE_MASK),
+                ).toVar();
+
+                const macroBound = macro.add(face).mul(float(BRICK_RESOLUTION)).toVar();
+                const tx = macroBound.x.sub(q.x).mul(rd.x).toVar();
+                const ty = macroBound.y.sub(q.y).mul(rd.y).toVar();
+                const tz = macroBound.z.sub(q.z).mul(rd.z).toVar();
+                const macroDelta = tx.min(ty).min(tz).max(0).toVar();
+                const macroExit = t.add(macroDelta).toVar();
+                const macroAxis = select(
+                  macroDelta.equal(tx),
+                  float(0),
+                  select(macroDelta.equal(ty), float(1), float(2)),
+                ).toVar();
+
+                If(cellType.equal(uint(MacroCellType.Brick)), () => {
+                  const validBrick = brickIndex.lessThan(uint(hybridLayout.brickCount))
+                    .and(brickIndex.notEqual(uint(INVALID_RAY_HIT_INDEX)));
+                  If(validBrick.not(), () => {
+                    invalidRef.assign(1);
+                    Break();
+                  });
+
+                  const safeBrick = brickIndex.min(uint(hybridLayout.brickCount - 1));
+                  const brickBase = uint(hybridWordOffset + hybridLayout.brickHeaderOffset)
+                    .add(safeBrick.mul(uint(BRICK_HEADER_WORDS))).toVar();
+                  const occupancyLow = bits.element(
+                    brickBase.add(uint(BRICK_OCCUPANCY_LOW_WORD)),
+                  ).toVar();
+                  const occupancyHigh = bits.element(
+                    brickBase.add(uint(BRICK_OCCUPANCY_HIGH_WORD)),
+                  ).toVar();
+                  const localT = t.toVar();
+                  const localResolved = float(0).toVar();
+                  const localAxis = axis.toVar();
+                  const segmentEnd = macroExit.min(t1).toVar();
+
+                  Loop({ start: 0, end: MAX_BRICK_STEPS, name: "hybridBrickDda" }, () => {
+                    If(localT.greaterThanEqual(segmentEnd.add(RAY_HIT_DDA_EPSILON)), () => {
+                      localResolved.assign(1);
+                      Break();
+                    });
+                    usedBrickSteps.addAssign(uint(1));
+                    const localQ = q0.add(dq.mul(localT)).toVar();
+                    const cell = localQ.floor().toVar();
+                    const localCell = cell.sub(macro.mul(float(BRICK_RESOLUTION)))
+                      .clamp(vec3(0), vec3(BRICK_RESOLUTION - 1)).toVar();
+                    const cellIndex = localCell.z.toUint().mul(uint(16))
+                      .add(localCell.y.toUint().mul(uint(4)))
+                      .add(localCell.x.toUint()).toVar();
+                    const occupancyWord = select(
+                      cellIndex.lessThan(uint(32)),
+                      occupancyLow,
+                      occupancyHigh,
+                    ).toVar();
+                    const occupancyBit = bitAnd(
+                      shiftRight(occupancyWord, bitAnd(cellIndex, uint(31))),
+                      uint(1),
+                    );
+                    If(occupancyBit.notEqual(uint(0)), () => {
+                      hit.assign(1);
+                      hitT.assign(localT);
+                      axis.assign(localAxis);
+                      resolved.assign(1);
+                      localResolved.assign(1);
+                      Break();
+                    });
+
+                    const cellBound = cell.add(face).toVar();
+                    const cx = cellBound.x.sub(localQ.x).mul(rd.x).toVar();
+                    const cy = cellBound.y.sub(localQ.y).mul(rd.y).toVar();
+                    const cz = cellBound.z.sub(localQ.z).mul(rd.z).toVar();
+                    const cellDelta = cx.min(cy).min(cz).max(0).toVar();
+                    localAxis.assign(select(
+                      cellDelta.equal(cx),
+                      float(0),
+                      select(cellDelta.equal(cy), float(1), float(2)),
+                    ));
+                    localT.addAssign(cellDelta.add(RAY_HIT_DDA_EPSILON));
+                  });
+
+                  If(hit.greaterThan(0.5), () => {
+                    Break();
+                  });
+                  If(localResolved.lessThan(0.5), () => {
+                    brickLimit.assign(1);
+                    Break();
+                  });
+                  axis.assign(localAxis);
+                  t.assign(macroExit.add(RAY_HIT_DDA_EPSILON));
+                  // The re-ascend only exists when the ride does; with the skip
+                  // off `level` must stay pinned at the macro level forever.
+                  if (coarseSkipEnabled) level.assign(int(3));
+                }).Else(() => {
+                  axis.assign(macroAxis);
+                  t.assign(macroExit.add(RAY_HIT_DDA_EPSILON));
+                  if (coarseSkipEnabled) level.assign(int(3));
+                });
+                };
+
+                // Reuse the existing conservative pyramid above level 2.
+                // Level 2 is exactly one 4^3 macrocell, so levels 3-4 provide
+                // broad empty-space skips without changing Phase-1 leaf data.
+                if (coarseSkipEnabled) {
+                  If(level.greaterThan(int(2)), () => {
+                    usedCoarseSteps.addAssign(uint(1));
+                    const scale = levelSelect(level, (l) => l.scale).toVar();
+                    const coarse = q.div(scale).floor().toVar();
+                    If(occupiedAt(coarse, level).greaterThan(0.5), () => {
+                      coarseDescends.addAssign(uint(1));
+                      level.assign(level.sub(int(1)));
+                    }).Else(() => {
+                      const coarseBound = coarse.add(face).mul(scale).toVar();
+                      const hx = coarseBound.x.sub(q.x).mul(rd.x).toVar();
+                      const hy = coarseBound.y.sub(q.y).mul(rd.y).toVar();
+                      const hz = coarseBound.z.sub(q.z).mul(rd.z).toVar();
+                      const coarseDelta = hx.min(hy).min(hz).max(0).toVar();
+                      axis.assign(select(
+                        coarseDelta.equal(hx),
+                        float(0),
+                        select(coarseDelta.equal(hy), float(1), float(2)),
+                      ));
+                      t.addAssign(coarseDelta.add(RAY_HIT_DDA_EPSILON));
+                      // Attributed BEFORE the re-ascend: the empty span belongs
+                      // to the level that was empty, not the one climbed to.
+                      coarseSkipsL3.addAssign(select(level.equal(int(3)), uint(1), uint(0)));
+                      coarseSkipsL4.addAssign(select(level.greaterThan(int(3)), uint(1), uint(0)));
+                      level.assign(level.add(int(1)).min(int(OCC_LEVELS - 1)));
+                    });
+                  }).Else(macroBody);
+                } else {
+                  macroBody();
+                }
+              });
+
+              if (rayHitDebug && profile) {
+                const invalid = t.notEqual(t).or(hitT.notEqual(hitT)).or(invalidRef.greaterThan(0.5));
+                const macroLimit = resolved.lessThan(0.5).and(brickLimit.lessThan(0.5));
+                rayHitDebug.recordTrace({
+                  hit,
+                  resolved,
+                  steps: usedMacroSteps,
+                  brickSteps: usedBrickSteps,
+                  macroLimit,
+                  brickLimit,
+                  invalid,
+                  coarseSteps: usedCoarseSteps,
+                  coarseSkipsL3,
+                  coarseSkipsL4,
+                  coarseDescends,
+                });
+              }
+
+              // W keeps diagnostic counts without another buffer/output: the
+              // integer part is macro steps and the fractional part is total
+              // local-cell visits / 4096.
+              return vec4(
+                hit,
+                hitT,
+                axis,
+                usedMacroSteps.toFloat().add(usedBrickSteps.toFloat().div(4096)),
+              );
+            },
+          });
+          hybridTraceVariants.set(key, fn);
+        }
+
+        const packed = fn(vec3(origin), vec3(dir), float(tMin), float(tMax)).toVar();
+        const hit = packed.x;
+        const hitT = packed.y;
+        const axis = packed.z;
+        const dq = vec3(dir).mul(vec3(voxelInv)).toVar();
+        const stepSign = vec3(dq.x.sign(), dq.y.sign(), dq.z.sign());
+        const normal = select(
+          axis.lessThan(0),
+          vec3(dir).negate().normalize(),
+          vec3(
+            select(axis.equal(0), stepSign.x.negate(), float(0)),
+            select(axis.equal(1), stepSign.y.negate(), float(0)),
+            select(axis.equal(2), stepSign.z.negate(), float(0)),
+          ),
+        ).toVar();
+        const q0 = vec3(origin).sub(vec3(gridOrigin)).mul(vec3(voxelInv));
+        const voxelAtHit = q0.add(dq.mul(hitT)).floor();
+        return {
+          hit,
+          t: hitT,
+          normal,
+          voxel: voxelAtHit,
+          macroSteps: floor(packed.w),
+          brickSteps: mod(packed.w, 1).mul(4096).round(),
+        };
+      }
+    : null;
+
+  /**
+   * Phase-2/3 traversal (HybridPlane / HybridPlaneCoverage): the Phase-1
+   * macrocell + brick DDA, but an occupied voxel holding a usable SIMPLE
+   * record resolves through a bounded ray-plane intersection — optionally
+   * clipped by the Phase-3 4x4 coverage mask — and a REJECTED plane lets the
+   * ray keep marching. That continuation is the accuracy improvement over
+   * occupied-box hits (a grazing ray no longer stops at a voxel face the
+   * surface never crosses). Any cell without a usable record — complex fit,
+   * pool overflow, DynamicBrick, not yet fitted — keeps the exact legacy
+   * occupied-box semantics, so classification can tighten accuracy but can
+   * never widen a leak beyond the bounded plane acceptance itself.
+   *
+   * `opts.exact` (Phase 4, HybridExactComplex) adds one more branch, between
+   * the plane test and that box fallback: a cell marked COMPLEX carries its
+   * whole (≤ MAX_COMPLEX_TRIANGLES) triangle list in the pool, so the ray runs
+   * a bounded Möller-Trumbore sweep over it and a genuinely empty result lets
+   * the DDA continue. It is the ONE case where a cell can be left without a
+   * hit on exact evidence rather than conservative evidence.
+   *
+   * The packed return differs from Phase-1: zw carry the OCT-ENCODED
+   * voxel-space hit normal (a fitted plane's normal no longer fits the axis
+   * convention). The wrapper decodes and maps it to world space with the
+   * covariant transform for the diagonal voxel scale (n_world ∝ n_vox ·
+   * voxelInv), which leaves axis-aligned face normals untouched.
+   */
+  const hybridPlaneVariants = new Map();
+  const traceHybridPlane = surfaceEnabled
+    ? (origin, dir, tMin, tMax, opts = {}) => {
+        const macroStepLimit = Math.min(
+          MAX_MACRO_STEPS,
+          Math.max(1, opts.macroSteps ?? MAX_MACRO_STEPS),
+        );
+        const coverage = opts.coverage === true;
+        // Gated on the BUILD flag too: with no triangle pool allocated no
+        // record can carry the COMPLEX marker, so an exact request there is
+        // exactly the Phase-3 variant and must compile as one.
+        const exact = complexEnabled && opts.exact === true;
+        const profile = rayHitDebug != null && opts.profile === true;
+        const key = `${macroStepLimit}|${coverage ? 1 : 0}|${exact ? 1 : 0}|${profile ? 1 : 0}` +
+          `|${coarseSkipEnabled ? 1 : 0}`;
+        let fn = hybridPlaneVariants.get(key);
+        if (fn === undefined) {
+          fn = sharedFn({
+            // "s0" is appended ONLY when the skip is off, so the default arm
+            // keeps the exact function names it has always emitted.
+            name: `giHybridPlaneTrace${macroStepLimit}${coverage ? "c" : ""}${exact ? "x" : ""}` +
+              `${coarseSkipEnabled ? "" : "s0"}`,
+            type: "vec4",
+            inputs: [
+              { name: "origin", type: "vec3" },
+              { name: "dir", type: "vec3" },
+              { name: "tMin", type: "float" },
+              { name: "tMax", type: "float" },
+            ],
+            body: (o, d, t0, t1) => {
+              const inv = vec3(voxelInv).toVar();
+              const q0 = vec3(o).sub(vec3(gridOrigin)).mul(inv).toVar();
+              const dq = vec3(d).mul(inv).toVar();
+              const safe = (c) => select(
+                c.abs().lessThan(RAY_HIT_DIRECTION_EPSILON),
+                select(c.lessThan(0), float(-RAY_HIT_DIRECTION_EPSILON), float(RAY_HIT_DIRECTION_EPSILON)),
+                c,
+              );
+              const rd = vec3(
+                float(1).div(safe(dq.x)),
+                float(1).div(safe(dq.y)),
+                float(1).div(safe(dq.z)),
+              ).toVar();
+              const face = vec3(
+                select(dq.x.greaterThanEqual(0), float(1), float(0)),
+                select(dq.y.greaterThanEqual(0), float(1), float(0)),
+                select(dq.z.greaterThanEqual(0), float(1), float(0)),
+              ).toVar();
+
+              const t = float(t0).toVar();
+              const hit = float(0).toVar();
+              const hitT = float(-1).toVar();
+              // Voxel-space hit normal; face normals and fitted plane normals
+              // share this one channel.
+              const hitNormal = vec3(0, 0, 1).toVar();
+              const axis = float(-1).toVar();
+              const resolved = float(0).toVar();
+              const invalidRef = float(0).toVar();
+              const brickLimit = float(0).toVar();
+              // Skip off starts AT the macro level, so the ride is not merely
+              // predicated away — levels 3-4 are never read.
+              const level = int(coarseSkipEnabled ? OCC_LEVELS - 1 : 2).toVar();
+              const usedMacroSteps = uint(0).toVar();
+              const usedBrickSteps = uint(0).toVar();
+              // Phase-5 skip instrumentation, declared only in the enabled
+              // variant so the A/B arm's WGSL stays free of coarse traffic.
+              const usedCoarseSteps = coarseSkipEnabled ? uint(0).toVar() : null;
+              const coarseSkipsL3 = coarseSkipEnabled ? uint(0).toVar() : null;
+              const coarseSkipsL4 = coarseSkipEnabled ? uint(0).toVar() : null;
+              const coarseDescends = coarseSkipEnabled ? uint(0).toVar() : null;
+              const planeTests = uint(0).toVar();
+              const planeAccepts = uint(0).toVar();
+              const planeRejects = uint(0).toVar();
+              const surfaceFallbacks = uint(0).toVar();
+              // Declared only in the exact variant so the Phase-2/3 variants
+              // emit byte-identical WGSL to before Phase 4.
+              const complexTests = exact ? uint(0).toVar() : null;
+              const triangleTests = exact ? uint(0).toVar() : null;
+              const complexAccepts = exact ? uint(0).toVar() : null;
+              const complexMisses = exact ? uint(0).toVar() : null;
+
+              const faceNormalFrom = (axisNode) => select(
+                axisNode.lessThan(0),
+                dq.negate().normalize(),
+                vec3(
+                  select(axisNode.equal(0), dq.x.sign().negate(), float(0)),
+                  select(axisNode.equal(1), dq.y.sign().negate(), float(0)),
+                  select(axisNode.equal(2), dq.z.sign().negate(), float(0)),
+                ),
+              );
+
+              Loop({ start: 0, end: macroStepLimit, name: "planeMacroDda" }, () => {
+                usedMacroSteps.addAssign(uint(1));
+                If(t.greaterThanEqual(t1), () => {
+                  resolved.assign(1);
+                  Break();
+                });
+
+                const q = q0.add(dq.mul(t)).toVar();
+                If(
+                  q.x.lessThan(0).or(q.y.lessThan(0)).or(q.z.lessThan(0))
+                    .or(q.x.greaterThanEqual(level0.res.x))
+                    .or(q.y.greaterThanEqual(level0.res.y))
+                    .or(q.z.greaterThanEqual(level0.res.z)),
+                  () => {
+                    resolved.assign(1);
+                    Break();
+                  },
+                );
+
+                // The macro+brick body is a JS closure so the coarse ride can
+                // be compiled OUT rather than predicated away: an A/B arm that
+                // still emits the level-3/4 reads measures the wrong thing.
+                const macroBody = () => {
+                const macro = q.div(float(BRICK_RESOLUTION)).floor().toVar();
+                const mx = macro.x.toUint().toVar();
+                const my = macro.y.toUint().toVar();
+                const mz = macro.z.toUint().toVar();
+                const macroIndex = mz.mul(uint(hybridLayout.macroResolution.y)).add(my)
+                  .mul(uint(hybridLayout.macroResolution.x)).add(mx).toVar();
+                const macroBase = uint(hybridWordOffset).add(
+                  macroIndex.mul(uint(MACRO_CELL_WORDS)),
+                ).toVar();
+                const brickIndex = bits.element(
+                  macroBase.add(uint(MACRO_CELL_BRICK_INDEX_WORD)),
+                ).toVar();
+                const metadata = bits.element(
+                  macroBase.add(uint(MACRO_CELL_METADATA_WORD)),
+                ).toVar();
+                const cellType = bitAnd(
+                  shiftRight(metadata, uint(MACRO_CELL_TYPE_SHIFT)),
+                  uint(MACRO_CELL_TYPE_MASK),
+                ).toVar();
+
+                const macroBound = macro.add(face).mul(float(BRICK_RESOLUTION)).toVar();
+                const tx = macroBound.x.sub(q.x).mul(rd.x).toVar();
+                const ty = macroBound.y.sub(q.y).mul(rd.y).toVar();
+                const tz = macroBound.z.sub(q.z).mul(rd.z).toVar();
+                const macroDelta = tx.min(ty).min(tz).max(0).toVar();
+                const macroExit = t.add(macroDelta).toVar();
+                const macroAxis = select(
+                  macroDelta.equal(tx),
+                  float(0),
+                  select(macroDelta.equal(ty), float(1), float(2)),
+                ).toVar();
+
+                // DynamicBrick bricks are traversed too — with occupied-box
+                // semantics only, because their records (if any) were fitted
+                // and rank-addressed against the static mask.
+                const isStaticBrick = cellType.equal(uint(MacroCellType.Brick)).toVar();
+                If(isStaticBrick.or(cellType.equal(uint(MacroCellType.DynamicBrick))), () => {
+                  const validBrick = brickIndex.lessThan(uint(hybridLayout.brickCount))
+                    .and(brickIndex.notEqual(uint(INVALID_RAY_HIT_INDEX)));
+                  If(validBrick.not(), () => {
+                    invalidRef.assign(1);
+                    Break();
+                  });
+
+                  const safeBrick = brickIndex.min(uint(hybridLayout.brickCount - 1));
+                  const brickBase = uint(hybridWordOffset + hybridLayout.brickHeaderOffset)
+                    .add(safeBrick.mul(uint(BRICK_HEADER_WORDS))).toVar();
+                  const occupancyLow = bits.element(
+                    brickBase.add(uint(BRICK_OCCUPANCY_LOW_WORD)),
+                  ).toVar();
+                  const occupancyHigh = bits.element(
+                    brickBase.add(uint(BRICK_OCCUPANCY_HIGH_WORD)),
+                  ).toVar();
+                  const surfOffset = bits.element(
+                    brickBase.add(uint(BRICK_SURFACE_OFFSET_WORD)),
+                  ).toVar();
+                  const useRecords = isStaticBrick
+                    .and(surfOffset.notEqual(uint(INVALID_RAY_HIT_INDEX))).toVar();
+                  const localT = t.toVar();
+                  const localResolved = float(0).toVar();
+                  const localAxis = axis.toVar();
+                  const segmentEnd = macroExit.min(t1).toVar();
+
+                  Loop({ start: 0, end: MAX_BRICK_STEPS, name: "planeBrickDda" }, () => {
+                    If(localT.greaterThanEqual(segmentEnd.add(RAY_HIT_DDA_EPSILON)), () => {
+                      localResolved.assign(1);
+                      Break();
+                    });
+                    usedBrickSteps.addAssign(uint(1));
+                    const localQ = q0.add(dq.mul(localT)).toVar();
+                    const cell = localQ.floor().toVar();
+                    // The epsilon advance can land a hair past the brick; the
+                    // mask and every rank below belong to THIS brick, so hand
+                    // such a ray back to the macro loop (mirrors the CPU).
+                    const cellMacro = cell.div(float(BRICK_RESOLUTION)).floor().toVar();
+                    If(
+                      cellMacro.x.notEqual(macro.x)
+                        .or(cellMacro.y.notEqual(macro.y))
+                        .or(cellMacro.z.notEqual(macro.z)),
+                      () => {
+                        localResolved.assign(1);
+                        Break();
+                      },
+                    );
+                    const localCell = cell.sub(macro.mul(float(BRICK_RESOLUTION)))
+                      .clamp(vec3(0), vec3(BRICK_RESOLUTION - 1)).toVar();
+                    const cellIndex = localCell.z.toUint().mul(uint(16))
+                      .add(localCell.y.toUint().mul(uint(4)))
+                      .add(localCell.x.toUint()).toVar();
+
+                    // Cell exit before the hit test: the plane acceptance is
+                    // bounded by this cell's [entry, exit] ray interval.
+                    const cellBound = cell.add(face).toVar();
+                    const cx = cellBound.x.sub(localQ.x).mul(rd.x).toVar();
+                    const cy = cellBound.y.sub(localQ.y).mul(rd.y).toVar();
+                    const cz = cellBound.z.sub(localQ.z).mul(rd.z).toVar();
+                    const cellDelta = cx.min(cy).min(cz).max(0).toVar();
+                    const cellExit = localT.add(cellDelta).toVar();
+                    const nextAxis = select(
+                      cellDelta.equal(cx),
+                      float(0),
+                      select(cellDelta.equal(cy), float(1), float(2)),
+                    ).toVar();
+
+                    const occupancyWord = select(
+                      cellIndex.lessThan(uint(32)),
+                      occupancyLow,
+                      occupancyHigh,
+                    ).toVar();
+                    const occupancyBit = bitAnd(
+                      shiftRight(occupancyWord, bitAnd(cellIndex, uint(31))),
+                      uint(1),
+                    );
+                    If(occupancyBit.notEqual(uint(0)), () => {
+                      // 0 = untouched (→ box fallback), 1 = hit taken,
+                      // 2 = plane rejected (→ keep marching).
+                      const cellVerdict = float(0).toVar();
+                      If(useRecords, () => {
+                        const inLow = cellIndex.lessThan(uint(32));
+                        const belowLow = select(
+                          inLow,
+                          shiftLeft(uint(1), bitAnd(cellIndex, uint(31))).sub(uint(1)),
+                          uint(0xffffffff),
+                        );
+                        const belowHigh = select(
+                          inLow,
+                          uint(0),
+                          shiftLeft(uint(1), bitAnd(cellIndex, uint(31))).sub(uint(1)),
+                        );
+                        const rank = countOneBits(bitAnd(occupancyLow, belowLow))
+                          .add(countOneBits(bitAnd(occupancyHigh, belowHigh)));
+                        const record = surfOffset.add(rank).toVar();
+                        If(record.lessThan(uint(surfaceCapacity)), () => {
+                          const rBase = uint(surfaceWordOffset)
+                            .add(record.mul(uint(SURFACE_RECORD_WORDS))).toVar();
+                          const flagsWord = bits.element(rBase.add(uint(3))).toVar();
+                          const simple = bitAnd(
+                            shiftRight(flagsWord, uint(COVERAGE_FLAGS_SHIFT)),
+                            uint(SURFACE_FLAG_SIMPLE),
+                          );
+                          If(simple.notEqual(uint(0)), () => {
+                            planeTests.addAssign(uint(1));
+                            const n = octDecodeTSL(unpackSnorm2x16(bits.element(rBase))).toVar();
+                            const dPlane = unpackSnorm2x16(bits.element(rBase.add(uint(1)))).x
+                              .mul(CELL_LOCAL_PLANE_OFFSET_RANGE).toVar();
+                            const denom = n.dot(dq).toVar();
+                            const accepted = float(0).toVar();
+                            If(denom.abs().greaterThan(1e-7), () => {
+                              const tP = dPlane.add(n.dot(cell)).sub(n.dot(q0)).div(denom).toVar();
+                              const okInterval = tP.greaterThanEqual(localT.sub(PLANE_HIT_INTERVAL_EPSILON))
+                                .and(tP.lessThanEqual(cellExit.min(segmentEnd).add(PLANE_HIT_INTERVAL_EPSILON)));
+                              If(okInterval, () => {
+                                const covOk = float(1).toVar();
+                                if (coverage) {
+                                  const covValid = bitAnd(shiftRight(flagsWord, uint(COVERAGE_VALID_SHIFT)), uint(1));
+                                  If(covValid.notEqual(uint(0)), () => {
+                                    const local = q0.add(dq.mul(tP)).sub(cell)
+                                      .clamp(vec3(0), vec3(1)).toVar();
+                                    const axisSel = bitAnd(shiftRight(flagsWord, uint(16)), uint(3)).toVar();
+                                    const u = select(axisSel.equal(uint(0)), local.y, local.x);
+                                    const v = select(axisSel.equal(uint(2)), local.y, local.z);
+                                    const texU = u.mul(4).floor().clamp(0, 3).toUint();
+                                    const texV = v.mul(4).floor().clamp(0, 3).toUint();
+                                    const covBit = bitAnd(
+                                      shiftRight(flagsWord, texV.mul(uint(4)).add(texU)),
+                                      uint(1),
+                                    );
+                                    covOk.assign(covBit.toFloat());
+                                  });
+                                }
+                                If(covOk.greaterThan(0.5), () => {
+                                  accepted.assign(1);
+                                  hit.assign(1);
+                                  hitT.assign(tP.max(t0));
+                                  // Face the side the ray sees — the sampler
+                                  // picks the radiance shell by this normal.
+                                  hitNormal.assign(select(denom.greaterThan(0), n.negate(), n));
+                                  resolved.assign(1);
+                                  localResolved.assign(1);
+                                  cellVerdict.assign(1);
+                                  planeAccepts.addAssign(uint(1));
+                                });
+                              });
+                            });
+                            If(accepted.lessThan(0.5), () => {
+                              planeRejects.addAssign(uint(1));
+                              cellVerdict.assign(2);
+                            });
+                          });
+                          if (exact) {
+                            // EXACT COMPLEX CELL. The record's reserved range
+                            // holds every triangle that overlaps this cell, so
+                            // an empty result is a real miss and the DDA is
+                            // allowed to continue (verdict 2) — the whole
+                            // point of Phase 4 over the occupied-box fallback.
+                            // Pool vertices are CELL-LOCAL, so `cell` puts them
+                            // back in the voxel space q0/dq already live in and
+                            // `t` comes out in the DDA's own world units.
+                            const complex = bitAnd(
+                              shiftRight(flagsWord, uint(COVERAGE_FLAGS_SHIFT)),
+                              uint(SURFACE_FLAG_COMPLEX),
+                            );
+                            If(complex.notEqual(uint(0)), () => {
+                              complexTests.addAssign(uint(1));
+                              const range = bits.element(rBase.add(uint(2))).toVar();
+                              const poolOffset = bitAnd(range, uint(COMPLEX_RANGE_OFFSET_MASK)).toVar();
+                              const triCount = bitAnd(
+                                shiftRight(range, uint(COMPLEX_RANGE_COUNT_SHIFT)),
+                                uint(COMPLEX_RANGE_COUNT_MASK),
+                              ).toVar();
+                              const tLo = localT.sub(PLANE_HIT_INTERVAL_EPSILON).toVar();
+                              const tHi = cellExit.min(segmentEnd).add(PLANE_HIT_INTERVAL_EPSILON).toVar();
+                              const nearest = float(1e30).toVar();
+                              const found = float(0).toVar();
+                              const nearestNormal = vec3(0, 0, 1).toVar();
+                              Loop({ start: 0, end: MAX_COMPLEX_TRIANGLES, name: "exactTri" }, ({ exactTri }) => {
+                                If(exactTri.toUint().greaterThanEqual(triCount), () => {
+                                  Break();
+                                });
+                                triangleTests.addAssign(uint(1));
+                                const w = uint(trianglePoolWordOffset).add(
+                                  poolOffset.add(exactTri.toUint()).mul(uint(COMPLEX_TRIANGLE_WORDS)),
+                                ).toVar();
+                                const a = vec3(
+                                  uintBitsToFloat(bits.element(w)),
+                                  uintBitsToFloat(bits.element(w.add(uint(1)))),
+                                  uintBitsToFloat(bits.element(w.add(uint(2)))),
+                                ).add(cell).toVar();
+                                const b = vec3(
+                                  uintBitsToFloat(bits.element(w.add(uint(3)))),
+                                  uintBitsToFloat(bits.element(w.add(uint(4)))),
+                                  uintBitsToFloat(bits.element(w.add(uint(5)))),
+                                ).add(cell).toVar();
+                                const c = vec3(
+                                  uintBitsToFloat(bits.element(w.add(uint(6)))),
+                                  uintBitsToFloat(bits.element(w.add(uint(7)))),
+                                  uintBitsToFloat(bits.element(w.add(uint(8)))),
+                                ).add(cell).toVar();
+                                // Möller-Trumbore, DOUBLE-SIDED: a back-facing
+                                // triangle still stops light, and complex cells
+                                // are exactly where both faces meet.
+                                const e1 = b.sub(a).toVar();
+                                const e2 = c.sub(a).toVar();
+                                const pv = dq.cross(e2).toVar();
+                                const det = e1.dot(pv).toVar();
+                                If(det.abs().greaterThan(1e-9), () => {
+                                  const invDet = float(1).div(det).toVar();
+                                  const tv = q0.sub(a).toVar();
+                                  const u = tv.dot(pv).mul(invDet).toVar();
+                                  // The barycentric slack is WATERTIGHTNESS, not
+                                  // tolerance: two triangles sharing an edge
+                                  // compute that edge from independent f32 cross
+                                  // products, so a hard [0,1] boundary lets a ray
+                                  // through the seam — and an exact miss here
+                                  // CONTINUES the march, i.e. leaks. 1e-6 of a
+                                  // barycentric is sub-micron on a 0.125m cell.
+                                  If(u.greaterThanEqual(-1e-6).and(u.lessThanEqual(1 + 1e-6)), () => {
+                                    const qv = tv.cross(e1).toVar();
+                                    const vBary = dq.dot(qv).mul(invDet).toVar();
+                                    If(vBary.greaterThanEqual(-1e-6).and(u.add(vBary).lessThanEqual(1 + 1e-6)), () => {
+                                      const tTri = e2.dot(qv).mul(invDet).toVar();
+                                      If(
+                                        tTri.greaterThanEqual(tLo)
+                                          .and(tTri.lessThanEqual(tHi))
+                                          .and(tTri.lessThan(nearest)),
+                                        () => {
+                                          nearest.assign(tTri);
+                                          found.assign(1);
+                                          const gn = e1.cross(e2).normalize().toVar();
+                                          nearestNormal.assign(select(gn.dot(dq).greaterThan(0), gn.negate(), gn));
+                                        },
+                                      );
+                                    });
+                                  });
+                                });
+                              });
+                              If(found.greaterThan(0.5), () => {
+                                hit.assign(1);
+                                hitT.assign(nearest.max(t0));
+                                hitNormal.assign(nearestNormal);
+                                resolved.assign(1);
+                                localResolved.assign(1);
+                                cellVerdict.assign(1);
+                                complexAccepts.addAssign(uint(1));
+                              }).Else(() => {
+                                cellVerdict.assign(2);
+                                complexMisses.addAssign(uint(1));
+                              });
+                            });
+                          }
+                        });
+                      });
+                      If(cellVerdict.lessThan(0.5), () => {
+                        surfaceFallbacks.addAssign(uint(1));
+                        hit.assign(1);
+                        hitT.assign(localT);
+                        hitNormal.assign(faceNormalFrom(localAxis));
+                        resolved.assign(1);
+                        localResolved.assign(1);
+                      });
+                      If(hit.greaterThan(0.5), () => {
+                        Break();
+                      });
+                    });
+
+                    localAxis.assign(nextAxis);
+                    localT.assign(cellExit.add(RAY_HIT_DDA_EPSILON));
+                  });
+
+                  If(hit.greaterThan(0.5), () => {
+                    Break();
+                  });
+                  If(localResolved.lessThan(0.5), () => {
+                    brickLimit.assign(1);
+                    Break();
+                  });
+                  axis.assign(localAxis);
+                  t.assign(macroExit.add(RAY_HIT_DDA_EPSILON));
+                  // The re-ascend only exists when the ride does; with the skip
+                  // off `level` must stay pinned at the macro level forever.
+                  if (coarseSkipEnabled) level.assign(int(3));
+                }).Else(() => {
+                  axis.assign(macroAxis);
+                  t.assign(macroExit.add(RAY_HIT_DDA_EPSILON));
+                  if (coarseSkipEnabled) level.assign(int(3));
+                });
+                };
+
+                // Reuse the existing conservative pyramid above level 2.
+                // Level 2 is exactly one 4^3 macrocell, so levels 3-4 provide
+                // broad empty-space skips without changing the leaf data.
+                if (coarseSkipEnabled) {
+                  If(level.greaterThan(int(2)), () => {
+                    usedCoarseSteps.addAssign(uint(1));
+                    const scale = levelSelect(level, (l) => l.scale).toVar();
+                    const coarse = q.div(scale).floor().toVar();
+                    If(occupiedAt(coarse, level).greaterThan(0.5), () => {
+                      coarseDescends.addAssign(uint(1));
+                      level.assign(level.sub(int(1)));
+                    }).Else(() => {
+                      const coarseBound = coarse.add(face).mul(scale).toVar();
+                      const hx = coarseBound.x.sub(q.x).mul(rd.x).toVar();
+                      const hy = coarseBound.y.sub(q.y).mul(rd.y).toVar();
+                      const hz = coarseBound.z.sub(q.z).mul(rd.z).toVar();
+                      const coarseDelta = hx.min(hy).min(hz).max(0).toVar();
+                      axis.assign(select(
+                        coarseDelta.equal(hx),
+                        float(0),
+                        select(coarseDelta.equal(hy), float(1), float(2)),
+                      ));
+                      t.addAssign(coarseDelta.add(RAY_HIT_DDA_EPSILON));
+                      // Attributed BEFORE the re-ascend: the empty span belongs
+                      // to the level that was empty, not the one climbed to.
+                      coarseSkipsL3.addAssign(select(level.equal(int(3)), uint(1), uint(0)));
+                      coarseSkipsL4.addAssign(select(level.greaterThan(int(3)), uint(1), uint(0)));
+                      level.assign(level.add(int(1)).min(int(OCC_LEVELS - 1)));
+                    });
+                  }).Else(macroBody);
+                } else {
+                  macroBody();
+                }
+              });
+
+              if (rayHitDebug && profile) {
+                const invalid = t.notEqual(t).or(hitT.notEqual(hitT)).or(invalidRef.greaterThan(0.5));
+                const macroLimit = resolved.lessThan(0.5).and(brickLimit.lessThan(0.5));
+                rayHitDebug.recordTrace({
+                  hit,
+                  resolved,
+                  steps: usedMacroSteps,
+                  brickSteps: usedBrickSteps,
+                  macroLimit,
+                  brickLimit,
+                  invalid,
+                  planeTests,
+                  planeAccepts,
+                  planeRejects,
+                  surfaceFallbacks,
+                  complexTests,
+                  triangleTests,
+                  complexAccepts,
+                  complexMisses,
+                  coarseSteps: usedCoarseSteps,
+                  coarseSkipsL3,
+                  coarseSkipsL4,
+                  coarseDescends,
+                });
+              }
+
+              const oct = octEncodeTSL(hitNormal).toVar();
+              return vec4(hit, hitT, oct.x, oct.y);
+            },
+          });
+          hybridPlaneVariants.set(key, fn);
+        }
+
+        const packed = fn(vec3(origin), vec3(dir), float(tMin), float(tMax)).toVar();
+        const hit = packed.x;
+        const hitT = packed.y;
+        const normal = octDecodeTSL(vec2(packed.z, packed.w)).mul(vec3(voxelInv)).normalize().toVar();
+        const dq = vec3(dir).mul(vec3(voxelInv)).toVar();
+        const q0 = vec3(origin).sub(vec3(gridOrigin)).mul(vec3(voxelInv));
+        const voxelAtHit = q0.add(dq.mul(hitT)).floor();
+        return { hit, t: hitT, normal, voxel: voxelAtHit };
+      }
+    : null;
 
   /**
    * Point test: is world point `p` inside occupied geometry at `level`? Used by
@@ -948,7 +2520,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
    *   traces) passes a small number and lets its existing far-field distance
    *   cover the rest. The composite, which HAS no other source, passes them all.
    */
-  const freeRadiusBody = (p, top, nearField, cap) => {
+  const freeRadiusBody = (p, top, nearField, cap, recordAware = false) => {
     const q0 = vec3(p).sub(vec3(gridOrigin)).mul(vec3(voxelInv)).toVar();
     const voxelWorld = vec3(voxel).toVar();
     const best = float(0).toVar();
@@ -980,6 +2552,30 @@ export function createOccupancyField(bounds, res0, options = {}) {
     if (nearField) {
       const cell = q0.floor().toVar();
       const nearest = float(1e9).toVar();
+      // RECORD-AWARE SHARPENING (Phase 5). The voxel-AABB bound this loop
+      // computes is what paints stair-stepped shadow silhouettes: its
+      // isosurface is a rounded BOX, so a light sweeping past a flat wall
+      // crosses a staircase of them and the penumbra steps in voxel-sized
+      // blocks ("squarish light changes"). Where the occupied
+      // neighbour carries a SIMPLE surface record — a plane already fitted to
+      // exactly the triangles that set the bit, living in the SAME `bits`
+      // buffer this oracle already reads — the true distance to that geometry
+      // is the plane distance, which is a hair larger than the box gap and
+      // whose isosurface is FLAT. Taking the max of the two is still a valid
+      // lower bound (both bound the same triangles), so this only ever
+      // SHARPENS; the box gap remains the floor for every case the record
+      // cannot speak for: dynamic bricks (records were fitted and rank-
+      // addressed against the STATIC mask), unallocated bricks, and complex
+      // cells whose geometry is not one plane.
+      //
+      // MIN of the world voxel dimensions, taken GPU-side off the live
+      // `voxel` uniform rather than baked as a JS literal, so an in-place
+      // refit rescales it with everything else in this file. Converting a
+      // voxel-space distance with the SMALLEST axis is the conservative
+      // choice on a non-cubic grid.
+      const minVoxelWorld = recordAware
+        ? voxelWorld.x.min(voxelWorld.y).min(voxelWorld.z).toVar()
+        : null;
       // NOTE `name:` is the WGSL iterator's NAME (LoopNode.getProperties), not
       // a label — the callback destructures by it, and nested loops need
       // distinct names so the inner counter can't shadow the outer.
@@ -993,7 +2589,112 @@ export function createOccupancyField(bounds, res0, options = {}) {
         // on an axis where `q0` is already inside the slab.
         const gap = v.sub(q0).max(q0.sub(v.add(1))).max(vec3(0)).mul(voxelWorld).toVar();
         const d = gap.length();
-        nearest.assign(nearest.min(select(occ.greaterThan(0.5), d, float(1e9))));
+        if (!recordAware) {
+          nearest.assign(nearest.min(select(occ.greaterThan(0.5), d, float(1e9))));
+        } else {
+          const contribution = d.toVar();
+          // The whole record chain is gated on the bit, unlike the fetches
+          // above: an EMPTY neighbour is the common case and it has no record
+          // to look up, so predicating this would pay four dependent buffer
+          // reads 27 times per sample for nothing. (Safe here in a way the
+          // pyramid fetches are not — nothing downstream needs the value the
+          // untaken branch would have produced; `contribution` already holds
+          // the conservative answer.)
+          If(occ.greaterThan(0.5), () => {
+            // Phase-1 macro → brick header walk, identical to the plane
+            // trace's. `v` is occupied, so it is inside level 0 by
+            // construction and its macrocell exists (level-0 resolution is a
+            // multiple of RES_QUANTUM ≥ BRICK_RESOLUTION); the clamps only
+            // keep the indices provably in range for the compiler.
+            const macro = v.div(float(BRICK_RESOLUTION)).floor().toVar();
+            const mx = macro.x.max(0).min(hybridLayout.macroResolution.x - 1).toUint().toVar();
+            const my = macro.y.max(0).min(hybridLayout.macroResolution.y - 1).toUint().toVar();
+            const mz = macro.z.max(0).min(hybridLayout.macroResolution.z - 1).toUint().toVar();
+            const macroIndex = mz.mul(uint(hybridLayout.macroResolution.y)).add(my)
+              .mul(uint(hybridLayout.macroResolution.x)).add(mx).toVar();
+            const macroBase = uint(hybridWordOffset).add(
+              macroIndex.mul(uint(MACRO_CELL_WORDS)),
+            ).toVar();
+            const metadata = bits.element(
+              macroBase.add(uint(MACRO_CELL_METADATA_WORD)),
+            ).toVar();
+            const cellType = bitAnd(
+              shiftRight(metadata, uint(MACRO_CELL_TYPE_SHIFT)),
+              uint(MACRO_CELL_TYPE_MASK),
+            ).toVar();
+            // STATIC bricks only — DynamicBrick keeps the AABB gap, exactly as
+            // the plane trace keeps occupied-box semantics there.
+            If(cellType.equal(uint(MacroCellType.Brick)), () => {
+              const brickIndex = bits.element(
+                macroBase.add(uint(MACRO_CELL_BRICK_INDEX_WORD)),
+              ).toVar();
+              If(
+                brickIndex.lessThan(uint(hybridLayout.brickCount))
+                  .and(brickIndex.notEqual(uint(INVALID_RAY_HIT_INDEX))),
+                () => {
+                  const brickBase = uint(hybridWordOffset + hybridLayout.brickHeaderOffset)
+                    .add(brickIndex.mul(uint(BRICK_HEADER_WORDS))).toVar();
+                  const surfOffset = bits.element(
+                    brickBase.add(uint(BRICK_SURFACE_OFFSET_WORD)),
+                  ).toVar();
+                  If(surfOffset.notEqual(uint(INVALID_RAY_HIT_INDEX)), () => {
+                    const localCell = v.sub(macro.mul(float(BRICK_RESOLUTION)))
+                      .clamp(vec3(0), vec3(BRICK_RESOLUTION - 1)).toVar();
+                    const cellIndex = localCell.z.toUint().mul(uint(16))
+                      .add(localCell.y.toUint().mul(uint(4)))
+                      .add(localCell.x.toUint()).toVar();
+                    const occupancyLow = bits.element(
+                      brickBase.add(uint(BRICK_OCCUPANCY_LOW_WORD)),
+                    ).toVar();
+                    const occupancyHigh = bits.element(
+                      brickBase.add(uint(BRICK_OCCUPANCY_HIGH_WORD)),
+                    ).toVar();
+                    // Records are RANK-addressed inside the brick mask — the
+                    // same popcount the trace uses, so the two read the same
+                    // record for the same voxel by construction.
+                    const inLow = cellIndex.lessThan(uint(32));
+                    const belowLow = select(
+                      inLow,
+                      shiftLeft(uint(1), bitAnd(cellIndex, uint(31))).sub(uint(1)),
+                      uint(0xffffffff),
+                    );
+                    const belowHigh = select(
+                      inLow,
+                      uint(0),
+                      shiftLeft(uint(1), bitAnd(cellIndex, uint(31))).sub(uint(1)),
+                    );
+                    const rank = countOneBits(bitAnd(occupancyLow, belowLow))
+                      .add(countOneBits(bitAnd(occupancyHigh, belowHigh)));
+                    const record = surfOffset.add(rank).toVar();
+                    If(record.lessThan(uint(surfaceCapacity)), () => {
+                      const rBase = uint(surfaceWordOffset)
+                        .add(record.mul(uint(SURFACE_RECORD_WORDS))).toVar();
+                      const flagsWord = bits.element(rBase.add(uint(3))).toVar();
+                      const simple = bitAnd(
+                        shiftRight(flagsWord, uint(COVERAGE_FLAGS_SHIFT)),
+                        uint(SURFACE_FLAG_SIMPLE),
+                      );
+                      If(simple.notEqual(uint(0)), () => {
+                        // Same decode as traceHybridPlane's: word 0 is the
+                        // octahedral voxel-space normal, word 1's low 16 bits
+                        // the CELL-LOCAL plane offset in snorm16 units of
+                        // CELL_LOCAL_PLANE_OFFSET_RANGE.
+                        const nHat = octDecodeTSL(unpackSnorm2x16(bits.element(rBase))).toVar();
+                        const dPlane = unpackSnorm2x16(bits.element(rBase.add(uint(1)))).x
+                          .mul(CELL_LOCAL_PLANE_OFFSET_RANGE).toVar();
+                        const planeVox = nHat.dot(q0.sub(v)).sub(dPlane).abs().toVar();
+                        const planeWorld = planeVox.sub(float(RECORD_PLANE_SLACK))
+                          .max(0).mul(minVoxelWorld).toVar();
+                        contribution.assign(contribution.max(planeWorld));
+                      });
+                    });
+                  });
+                },
+              );
+            });
+          });
+          nearest.assign(nearest.min(select(occ.greaterThan(0.5), contribution, float(1e9))));
+        }
       });
       // Distance from `q0` to the boundary of the 3×3×3 block, per axis:
       // `q0 - cell` is in [0, 1), so this is at least one voxel.
@@ -1068,22 +2769,38 @@ export function createOccupancyField(bounds, res0, options = {}) {
   // 2026-08-02; that queue WAS the "materials preparation" startup hang).
   // `maxLevel`/`nearField` change the UNROLLING, so they select a variant;
   // only `p` and the saturation cap are runtime parameters.
+  //
+  // `recordAware` is the fourth variant dimension and a BUILD-TIME boolean for
+  // the same reason: it adds a record chain to the near-field loop that must be
+  // COMPILED OUT of every other consumer, not predicated away. The A/B arm's
+  // WGSL is then byte-identical to before Phase 5 — the composite, the AO taps
+  // and the probe-burial ramp all keep the exact function they had.
   const freeRadiusVariants = new Map();
-  const freeRadiusAtWorld = (p, maxLevel = OCC_LEVELS - 1, nearField = true, saturateValue = null) => {
+  /**
+   * @param {*} p world position
+   * @param {number} [maxLevel] highest pyramid level to consult
+   * @param {boolean} [nearField] run the 27-voxel near field
+   * @param {*} [saturateValue] value reported when the coarsest level is empty
+   * @param {boolean} [recordAware] sharpen occupied near-field neighbours with
+   *   their fitted SIMPLE plane record. Silently ignored when this field was
+   *   built without surface records — there is nothing to read.
+   */
+  const freeRadiusAtWorld = (p, maxLevel = OCC_LEVELS - 1, nearField = true, saturateValue = null, recordAware = false) => {
     const top = Math.max(0, Math.min(OCC_LEVELS - 1, maxLevel));
     const sat = saturateValue != null;
-    const key = `${top}|${nearField ? 1 : 0}|${sat ? 1 : 0}`;
+    const rec = recordAware === true && surfaceEnabled && nearField;
+    const key = `${top}|${nearField ? 1 : 0}|${sat ? 1 : 0}|${rec ? 1 : 0}`;
     let fn = freeRadiusVariants.get(key);
     if (fn === undefined) {
       fn = sharedFn({
-        name: `giFreeRadius${top}${nearField ? "n" : ""}${sat ? "s" : ""}`,
+        name: `giFreeRadius${top}${nearField ? "n" : ""}${sat ? "s" : ""}${rec ? "r1" : ""}`,
         type: "float",
         inputs: sat
           ? [{ name: "p", type: "vec3" }, { name: "cap", type: "float" }]
           : [{ name: "p", type: "vec3" }],
         body: sat
-          ? (pp, cap) => freeRadiusBody(pp, top, nearField, cap)
-          : (pp) => freeRadiusBody(pp, top, nearField, null),
+          ? (pp, cap) => freeRadiusBody(pp, top, nearField, cap, rec)
+          : (pp) => freeRadiusBody(pp, top, nearField, null, rec),
       });
       freeRadiusVariants.set(key, fn);
     }
@@ -1320,17 +3037,43 @@ export function createOccupancyField(bounds, res0, options = {}) {
         //   FAST — replay the snapshot (2 copies) + dynamic side only. Runs
         //          on every frame where only dynamic transforms changed —
         //          the game steady state this split exists for.
+        //
+        // The Phase-2 surface build (and the Phase-4 triangle pool that hangs
+        // off it) rides the FULL chain only, wedged between the static
+        // voxelize and the dynamic one: an extra copy+hybridBuild lands the
+        // STATIC-ONLY state in the pyramid/brick tail, the surface passes
+        // allocate and fit against those static masks, and only then does the
+        // dynamic side stack on top. Fast chains never touch the records or
+        // the pool — static bits cannot have changed, and bricks that gain
+        // dynamic bits get typed DynamicBrick by the final hybridBuild, which
+        // the tracer reads as "box semantics here".
         const voxStatic = buildVoxelizeCompute("static");
         const voxDynamic = buildVoxelizeCompute("dynamic");
+        const surfaceChain = surfaceEnabled
+          ? [
+              copyCompute, hybridBuildCompute,
+              surfClearCompute, surfAllocCompute,
+              buildSurfAccumCompute(), surfFinalizeCompute,
+              // Phase 4 rides the same FULL chain: finalize reserves the
+              // triangle ranges, this fills them.
+              ...(buildComplexWriteCompute ? [buildComplexWriteCompute()] : []),
+            ]
+          : [];
         computes = {
           full: [
-            clearCompute, buildClearAttrCompute(),
+            // Fresh clear per geometry change — see buildClearCompute's note:
+            // a stale compiled clear executing ahead of skipped fresh
+            // voxelize nodes is the spawn-blink's empty-pyramid window.
+            buildClearCompute(), buildClearAttrCompute(),
             voxStatic, snapStaticBitsCompute, buildSnapStaticAttrCompute(),
+            ...surfaceChain,
             voxDynamic, copyCompute, ...downsampleComputes,
+            ...(hybridBuildCompute ? [hybridBuildCompute] : []),
           ],
           fast: [
             restoreStaticBitsCompute, buildRestoreStaticAttrCompute(),
             voxDynamic, copyCompute, ...downsampleComputes,
+            ...(hybridBuildCompute ? [hybridBuildCompute] : []),
           ],
         };
         computesRevision = geometryRevision;
@@ -1348,6 +3091,34 @@ export function createOccupancyField(bounds, res0, options = {}) {
     },
 
     traceOccupancy,
+    traceHybridBrick,
+    traceHybridPlane,
+    hybridLayout: hybridEnabled ? hybridLayout : null,
+    /**
+     * True when the `bits` tail carries SurfaceRecords, i.e. the active ray-hit
+     * mode is a plane-family one. The signal consumers use to decide whether
+     * `freeRadiusAtWorld`'s `recordAware` argument can do anything — `rayHitMode`
+     * itself is not in scope where the traces are built.
+     */
+    hasSurfaceRecords: surfaceEnabled,
+    surfaceCapacity,
+    rayHitDebug,
+    /**
+     * Pool allocator readback [recordNext, overflowBricks, triangleNext,
+     * complexOverflowCells] — diagnostics only.
+     */
+    async readbackSurfaceAlloc(renderer) {
+      if (!surfAlloc) return null;
+      const data = new Uint32Array(await renderer.getArrayBufferAsync(surfAlloc.value));
+      return {
+        allocated: data[0] ?? 0,
+        overflowBricks: data[1] ?? 0,
+        capacity: surfaceCapacity,
+        triangles: data[2] ?? 0,
+        complexOverflowCells: data[3] ?? 0,
+        triangleCapacity: complexTriangleCapacity,
+      };
+    },
     occupiedAtWorld,
     freeRadiusAtWorld,
     occupiedAt,

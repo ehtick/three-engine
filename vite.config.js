@@ -1,7 +1,18 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import { existsSync } from "node:fs";
 
 const host = process.env.TAURI_DEV_HOST;
+
+// QUIET MODE — `.no-hmr` sentinel in the repo root (or VITE_NO_HMR env).
+// Disables the HMR/reload PUSH only: the watcher and module graph stay
+// fresh, so a manual F5 always gets current code, but a running editor (or
+// a puppeteer harness page) is never yanked mid-session by another agent's
+// file edits. Made for parallel Claude sessions working in this repo while
+// the editor is open. Checked at SERVER START — editing this config
+// auto-restarts every running vite, which is how a toggle takes effect;
+// delete the sentinel and restart to restore hot reload.
+const quietHmr = existsSync(new URL("./.no-hmr", import.meta.url)) || !!process.env.VITE_NO_HMR;
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({
@@ -44,13 +55,15 @@ export default defineConfig(async () => ({
     port: 1420,
     strictPort: true,
     host: host || false,
-    hmr: host
-      ? {
-          protocol: "ws",
-          host,
-          port: 1421,
-        }
-      : undefined,
+    hmr: quietHmr
+      ? false
+      : host
+        ? {
+            protocol: "ws",
+            host,
+            port: 1421,
+          }
+        : undefined,
     watch: {
       // 3. tell Vite to ignore watching `src-tauri`
       ignored: ["**/src-tauri/**"],
