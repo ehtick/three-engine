@@ -1744,7 +1744,15 @@ export class GISystem {
               // resolving power anyway.
               const vox = vec3(occ.voxel);
               const tMin = vox.x.max(vox.y).max(vox.z);
-              const r = occ.traceOccupancy(origin, dir, tMin, maxT, { steps: 64, penumbraK: k });
+              // Tiered like every other march in this module — the DDA's
+              // hierarchical coarse-skip means these budgets cross the whole
+              // volume at every tier; the tiers trade tail-end reach in
+              // pathological threading rays for per-pixel cost.
+              // (`__giDirectShadowSteps` overrides both arms for an A/B.)
+              const ddaSteps =
+                Number(globalThis.__giDirectShadowSteps) ||
+                ({ low: 40, medium: 56, high: 64, ultra: 80 }[quality] ?? 64);
+              const r = occ.traceOccupancy(origin, dir, tMin, maxT, { steps: ddaSteps, penumbraK: k });
               return r.hit.oneMinus().mul(r.pen);
             },
       // STABLE estimator, deliberately (the sharp one was tried first): the
@@ -2903,7 +2911,7 @@ export class GISystem {
         : "[gi] light shadows: gi-traced OFF — every light renders its own shadow map",
     );
     console.log(
-      `[gi] ray-hit: requested ${rayHitModeName(rayHitConfig.requestedMode)}, ` +
+      `[gi] ray-hit: requested ${rayHitConfig.autoMode ? `auto→${rayHitModeName(rayHitConfig.requestedMode)}` : rayHitModeName(rayHitConfig.requestedMode)}, ` +
         `active ${rayHitModeName(rayHitConfig.activeMode)}, profiling ${rayHitConfig.enableProfiling ? "ON" : "off"}` +
         // Printed for the same reason the branch factor is: "I set the A/B
         // global and nothing changed" is unreadable without the ground truth.

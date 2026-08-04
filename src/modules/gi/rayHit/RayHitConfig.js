@@ -41,6 +41,27 @@ export function rayHitModeName(mode) {
 }
 
 /**
+ * `rayHitMode: "auto"` — the mode follows the QUALITY PRESET, which is the
+ * right default because the ladder's whole trade is memory/cost vs hit
+ * precision and that is exactly what the presets already arbitrate (the user
+ * eyeballed all four on their scene and could not tell them apart in a still
+ * — the differences live in silhouettes and temporal stability, which scale
+ * with everything else the preset scales). `custom` (or any unknown quality)
+ * lands on plane-coverage: measured FREE on the real scene (session 23b,
+ * −1%) with the silhouette/stability win, so it is the sweet spot.
+ */
+const AUTO_MODE_BY_QUALITY = Object.freeze({
+  low: RayHitMode.HybridBrickBox,
+  medium: RayHitMode.HybridPlane,
+  high: RayHitMode.HybridPlaneCoverage,
+  ultra: RayHitMode.HybridExactComplex,
+});
+
+export function resolveAutoRayHitMode(quality) {
+  return AUTO_MODE_BY_QUALITY[String(quality ?? "").toLowerCase()] ?? RayHitMode.HybridPlaneCoverage;
+}
+
+/**
  * Resolves authoring properties and diagnostic globals into one immutable
  * build configuration. All four hybrid phases are implemented: HybridBrickBox
  * (Phase 1), HybridPlane (Phase 2), HybridPlaneCoverage (Phase 3) and
@@ -62,7 +83,11 @@ export function rayHitModeName(mode) {
  * predicate.
  */
 export function resolveRayHitConfig(props = {}, runtime = globalThis) {
-  const requestedMode = normalizeRayHitMode(runtime.__giRayHitMode ?? props.rayHitMode);
+  const rawMode = runtime.__giRayHitMode ?? props.rayHitMode;
+  const autoMode = String(rawMode ?? "").toLowerCase() === "auto";
+  const requestedMode = autoMode
+    ? resolveAutoRayHitMode(props.quality)
+    : normalizeRayHitMode(rawMode);
   const activeMode = requestedMode >= RayHitMode.HybridBrickBox &&
     requestedMode <= RayHitMode.HybridExactComplex
     ? requestedMode
@@ -70,6 +95,7 @@ export function resolveRayHitConfig(props = {}, runtime = globalThis) {
   return Object.freeze({
     requestedMode,
     activeMode,
+    autoMode,
     fallbackToLegacy: requestedMode !== activeMode,
     enableProfiling: runtime.__giRayHitProfiling === true || props.rayHitProfiling === true,
     enableSkipDistance: runtime.__giRayHitSkipDistance !== false && props.rayHitSkipDistance !== false,

@@ -50,7 +50,7 @@ page.on("console", (m) => {
   const t = m.text();
   // `[gi] light shadows:` is the ground-truth line for this feature — without
   // it a failure below cannot be told apart from "the build declined it".
-  if (/\[gi\] built|\[gi\] light shadows|\[gi\] occupancy backend|compile wave/.test(t)) console.log(`  ${t.slice(0, 180)}`);
+  if (/\[gi\] built|\[gi\] light shadows|\[gi\] occupancy backend|\[gi\] ray-hit|compile wave/.test(t)) console.log(`  ${t.slice(0, 180)}`);
   if (/\[gi\] built/.test(t)) built = true;
   if (m.type() === "error" && !/favicon|404/.test(t)) console.log(`  console.error: ${t.slice(0, 250)}`);
 });
@@ -128,6 +128,11 @@ const restore = async () => {
       id: giEntity.id, type: "global-illumination", key: "emissiveShadows", value: originalEmissive,
     });
   }
+  if (process.env.RAYHIT_MODE) {
+    await call("component.setProp", {
+      id: giEntity.id, type: "global-illumination", key: "rayHitMode", value: originalRayHitMode,
+    });
+  }
 };
 
 // castShadow first: three only compiles a shadow branch for a shadow-casting
@@ -148,6 +153,18 @@ if (!flip.ok) { await browser.close(); process.exit(1); }
 // checks already judge it.
 const giProps = componentOf(giEntity, "global-illumination")?.props ?? {};
 const originalEmissive = giProps.emissiveShadows !== false;
+// RAYHIT_MODE=<mode|auto> — run the measurement under a different ray-hit
+// mode (the shadow DDA resolves hits through it, so "square shadows" on
+// brick-box vs smooth silhouettes on plane-coverage is directly visible in
+// the screenshot). Restored after.
+const originalRayHitMode = giProps.rayHitMode ?? "auto";
+if (process.env.RAYHIT_MODE) {
+  const r = await call("component.setProp", {
+    id: giEntity.id, type: "global-illumination", key: "rayHitMode", value: process.env.RAYHIT_MODE,
+  });
+  console.log(r.ok ? `  rayHitMode -> ${process.env.RAYHIT_MODE}` : `  rayHitMode set failed: ${r.error}`);
+  await wait(15000);
+}
 if (process.env.EMISSIVE_OFF) {
   const r = await call("component.setProp", {
     id: giEntity.id, type: "global-illumination", key: "emissiveShadows", value: false,

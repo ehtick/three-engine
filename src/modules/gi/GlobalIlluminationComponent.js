@@ -102,8 +102,13 @@ export class GlobalIlluminationComponent extends Component {
     // building-sized scene at every quality tier, not before.
     backend: "occupancy",
     // Stable ray-hit switch. All hybrid phases are implemented (brick-box →
-    // exact-complex); unknown future values fall back to legacy.
-    rayHitMode: "occupancy-legacy",
+    // exact-complex); unknown future values fall back to legacy. "auto"
+    // follows the quality preset (low→brick-box, medium→plane, high→
+    // plane-coverage, ultra→exact-complex, custom→plane-coverage) — the
+    // ladder's trade is memory/cost vs hit precision, which is exactly what
+    // the presets already arbitrate. Scenes with an explicit saved mode keep
+    // it.
+    rayHitMode: "auto",
     rayHitProfiling: false,
     // Phase-5 A/B kill switch for the hybrid traces' coarse pyramid ride.
     // Default ON — off exists to measure, not to ship.
@@ -190,7 +195,7 @@ export class GlobalIlluminationComponent extends Component {
     { key: "reflections", label: "GI Reflections", type: "boolean", advanced: true, flipsToCustom: "quality" },
     { key: "exactReflections", label: "Exact Reflections (High/Ultra)", type: "boolean", advanced: true, flipsToCustom: "quality" },
     { key: "backend", label: "Tracing Backend", type: "select", options: ["occupancy", "sdf-legacy"], advanced: true, flipsToCustom: "quality" },
-    { key: "rayHitMode", label: "Ray Hit Mode", type: "select", options: ["occupancy-legacy", "hybrid-brick-box", "hybrid-plane", "hybrid-plane-coverage", "hybrid-exact-complex"], advanced: true },
+    { key: "rayHitMode", label: "Ray Hit Mode", type: "select", options: ["auto", "occupancy-legacy", "hybrid-brick-box", "hybrid-plane", "hybrid-plane-coverage", "hybrid-exact-complex"], advanced: true },
     { key: "rayHitProfiling", label: "Ray Hit Counters", type: "boolean", advanced: true },
     { key: "rayHitSkipDistance", label: "Ray Hit Empty-Space Skip", type: "boolean", advanced: true },
     { key: "sparseField", label: "Sparse Fine Field (sub-cell occlusion)", type: "boolean", advanced: true, flipsToCustom: "quality" },
