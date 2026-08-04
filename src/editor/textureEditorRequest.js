@@ -29,3 +29,23 @@ export function consumeNewTextureRequest() {
   state.pendingNew = false;
   return pending;
 }
+
+/**
+ * "Pack these images into an atlas."
+ *
+ * Raised by the Assets panel's context menu, which is a component with no state
+ * of its own that survives its own closing — so the request travels to the
+ * panel that renders the dialog rather than the menu trying to own it.
+ */
+export const PACK_ATLAS_EVENT = "texture-editor-pack-atlas";
+
+export function requestPackAtlas(paths) {
+  state.pendingPack = [...paths];
+  window.dispatchEvent(new CustomEvent(PACK_ATLAS_EVENT));
+}
+
+export function consumePackAtlasRequest() {
+  const pending = state.pendingPack ?? null;
+  state.pendingPack = null;
+  return pending;
+}

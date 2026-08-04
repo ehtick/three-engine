@@ -1,5 +1,6 @@
 import {
   Boxes,
+  Grid3x3,
   FileCode2,
   Files,
   Folder,
@@ -21,6 +22,7 @@ import {
   PREFAB_EXTENSIONS,
   ANIMATOR_EXTENSIONS,
   GEOMETRY_EXTENSIONS,
+  ATLAS_EXTENSIONS,
   AUDIO_EXTENSIONS,
 } from "./assetLoader.js";
 import { getAssetFlags } from "./assetFlags.js";
@@ -38,6 +40,7 @@ export const ASSET_TYPES = [
   { id: "material", label: "Materials", Icon: Palette, exts: MATERIAL_EXTENSIONS },
   { id: "cubemap", label: "Cube Maps", Icon: Globe, exts: CUBEMAP_EXTENSIONS },
   { id: "geometry", label: "Geometry", Icon: Shapes, exts: GEOMETRY_EXTENSIONS },
+  { id: "atlas", label: "Sprite Atlases", Icon: Grid3x3, exts: ATLAS_EXTENSIONS },
   { id: "prefab", label: "Prefabs", Icon: Package, exts: PREFAB_EXTENSIONS },
   { id: "scene", label: "Scenes", Icon: Layers, exts: ["scene"] },
   { id: "script", label: "Scripts", Icon: FileCode2, exts: SCRIPT_EXTENSIONS },

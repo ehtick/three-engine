@@ -33,7 +33,7 @@ import {
 import { useModulesStore, setModuleEnabled } from "../modules.js";
 import { useProjectStore, basename } from "../store/projectStore.js";
 import { useSelectionStore } from "../store/selectionStore.js";
-import { extOf, TEXTURE_EXTENSIONS } from "../assetLoader.js";
+import { extOf, ATLAS_EXTENSIONS, TEXTURE_EXTENSIONS } from "../assetLoader.js";
 import { uniqueName } from "../assetOps.js";
 import { pushToast } from "../toasts.js";
 import { NEW_TEXTURE_EVENT, consumeNewTextureRequest } from "../textureEditorRequest.js";
@@ -53,6 +53,8 @@ import {
   SwizzleDialog,
   anchorOffset,
 } from "./TextureOps.jsx";
+import { AtlasEditor } from "./AtlasEditor.jsx";
+import { findAtlasForImage } from "../atlasFile.js";
 import { bufferToImageData } from "../texture/codecPng.js";
 import { BLEND_MODES, compositeLayers, blendInto } from "../texture/blend.js";
 import {
@@ -170,6 +172,7 @@ const SELECT_TOOLS = new Set(["selectRect", "selectEllipse", "lasso", "wand"]);
 const PAINT_TOOLS = new Set(["brush", "eraser", "line", "rect", "ellipse"]);
 
 const isImagePath = (path) => !!path && TEXTURE_EXTENSIONS.includes(extOf(path));
+const isAtlasPath = (path) => !!path && ATLAS_EXTENSIONS.includes(extOf(path));
 
 // ---------------------------------------------------------------------------
 
@@ -182,8 +185,17 @@ export function TextureEditorPanel() {
   // hierarchy clears `assetPath`, and blanking a half-finished painting because
   // the user glanced at the scene would be indefensible.
   const [path, setPath] = useState(null);
+  const [atlasPath, setAtlasPath] = useState(null);
+  const [mode, setMode] = useState("paint");
+
   useEffect(() => {
-    if (isImagePath(assetPath)) setPath(assetPath);
+    if (isImagePath(assetPath)) {
+      setPath(assetPath);
+      setMode("paint");
+    } else if (isAtlasPath(assetPath)) {
+      setAtlasPath(assetPath);
+      setMode("atlas");
+    }
   }, [assetPath]);
 
   if (!moduleOn) {
@@ -198,12 +210,47 @@ export function TextureEditorPanel() {
     );
   }
   if (!hasProject) return <div className="panel-empty">Open a project to edit textures.</div>;
-  return <TextureWorkspace path={path} onPathChange={setPath} key={path ?? "none"} />;
+
+  // Paint and Atlas are modes of one panel over one sheet, not two panels: the
+  // two are used in the same breath (slice what you just erased; paint inside
+  // the atlas you just packed), and separate panels would mean saving and
+  // reopening between every such step.
+  return (
+    <div className="texture-modes">
+      {atlasPath && (
+        <div className="texture-mode-tabs">
+          <button className={mode === "paint" ? "active" : ""} disabled={!path} onClick={() => setMode("paint")}>
+            Paint
+          </button>
+          <button className={mode === "atlas" ? "active" : ""} onClick={() => setMode("atlas")}>
+            Atlas · {basename(atlasPath)}
+          </button>
+        </div>
+      )}
+      {mode === "atlas" && atlasPath ? (
+        <AtlasEditor
+          path={atlasPath}
+          key={atlasPath}
+          onOpenImage={(image) => {
+            setPath(image);
+            setMode("paint");
+          }}
+        />
+      ) : (
+        <TextureWorkspace
+          path={path}
+          onPathChange={setPath}
+          onAtlasChange={setAtlasPath}
+          key={path ?? "none"}
+        />
+      )}
+    </div>
+  );
 }
 
 // ---------------------------------------------------------------------------
 
-function TextureWorkspace({ path, onPathChange }) {
+function TextureWorkspace({ path, onPathChange, onAtlasChange }) {
   const docRef = useRef(null);
   const [version, setVersion] = useState(0);
   const [status, setStatus] = useState(path ? "loading" : "empty");
@@ -261,6 +308,14 @@ function TextureWorkspace({ path, onPathChange }) {
         setDirty(false);
         setStatus("ready");
         bump();
+        // Offer the Atlas tab when some atlas in this folder claims this image.
+        // Matched by the atlas's own `image` field rather than by filename, so
+        // `Sheet.atlas` finds `Sheet.png` and a hand-named one still resolves.
+        findAtlasForImage(path)
+          .then((found) => {
+            if (!cancelled && found) onAtlasChange?.(found);
+          })
+          .catch(() => {});
       })
       .catch((error) => {
         if (cancelled) return;

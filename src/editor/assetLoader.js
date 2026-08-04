@@ -27,6 +27,9 @@ export const ANIMATOR_EXTENSIONS = ["anim"];
 // event, activation and camera-shot tracks. See src/engine/timeline/.
 export const TIMELINE_EXTENSIONS = ["timeline"];
 export const GEOMETRY_EXTENSIONS = ["geom"];
+// Sprite atlases (`.atlas`) — regions, pivots, nine-slice borders and sprite
+// animations over an ordinary image. See src/engine/sprite/atlasAsset.js.
+export const ATLAS_EXTENSIONS = ["atlas"];
 // `.audio` is the JSON sidecar; the others are raw audio files the engine
 // can decode straight away. AssetField filters both sidecars and raw files
 // in one picker.

@@ -504,6 +504,82 @@ export function PackChannelsDialog({ docSize, onApply, onCancel }) {
 
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Packing loose sprites into a sheet.
+ *
+ * Padding and extrusion are both offered because they solve different problems
+ * and neither substitutes for the other: padding stops a NEIGHBOUR bleeding in,
+ * extrusion repeats a sprite's own edge outward so the empty space around it
+ * cannot bleed in when a mipmap or a half-texel offset samples past the rect.
+ * An atlas with padding but no extrusion still fringes at distance.
+ */
+export function PackAtlasDialog({ count, defaultName = "Atlas", onApply, onCancel }) {
+  const [name, setName] = useState(defaultName);
+  const [padding, setPadding] = useState(2);
+  const [extrude, setExtrude] = useState(1);
+  const [maxSize, setMaxSize] = useState(2048);
+  const [powerOfTwo, setPowerOfTwo] = useState(true);
+  const [busy, setBusy] = useState(false);
+
+  return (
+    <div className="texture-dialog-backdrop" onPointerDown={busy ? undefined : onCancel}>
+      <div className="texture-dialog" onPointerDown={(e) => e.stopPropagation()}>
+        <h3>Pack into Atlas</h3>
+        <p className="texture-dialog-note">
+          {count} image{count === 1 ? "" : "s"} → one sheet plus a `.atlas` naming each region after its file.
+        </p>
+        <label>
+          Name
+          <input value={name} onChange={(e) => setName(e.target.value)} />
+        </label>
+        <div className="texture-dialog-row">
+          <label>
+            Padding
+            <input type="number" min={0} max={16} value={padding} onChange={(e) => setPadding(Number(e.target.value))} />
+          </label>
+          <label>
+            Extrude
+            <input type="number" min={0} max={8} value={extrude} onChange={(e) => setExtrude(Number(e.target.value))} />
+          </label>
+        </div>
+        <label>
+          Max size
+          <select value={maxSize} onChange={(e) => setMaxSize(Number(e.target.value))}>
+            {[512, 1024, 2048, 4096, 8192].map((size) => (
+              <option key={size} value={size}>
+                {size}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="texture-check">
+          <input type="checkbox" checked={powerOfTwo} onChange={(e) => setPowerOfTwo(e.target.checked)} />
+          Power-of-two sheet
+        </label>
+        <div className="texture-dialog-actions">
+          <button className="toolbar-btn" disabled={busy} onClick={onCancel}>
+            Cancel
+          </button>
+          <button
+            className="toolbar-btn primary"
+            disabled={busy || !name.trim()}
+            onClick={async () => {
+              setBusy(true);
+              try {
+                await onApply({ name: name.trim(), padding, extrude, maxSize, powerOfTwo });
+              } finally {
+                setBusy(false);
+              }
+            }}
+          >
+            {busy ? "Packing…" : "Pack"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 const SWIZZLE_TARGETS = ["r", "g", "b", "a"];
 
 export function SwizzleDialog({ onApply, onCancel }) {

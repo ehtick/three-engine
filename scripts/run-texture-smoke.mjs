@@ -534,6 +534,140 @@ console.log("\nchannel packing");
 }
 
 /* -------------------------------------------------------------------------- */
+/* 10 — packing an atlas, then editing it (phase 3)                             */
+/* -------------------------------------------------------------------------- */
+
+console.log("\nsprite atlas");
+{
+  // Three loose sprites of different sizes, each a flat identifiable colour so
+  // the packed sheet can be checked pixel by pixel.
+  const sprites = [
+    { name: "alpha", w: 20, h: 12, color: [255, 0, 0, 255] },
+    { name: "beta", w: 8, h: 30, color: [0, 255, 0, 255] },
+    { name: "gamma", w: 16, h: 16, color: [0, 0, 255, 255] },
+  ];
+  fs.mkdirSync(path.join(ROOT, "sprites"), { recursive: true });
+  for (const sprite of sprites) {
+    fs.writeFileSync(
+      path.join(ROOT, "sprites", `${sprite.name}.png`),
+      Buffer.from(await encodePng(flatBuffer(sprite.w, sprite.h, sprite.color))),
+    );
+  }
+
+  const packed = await page.evaluate(
+    async ({ dir, names }) => {
+      const { buildAtlasFromImages } = await globalThis.__importLive("/src/editor/atlasFile.js");
+      const result = await buildAtlasFromImages(
+        names.map((n) => `${dir}/${n}.png`),
+        { directory: dir, name: "Pack", padding: 2, extrude: 1, powerOfTwo: true },
+      );
+      return { atlasPath: result.atlasPath, overflow: result.overflow, regions: result.def.regions.length };
+    },
+    { dir: `${ROOT}/sprites`, names: sprites.map((s) => s.name) },
+  );
+  check("packing wrote an atlas with one region per image", packed.regions === 3, String(packed.regions));
+  check("nothing overflowed", packed.overflow.length === 0, packed.overflow.join());
+
+  const atlasFile = `${ROOT}/sprites/Pack.atlas`;
+  const sheetFile = `${ROOT}/sprites/Pack.png`;
+  check("both the sheet and the .atlas exist", fs.existsSync(atlasFile) && fs.existsSync(sheetFile));
+
+  const def = JSON.parse(fs.readFileSync(atlasFile, "utf8"));
+  const sheet = await decodePng(new Uint8Array(fs.readFileSync(sheetFile)));
+  check("regions are named after their source files", def.regions.map((r) => r.name).sort().join() === "alpha,beta,gamma", def.regions.map((r) => r.name).join());
+  check("the sheet is power-of-two", (sheet.width & (sheet.width - 1)) === 0 && (sheet.height & (sheet.height - 1)) === 0, `${sheet.width}×${sheet.height}`);
+
+  // The check that matters: each region must actually contain ITS sprite. A
+  // packer that reports plausible rects while blitting to the wrong place is
+  // the failure mode, and it looks completely fine until something renders.
+  let correct = 0;
+  for (const sprite of sprites) {
+    const region = def.regions.find((r) => r.name === sprite.name);
+    if (!region) continue;
+    const [x, y, w, h] = region.rect;
+    if (w !== sprite.w || h !== sprite.h) continue;
+    const i = ((y + (h >> 1)) * sheet.width + x + (w >> 1)) * 4;
+    const p = [sheet.data[i], sheet.data[i + 1], sheet.data[i + 2], sheet.data[i + 3]];
+    if (p.join() === sprite.color.join()) correct++;
+  }
+  check("every region holds its own sprite's pixels", correct === 3, `${correct}/3`);
+
+  // Extrusion: one texel outside the rect repeats the sprite's edge colour.
+  {
+    const region = def.regions.find((r) => r.name === "alpha");
+    const [x, y] = region.rect;
+    const i = (y * sheet.width + x - 1) * 4;
+    check(
+      "the sprite's edge is extruded into the gutter",
+      sheet.data[i] === 255 && sheet.data[i + 3] === 255,
+      [sheet.data[i], sheet.data[i + 1], sheet.data[i + 2], sheet.data[i + 3]].join(),
+    );
+  }
+
+  // Open it in the panel's Atlas mode.
+  await page.evaluate(async (p) => {
+    const { useSelectionStore } = await globalThis.__importLive("/src/editor/store/selectionStore.js");
+    useSelectionStore.getState().selectAsset(p);
+    const { openPanel } = await globalThis.__importLive("/src/editor/EditorShell.jsx");
+    openPanel("textureEditor");
+  }, atlasFile);
+  await page.waitForSelector(".atlas-editor", { timeout: 30000 });
+  await settle(1200);
+
+  const regionRows = await page.evaluate(() => document.querySelectorAll(".atlas-list .atlas-row").length);
+  check("the atlas editor lists its regions", regionRows >= 3, String(regionRows));
+
+  // Edit through the UI: set a nine-slice border and a pivot, save, read back.
+  const edited = await page.evaluate(() => {
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+    const rows = [...document.querySelectorAll(".atlas-grid4")];
+    if (rows.length < 3) return false;
+    // grids are: rect (X/Y/W/H), pivot (X/Y + buttons), nine-slice (L/R/T/B)
+    const slice = rows[2].querySelectorAll("input[type=number]");
+    if (slice.length < 4) return false;
+    slice.forEach((input) => {
+      setter.call(input, "3");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    return true;
+  });
+  check("the nine-slice fields accept a border", edited);
+  await settle(300);
+  const sliceCells = await page.evaluate(() => document.querySelectorAll(".atlas-nineslice-cell").length);
+  check("the nine-slice schematic appears once a border is set", sliceCells === 9, String(sliceCells));
+
+  const bottomPivot = await clickText(".atlas-grid4 .toolbar-btn", "Bottom");
+  check("the Bottom pivot preset is offered", bottomPivot);
+  await settle(300);
+
+  check("Save is offered once the atlas is dirty", await clickText(".atlas-editor .toolbar-btn", "Save"));
+  await settle(800);
+
+  const saved = JSON.parse(fs.readFileSync(atlasFile, "utf8"));
+  const first = saved.regions[0];
+  check("the nine-slice border round-tripped to disk", first.border.some((v) => v === 3), JSON.stringify(first.border));
+  check("the pivot round-tripped to disk", first.pivot[1] === 1, JSON.stringify(first.pivot));
+
+  // Unpack: every region back out as its own file.
+  check("Export Sprites is offered", await clickText(".atlas-editor .toolbar-btn", "Export Sprites"));
+  await settle(1500);
+  const outDir = path.join(ROOT, "sprites", "Pack_sprites");
+  check("the unpack direction wrote a folder of sprites", fs.existsSync(outDir));
+  if (fs.existsSync(outDir)) {
+    const files = fs.readdirSync(outDir).sort();
+    check("one file per region", files.length === 3, files.join());
+    const back = await decodePng(new Uint8Array(fs.readFileSync(path.join(outDir, "beta.png"))));
+    check("an exported sprite has its original size", back.width === 8 && back.height === 30, `${back.width}×${back.height}`);
+    check(
+      "and its original pixels",
+      back.data[0] === 0 && back.data[1] === 255 && back.data[2] === 0,
+      Array.from(back.data.subarray(0, 4)).join(),
+    );
+  }
+}
+
+/* -------------------------------------------------------------------------- */
 
 check("no page errors during the run", pageErrors.length === 0, pageErrors.slice(0, 2).join(" | "));
 

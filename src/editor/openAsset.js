@@ -1,5 +1,6 @@
 import {
   extOf,
+  ATLAS_EXTENSIONS,
   TEXTURE_EXTENSIONS,
   SCRIPT_EXTENSIONS,
   MATERIAL_EXTENSIONS,
@@ -52,6 +53,7 @@ export function hasAssetEditor(path) {
   return (
     ext === "scene" ||
     TEXTURE_EXTENSIONS.includes(ext) ||
+    ATLAS_EXTENSIONS.includes(ext) ||
     SCRIPT_EXTENSIONS.includes(ext) ||
     PREFAB_EXTENSIONS.includes(ext) ||
     ANIMATOR_EXTENSIONS.includes(ext) ||
@@ -90,6 +92,10 @@ export function openAssetPath(path, { isDir = false } = {}) {
     // A material *is* its shader graph — that's the only editor for it.
     useSelectionStore.getState().selectAsset(path);
     import("./EditorShell.jsx").then((m) => m.openPanel("shaderGraph"));
+  } else if (ATLAS_EXTENSIONS.includes(ext)) {
+    // A sprite atlas opens the same panel, in its Atlas mode.
+    useSelectionStore.getState().selectAsset(path);
+    import("./EditorShell.jsx").then((m) => m.openPanel("textureEditor"));
   } else if (TEXTURE_EXTENSIONS.includes(ext)) {
     // Images open in the Texture Editor rather than the OS image viewer. The
     // panel gates itself on the `texture-editor` module, so a project that has

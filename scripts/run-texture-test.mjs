@@ -105,6 +105,15 @@ import {
   unpremultiply,
 } from "../src/editor/texture/channels.js";
 import { trimDocument } from "../src/editor/texture/layers.js";
+import { blitWithExtrude, packAtlas, packIntoBin } from "../src/editor/texture/packer.js";
+import { nameRegions, sliceByAlpha, sliceGrid, sortReadingOrder } from "../src/editor/texture/slice.js";
+import {
+  animationDuration,
+  frameAt,
+  normalizeAtlas,
+  regionUv,
+} from "../src/engine/sprite/atlasAsset.js";
+import { applySlice, uniqueRegionName } from "../src/editor/texture/atlasOps.js";
 
 let failures = 0;
 let passes = 0;
@@ -1087,6 +1096,297 @@ check("trim on a full or empty document does nothing rather than something odd",
   const empty = createDocument({ width: 8, height: 8 });
   assert.equal(trimDocument(empty), null);
   assert.equal(empty.width, 8, "an empty document is not collapsed to nothing");
+});
+
+console.log("\natlas packing");
+
+const boxes = (n, w, h) => Array.from({ length: n }, (_, i) => ({ id: `s${i}`, width: w, height: h }));
+
+check("everything placed fits the bin and nothing overlaps", () => {
+  const items = [
+    ...boxes(6, 30, 12),
+    ...boxes(4, 12, 40),
+    { id: "big", width: 90, height: 70 },
+    { id: "wide", width: 120, height: 8 },
+  ];
+  const { width, height, placements, overflow } = packAtlas(items, { padding: 1, maxSize: 512 });
+  assert.equal(overflow.length, 0, `overflowed: ${overflow.join()}`);
+  assert.equal(placements.length, items.length);
+  for (const p of placements) {
+    assert.ok(p.x >= 0 && p.y >= 0 && p.x + p.width <= width && p.y + p.height <= height, `${p.id} left the sheet`);
+  }
+  for (let i = 0; i < placements.length; i++) {
+    for (let j = i + 1; j < placements.length; j++) {
+      const a = placements[i];
+      const b = placements[j];
+      const hit = a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
+      assert.ok(!hit, `${a.id} overlaps ${b.id}`);
+    }
+  }
+});
+
+check("packing is deterministic — the same sprites give the same sheet twice", () => {
+  // A packer that reorders equal-scoring rectangles nondeterministically makes
+  // every rebuild a different atlas, and therefore a full re-upload downstream.
+  const items = [...boxes(9, 17, 23), ...boxes(5, 40, 9)];
+  const a = packAtlas(items, { padding: 2 });
+  const b = packAtlas([...items].reverse(), { padding: 2 });
+  assert.equal(a.width, b.width);
+  assert.equal(a.height, b.height);
+  const key = (r) => r.placements.map((p) => `${p.id}@${p.x},${p.y}`).sort().join("|");
+  assert.equal(key(a), key(b), "input order must not change the result");
+});
+
+check("padding really separates sprites", () => {
+  const { placements } = packAtlas(boxes(4, 20, 20), { padding: 3, maxSize: 256 });
+  for (let i = 0; i < placements.length; i++) {
+    for (let j = i + 1; j < placements.length; j++) {
+      const a = placements[i];
+      const b = placements[j];
+      const gapX = Math.max(a.x - (b.x + b.width), b.x - (a.x + a.width));
+      const gapY = Math.max(a.y - (b.y + b.height), b.y - (a.y + a.height));
+      assert.ok(gapX >= 6 || gapY >= 6, `${a.id}/${b.id} are closer than 2× padding`);
+    }
+  }
+});
+
+check("power-of-two sheets stay power-of-two, and can be turned off", () => {
+  const pot = packAtlas(boxes(3, 50, 50), { powerOfTwo: true, padding: 0 });
+  const isPot = (v) => (v & (v - 1)) === 0;
+  assert.ok(isPot(pot.width) && isPot(pot.height), `${pot.width}×${pot.height}`);
+  const free = packAtlas(boxes(3, 50, 50), { powerOfTwo: false, padding: 0 });
+  assert.ok(free.width <= pot.width, "a non-POT sheet is never larger");
+});
+
+check("a sprite that cannot fit is REPORTED, never silently dropped", () => {
+  const { overflow, placements } = packAtlas(
+    [{ id: "ok", width: 8, height: 8 }, { id: "huge", width: 500, height: 500 }],
+    { maxSize: 64, padding: 0 },
+  );
+  assert.ok(overflow.includes("huge"), "the oversized sprite is named");
+  assert.ok(placements.some((p) => p.id === "ok"), "the rest still packed");
+});
+
+check("packing an empty set produces an empty sheet rather than throwing", () => {
+  const result = packAtlas([], {});
+  assert.equal(result.placements.length, 0);
+  assert.ok(result.width >= 1 && result.height >= 1);
+});
+
+check("packIntoBin fills a tight bin exactly", () => {
+  const { placements, overflow } = packIntoBin(boxes(4, 16, 16), 32, 32, { padding: 0 });
+  assert.equal(overflow.length, 0);
+  assert.equal(placements.length, 4);
+});
+
+check("extrusion repeats the sprite's own edge outward, padding does not", () => {
+  const sheet = createBuffer(16, 16);
+  const sprite = createBuffer(4, 4, [200, 50, 50, 255]);
+  blitWithExtrude(sheet, sprite, 6, 6, 2);
+  assert.deepEqual(px(sheet, 6, 6), [200, 50, 50, 255], "the sprite itself");
+  assert.deepEqual(px(sheet, 4, 6), [200, 50, 50, 255], "two texels left of it repeats the edge");
+  assert.deepEqual(px(sheet, 3, 6), [0, 0, 0, 0], "and stops after `extrude` texels");
+  assert.deepEqual(px(sheet, 4, 4), [200, 50, 50, 255], "corners are extruded too");
+});
+
+check("extrusion clips at the sheet edge instead of wrapping", () => {
+  const sheet = createBuffer(8, 8);
+  const sprite = createBuffer(2, 2, [1, 2, 3, 255]);
+  blitWithExtrude(sheet, sprite, 0, 0, 3);
+  assert.deepEqual(px(sheet, 7, 7), [0, 0, 0, 0], "nothing wrapped to the far corner");
+  assert.deepEqual(px(sheet, 0, 0), [1, 2, 3, 255]);
+});
+
+console.log("\nslicing");
+
+check("grid slicing by cell size respects offset and spacing", () => {
+  // 4 cells across: 2 offset + 4×16 + 3×2 spacing = 72, which fits in 74.
+  const rects = sliceGrid({ width: 74, height: 74, cellWidth: 16, cellHeight: 16, offsetX: 2, offsetY: 2, spacingX: 2, spacingY: 2 });
+  assert.equal(rects.length, 16, `${rects.length} cells`);
+  assert.deepEqual(rects[0], { x: 2, y: 2, width: 16, height: 16 });
+  assert.deepEqual(rects[1], { x: 20, y: 2, width: 16, height: 16 });
+  // One pixel narrower and the fourth column no longer fits, so it is dropped.
+  assert.equal(sliceGrid({ width: 71, height: 74, cellWidth: 16, cellHeight: 16, offsetX: 2, offsetY: 2, spacingX: 2, spacingY: 2 }).length, 12);
+});
+
+check("grid slicing by column/row count divides the sheet", () => {
+  const rects = sliceGrid({ width: 64, height: 32, columns: 4, rows: 2 });
+  assert.equal(rects.length, 8);
+  assert.deepEqual(rects[0], { x: 0, y: 0, width: 16, height: 16 });
+});
+
+check("a cell that would run off the edge is dropped, not clipped", () => {
+  // A clipped last column looks like a working slice and yields frames of the
+  // wrong size — one animation frame subtly squashed.
+  const rects = sliceGrid({ width: 40, height: 16, cellWidth: 16, cellHeight: 16 });
+  assert.equal(rects.length, 2, `${rects.length} cells`);
+  assert.ok(rects.every((r) => r.width === 16));
+});
+
+check("skipEmpty drops blank cells when given the image", () => {
+  const buffer = createBuffer(32, 16);
+  for (let y = 0; y < 16; y++) for (let x = 0; x < 16; x++) setPixel(buffer, x, y, [255, 255, 255, 255]);
+  const all = sliceGrid({ width: 32, height: 16, cellWidth: 16, cellHeight: 16 });
+  const some = sliceGrid({ width: 32, height: 16, cellWidth: 16, cellHeight: 16, skipEmpty: true, buffer });
+  assert.equal(all.length, 2);
+  assert.equal(some.length, 1);
+});
+
+check("alpha slicing finds each separate piece of artwork", () => {
+  const buffer = createBuffer(40, 20);
+  const blob = (x0, y0, w, h) => {
+    for (let y = y0; y < y0 + h; y++) for (let x = x0; x < x0 + w; x++) setPixel(buffer, x, y, [255, 0, 0, 255]);
+  };
+  blob(2, 2, 6, 6);
+  blob(20, 3, 8, 5);
+  blob(4, 12, 5, 5);
+  const rects = sliceByAlpha(buffer, { minSize: 2 });
+  assert.equal(rects.length, 3, `${rects.length} regions`);
+  assert.deepEqual(rects[0], { x: 2, y: 2, width: 6, height: 6 });
+});
+
+check("alpha slicing keeps overlapping pieces of one sprite together", () => {
+  // An L-shaped sprite with a detail floating in its concave corner: the two
+  // never touch, but the L's box CONTAINS the detail's. Two boxes there means
+  // half a sprite, so overlapping boxes merge even when the pixels do not.
+  const buffer = createBuffer(24, 24);
+  const fill = (x0, x1, y0, y1) => {
+    for (let x = x0; x <= x1; x++) for (let y = y0; y <= y1; y++) setPixel(buffer, x, y, [255, 255, 255, 255]);
+  };
+  fill(2, 5, 2, 14); // the L's upright
+  fill(2, 14, 11, 14); // its foot
+  fill(8, 11, 4, 7); // the detail, touching neither
+  const merged = sliceByAlpha(buffer, { minSize: 1, merge: true });
+  assert.equal(merged.length, 1, `${merged.length} regions`);
+  assert.deepEqual(merged[0], { x: 2, y: 2, width: 13, height: 13 });
+  const split = sliceByAlpha(buffer, { minSize: 1, merge: false });
+  assert.equal(split.length, 2, "without merging the labeller sees two");
+});
+
+check("pieces that merely sit near each other stay SEPARATE", () => {
+  // The other half of the trade: merging by proximity would fuse neighbouring
+  // sprites on a tightly-packed sheet, which is the more common sheet.
+  const buffer = createBuffer(24, 12);
+  for (let x = 2; x < 8; x++) for (let y = 2; y < 8; y++) setPixel(buffer, x, y, [255, 255, 255, 255]);
+  for (let x = 10; x < 16; x++) for (let y = 2; y < 8; y++) setPixel(buffer, x, y, [255, 255, 255, 255]);
+  assert.equal(sliceByAlpha(buffer, { minSize: 1 }).length, 2);
+});
+
+check("alpha slicing joins diagonally-touching pixels (8-connected)", () => {
+  const buffer = createBuffer(8, 8);
+  setPixel(buffer, 2, 2, [255, 255, 255, 255]);
+  setPixel(buffer, 3, 3, [255, 255, 255, 255]);
+  const rects = sliceByAlpha(buffer, { minSize: 1 });
+  assert.equal(rects.length, 1);
+});
+
+check("minSize drops antialiasing specks", () => {
+  const buffer = createBuffer(24, 24);
+  for (let y = 4; y < 14; y++) for (let x = 4; x < 14; x++) setPixel(buffer, x, y, [255, 255, 255, 255]);
+  setPixel(buffer, 20, 20, [255, 255, 255, 40]);
+  assert.equal(sliceByAlpha(buffer, { minSize: 4 }).length, 1);
+  assert.equal(sliceByAlpha(buffer, { minSize: 1 }).length, 2);
+});
+
+check("alpha threshold ignores near-transparent halo", () => {
+  const buffer = createBuffer(16, 16);
+  for (let y = 4; y < 10; y++) for (let x = 4; x < 10; x++) setPixel(buffer, x, y, [255, 255, 255, 255]);
+  for (let x = 3; x < 11; x++) setPixel(buffer, x, 3, [255, 255, 255, 12]);
+  assert.equal(sliceByAlpha(buffer, { threshold: 32, minSize: 2 })[0].y, 4, "the faint halo row was ignored");
+  assert.equal(sliceByAlpha(buffer, { threshold: 0, minSize: 2 })[0].y, 3);
+});
+
+check("regions come back in reading order, and names zero-pad", () => {
+  const ordered = sortReadingOrder([
+    { x: 40, y: 2, width: 4, height: 4 },
+    { x: 2, y: 40, width: 4, height: 4 },
+    { x: 2, y: 3, width: 4, height: 4 },
+  ]);
+  assert.deepEqual(ordered.map((r) => [r.x, r.y]), [[2, 3], [40, 2], [2, 40]]);
+  const named = nameRegions(new Array(12).fill({ x: 0, y: 0, width: 1, height: 1 }), "frame");
+  assert.equal(named[9].name, "frame_09");
+  assert.equal(named[10].name, "frame_10", "so 9 sorts before 10 everywhere");
+});
+
+console.log("\natlas definition");
+
+check("normalizeAtlas fills defaults and drops unusable regions", () => {
+  const def = normalizeAtlas({
+    regions: [
+      { name: "a", rect: [1, 2, 3, 4] },
+      { name: "", rect: [0, 0, 1, 1] },
+      { name: "a", rect: [9, 9, 9, 9] },
+    ],
+  });
+  assert.equal(def.regions.length, 1, "nameless and duplicate regions are dropped");
+  assert.deepEqual(def.regions[0].pivot, [0.5, 0.5]);
+  assert.deepEqual(def.regions[0].border, [0, 0, 0, 0]);
+});
+
+check("an animation naming a missing frame loses that frame, not the atlas", () => {
+  const def = normalizeAtlas({
+    regions: [{ name: "f0", rect: [0, 0, 8, 8] }],
+    animations: [{ name: "walk", frames: ["f0", "gone", "f0"], fps: 8 }],
+  });
+  assert.equal(def.animations.length, 1);
+  assert.deepEqual(def.animations[0].frames, ["f0", "f0"]);
+  assert.equal(def.animations[0].fps, 8);
+  assert.equal(def.animations[0].loop, true);
+});
+
+check("region UVs flip Y exactly once, at the UV boundary", () => {
+  // The atlas is stored top-down; texture V runs bottom-up. Getting this wrong
+  // produces sprites that are individually correct and vertically mirrored.
+  const def = normalizeAtlas({ size: [100, 100], regions: [{ name: "top", rect: [0, 0, 100, 20] }] });
+  const uv = regionUv(def, def.regions[0]);
+  assert.equal(uv.u0, 0);
+  assert.equal(uv.u1, 1);
+  assert.ok(Math.abs(uv.v1 - 1) < 1e-9, "a region at the TOP of the image reaches v = 1");
+  assert.ok(Math.abs(uv.v0 - 0.8) < 1e-9, `v0 was ${uv.v0}`);
+});
+
+check("frameAt loops, and a non-looping animation HOLDS its last frame", () => {
+  const animation = { name: "a", fps: 10, loop: true, frames: ["f0", "f1", "f2"] };
+  assert.equal(frameAt(animation, 0), "f0");
+  assert.equal(frameAt(animation, 0.15), "f1");
+  assert.equal(frameAt(animation, 0.35), "f0", "wrapped");
+  const once = { ...animation, loop: false };
+  assert.equal(frameAt(once, 5), "f2", "held, not vanished and not wrapped");
+  assert.equal(frameAt({ ...animation, frames: [] }, 1), null);
+  assert.ok(Math.abs(animationDuration(animation) - 0.3) < 1e-9);
+});
+
+check("re-slicing the same number of regions keeps their names and pivots", () => {
+  // Otherwise editing a sheet's artwork and re-slicing breaks every animation
+  // that references a frame by name.
+  const def = normalizeAtlas({
+    size: [64, 64],
+    regions: [
+      { name: "walk_0", rect: [0, 0, 16, 16], pivot: [0.5, 1], border: [2, 2, 2, 2] },
+      { name: "walk_1", rect: [16, 0, 16, 16], pivot: [0.5, 1] },
+    ],
+    animations: [{ name: "walk", fps: 12, frames: ["walk_0", "walk_1"] }],
+  });
+  const resliced = normalizeAtlas(
+    applySlice(def, [
+      { x: 0, y: 0, width: 20, height: 20 },
+      { x: 20, y: 0, width: 20, height: 20 },
+    ]),
+  );
+  assert.deepEqual(resliced.regions.map((r) => r.name), ["walk_0", "walk_1"]);
+  assert.deepEqual(resliced.regions[0].pivot, [0.5, 1], "pivots survive too");
+  assert.deepEqual(resliced.regions[0].border, [2, 2, 2, 2]);
+  assert.equal(resliced.animations.length, 1, "and the animation still resolves");
+
+  const different = normalizeAtlas(applySlice(def, [{ x: 0, y: 0, width: 8, height: 8 }], { baseName: "cell" }));
+  assert.deepEqual(different.regions.map((r) => r.name), ["cell_0"]);
+  assert.equal(different.animations.length, 0, "a different count regenerates names and clears animations");
+});
+
+check("uniqueRegionName never collides", () => {
+  const def = normalizeAtlas({ regions: [{ name: "sprite", rect: [0, 0, 1, 1] }, { name: "sprite_1", rect: [0, 0, 1, 1] }] });
+  assert.equal(uniqueRegionName(def, "sprite"), "sprite_2");
+  assert.equal(uniqueRegionName(def, "other"), "other");
 });
 
 console.log(`\n${passes} passed, ${failures} failed\n`);

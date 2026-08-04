@@ -130,7 +130,7 @@ Status is tracked per phase below as it lands.
 
 - [x] Phase 1 — **shipped 2026-08-05**
 - [x] Phase 2 — **shipped 2026-08-05**
-- [ ] Phase 3
+- [x] Phase 3 — **shipped 2026-08-05**
 - [ ] Phase 4
 
 ---
@@ -234,6 +234,76 @@ screenshot would show. The smoke now samples the dialog's busy marker over a sec
 fails if an idle dialog is still scheduling work — verified by reintroducing the bug
 (8/10 samples busy) and removing it again (0/10).
 
-Tests: `npm run test:texture` (90 headless checks) and `npm run smoke:texture` (46 checks
-driving the real panel, including that Cancel restores the layer exactly, Resize really
-changes the file on disk, and a packed map lands with `colorSpace: linear` beside it).
+Tests: `npm run test:texture` and `npm run smoke:texture` (counts under phase 3).
+
+---
+
+## Phase 3 — what landed
+
+`.atlas` assets, both directions of the round trip, and an Atlas mode in the panel.
+
+**The format** (`src/engine/sprite/atlasAsset.js`) is JSON beside the image, holding no
+pixels — same shape as `.cubemap` and `.mat`, so the sheet stays an ordinary editable
+texture and can still be referenced directly by anything wanting the whole thing.
+
+- **One coordinate convention, and it is image space**: every rect is in texture pixels,
+  top-left origin, Y down. Pivots are normalised into that same space, so `[0.5, 1]` is
+  bottom-centre — where a character standing on the ground wants its origin. The pull to
+  store pivots Y-up (what a quad in a Y-up world needs) is resisted deliberately: two
+  conventions in one file is how you get a sprite that is correct until it is flipped.
+  **The Y flip happens in exactly one function**, `regionUv`, at the UV boundary.
+- Nine-slice borders are texture pixels — a property of the artwork, not of what it is
+  stretched over — which is the same numbers `UiImageComponent` already takes.
+- `normalizeAtlas` degrades rather than throws: a region with no pivot gets a centred one,
+  an animation naming a frame that no longer exists loses that frame. An atlas that
+  refuses to load takes every sprite in the scene with it.
+- A non-looping animation **holds its last frame**. Vanishing on the final frame is the
+  usual bug and nobody wants it.
+
+**Packing** (`packer.js`) is MaxRects/best-short-side-fit rather than a shelf packer,
+because sprites are wildly non-uniform — a UI set is a dozen 16px icons and three 400px
+panels, and a shelf packer wastes a whole row's height on the tall one, routinely 30–40%
+of the sheet. It is **deterministic**: same sprites, same sheet, regardless of input
+order, so a rebuild isn't a gratuitous re-upload for anything caching the result.
+Overflow is **reported by name**, never silently dropped — an atlas missing three sprites
+looks like it worked until something renders empty.
+
+**Padding and extrusion are both offered because they solve different problems.** Padding
+puts space between sprites so a neighbour can't bleed in; extrusion repeats a sprite's own
+edge texels outward so the *empty space* can't bleed in when a mipmap or a half-texel
+offset samples past the rect. An atlas with padding and no extrusion still fringes at
+distance.
+
+**Slicing** (`slice.js`) covers the two kinds of sheet that exist. Grid, for anything
+exported from an animation tool — a cell that would run off the edge is **dropped, not
+clipped**, because a clipped last column looks like a working slice and yields one frame
+subtly squashed. And by transparency, 8-connected so an antialiased diagonal join doesn't
+split a sprite, then merging **overlapping** boxes so a sprite whose parts don't touch
+stays one region. Overlap, not proximity: proximity would fuse neighbours on a packed
+sheet, which is the more common sheet.
+
+**Re-slicing preserves names positionally** when the region count is unchanged, so editing
+a sheet's artwork and re-slicing doesn't break every animation that references a frame by
+name. Pivots and borders come along with them.
+
+**The panel** gained Paint / Atlas tabs over one sheet, because the two are used in the
+same breath — slice what you just erased, paint inside the atlas you just packed. Atlas
+mode has region rects you can drag, resize and create, **draggable nine-slice guides** on
+the canvas (tested before the move gesture, or the border could only ever be typed), a
+pivot cross, a nine-cell schematic showing which parts stretch, and an animation list with
+a live preview playing at its real frame rate on wall-clock time. Assets panel: select
+several textures → **Pack N into Atlas…**; in the editor, **Export Sprites** writes every
+region back out as its own PNG.
+
+Two bugs the tests caught, both mine: the packer sized its first guess without clamping to
+`maxSize`, so a single oversized sprite produced a sheet exceeding the cap and packed
+happily — failing at upload rather than where it could be reported. And two test premises
+were wrong about my own merge rule, which is how the "overlap, not proximity" trade above
+came to be stated explicitly rather than assumed.
+
+Tests: `npm run test:texture` (116 headless checks) and `npm run smoke:texture` (65 checks
+driving the real editor — packing three sprites and verifying **each region holds its own
+sprite's pixels** (a packer that reports plausible rects while blitting to the wrong place
+looks fine until something renders), that the gutter really is extruded, that a border and
+pivot set in the UI reach disk, and that unpacking returns sprites at their original size
+and colour).

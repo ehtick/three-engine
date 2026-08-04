@@ -81,7 +81,14 @@ import { loadAssetFlags, setAssetFlags, useAssetFlagsStore } from "../assetFlags
 import { collectUsedAssets } from "../assetUsage.js";
 import { samePath, useAssetRevealStore } from "../assetReveal.js";
 import { openAssetPath } from "../openAsset.js";
-import { requestNewTexture } from "../textureEditorRequest.js";
+import {
+  PACK_ATLAS_EVENT,
+  consumePackAtlasRequest,
+  requestNewTexture,
+  requestPackAtlas,
+} from "../textureEditorRequest.js";
+import { PackAtlasDialog } from "./TextureOps.jsx";
+import { buildAtlasFromImages } from "../atlasFile.js";
 import { ContextMenu, isTextEditTarget } from "../ContextMenu.jsx";
 import { requestGeometryThumb } from "../geometryThumb.js";
 
@@ -619,6 +626,15 @@ function AssetContextMenu({ menu, close, setRenamingPath, selectedEntries }) {
         ...(!multi && !entry.is_dir && TEXTURE_EXTENSIONS.includes(entry.ext)
           ? [{ label: "Edit Texture", action: () => openAssetPath(entry.path) }]
           : []),
+        ...(textureTargets.length > 1 && textureTargets.length === targets.length
+          ? [
+              {
+                label: `Pack ${textureTargets.length} into Atlas…`,
+                hint: "One sheet plus a .atlas naming each region after its file",
+                action: () => requestPackAtlas(textureTargets.map((t) => t.path)),
+              },
+            ]
+          : []),
         ...(!multi && MODEL_IMPORT_EXTENSIONS.includes(entry.ext)
           ? [
               { label: "Unpack Model", action: () => unpackModel(entry.path) },
@@ -790,6 +806,7 @@ export function AssetsPanel() {
   const assetPaths = useSelectionStore((s) => s.assetPaths);
   const [renamingPath, setRenamingPath] = useState(null);
   const [contextMenu, setContextMenu] = useState(null); // {x, y, entry|null}
+  const [packPaths, setPackPaths] = useState(null); // pending "Pack into Atlas"
   const [fileDropActive, setFileDropActive] = useState(false);
   const [viewId, setViewId] = useState(() => localStorage.getItem(VIEW_KEY) ?? "medium");
   const [showTree, setShowTree] = useState(() => localStorage.getItem(TREE_KEY) !== "0");
@@ -805,6 +822,17 @@ export function AssetsPanel() {
   const flagVersion = useAssetFlagsStore((s) => s.flags);
   const panelRef = useRef(null);
   const gridRef = useRef(null);
+
+  // "Pack into Atlas" is raised by the context menu, which unmounts the instant
+  // it is clicked — so the request travels here, where the dialog can outlive it.
+  useEffect(() => {
+    const open = () => {
+      const pending = consumePackAtlasRequest();
+      if (pending?.length) setPackPaths(pending);
+    };
+    window.addEventListener(PACK_ATLAS_EVENT, open);
+    return () => window.removeEventListener(PACK_ATLAS_EVENT, open);
+  }, []);
 
   const view = VIEW_MODES.find((v) => v.id === viewId) ?? VIEW_MODES[2];
   // A search or a "used by selection" filter is a question about the project,
@@ -1260,6 +1288,31 @@ export function AssetsPanel() {
           close={() => setContextMenu(null)}
           setRenamingPath={setRenamingPath}
           selectedEntries={selectedEntries}
+        />
+      )}
+      {packPaths && (
+        <PackAtlasDialog
+          count={packPaths.length}
+          onCancel={() => setPackPaths(null)}
+          onApply={async (options) => {
+            try {
+              const { atlasPath, overflow } = await buildAtlasFromImages(packPaths, {
+                directory: currentPath,
+                ...options,
+              });
+              await useProjectStore.getState().refresh();
+              setPackPaths(null);
+              if (overflow.length) {
+                // Never silently drop artwork: an atlas missing three sprites
+                // looks like it worked until something renders empty.
+                console.warn(`Atlas is full — left out: ${overflow.join(", ")}`);
+              }
+              openAssetPath(atlasPath);
+            } catch (error) {
+              console.error(`Pack failed: ${error?.message ?? error}`);
+              setPackPaths(null);
+            }
+          }}
         />
       )}
     </div>

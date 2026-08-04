@@ -9622,3 +9622,256 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
 .texture-pack-chip.ch-g { background: #6bd97f; }
 .texture-pack-chip.ch-b { background: #6ba8ff; }
 .texture-pack-chip.ch-a { background: #cfd2d8; }
+
+/* --- Texture Editor: Paint / Atlas mode tabs --- */
+
+.texture-modes {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.texture-mode-tabs {
+  display: flex;
+  gap: 2px;
+  padding: 5px 8px 0;
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.texture-mode-tabs button {
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 11.5px;
+  font-weight: 500;
+  padding: 5px 11px;
+  border-radius: 6px 6px 0 0;
+  cursor: pointer;
+  transition: background-color 0.12s var(--ease), color 0.12s var(--ease);
+}
+
+.texture-mode-tabs button:hover:not(:disabled) {
+  color: var(--text);
+}
+
+.texture-mode-tabs button.active {
+  background: var(--bg-2);
+  color: var(--text);
+}
+
+.texture-mode-tabs button:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+/* --- Atlas editor --- */
+
+.atlas-editor {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  background: var(--bg-1);
+}
+
+.atlas-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+.atlas-canvas-wrap {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  background: var(--bg-0);
+}
+
+.atlas-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  cursor: crosshair;
+  touch-action: none;
+}
+
+.atlas-side {
+  width: 250px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  overflow-y: auto;
+  border-left: 1px solid var(--border);
+  background: var(--bg-2);
+}
+
+.atlas-section {
+  padding: 8px 9px 10px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.atlas-section-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+}
+
+.atlas-section-head.sub {
+  text-transform: none;
+  letter-spacing: 0;
+  margin-top: 2px;
+}
+
+.atlas-section-head .muted {
+  opacity: 0.6;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.atlas-section-head .toolbar-btn {
+  margin-left: auto;
+}
+
+.atlas-list {
+  max-height: 220px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.atlas-list.short {
+  max-height: 120px;
+}
+
+.atlas-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 11.5px;
+}
+
+.atlas-row:hover {
+  background: var(--fill-1);
+}
+
+.atlas-row.active {
+  background: var(--accent-soft);
+}
+
+.atlas-row-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.atlas-row .muted {
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  font-size: 10.5px;
+}
+
+.atlas-row-x {
+  border: none;
+  background: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  opacity: 0;
+}
+
+.atlas-row:hover .atlas-row-x {
+  opacity: 1;
+}
+
+.atlas-row-x:hover {
+  color: var(--danger);
+}
+
+.atlas-field {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.atlas-field input {
+  flex: 1;
+  min-width: 0;
+}
+
+.atlas-grid4 {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 5px;
+  align-items: center;
+}
+
+.atlas-num {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
+.atlas-num input {
+  width: 100%;
+  min-width: 0;
+}
+
+/* Nine-slice schematic: which cells stretch, at a glance. Corners are solid,
+ * edges stretch on one axis, the centre on both. */
+.atlas-nineslice {
+  display: grid;
+  width: 100%;
+  height: 68px;
+  gap: 1px;
+  border-radius: 5px;
+  overflow: hidden;
+  background: var(--border);
+}
+
+.atlas-nineslice-cell.corner {
+  background: rgba(10, 132, 255, 0.42);
+}
+
+.atlas-nineslice-cell.edge {
+  background: rgba(10, 132, 255, 0.2);
+}
+
+.atlas-nineslice-cell.centre {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.atlas-preview {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.atlas-preview canvas {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background:
+    repeating-conic-gradient(#2a2a2e 0% 25%, #37373d 0% 50%) 50% / 12px 12px;
+}
