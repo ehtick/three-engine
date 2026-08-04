@@ -3,6 +3,7 @@ import * as THREE from "three/webgpu";
 import { createId } from "../shared/ids.js";
 import { createComponent } from "./components/registry.js";
 import { Component } from "./components/Component.js";
+import { EventEmitter } from "./EventEmitter.js";
 
 /**
  * Accepts either a registered type string (`"mesh"`) or a component class /
@@ -32,13 +33,24 @@ function resolveComponentType(typeOrCtor) {
  * `entity.children` and `entity.parent` deliberately stay separate from
  * `object3D.children` / `object3D.parent` — they refer to other Entities,
  * not raw three nodes.
+ *
+ * Extends `EventEmitter` for local, per-instance pub-sub (`entity.on`/`off`/
+ * `once`/`emit`/... — see EventEmitter.js) — a SEPARATE mechanism from
+ * `dispatch(hook, ...args)` below. `dispatch` calls a named METHOD
+ * (`onDamaged`, `onClick`, ...) on every attached script, framework-hook
+ * style, one slot per name, no unsubscribe. `on`/`emit` is real multi-
+ * listener pub-sub for ad-hoc, game-authored events
+ * (`this.entity.on("captured", ...)`), and every entity gets its own
+ * independent listener set — emitting on one entity never reaches another's
+ * listeners, only the global `engine.on`/`emit` bus is shared.
  */
-export class Entity {
+export class Entity extends EventEmitter {
   /**
    * @param {import("engine").Engine} engine
    * @param {{ id?: string, name?: string }} [opts]
    */
   constructor(engine, { id, name = "Entity" } = {}) {
+    super();
     this.engine = engine;
     this.id = id ?? createId();
     this.object3D = new THREE.Object3D();
@@ -410,6 +422,11 @@ export class Entity {
    * knowing what else is attached:
    *
    *     this.entity.dispatch("onDamaged", amount);
+   *
+   * For a named lifecycle-style hook other scripts implement as a method.
+   * For an ad-hoc event other code subscribes to, use the inherited
+   * `on`/`emit` (see the class doc comment) instead — `this.entity.emit(
+   * "damaged", amount)` / `otherEntity.on("damaged", (amount) => ...)`.
    */
   dispatch(hook, ...args) {
     return this.components.get("script")?.dispatch(hook, ...args) ?? false;

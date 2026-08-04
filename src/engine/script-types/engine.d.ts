@@ -106,8 +106,13 @@ declare module "engine" {
    * `this.entity.object3D.position.set(0, 1, 0)`. The underlying
    * `object3D` is still typed and reachable for matrix ops and the
    * scene-graph tree.
+   *
+   * `on`/`once`/`off`/`emit`/`emitAsync`/`callAll`/`callFirst`/`clear` come
+   * from `TypedEmitter<EntityEventMap>` — a LOCAL event bus scoped to this
+   * one entity instance, separate from `engine.on`/`emit`. See
+   * {@link EntityEventMap}.
    */
-  export interface Entity {
+  export interface Entity extends TypedEmitter<EntityEventMap> {
     id: string;
     name: string;
     object3D: Object3D;
@@ -1794,6 +1799,28 @@ declare module "engine" {
     "action-pressed": [name: string, value: number];
     "action-released": [name: string];
   }
+
+  /**
+   * Events fired locally on ONE entity (`entity.on`/`emit`), not the global
+   * `engine.on`/`emit` bus — every entity gets its own independent
+   * `TypedEmitter<EntityEventMap>`, so emitting on one entity never reaches
+   * another's listeners. Empty by default: these are ad-hoc, game-authored
+   * events (a "damaged" a Health script fires, a "captured" a flag fires),
+   * so there's nothing for the engine itself to predeclare — register yours
+   * via interface merging, same pattern as `EngineEventMap`:
+   *
+   *     declare module "engine" {
+   *       interface EntityEventMap { damaged: [amount: number]; }
+   *     }
+   *
+   *     this.entity.on("damaged", (amount) => { ... }); // amount: number
+   *     this.entity.emit("damaged", 10);
+   *
+   * Compare `entity.dispatch(hook, ...args)`, which calls a named METHOD on
+   * every attached script (framework-hook style) rather than this real
+   * multi-listener pub-sub — see the note on `Entity` in Entity.js.
+   */
+  export interface EntityEventMap {}
 
   export interface InputManager extends TypedEmitter<InputEventMap> {
     /** Currently active device group ("KeyboardMouse" | "Gamepad" | "Touch"). */

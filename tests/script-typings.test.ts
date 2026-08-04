@@ -19,6 +19,16 @@
 import { Script, attribute, MeshComponent, CameraComponent, CharacterControllerComponent } from "engine";
 import * as THREE from "three/webgpu";
 
+// `EntityEventMap` is empty out of the box (ad-hoc, game-authored events) —
+// a project registers its own the same way a module registers an
+// EngineEventMap entry. This is the fixture's own registration, exercised
+// in section 9 below.
+declare module "engine" {
+  interface EntityEventMap {
+    damaged: [amount: number];
+  }
+}
+
 // 1. extends Script
 export default class Player extends Script {
   @attribute({ type: "number", default: 5, min: 0, max: 20, step: 0.1, label: "Speed" })
@@ -41,6 +51,7 @@ export default class Player extends Script {
   private _offFire: (() => void) | null = null;
   private _offPlayChanged: (() => void) | null = null;
   private _offActionPressed: (() => void) | null = null;
+  private _offDamaged: (() => void) | null = null;
 
   onStart() {
     // this.entity — typed as Entity with transform aliases.
@@ -288,6 +299,23 @@ export default class Player extends Script {
       const v: number = value;
       void n; void v;
     }) ?? null;
+
+    // 9. entity.on/off/once/emit — a SEPARATE local TypedEmitter scoped to
+    //    this one entity, checked against EntityEventMap (registered above).
+    //    Distinct from `dispatch(hook, ...)`, which calls a named method.
+    this._offDamaged = this.entity.on("damaged", (amount) => {
+      const a: number = amount;
+      void a;
+    });
+    this.entity.emit("damaged", 10);
+    void this.entity.emitAsync("damaged", 5);
+    const totals: number[] = this.entity.callAll<"damaged", number>("damaged", 1);
+    void totals;
+    // Another entity's listeners are unaffected — a separate instance, a
+    // separate TypedEmitter.
+    const other = this.engine.createEntity({ name: "Other" });
+    other.on("damaged", () => {});
+    other.emit("damaged", 99);
   }
 
   onUpdate(dt: number) {
@@ -304,8 +332,10 @@ export default class Player extends Script {
     this._offFire = null;
     this._offPlayChanged?.();
     this._offActionPressed?.();
+    this._offDamaged?.();
     this._offPlayChanged = null;
     this._offActionPressed = null;
+    this._offDamaged = null;
   }
 
   onHotReload(oldInstance: Script) {

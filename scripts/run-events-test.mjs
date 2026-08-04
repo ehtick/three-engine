@@ -7,6 +7,7 @@
  */
 import assert from "node:assert/strict";
 import { EventEmitter } from "../src/engine/EventEmitter.js";
+import { Entity } from "../src/engine/Entity.js";
 
 let failures = 0;
 const check = (name, fn) => {
@@ -191,6 +192,37 @@ await asyncCheck("callFirstAsync returns undefined when every listener resolves 
   e.on("x", async () => undefined);
   const first = await e.callFirstAsync("x");
   assert.equal(first, undefined);
+});
+
+// Entity extends EventEmitter directly (see the class doc comment in
+// Entity.js) — a local, per-instance bus separate from `engine.on`/`emit`.
+// The `engine` constructor arg is never touched by on/off/emit, so a stub
+// is enough here.
+check("Entity has its own on/off/once/emit, identical to EventEmitter", () => {
+  const e = new Entity({}, { name: "Test" });
+  let calls = 0;
+  e.on("damaged", (amount) => (calls += amount));
+  e.emit("damaged", 5);
+  assert.equal(calls, 5);
+});
+
+check("two entities have independent listener sets", () => {
+  const a = new Entity({}, { name: "A" });
+  const b = new Entity({}, { name: "B" });
+  let aCalls = 0;
+  let bCalls = 0;
+  a.on("damaged", () => aCalls++);
+  b.on("damaged", () => bCalls++);
+  a.emit("damaged", 1);
+  assert.equal(aCalls, 1);
+  assert.equal(bCalls, 0, "emitting on entity A must not reach entity B's listeners");
+});
+
+check("entity.callFirst works the same way as the base EventEmitter", () => {
+  const e = new Entity({}, { name: "Test" });
+  e.on("query", () => null);
+  e.on("query", () => 7);
+  assert.equal(e.callFirst("query"), 7);
 });
 
 console.log(failures ? `\n${failures} failing` : "\nall events checks passed");
