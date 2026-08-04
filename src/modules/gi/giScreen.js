@@ -412,13 +412,22 @@ export function createGiResolve({ gbuffer, targets, width, height, gather, norma
             const cosSigned = dir.dot(rawN).toVar();
             const cosRayNormal = cosSigned.abs().toVar();
             const shadowOrigin = P.add(rawN.mul(cosSigned.sign()).mul(lightShadow.lift)).toVar();
-            // Terminator skip, on the ABSOLUTE cosine: under ~3° of incidence
-            // the analytic term is already ~0, while the ray hugs its own
-            // surface for its whole length, burns the step budget in tiny
-            // near-geometry steps, and the trace's exhaustion clamp then fails
-            // it CLOSED — a black wall exactly where the light contributes
-            // nothing. Skipping keeps the inert 1. (`sign()` at exactly 0
-            // zeroes the lift, but that ray is skipped here anyway.)
+            // Terminator handling, on the ABSOLUTE cosine: under ~3° of
+            // incidence a ray hugs its own surface for its whole length,
+            // burns its step budget in tiny near-geometry steps, and the
+            // trace's exhaustion clamp fails it CLOSED — so these rays never
+            // march. But the skipped value is 0, NOT the inert 1: the
+            // GEOMETRIC N·L here is ~0, while the SHADING normal three
+            // actually lights with (normal maps, double-sided foliage's
+            // camera-facing flip) can carry real N·L — a skipped 1 then
+            // renders as a full-sun pixel exactly where crumpled leaf
+            // normals and silhouette rims graze the sun direction. That was
+            // the white-dot population that survived five sampling-side
+            // fixes (DIAG arm 2 convicted the channel; every guard correctly
+            // trusted a lit value carrying a perfectly VALID position).
+            // Only the NO-GEOMETRY path keeps the load-bearing default 1.
+            // (`sign()` at exactly 0 zeroes the lift; that ray stays dark.)
+            lightShadowVars[index].assign(0);
             If(cosRayNormal.greaterThan(0.05), () => {
               // ANGULAR RADIUS → PENUMBRA. Directional lights carry it
               // directly (`soft`, radians — the sun's authored angle);
