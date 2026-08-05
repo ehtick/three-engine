@@ -1293,6 +1293,97 @@ console.log("\npanel maximize");
 }
 
 /* -------------------------------------------------------------------------- */
+/* 13 — the viewport stops rendering when it is not the focused panel          */
+/* -------------------------------------------------------------------------- */
+
+console.log("\nviewport suspension");
+{
+  // Counting real frames, not reading a flag: the complaint is that the
+  // viewport keeps working, and only the frame count can answer that.
+  // Counts ENGINE ticks, not rAF: the browser keeps ticking rAF regardless, and
+  // the question is whether the render loop is running at all.
+  const framesOver = async (ms) => {
+    await page.evaluate(() => {
+      globalThis.__frames = 0;
+      globalThis.__unsub?.();
+      globalThis.__unsub = globalThis.__engine.onUpdate(() => {
+        globalThis.__frames++;
+      });
+    });
+    await settle(ms);
+    return page.evaluate(() => {
+      globalThis.__unsub?.();
+      globalThis.__unsub = null;
+      return globalThis.__frames;
+    });
+  };
+
+  await page.evaluate(async () => {
+    const { ensureEngine } = await globalThis.__importLive("/src/editor/engineInstance.js");
+    globalThis.__engine = await ensureEngine();
+  });
+
+  // Focus the viewport by clicking its own canvas, and let the pacing settle.
+  // Focus is moved through dockview's own API. Setting `dv-active-group` by
+  // hand looks equivalent and is not: dockview owns that class and restores it
+  // on the next render, so the test would measure a state that lasts one tick.
+  const focusPanel = async (id) => {
+    const ok = await page.evaluate((panelId) => {
+      const panel = globalThis.__dockApi?.getPanel?.(panelId);
+      if (!panel) return false;
+      panel.api.setActive();
+      return true;
+    }, id);
+    await settle(800);
+    return ok;
+  };
+  const focused = await focusPanel("viewport");
+  check("the viewport group was found", focused);
+  await settle(700);
+  const whileFocused = await framesOver(1000);
+  check("a focused viewport renders", whileFocused > 5, `${whileFocused} frames in 1s`);
+
+  // Now hand focus to the Texture Editor, exactly as clicking it does.
+  check("the texture editor can take focus", await focusPanel("textureEditor"));
+  const whileUnfocused = await framesOver(1000);
+  // Near zero rather than exactly zero: the loop really does stop, and the
+  // handful of frames left are single wake frames granted at most once per
+  // sample because something in the editor emits `hierarchy-changed` at a very
+  // high rate. Worth fixing at the source; the cap is what keeps it bounded.
+  check(
+    "an unfocused viewport all but stops",
+    whileUnfocused * 5 < whileFocused,
+    `${whileUnfocused} frames in 1s (was ${whileFocused})`,
+  );
+
+  // ...but it must not go stale: anything that changes what it draws wakes it
+  // for a single frame.
+  await page.evaluate(() => {
+    globalThis.__frames = 0;
+    globalThis.__unsub?.();
+    globalThis.__unsub = globalThis.__engine.onUpdate(() => {
+      globalThis.__frames++;
+    });
+    globalThis.__engine.emit("hierarchy-changed");
+  });
+  await settle(500);
+  const woke = await page.evaluate(() => {
+    globalThis.__unsub?.();
+    globalThis.__unsub = null;
+    return globalThis.__frames;
+  });
+  check("a scene change wakes it for a frame or two", woke > 0 && woke <= 6, `${woke} frames`);
+
+  const stillQuiet = await framesOver(800);
+  check("and it goes quiet again straight after", stillQuiet * 5 < whileFocused, `${stillQuiet} frames`);
+
+  // Give focus back so nothing downstream inherits a stopped viewport.
+  await focusPanel("viewport");
+  const resumed = await framesOver(800);
+  check("focusing it again resumes rendering", resumed > 4, `${resumed} frames`);
+}
+
+/* -------------------------------------------------------------------------- */
 
 check("no page errors during the run", pageErrors.length === 0, pageErrors.slice(0, 2).join(" | "));
 

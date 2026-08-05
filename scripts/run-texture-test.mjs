@@ -7,7 +7,7 @@
  * the undo stack. What is left for a live check is only the panel's wiring.
  */
 import assert from "node:assert/strict";
-import { editorFrameRateFor } from "../src/editor/framePolicy.js";
+import { editorFrameRateFor, shouldSuspendViewport } from "../src/editor/framePolicy.js";
 
 import {
   createBuffer,
@@ -1834,16 +1834,24 @@ check("transformedBounds reports what a rotation actually needs", () => {
 
 console.log("\neditor frame pacing");
 
-check("an unfocused viewport is throttled hard, whatever it is rendering", () => {
-  // The complaint this exists for: a heavy scene rendering at full rate behind
-  // a paint canvas makes the WHOLE editor lag, and it is buying nothing.
-  assert.equal(editorFrameRateFor(0, { focused: false }), 8, "even an idle one");
-  assert.equal(editorFrameRateFor(80, { focused: false }), 8);
-  assert.equal(editorFrameRateFor(80, { focused: false, interacting: true }), 8);
+check("an unfocused viewport is suspended outright, not throttled", () => {
+  // The complaint this exists for: a heavy scene rendering behind a paint
+  // canvas makes the WHOLE editor lag, and it is buying nothing. Throttling was
+  // not enough — one 60ms frame still lands in the middle of a brush stroke.
+  assert.equal(shouldSuspendViewport({ focused: false }), true);
+  assert.equal(shouldSuspendViewport({ visible: false }), true);
+  assert.equal(shouldSuspendViewport({ visible: false, focused: false }), true);
+  assert.equal(shouldSuspendViewport({}), false, "the focused, visible case renders");
 });
 
-check("Play is never throttled, focused or not", () => {
-  assert.equal(editorFrameRateFor(80, { playing: true, focused: false }), 0);
+check("Play is never suspended, focused or not", () => {
+  // The game is the thing being watched even when the pointer is in the
+  // Inspector — and a paused game still has to draw its pause menu.
+  assert.equal(shouldSuspendViewport({ playing: true, focused: false }), false);
+  assert.equal(shouldSuspendViewport({ playing: true, visible: false }), false);
+});
+
+check("Play is never frame-capped either", () => {
   assert.equal(editorFrameRateFor(80, { playing: true }), 0);
 });
 
