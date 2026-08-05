@@ -301,6 +301,105 @@ if (camPose) {
 }
 await wait(3000);
 
+// BOXTEST=1 — THE SILHOUETTE GROUND TRUTH the counters can't give: spawn a
+// tilted box mid-atrium (never moved after spawn → static → records fitted on
+// the next full chain), close-up the floor shadow under the RECORD MARCH,
+// then rebuild with `__giLightShadowLegacyDda` and shoot the LEGACY arm from
+// the same pose. If the two images match, the record march is not changing
+// verdicts and the defect is inside the trace path — no amount of pool or
+// routing work will show up until that is explained.
+if (process.env.BOXTEST) {
+  const spawned = await page.evaluate(async (anchorId) => {
+    const api = globalThis.__editorApi;
+    const eng = api?.entities?.live(anchorId)?.engine;
+    if (!eng?.scene) return { error: "no engine/scene" };
+    // Same-specifier dynamic import returns the editor's own module instance —
+    // no duplicate-Engine trap (that needs a differing ?t= query).
+    const { THREE } = await import("/src/engine/index.js");
+    const mesh = new THREE.Mesh(
+      new THREE.BoxGeometry(1.2, 1.2, 1.2),
+      new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.9 }),
+    );
+    // Down-hall inside the -65° sun's lit floor pool (the scene camera at
+    // ~(8.3,0.7,-0.4) looks straight at it) so the cast shadow lands ON LIT
+    // floor — a shadow in ambient-only shade is invisible in the frame.
+    mesh.position.set(-1.5, 1.7, -0.4);
+    mesh.rotation.set(0.5, 0.7, 0.3);
+    mesh.updateMatrixWorld(true);
+    eng.scene.add(mesh);
+    globalThis.__BOXTEST_MESH__ = mesh;
+    return { ok: true };
+  }, sunEntity.id);
+  console.log(`  BOXTEST spawn: ${JSON.stringify(spawned)}`);
+  // A RAW scene mesh does not reach the GI fingerprint on its own (the first
+  // run proved it: the records frame had a shadowless box; the mesh only
+  // entered the field on the NEXT structural rebuild). Force that rebuild now
+  // — profiling off doubles as the user-realistic arm — then let records fit.
+  const originalProfiling = giProps.rayHitProfiling === true;
+  await call("component.setProp", {
+    id: giEntity.id, type: "global-illumination", key: "rayHitProfiling", value: false,
+  });
+  await wait(30000);
+  // NO MORE AIM GUESSWORK: project the box center along the sun's actual
+  // world direction onto the floor and park the camera 3m from that point.
+  const shadowSpot = await page.evaluate(async ({ sunId }) => {
+    const api = globalThis.__editorApi;
+    const sunObj = api?.entities?.live(sunId)?.object3D;
+    const box = globalThis.__BOXTEST_MESH__;
+    if (!sunObj || !box) return null;
+    const { THREE } = await import("/src/engine/index.js");
+    const q = sunObj.getWorldQuaternion(new THREE.Quaternion());
+    const d = new THREE.Vector3(0, 0, -1).applyQuaternion(q).normalize();
+    if (d.y >= -0.05) return null;
+    const p = box.position;
+    const t = -p.y / d.y;
+    const spot = [p.x + d.x * t, 0, p.z + d.z * t];
+    // Approach from the far side of the shadow so the box (between the sun
+    // and the spot) cannot occlude it: continue past the spot along the
+    // box→shadow direction.
+    const ax = spot[0] - p.x, az = spot[2] - p.z;
+    const len = Math.hypot(ax, az) || 1;
+    return { spot, away: [ax / len, az / len] };
+  }, { sunId: sunEntity.id });
+  console.log(`  BOXTEST shadow spot: ${JSON.stringify(shadowSpot)}`);
+  if (shadowSpot) {
+    const { spot, away } = shadowSpot;
+    await call("viewport.setCamera", {
+      position: [spot[0] + away[0] * 2.6, 2.3, spot[2] + away[1] * 2.6],
+      target: [spot[0], 0.05, spot[2]],
+    });
+    await wait(3000);
+  }
+  await page.screenshot({ path: "scripts/gi-boxtest-records.png" });
+  console.log("  BOXTEST records arm -> scripts/gi-boxtest-records.png");
+
+  // Legacy arm: the hatch is read at resolve build; toggling profiling back
+  // is the structural flip that forces the rebuild re-reading it.
+  await page.evaluate(() => { globalThis.__giLightShadowLegacyDda = true; });
+  await call("component.setProp", {
+    id: giEntity.id, type: "global-illumination", key: "rayHitProfiling", value: true,
+  });
+  await wait(30000);
+  await page.screenshot({ path: "scripts/gi-boxtest-legacy.png" });
+  console.log("  BOXTEST legacy arm -> scripts/gi-boxtest-legacy.png");
+
+  // Restore: hatch off, profiling back, mesh out. The scene file was never
+  // touched; the page dies at exit anyway, but leave the live state clean.
+  await page.evaluate((anchorId) => {
+    globalThis.__giLightShadowLegacyDda = false;
+    const eng = globalThis.__editorApi?.entities?.live(anchorId)?.engine;
+    const mesh = globalThis.__BOXTEST_MESH__;
+    if (eng?.scene && mesh) eng.scene.remove(mesh);
+  }, sunEntity.id);
+  await call("component.setProp", {
+    id: giEntity.id, type: "global-illumination", key: "rayHitProfiling", value: originalProfiling,
+  });
+  await restore().catch(() => {});
+  console.log("\nGI-LIGHTSHADOW BOXTEST DONE");
+  await browser.close();
+  process.exit(0);
+}
+
 // The measurement gets one remount-race retry too: a dead __editorApi inside
 // the evaluate throws out of the page, and losing a whole boot to that beat
 // costs minutes.
