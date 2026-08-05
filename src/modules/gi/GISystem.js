@@ -16,7 +16,7 @@
 // lights + promoted emissive emitters (uniform slots, zero rebakes), and
 // the GICascadeLight material injection.
 import * as THREE from "three/webgpu";
-import { cameraPosition, float, instanceIndex, mix, positionLocal, positionWorld, screenUV, select, texture, uniform, vec2, vec3, vec4 } from "three/tsl";
+import { cameraPosition, cos, float, fract, instanceIndex, mix, normalWorld, positionLocal, positionWorld, screenCoordinate, screenUV, select, sin, smoothstep, texture, uniform, vec2, vec3, vec4 } from "three/tsl";
 import { createRadianceCascades } from "./cascadeTrace.js";
 import { createCascadeMerge } from "./cascadeMerge.js";
 import { createBounceFeedback, createIrradianceGather, createProbeDepthMoments, createProbeIrradiance, createRadianceLookup, depthMomentsAlpha, gatherBias, gatherViewBias, probeSnapAlpha } from "./cascadeGather.js";
@@ -3485,30 +3485,7 @@ export class GISystem {
     const texel = (this._giLightShadowTexel ??= uniform(new THREE.Vector2(1 / 512, 1 / 512)));
     const viewDist = positionWorld.sub(cameraPosition).length().toVar();
     const threshold = viewDist.mul(0.02).max(0.15);
-    // ── PCSS PENUMBRA RADIUS ────────────────────────────────────────────
-    // Blender sun semantics: penumbra width at the receiver = tan(source
-    // half-angle) × blocker distance. The resolve wrote the trace's own
-    // occluder distance (normalized by the span) into the dist channel —
-    // no blocker search needed, the march already knows. LinearFilter on
-    // the dist texture blends the radius across the penumbra, which is
-    // exactly right. Devices without the extra storage texture never write
-    // it: reads 0 → radius 0 → the sharp bilateral below, unchanged.
-    const spanU = (this._giShadowSpanU ??= uniform(1));
-    const fovScaleU = (this._giShadowFovScaleU ??= uniform(1.2));
-    const blurTan = uniform(0);
-    const blockerNorm = this._giLightShadowDistNode
-      ? this._giLightShadowDistNode.sample(screenUV).dot(vec4(mask))
-      : float(0);
-    const penumbraW = blockerNorm.mul(spanU).mul(blurTan).toVar();
-    // World width → screen-height fraction (screenUV units): w·fovScale/dist,
-    // capped at 24 half-res texels so a 90° sun cannot blur across the frame.
-    const radiusUv = penumbraW.mul(fovScaleU).div(viewDist.max(0.05))
-      .min(vec2(texel).y.mul(24)).toVar();
-    const ringOn = radiusUv.greaterThan(vec2(texel).y.mul(0.75));
-    // Wide blurs must accept taps across the penumbra's own depth spread —
-    // widen the position-validity threshold with the penumbra width, or a
-    // soft shadow on a slanted floor rejects most of its own disc.
-    const ringThreshold = threshold.add(penumbraW.mul(0.35));
+    // ── SHARP BASE: the position-validated bilateral upsample (unchanged) ──
     const innerTaps = [[-0.5, -0.5], [0.5, -0.5], [-0.5, 0.5], [0.5, 0.5]].map(([dx, dy]) => {
       const uv = screenUV.add(vec2(texel).mul(vec2(dx, dy)));
       const s = this._giLightShadowNode.sample(uv).dot(vec4(mask));
@@ -3517,28 +3494,8 @@ export class GISystem {
       const w = select(g.w.greaterThan(0.5).and(d.lessThan(threshold)), float(1).div(d.add(0.02)), float(0));
       return { s, w };
     });
-    // 8-tap disc at the penumbra radius (two interleaved rings for coverage),
-    // compiled in only when the dist channel exists; weights collapse to 0
-    // when the radius is sub-texel, leaving the sharp path bit-exact.
-    const ringTaps = this._giLightShadowDistNode
-      ? [0, 1, 2, 3, 4, 5, 6, 7].map((k) => {
-          const a = (Math.PI / 4) * k + Math.PI / 8;
-          const scale = k % 2 === 0 ? 1 : 0.62;
-          const uv = screenUV.add(vec2(Math.cos(a) * scale, Math.sin(a) * scale).mul(radiusUv));
-          const s = this._giLightShadowNode.sample(uv).dot(vec4(mask));
-          const g = this._giShadowPosNode.sample(uv);
-          const d = g.xyz.sub(positionWorld).length();
-          const w = select(
-            ringOn.and(g.w.greaterThan(0.5)).and(d.lessThan(ringThreshold)),
-            float(1).div(d.add(0.05)),
-            float(0),
-          );
-          return { s, w };
-        })
-      : [];
-    const taps = [...innerTaps, ...ringTaps];
-    const wSum = taps.reduce((acc, t) => acc.add(t.w), float(0));
-    const sBlend = taps.reduce((acc, t) => acc.add(t.s.mul(t.w)), float(0)).div(wSum.max(1e-4));
+    const wSum = innerTaps.reduce((acc, t) => acc.add(t.w), float(0));
+    const sBlend = innerTaps.reduce((acc, t) => acc.add(t.s.mul(t.w)), float(0)).div(wSum.max(1e-4));
     // NO-VALID-TAP FALLBACK IS ZERO, not min-of-taps. When every tap belongs
     // to some OTHER surface (thin features, object silhouettes — a spinning
     // prop in front of a shadowed arch), min-of-foreign is only dark if the
@@ -3547,7 +3504,71 @@ export class GISystem {
     // behind it (user screenshot, the exact "still there" dots). A shadow
     // term with no information must fail DARK; the cost is a half-res-thin
     // darkened halo where lit meets lit, which reads as contact shading.
-    const shadow = select(wSum.greaterThan(1e-4), sBlend, float(0));
+    const sharp = select(wSum.greaterThan(1e-4), sBlend, float(0)).toVar();
+    // ── PCSS SOFT DISC (v2 — v1's artifacts were both kernel bugs) ──────
+    // Blender sun semantics: penumbra width = tan(source half-angle) ×
+    // blocker distance, which the resolve wrote per pixel (the march's own
+    // occluder distance — no blocker search estimate needed). v1 ghosted
+    // the occluder into 8 shifted copies (an UNROTATED sparse disc is a
+    // multi-exposure, not a blur) and mottled on floors (its euclidean tap
+    // validation rejects same-plane taps, whose lateral distance is ~the
+    // radius by definition). v2: a per-pixel IGN-rotated 12-tap golden
+    // spiral — rotation turns undersampling into noise, which reads as
+    // softness — with validity measured as distance from the RECEIVER'S
+    // PLANE (in-plane taps pass at any radius; cross-silhouette taps fail),
+    // plus a small 4-tap max blocker search so the penumbra extends OUTSIDE
+    // the geometric shadow instead of clipping at its edge.
+    const spanU = (this._giShadowSpanU ??= uniform(1));
+    const fovScaleU = (this._giShadowFovScaleU ??= uniform(1.2));
+    const blurTan = uniform(0);
+    let shadow = sharp;
+    if (this._giLightShadowDistNode) {
+      const distAt = (uv) => this._giLightShadowDistNode.sample(uv).dot(vec4(mask));
+      const t3 = vec2(texel).mul(3).toVar();
+      const blockerNorm = distAt(screenUV)
+        .max(distAt(screenUV.add(vec2(t3.x, 0))))
+        .max(distAt(screenUV.sub(vec2(t3.x, 0))))
+        .max(distAt(screenUV.add(vec2(0, t3.y))))
+        .max(distAt(screenUV.sub(vec2(0, t3.y))))
+        .toVar();
+      const penumbraW = blockerNorm.mul(spanU).mul(blurTan).toVar();
+      // World width → screenUV fraction: w·fovScale/viewDist, capped at 24
+      // half-res texels so a 90° sun cannot blur across the whole frame.
+      const radiusUv = penumbraW.mul(fovScaleU).div(viewDist.max(0.05))
+        .min(vec2(texel).y.mul(24)).toVar();
+      // Interleaved gradient noise → per-pixel spiral rotation.
+      const rotA = fract(
+        fract(screenCoordinate.x.mul(0.06711056).add(screenCoordinate.y.mul(0.00583715)))
+          .mul(52.9829189),
+      ).mul(Math.PI * 2).toVar();
+      const softW = float(0).toVar();
+      const softSum = float(0).toVar();
+      const N = normalWorld.toVar();
+      for (let k = 0; k < 12; k++) {
+        const r = radiusUv.mul(Math.sqrt((k + 0.5) / 12));
+        const a = rotA.add(k * 2.399963);
+        const uv = screenUV.add(vec2(cos(a), sin(a)).mul(r));
+        const s = this._giLightShadowNode.sample(uv).dot(vec4(mask));
+        const g = this._giShadowPosNode.sample(uv);
+        const rel = g.xyz.sub(positionWorld);
+        // Plane-distance validity: |N·rel| small keeps same-surface taps at
+        // any lateral distance; the lateral-scaled slack tolerates curvature.
+        const planeD = N.dot(rel).abs();
+        const lateral = rel.length();
+        const ok = g.w.greaterThan(0.5).and(planeD.lessThan(lateral.mul(0.2).add(0.15)));
+        softW.addAssign(select(ok, float(1), float(0)));
+        softSum.addAssign(select(ok, s, float(0)));
+      }
+      const soft = select(softW.greaterThan(0.5), softSum.div(softW.max(1)), sharp);
+      // Sub-texel radii keep the sharp bilateral bit-exact; the disc fades
+      // in as the penumbra grows past a couple of half-res texels.
+      const softness = smoothstep(
+        vec2(texel).y.mul(0.75),
+        vec2(texel).y.mul(3),
+        radiusUv,
+      );
+      shadow = mix(sharp, soft, softness);
+    }
     const entry = {
       active,
       mask,
