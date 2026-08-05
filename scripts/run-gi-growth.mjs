@@ -39,7 +39,10 @@ const browser = await puppeteer.launch({
   ],
 });
 const page = await browser.newPage();
-await page.setViewport({ width: 1400, height: 900, deviceScaleFactor: 1 });
+// VIEW=2560x1440 reproduces the user's monitor — GI screen passes scale with
+// resolution, so a 1400x900 probe understates their cost ~3x.
+const VIEW = (process.env.VIEW ?? "1400x900").split("x").map(Number);
+await page.setViewport({ width: VIEW[0] || 1400, height: VIEW[1] || 900, deviceScaleFactor: 1 });
 await installTauriShim(page, {});
 page.on("console", (m) => {
   const t = m.text();
@@ -132,6 +135,10 @@ await wait(15000);
 if (process.env.NOSHADOW) {
   await call("component.setProp", { id: sunEntity.id, type: "light", key: "shadowMode", value: "map" });
   console.log("  bisect: shadowMode -> map");
+}
+if (process.env.ANGLE) {
+  await call("component.setProp", { id: sunEntity.id, type: "light", key: "sourceAngle", value: Number(process.env.ANGLE) });
+  console.log(`  sourceAngle -> ${process.env.ANGLE}`);
 }
 if (QUALITY && QUALITY !== savedQuality) {
   await call("component.setProp", { id: giEntity.id, type: "global-illumination", key: "quality", value: QUALITY });

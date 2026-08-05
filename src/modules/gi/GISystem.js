@@ -1806,10 +1806,15 @@ export class GISystem {
                 Number(globalThis.__giConeShadowSteps) ||
                 ({ low: 48, medium: 64, high: 80, ultra: 96 }[quality] ?? 80);
               const coneT = cone
-                ? occ.traceOccupancyCone(origin, dir, exactEnd, maxT, {
+                ? occ.traceOccupancyCone(origin, dir, exactEnd.max(tMin), maxT, {
                     tanHalf,
                     steps: coneSteps,
                     boost: Number(globalThis.__giConeDensityBoost) || 3,
+                    // Receiver plane for the cone's self-shadow exclusion.
+                    // The light-facing normal is recoverable from the lifted
+                    // origin — origin = P + n·lift by construction.
+                    receiverP,
+                    receiverN: receiverP ? vec3(origin).sub(receiverP).normalize() : null,
                   })
                 : null;
               // THE RECORD MARCH — the non-voxel shadow arm. When the active

@@ -1988,8 +1988,10 @@ export function createOccupancyField(bounds, res0, options = {}) {
           { name: "tMax", type: "float" },
           { name: "tanHalf", type: "float" },
           { name: "boost", type: "float" },
+          { name: "recvP", type: "vec3" },
+          { name: "recvN", type: "vec3" },
         ],
-        body: (o, d, t0, t1, tanH, boost) => {
+        body: (o, d, t0, t1, tanH, boost, recvP, recvN) => {
           const inv = vec3(voxelInv).toVar();
           const q0 = vec3(o).sub(vec3(gridOrigin)).mul(inv).toVar();
           const dq = vec3(d).mul(inv).toVar();
@@ -2020,8 +2022,12 @@ export function createOccupancyField(bounds, res0, options = {}) {
               },
             );
             // Footprint leaf: the level whose cells the cone's diameter spans.
-            const leafF = log2(tanH.mul(t).mul(2).div(voxMinW).max(1)).clamp(0, OCC_LEVELS - 1).floor().toVar();
-            const leaf = leafF.toInt().toVar();
+            // `leafC` stays CONTINUOUS — the density sample blends the two
+            // straddling levels by its fraction, so the blur width grows
+            // smoothly along the ray instead of doubling at each level
+            // boundary (discrete jumps read as onion rings in the penumbra).
+            const leafC = log2(tanH.mul(t).mul(2).div(voxMinW).max(1)).clamp(0, OCC_LEVELS - 1).toVar();
+            const leaf = leafC.floor().toInt().toVar();
             const lvl = level.max(leaf).toVar();
             const scale = levelSelect(lvl, (l) => l.scale).toVar();
             const v = q.div(scale).floor().toVar();
@@ -2044,9 +2050,36 @@ export function createOccupancyField(bounds, res0, options = {}) {
                 // If follows the penK precedent in traceBody.
                 const tm = t.add(tNext.mul(0.5)).toVar();
                 const qm = q0.add(dq.mul(tm)).toVar();
-                const dens = densityTrilinear(qm, lvl.toFloat()).toVar();
+                const lNext = leaf.add(int(1)).min(int(OCC_LEVELS - 1)).toVar();
+                const dens = mix(
+                  densityTrilinear(qm, leaf.toFloat()),
+                  densityTrilinear(qm, lNext.toFloat()),
+                  leafC.sub(leafC.floor()),
+                ).toVar();
+                // Thin-occluder boost, COARSE LEVELS ONLY: a wall spanning a
+                // coarse cell blocks every ray through it while filling ~1/8
+                // of its volume, so coarse fractions under-block — but fine-
+                // level fractions are already honest, and boosting them
+                // saturated every partially-covered voxel into a hard blob
+                // (the user's blotchy-floor screenshot).
+                const boostEff = mix(float(1), boost, lvl.toFloat().div(OCC_LEVELS - 1)).toVar();
+                // RECEIVER-PLANE EXCLUSION, the cone form of the exact arm's
+                // origin-plane exclusion — and the fix for the self-shadowing
+                // that read as "quite bad most of the time": under a grazing
+                // sun the cone footprint overlaps the receiver's OWN surface
+                // voxels for meters, so floors blotched and shadow-side walls
+                // went pitch black from shadowing themselves. A plane cannot
+                // shadow itself: scale each sample by the fraction of its
+                // footprint that lies ABOVE the receiver's plane (≈ linear in
+                // signed distance / footprint radius). Real occluders stand
+                // off the plane and pass untouched.
+                // The denominator is the SAMPLED CELL's width — that is the
+                // trilinear support that actually reaches down into the
+                // receiver's surface row — not the cone radius.
+                const pw = qm.mul(vec3(voxel)).add(vec3(gridOrigin)).toVar();
                 const cellW = voxMinW.mul(exp2(lvl.toFloat())).toVar();
-                const op = dens.mul(boost).mul(tNext.div(cellW).clamp(0, 1)).clamp(0, 1);
+                const above = recvN.dot(pw.sub(recvP)).div(cellW).mul(0.5).add(0.5).clamp(0, 1).toVar();
+                const op = dens.mul(boostEff).mul(above).mul(tNext.div(cellW).clamp(0, 1)).clamp(0, 1);
                 alpha.assign(alpha.add(alpha.oneMinus().mul(op)));
               });
               t.addAssign(tNext.add(1e-4));
@@ -2061,6 +2094,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
     return fn(
       vec3(origin), vec3(dir), float(tMin), float(tMax),
       float(opts.tanHalf ?? 0), float(opts.boost ?? 3),
+      vec3(opts.receiverP ?? origin), vec3(opts.receiverN ?? vec3(0, 0, 0)),
     );
   };
 
