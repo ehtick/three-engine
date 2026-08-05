@@ -445,8 +445,11 @@ export function createGiResolve({ gbuffer, targets, width, height, gather, norma
               // for why), sphere trace as the hatched fallback. Trailing args
               // of the sphere arm default to "no lamp self-exclusion": an
               // analytic light has no body in the field to exclude.
+              // The receiver point rides along for the record march's
+              // origin-plane exclusion (self-shadow phantoms on tilted
+              // receivers); the legacy/sphere arms ignore it.
               const traced = lightShadow.traceDda
-                ? lightShadow.traceDda(shadowOrigin, dir, maxT, float(1).div(angle))
+                ? lightShadow.traceDda(shadowOrigin, dir, maxT, float(1).div(angle), P)
                 : lightShadow.trace(shadowOrigin, dir, maxT, float(1).div(angle), cosRayNormal);
               if (lightShadow.freeRadius) {
                 // BURIAL GATE — the answer to the surviving white dots (user-

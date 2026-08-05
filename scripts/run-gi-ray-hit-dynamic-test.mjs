@@ -443,5 +443,68 @@ const rotatedBox = (center, half, ry, rx) => {
     `mismatches=${mismatches}`);
 }
 
+// ---------------------------------------------------------------------------
+// ORIGIN-PLANE EXCLUSION — the teardrop self-shadow class: a grazing shadow
+// ray over a long TILTED receiver rides above its own voxel staircase, and
+// every tooth's fitted plane (the receiver's own plane) feeds the cone
+// estimator k·d⊥/t, which converges to k·sin(elevation) < 1 at long t —
+// periodic soft self-shadow phantoms with no occluder anywhere. Passing the
+// receiver point must zero that class while a REAL occluder (different
+// plane) on the same ray still blocks.
+{
+  const res32 = { x: 32, y: 32, z: 32 };
+  // Long tilted plane: y = 16 + (z-16)*0.4, normal ∝ (0, 1, -0.4).
+  const m = 0.4;
+  const tiltedBig = quad(
+    [2, 16 + (2 - 16) * m, 2], [30, 16 + (2 - 16) * m, 2],
+    [30, 16 + (30 - 16) * m, 30], [2, 16 + (30 - 16) * m, 30],
+  );
+  const nLen = Math.hypot(1, m);
+  const n = [0, 1 / nLen, -m / nLen];
+  const receiver = [16, 16, 16]; // on the plane
+  // Lift INSIDE the surface's conservative bulge band (~0.9 voxels for this
+  // tilt): the regime where the march actually visits the receiver's own
+  // cells — real receivers land here whenever the lift margin thins (voxel
+  // anisotropy, curved/rough geometry, leaf-on-leaf contact), and it is the
+  // dead-zone the exclusion exists to make shrinkable.
+  const lift = 0.2;
+  const origin = receiver.map((v, i) => v + n[i] * lift);
+  // Up-slope tangent + a small plane-relative elevation ≈ grazing sun.
+  const tan = [0, m / nLen, 1 / nLen];
+  const rawDir = tan.map((v, i) => v + n[i] * 0.05);
+  const dLen = Math.hypot(...rawDir);
+  const dir = rawDir.map((v) => v / dLen);
+  const opts = { tMax: 24, coverage: true, penumbraK: 2.5, voxelWorld: 1, tMin: 0.1 };
+
+  const frame = buildFrame(res32, tiltedBig, [], { complex: true });
+  const control = trace(frame, res32, origin, dir, opts);
+  check("control: grazing ray over own tilted surface phantom-darkens (the teardrop class)",
+    control.hit || control.pen < 0.9, `hit=${control.hit}, pen=${control.pen?.toFixed(3)}`);
+
+  const excluded = trace(frame, res32, origin, dir, { ...opts, excludePoint: receiver });
+  check("excluded: own-plane contributions vanish — clear ray, clear cone",
+    !excluded.hit && excluded.pen === 1, `hit=${excluded.hit}, pen=${excluded.pen?.toFixed(3)}`);
+
+  // A REAL occluder crossing the same ray (~t=6): a vertical quad whose plane
+  // does NOT contain the receiver — must still block with exclusion on.
+  const occluder = quad([14, 18, 20.8], [18, 18, 20.8], [18, 22, 20.8], [14, 22, 20.8]);
+  const frameOcc = buildFrame(res32, [...tiltedBig, ...occluder], [], { complex: true });
+  const blocked = trace(frameOcc, res32, origin, dir, { ...opts, excludePoint: receiver });
+  // Analytic t: wall plane z=20.8, origin z ≈ 15.93, dir z ≈ 0.910 → t ≈ 5.35.
+  check("excluded: a genuinely different plane still blocks (contact shadows preserved)",
+    blocked.hit === true && Math.abs(blocked.t - 5.35) < 0.3,
+    `hit=${blocked.hit}, t=${blocked.t?.toFixed(2)}`);
+
+  // Exclusion is unsigned — a flipped-normal copy of the same plane is still
+  // the same plane. Re-run the control with the receiver nudged slightly OFF
+  // the plane (0.3 voxels along n): no longer plane-member → phantoms return,
+  // proving the test is plane-membership, not a blanket near-origin skip.
+  const offPlane = receiver.map((v, i) => v + n[i] * 0.3);
+  const notMember = trace(frame, res32, origin, dir, { ...opts, excludePoint: offPlane });
+  check("membership is exact: an off-plane exclude point excludes nothing",
+    notMember.hit === control.hit && Math.abs((notMember.pen ?? 1) - (control.pen ?? 1)) < 1e-6,
+    `pen=${notMember.pen?.toFixed(3)} vs control=${control.pen?.toFixed(3)}`);
+}
+
 console.log(failed === 0 ? "\nALL PASS" : `\n${failed} FAILED`);
 process.exit(failed === 0 ? 0 : 1);

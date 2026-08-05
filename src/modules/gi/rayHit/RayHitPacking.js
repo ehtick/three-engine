@@ -63,6 +63,17 @@ export const MACRO_CELL_GENERATION_MASK = 0xff;
 export const MACRO_CELL_FLAGS_SHIFT = 24;
 export const MACRO_CELL_FLAGS_MASK = 0xff;
 
+/**
+ * Origin-plane exclusion slack, in level-0 voxel units: a shadow trace given
+ * its receiver point skips accepts/cone contributions from cells whose fitted
+ * plane (or exact triangle's plane) lies within this unsigned distance of the
+ * receiver. Same-surface cells re-fit the same plane within packing
+ * quantization (~1e-3 voxels), so 0.05 is generous for identity while staying
+ * far below any genuinely distinct occluder (0.05 voxels ≈ 6mm at a 0.12m
+ * voxel).
+ */
+export const SELF_PLANE_EXCLUSION_SLACK = 0.05;
+
 /** World-t advance used after crossing a DDA face. */
 export const RAY_HIT_DDA_EPSILON = 1e-4;
 export const RAY_HIT_DIRECTION_EPSILON = 1e-8;
@@ -1435,6 +1446,11 @@ export function traceHybridPlaneCpu(
     // size of one voxel — the CPU grid is voxel-unit, the GPU's t is world.
     penumbraK = null,
     voxelWorld = 1,
+    // Origin-plane exclusion (shadow variant): the RECEIVING surface point in
+    // voxel space. Accepts and cone contributions whose plane contains it are
+    // skipped — a plane cannot shadow itself, and the receiver's own bulged
+    // staircase cells re-fit exactly its plane (GPU parity).
+    excludePoint = null,
   } = {},
 ) {
   const counters = {
@@ -1559,6 +1575,12 @@ export function traceHybridPlaneCpu(
               counters.planeTests++;
               const normal = unpackOctNormal(records[record + SURFACE_PACKED_NORMAL_WORD]);
               const plane = unpackPlaneCoverage(records[record + SURFACE_PACKED_PLANE_COVERAGE_WORD]);
+              // Origin-plane exclusion: unsigned receiver membership of this
+              // cell's fitted plane — the receiver's own surface neither
+              // accepts nor darkens the cone (GPU parity).
+              const selfPlane = excludePoint != null &&
+                Math.abs(plane.planeOffset + v3dot(normal, voxel) - v3dot(normal, excludePoint)) <
+                  SELF_PLANE_EXCLUSION_SLACK;
               const denominator = v3dot(normal, direction);
               let accepted = false;
               let tPlane = Infinity;
@@ -1568,7 +1590,7 @@ export function traceHybridPlaneCpu(
                 const okInterval = Number.isFinite(tPlane) &&
                   tPlane >= localT - PLANE_HIT_INTERVAL_EPSILON &&
                   tPlane <= segmentEnd + PLANE_HIT_INTERVAL_EPSILON;
-                accepted = okInterval && tPlane >= tMin - PLANE_HIT_INTERVAL_EPSILON;
+                accepted = okInterval && !selfPlane && tPlane >= tMin - PLANE_HIT_INTERVAL_EPSILON;
                 if (accepted && coverage) {
                   const record3 = unpackCoverageRecord(flagsWord);
                   if (record3.valid) {
@@ -1589,13 +1611,13 @@ export function traceHybridPlaneCpu(
                 // GPU body's note: in-interval coverage rejects are real
                 // silhouette edges whose perpendicular distance of 0 must not
                 // black the cone out.
-                if (penumbraK != null && !okInterval && Number.isFinite(tPlane) &&
+                if (penumbraK != null && !okInterval && !selfPlane && Number.isFinite(tPlane) &&
                     localT > penGate && localT < tMax) {
                   const dVox = Math.abs(denominator) *
                     Math.min(Math.abs(localT - tPlane), Math.abs(segmentEnd - tPlane));
                   pen = Math.min(pen, clamp((penumbraK * dVox * voxelWorld) / Math.max(localT, 1e-4), 0, 1));
                 }
-              } else if (penumbraK != null && localT > penGate && localT < tMax) {
+              } else if (penumbraK != null && !selfPlane && localT > penGate && localT < tMax) {
                 // Parallel ray: constant perpendicular distance to the fitted
                 // plane along the whole segment — the analytic-cone case.
                 const localP = [
@@ -1643,6 +1665,17 @@ export function traceHybridPlaneCpu(
                   trianglePool[word + 8] + voxel[2],
                 ];
                 counters.triangleTests++;
+                // Origin-plane exclusion, triangle form (GPU parity): the
+                // receiving face's own geometry re-listed in a bulged cell
+                // must not occlude its own receiver.
+                if (excludePoint != null) {
+                  const nT = v3cross(v3sub(b, a), v3sub(c, a));
+                  const nLen = Math.hypot(nT[0], nT[1], nT[2]);
+                  if (nLen > 1e-12 &&
+                      Math.abs(v3dot(nT, v3sub(excludePoint, a))) < nLen * SELF_PLANE_EXCLUSION_SLACK) {
+                    continue;
+                  }
+                }
                 const tTriangle = intersectTriangleCpu(origin, direction, a, b, c);
                 if (tTriangle === null || !(tTriangle < bestT)) continue;
                 if (tTriangle < localT - PLANE_HIT_INTERVAL_EPSILON ||

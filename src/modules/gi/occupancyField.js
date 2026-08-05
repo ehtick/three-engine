@@ -103,6 +103,7 @@ import {
   RAY_HIT_DDA_EPSILON,
   RECORD_AWARE_PLANE_SLACK,
   RAY_HIT_DIRECTION_EPSILON,
+  SELF_PLANE_EXCLUSION_SLACK,
   SIMPLE_MAX_PLANE_SIGMA,
   SIMPLE_MAX_TRIANGLES,
   SIMPLE_MIN_COHERENCE,
@@ -2140,16 +2141,28 @@ export function createOccupancyField(bounds, res0, options = {}) {
         // the actual RECORDED surface, which is what makes the penumbra
         // geometry-true instead of voxel-hull-true.
         const penumbra = opts.penumbraK != null;
+        // ORIGIN-PLANE EXCLUSION (shadow variant only): the caller passes the
+        // RECEIVING surface point, and any accept or cone contribution whose
+        // plane CONTAINS that point is skipped — a plane cannot shadow
+        // itself, but the receiver's own SAT-bulged voxel staircase re-fits
+        // that same plane in cell after cell along a tilted surface, and each
+        // tooth used to stamp a soft self-shadow phantom (the teardrop grid
+        // on rotated faces). Unsigned test, so flipped normals don't matter;
+        // cells fitting a DIFFERENT plane (real contact occluders, the
+        // cube's own other face) still block. Sound at any t: a ray leaving a
+        // point on plane P can only re-cross P at t≈0, so far cells of the
+        // same plane never produced legitimate accepts anyway.
+        const exclude = penumbra && opts.excludePoint != null;
         const profile = rayHitDebug != null && opts.profile === true;
         const key = `${macroStepLimit}|${coverage ? 1 : 0}|${exact ? 1 : 0}|${profile ? 1 : 0}` +
-          `|${coarseSkipEnabled ? 1 : 0}|${penumbra ? 1 : 0}`;
+          `|${coarseSkipEnabled ? 1 : 0}|${penumbra ? 1 : 0}|${exclude ? 1 : 0}`;
         let fn = hybridPlaneVariants.get(key);
         if (fn === undefined) {
           fn = sharedFn({
             // "s0" is appended ONLY when the skip is off, so the default arm
             // keeps the exact function names it has always emitted.
             name: `giHybridPlaneTrace${macroStepLimit}${coverage ? "c" : ""}${exact ? "x" : ""}` +
-              `${penumbra ? "p" : ""}${coarseSkipEnabled ? "" : "s0"}`,
+              `${penumbra ? "p" : ""}${exclude ? "e" : ""}${coarseSkipEnabled ? "" : "s0"}`,
             type: "vec4",
             inputs: [
               { name: "origin", type: "vec3" },
@@ -2157,8 +2170,9 @@ export function createOccupancyField(bounds, res0, options = {}) {
               { name: "tMin", type: "float" },
               { name: "tMax", type: "float" },
               ...(penumbra ? [{ name: "penK", type: "float" }] : []),
+              ...(exclude ? [{ name: "excl", type: "vec3" }] : []),
             ],
-            body: (o, d, t0, t1, penKIn) => {
+            body: (o, d, t0, t1, penKIn, exclIn) => {
               const inv = vec3(voxelInv).toVar();
               const q0 = vec3(o).sub(vec3(gridOrigin)).mul(inv).toVar();
               const dq = vec3(d).mul(inv).toVar();
@@ -2224,6 +2238,11 @@ export function createOccupancyField(bounds, res0, options = {}) {
               // surface must not clamp rays at birth) — same gate the legacy
               // estimator applies.
               const penGate = penumbra ? float(t0).add(voxMinW.mul(2)).toVar() : null;
+              // Receiver point in level-0 voxel space, for the origin-plane
+              // exclusion tests below.
+              const qx = exclude
+                ? vec3(exclIn).sub(vec3(gridOrigin)).mul(inv).toVar()
+                : null;
               // Declared only in the exact variant so the Phase-2/3 variants
               // emit byte-identical WGSL to before Phase 4.
               const complexTests = exact ? uint(0).toVar() : null;
@@ -2414,6 +2433,15 @@ export function createOccupancyField(bounds, res0, options = {}) {
                             const n = octDecodeTSL(unpackSnorm2x16(bits.element(rBase))).toVar();
                             const dPlane = unpackSnorm2x16(bits.element(rBase.add(uint(1)))).x
                               .mul(CELL_LOCAL_PLANE_OFFSET_RANGE).toVar();
+                            // Unsigned plane-membership of the RECEIVER: true
+                            // means this cell's fitted plane is the receiving
+                            // surface itself (same-plane cells fit within
+                            // quantization of each other), so it must neither
+                            // accept nor darken the cone.
+                            const selfPlane = exclude
+                              ? dPlane.add(n.dot(cell)).sub(n.dot(qx)).abs()
+                                  .lessThan(SELF_PLANE_EXCLUSION_SLACK).toVar()
+                              : null;
                             const denom = n.dot(dq).toVar();
                             const accepted = float(0).toVar();
                             const denomIf = If(denom.abs().greaterThan(1e-7), () => {
@@ -2455,7 +2483,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
                                     covOk.assign(covBit.toFloat());
                                   });
                                 }
-                                If(covOk.greaterThan(0.5), () => {
+                                If(exclude ? covOk.greaterThan(0.5).and(selfPlane.not()) : covOk.greaterThan(0.5), () => {
                                   accepted.assign(1);
                                   hit.assign(1);
                                   hitT.assign(tP.max(t0));
@@ -2480,7 +2508,11 @@ export function createOccupancyField(bounds, res0, options = {}) {
                                 // surface genuinely is not (a real silhouette
                                 // edge), and their perpendicular distance of 0
                                 // would black the cone out.
-                                If(accepted.lessThan(0.5).and(okInterval.not()), () => {
+                                If(
+                                  exclude
+                                    ? accepted.lessThan(0.5).and(okInterval.not()).and(selfPlane.not())
+                                    : accepted.lessThan(0.5).and(okInterval.not()),
+                                  () => {
                                   const tEnd = cellExit.min(segmentEnd).toVar();
                                   const dVox = denom.abs().mul(
                                     localT.sub(tP).abs().min(tEnd.sub(tP).abs()),
@@ -2499,11 +2531,17 @@ export function createOccupancyField(bounds, res0, options = {}) {
                                 // Parallel ray: the perpendicular distance to
                                 // the fitted plane is constant along the whole
                                 // segment — the exact analytic-cone case (a ray
-                                // sliding just above a floor's surface).
+                                // sliding just above a floor's surface). With
+                                // exclusion on, a ray sliding above its OWN
+                                // tilted surface's staircase contributes
+                                // nothing (that was the teardrop smudge).
                                 const dVox = dPlane.add(n.dot(cell)).sub(n.dot(localQ)).abs().toVar();
                                 const cand = float(penKIn).mul(dVox.mul(voxMinW)).div(localT.max(1e-4)).clamp(0, 1);
+                                const penApply = exclude
+                                  ? localT.greaterThan(penGate).and(localT.lessThan(t1)).and(selfPlane.not())
+                                  : localT.greaterThan(penGate).and(localT.lessThan(t1));
                                 pen.assign(pen.min(select(
-                                  localT.greaterThan(penGate).and(localT.lessThan(t1)),
+                                  penApply,
                                   cand,
                                   float(1),
                                 )));
@@ -2586,17 +2624,29 @@ export function createOccupancyField(bounds, res0, options = {}) {
                                     const vBary = dq.dot(qv).mul(invDet).toVar();
                                     If(vBary.greaterThanEqual(-1e-6).and(u.add(vBary).lessThanEqual(1 + 1e-6)), () => {
                                       const tTri = e2.dot(qv).mul(invDet).toVar();
-                                      If(
-                                        tTri.greaterThanEqual(tLo)
-                                          .and(tTri.lessThanEqual(tHi))
-                                          .and(tTri.lessThan(nearest)),
-                                        () => {
-                                          nearest.assign(tTri);
-                                          found.assign(1);
-                                          const gn = e1.cross(e2).normalize().toVar();
-                                          nearestNormal.assign(select(gn.dot(dq).greaterThan(0), gn.negate(), gn));
-                                        },
-                                      );
+                                      // Origin-plane exclusion, triangle form:
+                                      // skip a triangle whose plane contains
+                                      // the receiver (the receiving face's own
+                                      // geometry re-listed in a bulged cell).
+                                      const triCond = exclude
+                                        ? (() => {
+                                            const nT = e1.cross(e2).toVar();
+                                            const selfTri = nT.dot(qx.sub(a)).abs()
+                                              .lessThan(nT.length().mul(SELF_PLANE_EXCLUSION_SLACK));
+                                            return tTri.greaterThanEqual(tLo)
+                                              .and(tTri.lessThanEqual(tHi))
+                                              .and(tTri.lessThan(nearest))
+                                              .and(selfTri.not());
+                                          })()
+                                        : tTri.greaterThanEqual(tLo)
+                                            .and(tTri.lessThanEqual(tHi))
+                                            .and(tTri.lessThan(nearest));
+                                      If(triCond, () => {
+                                        nearest.assign(tTri);
+                                        found.assign(1);
+                                        const gn = e1.cross(e2).normalize().toVar();
+                                        nearestNormal.assign(select(gn.dot(dq).greaterThan(0), gn.negate(), gn));
+                                      });
                                     });
                                   });
                                 });
@@ -2749,9 +2799,11 @@ export function createOccupancyField(bounds, res0, options = {}) {
           hybridPlaneVariants.set(key, fn);
         }
 
-        const packed = (penumbra
-          ? fn(vec3(origin), vec3(dir), float(tMin), float(tMax), float(opts.penumbraK))
-          : fn(vec3(origin), vec3(dir), float(tMin), float(tMax))).toVar();
+        const packed = (exclude
+          ? fn(vec3(origin), vec3(dir), float(tMin), float(tMax), float(opts.penumbraK), vec3(opts.excludePoint))
+          : penumbra
+            ? fn(vec3(origin), vec3(dir), float(tMin), float(tMax), float(opts.penumbraK))
+            : fn(vec3(origin), vec3(dir), float(tMin), float(tMax))).toVar();
         const hit = packed.x;
         const hitT = packed.y;
         const dq = vec3(dir).mul(vec3(voxelInv)).toVar();

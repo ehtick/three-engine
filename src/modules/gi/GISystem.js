@@ -1765,7 +1765,7 @@ export class GISystem {
       traceDda:
         globalThis.__giLightShadowSphere === true
           ? null
-          : (origin, dir, maxT, k) => {
+          : (origin, dir, maxT, k, receiverP = null) => {
               // tMin one voxel: the lifted origin can still clip its own
               // surface's SAT-bulged voxel on curved geometry, and a DDA
               // first-voxel hit is a hard black dot. One voxel along the ray
@@ -1805,6 +1805,14 @@ export class GISystem {
                   exact: shadowMode === RayHitMode.HybridExactComplex,
                   penumbraK: k,
                   macroSteps,
+                  // ORIGIN-PLANE EXCLUSION: the receiving surface point. The
+                  // march skips accepts/cone contributions whose plane
+                  // contains it — the receiver's own SAT-bulged staircase
+                  // cells re-fit exactly that plane, and each tooth used to
+                  // stamp a teardrop self-shadow phantom on tilted receivers.
+                  // `__giNoSelfPlaneExclusion = true` restores the old arm
+                  // (build-time A/B like every hatch here).
+                  excludePoint: globalThis.__giNoSelfPlaneExclusion === true ? null : receiverP,
                 });
                 if (globalThis.__giShadowKindDebug === true) {
                   // VERDICT-KIND MAP instead of a shadow: the channel paints
