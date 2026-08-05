@@ -210,8 +210,15 @@
           if (dynamicAlloc.dynamicOverflowBricks) {
             throw new Error(`dynamic arm: tail overflowed on ${dynamicAlloc.dynamicOverflowBricks} bricks in a tiny scene`);
           }
+          // Exact mode: the mover's corner/edge cells fail the simple fit and
+          // must claim DYNAMIC triangle ranges — a zero here means rotated
+          // movers still cast voxel-box silhouettes.
+          if (exactMode && !dynamicAlloc.dynamicTriangles) {
+            throw new Error("dynamic arm: no dynamic exact triangles claimed for the mover's edge cells");
+          }
           console.log(
-            `GI-SMOKE DYNAMIC tail=${dynamicAlloc.dynamicAllocated}/${dynamicAlloc.dynamicCapacity} overflow=0`,
+            `GI-SMOKE DYNAMIC tail=${dynamicAlloc.dynamicAllocated}/${dynamicAlloc.dynamicCapacity} ` +
+            `dynTris=${dynamicAlloc.dynamicTriangles ?? 0}/${dynamicAlloc.dynamicTriangleCapacity ?? 0} overflow=0`,
           );
         }
         if (lightShadowArm) {

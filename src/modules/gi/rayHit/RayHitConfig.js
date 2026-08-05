@@ -43,22 +43,29 @@ export function rayHitModeName(mode) {
 /**
  * `rayHitMode: "auto"` — the mode follows the QUALITY PRESET, which is the
  * right default because the ladder's whole trade is memory/cost vs hit
- * precision and that is exactly what the presets already arbitrate (the user
- * eyeballed all four on their scene and could not tell them apart in a still
- * — the differences live in silhouettes and temporal stability, which scale
- * with everything else the preset scales). `custom` (or any unknown quality)
- * lands on plane-coverage: measured FREE on the real scene (session 23b,
- * −1%) with the silhouette/stability win, so it is the sweet spot.
+ * precision and that is exactly what the presets already arbitrate.
+ *
+ * high/custom land on EXACT-COMPLEX, not plane-coverage. The original
+ * "can't tell the modes apart in a still" evaluation predates the record
+ * march: with shadows resolved through the records, the difference is
+ * exactly where a still shows it — a non-axis-aligned caster's silhouette
+ * cells contain an EDGE (two faces), which fails the simple-plane fit, and
+ * without a triangle pool every such cell falls back to occupied-box hits.
+ * That quantized every rotated cube's and every trim/arch edge's shadow to
+ * full voxels while the flat-face interiors stayed sub-voxel exact. The
+ * triangle pool's memory cost (~2 tris x 36 B per failed-fit cell) is the
+ * price of correct silhouettes and the presets that can afford it pay it;
+ * low/medium keep the lean modes.
  */
 const AUTO_MODE_BY_QUALITY = Object.freeze({
   low: RayHitMode.HybridBrickBox,
   medium: RayHitMode.HybridPlane,
-  high: RayHitMode.HybridPlaneCoverage,
+  high: RayHitMode.HybridExactComplex,
   ultra: RayHitMode.HybridExactComplex,
 });
 
 export function resolveAutoRayHitMode(quality) {
-  return AUTO_MODE_BY_QUALITY[String(quality ?? "").toLowerCase()] ?? RayHitMode.HybridPlaneCoverage;
+  return AUTO_MODE_BY_QUALITY[String(quality ?? "").toLowerCase()] ?? RayHitMode.HybridExactComplex;
 }
 
 /**

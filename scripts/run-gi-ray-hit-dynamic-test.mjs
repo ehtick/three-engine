@@ -55,37 +55,87 @@ const quad = (a, b, c, d) => [[a, b, c], [a, c, d]];
 const STATIC_CAPACITY = 4096;
 const DYNAMIC_CAPACITY = 512;
 
+const STATIC_TRI_CAPACITY = 4096;
+const DYNAMIC_TRI_CAPACITY = 1024;
+
 /**
  * Full CPU mirror of one GPU dispatch: static build once, then a merged
  * re-type + dynamic refit for the mover's CURRENT triangles. Returns
- * everything a trace needs plus the build diagnostics.
+ * everything a trace needs plus the build diagnostics. `complex: true`
+ * mirrors exact-complex mode: one flat absolute-offset triangle pool shared
+ * by the static build ([0, STATIC_TRI_CAPACITY)) and the dynamic tail slice
+ * after it.
  */
 const buildFrame = (resolution, staticTriangles, moverTriangles, {
   dynamicCapacity = DYNAMIC_CAPACITY,
+  complex = false,
 } = {}) => {
   const staticOccupied = voxelize(resolution, staticTriangles);
   const staticPred = (x, y, z) => staticOccupied.has(`${x},${y},${z}`);
   const { layout, words } = buildHybridBrickWords(resolution, staticPred);
   const staticBuild = buildSurfaceRecordsCpu(resolution, words, layout, staticTriangles, {
     capacity: STATIC_CAPACITY,
+    triangleCapacity: STATIC_TRI_CAPACITY,
   });
   const moverOccupied = voxelize(resolution, moverTriangles);
   const mergedPred = (x, y, z) => staticPred(x, y, z) || moverOccupied.has(`${x},${y},${z}`);
   updateHybridBrickWordsCpu(resolution, words, layout, mergedPred, staticPred);
   const records = new Uint32Array((STATIC_CAPACITY + dynamicCapacity) * SURFACE_RECORD_WORDS);
   records.set(staticBuild.records);
+  let trianglePool = null;
+  if (complex) {
+    trianglePool = new Float32Array((STATIC_TRI_CAPACITY + DYNAMIC_TRI_CAPACITY) * 9);
+    trianglePool.set(staticBuild.trianglePool);
+  }
   const dynamicBuild = buildDynamicSurfaceRecordsCpu(resolution, words, layout, moverTriangles, {
     dynamicBase: STATIC_CAPACITY,
     dynamicCapacity,
     records,
+    ...(complex
+      ? { complexPool: { base: STATIC_TRI_CAPACITY, capacity: DYNAMIC_TRI_CAPACITY, pool: trianglePool } }
+      : {}),
   });
-  return { layout, words, records, staticBuild, dynamicBuild, staticOccupied, moverOccupied };
+  return { layout, words, records, trianglePool, staticBuild, dynamicBuild, staticOccupied, moverOccupied };
 };
 
 const trace = (frame, resolution, origin, direction, opts = {}) => traceHybridPlaneCpu(
   origin, direction, resolution, frame.words, frame.layout, frame.records,
-  { tMax: 32, coverage: true, ...opts },
+  {
+    tMax: 32, coverage: true,
+    ...(frame.trianglePool ? { exactComplex: true, trianglePool: frame.trianglePool } : {}),
+    ...opts,
+  },
 );
+
+// Double-precision Möller-Trumbore for exact silhouette references.
+const exactHit = (origin, direction, triangles) => {
+  let best = Infinity;
+  for (const [a, b, c] of triangles) {
+    const e1 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    const e2 = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+    const p = [
+      direction[1] * e2[2] - direction[2] * e2[1],
+      direction[2] * e2[0] - direction[0] * e2[2],
+      direction[0] * e2[1] - direction[1] * e2[0],
+    ];
+    const det = e1[0] * p[0] + e1[1] * p[1] + e1[2] * p[2];
+    if (Math.abs(det) < 1e-12) continue;
+    const inv = 1 / det;
+    const s = [origin[0] - a[0], origin[1] - a[1], origin[2] - a[2]];
+    const u = (s[0] * p[0] + s[1] * p[1] + s[2] * p[2]) * inv;
+    if (u < 0 || u > 1) continue;
+    const q = [
+      s[1] * e1[2] - s[2] * e1[1],
+      s[2] * e1[0] - s[0] * e1[2],
+      s[0] * e1[1] - s[1] * e1[0],
+    ];
+    const v = (direction[0] * q[0] + direction[1] * q[1] + direction[2] * q[2]) * inv;
+    if (v < 0 || u + v > 1) continue;
+    const t = (e2[0] * q[0] + e2[1] * q[1] + e2[2] * q[2]) * inv;
+    if (t > 1e-6 && t < best) best = t;
+  }
+  return best;
+};
 
 // ---------------------------------------------------------------------------
 // Scene: static floor quad at y = 3.25 across the volume; the MOVER is an
@@ -216,6 +266,97 @@ const moverTris = quad([5, 8.25, 5], [11, 8.25, 5], [11, 8.25, 11], [5, 8.25, 11
     : 0;
   check("tilted mover normal follows the geometry (not a voxel face)",
     hit.hit && Math.abs(alignment) > 0.999, `n=${hit.normal}`);
+}
+
+// ---------------------------------------------------------------------------
+// ROTATED mover cube in exact mode — the class the dynamic triangle tail
+// exists for: the silhouette (as seen along the ray) is formed by EDGE cells
+// holding two faces, which fail the simple fit; without exact triangles they
+// box-fall-back and quantize the shadow outline to full voxels.
+const rotatedBox = (center, half, ry, rx) => {
+  const cy = Math.cos(ry), sy = Math.sin(ry);
+  const cx = Math.cos(rx), sx = Math.sin(rx);
+  const corners = [];
+  for (const dz of [0, 1]) {
+    for (const dy of [0, 1]) {
+      for (const dx of [0, 1]) {
+        let x = (dx * 2 - 1) * half, y = (dy * 2 - 1) * half, z = (dz * 2 - 1) * half;
+        [x, z] = [x * cy + z * sy, -x * sy + z * cy];
+        [y, z] = [y * cx - z * sx, y * sx + z * cx];
+        corners.push([center[0] + x, center[1] + y, center[2] + z]);
+      }
+    }
+  }
+  const idx = (dx, dy, dz) => dz * 4 + dy * 2 + dx;
+  const quads = [
+    [idx(0, 0, 0), idx(1, 0, 0), idx(1, 1, 0), idx(0, 1, 0)],
+    [idx(1, 0, 1), idx(0, 0, 1), idx(0, 1, 1), idx(1, 1, 1)],
+    [idx(0, 0, 1), idx(0, 0, 0), idx(0, 1, 0), idx(0, 1, 1)],
+    [idx(1, 0, 0), idx(1, 0, 1), idx(1, 1, 1), idx(1, 1, 0)],
+    [idx(0, 1, 0), idx(1, 1, 0), idx(1, 1, 1), idx(0, 1, 1)],
+    [idx(0, 0, 1), idx(1, 0, 1), idx(1, 0, 0), idx(0, 0, 0)],
+  ];
+  const tris = [];
+  for (const [a, b, c, d] of quads) {
+    tris.push([corners[a], corners[b], corners[c]], [corners[a], corners[c], corners[d]]);
+  }
+  return tris;
+};
+{
+  const box = rotatedBox([8, 8, 8], 1.5, 0.6, 0.4);
+  const frame = buildFrame(resolution, floorTris, box, { complex: true });
+  check("rotated mover reserves dynamic exact triangles",
+    frame.dynamicBuild.dynamicTriangles > 0 && frame.dynamicBuild.complexOverflowCells === 0,
+    `tris=${frame.dynamicBuild.dynamicTriangles}, complexCells=${frame.dynamicBuild.complexCells}`);
+
+  // The box-arm control: strip the dynamic offsets so every mover brick keeps
+  // voxel-box semantics — the pre-feature state.
+  const stripped = frame.words.slice();
+  for (let macro = 0; macro < frame.layout.macroCellCount; macro++) {
+    stripped[brickHeaderWord(frame.layout, macro, BRICK_DYNAMIC_OFFSET_WORD)] = INVALID_RAY_HIT_INDEX;
+  }
+
+  // Sun-style down-ray sweep across the footprint, judged against
+  // double-precision triangle intersection. Silhouette metric: rays the real
+  // geometry MISSES must sail past the mover and reach the floor (t = 9.75);
+  // any that get stopped are silhouette FATTENING. Hit rays must land close.
+  let hitErrMax = 0;
+  let hitMissed = 0;
+  let boxKindHits = 0;
+  let triangleKindHits = 0;
+  let missCount = 0;
+  let fattenedExact = 0;
+  let fattenedBox = 0;
+  for (let ix = 0; ix <= 40; ix++) {
+    for (let iz = 0; iz <= 40; iz++) {
+      const origin = [5 + (6 * ix) / 40, 13, 5 + (6 * iz) / 40];
+      const dir = [0, -1, 0];
+      const exact = exactHit(origin, dir, box);
+      const hit = trace(frame, resolution, origin, dir);
+      if (Number.isFinite(exact)) {
+        if (!hit.hit) { hitMissed++; continue; }
+        hitErrMax = Math.max(hitErrMax, Math.abs(hit.t - exact));
+        if (hit.kind === "box") boxKindHits++;
+        if (hit.kind === "triangles") triangleKindHits++;
+      } else {
+        missCount++;
+        if (!(hit.hit && Math.abs(hit.t - 9.75) < 0.05)) fattenedExact++;
+        const boxHit = traceHybridPlaneCpu(
+          origin, dir, resolution, stripped, frame.layout, frame.records,
+          { tMax: 32, coverage: true },
+        );
+        if (!(boxHit.hit && Math.abs(boxHit.t - 9.75) < 0.05)) fattenedBox++;
+      }
+    }
+  }
+  check("rotated mover blocked rays never miss", hitMissed === 0, `missed=${hitMissed}`);
+  check("rotated mover hits are geometry-exact (edge cells included)", hitErrMax < 0.06,
+    `maxErr=${hitErrMax.toFixed(4)} voxels`);
+  check("no mover cell degrades to box in exact mode", boxKindHits === 0, `boxKinds=${boxKindHits}`);
+  check("edge cells resolve via exact triangles", triangleKindHits > 0, `triangleHits=${triangleKindHits}`);
+  check("silhouette fattening collapses vs the box arm",
+    fattenedBox > 0 && fattenedExact <= Math.ceil(fattenedBox * 0.35),
+    `exact=${fattenedExact} vs box=${fattenedBox} of ${missCount} miss rays`);
 }
 
 // ---------------------------------------------------------------------------

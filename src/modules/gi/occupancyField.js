@@ -244,6 +244,17 @@ export function createOccupancyField(bounds, res0, options = {}) {
         options.dynamicSurfaceRecordCapacity ?? Math.ceil(surfaceCapacity / 16)))
     : 0;
   const totalSurfaceCapacity = surfaceCapacity + dynamicSurfaceCapacity;
+  // The dynamic tail's own slice of the triangle pool, refit per chain like
+  // the records. A mover's SILHOUETTE cells (as seen from a light) contain
+  // its EDGES — two faces per cell, which fail the simple-plane fit — so
+  // without exact triangles every rotated mover's shadow quantizes to full
+  // voxels along precisely the cells that define its outline. Same one-
+  // dispatch lifetime and overflow-degrades-to-box contract as the records.
+  const dynamicComplexTriangleCapacity = complexEnabled
+    ? Math.min(1 << 17, Math.max(1 << 10,
+        options.dynamicComplexTriangleCapacity ?? dynamicSurfaceCapacity * 2))
+    : 0;
+  const totalComplexTriangleCapacity = complexTriangleCapacity + dynamicComplexTriangleCapacity;
   // Phase 5: the conservative pyramid ride (levels 3-4) has been ALWAYS-ON
   // since Phase 1, so its cost/benefit was never isolable. This is the A/B
   // kill switch, default on: disabled the traces start at level 2 and the
@@ -287,7 +298,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
   // covers both without a second base.
   const trianglePoolWordOffset = surfaceWordOffset + totalSurfaceCapacity * SURFACE_RECORD_WORDS;
   const bits = instancedArray(new Uint32Array(
-    trianglePoolWordOffset + complexTriangleCapacity * COMPLEX_TRIANGLE_WORDS,
+    trianglePoolWordOffset + totalComplexTriangleCapacity * COMPLEX_TRIANGLE_WORDS,
   ), "uint");
   const atomicBits = instancedArray(new Uint32Array(level0.words), "uint").toAtomic();
   // Phase-1 macrocell/brick records, the Phase-2 surface-record pool and the
@@ -446,7 +457,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
     bytes: (
       totalWords + level0.words + (hybridEnabled ? hybridLayout.totalWords : 0) +
       totalSurfaceCapacity * (SURFACE_RECORD_WORDS + SURFACE_SCRATCH_WORDS) +
-      complexTriangleCapacity * COMPLEX_TRIANGLE_WORDS
+      totalComplexTriangleCapacity * COMPLEX_TRIANGLE_WORDS
     ) * 4,
     surfaceCapacity,
     dynamicSurfaceCapacity,
@@ -1166,7 +1177,13 @@ export function createOccupancyField(bounds, res0, options = {}) {
    * body on the normal would have hidden exactly those cells from the complex
    * path.
    */
-  const makeSurfFinalizeCompute = (baseRecord, recordCount, allowComplex) => Fn(() => {
+  // `complex` targets one slice of the triangle pool: null disables complex
+  // reservation entirely; otherwise {cursor, overflow} name the surfAlloc
+  // words and {poolBase, poolCapacity} the slice — the static finalize claims
+  // [0, complexTriangleCapacity), the dynamic one the tail after it, and the
+  // packed range carries the ABSOLUTE pool offset so the write pass and the
+  // tracer need no per-slice arithmetic.
+  const makeSurfFinalizeCompute = (baseRecord, recordCount, complex) => Fn(() => {
         const record = baseRecord === 0
           ? instanceIndex.toVar()
           : instanceIndex.add(uint(baseRecord)).toVar();
@@ -1248,7 +1265,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
               simpleTaken.assign(1);
             });
           });
-          if (allowComplex) {
+          if (complex) {
             // Reserve, never write: the pool cursor is claimed here so the
             // range is known before the geometry pass runs, and word 6 (the
             // overlap count this thread just read) is reset to 0 so that pass
@@ -1257,23 +1274,23 @@ export function createOccupancyField(bounds, res0, options = {}) {
             If(simpleTaken.lessThan(0.5).and(count.greaterThan(int(0))), () => {
               If(count.lessThanEqual(int(MAX_COMPLEX_TRIANGLES)), () => {
                 const triCount = count.toUint().toVar();
-                const base = atomicAdd(surfAlloc.element(2), triCount).toVar();
-                If(base.add(triCount).lessThanEqual(uint(complexTriangleCapacity)), () => {
+                const base = atomicAdd(surfAlloc.element(complex.cursor), triCount).toVar();
+                If(base.add(triCount).lessThanEqual(uint(complex.poolCapacity)), () => {
                   packedMaterial.assign(bitOr(
-                    bitAnd(base, uint(COMPLEX_RANGE_OFFSET_MASK)),
+                    bitAnd(uint(complex.poolBase).add(base), uint(COMPLEX_RANGE_OFFSET_MASK)),
                     shiftLeft(triCount, uint(COMPLEX_RANGE_COUNT_SHIFT)),
                   ));
                   packedFlags.assign(shiftLeft(uint(SURFACE_FLAG_COMPLEX), uint(COVERAGE_FLAGS_SHIFT)));
                   atomicStore(surfScratch.element(sBase.add(uint(6))), int(0));
                 }).Else(() => {
                   // Pool exhausted → the record stays zero, i.e. occupied box.
-                  atomicAdd(surfAlloc.element(3), uint(1));
+                  atomicAdd(surfAlloc.element(complex.overflow), uint(1));
                 });
               }).Else(() => {
                 // More triangles than the packed count field can address —
                 // counted as an overflow cell like the CPU mirror does, so the
                 // two report the same "how many cells fell back" number.
-                atomicAdd(surfAlloc.element(3), uint(1));
+                atomicAdd(surfAlloc.element(complex.overflow), uint(1));
               });
             });
           }
@@ -1284,34 +1301,45 @@ export function createOccupancyField(bounds, res0, options = {}) {
         bits.element(rBase.add(uint(3))).assign(packedFlags);
       })().compute(recordCount);
   const surfFinalizeCompute = surfaceEnabled
-    ? makeSurfFinalizeCompute(0, surfaceCapacity, complexEnabled)
+    ? makeSurfFinalizeCompute(0, surfaceCapacity, complexEnabled
+        ? { cursor: 2, overflow: 3, poolBase: 0, poolCapacity: complexTriangleCapacity }
+        : null)
     : null;
-  // Dynamic-tail finalize: same classification, but a dynamic record that
-  // fails the simple fit stays zero (box fallback for that cell) instead of
-  // reserving a complex triangle range — the triangle pool and its write pass
-  // are full-chain machinery, and a mover cell dense enough to need exact
-  // triangles is not worth re-writing the pool every frame for.
+  // Dynamic-tail finalize: same classification. In exact mode a dynamic
+  // record that fails the simple fit reserves a range in the DYNAMIC slice of
+  // the triangle pool (per-chain cursor, same one-dispatch lifetime as the
+  // records) — a mover's silhouette cells are edge cells, so without this
+  // every rotated mover's shadow outline stayed voxel-box. Without a pool
+  // (plane modes) the failed fit stays zero = box.
   const dynSurfFinalizeCompute = surfaceEnabled
-    ? makeSurfFinalizeCompute(surfaceCapacity, dynamicSurfaceCapacity, false)
+    ? makeSurfFinalizeCompute(surfaceCapacity, dynamicSurfaceCapacity, complexEnabled
+        ? { cursor: 6, overflow: 7, poolBase: complexTriangleCapacity, poolCapacity: dynamicComplexTriangleCapacity }
+        : null)
     : null;
 
   /**
    * Phase-4 geometry pass: fills every reserved triangle range with the
    * CELL-LOCAL vertices of the triangles that overlap that cell, f32-bitcast,
-   * 9 words each. Structurally the accumulate pass — same static-slot filter,
-   * same degenerate-triangle rejection, same SAT and chunk loop — because the
+   * 9 words each. Structurally the accumulate pass — same slot filter, same
+   * degenerate-triangle rejection, same SAT and chunk loop — because the
    * two must agree EXACTLY on which (triangle, cell) pairs exist: finalize
    * sized the range from the accumulate pass's overlap count, so a pair that
    * only one pass admits would either overrun the range or leave a stale
    * triangle in it, and a short list reads as an exact MISS (the ray keeps
    * marching) rather than a conservative hit.
    *
+   * `filter` mirrors buildSurfAccumCompute's: the "dynamic" variant fills the
+   * dynamic tail's ranges each chain (ranges carry ABSOLUTE pool offsets, so
+   * the write arithmetic is identical — only the slot gate, the offset word
+   * and the record bound differ).
+   *
    * A BUILDER like buildSurfAccumCompute: it closes over the geometry buffers.
    */
   const buildComplexWriteCompute = complexEnabled
-    ? () => Fn(() => {
+    ? (filter = "static") => Fn(() => {
         const slot = pairSlot.element(instanceIndex).toVar();
-        If(slotDynamic.element(slot.toInt()).notEqual(float(0)), () => {
+        const want = filter === "dynamic" ? 1 : 0;
+        If(slotDynamic.element(slot.toInt()).notEqual(float(want)), () => {
           Return();
         });
         const tri = pairTri.element(instanceIndex).toVar();
@@ -1364,7 +1392,10 @@ export function createOccupancyField(bounds, res0, options = {}) {
                 .mul(uint(hybridLayout.macroResolution.x)).add(mxq).toVar();
               const brickBase = uint(hybridWordOffset + hybridLayout.brickHeaderOffset)
                 .add(macroIndex.mul(uint(BRICK_HEADER_WORDS))).toVar();
-              const surfOffset = bits.element(brickBase.add(uint(BRICK_SURFACE_OFFSET_WORD))).toVar();
+              const offsetWord = filter === "dynamic"
+                ? BRICK_DYNAMIC_OFFSET_WORD
+                : BRICK_SURFACE_OFFSET_WORD;
+              const surfOffset = bits.element(brickBase.add(uint(offsetWord))).toVar();
               If(surfOffset.notEqual(uint(INVALID_RAY_HIT_INDEX)), () => {
                 const low = bits.element(brickBase.add(uint(BRICK_OCCUPANCY_LOW_WORD))).toVar();
                 const high = bits.element(brickBase.add(uint(BRICK_OCCUPANCY_HIGH_WORD))).toVar();
@@ -1380,7 +1411,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
                   const belowHigh = select(inLow, uint(0), shiftLeft(uint(1), bitAnd(bitIdx, uint(31))).sub(uint(1)));
                   const rank = countOneBits(bitAnd(low, belowLow)).add(countOneBits(bitAnd(high, belowHigh)));
                   const record = surfOffset.add(rank).toVar();
-                  If(record.lessThan(uint(surfaceCapacity)), () => {
+                  If(record.lessThan(uint(totalSurfaceCapacity)), () => {
                     const rBase = uint(surfaceWordOffset)
                       .add(record.mul(uint(SURFACE_RECORD_WORDS))).toVar();
                     const flagsWord = bits.element(rBase.add(uint(3))).toVar();
@@ -1447,14 +1478,15 @@ export function createOccupancyField(bounds, res0, options = {}) {
   // is no staleness to invalidate. Cost scales with the DynamicBrick set
   // (the mover's own footprint), not the scene.
 
-  /** Zero the dynamic tail's fit scratch and its allocator words. */
+  /** Zero the dynamic tail's fit scratch and its allocator words
+   *  [dynRecordNext, dynOverflowBricks, dynTriangleNext, dynComplexOverflow]. */
   const dynSurfClearCompute = surfaceEnabled
     ? Fn(() => {
         atomicStore(
           surfScratch.element(instanceIndex.add(uint(surfaceCapacity * SURFACE_SCRATCH_WORDS))),
           int(0),
         );
-        If(instanceIndex.lessThan(uint(2)), () => {
+        If(instanceIndex.lessThan(uint(4)), () => {
           atomicStore(surfAlloc.element(instanceIndex.add(uint(4))), uint(0));
         });
       })().compute(dynamicSurfaceCapacity * SURFACE_SCRATCH_WORDS)
@@ -3344,6 +3376,10 @@ export function createOccupancyField(bounds, res0, options = {}) {
           ? [
               dynSurfClearCompute, dynSurfAllocCompute,
               buildSurfAccumCompute("dynamic"), dynSurfFinalizeCompute,
+              // Exact mode: the dynamic finalize reserved tail triangle
+              // ranges; this fills them — mover edge cells resolve to real
+              // triangles instead of boxes.
+              ...(buildComplexWriteCompute ? [buildComplexWriteCompute("dynamic")] : []),
             ]
           : [];
         computes = {
@@ -3395,9 +3431,10 @@ export function createOccupancyField(bounds, res0, options = {}) {
     rayHitDebug,
     /**
      * Pool allocator readback [recordNext, overflowBricks, triangleNext,
-     * complexOverflowCells, dynRecordNext, dynOverflowBricks] — diagnostics
-     * only. The dynamic pair describes the LAST chain (the tail cursor resets
-     * every dispatch), so with a mover live it is that frame's refit demand.
+     * complexOverflowCells, dynRecordNext, dynOverflowBricks, dynTriangleNext,
+     * dynComplexOverflowCells] — diagnostics only. The dynamic quads describe
+     * the LAST chain (the tail cursors reset every dispatch), so with a mover
+     * live they are that frame's refit demand.
      */
     async readbackSurfaceAlloc(renderer) {
       if (!surfAlloc) return null;
@@ -3412,6 +3449,9 @@ export function createOccupancyField(bounds, res0, options = {}) {
         dynamicAllocated: data[4] ?? 0,
         dynamicOverflowBricks: data[5] ?? 0,
         dynamicCapacity: dynamicSurfaceCapacity,
+        dynamicTriangles: data[6] ?? 0,
+        dynamicComplexOverflowCells: data[7] ?? 0,
+        dynamicTriangleCapacity: dynamicComplexTriangleCapacity,
       };
     },
     occupiedAtWorld,

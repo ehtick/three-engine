@@ -1167,6 +1167,13 @@ export function updateHybridBrickWordsCpu(resolution, words, layout, occupied, s
  * no staleness to carry. Returns absolute record ids offset by `dynamicBase`
  * (= the static pool's capacity), matching the offsets written into
  * BRICK_DYNAMIC_OFFSET_WORD.
+ *
+ * With `complexPool` set ({base, capacity, pool}), a dynamic record that
+ * fails the simple fit takes an exact cell-local triangle range in the
+ * DYNAMIC slice of the triangle pool (absolute offsets, mirroring the GPU
+ * finalize/write pair) — the mover-silhouette edge cells this exists for.
+ * `pool` is one flat Float32Array indexed absolutely, shared with the static
+ * builder's triangles.
  */
 export function buildDynamicSurfaceRecordsCpu(resolution, words, layout, triangles, {
   dynamicBase,
@@ -1175,6 +1182,8 @@ export function buildDynamicSurfaceRecordsCpu(resolution, words, layout, triangl
   maxTriangles = SIMPLE_MAX_TRIANGLES,
   minCoherence = SIMPLE_MIN_COHERENCE,
   maxPlaneSigma = SIMPLE_MAX_PLANE_SIGMA,
+  maxComplexTriangles = MAX_COMPLEX_TRIANGLES,
+  complexPool = null,
 } = {}) {
   if (records === null) {
     records = new Uint32Array((dynamicBase + dynamicCapacity) * SURFACE_RECORD_WORDS);
@@ -1217,6 +1226,8 @@ export function buildDynamicSurfaceRecordsCpu(resolution, words, layout, triangl
   const acc = new Float64Array(next * 6); // nx ny nz w d d2
   const counts = new Uint32Array(next);
   const cov = new Uint32Array(next * 3);
+  const origins = new Int32Array(next * 3);
+  const triangleLists = new Map();
   const recordIndexOf = (x, y, z) => {
     const mx = Math.floor(x / BRICK_RESOLUTION);
     const my = Math.floor(y / BRICK_RESOLUTION);
@@ -1233,7 +1244,8 @@ export function buildDynamicSurfaceRecordsCpu(resolution, words, layout, triangl
   };
 
   const h = 0.5 + 1e-4; // the voxelizer's conservative half extent
-  for (const [a, b, c] of triangles) {
+  for (let triangleIndex = 0; triangleIndex < triangles.length; triangleIndex++) {
+    const [a, b, c] = triangles[triangleIndex];
     const n = v3cross(v3sub(b, a), v3sub(c, a));
     const len = Math.hypot(n[0], n[1], n[2]);
     if (!(len > 1e-12)) continue; // degenerate: no plane information
@@ -1250,6 +1262,12 @@ export function buildDynamicSurfaceRecordsCpu(resolution, words, layout, triangl
           if (!triBoxOverlapCpu([x + 0.5, y + 0.5, z + 0.5], h, a, b, c)) continue;
           const record = recordIndexOf(x, y, z);
           if (record < 0) continue;
+          origins[record * 3] = x;
+          origins[record * 3 + 1] = y;
+          origins[record * 3 + 2] = z;
+          let list = triangleLists.get(record);
+          if (list === undefined) triangleLists.set(record, list = []);
+          if (list.length <= maxComplexTriangles) list.push(triangleIndex);
           const localA = v3sub(a, [x, y, z]);
           const localB = v3sub(b, [x, y, z]);
           const localC = v3sub(c, [x, y, z]);
@@ -1278,14 +1296,55 @@ export function buildDynamicSurfaceRecordsCpu(resolution, words, layout, triangl
     }
   }
 
-  // --- pass 3: finalize, simple-plane only.
+  // --- pass 3: finalize. Simple planes pack as usual; with a complex pool
+  // slice available, a failed fit emits an exact triangle range instead of
+  // staying box (mirrors the GPU dynamic finalize + write pair).
   let simpleCells = 0;
   let unfittedCells = 0;
+  let complexCells = 0;
+  let poolTriangles = 0;
+  let complexOverflowCells = 0;
+  const countLimit = Math.min(maxComplexTriangles, COMPLEX_RANGE_COUNT_MASK);
+  const emitComplex = (local) => {
+    if (!complexPool) { unfittedCells++; return; }
+    const list = triangleLists.get(local);
+    if (list === undefined || list.length === 0) { unfittedCells++; return; }
+    if (list.length > countLimit || poolTriangles + list.length > complexPool.capacity) {
+      complexOverflowCells++;
+      unfittedCells++;
+      return;
+    }
+    const originX = origins[local * 3];
+    const originY = origins[local * 3 + 1];
+    const originZ = origins[local * 3 + 2];
+    const absoluteOffset = complexPool.base + poolTriangles;
+    for (let index = 0; index < list.length; index++) {
+      const [a, b, c] = triangles[list[index]];
+      const word = (absoluteOffset + index) * COMPLEX_TRIANGLE_WORDS;
+      complexPool.pool[word] = a[0] - originX;
+      complexPool.pool[word + 1] = a[1] - originY;
+      complexPool.pool[word + 2] = a[2] - originZ;
+      complexPool.pool[word + 3] = b[0] - originX;
+      complexPool.pool[word + 4] = b[1] - originY;
+      complexPool.pool[word + 5] = b[2] - originZ;
+      complexPool.pool[word + 6] = c[0] - originX;
+      complexPool.pool[word + 7] = c[1] - originY;
+      complexPool.pool[word + 8] = c[2] - originZ;
+    }
+    const base = (dynamicBase + local) * SURFACE_RECORD_WORDS;
+    records[base + SURFACE_MATERIAL_ID_WORD] = packComplexRange(absoluteOffset, list.length);
+    records[base + SURFACE_FLAGS_WORD] = packCoverageRecord({
+      mask: 0, axis: 0, valid: false, flags: SURFACE_FLAG_COMPLEX,
+    });
+    poolTriangles += list.length;
+    complexCells++;
+  };
   for (let local = 0; local < next; local++) {
     const base = local * 6;
     const weight = acc[base + 3];
     const sumLen = weight > 0 ? Math.hypot(acc[base], acc[base + 1], acc[base + 2]) : 0;
-    if (!(weight > 0) || !(sumLen > 1e-6)) { unfittedCells++; continue; }
+    if (!(weight > 0)) { unfittedCells++; continue; }
+    if (!(sumLen > 1e-6)) { emitComplex(local); continue; }
     const coherence = sumLen / weight;
     const nhat = [acc[base] / sumLen, acc[base + 1] / sumLen, acc[base + 2] / sumLen];
     const dhat = acc[base + 4] / weight;
@@ -1298,7 +1357,7 @@ export function buildDynamicSurfaceRecordsCpu(resolution, words, layout, triangl
       coherence >= minCoherence &&
       sigma <= maxPlaneSigma &&
       planeInCell;
-    if (!simple) { unfittedCells++; continue; }
+    if (!simple) { emitComplex(local); continue; }
     simpleCells++;
     const axis = dominantAxis(nhat);
     const mask = cov[local * 3 + axis] & 0xffff;
@@ -1313,7 +1372,10 @@ export function buildDynamicSurfaceRecordsCpu(resolution, words, layout, triangl
     records.set(packed, (dynamicBase + local) * SURFACE_RECORD_WORDS);
   }
 
-  return { records, allocated: next, overflowBricks, simpleCells, unfittedCells };
+  return {
+    records, allocated: next, overflowBricks, simpleCells, unfittedCells,
+    complexCells, dynamicTriangles: poolTriangles, complexOverflowCells,
+  };
 }
 
 /** Barycentric slack, mirroring the exact validator: shared edges stay sealed

@@ -120,13 +120,23 @@ const result = await page.evaluate(async () => {
     if (system?.state?.volume?.occupancyField) break;
   }
   if (!system?.state) return { error: "GI never built" };
-  await new Promise((r) => setTimeout(r, 2500));
 
   const { volume } = system.state;
   const field = volume.occupancyField;
   if (!field) return { error: "occupancy field missing — volume.occupancyField is null (storage-buffer gate?)" };
 
-  const reader = await field.readbackBits(engine.renderer);
+  // Poll until the field actually POPULATED, don't assume a settle time: the
+  // spawn-blink guard holds the whole pyramid chain back until every compute
+  // pipeline has compiled, and the compile wave's length scales with the
+  // kernel count (exact-complex + the dynamic-refit chain pushed it past the
+  // old fixed 2.5s wait, which then read back an all-zero field and reported
+  // five phantom FAILs with no error anywhere).
+  let reader = null;
+  for (let i = 0; i < 30; i++) {
+    reader = await field.readbackBits(engine.renderer);
+    if (field.stats.occupiedVoxels > 0) break;
+    await new Promise((r) => setTimeout(r, 2500));
+  }
   const L0 = reader.levels[0];
 
   // ── 1. CONSERVATIVE: sample points ON each wall plane; every one must land
