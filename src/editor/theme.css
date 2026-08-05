@@ -9217,58 +9217,227 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
 }
 
 /* ===========================================================================
-   Texture Editor (Window ▸ Texture Editor)
-   Three columns: a tool rail, the canvas with its option strip, and layers.
-   The canvas is the only element with a dark neutral surface — everything a
-   painting sits on has to be colour-neutral or it biases what the artist mixes.
+   Texture Editor — paint, atlas and their dialogs.
+
+   One rhythm throughout: 26px controls, 6px gaps, 10px padding, and a fixed
+   label column so every control in a column lines up with the one above it.
+   Chrome is icon-first; text appears only where an icon would be a guess —
+   menu names, the file name, values.
    =========================================================================== */
 
-.texture-editor {
+.texture-editor,
+.atlas-editor {
+  --tx-control: 26px;
+  --tx-gap: 6px;
+  --tx-pad: 10px;
+  --tx-label: 11px;
+}
+
+/* ---------- shell ---------- */
+
+.texture-modes {
   display: flex;
   flex-direction: column;
   height: 100%;
   min-height: 0;
-  background: var(--bg-1);
-  outline: none;
+  position: relative;
 }
 
-.texture-toolbar .toolbar-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-}
-
-.toolbar-sep {
-  width: 1px;
-  height: 16px;
-  background: var(--border);
-  margin: 0 3px;
-}
-
-.texture-title {
-  margin-left: auto;
-  color: var(--text-dim);
-  font-size: 11.5px;
-  padding-right: 4px;
-}
-
-.texture-warning {
+.texture-mode-tabs {
   display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 7px 10px;
-  font-size: 11.5px;
-  color: var(--warn);
-  background: rgba(226, 163, 60, 0.09);
+  gap: 2px;
+  padding: 6px 8px 0;
+  background: var(--bg-1);
   border-bottom: 1px solid var(--border);
-}
-
-.texture-warning .toolbar-btn {
-  margin-left: auto;
   flex-shrink: 0;
 }
 
-.texture-body {
+.texture-mode-tabs button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 11.5px;
+  font-weight: 500;
+  padding: 6px 12px;
+  border-radius: 7px 7px 0 0;
+  cursor: pointer;
+  transition: background-color 0.12s var(--ease), color 0.12s var(--ease);
+}
+
+.texture-mode-tabs button:hover:not(:disabled) { color: var(--text); }
+.texture-mode-tabs button.active { background: var(--bg-2); color: var(--text); }
+.texture-mode-tabs button:disabled { opacity: 0.3; cursor: default; }
+
+.texture-editor,
+.atlas-editor {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  background: var(--bg-1);
+  outline: none;
+  position: relative;
+}
+
+/* ---------- toolbars ---------- */
+
+.texture-toolbar,
+.atlas-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--tx-gap);
+  padding: 7px var(--tx-pad);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-1);
+  flex-shrink: 0;
+}
+
+/* Icon-led action. The text is optional and drops out on a narrow panel — the
+ * icon and its tooltip carry the meaning, so a docked strip never wraps. */
+.tx-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: var(--tx-control);
+  padding: 0 9px;
+  border: none;
+  border-radius: 7px;
+  background: var(--fill-1);
+  color: var(--text);
+  font-size: 11.5px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background-color 0.12s var(--ease), color 0.12s var(--ease), opacity 0.12s var(--ease);
+}
+
+.tx-btn:hover:not(:disabled) { background: var(--fill-2); }
+.tx-btn:active:not(:disabled) { background: var(--bg-3); }
+.tx-btn:disabled { opacity: 0.32; cursor: default; }
+.tx-btn.quiet { background: transparent; color: var(--text-dim); }
+.tx-btn.quiet:hover:not(:disabled) { background: var(--fill-1); color: var(--text); }
+.tx-btn.icon { width: var(--tx-control); padding: 0; justify-content: center; }
+.tx-btn.on { background: var(--accent-soft); color: var(--accent); }
+.tx-btn.primary { background: var(--accent); color: #fff; }
+.tx-btn.primary:hover:not(:disabled) { background: #2b95ff; }
+.tx-btn.danger:hover:not(:disabled) { background: rgba(255, 93, 85, 0.16); color: var(--danger); }
+
+/* A menu group reads as one control rather than four loose buttons. */
+.tx-group {
+  display: inline-flex;
+  gap: 1px;
+  padding: 1px;
+  border-radius: 8px;
+  background: var(--fill-1);
+}
+
+.tx-group .tx-btn {
+  background: transparent;
+  border-radius: 7px;
+  padding: 0 10px;
+  color: var(--text-dim);
+}
+
+.tx-group .tx-btn:hover:not(:disabled) { background: var(--fill-2); color: var(--text); }
+.tx-group .tx-btn.on { background: var(--accent-soft); color: var(--accent); }
+
+.tx-sep {
+  width: 1px;
+  align-self: stretch;
+  margin: 3px 2px;
+  background: var(--border);
+}
+
+.tx-spacer { flex: 1; }
+
+.tx-title {
+  color: var(--text-dim);
+  font-size: 11px;
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tx-title b {
+  color: var(--accent);
+  font-weight: 700;
+  margin-left: 4px;
+}
+
+@media (max-width: 980px) {
+  .tx-btn .tx-label { display: none; }
+  .tx-btn { padding: 0 7px; }
+}
+
+/* ---------- tool options strip ---------- */
+
+.texture-options {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 6px var(--tx-pad);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-2);
+  flex-shrink: 0;
+  flex-wrap: wrap;
+  min-height: 38px;
+}
+
+.texture-swatches {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.texture-swatches input[type="color"] {
+  width: 24px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: none;
+  cursor: pointer;
+}
+
+/* Slider and value on one line, labelled by an icon wherever one is honest. */
+.tx-slider {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: var(--tx-label);
+  color: var(--text-dim);
+}
+
+.tx-slider > svg { flex-shrink: 0; opacity: 0.75; }
+.tx-slider input[type="range"] { width: 84px; }
+
+.tx-slider b {
+  min-width: 30px;
+  text-align: right;
+  color: var(--text);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+}
+
+.texture-check {
+  display: inline-flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 7px;
+  font-size: var(--tx-label);
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+/* ---------- tool rail ---------- */
+
+.texture-body,
+.atlas-body {
   display: flex;
   flex: 1;
   min-height: 0;
@@ -9278,7 +9447,7 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
   display: grid;
   grid-template-columns: repeat(2, 28px);
   gap: 2px;
-  padding: 6px;
+  padding: 7px 6px;
   align-content: start;
   border-right: 1px solid var(--border);
   background: var(--bg-2);
@@ -9291,22 +9460,15 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
   display: grid;
   place-items: center;
   border: none;
-  border-radius: var(--r-input);
+  border-radius: 7px;
   background: transparent;
   color: var(--text-dim);
   cursor: pointer;
   transition: background-color 0.12s var(--ease), color 0.12s var(--ease);
 }
 
-.texture-tool:hover {
-  background: var(--fill-1);
-  color: var(--text);
-}
-
-.texture-tool.active {
-  background: var(--accent-soft);
-  color: var(--accent);
-}
+.texture-tool:hover { background: var(--fill-1); color: var(--text); }
+.texture-tool.active { background: var(--accent-soft); color: var(--accent); }
 
 .texture-main {
   display: flex;
@@ -9316,72 +9478,20 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
   min-height: 0;
 }
 
-.texture-options {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 6px 9px;
-  border-bottom: 1px solid var(--border);
-  background: var(--bg-2);
-  flex-wrap: wrap;
-  flex-shrink: 0;
-}
+/* ---------- canvases ---------- */
 
-.texture-options-spacer {
-  flex: 1;
-}
-
-.texture-swatches {
-  display: flex;
-  gap: 3px;
-}
-
-.texture-swatches input[type="color"] {
-  width: 26px;
-  height: 22px;
-  padding: 0;
-  border: 1px solid var(--border-strong);
-  border-radius: 5px;
-  background: none;
-  cursor: pointer;
-}
-
-.texture-slider {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 11px;
-  color: var(--text-dim);
-}
-
-.texture-slider input[type="range"] {
-  width: 78px;
-}
-
-.texture-slider b {
-  color: var(--text);
-  font-weight: 500;
-  font-variant-numeric: tabular-nums;
-  min-width: 30px;
-}
-
-.texture-check {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 11px;
-  color: var(--text-dim);
-}
-
-.texture-canvas-wrap {
+.texture-canvas-wrap,
+.atlas-canvas-wrap {
   position: relative;
   flex: 1;
+  min-width: 0;
   min-height: 0;
   overflow: hidden;
   background: var(--bg-0);
 }
 
-.texture-canvas {
+.texture-canvas,
+.atlas-canvas {
   display: block;
   width: 100%;
   height: 100%;
@@ -9394,115 +9504,217 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
   right: 10px;
   bottom: 10px;
   display: flex;
-  gap: 4px;
-  padding: 4px;
-  border-radius: var(--r-card);
-  background: var(--menu-bg);
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border-radius: 9px;
+  background: rgba(21, 22, 25, 0.82);
   backdrop-filter: blur(12px);
   border: 1px solid var(--border);
 }
 
-.texture-layers {
-  width: 208px;
+/* ---------- side columns ---------- */
+
+.texture-layers,
+.atlas-side {
+  width: 232px;
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
+  min-height: 0;
   border-left: 1px solid var(--border);
   background: var(--bg-2);
 }
 
-.texture-layers-head {
+.atlas-side { overflow-y: auto; }
+
+.tx-section {
   display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 8px 10px;
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  color: var(--text-dim);
+  flex-direction: column;
+  gap: 7px;
+  padding: 9px var(--tx-pad) 11px;
   border-bottom: 1px solid var(--border);
 }
 
-.texture-layer-list {
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-  padding: 4px;
-}
-
-.texture-layer {
+.tx-section-head {
   display: flex;
   align-items: center;
-  gap: 4px;
-  padding: 4px 6px;
-  border-radius: 6px;
+  gap: 7px;
+  height: 20px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.tx-section-head > svg { opacity: 0.7; }
+
+.tx-section-head .tx-count {
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+  opacity: 0.55;
+}
+
+/* ---------- fields ---------- */
+
+/* Label left, control right, one column width everywhere — so every field in
+ * the sidebar lines up whatever its label happens to say. */
+.tx-field {
+  display: grid;
+  grid-template-columns: 52px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  font-size: var(--tx-label);
+  color: var(--text-dim);
+}
+
+.tx-field > input,
+.tx-field > select {
+  width: 100%;
+  min-width: 0;
+  height: 24px;
+}
+
+/* Four small numbers on one line (a rect, a nine-slice border). The label sits
+ * above its box because four "L 0" pairs side by side never fit 232px. */
+.tx-quad {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 5px;
+}
+
+.tx-num {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 9.5px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.tx-num input {
+  width: 100%;
+  min-width: 0;
+  height: 24px;
+  padding: 0 6px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.tx-row {
+  display: flex;
+  align-items: center;
+  gap: var(--tx-gap);
+}
+
+.tx-hint {
+  margin: 0;
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--text-dim);
+  opacity: 0.8;
+}
+
+/* ---------- lists (layers, regions, animations) ---------- */
+
+.tx-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.texture-layers .tx-list { flex: 1; padding: 6px; }
+.atlas-side .tx-list { max-height: 208px; }
+.atlas-side .tx-list.short { max-height: 116px; }
+
+.tx-row-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: 28px;
+  padding: 0 7px;
+  border-radius: 7px;
   cursor: pointer;
-  font-size: 12px;
+  font-size: 11.5px;
+  color: var(--text);
 }
 
-.texture-layer:hover {
-  background: var(--fill-1);
-}
+.tx-row-item:hover { background: var(--fill-1); }
+.tx-row-item.active { background: var(--accent-soft); }
 
-.texture-layer.active {
-  background: var(--accent-soft);
-}
-
-.texture-layer-name {
+.tx-row-item .tx-name {
   flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.texture-layer input {
-  flex: 1;
-  min-width: 0;
-  font-size: 12px;
+.tx-row-item .tx-meta {
+  font-size: 10px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
 }
 
-.texture-layer-eye,
-.texture-layer-lock {
+.tx-row-item input {
+  flex: 1;
+  min-width: 0;
+  height: 20px;
+  font-size: 11.5px;
+}
+
+.tx-icon-btn {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
   border: none;
+  border-radius: 5px;
   background: none;
   color: var(--text-dim);
   cursor: pointer;
-  padding: 1px;
-  display: grid;
-  place-items: center;
+  transition: color 0.12s var(--ease), background-color 0.12s var(--ease), opacity 0.12s var(--ease);
 }
 
-.texture-layer-eye:hover,
-.texture-layer-lock:hover {
-  color: var(--text);
-}
+.tx-icon-btn:hover { background: var(--fill-2); color: var(--text); }
+.tx-icon-btn.danger:hover { color: var(--danger); }
+.tx-icon-btn.reveal { opacity: 0; }
+.tx-row-item:hover .tx-icon-btn.reveal { opacity: 1; }
+
+/* ---------- layer footer ---------- */
 
 .texture-layer-props {
-  padding: 7px 8px;
-  border-top: 1px solid var(--border);
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 7px;
+  padding: 9px var(--tx-pad);
+  border-top: 1px solid var(--border);
 }
 
-.texture-layer-props select {
-  width: 100%;
-  text-transform: capitalize;
-}
+.texture-layer-props select { text-transform: capitalize; }
 
 .texture-layer-actions {
   display: flex;
   gap: 3px;
-  padding: 6px 8px;
+  padding: 7px var(--tx-pad);
   border-top: 1px solid var(--border);
 }
+
+/* ---------- status bar ---------- */
 
 .texture-status {
   display: flex;
   align-items: center;
   gap: 14px;
-  padding: 5px 10px;
-  font-size: 11px;
+  height: 24px;
+  padding: 0 var(--tx-pad);
+  font-size: 10.5px;
   color: var(--text-dim);
   border-top: 1px solid var(--border);
   background: var(--bg-2);
@@ -9510,38 +9722,78 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
   font-variant-numeric: tabular-nums;
 }
 
-.texture-status .muted {
-  margin-left: auto;
-  opacity: 0.7;
-}
-
-.texture-editor-gate {
+.texture-warning {
+  display: flex;
+  align-items: center;
   gap: 10px;
+  padding: 7px var(--tx-pad);
+  font-size: 11px;
+  color: var(--warn);
+  background: rgba(226, 163, 60, 0.09);
+  border-bottom: 1px solid var(--border);
 }
 
-/* --- new-document dialog --- */
+.texture-editor-gate { gap: 10px; }
 
-/* Fixed to the VIEWPORT, not to the panel. These panels dock into the short
- * strip under the viewport — a dialog centred inside a 200px-tall panel has its
- * buttons off the bottom, and an absolutely-positioned backdrop escapes to
- * whatever ancestor happens to be positioned anyway. */
+/* ---------- nine-slice schematic + animation preview ---------- */
+
+.atlas-nineslice {
+  display: grid;
+  width: 100%;
+  height: 60px;
+  gap: 1px;
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--border);
+}
+
+.atlas-nineslice-cell.corner { background: rgba(10, 132, 255, 0.45); }
+.atlas-nineslice-cell.edge { background: rgba(10, 132, 255, 0.2); }
+.atlas-nineslice-cell.centre { background: rgba(255, 255, 255, 0.05); }
+
+.atlas-preview {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.atlas-preview canvas {
+  flex: 1;
+  min-width: 0;
+  height: 84px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: repeating-conic-gradient(#2a2a2e 0% 25%, #37373d 0% 50%) 50% / 12px 12px;
+}
+
+/* ===========================================================================
+   Dialogs
+   =========================================================================== */
+
+/* Fixed to the VIEWPORT: these panels dock into a short strip, and a dialog
+ * centred inside a 200px-tall panel puts its own buttons off the screen. */
 .texture-dialog-backdrop {
   position: fixed;
   inset: 0;
   display: grid;
   place-items: center;
   padding: 24px;
-  background: rgba(0, 0, 0, 0.42);
+  background: rgba(0, 0, 0, 0.45);
   z-index: 400;
+  animation: tx-fade 0.12s var(--ease);
+}
+
+@keyframes tx-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
 }
 
 .texture-dialog {
   width: 300px;
   max-width: 100%;
-  /* A long dialog scrolls rather than pushing its own actions off screen. */
   max-height: min(78vh, 640px);
   overflow-y: auto;
-  padding: 16px;
+  padding: 15px 16px;
   display: flex;
   flex-direction: column;
   gap: 9px;
@@ -9550,6 +9802,14 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
   backdrop-filter: blur(20px);
   border: 1px solid var(--border-strong);
   box-shadow: var(--shadow-menu);
+  animation: tx-pop 0.14s var(--ease);
+}
+
+.texture-dialog.wide { width: 400px; }
+
+@keyframes tx-pop {
+  from { opacity: 0; transform: translateY(6px) scale(0.985); }
+  to { opacity: 1; transform: none; }
 }
 
 .texture-dialog h3 {
@@ -9596,139 +9856,77 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
   gap: 8px;
 }
 
-.texture-dialog .texture-check input[type="checkbox"] {
-  flex-shrink: 0;
-}
+.texture-dialog .texture-check input[type="checkbox"] { flex-shrink: 0; }
 
-.texture-dialog-row {
-  display: flex;
-  gap: 10px;
-}
+.texture-dialog-row { display: flex; gap: 10px; }
 
-/* Fixed label column so paired fields line up with each other — "Cell W" and
- * "Spacing X" are different widths, and sizing to content staggers every input. */
+/* Fixed label column so paired fields line up — "Cell W" and "Spacing X" are
+ * different widths, and sizing to content staggers every input. */
 .texture-dialog-row label {
   flex: 1;
   grid-template-columns: 62px minmax(0, 1fr);
   gap: 6px;
 }
 
-.texture-dialog-presets {
-  display: flex;
-  gap: 4px;
-  flex-wrap: wrap;
-}
+.texture-dialog-presets { display: flex; gap: 4px; flex-wrap: wrap; }
 
 .texture-dialog-actions {
   display: flex;
   justify-content: flex-end;
   gap: 6px;
   margin-top: 4px;
-  /* Sticks to the bottom of a scrolled dialog so Cancel/Apply are always
-   * reachable without hunting for the end of the list. */
   position: sticky;
-  bottom: -16px;
+  bottom: -15px;
   padding: 10px 0 0;
   background: linear-gradient(to bottom, transparent, var(--menu-bg) 45%);
 }
 
-/* --- Texture Editor: operation dialogs (Image / Adjust / Filter / Channels) --- */
-
-.texture-dialog.wide {
-  width: 400px;
-}
-
-.texture-dialog-note {
-  margin: 0;
-  font-size: 11px;
-  color: var(--text-dim);
-  line-height: 1.45;
-}
-
-.texture-dialog-busy {
-  color: var(--text-dim);
-  font-weight: 400;
-}
-
-/* Wins over `.texture-dialog label`, which is one class more specific than a
- * bare `.texture-param` and would otherwise flatten this to two columns. */
+/* Slider plus number, for adjustment and filter parameters. Higher specificity
+ * than `.texture-dialog label`, which would flatten it to two columns. */
 .texture-dialog .texture-param,
 .texture-param {
   display: grid;
-  grid-template-columns: 84px minmax(0, 1fr) 58px;
+  grid-template-columns: 84px minmax(0, 1fr) 56px;
   align-items: center;
   gap: 8px;
-  font-size: 11px;
+  font-size: var(--tx-label);
   color: var(--text-dim);
 }
 
-.texture-param input[type="range"] {
-  width: 100%;
-}
+.texture-param input[type="range"] { width: 100%; }
+.texture-param input[type="number"] { width: 100%; min-width: 0; }
 
-.texture-anchor-label {
-  font-size: 11px;
-  color: var(--text-dim);
-}
+.texture-anchor-label { font-size: var(--tx-label); color: var(--text-dim); }
 
-.texture-anchor-grid {
-  display: grid;
-  grid-template-columns: repeat(3, 26px);
-  gap: 3px;
-}
+.texture-anchor-grid { display: grid; grid-template-columns: repeat(3, 26px); gap: 3px; }
 
 .texture-anchor {
   width: 26px;
   height: 26px;
   border: 1px solid var(--border);
-  border-radius: 5px;
+  border-radius: 6px;
   background: var(--fill-1);
   cursor: pointer;
   transition: background-color 0.12s var(--ease), border-color 0.12s var(--ease);
 }
 
-.texture-anchor:hover {
-  background: var(--fill-2);
-}
+.texture-anchor:hover { background: var(--fill-2); }
+.texture-anchor.active { background: var(--accent-soft); border-color: var(--accent-ring); }
 
-.texture-anchor.active {
-  background: var(--accent-soft);
-  border-color: var(--accent-ring);
-}
+.texture-pack-row { display: flex; align-items: center; gap: 6px; }
+.texture-pack-field { flex: 1; min-width: 0; }
+.texture-pack-row select { width: 96px; flex-shrink: 0; }
+.texture-pack-row input[type="number"] { width: 64px; flex-shrink: 0; }
+.texture-pack-row .texture-check { flex-shrink: 0; }
 
-.texture-pack-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.texture-pack-field {
-  flex: 1;
-  min-width: 0;
-}
-
-.texture-pack-row select {
-  width: 96px;
-  flex-shrink: 0;
-}
-
-.texture-pack-row input[type="number"] {
-  width: 64px;
-  flex-shrink: 0;
-}
-
-.texture-pack-row .texture-check {
-  flex-shrink: 0;
-}
-
-/* Channel chips: the colour IS the label, so a packing dialog can be read
- * at a glance rather than by matching four rows of text. */
+/* The colour IS the label, so a packing dialog reads at a glance instead of by
+ * matching four rows of text. */
 .texture-pack-chip {
-  width: 54px;
+  width: 52px;
   flex-shrink: 0;
   padding: 3px 6px;
   border-radius: 5px;
-  font-size: 10.5px;
+  font-size: 10px;
   font-weight: 600;
   text-align: center;
   color: #0d0e11;
@@ -9739,255 +9937,183 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
 .texture-pack-chip.ch-b { background: #6ba8ff; }
 .texture-pack-chip.ch-a { background: #cfd2d8; }
 
-/* --- Texture Editor: Paint / Atlas mode tabs --- */
+/* ---------------------------------------------------------------------------
+   Panel maximize (double-click a tab bar, Escape to restore).
 
-.texture-modes {
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-  min-height: 0;
+   Dockview swaps the layout instantly, so the animation is on the group that
+   remains — a panel that simply appears at full size reads as a broken repaint
+   rather than as a deliberate zoom.
+   --------------------------------------------------------------------------- */
+
+.dv-zooming {
+  animation: dv-zoom-in 0.19s cubic-bezier(0.2, 0, 0, 1);
 }
 
-.texture-mode-tabs {
-  display: flex;
-  gap: 2px;
-  padding: 5px 8px 0;
-  background: var(--bg-1);
-  border-bottom: 1px solid var(--border);
-  flex-shrink: 0;
+@keyframes dv-zoom-in {
+  from {
+    opacity: 0.55;
+    transform: scale(0.965);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
 }
 
-.texture-mode-tabs button {
+/* A quiet hint that Escape is the way out. */
+.dock-container.dv-has-maximized .dv-groupview.dv-active-group > .dv-tabs-and-actions-container {
+  box-shadow: inset 0 -1px 0 var(--accent-ring);
+}
+
+/* ---------- form controls inside the texture editor ----------
+   The editor's global inputs are styled, but a <select> keeps its native
+   chevron and border and a colour input keeps its OS swatch chrome, both of
+   which read as unfinished next to everything else. */
+
+.texture-editor select,
+.atlas-editor select,
+.texture-dialog select {
+  height: 24px;
+  padding: 0 26px 0 8px;
   border: none;
-  background: transparent;
-  color: var(--text-dim);
-  font-size: 11.5px;
-  font-weight: 500;
-  padding: 5px 11px;
-  border-radius: 6px 6px 0 0;
-  cursor: pointer;
-  transition: background-color 0.12s var(--ease), color 0.12s var(--ease);
-}
-
-.texture-mode-tabs button:hover:not(:disabled) {
+  border-radius: var(--r-input);
+  background-color: var(--fill-1);
+  background-image: linear-gradient(45deg, transparent 50%, var(--text-dim) 50%),
+    linear-gradient(135deg, var(--text-dim) 50%, transparent 50%);
+  background-position: calc(100% - 13px) 10px, calc(100% - 9px) 10px;
+  background-size: 4px 4px, 4px 4px;
+  background-repeat: no-repeat;
   color: var(--text);
-}
-
-.texture-mode-tabs button.active {
-  background: var(--bg-2);
-  color: var(--text);
-}
-
-.texture-mode-tabs button:disabled {
-  opacity: 0.35;
-  cursor: default;
-}
-
-/* --- Atlas editor --- */
-
-.atlas-editor {
-  display: flex;
-  flex-direction: column;
-  flex: 1;
-  min-height: 0;
-  background: var(--bg-1);
-}
-
-.atlas-body {
-  display: flex;
-  flex: 1;
-  min-height: 0;
-}
-
-.atlas-canvas-wrap {
-  position: relative;
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  background: var(--bg-0);
-}
-
-.atlas-canvas {
-  display: block;
-  width: 100%;
-  height: 100%;
-  cursor: crosshair;
-  touch-action: none;
-}
-
-.atlas-side {
-  width: 250px;
-  flex-shrink: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-  overflow-y: auto;
-  border-left: 1px solid var(--border);
-  background: var(--bg-2);
-}
-
-.atlas-section {
-  padding: 8px 9px 10px;
-  border-bottom: 1px solid var(--border);
-  display: flex;
-  flex-direction: column;
-  gap: 7px;
-}
-
-.atlas-section-head {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  color: var(--text-dim);
-}
-
-.atlas-section-head.sub {
-  text-transform: none;
-  letter-spacing: 0;
-  margin-top: 2px;
-}
-
-.atlas-section-head .muted {
-  opacity: 0.6;
-  text-transform: none;
-  letter-spacing: 0;
-}
-
-.atlas-section-head .toolbar-btn {
-  margin-left: auto;
-}
-
-.atlas-list {
-  max-height: 220px;
-  overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-}
-
-.atlas-list.short {
-  max-height: 120px;
-}
-
-.atlas-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 3px 6px;
-  border-radius: 5px;
-  cursor: pointer;
   font-size: 11.5px;
+  font-family: inherit;
+  appearance: none;
+  cursor: pointer;
+  transition: background-color 0.12s var(--ease), box-shadow 0.12s var(--ease);
 }
 
-.atlas-row:hover {
-  background: var(--fill-1);
+.texture-editor select:hover,
+.atlas-editor select:hover,
+.texture-dialog select:hover {
+  background-color: var(--fill-2);
 }
 
-.atlas-row.active {
-  background: var(--accent-soft);
+.texture-editor select:focus-visible,
+.atlas-editor select:focus-visible,
+.texture-dialog select:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-ring);
 }
 
-.atlas-row-name {
-  flex: 1;
+.texture-editor input[type="color"],
+.atlas-editor input[type="color"],
+.texture-dialog input[type="color"] {
+  padding: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: none;
+  cursor: pointer;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
-.atlas-row .muted {
+.texture-editor input[type="color"]::-webkit-color-swatch-wrapper,
+.atlas-editor input[type="color"]::-webkit-color-swatch-wrapper,
+.texture-dialog input[type="color"]::-webkit-color-swatch-wrapper {
+  padding: 2px;
+}
+
+.texture-editor input[type="color"]::-webkit-color-swatch,
+.atlas-editor input[type="color"]::-webkit-color-swatch,
+.texture-dialog input[type="color"]::-webkit-color-swatch {
+  border: none;
+  border-radius: 4px;
+}
+
+/* ---------- canvas readout + pan cursor ---------- */
+
+.tx-readout {
+  position: absolute;
+  left: 10px;
+  bottom: 10px;
+  padding: 4px 8px;
+  border-radius: 7px;
+  background: rgba(21, 22, 25, 0.78);
+  border: 1px solid var(--border);
+  backdrop-filter: blur(10px);
+  font-size: 10.5px;
   color: var(--text-dim);
   font-variant-numeric: tabular-nums;
-  font-size: 10.5px;
+  white-space: pre;
+  pointer-events: none;
 }
 
-.atlas-row-x {
+.texture-canvas-wrap.panning .texture-canvas { cursor: grab; }
+.texture-canvas-wrap.panning .texture-canvas:active { cursor: grabbing; }
+
+/* ---------- every bare input in the texture editor ----------
+   The design system styles fields through `.number-field` / `.text-field`
+   classes. These surfaces build their inputs inline, so the same tokens are
+   applied by scope instead — otherwise a dialog full of native borders, native
+   spinners and 13px system text sits inside an editor that has none of that. */
+
+.texture-editor input:not([type="checkbox"]):not([type="color"]):not([type="range"]),
+.atlas-editor input:not([type="checkbox"]):not([type="color"]):not([type="range"]),
+.texture-dialog input:not([type="checkbox"]):not([type="color"]):not([type="range"]),
+.texture-editor textarea,
+.atlas-editor textarea,
+.texture-dialog textarea {
+  height: 24px;
+  padding: 0 8px;
   border: none;
-  background: none;
-  color: var(--text-dim);
-  cursor: pointer;
-  padding: 0;
-  display: grid;
-  place-items: center;
-  opacity: 0;
+  border-radius: var(--r-input);
+  background: var(--fill-1);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  transition: background-color 0.12s var(--ease), box-shadow 0.12s var(--ease);
 }
 
-.atlas-row:hover .atlas-row-x {
-  opacity: 1;
+.texture-editor textarea,
+.atlas-editor textarea,
+.texture-dialog textarea {
+  height: auto;
+  padding: 6px 8px;
+  line-height: 1.45;
+  resize: vertical;
 }
 
-.atlas-row-x:hover {
-  color: var(--danger);
+.texture-editor input:not([type="checkbox"]):not([type="color"]):not([type="range"]):hover,
+.atlas-editor input:not([type="checkbox"]):not([type="color"]):not([type="range"]):hover,
+.texture-dialog input:not([type="checkbox"]):not([type="color"]):not([type="range"]):hover {
+  background: var(--fill-2);
 }
 
-.atlas-field {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  font-size: 11px;
-  color: var(--text-dim);
+.texture-editor input:not([type="checkbox"]):not([type="color"]):not([type="range"]):focus,
+.atlas-editor input:not([type="checkbox"]):not([type="color"]):not([type="range"]):focus,
+.texture-dialog input:not([type="checkbox"]):not([type="color"]):not([type="range"]):focus,
+.texture-editor textarea:focus,
+.atlas-editor textarea:focus,
+.texture-dialog textarea:focus {
+  outline: none;
+  background: var(--bg-0);
+  box-shadow: 0 0 0 2px var(--accent-ring);
 }
 
-.atlas-field input {
-  flex: 1;
-  min-width: 0;
+/* Native spinners are a different visual language (and a 16px-wide click
+ * target nobody hits on purpose). The value is typed or dragged instead. */
+.texture-editor input[type="number"]::-webkit-outer-spin-button,
+.texture-editor input[type="number"]::-webkit-inner-spin-button,
+.atlas-editor input[type="number"]::-webkit-outer-spin-button,
+.atlas-editor input[type="number"]::-webkit-inner-spin-button,
+.texture-dialog input[type="number"]::-webkit-outer-spin-button,
+.texture-dialog input[type="number"]::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
 }
 
-.atlas-grid4 {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 5px;
-  align-items: center;
-}
-
-.atlas-num {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  font-size: 10px;
-  color: var(--text-dim);
-}
-
-.atlas-num input {
-  width: 100%;
-  min-width: 0;
-}
-
-/* Nine-slice schematic: which cells stretch, at a glance. Corners are solid,
- * edges stretch on one axis, the centre on both. */
-.atlas-nineslice {
-  display: grid;
-  width: 100%;
-  height: 68px;
-  gap: 1px;
-  border-radius: 5px;
-  overflow: hidden;
-  background: var(--border);
-}
-
-.atlas-nineslice-cell.corner {
-  background: rgba(10, 132, 255, 0.42);
-}
-
-.atlas-nineslice-cell.edge {
-  background: rgba(10, 132, 255, 0.2);
-}
-
-.atlas-nineslice-cell.centre {
-  background: rgba(255, 255, 255, 0.06);
-}
-
-.atlas-preview {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.atlas-preview canvas {
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background:
-    repeating-conic-gradient(#2a2a2e 0% 25%, #37373d 0% 50%) 50% / 12px 12px;
+.texture-editor input[type="number"],
+.atlas-editor input[type="number"],
+.texture-dialog input[type="number"] {
+  -moz-appearance: textfield;
+  appearance: textfield;
 }

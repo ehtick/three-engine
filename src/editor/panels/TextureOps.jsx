@@ -89,16 +89,18 @@ export function OperationMenus({ onCommand, hasSelection, disabled }) {
 
   return (
     <>
-      {MENUS.map((name) => (
-        <button
-          key={name}
-          className={`toolbar-btn tiny ${menu?.name === name ? "active" : ""}`}
-          disabled={disabled}
-          onClick={(event) => open(name, event)}
-        >
-          {name}
-        </button>
-      ))}
+      <div className="tx-group">
+        {MENUS.map((name) => (
+          <button
+            key={name}
+            className={`tx-btn ${menu?.name === name ? "on" : ""}`}
+            disabled={disabled}
+            onClick={(event) => open(name, event)}
+          >
+            {name}
+          </button>
+        ))}
+      </div>
       {menu && <ContextMenu x={menu.x} y={menu.y} items={items} onClose={() => setMenu(null)} />}
     </>
   );
@@ -161,10 +163,10 @@ export function OperationDialog({ spec, docSize, onPreview, onApply, onCancel })
         ))}
         {!spec.params?.length && <p className="texture-dialog-note">Applies to the active layer.</p>}
         <div className="texture-dialog-actions">
-          <button className="toolbar-btn" onClick={onCancel}>
+          <button className="tx-btn quiet" onClick={onCancel}>
             Cancel
           </button>
-          <button className="toolbar-btn primary" onClick={() => onApply(params)}>
+          <button className="tx-btn primary" onClick={() => onApply(params)}>
             Apply
           </button>
         </div>
@@ -272,7 +274,7 @@ export function ResizeDialog({ docSize, onApply, onCancel }) {
           {[0.5, 2].map((scale) => (
             <button
               key={scale}
-              className="toolbar-btn tiny"
+              className="tx-btn quiet"
               onClick={() => {
                 setWidth(Math.max(1, Math.round(docSize.width * scale)));
                 setHeight(Math.max(1, Math.round(docSize.height * scale)));
@@ -284,7 +286,7 @@ export function ResizeDialog({ docSize, onApply, onCancel }) {
           {[64, 128, 256, 512, 1024, 2048].map((size) => (
             <button
               key={size}
-              className="toolbar-btn tiny"
+              className="tx-btn quiet"
               onClick={() => {
                 setWidth(size);
                 setHeight(link ? Math.max(1, Math.round((size * docSize.height) / docSize.width)) : height);
@@ -302,11 +304,11 @@ export function ResizeDialog({ docSize, onApply, onCancel }) {
           </select>
         </label>
         <div className="texture-dialog-actions">
-          <button className="toolbar-btn" onClick={onCancel}>
+          <button className="tx-btn quiet" onClick={onCancel}>
             Cancel
           </button>
           <button
-            className="toolbar-btn primary"
+            className="tx-btn primary"
             onClick={() => onApply({ width: clampSize(width), height: clampSize(height), filter })}
           >
             Resize
@@ -357,11 +359,11 @@ export function CanvasSizeDialog({ docSize, onApply, onCancel }) {
           ))}
         </div>
         <div className="texture-dialog-actions">
-          <button className="toolbar-btn" onClick={onCancel}>
+          <button className="tx-btn quiet" onClick={onCancel}>
             Cancel
           </button>
           <button
-            className="toolbar-btn primary"
+            className="tx-btn primary"
             onClick={() => onApply({ width: clampSize(width), height: clampSize(height), anchor })}
           >
             Resize Canvas
@@ -479,11 +481,11 @@ export function PackChannelsDialog({ docSize, onApply, onCancel }) {
           <input value={name} onChange={(e) => setName(e.target.value)} />
         </label>
         <div className="texture-dialog-actions">
-          <button className="toolbar-btn" disabled={busy} onClick={onCancel}>
+          <button className="tx-btn quiet" disabled={busy} onClick={onCancel}>
             Cancel
           </button>
           <button
-            className="toolbar-btn primary"
+            className="tx-btn primary"
             disabled={busy}
             onClick={async () => {
               setBusy(true);
@@ -557,11 +559,11 @@ export function PackAtlasDialog({ count, defaultName = "Atlas", onApply, onCance
           Power-of-two sheet
         </label>
         <div className="texture-dialog-actions">
-          <button className="toolbar-btn" disabled={busy} onClick={onCancel}>
+          <button className="tx-btn quiet" disabled={busy} onClick={onCancel}>
             Cancel
           </button>
           <button
-            className="toolbar-btn primary"
+            className="tx-btn primary"
             disabled={busy || !name.trim()}
             onClick={async () => {
               setBusy(true);
@@ -615,10 +617,10 @@ export function SwizzleDialog({ onApply, onCancel }) {
           </div>
         ))}
         <div className="texture-dialog-actions">
-          <button className="toolbar-btn" onClick={onCancel}>
+          <button className="tx-btn quiet" onClick={onCancel}>
             Cancel
           </button>
-          <button className="toolbar-btn primary" onClick={() => onApply({ mapping, invert })}>
+          <button className="tx-btn primary" onClick={() => onApply({ mapping, invert })}>
             Apply
           </button>
         </div>

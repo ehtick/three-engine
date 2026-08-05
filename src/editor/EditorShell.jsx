@@ -442,6 +442,73 @@ function buildDefaultLayout(api) {
   assets.api.setActive();
 }
 
+/**
+ * Double-click a tab (or the empty part of a tab bar) to fill the window with
+ * that panel; Escape puts it back.
+ *
+ * Dockview has the maximize API but binds no gesture to it, so a panel can only
+ * be enlarged by dragging splitters — and there is no way at all to get a
+ * temporarily-bigger viewport or paint canvas without wrecking the layout you
+ * then have to rebuild by hand.
+ *
+ * Bound to the TAB BAR, never to the panel body: panel bodies are full of
+ * double-click handlers already (renaming a layer, a keyframe, a graph node),
+ * and a gesture that sometimes renames a layer and sometimes swallows the whole
+ * screen is worse than no gesture.
+ */
+function installMaximizeGestures(api, container) {
+  const groupFromEvent = (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) return null;
+    // A tab, or the strip they sit in — but not the buttons in it, which have
+    // their own jobs (close, and any group actions).
+    const bar = target.closest(".dv-tabs-and-actions-container, .dv-tab");
+    if (!bar || target.closest(".dv-default-tab-action, button")) return null;
+    const groupEl = target.closest(".dv-groupview");
+    if (!groupEl) return null;
+    return api.groups.find((group) => group.element === groupEl) ?? null;
+  };
+
+  const onDoubleClick = (event) => {
+    const group = groupFromEvent(event);
+    if (!group) return;
+    event.preventDefault();
+    if (group.api.isMaximized?.()) api.exitMaximizedGroup();
+    else group.api.maximize?.();
+  };
+
+  const onKeyDown = (event) => {
+    // Bubble phase and `defaultPrevented`-aware on purpose: a dialog, a rename
+    // field or a modal tool gets Escape first and stops it. Un-maximizing is
+    // the LAST thing Escape should mean, not the first.
+    if (event.key !== "Escape" || event.defaultPrevented) return;
+    if (!api.hasMaximizedGroup?.()) return;
+    const active = document.activeElement;
+    if (active instanceof HTMLElement && /input|textarea|select/i.test(active.tagName)) return;
+    if (document.querySelector(".dropdown-menu, .texture-dialog, .modal, [role='dialog']")) return;
+    api.exitMaximizedGroup();
+  };
+
+  container.addEventListener("dblclick", onDoubleClick);
+  window.addEventListener("keydown", onKeyDown);
+
+  // The layout change itself is instant (dockview hides the other groups), so
+  // the animation is on the group that survives: without it a panel filling the
+  // screen looks like a broken repaint rather than a deliberate zoom.
+  api.onDidMaximizedGroupChange?.(() => {
+    const maximized = api.hasMaximizedGroup?.();
+    container.classList.toggle("dv-has-maximized", !!maximized);
+    const group = maximized ? api.groups.find((g) => g.api.isMaximized?.()) : null;
+    const element = group?.element ?? container;
+    element.classList.remove("dv-zooming");
+    // Force a reflow so re-adding the class restarts the animation when the
+    // user maximizes two panels in a row.
+    void element.offsetWidth;
+    element.classList.add("dv-zooming");
+    setTimeout(() => element.classList.remove("dv-zooming"), 220);
+  });
+}
+
 function onDockReady(event) {
   const { api } = event;
   dock.api = api;
@@ -483,6 +550,9 @@ function onDockReady(event) {
     dock.pending.clear();
     for (const id of queued) openPanel(id);
   }
+
+  const container = event.containerApi?.element ?? document.querySelector(".dock-container");
+  if (container) installMaximizeGestures(api, container);
 }
 
 export function EditorShell() {

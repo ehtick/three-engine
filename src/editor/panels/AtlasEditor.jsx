@@ -1,11 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  Brush,
+  Crosshair,
+  Download,
+  Film,
+  Frame,
   Grid3x3,
+  Maximize2,
   Pause,
   Play,
   Plus,
   Save,
   Scissors,
+  Shapes,
   Trash2,
   Undo2,
   Wand2,
@@ -224,28 +231,36 @@ export function AtlasEditor({ path, onOpenImage }) {
 
   return (
     <div className="atlas-editor">
-      <div className="texture-options">
-        <button className="toolbar-btn" disabled={!dirty} onClick={save}>
-          <Save size={13} /> Save
+      <div className="atlas-toolbar">
+        <button className="tx-btn" title="Save (Ctrl+S)" disabled={!dirty} onClick={save}>
+          <Save size={14} />
+          <span className="tx-label">Save</span>
         </button>
-        <button className="toolbar-btn icon-only" title="Undo" onClick={undo}>
+        <button className="tx-btn quiet icon" title="Undo" onClick={undo}>
           <Undo2 size={14} />
         </button>
-        <span className="toolbar-sep" />
+        <span className="tx-sep" />
         <button
-          className="toolbar-btn tiny"
+          className="tx-btn"
+          title="Cut the sheet into regions"
           onClick={(event) => {
             const rect = event.currentTarget.getBoundingClientRect();
-            setMenu({ x: rect.left, y: rect.bottom + 2 });
+            setMenu({ x: rect.left, y: rect.bottom + 4 });
           }}
         >
-          <Scissors size={12} /> Slice
-        </button>
-        <button className="toolbar-btn tiny" onClick={() => addRegion({ x: 0, y: 0, width: 32, height: 32 })}>
-          <Plus size={12} /> Region
+          <Scissors size={14} />
+          <span className="tx-label">Slice</span>
         </button>
         <button
-          className="toolbar-btn tiny"
+          className="tx-btn quiet icon"
+          title="Add a region by hand"
+          onClick={() => addRegion({ x: 0, y: 0, width: 32, height: 32 })}
+        >
+          <Plus size={14} />
+        </button>
+        <button
+          className="tx-btn quiet icon"
+          title="Export every region as its own PNG"
           disabled={!def.regions.length}
           onClick={async () => {
             try {
@@ -256,15 +271,19 @@ export function AtlasEditor({ path, onOpenImage }) {
             }
           }}
         >
-          Export Sprites
+          <Download size={14} />
         </button>
-        <button className="toolbar-btn tiny" onClick={() => onOpenImage?.(atlasImagePath(def, path))}>
-          Edit Sheet
+        <button
+          className="tx-btn quiet icon"
+          title="Paint this sheet"
+          onClick={() => onOpenImage?.(atlasImagePath(def, path))}
+        >
+          <Brush size={14} />
         </button>
-        <span className="texture-options-spacer" />
-        <span className="texture-title">
+        <span className="tx-spacer" />
+        <span className="tx-title" title={path}>
           {basename(path)}
-          {dirty ? " •" : ""}
+          {dirty ? <b>•</b> : null}
         </span>
       </div>
 
@@ -316,7 +335,7 @@ export function AtlasEditor({ path, onOpenImage }) {
           y={menu.y}
           onClose={() => setMenu(null)}
           items={[
-            { label: "By Grid…", action: () => setDialog({ kind: "grid" }) },
+            { label: "By Grid…", hint: "Uniform cells — sheets from an animation tool", action: () => setDialog({ kind: "grid" }) },
             { label: "By Transparency…", hint: "Find every separate piece of artwork", action: () => setDialog({ kind: "alpha" }) },
           ]}
         />
@@ -365,22 +384,32 @@ function AtlasCanvas({ def, image, selected, onSelect, onCreate, onUpdateRegion 
     return canvas;
   }, [image]);
 
+  // See the paint canvas: fitting against a zero-sized wrapper clamps the zoom
+  // to its minimum and parks the sheet in the corner, with no way back.
+  const fittedRef = useRef(false);
+
   const fit = useCallback(() => {
     const wrap = wrapRef.current;
-    if (!wrap) return;
+    if (!wrap) return false;
+    const width = wrap.clientWidth;
+    const height = wrap.clientHeight;
+    if (width < 8 || height < 8) return false;
     const zoom = Math.max(
       MIN_ZOOM,
-      Math.min((wrap.clientWidth - 40) / image.width, (wrap.clientHeight - 40) / image.height, 8),
+      Math.min((width - 40) / image.width, (height - 40) / image.height, 8),
     );
     viewRef.current = {
       zoom,
-      x: wrap.clientWidth / 2 - (image.width * zoom) / 2,
-      y: wrap.clientHeight / 2 - (image.height * zoom) / 2,
+      x: width / 2 - (image.width * zoom) / 2,
+      y: height / 2 - (image.height * zoom) / 2,
     };
+    fittedRef.current = true;
     bumpView((v) => v + 1);
+    return true;
   }, [image.width, image.height]);
 
   useEffect(() => {
+    fittedRef.current = false;
     fit();
   }, [fit]);
 
@@ -480,10 +509,13 @@ function AtlasCanvas({ def, image, selected, onSelect, onCreate, onUpdateRegion 
   useEffect(() => {
     const wrap = wrapRef.current;
     if (!wrap || typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(() => draw());
+    const observer = new ResizeObserver(() => {
+      if (!fittedRef.current && fit()) return;
+      draw();
+    });
     observer.observe(wrap);
     return () => observer.disconnect();
-  }, [draw]);
+  }, [draw, fit]);
 
   const toImage = useCallback((event) => {
     const rect = canvasRef.current.getBoundingClientRect();
@@ -663,7 +695,8 @@ function AtlasCanvas({ def, image, selected, onSelect, onCreate, onUpdateRegion 
       />
       <div className="texture-view-controls">
         <button
-          className="toolbar-btn icon-only"
+          className="tx-btn quiet icon"
+          title="Zoom out"
           onClick={() => {
             viewRef.current.zoom = Math.max(MIN_ZOOM, viewRef.current.zoom / 1.5);
             draw();
@@ -671,11 +704,12 @@ function AtlasCanvas({ def, image, selected, onSelect, onCreate, onUpdateRegion 
         >
           <ZoomOut size={14} />
         </button>
-        <button className="toolbar-btn tiny" onClick={fit}>
-          Fit
+        <button className="tx-btn quiet icon" title="Fit to view" onClick={fit}>
+          <Maximize2 size={13} />
         </button>
         <button
-          className="toolbar-btn icon-only"
+          className="tx-btn quiet icon"
+          title="Zoom in"
           onClick={() => {
             viewRef.current.zoom = Math.min(MAX_ZOOM, viewRef.current.zoom * 1.5);
             draw();
@@ -696,42 +730,49 @@ const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 
 function RegionList({ def, selected, onSelect, onDelete, onAddAnimation }) {
   return (
-    <div className="atlas-section">
-      <div className="atlas-section-head">
-        Regions <span className="muted">{def.regions.length}</span>
+    <div className="tx-section">
+      <div className="tx-section-head">
+        <Shapes size={13} />
+        Regions
+        <span className="tx-count">{def.regions.length}</span>
+        <span className="tx-spacer" />
         <button
-          className="toolbar-btn tiny"
+          className="tx-icon-btn"
           disabled={!def.regions.length}
           title="Make an animation from every region, in order"
           onClick={() => onAddAnimation(def.regions.map((r) => r.name))}
         >
-          <Play size={11} /> All
+          <Play size={12} />
         </button>
       </div>
-      <div className="atlas-list">
-        {def.regions.map((region) => (
-          <div
-            key={region.name}
-            className={`atlas-row ${region.name === selected ? "active" : ""}`}
-            onClick={() => onSelect(region.name)}
-          >
-            <span className="atlas-row-name">{region.name}</span>
-            <span className="muted">
-              {region.rect[2]}×{region.rect[3]}
-            </span>
-            <button
-              className="atlas-row-x"
-              onClick={(e) => {
-                e.stopPropagation();
-                onDelete(region.name);
-              }}
+      {def.regions.length ? (
+        <div className="tx-list">
+          {def.regions.map((region) => (
+            <div
+              key={region.name}
+              className={`tx-row-item ${region.name === selected ? "active" : ""}`}
+              onClick={() => onSelect(region.name)}
             >
-              <Trash2 size={11} />
-            </button>
-          </div>
-        ))}
-        {!def.regions.length && <p className="texture-dialog-note">Slice the sheet, or drag on it to add a region.</p>}
-      </div>
+              <span className="tx-name">{region.name}</span>
+              <span className="tx-meta">
+                {region.rect[2]}x{region.rect[3]}
+              </span>
+              <button
+                className="tx-icon-btn danger reveal"
+                title="Delete region"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onDelete(region.name);
+                }}
+              >
+                <Trash2 size={12} />
+              </button>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <p className="tx-hint">Slice the sheet, or drag on it to add a region.</p>
+      )}
     </div>
   );
 }
@@ -742,7 +783,7 @@ function RegionInspector({ region, sheet, onRename, onChange }) {
   const [x, y, w, h] = region.rect;
 
   const num = (label, value, apply, { min = 0, max = 8192 } = {}) => (
-    <label key={label} className="atlas-num">
+    <label key={label} className="tx-num">
       <span>{label}</span>
       <input
         type="number"
@@ -755,9 +796,12 @@ function RegionInspector({ region, sheet, onRename, onChange }) {
   );
 
   return (
-    <div className="atlas-section">
-      <div className="atlas-section-head">Region</div>
-      <label className="atlas-field">
+    <div className="tx-section">
+      <div className="tx-section-head">
+        <Frame size={13} />
+        Region
+      </div>
+      <label className="tx-field">
         <span>Name</span>
         <input
           value={name}
@@ -769,43 +813,51 @@ function RegionInspector({ region, sheet, onRename, onChange }) {
           }}
         />
       </label>
-      <div className="atlas-grid4">
+      <div className="tx-quad">
         {num("X", x, (v) => onChange({ rect: [Math.min(v, sheet[0] - w), y, w, h] }), { max: sheet[0] })}
         {num("Y", y, (v) => onChange({ rect: [x, Math.min(v, sheet[1] - h), w, h] }), { max: sheet[1] })}
         {num("W", w, (v) => onChange({ rect: [x, y, Math.max(1, Math.min(v, sheet[0] - x)), h] }), { min: 1 })}
         {num("H", h, (v) => onChange({ rect: [x, y, w, Math.max(1, Math.min(v, sheet[1] - y))] }), { min: 1 })}
       </div>
 
-      <div className="atlas-section-head sub">
-        Pivot <span className="muted">0–1, from the top-left</span>
+      <div className="tx-section-head" title="0 to 1 across the sprite, measured from its top-left">
+        <Crosshair size={13} />
+        Pivot
       </div>
-      <div className="atlas-grid4">
-        <label className="atlas-num">
-          <span>X</span>
-          <input
-            type="number" step={0.05} min={0} max={1} value={region.pivot[0]}
-            onChange={(e) => onChange({ pivot: [clamp(Number(e.target.value) || 0, 0, 1), region.pivot[1]] })}
-          />
-        </label>
-        <label className="atlas-num">
-          <span>Y</span>
-          <input
-            type="number" step={0.05} min={0} max={1} value={region.pivot[1]}
-            onChange={(e) => onChange({ pivot: [region.pivot[0], clamp(Number(e.target.value) || 0, 0, 1)] })}
-          />
-        </label>
-        <button className="toolbar-btn tiny" onClick={() => onChange({ pivot: [0.5, 0.5] })}>
+      <div className="tx-row">
+        <div className="tx-quad" style={{ flex: 1, gridTemplateColumns: "repeat(2, minmax(0, 1fr))" }}>
+          <label className="tx-num">
+            <span>X</span>
+            <input
+              type="number" step={0.05} min={0} max={1} value={region.pivot[0]}
+              onChange={(e) => onChange({ pivot: [clamp(Number(e.target.value) || 0, 0, 1), region.pivot[1]] })}
+            />
+          </label>
+          <label className="tx-num">
+            <span>Y</span>
+            <input
+              type="number" step={0.05} min={0} max={1} value={region.pivot[1]}
+              onChange={(e) => onChange({ pivot: [region.pivot[0], clamp(Number(e.target.value) || 0, 0, 1)] })}
+            />
+          </label>
+        </div>
+        <button className="tx-btn quiet" title="Centre the pivot" onClick={() => onChange({ pivot: [0.5, 0.5] })}>
           Centre
         </button>
-        <button className="toolbar-btn tiny" title="Feet — where a standing character wants its origin" onClick={() => onChange({ pivot: [0.5, 1] })}>
+        <button
+          className="tx-btn quiet"
+          title="Feet - where a standing character wants its origin"
+          onClick={() => onChange({ pivot: [0.5, 1] })}
+        >
           Bottom
         </button>
       </div>
 
-      <div className="atlas-section-head sub">
-        Nine-slice <span className="muted">texture px</span>
+      <div className="tx-section-head" title="Insets in texture pixels - corners keep their size as the sprite is stretched">
+        <Grid3x3 size={13} />
+        Nine-slice
       </div>
-      <div className="atlas-grid4">
+      <div className="tx-quad">
         {num("L", region.border[0], (v) => onChange({ border: [Math.min(v, w - 1), region.border[1], region.border[2], region.border[3]] }))}
         {num("R", region.border[1], (v) => onChange({ border: [region.border[0], Math.min(v, w - 1), region.border[2], region.border[3]] }))}
         {num("T", region.border[2], (v) => onChange({ border: [region.border[0], region.border[1], Math.min(v, h - 1), region.border[3]] }))}
@@ -816,13 +868,6 @@ function RegionInspector({ region, sheet, onRename, onChange }) {
   );
 }
 
-/**
- * A schematic of what the borders do, at a size the sprite was not authored at.
- *
- * Deliberately not a picture of the artwork: the question a nine-slice border
- * answers is "which parts stretch", and a diagram of the nine cells answers it
- * at a glance where a scaled-up sprite makes you squint at its corners.
- */
 function NineSlicePreview({ region }) {
   const [, , w, h] = region.rect;
   const [l, r, t, b] = region.border;
@@ -843,45 +888,53 @@ function NineSlicePreview({ region }) {
 function AnimationSection({ def, image, selected, onSelect, onChange, onDelete, onAdd }) {
   const animation = def.animations.find((a) => a.name === selected) ?? null;
   return (
-    <div className="atlas-section">
-      <div className="atlas-section-head">
-        Animations <span className="muted">{def.animations.length}</span>
-        <button className="toolbar-btn tiny" disabled={!def.regions.length} onClick={onAdd}>
-          <Plus size={11} />
+    <div className="tx-section">
+      <div className="tx-section-head">
+        <Film size={13} />
+        Animations
+        <span className="tx-count">{def.animations.length}</span>
+        <span className="tx-spacer" />
+        <button
+          className="tx-icon-btn"
+          title="New animation from every region"
+          disabled={!def.regions.length}
+          onClick={onAdd}
+        >
+          <Plus size={12} />
         </button>
       </div>
-      <div className="atlas-list short">
-        {def.animations.map((a) => (
-          <div
-            key={a.name}
-            className={`atlas-row ${a.name === selected ? "active" : ""}`}
-            onClick={() => onSelect(a.name)}
-          >
-            <span className="atlas-row-name">{a.name}</span>
-            <span className="muted">{a.frames.length}f</span>
-            <button
-              className="atlas-row-x"
-              onClick={(e) => {
-                e.stopPropagation();
-                onDelete(a.name);
-              }}
+      {def.animations.length > 0 && (
+        <div className="tx-list short">
+          {def.animations.map((a) => (
+            <div
+              key={a.name}
+              className={`tx-row-item ${a.name === selected ? "active" : ""}`}
+              onClick={() => onSelect(a.name)}
             >
-              <Trash2 size={11} />
-            </button>
-          </div>
-        ))}
-      </div>
+              <span className="tx-name">{a.name}</span>
+              <span className="tx-meta">{a.frames.length}f</span>
+              <button
+                className="tx-icon-btn danger reveal"
+                title="Delete animation"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onDelete(a.name);
+                }}
+              >
+                <Trash2 size={12} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
       {animation && (
         <>
-          <label className="atlas-field">
+          <label className="tx-field">
             <span>Name</span>
-            <input
-              value={animation.name}
-              onChange={(e) => onChange(animation.name, { name: e.target.value })}
-            />
+            <input value={animation.name} onChange={(e) => onChange(animation.name, { name: e.target.value })} />
           </label>
-          <div className="atlas-grid4">
-            <label className="atlas-num">
+          <div className="tx-row">
+            <label className="tx-field" style={{ flex: 1, gridTemplateColumns: "34px minmax(0, 1fr)" }}>
               <span>FPS</span>
               <input
                 type="number" min={0.1} max={120} step={1} value={animation.fps}
@@ -952,7 +1005,7 @@ function AnimationPreview({ def, image, animation }) {
   return (
     <div className="atlas-preview">
       <canvas ref={canvasRef} width={132} height={96} />
-      <button className="toolbar-btn icon-only" onClick={() => setPlaying((p) => !p)}>
+      <button className="tx-btn quiet icon" title={playing ? "Pause" : "Play"} onClick={() => setPlaying((p) => !p)}>
         {playing ? <Pause size={13} /> : <Play size={13} />}
       </button>
     </div>
@@ -1050,10 +1103,10 @@ function GridSliceDialog({ size, onCancel, onApply }) {
           <input value={baseName} onChange={(e) => setBaseName(e.target.value)} />
         </label>
         <div className="texture-dialog-actions">
-          <button className="toolbar-btn" onClick={onCancel}>
+          <button className="tx-btn quiet" onClick={onCancel}>
             Cancel
           </button>
-          <button className="toolbar-btn primary" onClick={() => onApply(options)}>
+          <button className="tx-btn primary" onClick={() => onApply(options)}>
             <Grid3x3 size={13} /> Slice
           </button>
         </div>
@@ -1097,10 +1150,10 @@ function AlphaSliceDialog({ onCancel, onApply }) {
           <input value={baseName} onChange={(e) => setBaseName(e.target.value)} />
         </label>
         <div className="texture-dialog-actions">
-          <button className="toolbar-btn" onClick={onCancel}>
+          <button className="tx-btn quiet" onClick={onCancel}>
             Cancel
           </button>
-          <button className="toolbar-btn primary" onClick={() => onApply({ threshold, minSize, padding, baseName })}>
+          <button className="tx-btn primary" onClick={() => onApply({ threshold, minSize, padding, baseName })}>
             <Wand2 size={13} /> Slice
           </button>
         </div>

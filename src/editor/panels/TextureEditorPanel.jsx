@@ -1,33 +1,45 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  Blend,
   Brush,
   ChevronDown,
   ChevronUp,
+  CircleDashed,
+  CircleDot,
+  Circle as CircleIcon,
   Copy,
   Droplet,
   Eraser,
   Eye,
   EyeOff,
+  Feather,
   Grid3x3,
   Image as ImageIcon,
   Lasso,
   Layers as LayersIcon,
   Lock,
+  Maximize2,
   Minus,
   Move,
   PaintBucket,
   Pipette,
   Plus,
+  Radius,
   Redo2,
+  Repeat,
   Save,
   Scissors,
-  Circle as CircleIcon,
   Square,
   SquareDashed,
+  SquareDot,
+  SquareMinus,
+  SquarePlus,
+  Target,
   Trash2,
   Undo2,
   Unlock,
   Wand2,
+  X,
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
@@ -161,7 +173,7 @@ const TOOLS = [
   { id: "rect", label: "Rectangle", Icon: Square, key: "R" },
   { id: "ellipse", label: "Ellipse", Icon: CircleIcon, key: "O" },
   { id: "selectRect", label: "Rectangle Select", Icon: SquareDashed, key: "M" },
-  { id: "selectEllipse", label: "Ellipse Select", Icon: CircleIcon, key: "" },
+  { id: "selectEllipse", label: "Ellipse Select", Icon: CircleDashed, key: "" },
   { id: "lasso", label: "Lasso", Icon: Lasso, key: "L" },
   { id: "wand", label: "Magic Wand", Icon: Wand2, key: "W" },
   { id: "eyedropper", label: "Eyedropper", Icon: Pipette, key: "I" },
@@ -171,6 +183,38 @@ const TOOLS = [
 const SHAPE_TOOLS = new Set(["line", "rect", "ellipse"]);
 const SELECT_TOOLS = new Set(["selectRect", "selectEllipse", "lasso", "wand"]);
 const PAINT_TOOLS = new Set(["brush", "eraser", "line", "rect", "ellipse"]);
+
+const SELECT_MODES = [
+  { id: "replace", label: "Replace", Icon: SquareDashed },
+  { id: "add", label: "Add to selection", Icon: SquarePlus },
+  { id: "subtract", label: "Subtract from selection", Icon: SquareMinus },
+  { id: "intersect", label: "Intersect with selection", Icon: SquareDot },
+];
+
+const GRADIENT_TYPES = [
+  { id: "linear", label: "Linear gradient", Icon: Minus },
+  { id: "radial", label: "Radial gradient", Icon: Radius },
+];
+
+/** Icon segmented control — replaces a native <select> wherever the options are
+ *  few and picturable. A dropdown here means an unstyleable OS popup for a
+ *  choice that is one click as a row of buttons. */
+function Segmented({ options, value, onChange }) {
+  return (
+    <div className="tx-group">
+      {options.map(({ id, label, Icon }) => (
+        <button
+          key={id}
+          className={`tx-btn icon ${value === id ? "on" : ""}`}
+          title={label}
+          onClick={() => onChange(id)}
+        >
+          <Icon size={14} />
+        </button>
+      ))}
+    </div>
+  );
+}
 
 const isImagePath = (path) => !!path && TEXTURE_EXTENSIONS.includes(extOf(path));
 const isAtlasPath = (path) => !!path && ATLAS_EXTENSIONS.includes(extOf(path));
@@ -239,7 +283,7 @@ export function TextureEditorPanel() {
       <div className="panel-empty texture-editor-gate">
         <ImageIcon size={26} />
         <p>The Texture Editor module is not enabled for this project.</p>
-        <button className="toolbar-btn" onClick={() => setModuleEnabled("texture-editor", true)}>
+        <button className="tx-btn primary" onClick={() => setModuleEnabled("texture-editor", true)}>
           Enable Texture Editor
         </button>
       </div>
@@ -810,57 +854,63 @@ function TextureWorkspace({ path, onPathChange, onAtlasChange, onSliceIntoSprite
 
   return (
     <div className="texture-editor" ref={rootRef} tabIndex={-1}>
-      <div className="panel-toolbar texture-toolbar">
-        <button className="toolbar-btn" onClick={() => setShowNew(true)}>
-          <Plus size={13} /> New
+      <div className="texture-toolbar">
+        <button className="tx-btn" title="New texture…" onClick={() => setShowNew(true)}>
+          <Plus size={14} />
+          <span className="tx-label">New</span>
         </button>
-        <button className="toolbar-btn" disabled={!dirty || saving || !path} onClick={save}>
-          <Save size={13} /> {saving ? "Saving…" : "Save"}
+        <button className="tx-btn" title="Save (Ctrl+S)" disabled={!dirty || saving || !path} onClick={save}>
+          <Save size={14} />
+          <span className="tx-label">{saving ? "Saving…" : "Save"}</span>
         </button>
-        <span className="toolbar-sep" />
-        <button className="toolbar-btn icon-only" title="Undo (Ctrl+Z)" onClick={undo}>
+        <span className="tx-sep" />
+        <button className="tx-btn quiet icon" title="Undo (Ctrl+Z)" onClick={undo}>
           <Undo2 size={14} />
         </button>
-        <button className="toolbar-btn icon-only" title="Redo (Ctrl+Shift+Z)" onClick={redo}>
+        <button className="tx-btn quiet icon" title="Redo (Ctrl+Shift+Z)" onClick={redo}>
           <Redo2 size={14} />
         </button>
-        <span className="toolbar-sep" />
+        <span className="tx-sep" />
         <OperationMenus
           onCommand={runCommand}
           hasSelection={!!selectionRef.current}
           disabled={status !== "ready"}
         />
-        <span className="toolbar-sep" />
+        <span className="tx-sep" />
         <button
-          className={`toolbar-btn icon-only ${tiling ? "active" : ""}`}
+          className={`tx-btn quiet icon ${tiling ? "on" : ""}`}
           title="Tiling preview — repeat the texture to check its seams"
           onClick={() => setTiling((t) => !t)}
         >
           <Grid3x3 size={14} />
         </button>
-        <button
-          className="toolbar-btn"
-          disabled={status !== "ready"}
-          title={
-            hasAtlas
-              ? "Open this sheet's sprite atlas"
-              : "Cut this sheet into sprite regions — creates a .atlas beside it"
-          }
-          onClick={onSliceIntoSprites}
-        >
-          <Scissors size={13} /> {hasAtlas ? "Sprites" : "Slice into Sprites"}
-        </button>
-        <span className="texture-title">
+        {/* Only offered when there is no atlas yet: once one exists the mode
+            tabs above are the way back to it, and two routes to the same place
+            is one more control than the toolbar needs. */}
+        {!hasAtlas && (
+          <button
+            className="tx-btn"
+            disabled={status !== "ready"}
+            title="Cut this sheet into sprite regions — creates a .atlas beside it"
+            onClick={onSliceIntoSprites}
+          >
+            <Scissors size={14} />
+            <span className="tx-label">Slice</span>
+          </button>
+        )}
+        <span className="tx-spacer" />
+        <span className="tx-title" title={path ?? ""}>
           {path ? basename(path) : "No texture open"}
-          {dirty ? " •" : ""}
+          {dirty ? <b>•</b> : null}
         </span>
       </div>
 
       {warning && (
         <div className="texture-warning">
           {warning}
-          <button className="toolbar-btn tiny" onClick={() => setWarning(null)}>
-            Dismiss
+          <span className="tx-spacer" />
+          <button className="tx-icon-btn" title="Dismiss" onClick={() => setWarning(null)}>
+            <X size={13} />
           </button>
         </div>
       )}
@@ -905,7 +955,7 @@ function TextureWorkspace({ path, onPathChange, onAtlasChange, onSliceIntoSprite
             <div className="panel-empty">
               <ImageIcon size={26} />
               <p>Select a texture in the Assets panel, or create a new one.</p>
-              <button className="toolbar-btn" onClick={() => setShowNew(true)}>
+              <button className="tx-btn" onClick={() => setShowNew(true)}>
                 New Texture…
               </button>
             </div>
@@ -1085,6 +1135,11 @@ function TextureCanvas({
   const uploadRef = useRef({ full: true, rect: null }); // what still needs uploading
   const toolRef = useRef(toolProps);
   toolRef.current = toolProps;
+  const readoutRef = useRef(null);
+  // Space is the universal "pan without changing tools" modifier. Held in a ref
+  // and mirrored onto the wrapper as a class, so the cursor changes without a
+  // React render on every keypress.
+  const spaceRef = useRef(false);
 
   /**
    * Pushes the composite (or just the rectangle that changed) into the
@@ -1150,23 +1205,34 @@ function TextureCanvas({
       : { ...rect };
   }, []);
 
+  // Whether the view has ever been framed against a REAL layout. A panel can
+  // mount with a zero-sized wrapper — a dock tab that is not the active one, or
+  // simply the first paint before layout settles — and fitting against 0
+  // clamps the zoom to its minimum and parks the image in the corner. That is
+  // exactly the "my texture isn't there" symptom, and it never recovers on its
+  // own because the resize observer only ever redrew.
+  const fittedRef = useRef(false);
+
   const fit = useCallback(() => {
     const wrap = wrapRef.current;
-    if (!wrap) return;
-    const zoom = Math.min(
-      (wrap.clientWidth - 48) / doc.width,
-      (wrap.clientHeight - 48) / doc.height,
-      8,
-    );
+    if (!wrap) return false;
+    const width = wrap.clientWidth;
+    const height = wrap.clientHeight;
+    if (width < 8 || height < 8) return false;
+    const zoom = Math.max(MIN_ZOOM, Math.min((width - 48) / doc.width, (height - 48) / doc.height, 8));
     viewRef.current = {
-      zoom: Math.max(MIN_ZOOM, zoom),
-      x: wrap.clientWidth / 2 - (doc.width * Math.max(MIN_ZOOM, zoom)) / 2,
-      y: wrap.clientHeight / 2 - (doc.height * Math.max(MIN_ZOOM, zoom)) / 2,
+      zoom,
+      x: width / 2 - (doc.width * zoom) / 2,
+      y: height / 2 - (doc.height * zoom) / 2,
     };
+    fittedRef.current = true;
     bumpView((v) => v + 1);
+    return true;
   }, [doc.width, doc.height]);
 
+  // A new document is a new framing; anything else keeps the user's view.
   useEffect(() => {
+    fittedRef.current = false;
     fit();
   }, [fit]);
 
@@ -1263,6 +1329,29 @@ function TextureCanvas({
       ctx.globalAlpha = 1;
     }
 
+    // Pixel grid, once a texel is big enough for the lines to mean something.
+    // Below ~8x it is a grey wash over the artwork rather than a guide.
+    if (zoom >= 8) {
+      ctx.strokeStyle = "rgba(255,255,255,0.07)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      const firstCol = Math.max(0, Math.floor(-x / zoom));
+      const lastCol = Math.min(doc.width, Math.ceil((w - x) / zoom));
+      for (let col = firstCol; col <= lastCol; col++) {
+        const px = Math.round(x + col * zoom) + 0.5;
+        ctx.moveTo(px, Math.max(y, 0));
+        ctx.lineTo(px, Math.min(y + dh, h));
+      }
+      const firstRow = Math.max(0, Math.floor(-y / zoom));
+      const lastRow = Math.min(doc.height, Math.ceil((h - y) / zoom));
+      for (let row = firstRow; row <= lastRow; row++) {
+        const py = Math.round(y + row * zoom) + 0.5;
+        ctx.moveTo(Math.max(x, 0), py);
+        ctx.lineTo(Math.min(x + dw, w), py);
+      }
+      ctx.stroke();
+    }
+
     // Document border, so an empty transparent texture is still locatable.
     ctx.strokeStyle = "rgba(255,255,255,0.22)";
     ctx.lineWidth = 1;
@@ -1278,10 +1367,36 @@ function TextureCanvas({
       ctx.setLineDash([]);
     }
 
+    // The lasso path, live. Without this the tool is invisible until the
+    // pointer is released, which is indistinguishable from it not working.
+    if (gesture?.kind === "lasso" && gesture.points.length > 1) {
+      ctx.strokeStyle = "rgba(255,255,255,0.9)";
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 3]);
+      ctx.beginPath();
+      ctx.moveTo(x + gesture.points[0][0] * zoom, y + gesture.points[0][1] * zoom);
+      for (let i = 1; i < gesture.points.length; i++) {
+        ctx.lineTo(x + gesture.points[i][0] * zoom, y + gesture.points[i][1] * zoom);
+      }
+      ctx.closePath();
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
     // Brush cursor: a true-size ring is the only reliable way to know what a
     // stroke will cover before committing to it.
     const cursor = cursorRef.current;
     const tp = toolRef.current;
+
+    // Written straight into the DOM rather than through state: this updates on
+    // every pointer move, and a React render per move to print two numbers is
+    // exactly the cost the whole canvas is built to avoid.
+    if (readoutRef.current) {
+      const at = cursor.inside
+        ? `${Math.floor(cursor.x)}, ${Math.floor(cursor.y)}`
+        : `${doc.width} × ${doc.height}`;
+      readoutRef.current.textContent = `${at}   ${Math.round(zoom * 100)}%`;
+    }
     if (cursor.inside && PAINT_TOOLS.has(tp.tool) && !SHAPE_TOOLS.has(tp.tool)) {
       ctx.strokeStyle = "rgba(0,0,0,0.75)";
       ctx.beginPath();
@@ -1293,6 +1408,34 @@ function TextureCanvas({
       ctx.stroke();
     }
   }, [composite, doc.width, doc.height, tiling, syncSurface]);
+
+  useEffect(() => {
+    const set = (down) => (event) => {
+      if (event.code !== "Space" && event.key !== " ") return;
+      const target = event.target;
+      if (target instanceof HTMLElement && /input|textarea|select/i.test(target.tagName)) return;
+      if (spaceRef.current === down) return;
+      spaceRef.current = down;
+      wrapRef.current?.classList.toggle("panning", down);
+      // Space scrolls the page by default, which inside a docked panel means
+      // the whole editor lurches while the user is trying to pan.
+      if (down) event.preventDefault();
+    };
+    const onDown = set(true);
+    const onUp = set(false);
+    const onBlur = () => {
+      spaceRef.current = false;
+      wrapRef.current?.classList.remove("panning");
+    };
+    window.addEventListener("keydown", onDown);
+    window.addEventListener("keyup", onUp);
+    window.addEventListener("blur", onBlur);
+    return () => {
+      window.removeEventListener("keydown", onDown);
+      window.removeEventListener("keyup", onUp);
+      window.removeEventListener("blur", onBlur);
+    };
+  }, []);
 
   // The workspace invalidates through this so every edit — wherever it
   // originates — goes through one upload path.
@@ -1312,10 +1455,16 @@ function TextureCanvas({
   useEffect(() => {
     const wrap = wrapRef.current;
     if (!wrap || typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(() => draw());
+    // The first real size is the first chance to frame the image. After that a
+    // resize is just a repaint — re-fitting would throw away the user's zoom
+    // every time the panel is dragged.
+    const observer = new ResizeObserver(() => {
+      if (!fittedRef.current && fit()) return;
+      draw();
+    });
     observer.observe(wrap);
     return () => observer.disconnect();
-  }, [draw]);
+  }, [draw, fit]);
 
   // --- coordinate helpers -------------------------------------------------
   const toDoc = useCallback((event) => {
@@ -1382,7 +1531,10 @@ function TextureCanvas({
 
   const onPointerDown = useCallback(
     (event) => {
-      if (event.button === 1 || event.altKey || (event.button === 0 && event.shiftKey && event.ctrlKey)) {
+      // Middle mouse or Space+drag pans, the two gestures every paint program
+      // shares. Alt is NOT pan here — it is the temporary eyedropper, which is
+      // the more useful of the two while a brush is in hand.
+      if (event.button === 1 || spaceRef.current) {
         gestureRef.current = { kind: "pan", start: { x: event.clientX, y: event.clientY }, view: { ...viewRef.current } };
         event.currentTarget.setPointerCapture(event.pointerId);
         return;
@@ -1391,6 +1543,12 @@ function TextureCanvas({
       const tp = toolRef.current;
       const point = toDoc(event);
       event.currentTarget.setPointerCapture(event.pointerId);
+
+      if (event.altKey) {
+        const picked = pickColor(composite.current, Math.floor(point.x), Math.floor(point.y));
+        if (picked) onPickColor(toHex(picked));
+        return;
+      }
 
       if (tp.tool === "eyedropper") {
         const picked = pickColor(composite.current, Math.floor(point.x), Math.floor(point.y));
@@ -1519,17 +1677,39 @@ function TextureCanvas({
         // every intermediate size painted underneath it.
         const previous = gesture.stroke.dirty;
         gesture.stroke = createStroke(doc.width, doc.height);
+        let end = point;
+        if (event.shiftKey) {
+          // Shift constrains: a square/circle for the box tools, 45° steps for
+          // a line. Doing it here rather than in the rasterizer keeps the
+          // preview and the committed shape identical by construction.
+          if (tp.tool === "line") {
+            const dx = point.x - gesture.start.x;
+            const dy = point.y - gesture.start.y;
+            const angle = Math.round(Math.atan2(dy, dx) / (Math.PI / 4)) * (Math.PI / 4);
+            const length = Math.hypot(dx, dy);
+            end = {
+              x: gesture.start.x + Math.cos(angle) * length,
+              y: gesture.start.y + Math.sin(angle) * length,
+            };
+          } else {
+            const size = Math.max(Math.abs(point.x - gesture.start.x), Math.abs(point.y - gesture.start.y));
+            end = {
+              x: gesture.start.x + Math.sign(point.x - gesture.start.x || 1) * size,
+              y: gesture.start.y + Math.sign(point.y - gesture.start.y || 1) * size,
+            };
+          }
+        }
         const rect = {
-          x: Math.min(gesture.start.x, point.x),
-          y: Math.min(gesture.start.y, point.y),
-          width: Math.abs(point.x - gesture.start.x),
-          height: Math.abs(point.y - gesture.start.y),
+          x: Math.min(gesture.start.x, end.x),
+          y: Math.min(gesture.start.y, end.y),
+          width: Math.abs(end.x - gesture.start.x),
+          height: Math.abs(end.y - gesture.start.y),
         };
         if (tp.tool === "rect") strokeRect(gesture.stroke, rect, { fill: tp.shapeFill, lineWidth: tp.brushSize / 4 });
         else if (tp.tool === "ellipse") {
           strokeEllipse(gesture.stroke, rect, { fill: tp.shapeFill, lineWidth: tp.brushSize / 4 });
         } else {
-          strokeSegment(gesture.stroke, gesture.start.x, gesture.start.y, point.x, point.y, {
+          strokeSegment(gesture.stroke, gesture.start.x, gesture.start.y, end.x, end.y, {
             radius: tp.brushSize / 2,
             hardness: tp.hardness,
             spacing: 0.1,
@@ -1546,12 +1726,20 @@ function TextureCanvas({
       }
 
       if (gesture.kind === "gradient" || gesture.kind === "marquee") {
-        gesture.current = point;
+        let end = point;
+        if (event.shiftKey && gesture.kind === "marquee") {
+          const size = Math.max(Math.abs(point.x - gesture.start.x), Math.abs(point.y - gesture.start.y));
+          end = {
+            x: gesture.start.x + Math.sign(point.x - gesture.start.x || 1) * size,
+            y: gesture.start.y + Math.sign(point.y - gesture.start.y || 1) * size,
+          };
+        }
+        gesture.current = end;
         gesture.preview = {
-          x: Math.min(gesture.start.x, point.x),
-          y: Math.min(gesture.start.y, point.y),
-          width: Math.abs(point.x - gesture.start.x),
-          height: Math.abs(point.y - gesture.start.y),
+          x: Math.min(gesture.start.x, end.x),
+          y: Math.min(gesture.start.y, end.y),
+          width: Math.abs(end.x - gesture.start.x),
+          height: Math.abs(end.y - gesture.start.y),
         };
         draw();
         return;
@@ -1564,10 +1752,15 @@ function TextureCanvas({
       }
 
       if (gesture.kind === "move") {
-        layer.offset = [
-          Math.round(gesture.origin[0] + (point.x - gesture.start.x)),
-          Math.round(gesture.origin[1] + (point.y - gesture.start.y)),
-        ];
+        let dx = point.x - gesture.start.x;
+        let dy = point.y - gesture.start.y;
+        // Shift locks to the dominant axis — nudging a layer sideways without
+        // drifting a pixel vertically is otherwise a matter of luck.
+        if (event.shiftKey) {
+          if (Math.abs(dx) >= Math.abs(dy)) dy = 0;
+          else dx = 0;
+        }
+        layer.offset = [Math.round(gesture.origin[0] + dx), Math.round(gesture.origin[1] + dy)];
         onPainting(null);
         draw();
       }
@@ -1695,9 +1888,10 @@ function TextureCanvas({
         onWheel={onWheel}
         onContextMenu={(e) => e.preventDefault()}
       />
+      <div className="tx-readout" ref={readoutRef} />
       <div className="texture-view-controls">
         <button
-          className="toolbar-btn icon-only"
+          className="tx-btn quiet icon"
           title="Zoom out"
           onClick={() => {
             viewRef.current.zoom = Math.max(MIN_ZOOM, viewRef.current.zoom / 1.5);
@@ -1706,11 +1900,11 @@ function TextureCanvas({
         >
           <ZoomOut size={14} />
         </button>
-        <button className="toolbar-btn tiny" onClick={fit}>
-          Fit
+        <button className="tx-btn quiet icon" title="Fit to view" onClick={fit}>
+          <Maximize2 size={13} />
         </button>
         <button
-          className="toolbar-btn icon-only"
+          className="tx-btn quiet icon"
           title="Zoom in"
           onClick={() => {
             viewRef.current.zoom = Math.min(MAX_ZOOM, viewRef.current.zoom * 1.5);
@@ -1754,29 +1948,47 @@ function ToolOptions(props) {
 
   return (
     <div className="texture-options">
-      <div className="texture-swatches" title="Primary / secondary colour (X swaps)">
-        <input type="color" value={props.color} onChange={(e) => props.onColor(e.target.value)} />
-        <input type="color" value={props.altColor} onChange={(e) => props.onAltColor(e.target.value)} />
+      <div className="texture-swatches">
+        <input
+          type="color"
+          title="Primary colour"
+          value={props.color}
+          onChange={(e) => props.onColor(e.target.value)}
+        />
+        <input
+          type="color"
+          title="Secondary colour"
+          value={props.altColor}
+          onChange={(e) => props.onAltColor(e.target.value)}
+        />
+        <button
+          className="tx-icon-btn"
+          title="Swap colours (X)"
+          onClick={() => {
+            const a = props.color;
+            props.onColor(props.altColor);
+            props.onAltColor(a);
+          }}
+        >
+          <Repeat size={12} />
+        </button>
       </div>
-      <Slider label="Alpha" value={props.alpha} min={0} max={255} step={1} onChange={props.onAlpha} />
+
+      <Slider Icon={Blend} title="Alpha" value={props.alpha} min={0} max={255} step={1} onChange={props.onAlpha} />
       {showBrush && (
         <>
-          <Slider label="Size" value={props.brushSize} min={1} max={400} step={1} onChange={props.onBrushSize} />
-          <Slider label="Hardness" value={props.hardness} min={0} max={1} step={0.01} onChange={props.onHardness} />
+          <Slider Icon={CircleDot} title="Brush size ([ and ])" value={props.brushSize} min={1} max={400} step={1} onChange={props.onBrushSize} />
+          <Slider Icon={Feather} title="Hardness" value={props.hardness} min={0} max={1} step={0.01} onChange={props.onHardness} />
         </>
       )}
       {(showBrush || tool === "fill" || tool === "gradient") && (
-        <Slider label="Opacity" value={props.opacity} min={0} max={1} step={0.01} onChange={props.onOpacity} />
+        <Slider Icon={Droplet} title="Opacity" value={props.opacity} min={0} max={1} step={0.01} onChange={props.onOpacity} />
       )}
       {showTolerance && (
         <>
-          <Slider label="Tolerance" value={props.tolerance} min={0} max={1} step={0.01} onChange={props.onTolerance} />
-          <label className="texture-check">
-            <input
-              type="checkbox"
-              checked={props.contiguous}
-              onChange={(e) => props.onContiguous(e.target.checked)}
-            />
+          <Slider Icon={Target} title="Tolerance" value={props.tolerance} min={0} max={1} step={0.01} onChange={props.onTolerance} />
+          <label className="texture-check" title="Only fill/select the connected region">
+            <input type="checkbox" checked={props.contiguous} onChange={(e) => props.onContiguous(e.target.checked)} />
             Contiguous
           </label>
         </>
@@ -1788,37 +2000,34 @@ function ToolOptions(props) {
         </label>
       )}
       {tool === "gradient" && (
-        <select value={props.gradientType} onChange={(e) => props.onGradientType(e.target.value)}>
-          <option value="linear">Linear</option>
-          <option value="radial">Radial</option>
-        </select>
+        <Segmented options={GRADIENT_TYPES} value={props.gradientType} onChange={props.onGradientType} />
       )}
       {showSelect && (
-        <select value={props.selectMode} onChange={(e) => props.onSelectMode(e.target.value)}>
-          <option value="replace">Replace</option>
-          <option value="add">Add</option>
-          <option value="subtract">Subtract</option>
-          <option value="intersect">Intersect</option>
-        </select>
+        <Segmented options={SELECT_MODES} value={props.selectMode} onChange={props.onSelectMode} />
       )}
-      <span className="texture-options-spacer" />
-      <button className="toolbar-btn tiny" onClick={props.onSelectAll}>
-        All
-      </button>
-      <button className="toolbar-btn tiny" disabled={!props.hasSelection} onClick={props.onDeselect}>
-        None
-      </button>
-      <button className="toolbar-btn tiny" onClick={props.onInvert}>
-        Invert
-      </button>
+
+      <span className="tx-spacer" />
+      <div className="tx-group">
+        <button className="tx-btn" title="Select all (Ctrl+A)" onClick={props.onSelectAll}>
+          All
+        </button>
+        <button className="tx-btn" title="Deselect (Ctrl+D)" disabled={!props.hasSelection} onClick={props.onDeselect}>
+          None
+        </button>
+        <button className="tx-btn" title="Invert selection (Ctrl+I)" onClick={props.onInvert}>
+          Invert
+        </button>
+      </div>
     </div>
   );
 }
 
-function Slider({ label, value, min, max, step, onChange }) {
+/** Icon, slider, value. The name lives in the tooltip — a strip of five
+ *  spelled-out labels is what made this toolbar wrap onto two lines. */
+function Slider({ Icon, title, value, min, max, step, onChange }) {
   return (
-    <label className="texture-slider">
-      <span>{label}</span>
+    <label className="tx-slider" title={title}>
+      <Icon size={13} />
       <input
         type="range"
         min={min}
@@ -1839,21 +2048,26 @@ function LayerColumn({
   const active = doc.activeId;
   const rows = useMemo(() => [...doc.layers].reverse(), [doc, version]);
   const [renaming, setRenaming] = useState(null);
+  const layer = getLayer(doc, active);
 
   return (
     <div className="texture-layers">
-      <div className="texture-layers-head">
-        <LayersIcon size={13} /> Layers
+      <div className="tx-section-head" style={{ padding: "9px 10px", height: "auto" }}>
+        <LayersIcon size={13} />
+        Layers
+        <span className="tx-count">{doc.layers.length}</span>
       </div>
-      <div className="texture-layer-list">
+
+      <div className="tx-list">
         {rows.map((l) => (
           <div
             key={l.id}
-            className={`texture-layer ${l.id === active ? "active" : ""}`}
+            className={`tx-row-item ${l.id === active ? "active" : ""}`}
             onClick={() => onSelect(l.id)}
           >
             <button
-              className="texture-layer-eye"
+              className="tx-icon-btn"
+              title={l.visible === false ? "Show" : "Hide"}
               onClick={(e) => {
                 e.stopPropagation();
                 onToggle(l.id);
@@ -1875,65 +2089,70 @@ function LayerColumn({
                 }}
               />
             ) : (
-              <span className="texture-layer-name" onDoubleClick={() => setRenaming(l.id)}>
+              <span className="tx-name" onDoubleClick={() => setRenaming(l.id)}>
                 {l.name}
               </span>
             )}
             <button
-              className="texture-layer-lock"
+              className={`tx-icon-btn ${l.locked ? "" : "reveal"}`}
+              title={l.locked ? "Unlock" : "Lock"}
               onClick={(e) => {
                 e.stopPropagation();
                 onLock(l.id);
               }}
             >
-              {l.locked ? <Lock size={12} /> : <Unlock size={12} opacity={0.35} />}
+              {l.locked ? <Lock size={12} /> : <Unlock size={12} />}
             </button>
           </div>
         ))}
       </div>
 
-      {(() => {
-        const l = getLayer(doc, active);
-        if (!l) return null;
-        return (
-          <div className="texture-layer-props">
-            <select value={l.blend ?? "normal"} onChange={(e) => onBlend(l.id, e.target.value)}>
+      {layer && (
+        <div className="texture-layer-props">
+          <label className="tx-field">
+            <span>Blend</span>
+            <select value={layer.blend ?? "normal"} onChange={(e) => onBlend(layer.id, e.target.value)}>
               {BLEND_MODES.map((mode) => (
                 <option key={mode} value={mode}>
                   {mode}
                 </option>
               ))}
             </select>
+          </label>
+          <div className="tx-field">
+            <span>Opacity</span>
             <Slider
-              label="Opacity"
-              value={l.opacity ?? 1}
+              Icon={Droplet}
+              title="Layer opacity"
+              value={layer.opacity ?? 1}
               min={0}
               max={1}
               step={0.01}
-              onChange={(v) => onOpacity(l.id, v)}
+              onChange={(v) => onOpacity(layer.id, v)}
             />
           </div>
-        );
-      })()}
+        </div>
+      )}
 
       <div className="texture-layer-actions">
-        <button className="toolbar-btn icon-only" title="New layer" onClick={onAdd}>
-          <Plus size={13} />
+        <button className="tx-btn quiet icon" title="New layer" onClick={onAdd}>
+          <Plus size={14} />
         </button>
-        <button className="toolbar-btn icon-only" title="Duplicate" onClick={() => onDuplicate(active)}>
-          <Copy size={13} />
+        <button className="tx-btn quiet icon" title="Duplicate layer" onClick={() => onDuplicate(active)}>
+          <Copy size={14} />
         </button>
-        <button className="toolbar-btn icon-only" title="Move up" onClick={() => onReorder(active, +1)}>
-          <ChevronUp size={13} />
+        <button className="tx-btn quiet icon" title="Move up" onClick={() => onReorder(active, +1)}>
+          <ChevronUp size={14} />
         </button>
-        <button className="toolbar-btn icon-only" title="Move down" onClick={() => onReorder(active, -1)}>
-          <ChevronDown size={13} />
+        <button className="tx-btn quiet icon" title="Move down" onClick={() => onReorder(active, -1)}>
+          <ChevronDown size={14} />
         </button>
-        <button className="toolbar-btn icon-only" title="Merge down" onClick={() => onMerge(active)}>
-          <LayersIcon size={13} />
+        <button className="tx-btn quiet icon" title="Merge down" onClick={() => onMerge(active)}>
+          <LayersIcon size={14} />
         </button>
-        <button className="toolbar-btn icon-only danger" title="Delete" onClick={() => onDelete(active)}>
-          <Trash2 size={13} />
+        <span className="tx-spacer" />
+        <button className="tx-btn quiet icon danger" title="Delete layer" onClick={() => onDelete(active)}>
+          <Trash2 size={14} />
         </button>
       </div>
     </div>
@@ -1950,8 +2169,11 @@ function StatusBar({ doc, historyRef, version }) {
       <span>
         {doc.width} × {doc.height}
       </span>
-      <span>{doc.layers.length} layer{doc.layers.length === 1 ? "" : "s"}</span>
-      {undoLabel && <span className="muted">Undo: {undoLabel}</span>}
+      <span>
+        {doc.layers.length} layer{doc.layers.length === 1 ? "" : "s"}
+      </span>
+      <span className="tx-spacer" />
+      {undoLabel && <span>Undo: {undoLabel}</span>}
     </div>
   );
 }
@@ -1985,7 +2207,7 @@ function NewTextureDialog({ onCancel, onCreate }) {
           {[64, 128, 256, 512, 1024, 2048].map((size) => (
             <button
               key={size}
-              className="toolbar-btn tiny"
+              className="tx-btn quiet"
               onClick={() => {
                 setWidth(size);
                 setHeight(size);
@@ -2006,11 +2228,11 @@ function NewTextureDialog({ onCancel, onCreate }) {
           </label>
         )}
         <div className="texture-dialog-actions">
-          <button className="toolbar-btn" onClick={onCancel}>
+          <button className="tx-btn quiet" onClick={onCancel}>
             Cancel
           </button>
           <button
-            className="toolbar-btn primary"
+            className="tx-btn primary"
             onClick={() =>
               onCreate({
                 name,

@@ -216,7 +216,7 @@ const clickText = async (selector, needle) => {
 };
 
 const save = async () => {
-  await clickText(".texture-toolbar .toolbar-btn", "Save");
+  await clickText(".texture-toolbar .tx-btn", "Save");
   await settle(700);
 };
 
@@ -239,14 +239,14 @@ console.log("\nopening");
 console.log("\npainting and saving");
 {
   await paintAcrossCentre();
-  const title = await page.evaluate(() => document.querySelector(".texture-title")?.textContent ?? "");
+  const title = await page.evaluate(() => document.querySelector(".tx-title")?.textContent ?? "");
   check("an unsaved edit is marked in the title", title.includes("•"), title);
 
   await save();
   const { changed, at } = await readWall();
   check("the stroke reached the saved PNG", changed > 50, `${changed} texels differ`);
   check("the corners were left alone", at(0, 0).join() === RED.join(), at(0, 0).join());
-  const cleanTitle = await page.evaluate(() => document.querySelector(".texture-title")?.textContent ?? "");
+  const cleanTitle = await page.evaluate(() => document.querySelector(".tx-title")?.textContent ?? "");
   check("saving clears the dirty marker", !cleanTitle.includes("•"), cleanTitle);
 }
 
@@ -372,7 +372,7 @@ console.log("\nnew texture");
     }
   });
   await settle(200);
-  check("Create is available", await clickText(".texture-dialog-actions .toolbar-btn", "Create"));
+  check("Create is available", await clickText(".texture-dialog-actions .tx-btn", "Create"));
   await settle(1500);
 
   const made = `${ROOT}/textures/Made.png`;
@@ -398,7 +398,7 @@ const readOther = async () => decodePng(new Uint8Array(fs.readFileSync(OTHER)));
 
 /** Opens one of the Image / Adjust / Filter / Channels menus and picks an item. */
 async function menuPick(menu, item) {
-  const opened = await clickText(".texture-toolbar .toolbar-btn", menu);
+  const opened = await clickText(".texture-toolbar .tx-btn", menu);
   if (!opened) return false;
   await settle(200);
   const picked = await page.evaluate((needle) => {
@@ -451,7 +451,7 @@ console.log("\nprocessing menus");
   }
   check("an idle dialog is not re-previewing in a loop", busySamples === 0, `${busySamples}/10 samples busy`);
 
-  check("Cancel is offered", await clickText(".texture-dialog-actions .toolbar-btn", "Cancel"));
+  check("Cancel is offered", await clickText(".texture-dialog-actions .tx-btn", "Cancel"));
   await settle(400);
   await save();
   {
@@ -475,7 +475,7 @@ console.log("\nprocessing menus");
     }
   });
   await settle(200);
-  check("Resize commits", await clickText(".texture-dialog-actions .toolbar-btn", "Resize"));
+  check("Resize commits", await clickText(".texture-dialog-actions .tx-btn", "Resize"));
   await settle(500);
   check("the panel reports the new size", (await statusText()).includes("32 × 32"), await statusText());
   await save();
@@ -516,7 +516,7 @@ console.log("\nchannel packing");
   });
   check("the dialog offers one row per channel", filled === 4, String(filled));
   await settle(200);
-  check("Pack commits", await clickText(".texture-dialog-actions .toolbar-btn", "Pack"));
+  check("Pack commits", await clickText(".texture-dialog-actions .tx-btn", "Pack"));
   await settle(2000);
 
   const packed = `${ROOT}/textures/Packed.png`;
@@ -614,13 +614,13 @@ console.log("\nsprite atlas");
   await page.waitForSelector(".atlas-editor", { timeout: 30000 });
   await settle(1200);
 
-  const regionRows = await page.evaluate(() => document.querySelectorAll(".atlas-list .atlas-row").length);
+  const regionRows = await page.evaluate(() => document.querySelectorAll(".tx-list .tx-row-item").length);
   check("the atlas editor lists its regions", regionRows >= 3, String(regionRows));
 
   // Edit through the UI: set a nine-slice border and a pivot, save, read back.
   const edited = await page.evaluate(() => {
     const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
-    const rows = [...document.querySelectorAll(".atlas-grid4")];
+    const rows = [...document.querySelectorAll(".tx-quad")];
     if (rows.length < 3) return false;
     // grids are: rect (X/Y/W/H), pivot (X/Y + buttons), nine-slice (L/R/T/B)
     const slice = rows[2].querySelectorAll("input[type=number]");
@@ -637,11 +637,11 @@ console.log("\nsprite atlas");
   const sliceCells = await page.evaluate(() => document.querySelectorAll(".atlas-nineslice-cell").length);
   check("the nine-slice schematic appears once a border is set", sliceCells === 9, String(sliceCells));
 
-  const bottomPivot = await clickText(".atlas-grid4 .toolbar-btn", "Bottom");
+  const bottomPivot = await clickText(".tx-row .tx-btn", "Bottom");
   check("the Bottom pivot preset is offered", bottomPivot);
   await settle(300);
 
-  check("Save is offered once the atlas is dirty", await clickText(".atlas-editor .toolbar-btn", "Save"));
+  check("Save is offered once the atlas is dirty", await clickText(".atlas-editor .tx-btn", "Save"));
   await settle(800);
 
   const saved = JSON.parse(fs.readFileSync(atlasFile, "utf8"));
@@ -650,7 +650,7 @@ console.log("\nsprite atlas");
   check("the pivot round-tripped to disk", first.pivot[1] === 1, JSON.stringify(first.pivot));
 
   // Unpack: every region back out as its own file.
-  check("Export Sprites is offered", await clickText(".atlas-editor .toolbar-btn", "Export Sprites"));
+  check("Export Sprites is offered", await clickButtonTitled("Export every region as its own PNG"));
   await settle(1500);
   const outDir = path.join(ROOT, "sprites", "Pack_sprites");
   check("the unpack direction wrote a folder of sprites", fs.existsSync(outDir));
@@ -698,17 +698,18 @@ console.log("\nslicing a lone spritesheet");
 
   // Opening a different sheet must not leave the PREVIOUS one's atlas attached
   // — the button would then be a shortcut to the wrong file's regions.
+  if (process.env.SHOT_PAINT) await page.screenshot({ path: process.env.SHOT_PAINT });
   const toolbarTexts = await page.evaluate(() =>
-    [...document.querySelectorAll(".texture-toolbar .toolbar-btn")].map((b) => b.textContent.trim()),
+    [...document.querySelectorAll(".texture-toolbar .tx-btn")].map((b) => b.textContent.trim()),
   );
   check(
     "a sheet with no atlas does not inherit the last one's",
-    !toolbarTexts.includes("Sprites"),
+    toolbarTexts.includes("Slice"),
     toolbarTexts.join(" | "),
   );
   check(
     "a lone sheet offers a way into slicing",
-    await clickText(".texture-toolbar .toolbar-btn", "Slice into Sprites"),
+    await clickText(".texture-toolbar .tx-btn", "Slice"),
     toolbarTexts.join(" | "),
   );
   await page.waitForSelector(".atlas-editor", { timeout: 20000 });
@@ -716,7 +717,7 @@ console.log("\nslicing a lone spritesheet");
   await settle(600);
 
   // The Slice menu lives on the ATLAS toolbar, not the paint one.
-  const openedSlice = await clickText(".atlas-editor .toolbar-btn", "Slice");
+  const openedSlice = await clickText(".atlas-editor .tx-btn", "Slice");
   await settle(250);
   const pickedGrid = await page.evaluate(() => {
     const el = [...document.querySelectorAll(".dropdown-item")].find((e) =>
@@ -783,13 +784,13 @@ console.log("\nslicing a lone spritesheet");
     }, 0);
   });
   await settle(400);
-  check("Slice commits", await clickText(".texture-dialog-actions .toolbar-btn", "Slice"));
+  check("Slice commits", await clickText(".texture-dialog-actions .tx-btn", "Slice"));
   await settle(600);
 
-  const rows = await page.evaluate(() => document.querySelectorAll(".atlas-list .atlas-row").length);
+  const rows = await page.evaluate(() => document.querySelectorAll(".tx-list .tx-row-item").length);
   check("the sheet was cut into one region per frame", rows >= frames, `${rows} rows`);
 
-  check("Save is offered", await clickText(".atlas-editor .toolbar-btn", "Save"));
+  check("Save is offered", await clickText(".atlas-editor .tx-btn", "Save"));
   await settle(800);
   const sliced = JSON.parse(fs.readFileSync(`${ROOT}/sprites/Walk.atlas`, "utf8"));
   check("the regions reached disk", sliced.regions.length === frames, `${sliced.regions.length} regions`);
@@ -892,6 +893,65 @@ console.log("\nsprite runtime");
   const w = Math.max(...xsOf) - Math.min(...xsOf);
   const h = Math.max(...ysOf) - Math.min(...ysOf);
   check("the quad's world size comes from its pixel size", Math.abs(w - 0.08) < 1e-4 && Math.abs(h - 0.3) < 1e-4, `${w.toFixed(3)} × ${h.toFixed(3)}`);
+}
+
+/* -------------------------------------------------------------------------- */
+/* 12 — double-click a tab bar to maximize, Escape to restore                  */
+/* -------------------------------------------------------------------------- */
+
+console.log("\npanel maximize");
+{
+  const isMaximized = () => page.evaluate(() => !!globalThis.__dockApi?.hasMaximizedGroup?.());
+  const tabBar = await page.evaluate(() => {
+    const panel = document.querySelector(".texture-modes, .texture-editor");
+    const group = panel?.closest(".dv-groupview");
+    const bar = group?.querySelector(".dv-tabs-and-actions-container");
+    if (!bar) return null;
+    const r = bar.getBoundingClientRect();
+    // The empty space to the right of the tabs — clicking a tab itself would
+    // also be valid, but this proves the whole bar is a target.
+    return { x: r.right - 24, y: r.y + r.height / 2 };
+  });
+  check("the panel's tab bar was found", !!tabBar);
+
+  if (tabBar) {
+    check("nothing is maximized to begin with", (await isMaximized()) === false);
+    await page.mouse.move(tabBar.x, tabBar.y);
+    await page.mouse.down();
+    await page.mouse.up();
+    await page.mouse.down({ clickCount: 2 });
+    await page.mouse.up({ clickCount: 2 });
+    await settle(400);
+    check("double-clicking the tab bar maximizes the panel", await isMaximized());
+
+    await page.keyboard.press("Escape");
+    await settle(400);
+    check("Escape restores the layout", (await isMaximized()) === false);
+
+    // Escape must not be greedy: a focused text field owns it first, and a
+    // gesture that also fires while someone is typing is worse than none.
+    await page.mouse.move(tabBar.x, tabBar.y);
+    await page.mouse.down();
+    await page.mouse.up();
+    await page.mouse.down({ clickCount: 2 });
+    await page.mouse.up({ clickCount: 2 });
+    await settle(400);
+    const focused = await page.evaluate(() => {
+      const input = document.querySelector(".texture-editor input[type=range], .atlas-editor input");
+      if (!input) return false;
+      input.focus();
+      return document.activeElement === input;
+    });
+    if (focused) {
+      await page.keyboard.press("Escape");
+      await settle(300);
+      check("Escape in a focused field does not un-maximize", await isMaximized());
+      await page.evaluate(() => document.activeElement?.blur?.());
+    }
+    await page.keyboard.press("Escape");
+    await settle(400);
+    check("and it restores once the field is left", (await isMaximized()) === false);
+  }
 }
 
 /* -------------------------------------------------------------------------- */
