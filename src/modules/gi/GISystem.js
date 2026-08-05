@@ -891,13 +891,6 @@ export class GISystem {
     // position validation can't see that, so the system flushes instead —
     // grain during rotation, converges the moment it stops).
     if (state.screen?.lightShadowPass && this._giShadowFrameU) {
-      // The jitter animates ONLY together with temporal accumulation — an
-      // animated dither without history integration is strictly worse than
-      // the static pattern (the user's live session saw exactly that as
-      // "extremely jumpy" when the animation briefly landed via HMR ahead of
-      // the verified temporal path). `__giShadowTemporal = false` freezes
-      // both, restoring the pre-temporal static-dither behaviour as the A/B.
-      this._giShadowFrameU.value = globalThis.__giShadowTemporal !== false ? this._frame % 4096 : 0;
       const camera = this.engine.camera;
       if (camera) {
         if (this._giPrevVPStore) this._giShadowPrevVPU.value.copy(this._giPrevVPStore);
@@ -913,9 +906,20 @@ export class GISystem {
           (lightHash * 31 + e[12] * 7.1 + e[13] * 13.3 + e[14] * 3.7 + e[8] * 101 + e[9] * 57 + e[10] * 23 + light.intensity) % 1e9;
       }
       const temporalOn = globalThis.__giShadowTemporal !== false;
-      this._giShadowHistWeightU.value =
-        temporalOn && lightHash === this._giShadowLightHash ? 0.9 : 0;
+      const lightsMoved = lightHash !== this._giShadowLightHash;
       this._giShadowLightHash = lightHash;
+      // The jitter animates ONLY while history accumulates. Two rules, both
+      // learned from "extremely jumpy" reports:
+      //   · temporal off (`__giShadowTemporal = false`) → frame held at 0,
+      //     the pre-temporal static dither exactly;
+      //   · a MOVING light flushes history (below) — the jitter must FREEZE
+      //     at its current phase for those frames, or the whole screen
+      //     strobes with fresh noise every frame of a sun drag. Frozen
+      //     phase + zero history = the old stable dither while dragging;
+      //     release the light and accumulation resumes the same frame.
+      if (temporalOn && !lightsMoved) this._giShadowFrameU.value = this._frame % 4096;
+      else if (!temporalOn) this._giShadowFrameU.value = 0;
+      this._giShadowHistWeightU.value = temporalOn && !lightsMoved ? 0.9 : 0;
       // Live lift A/B for the wall-leak question (`__giShadowLift`, voxels;
       // default 1.5 = shipped behaviour).
       if (state.screen.lightShadow?.liftFactor) {

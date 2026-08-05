@@ -741,6 +741,35 @@ export function createGiLightShadowFilterPass({
                   valid.assign(1);
                 });
               });
+              // SILHOUETTE RESCUE: during camera motion, sub-texel rounding
+              // lands ~15% of reprojections on a neighbouring texel whose
+              // surface differs — those pixels used to fall back to the raw
+              // animated dither and flicker with fresh noise every frame
+              // ("extremely jumpy on camera movement"). Search the 3×3 ring
+              // for a position-valid history texel before giving up; what
+              // remains invalid is true disocclusion, which is small and
+              // short-lived.
+              If(valid.lessThan(0.5), () => {
+                for (let dy = -1; dy <= 1; dy++) {
+                  for (let dx = -1; dx <= 1; dx++) {
+                    if (dx === 0 && dy === 0) continue;
+                    const nc = ivec2(
+                      hc.x.add(dx).clamp(0, width - 1),
+                      hc.y.add(dy).clamp(0, height - 1),
+                    ).toVar();
+                    const np = histPosNode.load(nc).toVar();
+                    If(
+                      valid.lessThan(0.5)
+                        .and(np.w.greaterThan(0.5))
+                        .and(np.xyz.sub(P).length().lessThan(float(history.validEps).max(1e-3))),
+                      () => {
+                        histSample.assign(vec4(histShadowNode.load(nc)));
+                        valid.assign(1);
+                      },
+                    );
+                  }
+                }
+              });
             },
           );
         });
