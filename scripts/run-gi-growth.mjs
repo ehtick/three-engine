@@ -52,6 +52,10 @@ page.on("pageerror", (e) => {
 
 // GPU object-creation counters, installed before any engine code runs.
 await page.evaluateOnNewDocument((PROJECT) => {
+  // The editor stops the engine loop for an unfocused viewport
+  // (editorFramePacing) — headless is never focused, so without this every
+  // motion arm reads a sleeping engine (giDisp ~8/s, compute 0.00).
+  globalThis.__editorKeepRendering = true;
   localStorage.setItem("engine.projectRoot.v1", PROJECT);
   localStorage.setItem("engine.recentProjects.v1", JSON.stringify([PROJECT]));
   const c = {
