@@ -46,7 +46,7 @@ await page.setViewport({ width: VIEW[0] || 1400, height: VIEW[1] || 900, deviceS
 await installTauriShim(page, {});
 page.on("console", (m) => {
   const t = m.text();
-  if (/\[gi\] built|\[gi\] occupancy|\[gi\] ray-hit|GROWTH/.test(t)) console.log(`  ${t.slice(0, 200)}`);
+  if (/\[gi\] built|\[gi\] occupancy|\[gi\] ray-hit|\[gi\] deferred|falling back|\[gi\] light shadows|GROWTH/.test(t)) console.log(`  ${t.slice(0, 260)}`);
 });
 page.on("pageerror", (e) => {
   const msg = e.stack ?? e.message ?? String(e);

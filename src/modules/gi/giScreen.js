@@ -250,7 +250,7 @@ export function renderGiGBuffer(renderer, scene, camera, gbuffer, { mirrorMask =
  * fetch. Bundle: `{ target, slots, trace, lift, span }` — GISystem owns all of
  * them because they need the volume (trace/lift/span) and the light slots.
  */
-export function createGiResolve({ gbuffer, targets, width, height, gather, normalOffset, intensity, emitter, radiance, bvhShade = null, ao = null, lightShadow = null }) {
+export function createGiResolve({ gbuffer, targets, width, height, gather, normalOffset, intensity, emitter, radiance, bvhShade = null, ao = null }) {
   // The TARGETS are owned by the caller and outlive every rebuild: materials
   // sample them through persistent texture nodes, so recreating them here
   // would silently leave already-compiled materials bound to dead textures.
@@ -281,21 +281,6 @@ export function createGiResolve({ gbuffer, targets, width, height, gather, norma
     // and the values are produced inside the If below, so they have to be
     // declared outside it and packed afterwards.
     const shadowVars = Array.from({ length: MAX_EMITTERS }, () => float(1).toVar());
-    // Same shape for the analytic-light shadow cones — exactly FOUR, because
-    // the target has exactly four channels and a fifth light slot would have
-    // nowhere to write (it keeps its shadow map instead).
-    //
-    // THE DEFAULT IS 1 (unshadowed) and it is load-bearing: a pixel with no
-    // geometry, a slot with no gi-flagged light, a back-facing receiver — every
-    // path that does not trace must leave the light untouched. A default of 0
-    // would black out whatever it missed, which is the one failure mode a
-    // shadow term must never have.
-    const lightShadowVars = lightShadow ? Array.from({ length: 4 }, () => float(1).toVar()) : null;
-    // PCSS blocker distances (normalized by the shadow span; 0 = no blocker
-    // = no blur). Only allocated when the device afforded the dist target.
-    const lightShadowDistVars = lightShadow?.distTarget
-      ? Array.from({ length: 4 }, () => float(0).toVar())
-      : null;
     If(g0.w.greaterThan(0.5), () => {
       const P = g0.xyz.toVar();
       const rawN = g1.xyz.normalize().toVar();
@@ -372,137 +357,9 @@ export function createGiResolve({ gbuffer, targets, width, height, gather, norma
           if (index < MAX_EMITTERS) shadowVars[index].assign(shadow);
         });
       }
-      // ── GI-TRACED DIRECT SHADOWS ────────────────────────────────────────
-      // One occupancy shadow cone per gi-flagged light slot. Everything here
-      // mirrors the field's analytic-light term (cascadeGather's lightSlots
-      // block) on purpose: the same `vector` convention, the same
-      // `dist - lift` reach, the same k = 1/angularRadius penumbra. Two terms
-      // that disagree about a light's shadow read as the indirect bounce and
-      // the direct light coming from different suns.
-      if (lightShadow) {
-        // THE LIFT IS 1.5 OCCUPANCY VOXELS, not the gather's `normalOffset`.
-        // The trace's own self-plane exclusion is sized off the OCCUPANCY
-        // VOXEL (giField's `planeCut`), because that is the quantization of
-        // the medium that answers the distance query — conservative
-        // voxelization marks every voxel a triangle touches, so a receiver
-        // standing on a surface is INSIDE an occupied voxel and reads its own
-        // floor as an occluder. The gather's ~0.4m field-cell offset is a
-        // different (and here, wrong) scale: too small and every contact
-        // point paints a black band; the ray must also START outside its own
-        // voxel or the first sample is already a hit. This value is handed to
-        // `createSoftShadowTrace` as its `lift` too — the trace compares
-        // distances against `lift + t·cos`, so the two MUST be the same node.
-        lightShadow.slots.slice(0, lightShadowVars.length).forEach((slot, index) => {
-          If(slot.giShadow.greaterThan(0.5).and(slot.active.greaterThan(0.5)), () => {
-            const isDir = float(slot.kind).toVar();
-            const rel = vec3(slot.vector).sub(P).toVar();
-            const pointDist = rel.length().max(1e-4).toVar();
-            // `vector` holds: point → world position, directional → the unit
-            // direction TOWARD the light (giLight.analyticDirectAt and
-            // cascadeGather use exactly this convention).
-            const dir = mix(rel.div(pointDist), vec3(slot.vector), isDir).toVar();
-            // A directional light has no position, so its ray runs until the
-            // volume ends — the trace's own slab exit clamps it, `span` only
-            // has to be generous (the volume diagonal).
-            const dist = mix(pointDist, float(lightShadow.span), isDir).toVar();
-            // THE SHADOW RAY'S FRAME IS LIGHT-RELATIVE, NEVER CAMERA-RELATIVE.
-            // `N` above is the gather's convention — `rawN` flipped toward the
-            // CAMERA — and a visibility term keyed to the camera changes when
-            // the VIEW does: near grazing view angles the flip's sign crosses
-            // zero coherently across a whole flat wall, so the entire wall
-            // flips between "traced" and "skipped" (black one frame, lit the
-            // next) under sub-degree camera motion. Orient the receiver plane
-            // toward the LIGHT instead: an opaque back-lit face gets no
-            // analytic light anyway (three's own max(0, N·L) zeroes it), and
-            // for double-sided sheets — banners, leaves — the light-facing
-            // side is exactly the plane the march must start from.
-            const cosSigned = dir.dot(rawN).toVar();
-            const cosRayNormal = cosSigned.abs().toVar();
-            const shadowOrigin = P.add(rawN.mul(cosSigned.sign()).mul(lightShadow.lift)).toVar();
-            // Terminator handling, on the ABSOLUTE cosine: under ~3° of
-            // incidence a ray hugs its own surface for its whole length,
-            // burns its step budget in tiny near-geometry steps, and the
-            // trace's exhaustion clamp fails it CLOSED — so these rays never
-            // march. But the skipped value is 0, NOT the inert 1: the
-            // GEOMETRIC N·L here is ~0, while the SHADING normal three
-            // actually lights with (normal maps, double-sided foliage's
-            // camera-facing flip) can carry real N·L — a skipped 1 then
-            // renders as a full-sun pixel exactly where crumpled leaf
-            // normals and silhouette rims graze the sun direction. That was
-            // the white-dot population that survived five sampling-side
-            // fixes (DIAG arm 2 convicted the channel; every guard correctly
-            // trusted a lit value carrying a perfectly VALID position).
-            // Only the NO-GEOMETRY path keeps the load-bearing default 1.
-            // (`sign()` at exactly 0 zeroes the lift; that ray stays dark.)
-            lightShadowVars[index].assign(0);
-            If(cosRayNormal.greaterThan(0.05), () => {
-              // ANGULAR RADIUS → PENUMBRA. Directional lights carry it
-              // directly (`soft`, radians — the sun's authored angle);
-              // point/spot lights carry a world-space source RADIUS, whose
-              // angular size is radius/distance and therefore per-pixel. The
-              // clamp floors the sharpest usable cone (0.0005 rad ≈ 0.03°,
-              // well under one half-res pixel at any sane view) and caps the
-              // softest so k can never approach 1, where the estimator would
-              // report a permanent half-shadow everywhere.
-              const rawAngle = mix(float(slot.srcRadius).div(pointDist), float(slot.soft), isDir)
-                .max(0)
-                .toVar();
-              const angle = rawAngle.clamp(0.0005, 0.35).toVar();
-              // The cone arm wants the TRUE half-angle, unclamped — the 0.35
-              // ceiling above exists to keep the analytic estimator's k sane,
-              // and capping the cone there was exactly the "90° looks the
-              // same as 20°" bug. tan is capped at ~44.7° half-angle only to
-              // keep tan() itself finite near π/2; Blender's 90° authored
-              // angle = 45° half-angle sits right at the useful maximum.
-              const tanHalf = tan(rawAngle.min(0.78)).toVar();
-              const maxT = dist.sub(lightShadow.lift).max(0).toVar();
-              // DDA marcher when the bundle carries one (see #buildLightShadow
-              // for why), sphere trace as the hatched fallback. Trailing args
-              // of the sphere arm default to "no lamp self-exclusion": an
-              // analytic light has no body in the field to exclude.
-              // The receiver point rides along for the record march's
-              // origin-plane exclusion (self-shadow phantoms on tilted
-              // receivers); the legacy/sphere arms ignore it. The DDA arm
-              // returns vec2(shadow, blockerDist/span) — the y feeds the
-              // PCSS blur radius at sample time; the sphere arm has no
-              // blocker distance and stays sharp (y = 0).
-              // Interleaved gradient noise, per RESOLVE pixel — the cone
-              // march's lattice-decorrelation rotation (see its jitter note).
-              // Deterministic per pixel and frame-stable: no motion, no
-              // temporal filter needed; the coherent lattice stripe becomes
-              // static fine grain the upsample already averages.
-              const ign = fract(
-                fract(float(coord.x).mul(0.06711056).add(float(coord.y).mul(0.00583715)))
-                  .mul(52.9829189),
-              );
-              const tracedRaw = lightShadow.traceDda
-                ? lightShadow.traceDda(shadowOrigin, dir, maxT, float(1).div(angle), P, tanHalf, ign)
-                : lightShadow.trace(shadowOrigin, dir, maxT, float(1).div(angle), cosRayNormal);
-              const traced = lightShadow.traceDda ? vec2(tracedRaw).toVar() : vec2(tracedRaw, 0).toVar();
-              if (lightShadowDistVars) lightShadowDistVars[index].assign(traced.y);
-              if (lightShadow.freeRadius) {
-                // BURIAL GATE — the answer to the surviving white dots (user-
-                // diagnosed: flipped normals + sub-dead-zone leaks, both of
-                // which make a single ray's verdict a lie no upsample can
-                // launder). Ask the record-aware oracle how much free space
-                // the RAY ORIGIN actually has: a receiver buried inside a
-                // canopy (an inverted-normal leaf lifted into its neighbor, a
-                // leaf-on-leaf pocket under the march's protective skip) reads
-                // ~0 and cannot plausibly see the sun — force dark. An open
-                // receiver's lifted origin reads ≈ the full 1.5-voxel lift
-                // (the record-aware near field measures to the fitted plane,
-                // not the bulged voxel AABB) and passes untouched. One near-
-                // field oracle call against an already-bound buffer.
-                const free = float(lightShadow.freeRadius(shadowOrigin)).toVar();
-                const burial = smoothstep(lightShadow.voxMax.mul(0.5), lightShadow.voxMax.mul(1.25), free);
-                lightShadowVars[index].assign(traced.x.mul(burial));
-              } else {
-                lightShadowVars[index].assign(traced.x);
-              }
-            });
-          });
-        });
-      }
+      // GI-traced direct shadows moved to their OWN pass — see
+      // createGiLightShadowPass below (independent pixel budget; the trace
+      // was the most expensive per-pixel work in this kernel).
       if (bvhShade) {
         const hitTexel = bvhTNode.load(coord).toVar();
         const albedoTexel = bvhAlbedoNode.load(coord).toVar();
@@ -550,23 +407,165 @@ export function createGiResolve({ gbuffer, targets, width, height, gather, norma
     textureStore(emitterShadow, coord, vec4(shadowVars[0], shadowVars[1], shadowVars[2], shadowVars[3]));
     textureStore(radianceTarget, coord, vec4(reflectedOut, 1));
     if (bvhShade) textureStore(bvhShade.target, coord, vec4(bvhOut, bvhValid));
-    // The 4th (or, with bvhShade, 5th) storage texture this pass writes —
-    // which is exactly why GISystem gates the whole feature on the device's
-    // `maxStorageTexturesPerShaderStage` before ever building this bundle.
-    if (lightShadow) {
-      if (lightShadowDistVars) {
-        textureStore(
-          lightShadow.distTarget,
-          coord,
-          vec4(lightShadowDistVars[0], lightShadowDistVars[1], lightShadowDistVars[2], lightShadowDistVars[3]),
-        );
-      }
+  })().compute(width * height);
+
+  return { compute, widthU };
+}
+
+/**
+ * GI-TRACED DIRECT SHADOWS, as their own pass at their OWN resolution.
+ *
+ * One occupancy shadow cone per gi-flagged light slot. Everything here
+ * mirrors the field's analytic-light term (cascadeGather's lightSlots block)
+ * on purpose: the same `vector` convention, the same `dist - lift` reach,
+ * the same k = 1/angularRadius penumbra. Two terms that disagree about a
+ * light's shadow read as the indirect bounce and the direct light coming
+ * from different suns.
+ *
+ * WHY A SEPARATE PASS: the trace behind this texture is the most expensive
+ * per-pixel work the module does (~5-7ns/px measured on the user's Sponza —
+ * ~10ms of the 4×-pixel Play frame), and nothing ties its resolution to the
+ * gather resolve's: the texture is sampled only by materials, through the
+ * position-validated bilateral that already reconstructs full-res edges.
+ * Its pixel count is therefore its own budget (GISystem #lightShadowSize),
+ * and the gbuffer is read at nearest-texel through the resolution ratio.
+ */
+export function createGiLightShadowPass({ gbuffer, lightShadow, width, height, resolveWidth, resolveHeight }) {
+  const widthU = uniform(width, "uint");
+  const positionNode = texture(gbuffer.position);
+  const normalNode = texture(gbuffer.normal);
+  const sx = resolveWidth / width;
+  const sy = resolveHeight / height;
+
+  const compute = Fn(() => {
+    const px = instanceIndex.mod(widthU);
+    const py = instanceIndex.div(widthU);
+    const coord = ivec2(px.toInt(), py.toInt());
+    // Nearest gbuffer texel at the (usually finer) resolve resolution.
+    const gCoord = ivec2(
+      px.toFloat().add(0.5).mul(sx).toInt(),
+      py.toFloat().add(0.5).mul(sy).toInt(),
+    );
+    const g0 = positionNode.load(gCoord).toVar();
+    const g1 = normalNode.load(gCoord).toVar();
+    // Exactly FOUR slots, because the target has exactly four channels — a
+    // fifth gi light keeps its shadow map instead.
+    //
+    // THE DEFAULT IS 1 (unshadowed) and it is load-bearing: a pixel with no
+    // geometry, a slot with no gi-flagged light, a back-facing receiver —
+    // every path that does not trace must leave the light untouched. A
+    // default of 0 would black out whatever it missed, which is the one
+    // failure mode a shadow term must never have.
+    const lightShadowVars = Array.from({ length: 4 }, () => float(1).toVar());
+    // PCSS blocker distances (normalized by the shadow span; 0 = no blocker
+    // = no blur). Only allocated when the device afforded the dist target.
+    const lightShadowDistVars = lightShadow.distTarget
+      ? Array.from({ length: 4 }, () => float(0).toVar())
+      : null;
+    If(g0.w.greaterThan(0.5), () => {
+      const P = g0.xyz.toVar();
+      const rawN = g1.xyz.normalize().toVar();
+      // THE LIFT IS 1.5 OCCUPANCY VOXELS, not the gather's `normalOffset`.
+      // The trace's own self-plane exclusion is sized off the OCCUPANCY
+      // VOXEL (giField's `planeCut`), because that is the quantization of
+      // the medium that answers the distance query — conservative
+      // voxelization marks every voxel a triangle touches, so a receiver
+      // standing on a surface is INSIDE an occupied voxel and reads its own
+      // floor as an occluder. The gather's ~0.4m field-cell offset is a
+      // different (and here, wrong) scale: too small and every contact
+      // point paints a black band; the ray must also START outside its own
+      // voxel or the first sample is already a hit.
+      lightShadow.slots.slice(0, lightShadowVars.length).forEach((slot, index) => {
+        If(slot.giShadow.greaterThan(0.5).and(slot.active.greaterThan(0.5)), () => {
+          const isDir = float(slot.kind).toVar();
+          const rel = vec3(slot.vector).sub(P).toVar();
+          const pointDist = rel.length().max(1e-4).toVar();
+          // `vector` holds: point → world position, directional → the unit
+          // direction TOWARD the light (giLight.analyticDirectAt and
+          // cascadeGather use exactly this convention).
+          const dir = mix(rel.div(pointDist), vec3(slot.vector), isDir).toVar();
+          // A directional light has no position, so its ray runs until the
+          // volume ends — the trace's own slab exit clamps it, `span` only
+          // has to be generous (the volume diagonal).
+          const dist = mix(pointDist, float(lightShadow.span), isDir).toVar();
+          // THE SHADOW RAY'S FRAME IS LIGHT-RELATIVE, NEVER CAMERA-RELATIVE:
+          // a visibility term keyed to the camera flips coherently across a
+          // whole wall near grazing view angles (black one frame, lit the
+          // next). An opaque back-lit face gets no analytic light anyway,
+          // and for double-sided sheets the light-facing side is exactly
+          // the plane the march must start from.
+          const cosSigned = dir.dot(rawN).toVar();
+          const cosRayNormal = cosSigned.abs().toVar();
+          const shadowOrigin = P.add(rawN.mul(cosSigned.sign()).mul(lightShadow.lift)).toVar();
+          // Terminator handling, on the ABSOLUTE cosine: under ~3° of
+          // incidence a ray hugs its own surface for its whole length and
+          // the exhaustion clamp fails it CLOSED — so these rays never
+          // march. The skipped value is 0, NOT the inert 1: the GEOMETRIC
+          // N·L here is ~0 while the SHADING normal three lights with can
+          // carry real N·L — a skipped 1 renders as a full-sun pixel
+          // exactly where crumpled leaf normals graze the sun direction
+          // (the white-dot population that survived five sampling-side
+          // fixes). Only the NO-GEOMETRY path keeps the load-bearing
+          // default 1. (`sign()` at exactly 0 zeroes the lift; dark.)
+          lightShadowVars[index].assign(0);
+          If(cosRayNormal.greaterThan(0.05), () => {
+            // ANGULAR RADIUS → PENUMBRA. Directional lights carry it
+            // directly (`soft`, radians); point/spot lights carry a world
+            // RADIUS whose angular size is radius/distance, per pixel. The
+            // clamp floors the sharpest usable cone and caps the softest so
+            // the analytic k can never approach 1.
+            const rawAngle = mix(float(slot.srcRadius).div(pointDist), float(slot.soft), isDir)
+              .max(0)
+              .toVar();
+            const angle = rawAngle.clamp(0.0005, 0.35).toVar();
+            // The cone arm wants the TRUE half-angle, unclamped — capping
+            // it at 0.35 was exactly the "90° looks the same as 20°" bug;
+            // tan capped at ~44.7° half-angle only to keep tan() finite.
+            const tanHalf = tan(rawAngle.min(0.78)).toVar();
+            const maxT = dist.sub(lightShadow.lift).max(0).toVar();
+            // Interleaved gradient noise, per SHADOW pixel — the cone
+            // march's lattice-decorrelation rotation (see its jitter note).
+            const ign = fract(
+              fract(float(coord.x).mul(0.06711056).add(float(coord.y).mul(0.00583715)))
+                .mul(52.9829189),
+            );
+            // DDA marcher when the bundle carries one, sphere trace as the
+            // hatched fallback. The receiver point rides along for the
+            // record march's origin-plane exclusion; the DDA arm returns
+            // vec2(shadow, blockerDist/span).
+            const tracedRaw = lightShadow.traceDda
+              ? lightShadow.traceDda(shadowOrigin, dir, maxT, float(1).div(angle), P, tanHalf, ign)
+              : lightShadow.trace(shadowOrigin, dir, maxT, float(1).div(angle), cosRayNormal);
+            const traced = lightShadow.traceDda ? vec2(tracedRaw).toVar() : vec2(tracedRaw, 0).toVar();
+            if (lightShadowDistVars) lightShadowDistVars[index].assign(traced.y);
+            if (lightShadow.freeRadius) {
+              // BURIAL GATE — ask the record-aware oracle how much free
+              // space the RAY ORIGIN has: a receiver buried inside a canopy
+              // reads ~0 and cannot plausibly see the sun — force dark. An
+              // open receiver's lifted origin reads ≈ the full 1.5-voxel
+              // lift and passes untouched.
+              const free = float(lightShadow.freeRadius(shadowOrigin)).toVar();
+              const burial = smoothstep(lightShadow.voxMax.mul(0.5), lightShadow.voxMax.mul(1.25), free);
+              lightShadowVars[index].assign(traced.x.mul(burial));
+            } else {
+              lightShadowVars[index].assign(traced.x);
+            }
+          });
+        });
+      });
+    });
+    if (lightShadowDistVars) {
       textureStore(
-        lightShadow.target,
+        lightShadow.distTarget,
         coord,
-        vec4(lightShadowVars[0], lightShadowVars[1], lightShadowVars[2], lightShadowVars[3]),
+        vec4(lightShadowDistVars[0], lightShadowDistVars[1], lightShadowDistVars[2], lightShadowDistVars[3]),
       );
     }
+    textureStore(
+      lightShadow.target,
+      coord,
+      vec4(lightShadowVars[0], lightShadowVars[1], lightShadowVars[2], lightShadowVars[3]),
+    );
   })().compute(width * height);
 
   return { compute, widthU };
@@ -718,7 +717,7 @@ let targetGeneration = 0;
  * material compiled against one of these textures keeps that binding until
  * it is recompiled — and never recompiling materials is the entire point.
  */
-export function createGiTargets(width, height) {
+export function createGiTargets(width, height, shadowWidth = width, shadowHeight = height) {
   // WHY THE VERSION IS FORCED: three invalidates a cached bind group only when
   // `binding.generation !== textureData.generation` (Bindings._update), and
   // `textureData.generation` is just `texture.version` (Textures.updateTexture).
@@ -753,7 +752,12 @@ export function createGiTargets(width, height) {
   // off: one rgba8 half-res texture is ~0.5MB, and making it optional would
   // fork createGiTargets/dispose/the resize swap three ways for nothing. What
   // is conditional is whether anything BINDS it.
-  const lightShadow = new THREE.StorageTexture(width, height);
+  // AT ITS OWN (usually coarser) RESOLUTION: the trace behind this texture is
+  // the most expensive per-pixel work in the module (~5-7ns/px measured), and
+  // it holds smooth visibility that the material-side position-validated
+  // bilateral reconstructs — so its pixel count is a cost knob independent of
+  // the gather resolve's (see GISystem #lightShadowSize).
+  const lightShadow = new THREE.StorageTexture(shadowWidth, shadowHeight);
   lightShadow.name = "giLightShadow";
   lightShadow.version = version;
   // PCSS blocker distance, one channel per light slot like `lightShadow`:
@@ -764,7 +768,7 @@ export function createGiTargets(width, height) {
   // the blur radius — exactly the right thing across a penumbra). Created
   // unconditionally like lightShadow; whether the resolve WRITES it is the
   // device-gated part (an unwritten texture reads 0 → radius 0 → sharp).
-  const lightShadowDist = new THREE.StorageTexture(width, height);
+  const lightShadowDist = new THREE.StorageTexture(shadowWidth, shadowHeight);
   lightShadowDist.name = "giLightShadowDist";
   lightShadowDist.version = version;
   if (import.meta.env?.DEV) globalThis.__giLastTargetVersion = version;

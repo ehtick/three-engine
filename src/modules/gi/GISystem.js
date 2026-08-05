@@ -20,7 +20,7 @@ import { cameraPosition, cos, float, fract, instanceIndex, mix, normalWorld, pos
 import { createRadianceCascades } from "./cascadeTrace.js";
 import { createCascadeMerge } from "./cascadeMerge.js";
 import { createBounceFeedback, createIrradianceGather, createProbeDepthMoments, createProbeIrradiance, createRadianceLookup, depthMomentsAlpha, gatherBias, gatherViewBias, probeSnapAlpha } from "./cascadeGather.js";
-import { blitBvhAtlasTiles, createGiBvhReflect, createGiBvhTarget, createGiGBuffer, createGiResolve, createGiTargets, renderGiGBuffer } from "./giScreen.js";
+import { blitBvhAtlasTiles, createGiBvhReflect, createGiBvhTarget, createGiGBuffer, createGiLightShadowPass, createGiResolve, createGiTargets, renderGiGBuffer } from "./giScreen.js";
 import { resolveMaterialSurface, serializeMeshForBake } from "./voxelizeOnce.js";
 import { createOccupancyDebugMaterial, createSdfDebugMaterial, createGiField } from "./giField.js";
 import { createOccupancyField, describeOccupancyField, quantizeOccupancyRes } from "./occupancyField.js";
@@ -1255,7 +1255,13 @@ export class GISystem {
         this._frame % GI_IDLE_HEARTBEAT_FRAMES !== 0;
       if (idle) {
         frameQueue = state.screen?.resolve?.compute
-          ? [state.screen.resolve.compute, ...debugExtra]
+          ? [
+              state.screen.resolve.compute,
+              // The shadow pass is camera-dependent like the resolve — an
+              // idle-frozen shadow texture would lag every camera move.
+              ...(state.screen.lightShadowPass ? [state.screen.lightShadowPass.compute] : []),
+              ...debugExtra,
+            ]
           : debugExtra;
       }
       // Guard the empty case: `__giFreeze = "all"` produces no computes, and
@@ -1943,10 +1949,11 @@ export class GISystem {
     const renderer = this.engine.renderer;
     if (!renderer?.backend?.device) return null;
     const { width, height } = this.#screenResolveSize();
+    const { width: shadowW, height: shadowH } = this.#lightShadowSize({ width, height });
     try {
       const gbuffer = createGiGBuffer(width, height);
       if (!this._giTargets) {
-        this._giTargets = createGiTargets(width, height);
+        this._giTargets = createGiTargets(width, height, shadowW, shadowH);
         this._giTargetSize = { width, height };
         this._giIrradianceNode = texture(this._giTargets.irradiance);
         this._giEmitterShadowNode = texture(this._giTargets.emitterShadow);
@@ -1971,9 +1978,10 @@ export class GISystem {
       if (lightShadow?.pcss && !this._giLightShadowDistNode) {
         this._giLightShadowDistNode = texture(targets.lightShadowDist);
       }
-      // The shadowNode's tap offsets are half-res texels; runs on every
-      // build (and #syncScreenResolveSize covers the resize path).
-      (this._giLightShadowTexel ??= uniform(new THREE.Vector2())).value.set(1 / width, 1 / height);
+      // The shadowNode's tap offsets are SHADOW-CHANNEL texels (its own
+      // resolution since the pass split); runs on every build (and
+      // #syncScreenResolveSize covers the resize path).
+      (this._giLightShadowTexel ??= uniform(new THREE.Vector2())).value.set(1 / shadowW, 1 / shadowH);
       // The gbuffer POSITION feeds the shadowNode's tap validity (see
       // #acquireLightShadowNode). The gbuffer is per-build, so the persistent
       // node re-points here every time; a resize reuses the same render
@@ -2023,6 +2031,18 @@ export class GISystem {
           }
         : null;
       const resolve = createGiResolve({ gbuffer, targets, width, height, ...inputs });
+      // The shadow trace as its own pass at its own budget — see
+      // createGiLightShadowPass for why it left the resolve kernel.
+      const lightShadowPass = inputs.lightShadow
+        ? createGiLightShadowPass({
+            gbuffer,
+            lightShadow: inputs.lightShadow,
+            width: shadowW,
+            height: shadowH,
+            resolveWidth: width,
+            resolveHeight: height,
+          })
+        : null;
       light.giIrradianceNode = this._giIrradianceNode;
       light.giEmitterShadowNode = emitterSlots ? this._giEmitterShadowNode : null;
       light.giRadianceNode = radianceLookup ? this._giRadianceNode : null;
@@ -2033,7 +2053,7 @@ export class GISystem {
       // smearing white dots across the dark silhouette in front of it.
       light.giPositionNode = this._giShadowPosNode;
       light.giScreenTexel = this._giLightShadowTexel;
-      return { gbuffer, resolve, targets, width, height, ...inputs };
+      return { gbuffer, resolve, lightShadowPass, targets, width, height, shadowWidth: shadowW, shadowHeight: shadowH, ...inputs };
     } catch (error) {
       // Falling back to the in-material path keeps GI working (slowly) rather
       // than rendering an unlit scene.
@@ -2064,23 +2084,26 @@ export class GISystem {
       this._resolveResizes = (this._resolveResizes ?? 0) + 1;
       console.log(`[gi] resolve target resized to ${width}x${height} (was ${screen.width}x${screen.height})`);
     }
+    const { width: shadowW, height: shadowH } = this.#lightShadowSize({ width, height });
     screen.width = width;
     screen.height = height;
+    screen.shadowWidth = shadowW;
+    screen.shadowHeight = shadowH;
     screen.gbuffer.setSize(width, height);
     // New targets at the new size; the persistent nodes are re-pointed at
     // them, which is a binding refresh rather than a shader rebuild (every
     // observed material has hasNode = true, so its bindings refresh per frame
     // — see #markObservedMaterial).
     const previousTargets = screen.targets;
-    screen.targets = createGiTargets(width, height);
+    screen.targets = createGiTargets(width, height, shadowW, shadowH);
     this._giTargets = screen.targets;
     this._giTargetSize = { width, height };
     this._giIrradianceNode.value = screen.targets.irradiance;
     this._giEmitterShadowNode.value = screen.targets.emitterShadow;
     this._giRadianceNode.value = screen.targets.radiance;
-    // The shadowNode's tap offsets are half-res texels — this path skips
-    // #buildScreenResolve, so the uniform must follow the size here too.
-    this._giLightShadowTexel?.value.set(1 / width, 1 / height);
+    // The shadowNode's tap offsets are SHADOW-CHANNEL texels — this path
+    // skips #buildScreenResolve, so the uniform must follow the size here too.
+    this._giLightShadowTexel?.value.set(1 / shadowW, 1 / shadowH);
     // Same swap for the gi light-shadow channel pack. The node is what every
     // gi light's compiled shadow branch holds, so re-pointing it (rather than
     // rebuilding it) is what keeps a viewport resize free of material
@@ -2131,11 +2154,31 @@ export class GISystem {
       radiance: screen.radiance,
       bvhShade: screen.bvhShade,
       ao: screen.ao,
-      lightShadow: screen.lightShadow,
     });
     if (index >= 0) state.queue[index] = screen.resolve.compute;
     if (indexNoFeedback >= 0) state.queueNoFeedback[indexNoFeedback] = screen.resolve.compute;
     if (indexFeedbackOnly >= 0) state.queueFeedbackOnly[indexFeedbackOnly] = screen.resolve.compute;
+    // Same rebuild + splice for the shadow pass (its own size, its own
+    // compute-count, the fresh targets).
+    if (screen.lightShadowPass) {
+      const oldPass = screen.lightShadowPass.compute;
+      const passIndexes = [
+        state.queue.indexOf(oldPass),
+        state.queueNoFeedback.indexOf(oldPass),
+        state.queueFeedbackOnly?.indexOf(oldPass) ?? -1,
+      ];
+      screen.lightShadowPass = createGiLightShadowPass({
+        gbuffer: screen.gbuffer,
+        lightShadow: screen.lightShadow,
+        width: shadowW,
+        height: shadowH,
+        resolveWidth: width,
+        resolveHeight: height,
+      });
+      if (passIndexes[0] >= 0) state.queue[passIndexes[0]] = screen.lightShadowPass.compute;
+      if (passIndexes[1] >= 0) state.queueNoFeedback[passIndexes[1]] = screen.lightShadowPass.compute;
+      if (passIndexes[2] >= 0) state.queueFeedbackOnly[passIndexes[2]] = screen.lightShadowPass.compute;
+    }
     this.#retireTargets(previousTargets);
     // Same follow-up for the BVH reflect compute (GI Phase 3 v1) — it is NOT
     // part of state.queue/queueNoFeedback (see #tick's dispatch comment), so
@@ -2396,6 +2439,30 @@ export class GISystem {
       height = Math.max(16, Math.round(height * s));
     }
     return { width: Math.min(4096, width), height: Math.min(4096, height) };
+  }
+
+  /**
+   * The shadow channel's own resolution, derived from (and never exceeding)
+   * the resolve's. Its trace is the most expensive per-pixel work in the
+   * module (~5-7ns/px measured), and the material-side bilateral validates
+   * every tap against the full-res gbuffer position — so its pixel count is
+   * a nearly-free cost knob. Default 900k px ≈ today's look at a 1440p
+   * viewport; big monitors stop paying quadratically for penumbras.
+   * `lightShadowMaxPixels` prop / `__giShadowResolvePixels` override.
+   */
+  #lightShadowSize(resolve) {
+    const budget =
+      Number(globalThis.__giShadowResolvePixels) ||
+      this.component?.props.lightShadowMaxPixels ||
+      900_000;
+    let { width, height } = resolve;
+    const px = width * height;
+    if (px > budget) {
+      const s = Math.sqrt(budget / px);
+      width = Math.max(16, Math.round(width * s));
+      height = Math.max(16, Math.round(height * s));
+    }
+    return { width, height };
   }
 
   /**
@@ -3038,6 +3105,13 @@ export class GISystem {
       // split — it is 0.1ms and skipping it would stall GI against camera
       // motion, which is the one thing measurement says is currently free.
       queueFeedbackOnly.push(screen.resolve.compute);
+      // The shadow pass is camera-dependent the same way (it reads the
+      // per-frame gbuffer), so it rides every half too.
+      if (screen.lightShadowPass) {
+        queue.push(screen.lightShadowPass.compute);
+        queueNoFeedback.push(screen.lightShadowPass.compute);
+        queueFeedbackOnly.push(screen.lightShadowPass.compute);
+      }
     }
     // Purge three's lights-hash memo — without this the FIRST build of a
     // session renders with the GI light silently inert (see #purgeLightsHashMemo).
