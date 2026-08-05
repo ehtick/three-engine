@@ -58,7 +58,13 @@ export function rayHitModeName(mode) {
  * low/medium keep the lean modes.
  */
 const AUTO_MODE_BY_QUALITY = Object.freeze({
-  low: RayHitMode.HybridBrickBox,
+  // low was HybridBrickBox until 2026-08-05. With the sun-disc stochastic
+  // shadow arm the records ARE the shadow quality: box hits quantize every
+  // silhouette to whole voxels (low's voxels are the biggest), and the box
+  // arm's origin lift leaves a dead zone ~1 voxel deep that the per-pixel
+  // jittered rays escape through — the "holes in the voxel mesh, light leaks"
+  // report. Plane records at low's small grid cost little and fix both.
+  low: RayHitMode.HybridPlane,
   medium: RayHitMode.HybridPlane,
   high: RayHitMode.HybridExactComplex,
   ultra: RayHitMode.HybridExactComplex,

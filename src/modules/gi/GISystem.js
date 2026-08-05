@@ -20,7 +20,7 @@ import { cameraPosition, cos, float, fract, instanceIndex, mix, normalWorld, pos
 import { createRadianceCascades } from "./cascadeTrace.js";
 import { createCascadeMerge } from "./cascadeMerge.js";
 import { createBounceFeedback, createIrradianceGather, createProbeDepthMoments, createProbeIrradiance, createRadianceLookup, depthMomentsAlpha, gatherBias, gatherViewBias, probeSnapAlpha } from "./cascadeGather.js";
-import { blitBvhAtlasTiles, createGiBvhReflect, createGiBvhTarget, createGiGBuffer, createGiLightShadowPass, createGiResolve, createGiTargets, renderGiGBuffer } from "./giScreen.js";
+import { blitBvhAtlasTiles, createGiBvhReflect, createGiBvhTarget, createGiGBuffer, createGiLightShadowFilterPass, createGiLightShadowPass, createGiResolve, createGiTargets, renderGiGBuffer } from "./giScreen.js";
 import { resolveMaterialSurface, serializeMeshForBake } from "./voxelizeOnce.js";
 import { createOccupancyDebugMaterial, createSdfDebugMaterial, createGiField } from "./giField.js";
 import { createOccupancyField, describeOccupancyField, quantizeOccupancyRes } from "./occupancyField.js";
@@ -111,6 +111,12 @@ const CHECKER_WARMUP_FRAMES = 8;
 let giDispatchDepth = 0;
 const giSkippedComputes = new Set();
 const giPendingComputePipelines = new Set();
+if (import.meta.env?.DEV) {
+  // Harness diagnostics (run-gi-spawn-test and friends): lets a probe see
+  // whether the dispatch loop is stuck waiting on pipelines / skipping.
+  globalThis.__giPendingComputePipelines = giPendingComputePipelines;
+  globalThis.__giSkippedComputesSet = giSkippedComputes;
+}
 
 /** Dispatch wrapper for GISystem's own renderer.compute calls — marks skips
  *  as GI-owned so they take the ordered-retry path, not the replay path. */
@@ -1260,6 +1266,7 @@ export class GISystem {
               // The shadow pass is camera-dependent like the resolve — an
               // idle-frozen shadow texture would lag every camera move.
               ...(state.screen.lightShadowPass ? [state.screen.lightShadowPass.compute] : []),
+              ...(state.screen.lightShadowFilterPass ? [state.screen.lightShadowFilterPass.compute] : []),
               ...debugExtra,
             ]
           : debugExtra;
@@ -2026,6 +2033,9 @@ export class GISystem {
         ? {
             ...lightShadow,
             target: targets.lightShadow,
+            // The trace writes RAW; the spatial filter pass averages it into
+            // `target`, which is what every material's shadow branch samples.
+            rawTarget: targets.lightShadowRaw,
             distTarget: lightShadow.pcss ? targets.lightShadowDist : null,
           }
         : null;
@@ -2062,6 +2072,21 @@ export class GISystem {
             resolveHeight: height,
           })
         : null;
+      // Edge-aware average of the stochastic trace — see the pass's comment
+      // for why penumbra smoothing lives here and not in materials. planeEps
+      // rides the occupancy voxel (a node, so refits rescale it).
+      const lightShadowFilterPass = lightShadowPass
+        ? createGiLightShadowFilterPass({
+            gbuffer,
+            source: targets.lightShadowRaw,
+            target: targets.lightShadow,
+            width: shadowW,
+            height: shadowH,
+            resolveWidth: width,
+            resolveHeight: height,
+            planeEps: inputs.lightShadow.voxMax ?? 0.1,
+          })
+        : null;
       light.giIrradianceNode = this._giIrradianceNode;
       light.giEmitterShadowNode = emitterSlots ? this._giEmitterShadowNode : null;
       light.giRadianceNode = radianceLookup ? this._giRadianceNode : null;
@@ -2072,7 +2097,7 @@ export class GISystem {
       // smearing white dots across the dark silhouette in front of it.
       light.giPositionNode = this._giShadowPosNode;
       light.giScreenTexel = this._giLightShadowTexel;
-      return { gbuffer, resolve, lightShadowPass, targets, width, height, shadowWidth: shadowW, shadowHeight: shadowH, ...inputs };
+      return { gbuffer, resolve, lightShadowPass, lightShadowFilterPass, targets, width, height, shadowWidth: shadowW, shadowHeight: shadowH, ...inputs };
     } catch (error) {
       // Falling back to the in-material path keeps GI working (slowly) rather
       // than rendering an unlit scene.
@@ -2135,6 +2160,7 @@ export class GISystem {
       screen.lightShadow = {
         ...screen.lightShadow,
         target: screen.targets.lightShadow,
+        rawTarget: screen.targets.lightShadowRaw,
         distTarget: screen.lightShadow.pcss ? screen.targets.lightShadowDist : null,
       };
     }
@@ -2197,6 +2223,28 @@ export class GISystem {
       if (passIndexes[0] >= 0) state.queue[passIndexes[0]] = screen.lightShadowPass.compute;
       if (passIndexes[1] >= 0) state.queueNoFeedback[passIndexes[1]] = screen.lightShadowPass.compute;
       if (passIndexes[2] >= 0) state.queueFeedbackOnly[passIndexes[2]] = screen.lightShadowPass.compute;
+    }
+    // And the filter pass riding behind it (same fresh targets, same splice).
+    if (screen.lightShadowFilterPass) {
+      const oldFilter = screen.lightShadowFilterPass.compute;
+      const filterIndexes = [
+        state.queue.indexOf(oldFilter),
+        state.queueNoFeedback.indexOf(oldFilter),
+        state.queueFeedbackOnly?.indexOf(oldFilter) ?? -1,
+      ];
+      screen.lightShadowFilterPass = createGiLightShadowFilterPass({
+        gbuffer: screen.gbuffer,
+        source: screen.targets.lightShadowRaw,
+        target: screen.targets.lightShadow,
+        width: shadowW,
+        height: shadowH,
+        resolveWidth: width,
+        resolveHeight: height,
+        planeEps: screen.lightShadow?.voxMax ?? 0.1,
+      });
+      if (filterIndexes[0] >= 0) state.queue[filterIndexes[0]] = screen.lightShadowFilterPass.compute;
+      if (filterIndexes[1] >= 0) state.queueNoFeedback[filterIndexes[1]] = screen.lightShadowFilterPass.compute;
+      if (filterIndexes[2] >= 0) state.queueFeedbackOnly[filterIndexes[2]] = screen.lightShadowFilterPass.compute;
     }
     this.#retireTargets(previousTargets);
     // Same follow-up for the BVH reflect compute (GI Phase 3 v1) — it is NOT
@@ -3130,6 +3178,11 @@ export class GISystem {
         queue.push(screen.lightShadowPass.compute);
         queueNoFeedback.push(screen.lightShadowPass.compute);
         queueFeedbackOnly.push(screen.lightShadowPass.compute);
+      }
+      if (screen.lightShadowFilterPass) {
+        queue.push(screen.lightShadowFilterPass.compute);
+        queueNoFeedback.push(screen.lightShadowFilterPass.compute);
+        queueFeedbackOnly.push(screen.lightShadowFilterPass.compute);
       }
     }
     // Purge three's lights-hash memo — without this the FIRST build of a
@@ -4849,6 +4902,10 @@ export class GISystem {
       z: Math.max(16, Math.round(size.sizeZ / voxelSize)),
     });
 
+    // Fresh field → fresh slot numbering: compact IDs at build time, then
+    // stable for the field's life (see #occupancyContentOf).
+    this._occSlotMap = new Map();
+    this._occSlotNext = 0;
     const { geometries, placements } = this.#occupancyContentOf(meshes);
 
     // `bounds` is the SAME object createGiField will hold and mutate in
@@ -4896,6 +4953,13 @@ export class GISystem {
     const seen = new Set();
     const placements = [];
     const scratch = new THREE.Matrix4();
+    // STABLE slot assignment: a mesh keeps its occupancy slot for the life of
+    // the field (map reset in #buildOccupancyField). This is what lets the
+    // field's incremental setGeometry treat a spawn as an append and a
+    // despawn as a disable — with index-order slots, removing one mesh
+    // renumbered every slot after it, which invalidated the static snapshot
+    // and the whole per-slot bookkeeping on every scene change.
+    const slotMap = (this._occSlotMap ??= new Map());
     for (const mesh of meshes) {
       const record = serializeMeshForBake(mesh);
       if (!record) continue;
@@ -4912,7 +4976,14 @@ export class GISystem {
           mesh.getMatrixAt(instanceId, scratch);
           matrix.copy(scratch).premultiply(mesh.matrixWorld);
         }
-        placements.push({ slot: placements.length, geometryKey: record.geometryKey, matrix, mesh, instanceId });
+        const key = slotKeyOf(mesh, instanceId);
+        let slot = slotMap.get(key);
+        if (slot == null) {
+          slot = this._occSlotNext ?? 0;
+          this._occSlotNext = slot + 1;
+          slotMap.set(key, slot);
+        }
+        placements.push({ slot, geometryKey: record.geometryKey, matrix, mesh, instanceId });
       }
     }
     return { geometries, placements };
@@ -4938,15 +5009,35 @@ export class GISystem {
     const field = this.state?.volume?.occupancyField;
     if (!field) return;
     const { geometries, placements } = this.#occupancyContentOf(meshes);
-    if (placements.length > field.slotCapacity) {
-      // Capacity is a buffer size fixed at creation — growing past it is one of
-      // the few things that genuinely needs the rebuild.
-      console.log(`[gi] occupancy: ${placements.length} placements exceeds capacity ${field.slotCapacity} — rebuilding`);
+    // Slots are stable-for-life now, so the binding constraint is the highest
+    // slot ID, not the placement count — a long spawn/despawn history can
+    // exhaust IDs even with few meshes alive. Capacity is a buffer size fixed
+    // at creation; growing past it genuinely needs the rebuild (which resets
+    // the slot map and re-derives capacity with headroom).
+    const maxSlot = placements.reduce((m, p) => Math.max(m, p.slot), -1);
+    if (maxSlot >= field.slotCapacity) {
+      console.log(`[gi] occupancy: slot ${maxSlot} exceeds capacity ${field.slotCapacity} — rebuilding`);
       this.requestRebuild();
       return;
     }
-    for (const p of placements) field.setSlotMatrix(p.slot, p.matrix);
+    // Placement objects are rebuilt every scan — carry the mover bookkeeping
+    // over by slot, and seed BRAND-NEW placements as freshly-moved so the
+    // quiet-frames demotion applies to them (the field spawns them on the
+    // dynamic side; this is the timer that settles a resting spawn back to
+    // static).
+    const prevBySlot = new Map((field.placements ?? []).map((p) => [p.slot, p]));
+    for (const p of placements) {
+      const prev = prevBySlot.get(p.slot);
+      p._lastMovedFrame = prev ? prev._lastMovedFrame : this._frame;
+    }
+    // GEOMETRY FIRST, matrices second — deliberately reversed from the build
+    // path. The incremental setGeometry flags a brand-new slot DYNAMIC; only
+    // then is its first matrix write a dynamic-slot write. The other order
+    // hits setSlotMatrix while the slot still reads static and forces the
+    // full re-voxelize this whole path exists to avoid. (Chunk sizing does
+    // not depend on the order: setGeometry reads p.matrix, not the uniform.)
     field.setGeometry(geometries, placements);
+    for (const p of placements) field.setSlotMatrix(p.slot, p.matrix);
     field.placements = placements;
     this.#refreshOccupancySlotRemap();
   }

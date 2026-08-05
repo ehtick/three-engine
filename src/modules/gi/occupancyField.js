@@ -382,16 +382,52 @@ export function createOccupancyField(bounds, res0, options = {}) {
   // `__giNoStaticSplit = true` (live, checked per dispatch) restores the
   // old full-re-voxelize-every-frame behaviour as the A/B arm.
   const staticBits = instancedArray(new Uint32Array(level0.words), "uint");
-  const slotDynamic = uniformArray(Array.from({ length: slotCapacity }, () => 0), "float");
+  // slotCapacity + 1 entries: index slotCapacity is a permanent DISABLED
+  // sentinel (2). Every pair-iterating kernel gates with `notEqual(want)`
+  // where want is 0 or 1, so both a slot VALUE of 2 and a pair entry whose
+  // pairSlot points at the sentinel are skipped by every variant with no
+  // kernel change — that is what makes despawn a uniform write and a
+  // tombstoned pair range one array fill.
+  const slotDynamic = uniformArray(
+    Array.from({ length: slotCapacity + 1 }, (_, i) => (i === slotCapacity ? 2 : 0)),
+    "float",
+  );
   let dynamicCount = 0;
   let staticDirty = true;
   const setSlotDynamic = (slot, dyn) => {
     if (slot < 0 || slot >= slotCapacity) return;
     const v = dyn ? 1 : 0;
-    if (slotDynamic.array[slot] === v) return;
+    const prev = slotDynamic.array[slot];
+    // Disabled slots (2) change state only through setSlotEnabled — the
+    // promote/demote cadence must not resurrect a despawned mover.
+    if (prev === v || prev === 2) return;
     slotDynamic.array[slot] = v;
     dynamicCount += v ? 1 : -1;
     staticDirty = true;
+    dirty = true;
+  };
+  /**
+   * Spawn/despawn without a full re-voxelize. A DISABLED slot (2) is skipped
+   * by both sides of the static/dynamic split, so parking a pooled mover is a
+   * uniform write; re-enabling restores the slot as DYNAMIC (spawned things
+   * move — the quiet-frames demotion settles them to static later).
+   * `staticDirty` fires only when a STATIC slot is disabled: its bits/attr
+   * live in the snapshot and must be re-voxelized away. A dynamic slot's
+   * stamps simply stop being replayed on the next fast chain.
+   */
+  const setSlotEnabled = (slot, enabled) => {
+    if (slot < 0 || slot >= slotCapacity) return;
+    const prev = slotDynamic.array[slot];
+    if (enabled) {
+      if (prev !== 2) return;
+      slotDynamic.array[slot] = 1;
+      dynamicCount += 1;
+    } else {
+      if (prev === 2) return;
+      if (prev === 1) dynamicCount -= 1;
+      else staticDirty = true;
+      slotDynamic.array[slot] = 2;
+    }
     dirty = true;
   };
 
@@ -461,7 +497,11 @@ export function createOccupancyField(bounds, res0, options = {}) {
     if (slot < 0 || slot >= slotCapacity) return;
     if (slotAtlas.array[slot] === atlasSlot) return;
     slotAtlas.array[slot] = atlasSlot;
-    staticDirty = true; // attribution numbering changed → the snapshot's attr is stale
+    // Attribution numbering changed. Only a STATIC slot's attr lives in the
+    // snapshot; dynamic (and disabled) slots re-stamp every dispatch, so
+    // their remap is a plain uniform write — this is what keeps pooled
+    // spawn/despawn (which reseats atlas slots) off the full re-voxelize.
+    if (slotDynamic.array[slot] === 0) staticDirty = true;
     dirty = true;
   };
 
@@ -479,6 +519,20 @@ export function createOccupancyField(bounds, res0, options = {}) {
   let pairChunk = instancedArray(new Uint32Array(1), "uint");
   let pairCount = 0;
   let geometryRevision = 0;
+  // ── Incremental bookkeeping (see setGeometry). The buffers above are
+  // allocated with HEADROOM on a full rebuild; afterwards a changed mesh set
+  // is, whenever it fits, an append into the existing arrays + partial GPU
+  // upload + a dispatch-count bump — no new buffer nodes, no compute-graph
+  // rebuild, no geometryRevision bump (which would force a whole-volume
+  // composite), and no staticDirty when only movers changed. That is the
+  // difference between "spawning a ball freezes the game" and a uniform write.
+  let geoRanges = new Map(); // key -> {vertexStart, triStart, triCount, verts}
+  let extentsCache = new Map(); // key -> Float32Array longest-local-axis per tri
+  let slotPairInfo = new Map(); // slot -> {start, count, key, chunkDensity}
+  let enabledSlots = new Set(); // slots present in the last placements list
+  let vertexUsed = 0, triUsed = 0, vertexCap = 0, triCap = 0, pairCap = 0;
+  let vdataArr = null, idataArr = null, pairSlotArr = null, pairTriArr = null, pairChunkArr = null;
+  let pairComputes = []; // every compute dispatched over the pair list
 
   // Local→world per instance slot. The atlas carries the INVERSE (it samples
   // slot SDFs by pushing world points into local space); voxelization pushes
@@ -3704,108 +3758,283 @@ export function createOccupancyField(bounds, res0, options = {}) {
    * @param {{key: string, positions: Float32Array, index: ArrayLike<number>|null}[]} geometries unique, deduped by key
    * @param {{slot: number, geometryKey: string, matrix: THREE.Matrix4}[]} placements one per instance slot
    */
-  const setGeometry = (geometries, placements) => {
-    const t0 = performance.now();
+  // Longest local axis per triangle — rotation-invariant chunk sizing.
+  // Computed from the SOURCE record (not the concatenated arrays) so it can
+  // run before an incremental commit and be cached purely by content key.
+  const computeExtents = (g) => {
+    const verts = Math.floor(g.positions.length / 3);
+    const triCount = Math.floor((g.index ? g.index.length : verts) / 3);
+    const ext = new Float32Array(triCount);
+    for (let ti = 0; ti < triCount; ti++) {
+      const a = (g.index ? g.index[ti * 3 + 0] : ti * 3 + 0) * 3;
+      const b = (g.index ? g.index[ti * 3 + 1] : ti * 3 + 1) * 3;
+      const c = (g.index ? g.index[ti * 3 + 2] : ti * 3 + 2) * 3;
+      let longest = 0;
+      for (let axis = 0; axis < 3; axis++) {
+        const va = g.positions[a + axis], vb = g.positions[b + axis], vc = g.positions[c + axis];
+        longest = Math.max(longest, Math.max(va, vb, vc) - Math.min(va, vb, vc));
+      }
+      ext[ti] = longest;
+    }
+    return ext;
+  };
 
-    // --- concatenate vertices + a GLOBAL index buffer (absolute vertex ids).
-    const ranges = new Map();
-    let vertexTotal = 0;
-    let triTotal = 0;
+  const matrixMaxScale = (matrix) => {
+    const e = matrix.elements;
+    return Math.max(
+      Math.hypot(e[0], e[1], e[2]),
+      Math.hypot(e[4], e[5], e[6]),
+      Math.hypot(e[8], e[9], e[10]),
+    );
+  };
+
+  // Chunk counts for one (placement, geometry) pair. A triangle spanning `n`
+  // voxels on its longest axis can touch at most (n+2)³ voxels; chunking on
+  // that bound over-allocates for thin triangles, and an empty chunk costs one
+  // comparison in the shader (`k >= total` on the first iteration). Over-
+  // allocating is the SAFE direction — an under-allocated chunk count silently
+  // drops voxels, which is a leak, which is the entire bug this module exists
+  // to fix. `density` = worldScale / minVoxel, recorded per slot so a scale-up
+  // (or a refit that shrinks voxels) re-appends instead of under-chunking.
+  const countPairsFor = (ext, density) => {
+    let n = 0;
+    for (let ti = 0; ti < ext.length; ti++) {
+      const span = Math.ceil(ext[ti] * density) + 2;
+      n += Math.max(1, Math.ceil((span * span * span) / CHUNK_VOXELS));
+    }
+    return n;
+  };
+
+  const writePairsFor = (slot, range, ext, density, at) => {
+    let cursor = at;
+    for (let ti = 0; ti < ext.length; ti++) {
+      const span = Math.ceil(ext[ti] * density) + 2;
+      const n = Math.max(1, Math.ceil((span * span * span) / CHUNK_VOXELS));
+      for (let c = 0; c < n; c++) {
+        pairSlotArr[cursor] = slot;
+        pairTriArr[cursor] = range.triStart + ti;
+        pairChunkArr[cursor] = c;
+        cursor++;
+      }
+    }
+    return cursor - at;
+  };
+
+  // Writes one geometry into the concatenated arrays at the current cursors.
+  const appendGeometryData = (g) => {
+    const verts = Math.floor(g.positions.length / 3);
+    const triCount = Math.floor((g.index ? g.index.length : verts) / 3);
+    const r = { vertexStart: vertexUsed, triStart: triUsed, triCount, verts };
+    for (let i = 0; i < verts; i++) {
+      vdataArr[(r.vertexStart + i) * 4 + 0] = g.positions[i * 3 + 0];
+      vdataArr[(r.vertexStart + i) * 4 + 1] = g.positions[i * 3 + 1];
+      vdataArr[(r.vertexStart + i) * 4 + 2] = g.positions[i * 3 + 2];
+    }
+    const base = r.triStart * 3;
+    const corners = r.triCount * 3;
+    if (g.index) {
+      for (let i = 0; i < corners; i++) idataArr[base + i] = r.vertexStart + g.index[i];
+    } else {
+      for (let i = 0; i < corners; i++) idataArr[base + i] = r.vertexStart + i;
+    }
+    vertexUsed += verts;
+    triUsed += triCount;
+    geoRanges.set(g.key, r);
+    if (!extentsCache.has(g.key)) extentsCache.set(g.key, computeExtents(g));
+    return r;
+  };
+
+  /**
+   * FULL rebuild: fresh arrays WITH HEADROOM, fresh buffer nodes, compute
+   * chain rebuild (geometryRevision), full re-voxelize. Runs on the first
+   * build and whenever the incremental path can't absorb the change.
+   */
+  const rebuildGeometryBuffers = (geometries, placements) => {
+    geoRanges = new Map();
+    let vertexTotal = 0, triTotal = 0;
     for (const g of geometries) {
       const verts = Math.floor(g.positions.length / 3);
-      const tris = Math.floor((g.index ? g.index.length : verts) / 3);
-      ranges.set(g.key, { vertexStart: vertexTotal, triStart: triTotal, triCount: tris, verts });
       vertexTotal += verts;
-      triTotal += tris;
+      triTotal += Math.floor((g.index ? g.index.length : verts) / 3);
     }
+    vertexCap = Math.ceil(vertexTotal * 1.3) + 1024;
+    triCap = Math.ceil(triTotal * 1.3) + 1024;
+    vdataArr = new Float32Array(vertexCap * 4);
+    idataArr = new Uint32Array(triCap * 3);
+    vertexUsed = 0;
+    triUsed = 0;
+    for (const g of geometries) appendGeometryData(g);
 
-    const vdata = new Float32Array(Math.max(1, vertexTotal) * 4);
-    const idata = new Uint32Array(Math.max(3, triTotal * 3));
-    for (const g of geometries) {
-      const r = ranges.get(g.key);
-      for (let i = 0; i < r.verts; i++) {
-        vdata[(r.vertexStart + i) * 4 + 0] = g.positions[i * 3 + 0];
-        vdata[(r.vertexStart + i) * 4 + 1] = g.positions[i * 3 + 1];
-        vdata[(r.vertexStart + i) * 4 + 2] = g.positions[i * 3 + 2];
-      }
-      const base = r.triStart * 3;
-      const corners = r.triCount * 3;
-      if (g.index) {
-        for (let i = 0; i < corners; i++) idata[base + i] = r.vertexStart + g.index[i];
-      } else {
-        for (let i = 0; i < corners; i++) idata[base + i] = r.vertexStart + i;
-      }
-    }
-
-    // --- per-triangle LOCAL extent, for rotation-invariant chunking.
-    const extents = new Map();
-    for (const g of geometries) {
-      const r = ranges.get(g.key);
-      const ext = new Float32Array(r.triCount);
-      for (let ti = 0; ti < r.triCount; ti++) {
-        const a = idata[(r.triStart + ti) * 3 + 0] * 4;
-        const b = idata[(r.triStart + ti) * 3 + 1] * 4;
-        const c = idata[(r.triStart + ti) * 3 + 2] * 4;
-        let longest = 0;
-        for (let axis = 0; axis < 3; axis++) {
-          const va = vdata[a + axis], vb = vdata[b + axis], vc = vdata[c + axis];
-          longest = Math.max(longest, Math.max(va, vb, vc) - Math.min(va, vb, vc));
-        }
-        ext[ti] = longest;
-      }
-      extents.set(g.key, ext);
-    }
-
-    // --- the work list. A triangle spanning `n` voxels on its longest axis can
-    // touch at most (n+2)³ voxels; chunking on that bound over-allocates for
-    // thin triangles, and an empty chunk costs one comparison in the shader
-    // (`k >= total` on the first iteration). Over-allocating is the SAFE
-    // direction — an under-allocated chunk count silently drops voxels, which
-    // is a leak, which is the entire bug this module exists to fix.
-    const slots = [];
-    const tris = [];
-    const chunks = [];
     const minVoxel = Math.min(voxel.value.x, voxel.value.y, voxel.value.z);
+    let pairTotal = 0;
+    const perPlacement = [];
     for (const p of placements) {
-      const r = ranges.get(p.geometryKey);
+      const r = geoRanges.get(p.geometryKey);
       if (!r) continue;
-      const ext = extents.get(p.geometryKey);
-      const e = p.matrix.elements;
-      const scale = Math.max(
-        Math.hypot(e[0], e[1], e[2]),
-        Math.hypot(e[4], e[5], e[6]),
-        Math.hypot(e[8], e[9], e[10]),
-      );
-      for (let ti = 0; ti < r.triCount; ti++) {
-        const span = Math.ceil((ext[ti] * scale) / minVoxel) + 2;
-        const n = Math.max(1, Math.ceil((span * span * span) / CHUNK_VOXELS));
-        for (let c = 0; c < n; c++) {
-          slots.push(p.slot);
-          tris.push(r.triStart + ti);
-          chunks.push(c);
-        }
-      }
+      const ext = extentsCache.get(p.geometryKey);
+      const density = matrixMaxScale(p.matrix) / minVoxel;
+      perPlacement.push({ p, r, ext, density });
+      pairTotal += countPairsFor(ext, density);
+    }
+    pairCap = Math.ceil(pairTotal * 1.4) + 4096;
+    pairSlotArr = new Uint32Array(pairCap);
+    pairTriArr = new Uint32Array(pairCap);
+    pairChunkArr = new Uint32Array(pairCap);
+    // Unwritten tail entries read slot 0 — harmless, the dispatch count never
+    // reaches them; the sentinel is only needed for TOMBSTONED live ranges.
+    slotPairInfo = new Map();
+    enabledSlots = new Set();
+    pairCount = 0;
+    for (const { p, r, ext, density } of perPlacement) {
+      const count = writePairsFor(p.slot, r, ext, density, pairCount);
+      slotPairInfo.set(p.slot, { start: pairCount, count, key: p.geometryKey, chunkDensity: density });
+      enabledSlots.add(p.slot);
+      pairCount += count;
     }
 
-    vertexBuffer = instancedArray(vdata, "vec4");
-    indexBuffer = instancedArray(idata, "uint");
-    pairSlot = instancedArray(slots.length ? Uint32Array.from(slots) : new Uint32Array(1), "uint");
-    pairTri = instancedArray(tris.length ? Uint32Array.from(tris) : new Uint32Array(1), "uint");
-    pairChunk = instancedArray(chunks.length ? Uint32Array.from(chunks) : new Uint32Array(1), "uint");
-    pairCount = slots.length;
+    vertexBuffer = instancedArray(vdataArr, "vec4");
+    indexBuffer = instancedArray(idataArr, "uint");
+    pairSlot = instancedArray(pairSlotArr, "uint");
+    pairTri = instancedArray(pairTriArr, "uint");
+    pairChunk = instancedArray(pairChunkArr, "uint");
+    pairComputes = [];
     geometryRevision++;
 
     stats.triangles = triTotal;
     stats.pairs = pairCount;
     stats.slots = placements.length;
-    stats.buildMs = performance.now() - t0;
     staticDirty = true;
     dirty = true;
+  };
+
+  /**
+   * INCREMENTAL path — the spawn/despawn fast lane. Absorbs a changed mesh
+   * set into the existing allocations when everything fits:
+   *   · new geometry keys append into the vertex/index headroom (partial
+   *     GPU upload via updateRanges);
+   *   · new placements (and placements whose geometry/scale changed) append
+   *     pair ranges at the tail and bump the live dispatch count on the
+   *     cached compute nodes (ComputeNode.count is read per dispatch and its
+   *     bounds guard is a uniform — no recompile);
+   *   · vanished placements are DISABLED (slotDynamic = 2), tombstoning
+   *     nothing; a replaced range rewrites its pairSlot entries to the
+   *     sentinel slot so both voxelize variants skip it;
+   *   · brand-new slots are flagged DYNAMIC directly (no staticDirty — they
+   *     have no bits in the snapshot), so a spawned mover rides the FAST
+   *     chain the same frame instead of forcing a full re-voxelize.
+   * Returns false when something doesn't fit — caller falls back to the full
+   * rebuild above.
+   */
+  const tryIncrementalSetGeometry = (geometries, placements) => {
+    if (!vdataArr || geometryRevision === 0) return false;
+    const geomByKey = new Map(geometries.map((g) => [g.key, g]));
+
+    // Validate geometry appends against the headroom.
+    let nv = 0, nt = 0;
+    for (const g of geometries) {
+      if (geoRanges.has(g.key)) continue;
+      const verts = Math.floor(g.positions.length / 3);
+      nv += verts;
+      nt += Math.floor((g.index ? g.index.length : verts) / 3);
+    }
+    if (vertexUsed + nv > vertexCap || triUsed + nt > triCap) return false;
+
+    // Classify placements; count the pair appends before mutating anything.
+    const minVoxel = Math.min(voxel.value.x, voxel.value.y, voxel.value.z);
+    const appends = [];
+    let newPairs = 0;
+    for (const p of placements) {
+      if (p.slot < 0 || p.slot >= slotCapacity) return false;
+      const info = slotPairInfo.get(p.slot);
+      const density = matrixMaxScale(p.matrix) / minVoxel;
+      if (info && info.key === p.geometryKey && density <= info.chunkDensity * 1.02) continue;
+      const g = geomByKey.get(p.geometryKey);
+      if (!g && !geoRanges.has(p.geometryKey)) continue; // mirror of the old `if (!r) continue`
+      const ext = extentsCache.get(p.geometryKey) ?? computeExtents(g);
+      if (!extentsCache.has(p.geometryKey)) extentsCache.set(p.geometryKey, ext);
+      appends.push({ p, ext, density, old: info ?? null });
+      newPairs += countPairsFor(ext, density);
+    }
+    if (pairCount + newPairs > pairCap) return false;
+
+    // ── Commit.
+    let geoDirty = false;
+    for (const g of geometries) {
+      if (geoRanges.has(g.key)) continue;
+      const before = { v: vertexUsed, t: triUsed };
+      const r = appendGeometryData(g);
+      vertexBuffer.value.addUpdateRange(before.v * 4, r.verts * 4);
+      indexBuffer.value.addUpdateRange(before.t * 3, r.triCount * 3);
+      geoDirty = true;
+    }
+    if (geoDirty) {
+      vertexBuffer.value.needsUpdate = true;
+      indexBuffer.value.needsUpdate = true;
+    }
+
+    let pairsDirty = false;
+    for (const { p, ext, density, old } of appends) {
+      if (old) {
+        // Replaced range: point its entries at the sentinel slot so every
+        // variant skips them. A STATIC slot whose geometry/scale changed has
+        // stale bits in the snapshot — that one genuinely needs a full pass.
+        pairSlotArr.fill(slotCapacity, old.start, old.start + old.count);
+        pairSlot.value.addUpdateRange(old.start, old.count);
+        pairsDirty = true;
+        if (slotDynamic.array[p.slot] === 0) staticDirty = true;
+      }
+      const range = geoRanges.get(p.geometryKey);
+      const count = writePairsFor(p.slot, range, ext, density, pairCount);
+      pairSlot.value.addUpdateRange(pairCount, count);
+      pairTri.value.addUpdateRange(pairCount, count);
+      pairChunk.value.addUpdateRange(pairCount, count);
+      slotPairInfo.set(p.slot, { start: pairCount, count, key: p.geometryKey, chunkDensity: density });
+      pairCount += count;
+      pairsDirty = true;
+      // Brand-new slot: spawn it on the DYNAMIC side directly — it has no
+      // footprint in the static snapshot, so no staticDirty. GISystem's
+      // quiet-frames demotion settles it to static if it stops moving.
+      if (!old && slotDynamic.array[p.slot] === 0) {
+        slotDynamic.array[p.slot] = 1;
+        dynamicCount += 1;
+      }
+    }
+    if (pairsDirty) {
+      pairSlot.value.needsUpdate = true;
+      pairTri.value.needsUpdate = true;
+      pairChunk.value.needsUpdate = true;
+      for (const c of pairComputes) c.count = Math.max(1, pairCount);
+    }
+
+    // Presence diff: despawned slots disable, returning slots re-enable.
+    const current = new Set();
+    for (const p of placements) current.add(p.slot);
+    for (const slot of enabledSlots) if (!current.has(slot)) setSlotEnabled(slot, false);
+    for (const slot of current) if (!enabledSlots.has(slot)) setSlotEnabled(slot, true);
+    enabledSlots = current;
+
+    stats.pairs = pairCount;
+    stats.slots = placements.length;
+    stats.triangles = triUsed;
+    stats.incrementalUpdates = (stats.incrementalUpdates ?? 0) + 1;
+    dirty = true;
+    return true;
+  };
+
+  const setGeometry = (geometries, placements) => {
+    const t0 = performance.now();
+    if (!tryIncrementalSetGeometry(geometries, placements)) {
+      rebuildGeometryBuffers(geometries, placements);
+    }
+    stats.buildMs = performance.now() - t0;
   };
 
   /** Updates one slot's local→world matrix. Cheap — this is the drag path. */
   const setSlotMatrix = (slot, matrix) => {
     if (slot < 0 || slot >= slotCapacity) return;
+    // No-op writes are common (every fingerprint scan re-sends every matrix)
+    // and must not invalidate the static snapshot below.
+    if (localToWorld.array[slot].equals(matrix)) return;
     localToWorld.array[slot].copy(matrix);
     // Self-defence for the split: a matrix write on a slot still flagged
     // STATIC invalidates the snapshot (its baked footprint moved). GISystem
@@ -3854,6 +4083,19 @@ export function createOccupancyField(bounds, res0, options = {}) {
 
     setGeometry,
     setSlotMatrix,
+    setSlotEnabled,
+    /** Harness diagnostics for the incremental path (run-gi-spawn-test). */
+    get debugIncremental() {
+      return {
+        pairCount, pairCap, vertexUsed, vertexCap, triUsed, triCap,
+        geometryRevision, dynamicCount, staticDirty, dirty,
+        pairComputeCounts: pairComputes.map((c) => c.count),
+        enabledSlots: [...enabledSlots],
+        slotDynamic: slotDynamic.array.slice(0, 12),
+        slotPairInfo: [...slotPairInfo.entries()].map(([slot, i]) => ({ slot, ...i })),
+      };
+    },
+    debugPairBuffers: () => ({ pairSlot, pairTri, pairChunk, vertexBuffer, indexBuffer }),
     setSlotDynamic,
     slotCapacity,
     /**
@@ -3937,24 +4179,33 @@ export function createOccupancyField(bounds, res0, options = {}) {
         // the whole promote window.
         const voxStatic = buildVoxelizeCompute("static");
         const voxDynamic = buildVoxelizeCompute("dynamic");
+        const surfAccumStatic = surfaceEnabled ? buildSurfAccumCompute() : null;
+        const surfAccumDynamic = surfaceEnabled ? buildSurfAccumCompute("dynamic") : null;
+        const complexStatic = surfaceEnabled && buildComplexWriteCompute ? buildComplexWriteCompute() : null;
+        const complexDynamic = surfaceEnabled && buildComplexWriteCompute ? buildComplexWriteCompute("dynamic") : null;
+        // Every compute dispatched over the pair work-list, so the incremental
+        // setGeometry path can bump their live dispatch count (ComputeNode
+        // .count is read per dispatch; its bounds guard is a uniform).
+        pairComputes = [voxStatic, voxDynamic, surfAccumStatic, surfAccumDynamic, complexStatic, complexDynamic]
+          .filter(Boolean);
         const surfaceChain = surfaceEnabled
           ? [
               copyCompute, hybridBuildCompute,
               surfClearCompute, surfAllocCompute,
-              buildSurfAccumCompute(), surfFinalizeCompute,
+              surfAccumStatic, surfFinalizeCompute,
               // Phase 4 rides the same FULL chain: finalize reserves the
               // triangle ranges, this fills them.
-              ...(buildComplexWriteCompute ? [buildComplexWriteCompute()] : []),
+              ...(complexStatic ? [complexStatic] : []),
             ]
           : [];
         const dynamicSurfaceChain = surfaceEnabled
           ? [
               dynSurfClearCompute, dynSurfAllocCompute,
-              buildSurfAccumCompute("dynamic"), dynSurfFinalizeCompute,
+              surfAccumDynamic, dynSurfFinalizeCompute,
               // Exact mode: the dynamic finalize reserved tail triangle
               // ranges; this fills them — mover edge cells resolve to real
               // triangles instead of boxes.
-              ...(buildComplexWriteCompute ? [buildComplexWriteCompute("dynamic")] : []),
+              ...(complexDynamic ? [complexDynamic] : []),
             ]
           : [];
         computes = {

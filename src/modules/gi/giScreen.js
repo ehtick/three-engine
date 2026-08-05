@@ -336,13 +336,34 @@ export function createGiResolve({ gbuffer, targets, width, height, gather, norma
         const radius = float(ao.radius).max(0.05).toVar();
         const voxN = vec3(ao.occupancy.voxel);
         const allowance = voxN.x.max(voxN.y).max(voxN.z).mul(2).toVar();
+        // THE ALLOWANCE USED TO KILL THE FEATURE BELOW ULTRA (user report:
+        // "not sure the AO toggle is doing anything at all" — it wasn't).
+        // With 2 voxels of allowance and the default 0.6m radius, every tap
+        // with d ≤ allowance contributes exactly 0 by construction: at
+        // medium/low voxel sizes that is ALL FOUR taps, and even at ultra
+        // the surviving taps were normalized against the full falloff sum,
+        // so a fully-buried pixel could only ever reach a fraction of
+        // `strength`. Two corrections, both voxel-size-aware:
+        //   · REACH: the ladder extends to at least 2.5× the allowance, so
+        //     taps clear the self-surface zone at every preset (the oracle's
+        //     bound saturates at ~8 level-0 voxels — 5 voxels of reach stays
+        //     comfortably inside it);
+        //   · NORMALIZATION by the ladder's ACHIEVABLE maximum (Σ falloff ×
+        //     capacity, where capacity = (d − allowance)/d is the most a tap
+        //     can report) instead of the ideal Σ falloff — full occlusion
+        //     now reads as `strength`, not `strength × whatever the
+        //     allowance left`.
+        const reach = radius.max(allowance.mul(2.5)).toVar();
+        const norm = float(0).toVar();
         for (let i = 1; i <= 4; i++) {
-          const d = radius.mul(i / 4);
+          const d = reach.mul(i / 4);
+          const falloff = 1 / 2 ** (i - 1);
           const free = float(ao.occupancy.freeRadiusAtWorld(P.add(N.mul(d)), 3, true, null));
-          occAcc.addAssign(d.sub(allowance).sub(free).max(0).div(d).mul(1 / 2 ** (i - 1)));
+          const capacity = d.sub(allowance).max(0).div(d).toVar();
+          occAcc.addAssign(d.sub(allowance).sub(free).max(0).div(d).mul(falloff));
+          norm.addAssign(capacity.mul(falloff));
         }
-        // Normalize by Σ falloff (1+½+¼+⅛), scale, floor at 0.
-        const obscurance = occAcc.mul(float(ao.strength).div(1.875)).clamp(0, 1);
+        const obscurance = occAcc.div(norm.max(1e-4)).mul(float(ao.strength)).clamp(0, 1);
         out.mulAssign(obscurance.oneMinus());
       }
       if (radiance) {
@@ -568,11 +589,91 @@ export function createGiLightShadowPass({ gbuffer, lightShadow, width, height, r
         vec4(lightShadowDistVars[0], lightShadowDistVars[1], lightShadowDistVars[2], lightShadowDistVars[3]),
       );
     }
+    // Into the RAW texture when the bundle carries one (the spatial filter
+    // pass averages it into the sampled target); straight to the target
+    // otherwise (filter unavailable — degraded but correct).
     textureStore(
-      lightShadow.target,
+      lightShadow.rawTarget ?? lightShadow.target,
       coord,
       vec4(lightShadowVars[0], lightShadowVars[1], lightShadowVars[2], lightShadowVars[3]),
     );
+  })().compute(width * height);
+
+  return { compute, widthU };
+}
+
+/**
+ * EDGE-AWARE SPATIAL FILTER for the traced light-shadow channels.
+ *
+ * The sun-disc stochastic march resolves ONE jittered sun-disc direction per
+ * shadow pixel: unbiased, but a wide penumbra renders as a static IGN dither
+ * (~50% black/white speckle at half occlusion — the "very grainy and noisy"
+ * report). This pass turns the pixel ensemble into the ensemble AVERAGE: a
+ * 21-tap (5×5 minus corners) cross-bilateral at shadow resolution, weights
+ * from the RECEIVER PLANE (gbuffer position/normal) so penumbras smooth along
+ * a surface but never bleed across silhouettes or depth steps. `planeEps` is
+ * the plane-distance tolerance — half an occupancy voxel, the medium's own
+ * quantization, passed as a node so a refit rescales it.
+ *
+ * Filtering happens HERE, at the shadow pass's own budgeted resolution, not
+ * in materials: every gi light's compiled shadow branch samples the filtered
+ * texture through the existing position-validated bilateral upsample, so the
+ * grain fix costs one small compute instead of N material recompiles.
+ */
+export function createGiLightShadowFilterPass({
+  gbuffer, source, target, width, height, resolveWidth, resolveHeight, planeEps,
+}) {
+  const widthU = uniform(width, "uint");
+  const positionNode = texture(gbuffer.position);
+  const normalNode = texture(gbuffer.normal);
+  const shadowNode = texture(source);
+  const sx = resolveWidth / width;
+  const sy = resolveHeight / height;
+
+  const compute = Fn(() => {
+    const px = instanceIndex.mod(widthU);
+    const py = instanceIndex.div(widthU);
+    const coord = ivec2(px.toInt(), py.toInt());
+    const center = vec4(shadowNode.load(coord)).toVar();
+    const gCoord = ivec2(
+      px.toFloat().add(0.5).mul(sx).toInt(),
+      py.toFloat().add(0.5).mul(sy).toInt(),
+    );
+    const g0 = positionNode.load(gCoord).toVar();
+    const out = center.toVar();
+    If(g0.w.greaterThan(0.5), () => {
+      const P = g0.xyz.toVar();
+      const N = vec3(normalNode.load(gCoord).xyz).normalize().toVar();
+      const eps = float(planeEps).max(1e-3).toVar();
+      const acc = vec4(0).toVar();
+      const wSum = float(0).toVar();
+      for (let dy = -2; dy <= 2; dy++) {
+        for (let dx = -2; dx <= 2; dx++) {
+          if (Math.abs(dx) + Math.abs(dy) > 3) continue; // corners add little support
+          const gauss = Math.exp(-(dx * dx + dy * dy) / (2 * 1.6 * 1.6));
+          const tap = ivec2(
+            coord.x.add(dx).clamp(0, width - 1),
+            coord.y.add(dy).clamp(0, height - 1),
+          ).toVar();
+          const tg = ivec2(
+            tap.x.toFloat().add(0.5).mul(sx).toInt(),
+            tap.y.toFloat().add(0.5).mul(sy).toInt(),
+          ).toVar();
+          const q0 = positionNode.load(tg).toVar();
+          const q1 = normalNode.load(tg).toVar();
+          // Same-surface test: distance to the receiver's plane, plus a
+          // normal agreement gate. `q0.w` zeroes sky/no-geometry taps.
+          const planeD = q0.xyz.sub(P).dot(N).abs();
+          const wPlane = float(1).sub(planeD.div(eps)).clamp(0, 1);
+          const wNormal = q1.xyz.normalize().dot(N).sub(0.7).mul(1 / 0.3).clamp(0, 1);
+          const w = wPlane.mul(wNormal).mul(q0.w).mul(gauss).toVar();
+          acc.addAssign(vec4(shadowNode.load(tap)).mul(w));
+          wSum.addAssign(w);
+        }
+      }
+      out.assign(acc.div(wSum.max(1e-4)));
+    });
+    textureStore(target, coord, out);
   })().compute(width * height);
 
   return { compute, widthU };
@@ -767,6 +868,15 @@ export function createGiTargets(width, height, shadowWidth = width, shadowHeight
   const lightShadow = new THREE.StorageTexture(shadowWidth, shadowHeight);
   lightShadow.name = "giLightShadow";
   lightShadow.version = version;
+  // The trace's UNFILTERED output. The sun-disc stochastic march resolves
+  // each pixel's visibility along ONE jittered sun direction — correct in
+  // expectation but dithered (IGN) inside penumbras. The filter pass
+  // (createGiLightShadowFilterPass) averages it into `lightShadow`, which is
+  // what materials sample; nothing ever binds the raw texture but the two
+  // passes.
+  const lightShadowRaw = new THREE.StorageTexture(shadowWidth, shadowHeight);
+  lightShadowRaw.name = "giLightShadowRaw";
+  lightShadowRaw.version = version;
   // PCSS blocker distance, one channel per light slot like `lightShadow`:
   // the trace's occluder distance normalized by the shadow span, driving the
   // sample-time penumbra radius (tan(sourceAngle) x blockerDist — Blender sun
@@ -784,12 +894,14 @@ export function createGiTargets(width, height, shadowWidth = width, shadowHeight
     emitterShadow,
     radiance,
     lightShadow,
+    lightShadowRaw,
     lightShadowDist,
     dispose() {
       irradiance.dispose();
       emitterShadow.dispose();
       radiance.dispose();
       lightShadow.dispose();
+      lightShadowRaw.dispose();
       lightShadowDist.dispose();
     },
   };
