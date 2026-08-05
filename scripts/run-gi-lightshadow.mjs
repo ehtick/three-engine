@@ -133,7 +133,38 @@ const restore = async () => {
       id: giEntity.id, type: "global-illumination", key: "rayHitMode", value: originalRayHitMode,
     });
   }
+  if (process.env.SKIP != null) {
+    await call("component.setProp", {
+      id: giEntity.id, type: "global-illumination", key: "rayHitSkipDistance", value: originalSkip,
+    });
+  }
 };
+
+// SKIP=1|0 — force the Phase-5 coarse ride regardless of the saved prop (the
+// ride's budget-exhaustion bug was only visible with it ON, and the scene may
+// be saved with it OFF from the user's own A/B). MUST flip BEFORE shadowMode:
+// it is structural, and a second compile wave after the claim left the field
+// mid-convergence at measurement (control 2.51 → 0.46, mean check false-FAIL).
+const giProps = componentOf(giEntity, "global-illumination")?.props ?? {};
+const originalSkip = giProps.rayHitSkipDistance !== false;
+if (process.env.SKIP != null) {
+  const want = process.env.SKIP === "1";
+  const r = await call("component.setProp", {
+    id: giEntity.id, type: "global-illumination", key: "rayHitSkipDistance", value: want,
+  });
+  console.log(r.ok ? `  rayHitSkipDistance -> ${want}` : `  rayHitSkipDistance set failed: ${r.error}`);
+  await wait(20000);
+}
+
+// STEPS=<n> — override the light-shadow DDA step budget (__giDirectShadowSteps,
+// read at resolve build time, i.e. after the flip below). The discriminator
+// arm for residual specks: if they vanish at 256 steps they are legacy-DDA
+// budget exhaustion failing open (level>0), not voxelization holes. In-page
+// only; the page dies at exit, nothing to restore.
+if (process.env.STEPS) {
+  await page.evaluate((n) => { globalThis.__giDirectShadowSteps = n; }, Number(process.env.STEPS));
+  console.log(`  __giDirectShadowSteps -> ${process.env.STEPS}`);
+}
 
 // castShadow first: three only compiles a shadow branch for a shadow-casting
 // light, so `shadowMode: "gi"` on a non-caster is inert by construction.
@@ -151,7 +182,6 @@ if (!flip.ok) { await browser.close(); process.exit(1); }
 // survive emissiveShadows=false. A dropped compute batch (the failure this
 // arm exists to catch) collapses the irradiance CONTROL, so the existing
 // checks already judge it.
-const giProps = componentOf(giEntity, "global-illumination")?.props ?? {};
 const originalEmissive = giProps.emissiveShadows !== false;
 // RAYHIT_MODE=<mode|auto> — run the measurement under a different ray-hit
 // mode (the shadow DDA resolves hits through it, so "square shadows" on

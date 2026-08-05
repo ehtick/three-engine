@@ -14,7 +14,10 @@
  */
 export const BRICK_RESOLUTION = 4;
 export const BRICK_VOXEL_COUNT = 64;
-export const MAX_MACRO_STEPS = 128;
+// 192, not 128: the macro grid's worst-case diagonal (e.g. 88+40+56 cells for
+// a 352×160×224 field) is ~184 crossings, so 128 exhausted on long grazing
+// rays even WITHOUT the coarse ride — and exhaustion used to fail open.
+export const MAX_MACRO_STEPS = 192;
 export const MAX_BRICK_STEPS = 16;
 export const MAX_COMPLEX_TRIANGLES = 16;
 
@@ -293,7 +296,7 @@ export function traceHybridBrickBoxesCpu(
   resolution,
   words,
   layout,
-  { tMin = 0, tMax = Infinity, maxMacroSteps = MAX_MACRO_STEPS, pyramid = null } = {},
+  { tMin = 0, tMax = Infinity, maxMacroSteps = MAX_MACRO_STEPS, pyramid = null, failClosed = true } = {},
 ) {
   let t = tMin;
   let axis = -1;
@@ -305,15 +308,27 @@ export function traceHybridBrickBoxesCpu(
   let coarseSkipsL3 = 0;
   let coarseSkipsL4 = 0;
   let coarseDescends = 0;
+  // Discriminates detail from open road at exhaustion: true while the last
+  // processed macro cell carried a brick. Mirrors the GPU var exactly.
+  let lastBrick = false;
   const coarseOut = () => ({ coarseSteps, coarseSkipsL3, coarseSkipsL4, coarseDescends });
+  // Exhaustion used to FAIL OPEN (hit:false), which read as "nothing blocked
+  // this ray" — a hole in geometry, and at grazing incidence a white dot.
+  // Failing closed from detail is the same clamp the legacy traceBody applies.
+  const exhausted = (limit, macroSteps) => (failClosed && lastBrick
+    ? { hit: true, resolved: false, failClosed: true, limit, t, axis, macroSteps, brickSteps, ...coarseOut() }
+    : { hit: false, resolved: false, limit, macroSteps, brickSteps, ...coarseOut() });
   for (let macroSteps = 1; macroSteps <= maxMacroSteps; macroSteps++) {
     if (t >= tMax) return { hit: false, resolved: true, macroSteps, brickSteps, ...coarseOut() };
     const p = cpuPointAt(origin, direction, t);
     if (!cpuInside(p, resolution)) return { hit: false, resolved: true, macroSteps, brickSteps, ...coarseOut() };
     // Conservative pyramid ride above level 2 (level 2 IS one 4^3 macro cell,
     // so descending further would just duplicate the Phase-1 leaf walk). An
-    // occupied ancestor descends WITHOUT advancing t — that consumes a loop
-    // iteration on the GPU too, and step-count parity depends on it.
+    // occupied ancestor descends WITHOUT advancing t; a descend that lands AT
+    // the macro level falls through and processes the macro cell in this SAME
+    // iteration (the GPU does too, and step-count parity depends on it) —
+    // otherwise rays hugging occupied geometry pay two iterations per macro
+    // cell and exhaust the budget at half distance.
     if (pyramid && level > 2) {
       coarseSteps++;
       const scale = 1 << level;
@@ -322,18 +337,19 @@ export function traceHybridBrickBoxesCpu(
       if (levelData.occupied(coarseCell[0], coarseCell[1], coarseCell[2])) {
         coarseDescends++;
         level--;
+        if (level > 2) continue; // still coarse: re-test one level down
+      } else {
+        const next = cpuDdaDelta(p, direction, scale);
+        if (!Number.isFinite(next.delta)) {
+          return { hit: false, resolved: true, macroSteps, brickSteps, ...coarseOut() };
+        }
+        axis = next.axis;
+        if (level === 3) coarseSkipsL3++;
+        else coarseSkipsL4++;
+        t += next.delta + RAY_HIT_DDA_EPSILON;
+        level = Math.min(level + 1, pyramid.levelCount - 1);
         continue;
       }
-      const next = cpuDdaDelta(p, direction, scale);
-      if (!Number.isFinite(next.delta)) {
-        return { hit: false, resolved: true, macroSteps, brickSteps, ...coarseOut() };
-      }
-      axis = next.axis;
-      if (level === 3) coarseSkipsL3++;
-      else coarseSkipsL4++;
-      t += next.delta + RAY_HIT_DDA_EPSILON;
-      level = Math.min(level + 1, pyramid.levelCount - 1);
-      continue;
     }
     const macro = p.map((value) => Math.floor(value / BRICK_RESOLUTION));
     const macroIndex = macroCellLinearIndex(macro[0], macro[1], macro[2], layout.macroResolution);
@@ -344,6 +360,7 @@ export function traceHybridBrickBoxesCpu(
     const macroExit = t + macroNext.delta;
 
     if (metadata.type === MacroCellType.Brick) {
+      lastBrick = true;
       let localT = t;
       let localResolved = false;
       for (let localStep = 0; localStep < MAX_BRICK_STEPS; localStep++) {
@@ -362,9 +379,10 @@ export function traceHybridBrickBoxesCpu(
         axis = cellNext.axis;
         localT += cellNext.delta + RAY_HIT_DDA_EPSILON;
       }
-      if (!localResolved) return { hit: false, resolved: false, limit: "brick", macroSteps, brickSteps, ...coarseOut() };
+      if (!localResolved) return exhausted("brick", macroSteps);
       axis = macroNext.axis;
     } else {
+      lastBrick = false;
       axis = macroNext.axis;
     }
 
@@ -372,7 +390,7 @@ export function traceHybridBrickBoxesCpu(
     t = macroExit + RAY_HIT_DDA_EPSILON;
     if (pyramid) level = 3; // re-ascend after a macro cell, as the GPU does
   }
-  return { hit: false, resolved: false, limit: "macro", brickSteps, ...coarseOut() };
+  return exhausted("macro", maxMacroSteps);
 }
 
 // ---------------------------------------------------------------------------
@@ -1116,6 +1134,7 @@ export function traceHybridPlaneCpu(
     trianglePool = null,
     exactComplex = false,
     pyramid = null,
+    failClosed = true,
   } = {},
 ) {
   const counters = {
@@ -1140,7 +1159,12 @@ export function traceHybridPlaneCpu(
   let coarseSkipsL3 = 0;
   let coarseSkipsL4 = 0;
   let coarseDescends = 0;
+  // Same exhaustion clamp as the Phase-1 tracer above; see its notes.
+  let lastBrick = false;
   const coarseOut = () => ({ coarseSteps, coarseSkipsL3, coarseSkipsL4, coarseDescends });
+  const exhausted = (limit, macroSteps) => (failClosed && lastBrick
+    ? { hit: true, resolved: false, failClosed: true, limit, t, normal: faceNormal(axis), kind: "budget", macroSteps, brickSteps, counters, ...coarseOut() }
+    : { hit: false, resolved: false, limit, macroSteps, brickSteps, counters, ...coarseOut() });
   for (let macroSteps = 1; macroSteps <= maxMacroSteps; macroSteps++) {
     if (t >= tMax) return { hit: false, resolved: true, macroSteps, brickSteps, counters, ...coarseOut() };
     const p = [origin[0] + direction[0] * t, origin[1] + direction[1] * t, origin[2] + direction[2] * t];
@@ -1156,18 +1180,20 @@ export function traceHybridPlaneCpu(
       if (levelData.occupied(coarseCell[0], coarseCell[1], coarseCell[2])) {
         coarseDescends++;
         level--;
+        if (level > 2) continue; // still coarse: re-test one level down
+        // landed at the macro level: fall through, same iteration
+      } else {
+        const next = cpuDdaDelta(p, direction, scale);
+        if (!Number.isFinite(next.delta)) {
+          return { hit: false, resolved: true, macroSteps, brickSteps, counters, ...coarseOut() };
+        }
+        axis = next.axis;
+        if (level === 3) coarseSkipsL3++;
+        else coarseSkipsL4++;
+        t += next.delta + RAY_HIT_DDA_EPSILON;
+        level = Math.min(level + 1, pyramid.levelCount - 1);
         continue;
       }
-      const next = cpuDdaDelta(p, direction, scale);
-      if (!Number.isFinite(next.delta)) {
-        return { hit: false, resolved: true, macroSteps, brickSteps, counters, ...coarseOut() };
-      }
-      axis = next.axis;
-      if (level === 3) coarseSkipsL3++;
-      else coarseSkipsL4++;
-      t += next.delta + RAY_HIT_DDA_EPSILON;
-      level = Math.min(level + 1, pyramid.levelCount - 1);
-      continue;
     }
     const macro = p.map((value) => Math.floor(value / BRICK_RESOLUTION));
     const macroIndex = macroCellLinearIndex(macro[0], macro[1], macro[2], layout.macroResolution);
@@ -1178,6 +1204,7 @@ export function traceHybridPlaneCpu(
     const macroExit = t + macroNext.delta;
 
     if (metadata.type === MacroCellType.Brick || metadata.type === MacroCellType.DynamicBrick) {
+      lastBrick = true;
       const useRecords = metadata.type === MacroCellType.Brick;
       const surfaceOffset = words[brickHeaderWord(layout, macroIndex, BRICK_SURFACE_OFFSET_WORD)];
       const low = words[brickHeaderWord(layout, macroIndex, BRICK_OCCUPANCY_LOW_WORD)];
@@ -1309,9 +1336,10 @@ export function traceHybridPlaneCpu(
         axis = cellNext.axis;
         localT = cellExit + RAY_HIT_DDA_EPSILON;
       }
-      if (!localResolved) return { hit: false, resolved: false, limit: "brick", macroSteps, brickSteps, counters, ...coarseOut() };
+      if (!localResolved) return exhausted("brick", macroSteps);
       axis = macroNext.axis;
     } else {
+      lastBrick = false;
       axis = macroNext.axis;
     }
 
@@ -1319,7 +1347,7 @@ export function traceHybridPlaneCpu(
     t = macroExit + RAY_HIT_DDA_EPSILON;
     if (pyramid) level = 3; // re-ascend after a macro cell, as the GPU does
   }
-  return { hit: false, resolved: false, limit: "macro", brickSteps, counters, ...coarseOut() };
+  return exhausted("macro", maxMacroSteps);
 }
 
 /** CPU mirror of the bounded simple-plane hit and Phase-3 coverage test. */

@@ -16,6 +16,7 @@ import {
   INVALID_RAY_HIT_INDEX,
   MacroCellType,
   buildHybridBrickWords,
+  buildOccupancyPyramidCpu,
   hybridBrickOccupied,
   macroCellWord,
   MACRO_CELL_BRICK_INDEX_WORD,
@@ -96,6 +97,31 @@ for (const ray of ddaRays) {
 }
 check("coarse/local DDA matches legacy occupied-box hits", traversalMatches);
 check("coarse/local DDA counters stay bounded", bounded);
+
+// Phase-5 ride regression: a grazing ray hugging an occupied floor toward a
+// distant wall. Every macro cell along the path is L3-occupied, so before the
+// fused descend the ride burned TWO loop iterations per macro cell, exhausted
+// MAX_MACRO_STEPS at half distance, and failed OPEN — the grazing-angle
+// white-dot class the rayHitSkipDistance A/B exposed in-scene.
+const rideRes = { x: 480, y: 32, z: 64 };
+const rideOccupied = (x, y, z) => y === 4 || x >= 476;
+const ridePacked = buildHybridBrickWords(rideRes, rideOccupied);
+const ridePyramid = buildOccupancyPyramidCpu(rideRes, rideOccupied);
+const rideArgs = [[1.5, 5.5, 32.5], [1, 0, 0], rideRes, ridePacked.words, ridePacked.layout];
+const rideOn = traceHybridBrickBoxesCpu(...rideArgs, { pyramid: ridePyramid });
+const rideOff = traceHybridBrickBoxesCpu(...rideArgs, { pyramid: null });
+check("ride reaches a wall behind a hugged floor (no budget fail-open)",
+  rideOn.hit === true && rideOn.resolved === true && rideOn.failClosed === undefined);
+check("ride and no-ride agree on the wall hit",
+  rideOff.hit === true && rideOn.voxel.join(",") === rideOff.voxel.join(",") && near(rideOn.t, rideOff.t, 1e-3));
+check("fused descend keeps the ride within +10% of the no-ride budget",
+  rideOn.macroSteps <= rideOff.macroSteps * 1.1 + 2);
+const rideStarved = traceHybridBrickBoxesCpu(...rideArgs, { pyramid: ridePyramid, maxMacroSteps: 8 });
+check("a starved in-detail march fails CLOSED", rideStarved.hit === true && rideStarved.failClosed === true);
+const rideStarvedAb = traceHybridBrickBoxesCpu(...rideArgs, { pyramid: ridePyramid, maxMacroSteps: 8, failClosed: false });
+check("failClosed:false preserves the old open verdict for A/B", rideStarvedAb.hit === false);
+const openStarved = traceHybridBrickBoxesCpu([1.5, 20.5, 32.5], [1, 0, 0], rideRes, ridePacked.words, ridePacked.layout, { pyramid: null, maxMacroSteps: 2 });
+check("a starved OPEN-space march still fails open", openStarved.hit === false && openStarved.failClosed === undefined);
 
 const plane = [
   { a: [-1, -1, 0], b: [1, -1, 0], c: [1, 1, 0] },

@@ -1664,6 +1664,9 @@ export function createOccupancyField(bounds, res0, options = {}) {
               const resolved = float(0).toVar();
               const invalidRef = float(0).toVar();
               const brickLimit = float(0).toVar();
+              // Detail discriminator for the exhaustion clamp below: 1 while
+              // the last processed macro cell carried a brick.
+              const lastBrick = float(0).toVar();
               // Skip off starts AT the macro level, so the ride is not merely
               // predicated away — levels 3-4 are never read.
               const level = int(coarseSkipEnabled ? OCC_LEVELS - 1 : 2).toVar();
@@ -1732,6 +1735,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
                 ).toVar();
 
                 If(cellType.equal(uint(MacroCellType.Brick)), () => {
+                  lastBrick.assign(1);
                   const validBrick = brickIndex.lessThan(uint(hybridLayout.brickCount))
                     .and(brickIndex.notEqual(uint(INVALID_RAY_HIT_INDEX)));
                   If(validBrick.not(), () => {
@@ -1810,6 +1814,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
                   // off `level` must stay pinned at the macro level forever.
                   if (coarseSkipEnabled) level.assign(int(3));
                 }).Else(() => {
+                  lastBrick.assign(0);
                   axis.assign(macroAxis);
                   t.assign(macroExit.add(RAY_HIT_DDA_EPSILON));
                   if (coarseSkipEnabled) level.assign(int(3));
@@ -1819,7 +1824,16 @@ export function createOccupancyField(bounds, res0, options = {}) {
                 // Reuse the existing conservative pyramid above level 2.
                 // Level 2 is exactly one 4^3 macrocell, so levels 3-4 provide
                 // broad empty-space skips without changing Phase-1 leaf data.
+                //
+                // FUSED DESCEND: a descend spends no distance, so one that
+                // lands AT the macro level runs macroBody in this SAME
+                // iteration (the flag below). The old shape burned a whole
+                // iteration per descend, so a ray hugging occupied geometry
+                // paid TWO iterations per macro cell — grazing sun rays
+                // exhausted the macro budget at half distance and failed open:
+                // the white-dot class the skip-off A/B exposed.
                 if (coarseSkipEnabled) {
+                  const rideAdvanced = float(0).toVar();
                   If(level.greaterThan(int(2)), () => {
                     usedCoarseSteps.addAssign(uint(1));
                     const scale = levelSelect(level, (l) => l.scale).toVar();
@@ -1844,12 +1858,29 @@ export function createOccupancyField(bounds, res0, options = {}) {
                       coarseSkipsL3.addAssign(select(level.equal(int(3)), uint(1), uint(0)));
                       coarseSkipsL4.addAssign(select(level.greaterThan(int(3)), uint(1), uint(0)));
                       level.assign(level.add(int(1)).min(int(OCC_LEVELS - 1)));
+                      rideAdvanced.assign(1);
                     });
-                  }).Else(macroBody);
+                  });
+                  If(rideAdvanced.lessThan(0.5).and(level.lessThanEqual(int(2))), macroBody);
                 } else {
                   macroBody();
                 }
               });
+
+              // FAIL CLOSED ON EXHAUSTION FROM DETAIL — hybrid parity with the
+              // legacy traceBody clamp (see its block comment). Both exhaustion
+              // exits (macro budget, brick budget) used to leave hit = 0, which
+              // callers read as "nothing blocked this ray"; when the march died
+              // inside a brick that verdict is a hole in the geometry — at
+              // grazing incidence, a white dot. `lastBrick` keeps genuinely
+              // long OPEN-space rays failing open. Applied before recordTrace,
+              // which still logs `resolved` raw, so limit counters stay honest.
+              if (!globalThis.__giNoFailClosed) {
+                If(resolved.lessThan(0.5).and(lastBrick.greaterThan(0.5)), () => {
+                  hit.assign(1);
+                  hitT.assign(t);
+                });
+              }
 
               if (rayHitDebug && profile) {
                 const invalid = t.notEqual(t).or(hitT.notEqual(hitT)).or(invalidRef.greaterThan(0.5));
@@ -1995,6 +2026,9 @@ export function createOccupancyField(bounds, res0, options = {}) {
               const resolved = float(0).toVar();
               const invalidRef = float(0).toVar();
               const brickLimit = float(0).toVar();
+              // Detail discriminator for the exhaustion clamp below: 1 while
+              // the last processed macro cell carried a brick.
+              const lastBrick = float(0).toVar();
               // Skip off starts AT the macro level, so the ride is not merely
               // predicated away — levels 3-4 are never read.
               const level = int(coarseSkipEnabled ? OCC_LEVELS - 1 : 2).toVar();
@@ -2087,6 +2121,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
                 // and rank-addressed against the static mask.
                 const isStaticBrick = cellType.equal(uint(MacroCellType.Brick)).toVar();
                 If(isStaticBrick.or(cellType.equal(uint(MacroCellType.DynamicBrick))), () => {
+                  lastBrick.assign(1);
                   const validBrick = brickIndex.lessThan(uint(hybridLayout.brickCount))
                     .and(brickIndex.notEqual(uint(INVALID_RAY_HIT_INDEX)));
                   If(validBrick.not(), () => {
@@ -2372,6 +2407,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
                   // off `level` must stay pinned at the macro level forever.
                   if (coarseSkipEnabled) level.assign(int(3));
                 }).Else(() => {
+                  lastBrick.assign(0);
                   axis.assign(macroAxis);
                   t.assign(macroExit.add(RAY_HIT_DDA_EPSILON));
                   if (coarseSkipEnabled) level.assign(int(3));
@@ -2381,7 +2417,13 @@ export function createOccupancyField(bounds, res0, options = {}) {
                 // Reuse the existing conservative pyramid above level 2.
                 // Level 2 is exactly one 4^3 macrocell, so levels 3-4 provide
                 // broad empty-space skips without changing the leaf data.
+                //
+                // FUSED DESCEND — see the Phase-1 tracer's note: a descend that
+                // lands at the macro level runs macroBody in this SAME
+                // iteration, so hugging rays pay one iteration per macro cell,
+                // not two.
                 if (coarseSkipEnabled) {
+                  const rideAdvanced = float(0).toVar();
                   If(level.greaterThan(int(2)), () => {
                     usedCoarseSteps.addAssign(uint(1));
                     const scale = levelSelect(level, (l) => l.scale).toVar();
@@ -2406,12 +2448,24 @@ export function createOccupancyField(bounds, res0, options = {}) {
                       coarseSkipsL3.addAssign(select(level.equal(int(3)), uint(1), uint(0)));
                       coarseSkipsL4.addAssign(select(level.greaterThan(int(3)), uint(1), uint(0)));
                       level.assign(level.add(int(1)).min(int(OCC_LEVELS - 1)));
+                      rideAdvanced.assign(1);
                     });
-                  }).Else(macroBody);
+                  });
+                  If(rideAdvanced.lessThan(0.5).and(level.lessThanEqual(int(2))), macroBody);
                 } else {
                   macroBody();
                 }
               });
+
+              // FAIL CLOSED ON EXHAUSTION FROM DETAIL — same clamp as the
+              // Phase-1 tracer above (and the legacy traceBody); see its note.
+              if (!globalThis.__giNoFailClosed) {
+                If(resolved.lessThan(0.5).and(lastBrick.greaterThan(0.5)), () => {
+                  hit.assign(1);
+                  hitT.assign(t);
+                  hitNormal.assign(faceNormalFrom(axis));
+                });
+              }
 
               if (rayHitDebug && profile) {
                 const invalid = t.notEqual(t).or(hitT.notEqual(hitT)).or(invalidRef.greaterThan(0.5));
