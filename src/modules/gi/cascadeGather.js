@@ -1024,8 +1024,16 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
               // DDA path does, so the two A/B arms finally agree on the sun's
               // size instead of differing by 2x.)
               const fallbackAngle = jitter?.penAngle ? float(jitter.penAngle).max(0.005) : float(0.025);
+              // UPPER CLAMP 0.35 rad, same ceiling the screen path puts on its
+              // analytic k: this estimator reports min(k·clearance/t), and at
+              // a Blender-style 90° authored angle (0.785 rad half-angle) an
+              // unclamped k ≈ 1.27 reads EVERYTHING near geometry as shadowed
+              // — the sun barely enters the field, the bounce collapses, and
+              // the whole shadow side of the scene goes black (user
+              // screenshot, 2026-08-05). The field's sun feed wants "roughly
+              // right" energy, not the screen channel's exact penumbra shape.
               const softAngle = slot.soft
-                ? select(float(slot.soft).greaterThan(1e-4), float(slot.soft).max(5e-4), fallbackAngle)
+                ? select(float(slot.soft).greaterThan(1e-4), float(slot.soft).clamp(5e-4, 0.35), fallbackAngle)
                 : fallbackAngle;
               let shadow = lightShadow(origin, traceDir, maxT, float(1).div(softAngle), ndotl);
               if (fieldShadowOff) shadow = mix(shadow, float(1), fieldShadowOff);

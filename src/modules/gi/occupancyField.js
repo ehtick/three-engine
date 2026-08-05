@@ -1991,8 +1991,9 @@ export function createOccupancyField(bounds, res0, options = {}) {
           { name: "recvP", type: "vec3" },
           { name: "recvN", type: "vec3" },
           { name: "jitter", type: "float" },
+          { name: "jitter2", type: "float" },
         ],
-        body: (o, d, t0, t1, tanH, boost, recvP, recvN, jitter) => {
+        body: (o, d, t0, t1, tanH, boost, recvP, recvN, jitter, jitter2) => {
           const inv = vec3(voxelInv).toVar();
           const q0 = vec3(o).sub(vec3(gridOrigin)).mul(inv).toVar();
           const dq = vec3(d).mul(inv).toVar();
@@ -2004,24 +2005,42 @@ export function createOccupancyField(bounds, res0, options = {}) {
             select(dq.z.greaterThanEqual(0), float(1), float(0)),
           ).toVar();
           const voxMinW = vec3(voxel).x.min(vec3(voxel).y).min(vec3(voxel).z).toVar();
-          // PER-PIXEL LATTICE DECORRELATION. When the sun's azimuth aligns
-          // with a voxel row (Sponza's nave runs along X), every grazing ray
-          // in a screen row threads the SAME cell rows and they all agree —
-          // the lattice prints as long stripes that stretch along that axis
-          // and swing with the light. A sub-voxel lateral offset in the
-          // plane ⊥ the ray, rotated per pixel (the caller passes IGN),
-          // makes neighbouring pixels thread different rows: the coherent
-          // stripe becomes fine noise the bilateral upsample absorbs.
+          // PER-PIXEL SUN-DISC DIRECTION SAMPLE — the lattice decorrelator,
+          // v2. v1 offset the ray ORIGIN laterally by ±0.35 voxel, which (a)
+          // pushed grazing origins into the receiver's own bulged surface
+          // voxels — the IGN pattern printed straight onto LIT faces as a
+          // diagonal crosshatch (user's cube screenshot) — and (b) was far
+          // too small to decorrelate the level-3/4 cells that actually
+          // stripe at wide angles. Jittering the DIRECTION inside the sun's
+          // disc fixes both: the origin never moves, the offset grows with
+          // distance exactly as the footprint does (so it decorrelates at
+          // EVERY level), and it is physically the ground truth — each pixel
+          // samples one point on the sun, the ensemble across neighbouring
+          // pixels integrates the disc, and the bilateral upsample is the
+          // averager. Each ray then carries HALF the cone footprint (the
+          // ensemble covers the rest), which sharpens per-ray detail.
+          // 0° degenerates exactly: rr = 0, jd = d.
           const upRef = select(d.y.abs().lessThan(0.9), vec3(0, 1, 0), vec3(1, 0, 0));
           const s1 = vec3(d).cross(upRef).normalize().toVar();
           const s2 = vec3(d).cross(s1).toVar();
           const ang = jitter.mul(Math.PI * 2).toVar();
-          q0.addAssign(s1.mul(ang.cos()).add(s2.mul(ang.sin())).mul(voxMinW.mul(0.35)).mul(inv));
+          const rr = jitter2.sqrt().mul(tanH).toVar();
+          const jd = vec3(d).add(s1.mul(ang.cos()).add(s2.mul(ang.sin())).mul(rr)).normalize().toVar();
+          dq.assign(jd.mul(inv));
+          const rdj = vec3(float(1).div(safe(dq.x)), float(1).div(safe(dq.y)), float(1).div(safe(dq.z))).toVar();
+          rd.assign(rdj);
+          face.assign(vec3(
+            select(dq.x.greaterThanEqual(0), float(1), float(0)),
+            select(dq.y.greaterThanEqual(0), float(1), float(0)),
+            select(dq.z.greaterThanEqual(0), float(1), float(0)),
+          ));
+          const effTan = tanH.mul(0.5).toVar();
           const t = float(t0).max(0).add(jitter.mul(voxMinW.mul(0.5))).toVar();
           const alpha = float(0).toVar();
           const level = int(OCC_LEVELS - 1).toVar();
           // See the fail-dark clamp after the loop.
           const resolved = float(0).toVar();
+          const lastLeaf = int(0).toVar();
 
           Loop({ start: 0, end: steps, name: "coneDda" }, () => {
             If(t.greaterThanEqual(t1).or(alpha.greaterThanEqual(0.98)), () => {
@@ -2044,8 +2063,9 @@ export function createOccupancyField(bounds, res0, options = {}) {
             // straddling levels by its fraction, so the blur width grows
             // smoothly along the ray instead of doubling at each level
             // boundary (discrete jumps read as onion rings in the penumbra).
-            const leafC = log2(tanH.mul(t).mul(2).div(voxMinW).max(1)).clamp(0, OCC_LEVELS - 1).toVar();
+            const leafC = log2(effTan.mul(t).mul(2).div(voxMinW).max(1)).clamp(0, OCC_LEVELS - 1).toVar();
             const leaf = leafC.floor().toInt().toVar();
+            lastLeaf.assign(leaf);
             const lvl = level.max(leaf).toVar();
             const scale = levelSelect(lvl, (l) => l.scale).toVar();
             const v = q.div(scale).floor().toVar();
@@ -2116,16 +2136,16 @@ export function createOccupancyField(bounds, res0, options = {}) {
               level.assign(lvl.add(int(1)).min(int(OCC_LEVELS - 1)));
             });
           });
-          // FAIL DARK FROM DOWN IN THE FINE LEVELS — the exact march's
-          // exhaustion clamp, ported. The exact arm used to own the whole
-          // ray and counted a budget-exhausted-in-detail ray as BLOCKED;
-          // handing its far segment to a fail-open cone brought back the
-          // white-rim dot population that clamp had killed (grazing
-          // silhouette rays burn their budget threading geometry, then
-          // read lit). Same discriminator as traceBody: exhausting at a
-          // coarse level means open road, exhausting at level ≤ 1 means
-          // the march was inside detail and almost certainly occluded.
-          If(resolved.lessThan(0.5).and(level.lessThanEqual(int(1))), () => {
+          // FAIL DARK FROM DOWN AT THE LEAF — the exact march's exhaustion
+          // clamp, ported, with the discriminator RELATIVE TO THE CONE. The
+          // first port compared against absolute level ≤ 1, which a wide
+          // cone never revisits (its leaf is 2-4 within meters), so
+          // wide-angle rays that burned their budget threading coarse
+          // occupied cells still failed OPEN — the surviving white speckles
+          // in the user's dark-side screenshot. "In detail" for a cone
+          // means AT OR NEAR ITS OWN LEAF; open-road climbs sit levels
+          // above it.
+          If(resolved.lessThan(0.5).and(level.lessThanEqual(lastLeaf.add(int(1)))), () => {
             alpha.assign(1);
           });
           return alpha.oneMinus().clamp(0, 1);
@@ -2137,7 +2157,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
       vec3(origin), vec3(dir), float(tMin), float(tMax),
       float(opts.tanHalf ?? 0), float(opts.boost ?? 3),
       vec3(opts.receiverP ?? origin), vec3(opts.receiverN ?? vec3(0, 0, 0)),
-      float(opts.jitter ?? 0),
+      float(opts.jitter ?? 0), float(opts.jitter2 ?? 0.5),
     );
   };
 

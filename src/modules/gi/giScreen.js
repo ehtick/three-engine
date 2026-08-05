@@ -523,10 +523,17 @@ export function createGiLightShadowPass({ gbuffer, lightShadow, width, height, r
             // tan capped at ~44.7° half-angle only to keep tan() finite.
             const tanHalf = tan(rawAngle.min(0.78)).toVar();
             const maxT = dist.sub(lightShadow.lift).max(0).toVar();
-            // Interleaved gradient noise, per SHADOW pixel — the cone
-            // march's lattice-decorrelation rotation (see its jitter note).
+            // Two decorrelated interleaved-gradient-noise channels per
+            // SHADOW pixel: rotation angle + disc radius of the cone
+            // march's sun-disc direction sample (see its jitter note). The
+            // second uses shifted coordinates — same lattice, different
+            // phase — which is enough independence for a 2D disc sample.
             const ign = fract(
               fract(float(coord.x).mul(0.06711056).add(float(coord.y).mul(0.00583715)))
+                .mul(52.9829189),
+            );
+            const ign2 = fract(
+              fract(float(coord.x).add(37).mul(0.06711056).add(float(coord.y).add(17).mul(0.00583715)))
                 .mul(52.9829189),
             );
             // DDA marcher when the bundle carries one, sphere trace as the
@@ -534,7 +541,7 @@ export function createGiLightShadowPass({ gbuffer, lightShadow, width, height, r
             // record march's origin-plane exclusion; the DDA arm returns
             // vec2(shadow, blockerDist/span).
             const tracedRaw = lightShadow.traceDda
-              ? lightShadow.traceDda(shadowOrigin, dir, maxT, float(1).div(angle), P, tanHalf, ign)
+              ? lightShadow.traceDda(shadowOrigin, dir, maxT, float(1).div(angle), P, tanHalf, ign, ign2)
               : lightShadow.trace(shadowOrigin, dir, maxT, float(1).div(angle), cosRayNormal);
             const traced = lightShadow.traceDda ? vec2(tracedRaw).toVar() : vec2(tracedRaw, 0).toVar();
             if (lightShadowDistVars) lightShadowDistVars[index].assign(traced.y);
