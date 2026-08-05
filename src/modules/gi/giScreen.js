@@ -31,9 +31,11 @@ import {
   Fn,
   If,
   abs,
+  atomicAdd,
   float,
   fract,
   instanceIndex,
+  instancedArray,
   ivec2,
   mix,
   mrt,
@@ -46,6 +48,7 @@ import {
   tan,
   texture,
   textureStore,
+  uint,
   uniform,
   vec2,
   vec3,
@@ -451,7 +454,7 @@ export function createGiResolve({ gbuffer, targets, width, height, gather, norma
  * Its pixel count is therefore its own budget (GISystem #lightShadowSize),
  * and the gbuffer is read at nearest-texel through the resolution ratio.
  */
-export function createGiLightShadowPass({ gbuffer, lightShadow, width, height, resolveWidth, resolveHeight }) {
+export function createGiLightShadowPass({ gbuffer, lightShadow, width, height, resolveWidth, resolveHeight, frame = null }) {
   const widthU = uniform(width, "uint");
   const positionNode = texture(gbuffer.position);
   const normalNode = texture(gbuffer.normal);
@@ -549,14 +552,22 @@ export function createGiLightShadowPass({ gbuffer, lightShadow, width, height, r
             // march's sun-disc direction sample (see its jitter note). The
             // second uses shifted coordinates — same lattice, different
             // phase — which is enough independence for a 2D disc sample.
-            const ign = fract(
+            // With a `frame` uniform the pattern ANIMATES (golden-ratio
+            // increments — a low-discrepancy walk of the sun disc), so the
+            // temporal accumulation in the filter pass integrates a NEW
+            // disc sample every frame instead of freezing one dither
+            // pattern; a wide penumbra converges to the true coverage in
+            // ~a dozen frames.
+            const ignBase = fract(
               fract(float(coord.x).mul(0.06711056).add(float(coord.y).mul(0.00583715)))
                 .mul(52.9829189),
             );
-            const ign2 = fract(
+            const ign2Base = fract(
               fract(float(coord.x).add(37).mul(0.06711056).add(float(coord.y).add(17).mul(0.00583715)))
                 .mul(52.9829189),
             );
+            const ign = frame ? fract(ignBase.add(float(frame).mul(0.618033988749895))) : ignBase;
+            const ign2 = frame ? fract(ign2Base.add(float(frame).mul(0.754877666246693))) : ign2Base;
             // DDA marcher when the bundle carries one, sphere trace as the
             // hatched fallback. The receiver point rides along for the
             // record march's origin-plane exclusion; the DDA arm returns
@@ -622,11 +633,26 @@ export function createGiLightShadowPass({ gbuffer, lightShadow, width, height, r
  */
 export function createGiLightShadowFilterPass({
   gbuffer, source, target, width, height, resolveWidth, resolveHeight, planeEps,
+  history = null,
 }) {
   const widthU = uniform(width, "uint");
   const positionNode = texture(gbuffer.position);
   const normalNode = texture(gbuffer.normal);
   const shadowNode = texture(source);
+  const histShadowNode = history ? texture(history.histShadow) : null;
+  const histPosNode = history ? texture(history.histPos) : null;
+  // Reprojection-validity counter, compiled ONLY under the debug global (an
+  // atomicAdd contended by every valid thread is a measurable cost) — the GPU
+  // smoke uses it to prove the NDC→texel convention below actually revisits
+  // the same surface (a wrong y-flip reads as ~0 valid pixels, silently
+  // disabling accumulation).
+  // [0] valid, [1] geometry threads, [2] reprojected inside bounds,
+  // [3] history texel had geometry (hp.w) — a staged funnel so a zero at
+  // [0] names its stage instead of "convention broken" generically.
+  const temporalCounter =
+    history && globalThis.__giShadowTemporalDebug === true
+      ? instancedArray(new Uint32Array(4), "uint").toAtomic()
+      : null;
   const sx = resolveWidth / width;
   const sy = resolveHeight / height;
 
@@ -641,6 +667,10 @@ export function createGiLightShadowFilterPass({
     );
     const g0 = positionNode.load(gCoord).toVar();
     const out = center.toVar();
+    // Funnel counter [1] counts EXECUTED THREADS (not geometry) — it
+    // separates "pass never dispatches" from "gbuffer is empty" when the
+    // valid count reads zero.
+    if (temporalCounter) atomicAdd(temporalCounter.element(1), uint(1));
     If(g0.w.greaterThan(0.5), () => {
       const P = g0.xyz.toVar();
       const N = vec3(normalNode.load(gCoord).xyz).normalize().toVar();
@@ -672,10 +702,88 @@ export function createGiLightShadowFilterPass({
         }
       }
       out.assign(acc.div(wSum.max(1e-4)));
+      // TEMPORAL ACCUMULATION (reprojected). The trace samples ONE point of
+      // the sun disc per pixel per frame (animated IGN); blending against
+      // last frame's result — reprojected through the previous camera and
+      // validated by WORLD POSITION — integrates the disc over time.
+      // ~0.9 history weight ≈ a dozen effective sun samples: wide penumbras
+      // stop reading as dither ("very dirty at larger angles") and converge
+      // to the true coverage fraction. Validation failure (disocclusion, a
+      // mover, a teleported camera) falls back to the spatial result alone —
+      // the failure mode is grain, never ghosting. `history.weight` is a
+      // uniform the system zeroes while a LIGHT is moving: a rotating sun
+      // invalidates every pixel's history semantically (same surface, stale
+      // shadow), which position validation cannot see.
+      if (history) {
+        const clip = history.prevViewProj.mul(vec4(P, 1)).toVar();
+        const histSample = vec4(0).toVar();
+        const valid = float(0).toVar();
+        If(clip.w.greaterThan(1e-3), () => {
+          const ndc = clip.xyz.div(clip.w).toVar();
+          const hx = ndc.x.mul(0.5).add(0.5).mul(width).toVar();
+          // Row convention: texture row 0 is the TOP of the frame (NDC y=+1)
+          // — proven by the smoke's per-axis agreement counters (the no-flip
+          // arm read 0.8% row agreement, the flip ~full agreement; an early
+          // "0 valid" reading against this flip was measured on a STOPPED
+          // engine loop and led development astray for an hour — see the
+          // smoke's restart note).
+          const hy = float(0.5).sub(ndc.y.mul(0.5)).mul(height).toVar();
+          If(
+            hx.greaterThanEqual(0).and(hx.lessThan(width)).and(hy.greaterThanEqual(0)).and(hy.lessThan(height)),
+            () => {
+              if (temporalCounter) atomicAdd(temporalCounter.element(2), uint(1));
+              const hc = ivec2(hx.toInt(), hy.toInt()).toVar();
+              const hp = histPosNode.load(hc).toVar();
+              If(hp.w.greaterThan(0.5), () => {
+                if (temporalCounter) atomicAdd(temporalCounter.element(3), uint(1));
+                If(hp.xyz.sub(P).length().lessThan(float(history.validEps).max(1e-3)), () => {
+                  histSample.assign(vec4(histShadowNode.load(hc)));
+                  valid.assign(1);
+                });
+              });
+            },
+          );
+        });
+        out.assign(mix(out, histSample, valid.mul(float(history.weight))));
+        if (temporalCounter) {
+          If(valid.greaterThan(0.5), () => {
+            atomicAdd(temporalCounter.element(0), uint(1));
+          });
+        }
+      }
     });
     textureStore(target, coord, out);
   })().compute(width * height);
 
+  return { compute, widthU, temporalCounter };
+}
+
+/**
+ * Copies the filtered+accumulated shadow result and the gbuffer position into
+ * the HISTORY textures for the next frame's reprojection. A separate pass, not
+ * folded into the filter: the filter READS history at reprojected (≠ own)
+ * coords, so writing history in the same dispatch would race.
+ */
+export function createGiLightShadowHistoryPass({
+  gbuffer, source, histShadow, histPos, width, height, resolveWidth, resolveHeight,
+}) {
+  const widthU = uniform(width, "uint");
+  const positionNode = texture(gbuffer.position);
+  const shadowNode = texture(source);
+  const sx = resolveWidth / width;
+  const sy = resolveHeight / height;
+  const compute = Fn(() => {
+    const px = instanceIndex.mod(widthU);
+    const py = instanceIndex.div(widthU);
+    const coord = ivec2(px.toInt(), py.toInt());
+    const gCoord = ivec2(
+      px.toFloat().add(0.5).mul(sx).toInt(),
+      py.toFloat().add(0.5).mul(sy).toInt(),
+    );
+    const g0 = positionNode.load(gCoord).toVar();
+    textureStore(histShadow, coord, vec4(shadowNode.load(coord)));
+    textureStore(histPos, coord, vec4(g0.xyz, g0.w));
+  })().compute(width * height);
   return { compute, widthU };
 }
 
@@ -877,6 +985,17 @@ export function createGiTargets(width, height, shadowWidth = width, shadowHeight
   const lightShadowRaw = new THREE.StorageTexture(shadowWidth, shadowHeight);
   lightShadowRaw.name = "giLightShadowRaw";
   lightShadowRaw.version = version;
+  // Temporal history for the shadow channel (createGiLightShadowFilterPass's
+  // reprojection): last frame's accumulated shadow + the world position it
+  // was resolved for (full float — half precision at world scale is ~3cm at
+  // 50m, the same order as the validity epsilon).
+  const lightShadowHist = new THREE.StorageTexture(shadowWidth, shadowHeight);
+  lightShadowHist.name = "giLightShadowHist";
+  lightShadowHist.version = version;
+  const lightShadowHistPos = new THREE.StorageTexture(shadowWidth, shadowHeight);
+  lightShadowHistPos.type = THREE.FloatType;
+  lightShadowHistPos.name = "giLightShadowHistPos";
+  lightShadowHistPos.version = version;
   // PCSS blocker distance, one channel per light slot like `lightShadow`:
   // the trace's occluder distance normalized by the shadow span, driving the
   // sample-time penumbra radius (tan(sourceAngle) x blockerDist — Blender sun
@@ -895,6 +1014,8 @@ export function createGiTargets(width, height, shadowWidth = width, shadowHeight
     radiance,
     lightShadow,
     lightShadowRaw,
+    lightShadowHist,
+    lightShadowHistPos,
     lightShadowDist,
     dispose() {
       irradiance.dispose();
@@ -902,6 +1023,8 @@ export function createGiTargets(width, height, shadowWidth = width, shadowHeight
       radiance.dispose();
       lightShadow.dispose();
       lightShadowRaw.dispose();
+      lightShadowHist.dispose();
+      lightShadowHistPos.dispose();
       lightShadowDist.dispose();
     },
   };

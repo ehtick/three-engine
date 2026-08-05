@@ -20,7 +20,7 @@ import { cameraPosition, cos, float, fract, instanceIndex, mix, normalWorld, pos
 import { createRadianceCascades } from "./cascadeTrace.js";
 import { createCascadeMerge } from "./cascadeMerge.js";
 import { createBounceFeedback, createIrradianceGather, createProbeDepthMoments, createProbeIrradiance, createRadianceLookup, depthMomentsAlpha, gatherBias, gatherViewBias, probeSnapAlpha } from "./cascadeGather.js";
-import { blitBvhAtlasTiles, createGiBvhReflect, createGiBvhTarget, createGiGBuffer, createGiLightShadowFilterPass, createGiLightShadowPass, createGiResolve, createGiTargets, renderGiGBuffer } from "./giScreen.js";
+import { blitBvhAtlasTiles, createGiBvhReflect, createGiBvhTarget, createGiGBuffer, createGiLightShadowFilterPass, createGiLightShadowHistoryPass, createGiLightShadowPass, createGiResolve, createGiTargets, renderGiGBuffer } from "./giScreen.js";
 import { resolveMaterialSurface, serializeMeshForBake } from "./voxelizeOnce.js";
 import { createOccupancyDebugMaterial, createSdfDebugMaterial, createGiField } from "./giField.js";
 import { createOccupancyField, describeOccupancyField, quantizeOccupancyRes } from "./occupancyField.js";
@@ -884,6 +884,44 @@ export class GISystem {
         globalThis.__giNoJitter === true ? 0 : globalThis.__giSunJitter ?? 0;
       state.shadowJitter.penAngle.value = globalThis.__giSunAngle ?? 0.025;
     }
+    // Shadow-channel temporal accumulation inputs (see the filter pass):
+    // the animated sun-disc jitter frame, the PREVIOUS camera view-projection
+    // for reprojection, and the history weight — zeroed while any light is
+    // moving (a rotating sun makes every pixel's history semantically stale;
+    // position validation can't see that, so the system flushes instead —
+    // grain during rotation, converges the moment it stops).
+    if (state.screen?.lightShadowPass && this._giShadowFrameU) {
+      // The jitter animates ONLY together with temporal accumulation — an
+      // animated dither without history integration is strictly worse than
+      // the static pattern (the user's live session saw exactly that as
+      // "extremely jumpy" when the animation briefly landed via HMR ahead of
+      // the verified temporal path). `__giShadowTemporal = false` freezes
+      // both, restoring the pre-temporal static-dither behaviour as the A/B.
+      this._giShadowFrameU.value = globalThis.__giShadowTemporal !== false ? this._frame % 4096 : 0;
+      const camera = this.engine.camera;
+      if (camera) {
+        if (this._giPrevVPStore) this._giShadowPrevVPU.value.copy(this._giPrevVPStore);
+        (this._giPrevVPStore ??= new THREE.Matrix4()).multiplyMatrices(
+          camera.projectionMatrix,
+          camera.matrixWorldInverse,
+        );
+      }
+      let lightHash = 0;
+      for (const light of this._lightObjects ?? []) {
+        const e = light.matrixWorld.elements;
+        lightHash =
+          (lightHash * 31 + e[12] * 7.1 + e[13] * 13.3 + e[14] * 3.7 + e[8] * 101 + e[9] * 57 + e[10] * 23 + light.intensity) % 1e9;
+      }
+      const temporalOn = globalThis.__giShadowTemporal !== false;
+      this._giShadowHistWeightU.value =
+        temporalOn && lightHash === this._giShadowLightHash ? 0.9 : 0;
+      this._giShadowLightHash = lightHash;
+      // Live lift A/B for the wall-leak question (`__giShadowLift`, voxels;
+      // default 1.5 = shipped behaviour).
+      if (state.screen.lightShadow?.liftFactor) {
+        state.screen.lightShadow.liftFactor.value = globalThis.__giShadowLift ?? 1.5;
+      }
+    }
     // Receiver-gather surface bias (fractions of a probe cell — normal and
     // toward-camera components, see cascadeGather.gatherBias). Defaults
     // 0.5/0.5: user-eye-tuned on their Sponza (2026-08-03) as the closest
@@ -1267,6 +1305,7 @@ export class GISystem {
               // idle-frozen shadow texture would lag every camera move.
               ...(state.screen.lightShadowPass ? [state.screen.lightShadowPass.compute] : []),
               ...(state.screen.lightShadowFilterPass ? [state.screen.lightShadowFilterPass.compute] : []),
+              ...(state.screen.lightShadowHistoryPass ? [state.screen.lightShadowHistoryPass.compute] : []),
               ...debugExtra,
             ]
           : debugExtra;
@@ -1772,11 +1811,15 @@ export class GISystem {
       globalThis.__giLightShadowLegacyDda !== true;
     // 1.5 OCCUPANCY VOXELS of ray lift — a node, not a number, so an in-place
     // refit rescales it with the pyramid. See the resolve's own comment for
-    // why the gather's normalOffset is the wrong scale here.
+    // why the gather's normalOffset is the wrong scale here. The factor is a
+    // LIVE uniform (`__giShadowLift`, synced per tick): the lift dead zone is
+    // the prime wall-leak suspect and this is the in-editor A/B for it.
     const vox = vec3(occ.voxel);
     const voxMax = vox.x.max(vox.y).max(vox.z);
-    const lift = voxMax.mul(1.5);
+    const liftFactor = uniform(1.5);
+    const lift = voxMax.mul(liftFactor);
     return {
+      liftFactor,
       marcher: globalThis.__giLightShadowSphere === true
         ? "sphere"
         : (recordMarch ? `records (${rayHitModeName(shadowMode)})` : "voxel-dda") +
@@ -2062,6 +2105,13 @@ export class GISystem {
       const resolve = createGiResolve({ gbuffer, targets, width, height, ...inputs });
       // The shadow trace as its own pass at its own budget — see
       // createGiLightShadowPass for why it left the resolve kernel.
+      // Temporal-accumulation uniforms, persistent across rebuilds/resizes
+      // (the tick updates them; a rebuild must not orphan the tick's refs).
+      if (inputs.lightShadow) {
+        this._giShadowFrameU ??= uniform(0);
+        this._giShadowPrevVPU ??= uniform(new THREE.Matrix4());
+        this._giShadowHistWeightU ??= uniform(0.9);
+      }
       const lightShadowPass = inputs.lightShadow
         ? createGiLightShadowPass({
             gbuffer,
@@ -2070,11 +2120,13 @@ export class GISystem {
             height: shadowH,
             resolveWidth: width,
             resolveHeight: height,
+            frame: this._giShadowFrameU,
           })
         : null;
       // Edge-aware average of the stochastic trace — see the pass's comment
       // for why penumbra smoothing lives here and not in materials. planeEps
-      // rides the occupancy voxel (a node, so refits rescale it).
+      // rides the occupancy voxel (a node, so refits rescale it). `history`
+      // adds the reprojected temporal blend (see the pass's comment).
       const lightShadowFilterPass = lightShadowPass
         ? createGiLightShadowFilterPass({
             gbuffer,
@@ -2085,6 +2137,25 @@ export class GISystem {
             resolveWidth: width,
             resolveHeight: height,
             planeEps: inputs.lightShadow.voxMax ?? 0.1,
+            history: {
+              histShadow: targets.lightShadowHist,
+              histPos: targets.lightShadowHistPos,
+              prevViewProj: this._giShadowPrevVPU,
+              weight: this._giShadowHistWeightU,
+              validEps: inputs.lightShadow.voxMax ?? 0.15,
+            },
+          })
+        : null;
+      const lightShadowHistoryPass = lightShadowFilterPass
+        ? createGiLightShadowHistoryPass({
+            gbuffer,
+            source: targets.lightShadow,
+            histShadow: targets.lightShadowHist,
+            histPos: targets.lightShadowHistPos,
+            width: shadowW,
+            height: shadowH,
+            resolveWidth: width,
+            resolveHeight: height,
           })
         : null;
       light.giIrradianceNode = this._giIrradianceNode;
@@ -2097,7 +2168,7 @@ export class GISystem {
       // smearing white dots across the dark silhouette in front of it.
       light.giPositionNode = this._giShadowPosNode;
       light.giScreenTexel = this._giLightShadowTexel;
-      return { gbuffer, resolve, lightShadowPass, lightShadowFilterPass, targets, width, height, shadowWidth: shadowW, shadowHeight: shadowH, ...inputs };
+      return { gbuffer, resolve, lightShadowPass, lightShadowFilterPass, lightShadowHistoryPass, targets, width, height, shadowWidth: shadowW, shadowHeight: shadowH, ...inputs };
     } catch (error) {
       // Falling back to the in-material path keeps GI working (slowly) rather
       // than rendering an unlit scene.
@@ -2241,10 +2312,38 @@ export class GISystem {
         resolveWidth: width,
         resolveHeight: height,
         planeEps: screen.lightShadow?.voxMax ?? 0.1,
+        history: {
+          histShadow: screen.targets.lightShadowHist,
+          histPos: screen.targets.lightShadowHistPos,
+          prevViewProj: this._giShadowPrevVPU,
+          weight: this._giShadowHistWeightU,
+          validEps: screen.lightShadow?.voxMax ?? 0.15,
+        },
       });
       if (filterIndexes[0] >= 0) state.queue[filterIndexes[0]] = screen.lightShadowFilterPass.compute;
       if (filterIndexes[1] >= 0) state.queueNoFeedback[filterIndexes[1]] = screen.lightShadowFilterPass.compute;
       if (filterIndexes[2] >= 0) state.queueFeedbackOnly[filterIndexes[2]] = screen.lightShadowFilterPass.compute;
+    }
+    if (screen.lightShadowHistoryPass) {
+      const oldHistory = screen.lightShadowHistoryPass.compute;
+      const historyIndexes = [
+        state.queue.indexOf(oldHistory),
+        state.queueNoFeedback.indexOf(oldHistory),
+        state.queueFeedbackOnly?.indexOf(oldHistory) ?? -1,
+      ];
+      screen.lightShadowHistoryPass = createGiLightShadowHistoryPass({
+        gbuffer: screen.gbuffer,
+        source: screen.targets.lightShadow,
+        histShadow: screen.targets.lightShadowHist,
+        histPos: screen.targets.lightShadowHistPos,
+        width: shadowW,
+        height: shadowH,
+        resolveWidth: width,
+        resolveHeight: height,
+      });
+      if (historyIndexes[0] >= 0) state.queue[historyIndexes[0]] = screen.lightShadowHistoryPass.compute;
+      if (historyIndexes[1] >= 0) state.queueNoFeedback[historyIndexes[1]] = screen.lightShadowHistoryPass.compute;
+      if (historyIndexes[2] >= 0) state.queueFeedbackOnly[historyIndexes[2]] = screen.lightShadowHistoryPass.compute;
     }
     this.#retireTargets(previousTargets);
     // Same follow-up for the BVH reflect compute (GI Phase 3 v1) — it is NOT
@@ -3183,6 +3282,11 @@ export class GISystem {
         queue.push(screen.lightShadowFilterPass.compute);
         queueNoFeedback.push(screen.lightShadowFilterPass.compute);
         queueFeedbackOnly.push(screen.lightShadowFilterPass.compute);
+      }
+      if (screen.lightShadowHistoryPass) {
+        queue.push(screen.lightShadowHistoryPass.compute);
+        queueNoFeedback.push(screen.lightShadowHistoryPass.compute);
+        queueFeedbackOnly.push(screen.lightShadowHistoryPass.compute);
       }
     }
     // Purge three's lights-hash memo — without this the FIRST build of a

@@ -38,6 +38,17 @@
         globalThis.__giRayHitProfiling = true;
         globalThis.__giRayHitMode = rayHitMode;
         globalThis.__giRayHitSkipDistance = coarseSkip;
+        // Compiles the shadow filter's temporal-validity counter (see the
+        // lightshadow arm's reprojection gate below). Build-time flag; the
+        // second global opts the runtime INTO temporal accumulation (still
+        // opt-in until this arm's gate proves it).
+        globalThis.__giShadowTemporalDebug = true;
+        globalThis.__giShadowTemporal = true;
+        // editorFramePacing stops unfocused engines — headless the page is
+        // NEVER focused, and the temporal gate below is the first assertion
+        // that needs the loop RUNNING at assert time (earlier arms only read
+        // state accumulated during the pinned boot window).
+        globalThis.__editorKeepRendering = true;
         const { Engine, THREE, registerBuiltInComponents } = await import("/src/engine/index.js");
         await import("/src/modules/index.js");
         const { enableEngineModule } = await import("/src/engine/modules.js");
@@ -45,9 +56,15 @@
         registerBuiltInComponents();
         const engine = new Engine();
         globalThis.__GI_SMOKE_ENGINE__ = engine;
+        // Diagnostic: our own preRender callback — separates "Engine stopped
+        // running preRender callbacks" from "GI's callback specifically died".
+        const preRenderProbe = { count: 0 };
+        engine.onPreRender(() => preRenderProbe.count++);
+        globalThis.__GI_SMOKE_PRERENDER__ = preRenderProbe;
         engine.setSize(320, 240);
         await engine.init(document.querySelector("#view"));
         if (engine.getBackendName() !== "WebGPU") throw new Error(`WebGPU unavailable (${engine.getBackendName()})`);
+        globalThis.__GI_SMOKE_RENDERER__ = engine.renderer;
         const device = engine.renderer.backend.device;
         const validationErrors = [];
         device.addEventListener?.("uncapturederror", (event) => {
@@ -276,9 +293,64 @@
           if (!partialCells) {
             throw new Error("lightshadow arm: no PARTIAL density cells — the fraction channel is behaving like the OR bit");
           }
+          // TEMPORAL REPROJECTION CONVENTION GATE: with a static camera the
+          // filter pass's history reprojection must land back on the same
+          // texel (position-validated) — the debug counter counts valid
+          // pixels per frame. A wrong NDC→texel y-flip reads ~0 forever,
+          // which would silently disable accumulation (grain looks like
+          // "the filter does nothing"), so this asserts the delta across a
+          // settle window covers at least one frame's worth of geometry.
+          const filterPass = engine.modules.get("gi").system.state.screen?.lightShadowFilterPass;
+          if (!filterPass) throw new Error("lightshadow arm: filter pass missing from the screen bundle");
+          if (!filterPass.temporalCounter) throw new Error("lightshadow arm: temporal debug counter not compiled");
+          const readValid = async () =>
+            Array.from(new Uint32Array(await engine.renderer.getArrayBufferAsync(filterPass.temporalCounter.value)));
+          const screenBundle = engine.modules.get("gi").system.state.screen;
+          const shadowPixels = screenBundle.shadowWidth * screenBundle.shadowHeight;
+          // GROUND-TRUTH CONVENTION CHECK (temporary diagnostic): read back a
+          // gbuffer row, project each texel's stored world position with the
+          // camera VP in JS, and report where it lands vs its own pixel.
+          {
+            const gb = screenBundle.gbuffer;
+            const W = screenBundle.width, H = screenBundle.height;
+            const row = Math.floor(H / 2);
+            const pixels = await engine.renderer.readRenderTargetPixelsAsync(gb.rt, 0, row, W, 1, 0);
+            const cam = engine.camera;
+            cam.updateMatrixWorld(true);
+            const vp = new THREE.Matrix4().multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
+            const offsets = [];
+            for (let x = 0; x < W; x += 13) {
+              const w = pixels[x * 4 + 3];
+              if (w < 0.5) continue;
+              const p = new THREE.Vector4(pixels[x * 4], pixels[x * 4 + 1], pixels[x * 4 + 2], 1).applyMatrix4(vp);
+              if (p.w <= 0) continue;
+              const hx = (p.x / p.w * 0.5 + 0.5) * W;
+              const hyUp = (p.y / p.w * 0.5 + 0.5) * H;
+              const hyDown = (0.5 - p.y / p.w * 0.5) * H;
+              offsets.push(`x=${x}: hx=${hx.toFixed(1)} hyUp=${hyUp.toFixed(1)} hyDown=${hyDown.toFixed(1)} (row=${row})`);
+            }
+            console.log(`GI-SMOKE REPROJ-TRUTH ${offsets.slice(0, 6).join(" | ")}`);
+          }
+          // The page stopped the engine after the stats settle (line ~162) —
+          // every other assert reads state ACCUMULATED during boot, but this
+          // gate needs live frames. Restart for the window, stop again after.
+          engine.start();
+          const v0 = await readValid();
+          await new Promise((resolve) => setTimeout(resolve, 800));
+          const v1 = await readValid();
+          engine.stop();
+          const funnel = v1.map((v, i) => v - v0[i]);
+          if (funnel[0] < shadowPixels * 0.5) {
+            throw new Error(
+              `lightshadow arm: temporal reprojection nearly never validates — window delta: ` +
+              `threads=${funnel[1]} inBounds=${funnel[2]} histGeom=${funnel[3]} valid=${funnel[0]} ` +
+              `of ${shadowPixels}px/frame; absolute v0=[${v0}] v1=[${v1}]`,
+            );
+          }
           console.log(
             `GI-SMOKE LIGHTSHADOW pen-variant=${penVariantSeen ? "compiled" : "n/a (non-plane mode)"} ` +
-            `marcher="${marcher}" densityCells=${densityCells} partial=${partialCells} mismatches=0`,
+            `marcher="${marcher}" densityCells=${densityCells} partial=${partialCells} mismatches=0 ` +
+            `temporalValid=${funnel[0]} threads=${funnel[1]} inBounds=${funnel[2]} loose=${funnel[3]} of ${shadowPixels}px/frame over the window`,
           );
         }
         globalThis.__GI_SMOKE_RESULT__ = {
