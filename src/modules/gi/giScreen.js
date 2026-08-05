@@ -1014,6 +1014,14 @@ export function createGiTargets(width, height, shadowWidth = width, shadowHeight
   const lightShadowRaw = new THREE.StorageTexture(shadowWidth, shadowHeight);
   lightShadowRaw.name = "giLightShadowRaw";
   lightShadowRaw.version = version;
+  // The ACCUMULATED signal (filter+temporal output). Materials do NOT sample
+  // this — a second, history-free filter pass cleans it into `lightShadow`.
+  // The split is what keeps the presentation blur OUTSIDE the accumulation
+  // loop: post-filtering the fed-back signal would convolve it once per
+  // frame and progressively wash every penumbra to flat grey.
+  const lightShadowAccum = new THREE.StorageTexture(shadowWidth, shadowHeight);
+  lightShadowAccum.name = "giLightShadowAccum";
+  lightShadowAccum.version = version;
   // Temporal history for the shadow channel (createGiLightShadowFilterPass's
   // reprojection): last frame's accumulated shadow + the world position it
   // was resolved for (full float — half precision at world scale is ~3cm at
@@ -1043,6 +1051,7 @@ export function createGiTargets(width, height, shadowWidth = width, shadowHeight
     radiance,
     lightShadow,
     lightShadowRaw,
+    lightShadowAccum,
     lightShadowHist,
     lightShadowHistPos,
     lightShadowDist,
@@ -1052,6 +1061,7 @@ export function createGiTargets(width, height, shadowWidth = width, shadowHeight
       radiance.dispose();
       lightShadow.dispose();
       lightShadowRaw.dispose();
+      lightShadowAccum.dispose();
       lightShadowHist.dispose();
       lightShadowHistPos.dispose();
       lightShadowDist.dispose();

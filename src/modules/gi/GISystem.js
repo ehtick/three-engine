@@ -919,7 +919,11 @@ export class GISystem {
       //     release the light and accumulation resumes the same frame.
       if (temporalOn && !lightsMoved) this._giShadowFrameU.value = this._frame % 4096;
       else if (!temporalOn) this._giShadowFrameU.value = 0;
-      this._giShadowHistWeightU.value = temporalOn && !lightsMoved ? 0.9 : 0;
+      // 0.94 ≈ 32 effective sun samples (was 0.9 ≈ 19 — visibly mottled in
+      // wide penumbras). The staleness cases this lag could hurt are all
+      // handled upstream: light motion flushes, camera motion reprojects,
+      // mover surfaces fail position validation and reset per-pixel.
+      this._giShadowHistWeightU.value = temporalOn && !lightsMoved ? 0.94 : 0;
       // Live lift A/B for the wall-leak question (`__giShadowLift`, voxels;
       // default 1.5 = shipped behaviour).
       if (state.screen.lightShadow?.liftFactor) {
@@ -1310,6 +1314,7 @@ export class GISystem {
               ...(state.screen.lightShadowPass ? [state.screen.lightShadowPass.compute] : []),
               ...(state.screen.lightShadowFilterPass ? [state.screen.lightShadowFilterPass.compute] : []),
               ...(state.screen.lightShadowHistoryPass ? [state.screen.lightShadowHistoryPass.compute] : []),
+              ...(state.screen.lightShadowPostPass ? [state.screen.lightShadowPostPass.compute] : []),
               ...debugExtra,
             ]
           : debugExtra;
@@ -2135,7 +2140,7 @@ export class GISystem {
         ? createGiLightShadowFilterPass({
             gbuffer,
             source: targets.lightShadowRaw,
-            target: targets.lightShadow,
+            target: targets.lightShadowAccum,
             width: shadowW,
             height: shadowH,
             resolveWidth: width,
@@ -2153,13 +2158,32 @@ export class GISystem {
       const lightShadowHistoryPass = lightShadowFilterPass
         ? createGiLightShadowHistoryPass({
             gbuffer,
-            source: targets.lightShadow,
+            source: targets.lightShadowAccum,
             histShadow: targets.lightShadowHist,
             histPos: targets.lightShadowHistPos,
             width: shadowW,
             height: shadowH,
             resolveWidth: width,
             resolveHeight: height,
+          })
+        : null;
+      // PRESENTATION FILTER — the same edge-aware kernel, history-free,
+      // cleaning the ACCUMULATED signal into the texture materials sample.
+      // Outside the feedback loop on purpose: history stores the un-post-
+      // filtered accumulation, so the extra blur never compounds frame over
+      // frame (that would flatten every penumbra), it only removes the
+      // residual filter-scale mottle the EMA leaves behind ("still very
+      // grainy and dirty").
+      const lightShadowPostPass = lightShadowFilterPass
+        ? createGiLightShadowFilterPass({
+            gbuffer,
+            source: targets.lightShadowAccum,
+            target: targets.lightShadow,
+            width: shadowW,
+            height: shadowH,
+            resolveWidth: width,
+            resolveHeight: height,
+            planeEps: inputs.lightShadow.voxMax ?? 0.1,
           })
         : null;
       light.giIrradianceNode = this._giIrradianceNode;
@@ -2172,7 +2196,7 @@ export class GISystem {
       // smearing white dots across the dark silhouette in front of it.
       light.giPositionNode = this._giShadowPosNode;
       light.giScreenTexel = this._giLightShadowTexel;
-      return { gbuffer, resolve, lightShadowPass, lightShadowFilterPass, lightShadowHistoryPass, targets, width, height, shadowWidth: shadowW, shadowHeight: shadowH, ...inputs };
+      return { gbuffer, resolve, lightShadowPass, lightShadowFilterPass, lightShadowHistoryPass, lightShadowPostPass, targets, width, height, shadowWidth: shadowW, shadowHeight: shadowH, ...inputs };
     } catch (error) {
       // Falling back to the in-material path keeps GI working (slowly) rather
       // than rendering an unlit scene.
@@ -2310,7 +2334,7 @@ export class GISystem {
       screen.lightShadowFilterPass = createGiLightShadowFilterPass({
         gbuffer: screen.gbuffer,
         source: screen.targets.lightShadowRaw,
-        target: screen.targets.lightShadow,
+        target: screen.targets.lightShadowAccum,
         width: shadowW,
         height: shadowH,
         resolveWidth: width,
@@ -2337,7 +2361,7 @@ export class GISystem {
       ];
       screen.lightShadowHistoryPass = createGiLightShadowHistoryPass({
         gbuffer: screen.gbuffer,
-        source: screen.targets.lightShadow,
+        source: screen.targets.lightShadowAccum,
         histShadow: screen.targets.lightShadowHist,
         histPos: screen.targets.lightShadowHistPos,
         width: shadowW,
@@ -2348,6 +2372,27 @@ export class GISystem {
       if (historyIndexes[0] >= 0) state.queue[historyIndexes[0]] = screen.lightShadowHistoryPass.compute;
       if (historyIndexes[1] >= 0) state.queueNoFeedback[historyIndexes[1]] = screen.lightShadowHistoryPass.compute;
       if (historyIndexes[2] >= 0) state.queueFeedbackOnly[historyIndexes[2]] = screen.lightShadowHistoryPass.compute;
+    }
+    if (screen.lightShadowPostPass) {
+      const oldPost = screen.lightShadowPostPass.compute;
+      const postIndexes = [
+        state.queue.indexOf(oldPost),
+        state.queueNoFeedback.indexOf(oldPost),
+        state.queueFeedbackOnly?.indexOf(oldPost) ?? -1,
+      ];
+      screen.lightShadowPostPass = createGiLightShadowFilterPass({
+        gbuffer: screen.gbuffer,
+        source: screen.targets.lightShadowAccum,
+        target: screen.targets.lightShadow,
+        width: shadowW,
+        height: shadowH,
+        resolveWidth: width,
+        resolveHeight: height,
+        planeEps: screen.lightShadow?.voxMax ?? 0.1,
+      });
+      if (postIndexes[0] >= 0) state.queue[postIndexes[0]] = screen.lightShadowPostPass.compute;
+      if (postIndexes[1] >= 0) state.queueNoFeedback[postIndexes[1]] = screen.lightShadowPostPass.compute;
+      if (postIndexes[2] >= 0) state.queueFeedbackOnly[postIndexes[2]] = screen.lightShadowPostPass.compute;
     }
     this.#retireTargets(previousTargets);
     // Same follow-up for the BVH reflect compute (GI Phase 3 v1) — it is NOT
@@ -3291,6 +3336,11 @@ export class GISystem {
         queue.push(screen.lightShadowHistoryPass.compute);
         queueNoFeedback.push(screen.lightShadowHistoryPass.compute);
         queueFeedbackOnly.push(screen.lightShadowHistoryPass.compute);
+      }
+      if (screen.lightShadowPostPass) {
+        queue.push(screen.lightShadowPostPass.compute);
+        queueNoFeedback.push(screen.lightShadowPostPass.compute);
+        queueFeedbackOnly.push(screen.lightShadowPostPass.compute);
       }
     }
     // Purge three's lights-hash memo — without this the FIRST build of a
