@@ -806,6 +806,33 @@ export class GISystem {
     // while a compile wave holds the rest of this tick.
     this.#drainRetiredTargets();
 
+    // BOOT AMBIENT — the answer to "black screen for 30 seconds until GI
+    // appears". In a GI-lit scene GI IS the ambient: an interior renders
+    // pitch black until the field's first composite, however long assets +
+    // the compile wave take (probe screenshot: draw calls live, one sunlit
+    // floor strip, everything else black — physics, not a bug). A neutral
+    // hemisphere carries the frame from the first tick until the field's
+    // first composite lands (`statsLogged`), then leaves — so startup shows
+    // a flat-lit scene that GI then deepens, instead of a void that GI
+    // eventually replaces. Cold boot only: rebuilds keep the previous
+    // field's light on screen and never re-enter here.
+    // FADES to zero and STAYS in the scene: removing a light changes three's
+    // lights hash, which forces a second full material-recompile wave — the
+    // exact freeze this feature exists to paper over. A zero-intensity
+    // hemisphere is a few dead uniforms per material.
+    if (!this.state && !this._bootAmbient && !this._everComposited) {
+      this._bootAmbient = new THREE.HemisphereLight(0xcfd8e6, 0x4a4238, 0.6);
+      this._bootAmbient.name = "gi-boot-ambient";
+      this.engine.scene.add(this._bootAmbient);
+    } else if (this._bootAmbient && this.state?.statsLogged) {
+      this._bootAmbient.intensity *= 0.9;
+      if (this._bootAmbient.intensity < 0.01) {
+        this._bootAmbient.intensity = 0;
+        this._everComposited = true;
+        this._bootAmbient = null;
+      }
+    }
+
     // While a compile wave runs, do NOTHING here: dispatching computes
     // would sync-compile pipelines inside this frame, and processing a
     // queued rebuild would swap state under the running wave and stack a
@@ -2340,15 +2367,34 @@ export class GISystem {
     this._retiredTargets = keep;
   }
 
-  /** Resolve resolution: half the drawing buffer, clamped to something sane. */
+  /** Resolve resolution: half the drawing buffer, clamped to a PIXEL budget. */
   #screenResolveSize() {
     const renderer = this.engine.renderer;
     const size = renderer.getDrawingBufferSize(new THREE.Vector2());
     const scale = this.component?.props.resolveScale ?? 0.5;
-    return {
-      width: Math.max(16, Math.min(4096, Math.round(size.x * scale))),
-      height: Math.max(16, Math.min(4096, Math.round(size.y * scale))),
-    };
+    let width = Math.max(16, Math.round(size.x * scale));
+    let height = Math.max(16, Math.round(size.y * scale));
+    // TOTAL-PIXEL budget, not a per-axis clamp. Every screen-space GI pass
+    // (gather resolve, the per-light shadow traces, AO) is per-RESOLVE-pixel
+    // work, so cost rides the DRAWING BUFFER — canvas CSS size × monitor
+    // devicePixelRatio — and a maximized 4K/150% viewport quietly quadruples
+    // it (probe-measured: 9ms → 22ms GPU for 4× pixels; the user's "larger
+    // screen - more ms, up to 70ms" panel readings are this line). The
+    // position-validated bilateral upsample already reconstructs full-res
+    // edges from the half-res channel, so capping the traced pixel count
+    // trades penumbra/GI detail nobody resolves at 4K for a flat cost
+    // ceiling. `resolveMaxPixels` prop / `__giResolveMaxPixels` override.
+    const budget =
+      Number(globalThis.__giResolveMaxPixels) ||
+      this.component?.props.resolveMaxPixels ||
+      1_600_000;
+    const px = width * height;
+    if (px > budget) {
+      const s = Math.sqrt(budget / px);
+      width = Math.max(16, Math.round(width * s));
+      height = Math.max(16, Math.round(height * s));
+    }
+    return { width: Math.min(4096, width), height: Math.min(4096, height) };
   }
 
   /**

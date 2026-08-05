@@ -42,7 +42,7 @@ const page = await browser.newPage();
 // VIEW=2560x1440 reproduces the user's monitor — GI screen passes scale with
 // resolution, so a 1400x900 probe understates their cost ~3x.
 const VIEW = (process.env.VIEW ?? "1400x900").split("x").map(Number);
-await page.setViewport({ width: VIEW[0] || 1400, height: VIEW[1] || 900, deviceScaleFactor: 1 });
+await page.setViewport({ width: VIEW[0] || 1400, height: VIEW[1] || 900, deviceScaleFactor: Number(process.env.DPR ?? 1) });
 await installTauriShim(page, {});
 page.on("console", (m) => {
   const t = m.text();
@@ -165,9 +165,32 @@ await page.evaluate(async (anchorId) => {
 // fingerprint. MUST be a real change: setting the prop to its saved value is
 // a no-op and the mesh stays invisible to GI (compute 0.00, ambient-cadence
 // dispatches — the broken-arm signature this line once produced).
+// PROFILING=on|off|flip (default flip): the flip doubles as the structural
+// poke that lets the spawned mesh enter the GI fingerprint. "on"/"off" pin
+// the final value for cost A/Bs — the user's scene SAVES profiling on, and
+// the counters are atomics in every trace, so the arms differ wildly.
 const originalProfiling = giProps.rayHitProfiling === true;
-await call("component.setProp", { id: giEntity.id, type: "global-illumination", key: "rayHitProfiling", value: !originalProfiling });
+const profilingWant =
+  process.env.PROFILING === "on" ? true :
+  process.env.PROFILING === "off" ? false : !originalProfiling;
+if (profilingWant === originalProfiling) {
+  // Still need a structural change for the mesh capture: flip away and back.
+  await call("component.setProp", { id: giEntity.id, type: "global-illumination", key: "rayHitProfiling", value: !originalProfiling });
+  await wait(8000);
+}
+await call("component.setProp", { id: giEntity.id, type: "global-illumination", key: "rayHitProfiling", value: profilingWant });
+console.log(`  rayHitProfiling: saved=${originalProfiling} arm=${profilingWant}`);
 await wait(30000);
+
+// PLAY=1 — measure the frame the USER'S FPS panel measures: game camera,
+// postprocess stack, scripts, everything. The edit-mode arms cannot see any
+// of that, which is exactly how a 5ms edit-mode reading coexists with a
+// 57ms panel reading.
+if (process.env.PLAY) {
+  const r = await call("play.set", { playing: true });
+  console.log(`  play mode: ${JSON.stringify(r)}`);
+  await wait(15000);
+}
 
 // Capture check: is the spawned mesh actually inside the GI field?
 const captured = await page.evaluate((anchorId) => {
