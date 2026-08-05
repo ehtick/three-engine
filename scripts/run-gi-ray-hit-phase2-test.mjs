@@ -284,5 +284,42 @@ const quad = (a, b, c, d) => [[a, b, c], [a, c, d]];
     `macro=${hit.macroSteps} brick=${hit.brickSteps}`);
 }
 
+// ---------------------------------------------------------------------------
+// Shadow variant (`penumbraK`): the analytic cone estimate comes from
+// perpendicular miss distances to the FITTED planes — the record march that
+// replaces the binary-voxel light-shadow DDA.
+{
+  const resolution = { x: 16, y: 16, z: 16 };
+  const triangles = quad([1, 3.25, 1], [15, 3.25, 1], [15, 3.25, 15], [1, 3.25, 15]);
+  const scene = { resolution, ...buildScene(resolution, triangles) };
+  const opts = { tMax: 12, coverage: true, penumbraK: 8 };
+
+  // A ray sliding 0.6 voxels above the fitted floor plane, inside the floor's
+  // own occupied voxel row: every cell's plane REJECTS (parallel), the ray
+  // must NOT hit, and the cone must darken to ~k·d/t of the farthest gated
+  // sample instead of staying blind at 1.
+  const graze = traceHybridPlaneCpu([2, 3.85, 8], [1, 0, 0], resolution, scene.words, scene.layout,
+    scene.surfaces.records, opts);
+  check("grazing ray above the fitted plane does not hit", graze.hit === false, JSON.stringify({ hit: graze.hit, kind: graze.kind }));
+  check("grazing ray accumulates a real cone value", graze.pen > 0 && graze.pen < 0.7, `pen=${graze.pen}`);
+
+  // Clear air far above the floor: nothing grazed, the cone stays open.
+  const clear = traceHybridPlaneCpu([2, 8.5, 8], [1, 0, 0], resolution, scene.words, scene.layout,
+    scene.surfaces.records, opts);
+  check("clear ray keeps pen = 1", clear.hit === false && clear.pen === 1, `pen=${clear.pen}`);
+
+  // Straight into the floor: the plane hit is unchanged by the estimator.
+  const into = traceHybridPlaneCpu([8.2, 9, 8.2], [0, -1, 0], resolution, scene.words, scene.layout,
+    scene.surfaces.records, opts);
+  check("shadow variant preserves the plane hit", into.hit === true && into.kind === "plane" &&
+    Math.abs(into.t - (9 - 3.25)) < 2e-2, `t=${into.t}`);
+  check("pen rides along on hits too", typeof into.pen === "number", `pen=${into.pen}`);
+
+  // Estimator off → no pen field, verdicts identical to the plain variant.
+  const plain = traceHybridPlaneCpu([2, 3.85, 8], [1, 0, 0], resolution, scene.words, scene.layout,
+    scene.surfaces.records, { tMax: 12, coverage: true });
+  check("penumbraK off leaves the result shape unchanged", plain.pen === undefined && plain.hit === graze.hit);
+}
+
 console.log(failed === 0 ? "\nGI-RAY-HIT-PHASE2 ALL PASS" : `\nGI-RAY-HIT-PHASE2 ${failed} FAILED`);
 process.exit(failed === 0 ? 0 : 1);

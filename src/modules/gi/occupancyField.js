@@ -1979,24 +1979,32 @@ export function createOccupancyField(bounds, res0, options = {}) {
         // record can carry the COMPLEX marker, so an exact request there is
         // exactly the Phase-3 variant and must compile as one.
         const exact = complexEnabled && opts.exact === true;
+        // `penumbraK` turns this into the SHADOW variant: the packed return
+        // carries an analytic cone-occlusion estimate in z INSTEAD of the oct
+        // normal (shadow callers don't consume normals), and every rejected
+        // plane contributes its perpendicular miss distance — the distance to
+        // the actual RECORDED surface, which is what makes the penumbra
+        // geometry-true instead of voxel-hull-true.
+        const penumbra = opts.penumbraK != null;
         const profile = rayHitDebug != null && opts.profile === true;
         const key = `${macroStepLimit}|${coverage ? 1 : 0}|${exact ? 1 : 0}|${profile ? 1 : 0}` +
-          `|${coarseSkipEnabled ? 1 : 0}`;
+          `|${coarseSkipEnabled ? 1 : 0}|${penumbra ? 1 : 0}`;
         let fn = hybridPlaneVariants.get(key);
         if (fn === undefined) {
           fn = sharedFn({
             // "s0" is appended ONLY when the skip is off, so the default arm
             // keeps the exact function names it has always emitted.
             name: `giHybridPlaneTrace${macroStepLimit}${coverage ? "c" : ""}${exact ? "x" : ""}` +
-              `${coarseSkipEnabled ? "" : "s0"}`,
+              `${penumbra ? "p" : ""}${coarseSkipEnabled ? "" : "s0"}`,
             type: "vec4",
             inputs: [
               { name: "origin", type: "vec3" },
               { name: "dir", type: "vec3" },
               { name: "tMin", type: "float" },
               { name: "tMax", type: "float" },
+              ...(penumbra ? [{ name: "penK", type: "float" }] : []),
             ],
-            body: (o, d, t0, t1) => {
+            body: (o, d, t0, t1, penKIn) => {
               const inv = vec3(voxelInv).toVar();
               const q0 = vec3(o).sub(vec3(gridOrigin)).mul(inv).toVar();
               const dq = vec3(d).mul(inv).toVar();
@@ -2044,6 +2052,18 @@ export function createOccupancyField(bounds, res0, options = {}) {
               const planeAccepts = uint(0).toVar();
               const planeRejects = uint(0).toVar();
               const surfaceFallbacks = uint(0).toVar();
+              // Analytic cone occlusion for the shadow variant: min over every
+              // rejected plane of k·d/t, where d is the ray's perpendicular
+              // miss distance to the FITTED SURFACE (world units) — the
+              // geometry-true analogue of the legacy DDA's voxel free-radius
+              // estimator. 1 = clear cone, →0 as the ray grazes real surface.
+              const pen = penumbra ? float(1).toVar() : null;
+              const voxNode = penumbra ? vec3(voxel).toVar() : null;
+              const voxMinW = penumbra ? voxNode.x.min(voxNode.y).min(voxNode.z).toVar() : null;
+              // No contribution before ~2 voxels of travel (the receiver's own
+              // surface must not clamp rays at birth) — same gate the legacy
+              // estimator applies.
+              const penGate = penumbra ? float(t0).add(voxMinW.mul(2)).toVar() : null;
               // Declared only in the exact variant so the Phase-2/3 variants
               // emit byte-identical WGSL to before Phase 4.
               const complexTests = exact ? uint(0).toVar() : null;
@@ -2232,7 +2252,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
                               .mul(CELL_LOCAL_PLANE_OFFSET_RANGE).toVar();
                             const denom = n.dot(dq).toVar();
                             const accepted = float(0).toVar();
-                            If(denom.abs().greaterThan(1e-7), () => {
+                            const denomIf = If(denom.abs().greaterThan(1e-7), () => {
                               const tP = dPlane.add(n.dot(cell)).sub(n.dot(q0)).div(denom).toVar();
                               const okInterval = tP.greaterThanEqual(localT.sub(PLANE_HIT_INTERVAL_EPSILON))
                                 .and(tP.lessThanEqual(cellExit.min(segmentEnd).add(PLANE_HIT_INTERVAL_EPSILON)));
@@ -2268,7 +2288,46 @@ export function createOccupancyField(bounds, res0, options = {}) {
                                   planeAccepts.addAssign(uint(1));
                                 });
                               });
+                              if (penumbra) {
+                                // Cone contribution from MISSED-SEGMENT rejects
+                                // only: F(t) = n·q(t) − plane is linear with
+                                // slope `denom`, so the closest approach inside
+                                // [entry, exit] is |denom|·min|t − tP| at the
+                                // nearer endpoint. In-interval COVERAGE rejects
+                                // are excluded on purpose — there the ray
+                                // crosses the plane's extension where the
+                                // surface genuinely is not (a real silhouette
+                                // edge), and their perpendicular distance of 0
+                                // would black the cone out.
+                                If(accepted.lessThan(0.5).and(okInterval.not()), () => {
+                                  const tEnd = cellExit.min(segmentEnd).toVar();
+                                  const dVox = denom.abs().mul(
+                                    localT.sub(tP).abs().min(tEnd.sub(tP).abs()),
+                                  ).toVar();
+                                  const cand = float(penKIn).mul(dVox.mul(voxMinW)).div(localT.max(1e-4)).clamp(0, 1);
+                                  pen.assign(pen.min(select(
+                                    localT.greaterThan(penGate).and(localT.lessThan(t1)),
+                                    cand,
+                                    float(1),
+                                  )));
+                                });
+                              }
                             });
+                            if (penumbra) {
+                              denomIf.Else(() => {
+                                // Parallel ray: the perpendicular distance to
+                                // the fitted plane is constant along the whole
+                                // segment — the exact analytic-cone case (a ray
+                                // sliding just above a floor's surface).
+                                const dVox = dPlane.add(n.dot(cell)).sub(n.dot(localQ)).abs().toVar();
+                                const cand = float(penKIn).mul(dVox.mul(voxMinW)).div(localT.max(1e-4)).clamp(0, 1);
+                                pen.assign(pen.min(select(
+                                  localT.greaterThan(penGate).and(localT.lessThan(t1)),
+                                  cand,
+                                  float(1),
+                                )));
+                              });
+                            }
                             If(accepted.lessThan(0.5), () => {
                               planeRejects.addAssign(uint(1));
                               cellVerdict.assign(2);
@@ -2493,6 +2552,11 @@ export function createOccupancyField(bounds, res0, options = {}) {
                 });
               }
 
+              if (penumbra) {
+                // Shadow variant: z carries the cone estimate; the normal is
+                // not decoded (shadow callers never consume it).
+                return vec4(hit, hitT, pen, 0);
+              }
               const oct = octEncodeTSL(hitNormal).toVar();
               return vec4(hit, hitT, oct.x, oct.y);
             },
@@ -2500,13 +2564,18 @@ export function createOccupancyField(bounds, res0, options = {}) {
           hybridPlaneVariants.set(key, fn);
         }
 
-        const packed = fn(vec3(origin), vec3(dir), float(tMin), float(tMax)).toVar();
+        const packed = (penumbra
+          ? fn(vec3(origin), vec3(dir), float(tMin), float(tMax), float(opts.penumbraK))
+          : fn(vec3(origin), vec3(dir), float(tMin), float(tMax))).toVar();
         const hit = packed.x;
         const hitT = packed.y;
-        const normal = octDecodeTSL(vec2(packed.z, packed.w)).mul(vec3(voxelInv)).normalize().toVar();
         const dq = vec3(dir).mul(vec3(voxelInv)).toVar();
         const q0 = vec3(origin).sub(vec3(gridOrigin)).mul(vec3(voxelInv));
         const voxelAtHit = q0.add(dq.mul(hitT)).floor();
+        if (penumbra) {
+          return { hit, t: hitT, pen: packed.z, voxel: voxelAtHit };
+        }
+        const normal = octDecodeTSL(vec2(packed.z, packed.w)).mul(vec3(voxelInv)).normalize().toVar();
         return { hit, t: hitT, normal, voxel: voxelAtHit };
       }
     : null;

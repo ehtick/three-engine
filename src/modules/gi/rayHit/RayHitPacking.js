@@ -1135,6 +1135,11 @@ export function traceHybridPlaneCpu(
     exactComplex = false,
     pyramid = null,
     failClosed = true,
+    // Shadow-variant mirror: k = 1/cone-angle enables the analytic cone
+    // estimator (`pen` in the result, 1 = clear). `voxelWorld` is the world
+    // size of one voxel — the CPU grid is voxel-unit, the GPU's t is world.
+    penumbraK = null,
+    voxelWorld = 1,
   } = {},
 ) {
   const counters = {
@@ -1161,16 +1166,23 @@ export function traceHybridPlaneCpu(
   let coarseDescends = 0;
   // Same exhaustion clamp as the Phase-1 tracer above; see its notes.
   let lastBrick = false;
+  // Cone estimator state + the same birth gate the GPU applies.
+  let pen = 1;
+  const penGate = tMin + 2 * voxelWorld;
   const coarseOut = () => ({ coarseSteps, coarseSkipsL3, coarseSkipsL4, coarseDescends });
-  const exhausted = (limit, macroSteps) => (failClosed && lastBrick
+  // Every exit path reports `pen` when the estimator is on — a shadow caller
+  // multiplies (1 − hit) · pen, so a miss with a grazed surface must still
+  // carry the cone value it accumulated.
+  const withPen = (o) => (penumbraK == null ? o : { ...o, pen });
+  const exhausted = (limit, macroSteps) => withPen(failClosed && lastBrick
     ? { hit: true, resolved: false, failClosed: true, limit, t, normal: faceNormal(axis), kind: "budget", macroSteps, brickSteps, counters, ...coarseOut() }
     : { hit: false, resolved: false, limit, macroSteps, brickSteps, counters, ...coarseOut() });
   for (let macroSteps = 1; macroSteps <= maxMacroSteps; macroSteps++) {
-    if (t >= tMax) return { hit: false, resolved: true, macroSteps, brickSteps, counters, ...coarseOut() };
+    if (t >= tMax) return withPen({ hit: false, resolved: true, macroSteps, brickSteps, counters, ...coarseOut() });
     const p = [origin[0] + direction[0] * t, origin[1] + direction[1] * t, origin[2] + direction[2] * t];
     if (!(p[0] >= 0 && p[1] >= 0 && p[2] >= 0 &&
         p[0] < resolution.x && p[1] < resolution.y && p[2] < resolution.z)) {
-      return { hit: false, resolved: true, macroSteps, brickSteps, counters, ...coarseOut() };
+      return withPen({ hit: false, resolved: true, macroSteps, brickSteps, counters, ...coarseOut() });
     }
     if (pyramid && level > 2) {
       coarseSteps++;
@@ -1185,7 +1197,7 @@ export function traceHybridPlaneCpu(
       } else {
         const next = cpuDdaDelta(p, direction, scale);
         if (!Number.isFinite(next.delta)) {
-          return { hit: false, resolved: true, macroSteps, brickSteps, counters, ...coarseOut() };
+          return withPen({ hit: false, resolved: true, macroSteps, brickSteps, counters, ...coarseOut() });
         }
         axis = next.axis;
         if (level === 3) coarseSkipsL3++;
@@ -1230,7 +1242,7 @@ export function traceHybridPlaneCpu(
           break;
         }
         const cellNext = cpuDdaDelta(localP, direction, 1);
-        if (!Number.isFinite(cellNext.delta)) return { hit: false, resolved: true, macroSteps, brickSteps, counters, ...coarseOut() };
+        if (!Number.isFinite(cellNext.delta)) return withPen({ hit: false, resolved: true, macroSteps, brickSteps, counters, ...coarseOut() });
         const cellExit = localT + cellNext.delta;
         if (hybridBrickOccupied(words, layout, voxel[0], voxel[1], voxel[2], resolution)) {
           const bit = voxelIndexInBrick(voxel[0] & 3, voxel[1] & 3, voxel[2] & 3);
@@ -1250,10 +1262,10 @@ export function traceHybridPlaneCpu(
               if (Math.abs(denominator) > PLANE_PARALLEL_EPSILON) {
                 tPlane = (plane.planeOffset + v3dot(normal, voxel) - v3dot(normal, origin)) / denominator;
                 const segmentEnd = Math.min(cellExit, macroExit, tMax);
-                accepted = Number.isFinite(tPlane) &&
+                const okInterval = Number.isFinite(tPlane) &&
                   tPlane >= localT - PLANE_HIT_INTERVAL_EPSILON &&
-                  tPlane <= segmentEnd + PLANE_HIT_INTERVAL_EPSILON &&
-                  tPlane >= tMin - PLANE_HIT_INTERVAL_EPSILON;
+                  tPlane <= segmentEnd + PLANE_HIT_INTERVAL_EPSILON;
+                accepted = okInterval && tPlane >= tMin - PLANE_HIT_INTERVAL_EPSILON;
                 if (accepted && coverage) {
                   const record3 = unpackCoverageRecord(flagsWord);
                   if (record3.valid) {
@@ -1265,16 +1277,36 @@ export function traceHybridPlaneCpu(
                     accepted = coverageMaskContainsPoint(record3.mask, local, record3.axis, 1e-3);
                   }
                 }
+                // Cone contribution from missed-segment rejects only — see the
+                // GPU body's note: in-interval coverage rejects are real
+                // silhouette edges whose perpendicular distance of 0 must not
+                // black the cone out.
+                if (penumbraK != null && !okInterval && Number.isFinite(tPlane) &&
+                    localT > penGate && localT < tMax) {
+                  const dVox = Math.abs(denominator) *
+                    Math.min(Math.abs(localT - tPlane), Math.abs(segmentEnd - tPlane));
+                  pen = Math.min(pen, clamp((penumbraK * dVox * voxelWorld) / Math.max(localT, 1e-4), 0, 1));
+                }
+              } else if (penumbraK != null && localT > penGate && localT < tMax) {
+                // Parallel ray: constant perpendicular distance to the fitted
+                // plane along the whole segment — the analytic-cone case.
+                const localP = [
+                  origin[0] + direction[0] * localT,
+                  origin[1] + direction[1] * localT,
+                  origin[2] + direction[2] * localT,
+                ];
+                const dVox = Math.abs(plane.planeOffset + v3dot(normal, voxel) - v3dot(normal, localP));
+                pen = Math.min(pen, clamp((penumbraK * dVox * voxelWorld) / Math.max(localT, 1e-4), 0, 1));
               }
               if (accepted) {
                 counters.planeAccepts++;
                 const flipped = denominator > 0
                   ? [-normal[0], -normal[1], -normal[2]]
                   : normal;
-                return {
+                return withPen({
                   hit: true, resolved: true, t: Math.max(tPlane, tMin), normal: flipped,
                   kind: "plane", voxel, macroSteps, brickSteps, counters, ...coarseOut(),
-                };
+                });
               }
               counters.planeRejects++;
               recordResolved = true; // rejected: fall through and keep marching
@@ -1316,10 +1348,10 @@ export function traceHybridPlaneCpu(
               }
               if (bestNormal) {
                 counters.complexAccepts++;
-                return {
+                return withPen({
                   hit: true, resolved: true, t: Math.max(bestT, tMin), normal: bestNormal,
                   kind: "triangles", voxel, macroSteps, brickSteps, counters, ...coarseOut(),
-                };
+                });
               }
               counters.complexMisses++;
               recordResolved = true; // exact miss: the box fallback would be wrong
@@ -1327,10 +1359,10 @@ export function traceHybridPlaneCpu(
           }
           if (!recordResolved) {
             counters.surfaceFallbacks++;
-            return {
+            return withPen({
               hit: true, resolved: true, t: localT, normal: faceNormal(axis),
               kind: "box", voxel, macroSteps, brickSteps, counters, ...coarseOut(),
-            };
+            });
           }
         }
         axis = cellNext.axis;
@@ -1343,7 +1375,7 @@ export function traceHybridPlaneCpu(
       axis = macroNext.axis;
     }
 
-    if (!Number.isFinite(macroNext.delta)) return { hit: false, resolved: true, macroSteps, brickSteps, counters, ...coarseOut() };
+    if (!Number.isFinite(macroNext.delta)) return withPen({ hit: false, resolved: true, macroSteps, brickSteps, counters, ...coarseOut() });
     t = macroExit + RAY_HIT_DDA_EPSILON;
     if (pyramid) level = 3; // re-ascend after a macro cell, as the GPU does
   }

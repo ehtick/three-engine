@@ -67,9 +67,26 @@
         floor.updateMatrixWorld(true);
         wall.updateMatrixWorld(true);
         engine.scene.add(floor, wall);
-        const sun = new THREE.DirectionalLight(0xffffff, 2);
-        sun.position.set(2, 4, 2);
-        engine.scene.add(sun);
+        // `?lightshadow=1` — the RECORD-MARCH arm: a component light claiming
+        // Shadow Source "gi" compiles the pen variant of the plane trace
+        // (giHybridPlaneTrace…p) into the resolve. An invalid pipeline there
+        // silently drops the whole compute batch, so this is the compile gate
+        // for the shadow variant that no CPU suite can provide.
+        const lightShadowArm = new URLSearchParams(location.search).get("lightshadow") === "1";
+        if (lightShadowArm) {
+          engine.renderer.shadowMap.enabled = true;
+          const sunEnt = engine.createEntity({ name: "Smoke Sun" });
+          const sunComp = sunEnt.addComponent("light", {
+            type: "directional", color: "#ffffff", intensity: 2,
+            castShadow: true, shadowMode: "gi", sourceAngle: 2,
+          });
+          sunEnt.object3D?.position?.set(2, 4, 2);
+          globalThis.__GI_SMOKE_SUN__ = { ent: sunEnt, comp: sunComp };
+        } else {
+          const sun = new THREE.DirectionalLight(0xffffff, 2);
+          sun.position.set(2, 4, 2);
+          engine.scene.add(sun);
+        }
         const camera = new THREE.PerspectiveCamera(55, 320 / 240, 0.1, 50);
         camera.position.set(5, 3, 5);
         camera.lookAt(0, 0, 0);
@@ -162,6 +179,27 @@
         }
         if (hybridMode && !coarseSkip && stats.coarseSteps !== 0) {
           throw new Error(`skip=0 arm still executed ${stats.coarseSteps} coarse levels`);
+        }
+        if (lightShadowArm) {
+          // The claim is only proven by the artifacts it leaves: a custom
+          // shadowNode on the component's light AND the pen-variant WGSL
+          // (name suffix "p") present in a composed compute shader.
+          const stash = globalThis.__GI_SMOKE_SUN__ ?? {};
+          const comp = stash.comp ?? stash.ent?.getComponent?.("light");
+          const sunLight = comp?.light;
+          if (!sunLight?.shadow?.shadowNode) throw new Error("lightshadow arm: the sun never received a gi shadowNode");
+          let penVariantSeen = false;
+          for (const node of state?.queue ?? []) {
+            const shader = engine.renderer._nodes?.getForCompute?.(node)?.computeShader ?? "";
+            if (/giHybridPlaneTrace\d+\w*p\w*\(/.test(shader) || shader.includes("giHybridPlaneTrace192cp")) {
+              penVariantSeen = true;
+              break;
+            }
+          }
+          if (planeMode && !penVariantSeen) {
+            throw new Error("lightshadow arm: the pen plane-trace variant never compiled into the resolve");
+          }
+          console.log(`GI-SMOKE LIGHTSHADOW pen-variant=${penVariantSeen ? "compiled" : "n/a (non-plane mode)"}`);
         }
         globalThis.__GI_SMOKE_RESULT__ = {
           pass: true,

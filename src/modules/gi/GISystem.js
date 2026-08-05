@@ -1758,6 +1758,30 @@ export class GISystem {
               // resolving power anyway.
               const vox = vec3(occ.voxel);
               const tMin = vox.x.max(vox.y).max(vox.z);
+              // THE RECORD MARCH — the non-voxel shadow arm. When the active
+              // ray-hit mode carries surface records, shadow rays resolve hits
+              // through the SAME fitted planes (+ coverage clips, + exact
+              // triangles on ultra) the gather uses: silhouettes follow the
+              // recorded geometry at sub-voxel precision instead of the voxel
+              // hull, and the cone estimate comes from perpendicular miss
+              // distances to those planes rather than voxel free-radius.
+              // `__giLightShadowLegacyDda = true` restores the binary-voxel
+              // arm for an A/B (build-time, like every hatch here).
+              const mode = volume.rayHitMode ?? RayHitMode.OccupancyLegacy;
+              const recordMarch =
+                occ.traceHybridPlane &&
+                occ.hasSurfaceRecords === true &&
+                mode >= RayHitMode.HybridPlane &&
+                mode <= RayHitMode.HybridExactComplex &&
+                globalThis.__giLightShadowLegacyDda !== true;
+              if (recordMarch) {
+                const r = occ.traceHybridPlane(origin, dir, tMin, maxT, {
+                  coverage: mode >= RayHitMode.HybridPlaneCoverage,
+                  exact: mode === RayHitMode.HybridExactComplex,
+                  penumbraK: k,
+                });
+                return r.hit.oneMinus().mul(r.pen);
+              }
               // Tiered like every other march in this module — the DDA's
               // hierarchical coarse-skip means these budgets cross the whole
               // volume at every tier; the tiers trade tail-end reach in
