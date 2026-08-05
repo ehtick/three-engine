@@ -1710,6 +1710,17 @@ export class GISystem {
     const steps =
       Number(globalThis.__giDirectShadowSteps) ||
       ({ low: 96, medium: 128, high: 160, ultra: 192 }[quality] ?? 160);
+    // THE MARCHER DECISION, hoisted so the boot log can print it: "I set
+    // Shadow Source to gi and the silhouettes are still voxel" is unreadable
+    // without knowing which arm compiled. A mode change is structural, so
+    // deciding here (build time) equals deciding inside the trace closure.
+    const shadowMode = volume.rayHitMode ?? RayHitMode.OccupancyLegacy;
+    const recordMarch =
+      occ.traceHybridPlane &&
+      occ.hasSurfaceRecords === true &&
+      shadowMode >= RayHitMode.HybridPlane &&
+      shadowMode <= RayHitMode.HybridExactComplex &&
+      globalThis.__giLightShadowLegacyDda !== true;
     // 1.5 OCCUPANCY VOXELS of ray lift — a node, not a number, so an in-place
     // refit rescales it with the pyramid. See the resolve's own comment for
     // why the gather's normalOffset is the wrong scale here.
@@ -1717,6 +1728,11 @@ export class GISystem {
     const voxMax = vox.x.max(vox.y).max(vox.z);
     const lift = voxMax.mul(1.5);
     return {
+      marcher: globalThis.__giLightShadowSphere === true
+        ? "sphere"
+        : recordMarch
+          ? `records (${rayHitModeName(shadowMode)})`
+          : "voxel-dda",
       slots: lightSlots,
       lift,
       voxMax,
@@ -1767,18 +1783,24 @@ export class GISystem {
               // distances to those planes rather than voxel free-radius.
               // `__giLightShadowLegacyDda = true` restores the binary-voxel
               // arm for an A/B (build-time, like every hatch here).
-              const mode = volume.rayHitMode ?? RayHitMode.OccupancyLegacy;
-              const recordMarch =
-                occ.traceHybridPlane &&
-                occ.hasSurfaceRecords === true &&
-                mode >= RayHitMode.HybridPlane &&
-                mode <= RayHitMode.HybridExactComplex &&
-                globalThis.__giLightShadowLegacyDda !== true;
+              // KNOWN LIMITS (why a silhouette can still read voxel-true):
+              // DynamicBrick cells — anything added or moved since the last
+              // FULL rebuild — deliberately ignore records (box semantics),
+              // and COMPLEX-classified cells (curved stone, thin double-face
+              // walls) only resolve to real triangles in exact-complex mode.
               if (recordMarch) {
+                // Tiered macro budget like the legacy arm — the cap only binds
+                // on long grazing rays (the frames where shadow cost spikes),
+                // and with the fail-closed clamp a capped ray goes DARK, never
+                // a leak. `__giDirectShadowSteps` overrides here too.
+                const macroSteps =
+                  Number(globalThis.__giDirectShadowSteps) ||
+                  ({ low: 96, medium: 128, high: 160, ultra: 192 }[quality] ?? 160);
                 const r = occ.traceHybridPlane(origin, dir, tMin, maxT, {
-                  coverage: mode >= RayHitMode.HybridPlaneCoverage,
-                  exact: mode === RayHitMode.HybridExactComplex,
+                  coverage: shadowMode >= RayHitMode.HybridPlaneCoverage,
+                  exact: shadowMode === RayHitMode.HybridExactComplex,
                   penumbraK: k,
+                  macroSteps,
                 });
                 return r.hit.oneMinus().mul(r.pen);
               }
@@ -2963,7 +2985,7 @@ export class GISystem {
     // built the trace, and at what step budget.
     console.log(
       screen?.lightShadow
-        ? `[gi] light shadows: gi-traced ON at ${screen.lightShadow.steps} steps (${quality}), ` +
+        ? `[gi] light shadows: gi-traced ON, marcher ${screen.lightShadow.marcher} (${quality}), ` +
             `up to ${MAX_GI_LIGHTS} lights — flag a light with Shadow Source "gi"`
         : "[gi] light shadows: gi-traced OFF — every light renders its own shadow map",
     );
