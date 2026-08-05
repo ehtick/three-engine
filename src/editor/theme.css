@@ -5472,6 +5472,25 @@ input[type="checkbox"]:checked::after {
   gap: 5px;
 }
 
+.modules-credential-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+.modules-credential-row input {
+  flex: 1;
+  min-width: 140px;
+  padding: 4px 7px;
+  color: var(--text);
+  background: var(--bg-1);
+  border: 1px solid var(--bg-3);
+  border-radius: 5px;
+  outline: none;
+  font-size: 11px;
+}
+.modules-credential-row input:focus { border-color: var(--accent); }
+
 /* Component chips — small pills that wrap, more legible than the previous
  * comma-separated inline list. */
 .modules-component-list {
@@ -7064,6 +7083,47 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
 @keyframes sf-progress {
   from { transform: translateX(-20%); }
   to { transform: translateX(145%); }
+}
+
+/* --- itch.io browser ----------------------------------------------------- */
+.itchio-upload-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 8px 0;
+}
+
+.itchio-upload-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px;
+  background: var(--bg-2);
+  border: 1px solid var(--bg-3);
+  border-radius: 6px;
+}
+
+.itchio-upload-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.itchio-upload-name {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.itchio-publish {
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  overflow-y: auto;
 }
 
 /* --- AmbientCG browser -------------------------------------------------- */
@@ -9461,21 +9521,30 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
 
 /* --- new-document dialog --- */
 
+/* Fixed to the VIEWPORT, not to the panel. These panels dock into the short
+ * strip under the viewport — a dialog centred inside a 200px-tall panel has its
+ * buttons off the bottom, and an absolutely-positioned backdrop escapes to
+ * whatever ancestor happens to be positioned anyway. */
 .texture-dialog-backdrop {
-  position: absolute;
+  position: fixed;
   inset: 0;
   display: grid;
   place-items: center;
+  padding: 24px;
   background: rgba(0, 0, 0, 0.42);
-  z-index: 40;
+  z-index: 400;
 }
 
 .texture-dialog {
-  width: 280px;
+  width: 300px;
+  max-width: 100%;
+  /* A long dialog scrolls rather than pushing its own actions off screen. */
+  max-height: min(78vh, 640px);
+  overflow-y: auto;
   padding: 16px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 9px;
   border-radius: var(--r-menu);
   background: var(--menu-bg);
   backdrop-filter: blur(20px);
@@ -9489,21 +9558,59 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
   font-weight: 600;
 }
 
+/* Label left, control right — a stacked pair per field doubles the dialog's
+ * height, which is what pushed the actions off the bottom. */
 .texture-dialog label {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
+  display: grid;
+  grid-template-columns: 1fr minmax(0, 128px);
+  align-items: center;
+  gap: 8px;
   font-size: 11px;
   color: var(--text-dim);
 }
 
-.texture-dialog-row {
+/* Text/number/select controls fill their column. Checkboxes must NOT — they
+ * are iOS switches with a fixed size, and stretching one to the column width
+ * pushes its own label out of the dialog. */
+.texture-dialog label > input:not([type="checkbox"]):not([type="color"]),
+.texture-dialog label > select {
+  width: 100%;
+  min-width: 0;
+}
+
+.texture-dialog label > input[type="color"] {
+  width: 46px;
+  height: 24px;
+  justify-self: start;
+}
+
+/* A checkbox row is a row. Without this the dialog's column layout wins on
+ * specificity and stacks the iOS switch above its own label. */
+.texture-dialog .texture-check,
+.texture-dialog-row .texture-check {
   display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: flex-start;
+  grid-template-columns: none;
   gap: 8px;
 }
 
+.texture-dialog .texture-check input[type="checkbox"] {
+  flex-shrink: 0;
+}
+
+.texture-dialog-row {
+  display: flex;
+  gap: 10px;
+}
+
+/* Fixed label column so paired fields line up with each other — "Cell W" and
+ * "Spacing X" are different widths, and sizing to content staggers every input. */
 .texture-dialog-row label {
   flex: 1;
+  grid-template-columns: 62px minmax(0, 1fr);
+  gap: 6px;
 }
 
 .texture-dialog-presets {
@@ -9517,6 +9624,12 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
   justify-content: flex-end;
   gap: 6px;
   margin-top: 4px;
+  /* Sticks to the bottom of a scrolled dialog so Cancel/Apply are always
+   * reachable without hunting for the end of the list. */
+  position: sticky;
+  bottom: -16px;
+  padding: 10px 0 0;
+  background: linear-gradient(to bottom, transparent, var(--menu-bg) 45%);
 }
 
 /* --- Texture Editor: operation dialogs (Image / Adjust / Filter / Channels) --- */
@@ -9537,9 +9650,12 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
   font-weight: 400;
 }
 
+/* Wins over `.texture-dialog label`, which is one class more specific than a
+ * bare `.texture-param` and would otherwise flatten this to two columns. */
+.texture-dialog .texture-param,
 .texture-param {
   display: grid;
-  grid-template-columns: 96px 1fr 62px;
+  grid-template-columns: 84px minmax(0, 1fr) 58px;
   align-items: center;
   gap: 8px;
   font-size: 11px;

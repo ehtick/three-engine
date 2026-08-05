@@ -728,6 +728,44 @@ console.log("\nslicing a lone spritesheet");
   });
   check("Slice ▸ By Grid is reachable", openedSlice && pickedGrid);
   await page.waitForSelector(".texture-dialog", { timeout: 10000 });
+  // SHOT=<path> captures the dialog. Layout bugs here are invisible to every
+  // assertion that is not about geometry, and this panel docks into a short
+  // strip where dialogs are easy to clip.
+  if (process.env.SHOT) await page.screenshot({ path: process.env.SHOT });
+
+  // Layout, measured rather than eyeballed. These panels dock into a short
+  // strip, and a dialog that centres inside the PANEL puts its own buttons off
+  // the bottom of the screen — which is exactly what happened.
+  const layout = await page.evaluate(() => {
+    const dialog = document.querySelector(".texture-dialog");
+    const actions = document.querySelector(".texture-dialog-actions");
+    const toggle = document.querySelector(".texture-dialog .texture-check");
+    const box = dialog.getBoundingClientRect();
+    const act = actions.getBoundingClientRect();
+    const tog = toggle?.getBoundingClientRect();
+    return {
+      dialog: { top: box.top, bottom: box.bottom, width: box.width },
+      actions: { top: act.top, bottom: act.bottom, left: act.left, width: act.width },
+      toggle: tog ? { width: tog.width, height: tog.height } : null,
+      viewport: { w: window.innerWidth, h: window.innerHeight },
+    };
+  });
+  check(
+    "the dialog fits on screen",
+    layout.dialog.top >= 0 && layout.dialog.bottom <= layout.viewport.h,
+    `${Math.round(layout.dialog.top)}..${Math.round(layout.dialog.bottom)} of ${layout.viewport.h}`,
+  );
+  check(
+    "its Cancel/Slice row is visible, not pushed off the bottom",
+    layout.actions.bottom <= layout.viewport.h && layout.actions.width > 0,
+    `actions bottom ${Math.round(layout.actions.bottom)} of ${layout.viewport.h}`,
+  );
+  check(
+    "a checkbox row lays out as a ROW, not stacked",
+    !!layout.toggle && layout.toggle.width > layout.toggle.height * 2,
+    layout.toggle ? `${Math.round(layout.toggle.width)}×${Math.round(layout.toggle.height)}` : "missing",
+  );
+  await page.waitForSelector(".texture-dialog", { timeout: 10000 });
 
   // Six columns, one row — the shape of the sheet.
   await page.evaluate(() => {
