@@ -166,6 +166,14 @@ if (process.env.STEPS) {
   console.log(`  __giDirectShadowSteps -> ${process.env.STEPS}`);
 }
 
+// KIND=1 — verdict-kind map arm: the shadow channel paints which acceptance
+// class decided each pixel (miss=white, plane=0.75, triangle=0.5, box=0.25,
+// budget-clamp=black). Must be set before the flip builds the resolve.
+if (process.env.KIND) {
+  await page.evaluate(() => { globalThis.__giShadowKindDebug = true; });
+  console.log("  verdict-kind map ON");
+}
+
 // castShadow first: three only compiles a shadow branch for a shadow-casting
 // light, so `shadowMode: "gi"` on a non-caster is inert by construction.
 if (!originalCastShadow) {

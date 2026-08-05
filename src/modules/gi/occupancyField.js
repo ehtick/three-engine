@@ -1175,28 +1175,27 @@ export function createOccupancyField(bounds, res0, options = {}) {
                 select(axis.equal(uint(0)), covX, select(axis.equal(uint(1)), covY, covZ)).toUint(),
                 uint(0xffff),
               ).toVar();
-              // One-texel chebyshev dilation without row wrap: horizontal
-              // (nibble-masked shifts), then vertical.
-              const hMask = bitAnd(bitOr(raw, bitOr(
-                bitAnd(shiftLeft(raw, uint(1)), uint(0xeeee)),
-                bitAnd(shiftRight(raw, uint(1)), uint(0x7777)),
-              )), uint(0xffff)).toVar();
-              const dilated = bitAnd(bitOr(hMask, bitOr(
-                shiftLeft(hMask, uint(4)),
-                shiftRight(hMask, uint(4)),
-              )), uint(0xffff)).toVar();
+              // The RAW mask is what gets PACKED. Dilation moved to TEST time:
+              // the gather still tests the one-texel-dilated mask (a false
+              // miss there CONTINUES the march = a light leak through the
+              // wall, so it must stay conservative), but the SHADOW variant
+              // tests the raw mask — a fit-time-dilated mask is full or
+              // near-full for most boundary cells (conservative rasterization
+              // already fattens by the Minkowski radius), which made every
+              // plane accept span its whole cell and quantized shadow
+              // silhouettes to FULL VOXELS (the kind-map-proven class).
               packedNormal.assign(packSnorm2x16(octEncodeTSL(nHat)));
               const offset16 = bitAnd(
                 packSnorm2x16(vec2(dHat.div(CELL_LOCAL_PLANE_OFFSET_RANGE).clamp(-1, 1), 0)),
                 uint(0xffff),
               );
-              const coverageByte = countOneBits(dilated).mul(uint(255)).div(uint(16)).min(uint(255));
+              const coverageByte = countOneBits(raw).mul(uint(255)).div(uint(16)).min(uint(255));
               const confidenceByte = coherence.mul(255).clamp(0, 255).toUint();
               packedPlane.assign(bitOr(offset16, bitOr(
                 shiftLeft(coverageByte, uint(16)),
                 shiftLeft(confidenceByte, uint(24)),
               )));
-              packedFlags.assign(bitOr(dilated, bitOr(
+              packedFlags.assign(bitOr(raw, bitOr(
                 shiftLeft(axis, uint(16)),
                 bitOr(
                   shiftLeft(uint(1), uint(COVERAGE_VALID_SHIFT)),
@@ -2064,6 +2063,12 @@ export function createOccupancyField(bounds, res0, options = {}) {
               // geometry-true analogue of the legacy DDA's voxel free-radius
               // estimator. 1 = clear cone, →0 as the ray grazes real surface.
               const pen = penumbra ? float(1).toVar() : null;
+              // Verdict-kind channel (w of the packed return, shadow variant
+              // only): 0 none/miss, 1 plane accept, 2 exact triangle, 3 box
+              // fallback, 4 fail-closed clamp. Costs one register; lets a
+              // debug view paint WHICH acceptance class decided each pixel —
+              // the instrument that ends silhouette-attribution guesswork.
+              const hitKind = penumbra ? float(0).toVar() : null;
               const voxNode = penumbra ? vec3(voxel).toVar() : null;
               const voxMinW = penumbra ? voxNode.x.min(voxNode.y).min(voxNode.z).toVar() : null;
               // No contribution before ~2 voxels of travel (the receiver's own
@@ -2274,8 +2279,24 @@ export function createOccupancyField(bounds, res0, options = {}) {
                                     const v = select(axisSel.equal(uint(2)), local.y, local.z);
                                     const texU = u.mul(4).floor().clamp(0, 3).toUint();
                                     const texV = v.mul(4).floor().clamp(0, 3).toUint();
+                                    // The packed mask is RAW. Gather rays test
+                                    // it one-texel DILATED (leak-conservative:
+                                    // a false miss continues the march through
+                                    // a wall); shadow rays test it raw — the
+                                    // silhouette lever.
+                                    let testMask = bitAnd(flagsWord, uint(0xffff)).toVar();
+                                    if (!penumbra) {
+                                      const hM = bitAnd(bitOr(testMask, bitOr(
+                                        bitAnd(shiftLeft(testMask, uint(1)), uint(0xeeee)),
+                                        bitAnd(shiftRight(testMask, uint(1)), uint(0x7777)),
+                                      )), uint(0xffff)).toVar();
+                                      testMask = bitAnd(bitOr(hM, bitOr(
+                                        shiftLeft(hM, uint(4)),
+                                        shiftRight(hM, uint(4)),
+                                      )), uint(0xffff)).toVar();
+                                    }
                                     const covBit = bitAnd(
-                                      shiftRight(flagsWord, texV.mul(uint(4)).add(texU)),
+                                      shiftRight(testMask, texV.mul(uint(4)).add(texU)),
                                       uint(1),
                                     );
                                     covOk.assign(covBit.toFloat());
@@ -2292,6 +2313,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
                                   localResolved.assign(1);
                                   cellVerdict.assign(1);
                                   planeAccepts.addAssign(uint(1));
+                                  if (penumbra) hitKind.assign(1);
                                 });
                               });
                               if (penumbra) {
@@ -2434,6 +2456,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
                                 localResolved.assign(1);
                                 cellVerdict.assign(1);
                                 complexAccepts.addAssign(uint(1));
+                                if (penumbra) hitKind.assign(2);
                               }).Else(() => {
                                 cellVerdict.assign(2);
                                 complexMisses.addAssign(uint(1));
@@ -2449,6 +2472,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
                         hitNormal.assign(faceNormalFrom(localAxis));
                         resolved.assign(1);
                         localResolved.assign(1);
+                        if (penumbra) hitKind.assign(3);
                       });
                       If(hit.greaterThan(0.5), () => {
                         Break();
@@ -2529,6 +2553,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
                   hit.assign(1);
                   hitT.assign(t);
                   hitNormal.assign(faceNormalFrom(axis));
+                  if (penumbra) hitKind.assign(4);
                 });
               }
 
@@ -2559,9 +2584,10 @@ export function createOccupancyField(bounds, res0, options = {}) {
               }
 
               if (penumbra) {
-                // Shadow variant: z carries the cone estimate; the normal is
-                // not decoded (shadow callers never consume it).
-                return vec4(hit, hitT, pen, 0);
+                // Shadow variant: z carries the cone estimate, w the verdict
+                // kind; the normal is not decoded (shadow callers never
+                // consume it).
+                return vec4(hit, hitT, pen, hitKind);
               }
               const oct = octEncodeTSL(hitNormal).toVar();
               return vec4(hit, hitT, oct.x, oct.y);
@@ -2579,7 +2605,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
         const q0 = vec3(origin).sub(vec3(gridOrigin)).mul(vec3(voxelInv));
         const voxelAtHit = q0.add(dq.mul(hitT)).floor();
         if (penumbra) {
-          return { hit, t: hitT, pen: packed.z, voxel: voxelAtHit };
+          return { hit, t: hitT, pen: packed.z, kind: packed.w, voxel: voxelAtHit };
         }
         const normal = octDecodeTSL(vec2(packed.z, packed.w)).mul(vec3(voxelInv)).normalize().toVar();
         return { hit, t: hitT, normal, voxel: voxelAtHit };

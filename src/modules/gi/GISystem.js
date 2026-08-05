@@ -1802,6 +1802,12 @@ export class GISystem {
                   penumbraK: k,
                   macroSteps,
                 });
+                if (globalThis.__giShadowKindDebug === true) {
+                  // VERDICT-KIND MAP instead of a shadow: the channel paints
+                  // WHICH acceptance class decided each pixel. miss=white,
+                  // plane=0.75, exact-triangle=0.5, box=0.25, clamp=black.
+                  return float(1).sub(r.kind.mul(0.25));
+                }
                 return r.hit.oneMinus().mul(r.pen);
               }
               // Tiered like every other march in this module — the DDA's

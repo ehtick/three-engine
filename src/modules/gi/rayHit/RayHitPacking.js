@@ -1058,7 +1058,10 @@ export function buildSurfaceRecordsCpu(resolution, words, layout, triangles, {
     if (!simple) { complexCells++; emitComplex(record); continue; }
     simpleCells++;
     const axis = dominantAxis(nhat);
-    const mask = dilateCoverageMask(cov[record * 3 + axis], 1);
+    // RAW mask packed; dilation happens at TEST time (gather only) — mirrors
+    // the GPU finalize. See the finalize's note: fit-time dilation made most
+    // boundary masks full and voxel-quantized every shadow silhouette.
+    const mask = cov[record * 3 + axis] & 0xffff;
     const packed = packSimplePlaneRecord({
       normal: nhat,
       planeOffset: clamp(dhat, -CELL_LOCAL_PLANE_OFFSET_RANGE, CELL_LOCAL_PLANE_OFFSET_RANGE),
@@ -1274,7 +1277,12 @@ export function traceHybridPlaneCpu(
                       origin[1] + direction[1] * tPlane - voxel[1],
                       origin[2] + direction[2] * tPlane - voxel[2],
                     ];
-                    accepted = coverageMaskContainsPoint(record3.mask, local, record3.axis, 1e-3);
+                    // Packed masks are RAW; gather rays test them dilated
+                    // (leak-conservative), shadow rays raw — GPU parity.
+                    const testMask = penumbraK == null
+                      ? dilateCoverageMask(record3.mask, 1)
+                      : record3.mask;
+                    accepted = coverageMaskContainsPoint(testMask, local, record3.axis, 1e-3);
                   }
                 }
                 // Cone contribution from missed-segment rejects only — see the
