@@ -240,17 +240,15 @@
           if (planeMode && !penVariantSeen) {
             throw new Error("lightshadow arm: the pen plane-trace variant never compiled into the resolve");
           }
-          // CONE ARM (soft shadows computed in-trace): the resolve must carry
-          // the cone-DDA WGSL, and the density pyramid must hold REAL
-          // fractions — cross-checked against the level-0 bits (a level-1
-          // cell's byte is round(255·popcount(children)/8) exactly).
-          let coneVariantSeen = false;
-          for (const node of state?.queue ?? []) {
-            const shader = engine.renderer._nodes?.getForCompute?.(node)?.computeShader ?? "";
-            if (/giOccConeTrace\d+/.test(shader)) { coneVariantSeen = true; break; }
-          }
-          if (!coneVariantSeen) {
-            throw new Error("lightshadow arm: the cone-DDA trace never compiled into the resolve");
+          // SOFT ARM: the default is the stochastic sun-disc sample (exact
+          // march along a jittered direction — no extra WGSL function), with
+          // the density cone behind __giConeShadowDensity. Assert the bundle
+          // says so, and that the density pyramid still holds REAL fractions
+          // for the hatched arm — cross-checked against the level-0 bits (a
+          // level-1 cell's byte is round(255·popcount(children)/8) exactly).
+          const marcher = engine.modules.get("gi").system.state.screen?.lightShadow?.marcher ?? "";
+          if (!/sun-disc|density-cone/.test(marcher)) {
+            throw new Error(`lightshadow arm: unexpected soft-shadow marcher "${marcher}"`);
           }
           const occField = engine.modules.get("gi").system.state.volume.occupancyField;
           const rb = await occField.readbackBits(engine.renderer);
@@ -280,7 +278,7 @@
           }
           console.log(
             `GI-SMOKE LIGHTSHADOW pen-variant=${penVariantSeen ? "compiled" : "n/a (non-plane mode)"} ` +
-            `cone-variant=compiled densityCells=${densityCells} partial=${partialCells} mismatches=0`,
+            `marcher="${marcher}" densityCells=${densityCells} partial=${partialCells} mismatches=0`,
           );
         }
         globalThis.__GI_SMOKE_RESULT__ = {

@@ -1773,7 +1773,7 @@ export class GISystem {
       marcher: globalThis.__giLightShadowSphere === true
         ? "sphere"
         : (recordMarch ? `records (${rayHitModeName(shadowMode)})` : "voxel-dda") +
-          (occ.traceOccupancyCone && globalThis.__giNoConeShadow !== true ? " + cone" : ""),
+          (globalThis.__giConeShadowDensity === true ? " + density-cone" : " + sun-disc"),
       slots: lightSlots,
       lift,
       voxMax,
@@ -1816,29 +1816,47 @@ export class GISystem {
               // resolving power anyway.
               const vox = vec3(occ.voxel);
               const tMin = vox.x.max(vox.y).max(vox.z);
-              // ── TWO-PHASE SOFT SHADOW ─────────────────────────────────────
-              // The exact arm (records/triangles, sub-voxel silhouettes) owns
-              // the ray only WHILE the light cone is narrower than the medium
-              // can resolve; past tSwitch = (voxel/2)/tan(halfAngle) the
-              // penumbra is wider than a voxel and sub-voxel precision buys
-              // nothing — the cone-DDA takes over and accumulates fractional
-              // occupancy into transmittance (softness computed IN the trace;
-              // see traceOccupancyCone). At 0° tSwitch → ∞, the exact arm
-              // keeps the whole ray and the cone arm never runs a step — the
-              // user-validated razor look is byte-identical by construction.
-              // `__giNoConeShadow = true` restores single-phase (build-time).
-              const cone =
-                tanHalf != null &&
-                occ.traceOccupancyCone &&
-                globalThis.__giNoConeShadow !== true;
+              // ── STOCHASTIC SUN-DISC SOFT SHADOWS (the soft arm of record).
+              // Each pixel traces the EXACT march along one jittered
+              // direction inside the sun's disc; the penumbra is the pixel
+              // ENSEMBLE (IGN dither, averaged by the material bilateral),
+              // not a per-ray estimate. This replaced the density-cone arm
+              // after the user's 15° screenshots showed both of that model's
+              // congenital diseases at once: a thin solid roof in a coarse
+              // cell reads fraction ~1/8 → dappled LIGHT LEAKS, while dense
+              // clusters + the fail-dark clamp collapse to BLACK — and
+              // tuning boost only trades one for the other. Binary exact
+              // occlusion per ray has neither disease, keeps sub-voxel
+              // record silhouettes at EVERY angle, costs the same march the
+              // user-validated 0° path always ran, and a jittered ray that
+              // dips below the receiver's horizon correctly reads its own
+              // ground as the occluder (that part of the disc IS set).
+              // 0° degenerates exactly (disc radius 0 → jd = dir).
+              // `__giConeShadowDensity = true` restores the density-cone
+              // two-phase arm for A/B (build-time, like every hatch here).
+              const soft = tanHalf != null && jitter != null;
+              const legacyCone =
+                globalThis.__giConeShadowDensity === true &&
+                soft &&
+                occ.traceOccupancyCone;
               const voxMin = vox.x.min(vox.y).min(vox.z);
-              const exactEnd = cone
+              let dirEff = dir;
+              if (soft && !legacyCone) {
+                const d = vec3(dir);
+                const upRef = select(d.y.abs().lessThan(0.9), vec3(0, 1, 0), vec3(1, 0, 0));
+                const s1 = d.cross(upRef).normalize().toVar();
+                const s2 = d.cross(s1).toVar();
+                const ang = float(jitter).mul(Math.PI * 2).toVar();
+                const rr = float(jitter2 ?? 0.5).sqrt().mul(float(tanHalf)).toVar();
+                dirEff = d.add(s1.mul(ang.cos()).add(s2.mul(ang.sin())).mul(rr)).normalize().toVar();
+              }
+              const exactEnd = legacyCone
                 ? voxMin.mul(0.5).div(float(tanHalf).max(1e-5)).min(maxT).toVar()
                 : maxT;
               const coneSteps =
                 Number(globalThis.__giConeShadowSteps) ||
                 ({ low: 48, medium: 64, high: 80, ultra: 96 }[quality] ?? 80);
-              const coneT = cone
+              const coneT = legacyCone
                 ? occ.traceOccupancyCone(origin, dir, exactEnd.max(tMin), maxT, {
                     tanHalf,
                     steps: coneSteps,
@@ -1878,7 +1896,7 @@ export class GISystem {
                 const macroSteps =
                   Number(globalThis.__giDirectShadowSteps) ||
                   ({ low: 96, medium: 128, high: 160, ultra: 192 }[quality] ?? 160);
-                const r = occ.traceHybridPlane(origin, dir, tMin, exactEnd, {
+                const r = occ.traceHybridPlane(origin, dirEff, tMin, exactEnd, {
                   coverage: shadowMode >= RayHitMode.HybridPlaneCoverage,
                   exact: shadowMode === RayHitMode.HybridExactComplex,
                   penumbraK: k,
@@ -1916,7 +1934,7 @@ export class GISystem {
               const ddaSteps =
                 Number(globalThis.__giDirectShadowSteps) ||
                 ({ low: 40, medium: 56, high: 64, ultra: 80 }[quality] ?? 64);
-              const r = occ.traceOccupancy(origin, dir, tMin, exactEnd, { steps: ddaSteps, penumbraK: k });
+              const r = occ.traceOccupancy(origin, dirEff, tMin, exactEnd, { steps: ddaSteps, penumbraK: k });
               const legacyVis = r.hit.oneMinus().mul(r.pen);
               return vec2(
                 coneT ? legacyVis.mul(coneT) : legacyVis,
