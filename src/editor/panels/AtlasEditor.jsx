@@ -388,6 +388,8 @@ function AtlasCanvas({ def, image, selected, onSelect, onCreate, onUpdateRegion 
   // See the paint canvas: fitting against a zero-sized wrapper clamps the zoom
   // to its minimum and parks the sheet in the corner, with no way back.
   const fittedRef = useRef(false);
+  const viewTouchedRef = useRef(false);
+  const sizeRef = useRef(null);
 
   const fit = useCallback(() => {
     const wrap = wrapRef.current;
@@ -405,9 +407,12 @@ function AtlasCanvas({ def, image, selected, onSelect, onCreate, onUpdateRegion 
       y: height / 2 - (image.height * zoom) / 2,
     };
     fittedRef.current = true;
+    viewTouchedRef.current = false;
+    sizeRef.current = { width, height };
     bumpView((v) => v + 1);
     return true;
   }, [image.width, image.height]);
+
 
   useEffect(() => {
     fittedRef.current = false;
@@ -507,16 +512,38 @@ function AtlasCanvas({ def, image, selected, onSelect, onCreate, onUpdateRegion 
     draw();
   }, [draw]);
 
+  /** See the paint canvas: the auto view re-fits when the panel is resized (so
+   *  maximizing shows more sheet), a view the user navigated is kept centred. */
+  const reflow = useCallback(() => {
+    const wrap = wrapRef.current;
+    if (!wrap) return;
+    const width = wrap.clientWidth;
+    const height = wrap.clientHeight;
+    if (width < 8 || height < 8) return;
+    if (!fittedRef.current || !viewTouchedRef.current) {
+      fit();
+      return;
+    }
+    const previous = sizeRef.current;
+    sizeRef.current = { width, height };
+    if (previous && (previous.width !== width || previous.height !== height)) {
+      const view = viewRef.current;
+      viewRef.current = {
+        zoom: view.zoom,
+        x: view.x + (width - previous.width) / 2,
+        y: view.y + (height - previous.height) / 2,
+      };
+    }
+    draw();
+  }, [fit, draw]);
+
   useEffect(() => {
     const wrap = wrapRef.current;
     if (!wrap || typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(() => {
-      if (!fittedRef.current && fit()) return;
-      draw();
-    });
+    const observer = new ResizeObserver(reflow);
     observer.observe(wrap);
     return () => observer.disconnect();
-  }, [draw, fit]);
+  }, [reflow]);
 
   const toImage = useCallback((event) => {
     const rect = canvasRef.current.getBoundingClientRect();
@@ -597,6 +624,7 @@ function AtlasCanvas({ def, image, selected, onSelect, onCreate, onUpdateRegion 
           x: gesture.view.x + (event.clientX - gesture.start.x),
           y: gesture.view.y + (event.clientY - gesture.start.y),
         };
+        viewTouchedRef.current = true;
         draw();
         return;
       }
@@ -691,6 +719,7 @@ function AtlasCanvas({ def, image, selected, onSelect, onCreate, onUpdateRegion 
             x: px - ((px - view.x) / view.zoom) * zoom,
             y: py - ((py - view.y) / view.zoom) * zoom,
           };
+          viewTouchedRef.current = true;
           draw();
         }}
       />
@@ -700,6 +729,7 @@ function AtlasCanvas({ def, image, selected, onSelect, onCreate, onUpdateRegion 
           title="Zoom out"
           onClick={() => {
             viewRef.current.zoom = Math.max(MIN_ZOOM, viewRef.current.zoom / 1.5);
+            viewTouchedRef.current = true;
             draw();
           }}
         >
@@ -713,6 +743,7 @@ function AtlasCanvas({ def, image, selected, onSelect, onCreate, onUpdateRegion 
           title="Zoom in"
           onClick={() => {
             viewRef.current.zoom = Math.min(MAX_ZOOM, viewRef.current.zoom * 1.5);
+            viewTouchedRef.current = true;
             draw();
           }}
         >

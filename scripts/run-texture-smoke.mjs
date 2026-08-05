@@ -1246,6 +1246,49 @@ console.log("\npanel maximize");
     await page.keyboard.press("Escape");
     await settle(400);
     check("and it restores once the field is left", (await isMaximized()) === false);
+
+    // Maximizing should show MORE of the image, not the same postage stamp in
+    // a bigger panel. The zoom readout is the honest measure.
+    await openTexture(WALL);
+    await page.waitForSelector(".texture-canvas", { timeout: 30000 });
+    await settle(900);
+    const zoomNow = () =>
+      page.evaluate(() => {
+        const text = document.querySelector(".tx-readout")?.textContent ?? "";
+        const match = text.match(/(\d+)%/);
+        return match ? Number(match[1]) : 0;
+      });
+    const small = await zoomNow();
+    check("the docked panel reports a zoom", small > 0, `${small}%`);
+
+    await page.mouse.move(tabBar.x, tabBar.y);
+    await page.mouse.down();
+    await page.mouse.up();
+    await page.mouse.down({ clickCount: 2 });
+    await page.mouse.up({ clickCount: 2 });
+    await settle(700);
+    const big = await zoomNow();
+    check("maximizing re-fits the image to the bigger panel", big > small, `${small}% -> ${big}%`);
+
+    // A view the user navigated is theirs: zoom in, maximize, and the zoom
+    // must survive rather than being reset by the resize.
+    await page.evaluate(() => {
+      const el = [...document.querySelectorAll(".texture-view-controls button")].find(
+        (b) => b.title === "Zoom in",
+      );
+      el?.click();
+      el?.click();
+    });
+    await settle(300);
+    const zoomed = await zoomNow();
+    await page.keyboard.press("Escape");
+    await settle(700);
+    const afterRestore = await zoomNow();
+    check(
+      "but a zoom the user chose survives a resize",
+      afterRestore === zoomed,
+      `${zoomed}% -> ${afterRestore}%`,
+    );
   }
 }
 

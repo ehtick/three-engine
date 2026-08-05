@@ -422,7 +422,6 @@ function TextureWorkspace({ path, onPathChange, onAtlasChange, onSliceIntoSprite
     return value;
   }, []);
 
-
   // --- load --------------------------------------------------------------
   useEffect(() => {
     if (!path) {
@@ -1667,6 +1666,10 @@ function TextureCanvas({
   // exactly the "my texture isn't there" symptom, and it never recovers on its
   // own because the resize observer only ever redrew.
   const fittedRef = useRef(false);
+  // Whether the user has zoomed or panned since the last fit, and the size the
+  // view was last laid out at.
+  const viewTouchedRef = useRef(false);
+  const sizeRef = useRef(null);
 
   const fit = useCallback(() => {
     const wrap = wrapRef.current;
@@ -1681,9 +1684,13 @@ function TextureCanvas({
       y: height / 2 - (doc.height * zoom) / 2,
     };
     fittedRef.current = true;
+    // A fit is the auto view again: a later resize may re-fit freely.
+    viewTouchedRef.current = false;
+    sizeRef.current = { width, height };
     bumpView((v) => v + 1);
     return true;
   }, [doc.width, doc.height]);
+
 
   // A new document is a new framing; anything else keeps the user's view.
   useEffect(() => {
@@ -1943,19 +1950,50 @@ function TextureCanvas({
     return () => cancelAnimationFrame(raf);
   }, [selectionVersion, selectionRef, draw]);
 
+  /**
+   * Keeps the view sensible when the panel changes size.
+   *
+   * Maximizing a panel that is showing the auto-fitted view should re-fit — the
+   * whole point of maximizing is to see more of the image, and being left with
+   * a postage stamp in a huge panel is the complaint this fixes. But a view the
+   * user has zoomed or panned is theirs: re-fitting that would throw away the
+   * detail they navigated to every time the window changed. So the auto view
+   * re-fits, and a touched view is merely kept CENTRED on whatever it was
+   * looking at, instead of drifting toward a corner as the panel grows.
+   */
+  const reflow = useCallback(() => {
+    const wrap = wrapRef.current;
+    if (!wrap) return;
+    const width = wrap.clientWidth;
+    const height = wrap.clientHeight;
+    if (width < 8 || height < 8) return;
+    if (!fittedRef.current || !viewTouchedRef.current) {
+      fit();
+      return;
+    }
+    const previous = sizeRef.current;
+    sizeRef.current = { width, height };
+    if (previous && (previous.width !== width || previous.height !== height)) {
+      const view = viewRef.current;
+      viewRef.current = {
+        zoom: view.zoom,
+        x: view.x + (width - previous.width) / 2,
+        y: view.y + (height - previous.height) / 2,
+      };
+    }
+    draw();
+  }, [fit, draw]);
+
   useEffect(() => {
     const wrap = wrapRef.current;
     if (!wrap || typeof ResizeObserver === "undefined") return;
     // The first real size is the first chance to frame the image. After that a
     // resize is just a repaint — re-fitting would throw away the user's zoom
     // every time the panel is dragged.
-    const observer = new ResizeObserver(() => {
-      if (!fittedRef.current && fit()) return;
-      draw();
-    });
+    const observer = new ResizeObserver(reflow);
     observer.observe(wrap);
     return () => observer.disconnect();
-  }, [draw, fit]);
+  }, [reflow]);
 
   // --- coordinate helpers -------------------------------------------------
   const toDoc = useCallback((event) => {
@@ -2157,6 +2195,7 @@ function TextureCanvas({
           x: gesture.view.x + (event.clientX - gesture.start.x),
           y: gesture.view.y + (event.clientY - gesture.start.y),
         };
+        viewTouchedRef.current = true;
         draw();
         return;
       }
@@ -2387,6 +2426,7 @@ function TextureCanvas({
         x: px - ((px - view.x) / view.zoom) * zoom,
         y: py - ((py - view.y) / view.zoom) * zoom,
       };
+      viewTouchedRef.current = true;
       draw();
     },
     [draw],
@@ -2417,6 +2457,7 @@ function TextureCanvas({
           title="Zoom out"
           onClick={() => {
             viewRef.current.zoom = Math.max(MIN_ZOOM, viewRef.current.zoom / 1.5);
+            viewTouchedRef.current = true;
             draw();
           }}
         >
@@ -2430,6 +2471,7 @@ function TextureCanvas({
           title="Zoom in"
           onClick={() => {
             viewRef.current.zoom = Math.min(MAX_ZOOM, viewRef.current.zoom * 1.5);
+            viewTouchedRef.current = true;
             draw();
           }}
         >
