@@ -2982,9 +2982,17 @@ export function createOccupancyField(bounds, res0, options = {}) {
               shiftRight(metadata, uint(MACRO_CELL_TYPE_SHIFT)),
               uint(MACRO_CELL_TYPE_MASK),
             ).toVar();
-            // STATIC bricks only — DynamicBrick keeps the AABB gap, exactly as
-            // the plane trace keeps occupied-box semantics there.
-            If(cellType.equal(uint(MacroCellType.Brick)), () => {
+            // DynamicBrick cells read the per-chain DYNAMIC record tail, like
+            // the plane trace: an axis-aligned voxel staircase ALWAYS
+            // protrudes above a rotated surface (user-diagnosed), so a mover
+            // face's lifted shadow origins sit inside their own bulged voxel
+            // AABBs — a record-blind oracle read ~0 free space there and the
+            // BURIAL GATE forced one dark blob per staircase tooth (the
+            // teardrop rows on rotating faces, angle-independent, upstream of
+            // the trace's own exclusion). The fitted plane is the unbiased
+            // surface, so measuring against it gives the true clearance.
+            const isStaticBrick = cellType.equal(uint(MacroCellType.Brick)).toVar();
+            If(isStaticBrick.or(cellType.equal(uint(MacroCellType.DynamicBrick))), () => {
               const brickIndex = bits.element(
                 macroBase.add(uint(MACRO_CELL_BRICK_INDEX_WORD)),
               ).toVar();
@@ -2994,8 +3002,10 @@ export function createOccupancyField(bounds, res0, options = {}) {
                 () => {
                   const brickBase = uint(hybridWordOffset + hybridLayout.brickHeaderOffset)
                     .add(brickIndex.mul(uint(BRICK_HEADER_WORDS))).toVar();
-                  const surfOffset = bits.element(
-                    brickBase.add(uint(BRICK_SURFACE_OFFSET_WORD)),
+                  const surfOffset = select(
+                    isStaticBrick,
+                    bits.element(brickBase.add(uint(BRICK_SURFACE_OFFSET_WORD))),
+                    bits.element(brickBase.add(uint(BRICK_DYNAMIC_OFFSET_WORD))),
                   ).toVar();
                   If(surfOffset.notEqual(uint(INVALID_RAY_HIT_INDEX)), () => {
                     const localCell = v.sub(macro.mul(float(BRICK_RESOLUTION)))
@@ -3026,7 +3036,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
                     const rank = countOneBits(bitAnd(occupancyLow, belowLow))
                       .add(countOneBits(bitAnd(occupancyHigh, belowHigh)));
                     const record = surfOffset.add(rank).toVar();
-                    If(record.lessThan(uint(surfaceCapacity)), () => {
+                    If(record.lessThan(uint(totalSurfaceCapacity)), () => {
                       const rBase = uint(surfaceWordOffset)
                         .add(record.mul(uint(SURFACE_RECORD_WORDS))).toVar();
                       const flagsWord = bits.element(rBase.add(uint(3))).toVar();
@@ -3047,6 +3057,119 @@ export function createOccupancyField(bounds, res0, options = {}) {
                           .max(0).mul(minVoxelWorld).toVar();
                         contribution.assign(contribution.max(planeWorld));
                       });
+                      if (complexEnabled) {
+                        // COMPLEX cells (a caster's EDGES — two faces per
+                        // cell) were the oracle's remaining blind spot: no
+                        // simple plane meant the AABB gap again, which buried
+                        // every lifted origin near an edge (the user's "only
+                        // near edge artifacts left"). Sharpen with EXACT
+                        // point-triangle distance over the cell's list —
+                        // cheaper bounds are not enough here: pool triangles
+                        // are UNCLIPPED, so a rotated side-face's AABB can
+                        // contain the origin while its plane passes near the
+                        // edge; only the true distance (closest point is the
+                        // edge itself) reports the full lift clearance.
+                        // Ericson region classification, mirroring
+                        // closestPointOnTriangleCpu branch for branch.
+                        const complexFlag = bitAnd(
+                          shiftRight(flagsWord, uint(COVERAGE_FLAGS_SHIFT)),
+                          uint(SURFACE_FLAG_COMPLEX),
+                        );
+                        If(complexFlag.notEqual(uint(0)), () => {
+                          const range = bits.element(rBase.add(uint(2))).toVar();
+                          const poolOffset = bitAnd(range, uint(COMPLEX_RANGE_OFFSET_MASK)).toVar();
+                          const triCount = bitAnd(
+                            shiftRight(range, uint(COMPLEX_RANGE_COUNT_SHIFT)),
+                            uint(COMPLEX_RANGE_COUNT_MASK),
+                          ).toVar();
+                          const triDist = float(1e9).toVar();
+                          Loop({ start: 0, end: MAX_COMPLEX_TRIANGLES, name: "nfTri" }, ({ nfTri }) => {
+                            If(nfTri.toUint().greaterThanEqual(triCount), () => {
+                              Break();
+                            });
+                            const w = uint(trianglePoolWordOffset).add(
+                              poolOffset.add(nfTri.toUint()).mul(uint(COMPLEX_TRIANGLE_WORDS)),
+                            ).toVar();
+                            const a = vec3(
+                              uintBitsToFloat(bits.element(w)),
+                              uintBitsToFloat(bits.element(w.add(uint(1)))),
+                              uintBitsToFloat(bits.element(w.add(uint(2)))),
+                            ).add(v).toVar();
+                            const b = vec3(
+                              uintBitsToFloat(bits.element(w.add(uint(3)))),
+                              uintBitsToFloat(bits.element(w.add(uint(4)))),
+                              uintBitsToFloat(bits.element(w.add(uint(5)))),
+                            ).add(v).toVar();
+                            const c = vec3(
+                              uintBitsToFloat(bits.element(w.add(uint(6)))),
+                              uintBitsToFloat(bits.element(w.add(uint(7)))),
+                              uintBitsToFloat(bits.element(w.add(uint(8)))),
+                            ).add(v).toVar();
+                            const ab = b.sub(a).toVar();
+                            const ac = c.sub(a).toVar();
+                            const ap = q0.sub(a).toVar();
+                            const d1 = ab.dot(ap).toVar();
+                            const d2 = ac.dot(ap).toVar();
+                            const cq = vec3(a).toVar(); // vertex-A default
+                            const cqDone = float(0).toVar();
+                            If(d1.lessThanEqual(0).and(d2.lessThanEqual(0)), () => {
+                              cqDone.assign(1);
+                            });
+                            const bp = q0.sub(b).toVar();
+                            const d3 = ab.dot(bp).toVar();
+                            const d4 = ac.dot(bp).toVar();
+                            If(cqDone.lessThan(0.5).and(d3.greaterThanEqual(0)).and(d4.lessThanEqual(d3)), () => {
+                              cq.assign(b);
+                              cqDone.assign(1);
+                            });
+                            const vcT = d1.mul(d4).sub(d3.mul(d2)).toVar();
+                            If(cqDone.lessThan(0.5).and(vcT.lessThanEqual(0)).and(d1.greaterThanEqual(0)).and(d3.lessThanEqual(0)), () => {
+                              const t = d1.div(d1.sub(d3).max(1e-20));
+                              cq.assign(a.add(ab.mul(t)));
+                              cqDone.assign(1);
+                            });
+                            const cp = q0.sub(c).toVar();
+                            const d5 = ab.dot(cp).toVar();
+                            const d6 = ac.dot(cp).toVar();
+                            If(cqDone.lessThan(0.5).and(d6.greaterThanEqual(0)).and(d5.lessThanEqual(d6)), () => {
+                              cq.assign(c);
+                              cqDone.assign(1);
+                            });
+                            const vbT = d5.mul(d2).sub(d1.mul(d6)).toVar();
+                            If(cqDone.lessThan(0.5).and(vbT.lessThanEqual(0)).and(d2.greaterThanEqual(0)).and(d6.lessThanEqual(0)), () => {
+                              const t = d2.div(d2.sub(d6).max(1e-20));
+                              cq.assign(a.add(ac.mul(t)));
+                              cqDone.assign(1);
+                            });
+                            const vaT = d3.mul(d6).sub(d5.mul(d4)).toVar();
+                            If(
+                              cqDone.lessThan(0.5).and(vaT.lessThanEqual(0))
+                                .and(d4.sub(d3).greaterThanEqual(0))
+                                .and(d5.sub(d6).greaterThanEqual(0)),
+                              () => {
+                                const t = d4.sub(d3).div(d4.sub(d3).add(d5.sub(d6)).max(1e-20));
+                                cq.assign(b.add(c.sub(b).mul(t)));
+                                cqDone.assign(1);
+                              },
+                            );
+                            If(cqDone.lessThan(0.5), () => {
+                              const sum = vaT.add(vbT).add(vcT).toVar();
+                              // Degenerate (sum <= 0) keeps the vertex-A
+                              // default, matching the CPU helper.
+                              If(sum.greaterThan(0), () => {
+                                const inv = float(1).div(sum);
+                                cq.assign(a.add(ab.mul(vbT.mul(inv))).add(ac.mul(vcT.mul(inv))));
+                              });
+                            });
+                            triDist.assign(triDist.min(q0.sub(cq).length()));
+                          });
+                          If(triCount.greaterThan(uint(0)), () => {
+                            const triWorld = triDist.sub(float(RECORD_PLANE_SLACK))
+                              .max(0).mul(minVoxelWorld).toVar();
+                            contribution.assign(contribution.max(triWorld));
+                          });
+                        });
+                      }
                     });
                   });
                 },

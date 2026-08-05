@@ -18,6 +18,7 @@ import {
   brickHeaderWord,
   macroCellLinearIndex,
   macroCellWord,
+  recordAwareNearFieldCpu,
   traceHybridPlaneCpu,
   triBoxOverlapCpu,
   unpackMacroCellMetadata,
@@ -504,6 +505,83 @@ const rotatedBox = (center, half, ry, rx) => {
   check("membership is exact: an off-plane exclude point excludes nothing",
     notMember.hit === control.hit && Math.abs((notMember.pen ?? 1) - (control.pen ?? 1)) < 1e-6,
     `pen=${notMember.pen?.toFixed(3)} vs control=${control.pen?.toFixed(3)}`);
+}
+
+// ---------------------------------------------------------------------------
+// BURIAL ORACLE ON MOVER FACES — the user-diagnosed class: an axis-aligned
+// voxel staircase ALWAYS protrudes above a rotated surface, so a mover face's
+// lifted shadow origins sit inside their own bulged voxel AABBs. The
+// record-blind oracle read ~0 free space there and the burial gate forced one
+// dark blob per staircase tooth. With DynamicBrick reading the dynamic record
+// tail, the oracle measures to the FITTED PLANE (the unbiased surface) and
+// reports the true lift clearance.
+{
+  const s = Math.SQRT1_2;
+  const tilted = quad(
+    [6, 8 - 1.5 * s, 6], [10, 8 - 1.5 * s, 6],
+    [10, 8 + 1.5 * s, 10], [6, 8 + 1.5 * s, 10],
+  );
+  const slope = (3 * s) / 4;
+  const invLen = 1 / Math.hypot(1, slope);
+  const n = [0, invLen, -slope * invLen];
+  const frame = buildFrame(resolution, floorTris, tilted);
+  const receiver = [8, 8, 8]; // on the tilted plane
+  const lift = 0.6; // inside the staircase's protrusion band
+  const origin = receiver.map((v, i) => v + n[i] * lift);
+
+  // Slack subtraction (0.02) plus the occasional unfitted boundary cell's
+  // conservative AABB floor shave a little off the exact lift — what matters
+  // is the ~lift reading vs the record-blind control's 0.
+  const free = recordAwareNearFieldCpu(origin, resolution, frame.words, frame.layout, frame.records, {});
+  check("oracle on a mover face measures the plane clearance, not the AABB gap",
+    free > lift - 0.15, `free=${free.toFixed(3)} vs lift=${lift}`);
+
+  // Record-blind control (the pre-fix state): strip the dynamic offsets — the
+  // oracle falls back to the voxel AABB gap and reports burial.
+  const stripped = frame.words.slice();
+  for (let macro = 0; macro < frame.layout.macroCellCount; macro++) {
+    stripped[brickHeaderWord(frame.layout, macro, BRICK_DYNAMIC_OFFSET_WORD)] = INVALID_RAY_HIT_INDEX;
+  }
+  const blind = recordAwareNearFieldCpu(origin, resolution, stripped, frame.layout, frame.records, {});
+  check("record-blind control reads buried (the teardrop mechanism)",
+    blind < lift * 0.5, `free=${blind.toFixed(3)}`);
+}
+
+// ---------------------------------------------------------------------------
+// BURIAL ORACLE NEAR EDGES — the residual class after the plane fix ("only
+// near edge artifacts left"): edge cells hold two faces → COMPLEX → no simple
+// plane → the oracle went record-blind again exactly along every edge. With
+// the exact-triangle sharpening it measures the true clearance (the closest
+// point on the side face is the edge itself, a full lift away).
+{
+  const box = rotatedBox([8, 8, 8], 1.5, 0.6, 0.4);
+  const frame = buildFrame(resolution, floorTris, box, { complex: true });
+  const cy = Math.cos(0.6), sy = Math.sin(0.6);
+  const cx = Math.cos(0.4), sx = Math.sin(0.4);
+  const rot = (p) => {
+    let [x, y, z] = p;
+    [x, z] = [x * cy + z * sy, -x * sy + z * cy];
+    [y, z] = [y * cx - z * sx, y * sx + z * cx];
+    return [x, y, z];
+  };
+  const onFace = rot([1.5 - 0.3, 1.5, 0]); // top face, 0.3 from the +x edge
+  const nTop = rot([0, 1, 0]);
+  const receiver = [8 + onFace[0], 8 + onFace[1], 8 + onFace[2]];
+  const lift = 0.8;
+  const origin = receiver.map((v, i) => v + nTop[i] * lift);
+
+  const free = recordAwareNearFieldCpu(
+    origin, resolution, frame.words, frame.layout, frame.records,
+    { trianglePool: frame.trianglePool },
+  );
+  check("oracle near a mover EDGE measures true clearance via exact triangles",
+    free > lift - 0.25, `free=${free.toFixed(3)} vs lift=${lift}`);
+
+  const poolBlind = recordAwareNearFieldCpu(
+    origin, resolution, frame.words, frame.layout, frame.records, {},
+  );
+  check("pool-blind control near the edge reads buried (the residual class)",
+    poolBlind < lift * 0.5, `free=${poolBlind.toFixed(3)}`);
 }
 
 console.log(failed === 0 ? "\nALL PASS" : `\n${failed} FAILED`);

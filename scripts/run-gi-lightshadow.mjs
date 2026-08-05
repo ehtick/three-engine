@@ -309,6 +309,82 @@ if (camPose) {
 }
 await wait(3000);
 
+// FACEKIND=1 — verdict-kind close-up of the RECEIVING faces of a tilted box:
+// the teardrop-row artifact lives on up-facing tilted surfaces, and the class
+// tone (miss=white, plane=0.75, triangle=0.5, box=0.25, clamp=black) is the
+// attribution the shadow render cannot give. Two shots from the SAME pose:
+// the kind map and the normal shadow term.
+if (process.env.FACEKIND) {
+  const spawned = await page.evaluate(async (anchorId) => {
+    const api = globalThis.__editorApi;
+    const eng = api?.entities?.live(anchorId)?.engine;
+    if (!eng?.scene) return { error: "no engine/scene" };
+    const { THREE } = await import("/src/engine/index.js");
+    const mesh = new THREE.Mesh(
+      new THREE.BoxGeometry(1.6, 1.6, 1.6),
+      new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.9 }),
+    );
+    mesh.position.set(-1.5, 2.2, -0.4);
+    mesh.rotation.set(0.5, 0.7, 0.3);
+    mesh.updateMatrixWorld(true);
+    eng.scene.add(mesh);
+    globalThis.__BOXTEST_MESH__ = mesh;
+    return { ok: true };
+  }, sunEntity.id);
+  console.log(`  FACEKIND spawn: ${JSON.stringify(spawned)}`);
+  // The kind map is read at resolve build; the profiling flip is the
+  // structural rebuild that also lets the box enter the GI fingerprint.
+  await page.evaluate(() => { globalThis.__giShadowKindDebug = true; });
+  const originalProfiling = giProps.rayHitProfiling === true;
+  await call("component.setProp", {
+    id: giEntity.id, type: "global-illumination", key: "rayHitProfiling", value: false,
+  });
+  await wait(30000);
+  // Park the camera a few meters UP-SUN of the box and above it, aimed at its
+  // center: the faces in frame are the sun-lit, artifact-bearing ones.
+  const camInfo = await page.evaluate(async ({ sunId }) => {
+    const api = globalThis.__editorApi;
+    const sunObj = api?.entities?.live(sunId)?.object3D;
+    const box = globalThis.__BOXTEST_MESH__;
+    if (!sunObj || !box) return null;
+    const { THREE } = await import("/src/engine/index.js");
+    const q = sunObj.getWorldQuaternion(new THREE.Quaternion());
+    const d = new THREE.Vector3(0, 0, -1).applyQuaternion(q).normalize();
+    return { toSun: [-d.x, -d.y, -d.z], p: [box.position.x, box.position.y, box.position.z] };
+  }, { sunId: sunEntity.id });
+  console.log(`  FACEKIND cam: ${JSON.stringify(camInfo)}`);
+  if (camInfo) {
+    const { toSun, p } = camInfo;
+    await call("viewport.setCamera", {
+      position: [p[0] + toSun[0] * 3.2, p[1] + Math.max(toSun[1] * 3.2, 1.2) + 1.0, p[2] + toSun[2] * 3.2],
+      target: p,
+    });
+    await wait(2500);
+  }
+  await page.screenshot({ path: "scripts/gi-facekind-map.png" });
+  console.log("  FACEKIND kind map -> scripts/gi-facekind-map.png");
+  // Same pose, normal shadow term.
+  await page.evaluate(() => { globalThis.__giShadowKindDebug = false; });
+  await call("component.setProp", {
+    id: giEntity.id, type: "global-illumination", key: "rayHitProfiling", value: true,
+  });
+  await wait(25000);
+  await page.screenshot({ path: "scripts/gi-facekind-shadow.png" });
+  console.log("  FACEKIND shadow -> scripts/gi-facekind-shadow.png");
+  await page.evaluate((anchorId) => {
+    const eng = globalThis.__editorApi?.entities?.live(anchorId)?.engine;
+    const mesh = globalThis.__BOXTEST_MESH__;
+    if (eng?.scene && mesh) eng.scene.remove(mesh);
+  }, sunEntity.id);
+  await call("component.setProp", {
+    id: giEntity.id, type: "global-illumination", key: "rayHitProfiling", value: originalProfiling,
+  });
+  await restore().catch(() => {});
+  console.log("\nGI-LIGHTSHADOW FACEKIND DONE");
+  await browser.close();
+  process.exit(0);
+}
+
 // BOXTEST=1 — THE SILHOUETTE GROUND TRUTH the counters can't give: spawn a
 // tilted box mid-atrium (never moved after spawn → static → records fitted on
 // the next full chain), close-up the floor shadow under the RECORD MARCH,

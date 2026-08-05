@@ -1813,9 +1813,19 @@ function simplePlaneRecordAt(words, layout, records, x, y, z) {
   const metadata = unpackMacroCellMetadata(
     words[macroCellWord(layout, macroIndex, MACRO_CELL_METADATA_WORD)],
   );
-  // STATIC bricks only — the same `useRecords` gate traceHybridPlaneCpu applies.
-  if (metadata.type !== MacroCellType.Brick) return null;
-  const surfaceOffset = words[brickHeaderWord(layout, macroIndex, BRICK_SURFACE_OFFSET_WORD)];
+  // Same `useRecords` gate traceHybridPlaneCpu applies: static bricks read
+  // the static offset, DynamicBrick the per-chain dynamic tail. The oracle
+  // being record-blind on movers is what buried every lifted origin inside
+  // the mover's own protruding voxel staircase (the axis-aligned hull always
+  // pokes above a rotated surface) — one forced-dark blob per tooth.
+  if (metadata.type !== MacroCellType.Brick && metadata.type !== MacroCellType.DynamicBrick) return null;
+  const surfaceOffset = words[brickHeaderWord(
+    layout,
+    macroIndex,
+    metadata.type === MacroCellType.DynamicBrick
+      ? BRICK_DYNAMIC_OFFSET_WORD
+      : BRICK_SURFACE_OFFSET_WORD,
+  )];
   if (surfaceOffset === INVALID_RAY_HIT_INDEX) return null;
   const low = words[brickHeaderWord(layout, macroIndex, BRICK_OCCUPANCY_LOW_WORD)];
   const high = words[brickHeaderWord(layout, macroIndex, BRICK_OCCUPANCY_HIGH_WORD)];
@@ -1824,11 +1834,18 @@ function simplePlaneRecordAt(words, layout, records, x, y, z) {
   // A short/absent pool reads `undefined`, which coerces to 0 — no SIMPLE flag,
   // so an out-of-range record degrades to the box instead of throwing.
   const flagsWord = records[record + SURFACE_FLAGS_WORD] >>> 0;
-  if (((flagsWord >>> COVERAGE_FLAGS_SHIFT) & SURFACE_FLAG_SIMPLE) === 0) return null;
-  return {
-    normal: unpackOctNormal(records[record + SURFACE_PACKED_NORMAL_WORD]),
-    planeOffset: unpackPlaneCoverage(records[record + SURFACE_PACKED_PLANE_COVERAGE_WORD]).planeOffset,
-  };
+  if (((flagsWord >>> COVERAGE_FLAGS_SHIFT) & SURFACE_FLAG_SIMPLE) !== 0) {
+    return {
+      simple: true,
+      normal: unpackOctNormal(records[record + SURFACE_PACKED_NORMAL_WORD]),
+      planeOffset: unpackPlaneCoverage(records[record + SURFACE_PACKED_PLANE_COVERAGE_WORD]).planeOffset,
+    };
+  }
+  if (((flagsWord >>> COVERAGE_FLAGS_SHIFT) & SURFACE_FLAG_COMPLEX) !== 0) {
+    const range = unpackComplexRange(records[record + SURFACE_MATERIAL_ID_WORD]);
+    if (range.count > 0) return { simple: false, ...range };
+  }
+  return null;
 }
 
 /**
@@ -1848,6 +1865,10 @@ export function recordAwareNearFieldCpu(q0, resolution, words, layout, records, 
   slack = RECORD_AWARE_PLANE_SLACK,
   recordAware = true,
   stats = null,
+  // Exact-complex cell sharpening (GPU parity): with the pool available, a
+  // COMPLEX neighbour (a caster's edge cells) contributes per-triangle
+  // max(plane distance, triangle-AABB distance) instead of its voxel AABB gap.
+  trianglePool = null,
 } = {}) {
   const cellX = Math.floor(q0[0]);
   const cellY = Math.floor(q0[1]);
@@ -1881,7 +1902,7 @@ export function recordAwareNearFieldCpu(q0, resolution, words, layout, records, 
 
     if (recordAware) {
       const record = simplePlaneRecordAt(words, layout, records, vx, vy, vz);
-      if (record !== null) {
+      if (record !== null && record.simple) {
         recordNeighbours++;
         // The record's plane is cell-local: dot(n, x - v) = planeOffset.
         const planeVox = Math.abs(
@@ -1893,6 +1914,26 @@ export function recordAwareNearFieldCpu(q0, resolution, words, layout, records, 
         const planeWorld = Math.max(planeVox - slack, 0) * minVoxelWorld;
         if (planeWorld > contribution) {
           contribution = planeWorld;
+          sharpenedNeighbours++;
+        }
+      } else if (record !== null && !record.simple && trianglePool) {
+        recordNeighbours++;
+        // EXACT point-triangle distance — bounds are not enough here: pool
+        // triangles are UNCLIPPED, so a rotated face's AABB can contain the
+        // query while its plane passes near the edge; the true closest point
+        // (the edge itself) is what reports the full clearance.
+        let triDist = Infinity;
+        for (let index = 0; index < record.count; index++) {
+          const word = (record.offset + index) * COMPLEX_TRIANGLE_WORDS;
+          const a = [trianglePool[word] + vx, trianglePool[word + 1] + vy, trianglePool[word + 2] + vz];
+          const b = [trianglePool[word + 3] + vx, trianglePool[word + 4] + vy, trianglePool[word + 5] + vz];
+          const c = [trianglePool[word + 6] + vx, trianglePool[word + 7] + vy, trianglePool[word + 8] + vz];
+          const q = closestPointOnTriangleCpu(q0, a, b, c);
+          triDist = Math.min(triDist, Math.hypot(q0[0] - q[0], q0[1] - q[1], q0[2] - q[2]));
+        }
+        const triWorld = Math.max(triDist - slack, 0) * minVoxelWorld;
+        if (triWorld > contribution) {
+          contribution = triWorld;
           sharpenedNeighbours++;
         }
       }
