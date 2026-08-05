@@ -68,7 +68,7 @@ import * as THREE from "three/webgpu";
 import {
   Break, Fn, If, Loop, Return, atomicAdd, atomicLoad, atomicMax, atomicOr, atomicStore, bitAnd, bitOr,
   countOneBits, exp2, float, floatBitsToUint, floor, instanceIndex, instancedArray, int, log2, mix, mod,
-  packSnorm2x16, select, shiftLeft, shiftRight, uint, uintBitsToFloat, uniform, uniformArray,
+  packSnorm2x16, select, shiftLeft, shiftRight, smoothstep, uint, uintBitsToFloat, uniform, uniformArray,
   unpackSnorm2x16, vec2, vec3, vec4,
 } from "three/tsl";
 import { sharedFn } from "./giFn.js";
@@ -2064,21 +2064,33 @@ export function createOccupancyField(bounds, res0, options = {}) {
                 // (the user's blotchy-floor screenshot).
                 const boostEff = mix(float(1), boost, lvl.toFloat().div(OCC_LEVELS - 1)).toVar();
                 // RECEIVER-PLANE EXCLUSION, the cone form of the exact arm's
-                // origin-plane exclusion — and the fix for the self-shadowing
-                // that read as "quite bad most of the time": under a grazing
-                // sun the cone footprint overlaps the receiver's OWN surface
-                // voxels for meters, so floors blotched and shadow-side walls
-                // went pitch black from shadowing themselves. A plane cannot
-                // shadow itself: scale each sample by the fraction of its
-                // footprint that lies ABOVE the receiver's plane (≈ linear in
-                // signed distance / footprint radius). Real occluders stand
-                // off the plane and pass untouched.
-                // The denominator is the SAMPLED CELL's width — that is the
-                // trilinear support that actually reaches down into the
-                // receiver's surface row — not the cone radius.
+                // origin-plane exclusion — the fix for cone self-shadowing
+                // ("quite bad most of the time": blotchy floors, shadow-side
+                // walls gone black). A plane cannot shadow itself, and under
+                // a grazing sun the ray runs just above the receiver's OWN
+                // surface slab for meters.
+                //
+                // HARD exclusion inside ~one sampled cell of the plane, not
+                // the half-space-fraction soft factor tried first: the honest
+                // "half the footprint is above the plane" still counted the
+                // plane's own slab at half weight, and over a long grazing
+                // run that residue compounded — modulated by the cell
+                // lattice, projected along the sun azimuth — into long
+                // light-aligned streak shadows that rotated with the light
+                // (the user's second screenshot). A sample whose center sits
+                // within a cell of the plane is plane-dominated by
+                // construction (the plane's slab is the only geometry that
+                // close); a real wall still blocks through its HIGHER cells,
+                // whose distance to the plane is many cell widths. Cost of
+                // the trade: sub-cell-tall clutter loses its long grazing
+                // shadow at range, where it is penumbra-blurred anyway.
+                // The denominator is the SAMPLED CELL's width — the trilinear
+                // support that actually reaches down into the surface row —
+                // not the cone radius.
                 const pw = qm.mul(vec3(voxel)).add(vec3(gridOrigin)).toVar();
                 const cellW = voxMinW.mul(exp2(lvl.toFloat())).toVar();
-                const above = recvN.dot(pw.sub(recvP)).div(cellW).mul(0.5).add(0.5).clamp(0, 1).toVar();
+                const planeD = recvN.dot(pw.sub(recvP)).toVar();
+                const above = smoothstep(cellW.mul(0.25), cellW, planeD).toVar();
                 const op = dens.mul(boostEff).mul(above).mul(tNext.div(cellW).clamp(0, 1)).clamp(0, 1);
                 alpha.assign(alpha.add(alpha.oneMinus().mul(op)));
               });
