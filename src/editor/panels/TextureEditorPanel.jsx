@@ -110,7 +110,13 @@ import {
 } from "../texture/layers.js";
 import { adjustmentById, defaultParams, luminance } from "../texture/adjust.js";
 import { transformBuffer, transformClips } from "../texture/transform.js";
-import { LAYER_EFFECTS, defaultEffect, hasEffects, renderLayerEffects } from "../texture/layerFx.js";
+import {
+  LAYER_EFFECTS,
+  defaultEffect,
+  hasEffects,
+  isFullyOpaque,
+  renderLayerEffects,
+} from "../texture/layerFx.js";
 import { filterById } from "../texture/filters.js";
 import {
   alphaFromLuminance,
@@ -2723,6 +2729,12 @@ function LayerColumn({
             </button>
           </div>
           {!layer.effects?.length && <p className="tx-hint">Outline, shadow and glow follow the layer&apos;s shape.</p>}
+          {!!layer.effects?.length && isFullyOpaque(layer.buffer) && (
+            <p className="tx-hint warn">
+              This layer is opaque edge to edge, so an outline, shadow or glow has nowhere to show.
+              Erase part of it, add a mask, or put it above another layer.
+            </p>
+          )}
           {(layer.effects ?? []).map((effect) => (
             <LayerEffectRow
               key={effect.id}
@@ -2807,21 +2819,63 @@ function LayerEffectRow({ effect, onChange, onRemove }) {
               />
             </label>
           ) : (
-            <label key={param.key} className="tx-field">
-              <span>{param.label}</span>
-              <Slider
-                Icon={Blend}
-                title={param.label}
-                value={effect[param.key] ?? param.default}
-                min={param.min}
-                max={param.max}
-                step={param.step}
-                onChange={(v) => onChange({ [param.key]: v })}
-              />
-            </label>
+            <EffectSlider
+              key={param.key}
+              param={param}
+              value={effect[param.key] ?? param.default}
+              onChange={(v) => onChange({ [param.key]: v })}
+            />
           ),
         )}
     </div>
+  );
+}
+
+/**
+ * An effect parameter, echoed instantly and committed on a delay.
+ *
+ * An effect re-renders the whole layer — a dilate and a blur — and a raw
+ * `onChange` runs that on every tick of a drag, which is what made the shadow
+ * sliders feel stuck. The knob follows the pointer from local state, so the UI
+ * never lags; the document is written once the value settles, which is also
+ * what keeps the undo history to one entry per gesture rather than forty.
+ */
+function EffectSlider({ param, value, onChange }) {
+  const [local, setLocal] = useState(value);
+  const committed = useRef(value);
+  const commitRef = useRef(onChange);
+  commitRef.current = onChange;
+
+  // Follow the document when it changes underneath (undo, a preset).
+  useEffect(() => {
+    if (value !== committed.current) {
+      committed.current = value;
+      setLocal(value);
+    }
+  }, [value]);
+
+  useEffect(() => {
+    if (local === committed.current) return undefined;
+    const timer = setTimeout(() => {
+      committed.current = local;
+      commitRef.current(local);
+    }, 90);
+    return () => clearTimeout(timer);
+  }, [local]);
+
+  return (
+    <label className="tx-field">
+      <span>{param.label}</span>
+      <Slider
+        Icon={Blend}
+        title={param.label}
+        value={local}
+        min={param.min}
+        max={param.max}
+        step={param.step}
+        onChange={setLocal}
+      />
+    </label>
   );
 }
 

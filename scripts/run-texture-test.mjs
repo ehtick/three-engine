@@ -7,6 +7,7 @@
  * the undo stack. What is left for a live check is only the panel's wiring.
  */
 import assert from "node:assert/strict";
+import { editorFrameRateFor } from "../src/editor/framePolicy.js";
 
 import {
   createBuffer,
@@ -742,13 +743,51 @@ check("a brush dab's undo cost is proportional to the dab, not the canvas", () =
 
 console.log("\nadjustments");
 
-check("every registered adjustment runs from its own defaults", () => {
+check("every adjustment survives its OWN registry defaults", () => {
+  // The test this replaces asserted "no NaN" and was worthless: a
+  // Uint8ClampedArray stores NaN as 0, so a parameter mismatch that produced
+  // NaN passed it while turning the layer black. `colorize` shipped broken
+  // behind exactly that assertion — its colour arrives from the registry as a
+  // HEX STRING, and it was destructuring it as an array.
+  //
+  // So: run each one on a mid-grey with the parameters the DIALOG would send,
+  // and assert the result is a colour rather than a hole.
   for (const spec of ADJUSTMENTS) {
-    const b = createBuffer(4, 4, [90, 140, 200, 180]);
+    const b = createBuffer(2, 2, [128, 128, 128, 255]);
     spec.apply(b, defaultParams(spec));
-    for (let i = 0; i < b.data.length; i++) assert.ok(Number.isFinite(b.data[i]), `${spec.id} produced NaN`);
+    const p = px(b, 0, 0);
+    assert.equal(p[3], 255, `${spec.id} touched alpha`);
+    const collapsed = p[0] === 0 && p[1] === 0 && p[2] === 0;
+    assert.ok(!collapsed, `${spec.id} turned mid-grey into black — a parameter it cannot read`);
   }
   assert.equal(adjustmentById("levels")?.label, "Levels");
+});
+
+check("every filter survives its OWN registry defaults", () => {
+  for (const spec of FILTERS) {
+    const b = createBuffer(6, 6, [160, 160, 160, 255]);
+    spec.apply(b, defaultParams(spec));
+    const p = px(b, 3, 3);
+    for (const v of p) assert.ok(Number.isFinite(v), `${spec.id} produced ${v}`);
+    // Edge detect on a flat field really is black — there are no edges. Every
+    // other filter has to leave something behind.
+    if (spec.id !== "edgeDetect") {
+      assert.ok(p[0] > 0 || p[1] > 0 || p[2] > 0, `${spec.id} turned a flat grey into black`);
+    }
+  }
+});
+
+check("a colour parameter works as a hex string AND as an array", () => {
+  // Both callers exist: the dialog sends "#rrggbb", code sends [r,g,b,a]. A
+  // function that only reads one of them fails silently in the other case.
+  const fromHex = createBuffer(1, 1, [128, 128, 128, 255]);
+  const fromArray = createBuffer(1, 1, [128, 128, 128, 255]);
+  colorize(fromHex, { color: "#ff8040", strength: 1 });
+  colorize(fromArray, { color: [255, 128, 64, 255], strength: 1 });
+  assert.deepEqual(px(fromHex, 0, 0), px(fromArray, 0, 0));
+  const p = px(fromHex, 0, 0);
+  assert.ok(p[0] > p[1] && p[1] > p[2], `tinted toward orange, got ${p.join()}`);
+  assert.ok(p[0] > 60, "and not black");
 });
 
 check("adjustments never touch alpha (brightening must not thicken an edge)", () => {
@@ -863,14 +902,6 @@ check("a selection blends an adjustment rather than clipping it", () => {
 });
 
 console.log("\nfilters");
-
-check("every registered filter runs from its own defaults", () => {
-  for (const spec of FILTERS) {
-    const b = createBuffer(8, 8, [90, 140, 200, 255]);
-    spec.apply(b, defaultParams(spec));
-    for (let i = 0; i < b.data.length; i++) assert.ok(Number.isFinite(b.data[i]), `${spec.id} produced NaN`);
-  }
-});
 
 check("blur spreads a dot and conserves roughly its energy", () => {
   const b = createBuffer(17, 17);
@@ -1585,15 +1616,36 @@ check("painting a mask writes coverage, and the brush colour is the value", () =
   assert.ok(mask[2 * 8 + 2] > 100 && mask[2 * 8 + 2] < 160, `half revealed (${mask[2 * 8 + 2]})`);
 });
 
-check("every effect renders from its own defaults without producing NaN", () => {
+check("every effect renders its OWN colour from its registry defaults", () => {
+  // Same class of bug as `colorize`: the colour arrives as a hex string, and an
+  // effect that cannot read it renders black instead of announcing anything.
   for (const spec of LAYER_EFFECTS) {
-    const result = spec.apply(squareLayer(), defaultEffect(spec.id));
+    const params = defaultEffect(spec.id);
+    const result = spec.apply(squareLayer(), params);
     const buffers = [...(result.under ? [result.under] : []), ...(result.over ? [result.over] : [])];
     assert.ok(buffers.length, `${spec.id} produced nothing`);
+    const expected = parseColor(params.color, 255);
+    // The MOST opaque texel, not a fully opaque one: a 60%-opacity blurred
+    // shadow never reaches 255 anywhere, and demanding that it does tests the
+    // defaults rather than the code.
+    let best = -1;
+    let bestAt = -1;
+    let bestBuffer = null;
     for (const buffer of buffers) {
-      for (let i = 0; i < buffer.data.length; i++) {
-        assert.ok(Number.isFinite(buffer.data[i]), `${spec.id} produced ${buffer.data[i]}`);
+      for (let i = 0; i < buffer.data.length; i += 4) {
+        if (buffer.data[i + 3] > best) {
+          best = buffer.data[i + 3];
+          bestAt = i;
+          bestBuffer = buffer;
+        }
       }
+    }
+    assert.ok(best > 20, `${spec.id} rendered nothing visible (peak alpha ${best})`);
+    for (let c = 0; c < 3; c++) {
+      assert.ok(
+        Math.abs(bestBuffer.data[bestAt + c] - expected[c]) <= 6,
+        `${spec.id} drew ${bestBuffer.data[bestAt]},${bestBuffer.data[bestAt + 1]},${bestBuffer.data[bestAt + 2]} instead of its colour`,
+      );
     }
   }
 });
@@ -1778,6 +1830,29 @@ check("transformedBounds reports what a rotation actually needs", () => {
   assert.ok(turned.width >= 14 && turned.width <= 15, `10x10 at 45 deg needs ~14.1 (${turned.width})`);
   assert.equal(transformClips(10, 10, { angle: 45 }), true, "so a 45 degree turn is reported as clipping");
   assert.equal(transformClips(10, 10, { scaleX: 0.5, scaleY: 0.5 }), false);
+});
+
+console.log("\neditor frame pacing");
+
+check("an unfocused viewport is throttled hard, whatever it is rendering", () => {
+  // The complaint this exists for: a heavy scene rendering at full rate behind
+  // a paint canvas makes the WHOLE editor lag, and it is buying nothing.
+  assert.equal(editorFrameRateFor(0, { focused: false }), 8, "even an idle one");
+  assert.equal(editorFrameRateFor(80, { focused: false }), 8);
+  assert.equal(editorFrameRateFor(80, { focused: false, interacting: true }), 8);
+});
+
+check("Play is never throttled, focused or not", () => {
+  assert.equal(editorFrameRateFor(80, { playing: true, focused: false }), 0);
+  assert.equal(editorFrameRateFor(80, { playing: true }), 0);
+});
+
+check("a focused viewport keeps the work-based policy", () => {
+  assert.equal(editorFrameRateFor(0), 0, "an idle scene runs uncapped");
+  assert.equal(editorFrameRateFor(10), 0);
+  assert.equal(editorFrameRateFor(30), 30);
+  assert.equal(editorFrameRateFor(50), 20);
+  assert.equal(editorFrameRateFor(20, { interacting: true }), 15);
 });
 
 console.log(`\n${passes} passed, ${failures} failed\n`);

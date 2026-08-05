@@ -386,7 +386,12 @@ export class SpriteComponent extends Component {
     if (name !== this.props.animation) this.setProp?.("animation", name);
     this.time = 0;
     this.playing = true;
-    this.currentFrame = null;
+    // Land on frame 0 NOW rather than at the next tick. A script that calls
+    // play() and reads `frame` in the same breath — or a single-frame state
+    // change followed immediately by a pause — would otherwise see the
+    // animation's first frame only after the renderer got round to it.
+    const animation = this.atlasDef && name ? findAnimation(this.atlasDef, name) : null;
+    this.currentFrame = animation ? frameAt(animation, 0) : null;
     this.#refresh();
     return this;
   }

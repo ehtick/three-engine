@@ -39,8 +39,124 @@ function blendSelection(target, original, selection) {
 }
 
 /**
+ * One box pass along one axis, with a RUNNING SUM.
+ *
+ * The obvious version re-adds every tap for every texel, which is O(radius) per
+ * pixel: a 1024² layer at radius 4 took 460ms, and a drop shadow re-runs this
+ * six times on every slider tick. Sliding the window — one add and one subtract
+ * per step — makes it O(1) per pixel, so the cost stops depending on the radius
+ * at all. The window is clipped at the edges and normalised by how many taps
+ * are actually inside, which is what keeps a blur from darkening the border.
+ */
+function boxPass(src, dst, width, height, r, horizontal) {
+  const outer = horizontal ? height : width;
+  const inner = horizontal ? width : height;
+  const step = horizontal ? 4 : width * 4;
+  for (let o = 0; o < outer; o++) {
+    const base = (horizontal ? o * width : o) * 4;
+    let r0 = 0;
+    let g0 = 0;
+    let b0 = 0;
+    let a0 = 0;
+    let n = 0;
+    for (let i = 0; i <= Math.min(inner - 1, r); i++) {
+      const s = base + i * step;
+      r0 += src[s];
+      g0 += src[s + 1];
+      b0 += src[s + 2];
+      a0 += src[s + 3];
+      n++;
+    }
+    for (let i = 0; i < inner; i++) {
+      const d = base + i * step;
+      dst[d] = r0 / n;
+      dst[d + 1] = g0 / n;
+      dst[d + 2] = b0 / n;
+      dst[d + 3] = a0 / n;
+      const drop = i - r;
+      if (drop >= 0) {
+        const s = base + drop * step;
+        r0 -= src[s];
+        g0 -= src[s + 1];
+        b0 -= src[s + 2];
+        a0 -= src[s + 3];
+        n--;
+      }
+      const add = i + r + 1;
+      if (add < inner) {
+        const s = base + add * step;
+        r0 += src[s];
+        g0 += src[s + 1];
+        b0 += src[s + 2];
+        a0 += src[s + 3];
+        n++;
+      }
+    }
+  }
+}
+
+/**
+ * Blurs ONLY the alpha channel, in place.
+ *
+ * For anything built by `layerFx.silhouette` the colour is already uniform, so
+ * blurring RGB reproduces what is there at four times the cost. Shadows and
+ * glows are the most frequently recomputed thing in the editor — they re-run
+ * on every parameter change — which makes this worth having as its own path.
+ */
+export function blurAlpha(buffer, radius) {
+  const r = Math.max(0, Math.round(radius));
+  if (!r) return buffer;
+  const { width, height, data } = buffer;
+  let src = new Float32Array(width * height);
+  for (let i = 0; i < src.length; i++) src[i] = data[i * 4 + 3];
+  let dst = new Float32Array(src.length);
+
+  const pass = (from, to, horizontal) => {
+    const outer = horizontal ? height : width;
+    const inner = horizontal ? width : height;
+    const step = horizontal ? 1 : width;
+    for (let o = 0; o < outer; o++) {
+      const base = horizontal ? o * width : o;
+      let sum = 0;
+      let n = 0;
+      for (let i = 0; i <= Math.min(inner - 1, r); i++) {
+        sum += from[base + i * step];
+        n++;
+      }
+      for (let i = 0; i < inner; i++) {
+        to[base + i * step] = sum / n;
+        const drop = i - r;
+        if (drop >= 0) {
+          sum -= from[base + drop * step];
+          n--;
+        }
+        const add = i + r + 1;
+        if (add < inner) {
+          sum += from[base + add * step];
+          n++;
+        }
+      }
+    }
+  };
+
+  for (let i = 0; i < 3; i++) {
+    pass(src, dst, true);
+    let swap = src;
+    src = dst;
+    dst = swap;
+    pass(src, dst, false);
+    swap = src;
+    src = dst;
+    dst = swap;
+  }
+  for (let i = 0; i < src.length; i++) data[i * 4 + 3] = src[i];
+  return buffer;
+}
+
+/**
  * Three box passes ≈ a gaussian, at a fraction of the cost and with no kernel
- * to size. Separable, so the work is O(radius) per axis rather than O(radius²).
+ * to size. Separable and running-sum, so the work is O(1) per texel per pass —
+ * independent of the radius.
  */
 export function gaussianBlur(buffer, { radius = 4 } = {}, selection = null) {
   const r = Math.max(0, Math.round(radius));
@@ -61,36 +177,14 @@ export function gaussianBlur(buffer, { radius = 4 } = {}, selection = null) {
   let src = premul;
   let dst = new Float32Array(premul.length);
   for (let pass = 0; pass < 3; pass++) {
-    for (const horizontal of [true, false]) {
-      for (let y = 0; y < height; y++) {
-        for (let x = 0; x < width; x++) {
-          let r0 = 0;
-          let g0 = 0;
-          let b0 = 0;
-          let a0 = 0;
-          let n = 0;
-          for (let k = -r; k <= r; k++) {
-            const sx = horizontal ? x + k : x;
-            const sy = horizontal ? y : y + k;
-            if (sx < 0 || sy < 0 || sx >= width || sy >= height) continue;
-            const s = (sy * width + sx) * 4;
-            r0 += src[s];
-            g0 += src[s + 1];
-            b0 += src[s + 2];
-            a0 += src[s + 3];
-            n++;
-          }
-          const d = (y * width + x) * 4;
-          dst[d] = r0 / n;
-          dst[d + 1] = g0 / n;
-          dst[d + 2] = b0 / n;
-          dst[d + 3] = a0 / n;
-        }
-      }
-      const swap = src === premul ? new Float32Array(premul.length) : src;
-      src = dst;
-      dst = swap;
-    }
+    boxPass(src, dst, width, height, r, true);
+    let swap = src === premul ? new Float32Array(premul.length) : src;
+    src = dst;
+    dst = swap;
+    boxPass(src, dst, width, height, r, false);
+    swap = src === premul ? new Float32Array(premul.length) : src;
+    src = dst;
+    dst = swap;
   }
 
   for (let i = 0; i < width * height; i++) {

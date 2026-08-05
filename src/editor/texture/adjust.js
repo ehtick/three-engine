@@ -19,6 +19,8 @@
 
 /** @typedef {import("./pixels.js").PixelBuffer} PixelBuffer */
 
+import { parseColor } from "./pixels.js";
+
 const clamp255 = (v) => (v < 0 ? 0 : v > 255 ? 255 : v);
 
 /**
@@ -227,10 +229,20 @@ export function posterize(buffer, { steps = 4 } = {}, selection = null) {
   return applyLut(buffer, buildLut((v) => Math.round((Math.round((v / 255) * (n - 1)) / (n - 1)) * 255)), selection);
 }
 
+/**
+ * A colour parameter arrives as a hex STRING from the registry (that is what
+ * the dialog's colour input produces) and as an array from code. Accepting
+ * only one of the two is how `colorize` came to multiply `"#"` by a number,
+ * produce NaN, and land as 0 in a `Uint8ClampedArray` — a silent black result
+ * with nothing in the console. Any colour parameter added here must go through
+ * this.
+ */
+const toRgb = (color) => (Array.isArray(color) ? color : parseColor(color, 255));
+
 /** Tints while keeping the image's own luminance — the way to turn one
  *  authored texture into a set of team-coloured variants. */
 export function colorize(buffer, { color = [255, 0, 0, 255], strength = 1 } = {}, selection = null) {
-  const [tr, tg, tb] = color;
+  const [tr, tg, tb] = toRgb(color);
   return applyPixel(
     buffer,
     (r, g, b, out) => {

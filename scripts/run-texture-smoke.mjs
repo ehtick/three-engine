@@ -840,8 +840,11 @@ console.log("\nsprite runtime");
 
     const mesh = entity.object3D.children.find((c) => c.isMesh);
     const positions = mesh?.geometry.getAttribute("position");
-    // Tick the component directly at a known dt rather than waiting on frames:
-    // this is about the animation's arithmetic, not the render loop's timing.
+    // Restart from zero and step synchronously. Everything from here to the
+    // return runs in one task, so the engine's own update loop cannot interleave
+    // — which it otherwise does, at whatever rate the frame pacing has settled
+    // on, making the sequence depend on how long the load happened to take.
+    sprite.play();
     // 10 fps, so one frame per 0.1s — four steps must wrap back to the first.
     const walked = [sprite.frame];
     for (let i = 0; i < 4; i++) {

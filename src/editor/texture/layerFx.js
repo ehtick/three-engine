@@ -16,7 +16,7 @@
  * Pure: no DOM, no three.js. Same alpha rules as everything else here.
  */
 
-import { gaussianBlur } from "./filters.js";
+import { blurAlpha } from "./filters.js";
 import { createBuffer, parseColor } from "./pixels.js";
 
 /** @typedef {import("./pixels.js").PixelBuffer} PixelBuffer */
@@ -129,14 +129,17 @@ function dropShadow(buffer, {
     offsetY: Math.sin(radians) * distance,
   });
   if (spread > 0) dilateAlpha(shadow, spread);
-  if (blur > 0) gaussianBlur(shadow, { radius: blur });
+  // Only the ALPHA needs blurring: `silhouette` gives every texel the same RGB,
+  // so blurring colour would compute four channels to reproduce three of them.
+  // A quarter of the work for an identical result.
+  if (blur > 0) blurAlpha(shadow, blur);
   return { under: shadow };
 }
 
 function outerGlow(buffer, { size = 6, color = "#ffd60a", opacity = 0.8 } = {}) {
   const glow = silhouette(buffer, parseColor(color, Math.round(opacity * 255)));
   dilateAlpha(glow, Math.max(1, Math.round(size / 2)));
-  gaussianBlur(glow, { radius: Math.max(1, Math.round(size / 2)) });
+  blurAlpha(glow, Math.max(1, Math.round(size / 2)));
   knockOut(glow, buffer);
   return { under: glow };
 }
@@ -167,8 +170,11 @@ export const LAYER_EFFECTS = [
     label: "Drop Shadow",
     apply: dropShadow,
     params: [
-      { key: "distance", label: "Distance", min: 0, max: 64, step: 1, default: 4 },
-      { key: "angle", label: "Angle", min: 0, max: 360, step: 1, default: 135 },
+      { key: "distance", label: "Distance", min: 0, max: 64, step: 1, default: 6 },
+      // Degrees clockwise from screen-right: the direction the shadow is CAST,
+      // not where the light is. 45 puts it down and to the right, which is what
+      // a shadow looks like to everyone who has not read a lighting menu.
+      { key: "angle", label: "Angle", min: 0, max: 360, step: 1, default: 45 },
       { key: "blur", label: "Blur", min: 0, max: 40, step: 1, default: 4 },
       { key: "spread", label: "Spread", min: 0, max: 20, step: 1, default: 0 },
       { key: "color", label: "Color", color: true, default: "#000000" },
@@ -204,6 +210,21 @@ export function defaultEffect(id) {
   const params = {};
   for (const param of spec.params) params[param.key] = param.default;
   return { id, enabled: true, ...params };
+}
+
+/**
+ * True when a layer is opaque across the whole canvas.
+ *
+ * Worth knowing because a shape-derived effect then has nowhere to appear: an
+ * outline, a shadow and a glow all live OUTSIDE the alpha, and a layer with no
+ * outside produces a perfectly correct effect that is invisible in every texel.
+ * That silence is the single most confusing thing about layer effects, so the
+ * panel says it out loud instead.
+ */
+export function isFullyOpaque(buffer) {
+  const { data } = buffer;
+  for (let i = 3; i < data.length; i += 4) if (data[i] < 255) return false;
+  return true;
 }
 
 /**
