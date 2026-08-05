@@ -2284,6 +2284,27 @@ export class GISystem {
         console.log(`[gi] composited field: occ ${stats.occupiedCells}, emissive ${stats.emissiveCells}`);
       }
     });
+    // SURFACE-RECORD POOL AUDIT — starvation here is otherwise invisible: the
+    // boot log says `marcher records` while a contiguous macro-order slab of
+    // the scene silently degrades to occupied-box hits and full-voxel square
+    // silhouettes (the Sponza-ultra bug: demand 1.24M vs the old 1M cap).
+    const occField = state.volume.occupancyField;
+    if (occField?.hasSurfaceRecords && occField.readbackSurfaceAlloc) {
+      occField.readbackSurfaceAlloc(renderer).then((alloc) => {
+        if (this.state !== state || !alloc) return;
+        const line = `[gi] surface records: ${alloc.allocated}/${alloc.capacity} claimed` +
+          `, triangles ${alloc.triangles}/${alloc.triangleCapacity}`;
+        if (alloc.overflowBricks > 0 || alloc.complexOverflowCells > 0) {
+          console.warn(
+            `${line} — POOL STARVED: ${alloc.overflowBricks} bricks + ` +
+              `${alloc.complexOverflowCells} complex cells degraded to voxel-box hits ` +
+              `(square silhouettes there). Raise the record pool or lower quality.`,
+          );
+        } else {
+          console.log(line);
+        }
+      });
+    }
   }
 
   #rebuild() {

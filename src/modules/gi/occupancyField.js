@@ -206,12 +206,18 @@ export function createOccupancyField(bounds, res0, options = {}) {
   const hybridEnabled = options.enableHybridBrick === true || options.enableSurfaceRecords === true;
   const surfaceEnabled = hybridEnabled && options.enableSurfaceRecords === true;
   // Compact CAPPED pool (never dense): surfaces are ~2D, so occupied level-0
-  // voxels are a few percent of the grid. /16 covers the measured Sponza-class
-  // ratio with headroom; overflow degrades those bricks to occupied-box
-  // fallback and increments a diagnostic — it can never become a miss.
+  // voxels are a few percent of the grid. /12 with a 1<<21 cap: MEASURED on
+  // Sponza-ultra (432×192×272) the true demand is 1.24M records, so the old
+  // /16 ask (1.41M) was right but its 1<<20 cap silently denied ~190k records
+  // across 10,117 bricks — a CONTIGUOUS macro-order slab of the scene whose
+  // every shadow and gather hit degraded to occupied-box (full-voxel square
+  // silhouettes with `marcher records` truthfully in the boot log). /12 gives
+  // ×1.5 headroom at ultra and ×1.36 at high. Overflow still degrades bricks
+  // to box fallback and increments the diagnostic — it can never become a
+  // miss — and GISystem now logs the pool state after the first full chain.
   const level0VoxelCount = res0.x * res0.y * res0.z;
   const surfaceCapacity = surfaceEnabled
-    ? Math.min(1 << 20, Math.max(1 << 14, options.surfaceRecordCapacity ?? Math.ceil(level0VoxelCount / 16)))
+    ? Math.min(1 << 21, Math.max(1 << 14, options.surfaceRecordCapacity ?? Math.ceil(level0VoxelCount / 12)))
     : 0;
   // Phase 4: complex cells keep their SHORT exact triangle list instead of
   // degrading to an occupied box. The pool is capped for the same reason the

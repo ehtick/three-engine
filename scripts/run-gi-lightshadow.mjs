@@ -208,6 +208,22 @@ if (process.env.EMISSIVE_OFF) {
 // list on its fingerprint cadence. Give both room, plus a compile wave.
 await wait(15000);
 
+// SURFACE-RECORD POOL AUDIT — the record march is only as real as its pool:
+// a brick that fails its claim silently keeps occupied-box semantics, and at
+// scene scale a capped pool degrades MOST cells that way (full-voxel square
+// silhouettes with `marcher records` proudly in the log).
+const alloc = await page.evaluate(async (anchorId) => {
+  const engine = globalThis.__editorApi?.entities?.live(anchorId)?.engine;
+  const occ = engine?.modules?.get?.("gi")?.system?.state?.volume?.occupancyField;
+  if (!occ?.readbackSurfaceAlloc) return { error: "no occupancy field / readback" };
+  try {
+    return await occ.readbackSurfaceAlloc(engine.renderer);
+  } catch (e) {
+    return { error: e?.stack ?? String(e) };
+  }
+}, sunEntity.id);
+console.log(`  surface records: ${JSON.stringify(alloc)}`);
+
 // A KNOWN sun, not the saved one: the scene ships with the sun aimed so the
 // whole interior is legitimately blocked (measured: dark 98%, GI control
 // near-black), which collapses the mean check into "is the leak rate under
