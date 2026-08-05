@@ -1801,7 +1801,7 @@ export class GISystem {
       traceDda:
         globalThis.__giLightShadowSphere === true
           ? null
-          : (origin, dir, maxT, k, receiverP = null, tanHalf = null) => {
+          : (origin, dir, maxT, k, receiverP = null, tanHalf = null, jitter = null) => {
               // tMin one voxel: the lifted origin can still clip its own
               // surface's SAT-bulged voxel on curved geometry, and a DDA
               // first-voxel hit is a hard black dot. One voxel along the ray
@@ -1842,6 +1842,7 @@ export class GISystem {
                     // origin — origin = P + n·lift by construction.
                     receiverP,
                     receiverN: receiverP ? vec3(origin).sub(receiverP).normalize() : null,
+                    jitter,
                   })
                 : null;
               // THE RECORD MARCH — the non-voxel shadow arm. When the active

@@ -1990,8 +1990,9 @@ export function createOccupancyField(bounds, res0, options = {}) {
           { name: "boost", type: "float" },
           { name: "recvP", type: "vec3" },
           { name: "recvN", type: "vec3" },
+          { name: "jitter", type: "float" },
         ],
-        body: (o, d, t0, t1, tanH, boost, recvP, recvN) => {
+        body: (o, d, t0, t1, tanH, boost, recvP, recvN, jitter) => {
           const inv = vec3(voxelInv).toVar();
           const q0 = vec3(o).sub(vec3(gridOrigin)).mul(inv).toVar();
           const dq = vec3(d).mul(inv).toVar();
@@ -2003,12 +2004,28 @@ export function createOccupancyField(bounds, res0, options = {}) {
             select(dq.z.greaterThanEqual(0), float(1), float(0)),
           ).toVar();
           const voxMinW = vec3(voxel).x.min(vec3(voxel).y).min(vec3(voxel).z).toVar();
-          const t = float(t0).max(0).toVar();
+          // PER-PIXEL LATTICE DECORRELATION. When the sun's azimuth aligns
+          // with a voxel row (Sponza's nave runs along X), every grazing ray
+          // in a screen row threads the SAME cell rows and they all agree —
+          // the lattice prints as long stripes that stretch along that axis
+          // and swing with the light. A sub-voxel lateral offset in the
+          // plane ⊥ the ray, rotated per pixel (the caller passes IGN),
+          // makes neighbouring pixels thread different rows: the coherent
+          // stripe becomes fine noise the bilateral upsample absorbs.
+          const upRef = select(d.y.abs().lessThan(0.9), vec3(0, 1, 0), vec3(1, 0, 0));
+          const s1 = vec3(d).cross(upRef).normalize().toVar();
+          const s2 = vec3(d).cross(s1).toVar();
+          const ang = jitter.mul(Math.PI * 2).toVar();
+          q0.addAssign(s1.mul(ang.cos()).add(s2.mul(ang.sin())).mul(voxMinW.mul(0.35)).mul(inv));
+          const t = float(t0).max(0).add(jitter.mul(voxMinW.mul(0.5))).toVar();
           const alpha = float(0).toVar();
           const level = int(OCC_LEVELS - 1).toVar();
+          // See the fail-dark clamp after the loop.
+          const resolved = float(0).toVar();
 
           Loop({ start: 0, end: steps, name: "coneDda" }, () => {
             If(t.greaterThanEqual(t1).or(alpha.greaterThanEqual(0.98)), () => {
+              resolved.assign(1);
               Break();
             });
             const q = q0.add(dq.mul(t)).toVar();
@@ -2018,6 +2035,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
                 .or(q.y.greaterThanEqual(level0.res.y))
                 .or(q.z.greaterThanEqual(level0.res.z)),
               () => {
+                resolved.assign(1);
                 Break();
               },
             );
@@ -2098,6 +2116,18 @@ export function createOccupancyField(bounds, res0, options = {}) {
               level.assign(lvl.add(int(1)).min(int(OCC_LEVELS - 1)));
             });
           });
+          // FAIL DARK FROM DOWN IN THE FINE LEVELS — the exact march's
+          // exhaustion clamp, ported. The exact arm used to own the whole
+          // ray and counted a budget-exhausted-in-detail ray as BLOCKED;
+          // handing its far segment to a fail-open cone brought back the
+          // white-rim dot population that clamp had killed (grazing
+          // silhouette rays burn their budget threading geometry, then
+          // read lit). Same discriminator as traceBody: exhausting at a
+          // coarse level means open road, exhausting at level ≤ 1 means
+          // the march was inside detail and almost certainly occluded.
+          If(resolved.lessThan(0.5).and(level.lessThanEqual(int(1))), () => {
+            alpha.assign(1);
+          });
           return alpha.oneMinus().clamp(0, 1);
         },
       });
@@ -2107,6 +2137,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
       vec3(origin), vec3(dir), float(tMin), float(tMax),
       float(opts.tanHalf ?? 0), float(opts.boost ?? 3),
       vec3(opts.receiverP ?? origin), vec3(opts.receiverN ?? vec3(0, 0, 0)),
+      float(opts.jitter ?? 0),
     );
   };
 

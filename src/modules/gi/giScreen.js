@@ -32,6 +32,7 @@ import {
   If,
   abs,
   float,
+  fract,
   instanceIndex,
   ivec2,
   mix,
@@ -465,8 +466,17 @@ export function createGiResolve({ gbuffer, targets, width, height, gather, norma
               // returns vec2(shadow, blockerDist/span) — the y feeds the
               // PCSS blur radius at sample time; the sphere arm has no
               // blocker distance and stays sharp (y = 0).
+              // Interleaved gradient noise, per RESOLVE pixel — the cone
+              // march's lattice-decorrelation rotation (see its jitter note).
+              // Deterministic per pixel and frame-stable: no motion, no
+              // temporal filter needed; the coherent lattice stripe becomes
+              // static fine grain the upsample already averages.
+              const ign = fract(
+                fract(float(coord.x).mul(0.06711056).add(float(coord.y).mul(0.00583715)))
+                  .mul(52.9829189),
+              );
               const tracedRaw = lightShadow.traceDda
-                ? lightShadow.traceDda(shadowOrigin, dir, maxT, float(1).div(angle), P, tanHalf)
+                ? lightShadow.traceDda(shadowOrigin, dir, maxT, float(1).div(angle), P, tanHalf, ign)
                 : lightShadow.trace(shadowOrigin, dir, maxT, float(1).div(angle), cosRayNormal);
               const traced = lightShadow.traceDda ? vec2(tracedRaw).toVar() : vec2(tracedRaw, 0).toVar();
               if (lightShadowDistVars) lightShadowDistVars[index].assign(traced.y);
