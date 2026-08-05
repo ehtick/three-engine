@@ -13,6 +13,7 @@ import {
   Eye,
   EyeOff,
   Feather,
+  FolderOpen,
   Grid3x3,
   Image as ImageIcon,
   Lasso,
@@ -51,6 +52,7 @@ import { uniqueName } from "../assetOps.js";
 import { pushToast } from "../toasts.js";
 import { ContextMenu } from "../ContextMenu.jsx";
 import { SelectField } from "../fields/SelectField.jsx";
+import { TexturePicker } from "./TexturePicker.jsx";
 import { NEW_TEXTURE_EVENT, consumeNewTextureRequest } from "../textureEditorRequest.js";
 import {
   createTextureAsset,
@@ -342,10 +344,12 @@ function TextureWorkspace({ path, onPathChange, onAtlasChange, onSliceIntoSprite
   const [warning, setWarning] = useState(null);
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
-  // "New Texture" in the Assets panel latches a request rather than firing an
-  // event into the void — this panel is lazy-loaded and usually mounts AFTER
-  // the click that asked for it. See textureEditorRequest.js.
-  const [showNew, setShowNew] = useState(() => !path || consumeNewTextureRequest());
+  // Only when something actually ASKED for a new texture. Opening the panel
+  // with nothing loaded used to raise the New dialog on its own, which puts a
+  // modal in front of someone who came to open an existing file — the empty
+  // state offers both routes instead, and neither is forced.
+  const [showNew, setShowNew] = useState(() => consumeNewTextureRequest());
+  const [showPicker, setShowPicker] = useState(false);
   useEffect(() => {
     const open = () => setShowNew(true);
     window.addEventListener(NEW_TEXTURE_EVENT, open);
@@ -1009,6 +1013,10 @@ function TextureWorkspace({ path, onPathChange, onAtlasChange, onSliceIntoSprite
   return (
     <div className="texture-editor" ref={rootRef} tabIndex={-1}>
       <div className="texture-toolbar">
+        <button className="tx-btn" title="Open a texture from this project…" onClick={() => setShowPicker(true)}>
+          <FolderOpen size={14} />
+          <span className="tx-label">Open</span>
+        </button>
         <button className="tx-btn" title="New texture…" onClick={() => setShowNew(true)}>
           <Plus size={14} />
           <span className="tx-label">New</span>
@@ -1105,13 +1113,21 @@ function TextureWorkspace({ path, onPathChange, onAtlasChange, onSliceIntoSprite
 
           {status === "loading" && <div className="panel-empty">Loading texture…</div>}
           {status === "error" && <div className="panel-empty">Could not open this texture.</div>}
-          {status === "empty" && !showNew && (
-            <div className="panel-empty">
-              <ImageIcon size={26} />
-              <p>Select a texture in the Assets panel, or create a new one.</p>
-              <button className="tx-btn" onClick={() => setShowNew(true)}>
-                New Texture…
-              </button>
+          {status === "empty" && (
+            <div className="panel-empty texture-empty">
+              <ImageIcon size={28} />
+              <p>No texture open.</p>
+              <div className="tx-row">
+                <button className="tx-btn primary" onClick={() => setShowPicker(true)}>
+                  <FolderOpen size={14} />
+                  <span>Open Texture…</span>
+                </button>
+                <button className="tx-btn" onClick={() => setShowNew(true)}>
+                  <Plus size={14} />
+                  <span>New Texture…</span>
+                </button>
+              </div>
+              <p className="tx-hint">Or double-click any image in the Assets panel.</p>
             </div>
           )}
           {status === "ready" && doc && (
@@ -1216,6 +1232,20 @@ function TextureWorkspace({ path, onPathChange, onAtlasChange, onSliceIntoSprite
               action: () => runCommand("cropToSelection"),
             },
           ]}
+        />
+      )}
+
+      {showPicker && (
+        <TexturePicker
+          onCancel={() => setShowPicker(false)}
+          onPick={(picked) => {
+            setShowPicker(false);
+            // Through the selection store, so the Assets panel and the asset
+            // inspector follow along — opening a texture here should leave the
+            // rest of the editor pointing at the same file.
+            useSelectionStore.getState().selectAsset(picked);
+            onPathChange(picked);
+          }}
         />
       )}
 
@@ -1327,11 +1357,8 @@ function TextureCanvas({
   toolRef.current = toolProps;
   const readoutRef = useRef(null);
   void hasClipboard;
-  // Marching ants: a screen-space canvas the outline is composited into, the
-  // stripe pattern that gives it its dashes, and how far along that pattern has
-  // crawled. Kept in refs — this advances every frame and must never re-render.
-  const antsRef = useRef(null);
-  const antsPatternRef = useRef(null);
+  // How far the ants have crawled, in dash units. A ref because it advances
+  // every frame and must never trigger a render.
   const antsOffsetRef = useRef(0);
   // Space is the universal "pan without changing tools" modifier. Held in a ref
   // and mirrored onto the wrapper as a class, so the cursor changes without a
@@ -1433,8 +1460,17 @@ function TextureCanvas({
     fit();
   }, [fit]);
 
-  // Selection outline: rebuilt only when the selection changes, then drawn with
-  // the same transform as the image so it tracks zoom and pan for free.
+  // The selection's boundary as line SEGMENTS in document space, rebuilt only
+  // when the selection changes.
+  //
+  // Not a bitmap. Drawing an edge mask and scaling it to the view makes the
+  // outline `zoom` pixels thick — a chunky white wall at 8x rather than a
+  // hairline — and a bitmap cannot be dashed. Segments stroke at exactly 1px
+  // at any zoom and take `setLineDash` directly, which is what makes real
+  // marching ants possible for a lasso or a wand result that has no path.
+  //
+  // Collinear edges are merged into runs, so a rectangular marquee is 4 lines
+  // rather than a few hundred one-texel ticks.
   useEffect(() => {
     const mask = selectionRef.current;
     if (!mask) {
@@ -1442,26 +1478,34 @@ function TextureCanvas({
       return;
     }
     const { width, height } = doc;
-    const edge = createBuffer(width, height);
-    for (let y = 0; y < height; y++) {
-      for (let x = 0; x < width; x++) {
-        const i = y * width + x;
-        if (!mask[i]) continue;
-        const boundary =
-          x === 0 || y === 0 || x === width - 1 || y === height - 1 ||
-          !mask[i - 1] || !mask[i + 1] || !mask[i - width] || !mask[i + width];
-        if (boundary) {
-          const d = i * 4;
-          edge.data[d] = edge.data[d + 1] = edge.data[d + 2] = 255;
-          edge.data[d + 3] = 255;
+    // The 50% coverage line is the boundary — a feathered selection has no
+    // single edge, and this is the one every editor draws.
+    const inside = (x, y) => x >= 0 && y >= 0 && x < width && y < height && mask[y * width + x] >= 128;
+    const segments = [];
+
+    for (let y = 0; y <= height; y++) {
+      let run = -1;
+      for (let x = 0; x <= width; x++) {
+        const edge = x < width && inside(x, y - 1) !== inside(x, y);
+        if (edge && run < 0) run = x;
+        else if (!edge && run >= 0) {
+          segments.push([run, y, x, y]);
+          run = -1;
         }
       }
     }
-    const canvas = document.createElement("canvas");
-    canvas.width = width;
-    canvas.height = height;
-    canvas.getContext("2d").putImageData(new ImageData(edge.data, width, height), 0, 0);
-    outlineRef.current = canvas;
+    for (let x = 0; x <= width; x++) {
+      let run = -1;
+      for (let y = 0; y <= height; y++) {
+        const edge = y < height && inside(x - 1, y) !== inside(x, y);
+        if (edge && run < 0) run = y;
+        else if (!edge && run >= 0) {
+          segments.push([x, run, x, y]);
+          run = -1;
+        }
+      }
+    }
+    outlineRef.current = segments.length ? segments : null;
   }, [selectionVersion, selectionRef, doc]);
 
   // --- painting the view --------------------------------------------------
@@ -1519,87 +1563,31 @@ function TextureCanvas({
     }
     ctx.drawImage(source, x, y, dw, dh);
 
-    // Marching ants.
-    //
-    // A static outline is indistinguishable from artwork — the whole point of
-    // the convention is that motion says "this is a selection, not a line you
-    // drew". The dashes are applied in SCREEN space rather than to the mask, so
-    // they stay the same size at any zoom (a doc-space dash becomes a solid bar
-    // at 16x), and compositing a moving stripe pattern through the outline with
-    // `source-in` works for an arbitrary shape — a lasso or a wand result has
-    // no path to hand to `setLineDash`.
+    // Marching ants: two dashed passes, black then white offset by one dash, so
+    // the outline reads on any artwork — a single white dash disappears over
+    // white pixels, which is most of what gets selected.
     if (outlineRef.current) {
-      let ants = antsRef.current;
-      if (!ants) {
-        ants = document.createElement("canvas");
-        antsRef.current = ants;
-      }
-      if (ants.width !== Math.round(w) || ants.height !== Math.round(h)) {
-        ants.width = Math.max(1, Math.round(w));
-        ants.height = Math.max(1, Math.round(h));
-      }
-      const actx = ants.getContext("2d");
-      actx.setTransform(1, 0, 0, 1, 0, 0);
-      actx.clearRect(0, 0, ants.width, ants.height);
-      actx.imageSmoothingEnabled = false;
-      actx.drawImage(outlineRef.current, x, y, dw, dh);
-
-      if (!antsPatternRef.current) {
-        const tile = document.createElement("canvas");
-        tile.width = 8;
-        tile.height = 8;
-        const tctx = tile.getContext("2d");
-        tctx.fillStyle = "#ffffff";
-        tctx.fillRect(0, 0, 8, 8);
-        tctx.fillStyle = "#000000";
-        // A diagonal band, so the crawl reads on horizontal and vertical edges
-        // alike — a purely horizontal stripe leaves vertical edges looking
-        // static however fast it moves.
-        tctx.beginPath();
-        tctx.moveTo(0, 0);
-        tctx.lineTo(4, 0);
-        tctx.lineTo(0, 4);
-        tctx.closePath();
-        tctx.fill();
-        tctx.beginPath();
-        tctx.moveTo(8, 4);
-        tctx.lineTo(8, 8);
-        tctx.lineTo(4, 8);
-        tctx.closePath();
-        tctx.fill();
-        antsPatternRef.current = actx.createPattern(tile, "repeat");
-      }
-      const pattern = antsPatternRef.current;
       const offset = antsOffsetRef.current;
-      pattern.setTransform?.(new DOMMatrix().translateSelf(offset, offset));
-      actx.globalCompositeOperation = "source-in";
-      actx.fillStyle = pattern;
-      actx.fillRect(0, 0, ants.width, ants.height);
-      actx.globalCompositeOperation = "source-over";
-      ctx.drawImage(ants, 0, 0);
-    }
-
-    // Pixel grid, once a texel is big enough for the lines to mean something.
-    // Below ~8x it is a grey wash over the artwork rather than a guide.
-    if (zoom >= 8) {
-      ctx.strokeStyle = "rgba(255,255,255,0.07)";
+      const path = () => {
+        ctx.beginPath();
+        for (const [x0, y0, x1, y1] of outlineRef.current) {
+          // The half-pixel keeps a 1px stroke on the pixel rather than
+          // straddling two and rendering as a 2px blur.
+          ctx.moveTo(Math.round(x + x0 * zoom) + 0.5, Math.round(y + y0 * zoom) + 0.5);
+          ctx.lineTo(Math.round(x + x1 * zoom) + 0.5, Math.round(y + y1 * zoom) + 0.5);
+        }
+        ctx.stroke();
+      };
+      ctx.save();
       ctx.lineWidth = 1;
-      ctx.beginPath();
-      const firstCol = Math.max(0, Math.floor(-x / zoom));
-      const lastCol = Math.min(doc.width, Math.ceil((w - x) / zoom));
-      for (let col = firstCol; col <= lastCol; col++) {
-        const px = Math.round(x + col * zoom) + 0.5;
-        ctx.moveTo(px, Math.max(y, 0));
-        ctx.lineTo(px, Math.min(y + dh, h));
-      }
-      const firstRow = Math.max(0, Math.floor(-y / zoom));
-      const lastRow = Math.min(doc.height, Math.ceil((h - y) / zoom));
-      for (let row = firstRow; row <= lastRow; row++) {
-        const py = Math.round(y + row * zoom) + 0.5;
-        ctx.moveTo(Math.max(x, 0), py);
-        ctx.lineTo(Math.min(x + dw, w), py);
-      }
-      ctx.stroke();
+      ctx.setLineDash([4, 4]);
+      ctx.lineDashOffset = -offset;
+      ctx.strokeStyle = "rgba(0,0,0,0.9)";
+      path();
+      ctx.lineDashOffset = -offset + 4;
+      ctx.strokeStyle = "#ffffff";
+      path();
+      ctx.restore();
     }
 
     // Document border, so an empty transparent texture is still locatable.
@@ -1715,8 +1703,8 @@ function TextureCanvas({
       if (now - last < 33) return;
       const dt = last ? Math.min(0.2, (now - last) / 1000) : 0;
       last = now;
-      // 8px per second: fast enough to read as motion, slow enough not to
-      // fight the artwork for attention.
+      // 8px per second — one full dash cycle a second: fast enough to read as
+      // motion, slow enough not to fight the artwork for attention.
       antsOffsetRef.current = (antsOffsetRef.current + dt * 8) % 8;
       draw();
     };

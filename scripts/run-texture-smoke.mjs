@@ -940,6 +940,10 @@ console.log("\nselections and the clipboard");
   const selected = await page.evaluate(() => !!document.querySelector(".texture-options .tx-btn:not(:disabled)"));
   check("a marquee drag produced a selection", selected);
 
+  if (process.env.SHOT_ANTS) {
+    await settle(300);
+    await page.screenshot({ path: process.env.SHOT_ANTS });
+  }
   check("back to the brush", await pickTool("Brush"));
   await paintAcrossCentre();
   await save();
