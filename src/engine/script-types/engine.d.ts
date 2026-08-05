@@ -880,6 +880,59 @@ declare module "engine" {
 
   /** `entity.getComponent("trail")`. A ribbon that follows the entity and fades
    *  behind it. Points are recorded in world space, on game time. */
+  /**
+   * A textured quad in the world, from a sprite atlas or a plain image —
+   * pickups, markers, 2D actors, nine-sliced world panels.
+   *
+   *     const sprite = this.entity.getComponent(SpriteComponent);
+   *     sprite.play("run");
+   *     this.entity.on("sprite-animation-end", (name) => { … });
+   */
+  export interface SpriteComponent extends ComponentBase<{
+    /** `.atlas` asset. Empty means `texture` is drawn whole. */
+    atlas: string;
+    /** Region name inside the atlas — the still frame. */
+    region: string;
+    /** Plain image, used when no atlas is set. */
+    texture: string;
+    /** Animation name inside the atlas. */
+    animation: string;
+    playOnStart: boolean;
+    speed: number;
+    /** Texture pixels per world unit — the only scale knob, shared with the
+     *  nine-slice border so the two can never disagree. */
+    pixelsPerUnit: number;
+    color: string;
+    opacity: number;
+    flipX: boolean;
+    flipY: boolean;
+    /** `"none"` keeps the entity's own rotation; `"y"` yaws to face the camera
+     *  while staying upright; `"full"` also pitches. */
+    billboard: "none" | "full" | "y";
+    /** Draw the region nine-sliced at `size` instead of at its pixel size. */
+    sliced: boolean;
+    size: [number, number];
+    lit: boolean;
+    blending: "alpha" | "additive";
+    alphaTest: number;
+    castShadow: boolean;
+  }> {
+    /** True while an animation is advancing. */
+    readonly isPlaying: boolean;
+    /** Region name on screen right now — the animation's frame, or the still. */
+    readonly frame: string;
+    /** Every region name in this sprite's atlas. */
+    readonly regionNames: string[];
+    /** Plays an animation from the start (defaults to the authored one). */
+    play(name?: string): SpriteComponent;
+    pause(): SpriteComponent;
+    resume(): SpriteComponent;
+    /** Stops and returns to the authored still region. */
+    stop(): SpriteComponent;
+    /** Shows a still region by name — for state-driven sprites with no timeline. */
+    setRegion(name: string): SpriteComponent;
+  }
+
   export interface TrailRendererComponent extends ComponentBase<{
     time: number;
     minVertexDistance: number;
@@ -1356,6 +1409,11 @@ declare module "engine" {
     color: string;
     opacity: number;
     texture: string;
+    /** `.atlas` asset. Takes precedence over `texture`, and the region's own
+     *  nine-slice border wins over the element's insets — the border belongs to
+     *  the artwork, not to every element that shows it. */
+    atlas: string;
+    region: string;
     cornerRadius: number;
     borderWidth: number;
     borderColor: string;
@@ -1472,6 +1530,7 @@ declare module "engine" {
     line: LineRendererComponent;
     trail: TrailRendererComponent;
     decal: DecalComponent;
+    sprite: SpriteComponent;
     lod: LodGroupComponent;
     spline: SplineComponent;
     splineFollower: SplineFollowerComponent;
@@ -1538,6 +1597,7 @@ declare module "engine" {
   export const InstancerComponent: ComponentClass<"instancer">;
   export const ParticleComponent: ComponentClass<"particles">;
   export const LineRendererComponent: ComponentClass<"line">;
+  export const SpriteComponent: ComponentClass<"sprite">;
   export const TrailRendererComponent: ComponentClass<"trail">;
   export const DecalComponent: ComponentClass<"decal">;
   export const LodGroupComponent: ComponentClass<"lod">;

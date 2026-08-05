@@ -131,7 +131,9 @@ Status is tracked per phase below as it lands.
 - [x] Phase 1 — **shipped 2026-08-05**
 - [x] Phase 2 — **shipped 2026-08-05**
 - [x] Phase 3 — **shipped 2026-08-05**
-- [ ] Phase 4
+- [x] Phase 4 — **shipped 2026-08-05**
+
+**All four phases are done.**
 
 ---
 
@@ -307,3 +309,64 @@ sprite's pixels** (a packer that reports plausible rects while blitting to the w
 looks fine until something renders), that the gutter really is extruded, that a border and
 pivot set in the UI reach disk, and that unpacking returns sprites at their original size
 and colour).
+
+---
+
+## Phase 4 — what landed
+
+The runtime. Everything the editor authors is now drawable by a shipped game, and none
+of it requires the module to be enabled — sprites are core engine, next to decals and
+trails, for the reason in decision 3 above.
+
+**`SpriteComponent`** (`sprite`) — a textured quad from an atlas region or a plain image.
+
+- **A sprite's size comes from its pixels.** `pixelsPerUnit` is the only scale knob, and
+  it is the same number that converts the nine-slice border, so a sprite and its border
+  can never disagree about scale. Two frames of one animation trimmed to different sizes
+  don't change size on screen; a 64px icon beside a 128px one is half as big with no
+  per-sprite scale factor to maintain.
+- **Animation runs on game time**, so bullet time slows it and a pause menu freezes it —
+  the rule the particle sim and the trails already follow. Playback position is
+  `resetOnStop` state, or leaving Play would strand the sprite on whatever frame it
+  reached. A non-looping animation fires `sprite-animation-end` **once**, at the moment
+  it finishes, not every frame it spends holding its last pose.
+- Script API: `play` / `pause` / `resume` / `stop` / `setRegion`, plus `isPlaying`,
+  `frame` and `regionNames`.
+- **Billboarding is CPU-side and that limitation is stated, not hidden**: each sprite owns
+  its mesh, so facing `engine.camera` is one quaternion per sprite per frame — but with
+  two cameras in one frame only the active one is faced. `"y"` (cylindrical) keeps the
+  sprite upright and only yaws, which is what a tree or a health bar wants; `"full"` also
+  pitches. `"none"` never writes to the transform at all, so a sprite laid flat as a
+  ground marker can't snap upright.
+- The bounding sphere is **written, never computed** — the buffers are over-allocated for
+  the nine-slice case, so a computed sphere would measure the stale tail past the live
+  vertices. Same trap the ribbons hit; it presents as "the sprite sometimes disappears".
+- Its mesh is marked `noBatch`: the vertices are rewritten whenever the frame changes.
+
+**`UiImageComponent`** gained `atlas` + `region`. The region's pixel size drives the
+nine-slice maths (so a region behaves exactly like a lone file), and **the region's own
+authored border wins over the element's insets** — the border belongs to the artwork, and
+retyping it on every element that shows the sprite is what the atlas exists to stop. In
+the shader the region remap happens *after* the slice maths, in region-relative space;
+doing it first would make the insets fractions of the whole sheet.
+
+**Pipeline**: scene preload follows a `.atlas` to its image the way it already follows a
+`.mat` to its textures (a level starting before the sheet arrives is a screen of blank
+quads), and `exportGame` re-emits each `.atlas` with its image path rewritten into the
+build's asset namespace — dropping each region's `source`, which is an authoring path
+that would otherwise drag every loose sprite along with the sheet.
+
+Also: the Inspector learned `vec2` (one component handling both axis counts rather than a
+near-identical twin).
+
+One bug the tests caught, and it is the one worth remembering: **the pivot's Y was mapped
+backwards**. A pivot is normalised in image space, so `[0.5, 1]` is the image's *bottom*
+row and must land at y = 0 with the sprite standing above it — a character's feet at its
+transform. The inverted version hangs every sprite below its entity, which looks perfectly
+plausible right up until something has to stand on the ground.
+
+Tests: `npm run test:texture` (124 headless checks — the sprite geometry additions assert
+the thing nine-slice exists for: widening a panel from 1 to 4 units leaves its corners
+exactly 0.08 units wide) and `npm run smoke:texture` (74 checks; the runtime section walks
+a real `SpriteComponent` through every frame of a real atlas animation, wraps it, and
+measures the built quad at 0.08 × 0.30 world units from an 8×30px region).

@@ -343,11 +343,13 @@ function TextPropField({ value, onCommit, readOnly = false, mixed = false }) {
   );
 }
 
-function Vec3PropField({ value, onCommit, mixed = [] }) {
-  const values = Array.isArray(value) ? value : [0, 0, 0];
+/** Handles both `vec3` and `vec2` — the axis count is the only difference, and
+ *  a second near-identical component would be one more place to fix a bug. */
+function Vec3PropField({ value, onCommit, mixed = [], axes = 3 }) {
+  const values = Array.isArray(value) ? value : new Array(axes).fill(0);
   return (
     <div className="vector-fields">
-      {[0, 1, 2].map((i) => (
+      {Array.from({ length: axes }, (_, i) => i).map((i) => (
         <AxisField
           key={i}
           axis={AXES[i]}
@@ -498,6 +500,8 @@ function PropField({ descriptor, value, onCommit, mixed = false, mixedAxes = [] 
       );
     case "vec3":
       return <Vec3PropField value={value} mixed={mixedAxes} onCommit={onCommit} />;
+    case "vec2":
+      return <Vec3PropField value={value} mixed={mixedAxes} onCommit={onCommit} axes={2} />;
     case "number":
       return (
         <NumberField
@@ -2006,7 +2010,7 @@ function MultiScriptAttributeFields({ entities }) {
       );
       const isMixed = !values.every((value) => valuesEqual(value, values[0]));
       const mixedAxes =
-        def.type === "vec3"
+        (def.type === "vec3" || def.type === "vec2")
           ? [0, 1, 2].map((axis) => !values.every((value) => value?.[axis] === values[0]?.[axis]))
           : [];
       rows.push(
@@ -2021,7 +2025,7 @@ function MultiScriptAttributeFields({ entities }) {
               const commands = entities.map((entity, i) => {
                 const list = slotLists[i];
                 const attributes = { ...(list[index]?.attributes ?? {}) };
-                if (def.type === "vec3" && Number.isInteger(changedAxis)) {
+                if ((def.type === "vec3" || def.type === "vec2") && Number.isInteger(changedAxis)) {
                   const next = [...(attributes[key] ?? def.default ?? [0, 0, 0])];
                   next[changedAxis] = value[changedAxis];
                   attributes[key] = next;
@@ -2127,7 +2131,7 @@ function MultiComponentSection({ entities, type }) {
         const renderField = (descriptor) => {
           const values = propsList.map((props) => props[descriptor.key]);
           const mixed = !values.every((value) => valuesEqual(value, values[0]));
-          const mixedAxes = descriptor.type === "vec3"
+          const mixedAxes = descriptor.type === "vec3" || descriptor.type === "vec2"
             ? [0, 1, 2].map((axis) => !values.every((value) => value?.[axis] === values[0]?.[axis]))
             : [];
           return (
@@ -2146,7 +2150,7 @@ function MultiComponentSection({ entities, type }) {
                       commands.push(new SetComponentPropCommand(entity.id, type, "geometryAsset", ""));
                     }
                     let entityValue = value;
-                    if (descriptor.type === "vec3" && Number.isInteger(changedAxis)) {
+                    if ((descriptor.type === "vec3" || descriptor.type === "vec2") && Number.isInteger(changedAxis)) {
                       entityValue = [...(props[descriptor.key] ?? [0, 0, 0])];
                       entityValue[changedAxis] = value[changedAxis];
                     }

@@ -188,6 +188,7 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
   const cubemapPaths = new Set(); // .cubemap files ship with rewritten face paths
   const audioSidecarPaths = new Set(); // .audio JSON, copied with path rewrites
   const timelinePaths = new Set(); // .timeline files ship with rewritten clip paths
+  const atlasPaths = new Set(); // .atlas files ship with a rewritten image path
   // Saved scenes deliberately use project-relative paths so projects remain
   // portable. Runtime asset loading resolves those paths against `root`; the
   // exporter must do the same before handing sources to native filesystem IPC.
@@ -233,6 +234,12 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
     } else if (c.type === "skinnedmesh" && c.props.material) {
       materialPaths.add(sourcePath(c.props.material));
       c.props.material = claimDoc(c.props.material);
+    } else if ((c.type === "sprite" || c.type === "uiimage") && c.props.atlas) {
+      // Like a .mat and a .timeline: the document itself is re-emitted below,
+      // because the sheet it names is a separate file that has to ship and be
+      // renamed with everything else.
+      atlasPaths.add(sourcePath(c.props.atlas));
+      c.props.atlas = claimDoc(c.props.atlas);
     } else if (c.type === "environment" && c.props.hdri) {
       c.props.hdri = claim(c.props.hdri);
     } else if (c.type === "animation" && c.props.controller) {
@@ -431,6 +438,22 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
           }
         }
       }
+      files.push([claimDoc(src), JSON.stringify(def)]);
+    }
+    for (const src of atlasPaths) {
+      onProgress({ phase: "assets", message: `Reading atlas ${basename(src)}…` });
+      let def;
+      try {
+        def = JSON.parse(await readRequiredText(src, "atlas"));
+      } catch (err) {
+        warnings.push(`Skipped atlas ${src}: ${err?.message ?? err}`);
+        continue;
+      }
+      if (def.image) def.image = claim(def.image);
+      // `source` records where each region came from at pack time. It is an
+      // authoring path into the project and has no business in a build — and
+      // shipping it would drag every loose sprite along with the sheet.
+      for (const region of def.regions ?? []) delete region.source;
       files.push([claimDoc(src), JSON.stringify(def)]);
     }
     for (const src of audioSidecarPaths) {

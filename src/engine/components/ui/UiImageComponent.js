@@ -3,6 +3,7 @@ import { Component } from "../Component.js";
 import { createUiImageMaterial, applyElementUniforms } from "../../ui/uiMaterial.js";
 import { UI_LAYER } from "../../ui/UiSystem.js";
 import { loadTextureAsset } from "../../textureAsset.js";
+import { atlasImagePath, findRegion, loadAtlasAsset, regionUv } from "../../sprite/atlasAsset.js";
 
 // One shared unit plane for every UI quad — meshes scale it per-rect.
 let sharedPlane = null;
@@ -24,6 +25,11 @@ export class UiImageComponent extends Component {
     color: "#ffffff",
     opacity: 1,
     texture: "", // image asset path; empty = flat color
+    // A sprite atlas plus the region to show. Takes precedence over `texture`:
+    // an atlas IS an image, and asking a UI element to reconcile two sources
+    // would only ever produce a rule nobody remembers.
+    atlas: "",
+    region: "",
     cornerRadius: 0,
     borderWidth: 0,
     borderColor: "#000000",
@@ -46,6 +52,8 @@ export class UiImageComponent extends Component {
     { key: "color", label: "Color", type: "color" },
     { key: "opacity", label: "Opacity", type: "number", min: 0, max: 1, step: 0.05 },
     { key: "texture", label: "Texture", type: "asset", exts: ["png", "jpg", "jpeg", "webp"] },
+    { key: "atlas", label: "Atlas", type: "asset", exts: ["atlas"] },
+    { key: "region", label: "Region", type: "string" },
     { key: "imageType", label: "Image Type", type: "select", options: ["simple", "sliced", "tiled"] },
     { key: "sliceLeft", label: "Slice L", type: "number", min: 0, step: 1 },
     { key: "sliceRight", label: "Slice R", type: "number", min: 0, step: 1 },
@@ -77,7 +85,8 @@ export class UiImageComponent extends Component {
     // UiSystem.hitTest instead).
     this.mesh.raycast = () => {};
     this.entity.object3D.add(this.mesh);
-    if (this.props.texture) this.#loadTexture(this.props.texture);
+    this.atlasDef = null;
+    this.#loadSource();
   }
 
   onDetach() {
@@ -93,11 +102,10 @@ export class UiImageComponent extends Component {
 
   onPropChanged(key) {
     if (!this.mesh) return;
-    if (key === "texture") {
+    if (key === "texture" || key === "atlas") {
       this.textureMap?.dispose();
       this.textureMap = null;
-      if (this.props.texture) this.#loadTexture(this.props.texture);
-      else this.#rebuildMaterial();
+      this.#loadSource();
     } else if (key === "fillMode" || key === "imageType") {
       this.#rebuildMaterial();
     }
@@ -114,9 +122,23 @@ export class UiImageComponent extends Component {
     });
   }
 
-  async #loadTexture(path) {
+  /** Resolves whichever source is set — an atlas region, or a plain image. */
+  async #loadSource() {
     const generation = ++this.generation;
+    let path = this.props.texture;
     try {
+      if (this.props.atlas) {
+        const def = await loadAtlasAsset(this.props.atlas);
+        if (generation !== this.generation) return;
+        this.atlasDef = def;
+        path = atlasImagePath(def, this.props.atlas);
+      } else {
+        this.atlasDef = null;
+      }
+      if (!path) {
+        this.#rebuildMaterial();
+        return;
+      }
       const tex = await loadTextureAsset(path, { colorSpace: THREE.SRGBColorSpace });
       if (generation !== this.generation || !this.mesh) {
         tex.dispose();
@@ -125,8 +147,14 @@ export class UiImageComponent extends Component {
       this.textureMap = tex;
       this.#rebuildMaterial();
     } catch (err) {
-      console.warn(`UI image texture failed to load: ${path}`, err);
+      console.warn(`UI image source failed to load: ${this.props.atlas || path}`, err);
     }
+  }
+
+  /** The atlas region currently shown, or null when this is a plain image. */
+  get spriteRegion() {
+    if (!this.atlasDef) return null;
+    return findRegion(this.atlasDef, this.props.region) ?? this.atlasDef.regions[0] ?? null;
   }
 
   /** Runtime tint (button hover/pressed states) — not serialized. */
@@ -160,17 +188,29 @@ export class UiImageComponent extends Component {
     u.fillAmount.value = p.fillAmount;
     const image = this.textureMap?.image;
     if (image?.width) {
-      u.texSize.value.set(image.width, image.height);
-      // Insets are clamped to the texture so a typo can't invert the middle
-      // region (which shows up as the panel's centre sampling backwards).
-      const maxX = image.width / 2;
-      const maxY = image.height / 2;
-      u.slice.value.set(
-        Math.min(p.sliceLeft ?? 0, maxX),
-        Math.min(p.sliceRight ?? 0, maxX),
-        Math.min(p.sliceTop ?? 0, maxY),
-        Math.min(p.sliceBottom ?? 0, maxY),
-      );
+      // An atlas region substitutes for the image everywhere below: its pixel
+      // size drives the nine-slice maths, and its own authored border wins over
+      // the element's insets — the border belongs to the artwork, and having to
+      // retype it on every element that uses the sprite is the thing the atlas
+      // exists to stop.
+      const region = this.spriteRegion;
+      const sheet = { size: [image.width, image.height] };
+      const width = region ? region.rect[2] : image.width;
+      const height = region ? region.rect[3] : image.height;
+      u.texSize.value.set(width, height);
+      if (region) {
+        const uv = regionUv(sheet, region, { width: image.width, height: image.height });
+        u.region.value.set(uv.u0, uv.v0, uv.u1 - uv.u0, uv.v1 - uv.v0);
+      } else {
+        u.region.value.set(0, 0, 1, 1);
+      }
+      const authored = region && region.border.some((v) => v > 0);
+      const [bl, br, bt, bb] = authored ? region.border : [p.sliceLeft ?? 0, p.sliceRight ?? 0, p.sliceTop ?? 0, p.sliceBottom ?? 0];
+      // Insets are clamped to the region so a typo can't invert the middle
+      // (which shows up as the panel's centre sampling backwards).
+      const maxX = width / 2;
+      const maxY = height / 2;
+      u.slice.value.set(Math.min(bl, maxX), Math.min(br, maxX), Math.min(bt, maxY), Math.min(bb, maxY));
     }
     applyElementUniforms(mesh.material, {
       clipRect,

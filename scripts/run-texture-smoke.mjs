@@ -668,6 +668,95 @@ console.log("\nsprite atlas");
 }
 
 /* -------------------------------------------------------------------------- */
+/* 11 — the runtime: SpriteComponent drawing and animating from the atlas       */
+/* -------------------------------------------------------------------------- */
+
+console.log("\nsprite runtime");
+{
+  // Give the atlas an animation over its three regions, on disk, so the
+  // component reads exactly what the editor writes.
+  const atlasFile = `${ROOT}/sprites/Pack.atlas`;
+  const def = JSON.parse(fs.readFileSync(atlasFile, "utf8"));
+  def.animations = [{ name: "spin", fps: 10, loop: true, frames: def.regions.map((r) => r.name) }];
+  fs.writeFileSync(atlasFile, JSON.stringify(def, null, 2));
+
+  const result = await page.evaluate(async (atlasPath) => {
+    const { ensureEngine } = await globalThis.__importLive("/src/editor/engineInstance.js");
+    const engine = await ensureEngine();
+    globalThis.__engine = engine;
+    const { invalidateAtlasAsset } = await globalThis.__importLive("/src/engine/sprite/atlasAsset.js");
+    invalidateAtlasAsset(); // the file was just rewritten under the cache
+
+    const entity = engine.createEntity({ name: "Sprite" });
+    const sprite = entity.addComponent("sprite", {
+      atlas: atlasPath,
+      animation: "spin",
+      pixelsPerUnit: 100,
+      playOnStart: true,
+    });
+    // Give the atlas + image loads a moment; both are async by design.
+    await new Promise((r) => setTimeout(r, 1200));
+
+    const mesh = entity.object3D.children.find((c) => c.isMesh);
+    const positions = mesh?.geometry.getAttribute("position");
+    // Tick the component directly at a known dt rather than waiting on frames:
+    // this is about the animation's arithmetic, not the render loop's timing.
+    // 10 fps, so one frame per 0.1s — four steps must wrap back to the first.
+    const walked = [sprite.frame];
+    for (let i = 0; i < 4; i++) {
+      sprite.tick(0.1);
+      walked.push(sprite.frame);
+    }
+
+    sprite.stop();
+    const stopped = { playing: sprite.isPlaying, frame: sprite.frame };
+    sprite.setRegion("beta");
+    const still = sprite.frame;
+
+    const bounds = [];
+    if (positions) {
+      for (let i = 0; i < 4; i++) bounds.push(positions.getX(i), positions.getY(i));
+    }
+
+    return {
+      regionNames: sprite.regionNames,
+      hasMesh: !!mesh,
+      hasMap: !!mesh?.material?.map,
+      drawCount: mesh?.geometry.drawRange.count ?? 0,
+      walked,
+      stopped,
+      still,
+      bounds,
+    };
+  }, atlasFile);
+
+  check("the sprite resolved its atlas", result.regionNames.length === 3, result.regionNames.join());
+  check("it built a mesh with a texture", result.hasMesh && result.hasMap);
+  check("a plain sprite draws one quad (6 indices)", result.drawCount === 6, String(result.drawCount));
+  check("it starts on a real frame", !!result.walked[0], result.walked[0]);
+  check(
+    "advancing game time walks every frame in order",
+    new Set(result.walked.slice(0, 3)).size === 3,
+    result.walked.join(" -> "),
+  );
+  check(
+    "and a looping animation wraps back to its first frame",
+    result.walked[3] === result.walked[0],
+    result.walked.join(" -> "),
+  );
+  check("stop() halts playback", result.stopped.playing === false);
+  check("setRegion shows a still frame by name", result.still === "beta", result.still);
+
+  // beta is 8×30 at 100 px/unit, so the quad must be 0.08 × 0.30 world units —
+  // the size comes from the sprite's pixels, with no scale factor anywhere.
+  const xsOf = result.bounds.filter((_, i) => i % 2 === 0);
+  const ysOf = result.bounds.filter((_, i) => i % 2 === 1);
+  const w = Math.max(...xsOf) - Math.min(...xsOf);
+  const h = Math.max(...ysOf) - Math.min(...ysOf);
+  check("the quad's world size comes from its pixel size", Math.abs(w - 0.08) < 1e-4 && Math.abs(h - 0.3) < 1e-4, `${w.toFixed(3)} × ${h.toFixed(3)}`);
+}
+
+/* -------------------------------------------------------------------------- */
 
 check("no page errors during the run", pageErrors.length === 0, pageErrors.slice(0, 2).join(" | "));
 

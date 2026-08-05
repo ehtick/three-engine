@@ -504,14 +504,18 @@ export function collectSceneAssets(json) {
 /**
  * Second pass over the preload list: a `.mat` is a few hundred bytes, but the
  * textures it points at are the megabytes that actually make a level pop in.
- * Materials are the only indirection worth following — everything else either
- * is the payload (`.glb`) or is negligible.
+ * Materials, timelines and sprite atlases are the indirections worth following
+ * — everything else either is the payload (`.glb`) or is negligible.
+ *
+ * A `.atlas` is followed for the same reason a material is: it names one image
+ * that every sprite in the scene draws from, and a level that starts before it
+ * arrives shows a screen of blank quads.
  */
 export async function expandMaterialAssets(paths) {
   const out = new Set(paths);
   await Promise.all(
     paths
-      .filter((path) => /\.(mat|timeline)$/i.test(path))
+      .filter((path) => /\.(mat|timeline|atlas)$/i.test(path))
       .map(async (path) => {
         try {
           const url = await resolveAssetUrl(path);

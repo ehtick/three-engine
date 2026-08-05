@@ -109,10 +109,16 @@ import { blitWithExtrude, packAtlas, packIntoBin } from "../src/editor/texture/p
 import { nameRegions, sliceByAlpha, sliceGrid, sortReadingOrder } from "../src/editor/texture/slice.js";
 import {
   animationDuration,
+  findRegion as findAtlasRegion,
   frameAt,
   normalizeAtlas,
   regionUv,
 } from "../src/engine/sprite/atlasAsset.js";
+import {
+  buildNineSliceQuad,
+  buildSpriteQuad,
+  spriteSize,
+} from "../src/engine/sprite/spriteGeometry.js";
 import { applySlice, uniqueRegionName } from "../src/editor/texture/atlasOps.js";
 
 let failures = 0;
@@ -1387,6 +1393,114 @@ check("uniqueRegionName never collides", () => {
   const def = normalizeAtlas({ regions: [{ name: "sprite", rect: [0, 0, 1, 1] }, { name: "sprite_1", rect: [0, 0, 1, 1] }] });
   assert.equal(uniqueRegionName(def, "sprite"), "sprite_2");
   assert.equal(uniqueRegionName(def, "other"), "other");
+});
+
+console.log("\nsprite geometry");
+
+const sheet = normalizeAtlas({
+  size: [128, 64],
+  regions: [
+    { name: "icon", rect: [0, 0, 32, 32] },
+    { name: "panel", rect: [64, 16, 48, 32], border: [8, 8, 6, 6] },
+    { name: "hero", rect: [32, 8, 16, 24], pivot: [0.5, 1] },
+  ],
+});
+const uvOf = (name) => regionUv(sheet, findAtlasRegion(sheet, name));
+const xs = (positions) => [...new Set(Array.from(positions).filter((_, i) => i % 3 === 0))].sort((a, b) => a - b);
+const ys = (positions) => [...new Set(Array.from(positions).filter((_, i) => i % 3 === 1))].sort((a, b) => a - b);
+
+check("a sprite's size comes from its pixels and pixelsPerUnit", () => {
+  assert.deepEqual(spriteSize([0, 0, 32, 32], 100), [0.32, 0.32]);
+  assert.deepEqual(spriteSize([0, 0, 64, 32], 32), [2, 1]);
+  // Two icons at different pixel sizes are different world sizes without any
+  // per-sprite scale factor to maintain.
+  assert.ok(spriteSize([0, 0, 128, 128], 100)[0] === 2 * spriteSize([0, 0, 64, 64], 100)[0]);
+});
+
+check("a centred pivot centres the quad; a bottom pivot puts the feet at y=0", () => {
+  const centred = buildSpriteQuad({ width: 2, height: 4, uv: uvOf("icon"), pivot: [0.5, 0.5] });
+  assert.deepEqual(ys(centred.positions), [-2, 2]);
+  // Pivots are normalised in IMAGE space (Y down), so [0.5, 1] is the sprite's
+  // BOTTOM — a standing character's feet at the entity's origin.
+  const feet = buildSpriteQuad({ width: 2, height: 4, uv: uvOf("icon"), pivot: [0.5, 1] });
+  assert.deepEqual(ys(feet.positions), [0, 4]);
+  const head = buildSpriteQuad({ width: 2, height: 4, uv: uvOf("icon"), pivot: [0.5, 0] });
+  assert.deepEqual(ys(head.positions), [-4, 0]);
+});
+
+check("flipX and flipY swap the UVs, never the positions", () => {
+  const plain = buildSpriteQuad({ width: 1, height: 1, uv: uvOf("icon") });
+  const flipped = buildSpriteQuad({ width: 1, height: 1, uv: uvOf("icon"), flipX: true });
+  assert.deepEqual(Array.from(plain.positions), Array.from(flipped.positions));
+  assert.equal(plain.uvs[0], flipped.uvs[2], "the left edge now samples the right");
+  const flippedY = buildSpriteQuad({ width: 1, height: 1, uv: uvOf("icon"), flipY: true });
+  assert.notDeepEqual(Array.from(plain.uvs), Array.from(flippedY.uvs));
+});
+
+check("a quad's UVs stay inside its own region of the sheet", () => {
+  const uv = uvOf("hero");
+  const quad = buildSpriteQuad({ width: 1, height: 1, uv });
+  for (let i = 0; i < quad.uvs.length; i += 2) {
+    assert.ok(quad.uvs[i] >= uv.u0 - 1e-9 && quad.uvs[i] <= uv.u1 + 1e-9, `u ${quad.uvs[i]}`);
+    assert.ok(quad.uvs[i + 1] >= uv.v0 - 1e-9 && quad.uvs[i + 1] <= uv.v1 + 1e-9, `v ${quad.uvs[i + 1]}`);
+  }
+});
+
+check("nine-slice emits a full 4x4 grid even where a border is zero", () => {
+  // Degenerate cells are kept so the index layout never changes — resizing a
+  // panel then rewrites buffers in place instead of reallocating on the GPU.
+  const sliced = buildNineSliceQuad({
+    width: 3, height: 2, uv: uvOf("icon"), region: [0, 0, 32, 32], border: [0, 0, 0, 0],
+    pixelsPerUnit: 100, textureSize: [128, 64],
+  });
+  assert.equal(sliced.positions.length, 16 * 3);
+  assert.equal(sliced.indices.length, 9 * 6);
+});
+
+check("nine-slice corners keep their world size as the panel is resized", () => {
+  // This is the entire guarantee of nine-slice, and the one thing worth
+  // asserting: widening the panel must not thicken its corners.
+  const make = (width) =>
+    buildNineSliceQuad({
+      width, height: 2, uv: uvOf("panel"), region: [64, 16, 48, 32], border: [8, 8, 6, 6],
+      pixelsPerUnit: 100, textureSize: [128, 64],
+    });
+  const narrow = xs(make(1).positions);
+  const wide = xs(make(4).positions);
+  assert.ok(Math.abs((narrow[1] - narrow[0]) - 0.08) < 1e-6, `left border ${narrow[1] - narrow[0]}`);
+  assert.ok(Math.abs((wide[1] - wide[0]) - 0.08) < 1e-6, `left border ${wide[1] - wide[0]}`);
+  assert.ok(Math.abs((wide[3] - wide[2]) - 0.08) < 1e-6, "and the right one too");
+  assert.ok(Math.abs((wide[3] - wide[0]) - 4) < 1e-6, "while the panel really is 4 units wide");
+});
+
+check("nine-slice borders are clamped so the middle can never invert", () => {
+  // A 48px border on a panel narrower than the border would otherwise sample
+  // the sprite's centre backwards — visually inexplicable, and easy to author.
+  const tiny = buildNineSliceQuad({
+    width: 0.05, height: 0.05, uv: uvOf("panel"), region: [64, 16, 48, 32], border: [8, 8, 6, 6],
+    pixelsPerUnit: 100, textureSize: [128, 64],
+  });
+  const cols = xs(tiny.positions);
+  for (let i = 1; i < cols.length; i++) {
+    assert.ok(cols[i] >= cols[i - 1] - 1e-9, `column ${i} went backwards`);
+  }
+  const rows = ys(tiny.positions);
+  for (let i = 1; i < rows.length; i++) {
+    assert.ok(rows[i] >= rows[i - 1] - 1e-9, `row ${i} went backwards`);
+  }
+});
+
+check("nine-slice UV insets are fractions of the REGION, not of the sheet", () => {
+  const uv = uvOf("panel");
+  const sliced = buildNineSliceQuad({
+    width: 4, height: 2, uv, region: [64, 16, 48, 32], border: [8, 8, 6, 6],
+    pixelsPerUnit: 100, textureSize: [128, 64],
+  });
+  const us = [...new Set(Array.from(sliced.uvs).filter((_, i) => i % 2 === 0))].sort((a, b) => a - b);
+  // 8px of a 48px-wide region, and the region is 48/128 of the sheet.
+  assert.ok(Math.abs((us[1] - us[0]) - (8 / 128)) < 1e-6, `inset was ${us[1] - us[0]}`);
+  assert.ok(Math.abs((us[3] - us[0]) - (48 / 128)) < 1e-6, "and the whole region is spanned");
+  for (const u of us) assert.ok(u >= uv.u0 - 1e-9 && u <= uv.u1 + 1e-9, "never leaves the region");
 });
 
 console.log(`\n${passes} passed, ${failures} failed\n`);

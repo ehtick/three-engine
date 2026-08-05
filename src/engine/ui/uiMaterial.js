@@ -163,9 +163,15 @@ export function createUiImageMaterial(options = {}) {
     borderWidth: uniform(0),
     borderColor: uniform(new THREE.Color(0, 0, 0)),
     fillAmount: uniform(1),
-    // Nine-slice: the texture's pixel size and the four insets into it.
+    // Nine-slice: the texture's pixel size and the four insets into it. With a
+    // sprite atlas, `texSize` is the REGION's pixel size, so the insets stay in
+    // the artwork's own space and a region behaves exactly like a lone file.
     texSize: uniform(new THREE.Vector2(1, 1)),
     slice: uniform(new THREE.Vector4(0, 0, 0, 0)), // left, right, top, bottom
+    // Sub-rectangle of the texture to sample: origin + span in UV. The default
+    // (0, 0, 1, 1) is the whole image, so nothing changes for an image that is
+    // not part of an atlas.
+    region: uniform(new THREE.Vector4(0, 0, 1, 1)),
   };
 
   // Signed distance to a rounded rect, in UI pixels. uv() is 0..1 across the
@@ -190,7 +196,11 @@ export function createUiImageMaterial(options = {}) {
           sliceAxis(uv().y, u.size.y, u.texSize.y, u.slice.z, u.slice.w, tile),
         )
       : uv();
-    const texel = tslTexture(options.texture, coord);
+    // Remap into the atlas region LAST, after the nine-slice maths has done its
+    // work in region-relative 0..1 space. Doing it first would make the slice
+    // insets fractions of the whole sheet.
+    const inRegion = coord.mul(vec2(u.region.z, u.region.w)).add(vec2(u.region.x, u.region.y));
+    const texel = tslTexture(options.texture, inRegion);
     rgb = rgb.mul(texel.rgb);
     alpha = alpha.mul(texel.a);
   }
