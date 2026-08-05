@@ -67,6 +67,7 @@ import {
 import {
   CanvasSizeDialog,
   OperationDialog,
+  TransformDialog,
   OperationMenus,
   PackChannelsDialog,
   ResizeDialog,
@@ -84,6 +85,7 @@ import {
   copyRegion,
   createBuffer,
   cropBuffer,
+  opaqueBounds,
   parseColor,
   toHex,
 } from "../texture/pixels.js";
@@ -107,6 +109,7 @@ import {
   trimDocument,
 } from "../texture/layers.js";
 import { adjustmentById, defaultParams, luminance } from "../texture/adjust.js";
+import { transformBuffer, transformClips } from "../texture/transform.js";
 import { LAYER_EFFECTS, defaultEffect, hasEffects, renderLayerEffects } from "../texture/layerFx.js";
 import { filterById } from "../texture/filters.js";
 import {
@@ -781,6 +784,50 @@ function TextureWorkspace({ path, onPathChange, onAtlasChange, onSliceIntoSprite
     [captureSelection, eraseSelection, dropOntoNewLayer],
   );
 
+  /**
+   * Transforms the active layer, or just the selected area of it.
+   *
+   * With a selection, the transform is applied to the selected pixels and
+   * dropped back in place with the rest of the layer left alone — which is what
+   * "transform the selection" means everywhere else, and the reason it is the
+   * same code path rather than a second tool.
+   */
+  const transformLayer = useCallback(
+    (label, spec, { base = null, preview = false } = {}) => {
+      const d = docRef.current;
+      const target = d ? findActiveLayer(d) : null;
+      if (!target || target.locked) return;
+      const source = base ?? cloneBuffer(target.buffer);
+      const rect = { x0: 0, y0: 0, x1: d.width, y1: d.height };
+      const before = preview ? null : captureRegion(target.buffer, rect);
+      const selection = selectionRef.current;
+
+      const moved = transformBuffer(source, { ...spec, width: d.width, height: d.height });
+      if (!selection) {
+        target.buffer.data.set(moved.data);
+      } else {
+        // Lift the selected pixels, transform them, and drop them back into a
+        // hole punched where they were. Transforming the whole layer and then
+        // masking would move the unselected pixels too and mask the evidence.
+        target.buffer.data.set(source.data);
+        for (let i = 0; i < selection.length; i++) {
+          const cover = selection[i] / 255;
+          if (cover <= 0) continue;
+          target.buffer.data[i * 4 + 3] *= 1 - cover;
+        }
+        const lifted = cloneBuffer(source);
+        for (let i = 0; i < selection.length; i++) lifted.data[i * 4 + 3] *= selection[i] / 255;
+        const liftedMoved = transformBuffer(lifted, { ...spec, width: d.width, height: d.height });
+        blendInto(target.buffer, liftedMoved, {});
+      }
+
+      if (!preview) pushHistory(regionEntry(target.buffer, rect, before, label));
+      target.rev = (target.rev ?? 0) + 1;
+      markEdited(null);
+    },
+    [pushHistory, markEdited],
+  );
+
   // --- the operation menus -----------------------------------------------
   const [dialog, setDialog] = useState(null);
   // Right-click on the canvas. The shortcuts are the fast path; this is how
@@ -798,6 +845,63 @@ function TextureWorkspace({ path, onPathChange, onAtlasChange, onSliceIntoSprite
         case "swizzle":
           setDialog({ kind });
           return;
+        case "transformLayer": {
+          const target = findActiveLayer(d);
+          if (!target || target.locked) {
+            if (target?.locked) pushToast({ title: "That layer is locked" });
+            return;
+          }
+          // Snapshot before the first preview: every preview transforms from
+          // THIS, never from the previous preview, or scaling to 50% twice in
+          // a row would land at 25% without anyone asking for it.
+          setDialog({ kind: "transform", base: cloneBuffer(target.buffer) });
+          return;
+        }
+        case "flipLayer":
+          transformLayer("Flip Layer", {
+            scaleX: payload === "horizontal" ? -1 : 1,
+            scaleY: payload === "vertical" ? -1 : 1,
+            filter: "nearest",
+          });
+          return;
+        case "rotateLayer":
+          // Quarter turns are exact, so they take the nearest sampler — a
+          // bilinear 90° rotation resamples every texel for no reason and
+          // softens pixel art that should have come through untouched.
+          transformLayer("Rotate Layer", { angle: payload, filter: "nearest" });
+          return;
+        case "fitLayer": {
+          const target = findActiveLayer(d);
+          const bounds = target ? opaqueBounds(target.buffer) : null;
+          if (!bounds) {
+            pushToast({ title: "That layer is empty" });
+            return;
+          }
+          const scale = Math.min(d.width / bounds.width, d.height / bounds.height);
+          transformLayer("Fit Layer", {
+            scaleX: scale,
+            scaleY: scale,
+            // The content is scaled about the canvas centre, so anything not
+            // already centred has to be brought there first — otherwise "fit"
+            // scales a corner-hugging logo off the edge.
+            offsetX: (d.width / 2 - (bounds.x + bounds.width / 2)) * scale,
+            offsetY: (d.height / 2 - (bounds.y + bounds.height / 2)) * scale,
+          });
+          return;
+        }
+        case "centreLayer": {
+          const target = findActiveLayer(d);
+          const bounds = target ? opaqueBounds(target.buffer) : null;
+          if (!bounds) {
+            pushToast({ title: "That layer is empty" });
+            return;
+          }
+          transformLayer("Centre Layer", {
+            offsetX: d.width / 2 - (bounds.x + bounds.width / 2),
+            offsetY: d.height / 2 - (bounds.y + bounds.height / 2),
+          });
+          return;
+        }
         case "adjust":
         case "filter": {
           const spec = kind === "adjust" ? adjustmentById(payload) : filterById(payload);
@@ -878,7 +982,7 @@ function TextureWorkspace({ path, onPathChange, onAtlasChange, onSliceIntoSprite
         default:
       }
     },
-    [runOnLayer, openOperation, withDocumentSnapshot, deselect],
+    [runOnLayer, openOperation, withDocumentSnapshot, deselect, transformLayer],
   );
 
   /** Pack Channels writes a NEW asset rather than replacing the open document:
@@ -1392,6 +1496,26 @@ function TextureWorkspace({ path, onPathChange, onAtlasChange, onSliceIntoSprite
             const offset = anchorOffset(anchor, { width: doc.width, height: doc.height }, { width, height });
             withDocumentSnapshot("Canvas Size", (d) => resizeDocumentCanvas(d, width, height, offset.x, offset.y));
             deselect();
+            setDialog(null);
+          }}
+        />
+      )}
+
+      {dialog?.kind === "transform" && (
+        <TransformDialog
+          scope={selectionRef.current ? "Selection" : "Layer"}
+          clipsAt={(spec) => transformClips(doc.width, doc.height, spec)}
+          onPreview={(spec) => transformLayer("Transform", spec, { base: dialog.base, preview: true })}
+          onApply={(spec) => {
+            transformLayer("Transform Layer", spec, { base: dialog.base });
+            setDialog(null);
+          }}
+          onCancel={() => {
+            // Put the pre-dialog pixels back: previewing wrote into the live
+            // layer so that what you see is exactly what Apply commits.
+            const target = findActiveLayer(docRef.current);
+            if (target && dialog.base) target.buffer.data.set(dialog.base.data);
+            markEdited(null);
             setDialog(null);
           }}
         />

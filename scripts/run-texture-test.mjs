@@ -117,6 +117,7 @@ import {
   renderLayerEffects,
 } from "../src/editor/texture/layerFx.js";
 import { applyStrokeToMask } from "../src/editor/texture/draw.js";
+import { transformBuffer, transformClips, transformedBounds } from "../src/editor/texture/transform.js";
 import { blitWithExtrude, packAtlas, packIntoBin } from "../src/editor/texture/packer.js";
 import { nameRegions, sliceByAlpha, sliceGrid, sortReadingOrder } from "../src/editor/texture/slice.js";
 import {
@@ -1691,6 +1692,92 @@ await asyncCheck("a layer with no effects writes none into .tex", async () => {
   const bytes = await encodeTexDoc(doc, codec);
   const text = new TextDecoder().decode(bytes.subarray(0, 400));
   assert.ok(!text.includes("effects"), "an empty list is not worth storing");
+});
+
+console.log("\nlayer transforms");
+
+const marker = (size = 16) => {
+  // Asymmetric on both axes, so a flip or a rotation that goes the wrong way
+  // is impossible to mistake for the right one.
+  const buffer = createBuffer(size, size);
+  setPixel(buffer, 2, 2, [255, 0, 0, 255]);
+  setPixel(buffer, size - 3, 2, [0, 255, 0, 255]);
+  setPixel(buffer, 2, size - 3, [0, 0, 255, 255]);
+  return buffer;
+};
+
+check("an identity transform changes nothing", () => {
+  const source = marker();
+  const out = transformBuffer(source, { filter: "nearest" });
+  assert.deepEqual(Array.from(out.data), Array.from(source.data));
+});
+
+check("a negative scale flips, and the canvas size is kept", () => {
+  const source = marker(16);
+  const flipped = transformBuffer(source, { scaleX: -1, filter: "nearest" });
+  assert.equal(flipped.width, 16);
+  assert.equal(flipped.height, 16);
+  // Red was at x=2; mirrored about the centre it lands at x=13.
+  assert.deepEqual(px(flipped, 13, 2), [255, 0, 0, 255]);
+  assert.deepEqual(px(flipped, 2, 2), [0, 255, 0, 255], "green came the other way");
+});
+
+check("a quarter turn moves the corners the way the number reads", () => {
+  const out = transformBuffer(marker(16), { angle: 90, filter: "nearest" });
+  // Clockwise on screen: the top-left marker ends up top-right.
+  assert.deepEqual(px(out, 13, 2), [255, 0, 0, 255]);
+});
+
+check("four quarter turns come back to the start", () => {
+  let buffer = marker(16);
+  for (let i = 0; i < 4; i++) buffer = transformBuffer(buffer, { angle: 90, filter: "nearest" });
+  assert.deepEqual(Array.from(buffer.data), Array.from(marker(16).data));
+});
+
+check("scaling up magnifies without leaving holes", () => {
+  // The reason the sampler is inverse-mapped: walking the SOURCE and writing
+  // where each texel lands leaves gaps the moment anything is magnified.
+  const source = createBuffer(8, 8, [200, 40, 40, 255]);
+  const out = transformBuffer(source, { scaleX: 2, scaleY: 2, filter: "nearest" });
+  let holes = 0;
+  for (let y = 0; y < 8; y++) {
+    for (let x = 0; x < 8; x++) if (px(out, x, y)[3] === 0) holes++;
+  }
+  assert.equal(holes, 0, `${holes} texels were never written`);
+});
+
+check("a rotated sprite on transparency keeps its colour at the edge", () => {
+  // Straight-alpha interpolation would drag the RGB of transparent texels into
+  // the visible ones and put a dark fringe around everything rotated.
+  const source = createBuffer(24, 24);
+  for (let y = 6; y < 18; y++) for (let x = 6; x < 18; x++) setPixel(source, x, y, [255, 40, 40, 255]);
+  const out = transformBuffer(source, { angle: 30, filter: "bilinear" });
+  let worst = 255;
+  for (let y = 0; y < 24; y++) {
+    for (let x = 0; x < 24; x++) {
+      const p = px(out, x, y);
+      if (p[3] > 40) worst = Math.min(worst, p[0]);
+    }
+  }
+  assert.ok(worst > 200, `the rotated edge stayed red (darkest R ${worst})`);
+});
+
+check("moving is exact at integer offsets", () => {
+  const out = transformBuffer(marker(16), { offsetX: 3, offsetY: -1, filter: "nearest" });
+  assert.deepEqual(px(out, 5, 1), [255, 0, 0, 255]);
+});
+
+check("a zero scale produces nothing rather than dividing by zero", () => {
+  const out = transformBuffer(marker(16), { scaleX: 0 });
+  for (let i = 3; i < out.data.length; i += 4) assert.equal(out.data[i], 0);
+});
+
+check("transformedBounds reports what a rotation actually needs", () => {
+  assert.deepEqual(transformedBounds(10, 10, { angle: 0 }), { width: 10, height: 10 });
+  const turned = transformedBounds(10, 10, { angle: 45 });
+  assert.ok(turned.width >= 14 && turned.width <= 15, `10x10 at 45 deg needs ~14.1 (${turned.width})`);
+  assert.equal(transformClips(10, 10, { angle: 45 }), true, "so a 45 degree turn is reported as clipping");
+  assert.equal(transformClips(10, 10, { scaleX: 0.5, scaleY: 0.5 }), false);
 });
 
 console.log(`\n${passes} passed, ${failures} failed\n`);

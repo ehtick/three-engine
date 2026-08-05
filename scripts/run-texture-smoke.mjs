@@ -1118,6 +1118,76 @@ console.log("\nmasks and effects");
 }
 
 /* -------------------------------------------------------------------------- */
+/* 11d — transforming a layer (scale / rotate / flip)                          */
+/* -------------------------------------------------------------------------- */
+
+console.log("\nlayer transforms");
+{
+  const TR = `${ROOT}/textures/Tr.png`;
+  // A red block in the top-left quadrant: a flip has somewhere unambiguous to
+  // move it to, and "did anything happen" is answerable from two texels.
+  const sheet = flatBuffer(32, 32, [0, 0, 0, 0]);
+  for (let y = 4; y < 12; y++) {
+    for (let x = 4; x < 12; x++) {
+      const i = (y * 32 + x) * 4;
+      sheet.data[i] = 255;
+      sheet.data[i + 3] = 255;
+    }
+  }
+  fs.writeFileSync(TR, Buffer.from(await encodePng(sheet)));
+
+  await openTexture(TR);
+  await page.waitForSelector(".texture-canvas", { timeout: 30000 });
+  await settle(1000);
+
+  const alphaAt = async (x, y) => {
+    const buffer = await decodePng(new Uint8Array(fs.readFileSync(TR)));
+    return buffer.data[(y * buffer.width + x) * 4 + 3];
+  };
+
+  check("the Layer menu exists", await clickText(".texture-toolbar .tx-btn", "Layer"));
+  await settle(250);
+  check("it offers a horizontal flip", await clickText(".dropdown-item", "Flip Horizontal"));
+  await settle(500);
+  await save();
+  check("flipping moved the block to the other side", (await alphaAt(24, 8)) > 200, String(await alphaAt(24, 8)));
+  check("and left nothing behind", (await alphaAt(8, 8)) === 0, String(await alphaAt(8, 8)));
+
+  // Rotate it back round: 180 twice must be a no-op, which is the cheapest
+  // proof the sampler is not drifting.
+  await clickText(".texture-toolbar .tx-btn", "Layer");
+  await settle(200);
+  await clickText(".dropdown-item", "Rotate 180");
+  await settle(400);
+  await clickText(".texture-toolbar .tx-btn", "Layer");
+  await settle(200);
+  await clickText(".dropdown-item", "Rotate 180");
+  await settle(400);
+  await save();
+  check("two 180 turns are exactly a no-op", (await alphaAt(24, 8)) > 200, String(await alphaAt(24, 8)));
+
+  // The numeric dialog, previewing live and cancelling cleanly.
+  await clickText(".texture-toolbar .tx-btn", "Layer");
+  await settle(200);
+  check("Transform opens a dialog", await clickText(".dropdown-item", "Transform"));
+  await page.waitForSelector(".texture-dialog", { timeout: 10000 });
+  const setScale = await page.evaluate(() => {
+    const input = document.querySelector(".texture-dialog input[type=number]");
+    if (!input) return false;
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+    setter.call(input, "50");
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    return true;
+  });
+  check("it takes a scale", setScale);
+  await settle(500);
+  check("Cancel is offered", await clickText(".texture-dialog-actions .tx-btn", "Cancel"));
+  await settle(400);
+  await save();
+  check("cancelling a previewed transform restores the layer", (await alphaAt(24, 8)) > 200, String(await alphaAt(24, 8)));
+}
+
+/* -------------------------------------------------------------------------- */
 /* 12 — double-click a tab bar to maximize, Escape to restore                  */
 /* -------------------------------------------------------------------------- */
 

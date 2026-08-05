@@ -19,7 +19,7 @@ import { CHANNEL_SOURCES } from "../texture/channels.js";
  * the document, the selection and the undo stack.
  */
 
-const MENUS = ["Image", "Adjust", "Filter", "Channels"];
+const MENUS = ["Image", "Layer", "Adjust", "Filter", "Channels"];
 
 export function OperationMenus({ onCommand, hasSelection, disabled }) {
   const [menu, setMenu] = useState(null);
@@ -53,6 +53,24 @@ export function OperationMenus({ onCommand, hasSelection, disabled }) {
         { label: "Rotate 90° CW", action: () => run("rotate", 1) },
         { label: "Rotate 90° CCW", action: () => run("rotate", 3) },
         { label: "Rotate 180°", action: () => run("rotate", 2) },
+      ];
+    }
+    if (menu.name === "Layer") {
+      // Transforms of the LAYER, as distinct from the Image menu above, which
+      // transforms the whole document. Conflating the two is how someone ends
+      // up with a 4096px texture because they wanted a bigger logo.
+      return [
+        { header: hasSelection ? "Selected area" : "Active layer" },
+        { label: "Transform…", hint: "Scale, rotate and move", action: () => run("transformLayer") },
+        { separator: true },
+        { label: "Flip Horizontal", action: () => run("flipLayer", "horizontal") },
+        { label: "Flip Vertical", action: () => run("flipLayer", "vertical") },
+        { label: "Rotate 90° CW", action: () => run("rotateLayer", 90) },
+        { label: "Rotate 90° CCW", action: () => run("rotateLayer", -90) },
+        { label: "Rotate 180°", action: () => run("rotateLayer", 180) },
+        { separator: true },
+        { label: "Scale to Fit Canvas", action: () => run("fitLayer") },
+        { label: "Centre in Canvas", action: () => run("centreLayer") },
       ];
     }
     if (menu.name === "Adjust") {
@@ -568,6 +586,117 @@ export function PackAtlasDialog({ count, defaultName = "Atlas", onApply, onCance
             }}
           >
             {busy ? "Packing…" : "Pack"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Transform the active layer (or the selected area of it).
+ *
+ * Numeric rather than drag-handles, deliberately for now: the numbers are what
+ * make a transform reproducible across the six frames of an animation, and a
+ * handle gesture that cannot be typed is no help when two sprites have to match.
+ * Live preview means the numbers are not a guess either.
+ */
+export function TransformDialog({ scope, clipsAt, onPreview, onApply, onCancel }) {
+  const [uniform, setUniform] = useState(true);
+  const [values, setValues] = useState({ scaleX: 100, scaleY: 100, angle: 0, offsetX: 0, offsetY: 0 });
+  const [filter, setFilter] = useState("bilinear");
+  const previewRef = useRef(onPreview);
+  previewRef.current = onPreview;
+
+  const spec = {
+    scaleX: values.scaleX / 100,
+    scaleY: (uniform ? values.scaleX : values.scaleY) / 100,
+    angle: values.angle,
+    offsetX: values.offsetX,
+    offsetY: values.offsetY,
+    filter,
+  };
+  const specKey = JSON.stringify(spec);
+
+  // Debounced, and the callback lives in a ref — previewing re-renders the
+  // panel, which hands this dialog a fresh callback, and depending on it would
+  // spin forever. Same trap as the adjustment dialog.
+  useEffect(() => {
+    const timer = setTimeout(() => previewRef.current(JSON.parse(specKey)), 110);
+    return () => clearTimeout(timer);
+  }, [specKey]);
+
+  const set = (key, value) => setValues((v) => ({ ...v, [key]: value }));
+  const clipped = clipsAt?.(spec);
+
+  return (
+    <div className="texture-dialog-backdrop" onPointerDown={onCancel}>
+      <div className="texture-dialog" onPointerDown={(e) => e.stopPropagation()}>
+        <h3>Transform {scope}</h3>
+        <div className="texture-dialog-row">
+          <label>
+            Scale X
+            <input type="number" min={-1000} max={1000} step={1} value={values.scaleX}
+              onChange={(e) => set("scaleX", Number(e.target.value))} />
+          </label>
+          <label>
+            Scale Y
+            <input type="number" min={-1000} max={1000} step={1}
+              value={uniform ? values.scaleX : values.scaleY}
+              disabled={uniform}
+              onChange={(e) => set("scaleY", Number(e.target.value))} />
+          </label>
+        </div>
+        <label className="texture-check">
+          <input type="checkbox" checked={uniform} onChange={(e) => setUniform(e.target.checked)} />
+          Lock aspect ratio
+        </label>
+        <label className="texture-param">
+          <span>Rotate</span>
+          <input type="range" min={-180} max={180} step={1} value={values.angle}
+            onChange={(e) => set("angle", Number(e.target.value))} />
+          <input type="number" min={-180} max={180} step={1} value={values.angle}
+            onChange={(e) => set("angle", Number(e.target.value))} />
+        </label>
+        <div className="texture-dialog-row">
+          <label>
+            Move X
+            <input type="number" step={1} value={values.offsetX}
+              onChange={(e) => set("offsetX", Number(e.target.value))} />
+          </label>
+          <label>
+            Move Y
+            <input type="number" step={1} value={values.offsetY}
+              onChange={(e) => set("offsetY", Number(e.target.value))} />
+          </label>
+        </div>
+        <div className="texture-dialog-field">
+          <span>Resampling</span>
+          <SelectField
+            value={filter}
+            options={[
+              { value: "bilinear", label: "Smooth", hint: "Bilinear" },
+              { value: "nearest", label: "Sharp", hint: "Nearest - pixel art" },
+            ]}
+            onChange={setFilter}
+          />
+        </div>
+        {clipped && (
+          <p className="texture-dialog-note warn">
+            This reaches outside the canvas — the parts that do will be cut off.
+          </p>
+        )}
+        <div className="texture-dialog-presets">
+          <button className="tx-btn quiet" onClick={() => setValues({ scaleX: 100, scaleY: 100, angle: 0, offsetX: 0, offsetY: 0 })}>
+            Reset
+          </button>
+        </div>
+        <div className="texture-dialog-actions">
+          <button className="tx-btn quiet" onClick={onCancel}>
+            Cancel
+          </button>
+          <button className="tx-btn primary" onClick={() => onApply(spec)}>
+            Apply
           </button>
         </div>
       </div>
