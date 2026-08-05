@@ -85,6 +85,7 @@
     "test:gi-rayhit-phase4": "node scripts/run-gi-ray-hit-phase4-test.mjs",
     "test:gi-rayhit-phase5": "node scripts/run-gi-ray-hit-phase5-test.mjs",
     "test:gi-rayhit-shadow": "node scripts/run-gi-ray-hit-shadow-test.mjs",
+    "test:gi-rayhit-dynamic": "node scripts/run-gi-ray-hit-dynamic-test.mjs",
     "test:gi-instanced": "node scripts/run-gi-instanced-sdf.mjs",
     "test:gi-sparse": "node scripts/run-gi-sparse-field.mjs",
     "test:gi-coverage": "node scripts/run-gi-sdf-coverage.mjs",

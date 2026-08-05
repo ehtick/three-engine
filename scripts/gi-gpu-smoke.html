@@ -120,6 +120,28 @@
             (!planeMode || stats.planeTests > 0) &&
             (!exactMode || stats.complexTests > 0)) break;
         }
+        // `?dynamic=1` — the DYNAMIC RECORD REFIT arm: wobble the wall so
+        // GISystem promotes its slot, the chain types its bricks DynamicBrick,
+        // and the per-chain tail refit claims records for them. The tail
+        // cursor resets every chain, so a non-zero readback proves the refit
+        // passes compiled AND dispatched on the mover's chains.
+        const dynamicArm = new URLSearchParams(location.search).get("dynamic") === "1";
+        let dynamicAlloc = null;
+        if (dynamicArm) {
+          const occField = engine.modules.get("gi").system.state.volume.occupancyField;
+          const dynDeadline = performance.now() + 20_000;
+          while (performance.now() < dynDeadline) {
+            for (let i = 0; i < 12; i++) {
+              wall.position.x += 0.01 * (i % 2 ? 1 : -1); // sub-voxel wobble
+              wall.updateMatrixWorld(true);
+              await new Promise((resolve) => setTimeout(resolve, 50));
+            }
+            dynamicAlloc = await occField.readbackSurfaceAlloc(engine.renderer);
+            if (dynamicAlloc?.dynamicAllocated > 0) break;
+          }
+          // Re-read so the limit/invalid asserts below cover the moving frames.
+          stats = await engine.modules.get("gi").system.readRayHitStats();
+        }
         engine.stop();
         const bindingAudit = [];
         const state = engine.modules.get("gi")?.system?.state;
@@ -179,6 +201,18 @@
         }
         if (hybridMode && !coarseSkip && stats.coarseSteps !== 0) {
           throw new Error(`skip=0 arm still executed ${stats.coarseSteps} coarse levels`);
+        }
+        if (dynamicArm) {
+          if (!planeMode) throw new Error("dynamic arm needs a plane-family mode (records off otherwise)");
+          if (!dynamicAlloc?.dynamicAllocated) {
+            throw new Error("dynamic arm: the record tail never allocated for the mover's bricks");
+          }
+          if (dynamicAlloc.dynamicOverflowBricks) {
+            throw new Error(`dynamic arm: tail overflowed on ${dynamicAlloc.dynamicOverflowBricks} bricks in a tiny scene`);
+          }
+          console.log(
+            `GI-SMOKE DYNAMIC tail=${dynamicAlloc.dynamicAllocated}/${dynamicAlloc.dynamicCapacity} overflow=0`,
+          );
         }
         if (lightShadowArm) {
           // The claim is only proven by the artifacts it leaves: a custom

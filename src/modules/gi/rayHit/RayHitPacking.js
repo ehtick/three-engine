@@ -34,7 +34,14 @@ export const MACRO_CELL_METADATA_WORD = 1;
 export const BRICK_OCCUPANCY_LOW_WORD = 0;
 export const BRICK_OCCUPANCY_HIGH_WORD = 1;
 export const BRICK_SURFACE_OFFSET_WORD = 2;
-export const BRICK_COMPLEX_OFFSET_WORD = 3;
+// Word 3 was reserved as a per-brick complex offset that never shipped —
+// Phase-4 complex ranges live in record word 2 (packComplexRange) instead, so
+// every writer stored INVALID here and nothing ever read it. Repurposed as
+// the DYNAMIC surface-record offset: the per-chain refit allocator writes the
+// brick's slice of the dynamic record tail here (INVALID = no dynamic
+// records, box semantics), and the plane-family traces consult it for
+// DynamicBrick cells exactly as they consult word 2 for static Bricks.
+export const BRICK_DYNAMIC_OFFSET_WORD = 3;
 
 export const INVALID_RAY_HIT_INDEX = 0xffffffff;
 
@@ -164,7 +171,7 @@ export function buildHybridBrickWords(resolution, occupied) {
         words[brickHeaderWord(layout, macroIndex, BRICK_OCCUPANCY_LOW_WORD)] = low;
         words[brickHeaderWord(layout, macroIndex, BRICK_OCCUPANCY_HIGH_WORD)] = high;
         words[brickHeaderWord(layout, macroIndex, BRICK_SURFACE_OFFSET_WORD)] = INVALID_RAY_HIT_INDEX;
-        words[brickHeaderWord(layout, macroIndex, BRICK_COMPLEX_OFFSET_WORD)] = INVALID_RAY_HIT_INDEX;
+        words[brickHeaderWord(layout, macroIndex, BRICK_DYNAMIC_OFFSET_WORD)] = INVALID_RAY_HIT_INDEX;
       }
     }
   }
@@ -1091,6 +1098,224 @@ export function buildSurfaceRecordsCpu(resolution, words, layout, triangles, {
   };
 }
 
+/**
+ * CPU mirror of the FINAL hybridBuild pass in surface mode: rewrites the
+ * brick masks / brick index / metadata from the MERGED occupancy predicate,
+ * types any brick holding a bit absent from `staticOccupied` as DynamicBrick,
+ * and — like the GPU kernel — NEVER touches the surface/dynamic offset words
+ * (the allocator passes own those). Run it on `words` built by
+ * buildHybridBrickWords + buildSurfaceRecordsCpu against the STATIC-only
+ * predicate to reproduce the GPU chain's end-of-dispatch state.
+ */
+export function updateHybridBrickWordsCpu(resolution, words, layout, occupied, staticOccupied = null) {
+  for (let mz = 0; mz < layout.macroResolution.z; mz++) {
+    for (let my = 0; my < layout.macroResolution.y; my++) {
+      for (let mx = 0; mx < layout.macroResolution.x; mx++) {
+        const macroIndex = macroCellLinearIndex(mx, my, mz, layout.macroResolution);
+        let low = 0;
+        let high = 0;
+        let occupiedCount = 0;
+        let dynamicCount = 0;
+        for (let z = 0; z < BRICK_RESOLUTION; z++) {
+          for (let y = 0; y < BRICK_RESOLUTION; y++) {
+            for (let x = 0; x < BRICK_RESOLUTION; x++) {
+              const gx = mx * BRICK_RESOLUTION + x;
+              const gy = my * BRICK_RESOLUTION + y;
+              const gz = mz * BRICK_RESOLUTION + z;
+              if (gx >= resolution.x || gy >= resolution.y || gz >= resolution.z || !occupied(gx, gy, gz)) continue;
+              const bit = voxelIndexInBrick(x, y, z);
+              if (bit < 32) low = (low | (1 << bit)) >>> 0;
+              else high = (high | (1 << (bit - 32))) >>> 0;
+              occupiedCount++;
+              if (staticOccupied && !staticOccupied(gx, gy, gz)) dynamicCount++;
+            }
+          }
+        }
+        const hasBrick = occupiedCount > 0;
+        words[macroCellWord(layout, macroIndex, MACRO_CELL_BRICK_INDEX_WORD)] = hasBrick
+          ? macroIndex
+          : INVALID_RAY_HIT_INDEX;
+        words[macroCellWord(layout, macroIndex, MACRO_CELL_METADATA_WORD)] = packMacroCellMetadata({
+          type: hasBrick
+            ? (dynamicCount > 0 ? MacroCellType.DynamicBrick : MacroCellType.Brick)
+            : MacroCellType.Empty,
+          coverage: Math.min(255, Math.floor((occupiedCount / BRICK_VOXEL_COUNT) * 255)),
+          generation: 1,
+        });
+        words[brickHeaderWord(layout, macroIndex, BRICK_OCCUPANCY_LOW_WORD)] = low;
+        words[brickHeaderWord(layout, macroIndex, BRICK_OCCUPANCY_HIGH_WORD)] = high;
+      }
+    }
+  }
+}
+
+/**
+ * CPU mirror of the per-chain DYNAMIC record refit (dynSurfClear +
+ * dynSurfAlloc + dynamic-filter accumulate + dynamic finalize).
+ *
+ * Call AFTER updateHybridBrickWordsCpu has landed the merged masks and the
+ * DynamicBrick typing — allocation and rank addressing both read those merged
+ * masks, exactly like the GPU passes that run after the chain's final
+ * hybridBuild. `triangles` must be the DYNAMIC slots' triangles only; a
+ * DynamicBrick cell whose bits are static-owned accumulates nothing and
+ * finalizes unfitted (all-zero record = box fallback — never a miss).
+ * Dynamic records are simple-plane only: a failed fit stays zero instead of
+ * reserving a complex triangle range (the triangle pool is full-chain
+ * machinery).
+ *
+ * The tail is zeroed first — dynamic records live one dispatch, so there is
+ * no staleness to carry. Returns absolute record ids offset by `dynamicBase`
+ * (= the static pool's capacity), matching the offsets written into
+ * BRICK_DYNAMIC_OFFSET_WORD.
+ */
+export function buildDynamicSurfaceRecordsCpu(resolution, words, layout, triangles, {
+  dynamicBase,
+  dynamicCapacity = 1 << 12,
+  records = null,
+  maxTriangles = SIMPLE_MAX_TRIANGLES,
+  minCoherence = SIMPLE_MIN_COHERENCE,
+  maxPlaneSigma = SIMPLE_MAX_PLANE_SIGMA,
+} = {}) {
+  if (records === null) {
+    records = new Uint32Array((dynamicBase + dynamicCapacity) * SURFACE_RECORD_WORDS);
+  }
+  records.fill(
+    0,
+    dynamicBase * SURFACE_RECORD_WORDS,
+    (dynamicBase + dynamicCapacity) * SURFACE_RECORD_WORDS,
+  );
+
+  // --- pass 1: allocation over DynamicBrick macros, deterministic scan.
+  // Every brick's dynamic offset word is rewritten (INVALID when not claimed),
+  // mirroring the GPU allocator — a brick that stopped being dynamic can
+  // never serve a stale offset.
+  let next = 0;
+  let overflowBricks = 0;
+  for (let macroIndex = 0; macroIndex < layout.macroCellCount; macroIndex++) {
+    const offsetWord = brickHeaderWord(layout, macroIndex, BRICK_DYNAMIC_OFFSET_WORD);
+    const metadata = unpackMacroCellMetadata(
+      words[macroCellWord(layout, macroIndex, MACRO_CELL_METADATA_WORD)],
+    );
+    const low = words[brickHeaderWord(layout, macroIndex, BRICK_OCCUPANCY_LOW_WORD)];
+    const high = words[brickHeaderWord(layout, macroIndex, BRICK_OCCUPANCY_HIGH_WORD)];
+    const count = popcount32(low) + popcount32(high);
+    if (metadata.type !== MacroCellType.DynamicBrick || count === 0) {
+      words[offsetWord] = INVALID_RAY_HIT_INDEX;
+      continue;
+    }
+    if (next + count > dynamicCapacity) {
+      words[offsetWord] = INVALID_RAY_HIT_INDEX;
+      overflowBricks++;
+      continue;
+    }
+    words[offsetWord] = dynamicBase + next;
+    next += count;
+  }
+
+  // --- pass 2: accumulation, dynamic triangles only, ranked against the
+  // MERGED masks (same fit math as buildSurfaceRecordsCpu's pass 2).
+  const acc = new Float64Array(next * 6); // nx ny nz w d d2
+  const counts = new Uint32Array(next);
+  const cov = new Uint32Array(next * 3);
+  const recordIndexOf = (x, y, z) => {
+    const mx = Math.floor(x / BRICK_RESOLUTION);
+    const my = Math.floor(y / BRICK_RESOLUTION);
+    const mz = Math.floor(z / BRICK_RESOLUTION);
+    const macroIndex = macroCellLinearIndex(mx, my, mz, layout.macroResolution);
+    const offset = words[brickHeaderWord(layout, macroIndex, BRICK_DYNAMIC_OFFSET_WORD)];
+    if (offset === INVALID_RAY_HIT_INDEX) return -1;
+    const low = words[brickHeaderWord(layout, macroIndex, BRICK_OCCUPANCY_LOW_WORD)];
+    const high = words[brickHeaderWord(layout, macroIndex, BRICK_OCCUPANCY_HIGH_WORD)];
+    const bit = voxelIndexInBrick(x & 3, y & 3, z & 3);
+    const set = bit < 32 ? (low >>> bit) & 1 : (high >>> (bit - 32)) & 1;
+    if (!set) return -1;
+    return offset - dynamicBase + brickRank(low, high, bit);
+  };
+
+  const h = 0.5 + 1e-4; // the voxelizer's conservative half extent
+  for (const [a, b, c] of triangles) {
+    const n = v3cross(v3sub(b, a), v3sub(c, a));
+    const len = Math.hypot(n[0], n[1], n[2]);
+    if (!(len > 1e-12)) continue; // degenerate: no plane information
+    const nhat = [n[0] / len, n[1] / len, n[2] / len];
+    const w = clamp(len * 0.5, SURFACE_MIN_WEIGHT, SURFACE_MAX_WEIGHT);
+    const lo = [0, 1, 2].map((axis) =>
+      Math.max(0, Math.floor(Math.min(a[axis], b[axis], c[axis]) - 0.5)));
+    const hi = [0, 1, 2].map((axis) => Math.min(
+      [resolution.x, resolution.y, resolution.z][axis] - 1,
+      Math.floor(Math.max(a[axis], b[axis], c[axis]) + 0.5)));
+    for (let z = lo[2]; z <= hi[2]; z++) {
+      for (let y = lo[1]; y <= hi[1]; y++) {
+        for (let x = lo[0]; x <= hi[0]; x++) {
+          if (!triBoxOverlapCpu([x + 0.5, y + 0.5, z + 0.5], h, a, b, c)) continue;
+          const record = recordIndexOf(x, y, z);
+          if (record < 0) continue;
+          const localA = v3sub(a, [x, y, z]);
+          const localB = v3sub(b, [x, y, z]);
+          const localC = v3sub(c, [x, y, z]);
+          const centroid = [
+            (localA[0] + localB[0] + localC[0]) / 3,
+            (localA[1] + localB[1] + localC[1]) / 3,
+            (localA[2] + localB[2] + localC[2]) / 3,
+          ];
+          const d = v3dot(nhat, centroid);
+          const base = record * 6;
+          acc[base] += nhat[0] * w;
+          acc[base + 1] += nhat[1] * w;
+          acc[base + 2] += nhat[2] * w;
+          acc[base + 3] += w;
+          acc[base + 4] += d * w;
+          acc[base + 5] += d * d * w;
+          counts[record]++;
+          for (let axis = 0; axis < 3; axis++) {
+            cov[record * 3 + axis] |= rasterizeTriangleCoverageMask(localA, localB, localC, {
+              axis,
+              dilate: false,
+            });
+          }
+        }
+      }
+    }
+  }
+
+  // --- pass 3: finalize, simple-plane only.
+  let simpleCells = 0;
+  let unfittedCells = 0;
+  for (let local = 0; local < next; local++) {
+    const base = local * 6;
+    const weight = acc[base + 3];
+    const sumLen = weight > 0 ? Math.hypot(acc[base], acc[base + 1], acc[base + 2]) : 0;
+    if (!(weight > 0) || !(sumLen > 1e-6)) { unfittedCells++; continue; }
+    const coherence = sumLen / weight;
+    const nhat = [acc[base] / sumLen, acc[base + 1] / sumLen, acc[base + 2] / sumLen];
+    const dhat = acc[base + 4] / weight;
+    const variance = Math.max(0, acc[base + 5] / weight - dhat * dhat);
+    const sigma = Math.sqrt(variance);
+    const cornerRadius = 0.5 * (Math.abs(nhat[0]) + Math.abs(nhat[1]) + Math.abs(nhat[2]));
+    const centerProjection = 0.5 * (nhat[0] + nhat[1] + nhat[2]);
+    const planeInCell = Math.abs(dhat - centerProjection) <= cornerRadius + SIMPLE_PLANE_IN_CELL_EPSILON;
+    const simple = counts[local] <= maxTriangles &&
+      coherence >= minCoherence &&
+      sigma <= maxPlaneSigma &&
+      planeInCell;
+    if (!simple) { unfittedCells++; continue; }
+    simpleCells++;
+    const axis = dominantAxis(nhat);
+    const mask = cov[local * 3 + axis] & 0xffff;
+    const packed = packSimplePlaneRecord({
+      normal: nhat,
+      planeOffset: clamp(dhat, -CELL_LOCAL_PLANE_OFFSET_RANGE, CELL_LOCAL_PLANE_OFFSET_RANGE),
+      coverage: Math.min(255, Math.floor((popcount32(mask) / COVERAGE_TEXEL_COUNT) * 255)),
+      confidence: Math.min(255, Math.floor(coherence * 255)),
+      materialId: 0,
+      flags: packCoverageRecord({ mask, axis, valid: true, flags: SURFACE_FLAG_SIMPLE }),
+    });
+    records.set(packed, (dynamicBase + local) * SURFACE_RECORD_WORDS);
+  }
+
+  return { records, allocated: next, overflowBricks, simpleCells, unfittedCells };
+}
+
 /** Barycentric slack, mirroring the exact validator: shared edges stay sealed
  * against the f32 rounding the triangle pool applies to its vertices. */
 const COMPLEX_BARYCENTRIC_EPSILON = 1e-9;
@@ -1225,8 +1450,16 @@ export function traceHybridPlaneCpu(
 
     if (metadata.type === MacroCellType.Brick || metadata.type === MacroCellType.DynamicBrick) {
       lastBrick = true;
-      const useRecords = metadata.type === MacroCellType.Brick;
-      const surfaceOffset = words[brickHeaderWord(layout, macroIndex, BRICK_SURFACE_OFFSET_WORD)];
+      // DynamicBrick cells consult the per-chain DYNAMIC record tail via
+      // their own offset word (GPU parity); INVALID keeps box semantics.
+      const surfaceOffset = words[brickHeaderWord(
+        layout,
+        macroIndex,
+        metadata.type === MacroCellType.DynamicBrick
+          ? BRICK_DYNAMIC_OFFSET_WORD
+          : BRICK_SURFACE_OFFSET_WORD,
+      )];
+      const useRecords = surfaceOffset !== INVALID_RAY_HIT_INDEX;
       const low = words[brickHeaderWord(layout, macroIndex, BRICK_OCCUPANCY_LOW_WORD)];
       const high = words[brickHeaderWord(layout, macroIndex, BRICK_OCCUPANCY_HIGH_WORD)];
       let localT = t;
@@ -1255,7 +1488,7 @@ export function traceHybridPlaneCpu(
         if (hybridBrickOccupied(words, layout, voxel[0], voxel[1], voxel[2], resolution)) {
           const bit = voxelIndexInBrick(voxel[0] & 3, voxel[1] & 3, voxel[2] & 3);
           let recordResolved = false;
-          if (useRecords && surfaceOffset !== INVALID_RAY_HIT_INDEX) {
+          if (useRecords) {
             const record = (surfaceOffset + brickRank(low, high, bit)) * SURFACE_RECORD_WORDS;
             const flagsWord = records[record + SURFACE_FLAGS_WORD] >>> 0;
             const simple = ((flagsWord >>> COVERAGE_FLAGS_SHIFT) & SURFACE_FLAG_SIMPLE) !== 0;

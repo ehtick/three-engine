@@ -1783,11 +1783,15 @@ export class GISystem {
               // distances to those planes rather than voxel free-radius.
               // `__giLightShadowLegacyDda = true` restores the binary-voxel
               // arm for an A/B (build-time, like every hatch here).
-              // KNOWN LIMITS (why a silhouette can still read voxel-true):
-              // DynamicBrick cells — anything added or moved since the last
-              // FULL rebuild — deliberately ignore records (box semantics),
-              // and COMPLEX-classified cells (curved stone, thin double-face
-              // walls) only resolve to real triangles in exact-complex mode.
+              // DynamicBrick cells resolve through the per-chain DYNAMIC
+              // record tail (refit at the mover's pose every dispatch), so
+              // movers keep fitted-plane silhouettes while moving. KNOWN
+              // LIMITS (why a silhouette can still read voxel-true): static
+              // cells sharing a mover's brick refit unfitted (box) until the
+              // demote's full rebuild, tail overflow degrades that brick to
+              // box, and COMPLEX-classified cells (curved stone, thin
+              // double-face walls) only resolve to real triangles in
+              // exact-complex mode.
               if (recordMarch) {
                 // Tiered macro budget like the legacy arm — the cap only binds
                 // on long grazing rays (the frames where shadow cost spikes),
@@ -2299,7 +2303,8 @@ export class GISystem {
       occField.readbackSurfaceAlloc(renderer).then((alloc) => {
         if (this.state !== state || !alloc) return;
         const line = `[gi] surface records: ${alloc.allocated}/${alloc.capacity} claimed` +
-          `, triangles ${alloc.triangles}/${alloc.triangleCapacity}`;
+          `, triangles ${alloc.triangles}/${alloc.triangleCapacity}` +
+          `, dynamic tail ${alloc.dynamicAllocated}/${alloc.dynamicCapacity}`;
         // TWO DIFFERENT degradations, two different remedies — do not conflate:
         // pool starvation (claims denied → whole bricks boxed; the capacity is
         // wrong) vs the per-cell exact-triangle cap (a dense cell exceeds
@@ -2317,6 +2322,16 @@ export class GISystem {
           );
         } else {
           console.log(line);
+        }
+        // The dynamic tail describes the LAST chain only (its cursor resets
+        // every dispatch), so at boot this is usually 0/0 — the warn matters
+        // when a large mover was live during the audited frame.
+        if (alloc.dynamicOverflowBricks > 0) {
+          console.warn(
+            `[gi] dynamic record tail STARVED: ${alloc.dynamicOverflowBricks} mover bricks ` +
+              `degraded to voxel-box hits this chain (${alloc.dynamicAllocated}/` +
+              `${alloc.dynamicCapacity} claimed). Raise dynamicSurfaceRecordCapacity.`,
+          );
         }
       });
     }

@@ -75,7 +75,7 @@ import { sharedFn } from "./giFn.js";
 import { createRayHitDebugBuffer } from "./rayHit/RayHitDebug.js";
 import { octDecodeTSL, octEncodeTSL } from "./rayHit/rayHitTSL.js";
 import {
-  BRICK_COMPLEX_OFFSET_WORD,
+  BRICK_DYNAMIC_OFFSET_WORD,
   BRICK_HEADER_WORDS,
   BRICK_OCCUPANCY_HIGH_WORD,
   BRICK_OCCUPANCY_LOW_WORD,
@@ -228,6 +228,22 @@ export function createOccupancyField(bounds, res0, options = {}) {
   const complexTriangleCapacity = complexEnabled
     ? Math.min(1 << 21, Math.max(1 << 12, options.complexTriangleCapacity ?? surfaceCapacity * 2))
     : 0;
+  // DYNAMIC RECORD REFIT: a reserved TAIL of the record pool, re-fitted for
+  // the DynamicBrick set on EVERY chain (fast ones included) so movers keep
+  // exact fitted-plane silhouettes instead of degrading to occupied-box hits
+  // for as long as they move ("shadows must be smooth and follow silhouettes
+  // exactly" is the standing product requirement — a moving character is
+  // permanently dynamic, so the records-off window was not an edge case).
+  // Dynamic records live ONE dispatch: the tail cursor resets each chain and
+  // every DynamicBrick re-allocates, so there is no invalidation problem to
+  // solve. Sized for mover SURFACE voxels, which are a tiny fraction of the
+  // static scene's; overflow degrades that brick to box fallback and counts
+  // a diagnostic — never a miss (same contract as the static pool).
+  const dynamicSurfaceCapacity = surfaceEnabled
+    ? Math.min(1 << 16, Math.max(1 << 12,
+        options.dynamicSurfaceRecordCapacity ?? Math.ceil(surfaceCapacity / 16)))
+    : 0;
+  const totalSurfaceCapacity = surfaceCapacity + dynamicSurfaceCapacity;
   // Phase 5: the conservative pyramid ride (levels 3-4) has been ALWAYS-ON
   // since Phase 1, so its cost/benefit was never isolable. This is the A/B
   // kill switch, default on: disabled the traces start at level 2 and the
@@ -265,7 +281,11 @@ export function createOccupancyField(bounds, res0, options = {}) {
   // ────────────────────────────────────────────────────────────── the bitsets
   const hybridWordOffset = totalWords;
   const surfaceWordOffset = totalWords + (hybridEnabled ? hybridLayout.totalWords : 0);
-  const trianglePoolWordOffset = surfaceWordOffset + surfaceCapacity * SURFACE_RECORD_WORDS;
+  // The record region carries the static pool followed by the dynamic tail —
+  // dynamic record ids are plain pool indices >= surfaceCapacity, so every
+  // consumer's `surfaceWordOffset + record * SURFACE_RECORD_WORDS` arithmetic
+  // covers both without a second base.
+  const trianglePoolWordOffset = surfaceWordOffset + totalSurfaceCapacity * SURFACE_RECORD_WORDS;
   const bits = instancedArray(new Uint32Array(
     trianglePoolWordOffset + complexTriangleCapacity * COMPLEX_TRIANGLE_WORDS,
   ), "uint");
@@ -277,13 +297,15 @@ export function createOccupancyField(bounds, res0, options = {}) {
   // unchanged and legacy-only builds allocate no tail at all.
   // Build-only scratch for the surface fit (fixed-point atomic accumulators)
   // and the pool allocator [recordNext, overflowBricks, triangleNext,
-  // complexOverflowCells]. Bound exclusively in build kernels, which sit far
-  // below the binding wall.
+  // complexOverflowCells, dynRecordNext, dynOverflowBricks, spare, spare].
+  // Bound exclusively in build kernels, which sit far below the binding wall.
+  // The scratch covers the dynamic tail too — dynamic records reuse the same
+  // fixed-point fit, just cleared and refilled every chain.
   const surfScratch = surfaceEnabled
-    ? instancedArray(new Int32Array(surfaceCapacity * SURFACE_SCRATCH_WORDS), "int").toAtomic()
+    ? instancedArray(new Int32Array(totalSurfaceCapacity * SURFACE_SCRATCH_WORDS), "int").toAtomic()
     : null;
   const surfAlloc = surfaceEnabled
-    ? instancedArray(new Uint32Array(4), "uint").toAtomic()
+    ? instancedArray(new Uint32Array(8), "uint").toAtomic()
     : null;
 
   // ── STATIC/DYNAMIC SPLIT ──────────────────────────────────────────────────
@@ -423,10 +445,11 @@ export function createOccupancyField(bounds, res0, options = {}) {
     totalWords,
     bytes: (
       totalWords + level0.words + (hybridEnabled ? hybridLayout.totalWords : 0) +
-      surfaceCapacity * (SURFACE_RECORD_WORDS + SURFACE_SCRATCH_WORDS) +
+      totalSurfaceCapacity * (SURFACE_RECORD_WORDS + SURFACE_SCRATCH_WORDS) +
       complexTriangleCapacity * COMPLEX_TRIANGLE_WORDS
     ) * 4,
     surfaceCapacity,
+    dynamicSurfaceCapacity,
     complexTriangleCapacity,
     triangles: 0,
     pairs: 0,
@@ -824,9 +847,11 @@ export function createOccupancyField(bounds, res0, options = {}) {
   //    owns them, and this kernel re-runs on every FAST (dynamic-only) chain,
   //    where clobbering them would erase the static allocation;
   //  · a brick whose mask contains any bit ABSENT from the static snapshot is
-  //    typed DynamicBrick. The plane path ignores records in such bricks (the
-  //    records were fitted and rank-addressed against the static mask), while
-  //    traversal still visits them with occupied-box semantics.
+  //    typed DynamicBrick. The plane path ignores the STATIC records in such
+  //    bricks (they were fitted and rank-addressed against the static mask)
+  //    and reads the per-chain DYNAMIC record tail instead, which the refit
+  //    passes at the end of every chain rank against the merged masks this
+  //    kernel just wrote.
   const hybridBuildCompute = hybridEnabled
     ? Fn(() => {
         const macroIndex = instanceIndex.toVar();
@@ -908,19 +933,20 @@ export function createOccupancyField(bounds, res0, options = {}) {
         bits.element(uint(hybridWordOffset).add(brickBase).add(uint(BRICK_OCCUPANCY_HIGH_WORD))).assign(high);
         if (!surfaceEnabled) {
           bits.element(uint(hybridWordOffset).add(brickBase).add(uint(BRICK_SURFACE_OFFSET_WORD))).assign(uint(INVALID_RAY_HIT_INDEX));
-          bits.element(uint(hybridWordOffset).add(brickBase).add(uint(BRICK_COMPLEX_OFFSET_WORD))).assign(uint(INVALID_RAY_HIT_INDEX));
+          bits.element(uint(hybridWordOffset).add(brickBase).add(uint(BRICK_DYNAMIC_OFFSET_WORD))).assign(uint(INVALID_RAY_HIT_INDEX));
         }
       })().compute(hybridLayout.macroCellCount)
     : null;
 
   // ══════════════════════════════════ SHADER: Phase-2 surface-record build
-  // Three passes, run on FULL chains only, against the STATIC-ONLY level-0
-  // state (they sit between the static-stage hybridBuild and the dynamic
-  // voxelize in passes()). Records are therefore fitted and rank-addressed
-  // against the static brick masks, which is what makes them remain valid on
-  // every FAST chain: static bits never change between full rebuilds, and
-  // bricks that gain dynamic bits are typed DynamicBrick, which the tracer
-  // reads as "ignore the records here".
+  // Three passes. The STATIC side runs on FULL chains only, against the
+  // STATIC-ONLY level-0 state (they sit between the static-stage hybridBuild
+  // and the dynamic voxelize in passes()). Records are therefore fitted and
+  // rank-addressed against the static brick masks, which is what makes them
+  // remain valid on every FAST chain: static bits never change between full
+  // rebuilds. Bricks that gain dynamic bits are typed DynamicBrick — the
+  // tracer ignores the STATIC records there and consults the per-chain
+  // DYNAMIC record tail instead (see the dynamic-tail refit passes below).
 
   /** Zero the fit scratch and the pool allocator. */
   const surfClearCompute = surfaceEnabled
@@ -956,22 +982,32 @@ export function createOccupancyField(bounds, res0, options = {}) {
           });
         });
         bits.element(brickBase.add(uint(BRICK_SURFACE_OFFSET_WORD))).assign(offset);
-        bits.element(brickBase.add(uint(BRICK_COMPLEX_OFFSET_WORD))).assign(uint(INVALID_RAY_HIT_INDEX));
+        bits.element(brickBase.add(uint(BRICK_DYNAMIC_OFFSET_WORD))).assign(uint(INVALID_RAY_HIT_INDEX));
       })().compute(hybridLayout.macroCellCount)
     : null;
 
   /**
    * Accumulation: the voxelizer's own (slot, triangle, chunk) work list and
-   * SAT test, STATIC slots only. Every conservative triangle/voxel overlap
-   * adds fixed-point area-weighted plane terms and three dominant-axis
-   * coverage projections to the voxel's record scratch. Integer atomics make
-   * the result order-independent, i.e. deterministic across dispatches.
+   * SAT test, one side of the static/dynamic split at a time. Every
+   * conservative triangle/voxel overlap adds fixed-point area-weighted plane
+   * terms and three dominant-axis coverage projections to the voxel's record
+   * scratch. Integer atomics make the result order-independent, i.e.
+   * deterministic across dispatches.
    * A BUILDER like buildVoxelizeCompute: closes over the geometry buffers.
+   *
+   * `filter` mirrors buildVoxelizeCompute's: "static" (full chain, records
+   * rank-addressed via the STATIC offset word against static masks) or
+   * "dynamic" (every chain, records rank-addressed via the DYNAMIC offset
+   * word against the final MERGED masks — the fit runs after the last
+   * hybridBuild, so the masks it ranks against are the ones the tracer
+   * reads). Threads on the other side of the split exit after two reads,
+   * same deliberate trade as the voxelizer's.
    */
   const buildSurfAccumCompute = surfaceEnabled
-    ? () => Fn(() => {
+    ? (filter = "static") => Fn(() => {
         const slot = pairSlot.element(instanceIndex).toVar();
-        If(slotDynamic.element(slot.toInt()).notEqual(float(0)), () => {
+        const want = filter === "dynamic" ? 1 : 0;
+        If(slotDynamic.element(slot.toInt()).notEqual(float(want)), () => {
           Return();
         });
         const tri = pairTri.element(instanceIndex).toVar();
@@ -1030,7 +1066,13 @@ export function createOccupancyField(bounds, res0, options = {}) {
                 .mul(uint(hybridLayout.macroResolution.x)).add(mxq).toVar();
               const brickBase = uint(hybridWordOffset + hybridLayout.brickHeaderOffset)
                 .add(macroIndex.mul(uint(BRICK_HEADER_WORDS))).toVar();
-              const surfOffset = bits.element(brickBase.add(uint(BRICK_SURFACE_OFFSET_WORD))).toVar();
+              // The dynamic variant reads its own offset word — INVALID on
+              // every brick the dynamic allocator did not claim, so the gate
+              // below scopes it to DynamicBrick bricks for free.
+              const offsetWord = filter === "dynamic"
+                ? BRICK_DYNAMIC_OFFSET_WORD
+                : BRICK_SURFACE_OFFSET_WORD;
+              const surfOffset = bits.element(brickBase.add(uint(offsetWord))).toVar();
               If(surfOffset.notEqual(uint(INVALID_RAY_HIT_INDEX)), () => {
                 const low = bits.element(brickBase.add(uint(BRICK_OCCUPANCY_LOW_WORD))).toVar();
                 const high = bits.element(brickBase.add(uint(BRICK_OCCUPANCY_HIGH_WORD))).toVar();
@@ -1047,7 +1089,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
                   const belowHigh = select(inLow, uint(0), shiftLeft(uint(1), bitAnd(bitIdx, uint(31))).sub(uint(1)));
                   const rank = countOneBits(bitAnd(low, belowLow)).add(countOneBits(bitAnd(high, belowHigh)));
                   const record = surfOffset.add(rank).toVar();
-                  If(record.lessThan(uint(surfaceCapacity)), () => {
+                  If(record.lessThan(uint(totalSurfaceCapacity)), () => {
                     const sBase = record.mul(uint(SURFACE_SCRATCH_WORDS)).toVar();
                     const cellOrigin = vec3(vx, vy, vz).toVar();
                     const dLocal = nHat.dot(centroid.sub(cellOrigin)).toVar();
@@ -1124,9 +1166,10 @@ export function createOccupancyField(bounds, res0, options = {}) {
    * body on the normal would have hidden exactly those cells from the complex
    * path.
    */
-  const surfFinalizeCompute = surfaceEnabled
-    ? Fn(() => {
-        const record = instanceIndex.toVar();
+  const makeSurfFinalizeCompute = (baseRecord, recordCount, allowComplex) => Fn(() => {
+        const record = baseRecord === 0
+          ? instanceIndex.toVar()
+          : instanceIndex.add(uint(baseRecord)).toVar();
         const sBase = record.mul(uint(SURFACE_SCRATCH_WORDS)).toVar();
         const rBase = uint(surfaceWordOffset).add(record.mul(uint(SURFACE_RECORD_WORDS))).toVar();
         const inv = float(1 / SURFACE_FIT_SCALE);
@@ -1205,7 +1248,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
               simpleTaken.assign(1);
             });
           });
-          if (complexEnabled) {
+          if (allowComplex) {
             // Reserve, never write: the pool cursor is claimed here so the
             // range is known before the geometry pass runs, and word 6 (the
             // overlap count this thread just read) is reset to 0 so that pass
@@ -1239,7 +1282,17 @@ export function createOccupancyField(bounds, res0, options = {}) {
         bits.element(rBase.add(uint(1))).assign(packedPlane);
         bits.element(rBase.add(uint(2))).assign(packedMaterial);
         bits.element(rBase.add(uint(3))).assign(packedFlags);
-      })().compute(surfaceCapacity)
+      })().compute(recordCount);
+  const surfFinalizeCompute = surfaceEnabled
+    ? makeSurfFinalizeCompute(0, surfaceCapacity, complexEnabled)
+    : null;
+  // Dynamic-tail finalize: same classification, but a dynamic record that
+  // fails the simple fit stays zero (box fallback for that cell) instead of
+  // reserving a complex triangle range — the triangle pool and its write pass
+  // are full-chain machinery, and a mover cell dense enough to need exact
+  // triangles is not worth re-writing the pool every frame for.
+  const dynSurfFinalizeCompute = surfaceEnabled
+    ? makeSurfFinalizeCompute(surfaceCapacity, dynamicSurfaceCapacity, false)
     : null;
 
   /**
@@ -1383,6 +1436,67 @@ export function createOccupancyField(bounds, res0, options = {}) {
           });
         });
       })().compute(Math.max(1, pairCount))
+    : null;
+
+  // ═══════════════════════ SHADER: dynamic-tail record refit (EVERY chain)
+  // Movers get fitted-plane records too. These passes run at the END of both
+  // chains, after the final hybridBuild has landed the MERGED masks and the
+  // DynamicBrick typing they allocate and rank against. The tail cursor
+  // resets every dispatch — dynamic records live exactly one chain, so a
+  // mover's records are refit at its new pose every frame it moves and there
+  // is no staleness to invalidate. Cost scales with the DynamicBrick set
+  // (the mover's own footprint), not the scene.
+
+  /** Zero the dynamic tail's fit scratch and its allocator words. */
+  const dynSurfClearCompute = surfaceEnabled
+    ? Fn(() => {
+        atomicStore(
+          surfScratch.element(instanceIndex.add(uint(surfaceCapacity * SURFACE_SCRATCH_WORDS))),
+          int(0),
+        );
+        If(instanceIndex.lessThan(uint(2)), () => {
+          atomicStore(surfAlloc.element(instanceIndex.add(uint(4))), uint(0));
+        });
+      })().compute(dynamicSurfaceCapacity * SURFACE_SCRATCH_WORDS)
+    : null;
+
+  /**
+   * One dynamic record per occupied voxel of every DynamicBrick, addressed by
+   * the voxel's rank in the MERGED brick mask (static bits included: the
+   * tracer ranks against the same merged mask, and a brick's static cells
+   * simply finalize as unfitted → box fallback, never a miss). Writes the
+   * brick's tail offset — or INVALID — into BRICK_DYNAMIC_OFFSET_WORD, which
+   * every chain rewrites for every brick, so a brick that stopped being
+   * dynamic can never serve a stale offset.
+   */
+  const dynSurfAllocCompute = surfaceEnabled
+    ? Fn(() => {
+        const macroIndex = instanceIndex.toVar();
+        const metadata = bits.element(
+          uint(hybridWordOffset).add(macroIndex.mul(uint(MACRO_CELL_WORDS))).add(uint(MACRO_CELL_METADATA_WORD)),
+        ).toVar();
+        const cellType = bitAnd(
+          shiftRight(metadata, uint(MACRO_CELL_TYPE_SHIFT)),
+          uint(MACRO_CELL_TYPE_MASK),
+        ).toVar();
+        const brickBase = uint(hybridWordOffset + hybridLayout.brickHeaderOffset)
+          .add(macroIndex.mul(uint(BRICK_HEADER_WORDS))).toVar();
+        const offset = uint(INVALID_RAY_HIT_INDEX).toVar();
+        If(cellType.equal(uint(MacroCellType.DynamicBrick)), () => {
+          const low = bits.element(brickBase.add(uint(BRICK_OCCUPANCY_LOW_WORD))).toVar();
+          const high = bits.element(brickBase.add(uint(BRICK_OCCUPANCY_HIGH_WORD))).toVar();
+          const count = countOneBits(low).add(countOneBits(high)).toVar();
+          If(count.greaterThan(uint(0)), () => {
+            const base = atomicAdd(surfAlloc.element(4), count).toVar();
+            If(base.add(count).lessThanEqual(uint(dynamicSurfaceCapacity)), () => {
+              offset.assign(uint(surfaceCapacity).add(base));
+            }).Else(() => {
+              atomicAdd(surfAlloc.element(5), uint(1));
+            });
+          });
+        });
+        bits.element(brickBase.add(uint(BRICK_DYNAMIC_OFFSET_WORD))).assign(offset);
+      })().compute(hybridLayout.macroCellCount)
     : null;
 
   const traceBody = (origin, dir, tMin, tMax, steps, topLevel, penK = null, profile = false) => {
@@ -1955,9 +2069,12 @@ export function createOccupancyField(bounds, res0, options = {}) {
    * ray keep marching. That continuation is the accuracy improvement over
    * occupied-box hits (a grazing ray no longer stops at a voxel face the
    * surface never crosses). Any cell without a usable record — complex fit,
-   * pool overflow, DynamicBrick, not yet fitted — keeps the exact legacy
-   * occupied-box semantics, so classification can tighten accuracy but can
-   * never widen a leak beyond the bounded plane acceptance itself.
+   * pool overflow, not yet fitted — keeps the exact legacy occupied-box
+   * semantics, so classification can tighten accuracy but can never widen a
+   * leak beyond the bounded plane acceptance itself. DynamicBrick cells read
+   * the per-chain DYNAMIC record tail (refit at the mover's current pose
+   * every dispatch), falling back to the same box semantics wherever the
+   * tail has no usable record.
    *
    * `opts.exact` (Phase 4, HybridExactComplex) adds one more branch, between
    * the plane test and that box fallback: a cell marked COMPLEX carries its
@@ -2147,9 +2264,11 @@ export function createOccupancyField(bounds, res0, options = {}) {
                   select(macroDelta.equal(ty), float(1), float(2)),
                 ).toVar();
 
-                // DynamicBrick bricks are traversed too — with occupied-box
-                // semantics only, because their records (if any) were fitted
-                // and rank-addressed against the static mask.
+                // DynamicBrick bricks resolve through the per-chain DYNAMIC
+                // record tail: their offset word was rewritten by this very
+                // dispatch's refit, ranked against the same merged masks read
+                // below. INVALID there (refit off, tail overflow, demoted
+                // mid-frame) keeps the occupied-box semantics — never a miss.
                 const isStaticBrick = cellType.equal(uint(MacroCellType.Brick)).toVar();
                 If(isStaticBrick.or(cellType.equal(uint(MacroCellType.DynamicBrick))), () => {
                   lastBrick.assign(1);
@@ -2169,11 +2288,13 @@ export function createOccupancyField(bounds, res0, options = {}) {
                   const occupancyHigh = bits.element(
                     brickBase.add(uint(BRICK_OCCUPANCY_HIGH_WORD)),
                   ).toVar();
-                  const surfOffset = bits.element(
-                    brickBase.add(uint(BRICK_SURFACE_OFFSET_WORD)),
+                  const surfOffset = select(
+                    isStaticBrick,
+                    bits.element(brickBase.add(uint(BRICK_SURFACE_OFFSET_WORD))),
+                    bits.element(brickBase.add(uint(BRICK_DYNAMIC_OFFSET_WORD))),
                   ).toVar();
-                  const useRecords = isStaticBrick
-                    .and(surfOffset.notEqual(uint(INVALID_RAY_HIT_INDEX))).toVar();
+                  const useRecords = surfOffset
+                    .notEqual(uint(INVALID_RAY_HIT_INDEX)).toVar();
                   const localT = t.toVar();
                   const localResolved = float(0).toVar();
                   const localAxis = axis.toVar();
@@ -2248,7 +2369,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
                         const rank = countOneBits(bitAnd(occupancyLow, belowLow))
                           .add(countOneBits(bitAnd(occupancyHigh, belowHigh)));
                         const record = surfOffset.add(rank).toVar();
-                        If(record.lessThan(uint(surfaceCapacity)), () => {
+                        If(record.lessThan(uint(totalSurfaceCapacity)), () => {
                           const rBase = uint(surfaceWordOffset)
                             .add(record.mul(uint(SURFACE_RECORD_WORDS))).toVar();
                           const flagsWord = bits.element(rBase.add(uint(3))).toVar();
@@ -3198,10 +3319,15 @@ export function createOccupancyField(bounds, res0, options = {}) {
         // voxelize and the dynamic one: an extra copy+hybridBuild lands the
         // STATIC-ONLY state in the pyramid/brick tail, the surface passes
         // allocate and fit against those static masks, and only then does the
-        // dynamic side stack on top. Fast chains never touch the records or
-        // the pool — static bits cannot have changed, and bricks that gain
-        // dynamic bits get typed DynamicBrick by the final hybridBuild, which
-        // the tracer reads as "box semantics here".
+        // dynamic side stack on top. Fast chains never touch the STATIC
+        // records or their pool — static bits cannot have changed.
+        //
+        // The DYNAMIC record tail is the opposite: it rides EVERY chain, after
+        // the final hybridBuild, so bricks typed DynamicBrick get fresh
+        // fitted-plane records ranked against the merged masks that same
+        // dispatch. That is what keeps a mover's shadow silhouette exact
+        // while it moves — before this, DynamicBrick meant box semantics for
+        // the whole promote window.
         const voxStatic = buildVoxelizeCompute("static");
         const voxDynamic = buildVoxelizeCompute("dynamic");
         const surfaceChain = surfaceEnabled
@@ -3214,6 +3340,12 @@ export function createOccupancyField(bounds, res0, options = {}) {
               ...(buildComplexWriteCompute ? [buildComplexWriteCompute()] : []),
             ]
           : [];
+        const dynamicSurfaceChain = surfaceEnabled
+          ? [
+              dynSurfClearCompute, dynSurfAllocCompute,
+              buildSurfAccumCompute("dynamic"), dynSurfFinalizeCompute,
+            ]
+          : [];
         computes = {
           full: [
             // Fresh clear per geometry change — see buildClearCompute's note:
@@ -3224,11 +3356,13 @@ export function createOccupancyField(bounds, res0, options = {}) {
             ...surfaceChain,
             voxDynamic, copyCompute, ...downsampleComputes,
             ...(hybridBuildCompute ? [hybridBuildCompute] : []),
+            ...dynamicSurfaceChain,
           ],
           fast: [
             restoreStaticBitsCompute, buildRestoreStaticAttrCompute(),
             voxDynamic, copyCompute, ...downsampleComputes,
             ...(hybridBuildCompute ? [hybridBuildCompute] : []),
+            ...dynamicSurfaceChain,
           ],
         };
         computesRevision = geometryRevision;
@@ -3257,10 +3391,13 @@ export function createOccupancyField(bounds, res0, options = {}) {
      */
     hasSurfaceRecords: surfaceEnabled,
     surfaceCapacity,
+    dynamicSurfaceCapacity,
     rayHitDebug,
     /**
      * Pool allocator readback [recordNext, overflowBricks, triangleNext,
-     * complexOverflowCells] — diagnostics only.
+     * complexOverflowCells, dynRecordNext, dynOverflowBricks] — diagnostics
+     * only. The dynamic pair describes the LAST chain (the tail cursor resets
+     * every dispatch), so with a mover live it is that frame's refit demand.
      */
     async readbackSurfaceAlloc(renderer) {
       if (!surfAlloc) return null;
@@ -3272,6 +3409,9 @@ export function createOccupancyField(bounds, res0, options = {}) {
         triangles: data[2] ?? 0,
         complexOverflowCells: data[3] ?? 0,
         triangleCapacity: complexTriangleCapacity,
+        dynamicAllocated: data[4] ?? 0,
+        dynamicOverflowBricks: data[5] ?? 0,
+        dynamicCapacity: dynamicSurfaceCapacity,
       };
     },
     occupiedAtWorld,
