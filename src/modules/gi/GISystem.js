@@ -899,31 +899,45 @@ export class GISystem {
           camera.matrixWorldInverse,
         );
       }
-      let lightHash = 0;
+      // VELOCITY-SCALED MEMORY. Moving lights are the DESIGN CASE here, not
+      // an edge case — the user's sun is script-driven ("we never meant to
+      // do those lights static"). Two earlier designs failed it: a flush on
+      // any transform change turned a per-frame script write into a
+      // PERMANENT flush (accumulation never engaged — the "grainy, dirty,
+      // hard dithered edge" trio is the un-accumulated estimator), and a
+      // binary moved/still split would still gut the memory for a slow day
+      // cycle whose shadow edge moves sub-pixel per frame. A moving light
+      // only makes history STALE, never wrong-surface, so the memory depth
+      // follows the measured angular velocity: imperceptible motion keeps
+      // ~32 effective sun samples (0.94), a fast gizmo drag drops to ~7
+      // (0.86 → a few frames of trailing softness on the sweeping edge,
+      // the standard real-time-shadows trade). Intensity changes are
+      // deliberately ignored — the shadow factor is pure visibility.
+      let motion = 0;
+      this._giShadowLightPrev ??= new WeakMap();
       for (const light of this._lightObjects ?? []) {
         const e = light.matrixWorld.elements;
-        lightHash =
-          (lightHash * 31 + e[12] * 7.1 + e[13] * 13.3 + e[14] * 3.7 + e[8] * 101 + e[9] * 57 + e[10] * 23 + light.intensity) % 1e9;
+        let prev = this._giShadowLightPrev.get(light);
+        if (!prev) {
+          prev = { dir: new THREE.Vector3(), pos: new THREE.Vector3(), seeded: false };
+          this._giShadowLightPrev.set(light, prev);
+        }
+        if (prev.seeded) {
+          // z-column delta ≈ radians for small rotations; translation folds
+          // in at 5cm ≈ 1° so dollying a point light shortens memory too.
+          const dirDelta = Math.hypot(e[8] - prev.dir.x, e[9] - prev.dir.y, e[10] - prev.dir.z);
+          const posDelta = Math.hypot(e[12] - prev.pos.x, e[13] - prev.pos.y, e[14] - prev.pos.z);
+          motion = Math.max(motion, dirDelta + posDelta * 0.05);
+        }
+        prev.dir.set(e[8], e[9], e[10]);
+        prev.pos.set(e[12], e[13], e[14]);
+        prev.seeded = true;
       }
       const temporalOn = globalThis.__giShadowTemporal !== false;
-      const lightsMoved = lightHash !== this._giShadowLightHash;
-      this._giShadowLightHash = lightHash;
-      // The jitter animates ONLY while history accumulates. Two rules, both
-      // learned from "extremely jumpy" reports:
-      //   · temporal off (`__giShadowTemporal = false`) → frame held at 0,
-      //     the pre-temporal static dither exactly;
-      //   · a MOVING light flushes history (below) — the jitter must FREEZE
-      //     at its current phase for those frames, or the whole screen
-      //     strobes with fresh noise every frame of a sun drag. Frozen
-      //     phase + zero history = the old stable dither while dragging;
-      //     release the light and accumulation resumes the same frame.
-      if (temporalOn && !lightsMoved) this._giShadowFrameU.value = this._frame % 4096;
-      else if (!temporalOn) this._giShadowFrameU.value = 0;
-      // 0.94 ≈ 32 effective sun samples (was 0.9 ≈ 19 — visibly mottled in
-      // wide penumbras). The staleness cases this lag could hurt are all
-      // handled upstream: light motion flushes, camera motion reprojects,
-      // mover surfaces fail position validation and reset per-pixel.
-      this._giShadowHistWeightU.value = temporalOn && !lightsMoved ? 0.94 : 0;
+      this._giShadowFrameU.value = temporalOn ? this._frame % 4096 : 0;
+      this._giShadowHistWeightU.value = temporalOn
+        ? Math.min(0.94, Math.max(0.86, 0.94 - motion * 30))
+        : 0;
       // Live lift A/B for the wall-leak question (`__giShadowLift`, voxels;
       // default 1.5 = shipped behaviour).
       if (state.screen.lightShadow?.liftFactor) {
