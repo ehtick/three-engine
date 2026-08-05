@@ -381,6 +381,22 @@ if (process.env.BOXTEST) {
   await page.screenshot({ path: "scripts/gi-boxtest-records.png" });
   console.log("  BOXTEST records arm -> scripts/gi-boxtest-records.png");
 
+  // ROTATE-AND-SETTLE arm — the user's exact repro ("when I rotate it a bit,
+  // it gets cubic"): a matrix write flips the slot DYNAMIC (records ignored,
+  // box shadows — expected in the first shot), and the 90-quiet-frame demote
+  // + staticDirty full chain should refit records at the new pose (second
+  // shot). If the second shot is still cubic, the demote path is broken —
+  // that would make ANY touched object permanently voxel-shadowed.
+  await page.evaluate(() => {
+    const m = globalThis.__BOXTEST_MESH__;
+    if (m) { m.rotation.y += 0.35; m.updateMatrixWorld(true); }
+  });
+  await wait(2000);
+  await page.screenshot({ path: "scripts/gi-boxtest-justrotated.png" });
+  await wait(9000);
+  await page.screenshot({ path: "scripts/gi-boxtest-settled.png" });
+  console.log("  BOXTEST rotate arms -> justrotated (dynamic window) / settled (post-demote)");
+
   // Legacy arm: the hatch is read at resolve build; toggling profiling back
   // is the structural flip that forces the rebuild re-reading it.
   await page.evaluate(() => { globalThis.__giLightShadowLegacyDda = true; });

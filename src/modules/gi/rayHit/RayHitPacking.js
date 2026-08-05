@@ -19,7 +19,12 @@ export const BRICK_VOXEL_COUNT = 64;
 // rays even WITHOUT the coarse ride — and exhaustion used to fail open.
 export const MAX_MACRO_STEPS = 192;
 export const MAX_BRICK_STEPS = 16;
-export const MAX_COMPLEX_TRIANGLES = 16;
+// 32, not 16: measured on Sponza-ultra, 12,423 cells exceeded 16 triangles
+// (banner cloth, vase ornament, trim) and every one of them kept voxel-box
+// hits — visibly cubic shadows from static architecture with records live.
+// The packed count field addresses up to 63; the trace loop Break()s at the
+// cell's actual count, so the higher bound costs nothing outside dense cells.
+export const MAX_COMPLEX_TRIANGLES = 32;
 
 export const MACRO_CELL_WORDS = 2;
 export const BRICK_HEADER_WORDS = 4;
