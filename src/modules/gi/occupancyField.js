@@ -67,9 +67,9 @@
 import * as THREE from "three/webgpu";
 import {
   Break, Fn, If, Loop, Return, atomicAdd, atomicLoad, atomicMax, atomicOr, atomicStore, bitAnd, bitOr,
-  countOneBits, float, floatBitsToUint, floor, instanceIndex, instancedArray, int, mod, packSnorm2x16,
-  select, shiftLeft, shiftRight, uint, uintBitsToFloat, uniform, uniformArray, unpackSnorm2x16, vec2,
-  vec3, vec4,
+  countOneBits, exp2, float, floatBitsToUint, floor, instanceIndex, instancedArray, int, log2, mix, mod,
+  packSnorm2x16, select, shiftLeft, shiftRight, uint, uintBitsToFloat, uniform, uniformArray,
+  unpackSnorm2x16, vec2, vec3, vec4,
 } from "three/tsl";
 import { sharedFn } from "./giFn.js";
 import { createRayHitDebugBuffer } from "./rayHit/RayHitDebug.js";
@@ -175,6 +175,37 @@ function planLevels(res0) {
     offset += words;
   }
   return { levels, totalWords: offset };
+}
+
+/**
+ * DENSITY PYRAMID layout — the cone trace's medium. One u8 per coarse cell
+ * (levels 1..4, packed 4-per-word) holding the FRACTION of the cell's level-0
+ * descendants whose occupancy bit is set, scaled to 0..255.
+ *
+ * WHY IT EXISTS: the OR-downsampled bits answer "is ANYTHING here" — perfect
+ * for empty-space skipping, catastrophic as a cone-trace density (one twig in
+ * an 8³-voxel cell reads fully solid, so every wide-cone shadow over-darkens
+ * to a black blob; that failure mode is most of why classic voxel cone tracing
+ * looks muddy). The fraction is the honest per-cell coverage the cone
+ * accumulator wants, it downsamples exactly (a parent's fraction is the mean
+ * of its 8 children's), and at Sponza-ultra scale the whole thing is ~0.7 MB
+ * appended inside the SAME `bits` buffer — zero new bindings at the
+ * 8-storage-buffer wall, the module's standing allocation rule.
+ *
+ * Offsets here are RELATIVE to the density region base; level 0 has no entry
+ * (its "fraction" is the bit itself).
+ */
+function planDensityLevels(levels) {
+  const densityLevels = [];
+  let offset = 0;
+  for (let L = 1; L < OCC_LEVELS; L++) {
+    const res = levels[L].res;
+    const cells = res.x * res.y * res.z;
+    const words = Math.ceil(cells / 4);
+    densityLevels.push({ level: L, res, cells, words, offset });
+    offset += words;
+  }
+  return { densityLevels, totalWords: offset };
 }
 
 /** Rounds a wanted level-0 resolution up so all OCC_LEVELS halve exactly. */
@@ -298,8 +329,12 @@ export function createOccupancyField(bounds, res0, options = {}) {
   // consumer's `surfaceWordOffset + record * SURFACE_RECORD_WORDS` arithmetic
   // covers both without a second base.
   const trianglePoolWordOffset = surfaceWordOffset + totalSurfaceCapacity * SURFACE_RECORD_WORDS;
+  // Cone-trace density region (see planDensityLevels) — appended last so every
+  // existing offset stays byte-identical.
+  const densityPlan = planDensityLevels(levels);
+  const densityWordOffset = trianglePoolWordOffset + totalComplexTriangleCapacity * COMPLEX_TRIANGLE_WORDS;
   const bits = instancedArray(new Uint32Array(
-    trianglePoolWordOffset + totalComplexTriangleCapacity * COMPLEX_TRIANGLE_WORDS,
+    densityWordOffset + densityPlan.totalWords,
   ), "uint");
   const atomicBits = instancedArray(new Uint32Array(level0.words), "uint").toAtomic();
   // Phase-1 macrocell/brick records, the Phase-2 surface-record pool and the
@@ -458,7 +493,8 @@ export function createOccupancyField(bounds, res0, options = {}) {
     bytes: (
       totalWords + level0.words + (hybridEnabled ? hybridLayout.totalWords : 0) +
       totalSurfaceCapacity * (SURFACE_RECORD_WORDS + SURFACE_SCRATCH_WORDS) +
-      totalComplexTriangleCapacity * COMPLEX_TRIANGLE_WORDS
+      totalComplexTriangleCapacity * COMPLEX_TRIANGLE_WORDS +
+      densityPlan.totalWords
     ) * 4,
     surfaceCapacity,
     dynamicSurfaceCapacity,
@@ -822,6 +858,83 @@ export function createOccupancyField(bounds, res0, options = {}) {
         }
         bits.element(w.add(uint(parent.offset))).assign(acc);
       })().compute(parent.words),
+    );
+  }
+
+  // ══════════════════════════════════════════════ SHADER: density downsample
+  // Fraction-of-occupied-descendants per coarse cell (see planDensityLevels).
+  // Level 1 counts its 8 level-0 BITS directly; levels 2-4 average their 8
+  // child BYTES — the mean of means is exact because every cell has the same
+  // descendant count. One thread per OUTPUT WORD (4 cells), like the bit
+  // downsample. No range guards on child coords: quantizeOccupancyRes makes
+  // every level halve exactly, so a child cell always exists. The only guard
+  // is the tail word's cell index against the cell count.
+  const densityComputes = [];
+  {
+    const d = densityPlan.densityLevels[0];
+    const l0 = levels[0];
+    densityComputes.push(
+      Fn(() => {
+        const w = instanceIndex.toVar();
+        const packed = uint(0).toVar();
+        for (let k = 0; k < 4; k++) {
+          const idx = w.mul(uint(4)).add(uint(k)).toVar();
+          const cx = idx.mod(uint(d.res.x)).toVar();
+          const cy = idx.div(uint(d.res.x)).mod(uint(d.res.y)).toVar();
+          const cz = idx.div(uint(d.res.x * d.res.y)).toVar();
+          const count = uint(0).toVar();
+          for (let dz = 0; dz < 2; dz++) {
+            for (let dy = 0; dy < 2; dy++) {
+              const vy = cy.mul(uint(2)).add(uint(dy)).toVar();
+              const vz = cz.mul(uint(2)).add(uint(dz)).toVar();
+              const vx = cx.mul(uint(2)).toVar();
+              // 2x is even, so both x-bits live in one word — one fetch per
+              // (dy, dz) pair, 4 per cell.
+              const word = uint(l0.offset)
+                .add(vz.mul(uint(l0.res.y)).add(vy).mul(uint(l0.wordsPerRow)))
+                .add(shiftRight(vx, uint(5)));
+              const pair = bitAnd(shiftRight(bits.element(word), bitAnd(vx, uint(31))), uint(3));
+              count.addAssign(countOneBits(pair));
+            }
+          }
+          // Round-to-nearest 0..8 → 0..255 so a fully solid cell is exactly 255.
+          const byte = count.mul(uint(255)).add(uint(4)).div(uint(8)).toVar();
+          packed.assign(bitOr(packed, shiftLeft(select(idx.lessThan(uint(d.cells)), byte, uint(0)), uint(k * 8))));
+        }
+        bits.element(w.add(uint(densityWordOffset + d.offset))).assign(packed);
+      })().compute(d.words),
+    );
+  }
+  for (let i = 1; i < densityPlan.densityLevels.length; i++) {
+    const d = densityPlan.densityLevels[i];
+    const c = densityPlan.densityLevels[i - 1];
+    densityComputes.push(
+      Fn(() => {
+        const w = instanceIndex.toVar();
+        const packed = uint(0).toVar();
+        for (let k = 0; k < 4; k++) {
+          const idx = w.mul(uint(4)).add(uint(k)).toVar();
+          const cx = idx.mod(uint(d.res.x)).toVar();
+          const cy = idx.div(uint(d.res.x)).mod(uint(d.res.y)).toVar();
+          const cz = idx.div(uint(d.res.x * d.res.y)).toVar();
+          const sum = uint(0).toVar();
+          for (let dz = 0; dz < 2; dz++) {
+            for (let dy = 0; dy < 2; dy++) {
+              for (let dx = 0; dx < 2; dx++) {
+                const ccx = cx.mul(uint(2)).add(uint(dx)).toVar();
+                const ccy = cy.mul(uint(2)).add(uint(dy)).toVar();
+                const ccz = cz.mul(uint(2)).add(uint(dz)).toVar();
+                const cIdx = ccz.mul(uint(c.res.y)).add(ccy).mul(uint(c.res.x)).add(ccx).toVar();
+                const cw = bits.element(uint(densityWordOffset + c.offset).add(shiftRight(cIdx, uint(2))));
+                sum.addAssign(bitAnd(shiftRight(cw, shiftLeft(bitAnd(cIdx, uint(3)), uint(3))), uint(255)));
+              }
+            }
+          }
+          const byte = sum.add(uint(4)).div(uint(8)).toVar();
+          packed.assign(bitOr(packed, shiftLeft(select(idx.lessThan(uint(d.cells)), byte, uint(0)), uint(k * 8))));
+        }
+        bits.element(w.add(uint(densityWordOffset + d.offset))).assign(packed);
+      })().compute(d.words),
     );
   }
 
@@ -1759,6 +1872,196 @@ export function createOccupancyField(bounds, res0, options = {}) {
     const q0 = vec3(origin).sub(vec3(gridOrigin)).mul(vec3(voxelInv));
     const voxelAtHit = q0.add(dq.mul(hitT)).floor();
     return { hit, t: hitT, normal, voxel: voxelAtHit, pen: packed.w };
+  };
+
+  // ═══════════════════════════════════════════════════ SHADER: cone density
+  /** `levelSelect` for the density region (levels 1..4 only). */
+  const densityLevelSelect = (level, pick) => {
+    const dl = densityPlan.densityLevels;
+    let node = float(pick(dl[dl.length - 1]));
+    for (let i = dl.length - 2; i >= 0; i--) {
+      node = select(level.equal(int(dl[i].level)), float(pick(dl[i])), node);
+    }
+    return node;
+  };
+
+  /**
+   * Occupancy FRACTION (0..1) of the cell at integer coords `v` on `level`.
+   * Level 0 is the bit itself; levels 1..4 read the density pyramid's byte.
+   * Out-of-range reads 0, like `occupiedAt`. Laid out as one WGSL function:
+   * the cone marcher's trilinear sampler calls it 8× per step.
+   */
+  const densityCellAt = sharedFn({
+    name: "giOccDensityCell",
+    type: "float",
+    inputs: [
+      { name: "v", type: "vec3" },
+      { name: "levelF", type: "float" },
+    ],
+    body: (v, levelF) => {
+      const level = levelF.round().toInt().toVar();
+      const rx = densityLevelSelect(level, (l) => l.res.x).toVar();
+      const ry = densityLevelSelect(level, (l) => l.res.y).toVar();
+      const rz = densityLevelSelect(level, (l) => l.res.z).toVar();
+      const off = densityLevelSelect(level, (l) => l.offset).toVar();
+      const inside = v.x.greaterThanEqual(0).and(v.y.greaterThanEqual(0)).and(v.z.greaterThanEqual(0))
+        .and(v.x.lessThan(rx)).and(v.y.lessThan(ry)).and(v.z.lessThan(rz));
+      const xi = v.x.max(0).min(rx.sub(1)).toUint().toVar();
+      const yi = v.y.max(0).min(ry.sub(1)).toUint().toVar();
+      const zi = v.z.max(0).min(rz.sub(1)).toUint().toVar();
+      const cIdx = zi.mul(ry.toUint()).add(yi).mul(rx.toUint()).add(xi).toVar();
+      const word = uint(densityWordOffset).add(off.toUint()).add(shiftRight(cIdx, uint(2)));
+      const byte = bitAnd(shiftRight(bits.element(word), shiftLeft(bitAnd(cIdx, uint(3)), uint(3))), uint(255));
+      const frac = select(inside, byte.toFloat().div(255), float(0));
+      return select(level.lessThanEqual(int(0)), occupiedAtLevel0(v), frac);
+    },
+  });
+
+  /**
+   * Trilinear occupancy fraction at LEVEL-0-space point `q`, sampled on
+   * `level`'s cell lattice. Continuity is load-bearing: the cone marcher's
+   * per-step opacity comes from here, and nearest-cell sampling would put the
+   * cell lattice back into the penumbra as visible onion rings.
+   */
+  const densityTrilinear = sharedFn({
+    name: "giOccDensityTri",
+    type: "float",
+    inputs: [
+      { name: "q", type: "vec3" },
+      { name: "levelF", type: "float" },
+    ],
+    body: (q, levelF) => {
+      const scale = exp2(levelF.round()).toVar();
+      const c = q.div(scale).sub(0.5).toVar();
+      const b = c.floor().toVar();
+      const f = c.sub(b).toVar();
+      const corner = (dx, dy, dz) => densityCellAt(b.add(vec3(dx, dy, dz)), levelF);
+      const d00 = mix(corner(0, 0, 0), corner(1, 0, 0), f.x).toVar();
+      const d10 = mix(corner(0, 1, 0), corner(1, 1, 0), f.x).toVar();
+      const d01 = mix(corner(0, 0, 1), corner(1, 0, 1), f.x).toVar();
+      const d11 = mix(corner(0, 1, 1), corner(1, 1, 1), f.x).toVar();
+      return mix(mix(d00, d10, f.y), mix(d01, d11, f.y), f.z);
+    },
+  });
+
+  // ══════════════════════════════════════════════════ SHADER: cone-DDA trace
+  /**
+   * SOFT SHADOW CONE MARCH — area-light visibility computed IN the trace, not
+   * faked after it. The screen-space PCSS pass this replaces blurred a
+   * single-ray binary verdict, and no filter can recover partial-sun
+   * visibility that was never computed — at Blender-style wide sun angles
+   * (a 90° authored angle = 45° half-angle) the penumbra spans meters and the
+   * blur read as ghosted blobs (user-rejected, twice).
+   *
+   * Structure = the hierarchical DDA (`traceBody`) with two changes:
+   *   · the LEAF level follows the cone footprint — at distance t the cone's
+   *     radius is tanHalf·t, and the march never descends below the level
+   *     whose cells that radius spans. Empty space above the leaf skips
+   *     hierarchically exactly as before, so the step budget stays bounded
+   *     at ANY angle (the wider the cone, the coarser and CHEAPER the march).
+   *   · an occupied LEAF cell accumulates fractional opacity from the density
+   *     pyramid instead of returning a binary hit — transmittance falls
+   *     smoothly, which IS the penumbra. Softness costs nothing downstream.
+   *
+   * `boost` compensates the volume-fraction/projected-coverage gap for thin
+   * occluders (a wall spanning a coarse cell blocks every ray through it but
+   * fills ~1/8 of its volume). 0° degenerates cleanly: the caller's tSwitch
+   * goes past tMax and this trace never runs a step.
+   *
+   * Returns transmittance 0..1 (0 = fully blocked). Step exhaustion fails
+   * SOFT (returns what accumulated) — this channel is never a binary verdict,
+   * so the fail-closed discriminator the binary DDA needs has nothing to
+   * protect here.
+   */
+  const coneTraceVariants = new Map();
+  const traceOccupancyCone = (origin, dir, tMin, tMax, opts = {}) => {
+    const steps = Math.max(16, opts.steps ?? 96);
+    let fn = coneTraceVariants.get(steps);
+    if (fn === undefined) {
+      fn = sharedFn({
+        name: `giOccConeTrace${steps}`,
+        type: "float",
+        inputs: [
+          { name: "origin", type: "vec3" },
+          { name: "dir", type: "vec3" },
+          { name: "tMin", type: "float" },
+          { name: "tMax", type: "float" },
+          { name: "tanHalf", type: "float" },
+          { name: "boost", type: "float" },
+        ],
+        body: (o, d, t0, t1, tanH, boost) => {
+          const inv = vec3(voxelInv).toVar();
+          const q0 = vec3(o).sub(vec3(gridOrigin)).mul(inv).toVar();
+          const dq = vec3(d).mul(inv).toVar();
+          const safe = (c) => select(c.abs().lessThan(1e-8), select(c.lessThan(0), float(-1e-8), float(1e-8)), c);
+          const rd = vec3(float(1).div(safe(dq.x)), float(1).div(safe(dq.y)), float(1).div(safe(dq.z))).toVar();
+          const face = vec3(
+            select(dq.x.greaterThanEqual(0), float(1), float(0)),
+            select(dq.y.greaterThanEqual(0), float(1), float(0)),
+            select(dq.z.greaterThanEqual(0), float(1), float(0)),
+          ).toVar();
+          const voxMinW = vec3(voxel).x.min(vec3(voxel).y).min(vec3(voxel).z).toVar();
+          const t = float(t0).max(0).toVar();
+          const alpha = float(0).toVar();
+          const level = int(OCC_LEVELS - 1).toVar();
+
+          Loop({ start: 0, end: steps, name: "coneDda" }, () => {
+            If(t.greaterThanEqual(t1).or(alpha.greaterThanEqual(0.98)), () => {
+              Break();
+            });
+            const q = q0.add(dq.mul(t)).toVar();
+            If(
+              q.x.lessThan(0).or(q.y.lessThan(0)).or(q.z.lessThan(0))
+                .or(q.x.greaterThanEqual(level0.res.x))
+                .or(q.y.greaterThanEqual(level0.res.y))
+                .or(q.z.greaterThanEqual(level0.res.z)),
+              () => {
+                Break();
+              },
+            );
+            // Footprint leaf: the level whose cells the cone's diameter spans.
+            const leafF = log2(tanH.mul(t).mul(2).div(voxMinW).max(1)).clamp(0, OCC_LEVELS - 1).floor().toVar();
+            const leaf = leafF.toInt().toVar();
+            const lvl = level.max(leaf).toVar();
+            const scale = levelSelect(lvl, (l) => l.scale).toVar();
+            const v = q.div(scale).floor().toVar();
+            const occ = occupiedAt(v, lvl).toVar();
+            If(occ.greaterThan(0.5).and(lvl.greaterThan(leaf)), () => {
+              // Occupied parent above the leaf → look closer, no advance.
+              level.assign(lvl.sub(int(1)));
+            }).Else(() => {
+              const bound = v.add(face).mul(scale).toVar();
+              const tx = bound.x.sub(q.x).mul(rd.x).toVar();
+              const ty = bound.y.sub(q.y).mul(rd.y).toVar();
+              const tz = bound.z.sub(q.z).mul(rd.z).toVar();
+              const tNext = tx.min(ty).min(tz).max(0).toVar();
+              If(occ.greaterThan(0.5), () => {
+                // Occupied AT the leaf: integrate this cell's density over the
+                // segment. Midpoint-sampled for the same reason the analytic
+                // penumbra is — at the entry point the crossed-face coordinate
+                // is degenerate for every step of every ray. Segment/cell
+                // ratio scales a corner graze down; the buffer read inside an
+                // If follows the penK precedent in traceBody.
+                const tm = t.add(tNext.mul(0.5)).toVar();
+                const qm = q0.add(dq.mul(tm)).toVar();
+                const dens = densityTrilinear(qm, lvl.toFloat()).toVar();
+                const cellW = voxMinW.mul(exp2(lvl.toFloat())).toVar();
+                const op = dens.mul(boost).mul(tNext.div(cellW).clamp(0, 1)).clamp(0, 1);
+                alpha.assign(alpha.add(alpha.oneMinus().mul(op)));
+              });
+              t.addAssign(tNext.add(1e-4));
+              level.assign(lvl.add(int(1)).min(int(OCC_LEVELS - 1)));
+            });
+          });
+          return alpha.oneMinus().clamp(0, 1);
+        },
+      });
+      coneTraceVariants.set(steps, fn);
+    }
+    return fn(
+      vec3(origin), vec3(dir), float(tMin), float(tMax),
+      float(opts.tanHalf ?? 0), float(opts.boost ?? 3),
+    );
   };
 
   /**
@@ -3565,13 +3868,13 @@ export function createOccupancyField(bounds, res0, options = {}) {
             buildClearCompute(), buildClearAttrCompute(),
             voxStatic, snapStaticBitsCompute, buildSnapStaticAttrCompute(),
             ...surfaceChain,
-            voxDynamic, copyCompute, ...downsampleComputes,
+            voxDynamic, copyCompute, ...downsampleComputes, ...densityComputes,
             ...(hybridBuildCompute ? [hybridBuildCompute] : []),
             ...dynamicSurfaceChain,
           ],
           fast: [
             restoreStaticBitsCompute, buildRestoreStaticAttrCompute(),
-            voxDynamic, copyCompute, ...downsampleComputes,
+            voxDynamic, copyCompute, ...downsampleComputes, ...densityComputes,
             ...(hybridBuildCompute ? [hybridBuildCompute] : []),
             ...dynamicSurfaceChain,
           ],
@@ -3591,8 +3894,11 @@ export function createOccupancyField(bounds, res0, options = {}) {
     },
 
     traceOccupancy,
+    traceOccupancyCone,
     traceHybridBrick,
     traceHybridPlane,
+    /** Density-region layout, for tests/diagnostics (offsets inside `bits`). */
+    densityLayout: { wordOffset: densityWordOffset, levels: densityPlan.densityLevels },
     hybridLayout: hybridEnabled ? hybridLayout : null,
     /**
      * True when the `bits` tail carries SurfaceRecords, i.e. the active ray-hit
@@ -3656,8 +3962,18 @@ export function createOccupancyField(bounds, res0, options = {}) {
         const word = l.offset + (z * l.res.y + y) * l.wordsPerRow + (x >> 5);
         return (data[word] >>> (x & 31)) & 1;
       };
+      // Density byte (0..255) of the level-L cell — the cone trace's medium.
+      // Level 0 returns bit×255 so callers can treat all levels uniformly.
+      const getDensity = (x, y, z, L = 1) => {
+        if (L <= 0) return get(x, y, z, 0) * 255;
+        const d = densityPlan.densityLevels[L - 1];
+        if (!d || x < 0 || y < 0 || z < 0 || x >= d.res.x || y >= d.res.y || z >= d.res.z) return 0;
+        const cIdx = (z * d.res.y + y) * d.res.x + x;
+        return (data[densityWordOffset + d.offset + (cIdx >> 2)] >>> ((cIdx & 3) * 8)) & 255;
+      };
       return {
         get,
+        getDensity,
         levels,
         stats,
         origin: gridOrigin.value.clone(),

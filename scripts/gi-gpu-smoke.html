@@ -240,7 +240,48 @@
           if (planeMode && !penVariantSeen) {
             throw new Error("lightshadow arm: the pen plane-trace variant never compiled into the resolve");
           }
-          console.log(`GI-SMOKE LIGHTSHADOW pen-variant=${penVariantSeen ? "compiled" : "n/a (non-plane mode)"}`);
+          // CONE ARM (soft shadows computed in-trace): the resolve must carry
+          // the cone-DDA WGSL, and the density pyramid must hold REAL
+          // fractions — cross-checked against the level-0 bits (a level-1
+          // cell's byte is round(255·popcount(children)/8) exactly).
+          let coneVariantSeen = false;
+          for (const node of state?.queue ?? []) {
+            const shader = engine.renderer._nodes?.getForCompute?.(node)?.computeShader ?? "";
+            if (/giOccConeTrace\d+/.test(shader)) { coneVariantSeen = true; break; }
+          }
+          if (!coneVariantSeen) {
+            throw new Error("lightshadow arm: the cone-DDA trace never compiled into the resolve");
+          }
+          const occField = engine.modules.get("gi").system.state.volume.occupancyField;
+          const rb = await occField.readbackBits(engine.renderer);
+          const d1 = occField.densityLayout.levels[0];
+          let densityCells = 0, densityMismatches = 0, partialCells = 0;
+          for (let z = 0; z < d1.res.z; z++) {
+            for (let y = 0; y < d1.res.y; y++) {
+              for (let x = 0; x < d1.res.x; x++) {
+                let count = 0;
+                for (let dz = 0; dz < 2; dz++) for (let dy = 0; dy < 2; dy++) for (let dx = 0; dx < 2; dx++) {
+                  count += rb.get(x * 2 + dx, y * 2 + dy, z * 2 + dz, 0);
+                }
+                const expected = Math.floor((count * 255 + 4) / 8);
+                const got = rb.getDensity(x, y, z, 1);
+                if (count > 0) densityCells++;
+                if (count > 0 && count < 8) partialCells++;
+                if (got !== expected) densityMismatches++;
+              }
+            }
+          }
+          if (densityMismatches) {
+            throw new Error(`lightshadow arm: ${densityMismatches} density cells disagree with the level-0 bits`);
+          }
+          if (!densityCells) throw new Error("lightshadow arm: density pyramid is empty over occupied geometry");
+          if (!partialCells) {
+            throw new Error("lightshadow arm: no PARTIAL density cells — the fraction channel is behaving like the OR bit");
+          }
+          console.log(
+            `GI-SMOKE LIGHTSHADOW pen-variant=${penVariantSeen ? "compiled" : "n/a (non-plane mode)"} ` +
+            `cone-variant=compiled densityCells=${densityCells} partial=${partialCells} mismatches=0`,
+          );
         }
         globalThis.__GI_SMOKE_RESULT__ = {
           pass: true,

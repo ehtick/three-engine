@@ -48,6 +48,11 @@ await page.evaluate(() => {
 await new Promise((r) => setTimeout(r, 5000));
 
 const result = await page.evaluate(async () => {
+  // The editor stops the whole engine loop when the viewport is unfocused
+  // (editorFramePacing) — in headless nothing is ever focused, so without
+  // this the GI system never ticks and the suite reports "GI never built"
+  // with no error anywhere.
+  globalThis.__editorKeepRendering = true;
   const { THREE } = await import("/src/engine/index.js");
   await import("/src/modules/index.js");
   const { enableEngineModule } = await import("/src/engine/modules.js");

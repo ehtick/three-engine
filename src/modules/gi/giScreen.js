@@ -42,6 +42,7 @@ import {
   select,
   smoothstep,
   step,
+  tan,
   texture,
   textureStore,
   uniform,
@@ -442,9 +443,17 @@ export function createGiResolve({ gbuffer, targets, width, height, gather, norma
               // well under one half-res pixel at any sane view) and caps the
               // softest so k can never approach 1, where the estimator would
               // report a permanent half-shadow everywhere.
-              const angle = mix(float(slot.srcRadius).div(pointDist), float(slot.soft), isDir)
-                .clamp(0.0005, 0.35)
+              const rawAngle = mix(float(slot.srcRadius).div(pointDist), float(slot.soft), isDir)
+                .max(0)
                 .toVar();
+              const angle = rawAngle.clamp(0.0005, 0.35).toVar();
+              // The cone arm wants the TRUE half-angle, unclamped — the 0.35
+              // ceiling above exists to keep the analytic estimator's k sane,
+              // and capping the cone there was exactly the "90° looks the
+              // same as 20°" bug. tan is capped at ~44.7° half-angle only to
+              // keep tan() itself finite near π/2; Blender's 90° authored
+              // angle = 45° half-angle sits right at the useful maximum.
+              const tanHalf = tan(rawAngle.min(0.78)).toVar();
               const maxT = dist.sub(lightShadow.lift).max(0).toVar();
               // DDA marcher when the bundle carries one (see #buildLightShadow
               // for why), sphere trace as the hatched fallback. Trailing args
@@ -457,7 +466,7 @@ export function createGiResolve({ gbuffer, targets, width, height, gather, norma
               // PCSS blur radius at sample time; the sphere arm has no
               // blocker distance and stays sharp (y = 0).
               const tracedRaw = lightShadow.traceDda
-                ? lightShadow.traceDda(shadowOrigin, dir, maxT, float(1).div(angle), P)
+                ? lightShadow.traceDda(shadowOrigin, dir, maxT, float(1).div(angle), P, tanHalf)
                 : lightShadow.trace(shadowOrigin, dir, maxT, float(1).div(angle), cosRayNormal);
               const traced = lightShadow.traceDda ? vec2(tracedRaw).toVar() : vec2(tracedRaw, 0).toVar();
               if (lightShadowDistVars) lightShadowDistVars[index].assign(traced.y);

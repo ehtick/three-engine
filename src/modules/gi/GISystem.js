@@ -1707,10 +1707,15 @@ export class GISystem {
       }
       return null;
     }
-    // PCSS wants ONE more storage texture (the blocker-distance channel). A
-    // device that affords the shadow but not the distance keeps sharp shadows
-    // — the dist texture exists but is never written, reads 0, radius 0.
-    const pcss = limit >= used + 2;
+    // PCSS blocker-distance channel — OFF by default since the cone march
+    // landed. The screen-space disc blurred a single-ray binary verdict, and
+    // partial-sun visibility that was never computed cannot be filtered into
+    // existence: at wide angles it read as ghosted blobs (user-rejected,
+    // twice) while burning 16 scattered full-res fetches per lit pixel in
+    // every material. The cone-DDA returns transmittance that is ALREADY the
+    // penumbra, so the disc has nothing left to add. `__giPcssDisc = true`
+    // resurrects it (build-time) for an A/B against the cone arm.
+    const pcss = globalThis.__giPcssDisc === true && limit >= used + 2;
     const steps =
       Number(globalThis.__giDirectShadowSteps) ||
       ({ low: 96, medium: 128, high: 160, ultra: 192 }[quality] ?? 160);
@@ -1734,9 +1739,8 @@ export class GISystem {
     return {
       marcher: globalThis.__giLightShadowSphere === true
         ? "sphere"
-        : recordMarch
-          ? `records (${rayHitModeName(shadowMode)})`
-          : "voxel-dda",
+        : (recordMarch ? `records (${rayHitModeName(shadowMode)})` : "voxel-dda") +
+          (occ.traceOccupancyCone && globalThis.__giNoConeShadow !== true ? " + cone" : ""),
       slots: lightSlots,
       lift,
       voxMax,
@@ -1770,7 +1774,7 @@ export class GISystem {
       traceDda:
         globalThis.__giLightShadowSphere === true
           ? null
-          : (origin, dir, maxT, k, receiverP = null) => {
+          : (origin, dir, maxT, k, receiverP = null, tanHalf = null) => {
               // tMin one voxel: the lifted origin can still clip its own
               // surface's SAT-bulged voxel on curved geometry, and a DDA
               // first-voxel hit is a hard black dot. One voxel along the ray
@@ -1779,6 +1783,35 @@ export class GISystem {
               // resolving power anyway.
               const vox = vec3(occ.voxel);
               const tMin = vox.x.max(vox.y).max(vox.z);
+              // ── TWO-PHASE SOFT SHADOW ─────────────────────────────────────
+              // The exact arm (records/triangles, sub-voxel silhouettes) owns
+              // the ray only WHILE the light cone is narrower than the medium
+              // can resolve; past tSwitch = (voxel/2)/tan(halfAngle) the
+              // penumbra is wider than a voxel and sub-voxel precision buys
+              // nothing — the cone-DDA takes over and accumulates fractional
+              // occupancy into transmittance (softness computed IN the trace;
+              // see traceOccupancyCone). At 0° tSwitch → ∞, the exact arm
+              // keeps the whole ray and the cone arm never runs a step — the
+              // user-validated razor look is byte-identical by construction.
+              // `__giNoConeShadow = true` restores single-phase (build-time).
+              const cone =
+                tanHalf != null &&
+                occ.traceOccupancyCone &&
+                globalThis.__giNoConeShadow !== true;
+              const voxMin = vox.x.min(vox.y).min(vox.z);
+              const exactEnd = cone
+                ? voxMin.mul(0.5).div(float(tanHalf).max(1e-5)).min(maxT).toVar()
+                : maxT;
+              const coneSteps =
+                Number(globalThis.__giConeShadowSteps) ||
+                ({ low: 48, medium: 64, high: 80, ultra: 96 }[quality] ?? 80);
+              const coneT = cone
+                ? occ.traceOccupancyCone(origin, dir, exactEnd, maxT, {
+                    tanHalf,
+                    steps: coneSteps,
+                    boost: Number(globalThis.__giConeDensityBoost) || 3,
+                  })
+                : null;
               // THE RECORD MARCH — the non-voxel shadow arm. When the active
               // ray-hit mode carries surface records, shadow rays resolve hits
               // through the SAME fitted planes (+ coverage clips, + exact
@@ -1805,7 +1838,7 @@ export class GISystem {
                 const macroSteps =
                   Number(globalThis.__giDirectShadowSteps) ||
                   ({ low: 96, medium: 128, high: 160, ultra: 192 }[quality] ?? 160);
-                const r = occ.traceHybridPlane(origin, dir, tMin, maxT, {
+                const r = occ.traceHybridPlane(origin, dir, tMin, exactEnd, {
                   coverage: shadowMode >= RayHitMode.HybridPlaneCoverage,
                   exact: shadowMode === RayHitMode.HybridExactComplex,
                   penumbraK: k,
@@ -1825,11 +1858,13 @@ export class GISystem {
                   // plane=0.75, exact-triangle=0.5, box=0.25, clamp=black.
                   return vec2(float(1).sub(r.kind.mul(0.25)), 0);
                 }
-                // y = PCSS blocker distance, normalized by the span (0 = no
-                // blocker = no blur). The pen variant returns hitT for
-                // exactly this; misses carry t = -1, hence the max(0).
+                // x = exact-arm visibility × cone transmittance (the two
+                // phases partition the ray, so the product is the ray's
+                // visibility). y = blocker distance, kept for the dormant
+                // PCSS A/B arm; misses carry t = -1, hence the max(0).
+                const exactVis = r.hit.oneMinus().mul(r.pen);
                 return vec2(
-                  r.hit.oneMinus().mul(r.pen),
+                  coneT ? exactVis.mul(coneT) : exactVis,
                   r.t.max(0).div(float(span)).clamp(0, 1),
                 );
               }
@@ -1841,9 +1876,10 @@ export class GISystem {
               const ddaSteps =
                 Number(globalThis.__giDirectShadowSteps) ||
                 ({ low: 40, medium: 56, high: 64, ultra: 80 }[quality] ?? 64);
-              const r = occ.traceOccupancy(origin, dir, tMin, maxT, { steps: ddaSteps, penumbraK: k });
+              const r = occ.traceOccupancy(origin, dir, tMin, exactEnd, { steps: ddaSteps, penumbraK: k });
+              const legacyVis = r.hit.oneMinus().mul(r.pen);
               return vec2(
-                r.hit.oneMinus().mul(r.pen),
+                coneT ? legacyVis.mul(coneT) : legacyVis,
                 r.t.max(0).div(float(span)).clamp(0, 1),
               );
             },
@@ -1894,7 +1930,12 @@ export class GISystem {
       }
       // PCSS blocker-distance channel, same persistence contract as the
       // shadow node above (every gi light's shadow branch samples it).
-      if (lightShadow && !this._giLightShadowDistNode) {
+      // GATED ON pcss: the node's mere existence is what compiles the
+      // 16-tap disc into every gi light's material shadow branch (see
+      // #acquireLightShadowNode) — with the cone march carrying softness,
+      // building the disc against a never-written texture would burn the
+      // fetches for a guaranteed no-op.
+      if (lightShadow?.pcss && !this._giLightShadowDistNode) {
         this._giLightShadowDistNode = texture(targets.lightShadowDist);
       }
       // The shadowNode's tap offsets are half-res texels; runs on every

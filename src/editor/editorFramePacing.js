@@ -116,6 +116,14 @@ export function installEditorFramePacing() {
 
   const apply = () => {
     if (
+      // HARNESS HATCH: headless suites (GI probes, smokes) drive the engine
+      // with nothing focused and no user input, which this pacing correctly
+      // reads as "nobody is looking" — and then their engine never ticks and
+      // every readback reports a dead field ("GI never built" with no error
+      // anywhere, giDispatches flat, compute 0.00 — the sleeping-engine
+      // signature). The flag is sampled every interval, so a harness can set
+      // it at any point, not just before install.
+      globalThis.__editorKeepRendering !== true &&
       shouldSuspendViewport({
         playing: engine.playing,
         visible: viewportVisible(),
