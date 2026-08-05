@@ -289,6 +289,11 @@ export function createGiResolve({ gbuffer, targets, width, height, gather, norma
     // would black out whatever it missed, which is the one failure mode a
     // shadow term must never have.
     const lightShadowVars = lightShadow ? Array.from({ length: 4 }, () => float(1).toVar()) : null;
+    // PCSS blocker distances (normalized by the shadow span; 0 = no blocker
+    // = no blur). Only allocated when the device afforded the dist target.
+    const lightShadowDistVars = lightShadow?.distTarget
+      ? Array.from({ length: 4 }, () => float(0).toVar())
+      : null;
     If(g0.w.greaterThan(0.5), () => {
       const P = g0.xyz.toVar();
       const rawN = g1.xyz.normalize().toVar();
@@ -447,10 +452,15 @@ export function createGiResolve({ gbuffer, targets, width, height, gather, norma
               // analytic light has no body in the field to exclude.
               // The receiver point rides along for the record march's
               // origin-plane exclusion (self-shadow phantoms on tilted
-              // receivers); the legacy/sphere arms ignore it.
-              const traced = lightShadow.traceDda
+              // receivers); the legacy/sphere arms ignore it. The DDA arm
+              // returns vec2(shadow, blockerDist/span) — the y feeds the
+              // PCSS blur radius at sample time; the sphere arm has no
+              // blocker distance and stays sharp (y = 0).
+              const tracedRaw = lightShadow.traceDda
                 ? lightShadow.traceDda(shadowOrigin, dir, maxT, float(1).div(angle), P)
                 : lightShadow.trace(shadowOrigin, dir, maxT, float(1).div(angle), cosRayNormal);
+              const traced = lightShadow.traceDda ? vec2(tracedRaw).toVar() : vec2(tracedRaw, 0).toVar();
+              if (lightShadowDistVars) lightShadowDistVars[index].assign(traced.y);
               if (lightShadow.freeRadius) {
                 // BURIAL GATE — the answer to the surviving white dots (user-
                 // diagnosed: flipped normals + sub-dead-zone leaks, both of
@@ -466,9 +476,9 @@ export function createGiResolve({ gbuffer, targets, width, height, gather, norma
                 // field oracle call against an already-bound buffer.
                 const free = float(lightShadow.freeRadius(shadowOrigin)).toVar();
                 const burial = smoothstep(lightShadow.voxMax.mul(0.5), lightShadow.voxMax.mul(1.25), free);
-                lightShadowVars[index].assign(traced.mul(burial));
+                lightShadowVars[index].assign(traced.x.mul(burial));
               } else {
-                lightShadowVars[index].assign(traced);
+                lightShadowVars[index].assign(traced.x);
               }
             });
           });
@@ -525,6 +535,13 @@ export function createGiResolve({ gbuffer, targets, width, height, gather, norma
     // which is exactly why GISystem gates the whole feature on the device's
     // `maxStorageTexturesPerShaderStage` before ever building this bundle.
     if (lightShadow) {
+      if (lightShadowDistVars) {
+        textureStore(
+          lightShadow.distTarget,
+          coord,
+          vec4(lightShadowDistVars[0], lightShadowDistVars[1], lightShadowDistVars[2], lightShadowDistVars[3]),
+        );
+      }
       textureStore(
         lightShadow.target,
         coord,
@@ -720,17 +737,30 @@ export function createGiTargets(width, height) {
   const lightShadow = new THREE.StorageTexture(width, height);
   lightShadow.name = "giLightShadow";
   lightShadow.version = version;
+  // PCSS blocker distance, one channel per light slot like `lightShadow`:
+  // the trace's occluder distance normalized by the shadow span, driving the
+  // sample-time penumbra radius (tan(sourceAngle) x blockerDist — Blender sun
+  // semantics). rgba8 is enough: the radius needs ~1% distance precision, not
+  // a position. LinearFilter deliberately (a blended blocker distance blends
+  // the blur radius — exactly the right thing across a penumbra). Created
+  // unconditionally like lightShadow; whether the resolve WRITES it is the
+  // device-gated part (an unwritten texture reads 0 → radius 0 → sharp).
+  const lightShadowDist = new THREE.StorageTexture(width, height);
+  lightShadowDist.name = "giLightShadowDist";
+  lightShadowDist.version = version;
   if (import.meta.env?.DEV) globalThis.__giLastTargetVersion = version;
   return {
     irradiance,
     emitterShadow,
     radiance,
     lightShadow,
+    lightShadowDist,
     dispose() {
       irradiance.dispose();
       emitterShadow.dispose();
       radiance.dispose();
       lightShadow.dispose();
+      lightShadowDist.dispose();
     },
   };
 }

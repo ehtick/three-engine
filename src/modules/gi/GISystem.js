@@ -1707,6 +1707,10 @@ export class GISystem {
       }
       return null;
     }
+    // PCSS wants ONE more storage texture (the blocker-distance channel). A
+    // device that affords the shadow but not the distance keeps sharp shadows
+    // — the dist texture exists but is never written, reads 0, radius 0.
+    const pcss = limit >= used + 2;
     const steps =
       Number(globalThis.__giDirectShadowSteps) ||
       ({ low: 96, medium: 128, high: 160, ultra: 192 }[quality] ?? 160);
@@ -1737,6 +1741,7 @@ export class GISystem {
       lift,
       voxMax,
       span,
+      pcss,
       steps,
       // BURIAL GATE INPUT (see the resolve's use). RECORD-AWARE is the load-
       // bearing word: the plain AABB oracle reads ~0 at every lifted origin
@@ -1818,9 +1823,15 @@ export class GISystem {
                   // VERDICT-KIND MAP instead of a shadow: the channel paints
                   // WHICH acceptance class decided each pixel. miss=white,
                   // plane=0.75, exact-triangle=0.5, box=0.25, clamp=black.
-                  return float(1).sub(r.kind.mul(0.25));
+                  return vec2(float(1).sub(r.kind.mul(0.25)), 0);
                 }
-                return r.hit.oneMinus().mul(r.pen);
+                // y = PCSS blocker distance, normalized by the span (0 = no
+                // blocker = no blur). The pen variant returns hitT for
+                // exactly this; misses carry t = -1, hence the max(0).
+                return vec2(
+                  r.hit.oneMinus().mul(r.pen),
+                  r.t.max(0).div(float(span)).clamp(0, 1),
+                );
               }
               // Tiered like every other march in this module — the DDA's
               // hierarchical coarse-skip means these budgets cross the whole
@@ -1831,7 +1842,10 @@ export class GISystem {
                 Number(globalThis.__giDirectShadowSteps) ||
                 ({ low: 40, medium: 56, high: 64, ultra: 80 }[quality] ?? 64);
               const r = occ.traceOccupancy(origin, dir, tMin, maxT, { steps: ddaSteps, penumbraK: k });
-              return r.hit.oneMinus().mul(r.pen);
+              return vec2(
+                r.hit.oneMinus().mul(r.pen),
+                r.t.max(0).div(float(span)).clamp(0, 1),
+              );
             },
       // STABLE estimator, deliberately (the sharp one was tried first): the
       // sharp arm's occluder admission is binary, and against a ~12cm-voxel
@@ -1878,6 +1892,11 @@ export class GISystem {
       if (lightShadow && !this._giLightShadowNode) {
         this._giLightShadowNode = texture(targets.lightShadow);
       }
+      // PCSS blocker-distance channel, same persistence contract as the
+      // shadow node above (every gi light's shadow branch samples it).
+      if (lightShadow && !this._giLightShadowDistNode) {
+        this._giLightShadowDistNode = texture(targets.lightShadowDist);
+      }
       // The shadowNode's tap offsets are half-res texels; runs on every
       // build (and #syncScreenResolveSize covers the resize path).
       (this._giLightShadowTexel ??= uniform(new THREE.Vector2())).value.set(1 / width, 1 / height);
@@ -1902,7 +1921,13 @@ export class GISystem {
       // The bundle arrives target-less (the targets are created just above, and
       // only the system knows when) — bind it here and keep the completed
       // bundle on `screen` so the resize path can re-point it.
-      inputs.lightShadow = lightShadow ? { ...lightShadow, target: targets.lightShadow } : null;
+      inputs.lightShadow = lightShadow
+        ? {
+            ...lightShadow,
+            target: targets.lightShadow,
+            distTarget: lightShadow.pcss ? targets.lightShadowDist : null,
+          }
+        : null;
       const radiance = radianceLookup
         ? {
             lookup: radianceLookup,
@@ -1989,8 +2014,13 @@ export class GISystem {
     // resolve rebuild below, or the pass would write into the target that is
     // about to be retired.
     if (this._giLightShadowNode) this._giLightShadowNode.value = screen.targets.lightShadow;
+    if (this._giLightShadowDistNode) this._giLightShadowDistNode.value = screen.targets.lightShadowDist;
     if (screen.lightShadow) {
-      screen.lightShadow = { ...screen.lightShadow, target: screen.targets.lightShadow };
+      screen.lightShadow = {
+        ...screen.lightShadow,
+        target: screen.targets.lightShadow,
+        distTarget: screen.lightShadow.pcss ? screen.targets.lightShadowDist : null,
+      };
     }
     // THE BVH TARGETS ARE REPLACED BEFORE THE RESOLVE IS REBUILT, not after.
     // The resolve now BINDS them (it shades the reflection hits — see
@@ -3357,6 +3387,16 @@ export class GISystem {
     const state = this.state;
     const nodes = (this._lightShadowNodes ??= new Map());
     const live = !!state?.screen?.lightShadow && !!this._giLightShadowNode;
+    // PCSS inputs, refreshed per frame: the shadow span (world → normalized
+    // blocker distances), and the projection scale that turns a world-space
+    // penumbra width into a screenUV radius (1 / (2·tan(fov/2))).
+    if (live) {
+      if (this._giShadowSpanU) this._giShadowSpanU.value = state.screen.lightShadow.span ?? 1;
+      const cam = this.engine.camera;
+      if (this._giShadowFovScaleU && cam?.isPerspectiveCamera) {
+        this._giShadowFovScaleU.value = 1 / (2 * Math.tan((cam.fov * Math.PI) / 360));
+      }
+    }
     // Slot index === channel index === index into the collected light list, by
     // construction — the resolve writes channel i from lightSlots[i], and
     // lightSlots[i] is fed by lights[i] in the loop above.
@@ -3371,6 +3411,16 @@ export class GISystem {
       claimed.add(light);
       const entry = this.#acquireLightShadowNode(light);
       entry.mask.value.set(i === 0 ? 1 : 0, i === 1 ? 1 : 0, i === 2 ? 1 : 0, i === 3 ? 1 : 0);
+      // PCSS blur strength = tan of the source HALF-angle (giSourceAngle is
+      // already the half-angle in radians). Directional-only for now — a
+      // point light's penumbra scales by srcRadius/dist per pixel, a later
+      // refinement. Capped at 60°-half so tan stays sane; NOT the cone
+      // estimator's 0.35 clamp — softness beyond it comes from this blur.
+      if (entry.blurTan) {
+        entry.blurTan.value = light.isDirectionalLight
+          ? Math.tan(Math.min(light.userData.giSourceAngle ?? 0.0046, Math.PI / 3))
+          : 0;
+      }
       // Inert unless the slot is genuinely being traced this frame: a hidden
       // or zero-intensity light keeps its (unwritten) channel, and reading it
       // would shadow with whatever the last live light left there.
@@ -3426,8 +3476,33 @@ export class GISystem {
     // by policy. The position texture is NearestFilter, so tap validity is
     // per-texel exact, never interpolated across the very edges it guards.
     const texel = (this._giLightShadowTexel ??= uniform(new THREE.Vector2(1 / 512, 1 / 512)));
-    const threshold = positionWorld.sub(cameraPosition).length().mul(0.02).max(0.15);
-    const taps = [[-0.5, -0.5], [0.5, -0.5], [-0.5, 0.5], [0.5, 0.5]].map(([dx, dy]) => {
+    const viewDist = positionWorld.sub(cameraPosition).length().toVar();
+    const threshold = viewDist.mul(0.02).max(0.15);
+    // ── PCSS PENUMBRA RADIUS ────────────────────────────────────────────
+    // Blender sun semantics: penumbra width at the receiver = tan(source
+    // half-angle) × blocker distance. The resolve wrote the trace's own
+    // occluder distance (normalized by the span) into the dist channel —
+    // no blocker search needed, the march already knows. LinearFilter on
+    // the dist texture blends the radius across the penumbra, which is
+    // exactly right. Devices without the extra storage texture never write
+    // it: reads 0 → radius 0 → the sharp bilateral below, unchanged.
+    const spanU = (this._giShadowSpanU ??= uniform(1));
+    const fovScaleU = (this._giShadowFovScaleU ??= uniform(1.2));
+    const blurTan = uniform(0);
+    const blockerNorm = this._giLightShadowDistNode
+      ? this._giLightShadowDistNode.sample(screenUV).dot(vec4(mask))
+      : float(0);
+    const penumbraW = blockerNorm.mul(spanU).mul(blurTan).toVar();
+    // World width → screen-height fraction (screenUV units): w·fovScale/dist,
+    // capped at 24 half-res texels so a 90° sun cannot blur across the frame.
+    const radiusUv = penumbraW.mul(fovScaleU).div(viewDist.max(0.05))
+      .min(vec2(texel).y.mul(24)).toVar();
+    const ringOn = radiusUv.greaterThan(vec2(texel).y.mul(0.75));
+    // Wide blurs must accept taps across the penumbra's own depth spread —
+    // widen the position-validity threshold with the penumbra width, or a
+    // soft shadow on a slanted floor rejects most of its own disc.
+    const ringThreshold = threshold.add(penumbraW.mul(0.35));
+    const innerTaps = [[-0.5, -0.5], [0.5, -0.5], [-0.5, 0.5], [0.5, 0.5]].map(([dx, dy]) => {
       const uv = screenUV.add(vec2(texel).mul(vec2(dx, dy)));
       const s = this._giLightShadowNode.sample(uv).dot(vec4(mask));
       const g = this._giShadowPosNode.sample(uv);
@@ -3435,6 +3510,26 @@ export class GISystem {
       const w = select(g.w.greaterThan(0.5).and(d.lessThan(threshold)), float(1).div(d.add(0.02)), float(0));
       return { s, w };
     });
+    // 8-tap disc at the penumbra radius (two interleaved rings for coverage),
+    // compiled in only when the dist channel exists; weights collapse to 0
+    // when the radius is sub-texel, leaving the sharp path bit-exact.
+    const ringTaps = this._giLightShadowDistNode
+      ? [0, 1, 2, 3, 4, 5, 6, 7].map((k) => {
+          const a = (Math.PI / 4) * k + Math.PI / 8;
+          const scale = k % 2 === 0 ? 1 : 0.62;
+          const uv = screenUV.add(vec2(Math.cos(a) * scale, Math.sin(a) * scale).mul(radiusUv));
+          const s = this._giLightShadowNode.sample(uv).dot(vec4(mask));
+          const g = this._giShadowPosNode.sample(uv);
+          const d = g.xyz.sub(positionWorld).length();
+          const w = select(
+            ringOn.and(g.w.greaterThan(0.5)).and(d.lessThan(ringThreshold)),
+            float(1).div(d.add(0.05)),
+            float(0),
+          );
+          return { s, w };
+        })
+      : [];
+    const taps = [...innerTaps, ...ringTaps];
     const wSum = taps.reduce((acc, t) => acc.add(t.w), float(0));
     const sBlend = taps.reduce((acc, t) => acc.add(t.s.mul(t.w)), float(0)).div(wSum.max(1e-4));
     // NO-VALID-TAP FALLBACK IS ZERO, not min-of-taps. When every tap belongs
@@ -3449,6 +3544,7 @@ export class GISystem {
     const entry = {
       active,
       mask,
+      blurTan,
       node: mix(float(1), shadow, active),
     };
     this._lightShadowNodes.set(light, entry);

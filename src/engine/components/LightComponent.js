@@ -88,7 +88,10 @@ export class LightComponent extends Component {
     { key: "shadowMode", label: "Shadow Source", type: "select", options: ["map", "gi"], showIf: (p) => p.kind !== "ambient" && p.castShadow, section: "Shadow" },
     // Angular size shapes the GI penumbra in BOTH modes (gi traces it directly;
     // map mode still feeds it to the GI bounce), so it is never gated on mode.
-    { key: "sourceAngle", label: "Source Angle°", type: "number", min: 0, max: 20, step: 0.05, showIf: (p) => p.kind === "directional", section: "Shadow" },
+    // Up to 90° (Blender sun parity): beyond ~20° the softness comes from the
+    // PCSS sample-time blur (radius = tan(half-angle) × blocker distance),
+    // not the trace's cone estimator, which keeps its own internal clamp.
+    { key: "sourceAngle", label: "Source Angle°", type: "number", min: 0, max: 90, step: 0.05, showIf: (p) => p.kind === "directional", section: "Shadow" },
     // Shadow-map controls. Master switch (castShadow) gates the rest via showIf
     // so the inspector stays tidy when shadows are off; `shadowMode === "gi"`
     // hides them too because no shadow map is rendered in that mode.
