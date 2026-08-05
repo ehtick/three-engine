@@ -668,6 +668,106 @@ console.log("\nsprite atlas");
 }
 
 /* -------------------------------------------------------------------------- */
+/* 10b — cutting a LONE spritesheet up, which needs no pre-existing atlas       */
+/* -------------------------------------------------------------------------- */
+
+console.log("\nslicing a lone spritesheet");
+{
+  // The case the packing flow does not cover and that a user actually starts
+  // from: one downloaded sheet, six frames in a row, no .atlas anywhere.
+  const SHEET = `${ROOT}/sprites/Walk.png`;
+  const frames = 6;
+  const cell = 24;
+  const strip = flatBuffer(cell * frames, cell, [0, 0, 0, 0]);
+  for (let f = 0; f < frames; f++) {
+    for (let y = 4; y < cell - 4; y++) {
+      for (let x = f * cell + 4; x < f * cell + cell - 4; x++) {
+        const i = (y * strip.width + x) * 4;
+        strip.data[i] = 40 * f + 15;
+        strip.data[i + 1] = 200;
+        strip.data[i + 2] = 90;
+        strip.data[i + 3] = 255;
+      }
+    }
+  }
+  fs.writeFileSync(SHEET, Buffer.from(await encodePng(strip)));
+
+  await openTexture(SHEET);
+  await page.waitForSelector(".texture-canvas", { timeout: 30000 });
+  await settle(1000);
+
+  // Opening a different sheet must not leave the PREVIOUS one's atlas attached
+  // — the button would then be a shortcut to the wrong file's regions.
+  const toolbarTexts = await page.evaluate(() =>
+    [...document.querySelectorAll(".texture-toolbar .toolbar-btn")].map((b) => b.textContent.trim()),
+  );
+  check(
+    "a sheet with no atlas does not inherit the last one's",
+    !toolbarTexts.includes("Sprites"),
+    toolbarTexts.join(" | "),
+  );
+  check(
+    "a lone sheet offers a way into slicing",
+    await clickText(".texture-toolbar .toolbar-btn", "Slice into Sprites"),
+    toolbarTexts.join(" | "),
+  );
+  await page.waitForSelector(".atlas-editor", { timeout: 20000 });
+  check("it created the atlas and switched to Atlas mode", fs.existsSync(`${ROOT}/sprites/Walk.atlas`));
+  await settle(600);
+
+  // The Slice menu lives on the ATLAS toolbar, not the paint one.
+  const openedSlice = await clickText(".atlas-editor .toolbar-btn", "Slice");
+  await settle(250);
+  const pickedGrid = await page.evaluate(() => {
+    const el = [...document.querySelectorAll(".dropdown-item")].find((e) =>
+      e.textContent.trim().startsWith("By Grid"),
+    );
+    if (!el) return false;
+    el.click();
+    return true;
+  });
+  check("Slice ▸ By Grid is reachable", openedSlice && pickedGrid);
+  await page.waitForSelector(".texture-dialog", { timeout: 10000 });
+
+  // Six columns, one row — the shape of the sheet.
+  await page.evaluate(() => {
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+    const select = document.querySelector(".texture-dialog select");
+    const nativeSelect = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, "value").set;
+    nativeSelect.call(select, "count");
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+    setTimeout(() => {
+      const numbers = [...document.querySelectorAll(".texture-dialog input[type=number]")];
+      setter.call(numbers[0], "6");
+      numbers[0].dispatchEvent(new Event("input", { bubbles: true }));
+      setter.call(numbers[1], "1");
+      numbers[1].dispatchEvent(new Event("input", { bubbles: true }));
+    }, 0);
+  });
+  await settle(400);
+  check("Slice commits", await clickText(".texture-dialog-actions .toolbar-btn", "Slice"));
+  await settle(600);
+
+  const rows = await page.evaluate(() => document.querySelectorAll(".atlas-list .atlas-row").length);
+  check("the sheet was cut into one region per frame", rows >= frames, `${rows} rows`);
+
+  check("Save is offered", await clickText(".atlas-editor .toolbar-btn", "Save"));
+  await settle(800);
+  const sliced = JSON.parse(fs.readFileSync(`${ROOT}/sprites/Walk.atlas`, "utf8"));
+  check("the regions reached disk", sliced.regions.length === frames, `${sliced.regions.length} regions`);
+  check(
+    "each region is one cell wide",
+    sliced.regions.every((r) => r.rect[2] === cell && r.rect[3] === cell),
+    JSON.stringify(sliced.regions[0]?.rect),
+  );
+  check(
+    "and they tile the sheet left to right",
+    sliced.regions.every((r, i) => r.rect[0] === i * cell),
+    sliced.regions.map((r) => r.rect[0]).join(),
+  );
+}
+
+/* -------------------------------------------------------------------------- */
 /* 11 — the runtime: SpriteComponent drawing and animating from the atlas       */
 /* -------------------------------------------------------------------------- */
 

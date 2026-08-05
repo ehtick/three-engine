@@ -108,6 +108,45 @@ export async function buildAtlasFromImages(paths, {
 }
 
 /**
+ * Starts an atlas for a sheet that already exists — the "cut this up" direction.
+ *
+ * Without this there is no way into slicing from a single spritesheet: the
+ * Atlas surface only appears once a `.atlas` claims the image, and packing
+ * needs several loose files. An atlas with no regions is a valid, useful thing
+ * — it is exactly what Slice ▸ By Grid fills in.
+ *
+ * The size is read from the image rather than trusted from anywhere, because
+ * it is the one field a stale atlas gets wrong.
+ */
+export async function createAtlasForImage(imagePath, { name = null } = {}) {
+  const dir = dirOf(imagePath);
+  const buffer = await readImageBuffer(imagePath);
+
+  // Never clobber an existing `.atlas` that happens to share the stem — it may
+  // describe a different sheet, and overwriting it would lose its regions.
+  let base = name ?? stem(imagePath);
+  let atlasPath = `${dir}/${base}.atlas`;
+  for (let i = 1; i < 100; i++) {
+    try {
+      await invoke("stat_file", { path: atlasPath });
+    } catch {
+      break; // absent — this name is free
+    }
+    atlasPath = `${dir}/${base}_${i}.atlas`;
+  }
+
+  const def = normalizeAtlas({
+    version: ATLAS_VERSION,
+    image: imagePath,
+    size: [buffer.width, buffer.height],
+    regions: [],
+    animations: [],
+  });
+  await writeAtlas(atlasPath, def);
+  return atlasPath;
+}
+
+/**
  * Rebuilds the sheet from the regions' recorded `source` files.
  *
  * Only possible for an atlas this editor packed (a sliced sheet has no sources),

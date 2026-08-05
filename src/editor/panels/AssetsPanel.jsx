@@ -88,7 +88,7 @@ import {
   requestPackAtlas,
 } from "../textureEditorRequest.js";
 import { PackAtlasDialog } from "./TextureOps.jsx";
-import { buildAtlasFromImages } from "../atlasFile.js";
+import { buildAtlasFromImages, createAtlasForImage, findAtlasForImage } from "../atlasFile.js";
 import { ContextMenu, isTextEditTarget } from "../ContextMenu.jsx";
 import { requestGeometryThumb } from "../geometryThumb.js";
 
@@ -179,6 +179,24 @@ const createAnimator = () =>
 
 const createSequence = () =>
   createAssetFile("NewTimeline.timeline", JSON.stringify(createDefaultTimeline(), null, 2));
+
+/**
+ * Opens (or first creates) the sprite atlas for a single sheet, in Atlas mode.
+ *
+ * An existing atlas that already claims this image is reused rather than a
+ * second one made beside it — two atlases over one sheet is how a project ends
+ * up with regions edited in the wrong file.
+ */
+async function sliceTextureIntoSprites(imagePath) {
+  try {
+    const existing = await findAtlasForImage(imagePath);
+    const atlasPath = existing ?? (await createAtlasForImage(imagePath));
+    if (!existing) await useProjectStore.getState().refresh();
+    openAssetPath(atlasPath);
+  } catch (error) {
+    console.error(`Could not create a sprite atlas: ${error?.message ?? error}`);
+  }
+}
 
 /** A new image is not a JSON template — it needs a size and a background, and
  *  those live in the Texture Editor's own dialog so there is one place that
@@ -624,7 +642,14 @@ function AssetContextMenu({ menu, close, setRenamingPath, selectedEntries }) {
             ]
           : []),
         ...(!multi && !entry.is_dir && TEXTURE_EXTENSIONS.includes(entry.ext)
-          ? [{ label: "Edit Texture", action: () => openAssetPath(entry.path) }]
+          ? [
+              { label: "Edit Texture", action: () => openAssetPath(entry.path) },
+              {
+                label: "Slice into Sprites…",
+                hint: "Cut this sheet into sprite regions (creates a .atlas beside it)",
+                action: () => sliceTextureIntoSprites(entry.path),
+              },
+            ]
           : []),
         ...(textureTargets.length > 1 && textureTargets.length === targets.length
           ? [

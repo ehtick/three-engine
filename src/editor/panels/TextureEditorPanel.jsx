@@ -20,6 +20,7 @@ import {
   Plus,
   Redo2,
   Save,
+  Scissors,
   Circle as CircleIcon,
   Square,
   SquareDashed,
@@ -54,7 +55,7 @@ import {
   anchorOffset,
 } from "./TextureOps.jsx";
 import { AtlasEditor } from "./AtlasEditor.jsx";
-import { findAtlasForImage } from "../atlasFile.js";
+import { createAtlasForImage, findAtlasForImage } from "../atlasFile.js";
 import { bufferToImageData } from "../texture/codecPng.js";
 import { BLEND_MODES, compositeLayers, blendInto } from "../texture/blend.js";
 import {
@@ -187,10 +188,45 @@ export function TextureEditorPanel() {
   const [path, setPath] = useState(null);
   const [atlasPath, setAtlasPath] = useState(null);
   const [mode, setMode] = useState("paint");
+  const [slicing, setSlicing] = useState(false);
+
+  /**
+   * "Cut this sheet into sprites."
+   *
+   * The entry point that was missing: slicing lives on the Atlas surface, and
+   * that surface only appears once some `.atlas` claims the image — so from a
+   * plain spritesheet there was no way in at all. This creates the (empty)
+   * atlas beside the image and switches to it, where Slice ▸ By Grid / By
+   * Transparency does the actual work.
+   */
+  const sliceIntoSprites = useCallback(async () => {
+    if (atlasPath) {
+      setMode("atlas");
+      return;
+    }
+    if (!path || slicing) return;
+    setSlicing(true);
+    try {
+      const created = await createAtlasForImage(path);
+      await useProjectStore.getState().refresh();
+      setAtlasPath(created);
+      setMode("atlas");
+      pushToast({ title: `Created ${basename(created)}`, detail: "Use Slice to cut the sheet into regions" });
+    } catch (error) {
+      pushToast({ level: "error", title: "Could not create an atlas", detail: String(error?.message ?? error) });
+    } finally {
+      setSlicing(false);
+    }
+  }, [atlasPath, path, slicing]);
 
   useEffect(() => {
     if (isImagePath(assetPath)) {
       setPath(assetPath);
+      // Drop the previous sheet's atlas immediately. The workspace looks up
+      // this image's own atlas as it loads and reports it back; until then
+      // there is none — leaving the old one attached would offer an Atlas tab,
+      // and a "Sprites" button, for a completely different sheet.
+      setAtlasPath(null);
       setMode("paint");
     } else if (isAtlasPath(assetPath)) {
       setAtlasPath(assetPath);
@@ -241,6 +277,8 @@ export function TextureEditorPanel() {
           path={path}
           onPathChange={setPath}
           onAtlasChange={setAtlasPath}
+          onSliceIntoSprites={sliceIntoSprites}
+          hasAtlas={!!atlasPath}
           key={path ?? "none"}
         />
       )}
@@ -250,7 +288,7 @@ export function TextureEditorPanel() {
 
 // ---------------------------------------------------------------------------
 
-function TextureWorkspace({ path, onPathChange, onAtlasChange }) {
+function TextureWorkspace({ path, onPathChange, onAtlasChange, onSliceIntoSprites, hasAtlas }) {
   const docRef = useRef(null);
   const [version, setVersion] = useState(0);
   const [status, setStatus] = useState(path ? "loading" : "empty");
@@ -799,6 +837,18 @@ function TextureWorkspace({ path, onPathChange, onAtlasChange }) {
           onClick={() => setTiling((t) => !t)}
         >
           <Grid3x3 size={14} />
+        </button>
+        <button
+          className="toolbar-btn"
+          disabled={status !== "ready"}
+          title={
+            hasAtlas
+              ? "Open this sheet's sprite atlas"
+              : "Cut this sheet into sprite regions — creates a .atlas beside it"
+          }
+          onClick={onSliceIntoSprites}
+        >
+          <Scissors size={13} /> {hasAtlas ? "Sprites" : "Slice into Sprites"}
         </button>
         <span className="texture-title">
           {path ? basename(path) : "No texture open"}

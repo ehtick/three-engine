@@ -370,3 +370,28 @@ the thing nine-slice exists for: widening a panel from 1 to 4 units leaves its c
 exactly 0.08 units wide) and `npm run smoke:texture` (74 checks; the runtime section walks
 a real `SpriteComponent` through every frame of a real atlas animation, wraps it, and
 measures the built quad at 0.08 × 0.30 world units from an 8×30px region).
+
+---
+
+## Follow-up: converting a texture into an atlas
+
+Shipped 2026-08-05, immediately after phase 4, because the flow had a hole in it: slicing
+lives on the Atlas surface, and that surface only appeared once some `.atlas` claimed the
+image — while the only way to *create* one was "Pack N into Atlas…" from several loose
+files. From a single downloaded spritesheet, the most ordinary starting point there is,
+there was no way in at all.
+
+**Slice into Sprites** now appears in the paint toolbar for any open texture (and as
+"Slice into Sprites…" on a texture's context menu in Assets). It writes an empty
+`<name>.atlas` beside the image and switches to Atlas mode, where Slice ▸ By Grid / By
+Transparency fills it in. An atlas that already claims the image is reused rather than a
+second one created beside it — two atlases over one sheet is how regions get edited in
+the wrong file. The button reads "Sprites" once one exists.
+
+The smoke found a real bug while covering this: opening a second sheet left the PREVIOUS
+sheet's atlas attached, so the Atlas tab and the button pointed at a completely different
+file's regions. Opening an image now drops the association immediately and waits for the
+lookup against the new image.
+
+Tests: `npm run smoke:texture` 74 → 84, including cutting a 6-frame strip with no atlas
+anywhere and asserting the six regions tile the sheet left to right on disk.
