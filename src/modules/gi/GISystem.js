@@ -3391,7 +3391,14 @@ export class GISystem {
     // blocker distances), and the projection scale that turns a world-space
     // penumbra width into a screenUV radius (1 / (2·tan(fov/2))).
     if (live) {
-      if (this._giShadowSpanU) this._giShadowSpanU.value = state.screen.lightShadow.span ?? 1;
+      // `span` is the bundle's diagU — a per-build UNIFORM NODE, not a
+      // number. The persistent sampler uniform must copy its NUMERIC value:
+      // assigning the node itself makes getNodeUniform choke on type "node"
+      // in every material's shadow branch compile.
+      const span = state.screen.lightShadow.span;
+      if (this._giShadowSpanU) {
+        this._giShadowSpanU.value = typeof span === "number" ? span : span?.value ?? 1;
+      }
       const cam = this.engine.camera;
       if (this._giShadowFovScaleU && cam?.isPerspectiveCamera) {
         this._giShadowFovScaleU.value = 1 / (2 * Math.tan((cam.fov * Math.PI) / 360));
