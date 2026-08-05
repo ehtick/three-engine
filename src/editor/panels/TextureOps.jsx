@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ContextMenu } from "../ContextMenu.jsx";
+import { SelectField } from "../fields/SelectField.jsx";
 import { AssetField } from "../fields/AssetField.jsx";
 import { TEXTURE_EXTENSIONS } from "../assetLoader.js";
 import { ADJUSTMENTS, defaultParams } from "../texture/adjust.js";
@@ -186,16 +187,10 @@ function ParamRow({ param, value, onChange }) {
   }
   if (param.options) {
     return (
-      <label>
-        {param.label}
-        <select value={value} onChange={(e) => onChange(e.target.value)}>
-          {param.options.map((option) => (
-            <option key={option} value={option}>
-              {option}
-            </option>
-          ))}
-        </select>
-      </label>
+      <div className="texture-dialog-field">
+        <span>{param.label}</span>
+        <SelectField value={value} options={param.options} capitalize onChange={onChange} />
+      </div>
     );
   }
   if (param.color) {
@@ -296,13 +291,17 @@ export function ResizeDialog({ docSize, onApply, onCancel }) {
             </button>
           ))}
         </div>
-        <label>
-          Resampling
-          <select value={filter} onChange={(e) => setFilter(e.target.value)}>
-            <option value="bilinear">Smooth (bilinear)</option>
-            <option value="nearest">Sharp (nearest — pixel art, masks)</option>
-          </select>
-        </label>
+        <div className="texture-dialog-field">
+          <span>Resampling</span>
+          <SelectField
+            value={filter}
+            options={[
+              { value: "bilinear", label: "Smooth", hint: "Bilinear — photographic source" },
+              { value: "nearest", label: "Sharp", hint: "Nearest — pixel art and masks" },
+            ]}
+            onChange={setFilter}
+          />
+        </div>
         <div className="texture-dialog-actions">
           <button className="tx-btn quiet" onClick={onCancel}>
             Cancel
@@ -434,17 +433,13 @@ export function PackChannelsDialog({ docSize, onApply, onCancel }) {
             </div>
             {slots[slot.key].path ? (
               <>
-                <select
+                <SelectField
+                  className="pack-source"
                   value={slots[slot.key].source}
-                  onChange={(e) => patch(slot.key, { source: e.target.value })}
+                  options={CHANNEL_SOURCES}
                   title="Which channel of the source file to read"
-                >
-                  {CHANNEL_SOURCES.map((source) => (
-                    <option key={source} value={source}>
-                      {source}
-                    </option>
-                  ))}
-                </select>
+                  onChange={(source) => patch(slot.key, { source })}
+                />
                 <label className="texture-check" title="Invert this channel">
                   <input
                     type="checkbox"
@@ -544,16 +539,14 @@ export function PackAtlasDialog({ count, defaultName = "Atlas", onApply, onCance
             <input type="number" min={0} max={8} value={extrude} onChange={(e) => setExtrude(Number(e.target.value))} />
           </label>
         </div>
-        <label>
-          Max size
-          <select value={maxSize} onChange={(e) => setMaxSize(Number(e.target.value))}>
-            {[512, 1024, 2048, 4096, 8192].map((size) => (
-              <option key={size} value={size}>
-                {size}
-              </option>
-            ))}
-          </select>
-        </label>
+        <div className="texture-dialog-field">
+          <span>Max size</span>
+          <SelectField
+            value={String(maxSize)}
+            options={[512, 1024, 2048, 4096, 8192].map((size) => String(size))}
+            onChange={(v) => setMaxSize(Number(v))}
+          />
+        </div>
         <label className="texture-check">
           <input type="checkbox" checked={powerOfTwo} onChange={(e) => setPowerOfTwo(e.target.checked)} />
           Power-of-two sheet
@@ -596,16 +589,12 @@ export function SwizzleDialog({ onApply, onCancel }) {
         {SWIZZLE_TARGETS.map((target) => (
           <div key={target} className="texture-pack-row">
             <span className={`texture-pack-chip ch-${target}`}>{target.toUpperCase()}</span>
-            <select
+            <SelectField
+              className="pack-source"
               value={mapping[target]}
-              onChange={(e) => setMapping((m) => ({ ...m, [target]: e.target.value }))}
-            >
-              {CHANNEL_SOURCES.map((source) => (
-                <option key={source} value={source}>
-                  {source}
-                </option>
-              ))}
-            </select>
+              options={CHANNEL_SOURCES}
+              onChange={(source) => setMapping((m) => ({ ...m, [target]: source }))}
+            />
             <label className="texture-check">
               <input
                 type="checkbox"

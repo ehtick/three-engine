@@ -49,6 +49,8 @@ import { useSelectionStore } from "../store/selectionStore.js";
 import { extOf, ATLAS_EXTENSIONS, TEXTURE_EXTENSIONS } from "../assetLoader.js";
 import { uniqueName } from "../assetOps.js";
 import { pushToast } from "../toasts.js";
+import { ContextMenu } from "../ContextMenu.jsx";
+import { SelectField } from "../fields/SelectField.jsx";
 import { NEW_TEXTURE_EVENT, consumeNewTextureRequest } from "../textureEditorRequest.js";
 import {
   createTextureAsset,
@@ -75,6 +77,7 @@ import {
   cloneBuffer,
   copyRegion,
   createBuffer,
+  cropBuffer,
   parseColor,
   toHex,
 } from "../texture/pixels.js";
@@ -614,8 +617,125 @@ function TextureWorkspace({ path, onPathChange, onAtlasChange, onSliceIntoSprite
     setSelection(invertSelection(selectionRef.current, d.width, d.height));
   }, [setSelection]);
 
+  // --- clipboard ----------------------------------------------------------
+  //
+  // Its own clipboard, not the OS one. The system clipboard can only carry an
+  // encoded image, so a round trip through it would flatten alpha precision
+  // and lose the selection's own soft edge — the very thing the editor is
+  // careful about everywhere else. It also means copying here cannot clobber
+  // whatever the user has copied elsewhere in the editor.
+  const clipboardRef = useRef(null);
+
+  /** Pixels of the active layer inside the selection, with the selection's
+   *  coverage folded into their alpha so a feathered edge survives the copy. */
+  const captureSelection = useCallback(() => {
+    const d = docRef.current;
+    const layer = d ? findActiveLayer(d) : null;
+    if (!layer) return null;
+    const selection = selectionRef.current;
+    const bounds = selection
+      ? selectionBounds(selection, d.width, d.height)
+      : { x: 0, y: 0, width: d.width, height: d.height };
+    if (!bounds) return null;
+    const buffer = cropBuffer(layer.buffer, bounds.x, bounds.y, bounds.width, bounds.height);
+    if (selection) {
+      for (let y = 0; y < bounds.height; y++) {
+        for (let x = 0; x < bounds.width; x++) {
+          const cover = selection[(bounds.y + y) * d.width + (bounds.x + x)] / 255;
+          const at = (y * bounds.width + x) * 4 + 3;
+          buffer.data[at] *= cover;
+        }
+      }
+    }
+    return { buffer, x: bounds.x, y: bounds.y };
+  }, []);
+
+  /** Clears the selected pixels of the active layer (alpha only — see draw.js
+   *  on why an eraser must not pull colour toward black). */
+  const eraseSelection = useCallback(
+    (label = "Delete") => {
+      const d = docRef.current;
+      const layer = d ? findActiveLayer(d) : null;
+      if (!layer || layer.locked) {
+        if (layer?.locked) pushToast({ title: "That layer is locked" });
+        return false;
+      }
+      const selection = selectionRef.current;
+      const bounds = selection
+        ? selectionBounds(selection, d.width, d.height)
+        : { x: 0, y: 0, width: d.width, height: d.height };
+      if (!bounds) return false;
+      const rect = { x0: bounds.x, y0: bounds.y, x1: bounds.x + bounds.width, y1: bounds.y + bounds.height };
+      const before = captureRegion(layer.buffer, rect);
+      for (let y = bounds.y; y < bounds.y + bounds.height; y++) {
+        for (let x = bounds.x; x < bounds.x + bounds.width; x++) {
+          const cover = selection ? selection[y * d.width + x] / 255 : 1;
+          if (cover <= 0) continue;
+          layer.buffer.data[(y * d.width + x) * 4 + 3] *= 1 - cover;
+        }
+      }
+      pushHistory(regionEntry(layer.buffer, rect, before, label));
+      markEdited(null);
+      return true;
+    },
+    [pushHistory, markEdited],
+  );
+
+  const copySelection = useCallback(() => {
+    const captured = captureSelection();
+    if (!captured) return false;
+    clipboardRef.current = captured;
+    pushToast({ title: `Copied ${captured.buffer.width} × ${captured.buffer.height}` });
+    return true;
+  }, [captureSelection]);
+
+  const cutSelection = useCallback(() => {
+    if (!copySelection()) return;
+    eraseSelection("Cut");
+  }, [copySelection, eraseSelection]);
+
+  /** Drops a buffer onto a brand-new layer at a document position. Paste and
+   *  "layer via copy" are the same operation with a different source. */
+  const dropOntoNewLayer = useCallback(
+    (source, label, name) => {
+      if (!source) return;
+      withDocumentSnapshot(label, (d) => {
+        const layer = addLayer(d, { name });
+        blendInto(layer.buffer, source.buffer, { offsetX: source.x, offsetY: source.y });
+      });
+      // Photoshop switches to Move after a paste, and it is right to: the thing
+      // you just made is floating and the next action is almost always to place
+      // it. Landing in Brush instead means the first drag paints over it.
+      setTool("move");
+    },
+    [withDocumentSnapshot],
+  );
+
+  const pasteAsLayer = useCallback(() => {
+    if (!clipboardRef.current) {
+      pushToast({ title: "Nothing copied yet" });
+      return;
+    }
+    dropOntoNewLayer(clipboardRef.current, "Paste", "Pasted");
+  }, [dropOntoNewLayer]);
+
+  /** Ctrl+J — the selection straight onto a new layer, no clipboard involved,
+   *  so it never disturbs what you copied earlier. */
+  const layerViaCopy = useCallback(
+    (cut = false) => {
+      const captured = captureSelection();
+      if (!captured) return;
+      if (cut && !eraseSelection("Layer via Cut")) return;
+      dropOntoNewLayer(captured, cut ? "Layer via Cut" : "Layer via Copy", cut ? "Cut layer" : "Copied layer");
+    },
+    [captureSelection, eraseSelection, dropOntoNewLayer],
+  );
+
   // --- the operation menus -----------------------------------------------
   const [dialog, setDialog] = useState(null);
+  // Right-click on the canvas. The shortcuts are the fast path; this is how
+  // anyone finds out they exist.
+  const [canvasMenu, setCanvasMenu] = useState(null);
 
   const runCommand = useCallback(
     (kind, payload) => {
@@ -796,7 +916,38 @@ function TextureWorkspace({ path, onPathChange, onAtlasChange, onSliceIntoSprite
         invert();
         return;
       }
+      if (ctrl && key === "c") {
+        event.preventDefault();
+        event.stopPropagation();
+        copySelection();
+        return;
+      }
+      if (ctrl && key === "x") {
+        event.preventDefault();
+        event.stopPropagation();
+        cutSelection();
+        return;
+      }
+      if (ctrl && key === "v") {
+        event.preventDefault();
+        event.stopPropagation();
+        pasteAsLayer();
+        return;
+      }
+      if (ctrl && key === "j") {
+        event.preventDefault();
+        event.stopPropagation();
+        layerViaCopy(event.shiftKey);
+        return;
+      }
       if (ctrl) return;
+
+      if (key === "delete" || key === "backspace") {
+        event.preventDefault();
+        event.stopPropagation();
+        eraseSelection();
+        return;
+      }
 
       if (key === "[") {
         setBrushSize((s) => Math.max(1, Math.round(s * 0.8)));
@@ -816,7 +967,10 @@ function TextureWorkspace({ path, onPathChange, onAtlasChange, onSliceIntoSprite
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [undo, redo, save, selectAll, deselect, invert, color, altColor]);
+  }, [
+    undo, redo, save, selectAll, deselect, invert, color, altColor,
+    copySelection, cutSelection, pasteAsLayer, layerViaCopy, eraseSelection,
+  ]);
 
   // --- new document ------------------------------------------------------
   const createNew = useCallback(
@@ -971,6 +1125,8 @@ function TextureWorkspace({ path, onPathChange, onAtlasChange, onSliceIntoSprite
               tiling={tiling}
               toolProps={toolProps}
               invalidateRef={invalidateRef}
+              hasClipboard={!!clipboardRef.current}
+              onContextMenu={(at) => setCanvasMenu(at)}
               onSelection={setSelection}
               onEdited={markEdited}
               onPainting={markPainting}
@@ -1030,6 +1186,38 @@ function TextureWorkspace({ path, onPathChange, onAtlasChange, onSliceIntoSprite
       </div>
 
       <StatusBar doc={doc} historyRef={historyRef} version={version} />
+
+      {canvasMenu && (
+        <ContextMenu
+          x={canvasMenu.x}
+          y={canvasMenu.y}
+          onClose={() => setCanvasMenu(null)}
+          items={[
+            { label: "Copy", shortcut: "Ctrl+C", action: copySelection },
+            { label: "Cut", shortcut: "Ctrl+X", action: cutSelection },
+            { label: "Paste as Layer", shortcut: "Ctrl+V", disabled: !clipboardRef.current, action: pasteAsLayer },
+            { separator: true },
+            {
+              label: "Layer via Copy",
+              shortcut: "Ctrl+J",
+              hint: "The selection on a new layer, leaving this one intact",
+              action: () => layerViaCopy(false),
+            },
+            { label: "Layer via Cut", shortcut: "Ctrl+Shift+J", action: () => layerViaCopy(true) },
+            { separator: true },
+            { label: "Delete Selected", shortcut: "Del", action: () => eraseSelection() },
+            { separator: true },
+            { label: "Select All", shortcut: "Ctrl+A", action: selectAll },
+            { label: "Deselect", shortcut: "Ctrl+D", disabled: !selectionRef.current, action: deselect },
+            { label: "Invert Selection", shortcut: "Ctrl+I", action: invert },
+            {
+              label: "Crop to Selection",
+              disabled: !selectionRef.current,
+              action: () => runCommand("cropToSelection"),
+            },
+          ]}
+        />
+      )}
 
       {showNew && <NewTextureDialog onCancel={() => setShowNew(false)} onCreate={createNew} />}
 
@@ -1114,6 +1302,8 @@ function TextureCanvas({
   tiling,
   toolProps,
   invalidateRef,
+  hasClipboard,
+  onContextMenu,
   onSelection,
   onEdited,
   onPainting,
@@ -1136,6 +1326,13 @@ function TextureCanvas({
   const toolRef = useRef(toolProps);
   toolRef.current = toolProps;
   const readoutRef = useRef(null);
+  void hasClipboard;
+  // Marching ants: a screen-space canvas the outline is composited into, the
+  // stripe pattern that gives it its dashes, and how far along that pattern has
+  // crawled. Kept in refs — this advances every frame and must never re-render.
+  const antsRef = useRef(null);
+  const antsPatternRef = useRef(null);
+  const antsOffsetRef = useRef(0);
   // Space is the universal "pan without changing tools" modifier. Held in a ref
   // and mirrored onto the wrapper as a class, so the cursor changes without a
   // React render on every keypress.
@@ -1322,11 +1519,64 @@ function TextureCanvas({
     }
     ctx.drawImage(source, x, y, dw, dh);
 
+    // Marching ants.
+    //
+    // A static outline is indistinguishable from artwork — the whole point of
+    // the convention is that motion says "this is a selection, not a line you
+    // drew". The dashes are applied in SCREEN space rather than to the mask, so
+    // they stay the same size at any zoom (a doc-space dash becomes a solid bar
+    // at 16x), and compositing a moving stripe pattern through the outline with
+    // `source-in` works for an arbitrary shape — a lasso or a wand result has
+    // no path to hand to `setLineDash`.
     if (outlineRef.current) {
-      ctx.imageSmoothingEnabled = false;
-      ctx.globalAlpha = 0.9;
-      ctx.drawImage(outlineRef.current, x, y, dw, dh);
-      ctx.globalAlpha = 1;
+      let ants = antsRef.current;
+      if (!ants) {
+        ants = document.createElement("canvas");
+        antsRef.current = ants;
+      }
+      if (ants.width !== Math.round(w) || ants.height !== Math.round(h)) {
+        ants.width = Math.max(1, Math.round(w));
+        ants.height = Math.max(1, Math.round(h));
+      }
+      const actx = ants.getContext("2d");
+      actx.setTransform(1, 0, 0, 1, 0, 0);
+      actx.clearRect(0, 0, ants.width, ants.height);
+      actx.imageSmoothingEnabled = false;
+      actx.drawImage(outlineRef.current, x, y, dw, dh);
+
+      if (!antsPatternRef.current) {
+        const tile = document.createElement("canvas");
+        tile.width = 8;
+        tile.height = 8;
+        const tctx = tile.getContext("2d");
+        tctx.fillStyle = "#ffffff";
+        tctx.fillRect(0, 0, 8, 8);
+        tctx.fillStyle = "#000000";
+        // A diagonal band, so the crawl reads on horizontal and vertical edges
+        // alike — a purely horizontal stripe leaves vertical edges looking
+        // static however fast it moves.
+        tctx.beginPath();
+        tctx.moveTo(0, 0);
+        tctx.lineTo(4, 0);
+        tctx.lineTo(0, 4);
+        tctx.closePath();
+        tctx.fill();
+        tctx.beginPath();
+        tctx.moveTo(8, 4);
+        tctx.lineTo(8, 8);
+        tctx.lineTo(4, 8);
+        tctx.closePath();
+        tctx.fill();
+        antsPatternRef.current = actx.createPattern(tile, "repeat");
+      }
+      const pattern = antsPatternRef.current;
+      const offset = antsOffsetRef.current;
+      pattern.setTransform?.(new DOMMatrix().translateSelf(offset, offset));
+      actx.globalCompositeOperation = "source-in";
+      actx.fillStyle = pattern;
+      actx.fillRect(0, 0, ants.width, ants.height);
+      actx.globalCompositeOperation = "source-over";
+      ctx.drawImage(ants, 0, 0);
     }
 
     // Pixel grid, once a texel is big enough for the lines to mean something.
@@ -1451,6 +1701,28 @@ function TextureCanvas({
   useEffect(() => {
     draw();
   }, [draw, version, selectionVersion, viewVersion]);
+
+  // Crawl the ants. Runs ONLY while there is a selection — an idle canvas must
+  // not hold a repaint loop open, and this is the one thing on screen that has
+  // to animate without anything having happened.
+  useEffect(() => {
+    if (!selectionRef.current) return undefined;
+    let raf = 0;
+    let last = 0;
+    const tick = (now) => {
+      raf = requestAnimationFrame(tick);
+      // ~30fps is plenty for a crawl and halves the cost of holding the loop.
+      if (now - last < 33) return;
+      const dt = last ? Math.min(0.2, (now - last) / 1000) : 0;
+      last = now;
+      // 8px per second: fast enough to read as motion, slow enough not to
+      // fight the artwork for attention.
+      antsOffsetRef.current = (antsOffsetRef.current + dt * 8) % 8;
+      draw();
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [selectionVersion, selectionRef, draw]);
 
   useEffect(() => {
     const wrap = wrapRef.current;
@@ -1886,7 +2158,10 @@ function TextureCanvas({
           draw();
         }}
         onWheel={onWheel}
-        onContextMenu={(e) => e.preventDefault()}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          onContextMenu?.({ x: e.clientX, y: e.clientY });
+        }}
       />
       <div className="tx-readout" ref={readoutRef} />
       <div className="texture-view-controls">
@@ -2109,16 +2384,16 @@ function LayerColumn({
 
       {layer && (
         <div className="texture-layer-props">
-          <label className="tx-field">
+          <div className="tx-field">
             <span>Blend</span>
-            <select value={layer.blend ?? "normal"} onChange={(e) => onBlend(layer.id, e.target.value)}>
-              {BLEND_MODES.map((mode) => (
-                <option key={mode} value={mode}>
-                  {mode}
-                </option>
-              ))}
-            </select>
-          </label>
+            <SelectField
+              value={layer.blend ?? "normal"}
+              options={BLEND_MODES}
+              capitalize
+              title="Layer blend mode"
+              onChange={(mode) => onBlend(layer.id, mode)}
+            />
+          </div>
           <div className="tx-field">
             <span>Opacity</span>
             <Slider

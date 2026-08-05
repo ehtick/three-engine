@@ -22,6 +22,7 @@ import {
 import { basename } from "../store/projectStore.js";
 import { pushToast } from "../toasts.js";
 import { ContextMenu } from "../ContextMenu.jsx";
+import { SelectField } from "../fields/SelectField.jsx";
 import { readImageBuffer } from "../textureFile.js";
 import { bufferToImageData } from "../texture/codecPng.js";
 import { sliceByAlpha, sliceGrid } from "../texture/slice.js";
@@ -1042,13 +1043,17 @@ function GridSliceDialog({ size, onCancel, onApply }) {
         <p className="texture-dialog-note">
           Sheet is {size[0]} × {size[1]} — this makes {preview} cell{preview === 1 ? "" : "s"}.
         </p>
-        <label>
-          Define by
-          <select value={mode} onChange={(e) => setMode(e.target.value)}>
-            <option value="size">Cell size</option>
-            <option value="count">Column / row count</option>
-          </select>
-        </label>
+        <div className="texture-dialog-field">
+          <span>Define by</span>
+          <SelectField
+            value={mode}
+            options={[
+              { value: "size", label: "Cell size" },
+              { value: "count", label: "Column / row count" },
+            ]}
+            onChange={setMode}
+          />
+        </div>
         <div className="texture-dialog-row">
           {mode === "size" ? (
             <>

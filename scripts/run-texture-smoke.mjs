@@ -768,20 +768,22 @@ console.log("\nslicing a lone spritesheet");
   );
   await page.waitForSelector(".texture-dialog", { timeout: 10000 });
 
-  // Six columns, one row — the shape of the sheet.
+  // Six columns, one row - the shape of the sheet. The dropdown is the editor's
+  // own SelectField (a portalled popover), not a native <select>.
+  check("the dialog uses the editor's own dropdown", await clickText(".texture-dialog .tx-select", "Cell"));
+  await settle(250);
+  check(
+    "its menu offers the column/row mode",
+    await clickText(".tx-select-menu .dropdown-item", "Column"),
+  );
+  await settle(300);
   await page.evaluate(() => {
     const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
-    const select = document.querySelector(".texture-dialog select");
-    const nativeSelect = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, "value").set;
-    nativeSelect.call(select, "count");
-    select.dispatchEvent(new Event("change", { bubbles: true }));
-    setTimeout(() => {
-      const numbers = [...document.querySelectorAll(".texture-dialog input[type=number]")];
-      setter.call(numbers[0], "6");
-      numbers[0].dispatchEvent(new Event("input", { bubbles: true }));
-      setter.call(numbers[1], "1");
-      numbers[1].dispatchEvent(new Event("input", { bubbles: true }));
-    }, 0);
+    const numbers = [...document.querySelectorAll(".texture-dialog input[type=number]")];
+    setter.call(numbers[0], "6");
+    numbers[0].dispatchEvent(new Event("input", { bubbles: true }));
+    setter.call(numbers[1], "1");
+    numbers[1].dispatchEvent(new Event("input", { bubbles: true }));
   });
   await settle(400);
   check("Slice commits", await clickText(".texture-dialog-actions .tx-btn", "Slice"));
@@ -893,6 +895,128 @@ console.log("\nsprite runtime");
   const w = Math.max(...xsOf) - Math.min(...xsOf);
   const h = Math.max(...ysOf) - Math.min(...ysOf);
   check("the quad's world size comes from its pixel size", Math.abs(w - 0.08) < 1e-4 && Math.abs(h - 0.3) < 1e-4, `${w.toFixed(3)} × ${h.toFixed(3)}`);
+}
+
+/* -------------------------------------------------------------------------- */
+/* 11b — selections really clip painting, and copy/paste-to-layer              */
+/* -------------------------------------------------------------------------- */
+
+console.log("\nselections and the clipboard");
+{
+  // A fresh flat sheet so every assertion is about what this section did.
+  const SEL = `${ROOT}/textures/Sel.png`;
+  fs.writeFileSync(SEL, Buffer.from(await encodePng(flatBuffer(64, 64, [30, 30, 30, 255]))));
+  await openTexture(SEL);
+  await page.waitForSelector(".texture-canvas", { timeout: 30000 });
+  await settle(1000);
+
+  const canvasCentre = async () => {
+    const box = await canvasBox();
+    return { x: box.x + box.w / 2, y: box.y + box.h / 2 };
+  };
+
+  // Rectangle-select a small box in the middle, then paint right across the
+  // whole width. Only the selected band may change.
+  const pickTool = async (title) => {
+    const ok = await page.evaluate((t) => {
+      const el = [...document.querySelectorAll(".texture-tool")].find((b) => (b.title ?? "").startsWith(t));
+      if (!el) return false;
+      el.click();
+      return true;
+    }, title);
+    await settle(200);
+    return ok;
+  };
+
+  check("the rectangle-select tool is offered", await pickTool("Rectangle Select"));
+  {
+    const c = await canvasCentre();
+    await page.mouse.move(c.x - 40, c.y - 20);
+    await page.mouse.down();
+    await page.mouse.move(c.x + 40, c.y + 20, { steps: 8 });
+    await page.mouse.up();
+    await settle(400);
+  }
+  const selected = await page.evaluate(() => !!document.querySelector(".texture-options .tx-btn:not(:disabled)"));
+  check("a marquee drag produced a selection", selected);
+
+  check("back to the brush", await pickTool("Brush"));
+  await paintAcrossCentre();
+  await save();
+  {
+    const buffer = await decodePng(new Uint8Array(fs.readFileSync(SEL)));
+    const rows = new Set();
+    for (let y = 0; y < buffer.height; y++) {
+      for (let x = 0; x < buffer.width; x++) {
+        const i = (y * buffer.width + x) * 4;
+        if (buffer.data[i] > 90) {
+          rows.add(y);
+          break;
+        }
+      }
+    }
+    // The marquee covered roughly the middle 40 rows of a 64px sheet; painting
+    // ran across the full width. If the selection were ignored the stroke would
+    // reach rows outside it.
+    const painted = [...rows].sort((a, b) => a - b);
+    check("something was painted", painted.length > 0, `${painted.length} rows`);
+    check(
+      "the selection clipped the stroke to its own rows",
+      painted.length > 0 && painted[0] > 2 && painted[painted.length - 1] < 61,
+      `rows ${painted[0]}..${painted[painted.length - 1]}`,
+    );
+  }
+
+  // Layer via Copy: the selected pixels onto a brand-new layer, in one step.
+  const beforeLayers = await statusText();
+  const c = await canvasCentre();
+  await page.mouse.move(c.x, c.y);
+  await page.keyboard.down("Control");
+  await page.keyboard.press("KeyJ");
+  await page.keyboard.up("Control");
+  await settle(500);
+  const afterLayers = await statusText();
+  check(
+    "Ctrl+J puts the selection on a new layer",
+    /2 layers/.test(afterLayers),
+    `${beforeLayers.trim()} -> ${afterLayers.trim()}`,
+  );
+
+  // And it really carries pixels: hide the original, save, and the sheet must
+  // still show the painted band (from the copy) but nothing outside it.
+  const copied = await page.evaluate(() => {
+    const rows = [...document.querySelectorAll(".texture-layers .tx-row-item")];
+    // Rows are top-of-stack first; the copy is the new top layer.
+    return rows.length;
+  });
+  check("the layer list shows both", copied === 2, String(copied));
+
+  // Ctrl+C / Ctrl+V — copy the selected area, paste it onto its own layer.
+  const press = async (key, ...modifiers) => {
+    for (const m of modifiers) await page.keyboard.down(m);
+    await page.keyboard.press(key);
+    for (const m of modifiers.reverse()) await page.keyboard.up(m);
+    await settle(400);
+  };
+  await page.mouse.move(c.x, c.y);
+  await press("KeyC", "Control");
+  await press("KeyV", "Control");
+  check("Ctrl+C then Ctrl+V pastes onto a new layer", /3 layers/.test(await statusText()), await statusText());
+
+  // Ctrl+X removes the selected pixels from the layer it cut from.
+  await press("KeyX", "Control");
+  await save();
+  {
+    const buffer = await decodePng(new Uint8Array(fs.readFileSync(SEL)));
+    // The cut layer is the pasted copy, which held the painted band; with it
+    // gone the flattened sheet must be back to its flat background there.
+    const i = ((buffer.height >> 1) * buffer.width + (buffer.width >> 1)) * 4;
+    check(
+      "Ctrl+X removes the selected pixels",
+      buffer.data[i + 3] === 255,
+      Array.from(buffer.data.subarray(i, i + 4)).join(),
+    );
+  }
 }
 
 /* -------------------------------------------------------------------------- */
