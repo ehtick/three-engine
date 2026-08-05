@@ -1024,6 +1024,100 @@ console.log("\nselections and the clipboard");
 }
 
 /* -------------------------------------------------------------------------- */
+/* 11c — layer masks and layer effects, all the way to the saved PNG           */
+/* -------------------------------------------------------------------------- */
+
+console.log("\nmasks and effects");
+{
+  const FX = `${ROOT}/textures/Fx.png`;
+  // A small opaque square on a transparent sheet: an outline has somewhere to
+  // go, and a mask has something to hide.
+  const sheet = flatBuffer(48, 48, [0, 0, 0, 0]);
+  for (let y = 16; y < 32; y++) {
+    for (let x = 16; x < 32; x++) {
+      const i = (y * 48 + x) * 4;
+      sheet.data[i] = 255;
+      sheet.data[i + 1] = 255;
+      sheet.data[i + 2] = 255;
+      sheet.data[i + 3] = 255;
+    }
+  }
+  fs.writeFileSync(FX, Buffer.from(await encodePng(sheet)));
+
+  await openTexture(FX);
+  await page.waitForSelector(".texture-canvas", { timeout: 30000 });
+  await settle(1200);
+
+  // --- effects ---
+  check("the Effects section is offered", await page.evaluate(() =>
+    [...document.querySelectorAll(".tx-section-head")].some((h) => h.textContent.includes("Effects")),
+  ));
+  const added = await page.evaluate(() => {
+    const head = [...document.querySelectorAll(".tx-section-head")].find((h) => h.textContent.includes("Effects"));
+    head?.querySelector(".tx-icon-btn")?.click();
+    return !!head;
+  });
+  check("the add-effect menu opens", added);
+  await settle(300);
+  check("Outline is on the menu", await clickText(".dropdown-item", "Outline"));
+  await settle(600);
+
+  // Red, so the outline is unmistakable in the saved pixels.
+  const coloured = await page.evaluate(() => {
+    const input = document.querySelector(".tx-effect input[type=color]");
+    if (!input) return false;
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+    setter.call(input, "#ff0000");
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    return true;
+  });
+  check("the effect exposes its parameters", coloured);
+  await settle(500);
+  await save();
+  {
+    const buffer = await decodePng(new Uint8Array(fs.readFileSync(FX)));
+    const at = (x, y) => Array.from(buffer.data.subarray((y * buffer.width + x) * 4, (y * buffer.width + x) * 4 + 4));
+    // The square is 16..31; a 2px outline lands just outside it.
+    check("the outline reached the SAVED png", at(15, 24)[0] > 180 && at(15, 24)[3] > 180, at(15, 24).join());
+    check("and it is the colour that was picked", at(15, 24)[1] < 80 && at(15, 24)[2] < 80, at(15, 24).join());
+    check("the artwork itself is untouched", at(24, 24).join() === "255,255,255,255", at(24, 24).join());
+  }
+
+  // --- masks ---
+  check("a mask can be added", await clickText(".texture-layer-props .tx-btn", "Mask"));
+  await settle(500);
+  check(
+    "the layer row shows it carries one",
+    await page.evaluate(() => !!document.querySelector(".texture-layers .tx-badge")),
+  );
+  check("mask editing can be entered", await clickText(".texture-layer-props .tx-btn", "Edit mask"));
+  await settle(300);
+
+  // Paint black into the mask — the brush colour is the mask value, so this
+  // hides what it covers rather than painting on the artwork.
+  await page.evaluate(() => {
+    const inputs = [...document.querySelectorAll(".texture-swatches input[type=color]")];
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+    setter.call(inputs[0], "#000000");
+    inputs[0].dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await settle(200);
+  await paintAcrossCentre();
+  await save();
+  {
+    const buffer = await decodePng(new Uint8Array(fs.readFileSync(FX)));
+    const at = (x, y) => Array.from(buffer.data.subarray((y * buffer.width + x) * 4, (y * buffer.width + x) * 4 + 4));
+    check("painting the mask hid part of the artwork", at(24, 24)[3] < 120, at(24, 24).join());
+    check(
+      "the outline survives what the mask hid",
+      at(15, 24)[3] > 150,
+      "an effect is derived from the shape, not from what the mask left visible",
+    );
+  }
+}
+
+/* -------------------------------------------------------------------------- */
 /* 12 — double-click a tab bar to maximize, Escape to restore                  */
 /* -------------------------------------------------------------------------- */
 

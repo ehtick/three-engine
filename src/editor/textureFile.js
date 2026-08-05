@@ -96,8 +96,10 @@ export async function openTextureDocument(path) {
  * engine's decoded caches both key on path, and neither has any way to notice
  * the bytes changed underneath them.
  */
-export async function saveTextureDocument(path, doc, { writeSidecar = true } = {}) {
-  const flat = flattenDocument(doc);
+export async function saveTextureDocument(path, doc, { writeSidecar = true, renderEffects } = {}) {
+  // The saved PNG must be what the canvas shows, layer effects included — a
+  // file that differs from the preview is the worst kind of surprise.
+  const flat = renderEffects ? flattenDocument(doc, renderEffects) : flattenDocument(doc);
   const ext = extOf(path);
   await writeBinaryFile(path, await encodeImage(flat, ext));
 

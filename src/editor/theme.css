@@ -10328,3 +10328,51 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
 .texture-empty {
   gap: 10px;
 }
+
+/* ---------- layer badges and effects ---------- */
+
+.tx-badge {
+  display: grid;
+  place-items: center;
+  width: 17px;
+  height: 17px;
+  flex-shrink: 0;
+  border-radius: 5px;
+  background: var(--fill-2);
+  color: var(--text-dim);
+}
+
+.tx-badge.on {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.tx-effect {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 6px 7px 8px;
+  border-radius: var(--r-input);
+  background: var(--fill-1);
+}
+
+.tx-effect.off { opacity: 0.45; }
+
+.tx-effect-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.tx-effect-head .tx-name { cursor: pointer; }
+.tx-effect:hover .tx-icon-btn.reveal { opacity: 1; }
+
+.tx-effect .tx-field {
+  grid-template-columns: 56px minmax(0, 1fr);
+  font-size: 10px;
+}
+
+.tx-effect .tx-slider input[type="range"] { width: 100%; }
+.tx-effect .tx-slider { width: 100%; }

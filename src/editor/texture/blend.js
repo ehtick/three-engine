@@ -151,10 +151,23 @@ export function blendInto(dst, src, options = {}) {
 /**
  * Flattens a layer stack bottom-to-top into one buffer.
  *
+ * `renderEffects` is injected rather than imported so this file stays free of
+ * the effect implementations (and their blur), and so a caller that has
+ * already computed a layer's effects can hand the cached buffers back instead
+ * of paying for them again on every stroke.
+ *
+ * A layer's effects are composited with the LAYER'S own opacity and blend mode
+ * — an outline is part of the layer, so fading the layer must fade its outline
+ * too, or turning a layer down to 20% leaves a solid black rim floating there.
+ * They are NOT masked by the layer mask, because masking the shape that
+ * produced them would erase the shadow of the part the mask hid, which is
+ * exactly what a mask is meant to leave behind.
+ *
  * @param {Array<{ buffer: PixelBuffer, visible?: boolean, opacity?: number,
- *                 blend?: string, mask?: Uint8Array|null, offset?: [number, number] }>} layers
+ *                 blend?: string, mask?: Uint8Array|null, offset?: [number, number],
+ *                 effects?: object[] }>} layers
  */
-export function compositeLayers(layers, width, height, out = null) {
+export function compositeLayers(layers, width, height, out = null, renderEffects = null) {
   const target = out ?? {
     width,
     height,
@@ -163,13 +176,16 @@ export function compositeLayers(layers, width, height, out = null) {
   if (out) target.data.fill(0);
   for (const layer of layers) {
     if (!layer || layer.visible === false || !layer.buffer) continue;
-    blendInto(target, layer.buffer, {
+    const common = {
       offsetX: layer.offset?.[0] ?? 0,
       offsetY: layer.offset?.[1] ?? 0,
       opacity: layer.opacity ?? 1,
       blend: layer.blend ?? "normal",
-      mask: layer.mask ?? null,
-    });
+    };
+    const fx = renderEffects ? renderEffects(layer) : null;
+    for (const under of fx?.under ?? []) blendInto(target, under, common);
+    blendInto(target, layer.buffer, { ...common, mask: layer.mask ?? null });
+    for (const over of fx?.over ?? []) blendInto(target, over, common);
   }
   return target;
 }

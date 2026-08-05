@@ -14,6 +14,7 @@
  */
 
 import { compositeLayers } from "./blend.js";
+import { hasEffects, renderLayerEffects } from "./layerFx.js";
 import {
   cloneBuffer,
   createBuffer,
@@ -42,6 +43,7 @@ export function nextLayerId() {
 }
 
 export function createLayer({
+  effects = null,
   name = "Layer",
   width,
   height,
@@ -65,6 +67,14 @@ export function createLayer({
     offset: [offset[0] ?? 0, offset[1] ?? 0],
     buffer: buffer ?? createBuffer(width, height, fill),
     mask,
+    // Non-destructive decorations derived from this layer's alpha — see
+    // layerFx.js. An empty list is the overwhelmingly common case, so it is
+    // stored as one and never written to `.tex` when empty.
+    effects: effects ? effects.map((effect) => ({ ...effect })) : [],
+    // Bumped whenever the layer's pixels change; the effect cache keys on it.
+    // A content hash would be correct too and would cost a full pass over the
+    // buffer on every stroke, which is the thing being avoided.
+    rev: 0,
   };
 }
 
@@ -95,6 +105,7 @@ export function cloneDocument(doc) {
       offset: [layer.offset[0], layer.offset[1]],
       buffer: cloneBuffer(layer.buffer),
       mask: layer.mask ? new Uint8Array(layer.mask) : null,
+      effects: (layer.effects ?? []).map((effect) => ({ ...effect })),
     })),
   };
 }
@@ -180,20 +191,37 @@ export function mergeDown(doc, id) {
     ],
     doc.width,
     doc.height,
+    null,
+    renderEffectsUncached,
   );
   lower.buffer = merged;
   lower.offset = [0, 0];
   lower.opacity = 1;
   lower.blend = "normal";
   lower.mask = null;
+  // Effects are baked into `merged`; leaving them attached would apply an
+  // outline to an image that already has one drawn into it.
+  lower.effects = [];
+  lower.rev = (lower.rev ?? 0) + 1;
   doc.layers.splice(at, 1);
   doc.activeId = lower.id;
   return true;
 }
 
+/**
+ * The default effect renderer: computes a layer's effects on demand.
+ *
+ * The panel passes a CACHED renderer instead, because recomputing a blur for
+ * every layer on every stroke is not affordable. This one exists so that
+ * anything which just wants the finished image — saving, merging, flattening —
+ * gets the same picture without having to own a cache.
+ */
+export const renderEffectsUncached = (layer) =>
+  hasEffects(layer) ? renderLayerEffects(layer.buffer, layer.effects) : null;
+
 /** @returns {PixelBuffer} the document as the PNG on disk will look. */
-export function flattenDocument(doc) {
-  return compositeLayers(doc.layers, doc.width, doc.height);
+export function flattenDocument(doc, renderEffects = renderEffectsUncached) {
+  return compositeLayers(doc.layers, doc.width, doc.height, null, renderEffects);
 }
 
 export function flattenToLayer(doc, name = "Flattened") {
@@ -201,6 +229,34 @@ export function flattenToLayer(doc, name = "Flattened") {
   doc.layers = [createLayer({ name, buffer })];
   doc.activeId = doc.layers[0].id;
   return doc;
+}
+
+/**
+ * Adds a layer mask.
+ *
+ * `reveal` starts it fully opaque, which is the useful default: a mask that
+ * hides everything the moment it is added makes the layer vanish and looks
+ * like a bug. `fromSelection` starts it as the selection, which is the other
+ * thing people always want and the reason masks exist at all.
+ */
+export function addLayerMask(layer, width, height, { reveal = true, fromSelection = null } = {}) {
+  if (fromSelection) {
+    layer.mask = new Uint8Array(fromSelection);
+  } else {
+    layer.mask = new Uint8Array(width * height);
+    if (reveal) layer.mask.fill(255);
+  }
+  return layer;
+}
+
+/** Bakes the mask into the layer's alpha and drops it. */
+export function applyLayerMask(layer) {
+  if (!layer.mask) return false;
+  const { data } = layer.buffer;
+  for (let i = 0; i < layer.mask.length; i++) data[i * 4 + 3] *= layer.mask[i] / 255;
+  layer.mask = null;
+  layer.rev = (layer.rev ?? 0) + 1;
+  return true;
 }
 
 /** Canvas size change: pixels keep their scale, the frame around them moves. */

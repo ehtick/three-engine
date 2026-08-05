@@ -3,6 +3,7 @@ import {
   Blend,
   Brush,
   ChevronDown,
+  Check,
   ChevronUp,
   CircleDashed,
   CircleDot,
@@ -12,6 +13,7 @@ import {
   Eraser,
   Eye,
   EyeOff,
+  CircleSlash2,
   Feather,
   FolderOpen,
   Grid3x3,
@@ -30,6 +32,7 @@ import {
   Repeat,
   Save,
   Scissors,
+  Sparkles,
   Square,
   SquareDashed,
   SquareDot,
@@ -77,6 +80,7 @@ import { BLEND_MODES, compositeLayers, blendInto } from "../texture/blend.js";
 import {
   clearRegion,
   cloneBuffer,
+  copyMaskRegion,
   copyRegion,
   createBuffer,
   cropBuffer,
@@ -86,6 +90,8 @@ import {
 import {
   activeLayer as findActiveLayer,
   addLayer,
+  addLayerMask,
+  applyLayerMask,
   cloneDocument,
   cropDocument,
   documentFromBuffer,
@@ -100,7 +106,8 @@ import {
   rotateDocument,
   trimDocument,
 } from "../texture/layers.js";
-import { adjustmentById, defaultParams } from "../texture/adjust.js";
+import { adjustmentById, defaultParams, luminance } from "../texture/adjust.js";
+import { LAYER_EFFECTS, defaultEffect, hasEffects, renderLayerEffects } from "../texture/layerFx.js";
 import { filterById } from "../texture/filters.js";
 import {
   alphaFromLuminance,
@@ -114,6 +121,7 @@ import {
 } from "../texture/channels.js";
 import {
   applyStroke,
+  applyStrokeToMask,
   createStroke,
   fillGradient,
   floodFill,
@@ -358,6 +366,10 @@ function TextureWorkspace({ path, onPathChange, onAtlasChange, onSliceIntoSprite
   }, []);
 
   const [tool, setTool] = useState("brush");
+  // Painting targets the active layer's MASK instead of its pixels. Kept as a
+  // panel-level flag rather than a tool, because every tool should work on a
+  // mask — a mask is painted with the same brush, bucket and gradient.
+  const [maskEditing, setMaskEditing] = useState(false);
   const [color, setColor] = useState("#ffffff");
   const [altColor, setAltColor] = useState("#000000");
   const [alpha, setAlpha] = useState(255);
@@ -378,6 +390,30 @@ function TextureWorkspace({ path, onPathChange, onAtlasChange, onSliceIntoSprite
 
   const bump = useCallback(() => setVersion((v) => v + 1), []);
 
+  /**
+   * Rendered layer effects, cached per layer.
+   *
+   * An outline or a shadow costs a dilate and a blur over the whole layer —
+   * milliseconds, which is nothing once and unusable at pointer rate. The key
+   * is the layer's `rev` (bumped when its pixels change) plus its effect
+   * settings, so a stroke on layer A never recomputes layer B, and moving a
+   * slider recomputes only what the slider changed.
+   */
+  const fxCacheRef = useRef(new Map());
+  const renderEffects = useCallback((layer) => {
+    if (!hasEffects(layer)) {
+      fxCacheRef.current.delete(layer.id);
+      return null;
+    }
+    const key = `${layer.rev ?? 0}:${JSON.stringify(layer.effects)}`;
+    const cached = fxCacheRef.current.get(layer.id);
+    if (cached?.key === key) return cached.value;
+    const value = renderLayerEffects(layer.buffer, layer.effects);
+    fxCacheRef.current.set(layer.id, { key, value });
+    return value;
+  }, []);
+
+
   // --- load --------------------------------------------------------------
   useEffect(() => {
     if (!path) {
@@ -390,7 +426,7 @@ function TextureWorkspace({ path, onPathChange, onAtlasChange, onSliceIntoSprite
       .then(({ doc, warning: warn }) => {
         if (cancelled) return;
         docRef.current = doc;
-        compositeRef.current = compositeLayers(doc.layers, doc.width, doc.height);
+        compositeRef.current = compositeLayers(doc.layers, doc.width, doc.height, null, renderEffects);
         selectionRef.current = null;
         historyRef.current = createHistory();
         setWarning(warn);
@@ -414,7 +450,7 @@ function TextureWorkspace({ path, onPathChange, onAtlasChange, onSliceIntoSprite
     return () => {
       cancelled = true;
     };
-  }, [path, bump]);
+  }, [path, bump, onAtlasChange, renderEffects]);
 
   const doc = docRef.current;
   const layer = doc ? findActiveLayer(doc) : null;
@@ -434,16 +470,19 @@ function TextureWorkspace({ path, onPathChange, onAtlasChange, onSliceIntoSprite
     };
     for (const l of document_.layers) {
       if (l.visible === false) continue;
-      blendInto(composite, l.buffer, {
+      const common = {
         offsetX: l.offset?.[0] ?? 0,
         offsetY: l.offset?.[1] ?? 0,
         opacity: l.opacity ?? 1,
         blend: l.blend ?? "normal",
-        mask: l.mask ?? null,
         clip,
-      });
+      };
+      const fx = renderEffects(l);
+      for (const under of fx?.under ?? []) blendInto(composite, under, common);
+      blendInto(composite, l.buffer, { ...common, mask: l.mask ?? null });
+      for (const over of fx?.over ?? []) blendInto(composite, over, common);
     }
-  }, []);
+  }, [renderEffects]);
 
   // Registered by the canvas. Every edit routes its dirty rectangle through
   // here so there is exactly one place that decides what gets re-uploaded.
@@ -451,6 +490,11 @@ function TextureWorkspace({ path, onPathChange, onAtlasChange, onSliceIntoSprite
 
   const markEdited = useCallback(
     (rect) => {
+      // Bump the active layer's revision so its effects are re-rendered. Doing
+      // it here rather than at every edit site is what keeps "did I remember to
+      // invalidate?" from being a question anyone has to answer.
+      const active = docRef.current ? findActiveLayer(docRef.current) : null;
+      if (active) active.rev = (active.rev ?? 0) + 1;
       recomposite(rect);
       invalidateRef.current?.(rect);
       setDirty(true);
@@ -495,6 +539,8 @@ function TextureWorkspace({ path, onPathChange, onAtlasChange, onSliceIntoSprite
               docRef.current.layers,
               docRef.current.width,
               docRef.current.height,
+              null,
+              renderEffects,
             );
             setDirty(true);
             bump();
@@ -505,7 +551,7 @@ function TextureWorkspace({ path, onPathChange, onAtlasChange, onSliceIntoSprite
       );
       markEdited(null);
     },
-    [pushHistory, markEdited, bump],
+    [pushHistory, markEdited, bump, renderEffects],
   );
 
   // Undo/redo write straight into the existing buffers, so the display surface
@@ -526,7 +572,7 @@ function TextureWorkspace({ path, onPathChange, onAtlasChange, onSliceIntoSprite
     if (!docRef.current || !path || saving) return;
     setSaving(true);
     try {
-      await saveTextureDocument(path, docRef.current);
+      await saveTextureDocument(path, docRef.current, { renderEffects });
       setDirty(false);
       pushToast({ title: `Saved ${basename(path)}` });
     } catch (error) {
@@ -535,7 +581,7 @@ function TextureWorkspace({ path, onPathChange, onAtlasChange, onSliceIntoSprite
     } finally {
       setSaving(false);
     }
-  }, [path, saving]);
+  }, [path, saving, renderEffects]);
 
   // --- operations (Image / Adjust / Filter / Channels) --------------------
 
@@ -1009,6 +1055,15 @@ function TextureWorkspace({ path, onPathChange, onAtlasChange, onSliceIntoSprite
     gradientType,
     selectMode,
   };
+  // Leaving mask mode when the layer's mask goes away — otherwise the brush
+  // silently paints colour where the user expects to be shaping visibility.
+  // In an effect, not during render: a setState in the render body of a
+  // component that renders on every pointer move is an infinite loop waiting
+  // for the right sequence of edits.
+  const activeHasMask = !!(doc && findActiveLayer(doc)?.mask);
+  useEffect(() => {
+    if (maskEditing && !activeHasMask) setMaskEditing(false);
+  }, [maskEditing, activeHasMask]);
 
   return (
     <div className="texture-editor" ref={rootRef} tabIndex={-1}>
@@ -1140,6 +1195,7 @@ function TextureWorkspace({ path, onPathChange, onAtlasChange, onSliceIntoSprite
               version={version}
               tiling={tiling}
               toolProps={toolProps}
+              maskEditing={maskEditing}
               invalidateRef={invalidateRef}
               hasClipboard={!!clipboardRef.current}
               onContextMenu={(at) => setCanvasMenu(at)}
@@ -1192,6 +1248,50 @@ function TextureWorkspace({ path, onPathChange, onAtlasChange, onSliceIntoSprite
               l.blend = mode;
               markEdited(null);
             }}
+            maskEditing={maskEditing}
+            onMaskEditing={setMaskEditing}
+            onAddMask={(id, fromSelection) =>
+              withDocumentSnapshot(fromSelection ? "Mask from Selection" : "Add Mask", (d) => {
+                const l = getLayer(d, id);
+                if (l) {
+                  addLayerMask(l, d.width, d.height, {
+                    fromSelection: fromSelection ? selectionRef.current : null,
+                  });
+                }
+              })
+            }
+            onDeleteMask={(id) =>
+              withDocumentSnapshot("Delete Mask", (d) => {
+                const l = getLayer(d, id);
+                if (l) l.mask = null;
+              })
+            }
+            onApplyMask={(id) =>
+              withDocumentSnapshot("Apply Mask", (d) => {
+                const l = getLayer(d, id);
+                if (l) applyLayerMask(l);
+              })
+            }
+            hasSelection={!!selectionRef.current}
+            onAddEffect={(id, effectId) =>
+              withDocumentSnapshot("Add Effect", (d) => {
+                const l = getLayer(d, id);
+                if (!l || l.effects.some((e) => e.id === effectId)) return;
+                l.effects = [...l.effects, defaultEffect(effectId)];
+              })
+            }
+            onChangeEffect={(id, effectId, patch) => {
+              const l = getLayer(doc, id);
+              if (!l) return;
+              l.effects = l.effects.map((e) => (e.id === effectId ? { ...e, ...patch } : e));
+              markEdited(null);
+            }}
+            onRemoveEffect={(id, effectId) =>
+              withDocumentSnapshot("Remove Effect", (d) => {
+                const l = getLayer(d, id);
+                if (l) l.effects = l.effects.filter((e) => e.id !== effectId);
+              })
+            }
             onAdd={() => withDocumentSnapshot("Add Layer", (d) => addLayer(d, { name: `Layer ${d.layers.length}` }))}
             onDuplicate={(id) => withDocumentSnapshot("Duplicate Layer", (d) => duplicateLayer(d, id))}
             onDelete={(id) => withDocumentSnapshot("Delete Layer", (d) => removeLayer(d, id))}
@@ -1331,6 +1431,7 @@ function TextureCanvas({
   version,
   tiling,
   toolProps,
+  maskEditing,
   invalidateRef,
   hasClipboard,
   onContextMenu,
@@ -1743,16 +1844,21 @@ function TextureCanvas({
         pushToast({ title: layer?.locked ? "That layer is locked" : "That layer is hidden" });
         return null;
       }
+      const onMask = maskEditing && !!layer.mask;
       return {
         kind: "stroke",
-        base: cloneBuffer(layer.buffer),
+        onMask,
+        // A mask is one byte per texel, so its pre-stroke copy is a quarter the
+        // size of the pixel one — worth keeping the two paths apart rather than
+        // round-tripping the mask through an RGBA buffer.
+        base: onMask ? new Uint8Array(layer.mask) : cloneBuffer(layer.buffer),
         stroke: createStroke(doc.width, doc.height),
         carry: 0,
         last: point,
         total: { x0: doc.width, y0: doc.height, x1: 0, y1: 0 },
       };
     },
-    [layer, doc.width, doc.height],
+    [layer, doc.width, doc.height, maskEditing],
   );
 
   const growTotal = (total, rect) => {
@@ -1774,14 +1880,26 @@ function TextureCanvas({
       if (clip.x1 <= clip.x0 || clip.y1 <= clip.y0) return;
       // Restore, then re-apply: coverage accumulates with max(), so painting
       // over already-painted pixels a second time would darken them.
-      copyRegion(layer.buffer, gesture.base, clip);
-      applyStroke(layer.buffer, gesture.stroke, {
-        color: parseColor(tp.color, tp.alpha),
-        opacity: tp.opacity,
-        erase: tp.tool === "eraser",
-        selection: selectionRef.current,
-        clip,
-      });
+      if (gesture.onMask) {
+        copyMaskRegion(layer.mask, gesture.base, doc.width, clip);
+        applyStrokeToMask(layer.mask, doc.width, gesture.stroke, {
+          // White reveals, black hides — the brush's own colour decides, which
+          // is the convention every editor with masks shares.
+          value: tp.tool === "eraser" ? 0 : luminance(...parseColor(tp.color, 255).slice(0, 3)),
+          opacity: tp.opacity,
+          selection: selectionRef.current,
+          clip,
+        });
+      } else {
+        copyRegion(layer.buffer, gesture.base, clip);
+        applyStroke(layer.buffer, gesture.stroke, {
+          color: parseColor(tp.color, tp.alpha),
+          opacity: tp.opacity,
+          erase: tp.tool === "eraser",
+          selection: selectionRef.current,
+          clip,
+        });
+      }
       growTotal(gesture.total, clip);
       onPainting(clip);
       draw();
@@ -2039,8 +2157,19 @@ function TextureCanvas({
       if (gesture.kind === "stroke" || gesture.kind === "shape") {
         const total = gesture.total;
         if (total.x1 > total.x0 && total.y1 > total.y0) {
-          const before = captureRegion(gesture.base, total);
-          onHistory(regionEntry(layer.buffer, total, before, gesture.kind === "shape" ? "Shape" : "Paint"));
+          if (gesture.onMask) {
+            const before = gesture.base;
+            const after = new Uint8Array(layer.mask);
+            onHistory({
+              label: "Paint Mask",
+              bytes: before.length * 2,
+              undo: () => layer.mask.set(before),
+              redo: () => layer.mask.set(after),
+            });
+          } else {
+            const before = captureRegion(gesture.base, total);
+            onHistory(regionEntry(layer.buffer, total, before, gesture.kind === "shape" ? "Shape" : "Paint"));
+          }
         }
         onTouched();
         return;
@@ -2307,10 +2436,13 @@ function Slider({ Icon, title, value, min, max, step, onChange }) {
 function LayerColumn({
   doc, version, onSelect, onToggle, onLock, onRename, onOpacity, onBlend,
   onAdd, onDuplicate, onDelete, onMerge, onReorder,
+  maskEditing, onMaskEditing, onAddMask, onDeleteMask, onApplyMask, hasSelection,
+  onAddEffect, onChangeEffect, onRemoveEffect,
 }) {
   const active = doc.activeId;
   const rows = useMemo(() => [...doc.layers].reverse(), [doc, version]);
   const [renaming, setRenaming] = useState(null);
+  const [fxMenu, setFxMenu] = useState(null);
   const layer = getLayer(doc, active);
 
   return (
@@ -2356,6 +2488,18 @@ function LayerColumn({
                 {l.name}
               </span>
             )}
+            {/* Badges, not words: at a glance you can see which layers carry a
+                mask and which carry effects, without a second column of text. */}
+            {l.mask && (
+              <span className={`tx-badge ${l.id === active && maskEditing ? "on" : ""}`} title="Has a layer mask">
+                <CircleSlash2 size={11} />
+              </span>
+            )}
+            {hasEffects(l) && (
+              <span className="tx-badge" title={`${l.effects.length} effect${l.effects.length === 1 ? "" : "s"}`}>
+                <Sparkles size={11} />
+              </span>
+            )}
             <button
               className={`tx-icon-btn ${l.locked ? "" : "reveal"}`}
               title={l.locked ? "Unlock" : "Lock"}
@@ -2394,6 +2538,75 @@ function LayerColumn({
               onChange={(v) => onOpacity(layer.id, v)}
             />
           </div>
+
+          {/* Mask. Editing is a mode rather than a tool, because every tool
+              should work on a mask — it is painted with the same brush. */}
+          <div className="tx-row">
+            {layer.mask ? (
+              <>
+                <button
+                  className={`tx-btn ${maskEditing ? "on" : "quiet"}`}
+                  title="Paint the mask instead of the layer — white reveals, black hides"
+                  onClick={() => onMaskEditing(!maskEditing)}
+                >
+                  <CircleSlash2 size={13} />
+                  <span>{maskEditing ? "Editing mask" : "Edit mask"}</span>
+                </button>
+                <span className="tx-spacer" />
+                <button className="tx-icon-btn" title="Apply the mask to the pixels" onClick={() => onApplyMask(layer.id)}>
+                  <Check size={13} />
+                </button>
+                <button className="tx-icon-btn danger" title="Delete the mask" onClick={() => onDeleteMask(layer.id)}>
+                  <Trash2 size={13} />
+                </button>
+              </>
+            ) : (
+              <>
+                <button className="tx-btn quiet" title="Add a layer mask" onClick={() => onAddMask(layer.id, false)}>
+                  <CircleSlash2 size={13} />
+                  <span>Mask</span>
+                </button>
+                <button
+                  className="tx-btn quiet"
+                  disabled={!hasSelection}
+                  title={hasSelection ? "Mask from the current selection" : "Make a selection first"}
+                  onClick={() => onAddMask(layer.id, true)}
+                >
+                  From selection
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      {layer && (
+        <div className="tx-section">
+          <div className="tx-section-head">
+            <Sparkles size={13} />
+            Effects
+            <span className="tx-count">{layer.effects?.length ?? 0}</span>
+            <span className="tx-spacer" />
+            <button
+              className="tx-icon-btn"
+              title="Add an effect"
+              onClick={(event) => {
+                const rect = event.currentTarget.getBoundingClientRect();
+                setFxMenu({ x: rect.right, y: rect.bottom + 4 });
+              }}
+            >
+              <Plus size={12} />
+            </button>
+          </div>
+          {!layer.effects?.length && <p className="tx-hint">Outline, shadow and glow follow the layer&apos;s shape.</p>}
+          {(layer.effects ?? []).map((effect) => (
+            <LayerEffectRow
+              key={effect.id}
+              effect={effect}
+              onChange={(patch) => onChangeEffect(layer.id, effect.id, patch)}
+              onRemove={() => onRemoveEffect(layer.id, effect.id)}
+            />
+          ))}
         </div>
       )}
 
@@ -2418,6 +2631,72 @@ function LayerColumn({
           <Trash2 size={14} />
         </button>
       </div>
+
+      {fxMenu && (
+        <ContextMenu
+          x={fxMenu.x}
+          y={fxMenu.y}
+          onClose={() => setFxMenu(null)}
+          items={LAYER_EFFECTS.map((spec) => ({
+            label: spec.label,
+            disabled: (layer?.effects ?? []).some((e) => e.id === spec.id),
+            action: () => onAddEffect(active, spec.id),
+          }))}
+        />
+      )}
+    </div>
+  );
+}
+
+/** One effect and its parameters, collapsed to a header until opened — four
+ *  effects expanded at once would fill the column and hide the layer list. */
+function LayerEffectRow({ effect, onChange, onRemove }) {
+  const spec = LAYER_EFFECTS.find((e) => e.id === effect.id);
+  const [open, setOpen] = useState(true);
+  if (!spec) return null;
+  return (
+    <div className={`tx-effect ${effect.enabled === false ? "off" : ""}`}>
+      <div className="tx-effect-head">
+        <button
+          className="tx-icon-btn"
+          title={effect.enabled === false ? "Enable" : "Disable"}
+          onClick={() => onChange({ enabled: effect.enabled === false })}
+        >
+          {effect.enabled === false ? <EyeOff size={12} /> : <Eye size={12} />}
+        </button>
+        <span className="tx-name" onClick={() => setOpen((v) => !v)}>
+          {spec.label}
+        </span>
+        <button className="tx-icon-btn danger reveal" title="Remove effect" onClick={onRemove}>
+          <Trash2 size={12} />
+        </button>
+      </div>
+      {open &&
+        spec.params.map((param) =>
+          param.color ? (
+            <label key={param.key} className="tx-field">
+              <span>{param.label}</span>
+              <input
+                type="color"
+                value={effect[param.key] ?? param.default}
+                onChange={(e) => onChange({ [param.key]: e.target.value })}
+              />
+            </label>
+          ) : (
+            <label key={param.key} className="tx-field">
+              <span>{param.label}</span>
+              <Slider
+                Icon={Blend}
+                title={param.label}
+                value={effect[param.key] ?? param.default}
+                min={param.min}
+                max={param.max}
+                step={param.step}
+                onChange={(v) => onChange({ [param.key]: v })}
+              />
+            </label>
+          ),
+        )}
     </div>
   );
 }

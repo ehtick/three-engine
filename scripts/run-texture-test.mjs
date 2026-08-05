@@ -104,7 +104,19 @@ import {
   swizzle,
   unpremultiply,
 } from "../src/editor/texture/channels.js";
-import { trimDocument } from "../src/editor/texture/layers.js";
+import {
+  addLayerMask,
+  applyLayerMask,
+  renderEffectsUncached,
+  trimDocument,
+} from "../src/editor/texture/layers.js";
+import {
+  LAYER_EFFECTS,
+  defaultEffect,
+  hasEffects,
+  renderLayerEffects,
+} from "../src/editor/texture/layerFx.js";
+import { applyStrokeToMask } from "../src/editor/texture/draw.js";
 import { blitWithExtrude, packAtlas, packIntoBin } from "../src/editor/texture/packer.js";
 import { nameRegions, sliceByAlpha, sliceGrid, sortReadingOrder } from "../src/editor/texture/slice.js";
 import {
@@ -1501,6 +1513,184 @@ check("nine-slice UV insets are fractions of the REGION, not of the sheet", () =
   assert.ok(Math.abs((us[1] - us[0]) - (8 / 128)) < 1e-6, `inset was ${us[1] - us[0]}`);
   assert.ok(Math.abs((us[3] - us[0]) - (48 / 128)) < 1e-6, "and the whole region is spanned");
   for (const u of us) assert.ok(u >= uv.u0 - 1e-9 && u <= uv.u1 + 1e-9, "never leaves the region");
+});
+
+console.log("\nlayer masks and effects");
+
+/** A small opaque square in the middle of an otherwise empty layer. */
+const squareLayer = (size = 24, box = 8) => {
+  const buffer = createBuffer(size, size);
+  const lo = (size - box) >> 1;
+  for (let y = lo; y < lo + box; y++) {
+    for (let x = lo; x < lo + box; x++) setPixel(buffer, x, y, [255, 255, 255, 255]);
+  }
+  return buffer;
+};
+
+check("a mask starts revealing everything, not hiding it", () => {
+  // A mask that hides the layer the moment it is added makes the artwork
+  // vanish and reads as a bug rather than as a tool.
+  const doc = createDocument({ width: 8, height: 8, background: [255, 0, 0, 255] });
+  addLayerMask(doc.layers[0], 8, 8);
+  assert.equal(doc.layers[0].mask.length, 64);
+  assert.equal(doc.layers[0].mask[0], 255);
+  assert.deepEqual(px(flattenDocument(doc), 0, 0), [255, 0, 0, 255]);
+});
+
+check("a mask hides what it covers, without touching the pixels", () => {
+  const doc = createDocument({ width: 4, height: 1, background: [10, 200, 30, 255] });
+  const layer = doc.layers[0];
+  addLayerMask(layer, 4, 1);
+  layer.mask[1] = 0;
+  layer.mask[2] = 128;
+  const flat = flattenDocument(doc);
+  assert.equal(px(flat, 0, 0)[3], 255);
+  assert.equal(px(flat, 1, 0)[3], 0, "fully masked");
+  assert.ok(Math.abs(px(flat, 2, 0)[3] - 128) <= 1, "half masked");
+  assert.equal(px(layer.buffer, 1, 0)[3], 255, "the layer own alpha is untouched");
+});
+
+check("a mask can be built from a selection", () => {
+  const doc = createDocument({ width: 8, height: 8, background: [1, 2, 3, 255] });
+  const selection = rectSelection(8, 8, { x: 2, y: 2, width: 3, height: 3 });
+  addLayerMask(doc.layers[0], 8, 8, { fromSelection: selection });
+  assert.equal(doc.layers[0].mask[2 * 8 + 2], 255);
+  assert.equal(doc.layers[0].mask[0], 0);
+});
+
+check("applying a mask bakes it into alpha and drops it", () => {
+  const doc = createDocument({ width: 4, height: 1, background: [9, 9, 9, 255] });
+  const layer = doc.layers[0];
+  addLayerMask(layer, 4, 1);
+  layer.mask[0] = 0;
+  layer.mask[1] = 128;
+  assert.equal(applyLayerMask(layer), true);
+  assert.equal(layer.mask, null);
+  assert.equal(px(layer.buffer, 0, 0)[3], 0);
+  assert.ok(Math.abs(px(layer.buffer, 1, 0)[3] - 128) <= 1);
+  assert.equal(applyLayerMask(layer), false, "nothing to apply twice");
+});
+
+check("painting a mask writes coverage, and the brush colour is the value", () => {
+  // White reveals, black hides - the convention every editor with masks shares,
+  // and the reason a mask needs no tool of its own.
+  const mask = new Uint8Array(8 * 8).fill(255);
+  const stroke = createStroke(8, 8);
+  strokeRect(stroke, { x: 2, y: 2, width: 3, height: 3 });
+  applyStrokeToMask(mask, 8, stroke, { value: 0 });
+  assert.equal(mask[2 * 8 + 2], 0, "black hid it");
+  assert.equal(mask[0], 255, "outside the stroke is untouched");
+  applyStrokeToMask(mask, 8, stroke, { value: 255, opacity: 0.5 });
+  assert.ok(mask[2 * 8 + 2] > 100 && mask[2 * 8 + 2] < 160, `half revealed (${mask[2 * 8 + 2]})`);
+});
+
+check("every effect renders from its own defaults without producing NaN", () => {
+  for (const spec of LAYER_EFFECTS) {
+    const result = spec.apply(squareLayer(), defaultEffect(spec.id));
+    const buffers = [...(result.under ? [result.under] : []), ...(result.over ? [result.over] : [])];
+    assert.ok(buffers.length, `${spec.id} produced nothing`);
+    for (const buffer of buffers) {
+      for (let i = 0; i < buffer.data.length; i++) {
+        assert.ok(Number.isFinite(buffer.data[i]), `${spec.id} produced ${buffer.data[i]}`);
+      }
+    }
+  }
+});
+
+check("an outline traces the shape and does NOT cover it", () => {
+  // Effects are derived from alpha, so they follow artwork that has not been
+  // drawn yet - but an outline drawn over the shape would hide it.
+  const layer = squareLayer(24, 8);
+  const { under } = LAYER_EFFECTS.find((e) => e.id === "outline").apply(layer, {
+    id: "outline", size: 2, color: "#ff0000", opacity: 1,
+  });
+  assert.equal(px(under, 12, 12)[3], 0, "the shape own area is knocked out");
+  assert.ok(px(under, 7, 12)[3] > 200, "two texels outside the edge is drawn");
+  assert.deepEqual(px(under, 7, 12).slice(0, 3), [255, 0, 0]);
+  assert.equal(px(under, 4, 12)[3], 0, "and it stops after `size`");
+});
+
+check("a drop shadow is the shape, offset", () => {
+  const layer = squareLayer(32, 8);
+  const { under } = LAYER_EFFECTS.find((e) => e.id === "dropShadow").apply(layer, {
+    id: "dropShadow", distance: 6, angle: 0, blur: 0, spread: 0, color: "#000000", opacity: 1,
+  });
+  // Angle 0 is +X, so the shadow sits to the right of the square.
+  assert.ok(px(under, 20, 16)[3] > 200, `shadow to the right (${px(under, 20, 16)[3]})`);
+  assert.equal(px(under, 8, 16)[3], 0, "and not to the left");
+});
+
+check("a colour overlay tints the shape and nothing else", () => {
+  const layer = squareLayer(16, 6);
+  const { over, under } = LAYER_EFFECTS.find((e) => e.id === "colorOverlay").apply(layer, {
+    id: "colorOverlay", color: "#00ff00", opacity: 1,
+  });
+  assert.equal(under, undefined, "an overlay goes on top, not underneath");
+  assert.deepEqual(px(over, 8, 8), [0, 255, 0, 255]);
+  assert.equal(px(over, 0, 0)[3], 0, "outside the shape it is empty");
+});
+
+check("effects composite under and over the layer, in registry order", () => {
+  const doc = createDocument({ width: 24, height: 24 });
+  doc.layers[0].buffer = squareLayer(24, 8);
+  doc.layers[0].effects = [
+    { id: "outline", enabled: true, size: 2, color: "#ff0000", opacity: 1 },
+    { id: "colorOverlay", enabled: true, color: "#0000ff", opacity: 1 },
+  ];
+  const flat = flattenDocument(doc, renderEffectsUncached);
+  assert.deepEqual(px(flat, 12, 12).slice(0, 3), [0, 0, 255], "the overlay is on top of the shape");
+  assert.deepEqual(px(flat, 7, 12).slice(0, 3), [255, 0, 0], "the outline is beside it");
+});
+
+check("a disabled effect renders nothing, and hasEffects agrees", () => {
+  const layer = { buffer: squareLayer(), effects: [{ id: "outline", enabled: false, size: 3 }] };
+  assert.equal(hasEffects(layer), false);
+  assert.deepEqual(renderLayerEffects(layer.buffer, layer.effects), { under: [], over: [] });
+});
+
+check("a layer opacity fades its effects with it", () => {
+  // An outline is part of the layer; fading the layer to 25% and leaving a
+  // solid rim behind is the thing this rules out.
+  const doc = createDocument({ width: 24, height: 24 });
+  doc.layers[0].buffer = squareLayer(24, 8);
+  doc.layers[0].effects = [{ id: "outline", enabled: true, size: 2, color: "#ff0000", opacity: 1 }];
+  doc.layers[0].opacity = 0.25;
+  const flat = flattenDocument(doc, renderEffectsUncached);
+  assert.ok(px(flat, 7, 12)[3] < 90, `the outline faded too (${px(flat, 7, 12)[3]})`);
+});
+
+check("merging a layer bakes its effects instead of re-applying them", () => {
+  const doc = createDocument({ width: 24, height: 24 });
+  const top = addLayer(doc, { name: "Top" });
+  top.buffer = squareLayer(24, 8);
+  top.effects = [{ id: "outline", enabled: true, size: 2, color: "#ff0000", opacity: 1 }];
+  mergeDown(doc, top.id);
+  assert.equal(doc.layers.length, 1);
+  assert.deepEqual(doc.layers[0].effects, [], "the effect list is cleared");
+  assert.deepEqual(px(doc.layers[0].buffer, 7, 12).slice(0, 3), [255, 0, 0], "but its pixels are there");
+});
+
+await asyncCheck("effects and masks round-trip through .tex", async () => {
+  const doc = createDocument({ width: 12, height: 12 });
+  const layer = doc.layers[0];
+  layer.buffer = squareLayer(12, 4);
+  layer.effects = [{ id: "dropShadow", enabled: true, distance: 3, angle: 90, blur: 1, color: "#112233", opacity: 0.5 }];
+  addLayerMask(layer, 12, 12);
+  layer.mask[5] = 40;
+
+  const back = await decodeTexDoc(await encodeTexDoc(doc, codec), codec);
+  assert.equal(back.layers[0].effects.length, 1);
+  assert.equal(back.layers[0].effects[0].id, "dropShadow");
+  assert.equal(back.layers[0].effects[0].distance, 3);
+  assert.equal(back.layers[0].effects[0].color, "#112233");
+  assert.equal(back.layers[0].mask[5], 40);
+});
+
+await asyncCheck("a layer with no effects writes none into .tex", async () => {
+  const doc = createDocument({ width: 4, height: 4 });
+  const bytes = await encodeTexDoc(doc, codec);
+  const text = new TextDecoder().decode(bytes.subarray(0, 400));
+  assert.ok(!text.includes("effects"), "an empty list is not worth storing");
 });
 
 console.log(`\n${passes} passed, ${failures} failed\n`);

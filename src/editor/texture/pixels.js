@@ -322,3 +322,18 @@ export function toHex(rgba) {
   const h = (v) => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, "0");
   return `#${h(rgba[0])}${h(rgba[1])}${h(rgba[2])}`;
 }
+
+/** `copyRegion` for a single-channel mask — the live-stroke restore needs it
+ *  when the brush is painting visibility rather than colour. */
+export function copyMaskRegion(dst, src, width, { x0, y0, x1, y1 }) {
+  const left = Math.max(0, Math.floor(x0));
+  const right = Math.min(width, Math.ceil(x1));
+  const top = Math.max(0, Math.floor(y0));
+  const bottom = Math.min(Math.floor(src.length / width), Math.ceil(y1));
+  if (right <= left) return dst;
+  for (let y = top; y < bottom; y++) {
+    const at = y * width + left;
+    dst.set(src.subarray(at, at + (right - left)), at);
+  }
+  return dst;
+}

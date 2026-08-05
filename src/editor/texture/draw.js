@@ -425,3 +425,45 @@ export function pickColor(buffer, x, y) {
   const i = (y * buffer.width + x) * 4;
   return [buffer.data[i], buffer.data[i + 1], buffer.data[i + 2], buffer.data[i + 3]];
 }
+
+/**
+ * The stroke, applied to a single-channel MASK rather than to pixels.
+ *
+ * A mask is painted with the same brush, bucket and gradient as anything else —
+ * making it a separate tool would mean maintaining two of each. What differs is
+ * the target: one byte per texel, where the brush's *colour* decides the value
+ * (white reveals, black hides, grey partially), which is the convention every
+ * editor with masks shares.
+ *
+ * @param {Uint8Array} mask
+ * @param {number} width document width, since a mask carries no dimensions
+ * @param {Stroke} stroke
+ */
+export function applyStrokeToMask(mask, width, stroke, {
+  value = 255,
+  opacity = 1,
+  selection = null,
+  clip = null,
+} = {}) {
+  const x0 = Math.max(stroke.dirty.x0, clip?.x0 ?? 0);
+  const y0 = Math.max(stroke.dirty.y0, clip?.y0 ?? 0);
+  const x1 = Math.min(stroke.dirty.x1, clip?.x1 ?? stroke.width);
+  const y1 = Math.min(stroke.dirty.y1, clip?.y1 ?? stroke.height);
+  if (x1 <= x0 || y1 <= y0) return mask;
+
+  const target = Math.max(0, Math.min(255, value));
+  for (let y = y0; y < y1; y++) {
+    for (let x = x0; x < x1; x++) {
+      const i = y * width + x;
+      let cover = stroke.coverage[i] / 255;
+      if (cover <= 0) continue;
+      if (selection) {
+        cover *= selection[i] / 255;
+        if (cover <= 0) continue;
+      }
+      cover *= opacity;
+      mask[i] += (target - mask[i]) * cover;
+    }
+  }
+  return mask;
+}

@@ -62,6 +62,7 @@ export async function encodeTexDoc(doc, { encodePng }) {
       at: offset,
       length: png.length,
     };
+    if (layer.effects?.length) entry.effects = layer.effects.map((effect) => ({ ...effect }));
     offset += png.length;
     if (layer.mask) {
       const maskPng = await encodePng(maskToBuffer(layer.mask, layer.buffer.width, layer.buffer.height));
@@ -137,6 +138,7 @@ export async function decodeTexDoc(bytes, { decodePng }) {
         offset: entry.offset ?? [0, 0],
         buffer,
         mask,
+        effects: Array.isArray(entry.effects) ? entry.effects : null,
       }),
     );
   }
