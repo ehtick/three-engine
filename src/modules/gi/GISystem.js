@@ -16,7 +16,7 @@
 // lights + promoted emissive emitters (uniform slots, zero rebakes), and
 // the GICascadeLight material injection.
 import * as THREE from "three/webgpu";
-import { cameraPosition, cos, float, fract, instanceIndex, mix, normalWorld, positionLocal, positionWorld, screenCoordinate, screenUV, select, sin, smoothstep, texture, uniform, vec2, vec3, vec4 } from "three/tsl";
+import { cameraPosition, cos, float, fract, instanceIndex, mix, normalWorld, positionLocal, positionWorld, renderGroup, screenCoordinate, screenUV, select, sin, smoothstep, texture, uniform, vec2, vec3, vec4 } from "three/tsl";
 import { createRadianceCascades } from "./cascadeTrace.js";
 import { createCascadeMerge } from "./cascadeMerge.js";
 import { createBounceFeedback, createIrradianceGather, createProbeDepthMoments, createProbeIrradiance, createRadianceLookup, depthMomentsAlpha, gatherBias, gatherViewBias, probeSnapAlpha } from "./cascadeGather.js";
@@ -934,7 +934,17 @@ export class GISystem {
         prev.seeded = true;
       }
       const temporalOn = globalThis.__giShadowTemporal !== false;
-      this._giShadowFrameU.value = temporalOn ? this._frame % 4096 : 0;
+      // DEDICATED phase counter — NOT `this._frame`, which is a scan-cadence
+      // counter that #queueRebakeCheck RESETS to -1 on every change event. A
+      // scene with any per-frame transform write (the user's script-driven
+      // sun, any animated prop) pinned `_frame` near zero, the "animated"
+      // jitter oscillated between two phases, and the accumulation converged
+      // to a frozen two-sample stipple — measured by run-gi-shadow-motion as
+      // flicker 0.0000 with grain 0.2262: temporally rock-solid, spatially
+      // filthy, exactly the user's "still grainy" verdict.
+      this._giShadowPhase = ((this._giShadowPhase ?? 0) + 1) % 4096;
+      this._giShadowFrameU.value = temporalOn ? this._giShadowPhase : 0;
+      this._giShadowLastMotion = motion;
       this._giShadowHistWeightU.value = temporalOn
         ? Math.min(0.94, Math.max(0.86, 0.94 - motion * 30))
         : 0;
@@ -2131,9 +2141,18 @@ export class GISystem {
       // Temporal-accumulation uniforms, persistent across rebuilds/resizes
       // (the tick updates them; a rebuild must not orphan the tick's refs).
       if (inputs.lightShadow) {
-        this._giShadowFrameU ??= uniform(0);
-        this._giShadowPrevVPU ??= uniform(new THREE.Matrix4());
-        this._giShadowHistWeightU ??= uniform(0.9);
+        // renderGroup + onRenderUpdate — three's canonical per-frame-uniform
+        // pattern (what time uniforms use). The default object group's
+        // buffer does NOT re-upload on a quiet scene: the phase uniform's
+        // CPU value climbed every tick while the GPU kernel kept the boot
+        // value — the animated jitter was compiled in yet never animated
+        // (probe signature: two same-state raw readbacks differing by ~1
+        // pixel while the phase climbs). The same treatment goes to the
+        // reprojection matrix and history weight — all three are per-frame
+        // temporal inputs with no other upload trigger on a still scene.
+        this._giShadowFrameU ??= uniform(0).setGroup(renderGroup).onRenderUpdate(() => this._giShadowPhase ?? 0);
+        this._giShadowPrevVPU ??= uniform(new THREE.Matrix4()).setGroup(renderGroup);
+        this._giShadowHistWeightU ??= uniform(0.9).setGroup(renderGroup);
       }
       const lightShadowPass = inputs.lightShadow
         ? createGiLightShadowPass({
@@ -2332,6 +2351,14 @@ export class GISystem {
         height: shadowH,
         resolveWidth: width,
         resolveHeight: height,
+        // MUST match the build path's inputs. This splice originally omitted
+        // `frame`, which silently replaced the animated-jitter kernel with
+        // the static one on the FIRST viewport resize — the editor always
+        // resizes once at layout-settle, so every editor session ran frozen
+        // dither while the (never-resizing) smoke page validated the
+        // animated path. Probe signature: two same-state readbacks of the
+        // raw texture differing by ~1 pixel while the phase uniform climbs.
+        frame: this._giShadowFrameU,
       });
       if (passIndexes[0] >= 0) state.queue[passIndexes[0]] = screen.lightShadowPass.compute;
       if (passIndexes[1] >= 0) state.queueNoFeedback[passIndexes[1]] = screen.lightShadowPass.compute;
