@@ -2294,11 +2294,20 @@ export class GISystem {
         if (this.state !== state || !alloc) return;
         const line = `[gi] surface records: ${alloc.allocated}/${alloc.capacity} claimed` +
           `, triangles ${alloc.triangles}/${alloc.triangleCapacity}`;
-        if (alloc.overflowBricks > 0 || alloc.complexOverflowCells > 0) {
+        // TWO DIFFERENT degradations, two different remedies — do not conflate:
+        // pool starvation (claims denied → whole bricks boxed; the capacity is
+        // wrong) vs the per-cell exact-triangle cap (a dense cell exceeds
+        // MAX_COMPLEX_TRIANGLES and is boxed by design; capacity is fine).
+        if (alloc.overflowBricks > 0) {
           console.warn(
-            `${line} — POOL STARVED: ${alloc.overflowBricks} bricks + ` +
-              `${alloc.complexOverflowCells} complex cells degraded to voxel-box hits ` +
-              `(square silhouettes there). Raise the record pool or lower quality.`,
+            `${line} — POOL STARVED: ${alloc.overflowBricks} bricks degraded to voxel-box ` +
+              `hits (square silhouettes there). The record pool is undersized for this scene.`,
+          );
+        } else if (alloc.complexOverflowCells > 0) {
+          console.log(
+            `${line} — ${alloc.complexOverflowCells} dense cells exceed the per-cell ` +
+              `exact-triangle limit and keep voxel-box hits (localized square silhouettes ` +
+              `on dense trim/foliage).`,
           );
         } else {
           console.log(line);
