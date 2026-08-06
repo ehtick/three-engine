@@ -71,7 +71,14 @@ const emitterCounts = process.env.EMITTERS
 // box-kind growth under rotation convicts the contact/complex fallback,
 // raw-delta growth without kind change convicts the width term.
 const moverOn = process.env.MOVER === "1";
-const result = await page.evaluate(async ({ hatch, quality, steps, slab, sunOn, profileOn, kindSub, sunPos, floorY, emitterCounts, moverOn }) => {
+// MOVERY — mover height (default 0.6 = resting on the floor; ~2.5 = the
+// floating-caster case where the width probe's coarse distanceTexture
+// owns the penumbra shape).
+const moverY = Number(process.env.MOVERY ?? 0.6);
+// SOURCEANGLE — the sun's authored source angle (default 10; 0 = the user's
+// razor-sun case where any visible softness is a bug).
+const sourceAngle = Number(process.env.SOURCEANGLE ?? 10);
+const result = await page.evaluate(async ({ hatch, quality, steps, slab, sunOn, profileOn, kindSub, sunPos, floorY, emitterCounts, moverOn, moverY, sourceAngle }) => {
   globalThis.__probeFloorY = floorY;
   globalThis.__editorKeepRendering = true;
   if (hatch === "noselfcut") globalThis.__giNoOccSelfCut = true;
@@ -118,7 +125,7 @@ const result = await page.evaluate(async ({ hatch, quality, steps, slab, sunOn, 
   let mover = null;
   if (moverOn) {
     mover = new THREE.Mesh(anon(new THREE.BoxGeometry(1.2, 1.2, 1.2)), grey);
-    mover.position.set(2.5, 0.6 + floorY, 2.5);
+    mover.position.set(2.5, moverY + floorY, 2.5);
     mover.updateMatrixWorld(true);
     engine.scene.add(mover);
   }
@@ -137,7 +144,7 @@ const result = await page.evaluate(async ({ hatch, quality, steps, slab, sunOn, 
     const sunEnt = engine.createEntity({ name: "Probe Sun" });
     sunEnt.addComponent("light", {
       type: "directional", color: "#ffffff", intensity: 3,
-      castShadow: true, shadowMode: "gi", sourceAngle: 10,
+      castShadow: true, shadowMode: "gi", sourceAngle,
     });
     sunEnt.object3D?.position?.set(sunPos[0], sunPos[1], sunPos[2]);
     // AIM the light: directional direction comes from the entity's ROTATION
@@ -614,7 +621,7 @@ const result = await page.evaluate(async ({ hatch, quality, steps, slab, sunOn, 
     }
   }
   return { W, H, emitters, grain: n ? sum / n : 0, penPx: n, leak, shadowPng: toPng(img), sunKinds, rayStats, bitsProfile };
-}, { hatch, quality, steps, slab, sunOn, profileOn, kindSub, sunPos, floorY, emitterCounts, moverOn });
+}, { hatch, quality, steps, slab, sunOn, profileOn, kindSub, sunPos, floorY, emitterCounts, moverOn, moverY, sourceAngle });
 
 if (result.fail) { console.log(`FAIL: ${result.fail}`); await browser.close(); process.exit(1); }
 if (result.moverStill) {
