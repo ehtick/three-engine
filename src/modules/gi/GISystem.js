@@ -16,7 +16,7 @@
 // lights + promoted emissive emitters (uniform slots, zero rebakes), and
 // the GICascadeLight material injection.
 import * as THREE from "three/webgpu";
-import { If, cameraPosition, cos, float, fract, instanceIndex, mix, normalWorld, positionLocal, positionWorld, renderGroup, screenCoordinate, screenUV, select, sin, smoothstep, texture, uniform, vec2, vec3, vec4 } from "three/tsl";
+import { Fn, If, cameraPosition, cos, float, fract, instanceIndex, mix, normalWorld, positionLocal, positionWorld, renderGroup, screenCoordinate, screenUV, select, sin, smoothstep, texture, uniform, vec2, vec3, vec4 } from "three/tsl";
 import { createRadianceCascades } from "./cascadeTrace.js";
 import { createCascadeMerge } from "./cascadeMerge.js";
 import { createBounceFeedback, createIrradianceGather, createProbeDepthMoments, createProbeIrradiance, createRadianceLookup, depthMomentsAlpha, gatherBias, gatherViewBias, probeSnapAlpha } from "./cascadeGather.js";
@@ -3092,7 +3092,7 @@ export class GISystem {
     const budget =
       Number(globalThis.__giShadowResolvePixels) ||
       this.component?.props.lightShadowMaxPixels ||
-      900_000;
+      1_900_000;
     let { width, height } = resolve;
     const px = width * height;
     if (px > budget) {
@@ -4406,51 +4406,61 @@ export class GISystem {
     const blurTan = uniform(0);
     let shadow = sharp;
     if (this._giLightShadowDistNode) {
-      const distAt = (uv) => this._giLightShadowDistNode.sample(uv).dot(vec4(mask));
-      const t3 = vec2(texel).mul(3).toVar();
-      const blockerNorm = distAt(screenUV)
-        .max(distAt(screenUV.add(vec2(t3.x, 0))))
-        .max(distAt(screenUV.sub(vec2(t3.x, 0))))
-        .max(distAt(screenUV.add(vec2(0, t3.y))))
-        .max(distAt(screenUV.sub(vec2(0, t3.y))))
-        .toVar();
-      const penumbraW = blockerNorm.mul(spanU).mul(blurTan).toVar();
-      // World width → screenUV fraction: w·fovScale/viewDist, capped at 24
-      // half-res texels so a 90° sun cannot blur across the whole frame.
-      const radiusUv = penumbraW.mul(fovScaleU).div(viewDist.max(0.05))
-        .min(vec2(texel).y.mul(24)).toVar();
-      // Interleaved gradient noise → per-pixel spiral rotation.
-      const rotA = fract(
-        fract(screenCoordinate.x.mul(0.06711056).add(screenCoordinate.y.mul(0.00583715)))
-          .mul(52.9829189),
-      ).mul(Math.PI * 2).toVar();
-      const softW = float(0).toVar();
-      const softSum = float(0).toVar();
-      const N = normalWorld.toVar();
-      for (let k = 0; k < 12; k++) {
-        const r = radiusUv.mul(Math.sqrt((k + 0.5) / 12));
-        const a = rotA.add(k * 2.399963);
-        const uv = screenUV.add(vec2(cos(a), sin(a)).mul(r));
-        const s = this._giLightShadowNode.sample(uv).dot(vec4(mask));
-        const g = this._giShadowPosNode.sample(uv);
-        const rel = g.xyz.sub(positionWorld);
-        // Plane-distance validity: |N·rel| small keeps same-surface taps at
-        // any lateral distance; the lateral-scaled slack tolerates curvature.
-        const planeD = N.dot(rel).abs();
-        const lateral = rel.length();
-        const ok = g.w.greaterThan(0.5).and(planeD.lessThan(lateral.mul(0.2).add(0.15)));
-        softW.addAssign(select(ok, float(1), float(0)));
-        softSum.addAssign(select(ok, s, float(0)));
-      }
-      const soft = select(softW.greaterThan(0.5), softSum.div(softW.max(1)), sharp);
-      // Sub-texel radii keep the sharp bilateral bit-exact; the disc fades
-      // in as the penumbra grows past a couple of half-res texels.
-      const softness = smoothstep(
-        vec2(texel).y.mul(0.75),
-        vec2(texel).y.mul(3),
-        radiusUv,
-      );
-      shadow = mix(sharp, soft, softness);
+      // INSIDE A Fn(), NON-NEGOTIABLY (2026-08-06, user's console caught it):
+      // this assembly runs at NODE-BUILD time from #rebuild — there is no
+      // active TSL stack here, so the accumulator `addAssign`es below emitted
+      // "No stack defined for assign operation" and were ORPHANED: softW
+      // stayed 0, the select always fell back to `sharp`, and the whole PCSS
+      // disc was dead code from the day it shipped (the "still a hard edge
+      // at 90°" reports were partly this). Fn() gives the statements a stack;
+      // the closure is built lazily inside the material's own shader build.
+      shadow = Fn(() => {
+        const distAt = (uv) => this._giLightShadowDistNode.sample(uv).dot(vec4(mask));
+        const t3 = vec2(texel).mul(3).toVar();
+        const blockerNorm = distAt(screenUV)
+          .max(distAt(screenUV.add(vec2(t3.x, 0))))
+          .max(distAt(screenUV.sub(vec2(t3.x, 0))))
+          .max(distAt(screenUV.add(vec2(0, t3.y))))
+          .max(distAt(screenUV.sub(vec2(0, t3.y))))
+          .toVar();
+        const penumbraW = blockerNorm.mul(spanU).mul(blurTan).toVar();
+        // World width → screenUV fraction: w·fovScale/viewDist, capped at 24
+        // half-res texels so a 90° sun cannot blur across the whole frame.
+        const radiusUv = penumbraW.mul(fovScaleU).div(viewDist.max(0.05))
+          .min(vec2(texel).y.mul(24)).toVar();
+        // Interleaved gradient noise → per-pixel spiral rotation.
+        const rotA = fract(
+          fract(screenCoordinate.x.mul(0.06711056).add(screenCoordinate.y.mul(0.00583715)))
+            .mul(52.9829189),
+        ).mul(Math.PI * 2).toVar();
+        const softW = float(0).toVar();
+        const softSum = float(0).toVar();
+        const N = normalWorld.toVar();
+        for (let k = 0; k < 12; k++) {
+          const r = radiusUv.mul(Math.sqrt((k + 0.5) / 12));
+          const a = rotA.add(k * 2.399963);
+          const uv = screenUV.add(vec2(cos(a), sin(a)).mul(r));
+          const s = this._giLightShadowNode.sample(uv).dot(vec4(mask));
+          const g = this._giShadowPosNode.sample(uv);
+          const rel = g.xyz.sub(positionWorld);
+          // Plane-distance validity: |N·rel| small keeps same-surface taps at
+          // any lateral distance; the lateral-scaled slack tolerates curvature.
+          const planeD = N.dot(rel).abs();
+          const lateral = rel.length();
+          const ok = g.w.greaterThan(0.5).and(planeD.lessThan(lateral.mul(0.2).add(0.15)));
+          softW.addAssign(select(ok, float(1), float(0)));
+          softSum.addAssign(select(ok, s, float(0)));
+        }
+        const soft = select(softW.greaterThan(0.5), softSum.div(softW.max(1)), sharp);
+        // Sub-texel radii keep the sharp bilateral bit-exact; the disc fades
+        // in as the penumbra grows past a couple of half-res texels.
+        const softness = smoothstep(
+          vec2(texel).y.mul(0.75),
+          vec2(texel).y.mul(3),
+          radiusUv,
+        );
+        return mix(sharp, soft, softness);
+      })();
     }
     const entry = {
       active,
