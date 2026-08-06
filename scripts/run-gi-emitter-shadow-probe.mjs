@@ -64,7 +64,14 @@ const floorY = Number(process.env.FLOORY ?? 0);
 const emitterCounts = process.env.EMITTERS
   ? process.env.EMITTERS.split(",").map(Number).filter((n) => Number.isFinite(n))
   : null;
-const result = await page.evaluate(async ({ hatch, quality, steps, slab, sunOn, profileOn, kindSub, sunPos, floorY, emitterCounts }) => {
+// MOVER=1 — the OBJECT-MOTION shadow instrument (plan §7.1, shadow channel):
+// a cube ON THE FLOOR (present from boot so it is in the GI fingerprint),
+// measured still vs rotating: per-frame step amplitude of the sun's raw
+// shadow channel + (with KINDSUB=1) the verdict-kind counts per phase —
+// box-kind growth under rotation convicts the contact/complex fallback,
+// raw-delta growth without kind change convicts the width term.
+const moverOn = process.env.MOVER === "1";
+const result = await page.evaluate(async ({ hatch, quality, steps, slab, sunOn, profileOn, kindSub, sunPos, floorY, emitterCounts, moverOn }) => {
   globalThis.__probeFloorY = floorY;
   globalThis.__editorKeepRendering = true;
   if (hatch === "noselfcut") globalThis.__giNoOccSelfCut = true;
@@ -106,6 +113,15 @@ const result = await page.evaluate(async ({ hatch, quality, steps, slab, sunOn, 
   const panel = new THREE.Mesh(anon(new THREE.BoxGeometry(5, 4, 0.3)), glowMat);
   panel.position.set(0, 2, -6);
   engine.scene.add(floor, crate, panel);
+  // MOVER: on the floor (ground contact = the mixed-brick case), present
+  // BEFORE the GI entity so it lives in the field fingerprint from boot.
+  let mover = null;
+  if (moverOn) {
+    mover = new THREE.Mesh(anon(new THREE.BoxGeometry(1.2, 1.2, 1.2)), grey);
+    mover.position.set(2.5, 0.6 + floorY, 2.5);
+    mover.updateMatrixWorld(true);
+    engine.scene.add(mover);
+  }
   if (slab) {
     const wall = new THREE.Mesh(anon(new THREE.BoxGeometry(6, 3, 0.08)), grey);
     wall.position.set(0, 1.5, -3);
@@ -161,6 +177,88 @@ const result = await page.evaluate(async ({ hatch, quality, steps, slab, sunOn, 
     }
   }
   await new Promise((r) => setTimeout(r, 2000));
+  if (moverOn && mover) {
+    // OBJECT-MOTION SHADOW METRIC: still-phase vs rotating-phase per-frame
+    // deltas of the sun's raw channel (production values without KINDSUB,
+    // verdict-kind churn with KINDSUB=1).
+    const sb = system.state?.screen;
+    if (!sb?.targets?.lightShadowRaw) return { fail: "mover arm needs SUN=1 (no lightShadowRaw)" };
+    const W3 = sb.shadowWidth, H3 = sb.shadowHeight;
+    const stride3 = Math.ceil((W3 * 4) / 256) * 256;
+    const grab = async () => engine.renderer.backend.copyTextureToBuffer(sb.targets.lightShadowRaw, 0, 0, W3, H3);
+    const deltaOf = (A, B) => {
+      const diffs = new Array(W3 * H3);
+      let di = 0, changed = 0;
+      for (let y = 0; y < H3; y++) {
+        const row = y * stride3;
+        for (let x = 0; x < W3; x++) {
+          const d = Math.abs(A[row + x * 4] - B[row + x * 4]);
+          diffs[di++] = d;
+          if (d > 2) changed++;
+        }
+      }
+      diffs.sort((a, b) => a - b);
+      return { p95: diffs[Math.floor(di * 0.95)], p99: diffs[Math.floor(di * 0.99)], changedPx: changed };
+    };
+    const kindsOf = (A) => {
+      if (!kindSub) return null;
+      const counts = { miss: 0, plane: 0, tri: 0, box: 0, fail: 0, other: 0 };
+      for (let y = 0; y < H3; y++) {
+        const row = y * stride3;
+        for (let x = 0; x < W3; x++) {
+          const b = A[row + x * 4];
+          if (b < 16) counts.miss++;
+          else if (Math.abs(b - 32) <= 5) counts.plane++;
+          else if (Math.abs(b - 64) <= 5) counts.tri++;
+          else if (Math.abs(b - 96) <= 5) counts.box++;
+          else if (b >= 120 && b <= 200) counts.fail++;
+          else counts.other++;
+        }
+      }
+      return counts;
+    };
+    const s1 = await grab();
+    await new Promise((r) => setTimeout(r, 400));
+    const s2 = await grab();
+    const rot = setInterval(() => {
+      mover.rotation.y += 0.01;
+      mover.updateMatrixWorld(true);
+    }, 30);
+    await new Promise((r) => setTimeout(r, 2500));
+    const m1 = await grab();
+    await new Promise((r) => setTimeout(r, 400));
+    const m2 = await grab();
+    clearInterval(rot);
+    // Post-rotation still: wait past the ~90-quiet-frame demote + settle.
+    await new Promise((r) => setTimeout(r, 4000));
+    const p1 = await grab();
+    const pngOf = (A) => {
+      const c = document.createElement("canvas");
+      c.width = W3; c.height = H3;
+      const ctx = c.getContext("2d");
+      const id = ctx.createImageData(W3, H3);
+      for (let y = 0; y < H3; y++) {
+        const row = y * stride3;
+        for (let x = 0; x < W3; x++) {
+          const i = y * W3 + x, b = A[row + x * 4];
+          id.data[i * 4] = b; id.data[i * 4 + 1] = b; id.data[i * 4 + 2] = b; id.data[i * 4 + 3] = 255;
+        }
+      }
+      ctx.putImageData(id, 0, 0);
+      return c.toDataURL("image/png");
+    };
+    return {
+      moverStill: { ...deltaOf(s1, s2), kinds: kindsOf(s2) },
+      moverRotating: { ...deltaOf(m1, m2), kinds: kindsOf(m2) },
+      // Cross-phase: how different is the rotating regime from still, and
+      // does stopping restore the still image?
+      crossStillVsRot: deltaOf(s2, m2),
+      crossStillVsPost: deltaOf(s2, p1),
+      stillPng: pngOf(s2),
+      rotPng: pngOf(m2),
+      postPng: pngOf(p1),
+    };
+  }
   if (emitterCounts) {
     // COST-CURVE ARM: step the emissive count, keep GI awake with a wiggling
     // crate (the game-representative state), record whole-frame GPU medians
@@ -516,9 +614,19 @@ const result = await page.evaluate(async ({ hatch, quality, steps, slab, sunOn, 
     }
   }
   return { W, H, emitters, grain: n ? sum / n : 0, penPx: n, leak, shadowPng: toPng(img), sunKinds, rayStats, bitsProfile };
-}, { hatch, quality, steps, slab, sunOn, profileOn, kindSub, sunPos, floorY, emitterCounts });
+}, { hatch, quality, steps, slab, sunOn, profileOn, kindSub, sunPos, floorY, emitterCounts, moverOn });
 
 if (result.fail) { console.log(`FAIL: ${result.fail}`); await browser.close(); process.exit(1); }
+if (result.moverStill) {
+  console.log(`PROBE MOVER-STILL ${JSON.stringify(result.moverStill)}`);
+  console.log(`PROBE MOVER-ROT   ${JSON.stringify(result.moverRotating)}`);
+  if (result.crossStillVsRot) console.log(`PROBE MOVER-CROSS stillVsRot=${JSON.stringify(result.crossStillVsRot)} stillVsPost=${JSON.stringify(result.crossStillVsPost)}`);
+  if (result.postPng) writeFileSync(`scripts/gi-diag-mover-post${kindSub ? "-kind" : ""}.png`, Buffer.from(result.postPng.split(",")[1], "base64"));
+  if (result.stillPng) writeFileSync(`scripts/gi-diag-mover-still${kindSub ? "-kind" : ""}.png`, Buffer.from(result.stillPng.split(",")[1], "base64"));
+  if (result.rotPng) writeFileSync(`scripts/gi-diag-mover-rot${kindSub ? "-kind" : ""}.png`, Buffer.from(result.rotPng.split(",")[1], "base64"));
+  await browser.close();
+  process.exit(0);
+}
 if (result.costCurve) {
   for (const row of result.costCurve) console.log(`PROBE EMITTER-COST n=${row.n} gpuMs=${row.gpuMs} promoted=${row.promoted} samples=${row.samples}`);
   console.log(`PROBE EMITTER-STABLE ${result.promotedStable}`);
