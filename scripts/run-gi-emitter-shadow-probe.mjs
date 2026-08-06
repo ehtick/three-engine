@@ -56,7 +56,15 @@ await page.evaluate(() => {
 await new Promise((r) => setTimeout(r, 5000));
 
 const floorY = Number(process.env.FLOORY ?? 0);
-const result = await page.evaluate(async ({ hatch, quality, steps, slab, sunOn, profileOn, kindSub, sunPos, floorY }) => {
+// EMITTERS=0,1,2,4,6 — the COST-CURVE arm: steps the number of emissive
+// panels and records whole-frame GPU medians + the promoted-slot set at each
+// count. Answers "how much does each emissive cost" and "what happens past
+// MAX_EMITTERS" with numbers instead of fps feel. Skips the shadow-texture
+// metrics (the scene keeps changing).
+const emitterCounts = process.env.EMITTERS
+  ? process.env.EMITTERS.split(",").map(Number).filter((n) => Number.isFinite(n))
+  : null;
+const result = await page.evaluate(async ({ hatch, quality, steps, slab, sunOn, profileOn, kindSub, sunPos, floorY, emitterCounts }) => {
   globalThis.__probeFloorY = floorY;
   globalThis.__editorKeepRendering = true;
   if (hatch === "noselfcut") globalThis.__giNoOccSelfCut = true;
@@ -153,6 +161,70 @@ const result = await page.evaluate(async ({ hatch, quality, steps, slab, sunOn, 
     }
   }
   await new Promise((r) => setTimeout(r, 2000));
+  if (emitterCounts) {
+    // COST-CURVE ARM: step the emissive count, keep GI awake with a wiggling
+    // crate (the game-representative state), record whole-frame GPU medians
+    // (engine.stats gpuMs = real resolved timestamps, EMA'd) per count.
+    const glowOf = () => {
+      const m = new THREE.MeshStandardNodeMaterial({ color: 0x111111, roughness: 0.9 });
+      m.emissive = new THREE.Color(1, 1, 1);
+      m.emissiveIntensity = 8;
+      return m;
+    };
+    const extras = [];
+    const curve = [];
+    const sortedCounts = [...emitterCounts].sort((a, b) => a - b);
+    const sample = async (label) => {
+      let flip = 1;
+      const wig = setInterval(() => {
+        crate.position.x += 0.02 * (flip = -flip);
+        crate.updateMatrixWorld(true);
+      }, 50);
+      await new Promise((r) => setTimeout(r, 4000)); // pipeline settle after adds
+      const xs = [];
+      const t0 = performance.now();
+      while (performance.now() - t0 < 5000) {
+        await new Promise((r) => setTimeout(r, 200));
+        const v = engine.stats?.readout?.gpuMs;
+        if (Number.isFinite(v) && v > 0) xs.push(v);
+      }
+      clearInterval(wig);
+      xs.sort((a, b) => a - b);
+      const med = xs.length ? xs[Math.floor(xs.length / 2)] : -1;
+      const promoted = system._emitterInfos ?? [];
+      curve.push({ n: label, gpuMs: +med.toFixed(2), samples: xs.length, promoted: promoted.length });
+    };
+    for (const n of sortedCounts) {
+      if (n === 0) {
+        panel.material.emissiveIntensity = 0;
+        panel.material.needsUpdate = true;
+      } else {
+        if (panel.material.emissiveIntensity === 0) {
+          panel.material.emissiveIntensity = 8;
+          panel.material.needsUpdate = true;
+        }
+        while (extras.length < n - 1) {
+          const p = new THREE.Mesh(anon(new THREE.BoxGeometry(1.5, 1.2, 0.2)), glowOf());
+          const a = extras.length * 1.1 + 0.6;
+          p.position.set(Math.cos(a) * 5, 1.2, Math.sin(a) * 5);
+          p.lookAt(0, 1.2, 0);
+          engine.scene.add(p);
+          p.updateMatrixWorld(true);
+          extras.push(p);
+        }
+      }
+      await sample(n);
+    }
+    // Promoted-set stability: does moving an unrelated object reshuffle the
+    // promoted 4 when more candidates exist than slots?
+    const idsOf = () => (system._emitterInfos ?? []).map((i) => i.mesh?.uuid ?? "prov").join("|");
+    const setA = idsOf();
+    crate.position.x += 0.3;
+    crate.updateMatrixWorld(true);
+    await new Promise((r) => setTimeout(r, 1500));
+    const setB = idsOf();
+    return { costCurve: curve, promotedStable: setA === setB };
+  }
   const emitters = system.state?.emitterSlots?.length ?? 0;
   // The emitter shadow texture lives at the SHADOW-channel resolution since
   // the pass split (2026-08-06).
@@ -444,9 +516,15 @@ const result = await page.evaluate(async ({ hatch, quality, steps, slab, sunOn, 
     }
   }
   return { W, H, emitters, grain: n ? sum / n : 0, penPx: n, leak, shadowPng: toPng(img), sunKinds, rayStats, bitsProfile };
-}, { hatch, quality, steps, slab, sunOn, profileOn, kindSub, sunPos, floorY });
+}, { hatch, quality, steps, slab, sunOn, profileOn, kindSub, sunPos, floorY, emitterCounts });
 
 if (result.fail) { console.log(`FAIL: ${result.fail}`); await browser.close(); process.exit(1); }
+if (result.costCurve) {
+  for (const row of result.costCurve) console.log(`PROBE EMITTER-COST n=${row.n} gpuMs=${row.gpuMs} promoted=${row.promoted} samples=${row.samples}`);
+  console.log(`PROBE EMITTER-STABLE ${result.promotedStable}`);
+  await browser.close();
+  process.exit(0);
+}
 writeFileSync(`scripts/gi-diag-emissive-grid-${hatch}${slab ? "-slab" : ""}${steps ? `-s${steps}` : ""}.png`, Buffer.from(result.shadowPng.split(",")[1], "base64"));
 await page.screenshot({ path: `scripts/gi-diag-emissive-grid-${hatch}-view.png` });
 console.log(`PROBE hatch=${hatch}${slab ? "+slab" : ""} q=${quality} ${result.W}x${result.H} emitters=${result.emitters} penumbraPx=${result.penPx} grain=${result.grain.toFixed(4)} leak=${result.leak == null ? "n/a" : result.leak.toFixed(4)}`);
