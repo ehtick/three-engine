@@ -3551,6 +3551,19 @@ export class GISystem {
       lightSlots,
       emitterSlots,
       bleedSaturation,
+      // COVERAGE-WEIGHTED INJECTION (GI_MOTION_PERF_PLAN §5.1): scale each
+      // occupied field cell's injected radiance (emissive base + direct +
+      // bounce) by the fraction of the cell the level-0 occupancy actually
+      // covers. Binary injection made a 5%-covered edge cell as bright as a
+      // solid wall cell, so mover light lurched in whole-cell quanta and
+      // past-MAX_EMITTERS emissives (field-only light) flickered blockily.
+      // The bits buffer is already bound in this kernel (the shadow DDA
+      // marches it) — zero new bindings. `__giCoverageInjection = false`
+      // restores binary injection (build-time A/B).
+      coverageAt:
+        volume.occupancyField?.coverageInBox && globalThis.__giCoverageInjection !== false
+          ? (p) => volume.occupancyField.coverageInBox(p, volume.world.cell.mul(0.5))
+          : null,
       probeIrradiance: probeIrradiance.buffer,
       depthMoments: probeDepth.buffer,
       fieldSmoothing,

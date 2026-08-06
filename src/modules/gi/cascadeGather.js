@@ -765,6 +765,15 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
   // the baked field, injected here per frame instead.
   const emitterSlots = options.emitterSlots ?? null;
   const shadowTrace = options.shadowTrace ?? null;
+  // COVERAGE-WEIGHTED INJECTION (GI_MOTION_PERF_PLAN §5.1): a closure
+  // returning the fraction [~1/K, 1] of a field cell the level-0 occupancy
+  // actually covers (1 when the oracle cannot see the occupancy source).
+  // Applied ONCE to the cell's whole outgoing radiance below — emissive base,
+  // analytic direct, emitter direct and bounce all scale together, because
+  // the physical quantity being represented is per-cell SURFACE AREA and
+  // area is the frame-to-frame invariant of a rigid mover. Binary injection
+  // (coverageAt = null) is the historical behavior.
+  const coverageAt = options.coverageAt ?? null;
   // ANALYTIC-LIGHT shadows may use a different tracer than emitter shadows.
   // GISystem passes the hierarchical occupancy DDA here: the sphere march over
   // the trilinear field TUNNELS through thin slabs at coarse presets — the
@@ -1133,6 +1142,16 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
       const bounceTerm = albedo.mul(irradiance).div(Math.PI).mul(gainUniform);
       out.assign(vec4(out.xyz.add(bounceTerm), 1));
       indirect.addAssign(bounceTerm);
+      if (coverageAt) {
+        // Area weighting (see the option's note). AFTER all injection terms,
+        // BEFORE the EMA: the smoothing then integrates coverage changes the
+        // same way it integrates lighting changes, and a cell entering the
+        // occupied set ramps in at its (small) initial coverage instead of
+        // popping to full-cell brightness — the mover-flicker mechanism.
+        const cov = float(coverageAt(cellCenter)).toVar();
+        out.assign(vec4(out.xyz.mul(cov), out.w));
+        indirect.mulAssign(cov);
+      }
     });
     if (fieldSmoothing) {
       // Retain weight 0 for a cell that just went empty→occupied (the

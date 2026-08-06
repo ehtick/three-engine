@@ -3761,6 +3761,55 @@ export function createOccupancyField(bounds, res0, options = {}) {
     return sat ? fn(p, saturateValue) : fn(p);
   };
 
+  /**
+   * COVERAGE ORACLE (coverage-weighted injection — GI_MOTION_PERF_PLAN §5.1).
+   * Fraction of a world-space box (a radiance-FIELD cell, 2-3 occupancy
+   * voxels per axis at every preset) covered by level-0 bits, normalized so
+   * a flat surface crossing the box reads ≈ 1: occupied-voxel count over the
+   * box's largest cross-section in voxels (an axis-aligned plane sets exactly
+   * that many; oblique planes set more and clamp at 1).
+   *
+   * WHY: the field's injection was BINARY per cell — a 5%-covered edge voxel
+   * of a mover injected like a solid wall cell, so a rotating object's bounce
+   * light lurched in whole field-cell quanta (and every past-MAX_EMITTERS
+   * emissive, whose light lives ONLY in the field, flickered blockily).
+   * Surface AREA is the frame-to-frame invariant of a rigid mover; weighting
+   * injection by this count restores that conservation, so motion
+   * redistributes energy between cells instead of popping it.
+   *
+   * Bounded 4 voxels/axis (64 taps, early-skip beyond the span — headroom,
+   * not truncation, at shipped presets). A zero count means the composite's
+   * occupancy came from something this window cannot see (coarse-level OR,
+   * slot SDF) — report the NEUTRAL 1, never a kill: this oracle only ever
+   * DIMS partially-covered cells, exactly like the record-aware free radius
+   * only ever sharpens.
+   */
+  const coverageInBoxFn = sharedFn({
+    name: "giCoverageInBox",
+    type: "float",
+    inputs: [
+      { name: "center", type: "vec3" },
+      { name: "half", type: "vec3" },
+    ],
+    body: (center, half) => {
+      const inv = vec3(voxelInv).toVar();
+      const lo = vec3(center).sub(vec3(half)).sub(vec3(gridOrigin)).mul(inv).floor().toVar();
+      const span = vec3(half).mul(2).mul(inv).ceil().clamp(vec3(1), vec3(4)).toVar();
+      const count = float(0).toVar();
+      Loop({ start: 0, end: 64, name: "cvi" }, ({ cvi }) => {
+        const cx = cvi.mod(int(4)).toFloat();
+        const cy = cvi.div(int(4)).mod(int(4)).toFloat();
+        const cz = cvi.div(int(16)).toFloat();
+        If(cx.lessThan(span.x).and(cy.lessThan(span.y)).and(cz.lessThan(span.z)), () => {
+          count.addAssign(occupiedAtLevel0(lo.add(vec3(cx, cy, cz))));
+        });
+      });
+      const K = span.x.mul(span.y).max(span.y.mul(span.z)).max(span.x.mul(span.z));
+      return select(count.lessThan(0.5), float(1), count.div(K).clamp(0, 1));
+    },
+  });
+  const coverageInBox = (center, half) => coverageInBoxFn(center, half);
+
   // ═══════════════════════════════════════════════════════════ CPU: geometry
   /**
    * Uploads the scene's unique geometries and the (slot, triangle, chunk) work
@@ -4262,6 +4311,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
     traceOccupancyCone,
     traceHybridBrick,
     traceHybridPlane,
+    coverageInBox,
     /** Density-region layout, for tests/diagnostics (offsets inside `bits`). */
     densityLayout: { wordOffset: densityWordOffset, levels: densityPlan.densityLevels },
     hybridLayout: hybridEnabled ? hybridLayout : null,
