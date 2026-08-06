@@ -333,8 +333,16 @@ export function createOccupancyField(bounds, res0, options = {}) {
   // existing offset stays byte-identical.
   const densityPlan = planDensityLevels(levels);
   const densityWordOffset = trianglePoolWordOffset + totalComplexTriangleCapacity * COMPLEX_TRIANGLE_WORDS;
+  // EXACT-DYNAMIC-OBJECT region (dynamicObjects.js): per-object header +
+  // object-local BVH4 node/triangle pool, appended after the density bytes for
+  // the same reason every other tail rides in this allocation — the composed
+  // kernels sit at the 8-storage-buffer wall, so dynamic-object data must be
+  // readable through the binding they already have. Zero words unless the
+  // feature is on; all existing offsets stay byte-identical.
+  const dynamicObjectWords = Math.max(0, options.dynamicObjectWords | 0);
+  const dynamicObjectWordOffset = densityWordOffset + densityPlan.totalWords;
   const bits = instancedArray(new Uint32Array(
-    densityWordOffset + densityPlan.totalWords,
+    dynamicObjectWordOffset + dynamicObjectWords,
   ), "uint");
   const atomicBits = instancedArray(new Uint32Array(level0.words), "uint").toAtomic();
   // Phase-1 macrocell/brick records, the Phase-2 surface-record pool and the
@@ -548,7 +556,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
       totalWords + level0.words + (hybridEnabled ? hybridLayout.totalWords : 0) +
       totalSurfaceCapacity * (SURFACE_RECORD_WORDS + SURFACE_SCRATCH_WORDS) +
       totalComplexTriangleCapacity * COMPLEX_TRIANGLE_WORDS +
-      densityPlan.totalWords
+      densityPlan.totalWords + dynamicObjectWords
     ) * 4,
     surfaceCapacity,
     dynamicSurfaceCapacity,
@@ -4486,6 +4494,14 @@ export function createOccupancyField(bounds, res0, options = {}) {
     traceHybridBrick,
     traceHybridPlane,
     coverageInBox,
+    /**
+     * Exact-dynamic-object region plumbing (dynamicObjects.js): the bits
+     * buffer node itself plus the reserved tail's offset/capacity. Consumers
+     * never bind anything new — they read through this same buffer.
+     */
+    bitsBuffer: bits,
+    dynamicObjectWordOffset,
+    dynamicObjectWords,
     /** Density-region layout, for tests/diagnostics (offsets inside `bits`). */
     densityLayout: { wordOffset: densityWordOffset, levels: densityPlan.densityLevels },
     hybridLayout: hybridEnabled ? hybridLayout : null,

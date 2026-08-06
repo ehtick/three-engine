@@ -24,6 +24,7 @@ import { blitBvhAtlasTiles, createGiBvhReflect, createGiBvhTarget, createGiEmitt
 import { resolveMaterialSurface, serializeMeshForBake } from "./voxelizeOnce.js";
 import { createOccupancyDebugMaterial, createSdfDebugMaterial, createGiField } from "./giField.js";
 import { createOccupancyField, describeOccupancyField, quantizeOccupancyRes } from "./occupancyField.js";
+import { classifyDynamicShape, composeFieldDynamics, createDynamicObjectSet, dynHeaderWords } from "./dynamicObjects.js";
 import { fitPrimitive } from "./primitiveFit.js";
 import { describeGrid } from "./instanceGrid.js";
 import { BRICK_AXIS_BY_QUALITY, describeSparseField } from "./sparseField.js";
@@ -1018,6 +1019,10 @@ export class GISystem {
     // work list are rotation/translation invariant by construction, so a drag
     // never touches them — see #buildOccupancyField.
     this.#refreshOccupancyTransforms(state.volume.occupancyField);
+    // Exact dynamic objects: live transforms into the header region, queued
+    // geometry uploads, deferred voxel-slot parking. Before the gbuffer/
+    // compute work so this frame's rays see this frame's pose.
+    this.#refreshDynamicObjects(renderer, state);
     // The deferred resolve reads THIS frame's gbuffer, so the prepass renders
     // before any compute is dispatched. It is a nested render (one override
     // material, editor layers excluded) that restores renderer state.
@@ -3585,6 +3590,14 @@ export class GISystem {
           : null,
       probeIrradiance: probeIrradiance.buffer,
       depthMoments: probeDepth.buffer,
+      // Swept-bounds history invalidation (dynamicObjects.js): cells inside a
+      // moving exact-dynamic object's swept region drop EMA history so its
+      // shadow/bounce track instead of ghosting. Reads the header words in
+      // the bits buffer this kernel already binds — zero new bindings.
+      sweptInvalidationAt:
+        this._dynSet?.enabled && globalThis.__giNoSweptInvalidation !== true
+          ? (p) => this._dynSet.sweptFactorAt(p)
+          : null,
       // The lightShadow closure below band-limits its penumbra (penWidth) —
       // tells the gather to keep authored razor angles razor (see its
       // softAngle note).
@@ -4260,6 +4273,11 @@ export class GISystem {
     const sky = state.skyRadiance?.value;
     if (sky) { mix(sky.r); mix(sky.g); mix(sky.b); }
     mix(state.bounceGain?.value ?? 0);
+    // Exact dynamic objects: their transforms are invisible to every other
+    // signal here (no atlas bump, no occupancy revision — that is the whole
+    // point), so their version keeps the pipeline awake while one rotates
+    // and lets it sleep when they rest.
+    mix(this._dynSet?.version ?? 0);
     mix(state.temporalBlend?.value ?? 0);
     mix(state.probeSmoothing?.value ?? 0);
     mix(state.fieldSmoothing?.value ?? 0);
@@ -4967,6 +4985,15 @@ export class GISystem {
     const state = this.state;
     if (!state) return;
     const atlas = state.atlas;
+    // Exact-dynamic adoptees leave the composite too: their atlas slot is
+    // cleared (below, via the byKey miss) and their motion stops bumping the
+    // atlas revision — a rotating adopted mover costs ZERO per-frame
+    // composites. Their occlusion/width lives entirely in the exact
+    // ray-query path (dynamicObjects.js); an adopted EMISSIVE mover keeps
+    // its analytic emitter slot (promotion reads the entry list upstream).
+    if (this._dynAdoptedKeys?.size) {
+      entries = entries.filter((entry) => !this._dynAdoptedKeys.has(entry.key));
+    }
     // Keyed by PLACEMENT (mesh, or mesh+instance index), and a Map rather
     // than the old findIndex-per-entry: that scan was O(entries × capacity),
     // which was invisible at 128 slots and is not at 512 with instancing.
@@ -5696,9 +5723,20 @@ export class GISystem {
     // fingerprint scan, and `#refreshOccupancyContent` re-uploads them into
     // this same field. Sizing the capacity exactly to the meshes present at
     // build time would leave every late arrival with nowhere to go.
+    // EXACT DYNAMIC OBJECTS (docs/dynamic_gi_exact_dynamic_objects.md):
+    // reserved words in the bits allocation for the per-object header + the
+    // object-local BVH4 pool. Header is always needed when the feature is on;
+    // the pool tier bounds how much unique mover geometry can go exact
+    // (overflow keeps the voxel path — never a hole).
+    const dynObjectsOn = globalThis.__giDynamicObjects !== false;
+    const dynPoolWords = Number(globalThis.__giDynMeshWords) ||
+      ({ low: 262144, medium: 393216, high: 786432, ultra: 1572864 }[quality] ?? 786432);
+    const dynWords = dynObjectsOn ? dynHeaderWords() + dynPoolWords : 0;
+
     const field = createOccupancyField(bounds, res, {
       slotCapacity: Math.min(MAX_INSTANCE_SLOTS, Math.max(64, placements.length * 2)),
       traceSteps: { low: 48, medium: 64, high: 96, ultra: 128 }[quality] ?? 96,
+      dynamicObjectWords: dynWords,
       enableProfiling: rayHitConfig?.enableProfiling === true,
       countLegacyFallbacks: rayHitConfig?.fallbackToLegacy === true,
       enableHybridBrick: (rayHitConfig?.activeMode ?? RayHitMode.OccupancyLegacy) >= RayHitMode.HybridBrickBox &&
@@ -5720,7 +5758,82 @@ export class GISystem {
     for (const p of placements) field.setSlotMatrix(p.slot, p.matrix);
     field.setGeometry(geometries, placements);
     field.placements = placements;
+
+    // Fresh per-build dynamic-object set (GPU state is per-field: region
+    // offsets move with the allocation). Adoption KEYS persist across builds
+    // in `_dynAdoptedKeys`, so a previously-adopted mover re-enters exact
+    // representation immediately — it was excluded from `placements` above
+    // and must never voxelize again.
+    this._dynSet = null;
+    if (dynObjectsOn && field.dynamicObjectWords > 0) {
+      this._dynAdoptedKeys ??= new Set();
+      this._dynIneligibleKeys?.clear();
+      this._dynSet = createDynamicObjectSet({
+        bits: field.bitsBuffer,
+        baseWord: field.dynamicObjectWordOffset,
+        capacityWords: field.dynamicObjectWords,
+      });
+      composeFieldDynamics(field, this._dynSet);
+      if (this._dynAdoptedKeys.size > 0) this.#readoptDynamicObjects(meshes);
+      // Boot marker (the "is my build live" pattern): one line that settles
+      // which representation movers get in a running editor.
+      console.log(
+        `[gi] dynamic-objects: exact movers ON (obb + bvh4) — max ${this._dynSet.maxObjects} objects, ` +
+          `${(field.dynamicObjectWords * 4 / (1024 * 1024)).toFixed(1)}MB pool, ${this._dynAdoptedKeys.size} adopted`,
+      );
+    }
     return field;
+  }
+
+  /**
+   * Keeps the exact-dynamic set consistent with the scanned mesh set:
+   * a despawned adoptee releases its object slot (its key persists, so a
+   * pooled respawn re-adopts instead of re-voxelizing); a respawned adoptee
+   * whose entry was released re-enters the set here.
+   */
+  #reconcileDynamicAdoptions(meshes) {
+    const dyn = this._dynSet;
+    if (!dyn?.enabled || !this._dynAdoptedKeys?.size) return;
+    const present = new Map();
+    for (const mesh of meshes) {
+      for (const instanceId of this.#placementsOf(mesh)) {
+        const key = slotKeyOf(mesh, instanceId);
+        if (this._dynAdoptedKeys.has(key)) present.set(key, { mesh, instanceId });
+      }
+    }
+    for (const key of this._dynAdoptedKeys) {
+      const here = present.get(key);
+      if (!here && dyn.has(key)) {
+        dyn.release(key);
+      } else if (here && !dyn.has(key)) {
+        const shape = this.#classifyForAdoption(key, here.mesh);
+        if (shape) dyn.adopt(key, here.mesh, here.instanceId, shape);
+        else this._dynAdoptedKeys.delete(key);
+      }
+    }
+  }
+
+  /** classifyDynamicShape with a per-key negative cache (skinned/huge meshes
+   *  would otherwise re-classify every motion frame). */
+  #classifyForAdoption(key, mesh) {
+    this._dynIneligibleKeys ??= new Set();
+    if (this._dynIneligibleKeys.has(key)) return null;
+    const shape = classifyDynamicShape(mesh);
+    if (!shape) this._dynIneligibleKeys.add(key);
+    return shape;
+  }
+
+  /** Re-adopts persisted keys into a freshly built set (full rebuild path). */
+  #readoptDynamicObjects(meshes) {
+    for (const mesh of meshes) {
+      for (const instanceId of this.#placementsOf(mesh)) {
+        const key = slotKeyOf(mesh, instanceId);
+        if (!this._dynAdoptedKeys.has(key)) continue;
+        const shape = this.#classifyForAdoption(key, mesh);
+        if (shape) this._dynSet.adopt(key, mesh, instanceId, shape);
+        else this._dynAdoptedKeys.delete(key); // geometry changed under the key
+      }
+    }
   }
 
   /**
@@ -5756,6 +5869,9 @@ export class GISystem {
           matrix.copy(scratch).premultiply(mesh.matrixWorld);
         }
         const key = slotKeyOf(mesh, instanceId);
+        // Exact-dynamic adoptees never voxelize: no placement, no slot, no
+        // bits — their geometry is intersected analytically (dynamicObjects.js).
+        if (this._dynAdoptedKeys?.has(key)) continue;
         let slot = slotMap.get(key);
         if (slot == null) {
           slot = this._occSlotNext ?? 0;
@@ -5787,6 +5903,7 @@ export class GISystem {
   #refreshOccupancyContent(meshes) {
     const field = this.state?.volume?.occupancyField;
     if (!field) return;
+    this.#reconcileDynamicAdoptions(meshes);
     const { geometries, placements } = this.#occupancyContentOf(meshes);
     // Slots are stable-for-life now, so the binding constraint is the highest
     // slot ID, not the placement count — a long spawn/despawn history can
@@ -5855,6 +5972,11 @@ export class GISystem {
     const scratch = new THREE.Matrix4();
     for (const p of field.placements) {
       const { mesh, instanceId } = p;
+      // Exact-dynamic adoptees: the slot is parked (or parking — see the
+      // deferred disable in #refreshDynamicObjects) and the object's live
+      // transform is the dynamic set's job. Touching the voxel path again
+      // would re-create exactly the per-frame rebuild this exists to remove.
+      if (p._giAnalytic) continue;
       let changed = false;
       if (instanceId == null || !mesh.isInstancedMesh) {
         changed = !p.matrix.equals(mesh.matrixWorld);
@@ -5866,6 +5988,13 @@ export class GISystem {
         if (changed) p.matrix.copy(scratch);
       }
       if (changed) {
+        // FIRST MOTION = ADOPTION POINT for exact dynamic objects: a mover
+        // that classifies (box → analytic OBB, other rigid mesh → BVH4)
+        // leaves the voxel path here, permanently — its silhouette stops
+        // being a per-frame voxel-membership function, which was the
+        // measured popping mechanism (sessions 31/31d). Ineligible movers
+        // (skinned, over-budget, set full) keep the voxel split below.
+        if (this.#tryAdoptDynamic(p)) continue;
         // Static/dynamic split (occupancyField.staticBits): flag the mover
         // DYNAMIC *before* the matrix write — the flag flip re-snapshots the
         // static side once, and every further frame of this motion replays
@@ -5884,6 +6013,74 @@ export class GISystem {
         p._lastMovedFrame = null;
       }
     }
+  }
+
+  /**
+   * Per-frame exact-dynamic upkeep: transform sync into the header mirror,
+   * header/geometry compute dispatch (with skipped-pipeline retry — the same
+   * async-compile reality the spawn-blink guard documents), and the deferred
+   * voxel-slot parking that makes adoption a one-frame voxel→exact swap.
+   */
+  #refreshDynamicObjects(renderer, state) {
+    const dyn = this._dynSet;
+    if (!dyn?.enabled) return;
+    const world = state.volume?.world;
+    const cellRaw = world?.cellMax;
+    const cell = typeof cellRaw === "number" ? cellRaw : (typeof cellRaw?.value === "number" ? cellRaw.value : 0.35);
+    dyn.sync(cell * 1.5);
+    const pending = dyn.pendingDispatch();
+    if (pending.length > 0) giCompute(renderer, pending);
+    const live = dyn.confirmDispatch(giSkippedComputes);
+    // Park the adoptees' voxel slots only once the exact side is actually
+    // live on the GPU — until then the frozen bits stand in.
+    if (live && this._dynPendingDisable?.length) {
+      const field = state.volume?.occupancyField;
+      for (const slot of this._dynPendingDisable) field?.setSlotEnabled?.(slot, false);
+      this._dynPendingDisable.length = 0;
+      // The pyramid chain only DISPATCHES inside the composite branch, and an
+      // adopted mover no longer bumps the atlas — without this the disable
+      // marks the field dirty and nothing ever consumes it, leaving the
+      // mover's stale bits in the world forever (measured: the dynobj=2
+      // smoke arm's occupancy never dropped). One forced whole-volume
+      // composite purges the bits and refreshes the distance/attr field the
+      // mover just left.
+      this._forceWholeComposite = true;
+      this._compositedOnce = false;
+    }
+  }
+
+  /**
+   * Adopts a moving placement into the exact-dynamic set. The occupancy slot
+   * is NOT parked yet — the header/geometry kernels compile async, and until
+   * they have actually dispatched the object would have no representation at
+   * all. The placement freezes at its pre-motion pose (marked _giAnalytic so
+   * the voxel path stops updating it) and #refreshDynamicObjects swaps the
+   * frozen bits for the live exact shape the moment the GPU side is ready —
+   * a one-frame voxel→exact swap instead of a blink.
+   */
+  #tryAdoptDynamic(p) {
+    const dyn = this._dynSet;
+    if (!dyn?.enabled) return false;
+    const key = slotKeyOf(p.mesh, p.instanceId);
+    if (this._dynAdoptedKeys.has(key)) return true; // already ours
+    const shape = this.#classifyForAdoption(key, p.mesh);
+    if (!shape) return false;
+    if (!dyn.adopt(key, p.mesh, p.instanceId, shape)) return false;
+    this._dynAdoptedKeys.add(key);
+    p._giAnalytic = true;
+    p._lastMovedFrame = null;
+    (this._dynPendingDisable ??= []).push(p.slot);
+    // Leave the composite immediately too (the #syncSlots filter only runs on
+    // fingerprint scans): clearing the atlas slot purges the mover from the
+    // distance field in one composite and stops its rotation from bumping the
+    // atlas revision every frame thereafter.
+    const atlas = this.state?.atlas;
+    if (atlas?.assignments) {
+      for (let i = 0; i < atlas.assignments.length; i++) {
+        if (atlas.assignments[i]?.key === key) { atlas.clearSlot(i); break; }
+      }
+    }
+    return true;
   }
 
   /** Debug "Occupancy" view: a volume box hierarchical-DDA-ing the pyramid. */

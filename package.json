@@ -102,7 +102,8 @@
     "smoke:git": "node scripts/run-git-smoke.mjs",
     "test:fonts": "node scripts/run-fonts-test.mjs",
     "test:mcp-coverage": "node scripts/run-mcp-coverage-test.mjs",
-    "smoke:mcp-tools": "node scripts/run-mcp-tools-smoke.mjs"
+    "smoke:mcp-tools": "node scripts/run-mcp-tools-smoke.mjs",
+    "test:gi-dynobj": "node scripts/run-gi-dynobj-bvh4-test.mjs"
   },
   "dependencies": {
     "@dimforge/rapier3d-compat": "^0.19.3",

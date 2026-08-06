@@ -27,10 +27,14 @@ const page = await browser.newPage();
 await page.setViewport({ width: 1600, height: 1000, deviceScaleFactor: 1 });
 await installTauriShim(page, {});
 let built = false;
+let waveDone = false;
 page.on("console", (m) => {
   const t = m.text();
-  if (/\[gi\] built|light shadows/.test(t)) console.log(`  ${t.slice(0, 160)}`);
+  if (/\[gi\] built|light shadows|dynamic-objects|compile wave: materials/.test(t)) console.log(`  ${t.slice(0, 160)}`);
   if (/\[gi\] built/.test(t)) built = true;
+  // Headless cold-cache waves run 30-100s (session-15 trap: wave timings are
+  // noise) — sampling before completion reads a stalled engine as zero churn.
+  if (/compile wave: materials \d+ms/.test(t)) waveDone = true;
 });
 page.on("pageerror", (e) => {
   const msg = e.message ?? String(e);
@@ -50,6 +54,7 @@ await page.evaluate((project) => {
 }, PROJECT);
 await page.waitForFunction(() => !!globalThis.__editorApi, { timeout: 150000 });
 for (let i = 0; i < 90 && !built; i++) await wait(1000);
+for (let i = 0; i < 180 && !waveDone; i++) await wait(1000);
 await wait(12000);
 
 const call = (op, args = {}) =>
@@ -82,6 +87,54 @@ if (mpos) {
   });
 }
 await wait(2500);
+
+// SPIN=1 — rotate the mover from the harness (2-axis 0.6 rad/s, the user's
+// MeshScript verbatim) instead of relying on the scene's script still being
+// attached. The scene file changes under us between sessions; an instrument
+// whose stimulus depends on it silently measures a STATIC cube (this run's
+// all-zero BURST diffs, 2026-08-06).
+if (process.env.SPIN === "1" && mover?.id) {
+  await page.evaluate((id) => {
+    const o = globalThis.__editorApi.entities.live(id)?.object3D;
+    if (!o) return;
+    let last = performance.now();
+    const tick = () => {
+      const now = performance.now();
+      const dt = Math.min(0.1, (now - last) / 1000);
+      last = now;
+      o.rotation.y += 0.6 * dt;
+      o.rotation.x += 0.6 * dt;
+      o.updateMatrixWorld(true);
+      globalThis.__spinRaf = requestAnimationFrame(tick);
+    };
+    globalThis.__spinRaf = requestAnimationFrame(tick);
+  }, mover.id);
+  await wait(3000); // adoption + purge settle before sampling
+  const dynState = await page.evaluate(async (id) => {
+    const eng = globalThis.__editorApi.entities.live(id)?.engine;
+    const sys = eng?.modules?.get("gi")?.system;
+    const dyn = sys?._dynSet;
+    const f0 = sys?._frame ?? -1;
+    const r0 = eng?.renderer?.info?.render?.frame ?? -1;
+    await new Promise((r) => setTimeout(r, 600));
+    const f1 = sys?._frame ?? -1;
+    const r1 = eng?.renderer?.info?.render?.frame ?? -1;
+    return {
+      ticking: f1 > f0, frames: [f0, f1], renderFrames: [r0, r1],
+      suspended: eng?.renderSuspended ?? null,
+      keepRendering: globalThis.__editorKeepRendering ?? null,
+      dynSet: !!dyn,
+      enabled: dyn?.enabled ?? false,
+      count: dyn?.count?.() ?? -1,
+      version: dyn?.version ?? -1,
+      pending: dyn?.pendingDispatch?.().length ?? -1,
+      pendingDisable: sys?._dynPendingDisable?.length ?? 0,
+      adoptedKeys: sys?._dynAdoptedKeys?.size ?? 0,
+      stats: dyn?.stats ?? null,
+    };
+  }, mover.id);
+  console.log(`  SPIN dynState=${JSON.stringify(dynState)}`);
+}
 
 const result = await page.evaluate(async ({ anchorId, frames }) => {
   const eng = globalThis.__editorApi.entities.live(anchorId)?.engine;
@@ -169,30 +222,43 @@ if (process.env.CELLBURST === "1") {
         for (let x = lo[0]; x <= hi[0]; x++)
           idxs.push((z * res.y + y) * res.x + x);
     const track = [];
+    const wTrack = [];
     for (let f = 0; f < 20; f++) {
       await new Promise((r) => requestAnimationFrame(r));
       const rad = new Float32Array(await eng.renderer.getArrayBufferAsync(vol.radianceBuffer.value));
       track.push(idxs.map((i) => +(rad[i * 4] * 0.2126 + rad[i * 4 + 1] * 0.7152 + rad[i * 4 + 2] * 0.0722).toFixed(3)));
+      wTrack.push(idxs.map((i) => rad[i * 4 + 3]));
     }
     // Per-cell max single-frame |step| and the count of big appear/disappear
-    // events (step > 50% of the cell's own max).
-    let bigPops = 0, maxStep = 0, active = 0;
+    // events (step > 50% of the cell's own max). For each big pop, record
+    // whether the cell's MEMBERSHIP (radiance.w — 1 occupied / 0 cleared)
+    // flipped on that exact frame: the EMA bounds occupied-cell change to
+    // ~5%/frame, so full-amplitude pops can only ride the wasEmpty-adoption /
+    // instant-clear bypass paths. wFlip counts convict or clear that theory.
+    let bigPops = 0, maxStep = 0, active = 0, popsWithWFlip = 0, popsNoWFlip = 0;
     const worstCells = [];
     for (let c = 0; c < idxs.length; c++) {
-      let cellMax = 0, cellStep = 0;
+      let cellMax = 0, cellStep = 0, cellStepF = 0;
       for (let f = 0; f < track.length; f++) cellMax = Math.max(cellMax, track[f][c]);
       if (cellMax < 0.05) continue;
       active++;
       for (let f = 1; f < track.length; f++) {
         const st = Math.abs(track[f][c] - track[f - 1][c]);
-        cellStep = Math.max(cellStep, st);
-        if (st > cellMax * 0.5) bigPops++;
+        if (st > cellStep) { cellStep = st; cellStepF = f; }
+        if (st > cellMax * 0.5) {
+          bigPops++;
+          if (Math.abs(wTrack[f][c] - wTrack[f - 1][c]) > 0.25) popsWithWFlip++;
+          else popsNoWFlip++;
+        }
       }
       maxStep = Math.max(maxStep, cellStep);
-      worstCells.push({ step: +cellStep.toFixed(2), max: +cellMax.toFixed(2) });
+      worstCells.push({
+        step: +cellStep.toFixed(2), max: +cellMax.toFixed(2),
+        wPrev: +wTrack[cellStepF - 1]?.[c]?.toFixed(2), wNow: +wTrack[cellStepF]?.[c]?.toFixed(2),
+      });
     }
     worstCells.sort((a, b) => b.step - a.step);
-    return { cells: idxs.length, active, bigPops, maxStep: +maxStep.toFixed(2), worst: worstCells.slice(0, 8) };
+    return { cells: idxs.length, active, bigPops, popsWithWFlip, popsNoWFlip, maxStep: +maxStep.toFixed(2), worst: worstCells.slice(0, 8) };
   }, { anchorId: mover?.id ?? ents[0].id, mpos });
   console.log(`CELLBURST ${JSON.stringify(cb)}`);
 }

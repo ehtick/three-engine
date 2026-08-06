@@ -161,8 +161,13 @@ export function createCascadeMerge(cascades, { sky = [0, 0, 0], occupancyVoxel =
         const bias = float(cascade.world.minCell).mul(0.25).toVar();
         const blocked = float(0).toVar();
         If(dist.greaterThan(bias.mul(4)), () => {
+          // `dynamics: false` — this prepass re-runs only on composite frames
+          // (geometry changes), so per-frame exact-dynamic objects must not
+          // leak into it: a mover's stale verdict here would gate the merge
+          // wrongly for whole frames. Movers never participated when they
+          // were voxelized either (transform updates don't recomposite).
           const r = occupancy.traceOccupancy(
-            childPos, rel.div(dist), bias, dist.sub(bias), { steps: 48 },
+            childPos, rel.div(dist), bias, dist.sub(bias), { steps: 48, dynamics: false },
           );
           blocked.assign(r.hit);
         });

@@ -1580,6 +1580,11 @@ export function createOccupancyDebugMaterial(volume) {
     // report a hole the transport rays would not see just because it ran out of
     // iterations (the failure that made the sparse field look broken when the
     // MARCHER was starved).
+    // `dynamics: "obb"` — this is a FRAGMENT shader, and the exact-dynamic
+    // BVH4 traversal is compute-only by policy (its raw-WGSL storage pointer
+    // is annotated for the compute kernels' binding mode). Analytic OBB
+    // movers still show up in the debug view — which is the instrument for
+    // "is the exact box actually where the mesh is".
     const r = plane
       ? occField.traceHybridPlane(
           cameraPosition,
@@ -1590,6 +1595,7 @@ export function createOccupancyDebugMaterial(volume) {
             macroSteps: MAX_MACRO_STEPS,
             coverage: volume.rayHitMode >= RayHitMode.HybridPlaneCoverage,
             exact: volume.rayHitMode === RayHitMode.HybridExactComplex,
+            dynamics: "obb",
           },
         )
       : hybrid
@@ -1598,10 +1604,10 @@ export function createOccupancyDebugMaterial(volume) {
             dir,
             tEnter.max(0),
             tExit.max(0),
-            { macroSteps: MAX_MACRO_STEPS },
+            { macroSteps: MAX_MACRO_STEPS, dynamics: "obb" },
           )
         : occField.traceOccupancy(
-            cameraPosition, dir, tEnter.max(0), tExit.max(0), { steps: 256 },
+            cameraPosition, dir, tEnter.max(0), tExit.max(0), { steps: 256, dynamics: "obb" },
           );
     If(r.hit.lessThan(0.5), () => {
       Discard();

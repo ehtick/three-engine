@@ -844,6 +844,14 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
   // frozen). GISystem defaults its uniform to 0.95 (user-confirmed live,
   // 2026-08-03) via `__giFieldSmoothing`.
   const fieldSmoothing = options.fieldSmoothing ?? null;
+  // SWEPT-BOUNDS TEMPORAL INVALIDATION (docs/dynamic_gi_exact_dynamic_objects.md):
+  // a closure returning a history factor [~0.35, 1] at a cell center — reduced
+  // inside any exact-dynamic object's swept region (prev ∪ curr world bounds,
+  // expanded) while it moves. Cells whose lighting the mover just changed drop
+  // their EMA history so shadows/bounce track the object instead of ghosting;
+  // everything outside keeps full history. Null = off (no dynamic objects, or
+  // `__giNoSweptInvalidation`).
+  const sweptInvalidationAt = options.sweptInvalidationAt ?? null;
 
   return Fn(() => {
     // Temporal ingest of streamed bakes: staging holds the latest CPU bake
@@ -1210,6 +1218,21 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
       // the whole downstream (probe EMA, screen resolve) inherits.
       const fieldAlpha = float(fieldSmoothing).toVar();
       If(wasEmpty, () => { fieldAlpha.assign(0); });
+      // Swept-region history cut (see the option's note): the retain weight
+      // scales down inside a moving exact-dynamic object's swept bounds, so
+      // its shadow/bounce sweep across static cells with low lag while the
+      // rest of the field keeps full smoothing. Cell center recomputed here —
+      // the occupied-branch `cellCenter` is out of scope, and this block runs
+      // for every cell.
+      if (sweptInvalidationAt) {
+        const idxS = instanceIndex.toFloat();
+        const cellCenterS = vec3(
+          mod(idxS, res.x).add(0.5).mul(world.cell.x).add(world.min.x),
+          mod(floor(idxS.div(res.x)), res.y).add(0.5).mul(world.cell.y).add(world.min.y),
+          floor(idxS.div(res.x * res.y)).add(0.5).mul(world.cell.z).add(world.min.z),
+        );
+        fieldAlpha.assign(fieldAlpha.mul(float(sweptInvalidationAt(cellCenterS))));
+      }
       out.assign(vec4(mix(out.xyz, prevRadiance.xyz, fieldAlpha), out.w));
       if (prevIndirect) indirect.assign(mix(indirect, prevIndirect.xyz, fieldAlpha));
     }

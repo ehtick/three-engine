@@ -50,6 +50,12 @@ await new Promise((r) => setTimeout(r, 5000));
 const result = await page.evaluate(async () => {
   // editorFramePacing stops the engine loop headless — see run-gi-occupancy.
   globalThis.__editorKeepRendering = true;
+  // This suite regression-tests the VOXEL spawn/despawn machinery (stable
+  // slots, pair reuse, fast chains) — the path non-adoptable movers still
+  // take. Exact-dynamic adoption would park the mover's slot on first motion
+  // and every voxel assertion below would measure the wrong subsystem, so it
+  // is pinned off here (the gi-gpu-smoke ?dynobj arms cover adoption).
+  globalThis.__giDynamicObjects = false;
   const { THREE } = await import("/src/engine/index.js");
   await import("/src/modules/index.js");
   const { enableEngineModule } = await import("/src/engine/modules.js");

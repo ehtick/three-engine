@@ -67,6 +67,13 @@
         // The zero-limit assertions below then measure the shadow arm too —
         // a run FAILING with nonzero macro=/brick= counts IS the attribution.
         if (new URLSearchParams(location.search).get("shadowprofile") === "1") globalThis.__giShadowProfile = true;
+        // `?dynamic=1` pins exact-dynamic adoption OFF at boot (build-time
+        // hatch) — that arm gates the voxel record-refit tail, which adoption
+        // would legitimately bypass. `?dynobj=1` is the adoption arm.
+        if (new URLSearchParams(location.search).get("dynamic") === "1") globalThis.__giDynamicObjects = false;
+        // dynobj=1 → box mover (analytic OBB path); dynobj=2 → torus mover
+        // (object-local BVH4 exact-triangle path).
+        const dynObjArm = Number(new URLSearchParams(location.search).get("dynobj") ?? 0);
         // editorFramePacing stops unfocused engines — headless the page is
         // NEVER focused, and the temporal gate below is the first assertion
         // that needs the loop RUNNING at assert time (earlier arms only read
@@ -168,6 +175,14 @@
         const dynamicArm = new URLSearchParams(location.search).get("dynamic") === "1";
         let dynamicAlloc = null;
         if (dynamicArm) {
+          // This arm regression-gates the VOXEL record-refit tail — the path
+          // non-adoptable movers (skinned, over-budget, set overflow) still
+          // take. Exact-dynamic adoption would park the wall's slot on first
+          // motion and the tail would legitimately stay at zero, so the arm
+          // pins the feature off. (?dynobj=1 is the adoption arm.)
+          if (globalThis.__giDynamicObjects !== false) {
+            throw new Error("dynamic arm: set __giDynamicObjects=false before GI builds (see the boot pin below)");
+          }
           const occField = engine.modules.get("gi").system.state.volume.occupancyField;
           const dynDeadline = performance.now() + 20_000;
           while (performance.now() < dynDeadline) {
@@ -181,6 +196,65 @@
           }
           // Re-read so the limit/invalid asserts below cover the moving frames.
           stats = await engine.modules.get("gi").system.readRayHitStats();
+        }
+        // `?dynobj=1` — the EXACT-DYNAMIC ADOPTION arm
+        // (docs/dynamic_gi_exact_dynamic_objects.md): rotate the wall so the
+        // first transform change adopts it as an analytic OBB. Asserts the
+        // three contract points no CPU suite can: (1) adoption happened and
+        // the GPU side went live, (2) the wall's bits LEFT the world
+        // occupancy (occupied-voxel count drops), (3) further rotation leaves
+        // the occupancy BYTE-STABLE — the membership churn that popped
+        // silhouettes is structurally gone.
+        let dynObjReport = null;
+        if (dynObjArm) {
+          const system = engine.modules.get("gi").system;
+          const occField = system.state.volume.occupancyField;
+          const settle = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+          let mover = wall;
+          if (dynObjArm === 2) {
+            // Non-default mesh → the BVH4 exact-triangle path. Added AFTER
+            // boot so the content refresh ships it like a late-loading GLB.
+            mover = new THREE.Mesh(new THREE.TorusKnotGeometry(0.8, 0.25, 48, 12), material);
+            mover.position.set(1.5, 0.5, 0);
+            mover.updateMatrixWorld(true);
+            engine.scene.add(mover);
+            await settle(2_500); // fingerprint scan + content refresh + re-voxelize
+          }
+          await settle(1_000);
+          const before = await occField.readbackStats(engine.renderer);
+          const occupiedBefore = before.occupiedVoxels;
+          const adoptDeadline = performance.now() + 20_000;
+          let adopted = false;
+          while (performance.now() < adoptDeadline) {
+            mover.rotation.y += 0.05;
+            mover.rotation.x += 0.03;
+            mover.updateMatrixWorld(true);
+            await settle(50);
+            if ((system._dynSet?.count() ?? 0) > 0 && system._dynSet.pendingDispatch().length === 0 &&
+                (system._dynPendingDisable?.length ?? 0) === 0) { adopted = true; break; }
+          }
+          if (!adopted) throw new Error("dynobj arm: the rotating mover never adopted (or the GPU side never went live)");
+          if (dynObjArm === 2 && !(system._dynSet.stats.meshUploadsQueued > 0)) {
+            throw new Error("dynobj=2 arm: the torus adopted without a BVH4 upload — it took the OBB path");
+          }
+          // Let the parked slot's purge re-voxelize land, then measure.
+          for (let i = 0; i < 20; i++) { mover.rotation.y += 0.05; mover.updateMatrixWorld(true); await settle(50); }
+          const mid = await occField.readbackStats(engine.renderer);
+          for (let i = 0; i < 10; i++) { mover.rotation.y += 0.07; mover.rotation.z += 0.04; mover.updateMatrixWorld(true); await settle(50); }
+          const after = await occField.readbackStats(engine.renderer);
+          if (!(mid.occupiedVoxels < occupiedBefore)) {
+            throw new Error(`dynobj arm: occupancy never dropped after adoption (${occupiedBefore} -> ${mid.occupiedVoxels}) — the mover still voxelizes`);
+          }
+          if (mid.occupiedVoxels !== after.occupiedVoxels) {
+            throw new Error(`dynobj arm: occupancy changed under pure mover rotation (${mid.occupiedVoxels} -> ${after.occupiedVoxels}) — membership churn survives`);
+          }
+          dynObjReport = {
+            occupiedBefore, occupiedAfter: after.occupiedVoxels,
+            adopted: system._dynSet.count(), meshUploads: system._dynSet.stats.meshUploadsQueued,
+            poolWords: system._dynSet.stats.poolWordsUsed,
+          };
+          console.log("GI-SMOKE DYNOBJ", JSON.stringify(dynObjReport));
+          stats = await system.readRayHitStats();
         }
         engine.stop();
         const bindingAudit = [];
