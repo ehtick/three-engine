@@ -2052,6 +2052,13 @@ export class GISystem {
                   exact: shadowMode === RayHitMode.HybridExactComplex,
                   penumbraK: k,
                   macroSteps,
+                  // DIAGNOSTIC (build-time): fold the SHADOW rays into the
+                  // rayHitDebug counters. The gather rays are profiled by
+                  // default and read 0 limit exits on healthy scenes, so any
+                  // macro/brick/invalid counts that appear under this hatch
+                  // are the shadow arm's — the fail-closed attribution the
+                  // texture-side kind map exists for, without the texture.
+                  profile: globalThis.__giShadowProfile === true,
                   // ORIGIN-PLANE EXCLUSION: the receiving surface point. The
                   // march skips accepts/cone contributions whose plane
                   // contains it — the receiver's own SAT-bulged staircase
@@ -2066,6 +2073,14 @@ export class GISystem {
                   // WHICH acceptance class decided each pixel. miss=white,
                   // plane=0.75, exact-triangle=0.5, box=0.25, clamp=black.
                   return vec2(float(1).sub(r.kind.mul(0.25)), 0);
+                }
+                if (globalThis.__giShadowKindDebug === "sub") {
+                  // SUB-KIND MAP: kind·0.125 puts every class at a distinct
+                  // byte — miss=0, plane=32, tri=64, box=96, macro-exhaust=128,
+                  // brick-limit=159, invalid-brick=191 (and 255 = no geometry,
+                  // the pass default). This is the fail-closed ATTRIBUTION
+                  // instrument: 4/5/6 render identically in production.
+                  return vec2(r.kind.mul(0.125), 0);
                 }
                 // x = exact-arm visibility × cone transmittance (the two
                 // phases partition the ray, so the product is the ray's

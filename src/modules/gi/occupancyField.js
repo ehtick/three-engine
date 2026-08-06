@@ -2781,6 +2781,11 @@ export function createOccupancyField(bounds, res0, options = {}) {
                     .and(brickIndex.notEqual(uint(INVALID_RAY_HIT_INDEX)));
                   If(validBrick.not(), () => {
                     invalidRef.assign(1);
+                    // Sub-kind 6: Brick-typed macro cell with a broken brick
+                    // index. Consumers treat every kind > 3.5 as one
+                    // fail-closed class; the distinct value serves the
+                    // kind-map instrument (attribution, not behaviour).
+                    if (penumbra) hitKind.assign(6);
                     Break();
                   });
 
@@ -3145,6 +3150,11 @@ export function createOccupancyField(bounds, res0, options = {}) {
                   });
                   If(localResolved.lessThan(0.5), () => {
                     brickLimit.assign(1);
+                    // Sub-kind 5: the INNER brick loop spent MAX_BRICK_STEPS
+                    // without reaching the segment end — fail-closed from the
+                    // brick, not the macro budget. Same > 3.5 class for
+                    // consumers; distinct for the kind-map instrument.
+                    if (penumbra) hitKind.assign(5);
                     Break();
                   });
                   axis.assign(localAxis);
@@ -3210,7 +3220,14 @@ export function createOccupancyField(bounds, res0, options = {}) {
                   hit.assign(1);
                   hitT.assign(t);
                   hitNormal.assign(faceNormalFrom(axis));
-                  if (penumbra) hitKind.assign(4);
+                  // Kind 4 = macro-budget exhaustion. Break paths already
+                  // stamped 5 (brick limit) / 6 (invalid brick ref) — keep
+                  // them; every consumer tests > 3.5, one class.
+                  if (penumbra) {
+                    If(hitKind.lessThan(3.5), () => {
+                      hitKind.assign(4);
+                    });
+                  }
                 });
               }
 

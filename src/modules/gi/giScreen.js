@@ -542,6 +542,23 @@ export function createGiLightShadowPass({ gbuffer, lightShadow, width, height, r
           // fixes). Only the NO-GEOMETRY path keeps the load-bearing
           // default 1. (`sign()` at exactly 0 zeroes the lift; dark.)
           lightShadowVars[index].assign(0);
+          if (globalThis.__giShadowKindDebug === "gate") {
+            // TERMINATOR-GATE MAP: raw |cos(ray, N)| ×2 for EVERY slot-active
+            // pixel — painted BEFORE the 0.05 gate, so a floor reading ~0
+            // here means `dir` itself is broken (zero/tangent slot vector),
+            // not a genuinely grazing sun.
+            lightShadowVars[index].assign(cosRayNormal.mul(2).clamp(0, 1));
+          }
+          if (globalThis.__giShadowKindDebug === "diry") {
+            // dir.y remapped [-1,1]→[0,1]: 0.5 = zero vector, >0.5 = upward
+            // (toward a sun above the horizon), <0.5 = pointing down.
+            lightShadowVars[index].assign(dir.y.mul(0.5).add(0.5).clamp(0, 1));
+          }
+          if (globalThis.__giShadowKindDebug === "normy") {
+            // Receiver normal health: rawN.y remapped [-1,1]→[0,1] (floor
+            // should read 255; 128 = degenerate/zero normal).
+            lightShadowVars[index].assign(rawN.y.mul(0.5).add(0.5).clamp(0, 1));
+          }
           If(cosRayNormal.greaterThan(0.05), () => {
             // ANGULAR RADIUS → PENUMBRA. Directional lights carry it
             // directly (`soft`, radians); point/spot lights carry a world
@@ -597,14 +614,76 @@ export function createGiLightShadowPass({ gbuffer, lightShadow, width, height, r
             const traced = lightShadow.traceDda ? vec2(tracedRaw).toVar() : vec2(tracedRaw, 0).toVar();
             if (lightShadowDistVars) lightShadowDistVars[index].assign(traced.y);
             if (lightShadow.freeRadius) {
-              // BURIAL GATE — ask the record-aware oracle how much free
-              // space the RAY ORIGIN has: a receiver buried inside a canopy
-              // reads ~0 and cannot plausibly see the sun — force dark. An
-              // open receiver's lifted origin reads ≈ the full 1.5-voxel
-              // lift and passes untouched.
-              const free = float(lightShadow.freeRadius(shadowOrigin)).toVar();
+              // BURIAL GATE — ask the record-aware oracle how much free space
+              // the receiver has on its light side: buried in a canopy reads
+              // ~0 → force dark. PROBE HEIGHT IS 3.5 VOXELS, NOT THE 1.5-VOXEL
+              // RAY LIFT (2026-08-06, measured on the wall rig): the
+              // conservative voxel shell extends TWO rows above a
+              // lattice-aligned surface, so a 1.5-voxel probe sits INSIDE the
+              // shell — and wherever the shell's top row carries no usable
+              // record (voxelize/accumulate predicate disagreement, ~⅓ of
+              // floor columns measured) the oracle reads gap 0 and the gate
+              // forced open ground BLACK. That population was previously
+              // misread as "⅓ exhaustion clamps" (the old kind map multiplied
+              // the paint by this very gate), and its lattice-phase
+              // alternation is the raw voxel-grid etching on lit floors. At
+              // 3.5 voxels the probe clears the worst-case shell: recordless
+              // shells read ≥1.1·voxMax (open) while a real canopy within
+              // ~0.5m still reads ~0 (dark). `__giBurialProbeHeight`
+              // overrides at build time for A/B, like every hatch here.
+              const burialH = Number(globalThis.__giBurialProbeHeight) || 3.5;
+              const free = float(lightShadow.freeRadius(
+                P.add(rawN.mul(cosSigned.sign()).mul(lightShadow.voxMax.mul(burialH))),
+              )).toVar();
               const burial = smoothstep(lightShadow.voxMax.mul(0.5), lightShadow.voxMax.mul(1.25), free);
-              lightShadowVars[index].assign(traced.x.mul(burial));
+              if (globalThis.__giShadowKindDebug === "burial") {
+                // BURIAL-FACTOR MAP: paints the gate itself. The session-29
+                // ⅓-"clamped" kind map was read THROUGH the burial multiply
+                // below, so a burial-zero pixel and a kind-4 clamp were
+                // indistinguishable — this arm separates them.
+                lightShadowVars[index].assign(burial);
+              } else if (globalThis.__giShadowKindDebug === "free") {
+                // FREE-RADIUS MAP: the oracle's raw answer in units of
+                // 2·voxMax. ~0.25 = the bare AABB gap (record sharpening not
+                // engaging), ~0.7 = the fitted-plane distance (record path
+                // works — the gate's smoothstep/uniform is then the suspect).
+                lightShadowVars[index].assign(free.div(lightShadow.voxMax.mul(2)).clamp(0, 1));
+              } else if (globalThis.__giShadowKindDebug === "freeabs") {
+                // ABSOLUTE free radius, ×4 (0.1875m lift → 0.75): separates a
+                // zero ORACLE from a zero NORMALIZER in the "free" paint.
+                lightShadowVars[index].assign(free.mul(4).clamp(0, 1));
+              } else if (globalThis.__giShadowKindDebug === "freenan") {
+                // NaN DETECTor: rgba8 stores NaN as 0, so a NaN-poisoned
+                // oracle is indistinguishable from "buried" in every scalar
+                // map. White = NaN here.
+                lightShadowVars[index].assign(select(free.notEqual(free), float(1), float(0)));
+              } else if (globalThis.__giShadowKindDebug === "free075") {
+                // RECORD-HEALTH PROBE: the oracle at P + 0.75·voxMax·N — a
+                // point INSIDE the receiver's own surface voxel, where the
+                // AABB gap is 0 by construction and only the fitted-plane
+                // record can answer nonzero (~0.63 voxels → paint ~0.31).
+                // Zero here = the cell's record is missing/unusable.
+                const free075 = float(lightShadow.freeRadius(
+                  P.add(rawN.mul(lightShadow.voxMax.mul(0.75))),
+                )).toVar();
+                lightShadowVars[index].assign(free075.mul(4).clamp(0, 1));
+              } else if (globalThis.__giShadowKindDebug === "voxmax") {
+                // The voxMax uniform itself, ×4 (0.125m → 0.5): a stale/zero
+                // voxel scale here zeroes the lift AND the burial thresholds.
+                lightShadowVars[index].assign(lightShadow.voxMax.mul(4).clamp(0, 1));
+              } else if (
+                globalThis.__giShadowKindDebug === "gate" ||
+                globalThis.__giShadowKindDebug === "diry" ||
+                globalThis.__giShadowKindDebug === "normy"
+              ) {
+                // Pre-gate paints (assigned above the cos If) — keep them.
+              } else if (globalThis.__giShadowKindDebug) {
+                // Any kind-paint mode: bypass the burial multiply so the map
+                // shows the MARCHER's verdict, uncorrupted by the gate.
+                lightShadowVars[index].assign(traced.x);
+              } else {
+                lightShadowVars[index].assign(traced.x.mul(burial));
+              }
             } else {
               lightShadowVars[index].assign(traced.x);
             }

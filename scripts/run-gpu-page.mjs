@@ -11,7 +11,13 @@ const executablePath = process.env.CHROME_PATH ?? "C:/Program Files/Google/Chrom
 const browser = await puppeteer.launch({
   executablePath,
   headless: process.env.HEADED ? false : "new",
-  args: ["--enable-unsafe-webgpu", "--enable-features=WebGPU", "--no-sandbox", "--disable-dev-shm-usage"],
+  args: [
+    "--enable-unsafe-webgpu", "--enable-features=WebGPU", "--no-sandbox", "--disable-dev-shm-usage",
+    // Headless/occluded pages get ~1/s timer+rAF throttling without these —
+    // any arm that needs LIVE frames (temporal gates, kind-map readbacks)
+    // silently measures a stalled engine (the session-15 profiling trap).
+    "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding",
+  ],
 });
 const page = await browser.newPage();
 const validationErrors = [];

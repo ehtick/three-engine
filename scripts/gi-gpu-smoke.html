@@ -51,6 +51,22 @@
         // gates below only run there.
         const analyticArm = new URLSearchParams(location.search).get("analytic") !== "0";
         if (!analyticArm) globalThis.__giShadowAnalyticWidth = false;
+        // `?kindmap=1` — FAIL-CLOSED ATTRIBUTION arm: compiles the marcher's
+        // verdict SUB-KIND paint (GISystem's "sub" mode) into the sun's shadow
+        // channel instead of a shadow, then histograms the raw readback below.
+        // Distinguishes macro-exhaust (128) / brick-limit (159) / invalid
+        // brick ref (191) — one run answers WHICH fail-closed class the
+        // session-29 ⅓-clamped map was. Build-time, so it must be set here.
+        // kindmap=1 → paint + readback; kindmap=2 → readback only (isolates
+        // "paint broke the pass" from "readback reads an unwritten texture").
+        const kindMapMode = Number(new URLSearchParams(location.search).get("kindmap") ?? 0);
+        const kindMap = kindMapMode > 0;
+        if (kindMapMode === 1) globalThis.__giShadowKindDebug = "sub";
+        // `?shadowprofile=1` — fold the SHADOW rays into the rayHitDebug
+        // counters (macroLimit/brickLimit/invalid are separate columns there).
+        // The zero-limit assertions below then measure the shadow arm too —
+        // a run FAILING with nonzero macro=/brick= counts IS the attribution.
+        if (new URLSearchParams(location.search).get("shadowprofile") === "1") globalThis.__giShadowProfile = true;
         // editorFramePacing stops unfocused engines — headless the page is
         // NEVER focused, and the temporal gate below is the first assertion
         // that needs the loop RUNNING at assert time (earlier arms only read
@@ -324,7 +340,9 @@
               throw new Error("analytic arm: filter pass compiled the temporal counter (history should be null)");
             }
             const shadowShader = engine.renderer._nodes?.getForCompute?.(sb.lightShadowPass.compute)?.computeShader ?? "";
-            if (!/giShadowWidthProbe/.test(shadowShader)) {
+            // Under the kind-map paint the trace returns before the width
+            // probe multiply, so the probe legitimately never enters the graph.
+            if (!kindMap && !/giShadowWidthProbe/.test(shadowShader)) {
               throw new Error("analytic arm: the width probe never compiled into the shadow pass");
             }
             console.log(
@@ -382,6 +400,92 @@
             `marcher="${marcher}" densityCells=${densityCells} partial=${partialCells} mismatches=0 ` +
             `temporalValid=${funnel[0]} threads=${funnel[1]} inBounds=${funnel[2]} loose=${funnel[3]} of ${shadowPixels}px/frame over the window`,
           );
+          }
+          if (kindMap) {
+            // Read the RAW trace target (pre-filter — the bilateral would
+            // smear the class bytes). The paint is deterministic per frame,
+            // so the boot frames' content is already final; run a short live
+            // window anyway so the read post-dates full field convergence.
+            const framesBefore = preRenderProbe.count;
+            engine.start();
+            await new Promise((resolve) => setTimeout(resolve, 1200));
+            engine.stop();
+            const framesInWindow = preRenderProbe.count - framesBefore;
+            const sb2 = engine.modules.get("gi").system.state.screen;
+            const W = sb2.shadowWidth, H = sb2.shadowHeight;
+            const strideBytes = Math.ceil((W * 4) / 256) * 256;
+            const data = await engine.renderer.backend.copyTextureToBuffer(sb2.targets.lightShadowRaw, 0, 0, W, H);
+            const names = { 0: "miss", 32: "plane", 64: "tri", 96: "box", 128: "macroExhaust", 159: "brickLimit", 191: "invalidBrick", 255: "noGeom" };
+            const anchors = [0, 32, 64, 96, 128, 159, 191, 255];
+            const buckets = {};
+            for (let y = 0; y < H; y++) {
+              const row = y * strideBytes;
+              for (let x = 0; x < W; x++) {
+                const b = data[row + x * 4];
+                let best = 255, bd = 1e9;
+                for (const k of anchors) { const dd = Math.abs(b - k); if (dd < bd) { bd = dd; best = k; } }
+                const key = bd > 2 ? `odd(${b})` : names[best];
+                buckets[key] = (buckets[key] ?? 0) + 1;
+              }
+            }
+            console.log(`GI-SMOKE KINDMAP ${W}x${H} ${JSON.stringify(buckets)}`);
+            // Diagnostics for an all-zero map: is the pass in the live queue,
+            // and does the FILTERED target differ from raw?
+            const dataF = await engine.renderer.backend.copyTextureToBuffer(sb2.targets.lightShadow, 0, 0, W, H);
+            let rawNonZero = 0, filtNonZero = 0;
+            for (let y = 0; y < H; y++) {
+              const row = y * strideBytes;
+              for (let x = 0; x < W; x++) {
+                if (data[row + x * 4] !== 0) rawNonZero++;
+                if (dataF[row + x * 4] !== 0) filtNonZero++;
+              }
+            }
+            const st = engine.modules.get("gi").system.state;
+            // Readback-health control: the gbuffer position texture PROVABLY
+            // holds data (the reproj-truth block reads it via
+            // readRenderTargetPixelsAsync). If THIS path reads it as zeros,
+            // copyTextureToBuffer is the broken link, not the shadow pass.
+            let gbNonZero = 0;
+            try {
+              const gbTex = sb2.gbuffer?.position ?? sb2.gbuffer?.rt?.textures?.[0];
+              if (gbTex) {
+                const gdata = await engine.renderer.backend.copyTextureToBuffer(gbTex, 0, 0, 32, 32);
+                for (let i = 0; i < gdata.length; i++) if (gdata[i] !== 0) gbNonZero++;
+              }
+            } catch (err) {
+              console.log(`GI-SMOKE KINDMAP-DIAG gbuffer readback threw: ${err?.message ?? err}`);
+            }
+            console.log(
+              `GI-SMOKE KINDMAP-DIAG frames=${framesInWindow} rawNonZero=${rawNonZero} filtNonZero=${filtNonZero} ` +
+              `gbNonZero=${gbNonZero} pendingPipes=${globalThis.__giPendingComputePipelines?.size ?? "?"} ` +
+              `passInQueue=${st.queue?.includes?.(st.screen?.lightShadowPass?.compute) ?? "?"} ` +
+              `widthU=${st.screen?.lightShadowPass?.widthU?.value ?? "?"} shadowWH=${sb2.shadowWidth}x${sb2.shadowHeight} ` +
+              `texWH=${sb2.targets?.lightShadowRaw?.image?.width ?? "?"}x${sb2.targets?.lightShadowRaw?.image?.height ?? "?"} ` +
+              `marcher="${st.screen?.lightShadow?.marcher ?? ""}" slots=${st.screen?.lightShadow?.slots?.length ?? 0}`,
+            );
+            // Decisive: dispatch the shadow pass OURSELVES and re-read. Content
+            // appearing = the tick never dispatches it; still-zero = the store
+            // itself is dead (dropped batch / dead branch).
+            try {
+              await engine.renderer.computeAsync(st.screen.lightShadowPass.compute);
+              const data2 = await engine.renderer.backend.copyTextureToBuffer(sb2.targets.lightShadowRaw, 0, 0, W, H);
+              let nz2 = 0;
+              const buckets2 = {};
+              for (let y = 0; y < H; y++) {
+                const row = y * strideBytes;
+                for (let x = 0; x < W; x++) {
+                  const b = data2[row + x * 4];
+                  if (b !== 0) nz2++;
+                  let best = 255, bd = 1e9;
+                  for (const k of anchors) { const dd = Math.abs(b - k); if (dd < bd) { bd = dd; best = k; } }
+                  const key = bd > 2 ? `odd(${b})` : names[best];
+                  buckets2[key] = (buckets2[key] ?? 0) + 1;
+                }
+              }
+              console.log(`GI-SMOKE KINDMAP-MANUAL nonZero=${nz2} ${JSON.stringify(buckets2)}`);
+            } catch (err) {
+              console.log(`GI-SMOKE KINDMAP-MANUAL threw: ${err?.message ?? err}`);
+            }
           }
         }
         globalThis.__GI_SMOKE_RESULT__ = {
