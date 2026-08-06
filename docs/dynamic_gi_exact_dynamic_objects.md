@@ -17,7 +17,12 @@ What shipped vs this doc:
   exact triangle leaves** (this replaced §"sparse 8x8x8 bricks"): compressed
   8-wide nodes by default (origin + power-of-two steps + u8-quantized child
   bounds, conservative both ways), `__giDynBvhArity=4` = uncompressed A/B.
-  `mesh.userData.giDynamic` overrides: `"voxel" | "bvh" | "obb"`.
+  Per-mesh override: the Mesh component's **"GI Dynamic" Inspector dropdown**
+  (`auto | voxel | bvh | obb` — a typed component prop, also settable from
+  scripts via `getComponent("mesh").setProp("giDynamic", …)` or, for raw
+  THREE meshes, `mesh.userData.giDynamic`). Flips take effect live: the tag
+  bypasses the classify cache, and an already-adopted mover releases and
+  re-routes on the next frames — no rebuild.
   Skinned/morphing/over-budget (`__giDynMeshMaxTris`, default 120k) stay voxel.
 - **Unified ray query**: composed as a wrapper over the occupancy field's
   `traceOccupancy`/`traceHybridPlane`/`traceHybridBrick` — every consumer

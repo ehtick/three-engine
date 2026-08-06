@@ -5814,12 +5814,18 @@ export class GISystem {
   }
 
   /** classifyDynamicShape with a per-key negative cache (skinned/huge meshes
-   *  would otherwise re-classify every motion frame). */
+   *  would otherwise re-classify every motion frame). Tag-aware: a
+   *  `userData.giDynamic` tag bypasses and clears the cache so flipping the
+   *  Mesh component's "GI Dynamic" dropdown takes effect without a rebuild —
+   *  and tag-based rejections ("voxel") are never cached, so flipping BACK
+   *  to auto works too. */
   #classifyForAdoption(key, mesh) {
     this._dynIneligibleKeys ??= new Set();
+    const tag = mesh?.userData?.giDynamic;
+    if (tag) this._dynIneligibleKeys.delete(key);
     if (this._dynIneligibleKeys.has(key)) return null;
     const shape = classifyDynamicShape(mesh);
-    if (!shape) this._dynIneligibleKeys.add(key);
+    if (!shape && !tag) this._dynIneligibleKeys.add(key);
     return shape;
   }
 
@@ -6024,6 +6030,35 @@ export class GISystem {
   #refreshDynamicObjects(renderer, state) {
     const dyn = this._dynSet;
     if (!dyn?.enabled) return;
+    // LIVE TAG FLIPS (the Mesh component's "GI Dynamic" dropdown → the mesh's
+    // userData): an adopted mover whose tag no longer matches its
+    // representation releases its exact slot. "voxel" returns it to the voxel
+    // path (the forced rescan below re-voxelizes it); a class change
+    // ("bvh"/"obb") re-adopts under the new classification on its next
+    // motion frame. ≤16 entries, one string compare each — per-frame is free.
+    if (dyn.count() > 0) {
+      let released = false;
+      dyn.forEachEntry((entry) => {
+        const tag = entry.mesh?.userData?.giDynamic;
+        const mismatch =
+          tag === "voxel" || tag === "none" ||
+          (tag === "bvh" && entry.type !== "mesh") ||
+          (tag === "obb" && entry.type !== "obb");
+        if (!mismatch) return;
+        if (globalThis.__giDynObjectsDebug) {
+          console.log(`[gi] dynamic-objects: released "${entry.mesh?.name}" (tag "${tag}" vs ${entry.type})`);
+        }
+        dyn.release(entry.key);
+        this._dynAdoptedKeys.delete(entry.key);
+        released = true;
+      });
+      if (released) {
+        // Force the next fingerprint scan to run its content pass — the
+        // un-adopted mesh needs its placement + bits back, and nothing else
+        // signals that (userData is not in the fingerprint).
+        this._fingerprint = null;
+      }
+    }
     const world = state.volume?.world;
     const cellRaw = world?.cellMax;
     const cell = typeof cellRaw === "number" ? cellRaw : (typeof cellRaw?.value === "number" ? cellRaw.value : 0.35);

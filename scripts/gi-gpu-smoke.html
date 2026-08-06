@@ -221,6 +221,9 @@
               : dynObjArm === 5 ? new THREE.CylinderGeometry(0.6, 0.3, 1.6, 24)
               : new THREE.TorusKnotGeometry(0.8, 0.25, 48, 12);
             mover = new THREE.Mesh(geo, material);
+            // dynobj=6: the per-mesh override — a CUSTOM mesh tagged "obb"
+            // must adopt as the analytic bounding box, no BVH upload.
+            if (dynObjArm === 6) mover.userData.giDynamic = "obb";
             mover.position.set(1.5, 0.5, 0);
             mover.updateMatrixWorld(true);
             engine.scene.add(mover);
@@ -244,7 +247,8 @@
             throw new Error("dynobj=2 arm: the torus adopted without a BVH upload — it took an analytic path");
           }
           if (dynObjArm >= 3 && system._dynSet.stats.meshUploadsQueued > 0) {
-            throw new Error(`dynobj=${dynObjArm} arm: an analytic default primitive queued a BVH upload — classification regressed`);
+            throw new Error(`dynobj=${dynObjArm} arm: an analytic path queued a BVH upload — ` +
+              (dynObjArm === 6 ? "the userData.giDynamic=\"obb\" override was ignored" : "classification regressed"));
           }
           // Let the parked slot's purge re-voxelize land, then measure.
           for (let i = 0; i < 20; i++) { mover.rotation.y += 0.05; mover.updateMatrixWorld(true); await settle(50); }

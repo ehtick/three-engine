@@ -981,6 +981,9 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
 
     has(key) { return entries.has(key); },
     count() { return entries.size; },
+    /** Iterates live entries — the caller must not mutate during iteration
+     *  except through release() on a COPIED key list. */
+    forEachEntry(fn) { for (const entry of [...entries.values()]) fn(entry); },
 
     /**
      * Adopts a mesh placement. `shape` comes from classifyDynamicShape.

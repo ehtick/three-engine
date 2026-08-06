@@ -498,6 +498,15 @@ declare module "engine" {
     material8: string;
     castShadow: boolean;
     receiveShadow: boolean;
+    /**
+     * How GI represents this mesh once it moves (exact dynamic objects):
+     * `"auto"` classifies by geometry — default primitives become analytic
+     * shapes (box/plane → OBB, sphere, capsule, cylinder/cone → frustum),
+     * everything else an exact-triangle BVH; `"voxel"` keeps the legacy
+     * voxelized path; `"bvh"` forces exact triangles; `"obb"` forces the
+     * bounding box (cheapest, over-occludes concave shapes).
+     */
+    giDynamic: "auto" | "voxel" | "bvh" | "obb";
   }> {}
 
   /**
@@ -680,6 +689,49 @@ declare module "engine" {
     /** Drops every timed shape. */
     clear(): void;
     setEnabled(value: boolean): void;
+  }
+
+  /**
+   * The immediate-mode wireframe surface handed to a script's `onDrawGizmos` /
+   * `onDrawGizmosSelected` — Unity's `OnDrawGizmos`. Editor-only: the mesh sits
+   * on a layer play cameras don't render, so gizmos never appear in the game
+   * view or in a build.
+   *
+   * Every call appends to one batched line buffer that is cleared at the start
+   * of each frame, so draw unconditionally and never clean up — there is
+   * nothing to dispose and nothing to leak. Every method returns the surface,
+   * so calls chain.
+   *
+   * The same shapes as {@link DebugDraw}, minus `text` and minus every colour /
+   * duration argument: a gizmo lives exactly as long as the code that draws it,
+   * and colour is a mode you set with `color()` rather than repeat per shape.
+   */
+  export interface Gizmos {
+    /** Colour for subsequent draws: `"#ff0"`, `0xff0000`, or a Color. */
+    color(value: string | number | Color): Gizmos;
+    /** Colour for subsequent draws, as r/g/b in 0..1. */
+    color(r: number, g: number, b: number): Gizmos;
+    /** Transform applied to every subsequent vertex; null clears it.
+     *  `gizmos.transform(this.entity.object3D.matrixWorld)` draws in local space. */
+    transform(matrix: Matrix4 | null): Gizmos;
+    line(from: PointLike, to: PointLike): Gizmos;
+    /** A line from `origin` along `direction`, scaled by `length`. */
+    ray(origin: PointLike, direction: PointLike, length?: number): Gizmos;
+    /** A line with a head, so which end is which is readable. `headSize` 0 scales it to the length. */
+    arrow(from: PointLike, to: PointLike, headSize?: number): Gizmos;
+    /** Wire box. `size` is the full extent, not the half-extent. */
+    box(center: PointLike, size?: number | PointLike, quaternion?: Quaternion | null): Gizmos;
+    /** Wire circle in the plane whose normal is `normal` (default +Y). */
+    circle(center: PointLike, radius?: number, normal?: PointLike, segments?: number): Gizmos;
+    /** Wire sphere drawn as three great circles. */
+    sphere(center: PointLike, radius?: number, segments?: number): Gizmos;
+    /** Upright capsule — the shape a character controller actually is. */
+    capsule(center: PointLike, radius?: number, height?: number, segments?: number): Gizmos;
+    /** Small three-axis cross marking a position. */
+    point(position: PointLike, size?: number): Gizmos;
+    polyline(points: PointLike[], closed?: boolean): Gizmos;
+    /** Red/green/blue axis triad for a matrix — which way is this thing facing? */
+    axes(matrix: Matrix4, size?: number): Gizmos;
   }
 
   /**
@@ -2816,6 +2868,45 @@ declare module "engine" {
      * Copy state across from `oldInstance` to survive the reload.
      */
     onHotReload?(oldInstance: Script): void;
+
+    // --- editor-only hooks --------------------------------------------------
+    // Dispatched by the editor while you author, never by a build. The API they
+    // are usually paired with — `Editor`, `@executeInEditMode`, `@menuItem` —
+    // comes from the separate `"editor"` module, NOT from `"engine"`:
+    //
+    //     import { Script } from "engine";
+    //     import { executeInEditMode } from "editor";
+    //
+    //     @executeInEditMode
+    //     export default class SpawnVolume extends Script {
+    //       onEditorUpdate(dt: number) {}
+    //       onDrawGizmos(g: Gizmos) { g.color("#4af").box(this.entity.position, 2); }
+    //     }
+
+    /**
+     * Ticks while the editor is STOPPED, once per frame, `dt` in seconds.
+     *
+     * Only fires on a class marked `@executeInEditMode` (from `"editor"`),
+     * which also gives it `onStart` / `onDestroy` in edit mode. `onUpdate`
+     * deliberately stays play-only, so gameplay logic can't run against the
+     * scene you are authoring by accident — if you want one body for both,
+     * write `onEditorUpdate(dt) { this.onUpdate(dt); }`.
+     */
+    onEditorUpdate?(dt: number): void;
+
+    /**
+     * Draw wireframe into the viewport while authoring — a trigger volume, a
+     * patrol path, a spawn radius, where a raycast actually goes.
+     *
+     * Runs on any LOADED script, playing or stopped, with no decorator needed:
+     * making invisible data visible is not a behaviour you should have to opt
+     * a script into. Called every frame; the buffer is cleared for you.
+     */
+    onDrawGizmos?(gizmos: Gizmos): void;
+
+    /** As `onDrawGizmos`, but only while this script's entity is selected —
+     *  for detail that would be noise drawn on every entity at once. */
+    onDrawGizmosSelected?(gizmos: Gizmos): void;
 
     // --- hooks other systems dispatch -------------------------------------
     // These reach every script on the entity (see ScriptComponent.dispatch),

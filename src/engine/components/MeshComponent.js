@@ -41,6 +41,12 @@ export class MeshComponent extends Component {
     material8: "",
     castShadow: true,
     receiveShadow: true,
+    // How GI represents this mesh once it MOVES (exact-dynamic adoption,
+    // src/modules/gi/dynamicObjects.js): "auto" classifies by geometry
+    // (default primitives → analytic shapes, everything else → triangle BVH);
+    // "voxel" keeps the legacy voxel path; "bvh" forces exact triangles;
+    // "obb" forces the bounding box (cheapest, over-occludes concave shapes).
+    giDynamic: "auto",
   };
   static schema = [
     { key: "geometry", label: "Primitive", type: "select", options: Object.keys(geometryFactories), showIf: (props) => !props.geometryAsset },
@@ -59,6 +65,7 @@ export class MeshComponent extends Component {
     { key: "material8", label: "Material 8", type: "asset", exts: ["mat"], hidden: true },
     { key: "castShadow", label: "Cast Shadow", type: "boolean" },
     { key: "receiveShadow", label: "Receive Shadow", type: "boolean" },
+    { key: "giDynamic", label: "GI Dynamic", type: "select", options: ["auto", "voxel", "bvh", "obb"] },
   ];
 
   constructor(props = {}) {
@@ -85,6 +92,7 @@ export class MeshComponent extends Component {
     this.mesh.userData.entityId = this.entity.id;
     this.mesh.castShadow = !!this.props.castShadow;
     this.mesh.receiveShadow = !!this.props.receiveShadow;
+    this.#applyGiDynamic();
     this.entity.object3D.add(this.mesh);
     if (this.props.geometryAsset) this.#loadGeometry(this.props.geometryAsset);
     if (this.props.material) this.#loadSharedMaterial(this.props.material);
@@ -292,6 +300,19 @@ export class MeshComponent extends Component {
       this.#loadExtraMaterials();
     } else if (key === "castShadow" || key === "receiveShadow") {
       this.mesh[key] = !!this.props[key];
+    } else if (key === "giDynamic") {
+      // Live: the GI system re-reads the tag every frame for adopted movers
+      // and before every adoption, so no rebuild is needed here.
+      this.#applyGiDynamic();
     }
+  }
+
+  /** Mirrors the giDynamic prop onto the render mesh's userData — the tag the
+   *  GI exact-dynamic classifier reads (dynamicObjects.js). "auto" clears it. */
+  #applyGiDynamic() {
+    if (!this.mesh) return;
+    const v = this.props.giDynamic;
+    if (v && v !== "auto") this.mesh.userData.giDynamic = v;
+    else delete this.mesh.userData.giDynamic;
   }
 }

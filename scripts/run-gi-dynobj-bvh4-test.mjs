@@ -360,6 +360,28 @@ for (const [ai, { name, geometry }] of analyticCases.entries()) {
   if (!ok) failures++;
 }
 
+// ── per-mesh giDynamic tag overrides ─────────────────────────────────────────
+{
+  const mk = (geometry, tag) => {
+    const mesh = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial());
+    if (tag) mesh.userData.giDynamic = tag;
+    return classifyDynamicShape(mesh);
+  };
+  const torus = new THREE.TorusKnotGeometry(0.8, 0.25, 24, 8);
+  const sphere = new THREE.SphereGeometry(0.8, 24, 16);
+  const tagChecks = [
+    ["voxel tag rejects adoption", mk(sphere, "voxel") === null],
+    ["bvh tag forces triangles on a default primitive", mk(sphere, "bvh")?.type === "mesh"],
+    ["obb tag forces the bounding box on a custom mesh", mk(torus, "obb")?.type === "obb"],
+    ["untagged sphere stays analytic", mk(sphere, null)?.type === "sphere"],
+    ["untagged torus takes the BVH", mk(torus, null)?.type === "mesh"],
+  ];
+  for (const [label, ok] of tagChecks) {
+    console.log(`${ok ? "PASS" : "FAIL"} tag: ${label}`);
+    if (!ok) failures++;
+  }
+}
+
 if (failures) {
   console.error(`gi-dynobj-bvh4: ${failures} case(s) FAILED`);
   process.exit(1);
