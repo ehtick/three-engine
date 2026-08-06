@@ -3316,6 +3316,138 @@ export function createOccupancyField(bounds, res0, options = {}) {
   };
 
   /**
+   * RECORD-TRUE NORMAL AT A POINT (GI_MOTION_PERF_PLAN §5.2). The field's
+   * injection normal is the gradient of the binary-forced distance field, so
+   * it SNAPS between quantized directions as a mover's rasterization
+   * staircase re-phases — lurching `ndotl` and the shadow-ray origin for
+   * cells that stay occupied. This returns the fitted-plane record normal of
+   * the occupied level-0 voxel NEAREST `p` (DynamicBrick cells read the
+   * per-chain dynamic tail, so a mover's normal rotates continuously with
+   * the mesh), for the injection site to substitute where a simple record
+   * exists. vec4(worldNormal, flag) — flag 0 means "no record" (empty
+   * neighbourhood, unallocated brick, complex cell) and the caller keeps its
+   * gradient fallback. Reads only the already-bound `bits` buffer.
+   */
+  const recordNormalAt = surfaceEnabled && hybridEnabled
+    ? (p) => {
+        const fn = sharedFn({
+          name: "giRecordNormalAt",
+          type: "vec4",
+          inputs: [{ name: "p", type: "vec3" }],
+          body: (pp) => {
+            const q0 = vec3(pp).sub(vec3(gridOrigin)).mul(vec3(voxelInv)).toVar();
+            const cell = q0.floor().toVar();
+            const voxelWorld = vec3(voxel).toVar();
+            const bestD = float(1e9).toVar();
+            const bestV = vec3(0).toVar();
+            // Same 3×3×3 argmin walk as the oracle's near field (see
+            // freeRadiusBody's loop notes — runtime Loop, not a JS unroll).
+            Loop({ start: 0, end: 27, name: "rn" }, ({ rn }) => {
+              const dx = rn.mod(int(3)).sub(int(1)).toFloat();
+              const dy = rn.div(int(3)).mod(int(3)).sub(int(1)).toFloat();
+              const dz = rn.div(int(9)).sub(int(1)).toFloat();
+              const v = cell.add(vec3(dx, dy, dz)).toVar();
+              const occ = occupiedAtLevel0(v).toVar();
+              const gap = v.sub(q0).max(q0.sub(v.add(1))).max(vec3(0)).mul(voxelWorld).toVar();
+              const d = gap.length();
+              If(occ.greaterThan(0.5).and(d.lessThan(bestD)), () => {
+                bestD.assign(d);
+                bestV.assign(v);
+              });
+            });
+            const outN = vec4(0, 0, 0, 0).toVar();
+            If(bestD.lessThan(1e8), () => {
+              // Macro → brick → record walk, identical to the oracle's
+              // record-aware near field (rank-addressed in the merged mask;
+              // static bricks read the static pool offset, DynamicBrick the
+              // per-chain tail).
+              const macro = bestV.div(float(BRICK_RESOLUTION)).floor().toVar();
+              const mx = macro.x.max(0).min(hybridLayout.macroResolution.x - 1).toUint().toVar();
+              const my = macro.y.max(0).min(hybridLayout.macroResolution.y - 1).toUint().toVar();
+              const mz = macro.z.max(0).min(hybridLayout.macroResolution.z - 1).toUint().toVar();
+              const macroIndex = mz.mul(uint(hybridLayout.macroResolution.y)).add(my)
+                .mul(uint(hybridLayout.macroResolution.x)).add(mx).toVar();
+              const macroBase = uint(hybridWordOffset).add(
+                macroIndex.mul(uint(MACRO_CELL_WORDS)),
+              ).toVar();
+              const metadata = bits.element(
+                macroBase.add(uint(MACRO_CELL_METADATA_WORD)),
+              ).toVar();
+              const cellType = bitAnd(
+                shiftRight(metadata, uint(MACRO_CELL_TYPE_SHIFT)),
+                uint(MACRO_CELL_TYPE_MASK),
+              ).toVar();
+              const isStaticBrick = cellType.equal(uint(MacroCellType.Brick)).toVar();
+              If(isStaticBrick.or(cellType.equal(uint(MacroCellType.DynamicBrick))), () => {
+                const brickIndex = bits.element(
+                  macroBase.add(uint(MACRO_CELL_BRICK_INDEX_WORD)),
+                ).toVar();
+                If(
+                  brickIndex.lessThan(uint(hybridLayout.brickCount))
+                    .and(brickIndex.notEqual(uint(INVALID_RAY_HIT_INDEX))),
+                  () => {
+                    const brickBase = uint(hybridWordOffset + hybridLayout.brickHeaderOffset)
+                      .add(brickIndex.mul(uint(BRICK_HEADER_WORDS))).toVar();
+                    const surfOffset = select(
+                      isStaticBrick,
+                      bits.element(brickBase.add(uint(BRICK_SURFACE_OFFSET_WORD))),
+                      bits.element(brickBase.add(uint(BRICK_DYNAMIC_OFFSET_WORD))),
+                    ).toVar();
+                    If(surfOffset.notEqual(uint(INVALID_RAY_HIT_INDEX)), () => {
+                      const localCell = bestV.sub(macro.mul(float(BRICK_RESOLUTION)))
+                        .clamp(vec3(0), vec3(BRICK_RESOLUTION - 1)).toVar();
+                      const cellIndex = localCell.z.toUint().mul(uint(16))
+                        .add(localCell.y.toUint().mul(uint(4)))
+                        .add(localCell.x.toUint()).toVar();
+                      const occupancyLow = bits.element(
+                        brickBase.add(uint(BRICK_OCCUPANCY_LOW_WORD)),
+                      ).toVar();
+                      const occupancyHigh = bits.element(
+                        brickBase.add(uint(BRICK_OCCUPANCY_HIGH_WORD)),
+                      ).toVar();
+                      const inLow = cellIndex.lessThan(uint(32));
+                      const belowLow = select(
+                        inLow,
+                        shiftLeft(uint(1), bitAnd(cellIndex, uint(31))).sub(uint(1)),
+                        uint(0xffffffff),
+                      );
+                      const belowHigh = select(
+                        inLow,
+                        uint(0),
+                        shiftLeft(uint(1), bitAnd(cellIndex, uint(31))).sub(uint(1)),
+                      );
+                      const rank = countOneBits(bitAnd(occupancyLow, belowLow))
+                        .add(countOneBits(bitAnd(occupancyHigh, belowHigh)));
+                      const record = surfOffset.add(rank).toVar();
+                      If(record.lessThan(uint(totalSurfaceCapacity)), () => {
+                        const rBase = uint(surfaceWordOffset)
+                          .add(record.mul(uint(SURFACE_RECORD_WORDS))).toVar();
+                        const flagsWord = bits.element(rBase.add(uint(3))).toVar();
+                        const simple = bitAnd(
+                          shiftRight(flagsWord, uint(COVERAGE_FLAGS_SHIFT)),
+                          uint(SURFACE_FLAG_SIMPLE),
+                        );
+                        If(simple.notEqual(uint(0)), () => {
+                          // Same decode + world transform as the gather
+                          // trace's normal return (voxel-space oct → world
+                          // via the inverse scale).
+                          const nHat = octDecodeTSL(unpackSnorm2x16(bits.element(rBase))).toVar();
+                          outN.assign(vec4(nHat.mul(vec3(voxelInv)).normalize(), 1));
+                        });
+                      });
+                    });
+                  },
+                );
+              });
+            });
+            return outN;
+          },
+        });
+        return fn(p);
+      }
+    : null;
+
+  /**
    * THE PYRAMID AS A DISTANCE ORACLE — a conservative lower bound on the
    * distance from world point `p` to the nearest occupied geometry.
    *
@@ -4352,6 +4484,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
     },
     occupiedAtWorld,
     freeRadiusAtWorld,
+    recordNormalAt,
     occupiedAt,
 
     /**

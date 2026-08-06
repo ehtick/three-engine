@@ -71,6 +71,23 @@ const emitterCounts = process.env.EMITTERS
 // box-kind growth under rotation convicts the contact/complex fallback,
 // raw-delta growth without kind change convicts the width term.
 const moverOn = process.env.MOVER === "1";
+// INTERMIT=1 — the REFIT-INTERMITTENCY instrument (session 30f fix queue b):
+// the user's Sponza screenshot shows RANDOM DARK SQUARE PIECES protruding
+// from a mover's shadow on some frames only. Hypotheses to separate:
+//   H1 dyn-tail overflow      → box px spikes correlate with
+//                               dynamicOverflowBricks>0 / allocated≈capacity
+//   H2 half-executed chain    → spikes correlate with pendingPipelines>0 or
+//                               full-chain dispatches (skipped computes)
+//   H3 static-cells-in-brick  → steady box floor, present while STILL too
+//   H4 stale-pose (frame lag) → raw churn with ZERO box kinds
+// Needs SUN=1 KINDSUB=1. Samples the raw kind map + readbackSurfaceAlloc +
+// dispatch counters as fast as readback allows while rotating the mover on
+// TWO axes (the user's script: rotation.x/y += dt*0.6, edit-mode update).
+// PRESSURE=n adds n dense torus-knot static meshes first (Sponza-class
+// record/triangle pool pressure — my clean rig could not reproduce).
+const intermitOn = process.env.INTERMIT === "1";
+const pressure = Number(process.env.PRESSURE ?? 0);
+const intermitMs = Number(process.env.DUR ?? 12000);
 // MOVERY — mover height (default 0.6 = resting on the floor; ~2.5 = the
 // floating-caster case where the width probe's coarse distanceTexture
 // owns the penumbra shape).
@@ -78,7 +95,7 @@ const moverY = Number(process.env.MOVERY ?? 0.6);
 // SOURCEANGLE — the sun's authored source angle (default 10; 0 = the user's
 // razor-sun case where any visible softness is a bug).
 const sourceAngle = Number(process.env.SOURCEANGLE ?? 10);
-const result = await page.evaluate(async ({ hatch, quality, steps, slab, sunOn, profileOn, kindSub, sunPos, floorY, emitterCounts, moverOn, moverY, sourceAngle }) => {
+const result = await page.evaluate(async ({ hatch, quality, steps, slab, sunOn, profileOn, kindSub, sunPos, floorY, emitterCounts, moverOn, moverY, sourceAngle, intermitOn, pressure, intermitMs }) => {
   globalThis.__probeFloorY = floorY;
   globalThis.__editorKeepRendering = true;
   if (hatch === "noselfcut") globalThis.__giNoOccSelfCut = true;
@@ -120,10 +137,26 @@ const result = await page.evaluate(async ({ hatch, quality, steps, slab, sunOn, 
   const panel = new THREE.Mesh(anon(new THREE.BoxGeometry(5, 4, 0.3)), glowMat);
   panel.position.set(0, 2, -6);
   engine.scene.add(floor, crate, panel);
+  // PRESSURE: dense curved static geometry ringing the rig — fills the
+  // static record pool and the complex triangle pool the way Sponza does
+  // (the intermittency never reproduced on the clean rig; pool pressure is
+  // the named delta). Static-only: they never move, so fast chains skip them.
+  if (pressure > 0) {
+    for (let i = 0; i < pressure; i++) {
+      const a = (i / pressure) * Math.PI * 2;
+      const r = 8 + (i % 3) * 2;
+      const knot = new THREE.Mesh(
+        anon(new THREE.TorusKnotGeometry(0.6, 0.2, 48, 12)), grey);
+      knot.position.set(Math.cos(a) * r, 0.8, Math.sin(a) * r);
+      knot.rotation.set(i * 0.7, i * 1.3, i * 0.4);
+      knot.updateMatrixWorld(true);
+      engine.scene.add(knot);
+    }
+  }
   // MOVER: on the floor (ground contact = the mixed-brick case), present
   // BEFORE the GI entity so it lives in the field fingerprint from boot.
   let mover = null;
-  if (moverOn) {
+  if (moverOn || intermitOn) {
     mover = new THREE.Mesh(anon(new THREE.BoxGeometry(1.2, 1.2, 1.2)), grey);
     mover.position.set(2.5, moverY + floorY, 2.5);
     mover.updateMatrixWorld(true);
@@ -184,6 +217,134 @@ const result = await page.evaluate(async ({ hatch, quality, steps, slab, sunOn, 
     }
   }
   await new Promise((r) => setTimeout(r, 2000));
+  if (intermitOn && mover) {
+    // ── REFIT-INTERMITTENCY ARM (see the env note up top for hypotheses) ──
+    const sb = system.state?.screen;
+    if (!sb?.targets?.lightShadowRaw) return { fail: "intermit arm needs SUN=1 (no lightShadowRaw)" };
+    if (!kindSub) return { fail: "intermit arm needs KINDSUB=1 (kind attribution)" };
+    const W3 = sb.shadowWidth, H3 = sb.shadowHeight;
+    const stride3 = Math.ceil((W3 * 4) / 256) * 256;
+    const occF = system.state.volume.occupancyField;
+    const countKinds = (A) => {
+      const c = { miss: 0, plane: 0, tri: 0, box: 0, macroExhaust: 0, brickLimit: 0, invalidBrick: 0, other: 0 };
+      for (let y = 0; y < H3; y++) {
+        const row = y * stride3;
+        for (let x = 0; x < W3; x++) {
+          const b = A[row + x * 4];
+          if (b < 16) c.miss++;
+          else if (Math.abs(b - 32) <= 8) c.plane++;
+          else if (Math.abs(b - 64) <= 8) c.tri++;
+          else if (Math.abs(b - 96) <= 8) c.box++;
+          else if (Math.abs(b - 128) <= 8) c.macroExhaust++;
+          else if (Math.abs(b - 159) <= 8) c.brickLimit++;
+          else if (Math.abs(b - 191) <= 8) c.invalidBrick++;
+          else if (b < 250) c.other++;
+        }
+      }
+      return c;
+    };
+    const sampleOnce = async () => {
+      const tex = await engine.renderer.backend.copyTextureToBuffer(sb.targets.lightShadowRaw, 0, 0, W3, H3);
+      const alloc = await occF.readbackSurfaceAlloc(engine.renderer);
+      const st = occF.stats ?? {};
+      return {
+        kinds: countKinds(tex), tex,
+        dynAlloc: alloc?.dynamicAllocated ?? -1,
+        dynOver: alloc?.dynamicOverflowBricks ?? -1,
+        dynTris: alloc?.dynamicTriangles ?? -1,
+        dynTriOver: alloc?.dynamicComplexOverflowCells ?? -1,
+        dispatches: st.dispatches ?? -1,
+        fastDispatches: st.fastDispatches ?? 0,
+        pending: globalThis.__giPendingComputePipelines?.size ?? -1,
+      };
+    };
+    const pngOf = (A) => {
+      const c = document.createElement("canvas");
+      c.width = W3; c.height = H3;
+      const ctx = c.getContext("2d");
+      const id = ctx.createImageData(W3, H3);
+      for (let y = 0; y < H3; y++) {
+        const row = y * stride3;
+        for (let x = 0; x < W3; x++) {
+          const i = y * W3 + x, b = A[row + x * 4];
+          id.data[i * 4] = b; id.data[i * 4 + 1] = b; id.data[i * 4 + 2] = b; id.data[i * 4 + 3] = 255;
+        }
+      }
+      ctx.putImageData(id, 0, 0);
+      return c.toDataURL("image/png");
+    };
+    // Still-phase baseline (3 samples).
+    const still = [];
+    for (let i = 0; i < 3; i++) { still.push(await sampleOnce()); await new Promise((r) => setTimeout(r, 150)); }
+    const staticAlloc = await occF.readbackSurfaceAlloc(engine.renderer);
+    // The user's script, verbatim cadence: two-axis rotation at 0.6 rad/s
+    // driven per frame (rAF), not a coarse interval.
+    let last = performance.now(), rotating = true;
+    const spin = () => {
+      if (!rotating) return;
+      const now = performance.now(), dt = Math.min(0.1, (now - last) / 1000);
+      last = now;
+      mover.rotation.x += dt * 0.6;
+      mover.rotation.y += dt * 0.6;
+      mover.updateMatrixWorld(true);
+      requestAnimationFrame(spin);
+    };
+    requestAnimationFrame(spin);
+    await new Promise((r) => setTimeout(r, 500)); // enter the rotating regime
+    const series = [];
+    let worst = null;
+    const tEnd = performance.now() + intermitMs;
+    while (performance.now() < tEnd) {
+      const s = await sampleOnce();
+      const { tex, ...rest } = s;
+      const badPx = rest.kinds.box + rest.kinds.macroExhaust + rest.kinds.brickLimit + rest.kinds.invalidBrick;
+      rest.badPx = badPx;
+      series.push(rest);
+      if (!worst || badPx > worst.badPx) worst = { badPx, png: pngOf(tex), sample: rest };
+    }
+    rotating = false;
+    // Summaries the hypotheses read directly.
+    const nums = (k) => series.map((s) => s[k]);
+    const stat = (xs) => {
+      const ys = [...xs].sort((a, b) => a - b);
+      return { min: ys[0], med: ys[Math.floor(ys.length / 2)], p95: ys[Math.floor(ys.length * 0.95)], max: ys[ys.length - 1] };
+    };
+    const spikes = series.filter((s) => s.badPx > (still[still.length - 1].kinds.box + 50));
+    return {
+      intermit: {
+        samples: series.length,
+        stillKinds: still.map((s) => s.kinds),
+        stillDyn: { alloc: still.map((s) => s.dynAlloc), over: still.map((s) => s.dynOver) },
+        staticPool: staticAlloc ? {
+          records: `${staticAlloc.allocated}/${staticAlloc.capacity}`,
+          overflow: staticAlloc.overflowBricks,
+          triangles: `${staticAlloc.triangles}/${staticAlloc.triangleCapacity}`,
+          triOverflowCells: staticAlloc.complexOverflowCells,
+          dynCapacity: staticAlloc.dynamicCapacity,
+        } : null,
+        badPx: stat(nums("badPx")),
+        box: stat(series.map((s) => s.kinds.box)),
+        fail: stat(series.map((s) => s.kinds.macroExhaust + s.kinds.brickLimit + s.kinds.invalidBrick)),
+        tri: stat(series.map((s) => s.kinds.tri)),
+        plane: stat(series.map((s) => s.kinds.plane)),
+        dynAlloc: stat(nums("dynAlloc")),
+        dynOver: stat(nums("dynOver")),
+        dynTris: stat(nums("dynTris")),
+        dynTriOver: stat(nums("dynTriOver")),
+        pendingNonzero: series.filter((s) => s.pending > 0).length,
+        chainDelta: {
+          total: series[series.length - 1].dispatches - series[0].dispatches,
+          fast: series[series.length - 1].fastDispatches - series[0].fastDispatches,
+        },
+        spikeCount: spikes.length,
+        spikeWithOverflow: spikes.filter((s) => s.dynOver > 0 || s.dynTriOver > 0).length,
+        spikeWithPending: spikes.filter((s) => s.pending > 0).length,
+        worstSample: worst?.sample ?? null,
+      },
+      worstPng: worst?.png ?? null,
+      stillPng: pngOf((await sampleOnce()).tex),
+    };
+  }
   if (moverOn && mover) {
     // OBJECT-MOTION SHADOW METRIC: still-phase vs rotating-phase per-frame
     // deltas of the sun's raw channel (production values without KINDSUB,
@@ -621,9 +782,18 @@ const result = await page.evaluate(async ({ hatch, quality, steps, slab, sunOn, 
     }
   }
   return { W, H, emitters, grain: n ? sum / n : 0, penPx: n, leak, shadowPng: toPng(img), sunKinds, rayStats, bitsProfile };
-}, { hatch, quality, steps, slab, sunOn, profileOn, kindSub, sunPos, floorY, emitterCounts, moverOn, moverY, sourceAngle });
+}, { hatch, quality, steps, slab, sunOn, profileOn, kindSub, sunPos, floorY, emitterCounts, moverOn, moverY, sourceAngle, intermitOn, pressure, intermitMs });
 
 if (result.fail) { console.log(`FAIL: ${result.fail}`); await browser.close(); process.exit(1); }
+if (result.intermit) {
+  const { stillKinds, ...rest } = result.intermit;
+  console.log(`PROBE INTERMIT-STILL ${JSON.stringify(stillKinds)}`);
+  console.log(`PROBE INTERMIT ${JSON.stringify(rest)}`);
+  if (result.worstPng) writeFileSync("scripts/gi-diag-intermit-worst.png", Buffer.from(result.worstPng.split(",")[1], "base64"));
+  if (result.stillPng) writeFileSync("scripts/gi-diag-intermit-post.png", Buffer.from(result.stillPng.split(",")[1], "base64"));
+  await browser.close();
+  process.exit(0);
+}
 if (result.moverStill) {
   console.log(`PROBE MOVER-STILL ${JSON.stringify(result.moverStill)}`);
   console.log(`PROBE MOVER-ROT   ${JSON.stringify(result.moverRotating)}`);

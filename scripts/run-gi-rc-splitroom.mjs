@@ -13,6 +13,11 @@ const browser = await puppeteer.launch({
 });
 const page = await browser.newPage();
 await page.setViewport({ width: 1400, height: 900, deviceScaleFactor: 1 });
+// PRESET_GLOBALS='{"__giFieldAngleFloor":false}' — build-time hatch A/Bs,
+// same contract as run-gi-flicker-frame's.
+await page.evaluateOnNewDocument((PRESET) => {
+  for (const [k, v] of Object.entries(PRESET)) globalThis[k] = v;
+}, JSON.parse(process.env.PRESET_GLOBALS ?? "{}"));
 page.on("console", (message) => {
   const text = message.text();
   if (/\[gi\]|GI-SR|pageerror/.test(text)) console.log(`${message.type()}: ${text}`);

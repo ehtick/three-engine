@@ -28,6 +28,13 @@ const PROJECT = (process.env.PROJECT ?? "C:/Users/Khudiiash/Documents/GAME").rep
 const QUALITY = process.env.QUALITY ?? "ultra";
 const FRAMES = Number(process.env.FRAMES ?? 240);
 const AMP = Number(process.env.AMP ?? 0.5);
+// ROTATE=1 — the ROTATING-CUBE arm (GI_MOTION_PERF_PLAN §7.1): a box mover
+// spun on TWO axes at 0.6 rad/s (the user's MeshScript verbatim) instead of
+// the translation sinusoid — rotation re-phases every face's rasterization
+// staircase per frame, the worst case by construction. Adds the plan's
+// STEP-AMPLITUDE metric (p95 per-pixel max |Δlum|): popping is a step, not
+// an oscillation, so reversals alone under-report it.
+const ROTATE = process.env.ROTATE === "1";
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const browser = await puppeteer.launch({
@@ -89,7 +96,7 @@ for (let i = 0; i < 120; i++) {
 const componentOf = (e, type) => (e.components ?? []).find((c) => c.type === type);
 const giCandidates = entities.filter((e) => componentOf(e, "global-illumination"));
 const giEntity = giCandidates.find((e) => componentOf(e, "global-illumination")?.props?.enabled !== false) ?? giCandidates[0];
-let sphere = entities.find((e) => componentOf(e, "mesh")?.props?.geometry === "sphere");
+let sphere = ROTATE ? null : entities.find((e) => componentOf(e, "mesh")?.props?.geometry === "sphere");
 if (!giEntity) { console.log("FATAL: gi entity missing"); await browser.close(); process.exit(1); }
 // NO AUTHORED MOVER ANY MORE (same trap run-gi-perf.mjs hit): the scene is one
 // prefab of static masonry, so create the mover — a fresh mesh is exactly the
@@ -106,7 +113,8 @@ if (!sphere) {
   const made = await call("entity.create", {
     name: "__flicker_mover",
     transform: { position: [7.9, 1.4, 0.2] },
-    components: [{ type: "mesh", props: { geometry: "sphere" } }],
+    // ROTATE arm: a box — rotation is a no-op on a sphere's occupancy.
+    components: [{ type: "mesh", props: { geometry: ROTATE ? "box" : "sphere" } }],
   });
   const id = made.ok ? (made.value?.id ?? made.value) : null;
   if (!id) { console.log(`FATAL: no mover and entity.create failed (${made.error})`); await browser.close(); process.exit(1); }
@@ -134,7 +142,7 @@ await wait(10000);
 await must("viewport.setCamera", { position: [11.8, 2.2, 0.73], target: [-3.2, 1.0, -1.47] });
 await wait(1500);
 
-const result = await page.evaluate(async ({ anchorId, moverId, frames, amp }) => {
+const result = await page.evaluate(async ({ anchorId, moverId, frames, amp, rotate }) => {
   const eng = globalThis.__editorApi.entities.live(anchorId)?.engine;
   if (!eng?.renderer) throw new Error("no live engine");
   const obj = globalThis.__editorApi.entities.live(moverId)?.object3D;
@@ -147,11 +155,14 @@ const result = await page.evaluate(async ({ anchorId, moverId, frames, amp }) =>
   const { width, height } = size;
 
   const TSL = await import("/node_modules/three/build/three.tsl.js");
-  const { Fn, If, float, instanceIndex, instancedArray, ivec2, select, texture, uniform, vec3, vec4 } = TSL;
+  const { Fn, If, float, instanceIndex, instancedArray, ivec2, select, texture, uniform, vec2, vec3, vec4 } = TSL;
 
   // Per-pixel state: x prevLum, y prev significant delta, z reversal count,
   // w changed-frame count (for excluding the mover's own footprint).
   const stateBuf = instancedArray(new Float32Array(width * height * 4), "vec4");
+  // Step-amplitude state (ROTATE arm's headline metric, cheap enough to keep
+  // always): x = max |Δlum| seen, y = Σ|Δlum| over significant frames.
+  const ampBuf = instancedArray(new Float32Array(width * height * 2), "vec2");
   const irrNode = texture(targets.irradiance);
   const widthU = uniform(width, "uint");
   const armed = uniform(0); // 0 = seed only (warmup), 1 = count
@@ -174,6 +185,10 @@ const result = await page.evaluate(async ({ anchorId, moverId, frames, amp }) =>
       outRev.assign(prev.z.add(select(flipped, float(1), float(0))));
       outDelta.assign(delta);
       outChanged.assign(prev.w.add(1));
+      const amp = ampBuf.element(instanceIndex).toVar();
+      ampBuf.element(instanceIndex).assign(
+        vec2(amp.x.max(delta.abs()), amp.y.add(delta.abs())),
+      );
     });
     stateBuf.element(instanceIndex).assign(vec4(lum, outDelta, outRev, outChanged));
   })().compute(width * height);
@@ -185,11 +200,22 @@ const result = await page.evaluate(async ({ anchorId, moverId, frames, amp }) =>
     renderer.compute(accumulator);
   }
   armed.value = 1;
-  // Measured run: one full sinusoid period over `frames` frames — max step
-  // amp·2π/frames (~13mm at defaults: sub-voxel, a realistic slow mover).
+  // Measured run. Translation arm: one full sinusoid period over `frames`
+  // frames — max step amp·2π/frames (~13mm at defaults: sub-voxel, a
+  // realistic slow mover). ROTATE arm: the user's MeshScript verbatim —
+  // rotation.x/y += dt·0.6, per rendered frame.
+  let lastT = performance.now();
   for (let i = 0; i < frames; i++) {
     await new Promise((r) => requestAnimationFrame(r));
-    obj.position.x = base.x + amp * Math.sin((2 * Math.PI * i) / frames);
+    if (rotate) {
+      const now = performance.now();
+      const dt = Math.min(0.1, (now - lastT) / 1000);
+      lastT = now;
+      obj.rotation.x += dt * 0.6;
+      obj.rotation.y += dt * 0.6;
+    } else {
+      obj.position.x = base.x + amp * Math.sin((2 * Math.PI * i) / frames);
+    }
     obj.updateMatrixWorld(true);
     renderer.compute(accumulator);
   }
@@ -197,10 +223,13 @@ const result = await page.evaluate(async ({ anchorId, moverId, frames, amp }) =>
   obj.updateMatrixWorld(true);
 
   const data = new Float32Array(await renderer.getArrayBufferAsync(stateBuf.value));
+  const ampData = new Float32Array(await renderer.getArrayBufferAsync(ampBuf.value));
   // CPU analysis. Exclude pixels that changed on most frames (the mover's own
   // silhouette + its immediate ground shading, which legitimately track it).
   let kept = 0, excluded = 0, revSum = 0, popped = 0, changedSum = 0;
   const revHist = [0, 0, 0, 0, 0]; // 0, 1-2, 3-5, 6-10, >10
+  const maxSteps = [];
+  let ampSum = 0;
   for (let i = 0; i < width * height; i++) {
     const rev = data[i * 4 + 2];
     const changed = data[i * 4 + 3];
@@ -210,22 +239,31 @@ const result = await page.evaluate(async ({ anchorId, moverId, frames, amp }) =>
     changedSum += changed;
     if (rev >= 3) popped++;
     revHist[rev === 0 ? 0 : rev <= 2 ? 1 : rev <= 5 ? 2 : rev <= 10 ? 3 : 4]++;
+    if (changed > 0) { maxSteps.push(ampData[i * 2]); ampSum += ampData[i * 2 + 1]; }
   }
+  maxSteps.sort((a, b) => a - b);
   return {
     width, height, frames, kept, excluded,
     meanReversals: revSum / Math.max(1, kept),
     poppedPct: (popped / Math.max(1, kept)) * 100,
     meanChangedFrames: changedSum / Math.max(1, kept),
     revHist,
+    // Step amplitude over pixels that changed at least once (plan §7.1):
+    // p95/max of the per-pixel MAX step, and the mean total |Δ| walked.
+    changedPx: maxSteps.length,
+    stepP95: maxSteps.length ? maxSteps[Math.floor(maxSteps.length * 0.95)] : 0,
+    stepMax: maxSteps.length ? maxSteps[maxSteps.length - 1] : 0,
+    meanWalk: maxSteps.length ? ampSum / maxSteps.length : 0,
   };
-}, { anchorId: giEntity.id, moverId: sphere.id, frames: FRAMES, amp: AMP });
+}, { anchorId: giEntity.id, moverId: sphere.id, frames: FRAMES, amp: AMP, rotate: ROTATE });
 
-console.log(`\n=== PER-FRAME FLICKER (${result.width}x${result.height}, ${result.frames} frames, sub-voxel mover) ===`);
+console.log(`\n=== PER-FRAME FLICKER (${result.width}x${result.height}, ${result.frames} frames, ${ROTATE ? "ROTATING box 2-axis 0.6rad/s" : "sub-voxel mover"}) ===`);
 console.log(`  kept ${result.kept} px, excluded ${result.excluded} (mover footprint)`);
 console.log(`  mean reversals/px       ${result.meanReversals.toFixed(3)}   <- THE FLICKER METRIC`);
 console.log(`  popped px (>=3 rev)     ${result.poppedPct.toFixed(1)}%`);
 console.log(`  mean changed frames/px  ${result.meanChangedFrames.toFixed(1)} of ${result.frames}`);
 console.log(`  histogram [0, 1-2, 3-5, 6-10, >10] = ${result.revHist.join(", ")}`);
+console.log(`  step amplitude: changedPx=${result.changedPx} p95=${result.stepP95.toFixed(4)} max=${result.stepMax.toFixed(4)} meanWalk=${result.meanWalk.toFixed(3)}   <- THE POPPING METRIC`);
 
 await browser.close();
 process.exit(0);

@@ -774,6 +774,11 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
   // area is the frame-to-frame invariant of a rigid mover. Binary injection
   // (coverageAt = null) is the historical behavior.
   const coverageAt = options.coverageAt ?? null;
+  // RECORD-TRUE INJECTION NORMALS (plan §5.2): closure returning
+  // vec4(worldNormal, flag) — the fitted-plane record normal of the occupied
+  // voxel nearest the cell center, flag 0 when no simple record exists (the
+  // gradient below stays the fallback). See GISystem's option note.
+  const recordNormalAt = options.recordNormalAt ?? null;
   // ANALYTIC-LIGHT shadows may use a different tracer than emitter shadows.
   // GISystem passes the hierarchical occupancy DDA here: the sphere march over
   // the trilinear field TUNNELS through thin slabs at coarse presets — the
@@ -836,6 +841,16 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
   // frozen). GISystem defaults its uniform to 0.95 (user-confirmed live,
   // 2026-08-03) via `__giFieldSmoothing`.
   const fieldSmoothing = options.fieldSmoothing ?? null;
+  // THE FIELD-CELL PENUMBRA FLOOR (see the analytic block's band-limit note):
+  // minimum shadow cone angle = cellMax / reference distance, so a shadow
+  // edge spans ≥ ~a field cell wherever the field can see it. Node-assembly
+  // expression (no toVar here — the 30e orphan-assign trap).
+  const angleFloorRef = globalThis.__giFieldAngleFloor;
+  const angleFloor = angleFloorRef === false
+    ? null
+    : float(world.cellMax)
+        .div(typeof angleFloorRef === "number" ? angleFloorRef : 4)
+        .clamp(0.02, 0.2);
 
   return Fn(() => {
     // Temporal ingest of streamed bakes: staging holds the latest CPU bake
@@ -918,10 +933,35 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
       // Sampling that existing texture removes normalBuffer from this fully
       // composed feedback graph, keeping it within the portable 8-storage-
       // buffer limit (and preserving the same normal, fp16-quantized).
-      const normal = texture3D(
+      const gradNormal = texture3D(
         volume.distanceTexture,
         vec3(ix.add(0.5).div(res.x), iy.add(0.5).div(res.y), iz.add(0.5).div(res.z)),
       ).level(0).gba.mul(2).sub(1).normalize();
+      // RECORD-TRUE NORMAL (plan §5.2) where a simple record exists,
+      // SIGN-ALIGNED to the gradient: the gradient is per-shell-side (thin
+      // geometry gets a shell layer per side — the one-sided-lighting fix),
+      // so it stays the authority on WHICH side this cell is; the record
+      // supplies the unquantized orientation within that hemisphere. A
+      // record perpendicular to the gradient (degenerate alignment) keeps
+      // the gradient outright.
+      let normal = gradNormal;
+      const cellCenterEarly = recordNormalAt
+        ? vec3(
+            ix.add(0.5).mul(world.cell.x).add(world.min.x),
+            iy.add(0.5).mul(world.cell.y).add(world.min.y),
+            iz.add(0.5).mul(world.cell.z).add(world.min.z),
+          ).toVar()
+        : null;
+      if (recordNormalAt) {
+        const rec = vec4(recordNormalAt(cellCenterEarly)).toVar();
+        const side = rec.xyz.dot(gradNormal).toVar();
+        const aligned = rec.xyz.mul(select(side.lessThan(0), float(-1), float(1)));
+        normal = select(
+          rec.w.greaterThan(0.5).and(side.abs().greaterThan(0.1)),
+          aligned,
+          gradNormal,
+        ).toVar();
+      }
       // One desaturated field albedo for ALL bounce-color sites below (the
       // two direct injections and the feedback term) — see bleedSaturation's
       // note above. Null uniform → plain surface albedo, byte-identical.
@@ -1041,9 +1081,26 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
               // the whole shadow side of the scene goes black (user
               // screenshot, 2026-08-05). The field's sun feed wants "roughly
               // right" energy, not the screen channel's exact penumbra shape.
-              const softAngle = slot.soft
+              // LOWER CLAMP = THE FIELD'S OWN SAMPLING RATE (the razor-sun
+              // band-limit, measured 2026-08-06 on the user's Sponza): with
+              // an authored sourceAngle of 0 the shadow edge is sub-cell
+              // sharp, so a rotating mover's field shadow crosses each
+              // ~0.3m cell as a FULL-AMPLITUDE one-frame step — the freeze
+              // bisect put ~half of all visible mover popping in exactly
+              // this term, and no marcher precision can fix it (records
+              // move the transition point, not its width). A signal sharper
+              // than the sampling grid cannot be represented — so the FIELD
+              // trace gets a minimum penumbra angle that spreads the edge
+              // across ≥ a cell at typical occluder distances (cellMax/4m,
+              // clamped [0.02, 0.2] rad). The SCREEN shadow channel keeps
+              // the authored razor edge — this only softens the bounce
+              // feed, which the field could never resolve sharply anyway.
+              // `__giFieldAngleFloor = false` removes the floor (build-time
+              // A/B); a number overrides the 4m reference distance.
+              const softAngle0 = slot.soft
                 ? select(float(slot.soft).greaterThan(1e-4), float(slot.soft).clamp(5e-4, 0.35), fallbackAngle)
                 : fallbackAngle;
+              const softAngle = angleFloor ? softAngle0.max(angleFloor) : softAngle0;
               let shadow = lightShadow(origin, traceDir, maxT, float(1).div(softAngle), ndotl);
               if (fieldShadowOff) shadow = mix(shadow, float(1), fieldShadowOff);
               const direct = rawAlbedo
@@ -1084,7 +1141,11 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
             const emitterCellLum = emitterEnergy.dot(vec3(0.2126, 0.7152, 0.0722)).toVar();
             If(factor.greaterThan(1e-6).and(emitterCellLum.greaterThan(0.002)), () => {
               const origin = cellCenter.add(normal.mul(normalLiftV));
-              const k = dist.div(float(emitterAngularRadius(slot)).max(0.05)).clamp(1.2, 48);
+              // Same field-cell band-limit as the analytic block: a small
+              // far lamp's cone (k up to 48 ⇒ ~0.02 rad) is sub-cell sharp
+              // for coarse field grids — cap k at 1/angleFloor.
+              const kMax = angleFloor ? float(1).div(angleFloor).min(48) : float(48);
+              const k = dist.div(float(emitterAngularRadius(slot)).max(0.05)).clamp(1.2, kMax);
               const maxT = emitterSurfaceT(slot, origin, dir, dist).sub(normalLiftV).max(0);
               const shadow = float(1).toVar();
               If(maxT.greaterThan(normalLiftV), () => {

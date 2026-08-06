@@ -3564,6 +3564,22 @@ export class GISystem {
         volume.occupancyField?.coverageInBox && globalThis.__giCoverageInjection !== false
           ? (p) => volume.occupancyField.coverageInBox(p, volume.world.cell.mul(0.5))
           : null,
+      // RECORD-TRUE INJECTION NORMALS (plan §5.2, session 30f queue): where
+      // the cell's nearest occupied voxel carries a simple fitted-plane
+      // record (DynamicBrick cells read the per-chain dynamic tail), the
+      // injection normal comes from the record instead of the binary-forced
+      // distance gradient — `ndotl`, the one-sided gates and the shadow-ray
+      // origin stop snapping with the rasterization staircase as a mover
+      // rotates. Gradient stays the fallback (and the side authority — see
+      // cascadeGather's sign alignment). Zero new bindings (`bits` is
+      // already bound). `__giRecordInjectionNormals = false` = gradient-only
+      // arm (build-time A/B).
+      recordNormalAt:
+        volume.occupancyField?.recordNormalAt &&
+        volume.occupancyField?.hasSurfaceRecords === true &&
+        globalThis.__giRecordInjectionNormals !== false
+          ? (p) => volume.occupancyField.recordNormalAt(p)
+          : null,
       probeIrradiance: probeIrradiance.buffer,
       depthMoments: probeDepth.buffer,
       fieldSmoothing,
@@ -3613,15 +3629,68 @@ export class GISystem {
             // caller's geometric N·L (cascadeGather already passes it).
             (origin, dir, maxT, k = null, cosRayNormal = null) => {
               const kEff = k ?? float(1).div(shadowJitter.penAngle.max(0.005));
-              const r = volume.occupancyField.traceOccupancy(
-                origin, dir, volume.world.minCell.mul(0.25), maxT,
-                { steps: 64, penumbraK: kEff },
-              );
-              let vis = r.hit.oneMinus().mul(r.pen);
+              // THE FIELD'S RECORD MARCH (session 30f fix queue a / plan §5's
+              // "records for the field side"). The screen's sun shadows moved
+              // onto fitted-plane records in session 25 and movers refit them
+              // per frame — but this closure, re-evaluated for EVERY occupied
+              // field cell EVERY frame, kept marching binary voxels: a
+              // rotating mover's whole-voxel verdict flips are what churned
+              // the field pool ("cube indirect is very blocky and jumpy" —
+              // the artifact stayed after coverage weighting because the
+              // SHADOW side of injection still popped per voxel). Route the
+              // same traceHybridPlane penumbra variant here: hits resolve
+              // through records (DynamicBrick cells through the per-chain
+              // dynamic tail), so a smoothly rotating face gives a smoothly
+              // moving verdict. Zero new bindings — the march reads the same
+              // `bits` buffer the DDA already binds. Fail-closed on the
+              // march's own budget exhaustion, exactly like the DDA arm.
+              // `__giFieldRecordShadows = false` restores the binary-voxel
+              // DDA (build-time A/B, independent of the screen's
+              // `__giLightShadowLegacyDda`).
+              const occ = volume.occupancyField;
+              const fieldMode = volume.rayHitMode ?? RayHitMode.OccupancyLegacy;
+              const fieldRecords =
+                occ.traceHybridPlane &&
+                occ.hasSurfaceRecords === true &&
+                fieldMode >= RayHitMode.HybridPlane &&
+                fieldMode <= RayHitMode.HybridExactComplex &&
+                globalThis.__giFieldRecordShadows !== false;
+              let vis;
+              let hitFlag; // both arms' binary hit — the width probe's gate
+              if (fieldRecords) {
+                const r = occ.traceHybridPlane(
+                  origin, dir, volume.world.minCell.mul(0.25), maxT,
+                  {
+                    coverage: fieldMode >= RayHitMode.HybridPlaneCoverage,
+                    exact: fieldMode === RayHitMode.HybridExactComplex,
+                    penumbraK: kEff,
+                    // Cheaper budget than the screen's (96–192): the field
+                    // wants "roughly right" energy per cell, and its rays
+                    // start at cell centers, not grazing receivers.
+                    macroSteps: 96,
+                  },
+                );
+                // kind > 3.5 = macro-limit / brick-limit / invalid-brick —
+                // fail closed (dark), matching the DDA arm's exhaustion
+                // clamp; the field EMA absorbs the rare capped ray.
+                vis = select(
+                  r.kind.greaterThan(3.5),
+                  float(0),
+                  r.hit.oneMinus().mul(r.pen),
+                ).toVar();
+                hitFlag = r.hit;
+              } else {
+                const r = occ.traceOccupancy(
+                  origin, dir, volume.world.minCell.mul(0.25), maxT,
+                  { steps: 64, penumbraK: kEff },
+                );
+                vis = r.hit.oneMinus().mul(r.pen);
+                hitFlag = r.hit;
+              }
               if (fieldWidthProbe) {
                 // Lazy like the screen arm: umbra cells skip the taps.
                 const w = float(1).toVar();
-                If(float(r.hit).lessThan(0.5), () => {
+                If(float(hitFlag).lessThan(0.5), () => {
                   const occV = vec3(volume.occupancyField.voxel);
                   const gate = occV.x.max(occV.y).max(occV.z).mul(3);
                   w.assign(fieldWidthProbe(
