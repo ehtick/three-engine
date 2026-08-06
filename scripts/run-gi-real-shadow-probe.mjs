@@ -146,6 +146,57 @@ writeFileSync(`scripts/gi-diag-chain-raw-${ARM}.png`, Buffer.from(result.rawPng.
 writeFileSync(`scripts/gi-diag-chain-final-${ARM}.png`, Buffer.from(result.finPng.split(",")[1], "base64"));
 await page.screenshot({ path: `scripts/gi-diag-chain-view-${ARM}.png` });
 
+// FIELD CELL BURST (CELLBURST=1): per-frame radiance of the cells in the
+// mover's AABB — the user's "large spots of light appear/disappear". Step
+// amplitude per cell per frame, coverage arm vs binary
+// (PRESET_GLOBALS __giCoverageInjection=false). If the coverage arm still
+// shows full-amplitude pops, §5.1 v1 is not doing its job on movers.
+if (process.env.CELLBURST === "1") {
+  const cb = await page.evaluate(async ({ anchorId, mpos }) => {
+    const eng = globalThis.__editorApi.entities.live(anchorId)?.engine;
+    const sys = eng.modules.get("gi").system;
+    const vol = sys.state.volume;
+    const res = vol.res;
+    const world = vol.world;
+    const min = world.min.value ?? world.min;
+    const cell = world.cell.value ?? world.cell;
+    // Cell index window covering the cube AABB +1 cell.
+    const lo = [0, 1, 2].map((a) => Math.floor((mpos[a] - 1.1 - min[["x","y","z"][a]]) / cell[["x","y","z"][a]]));
+    const hi = [0, 1, 2].map((a) => Math.ceil((mpos[a] + 1.1 - min[["x","y","z"][a]]) / cell[["x","y","z"][a]]));
+    const idxs = [];
+    for (let z = lo[2]; z <= hi[2]; z++)
+      for (let y = lo[1]; y <= hi[1]; y++)
+        for (let x = lo[0]; x <= hi[0]; x++)
+          idxs.push((z * res.y + y) * res.x + x);
+    const track = [];
+    for (let f = 0; f < 20; f++) {
+      await new Promise((r) => requestAnimationFrame(r));
+      const rad = new Float32Array(await eng.renderer.getArrayBufferAsync(vol.radianceBuffer.value));
+      track.push(idxs.map((i) => +(rad[i * 4] * 0.2126 + rad[i * 4 + 1] * 0.7152 + rad[i * 4 + 2] * 0.0722).toFixed(3)));
+    }
+    // Per-cell max single-frame |step| and the count of big appear/disappear
+    // events (step > 50% of the cell's own max).
+    let bigPops = 0, maxStep = 0, active = 0;
+    const worstCells = [];
+    for (let c = 0; c < idxs.length; c++) {
+      let cellMax = 0, cellStep = 0;
+      for (let f = 0; f < track.length; f++) cellMax = Math.max(cellMax, track[f][c]);
+      if (cellMax < 0.05) continue;
+      active++;
+      for (let f = 1; f < track.length; f++) {
+        const st = Math.abs(track[f][c] - track[f - 1][c]);
+        cellStep = Math.max(cellStep, st);
+        if (st > cellMax * 0.5) bigPops++;
+      }
+      maxStep = Math.max(maxStep, cellStep);
+      worstCells.push({ step: +cellStep.toFixed(2), max: +cellMax.toFixed(2) });
+    }
+    worstCells.sort((a, b) => b.step - a.step);
+    return { cells: idxs.length, active, bigPops, maxStep: +maxStep.toFixed(2), worst: worstCells.slice(0, 8) };
+  }, { anchorId: mover?.id ?? ents[0].id, mpos });
+  console.log(`CELLBURST ${JSON.stringify(cb)}`);
+}
+
 // SILHOUETTE BURST (BURST=1): the user's actual complaint — "random voxel
 // shadows appear AROUND the box silhouette as it rotates". 24 consecutive
 // grabs of the raw (kind paint via PRESET_GLOBALS) cropped to the cube's
