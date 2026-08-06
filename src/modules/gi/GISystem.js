@@ -4062,7 +4062,12 @@ export class GISystem {
     console.log(
       screen?.lightShadow
         ? `[gi] light shadows: gi-traced ON, marcher ${screen.lightShadow.marcher} (${quality}), ` +
-            `up to ${MAX_GI_LIGHTS} lights — flag a light with Shadow Source "gi"`
+            // BUILD MARKER (2026-08-06 session 31c): "adaptive-σ" printed =
+            // the angle-adaptive filter build is what's actually running.
+            // Three rounds of "absolutely nothing changed" were spent unable
+            // to tell the user's live editor apart from the disk code — this
+            // token settles it from their own console.
+            `filter adaptive-σ, up to ${MAX_GI_LIGHTS} lights — flag a light with Shadow Source "gi"`
         : "[gi] light shadows: gi-traced OFF — every light renders its own shadow map",
     );
     if (screen?.emitter) {
