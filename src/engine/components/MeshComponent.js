@@ -41,11 +41,14 @@ export class MeshComponent extends Component {
     material8: "",
     castShadow: true,
     receiveShadow: true,
-    // How GI represents this mesh once it MOVES (exact-dynamic adoption,
-    // src/modules/gi/dynamicObjects.js): "auto" classifies by geometry
-    // (default primitives → analytic shapes, everything else → triangle BVH);
-    // "voxel" keeps the legacy voxel path; "bvh" forces exact triangles;
-    // "obb" forces the bounding box (cheapest, over-occludes concave shapes).
+    // How GI represents this mesh (exact-dynamic adoption,
+    // src/modules/gi/dynamicObjects.js): "auto" = voxelized while static,
+    // adopted into the exact ray-traced path on first motion (and demoted
+    // back after a long rest in edit mode); "static" = never adopt; "dynamic"
+    // = adopt at load (no first-motion transition), classified by geometry
+    // (default primitives → analytic shapes, everything else → triangle
+    // BVH); "bvh" / "obb" = adopt at load with a forced representation
+    // (exact triangles / bounding box).
     giDynamic: "auto",
   };
   static schema = [
@@ -65,7 +68,7 @@ export class MeshComponent extends Component {
     { key: "material8", label: "Material 8", type: "asset", exts: ["mat"], hidden: true },
     { key: "castShadow", label: "Cast Shadow", type: "boolean" },
     { key: "receiveShadow", label: "Receive Shadow", type: "boolean" },
-    { key: "giDynamic", label: "GI Dynamic", type: "select", options: ["auto", "voxel", "bvh", "obb"] },
+    { key: "giDynamic", label: "GI Dynamic", type: "select", options: ["auto", "static", "dynamic", "bvh", "obb"] },
   ];
 
   constructor(props = {}) {

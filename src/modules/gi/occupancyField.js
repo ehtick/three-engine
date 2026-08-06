@@ -430,11 +430,17 @@ export function createOccupancyField(bounds, res0, options = {}) {
       if (prev !== 2) return;
       slotDynamic.array[slot] = 1;
       dynamicCount += 1;
+      // Keep the presence-diff bookkeeping truthful for DIRECT callers (the
+      // exact-dynamic adoption path parks/unparks slots outside setGeometry —
+      // without this, a placements list that still names the slot would never
+      // re-enable it, and a parked-then-returning slot would re-disable).
+      enabledSlots.add(slot);
     } else {
       if (prev === 2) return;
       if (prev === 1) dynamicCount -= 1;
       else staticDirty = true;
       slotDynamic.array[slot] = 2;
+      enabledSlots.delete(slot);
     }
     dirty = true;
   };
@@ -4332,6 +4338,8 @@ export function createOccupancyField(bounds, res0, options = {}) {
     setGeometry,
     setSlotMatrix,
     setSlotEnabled,
+    /** Diagnostic: the slot's static/dynamic/disabled state (0/1/2). */
+    slotState: (slot) => slotDynamic.array[slot],
     /** Harness diagnostics for the incremental path (run-gi-spawn-test). */
     get debugIncremental() {
       return {

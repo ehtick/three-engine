@@ -5983,6 +5983,16 @@ export class GISystem {
       // transform is the dynamic set's job. Touching the voxel path again
       // would re-create exactly the per-frame rebuild this exists to remove.
       if (p._giAnalytic) continue;
+      // PINNED DYNAMIC ("dynamic"/"bvh"/"obb" tags): adopt WITHOUT waiting
+      // for motion — the purge re-voxelize lands at load/idle instead of on
+      // the first gameplay frame that moves the object, and statically
+      // tagged meshes (the user's "set these to bvh" case) take effect at
+      // all. "auto" keeps the motion trigger below.
+      const eagerTag = p.mesh?.userData?.giDynamic;
+      if (
+        (eagerTag === "dynamic" || eagerTag === "bvh" || eagerTag === "obb") &&
+        this.#tryAdoptDynamic(p)
+      ) continue;
       let changed = false;
       if (instanceId == null || !mesh.isInstancedMesh) {
         changed = !p.matrix.equals(mesh.matrixWorld);
@@ -6037,26 +6047,74 @@ export class GISystem {
     // ("bvh"/"obb") re-adopts under the new classification on its next
     // motion frame. ≤16 entries, one string compare each — per-frame is free.
     if (dyn.count() > 0) {
+      // REST DEMOTION (edit mode only): an "auto"-adopted mover that has sat
+      // still long enough returns to the voxel path — layout drags must not
+      // permanently consume dynamic slots or cost the static-path AO. Play
+      // mode keeps adoptions sticky: gameplay movers move again, and a
+      // periodic mover (an elevator pausing between trips) must not thrash
+      // adopt/demote re-voxelizes mid-game. Pinned tags never demote.
+      const demoteAfter = Number(globalThis.__giDynDemoteFrames) || 1800;
+      const canDemote = !this.engine?.playing;
       let released = false;
       dyn.forEachEntry((entry) => {
         const tag = entry.mesh?.userData?.giDynamic;
+        const pinned = tag === "dynamic" || tag === "bvh" || tag === "obb";
         const mismatch =
-          tag === "voxel" || tag === "none" ||
+          tag === "static" || tag === "voxel" || tag === "none" ||
           (tag === "bvh" && entry.type !== "mesh") ||
           (tag === "obb" && entry.type !== "obb");
-        if (!mismatch) return;
+        const resting = canDemote && !pinned && (entry.restFrames ?? 0) > demoteAfter;
+        if (!mismatch && !resting) return;
         if (globalThis.__giDynObjectsDebug) {
-          console.log(`[gi] dynamic-objects: released "${entry.mesh?.name}" (tag "${tag}" vs ${entry.type})`);
+          console.log(
+            `[gi] dynamic-objects: released "${entry.mesh?.name}" ` +
+              (mismatch ? `(tag "${tag}" vs ${entry.type})` : `(rested ${entry.restFrames} frames)`),
+          );
         }
         dyn.release(entry.key);
         this._dynAdoptedKeys.delete(entry.key);
+        (this._dynCooldown ??= new Map()).set(entry.key, this._frame + 300);
+        // If the placement survived (no content refresh ran since adoption),
+        // revive it in place: back on the voxel path as a dynamic slot (the
+        // quiet-frames demotion settles it static later). A removed placement
+        // is re-created by the forced rescan below instead.
+        const field = state.volume?.occupancyField;
+        const placement = field?.placements?.find(
+          (pl) => slotKeyOf(pl.mesh, pl.instanceId) === entry.key,
+        );
+        if (placement) {
+          placement._giAnalytic = false;
+          placement._lastMovedFrame = this._frame;
+          // Sync the frozen placement matrix (and the slot uniform, which
+          // still holds the pre-adoption pose) to the CURRENT pose — without
+          // this the next transforms tick reads a phantom "changed" and
+          // re-adopts the resting mesh before it ever re-voxelizes
+          // (measured: the dynobj=8 arm ping-ponged demote→re-adopt and the
+          // bits never returned).
+          if (placement.instanceId == null || !placement.mesh.isInstancedMesh) {
+            placement.matrix.copy(placement.mesh.matrixWorld);
+          } else {
+            placement.mesh.getMatrixAt(placement.instanceId, placement.matrix);
+            placement.matrix.premultiply(placement.mesh.matrixWorld);
+          }
+          field.setSlotEnabled?.(placement.slot, true);
+          field.setSlotMatrix?.(placement.slot, placement.matrix);
+        }
         released = true;
       });
       if (released) {
         // Force the next fingerprint scan to run its content pass — the
         // un-adopted mesh needs its placement + bits back, and nothing else
-        // signals that (userData is not in the fingerprint).
+        // signals that (userData is not in the fingerprint) — and force the
+        // composite branch, which is the only place the pyramid chain
+        // DISPATCHES (the same trigger the park path needs).
         this._fingerprint = null;
+        this._forceWholeComposite = true;
+        this._compositedOnce = false;
+        if (globalThis.__giDynObjectsDebug) {
+          const f = state.volume?.occupancyField;
+          console.log(`[gi] dynamic-objects: revive state — dispatches=${f?.stats?.dispatches} isDirty=${f?.isDirty} dynSlots=${f?.placements?.length}`);
+        }
       }
     }
     const world = state.volume?.world;
@@ -6098,6 +6156,14 @@ export class GISystem {
     if (!dyn?.enabled) return false;
     const key = slotKeyOf(p.mesh, p.instanceId);
     if (this._dynAdoptedKeys.has(key)) return true; // already ours
+    // Post-demotion cooldown: a just-demoted mesh needs its voxel bits back
+    // through a few normal mover frames before it may re-adopt, or a single
+    // stray motion frame right after demotion ping-pongs the representations.
+    const cooldownUntil = this._dynCooldown?.get(key);
+    if (cooldownUntil != null) {
+      if (this._frame < cooldownUntil) return false;
+      this._dynCooldown.delete(key);
+    }
     const shape = this.#classifyForAdoption(key, p.mesh);
     if (!shape) return false;
     if (!dyn.adopt(key, p.mesh, p.instanceId, shape)) return false;

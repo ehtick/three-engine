@@ -211,7 +211,7 @@
           const occField = system.state.volume.occupancyField;
           const settle = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
           let mover = wall;
-          if (dynObjArm >= 2) {
+          if (dynObjArm >= 2 && dynObjArm <= 6) {
             // dynobj=2 torus-knot → BVH exact triangles; 3 sphere, 4 capsule,
             // 5 cylinder-frustum → the analytic default-primitive paths.
             // Added AFTER boot so the content refresh ships it like a
@@ -232,6 +232,25 @@
           await settle(1_000);
           const before = await occField.readbackStats(engine.renderer);
           const occupiedBefore = before.occupiedVoxels;
+          // dynobj=7 — the "dynamic" PIN: tag the (never-moved) wall AFTER
+          // the baseline readback and assert adoption fires with ZERO motion.
+          if (dynObjArm === 7) {
+            mover.userData.giDynamic = "dynamic";
+            const eagerDeadline = performance.now() + 15_000;
+            let eager = false;
+            while (performance.now() < eagerDeadline) {
+              await settle(250);
+              if ((system._dynSet?.count() ?? 0) > 0) { eager = true; break; }
+            }
+            if (!eager) throw new Error("dynobj=7: the 'dynamic' pin never adopted a motionless mesh");
+          }
+          // dynobj=8 — REST DEMOTION. The window starts HUGE: GPU readbacks
+          // stall the rotation for seconds at a time, and a short window
+          // fires mid-phase — the "after" baseline then reads the already-
+          // revived wall and the final assert compares equal numbers while
+          // everything works (this arm's first three failures). It shortens
+          // only once the baselines are taken.
+          if (dynObjArm === 8) { globalThis.__giDynDemoteFrames = 1e9; globalThis.__giDynObjectsDebug = true; }
           const adoptDeadline = performance.now() + 20_000;
           let adopted = false;
           while (performance.now() < adoptDeadline) {
@@ -243,6 +262,28 @@
                 (system._dynPendingDisable?.length ?? 0) === 0) { adopted = true; break; }
           }
           if (!adopted) throw new Error("dynobj arm: the rotating mover never adopted (or the GPU side never went live)");
+          // Refit-immune wall detector: the rotating 8m wall changes the
+          // scene AABB and triggers auto-fit refits mid-arm, so TOTAL
+          // occupancy counts are incomparable across phases (voxel sizing
+          // moves under them — this arm's first four failures were all this
+          // instrument trap). The wall is the only geometry above the floor
+          // band, so a world-space count above y=-0.7 reads its presence
+          // regardless of the current voxel size.
+          const wallVoxels = async () => {
+            const rb = await occField.readbackBits(engine.renderer);
+            let n = 0;
+            const l0 = rb.levels[0].res;
+            for (let z = 0; z < l0.z; z++) for (let y = 0; y < l0.y; y++) for (let x = 0; x < l0.x; x++) {
+              if (!rb.get(x, y, z, 0)) continue;
+              if (rb.origin.y + (y + 0.5) * rb.voxel.y > -0.7) n++;
+            }
+            return n;
+          };
+          if (dynObjArm === 8) {
+            const parked = await wallVoxels();
+            console.log(`GI-SMOKE D8 postadopt wallVoxels=${parked} dispatches=${occField.stats.dispatches}`);
+            if (parked > 50) throw new Error(`dynobj=8: ${parked} wall voxels survived the park`);
+          }
           if (dynObjArm === 2 && !(system._dynSet.stats.meshUploadsQueued > 0)) {
             throw new Error("dynobj=2 arm: the torus adopted without a BVH upload — it took an analytic path");
           }
@@ -266,6 +307,35 @@
             adopted: system._dynSet.count(), meshUploads: system._dynSet.stats.meshUploadsQueued,
             poolWords: system._dynSet.stats.poolWordsUsed,
           };
+          // dynobj=8: stop moving and watch the edit-idle demotion return
+          // the mesh to the voxel path (slot re-enabled, bits back).
+          if (dynObjArm === 8) {
+            globalThis.__giDynDemoteFrames = 120;
+            const demoteDeadline = performance.now() + 30_000;
+            let demoted = false;
+            while (performance.now() < demoteDeadline) {
+              await settle(500);
+              if ((system._dynSet?.count() ?? 0) === 0) { demoted = true; break; }
+            }
+            if (!demoted) throw new Error("dynobj=8: the rested adoptee never demoted back to voxel");
+            const backDeadline = performance.now() + 15_000;
+            let backWall = 0;
+            while (performance.now() < backDeadline) {
+              await settle(1_000);
+              backWall = await wallVoxels();
+              const wp = occField.placements?.find((pl) => pl.mesh === mover);
+              console.log(`GI-SMOKE D8 wallVoxels=${backWall} state=${wp ? occField.slotState?.(wp.slot) : "?"} dispatches=${occField.stats.dispatches}`);
+              if (backWall > 200) break;
+            }
+            if (!(backWall > 200)) {
+              throw new Error(
+                `dynobj=8: the demoted mesh never re-voxelized (wallVoxels=${backWall}) — ` +
+                `dynCount=${system._dynSet?.count()} adoptedKeys=${system._dynAdoptedKeys?.size} ` +
+                `dispatches=${occField.stats.dispatches} composited=${system._compositedOnce}`,
+              );
+            }
+            dynObjReport.demotedWallVoxels = backWall;
+          }
           console.log("GI-SMOKE DYNOBJ", JSON.stringify(dynObjReport));
           stats = await system.readRayHitStats();
         }

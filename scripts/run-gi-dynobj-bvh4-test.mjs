@@ -371,6 +371,9 @@ for (const [ai, { name, geometry }] of analyticCases.entries()) {
   const sphere = new THREE.SphereGeometry(0.8, 24, 16);
   const tagChecks = [
     ["voxel tag rejects adoption", mk(sphere, "voxel") === null],
+    ["static tag rejects adoption (voxel alias)", mk(sphere, "static") === null],
+    ["dynamic tag classifies by geometry like auto", mk(sphere, "dynamic")?.type === "sphere"],
+    ["dynamic tag sends custom meshes to the BVH", mk(torus, "dynamic")?.type === "mesh"],
     ["bvh tag forces triangles on a default primitive", mk(sphere, "bvh")?.type === "mesh"],
     ["obb tag forces the bounding box on a custom mesh", mk(torus, "obb")?.type === "obb"],
     ["untagged sphere stays analytic", mk(sphere, null)?.type === "sphere"],

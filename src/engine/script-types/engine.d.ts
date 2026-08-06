@@ -499,14 +499,17 @@ declare module "engine" {
     castShadow: boolean;
     receiveShadow: boolean;
     /**
-     * How GI represents this mesh once it moves (exact dynamic objects):
-     * `"auto"` classifies by geometry — default primitives become analytic
-     * shapes (box/plane → OBB, sphere, capsule, cylinder/cone → frustum),
-     * everything else an exact-triangle BVH; `"voxel"` keeps the legacy
-     * voxelized path; `"bvh"` forces exact triangles; `"obb"` forces the
-     * bounding box (cheapest, over-occludes concave shapes).
+     * How GI represents this mesh (exact dynamic objects). `"auto"` (default):
+     * voxelized while static, adopted into the exact ray-traced path on first
+     * motion, demoted back after a long rest in edit mode. `"static"`: never
+     * adopt (legacy alias `"voxel"`). `"dynamic"`: adopt at load — no
+     * first-motion transition — classified by geometry (default primitives →
+     * analytic box/plane/sphere/capsule/frustum, everything else an
+     * exact-triangle BVH). `"bvh"` / `"obb"`: adopt at load with a forced
+     * representation (exact triangles / bounding box — the latter is cheapest
+     * but over-occludes concave shapes).
      */
-    giDynamic: "auto" | "voxel" | "bvh" | "obb";
+    giDynamic: "auto" | "static" | "dynamic" | "voxel" | "bvh" | "obb";
   }> {}
 
   /**

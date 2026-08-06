@@ -61,7 +61,9 @@
 //     +22        max world scale factor (local→world distance approximation)
 //     +23        reserved
 //     +24..26    swept-bounds world min (prev ∪ curr, pre-expanded)
-//     +27        swept active flag (1 while the object moved recently)
+//     +27        swept retain factor: 0 = inactive · else the EMA retain
+//                scale for cells inside (translation-scaled — ~1 rotating
+//                in place, 0.35 translating fast)
 //     +28..30    swept-bounds world max
 //     +31..33    shape params: sphere [r,-,-] · capsule [r, halfSeg,-] ·
 //                frustum [rBottom, rTop, halfHeight]
@@ -129,7 +131,10 @@ const fullSweep = (v, target) => Math.abs((v ?? target) - target) < 1e-3;
 export function classifyDynamicShape(mesh) {
   if (!mesh?.geometry) return null;
   const tag = mesh.userData?.giDynamic;
-  if (tag === "voxel" || tag === "none" || tag === false) return null;
+  // "static" is the user-facing pin (never adopt); "voxel" is its legacy
+  // alias. "dynamic" pins ADOPTION EAGERNESS (GISystem adopts at load, no
+  // motion needed) but classifies by geometry like auto.
+  if (tag === "static" || tag === "voxel" || tag === "none" || tag === false) return null;
   if (mesh.isSkinnedMesh) return null;
   const geometry = mesh.geometry;
   if (geometry.morphAttributes?.position?.length) return null;
@@ -1104,7 +1109,9 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
         const i = entry.index;
         const M = worldMatrixOf(entry);
         const moved = !entry.prev.equals(M);
+        if (!moved) entry.restFrames = (entry.restFrames ?? 0) + 1;
         if (moved) {
+          entry.restFrames = 0;
           entry.prev.copy(M);
           // obbWorld = M × translate(center): the local box becomes symmetric
           // ±halfExtents around the object-space origin.
@@ -1145,7 +1152,27 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
           const mxz = Math.max(entry.prevBounds.max.z, entry.currBounds.max.z) + sweptExpand;
           wm(i, 24, mnx); wm(i, 25, mny); wm(i, 26, mnz);
           wm(i, 28, mxx); wm(i, 29, mxy); wm(i, 30, mxz);
-          wm(i, 27, 1);
+          // TRANSLATION-SCALED history cut (word 27 carries the EMA retain
+          // factor, 0 = inactive). An object ROTATING IN PLACE keeps a
+          // near-stationary AABB — cutting history there just re-exposes the
+          // receiving lattice's cell steps as visible jumps (the field EMA is
+          // what integrates them; user-reported on the rotating cube). A
+          // TRANSLATING object genuinely invalidates the cells it sweeps —
+          // low retain there prevents ghost trails. The per-axis
+          // overlap/union ratio of prev vs curr bounds separates the two:
+          // ~1 in-place → factor ~1 (no cut), →0 under fast translation →
+          // factor 0.35 (the original invalidation strength).
+          const ov = (a0, a1, b0, b1) => Math.max(0, Math.min(a1, b1) - Math.max(a0, b0));
+          const un = (a0, a1, b0, b1) => Math.max(a1, b1) - Math.min(a0, b0);
+          const axisRatio = (a0, a1, b0, b1) => {
+            const u = un(a0, a1, b0, b1);
+            return u > 1e-6 ? ov(a0, a1, b0, b1) / u : 1;
+          };
+          const overlap =
+            axisRatio(entry.prevBounds.min.x, entry.prevBounds.max.x, entry.currBounds.min.x, entry.currBounds.max.x) *
+            axisRatio(entry.prevBounds.min.y, entry.prevBounds.max.y, entry.currBounds.min.y, entry.currBounds.max.y) *
+            axisRatio(entry.prevBounds.min.z, entry.prevBounds.max.z, entry.currBounds.min.z, entry.currBounds.max.z);
+          wm(i, 27, Math.min(1, 0.35 + 0.65 * overlap));
           entry.movedFrames = 3;
           changed = true;
         } else if (entry.movedFrames > 0) {
@@ -1271,13 +1298,16 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
       const pv = vec3(p).toVar();
       Loop({ start: int(0), end: count, type: "int", condition: "<" }, ({ i }) => {
         const ob = uint(DYN_HEADER_RESERVED).add(i.toUint().mul(uint(OBJ_WORDS))).toVar();
-        const active = rf(ob.add(uint(27)));
+        // Word 27 = the object's translation-scaled retain factor (see the
+        // sync writer): 0 inactive, ~1 rotating in place (full smoothing —
+        // the receiving lattice's steps need the EMA), 0.35 translating fast.
+        const fObj = rf(ob.add(uint(27))).toVar();
         const mn = vec3(rf(ob.add(uint(24))), rf(ob.add(uint(25))), rf(ob.add(uint(26)))).toVar();
         const mx = vec3(rf(ob.add(uint(28))), rf(ob.add(uint(29))), rf(ob.add(uint(30)))).toVar();
-        const inside = active.greaterThan(0.5)
+        const inside = fObj.greaterThan(0.01)
           .and(pv.x.greaterThanEqual(mn.x)).and(pv.y.greaterThanEqual(mn.y)).and(pv.z.greaterThanEqual(mn.z))
           .and(pv.x.lessThanEqual(mx.x)).and(pv.y.lessThanEqual(mx.y)).and(pv.z.lessThanEqual(mx.z));
-        factor.assign(select(inside, factor.min(0.35), factor));
+        factor.assign(select(inside, factor.min(fObj), factor));
       });
       return factor;
     },
