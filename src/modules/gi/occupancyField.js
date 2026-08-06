@@ -1699,7 +1699,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
       })().compute(hybridLayout.macroCellCount)
     : null;
 
-  const traceBody = (origin, dir, tMin, tMax, steps, topLevel, penK = null, profile = false) => {
+  const traceBody = (origin, dir, tMin, tMax, steps, topLevel, penK = null, profile = false, penWidth = null) => {
     const inv = vec3(voxelInv).toVar();
     const q0 = vec3(origin).sub(vec3(gridOrigin)).mul(inv).toVar();
     const dq = vec3(dir).mul(inv).toVar();
@@ -1803,7 +1803,24 @@ export function createOccupancyField(bounds, res0, options = {}) {
             const qm = q0.add(dq.mul(tm));
             const pWorld = qm.mul(vec3(voxel)).add(vec3(gridOrigin));
             const d = freeRadiusAtWorld(pWorld, 0, true, null);
-            const cand = float(penK).mul(d).div(tm.max(1e-4)).clamp(0, 1);
+            // PENUMBRA RADIUS r(t) = max(t/k, penWidth) — the optional
+            // `penWidth` (world units) BAND-LIMITS the cone: without it the
+            // penumbra grows linearly with sample distance, so a near-razor
+            // sun traced 10-60m through architecture reads centimeter
+            // clearances at aperture edges and multiplies whole regions to
+            // ~0 (the field's "GI collapses when the sun shines through the
+            // roof slit", measured 2026-08-06: lit-strip cells 0.002 vs
+            // 0.18 with shadows off while the CPU DDA proved the paths
+            // CLEAR). With the floor, a razor sun (k→∞) degrades to a
+            // fixed penWidth-wide antialias band around silhouettes —
+            // full energy through any aperture wider than the band — and
+            // an authored wide sun keeps its cone wherever t/k exceeds the
+            // band. null (the default and every screen caller) compiles the
+            // historical cone exactly.
+            const rPen = penWidth == null
+              ? tm.max(1e-4).div(float(penK))
+              : tm.max(1e-4).div(float(penK)).max(float(penWidth));
+            const cand = d.div(rPen).clamp(0, 1);
             // Gated: not before ~2 voxels of travel (the surface's own
             // neighbourhood must not clamp rays at birth) and not past tMax
             // (geometry behind a point light must not darken it).
@@ -1883,15 +1900,19 @@ export function createOccupancyField(bounds, res0, options = {}) {
     // analytic cone-occlusion accumulator (see traceBody's penumbra note) and
     // returns it as `.pen` — 1 = clear, →0 as the ray grazes geometry.
     const penumbra = opts.penumbraK != null;
+    // Optional band-limit width (world units, may be a node — see traceBody's
+    // rPen note). A variant key + extra input, so screen callers keep their
+    // exact historical WGSL.
+    const penWidth = penumbra && opts.penWidth != null ? opts.penWidth : null;
     // Profiling is a graph variant: only cascade transport rays bind the
     // counter buffer. Shadow/AO callers must not inherit an otherwise-unused
     // storage binding into already dense composed kernels.
     const profile = rayHitDebug != null && opts.profile === true;
-    const key = `${steps}|${topLevel}|${penumbra ? 1 : 0}|${profile ? 1 : 0}`;
+    const key = `${steps}|${topLevel}|${penumbra ? 1 : 0}|${profile ? 1 : 0}|${penWidth != null ? 1 : 0}`;
     let fn = traceVariants.get(key);
     if (fn === undefined) {
       fn = sharedFn({
-        name: `giOccTrace${steps}_${topLevel}${penumbra ? "p" : ""}`,
+        name: `giOccTrace${steps}_${topLevel}${penumbra ? "p" : ""}${penWidth != null ? "w" : ""}`,
         type: "vec4",
         inputs: [
           { name: "origin", type: "vec3" },
@@ -1899,16 +1920,21 @@ export function createOccupancyField(bounds, res0, options = {}) {
           { name: "tMin", type: "float" },
           { name: "tMax", type: "float" },
           ...(penumbra ? [{ name: "penK", type: "float" }] : []),
+          ...(penWidth != null ? [{ name: "penW", type: "float" }] : []),
         ],
-        body: penumbra
-          ? (o, d, t0, t1, k) => traceBody(o, d, t0, t1, steps, topLevel, k, profile)
-          : (o, d, t0, t1) => traceBody(o, d, t0, t1, steps, topLevel, null, profile),
+        body: penWidth != null
+          ? (o, d, t0, t1, k, w) => traceBody(o, d, t0, t1, steps, topLevel, k, profile, w)
+          : penumbra
+            ? (o, d, t0, t1, k) => traceBody(o, d, t0, t1, steps, topLevel, k, profile)
+            : (o, d, t0, t1) => traceBody(o, d, t0, t1, steps, topLevel, null, profile),
       });
       traceVariants.set(key, fn);
     }
-    const packed = penumbra
-      ? fn(vec3(origin), vec3(dir), float(tMin), float(tMax), float(opts.penumbraK)).toVar()
-      : fn(vec3(origin), vec3(dir), float(tMin), float(tMax)).toVar();
+    const packed = penWidth != null
+      ? fn(vec3(origin), vec3(dir), float(tMin), float(tMax), float(opts.penumbraK), float(penWidth)).toVar()
+      : penumbra
+        ? fn(vec3(origin), vec3(dir), float(tMin), float(tMax), float(opts.penumbraK)).toVar()
+        : fn(vec3(origin), vec3(dir), float(tMin), float(tMax)).toVar();
     const hit = packed.x;
     const hitT = packed.y;
     const axis = packed.z;
@@ -2607,16 +2633,20 @@ export function createOccupancyField(bounds, res0, options = {}) {
         // point on plane P can only re-cross P at t≈0, so far cells of the
         // same plane never produced legitimate accepts anyway.
         const exclude = penumbra && opts.excludePoint != null;
+        // Band-limit width (world units) — see traceBody's rPen note. A
+        // variant + trailing input so every existing caller keeps its exact
+        // historical WGSL.
+        const penWidth = penumbra && opts.penWidth != null ? opts.penWidth : null;
         const profile = rayHitDebug != null && opts.profile === true;
         const key = `${macroStepLimit}|${coverage ? 1 : 0}|${exact ? 1 : 0}|${profile ? 1 : 0}` +
-          `|${coarseSkipEnabled ? 1 : 0}|${penumbra ? 1 : 0}|${exclude ? 1 : 0}`;
+          `|${coarseSkipEnabled ? 1 : 0}|${penumbra ? 1 : 0}|${exclude ? 1 : 0}|${penWidth != null ? 1 : 0}`;
         let fn = hybridPlaneVariants.get(key);
         if (fn === undefined) {
           fn = sharedFn({
             // "s0" is appended ONLY when the skip is off, so the default arm
             // keeps the exact function names it has always emitted.
             name: `giHybridPlaneTrace${macroStepLimit}${coverage ? "c" : ""}${exact ? "x" : ""}` +
-              `${penumbra ? "p" : ""}${exclude ? "e" : ""}${coarseSkipEnabled ? "" : "s0"}`,
+              `${penumbra ? "p" : ""}${exclude ? "e" : ""}${penWidth != null ? "w" : ""}${coarseSkipEnabled ? "" : "s0"}`,
             type: "vec4",
             inputs: [
               { name: "origin", type: "vec3" },
@@ -2625,8 +2655,14 @@ export function createOccupancyField(bounds, res0, options = {}) {
               { name: "tMax", type: "float" },
               ...(penumbra ? [{ name: "penK", type: "float" }] : []),
               ...(exclude ? [{ name: "excl", type: "vec3" }] : []),
+              ...(penWidth != null ? [{ name: "penW", type: "float" }] : []),
             ],
-            body: (o, d, t0, t1, penKIn, exclIn) => {
+            // Trailing-optional positional mapping: penW rides after excl
+            // when both exist, in excl's seat when exclude is off.
+            body: (o, d, t0, t1, a5, a6, a7) => {
+              const penKIn = penumbra ? a5 : undefined;
+              const exclIn = exclude ? a6 : undefined;
+              const penWIn = penWidth != null ? (exclude ? a7 : a6) : undefined;
               const inv = vec3(voxelInv).toVar();
               const q0 = vec3(o).sub(vec3(gridOrigin)).mul(inv).toVar();
               const dq = vec3(d).mul(inv).toVar();
@@ -2976,7 +3012,10 @@ export function createOccupancyField(bounds, res0, options = {}) {
                                   const dVox = denom.abs().mul(
                                     localT.sub(tP).abs().min(tEnd.sub(tP).abs()),
                                   ).toVar();
-                                  const cand = float(penKIn).mul(dVox.mul(voxMinW)).div(localT.max(1e-4)).clamp(0, 1);
+                                  const rPen1 = penWidth != null
+                                    ? localT.max(1e-4).div(float(penKIn)).max(float(penWIn))
+                                    : localT.max(1e-4).div(float(penKIn));
+                                  const cand = dVox.mul(voxMinW).div(rPen1).clamp(0, 1);
                                   pen.assign(pen.min(select(
                                     localT.greaterThan(penGate).and(localT.lessThan(t1)),
                                     cand,
@@ -2995,7 +3034,10 @@ export function createOccupancyField(bounds, res0, options = {}) {
                                 // tilted surface's staircase contributes
                                 // nothing (that was the teardrop smudge).
                                 const dVox = dPlane.add(n.dot(cell)).sub(n.dot(localQ)).abs().toVar();
-                                const cand = float(penKIn).mul(dVox.mul(voxMinW)).div(localT.max(1e-4)).clamp(0, 1);
+                                const rPen2 = penWidth != null
+                                  ? localT.max(1e-4).div(float(penKIn)).max(float(penWIn))
+                                  : localT.max(1e-4).div(float(penKIn));
+                                const cand = dVox.mul(voxMinW).div(rPen2).clamp(0, 1);
                                 const penApply = exclude
                                   ? localT.greaterThan(penGate).and(localT.lessThan(t1)).and(selfPlane.not())
                                   : localT.greaterThan(penGate).and(localT.lessThan(t1));
@@ -3270,11 +3312,11 @@ export function createOccupancyField(bounds, res0, options = {}) {
           hybridPlaneVariants.set(key, fn);
         }
 
-        const packed = (exclude
-          ? fn(vec3(origin), vec3(dir), float(tMin), float(tMax), float(opts.penumbraK), vec3(opts.excludePoint))
-          : penumbra
-            ? fn(vec3(origin), vec3(dir), float(tMin), float(tMax), float(opts.penumbraK))
-            : fn(vec3(origin), vec3(dir), float(tMin), float(tMax))).toVar();
+        const callArgs = [vec3(origin), vec3(dir), float(tMin), float(tMax)];
+        if (penumbra) callArgs.push(float(opts.penumbraK));
+        if (exclude) callArgs.push(vec3(opts.excludePoint));
+        if (penWidth != null) callArgs.push(float(penWidth));
+        const packed = fn(...callArgs).toVar();
         const hit = packed.x;
         const hitT = packed.y;
         const dq = vec3(dir).mul(vec3(voxelInv)).toVar();

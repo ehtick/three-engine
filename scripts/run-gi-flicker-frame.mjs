@@ -127,6 +127,14 @@ const gi = componentOf(giEntity, "global-illumination");
 console.log(`  GI "${giEntity.name}" quality ${gi.props?.quality} probeSmoothing ${gi.props?.probeSmoothing}; mover "${sphere.name}"`);
 
 if (QUALITY) await must("component.setProp", { id: giEntity.id, type: "global-illumination", key: "quality", value: QUALITY });
+// INTENSITY env — the user's scene saves intensity 0 (2026-08-06), which
+// makes every GI metric read a perfect zero; force a live value for A/Bs.
+if (process.env.INTENSITY) {
+  await must("component.setProp", {
+    id: giEntity.id, type: "global-illumination",
+    key: "intensity", value: Number(process.env.INTENSITY),
+  });
+}
 // PROBE_SMOOTHING=0.02 — arm override of the scene's saved Light Smoothing
 // (a live uniform, no rebuild).
 if (process.env.PROBE_SMOOTHING) {

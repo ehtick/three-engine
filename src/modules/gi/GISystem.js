@@ -3582,6 +3582,10 @@ export class GISystem {
           : null,
       probeIrradiance: probeIrradiance.buffer,
       depthMoments: probeDepth.buffer,
+      // The lightShadow closure below band-limits its penumbra (penWidth) —
+      // tells the gather to keep authored razor angles razor (see its
+      // softAngle note).
+      fieldPenWidthOn: globalThis.__giFieldPenWidth !== false,
       fieldSmoothing,
       // Private to the feedback compute (see createShadowTrace's layout note).
       // STABLE mode — the moving-light flicker fix (see createShadowTrace's
@@ -3655,6 +3659,26 @@ export class GISystem {
                 fieldMode >= RayHitMode.HybridPlane &&
                 fieldMode <= RayHitMode.HybridExactComplex &&
                 globalThis.__giFieldRecordShadows !== false;
+              // PENUMBRA BAND-LIMIT (`penWidth`, world units): the marchers'
+              // cone r(t) = t/k grows with sample distance, so a near-razor
+              // sun traced 10-60m through architecture reads centimeter
+              // clearances at aperture edges and multiplied whole regions
+              // to ~0 — MEASURED 2026-08-06 on the user's Sponza (vertical
+              // sun through the roof slit): lit-strip cells 0.002 lum vs
+              // 0.18 with `__giNoFieldShadows`, while a CPU DDA over the
+              // readback bits proved 52/60 paths CLEAR. The floor
+              // r(t) = max(t/k, halfCell) turns a razor sun into a fixed
+              // half-cell antialias band around silhouettes — full energy
+              // through any aperture wider than the band, cell-scale
+              // softness on mover edges (the popping band-limit), authored
+              // cone wherever it is wider. `__giFieldPenWidth`: false = the
+              // legacy cone, number = the width in meters.
+              const pwRef = globalThis.__giFieldPenWidth;
+              const penWidth = pwRef === false
+                ? null
+                : typeof pwRef === "number"
+                  ? pwRef
+                  : volume.world.cellMax.mul(0.5);
               let vis;
               let hitFlag; // both arms' binary hit — the width probe's gate
               if (fieldRecords) {
@@ -3664,10 +3688,11 @@ export class GISystem {
                     coverage: fieldMode >= RayHitMode.HybridPlaneCoverage,
                     exact: fieldMode === RayHitMode.HybridExactComplex,
                     penumbraK: kEff,
+                    penWidth,
                     // Cheaper budget than the screen's (96–192): the field
                     // wants "roughly right" energy per cell, and its rays
                     // start at cell centers, not grazing receivers.
-                    macroSteps: 96,
+                    macroSteps: Number(globalThis.__giFieldShadowSteps) || 96,
                   },
                 );
                 // kind > 3.5 = macro-limit / brick-limit / invalid-brick —
@@ -3678,16 +3703,28 @@ export class GISystem {
                   float(0),
                   r.hit.oneMinus().mul(r.pen),
                 ).toVar();
+                // DECOMPOSITION DEBUG (build-time): which factor darkens?
+                if (globalThis.__giFieldShadowDebug === "hit") vis = r.hit.oneMinus().toVar();
+                if (globalThis.__giFieldShadowDebug === "pen") vis = float(r.pen).toVar();
                 hitFlag = r.hit;
               } else {
                 const r = occ.traceOccupancy(
                   origin, dir, volume.world.minCell.mul(0.25), maxT,
-                  { steps: 64, penumbraK: kEff },
+                  { steps: Number(globalThis.__giFieldShadowSteps) || 64, penumbraK: kEff, penWidth },
                 );
                 vis = r.hit.oneMinus().mul(r.pen);
+                if (globalThis.__giFieldShadowDebug === "hit") vis = r.hit.oneMinus();
+                if (globalThis.__giFieldShadowDebug === "pen") vis = float(r.pen);
                 hitFlag = r.hit;
               }
-              if (fieldWidthProbe) {
+              // THE FIELD WIDTH PROBE IS OFF BY DEFAULT since 2026-08-06
+              // (`__giFieldWidthProbe = true` re-enables): its min k·D/t
+              // over BLURRED distance taps reads ~0 wherever a long ray
+              // passes near aperture edges — measured a further ×3 energy
+              // loss on the same Sponza slit — and the band-limited pen
+              // above now owns the anti-stepping job it was added for. The
+              // SCREEN arm keeps its width probe (user-validated).
+              if (fieldWidthProbe && globalThis.__giFieldWidthProbe === true) {
                 // Lazy like the screen arm: umbra cells skip the taps.
                 const w = float(1).toVar();
                 If(float(hitFlag).lessThan(0.5), () => {

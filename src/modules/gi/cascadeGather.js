@@ -779,6 +779,9 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
   // voxel nearest the cell center, flag 0 when no simple record exists (the
   // gradient below stays the fallback). See GISystem's option note.
   const recordNormalAt = options.recordNormalAt ?? null;
+  // True when the field's lightShadow closure band-limits its penumbra
+  // (GISystem's penWidth) — see the analytic block's softAngle note.
+  const bandLimited = options.fieldPenWidthOn === true;
   // ANALYTIC-LIGHT shadows may use a different tracer than emitter shadows.
   // GISystem passes the hierarchical occupancy DDA here: the sphere march over
   // the trilinear field TUNNELS through thin slabs at coarse presets — the
@@ -841,16 +844,6 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
   // frozen). GISystem defaults its uniform to 0.95 (user-confirmed live,
   // 2026-08-03) via `__giFieldSmoothing`.
   const fieldSmoothing = options.fieldSmoothing ?? null;
-  // THE FIELD-CELL PENUMBRA FLOOR (see the analytic block's band-limit note):
-  // minimum shadow cone angle = cellMax / reference distance, so a shadow
-  // edge spans ≥ ~a field cell wherever the field can see it. Node-assembly
-  // expression (no toVar here — the 30e orphan-assign trap).
-  const angleFloorRef = globalThis.__giFieldAngleFloor;
-  const angleFloor = angleFloorRef === false
-    ? null
-    : float(world.cellMax)
-        .div(typeof angleFloorRef === "number" ? angleFloorRef : 4)
-        .clamp(0.02, 0.2);
 
   return Fn(() => {
     // Temporal ingest of streamed bakes: staging holds the latest CPU bake
@@ -1081,26 +1074,24 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
               // the whole shadow side of the scene goes black (user
               // screenshot, 2026-08-05). The field's sun feed wants "roughly
               // right" energy, not the screen channel's exact penumbra shape.
-              // LOWER CLAMP = THE FIELD'S OWN SAMPLING RATE (the razor-sun
-              // band-limit, measured 2026-08-06 on the user's Sponza): with
-              // an authored sourceAngle of 0 the shadow edge is sub-cell
-              // sharp, so a rotating mover's field shadow crosses each
-              // ~0.3m cell as a FULL-AMPLITUDE one-frame step — the freeze
-              // bisect put ~half of all visible mover popping in exactly
-              // this term, and no marcher precision can fix it (records
-              // move the transition point, not its width). A signal sharper
-              // than the sampling grid cannot be represented — so the FIELD
-              // trace gets a minimum penumbra angle that spreads the edge
-              // across ≥ a cell at typical occluder distances (cellMax/4m,
-              // clamped [0.02, 0.2] rad). The SCREEN shadow channel keeps
-              // the authored razor edge — this only softens the bounce
-              // feed, which the field could never resolve sharply anyway.
-              // `__giFieldAngleFloor = false` removes the floor (build-time
-              // A/B); a number overrides the 4m reference distance.
-              const softAngle0 = slot.soft
-                ? select(float(slot.soft).greaterThan(1e-4), float(slot.soft).clamp(5e-4, 0.35), fallbackAngle)
+              // (The 2026-08-06 razor-sun anti-popping fix lives in the
+              // MARCHERS now — the field trace passes a `penWidth` band
+              // r(t) = max(t/k, halfCell), see GISystem's lightShadow
+              // closure. An angle floor here was tried first and REVERTED:
+              // fattening the cone dims every long constricted path — a
+              // vertical sun through Sponza's roof slit lost ~99% of its
+              // injected energy, GI collapsed scene-wide.)
+              // UNDER THE BAND (`bandLimited`), an authored razor sun stays
+              // razor: slot.soft = 0 maps to ~5e-4 (k≈2000, cone thinner
+              // than the band everywhere that matters) instead of the 1.4°
+              // fallback — the fallback's cone at aperture distance was
+              // exactly the over-dimming the band exists to prevent. The
+              // legacy (band-off) arm keeps the historical substitution.
+              const softAngle = slot.soft
+                ? (bandLimited
+                    ? float(slot.soft).clamp(5e-4, 0.35)
+                    : select(float(slot.soft).greaterThan(1e-4), float(slot.soft).clamp(5e-4, 0.35), fallbackAngle))
                 : fallbackAngle;
-              const softAngle = angleFloor ? softAngle0.max(angleFloor) : softAngle0;
               let shadow = lightShadow(origin, traceDir, maxT, float(1).div(softAngle), ndotl);
               if (fieldShadowOff) shadow = mix(shadow, float(1), fieldShadowOff);
               const direct = rawAlbedo
@@ -1141,11 +1132,7 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
             const emitterCellLum = emitterEnergy.dot(vec3(0.2126, 0.7152, 0.0722)).toVar();
             If(factor.greaterThan(1e-6).and(emitterCellLum.greaterThan(0.002)), () => {
               const origin = cellCenter.add(normal.mul(normalLiftV));
-              // Same field-cell band-limit as the analytic block: a small
-              // far lamp's cone (k up to 48 ⇒ ~0.02 rad) is sub-cell sharp
-              // for coarse field grids — cap k at 1/angleFloor.
-              const kMax = angleFloor ? float(1).div(angleFloor).min(48) : float(48);
-              const k = dist.div(float(emitterAngularRadius(slot)).max(0.05)).clamp(1.2, kMax);
+              const k = dist.div(float(emitterAngularRadius(slot)).max(0.05)).clamp(1.2, 48);
               const maxT = emitterSurfaceT(slot, origin, dir, dist).sub(normalLiftV).max(0);
               const shadow = float(1).toVar();
               If(maxT.greaterThan(normalLiftV), () => {
