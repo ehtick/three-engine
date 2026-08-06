@@ -790,7 +790,7 @@ export function createGiEmitterShadowPass({
  */
 export function createGiLightShadowFilterPass({
   gbuffer, source, target, width, height, resolveWidth, resolveHeight, planeEps,
-  history = null,
+  history = null, softness = null,
 }) {
   const widthU = uniform(width, "uint");
   const positionNode = texture(gbuffer.position);
@@ -834,10 +834,24 @@ export function createGiLightShadowFilterPass({
       const eps = float(planeEps).max(1e-3).toVar();
       const acc = vec4(0).toVar();
       const wSum = float(0).toVar();
+      // ANGLE-ADAPTIVE SPATIAL SUPPORT (2026-08-06). σ1.6 was tuned to
+      // average the STOCHASTIC arm's per-pixel sun-disc dither; the analytic
+      // arm is deterministic, and for a razor-authored sun (sourceAngle 0)
+      // the same kernel was the largest single softener in the chain — the
+      // user's A/B against three's shadow map read "crisp hexagon vs soft
+      // blob". `softness` (uniform, 0 = sharpest claimed light is a razor,
+      // 1 = wide) morphs σ 0.55→1.6 at runtime: razor suns keep a center-
+      // dominated despeckle (the tile-lattice raw noise still needs SOME
+      // support), wide suns keep the historical kernel exactly.
+      const sigma2 = softness
+        ? mix(float(2 * 0.55 * 0.55), float(2 * 1.6 * 1.6), float(softness).clamp(0, 1)).toVar()
+        : null;
       for (let dy = -2; dy <= 2; dy++) {
         for (let dx = -2; dx <= 2; dx++) {
           if (Math.abs(dx) + Math.abs(dy) > 3) continue; // corners add little support
-          const gauss = Math.exp(-(dx * dx + dy * dy) / (2 * 1.6 * 1.6));
+          const gauss = sigma2
+            ? float(-(dx * dx + dy * dy)).div(sigma2).exp()
+            : Math.exp(-(dx * dx + dy * dy) / (2 * 1.6 * 1.6));
           const tap = ivec2(
             coord.x.add(dx).clamp(0, width - 1),
             coord.y.add(dy).clamp(0, height - 1),

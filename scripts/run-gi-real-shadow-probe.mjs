@@ -146,6 +146,105 @@ writeFileSync(`scripts/gi-diag-chain-raw-${ARM}.png`, Buffer.from(result.rawPng.
 writeFileSync(`scripts/gi-diag-chain-final-${ARM}.png`, Buffer.from(result.finPng.split(",")[1], "base64"));
 await page.screenshot({ path: `scripts/gi-diag-chain-view-${ARM}.png` });
 
+// TEXTURE DIMS (DIMS=1): actual GPU dims of every shadow-chain target vs
+// the screen bundle's shadowWidth/Height — a mismatch means stale targets
+// after a resize (sampled stretched = the soft blob).
+if (process.env.DIMS === "1") {
+  const dims = await page.evaluate(({ anchorId }) => {
+    const eng = globalThis.__editorApi.entities.live(anchorId)?.engine;
+    const sb = eng.modules.get("gi").system.state.screen;
+    const of = (t) => t ? [t.image?.width ?? t.width, t.image?.height ?? t.height] : null;
+    return {
+      bundle: [sb.shadowWidth, sb.shadowHeight],
+      resolve: [sb.width, sb.height],
+      raw: of(sb.targets.lightShadowRaw),
+      mid: of(sb.targets.lightShadowMid),
+      wide: of(sb.targets.lightShadowWide),
+      final: of(sb.targets.lightShadow),
+      dist: of(sb.targets.lightShadowDist),
+      gbufferPos: of(sb.gbuffer?.position),
+    };
+  }, { anchorId: mover?.id ?? ents[0].id });
+  console.log(`DIMS ${JSON.stringify(dims)}`);
+}
+
+// SHADOW-SOURCE ATTRIBUTION (FOCUS=1): the user's close-up state — GI
+// intensity as saved (0), camera tight on the cube's floor shadow — with a
+// live toggle ladder over the DIRECT-shadow sources. Which toggle deletes
+// the soft chunky blob?
+if (process.env.FOCUS === "1") {
+  const lightEnt = ents.find((e) => (e.components ?? []).some((c) => c.type === "light" && c.props?.kind === "directional"));
+  // Aim at the ACTUAL shadow: project the cube center along the live sun
+  // direction onto the floor, then frame it from 3m up-sun.
+  const aim = await page.evaluate(({ anchorId, mpos }) => {
+    const eng = globalThis.__editorApi.entities.live(anchorId)?.engine;
+    const slot = eng.modules.get("gi").system.state.lightSlots?.[0];
+    const d = slot?.vector?.value; // toward the light
+    if (!d || Math.abs(d.y) < 0.05) return null;
+    const t = mpos[1] / d.y; // steps down to y=0 along -d
+    return { sun: [d.x, d.y, d.z].map((n) => +n.toFixed(3)), shadowP: [mpos[0] - d.x * t, 0, mpos[2] - d.z * t] };
+  }, { anchorId: mover?.id ?? ents[0].id, mpos });
+  console.log(`  sun/shadow: ${JSON.stringify(aim)}`);
+  const sp = aim?.shadowP ?? [mpos[0], 0, mpos[2]];
+  await call("viewport.setCamera", {
+    position: [sp[0] + 2.2, 2.0, sp[2] + 1.8],
+    target: [sp[0], 0.1, sp[2]],
+  });
+  await wait(2000);
+  const shot = async (name) => {
+    await wait(2500);
+    await page.screenshot({ path: `scripts/gi-diag-focus-${name}.png` });
+    console.log(`  focus shot: ${name}`);
+  };
+  await shot("base");
+  // Same-frame raw + final shadow textures at THIS close view.
+  {
+    const texes = await page.evaluate(async ({ anchorId }) => {
+      const eng = globalThis.__editorApi.entities.live(anchorId)?.engine;
+      const sb = eng.modules.get("gi").system.state.screen;
+      const W = sb.shadowWidth, H = sb.shadowHeight;
+      const stride = Math.ceil((W * 4) / 256) * 256;
+      const png = (A) => {
+        const cv = document.createElement("canvas");
+        cv.width = W; cv.height = H;
+        const ctx = cv.getContext("2d");
+        const id = ctx.createImageData(W, H);
+        for (let y = 0; y < H; y++) {
+          const row = y * stride;
+          for (let x = 0; x < W; x++) {
+            const i = (y * W + x) * 4, b = A[row + x * 4];
+            id.data[i] = b; id.data[i + 1] = b; id.data[i + 2] = b; id.data[i + 3] = 255;
+          }
+        }
+        ctx.putImageData(id, 0, 0);
+        return cv.toDataURL("image/png");
+      };
+      const raw = await eng.renderer.backend.copyTextureToBuffer(sb.targets.lightShadowRaw, 0, 0, W, H);
+      const fin = await eng.renderer.backend.copyTextureToBuffer(sb.targets.lightShadow, 0, 0, W, H);
+      const mid = sb.targets.lightShadowMid
+        ? await eng.renderer.backend.copyTextureToBuffer(sb.targets.lightShadowMid, 0, 0, W, H) : null;
+      const wide = sb.targets.lightShadowWide
+        ? await eng.renderer.backend.copyTextureToBuffer(sb.targets.lightShadowWide, 0, 0, W, H) : null;
+      return { raw: png(raw), fin: png(fin), mid: mid ? png(mid) : null, wide: wide ? png(wide) : null };
+    }, { anchorId: mover?.id ?? ents[0].id });
+    writeFileSync("scripts/gi-diag-focus-raw.png", Buffer.from(texes.raw.split(",")[1], "base64"));
+    writeFileSync("scripts/gi-diag-focus-final.png", Buffer.from(texes.fin.split(",")[1], "base64"));
+    if (texes.mid) writeFileSync("scripts/gi-diag-focus-mid.png", Buffer.from(texes.mid.split(",")[1], "base64"));
+    if (texes.wide) writeFileSync("scripts/gi-diag-focus-wide.png", Buffer.from(texes.wide.split(",")[1], "base64"));
+  }
+  // 1. castShadow off — kills the gi channel AND any three map. Blob
+  //    survives => not a shadow term at all.
+  await call("component.setProp", { id: lightEnt.id, type: "light", key: "castShadow", value: false });
+  await shot("noshadow");
+  await call("component.setProp", { id: lightEnt.id, type: "light", key: "castShadow", value: true });
+  // 2. three's shadow map instead of the gi channel.
+  await call("component.setProp", { id: lightEnt.id, type: "light", key: "shadowMode", value: "map" });
+  await shot("mapmode");
+  await call("component.setProp", { id: lightEnt.id, type: "light", key: "shadowMode", value: "gi" });
+  await wait(1500);
+  await shot("restored");
+}
+
 // KIND HISTOGRAM (KINDS=1, needs PRESET_GLOBALS __giShadowKindDebug:"sub"):
 // count verdict-kind bytes in the raw over N grabs while the scene script
 // rotates the cube — box/fail growth on the REAL project is the conviction

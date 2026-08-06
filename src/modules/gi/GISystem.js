@@ -2406,6 +2406,9 @@ export class GISystem {
             resolveWidth: width,
             resolveHeight: height,
             planeEps: inputs.lightShadow.voxMax ?? 0.1,
+            // Angle-adaptive σ (see the filter's note) — synced per tick
+            // from the sharpest claimed light in #syncLightShadowNodes.
+            softness: (this._giShadowSoftnessU ??= uniform(1)),
             history: analyticWidth ? null : {
               histShadow: targets.lightShadowHist,
               histPos: targets.lightShadowHistPos,
@@ -4397,6 +4400,10 @@ export class GISystem {
     // construction — the resolve writes channel i from lightSlots[i], and
     // lightSlots[i] is fed by lights[i] in the loop above.
     const claimed = new Set();
+    // Sharpest claimed angle drives the filter's spatial σ (see the
+    // angle-adaptive note in createGiLightShadowFilterPass). 5° half-angle
+    // and up = the full historical kernel.
+    let maxClaimedAngle = 0;
     // Hard-capped at the target's four channels. A slot past the 4th would get
     // an all-zero mask, and an all-zero mask dots to 0 — i.e. a fully BLACK
     // light rather than an unshadowed one. Bounding the loop is the guard.
@@ -4405,6 +4412,7 @@ export class GISystem {
       const light = lights[i];
       if (!light?.shadow || light.userData?.giShadowMode !== "gi") continue;
       claimed.add(light);
+      maxClaimedAngle = Math.max(maxClaimedAngle, light.userData?.giSourceAngle ?? 0);
       const entry = this.#acquireLightShadowNode(light);
       entry.mask.value.set(i === 0 ? 1 : 0, i === 1 ? 1 : 0, i === 2 ? 1 : 0, i === 3 ? 1 : 0);
       // PCSS blur strength = tan of the source HALF-angle (giSourceAngle is
@@ -4436,6 +4444,12 @@ export class GISystem {
       }
       this.#releaseLightShadowNode(light, entry);
       nodes.delete(light);
+    }
+    // Filter σ from the sharpest claimed light (0 = razor → despeckle-only;
+    // ≥5° half-angle → the historical σ1.6). No claimed lights → leave the
+    // uniform wherever it is; nothing samples the channel then.
+    if (this._giShadowSoftnessU && claimed.size) {
+      this._giShadowSoftnessU.value = Math.min(1, maxClaimedAngle / 0.0873);
     }
     // Counted over the WHOLE collected list, not the channels above: the point
     // of the warning is precisely the lights that fell off the end.
