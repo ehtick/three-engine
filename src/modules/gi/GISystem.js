@@ -24,7 +24,7 @@ import { blitBvhAtlasTiles, createGiBvhReflect, createGiBvhTarget, createGiEmitt
 import { resolveMaterialSurface, serializeMeshForBake } from "./voxelizeOnce.js";
 import { createOccupancyDebugMaterial, createSdfDebugMaterial, createGiField } from "./giField.js";
 import { createOccupancyField, describeOccupancyField, quantizeOccupancyRes } from "./occupancyField.js";
-import { classifyDynamicShape, composeFieldDynamics, createDynamicObjectSet, dynHeaderWords } from "./dynamicObjects.js";
+import { buildStaticSceneBvhWords, classifyDynamicShape, composeFieldDynamics, createDynamicObjectSet, dynHeaderWords } from "./dynamicObjects.js";
 import { fitPrimitive } from "./primitiveFit.js";
 import { describeGrid } from "./instanceGrid.js";
 import { BRICK_AXIS_BY_QUALITY, describeSparseField } from "./sparseField.js";
@@ -1896,7 +1896,9 @@ export class GISystem {
       analyticWidth,
       marcher: globalThis.__giLightShadowSphere === true
         ? "sphere"
-        : (recordMarch ? `records (${rayHitModeName(shadowMode)})` : "voxel-dda") +
+        : (this._dynSet?.staticBvh && globalThis.__giShadowStaticBvh !== false
+            ? "static-bvh8 + exact-dynamics"
+            : recordMarch ? `records (${rayHitModeName(shadowMode)})` : "voxel-dda") +
           (analyticWidth
             ? " + analytic-width"
             : globalThis.__giConeShadowDensity === true ? " + density-cone" : " + sun-disc"),
@@ -2026,6 +2028,33 @@ export class GISystem {
                     return w;
                   }
                 : null;
+              // STATIC-BVH ARM ("light by voxels, shadows by BVH", user
+              // directive 2026-08-06): the shadow ray intersects EXACT world
+              // triangles — the masked static-scene BVH8 merged with the
+              // exact dynamic set — and never touches voxels. Admission is
+              // exact geometry; softness stays the analytic width probe
+              // (width, never admission). Radiance/bounce remain voxel.
+              // `__giShadowStaticBvh = false` restores the records marcher.
+              if (this._dynSet?.staticBvh && globalThis.__giShadowStaticBvh !== false) {
+                const s = this._dynSet.traceStaticBvh(origin, dirEff, tMin, exactEnd);
+                const dr = this._dynSet.trace(origin, dirEff, tMin, exactEnd, {});
+                const sHit = s.x.greaterThanEqual(0).toVar();
+                const hit = sHit.or(dr.hit.greaterThan(0.5)).toVar();
+                const tBest = select(
+                  sHit.and(dr.hit.greaterThan(0.5)), s.x.min(dr.t),
+                  select(sHit, s.x, dr.t),
+                ).toVar();
+                let exactVis;
+                if (evalMidW) {
+                  exactVis = select(hit, float(0), evalMidW(hit.not()));
+                } else {
+                  exactVis = select(hit, float(0), float(1));
+                }
+                return vec2(
+                  coneT ? exactVis.mul(coneT) : exactVis,
+                  tBest.max(0).div(float(span)).clamp(0, 1),
+                );
+              }
               // THE RECORD MARCH — the non-voxel shadow arm. When the active
               // ray-hit mode carries surface records, shadow rays resolve hits
               // through the SAME fitted planes (+ coverage clips, + exact
@@ -2187,6 +2216,26 @@ export class GISystem {
       // (≥ 2 field cells); one extra voxel keeps grazing rays out of the
       // lamp's own conservatively-bulged shell.
       const tEnd = float(maxT).sub(voxMax).max(0).toVar();
+      // STATIC-BVH ARM (see the direct arm's note): exact triangles for the
+      // emitter's occlusion too. The tEnd trim above already excludes the
+      // lamp's own surface; the width probe supplies area-light softness.
+      if (this._dynSet?.staticBvh && globalThis.__giShadowStaticBvh !== false) {
+        const s = this._dynSet.traceStaticBvh(origin, dir, voxMax, tEnd);
+        const dr = this._dynSet.trace(origin, dir, voxMax, tEnd, {});
+        const hit = s.x.greaterThanEqual(0).or(dr.hit.greaterThan(0.5)).toVar();
+        if (widthProbe) {
+          const w = float(1).toVar();
+          If(hit.not(), () => {
+            w.assign(widthProbe(
+              origin, dir, voxMax.mul(3), tEnd, k,
+              cosRayNormal != null ? float(cosRayNormal) : float(1),
+              lift,
+            ));
+          });
+          return select(hit, float(0), w);
+        }
+        return select(hit, float(0), float(1));
+      }
       const r = occ.traceHybridPlane(origin, dir, voxMax, tEnd, {
         coverage: shadowMode >= RayHitMode.HybridPlaneCoverage,
         exact: shadowMode === RayHitMode.HybridExactComplex,
@@ -5733,10 +5782,37 @@ export class GISystem {
       ({ low: 262144, medium: 393216, high: 786432, ultra: 1572864 }[quality] ?? 786432);
     const dynWords = dynObjectsOn ? dynHeaderWords() + dynPoolWords : 0;
 
-    const field = createOccupancyField(bounds, res, {
+    // STATIC-SCENE SHADOW BVH ("light by voxels, shadows by BVH"): one
+    // world-space BVH8 over every static placement — the screen shadow
+    // channels trace exact triangles while injection/bounce stay voxel.
+    // `__giShadowStaticBvh = false` restores the records/DDA marcher.
+    let staticBvhPacked = null;
+    if (dynObjectsOn && globalThis.__giShadowStaticBvh !== false) {
+      const t0 = performance.now();
+      const geomByKey = new Map(geometries.map((g) => [g.key, g]));
+      const items = placements
+        .map((p) => {
+          const g = geomByKey.get(p.geometryKey);
+          return g ? { positions: g.positions, index: g.index, matrix: p.matrix, slot: p.slot } : null;
+        })
+        .filter(Boolean);
+      staticBvhPacked = items.length ? buildStaticSceneBvhWords(items) : null;
+      if (staticBvhPacked) {
+        console.log(
+          `[gi] static shadow bvh: ${staticBvhPacked.triCount} tris, ` +
+            `${(staticBvhPacked.words.length * 4 / (1024 * 1024)).toFixed(1)}MB, built in ${(performance.now() - t0).toFixed(0)}ms`,
+        );
+      }
+    }
+    // 1.5× headroom so content refreshes (late GLBs) and demote rebuilds fit
+    // without a full field rebuild.
+    const staticBvhWords = staticBvhPacked ? Math.ceil(staticBvhPacked.words.length * 1.5) : 0;
+
+    const makeField = (dynW, statW) => createOccupancyField(bounds, res, {
       slotCapacity: Math.min(MAX_INSTANCE_SLOTS, Math.max(64, placements.length * 2)),
       traceSteps: { low: 48, medium: 64, high: 96, ultra: 128 }[quality] ?? 96,
-      dynamicObjectWords: dynWords,
+      dynamicObjectWords: dynW,
+      staticBvhWords: statW,
       enableProfiling: rayHitConfig?.enableProfiling === true,
       countLegacyFallbacks: rayHitConfig?.fallbackToLegacy === true,
       enableHybridBrick: (rayHitConfig?.activeMode ?? RayHitMode.OccupancyLegacy) >= RayHitMode.HybridBrickBox &&
@@ -5755,6 +5831,29 @@ export class GISystem {
       // skip; only an explicit opt-out compiles the no-skip A/B arm.
       rayHitCoarseSkip: rayHitConfig?.enableSkipDistance !== false,
     });
+    // BINDING-SIZE DEGRADE LADDER: the bits buffer is ONE binding, and a big
+    // ultra scene already sits near 128MB before the optional tails — a real
+    // project hit 144MB and every bind group using the buffer failed (GI
+    // dark, console full of CreateBindGroup errors). The engine now asks the
+    // adapter for a higher maxStorageBufferBindingSize, but on devices that
+    // only offer the baseline the optional regions must shrink to fit:
+    // static shadow BVH first (shadows fall back to the records marcher),
+    // then the exact-dynamic pool.
+    const deviceLimit =
+      this.engine?.renderer?.backend?.device?.limits?.maxStorageBufferBindingSize ?? 134217728;
+    let field = makeField(dynWords, staticBvhWords);
+    if (field.bitsBuffer.value.array.byteLength > deviceLimit && staticBvhWords > 0) {
+      console.warn(
+        `[gi] bits buffer ${(field.bitsBuffer.value.array.byteLength / 1048576).toFixed(0)}MB exceeds the device's ` +
+          `${(deviceLimit / 1048576).toFixed(0)}MB storage binding limit — dropping the static shadow BVH (records marcher fallback)`,
+      );
+      staticBvhPacked = null;
+      field = makeField(dynWords, 0);
+    }
+    if (field.bitsBuffer.value.array.byteLength > deviceLimit && dynWords > 0) {
+      console.warn("[gi] bits buffer still over the storage binding limit — disabling exact dynamic objects");
+      field = makeField(0, 0);
+    }
     for (const p of placements) field.setSlotMatrix(p.slot, p.matrix);
     field.setGeometry(geometries, placements);
     field.placements = placements;
@@ -5774,12 +5873,22 @@ export class GISystem {
         capacityWords: field.dynamicObjectWords,
       });
       composeFieldDynamics(field, this._dynSet);
+      if (staticBvhPacked && field.staticBvhWords > 0) {
+        this._dynSet.queueRegionUpload(field.staticBvhWordOffset, staticBvhPacked.words);
+        this._dynSet.attachStaticBvh({
+          nodeBase: field.staticBvhWordOffset,
+          triBase: field.staticBvhWordOffset + staticBvhPacked.nodeWords,
+        });
+        this._staticBvhCapacity = field.staticBvhWords;
+        this._staticBvhStale = null;
+      }
       if (this._dynAdoptedKeys.size > 0) this.#readoptDynamicObjects(meshes);
       // Boot marker (the "is my build live" pattern): one line that settles
       // which representation movers get in a running editor.
       console.log(
-        `[gi] dynamic-objects: exact movers ON (obb + bvh4) — max ${this._dynSet.maxObjects} objects, ` +
-          `${(field.dynamicObjectWords * 4 / (1024 * 1024)).toFixed(1)}MB pool, ${this._dynAdoptedKeys.size} adopted`,
+        `[gi] dynamic-objects: exact movers ON (obb + bvh) — max ${this._dynSet.maxObjects} objects, ` +
+          `${(field.dynamicObjectWords * 4 / (1024 * 1024)).toFixed(1)}MB pool, ${this._dynAdoptedKeys.size} adopted` +
+          (this._dynSet.staticBvh ? `, static shadow bvh ${(field.staticBvhWords * 4 / (1024 * 1024)).toFixed(1)}MB` : ""),
       );
     }
     return field;
@@ -5942,6 +6051,9 @@ export class GISystem {
     for (const p of placements) field.setSlotMatrix(p.slot, p.matrix);
     field.placements = placements;
     this.#refreshOccupancySlotRemap();
+    // The static shadow BVH bakes world-space triangles — a changed mesh SET
+    // means it no longer matches the scene.
+    if (this._dynSet?.staticBvh) this._staticBvhStale = this._frame;
   }
 
   /**
@@ -6111,12 +6223,17 @@ export class GISystem {
         this._fingerprint = null;
         this._forceWholeComposite = true;
         this._compositedOnce = false;
+        // The released mesh's static-BVH triangles are at the BUILD pose —
+        // stale if it moved. Rebuild the static BVH at current poses
+        // (debounced; edit-mode only, where demotions happen).
+        if (dyn.staticBvh) this._staticBvhStale = this._frame;
         if (globalThis.__giDynObjectsDebug) {
           const f = state.volume?.occupancyField;
           console.log(`[gi] dynamic-objects: revive state — dispatches=${f?.stats?.dispatches} isDirty=${f?.isDirty} dynSlots=${f?.placements?.length}`);
         }
       }
     }
+    this.#maybeRebuildStaticBvh(state);
     const world = state.volume?.world;
     const cellRaw = world?.cellMax;
     const cell = typeof cellRaw === "number" ? cellRaw : (typeof cellRaw?.value === "number" ? cellRaw.value : 0.35);
@@ -6139,6 +6256,48 @@ export class GISystem {
       // mover just left.
       this._forceWholeComposite = true;
       this._compositedOnce = false;
+    }
+  }
+
+  /**
+   * Debounced static-shadow-BVH rebuild at CURRENT poses — after demotions
+   * (whose static triangles went stale the moment the mesh first moved) and
+   * content changes. Excludes adopted placements; the mask resets to empty
+   * because the fresh soup simply omits them.
+   */
+  #maybeRebuildStaticBvh(state) {
+    const dyn = this._dynSet;
+    if (this._staticBvhStale == null || !dyn?.staticBvh) return;
+    if (this._frame - this._staticBvhStale < 180) return;
+    this._staticBvhStale = null;
+    const field = state.volume?.occupancyField;
+    if (!field?.placements) return;
+    const t0 = performance.now();
+    const items = [];
+    for (const p of field.placements) {
+      if (p._giAnalytic) continue;
+      if (this._dynAdoptedKeys?.has(slotKeyOf(p.mesh, p.instanceId))) continue;
+      const record = serializeMeshForBake(p.mesh);
+      if (!record) continue;
+      items.push({ positions: record.positions, index: record.index, matrix: p.matrix, slot: p.slot });
+    }
+    const packed = items.length ? buildStaticSceneBvhWords(items) : null;
+    if (!packed) return;
+    if (packed.words.length > (this._staticBvhCapacity ?? 0)) {
+      console.warn(
+        `[gi] static shadow bvh: rebuild needs ${packed.words.length} words > ${this._staticBvhCapacity} capacity — ` +
+          "keeping the stale BVH (new content shadows arrive on the next full GI rebuild)",
+      );
+      return;
+    }
+    dyn.queueRegionUpload(field.staticBvhWordOffset, packed.words);
+    dyn.attachStaticBvh({
+      nodeBase: field.staticBvhWordOffset,
+      triBase: field.staticBvhWordOffset + packed.nodeWords,
+    });
+    dyn.resetStaticMask([]);
+    if (globalThis.__giDynObjectsDebug) {
+      console.log(`[gi] static shadow bvh: rebuilt ${packed.triCount} tris in ${(performance.now() - t0).toFixed(0)}ms`);
     }
   }
 
@@ -6171,6 +6330,10 @@ export class GISystem {
     p._giAnalytic = true;
     p._lastMovedFrame = null;
     (this._dynPendingDisable ??= []).push(p.slot);
+    // Mask its triangles out of the static shadow BVH the same frame — the
+    // exact dynamic object takes over; the static copy would ghost at its
+    // build pose otherwise.
+    dyn.setStaticMaskBit(p.slot, true);
     // Leave the composite immediately too (the #syncSlots filter only runs on
     // fingerprint scans): clearing the atlas slot purges the mover from the
     // distance field in one composite and stops its rotation from bumping the

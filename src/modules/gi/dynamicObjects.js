@@ -95,7 +95,13 @@ import { sharedFn } from "./giFn.js";
 import { octDecodeTSL, octEncodeTSL } from "./rayHit/rayHitTSL.js";
 
 export const OBJ_WORDS = 40;
-export const DYN_HEADER_RESERVED = 16;
+// Header words 0..15: count + reserved. Words 16..31: the STATIC-BVH
+// slot-disable mask (512 slots, raw u32 — adopted movers' static triangles
+// are masked out of the shadow BVH live). 32..47: reserved. Object blocks
+// follow.
+export const DYN_HEADER_RESERVED = 48;
+export const STATIC_MASK_WORD_BASE = 16;
+export const STATIC_MASK_WORDS = 16;
 const DEFAULT_MAX_OBJECTS = 16;
 
 /** Header words for a given object capacity. */
@@ -224,7 +230,7 @@ export function buildBvh8Words(geometry) {
  * levels, which preserves its SAH quality while dividing the traversal's pop
  * count; arity 8 additionally quantizes child bounds (see the header note).
  */
-export function buildBvhWords(geometry, arity = 8) {
+export function buildBvhWords(geometry, arity = 8, triSlotOf = null) {
   const srcPos = geometry.attributes.position;
   const positions = srcPos.array.slice(0, srcPos.count * 3);
   let index;
@@ -234,6 +240,12 @@ export function buildBvhWords(geometry, arity = 8) {
     index = srcPos.count > 65535 ? new Uint32Array(srcPos.count) : new Uint16Array(srcPos.count);
     for (let i = 0; i < srcPos.count; i++) index[i] = i;
   }
+  // `triSlotOf(originalTriIndex)` turns on SLOT-TAGGED triangles (stride 10:
+  // 9 vertex floats + an occupancy-slot id word) — the static-scene BVH's
+  // format, where a per-slot mask lets adopted movers leave the shadow set
+  // without a rebuild. Only valid for SEQUENTIALLY-INDEXED soups (the
+  // original triangle id is recovered as idx[3t]/3).
+  const TRI_WORDS = triSlotOf ? 10 : 9;
   // Fresh geometry: MeshBVH reorders the index in place, and the render
   // geometry must never be mutated by a GI acceleration build.
   const geom = new THREE.BufferGeometry();
@@ -257,6 +269,7 @@ export function buildBvhWords(geometry, arity = 8) {
 
   const nodes = [];
   const tris = [];
+  const triSlots = [];
   const makeLeafRef = (n) => {
     const start = tris.length / 9;
     const c = Math.min(cnt(n), 127);
@@ -267,6 +280,7 @@ export function buildBvhWords(geometry, arity = 8) {
         const vi = idx[ti + k] * 3;
         tris.push(pos[vi], pos[vi + 1], pos[vi + 2]);
       }
+      if (triSlotOf) triSlots.push(triSlotOf(idx[ti] / 3) >>> 0);
     }
     return (0x80000000 | (start & 0xffffff) | (c << 24)) >>> 0;
   };
@@ -308,7 +322,8 @@ export function buildBvhWords(geometry, arity = 8) {
 
   const NODE_WORDS = 28;
   const nodeWords = nodes.length * NODE_WORDS;
-  const words = new Uint32Array(nodeWords + tris.length);
+  const triCount = tris.length / 9;
+  const words = new Uint32Array(nodeWords + triCount * TRI_WORDS);
   const wf = new Float32Array(words.buffer);
   if (arity === 8) {
     // COMPRESSED 8-wide: per-node origin + per-axis power-of-two step,
@@ -371,9 +386,65 @@ export function buildBvhWords(geometry, arity = 8) {
       }
     });
   }
-  wf.set(tris, nodeWords);
+  if (triSlotOf) {
+    // Stride-10 triangles: 9 f32 vertex words + a RAW u32 slot-id word (the
+    // masked traversal reads it unbitcast).
+    for (let t = 0; t < triCount; t++) {
+      const base = nodeWords + t * 10;
+      for (let k = 0; k < 9; k++) wf[base + k] = tris[t * 9 + k];
+      words[base + 9] = triSlots[t];
+    }
+  } else {
+    wf.set(tris, nodeWords);
+  }
   geom.dispose();
-  return { words, nodeWords, triWords: tris.length, triCount: tris.length / 9, arity };
+  return { words, nodeWords, triWords: triCount * TRI_WORDS, triCount, arity };
+}
+
+/**
+ * ONE world-space BVH8 over every STATIC placement — the shadow channels'
+ * exact scene ("light by voxels, shadows by BVH"). Triangles carry their
+ * occupancy-slot id so an adopting mover's static copy can be masked out the
+ * same frame (no stale-pose ghosts), and a demotion rebuilds at current
+ * poses. Instances are baked per placement (world-space soup — necessary,
+ * and what makes the traversal transform-free).
+ *
+ * @param items [{ positions: Float32Array, index: TypedArray|null,
+ *                 matrix: THREE.Matrix4, slot: number }]
+ */
+export function buildStaticSceneBvhWords(items) {
+  let triTotal = 0;
+  for (const it of items) {
+    triTotal += Math.floor((it.index ? it.index.length : it.positions.length / 3) / 3);
+  }
+  if (triTotal < 1) return null;
+  const soup = new Float32Array(triTotal * 9);
+  const triSlot = new Uint32Array(triTotal);
+  const v = new THREE.Vector3();
+  let t = 0;
+  for (const it of items) {
+    const n = Math.floor((it.index ? it.index.length : it.positions.length / 3) / 3);
+    for (let i = 0; i < n; i++) {
+      for (let k = 0; k < 3; k++) {
+        const vi = it.index ? it.index[i * 3 + k] : i * 3 + k;
+        v.set(it.positions[vi * 3], it.positions[vi * 3 + 1], it.positions[vi * 3 + 2]).applyMatrix4(it.matrix);
+        const o = t * 9 + k * 3;
+        soup[o] = v.x; soup[o + 1] = v.y; soup[o + 2] = v.z;
+      }
+      triSlot[t] = it.slot >>> 0;
+      t++;
+    }
+  }
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute("position", new THREE.BufferAttribute(soup, 3));
+  // Sequential index — what makes idx[3t]/3 recover the original triangle id
+  // for the slot lookup after MeshBVH's in-place reorder.
+  const index = new Uint32Array(triTotal * 3);
+  for (let i = 0; i < index.length; i++) index[i] = i;
+  geom.setIndex(new THREE.BufferAttribute(index, 1));
+  const packed = buildBvhWords(geom, 8, (origTri) => triSlot[origTri]);
+  geom.dispose();
+  return packed;
 }
 
 // ═══════════════════════════════════════════════════ WGSL: BVH4 traversal
@@ -609,6 +680,125 @@ export function dynBvhArity() {
   return Number(globalThis.__giDynBvhArity) === 4 ? 4 : 8;
 }
 
+// STATIC-SCENE traversal: identical to giDynBvh8 except stride-10 triangles
+// whose 10th word is an occupancy-slot id checked against a 512-bit disable
+// mask (adopted movers' static copies are masked out live). Compiled ONLY
+// into the shadow kernels that carry the static-BVH arm.
+const bvh8MaskedTraceWgsl = wgslFn(/* wgsl */ `
+
+	fn giStaticBvh8(
+		roL: vec3f, rdL: vec3f, tMin: f32, tMax: f32,
+		nodeBase: u32, triBase: u32, maskBase: u32,
+		bits: ptr<storage, array<u32>, read_write>
+	) -> vec4f {
+
+		var stack: array<u32, 44>;
+		var sp: i32 = 0;
+		stack[0] = 1u;
+
+		var bestT: f32 = tMax;
+		var found: f32 = -1.0;
+		var bestN: vec3f = vec3f(0.0, 0.0, 1.0);
+		let inv = vec3f(1.0 / statNz8(rdL.x), 1.0 / statNz8(rdL.y), 1.0 / statNz8(rdL.z));
+		var guard: u32 = 0u;
+
+		loop {
+			if (sp < 0 || guard > 1024u) { break; }
+			guard = guard + 1u;
+			let nref = stack[sp];
+			sp = sp - 1;
+			if (nref == 0u) { continue; }
+
+			if ((nref & 0x80000000u) != 0u) {
+				let triStart = nref & 0x00ffffffu;
+				let triCount = (nref >> 24u) & 0x7fu;
+				for (var j: u32 = 0u; j < triCount; j = j + 1u) {
+					let tw = triBase + (triStart + j) * 10u;
+					let slotId = bits[tw + 9u];
+					if ((bits[maskBase + (slotId >> 5u)] & (1u << (slotId & 31u))) != 0u) { continue; }
+					let a = vec3f(bitcast<f32>(bits[tw]), bitcast<f32>(bits[tw + 1u]), bitcast<f32>(bits[tw + 2u]));
+					let b = vec3f(bitcast<f32>(bits[tw + 3u]), bitcast<f32>(bits[tw + 4u]), bitcast<f32>(bits[tw + 5u]));
+					let c = vec3f(bitcast<f32>(bits[tw + 6u]), bitcast<f32>(bits[tw + 7u]), bitcast<f32>(bits[tw + 8u]));
+					let e1 = b - a;
+					let e2 = c - a;
+					let h = cross(rdL, e2);
+					let det = dot(e1, h);
+					if (abs(det) < 1e-10) { continue; }
+					let invDet = 1.0 / det;
+					let s = roL - a;
+					let u = dot(s, h) * invDet;
+					let q = cross(s, e1);
+					let v = dot(rdL, q) * invDet;
+					let t = dot(e2, q) * invDet;
+					if (u >= -1e-4 && v >= -1e-4 && (u + v) <= 1.0001 && t > tMin && t < bestT) {
+						bestT = t;
+						found = 1.0;
+						bestN = cross(e1, e2);
+					}
+				}
+				continue;
+			}
+
+			let nb = nodeBase + (nref - 1u) * 28u;
+			let org = vec3f(bitcast<f32>(bits[nb]), bitcast<f32>(bits[nb + 1u]), bitcast<f32>(bits[nb + 2u]));
+			let ep = bits[nb + 3u];
+			let step = vec3f(
+				exp2(f32(i32(ep & 0xffu) - 128)),
+				exp2(f32(i32((ep >> 8u) & 0xffu) - 128)),
+				exp2(f32(i32((ep >> 16u) & 0xffu) - 128))
+			);
+			var ct: array<f32, 8>;
+			var cr: array<u32, 8>;
+			var cn: i32 = 0;
+			for (var ci: u32 = 0u; ci < 8u; ci = ci + 1u) {
+				let cref = bits[nb + 4u + ci];
+				if (cref == 0u) { continue; }
+				let qa = bits[nb + 12u + ci * 2u];
+				let qb = bits[nb + 13u + ci * 2u];
+				let bmin = org + vec3f(f32(qa & 0xffu), f32((qa >> 8u) & 0xffu), f32((qa >> 16u) & 0xffu)) * step;
+				let bmax = org + vec3f(f32((qa >> 24u) & 0xffu), f32(qb & 0xffu), f32((qb >> 8u) & 0xffu)) * step;
+				let t0 = (bmin - roL) * inv;
+				let t1 = (bmax - roL) * inv;
+				let tn = min(t0, t1);
+				let tf = max(t0, t1);
+				let te = max(max(tn.x, tn.y), max(tn.z, tMin));
+				let tx = min(min(tf.x, tf.y), min(tf.z, bestT));
+				if (tx < te) { continue; }
+				ct[cn] = te;
+				cr[cn] = cref;
+				cn = cn + 1;
+			}
+			for (var ai: i32 = 1; ai < cn; ai = ai + 1) {
+				let kt = ct[ai];
+				let kr = cr[ai];
+				var bi: i32 = ai - 1;
+				loop {
+					if (bi < 0 || ct[bi] <= kt) { break; }
+					ct[bi + 1] = ct[bi];
+					cr[bi + 1] = cr[bi];
+					bi = bi - 1;
+				}
+				ct[bi + 1] = kt;
+				cr[bi + 1] = kr;
+			}
+			for (var pi: i32 = cn - 1; pi >= 0; pi = pi - 1) {
+				if (sp >= 43) { break; }
+				sp = sp + 1;
+				stack[sp] = cr[pi];
+			}
+		}
+
+		if (found < 0.0) { return vec4f(-1.0, 0.0, 0.0, 1.0); }
+		return vec4f(bestT, normalize(bestN));
+	}
+
+	fn statNz8(x: f32) -> f32 {
+		if (abs(x) < 1e-9) { return select(-1e-9, 1e-9, x >= 0.0); }
+		return x;
+	}
+
+`);
+
 // ═══════════════════════════ TSL: analytic default-primitive intersections
 /**
  * Sphere / capsule / conical-frustum ray intersection in OBJECT-LOCAL space
@@ -774,8 +964,14 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
   );
   let headerDirty = true;
 
+  // The static-BVH slot-disable mask travels as RAW u32 — it must not ride
+  // the float header path (arbitrary bit patterns include NaNs, which float
+  // plumbing may canonicalize into corrupted masks).
+  const staticMaskUniform = uniformArray(new Array(STATIC_MASK_WORDS).fill(0), "uint");
+
   // Persistent header-sync compute: uniform vec4s → bitcast f32 words in the
-  // bits region. Its own pipeline, 2 bindings — nowhere near any wall.
+  // bits region (mask words pass through raw). Its own pipeline, 3 bindings —
+  // nowhere near any wall.
   const headerCompute = enabled
     ? Fn(() => {
         const w = instanceIndex.toVar();
@@ -783,7 +979,14 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
         const c = w.mod(4);
         const f = select(c.equal(uint(0)), v.x,
           select(c.equal(uint(1)), v.y, select(c.equal(uint(2)), v.z, v.w))).toVar();
-        bits.element(uint(baseWord).add(w)).assign(floatBitsToUint(f));
+        const inMask = w.greaterThanEqual(uint(STATIC_MASK_WORD_BASE))
+          .and(w.lessThan(uint(STATIC_MASK_WORD_BASE + STATIC_MASK_WORDS)));
+        const word = select(
+          inMask,
+          staticMaskUniform.element(w.sub(uint(STATIC_MASK_WORD_BASE)).toInt()),
+          floatBitsToUint(f),
+        );
+        bits.element(uint(baseWord).add(w)).assign(word);
       })().compute(HEADER_WORDS)
     : null;
 
@@ -989,6 +1192,66 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
     /** Iterates live entries — the caller must not mutate during iteration
      *  except through release() on a COPIED key list. */
     forEachEntry(fn) { for (const entry of [...entries.values()]) fn(entry); },
+
+    // ═════════════════════════════════════════ static-scene shadow BVH
+    /** Info for the world-space static BVH riding this bits buffer. */
+    staticBvh: null,
+
+    /** Registers the static-scene BVH region (absolute word offsets). */
+    attachStaticBvh({ nodeBase, triBase }) {
+      set.staticBvh = { nodeBase, triBase };
+    },
+
+    /**
+     * One-shot upload of arbitrary words into the bits buffer (the static
+     * BVH's build/rebuild path — same staging pattern as geometry blocks).
+     */
+    queueRegionUpload(absWordStart, words) {
+      const staging = instancedArray(words, "uint");
+      const copy = Fn(() => {
+        bits.element(uint(absWordStart).add(instanceIndex)).assign(staging.element(instanceIndex));
+      })().compute(words.length);
+      const block = { uploaded: false };
+      pendingComputes.push({ compute: copy, block });
+      return block;
+    },
+
+    /** Masks a static slot's triangles out of the shadow BVH (adoption). */
+    setStaticMaskBit(slot, on) {
+      if (slot < 0 || slot >= STATIC_MASK_WORDS * 32) return;
+      const idx = slot >> 5;
+      const bit = (1 << (slot & 31)) >>> 0;
+      const prev = staticMaskUniform.array[idx] >>> 0;
+      const next = on ? (prev | bit) >>> 0 : (prev & ~bit) >>> 0;
+      if (next === prev) return;
+      staticMaskUniform.array[idx] = next;
+      headerDirty = true;
+    },
+
+    /** Rebuild support: mask = exactly the given adopted slots. */
+    resetStaticMask(slots) {
+      for (let i = 0; i < STATIC_MASK_WORDS; i++) staticMaskUniform.array[i] = 0;
+      for (const slot of slots ?? []) {
+        if (slot >= 0 && slot < STATIC_MASK_WORDS * 32) {
+          staticMaskUniform.array[slot >> 5] = (staticMaskUniform.array[slot >> 5] | (1 << (slot & 31))) >>> 0;
+        }
+      }
+      headerDirty = true;
+    },
+
+    /**
+     * Nearest static-scene hit (masked exact triangles, world space).
+     * Returns the packed vec4 node: x = t (< 0 miss), yzw = geometric normal.
+     */
+    traceStaticBvh(origin, dir, tMin, tMax) {
+      const info = set.staticBvh;
+      if (!info) return null;
+      return bvh8MaskedTraceWgsl(
+        vec3(origin), vec3(dir), float(tMin), float(tMax),
+        uint(info.nodeBase), uint(info.triBase),
+        uint(baseWord + STATIC_MASK_WORD_BASE), bits,
+      ).toVar();
+    },
 
     /**
      * Adopts a mesh placement. `shape` comes from classifyDynamicShape.

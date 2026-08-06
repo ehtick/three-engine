@@ -302,6 +302,18 @@ export async function resolveRendererLimits() {
     // (GISystem gates on the DEVICE limit before binding).
     const storageTex = adapter?.limits?.maxStorageTexturesPerShaderStage ?? 0;
     if (storageTex > 4) requiredLimits.maxStorageTexturesPerShaderStage = Math.min(8, storageTex);
+    // BINDING SIZE (not count — the count stays at the portable baseline):
+    // the GI occupancy bits buffer scales with SCENE VOLUME, and a large
+    // ultra scene sits near the 128MB default cliff — the static shadow BVH
+    // region pushed a real project's buffer to 144MB, at which point EVERY
+    // bind group using it failed and GI went dark (user-hit, 2026-08-06).
+    // Same adapter-clamped ask as above (most desktop adapters advertise
+    // ≥ 1GB); GISystem additionally shrinks its optional regions to fit the
+    // DEVICE limit, so a baseline-128MB device degrades instead of breaking.
+    const storageSize = adapter?.limits?.maxStorageBufferBindingSize ?? 0;
+    if (storageSize > 134217728) {
+      requiredLimits.maxStorageBufferBindingSize = Math.min(1073741824, storageSize);
+    }
     // One line, always: when GI later refuses the occupancy backend ("device
     // gate"), THIS is the first thing to check. Storage buffers intentionally
     // remain at the portable baseline; only unrelated limits are raised.

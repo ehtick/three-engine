@@ -71,6 +71,13 @@
         // hatch) — that arm gates the voxel record-refit tail, which adoption
         // would legitimately bypass. `?dynobj=1` is the adoption arm.
         if (new URLSearchParams(location.search).get("dynamic") === "1") globalThis.__giDynamicObjects = false;
+        // `?staticbvh=1` — the static-scene BVH shadow arm. Without it the
+        // lightshadow arm pins the RECORD marcher (its pen-variant compile
+        // gate is meaningless under the BVH arm, which replaces that WGSL).
+        const staticBvhArm = new URLSearchParams(location.search).get("staticbvh") === "1";
+        if (new URLSearchParams(location.search).get("lightshadow") === "1" && !staticBvhArm) {
+          globalThis.__giShadowStaticBvh = false;
+        }
         // dynobj=1 → box mover (analytic OBB path); dynobj=2 → torus mover
         // (object-local BVH4 exact-triangle path).
         const dynObjArm = Number(new URLSearchParams(location.search).get("dynobj") ?? 0);
@@ -434,8 +441,14 @@
               break;
             }
           }
-          if (planeMode && !penVariantSeen) {
+          if (planeMode && !penVariantSeen && !staticBvhArm) {
             throw new Error("lightshadow arm: the pen plane-trace variant never compiled into the resolve");
+          }
+          if (staticBvhArm) {
+            const m = engine.modules.get("gi").system.state.screen?.lightShadow?.marcher ?? "";
+            if (!/static-bvh8/.test(m)) {
+              throw new Error(`staticbvh arm: unexpected marcher "${m}" — the static-BVH arm never engaged`);
+            }
           }
           // SOFT ARM: the default is the stochastic sun-disc sample (exact
           // march along a jittered direction — no extra WGSL function), with

@@ -341,8 +341,14 @@ export function createOccupancyField(bounds, res0, options = {}) {
   // feature is on; all existing offsets stay byte-identical.
   const dynamicObjectWords = Math.max(0, options.dynamicObjectWords | 0);
   const dynamicObjectWordOffset = densityWordOffset + densityPlan.totalWords;
+  // STATIC-SCENE SHADOW BVH region ("light by voxels, shadows by BVH"):
+  // world-space BVH8 + slot-tagged exact triangles for the screen shadow
+  // channels, appended after the dynamic-object region for the same
+  // zero-new-bindings reason.
+  const staticBvhWords = Math.max(0, options.staticBvhWords | 0);
+  const staticBvhWordOffset = dynamicObjectWordOffset + dynamicObjectWords;
   const bits = instancedArray(new Uint32Array(
-    dynamicObjectWordOffset + dynamicObjectWords,
+    staticBvhWordOffset + staticBvhWords,
   ), "uint");
   const atomicBits = instancedArray(new Uint32Array(level0.words), "uint").toAtomic();
   // Phase-1 macrocell/brick records, the Phase-2 surface-record pool and the
@@ -4510,6 +4516,8 @@ export function createOccupancyField(bounds, res0, options = {}) {
     bitsBuffer: bits,
     dynamicObjectWordOffset,
     dynamicObjectWords,
+    staticBvhWordOffset,
+    staticBvhWords,
     /** Density-region layout, for tests/diagnostics (offsets inside `bits`). */
     densityLayout: { wordOffset: densityWordOffset, levels: densityPlan.densityLevels },
     hybridLayout: hybridEnabled ? hybridLayout : null,
