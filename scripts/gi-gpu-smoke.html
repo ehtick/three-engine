@@ -211,10 +211,16 @@
           const occField = system.state.volume.occupancyField;
           const settle = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
           let mover = wall;
-          if (dynObjArm === 2) {
-            // Non-default mesh → the BVH4 exact-triangle path. Added AFTER
-            // boot so the content refresh ships it like a late-loading GLB.
-            mover = new THREE.Mesh(new THREE.TorusKnotGeometry(0.8, 0.25, 48, 12), material);
+          if (dynObjArm >= 2) {
+            // dynobj=2 torus-knot → BVH exact triangles; 3 sphere, 4 capsule,
+            // 5 cylinder-frustum → the analytic default-primitive paths.
+            // Added AFTER boot so the content refresh ships it like a
+            // late-loading GLB.
+            const geo = dynObjArm === 3 ? new THREE.SphereGeometry(0.8, 24, 16)
+              : dynObjArm === 4 ? new THREE.CapsuleGeometry(0.5, 1.2, 8, 16)
+              : dynObjArm === 5 ? new THREE.CylinderGeometry(0.6, 0.3, 1.6, 24)
+              : new THREE.TorusKnotGeometry(0.8, 0.25, 48, 12);
+            mover = new THREE.Mesh(geo, material);
             mover.position.set(1.5, 0.5, 0);
             mover.updateMatrixWorld(true);
             engine.scene.add(mover);
@@ -235,7 +241,10 @@
           }
           if (!adopted) throw new Error("dynobj arm: the rotating mover never adopted (or the GPU side never went live)");
           if (dynObjArm === 2 && !(system._dynSet.stats.meshUploadsQueued > 0)) {
-            throw new Error("dynobj=2 arm: the torus adopted without a BVH4 upload — it took the OBB path");
+            throw new Error("dynobj=2 arm: the torus adopted without a BVH upload — it took an analytic path");
+          }
+          if (dynObjArm >= 3 && system._dynSet.stats.meshUploadsQueued > 0) {
+            throw new Error(`dynobj=${dynObjArm} arm: an analytic default primitive queued a BVH upload — classification regressed`);
           }
           // Let the parked slot's purge re-voxelize land, then measure.
           for (let i = 0; i < 20; i++) { mover.rotation.y += 0.05; mover.updateMatrixWorld(true); await settle(50); }

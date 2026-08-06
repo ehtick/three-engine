@@ -17,11 +17,16 @@
 //
 // ══ REPRESENTATION ══════════════════════════════════════════════════════════
 //
-//   default box meshes    → analytic OBB (slab test in object-local space)
-//   other rigid meshes    → object-local BVH4, exact triangle leaves
-//                           (collapsed from three-mesh-bvh's binary tree,
-//                           traversed in raw WGSL with a small local stack)
-//   skinned / morphing    → not adopted (stay on the voxel path)
+//   Box / Plane geometry          → analytic OBB (slab test, local space)
+//   Sphere geometry               → analytic sphere (ellipsoid under scale)
+//   Capsule geometry              → analytic capsule
+//   Cylinder / Cone geometry      → analytic conical frustum + caps
+//   (partial sweeps / open-ended  → BVH — they are not the analytic solid)
+//   every OTHER rigid geometry    → object-local wide BVH, exact triangle
+//     (custom + torus/knot/…)       leaves (three-mesh-bvh collapsed,
+//                                   traversed in raw WGSL, compressed 8-wide)
+//   skinned / morphing            → not adopted (stay on the voxel path)
+//   mesh.userData.giDynamic       → override: "voxel" | "bvh" | "obb"
 //
 // Rays transform into object space with the UN-normalized inverse-transformed
 // direction, so the ray parameter t is preserved 1:1 with world t (the doc's
@@ -49,7 +54,8 @@
 //     +0..15     inverse OBB world matrix, column-major (obbWorld⁻¹ where
 //                obbWorld = mesh.matrixWorld × translate(localBoxCenter))
 //     +16..18    local half extents
-//     +19        type: 0 inactive · 1 OBB · 2 BVH4 mesh · 3 reserved (BVH8)
+//     +19        type: 0 inactive · 1 OBB · 2 BVH mesh · 3 sphere ·
+//                4 capsule · 5 conical frustum (DYN_TYPE)
 //     +20        BVH node base (word offset relative to baseWord)
 //     +21        BVH triangle base (relative)
 //     +22        max world scale factor (local→world distance approximation)
@@ -57,7 +63,9 @@
 //     +24..26    swept-bounds world min (prev ∪ curr, pre-expanded)
 //     +27        swept active flag (1 while the object moved recently)
 //     +28..30    swept-bounds world max
-//     +31..39    reserved (albedo/emissive — phase 2 material evaluation)
+//     +31..33    shape params: sphere [r,-,-] · capsule [r, halfSeg,-] ·
+//                frustum [rBottom, rTop, halfHeight]
+//     +34..39    reserved (albedo/emissive — phase 2 material evaluation)
 //   HEADER_WORDS = 16 + maxObjects*40, then the BVH pool.
 //
 // BVH4 node = 28 words: [ref0..ref3, then 4× (min.xyz,max.xyz) f32].
@@ -94,14 +102,35 @@ export function dynHeaderWords(maxObjects = DEFAULT_MAX_OBJECTS) {
 }
 
 // ═══════════════════════════════════════════════════════ CPU: classification
+/** Shape type codes as stored in the header's type word. */
+export const DYN_TYPE = { obb: 1, mesh: 2, sphere: 3, capsule: 4, frustum: 5 };
+
+const TWO_PI = Math.PI * 2;
+const fullSweep = (v, target) => Math.abs((v ?? target) - target) < 1e-3;
+
 /**
  * Decides how a mesh would be represented if adopted as a dynamic object.
- * Returns { type: "obb" | "mesh", center, halfExtents } or null (not
- * adoptable — deforming meshes and over-budget triangle counts stay on the
- * voxel path, which remains correct for them, just softer).
+ * Returns { type, center, halfExtents, params } or null (not adoptable —
+ * deforming meshes stay on the voxel path, which remains correct for them,
+ * just softer).
+ *
+ * THE RULES (user directive, 2026-08-06):
+ *   · every three.js DEFAULT geometry with a closed-form intersection gets
+ *     the exact ANALYTIC shape: Box/Plane → OBB, Sphere → sphere (ellipsoid
+ *     under non-uniform scale — the inverse matrix carries it), Capsule →
+ *     capsule, Cylinder/Cone → conical frustum with caps. Partial sweeps and
+ *     open-ended primitives are NOT the analytic solid and take the BVH.
+ *   · every OTHER geometry — custom, and defaults with no closed form
+ *     (torus, torus-knot, polyhedra, lathe, extrude…) — gets the exact
+ *     triangle BVH. Their triangles ARE the rendered border.
+ *   · `mesh.userData.giDynamic` overrides: "voxel" (never adopt — keep the
+ *     voxel path), "bvh" (force triangles), "obb" (force the bounding box).
  */
 export function classifyDynamicShape(mesh) {
-  if (!mesh?.geometry || mesh.isSkinnedMesh) return null;
+  if (!mesh?.geometry) return null;
+  const tag = mesh.userData?.giDynamic;
+  if (tag === "voxel" || tag === "none" || tag === false) return null;
+  if (mesh.isSkinnedMesh) return null;
   const geometry = mesh.geometry;
   if (geometry.morphAttributes?.position?.length) return null;
   const pos = geometry.attributes?.position;
@@ -110,14 +139,50 @@ export function classifyDynamicShape(mesh) {
   const bb = geometry.boundingBox;
   const halfExtents = new THREE.Vector3().subVectors(bb.max, bb.min).multiplyScalar(0.5);
   const center = new THREE.Vector3().addVectors(bb.max, bb.min).multiplyScalar(0.5);
-  // Degenerate (flat) boxes make the slab test ill-conditioned; a flat mover
-  // is also below the medium's resolving interest. Leave them voxelized.
-  const minExtent = Math.min(halfExtents.x, halfExtents.y, halfExtents.z);
+  const asMesh = () => {
+    const triCount = geometry.index ? geometry.index.count / 3 : pos.count / 3;
+    const maxTris = Number(globalThis.__giDynMeshMaxTris) || 120000;
+    if (triCount < 1 || triCount > maxTris) return null;
+    return { type: "mesh", center, halfExtents };
+  };
+  if (tag === "bvh") return asMesh();
+  if (tag === "obb") return { type: "obb", center, halfExtents };
 
-  // A BOX is a geometry whose every vertex sits on a CORNER of its local
-  // bounding box (BoxGeometry: 24 verts, 8 distinct corners). That is exact —
-  // any such triangle set is surface-contained in the box, so the analytic OBB
-  // IS its silhouette.
+  const p = geometry.parameters;
+  switch (geometry.type) {
+    case "BoxGeometry":
+    case "PlaneGeometry": // a zero-thickness OBB IS the exact rectangle
+      return { type: "obb", center, halfExtents };
+    case "SphereGeometry":
+      if (p && fullSweep(p.phiLength, TWO_PI) && fullSweep(p.thetaLength, Math.PI)) {
+        return { type: "sphere", center, halfExtents, params: [p.radius ?? 1, 0, 0] };
+      }
+      break;
+    case "CapsuleGeometry":
+      if (p) {
+        // r185 names the mid-section length `height` (older three: `length`).
+        return { type: "capsule", center, halfExtents, params: [p.radius ?? 1, (p.height ?? p.length ?? 1) / 2, 0] };
+      }
+      break;
+    case "CylinderGeometry":
+      if (p && fullSweep(p.thetaLength, TWO_PI) && !p.openEnded) {
+        return { type: "frustum", center, halfExtents, params: [p.radiusBottom ?? 1, p.radiusTop ?? 1, (p.height ?? 1) / 2] };
+      }
+      break;
+    case "ConeGeometry":
+      if (p && fullSweep(p.thetaLength, TWO_PI) && !p.openEnded) {
+        return { type: "frustum", center, halfExtents, params: [p.radius ?? 1, 0, (p.height ?? 1) / 2] };
+      }
+      break;
+    default:
+      break;
+  }
+
+  // Anonymized-box fallback (imported/parameter-stripped boxes): a geometry
+  // whose every vertex sits on a CORNER of its local bounding box is exactly
+  // its OBB. Degenerate-flat only via the typed Plane path above — an unknown
+  // flat mesh takes the BVH (its triangles are still exact).
+  const minExtent = Math.min(halfExtents.x, halfExtents.y, halfExtents.z);
   if (pos.count <= 40 && minExtent > 1e-4) {
     let corners = true;
     for (let i = 0; i < pos.count && corners; i++) {
@@ -132,11 +197,7 @@ export function classifyDynamicShape(mesh) {
     if (corners) return { type: "obb", center, halfExtents };
   }
 
-  const triCount = geometry.index ? geometry.index.count / 3 : pos.count / 3;
-  const maxTris = Number(globalThis.__giDynMeshMaxTris) || 30000;
-  if (triCount < 1 || triCount > maxTris) return null;
-  if (minExtent <= 1e-5) return null;
-  return { type: "mesh", center, halfExtents };
+  return asMesh();
 }
 
 // ═══════════════════════════════════════════════════════ CPU: BVH4 packing
@@ -543,6 +604,143 @@ export function dynBvhArity() {
   return Number(globalThis.__giDynBvhArity) === 4 ? 4 : 8;
 }
 
+// ═══════════════════════════ TSL: analytic default-primitive intersections
+/**
+ * Sphere / capsule / conical-frustum ray intersection in OBJECT-LOCAL space
+ * (the caller already transformed the ray; t is world-exact because the local
+ * direction is un-normalized). ONE WGSL function per shader, shared by every
+ * trace variant — pure ALU, no buffers, so the per-builder sharedFn cache
+ * keeps the kernel-size cost to a single emission.
+ *
+ * Returns vec4(t, localNormal) with t < 0 = miss; the normal is UN-normalized
+ * (the caller applies the covariant world transform and normalizes once).
+ * prm: sphere [r,-,-] · capsule [r, halfSegment,-] · frustum [rBottom, rTop, halfHeight].
+ */
+const dynShapeHitFn = sharedFn({
+  name: "giDynShapeHit",
+  type: "vec4",
+  inputs: [
+    { name: "roL", type: "vec3" },
+    { name: "rdL", type: "vec3" },
+    { name: "tMin", type: "float" },
+    { name: "tMax", type: "float" },
+    { name: "shapeType", type: "float" },
+    { name: "prm", type: "vec3" },
+  ],
+  body: (roL, rdL, tMin, tMax, shapeType, prm) => {
+    const bestT = float(-1).toVar();
+    const bestN = vec3(0, 1, 0).toVar();
+    const accept = (t, n) => {
+      If(
+        t.greaterThanEqual(tMin).and(t.lessThan(tMax))
+          .and(bestT.lessThan(0).or(t.lessThan(bestT))),
+        () => {
+          bestT.assign(t);
+          bestN.assign(n);
+        },
+      );
+    };
+    If(shapeType.lessThan(3.5), () => {
+      // SPHERE (ellipsoid under non-uniform scale — the matrix carries it).
+      const r = prm.x.max(1e-6).toVar();
+      const a = rdL.dot(rdL).max(1e-12).toVar();
+      const b = roL.dot(rdL).toVar(); // half-b
+      const cq = roL.dot(roL).sub(r.mul(r)).toVar();
+      const disc = b.mul(b).sub(a.mul(cq)).toVar();
+      If(disc.greaterThanEqual(0), () => {
+        const sq = disc.sqrt().toVar();
+        const tN = b.negate().sub(sq).div(a).toVar();
+        const tF = b.negate().add(sq).div(a).toVar();
+        // Inside the sphere: surface is behind → occlude from tMin, matching
+        // the OBB's enter = max(tEnter, t0) semantics.
+        If(tN.greaterThanEqual(tMin), () => {
+          accept(tN, roL.add(rdL.mul(tN)).div(r));
+        }).ElseIf(tF.greaterThanEqual(tMin), () => {
+          accept(tMin, rdL.negate());
+        });
+      });
+    }).ElseIf(shapeType.lessThan(4.5), () => {
+      // CAPSULE: Y segment ±halfSegment, radius r.
+      const r = prm.x.max(1e-6).toVar();
+      const hs = prm.y.max(0).toVar();
+      const a = rdL.x.mul(rdL.x).add(rdL.z.mul(rdL.z)).toVar();
+      const b = roL.x.mul(rdL.x).add(roL.z.mul(rdL.z)).toVar();
+      const cq = roL.x.mul(roL.x).add(roL.z.mul(roL.z)).sub(r.mul(r)).toVar();
+      If(a.greaterThan(1e-12), () => {
+        const disc = b.mul(b).sub(a.mul(cq)).toVar();
+        If(disc.greaterThanEqual(0), () => {
+          const tS = b.negate().sub(disc.sqrt()).div(a).toVar();
+          const y = roL.y.add(rdL.y.mul(tS)).toVar();
+          If(y.abs().lessThanEqual(hs), () => {
+            const pH = roL.add(rdL.mul(tS));
+            accept(tS, vec3(pH.x, 0, pH.z).div(r));
+          });
+        });
+      });
+      // End caps: hemispheres at (0, ±hs, 0) — gated to the half beyond the
+      // segment so interior-side sphere hits don't pre-empt the true surface.
+      for (const sgn of [1, -1]) {
+        const ro2 = roL.sub(vec3(0, hs.mul(sgn), 0)).toVar();
+        const a2 = rdL.dot(rdL).max(1e-12).toVar();
+        const b2 = ro2.dot(rdL).toVar();
+        const c2 = ro2.dot(ro2).sub(r.mul(r)).toVar();
+        const d2 = b2.mul(b2).sub(a2.mul(c2)).toVar();
+        If(d2.greaterThanEqual(0), () => {
+          const tC = b2.negate().sub(d2.sqrt()).div(a2).toVar();
+          const pH = ro2.add(rdL.mul(tC)).toVar();
+          If(pH.y.mul(sgn).greaterThanEqual(0), () => {
+            accept(tC, pH.div(r));
+          });
+        });
+      }
+    }).Else(() => {
+      // CONICAL FRUSTUM (cylinder rT==rB, cone rT==0): radius grows linearly
+      // rB→rT from y=-hh to +hh; the side is a quadratic in t, the caps are
+      // radius-bounded plane hits. kAt >= 0 rejects the mirror cone.
+      const rB = prm.x.max(0).toVar();
+      const rT = prm.y.max(0).toVar();
+      const hh = prm.z.max(1e-6).toVar();
+      const s = rT.sub(rB).div(hh.mul(2)).toVar();
+      const k0 = rB.add(s.mul(roL.y.add(hh))).toVar();
+      const trySide = (t) => {
+        const y = roL.y.add(rdL.y.mul(t)).toVar();
+        const kAt = rB.add(s.mul(y.add(hh))).toVar();
+        If(y.abs().lessThanEqual(hh).and(kAt.greaterThanEqual(0)), () => {
+          const pH = roL.add(rdL.mul(t));
+          accept(t, vec3(pH.x, kAt.mul(s).negate(), pH.z));
+        });
+      };
+      const a = rdL.x.mul(rdL.x).add(rdL.z.mul(rdL.z)).sub(s.mul(s).mul(rdL.y).mul(rdL.y)).toVar();
+      const b = roL.x.mul(rdL.x).add(roL.z.mul(rdL.z)).sub(k0.mul(s).mul(rdL.y)).toVar(); // half-b
+      const cq = roL.x.mul(roL.x).add(roL.z.mul(roL.z)).sub(k0.mul(k0)).toVar();
+      If(a.abs().greaterThan(1e-10), () => {
+        const disc = b.mul(b).sub(a.mul(cq)).toVar();
+        If(disc.greaterThanEqual(0), () => {
+          const sq = disc.sqrt().toVar();
+          trySide(b.negate().sub(sq).div(a).toVar());
+          trySide(b.negate().add(sq).div(a).toVar());
+        });
+      }).Else(() => {
+        // Ray parallel to the cone slope: the quadratic degenerates linear.
+        If(b.abs().greaterThan(1e-12), () => {
+          trySide(cq.negate().div(b.mul(2)).toVar());
+        });
+      });
+      If(rdL.y.abs().greaterThan(1e-12), () => {
+        for (const [sgn, rc] of [[1, rT], [-1, rB]]) {
+          const t = hh.mul(sgn).sub(roL.y).div(rdL.y).toVar();
+          const px = roL.x.add(rdL.x.mul(t)).toVar();
+          const pz = roL.z.add(rdL.z.mul(t)).toVar();
+          If(px.mul(px).add(pz.mul(pz)).lessThanEqual(rc.mul(rc)), () => {
+            accept(t, vec3(0, sgn, 0));
+          });
+        }
+      });
+    });
+    return vec4(bestT, bestN);
+  },
+});
+
 // ══════════════════════════════════════════════════════════ the object set
 /**
  * Creates the dynamic-object set bound to one occupancy field build.
@@ -649,6 +847,9 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
         const c2 = vec3(rf(ob.add(uint(8))), rf(ob.add(uint(9))), rf(ob.add(uint(10)))).toVar();
         const c3 = vec3(rf(ob.add(uint(12))), rf(ob.add(uint(13))), rf(ob.add(uint(14)))).toVar();
         const he = vec3(rf(ob.add(uint(16))), rf(ob.add(uint(17))), rf(ob.add(uint(18)))).toVar();
+        // Shape parameters (sphere r / capsule r+halfSeg / frustum radii+hh) —
+        // read once, used by both the pen clearance and the analytic branch.
+        const prm = vec3(rf(ob.add(uint(31))), rf(ob.add(uint(32))), rf(ob.add(uint(33)))).toVar();
         const roL = c0.mul(o.x).add(c1.mul(o.y)).add(c2.mul(o.z)).add(c3).toVar();
         // NOT normalized — preserves the world ray parameter exactly.
         const rdL = c0.mul(d.x).add(c1.mul(d.y)).add(c2.mul(d.z)).toVar();
@@ -675,13 +876,20 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
           : null;
 
         if (penK != null) {
-          // Closest-approach clearance to the bounding box, through the same
-          // r(t) band the marchers use.
+          // Closest-approach clearance through the same r(t) band the
+          // marchers use — exact signed distance for spheres/capsules, the
+          // bounding box (a conservative superset) for everything else.
           const rdLen2 = rdL.dot(rdL).max(1e-12);
           const tc = roL.negate().dot(rdL).div(rdLen2).clamp(t0, t1).toVar();
           const pL = roL.add(rdL.mul(tc)).toVar();
           const q = pL.abs().sub(he).toVar();
-          const dLocal = q.max(vec3(0)).length().add(q.x.max(q.y.max(q.z)).min(0)).toVar();
+          const dBox = q.max(vec3(0)).length().add(q.x.max(q.y.max(q.z)).min(0));
+          const dSphere = pL.length().sub(prm.x);
+          const dCapsule = vec3(pL.x, pL.y.sub(pL.y.clamp(prm.y.negate(), prm.y)), pL.z).length().sub(prm.x);
+          const dLocal = select(
+            type.greaterThan(2.5).and(type.lessThan(3.5)), dSphere,
+            select(type.greaterThan(3.5).and(type.lessThan(4.5)), dCapsule, dBox),
+          ).toVar();
           const dWorld = dLocal.mul(scale).max(0).toVar();
           const rBand = penW != null
             ? tc.div(penK).max(penW).max(1e-5)
@@ -713,7 +921,7 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
             bestT.assign(enter);
             bestHit.assign(1);
             bestCode.assign(oct.x.mul(4095).floor().mul(4096).add(oct.y.mul(4095).floor()));
-          }).Else(() => {
+          }).ElseIf(type.lessThan(2.5), () => {
             if (meshes) {
               // Wide-BVH exact-triangle refinement in object-local space
               // (compressed 8-wide by default; `__giDynBvhArity=4` = the
@@ -734,6 +942,20 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
                 bestCode.assign(oct.x.mul(4095).floor().mul(4096).add(oct.y.mul(4095).floor()));
               });
             }
+          }).Else(() => {
+            // ANALYTIC DEFAULT PRIMITIVES (sphere / capsule / frustum) — one
+            // shared intersector per shader, exact under any rigid transform
+            // + scale (the local-space ray carries it).
+            const rs = dynShapeHitFn(roL, rdL, t0, t1.min(bestT), type, prm).toVar();
+            If(rs.x.greaterThanEqual(0).and(rs.x.lessThan(bestT)), () => {
+              const nL = rs.yzw.toVar();
+              const nRaw = vec3(c0.dot(nL), c1.dot(nL), c2.dot(nL)).normalize().toVar();
+              const nW = select(nRaw.dot(d).greaterThan(0), nRaw.negate(), nRaw).toVar();
+              const oct = octEncodeTSL(nW).mul(0.5).add(0.5).toVar();
+              bestT.assign(rs.x);
+              bestHit.assign(1);
+              bestCode.assign(oct.x.mul(4095).floor().mul(4096).add(oct.y.mul(4095).floor()));
+            });
           });
         });
       });
@@ -828,15 +1050,20 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
       entries.set(key, entry);
       set.stats.adopted++;
 
-      // Static header fields. Type publishes 0 until the geometry block has
-      // actually landed on the GPU — until then the object simply does not
-      // exist for rays, which is the safe direction.
+      // Static header fields. A mesh type publishes 0 until its geometry
+      // block has actually landed on the GPU — until then the object simply
+      // does not exist for rays, which is the safe direction. Analytic types
+      // need no upload and publish on the first sync.
       wm(index, 16, entry.halfExtents.x);
       wm(index, 17, entry.halfExtents.y);
       wm(index, 18, entry.halfExtents.z);
       wm(index, 19, 0);
       wm(index, 20, geoBlock ? geoBlock.rel : 0);
       wm(index, 21, geoBlock ? geoBlock.rel + geoBlock.nodeWords : 0);
+      const prm = shape.params ?? [0, 0, 0];
+      wm(index, 31, prm[0] ?? 0);
+      wm(index, 32, prm[1] ?? 0);
+      wm(index, 33, prm[2] ?? 0);
       publishCount();
       if (globalThis.__giDynObjectsDebug) {
         console.log(`[gi] dynamic-objects: adopted "${mesh.name}" as ${shape.type} (slot ${index})`);
@@ -923,8 +1150,8 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
           if (entry.movedFrames === 0) { wm(i, 27, 0); changed = true; }
         }
         // Type publishes once the geometry (if any) is on the GPU.
-        const ready = entry.type === "obb" || entry.geoBlock?.uploaded === true;
-        const typeVal = ready ? (entry.type === "obb" ? 1 : 2) : 0;
+        const ready = entry.type !== "mesh" || entry.geoBlock?.uploaded === true;
+        const typeVal = ready ? (DYN_TYPE[entry.type] ?? 0) : 0;
         if (!entry.published && ready) { entry.published = true; }
         wm(i, 19, typeVal);
       }

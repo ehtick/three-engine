@@ -9,12 +9,16 @@ What shipped vs this doc:
 
 - **Adoption on first motion, sticky**: a mover that classifies leaves the
   voxel path permanently — no placement, no slot, no bits, no per-frame
-  re-voxelize. Boxes (every vertex on a bbox corner) → analytic OBB; other
-  rigid meshes → **object-local wide BVH with exact triangle leaves**
-  (per user directive this replaced §"sparse 8x8x8 bricks"): compressed
+  re-voxelize. Representation (user directives): **every three.js default
+  geometry with a closed form is analytic** — Box/Plane → OBB, Sphere →
+  sphere (ellipsoid under scale), Capsule → capsule, Cylinder/Cone → conical
+  frustum with caps (partial sweeps / open-ended → BVH); **every other rigid
+  geometry** (custom, torus/knot/polyhedra/…) → **object-local wide BVH with
+  exact triangle leaves** (this replaced §"sparse 8x8x8 bricks"): compressed
   8-wide nodes by default (origin + power-of-two steps + u8-quantized child
   bounds, conservative both ways), `__giDynBvhArity=4` = uncompressed A/B.
-  Skinned/morphing/over-budget (`__giDynMeshMaxTris`, default 30k) stay voxel.
+  `mesh.userData.giDynamic` overrides: `"voxel" | "bvh" | "obb"`.
+  Skinned/morphing/over-budget (`__giDynMeshMaxTris`, default 120k) stay voxel.
 - **Unified ray query**: composed as a wrapper over the occupancy field's
   `traceOccupancy`/`traceHybridPlane`/`traceHybridBrick` — every consumer
   (cascade transport, field feedback sun shadows, screen direct shadows,

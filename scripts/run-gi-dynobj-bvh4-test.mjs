@@ -232,6 +232,134 @@ for (const [caseIndex, { name: baseName, geometry, arity }] of arms.entries()) {
   if (!ok) failures++;
 }
 
+// ── analytic default primitives: formula ground truth vs THREE.Raycaster ────
+// CPU mirrors of dynShapeHitFn's sphere/capsule/frustum math (same branches,
+// same epsilons) against HI-tessellation meshes of the same primitives.
+// Facet error at 128+ segments is ~3e-4·r, so the 8e-3 tolerance separates
+// formula bugs (gross, sign-level) from silhouette-grazing facet noise.
+function shapeHit(type, prm, ro, rd, tMin, tMax) {
+  const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+  let bestT = -1;
+  const accept = (t) => { if (t >= tMin && t < tMax && (bestT < 0 || t < bestT)) bestT = t; };
+  if (type === "sphere") {
+    const r = prm[0];
+    const a = Math.max(dot(rd, rd), 1e-12);
+    const b = dot(ro, rd);
+    const c = dot(ro, ro) - r * r;
+    const disc = b * b - a * c;
+    if (disc >= 0) {
+      const sq = Math.sqrt(disc);
+      const tN = (-b - sq) / a;
+      const tF = (-b + sq) / a;
+      if (tN >= tMin) accept(tN);
+      else if (tF >= tMin) accept(tMin);
+    }
+  } else if (type === "capsule") {
+    const r = prm[0], hs = prm[1];
+    const a = rd[0] * rd[0] + rd[2] * rd[2];
+    const b = ro[0] * rd[0] + ro[2] * rd[2];
+    const c = ro[0] * ro[0] + ro[2] * ro[2] - r * r;
+    if (a > 1e-12) {
+      const disc = b * b - a * c;
+      if (disc >= 0) {
+        const tS = (-b - Math.sqrt(disc)) / a;
+        const y = ro[1] + rd[1] * tS;
+        if (Math.abs(y) <= hs) accept(tS);
+      }
+    }
+    for (const sgn of [1, -1]) {
+      const ro2 = [ro[0], ro[1] - sgn * hs, ro[2]];
+      const a2 = Math.max(dot(rd, rd), 1e-12);
+      const b2 = dot(ro2, rd);
+      const c2 = dot(ro2, ro2) - r * r;
+      const d2 = b2 * b2 - a2 * c2;
+      if (d2 >= 0) {
+        const tC = (-b2 - Math.sqrt(d2)) / a2;
+        if ((ro2[1] + rd[1] * tC) * sgn >= 0) accept(tC);
+      }
+    }
+  } else if (type === "frustum") {
+    const rB = prm[0], rT = prm[1], hh = prm[2];
+    const s = (rT - rB) / (2 * hh);
+    const k0 = rB + s * (ro[1] + hh);
+    const trySide = (t) => {
+      const y = ro[1] + rd[1] * t;
+      const kAt = rB + s * (y + hh);
+      if (Math.abs(y) <= hh && kAt >= 0) accept(t);
+    };
+    const a = rd[0] * rd[0] + rd[2] * rd[2] - s * s * rd[1] * rd[1];
+    const b = ro[0] * rd[0] + ro[2] * rd[2] - k0 * s * rd[1];
+    const c = ro[0] * ro[0] + ro[2] * ro[2] - k0 * k0;
+    if (Math.abs(a) > 1e-10) {
+      const disc = b * b - a * c;
+      if (disc >= 0) {
+        const sq = Math.sqrt(disc);
+        trySide((-b - sq) / a);
+        trySide((-b + sq) / a);
+      }
+    } else if (Math.abs(b) > 1e-12) {
+      trySide(-c / (2 * b));
+    }
+    if (Math.abs(rd[1]) > 1e-12) {
+      for (const [sgn, rc] of [[1, rT], [-1, rB]]) {
+        const t = (sgn * hh - ro[1]) / rd[1];
+        const px = ro[0] + rd[0] * t;
+        const pz = ro[2] + rd[2] * t;
+        if (px * px + pz * pz <= rc * rc) accept(t);
+      }
+    }
+  }
+  return bestT;
+}
+
+const { classifyDynamicShape } = await import("../src/modules/gi/dynamicObjects.js");
+const analyticCases = [
+  { name: "sphere", geometry: new THREE.SphereGeometry(0.8, 128, 96) },
+  { name: "capsule", geometry: new THREE.CapsuleGeometry(0.5, 1.2, 64, 128) },
+  { name: "cylinder-frustum", geometry: new THREE.CylinderGeometry(0.6, 0.3, 1.6, 256) },
+  { name: "cone", geometry: new THREE.ConeGeometry(0.7, 1.5, 256) },
+];
+for (const [ai, { name, geometry }] of analyticCases.entries()) {
+  const mesh = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({ side: THREE.DoubleSide }));
+  mesh.updateMatrixWorld(true);
+  const shape = classifyDynamicShape(mesh);
+  if (!shape || shape.type === "mesh" || shape.type === "obb") {
+    console.error(`FAIL analytic:${name}: classified as ${shape?.type ?? "null"} — expected an analytic primitive`);
+    failures++;
+    continue;
+  }
+  const raycaster = new THREE.Raycaster();
+  raycaster.far = 100;
+  seed = 0x7f4a11 + ai * 104729;
+  const RAYS = 3000;
+  let agree = 0;
+  let disagreements = 0;
+  let maxDt = 0;
+  for (let i = 0; i < RAYS; i++) {
+    const o = new THREE.Vector3(rand() * 2 - 1, rand() * 2 - 1, rand() * 2 - 1).normalize().multiplyScalar(3);
+    const target = new THREE.Vector3(rand() * 2 - 1, rand() * 2 - 1, rand() * 2 - 1).multiplyScalar(i % 4 === 3 ? 4 : 0.8);
+    const d = target.sub(o).normalize();
+    raycaster.set(o, d);
+    const hits = raycaster.intersectObject(mesh, false);
+    const refT = hits.length ? hits[0].distance : -1;
+    const t = shapeHit(shape.type, shape.params, [o.x, o.y, o.z], [d.x, d.y, d.z], 1e-5, 100);
+    if (refT < 0 && t < 0) { agree++; continue; }
+    if (refT >= 0 && t >= 0 && Math.abs(refT - t) < 8e-3) {
+      maxDt = Math.max(maxDt, Math.abs(refT - t));
+      agree++;
+      continue;
+    }
+    disagreements++;
+  }
+  const rate = disagreements / RAYS;
+  const ok = rate <= 0.02 && agree > 0;
+  console.log(
+    `${ok ? "PASS" : "FAIL"} analytic:${name} (${shape.type}): agree=${agree} ` +
+      `disagree=${disagreements}/${RAYS} (${(rate * 100).toFixed(2)}%) maxΔt=${maxDt.toExponential(2)}`,
+  );
+  if (!ok) failures++;
+}
+
 if (failures) {
   console.error(`gi-dynobj-bvh4: ${failures} case(s) FAILED`);
   process.exit(1);
