@@ -146,6 +146,166 @@ writeFileSync(`scripts/gi-diag-chain-raw-${ARM}.png`, Buffer.from(result.rawPng.
 writeFileSync(`scripts/gi-diag-chain-final-${ARM}.png`, Buffer.from(result.finPng.split(",")[1], "base64"));
 await page.screenshot({ path: `scripts/gi-diag-chain-view-${ARM}.png` });
 
+// SILHOUETTE BURST (BURST=1): the user's actual complaint — "random voxel
+// shadows appear AROUND the box silhouette as it rotates". 24 consecutive
+// grabs of the raw (kind paint via PRESET_GLOBALS) cropped to the cube's
+// screen region; per-frame kind counts in the crop + the 4 most box-heavy
+// crops saved as PNGs. A transient artifact hides in whole-frame
+// histograms; the crop + burst is what catches it.
+if (process.env.BURST === "1") {
+  await call("viewport.setCamera", {
+    position: [mpos[0] + 6.5, mpos[1] + 1.2, mpos[2] + 0.3],
+    target: [mpos[0], mpos[1] - 0.8, mpos[2]],
+  });
+  await wait(2500);
+  const burst = await page.evaluate(async ({ anchorId, mpos }) => {
+    const eng = globalThis.__editorApi.entities.live(anchorId)?.engine;
+    const sys = eng.modules.get("gi").system;
+    const sb = sys.state.screen;
+    const W = sb.shadowWidth, H = sb.shadowHeight;
+    const stride = Math.ceil((W * 4) / 256) * 256;
+    // Crop: project the cube center and its floor shadow into shadow texels,
+    // take a generous box around both.
+    const cam = eng.camera;
+    cam.updateMatrixWorld(true);
+    const THREE = (await import("/src/engine/index.js")).THREE;
+    const vp = new THREE.Matrix4().multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
+    const proj = (x, y, z) => {
+      const p = new THREE.Vector4(x, y, z, 1).applyMatrix4(vp);
+      return [Math.round((p.x / p.w * 0.5 + 0.5) * W), Math.round((0.5 - p.y / p.w * 0.5) * H)];
+    };
+    const a = proj(mpos[0], mpos[1] + 1.2, mpos[2]);
+    const b = proj(mpos[0], 0, mpos[2]);
+    const x0 = Math.max(0, Math.min(a[0], b[0]) - 70), x1 = Math.min(W, Math.max(a[0], b[0]) + 70);
+    const y0 = Math.max(0, Math.min(a[1], b[1]) - 30), y1 = Math.min(H, Math.max(a[1], b[1]) + 40);
+    const frames = [];
+    for (let i = 0; i < 24; i++) {
+      await new Promise((r) => requestAnimationFrame(r));
+      const A = await eng.renderer.backend.copyTextureToBuffer(sb.targets.lightShadowRaw, 0, 0, W, H);
+      const c = { miss: 0, plane: 0, tri: 0, box: 0, fail: 0 };
+      for (let y = y0; y < y1; y++) {
+        const row = y * stride;
+        for (let x = x0; x < x1; x++) {
+          const bb = A[row + x * 4];
+          if (bb < 16) c.miss++;
+          else if (Math.abs(bb - 32) <= 8) c.plane++;
+          else if (Math.abs(bb - 64) <= 8) c.tri++;
+          else if (Math.abs(bb - 96) <= 8) c.box++;
+          else if (bb >= 120 && bb <= 200) c.fail++;
+        }
+      }
+      frames.push({ c, A });
+    }
+    const cw = x1 - x0, ch = y1 - y0;
+    const cropPng = (A) => {
+      const cv = document.createElement("canvas");
+      cv.width = cw; cv.height = ch;
+      const ctx = cv.getContext("2d");
+      const id = ctx.createImageData(cw, ch);
+      for (let y = 0; y < ch; y++) {
+        const row = (y + y0) * stride;
+        for (let x = 0; x < cw; x++) {
+          const i = (y * cw + x) * 4, bb = A[row + (x + x0) * 4];
+          id.data[i] = bb; id.data[i + 1] = bb; id.data[i + 2] = bb; id.data[i + 3] = 255;
+        }
+      }
+      ctx.putImageData(id, 0, 0);
+      return cv.toDataURL("image/png");
+    };
+    // Per-frame CHANGE in the crop: transient chunks = a frame whose diff
+    // from its predecessor is large and blocky, invisible in kind counts.
+    const diffs = frames.map((f, i) => {
+      if (i === 0) return 0;
+      let d = 0;
+      const A = f.A, B = frames[i - 1].A;
+      for (let y = y0; y < y1; y++) {
+        const row = y * stride;
+        for (let x = x0; x < x1; x++) {
+          if (Math.abs(A[row + x * 4] - B[row + x * 4]) > 40) d++;
+        }
+      }
+      return d;
+    });
+    const diffPng = (A, B) => {
+      const cv = document.createElement("canvas");
+      cv.width = cw; cv.height = ch;
+      const ctx = cv.getContext("2d");
+      const id = ctx.createImageData(cw, ch);
+      for (let y = 0; y < ch; y++) {
+        const row = (y + y0) * stride;
+        for (let x = 0; x < cw; x++) {
+          const i = (y * cw + x) * 4;
+          const d = Math.abs(A[row + (x + x0) * 4] - B[row + (x + x0) * 4]);
+          id.data[i] = Math.min(255, d * 3); id.data[i + 1] = A[row + (x + x0) * 4] >> 1; id.data[i + 2] = 0; id.data[i + 3] = 255;
+        }
+      }
+      ctx.putImageData(id, 0, 0);
+      return cv.toDataURL("image/png");
+    };
+    const rankedD = diffs.map((d, i) => ({ i, d })).filter((r) => r.i > 0).sort((p, q) => q.d - p.d);
+    const ranked = frames.map((f, i) => ({ i, box: f.c.box, fail: f.c.fail, f }))
+      .sort((p, q) => (q.box + q.fail) - (p.box + p.fail));
+    return {
+      crop: [x0, y0, x1, y1],
+      counts: frames.map((f) => f.c),
+      diffs,
+      worst: ranked.slice(0, 3).map((r) => ({ i: r.i, png: cropPng(r.f.A) })),
+      best: ranked.slice(-1).map((r) => ({ i: r.i, png: cropPng(r.f.A) })),
+      worstDiff: rankedD.slice(0, 3).map((r) => ({
+        i: r.i, d: r.d,
+        png: cropPng(frames[r.i].A),
+        prevPng: cropPng(frames[r.i - 1].A),
+        dPng: diffPng(frames[r.i].A, frames[r.i - 1].A),
+      })),
+    };
+  }, { anchorId: mover?.id ?? ents[0].id, mpos });
+  console.log(`BURST crop=${JSON.stringify(burst.crop)}`);
+  console.log(`BURST counts=${JSON.stringify(burst.counts)}`);
+  for (const w of burst.worst) writeFileSync(`scripts/gi-diag-burst-worst${w.i}.png`, Buffer.from(w.png.split(",")[1], "base64"));
+  for (const w of burst.best) writeFileSync(`scripts/gi-diag-burst-best${w.i}.png`, Buffer.from(w.png.split(",")[1], "base64"));
+  console.log(`BURST diffs=${JSON.stringify(burst.diffs)}`);
+  for (const w of burst.worstDiff ?? []) {
+    writeFileSync(`scripts/gi-diag-burst-d${w.i}.png`, Buffer.from(w.png.split(",")[1], "base64"));
+    writeFileSync(`scripts/gi-diag-burst-d${w.i}prev.png`, Buffer.from(w.prevPng.split(",")[1], "base64"));
+    writeFileSync(`scripts/gi-diag-burst-d${w.i}diff.png`, Buffer.from(w.dPng.split(",")[1], "base64"));
+  }
+}
+
+// FACE ARTIFACT ATTRIBUTION (FACE=1): frame the cube from the user's own
+// angle (down the nave, cube centered), dump the raw with whatever paint
+// PRESET_GLOBALS selected (production or __giShadowKindDebug="sub") plus a
+// viewport shot. The self-shadow patch pixels' verdict class names the fix.
+if (process.env.FACE === "1") {
+  await call("viewport.setCamera", {
+    position: [mpos[0] + 6.5, mpos[1] + 1.2, mpos[2] + 0.3],
+    target: [mpos[0], mpos[1] - 0.8, mpos[2]],
+  });
+  await wait(2500);
+  const face = await page.evaluate(async ({ anchorId }) => {
+    const eng = globalThis.__editorApi.entities.live(anchorId)?.engine;
+    const sb = eng.modules.get("gi").system.state.screen;
+    const W = sb.shadowWidth, H = sb.shadowHeight;
+    const stride = Math.ceil((W * 4) / 256) * 256;
+    const A = await eng.renderer.backend.copyTextureToBuffer(sb.targets.lightShadowRaw, 0, 0, W, H);
+    const cv = document.createElement("canvas");
+    cv.width = W; cv.height = H;
+    const ctx = cv.getContext("2d");
+    const id = ctx.createImageData(W, H);
+    for (let y = 0; y < H; y++) {
+      const row = y * stride;
+      for (let x = 0; x < W; x++) {
+        const i = (y * W + x) * 4, b = A[row + x * 4];
+        id.data[i] = b; id.data[i + 1] = b; id.data[i + 2] = b; id.data[i + 3] = 255;
+      }
+    }
+    ctx.putImageData(id, 0, 0);
+    return cv.toDataURL("image/png");
+  }, { anchorId: mover?.id ?? ents[0].id });
+  writeFileSync(`scripts/gi-diag-face-${process.env.FACETAG ?? "raw"}.png`, Buffer.from(face.split(",")[1], "base64"));
+  await page.screenshot({ path: `scripts/gi-diag-face-view-${process.env.FACETAG ?? "raw"}.png` });
+  console.log("  face dump done");
+}
+
 // TEXTURE DIMS (DIMS=1): actual GPU dims of every shadow-chain target vs
 // the screen bundle's shadowWidth/Height — a mismatch means stale targets
 // after a resize (sampled stretched = the soft blob).
