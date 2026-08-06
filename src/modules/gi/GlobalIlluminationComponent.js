@@ -164,11 +164,11 @@ export class GlobalIlluminationComponent extends Component {
     // budgets/cadence — see GISystem's `qualityTierOf`), it just means the
     // advanced fields below were hand-edited and no longer match a preset.
     { key: "quality", label: "Quality", type: "select", options: ["low", "medium", "high", "ultra", "custom"] },
-    { key: "sizeX", label: "Size X (manual mode)", type: "number", min: 4, max: 200, step: 1, advanced: true, flipsToCustom: "quality" },
-    { key: "sizeY", label: "Size Y (manual mode)", type: "number", min: 2, max: 100, step: 1, advanced: true, flipsToCustom: "quality" },
-    { key: "sizeZ", label: "Size Z (manual mode)", type: "number", min: 4, max: 200, step: 1, advanced: true, flipsToCustom: "quality" },
-    { key: "voxelSize", label: "Voxel Size (manual mode)", type: "number", min: 0.1, max: 2, step: 0.05, advanced: true, flipsToCustom: "quality" },
-    { key: "probeSpacing", label: "Probe Spacing (manual mode)", type: "number", min: 0.25, max: 8, step: 0.25, advanced: true, flipsToCustom: "quality" },
+    { key: "sizeX", label: "Size X", type: "number", min: 4, max: 200, step: 1, advanced: true, flipsToCustom: "quality" },
+    { key: "sizeY", label: "Size Y", type: "number", min: 2, max: 100, step: 1, advanced: true, flipsToCustom: "quality" },
+    { key: "sizeZ", label: "Size Z", type: "number", min: 4, max: 200, step: 1, advanced: true, flipsToCustom: "quality" },
+    { key: "voxelSize", label: "Voxel Size", type: "number", min: 0.1, max: 2, step: 0.05, advanced: true, flipsToCustom: "quality" },
+    { key: "probeSpacing", label: "Probe Spacing", type: "number", min: 0.25, max: 8, step: 0.25, advanced: true, flipsToCustom: "quality" },
     { key: "cascadeCount", label: "Cascades", type: "number", min: 2, max: 6, step: 1, advanced: true, flipsToCustom: "quality" },
     { key: "c0DirRes", label: "C0 Dir Res", type: "select", options: [2, 4], advanced: true, flipsToCustom: "quality" },
     { key: "intensity", label: "Intensity", type: "number", min: 0, max: 10, step: 0.1 },
@@ -188,18 +188,10 @@ export class GlobalIlluminationComponent extends Component {
     // How fast streamed re-bakes blend into the live field. 1 = instant
     // snap (DISABLES the anti-flicker smoothing); 0.2-0.3 is the sweet spot.
     { key: "temporalBlend", label: "Bake Smoothing (1=off)", type: "number", min: 0.02, max: 1, step: 0.01, advanced: true, flipsToCustom: "quality" },
-    // Deliberately NOT `flipsToCustom` — it is a stability knob, not a quality
-    // level, and switching preset must not silently reset it.
-    { key: "probeSmoothing", label: "Light Smoothing (1=off)", type: "number", min: 0.02, max: 1, step: 0.01, advanced: true },
-    { key: "peakSplit", label: "Split Update Across Frames", type: "boolean", advanced: true },
+
     { key: "reflections", label: "GI Reflections", type: "boolean", advanced: true, flipsToCustom: "quality" },
-    { key: "exactReflections", label: "Exact Reflections (High/Ultra)", type: "boolean", advanced: true, flipsToCustom: "quality" },
+    { key: "exactReflections", label: "Exact Reflections", type: "boolean", advanced: true, flipsToCustom: "quality" },
     { key: "backend", label: "Tracing Backend", type: "select", options: ["occupancy", "sdf-legacy"], advanced: true, flipsToCustom: "quality" },
-    { key: "rayHitMode", label: "Ray Hit Mode", type: "select", options: ["auto", "occupancy-legacy", "hybrid-brick-box", "hybrid-plane", "hybrid-plane-coverage", "hybrid-exact-complex"], advanced: true },
-    { key: "rayHitProfiling", label: "Ray Hit Counters", type: "boolean", advanced: true },
-    { key: "rayHitSkipDistance", label: "Ray Hit Empty-Space Skip", type: "boolean", advanced: true },
-    { key: "sparseField", label: "Sparse Fine Field (sub-cell occlusion)", type: "boolean", advanced: true, flipsToCustom: "quality" },
-    { key: "emissiveShadows", label: "Emissive Shadows", type: "boolean", advanced: true, flipsToCustom: "quality" },
     // A LOOK control like Sky Light, deliberately not advanced/flipsToCustom:
     // contact darkening is the single most visible realism knob after
     // intensity, and it costs a few bitset fetches at half res.
@@ -215,6 +207,16 @@ export class GlobalIlluminationComponent extends Component {
     // actually in the field". "sdf" shows the composited distance field the
     // shadow and mirror traces still read.
     { key: "debugProbes", label: "Debug View", type: "select", options: ["off", "raw", "merged", "sdf", "occupancy"], advanced: true, flipsToCustom: "quality" },
+
+    // Deliberately NOT `flipsToCustom` — it is a stability knob, not a quality
+    // level, and switching preset must not silently reset it.
+    { key: "probeSmoothing", label: "Light Smoothing (1=off)", type: "number", min: 0.02, max: 1, step: 0.01, advanced: true },
+    { key: "peakSplit", label: "Peak Split", type: "boolean", advanced: true },
+    { key: "rayHitMode", label: "Ray Hit Mode", type: "select", options: ["auto", "occupancy-legacy", "hybrid-brick-box", "hybrid-plane", "hybrid-plane-coverage", "hybrid-exact-complex"], advanced: true },
+    { key: "rayHitProfiling", label: "Ray Hit Profiling", type: "boolean", advanced: true },
+    { key: "rayHitSkipDistance", label: "Ray Hit Empty-Space Skip", type: "boolean", advanced: true },
+    { key: "sparseField", label: "Sparse Fine Field", type: "boolean", advanced: true, flipsToCustom: "quality" },
+    { key: "emissiveShadows", label: "Emissive Shadows", type: "boolean", advanced: true, flipsToCustom: "quality" },
   ];
 
   get #system() {

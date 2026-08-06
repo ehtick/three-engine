@@ -1,0 +1,360 @@
+// MCP tools smoke: do the newer tool families actually run?
+//
+//   npx vite --port 5211 --strictPort
+//   node scripts/run-mcp-tools-smoke.mjs [url]
+//
+// HEADED=1 to watch it run.
+//
+// `run-mcp-coverage-test.mjs` proves the tools EXIST and are described. That is
+// a source scan, and a source scan cannot tell a working tool from one that
+// throws on its first line — which is the failure mode a thin op wrapper
+// actually has, because it is mostly a call into a module whose signature may
+// have moved. So this drives them against a live editor with a real project
+// open, and asserts on the files and scene state they claim to produce.
+//
+// Deliberately NOT covered here: anything that goes to the network (library
+// searches and imports hit Poly Haven / ambientCG / Sketchfab / itch.io) or
+// that takes minutes (build.export, compressAllTextures). Their gating,
+// validation and status reporting are checked; the download itself is not
+// something a test should do sixty times a day to somebody else's free API.
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import puppeteer from "puppeteer-core";
+import { installTauriShim } from "./lib/tauriShim.mjs";
+
+const url = process.argv[2] ?? "http://localhost:5211/";
+
+const results = [];
+const check = (name, ok, detail = "") => {
+  results.push({ name, ok });
+  console.log(`${ok ? "  ok  " : " FAIL "} ${name}${detail ? ` — ${detail}` : ""}`);
+};
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const root = fs.mkdtempSync(path.join(os.tmpdir(), "engine-tools-"));
+fs.writeFileSync(path.join(root, "project.json"), JSON.stringify({ name: "Tools", version: 1 }, null, 2));
+fs.mkdirSync(path.join(root, "textures"), { recursive: true });
+
+const browser = await puppeteer.launch({
+  executablePath: "C:/Program Files/Google/Chrome/Application/chrome.exe",
+  headless: process.env.HEADED ? false : "new",
+  args: ["--enable-unsafe-webgpu", "--enable-features=WebGPU", "--no-sandbox", "--disable-dev-shm-usage"],
+});
+const page = await browser.newPage();
+await page.setViewport({ width: 1600, height: 1000, deviceScaleFactor: 1 });
+await installTauriShim(page, {
+  writableRoot: root,
+  verbose: !!process.env.VERBOSE,
+  extraCommands: { watch_project: () => true, unwatch_project: () => null },
+});
+
+const errors = [];
+page.on("console", (m) => {
+  if (m.type() === "error") errors.push(m.text());
+});
+page.on("pageerror", (e) => errors.push(`pageerror: ${e.stack ?? e.message}`));
+
+await page.goto(url, { waitUntil: "load", timeout: 45000 });
+await page.evaluate(() => {
+  [...document.querySelectorAll("button")].find((b) => b.textContent?.includes("Skip the project"))?.click();
+});
+await wait(6000);
+
+await page.evaluate(async (projectRoot) => {
+  const importLive = (p) => {
+    const prefix = location.origin + p;
+    const fetched = performance
+      .getEntriesByType("resource")
+      .map((e) => e.name)
+      .filter((n) => n === prefix || n.startsWith(`${prefix}?`));
+    return import(/* @vite-ignore */ (fetched.find((n) => n.includes("?")) ?? fetched[0]) ?? p);
+  };
+  globalThis.__importLive = importLive;
+  const { ensureEngine } = await importLive("/src/editor/engineInstance.js");
+  await ensureEngine();
+  const { useProjectStore } = await importLive("/src/editor/store/projectStore.js");
+  globalThis.__openDone = false;
+  useProjectStore.getState().openProject(projectRoot).then(() => (globalThis.__openDone = true));
+  globalThis.__call = async (tool, args = {}) => {
+    const { callTool } = await importLive("/src/editor/api/registry.js");
+    return callTool(tool, args);
+  };
+}, root.replaceAll("\\", "/"));
+
+for (let i = 0; i < 60 && !(await page.evaluate(() => globalThis.__openDone === true)); i++) await wait(500);
+check("the scratch project opens", await page.evaluate(() => globalThis.__openDone === true));
+
+// --- the module gate is real ------------------------------------------------
+//
+// The project's module list is a statement about what the project uses. A tool
+// that quietly worked through a disabled module would make "enabled" mean
+// nothing — and would leave files from a module the project does not ship.
+
+const gated = await page.evaluate(() =>
+  globalThis.__call("texture_create", { directory: "x", name: "y.png" }),
+);
+check(
+  "a tool refuses to work through a disabled module, and says which one",
+  gated.ok === false && /texture-editor/.test(gated.error ?? ""),
+  gated.error,
+);
+
+const enabled = await page.evaluate(() => globalThis.__call("module_setEnabled", { id: "texture-editor", enabled: true }));
+check("module.setEnabled turns it on", enabled.ok === true, enabled.error ?? "");
+await wait(600);
+
+// --- textures ----------------------------------------------------------------
+
+const effects = await page.evaluate(() => globalThis.__call("texture_effects"));
+const effectList = effects.result ?? [];
+check("texture.effects lists the panel's own registry", effectList.length >= 10, `${effectList.length} effects`);
+check(
+  "…with the parameters and ranges a caller needs to use them",
+  effectList.some((e) => e.id === "levels" && e.params.some((p) => p.key === "gamma" && p.max !== undefined)),
+);
+
+const dir = `${root.replaceAll("\\", "/")}/textures`;
+const created = await page.evaluate(
+  (d) => globalThis.__call("texture_create", { directory: d, name: "Probe.png", width: 64, height: 32, background: "#804020" }),
+  dir,
+);
+check("texture.create writes a new image", created.ok === true, created.error ?? "");
+check("…to disk, not just to an open tab", fs.existsSync(path.join(root, "textures", "Probe.png")));
+
+const info = await page.evaluate((d) => globalThis.__call("texture_info", { path: `${d}/Probe.png` }), dir);
+check("texture.info reports its size", info.result?.width === 64 && info.result?.height === 32, JSON.stringify(info.result ?? info.error));
+
+// Compared by CONTENT, not by size: inverting a flat colour produces a PNG of
+// exactly the same length, so a length check here passes whether the pixels
+// changed or not — which is the same as not checking.
+const beforeBytes = fs.readFileSync(path.join(root, "textures", "Probe.png"));
+const processed = await page.evaluate((d) => globalThis.__call("texture_process", { path: `${d}/Probe.png`, effect: "invert" }), dir);
+check("texture.process applies an effect", processed.ok === true, processed.error ?? "");
+const afterBytes = fs.readFileSync(path.join(root, "textures", "Probe.png"));
+check("…and the pixels on disk really changed", !beforeBytes.equals(afterBytes), `${beforeBytes.length} -> ${afterBytes.length} bytes`);
+
+const badEffect = await page.evaluate((d) => globalThis.__call("texture_process", { path: `${d}/Probe.png`, effect: "nope" }), dir);
+check(
+  "…and an unknown effect answers with the list instead of a stack trace",
+  badEffect.ok === false && /Available:/.test(badEffect.error ?? ""),
+  (badEffect.error ?? "").slice(0, 60),
+);
+
+const resized = await page.evaluate((d) => globalThis.__call("texture_resize", { path: `${d}/Probe.png`, width: 32, height: 32 }), dir);
+check("texture.resize resamples", resized.ok === true && resized.result?.width === 32, JSON.stringify(resized.result ?? resized.error));
+
+const meta = await page.evaluate((d) => globalThis.__call("texture_setMeta", { path: `${d}/Probe.png`, colorSpace: "linear" }), dir);
+check("texture.setMeta writes the colour-space flag", meta.ok === true, meta.error ?? "");
+check(
+  "…into the .meta sidecar the loader reads",
+  fs.existsSync(path.join(root, "textures", "Probe.png.meta")) &&
+    JSON.parse(fs.readFileSync(path.join(root, "textures", "Probe.png.meta"), "utf8")).colorSpace === "linear",
+);
+
+const second = await page.evaluate(
+  (d) => globalThis.__call("texture_create", { directory: d, name: "Probe2.png", width: 32, height: 32, background: "#204080" }),
+  dir,
+);
+const packed = await page.evaluate(
+  (d) => globalThis.__call("texture_atlas_pack", { paths: [`${d}/Probe.png`, `${d}/Probe2.png`], name: "Sprites", directory: d }),
+  dir,
+);
+check("texture.atlas.pack builds an atlas", second.ok === true && packed.ok === true, packed.error ?? "");
+const atlasPath = `${dir}/Sprites.atlas`;
+check("…writing the descriptor beside the packed image", fs.existsSync(path.join(root, "textures", "Sprites.atlas")));
+
+const atlas = await page.evaluate((p) => globalThis.__call("texture_atlas_get", { path: p }), atlasPath);
+check("texture.atlas.get reads the regions back", (atlas.result?.regions?.length ?? 0) === 2, JSON.stringify(atlas.result?.regions ?? atlas.error));
+
+// --- authoring a texture from nothing ----------------------------------------
+//
+// "Create a texture" means building one up — layers, shapes, patterns — not
+// only running filters over an image that already exists.
+
+const authored = `${dir}/Authored.png`;
+await page.evaluate((d) => globalThis.__call("texture_create", { directory: d, name: "Authored.png", width: 64, height: 64 }), dir);
+
+const gen = await page.evaluate(
+  (p) => globalThis.__call("texture_generate", { path: p, generator: "checker", size: 16, color: "#ffffff", colorTo: "#202020" }),
+  authored,
+);
+check("texture.generate paints a checkerboard", gen.ok === true, gen.error ?? "");
+
+const layered = await page.evaluate((p) => globalThis.__call("texture_addLayer", { path: p, name: "Detail" }), authored);
+check("texture.addLayer adds a layer", layered.ok === true && layered.result?.index === 1, layered.error ?? "");
+
+const drawn = await page.evaluate(
+  (p) => globalThis.__call("texture_draw", { path: p, shape: "ellipse", rect: [8, 8, 48, 48], color: "#ff3300", layer: 1 }),
+  authored,
+);
+check("texture.draw draws onto the layer it was told to", drawn.ok === true, drawn.error ?? "");
+
+const gradient = await page.evaluate(
+  (p) => globalThis.__call("texture_draw", { path: p, shape: "gradient", gradient: "radial", color: "#ffffff", colorTo: "#000000", opacity: 0.5, layer: 1 }),
+  authored,
+);
+check("…and a gradient", gradient.ok === true, gradient.error ?? "");
+
+const layerInfo = await page.evaluate((p) => globalThis.__call("texture_info", { path: p }), authored);
+check(
+  "texture.info reports the layer stack that produced the image",
+  (layerInfo.result?.layers?.length ?? 0) === 2 && layerInfo.result.layers[1].name === "Detail",
+  JSON.stringify(layerInfo.result?.layers?.map((l) => l.name)),
+);
+
+const opacity = await page.evaluate((p) => globalThis.__call("texture_setLayer", { path: p, layer: 1, opacity: 0.4 }), authored);
+check("texture.setLayer changes the mix", opacity.ok === true && opacity.result?.opacity === 0.4, opacity.error ?? "");
+
+const badShape = await page.evaluate((p) => globalThis.__call("texture_draw", { path: p, shape: "rect" }), authored);
+check("…and a shape with no geometry says what is missing", badShape.ok === false && /rect/.test(badShape.error ?? ""), (badShape.error ?? "").slice(0, 60));
+
+const dropped = await page.evaluate((p) => globalThis.__call("texture_removeLayer", { path: p, layer: 1 }), authored);
+check("texture.removeLayer removes it", dropped.ok === true && dropped.result?.layers === 1, dropped.error ?? "");
+
+// --- editing geometry ---------------------------------------------------------
+//
+// The session model: begin, select, operate, commit — the same sequence a person
+// performs with Tab. Every operator below is checked by its effect on the mesh's
+// element counts, because an operator that silently no-ops (wrong selection mode,
+// a signature that moved) reports success just as happily as one that worked.
+
+const cube = await page.evaluate(() =>
+  globalThis.__call("entity_create", { name: "EditMe", components: [{ type: "mesh", props: { geometry: "box" } }] }),
+);
+check("a mesh entity to edit", cube.ok === true, cube.error ?? "");
+const cubeId = cube.result?.id;
+
+const noSession = await page.evaluate(() => globalThis.__call("geometry_edit", { operation: "extrude" }));
+check(
+  "an operator with no session says so instead of throwing from three layers down",
+  noSession.ok === false && /beginEdit/.test(noSession.error ?? ""),
+  (noSession.error ?? "").slice(0, 60),
+);
+
+const began = await page.evaluate((id) => globalThis.__call("geometry_beginEdit", { entityId: id }), cubeId);
+check("geometry.beginEdit opens the mesh", began.ok === true, began.error ?? "");
+check(
+  "…decoded as a real polygon mesh, not a triangle soup",
+  began.result?.statistics?.faces === 6 && began.result?.statistics?.quads === 6,
+  JSON.stringify(began.result?.statistics),
+);
+check("…and forks a .geom asset to save into", typeof began.result?.path === "string", began.result?.path);
+
+const operations = await page.evaluate(() => globalThis.__call("geometry_operations"));
+check("geometry.operations lists the operators", (operations.result?.length ?? 0) >= 20, `${operations.result?.length} operators`);
+
+const nothingSelected = await page.evaluate(() => globalThis.__call("geometry_edit", { operation: "bevel" }));
+check(
+  "an operator with an empty selection names the mode to select in",
+  nothingSelected.ok === false && /geometry.select/.test(nothingSelected.error ?? ""),
+  (nothingSelected.error ?? "").slice(0, 70),
+);
+
+const selectAll = await page.evaluate(() => globalThis.__call("geometry_select", { mode: "face", action: "all" }));
+check("geometry.select selects every face", selectAll.result?.selected?.faces === 6, JSON.stringify(selectAll.result ?? selectAll.error));
+
+const subdivided = await page.evaluate(() => globalThis.__call("geometry_edit", { operation: "subdivide", params: { cuts: 1 } }));
+check(
+  "subdivide really subdivides",
+  subdivided.result?.after?.faces === 24,
+  JSON.stringify({ before: subdivided.result?.before?.faces, after: subdivided.result?.after?.faces, error: subdivided.error }),
+);
+
+// A box selection over the top half — the kind of selection an agent can
+// actually reason about, unlike element indices.
+const topFaces = await page.evaluate(() =>
+  globalThis.__call("geometry_select", { mode: "face", action: "box", min: [-2, 0.4, -2], max: [2, 2, 2] }),
+);
+check("box selection picks out a region by position", (topFaces.result?.selected?.faces ?? 0) > 0, JSON.stringify(topFaces.result ?? topFaces.error));
+
+const extruded = await page.evaluate(() => globalThis.__call("geometry_edit", { operation: "extrude", params: { offset: 0.5 } }));
+check(
+  "extrude adds geometry",
+  (extruded.result?.after?.verts ?? 0) > (extruded.result?.before?.verts ?? 0),
+  JSON.stringify({ before: extruded.result?.before?.verts, after: extruded.result?.after?.verts, error: extruded.error }),
+);
+
+const inset = await page.evaluate(() => globalThis.__call("geometry_edit", { operation: "inset", params: { thickness: 0.1 } }));
+check("inset runs with a thickness", inset.ok === true && (inset.result?.after?.faces ?? 0) > (inset.result?.before?.faces ?? 0), inset.error ?? "");
+
+const nudged = await page.evaluate(() => globalThis.__call("geometry_transform", { translate: [0, 0.25, 0] }));
+check("geometry.transform moves the selection", nudged.ok === true && (nudged.result?.moved ?? 0) > 0, nudged.error ?? "");
+
+const shaded = await page.evaluate(() => globalThis.__call("geometry_edit", { operation: "recalculateNormals" }));
+check("cleanup operators run too", shaded.ok === true, shaded.error ?? "");
+
+const status = await page.evaluate(() => globalThis.__call("geometry_status"));
+check("geometry.status reports the open session", status.result?.open === true && status.result?.entityId === cubeId, JSON.stringify(status.result));
+
+const committed = await page.evaluate(() => globalThis.__call("geometry_commit"));
+check("geometry.commit saves", committed.ok === true, committed.error ?? "");
+const geomPath = committed.result?.path?.replace(root.replaceAll("\\", "/"), "");
+check("…to the .geom asset on disk", !!geomPath && fs.existsSync(path.join(root, geomPath)), geomPath);
+const savedGeom = geomPath ? JSON.parse(fs.readFileSync(path.join(root, geomPath), "utf8")) : null;
+check("…carrying the edited mesh, not the original cube", (savedGeom?.positions?.length ?? savedGeom?.verts?.length ?? 0) > 24, Object.keys(savedGeom ?? {}).join(", "));
+
+const afterCommit = await page.evaluate(() => globalThis.__call("geometry_status"));
+check("…and closes the session", afterCommit.result?.open === false);
+
+// --- libraries and build ------------------------------------------------------
+
+const libStatus = await page.evaluate(() => globalThis.__call("library_status"));
+const providers = libStatus.result?.providers ?? [];
+check("library.status answers for every library", providers.length === 4, providers.map((p) => p.id).join(", "));
+check(
+  "…and explains what is missing rather than just refusing",
+  providers.every((p) => p.ready || (p.note ?? "").length > 10),
+  JSON.stringify(providers.find((p) => !p.ready)),
+);
+
+const badProvider = await page.evaluate(() => globalThis.__call("library_search", { provider: "nope", query: "rock" }));
+check("library.search rejects an unknown library by name", badProvider.ok === false, (badProvider.error ?? "").slice(0, 70));
+
+const buildSettings = await page.evaluate(() => globalThis.__call("build_getSettings"));
+check("build.getSettings reads the project's settings", buildSettings.ok === true, buildSettings.error ?? "");
+check(
+  "…and resolves which scenes a build would actually contain",
+  !!buildSettings.result?.resolved,
+  JSON.stringify(buildSettings.result?.settings?.target ?? null),
+);
+
+const buildPatch = await page.evaluate(() => globalThis.__call("build_setSettings", { patch: { target: "zip" } }));
+check("build.setSettings saves a change", buildPatch.ok === true && buildPatch.result?.settings?.target === "zip", buildPatch.error ?? "");
+
+// --- new asset-management tools ----------------------------------------------
+
+const folder = await page.evaluate((r) => globalThis.__call("asset_createFolder", { path: `${r}/Made` }), root.replaceAll("\\", "/"));
+check("asset.createFolder creates a folder", folder.ok === true && fs.existsSync(path.join(root, "Made")), folder.error ?? "");
+
+const renamed = await page.evaluate((d) => globalThis.__call("asset_rename", { path: `${d}/Probe2.png`, name: "Renamed.png" }), dir);
+check("asset.rename renames on disk", renamed.ok === true && fs.existsSync(path.join(root, "textures", "Renamed.png")), renamed.error ?? "");
+
+const moved = await page.evaluate(
+  (args) => globalThis.__call("asset_move", { paths: [`${args.dir}/Renamed.png`], directory: `${args.root}/Made` }),
+  { dir, root: root.replaceAll("\\", "/") },
+);
+check("asset.move moves it", moved.ok === true && fs.existsSync(path.join(root, "Made", "Renamed.png")), moved.error ?? "");
+
+const removed = await page.evaluate((r) => globalThis.__call("asset_delete", { paths: [`${r}/Made/Renamed.png`] }), root.replaceAll("\\", "/"));
+check("asset.delete deletes it", removed.ok === true && !fs.existsSync(path.join(root, "Made", "Renamed.png")), removed.error ?? "");
+
+const escape = await page.evaluate(() => globalThis.__call("asset_delete", { paths: ["C:/Windows/System32/drivers/etc/hosts"] }));
+check(
+  "…and refuses a path outside the project",
+  escape.ok === false && /outside the open project/.test(escape.error ?? ""),
+  (escape.error ?? "").slice(0, 60),
+);
+
+// ---------------------------------------------------------------------------
+const hard = errors.filter((e) => !/WebGPU|GPUAdapter|deprecat|Failed to load resource|WebSocket/i.test(e));
+if (hard.length) {
+  console.log("\nconsole errors:");
+  for (const e of hard.slice(0, 10)) console.log(`  ${e}`);
+}
+const failed = results.filter((r) => !r.ok);
+console.log(
+  `\nMCP-TOOLS-SMOKE ${failed.length === 0 && hard.length === 0 ? "PASS" : "FAIL"} — ${results.length - failed.length}/${results.length} checks`,
+);
+await browser.close();
+process.exit(failed.length === 0 && hard.length === 0 ? 0 : 1);

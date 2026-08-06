@@ -1,5 +1,5 @@
 import { defineConfig } from "vite";
-import { renameSync } from "node:fs";
+import { existsSync, renameSync } from "node:fs";
 
 // Builds the standalone game player (no React, no Tauri) into dist-player/,
 // used as the template by the editor's File → Export Game.
@@ -23,7 +23,19 @@ export default defineConfig({
   plugins: [
     {
       name: "rename-entry-to-index",
-      closeBundle: () => renameSync("dist-player/player.html", "dist-player/index.html"),
+      closeBundle: () => {
+        // Tolerant of an already-renamed output. The editor rebuilds this
+        // template on demand (browser preview start, and a 5s staleness poll
+        // while one is live), so two builds can overlap — a `tauri dev`
+        // restart mid-preview is enough. The loser used to crash the whole
+        // build with a bare ENOENT on player.html, leaving dist-player in a
+        // half-written state that then failed every later export.
+        if (existsSync("dist-player/player.html")) {
+          renameSync("dist-player/player.html", "dist-player/index.html");
+        } else if (!existsSync("dist-player/index.html")) {
+          throw new Error("player build produced neither player.html nor index.html");
+        }
+      },
     },
     {
       // The template is PREBUILT: exports/browser previews copy dist-player

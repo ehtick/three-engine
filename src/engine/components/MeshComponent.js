@@ -61,8 +61,8 @@ export class MeshComponent extends Component {
     { key: "receiveShadow", label: "Receive Shadow", type: "boolean" },
   ];
 
-  constructor(entity, props = {}) {
-    super(entity, props);
+  constructor(props = {}) {
+    super(props);
     // Scene-wide systems must not measure the placeholder box installed by
     // onAttach() while authored assets are still streaming in. Each flag
     // describes only the current request generation; a superseded promise

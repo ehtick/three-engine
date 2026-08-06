@@ -1,5 +1,6 @@
 // @ts-check
 import { create } from "zustand";
+import { vmSingleton, oncePerVm } from "../singleton.js";
 import { ensureEngine } from "../engineInstance.js";
 
 /**
@@ -12,7 +13,7 @@ import { ensureEngine } from "../engineInstance.js";
  * trip through the manager's toJSON/fromJSON so the editor's "save" and
  * "live update" share a single code path, and panel edits are atomic.
  */
-export const useInputStore = create((set) => ({
+export const useInputStore = vmSingleton("inputStore", () => create((set) => ({
   snapshot: null, // JSON produced by InputManager.toJSON()
   selectedMap: null,
   selectedAction: null,
@@ -60,13 +61,18 @@ export const useInputStore = create((set) => ({
   selectAction(mapName, actionName) {
     set({ selectedMap: mapName, selectedAction: actionName });
   },
-}));
+})));
 
 let engineInstanceCache = null;
-ensureEngine().then((engine) => {
-  engineInstanceCache = engine;
-  // Re-hydrate after an `applyInput` swap so the panel sees the new map list.
-  engine.on("input-changed", () => useInputStore.getState().hydrate());
-  // First-time hydration once the engine is built.
-  useInputStore.getState().hydrate();
-});
+// `oncePerVm` for the same reason as sceneStore's: a re-evaluated copy of this
+// module would attach a second "input-changed" listener to the one engine and
+// re-hydrate the one store twice per change, growing with every hot reload.
+if (oncePerVm("inputStore.subscribe")) {
+  ensureEngine().then((engine) => {
+    engineInstanceCache = engine;
+    // Re-hydrate after an `applyInput` swap so the panel sees the new map list.
+    engine.on("input-changed", () => useInputStore.getState().hydrate());
+    // First-time hydration once the engine is built.
+    useInputStore.getState().hydrate();
+  });
+}

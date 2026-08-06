@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { vmSingleton } from "../singleton.js";
 import { scaffoldProjectTypes } from "../projectTypes.js";
 
 const ROOT_KEY = "engine.projectRoot.v1";
@@ -22,7 +23,7 @@ function loadRecent() {
   }
 }
 
-export const useProjectStore = create((set, get) => ({
+export const useProjectStore = vmSingleton("projectStore", () => create((set, get) => ({
   rootPath: null,
   currentPath: null,
   entries: [],
@@ -94,6 +95,26 @@ export const useProjectStore = create((set, get) => ({
       console.warn(`Could not scaffold engine types into ${path}: ${err}`);
     });
     await get().navigate(path);
+    // Watch the folder so files written by anything other than the editor — an
+    // agent's own file tools, an IDE, a paint program — appear without a
+    // restart. Dynamically imported to keep the import cycle (the watcher reads
+    // this store) from existing at module scope, and never fatal: a project
+    // without a watcher is the editor as it behaved before, not a broken one.
+    import("../projectWatcher.js")
+      .then((m) => m.startProjectWatcher(path))
+      .catch((err) => console.warn(`Project watcher unavailable: ${err}`));
+    // The assistant guide is normally written when an assistant connects — but
+    // a connection that is ALREADY up when a project opens would otherwise never
+    // trigger it, and switching projects mid-conversation is an ordinary thing
+    // to do. Only when connected, so the "never used an assistant" case still
+    // gets a clean folder.
+    import("../api/mcpBridge.js")
+      .then(async ({ useMcpStore }) => {
+        if (useMcpStore.getState().status !== "connected") return;
+        const { ensureAgentGuide } = await import("../agentGuide.js");
+        await ensureAgentGuide(path);
+      })
+      .catch(() => {});
     return true;
   },
 
@@ -177,6 +198,6 @@ export const useProjectStore = create((set, get) => ({
     }
     set({ recent });
   },
-}));
+})));
 
 export { basename };

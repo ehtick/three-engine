@@ -99,7 +99,15 @@ export class SpriteComponent extends Component {
   onAttach() {
     this.generation = (this.generation ?? 0) + 1;
     this.atlasDef = null;
-    this.texture = null;
+    // NOT `this.texture` — `texture` is a declared prop, and `Component`
+    // installs an accessor for every prop name, so assigning it writes the
+    // PROP. That put a THREE.Texture where the authored path string belongs
+    // (serialising garbage into the scene) and, because `onPropChanged`
+    // reloads on "texture", re-entered #load forever: a sprite in the scene
+    // meant ~150 `hierarchy-changed` emits a second, which in turn kept the
+    // editor's viewport from ever going idle. Any field on a component must
+    // avoid the prop namespace.
+    this.loadedTexture = null;
     this.time = 0;
     this.playing = false;
     this.currentFrame = null;
@@ -136,8 +144,8 @@ export class SpriteComponent extends Component {
     }
     this.geometry?.dispose();
     this.geometry = null;
-    this.texture?.dispose();
-    this.texture = null;
+    this.loadedTexture?.dispose();
+    this.loadedTexture = null;
     this.atlasDef = null;
   }
 
@@ -187,7 +195,7 @@ export class SpriteComponent extends Component {
     // and discarding at 0.5 leaves a jagged silhouette. The default only drops
     // fully-transparent texels so they stop writing depth.
     material.alphaTest = Math.max(0, Math.min(1, this.props.alphaTest ?? 0.01));
-    material.map = this.texture ?? null;
+    material.map = this.loadedTexture ?? null;
     this.#applyTint(material);
     return material;
   }
@@ -221,8 +229,8 @@ export class SpriteComponent extends Component {
         texture.dispose();
         return;
       }
-      this.texture?.dispose();
-      this.texture = texture;
+      this.loadedTexture?.dispose();
+      this.loadedTexture = texture;
       this.mesh.material.map = texture;
       this.mesh.material.needsUpdate = true;
       this.playing = this.props.playOnStart !== false && !!this.props.animation;
@@ -236,7 +244,7 @@ export class SpriteComponent extends Component {
   /** The region the sprite is currently showing, or a whole-image stand-in. */
   #resolveRegion() {
     const def = this.atlasDef;
-    const image = this.texture?.image;
+    const image = this.loadedTexture?.image;
     if (!def) {
       const w = image?.width ?? 1;
       const h = image?.height ?? 1;
@@ -249,7 +257,7 @@ export class SpriteComponent extends Component {
   #textureSize() {
     const def = this.atlasDef;
     if (def && def.size[0] && def.size[1]) return def.size;
-    const image = this.texture?.image;
+    const image = this.loadedTexture?.image;
     return [image?.width ?? 1, image?.height ?? 1];
   }
 

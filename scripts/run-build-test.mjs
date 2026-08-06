@@ -10,6 +10,7 @@
  * Usage: npm run test:build
  */
 import { createAssetNames, splitExtension } from "../src/editor/build/assetNames.js";
+import { rewriteComponentAssets } from "../src/editor/build/assetRefs.js";
 import {
   BUILD_DEFAULTS,
   resolveBuildScenes,
@@ -278,8 +279,7 @@ console.log("\nLive-preview reload client");
     "<html><head><title>x</title></head><body><div id=\"game\"></div></body></html>",
     { title: "Game" },
   );
-  const revision = 1754200000000;
-  const out = injectLivePreviewClient(themed, revision);
+  const out = injectLivePreviewClient(themed);
   check("the client is injected before </body>", /live-preview-client[\s\S]*<\/body>/.test(out));
   check("the game markup survives", out.includes('<div id="game">'));
   check(
@@ -287,12 +287,24 @@ console.log("\nLive-preview reload client");
     out.includes(`fetch("${PREVIEW_REVISION_PATH}"`),
   );
   eq("the marker path matches the exporter contract", PREVIEW_REVISION_PATH, "__preview_revision.json");
-  check("the build's own revision is baked in", out.includes(`const initial = ${revision};`));
+  check(
+    "no revision is baked in — an unchanged index.html must stay byte-identical across rebuilds",
+    injectLivePreviewClient(themed) === out,
+  );
   check("polls bypass every cache", out.includes('cache: "no-store"'));
   check("hidden tabs don't poll", out.includes("document.hidden"));
-  check("a changed revision reloads", out.includes("location.reload()"));
+  check("it prefers the runtime's in-place hook", out.includes("window.__playerLiveUpdate"));
+  check(
+    "a skipped build cannot trust the delta — previous must match the running revision",
+    out.includes("data.previous === seen"),
+  );
+  check(
+    "…but missed deltas are recovered from the manifest history",
+    out.includes("data.history.findIndex"),
+  );
+  check("a changed revision still reloads when hot-apply declines", out.includes("location.reload()"));
 
-  const headless = injectLivePreviewClient("<html><head></head></html>", 42);
+  const headless = injectLivePreviewClient("<html><head></head></html>");
   check("a template without </body> still gets the client", headless.includes("live-preview-client"));
 
   // The injection is exporter-conditional (livePreview only), but double-check
@@ -353,6 +365,106 @@ console.log("\nPages project names");
     "space-runner",
   );
   eq("nothing at all still yields a deployable name", resolvePagesProject({}), "my-game");
+}
+
+// --- Component asset rewriting ----------------------------------------------
+// The exporter's walker is schema-driven, same as the runtime's preloader —
+// these checks pin the contract that made the old hand-maintained type ladder
+// ship Sprite/Decal/Instancer references as absolute authoring paths.
+console.log("\nComponent asset rewriting");
+{
+  const SCHEMAS = {
+    sprite: [
+      { key: "atlas", type: "asset" },
+      { key: "texture", type: "asset" },
+      { key: "region", type: "string" },
+    ],
+    mesh: [
+      { key: "geometryAsset", type: "asset" },
+      { key: "material", type: "asset" },
+      { key: "material2", type: "asset" },
+      { key: "material3", type: "asset" },
+    ],
+    instancer: [{ key: "material", type: "asset" }],
+    timeline: [{ key: "asset", type: "asset" }],
+    model: [{ key: "path", type: "asset" }],
+    script: [],
+    sound: [],
+  };
+  const run = (component) => {
+    const added = [];
+    const names = createAssetNames();
+    rewriteComponentAssets(component, {
+      getSchema: (type) => SCHEMAS[type],
+      claim: (p) => names.claim(p),
+      claimDoc: (p, rename) => names.claimGenerated(p, rename ? { rename } : undefined),
+      add: (kind, p) => added.push([kind, p]),
+    });
+    return { added, component };
+  };
+
+  // The exact bug that shipped: a sprite's plain-image texture stayed an
+  // absolute Windows path and the served build could not fetch it.
+  const sprite = { type: "sprite", props: { texture: "C:\\Users\\me\\GAME\\Fonts\\Roboto\\Text.png", atlas: "", region: "hero" } };
+  run(sprite);
+  eq("a sprite's plain texture is claimed into the build", sprite.props.texture, "assets/Text.png");
+  eq("an empty atlas slot is left alone", sprite.props.atlas, "");
+  eq("non-asset schema fields are untouched", sprite.props.region, "hero");
+
+  const mesh = {
+    type: "mesh",
+    props: { geometryAsset: "C:/proj/geo/rock.geom", material: "C:/proj/mats/a.mat", material2: "C:/proj/mats/b.mat", material3: "" },
+  };
+  const meshRun = run(mesh);
+  eq("multi-material slots all ship", mesh.props.material2, "assets/b.mat");
+  eq(
+    "every .mat is registered for re-emission",
+    meshRun.added.filter(([kind]) => kind === "material").length,
+    2,
+  );
+  eq("geometry is a plain copy, not a document", meshRun.added.some(([, p]) => p.endsWith(".geom")), false);
+
+  const instancer = { type: "instancer", props: { material: "C:/proj/mats/leaves.mat" } };
+  const instancerRun = run(instancer);
+  eq("an instancer's material override ships", instancer.props.material, "assets/leaves.mat");
+  eq("…and is re-emitted like any .mat", instancerRun.added, [["material", "C:/proj/mats/leaves.mat"]]);
+
+  const timeline = { type: "timeline", props: { asset: "C:/proj/cut/intro.timeline" } };
+  eq("a timeline routes to the document bucket", run(timeline).added, [["timeline", "C:/proj/cut/intro.timeline"]]);
+
+  const model = {
+    type: "model",
+    props: { path: "C:/proj/models/tree.glb", materials: { Bark: "C:/proj/mats/bark.mat", Leaf: "" } },
+  };
+  const modelRun = run(model);
+  eq("a model's override map is rewritten", model.props.materials.Bark, "assets/bark.mat");
+  eq("empty override slots survive untouched", model.props.materials.Leaf, "");
+  check("the override map's .mat is registered", modelRun.added.some(([kind, p]) => kind === "material" && p.endsWith("bark.mat")));
+
+  const script = {
+    type: "script",
+    props: { scripts: [{ path: "C:/proj/scripts/Player.ts" }, { path: "C:/proj/scripts/Enemy.js" }, { path: "" }] },
+  };
+  const scriptRun = run(script);
+  eq("a .ts slot ships as .js", script.props.scripts[0].path, "assets/Player.js");
+  eq("a .js slot keeps its extension", script.props.scripts[1].path, "assets/Enemy.js");
+  eq("both slots are registered for transpilation", scriptRun.added.length, 2);
+
+  // Legacy single-script shape: the rewritten path must land back in props —
+  // the old exporter rewrote a temp slot object and shipped the scene still
+  // pointing at the authoring path.
+  const legacy = { type: "script", props: { path: "C:/proj/scripts/Old.ts" } };
+  run(legacy);
+  eq("a legacy script component's path is rewritten in place", legacy.props.path, "assets/Old.js");
+
+  const sound = { type: "sound", props: { entries: [{ audioAsset: "C:/proj/audio/step.audio" }, { audioAsset: "" }] } };
+  const soundRun = run(sound);
+  eq("a sound entry's sidecar ships", sound.props.entries[0].audioAsset, "assets/step.audio");
+  eq("the sidecar is registered as an audio document", soundRun.added, [["audio", "C:/proj/audio/step.audio"]]);
+
+  const unknown = { type: "somefuturething", props: { texture: "C:/proj/tex/a.png" } };
+  run(unknown);
+  eq("a component without a schema is left untouched", unknown.props.texture, "C:/proj/tex/a.png");
 }
 
 console.log(`\nBUILD-TEST ${fail ? "FAIL" : "PASS"} — ${pass}/${pass + fail} checks`);

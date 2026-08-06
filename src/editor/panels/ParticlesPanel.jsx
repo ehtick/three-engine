@@ -196,7 +196,7 @@ function ParticleGraphEditor({ entityId, initialGraph }) {
       initialGraph={initialGraph}
       onChange={onChange}
       toolbar={toolbar}
-      hint="Wire emitters and forces into the Particle System node · right-click the canvas or drop a wire on it to add nodes · double-click a wire for a reroute pin · Ctrl+Z undoes"
+      hint="Wire emitters and forces into the Particle System node · right-click the canvas or drop a wire on it to add nodes · double-click a wire to delete it (Alt+double-click for a reroute pin) · Ctrl+Z undoes"
     />
   );
 }

@@ -13,8 +13,8 @@ export const BUILD_TARGETS = {
     hint: "A folder to drop on any static host. Needs a server — module scripts don't run over file://.",
   },
   zip: {
-    label: "Web (zip, itch.io)",
-    hint: "The same folder, zipped with index.html at the root — the layout itch.io expects.",
+    label: "Web (zip)",
+    hint: "The same folder, zipped with index.html at the root — ready to upload to any static host. The itch.io module's Publish tab builds this and opens your itch.io dashboard for you.",
   },
   desktop: {
     label: "Desktop (Tauri project)",

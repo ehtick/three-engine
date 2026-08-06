@@ -1,9 +1,12 @@
 import { create } from "zustand";
+import { vmSingleton } from "../singleton.js";
 
-let nextId = 1;
+// VM-wide alongside the store itself: a second copy of this module with its own
+// counter would hand React duplicate keys for entries in one shared list.
+const ids = vmSingleton("consoleStoreIds", () => ({ next: 1 }));
 const MAX_ENTRIES = 500;
 
-export const useConsoleStore = create((set) => ({
+export const useConsoleStore = vmSingleton("consoleStore", () => create((set) => ({
   entries: [],
   // Number of error-level entries the user hasn't seen yet. Incremented when a
   // new error lands, reset to zero when the Console panel becomes active (i.e.
@@ -13,7 +16,7 @@ export const useConsoleStore = create((set) => ({
 
   push(level, message) {
     set((state) => {
-      const entries = [...state.entries, { id: nextId++, level, message, time: new Date() }];
+      const entries = [...state.entries, { id: ids.next++, level, message, time: new Date() }];
       if (entries.length > MAX_ENTRIES) entries.splice(0, entries.length - MAX_ENTRIES);
       return {
         entries,
@@ -30,7 +33,7 @@ export const useConsoleStore = create((set) => ({
   markConsoleRead() {
     set({ unreadErrors: 0 });
   },
-}));
+})));
 
 function format(args) {
   return args

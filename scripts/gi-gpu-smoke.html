@@ -44,6 +44,13 @@
         // opt-in until this arm's gate proves it).
         globalThis.__giShadowTemporalDebug = true;
         globalThis.__giShadowTemporal = true;
+        // ANALYTIC-WIDTH is the DEFAULT (docs/GI_SHADOWS_PLAN.md §5):
+        // deterministic central-ray march × mid-field distanceTexture width,
+        // NO temporal chain. `?analytic=0` compiles the legacy stochastic
+        // sun-disc + temporal arm instead — that arm's reprojection/counter
+        // gates below only run there.
+        const analyticArm = new URLSearchParams(location.search).get("analytic") !== "0";
+        if (!analyticArm) globalThis.__giShadowAnalyticWidth = false;
         // editorFramePacing stops unfocused engines — headless the page is
         // NEVER focused, and the temporal gate below is the first assertion
         // that needs the loop RUNNING at assert time (earlier arms only read
@@ -264,7 +271,7 @@
           // for the hatched arm — cross-checked against the level-0 bits (a
           // level-1 cell's byte is round(255·popcount(children)/8) exactly).
           const marcher = engine.modules.get("gi").system.state.screen?.lightShadow?.marcher ?? "";
-          if (!/sun-disc|density-cone/.test(marcher)) {
+          if (analyticArm ? !/analytic-width/.test(marcher) : !/sun-disc|density-cone/.test(marcher)) {
             throw new Error(`lightshadow arm: unexpected soft-shadow marcher "${marcher}"`);
           }
           const occField = engine.modules.get("gi").system.state.volume.occupancyField;
@@ -302,6 +309,29 @@
           // settle window covers at least one frame's worth of geometry.
           const filterPass = engine.modules.get("gi").system.state.screen?.lightShadowFilterPass;
           if (!filterPass) throw new Error("lightshadow arm: filter pass missing from the screen bundle");
+          if (analyticArm) {
+            // ANALYTIC-WIDTH TOPOLOGY GATE: no temporal chain may exist —
+            // one trace pass, one history-free filter straight into the
+            // sampled target — and the width probe's WGSL function must have
+            // compiled into the shadow pass (an invalid pipeline there
+            // silently drops the whole compute batch, so presence of the
+            // function in the composed shader is the compile gate).
+            const sb = engine.modules.get("gi").system.state.screen;
+            if (sb.lightShadowHistoryPass || sb.lightShadowPostPass) {
+              throw new Error("analytic arm: temporal passes were built despite __giShadowAnalyticWidth");
+            }
+            if (filterPass.temporalCounter) {
+              throw new Error("analytic arm: filter pass compiled the temporal counter (history should be null)");
+            }
+            const shadowShader = engine.renderer._nodes?.getForCompute?.(sb.lightShadowPass.compute)?.computeShader ?? "";
+            if (!/giShadowWidthProbe/.test(shadowShader)) {
+              throw new Error("analytic arm: the width probe never compiled into the shadow pass");
+            }
+            console.log(
+              `GI-SMOKE LIGHTSHADOW-ANALYTIC marcher="${marcher}" widthProbe=compiled ` +
+              `temporalPasses=none pen-variant=${penVariantSeen ? "compiled" : "n/a (non-plane mode)"}`,
+            );
+          } else {
           if (!filterPass.temporalCounter) throw new Error("lightshadow arm: temporal debug counter not compiled");
           const readValid = async () =>
             Array.from(new Uint32Array(await engine.renderer.getArrayBufferAsync(filterPass.temporalCounter.value)));
@@ -352,6 +382,7 @@
             `marcher="${marcher}" densityCells=${densityCells} partial=${partialCells} mismatches=0 ` +
             `temporalValid=${funnel[0]} threads=${funnel[1]} inBounds=${funnel[2]} loose=${funnel[3]} of ${shadowPixels}px/frame over the window`,
           );
+          }
         }
         globalThis.__GI_SMOKE_RESULT__ = {
           pass: true,

@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { vmSingleton } from "./singleton.js";
 import { invoke } from "./assetOps.js";
 import { readAssetMeta } from "./assetLoader.js";
 import { assetCatalog } from "../engine/assets/catalog.js";
@@ -27,7 +28,7 @@ export const ASSET_FLAG_DEFAULTS = { preload: false, exclude: false, tags: [] };
  * from here (synchronously, during render) while the actual `.meta` reads and
  * writes happen through the async helpers below.
  */
-export const useAssetFlagsStore = create((set) => ({
+export const useAssetFlagsStore = vmSingleton("assetFlagsStore", () => create((set) => ({
   flags: {}, // path -> { preload, exclude }
   merge: (entries) =>
     set((state) => {
@@ -39,7 +40,7 @@ export const useAssetFlagsStore = create((set) => ({
       }
       return { flags: { ...state.flags, ...entries } };
     }),
-}));
+})));
 
 export function getAssetFlags(path) {
   return useAssetFlagsStore.getState().flags[path] ?? ASSET_FLAG_DEFAULTS;

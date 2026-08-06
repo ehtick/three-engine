@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { GitBranch } from "lucide-react";
 import { commandBus, useHistoryStore } from "./commands/CommandBus.js";
 import { useSelectionStore } from "./store/selectionStore.js";
 import { useSceneStore } from "./store/sceneStore.js";
@@ -29,6 +30,7 @@ import {
 } from "./threeDCursorOps.js";
 import { subscribeMenuItems } from "../engine/editorBridge.js";
 import { useMcpStore } from "./api/mcpBridge.js";
+import { startGitWatch, summarize, useGitStore } from "./git/gitStore.js";
 
 /**
  * Merges script-contributed entries (`@menuItem` / `Editor.menu.add`) into the
@@ -90,6 +92,35 @@ function McpIndicator() {
     >
       <span className="mcp-dot" />
       MCP{status === "connected" && callCount > 0 ? ` ${callCount}` : ""}
+    </button>
+  );
+}
+
+/**
+ * Branch and change count, always visible.
+ *
+ * The same argument as the MCP chip next to it: a panel nobody opens is a
+ * feature nobody has. But this one also answers a question that costs real work
+ * to get wrong — "which branch am I editing?" — and the honest place for that
+ * answer is next to the scene name, not three clicks away. It stays quiet
+ * (dimmed, one word) until there is something to say.
+ */
+function GitIndicator() {
+  const state = useGitStore();
+  // Starts the poll and the file-change subscription once, for the life of the
+  // editor: the chip is the one thing that needs repository state even when the
+  // Source Control panel has never been opened.
+  useEffect(() => startGitWatch(), []);
+  const summary = summarize(state);
+  return (
+    <button className={`git-chip ${summary.tone}`} title={summary.title} onClick={() => openPanel("git")}>
+      {/* The branch glyph carries the state colour, so the chip reads as
+          version control at a glance instead of relying on the word "git". */}
+      <GitBranch size={11} className="git-chip-icon" />
+      {summary.label}
+      {summary.changed ? <span className="git-chip-count">{summary.changed}</span> : null}
+      {summary.behind ? <span className="git-chip-arrow">↓{summary.behind}</span> : null}
+      {summary.ahead ? <span className="git-chip-arrow">↑{summary.ahead}</span> : null}
     </button>
   );
 }
@@ -215,9 +246,15 @@ export function MenuBar() {
       { label: "Modules", action: () => openPanel("modules") },
       { label: "Input", action: () => openPanel("input") },
       { label: "Texture Editor", action: () => openPanel("textureEditor") },
+      { label: "Code", action: () => openPanel("code") },
+      { label: "Fonts", action: () => openPanel("fontLibrary") },
       { label: "Poly Haven", action: () => openPanel("polyhaven") },
       { label: "AmbientCG", action: () => openPanel("ambientcg") },
       { label: "Sketchfab", action: () => openPanel("sketchfab") },
+      { label: "itch.io", action: () => openPanel("itchio") },
+      { label: "Audio Library", action: () => openPanel("audioLibrary") },
+      { label: "Audio Editor", action: () => openPanel("audioEditor") },
+      { label: "Source Control", action: () => openPanel("git") },
       { label: "Terminal", action: () => openPanel("terminal") },
       { label: "Assistant (MCP)", action: () => openPanel("mcp") },
       { label: "AI", action: () => openPanel("ai") },
@@ -324,6 +361,7 @@ export function MenuBar() {
       ))}
       {openMenu && <div className="dropdown-overlay" onClick={() => setOpenMenu(null)} />}
       <div className="menu-spacer" />
+      <GitIndicator />
       <McpIndicator />
       <ProcessingIndicator />
       <div className="menu-title">

@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { vmSingleton } from "./singleton.js";
 import { useProjectStore } from "./store/projectStore.js";
 import { ensureEngine } from "./engineInstance.js";
 
@@ -9,7 +10,7 @@ import { ensureEngine } from "./engineInstance.js";
  * Add Component menu, disabled ones degrade to inert "missing" data that
  * still round-trips through save.
  */
-export const useModulesStore = create(() => ({ enabled: [] }));
+export const useModulesStore = vmSingleton("modulesStore", () => create(() => ({ enabled: [] })));
 
 async function engineModulesApi() {
   // The catalog import registers all built-in definitions; kept dynamic so

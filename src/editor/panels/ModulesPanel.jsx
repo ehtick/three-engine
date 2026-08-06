@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Boxes, ChevronDown, Search, Sliders, Tag } from "lucide-react";
+import { Boxes, ChevronDown, KeyRound, Search, Sliders, Tag } from "lucide-react";
 import {
   useModulesStore,
   listModuleDefinitions,
@@ -9,6 +9,7 @@ import {
 } from "../modules.js";
 import { usePlayStore } from "../store/playStore.js";
 import { useProjectStore } from "../store/projectStore.js";
+import { CREDENTIAL_CHANGED_EVENT } from "../credentialEvents.js";
 
 const SELECTED_KEY = "engine.modules.selected";
 const COLLAPSED_KEY = "engine.modules.collapsedCategories";
@@ -274,6 +275,131 @@ export function ModulesPanel() {
 }
 
 /**
+ * Per-user API keys/tokens live here, not on the browse/import panel they
+ * unlock — the Modules panel is where every other per-module setting lives,
+ * and it means switching to a different itch.io/Sketchfab account doesn't
+ * require re-finding the field inside a grid of thumbnails. Each entry names
+ * the editor-only client module (dynamically imported so it never enters the
+ * runtime module registry's import graph) and the three functions every one
+ * of these clients already exposes: getSavedToken/clearSavedToken/
+ * validateAndSaveToken. Keyed as arrays so a module can list more than one
+ * credential later; `id` (not the module id) is what travels in
+ * `CREDENTIAL_CHANGED_EVENT`, since one module could own several.
+ */
+const CREDENTIAL_PROVIDERS = {
+  sketchfab: [
+    {
+      id: "sketchfab",
+      label: "Sketchfab token",
+      placeholder: "Sketchfab API/OAuth token",
+      helpLabel: "Find token",
+      load: () => import("../sketchfab.js"),
+      openHelp: (mod) => mod.openTokenPage(),
+    },
+  ],
+  itchio: [
+    {
+      id: "itchio",
+      label: "itch.io API key",
+      placeholder: "itch.io API key",
+      helpLabel: "Find key",
+      load: () => import("../itchio.js"),
+      openHelp: (mod) => mod.openApiKeyPage(),
+    },
+  ],
+  // Freesound only — the module's other source (Wikimedia Commons) is keyless,
+  // so the panel still works with this left blank.
+  "audio-library": [
+    {
+      id: "freesound",
+      label: "Freesound API key",
+      placeholder: "Freesound API key",
+      helpLabel: "Get key",
+      load: () => import("../audioLibrary.js"),
+      openHelp: (mod) => mod.openApiKeyPage(),
+    },
+  ],
+};
+
+function ModuleCredential({ provider }) {
+  const [mod, setMod] = useState(null);
+  const [token, setToken] = useState("");
+  const [name, setName] = useState("");
+  const [draft, setDraft] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    let alive = true;
+    provider.load().then((m) => {
+      if (!alive) return;
+      setMod(m);
+      setToken(m.getSavedToken());
+    });
+    return () => { alive = false; };
+  }, [provider]);
+
+  if (!mod) return null;
+
+  const connect = async (event) => {
+    event.preventDefault();
+    setBusy(true);
+    setError(null);
+    try {
+      const displayName = await mod.validateAndSaveToken(draft);
+      setToken(mod.getSavedToken());
+      setName(displayName);
+      setDraft("");
+      window.dispatchEvent(new CustomEvent(CREDENTIAL_CHANGED_EVENT, { detail: { id: provider.id, connected: true } }));
+    } catch (err) {
+      setError(err.message ?? String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const disconnect = () => {
+    mod.clearSavedToken();
+    setToken("");
+    setName("");
+    window.dispatchEvent(new CustomEvent(CREDENTIAL_CHANGED_EVENT, { detail: { id: provider.id, connected: false } }));
+  };
+
+  return (
+    <section className="modules-detail-section">
+      <div className="modules-detail-section-label">
+        <KeyRound size={11} />
+        <span>{provider.label}</span>
+      </div>
+      {token ? (
+        <div className="modules-credential-row">
+          <span className="asset-hint">Saved locally{name ? ` — ${name}` : ""}</span>
+          <button className="toolbar-btn" onClick={disconnect}>Disconnect</button>
+        </div>
+      ) : (
+        <form className="modules-credential-row" onSubmit={connect}>
+          <input
+            type="password"
+            autoComplete="off"
+            className="text-field"
+            placeholder={provider.placeholder}
+            value={draft}
+            onChange={(event) => setDraft(event.target.value)}
+          />
+          <button className="toolbar-btn" disabled={busy || !draft.trim()}>
+            {busy ? "Checking…" : "Connect"}
+          </button>
+          <button type="button" className="sf-link-btn" onClick={() => provider.openHelp(mod)}>
+            {provider.helpLabel}
+          </button>
+        </form>
+      )}
+      {error && <div className="ph-error">{error}</div>}
+    </section>
+  );
+}
+
+/**
  * Editable project-level defaults for a module that declares a `settings`
  * schema (see the module definition). Persists into project.json and pushes
  * runtime-affecting values onto the live engine via the module's
@@ -385,6 +511,10 @@ function ModuleDetail({ def, on, busy, disabledReason, onToggle }) {
       </header>
 
       <p className="modules-detail-desc">{def.description}</p>
+
+      {CREDENTIAL_PROVIDERS[def.id]?.map((provider) => (
+        <ModuleCredential key={provider.id} provider={provider} />
+      ))}
 
       {def.settings?.length > 0 && <ModuleSettings def={def} />}
 

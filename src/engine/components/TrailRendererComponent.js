@@ -88,7 +88,7 @@ export class TrailRendererComponent extends Component {
 
   onAttach() {
     this.generation = (this.generation ?? 0) + 1;
-    this.texture = null;
+    this.loadedTexture = null;
     /** Oldest first: `[{x, y, z, birth}, …]`. The last entry is the head and
      *  tracks the entity every frame until it is far enough to be committed. */
     this.points = [];
@@ -112,8 +112,8 @@ export class TrailRendererComponent extends Component {
     this.unsubTick = null;
     this.ribbon?.dispose();
     this.ribbon = null;
-    this.texture?.dispose();
-    this.texture = null;
+    this.loadedTexture?.dispose();
+    this.loadedTexture = null;
     this.points = [];
   }
 
@@ -125,7 +125,7 @@ export class TrailRendererComponent extends Component {
     return createRibbonMaterial({
       alignment: this.props.alignment,
       blending: this.props.blending,
-      map: this.texture,
+      map: this.loadedTexture,
       color: 0xffffff,
       opacity: 1,
     });
@@ -140,8 +140,8 @@ export class TrailRendererComponent extends Component {
         return;
       }
       applyRibbonWrap(texture, this.props.textureMode);
-      this.texture?.dispose();
-      this.texture = texture;
+      this.loadedTexture?.dispose();
+      this.loadedTexture = texture;
       this.#swapMaterial();
     } catch (err) {
       console.warn(`Trail renderer texture failed to load: ${path}`, err);
@@ -305,8 +305,8 @@ export class TrailRendererComponent extends Component {
       if (this.props.texture) {
         this.#loadTexture(this.props.texture);
       } else {
-        this.texture?.dispose();
-        this.texture = null;
+        this.loadedTexture?.dispose();
+        this.loadedTexture = null;
         this.#swapMaterial();
       }
       return;
@@ -315,7 +315,7 @@ export class TrailRendererComponent extends Component {
       this.#swapMaterial();
       return;
     }
-    if (key === "textureMode") applyRibbonWrap(this.texture, this.props.textureMode);
+    if (key === "textureMode") applyRibbonWrap(this.loadedTexture, this.props.textureMode);
     // Everything else is read on the next tick.
   }
 }

@@ -59,8 +59,8 @@ export class LodGroupComponent extends Component {
     },
   ];
 
-  constructor(entity, props) {
-    super(entity, props);
+  constructor(props) {
+    super(props);
     /** Level currently showing; -1 while culled, null before the first decision. */
     this.activeLevel = null;
     /** Screen height measured on the last update — what the inspector reads. */

@@ -2,15 +2,10 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Download, ExternalLink, Globe, KeyRound, Loader2, Search } from "lucide-react";
 import { useModulesStore, setModuleEnabled } from "../modules.js";
 import { useProjectStore } from "../store/projectStore.js";
-import {
-  clearSavedToken,
-  downloadModel,
-  getSavedToken,
-  openModelPage,
-  openTokenPage,
-  searchModels,
-  validateAndSaveToken,
-} from "../sketchfab.js";
+import { downloadModel, getSavedToken, openModelPage, searchModels } from "../sketchfab.js";
+import { CREDENTIAL_CHANGED_EVENT } from "../credentialEvents.js";
+
+const openModulesPanel = () => import("../EditorShell.jsx").then((m) => m.openPanel("modules"));
 
 export function SketchfabPanel() {
   const moduleOn = useModulesStore((state) => state.enabled.includes("sketchfab"));
@@ -24,10 +19,15 @@ export function SketchfabPanel() {
   const [loadingMore, setLoadingMore] = useState(false);
   const [selectedId, setSelectedId] = useState(null);
   const [token, setToken] = useState(() => getSavedToken());
-  const [tokenDraft, setTokenDraft] = useState("");
-  const [tokenBusy, setTokenBusy] = useState(false);
-  const [tokenError, setTokenError] = useState(null);
   const gridRef = useRef(null);
+
+  useEffect(() => {
+    const onCredentialChange = (event) => {
+      if (event.detail?.id === "sketchfab") setToken(getSavedToken());
+    };
+    window.addEventListener(CREDENTIAL_CHANGED_EVENT, onCredentialChange);
+    return () => window.removeEventListener(CREDENTIAL_CHANGED_EVENT, onCredentialChange);
+  }, []);
 
   useEffect(() => {
     if (!moduleOn) return;
@@ -84,21 +84,6 @@ export function SketchfabPanel() {
     }
   };
 
-  const saveToken = async (event) => {
-    event.preventDefault();
-    setTokenBusy(true);
-    setTokenError(null);
-    try {
-      await validateAndSaveToken(tokenDraft);
-      setToken(getSavedToken());
-      setTokenDraft("");
-    } catch (err) {
-      setTokenError(err.message ?? String(err));
-    } finally {
-      setTokenBusy(false);
-    }
-  };
-
   if (!moduleOn) {
     return (
       <div className="ph-panel">
@@ -136,31 +121,13 @@ export function SketchfabPanel() {
         </select>
       </form>
 
-      <div className="sf-authbar">
-        <KeyRound size={13} />
-        {token ? (
-          <>
-            <span>Sketchfab token saved locally — downloads enabled</span>
-            <button className="toolbar-btn" onClick={() => { clearSavedToken(); setToken(""); }}>Disconnect</button>
-          </>
-        ) : (
-          <form onSubmit={saveToken}>
-            <span>Downloads require your personal token</span>
-            <input
-              type="password"
-              autoComplete="off"
-              placeholder="Sketchfab API/OAuth token"
-              value={tokenDraft}
-              onChange={(event) => setTokenDraft(event.target.value)}
-            />
-            <button className="toolbar-btn" disabled={tokenBusy || !tokenDraft.trim()}>
-              {tokenBusy ? "Checking…" : "Connect"}
-            </button>
-            <button className="sf-link-btn" type="button" onClick={() => openTokenPage()}>Find token</button>
-          </form>
-        )}
-        {tokenError && <span className="ph-error">{tokenError}</span>}
-      </div>
+      {!token && (
+        <div className="sf-authbar">
+          <KeyRound size={13} />
+          <span>Downloads require your personal Sketchfab token — connect it in the Modules panel</span>
+          <button className="toolbar-btn" onClick={() => openModulesPanel()}>Open Modules</button>
+        </div>
+      )}
 
       <div className="ph-body">
         <div className="ph-grid-scroll" ref={gridRef}>
@@ -249,7 +216,7 @@ function ModelDetail({ model, hasProject, hasToken, onClose }) {
       )}
       {model.description && <p className="sf-description">{model.description.replace(/<[^>]*>/g, " ")}</p>}
       {!hasProject && <div className="ph-status">Open a project to download.</div>}
-      {!hasToken && <div className="ph-status">Connect your Sketchfab token to download.</div>}
+      {!hasToken && <div className="ph-status">Connect your Sketchfab token in the Modules panel to download.</div>}
       {progress ? (
         <div className="ph-progress">
           <div className="ph-progress-bar"><div className="ph-progress-fill sf-progress" /></div>

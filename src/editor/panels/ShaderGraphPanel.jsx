@@ -32,6 +32,7 @@ import { SetComponentPropCommand } from "../commands/componentCommands.js";
 import { engine } from "../engineInstance.js";
 import { createDefaultMaterialFork } from "../defaultMaterialFork.js";
 import { throttlePreviewFrame } from "../previewLoop.js";
+import { invalidateBlobUrl } from "../assetLoader.js";
 
 /** Resolve the existing material def for `matPath`. Prefers the in-memory
  *  cache (which has whatever the user has been editing this session), but
@@ -444,6 +445,12 @@ function ShaderGraphEditor({ matPath, defaultEntity, onFork }) {
           const cached = getMaterialDef(path);
           if (cached) cached.shaderGraph = graph;
           await invoke("save_scene", { path, contents: JSON.stringify(def, null, 2) });
+          // The autosave is invisible to everything that watches for asset
+          // changes — the scene didn't change, no command ran, and the file
+          // watcher ignores the editor's own writes. Without this, the live
+          // browser preview never learns a material was edited and serves the
+          // old look until some unrelated edit forces a rebuild.
+          invalidateBlobUrl(path);
         }
         setSaved(true);
       } catch (err) {
@@ -488,7 +495,7 @@ function ShaderGraphEditor({ matPath, defaultEntity, onFork }) {
       overlay={material ? <MaterialPreview material={material} /> : null}
       canPreview
       registerThumb={registerThumb}
-      hint="Right-click or drop a wire on the canvas to add a node · double-click a wire for a reroute pin · eye icon previews a node · Ctrl+Z undoes · changes autosave"
+      hint="Right-click or drop a wire on the canvas to add a node · double-click a wire to delete it (Alt+double-click for a reroute pin) · eye icon previews a node · Ctrl+Z undoes · changes autosave"
     />
   );
 }

@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { vmSingleton } from "./singleton.js";
 import { useProjectStore } from "./store/projectStore.js";
 import { isPanelVisible } from "./EditorShell.jsx";
 
@@ -15,14 +16,14 @@ import { isPanelVisible } from "./EditorShell.jsx";
  * clicked in. A separate highlight channel keeps the entity selected and still
  * answers "which file is this?".
  */
-export const useAssetRevealStore = create((set) => ({
+export const useAssetRevealStore = vmSingleton("assetRevealStore", () => create((set) => ({
   path: null,
   // Bumped on every reveal so asking for the SAME asset twice still re-scrolls
   // and re-flashes the ring.
   token: 0,
   reveal: (path) => set((state) => ({ path, token: state.token + 1 })),
   clear: () => set({ path: null }),
-}));
+})));
 
 const norm = (p) => String(p ?? "").replaceAll("\\", "/").replace(/\/$/, "").toLowerCase();
 

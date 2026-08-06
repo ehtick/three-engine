@@ -8,9 +8,12 @@ import { postprocessingModule } from "./postprocessing/index.js";
 import { polyhavenModule } from "./polyhaven/index.js";
 import { ambientcgModule } from "./ambientcg/index.js";
 import { sketchfabModule } from "./sketchfab/index.js";
+import { itchioModule } from "./itchio/index.js";
 import { giModule } from "./gi/index.js";
 import { navigationModule } from "./navigation/index.js";
 import { textureEditorModule } from "./texture-editor/index.js";
+import { audioLibraryModule } from "./audio-library/index.js";
+import { audioEditorModule } from "./audio-editor/index.js";
 /**
  * Built-in module catalog. Importing this file registers every definition;
  * nothing runs until a host enables a module on an engine (editor: Modules
@@ -28,8 +31,11 @@ registerModuleDefinition(postprocessingModule);
 registerModuleDefinition(polyhavenModule);
 registerModuleDefinition(ambientcgModule);
 registerModuleDefinition(sketchfabModule);
+registerModuleDefinition(itchioModule);
 registerModuleDefinition(giModule);
 registerModuleDefinition(navigationModule);
 registerModuleDefinition(textureEditorModule);
+registerModuleDefinition(audioLibraryModule);
+registerModuleDefinition(audioEditorModule);
 
-export { physicsRapierModule, dracoModule, basisModule, terrainModule, virtualGeometryModule, postprocessingModule, polyhavenModule, ambientcgModule, sketchfabModule, giModule, navigationModule, textureEditorModule };
+export { physicsRapierModule, dracoModule, basisModule, terrainModule, virtualGeometryModule, postprocessingModule, polyhavenModule, ambientcgModule, sketchfabModule, itchioModule, giModule, navigationModule, textureEditorModule, audioLibraryModule, audioEditorModule };

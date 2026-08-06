@@ -432,6 +432,61 @@ function makeLoopProvider(impl) {
   resetOps();
 }
 
+// 6b-image. A tool result carrying an image (what `viewport.screenshot`
+// returns) must NEVER put its base64 into the conversation. A `role:"tool"`
+// message is plain text, so those bytes are not a picture the model can see —
+// they are ~1 MB of gibberish that buries the real results, blows a local
+// model's context, and invites it to invent a description. This shipped
+// broken once: a small local model confidently described a Genshin Impact
+// screenshot, HP bars and all, for a scene containing a single light.
+{
+  resetOps();
+  const base64 = "iVBORw0KGgoAAAANSUhEUg" + "A".repeat(4000);
+  defineOp({
+    name: "viewport.screenshot",
+    description: "Screenshot the viewport.",
+    readOnly: true,
+    run: () => ({ __image: { mimeType: "image/png", base64 } }),
+  });
+  const workflow = { id: "loop-image", allowedTools: ["viewport.screenshot"] };
+
+  const bodies = [];
+  let call = 0;
+  const provider = makeLoopProvider(async ({ body }) => {
+    call += 1;
+    bodies.push(JSON.parse(body));
+    if (call === 1) {
+      return JSON.stringify({
+        choices: [
+          {
+            finish_reason: "tool_calls",
+            message: {
+              role: "assistant",
+              tool_calls: [{ id: "call_1", function: { name: "viewport_screenshot", arguments: "{}" } }],
+            },
+          },
+        ],
+      });
+    }
+    return JSON.stringify({ choices: [{ finish_reason: "stop", message: { role: "assistant", content: "Done." } }] });
+  });
+  await provider.runTurn({ workflow, prompt: "diagnose" }, () => {});
+
+  const toolMsg = bodies[1]?.messages.find((m) => m.role === "tool");
+  const sent = JSON.stringify(bodies[1] ?? {});
+  check(
+    "an image tool result NEVER sends its base64 bytes into the conversation",
+    !sent.includes(base64.slice(0, 64)),
+    `request body length ${sent.length}`,
+  );
+  check(
+    "...and the model is told explicitly it has NOT seen the image, so it has no excuse to describe it",
+    /NOT shown to you|have not seen it/i.test(toolMsg?.content ?? ""),
+    toolMsg?.content,
+  );
+  resetOps();
+}
+
 // 6c. the allowlist guard — the load-bearing safety check of the whole
 // feature. A tool_calls response naming something outside the workflow's
 // allowedTools must not execute, and must feed back an error.

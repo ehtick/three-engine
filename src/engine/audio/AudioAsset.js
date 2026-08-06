@@ -1,3 +1,4 @@
+import { vmState } from "../vmState.js";
 import { resolveAssetUrl } from "../assetResolver.js";
 
 /**
@@ -25,8 +26,8 @@ export const AUDIO_ASSET_DEFAULTS = {
   loop: false,
 };
 
-const cache = new Map(); // path -> { path, def, buffer, generation, loading }
-const subscribers = new Map(); // path -> Set<({buffer}) => void>
+const cache = vmState("audioCache", () => new Map()); // path -> { path, def, buffer, generation, loading }
+const subscribers = vmState("audioSubscribers", () => new Map()); // path -> Set<({buffer}) => void>
 
 /** Subscribes to changes for a single asset; returns an unsubscribe fn. */
 export function subscribeAudioAsset(path, cb) {

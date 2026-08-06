@@ -1,3 +1,4 @@
+import { vmState } from "./vmState.js";
 import * as THREE from "three/webgpu";
 import { loadAssetMeta, resolveAssetUrl } from "./assetResolver.js";
 
@@ -462,7 +463,10 @@ async function fetchGeometryAsset(path) {
  * sharing is safe. Ownership is refcounted because the meshes that share an
  * instance are disposed independently.
  */
-const cache = new Map(); // path -> entry, only while the entry is current
+// path -> entry, only while the entry is current. VM-wide so
+// `invalidateGeometryAsset` (wired to the editor's asset invalidation) empties
+// the same map the meshes resolved their geometry from.
+const cache = vmState("geometryCache", () => new Map());
 // geometry -> its entry. Keyed by the instance rather than the path so a
 // RETIRED entry (one evicted by `invalidateGeometryAsset` after the file was
 // rewritten) still refcounts correctly for the meshes that are mid-reload and

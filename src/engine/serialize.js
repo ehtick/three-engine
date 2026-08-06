@@ -89,8 +89,15 @@ export function instantiateEntity(engine, data, parent) {
  * Components that keep simulation state outside their props (`resetOnStop`)
  * are still torn down and re-attached, so a second Play starts as clean as it
  * does today.
+ *
+ * `resetStatefulComponents: false` keeps those alive unless their own props
+ * changed. That is for applying an AUTHORED edit onto a scene that is still
+ * running — the browser preview's live update. There the running game is the
+ * thing being debugged, so restarting every script, sound and animation
+ * because an unrelated entity moved would be indistinguishable from the page
+ * reload this exists to avoid.
  */
-export async function reconcileScene(engine, json) {
+export async function reconcileScene(engine, json, { resetStatefulComponents = true } = {}) {
   if (json.version !== SCENE_VERSION) {
     throw new Error(`Unsupported scene version ${json.version}`);
   }
@@ -152,7 +159,7 @@ export async function reconcileScene(engine, json) {
       if (existing.parent !== parentEntity) existing.setParent(parentEntity);
       existing.name = data.name;
       applyEntityData(existing, data);
-      reconcileComponents(existing, data.components ?? []);
+      reconcileComponents(existing, data.components ?? [], resetStatefulComponents);
     }
 
     // 3. Prefab instances that need rebuilding from their def. After the plain
@@ -202,23 +209,35 @@ function sameProp(a, b) {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
-function reconcileComponents(entity, wanted) {
+/** True when every prop the snapshot names already holds that value live. */
+function propsAlreadyMatch(existing, props) {
+  for (const [key, value] of Object.entries(props ?? {})) {
+    if (!sameProp(existing.props[key], value)) return false;
+  }
+  return true;
+}
+
+function reconcileComponents(entity, wanted, resetStateful = true) {
   const wantedTypes = new Set(wanted.map((c) => c.type));
   for (const type of [...entity.components.keys()]) {
     if (!wantedTypes.has(type)) entity.removeComponent(type);
   }
   for (const { type, props } of wanted) {
     const existing = entity.getComponent(type);
-    // Simulation state (a playing sound, an animation state machine's
-    // position, a script instance's fields) lives outside props and would
-    // otherwise leak from one Play session into the next.
-    if (existing && existing.constructor.resetOnStop) {
-      entity.removeComponent(type);
+    if (!existing) {
       entity.addComponent(type, props);
       continue;
     }
-    if (!existing) {
-      entity.addComponent(type, props);
+    // Simulation state (a playing sound, an animation state machine's
+    // position, a script instance's fields) lives outside props. Leaving Play
+    // must re-attach regardless — that state diverged even where the props
+    // did not. Applying a live authored edit must NOT: see the
+    // `resetStatefulComponents` note on reconcileScene.
+    if (existing.constructor.resetOnStop) {
+      if (resetStateful || !propsAlreadyMatch(existing, props)) {
+        entity.removeComponent(type);
+        entity.addComponent(type, props);
+      }
       continue;
     }
     for (const [key, value] of Object.entries(props ?? {})) {

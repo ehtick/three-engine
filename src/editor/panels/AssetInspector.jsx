@@ -1,11 +1,48 @@
-// @ts-check
+// @ts-nocheck
 import { useEffect, useRef, useState } from "react";
-import { ExternalLink, Globe, Workflow, Package, Tag } from "lucide-react";
+import {
+  Archive,
+  AudioWaveform,
+  Braces,
+  Brush,
+  ChevronRight,
+  Copy,
+  CopyPlus,
+  ExternalLink,
+  FileCode2,
+  FolderOpen,
+  Globe,
+  Grid3x3,
+  Layers,
+  MousePointerClick,
+  Package,
+  PackageOpen,
+  Palette,
+  Play,
+  Plus,
+  Search,
+  Tag,
+  Trash2,
+  Type,
+  Workflow,
+} from "lucide-react";
 import * as THREE from "three/webgpu";
 import { createGltfLoader } from "../../engine/gltfLoader.js";
 import { useSelectionStore } from "../store/selectionStore.js";
 import { useProjectStore } from "../store/projectStore.js";
-import { toBlobUrl, extOf, readAssetMeta, TEXTURE_EXTENSIONS } from "../assetLoader.js";
+import {
+  toBlobUrl,
+  extOf,
+  invalidateBlobUrl,
+  readAssetMeta,
+  TEXTURE_EXTENSIONS,
+  AUDIO_EXTENSIONS,
+  FONT_EXTENSIONS,
+  SCRIPT_EXTENSIONS,
+} from "../assetLoader.js";
+import { assetActions } from "../assetActions.js";
+import { CodeEditor } from "../components/CodeEditor.jsx";
+import { AudioScrubber } from "../components/AudioScrubber.jsx";
 import {
   CUBEMAP_DEFAULTS,
   CUBEMAP_FACES,
@@ -24,7 +61,6 @@ import {
 } from "../../engine/materialAsset.js";
 import { openPanel } from "../EditorShell.jsx";
 import { syncScriptClassNameAfterRename } from "../scriptClassSync.js";
-import { openInIDE } from "../openInIde.js";
 import { TagField } from "../fields/TagField.jsx";
 import {
   ASSET_FLAG_DEFAULTS,
@@ -65,17 +101,95 @@ const TYPE_LABELS = {
   jpeg: "Texture",
   webp: "Texture",
   glb: "Model",
+  fbx: "FBX Source",
   geom: "Geometry",
   mat: "Material",
   cubemap: "Cube Map",
   anim: "Animator",
+  timeline: "Timeline",
+  atlas: "Sprite Atlas",
   prefab: "Prefab",
   entity: "Prefab (legacy)",
   js: "Script",
   ts: "Script",
   scene: "Scene",
   json: "JSON",
+  ttf: "Font",
+  otf: "Font",
+  woff: "Font",
+  woff2: "Font",
+  ogg: "Audio",
+  wav: "Audio",
+  mp3: "Audio",
+  flac: "Audio",
+  m4a: "Audio",
+  opus: "Audio",
+  oga: "Audio",
+  audio: "Audio Settings",
 };
+
+/**
+ * Lucide components for the icon names `assetActions.js` hands back.
+ *
+ * The registry deals in names rather than components so it can be imported by
+ * the headless API layer, which has no business pulling in React — this map is
+ * where the two meet.
+ */
+const ACTION_ICONS = {
+  Archive,
+  AudioWaveform,
+  Braces,
+  Brush,
+  Copy,
+  CopyPlus,
+  ExternalLink,
+  FileCode2,
+  FolderOpen,
+  Globe,
+  Grid3x3,
+  Layers,
+  MousePointerClick,
+  Package,
+  PackageOpen,
+  Palette,
+  Play,
+  Plus,
+  Search,
+  Trash2,
+  Type,
+  Workflow,
+};
+
+/** Assets stored as JSON, which can therefore be shown (and hand-edited) raw. */
+const JSON_SOURCE_EXTS = ["mat", "scene", "prefab", "entity", "anim", "timeline", "atlas", "cubemap", "audio"];
+
+/**
+ * Extensions with a dedicated section above. Anything else falls through to
+ * `GenericPreview` — which is the difference between an unrecognised file
+ * showing an empty panel and showing its facts plus what can be done with it.
+ */
+const KNOWN_EXTS = new Set([
+  ...TEXTURE_EXTENSIONS,
+  ...FONT_EXTENSIONS,
+  ...SCRIPT_EXTENSIONS,
+  ...AUDIO_EXTENSIONS,
+  ...JSON_SOURCE_EXTS,
+  "glb",
+  "geom",
+  "json",
+]);
+
+/** Local date/time for a mtime in seconds, or "" when unknown. */
+function formatDate(seconds) {
+  if (!seconds) return "";
+  return new Date(seconds * 1000).toLocaleString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
 
 /** Renames the asset (and its .meta sidecar), keeping it selected. */
 async function renameAsset(path, newStem) {
@@ -160,6 +274,8 @@ function TextureSettings({ path }) {
     try {
       await invoke("save_scene", { path: `${path}.meta`, contents: JSON.stringify(next, null, 2) });
       refreshMaterialsUsingTexture(path); // live-update materials using it
+      // Shipped as a sidecar — the live browser preview must rebuild too.
+      invalidateBlobUrl(`${path}.meta`);
     } catch (err) {
       console.error(`Failed to save settings: ${err}`);
     }
@@ -276,6 +392,7 @@ function MultiTextureSettings({ paths }) {
     await Promise.all(next.map(async ({ path, meta }) => {
       await invoke("save_scene", { path: `${path}.meta`, contents: JSON.stringify(meta, null, 2) });
       refreshMaterialsUsingTexture(path);
+      invalidateBlobUrl(`${path}.meta`);
     })).catch((error) => console.error(`Failed to save texture settings: ${error}`));
   };
   const select = (key, options) => {
@@ -551,6 +668,7 @@ function VirtualGeometrySettings({ path }) {
       await invoke("save_scene", { path: `${path}.meta`, contents: JSON.stringify(meta, null, 2) });
       const { refreshVirtualGeometryAsset } = await import("../../modules/virtual-geometry/index.js");
       refreshVirtualGeometryAsset(path); // live-update every open engine
+      invalidateBlobUrl(`${path}.meta`);
     } catch (err) {
       console.error(`Failed to save virtual geometry settings: ${err}`);
     }
@@ -637,6 +755,7 @@ function MultiVirtualGeometrySettings({ paths }) {
         const nextMeta = { ...meta, virtualGeometry: vg };
         await invoke("save_scene", { path: `${path}.meta`, contents: JSON.stringify(nextMeta, null, 2) });
         refreshVirtualGeometryAsset(path);
+        invalidateBlobUrl(`${path}.meta`);
       }));
     } catch (error) {
       console.error(`Failed to save virtual geometry settings: ${error}`);
@@ -789,6 +908,7 @@ function CubemapEditor({ path }) {
       .catch(() => {})
       .then(async () => {
         await invoke("save_scene", { path, contents: JSON.stringify(next, null, 2) });
+        invalidateBlobUrl(path);
         // Drop the decoded texture and re-apply scene settings so a skybox
         // built from this asset picks up the new face immediately. Resolve the
         // engine BEFORE disposing: an await between dispose and re-apply would
@@ -909,9 +1029,10 @@ function MaterialSummary({ path }) {
     defRef.current = next;
     setDef(next);
     updateMaterialPipeline(path, nextPipeline);
-    saveQueue.current = saveQueue.current.catch(() => {}).then(() =>
-      invoke("save_scene", { path, contents: JSON.stringify(next, null, 2) }),
-    ).catch((error) => console.error(`Failed to save material pipeline: ${error}`));
+    saveQueue.current = saveQueue.current.catch(() => {}).then(async () => {
+      await invoke("save_scene", { path, contents: JSON.stringify(next, null, 2) });
+      invalidateBlobUrl(path);
+    }).catch((error) => console.error(`Failed to save material pipeline: ${error}`));
   };
 
   const toggle = (key, label, title) => (
@@ -1104,6 +1225,139 @@ function PrefabSummary({ path }) {
  * explicit "on demand" resting state keeps that legible instead of hiding it
  * behind a pair of unrelated checkboxes.
  */
+/**
+ * Audition an audio asset without leaving the Inspector.
+ *
+ * A bare `<audio controls>` would have been one line, and it's the wrong answer:
+ * it renders the browser's chrome (which matches nothing else in the editor),
+ * and it shows a scrub bar with no waveform — so you can't see where the sound
+ * actually is, which is the one thing you want when checking whether a file is
+ * the footstep you meant. This decodes through the same core the Audio Editor
+ * uses and draws the real peaks, so what you see here and there agree.
+ *
+ * Decoding is the expensive part, so it happens once per path and is abandoned
+ * cleanly if the selection changes mid-decode.
+ */
+/**
+ * How big a sound may be before the Inspector stops drawing its waveform.
+ *
+ * Decoding is *expensive in a way that is not obvious from the file size*.
+ * Getting a waveform for a 55 MB FLAC means holding, at the same moment: the
+ * raw bytes, a copy of them (decodeAudioData detaches the buffer it is given),
+ * the decoded AudioBuffer — 3 minutes of 48 kHz stereo float is ~70 MB — and,
+ * previously, another full copy of that as Float32Arrays. Next to a WebGPU
+ * renderer that is enough to run the tab out of memory and take the editor with
+ * it, which is exactly what happened.
+ *
+ * Past this size the preview still plays and still reports duration (the media
+ * element knows both); it just doesn't draw. The Audio Editor is where a long
+ * file gets opened properly.
+ */
+const PREVIEW_DECODE_LIMIT = 24 * 1024 * 1024;
+
+function AudioPreview({ path }) {
+  const [info, setInfo] = useState(null);
+  const [error, setError] = useState(null);
+  const [src, setSrc] = useState(null);
+
+  useEffect(() => {
+    let live = true;
+    setInfo(null);
+    setError(null);
+    setSrc(null);
+    (async () => {
+      try {
+        // The blob URL is what plays; it's cheap and independent of decoding.
+        const url = await toBlobUrl(path);
+        if (!live) return;
+        setSrc(url);
+
+        const raw = await invoke("read_binary_file", { path });
+        if (!live) return;
+        const bytes = raw instanceof ArrayBuffer ? new Uint8Array(raw) : new Uint8Array(raw);
+
+        // Measured from the bytes we already hold, deliberately NOT from a
+        // `file_size` round trip: reading is cheap (one buffer) and decoding is
+        // what costs, so the check belongs after the read and before the decode.
+        // Asking the backend for a size would also make this silently
+        // unenforceable anywhere that command isn't available — which is exactly
+        // how the first version of this cap failed to fire.
+        if (bytes.byteLength > PREVIEW_DECODE_LIMIT) {
+          setInfo({ peaks: null, tooLarge: true, sizeMb: bytes.byteLength / 1048576 });
+          return;
+        }
+
+        const { decodeAudioBytes } = await import("../audio/decode.js");
+        const pcm = await decodeAudioBytes(bytes);
+        if (!live) return;
+
+        const { buildPeaks } = await import("../audio/peaks.js");
+        const { peak } = await import("../audio/pcm.js");
+        const peaks = buildPeaks(pcm);
+        const level = peak(pcm);
+        const frames = pcm.channels[0]?.length ?? 0;
+        // Keep the summary, drop the samples. `peaks` is well under 1% of the
+        // decoded audio, and the Inspector only ever draws the whole file at
+        // once — the zoomed-in path that would need real samples belongs to the
+        // Audio Editor. Holding `pcm` here was tens of megabytes retained for
+        // a 52-pixel-tall drawing.
+        setInfo({
+          peaks,
+          sampleRate: pcm.sampleRate,
+          channels: pcm.channels.length,
+          seconds: frames / pcm.sampleRate,
+          peakDb: level > 0 ? 20 * Math.log10(level) : null,
+          clipping: level > 1,
+        });
+      } catch (err) {
+        if (live) setError(err.message ?? String(err));
+      }
+    })();
+    return () => {
+      live = false;
+    };
+  }, [path]);
+
+  return (
+    <div className="inspector-section audio-preview">
+      <div className="inspector-section-title">Preview</div>
+      {error ? (
+        <div className="audio-preview-error">{error}</div>
+      ) : (
+        <>
+          {/* The same control the Audio Library rows use, sharing one player —
+              auditioning a search result stops this, and vice versa. */}
+          <AudioScrubber
+            id={`asset:${path}`}
+            src={src}
+            peaks={info?.peaks ?? null}
+            duration={info?.seconds ?? 0}
+            variant="block"
+            disabled={!src}
+          />
+          <div className="audio-preview-row">
+            <span className="audio-preview-meta">
+              {info?.tooLarge
+                ? `${info.sizeMb.toFixed(0)} MB — too large to draw here; open it in the Audio Editor`
+                : info
+                  ? `${info.sampleRate} Hz · ${info.channels === 1 ? "mono" : `${info.channels}ch`}${
+                      info.peakDb != null ? ` · peak ${info.peakDb.toFixed(1)} dB` : ""
+                    }${info.clipping ? " · CLIPPING" : ""}`
+                  : "Decoding…"}
+            </span>
+          </div>
+          <button
+            className="toolbar-btn wide"
+            onClick={() => import("../openAsset.js").then((m) => m.openAssetPath(path))}
+          >
+            Open in Audio Editor
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
 function AssetSettingsSection({ paths }) {
   // Select the map, not a derived array: a selector that builds a new array on
   // every call gives useSyncExternalStore a different snapshot each render and
@@ -1196,11 +1450,610 @@ function AssetSettingsSection({ paths }) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Cross-type sections: file facts and the action list
+// ---------------------------------------------------------------------------
+
+/**
+ * Size and last-modified, for any file.
+ *
+ * Trivial, and it was missing from every asset type — so the Inspector could
+ * not answer "is this the 4K version or the 1K one" or "did my import actually
+ * overwrite it", both of which are questions you ask of the Inspector because
+ * that is where an asset's facts are supposed to live.
+ */
+function FileFacts({ path }) {
+  const [facts, setFacts] = useState(null);
+  useEffect(() => {
+    let live = true;
+    setFacts(null);
+    Promise.all([
+      invoke("file_size", { path }).catch(() => null),
+      invoke("stat_file", { path }).catch(() => null),
+    ]).then(([size, modified]) => live && setFacts({ size, modified }));
+    return () => {
+      live = false;
+    };
+  }, [path]);
+  if (!facts?.size && !facts?.modified) return null;
+  return (
+    <div className="asset-facts">
+      {facts.size != null && <span>{formatBytes(facts.size)}</span>}
+      {facts.modified ? <span>{formatDate(facts.modified)}</span> : null}
+    </div>
+  );
+}
+
+/**
+ * Everything you can do with this asset, spelled out.
+ *
+ * The old Inspector had a scattering of one-off buttons — "Open Shader Graph"
+ * on materials, "Open Prefab" on prefabs — and nothing at all on half the
+ * types, so the answer to "what can I do with a `.timeline`?" was to right-
+ * click in a different panel and hope. Listing the actions with a sentence
+ * each turns the Inspector into the place that answers that, which is what
+ * someone selecting an unfamiliar file is asking.
+ *
+ * Actions that can't run right now (assign-to-selection with nothing selected)
+ * are shown disabled with the reason, rather than hidden: a control that
+ * appears and disappears teaches nothing about why.
+ */
+function AssetActionsSection({ path }) {
+  const [visible, setVisible] = useState([]);
+  const [running, setRunning] = useState(null);
+  // Subscribing to the entity selection is what keeps "Assign to Selected"
+  // enabling itself the moment something is clicked in the viewport.
+  const selectedIds = useSelectionStore((state) => state.ids);
+
+  useEffect(() => {
+    let live = true;
+    (async () => {
+      const actions = assetActions(path);
+      const allowed = [];
+      for (const action of actions) {
+        // `available` is async because some checks (is this text-editable, is
+        // the Draco module on) live behind a lazy import we don't want in the
+        // boot graph.
+        if (action.available && !(await action.available())) continue;
+        allowed.push(action);
+      }
+      if (live) setVisible(allowed);
+    })();
+    return () => {
+      live = false;
+    };
+  }, [path]);
+
+  if (!visible.length) return null;
+
+  const run = async (action) => {
+    setRunning(action.id);
+    try {
+      await action.run();
+    } catch (error) {
+      console.error(`${action.label} failed: ${error?.message ?? error}`);
+    } finally {
+      setRunning(null);
+    }
+  };
+
+  return (
+    <div className="inspector-section asset-actions">
+      <div className="section-header">Actions</div>
+      {visible.map((action) => {
+        const Icon = ACTION_ICONS[action.icon] ?? ChevronRight;
+        const enabled = action.enabled ? action.enabled() : true;
+        return (
+          <button
+            key={action.id}
+            className={`asset-action${action.primary ? " primary" : ""}${action.danger ? " danger" : ""}`}
+            disabled={!enabled || running === action.id}
+            onClick={() => run(action)}
+            title={enabled ? action.hint : `${action.hint} (select an entity first)`}
+          >
+            <Icon size={14} className="asset-action-icon" />
+            <span className="asset-action-text">
+              <span className="asset-action-label">{action.label}</span>
+              <span className="asset-action-hint">{action.hint}</span>
+            </span>
+          </button>
+        );
+      })}
+      {!selectedIds.length && visible.some((action) => action.enabled) && (
+        <div className="asset-hint">Some actions need an entity selected in the scene.</div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * A collapsible raw-source view for anything the code editor can render.
+ *
+ * Offered on JSON-backed assets (`.mat`, `.scene`, `.atlas`, `.meta`) because
+ * they are readable, occasionally need a hand edit, and the alternative was
+ * launching an external editor. Collapsed by default — Monaco is several
+ * megabytes, so nothing loads until it is opened.
+ */
+function SourceSection({ path, label = "Source", defaultOpen = false }) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <div className="inspector-section">
+      <button className={`section-header toggle${open ? " open" : ""}`} onClick={() => setOpen(!open)}>
+        <ChevronRight size={12} className="section-chevron" />
+        {label}
+      </button>
+      {open && (
+        <div className="asset-source">
+          {/* Keyed by section rather than by file: how tall you want a raw-JSON
+              pane is a property of the job, not of the particular `.mat` open
+              at the time, and a per-file size would mean re-dragging it for
+              every asset. */}
+          <CodeEditor path={path} height={260} compact toolbar resizable storageKey="inspector-source" />
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Script assets
+// ---------------------------------------------------------------------------
+
+/** Rough facts about a script, read from its text without compiling it. */
+function summarizeScript(text) {
+  const lines = text.split("\n");
+  const className = /export\s+default\s+class\s+([A-Za-z0-9_$]+)/.exec(text)?.[1] ?? null;
+  const extendsScript = /class\s+[A-Za-z0-9_$]+\s+extends\s+Script\b/.test(text);
+  const attributes = [...text.matchAll(/@attribute\s*\(([^)]*)\)\s*\n?\s*([A-Za-z0-9_$]+)/g)].map(
+    (match) => match[2],
+  );
+  const hooks = ["onStart", "onUpdate", "onFixedUpdate", "onDestroy", "onEnable", "onDisable"].filter(
+    (hook) => new RegExp(`\\b${hook}\\s*\\(`).test(text),
+  );
+  return { lines: lines.length, className, extendsScript, attributes, hooks };
+}
+
+/**
+ * A script, editable in place.
+ *
+ * The Inspector is where you land after clicking a file, and for a script the
+ * only useful thing to show there is the code — which meant, until now, a
+ * button that opened a different application. The editor is the real one
+ * (autocompletion against `engine.d.ts`, diagnostics, formatting), just short:
+ * the Inspector column is 320px, so it's for reading and small fixes, and the
+ * Code panel is one click away when the edit gets real.
+ */
+function ScriptInspector({ path }) {
+  const [facts, setFacts] = useState(null);
+  useEffect(() => {
+    let live = true;
+    setFacts(null);
+    invoke("read_text_file", { path })
+      .then((text) => live && setFacts(summarizeScript(text)))
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [path]);
+
+  return (
+    <>
+      {facts && (
+        <div className="inspector-section">
+          <div className="section-header">Script</div>
+          <div className="asset-info-row">
+            {facts.className ? `class ${facts.className}` : "No default-exported class"}
+            {" · "}
+            {facts.lines} lines
+          </div>
+          {facts.className && !facts.extendsScript && (
+            <div className="asset-hint warn">
+              This class doesn't extend <code>Script</code>, so the engine can't attach it to an entity.
+            </div>
+          )}
+          {facts.hooks.length > 0 && (
+            <div className="asset-info-row">Hooks: {facts.hooks.join(", ")}</div>
+          )}
+          {facts.attributes.length > 0 && (
+            <div className="asset-info-row">
+              Inspector fields: {facts.attributes.join(", ")}
+            </div>
+          )}
+        </div>
+      )}
+      <div className="inspector-section asset-code">
+        <div className="section-header">Code</div>
+        <CodeEditor path={path} height={320} compact resizable storageKey="inspector-script" />
+      </div>
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Fonts
+// ---------------------------------------------------------------------------
+
+/** Sample lines a specimen shows, from headline down to body. */
+const SPECIMEN_SIZES = [32, 22, 16, 12];
+
+/**
+ * A font specimen plus everything the file declares about itself.
+ *
+ * A font asset has no visual thumbnail worth the name — the only useful
+ * preview is the alphabet, at several sizes, in the actual face. The metadata
+ * underneath answers the questions you can't answer by looking: does it have
+ * the glyphs my localisation needs, is it hinted, and — the one that matters
+ * before shipping — does its embedding permission allow it in a build.
+ */
+function FontPreview({ path }) {
+  const [state, setState] = useState(null);
+  const [error, setError] = useState(null);
+  const [sample, setSample] = useState("Sphinx of black quartz, judge my vow");
+
+  useEffect(() => {
+    let live = true;
+    setState(null);
+    setError(null);
+    import("../../engine/ui/fontAsset.js")
+      .then(({ ensureFontLoaded }) => ensureFontLoaded(path))
+      .then((entry) => live && setState(entry))
+      .catch((err) => live && setError(String(err?.message ?? err)));
+    return () => {
+      live = false;
+    };
+  }, [path]);
+
+  const meta = state?.meta ?? null;
+  const family = state?.loaded ? `"${state.family}"` : "inherit";
+
+  return (
+    <>
+      <div className="asset-preview font-preview">
+        {error ? (
+          <div className="asset-hint">Can't load this font: {error}</div>
+        ) : (
+          <>
+            <div className="font-specimen-alphabet" style={{ fontFamily: family }}>
+              ABCDEFGHIJKLMNOPQRSTUVWXYZ
+              <br />
+              abcdefghijklmnopqrstuvwxyz
+              <br />
+              0123456789 &amp;.,;:!? @#$%
+            </div>
+            {SPECIMEN_SIZES.map((size) => (
+              <div key={size} className="font-specimen-line" style={{ fontFamily: family, fontSize: size }}>
+                {sample || "The quick brown fox"}
+              </div>
+            ))}
+          </>
+        )}
+      </div>
+      <div className="inspector-section">
+        <div className="field-row">
+          <span className="field-label">Sample</span>
+          <input
+            className="text-field"
+            type="text"
+            value={sample}
+            onChange={(event) => setSample(event.target.value)}
+          />
+        </div>
+      </div>
+      {meta && (
+        <div className="inspector-section">
+          <div className="section-header">Font</div>
+          {state.displayName && <div className="asset-info-row">{state.displayName}</div>}
+          {meta.readable ? (
+            <>
+              {meta.subfamily && (
+                <div className="asset-info-row">
+                  {meta.subfamily}
+                  {meta.weight ? ` · weight ${meta.weight}` : ""}
+                  {meta.width && meta.width !== "normal" ? ` · ${meta.width}` : ""}
+                  {meta.italic ? " · italic" : ""}
+                </div>
+              )}
+              <div className="asset-info-row">
+                {meta.glyphs != null ? `${meta.glyphs.toLocaleString()} glyphs` : ""}
+                {meta.codepoints != null ? ` · ${meta.codepoints.toLocaleString()} codepoints` : ""}
+                {meta.unitsPerEm ? ` · ${meta.unitsPerEm} upem` : ""}
+              </div>
+              <div className="asset-info-row">
+                {[
+                  meta.outlines,
+                  meta.variable ? "variable" : null,
+                  meta.monospaced ? "monospaced" : null,
+                  meta.hinted ? "hinted" : null,
+                  meta.kerning ? "kerning" : null,
+                  meta.colorGlyphs ? "colour glyphs" : null,
+                ]
+                  .filter(Boolean)
+                  .join(" · ")}
+              </div>
+              {meta.coverage?.length > 0 && (
+                <>
+                  <div className="asset-info-label">Scripts covered</div>
+                  <div className="font-coverage">
+                    {meta.coverage.map((block) => (
+                      <span className="font-coverage-chip" key={block}>
+                        {block}
+                      </span>
+                    ))}
+                  </div>
+                </>
+              )}
+              {meta.embedding && (
+                <div className={`asset-hint${meta.embeddable ? "" : " warn"}`}>
+                  {meta.embeddable
+                    ? `Embedding: ${meta.embedding} — this font may ship inside a build.`
+                    : "Embedding: restricted — the licence in this file forbids shipping it inside a game. Check with the foundry before building."}
+                </div>
+              )}
+              {meta.designer && <div className="asset-info-row">Designed by {meta.designer}</div>}
+              {meta.license && <div className="asset-info-row license">{meta.license.slice(0, 220)}</div>}
+              {meta.licenseUrl && (
+                <div className="asset-info-row">
+                  <a href={meta.licenseUrl} target="_blank" rel="noreferrer">
+                    {meta.licenseUrl}
+                  </a>
+                </div>
+              )}
+            </>
+          ) : (
+            <div className="asset-hint">
+              {meta.format === "woff2"
+                ? "WOFF2 files are compressed in a way that hides their metadata — the font works, but its name, licence and glyph coverage can't be read here. Import the TTF or OTF if you need those."
+                : "This file's tables couldn't be read, so only the preview is available."}
+            </div>
+          )}
+          <div className="asset-info-row css-family" title="The CSS family name to use in a script or a canvas">
+            family: {state.family}
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Scenes, timelines, atlases, geometry
+// ---------------------------------------------------------------------------
+
+function SceneSummary({ path }) {
+  const mainScene = useProjectStore((state) => state.projectMeta?.mainScene ?? "");
+  const rootPath = useProjectStore((state) => state.rootPath ?? "");
+  const relative = path.replaceAll("\\", "/").replace(`${rootPath.replaceAll("\\", "/")}/`, "");
+  const isMain = mainScene && mainScene.replaceAll("\\", "/") === relative;
+  return (
+    <JsonSummary
+      path={path}
+      render={(scene) => {
+        const entities = scene.entities ?? [];
+        const componentCounts = new Map();
+        for (const entity of entities) {
+          for (const type of Object.keys(entity.components ?? {})) {
+            componentCounts.set(type, (componentCounts.get(type) ?? 0) + 1);
+          }
+        }
+        const top = [...componentCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 6);
+        return (
+          <div className="inspector-section">
+            <div className="section-header">Scene</div>
+            <div className="asset-info-row">
+              <Layers size={13} /> {entities.length} {entities.length === 1 ? "entity" : "entities"}
+              {isMain ? " · main scene" : ""}
+            </div>
+            {top.length > 0 && (
+              <>
+                <div className="asset-info-label">Components used</div>
+                {top.map(([type, count]) => (
+                  <div className="asset-info-row" key={type}>
+                    {type} × {count}
+                  </div>
+                ))}
+              </>
+            )}
+            {scene.settings?.environment?.cubemap && (
+              <div className="asset-info-row">Skybox: {fileName(scene.settings.environment.cubemap)}</div>
+            )}
+          </div>
+        );
+      }}
+    />
+  );
+}
+
+function TimelineSummary({ path }) {
+  return (
+    <JsonSummary
+      path={path}
+      render={(def) => {
+        const tracks = def.tracks ?? [];
+        const byKind = new Map();
+        for (const track of tracks) byKind.set(track.type, (byKind.get(track.type) ?? 0) + 1);
+        return (
+          <div className="inspector-section">
+            <div className="section-header">Timeline</div>
+            <div className="asset-info-row">
+              {tracks.length} {tracks.length === 1 ? "track" : "tracks"}
+              {def.duration ? ` · ${Number(def.duration).toFixed(2)}s` : ""}
+              {def.frameRate ? ` · ${def.frameRate} fps` : ""}
+            </div>
+            {[...byKind.entries()].map(([kind, count]) => (
+              <div className="asset-info-row" key={kind}>
+                {kind} × {count}
+              </div>
+            ))}
+          </div>
+        );
+      }}
+    />
+  );
+}
+
+/**
+ * A sprite atlas over its sheet, with the regions drawn on top.
+ *
+ * The regions are the whole content of the asset, and a list of names and
+ * numbers does not tell you whether they line up with the artwork — which is
+ * the only thing anyone checks an atlas for.
+ */
+function AtlasPreview({ path }) {
+  const [state, setState] = useState(null);
+  useEffect(() => {
+    let live = true;
+    setState(null);
+    (async () => {
+      try {
+        const { readAtlas } = await import("../atlasFile.js");
+        const def = await readAtlas(path);
+        const image = def.image ? await toBlobUrl(def.image).catch(() => null) : null;
+        if (live) setState({ def, image });
+      } catch (error) {
+        if (live) setState({ error: String(error?.message ?? error) });
+      }
+    })();
+    return () => {
+      live = false;
+    };
+  }, [path]);
+
+  if (!state) return null;
+  if (state.error) return <div className="asset-hint">Can't read this atlas: {state.error}</div>;
+  const regions = state.def.regions ?? [];
+  const [sheetW, sheetH] = state.def.size ?? [0, 0];
+
+  return (
+    <>
+      <div className="asset-preview atlas-preview">
+        {state.image ? (
+          <div className="atlas-preview-frame">
+            <img src={state.image} alt="" draggable={false} />
+            {/* Regions are `[x, y, w, h]` in image space; percentages of the
+                sheet let the overlay follow the image however it is scaled to
+                fit the 320px column. Skipped entirely when the atlas has no
+                recorded sheet size, since every rect would land at 0. */}
+            {sheetW > 0 &&
+              sheetH > 0 &&
+              regions.map((region) => {
+                const [x, y, w, h] = region.rect;
+                return (
+                  <span
+                    key={region.name}
+                    className="atlas-preview-region"
+                    title={`${region.name} — ${w}×${h}`}
+                    style={{
+                      left: `${(x / sheetW) * 100}%`,
+                      top: `${(y / sheetH) * 100}%`,
+                      width: `${(w / sheetW) * 100}%`,
+                      height: `${(h / sheetH) * 100}%`,
+                    }}
+                  />
+                );
+              })}
+          </div>
+        ) : (
+          <div className="asset-hint">No sheet assigned yet.</div>
+        )}
+      </div>
+      <div className="inspector-section">
+        <div className="section-header">Atlas</div>
+        <div className="asset-info-row">
+          {regions.length} {regions.length === 1 ? "region" : "regions"}
+          {state.def.animations?.length ? ` · ${state.def.animations.length} animations` : ""}
+          {sheetW ? ` · sheet ${sheetW}×${sheetH}` : ""}
+        </div>
+        {state.def.image && <div className="asset-info-row">Sheet: {fileName(state.def.image)}</div>}
+      </div>
+    </>
+  );
+}
+
+/**
+ * A `.geom` thumbnail plus its counts.
+ *
+ * Reuses the Assets panel's cached thumbnail renderer rather than standing up
+ * a second WebGPU context in the Inspector — one offscreen renderer for the
+ * whole app was a deliberate choice there (see `geometryThumb.js`), and a
+ * second one here would double the GPU cost of clicking through a folder.
+ */
+function GeometryPreview({ path }) {
+  const [url, setUrl] = useState(null);
+  const [info, setInfo] = useState(null);
+  useEffect(() => {
+    let live = true;
+    setUrl(null);
+    setInfo(null);
+    import("../geometryThumb.js")
+      .then((m) => m.requestGeometryThumb(path))
+      .then((value) => live && setUrl(value))
+      .catch(() => {});
+    invoke("read_text_file", { path })
+      .then((text) => {
+        const def = JSON.parse(text);
+        if (!live) return;
+        const positions = def.attributes?.position?.length ?? def.positions?.length ?? 0;
+        setInfo({
+          vertices: Math.round(positions / 3),
+          triangles: Math.round((def.index?.length ?? positions / 3) / 3),
+          groups: def.groups?.length ?? 0,
+        });
+      })
+      // Binary `.geom` v2 files aren't JSON — the thumbnail still renders, and
+      // counts are a bonus rather than the point.
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [path]);
+  return (
+    <>
+      <div className="asset-preview geometry-preview">
+        {url ? <img src={url} alt="" draggable={false} /> : <div className="asset-hint">Rendering…</div>}
+      </div>
+      {info && (
+        <div className="inspector-section">
+          <div className="section-header">Geometry</div>
+          <div className="asset-info-row">
+            {info.vertices.toLocaleString()} vertices · {info.triangles.toLocaleString()} triangles
+            {info.groups ? ` · ${info.groups} material groups` : ""}
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+/**
+ * The fallback: a file the Inspector has nothing specific to say about.
+ *
+ * Still gets a name, a size, tags, build flags and the shared actions — which
+ * is more than the old Inspector gave a `.txt`, a `.hdr` or an unrecognised
+ * import, all of which used to render an empty panel that looked broken.
+ */
+function GenericPreview({ path, ext }) {
+  return (
+    <div className="inspector-section">
+      <div className="section-header">File</div>
+      <div className="asset-hint">
+        No dedicated editor for <code>.{ext || "?"}</code> files. It's still part of the project — tag it,
+        control whether it ships, and open it with whatever your OS uses for it.
+      </div>
+    </div>
+  );
+}
+
 export function AssetInspector({ path }) {
   const assetPaths = useSelectionStore((state) => state.assetPaths);
   if (assetPaths.length > 1) return <MultiAssetInspector paths={assetPaths} />;
   const ext = extOf(path);
   const isTexture = TEXTURE_EXTENSIONS.includes(ext);
+  const isFont = FONT_EXTENSIONS.includes(ext);
+  const isScript = SCRIPT_EXTENSIONS.includes(ext);
+  // `.audio` is the import-settings sidecar, not samples — there is nothing to
+  // play, so it takes the generic path rather than the waveform.
+  const isAudio = AUDIO_EXTENSIONS.includes(ext) && ext !== "audio";
+  const isUnknown = !KNOWN_EXTS.has(ext);
 
   return (
     <div className="inspector-panel">
@@ -1223,34 +2076,37 @@ export function AssetInspector({ path }) {
         <div className="asset-inspector-path" title={path}>
           {path}
         </div>
-        {["js", "ts"].includes(ext) && (
-          <button
-            className="toolbar-btn wide"
-            onClick={() => openInIDE(path)}
-          >
-            <ExternalLink size={13} />
-            Open in IDE
-          </button>
-        )}
+        <FileFacts path={path} />
       </div>
-      <AssetSettingsSection paths={[path]} />
-      {isTexture && (
-        <>
-          <TexturePreview path={path} />
-          <TextureSettings path={path} />
-        </>
-      )}
-      {ext === "glb" && (
-        <>
-          <ModelPreview path={path} />
-          <VirtualGeometrySettings path={path} />
-        </>
-      )}
-      {ext === "geom" && <VirtualGeometrySettings path={path} />}
-      {ext === "mat" && <MaterialSummary path={path} />}
+
+      {/* Preview first, then what you can do with it, then its settings. That
+          order matches how someone reads an unfamiliar asset: see it, learn
+          what it's for, then tune it. */}
+      {isTexture && <TexturePreview path={path} />}
+      {ext === "glb" && <ModelPreview path={path} />}
+      {ext === "geom" && <GeometryPreview path={path} />}
+      {isFont && <FontPreview path={path} />}
+      {ext === "atlas" && <AtlasPreview path={path} />}
       {ext === "cubemap" && <CubemapEditor path={path} />}
+      {isAudio && <AudioPreview path={path} />}
+      {ext === "scene" && <SceneSummary path={path} />}
+      {ext === "timeline" && <TimelineSummary path={path} />}
+      {ext === "mat" && <MaterialSummary path={path} />}
       {ext === "anim" && <AnimatorSummary path={path} />}
       {(ext === "prefab" || ext === "entity") && <PrefabSummary path={path} />}
+      {isScript && <ScriptInspector path={path} />}
+      {isUnknown && <GenericPreview path={path} ext={ext} />}
+
+      <AssetActionsSection path={path} />
+      <AssetSettingsSection paths={[path]} />
+
+      {isTexture && <TextureSettings path={path} />}
+      {(ext === "glb" || ext === "geom") && <VirtualGeometrySettings path={path} />}
+      {/* JSON-backed assets get their raw form, collapsed. Everything here is
+          authored through a proper editor, but being able to look — and fix a
+          hand-editable field — without launching another app is the point. */}
+      {JSON_SOURCE_EXTS.includes(ext) && <SourceSection path={path} label="Raw JSON" />}
+      {ext === "json" && <SourceSection path={path} label="JSON" defaultOpen />}
     </div>
   );
 }

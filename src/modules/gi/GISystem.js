@@ -16,11 +16,11 @@
 // lights + promoted emissive emitters (uniform slots, zero rebakes), and
 // the GICascadeLight material injection.
 import * as THREE from "three/webgpu";
-import { cameraPosition, cos, float, fract, instanceIndex, mix, normalWorld, positionLocal, positionWorld, renderGroup, screenCoordinate, screenUV, select, sin, smoothstep, texture, uniform, vec2, vec3, vec4 } from "three/tsl";
+import { If, cameraPosition, cos, float, fract, instanceIndex, mix, normalWorld, positionLocal, positionWorld, renderGroup, screenCoordinate, screenUV, select, sin, smoothstep, texture, uniform, vec2, vec3, vec4 } from "three/tsl";
 import { createRadianceCascades } from "./cascadeTrace.js";
 import { createCascadeMerge } from "./cascadeMerge.js";
 import { createBounceFeedback, createIrradianceGather, createProbeDepthMoments, createProbeIrradiance, createRadianceLookup, depthMomentsAlpha, gatherBias, gatherViewBias, probeSnapAlpha } from "./cascadeGather.js";
-import { blitBvhAtlasTiles, createGiBvhReflect, createGiBvhTarget, createGiGBuffer, createGiLightShadowFilterPass, createGiLightShadowHistoryPass, createGiLightShadowPass, createGiResolve, createGiTargets, renderGiGBuffer } from "./giScreen.js";
+import { blitBvhAtlasTiles, createGiBvhReflect, createGiBvhTarget, createGiEmitterShadowPass, createGiGBuffer, createGiLightShadowFilterPass, createGiLightShadowHistoryPass, createGiLightShadowPass, createGiLightShadowWidePass, createGiResolve, createGiTargets, renderGiGBuffer } from "./giScreen.js";
 import { resolveMaterialSurface, serializeMeshForBake } from "./voxelizeOnce.js";
 import { createOccupancyDebugMaterial, createSdfDebugMaterial, createGiField } from "./giField.js";
 import { createOccupancyField, describeOccupancyField, quantizeOccupancyRes } from "./occupancyField.js";
@@ -884,12 +884,25 @@ export class GISystem {
         globalThis.__giNoJitter === true ? 0 : globalThis.__giSunJitter ?? 0;
       state.shadowJitter.penAngle.value = globalThis.__giSunAngle ?? 0.025;
     }
+    // Live lift A/B for the wall-leak question (`__giShadowLift`, voxels;
+    // default 1.5 = shipped behaviour). Outside the temporal block below
+    // because the analytic-width arm builds no temporal uniforms yet still
+    // owns a lift.
+    if (state.screen?.lightShadow?.liftFactor) {
+      state.screen.lightShadow.liftFactor.value = globalThis.__giShadowLift ?? 1.5;
+    }
+    // Wide-penumbra pass camera (viewDist for the world→texel radius map).
+    if (this._giShadowWideCamU && this.engine.camera) {
+      this.engine.camera.getWorldPosition(this._giShadowWideCamU.value);
+    }
     // Shadow-channel temporal accumulation inputs (see the filter pass):
     // the animated sun-disc jitter frame, the PREVIOUS camera view-projection
     // for reprojection, and the history weight — zeroed while any light is
     // moving (a rotating sun makes every pixel's history semantically stale;
     // position validation can't see that, so the system flushes instead —
     // grain during rotation, converges the moment it stops).
+    // (Analytic-width arm: `_giShadowFrameU` is never created, the whole
+    // block compiles out of the frame — no motion tracking, no phase.)
     if (state.screen?.lightShadowPass && this._giShadowFrameU) {
       const camera = this.engine.camera;
       if (camera) {
@@ -948,11 +961,6 @@ export class GISystem {
       this._giShadowHistWeightU.value = temporalOn
         ? Math.min(0.94, Math.max(0.86, 0.94 - motion * 30))
         : 0;
-      // Live lift A/B for the wall-leak question (`__giShadowLift`, voxels;
-      // default 1.5 = shipped behaviour).
-      if (state.screen.lightShadow?.liftFactor) {
-        state.screen.lightShadow.liftFactor.value = globalThis.__giShadowLift ?? 1.5;
-      }
     }
     // Receiver-gather surface bias (fractions of a probe cell — normal and
     // toward-camera components, see cascadeGather.gatherBias). Defaults
@@ -1332,11 +1340,19 @@ export class GISystem {
       if (idle) {
         frameQueue = state.screen?.resolve?.compute
           ? [
+              // Emitter shadows are camera-dependent too (screen-space
+              // texture) and the resolve consumes them — before it.
+              ...(state.screen.emitterShadowPass
+                ? [state.screen.emitterShadowPass.compute, state.screen.emitterShadowFilterPass.compute]
+                : []),
               state.screen.resolve.compute,
               // The shadow pass is camera-dependent like the resolve — an
               // idle-frozen shadow texture would lag every camera move.
               ...(state.screen.lightShadowPass ? [state.screen.lightShadowPass.compute] : []),
               ...(state.screen.lightShadowFilterPass ? [state.screen.lightShadowFilterPass.compute] : []),
+              ...(state.screen.lightShadowWidePass
+                ? [state.screen.lightShadowWidePass.compute, state.screen.lightShadowWidePass2.compute]
+                : []),
               ...(state.screen.lightShadowHistoryPass ? [state.screen.lightShadowHistoryPass.compute] : []),
               ...(state.screen.lightShadowPostPass ? [state.screen.lightShadowPostPass.compute] : []),
               ...debugExtra,
@@ -1819,15 +1835,19 @@ export class GISystem {
       }
       return null;
     }
-    // PCSS blocker-distance channel — OFF by default since the cone march
-    // landed. The screen-space disc blurred a single-ray binary verdict, and
-    // partial-sun visibility that was never computed cannot be filtered into
-    // existence: at wide angles it read as ghosted blobs (user-rejected,
-    // twice) while burning 16 scattered full-res fetches per lit pixel in
-    // every material. The cone-DDA returns transmittance that is ALREADY the
-    // penumbra, so the disc has nothing left to add. `__giPcssDisc = true`
-    // resurrects it (build-time) for an A/B against the cone arm.
-    const pcss = globalThis.__giPcssDisc === true && limit >= used + 2;
+    // PCSS blocker-distance channel — DEFAULT ON since the analytic-width
+    // arm became the default (2026-08-06; plan §5 named it the default-on
+    // candidate "once its input stops boiling"). The min-ratio width term
+    // only softens the MISS side of a silhouette: the central-ray hit
+    // boundary stays binary, which reads as a hard edge INSIDE the smoothed
+    // penumbra at large source angles (user screenshot, sourceAngle ~30°).
+    // The disc reconstructs width symmetrically from the trace's blocker
+    // distance — deterministic width at the sampling end, i.e. the same
+    // move as the width probe — and its historical rejection was about the
+    // stochastic arm's boiling input, not the disc. `__giPcssDisc = false`
+    // disables (build-time); devices without storage-texture headroom for
+    // the dist target skip it exactly as before.
+    const pcss = globalThis.__giPcssDisc !== false && limit >= used + 2;
     const steps =
       Number(globalThis.__giDirectShadowSteps) ||
       ({ low: 96, medium: 128, high: 160, ultra: 192 }[quality] ?? 160);
@@ -1842,6 +1862,21 @@ export class GISystem {
       shadowMode >= RayHitMode.HybridPlane &&
       shadowMode <= RayHitMode.HybridExactComplex &&
       globalThis.__giLightShadowLegacyDda !== true;
+    // ANALYTIC-WIDTH ARM (docs/GI_SHADOWS_PLAN.md §5) — THE DEFAULT since
+    // 2026-08-06 (user call): the deterministic soft-shadow estimator.
+    // Admission stays with the march (records/DDA, unchanged); softness
+    // comes from multiplying in the mid-field width probe — min k·D/t over
+    // ~12 trilinear distanceTexture taps (see giField createWidthProbeFn) —
+    // instead of from the stochastic sun-disc jitter + temporal repair
+    // chain. Downstream, this arm traces the CENTRAL ray only (no disc
+    // sample), and #buildScreenResolve skips the whole temporal machinery:
+    // each frame is already the converged answer, which is what makes the
+    // shadow track a dragged sun at full sharpness with zero grain.
+    // `__giShadowAnalyticWidth = false` (build-time) restores the stochastic
+    // sun-disc + temporal arm for A/B — it remains the reference instrument
+    // (256-frame static accumulation is unbiased ground truth).
+    const analyticWidth = globalThis.__giShadowAnalyticWidth !== false;
+    const widthProbe = analyticWidth ? volume.createWidthProbe?.() : null;
     // 1.5 OCCUPANCY VOXELS of ray lift — a node, not a number, so an in-place
     // refit rescales it with the pyramid. See the resolve's own comment for
     // why the gather's normalOffset is the wrong scale here. The factor is a
@@ -1853,10 +1888,13 @@ export class GISystem {
     const lift = voxMax.mul(liftFactor);
     return {
       liftFactor,
+      analyticWidth,
       marcher: globalThis.__giLightShadowSphere === true
         ? "sphere"
         : (recordMarch ? `records (${rayHitModeName(shadowMode)})` : "voxel-dda") +
-          (globalThis.__giConeShadowDensity === true ? " + density-cone" : " + sun-disc"),
+          (analyticWidth
+            ? " + analytic-width"
+            : globalThis.__giConeShadowDensity === true ? " + density-cone" : " + sun-disc"),
       slots: lightSlots,
       lift,
       voxMax,
@@ -1890,7 +1928,7 @@ export class GISystem {
       traceDda:
         globalThis.__giLightShadowSphere === true
           ? null
-          : (origin, dir, maxT, k, receiverP = null, tanHalf = null, jitter = null, jitter2 = null) => {
+          : (origin, dir, maxT, k, receiverP = null, tanHalf = null, jitter = null, jitter2 = null, cosRayNormal = null) => {
               // tMin one voxel: the lifted origin can still clip its own
               // surface's SAT-bulged voxel on curved geometry, and a DDA
               // first-voxel hit is a hard black dot. One voxel along the ray
@@ -1920,11 +1958,16 @@ export class GISystem {
               const soft = tanHalf != null && jitter != null;
               const legacyCone =
                 globalThis.__giConeShadowDensity === true &&
+                !analyticWidth &&
                 soft &&
                 occ.traceOccupancyCone;
               const voxMin = vox.x.min(vox.y).min(vox.z);
+              // The analytic-width arm traces the CENTRAL ray only — a
+              // deterministic ray cannot wander into the origin dead zone
+              // and needs no ensemble to average; softness is the width
+              // probe's job (multiplied in below).
               let dirEff = dir;
-              if (soft && !legacyCone) {
+              if (soft && !legacyCone && !analyticWidth) {
                 const d = vec3(dir);
                 const upRef = select(d.y.abs().lessThan(0.9), vec3(0, 1, 0), vec3(1, 0, 0));
                 const s1 = d.cross(upRef).normalize().toVar();
@@ -1952,6 +1995,31 @@ export class GISystem {
                     jitter,
                     jitter2,
                   })
+                : null;
+              // THE MID-FIELD WIDTH TERM (analytic-width arm only): the
+              // penumbra reach the near-field pen terms are starved of.
+              // Evaluated on the CENTRAL ray, gated the same ~3 voxels the
+              // marchers' own penGate uses so the receiver's neighbourhood
+              // never clamps a ray at birth. cosRayNormal comes from the
+              // resolve (the receiver's geometric N·L); a missing value
+              // degrades to 1, which only ever makes the own-plane test
+              // stricter about calling a sample an occluder.
+              // LAZY — the probe only runs where the central ray MISSED:
+              // in the umbra the verdict is already 0 and multiplying a
+              // width into it changes nothing, so the umbra (often the
+              // largest shadowed region on screen) skips all 12 taps.
+              const evalMidW = widthProbe
+                ? (gateNode) => {
+                    const w = float(1).toVar();
+                    If(gateNode, () => {
+                      w.assign(widthProbe(
+                        origin, dir, tMin.mul(3), maxT, k,
+                        cosRayNormal != null ? float(cosRayNormal) : float(1),
+                        lift,
+                      ));
+                    });
+                    return w;
+                  }
                 : null;
               // THE RECORD MARCH — the non-voxel shadow arm. When the active
               // ray-hit mode carries surface records, shadow rays resolve hits
@@ -2001,9 +2069,27 @@ export class GISystem {
                 }
                 // x = exact-arm visibility × cone transmittance (the two
                 // phases partition the ray, so the product is the ray's
-                // visibility). y = blocker distance, kept for the dormant
-                // PCSS A/B arm; misses carry t = -1, hence the max(0).
-                const exactVis = r.hit.oneMinus().mul(r.pen);
+                // visibility). y = blocker distance for the PCSS/wide-pass
+                // chain; misses carry t = -1, hence the max(0).
+                // EXHAUSTION (kind 4) → THE PROBE'S VERDICT, exactly like
+                // the emitter arm. The 90° kind map measured 16.8k of 51.8k
+                // pixels CLAMPED — the fail-closed black was most of the
+                // "umbra", with a bogus ~0.3m blocker distance that also
+                // collapsed the wide-pass radius. The probe's openness
+                // reading gives those rays the physically-shaped gradient
+                // (dark at the caster's base, washing out with distance —
+                // the Blender 90° look) instead of a hard black blob, and
+                // it is what makes LOWERING march budgets safe: an
+                // exhausted ray now degrades to "approximately right" not
+                // "black".
+                let exactVis;
+                if (evalMidW) {
+                  const exhausted = float(r.kind).greaterThan(3.5).toVar();
+                  const w = evalMidW(float(r.hit).lessThan(0.5).or(exhausted));
+                  exactVis = select(exhausted, r.pen.mul(w), r.hit.oneMinus().mul(r.pen).mul(w));
+                } else {
+                  exactVis = r.hit.oneMinus().mul(r.pen);
+                }
                 return vec2(
                   coneT ? exactVis.mul(coneT) : exactVis,
                   r.t.max(0).div(float(span)).clamp(0, 1),
@@ -2018,7 +2104,8 @@ export class GISystem {
                 Number(globalThis.__giDirectShadowSteps) ||
                 ({ low: 40, medium: 56, high: 64, ultra: 80 }[quality] ?? 64);
               const r = occ.traceOccupancy(origin, dirEff, tMin, exactEnd, { steps: ddaSteps, penumbraK: k });
-              const legacyVis = r.hit.oneMinus().mul(r.pen);
+              let legacyVis = r.hit.oneMinus().mul(r.pen);
+              if (evalMidW) legacyVis = legacyVis.mul(evalMidW(float(r.hit).lessThan(0.5)));
               return vec2(
                 coneT ? legacyVis.mul(coneT) : legacyVis,
                 r.t.max(0).div(float(span)).clamp(0, 1),
@@ -2037,6 +2124,102 @@ export class GISystem {
   }
 
   /**
+   * RECORD-MARCH EMITTER SHADOWS (plan §6 — the emitter arm and the light
+   * arm converge on one estimator family). Returns the closure the RESOLVE
+   * pass's emitter bundle carries as `recordShadowTrace`, or null when the
+   * scene's ray-hit mode has no records (the sphere arm stays the fallback,
+   * and it remains the only arm the in-material path ever compiles — the
+   * occupancy bits buffer must never enter fragment shaders).
+   *
+   * Why this replaces the sphere trace where records exist: the sphere
+   * arm's admissions are THRESHOLDS over a voxel-quantized distance field
+   * (own-plane cut, cap cut, contact cut), and every one of them flips with
+   * lattice phase somewhere — the big-panel "waffle grid" screenshot is
+   * that class, and the probe ladder showed no tuning hatch moved it. The
+   * record march's admission is exact geometry (planes/coverage/triangles,
+   * fail-closed), and softness is the same analytic width term the direct
+   * arm uses — deterministic, no thresholds, unified with the light arm.
+   * `__giEmitterRecordShadows = false` restores the sphere arm (build-time).
+   */
+  #buildEmitterRecordTrace(volume, quality) {
+    if (globalThis.__giEmitterRecordShadows === false) return null;
+    const occ = volume.occupancyField;
+    if (!occ?.voxel || !occ.traceHybridPlane || occ.hasSurfaceRecords !== true) return null;
+    const shadowMode = volume.rayHitMode ?? RayHitMode.OccupancyLegacy;
+    if (shadowMode < RayHitMode.HybridPlane || shadowMode > RayHitMode.HybridExactComplex) return null;
+    const widthProbe =
+      globalThis.__giShadowAnalyticWidth !== false ? volume.createWidthProbe?.() ?? null : null;
+    // HALF the direct arm's tier ("even one emissive is -10 fps"): emitter
+    // shadows are soft area-light shadows, and with the exhaustion→probe
+    // fallback a capped ray degrades to "approximately right", never black —
+    // so the budget is a pure cost knob now, not a correctness one.
+    const macroSteps =
+      Number(globalThis.__giDirectShadowSteps) ||
+      ({ low: 48, medium: 64, high: 80, ultra: 96 }[quality] ?? 80);
+    return (P, N, dir, maxT, k, cosRayNormal) => {
+      const vox = vec3(occ.voxel);
+      const voxMax = vox.x.max(vox.y).max(vox.z).toVar();
+      // Same 1.5-voxel light-side lift as the direct arm — the emitter gate
+      // (cosθ > 0.05 in emitterDirectAt) guarantees N faces the lamp.
+      const lift = voxMax.mul(1.5).toVar();
+      const origin = vec3(P).add(vec3(N).mul(lift)).toVar();
+      // maxT already stops at the lamp's surface minus shadowMargin
+      // (≥ 2 field cells); one extra voxel keeps grazing rays out of the
+      // lamp's own conservatively-bulged shell.
+      const tEnd = float(maxT).sub(voxMax).max(0).toVar();
+      const r = occ.traceHybridPlane(origin, dir, voxMax, tEnd, {
+        coverage: shadowMode >= RayHitMode.HybridPlaneCoverage,
+        exact: shadowMode === RayHitMode.HybridExactComplex,
+        penumbraK: k,
+        macroSteps,
+        excludePoint: globalThis.__giNoSelfPlaneExclusion === true ? null : P,
+      });
+      if (globalThis.__giEmitterShadowKindDebug === true) {
+        // Verdict-kind map instead of a shadow (the light arm's
+        // __giShadowKindDebug, for the emitter channel): miss=white,
+        // plane=0.75, exact-triangle=0.5, box=0.25, clamp=black.
+        return float(1).sub(float(r.kind).mul(0.25));
+      }
+      if (widthProbe) {
+        // EXHAUSTION → THE PROBE'S VERDICT, not the fail-closed black.
+        // Emitter geometry makes GRAZING rays the common case, not the
+        // pathological one: a floor pixel's ray to a low panel hugs its own
+        // surface for metres, the DDA descends at every voxel column along
+        // it, and the macro budget (160 at high) burns before the lamp —
+        // measured as the probe rig's ENTIRE floor reading occluded with
+        // lattice-phase speckle (the sphere arm died of the same disease as
+        // black wedges). The march reports exhaustion as verdict kind 4,
+        // and the width probe has full reach at FIXED cost: an exhausted
+        // ray takes `pen × probe` — open floors read open, rays threading
+        // real geometry still read dark (taps inside walls give k·D/t ≈ 0).
+        // Resolved rays keep exact admission; the probe runs lazily for
+        // misses and exhaustions only (the true umbra still skips it).
+        const exhausted = float(r.kind).greaterThan(3.5).toVar();
+        const w = float(1).toVar();
+        // LAMP EXCLUSION, width-probe form. The emissive mesh IS occupancy
+        // geometry, so D → 0 as taps approach the lamp face — without a
+        // pullback the LAST taps of every ray read k·d/t ≈ 0 and the whole
+        // receiver plane went near-black (the probe rig's waffle floor;
+        // neither the plane gate nor step budget moved it — the darkening
+        // samples were lamp-proximal, not floor-proximal). The lamp's
+        // D-footprint along the ray is its own effective radius, which is
+        // exactly maxT/k (emitter k = dist/reff) — so the probe's reach
+        // ends at maxT·(1 − 1/k) minus a voxel of bulge. The march still
+        // owns admission over the FULL ray, so an occluder hugging the
+        // lamp keeps its (hard) shadow; only its extra width is forgone.
+        // Analytic gi lights need no such pullback: they have no body in
+        // the field (the direct arm passes maxT unchanged).
+        const tProbe = tEnd.mul(float(1).sub(float(1).div(float(k).max(1.05)))).sub(voxMax).max(0).toVar();
+        If(float(r.hit).lessThan(0.5).or(exhausted), () => {
+          w.assign(widthProbe(origin, dir, voxMax.mul(3), tProbe, float(k), float(cosRayNormal), lift));
+        });
+        return select(exhausted, r.pen.mul(w), r.hit.oneMinus().mul(r.pen).mul(w));
+      }
+      return r.hit.oneMinus().mul(r.pen);
+    };
+  }
+
+  /**
    * Builds the deferred resolve for this GI state: a half-resolution gbuffer
    * plus the compute that turns it into the irradiance / emitter-shadow
    * textures materials sample.
@@ -2047,15 +2230,20 @@ export class GISystem {
    * rebuild, its shader stays in the pipeline cache, and a quality change or
    * an auto-fit refit no longer triggers a material recompile wave.
    */
-  #buildScreenResolve({ gather, light, emitterSlots, radianceLookup = null, lightSlots = null, ao = null, lightShadow = null }) {
+  #buildScreenResolve({ gather, light, emitterSlots, radianceLookup = null, lightSlots = null, ao = null, lightShadow = null, emitterRecordTrace = null }) {
     const renderer = this.engine.renderer;
     if (!renderer?.backend?.device) return null;
     const { width, height } = this.#screenResolveSize();
     const { width: shadowW, height: shadowH } = this.#lightShadowSize({ width, height });
     try {
       const gbuffer = createGiGBuffer(width, height);
+      // Emitter shadows at HALF the direct arm's pixel budget (1/sqrt2 per
+      // axis): soft area-light shadows survive the lower res behind the
+      // bilateral + UV upsample, and per-slot cost was the user's fps cliff.
+      const emitterW = Math.max(64, Math.round(shadowW * 0.7071));
+      const emitterH = Math.max(64, Math.round(shadowH * 0.7071));
       if (!this._giTargets) {
-        this._giTargets = createGiTargets(width, height, shadowW, shadowH);
+        this._giTargets = createGiTargets(width, height, shadowW, shadowH, { emitterWidth: emitterW, emitterHeight: emitterH });
         this._giTargetSize = { width, height };
         this._giIrradianceNode = texture(this._giTargets.irradiance);
         this._giEmitterShadowNode = texture(this._giTargets.emitterShadow);
@@ -2097,6 +2285,11 @@ export class GISystem {
         ? {
             emitterSlots,
             shadowTraceFn: light.shadowTraceFn,
+            // Resolve-only record-march arm (see #buildEmitterRecordTrace) —
+            // deliberately NOT on `light`, so the in-material fallback path
+            // (emitterDirectAt with the light as params) can never compile
+            // the bits buffer into fragment shaders.
+            recordShadowTrace: emitterRecordTrace,
             shadowMargin: light.shadowMargin,
             shadowRange: light.shadowRange,
           }
@@ -2140,7 +2333,17 @@ export class GISystem {
       // createGiLightShadowPass for why it left the resolve kernel.
       // Temporal-accumulation uniforms, persistent across rebuilds/resizes
       // (the tick updates them; a rebuild must not orphan the tick's refs).
-      if (inputs.lightShadow) {
+      // THE ANALYTIC-WIDTH ARM NEEDS NO TEMPORAL ANYTHING (docs/
+      // GI_SHADOWS_PLAN.md §5): the trace is deterministic, so each frame
+      // is already the converged answer — no jitter animation, no
+      // reprojection, no history, and the single filter pass below writes
+      // straight into the sampled target as banding insurance (rgba16
+      // quantization of D and record-plane seams are the residual risks).
+      const analyticWidth = inputs.lightShadow?.analyticWidth === true;
+      if (inputs.lightShadow && !analyticWidth) {
+        // Stochastic arm: materialize the accumulate/history textures (lazy
+        // since the analytic default — see createGiTargets).
+        targets.ensureShadowTemporal?.();
         // renderGroup + onRenderUpdate — three's canonical per-frame-uniform
         // pattern (what time uniforms use). The default object group's
         // buffer does NOT re-upload on a quiet scene: the phase uniform's
@@ -2162,24 +2365,33 @@ export class GISystem {
             height: shadowH,
             resolveWidth: width,
             resolveHeight: height,
-            frame: this._giShadowFrameU,
+            frame: analyticWidth ? null : this._giShadowFrameU,
           })
         : null;
       // Edge-aware average of the stochastic trace — see the pass's comment
       // for why penumbra smoothing lives here and not in materials. planeEps
       // rides the occupancy voxel (a node, so refits rescale it). `history`
       // adds the reprojected temporal blend (see the pass's comment).
+      // WIDE PENUMBRA PASS (analytic + PCSS only): the bilateral writes MID,
+      // the wide pass reconstructs blocker-distance-driven penumbra width
+      // into the sampled target (see createGiLightShadowWidePass — the 90°
+      // hard-inner-edge fix). Without PCSS (no dist channel) the bilateral
+      // writes the target directly, exactly as before.
+      const wideOn = analyticWidth && inputs.lightShadow?.pcss && globalThis.__giShadowWidePass !== false;
+      if (wideOn) this._giShadowWideCamU ??= uniform(new THREE.Vector3());
       const lightShadowFilterPass = lightShadowPass
         ? createGiLightShadowFilterPass({
             gbuffer,
             source: targets.lightShadowRaw,
-            target: targets.lightShadowAccum,
+            // Analytic arm: ONE bilateral, straight into the sampled target
+            // (the accumulate→history→post chain never exists).
+            target: analyticWidth ? (wideOn ? targets.lightShadowMid : targets.lightShadow) : targets.lightShadowAccum,
             width: shadowW,
             height: shadowH,
             resolveWidth: width,
             resolveHeight: height,
             planeEps: inputs.lightShadow.voxMax ?? 0.1,
-            history: {
+            history: analyticWidth ? null : {
               histShadow: targets.lightShadowHist,
               histPos: targets.lightShadowHistPos,
               prevViewProj: this._giShadowPrevVPU,
@@ -2188,7 +2400,42 @@ export class GISystem {
             },
           })
         : null;
-      const lightShadowHistoryPass = lightShadowFilterPass
+      // Two chained instances — small radius first, large radius over the
+      // pre-blurred result: compounding is what reaches the whole-shadow
+      // footprints a 90° source needs (core lift, not just edge blur).
+      const lightShadowWidePass = wideOn && lightShadowFilterPass
+        ? createGiLightShadowWidePass({
+            gbuffer,
+            source: targets.lightShadowMid,
+            dist: targets.lightShadowDist,
+            target: targets.lightShadowWide,
+            slots: inputs.lightShadow.slots,
+            span: inputs.lightShadow.span,
+            width: shadowW,
+            height: shadowH,
+            resolveWidth: width,
+            resolveHeight: height,
+            cameraPosition: this._giShadowWideCamU,
+            capFrac: 0.08,
+          })
+        : null;
+      const lightShadowWidePass2 = lightShadowWidePass
+        ? createGiLightShadowWidePass({
+            gbuffer,
+            source: targets.lightShadowWide,
+            dist: targets.lightShadowDist,
+            target: targets.lightShadow,
+            slots: inputs.lightShadow.slots,
+            span: inputs.lightShadow.span,
+            width: shadowW,
+            height: shadowH,
+            resolveWidth: width,
+            resolveHeight: height,
+            cameraPosition: this._giShadowWideCamU,
+            capFrac: 0.25,
+          })
+        : null;
+      const lightShadowHistoryPass = lightShadowFilterPass && !analyticWidth
         ? createGiLightShadowHistoryPass({
             gbuffer,
             source: targets.lightShadowAccum,
@@ -2207,7 +2454,7 @@ export class GISystem {
       // frame (that would flatten every penumbra), it only removes the
       // residual filter-scale mottle the EMA leaves behind ("still very
       // grainy and dirty").
-      const lightShadowPostPass = lightShadowFilterPass
+      const lightShadowPostPass = lightShadowFilterPass && !analyticWidth
         ? createGiLightShadowFilterPass({
             gbuffer,
             source: targets.lightShadowAccum,
@@ -2217,6 +2464,34 @@ export class GISystem {
             resolveWidth: width,
             resolveHeight: height,
             planeEps: inputs.lightShadow.voxMax ?? 0.1,
+          })
+        : null;
+      // EMITTER SHADOW PASS + FILTER (see createGiEmitterShadowPass in
+      // giScreen) — queued BEFORE the resolve each frame: the resolve
+      // samples the filtered texture instead of tracing per resolve pixel.
+      const emitterShadowPass = inputs.emitter
+        ? createGiEmitterShadowPass({
+            gbuffer,
+            emitter: inputs.emitter,
+            normalOffset: inputs.normalOffset,
+            target: targets.emitterShadowRaw,
+            width: emitterW,
+            height: emitterH,
+            resolveWidth: width,
+            resolveHeight: height,
+            cameraPosition: radiance?.cameraPosition ?? null,
+          })
+        : null;
+      const emitterShadowFilterPass = emitterShadowPass
+        ? createGiLightShadowFilterPass({
+            gbuffer,
+            source: targets.emitterShadowRaw,
+            target: targets.emitterShadow,
+            width: emitterW,
+            height: emitterH,
+            resolveWidth: width,
+            resolveHeight: height,
+            planeEps: inputs.lightShadow?.voxMax ?? 0.1,
           })
         : null;
       light.giIrradianceNode = this._giIrradianceNode;
@@ -2229,7 +2504,7 @@ export class GISystem {
       // smearing white dots across the dark silhouette in front of it.
       light.giPositionNode = this._giShadowPosNode;
       light.giScreenTexel = this._giLightShadowTexel;
-      return { gbuffer, resolve, lightShadowPass, lightShadowFilterPass, lightShadowHistoryPass, lightShadowPostPass, targets, width, height, shadowWidth: shadowW, shadowHeight: shadowH, ...inputs };
+      return { gbuffer, resolve, lightShadowPass, lightShadowFilterPass, lightShadowWidePass, lightShadowWidePass2, lightShadowHistoryPass, lightShadowPostPass, emitterShadowPass, emitterShadowFilterPass, targets, width, height, shadowWidth: shadowW, shadowHeight: shadowH, emitterShadowWidth: emitterW, emitterShadowHeight: emitterH, ...inputs };
     } catch (error) {
       // Falling back to the in-material path keeps GI working (slowly) rather
       // than rendering an unlit scene.
@@ -2271,7 +2546,15 @@ export class GISystem {
     // observed material has hasNode = true, so its bindings refresh per frame
     // — see #markObservedMaterial).
     const previousTargets = screen.targets;
-    screen.targets = createGiTargets(width, height, shadowW, shadowH);
+    const emitterW = Math.max(64, Math.round(shadowW * 0.7071));
+    const emitterH = Math.max(64, Math.round(shadowH * 0.7071));
+    screen.targets = createGiTargets(width, height, shadowW, shadowH, { emitterWidth: emitterW, emitterHeight: emitterH });
+    screen.emitterShadowWidth = emitterW;
+    screen.emitterShadowHeight = emitterH;
+    // The stochastic arm's accumulate/history textures are lazy now — a
+    // resize on that arm must re-materialize them before the pass rebuilds
+    // below bind them (the history pass's existence records the arm).
+    if (screen.lightShadowHistoryPass) screen.targets.ensureShadowTemporal?.();
     this._giTargets = screen.targets;
     this._giTargetSize = { width, height };
     this._giIrradianceNode.value = screen.targets.irradiance;
@@ -2335,6 +2618,52 @@ export class GISystem {
     if (index >= 0) state.queue[index] = screen.resolve.compute;
     if (indexNoFeedback >= 0) state.queueNoFeedback[indexNoFeedback] = screen.resolve.compute;
     if (indexFeedbackOnly >= 0) state.queueFeedbackOnly[indexFeedbackOnly] = screen.resolve.compute;
+    // Emitter shadow pass + filter follow the same rebuild+splice contract
+    // (fresh targets at the new sizes; queue positions preserved so they
+    // stay AHEAD of the resolve that samples them).
+    if (screen.emitterShadowPass) {
+      const oldEmitter = screen.emitterShadowPass.compute;
+      const emitterIndexes = [
+        state.queue.indexOf(oldEmitter),
+        state.queueNoFeedback.indexOf(oldEmitter),
+        state.queueFeedbackOnly?.indexOf(oldEmitter) ?? -1,
+      ];
+      screen.emitterShadowPass = createGiEmitterShadowPass({
+        gbuffer: screen.gbuffer,
+        emitter: screen.emitter,
+        normalOffset: screen.normalOffset,
+        target: screen.targets.emitterShadowRaw,
+        width: emitterW,
+        height: emitterH,
+        resolveWidth: width,
+        resolveHeight: height,
+        cameraPosition: screen.radiance?.cameraPosition ?? null,
+      });
+      if (emitterIndexes[0] >= 0) state.queue[emitterIndexes[0]] = screen.emitterShadowPass.compute;
+      if (emitterIndexes[1] >= 0) state.queueNoFeedback[emitterIndexes[1]] = screen.emitterShadowPass.compute;
+      if (emitterIndexes[2] >= 0) state.queueFeedbackOnly[emitterIndexes[2]] = screen.emitterShadowPass.compute;
+    }
+    if (screen.emitterShadowFilterPass) {
+      const oldEmitterFilter = screen.emitterShadowFilterPass.compute;
+      const emitterFilterIndexes = [
+        state.queue.indexOf(oldEmitterFilter),
+        state.queueNoFeedback.indexOf(oldEmitterFilter),
+        state.queueFeedbackOnly?.indexOf(oldEmitterFilter) ?? -1,
+      ];
+      screen.emitterShadowFilterPass = createGiLightShadowFilterPass({
+        gbuffer: screen.gbuffer,
+        source: screen.targets.emitterShadowRaw,
+        target: screen.targets.emitterShadow,
+        width: emitterW,
+        height: emitterH,
+        resolveWidth: width,
+        resolveHeight: height,
+        planeEps: screen.lightShadow?.voxMax ?? 0.1,
+      });
+      if (emitterFilterIndexes[0] >= 0) state.queue[emitterFilterIndexes[0]] = screen.emitterShadowFilterPass.compute;
+      if (emitterFilterIndexes[1] >= 0) state.queueNoFeedback[emitterFilterIndexes[1]] = screen.emitterShadowFilterPass.compute;
+      if (emitterFilterIndexes[2] >= 0) state.queueFeedbackOnly[emitterFilterIndexes[2]] = screen.emitterShadowFilterPass.compute;
+    }
     // Same rebuild + splice for the shadow pass (its own size, its own
     // compute-count, the fresh targets).
     if (screen.lightShadowPass) {
@@ -2358,7 +2687,8 @@ export class GISystem {
         // dither while the (never-resizing) smoke page validated the
         // animated path. Probe signature: two same-state readbacks of the
         // raw texture differing by ~1 pixel while the phase uniform climbs.
-        frame: this._giShadowFrameU,
+        // (The analytic-width arm builds with frame null — same rule.)
+        frame: screen.lightShadow?.analyticWidth ? null : this._giShadowFrameU,
       });
       if (passIndexes[0] >= 0) state.queue[passIndexes[0]] = screen.lightShadowPass.compute;
       if (passIndexes[1] >= 0) state.queueNoFeedback[passIndexes[1]] = screen.lightShadowPass.compute;
@@ -2372,26 +2702,63 @@ export class GISystem {
         state.queueNoFeedback.indexOf(oldFilter),
         state.queueFeedbackOnly?.indexOf(oldFilter) ?? -1,
       ];
+      // The history pass's existence is the durable record of which chain
+      // the build chose (temporal vs analytic-width single-filter) — derive
+      // target/history from it so a resize can never silently flip arms.
+      const temporalChain = !!screen.lightShadowHistoryPass;
       screen.lightShadowFilterPass = createGiLightShadowFilterPass({
         gbuffer: screen.gbuffer,
         source: screen.targets.lightShadowRaw,
-        target: screen.targets.lightShadowAccum,
+        target: temporalChain
+          ? screen.targets.lightShadowAccum
+          : screen.lightShadowWidePass ? screen.targets.lightShadowMid : screen.targets.lightShadow,
         width: shadowW,
         height: shadowH,
         resolveWidth: width,
         resolveHeight: height,
         planeEps: screen.lightShadow?.voxMax ?? 0.1,
-        history: {
+        history: temporalChain ? {
           histShadow: screen.targets.lightShadowHist,
           histPos: screen.targets.lightShadowHistPos,
           prevViewProj: this._giShadowPrevVPU,
           weight: this._giShadowHistWeightU,
           validEps: screen.lightShadow?.voxMax ?? 0.15,
-        },
+        } : null,
       });
       if (filterIndexes[0] >= 0) state.queue[filterIndexes[0]] = screen.lightShadowFilterPass.compute;
       if (filterIndexes[1] >= 0) state.queueNoFeedback[filterIndexes[1]] = screen.lightShadowFilterPass.compute;
       if (filterIndexes[2] >= 0) state.queueFeedbackOnly[filterIndexes[2]] = screen.lightShadowFilterPass.compute;
+    }
+    if (screen.lightShadowWidePass) {
+      const wideSpecs = [
+        { key: "lightShadowWidePass", source: screen.targets.lightShadowMid, target: screen.targets.lightShadowWide, capFrac: 0.08 },
+        { key: "lightShadowWidePass2", source: screen.targets.lightShadowWide, target: screen.targets.lightShadow, capFrac: 0.25 },
+      ];
+      for (const spec of wideSpecs) {
+        const oldWide = screen[spec.key].compute;
+        const wideIndexes = [
+          state.queue.indexOf(oldWide),
+          state.queueNoFeedback.indexOf(oldWide),
+          state.queueFeedbackOnly?.indexOf(oldWide) ?? -1,
+        ];
+        screen[spec.key] = createGiLightShadowWidePass({
+          gbuffer: screen.gbuffer,
+          source: spec.source,
+          dist: screen.targets.lightShadowDist,
+          target: spec.target,
+          slots: screen.lightShadow.slots,
+          span: screen.lightShadow.span,
+          width: shadowW,
+          height: shadowH,
+          resolveWidth: width,
+          resolveHeight: height,
+          cameraPosition: this._giShadowWideCamU,
+          capFrac: spec.capFrac,
+        });
+        if (wideIndexes[0] >= 0) state.queue[wideIndexes[0]] = screen[spec.key].compute;
+        if (wideIndexes[1] >= 0) state.queueNoFeedback[wideIndexes[1]] = screen[spec.key].compute;
+        if (wideIndexes[2] >= 0) state.queueFeedbackOnly[wideIndexes[2]] = screen[spec.key].compute;
+      }
     }
     if (screen.lightShadowHistoryPass) {
       const oldHistory = screen.lightShadowHistoryPass.compute;
@@ -3159,6 +3526,12 @@ export class GISystem {
     // without visibly hurting light response). `__giFieldSmoothing` stays as
     // a live override for further A/B (0 = pre-Phase-1 behaviour).
     const fieldSmoothing = uniform(globalThis.__giFieldSmoothing ?? 0.95);
+    // Field-side instance of the analytic mid-width term (plan §6) — its own
+    // instance because sharedFn layouts are per-shader; see the `lightShadow`
+    // closure below for why the field wants it too. Default-on, same hatch
+    // as the screen arm so the two always agree about the sun's softness.
+    const fieldWidthProbe =
+      globalThis.__giShadowAnalyticWidth !== false ? volume.createWidthProbe?.() ?? null : null;
     const feedbackCompute = createBounceFeedback(cascades, volume, bounceGain, temporalBlend, {
       lightSlots,
       emitterSlots,
@@ -3202,12 +3575,36 @@ export class GISystem {
             // light's authored sun Angle) and falls back to this global
             // `penAngle` otherwise, so an un-flagged scene is unchanged. The
             // `??` keeps any other caller on the old behaviour.
-            (origin, dir, maxT, k = null) => {
+            // UNDER `__giShadowAnalyticWidth` the same mid-field width term
+            // the screen arm gained multiplies in here too (plan §6): the
+            // field's hit×pen has the same ~1.5-voxel starved reach, so
+            // wide-sun BOUNCE shadows stepped at cell scale for the same
+            // reason the screen ones dithered. distanceTexture is already
+            // bound in this kernel (the emitter sphere trace reads it), so
+            // this costs the taps and no new bindings. `cosRayNormal` is the
+            // caller's geometric N·L (cascadeGather already passes it).
+            (origin, dir, maxT, k = null, cosRayNormal = null) => {
+              const kEff = k ?? float(1).div(shadowJitter.penAngle.max(0.005));
               const r = volume.occupancyField.traceOccupancy(
                 origin, dir, volume.world.minCell.mul(0.25), maxT,
-                { steps: 64, penumbraK: k ?? float(1).div(shadowJitter.penAngle.max(0.005)) },
+                { steps: 64, penumbraK: kEff },
               );
-              return r.hit.oneMinus().mul(r.pen);
+              let vis = r.hit.oneMinus().mul(r.pen);
+              if (fieldWidthProbe) {
+                // Lazy like the screen arm: umbra cells skip the taps.
+                const w = float(1).toVar();
+                If(float(r.hit).lessThan(0.5), () => {
+                  const occV = vec3(volume.occupancyField.voxel);
+                  const gate = occV.x.max(occV.y).max(occV.z).mul(3);
+                  w.assign(fieldWidthProbe(
+                    origin, dir, gate, maxT, float(kEff),
+                    cosRayNormal != null ? float(cosRayNormal) : float(1),
+                    float(normalLift),
+                  ));
+                });
+                vis = vis.mul(w);
+              }
+              return vis;
             }
           : null,
     });
@@ -3353,8 +3750,18 @@ export class GISystem {
       hasEmitterTrace: !!light.shadowTraceFn,
       span: diagU,
     });
-    const screen = this.#buildScreenResolve({ gather, light, emitterSlots, radianceLookup: deferredRadianceLookup, ao, lightShadow });
+    const screen = this.#buildScreenResolve({
+      gather, light, emitterSlots, radianceLookup: deferredRadianceLookup, ao, lightShadow,
+      emitterRecordTrace: emitterSlots ? this.#buildEmitterRecordTrace(volume, quality) : null,
+    });
     if (screen) {
+      // Emitter shadow trace + filter FIRST — the resolve samples their
+      // output texture in the same frame.
+      if (screen.emitterShadowPass) {
+        queue.push(screen.emitterShadowPass.compute, screen.emitterShadowFilterPass.compute);
+        queueNoFeedback.push(screen.emitterShadowPass.compute, screen.emitterShadowFilterPass.compute);
+        queueFeedbackOnly.push(screen.emitterShadowPass.compute, screen.emitterShadowFilterPass.compute);
+      }
       queue.push(screen.resolve.compute);
       queueNoFeedback.push(screen.resolve.compute);
       // The resolve is camera-dependent, so it runs on BOTH halves of the
@@ -3372,6 +3779,11 @@ export class GISystem {
         queue.push(screen.lightShadowFilterPass.compute);
         queueNoFeedback.push(screen.lightShadowFilterPass.compute);
         queueFeedbackOnly.push(screen.lightShadowFilterPass.compute);
+      }
+      if (screen.lightShadowWidePass) {
+        queue.push(screen.lightShadowWidePass.compute, screen.lightShadowWidePass2.compute);
+        queueNoFeedback.push(screen.lightShadowWidePass.compute, screen.lightShadowWidePass2.compute);
+        queueFeedbackOnly.push(screen.lightShadowWidePass.compute, screen.lightShadowWidePass2.compute);
       }
       if (screen.lightShadowHistoryPass) {
         queue.push(screen.lightShadowHistoryPass.compute);
@@ -3516,6 +3928,11 @@ export class GISystem {
             `up to ${MAX_GI_LIGHTS} lights — flag a light with Shadow Source "gi"`
         : "[gi] light shadows: gi-traced OFF — every light renders its own shadow map",
     );
+    if (screen?.emitter) {
+      console.log(
+        `[gi] emitter shadows: ${screen.emitter.recordShadowTrace ? "record-march + analytic-width" : "sphere-trace"} (resolve side)`,
+      );
+    }
     console.log(
       `[gi] ray-hit: requested ${rayHitConfig.autoMode ? `auto→${rayHitModeName(rayHitConfig.requestedMode)}` : rayHitModeName(rayHitConfig.requestedMode)}, ` +
         `active ${rayHitModeName(rayHitConfig.activeMode)}, profiling ${rayHitConfig.enableProfiling ? "ON" : "off"}` +

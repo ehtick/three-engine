@@ -158,6 +158,14 @@ function connect() {
     );
     useMcpStore.setState({ status: "connected", toolCount: tools.length, lastError: null });
     console.log(`MCP bridge connected on port ${state.config.port} — ${tools.length} tools exposed`);
+    // An assistant is now on the other end, so the orientation notes in the
+    // project folder have become true — write them if they are not there. Doing
+    // it here rather than on project open is what keeps a file about AI
+    // assistants out of the folder of someone who has never used one. Fire and
+    // forget: it must not delay or fail the connection.
+    import("../agentGuide.js")
+      .then((m) => m.ensureAgentGuide())
+      .catch(() => {});
   };
 
   ws.onmessage = (event) => {

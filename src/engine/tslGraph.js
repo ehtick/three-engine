@@ -1,3 +1,4 @@
+import { vmState } from "./vmState.js";
 import * as THREE from "three/webgpu";
 import * as TSL from "three/tsl";
 import { loadTextureAsset } from "./textureAsset.js";
@@ -17,7 +18,7 @@ import { loadTextureAsset } from "./textureAsset.js";
  * in `uniforms`, so the editor can live-patch values without recompiling.
  */
 
-const textureCache = new Map(); // path -> Promise<THREE.Texture>
+const textureCache = vmState("tslGraphTextures", () => new Map()); // path -> Promise<THREE.Texture>
 const textureKey = (path) => String(path ?? "").replaceAll("\\", "/");
 
 function loadTexture(path) {

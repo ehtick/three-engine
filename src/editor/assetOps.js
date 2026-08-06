@@ -39,6 +39,66 @@ export async function createAssetFile(baseName, contents) {
   console.log(`Created ${name}`);
 }
 
+/**
+ * Copies an asset next to itself, `.meta` sidecar included.
+ *
+ * Byte-for-byte through `read_binary_file`/`write_binary_file` rather than a
+ * text round trip: half the things worth duplicating are binary, and a `.glb`
+ * that has been through a UTF-8 decode is no longer a `.glb`.
+ *
+ * The sidecar comes along because it *is* part of the asset — a duplicated
+ * texture that lost its colour-space and filtering settings looks subtly wrong
+ * in a way that takes a while to trace back to the copy.
+ */
+export async function duplicateAsset(path) {
+  const { entries, refresh } = useProjectStore.getState();
+  const name = path.split(/[\\/]/).pop();
+  const dir = path.slice(0, path.length - name.length);
+  // Sibling names come from the browsed folder when it is this asset's folder,
+  // and from a listing otherwise (the inspector can show an asset the grid
+  // never listed — a search result, or a slot's target).
+  const siblings = entries?.length && norm(`${dir}`).startsWith(norm(useProjectStore.getState().currentPath ?? ""))
+    ? entries
+    : await invoke("list_dir", { path: dir.replace(/[\\/]$/, "") }).catch(() => []);
+  const copyName = uniqueName(name, siblings);
+  const target = `${dir}${copyName}`;
+  const bytes = await invoke("read_binary_file", { path });
+  const { writeBinaryFile } = await import("./assetLoader.js");
+  await writeBinaryFile(target, new Uint8Array(bytes));
+  try {
+    const meta = await invoke("read_text_file", { path: `${path}.meta` });
+    await invoke("save_scene", { path: `${target}.meta`, contents: meta });
+  } catch {
+    // No sidecar — the common case, and not a failure.
+  }
+  await refresh();
+  console.log(`Duplicated as ${copyName}`);
+  return target;
+}
+
+/**
+ * A `.mat` beside an image, already wired to it as the base-colour map.
+ *
+ * The manual route is: new material, open the shader graph, add a texture
+ * node, pick the file, connect it to the BSDF — five steps to express "make a
+ * material out of this picture", which is the single most common reason to
+ * create a material at all.
+ */
+export async function createMaterialFromTexture(texturePath) {
+  const name = texturePath.split(/[\\/]/).pop();
+  const stem = name.replace(/\.[^.]+$/, "");
+  const dir = texturePath.slice(0, texturePath.length - name.length);
+  const siblings = await invoke("list_dir", { path: dir.replace(/[\\/]$/, "") }).catch(() => []);
+  const fileName = uniqueName(`${stem}.mat`, siblings);
+  const { buildPbrGraph } = await import("./pbrMaterialGraph.js");
+  const shaderGraph = buildPbrGraph({ diffuse: texturePath });
+  const path = `${dir}${fileName}`;
+  await invoke("save_scene", { path, contents: JSON.stringify({ shaderGraph }, null, 2) });
+  await useProjectStore.getState().refresh();
+  console.log(`Created ${fileName}`);
+  return path;
+}
+
 export async function createFolder() {
   const { currentPath, entries, refresh } = useProjectStore.getState();
   if (!currentPath) return;
@@ -121,6 +181,7 @@ export async function deleteEntries(entries) {
         await invoke("delete_path", { path: `${entry.path}.meta` }).catch(() => {});
         await invoke("delete_path", { path: `${entry.path}.basis` }).catch(() => {});
         await invoke("delete_path", { path: `${entry.path}.tex` }).catch(() => {});
+        await invoke("delete_path", { path: `${entry.path}.aud` }).catch(() => {});
         // Legacy GI mesh-SDF sidecars (pre-Library). New bakes live under
         // `<project>/Library/gi-sdf/`; this just sweeps the old neighbour files.
         await invoke("delete_path", { path: `${entry.path}.sdf` }).catch(() => {});
@@ -189,6 +250,7 @@ export async function renameEntry(entry, newName) {
     await invoke("rename_path", { from: `${entry.path}.meta`, to: `${newPath}.meta` }).catch(() => {});
     await invoke("rename_path", { from: `${entry.path}.basis`, to: `${newPath}.basis` }).catch(() => {});
     await invoke("rename_path", { from: `${entry.path}.tex`, to: `${newPath}.tex` }).catch(() => {});
+    await invoke("rename_path", { from: `${entry.path}.aud`, to: `${newPath}.aud` }).catch(() => {});
 
     // Scripts: rewrite the default-exported class name to match the new
     // filename stem, and inject `extends Script` if the script predates the
@@ -224,6 +286,7 @@ export async function movePathsIntoFolder(sourcePaths, destDir) {
       await invoke("rename_path", { from: `${sourcePath}.meta`, to: `${dest}.meta` }).catch(() => {});
       await invoke("rename_path", { from: `${sourcePath}.basis`, to: `${dest}.basis` }).catch(() => {});
       await invoke("rename_path", { from: `${sourcePath}.tex`, to: `${dest}.tex` }).catch(() => {});
+      await invoke("rename_path", { from: `${sourcePath}.aud`, to: `${dest}.aud` }).catch(() => {});
       moved++;
     } catch (err) {
       console.error(`Move failed for ${name}: ${err}`);

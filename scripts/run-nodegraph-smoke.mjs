@@ -366,19 +366,41 @@ if (scrub) {
   check("dragging the grip scrubs the value", v0 !== v1, `${v0} → ${v1}`);
 }
 
-// --- reroute via double-click on a wire ------------------------------------
+// --- edge gestures: double-click deletes, Alt+double-click reroutes ---------
 
-const reroute = await page.evaluate(() => {
-  const edge = document.querySelector(".react-flow__edge-interaction, .react-flow__edge-path");
-  if (!edge) return "no-edge";
-  const r = edge.getBoundingClientRect();
-  const opts = { bubbles: true, clientX: r.x + r.width / 2, clientY: r.y + r.height / 2 };
-  edge.dispatchEvent(new MouseEvent("dblclick", opts));
-  return "sent";
-});
+const countEdges = () => page.evaluate(() => document.querySelectorAll(".react-flow__edge").length);
+const dblclickEdge = (altKey) =>
+  page.evaluate((alt) => {
+    const edge = document.querySelector(".react-flow__edge-interaction, .react-flow__edge-path");
+    if (!edge) return "no-edge";
+    const r = edge.getBoundingClientRect();
+    const opts = { bubbles: true, altKey: alt, clientX: r.x + r.width / 2, clientY: r.y + r.height / 2 };
+    edge.dispatchEvent(new MouseEvent("dblclick", opts));
+    return "sent";
+  }, altKey);
+
+const edgesBefore = await countEdges();
+const del = await dblclickEdge(false);
+await new Promise((r) => setTimeout(r, 400));
+const edgesAfterDelete = await countEdges();
+check("double-clicking a wire deletes it", edgesAfterDelete === edgesBefore - 1, `${del}, ${edgesBefore} → ${edgesAfterDelete}`);
+check(
+  "…without inserting a reroute pin",
+  (await page.evaluate(() => document.querySelectorAll(".graph-reroute").length)) === 0,
+);
+
+// Put the wire back (graph-scoped undo), then reroute it explicitly.
+await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+await page.keyboard.down("Control");
+await page.keyboard.press("KeyZ");
+await page.keyboard.up("Control");
+await new Promise((r) => setTimeout(r, 400));
+check("Ctrl+Z restores the deleted wire", (await countEdges()) === edgesBefore);
+
+const reroute = await dblclickEdge(true);
 await new Promise((r) => setTimeout(r, 400));
 const rerouteCount = await page.evaluate(() => document.querySelectorAll(".graph-reroute").length);
-check("double-clicking a wire inserts a reroute pin", rerouteCount > 0, `${reroute}, ${rerouteCount} pin(s)`);
+check("Alt+double-clicking a wire inserts a reroute pin", rerouteCount > 0, `${reroute}, ${rerouteCount} pin(s)`);
 
 // --- committed graph still compiles ----------------------------------------
 

@@ -32,6 +32,7 @@ import {
   If,
   abs,
   atomicAdd,
+  cos,
   float,
   fract,
   instanceIndex,
@@ -43,6 +44,7 @@ import {
   positionWorld,
   reflect,
   select,
+  sin,
   smoothstep,
   step,
   tan,
@@ -54,7 +56,7 @@ import {
   vec3,
   vec4,
 } from "three/tsl";
-import { MAX_EMITTERS, analyticDirectAt, decodeOctNormal, emitterDirectAt } from "./giLight.js";
+import { MAX_EMITTERS, analyticDirectAt, decodeOctNormal, emitterDirectAt, emitterSlotShadow } from "./giLight.js";
 import { DEBUG_LAYER, EDITOR_LAYER, GI_MIRROR_LAYER, UI_LAYER } from "../../engine/editorLayers.js";
 import { ALBEDO_ATLAS_GRID, ALBEDO_ATLAS_SIZE, ALBEDO_ATLAS_TILE } from "./bvh/bvhScene.js";
 
@@ -257,7 +259,10 @@ export function createGiResolve({ gbuffer, targets, width, height, gather, norma
   // The TARGETS are owned by the caller and outlive every rebuild: materials
   // sample them through persistent texture nodes, so recreating them here
   // would silently leave already-compiled materials bound to dead textures.
-  const { irradiance, emitterShadow, radiance: radianceTarget } = targets;
+  // `emitterShadow` is no longer written here — the dedicated emitter shadow
+  // pass + filter own it (see createGiEmitterShadowPass); this kernel only
+  // SAMPLES it for the diffuse emitter-direct term.
+  const { irradiance, radiance: radianceTarget } = targets;
 
   // Size lives in a uniform so a viewport resize is a uniform write, not a
   // shader rebuild (the WGSL stays byte-identical → three's node cache and
@@ -280,10 +285,6 @@ export function createGiResolve({ gbuffer, targets, width, height, gather, norma
     // Exact-reflection hit radiance (see bvhShade's doc on this function).
     const bvhOut = vec3(0).toVar();
     const bvhValid = float(0).toVar();
-    // One var per emitter slot: TSL can't assign INTO a vec4 var's components,
-    // and the values are produced inside the If below, so they have to be
-    // declared outside it and packed afterwards.
-    const shadowVars = Array.from({ length: MAX_EMITTERS }, () => float(1).toVar());
     If(g0.w.greaterThan(0.5), () => {
       const P = g0.xyz.toVar();
       const rawN = g1.xyz.normalize().toVar();
@@ -375,11 +376,21 @@ export function createGiResolve({ gbuffer, targets, width, height, gather, norma
         reflectedOut.assign(vec3(radiance.lookup(samplePoint, reflected)).mul(intensity));
       }
       if (emitter) {
-        const direct = emitterDirectAt(emitter, P, N, samplePoint);
+        // The per-slot shadows come pre-traced and pre-filtered from the
+        // emitter shadow pass (LinearFilter over the shadow-res texture is
+        // the upsample). The trace left this kernel for the same reason the
+        // direct-light trace did: it was the most expensive per-pixel work
+        // here and its pixel count deserves its own budget.
+        const packedShadow = texture(
+          targets.emitterShadow,
+          vec2(px.toFloat().add(0.5).div(width), py.toFloat().add(0.5).div(height)),
+        ).level(0).toVar();
+        const shadowChannels = [packedShadow.x, packedShadow.y, packedShadow.z, packedShadow.w];
+        const direct = emitterDirectAt(
+          { ...emitter, shadowSample: (i) => shadowChannels[i] ?? float(1) },
+          P, N, samplePoint,
+        );
         out.addAssign(direct.irradiance.mul(intensity));
-        direct.shadows.forEach((shadow, index) => {
-          if (index < MAX_EMITTERS) shadowVars[index].assign(shadow);
-        });
       }
       // GI-traced direct shadows moved to their OWN pass — see
       // createGiLightShadowPass below (independent pixel budget; the trace
@@ -428,7 +439,6 @@ export function createGiResolve({ gbuffer, targets, width, height, gather, norma
       }
     });
     textureStore(irradiance, coord, vec4(out, 1));
-    textureStore(emitterShadow, coord, vec4(shadowVars[0], shadowVars[1], shadowVars[2], shadowVars[3]));
     textureStore(radianceTarget, coord, vec4(reflectedOut, 1));
     if (bvhShade) textureStore(bvhShade.target, coord, vec4(bvhOut, bvhValid));
   })().compute(width * height);
@@ -538,10 +548,19 @@ export function createGiLightShadowPass({ gbuffer, lightShadow, width, height, r
             // RADIUS whose angular size is radius/distance, per pixel. The
             // clamp floors the sharpest usable cone and caps the softest so
             // the analytic k can never approach 1.
+            // The 0.35 cap partly existed because the reach-starved
+            // estimator made wide k meaningless (the "90° looks like 20°"
+            // class) — with the analytic mid-field width supplying real
+            // reach, the cap lifts toward the true half-angle (0.78 ≈ the
+            // tan cap below; at extreme angles single-ray min-ratio
+            // degrades to "openness along the light axis", which is the
+            // right read for a half-sky source).
             const rawAngle = mix(float(slot.srcRadius).div(pointDist), float(slot.soft), isDir)
               .max(0)
               .toVar();
-            const angle = rawAngle.clamp(0.0005, 0.35).toVar();
+            const angle = rawAngle
+              .clamp(0.0005, globalThis.__giShadowAnalyticWidth !== false ? 0.78 : 0.35)
+              .toVar();
             // The cone arm wants the TRUE half-angle, unclamped — capping
             // it at 0.35 was exactly the "90° looks the same as 20°" bug;
             // tan capped at ~44.7° half-angle only to keep tan() finite.
@@ -573,7 +592,7 @@ export function createGiLightShadowPass({ gbuffer, lightShadow, width, height, r
             // record march's origin-plane exclusion; the DDA arm returns
             // vec2(shadow, blockerDist/span).
             const tracedRaw = lightShadow.traceDda
-              ? lightShadow.traceDda(shadowOrigin, dir, maxT, float(1).div(angle), P, tanHalf, ign, ign2)
+              ? lightShadow.traceDda(shadowOrigin, dir, maxT, float(1).div(angle), P, tanHalf, ign, ign2, cosRayNormal)
               : lightShadow.trace(shadowOrigin, dir, maxT, float(1).div(angle), cosRayNormal);
             const traced = lightShadow.traceDda ? vec2(tracedRaw).toVar() : vec2(tracedRaw, 0).toVar();
             if (lightShadowDistVars) lightShadowDistVars[index].assign(traced.y);
@@ -608,6 +627,65 @@ export function createGiLightShadowPass({ gbuffer, lightShadow, width, height, r
       coord,
       vec4(lightShadowVars[0], lightShadowVars[1], lightShadowVars[2], lightShadowVars[3]),
     );
+  })().compute(width * height);
+
+  return { compute, widthU };
+}
+
+/**
+ * EMITTER SHADOWS as their own pass at the shadow-channel budget
+ * (2026-08-06). These traces used to run inside the resolve kernel — one
+ * record march (or sphere trace) per RESOLVE pixel per emitter slot, so a
+ * scene with several emissive objects paid up to 4 marches × the resolve's
+ * 1.6M-pixel budget every frame ("fps drops too quickly with more emissive
+ * objects"). This pass runs the identical estimator (emitterSlotShadow —
+ * shared with the resolve's hit-shading path) at the SHADOW pixel budget,
+ * writes the raw 4-channel result, and the edge-aware filter pass averages
+ * it into `emitterShadow` — which also gives the emitter channel the
+ * spatial filter it never had (a good part of the coarse-preset
+ * blockiness). The resolve and materials then just sample the texture.
+ *
+ * `cameraPosition` (optional) reproduces the resolve's facing flip so both
+ * kernels shade the same side of double-sided geometry; without a camera
+ * the raw gbuffer normal is used, exactly like the resolve's own fallback.
+ */
+export function createGiEmitterShadowPass({
+  gbuffer, emitter, normalOffset, target, width, height, resolveWidth, resolveHeight,
+  cameraPosition = null,
+}) {
+  const widthU = uniform(width, "uint");
+  const positionNode = texture(gbuffer.position);
+  const normalNode = texture(gbuffer.normal);
+  const sx = resolveWidth / width;
+  const sy = resolveHeight / height;
+
+  const compute = Fn(() => {
+    const px = instanceIndex.mod(widthU);
+    const py = instanceIndex.div(widthU);
+    const coord = ivec2(px.toInt(), py.toInt());
+    const gCoord = ivec2(
+      px.toFloat().add(0.5).mul(sx).toInt(),
+      py.toFloat().add(0.5).mul(sy).toInt(),
+    );
+    const g0 = positionNode.load(gCoord).toVar();
+    const g1 = normalNode.load(gCoord).toVar();
+    // Default 1 (unshadowed) is load-bearing exactly as in the light-shadow
+    // pass: every no-geometry / inactive-slot path must leave the emitter's
+    // light untouched.
+    const shadowVars = Array.from({ length: MAX_EMITTERS }, () => float(1).toVar());
+    If(g0.w.greaterThan(0.5), () => {
+      const P = g0.xyz.toVar();
+      const rawN = g1.xyz.normalize().toVar();
+      const facing = cameraPosition
+        ? step(0, rawN.dot(vec3(cameraPosition).sub(P))).mul(2).sub(1)
+        : float(1);
+      const N = rawN.mul(facing).toVar();
+      const samplePoint = P.add(N.mul(normalOffset)).toVar();
+      emitter.emitterSlots.slice(0, MAX_EMITTERS).forEach((slot, index) => {
+        shadowVars[index].assign(emitterSlotShadow(emitter, slot, P, N, samplePoint));
+      });
+    });
+    textureStore(target, coord, vec4(shadowVars[0], shadowVars[1], shadowVars[2], shadowVars[3]));
   })().compute(width * height);
 
   return { compute, widthU };
@@ -788,6 +866,160 @@ export function createGiLightShadowFilterPass({
 }
 
 /**
+ * WIDE PENUMBRA RECONSTRUCTION for the direct-shadow channel (2026-08-06).
+ *
+ * The analytic-width estimator softens the MISS side of a silhouette; the
+ * central-ray HIT boundary is binary, and at large source angles that reads
+ * as a hard edge inside the smoothed penumbra (user report at 30°, then
+ * again at 90°). The material-side PCSS disc cannot fix it alone: its
+ * radius is capped at 24 half-res texels (a 90° sun wants 3-4× that) and
+ * spending more taps there costs every lit pixel of every material. This
+ * pass does the wide blur ONCE, at the shadow channel's own budgeted
+ * resolution: per-pixel penumbra width = tan(source half-angle) × blocker
+ * distance (the march's own occluder distance, deterministic), radius up
+ * to 40 shadow-res texels, a per-pixel IGN-rotated 12-tap golden spiral
+ * whose taps contribute per-channel only within that channel's radius,
+ * with receiver-plane validity so silhouettes don't cross-bleed. Sub-texel
+ * radii keep the sharp result bit-exact, so a 0° sun is untouched.
+ *
+ * Point lights keep radius 0 for now (their angular size is per-pixel;
+ * same deliberate deferral as the material disc).
+ */
+export function createGiLightShadowWidePass({
+  gbuffer, source, dist, target, slots, span, width, height, resolveWidth, resolveHeight,
+  cameraPosition, capFrac = 0.1,
+}) {
+  const widthU = uniform(width, "uint");
+  const positionNode = texture(gbuffer.position);
+  const normalNode = texture(gbuffer.normal);
+  const sourceNode = texture(source);
+  const distNode = texture(dist);
+  const sx = resolveWidth / width;
+  const sy = resolveHeight / height;
+
+  const compute = Fn(() => {
+    const px = instanceIndex.mod(widthU);
+    const py = instanceIndex.div(widthU);
+    const coord = ivec2(px.toInt(), py.toInt());
+    const uv0 = vec2(
+      px.toFloat().add(0.5).div(width),
+      py.toFloat().add(0.5).div(height),
+    ).toVar();
+    const gCoord = ivec2(
+      px.toFloat().add(0.5).mul(sx).toInt(),
+      py.toFloat().add(0.5).mul(sy).toInt(),
+    );
+    const center = vec4(sourceNode.load(coord)).toVar();
+    const out = center.toVar();
+    const g0 = positionNode.load(gCoord).toVar();
+    If(g0.w.greaterThan(0.5), () => {
+      const P = g0.xyz.toVar();
+      const N = vec3(normalNode.load(gCoord).xyz).normalize().toVar();
+      const viewDist = P.sub(vec3(cameraPosition)).length().max(0.05).toVar();
+      // Blocker distance per channel: own texel plus a 4-tap max search so
+      // the penumbra extends OUTSIDE the geometric silhouette instead of
+      // clipping at its edge (misses write 0).
+      const texelUv = vec2(1 / width, 1 / height);
+      const t3 = texelUv.mul(3);
+      const blocker = vec4(distNode.load(coord))
+        .max(distNode.sample(uv0.add(vec2(t3.x, 0))).level(0))
+        .max(distNode.sample(uv0.sub(vec2(t3.x, 0))).level(0))
+        .max(distNode.sample(uv0.add(vec2(0, t3.y))).level(0))
+        .max(distNode.sample(uv0.sub(vec2(0, t3.y))).level(0))
+        .toVar();
+      // Per-slot radius in SHADOW texels. World width → screen fraction is
+      // w/(2·tan(fov/2)·viewDist); 1.2 ≈ that fov term at a 60° camera.
+      const blockerCh = [blocker.x, blocker.y, blocker.z, blocker.w];
+      const radii = Array.from({ length: 4 }, (_, i) => {
+        const slot = slots[i];
+        if (!slot) return float(0).toVar();
+        const tanHalf = tan(float(slot.soft).min(1.0472)); // ≤60° half-angle
+        return blockerCh[i].mul(float(span)).mul(tanHalf)
+          .mul(float(slot.kind)) // directional only
+          .mul(slot.giShadow).mul(slot.active)
+          .mul(1.2).div(viewDist)
+          .mul(height) // → texels
+          // RESOLUTION-PROPORTIONAL cap (`capFrac` of frame height), not a
+          // fixed texel count: a fixed 40 was 13% of the probe rig's height
+          // but only 5% at the real 900k budget — the 90° hard edge
+          // survived exactly because the cap shrank on real scenes. Two
+          // CHAINED instances (0.08 then 0.25) compound to the huge radii a
+          // 90° source demands: at that angle the penumbra width equals the
+          // blocker distance, which routinely EXCEEDS the whole geometric
+          // shadow — the average over that footprint is what lifts the
+          // shadow CORE toward its true partial visibility (Blender's 90°
+          // look is mostly-lit wash, not a blurred black blob).
+          .clamp(0, height * capFrac)
+          .toVar();
+      });
+      const rMax = radii[0].max(radii[1]).max(radii[2]).max(radii[3]).toVar();
+      const dbgMode = globalThis.__giWideRadiusDebug;
+      if (dbgMode === true || typeof dbgMode === "string") {
+        // FACTOR MAPS instead of a blur (channel 0 only — the probe's
+        // readback is single-channel): true→radius/cap, "blocker",
+        // "tan" (tanHalf/2), "vd" (viewDist/30). The locator for "the wide
+        // pass changes nothing" bugs.
+        const paint =
+          dbgMode === "blocker" ? blocker.x
+          : dbgMode === "tan" ? float(slots[0] ? tan(float(slots[0].soft).min(1.0472)) : 0).div(2)
+          : dbgMode === "vd" ? viewDist.div(30)
+          : dbgMode === "span" ? float(span).div(30)
+          : dbgMode === "soft" ? null
+          : rMax.div(height * capFrac);
+        if (paint) out.assign(vec4(paint, paint, paint, 1));
+      }
+      const wideBody = () => {
+        const rotA = fract(
+          fract(float(coord.x).mul(0.06711056).add(float(coord.y).mul(0.00583715)))
+            .mul(52.9829189),
+        ).mul(Math.PI * 2).toVar();
+        const acc = vec4(0).toVar();
+        const wSum = vec4(0).toVar();
+        for (let k = 0; k < 16; k++) {
+          const tapR = rMax.mul(Math.sqrt((k + 0.5) / 16)).toVar();
+          const a = rotA.add(k * 2.399963);
+          const uv = uv0.add(vec2(cos(a).mul(tapR).div(width), sin(a).mul(tapR).div(height))).toVar();
+          const s = vec4(sourceNode.sample(uv).level(0)).toVar();
+          const g = vec4(positionNode.sample(uv).level(0)).toVar();
+          const rel = g.xyz.sub(P);
+          // Receiver-plane validity: in-plane taps pass at any radius,
+          // cross-silhouette taps fail (the material disc's v2 rule).
+          const ok = g.w.greaterThan(0.5)
+            .and(N.dot(rel).abs().lessThan(rel.length().mul(0.2).add(0.15)));
+          // Each channel accepts the tap only within ITS radius — one
+          // spiral serves four different penumbra widths.
+          const chanOk = vec4(
+            select(ok.and(tapR.lessThanEqual(radii[0])), 1, 0),
+            select(ok.and(tapR.lessThanEqual(radii[1])), 1, 0),
+            select(ok.and(tapR.lessThanEqual(radii[2])), 1, 0),
+            select(ok.and(tapR.lessThanEqual(radii[3])), 1, 0),
+          ).toVar();
+          acc.addAssign(s.mul(chanOk));
+          wSum.addAssign(chanOk);
+        }
+        const soft = acc.add(center).div(wSum.add(1)).toVar();
+        // Fade the wide result in per channel as its radius clears a couple
+        // of texels — sharp shadows stay bit-exact.
+        const softness = vec4(
+          smoothstep(0.75, 3, radii[0]),
+          smoothstep(0.75, 3, radii[1]),
+          smoothstep(0.75, 3, radii[2]),
+          smoothstep(0.75, 3, radii[3]),
+        );
+        // `__giWideRadiusDebug === "soft"` paints the raw spiral average —
+        // splits "spiral gathers nothing" from "the softness mix discards
+        // it" when the wide pass reads as a no-op.
+        out.assign(globalThis.__giWideRadiusDebug === "soft" ? soft : mix(center, soft, softness));
+      };
+      if (dbgMode === undefined || dbgMode === false || dbgMode === "soft") If(rMax.greaterThan(0.75), wideBody);
+    });
+    textureStore(target, coord, out);
+  })().compute(width * height);
+
+  return { compute, widthU };
+}
+
+/**
  * Copies the filtered+accumulated shadow result and the gbuffer position into
  * the HISTORY textures for the next frame's reprojection. A separate pass, not
  * folded into the filter: the filter READS history at reprojected (≠ own)
@@ -962,7 +1194,7 @@ let targetGeneration = 0;
  * material compiled against one of these textures keeps that binding until
  * it is recompiled — and never recompiling materials is the entire point.
  */
-export function createGiTargets(width, height, shadowWidth = width, shadowHeight = height) {
+export function createGiTargets(width, height, shadowWidth = width, shadowHeight = height, { emitterWidth = shadowWidth, emitterHeight = shadowHeight } = {}) {
   // WHY THE VERSION IS FORCED: three invalidates a cached bind group only when
   // `binding.generation !== textureData.generation` (Bindings._update), and
   // `textureData.generation` is just `texture.version` (Textures.updateTexture).
@@ -981,9 +1213,22 @@ export function createGiTargets(width, height, shadowWidth = width, shadowHeight
   irradiance.type = THREE.HalfFloatType;
   irradiance.name = "giIrradiance";
   irradiance.version = version;
-  const emitterShadow = new THREE.StorageTexture(width, height);
+  // SHADOW-CHANNEL resolution since 2026-08-06: the emitter shadow traces
+  // moved out of the resolve kernel into their own pass at the shadow-pass
+  // pixel budget (the same split that took the direct arm from 22ms to
+  // 5.4ms) — the texture follows the pass. Materials sample it by UV, so
+  // the resolution change is transparent to them; it also finally matches
+  // the shadow-res texel size `giScreenTexel` advertises to the material
+  // bilateral. `emitterShadowRaw` is the unfiltered trace output the
+  // edge-aware filter pass averages into `emitterShadow` — the emitter
+  // channel never had ANY spatial filter before, which is a good part of
+  // why coarse-voxel presets read blocky.
+  const emitterShadow = new THREE.StorageTexture(emitterWidth, emitterHeight);
   emitterShadow.name = "giEmitterShadow";
   emitterShadow.version = version;
+  const emitterShadowRaw = new THREE.StorageTexture(emitterWidth, emitterHeight);
+  emitterShadowRaw.name = "giEmitterShadowRaw";
+  emitterShadowRaw.version = version;
   const radiance = new THREE.StorageTexture(width, height);
   radiance.type = THREE.HalfFloatType;
   radiance.name = "giRadiance";
@@ -1005,34 +1250,25 @@ export function createGiTargets(width, height, shadowWidth = width, shadowHeight
   const lightShadow = new THREE.StorageTexture(shadowWidth, shadowHeight);
   lightShadow.name = "giLightShadow";
   lightShadow.version = version;
-  // The trace's UNFILTERED output. The sun-disc stochastic march resolves
-  // each pixel's visibility along ONE jittered sun direction — correct in
-  // expectation but dithered (IGN) inside penumbras. The filter pass
+  // The trace's UNFILTERED output. The march resolves each pixel's
+  // visibility along the central (analytic-width arm) or one jittered
+  // (stochastic arm) sun direction; the filter pass
   // (createGiLightShadowFilterPass) averages it into `lightShadow`, which is
   // what materials sample; nothing ever binds the raw texture but the two
   // passes.
   const lightShadowRaw = new THREE.StorageTexture(shadowWidth, shadowHeight);
   lightShadowRaw.name = "giLightShadowRaw";
   lightShadowRaw.version = version;
-  // The ACCUMULATED signal (filter+temporal output). Materials do NOT sample
-  // this — a second, history-free filter pass cleans it into `lightShadow`.
-  // The split is what keeps the presentation blur OUTSIDE the accumulation
-  // loop: post-filtering the fed-back signal would convolve it once per
-  // frame and progressively wash every penumbra to flat grey.
-  const lightShadowAccum = new THREE.StorageTexture(shadowWidth, shadowHeight);
-  lightShadowAccum.name = "giLightShadowAccum";
-  lightShadowAccum.version = version;
-  // Temporal history for the shadow channel (createGiLightShadowFilterPass's
-  // reprojection): last frame's accumulated shadow + the world position it
-  // was resolved for (full float — half precision at world scale is ~3cm at
-  // 50m, the same order as the validity epsilon).
-  const lightShadowHist = new THREE.StorageTexture(shadowWidth, shadowHeight);
-  lightShadowHist.name = "giLightShadowHist";
-  lightShadowHist.version = version;
-  const lightShadowHistPos = new THREE.StorageTexture(shadowWidth, shadowHeight);
-  lightShadowHistPos.type = THREE.FloatType;
-  lightShadowHistPos.name = "giLightShadowHistPos";
-  lightShadowHistPos.version = version;
+  // Intermediates for the wide-penumbra chain (analytic chain with PCSS:
+  // trace → raw → filter → MID → wide₁ → WIDE → wide₂ → lightShadow). Two
+  // more rgba8 at shadow res; unconditional for the same non-forking reason
+  // as `lightShadowRaw`.
+  const lightShadowMid = new THREE.StorageTexture(shadowWidth, shadowHeight);
+  lightShadowMid.name = "giLightShadowMid";
+  lightShadowMid.version = version;
+  const lightShadowWide = new THREE.StorageTexture(shadowWidth, shadowHeight);
+  lightShadowWide.name = "giLightShadowWide";
+  lightShadowWide.version = version;
   // PCSS blocker distance, one channel per light slot like `lightShadow`:
   // the trace's occluder distance normalized by the shadow span, driving the
   // sample-time penumbra radius (tan(sourceAngle) x blockerDist — Blender sun
@@ -1045,28 +1281,68 @@ export function createGiTargets(width, height, shadowWidth = width, shadowHeight
   lightShadowDist.name = "giLightShadowDist";
   lightShadowDist.version = version;
   if (import.meta.env?.DEV) globalThis.__giLastTargetVersion = version;
-  return {
+  const targets = {
     irradiance,
     emitterShadow,
+    emitterShadowRaw,
     radiance,
     lightShadow,
     lightShadowRaw,
-    lightShadowAccum,
-    lightShadowHist,
-    lightShadowHistPos,
+    lightShadowMid,
+    lightShadowWide,
+    // TEMPORAL TRIO — LAZY (2026-08-06, the analytic-width default): the
+    // accumulate/history chain only exists on the stochastic A/B arm, and
+    // its history-position texture alone is 14.4MB of rgba32float at the
+    // 900k shadow budget (~22MB for the trio). `ensureShadowTemporal()`
+    // creates them on demand when a stochastic build actually asks — so an
+    // arm flip via `__giShadowAnalyticWidth = false` + rebuild still works
+    // against the SAME persistent targets object.
+    lightShadowAccum: null,
+    lightShadowHist: null,
+    lightShadowHistPos: null,
     lightShadowDist,
+    ensureShadowTemporal() {
+      if (this.lightShadowAccum) return;
+      const v = globalThis.__giNoTargetVersion ? 0 : ++targetGeneration;
+      // The ACCUMULATED signal (filter+temporal output). Materials do NOT
+      // sample this — a second, history-free filter pass cleans it into
+      // `lightShadow`. The split keeps the presentation blur OUTSIDE the
+      // accumulation loop: post-filtering the fed-back signal would
+      // convolve it once per frame and wash every penumbra to flat grey.
+      const accum = new THREE.StorageTexture(shadowWidth, shadowHeight);
+      accum.name = "giLightShadowAccum";
+      accum.version = v;
+      // Temporal history (createGiLightShadowFilterPass's reprojection):
+      // last frame's accumulated shadow + the world position it was
+      // resolved for (full float — half precision at world scale is ~3cm
+      // at 50m, the same order as the validity epsilon).
+      const hist = new THREE.StorageTexture(shadowWidth, shadowHeight);
+      hist.name = "giLightShadowHist";
+      hist.version = v;
+      const histPos = new THREE.StorageTexture(shadowWidth, shadowHeight);
+      histPos.type = THREE.FloatType;
+      histPos.name = "giLightShadowHistPos";
+      histPos.version = v;
+      this.lightShadowAccum = accum;
+      this.lightShadowHist = hist;
+      this.lightShadowHistPos = histPos;
+    },
     dispose() {
       irradiance.dispose();
       emitterShadow.dispose();
+      emitterShadowRaw.dispose();
       radiance.dispose();
       lightShadow.dispose();
       lightShadowRaw.dispose();
-      lightShadowAccum.dispose();
-      lightShadowHist.dispose();
-      lightShadowHistPos.dispose();
+      lightShadowMid.dispose();
+      lightShadowWide.dispose();
+      this.lightShadowAccum?.dispose();
+      this.lightShadowHist?.dispose();
+      this.lightShadowHistPos?.dispose();
       lightShadowDist.dispose();
     },
   };
+  return targets;
 }
 
 /**

@@ -81,7 +81,8 @@ defineOp({
 defineOp({
   name: "material.get",
   readOnly: true,
-  description: "Read a .mat asset's definition.",
+  description:
+    "Read a .mat asset's definition: colour, roughness, metalness, texture map paths and pipeline flags. Read before material.set so you patch rather than replace.",
   params: { path: { type: "string", required: true } },
   async run({ path }) {
     const contents = await invoke("read_text_file", { path: insideProject(path) });

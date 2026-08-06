@@ -39,7 +39,11 @@ import {
   SquareMinus,
   SquarePlus,
   Target,
+  AlignCenter,
+  AlignLeft,
+  AlignRight,
   Trash2,
+  Type,
   Undo2,
   Unlock,
   Wand2,
@@ -56,7 +60,13 @@ import { pushToast } from "../toasts.js";
 import { ContextMenu } from "../ContextMenu.jsx";
 import { SelectField } from "../fields/SelectField.jsx";
 import { TexturePicker } from "./TexturePicker.jsx";
-import { NEW_TEXTURE_EVENT, consumeNewTextureRequest } from "../textureEditorRequest.js";
+import {
+  NEW_TEXTURE_EVENT,
+  TEXT_FONT_EVENT,
+  consumeNewTextureRequest,
+  currentTextToolFont,
+  setTextToolFont,
+} from "../textureEditorRequest.js";
 import {
   createTextureAsset,
   openTextureDocument,
@@ -157,6 +167,7 @@ import {
   documentEntry,
   regionEntry,
 } from "../texture/history.js";
+import { rasterizeTextStroke } from "../texture/text.js";
 
 /**
  * The texture editor: paint, layers, selections, save.
@@ -199,12 +210,39 @@ const TOOLS = [
   { id: "lasso", label: "Lasso", Icon: Lasso, key: "L" },
   { id: "wand", label: "Magic Wand", Icon: Wand2, key: "W" },
   { id: "eyedropper", label: "Eyedropper", Icon: Pipette, key: "I" },
+  { id: "text", label: "Text", Icon: Type, key: "T" },
   { id: "move", label: "Move Layer", Icon: Move, key: "V" },
+];
+
+/** What the Text tool draws with when no project font is chosen. */
+const SYSTEM_FONT_STACK = "system-ui, sans-serif";
+
+/**
+ * System stacks offered alongside the project's own fonts.
+ *
+ * Not a font picker over everything installed — the browser cannot enumerate
+ * local fonts without a permission prompt, and a texture that renders with
+ * whatever happens to be on the author's machine is a texture that looks
+ * different on someone else's. These four are generic families every platform
+ * resolves to something, and the honest answer for anything specific is to
+ * import the font as a project asset.
+ */
+const SYSTEM_FONTS = [
+  { value: SYSTEM_FONT_STACK, label: "System Sans" },
+  { value: "Georgia, 'Times New Roman', serif", label: "System Serif" },
+  { value: "ui-monospace, Consolas, monospace", label: "System Mono" },
+  { value: "Impact, 'Arial Black', sans-serif", label: "Display" },
 ];
 
 const SHAPE_TOOLS = new Set(["line", "rect", "ellipse"]);
 const SELECT_TOOLS = new Set(["selectRect", "selectEllipse", "lasso", "wand"]);
 const PAINT_TOOLS = new Set(["brush", "eraser", "line", "rect", "ellipse"]);
+
+const TEXT_ALIGNS = [
+  { id: "left", label: "Left", Icon: AlignLeft },
+  { id: "center", label: "Center", Icon: AlignCenter },
+  { id: "right", label: "Right", Icon: AlignRight },
+];
 
 const SELECT_MODES = [
   { id: "replace", label: "Replace", Icon: SquareDashed },
@@ -390,6 +428,18 @@ function TextureWorkspace({ path, onPathChange, onAtlasChange, onSliceIntoSprite
   const [shapeFill, setShapeFill] = useState(true);
   const [gradientType, setGradientType] = useState("linear");
   const [selectMode, setSelectMode] = useState("replace");
+  // Text tool. `textFont` is a project font asset path, or "" for a system
+  // stack — the same distinction UI Text draws, and for the same reason: a
+  // generated family that can't collide with anything installed locally.
+  const [textFont, setTextFont] = useState(() => currentTextToolFont());
+  const [textSize, setTextSize] = useState(48);
+  const [textBold, setTextBold] = useState(false);
+  const [textItalic, setTextItalic] = useState(false);
+  const [textAlign, setTextAlign] = useState("left");
+  const [textOutline, setTextOutline] = useState(0);
+  const [textLineHeight, setTextLineHeight] = useState(1.2);
+  const [projectFonts, setProjectFonts] = useState([]);
+  const [textFontFamily, setTextFontFamily] = useState(SYSTEM_FONT_STACK);
   const [tiling, setTiling] = useState(false);
 
   const historyRef = useRef(createHistory());
@@ -1163,7 +1213,76 @@ function TextureWorkspace({ path, onPathChange, onAtlasChange, onSliceIntoSprite
     shapeFill,
     gradientType,
     selectMode,
+    // The Text tool's style, as one object so the canvas can hand it straight
+    // to the rasterizer.
+    text: {
+      fontFamily: textFontFamily,
+      fontSize: textSize,
+      bold: textBold,
+      italic: textItalic,
+      align: textAlign,
+      outlineWidth: textOutline,
+      lineHeight: textLineHeight,
+    },
   };
+  // The project's own fonts, for the Text tool's picker. Refreshed with the
+  // project so a font imported from the Fonts panel while this is open shows
+  // up without a reload.
+  const projectRoot = useProjectStore((state) => state.rootPath);
+  const projectVersion = useProjectStore((state) => state.entries);
+  useEffect(() => {
+    let live = true;
+    if (!projectRoot) {
+      setProjectFonts([]);
+      return undefined;
+    }
+    (async () => {
+      const { listProjectAssets, FONT_EXTENSIONS } = await import("../assetLoader.js");
+      const paths = await listProjectAssets(projectRoot, FONT_EXTENSIONS, 6);
+      if (live) setProjectFonts(paths);
+    })().catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [projectRoot, projectVersion]);
+
+  // The Inspector's "Use in Texture Editor" action sets the font through a
+  // latch, because it also opens this panel and the panel may not exist yet
+  // when it fires (see textureEditorRequest.js).
+  useEffect(() => {
+    const onFont = (event) => setTextFont(event.detail ?? "");
+    window.addEventListener(TEXT_FONT_EVENT, onFont);
+    return () => window.removeEventListener(TEXT_FONT_EVENT, onFont);
+  }, []);
+
+  /**
+   * Resolves the chosen font to a CSS family the canvas can actually use.
+   *
+   * A project font has to be registered with the platform before `ctx.font`
+   * will honour it, and rasterizing one texel too early silently falls back to
+   * the default face — which looks like the wrong font was picked rather than
+   * like a race. So the family only changes once the load has resolved.
+   */
+  useEffect(() => {
+    let live = true;
+    if (!textFont) {
+      setTextFontFamily(SYSTEM_FONT_STACK);
+      return undefined;
+    }
+    import("../../engine/ui/fontAsset.js")
+      .then(({ ensureFontLoaded }) => ensureFontLoaded(textFont))
+      .then((entry) => {
+        if (live && entry?.loaded) setTextFontFamily(`"${entry.family}", ${SYSTEM_FONT_STACK}`);
+      })
+      .catch((error) => {
+        console.error(`Couldn't load font "${basename(textFont)}": ${error?.message ?? error}`);
+        if (live) setTextFontFamily(SYSTEM_FONT_STACK);
+      });
+    return () => {
+      live = false;
+    };
+  }, [textFont]);
+
   // Leaving mask mode when the layer's mask goes away — otherwise the brush
   // silently paints colour where the user expects to be shaping visibility.
   // In an effect, not during render: a setState in the render body of a
@@ -1273,6 +1392,24 @@ function TextureWorkspace({ path, onPathChange, onAtlasChange, onSliceIntoSprite
             onDeselect={deselect}
             onInvert={invert}
             hasSelection={!!selectionRef.current}
+            textFont={textFont}
+            onTextFont={(value) => {
+              setTextFont(value);
+              setTextToolFont(value);
+            }}
+            projectFonts={projectFonts}
+            textSize={textSize}
+            onTextSize={setTextSize}
+            textBold={textBold}
+            onTextBold={setTextBold}
+            textItalic={textItalic}
+            onTextItalic={setTextItalic}
+            textAlign={textAlign}
+            onTextAlign={setTextAlign}
+            textOutline={textOutline}
+            onTextOutline={setTextOutline}
+            textLineHeight={textLineHeight}
+            onTextLineHeight={setTextLineHeight}
           />
 
           {status === "loading" && <div className="panel-empty">Loading texture…</div>}
@@ -2005,6 +2142,141 @@ function TextureCanvas({
     };
   }, []);
 
+  // --- text tool ----------------------------------------------------------
+  //
+  // Typing is not a drag gesture, so it lives outside `gestureRef`: a text box
+  // stays open across pointer events, keystrokes and tool-option changes until
+  // it is committed or cancelled. The live preview works by keeping a clean
+  // copy of the layer (`base`) and re-applying `base + rasterized text` on
+  // every change — the same restore-and-reapply the shape tools use, which is
+  // what makes the preview WYSIWYG rather than an approximation drawn on top.
+  const textRef = useRef(null);
+  const [textBox, setTextBox] = useState(null); // mirrors textRef for rendering
+  const textAreaRef = useRef(null);
+
+  /** Re-renders the in-progress text into the layer from the clean base. */
+  const paintText = useCallback(() => {
+    const entry = textRef.current;
+    if (!entry || !layer) return;
+    const tp = toolRef.current;
+    // Restore the whole layer rather than the last dirty rect: text can shrink
+    // (deleting a character, switching to a smaller size) and a rect-only
+    // restore leaves the tail of the previous string behind.
+    layer.buffer.data.set(entry.base.data);
+    const stroke = rasterizeTextStroke(doc.width, doc.height, {
+      x: entry.x,
+      y: entry.y,
+      text: entry.text,
+      ...tp.text,
+    });
+    if (stroke) {
+      applyStroke(layer.buffer, stroke, {
+        color: parseColor(tp.color, tp.alpha),
+        opacity: tp.opacity,
+        blend: "normal",
+        selection: selectionRef.current,
+      });
+    }
+    entry.lastStroke = stroke;
+    onEdited(null);
+  }, [layer, doc.width, doc.height, onEdited, selectionRef]);
+
+  const beginText = useCallback(
+    (point) => {
+      if (!layer || layer.locked) return;
+      const entry = {
+        // Snapped to whole texels: a baseline at x.5 makes canvas antialias
+        // every glyph horizontally, and typed text on a 64px icon looks
+        // blurred for no reason the user can see.
+        x: Math.round(point.x),
+        y: Math.round(point.y),
+        text: "",
+        base: cloneBuffer(layer.buffer),
+        lastStroke: null,
+      };
+      textRef.current = entry;
+      setTextBox({ x: entry.x, y: entry.y });
+      // Focus after the overlay has actually mounted.
+      requestAnimationFrame(() => textAreaRef.current?.focus());
+    },
+    [layer],
+  );
+
+  const cancelText = useCallback(() => {
+    const entry = textRef.current;
+    textRef.current = null;
+    setTextBox(null);
+    if (!entry || !layer) return;
+    layer.buffer.data.set(entry.base.data);
+    onEdited(null);
+  }, [layer, onEdited]);
+
+  const commitText = useCallback(() => {
+    const entry = textRef.current;
+    textRef.current = null;
+    setTextBox(null);
+    if (!entry || !layer) return;
+    if (!entry.text.trim() || !entry.lastStroke) {
+      // Nothing typed — put the layer back exactly as it was rather than
+      // pushing an empty undo step.
+      layer.buffer.data.set(entry.base.data);
+      onEdited(null);
+      return;
+    }
+    const rect = { ...entry.lastStroke.dirty };
+    const snapshot = captureRegion(entry.base, rect);
+    onHistory(regionEntry(layer.buffer, rect, snapshot, "Text"));
+    onTouched?.();
+    onEdited(rect);
+  }, [layer, onHistory, onEdited, onTouched]);
+
+  // Re-render the preview when a tool option changes mid-typing, so adjusting
+  // the size slider with a box open shows the result immediately.
+  useEffect(() => {
+    if (textRef.current) paintText();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    toolProps.text?.fontFamily,
+    toolProps.text?.fontSize,
+    toolProps.text?.bold,
+    toolProps.text?.italic,
+    toolProps.text?.align,
+    toolProps.text?.outlineWidth,
+    toolProps.text?.lineHeight,
+    toolProps.color,
+    toolProps.alpha,
+    toolProps.opacity,
+  ]);
+
+  // Switching tools, layers or documents ends the box rather than leaving an
+  // orphaned preview baked into a layer nobody is editing anymore.
+  useEffect(() => {
+    if (textRef.current && toolProps.tool !== "text") commitText();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [toolProps.tool]);
+  // Unmounting with a box open commits it rather than losing what was typed.
+  // Through a ref, because an empty-dependency cleanup would otherwise capture
+  // the FIRST render's `commitText` — and with it a `layer` that is null on
+  // mount, so the commit would silently do nothing.
+  const commitTextRef = useRef(commitText);
+  commitTextRef.current = commitText;
+  useEffect(
+    () => () => {
+      if (textRef.current) commitTextRef.current();
+    },
+    [],
+  );
+
+  /** Where the text box floats, in wrapper-relative screen pixels. */
+  const textScreen = useMemo(() => {
+    if (!textBox) return null;
+    const { zoom, x, y } = viewRef.current;
+    return { left: textBox.x * zoom + x, top: textBox.y * zoom + y };
+    // viewVersion is the signal that zoom/pan changed — the ref itself can't
+    // be a dependency.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [textBox, viewVersion]);
+
   // --- gestures -----------------------------------------------------------
   const beginStroke = useCallback(
     (point) => {
@@ -2101,6 +2373,15 @@ function TextureCanvas({
         if (picked) onPickColor(toHex(picked));
         return;
       }
+      if (tp.tool === "text") {
+        if (!layer || layer.locked) return;
+        // Clicking while a text box is open commits it and starts another,
+        // which is how every paint program behaves and is much less annoying
+        // than being trapped in one box until you find the confirm button.
+        if (textRef.current) commitText();
+        beginText(point);
+        return;
+      }
       if (tp.tool === "move") {
         if (!layer || layer.locked) return;
         gestureRef.current = { kind: "move", start: point, origin: [...layer.offset], before: cloneDocument(doc) };
@@ -2174,7 +2455,7 @@ function TextureCanvas({
         y1: point.y + tp.brushSize,
       });
     },
-    [toDoc, layer, doc, composite, selectionRef, onSelection, onPickColor, onHistory, onEdited, beginStroke, applySegment],
+    [toDoc, layer, doc, composite, selectionRef, onSelection, onPickColor, onHistory, onEdited, beginStroke, applySegment, beginText, commitText],
   );
 
   const onPointerMove = useCallback(
@@ -2450,6 +2731,52 @@ function TextureCanvas({
           onContextMenu?.({ x: e.clientX, y: e.clientY });
         }}
       />
+      {textScreen && (
+        <div
+          className="texture-text-entry"
+          style={{ left: textScreen.left, top: textScreen.top }}
+          // The canvas below is listening for pointer-downs to start another
+          // text box; without this, clicking into the textarea to move the
+          // caret would commit the box you are typing in.
+          onPointerDown={(event) => event.stopPropagation()}
+        >
+          <textarea
+            ref={textAreaRef}
+            value={textBox?.text ?? ""}
+            placeholder="Type…"
+            spellCheck={false}
+            onChange={(event) => {
+              if (!textRef.current) return;
+              textRef.current.text = event.target.value;
+              setTextBox((current) => ({ ...current, text: event.target.value }));
+              paintText();
+            }}
+            onKeyDown={(event) => {
+              // Enter inserts a newline (text is multi-line); Ctrl/Cmd+Enter
+              // and Escape are the two ways out. Stopped from bubbling so the
+              // panel's single-letter tool shortcuts don't fire while typing.
+              event.stopPropagation();
+              if (event.key === "Escape") {
+                event.preventDefault();
+                cancelText();
+              } else if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+                event.preventDefault();
+                commitText();
+              }
+            }}
+          />
+          <div className="texture-text-actions">
+            <span className="hint">Ctrl+Enter to place · Esc to cancel</span>
+            <button className="tx-btn quiet" onClick={cancelText}>
+              Cancel
+            </button>
+            <button className="tx-btn primary" onClick={commitText}>
+              <Check size={13} />
+              Place
+            </button>
+          </div>
+        </div>
+      )}
       <div className="tx-readout" ref={readoutRef} />
       <div className="texture-view-controls">
         <button
@@ -2565,6 +2892,47 @@ function ToolOptions(props) {
       )}
       {tool === "gradient" && (
         <Segmented options={GRADIENT_TYPES} value={props.gradientType} onChange={props.onGradientType} />
+      )}
+      {tool === "text" && (
+        <>
+          <select
+            className="select-field texture-font-select"
+            value={props.textFont}
+            title="Project fonts are registered under a generated family, so a texture looks the same on every machine"
+            onChange={(event) => props.onTextFont(event.target.value)}
+          >
+            <optgroup label="System">
+              <option value="">System Sans</option>
+            </optgroup>
+            {props.projectFonts?.length > 0 && (
+              <optgroup label="Project fonts">
+                {props.projectFonts.map((fontPath) => (
+                  <option value={fontPath} key={fontPath}>
+                    {basename(fontPath)}
+                  </option>
+                ))}
+              </optgroup>
+            )}
+          </select>
+          <Slider Icon={Type} title="Font size" value={props.textSize} min={6} max={400} step={1} onChange={props.onTextSize} />
+          <button
+            className={`tx-icon-btn${props.textBold ? " active" : ""}`}
+            title="Bold"
+            onClick={() => props.onTextBold(!props.textBold)}
+          >
+            <b>B</b>
+          </button>
+          <button
+            className={`tx-icon-btn${props.textItalic ? " active" : ""}`}
+            title="Italic"
+            onClick={() => props.onTextItalic(!props.textItalic)}
+          >
+            <i>I</i>
+          </button>
+          <Segmented options={TEXT_ALIGNS} value={props.textAlign} onChange={props.onTextAlign} />
+          <Slider Icon={CircleSlash2} title="Outline width" value={props.textOutline} min={0} max={24} step={0.5} onChange={props.onTextOutline} />
+          <Slider Icon={LayersIcon} title="Line height" value={props.textLineHeight} min={0.6} max={3} step={0.05} onChange={props.onTextLineHeight} />
+        </>
       )}
       {showSelect && (
         <Segmented options={SELECT_MODES} value={props.selectMode} onChange={props.onSelectMode} />

@@ -1,15 +1,17 @@
 use serde::Serialize;
 use std::fs;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tauri::Manager;
 
 mod agent;
+mod git;
 mod mcp_clients;
 mod preview;
 mod pty;
 mod publish;
 mod share;
+mod watcher;
 
 #[derive(Serialize)]
 struct BasisCompressionInfo {
@@ -92,6 +94,7 @@ async fn compress_texture_basis(
 
 #[tauri::command]
 fn save_scene(path: String, contents: String) -> Result<(), String> {
+    watcher::note_self_write(&path);
     if let Some(parent) = Path::new(&path).parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -194,6 +197,68 @@ fn read_text_file(path: String) -> Result<String, String> {
     fs::read_to_string(&path).map_err(|e| e.to_string())
 }
 
+#[derive(Serialize)]
+struct TextFileEntry {
+    path: String,
+    contents: String,
+}
+
+/// Reads every file under `root` whose name ends with `suffix`, recursively.
+///
+/// This exists for exactly one caller — feeding the in-editor code editor's
+/// TypeScript service the project's vendored `@types/three`, which is ~970
+/// `.d.ts` files. Doing that as one `read_text_file` per file means ~970 IPC
+/// round trips and several seconds of stall before autocomplete knows what a
+/// `Vector3` is; doing it here is one round trip and a few tens of
+/// milliseconds, because the cost was never the reading.
+///
+/// `max_files` and `max_bytes` are a guard against being pointed at a project
+/// root by accident: the command stops early and reports what it read rather
+/// than trying to serialize a whole disk.
+#[tauri::command]
+fn read_text_files(
+    root: String,
+    suffix: String,
+    max_files: Option<usize>,
+    max_bytes: Option<u64>,
+) -> Result<Vec<TextFileEntry>, String> {
+    let max_files = max_files.unwrap_or(4000);
+    let max_bytes = max_bytes.unwrap_or(64 * 1024 * 1024);
+    let mut out: Vec<TextFileEntry> = Vec::new();
+    let mut total: u64 = 0;
+    let mut stack = vec![PathBuf::from(&root)];
+    while let Some(dir) = stack.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            // A missing subdirectory is not an error worth failing the whole
+            // read for — the caller wants whatever declarations exist.
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            if out.len() >= max_files || total >= max_bytes {
+                return Ok(out);
+            }
+            let path = entry.path();
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                stack.push(path);
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.ends_with(&suffix) {
+                continue;
+            }
+            if let Ok(contents) = fs::read_to_string(&path) {
+                total += contents.len() as u64;
+                out.push(TextFileEntry {
+                    path: path.to_string_lossy().into_owned(),
+                    contents,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Last-modified time in fractional seconds since the Unix epoch, used to
 /// detect script file changes for hot reload without a filesystem watcher.
 #[tauri::command]
@@ -210,18 +275,57 @@ fn stat_file(path: String) -> Result<f64, String> {
 
 /// Recursively copies `src` into `dst`, returning the number of files written.
 fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<u64> {
+    copy_dir_tracking(src, dst, "", &mut Vec::new(), &std::collections::HashSet::new())
+}
+
+/// `copy_dir`, but records the destination-relative path of every file that
+/// was actually (re)written, and skips anything in `exclude`. The live
+/// preview's hot-update client decides between an in-place refresh and a full
+/// page reload based on WHAT a rebuild touched — a runtime file from the
+/// player template in this list means "new engine code, reload the page".
+///
+/// `exclude` exists because the exporter REGENERATES some template files
+/// (index.html gets themed + the preview client injected). Copying the raw
+/// template over the themed copy first meant every rebuild rewrote
+/// index.html twice — and a manifest that says "index.html changed" on every
+/// build downgrades every material tweak to a full page reload.
+fn copy_dir_tracking(
+    src: &Path,
+    dst: &Path,
+    prefix: &str,
+    changed: &mut Vec<String>,
+    exclude: &std::collections::HashSet<&str>,
+) -> std::io::Result<u64> {
     fs::create_dir_all(dst)?;
     let mut copied = 0;
     for entry in fs::read_dir(src)? {
         let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let rel = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
         let dest = dst.join(entry.file_name());
         if entry.file_type()?.is_dir() {
-            copied += copy_dir(&entry.path(), &dest)?;
-        } else {
-            copied += copy_file_if_changed(&entry.path(), &dest)? as u64;
+            copied += copy_dir_tracking(&entry.path(), &dest, &rel, changed, exclude)?;
+        } else if exclude.contains(rel.as_str()) {
+            // The generated version is written (and diffed) by the caller.
+        } else if copy_file_if_changed(&entry.path(), &dest)? {
+            changed.push(rel);
+            copied += 1;
         }
     }
     Ok(copied)
+}
+
+/// Writes `contents` to `dest` (atomically) only when the bytes differ,
+/// returning whether a write happened. This is what keeps the live preview's
+/// change manifest honest: a generated file re-emitted identically on every
+/// rebuild must not read as "changed", or every material tweak would look
+/// like a full scene edit to the hot-update client.
+fn write_if_different(dest: &Path, contents: &[u8]) -> std::io::Result<bool> {
+    if fs::read(dest).map(|old| old == contents).unwrap_or(false) {
+        return Ok(false);
+    }
+    replace_atomically(dest, |staging| fs::write(staging, contents))?;
+    Ok(true)
 }
 
 /// Copies one file unless the destination is already at least as new and has
@@ -516,6 +620,16 @@ async fn rebuild_player_template() -> Result<(), String> {
 /// source paths of referenced assets that no longer exist on disk — a deleted
 /// asset a scene still points at is the caller's warning to surface, not a
 /// reason to refuse the whole build.
+/// What one export actually did: which referenced sources no longer exist, and
+/// which build-relative files were (re)written. `changed` feeds the live
+/// preview's revision manifest so the browser can update in place instead of
+/// reloading the whole page.
+#[derive(Serialize)]
+struct ExportGameReport {
+    missing: Vec<String>,
+    changed: Vec<String>,
+}
+
 #[tauri::command]
 fn export_game(
     app: tauri::AppHandle,
@@ -523,10 +637,16 @@ fn export_game(
     scene_json: String,
     assets: Vec<(String, String)>,
     files: Vec<(String, String)>,
-) -> Result<Vec<String>, String> {
+) -> Result<ExportGameReport, String> {
     let player = player_template_dir(&app)?;
     let out = Path::new(&out_dir);
-    copy_dir(&player, out).map_err(|e| {
+    let mut changed = Vec::new();
+    // Template files the exporter re-emits itself must not be copied raw
+    // first — the copy and the regeneration would take turns rewriting them,
+    // polluting the change manifest on every single rebuild.
+    let generated: std::collections::HashSet<&str> =
+        files.iter().map(|(rel, _)| rel.as_str()).collect();
+    copy_dir_tracking(&player, out, "", &mut changed, &generated).map_err(|e| {
         format!(
             "copy player template {} to {}: {e}",
             player.display(),
@@ -536,8 +656,11 @@ fn export_game(
     let scene_path = out.join("scene.json");
     // Atomic: a live browser preview is serving this exact file while the
     // rebuild runs (see replace_atomically).
-    replace_atomically(&scene_path, |staging| fs::write(staging, &scene_json))
-        .map_err(|e| format!("write {}: {e}", scene_path.display()))?;
+    if write_if_different(&scene_path, scene_json.as_bytes())
+        .map_err(|e| format!("write {}: {e}", scene_path.display()))?
+    {
+        changed.push("scene.json".into());
+    }
     let mut missing = Vec::new();
     for (src, rel) in assets {
         let dest = out.join(&rel);
@@ -546,7 +669,8 @@ fn export_game(
                 .map_err(|e| format!("create asset directory {}: {e}", parent.display()))?;
         }
         match copy_file_if_changed(Path::new(&src), &dest) {
-            Ok(_) => {}
+            Ok(true) => changed.push(rel),
+            Ok(false) => {}
             // Only a vanished source is survivable. Permission and disk
             // errors still fail: they would ship a silently incomplete build.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => missing.push(src),
@@ -560,10 +684,26 @@ fn export_game(
                 format!("create generated-file directory {}: {e}", parent.display())
             })?;
         }
-        replace_atomically(&dest, |staging| fs::write(staging, &contents))
-            .map_err(|e| format!("write generated file {}: {e}", dest.display()))?;
+        if write_if_different(&dest, contents.as_bytes())
+            .map_err(|e| format!("write generated file {}: {e}", dest.display()))?
+        {
+            changed.push(rel);
+        }
     }
-    Ok(missing)
+    Ok(ExportGameReport { missing, changed })
+}
+
+/// Atomic sibling of `save_scene`, for files that are READ WHILE BEING
+/// REWRITTEN — above all the live preview's revision manifest, which every
+/// connected browser polls once a second while the exporter replaces it.
+#[tauri::command]
+fn write_file_atomic(path: String, contents: String) -> Result<(), String> {
+    watcher::note_self_write(&path);
+    if let Some(parent) = Path::new(&path).parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    replace_atomically(Path::new(&path), |staging| fs::write(staging, &contents))
+        .map_err(|e| e.to_string())
 }
 
 /// Zips a directory's contents with the directory itself as the *root* of the
@@ -626,6 +766,7 @@ fn zip_dir(dir: String, dest: String) -> Result<u64, String> {
 /// Creates a directory (and any missing parents).
 #[tauri::command]
 fn create_dir(path: String) -> Result<(), String> {
+    watcher::note_self_write(&path);
     fs::create_dir_all(&path).map_err(|e| e.to_string())
 }
 
@@ -635,12 +776,15 @@ fn rename_path(from: String, to: String) -> Result<(), String> {
     if Path::new(&to).exists() {
         return Err(format!("\"{to}\" already exists"));
     }
+    watcher::note_self_write(&from);
+    watcher::note_self_write(&to);
     fs::rename(&from, &to).map_err(|e| e.to_string())
 }
 
 /// Deletes a file or directory (recursively).
 #[tauri::command]
 fn delete_path(path: String) -> Result<(), String> {
+    watcher::note_self_write(&path);
     let p = Path::new(&path);
     if p.is_dir() {
         fs::remove_dir_all(p).map_err(|e| e.to_string())
@@ -692,6 +836,7 @@ fn import_files(paths: Vec<String>, dest_dir: String) -> Result<Vec<String>, Str
 /// output is otherwise invisible during `tauri dev`).
 #[tauri::command]
 fn write_binary_file(path: String, contents: Vec<u8>) -> Result<(), String> {
+    watcher::note_self_write(&path);
     if let Some(parent) = Path::new(&path).parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -747,6 +892,7 @@ fn write_binary_file_raw(request: tauri::ipc::Request<'_>) -> Result<(), String>
     let tauri::ipc::InvokeBody::Raw(contents) = request.body() else {
         return Err("write_binary_file_raw: expected a raw byte body".to_string());
     };
+    watcher::note_self_write(&path);
     if let Some(parent) = Path::new(&path).parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -923,6 +1069,126 @@ async fn fetch_sketchfab_text(url: String, token: Option<String>) -> Result<Stri
     .map_err(|e| e.to_string())?
 }
 
+/// itch.io's authenticated endpoints (owned library, uploads, download links)
+/// live on `api.itch.io` and, like Sketchfab, don't send CORS headers, so a
+/// direct browser fetch from the webview fails. Same shape as
+/// `fetch_sketchfab_text`: a hardcoded host allowlist keeps the personal API
+/// key from ever being attached to an arbitrary URL, and the key rides as a
+/// `Bearer` header rather than through JS `fetch`. Unlike Sketchfab, itch.io
+/// has one credential shape — API keys generated from account settings are
+/// unscoped bearer tokens — so there's no OAuth/legacy scheme fallback to try.
+///
+/// Note for future maintenance: the owned-library (`/profile/owned-keys`),
+/// per-game upload listing (`/games/{id}/uploads`) and download-link
+/// (`/uploads/{id}/download`) endpoints are not part of itch.io's published
+/// API reference — they're the same endpoints the official itch.io desktop
+/// app calls, reverse-engineered by the community. They've been stable for
+/// years but carry no compatibility guarantee; if itch.io ever changes their
+/// shape, `src/editor/itchio.js` is where the field names live.
+#[tauri::command]
+async fn fetch_itchio_text(url: String, token: Option<String>) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let parsed = url::Url::parse(&url).map_err(|e| format!("bad itch.io URL: {e}"))?;
+        if parsed.scheme() != "https" || parsed.host_str() != Some("api.itch.io") {
+            return Err("itch.io API requests must use https://api.itch.io".to_string());
+        }
+
+        let mut req = ureq::get(&url)
+            .set("User-Agent", "three-engine/0.1")
+            .set("Accept", "application/json");
+        if let Some(value) = token.as_deref().filter(|value| !value.is_empty()) {
+            req = req.set("Authorization", &format!("Bearer {value}"));
+        }
+        let response = req.call().map_err(|e| format!("itch.io API: {e}"))?;
+        response
+            .into_string()
+            .map_err(|e| format!("read itch.io response: {e}"))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Freesound's `apiv2` JSON endpoints. Freesound *does* send
+/// `Access-Control-Allow-Origin: *`, so unlike Sketchfab/itch.io this isn't a
+/// CORS workaround — it exists so the personal API key is attached
+/// server-side and never reaches JS `fetch`, with the same hardcoded host
+/// allowlist keeping it from leaking to an arbitrary URL.
+///
+/// Only the JSON API needs this. Verified against the live CDN: sound
+/// previews (`cdn.freesound.org/previews/…`) and waveform images
+/// (`…/displays/…`) are served publicly with no credentials, so playback goes
+/// through a plain `<audio>`/`<img>` src and the import download reuses the
+/// generic `fetch_bytes`.
+///
+/// Errors arrive as HTTP 401/429 with a JSON `{"detail": "…"}` body, which
+/// `ureq` turns into a `Status` error whose body we'd otherwise drop — so the
+/// body is read back out and returned, or "Authentication credentials were
+/// not provided" surfaces in the panel as a bare `401`.
+#[tauri::command]
+async fn fetch_freesound_text(url: String, token: Option<String>) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let parsed = url::Url::parse(&url).map_err(|e| format!("bad Freesound URL: {e}"))?;
+        if parsed.scheme() != "https" || parsed.host_str() != Some("freesound.org") {
+            return Err("Freesound API requests must use https://freesound.org".to_string());
+        }
+
+        let mut req = ureq::get(&url)
+            .set("User-Agent", "three-engine/0.1")
+            .set("Accept", "application/json");
+        if let Some(value) = token.as_deref().filter(|value| !value.is_empty()) {
+            req = req.set("Authorization", &format!("Token {value}"));
+        }
+        match req.call() {
+            Ok(response) => response
+                .into_string()
+                .map_err(|e| format!("read Freesound response: {e}")),
+            Err(ureq::Error::Status(code, response)) => {
+                let body = response.into_string().unwrap_or_default();
+                Err(format!("Freesound API {code}: {body}"))
+            }
+            Err(e) => Err(format!("Freesound API: {e}")),
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// itch.io has no public catalog/search API — only the per-account endpoints
+/// above. Browsing the *whole* store means fetching itch.io's own public
+/// browse/search HTML pages and parsing them client-side with the browser's
+/// native `DOMParser` (see itchioStore.js); this command only does the
+/// fetch, same CORS rationale as `fetch_text`. It's a dedicated command
+/// rather than reusing `fetch_text`: itch.io serves these pages to real
+/// browsers and, per manual testing against the live site, starts returning
+/// HTTP 429 after a handful of rapid requests — a convincing browser
+/// User-Agent (`fetch_text`'s is a custom UA string, fine for ambientCG's
+/// API but not for a page meant for humans) keeps normal, human-paced usage
+/// from tripping that. Host-locking to `itch.io` (not `api.itch.io`, and not
+/// the fully generic `fetch_text`) also keeps this proxy from being
+/// repurposed to fetch arbitrary URLs.
+#[tauri::command]
+async fn fetch_itchio_html(url: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let parsed = url::Url::parse(&url).map_err(|e| format!("bad itch.io URL: {e}"))?;
+        if parsed.scheme() != "https" || parsed.host_str() != Some("itch.io") {
+            return Err("itch.io page requests must use https://itch.io".to_string());
+        }
+        let response = ureq::get(&url)
+            .set(
+                "User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            )
+            .set("Accept", "text/html,application/xhtml+xml")
+            .call()
+            .map_err(|e| format!("itch.io: {e}"))?;
+        response
+            .into_string()
+            .map_err(|e| format!("read itch.io page: {e}"))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Proxies a `chat/completions`-shaped POST to an OpenAI-compatible endpoint
 /// (Ollama by default, or any self-hosted server speaking the same API) for
 /// the in-editor AI panel's tool-loop provider. Ollama only answers
@@ -975,10 +1241,55 @@ async fn ai_chat(url: String, api_key: Option<String>, body: String) -> Result<S
 #[cfg(test)]
 mod tests {
     use super::{
-        newest_player_source, percent_decode, player_checkout_root, validate_browser_preview_url,
-        zip_dir,
+        copy_dir_tracking, newest_player_source, percent_decode, player_checkout_root,
+        validate_browser_preview_url, write_if_different, zip_dir,
     };
     use std::fs;
+
+    /// The hot-update client trusts this list to tell a material tweak from an
+    /// engine rebuild — an unchanged file reported as changed downgrades every
+    /// in-place update to a page reload, and a changed file NOT reported means
+    /// the browser keeps running stale bytes.
+    #[test]
+    fn the_change_manifest_reports_exactly_what_was_written() {
+        let base = std::env::temp_dir().join("three-engine-manifest-test");
+        let _ = fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let dst = base.join("dst");
+        fs::create_dir_all(src.join("_engine")).unwrap();
+        fs::write(src.join("index.html"), "<!doctype html>").unwrap();
+        fs::write(src.join("_engine").join("player.js"), "boot()").unwrap();
+
+        let mut changed = Vec::new();
+        copy_dir_tracking(&src, &dst, "", &mut changed, &Default::default()).unwrap();
+        changed.sort();
+        assert_eq!(changed, vec!["_engine/player.js".to_string(), "index.html".to_string()]);
+
+        // Second pass over an unchanged tree: nothing may report as changed.
+        let mut second = Vec::new();
+        copy_dir_tracking(&src, &dst, "", &mut second, &Default::default()).unwrap();
+        assert!(second.is_empty(), "unchanged copies reported: {second:?}");
+
+        // A template file the exporter regenerates (the themed index.html)
+        // must be left to the generator. Without the exclusion, the raw copy
+        // and the themed write took turns rewriting it — "index.html changed"
+        // on EVERY rebuild, which reloaded the page for every material tweak.
+        fs::write(dst.join("index.html"), "<themed>").unwrap();
+        let mut third = Vec::new();
+        let generated = std::collections::HashSet::from(["index.html"]);
+        copy_dir_tracking(&src, &dst, "", &mut third, &generated).unwrap();
+        assert!(third.is_empty(), "excluded template file was copied: {third:?}");
+        assert_eq!(fs::read(dst.join("index.html")).unwrap(), b"<themed>");
+
+        let doc = dst.join("assets").join("m.mat");
+        fs::create_dir_all(doc.parent().unwrap()).unwrap();
+        assert!(write_if_different(&doc, b"{\"a\":1}").unwrap(), "first write");
+        assert!(!write_if_different(&doc, b"{\"a\":1}").unwrap(), "identical re-emit");
+        assert!(write_if_different(&doc, b"{\"a\":2}").unwrap(), "real edit");
+        assert_eq!(fs::read(&doc).unwrap(), b"{\"a\":2}");
+
+        let _ = fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn finds_the_dev_checkout_from_the_crate_dir() {
@@ -1084,6 +1395,9 @@ pub fn run() {
         .manage(preview::PreviewState::default())
         // The public share tunnel fronting the preview server, if one runs.
         .manage(share::ShareState::default())
+        // Watches the open project folder so a file written by anything other
+        // than the editor shows up without a restart.
+        .manage(watcher::WatchState::default())
         .invoke_handler(tauri::generate_handler![
             save_scene,
             load_scene,
@@ -1092,12 +1406,14 @@ pub fn run() {
             read_binary_file_head,
             file_size,
             read_text_file,
+            read_text_files,
             stat_file,
             create_dir,
             rename_path,
             delete_path,
             import_files,
             export_game,
+            write_file_atomic,
             read_player_template,
             player_template_status,
             rebuild_player_template,
@@ -1120,6 +1436,9 @@ pub fn run() {
             fetch_text,
             fetch_bytes,
             fetch_sketchfab_text,
+            fetch_itchio_text,
+            fetch_itchio_html,
+            fetch_freesound_text,
             ai_chat,
             pty::pty_spawn,
             pty::pty_write,
@@ -1131,7 +1450,13 @@ pub fn run() {
             mcp_clients::mcp_client_unregister,
             mcp_clients::detect_terminal_programs,
             agent::agent_run,
-            agent::agent_cancel
+            agent::agent_cancel,
+            watcher::watch_project,
+            watcher::unwatch_project,
+            git::git_probe,
+            git::git_exec,
+            git::gh_exec,
+            git::github_login
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")

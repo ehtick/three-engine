@@ -3,17 +3,29 @@ import { commandBus } from "./commands/CommandBus.js";
 import { useSceneStore } from "./store/sceneStore.js";
 import { useSelectionStore } from "./store/selectionStore.js";
 import { usePlayStore } from "./store/playStore.js";
+import { vmSingleton } from "./singleton.js";
 
-let snapshot = null;
-let transition = null;
+/**
+ * VM-wide, not module-level `let`s.
+ *
+ * Play snapshots the authored scene and Stop restores it. A second copy of this
+ * module keeps its own `snapshot`, so a Stop routed through the other copy finds
+ * nothing to restore and leaves whatever the game did to the scene sitting there
+ * as the user's authored work. `transition` is shared for the same reason: two
+ * copies means the re-entrancy guard guards nothing.
+ */
+const mode = vmSingleton("playModeState", () => ({
+  /** @type {any} */ snapshot: null,
+  /** @type {Promise<any> | null} */ transition: null,
+}));
 
 export async function play() {
-  if (transition) return transition;
-  transition = doPlay();
+  if (mode.transition) return mode.transition;
+  mode.transition = doPlay();
   try {
-    return await transition;
+    return await mode.transition;
   } finally {
-    transition = null;
+    mode.transition = null;
   }
 }
 
@@ -22,7 +34,7 @@ async function doPlay() {
   const { serializeScene } = await import("../engine/index.js");
   const { currentScenePath } = await import("./sceneIO.js");
   if (engine.playing) return;
-  snapshot = serializeScene(engine);
+  mode.snapshot = serializeScene(engine);
   // Tell the scene manager which scene the game is starting in, so a script
   // can ask (and so `loadScene` of the *same* scene still counts as a reload).
   engine.scenes.reset({ path: currentScenePath() ?? null, name: engine.sceneName });
@@ -31,12 +43,12 @@ async function doPlay() {
 }
 
 export async function stop() {
-  if (transition) return transition;
-  transition = doStop();
+  if (mode.transition) return mode.transition;
+  mode.transition = doStop();
   try {
-    return await transition;
+    return await mode.transition;
   } finally {
-    transition = null;
+    mode.transition = null;
   }
 }
 
@@ -51,13 +63,13 @@ async function doStop() {
   // editor's own scene is back, and a load still resolving would otherwise
   // instantiate into the restored scene a moment later.
   engine.scenes.reset({ path: currentScenePath() ?? null, name: engine.sceneName });
-  if (snapshot) {
+  if (mode.snapshot) {
     // Restores the snapshot ONTO the live scene rather than clearing and
     // rebuilding it. A full rebuild re-attaches every component, and the GI
     // component's re-attach alone froze the main thread for ~2s on a real
     // project. See serialize.js `reconcileScene`.
-    await reconcileScene(engine, snapshot);
-    snapshot = null;
+    await reconcileScene(engine, mode.snapshot);
+    mode.snapshot = null;
   }
   commandBus.clearHistory();
   useSelectionStore.getState().clear();
@@ -94,7 +106,7 @@ export async function toggle() {
   // Ignore repeated toolbar/shortcut input while the snapshot is being
   // restored. Starting Play midway through that transaction can select a
   // camera or start scripts from a half-populated scene.
-  if (transition) return transition;
+  if (mode.transition) return mode.transition;
   const engine = await ensureEngine();
   if (engine.playing) await stop();
   else await play();

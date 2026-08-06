@@ -2,13 +2,18 @@
 // errors unrelated to events (Camera/Engine.scene typing too narrow, import.meta.env),
 // a follow-up outside the events-system pass.
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { Play, Square, Pause, StepForward, Move, Rotate3d, Scale3d, Layers as LayersIcon, Crosshair, Monitor, Wifi, Smartphone, QrCode, Share2, Link2, Loader2, Sparkles } from "lucide-react";
+import { Play, Square, Pause, StepForward, Move, Rotate3d, Scale3d, Layers as LayersIcon, Crosshair, Monitor, Wifi, Smartphone, QrCode, Share2, Link2, Loader2, Sparkles, Snowflake } from "lucide-react";
 import qrcode from "qrcode-generator";
 import * as THREE from "three/webgpu";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
 import { ensureEngine, engine, isEngineReady } from "../engineInstance.js";
 import { installEditorFramePacing } from "../editorFramePacing.js";
+import {
+  isViewportFreezeEnabled,
+  onViewportFreezeChanged,
+  setViewportFreezeEnabled,
+} from "../viewportFreeze.js";
 import {
   openBrowserPreview,
   openBrowserPreviewUrl,
@@ -64,7 +69,7 @@ import {
 import { BatchCommand, topMostIds } from "../commands/entityCommands.js";
 import { getUiSystem } from "../../engine/ui/UiSystem.js";
 import { AddComponentCommand, SetComponentPropCommand } from "../commands/componentCommands.js";
-import { extOf, MODEL_EXTENSIONS, TEXTURE_EXTENSIONS, SCRIPT_EXTENSIONS, MATERIAL_EXTENSIONS, PREFAB_EXTENSIONS } from "../assetLoader.js";
+import { extOf, invalidateBlobUrl, MODEL_EXTENSIONS, TEXTURE_EXTENSIONS, SCRIPT_EXTENSIONS, MATERIAL_EXTENSIONS, PREFAB_EXTENSIONS } from "../assetLoader.js";
 import { basename, useProjectStore } from "../store/projectStore.js";
 import { getEditorCameraStorageKey, loadEditorCamera, saveEditorCamera } from "../cameraPrefs.js";
 import { usePlayStore } from "../store/playStore.js";
@@ -2674,6 +2679,9 @@ async function applyTextureToMaterial(matPath, texPath) {
   updateMaterialAsset(matPath, def);
   const { invoke } = await import("@tauri-apps/api/core");
   await invoke("save_scene", { path: matPath, contents: JSON.stringify(def, null, 2) });
+  // Nothing else announces this write — no command, no scene change — so tell
+  // asset watchers (the live browser preview above all) the .mat changed.
+  invalidateBlobUrl(matPath);
   console.log(`Set texture on ${matPath.split(/[\\/]/).pop()}`);
 }
 
@@ -2942,9 +2950,22 @@ function setupKeyboard(canvas) {
   }, { capture: true });
 
   window.addEventListener("keydown", (e) => {
-    if (!viewport.hovered || engine.playing) return;
-    if (e.target.closest?.(".geometry-editor")) return;
+    if (engine.playing) return;
     if (e.target.closest?.("input, textarea, select, [contenteditable]")) return;
+    // Framing the selection belongs to the Hierarchy too: you pick an entity in
+    // the tree and press F, with the pointer still on the row you just clicked.
+    // Handled up here rather than by loosening the hover gate below — every
+    // other shortcut in this handler acts on what is under the cursor, and the
+    // terrain/macro dispatchers it runs first would misfire from a tree row.
+    if (
+      !e.repeat && !e.ctrlKey && !e.metaKey && !e.altKey &&
+      e.key.toLowerCase() === "f" && e.target.closest?.(".hierarchy-panel")
+    ) {
+      focusSelection();
+      return;
+    }
+    if (!viewport.hovered) return;
+    if (e.target.closest?.(".geometry-editor")) return;
     if (!e.repeat && dispatchTerrainKeyAction(e)) {
       e.preventDefault();
       e.stopImmediatePropagation();
@@ -3768,6 +3789,10 @@ export function ViewportPanel() {
   // subscribeLayers pub-sub.
   const [layers, setLayers] = useState(viewport.layers);
   const [layersOpen, setLayersOpen] = useState(false);
+  // Read from the pref rather than held here: the setting is per machine and
+  // outlives this panel, which dockview remounts on every tab move.
+  const [freezeUnfocused, setFreezeUnfocused] = useState(isViewportFreezeEnabled);
+  useEffect(() => onViewportFreezeChanged(setFreezeUnfocused), []);
   // Seeded from the singleton: dockview remounts this panel on tab moves, and
   // a remounted toolbar must show (and be able to stop) the server that is
   // already running, not offer to start a second one.
@@ -4321,6 +4346,22 @@ export function ViewportPanel() {
             </>
           )}
         </div>
+        {/* Always-rendering is the default, so the button lights up only once
+            the user has turned pausing ON — a stopped viewport is the state
+            worth advertising, since it is the one that can look like a bug. */}
+        <button
+          className={`toolbar-btn icon-only ${freezeUnfocused ? "active" : ""}`}
+          title={
+            freezeUnfocused
+              ? "Viewport pauses when another panel is focused — click to keep it always rendering"
+              : "Viewport always renders — click to pause it when another panel is focused"
+          }
+          aria-pressed={freezeUnfocused}
+          disabled={playing}
+          onClick={() => setViewportFreezeEnabled(!freezeUnfocused)}
+        >
+          <Snowflake size={14} />
+        </button>
         {playing && <span className="backend-badge playing">Playing</span>}
         {backend && <span className={`backend-badge ${backend === "WebGPU" ? "webgpu" : "webgl"}`}>{backend}</span>}
       </div>

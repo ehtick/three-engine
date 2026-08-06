@@ -7147,11 +7147,351 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
   white-space: nowrap;
 }
 
+.itchio-upload-sub {
+  color: var(--text-dim);
+  font-size: 10px;
+}
+
+.itchio-upload-sub.done { color: #58c26e; }
+
+/* The label wrapped to two lines at this width before it was shortened and
+   pinned; the row is narrow (it lives in the 280px detail rail). */
+.itchio-upload-btn {
+  flex: none;
+  white-space: nowrap;
+}
+
+/* Publish is a short guided flow, not a form — full-bleed rows stretched the
+   select and the action button across the whole panel width (which can be
+   very wide when docked), so it lives in a fixed-width centred card. */
 .itchio-publish {
-  flex-direction: column;
-  gap: 10px;
-  padding: 12px;
+  flex: 1;
+  min-height: 0;
   overflow-y: auto;
+  padding: 22px 16px;
+}
+
+.itchio-card {
+  max-width: 520px;
+  margin: 0 auto;
+  background: var(--bg-2);
+  border: 1px solid var(--bg-3);
+  border-radius: 10px;
+  padding: 16px;
+}
+
+.itchio-card-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--bg-3);
+}
+
+.itchio-card-head h3 {
+  margin: 0 0 3px;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.itchio-card-head p {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.itchio-card-icon {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  flex: none;
+  border-radius: 8px;
+  background: var(--bg-3);
+  color: var(--accent);
+}
+
+.itchio-steps {
+  list-style: none;
+  margin: 0;
+  padding: 14px 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.itchio-step {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.itchio-step.pending { opacity: 0.62; }
+
+.itchio-step-num {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--bg-3);
+  color: var(--text-dim);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.itchio-step:not(.pending) .itchio-step-num {
+  background: var(--accent);
+  color: #fff;
+}
+
+.itchio-step-body {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  min-width: 0;
+  flex: 1;
+}
+
+.itchio-step-title {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.itchio-step-note {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.itchio-step-note b { color: var(--text); font-weight: 500; }
+
+.itchio-step-select {
+  width: 100%;
+  max-width: 300px;
+}
+
+.itchio-primary-btn {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.itchio-primary-btn:hover:not(:disabled) {
+  filter: brightness(1.12);
+  background: var(--accent);
+}
+
+.itchio-step-result {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.itchio-step-result code {
+  color: var(--text-dim);
+  font-size: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.itchio-card-foot {
+  margin: 14px 0 0;
+  padding-top: 12px;
+  border-top: 1px solid var(--bg-3);
+  color: var(--text-dim);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+/* Store tab: search + filters sit above a full-width grid, rather than in a
+   left rail — the rail spent ~40% of its height on explanatory prose and
+   pushed the controls below the fold. */
+.itchio-store {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+.itchio-searchbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px 6px;
+  flex: none;
+}
+
+.itchio-searchbar .ph-search { max-width: none; }
+
+.itchio-searchbar .ph-search:focus-within {
+  border-color: var(--accent);
+}
+
+.itchio-tagfield {
+  flex: none;
+  width: 140px;
+}
+
+.itchio-help {
+  display: grid;
+  place-items: center;
+  color: var(--text-dim);
+  cursor: help;
+  flex: none;
+}
+
+.itchio-help:hover { color: var(--text); }
+
+.itchio-chips {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 0 10px 8px;
+  border-bottom: 1px solid var(--bg-3);
+  flex: none;
+}
+
+.itchio-chip {
+  border: 1px solid var(--bg-3);
+  background: var(--bg-2);
+  color: var(--text-dim);
+  font-size: 11px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+
+.itchio-chip:hover {
+  color: var(--text);
+  border-color: var(--text-dim);
+}
+
+.itchio-chip.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.itchio-chip-note {
+  color: var(--text-dim);
+  font-size: 10px;
+  margin-left: 2px;
+}
+
+/* itch.io cover art is a wide banner (630x500 source, cropped to ~5:4 on
+   itch.io itself). The shared square + `contain` tile letterboxes it into a
+   thin strip, so these opt into a matching ratio and crop instead. */
+.itchio-grid {
+  grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
+  gap: 10px;
+}
+
+.itchio-tile {
+  aspect-ratio: 5 / 4;
+  display: block;
+  padding: 0;
+  border: none;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  transition: transform 0.12s ease, box-shadow 0.12s ease;
+}
+
+.itchio-tile img { object-fit: cover; }
+
+.itchio-tile:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+}
+
+.itchio-tile:hover img { transform: none; }
+
+.itchio-tile-meta {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 20px 8px 7px;
+  background: linear-gradient(transparent, rgba(0, 0, 0, 0.82) 55%);
+  pointer-events: none;
+}
+
+.itchio-tile-name {
+  color: #fff;
+  font-size: 11px;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.itchio-tile-author {
+  color: rgba(255, 255, 255, 0.62);
+  font-size: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.itchio-price {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.72);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 500;
+  backdrop-filter: blur(3px);
+}
+
+.itchio-price.free {
+  background: #2f9e52;
+}
+
+.itchio-price.inline {
+  position: static;
+  backdrop-filter: none;
+  background: var(--bg-3);
+  color: var(--text);
+}
+
+.itchio-price.inline.free {
+  background: #2f9e52;
+  color: #fff;
+}
+
+.itchio-price.sale {
+  background: #c2492f;
+  color: #fff;
+}
+
+.itchio-detail-head {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.itchio-detail-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 2px;
 }
 
 /* --- AmbientCG browser -------------------------------------------------- */
@@ -9846,20 +10186,25 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
   font-weight: 600;
 }
 
-/* Label left, control right — a stacked pair per field doubles the dialog's
- * height, which is what pushed the actions off the bottom. */
+.texture-dialog-busy { color: var(--text-dim); font-weight: 400; }
+
+.texture-dialog-note,
+.texture-dialog .tx-hint {
+  margin: 0;
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--text-dim);
+}
+
 .texture-dialog label {
   display: grid;
   grid-template-columns: 1fr minmax(0, 128px);
   align-items: center;
   gap: 8px;
-  font-size: 11px;
+  font-size: var(--tx-label);
   color: var(--text-dim);
 }
 
-/* Text/number/select controls fill their column. Checkboxes must NOT — they
- * are iOS switches with a fixed size, and stretching one to the column width
- * pushes its own label out of the dialog. */
 .texture-dialog label > input:not([type="checkbox"]):not([type="color"]),
 .texture-dialog label > select {
   width: 100%;
@@ -9872,8 +10217,8 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
   justify-self: start;
 }
 
-/* A checkbox row is a row. Without this the dialog's column layout wins on
- * specificity and stacks the iOS switch above its own label. */
+/* A checkbox row is a row. The dialog's column layout is one class more
+ * specific and would stack the iOS switch above its own label. */
 .texture-dialog .texture-check,
 .texture-dialog-row .texture-check {
   display: flex;
@@ -10543,125 +10888,113 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
 .audiolib-spin { animation: acg-spin 0.9s linear infinite; }
 
 .audiolib-row {
-  display: grid;
-  grid-template-columns: auto 120px 1fr auto;
+  display: flex;
   align-items: center;
   gap: 10px;
-  padding: 7px 8px;
-  border-radius: 6px;
+  padding: 5px 8px;
+  border-radius: 5px;
   border: 1px solid transparent;
+  min-height: 38px;
+  flex-wrap: wrap;
 }
 
 .audiolib-row:hover { background: var(--bg-2); }
-.audiolib-row.playing {
-  background: var(--bg-2);
-  border-color: var(--accent);
-}
 
-.audiolib-play {
-  width: 28px;
-  height: 28px;
-  flex: none;
+.audiolib-info {
+  /* Fixed basis, not content-sized: with `auto` every row's title set its own
+     width and the play buttons formed a ragged left edge down the list. */
+  flex: 0 0 38%;
+  min-width: 130px;
   display: flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: 50%;
-  border: 1px solid var(--bg-3);
-  background: var(--bg-2);
-  color: var(--text);
-  cursor: pointer;
+  flex-direction: column;
+  gap: 1px;
 }
-
-.audiolib-play:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
-.audiolib-play:disabled { opacity: 0.35; cursor: default; }
-.audiolib-row.playing .audiolib-play { background: var(--accent); border-color: var(--accent); color: #fff; }
-
-.audiolib-wave {
-  height: 30px;
-  display: flex;
-  align-items: center;
-  overflow: hidden;
-}
-
-.audiolib-wave img {
-  width: 100%;
-  height: 100%;
-  object-fit: fill;
-  opacity: 0.65;
-  /* Freesound's waveform PNGs are dark-on-transparent; invert so they read
-     on a dark panel instead of disappearing into it. */
-  filter: invert(1) brightness(1.4);
-}
-
-.audiolib-row.playing .audiolib-wave img { opacity: 1; }
-
-.audiolib-wave-blank {
-  width: 100%;
-  height: 2px;
-  background: var(--bg-3);
-  border-radius: 1px;
-}
-
-.audiolib-info { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 
 .audiolib-name {
   color: var(--text);
+  font-size: 12px;
+  line-height: 1.25;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
 .audiolib-meta {
+  display: flex;
+  gap: 8px;
   color: var(--text-dim);
-  font-size: 11px;
+  font-size: 10px;
+  line-height: 1.3;
   white-space: nowrap;
   overflow: hidden;
-  text-overflow: ellipsis;
+  font-variant-numeric: tabular-nums;
 }
 
-.audiolib-badges { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 1px; }
+.audiolib-author { overflow: hidden; text-overflow: ellipsis; max-width: 150px; flex: 0 1 auto; }
 
-.audiolib-badge {
+/* The scrubber takes the space the old layout wasted between the title and the
+   licence chip. */
+.audiolib-row .audio-scrubber { flex: 1 1 160px; min-width: 120px; }
+
+.audiolib-lic {
+  flex: none;
+  min-width: 74px;
+  text-align: center;
   font-size: 10px;
-  padding: 1px 7px;
-  border-radius: 9px;
-  background: var(--bg-3);
-  color: var(--text-dim);
+  line-height: 1;
+  padding: 3px 7px;
+  border-radius: 3px;
+  border: 1px solid transparent;
+  white-space: nowrap;
+  cursor: help;
 }
 
-.audiolib-badge.lic-cc0,
-.audiolib-badge.lic-pd { background: rgba(88, 194, 110, 0.18); color: #58c26e; }
-.audiolib-badge.warn { background: rgba(224, 168, 74, 0.16); color: var(--warn, #e0a84a); }
-.audiolib-badge.danger { background: rgba(228, 106, 106, 0.16); color: #e46a6a; }
+.audiolib-lic.good { background: rgba(88, 194, 110, 0.13); color: #6ec983; border-color: rgba(88, 194, 110, 0.28); }
+.audiolib-lic.warn { background: rgba(224, 168, 74, 0.13); color: #e0a84a; border-color: rgba(224, 168, 74, 0.28); }
+.audiolib-lic.bad { background: rgba(228, 106, 106, 0.13); color: #e46a6a; border-color: rgba(228, 106, 106, 0.28); }
+.audiolib-lic.unset {
+  background: transparent;
+  color: var(--text-dim);
+  border-color: var(--bg-3);
+  border-style: dashed;
+}
 
-.audiolib-actions { display: flex; gap: 4px; }
+.audiolib-actions { flex: none; display: flex; gap: 3px; opacity: 0.45; transition: opacity 0.1s ease; }
+
+.audiolib-row:hover .audiolib-actions,
+.audiolib-row:focus-within .audiolib-actions { opacity: 1; }
 
 .audiolib-icon-btn {
-  width: 26px;
-  height: 26px;
+  width: 24px;
+  height: 24px;
   display: flex;
   align-items: center;
   justify-content: center;
-  border-radius: 5px;
+  border-radius: 4px;
   border: 1px solid var(--bg-3);
-  background: var(--bg-2);
+  background: var(--bg-1);
   color: var(--text-dim);
   cursor: pointer;
+  padding: 0;
 }
 
 .audiolib-icon-btn:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
 .audiolib-icon-btn.primary:hover:not(:disabled) { background: var(--accent); border-color: var(--accent); color: #fff; }
-.audiolib-icon-btn:disabled { opacity: 0.35; cursor: default; }
+.audiolib-icon-btn:disabled { opacity: 0.3; cursor: default; }
 
-.audiolib-row-progress {
-  grid-column: 1 / -1;
+.audiolib-suggest { padding: 22px 12px; color: var(--text-dim); text-align: center; }
+.audiolib-suggest p { margin: 0 0 10px; font-size: 12px; }
+.audiolib-suggest-chips { display: flex; flex-wrap: wrap; gap: 6px; justify-content: center; }
+
+.audiolib-rowmsg {
+  grid-column: 2 / -1;
+  font-size: 10px;
   color: var(--text-dim);
-  font-size: 11px;
-  padding-left: 38px;
+  padding-top: 1px;
 }
 
-.audiolib-done { color: #58c26e; font-size: 11px; }
-.audiolib-error { color: #e46a6a; font-size: 11px; }
+.audiolib-rowmsg.good { color: #6ec983; }
+.audiolib-rowmsg.bad { color: #e46a6a; }
 
 .audiolib-more { margin: 8px auto; max-width: 240px; }
 
@@ -10938,3 +11271,1410 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
 }
 
 .aud-hint { display: flex; align-items: center; gap: 5px; opacity: 0.75; }
+
+/* Inspector audio preview — waveform + transport for a selected sound asset. */
+.audio-preview { --aud-wave: #6ba7ff; display: flex; flex-direction: column; gap: 6px; }
+
+.audio-preview-wave {
+  position: relative;
+  background: var(--bg-2);
+  border: 1px solid var(--bg-3);
+  border-radius: 4px;
+  overflow: hidden;
+  cursor: pointer;
+}
+
+.audio-preview-wave canvas { display: block; }
+
+.audio-preview-head {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: #e0a84a;
+  pointer-events: none;
+}
+
+.audio-preview-row { display: flex; align-items: center; gap: 8px; }
+.audio-preview-time { font-size: 11px; color: var(--text); font-variant-numeric: tabular-nums; }
+.audio-preview-meta { margin-left: auto; font-size: 10px; color: var(--text-dim); }
+.audio-preview-empty { font-size: 11px; color: var(--text-dim); padding: 10px 0; }
+.audio-preview-error { font-size: 11px; color: #e46a6a; }
+
+/* Audio Editor — effects menu and the generated effect dialog. */
+.aud-menu-wrap { position: relative; }
+
+.aud-menu-scrim { position: fixed; inset: 0; z-index: 40; }
+
+.aud-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 41;
+  min-width: 210px;
+  max-height: 420px;
+  overflow-y: auto;
+  background: var(--bg-2);
+  border: 1px solid var(--bg-3);
+  border-radius: 6px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.5);
+  padding: 4px;
+}
+
+.aud-menu-group + .aud-menu-group { border-top: 1px solid var(--bg-3); margin-top: 4px; padding-top: 4px; }
+
+.aud-menu-label {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+  padding: 3px 8px;
+}
+
+.aud-menu-item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  gap: 8px;
+  padding: 5px 8px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.aud-menu-item:hover { background: var(--bg-3); }
+.aud-menu-hint { margin-left: auto; font-size: 9px; color: var(--text-dim); }
+
+/* The Export menu sits at the right end of the toolbar, so it opens leftwards
+   rather than off the panel's edge. */
+.aud-menu.right { left: auto; right: 0; }
+
+.aud-menu-note {
+  padding: 5px 8px;
+  font-size: 10px;
+  line-height: 1.4;
+  color: var(--text-dim);
+  border-top: 1px solid var(--bg-3);
+  margin-top: 4px;
+}
+
+.aud-dialog {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  z-index: 42;
+  width: 320px;
+  background: var(--bg-2);
+  border: 1px solid var(--bg-3);
+  border-radius: 8px;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.55);
+  display: flex;
+  flex-direction: column;
+}
+
+.aud-dialog-head {
+  display: flex;
+  align-items: center;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--bg-3);
+}
+
+.aud-dialog-title { font-size: 12px; color: var(--text); }
+
+.aud-dialog-close {
+  margin-left: auto;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 2px;
+}
+
+.aud-dialog-close:hover { color: var(--text); }
+
+.aud-dialog-desc,
+.aud-dialog-note {
+  margin: 0;
+  padding: 7px 10px 0;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-dim);
+}
+
+.aud-dialog-note { color: var(--accent); }
+
+.aud-dialog-body {
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.aud-param { display: flex; align-items: center; gap: 7px; font-size: 11px; color: var(--text-dim); }
+.aud-param.check { gap: 6px; }
+.aud-param-label { width: 82px; flex: none; }
+.aud-param input[type="range"] { flex: 1; min-width: 0; height: 14px; }
+
+.aud-param-number {
+  width: 58px;
+  flex: none;
+  background: var(--bg-1);
+  border: 1px solid var(--bg-3);
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 11px;
+  padding: 2px 4px;
+  font-variant-numeric: tabular-nums;
+}
+
+.aud-param-unit { width: 26px; flex: none; font-size: 10px; }
+
+.aud-param select {
+  flex: 1;
+  background: var(--bg-1);
+  border: 1px solid var(--bg-3);
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 11px;
+  padding: 2px 4px;
+}
+
+.aud-dialog-foot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border-top: 1px solid var(--bg-3);
+}
+
+.aud-dialog-live { display: flex; align-items: center; gap: 5px; font-size: 11px; color: var(--text-dim); cursor: pointer; }
+.aud-dialog-spacer { flex: 1; }
+
+.aud-dialog-flag {
+  font-size: 9px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  background: var(--bg-3);
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.aud-dialog-foot .aud-btn.primary { margin-left: 0; }
+
+
+/* =========================================================================
+   AudioScrubber — the one audition control, used by the Audio Library rows
+   and the Inspector's asset preview. They shared nothing before and looked
+   it; they now share this and the singleton player behind it.
+   ========================================================================= */
+
+.audio-scrubber {
+  --aud-wave: #6ba7ff;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.audio-scrubber-play {
+  width: 24px;
+  height: 24px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--bg-3);
+  background: var(--bg-1);
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.audio-scrubber-play:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.audio-scrubber-play:disabled { opacity: 0.3; cursor: default; }
+.audio-scrubber.playing .audio-scrubber-play { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+.audio-scrubber-track {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 26px;
+  background: var(--bg-2);
+  border: 1px solid transparent;
+  border-radius: 4px;
+  overflow: hidden;
+  cursor: pointer;
+}
+
+/* Only outline it once it's a control you can actually use — an idle, empty
+   track with a hard border reads as a broken input field. */
+.audio-scrubber-track:hover { border-color: var(--bg-3); }
+.audio-scrubber.playing .audio-scrubber-track { border-color: var(--accent); }
+.audio-scrubber.block .audio-scrubber-track { height: 52px; }
+
+/* Explicit width/height, NOT `inset` with auto sizing: for a replaced element
+   (an <img>) `width: auto` resolves to the image's INTRINSIC size and the
+   insets are ignored, so a 195x101 waveform PNG rendered at 195x101 and spilled
+   across several rows. */
+.audio-scrubber-wave,
+.audio-scrubber-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: fill;
+  display: block;
+  pointer-events: none;
+}
+
+/* Freesound's waveform PNGs are dark-on-transparent, which is invisible on a
+   dark panel. */
+.audio-scrubber-wave { opacity: 0.5; filter: invert(1) brightness(1.7); }
+.audio-scrubber.playing .audio-scrubber-wave { opacity: 0.75; }
+
+.audio-scrubber-fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  background: rgba(107, 167, 255, 0.22);
+  pointer-events: none;
+}
+
+.audio-scrubber-head {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: #e0a84a;
+  pointer-events: none;
+}
+
+.audio-scrubber-time {
+  flex: none;
+  font-size: 10px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  min-width: 64px;
+  text-align: right;
+}
+
+.audio-scrubber-spin { animation: acg-spin 0.9s linear infinite; }
+
+/* Inspector preview: the scrubber plus a one-line fact row. */
+.audio-preview { display: flex; flex-direction: column; gap: 7px; }
+.audio-preview .audio-scrubber { width: 100%; }
+.audio-preview-row { display: flex; align-items: center; }
+.audio-preview-meta { font-size: 10px; color: var(--text-dim); }
+.audio-preview-error { font-size: 11px; color: #e46a6a; }
+
+
+/* A track with no waveform and nothing playing is just a hairline, not an empty
+   box — a filled rectangle there reads as a broken input field. */
+.audio-scrubber.bare-track .audio-scrubber-track { background: transparent; }
+.audio-scrubber.bare-track .audio-scrubber-track::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 2px;
+  border-radius: 1px;
+  background: var(--bg-3);
+}
+.audio-scrubber.bare-track:hover .audio-scrubber-track,
+.audio-scrubber.bare-track.playing .audio-scrubber-track { background: var(--bg-2); }
+
+
+/* ---------------------------------------------------------------------------
+   Source Control (GitPanel.jsx)
+
+   Two columns: a fixed-width list of changes with the commit box on top, and a
+   diff that takes the rest. The diff is the reason this panel docks with the
+   wide Assets strip, so it gets the flexible column.
+   --------------------------------------------------------------------------- */
+.git-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  padding: 0;
+  overflow: hidden;
+}
+.git-toolbar {
+  flex: 0 0 auto;
+  gap: 4px;
+}
+.git-branch-btn {
+  font-weight: 500;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.git-body {
+  flex: 1 1 auto;
+  display: flex;
+  min-height: 0;
+}
+.git-changes {
+  flex: 0 0 300px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow-y: auto;
+  border-right: 1px solid var(--border);
+  background: var(--bg-1);
+}
+.git-detail {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* -- the commit box --------------------------------------------------------- */
+.git-commit-box {
+  flex: 0 0 auto;
+  padding: 8px;
+  border-bottom: 1px solid var(--border);
+}
+.git-commit-message {
+  width: 100%;
+  resize: vertical;
+  font-family: inherit;
+  line-height: 1.45;
+}
+.git-commit-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+.git-commit-row .toolbar-btn { margin-left: auto; }
+.git-check {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+/* The one accent-filled button per surface: the action the panel exists for. */
+.toolbar-btn.primary {
+  background: var(--accent);
+  border-color: transparent;
+  color: #fff;
+}
+.toolbar-btn.primary:hover:not(:disabled) { filter: brightness(1.1); }
+.toolbar-btn.danger { color: var(--danger); }
+.toolbar-btn.danger:hover:not(:disabled) { border-color: var(--danger); }
+
+/* -- the file list ---------------------------------------------------------- */
+.git-section { padding-bottom: 4px; }
+.git-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 8px 3px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-dim);
+}
+.git-count {
+  padding: 0 5px;
+  border-radius: 8px;
+  background: var(--fill-1);
+  color: var(--text-dim);
+  letter-spacing: 0;
+}
+.git-file {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  cursor: default;
+  font-size: 12px;
+  color: var(--text);
+}
+.git-file:hover { background: var(--bg-3); }
+.git-file.active { background: var(--accent-soft); }
+.git-letter {
+  flex: 0 0 12px;
+  font-family: ui-monospace, "Cascadia Mono", Menlo, monospace;
+  font-size: 10px;
+  text-align: center;
+  color: var(--text-dim);
+}
+/* Status colour lives on the letter, not the row: a list of coloured rows is a
+   list where nothing stands out. */
+.git-letter.modified { color: var(--warn); }
+.git-letter.added,
+.git-letter.untracked { color: var(--ok); }
+.git-letter.deleted { color: var(--danger); }
+.git-letter.renamed { color: var(--accent); }
+.git-letter.conflicted { color: var(--danger); }
+.git-file-name {
+  flex: 0 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.git-file.deleted .git-file-name { text-decoration: line-through; opacity: 0.7; }
+.git-file-folder {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  /* Keeps the DEEPEST folder visible when the path is too long: the leading
+     directories are the part you can guess, the last one is the part you need. */
+  direction: rtl;
+  text-align: left;
+  font-size: 10.5px;
+  color: var(--text-dim);
+}
+.git-file-actions {
+  flex: 0 0 auto;
+  display: none;
+  gap: 2px;
+  margin-left: auto;
+}
+.git-file:hover .git-file-actions,
+.git-file.active .git-file-actions { display: flex; }
+.git-section.conflict .git-file { background: rgba(255, 93, 85, 0.07); }
+
+.git-empty,
+.git-detail-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 18px 10px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  text-align: center;
+}
+.git-detail-empty { height: 100%; }
+
+/* -- banners ---------------------------------------------------------------- */
+.git-banner {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-2);
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+.git-banner strong { color: var(--text); font-weight: 500; }
+.git-banner.warn { background: rgba(226, 163, 60, 0.1); }
+.git-banner .text-field { max-width: 180px; }
+.git-banner > button { margin-left: auto; }
+.git-error {
+  flex: 0 0 auto;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(255, 93, 85, 0.1);
+  color: #ffb0ab;
+  font-size: 11.5px;
+  white-space: pre-wrap;
+}
+.git-note {
+  display: flex;
+  gap: 6px;
+  padding: 6px 0;
+  font-size: 11px;
+  color: var(--warn);
+  text-align: left;
+}
+
+/* -- tabs + diff ------------------------------------------------------------ */
+.git-tabs {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--border);
+}
+.git-tab {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  height: 22px;
+  padding: 0 9px;
+  border: none;
+  border-radius: var(--r-input);
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.git-tab:hover { background: var(--bg-3); color: var(--text); }
+.git-tab.active { background: var(--fill-1); color: var(--text); }
+.git-busy {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.git-diff,
+.git-history {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
+.git-diff-file { border-bottom: 1px solid var(--border); }
+.git-diff-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 5px 10px;
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--border);
+  font-size: 11.5px;
+}
+.git-diff-stat { font-size: 10.5px; }
+.git-diff-stat .add { color: var(--ok); }
+.git-diff-stat .del { color: var(--danger); }
+.git-diff-binary { padding: 12px; font-size: 11.5px; color: var(--text-dim); }
+.git-hunk { border-top: 1px solid var(--border); }
+.git-hunk-head {
+  padding: 2px 10px;
+  background: var(--fill-1);
+  font-size: 10.5px;
+  color: var(--text-dim);
+}
+/* The diff is code: monospace, no wrapping, its own horizontal scroll. Wrapped
+   diff lines make the +/- column meaningless. */
+.git-line {
+  display: flex;
+  font-family: ui-monospace, "Cascadia Mono", Menlo, monospace;
+  font-size: 11.5px;
+  line-height: 1.55;
+  white-space: pre;
+}
+.git-line.add { background: rgba(79, 212, 117, 0.09); }
+.git-line.del { background: rgba(255, 93, 85, 0.09); }
+.git-line.meta { color: var(--text-dim); font-style: italic; }
+.git-gutter {
+  flex: 0 0 42px;
+  padding-right: 8px;
+  text-align: right;
+  color: var(--text-dim);
+  opacity: 0.65;
+  user-select: none;
+}
+.git-sign {
+  flex: 0 0 14px;
+  text-align: center;
+  user-select: none;
+}
+.git-line.add .git-sign { color: var(--ok); }
+.git-line.del .git-sign { color: var(--danger); }
+.git-code { flex: 1 1 auto; padding-right: 12px; }
+
+/* -- history ---------------------------------------------------------------- */
+.git-commit { border-bottom: 1px solid var(--border); }
+.git-commit-row-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 10px;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+.git-commit-row-btn:hover { background: var(--bg-3); }
+.git-commit-row-btn.active { background: var(--accent-soft); }
+.git-sha {
+  font-family: ui-monospace, "Cascadia Mono", Menlo, monospace;
+  font-size: 10.5px;
+  color: var(--text-dim);
+}
+.git-subject {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.git-ref {
+  flex: 0 0 auto;
+  padding: 0 6px;
+  border: 1px solid var(--accent-ring);
+  border-radius: 8px;
+  font-size: 10px;
+  color: var(--accent);
+}
+.git-when { flex: 0 0 auto; font-size: 10.5px; color: var(--text-dim); }
+
+/* -- setup + GitHub --------------------------------------------------------- */
+.git-hero {
+  max-width: 460px;
+  margin: 0 auto;
+  padding: 26px 18px;
+  text-align: center;
+}
+.git-hero h3 { margin: 10px 0 6px; font-size: 14px; font-weight: 500; }
+.git-hero p { margin: 0 0 12px; font-size: 12px; line-height: 1.55; color: var(--text-dim); }
+.git-hero-list {
+  margin: 0 0 14px;
+  padding: 10px 12px;
+  list-style: none;
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  background: var(--bg-2);
+  text-align: left;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--text-dim);
+}
+.git-hero-list li + li { margin-top: 6px; }
+.git-hero-list code { color: var(--text); }
+.git-hero-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: center;
+  margin-top: 12px;
+}
+.git-hero .git-check { justify-content: center; }
+
+.git-github {
+  margin-top: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-2);
+  font-size: 11.5px;
+}
+.git-github.column { flex-direction: column; align-items: stretch; }
+.git-github-row { display: flex; align-items: center; gap: 8px; }
+.git-github-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-dim);
+}
+.git-github-url {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-dim);
+}
+.git-github .toolbar-btn { margin-left: auto; }
+.git-github.column .toolbar-btn { margin-left: 0; }
+.git-github.column .git-github-row .toolbar-btn:last-child { margin-left: auto; }
+.git-github .text-field { flex: 1 1 auto; }
+.git-link {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--accent);
+  font-size: 11.5px;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.git-link:hover { text-decoration: underline; }
+.git-auth-code {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  padding: 7px 8px;
+  border: 1px solid var(--accent-ring);
+  border-radius: var(--r-input);
+  background: var(--accent-soft);
+  font-size: 11px;
+}
+.git-auth-code code {
+  font-family: ui-monospace, "Cascadia Mono", Menlo, monospace;
+  font-size: 13px;
+  letter-spacing: 1.5px;
+  color: var(--text);
+}
+
+/* -- branch menu ------------------------------------------------------------ */
+.git-menu-section {
+  padding: 6px 10px 3px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-dim);
+}
+.git-menu-note { margin-left: auto; font-size: 10px; color: var(--text-dim); }
+.git-menu-form { display: flex; gap: 4px; padding: 4px 8px 8px; }
+.git-menu-form .text-field { flex: 1 1 auto; }
+
+/* -- the menu-bar chip ------------------------------------------------------ */
+.git-chip {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  height: 20px;
+  padding: 0 8px;
+  margin-right: 6px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 10.5px;
+  cursor: pointer;
+  white-space: nowrap;
+  max-width: 220px;
+  overflow: hidden;
+}
+.git-chip:hover { color: var(--text); border-color: var(--text-dim); }
+/* The branch glyph is the state light: colour on the icon rather than a
+   separate dot keeps the chip to two elements at 20px tall. */
+.git-chip-icon {
+  flex: 0 0 auto;
+  color: var(--text-dim);
+}
+.git-chip.clean .git-chip-icon { color: var(--ok); }
+.git-chip.dirty .git-chip-icon { color: var(--warn); }
+.git-chip.warn .git-chip-icon { color: var(--danger); }
+.git-chip.clean,
+.git-chip.dirty { color: var(--text); }
+.git-chip-count,
+.git-chip-arrow {
+  padding: 0 4px;
+  border-radius: 7px;
+  background: var(--fill-1);
+  font-size: 9.5px;
+}
+
+/* ===========================================================================
+   Code editor â€” the embedded Monaco surface, in the Inspector and the Code
+   panel. Monaco brings its own theme (see code/monaco.js); everything here is
+   the chrome around it, matched to the panels it sits in.
+   =========================================================================== */
+
+.code-editor {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  position: relative;
+  background: var(--bg-1);
+}
+.code-editor-bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-2);
+  flex: 0 0 auto;
+}
+/* Monaco measures its own box, so the host has to be a flex child with a zero
+   basis â€” left to size itself it grows to fit the document and the panel ends
+   up with two scrollbars. */
+.code-editor-host {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+}
+.code-editor-status {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 10.5px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.code-editor-error {
+  color: var(--danger);
+}
+.code-editor-error.inline {
+  padding: 8px 10px;
+  font-size: 11px;
+}
+.code-editor-loading {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: var(--text-dim);
+  font-size: 11px;
+  pointer-events: none;
+}
+
+.code-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--bg-1);
+}
+.code-panel.empty {
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  color: var(--text-dim);
+  text-align: center;
+  padding: 24px;
+}
+.code-panel.empty p {
+  margin: 0;
+  font-size: 12px;
+}
+.code-panel-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  flex-direction: column;
+}
+.code-tabs {
+  display: flex;
+  align-items: stretch;
+  gap: 1px;
+  padding: 0 4px;
+  background: var(--bg-0);
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+  scrollbar-width: none;
+  flex: 0 0 auto;
+}
+.code-tabs::-webkit-scrollbar {
+  display: none;
+}
+.code-tab {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 8px 6px 10px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  background: transparent;
+  border-top: 2px solid transparent;
+  cursor: pointer;
+  white-space: nowrap;
+  user-select: none;
+}
+.code-tab.active {
+  color: var(--text);
+  background: var(--bg-1);
+  border-top-color: var(--accent);
+}
+.code-tab-dot {
+  color: var(--warn);
+  flex: 0 0 auto;
+}
+.code-tab-close {
+  display: grid;
+  place-items: center;
+  width: 15px;
+  height: 15px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  opacity: 0.5;
+  cursor: pointer;
+}
+.code-tab-close:hover {
+  opacity: 1;
+  background: var(--fill-2);
+}
+
+/* ===========================================================================
+   Asset Inspector â€” file facts, the action list, and the type previews added
+   alongside them.
+   =========================================================================== */
+
+.asset-facts {
+  display: flex;
+  gap: 8px;
+  padding: 2px 10px 6px;
+  font-size: 10.5px;
+  color: var(--text-dim);
+}
+.asset-facts span + span::before {
+  content: "\00b7";
+  margin-right: 8px;
+  opacity: 0.6;
+}
+
+.asset-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.asset-action {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  width: calc(100% - 16px);
+  margin: 0 8px;
+  padding: 7px 8px;
+  border: 1px solid transparent;
+  border-radius: var(--r-input);
+  background: var(--fill-1);
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.12s var(--ease), border-color 0.12s var(--ease);
+}
+.asset-action:hover:not(:disabled) {
+  background: var(--fill-2);
+  border-color: var(--border-strong);
+}
+.asset-action:disabled {
+  opacity: 0.42;
+  cursor: default;
+}
+.asset-action.primary {
+  background: var(--accent-soft);
+  border-color: var(--accent-ring);
+}
+.asset-action.primary:hover:not(:disabled) {
+  background: rgba(10, 132, 255, 0.24);
+}
+.asset-action.danger {
+  color: var(--danger);
+}
+.asset-action.danger:hover:not(:disabled) {
+  background: rgba(255, 93, 85, 0.14);
+}
+.asset-action-icon {
+  flex: 0 0 auto;
+  margin-top: 1px;
+  opacity: 0.85;
+}
+.asset-action-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.asset-action-label {
+  font-size: 11.5px;
+  font-weight: 500;
+}
+.asset-action-hint {
+  font-size: 10px;
+  color: var(--text-dim);
+  line-height: 1.35;
+}
+
+/* A section header that opens something. Same type as a plain header, plus a
+   chevron that turns â€” so a collapsed section reads as collapsed rather than
+   as a section with nothing in it. */
+.section-header.toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+.section-chevron {
+  transition: transform 0.12s var(--ease);
+  flex: 0 0 auto;
+}
+.section-header.toggle.open .section-chevron {
+  transform: rotate(90deg);
+}
+
+.asset-source,
+.asset-code {
+  margin: 0 8px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-input);
+  overflow: hidden;
+}
+/* A resizable editor owns its own height (set inline from the drag), so the
+   wrapper must not pin one — and the grab strip needs room below the text. */
+.asset-code .code-editor:not(.resizable) {
+  height: 320px;
+}
+.code-editor.resizable {
+  padding-bottom: 9px;
+  position: relative;
+}
+.code-editor-resize {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 9px;
+  display: grid;
+  place-items: center;
+  cursor: ns-resize;
+  background: var(--bg-2);
+  border-top: 1px solid var(--border);
+  touch-action: none;
+}
+.code-editor-resize:hover,
+.code-editor-resize:active {
+  background: var(--bg-3);
+}
+/* The grip is the affordance — a bare strip reads as a border, and nobody
+   tries to drag a border. */
+.code-editor-grip {
+  width: 26px;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--border-strong);
+  transition: background 0.12s var(--ease), width 0.12s var(--ease);
+}
+.code-editor-resize:hover .code-editor-grip {
+  background: var(--accent);
+  width: 34px;
+}
+.asset-hint.warn {
+  color: var(--warn);
+}
+.asset-info-row.license {
+  font-size: 10px;
+  line-height: 1.4;
+  color: var(--text-dim);
+  white-space: normal;
+}
+.asset-info-row.css-family {
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 10px;
+  color: var(--text-dim);
+  user-select: text;
+}
+
+.geometry-preview {
+  display: grid;
+  place-items: center;
+  min-height: 150px;
+  background: var(--bg-0);
+}
+.geometry-preview img {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+
+.atlas-preview {
+  background: var(--bg-0);
+}
+.atlas-preview-frame {
+  position: relative;
+  line-height: 0;
+}
+.atlas-preview-frame img {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+/* Region outlines sit over the sheet as percentages, so they track the image
+   at whatever width the 320px column gives it. */
+.atlas-preview-region {
+  position: absolute;
+  border: 1px solid rgba(63, 208, 201, 0.85);
+  background: rgba(63, 208, 201, 0.1);
+}
+.atlas-preview-region:hover {
+  background: rgba(63, 208, 201, 0.28);
+}
+
+/* ===========================================================================
+   Fonts â€” the Assets-grid specimen tile, the Inspector's specimen, and the
+   Google Fonts browser.
+   =========================================================================== */
+
+.font-thumb {
+  display: grid;
+  place-items: center;
+  color: var(--text);
+  overflow: hidden;
+}
+.font-thumb span {
+  line-height: 1;
+}
+
+.font-preview {
+  padding: 12px 10px;
+  background: var(--bg-0);
+  color: var(--text);
+  overflow: hidden;
+}
+.font-specimen-alphabet {
+  font-size: 13px;
+  line-height: 1.5;
+  word-break: break-all;
+  color: var(--text-dim);
+  margin-bottom: 10px;
+}
+.font-specimen-line {
+  line-height: 1.3;
+  margin: 6px 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.font-coverage {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 2px 10px 6px;
+}
+.font-coverage-chip {
+  padding: 2px 7px;
+  border-radius: 6px;
+  background: var(--fill-1);
+  border: 1px solid var(--border);
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
+.font-library {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--bg-1);
+}
+.font-library-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+.font-library-bar .search-field {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0 8px;
+  height: 26px;
+  border-radius: var(--r-input);
+  background: var(--fill-1);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+}
+.font-library-bar .search-field input {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font-size: 11.5px;
+  outline: none;
+}
+.font-library-bar .text-field.grow {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.font-library-bar .range-field {
+  width: 110px;
+  flex: 0 0 auto;
+  accent-color: var(--accent);
+}
+.font-library-status {
+  font-size: 10.5px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 220px;
+}
+.font-library-error {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px;
+  padding: 8px 10px;
+  border-radius: var(--r-input);
+  background: rgba(255, 93, 85, 0.12);
+  border: 1px solid rgba(255, 93, 85, 0.3);
+  color: var(--danger);
+  font-size: 11px;
+}
+.font-library-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 4px 8px 12px;
+}
+.font-row {
+  padding: 8px 2px 10px;
+  border-bottom: 1px solid var(--border);
+}
+.font-row-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.font-row-name {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text);
+}
+.font-row-meta {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 10.5px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.font-row-warn {
+  color: var(--warn);
+  display: flex;
+}
+.font-row-sample {
+  margin-top: 6px;
+  color: var(--text);
+  line-height: 1.25;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: opacity 0.15s var(--ease);
+}
+.font-variant-picker {
+  margin: 8px;
+  padding: 8px 10px;
+  border-radius: var(--r-card);
+  background: var(--bg-2);
+  border: 1px solid var(--border-strong);
+}
+.font-variant-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin: 6px 0 8px;
+}
+.font-variant {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  background: var(--fill-1);
+  border: 1px solid var(--border);
+  font-size: 10.5px;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.font-variant.on {
+  background: var(--accent-soft);
+  border-color: var(--accent-ring);
+  color: var(--text);
+}
+.font-variant input {
+  margin: 0;
+}
+.font-variant-actions {
+  display: flex;
+  gap: 6px;
+}
+
+/* ===========================================================================
+   Texture Editor â€” the Text tool's floating entry box and its options.
+   =========================================================================== */
+
+.texture-text-entry {
+  position: absolute;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px;
+  border-radius: var(--r-card);
+  background: var(--menu-bg);
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow-menu);
+  backdrop-filter: blur(12px);
+}
+.texture-text-entry textarea {
+  width: 220px;
+  min-height: 54px;
+  resize: both;
+  padding: 6px 7px;
+  border-radius: var(--r-input);
+  border: 1px solid var(--border);
+  background: var(--bg-1);
+  color: var(--text);
+  font-size: 12px;
+  font-family: inherit;
+  outline: none;
+}
+.texture-text-entry textarea:focus {
+  border-color: var(--accent-ring);
+}
+.texture-text-actions {
+  display: flex;
+  gap: 5px;
+  align-items: center;
+}
+.texture-text-actions .hint {
+  flex: 1 1 auto;
+  font-size: 9.5px;
+  color: var(--text-dim);
+}
+.texture-font-select {
+  max-width: 150px;
+}
+
+
+/* The vim status line, below the editor: mode indicator, pending command, and
+   the `:` prompt monaco-vim writes into. */
+.code-vim-status {
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-2);
+  color: var(--text-dim);
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 10.5px;
+  line-height: 16px;
+  min-height: 18px;
+}
+.code-vim-status input {
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  outline: none;
+  width: 60%;
+}
+.toolbar-btn.active {
+  background: var(--accent-soft);
+  border-color: var(--accent-ring);
+  color: var(--text);
+}

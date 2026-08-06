@@ -1343,39 +1343,109 @@ console.log("\nviewport suspension");
   const whileFocused = await framesOver(1000);
   check("a focused viewport renders", whileFocused > 5, `${whileFocused} frames in 1s`);
 
-  // Now hand focus to the Texture Editor, exactly as clicking it does.
+  // Now hand focus to the Texture Editor, exactly as clicking it does. Pausing
+  // is opt-in, so out of the box this must change nothing at all.
   check("the texture editor can take focus", await focusPanel("textureEditor"));
-  const whileUnfocused = await framesOver(1000);
-  // Near zero rather than exactly zero: the loop really does stop, and the
-  // handful of frames left are single wake frames granted at most once per
-  // sample because something in the editor emits `hierarchy-changed` at a very
-  // high rate. Worth fixing at the source; the cap is what keeps it bounded.
+  const unfocusedDefault = await framesOver(1000);
   check(
-    "an unfocused viewport all but stops",
-    whileUnfocused * 5 < whileFocused,
+    "an unfocused viewport keeps rendering by default",
+    unfocusedDefault * 2 > whileFocused,
+    `${unfocusedDefault} frames in 1s (focused: ${whileFocused})`,
+  );
+
+  // Turn pausing on through the real toolbar button, so a mis-wired onClick
+  // fails here rather than in the pref module.
+  const clickFreeze = async () =>
+    page.evaluate(() => {
+      const button = [...document.querySelectorAll(".viewport-toolbar .toolbar-btn")].find((b) =>
+        /pause it when another panel/.test(b.getAttribute("title") ?? ""),
+      );
+      if (!button) return false;
+      button.click();
+      return true;
+    });
+  check("the freeze toggle is in the viewport toolbar", await clickFreeze());
+  await settle(900);
+  const whileUnfocused = await framesOver(1000);
+  // Zero, not "a lot less": the loop really does stop. A straggler frame is
+  // tolerated because a wake granted just before the window opens can still be
+  // in flight, but anything more means something is holding the loop open.
+  check(
+    "turning it on stops an unfocused viewport",
+    whileUnfocused <= 2,
     `${whileUnfocused} frames in 1s (was ${whileFocused})`,
   );
 
-  // ...but it must not go stale: anything that changes what it draws wakes it
-  // for a single frame.
-  await page.evaluate(() => {
-    globalThis.__frames = 0;
-    globalThis.__unsub?.();
-    globalThis.__unsub = globalThis.__engine.onUpdate(() => {
-      globalThis.__frames++;
+  // ...but it must not go stale. Everything below is a way the picture can
+  // change while the viewport is not the focused panel; each one has to reach
+  // the screen, or the user gets a viewport that quietly lies to them.
+  const framesAfter = async (fn, ms = 700) => {
+    await page.evaluate(() => {
+      globalThis.__frames = 0;
+      globalThis.__unsub?.();
+      globalThis.__unsub = globalThis.__engine.onUpdate(() => {
+        globalThis.__frames++;
+      });
     });
-    globalThis.__engine.emit("hierarchy-changed");
-  });
-  await settle(500);
-  const woke = await page.evaluate(() => {
-    globalThis.__unsub?.();
-    globalThis.__unsub = null;
-    return globalThis.__frames;
-  });
-  check("a scene change wakes it for a frame or two", woke > 0 && woke <= 6, `${woke} frames`);
+    await fn();
+    await settle(ms);
+    return page.evaluate(() => {
+      globalThis.__unsub?.();
+      globalThis.__unsub = null;
+      return globalThis.__frames;
+    });
+  };
+
+  const woke = await framesAfter(() => page.evaluate(() => globalThis.__engine.emit("hierarchy-changed")), 500);
+  check("a scene change wakes it", woke > 0 && woke <= 20, `${woke} frames`);
+
+  // Frame Selected (F) moves the camera directly, emitting nothing at all — the
+  // pacer notices by watching the camera's pose. This is the exact regression
+  // that made pressing F look like it did nothing.
+  const afterCamera = await framesAfter(() =>
+    page.evaluate(() => {
+      globalThis.__engine.camera.position.x += 3;
+    }),
+  );
+  check("a camera move wakes it", afterCamera > 0, `${afterCamera} frames`);
+
+  // An Inspector edit. Every scene mutation goes through the command bus, so
+  // one dummy transform command stands in for the whole panel.
+  const afterEdit = await framesAfter(() =>
+    page.evaluate(async () => {
+      const { commandBus } = await globalThis.__importLive("/src/editor/commands/CommandBus.js");
+      const { SetTransformCommand } = await globalThis.__importLive(
+        "/src/editor/commands/transformCommands.js",
+      );
+      const entity = [...globalThis.__engine.entities.values()][0];
+      if (!entity) return;
+      const transform = entity.getTransform();
+      commandBus.execute(
+        new SetTransformCommand(entity.id, {
+          ...transform,
+          position: [(transform.position?.[0] ?? 0) + 1, transform.position?.[1] ?? 0, transform.position?.[2] ?? 0],
+        }),
+      );
+    }),
+  );
+  check("an inspector-style edit wakes it", afterEdit > 0, `${afterEdit} frames`);
 
   const stillQuiet = await framesOver(800);
-  check("and it goes quiet again straight after", stillQuiet * 5 < whileFocused, `${stillQuiet} frames`);
+  check("and it goes quiet again straight after", stillQuiet <= 2, `${stillQuiet} frames`);
+
+  // And clicking it again puts the viewport back to always rendering.
+  const unclicked = await page.evaluate(() => {
+    const button = [...document.querySelectorAll(".viewport-toolbar .toolbar-btn")].find((b) =>
+      /always rendering/.test(b.getAttribute("title") ?? ""),
+    );
+    if (!button) return false;
+    button.click();
+    return true;
+  });
+  check("the toggle reads as pressed once freezing is on", unclicked);
+  await settle(900);
+  const unfrozen = await framesOver(1000);
+  check("turning it back off resumes rendering", unfrozen * 2 > whileFocused, `${unfrozen} frames in 1s`);
 
   // Give focus back so nothing downstream inherits a stopped viewport.
   await focusPanel("viewport");

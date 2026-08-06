@@ -25,7 +25,11 @@ const PANELS = [
   ["projectSettings", "Project Settings"], ["build", "Build"], ["modules", "Modules"],
   ["input", "Input"], ["geometryEditor", "Geometry Editor"], ["postprocess", "Post Process"],
   ["polyhaven", "Poly Haven"], ["ambientcg", "AmbientCG"], ["sketchfab", "Sketchfab"],
+  ["itchio", "itch.io"], ["audioLibrary", "Audio Library"], ["audioEditor", "Audio Editor"],
   ["terminal", "Terminal"], ["mcp", "Assistant (MCP)"],
+  // The panel id doubles as a search keyword (see `panelItems`), so "git"
+  // finds this even though the panel is called Source Control.
+  ["git", "Source Control"],
 ];
 
 const SETTINGS = [

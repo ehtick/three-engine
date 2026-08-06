@@ -10,6 +10,7 @@ import {
   Package,
   Palette,
   Shapes,
+  Type,
   Volume2,
   Workflow,
 } from "lucide-react";
@@ -24,6 +25,7 @@ import {
   GEOMETRY_EXTENSIONS,
   ATLAS_EXTENSIONS,
   AUDIO_EXTENSIONS,
+  FONT_EXTENSIONS,
 } from "./assetLoader.js";
 import { getAssetFlags } from "./assetFlags.js";
 
@@ -46,6 +48,7 @@ export const ASSET_TYPES = [
   { id: "script", label: "Scripts", Icon: FileCode2, exts: SCRIPT_EXTENSIONS },
   { id: "animator", label: "Animators", Icon: Workflow, exts: ANIMATOR_EXTENSIONS },
   { id: "audio", label: "Audio", Icon: Volume2, exts: AUDIO_EXTENSIONS },
+  { id: "font", label: "Fonts", Icon: Type, exts: FONT_EXTENSIONS },
 ];
 
 export const assetType = (id) => ASSET_TYPES.find((type) => type.id === id) ?? ASSET_TYPES[0];

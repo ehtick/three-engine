@@ -364,10 +364,18 @@ export const GraphEditor = forwardRef(function GraphEditor(
     [commit],
   );
 
-  /** Double-clicking a wire drops a reroute pin on it — the standard way to
-   *  route a long connection around the middle of a dense graph. */
+  /** Double-clicking a wire deletes it. Alt+double-click drops a reroute pin
+   *  instead — routing a long connection around a dense graph is still
+   *  possible, but the common gesture is the destructive one. */
   const onEdgeDoubleClick = useCallback(
     (event, edge) => {
+      if (!event.altKey) {
+        commit(live.current.nodes, live.current.edges.filter((e) => e.id !== edge.id), {
+          kind: "structure",
+          reason: "disconnect",
+        });
+        return;
+      }
       const position = screenToFlowPosition({ x: event.clientX, y: event.clientY });
       const id = makeNodeId("reroute");
       const node = {
@@ -489,11 +497,16 @@ export const GraphEditor = forwardRef(function GraphEditor(
     (type, screenPos, autoWire = null) => {
       setMenuOpen(false);
       setCanvasMenu(null);
+      // No explicit position (the toolbar's Add menu) → the visible center of
+      // the canvas. `screenToFlowPosition` takes PAGE-client coordinates, so
+      // the wrapper's own width/2 is only correct when the panel happens to sit
+      // at the page origin — docked anywhere else, nodes spawned off-screen.
+      const rect = wrapRef.current?.getBoundingClientRect();
       const position = screenPos
         ? screenToFlowPosition({ x: screenPos.x, y: screenPos.y })
         : screenToFlowPosition({
-            x: (wrapRef.current?.clientWidth ?? 600) / 2,
-            y: (wrapRef.current?.clientHeight ?? 400) / 2,
+            x: (rect?.left ?? 0) + (rect?.width ?? 1200) / 2,
+            y: (rect?.top ?? 0) + (rect?.height ?? 800) / 2,
           });
       const id = makeNodeId(type);
       const node = {

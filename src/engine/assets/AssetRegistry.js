@@ -3,6 +3,7 @@ import { loadMaterialAsset, getMaterialInstance } from "../materialAsset.js";
 import { acquireGeometryAsset, releaseGeometryAsset } from "../geometryAsset.js";
 import { loadAudioAsset, getAudioBuffer } from "../audio/AudioAsset.js";
 import { loadCubemapAsset, getLoadedCubemap } from "../cubemapAsset.js";
+import { ensureFontLoaded, getLoadedFont, fontFamilyFor } from "../ui/fontAsset.js";
 import { assetCatalog } from "./catalog.js";
 
 /**
@@ -96,6 +97,34 @@ export class AssetRegistry {
   /** The already-loaded cube texture for `path`, or null if not loaded yet. */
   getCubemap(path) {
     return getLoadedCubemap(path);
+  }
+
+  /**
+   * Registers a project font file so text can be drawn with it, resolving to
+   * `{ family, displayName, meta }`.
+   *
+   * `family` is the CSS family name to use — a generated id, not the font's
+   * own name, so two files that both call themselves "Inter" don't shadow each
+   * other and a project font never collides with one installed on the player's
+   * machine. Await this before drawing to a canvas yourself; `UiText` does it
+   * for you.
+   */
+  font(path) {
+    return ensureFontLoaded(path);
+  }
+
+  /** The loaded font record for `path`, or null if it isn't ready yet. */
+  getFont(path) {
+    return getLoadedFont(path);
+  }
+
+  /**
+   * The CSS family name `path` is (or will be) registered under. Synchronous
+   * and stable, so it can go straight into a `ctx.font` string — it simply
+   * won't resolve until `font(path)` has settled.
+   */
+  fontFamily(path) {
+    return fontFamilyFor(path);
   }
 
   /**

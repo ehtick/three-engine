@@ -1,6 +1,10 @@
+import { vmState } from "../vmState.js";
 import { Component } from "./Component.js";
 
-const componentClasses = new Map();
+// One registry per VM. Two copies of this module means a component
+// registered through one is "Unknown component type" through the other — and
+// which one a scene deserializes against depends on import order.
+const componentClasses = vmState("componentClasses", () => new Map());
 
 export function registerComponent(cls) {
   if (!cls.type) throw new Error("Component class needs a static `type`");
@@ -31,8 +35,8 @@ export class MissingComponent extends Component {
   static schema = [];
   static tags = [];
 
-  constructor(entity, props, missingType) {
-    super(entity, props);
+  constructor(props, missingType) {
+    super(props);
     this.missingType = missingType;
   }
 
@@ -41,11 +45,11 @@ export class MissingComponent extends Component {
   }
 }
 
-export function createComponent(type, entity, props) {
+export function createComponent(type, props) {
   const Cls = componentClasses.get(type);
   if (!Cls) {
     console.warn(`Unknown component type "${type}" — keeping it as data (is its module enabled?)`);
-    return new MissingComponent(entity, props, type);
+    return new MissingComponent(props, type);
   }
-  return new Cls(entity, props);
+  return new Cls(props);
 }

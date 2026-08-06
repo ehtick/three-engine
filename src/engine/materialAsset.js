@@ -1,3 +1,4 @@
+import { vmState, vmRecord } from "./vmState.js";
 import * as THREE from "three/webgpu";
 
 import { fract, interleavedGradientNoise, screenCoordinate, viewportDepthTexture } from "three/tsl";
@@ -111,7 +112,7 @@ export function applyMaterialPipeline(material, definition = MATERIAL_PIPELINE_D
 
 
 
-let defaultMaterial = null;
+const defaults = vmRecord("defaultMaterial", { material: null });
 
 
 
@@ -119,9 +120,9 @@ let defaultMaterial = null;
 
 export function getDefaultMaterial() {
 
-  if (!defaultMaterial) {
+  if (!defaults.material) {
 
-    defaultMaterial = new THREE.MeshPhysicalNodeMaterial({
+    defaults.material = new THREE.MeshPhysicalNodeMaterial({
 
       color: new THREE.Color(MATERIAL_DEFAULTS.color),
 
@@ -133,7 +134,7 @@ export function getDefaultMaterial() {
 
   }
 
-  return defaultMaterial;
+  return defaults.material;
 
 }
 
@@ -147,7 +148,11 @@ export function getDefaultMaterial() {
 // opened on a case-sensitive filesystem), but canonicalise separators.
 const assetKey = (path) => String(path ?? "").replaceAll("\\", "/");
 
-const cache = new Map(); // canonical path -> { path, material, def, generation, migrated, isVolume, renderable }
+// canonical path -> { path, material, def, generation, migrated, isVolume, renderable }
+// VM-wide: an editor material edit invalidates the cache and notifies
+// subscribers through whichever copy it imported, and a mesh that resolved its
+// material through the other copy would keep the stale instance forever.
+const cache = vmState("materialCache", () => new Map());
 
 
 // Meshes referencing a .mat subscribe here so they can react when its material
@@ -158,7 +163,7 @@ const cache = new Map(); // canonical path -> { path, material, def, generation,
 
 // no notification; only identity/visibility changes do.
 
-const subscribers = new Map(); // path -> Set<() => void>
+const subscribers = vmState("materialSubscribers", () => new Map()); // path -> Set<() => void>
 
 
 
@@ -725,6 +730,31 @@ function readConstantColor(node) {
 }
 
 
+
+/**
+ * Re-reads a `.mat` from disk and re-applies it to the SHARED instance every
+ * mesh already points at.
+ *
+ * For when the file changed underneath the editor — a `.mat` written by an
+ * agent, an external tool, or a version-control checkout. Mutating the existing
+ * instance rather than making a new one is what makes the change appear without
+ * touching a single mesh: nothing has to be re-pointed, and a surface↔volume
+ * switch still reaches subscribers through `applyMaterialDef`.
+ *
+ * The caller must have dropped any cached URL for `path` first (the editor's
+ * `invalidateBlobUrl`), or `resolveAssetUrl` hands back the stale bytes.
+ *
+ * Returns false when the material was never loaded — there is nothing on screen
+ * using it, so there is nothing to refresh.
+ */
+export async function reloadMaterialAsset(path) {
+  const entry = cache.get(assetKey(path));
+  if (!entry) return false;
+  const url = await resolveAssetUrl(path);
+  const def = await (await fetch(url)).json();
+  applyMaterialDef(entry, { ...MATERIAL_DEFAULTS, ...def });
+  return true;
+}
 
 /** Re-applies materials referencing a texture (after its .meta changed). */
 

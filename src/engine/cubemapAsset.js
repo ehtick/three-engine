@@ -1,3 +1,4 @@
+import { vmState } from "./vmState.js";
 import * as THREE from "three/webgpu";
 import { resolveAssetUrl } from "./assetResolver.js";
 
@@ -98,7 +99,7 @@ export function guessCubemapFaces(paths) {
   return faces;
 }
 
-const cache = new Map(); // normalized path -> { promise, texture, error }
+const cache = vmState("cubemapCache", () => new Map()); // normalized path -> { promise, texture, error }
 
 const assetKey = (path) => String(path ?? "").replaceAll("\\", "/");
 

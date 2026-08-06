@@ -289,8 +289,37 @@ export class SdfFont {
 
 const fontCache = new Map();
 
+/**
+ * Atlases are baked from whatever the platform resolves the family to AT THE
+ * MOMENT a glyph is first drawn. A project font that finishes loading after
+ * that has no effect on an atlas already full of fallback glyphs, and the
+ * atlas is cached for the session — so the text stays visibly wrong until a
+ * reload, which makes it look like the font import failed.
+ *
+ * Subscribing once, lazily, keeps that from happening: any atlas built against
+ * a family that just became available is thrown away and rebuilt on the next
+ * layout. Lazy because this module is imported by headless tests where
+ * `document.fonts` does not exist and no font will ever load.
+ */
+let fontSubscription = null;
+function ensureFontSubscription() {
+  if (fontSubscription) return;
+  fontSubscription = import("./fontAsset.js")
+    .then(({ onFontLoaded }) =>
+      onFontLoaded((_path, entry) => {
+        for (const [key, font] of [...fontCache.entries()]) {
+          if (!key.includes(entry.family)) continue;
+          font.dispose();
+          fontCache.delete(key);
+        }
+      }),
+    )
+    .catch(() => {});
+}
+
 /** Shared atlas per (family, weight) — one texture for every label using it. */
 export function getSdfFont(fontFamily, fontWeight) {
+  ensureFontSubscription();
   const key = `${fontWeight}|${fontFamily}`;
   let font = fontCache.get(key);
   if (!font) {

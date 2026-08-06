@@ -1,3 +1,4 @@
+import { vmSingleton } from "./singleton.js";
 import * as THREE from "three/webgpu";
 import { ensureEngine } from "./engineInstance.js";
 import { commandBus } from "./commands/CommandBus.js";
@@ -5,7 +6,13 @@ import { useSceneStore } from "./store/sceneStore.js";
 import { useSelectionStore } from "./store/selectionStore.js";
 import { useProjectStore } from "./store/projectStore.js";
 
-let currentPath = null;
+/**
+ * The scene file on screen. VM-wide rather than a module-level `let`: "which
+ * file does Ctrl+S write?" must have exactly one answer, and a second copy of
+ * this module starts at null — so a save driven through it would silently
+ * become a Save-As of a scene the other copy opened.
+ */
+const open = vmSingleton("openScene", () => ({ /** @type {string | null} */ path: null }));
 
 const SCENE_FILTERS = [{ name: "Scene", extensions: ["scene", "json"] }];
 // Only consulted in the projectless ("Skip the project") path. With a real
@@ -14,8 +21,8 @@ const SCENE_FILTERS = [{ name: "Scene", extensions: ["scene", "json"] }];
 // previous project. See restoreLastScene().
 const LAST_SCENE_KEY = "engine.lastScene.v1";
 
-export const hasScenePath = () => !!currentPath;
-export const currentScenePath = () => currentPath;
+export const hasScenePath = () => !!open.path;
+export const currentScenePath = () => open.path;
 
 /**
  * Flag consulted by EditorChrome on its mount effect. A single engine
@@ -42,7 +49,7 @@ export async function resetEditorScene() {
   await leavePrefabMode();
   const engine = await ensureEngine();
   engine.clear();
-  currentPath = null;
+  open.path = null;
   resetSceneBooted();
   afterSceneSwap(engine);
 }
@@ -66,7 +73,7 @@ function toProjectRelative(root, path) {
  * entry bleed into the next project opened.
  */
 function rememberScene(path) {
-  currentPath = path;
+  open.path = path;
   useSceneStore.getState().setScenePath(path);
   const root = projectRoot();
   if (root) {
@@ -130,7 +137,7 @@ export async function restoreLastScene() {
     const contents = await invoke("load_scene", { path });
     await deserializeScene(engine, JSON.parse(contents));
     engine.sceneName = sceneNameFromPath(path);
-    currentPath = path;
+    open.path = path;
     afterSceneSwap(engine);
     console.log(`Restored scene: ${path}`);
     return true;
@@ -143,12 +150,12 @@ export async function restoreLastScene() {
 function afterSceneSwap(engine = null) {
   commandBus.clearHistory();
   useSelectionStore.getState().clear();
-  useSceneStore.getState().refresh(currentPath);
+  useSceneStore.getState().refresh(open.path);
   useSceneStore.getState().markDirty(false);
   // Keep the runtime scene manager's idea of "the scene you are in" aligned
   // with the editor's, so `engine.scenes.active` is meaningful while stopped
   // and Play starts from the right record.
-  engine?.scenes?.reset({ path: currentPath, name: engine.sceneName });
+  engine?.scenes?.reset({ path: open.path, name: engine.sceneName });
 }
 
 /** Prefab Mode holds the scene suspended in memory. Any operation that swaps
@@ -163,7 +170,7 @@ export async function newScene() {
   await leavePrefabMode();
   const engine = await ensureEngine();
   engine.clear();
-  currentPath = null;
+  open.path = null;
   useSceneStore.getState().setScenePath(null);
   engine.sceneName = projectRoot() ? "Main" : "Untitled";
 
@@ -219,7 +226,7 @@ export async function saveScene({ saveAs = false } = {}) {
   const { isPrefabModeActive, savePrefabStage } = await import("./prefab.js");
   if (isPrefabModeActive()) return savePrefabStage();
 
-  let path = !saveAs && currentPath;
+  let path = !saveAs && open.path;
   if (!path) {
     const root = projectRoot();
     if (!saveAs && root) {

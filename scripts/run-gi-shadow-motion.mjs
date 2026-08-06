@@ -9,9 +9,12 @@
 //   · GRAIN: mean |4-neighbour Laplacian| within the penumbra — the
 //     "grainy" number;
 //   · penumbra coverage, so arms are comparing the same signal.
-// Arms (env ARM): "off" = __giShadowTemporal=false (raw dither baseline),
-// "on" = shipping default, "still" = temporal on + static light (the
-// convergence celling). ROT=deg/sec overrides the rotation speed.
+// Arms (env ARM): "analytic" = the SHIPPING DEFAULT (deterministic
+// analytic-width, docs/GI_SHADOWS_PLAN.md §5 — its bar is flicker AND grain
+// at the static noise floor WHILE the sun rotates); the three stochastic-path
+// arms pin __giShadowAnalyticWidth=false: "on" = sun-disc + temporal,
+// "off" = temporal also off (raw dither baseline), "still" = temporal on +
+// static light (the convergence ceiling). ROT=deg/sec overrides rotation.
 //
 //   node scripts/run-gi-shadow-motion.mjs [url]
 import puppeteer from "puppeteer-core";
@@ -43,6 +46,9 @@ await new Promise((r) => setTimeout(r, 5000));
 
 const result = await page.evaluate(async ({ arm, rotDegPerSec }) => {
   globalThis.__editorKeepRendering = true;
+  // Build-time hatches — set BEFORE the GI entity below triggers the build.
+  // Analytic-width is the default; the stochastic arms pin it off.
+  if (arm === "off" || arm === "on" || arm === "still") globalThis.__giShadowAnalyticWidth = false;
   if (arm === "off") globalThis.__giShadowTemporal = false;
   const { THREE } = await import("/src/engine/index.js");
   await import("/src/modules/index.js");
@@ -174,7 +180,13 @@ const result = await page.evaluate(async ({ arm, rotDegPerSec }) => {
   // Same-instant stage comparison (the shadow moves fast — grabbing stages
   // seconds apart made the post-filter look like it ADDED noise).
   const rawLast = await grab(screen.targets.lightShadowRaw);
-  const accumLast = await grab(screen.targets.lightShadowAccum);
+  // The analytic-width arm has no accum stage (trace → one filter → final);
+  // its accum texture exists but is never written, and copyTextureToBuffer
+  // throws on a GPU texture no pass ever touched. Read final in its place so
+  // the stage table stays shaped.
+  const accumLast = screen.lightShadowHistoryPass
+    ? await grab(screen.targets.lightShadowAccum)
+    : await grab(screen.targets.lightShadow);
   const finalLast = await grab(screen.targets.lightShadow);
   const rawG = grainOf(rawLast);
   const accumG = grainOf(accumLast);

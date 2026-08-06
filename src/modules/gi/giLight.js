@@ -321,7 +321,7 @@ export function emitterDirectAt(params, P, N, samplePoint) {
   const total = vec3(0).toVar();
   const shadows = [];
   const perSlot = [];
-  for (const slot of params.emitterSlots) {
+  for (const [index, slot] of params.emitterSlots.entries()) {
     const center = vec3(slot.center);
     const toEmitter = center.sub(P).toVar();
     const dist = toEmitter.length().max(1e-3).toVar();
@@ -334,63 +334,104 @@ export function emitterDirectAt(params, P, N, samplePoint) {
     const emitterDirect = vec3(slot.color)
       .mul(emitterSlotFactor(slot, P, N, cosTheta, sinR))
       .toVar();
-
-    const shadow = float(1).toVar();
-    // Trace gates beyond the basics: below cosθ 0.05 the grazing fade
-    // discards the traced result entirely, and a contribution too dim to see
-    // doesn't earn a march either — both skip the trace outright.
     // CRITICAL: light too dim to TRACE must also be too dim to SHOW — the old
     // gate skipped the trace but KEPT the contribution, so dim emitter light
     // crossed walls unshadowed and read clearly in dark adjacent rooms.
     const emitterLum = emitterDirect.dot(vec3(0.2126, 0.7152, 0.0722)).toVar();
     emitterDirect.mulAssign(smoothstep(0.0005, 0.0015, emitterLum));
-    If(
-      slot.radius.greaterThan(0.001)
-        .and(cosTheta.greaterThan(0.05))
-        .and(dist.lessThan(params.shadowRange))
-        .and(emitterLum.greaterThan(0.0015)),
-      () => {
-        // SDF sphere-traced penumbra: ONE ray, smooth by construction.
-        // k = distance / emitter angular radius encodes the light's angular
-        // size: bigger/closer emitter → softer. Floor 1.2 so a large area
-        // lamp close to the receiver keeps a wide, soft penumbra.
-        const k = dist.div(float(emitterAngularRadius(slot)).max(0.05)).clamp(1.2, 48);
-        // Ray cap at the emitter's actual SURFACE (slab entry for boxes —
-        // the bounding sphere of an elongated lamp stopped the ray well
-        // short of its face, exempting anything hugging it from occluding).
-        const maxT = emitterSurfaceT(slot, samplePoint, dirToEmitter, dist).sub(params.shadowMargin).max(0);
-        If(maxT.greaterThan(params.shadowMargin), () => {
-          // Self-exclusion covers ONLY the lamp's own body + a couple of
-          // field cells. Sphere slots: the bounding sphere ×1.5 (their body
-          // IS the sphere). Box slots: the OBB dilated by the margin — the
-          // bounding sphere of a big panel swallowed nearby ceilings/walls,
-          // which then stopped occluding (light poured through into the
-          // next room as a circle) and its boundary ringed the pool.
-          const kindF = slot.kind ? float(slot.kind) : null;
-          const exRadius = kindF
-            ? mix(slot.radius.mul(1.5).add(params.shadowMargin), float(params.shadowMargin), kindF)
-            : slot.radius.mul(1.5).add(params.shadowMargin);
-          const exBox = kindF
-            ? { half: mix(vec3(-1), vec3(slot.half), kindF), bx: slot.bx, by: slot.by, bz: slot.bz }
-            : null;
-          const traced = params.shadowTraceFn(
-            samplePoint, dirToEmitter, maxT, k, cosTheta,
-            center, exRadius, exBox,
-          );
-          // Grazing fade: with the ray nearly parallel to the receiver plane
-          // the trace hugs the surface's own field and flickers in terraced
-          // rings around the emitter. E already carries cosθ, so at grazing
-          // angles the shadow contributes nothing but rings.
-          shadow.assign(mix(float(1), traced, smoothstep(0.05, 0.2, cosTheta)));
-        });
-      },
-    );
+    // PRE-TRACED CHANNEL (2026-08-06): when the emitter shadows run as their
+    // own pass at their own pixel budget (giScreen's emitter shadow pass —
+    // the same split that took the direct arm from 22ms to 5.4ms at 4×
+    // pixels), the resolve just SAMPLES the filtered texture; the trace
+    // lives in exactly one kernel. The hit-shading path (bvhShade) keeps
+    // tracing inline — a reflection hit is a different world point than the
+    // pixel, so a screen-space sample would be the wrong surface's shadow.
+    const shadow = params.shadowSample
+      ? float(params.shadowSample(index)).toVar()
+      : emitterSlotShadow(params, slot, P, N, samplePoint);
     const active = step(0.001, slot.radius);
     total.addAssign(emitterDirect.mul(shadow).mul(active));
     shadows.push(shadow);
     perSlot.push({ slot, shadow, dist, dirToEmitter, active });
   }
   return { irradiance: total, shadows, perSlot };
+}
+
+/**
+ * One emitter slot's traced shadow factor at receiver P — the block
+ * emitterDirectAt always carried, extracted (2026-08-06) so the dedicated
+ * emitter shadow pass (giScreen createGiEmitterShadowPass) and the resolve's
+ * hit-shading path evaluate the IDENTICAL estimator. Trace gates: below
+ * cosθ 0.05 the grazing fade discards the traced result entirely, and a
+ * contribution too dim to see doesn't earn a march either.
+ */
+export function emitterSlotShadow(params, slot, P, N, samplePoint) {
+  const center = vec3(slot.center);
+  const toEmitter = center.sub(P).toVar();
+  const dist = toEmitter.length().max(1e-3).toVar();
+  const dirToEmitter = toEmitter.div(dist).toVar();
+  const cosTheta = dirToEmitter.dot(N).toVar();
+  const sinR = float(slot.radius).div(dist).clamp(0, 1).toVar();
+  const emitterLum = vec3(slot.color)
+    .mul(emitterSlotFactor(slot, P, N, cosTheta, sinR))
+    .dot(vec3(0.2126, 0.7152, 0.0722))
+    .toVar();
+  const shadow = float(1).toVar();
+  If(
+    slot.radius.greaterThan(0.001)
+      .and(cosTheta.greaterThan(0.05))
+      .and(dist.lessThan(params.shadowRange))
+      .and(emitterLum.greaterThan(0.0015)),
+    () => {
+      // k = distance / emitter angular radius encodes the light's angular
+      // size: bigger/closer emitter → softer. Floor 1.2 so a large area
+      // lamp close to the receiver keeps a wide, soft penumbra.
+      const k = dist.div(float(emitterAngularRadius(slot)).max(0.05)).clamp(1.2, 48);
+      // Ray cap at the emitter's actual SURFACE (slab entry for boxes —
+      // the bounding sphere of an elongated lamp stopped the ray well
+      // short of its face, exempting anything hugging it from occluding).
+      const maxT = emitterSurfaceT(slot, samplePoint, dirToEmitter, dist).sub(params.shadowMargin).max(0);
+      If(maxT.greaterThan(params.shadowMargin), () => {
+        // Self-exclusion covers ONLY the lamp's own body + a couple of
+        // field cells. Sphere slots: the bounding sphere ×1.5 (their body
+        // IS the sphere). Box slots: the OBB dilated by the margin — the
+        // bounding sphere of a big panel swallowed nearby ceilings/walls,
+        // which then stopped occluding (light poured through into the
+        // next room as a circle) and its boundary ringed the pool.
+        const kindF = slot.kind ? float(slot.kind) : null;
+        const exRadius = kindF
+          ? mix(slot.radius.mul(1.5).add(params.shadowMargin), float(params.shadowMargin), kindF)
+          : slot.radius.mul(1.5).add(params.shadowMargin);
+        const exBox = kindF
+          ? { half: mix(vec3(-1), vec3(slot.half), kindF), bx: slot.bx, by: slot.by, bz: slot.bz }
+          : null;
+        // RECORD-MARCH EMITTER SHADOWS (2026-08-06, plan §6 unification —
+        // the emitter arm joins the light arm's estimator family). The
+        // sphere trace's threshold admissions over the voxel-quantized
+        // distance field etched a lattice grid across receivers under big
+        // panel emitters; the record march has no admission thresholds at
+        // all, and the analytic width probe supplies the penumbra.
+        // `recordShadowTrace` exists ONLY on compute-pass bundles — the
+        // legacy in-material fallback (params = the light itself) must
+        // never compile the occupancy bits buffer into fragment shaders,
+        // so it keeps the sphere arm. The lamp's own body is excluded by
+        // maxT (surface slab entry minus margin), not by a region test —
+        // admission is exact, so a wall hugging the lamp still occludes.
+        const traced = params.recordShadowTrace
+          ? params.recordShadowTrace(P, N, dirToEmitter, maxT, k, cosTheta)
+          : params.shadowTraceFn(
+              samplePoint, dirToEmitter, maxT, k, cosTheta,
+              center, exRadius, exBox,
+            );
+        // Grazing fade: with the ray nearly parallel to the receiver plane
+        // the trace hugs the surface's own field and flickers in terraced
+        // rings around the emitter. E already carries cosθ, so at grazing
+        // angles the shadow contributes nothing but rings.
+        shadow.assign(mix(float(1), traced, smoothstep(0.05, 0.2, cosTheta)));
+      });
+    },
+  );
+  return shadow;
 }
 
 /**

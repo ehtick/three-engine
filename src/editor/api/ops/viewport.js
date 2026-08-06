@@ -26,6 +26,7 @@ import { getViewportHandle } from "../../viewportHandle.js";
 import { EDITOR_LAYER } from "../../../engine/editorLayers.js";
 import { getEntityBoundingSphere } from "../../../engine/viewFrustum.js";
 import { useConsoleStore } from "../../store/consoleStore.js";
+import { isViewportFreezeEnabled, setViewportFreezeEnabled } from "../../viewportFreeze.js";
 
 /** Caps the readback so a caller can't ask for a gigabyte of pixels. */
 const MAX_DIM = 2048;
@@ -256,6 +257,22 @@ defineOp({
     viewport.orbit?.target.copy(center);
     viewport.orbit?.update();
     return { center: center.toArray(), radius, distance: dist };
+  },
+});
+
+defineOp({
+  name: "viewport.setFreezeWhenUnfocused",
+  description:
+    "Toggle whether the viewport stops rendering while another panel is focused (the snowflake in the viewport toolbar). Off by default, so the viewport always renders; turn it ON only to stop a heavy scene stealing the main thread from whatever panel the user is actually working in. Omit `enabled` to just read the current setting.",
+  params: {
+    enabled: {
+      type: "boolean",
+      description: "true to pause an unfocused viewport, false (the default) to always render.",
+    },
+  },
+  run({ enabled }) {
+    if (enabled !== undefined) setViewportFreezeEnabled(!!enabled);
+    return { enabled: isViewportFreezeEnabled() };
   },
 });
 

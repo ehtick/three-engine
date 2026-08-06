@@ -22,11 +22,19 @@
  * decorator is a marker, and the marker means nothing at runtime.
  */
 
-let editorApi = null;
+import { vmRecord, vmState } from "./vmState.js";
+
+/**
+ * The slot itself is VM-wide. The editor installs the API through whichever
+ * copy of this module `api/index.js` imported; a script reaching `Editor.*`
+ * through a second copy would find an empty slot and be told, in a confident
+ * full sentence, that it is not running inside the editor.
+ */
+const slot = vmRecord("editorApiSlot", { api: null });
 
 /** True when running inside the editor (i.e. `setEditorApi` has been called). */
 export function hasEditorApi() {
-  return !!editorApi;
+  return !!slot.api;
 }
 
 /**
@@ -35,15 +43,15 @@ export function hasEditorApi() {
  * runs; production never calls it.
  */
 export function setEditorApi(api) {
-  editorApi = api ?? null;
+  slot.api = api ?? null;
   return () => {
-    if (editorApi === api) editorApi = null;
+    if (slot.api === api) slot.api = null;
   };
 }
 
 /** The raw API object, or null outside the editor. */
 export function getEditorApi() {
-  return editorApi;
+  return slot.api;
 }
 
 const NO_EDITOR =
@@ -64,19 +72,19 @@ export const Editor = new Proxy(
   {
     get(_target, prop) {
       if (prop === "then") return undefined; // never look thenable to `await`
-      if (!editorApi) throw new Error(NO_EDITOR);
-      const value = editorApi[prop];
-      return typeof value === "function" ? value.bind(editorApi) : value;
+      if (!slot.api) throw new Error(NO_EDITOR);
+      const value = slot.api[prop];
+      return typeof value === "function" ? value.bind(slot.api) : value;
     },
     has(_target, prop) {
-      return !!editorApi && prop in editorApi;
+      return !!slot.api && prop in slot.api;
     },
     ownKeys() {
-      return editorApi ? Reflect.ownKeys(editorApi) : [];
+      return slot.api ? Reflect.ownKeys(slot.api) : [];
     },
     getOwnPropertyDescriptor(_target, prop) {
-      if (!editorApi) return undefined;
-      const descriptor = Reflect.getOwnPropertyDescriptor(editorApi, prop);
+      if (!slot.api) return undefined;
+      const descriptor = Reflect.getOwnPropertyDescriptor(slot.api, prop);
       return descriptor && { ...descriptor, configurable: true };
     },
   },
@@ -84,7 +92,7 @@ export const Editor = new Proxy(
 
 /** Cheap "am I in the editor?" test for scripts that ship with the game. */
 export function isEditor() {
-  return !!editorApi;
+  return !!slot.api;
 }
 
 // ---- @executeInEditMode -----------------------------------------------------
@@ -140,9 +148,12 @@ export function runsInEditMode(cls) {
  *   - `registerMenuItem("Tools/Import CSV", fn)` at module scope. Not bound to
  *     anything, alive as long as the module is loaded. For project-wide tools.
  */
-const menuEntries = new Map(); // id -> { id, path, label, order, run }
-const menuListeners = new Set();
-let menuSeq = 0;
+// VM-wide, like the API slot above: the MenuBar subscribes through the copy the
+// editor chrome imported, and a script registering through another copy would
+// add an entry no menu is listening to.
+const menuEntries = vmState("scriptMenuEntries", () => new Map()); // id -> { id, path, label, order, run }
+const menuListeners = vmState("scriptMenuListeners", () => new Set());
+const menuIds = vmRecord("scriptMenuSeq", { next: 0 });
 
 function notifyMenus() {
   for (const fn of menuListeners) {
@@ -168,7 +179,7 @@ function notifyMenus() {
  */
 export function registerMenuItem(path, run, { id, order = 0 } = {}) {
   if (typeof run !== "function") throw new Error("registerMenuItem needs a function");
-  const key = id ?? `menu:${++menuSeq}`;
+  const key = id ?? `menu:${++menuIds.next}`;
   const [menu, ...rest] = String(path).split("/");
   menuEntries.set(key, {
     id: key,

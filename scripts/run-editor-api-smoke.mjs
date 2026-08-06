@@ -332,6 +332,19 @@ const out = await page.evaluate(async () => {
   const aimed = Editor.viewport.getCamera();
   report.setCamera = { applied: aimed.position.map((v) => Math.round(v)).join(",") === "6,5,6" };
 
+  // An agent watching something run unattended needs to be able to stop the
+  // viewport pausing itself — nothing is ever "focused" in a headless session.
+  const freezeDefault = Editor.viewport.freezeWhenUnfocused();
+  const freezeOn = Editor.viewport.freezeWhenUnfocused(true);
+  const freezeBack = Editor.viewport.freezeWhenUnfocused(false);
+  report.freeze = {
+    defaultsOff: freezeDefault.enabled === false,
+    turnsOn: freezeOn.enabled === true,
+    turnsBackOff: freezeBack.enabled === false,
+    // Reading without an argument must not change it.
+    readOnly: Editor.viewport.freezeWhenUnfocused().enabled === false,
+  };
+
   const shot = await Editor.viewport.screenshot({ width: 200, height: 120 });
   const decoded = shot.__image?.base64 ? atob(shot.__image.base64) : "";
   report.screenshot = {
@@ -457,6 +470,31 @@ const out = await page.evaluate(async () => {
     historyShape: typeof Editor.history.get().canUndo === "boolean",
   };
 
+  // === 8. audio ops ========================================================
+  // Only the parts that need no filesystem. This smoke runs plain Chrome with
+  // no Tauri, so the file-writing audio ops (edit/addTrack/setTrack/…) cannot
+  // run here — their behavioural coverage lives in `npm run smoke:audio`,
+  // which boots the same editor behind the Tauri shim and a real scratch
+  // project. What's checked here is the half that is genuinely this smoke's
+  // business: that the ops are registered and that their module gate refuses
+  // rather than half-working.
+  const audioOps = ops.filter((op) => op.name.startsWith("audio."));
+  let gateError = null;
+  await Editor.audio.search("footstep").catch((err) => { gateError = err.message; });
+  const modulesStore = await importLive("/src/editor/modules.js");
+  report.audio = {
+    registered: audioOps.length,
+    coversLibraryAndEditor:
+      audioOps.some((op) => op.name.startsWith("audio.library.")) &&
+      ["audio.info", "audio.tracks", "audio.edit", "audio.addTrack", "audio.setTrack", "audio.removeTrack"]
+        .every((name) => audioOps.some((op) => op.name === name)),
+    readsAreFlaggedReadOnly:
+      audioOps.filter((op) => op.readOnly).length >= 4 && audioOps.some((op) => !op.readOnly),
+    statusReadable: typeof (await Editor.audio.status()).moduleEnabled === "boolean",
+    searchRefusedWhileOff:
+      modulesStore.useModulesStore.getState().enabled.includes("audio-library") || /not enabled/i.test(gateError ?? ""),
+  };
+
   return report;
 });
 
@@ -467,6 +505,13 @@ if (out.fatal) {
 }
 
 // --- registry / MCP shape ----------------------------------------------------
+// --- audio ops (registration + gating; behaviour lives in smoke:audio) -------
+check("audio ops are registered", out.audio.registered >= 10, `${out.audio.registered} ops`);
+check("…covering both the library and the editor", out.audio.coversLibraryAndEditor === true);
+check("…with reads flagged readOnly and writes not", out.audio.readsAreFlaggedReadOnly === true);
+check("audio.library.status is readable", out.audio.statusReadable === true);
+check("searching through a disabled library module is refused", out.audio.searchRefusedWhileOff === true);
+
 check("ops are registered", out.registry.count > 15, `${out.registry.count} ops`);
 check("every op carries a real description", out.registry.allDescribed === true);
 check("entity.create is registered", out.registry.hasEntityCreate === true);
@@ -537,6 +582,9 @@ check("entity.getBounds returns real extents", out.bounds.empty === false && out
 check("viewport.focus moves the camera", out.focus.moved === true);
 check("…and centres on the entity", out.focus.targetsProbe === true);
 check("viewport.setCamera applies exactly", out.setCamera.applied === true);
+check("viewport freezing is off by default", out.freeze.defaultsOff === true);
+check("…and an agent can turn it on and back off", out.freeze.turnsOn === true && out.freeze.turnsBackOff === true, JSON.stringify(out.freeze));
+check("…while reading it alone changes nothing", out.freeze.readOnly === true);
 check("viewport.screenshot returns an image", out.screenshot.hasImage === true, `${out.screenshot.mime} ${out.screenshot.size}`);
 check("…that is really a PNG", out.screenshot.isPng === true, `${out.screenshot.bytes} bytes`);
 check("…at the requested size", out.screenshot.size === "200x120");

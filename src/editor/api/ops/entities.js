@@ -146,7 +146,8 @@ defineOp({
 defineOp({
   name: "entity.rename",
   undoable: true,
-  description: "Rename one entity.",
+  description:
+    "Rename one entity. Names are labels, not identifiers — nothing resolves by name, so duplicates are allowed and renaming breaks no references.",
   params: {
     id: { type: "string", required: true },
     name: { type: "string", required: true },
@@ -221,7 +222,8 @@ defineOp({
 defineOp({
   name: "entity.setTags",
   undoable: true,
-  description: "Replace an entity's tag list.",
+  description:
+    "Replace an entity's tag list outright (not a merge). Tags are how scripts and entity.list find entities by role rather than by name.",
   params: {
     id: { type: "string", required: true },
     tags: { type: "array", required: true, items: { type: "string" } },
@@ -285,7 +287,8 @@ defineOp({
 defineOp({
   name: "component.remove",
   undoable: true,
-  description: "Detach a component from an entity.",
+  description:
+    "Detach a component from an entity, discarding its properties. Undoable, so the properties come back with history.undo.",
   params: {
     id: { type: "string", required: true },
     type: { type: "string", required: true },

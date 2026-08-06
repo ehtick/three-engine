@@ -1,3 +1,4 @@
+import { vmSingleton } from "./singleton.js";
 import { useProjectStore } from "./store/projectStore.js";
 import { ensureEngine } from "./engineInstance.js";
 // layers.js is dependency-free (no Rapier, no wasm) — safe to pull into the
@@ -98,7 +99,10 @@ export async function saveProjectSettings(settings) {
 }
 
 // Consumers that hold live objects (viewport grid…) subscribe to re-apply.
-const listeners = new Set();
+// VM-wide: consumers holding live objects (the viewport grid, the renderer)
+// subscribe through whichever copy of this module they imported, so settings
+// applied through a second copy would reach none of them.
+const listeners = vmSingleton("projectSettingsListeners", () => new Set());
 export function onProjectSettingsApplied(fn) {
   listeners.add(fn);
   return () => listeners.delete(fn);

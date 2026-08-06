@@ -8,6 +8,7 @@ import {
 import { UI_LAYER } from "../../ui/UiSystem.js";
 import { drawTextToCanvas } from "../../ui/uiText.js";
 import { getSdfFont, layoutGlyphs, outlineToField } from "../../ui/sdfFont.js";
+import { ensureFontLoaded, fontStackFor, FONT_EXTENSIONS } from "../../ui/fontAsset.js";
 
 let sharedPlane = null;
 function getPlane() {
@@ -37,6 +38,10 @@ export class UiTextComponent extends Component {
     text: "Text",
     fontSize: 16,
     color: "#ffffff",
+    // A project font file. Wins over `fontFamily` when set — which stays as
+    // the fallback, so a label reads in *something* while the font loads and
+    // on a machine where the file is missing.
+    fontAsset: "",
     fontFamily: "system-ui, sans-serif",
     fontWeight: "400",
     align: "center", // left | center | right
@@ -54,7 +59,8 @@ export class UiTextComponent extends Component {
     { key: "text", label: "Text", type: "text" },
     { key: "fontSize", label: "Font Size", type: "number", min: 1, step: 1 },
     { key: "color", label: "Color", type: "color" },
-    { key: "fontFamily", label: "Font", type: "text" },
+    { key: "fontAsset", label: "Font Asset", type: "asset", exts: FONT_EXTENSIONS, emptyLabel: "System font" },
+    { key: "fontFamily", label: "Fallback Font", type: "text" },
     { key: "fontWeight", label: "Weight", type: "select", options: ["300", "400", "500", "600", "700", "800"] },
     { key: "align", label: "Align", type: "select", options: ["left", "center", "right"] },
     { key: "valign", label: "V-Align", type: "select", options: ["top", "middle", "bottom"] },
@@ -75,6 +81,7 @@ export class UiTextComponent extends Component {
     this.geometry = null;
     this.canvas = null;
     this.canvasTexture = null;
+    this.#requestFont();
   }
 
   onDetach() {
@@ -99,8 +106,44 @@ export class UiTextComponent extends Component {
   onPropChanged(key) {
     // Switching path or font means a different material and a different mesh
     // shape; everything else is re-laid-out on the next frame.
-    if (key === "sdf" || key === "fontFamily" || key === "fontWeight") this.#teardown();
+    if (key === "sdf" || key === "fontFamily" || key === "fontWeight" || key === "fontAsset") this.#teardown();
+    if (key === "fontAsset") this.#requestFont();
     this.drawKey = null;
+  }
+
+  /**
+   * The CSS family list to draw in — the project font first, the configured
+   * family as its fallback.
+   *
+   * Also the SDF atlas cache key, which is why it has to be a pure function of
+   * the props: two labels with the same font share one atlas and one texture,
+   * and a key that varied with load state would build a second atlas the
+   * moment the font arrived.
+   */
+  #fontStack() {
+    return fontStackFor(this.props.fontAsset, this.props.fontFamily);
+  }
+
+  /**
+   * Starts loading the project font, if there is one.
+   *
+   * Nothing waits on it: the label draws in the fallback face immediately, and
+   * the atlas cache tears itself down when the real font lands (see
+   * `sdfFont.js`), so the swap happens on the next layout. Blocking the first
+   * frame on a font fetch would leave a HUD blank on load, which is a worse
+   * trade than one frame of fallback type.
+   */
+  #requestFont() {
+    const path = this.props.fontAsset;
+    if (!path) return;
+    ensureFontLoaded(path)
+      .then(() => {
+        // The atlas keyed on this family was dropped by the load listener;
+        // clearing the draw key is what makes this label rebuild against the
+        // fresh one rather than keep its stale geometry.
+        this.drawKey = null;
+      })
+      .catch((error) => console.warn(`[uitext] font "${path}" failed to load: ${error?.message ?? error}`));
   }
 
   #buildRaster() {
@@ -114,7 +157,7 @@ export class UiTextComponent extends Component {
   }
 
   #buildSdf() {
-    this.font = getSdfFont(this.props.fontFamily, this.props.fontWeight);
+    this.font = getSdfFont(this.#fontStack(), this.props.fontWeight);
     this.geometry = new THREE.BufferGeometry();
     this.geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(0), 3));
     this.geometry.setAttribute("uv", new THREE.BufferAttribute(new Float32Array(0), 2));
@@ -213,13 +256,16 @@ export class UiTextComponent extends Component {
         -(0.5 - spec.pivot[1]) * h * unit,
         0.001 * unit,
       );
+      const stack = this.#fontStack();
       const key = [
-        Math.round(w * k), Math.round(h * k), p.text, p.fontSize, p.color, p.fontFamily,
+        Math.round(w * k), Math.round(h * k), p.text, p.fontSize, p.color, stack,
         p.fontWeight, p.align, p.valign, p.wrap, p.lineHeight,
       ].join(" ");
       if (key !== this.drawKey) {
         this.drawKey = key;
-        if (drawTextToCanvas(this.canvas, w, h, k, p)) this.canvasTexture.needsUpdate = true;
+        if (drawTextToCanvas(this.canvas, w, h, k, { ...p, fontFamily: stack })) {
+          this.canvasTexture.needsUpdate = true;
+        }
       }
     }
     applyElementUniforms(mesh.material, {
@@ -236,7 +282,7 @@ export class UiTextComponent extends Component {
   /** Natural size of the current text in UI px — for auto-sizing a label. */
   measure(maxWidth = Infinity) {
     if (this.props.sdf === false || typeof document === "undefined") return { w: 0, h: 0 };
-    const font = this.font ?? getSdfFont(this.props.fontFamily, this.props.fontWeight);
+    const font = this.font ?? getSdfFont(this.#fontStack(), this.props.fontWeight);
     const { width, height } = layoutGlyphs(font, maxWidth, 0, this.props);
     return { w: width, h: height };
   }

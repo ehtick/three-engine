@@ -93,8 +93,29 @@ pub fn prepare_browser_preview(
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("create preview directory {}: {e}", dir.display()))?;
     std::fs::canonicalize(&dir)
-        .map(|path| path.to_string_lossy().into_owned())
+        .map(|path| simplify_verbatim(path.to_string_lossy().into_owned()))
         .map_err(|e| format!("resolve preview directory {}: {e}", dir.display()))
+}
+
+/// Strips Windows' `\\?\` verbatim prefix off a canonicalized path.
+///
+/// This string goes back to the FRONTEND, which joins build-relative names
+/// onto it with forward slashes (`{dir}/__preview_revision.json`). A verbatim
+/// path is passed to the filesystem UNNORMALIZED — forward slashes are not
+/// separators there, so every such join fails with os error 123 ("The
+/// filename, directory name, or volume label syntax is incorrect"). The
+/// simplified `C:\…` form is what every join, server and exporter after this
+/// point actually expects.
+pub fn simplify_verbatim(path: String) -> String {
+    if let Some(rest) = path.strip_prefix(r"\\?\") {
+        if rest.as_bytes().get(1) == Some(&b':') {
+            return rest.to_string();
+        }
+        if let Some(unc) = rest.strip_prefix(r"UNC\") {
+            return format!(r"\\{unc}");
+        }
+    }
+    path
 }
 
 /// Maps a request target to a path inside `root`, or `None` if it escapes.
@@ -725,6 +746,16 @@ mod tests {
             prepare_browser_preview(project.to_string_lossy().into_owned(), None, None).unwrap();
         let path = Path::new(&dir);
         assert!(path.is_dir());
+        // The frontend joins onto this with FORWARD slashes. A verbatim
+        // (`\\?\C:\…`) return makes every such join fail with os error 123 —
+        // which is exactly how the first revision-manifest write failed live.
+        assert!(
+            !dir.starts_with(r"\\?\"),
+            "preview dir must be a simplified native path, got {dir}"
+        );
+        std::fs::write(format!("{dir}/__join-probe.json"), b"{}")
+            .expect("a forward-slash join onto the returned dir must be writable");
+        let _ = std::fs::remove_file(format!("{dir}/__join-probe.json"));
         assert!(path.ends_with(format!("{:016x}", {
             let root = std::fs::canonicalize(&project).unwrap();
             let mut hasher = DefaultHasher::new();

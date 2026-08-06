@@ -1,5 +1,6 @@
 import { ensureEngine } from "./engineInstance.js";
 import { createAssetNames, basename } from "./build/assetNames.js";
+import { rewriteComponentAssets } from "./build/assetRefs.js";
 import { BUILD_DEFAULTS, resolveBuildScenes, normalizeRelPath, toProjectRelative } from "./build/buildSettings.js";
 import { themePlayerHtml, injectLivePreviewClient, PREVIEW_REVISION_PATH } from "./build/playerHtml.js";
 import { desktopScaffoldFiles } from "./build/desktopScaffold.js";
@@ -114,7 +115,7 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
     }
   };
   const engine = await ensureEngine();
-  const { serializeScene, prefabRegistry } = await import("../engine/index.js");
+  const { serializeScene, prefabRegistry, getComponentClass } = await import("../engine/index.js");
   const { getProjectSettings } = await import("./projectSettings.js");
   const { useProjectStore } = await import("./store/projectStore.js");
   const { useModulesStore } = await import("./modules.js");
@@ -217,61 +218,30 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
     }
   };
 
+  // Where each re-emitted document's SOURCE is collected, per assetRefs kind.
+  const documentBuckets = {
+    material: materialPaths,
+    atlas: atlasPaths,
+    timeline: timelinePaths,
+    audio: audioSidecarPaths,
+    script: scriptPaths,
+  };
+  /**
+   * Schema-driven, same as the runtime's `collectSceneAssets`: every component
+   * schema field of `type: "asset"` ships, the day the component is added. The
+   * hand-maintained ladder this replaces fell behind the component roster —
+   * Sprite/UiImage/Decal/Line/Trail textures, Instancer and SplineMesh material
+   * overrides, a mesh's material2…8 and UiText fonts all reached the browser
+   * as absolute authoring paths that no server will serve.
+   */
   const visitComponent = (c) => {
     rewritePrefabRefs(c.props);
-    if (c.type === "mesh") {
-      if (c.props.geometryAsset) c.props.geometryAsset = claim(c.props.geometryAsset);
-      if (c.props.material) {
-        materialPaths.add(sourcePath(c.props.material));
-        c.props.material = claimDoc(c.props.material);
-      }
-    } else if (c.type === "model") {
-      c.props.path = claim(c.props.path) || c.props.path;
-      for (const [name, matPath] of Object.entries(c.props.materials ?? {})) {
-        materialPaths.add(sourcePath(matPath));
-        c.props.materials[name] = claimDoc(matPath);
-      }
-    } else if (c.type === "skinnedmesh" && c.props.material) {
-      materialPaths.add(sourcePath(c.props.material));
-      c.props.material = claimDoc(c.props.material);
-    } else if ((c.type === "sprite" || c.type === "uiimage") && c.props.atlas) {
-      // Like a .mat and a .timeline: the document itself is re-emitted below,
-      // because the sheet it names is a separate file that has to ship and be
-      // renamed with everything else.
-      atlasPaths.add(sourcePath(c.props.atlas));
-      c.props.atlas = claimDoc(c.props.atlas);
-    } else if (c.type === "environment" && c.props.hdri) {
-      c.props.hdri = claim(c.props.hdri);
-    } else if (c.type === "animation" && c.props.controller) {
-      c.props.controller = claim(c.props.controller);
-    } else if (c.type === "timeline" && c.props.asset) {
-      // Like a .mat: the document itself is rewritten and re-emitted below,
-      // because the clips its audio tracks name are separate files that have to
-      // ship too.
-      timelinePaths.add(sourcePath(c.props.asset));
-      c.props.asset = claimDoc(c.props.asset);
-    } else if (c.type === "script") {
-      // Every slot in the list ships, not just the first. Legacy `{ path }`
-      // components are still readable here: normalizeProps folds them into
-      // `scripts` when the component loads, but an unopened scene on disk may
-      // not have been through that yet.
-      const slots = c.props.scripts ?? (c.props.path ? [{ path: c.props.path }] : []);
-      for (const slot of slots) {
-        if (!slot?.path) continue;
-        scriptPaths.add(sourcePath(slot.path));
-        slot.path = claimDoc(slot.path, (name) => name.replace(/\.ts$/i, ".js"));
-      }
-      if (c.props.scripts) delete c.props.path;
-    } else if (c.type === "sound") {
-      // Each entry's audioAsset is the sidecar path. Ship the sidecar JSON
-      // (with its inner `path` rewritten to the assets folder) and the raw
-      // audio file it points to.
-      for (const entry of c.props.entries ?? []) {
-        if (!entry.audioAsset) continue;
-        audioSidecarPaths.add(sourcePath(entry.audioAsset));
-        entry.audioAsset = claimDoc(entry.audioAsset);
-      }
-    }
+    rewriteComponentAssets(c, {
+      getSchema: (type) => getComponentClass(type)?.schema,
+      claim,
+      claimDoc,
+      add: (kind, p) => documentBuckets[kind]?.add(sourcePath(p)),
+    });
   };
 
   /**
@@ -336,9 +306,12 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
       // Which project-relative path scene.json is a copy of, so a script can
       // tell "am I in the first level" without hard-coding the name.
       startScene: plan.startScene,
-      // Browser preview polls this token and refreshes after a debounced live
-      // rebuild. Release builds omit it and perform no polling.
-      ...(build.livePreview ? { previewRevision: Date.now() } : {}),
+      // Tells the player runtime to expose the in-place hot-update hook the
+      // injected preview client calls. Deliberately a stable flag rather than
+      // a timestamp: the revision token lives ONLY in __preview_revision.json,
+      // so an otherwise-unedited scene.json is byte-identical across rebuilds
+      // and a material tweak doesn't read as a scene change in the manifest.
+      ...(build.livePreview ? { livePreview: true } : {}),
     };
     const enabledModules = [...useModulesStore.getState().enabled];
     scene.modules = enabledModules;
@@ -593,13 +566,15 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
         }
       }
       let themed = themePlayerHtml(template, { title, icon: iconRel, loading: build.loading ?? {} });
-      // Live previews reload themselves when the marker below changes. The
+      // Live previews watch the revision marker and update themselves. The
       // client is injected into the FRESHLY GENERATED index.html rather than
       // living in the player bundle, so it works even when the prebuilt
       // template is out of date — the exact situation live preview is in the
-      // business of surviving.
-      if (scene.player.previewRevision) {
-        themed = injectLivePreviewClient(themed, scene.player.previewRevision);
+      // business of surviving. It carries no baked revision (it baselines from
+      // its first poll), so an unchanged index.html stays byte-identical
+      // across rebuilds and never pollutes the change manifest.
+      if (build.livePreview) {
+        themed = injectLivePreviewClient(themed);
       }
       shippedFiles.push(["index.html", themed]);
     } catch (err) {
@@ -607,23 +582,18 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
       // it just wears the engine's default title and colours.
       warnings.push(`Loading screen not customised: ${err?.message ?? err}`);
     }
-    if (scene.player.previewRevision) {
-      // `files` are written after the template, scene, and copied assets. Keep
-      // this marker last so the browser never refreshes into a half-published
-      // live rebuild.
-      shippedFiles.push([
-        PREVIEW_REVISION_PATH,
-        JSON.stringify({ revision: scene.player.previewRevision }),
-      ]);
-    }
-
-    const missingAssets = await invoke("export_game", {
+    const exportReport = await invoke("export_game", {
       outDir: contentDir,
       sceneJson: JSON.stringify(scene, null, 2),
       assets: [...names.copyEntries(), ...shippedSidecars, ...derivedCopies],
       files: shippedFiles,
     });
-    for (const src of missingAssets ?? []) {
+    // Test shims may still answer with the old bare missing-list (or null).
+    const missingAssets = Array.isArray(exportReport)
+      ? exportReport
+      : (exportReport?.missing ?? []);
+    const changedFiles = Array.isArray(exportReport) ? null : (exportReport?.changed ?? null);
+    for (const src of missingAssets) {
       warnings.push(`Skipped missing asset ${src} — a scene or material still references it.`);
     }
 
@@ -633,6 +603,39 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
     // cache, the same one the import path creates.)
     for (const [rel, bytes] of compression.overwrites) {
       await invoke("write_binary_file", { path: joinPath(contentDir, rel), contents: [...bytes] });
+    }
+
+    if (build.livePreview) {
+      // The revision marker is written LAST — and atomically, because every
+      // connected browser is polling this exact file — so a changed revision
+      // always means "a complete new build is on disk". It carries the change
+      // manifest, the revision it replaced, and a short delta history: the
+      // client hot-applies the union of every delta since the revision it is
+      // running, so rapid consecutive rebuilds (a gizmo drag outruns the 1s
+      // poll easily) don't force a page reload. Only a client older than the
+      // whole window — or one running a build the manifest can't account for
+      // — falls back to reloading.
+      let previous = null;
+      let history = [];
+      try {
+        const old = JSON.parse(
+          await invoke("read_text_file", { path: joinPath(contentDir, PREVIEW_REVISION_PATH) }),
+        );
+        previous = old?.revision ?? null;
+        if (Array.isArray(old?.history)) history = old.history;
+      } catch {
+        // First build into this directory — nothing came before.
+      }
+      const revision = Date.now();
+      const manifest = { revision, previous };
+      if (changedFiles) {
+        manifest.changed = changedFiles;
+        manifest.history = [...history, { revision, changed: changedFiles }].slice(-25);
+      }
+      await invoke("write_file_atomic", {
+        path: joinPath(contentDir, PREVIEW_REVISION_PATH),
+        contents: JSON.stringify(manifest),
+      });
     }
 
     // --- Target-specific delivery -------------------------------------------

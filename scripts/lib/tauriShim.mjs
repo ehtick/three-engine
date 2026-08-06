@@ -17,6 +17,7 @@ import path from "node:path";
 
 const WRITE_COMMANDS = new Set([
   "save_scene",
+  "write_file_atomic",
   "write_binary_file",
   "create_dir",
   "rename_path",
@@ -72,12 +73,20 @@ function listDir(dir) {
  */
 function handle(cmd, args = {}, writableRoot = null) {
   if (WRITE_COMMANDS.has(cmd)) {
-    const target = args.path ?? args.destination ?? args.dest;
-    if (!writableRoot || !target || !isInside(writableRoot, target)) {
+    // `rename_path` names its arguments `from`/`to` rather than `path`, so a
+    // guard reading only `path` refused every rename and move outright — and
+    // said "outside the scratch root" about a path that was inside it, which is
+    // a confusing way to learn the guard has a blind spot. Both ends are
+    // checked: a rename is a write to two places.
+    const targets = [args.path, args.destination, args.dest, args.from, args.to].filter(Boolean);
+    if (!writableRoot || !targets.length || !targets.every((target) => isInside(writableRoot, target))) {
       throw new Error(`tauriShim: refusing write command "${cmd}" outside the harness scratch root`);
     }
     switch (cmd) {
       case "save_scene":
+      // Atomicity matters against a live server, not against Node's fs in a
+      // harness — the plain write is behaviourally identical here.
+      case "write_file_atomic":
         fs.mkdirSync(path.dirname(args.path), { recursive: true });
         fs.writeFileSync(args.path, args.contents ?? "", "utf8");
         return null;
@@ -90,6 +99,15 @@ function handle(cmd, args = {}, writableRoot = null) {
         return null;
       case "delete_path":
         fs.rmSync(args.path, { recursive: true, force: true });
+        return null;
+      // Renames and moves are the same command; the editor's rename path also
+      // fires it speculatively for each sidecar (`.meta`, `.basis`, `.tex`,
+      // `.aud`) and catches the failures, so a missing source must throw the
+      // way the Rust side does rather than succeed quietly.
+      case "rename_path":
+        if (fs.existsSync(args.to)) throw new Error(`"${args.to}" already exists`);
+        fs.mkdirSync(path.dirname(args.to), { recursive: true });
+        fs.renameSync(args.from, args.to);
         return null;
       // scaffold_three_types is a no-op the editor calls on every Assets mount;
       // succeeding silently keeps it out of the harness's error log.

@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { vmSingleton } from "../singleton.js";
 
 /**
  * UI-facing prefab state.
@@ -12,7 +13,7 @@ import { create } from "zustand";
  * checks this so Ctrl+S (and autosave) write the prefab rather than clobbering
  * the real scene file with the staged contents.
  */
-export const usePrefabStore = create((set) => ({
+export const usePrefabStore = vmSingleton("prefabStore", () => create((set) => ({
   version: 0,
   prefabs: [], // [{ guid, name, path }] — for asset pickers and the variant menu
   stage: null, // { guid, path, name, rootId }
@@ -37,6 +38,6 @@ export const usePrefabStore = create((set) => ({
   exitStage() {
     set({ stage: null, stageDirty: false });
   },
-}));
+})));
 
 export const inPrefabMode = () => !!usePrefabStore.getState().stage;

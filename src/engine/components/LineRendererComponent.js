@@ -76,7 +76,7 @@ export class LineRendererComponent extends Component {
 
   onAttach() {
     this.generation = (this.generation ?? 0) + 1;
-    this.texture = null;
+    this.loadedTexture = null;
     this.ribbon = new RibbonMesh(this.#buildMaterial(), { name: "__lineRenderer" });
     this.ribbon.mesh.userData.entityId = this.entity.id;
     // Never batched, never picked as scene geometry by the decal projector:
@@ -95,8 +95,8 @@ export class LineRendererComponent extends Component {
     this.unsubVisibility = null;
     this.ribbon?.dispose();
     this.ribbon = null;
-    this.texture?.dispose();
-    this.texture = null;
+    this.loadedTexture?.dispose();
+    this.loadedTexture = null;
   }
 
   onDisable() {
@@ -134,7 +134,7 @@ export class LineRendererComponent extends Component {
     return createRibbonMaterial({
       alignment: this.props.alignment,
       blending: this.props.blending,
-      map: this.texture,
+      map: this.loadedTexture,
       // The ramp colours are baked per vertex (they vary along the line), so
       // the material tint stays white and is left free for runtime modulation.
       color: 0xffffff,
@@ -152,8 +152,8 @@ export class LineRendererComponent extends Component {
         return;
       }
       applyRibbonWrap(texture, this.props.textureMode);
-      this.texture?.dispose();
-      this.texture = texture;
+      this.loadedTexture?.dispose();
+      this.loadedTexture = texture;
       this.#swapMaterial();
     } catch (err) {
       console.warn(`Line renderer texture failed to load: ${path}`, err);
@@ -295,8 +295,8 @@ export class LineRendererComponent extends Component {
       if (this.props.texture) {
         this.#loadTexture(this.props.texture);
       } else {
-        this.texture?.dispose();
-        this.texture = null;
+        this.loadedTexture?.dispose();
+        this.loadedTexture = null;
         this.#swapMaterial();
       }
       return;
@@ -306,7 +306,7 @@ export class LineRendererComponent extends Component {
       return;
     }
     if (key === "textureMode") {
-      applyRibbonWrap(this.texture, this.props.textureMode);
+      applyRibbonWrap(this.loadedTexture, this.props.textureMode);
       this.rebuild();
       return;
     }

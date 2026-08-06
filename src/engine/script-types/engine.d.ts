@@ -1425,10 +1425,28 @@ declare module "engine" {
   /** Raster or SDF text rendered in a UI hierarchy. */
   export interface UiTextComponent extends ComponentBase<{
     text: string;
-    font: string;
     fontSize: number;
     color: string;
-    align: string;
+    /**
+     * A project font file (`.ttf` / `.otf` / `.woff` / `.woff2`). Wins over
+     * `fontFamily`, which stays as the fallback — so a label still reads while
+     * the font loads and on a machine where the file is missing.
+     */
+    fontAsset: string;
+    /** CSS family list used when `fontAsset` is empty or still loading. */
+    fontFamily: string;
+    fontWeight: string;
+    align: "left" | "center" | "right";
+    valign: "top" | "middle" | "bottom";
+    wrap: boolean;
+    lineHeight: number;
+    opacity: number;
+    /** Signed-distance rendering: sharp at any scale. Off = canvas raster. */
+    sdf: boolean;
+    outlineWidth: number;
+    outlineColor: string;
+    /** -0.2 … 0.2, thinner … fatter. */
+    weightBias: number;
     [key: string]: unknown;
   }> {}
 
@@ -2552,8 +2570,57 @@ declare module "engine" {
     stats(): PoolStats;
   }
 
+  /** What a font file says about itself. See `engine.assets.font`. */
+  export interface FontMetadata {
+    /** Container format, or null when the bytes aren't a font at all. */
+    format: "ttf" | "otf" | "woff" | "woff2" | "ttc" | null;
+    /**
+     * False when the tables could not be read — always the case for `.woff2`,
+     * whose directory is brotli-compressed. The font still WORKS; only its
+     * metadata is unavailable.
+     */
+    readable: boolean;
+    family?: string | null;
+    subfamily?: string | null;
+    /** OS/2 usWeightClass, 100–900. */
+    weight?: number;
+    /** CSS `font-stretch` keyword from usWidthClass. */
+    width?: string | null;
+    italic?: boolean;
+    monospaced?: boolean;
+    variable?: boolean;
+    hinted?: boolean;
+    kerning?: boolean;
+    colorGlyphs?: boolean;
+    unitsPerEm?: number;
+    glyphs?: number;
+    codepoints?: number;
+    /** Unicode blocks with at least partial coverage, e.g. ["Latin", "Cyrillic"]. */
+    coverage?: string[];
+    /** `fsType` in words: "installable" | "restricted" | "editable" | "preview & print". */
+    embedding?: string;
+    /** False when the licence in the file forbids shipping it inside a build. */
+    embeddable?: boolean;
+    license?: string;
+    licenseUrl?: string;
+    designer?: string;
+    copyright?: string;
+  }
+
+  /** A registered project font. See `engine.assets.font`. */
+  export interface LoadedFont {
+    path: string;
+    /** The generated CSS family name to draw with. */
+    family: string;
+    /** The font's own name, for showing a human. */
+    displayName: string | null;
+    /** True once the platform has accepted the face and it can be drawn with. */
+    loaded: boolean;
+    meta: FontMetadata | null;
+  }
+
   /**
-   * `engine.assets` — texture / material / geometry / audio / cubemap access
+   * `engine.assets` — texture / material / geometry / audio / cubemap / font access
    * by project path, the same string an `@attribute({ type: "asset" })`
    * field gives you. Every accessor returns the SHARED instance other
    * systems (components, the editor) are also using — don't mutate or
@@ -2598,6 +2665,33 @@ declare module "engine" {
     cubemap(path: string): Promise<CubeTexture | null>;
     /** The already-loaded cube texture for `path`, or null if not loaded yet. */
     getCubemap(path: string): CubeTexture | null;
+
+    /**
+     * Registers a project font file so text can be drawn with it.
+     *
+     * `family` is the CSS family name to use — a GENERATED id, not the name
+     * inside the file. That is what stops two files both called "Inter" from
+     * shadowing each other, and stops a project font colliding with one
+     * installed on the player's machine (which would make the game look right
+     * for you and wrong for everyone else).
+     *
+     * ```ts
+     * const { family } = await engine.assets.font("Fonts/Inter/Inter-Bold.ttf");
+     * ctx.font = `700 32px "${family}"`;
+     * ```
+     *
+     * Await this before drawing to a canvas yourself — a glyph rasterized
+     * early bakes the fallback face into a cache. `UiText` handles it for you.
+     */
+    font(path: string): Promise<LoadedFont | null>;
+    /** The loaded font record for `path`, or null if it isn't ready yet. */
+    getFont(path: string): LoadedFont | null;
+    /**
+     * The CSS family name `path` is (or will be) registered under.
+     * Synchronous and stable, so it can go straight into a cache key — it
+     * simply won't resolve to anything until `font(path)` has settled.
+     */
+    fontFamily(path: string): string | null;
 
     /**
      * The path of the asset named `name` (case-insensitive, exact match), or

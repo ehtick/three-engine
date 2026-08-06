@@ -71,6 +71,25 @@ Every mutating tool runs through the editor's command bus, so anything an
 assistant does lands on the undo stack and can be reverted with Ctrl+Z (or the
 `history_undo` tool) exactly like a hand edit.
 
+## Orienting the assistant
+
+A tool list says what each tool does and nothing about where the assistant is:
+that the folder is a game, that a live editor holds it in memory right now, that
+`.scene` files are generated and must not be hand-edited. Two things close that
+gap, deliberately at different depths:
+
+- **The server's `instructions`**, sent during `initialize`. Short, always
+  delivered, true before the editor has even connected. This is the floor.
+- **`AGENTS.md` + `CLAUDE.md` in the user's project folder**, written by
+  `src/editor/agentGuide.js` — the longer version, including the project layout,
+  the scripting conventions and what is not undoable.
+
+The project files are written **when an assistant first connects**, not when a
+project opens: a user who has never attached one should not find a file about AI
+assistants in their game folder. They are never overwritten afterwards, because
+the point is that the user edits them with their own project's conventions —
+delete one and reconnect to get the current version back.
+
 ## Tools
 
 `editor_status` always exists, even with no editor connected — call it first if
@@ -79,7 +98,7 @@ real failure. Everything else is generated from the registry:
 
 | Group | Tools |
 |---|---|
-| **Sight** | `viewport_screenshot` `viewport_getCamera` `viewport_setCamera` `viewport_focus` `entity_getBounds` `console_read` |
+| **Sight** | `viewport_screenshot` `viewport_getCamera` `viewport_setCamera` `viewport_focus` `viewport_setFreezeWhenUnfocused` `entity_getBounds` `console_read` |
 | **Batching** | `batch` |
 | Entities | `entity_list` `entity_get` `entity_create` `entity_delete` `entity_rename` `entity_reparent` `entity_duplicate` `entity_setTransform` `entity_setTags` |
 | Components | `component_types` `component_add` `component_remove` `component_setProp` |

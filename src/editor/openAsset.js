@@ -9,6 +9,7 @@ import {
   ANIMATOR_EXTENSIONS,
   TIMELINE_EXTENSIONS,
   GEOMETRY_EXTENSIONS,
+  AUDIO_EXTENSIONS,
 } from "./assetLoader.js";
 import { useProjectStore, basename } from "./store/projectStore.js";
 import { useSceneStore } from "./store/sceneStore.js";
@@ -47,6 +48,13 @@ function openGeometryAsset(path) {
   import("./EditorShell.jsx").then((m) => m.openPanel("geometryEditor"));
 }
 
+/**
+ * `.audio` is the JSON sidecar describing import options, not samples — the
+ * Audio Editor has nothing to open for it, so it stays out of this list even
+ * though it lives in AUDIO_EXTENSIONS.
+ */
+const isEditableAudio = (ext) => AUDIO_EXTENSIONS.includes(ext) && ext !== "audio";
+
 /** True when `openAssetPath` has a dedicated editor for this file. */
 export function hasAssetEditor(path) {
   const ext = extOf(path);
@@ -60,7 +68,8 @@ export function hasAssetEditor(path) {
     TIMELINE_EXTENSIONS.includes(ext) ||
     CUBEMAP_EXTENSIONS.includes(ext) ||
     MATERIAL_EXTENSIONS.includes(ext) ||
-    GEOMETRY_EXTENSIONS.includes(ext)
+    GEOMETRY_EXTENSIONS.includes(ext) ||
+    isEditableAudio(ext)
   );
 }
 
@@ -72,7 +81,11 @@ export function openAssetPath(path, { isDir = false } = {}) {
   }
   const ext = extOf(path);
   if (SCRIPT_EXTENSIONS.includes(ext)) {
-    openInIDE(path);
+    // Opens in the editor's own code editor, not the OS's. Handing a script
+    // to VS Code was the last thing in the pipeline that made you leave the
+    // app for an everyday edit; "Open in IDE" is still one click away in the
+    // Inspector and the context menu for when that's genuinely what you want.
+    import("./codeStore.js").then((m) => m.openCodeFile(path));
   } else if (ext === "scene") {
     openScenePath(path).catch((err) => console.error(String(err)));
   } else if (PREFAB_EXTENSIONS.includes(ext)) {
@@ -84,6 +97,9 @@ export function openAssetPath(path, { isDir = false } = {}) {
   } else if (TIMELINE_EXTENSIONS.includes(ext)) {
     useSelectionStore.getState().selectAsset(path);
     import("./EditorShell.jsx").then((m) => m.openPanel("timeline"));
+  } else if (isEditableAudio(ext)) {
+    useSelectionStore.getState().selectAsset(path);
+    import("./EditorShell.jsx").then((m) => m.openPanel("audioEditor"));
   } else if (CUBEMAP_EXTENSIONS.includes(ext)) {
     // Face slots live in the Inspector — there's no separate cube map editor.
     useSelectionStore.getState().selectAsset(path);
@@ -105,6 +121,12 @@ export function openAssetPath(path, { isDir = false } = {}) {
   } else if (GEOMETRY_EXTENSIONS.includes(ext)) {
     openGeometryAsset(path);
   } else {
-    openInIDE(path);
+    // Anything else the code editor understands (`.json`, `.md`, `.wgsl`, a
+    // stray `.txt`) opens in it; genuinely opaque files still go to the OS,
+    // which is the only thing that knows what to do with them.
+    import("./code/monaco.js").then(({ isTextEditablePath }) => {
+      if (isTextEditablePath(path)) import("./codeStore.js").then((m) => m.openCodeFile(path));
+      else openInIDE(path);
+    });
   }
 }

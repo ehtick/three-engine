@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { vmSingleton } from "../singleton.js";
 
 /**
  * Tracks long-running asset processing tasks (GLB/FBX unpack, Draco
@@ -11,9 +12,11 @@ import { create } from "zustand";
  * unpack can look frozen for several seconds with no visual cue.
  */
 
-let nextId = 0;
+// VM-wide alongside the store: two copies with private counters would issue the
+// same job handle twice, and `end(handle)` would clear the wrong job.
+const ids = vmSingleton("assetProcessingIds", () => ({ next: 0 }));
 
-export const useAssetProcessingStore = create((set, get) => ({
+export const useAssetProcessingStore = vmSingleton("assetProcessingStore", () => create((set, get) => ({
   jobs: new Map(),
 
   /** Number of in-flight jobs. */
@@ -33,7 +36,7 @@ export const useAssetProcessingStore = create((set, get) => ({
    * recommended path — it ties registration and cleanup to a single promise.
    */
   begin(label) {
-    const id = ++nextId;
+    const id = ++ids.next;
     const entry = { id, label, startedAt: performance.now() };
     set((state) => {
       const next = new Map(state.jobs);
@@ -66,4 +69,4 @@ export const useAssetProcessingStore = create((set, get) => ({
       get().end(id);
     }
   },
-}));
+})));

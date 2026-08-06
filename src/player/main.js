@@ -47,30 +47,43 @@ function looksLikeHtml(source) {
   const head = source.trimStart().slice(0, 256).toLowerCase();
   return head.startsWith("<!doctype") || head.startsWith("<html") || head.startsWith("<?xml");
 }
+async function importScript(path) {
+  const raw = await (await fetch(path, { cache: "no-cache" })).text();
+  if (looksLikeHtml(raw)) {
+    throw new Error(`Script "${path}" looks like HTML/markup, not JavaScript or TypeScript`);
+  }
+  let code;
+  try {
+    code = await linkEngineImports(raw);
+  } catch (err) {
+    throw new Error(`Failed to import script "${path}": ${err.message ?? err}`);
+  }
+  const url = URL.createObjectURL(new Blob([code], { type: "text/javascript" }));
+  try {
+    const mod = await import(/* @vite-ignore */ url);
+    return mod.default ?? null;
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
 setScriptLoader(async (path) => {
   let entry = scriptCache.get(path);
   if (!entry) {
-    const raw = await (await fetch(path)).text();
-    if (looksLikeHtml(raw)) {
-      throw new Error(`Script "${path}" looks like HTML/markup, not JavaScript or TypeScript`);
-    }
-    let code;
-    try {
-      code = await linkEngineImports(raw);
-    } catch (err) {
-      throw new Error(`Failed to import script "${path}": ${err.message ?? err}`);
-    }
-    const url = URL.createObjectURL(new Blob([code], { type: "text/javascript" }));
-    try {
-      const mod = await import(/* @vite-ignore */ url);
-      entry = { version: 1, default: mod.default ?? null };
-    } finally {
-      URL.revokeObjectURL(url);
-    }
+    entry = { version: 1, default: await importScript(path) };
     scriptCache.set(path, entry);
   }
   return entry;
 });
+
+/** Live preview only: re-import a rewritten script and bump its version, so
+ *  the ScriptComponent hot-reload poll swaps it exactly as in the editor
+ *  (state carried over when the script defines `onHotReload`). */
+async function refreshScript(path) {
+  const next = await importScript(path);
+  const prev = scriptCache.get(path);
+  scriptCache.set(path, { version: (prev?.version ?? 0) + 1, default: next });
+}
 
 /**
  * The loading screen. Scenes now load at runtime (menu → level 1 → level 2),
@@ -173,6 +186,13 @@ async function boot() {
   await engine.prefs.hydrate();
   if (config.player?.pixelRatioCap) {
     engine.setPixelRatio(Math.min(window.devicePixelRatio ?? 1, config.player.pixelRatioCap));
+  }
+  // Live previews update in place instead of reloading: the injected client in
+  // index.html (see editor/build/playerHtml.js) calls the hook this installs.
+  // Published builds don't carry the flag, so they never grow the hook.
+  if (config.player?.livePreview) {
+    const { installLiveUpdate } = await import("./liveUpdate.js");
+    installLiveUpdate(engine, { refreshScript });
   }
 
   // Everything past here goes through the same path a mid-game level change

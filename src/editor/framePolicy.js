@@ -11,20 +11,32 @@
 /**
  * Whether the viewport should render at all.
  *
- * A viewport nobody is looking at is pure cost: a heavy scene rendering behind
- * a paint canvas or a node graph makes the WHOLE editor lag and is buying
+ * A viewport nobody is looking at can be pure cost: a heavy scene rendering
+ * behind a paint canvas or a node graph makes the WHOLE editor lag and is buying
  * nothing. Throttling it to a few frames a second was not enough — one 60ms
- * frame still lands in the middle of a brush stroke — so an unfocused viewport
- * stops completely, and `editorFramePacing` wakes it for a SINGLE frame when
+ * frame still lands in the middle of a brush stroke — so when the user opts in,
+ * an unfocused viewport stops completely and `editorFramePacing` wakes it when
  * something it draws actually changes. That keeps the picture honest without
  * holding a render loop open for a panel nobody is looking at.
  *
  * Play is the exception and always will be: the game is the thing being watched
  * even when the pointer is in the Inspector.
+ *
+ * `freeze` is the user's toggle (the snowflake in the viewport toolbar), and it
+ * is OFF unless they turned it on — a viewport that keeps drawing can never
+ * surprise anyone, and pausing is the thing you reach for once a heavy scene is
+ * visibly costing you. A hidden viewport still stops either way: an element with
+ * no box on screen cannot be being watched, whatever the preference says.
  */
-export function shouldSuspendViewport({ playing = false, visible = true, focused = true } = {}) {
+export function shouldSuspendViewport({
+  playing = false,
+  visible = true,
+  focused = true,
+  freeze = false,
+} = {}) {
   if (playing) return false;
-  return !visible || !focused;
+  if (!visible) return true;
+  return freeze && !focused;
 }
 
 /**

@@ -32,12 +32,20 @@ const PostprocessPanel = lazy(() => import("./panels/PostprocessPanel.jsx").then
 const PolyHavenPanel = lazy(() => import("./panels/PolyHavenPanel.jsx").then((m) => ({ default: m.PolyHavenPanel })));
 const AmbientCGPanel = lazy(() => import("./panels/AmbientCGPanel.jsx").then((m) => ({ default: m.AmbientCGPanel })));
 const SketchfabPanel = lazy(() => import("./panels/SketchfabPanel.jsx").then((m) => ({ default: m.SketchfabPanel })));
+const ItchioPanel = lazy(() => import("./panels/ItchioPanel.jsx").then((m) => ({ default: m.ItchioPanel })));
+const AudioLibraryPanel = lazy(() => import("./panels/AudioLibraryPanel.jsx").then((m) => ({ default: m.AudioLibraryPanel })));
+const AudioEditorPanel = lazy(() => import("./panels/AudioEditorPanel.jsx").then((m) => ({ default: m.AudioEditorPanel })));
 const TerminalPanel = lazy(() => import("./panels/TerminalPanel.jsx").then((m) => ({ default: m.TerminalPanel })));
 const McpPanel = lazy(() => import("./panels/McpPanel.jsx").then((m) => ({ default: m.McpPanel })));
 const AiPanel = lazy(() => import("./panels/AiPanel.jsx").then((m) => ({ default: m.AiPanel })));
 const GamePanel = lazy(() => import("./panels/GamePanel.jsx").then((m) => ({ default: m.GamePanel })));
 const BuildPanel = lazy(() => import("./panels/BuildPanel.jsx").then((m) => ({ default: m.BuildPanel })));
 const TextureEditorPanel = lazy(() => import("./panels/TextureEditorPanel.jsx").then((m) => ({ default: m.TextureEditorPanel })));
+// Monaco is several megabytes of editor and language services. Lazy like every
+// other heavy panel, so a project that never opens a script never loads it.
+const CodePanel = lazy(() => import("./panels/CodePanel.jsx").then((m) => ({ default: m.CodePanel })));
+const FontLibraryPanel = lazy(() => import("./panels/FontLibraryPanel.jsx").then((m) => ({ default: m.FontLibraryPanel })));
+const GitPanel = lazy(() => import("./panels/GitPanel.jsx").then((m) => ({ default: m.GitPanel })));
 
 /** Keep lazy loading local to one Dockview portal. A shared boundary around
  * Dockview would hide the entire editor whenever any heavy panel suspends. */
@@ -72,10 +80,16 @@ const panelComponents = {
   polyhaven: withPanelSuspense(PolyHavenPanel),
   ambientcg: withPanelSuspense(AmbientCGPanel),
   sketchfab: withPanelSuspense(SketchfabPanel),
+  itchio: withPanelSuspense(ItchioPanel),
+  audioLibrary: withPanelSuspense(AudioLibraryPanel),
+  audioEditor: withPanelSuspense(AudioEditorPanel),
   terminal: withPanelSuspense(TerminalPanel),
   mcp: withPanelSuspense(McpPanel),
   ai: withPanelSuspense(AiPanel),
   textureEditor: withPanelSuspense(TextureEditorPanel),
+  git: withPanelSuspense(GitPanel),
+  code: withPanelSuspense(CodePanel),
+  fontLibrary: withPanelSuspense(FontLibraryPanel),
 };
 const tabComponents = {
   console: withPanelSuspense(ConsoleTab, <span className="tab-loading">Console</span>),
@@ -121,6 +135,11 @@ export const PANEL_SPECS = {
   polyhaven: { title: "Poly Haven", position: { referencePanel: "assets", direction: "within" } },
   ambientcg: { title: "AmbientCG", position: { referencePanel: "assets", direction: "within" } },
   sketchfab: { title: "Sketchfab", position: { referencePanel: "assets", direction: "within" } },
+  itchio: { title: "itch.io", position: { referencePanel: "assets", direction: "within" } },
+  audioLibrary: { title: "Audio Library", position: { referencePanel: "assets", direction: "within" } },
+  // Docks with the Assets strip for the same reason the Texture Editor does:
+  // track heads plus waveform lanes need width, not the 320px Inspector column.
+  audioEditor: { title: "Audio Editor", position: { referencePanel: "assets", direction: "within" }, initialHeight: 420 },
   // Docks with the Assets strip like the other wide authoring surfaces: a
   // paint canvas plus a tool column plus a layer column does not fit the
   // 320px Inspector column, and the canvas is the point of the panel.
@@ -135,6 +154,16 @@ export const PANEL_SPECS = {
   // Same column as the Assistant panel it runs through — opened by context-menu
   // AI actions, not something a user finds by browsing first.
   ai: { title: "AI", position: { referencePanel: "inspector", direction: "within" } },
+  // Docks with the Assets strip: the changed-files list and the diff have to be
+  // side by side (see GitPanel's header), and a diff in the 320px Inspector
+  // column wraps every line into uselessness.
+  git: { title: "Source Control", position: { referencePanel: "assets", direction: "within" }, initialHeight: 420 },
+  // Code wants the viewport's real estate, not the Assets strip: you read a
+  // script down the page, and a 200px-tall pane shows eight lines of it.
+  code: { title: "Code", position: { referencePanel: "viewport", direction: "within" } },
+  // A font browser is a grid of specimens — same wide strip as the other
+  // asset-library panels it sits alongside.
+  fontLibrary: { title: "Fonts", position: { referencePanel: "assets", direction: "within" } },
 };
 
 /**

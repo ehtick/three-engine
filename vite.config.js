@@ -1,6 +1,7 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import { existsSync } from "node:fs";
+import { duplicateModuleGuard } from "./vite/duplicateModuleGuard.js";
 
 const host = process.env.TAURI_DEV_HOST;
 
@@ -16,7 +17,7 @@ const quietHmr = existsSync(new URL("./.no-hmr", import.meta.url)) || !!process.
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({
-  plugins: [react()],
+  plugins: [react(), duplicateModuleGuard()],
 
   // The repo root, baked in at config-load time.
   //
@@ -138,6 +139,17 @@ export default defineConfig(async () => ({
       "three/examples/jsm/tsl/display/BilateralBlurNode.js",
       "three/examples/jsm/tsl/display/MotionBlur.js",
       "three/examples/jsm/tsl/display/FSR1Node.js",
+      // The code editor and its vim keymap. Listed even though both are
+      // lazy-loaded, and specifically BECAUSE they are: a dep Vite discovers
+      // mid-session triggers a re-optimization, which changes every dep
+      // chunk's `?v=` hash and is normally survivable only because Vite pushes
+      // a full reload afterwards. Quiet mode (`.no-hmr`, above) suppresses
+      // that push — so the open page keeps requesting a hash that no longer
+      // exists and the import fails with "Failed to fetch dynamically imported
+      // module". Pre-bundling them at server start moves that discovery to a
+      // moment when no page is loaded.
+      "monaco-editor",
+      "monaco-vim",
       "lucide-react",
       "zustand",
       "immer",

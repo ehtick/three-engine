@@ -110,7 +110,7 @@ export function themePlayerHtml(html, { title = "", icon = "", loading = {} } = 
 export const PREVIEW_REVISION_PATH = "__preview_revision.json";
 
 /**
- * Injects the live-reload client into a LIVE PREVIEW build's index.html.
+ * Injects the live-update client into a LIVE PREVIEW build's index.html.
  *
  * The rebuild loop keeps the served files fresh, but a browser (worst of all
  * a phone across the room) runs whatever it loaded until someone remembers to
@@ -118,38 +118,79 @@ export const PREVIEW_REVISION_PATH = "__preview_revision.json";
  * to live inside the player bundle itself, but that put the staleness fix
  * inside the very artifact that goes stale: a build made from an old
  * dist-player template shipped an old (or no) poll. index.html is regenerated
- * by the exporter on EVERY build, so a client injected here — with the
- * build's own revision baked in — works no matter how old the template is.
+ * by the exporter on EVERY build, so a client injected here works no matter
+ * how old the template is.
  *
- * Deliberately dumb: no SSE, no sockets, nothing added to the Rust server.
- * One tiny same-origin fetch per second over the existing keep-alive
+ * The client baselines on its FIRST successful poll rather than carrying a
+ * baked-in revision: that keeps an unchanged index.html byte-identical across
+ * rebuilds, which is what lets the exporter's change manifest tell "a material
+ * was tweaked" apart from "the page itself changed".
+ *
+ * When the revision flips, the client prefers the player runtime's in-place
+ * hook (`window.__playerLiveUpdate(changed)`) — materials re-apply live, a
+ * scene edit restarts the scene without paying for a page load, WebGPU init
+ * and shader compiles. A page that skipped intermediate rebuilds (a gizmo
+ * drag outruns the 1s poll; a hidden tab misses many) unions the missed
+ * deltas from the manifest's short history instead of giving up. It falls
+ * back to a full `location.reload()` whenever the hook is missing (a stale
+ * player template), declines (engine code changed), throws, or the running
+ * revision is older than the whole history window.
+ *
+ * Deliberately dumb transport: no SSE, no sockets, nothing added to the Rust
+ * server. One tiny same-origin fetch per second over the existing keep-alive
  * connection, `no-store` so the poll itself can never be cached. Fetch
  * failures are tolerated silently — the server dies with the editor, and when
- * it comes back with a fresh build the next successful poll reloads into it.
- * Hidden tabs don't poll; a phone reloads when it is next looked at.
+ * it comes back with a fresh build the next successful poll catches up.
+ * Hidden tabs don't poll; a phone updates when it is next looked at.
  *
  * Published builds never see this: the exporter only injects it when
  * `livePreview` is set, so a shipped game contains no polling loop.
  */
-export function injectLivePreviewClient(html, revision) {
-  const initial = JSON.stringify(revision ?? null);
+export function injectLivePreviewClient(html) {
   const client =
     `<script id="live-preview-client">(() => {\n` +
-    `  const initial = ${initial};\n` +
-    `  let checking = false;\n` +
+    `  let current = null;\n` +
+    `  let busy = false;\n` +
     `  const tick = async () => {\n` +
-    `    if (checking || document.hidden) return;\n` +
-    `    checking = true;\n` +
+    `    if (busy || document.hidden) return;\n` +
+    `    busy = true;\n` +
     `    try {\n` +
     `      const res = await fetch("${PREVIEW_REVISION_PATH}", { cache: "no-store" });\n` +
     `      if (res.ok) {\n` +
-    `        const { revision } = await res.json();\n` +
-    `        if (revision && revision !== initial) location.reload();\n` +
+    `        const data = await res.json();\n` +
+    `        if (data && data.revision) {\n` +
+    `          if (current === null) {\n` +
+    `            current = data.revision;\n` +
+    `          } else if (data.revision !== current) {\n` +
+    `            const seen = current;\n` +
+    `            current = data.revision;\n` +
+    `            const hot = window.__playerLiveUpdate;\n` +
+    `            let delta = null;\n` +
+    `            if (data.previous === seen && Array.isArray(data.changed)) {\n` +
+    `              delta = data.changed;\n` +
+    `            } else if (Array.isArray(data.history)) {\n` +
+    `              const i = data.history.findIndex((e) => e && e.revision === seen);\n` +
+    `              if (i >= 0) {\n` +
+    `                delta = [];\n` +
+    `                for (const e of data.history.slice(i + 1)) {\n` +
+    `                  if (!Array.isArray(e?.changed)) { delta = null; break; }\n` +
+    `                  delta.push(...e.changed);\n` +
+    `                }\n` +
+    `              }\n` +
+    `            }\n` +
+    `            let applied = false;\n` +
+    `            if (hot && delta) {\n` +
+    `              try { applied = await hot(delta); } catch {}\n` +
+    `            }\n` +
+    `            if (!applied) location.reload();\n` +
+    `          }\n` +
+    `        }\n` +
     `      }\n` +
     `    } catch {}\n` +
-    `    checking = false;\n` +
+    `    busy = false;\n` +
     `  };\n` +
     `  setInterval(tick, 1000);\n` +
+    `  tick();\n` +
     `})();</script>`;
   const out = String(html);
   // Before </body> when the template has one; appended otherwise, which every

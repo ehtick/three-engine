@@ -1,3 +1,4 @@
+import { vmSingleton } from "./singleton.js";
 // @ts-check
 import { engine } from "./engineInstance.js";
 import { commandBus } from "./commands/CommandBus.js";
@@ -222,7 +223,7 @@ export function prefabAssetPathOf(entityId) {
  * entering Prefab Mode never touches the user's scene file — and so unsaved
  * scene edits survive a trip into a prefab and back.
  */
-let suspendedScene = null;
+const parked = vmSingleton("prefabSuspendedScene", () => ({ /** @type {any} */ scene: null }));
 
 export function isPrefabModeActive() {
   return !!usePrefabStore.getState().stage;
@@ -244,7 +245,7 @@ export async function openPrefabMode(path) {
     return false;
   }
 
-  suspendedScene = { json: serializeScene(engine), name: engine.sceneName };
+  parked.scene = { json: serializeScene(engine), name: engine.sceneName };
 
   engine.clear();
   engine.sceneName = def.name ?? stemOf(path);
@@ -292,8 +293,8 @@ export async function exitPrefabMode({ save = true } = {}) {
   if (!stage) return;
   if (save && usePrefabStore.getState().stageDirty) await savePrefabStage();
 
-  const backup = suspendedScene;
-  suspendedScene = null;
+  const backup = parked.scene;
+  parked.scene = null;
   usePrefabStore.getState().exitStage();
 
   engine.clear();

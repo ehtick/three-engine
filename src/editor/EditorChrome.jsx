@@ -170,6 +170,13 @@ export function EditorChrome() {
       for (const el of document.querySelectorAll(".texture-editor")) {
         if (isPointerInside(el)) return;
       }
+      // The audio editor owns Space (play/pause), Ctrl+Z/S/X/C/V and Delete
+      // over its own surface. Same hover test: clicking a waveform lane never
+      // moves `document.activeElement` either.
+      if (e.target.closest?.(".audio-editor")) return;
+      for (const el of document.querySelectorAll(".audio-editor")) {
+        if (isPointerInside(el)) return;
+      }
 
       const selection = useSelectionStore.getState().ids;
       if (e.shiftKey && !ctrl && !e.altKey && e.key.toLowerCase() === "d") {

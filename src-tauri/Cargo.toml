@@ -42,6 +42,12 @@ base64 = "0.22"
 # and AES, none of which a game bundle needs.
 zip = { version = "2", default-features = false, features = ["deflate"] }
 walkdir = "2"
+# Watches the open project folder so a file written by anything other than the
+# editor — an AI agent's own file tools, a texture painted in another app, a
+# script edited in an IDE — shows up without a restart. `default-features =
+# false` drops the crossbeam channel we don't use; events cross to the webview
+# as Tauri events instead.
+notify = { version = "7", default-features = false, features = ["macos_fsevent"] }
 # LAN browser previews need a secure context for WebGPU. The editor generates
 # an ephemeral certificate and terminates TLS itself; localhost stays HTTP.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

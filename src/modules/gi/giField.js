@@ -640,6 +640,10 @@ export function createGiField(bounds, res, atlas, options = {}) {
         options.rayHitConfig?.enableShadowRecords !== false;
       return createShadowTrace(distanceTexture, world, res, lift, atlas, steps, stagingBuffer, name, sparse, occField, killSdf, stable, recordAware);
     },
+    // The analytic mid-field width term (docs/GI_SHADOWS_PLAN.md §5, behind
+    // `__giShadowAnalyticWidth`) — see createWidthProbeFn. Each caller gets
+    // its own instance; sharedFn keeps it one WGSL function per shader.
+    createWidthProbe: (name = undefined) => createWidthProbeFn(distanceTexture, world, occField, name),
     // MIRROR RAYS stay on the sphere trace deliberately. They were a voxel DDA
     // once and moved OFF it because binary cells give stair-stepped hit
     // silhouettes where continuous distance gives smooth ones — and the spec's
@@ -697,6 +701,134 @@ function createHitSurfaceFn(atlas, minCellNode) {
     });
     return { albedo, normal, valid };
   };
+}
+
+/**
+ * ANALYTIC MID-FIELD PENUMBRA WIDTH (docs/GI_SHADOWS_PLAN.md §5 — the
+ * deterministic soft-shadow arm, behind `__giShadowAnalyticWidth`).
+ *
+ * The record march's own cone term (`pen`) only sees geometry within ~1–2
+ * occupancy voxels of the ray — planes are tested in cells the ray ENTERS
+ * and the near-field oracle reaches ~1.5 voxels — so penumbras wider than a
+ * couple of voxels are unrepresentable and the stochastic sun-disc jitter
+ * existed solely to fill that mid-range hole. This term IS that missing
+ * mid-range oracle: min over ~12 log-spaced ray points of k·D(p)/t, where D
+ * is the composited `distanceTexture` (trilinear, fp16, reach capWorld ≈
+ * 16 field cells ≈ metres) — the same estimator family as Unreal's
+ * distance-field shadows, and the reason those are famously stable under a
+ * dragged sun: every term is deterministic, so each frame is already the
+ * converged answer and there is no convergence process to disturb.
+ *
+ * WIDTH ONLY, NEVER ADMISSION — the invariant that evades both recorded
+ * analytic-arm failures (the density cone's density≠opacity leaks/blacks
+ * and the session-24 sphere arm's lattice-phase speckle, GISystem.js
+ * ~1902-2034): the factor multiplies the record march's verdict and lives
+ * in [0,1], so a melty or coarse D can only soften a penumbra — it can
+ * never open the umbra (admission stays with the records) and it saturates
+ * lit wherever D reads far (the `capCut` gate below, same 0.85·capWorld
+ * saturation test createShadowTrace uses — without it every sample beyond
+ * t ≈ k·capWorld would "occlude" and carve a hard light sphere).
+ *
+ * The receiver's own surface is excluded the way createShadowTrace does it:
+ * a sample only counts when D reads decisively closer than the sample's
+ * height above the receiver plane (`lift + t·cos`), with the tolerance
+ * sized off the OCCUPANCY voxel (the medium that quantizes D near
+ * surfaces) — the hugging-ray case a plain distance test gets wrong.
+ *
+ * `__giShadowWidthTaps` overrides the tap count (build-time, default 12).
+ */
+function createWidthProbeFn(distanceTexture, world, occField, name = "giShadowWidthProbe") {
+  const TAPS = Math.max(4, Math.min(24, Number(globalThis.__giShadowWidthTaps) || 12));
+  return sharedFn({
+    name,
+    type: "float",
+    inputs: [
+      { name: "origin", type: "vec3" },
+      { name: "dir", type: "vec3" },
+      { name: "tStart", type: "float" },
+      { name: "maxT", type: "float" },
+      { name: "k", type: "float" },
+      { name: "cosRayNormal", type: "float" },
+      { name: "lift", type: "float" },
+    ],
+    body: (origin, dir, tStart, maxT, k, cosRayNormal, lift) => {
+      const minV = vec3(world.min).toVar();
+      const sizeInvV = vec3(1).div(world.size).toVar();
+      const capWorldV = float(world.capWorld).toVar();
+      const capCut = capWorldV.mul(0.85).toVar();
+      const minCellV = float(world.minCell).toVar();
+      // Same own-plane tolerance createShadowTrace derived for the hugging-
+      // ray case: up to a voxel of SAT bulge + ~half a coarse cell of
+      // trilinear undershoot on the receiver's floor.
+      const occVox = occField?.voxel
+        ? vec3(occField.voxel).x.max(vec3(occField.voxel).y).max(vec3(occField.voxel).z).toVar()
+        : null;
+      // 3.5 voxels, deliberately WIDER than createShadowTrace's 2.5: the
+      // probe rig's blocky residual showed the composited D undershoots a
+      // big flat receiver by up to ~3 voxels (SAT bulge + trilinear over
+      // coarse cells + fp16), and a hugging ray lives at that margin for
+      // its whole length. Contact-scale width below ~4 voxels is the
+      // MARCH's near-field pen term's job anyway — the probe is strictly
+      // the mid-field.
+      const planeCut = (occVox ? minCellV.mul(1.0).max(occVox.mul(3.5)) : minCellV.mul(0.75)).toVar();
+      const width = float(1).toVar();
+      // DEBUG (`__giWidthProbeDebugTap`, build-time): paint the ARGMIN tap
+      // index instead of the width — dark = the darkening happened at an
+      // early tap (receiver-proximal), light grey = late (lamp-proximal),
+      // white = the probe left the ray alone. The instrument that locates
+      // WHERE along rays a false darkening lives.
+      const dbgTap = globalThis.__giWidthProbeDebugTap === true;
+      const bestIdx = dbgTap ? float(1).toVar() : null;
+      // Log-spaced t_i in [tStart, maxT]: constant ratio per tap, so near
+      // taps resolve contact-scale width and far taps cover metres. The
+      // spacing is FIXED (no jitter of any kind) — determinism is the point.
+      const t0 = tStart.max(minCellV.mul(0.5)).toVar();
+      const ratio = maxT.div(t0).max(1.0001).pow(1 / (TAPS - 1)).toVar();
+      const t = t0.toVar();
+      for (let i = 0; i < TAPS; i++) {
+        const p = origin.add(dir.mul(t)).toVar();
+        const uvw = p.sub(minV).mul(sizeInvV).toVar();
+        // Outside the volume D is undefined — saturate lit; the record
+        // march (which owns admission) already clamps to the volume slab.
+        const inBounds = uvw.x.greaterThanEqual(0).and(uvw.y.greaterThanEqual(0)).and(uvw.z.greaterThanEqual(0))
+          .and(uvw.x.lessThanEqual(1)).and(uvw.y.lessThanEqual(1)).and(uvw.z.lessThanEqual(1));
+        // Hardware trilinear; explicit level — implicit-derivative sampling
+        // inside unrolled bodies is illegal WGSL in compute.
+        const d = texture3D(distanceTexture, uvw).level(0).r.mul(capWorldV).toVar();
+        // Own-plane exclusion needs BOTH an absolute and a PROPORTIONAL
+        // margin. On a grazing ray hugging its receiver (the common case
+        // for a low panel emitter lighting a floor), D ≈ planeHeight for
+        // the ENTIRE ray — the absolute cut alone leaves the threshold
+        // inside D's quantization noise band (SAT bulge + trilinear
+        // undershoot ≈ 0.2m) forever, so admission flipped with lattice
+        // phase and, at emitter k as low as 1.2, each admitted sample read
+        // k·d/t ≈ 0: the whole floor went near-black in a waffle-grid
+        // pattern (the emissive probe's PNG; probe-off A/B was clean).
+        // Requiring d < 0.6·planeHeight gives headroom that GROWS with
+        // hugging height, so the far field is unconditionally clean, while
+        // real occluders — laterally close to the ray but well under its
+        // receiver-plane height — still register. 0.6, not 0.75: the probe
+        // rig measured D's relative undershoot over a hugging ray at
+        // 25-30% (far-floor grey landed at exactly k·0.75h/t), so the
+        // factor must sit below ~0.7 to clear the noise band; what it
+        // costs is probe WIDTH from occluders within 40% of the ray's
+        // receiver-plane height — admission of those stays with the march.
+        const planeHeight = lift.add(t.mul(cosRayNormal));
+        const counts = inBounds
+          .and(d.lessThan(capCut))
+          .and(d.lessThan(planeHeight.sub(planeCut)))
+          .and(d.lessThan(planeHeight.mul(0.6)))
+          .and(t.lessThan(maxT));
+        const cand = k.mul(d).div(t.max(1e-4)).clamp(0, 1);
+        const candEff = select(counts, cand, float(1)).toVar();
+        if (dbgTap) bestIdx.assign(select(candEff.lessThan(width), float(i / (TAPS - 1)), bestIdx));
+        width.assign(width.min(candEff));
+        if (i < TAPS - 1) t.mulAssign(ratio);
+      }
+      if (dbgTap) return select(width.lessThan(0.95), bestIdx.mul(0.7).add(0.15), float(1));
+      return width;
+    },
+  });
 }
 
 /**

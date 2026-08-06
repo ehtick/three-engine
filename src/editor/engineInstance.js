@@ -6,13 +6,30 @@
 // on direct `engine.X` access exists to catch any consumer that forgets to
 // await; replace with `engineInstance` once it's resolved.
 
-let engineInstance = null;
-let loaderPromise = null;
+import { vmSingleton } from "./singleton.js";
+
+/**
+ * The one Engine, and the one in-flight load, held VM-wide.
+ *
+ * These were plain module-level `let`s, which is a singleton only while the
+ * module is evaluated once — and this one is not. Vite serves a touched module
+ * as both `foo.js` and `foo.js?t=<mtime>`, so a second evaluation used to
+ * construct a SECOND `Engine`: ops would spawn entities into an engine nothing
+ * was rendering, the viewport kept drawing the first one, and the edit only
+ * appeared after a restart (when the autosaved scene was reloaded into a single
+ * fresh instance). Two engines is the worst version of the split-brain
+ * described in `singleton.js`, because every downstream store is keyed off
+ * whichever one its module happened to capture.
+ */
+const state = vmSingleton("engineInstance", () => ({
+  /** @type {any} */ instance: null,
+  /** @type {Promise<any> | null} */ loader: null,
+}));
 
 async function loadEngine() {
-  if (engineInstance) return engineInstance;
-  if (!loaderPromise) {
-    loaderPromise = (async () => {
+  if (state.instance) return state.instance;
+  if (!state.loader) {
+    state.loader = (async () => {
       const [
         {
           Engine,
@@ -68,7 +85,7 @@ async function loadEngine() {
         const root = useProjectStore.getState().rootPath;
         return root ? `${root}/Library` : null;
       });
-      engineInstance = inst;
+      state.instance = inst;
       // The Editor API publishes itself to the script runtime and starts the
       // gizmo pass, both of which need a live engine — hence here rather than
       // at module scope. Dynamically imported so the command bus and the React
@@ -78,7 +95,7 @@ async function loadEngine() {
       return inst;
     })();
   }
-  return loaderPromise;
+  return state.loader;
 }
 
 /** Resolves to the singleton Engine. Safe to await multiple times. */
@@ -95,7 +112,7 @@ export function ensureEngine() {
  * visible symptom is not an error message but a viewport that never appears.
  */
 export function isEngineReady() {
-  return engineInstance !== null && engineInstance !== undefined;
+  return state.instance !== null && state.instance !== undefined;
 }
 
 /**
@@ -106,27 +123,33 @@ export function isEngineReady() {
  * obvious instead of silently returning undefined.
  */
 /** @type {import("engine").Engine} */
-export const engine = new Proxy(function () {}, {
-  get(_target, prop) {
-    if (prop === "then") return undefined; // not a thenable
-    if (!engineInstance) {
-      if (import.meta.env?.DEV) {
-        throw new Error(
-          "engine accessed before `await ensureEngine()` — fix the consumer to await.",
-        );
-      }
-      throw new Error("engine not initialized; await ensureEngine() first");
-    }
-    const value = engineInstance[prop];
-    return typeof value === "function" ? value.bind(engineInstance) : value;
-  },
-  // Without a set trap, writes like `engine.camera = ...` would land on the
-  // dummy Proxy target and silently never reach the real engine.
-  set(_target, prop, value) {
-    if (!engineInstance) {
-      throw new Error("engine assigned before `await ensureEngine()` — fix the consumer to await.");
-    }
-    engineInstance[prop] = value;
-    return true;
-  },
-});
+export const engine = /** @type {any} */ (
+  vmSingleton(
+    "engineProxy",
+    () =>
+      new Proxy(function () {}, {
+        get(_target, prop) {
+          if (prop === "then") return undefined; // not a thenable
+          if (!state.instance) {
+            if (import.meta.env?.DEV) {
+              throw new Error(
+                "engine accessed before `await ensureEngine()` — fix the consumer to await.",
+              );
+            }
+            throw new Error("engine not initialized; await ensureEngine() first");
+          }
+          const value = state.instance[prop];
+          return typeof value === "function" ? value.bind(state.instance) : value;
+        },
+        // Without a set trap, writes like `engine.camera = ...` would land on the
+        // dummy Proxy target and silently never reach the real engine.
+        set(_target, prop, value) {
+          if (!state.instance) {
+            throw new Error("engine assigned before `await ensureEngine()` — fix the consumer to await.");
+          }
+          state.instance[prop] = value;
+          return true;
+        },
+      }),
+  )
+);

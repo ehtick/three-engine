@@ -243,15 +243,17 @@ try {
   const fatal = pageErrors.filter((m) => !/Preload failed|preload failed|icon\.png/i.test(m));
   check("no page errors", fatal.length === 0, fatal.slice(0, 2).join(" | "));
 
-  // --- Live-preview reload client -------------------------------------------
+  // --- Live-preview update client -------------------------------------------
   // The editor's rebuild loop rewrites the served files, but the open tab
   // (worst of all a phone across the room) keeps running the old build until
-  // it reloads itself. Stage the same build the way a `livePreview` export
-  // ships it and prove the injected client notices a finished rebuild.
+  // it catches up. Stage the same build the way a `livePreview` export ships
+  // it and prove the injected client notices a finished rebuild — reloading
+  // when it must, hot-applying in place when the runtime offers the hook.
   check("a release build carries no reload client", !rawHtml.includes("live-preview-client"));
   const REV_A = 1111;
   const REV_B = 2222;
-  await writeFile(path.join(out, "index.html"), injectLivePreviewClient(themed, REV_A));
+  const REV_C = 3333;
+  await writeFile(path.join(out, "index.html"), injectLivePreviewClient(themed));
   await writeFile(path.join(out, PREVIEW_REVISION_PATH), JSON.stringify({ revision: REV_A }));
   const previewHtml = await (await fetch(url)).text();
   check("a live-preview build carries the client", previewHtml.includes("live-preview-client"));
@@ -260,12 +262,135 @@ try {
     .waitForNavigation({ waitUntil: "load", timeout: 15000 })
     .then(() => true)
     .catch(() => false);
-  // What the live rebuild loop does last on every export.
+  // A flip whose `previous` doesn't match what the page is running (here:
+  // absent entirely) must fall back to the full reload — the client cannot
+  // trust a delta it didn't watch happen.
   await writeFile(path.join(out, PREVIEW_REVISION_PATH), JSON.stringify({ revision: REV_B }));
   check("a finished rebuild reloads the open page", await navigated);
   check(
     "the reloaded page is the served build",
     await page.evaluate(() => !!document.getElementById("live-preview-client")),
+  );
+
+  // Hot path: when the runtime exposes __playerLiveUpdate and the manifest
+  // chains cleanly (previous === the revision on screen), the client hands the
+  // changed list over and does NOT navigate. The marker survives precisely
+  // because the page didn't reload.
+  await page.evaluate(() => {
+    globalThis.__stayed = true;
+    globalThis.__hotChanged = null;
+    globalThis.__playerLiveUpdate = async (changed) => {
+      globalThis.__hotChanged = changed;
+      return true;
+    };
+  });
+  await writeFile(
+    path.join(out, PREVIEW_REVISION_PATH),
+    JSON.stringify({ revision: REV_C, previous: REV_B, changed: ["assets/crate.mat"] }),
+  );
+  await page.waitForFunction(() => globalThis.__hotChanged !== null, { timeout: 10000, polling: 200 });
+  const hot = await page.evaluate(() => ({
+    changed: globalThis.__hotChanged,
+    stayed: globalThis.__stayed === true,
+  }));
+  check(
+    "a chained rebuild reaches the in-place hook with its manifest",
+    Array.isArray(hot.changed) && hot.changed[0] === "assets/crate.mat",
+    JSON.stringify(hot.changed),
+  );
+  check("and the page did not reload around it", hot.stayed);
+
+  // A page that missed intermediate rebuilds (drag outruns the poll, hidden
+  // tab) must recover the union of missed deltas from the manifest history
+  // rather than reloading. The page runs REV_C; two more builds happened.
+  const REV_D = 4444;
+  const REV_E = 5555;
+  await page.evaluate(() => {
+    globalThis.__hotChanged = null;
+  });
+  await writeFile(
+    path.join(out, PREVIEW_REVISION_PATH),
+    JSON.stringify({
+      revision: REV_E,
+      previous: REV_D,
+      changed: ["assets/late.mat"],
+      history: [
+        { revision: REV_C, changed: ["assets/crate.mat"] },
+        { revision: REV_D, changed: ["assets/mid.png"] },
+        { revision: REV_E, changed: ["assets/late.mat"] },
+      ],
+    }),
+  );
+  await page.waitForFunction(() => globalThis.__hotChanged !== null, { timeout: 10000, polling: 200 });
+  const skipped = await page.evaluate(() => ({
+    changed: globalThis.__hotChanged,
+    stayed: globalThis.__stayed === true,
+  }));
+  check(
+    "skipped rebuilds hand the hook the union of missed deltas",
+    JSON.stringify(skipped.changed) === JSON.stringify(["assets/mid.png", "assets/late.mat"]),
+    JSON.stringify(skipped.changed),
+  );
+  check("still without reloading", skipped.stayed);
+
+  // --- The REAL runtime, end to end -----------------------------------------
+  // Everything above stubs the hook. This drives the SHIPPED player: it must
+  // install `__playerLiveUpdate` itself and apply an authored scene edit by
+  // reconciling it onto the running scene. Two earlier generations both got
+  // the change on screen while still being reported as "it reloads" — one
+  // reloaded the page, the next called loadScene() and rebuilt the whole
+  // scene behind the loading screen. So assert all three properties
+  // separately: the edit lands, the PAGE survives, and the live entity
+  // instance survives.
+  const REV_F = 6666;
+  const REV_G = 7777;
+  const liveScene = { ...startScene, player: { ...startScene.player, livePreview: true } };
+  await writeFile(path.join(out, "scene.json"), JSON.stringify(liveScene));
+  await writeFile(path.join(out, PREVIEW_REVISION_PATH), JSON.stringify({ revision: REV_F }));
+  await page.goto(url, { waitUntil: "load", timeout: 60000 });
+  await page.waitForFunction(() => globalThis.__engine?.getEntity?.("box"), {
+    timeout: 60000,
+    polling: 200,
+  });
+  check(
+    "the shipped player installs the live-update hook",
+    await page.evaluate(() => typeof globalThis.__playerLiveUpdate === "function"),
+  );
+
+  // Marks that only survive if neither the page nor the scene was rebuilt.
+  await page.evaluate(() => {
+    globalThis.__stayedLive = true;
+    globalThis.__engine.getEntity("box").__liveMarker = "original";
+  });
+
+  const movedScene = JSON.parse(JSON.stringify(liveScene));
+  movedScene.entities.find((e) => e.id === "box").position = [7, 0, 0];
+  await writeFile(path.join(out, "scene.json"), JSON.stringify(movedScene));
+  await writeFile(
+    path.join(out, PREVIEW_REVISION_PATH),
+    JSON.stringify({ revision: REV_G, previous: REV_F, changed: ["scene.json"] }),
+  );
+  const applied = await page
+    .waitForFunction(
+      () => globalThis.__engine?.getEntity?.("box")?.getTransform?.().position?.[0] === 7,
+      { timeout: 15000, polling: 200 },
+    )
+    .then(() => true)
+    .catch(() => false);
+  const liveState = await page.evaluate(() => {
+    const box = globalThis.__engine?.getEntity?.("box");
+    return {
+      stayed: globalThis.__stayedLive === true,
+      marker: box?.__liveMarker ?? null,
+      x: box?.getTransform?.().position?.[0] ?? null,
+    };
+  });
+  check("an authored scene edit reaches the running build", applied, `x=${liveState.x}`);
+  check("…without reloading the page", liveState.stayed);
+  check(
+    "…and without rebuilding the scene (the live entity instance survives)",
+    liveState.marker === "original",
+    `marker=${liveState.marker}`,
   );
 } catch (error) {
   check("harness completed", false, error.message);

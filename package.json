@@ -93,7 +93,16 @@
     "test:gi-spawn": "node scripts/run-gi-spawn-test.mjs",
     "test:texture": "node scripts/run-texture-test.mjs",
     "smoke:texture": "node scripts/run-texture-smoke.mjs",
-    "test:planar": "node scripts/run-planar-reflection.mjs"
+    "test:planar": "node scripts/run-planar-reflection.mjs",
+    "test:audio": "node scripts/run-audio-test.mjs",
+    "smoke:audio": "node scripts/run-audio-smoke.mjs",
+    "test:live": "node scripts/run-live-update-test.mjs",
+    "smoke:live": "node scripts/run-live-update-smoke.mjs",
+    "test:git": "node scripts/run-git-test.mjs",
+    "smoke:git": "node scripts/run-git-smoke.mjs",
+    "test:fonts": "node scripts/run-fonts-test.mjs",
+    "test:mcp-coverage": "node scripts/run-mcp-coverage-test.mjs",
+    "smoke:mcp-tools": "node scripts/run-mcp-tools-smoke.mjs"
   },
   "dependencies": {
     "@dimforge/rapier3d-compat": "^0.19.3",
@@ -116,6 +125,8 @@
     "jszip": "^3.10.1",
     "lucide-react": "^1.23.0",
     "meshoptimizer": "^1.2.0",
+    "monaco-editor": "^0.55.1",
+    "monaco-vim": "^0.4.4",
     "nanoid": "^5.1.16",
     "qrcode-generator": "^1.4.4",
     "react": "^19.1.0",

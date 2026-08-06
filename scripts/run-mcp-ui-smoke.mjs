@@ -194,6 +194,34 @@ check(
   }),
 );
 
+// --- the project gets orientation notes, but only now -------------------------
+//
+// An assistant on the other end of the bridge sees a tool list and knows nothing
+// about where it is. AGENTS.md answers that — and is written on CONNECT rather
+// than on project open, so a user who has never attached an assistant never
+// finds a file about them in their game folder.
+
+const guidePath = path.join(root, "AGENTS.md");
+check("AGENTS.md is written when an assistant connects", fs.existsSync(guidePath));
+check("CLAUDE.md points at it, for the clients that read that instead", fs.existsSync(path.join(root, "CLAUDE.md")));
+const guide = fs.existsSync(guidePath) ? fs.readFileSync(guidePath, "utf8") : "";
+check("…and it says where the agent is", /live editor/i.test(guide) && /game project/i.test(guide));
+check("…what to call first", /editor_status/.test(guide));
+check("…and what not to hand-edit", /\.scene/.test(guide) && /Library\//.test(guide));
+
+// The user is meant to edit this file — project conventions, tone, "don't touch
+// the boss arena". A scaffold that rewrote it on every connect would delete that
+// silently, which is the worst way to lose work.
+fs.writeFileSync(guidePath, "# Mine\n\nDo not touch the boss arena.\n");
+await page.evaluate(async () => {
+  const { ensureAgentGuide } = await globalThis.__importLive("/src/editor/agentGuide.js");
+  await ensureAgentGuide();
+});
+check(
+  "reconnecting never overwrites a guide the user has edited",
+  fs.readFileSync(guidePath, "utf8").includes("boss arena"),
+);
+
 // --- clients render as rows with brand marks ---------------------------------
 
 const clientRows = await page.evaluate(() =>

@@ -213,7 +213,11 @@ export function createToolLoopProvider({ id, label, baseUrl, model, apiKey, capa
 
       finalText = message.content ?? "";
       onEvent({
-        lines: finalText ? [{ kind: "text", text: finalText }] : [],
+        // Deliberately NOT also pushed as a `text` line: `AiPanel` renders the
+        // transcript AND `result`, so emitting both printed the whole answer
+        // twice. The transcript's job is the tool calls that led to the
+        // answer; the answer itself is `result`.
+        lines: [],
         result: finalText,
         meta: { durationMs: Date.now() - startedAt, turns, tokens, costUsd: null },
       });

@@ -26,6 +26,7 @@ import {
   Tag,
   Target,
   Trash2,
+  Type,
   Volume2,
   Workflow,
   Film,
@@ -44,6 +45,8 @@ import {
   MODEL_EXTENSIONS,
   MODEL_IMPORT_EXTENSIONS,
   TEXTURE_EXTENSIONS,
+  AUDIO_EXTENSIONS,
+  FONT_EXTENSIONS,
   SCRIPT_EXTENSIONS,
   MATERIAL_EXTENSIONS,
   CUBEMAP_EXTENSIONS,
@@ -111,6 +114,10 @@ const ICON_BY_EXT = {
   anim: Workflow,
   geom: Shapes,
   timeline: Film,
+  ttf: Type,
+  otf: Type,
+  woff: Type,
+  woff2: Type,
 };
 
 const TYPE_LABEL = {
@@ -131,6 +138,10 @@ const TYPE_LABEL = {
   anim: "Animator",
   geom: "Geometry",
   timeline: "Timeline",
+  ttf: "Font",
+  otf: "Font",
+  woff: "Font",
+  woff2: "Font",
 };
 
 /**
@@ -382,6 +393,35 @@ function CubemapThumb({ path, size }) {
   );
 }
 
+/**
+ * A font tile shows the font. Anything else — a glyph icon, the filename in
+ * the UI's own face — tells you nothing you didn't already know from the name,
+ * and choosing a typeface is entirely a matter of looking at it.
+ */
+function FontThumb({ path, size }) {
+  const [family, setFamily] = useState(null);
+  useEffect(() => {
+    let live = true;
+    setFamily(null);
+    import("../../engine/ui/fontAsset.js")
+      .then(({ ensureFontLoaded }) => ensureFontLoaded(path))
+      .then((entry) => live && entry?.loaded && setFamily(entry.family))
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [path]);
+  return (
+    <div className="asset-icon font-thumb" style={{ width: size, height: size }}>
+      {family ? (
+        <span style={{ fontFamily: `"${family}"`, fontSize: size * 0.56 }}>Ag</span>
+      ) : (
+        <Type size={size * 0.6} strokeWidth={1.5} />
+      )}
+    </div>
+  );
+}
+
 function Thumb({ entry, size }) {
   if (entry.is_dir)
     return (
@@ -393,6 +433,7 @@ function Thumb({ entry, size }) {
   if (entry.ext === "mat") return <MaterialThumb path={entry.path} size={size} />;
   if (entry.ext === "cubemap") return <CubemapThumb path={entry.path} size={size} />;
   if (entry.ext === "geom") return <GeometryThumb path={entry.path} size={size} />;
+  if (FONT_EXTENSIONS.includes(entry.ext)) return <FontThumb path={entry.path} size={size} />;
   const Icon = ICON_BY_EXT[entry.ext] ?? File;
   return (
     <div className="asset-icon" style={{ width: size, height: size }}>
@@ -614,6 +655,18 @@ function AssetContextMenu({ menu, close, setRenamingPath, selectedEntries }) {
         ...(multi
           ? []
           : [{ label: "Rename", action: () => setRenamingPath(entry.path) }]),
+        ...(multi || entry.is_dir
+          ? []
+          : [
+              {
+                label: "Duplicate",
+                action: () =>
+                  import("../assetOps.js")
+                    .then((m) => m.duplicateAsset(entry.path))
+                    .then((created) => created && useSelectionStore.getState().selectAsset(created))
+                    .catch((error) => console.error(`Duplicate failed: ${error?.message ?? error}`)),
+              },
+            ]),
         {
           label: multi ? `Group ${targets.length} into Folder` : "Group into Folder",
           shortcut: "Ctrl+G",
@@ -640,6 +693,9 @@ function AssetContextMenu({ menu, close, setRenamingPath, selectedEntries }) {
                 action: () => createCubemapFromTextures(textureTargets.map((t) => t.path)),
               },
             ]
+          : []),
+        ...(!multi && !entry.is_dir && AUDIO_EXTENSIONS.includes(entry.ext) && entry.ext !== "audio"
+          ? [{ label: "Open in Audio Editor", action: () => openAssetPath(entry.path) }]
           : []),
         ...(!multi && !entry.is_dir && TEXTURE_EXTENSIONS.includes(entry.ext)
           ? [

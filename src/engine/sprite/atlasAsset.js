@@ -1,3 +1,4 @@
+import { vmState } from "../vmState.js";
 import { resolveAssetUrl } from "../assetResolver.js";
 
 /**
@@ -145,7 +146,7 @@ export function frameAt(animation, t) {
 
 // --- loading ----------------------------------------------------------------
 
-const cache = new Map(); // path -> Promise<AtlasDef>
+const cache = vmState("atlasCache", () => new Map()); // path -> Promise<AtlasDef>
 
 /** Drops a cached atlas after the editor rewrites it. */
 export function invalidateAtlasAsset(path) {

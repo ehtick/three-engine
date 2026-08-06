@@ -75,7 +75,8 @@ defineOp({
 
 defineOp({
   name: "history.undo",
-  description: "Undo the last editor action.",
+  description:
+    "Undo the last editor action, whoever made it — an agent's edits and a person's share one stack. Call history.get first to see what would be undone.",
   params: {},
   run() {
     commandBus.undo();
@@ -85,7 +86,8 @@ defineOp({
 
 defineOp({
   name: "history.redo",
-  description: "Redo the last undone editor action.",
+  description:
+    "Redo the action most recently undone. Making any new edit clears the redo stack, exactly as it does for a person.",
   params: {},
   run() {
     commandBus.redo();

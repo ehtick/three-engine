@@ -214,9 +214,54 @@ wss.on("connection", (socket, req) => {
 // MCP surface
 // ---------------------------------------------------------------------------
 
+/**
+ * Sent to the client during initialize, before any tool is called.
+ *
+ * The tool list says what each tool does and nothing about where the assistant
+ * IS: that the folder it has open is a game, that a live editor is holding that
+ * project in memory, that scene files are generated. The project's own AGENTS.md
+ * carries the long version — but only agents that read files before acting will
+ * ever see it, and only once a project is open. This is the floor: short, always
+ * delivered, and true before the editor has even connected.
+ */
+const INSTRUCTIONS = `These tools drive a LIVE, RUNNING instance of the Three Engine editor — a
+three.js/WebGPU game editor — with a person watching it. They are not file
+operations against a project on disk; they are remote control of an application.
+
+Call \`editor_status\` first. It tells you whether the editor is actually
+connected and which project and scene it has open. If it is not connected, no
+other tool will work, and saying so is better than guessing.
+
+Then orient yourself with \`scene_get\`, \`entity_list\` and \`module_list\` before
+changing anything. \`component_types\` lists every component and its real property
+names; read it rather than guessing.
+
+What to keep in mind:
+- Scene edits (\`entity_*\`, \`component_*\`) go through the editor's undo stack, so
+  the person can take back your work. Prefer them to writing files.
+- Never hand-edit a \`.scene\` file. It is a serialization format the editor
+  already has loaded; your changes will be overwritten or load broken.
+- \`asset_delete\`, \`asset_write\` and the build tools are NOT undoable. Ask before
+  deleting the user's files.
+- The project may be under version control: \`git_status\` says whether it is, and
+  the \`git_*\` tools commit, branch, diff and push exactly as the editor's Source
+  Control panel does. A commit before a large or risky change is the only undo
+  that survives closing the editor. \`git_discard\` is the one tool here that
+  destroys work — confirm it first.
+- Look at what you built: \`viewport_screenshot\` returns a real image, and
+  \`console_read\` returns the editor's errors.
+- Many tools are gated on an engine module and will refuse with a message naming
+  it. Enabling a module changes what the project ships — ask first.
+- Before concluding the editor cannot do something, check \`editor_status\`:
+  it reports how many tools the editor is actually offering, by family. Your
+  tool list was fetched once and can be older than the editor it describes.
+
+If a project is open, read AGENTS.md in the project folder for the fuller
+version, including that project's own conventions.`;
+
 const server = new Server(
   { name: "three-engine", version: "1.0.0" },
-  { capabilities: { tools: { listChanged: true } } },
+  { capabilities: { tools: { listChanged: true } }, instructions: INSTRUCTIONS },
 );
 
 let mcpConnected = false;
@@ -268,11 +313,28 @@ async function describeStatus() {
     request("call", { tool: "scene_get", args: {} }).then(unwrap).catch(() => null),
     request("call", { tool: "project_get", args: {} }).then(unwrap).catch(() => null),
   ]);
+  // Families, not just a count. The number on its own cannot be compared to
+  // anything — but "the editor is offering 12 texture_* tools" is directly
+  // checkable against the list the client is holding, which is the one thing
+  // that distinguishes "this editor cannot do that" from "your tool list is
+  // older than this editor". An assistant that concludes the former when the
+  // latter is true stops looking and writes a worse solution around the gap,
+  // and nothing in a stale tool list says it is stale.
+  const families = {};
+  for (const tool of editorTools) {
+    const family = tool.name.split("_")[0];
+    families[family] = (families[family] ?? 0) + 1;
+  }
   return {
     connected: true,
     port: PORT,
     apiVersion: editorInfo?.apiVersion ?? null,
     toolCount: editorTools.length,
+    toolFamilies: families,
+    staleListHint:
+      "If a tool you expect is missing from your list, compare it with toolCount/toolFamilies above. " +
+      "A tool list is fetched once per session, so it can predate the running editor; reconnecting " +
+      "(or reloading the editor after an engine update) refreshes it.",
     project,
     scene,
   };

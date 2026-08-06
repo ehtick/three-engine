@@ -72,8 +72,8 @@ export class ImpostorComponent extends Component {
     { key: "receiveShadow", label: "Receive Shadow", type: "boolean" },
   ];
 
-  constructor(entity, props) {
-    super(entity, props);
+  constructor(props) {
+    super(props);
     this.atlasKey = null;
     this.batchKey = null;
     this.atlas = null;

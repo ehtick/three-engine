@@ -16,6 +16,7 @@ import { listProjectEntries, withoutSidecars, extOf } from "../../assetLoader.js
 import { createScriptFile } from "../../scriptAsset.js";
 import { openInIDE } from "../../openInIde.js";
 import { revealAssetInPanel } from "../../assetReveal.js";
+import { refreshAssetFromDisk, watchedProjectRoot } from "../../projectWatcher.js";
 
 const norm = (p) => String(p ?? "").replaceAll("\\", "/").replace(/\/+$/, "");
 
@@ -89,9 +90,123 @@ defineOp({
   async run({ path, contents }) {
     // `save_scene` is the generic "write this text to this path" Tauri command
     // despite the name (it predates everything else that writes text).
-    await invoke("save_scene", { path: insideProject(path, { forWriting: true }), contents });
+    const full = insideProject(path, { forWriting: true });
+    await invoke("save_scene", { path: full, contents });
+    // Writing the bytes is not the same as the editor SEEING them. Every cache
+    // downstream keys on the path — the asset loader's blob URL, the engine's
+    // decoded material/geometry/atlas caches — and none of them can notice a
+    // file it already read has changed. Without this, an agent writing a `.mat`
+    // through this tool gets a correct file on disk and a viewport that keeps
+    // rendering the old one until the editor is restarted, which is
+    // indistinguishable from the tool not working.
+    await refreshAssetFromDisk(full);
     await useProjectStore.getState().refresh();
     return { path };
+  },
+});
+
+/** Sidecars follow their asset through a rename, a move and a delete. */
+const SIDECAR_SUFFIXES = [".meta", ".basis", ".tex", ".aud"];
+
+defineOp({
+  name: "asset.refresh",
+  description:
+    "Re-read files from disk that changed without the editor writing them — after you edit project files with your own tools rather than through asset.write. Drops the editor's cached copy, reloads materials/textures/atlases/audio in the open scene, and re-lists the Assets panel. Pass `paths` for specific files, or omit it to just re-list the project. Note the editor also watches the project folder, so this is a way to force the issue, not the only way changes are noticed.",
+  params: {
+    paths: {
+      type: "array",
+      description: "Absolute paths that changed. Omit to re-list the project without reloading any asset.",
+      items: { type: "string" },
+    },
+  },
+  async run({ paths = [] }) {
+    const targets = paths.map((path) => insideProject(path));
+    for (const path of targets) await refreshAssetFromDisk(path);
+    await useProjectStore.getState().refresh();
+    return { refreshed: targets.map((p) => p.replaceAll("\\", "/")) };
+  },
+});
+
+defineOp({
+  name: "asset.watchStatus",
+  readOnly: true,
+  description:
+    "Whether the editor is watching the project folder for changes made outside it. When `watching` is false (a browser session, or the watcher failed to start) you must call asset.refresh yourself after writing project files with tools other than this API.",
+  params: {},
+  run() {
+    const root = watchedProjectRoot();
+    return { watching: !!root, root };
+  },
+});
+
+defineOp({
+  name: "asset.delete",
+  description:
+    "Delete files or folders from the project, with their .meta/.basis/.tex/.aud sidecars. Folders go with everything inside them. THIS IS NOT UNDOABLE — it is a filesystem delete, not an editor command, and nothing in the editor's undo stack can bring the file back.",
+  params: {
+    paths: { type: "array", required: true, description: "Absolute paths to delete.", items: { type: "string" } },
+  },
+  async run({ paths }) {
+    const deleted = [];
+    for (const raw of paths) {
+      const path = insideProject(raw, { forWriting: true });
+      await invoke("delete_path", { path });
+      for (const suffix of SIDECAR_SUFFIXES) {
+        await invoke("delete_path", { path: `${path}${suffix}` }).catch(() => {});
+      }
+      deleted.push(path.replaceAll("\\", "/"));
+    }
+    await useProjectStore.getState().refresh();
+    return { deleted };
+  },
+});
+
+defineOp({
+  name: "asset.rename",
+  description:
+    "Rename a file or folder in place, carrying its sidecars along. Renaming a script also rewrites its exported class name to match, the same as renaming it in the Assets panel does.",
+  params: {
+    path: { type: "string", required: true, description: "Absolute path of the asset to rename." },
+    name: { type: "string", required: true, description: "New filename including extension." },
+  },
+  async run({ path, name }) {
+    const from = insideProject(path, { forWriting: true }).replaceAll("\\", "/");
+    const entry = { path: from, name: from.split("/").pop(), is_dir: false };
+    const { renameEntry } = await import("../../assetOps.js");
+    await renameEntry(entry, name);
+    const to = `${from.slice(0, from.length - entry.name.length)}${name.trim()}`;
+    return { from, to };
+  },
+});
+
+defineOp({
+  name: "asset.move",
+  description: "Move files or folders into another folder in the project, sidecars included.",
+  params: {
+    paths: { type: "array", required: true, description: "Absolute paths to move.", items: { type: "string" } },
+    directory: { type: "string", required: true, description: "Absolute destination folder." },
+  },
+  async run({ paths, directory }) {
+    const dest = insideProject(directory, { forWriting: true });
+    const sources = paths.map((path) => insideProject(path, { forWriting: true }));
+    const { movePathsIntoFolder } = await import("../../assetOps.js");
+    await movePathsIntoFolder(sources, dest);
+    return { moved: sources.map((p) => p.replaceAll("\\", "/")), directory: dest.replaceAll("\\", "/") };
+  },
+});
+
+defineOp({
+  name: "asset.createFolder",
+  description:
+    "Create a folder in the project. Parents are created too, so one call is enough for a nested path.",
+  params: {
+    path: { type: "string", required: true, description: "Absolute path of the folder to create." },
+  },
+  async run({ path }) {
+    const full = insideProject(path, { forWriting: true });
+    await invoke("create_dir", { path: full });
+    await useProjectStore.getState().refresh();
+    return { path: full.replaceAll("\\", "/") };
   },
 });
 

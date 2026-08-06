@@ -1834,14 +1834,26 @@ check("transformedBounds reports what a rotation actually needs", () => {
 
 console.log("\neditor frame pacing");
 
-check("an unfocused viewport is suspended outright, not throttled", () => {
+check("with the toggle on, an unfocused viewport is suspended outright", () => {
   // The complaint this exists for: a heavy scene rendering behind a paint
   // canvas makes the WHOLE editor lag, and it is buying nothing. Throttling was
   // not enough — one 60ms frame still lands in the middle of a brush stroke.
-  assert.equal(shouldSuspendViewport({ focused: false }), true);
+  assert.equal(shouldSuspendViewport({ focused: false, freeze: true }), true);
+  assert.equal(shouldSuspendViewport({ visible: false, freeze: true }), true);
+  assert.equal(shouldSuspendViewport({ visible: false, focused: false, freeze: true }), true);
+  assert.equal(shouldSuspendViewport({ freeze: true }), false, "the focused, visible case renders");
+});
+
+check("freezing is opt-in — the default keeps rendering", () => {
+  // The toolbar snowflake starts off: a viewport that keeps drawing can never
+  // surprise anyone, and pausing is what you reach for once a heavy scene is
+  // visibly costing you.
+  assert.equal(shouldSuspendViewport({ focused: false }), false);
+  assert.equal(shouldSuspendViewport({}), false);
+  // But a viewport with no box on screen stops either way: it cannot be being
+  // watched, whatever the preference says. Leaving the toggle off must not
+  // resurrect a render loop behind a hidden dock tab.
   assert.equal(shouldSuspendViewport({ visible: false }), true);
-  assert.equal(shouldSuspendViewport({ visible: false, focused: false }), true);
-  assert.equal(shouldSuspendViewport({}), false, "the focused, visible case renders");
 });
 
 check("Play is never suspended, focused or not", () => {

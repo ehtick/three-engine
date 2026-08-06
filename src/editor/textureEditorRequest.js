@@ -49,3 +49,23 @@ export function consumePackAtlasRequest() {
   state.pendingPack = null;
   return pending;
 }
+
+/**
+ * "Use this font for the Text tool."
+ *
+ * Latched the same way, for the same reason — the Inspector's font action opens
+ * the Texture Editor and sets the font in one click, and the panel may not
+ * exist yet when it does. Unlike the two above this one is *not* consumed: the
+ * chosen font is a persistent tool setting, and re-reading it on mount is how
+ * the Text tool remembers what you last drew with.
+ */
+export const TEXT_FONT_EVENT = "texture-editor-text-font";
+
+export function setTextToolFont(path) {
+  state.textFont = path ?? "";
+  window.dispatchEvent(new CustomEvent(TEXT_FONT_EVENT, { detail: path ?? "" }));
+}
+
+export function currentTextToolFont() {
+  return state.textFont ?? "";
+}

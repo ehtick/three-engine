@@ -66,6 +66,15 @@ const client = new Client({ name: "mcp-test", version: "1.0.0" }, { capabilities
 await client.connect(transport);
 check("the MCP client completes the handshake", true);
 
+// Orientation is delivered by the protocol itself, before any tool is called.
+// Without it an assistant sees ~95 tool descriptions and knows nothing about
+// where it is — that these drive a live editor with a person watching, that
+// scene files are generated, that undo exists. A tool list cannot say that.
+const instructions = client.getInstructions?.() ?? "";
+check("the server introduces itself in the initialize response", instructions.length > 200, `${instructions.length} chars`);
+check("…saying what the tools actually drive", /live/i.test(instructions) && /editor/i.test(instructions));
+check("…and where to start", /editor_status/.test(instructions));
+
 // --- 1. before any editor connects -------------------------------------------
 
 let listed = await client.listTools();
@@ -160,6 +169,20 @@ const statusOnline = await client.callTool({ name: "editor_status", arguments: {
 const onlineText = statusOnline.content?.[0]?.text ?? "";
 check("editor_status reports connected", /"connected":\s*true/.test(onlineText));
 check("…and reads the scene LIVE rather than from the cached hello", /FakeScene/.test(onlineText), onlineText.slice(0, 120));
+
+// A stale tool list is indistinguishable from a missing feature — it caused an
+// assistant to conclude the texture editor had "no drawing primitives" and work
+// around a tool it simply had not been told about. The count and the per-family
+// breakdown come from what the EDITOR is offering right now, so an assistant
+// that suspects a gap can compare them against the list it is holding.
+const status = JSON.parse(onlineText);
+check("editor_status reports how many tools the editor is really offering", status.toolCount === FAKE_TOOLS.length, `${status.toolCount}`);
+check(
+  "…broken down by family, so a missing one is checkable",
+  status.toolFamilies?.scene === 1 && status.toolFamilies?.entity === 1,
+  JSON.stringify(status.toolFamilies),
+);
+check("…with the reason a list can disagree", /predate the running editor/.test(status.staleListHint ?? ""));
 
 // --- 3. calls ----------------------------------------------------------------
 

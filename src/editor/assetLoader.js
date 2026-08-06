@@ -1,3 +1,5 @@
+import { vmSingleton } from "./singleton.js";
+
 const MIME_BY_EXT = {
   glb: "model/gltf-binary",
   gltf: "model/gltf+json",
@@ -33,7 +35,18 @@ export const ATLAS_EXTENSIONS = ["atlas"];
 // `.audio` is the JSON sidecar; the others are raw audio files the engine
 // can decode straight away. AssetField filters both sidecars and raw files
 // in one picker.
-export const AUDIO_EXTENSIONS = ["audio", "ogg", "wav", "mp3"];
+//
+// The list is exactly what `decodeAudioData` handles in the browsers the engine
+// targets — nothing is listed that would import cleanly and then fail to play.
+// `flac` because Wikimedia Commons ships most field recordings that way;
+// `m4a`/`opus`/`oga` because the Internet Archive does. Lossless is a poor
+// choice to *ship* (5-10x an ogg), which is the Audio Editor's problem to flag,
+// not the loader's.
+export const AUDIO_EXTENSIONS = ["audio", "ogg", "oga", "wav", "mp3", "flac", "m4a", "opus"];
+// Font files, used by UI Text and the Texture Editor's Text tool. Registered
+// with the platform as generated `FontFace`s rather than by their declared
+// family — see src/engine/ui/fontAsset.js for why.
+export const FONT_EXTENSIONS = ["ttf", "otf", "woff", "woff2"];
 
 /** TypeScript declaration files (`.d.ts` / `.d.mts` / `.d.cts`) are never
  *  runtime scripts — they're ambient type-only declarations the editor
@@ -127,6 +140,9 @@ export const withoutSidecars = (entries) =>
       // to (see textureFile.js). Like `.meta`, it is an implementation detail
       // of an asset the user already sees, not an asset of its own.
       !entry.name.endsWith(".tex") &&
+      // The audio editor's track stack, stored beside the sound it belongs to
+      // (see audioFile.js). Same rationale as `.tex`.
+      !entry.name.endsWith(".aud") &&
       !entry.name.endsWith(".sdf"),
   );
 
@@ -175,13 +191,31 @@ export async function transpileScript(code) {
   return result.code;
 }
 
-const blobUrlCache = new Map(); // path -> object URL
-
-// Downstream caches that also key on asset path — currently the engine's
-// decoded-geometry cache. Registered by engineInstance.js rather than imported
-// here on purpose: this module is pulled in by lightweight editor code (the
-// Assets panel, asset flags) and must NOT drag `three/webgpu` in behind it.
-const invalidationListeners = new Set();
+/**
+ * path -> object URL, and the set of things to tell when one is dropped.
+ *
+ * Both are VM-wide, not module-scope, and that is load-bearing rather than
+ * tidiness. A second evaluation of this module (Vite's `?t=` twin, an HMR
+ * update) used to get its OWN cache and its OWN listener set, which breaks the
+ * live-update path in both directions: `invalidateBlobUrl` called on copy A
+ * never reaches the geometry cache, the Assets-panel thumbnails or the frame
+ * pacer, all of which subscribed through copy B; and the stale URL stays in
+ * copy B's map, so the engine keeps resolving the OLD bytes. The symptom is
+ * exactly the one this whole class of bug produces — the file on disk is
+ * correct, so a restart looks like the fix.
+ */
+const cache = vmSingleton("assetLoaderCache", () => ({
+  /** @type {Map<string, string>} path -> object URL */
+  blobUrls: new Map(),
+  // Downstream caches that also key on asset path — the engine's decoded-geometry
+  // cache, the Assets panel, the frame pacer. Registered by their owners rather
+  // than imported here on purpose: this module is pulled in by lightweight editor
+  // code (the Assets panel, asset flags) and must NOT drag `three/webgpu` behind it.
+  /** @type {Set<(path: string) => void>} */
+  listeners: new Set(),
+}));
+const blobUrlCache = cache.blobUrls;
+const invalidationListeners = cache.listeners;
 
 /** Subscribes `fn(path)` to every in-place asset overwrite. Returns an unsubscribe. */
 export function onAssetInvalidated(fn) {
@@ -305,7 +339,10 @@ export async function readSceneJson(path) {
   return JSON.parse(await invoke("load_scene", { path: full }));
 }
 
-const scriptModuleCache = new Map(); // path -> { version, default }
+/** path -> { version, default }. VM-wide for the same reason as the blob cache
+ *  above: a duplicated module with its own cache re-imports every script on the
+ *  next hot-reload poll, resetting each script's module state. */
+const scriptModuleCache = vmSingleton("scriptModuleCache", () => new Map());
 
 /** Cheap sniff: HTML / XML payloads can land in script slots when a project
  *  file with the wrong extension is dropped onto a script entity. esbuild
