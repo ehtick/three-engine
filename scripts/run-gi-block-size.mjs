@@ -147,7 +147,21 @@ const SPIN = !Number.isFinite(SPIN_RAW) ? 0 : SPIN_RAW === 1 ? SPIN_DEFAULT : SP
 // A spinning panel that is NOT on the exact-mover path re-voxelizes every frame,
 // so the difference between two frames would be the voxelizer's own churn rather
 // than the mover's. Force it rather than measure the wrong thing quietly.
-const MOVER = process.env.MOVER === "1" || SPIN !== 0;
+// DRIFT — a TRANSLATING mover, which SPIN cannot produce and which is a
+// different regime, not a variation. A yaw keeps the object's AABB
+// near-stationary, so dynamicObjects' translation-scaled history cut stays at
+// retain ~1 and the probe lattice sees a slowly-changing occluder. A TRANSLATION
+// sweeps new cells every frame, cuts field history to 0.35, and — the part that
+// matters for flicker — makes the probe EMA's `boost` term pin to 1 at every
+// probe the object passes, which at probeSmoothing 1 disables probe integration
+// exactly where the object is (see cascadeGather's snap-arm ceiling note).
+//
+// The motion is the user's own repro: "moving the sphere by Y and Z in a circle
+// (sin)". DRIFT is the orbit RADIUS in metres; DRIFT_DEG is how far around that
+// circle each captured frame advances.
+const DRIFT = Number(process.env.DRIFT ?? 0) || 0;
+const DRIFT_DEG = Number(process.env.DRIFT_DEG ?? 25) || 25;
+const MOVER = process.env.MOVER === "1" || SPIN !== 0 || DRIFT !== 0;
 const FRAMES = Number(process.env.FRAMES ?? 3);
 const SETTLE = Number(process.env.SETTLE ?? 12000);
 const SHOT = process.env.SHOT ?? ".gi-shots/block-size";
@@ -872,6 +886,32 @@ async function setPanelYawDeg(deg) {
   });
 }
 
+/**
+ * Absolute orbit position for frame `i` — a circle in the Y/Z plane of radius
+ * DRIFT, centred so that frame 0 sits exactly on the authored pose (offset
+ * starts at zero). Same ABSOLUTE-not-incremental discipline as the yaw above:
+ * setTransform goes through the command bus, so accumulating from a read-back
+ * transform would drift.
+ *
+ * Y AND Z, matching the report. Y alone would change only the object's height
+ * above the floor patch (a smooth falloff); Z alone would slide it along. The
+ * circle does both, so the patch sees the occluder approach, pass and recede
+ * while its distance to the floor also varies — which is what makes every probe
+ * near the path register a large per-frame delta.
+ */
+const panelBasePos = panel.transform?.position ?? [0, 0, 0];
+async function setPanelOrbit(i) {
+  const phi = (i * DRIFT_DEG * Math.PI) / 180;
+  await must("entity.setTransform", {
+    id: panel.id,
+    position: [
+      panelBasePos[0],
+      panelBasePos[1] + DRIFT * Math.sin(phi),
+      panelBasePos[2] + DRIFT * (Math.cos(phi) - 1),
+    ],
+  });
+}
+
 // ---- albedo mode needs the sun on --------------------------------------------
 if (MODE === "albedo") {
   await must("component.setProp", { id: panel.id, type: "mesh", key: "material", value: `${GEN_ROOT}/materials/PanelGreen.mat` });
@@ -1026,6 +1066,10 @@ for (const arm of arms) {
   // Back to yaw 0 BEFORE the settle, so the arm settles on the pose frame 0 is
   // shot at and the block-size/differential columns stay comparable across arms.
   if (SPIN) await setPanelYawDeg(0);
+  // Same reason as the yaw reset: settle on the pose frame 0 is shot at, so the
+  // still columns stay comparable across arms and only the flicker columns
+  // carry the motion.
+  if (DRIFT) await setPanelOrbit(0);
   await wait(SETTLE);
   const state = await builtState();
   const shots = [];
@@ -1041,6 +1085,7 @@ for (const arm of arms) {
     // re-adopt, re-trace and settle before the shutter opens.
     if (f > 0) {
       if (SPIN) await setPanelYawDeg(f * SPIN_STEP_DEG);
+      if (DRIFT) await setPanelOrbit(f);
       await wait(FRAME_GAP);
     }
     const cap = await shootChecked(f === 0 ? tag : `${tag}-f${f}`);

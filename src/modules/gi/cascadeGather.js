@@ -438,7 +438,42 @@ export function createProbeIrradiance(cascades, options = {}) {
       //     0.25 regardless of `boost`: the per-probe threshold is gone but the
       //     ~4-frame lag is kept. That is the arm for "is the artifact the
       //     THRESHOLD or the LAG".
-      const adaptive = mix(noiseFloor, float(probeSnapAlpha).max(base), boost);
+      // ── THE SNAP ARM HAS NO CEILING, AND A MOVER LIVES IN IT ──────────────
+      // `boost` asks "did this probe change a lot?" and treats yes as "signal,
+      // show it now". For a light switching on that is right. For an OBJECT
+      // MOVING THROUGH THE SCENE it is exactly wrong, because a mover makes
+      // every frame a large change at precisely the probes it affects — so
+      // `boost` pins to 1 there, and at the user's probeSmoothing = 1 the snap
+      // arm `max(probeSnapAlpha, base)` is also 1. alpha = 1 means
+      // `value = irradiance`: the probe displays ONE UNINTEGRATED SAMPLE, every
+      // frame, for as long as the object keeps moving.
+      //
+      // That sample is not clean. At c0DirRes 4 the gather integrates 16
+      // point-sampled directions whose angular footprint is 2.9-5.4x the voxel
+      // size (see run-gi-gather-invariance-test's ladder), so a single frame's
+      // probe estimate carries real variance. Snapping to it is what the user
+      // sees as "light just jumps around, light around randomly blinks" while a
+      // sphere orbits — reported since the beginning and never fixed, because
+      // the snap is DELIBERATE and reads as a feature everywhere it is
+      // documented ("nothing the eye should follow is slowed").
+      //
+      // The missing distinction is between RESPONSIVENESS and INTEGRATION. A
+      // mover's signal changes smoothly frame to frame; its noise does not. Two
+      // or three frames of EMA remove most of the variance and cost ~35ms of
+      // lag at 60fps, which no eye tracks. So the snap arm gets a ceiling: fast,
+      // never instant. The noise-band arm below 15% is untouched, and the
+      // first-write path (prev.w ~ 0) still takes alpha 1 outright.
+      //
+      // DEFAULT 1 = INERT, deliberately. This ships as a measurable knob and not
+      // as a behaviour change: today's graph is byte-for-byte unchanged until
+      // `__giProbeMaxAlpha` is set. Flip the default only on a flicker
+      // measurement that survives a repeat-run control.
+      const rawMaxAlpha = Number(globalThis.__giProbeMaxAlpha);
+      const maxAlpha = Number.isFinite(rawMaxAlpha) ? Math.min(1, Math.max(0.02, rawMaxAlpha)) : 1;
+      const snapArm = maxAlpha >= 1
+        ? float(probeSnapAlpha).max(base)
+        : float(probeSnapAlpha).max(base).min(maxAlpha);
+      const adaptive = mix(noiseFloor, snapArm, boost);
       // prev.w == 0 ⇒ this slot has never been written (fresh build/refit):
       // take the integral outright rather than lerping up from black.
       const alpha = select(prev.w.lessThan(1e-3), float(1), adaptive);
