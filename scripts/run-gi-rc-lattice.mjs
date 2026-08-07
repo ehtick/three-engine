@@ -74,8 +74,16 @@ const flags = {
   __giNoPlaneCut: !!process.env.NOPLANE,
   __giNoAngleCut: !!process.env.NOANGLE,
   __giHardMergeVis: !!process.env.HARDMERGE,
-  __giMergeVisTol: process.env.MERGETOL ? Number(process.env.MERGETOL) : 0,
 };
+// MERGETOL is set as a KEY ONLY WHEN GIVEN. It used to be
+// `MERGETOL ? Number(MERGETOL) : 0`, i.e. a literal 0 on every unset run, which
+// was harmless only because cascadeMerge.js read the hatch as
+// `Number(x) || DEFAULT` and swallowed the falsy zero. That read became
+// `Number.isFinite` on 2026-08-07 (0 is a meaningful ablation — the hard cut),
+// so the old line would now silently run this harness at tolerance 0 and report
+// it as the default arm. Absent key = module default; the same rule applies to
+// any hatch here whose 0 means something.
+if (process.env.MERGETOL) flags.__giMergeVisTol = Number(process.env.MERGETOL);
 
 const browser = await puppeteer.launch({
   executablePath: "C:/Program Files/Google/Chrome/Application/chrome.exe",

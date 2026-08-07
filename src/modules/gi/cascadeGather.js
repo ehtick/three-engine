@@ -173,11 +173,56 @@ export function createProbeIrradiance(cascades, options = {}) {
       // actually moved) keep the user's alpha — instant at 1. Nothing the
       // eye should follow is slowed; only sub-threshold oscillation is
       // refused. `__giProbeNoise = 0` restores the raw passthrough (A/B).
+      //
+      // ── THE HATCH THIS COMMENT PROMISED DID NOT EXIST UNTIL 2026-08-07 ─────
+      // `probeNoiseAlpha` was a bare `uniform(0.25)` that NOTHING ever wrote:
+      // GISystem's per-tick hatch block writes `probeSnapAlpha` and
+      // `depthMomentsAlpha` from `__giProbeSnap`/`__giDepthAlpha` and skips this
+      // one, so `__giProbeNoise` was named in two comments (here and at the
+      // export below) and read nowhere. Every "I set __giProbeNoise=0 and saw no
+      // difference" was that, not a null result. Read it HERE, at the point of
+      // use, BUILD-TIME (like `__giNoChebyshev`/`__giNoPlaneCut` below): unset →
+      // the live uniform, byte-for-byte today's graph; set → a literal.
+      //
+      // `Number.isFinite`, NOT `Number(x) || 0.25`: **0 is the whole point of
+      // this hatch** (raw passthrough), and `||` would swallow it back to 0.25.
+      // Same family as `__giBilateralWorldEps` in giLight.js.
+      const rawProbeNoise = Number(globalThis.__giProbeNoise);
+      // A factory, not one shared node: this reproduces the two independent
+      // `float(probeNoiseAlpha)` expressions the unset path used to emit,
+      // node-for-node, so "unset = today's graph" needs no argument about TSL
+      // node reuse.
+      const noiseAlpha = () =>
+        (Number.isFinite(rawProbeNoise) ? float(rawProbeNoise) : float(probeNoiseAlpha));
       const noiseFloor = select(
-        float(probeNoiseAlpha).greaterThan(1e-3),
-        base.min(float(probeNoiseAlpha)),
+        noiseAlpha().greaterThan(1e-3),
+        base.min(noiseAlpha()),
         base,
       );
+      // `probeSnapAlpha` IS live-hatched — GISystem writes
+      // `probeSnapAlpha.value = __giProbeSnap ?? 0.35` every tick and this is
+      // the expression that consumes it — but READ THE `max` BEFORE TRUSTING IT:
+      //
+      //   **`__giProbeSnap` IS INERT WHENEVER `probeSmoothing >= probeSnapAlpha`.**
+      //
+      // `max(probeSnapAlpha, base)` takes `base` in that case and the snap value
+      // never appears. The user's own scene (and this module's block rig) run
+      // probeSmoothing = 1, i.e. base = 1, so `__giProbeSnap` — including
+      // `__giProbeSnap = 0`, documented below as "disables adaptivity" — changes
+      // NOTHING there: the mix is already between `noiseFloor` and 1. That cost
+      // a whole measurement run. At probeSmoothing 1 the only knob that moves
+      // this expression is `__giProbeNoise` above.
+      //
+      // Two ways to flatten the mix to a constant, and they are NOT the same:
+      //   · `__giProbeNoise = 0` at probeSmoothing 1 → noiseFloor = base = 1 and
+      //     max(snap, 1) = 1, so adaptive ≡ 1: no probe EMA at all, no lag, no
+      //     per-probe threshold. This is what "probeSmoothing 1 = no probe EMA"
+      //     was always assumed to mean.
+      //   · probeSmoothing = 0.25 with `__giProbeSnap = 0.25` → noiseFloor =
+      //     min(0.25, 0.25) and max(0.25, 0.25) both equal 0.25, so adaptive ≡
+      //     0.25 regardless of `boost`: the per-probe threshold is gone but the
+      //     ~4-frame lag is kept. That is the arm for "is the artifact the
+      //     THRESHOLD or the LAG".
       const adaptive = mix(noiseFloor, float(probeSnapAlpha).max(base), boost);
       // prev.w == 0 ⇒ this slot has never been written (fresh build/refit):
       // take the integral outright rather than lerping up from black.
@@ -274,6 +319,12 @@ export const gatherBias = uniform(0.5);
  * per-frame blend a probe ramps TOWARD when its irradiance changes a lot in
  * one frame. 0.35 ≈ converged in ~4 frames. Live via `__giProbeSnap`
  * (0 disables adaptivity — the EMA becomes the old fixed-alpha one).
+ *
+ * CAVEAT, measured the hard way: the use site takes
+ * `max(probeSnapAlpha, probeSmoothing)`, so this uniform is INERT whenever
+ * `probeSmoothing >= probeSnapAlpha` — at probeSmoothing 1 (the block rig's and
+ * the user's scene's value) `__giProbeSnap` does nothing at all, including
+ * `__giProbeSnap = 0`. See the long note at the use site.
  */
 export const probeSnapAlpha = uniform(0.35);
 
@@ -281,8 +332,14 @@ export const probeSnapAlpha = uniform(0.35);
  * NOISE-BAND alpha ceiling for the probe EMA (see the noiseFloor note in
  * createProbeIrradiance): sub-15%-relative irradiance wiggles integrate at
  * most this fast even when Light Smoothing is off. ~0.25 ≈ 4-frame ramp —
- * kills pop-and-return churn, invisible as lag. Live via `__giProbeNoise`
- * (0 disables — raw passthrough, the flicker A/B arm).
+ * kills pop-and-return churn, invisible as lag.
+ *
+ * `__giProbeNoise` (default 0.25 = this uniform's value; 0 disables — raw
+ * passthrough, the flicker A/B arm) is read BUILD-TIME at the use site, NOT
+ * copied into this uniform per tick the way GISystem copies `__giProbeSnap` into
+ * `probeSnapAlpha`. Nothing writes this uniform, so its value is always 0.25 and
+ * the hatch bypasses it entirely — set the global and force a rebuild (the
+ * ABLATE voxelSize nudge in scripts/run-gi-block-size.mjs) for it to land.
  */
 export const probeNoiseAlpha = uniform(0.25);
 
@@ -333,7 +390,36 @@ export function createIrradianceGather(cascades, probeIrradiance = null, fieldCe
   const traceQuantization = occupancyVoxel
     ? vec3(occupancyVoxel).x.max(vec3(occupancyVoxel).y).max(vec3(occupancyVoxel).z).min(quantization)
     : quantization;
-  const visTolerance = traceQuantization.mul(1.75);
+  // ── ONE CONTRACT, TWO HALVES — AND ONLY THE OTHER HALF HAD A HATCH ────────
+  //
+  // 1.75 trace-quantizations is the SAME number as `DEFAULT_MERGE_VIS_TOLERANCE`
+  // in cascadeMerge.js, and that is not a coincidence: both fade a probe out
+  // over [tol, 2·tol] of blocker penetration, both are sized off the same
+  // `traceQuantization` (the occupancy voxel, `min`-ed with the field cell), and
+  // both exist for the same reason — a hard cut on a twice-quantized hit
+  // distance produced the dotted-lattice artifact. The merge cuts a PARENT probe
+  // out of a child's trilinear blend; this one cuts a CAGE probe out of a
+  // receiver's gather. The same physical blocker is judged by both, one level
+  // apart.
+  //
+  // So a tolerance change applied to one side is HALF APPLIED. The merge side
+  // got `__giMergeVisTol` (cascadeMerge.js — DEFAULT_MERGE_VIS_TOLERANCE) and
+  // this side stayed a bare literal, which means every merge-tolerance sweep
+  // ever run moved one half of the contract while the other stayed at 1.75, and
+  // the two halves can disagree about the same wall. Sweep BOTH, or say in the
+  // result that you swept one.
+  //
+  // `__giGatherVisTol`, default 1.75 = today's literal exactly. BUILD-TIME (the
+  // node graph bakes it), so an A/B has to force a rebuild — the voxelSize nudge
+  // in scripts/run-gi-block-size.mjs's ABLATE path.
+  //
+  // `Number.isFinite`, not `Number(x) || 1.75`: **0 is a meaningful setting** —
+  // it collapses the smoothstep to a step at the exact hit distance, i.e. the
+  // hard binary cut this soft fade replaced, which is the ablation arm. `||`
+  // would silently hand back 1.75 and report the default as the ablation.
+  const rawGatherVisTol = Number(globalThis.__giGatherVisTol);
+  const GATHER_VIS_TOLERANCE = Number.isFinite(rawGatherVisTol) ? rawGatherVisTol : 1.75;
+  const visTolerance = traceQuantization.mul(GATHER_VIS_TOLERANCE);
   // GEOMETRY SCALE vs PROBE SCALE — the distinction the leak turned on.
   //
   // "How far behind my surface's plane can a probe sit and still be on MY side

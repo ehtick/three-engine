@@ -114,6 +114,16 @@
 //   SHOT=<dir>         dump the frames it samples, AND `{SHOT}/bleed.json`
 //                      with every number below in machine-readable form
 //   HEADED=1
+//   RESHOOTS=3         re-shoots allowed before an arm is FAILED (see CAPTURE
+//   RESHOOT_WAIT=6000  HEALTH, below the exposure bracket)
+//   GAIN_TOL=2         how far the measured exposure ratio may sit from the
+//                      asked one before the stitch is called fiction
+//
+// EXIT CODE: 0 only if every requested arm produced a usable capture. An arm
+// whose frames came back black, whose two bracket exposures disagree, or that
+// has no usable fit sample at all is FAILED — `exponent: null` + `error` in
+// bleed.json, a FAILED line in the summary, and exit 1. This rig never prints a
+// number that cannot be told apart from a real measurement.
 import path from "node:path";
 import { mkdir, writeFile } from "node:fs/promises";
 import puppeteer from "puppeteer-core";
@@ -213,6 +223,18 @@ const GLOBALS = (process.env.GLOBALS ?? "").split(",").map((s) => s.trim()).filt
 await page.evaluateOnNewDocument((project, hatch, globals) => {
   localStorage.setItem("engine.projectRoot.v1", project);
   localStorage.setItem("engine.recentProjects.v1", JSON.stringify([project]));
+  // THE HARNESS PACING HATCH. The editor stops the whole engine loop when the
+  // viewport is unfocused (src/editor/editorFramePacing.js:178-192) — in
+  // headless NOTHING is ever focused, so without this a probe reads a sleeping
+  // engine. Ten other probes in scripts/ set it; this one did not, and that is
+  // worse here than anywhere else: a sleeping or half-woken engine does not
+  // fail loudly on this rig, it hands back a stale or black frame that the
+  // exposure bracket and the log-log fit turn into a PLAUSIBLE WRONG EXPONENT,
+  // which then lands on the ladder in this file's header as if it were real.
+  // Set in evaluateOnNewDocument, next to GLOBALS/HATCH, because it has to be
+  // true before any module runs — the pacing installer reads it on its first
+  // apply(), which happens during boot.
+  globalThis.__editorKeepRendering = true;
   for (const h of hatch) globalThis[h] = true;
   for (const g of globals) {
     const [k, v] = g.split("=");
@@ -397,12 +419,96 @@ const setExposure = async (v) => {
   await wait(3500);
 };
 
-for (const arm of ARMS) {
-  if (!MATS[arm]) continue;
-  await must("component.setProp", { id: panel.id, type: "mesh", key: "material", value: MATS[arm] });
-  // The emissive change has to reach the field: material swap → re-bake of the
-  // cell radiance → feedback → probes. Generous, this is not a timing test.
-  await wait(12000);
+// IS THIS ARM'S EXPONENT A MEASUREMENT OR IS IT NOISE?
+//
+// (Defined HERE, above the capture loop, rather than down beside the report
+// where it used to live: CAPTURE HEALTH needs it. An arm with zero usable fit
+// samples is not a noisy exponent, it is NO exponent, and that has to be caught
+// before it becomes a printed number.)
+//
+// The tell, learned from the red arm on 2026-08-07: its series flatlines at
+// ~0.00006 from ~8m out and then hits exact 0/1 — the exposure bracket
+// bottoming out, not light. A log-log fit over repeated quantisation-floor
+// values has no slope to find, and red consequently swung -1.09/-1.16/-1.38/
+// -1.73 across four estimator arms while white stayed stable and correctly
+// ordered. That is an instrument artifact, and without a flag it reads exactly
+// like a colour-dependent transport bug.
+//
+// So count, over the SAME window the fit uses, the three ways the bracket
+// fails: samples it could not place at any exposure (`none`), samples railed
+// at the very bottom or the clip, and REPEATS — distinct values below the
+// sample count means consecutive distances landed on one 8-bit code, which is
+// the flatline itself. Cheap (one pass over ~35 samples), and it turns "why do
+// the arms disagree" into a printed reason.
+const bracketHealth = (samples) => {
+  let inWindow = 0, none = 0, railed = 0, used = 0;
+  const seen = new Set();
+  let minUsed = Infinity;
+  for (let i = 0; i < DISTANCES.length; i++) {
+    if (DISTANCES[i] < FIT_LO || DISTANCES[i] > FIT_HI) continue;
+    inWindow++;
+    const s = samples[i];
+    const lum = s?.lum ?? 0;
+    if (s?.from === "none") { none++; continue; }      // fit skips these
+    if (!(lum > 1e-6)) { railed++; continue; }         // fit skips these too
+    if (lum >= 1) { railed++; continue; }              // clipped white
+    used++;
+    minUsed = Math.min(minUsed, lum);
+    seen.add(lum.toPrecision(6));
+  }
+  const repeats = Math.max(0, used - seen.size);
+  return {
+    inWindow, used, none, railed, repeats,
+    distinct: seen.size,
+    minLum: Number.isFinite(minUsed) ? minUsed : 0,
+    // Any of the three, and the exponent is a fit to the instrument's floor as
+    // much as to the scene. `repeats` is the softest of them, so allow one.
+    suspect: none > 0 || railed > 0 || repeats > 1,
+  };
+};
+
+// ---- CAPTURE HEALTH --------------------------------------------------------
+// A SCREENSHOT THAT COMES BACK BLACK IS NOT A MEASUREMENT — and on THIS rig a
+// dark or half-dark frame does not present as an obvious zero. It presents as a
+// PLAUSIBLE WRONG EXPONENT, because the log-log fit runs over whatever samples
+// the exposure bracket managed to place, and that number then lands on the
+// ladder in this file's header as though it were real. (2026-08-07: the sibling
+// run-gi-block-size.mjs was caught reporting `modulation x 0.00% level 0.0000`
+// off a silently-black arm sitting between two healthy 9.39% / level 0.2345
+// neighbours — with a healthy `[gi] built …` line on the black arm. Build fine,
+// CAPTURE black. It printed as an extraordinarily good result rather than as a
+// failure.)
+//
+// So every arm's two bracket frames are interrogated BEFORE they become
+// numbers, on three questions:
+//
+//   1. IS THERE ANY LIGHT AT ALL? The brightest of the sampled floor points, at
+//      BOTH exposures, at or under the in-range floor means the profile is
+//      entirely at/near zero. This is the exact mirror of the `CONTROL — GI
+//      off … (black, good)` check above: black is the PASS there, the FAIL
+//      here, and the rig already knows how to assert on frame content.
+//   2. DID BOTH FRAMES SEE THE SAME SCENE? The bracket already measures the
+//      ratio between its two exposures. If that ratio is off the asked gain by
+//      more than GAIN_TOL — or if the two frames share no in-range sample at
+//      all to measure it from — one of them did not update, and the stitch is
+//      fiction rather than merely non-linear. (`spread` stays a warning: a
+//      non-linear knob is a real frame, just an imperfect one.)
+//   3. IS THERE AN EXPONENT TO FIT? ZERO usable samples in the fit window is
+//      not a noisy exponent — `bracket.suspect` covers noisy, and stays a
+//      warning — it is no exponent at all.
+//
+// Any of those and the arm is re-shot, up to RESHOOTS times; if it never comes
+// good the arm is FAILED — `exponent: null` plus an `error` in bleed.json, an
+// explicit FAILED line in the summary, and a non-zero exit. Never emit a number
+// that cannot be told apart from a real measurement.
+const RESHOOTS = Number(process.env.RESHOOTS ?? 3);
+const RESHOOT_WAIT = Number(process.env.RESHOOT_WAIT ?? 6000);
+const GAIN_TOL = Number(process.env.GAIN_TOL ?? 2);
+/** @type {Record<string, { error: string, attempts: number, detail: Record<string, number>, samples: any[] }>} */
+const armFailed = {};
+
+/** One full exposure bracket for one arm: both frames, the stitch, its health. */
+const captureArm = async (arm) => {
   await setExposure(1);
   const low = await shoot(`${arm}-e1`);
   await setExposure(HIGH_EXPOSURE);
@@ -417,11 +523,7 @@ for (const arm of ARMS) {
   ratios.sort((a, b) => a - b);
   const gain = ratios.length ? ratios[Math.floor(ratios.length / 2)] : HIGH_EXPOSURE;
   const spread = ratios.length > 1 ? ratios[ratios.length - 1] / ratios[0] : NaN;
-  console.log(
-    `  arm ${arm}: exposure gain measured ${gain.toFixed(2)} (asked ${HIGH_EXPOSURE}, ${ratios.length} overlapping samples, spread ${Number.isFinite(spread) ? spread.toFixed(2) : "-"}x)` +
-    `${Number.isFinite(spread) && spread > 1.35 ? "  !! not linear — stitch unreliable" : ""}`,
-  );
-  results[arm] = DISTANCES.map((_, i) => {
+  const stitched = DISTANCES.map((_, i) => {
     const l = low[i], h = high[i];
     const lowOk = (l?.lum ?? 0) > IN_RANGE_LO && (l?.lum ?? 1) < IN_RANGE_HI;
     if (lowOk) return { ...l, from: "low" };
@@ -429,6 +531,84 @@ for (const arm of ARMS) {
     if (highOk) return { r: h.r / gain, g: h.g / gain, b: h.b / gain, lum: h.lum / gain, sat: h.sat, from: "high" };
     return { ...(l ?? { r: 0, g: 0, b: 0, lum: 0, sat: 0 }), from: "none" };
   });
+  const lowMax = low.reduce((m, s) => Math.max(m, s?.lum ?? 0), 0);
+  const highMax = high.reduce((m, s) => Math.max(m, s?.lum ?? 0), 0);
+  const health = bracketHealth(stitched);
+  /** @type {string[]} */
+  const problems = [];
+  if (Math.max(lowMax, highMax) <= IN_RANGE_LO) {
+    problems.push(
+      `BLACK FRAME — brightest of ${DISTANCES.length} floor samples is ${Math.max(lowMax, highMax).toExponential(2)} at BOTH exposures (in-range floor ${IN_RANGE_LO})`,
+    );
+  }
+  if (!ratios.length) {
+    problems.push("the two bracket exposures share NO in-range sample — the stitch cannot be validated at all, one frame did not update");
+  } else if (!(gain <= HIGH_EXPOSURE * GAIN_TOL && gain >= HIGH_EXPOSURE / GAIN_TOL)) {
+    problems.push(
+      `exposure gain ${gain.toFixed(2)} is more than ${GAIN_TOL}x off the asked ${HIGH_EXPOSURE} — these two frames are not one scene at two exposures`,
+    );
+  }
+  if (health.used === 0) {
+    problems.push(
+      `ZERO usable fit samples in ${FIT_LO}–${FIT_HI}m (${health.none} unplaceable at any exposure, ${health.railed} railed at the floor/clip) — there is no exponent to fit`,
+    );
+  }
+  return { gain, spread, overlap: ratios.length, stitched, lowMax, highMax, health, problems };
+};
+
+for (const arm of ARMS) {
+  if (!MATS[arm]) continue;
+  await must("component.setProp", { id: panel.id, type: "mesh", key: "material", value: MATS[arm] });
+  // The emissive change has to reach the field: material swap → re-bake of the
+  // cell radiance → feedback → probes. Generous, this is not a timing test.
+  await wait(12000);
+
+  let take = null;
+  const attempts = Math.max(1, RESHOOTS + 1);
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      take = await captureArm(arm);
+    } catch (err) {
+      // A screenshot op that THROWS is exactly as unusable as one that comes
+      // back black — and it used to take the whole run down with it, browser
+      // and all. Same treatment: re-shoot, then FAIL the arm.
+      take = {
+        gain: NaN, spread: NaN, overlap: 0, stitched: [], lowMax: 0, highMax: 0,
+        health: { inWindow: 0, used: 0, none: 0, railed: 0, repeats: 0, distinct: 0, minLum: 0, suspect: true },
+        problems: [`capture threw — ${err?.message ?? String(err)}`],
+      };
+    }
+    console.log(
+      `  arm ${arm}${attempt > 1 ? ` [re-shoot ${attempt - 1}/${RESHOOTS}]` : ""}: exposure gain measured ${take.gain.toFixed(2)} (asked ${HIGH_EXPOSURE}, ${take.overlap} overlapping samples, spread ${Number.isFinite(take.spread) ? take.spread.toFixed(2) : "-"}x)` +
+      `${Number.isFinite(take.spread) && take.spread > 1.35 ? "  !! not linear — stitch unreliable" : ""}`,
+    );
+    console.log(
+      `    frame check: brightest sample low ${take.lowMax.toExponential(2)} / high ${take.highMax.toExponential(2)}, ${take.health.used}/${take.health.inWindow} fit samples usable`,
+    );
+    if (!take.problems.length) break;
+    console.log(`    !! CAPTURE UNUSABLE — ${take.problems.join("; ")}`);
+    if (attempt < attempts) {
+      // Re-affirm the pacing hatch before re-shooting: the one thing that
+      // produces a stale or black frame here is an engine that stopped ticking.
+      await page.evaluate(() => { globalThis.__editorKeepRendering = true; });
+      console.log(`    re-shooting in ${RESHOOT_WAIT}ms …`);
+      await wait(RESHOOT_WAIT);
+    }
+  }
+  if (take?.problems.length) {
+    armFailed[arm] = {
+      error: take.problems.join("; "),
+      attempts,
+      detail: {
+        lowMax: take.lowMax, highMax: take.highMax, gain: take.gain, spread: take.spread,
+        overlappingSamples: take.overlap, usableFitSamples: take.health.used, fitWindowSamples: take.health.inWindow,
+      },
+      samples: take.stitched,
+    };
+    console.log(`  !! ARM ${arm} FAILED after ${attempts} capture attempt(s) — NO EXPONENT will be reported for it.`);
+    continue;
+  }
+  results[arm] = take.stitched;
   console.log(`    stitched from: ${results[arm].map((s, i) => `${DISTANCES[i]}:${s.from}`).join(" ")}`);
 }
 
@@ -550,63 +730,46 @@ const fitExponent = (vals, flags = null) => {
 // these same numbers now go three places: the block below, the JSON dump, and
 // the compact summary that is reprinted LAST (see the tail of this file).
 const analyticExp = fitExponent(analytic);
+/** @type {Record<string, ReturnType<typeof bracketHealth>>} */
+const armBracket = {};
+for (const arm of ARMS) if (results[arm]) armBracket[arm] = bracketHealth(results[arm]);
 /** @type {Record<string, number>} */
 const armExp = {};
 for (const arm of ARMS) {
   if (!results[arm]) continue;
-  armExp[arm] = fitExponent(results[arm].map((s) => s?.lum ?? 0), results[arm].map((s) => s?.from));
+  const e = fitExponent(results[arm].map((s) => s?.lum ?? 0), results[arm].map((s) => s?.from));
+  // A fit with fewer than 3 usable points returns NaN — and `JSON.stringify`
+  // writes NaN as `null`, which in bleed.json is indistinguishable from an arm
+  // that was never run. Name it instead: this is a FAILED arm, with a reason.
+  if (!Number.isFinite(e)) {
+    armFailed[arm] = {
+      error: `the far-field fit found fewer than 3 usable samples in ${FIT_LO}–${FIT_HI}m — no exponent exists for this arm`,
+      attempts: RESHOOTS + 1,
+      detail: {
+        usableFitSamples: armBracket[arm]?.used ?? 0,
+        fitWindowSamples: armBracket[arm]?.inWindow ?? 0,
+      },
+      samples: results[arm],
+    };
+    continue;
+  }
+  armExp[arm] = e;
 }
 
-// IS THIS ARM'S EXPONENT A MEASUREMENT OR IS IT NOISE?
-//
-// The tell, learned from the red arm on 2026-08-07: its series flatlines at
-// ~0.00006 from ~8m out and then hits exact 0/1 — the exposure bracket
-// bottoming out, not light. A log-log fit over repeated quantisation-floor
-// values has no slope to find, and red consequently swung -1.09/-1.16/-1.38/
-// -1.73 across four estimator arms while white stayed stable and correctly
-// ordered. That is an instrument artifact, and without a flag it reads exactly
-// like a colour-dependent transport bug.
-//
-// So count, over the SAME window the fit uses, the three ways the bracket
-// fails: samples it could not place at any exposure (`none`), samples railed
-// at the very bottom or the clip, and REPEATS — distinct values below the
-// sample count means consecutive distances landed on one 8-bit code, which is
-// the flatline itself. Cheap (one pass over ~35 samples), and it turns "why do
-// the arms disagree" into a printed reason.
-const bracketHealth = (samples) => {
-  let inWindow = 0, none = 0, railed = 0, used = 0;
-  const seen = new Set();
-  let minUsed = Infinity;
-  for (let i = 0; i < DISTANCES.length; i++) {
-    if (DISTANCES[i] < FIT_LO || DISTANCES[i] > FIT_HI) continue;
-    inWindow++;
-    const s = samples[i];
-    const lum = s?.lum ?? 0;
-    if (s?.from === "none") { none++; continue; }      // fit skips these
-    if (!(lum > 1e-6)) { railed++; continue; }         // fit skips these too
-    if (lum >= 1) { railed++; continue; }              // clipped white
-    used++;
-    minUsed = Math.min(minUsed, lum);
-    seen.add(lum.toPrecision(6));
-  }
-  const repeats = Math.max(0, used - seen.size);
-  return {
-    inWindow, used, none, railed, repeats,
-    distinct: seen.size,
-    minLum: Number.isFinite(minUsed) ? minUsed : 0,
-    // Any of the three, and the exponent is a fit to the instrument's floor as
-    // much as to the scene. `repeats` is the softest of them, so allow one.
-    suspect: none > 0 || railed > 0 || repeats > 1,
-  };
-};
-/** @type {Record<string, ReturnType<typeof bracketHealth>>} */
-const armBracket = {};
-for (const arm of ARMS) if (results[arm]) armBracket[arm] = bracketHealth(results[arm]);
+// `bracketHealth` — "is this arm's exponent a measurement or is it noise?" — is
+// defined ABOVE the capture loop now, because capture health calls it: an arm
+// with ZERO usable fit samples is not a noisy exponent, it is no exponent, and
+// that has to fail before it becomes a number. `armBracket` is likewise
+// computed with `armExp` above, so the fit's own NaN case can cite it.
 console.log(`\n  FAR-FIELD FALLOFF EXPONENT (d ≥ ${(BLEED_RIG.panelH * 1.5).toFixed(1)}m; this geometry → ≈ -3)`);
 console.log(`    analytic ${analyticExp.toFixed(2)}`);
 for (const arm of ARMS) {
   if (!(arm in armExp)) continue;
   console.log(`    ${arm.padEnd(8)} ${armExp[arm].toFixed(2)}`);
+}
+for (const arm of ARMS) {
+  if (!armFailed[arm]) continue;
+  console.log(`    ${arm.padEnd(8)} FAILED — ${armFailed[arm].error}`);
 }
 
 /** @type {{ d: number, red: number, white: number, redOverWhite: number, sat: number }[] | null} */
@@ -649,22 +812,39 @@ await writeFile(
     // Normalised at REF_D — the curve the console table actually compares.
     analyticNorm: analytic.map((a) => a / aRef),
     control: { giOffMaxLum: offMax },
+    // Arms whose CAPTURE failed. Top-level and by name, so a reader (or a
+    // script) sees "this run produced no measurement for white" without having
+    // to notice a null buried in `exponents`.
+    failedArms: ARMS.filter((a) => armFailed[a]),
     // Per-arm samples: the luminance the exponent is fitted to, plus WHICH
     // exposure of the bracket each sample came from ("low"/"high"/"none").
     // A fit that disagrees with a past run is usually a `from` difference.
     arms: Object.fromEntries(
-      ARMS.filter((a) => results[a]).map((a) => [a, {
-        exponent: armExp[a],
-        // `bracket.suspect` true = this arm's exponent is a fit to the
-        // exposure bracket's floor as much as to the scene. Do not compare a
-        // suspect arm against the ladder in this file's header.
-        bracket: armBracket[a],
-        lum: results[a].map((s) => s?.lum ?? 0),
-        from: results[a].map((s) => s?.from ?? "none"),
-        sat: results[a].map((s) => s?.sat ?? 0),
-      }]),
+      ARMS.filter((a) => results[a] || armFailed[a]).map((a) => {
+        const fail = armFailed[a];
+        const samples = results[a] ?? fail?.samples ?? [];
+        return [a, {
+          // A FAILED arm carries `exponent: null` plus an `error`. A number
+          // that cannot be told apart from a real measurement must never
+          // appear here, and a silently absent key reads as "not run".
+          exponent: fail ? null : armExp[a],
+          ...(fail ? { error: fail.error, attempts: fail.attempts, capture: fail.detail } : {}),
+          // `bracket.suspect` true = this arm's exponent is a fit to the
+          // exposure bracket's floor as much as to the scene. Do not compare a
+          // suspect arm against the ladder in this file's header.
+          bracket: armBracket[a] ?? (samples.length ? bracketHealth(samples) : null),
+          lum: samples.map((s) => s?.lum ?? 0),
+          from: samples.map((s) => s?.from ?? "none"),
+          sat: samples.map((s) => s?.sat ?? 0),
+        }];
+      }),
     ),
-    exponents: { analytic: analyticExp, ...armExp },
+    exponents: {
+      analytic: analyticExp,
+      ...armExp,
+      // Explicit nulls last: a failed arm must not inherit a stale number.
+      ...Object.fromEntries(ARMS.filter((a) => armFailed[a]).map((a) => [a, null])),
+    },
     satSeries,
   }, null, 1),
 );
@@ -694,6 +874,20 @@ for (const arm of ARMS) {
         : ""),
   );
 }
+// A FAILED arm is NOT a bad number — it is the ABSENCE of a number, and that
+// distinction is the whole point of the capture check. Printed in the same
+// block as the exponents so a reader scanning the summary cannot miss that an
+// arm is missing, and repeated in bleed.json as `exponent: null` + `error`.
+for (const arm of ARMS) {
+  if (!armFailed[arm]) continue;
+  const f = armFailed[arm];
+  console.log(`  ${arm.padEnd(8)} FAILED — NO MEASUREMENT. ${f.error}`);
+  console.log(
+    `           ${f.attempts} capture attempt(s), none usable.` +
+    ` bleed.json carries exponent: null for this arm. Nothing to place on the ladder — re-run it,` +
+    ` and if it fails again the engine was not rendering (check __editorKeepRendering) or the rig is misconfigured.`,
+  );
+}
 // Measured on THIS rig 2026-08-07 at these defaults, white channel. The
 // 2026-08-04 doc values (naive -1.44 / v1 -2.35 / v2 -2.66) are deliberately
 // NOT here: every arm now reads ~0.7-0.8 flatter and they are not reproducible,
@@ -702,5 +896,15 @@ console.log(`  ladder (2026-08-07, this rig, WHITE arm — red is bracket-limite
 console.log(`    naive -1.09  <  gate-fade -1.39  <  snap -1.88  <=  smooth/shipped -1.94  <  analytic -2.72`);
 console.log(`    Judge a change by where it lands BETWEEN those rungs, re-measured this session — not by its distance from -2.72.`);
 
+// EXIT CODE CARRIES THE VERDICT. A run whose capture failed must not look like
+// a run that succeeded — an automated caller (or a hurried operator reading the
+// tail) has nothing else to go on.
+const failedArms = ARMS.filter((a) => armFailed[a]);
+if (failedArms.length) {
+  console.log(
+    `\n  !! ${failedArms.length} of ${ARMS.length} arm(s) FAILED TO CAPTURE: ${failedArms.join(", ")}.` +
+    ` Exiting 1 — this run produced no usable exponent for them, and no number was emitted in their place.`,
+  );
+}
 await browser.close();
-process.exit(0);
+process.exit(failedArms.length ? 1 : 0);

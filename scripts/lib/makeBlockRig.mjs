@@ -141,6 +141,59 @@ export const BLOCK_RIG = {
 };
 
 /**
+ * WHAT "NO TEMPORAL BLUR" ACTUALLY TAKES — the globals the component props
+ * cannot reach. Injected before any module runs (run-gi-block-size.mjs's
+ * `evaluateOnNewDocument` GLOBALS path) when `QUIET_EMA=1`.
+ *
+ * OPT-IN, NOT THE DEFAULT. The rig's default arm keeps today's behaviour byte
+ * for byte — see the long note on `temporalBlend`/`probeSmoothing` in the scene
+ * above for why the props there do not do what they claimed. A sweep run with
+ * QUIET_EMA is NOT comparable with one run without it; say which you used.
+ *
+ * There are THREE temporal integrators in the chain, not two:
+ *
+ *   __giFieldSmoothing = 0   the per-cell FIELD RADIANCE EMA retain weight
+ *                            (default 0.95, ~20-frame constant, NO component
+ *                            prop — `temporalBlend` is a different uniform).
+ *                            0 = "this frame's value outright", which the
+ *                            module's own comment calls the pre-Phase-1
+ *                            behaviour byte-for-byte.
+ *
+ *   __giProbeNoise     = 0   the PROBE EMA's noise-band alpha ceiling. This is
+ *                            the one that makes `probeSmoothing: 1` a real
+ *                            passthrough: with it at 0 the `select` in
+ *                            createProbeIrradiance takes `base`, so
+ *                            noiseFloor = base = 1 and
+ *                            adaptive = mix(1, max(snap,1), boost) ≡ 1 for
+ *                            EVERY probe at every `boost`. No lag, and — just
+ *                            as important for a lattice measurement — no
+ *                            per-probe 15% threshold deciding which probes lag.
+ *                            (REQUIRES the hatch added to cascadeGather.js on
+ *                            2026-08-07; before that the global was named in
+ *                            two comments and read nowhere.)
+ *
+ *   __giDepthAlpha     = 1   the VISIBILITY integrators — the probe depth
+ *                            moments AND the openness EMA. Both are documented
+ *                            as deliberately INDEPENDENT of probeSmoothing, so
+ *                            they keep integrating however the props are set;
+ *                            1 = this frame only. Included because a rig whose
+ *                            stated goal is "a settled measurement must not
+ *                            depend on how long it settled" cannot leave a
+ *                            third EMA running and call itself quiet.
+ *
+ * NOT the other flattening arm. If what you want is "remove the per-probe
+ * threshold but KEEP the lag" (to separate the two), that is
+ * `probeSmoothing: 0.25` + `__giProbeSnap = 0.25` on the component instead:
+ * noiseFloor = min(0.25, 0.25) and max(0.25, 0.25) both collapse to 0.25, so
+ * `adaptive` is a constant 0.25 regardless of `boost`.
+ */
+export const QUIET_EMA_GLOBALS = Object.freeze({
+  __giFieldSmoothing: 0,
+  __giProbeNoise: 0,
+  __giDepthAlpha: 1,
+});
+
+/**
  * Euler XYZ (radians) whose -Z forward is `dir` — a directional light aims down
  * its ENTITY'S forward (LightComponent parents a target at local (0,0,-1)), so
  * position does not aim it. Same derivation as makeMoverBounceProject's.
@@ -240,9 +293,46 @@ export async function makeBlockRigProject(root, opts = {}) {
             // quantisation step.
             intensity: 3, skyColor: "#ffffff", skyIntensity: 0,
             bounce: 1, bleedSaturation: 1,
-            // temporalBlend 1 = no field EMA, probeSmoothing 1 = no probe EMA:
-            // a settled measurement should not depend on how long it settled,
-            // and a blur in time hides exactly the flicker being characterised.
+            // ── THESE TWO DO NOT DISABLE THE EMAs. THEY NEVER DID. ───────────
+            //
+            // This pair shipped with the comment "temporalBlend 1 = no field
+            // EMA, probeSmoothing 1 = no probe EMA", and BOTH halves are false.
+            // Every measurement this rig has ever produced was taken with two
+            // temporal integrators running, so read its history accordingly.
+            //
+            //  · `temporalBlend` is NOT the field EMA. It is the staging→base
+            //    INGEST lerp (cascadeGather.js, the `blendUniform` at the top of
+            //    the feedback Fn: `alpha = blendUniform` when occupancy did not
+            //    flip, `base = mix(prev, staging, alpha)`). At 1 the CPU bake
+            //    lands outright — correct, and worth keeping — but that is the
+            //    bake-swap ramp, not the radiance history.
+            //    The FIELD EMA is a different uniform entirely:
+            //    `state.fieldSmoothing`, the per-cell radiance RETAIN weight,
+            //    fed from `globalThis.__giFieldSmoothing ?? 0.95` (GISystem
+            //    #applyLiveProps and the build). **It has no component prop at
+            //    all**, so no value of any authored field can reach it, and it
+            //    defaults to 0.95 — a ~20-frame time constant sitting under
+            //    every "settled" number this rig reports.
+            //
+            //  · `probeSmoothing: 1` does NOT make the probe EMA a passthrough.
+            //    The adaptive-hysteresis mix in createProbeIrradiance is
+            //      base      = clamp(probeSmoothing, 0.02, 1)          = 1
+            //      noiseFloor= min(base, probeNoiseAlpha)              = 0.25
+            //      adaptive  = mix(noiseFloor, max(probeSnapAlpha, base), boost)
+            //      boost     = smoothstep(0.15, 0.60, relative frame delta)
+            //    so any probe whose frame-to-frame irradiance moves less than
+            //    15% is pinned at alpha ≤ 0.25 — a ~4-frame ramp — REGARDLESS of
+            //    this prop. Sub-threshold probes lag; above-threshold probes do
+            //    not; which side a probe is on is itself part of the picture.
+            //    (And `__giProbeSnap` cannot undo it: `max(probeSnapAlpha, base)`
+            //    ignores the snap value whenever probeSmoothing ≥ it, which at 1
+            //    is always.)
+            //
+            // KEPT AS THE DEFAULT ANYWAY, deliberately: changing them would
+            // change what every previous run of this rig measured, and the
+            // point of a frozen rig is that its arms stay comparable. The
+            // genuinely-quiet configuration is QUIET_EMA_GLOBALS below, opt-in
+            // via `QUIET_EMA=1` on scripts/run-gi-block-size.mjs.
             temporalBlend: 1, probeSmoothing: 1,
             peakSplit: false,
             // Reflections add a second screen term with its own reconstruction

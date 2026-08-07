@@ -102,12 +102,36 @@ export class GlobalIlluminationComponent extends Component {
     // building-sized scene at every quality tier, not before.
     backend: "occupancy",
     // Stable ray-hit switch. All hybrid phases are implemented (brick-box →
-    // exact-complex); unknown future values fall back to legacy. "auto"
-    // follows the quality preset (low→brick-box, medium→plane, high→
-    // plane-coverage, ultra→exact-complex, custom→plane-coverage) — the
-    // ladder's trade is memory/cost vs hit precision, which is exactly what
-    // the presets already arbitrate. Scenes with an explicit saved mode keep
-    // it.
+    // exact-complex). "auto" follows the quality preset — the ladder's trade is
+    // memory/cost vs hit precision, which is exactly what the presets already
+    // arbitrate. Scenes with an explicit saved mode keep it.
+    //
+    // THE MAPPING, verbatim from rayHit/RayHitConfig.js AUTO_MODE_BY_QUALITY —
+    // it is only TWO modes, not four:
+    //     low    → hybrid-plane
+    //     medium → hybrid-plane
+    //     high   → hybrid-exact-complex
+    //     ultra  → hybrid-exact-complex
+    //     anything else (incl. "custom") → hybrid-exact-complex
+    // The last line is `resolveAutoRayHitMode`'s `?? HybridExactComplex`
+    // fallback, so an unrecognised QUALITY lands on the most precise mode, not
+    // on plane-coverage.
+    //
+    // This comment used to document the commit-b5961d7 ladder — low→brick-box,
+    // medium→plane, high→plane-coverage, ultra→exact-complex,
+    // custom→plane-coverage. Commits 66d7ace and 7c6c605 replaced it: low left
+    // brick-box (box hits quantize every silhouette to whole voxels, and low's
+    // voxels are the biggest) and high was promoted to exact-complex (edge cells
+    // fail the simple-plane fit, so without a triangle pool every rotated
+    // caster's silhouette went back to full-voxel shadows). HybridBrickBox and
+    // HybridPlaneCoverage are still implemented and still selectable BY NAME;
+    // "auto" simply no longer picks either.
+    //
+    // UNKNOWN VALUES ARE NOT "auto" — `normalizeRayHitMode` (RayHitConfig.js)
+    // ends in `?? RayHitMode.OccupancyLegacy`, so a stale or misspelled saved
+    // mode string resolves to LEGACY, deliberately, so an experimental mode can
+    // never silently turn GI off. Only the literal string "auto" reaches the
+    // preset ladder above.
     rayHitMode: "auto",
     rayHitProfiling: false,
     // Phase-5 A/B kill switch for the hybrid traces' coarse pyramid ride.

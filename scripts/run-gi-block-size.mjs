@@ -35,10 +35,19 @@
 //
 // FLICKER COMES FREE. Three frames of an identical settled scene, differenced:
 // the RMS is how much it flickers and the ACF of the difference is the size of
-// what flickers. With the field EMA and the probe EMA both off (rig sets
-// temporalBlend 1, probeSmoothing 1) a settled static scene should be
-// deterministic — anything left is the sampling cadence (traceParity /
-// feedbackParity / the checker), which is the "dithered" half of the report.
+// what flickers. A settled static scene should be deterministic — anything left
+// is the sampling cadence (traceParity / feedbackParity / the checker), which is
+// the "dithered" half of the report.
+//
+// CORRECTION, 2026-08-07 — this used to read "with the field EMA and the probe
+// EMA both off (rig sets temporalBlend 1, probeSmoothing 1)". BOTH CLAIMS WERE
+// FALSE and every number this rig has printed was taken with the EMAs running:
+// `temporalBlend` is the staging→base ingest lerp, the FIELD EMA is
+// `__giFieldSmoothing` (default 0.95, no component prop exists), and at
+// `probeSmoothing: 1` the adaptive mix still pins any probe moving less than 15%
+// per frame at alpha ≤ 0.25. See makeBlockRig.mjs for the full derivation. The
+// props are UNCHANGED (a frozen rig's arms have to stay comparable); `QUIET_EMA=1`
+// is the opt-in arm that genuinely silences all three integrators.
 //
 // …AND SPIN MAKES IT MEAN SOMETHING. A settled static scene answers "is a frame
 // reproducible", and the answer is yes (rms ~0). The user's complaint is about a
@@ -102,12 +111,23 @@
 //                      (giScreen's obscurance ladder) and its radius is 0.6
 //                      FIXED METRES, which makes it a fixed-metre suspect in
 //                      exactly the way the material-side bilateral is.
+//   QUIET_EMA=1        actually silence the three temporal integrators
+//                      (__giFieldSmoothing=0, __giProbeNoise=0, __giDepthAlpha=1
+//                      — see QUIET_EMA_GLOBALS in lib/makeBlockRig.mjs). OFF by
+//                      default: it changes what the default arm measures, and
+//                      QUIET_EMA arms are not comparable with plain ones.
+//   RESHOOT=3          attempts before an un-capturable arm is marked FAILED
+//   RESHOOT_WAIT=1500  ms between those attempts
+//   BLACK_PATCH / BLACK_FRAME   liveness thresholds for the capture guard
 //   HEADED=1
+//
+// EXIT CODE: non-zero if any arm failed to capture. A black frame is reported as
+// FAILED, never as `modulation 0.00%` — see the capture guard.
 import path from "node:path";
 import { mkdir, writeFile } from "node:fs/promises";
 import puppeteer from "puppeteer-core";
 import { installTauriShim } from "./lib/tauriShim.mjs";
-import { makeBlockRigProject, BLOCK_RIG } from "./lib/makeBlockRig.mjs";
+import { makeBlockRigProject, BLOCK_RIG, QUIET_EMA_GLOBALS } from "./lib/makeBlockRig.mjs";
 
 const url = process.argv[2] ?? "http://localhost:5201/";
 const GEN_ROOT = (process.env.GEN_ROOT ?? path.resolve("scripts/.gi-block-size")).replaceAll("\\", "/");
@@ -215,11 +235,45 @@ page.on("console", (m) => {
 });
 page.on("pageerror", (e) => console.log(`  pageerror: ${(e.message ?? String(e)).slice(0, 200)}`));
 
-const GLOBALS = (process.env.GLOBALS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+// QUIET_EMA=1 — actually quiet the temporal integrators, which the rig's
+// component props DO NOT do (see the long note on `temporalBlend`/
+// `probeSmoothing` in makeBlockRig.mjs: `temporalBlend` is the staging→base
+// ingest lerp, not the field EMA, and the field EMA has no prop at all; and
+// `probeSmoothing: 1` still pins sub-15%-delta probes at alpha ≤ 0.25).
+//
+// OFF BY DEFAULT ON PURPOSE. Turning it on changes what the default arm
+// measures, and every number this rig has produced so far was taken with the
+// EMAs running — so this ships as a separate arm rather than as a silent
+// correction. QUIET_EMA arms are NOT comparable with non-QUIET_EMA arms.
+// The globals go FIRST so an explicit `GLOBALS=` entry still overrides them.
+const QUIET_EMA = process.env.QUIET_EMA === "1";
+const GLOBALS = [
+  ...(QUIET_EMA ? Object.entries(QUIET_EMA_GLOBALS).map(([k, v]) => `${k}=${v}`) : []),
+  ...(process.env.GLOBALS ?? "").split(",").map((s) => s.trim()).filter(Boolean),
+];
+if (QUIET_EMA) {
+  console.log(`  QUIET_EMA: field EMA off, probe EMA a true passthrough, visibility integrators off —`);
+  console.log(`             ${Object.entries(QUIET_EMA_GLOBALS).map(([k, v]) => `${k}=${v}`).join(" ")}`);
+  console.log(`             (this arm is NOT comparable with a run without QUIET_EMA)`);
+}
 if (GLOBALS.length) console.log(`  globals: ${GLOBALS.join(" ")}`);
 await page.evaluateOnNewDocument((project, globals) => {
   localStorage.setItem("engine.projectRoot.v1", project);
   localStorage.setItem("engine.recentProjects.v1", JSON.stringify([project]));
+  // THE EDITOR STOPS THE ENGINE LOOP FOR AN UNFOCUSED VIEWPORT
+  // (src/editor/editorFramePacing.js — its own comment: "headless suites are
+  // never focused, so without it every probe reads a sleeping engine"). Ten
+  // other GI probes set this; this rig did NOT until 2026-08-07, and that is
+  // the best explanation for the black arms it was silently reporting as
+  // `modulation 0.00%` (a `__giMergeVisTol` sweep returned a black arm at 1.55
+  // with BOTH neighbours identical to baseline to four decimals — no monotonic
+  // dial does that, and the arm's `[gi] built` line was present and healthy, so
+  // the build succeeded and the CAPTURE did not). Set here, in the same
+  // pre-document block as GLOBALS, so it lands before any module runs.
+  //
+  // It is a PIN, not a fix for a broken frame — the capture guard below
+  // (`shootChecked`) is what makes a lost frame loud instead of a zero.
+  globalThis.__editorKeepRendering = true;
   globalThis.__giDynObjectsDebug = true;
   for (const g of globals) {
     const [k, v] = g.split("=");
@@ -690,6 +744,105 @@ async function shoot(tag) {
   return shot.__image.base64;
 }
 
+// ---- THE CAPTURE GUARD -------------------------------------------------------
+//
+// A LOST CAPTURE AND A PERFECT RESULT LOOK IDENTICAL IN THIS TABLE, and that is
+// the worst failure an instrument can have. Measured 2026-08-07: a
+// `__giMergeVisTol` ablation returned
+//
+//   (baseline)              modulation x 9.39%  z 19.51%  level 0.2345
+//   __giMergeVisTol=1.7     modulation x 9.39%  z 19.51%  level 0.2345
+//   __giMergeVisTol=1.55    modulation x 0.00%  z  0.00%  level 0.0000  <- BLACK
+//   __giMergeVisTol=1.4     modulation x 9.39%  z 19.51%  level 0.2345
+//
+// — a black arm between two arms identical to baseline to four decimals. No
+// monotonic dial does that, the arm's `[gi] built` line was present and healthy,
+// and the rig printed the failure as `0.00%`, i.e. as an EXTRAORDINARILY GOOD
+// result. An earlier coarse sweep lost three arms the same way. Suspected cause:
+// no `__editorKeepRendering` (now set above), which is opt-in wake/sleep and so
+// fails intermittently rather than constantly — exactly this signature.
+//
+// WHY BOTH A FRAME TEST AND A PATCH TEST. The panel is emissive (strength 4) and
+// sits inside this camera's frustum by construction — the patch starts at x=0.6
+// specifically to CLEAR the panel's silhouette, so the panel is in shot — and in
+// albedo mode a sun lights the whole floor. So:
+//   · frameMax ≈ 0  → nothing rendered at all. A lost capture, full stop.
+//   · patch black but the frame is lit → the floor genuinely received nothing.
+//     Also not a measurement of "0% modulation" (the residual of a constant is
+//     0/0), but it is a different diagnosis, so it is reported as a different
+//     message and still fails the arm.
+// Thresholds are two decades below one 8-bit step, so nothing that rendered can
+// trip them; override via BLACK_PATCH / BLACK_FRAME if a legitimately dark arm
+// ever needs measuring.
+const BLACK_PATCH = Number(process.env.BLACK_PATCH ?? 1e-5);
+const BLACK_FRAME = Number(process.env.BLACK_FRAME ?? 2 / 255);
+const RESHOOT_ATTEMPTS = Math.max(1, Number(process.env.RESHOOT ?? 3));
+const RESHOOT_WAIT = Number(process.env.RESHOOT_WAIT ?? 1500);
+
+/** Liveness of one capture: whole-frame peak + patch level. */
+async function frameLevel(b64) {
+  return page.evaluate(async ({ url, rect: r }) => {
+    const toLinear = (v) => (v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4));
+    const img = new Image();
+    img.src = url;
+    await img.decode();
+    const c = document.createElement("canvas");
+    c.width = img.width; c.height = img.height;
+    const g = c.getContext("2d", { willReadFrequently: true });
+    g.drawImage(img, 0, 0);
+    // Whole frame, every 4th pixel — this is a liveness check, not a metric.
+    const full = g.getImageData(0, 0, img.width, img.height).data;
+    let frameMax = 0;
+    for (let i = 0; i < full.length; i += 16) {
+      const m = Math.max(full[i], full[i + 1], full[i + 2]);
+      if (m > frameMax) frameMax = m;
+    }
+    const d = g.getImageData(r.x, r.y, r.w, r.h).data;
+    let sum = 0, lit = 0, n = 0;
+    for (let i = 0; i < d.length; i += 4) {
+      sum += 0.2126 * toLinear(d[i] / 255) + 0.7152 * toLinear(d[i + 1] / 255) + 0.0722 * toLinear(d[i + 2] / 255);
+      if (Math.max(d[i], d[i + 1], d[i + 2]) > 1) lit++;
+      n++;
+    }
+    return { patchMean: sum / Math.max(n, 1), patchLitFrac: lit / Math.max(n, 1), frameMax: frameMax / 255 };
+  }, { url: `data:image/png;base64,${b64}`, rect });
+}
+
+/**
+ * `shoot` + the guard: re-take a black frame up to RESHOOT_ATTEMPTS times, then
+ * give up LOUDLY. Returns `{ b64, ok, why }` — callers must propagate `ok`, and
+ * a run with any `ok: false` exits non-zero. NEVER returns zeros-as-data.
+ */
+async function shootChecked(tag) {
+  let last = null;
+  for (let a = 0; a < RESHOOT_ATTEMPTS; a++) {
+    const b64 = await shoot(a === 0 ? tag : `${tag}-retry${a}`);
+    const lv = await frameLevel(b64);
+    last = { b64, lv };
+    const frameDead = lv.frameMax <= BLACK_FRAME;
+    const patchDead = lv.patchMean <= BLACK_PATCH;
+    if (!frameDead && !patchDead) return { b64, ok: true, why: null, lv, attempts: a + 1 };
+    const why = frameDead
+      ? `LOST CAPTURE — the whole frame is black (peak ${(lv.frameMax * 255).toFixed(1)}/255); the engine was not rendering`
+      : `patch is black (mean ${lv.patchMean.toExponential(2)}, ${(lv.patchLitFrac * 100).toFixed(1)}% lit px) while the frame is lit — the floor received nothing`;
+    console.log(`    !! ${tag}: ${why} — attempt ${a + 1}/${RESHOOT_ATTEMPTS}`);
+    // Re-assert the pin and give the loop a beat; if the engine was asleep this
+    // is what wakes it, and if it was not, the retry costs one screenshot.
+    await page.evaluate(() => { globalThis.__editorKeepRendering = true; });
+    await wait(RESHOOT_WAIT);
+  }
+  const lv = last.lv;
+  const why = lv.frameMax <= BLACK_FRAME
+    ? `black frame after ${RESHOOT_ATTEMPTS} attempts (frame peak ${(lv.frameMax * 255).toFixed(1)}/255)`
+    : `black patch after ${RESHOOT_ATTEMPTS} attempts (patch mean ${lv.patchMean.toExponential(2)})`;
+  console.log(`    !! ${tag}: FAILED — ${why}. This arm produced NO measurement; it is not a zero.`);
+  return { b64: last.b64, ok: false, why, lv, attempts: RESHOOT_ATTEMPTS };
+}
+
+// Every arm that could not be captured, so the process can exit non-zero and the
+// operator cannot mistake a hole in the table for a result.
+const failures = [];
+
 /**
  * Absolute yaw, in degrees, about the panel's own centre (its local origin IS
  * its centre — the box mesh is placed by `position`, not by an offset pivot),
@@ -817,15 +970,29 @@ if (process.env.ABLATE) {
     for (let k = 0; k < 60 && built === before; k++) await wait(500);
     await wait(SETTLE);
     const tag = spec ? spec.replaceAll(/[^\w.=-]/g, "_") : "baseline";
-    const b64 = await shoot(`ablate-${i}-${tag}`);
-    const m = await analyze([b64]);
-    shots.push({ spec: spec || "(baseline)", b64, m });
-    console.log(`  ablate ${(spec || "(baseline)").padEnd(34)} modulation x ${(m.residRms * 100).toFixed(2)}%  z ${(m.residRmsZ * 100).toFixed(2)}%  level ${m.mean.toFixed(4)}`);
+    const cap = await shootChecked(`ablate-${i}-${tag}`);
+    const label = spec || "(baseline)";
+    if (!cap.ok) {
+      // NOT `modulation 0.00%`. A hole, named as a hole.
+      failures.push({ arm: `ablate ${label}`, why: cap.why });
+      shots.push({ spec: label, b64: cap.b64, m: null, error: cap.why });
+      console.log(`  ablate ${label.padEnd(34)} FAILED — ${cap.why}`);
+      continue;
+    }
+    const m = await analyze([cap.b64]);
+    shots.push({ spec: label, b64: cap.b64, m });
+    console.log(`  ablate ${label.padEnd(34)} modulation x ${(m.residRms * 100).toFixed(2)}%  z ${(m.residRmsZ * 100).toFixed(2)}%  level ${m.mean.toFixed(4)}`);
   }
   console.log(`\n=== ABLATION — which term carries the artifact? (vs baseline) ===`);
   console.log(`  hatch                              | mod x%  Δmod   | change rms  mean shift | change size x`);
   const base = shots[0];
   for (const s of shots.slice(1)) {
+    // A failed arm has no picture to compare against, and the baseline itself
+    // failing voids every row — say so instead of differencing black.
+    if (!s.m || !base?.m) {
+      console.log(`  ${s.spec.padEnd(34)} | ${(s.m ? "baseline FAILED" : "FAILED").padStart(13)} — ${s.error ?? base?.error ?? "no capture"}`);
+      continue;
+    }
     const d = await compare(base.b64, s.b64);
     console.log(
       `  ${s.spec.padEnd(34)} | ${f(s.m.residRms * 100, 6, 2)} ${f((s.m.residRms - base.m.residRms) * 100, 6, 2)} | ` +
@@ -833,8 +1000,12 @@ if (process.env.ABLATE) {
     );
   }
   console.log(`\n  frames: ${SHOT}`);
+  if (failures.length) {
+    console.log(`\n  !! ${failures.length} ABLATION ARM(S) FAILED TO CAPTURE — exiting non-zero:`);
+    for (const fl of failures) console.log(`     ${fl.arm}: ${fl.why}`);
+  }
   await browser.close();
-  process.exit(0);
+  process.exit(failures.length ? 1 : 0);
 }
 
 // ---- the arms ----------------------------------------------------------------
@@ -858,6 +1029,12 @@ for (const arm of arms) {
   await wait(SETTLE);
   const state = await builtState();
   const shots = [];
+  // EVERY FRAME IS GUARDED, not just frame 0. A single black frame among FRAMES
+  // does NOT zero the flicker columns — it makes them plausible and wrong
+  // (`diff` becomes "the whole patch went dark", a smooth patch-sized change
+  // that the per-line cubic partly absorbs), which is strictly harder to spot
+  // than the zeroed single-frame case. So one bad frame voids the arm.
+  let armError = null;
   for (let f = 0; f < FRAMES; f++) {
     // Same cadence as the still sweep — shoot, gap, shoot — with the yaw
     // advanced at the top of each gap so the panel has the whole FRAME_GAP to
@@ -866,29 +1043,62 @@ for (const arm of arms) {
       if (SPIN) await setPanelYawDeg(f * SPIN_STEP_DEG);
       await wait(FRAME_GAP);
     }
-    shots.push(await shoot(f === 0 ? tag : `${tag}-f${f}`));
+    const cap = await shootChecked(f === 0 ? tag : `${tag}-f${f}`);
+    shots.push(cap.b64);
+    if (!cap.ok) { armError = `frame ${f}: ${cap.why}`; break; }
   }
-  const m = await analyze(shots);
+  const m = armError ? null : await analyze(shots);
   // Under SPIN the only thing that can silently void the arm is the mover
   // falling off the exact path mid-spin, so read the adoption count back after
   // the frames as well as before them.
-  const stateAfter = SPIN ? await builtState() : null;
-  results.push({ arm, state, ...(stateAfter ? { stateAfter } : {}), m, shot: shots[0] });
+  const stateAfter = SPIN && !armError ? await builtState() : null;
+  results.push({
+    arm, state, ...(stateAfter ? { stateAfter } : {}), m, shot: shots[0],
+    ...(armError ? { error: armError } : {}),
+  });
+  if (armError) failures.push({ arm: tag, why: armError });
   const cell = state.cell?.x ?? NaN;
   console.log(
     `  ${tag.padEnd(26)} built cell ${cell?.toFixed?.(3) ?? "?"}m res ${state.res ? `${state.res.x}x${state.res.y}x${state.res.z}` : "?"} | ` +
       `probe ${state.probeSpacing?.toFixed?.(3)}m c0 ${state.c0Grid ? `${state.c0Grid.x}x${state.c0Grid.y}x${state.c0Grid.z}` : "?"}` +
-      (SPIN ? ` | movers ${state.adopted}→${stateAfter?.adopted}` : "") +
-      (m.error ? `  !! ${m.error}` : ""),
+      (SPIN && !armError ? ` | movers ${state.adopted}→${stateAfter?.adopted}` : "") +
+      (armError ? `  !! ARM FAILED: ${armError}` : m?.error ? `  !! ${m.error}` : ""),
   );
-  if (SPIN && !(state.adopted > 0 && stateAfter?.adopted > 0)) {
+  if (SPIN && !armError && !(state.adopted > 0 && stateAfter?.adopted > 0)) {
     console.log(`    !! the panel is not on the exact-mover path for this arm — its flicker is re-voxelization, not a mover`);
   }
 }
 
 // ---- report ------------------------------------------------------------------
-const blockX = (r) => (r.m.x?.halfC * 2) / pxPerMx;
-const blockZ = (r) => (r.m.z?.halfC * 2) / pxPerMz;
+// `r.m` is NULL for an arm whose capture failed — optional-chain everything, so
+// a hole prints as "-" and never as a number.
+const blockX = (r) => (r.m?.x?.halfC * 2) / pxPerMx;
+const blockZ = (r) => (r.m?.z?.halfC * 2) / pxPerMz;
+// THE DETRENDED FLICKER SIZES. Only ever finite under SPIN: `analyze` computes
+// the detrended pair only when the raw frame difference clears its noise gate,
+// and a still scene's difference never does.
+const detrX = (r) => (r.m?.flick?.detrended?.halfX * 2) / pxPerMx;
+const detrZ = (r) => (r.m?.flick?.detrended?.halfZ * 2) / pxPerMz;
+
+/** Least-squares slope of ys on xs, plus r² and both spans. */
+function regress(xs, ys) {
+  const n = xs.length;
+  const mx = xs.reduce((a, b) => a + b, 0) / n;
+  const my = ys.reduce((a, b) => a + b, 0) / n;
+  let sxy = 0, sxx = 0, syy = 0;
+  for (let i = 0; i < n; i++) { sxy += (xs[i] - mx) * (ys[i] - my); sxx += (xs[i] - mx) ** 2; syy += (ys[i] - my) ** 2; }
+  return {
+    n,
+    slope: sxy / Math.max(sxx, 1e-12),
+    r2: (sxy * sxy) / Math.max(sxx * syy, 1e-12),
+    dialSpan: Math.max(...xs) / Math.min(...xs),
+    valSpan: Math.max(...ys) / Math.min(...ys),
+  };
+}
+/** The dial value the BUILD actually used — never the request. */
+const builtDial = (r, dial) => (dial === "voxel" ? r.state.cell?.x : r.state.probeSpacing) ?? NaN;
+const verdict = (g) =>
+  g.valSpan < 1.25 ? "→ IGNORES this dial" : g.slope > 0.4 ? "→ SCALES WITH THIS DIAL" : "→ partial / mixed";
 
 console.log(`\n=== BLOCK SIZE ON THE FLOOR (ACF half-width × 2, metres) ===`);
 console.log(`  patch spans ${(BLOCK_RIG.patch.x1 - BLOCK_RIG.patch.x0).toFixed(1)}m in x, ` +
@@ -903,6 +1113,14 @@ console.log(`  dial   requested   built cell   built probe |  block x   block z 
   (SPIN ? ` | detr%  detr size x  detr size z` : ""));
 for (const r of results) {
   const req = r.arm.dial === "voxel" ? r.arm.voxelSize : r.arm.probeSpacing;
+  if (!r.m) {
+    // A FAILED arm gets a row that cannot be read as data. Never zeros.
+    console.log(
+      `  ${r.arm.dial.padEnd(6)} ${f(req, 9)}   ${f(r.state.cell?.x, 10)}   ${f(r.state.probeSpacing, 11)} | ` +
+        `  FAILED — ${r.error}`,
+    );
+    continue;
+  }
   const dt = r.m.flick?.detrended;
   console.log(
     `  ${r.arm.dial.padEnd(6)} ${f(req, 9)}   ${f(r.state.cell?.x, 10)}   ${f(r.state.probeSpacing, 11)} | ` +
@@ -924,33 +1142,90 @@ for (const dial of ["voxel", "probe"]) for (const axis of ["x", "z"]) {
   const rows = results.filter((r) => r.arm.dial === dial && Number.isFinite(metric(r)));
   if (rows.length < 2) continue;
   // Regress block size on the value the build ACTUALLY used, not the request.
-  const xs = rows.map((r) => (dial === "voxel" ? r.state.cell?.x : r.state.probeSpacing) ?? NaN);
-  const ys = rows.map(metric);
-  const n = xs.length;
-  const mx = xs.reduce((a, b) => a + b, 0) / n;
-  const my = ys.reduce((a, b) => a + b, 0) / n;
-  let sxy = 0, sxx = 0, syy = 0;
-  for (let i = 0; i < n; i++) { sxy += (xs[i] - mx) * (ys[i] - my); sxx += (xs[i] - mx) ** 2; syy += (ys[i] - my) ** 2; }
-  const slope = sxy / Math.max(sxx, 1e-12);
-  const r2 = (sxy * sxy) / Math.max(sxx * syy, 1e-12);
-  const span = Math.max(...xs) / Math.min(...xs);
-  const blockSpan = Math.max(...ys) / Math.min(...ys);
+  const g = regress(rows.map((r) => builtDial(r, dial)), rows.map(metric));
   console.log(
-    `  ${dial.padEnd(6)} block-${axis}: dial spans ${span.toFixed(1)}x → block spans ${blockSpan.toFixed(2)}x   ` +
-      `slope ${f(slope, 6, 2)}  r² ${f(r2, 5, 2)}  ` +
-      (blockSpan < 1.25
+    `  ${dial.padEnd(6)} block-${axis}: dial spans ${g.dialSpan.toFixed(1)}x → block spans ${g.valSpan.toFixed(2)}x   ` +
+      `slope ${f(g.slope, 6, 2)}  r² ${f(g.r2, 5, 2)}  ` +
+      (g.valSpan < 1.25
         ? "→ the artifact IGNORES this dial"
-        : slope > 0.4
+        : g.slope > 0.4
           ? "→ THE ARTIFACT SCALES WITH THIS DIAL"
           : "→ partial / mixed"),
   );
+}
+
+// ---- THE SAME QUESTION, ASKED OF THE FLICKER RESIDUAL (SPIN only) -----------
+//
+// The section above regresses the STATIC block size (`blockX`/`blockZ`, frame 0)
+// and NOTHING regressed the columns that only exist under SPIN — `detr size x` /
+// `detr size z`, the size of what is left of a mover's frame-to-frame change
+// after the smooth relighting is fitted out. Those are the columns that answer
+// the user's actual complaint (a ROTATING box's bleed is "blocky and flickery"),
+// and until 2026-08-07 reading them meant dividing by hand.
+//
+// WHY THE Z AXIS IS THE CLEAN READ, and x is not. The emitting panel is a plane
+// running along z (2 m in z, 0.2 m in x), so to first order the floor's
+// irradiance is a function of x ALONE — it is flat along z. Any lattice
+// quantization therefore shows up as BANDS PARALLEL TO Z, i.e. as structure in
+// the z-lag with no honest signal underneath it to confuse. A measured run:
+//
+//     detr size z = 0.377 m against probeSpacing 0.375 m   (0.5% off)
+//     detr size x = 0.174 m against a 0.150 m field cell   (16% off)
+//
+// The z number lands on the probe lattice; the x number sits between the two
+// dials because the true irradiance gradient runs along x and the per-line cubic
+// only partly removes it. So: read `detr-z` first, and treat `detr-x` as
+// corroboration only.
+//
+// The per-arm ratio columns are the point — a flat `÷cell` column means the
+// residual IS a field cell wide at every arm, a flat `÷probe` column means it is
+// a probe spacing wide, and the regression below turns that impression into a
+// slope.
+if (SPIN) {
+  const spun = results.filter((r) => r.m && (Number.isFinite(detrX(r)) || Number.isFinite(detrZ(r))));
+  if (spun.length === 0) {
+    console.log(`\n=== FLICKER RESIDUAL SIZE (SPIN) === no arm produced a detrended flicker measurement.`);
+  } else {
+    console.log(`\n=== FLICKER RESIDUAL SIZE — WHOSE LATTICE IS THE MOVER'S POP? (SPIN) ===`);
+    console.log(`  believe detr-z: the panel is a plane along z, so the floor's true irradiance varies in x only`);
+    console.log(`  dial   built cell  built probe |  detr x   ÷cell  ÷probe |  detr z   ÷cell  ÷probe`);
+    for (const r of spun) {
+      const cell = r.state.cell?.x ?? NaN;
+      const probe = r.state.probeSpacing ?? NaN;
+      const dx = detrX(r), dz = detrZ(r);
+      console.log(
+        `  ${r.arm.dial.padEnd(6)} ${f(cell, 10)}  ${f(probe, 11)} | ` +
+          `${f(dx, 7)}  ${f(dx / cell, 6, 2)}  ${f(dx / probe, 6, 2)} | ` +
+          `${f(dz, 7)}  ${f(dz / cell, 6, 2)}  ${f(dz / probe, 6, 2)}`,
+      );
+    }
+    // BOTH detr axes against BOTH dials — four regressions, the same shape as
+    // the block-size discriminator above, on the value the build actually used.
+    console.log(`\n  slope of the flicker residual's size vs the dial, over each sweep:`);
+    for (const dial of ["voxel", "probe"]) for (const axis of ["x", "z"]) {
+      const metric = axis === "x" ? detrX : detrZ;
+      const rows = results.filter((r) => r.arm.dial === dial && r.m && Number.isFinite(metric(r)) && Number.isFinite(builtDial(r, dial)));
+      if (rows.length < 2) {
+        console.log(`  ${dial.padEnd(6)} detr-${axis}: only ${rows.length} usable arm(s) — no slope`);
+        continue;
+      }
+      const g = regress(rows.map((r) => builtDial(r, dial)), rows.map(metric));
+      console.log(
+        `  ${dial.padEnd(6)} detr-${axis}:  dial spans ${g.dialSpan.toFixed(1)}x → size spans ${g.valSpan.toFixed(2)}x   ` +
+          `slope ${f(g.slope, 6, 2)}  r² ${f(g.r2, 5, 2)}  ${verdict(g)}` +
+          (axis === "z" ? "  [the clean axis]" : ""),
+      );
+    }
+  }
 }
 
 // ---- the differential: every arm against the FINEST arm of its own sweep ----
 console.log(`\n=== WHAT THE DIAL ACTUALLY CHANGED (arm ÷ finest arm of the same sweep) ===`);
 console.log(`  dial   value    built |  change rms  mean shift |  change size x   change size z`);
 for (const dial of ["voxel", "probe"]) {
-  const rows = results.filter((r) => r.arm.dial === dial);
+  // FAILED arms carry a black picture; differencing against one would report the
+  // whole scene as "what the dial changed". Drop them from both sides.
+  const rows = results.filter((r) => r.arm.dial === dial && r.m);
   if (rows.length < 2) continue;
   const ref = rows[0];
   for (const r of rows.slice(1)) {
@@ -969,10 +1244,10 @@ for (const dial of ["voxel", "probe"]) {
 console.log(`\n=== ACF CURVES (lag in px; ${pxPerMx.toFixed(0)} px/m along x) ===`);
 for (const r of results) {
   const req = r.arm.dial === "voxel" ? r.arm.voxelSize : r.arm.probeSpacing;
-  console.log(`  ${r.arm.dial}=${req}  x: ${(r.m.x?.curve ?? []).slice(0, 24).join(" ")}`);
+  console.log(`  ${r.arm.dial}=${req}  x: ${r.m ? (r.m.x?.curve ?? []).slice(0, 24).join(" ") : `FAILED (${r.error})`}`);
 }
 
-const anyClipped = results.filter((r) => (r.m.clipped ?? 0) > 0.001);
+const anyClipped = results.filter((r) => (r.m?.clipped ?? 0) > 0.001);
 if (anyClipped.length) console.log(`\n  !! ${anyClipped.length} arms have clipped pixels in the patch — those residuals under-report.`);
 const inert = results.filter((r, i) => i > 0 && results[i - 1].arm.dial === r.arm.dial &&
   results[i - 1].state.cell?.x === r.state.cell?.x && results[i - 1].state.probeSpacing === r.state.probeSpacing);
@@ -982,10 +1257,19 @@ console.log(`\n  frames: ${SHOT}`);
 await writeFile(
   path.join(SHOT, "block-size.json"),
   // `shot` is a whole base64 PNG per arm — the frames are already on disk.
+  // A failed arm serialises as `m: null` + `error`, NOT as zeros: a consumer
+  // that averages this file must be able to tell a hole from a measurement.
   JSON.stringify({
     mode: MODE, mover: MOVER, spin: SPIN, spinStepDeg: SPIN_STEP_DEG, frames: FRAMES, frameGapMs: FRAME_GAP,
+    quietEma: QUIET_EMA, keepRendering: true,
+    failures,
     pxPerMx, pxPerMz, rect, results: results.map(({ shot, ...rest }) => rest),
   }, null, 1),
 );
+if (failures.length) {
+  console.log(`\n  !! ${failures.length} of ${results.length} ARMS FAILED TO CAPTURE — this run is INCOMPLETE:`);
+  for (const fl of failures) console.log(`     ${fl.arm}: ${fl.why}`);
+  console.log(`     A black frame is not a measurement of zero. Re-run before drawing any conclusion.`);
+}
 await browser.close();
-process.exit(0);
+process.exit(failures.length ? 1 : 0);

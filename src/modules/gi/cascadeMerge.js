@@ -52,10 +52,31 @@ import { BURIED_PROBE_WEIGHT } from "./cascadeGather.js";
 // use site for why a binary cut is what produced the lattice artifact.
 // `globalThis.__giMergeVisTol` overrides it for harness A/Bs (read per build,
 // not at module load — the harness sets it after the module is imported).
+//
+// THE OTHER HALF OF THIS CONTRACT IS `__giGatherVisTol` (cascadeGather.js, same
+// 1.75 default, same [tol, 2·tol] fade, same `traceQuantization`). Moving one
+// and not the other applies half a tolerance change: the merge judges a
+// PARENT probe against a blocker, the gather judges a CAGE probe against the
+// same blocker one level finer. Sweep both, or state that you swept one.
 const DEFAULT_MERGE_VIS_TOLERANCE = 1.75;
 
 export function createCascadeMerge(cascades, { sky = [0, 0, 0], occupancyVoxel = null, occupancy = null } = {}) {
-  const MERGE_VIS_TOLERANCE = Number(globalThis.__giMergeVisTol) || DEFAULT_MERGE_VIS_TOLERANCE;
+  // FALSY-ZERO TRAP, fixed 2026-08-07. This was
+  // `Number(globalThis.__giMergeVisTol) || DEFAULT_MERGE_VIS_TOLERANCE`, so
+  // `__giMergeVisTol = 0` — a MEANINGFUL value, the hard-cut ablation, the same
+  // arm `__giHardMergeVis` reaches by a different route — silently restored
+  // 1.75 and reported the default as the ablation. `Number.isFinite` is how
+  // `__giBilateralWorldEps` & co. are read in giLight.js, for exactly this
+  // reason; unset still lands on the default because `Number(undefined)` is NaN.
+  //
+  // KNOWN CALLER TO FIX: scripts/run-gi-rc-lattice.mjs:77 sets
+  // `__giMergeVisTol: process.env.MERGETOL ? Number(process.env.MERGETOL) : 0`
+  // — i.e. it writes a literal 0 on EVERY run where MERGETOL is unset, and only
+  // worked because the `||` above swallowed it. With this fix that harness's
+  // default arm now genuinely runs tolerance 0. It must be changed to leave the
+  // key absent (or set 1.75) before its numbers mean anything again.
+  const rawMergeVisTol = Number(globalThis.__giMergeVisTol);
+  const MERGE_VIS_TOLERANCE = Number.isFinite(rawMergeVisTol) ? rawMergeVisTol : DEFAULT_MERGE_VIS_TOLERANCE;
   // See the use site: the visibility proxy's tolerance must track whatever the
   // rays actually traced. `min` with the field cell keeps it a tightening.
   const traceQuantization = occupancyVoxel
