@@ -1006,6 +1006,40 @@ const dynShapeHitFn = sharedFn({
   },
 });
 
+// ═══════════════════════════════════════════════ SURFACE-CACHE card slot (§6.4)
+/**
+ * The card slot an OBJECT-SPACE normal addresses: `axis*2 + (n[axis] < 0)`,
+ * branchless, over `argmax |dot(n, ±e_k)|`.
+ *
+ * WHY IT LIVES HERE AND NOT AT THE HIT SITE. `trace({objId: true})` hands back
+ * an oct-packed WORLD normal, and the object header carries only M⁻¹ — the
+ * object-space geometric normal would need Mᵀ, which is stored nowhere, and
+ * `M⁻¹·nWorld` ranks the same as `Mᵀ·nWorld` ONLY under uniform scale. So the
+ * slot has to be decided INSIDE `traceDynBody`, where the exact local normal is
+ * already in hand, and ride out packed into `bestObj` (see its note).
+ *
+ * Byte-for-byte the same decision as `surfaceCache.cardSlotFor` and
+ * `surfaceCacheGpu.cardArgmaxSlot`; `run-gi-card-lookup-test.mjs` pins those two
+ * against `cardProject`'s ground truth over a dense normal set, so this is the
+ * third writing of one rule and must not drift from it.
+ */
+const cardSlotFromLocalNormal = (nL) => {
+  const n = vec3(nL).toVar();
+  const a = n.abs().toVar();
+  const useY = a.y.greaterThan(a.x).and(a.y.greaterThanEqual(a.z)).toVar();
+  const useZ = useY.not().and(a.z.greaterThan(a.x)).and(a.z.greaterThan(a.y)).toVar();
+  const axisN = select(useY, n.y, select(useZ, n.z, n.x)).toVar();
+  const axis = select(useY, float(1), select(useZ, float(2), float(0)));
+  return axis.mul(2).add(select(axisN.lessThan(0), float(1), float(0))).toVar();
+};
+
+/**
+ * Object index and card slot out of the packed `bestObj` the objId trace
+ * returns (`i*8 + slot`). A miss is -1 and stays negative through the split
+ * (`floor(-1/8) = -1`), so a caller's existing `>= 0` gate is unchanged.
+ */
+export const OBJ_SLOT_STRIDE = 8;
+
 // ══════════════════════════════════════════════════════════ the object set
 /**
  * Creates the dynamic-object set bound to one occupancy field build.
@@ -1166,12 +1200,24 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
     const bestT = float(1e30).toVar();
     const bestHit = float(0).toVar();
     const bestCode = float(-1).toVar();
-    // WHICH object won, for consumers that need its surface (the cascade
-    // transport rays shade a dynamic hit from the header's mean albedo /
-    // emissive). Rides the return's `pen` slot, which is meaningless in the
-    // no-penumbra variant this flag is only ever paired with — cheaper than
-    // stealing bits from the oct-packed normal, which every shadow consumer
-    // reads.
+    // WHICH object won, AND WHICH SURFACE-CACHE CARD its hit lands on, packed
+    // as `i*OBJ_SLOT_STRIDE + slot` (slot 0..5). Rides the return's `pen` slot,
+    // which is meaningless in the no-penumbra variant this flag is only ever
+    // paired with — cheaper than stealing bits from the oct-packed normal,
+    // which every shadow consumer reads.
+    //
+    // THE SLOT IS PACKED HERE BECAUSE IT CAN ONLY BE COMPUTED HERE. §6.4's
+    // lookup indexes the card table by the OBJECT-SPACE normal's argmax, and
+    // the object-space normal exists exactly once in the whole pipeline: as
+    // `nL`, in this function, BEFORE the covariant transform to world and
+    // BEFORE the double-sided flip (the packer's cards face OUTWARD, so the
+    // flipped normal would address the opposite card on every back-side hit).
+    // See `cardSlotFromLocalNormal`. Exact in f32: MAX ≤ 64 objects ⇒ ≤ 509.
+    //
+    // Always packed, not gated on the surface cache being on: `dynObj` has
+    // exactly ONE consumer (giField's createOccupancySceneTrace), which splits
+    // it, and a second trace variant would double this kernel's WGSL for a
+    // multiply.
     const bestObj = objId ? float(-1).toVar() : null;
     const penAcc = float(1).toVar();
 
@@ -1258,7 +1304,17 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
             bestT.assign(enter);
             bestHit.assign(1);
             bestCode.assign(oct.x.mul(4095).floor().mul(4096).add(oct.y.mul(4095).floor()));
-            if (objId) bestObj.assign(i.toFloat());
+            // The OBB branch already HAS the card slot: `axis` is the entry
+            // face's axis and `s` its outward local sign, which is exactly
+            // `argmax |dot(nLocal, ±e_k)|` for an axis-aligned face — no
+            // argmax needed, 2 ALU.
+            if (objId) {
+              bestObj.assign(
+                i.toFloat().mul(OBJ_SLOT_STRIDE)
+                  .add(axis.toFloat().mul(2))
+                  .add(select(s.lessThan(0), float(1), float(0))),
+              );
+            }
           }).ElseIf(type.lessThan(2.5), () => {
             if (meshes) {
               // Wide-BVH exact-triangle refinement in object-local space
@@ -1278,7 +1334,9 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
                 bestT.assign(r.x);
                 bestHit.assign(1);
                 bestCode.assign(oct.x.mul(4095).floor().mul(4096).add(oct.y.mul(4095).floor()));
-                if (objId) bestObj.assign(i.toFloat());
+                // `nL`, NOT `nRaw`/`nW`: object space, and before the
+                // double-sided flip. The cards face outward.
+                if (objId) bestObj.assign(i.toFloat().mul(OBJ_SLOT_STRIDE).add(cardSlotFromLocalNormal(nL)));
               });
             }
           }).Else(() => {
@@ -1294,7 +1352,8 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
               bestT.assign(rs.x);
               bestHit.assign(1);
               bestCode.assign(oct.x.mul(4095).floor().mul(4096).add(oct.y.mul(4095).floor()));
-              if (objId) bestObj.assign(i.toFloat());
+              // Same rule as the BVH branch: the UNFLIPPED object-space normal.
+              if (objId) bestObj.assign(i.toFloat().mul(OBJ_SLOT_STRIDE).add(cardSlotFromLocalNormal(nL)));
             });
           });
         });
@@ -1723,8 +1782,9 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
       const packed = fn(...args).toVar();
       const hit = packed.x.toVar();
       const t = packed.y.toVar();
-      // Shared slot: the pen accumulator, or the winning object index (< 0 on
-      // a miss) when the caller asked for it.
+      // Shared slot: the pen accumulator, or the PACKED winner
+      // (`objIndex*OBJ_SLOT_STRIDE + cardSlot`, < 0 on a miss) when the caller
+      // asked for it. Split it with `splitObj` — never index a header with it.
       const penOut = objId ? float(1) : packed.z.toVar();
       const obj = objId ? packed.z.toVar() : null;
       // Oct-packed 2×12-bit world normal (exact in f32); < 0 ⇒ miss.
@@ -1740,11 +1800,28 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
     },
 
     /**
+     * Splits the packed winner `trace({objId: true})` returns into the object
+     * index and its SURFACE-CACHE card slot.
+     *
+     * A miss is -1 and stays negative (`floor(-1/8) = -1`), so the caller's
+     * existing `>= 0` gate is unchanged — that is why the pack is a plain
+     * multiply rather than a bitfield.
+     *
+     * @returns {{index: any, slot: any}} both float nodes
+     */
+    splitObj(packed) {
+      const p = float(packed).toVar();
+      const index = p.div(OBJ_SLOT_STRIDE).floor().toVar();
+      return { index, slot: p.sub(index.mul(OBJ_SLOT_STRIDE)).toVar() };
+    },
+
+    /**
      * Mean surface of object `idx` (header words 34..39) — the albedo and
      * emissive a transport ray shades an exact dynamic hit with. `idx` is the
-     * float index `trace({objId: true})` returns; a negative index reads
-     * object 0's words, so callers must gate on the index themselves (a
-     * branch they already have, since a static hit needs no lookup).
+     * OBJECT INDEX (i.e. `splitObj(...).index`, not the raw packed value); a
+     * negative index reads object 0's words, so callers must gate on the index
+     * themselves (a branch they already have, since a static hit needs no
+     * lookup).
      */
     surfaceAt(idx) {
       const rf = (rel) => uintBitsToFloat(bits.element(uint(baseWord).add(rel)));
@@ -1787,6 +1864,59 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
         cardTableRel: rf(ob.add(uint(23))).toVar(),
         pLocal: c0.mul(p.x).add(c1.mul(p.y)).add(c2.mul(p.z)).add(c3).toVar(),
         halfExtents: vec3(rf(ob.add(uint(16))), rf(ob.add(uint(17))), rf(ob.add(uint(18)))).toVar(),
+      };
+    },
+
+    /**
+     * The FORWARD obb-world matrix of object `idx`, as its four columns —
+     * local → world, the direction `cardFrameAt` does not go.
+     *
+     * WHY IT IS COMPUTED RATHER THAN STORED. The header carries M⁻¹ and
+     * nothing else (words 0..15), because every existing consumer transforms
+     * world → local: the slab test, the BVH ray, the analytic intersectors and
+     * the card lookup all start from a world ray. The SURFACE-CACHE LIGHTING
+     * PASS (§6.6) is the first consumer that starts from a CARD TEXEL — an
+     * (s, t) in object space — and has to get out to world space to light it,
+     * and there is no spare object-block word to publish M in (0..39 are all
+     * claimed, +23 by the card table itself). So the 3×3 is inverted here:
+     * ~30 ALU, ONCE PER TEXEL, not per ray, against a per-texel cost that
+     * already contains a trace and a light loop.
+     *
+     * `ok` is 0 on a singular (zero-scale) matrix — the caller must skip the
+     * texel rather than write inf.
+     */
+    cardWorldAt(idx) {
+      const rf = (rel) => uintBitsToFloat(bits.element(uint(baseWord).add(rel)));
+      const ob = uint(DYN_HEADER_RESERVED)
+        .add(float(idx).max(0).toUint().min(uint(MAX - 1)).mul(uint(OBJ_WORDS)))
+        .toVar();
+      // Columns of M⁻¹ (column-major, exactly how `traceDynBody` reads them).
+      const a0 = vec3(rf(ob.add(uint(0))), rf(ob.add(uint(1))), rf(ob.add(uint(2)))).toVar();
+      const a1 = vec3(rf(ob.add(uint(4))), rf(ob.add(uint(5))), rf(ob.add(uint(6)))).toVar();
+      const a2 = vec3(rf(ob.add(uint(8))), rf(ob.add(uint(9))), rf(ob.add(uint(10)))).toVar();
+      const a3 = vec3(rf(ob.add(uint(12))), rf(ob.add(uint(13))), rf(ob.add(uint(14)))).toVar();
+      // Adjugate rows: for A = [a0 a1 a2] (columns), the ROWS of A⁻¹·det are
+      // a1×a2, a2×a0, a0×a1.
+      const r0 = a1.cross(a2).toVar();
+      const r1 = a2.cross(a0).toVar();
+      const r2 = a0.cross(a1).toVar();
+      const det = a0.dot(r0).toVar();
+      const ok = det.abs().greaterThan(1e-20).toVar();
+      const inv = float(1).div(select(ok, det, float(1))).toVar();
+      // COLUMNS of A⁻¹ are the components of those rows, transposed.
+      const c0 = vec3(r0.x, r1.x, r2.x).mul(inv).toVar();
+      const c1 = vec3(r0.y, r1.y, r2.y).mul(inv).toVar();
+      const c2 = vec3(r0.z, r1.z, r2.z).mul(inv).toVar();
+      // p_local = A·p_world + a3  ⇒  p_world = A⁻¹·p_local − A⁻¹·a3.
+      const c3 = c0.mul(a3.x).add(c1.mul(a3.y)).add(c2.mul(a3.z)).negate().toVar();
+      return {
+        c0, c1, c2, c3,
+        ok: select(ok, float(1), float(0)).toVar(),
+        /** local → world for a POINT. */
+        point: (p) => c0.mul(p.x).add(c1.mul(p.y)).add(c2.mul(p.z)).add(c3).toVar(),
+        /** local → world for a DIRECTION (no translation, NOT normalized —
+         *  its length carries the scale, which the card's ray parameter needs). */
+        dir: (d) => c0.mul(d.x).add(c1.mul(d.y)).add(c2.mul(d.z)).toVar(),
       };
     },
 

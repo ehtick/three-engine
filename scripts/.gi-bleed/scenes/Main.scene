@@ -78,7 +78,7 @@
       "voxelSize": 0.15,
       "probeSpacing": 0.35,
       "cascadeCount": 5,
-      "c0DirRes": 4,
+      "c0DirRes": 8,
       "intensity": 1,
       "skyColor": "#ffffff",
       "skyIntensity": 0,

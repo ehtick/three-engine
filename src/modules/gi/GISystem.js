@@ -25,6 +25,9 @@ import { resolveMaterialSurface, serializeMeshForBake } from "./voxelizeOnce.js"
 import { createOccupancyDebugMaterial, createSdfDebugMaterial, createGiField } from "./giField.js";
 import { createOccupancyField, describeOccupancyField, quantizeOccupancyRes } from "./occupancyField.js";
 import { BVH_STRATEGY, buildStaticSceneBvhWords, classifyDynamicShape, composeFieldDynamics, createDynamicObjectSet, dynHeaderWords, giMobilityOf, giTraceOf } from "./dynamicObjects.js";
+import { CARD_SLOTS, CARD_WORDS, buildSurfaceCache, cardLayerCount } from "./surfaceCache.js";
+import { createSurfaceCacheAtlas, surfaceCachePoolWords } from "./surfaceCacheGpu.js";
+import { createSurfaceCacheLightPass } from "./surfaceCacheLight.js";
 import { fitPrimitive } from "./primitiveFit.js";
 import { describeGrid } from "./instanceGrid.js";
 import { BRICK_AXIS_BY_QUALITY, describeSparseField } from "./sparseField.js";
@@ -604,6 +607,12 @@ export class GISystem {
       // AO compiles the resolve's obscurance block (and its pyramid binding)
       // in or out — structural for the same reason exactReflections is.
       p.ao !== false,
+      // SURFACE RADIANCE CACHE: it sizes the card words into the bits region
+      // AND compiles the atlas sampler into every transport kernel, so it is
+      // structural in the strongest sense — this is the exactReflections lesson
+      // again, and an A/B whose "off" arm still carried the sampler would not
+      // be an A/B at all.
+      p.surfaceCache === true,
     ]);
   }
 
@@ -864,6 +873,13 @@ export class GISystem {
     for (const unsub of this._unsubs) unsub?.();
     this._unsubs = [];
     this.#dispose();
+    // The atlas is system-lifetime, like `_giTargets` — it survives every
+    // rebuild because trace kernels are compiled against `srcRadiance`. THIS is
+    // the teardown that owns it, and the only one: `#dispose` runs on every
+    // detach and must not strand a compiled kernel on a destroyed texture.
+    this._srcAtlas?.dispose();
+    this._srcAtlas = null;
+    this._surfaceCache = null;
     this.component = null;
   }
 
@@ -3704,6 +3720,21 @@ export class GISystem {
     // than from voxel radiance the mover is no longer part of (giField's
     // createOccupancySceneTrace). Uniforms, so no kernel gains a binding.
     const lightSlots = makeLightSlots();
+    // SURFACE RADIANCE CACHE — the atlas is system-lifetime (see
+    // #ensureSurfaceCacheAtlas); only the per-build wiring is rebuilt here.
+    const srcAtlas =
+      this.#surfaceCacheEnabled() && this._dynSet?.enabled ? this.#ensureSurfaceCacheAtlas() : null;
+    // Turned OFF (or dynamic objects gone) with an atlas still allocated: 100 MB
+    // at the 2048² tier is not something to hold "just in case". Retired through
+    // the same deferred queue the resolve targets use, because the OUTGOING
+    // build's cascade-trace kernels still hold the texture until this frame's
+    // submits drain — destroying it now is the "Destroyed texture used in a
+    // submit" failure `#retireTargets` exists to prevent.
+    if (!srcAtlas && this._srcAtlas) {
+      this.#retireTargets(this._srcAtlas);
+      this._srcAtlas = null;
+      this._surfaceCache = null;
+    }
     // How much of the neighbourhood VOXEL radiance a mover takes as ambient.
     // DEFAULT 0: it measured as no contribution at all (an adopted mover's
     // cells are empty) while being the only voxel-quantized term left in an
@@ -3736,10 +3767,49 @@ export class GISystem {
       world: volume.world,
       cascadeCount: Math.min(6, Math.max(2, props.cascadeCount || 5)),
       c0Grid,
-      c0DirRes: props.c0DirRes === 2 ? 2 : 4,
+      // c0DirRes was pinned to {2, 4} — anything else silently became 4, which
+      // made `scripts/run-gi-bleed.mjs`'s `C0DIR` env (it writes
+      // `giOverrides.c0DirRes`) a dead knob and blocked the measurement below.
+      //
+      // WHY IT MATTERS. The final gather applies the receiver cosine at the c0
+      // texel's CENTRE direction (cascadeGather.js:277-278, :907-908), i.e. it
+      // assumes L is uniform inside the bin. At c0DirRes 4 there are 16 texels on
+      // the WHOLE sphere, so on the bleed rig the direction from a floor point to
+      // the emitting panel stays inside ONE texel for the entire 3-10 m fit
+      // window: the applied cosine is frozen at 0.3162 while the true
+      // energy-weighted cosine decays as ~1/d. Over-estimate 1.15x at 3 m, 3.23x
+      // at 10 m — a whole lost power of d, i.e. a bent EXPONENT, not a brightness
+      // error. A forward model of the real ladder predicts -2.095 against the
+      // measured -2.18 (analytic -2.718).
+      //
+      // Widening only; every shipping preset passes 4 (presets never set this),
+      // so the default graph is unchanged. Powers of two only — dirRes doubles
+      // per cascade level and a non-power-of-two would desynchronise the 2x2
+      // angular-child block the merge indexes with `v*2*parent.dirRes + u*2`.
+      // `r >= 2` and not merely `Number.isFinite`: `Number(null)` and `Number("")`
+      // are 0, which IS finite, so a scene storing `c0DirRes: null` would fall
+      // through the clamp and land on 2 — the DIAGNOSTIC config that
+      // cascadeMerge.js:389-394 records as over-steepening the falloff to -5.38.
+      // Unset, null, empty and junk must all mean "the shipped 4".
+      c0DirRes: (() => {
+        const r = Number(props.c0DirRes);
+        if (!Number.isFinite(r) || r < 2) return 4;
+        return Math.max(2, Math.min(16, 2 ** Math.round(Math.log2(Math.min(16, r)))));
+      })(),
       t0: probeSpacing,
       farT: Math.max(sizeX, sizeY, sizeZ) * 2,
-      sceneTrace: volume.createSceneTrace({ lightSlots, emitterSlots, ambient: dynShadeAmbient }),
+      // SURFACE RADIANCE CACHE (§6.4), default off. ONE sampled texture reaches
+      // the transport kernels — `hotBindings()` is what makes "which of the
+      // three planes may a trace bind" a call rather than a convention. The
+      // other two are lighting-pass outputs and never appear here.
+      sceneTrace: volume.createSceneTrace({
+        lightSlots,
+        emitterSlots,
+        ambient: dynShadeAmbient,
+        surfaceCache: srcAtlas
+          ? { srcRadiance: srcAtlas.hotBindings().srcRadiance, atlasSize: srcAtlas.size, layer: 0 }
+          : null,
+      }),
       traceParity,
     });
     // Sky light: the radiance a cascade ray brings back when it escapes the
@@ -3789,6 +3859,73 @@ export class GISystem {
       // trace medium.
       rayHitConfig.activeMode,
     );
+    // ── §6.6's LIGHTING PASS, the only writer of the three atlas planes ──────
+    // ITS OWN DISPATCH, and it must stay that way: 3 storage textures against a
+    // WebGPU baseline of 4, on top of the resolve's own 3-or-4. Built here
+    // because this is where the light slots, the emitter slots, the cascade
+    // probes and the volume all exist at once — the same three-way combination
+    // giScreen.js:1195-1199 measured at 16 uniform buffers in the BVH pass. It
+    // is 2 here (the shared 'object' group + the card work list); the difference
+    // is that the BVH pass drags `bvhScene`'s 7 uniformArrays and the slot
+    // registry's 10 along with it, and this pass reaches everything through the
+    // `bits` STORAGE buffer instead. See surfaceCacheLight.js's header.
+    this._surfaceCache = null;
+    if (srcAtlas && this._dynSet?.enabled && volume.createOccTrace) {
+      const occTrace = volume.createOccTrace();
+      if (occTrace) {
+        const lightPass = createSurfaceCacheLightPass({
+          atlas: srcAtlas,
+          dyn: this._dynSet,
+          trace: occTrace,
+          world: volume.world,
+          lightSlots,
+          emitterSlots,
+          // The one-bounce term. Its own gather instance because a sharedFn
+          // layout is per-shader (giFn's contract) — `giResolveGather` above
+          // belongs to the resolve kernel and cannot be called from this one.
+          // `__giSrcBounce = false` drops it, which is the A/B for "is the
+          // cached surface's indirect worth two storage buffers".
+          bounce: globalThis.__giSrcBounce === false
+            ? null
+            : createIrradianceGather(
+                cascades, probeIrradiance.buffer, volume.world.cellMax, "giSrcCardGather",
+                volume.occupancyField ?? null, probeDepth.buffer, rayHitConfig.activeMode,
+              ),
+          steps: Number(globalThis.__giSrcShadowSteps) || 48,
+          budgetTexels: Number(globalThis.__giSrcTexelBudget) || undefined,
+          accumTexels: Number(globalThis.__giSrcAccumTexels) || undefined,
+          smoothing: Number.isFinite(globalThis.__giSrcSmoothing) ? globalThis.__giSrcSmoothing : 0.8,
+        });
+        this._surfaceCache = {
+          atlas: srcAtlas,
+          lightPass,
+          built: null,
+          cards: [],
+          uploadBlock: null,
+          keyByObjIndex: null,
+          sig: "",
+          eye: new THREE.Vector3(1e9, 1e9, 1e9),
+          meanDistance: 8,
+          builtFrame: -1e9,
+          rebuilds: 0,
+          published: false,
+          frozen: false,
+          /** What a `profile.giSurfaceCache` op reads. */
+          get profile() {
+            return {
+              atlas: srcAtlas.stats,
+              build: this.built?.stats ?? null,
+              demoted: this.built?.demoted ?? [],
+              pass: lightPass.stats,
+              cards: this.cards.length,
+              rebuilds: this.rebuilds,
+              published: this.published,
+              frozen: this.frozen,
+            };
+          },
+        };
+      }
+    }
     // Volume diagonal as a uniform: shadow/mirror reach rescales with an
     // in-place refit (all world-scale shader inputs must be uniforms — a
     // baked one would pin part of the old volume after a refit).
@@ -5101,6 +5238,9 @@ export class GISystem {
     this._lightShadowNodes?.clear();
     state.volume?.dispose?.();
     state.bvhScene?.dispose?.();
+    // Per-build wiring only. The ATLAS is not touched here (see `dispose()`):
+    // it outlives rebuilds exactly like the resolve targets do.
+    this._surfaceCache = null;
     // The gbuffer is per-build; the resolve TARGETS are not (see
     // createGiTargets) — disposing them here would strand every material that
     // is still bound to them. Same rule for the BVH reflect target
@@ -6144,7 +6284,15 @@ export class GISystem {
     const dynObjectsOn = globalThis.__giDynamicObjects !== false;
     const dynPoolWords = Number(globalThis.__giDynMeshWords) ||
       ({ low: 262144, medium: 393216, high: 786432, ultra: 1572864 }[quality] ?? 786432);
-    const dynWords = dynObjectsOn ? dynHeaderWords() + dynPoolWords : 0;
+    // SURFACE RADIANCE CACHE (§6.3) — the card tables ride the SAME pool the
+    // BVH blocks do, through the same bump allocator, so their words have to be
+    // asked for HERE. Without this every object comes back `pool-full` from
+    // `buildSurfaceCache` and silently keeps the mean-albedo path: 48 words per
+    // object per layer, times a rebuild allowance because `allocPoolWords`
+    // never recycles. Zero when the cache is off, so the region is byte-identical
+    // to before on the default path.
+    const cardWords = dynObjectsOn && this.#surfaceCacheEnabled() ? surfaceCachePoolWords() : 0;
+    const dynWords = dynObjectsOn ? dynHeaderWords() + dynPoolWords + cardWords : 0;
 
     // STATIC-SCENE SHADOW BVH ("light by voxels, shadows by BVH"): one
     // world-space BVH8 over every static placement — the screen shadow
@@ -6606,6 +6754,12 @@ export class GISystem {
       this._forceWholeComposite = true;
       this._compositedOnce = false;
     }
+    // SURFACE RADIANCE CACHE, after the header sync AND gated on it: the
+    // lighting pass fires a ray per texel through the object header, so on a
+    // frame where the header has not landed every card would come back a miss
+    // and get lit as flat near-plane geometry. `live` is the same signal the
+    // voxel-slot parking waits for, and for the same reason.
+    if (live) this.#refreshSurfaceCache(renderer);
   }
 
   /**
@@ -6656,6 +6810,277 @@ export class GISystem {
       `[gi] static shadow bvh: rebuild #${this._staticBvhRebuilds} — ` +
         `${packed.triCount} tris in ${(performance.now() - t0).toFixed(0)}ms`,
     );
+  }
+
+  // ═══════════════════════════════════════════ SURFACE RADIANCE CACHE (§6.2-6.7)
+  //
+  // DEFAULT OFF, both ways. `__giSurfaceCache` is the build-time A/B hatch and
+  // wins outright when it is set at all; otherwise the `surfaceCache` component
+  // prop decides, and its absence means off. Nothing about the shipped look
+  // changes until one of them is turned on, which is what makes this
+  // measurable — the whole point of the hatch is an A/B against the per-hit
+  // shading it replaces.
+  //
+  // BUILD-TIME, not live: the atlas plane is compiled into every trace kernel
+  // that samples it and the card words are sized into the bits region, so
+  // flipping the hatch needs a rebuild (the same contract every other
+  // `__gi*` structural hatch in this file has).
+  #surfaceCacheEnabled() {
+    const hatch = globalThis.__giSurfaceCache;
+    if (hatch !== undefined) return hatch === true;
+    return this.component?.props?.surfaceCache === true;
+  }
+
+  /**
+   * The three atlas planes, created ONCE and kept for the system's life —
+   * exactly like `_giTargets`, and for the same reason: a trace kernel compiled
+   * against `srcRadiance` holds that texture until it is recompiled, and
+   * swapping in a fresh one is invisible to three's bind-group generation check
+   * (see createGiTargets' own note on the forced version).
+   */
+  #ensureSurfaceCacheAtlas() {
+    if (this._srcAtlas) return this._srcAtlas;
+    const size = Number(globalThis.__giSrcAtlasSize) || undefined;
+    this._srcAtlas = createSurfaceCacheAtlas({ size, name: "giSrc" });
+    console.log(
+      `[gi] surface-cache: atlas ${this._srcAtlas.size}² × 3 rgba16f = ` +
+        `${(this._srcAtlas.stats.bytes / 1048576).toFixed(1)}MB ` +
+        `(${this._srcAtlas.stats.sampledInHotPath} sampled in the hot path, ` +
+        `${this._srcAtlas.stats.storageTexturesWhenLit} storage textures while lighting)`,
+    );
+    return this._srcAtlas;
+  }
+
+  /**
+   * Rebuilds every adopted mover's cards: plan → atlas rects → packed words →
+   * one pool allocation → one region upload. Integration point 3.
+   *
+   * THE POOL IS A BUMP ALLOCATOR THAT NEVER RECYCLES (`allocPoolWords`, shared
+   * with the BVH blocks), so this is deliberately NOT per-frame: it runs on
+   * adoption churn and on a large eye-distance change, which is what §6.2's
+   * screen-projected resolution actually depends on. When the allowance runs
+   * out the cache stops rebuilding and says so — the module's rule against
+   * silent caps.
+   */
+  #rebuildSurfaceCache(sc) {
+    const dyn = this._dynSet;
+    if (!dyn?.enabled) return false;
+    const objects = [];
+    dyn.forEachEntry((entry) => {
+      objects.push({
+        mesh: entry.mesh,
+        // The adoption entry IS the shape — reconstructing one here would be a
+        // second taxonomy, which is the trap `cardPlan` documents.
+        shape: { type: entry.type, center: entry.center, halfExtents: entry.halfExtents },
+        objIndex: entry.index,
+        key: entry.key,
+      });
+    });
+    sc.cards = [];
+    sc.built = null;
+    if (!objects.length) return false;
+
+    // Allocate BEFORE building, because `poolBaseWord` has to be the region's
+    // own `rel` for the packed `cardTableRel` values to be relative to
+    // `baseWord` (the convention words +20/+21 already use). The worst case is
+    // exact — constant stride, `cardLayerCount` layers per mesh — so the tail
+    // slack is at most the demoted objects' tables.
+    const worst = objects.reduce((a, o) => a + CARD_SLOTS * CARD_WORDS * cardLayerCount(o.mesh), 0);
+    const region = dyn.allocPoolWords(worst);
+    if (!region) {
+      console.log(
+        `[gi] surface-cache: dynamic pool has no room for ${worst} card words after ` +
+          `${sc.rebuilds} rebuild(s) — the cache is FROZEN at its last build ` +
+          "(raise __giDynMeshWords or rebuild GI to reclaim the pool)",
+      );
+      sc.frozen = true;
+      return false;
+    }
+
+    const eye = this.engine.camera?.getWorldPosition(new THREE.Vector3()) ?? new THREE.Vector3();
+    const built = buildSurfaceCache({
+      objects,
+      atlasSize: sc.atlas.size,
+      poolBaseWord: region.rel,
+      poolCapacityWords: region.words,
+      eye,
+      detectConcavity: globalThis.__giSrcConcavity !== false,
+    });
+    // The upload is a staged compute copy, so it lands on a LATER frame than
+    // this build. The returned block is what says when — publishing word +23
+    // before it would point the consumer at an un-uploaded region. (Zeros read
+    // as "inactive slot", so the failure would be a silent fallback rather than
+    // garbage, which is precisely the kind of thing that hides for weeks.)
+    sc.uploadBlock = dyn.queueRegionUpload(region.abs, built.words);
+    sc.built = built;
+    // `buildSurfaceCache` entries carry `objIndex` and a display `name`, not the
+    // adoption key `setCardTable` needs — so the mapping is kept here rather
+    // than pushed into the CPU builder, which has no business knowing about
+    // adoption at all.
+    sc.keyByObjIndex = new Map(objects.map((o) => [o.objIndex, o.key]));
+    sc.rebuilds++;
+    sc.eye.copy(eye);
+    sc.published = false;
+
+    // Flatten to the per-frame scheduler's unit of work: one CARD, with the
+    // atlas rect in texels and its own slice of the EMA history.
+    let accum = 0;
+    let overflow = 0;
+    let layered = 0;
+    for (const e of built.entries) {
+      if (!e.words || !e.cardTableRel) continue;
+      const o = objects.find((x) => x.objIndex === e.objIndex);
+      for (const c of e.cards) {
+        // DEPTH-PEEL LAYERS ARE NOT WIRED END TO END. The table index IS
+        // `layer*6 + slot`, but the trace-side pack carries slot 0..5 only
+        // (`i*OBJ_SLOT_STRIDE + slot`) and the lighting pass decodes the axis
+        // from the same 6 states — so a layer-1 card would be lit into a rect
+        // nothing ever reads. Skipped out loud rather than lit for nothing;
+        // `__giSrcCards` is the opt-in that would need the layer selection
+        // §6.2 itself says the budget does not cover.
+        if (c.layer > 0) { layered++; continue; }
+        const texels = c.rect.w * c.rect.h;
+        if (accum + texels > sc.lightPass.accumTexels) { overflow++; continue; }
+        sc.cards.push({
+          objIndex: e.objIndex,
+          slot: c.slot,
+          rectX: c.rect.x, rectY: c.rect.y, resU: c.rect.w, resV: c.rect.h,
+          accumBase: accum,
+          // The card's TEXEL area — `cardResolution` already sized it by
+          // `k·worldSize/distance`, so this IS the screen projection at build
+          // time; the scheduler only has to re-apply the CURRENT eye distance.
+          texelArea: texels,
+          mesh: o?.mesh ?? null,
+          lastFrame: -1,
+        });
+        accum += texels;
+      }
+    }
+    if (overflow > 0) {
+      console.log(
+        `[gi] surface-cache: ${overflow} card(s) past the ${sc.lightPass.accumTexels}-texel history ` +
+          "capacity — they keep the mean-albedo path (raise __giSrcAccumTexels)",
+      );
+    }
+    if (layered > 0) {
+      console.log(
+        `[gi] surface-cache: ${layered} depth-peel card(s) beyond layer 0 SKIPPED — ` +
+          "the trace-side slot pack and the lighting pass both address 6 slots, " +
+          "so extra layers would be lit into rects nothing reads",
+      );
+    }
+    console.log(
+      `[gi] surface-cache: build #${sc.rebuilds} — ${built.stats.cached}/${built.stats.objects} objects cached, ` +
+        `${built.stats.cardsAllocated} cards, atlas ${(built.stats.atlasOccupancy * 100).toFixed(1)}% full, ` +
+        `res scale ${built.stats.resScale}, ${built.poolWords}/${region.words} pool words` +
+        (built.demoted.length ? ` — demoted: ${built.demoted.map((d) => `${d.name}(${d.reason})`).join(", ")}` : ""),
+    );
+    return true;
+  }
+
+  /**
+   * Per-frame half: decide whether the tables are stale, choose this frame's
+   * cards, and dispatch §6.6's lighting pass.
+   *
+   * THE BUDGET IS HARD. `lightPass` dispatches a fixed texel count (a compute
+   * node's size is baked at construction), so the choice here is which cards get
+   * to occupy it — priority = SCREEN-PROJECTED AREA × AGE, so a big near card
+   * refreshes often and a small far one still cannot starve. What did not fit is
+   * logged rather than dropped quietly.
+   */
+  #refreshSurfaceCache(renderer) {
+    const sc = this._surfaceCache;
+    const dyn = this._dynSet;
+    if (!sc || !dyn?.enabled) return;
+
+    // Adoption churn: the card table is indexed by OBJECT SLOT, so a released
+    // mover's table would be read by whoever takes its slot next.
+    let sig = "";
+    dyn.forEachEntry((e) => { sig += `${e.key}:${e.type};`; });
+    const eye = this.engine.camera?.getWorldPosition(this._srcEye ??= new THREE.Vector3());
+    // §6.2's resolution is screen-projected, so a big eye move invalidates the
+    // whole plan — not the radiance, the CARD SIZES.
+    const moved = eye ? eye.distanceTo(sc.eye) : 0;
+    const eyeStale = sc.cards.length > 0 && moved > Math.max(2, sc.meanDistance * 0.35);
+    if (!sc.frozen && (sig !== sc.sig || (eyeStale && this._frame - sc.builtFrame > 120))) {
+      sc.sig = sig;
+      sc.builtFrame = this._frame;
+      this.#rebuildSurfaceCache(sc);
+    }
+    if (!sc.cards.length) return;
+
+    // Priority = SCREEN-PROJECTED AREA × AGE. `texelArea` is the card's own
+    // resolution, which `cardResolution` already derived from
+    // `k·worldSize/distance` at build time — so the only thing left to apply is
+    // how far the eye has moved SINCE, hence the 1/d² against the current eye.
+    // A never-lit card (`lastFrame < 0`) gets an enormous age so it cannot be
+    // starved out by big neighbours on its first frame.
+    let meanD = 0;
+    for (const c of sc.cards) {
+      const e = c.mesh?.matrixWorld?.elements;
+      const d = e && eye ? Math.max(0.25, Math.hypot(e[12] - eye.x, e[13] - eye.y, e[14] - eye.z)) : 8;
+      meanD += d;
+      const age = c.lastFrame < 0 ? 1e6 : this._frame - c.lastFrame;
+      c.priority = (c.texelArea / (d * d)) * Math.max(1, age);
+    }
+    sc.meanDistance = meanD / sc.cards.length;
+    const order = sc.cards.slice().sort((a, b) => b.priority - a.priority);
+
+    const budget = sc.lightPass.budgetTexels;
+    const picked = [];
+    let texels = 0;
+    let droppedCards = 0;
+    let droppedTexels = 0;
+    for (const c of order) {
+      const n = c.resU * c.resV;
+      if (picked.length < sc.lightPass.workCapacity && texels + n <= budget) {
+        picked.push(c);
+        texels += n;
+      } else {
+        droppedCards++;
+        droppedTexels += n;
+      }
+    }
+    sc.lightPass.setWork(picked);
+    sc.lightPass.stats.cardsDropped = droppedCards;
+    sc.lightPass.stats.texelsDropped = droppedTexels;
+    // THE MODULE'S RULE ABOUT SILENT CAPS. Throttled, because a scene that is
+    // permanently over budget would otherwise log every frame — but never
+    // suppressed, because "the cache looks laggy" and "the cache is dropping
+    // 80% of its cards every frame" are the same symptom and only this line
+    // tells them apart.
+    if (droppedCards > 0 && this._frame - (sc.dropLoggedFrame ?? -1e9) > 300) {
+      sc.dropLoggedFrame = this._frame;
+      console.log(
+        `[gi] surface-cache: budget ${texels}/${budget} texels for ${picked.length} card(s) — ` +
+          `${droppedCards} card(s) (${droppedTexels} texels) DEFERRED to a later frame ` +
+          "(raise __giSrcTexelBudget, or accept the slower refresh)",
+      );
+    }
+    if (!sc.lightPass.hasWork()) return;
+
+    // ITS OWN DISPATCH. Never appended to `state.queue` and never folded into
+    // the resolve: this writes 3 storage textures against a WebGPU baseline of
+    // 4, and the resolve already writes 3 or 4 of its own.
+    giCompute(renderer, [sc.lightPass.compute]);
+    if (giSkippedComputes.has(sc.lightPass.compute)) return;
+    sc.lightPass.stats.dispatches++;
+    for (const c of picked) c.lastFrame = this._frame;
+
+    // PUBLISH LAST. Word +23 is what switches the consumer on, and until this
+    // pass has actually run the atlas is uninitialized memory — publishing the
+    // tables first makes every cached mover read black for the few frames a
+    // fresh compute pipeline takes to compile.
+    if (!sc.published && sc.built && sc.uploadBlock?.uploaded) {
+      sc.published = true;
+      let n = 0;
+      for (const e of sc.built.entries) {
+        if (!e.words || !e.cardTableRel) continue;
+        const key = sc.keyByObjIndex?.get(e.objIndex);
+        if (key != null && dyn.setCardTable(key, e.cardTableRel)) n++;
+      }
+      console.log(`[gi] surface-cache: published ${n} card table(s) — movers now shade from the atlas`);
+    }
   }
 
   /**

@@ -10,8 +10,9 @@
 //      mirroring, same EPS guards. Where §6.4's prose and the real packer
 //      disagree, THE PACKER WINS; every such case is listed below.
 //
-// The §6.6 lighting pass is NOT here, and nothing is wired into GISystem — see
-// the INTEGRATION POINTS block at the bottom of this file.
+// The §6.6 lighting pass is NOT here — it is `surfaceCacheLight.js`, the only
+// writer of these three planes. What GISystem had to touch to wire all of it up
+// is recorded in the INTEGRATION POINTS block at the bottom of this file.
 //
 // ══ BINDING BUDGET (§6.5, audited 2026-08-07) ═══════════════════════════════
 //
@@ -122,6 +123,24 @@ const COMP = ["x", "y", "z"];
 // and a freshly constructed texture has version 0 — so swapping one brand-new
 // texture for another is INVISIBLE and every material keeps the destroyed one.
 let atlasGeneration = 0;
+
+/**
+ * Words the card tables need in the dynamic region, for `maxObjects` objects at
+ * `layers` depth-peel layers — integration point 1. Constant stride by
+ * construction (§6.4 indexes the table by a normal, so a plane still occupies
+ * all 6 slots), which is what makes this a multiply and not a scan.
+ *
+ * `slack` is a rebuild allowance, NOT padding: `allocPoolWords` is a bump
+ * allocator that never recycles (the BVH pool has the same contract), so every
+ * adoption-churn rebuild of the cache consumes another table's worth. 48 words
+ * per object per rebuild is small enough that 32 rebuilds cost less than one
+ * mesh BVH — and `buildSurfaceCache` reports `pool-full` out loud when it runs
+ * out, so the failure is a log rather than a wrong colour.
+ */
+export function surfaceCachePoolWords(maxObjects = 16, layers = 1, slack = 32) {
+  const perObject = CARD_SLOTS * CARD_WORDS * Math.max(1, layers);
+  return Math.max(1, maxObjects) * perObject * Math.max(1, slack);
+}
 
 /** Snaps a requested edge to the nearest legal tier at or below it. */
 export function snapAtlasTier(size) {
@@ -485,47 +504,46 @@ export function createCardRadianceSampler({
 
 // ═══════════════════════════════════════════════════════ INTEGRATION POINTS
 //
-// NOTHING here is wired in. What GISystem (and one giField site) would have to
-// touch, named exactly:
+// WIRED, 2026-08-07 — behind `__giSurfaceCache` / the `surfaceCache` prop, which
+// DEFAULT OFF. Where each point landed, and what changed from the plan:
 //
-// 1. `GISystem.js` — the dynamic-region sizing block (`#buildGiField`, around
-//    the `dynWords = dynHeaderWords() + dynPoolWords` line, GISystem.js:6134):
-//    the card table needs `entries * CARD_SLOTS * CARD_WORDS` words on top of
-//    the BVH pool, or `buildSurfaceCache` will report `pool-full` demotions.
+// 1. `GISystem.js` `#buildOccupancyField` — `surfaceCachePoolWords()` is added
+//    to `dynPoolWords`. AS PLANNED, plus a rebuild allowance: `allocPoolWords`
+//    never recycles, so adoption churn re-allocates a fresh table each time.
 //
-// 2. `GISystem.js` — beside `createGiTargets`: `createSurfaceCacheAtlas(...)`,
-//    kept across rebuilds like the screen targets are, disposed in the same
-//    teardown. Only `atlas.hotBindings().srcRadiance` may reach a trace.
+// 2. `GISystem.js` `#ensureSurfaceCacheAtlas` — created lazily beside the screen
+//    targets, kept across rebuilds, disposed only in `#dispose`. AS PLANNED.
+//    Only `atlas.hotBindings().srcRadiance` reaches a trace (giField).
 //
-// 3. `GISystem.js` — after adoption settles, per field build:
-//      const built = buildSurfaceCache({ objects, poolBaseWord: <from alloc>, … });
-//      const region = dyn.allocPoolWords(built.poolWords);   // bump allocator
-//      dyn.queueRegionUpload(region.abs, built.words);       // one-shot copy
-//      for (const e of built.entries) dyn.setCardTable(e.key, e.cardTableRel);
-//    `buildSurfaceCache`'s `poolBaseWord` must be `region.rel` so the packed
-//    `cardTableRel` values are relative to `baseWord`, like words +20/+21.
-//    Re-run on adoption churn and on a large eye-distance change (§6.2's
-//    resolution is screen-projected).
+// 3. `GISystem.js` `#rebuildSurfaceCache` — `buildSurfaceCache` →
+//    `allocPoolWords` → `queueRegionUpload` → `setCardTable`, in that order.
+//    ONE DEVIATION: `setCardTable` is DEFERRED until the lighting pass has
+//    actually dispatched once. Word +23 is what turns the consumer on, and the
+//    atlas is uninitialized memory until something writes it — publishing the
+//    table first makes every mover read black for the handful of frames a fresh
+//    compute pipeline takes to compile.
 //
-// 4. `dynamicObjects.js` `traceDynBody` — the three places that set `bestObj`
-//    (the OBB branch, the BVH branch, the analytic branch): pack the CARD SLOT
-//    alongside the object index, `bestObj = i*8 + slot`. Exact in f32 (≤ 512)
-//    and it is the only place the object-space normal exists (note H). The OBB
-//    branch already has axis + sign in hand; the other two have `nL` before the
-//    covariant transform and before the double-sided flip — use the UNFLIPPED
-//    one, the packer's cards face outward.
+// 4. `dynamicObjects.js` `traceDynBody` — all three `bestObj` sites now pack
+//    `i*OBJ_SLOT_STRIDE + slot`. AS PLANNED, and forced: note H. The OBB branch
+//    gets the slot from the axis + face sign it already has (2 ALU); the BVH and
+//    analytic branches from `cardSlotFromLocalNormal(nL)` — the UNFLIPPED
+//    object-space normal, because the packer's cards face outward. Packed
+//    UNCONDITIONALLY: `dynObj` has exactly one consumer, and a second trace
+//    variant would double the kernel's WGSL for a multiply.
 //
-// 5. `giField.js:1559-1561` (`createOccupancySceneTrace`) — the consumer. Today:
-//      const surf = dyn.surfaceAt(r.dynObj);
-//    becomes: split `r.dynObj` into index and slot, `dyn.cardFrameAt(idx, hp)`
-//    for the card-table base + local point + half extents, then
-//    `sampler.sampleOrFallback({ …, fallback: surf.albedo })`. `surfaceAt` STAYS
-//    — it is the fallback, and §6.7 demotions depend on it.
+// 5. `giField.js` `createOccupancySceneTrace` — the consumer. `dyn.splitObj`,
+//    then `cardFrameAt(index, hp)` + `sampleAtSlot`. DEVIATION FROM THE PLAN'S
+//    `sampleOrFallback({ …, fallback: surf.albedo })`: `srcRadiance` carries
+//    OUTGOING RADIANCE, not albedo, so the two sides of that select are not the
+//    same quantity. The fallback is the existing per-hit shading — and it is an
+//    If/Else, not a select, because skipping that shading (a light loop plus one
+//    shadow ray per light) IS the win. `surfaceAt` stays, as the plan requires:
+//    it feeds both the fallback and the cache's own albedo.
 //
-// 6. `GISystem.js` profile/MCP — §6.8's `profile.giSurfaceCache` op reads
-//    `atlas.stats` plus `buildSurfaceCache`'s `stats`/`demoted`.
+// 6. `atlas.stats` + `buildSurfaceCache().stats`/`.demoted` +
+//    `lightPass.stats` are what a `profile.giSurfaceCache` op should read;
+//    GISystem republishes all three under `this._surfaceCache.profile`.
 //
-// NOT here, and deliberately: §6.6's lighting pass. It is its own dispatch
-// (never folded into the resolve — §6.5's storage-texture wall), it writes the
-// three planes `lightingTargets()` returns, and it has to be counted against the
-// 12-uniform wall while it is threaded (§6.6).
+// AND: §6.6's lighting pass now exists, in `surfaceCacheLight.js` — its own
+// dispatch, 3 storage textures, 2 uniform buffers. Read that file's header for
+// the count and for the four places §6.6 disagreed with the real code.
