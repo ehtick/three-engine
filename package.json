@@ -111,6 +111,7 @@
     "test:gi-lighttree": "node scripts/run-gi-light-tree-test.mjs",
     "test:gi-boot-ambient": "node scripts/run-gi-boot-ambient-test.mjs",
     "gi:shot-diff": "node scripts/run-gi-shot-diff.mjs",
+    "gate:gi-gather": "node scripts/run-gi-gather-invariance-test.mjs",
     "probe:gi-mover-bounce": "node scripts/run-gi-mover-bounce.mjs",
     "probe:gi-emissive-cost": "node scripts/run-gi-emissive-cost.mjs",
     "probe:gi-emitter-cap": "node scripts/run-gi-emitter-cap.mjs",
