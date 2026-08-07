@@ -1585,11 +1585,49 @@ function createOccupancySceneTrace(
     // Self-bias (spec §5.3): start a quarter of a coarse cell out so a probe
     // sitting on a surface does not instantly hit the voxel it lives in.
     const tMin = float(world.minCell).mul(0.25).toVar();
+    // ── MOVERS ARE INVISIBLE TO DIFFUSE TRANSPORT (`__giDiffuseSkipMovers`) ──
+    //
+    // THE BUG THIS EXISTS FOR: "light just jumps around, randomly blinks" while
+    // an object moves or rotates — reported since the beginning, never fixed.
+    // Measured 1.404 reversals/px, 23.4% of pixels popping (run-gi-flicker-frame
+    // on the user's Sponza with an orbiting sphere).
+    //
+    // WHY IT HAPPENS. These rays are a SMALL, FIXED, POSE-INDEPENDENT direction
+    // set — 16 per c0 probe, a handful per field cell — and each one either hits
+    // the mover's exact triangles or does not. Binary. Rotate the object one
+    // degree and a DIFFERENT SUBSET blocks, so the estimate moves by O(1/N)
+    // quanta with no continuity between neighbouring poses. Each frame is a
+    // deterministic function of the pose, but a chaotic one, and a pose is never
+    // revisited — which is indistinguishable from randomness. That is exactly
+    // the "it gets random as the object moves" report, and it is why chasing the
+    // CONVERGED image never touched it: the converged image is fine; the path
+    // BETWEEN poses was never continuous.
+    //
+    // THE PATTERN, ALREADY PROVEN HERE ON EMISSIVES. Bright emissive meshes were
+    // "blocky and flickery" through the voxel field — same disease, same words —
+    // and the fix was not better sampling but PROMOTION: they leave the sampled
+    // field (voxel emissive zeroed, see GISystem #slotSurface) and return as
+    // analytic emitter slots, smooth because nothing discrete samples them.
+    // Movers got only HALF of that: their REPRESENTATION was promoted (exact
+    // OBB/BVH, "movers leave voxelization") while they stayed in the discrete
+    // ray transport. The flicker is the unfinished half.
+    //
+    // So finish it. Diffuse rays skip movers entirely and the field becomes
+    // exactly as stable as a static scene — because to this estimator it IS one.
+    // The occlusion comes back CONTINUOUSLY, in closed form, in the gather
+    // (cascadeGather's moverOcclusion): a sphere's cosine-weighted blocked
+    // fraction is analytic, so rotating one is a no-op by construction, which is
+    // what the eye expects and what sampling could never deliver.
+    //
+    // NOT AFFECTED, deliberately: the screen-space light/emitter shadow channels
+    // still trace movers per pixel and densely — that path never popped.
+    const skipMovers = globalThis.__giDiffuseSkipMovers === true;
     const r = trace(o, d, tMin, float(tMaxWorld), {
       steps,
       macroSteps: MAX_MACRO_STEPS,
       profile: true,
-      dynObj: shadeDynamic,
+      dynObj: shadeDynamic && !skipMovers,
+      ...(skipMovers ? { dynamics: false } : {}),
     });
     const p = o.add(d.mul(r.t)).add(r.normal.mul(float(world.minCell).mul(0.5))).toVar();
     const shaded = radianceSampler(p, r.normal);

@@ -26,7 +26,7 @@
 // second transport implementation. Direct material shading here deliberately
 // bypasses any G-buffer/deferred-resolve layer (where the prior attempt's
 // never-root-caused stripe bug lived).
-import { Fn, If, Loop, Return, cos, float, floor, fract, instanceIndex, instancedArray, max, mix, mod, select, sin, smoothstep, sqrt, step, texture3D, uniform, vec2, vec3, vec4 } from "three/tsl";
+import { Fn, If, Loop, Return, acos, atan, cos, float, floor, fract, instanceIndex, instancedArray, max, mix, mod, select, sin, smoothstep, sqrt, step, texture3D, uniform, vec2, vec3, vec4 } from "three/tsl";
 import { octahedralTexelIndex, octahedralTexelWeight, octahedralUV } from "./cascadeTrace.js";
 import { sharedFn } from "./giFn.js";
 import { emitterAngularRadius, emitterSlotFactor, emitterSurfaceT } from "./giLight.js";
@@ -611,7 +611,50 @@ export const gatherViewBias = uniform(0.5);
  * @param {Array} cascades from createRadianceCascades (uses cascades[0])
  * @returns {(P, N) => vec3} TSL irradiance sampler
  */
-export function createIrradianceGather(cascades, probeIrradiance = null, fieldCellMax = null, name = "giGather", occupancy = null, depthMoments = null, activeRayHitMode = null) {
+/**
+ * ANALYTIC MOVER OCCLUSION — the other half of `__giDiffuseSkipMovers`.
+ *
+ * Once diffuse rays stop intersecting movers (see giField's transport march),
+ * their shadow has to come back, and it must come back as a CONTINUOUS function
+ * of the transform — that is the entire point. Sampling gave a pose-chaotic
+ * estimate; this gives a closed form whose derivative exists everywhere, so a
+ * rotating sphere is analytically a no-op and a translating one slides.
+ *
+ * Iñigo Quílez's exact sphere-occlusion integral: the cosine-weighted fraction
+ * of the hemisphere at (P, N) subtended by a sphere, including the case where
+ * the horizon cuts the sphere. Not an approximation of the form factor — the
+ * closed-form solution of it.
+ *
+ * GUARDS, because every term here has a singularity the shipped scene will find:
+ *   · receiver INSIDE the sphere (h < 1): the formula's (h²−1) goes negative.
+ *     Fully occluded, return 1.
+ *   · N parallel to the sphere direction (|nl| → 1): 1−nl² → 0 under a sqrt
+ *     divisor. Floored.
+ *   · degenerate radius/distance: l and R floored off zero.
+ * A NaN here does not look like a bug, it looks like a black pixel — and this
+ * runs on every shaded pixel, so the guards are load-bearing, not defensive.
+ */
+const sphereOcclusion = (P, N, sph) => {
+  const di = sph.xyz.sub(P).toVar();
+  const l = di.length().max(1e-4).toVar();
+  const nl = N.dot(di.div(l)).toVar();
+  const h = l.div(sph.w.max(1e-4)).toVar();
+  const h2 = h.mul(h).toVar();
+  const k2 = float(1).sub(h2.mul(nl).mul(nl)).toVar();
+  // Sphere entirely above (or below) the horizon — the cheap branch.
+  const far = max(nl, 0).div(h2.max(1e-4)).toVar();
+  // Horizon-cutting branch.
+  const h2m1 = h2.sub(1).max(1e-4).toVar();
+  const oneMinusNl2 = float(1).sub(nl.mul(nl)).max(1e-4).toVar();
+  const inner = nl.mul(acos(nl.negate().mul(sqrt(h2m1.div(oneMinusNl2))).clamp(-1, 1)))
+    .sub(sqrt(k2.max(0).mul(h2m1)));
+  const near = inner.div(h2.max(1e-4)).add(atan(sqrt(k2.max(0).div(h2m1)))).div(Math.PI);
+  const res = select(k2.greaterThan(0), near, far);
+  // Inside the sphere → fully blocked. Outside → clamp the integral to [0,1].
+  return select(h.lessThan(1), float(1), res.clamp(0, 1));
+};
+
+export function createIrradianceGather(cascades, probeIrradiance = null, fieldCellMax = null, name = "giGather", occupancy = null, depthMoments = null, activeRayHitMode = null, moverOccluders = null) {
   const occupancyVoxel = occupancy?.voxel ?? null;
   const c0 = cascades[0];
   const { world, grid, dirCount, dirRes } = c0;
@@ -992,10 +1035,36 @@ export function createIrradianceGather(cascades, probeIrradiance = null, fieldCe
       // cosine-weighted AVERAGE radiance times π — exact for uniform L at any
       // direction count and bounded E ≤ π·max(L), so the feedback loop's gain
       // stays ≤ albedo < 1 (always convergent). All-probes-rejected → 0.
+      // MOVER SHADOW, analytically. The transport rays no longer see movers at
+      // all (giField, `__giDiffuseSkipMovers`), so their occlusion is applied
+      // here instead — as a product of per-mover transmittances rather than a
+      // sum of occlusions, which keeps the result in [0,1] for overlapping
+      // movers without a clamp that would flatten their combined shadow.
+      //
+      // Single-occluder per mover, i.e. two movers in a line double-count their
+      // overlap slightly. That is the standard trade in every capsule/sphere
+      // shadow system and it is a smooth error, which is the only kind this
+      // change is willing to introduce.
+      const occ = moverOccluders
+        ? (() => {
+            const vis = float(1).toVar();
+            Loop({ start: 0, end: moverOccluders.max, name: "mo" }, ({ mo }) => {
+              If(float(mo).lessThan(moverOccluders.count), () => {
+                const sph = moverOccluders.spheres.element(mo).toVar();
+                // radius 0 = an empty slot; skip rather than divide by it.
+                If(sph.w.greaterThan(1e-4), () => {
+                  vis.mulAssign(float(1).sub(sphereOcclusion(P, N, sph)));
+                });
+              });
+            });
+            return vis;
+          })()
+        : null;
+      const shadowed = (e) => (occ ? e.mul(occ) : e);
       if (probeIrradiance) {
-        return acc.div(max(cosAcc, 1e-3)).mul(edgeFade);
+        return shadowed(acc.div(max(cosAcc, 1e-3))).mul(edgeFade);
       }
-      return acc.div(max(cosAcc, 1e-3)).mul(Math.PI).mul(edgeFade);
+      return shadowed(acc.div(max(cosAcc, 1e-3)).mul(Math.PI)).mul(edgeFade);
     },
   });
   // V (unit toward-camera) is optional — omitted = vec3(0) = no view bias,

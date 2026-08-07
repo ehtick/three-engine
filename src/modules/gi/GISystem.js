@@ -16,7 +16,7 @@
 // lights + promoted emissive emitters (uniform slots, zero rebakes), and
 // the GICascadeLight material injection.
 import * as THREE from "three/webgpu";
-import { Fn, If, cameraPosition, cos, float, fract, instanceIndex, mix, normalWorld, positionLocal, positionWorld, renderGroup, screenCoordinate, screenUV, select, sin, smoothstep, texture, uniform, vec2, vec3, vec4 } from "three/tsl";
+import { Fn, If, cameraPosition, cos, float, fract, instanceIndex, mix, normalWorld, positionLocal, positionWorld, renderGroup, screenCoordinate, screenUV, select, sin, smoothstep, texture, uniform, uniformArray, vec2, vec3, vec4 } from "three/tsl";
 import { createRadianceCascades } from "./cascadeTrace.js";
 import { GI_BOOT_AMBIENT_MAX_TICKS, bootAmbientStep } from "./bootAmbient.js";
 import { createCascadeMerge } from "./cascadeMerge.js";
@@ -1187,6 +1187,10 @@ export class GISystem {
     // work list are rotation/translation invariant by construction, so a drag
     // never touches them — see #buildOccupancyField.
     this.#refreshOccupancyTransforms(state.volume.occupancyField);
+    // AFTER the transform refresh, so the bounds this reads are this frame's.
+    // Reading them before would publish the previous pose's occluder spheres and
+    // give every mover shadow a one-frame lag against its own geometry.
+    this.#syncMoverOccluders();
     // Exact dynamic objects: live transforms into the header region, queued
     // geometry uploads, deferred voxel-slot parking. Before the gbuffer/
     // compute work so this frame's rays see this frame's pose.
@@ -4089,6 +4093,13 @@ export class GISystem {
       // are one contract and must size their radial tolerance off the same
       // trace medium.
       rayHitConfig.activeMode,
+      // ANALYTIC MOVER SHADOW, the return half of `__giDiffuseSkipMovers`.
+      // UNIFORMS, not the bits buffer: at MAX 16 movers this is 16 vec4s and one
+      // count, so it binds nothing new in a kernel that already sits near the
+      // uniform-buffer wall (see the §6.6 note directly below on why that wall
+      // decides the shape of everything here). The CPU already holds every
+      // mover's world bounds each frame, so the sphere is free.
+      this.#moverOccluders(),
     );
     // ── §6.6's LIGHTING PASS, the only writer of the three atlas planes ──────
     // ITS OWN DISPATCH, and it must stay that way: 3 storage textures against a
@@ -6848,6 +6859,68 @@ export class GISystem {
    * a geometry reupload: chunk counts were computed rotation-invariantly, so
    * nothing on the CPU has to be rebuilt when something moves.
    */
+  /**
+   * The mover-occluder uniform bundle the gather applies analytically, created
+   * once and refreshed in place by #syncMoverOccluders every frame.
+   *
+   * Returns null (and the gather compiles WITHOUT the occlusion loop at all)
+   * unless `__giDiffuseSkipMovers` is on — the two halves are one change and
+   * shipping half of it is strictly worse than shipping neither: rays skipping
+   * movers with no analytic term back means movers stop casting indirect
+   * shadows entirely, and the analytic term with rays still hitting them means
+   * every mover shadow is applied twice.
+   */
+  #moverOccluders() {
+    if (globalThis.__giDiffuseSkipMovers !== true) return null;
+    const max = Math.min(64, Math.max(4, Number(globalThis.__giMaxDynamicObjects) || 16));
+    this._moverOccluders ??= {
+      max,
+      count: uniform(0),
+      spheres: uniformArray(Array.from({ length: max }, () => new THREE.Vector4()), "vec4"),
+    };
+    return this._moverOccluders;
+  }
+
+  /**
+   * World bounding sphere per adopted mover, straight from the bounds the
+   * dynamic set already maintains. CURRENT bounds, never the SWEPT ones: the
+   * swept box is prev ∪ curr and would make a moving occluder's shadow smear
+   * along its path and then snap when the retain factor resets — reintroducing,
+   * in the analytic term, exactly the discontinuity this whole change removes.
+   *
+   * A bounding sphere is EXACT for the sphere movers (the reported repro) and
+   * conservative for boxes — a rotating box's shadow will be slightly too round
+   * and, notably, will not change as it spins. That is the correct trade for
+   * now: a smooth, slightly-wrong shadow beats a sharp, randomly-flickering
+   * one, and multi-sphere fitting for elongated shapes is the follow-up.
+   */
+  #syncMoverOccluders() {
+    const bundle = this._moverOccluders;
+    if (!bundle) return;
+    const dyn = this._dynSet;
+    let n = 0;
+    if (dyn?.enabled && dyn.forEachEntry) {
+      dyn.forEachEntry((entry) => {
+        if (n >= bundle.max || !entry?.boundsValid || entry.active === false) return;
+        const b = entry.currBounds;
+        if (!b || b.isEmpty?.()) return;
+        const cx = (b.min.x + b.max.x) * 0.5;
+        const cy = (b.min.y + b.max.y) * 0.5;
+        const cz = (b.min.z + b.max.z) * 0.5;
+        const r = Math.hypot(b.max.x - cx, b.max.y - cy, b.max.z - cz);
+        if (!(r > 1e-4)) return;
+        bundle.spheres.array[n].set(cx, cy, cz, r);
+        n++;
+      });
+    }
+    // Zero the tail: a stale radius in an unused slot is a shadow cast by an
+    // object that no longer exists, and the loop's `mo < count` gate is the
+    // only thing standing between that and the screen.
+    for (let i = n; i < bundle.max; i++) bundle.spheres.array[i].set(0, 0, 0, 0);
+    bundle.count.value = n;
+    bundle.spheres.needsUpdate = true;
+  }
+
   #refreshOccupancyTransforms(field) {
     if (!field?.placements) return;
     const scratch = new THREE.Matrix4();
