@@ -60,6 +60,61 @@ for (const file of opFiles) {
 const thin = descriptions.filter((d) => d.length < 40);
 check("every op explains itself to the model calling it", thin.length === 0, thin.map((d) => d.name).join(", "));
 
+// --- component properties: the half of the surface that is not an op ---------
+//
+// COMPONENT_ONLY below is only honest if `component.setProp` really can reach
+// everything, and reaching a property means being able to name a legal VALUE
+// for it. `component.types` is the one channel for that: it projects each
+// schema's key/label/type/options, and for a `select` the `options` array IS
+// the enum. A select that declares none is a property an assistant can only set
+// by guessing — and guessing wrong is silent, because the command bus stores
+// whatever it is handed and the inspector is the only thing that would have
+// constrained it. That is the failure this file exists to catch, one layer down
+// from a missing op: the tool is there, the property is there, and the agent
+// still cannot use it.
+//
+// The mesh's giMobility/giTrace pair (the 2026-08-07 split of `giDynamic`) is
+// exactly this case — neither tag has an op of its own, and neither needs one,
+// so their options list is the whole of their MCP surface.
+
+const schemaFiles = [];
+const collectSchemas = (dir) => {
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) collectSchemas(full);
+    else if (entry.name.endsWith(".js") && fs.readFileSync(full, "utf8").includes("static schema = [")) {
+      schemaFiles.push(full);
+    }
+  }
+};
+collectSchemas(path.join(ROOT, "src/engine/components"));
+collectSchemas(path.join(ROOT, "src/modules"));
+
+const optionless = [];
+let selects = 0;
+for (const file of schemaFiles) {
+  const src = fs.readFileSync(file, "utf8");
+  // Scoped to `static schema = [ … ]` so a `type: "select"` in unrelated code
+  // cannot be mistaken for a property descriptor. Inside it, descriptors run
+  // one after another and each opens with `key:`, so splitting on that gives
+  // one chunk per property without matching a single bracket.
+  for (const [, region] of src.matchAll(/static schema = \[([\s\S]*?)\n\s*\];/g)) {
+    for (const chunk of region.split(/\bkey:\s*"/).slice(1)) {
+      const key = /^(\w+)"/.exec(chunk)?.[1];
+      if (!key || !/type:\s*"select"/.test(chunk)) continue;
+      selects++;
+      if (!/\boptions:/.test(chunk)) optionless.push(`${path.basename(file, ".js")}.${key}`);
+    }
+  }
+}
+check(
+  "every select property tells an agent its legal values",
+  optionless.length === 0 && selects > 20,
+  optionless.length
+    ? `no options on ${optionless.join(", ")}`
+    : `${selects} select props across ${schemaFiles.length} components`,
+);
+
 // --- modules: each one either has ops, or says why it does not ----------------
 
 const moduleIds = [];
@@ -83,7 +138,7 @@ check("found the module catalogue", moduleIds.length >= 15, moduleIds.join(", ")
  * for them, because a button is a capability `component.setProp` cannot reach.
  */
 const COMPONENT_ONLY = {
-  gi: "Global illumination is one component with properties; the bake is automatic and driven by the scene, not by a button.",
+  gi: "Global illumination is properties — the gi component for the volume, and giMobility/giTrace on each mesh; the bake is automatic and driven by the scene, not by a button.",
   postprocessing: "Effects are properties of the post component; enabling the module is module.setEnabled.",
   "physics-rapier": "Bodies, colliders and joints are components; the layer matrix is scene.setSettings.",
   "virtual-geometry": "Cluster building happens on import when the module is on; the flag is a component/.meta property.",

@@ -241,7 +241,7 @@ defineOp({
   name: "component.types",
   readOnly: true,
   description:
-    "List every registered component type with its label and inspector schema. This is how you discover what `component.add` accepts and which props a type has.",
+    "List every registered component type with its label and inspector schema. This is how you discover what `component.add` accepts and which props a type has. A prop of type 'select' carries its `options` — those are the only legal values, so read them rather than guessing. A prop whose label says DEPRECATED exists only so older scenes still load; set the prop its label names instead, because writing the deprecated one is ignored once the replacement has been set.",
   params: {},
   run() {
     return getComponentTypes().map((type) => {

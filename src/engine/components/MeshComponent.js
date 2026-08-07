@@ -87,7 +87,23 @@ export class MeshComponent extends Component {
     // Only meaningful for movers — a static mesh is traced exactly by the
     // world shadow BVH no matter what this says.
     { key: "giTrace", label: "GI Trace", type: "select", options: ["auto", "bvh", "obb", "voxel"], showIf: (props) => props.giMobility !== "static" },
-    { key: "giDynamic", label: "GI Dynamic (legacy)", type: "select", options: ["auto", "static", "dynamic", "bvh", "obb"], hidden: true },
+    // `hidden` keeps this out of the inspector, but it does NOT cross the MCP
+    // bridge: `component.types` projects key/label/type/options only, so an
+    // assistant reading the schema sees THREE GI selects with nothing to rank
+    // them. The label is the one piece of free text that projection carries per
+    // property, so it has to name the replacement outright — otherwise the
+    // cheapest thing for a model to reach for is the one word it already knows,
+    // and setting `giDynamic` on a mesh whose pair is no longer "auto"/"auto"
+    // is silently ignored by the migration below. "voxel" is in the option list
+    // because scenes written before the split contain it, even though the
+    // pre-split dropdown never offered it.
+    {
+      key: "giDynamic",
+      label: "GI Dynamic (DEPRECATED — set giMobility + giTrace instead)",
+      type: "select",
+      options: ["auto", "static", "dynamic", "voxel", "bvh", "obb"],
+      hidden: true,
+    },
   ];
 
   constructor(props = {}) {
