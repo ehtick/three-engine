@@ -45,6 +45,7 @@
     "smoke:geoui": "node scripts/run-geometry-ui-smoke.mjs",
     "smoke:geoopen": "node scripts/run-geometry-open-visual.mjs",
     "test:mcp": "node scripts/run-mcp-test.mjs",
+    "test:mcp-multi": "node scripts/run-mcp-multi-test.mjs",
     "test:ai": "node scripts/run-ai-test.mjs",
     "smoke:ai": "node scripts/run-ai-smoke.mjs",
     "mcp": "node mcp/server.mjs",
@@ -103,7 +104,11 @@
     "test:fonts": "node scripts/run-fonts-test.mjs",
     "test:mcp-coverage": "node scripts/run-mcp-coverage-test.mjs",
     "smoke:mcp-tools": "node scripts/run-mcp-tools-smoke.mjs",
-    "test:gi-dynobj": "node scripts/run-gi-dynobj-bvh4-test.mjs"
+    "test:gi-dynobj": "node scripts/run-gi-dynobj-bvh4-test.mjs",
+    "probe:gi-mover-bounce": "node scripts/run-gi-mover-bounce.mjs",
+    "probe:gi-emissive-cost": "node scripts/run-gi-emissive-cost.mjs",
+    "probe:gi-emitter-cap": "node scripts/run-gi-emitter-cap.mjs",
+    "probe:gi-block-size": "node scripts/run-gi-block-size.mjs"
   },
   "dependencies": {
     "@dimforge/rapier3d-compat": "^0.19.3",

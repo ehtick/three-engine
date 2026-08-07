@@ -26,7 +26,8 @@
 //     (custom + torus/knot/…)       leaves (three-mesh-bvh collapsed,
 //                                   traversed in raw WGSL, compressed 8-wide)
 //   skinned / morphing            → not adopted (stay on the voxel path)
-//   mesh.userData.giDynamic       → override: "voxel" | "bvh" | "obb"
+//   mesh.userData.giTrace         → override: "voxel" | "bvh" | "obb"
+//   mesh.userData.giMobility      → "static" (never adopt) | "dynamic" (pin)
 //
 // Rays transform into object space with the UN-normalized inverse-transformed
 // direction, so the ray parameter t is preserved 1:1 with world t (the doc's
@@ -67,7 +68,18 @@
 //     +28..30    swept-bounds world max
 //     +31..33    shape params: sphere [r,-,-] · capsule [r, halfSeg,-] ·
 //                frustum [rBottom, rTop, halfHeight]
-//     +34..39    reserved (albedo/emissive — phase 2 material evaluation)
+//     +34..36    MEAN ALBEDO (rgb) — the colour a cascade ray shades an exact
+//                dynamic hit with. An adopted mover has left the voxel field
+//                (its occupancy slot is parked and its atlas slot cleared), so
+//                the trilinear radiance sample at its hit point reads the
+//                SURROUNDING room and the mover contributes none of its own
+//                colour. Measured 2026-08-07 on the mover-bounce rig: a red box
+//                on the voxel path put 16.1% red excess on the floor beside it;
+//                the same box adopted put 0.0% — the red/white frames were
+//                pixel-identical. Mean per OBJECT, not per texel: per-texel
+//                would need textures bound in the compute pass, and the gap
+//                being closed here is wrong-vs-right, not right-vs-detailed.
+//     +37..39    MEAN EMISSIVE (rgb), premultiplied by emissiveIntensity
 //   HEADER_WORDS = 16 + maxObjects*40, then the BVH pool.
 //
 // BVH4 node = 28 words: [ref0..ref3, then 4× (min.xyz,max.xyz) f32].
@@ -86,12 +98,16 @@
 // 4 = the uncompressed A/B arm): both functions in every trace kernel would
 // double the added WGSL, and kernel size is a first-class boot cost.
 import * as THREE from "three/webgpu";
-import { MeshBVH } from "three-mesh-bvh";
+import { MeshBVH, SAH, AVERAGE, CENTER } from "three-mesh-bvh";
+
+/** Split-strategy names for the static-scene build (`__giStaticBvhStrategy`). */
+export const BVH_STRATEGY = { sah: SAH, average: AVERAGE, center: CENTER };
 import {
   Fn, If, Loop, float, floatBitsToUint, instanceIndex, instancedArray, int,
   select, uint, uintBitsToFloat, uniformArray, vec2, vec3, vec4, wgslFn,
 } from "three/tsl";
 import { sharedFn } from "./giFn.js";
+import { resolveMaterialSurface } from "./voxelizeOnce.js";
 import { octDecodeTSL, octEncodeTSL } from "./rayHit/rayHitTSL.js";
 
 export const OBJ_WORDS = 40;
@@ -116,6 +132,44 @@ export const DYN_TYPE = { obb: 1, mesh: 2, sphere: 3, capsule: 4, frustum: 5 };
 const TWO_PI = Math.PI * 2;
 const fullSweep = (v, target) => Math.abs((v ?? target) - target) < 1e-3;
 
+// ═══════════════════════════════ TWO INDEPENDENT AXES (user directive, 33)
+// MOBILITY ("does this move?") and TRACE ("what surface do rays intersect?")
+// are orthogonal, and conflating them into one `giDynamic` list was a real
+// trap: the only values that promised exact triangles ("bvh") or a box
+// ("obb") ALSO pinned the object as a mover. A user who wants exact shadows
+// on static architecture — the whole point of the static shadow BVH — had no
+// way to say so, and picking a trace value dragged 30 Sponza meshes into the
+// per-ray mover loop (measured: 16 adopted at the cap, and every shadow ray
+// then walks 16 object BVHs instead of one shared world BVH).
+//
+// Static geometry already gets EXACT TRIANGLE shadows for free from the
+// world-space static BVH. Mobility "dynamic" buys nothing there and costs a
+// lot; it is for objects that actually move.
+const LEGACY_GI_DYNAMIC = {
+  static: { mobility: "static", trace: "auto" },
+  voxel: { mobility: "auto", trace: "voxel" },
+  none: { mobility: "auto", trace: "voxel" },
+  dynamic: { mobility: "dynamic", trace: "auto" },
+  bvh: { mobility: "dynamic", trace: "bvh" },
+  obb: { mobility: "dynamic", trace: "obb" },
+};
+
+/** Reads a mesh's GI mobility: "auto" | "static" | "dynamic". */
+export function giMobilityOf(mesh) {
+  const m = mesh?.userData?.giMobility;
+  if (m === "static" || m === "dynamic" || m === "auto") return m;
+  const legacy = LEGACY_GI_DYNAMIC[mesh?.userData?.giDynamic];
+  return legacy?.mobility ?? "auto";
+}
+
+/** Reads a mesh's GI trace representation: "auto" | "voxel" | "bvh" | "obb". */
+export function giTraceOf(mesh) {
+  const t = mesh?.userData?.giTrace;
+  if (t === "voxel" || t === "bvh" || t === "obb" || t === "auto") return t;
+  const legacy = LEGACY_GI_DYNAMIC[mesh?.userData?.giDynamic];
+  return legacy?.trace ?? "auto";
+}
+
 /**
  * Decides how a mesh would be represented if adopted as a dynamic object.
  * Returns { type, center, halfExtents, params } or null (not adoptable —
@@ -131,16 +185,15 @@ const fullSweep = (v, target) => Math.abs((v ?? target) - target) < 1e-3;
  *   · every OTHER geometry — custom, and defaults with no closed form
  *     (torus, torus-knot, polyhedra, lathe, extrude…) — gets the exact
  *     triangle BVH. Their triangles ARE the rendered border.
- *   · `mesh.userData.giDynamic` overrides: "voxel" (never adopt — keep the
- *     voxel path), "bvh" (force triangles), "obb" (force the bounding box).
+ *   · `mesh.userData.giTrace` overrides the representation: "voxel" (never go
+ *     exact — keep the voxel path), "bvh" (force triangles), "obb" (force the
+ *     bounding box). MOBILITY is not decided here — see giMobilityOf; a
+ *     "static" mesh is simply never offered to this function.
  */
 export function classifyDynamicShape(mesh) {
   if (!mesh?.geometry) return null;
-  const tag = mesh.userData?.giDynamic;
-  // "static" is the user-facing pin (never adopt); "voxel" is its legacy
-  // alias. "dynamic" pins ADOPTION EAGERNESS (GISystem adopts at load, no
-  // motion needed) but classifies by geometry like auto.
-  if (tag === "static" || tag === "voxel" || tag === "none" || tag === false) return null;
+  const tag = giTraceOf(mesh);
+  if (tag === "voxel") return null;
   if (mesh.isSkinnedMesh) return null;
   const geometry = mesh.geometry;
   if (geometry.morphAttributes?.position?.length) return null;
@@ -230,7 +283,7 @@ export function buildBvh8Words(geometry) {
  * levels, which preserves its SAH quality while dividing the traversal's pop
  * count; arity 8 additionally quantizes child bounds (see the header note).
  */
-export function buildBvhWords(geometry, arity = 8, triSlotOf = null) {
+export function buildBvhWords(geometry, arity = 8, triSlotOf = null, strategy = null) {
   const srcPos = geometry.attributes.position;
   const positions = srcPos.array.slice(0, srcPos.count * 3);
   let index;
@@ -251,7 +304,11 @@ export function buildBvhWords(geometry, arity = 8, triSlotOf = null) {
   const geom = new THREE.BufferGeometry();
   geom.setAttribute("position", new THREE.BufferAttribute(positions, 3));
   geom.setIndex(new THREE.BufferAttribute(index, 1));
-  const bvh = new MeshBVH(geom, { maxLeafTris: 8, indirect: false });
+  const bvh = new MeshBVH(geom, {
+    maxLeafTris: 8,
+    indirect: false,
+    ...(strategy != null ? { strategy } : null),
+  });
   if (bvh._roots.length !== 1) {
     // Multi-group geometry builds multiple roots; out of scope — caller keeps
     // the voxel path for this mesh.
@@ -412,7 +469,7 @@ export function buildBvhWords(geometry, arity = 8, triSlotOf = null) {
  * @param items [{ positions: Float32Array, index: TypedArray|null,
  *                 matrix: THREE.Matrix4, slot: number }]
  */
-export function buildStaticSceneBvhWords(items) {
+export function buildStaticSceneBvhWords(items, strategy = null) {
   let triTotal = 0;
   for (const it of items) {
     triTotal += Math.floor((it.index ? it.index.length : it.positions.length / 3) / 3);
@@ -442,7 +499,7 @@ export function buildStaticSceneBvhWords(items) {
   const index = new Uint32Array(triTotal * 3);
   for (let i = 0; i < index.length; i++) index[i] = i;
   geom.setIndex(new THREE.BufferAttribute(index, 1));
-  const packed = buildBvhWords(geom, 8, (origTri) => triSlot[origTri]);
+  const packed = buildBvhWords(geom, 8, (origTri) => triSlot[origTri], strategy);
   geom.dispose();
   return packed;
 }
@@ -688,7 +745,7 @@ const bvh8MaskedTraceWgsl = wgslFn(/* wgsl */ `
 
 	fn giStaticBvh8(
 		roL: vec3f, rdL: vec3f, tMin: f32, tMax: f32,
-		nodeBase: u32, triBase: u32, maskBase: u32,
+		nodeBase: u32, triBase: u32, maskBase: u32, anyHit: u32,
 		bits: ptr<storage, array<u32>, read_write>
 	) -> vec4f {
 
@@ -716,6 +773,7 @@ const bvh8MaskedTraceWgsl = wgslFn(/* wgsl */ `
 					let tw = triBase + (triStart + j) * 10u;
 					let slotId = bits[tw + 9u];
 					if ((bits[maskBase + (slotId >> 5u)] & (1u << (slotId & 31u))) != 0u) { continue; }
+					// (any-hit early-out lives at the acceptance test below)
 					let a = vec3f(bitcast<f32>(bits[tw]), bitcast<f32>(bits[tw + 1u]), bitcast<f32>(bits[tw + 2u]));
 					let b = vec3f(bitcast<f32>(bits[tw + 3u]), bitcast<f32>(bits[tw + 4u]), bitcast<f32>(bits[tw + 5u]));
 					let c = vec3f(bitcast<f32>(bits[tw + 6u]), bitcast<f32>(bits[tw + 7u]), bitcast<f32>(bits[tw + 8u]));
@@ -1022,6 +1080,43 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
   const scratchInv = new THREE.Matrix4();
   const scratchV = new THREE.Vector3();
 
+  /**
+   * Writes the mover's MEAN albedo/emissive into header words 34..39.
+   *
+   * `resolveMaterialSurface` is the same resolver the voxel path uses for a
+   * slot's mean colour — deliberately, so an adopted mover and its voxel self
+   * agree about what colour it is. A second convention here would show up as a
+   * hue step every time a mesh crossed the adopt/demote boundary.
+   *
+   * Returns true when anything changed (caller decides whether to re-sync).
+   */
+  const writeSurface = (entry) => {
+    const mesh = entry.mesh;
+    const material = Array.isArray(mesh?.material) ? mesh.material[0] : mesh?.material;
+    const stamp = `${material?.id ?? -1}:${material?.version ?? 0}`;
+    if (entry.surfaceStamp === stamp) return false;
+    entry.surfaceStamp = stamp;
+    const s = resolveMaterialSurface(mesh?.material, mesh?.name);
+    const i = entry.index;
+    wm(i, 34, s.color?.r ?? 1);
+    wm(i, 35, s.color?.g ?? 1);
+    wm(i, 36, s.color?.b ?? 1);
+    // Premultiplied: the shading site wants one number, and the voxel bake
+    // already folds intensity in the same place.
+    const k = s.emissiveIntensity ?? 1;
+    wm(i, 37, (s.emissive?.r ?? 0) * k);
+    wm(i, 38, (s.emissive?.g ?? 0) * k);
+    wm(i, 39, (s.emissive?.b ?? 0) * k);
+    // Diagnostics only — the header mirror is closure-private, and "did the
+    // mover's colour actually reach the GPU" is the first question every
+    // bounce measurement asks.
+    entry.surface = {
+      albedo: [s.color?.r ?? 1, s.color?.g ?? 1, s.color?.b ?? 1],
+      emissive: [(s.emissive?.r ?? 0) * k, (s.emissive?.g ?? 0) * k, (s.emissive?.b ?? 0) * k],
+    };
+    return true;
+  };
+
   const worldMatrixOf = (entry) => {
     const { mesh, instanceId } = entry;
     if (instanceId == null || !mesh.isInstancedMesh) return mesh.matrixWorld;
@@ -1037,13 +1132,20 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
    * near-misses fade shadow verdicts continuously — the same band-limit
    * contract the voxel marchers follow (WIDTH only, never admission).
    */
-  const traceDynBody = (o, d, t0, t1, penK, penW, exclP, meshes) => {
+  const traceDynBody = (o, d, t0, t1, penK, penW, exclP, meshes, objId) => {
     const rw = (rel) => bits.element(uint(baseWord).add(rel));
     const rf = (rel) => uintBitsToFloat(rw(rel));
     const count = rf(uint(0)).toInt().min(int(MAX)).toVar();
     const bestT = float(1e30).toVar();
     const bestHit = float(0).toVar();
     const bestCode = float(-1).toVar();
+    // WHICH object won, for consumers that need its surface (the cascade
+    // transport rays shade a dynamic hit from the header's mean albedo /
+    // emissive). Rides the return's `pen` slot, which is meaningless in the
+    // no-penumbra variant this flag is only ever paired with — cheaper than
+    // stealing bits from the oct-packed normal, which every shadow consumer
+    // reads.
+    const bestObj = objId ? float(-1).toVar() : null;
     const penAcc = float(1).toVar();
 
     Loop({ start: int(0), end: count, type: "int", condition: "<" }, ({ i }) => {
@@ -1129,6 +1231,7 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
             bestT.assign(enter);
             bestHit.assign(1);
             bestCode.assign(oct.x.mul(4095).floor().mul(4096).add(oct.y.mul(4095).floor()));
+            if (objId) bestObj.assign(i.toFloat());
           }).ElseIf(type.lessThan(2.5), () => {
             if (meshes) {
               // Wide-BVH exact-triangle refinement in object-local space
@@ -1148,6 +1251,7 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
                 bestT.assign(r.x);
                 bestHit.assign(1);
                 bestCode.assign(oct.x.mul(4095).floor().mul(4096).add(oct.y.mul(4095).floor()));
+                if (objId) bestObj.assign(i.toFloat());
               });
             }
           }).Else(() => {
@@ -1163,6 +1267,7 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
               bestT.assign(rs.x);
               bestHit.assign(1);
               bestCode.assign(oct.x.mul(4095).floor().mul(4096).add(oct.y.mul(4095).floor()));
+              if (objId) bestObj.assign(i.toFloat());
             });
           });
         });
@@ -1172,7 +1277,7 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
     return vec4(
       bestHit,
       select(bestHit.greaterThan(0.5), bestT, float(-1)),
-      penAcc,
+      objId ? bestObj : penAcc,
       bestCode,
     );
   };
@@ -1240,16 +1345,20 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
     },
 
     /**
-     * Nearest static-scene hit (masked exact triangles, world space).
+     * Static-scene hit (masked exact triangles, world space).
      * Returns the packed vec4 node: x = t (< 0 miss), yzw = geometric normal.
+     * `anyHit` (the SHADOW default) returns the first blocker found under
+     * near-first child ordering instead of the exact nearest — half the work,
+     * and visibility is a boolean question. Pass `{ anyHit: false }` where the
+     * hit POINT matters (reflection/gather style rays).
      */
-    traceStaticBvh(origin, dir, tMin, tMax) {
+    traceStaticBvh(origin, dir, tMin, tMax, { anyHit = globalThis.__giShadowAnyHit !== false } = {}) {
       const info = set.staticBvh;
       if (!info) return null;
       return bvh8MaskedTraceWgsl(
         vec3(origin), vec3(dir), float(tMin), float(tMax),
         uint(info.nodeBase), uint(info.triBase),
-        uint(baseWord + STATIC_MASK_WORD_BASE), bits,
+        uint(baseWord + STATIC_MASK_WORD_BASE), uint(anyHit ? 1 : 0), bits,
       ).toVar();
     },
 
@@ -1335,6 +1444,7 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
       wm(index, 31, prm[0] ?? 0);
       wm(index, 32, prm[1] ?? 0);
       wm(index, 33, prm[2] ?? 0);
+      writeSurface(entry);
       publishCount();
       if (globalThis.__giDynObjectsDebug) {
         console.log(`[gi] dynamic-objects: adopted "${mesh.name}" as ${shape.type} (slot ${index})`);
@@ -1447,6 +1557,11 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
         const typeVal = ready ? (DYN_TYPE[entry.type] ?? 0) : 0;
         if (!entry.published && ready) { entry.published = true; }
         wm(i, 19, typeVal);
+        // Live material swaps/edits: an adopted mover is excluded from the
+        // voxel path's content refresh, so this is the ONLY place its colour
+        // can be re-read. Guarded by an id:version stamp — a string compare
+        // per mover per frame, against a node-graph walk that is not.
+        if (writeSurface(entry)) changed = true;
       }
       if (changed) set.version++;
       if (headerDirty) syncHeaderUniform();
@@ -1499,7 +1614,12 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
       const pw = pen && opts.penWidth != null;
       const meshes = opts.meshes !== false && poolCapacity > 0;
       const excl = opts.excludePoint != null;
-      const key = `${pen ? 1 : 0}${pw ? 1 : 0}${meshes ? 1 : 0}${excl ? 1 : 0}`;
+      // `objId` returns the winning object's index in the pen slot. Mutually
+      // exclusive with penumbra by construction — they share the slot, and no
+      // consumer wants both (penumbra is a shadow-ray term; the index is for
+      // shading a transport-ray hit).
+      const objId = opts.objId === true && !pen;
+      const key = `${pen ? 1 : 0}${pw ? 1 : 0}${meshes ? 1 : 0}${excl ? 1 : 0}${objId ? 1 : 0}`;
       let fn = set._traceVariants.get(key);
       if (fn === undefined) {
         fn = sharedFn({
@@ -1522,7 +1642,7 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
             const penK = pen ? params[seat++] : null;
             const penW = pw ? params[seat++] : null;
             const exclP = excl ? params[seat++] : null;
-            return traceDynBody(o, d, t0, t1, penK, penW, exclP, meshes);
+            return traceDynBody(o, d, t0, t1, penK, penW, exclP, meshes, objId);
           },
         });
         set._traceVariants.set(key, fn);
@@ -1534,7 +1654,10 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
       const packed = fn(...args).toVar();
       const hit = packed.x.toVar();
       const t = packed.y.toVar();
-      const penOut = packed.z.toVar();
+      // Shared slot: the pen accumulator, or the winning object index (< 0 on
+      // a miss) when the caller asked for it.
+      const penOut = objId ? float(1) : packed.z.toVar();
+      const obj = objId ? packed.z.toVar() : null;
       // Oct-packed 2×12-bit world normal (exact in f32); < 0 ⇒ miss.
       const code = packed.w.toVar();
       const oy = code.mod(4096).div(4095).mul(2).sub(1);
@@ -1544,7 +1667,25 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
         vec3(dir).negate(),
         octDecodeTSL(vec2(ox, oy)),
       ).toVar();
-      return { hit, t, pen: penOut, normal };
+      return { hit, t, pen: penOut, normal, obj };
+    },
+
+    /**
+     * Mean surface of object `idx` (header words 34..39) — the albedo and
+     * emissive a transport ray shades an exact dynamic hit with. `idx` is the
+     * float index `trace({objId: true})` returns; a negative index reads
+     * object 0's words, so callers must gate on the index themselves (a
+     * branch they already have, since a static hit needs no lookup).
+     */
+    surfaceAt(idx) {
+      const rf = (rel) => uintBitsToFloat(bits.element(uint(baseWord).add(rel)));
+      const ob = uint(DYN_HEADER_RESERVED)
+        .add(float(idx).max(0).toUint().min(uint(MAX - 1)).mul(uint(OBJ_WORDS)))
+        .toVar();
+      return {
+        albedo: vec3(rf(ob.add(uint(34))), rf(ob.add(uint(35))), rf(ob.add(uint(36)))).toVar(),
+        emissive: vec3(rf(ob.add(uint(37))), rf(ob.add(uint(38))), rf(ob.add(uint(39)))).toVar(),
+      };
     },
 
     /**
@@ -1595,11 +1736,17 @@ export function composeFieldDynamics(field, dyn) {
 
   const mergeHit = (r, o, d, tMin, tMax, opts, hasKind) => {
     const wantPen = opts.penumbraK != null;
+    // `dynObj`: the caller wants to know WHICH mover it hit, so it can shade
+    // the hit from that object's surface instead of sampling voxel radiance
+    // the mover is no longer part of (the transport rays — see giField's
+    // createOccupancySceneTrace).
+    const wantObj = opts.dynObj === true && !wantPen;
     const dr = dyn.trace(o, d, tMin, tMax, {
       penumbraK: wantPen ? opts.penumbraK : null,
       penWidth: wantPen && opts.penWidth != null ? opts.penWidth : null,
       meshes: opts.dynamics !== "obb",
       excludePoint: opts.excludePoint ?? null,
+      objId: wantObj,
     });
     const better = dr.hit.greaterThan(0.5)
       .and(float(r.hit).lessThan(0.5).or(dr.t.lessThan(r.t)))
@@ -1612,6 +1759,7 @@ export function composeFieldDynamics(field, dyn) {
     // Dynamic hits report as the exact-triangle acceptance class — verdict
     // maps stay honest and the exhaustion gates (kind > 3.5) never fire.
     if (hasKind && r.kind != null) out.kind = select(better, float(2), float(r.kind)).toVar();
+    if (wantObj) out.dynObj = select(better, dr.obj, float(-1)).toVar();
     return out;
   };
 

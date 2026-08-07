@@ -20,6 +20,7 @@ import { sharedFn } from "./giFn.js";
 import { createInstanceGrid, loopCandidates } from "./instanceGrid.js";
 import { createSparseField } from "./sparseField.js";
 import { createTrilinearRadianceSampler } from "./voxelizeOnce.js";
+import { emitterSlotFactor, emitterSurfaceT } from "./giLight.js";
 import { RayHitMode } from "./rayHit/RayHitConfig.js";
 import { MAX_MACRO_STEPS } from "./rayHit/RayHitPacking.js";
 
@@ -607,12 +608,14 @@ export function createGiField(bounds, res, atlas, options = {}) {
     //
     // Without it, the legacy sphere trace of the composited SDF (+ sparse
     // bricks) — unchanged.
-    createSceneTrace: () => {
+    // `dynamicShade` ({ lightSlots, ambient }) is uniforms only — no storage
+    // binding, so the composed cascade kernels stay under the portable 8.
+    createSceneTrace: (dynamicShade = null) => {
       const sampler = createTrilinearRadianceSampler(
         radianceBuffer, { min: world.min }, res, world.cell, normalBuffer,
       );
       return occField
-        ? createOccupancySceneTrace(occField, world, sampler, 64, rayHitMode)
+        ? createOccupancySceneTrace(occField, world, sampler, 64, rayHitMode, dynamicShade)
         : createGiFieldTrace(distanceTexture, world, res, atlas, sampler, sparse);
     },
     createRadianceSampler: () => createTrilinearRadianceSampler(radianceBuffer, { min: world.min }, res, world.cell),
@@ -1503,6 +1506,7 @@ function createOccupancySceneTrace(
   radianceSampler,
   steps = 64,
   rayHitMode = RayHitMode.OccupancyLegacy,
+  dynamicShade = null,
 ) {
   // The one place the ray-hit mode swaps implementations. Interval semantics,
   // radiance lookup and the {rad, t} contract are identical across modes.
@@ -1517,6 +1521,26 @@ function createOccupancySceneTrace(
     : rayHitMode === RayHitMode.HybridBrickBox && occField.traceHybridBrick
       ? occField.traceHybridBrick
       : occField.traceOccupancy;
+  // EXACT-DYNAMIC HITS SHADE THEMSELVES (2026-08-07). Adoption parks a mover's
+  // occupancy slot and clears its atlas slot, so the voxel radiance buffer has
+  // nothing where the mover is — and a ray that hits its exact triangles used
+  // to come back with the SURROUNDING room's colour. Measured on the
+  // mover-bounce rig: a voxel-path red box put 16.1% red excess on the floor
+  // beside it, the same box adopted put 0.0% (its red and white frames were
+  // pixel-identical). So when the hit is a mover, shade it from its own header
+  // surface instead of sampling a field it left.
+  const dyn = occField.dynamicObjects;
+  const lightSlots = dynamicShade?.lightSlots ?? null;
+  const emitterSlots = dynamicShade?.emitterSlots ?? null;
+  const shadeDynamic = !!(dyn?.enabled && dyn.surfaceAt && (lightSlots?.length || emitterSlots?.length));
+  // Sun/point visibility for the mover's own direct term, through the SAME
+  // marcher the primary ray used (no extra WGSL, no new bindings) with
+  // dynamics excluded — so a mover cannot shadow itself and the ray costs one
+  // traversal per active light per mover hit. `__giDynShadeShadow = false`
+  // drops it: unshadowed movers bounce sun colour everywhere, which is the
+  // A/B that says whether the ray is worth its cost.
+  const shadeShadow = shadeDynamic && globalThis.__giDynShadeShadow !== false;
+  const farT = Math.hypot(world.size?.x ?? 0, world.size?.y ?? 0, world.size?.z ?? 0) || 1e3;
   return (origin, dir, tMaxWorld) => {
     const o = vec3(origin).toVar();
     const d = vec3(dir).toVar();
@@ -1527,10 +1551,98 @@ function createOccupancySceneTrace(
       steps,
       macroSteps: MAX_MACRO_STEPS,
       profile: true,
+      dynObj: shadeDynamic,
     });
     const p = o.add(d.mul(r.t)).add(r.normal.mul(float(world.minCell).mul(0.5))).toVar();
     const shaded = radianceSampler(p, r.normal);
     const rad = vec3(shaded.rad).mul(r.hit).toVar();
+    if (shadeDynamic && r.dynObj != null) {
+      If(r.dynObj.greaterThanEqual(0), () => {
+        const surf = dyn.surfaceAt(r.dynObj);
+        // The EXACT hit point, not the half-cell-lifted one: that lift exists
+        // to move a voxel-face hit out to the shell cell carrying its
+        // lighting, and an exact triangle needs no such correction.
+        const hp = o.add(d.mul(r.t)).toVar();
+        const n = vec3(r.normal).toVar();
+        // AMBIENT PROXY, DEFAULT OFF (2026-08-07). This was the neighbourhood
+        // voxel radiance, kept at weight 1 so the change could only ADD the
+        // direct term. Two measurements retired it: in the controlled rig it
+        // contributes ~nothing (an adopted mover's cells are EMPTY, so there
+        // is no neighbourhood radiance to read), and it was the ONLY
+        // voxel-quantized term left in an otherwise exact path — which is
+        // precisely the user's "large square patches of colour bleed that
+        // appear and disappear fast" as a mover rotates through the lattice.
+        // The uniform survives for the A/B; the emitter term below is what
+        // now covers "lit by something other than an analytic light".
+        const irr = vec3(shaded.rad).mul(float(dynamicShade.ambient ?? 0)).toVar();
+        const lift = float(world.minCell).mul(0.75).toVar();
+        /** Binary visibility toward a source, through the primary ray's own marcher. */
+        const visibility = (L, maxT) => {
+          const v = float(1).toVar();
+          if (shadeShadow) {
+            const sh = trace(hp.add(n.mul(lift)), L, lift, maxT, {
+              steps,
+              macroSteps: MAX_MACRO_STEPS,
+              dynamics: false,
+            });
+            v.assign(select(float(sh.hit).greaterThan(0.5), float(0), float(1)));
+          }
+          return v;
+        };
+        for (const slot of lightSlots) {
+          If(float(slot.active).greaterThan(0.5), () => {
+            // Same convention as the field gather's analytic direct block:
+            // `vector` is a world position for a point light and the
+            // normalized direction TOWARD a directional one.
+            const isDir = float(slot.kind).toVar();
+            const rel = vec3(slot.vector).sub(hp).toVar();
+            const pointDist = rel.length().max(1e-4).toVar();
+            const L = mix(rel.div(pointDist), vec3(slot.vector), isDir).toVar();
+            let atten = mix(float(1).div(pointDist.mul(pointDist).max(1)), float(1), isDir);
+            if (slot.range) {
+              // three's PointLight `distance` cutoff, mirrored so GI dies
+              // where the renderer's own direct light does.
+              const range = float(slot.range);
+              const ratio = pointDist.div(range.max(1e-4)).clamp(0, 1);
+              const r2 = ratio.mul(ratio);
+              const win = r2.mul(r2).oneMinus().clamp(0, 1);
+              atten = atten.mul(mix(float(1), win.mul(win), step(1e-3, range).mul(isDir.oneMinus())));
+            }
+            const ndotl = L.dot(n).max(0).toVar();
+            If(ndotl.greaterThan(1e-4), () => {
+              const vis = visibility(L, mix(pointDist.sub(lift).max(0), float(farT), isDir).toVar());
+              // Lambert /π, matching cascadeGather's `direct` term exactly —
+              // a different normalisation here would make movers read
+              // brighter or darker than the static geometry beside them.
+              irr.addAssign(vec3(slot.color).mul(atten.mul(ndotl).mul(vis).mul(1 / Math.PI)));
+            });
+          });
+        }
+        // PROMOTED EMISSIVE MESHES. Without this a mover lit only by a lamp
+        // bounces nothing — and "dynamic objects and emissive light" is the
+        // case the user actually cares about. Same `emitterSlotFactor` the
+        // field gather and the receiver material use, so a mover and the floor
+        // beside it agree about how bright the lamp is.
+        for (const slot of emitterSlots ?? []) {
+          If(float(slot.radius).greaterThan(0.001), () => {
+            const rel = vec3(slot.center).sub(hp).toVar();
+            const dist = rel.length().max(1e-4).toVar();
+            const L = rel.div(dist).toVar();
+            const cosTheta = L.dot(n).toVar();
+            const sinR = float(slot.radius).div(dist).clamp(0, 1).toVar();
+            const factor = emitterSlotFactor(slot, hp, n, cosTheta, sinR).toVar();
+            If(factor.greaterThan(1e-6), () => {
+              // Stop at the lamp's surface, not its centre, or every ray ends
+              // inside the lamp body and reports itself occluded.
+              const maxT = emitterSurfaceT(slot, hp, L, dist).sub(lift).max(0).toVar();
+              const vis = visibility(L, maxT);
+              irr.addAssign(vec3(slot.color).mul(factor).mul(vis).mul(1 / Math.PI));
+            });
+          });
+        }
+        rad.assign(surf.emissive.add(surf.albedo.mul(irr)));
+      });
+    }
     const hitT = select(r.hit.greaterThan(0.5), r.t.max(1e-4), float(-1)).toVar();
     return { rad, t: hitT };
   };

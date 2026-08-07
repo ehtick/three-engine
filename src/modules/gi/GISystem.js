@@ -24,7 +24,7 @@ import { blitBvhAtlasTiles, createGiBvhReflect, createGiBvhTarget, createGiEmitt
 import { resolveMaterialSurface, serializeMeshForBake } from "./voxelizeOnce.js";
 import { createOccupancyDebugMaterial, createSdfDebugMaterial, createGiField } from "./giField.js";
 import { createOccupancyField, describeOccupancyField, quantizeOccupancyRes } from "./occupancyField.js";
-import { buildStaticSceneBvhWords, classifyDynamicShape, composeFieldDynamics, createDynamicObjectSet, dynHeaderWords } from "./dynamicObjects.js";
+import { BVH_STRATEGY, buildStaticSceneBvhWords, classifyDynamicShape, composeFieldDynamics, createDynamicObjectSet, dynHeaderWords, giMobilityOf, giTraceOf } from "./dynamicObjects.js";
 import { fitPrimitive } from "./primitiveFit.js";
 import { describeGrid } from "./instanceGrid.js";
 import { BRICK_AXIS_BY_QUALITY, describeSparseField } from "./sparseField.js";
@@ -117,6 +117,19 @@ if (import.meta.env?.DEV) {
   // whether the dispatch loop is stuck waiting on pipelines / skipping.
   globalThis.__giPendingComputePipelines = giPendingComputePipelines;
   globalThis.__giSkippedComputesSet = giSkippedComputes;
+}
+
+/**
+ * Split strategy for the STATIC-SCENE shadow BVH (`__giStaticBvhStrategy`:
+ * "sah" | "average" | "center"). A scene-scale soup mixes metre-wide floor
+ * quads with millimetre ornament triangles, and a median/centroid split puts
+ * both in one leaf whose box spans the room — every ray then descends into it.
+ * Object-local mover BVHs keep the default (their triangles are size-uniform
+ * and the build has to stay interactive).
+ */
+function staticBvhStrategy() {
+  const name = String(globalThis.__giStaticBvhStrategy ?? "sah").toLowerCase();
+  return BVH_STRATEGY[name] ?? BVH_STRATEGY.sah;
 }
 
 /** Dispatch wrapper for GISystem's own renderer.compute calls — marks skips
@@ -419,6 +432,43 @@ const PROBE_SPACING_LADDER = [
 const quantizeSpacing = (value) =>
   PROBE_SPACING_LADDER.find((step) => value <= step * 1.0001) ??
   PROBE_SPACING_LADDER[PROBE_SPACING_LADDER.length - 1];
+
+/**
+ * The per-frame analytic direct-light slots: fixed uniforms every consumer
+ * reads (field gather, screen resolve, and the transport rays' exact-dynamic
+ * shading). Light moves/edits update uniforms only — never a rebuild.
+ */
+function makeLightSlots() {
+  return Array.from({ length: MAX_GI_LIGHTS }, () => ({
+    active: uniform(0),
+    kind: uniform(0),
+    vector: uniform(new THREE.Vector3()),
+    color: uniform(new THREE.Color(0, 0, 0)),
+    // three PointLight `distance` cutoff (0 = infinite) — GI must die
+    // where the renderer's own direct light does, or the mismatch reads
+    // as light being "cut" at a circle.
+    range: uniform(0),
+    // ── GI-TRACED DIRECT SHADOWS (LightComponent's `shadowMode: "gi"`) ──
+    // `soft` = the light's own angular RADIUS in radians (a sun's authored
+    // "Angle", halved by LightComponent). `srcRadius` = a point/spot source's
+    // world-space radius, whose angular size is radius/distance and therefore
+    // has to be resolved per pixel rather than stored as an angle. Exactly
+    // one of the two is meaningful per slot, chosen by `kind`.
+    //
+    // BOTH ARE 0 UNLESS THE LIGHT IS GI-FLAGGED, and that is deliberate: 0
+    // means "unset", which every consumer falls back from to the global sun
+    // angle. So a scene that never opts into gi shadows keeps byte-identical
+    // field behaviour, and the feature can only change lights that asked for
+    // it (see #updateLightUniforms and cascadeGather's per-slot k).
+    soft: uniform(0),
+    srcRadius: uniform(0),
+    // 1 only while the screen resolve should trace this slot's shadow cone:
+    // the light asked for gi shadows AND the device/binding gate passed AND
+    // the slot is live. A uniform rather than a build-time switch because
+    // flipping a light's Shadow Source must not need a GI rebuild.
+    giShadow: uniform(0),
+  }));
+}
 
 export class GISystem {
   constructor(engine) {
@@ -892,6 +942,17 @@ export class GISystem {
     if (state.screen?.lightShadow?.liftFactor) {
       state.screen.lightShadow.liftFactor.value = globalThis.__giShadowLift ?? 1.5;
     }
+    if (state.screen?.lightShadow?.exactBiasFactor) {
+      state.screen.lightShadow.exactBiasFactor.value = Number(globalThis.__giShadowExactBias) || 0.02;
+    }
+    // How much neighbourhood radiance an exact-dynamic hit takes as ambient
+    // (giField's createOccupancySceneTrace). 1 = the pre-2026-08-07 value a
+    // dynamic hit returned outright, so the direct/emissive term is purely
+    // additive; 0 isolates it for an A/B.
+    if (state.dynShadeAmbient) {
+      const v = globalThis.__giDynShadeAmbient;
+      state.dynShadeAmbient.value = Number.isFinite(v) ? v : 0;
+    }
     // Wide-penumbra pass camera (viewDist for the world→texel radius map).
     if (this._giShadowWideCamU && this.engine.camera) {
       this.engine.camera.getWorldPosition(this._giShadowWideCamU.value);
@@ -1364,6 +1425,49 @@ export class GISystem {
             ]
           : debugExtra;
       }
+      // NO EMITTERS, NO EMITTER PASSES. The emitter shadow trace and its
+      // bilateral filter are built whenever `emissiveShadows` is on — that is
+      // a CAPABILITY (MAX_EMITTERS uniform slots), not a statement that the
+      // scene contains an emissive mesh. With zero emitters the trace early-
+      // outs cheaply but the FILTER still blurs a whole texture for nothing:
+      // measured 0.119ms per frame at a 695x227 emitter target on the user's
+      // Sponza (which logs "0 emitters"), against 0.019ms for the trace it is
+      // filtering. Emitter infos refresh every frame, so this is a live check
+      // and a promoted emissive mesh brings both passes straight back.
+      // ── CAPABILITY IS NOT USE (both skips below) ────────────────────────
+      // The GI screen chain is built from FIXED-SIZE slot arrays — MAX_EMITTERS
+      // emitter slots, MAX_GI_LIGHTS light slots — so the passes exist as soon
+      // as the feature is compiled in, whether or not the scene has a single
+      // emissive mesh or a single light flagged Shadow Source "gi". Skipping
+      // them here rather than at build time keeps the contract those bundles
+      // document: flipping a light's Shadow Source stays a UNIFORM WRITE, never
+      // a GI rebuild. The pass is still there; it just stops being dispatched
+      // on frames where nothing reads it.
+      const skip = new Set();
+      // 1. No emitters: the trace early-outs at 0.018ms but its bilateral
+      // FILTER still blurred a whole 695x227 texture for 0.119ms — 6x the
+      // trace it was filtering — on a scene logging "0 emitters".
+      if (!(this._emitterInfos?.length > 0) && state.screen?.emitterShadowPass) {
+        skip.add(state.screen.emitterShadowPass.compute);
+        skip.add(state.screen.emitterShadowFilterPass?.compute);
+      }
+      // 2. No light asks for GI-traced direct shadows (the user's measured
+      // finding, 2026-08-07: a directional light on three's shadow map runs
+      // 2.6ms vs 5.4ms and looks better, so `map` is the normal case now).
+      // `giShadow` is cleared per frame for every off/hidden/map-mode light,
+      // which makes it an exact live signal — and when every slot reads 0 the
+      // trace writes the inert 1 into a texture only gi-mode lights sample.
+      // Measured worth ~0.4ms of a 1.13ms screen chain at 983x321, and it
+      // scales with resolve pixels like everything else here.
+      const anyGiShadow = (state.lightSlots ?? []).some((s) => (s?.giShadow?.value ?? 0) > 0);
+      if (!anyGiShadow && state.screen?.lightShadowPass) {
+        for (const name of [
+          "lightShadowPass", "lightShadowFilterPass", "lightShadowWidePass",
+          "lightShadowWidePass2", "lightShadowHistoryPass", "lightShadowPostPass",
+        ]) skip.add(state.screen[name]?.compute);
+      }
+      skip.delete(undefined);
+      if (skip.size) frameQueue = frameQueue.filter((node) => !skip.has(node));
       // Guard the empty case: `__giFreeze = "all"` produces no computes, and
       // three's renderer.compute([]) throws "expects a ComputeNode".
       if (frameQueue.length) giCompute(renderer, frameQueue);
@@ -1891,8 +1995,15 @@ export class GISystem {
     const voxMax = vox.x.max(vox.y).max(vox.z);
     const liftFactor = uniform(1.5);
     const lift = voxMax.mul(liftFactor);
+    // EXACT-ARM BIAS, in voxels — the static-BVH arm's own, ~75x smaller than
+    // the voxel lift (see its use in traceDda for the measurement that sized
+    // it). Live uniform `__giShadowExactBias` for the same in-editor A/B.
+    const exactBiasFactor = uniform(0.02);
+    const exactArm = !!(this._dynSet?.staticBvh && globalThis.__giShadowStaticBvh !== false);
     return {
       liftFactor,
+      exactBiasFactor,
+      exactArm,
       analyticWidth,
       marcher: globalThis.__giLightShadowSphere === true
         ? "sphere"
@@ -1916,8 +2027,21 @@ export class GISystem {
       // an open-ground origin measures ≈ the full lift and stays untouched.
       // That is also why the gate only exists when records do: without them
       // (brick-box / legacy modes) it is null and the resolve compiles it out.
+      // OFF UNDER THE EXACT ARM. The gate is a VOXEL oracle whose whole job is
+      // covering for a VOXEL marcher: the DDA starts 1.5 voxels up and cannot
+      // see a canopy it has already skipped past, so the gate asks the field
+      // "is this point buried?" separately. An exact triangle ray starts ~2 mm
+      // off the surface and intersects that canopy itself — the gate adds no
+      // information and does add its own documented disease, the lattice-phase
+      // alternation that etches the voxel grid back onto lit floors (see the
+      // resolve's burial note: recordless shell columns read gap 0 and force
+      // open ground BLACK). Stamping that pattern back over exact silhouettes
+      // is the speckle/dash population in the user's 2026-08-06 screenshots.
+      // `__giShadowBurialGate = true` forces it back on for A/B.
       freeRadius:
-        occ.hasSurfaceRecords === true && occ.freeRadiusAtWorld
+        occ.hasSurfaceRecords === true && occ.freeRadiusAtWorld &&
+        (globalThis.__giShadowBurialGate === true ||
+          !(this._dynSet?.staticBvh && globalThis.__giShadowStaticBvh !== false))
           ? (p) => occ.freeRadiusAtWorld(p, 1, true, null, true)
           : null,
       // THE MARCHER IS THE TRANSPORT DDA, NOT THE SPHERE TRACE. This is the
@@ -2036,8 +2160,39 @@ export class GISystem {
               // (width, never admission). Radiance/bounce remain voxel.
               // `__giShadowStaticBvh = false` restores the records marcher.
               if (this._dynSet?.staticBvh && globalThis.__giShadowStaticBvh !== false) {
-                const s = this._dynSet.traceStaticBvh(origin, dirEff, tMin, exactEnd);
-                const dr = this._dynSet.trace(origin, dirEff, tMin, exactEnd, {});
+                // EXACT GEOMETRY NEEDS AN EXACT-GEOMETRY BIAS — this arm
+                // inherited the VOXEL one and that is the measured cause of
+                // the "holes in the shadows". `origin` arrives lifted 1.5
+                // occupancy voxels off the surface and `tMin` skips a whole
+                // voxel more; both exist because the conservative voxel shell
+                // bulges the receiver's own surface up to a voxel above its
+                // true plane. Against real triangles there is no shell and
+                // nothing to escape, so the pair is pure loss: 0.25 m of
+                // blind band on the user's Sponza (voxel 0.098 m), measured
+                // as 10.8% of surface points with their NEAREST occluder
+                // inside it and 2.6% losing their shadow outright
+                // (run-gi-static-bvh-probe.mjs). It is worst on walls, whose
+                // light-facing normal shoves the origin 0.15 m out of the
+                // arcade — past the very column that should shadow them.
+                // The lift direction is recoverable: origin = P + n·lift by
+                // construction, and cosRayNormal > 0.05 at every call site
+                // keeps that difference non-degenerate.
+                let exactOrigin = origin;
+                let exactMin = tMin;
+                if (receiverP != null) {
+                  const nHat = vec3(origin).sub(vec3(receiverP)).normalize().toVar();
+                  // Slope-scaled: a grazing ray is where the interpolated
+                  // shading normal and the true face diverge most, so the
+                  // offset has to grow with 1/cos to stay off its own surface.
+                  const bias = voxMax
+                    .mul(exactBiasFactor)
+                    .div(float(cosRayNormal ?? 1).max(0.25))
+                    .toVar();
+                  exactOrigin = vec3(receiverP).add(nHat.mul(bias)).toVar();
+                  exactMin = bias;
+                }
+                const s = this._dynSet.traceStaticBvh(exactOrigin, dirEff, exactMin, exactEnd);
+                const dr = this._dynSet.trace(exactOrigin, dirEff, exactMin, exactEnd, {});
                 const sHit = s.x.greaterThanEqual(0).toVar();
                 const hit = sHit.or(dr.hit.greaterThan(0.5)).toVar();
                 const tBest = select(
@@ -2220,8 +2375,17 @@ export class GISystem {
       // emitter's occlusion too. The tEnd trim above already excludes the
       // lamp's own surface; the width probe supplies area-light softness.
       if (this._dynSet?.staticBvh && globalThis.__giShadowStaticBvh !== false) {
-        const s = this._dynSet.traceStaticBvh(origin, dir, voxMax, tEnd);
-        const dr = this._dynSet.trace(origin, dir, voxMax, tEnd, {});
+        // Exact-geometry bias, same reasoning as the direct arm's (see there):
+        // the voxel lift + one-voxel tMin is a quarter-metre blind band that
+        // exact triangles have no shell to justify. P and N arrive directly
+        // here, so the tight origin needs no reconstruction.
+        const bias = voxMax
+          .mul(Number(globalThis.__giShadowExactBias) || 0.02)
+          .div(float(cosRayNormal ?? 1).max(0.25))
+          .toVar();
+        const exactOrigin = vec3(P).add(vec3(N).mul(bias)).toVar();
+        const s = this._dynSet.traceStaticBvh(exactOrigin, dir, bias, tEnd);
+        const dr = this._dynSet.trace(exactOrigin, dir, bias, tEnd, {});
         const hit = s.x.greaterThanEqual(0).or(dr.hit.greaterThan(0.5)).toVar();
         if (widthProbe) {
           const w = float(1).toVar();
@@ -2299,7 +2463,7 @@ export class GISystem {
    * rebuild, its shader stays in the pipeline cache, and a quality change or
    * an auto-fit refit no longer triggers a material recompile wave.
    */
-  #buildScreenResolve({ gather, light, emitterSlots, radianceLookup = null, lightSlots = null, ao = null, lightShadow = null, emitterRecordTrace = null }) {
+  #buildScreenResolve({ gather, light, emitterSlots, radianceLookup = null, lightSlots = null, ao = null, lightShadow = null, emitterRecordTrace = null, emitterCutoff = null }) {
     const renderer = this.engine.renderer;
     if (!renderer?.backend?.device) return null;
     const { width, height } = this.#screenResolveSize();
@@ -2361,6 +2525,12 @@ export class GISystem {
             recordShadowTrace: emitterRecordTrace,
             shadowMargin: light.shadowMargin,
             shadowRange: light.shadowRange,
+            // PER-PRESET EMITTER REACH — the single biggest dial on the screen
+            // emitter shadow pass (see giLight's emitterCutoff). Passed as a
+            // plain number rather than read off `light`, because
+            // `light.shadowRange` is assigned AFTER this bundle is built and
+            // a second field with that ordering hazard would be a trap.
+            emitterCutoff,
           }
         : null;
       const inputs = { gather, normalOffset: light.normalOffset, intensity: light.intensityUniform, emitter, ao };
@@ -3328,12 +3498,32 @@ export class GISystem {
     // Per-quality trace budgets — the fixed 56/64-step traces at every
     // preset were why "medium" still cost ~20ms GPU at editor resolutions.
     const quality = qualityTierOf(props);
+    // `feedbackEmitter` is the FIELD's per-emitter shadow march, split out of
+    // `feedback` (2026-08-07). It is the scene's steepest per-object cost:
+    // measured 0.73ms per live emitter at a 128x32x128 volume, linear in
+    // emitter count, because every occupied cell re-marches to every emitter
+    // every frame (scripts/run-gi-emissive-cost.mjs). Shorter than the sun's
+    // march at every preset on purpose — this ray only seeds BOUNCE, which is
+    // then gathered, probe-blurred and EMA-blended, so the extra steps buy
+    // precision the chain cannot carry. Visible emitter shadows come from the
+    // screen-side record march, whose budget is untouched.
+    // `__giFieldEmitterSteps=<n>` overrides for an A/B (build-time).
     const traceBudget =
-      { low: { shadow: 24, mirror: 32, feedback: 18 },
-        medium: { shadow: 32, mirror: 40, feedback: 24 },
-        high: { shadow: 44, mirror: 56, feedback: 32 },
-        ultra: { shadow: 56, mirror: 64, feedback: 40 } }[quality]
-      ?? { shadow: 44, mirror: 56, feedback: 32 };
+    // `feedbackEmitterMacro` is the same arm's budget when it runs as a RECORD
+    // MARCH (the default — see the emitterShadowTrace closure). Well under the
+    // field sun's 96 because an emitter ray is bounded by the distance to its
+    // lamp (metres), while a sun ray crosses the whole volume.
+      { low: { shadow: 24, mirror: 32, feedback: 18, feedbackEmitter: 8, feedbackEmitterMacro: 16 },
+        medium: { shadow: 32, mirror: 40, feedback: 24, feedbackEmitter: 10, feedbackEmitterMacro: 20 },
+        high: { shadow: 44, mirror: 56, feedback: 32, feedbackEmitter: 14, feedbackEmitterMacro: 28 },
+        ultra: { shadow: 56, mirror: 64, feedback: 40, feedbackEmitter: 20, feedbackEmitterMacro: 40 } }[quality]
+      ?? { shadow: 44, mirror: 56, feedback: 32, feedbackEmitter: 14, feedbackEmitterMacro: 28 };
+    {
+      const sphere = Number(globalThis.__giFieldEmitterSteps);
+      if (Number.isFinite(sphere) && sphere > 0) traceBudget.feedbackEmitter = Math.round(sphere);
+      const macro = Number(globalThis.__giFieldEmitterMacroSteps);
+      if (Number.isFinite(macro) && macro > 0) traceBudget.feedbackEmitterMacro = Math.round(macro);
+    }
     // Low/medium's feedback cost halving, restructured: instead of the whole
     // pass running every OTHER frame (which stair-steps the entire field at
     // half the light's rate — flicker on exactly the presets meant to be
@@ -3465,6 +3655,41 @@ export class GISystem {
     // #tick writes the frame parity when enabled. Built at every tier so the
     // switch is live — one compare per thread when it is off.
     const traceParity = uniform(-1);
+    // Per-frame analytic direct light: fixed uniform slots read by the
+    // feedback compute. Light moves/edits update uniforms only. Declared HERE,
+    // above the cascades, because the transport rays need them too — an exact
+    // dynamic hit is shaded from its own header surface × these lights rather
+    // than from voxel radiance the mover is no longer part of (giField's
+    // createOccupancySceneTrace). Uniforms, so no kernel gains a binding.
+    const lightSlots = makeLightSlots();
+    // How much of the neighbourhood VOXEL radiance a mover takes as ambient.
+    // DEFAULT 0: it measured as no contribution at all (an adopted mover's
+    // cells are empty) while being the only voxel-quantized term left in an
+    // otherwise exact path — the square-patch flicker. 1 restores the
+    // pre-2026-08-07 value for an A/B.
+    const dynShadeAmbient = uniform(0);
+    // Emitter slots (promoted emissive meshes) are shared by the feedback
+    // compute (voxel direct inject), the material light node (receiver
+    // direct + shadows + mirror glow), and refreshed EVERY FRAME.
+    const emitterSlots =
+      props.emissiveShadows !== false
+        ? Array.from({ length: MAX_EMITTERS }, () => ({
+            center: uniform(new THREE.Vector3()),
+            radius: uniform(0),
+            color: uniform(new THREE.Color(0, 0, 0)),
+            // Slot SHAPE (see giLight emitterSlotFactor): kind 0 = sphere,
+            // 1 = oriented box; half = world half-extents; bx/by/bz = world
+            // axes; reff = mean-projected-area-equivalent radius (angular
+            // size for penumbra k and glow energy). radius stays the
+            // bounding sphere — trace self-exclusion and the active gate.
+            kind: uniform(0),
+            half: uniform(new THREE.Vector3(0.1, 0.1, 0.1)),
+            bx: uniform(new THREE.Vector3(1, 0, 0)),
+            by: uniform(new THREE.Vector3(0, 1, 0)),
+            bz: uniform(new THREE.Vector3(0, 0, 1)),
+            reff: uniform(0),
+          }))
+        : null;
     const { cascades, intervals } = createRadianceCascades({
       world: volume.world,
       cascadeCount: Math.min(6, Math.max(2, props.cascadeCount || 5)),
@@ -3472,7 +3697,7 @@ export class GISystem {
       c0DirRes: props.c0DirRes === 2 ? 2 : 4,
       t0: probeSpacing,
       farT: Math.max(sizeX, sizeY, sizeZ) * 2,
-      sceneTrace: volume.createSceneTrace(),
+      sceneTrace: volume.createSceneTrace({ lightSlots, emitterSlots, ambient: dynShadeAmbient }),
       traceParity,
     });
     // Sky light: the radiance a cascade ray brings back when it escapes the
@@ -3527,59 +3752,6 @@ export class GISystem {
     // Per-frame lerp pulling the base field toward the latest composite —
     // spreads occupancy/lighting swaps over ~10 frames instead of popping.
     const temporalBlend = uniform(Math.min(1, Math.max(0.02, props.temporalBlend ?? 0.25)));
-    // Per-frame analytic direct light: fixed uniform slots read by the
-    // feedback compute. Light moves/edits update uniforms only.
-    const lightSlots = Array.from({ length: MAX_GI_LIGHTS }, () => ({
-      active: uniform(0),
-      kind: uniform(0),
-      vector: uniform(new THREE.Vector3()),
-      color: uniform(new THREE.Color(0, 0, 0)),
-      // three PointLight `distance` cutoff (0 = infinite) — GI must die
-      // where the renderer's own direct light does, or the mismatch reads
-      // as light being "cut" at a circle.
-      range: uniform(0),
-      // ── GI-TRACED DIRECT SHADOWS (LightComponent's `shadowMode: "gi"`) ──
-      // `soft` = the light's own angular RADIUS in radians (a sun's authored
-      // "Angle", halved by LightComponent). `srcRadius` = a point/spot source's
-      // world-space radius, whose angular size is radius/distance and therefore
-      // has to be resolved per pixel rather than stored as an angle. Exactly
-      // one of the two is meaningful per slot, chosen by `kind`.
-      //
-      // BOTH ARE 0 UNLESS THE LIGHT IS GI-FLAGGED, and that is deliberate: 0
-      // means "unset", which every consumer falls back from to the global sun
-      // angle. So a scene that never opts into gi shadows keeps byte-identical
-      // field behaviour, and the feature can only change lights that asked for
-      // it (see #updateLightUniforms and cascadeGather's per-slot k).
-      soft: uniform(0),
-      srcRadius: uniform(0),
-      // 1 only while the screen resolve should trace this slot's shadow cone:
-      // the light asked for gi shadows AND the device/binding gate passed AND
-      // the slot is live. A uniform rather than a build-time switch because
-      // flipping a light's Shadow Source must not need a GI rebuild.
-      giShadow: uniform(0),
-    }));
-    // Emitter slots (promoted emissive meshes) are shared by the feedback
-    // compute (voxel direct inject), the material light node (receiver
-    // direct + shadows + mirror glow), and refreshed EVERY FRAME.
-    const emitterSlots =
-      props.emissiveShadows !== false
-        ? Array.from({ length: MAX_EMITTERS }, () => ({
-            center: uniform(new THREE.Vector3()),
-            radius: uniform(0),
-            color: uniform(new THREE.Color(0, 0, 0)),
-            // Slot SHAPE (see giLight emitterSlotFactor): kind 0 = sphere,
-            // 1 = oriented box; half = world half-extents; bx/by/bz = world
-            // axes; reff = mean-projected-area-equivalent radius (angular
-            // size for penumbra k and glow energy). radius stays the
-            // bounding sphere — trace self-exclusion and the active gate.
-            kind: uniform(0),
-            half: uniform(new THREE.Vector3(0.1, 0.1, 0.1)),
-            bx: uniform(new THREE.Vector3(1, 0, 0)),
-            by: uniform(new THREE.Vector3(0, 1, 0)),
-            bz: uniform(new THREE.Vector3(0, 0, 1)),
-            reff: uniform(0),
-          }))
-        : null;
     const normalLift = volume.world.minCell.mul(1.2);
     // Live A/B hatch for the field's shadow traces (see createBounceFeedback's
     // note on why this must be a UNIFORM, not a globalThis read).
@@ -3662,6 +3834,72 @@ export class GISystem {
         normalLift, traceBudget.feedback, "giFeedbackShadowTrace",
         globalThis.__giStableFieldShadows !== false,
       ),
+      // ── THE FIELD'S EMITTER SHADOW ─────────────────────────────────────────
+      // Two arms. The DEFAULT is the record march, for a correctness reason
+      // the user named directly ("emissive shadows are still voxelized a lot",
+      // "the dynamic boxes mostly do not cast any indirect or emissive
+      // shadows"): the sphere arm marches `distanceTexture` and the occupancy
+      // oracle, and BOTH are pure voxel media. An exact-dynamic mover has been
+      // removed from the voxel field entirely — its occupancy slot is parked
+      // and its atlas slot cleared — so it is INVISIBLE to that march and
+      // casts no emitter shadow into the field at all. The field's SUN arm
+      // does not have this problem because it already routes through
+      // `traceHybridPlane`, and `composeFieldDynamics` wraps exactly those
+      // ray-hit traces with the exact-mover query. Putting the emitter arm on
+      // the same trace makes movers occlude emitter light for free, and
+      // resolves hits through fitted-plane records instead of binary voxels,
+      // which is the same swap that took the sun's field shadows off the
+      // lattice in session 30f.
+      //
+      // The lamp's own body is excluded by maxT (the caller already trims to
+      // the lamp's surface; one voxel more clears its conservative shell) —
+      // NOT by the sphere arm's region test. Same choice the screen-side
+      // emitter arm made (#buildEmitterRecordTrace) and for the same reason:
+      // maxT admission is exact, so a wall hugging the lamp still occludes.
+      //
+      // The sphere arm survives as the fallback (no records / legacy ray-hit
+      // mode / `__giFieldEmitterRecordShadows = false`), with its own shorter
+      // budget — see traceBudget.feedbackEmitter.
+      emitterShadowTrace: (() => {
+        const sphereArm = volume.createSoftShadowTrace(
+          normalLift, traceBudget.feedbackEmitter, "giFeedbackEmitterShadowTrace",
+          globalThis.__giStableFieldShadows !== false,
+        );
+        const occ = volume.occupancyField;
+        const emitMode = volume.rayHitMode ?? RayHitMode.OccupancyLegacy;
+        const canRecord =
+          occ?.traceHybridPlane &&
+          occ.hasSurfaceRecords === true &&
+          emitMode >= RayHitMode.HybridPlane &&
+          emitMode <= RayHitMode.HybridExactComplex &&
+          globalThis.__giFieldEmitterRecordShadows !== false;
+        if (!canRecord) return sphereArm;
+        const pwRefE = globalThis.__giFieldPenWidth;
+        const penWidthE = pwRefE === false
+          ? null
+          : typeof pwRefE === "number"
+            ? pwRefE
+            : volume.world.cellMax.mul(0.5);
+        return (origin, dir, maxT, k, cosRayNormal) => {
+          const voxE = vec3(occ.voxel);
+          const voxMaxE = voxE.x.max(voxE.y).max(voxE.z).toVar();
+          const tEndE = float(maxT).sub(voxMaxE).max(0).toVar();
+          const r = occ.traceHybridPlane(
+            origin, dir, volume.world.minCell.mul(0.25), tEndE,
+            {
+              coverage: emitMode >= RayHitMode.HybridPlaneCoverage,
+              exact: emitMode === RayHitMode.HybridExactComplex,
+              penumbraK: k,
+              penWidth: penWidthE,
+              macroSteps: traceBudget.feedbackEmitterMacro,
+            },
+          );
+          // kind > 3.5 = macro/brick limit or invalid brick. Fail CLOSED, the
+          // same contract as the sun arm — the field EMA absorbs a rare
+          // capped ray, and failing open puts emitter light through walls.
+          return select(r.kind.greaterThan(3.5), float(0), r.hit.oneMinus().mul(r.pen));
+        };
+      })(),
       gridDiagonal: diagU,
       fieldShadowOff,
       jitter: shadowJitter,
@@ -3952,6 +4190,17 @@ export class GISystem {
     const screen = this.#buildScreenResolve({
       gather, light, emitterSlots, radianceLookup: deferredRadianceLookup, ao, lightShadow,
       emitterRecordTrace: emitterSlots ? this.#buildEmitterRecordTrace(volume, quality) : null,
+      // EMITTER REACH PER PRESET. Falloff is 1/d², so the pixels that pay for
+      // an emitter's shadow march scale as 1/cutoff — this is the dominant
+      // dial on a pass the user measured at 77% of all per-frame GI screen
+      // work. Measured on the heavy rig (3 emitters, 570x277, 90k tris):
+      // 0.0015 -> 0.868ms, 0.006 -> 0.434ms (max pixel deviation 8/255,
+      // brightness -0.04%), 0.02 -> 0.183ms (max 17/255 on 0.09% of
+      // subpixels, brightness -0.13%). High takes the 2x that costs nothing
+      // visible; low/medium trade a fading pool fringe for another 2.4x;
+      // ultra keeps essentially the old reach.
+      emitterCutoff:
+        { low: 0.02, medium: 0.012, high: 0.006, ultra: 0.002 }[quality] ?? 0.006,
     });
     if (screen) {
       // Emitter shadow trace + filter FIRST — the resolve samples their
@@ -4005,6 +4254,23 @@ export class GISystem {
     // hash) covers the lights-hash memo bug on their own.
     this._lightsRefreshTicks = 0;
 
+    // NAMES FOR THE QUEUE. `profile.giPasses` reports each entry's GPU cost,
+    // and an unlabelled array of 20 numbers cannot answer "which pass owns the
+    // frame" — which is the only question anyone profiles this module to ask.
+    // Built by identity after assembly rather than at each push site, so the
+    // ordering logic above stays one concern.
+    const queueLabel = new Map();
+    queueLabel.set(feedbackCompute, "feedback");
+    cascades.forEach((c, i) => queueLabel.set(c.traceCompute, `trace c${c.level ?? i}`));
+    mergeComputes.forEach((m, i) => queueLabel.set(m, `merge ${i}`));
+    averageComputes?.forEach((m, i) => queueLabel.set(m, `average ${i}`));
+    if (probeIrradiance?.compute) queueLabel.set(probeIrradiance.compute, "probeIrradiance");
+    if (probeDepth?.compute) queueLabel.set(probeDepth.compute, "probeDepth");
+    for (const [name, entry] of Object.entries(screen ?? {})) {
+      if (entry?.compute) queueLabel.set(entry.compute, name);
+    }
+    const queueLabels = queue.map((node, i) => queueLabel.get(node) ?? `queue[${i}]`);
+
     const gizmos = this.#buildGizmos(cascades, bounds);
     gizmos.sdfView = this.#buildSdfView(volume, bounds, center);
     gizmos.all.push(gizmos.sdfView);
@@ -4019,6 +4285,7 @@ export class GISystem {
       intervals,
       diagU,
       queue,
+      queueLabels,
       queueNoFeedback,
       queueFeedbackOnly,
       // Authored default ON: it is a straight 2x cut of the awake cost whose
@@ -4059,6 +4326,7 @@ export class GISystem {
       skyRadiance,
       autoFit,
       lightSlots,
+      dynShadeAmbient,
       emitterSlots,
       statsLogged: false,
       rayHitConfig,
@@ -4129,6 +4397,15 @@ export class GISystem {
             // Three rounds of "absolutely nothing changed" were spent unable
             // to tell the user's live editor apart from the disk code — this
             // token settles it from their own console.
+            // BUILD MARKER, session 33: same discipline as "adaptive-σ" above.
+            // Three separate rounds were lost to not knowing whether the live
+            // editor ran the disk code, so every arm that changes what a
+            // shadow ray DOES prints a token here.
+            (screen.lightShadow.exactArm
+              ? `exact-bias ${screen.lightShadow.exactBiasFactor?.value ?? "?"}vox, ` +
+                `${globalThis.__giShadowAnyHit === false ? "nearest-hit" : "any-hit"}, ` +
+                `${screen.lightShadow.freeRadius ? "burial-gate ON" : "no burial gate"}, `
+              : "") +
             `filter adaptive-σ, up to ${MAX_GI_LIGHTS} lights — flag a light with Shadow Source "gi"`
         : "[gi] light shadows: gi-traced OFF — every light renders its own shadow map",
     );
@@ -4891,6 +5168,19 @@ export class GISystem {
       const g = surface.emissive.g * surface.emissiveIntensity;
       const b = surface.emissive.b * surface.emissiveIntensity;
       const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      // PEAK radiance, the emitter-promotion QUALIFIER (2026-08-07). Luminance
+      // is a perceptual weighting — green counts 10x more than blue — so it is
+      // the right way to RANK lamps by power but the wrong way to decide
+      // whether something is a lamp at all. Measured on the four-lamp rig:
+      // at emission strength 1, a full-intensity green mesh scores 0.72 and
+      // promotes while an equally bright saturated RED scores 0.23 and a BLUE
+      // 0.14, so both fall under the 0.5 gate and get no analytic slot at all.
+      // A mesh with no slot lights the scene only through the voxel field —
+      // blocky, and with no exact-silhouette shadow — which is exactly the
+      // reported "emissive shadows are still voxelized a lot" and "sometimes
+      // dynamic objects don't even cast shadows from emissive objects at all",
+      // on lamps whose only sin was being a saturated colour.
+      const peak = Math.max(r, g, b);
       const geometry = mesh.geometry;
       const position = geometry.attributes.position;
       const tris = (geometry.index?.count ?? position.count) / 3;
@@ -4931,7 +5221,7 @@ export class GISystem {
         for (const instanceId of placements) {
           entries.push({
             mesh, instanceId, key: slotKeyOf(mesh, instanceId),
-            surface, tris, luminance, r, g, b, analytic,
+            surface, tris, luminance, peak, r, g, b, analytic,
             contentKey: null, sdfPath: null, promoted: false,
           });
         }
@@ -4947,14 +5237,16 @@ export class GISystem {
       for (const instanceId of placements) {
         entries.push({
           mesh, instanceId, key: slotKeyOf(mesh, instanceId),
-          surface, tris, luminance, r, g, b, hiRes,
+          surface, tris, luminance, peak, r, g, b, hiRes,
           contentKey, promoted: false,
         });
       }
     }
 
-    // Emitter promotion: qualify by luminance ≥ 0.5, rank by emitted POWER
-    // (luminance · world radius²) — a large dim panel outshines a tiny
+    // Emitter promotion: qualify by PEAK radiance ≥ 0.5 (see the `peak` note
+    // in #buildEntries — luminance rejected saturated red/blue lamps that are
+    // every bit as bright as the white ones it accepted), rank by emitted
+    // POWER (luminance · world radius²) — a large dim panel outshines a tiny
     // bright trinket, and the slots should go to the lamps that actually
     // light the scene.
     this._emitterInfos = [];
@@ -4978,7 +5270,7 @@ export class GISystem {
       // composited per instance); it just does not get an analytic slot.
       const seenEmitterMesh = new Set();
       const bright = entries
-        .filter((entry) => entry.luminance >= 0.5 && !entry.mesh.isInstancedMesh)
+        .filter((entry) => entry.peak >= 0.5 && !entry.mesh.isInstancedMesh)
         .sort((a, b) => powerOf(b) - powerOf(a));
       if (bright.length > MAX_EMITTERS && !this._warnedEmitterBudget) {
         this._warnedEmitterBudget = true;
@@ -5796,11 +6088,16 @@ export class GISystem {
           return g ? { positions: g.positions, index: g.index, matrix: p.matrix, slot: p.slot } : null;
         })
         .filter(Boolean);
-      staticBvhPacked = items.length ? buildStaticSceneBvhWords(items) : null;
+      staticBvhPacked = items.length ? buildStaticSceneBvhWords(items, staticBvhStrategy()) : null;
+      // Diagnostics handle: the CPU traversal mirror in the static-BVH probe
+      // reads the SAME words the GPU traverses (the bits upload is a compute
+      // copy from staging — the CPU bits array never holds them).
+      this._staticBvhPacked = staticBvhPacked;
       if (staticBvhPacked) {
         console.log(
           `[gi] static shadow bvh: ${staticBvhPacked.triCount} tris, ` +
-            `${(staticBvhPacked.words.length * 4 / (1024 * 1024)).toFixed(1)}MB, built in ${(performance.now() - t0).toFixed(0)}ms`,
+            `${(staticBvhPacked.words.length * 4 / (1024 * 1024)).toFixed(1)}MB, built in ${(performance.now() - t0).toFixed(0)}ms` +
+            ` (${globalThis.__giStaticBvhStrategy ?? "sah"} splits)`,
         );
       }
     }
@@ -5924,13 +6221,13 @@ export class GISystem {
 
   /** classifyDynamicShape with a per-key negative cache (skinned/huge meshes
    *  would otherwise re-classify every motion frame). Tag-aware: a
-   *  `userData.giDynamic` tag bypasses and clears the cache so flipping the
-   *  Mesh component's "GI Dynamic" dropdown takes effect without a rebuild —
-   *  and tag-based rejections ("voxel") are never cached, so flipping BACK
-   *  to auto works too. */
+   *  `userData.giTrace`/`giMobility` tag bypasses and clears the cache so
+   *  flipping the Mesh component's GI dropdowns takes effect without a
+   *  rebuild — and tag-based rejections ("voxel") are never cached, so
+   *  flipping BACK to auto works too. */
   #classifyForAdoption(key, mesh) {
     this._dynIneligibleKeys ??= new Set();
-    const tag = mesh?.userData?.giDynamic;
+    const tag = mesh?.userData?.giTrace ?? mesh?.userData?.giMobility ?? mesh?.userData?.giDynamic;
     if (tag) this._dynIneligibleKeys.delete(key);
     if (this._dynIneligibleKeys.has(key)) return null;
     const shape = classifyDynamicShape(mesh);
@@ -6095,16 +6392,19 @@ export class GISystem {
       // transform is the dynamic set's job. Touching the voxel path again
       // would re-create exactly the per-frame rebuild this exists to remove.
       if (p._giAnalytic) continue;
-      // PINNED DYNAMIC ("dynamic"/"bvh"/"obb" tags): adopt WITHOUT waiting
-      // for motion — the purge re-voxelize lands at load/idle instead of on
-      // the first gameplay frame that moves the object, and statically
-      // tagged meshes (the user's "set these to bvh" case) take effect at
-      // all. "auto" keeps the motion trigger below.
-      const eagerTag = p.mesh?.userData?.giDynamic;
-      if (
-        (eagerTag === "dynamic" || eagerTag === "bvh" || eagerTag === "obb") &&
-        this.#tryAdoptDynamic(p)
-      ) continue;
+      // MOBILITY, not representation (the two-axis split). "dynamic" adopts
+      // WITHOUT waiting for motion, so the purge re-voxelize lands at load
+      // instead of on the first gameplay frame that moves the object.
+      // "static" never adopts: it keeps the voxel field for radiance AND its
+      // triangles in the world static shadow BVH, which is where exact
+      // silhouettes come from for free. "auto" keeps the motion trigger below.
+      // Choosing a TRACE representation no longer drags an object in here —
+      // that conflation is what put 30 static Sponza meshes (the user's
+      // 2026-08-06 scene) into the per-ray mover loop, 16 of them adopted at
+      // the cap, and cost every shadow ray 16 object BVHs instead of one.
+      const mobility = giMobilityOf(p.mesh);
+      if (mobility === "static") continue;
+      if (mobility === "dynamic" && this.#tryAdoptDynamic(p, false)) continue;
       let changed = false;
       if (instanceId == null || !mesh.isInstancedMesh) {
         changed = !p.matrix.equals(mesh.matrixWorld);
@@ -6122,7 +6422,7 @@ export class GISystem {
         // being a per-frame voxel-membership function, which was the
         // measured popping mechanism (sessions 31/31d). Ineligible movers
         // (skinned, over-budget, set full) keep the voxel split below.
-        if (this.#tryAdoptDynamic(p)) continue;
+        if (this.#tryAdoptDynamic(p, true)) continue;
         // Static/dynamic split (occupancyField.staticBits): flag the mover
         // DYNAMIC *before* the matrix write — the flag flip re-snapshots the
         // static side once, and every further frame of this motion replays
@@ -6169,50 +6469,27 @@ export class GISystem {
       const canDemote = !this.engine?.playing;
       let released = false;
       dyn.forEachEntry((entry) => {
-        const tag = entry.mesh?.userData?.giDynamic;
-        const pinned = tag === "dynamic" || tag === "bvh" || tag === "obb";
+        // Two axes, two release reasons: MOBILITY flipped to static (or the
+        // mover rested out of an "auto" adoption), or the TRACE representation
+        // no longer matches what the entry was adopted as.
+        const mobility = giMobilityOf(entry.mesh);
+        const trace = giTraceOf(entry.mesh);
+        const pinned = mobility === "dynamic";
         const mismatch =
-          tag === "static" || tag === "voxel" || tag === "none" ||
-          (tag === "bvh" && entry.type !== "mesh") ||
-          (tag === "obb" && entry.type !== "obb");
+          mobility === "static" || trace === "voxel" ||
+          (trace === "bvh" && entry.type !== "mesh") ||
+          (trace === "obb" && entry.type !== "obb");
         const resting = canDemote && !pinned && (entry.restFrames ?? 0) > demoteAfter;
         if (!mismatch && !resting) return;
         if (globalThis.__giDynObjectsDebug) {
           console.log(
             `[gi] dynamic-objects: released "${entry.mesh?.name}" ` +
-              (mismatch ? `(tag "${tag}" vs ${entry.type})` : `(rested ${entry.restFrames} frames)`),
+              (mismatch
+                ? `(mobility "${mobility}" / trace "${trace}" vs ${entry.type})`
+                : `(rested ${entry.restFrames} frames)`),
           );
         }
-        dyn.release(entry.key);
-        this._dynAdoptedKeys.delete(entry.key);
-        (this._dynCooldown ??= new Map()).set(entry.key, this._frame + 300);
-        // If the placement survived (no content refresh ran since adoption),
-        // revive it in place: back on the voxel path as a dynamic slot (the
-        // quiet-frames demotion settles it static later). A removed placement
-        // is re-created by the forced rescan below instead.
-        const field = state.volume?.occupancyField;
-        const placement = field?.placements?.find(
-          (pl) => slotKeyOf(pl.mesh, pl.instanceId) === entry.key,
-        );
-        if (placement) {
-          placement._giAnalytic = false;
-          placement._lastMovedFrame = this._frame;
-          // Sync the frozen placement matrix (and the slot uniform, which
-          // still holds the pre-adoption pose) to the CURRENT pose — without
-          // this the next transforms tick reads a phantom "changed" and
-          // re-adopts the resting mesh before it ever re-voxelizes
-          // (measured: the dynobj=8 arm ping-ponged demote→re-adopt and the
-          // bits never returned).
-          if (placement.instanceId == null || !placement.mesh.isInstancedMesh) {
-            placement.matrix.copy(placement.mesh.matrixWorld);
-          } else {
-            placement.mesh.getMatrixAt(placement.instanceId, placement.matrix);
-            placement.matrix.premultiply(placement.mesh.matrixWorld);
-          }
-          field.setSlotEnabled?.(placement.slot, true);
-          field.setSlotMatrix?.(placement.slot, placement.matrix);
-        }
-        released = true;
+        if (this.#releaseAdoptee(entry.key)) released = true;
       });
       if (released) {
         // Force the next fingerprint scan to run its content pass — the
@@ -6281,8 +6558,9 @@ export class GISystem {
       if (!record) continue;
       items.push({ positions: record.positions, index: record.index, matrix: p.matrix, slot: p.slot });
     }
-    const packed = items.length ? buildStaticSceneBvhWords(items) : null;
+    const packed = items.length ? buildStaticSceneBvhWords(items, staticBvhStrategy()) : null;
     if (!packed) return;
+    this._staticBvhPacked = packed;
     if (packed.words.length > (this._staticBvhCapacity ?? 0)) {
       console.warn(
         `[gi] static shadow bvh: rebuild needs ${packed.words.length} words > ${this._staticBvhCapacity} capacity — ` +
@@ -6296,9 +6574,16 @@ export class GISystem {
       triBase: field.staticBvhWordOffset + packed.nodeWords,
     });
     dyn.resetStaticMask([]);
-    if (globalThis.__giDynObjectsDebug) {
-      console.log(`[gi] static shadow bvh: rebuilt ${packed.triCount} tris in ${(performance.now() - t0).toFixed(0)}ms`);
-    }
+    // ALWAYS LOGGED, not behind the debug flag: this is a SYNCHRONOUS
+    // main-thread stall of hundreds of milliseconds (262k tris ≈ 200ms center
+    // / 600ms SAH on the user's Sponza). A rebuild that fires on a timer is
+    // indistinguishable from "the editor is lagging", and the only way to tell
+    // a one-off from a loop is to see them in the console.
+    this._staticBvhRebuilds = (this._staticBvhRebuilds ?? 0) + 1;
+    console.log(
+      `[gi] static shadow bvh: rebuild #${this._staticBvhRebuilds} — ` +
+        `${packed.triCount} tris in ${(performance.now() - t0).toFixed(0)}ms`,
+    );
   }
 
   /**
@@ -6310,7 +6595,7 @@ export class GISystem {
    * frozen bits for the live exact shape the moment the GPU side is ready —
    * a one-frame voxel→exact swap instead of a blink.
    */
-  #tryAdoptDynamic(p) {
+  #tryAdoptDynamic(p, moving = false) {
     const dyn = this._dynSet;
     if (!dyn?.enabled) return false;
     const key = slotKeyOf(p.mesh, p.instanceId);
@@ -6325,7 +6610,72 @@ export class GISystem {
     }
     const shape = this.#classifyForAdoption(key, p.mesh);
     if (!shape) return false;
-    if (!dyn.adopt(key, p.mesh, p.instanceId, shape)) return false;
+    if (!dyn.adopt(key, p.mesh, p.instanceId, shape)) {
+      // CAP PRESSURE EVICTION. Before declaring defeat, take a slot back from
+      // something that is not using it. The two rest-demotion guards below
+      // (#refreshDynamicObjects) are deliberately conservative — a pinned
+      // "dynamic" tag never demotes, and nothing demotes in play mode — and
+      // both are right when there is room. Under a FULL cap they are exactly
+      // wrong: they hold the cliff shut against the objects that actually
+      // move. The user's real scene is the case — 15 stationary crates pinned
+      // "dynamic" holding 15 of 16 slots in PLAY MODE while spawned balls,
+      // the only things moving, lost every race and re-voxelized per frame.
+      //
+      // Only ever evicts a mover that has been still for `restNeeded` frames,
+      // longest-resting first, and only to seat one that is moving right now,
+      // so an uncontended scene reaches none of this. `evictCooldown` bounds
+      // the churn: a release forces a whole-volume composite, so a thrashing
+      // evict/re-adopt loop would cost more than the cap ever did.
+      // ONLY FOR A MESH THAT MOVED THIS FRAME. The two call sites are already
+      // the distinction that matters: the eager-pin path adopts on the tag
+      // alone, while this one fires inside `if (changed)`. Evicting for a
+      // pinned-but-stationary mesh turns the cap into a CAROUSEL — measured
+      // on a rig with 20 stationary pinned meshes and 16 slots: an eviction
+      // every cooldown window, forever, each forcing a whole-volume
+      // composite. A slot is only worth taking from a resting mover to give
+      // to one that is actually in motion.
+      const evicted = moving && this.#evictRestingMover(key);
+      if (evicted && dyn.adopt(key, p.mesh, p.instanceId, shape)) {
+        this._dynAdoptedKeys.add(key);
+        p._giAnalytic = true;
+        p._lastMovedFrame = null;
+        (this._dynPendingDisable ??= []).push(p.slot);
+        dyn.setStaticMaskBit(p.slot, true);
+        return true;
+      }
+      // THE CAP IS A CLIFF, AND IT USED TO BE SILENT. Every adopted mover is
+      // tested by EVERY shadow/GI ray (the set is a linear loop of OBB tests
+      // + per-object BVH descents), so a scene that pins its architecture as
+      // movers pays for it on every ray — while the meshes that lost the race
+      // also lost their static-BVH triangles. This was the user's 2026-08-06
+      // "lagging as hell": 30 meshes tagged mobility=dynamic, 16 adopted.
+      if (!this._dynCapWarned) {
+        this._dynCapWarned = true;
+        // NAME THE FREELOADERS. A bare "cap reached" sends the user hunting
+        // through the hierarchy; the meshes actually worth retagging are the
+        // ones holding a slot while never having moved, and the set knows
+        // exactly which those are. (Measured on the user's real project
+        // 2026-08-07: 15 of 16 slots held by stationary crates pinned
+        // "dynamic", with one genuinely rotating cube — and `p.mesh` here is
+        // the one that lost the race.)
+        const idle = [];
+        dyn.forEachEntry((e) => {
+          if ((e.movedFrames ?? 0) === 0 && !e.boundsValid) idle.push(e.mesh?.name || "(unnamed)");
+        });
+        console.warn(
+          `[gi] dynamic-objects: mover cap reached (${dyn.maxObjects}) — "${p.mesh?.name || "a mesh"}" ` +
+            "lost the race and stays voxelized (it will re-voxelize every frame it moves, which reads as " +
+            "blocky flickering light). Every mover costs EVERY ray, so set GI Mobility to \"static\" " +
+            "(or \"auto\") on anything that does not actually move. Static geometry already gets exact " +
+            "triangle shadows from the world static BVH; GI Trace \"bvh\" does NOT require Mobility " +
+            "\"dynamic\"." +
+            (idle.length
+              ? ` Holding slots without ever having moved: ${idle.slice(0, 20).join(", ")}${idle.length > 20 ? ` (+${idle.length - 20} more)` : ""}.`
+              : ""),
+        );
+      }
+      return false;
+    }
     this._dynAdoptedKeys.add(key);
     p._giAnalytic = true;
     p._lastMovedFrame = null;
@@ -6344,6 +6694,98 @@ export class GISystem {
         if (atlas.assignments[i]?.key === key) { atlas.clearSlot(i); break; }
       }
     }
+    return true;
+  }
+
+  /**
+   * Releases ONE adoptee back to the voxel path: drops its exact slot, arms a
+   * re-adoption cooldown, and revives its placement in place at the CURRENT
+   * pose. Shared by rest demotion and cap-pressure eviction — the two paths
+   * used to be one inline block, and a second copy of the pose-sync below is
+   * exactly the kind of divergence that produces a demote→re-adopt ping-pong.
+   *
+   * The caller owns the post-release invalidation (fingerprint / composite /
+   * static-BVH staleness), because rest demotion batches it across a whole
+   * sweep while eviction releases exactly one.
+   */
+  #releaseAdoptee(key) {
+    const dyn = this._dynSet;
+    if (!dyn?.enabled) return false;
+    dyn.release(key);
+    this._dynAdoptedKeys.delete(key);
+    (this._dynCooldown ??= new Map()).set(key, this._frame + 300);
+    // If the placement survived (no content refresh ran since adoption),
+    // revive it in place: back on the voxel path as a dynamic slot (the
+    // quiet-frames demotion settles it static later). A removed placement
+    // is re-created by the caller's forced rescan instead.
+    const field = this.state?.volume?.occupancyField;
+    const placement = field?.placements?.find(
+      (pl) => slotKeyOf(pl.mesh, pl.instanceId) === key,
+    );
+    if (placement) {
+      placement._giAnalytic = false;
+      placement._lastMovedFrame = this._frame;
+      // Sync the frozen placement matrix (and the slot uniform, which still
+      // holds the pre-adoption pose) to the CURRENT pose — without this the
+      // next transforms tick reads a phantom "changed" and re-adopts the
+      // resting mesh before it ever re-voxelizes (measured: the dynobj=8 arm
+      // ping-ponged demote→re-adopt and the bits never returned).
+      if (placement.instanceId == null || !placement.mesh.isInstancedMesh) {
+        placement.matrix.copy(placement.mesh.matrixWorld);
+      } else {
+        placement.mesh.getMatrixAt(placement.instanceId, placement.matrix);
+        placement.matrix.premultiply(placement.mesh.matrixWorld);
+      }
+      field.setSlotEnabled?.(placement.slot, true);
+      field.setSlotMatrix?.(placement.slot, placement.matrix);
+    }
+    return true;
+  }
+
+  /**
+   * Frees one exact-mover slot by releasing the LONGEST-RESTING adoptee, so a
+   * mesh that is moving right now can take it. Returns true if a slot was
+   * freed. See the call site in #tryAdoptDynamic for why this overrides the
+   * normal demotion guards.
+   *
+   * `restFrames` is the set's own per-entry counter — the same one the
+   * edit-mode rest demotion reads — so "not using its slot" is measured from
+   * frames, not from the mesh's tag.
+   */
+  #evictRestingMover(wantKey) {
+    const dyn = this._dynSet;
+    if (!dyn?.enabled) return false;
+    // One eviction per cooldown window. A release forces a whole-volume
+    // composite (see the release path), which is far too expensive to run on
+    // every refused adoption in a scene that is simply over budget.
+    const cooldown = Number(globalThis.__giDynEvictCooldown) || 90;
+    if (this._dynLastEvictFrame != null && this._frame - this._dynLastEvictFrame < cooldown) return false;
+    // Long enough that a mover pausing mid-trip (an elevator at a floor, a
+    // ball at the top of its arc) is never evicted out from under itself.
+    const restNeeded = Number(globalThis.__giDynEvictRestFrames) || 240;
+    let victim = null;
+    dyn.forEachEntry((entry) => {
+      if (entry.key === wantKey) return;
+      const rest = entry.restFrames ?? 0;
+      if (rest < restNeeded) return;
+      if (!victim || rest > victim.restFrames) victim = entry;
+    });
+    if (!victim) return false;
+    if (globalThis.__giDynObjectsDebug) {
+      console.log(
+        `[gi] dynamic-objects: evicting "${victim.mesh?.name || "(unnamed)"}" ` +
+          `(rested ${victim.restFrames} frames) to seat a mover that is actually moving`,
+      );
+    }
+    this.#releaseAdoptee(victim.key);
+    // Same post-release invalidation the rest-demotion sweep runs: the evicted
+    // mesh needs its placement + bits back, and the pyramid chain only
+    // DISPATCHES inside the composite branch.
+    this._fingerprint = null;
+    this._forceWholeComposite = true;
+    this._compositedOnce = false;
+    if (dyn.staticBvh) this._staticBvhStale = this._frame;
+    this._dynLastEvictFrame = this._frame;
     return true;
   }
 

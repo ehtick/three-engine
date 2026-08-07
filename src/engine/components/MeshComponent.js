@@ -41,14 +41,29 @@ export class MeshComponent extends Component {
     material8: "",
     castShadow: true,
     receiveShadow: true,
-    // How GI represents this mesh (exact-dynamic adoption,
-    // src/modules/gi/dynamicObjects.js): "auto" = voxelized while static,
-    // adopted into the exact ray-traced path on first motion (and demoted
-    // back after a long rest in edit mode); "static" = never adopt; "dynamic"
-    // = adopt at load (no first-motion transition), classified by geometry
-    // (default primitives → analytic shapes, everything else → triangle
-    // BVH); "bvh" / "obb" = adopt at load with a forced representation
-    // (exact triangles / bounding box).
+    // ── GI: TWO INDEPENDENT AXES (src/modules/gi/dynamicObjects.js) ──────
+    // Does it move, and what do rays intersect? Unrelated questions that used
+    // to share one dropdown — which meant "I want exact triangles" could only
+    // be said by ALSO declaring the object a mover. That conflation is what
+    // put 30 static Sponza meshes into the per-ray mover loop (2026-08-06).
+    //
+    // giMobility — "auto": voxelized while it sits still, adopted into the
+    // exact ray-traced mover path on first motion (and demoted back after a
+    // long rest in edit mode). "static": never adopt — it stays in the voxel
+    // field for radiance and in the world static shadow BVH, which ALREADY
+    // gives it exact triangle shadows. "dynamic": adopt at load without
+    // waiting for motion. Every mover is tested by every ray, so "dynamic"
+    // is the expensive one — use it for things that actually move.
+    giMobility: "auto",
+    // giTrace — the surface a ray intersects once this mesh IS a mover.
+    // "auto": by geometry (three.js primitives with a closed form → analytic
+    // sphere/capsule/frustum/OBB, everything else → exact triangle BVH).
+    // "bvh": force exact triangles. "obb": force the bounding box (cheapest).
+    // "voxel": never go exact — keep the voxel path even while moving.
+    // Ignored while giMobility is "static": static surfaces are already exact.
+    giTrace: "auto",
+    // LEGACY pre-split tag. Migrated to the pair above on attach, then left
+    // alone; scenes written before the split still carry it.
     giDynamic: "auto",
   };
   static schema = [
@@ -68,7 +83,11 @@ export class MeshComponent extends Component {
     { key: "material8", label: "Material 8", type: "asset", exts: ["mat"], hidden: true },
     { key: "castShadow", label: "Cast Shadow", type: "boolean" },
     { key: "receiveShadow", label: "Receive Shadow", type: "boolean" },
-    { key: "giDynamic", label: "GI Dynamic", type: "select", options: ["auto", "static", "dynamic", "bvh", "obb"] },
+    { key: "giMobility", label: "GI Mobility", type: "select", options: ["auto", "static", "dynamic"] },
+    // Only meaningful for movers — a static mesh is traced exactly by the
+    // world shadow BVH no matter what this says.
+    { key: "giTrace", label: "GI Trace", type: "select", options: ["auto", "bvh", "obb", "voxel"], showIf: (props) => props.giMobility !== "static" },
+    { key: "giDynamic", label: "GI Dynamic (legacy)", type: "select", options: ["auto", "static", "dynamic", "bvh", "obb"], hidden: true },
   ];
 
   constructor(props = {}) {
@@ -303,19 +322,53 @@ export class MeshComponent extends Component {
       this.#loadExtraMaterials();
     } else if (key === "castShadow" || key === "receiveShadow") {
       this.mesh[key] = !!this.props[key];
-    } else if (key === "giDynamic") {
-      // Live: the GI system re-reads the tag every frame for adopted movers
+    } else if (key === "giDynamic" || key === "giMobility" || key === "giTrace") {
+      // Live: the GI system re-reads the tags every frame for adopted movers
       // and before every adoption, so no rebuild is needed here.
       this.#applyGiDynamic();
     }
   }
 
-  /** Mirrors the giDynamic prop onto the render mesh's userData — the tag the
-   *  GI exact-dynamic classifier reads (dynamicObjects.js). "auto" clears it. */
+  /**
+   * Mirrors the GI tags onto the render mesh's userData — what the GI
+   * classifier and the adoption path read (dynamicObjects.js). "auto" clears,
+   * so an untagged mesh carries no userData at all.
+   *
+   * MIGRATION: a scene written before the mobility/trace split carries only
+   * `giDynamic`. Its five values each meant a (mobility, trace) PAIR, so they
+   * map cleanly — and the mapping is applied to the PROPS, once, so the next
+   * save writes the new pair and the inspector shows what is actually in
+   * effect. It is deliberately faithful: "dynamic"/"bvh"/"obb" really did pin
+   * the object as a mover, and silently un-pinning them would change what the
+   * scene renders. (If that pin was unintentional — the common case, since
+   * wanting exact triangles was the only reason to reach for "bvh" — the GI
+   * mover-cap warning names it, and GI Mobility "static" is the fix.)
+   */
   #applyGiDynamic() {
     if (!this.mesh) return;
-    const v = this.props.giDynamic;
-    if (v && v !== "auto") this.mesh.userData.giDynamic = v;
-    else delete this.mesh.userData.giDynamic;
+    const legacy = this.props.giDynamic;
+    if (legacy && legacy !== "auto" && this.props.giMobility === "auto" && this.props.giTrace === "auto") {
+      const map = {
+        static: ["static", "auto"],
+        voxel: ["auto", "voxel"],
+        none: ["auto", "voxel"],
+        dynamic: ["dynamic", "auto"],
+        bvh: ["dynamic", "bvh"],
+        obb: ["dynamic", "obb"],
+      }[legacy];
+      if (map) {
+        this.props.giMobility = map[0];
+        this.props.giTrace = map[1];
+      }
+    }
+    const write = (key, v) => {
+      if (v && v !== "auto") this.mesh.userData[key] = v;
+      else delete this.mesh.userData[key];
+    };
+    write("giMobility", this.props.giMobility);
+    write("giTrace", this.props.giTrace);
+    // The legacy key is no longer read once either new tag is present, but a
+    // stale value on the mesh would still answer giMobilityOf's fallback.
+    delete this.mesh.userData.giDynamic;
   }
 }

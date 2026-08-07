@@ -317,6 +317,38 @@ export function emitterAngularRadius(slot) {
  * texture by the resolve pass), and the per-slot geometry the specular glow
  * reuses.
  */
+/**
+ * Irradiance below which an emitter is neither TRACED nor SHOWN.
+ *
+ * This one number sets each emitter's effective reach, and reach is the whole
+ * cost of the screen emitter shadow pass: every pixel inside it marches a
+ * record ray (plus a static-BVH8 traversal, plus every adopted mover) to that
+ * emitter, every frame. Falloff is 1/d², so the traced AREA grows as
+ * cutoff⁻¹ — halving the cutoff doubles the pixels that pay.
+ *
+ * MEASURED (user's editor, 2026-08-07, 3 emitters at 636x249): the emitter
+ * shadow pass was 10.53ms, 77% of all per-frame GI screen work. The rig
+ * reproduced the SHAPE of it (0.23ms in a bare scene → 0.87ms at 90k tris,
+ * same pixel count) and ruled out the obvious suspects: disabling the static
+ * BVH arm saved 19%, dropping 12 adopted movers 12%, the analytic width probe
+ * nothing. What is left is how FAR the rays go — with `shadowRange` at the
+ * volume diagonal (up to 64m) and this cutoff at 0.0015, a strength-12 lamp
+ * keeps earning full marches out to ~28m, which in a real scene is every
+ * pixel on screen, three times over.
+ *
+ * The trace gate and the contribution fade MUST use the same number, or dim
+ * emitter light crosses walls unshadowed (the bug the original 0.0015 gate was
+ * introduced to fix). `__giEmitterCutoff` overrides.
+ */
+export function emitterCutoff(params = null) {
+  const override = Number(globalThis.__giEmitterCutoff);
+  if (Number.isFinite(override) && override > 0) return override;
+  const preset = Number(params?.emitterCutoff);
+  // The 0.0015 fallback is the in-material path's, which has no preset to
+  // read — it keeps the historical reach rather than silently changing.
+  return Number.isFinite(preset) && preset > 0 ? preset : 0.0015;
+}
+
 export function emitterDirectAt(params, P, N, samplePoint) {
   const total = vec3(0).toVar();
   const shadows = [];
@@ -338,7 +370,8 @@ export function emitterDirectAt(params, P, N, samplePoint) {
     // gate skipped the trace but KEPT the contribution, so dim emitter light
     // crossed walls unshadowed and read clearly in dark adjacent rooms.
     const emitterLum = emitterDirect.dot(vec3(0.2126, 0.7152, 0.0722)).toVar();
-    emitterDirect.mulAssign(smoothstep(0.0005, 0.0015, emitterLum));
+    const cutD = emitterCutoff(params);
+    emitterDirect.mulAssign(smoothstep(cutD / 3, cutD, emitterLum));
     // PRE-TRACED CHANNEL (2026-08-06): when the emitter shadows run as their
     // own pass at their own pixel budget (giScreen's emitter shadow pass —
     // the same split that took the direct arm from 22ms to 5.4ms at 4×
@@ -381,7 +414,7 @@ export function emitterSlotShadow(params, slot, P, N, samplePoint) {
     slot.radius.greaterThan(0.001)
       .and(cosTheta.greaterThan(0.05))
       .and(dist.lessThan(params.shadowRange))
-      .and(emitterLum.greaterThan(0.0015)),
+      .and(emitterLum.greaterThan(emitterCutoff(params))),
     () => {
       // k = distance / emitter angular radius encodes the light's angular
       // size: bigger/closer emitter → softer. Floor 1.2 so a large area

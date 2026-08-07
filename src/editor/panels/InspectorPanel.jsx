@@ -19,6 +19,7 @@ import {
   Link2Off,
   Search,
   Pencil,
+  ExternalLink,
   PanelsTopLeft,
   Waypoints,
   Layers2,
@@ -670,17 +671,36 @@ function ScriptsSection({ entityId, props }) {
                 value={slot.path ?? ""}
                 onCommit={(path) => updateSlot(index, { path }, "Set script")}
               />
+              {/* Two ways out to the same file. The Code panel is first and
+                  keeps the pencil because editing a script without leaving the
+                  app is the default we want; "Open in IDE" stays one click away
+                  for when the user genuinely wants their own setup. */}
               <button
                 className="icon-btn"
                 title={
                   slot.path
-                    ? `Edit ${slot.path.split(/[\\/]/).pop()} in your IDE`
+                    ? `Edit ${slot.path.split(/[\\/]/).pop()} in the Code panel`
+                    : "Assign a script first"
+                }
+                disabled={!slot.path}
+                // Lazy, like openAsset.js's own use of it: codeStore pulls in
+                // the Monaco setup module, and the Inspector opens far more
+                // often than this button is pressed.
+                onClick={() => import("../codeStore.js").then((m) => m.openCodeFile(slot.path))}
+              >
+                <Pencil size={12} />
+              </button>
+              <button
+                className="icon-btn"
+                title={
+                  slot.path
+                    ? `Open ${slot.path.split(/[\\/]/).pop()} in your IDE`
                     : "Assign a script first"
                 }
                 disabled={!slot.path}
                 onClick={() => openInIDE(slot.path)}
               >
-                <Pencil size={12} />
+                <ExternalLink size={12} />
               </button>
               <NewScriptButton
                 defaultName={defaultScriptName}

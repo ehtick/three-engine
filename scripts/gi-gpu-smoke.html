@@ -213,7 +213,38 @@
         // the occupancy BYTE-STABLE — the membership churn that popped
         // silhouettes is structurally gone.
         let dynObjReport = null;
-        if (dynObjArm) {
+        // `?dynobj=9` — MOBILITY "static" HOLDS THROUGH MOTION. The
+        // load-bearing case of the mobility/trace split: every mover is
+        // tested by EVERY ray, so "this never moves" has to be a promise the
+        // adoption path keeps even when the transform says otherwise. The old
+        // single tag could not express it — asking for exact triangles also
+        // pinned the object as a mover, which is how 30 static Sponza meshes
+        // ended up in the per-ray loop. A trace override rides along to prove
+        // the two axes really are independent.
+        if (dynObjArm === 9) {
+          const system = engine.modules.get("gi").system;
+          const occField = system.state.volume.occupancyField;
+          const settle = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+          wall.userData.giMobility = "static";
+          wall.userData.giTrace = "bvh";
+          const staticDeadline = performance.now() + 12_000;
+          while (performance.now() < staticDeadline) {
+            wall.rotation.y += 0.05;
+            wall.rotation.x += 0.03;
+            wall.updateMatrixWorld(true);
+            await settle(50);
+            if ((system._dynSet?.count() ?? 0) > 0) {
+              throw new Error('dynobj=9: GI Mobility "static" adopted a moving mesh anyway — the axes are still coupled');
+            }
+          }
+          const held = await occField.readbackStats(engine.renderer);
+          if (!(held.occupiedVoxels > 0)) {
+            throw new Error("dynobj=9: the static mesh left the voxel field — static keeps BOTH the field and the static BVH");
+          }
+          dynObjReport = { staticHeld: true, adopted: system._dynSet?.count() ?? 0, occupied: held.occupiedVoxels };
+          console.log("GI-SMOKE DYNOBJ", JSON.stringify(dynObjReport));
+          stats = await system.readRayHitStats();
+        } else if (dynObjArm) {
           const system = engine.modules.get("gi").system;
           const occField = system.state.volume.occupancyField;
           const settle = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -230,7 +261,7 @@
             mover = new THREE.Mesh(geo, material);
             // dynobj=6: the per-mesh override — a CUSTOM mesh tagged "obb"
             // must adopt as the analytic bounding box, no BVH upload.
-            if (dynObjArm === 6) mover.userData.giDynamic = "obb";
+            if (dynObjArm === 6) mover.userData.giTrace = "obb";
             mover.position.set(1.5, 0.5, 0);
             mover.updateMatrixWorld(true);
             engine.scene.add(mover);
@@ -242,7 +273,7 @@
           // dynobj=7 — the "dynamic" PIN: tag the (never-moved) wall AFTER
           // the baseline readback and assert adoption fires with ZERO motion.
           if (dynObjArm === 7) {
-            mover.userData.giDynamic = "dynamic";
+            mover.userData.giMobility = "dynamic";
             const eagerDeadline = performance.now() + 15_000;
             let eager = false;
             while (performance.now() < eagerDeadline) {
@@ -296,7 +327,7 @@
           }
           if (dynObjArm >= 3 && system._dynSet.stats.meshUploadsQueued > 0) {
             throw new Error(`dynobj=${dynObjArm} arm: an analytic path queued a BVH upload — ` +
-              (dynObjArm === 6 ? "the userData.giDynamic=\"obb\" override was ignored" : "classification regressed"));
+              (dynObjArm === 6 ? "the userData.giTrace=\"obb\" override was ignored" : "classification regressed"));
           }
           // Let the parked slot's purge re-voxelize land, then measure.
           for (let i = 0; i < 20; i++) { mover.rotation.y += 0.05; mover.updateMatrixWorld(true); await settle(50); }

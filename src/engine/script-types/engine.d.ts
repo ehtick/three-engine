@@ -499,15 +499,34 @@ declare module "engine" {
     castShadow: boolean;
     receiveShadow: boolean;
     /**
-     * How GI represents this mesh (exact dynamic objects). `"auto"` (default):
-     * voxelized while static, adopted into the exact ray-traced path on first
-     * motion, demoted back after a long rest in edit mode. `"static"`: never
-     * adopt (legacy alias `"voxel"`). `"dynamic"`: adopt at load — no
-     * first-motion transition — classified by geometry (default primitives →
-     * analytic box/plane/sphere/capsule/frustum, everything else an
-     * exact-triangle BVH). `"bvh"` / `"obb"`: adopt at load with a forced
-     * representation (exact triangles / bounding box — the latter is cheapest
-     * but over-occludes concave shapes).
+     * Does this mesh move? `"auto"` (default): voxelized while it sits still,
+     * adopted into the exact ray-traced mover path on first motion, demoted
+     * back after a long rest in edit mode. `"static"`: never adopt — it keeps
+     * the voxel field for radiance and its triangles in the world static
+     * shadow BVH, which already gives it exact triangle shadows. `"dynamic"`:
+     * adopt at load, without waiting for motion.
+     *
+     * Every mover is tested by every GI/shadow ray, so `"dynamic"` is the
+     * expensive setting — reach for it only for things that actually move.
+     * Wanting exact silhouettes is NOT a reason: see {@link giTrace}.
+     */
+    giMobility: "auto" | "static" | "dynamic";
+    /**
+     * What a ray intersects once this mesh IS a mover. `"auto"` (default): by
+     * geometry — three.js primitives with a closed form become analytic
+     * box/plane/sphere/capsule/frustum, everything else an exact-triangle BVH.
+     * `"bvh"`: force exact triangles. `"obb"`: force the bounding box
+     * (cheapest, over-occludes concave shapes). `"voxel"`: never go exact,
+     * keep the voxel path even while moving.
+     *
+     * Ignored while {@link giMobility} is `"static"` — static surfaces are
+     * traced exactly by the world shadow BVH regardless.
+     */
+    giTrace: "auto" | "bvh" | "obb" | "voxel";
+    /**
+     * @deprecated Pre-split single tag, migrated to {@link giMobility} +
+     * {@link giTrace} on attach. Its values each meant a pair: `"bvh"` was
+     * mobility `"dynamic"` + trace `"bvh"`, and so on.
      */
     giDynamic: "auto" | "static" | "dynamic" | "voxel" | "bvh" | "obb";
   }> {}

@@ -393,17 +393,64 @@ export function createCascadeMerge(cascades, { sky = [0, 0, 0], occupancyVoxel =
                 const relAim = target.sub(parentPos).toVar();
                 const lenAim = relAim.length().max(1e-4);
                 const { u: pu, v: pv } = octahedralUV(relAim.div(lenAim), parent.dirRes);
-                // Whole-texel-snapped 2×2 box centred on the re-aimed
-                // direction — box width = the child's bin, so small-source
-                // dilution is preserved; only the CENTER moves with parallax.
-                const bxA = pu.add(0.5).floor().sub(1).clamp(0, parent.dirRes - 2);
-                const byA = pv.add(0.5).floor().sub(1).clamp(0, parent.dirRes - 2);
-                const rowA = parentProbeIdx.mul(parent.dirCount).add(byA.mul(parent.dirRes)).add(bxA).toVar();
-                const r0 = parent.merged.element(rowA.toInt()).xyz;
-                const r1 = parent.merged.element(rowA.add(1).toInt()).xyz;
-                const r2 = parent.merged.element(rowA.add(parent.dirRes).toInt()).xyz;
-                const r3 = parent.merged.element(rowA.add(parent.dirRes).add(1).toInt()).xyz;
-                reproj.assign(r0.add(r1).add(r2).add(r3).mul(0.25));
+                // A 2-texel-wide box centred on the re-aimed direction — box
+                // width = the child's bin, so small-source dilution is
+                // preserved; only the CENTER moves with parallax.
+                //
+                // THE CENTRE MUST MOVE CONTINUOUSLY, and until 2026-08-07 it
+                // did not: the box was snapped to whole texels
+                // (`floor(pu + 0.5) - 1`), so as a child probe slid across its
+                // parent's cell the re-aimed tap INDEX jumped by a whole bin
+                // and the merged radiance stepped with it. That step is the
+                // user's "blocky indirect light", and it is the parallax
+                // correction's own doing: with `__giParallaxMerge = false` the
+                // naive tap has no re-aim to snap and the floor comes out
+                // smooth. MEASURED on scripts/run-gi-block-size.mjs (emissive
+                // panel, open floor, per-line-detrended relative modulation of
+                // the floor patch): 14.71% with the snap, 4.58% with the whole
+                // correction disabled — i.e. two thirds of ALL the structure on
+                // that floor was this one floor().
+                //
+                // The continuous form is the same box mean, evaluated at a
+                // fractional centre: interpolate between the two integer-
+                // aligned boxes on each axis. Separably that is a 3-tap
+                // [(1−f)/2, 1/2, f/2] kernel per axis (weights sum to 1 by
+                // construction, so the box's WIDTH — and therefore the
+                // dilution — is unchanged; only its position is now smooth).
+                // Nine buffer reads instead of four, in a loop that is already
+                // reading eight parent probes.
+                //
+                // `__giParallaxMergeSmooth = false` restores the snapped box
+                // for an A/B. BUILD-TIME, like every other hatch here.
+                const gx = pu.sub(1).toVar();
+                const gy = pv.sub(1).toVar();
+                const i0 = gx.floor().toVar();
+                const j0 = gy.floor().toVar();
+                const fu = gx.sub(i0).toVar();
+                const fv = gy.sub(j0).toVar();
+                if (globalThis.__giParallaxMergeSmooth === false) {
+                  const bxA = pu.add(0.5).floor().sub(1).clamp(0, parent.dirRes - 2);
+                  const byA = pv.add(0.5).floor().sub(1).clamp(0, parent.dirRes - 2);
+                  const rowA = parentProbeIdx.mul(parent.dirCount).add(byA.mul(parent.dirRes)).add(bxA).toVar();
+                  const r0 = parent.merged.element(rowA.toInt()).xyz;
+                  const r1 = parent.merged.element(rowA.add(1).toInt()).xyz;
+                  const r2 = parent.merged.element(rowA.add(parent.dirRes).toInt()).xyz;
+                  const r3 = parent.merged.element(rowA.add(parent.dirRes).add(1).toInt()).xyz;
+                  reproj.assign(r0.add(r1).add(r2).add(r3).mul(0.25));
+                } else {
+                  const wu = [fu.oneMinus().mul(0.5), float(0.5), fu.mul(0.5)];
+                  const wv = [fv.oneMinus().mul(0.5), float(0.5), fv.mul(0.5)];
+                  const box = vec3(0).toVar();
+                  for (let a = 0; a < 3; a++) {
+                    const ix = i0.add(a).clamp(0, parent.dirRes - 1);
+                    for (let b = 0; b < 3; b++) {
+                      const iy = j0.add(b).clamp(0, parent.dirRes - 1);
+                      const idx = parentProbeIdx.mul(parent.dirCount).add(iy.mul(parent.dirRes)).add(ix);
+                      box.addAssign(parent.merged.element(idx.toInt()).xyz.mul(wu[a].mul(wv[b])));
+                    }
+                  }
+                  reproj.assign(box);
+                }
               });
               parentRad = reproj;
             } else {

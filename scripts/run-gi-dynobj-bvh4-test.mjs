@@ -312,7 +312,7 @@ function shapeHit(type, prm, ro, rd, tMin, tMax) {
   return bestT;
 }
 
-const { classifyDynamicShape } = await import("../src/modules/gi/dynamicObjects.js");
+const { classifyDynamicShape, giMobilityOf, giTraceOf } = await import("../src/modules/gi/dynamicObjects.js");
 const analyticCases = [
   { name: "sphere", geometry: new THREE.SphereGeometry(0.8, 128, 96) },
   { name: "capsule", geometry: new THREE.CapsuleGeometry(0.5, 1.2, 64, 128) },
@@ -360,24 +360,43 @@ for (const [ai, { name, geometry }] of analyticCases.entries()) {
   if (!ok) failures++;
 }
 
-// ── per-mesh giDynamic tag overrides ─────────────────────────────────────────
+// ── the two GI axes: MOBILITY (does it move) × TRACE (what rays intersect) ───
+// They are independent by design. classifyDynamicShape answers TRACE only —
+// mobility is GISystem's adoption decision — so a "static" mesh still
+// classifies here; what makes it static is that it is never offered.
 {
-  const mk = (geometry, tag) => {
+  const mk = (geometry, userData) => {
     const mesh = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial());
-    if (tag) mesh.userData.giDynamic = tag;
-    return classifyDynamicShape(mesh);
+    Object.assign(mesh.userData, userData ?? {});
+    return mesh;
   };
+  const shapeOf = (geometry, userData) => classifyDynamicShape(mk(geometry, userData));
   const torus = new THREE.TorusKnotGeometry(0.8, 0.25, 24, 8);
   const sphere = new THREE.SphereGeometry(0.8, 24, 16);
   const tagChecks = [
-    ["voxel tag rejects adoption", mk(sphere, "voxel") === null],
-    ["static tag rejects adoption (voxel alias)", mk(sphere, "static") === null],
-    ["dynamic tag classifies by geometry like auto", mk(sphere, "dynamic")?.type === "sphere"],
-    ["dynamic tag sends custom meshes to the BVH", mk(torus, "dynamic")?.type === "mesh"],
-    ["bvh tag forces triangles on a default primitive", mk(sphere, "bvh")?.type === "mesh"],
-    ["obb tag forces the bounding box on a custom mesh", mk(torus, "obb")?.type === "obb"],
-    ["untagged sphere stays analytic", mk(sphere, null)?.type === "sphere"],
-    ["untagged torus takes the BVH", mk(torus, null)?.type === "mesh"],
+    // TRACE axis
+    ["trace voxel rejects the exact path", shapeOf(sphere, { giTrace: "voxel" }) === null],
+    ["trace bvh forces triangles on a default primitive", shapeOf(sphere, { giTrace: "bvh" })?.type === "mesh"],
+    ["trace obb forces the bounding box on a custom mesh", shapeOf(torus, { giTrace: "obb" })?.type === "obb"],
+    ["trace auto keeps a sphere analytic", shapeOf(sphere, { giTrace: "auto" })?.type === "sphere"],
+    ["untagged sphere stays analytic", shapeOf(sphere, null)?.type === "sphere"],
+    ["untagged torus takes the BVH", shapeOf(torus, null)?.type === "mesh"],
+    // MOBILITY axis — orthogonal: it must not change the representation
+    ["mobility static still classifies (trace is a separate axis)", shapeOf(sphere, { giMobility: "static" })?.type === "sphere"],
+    ["mobility static reads back as static", giMobilityOf(mk(sphere, { giMobility: "static" })) === "static"],
+    ["mobility dynamic reads back as dynamic", giMobilityOf(mk(sphere, { giMobility: "dynamic" })) === "dynamic"],
+    ["untagged mesh is mobility auto", giMobilityOf(mk(sphere, null)) === "auto"],
+    ["mobility static + trace bvh is a legal pair", shapeOf(sphere, { giMobility: "static", giTrace: "bvh" })?.type === "mesh"],
+    // LEGACY giDynamic migration — each old value meant a (mobility, trace) pair
+    ["legacy static → mobility static", giMobilityOf(mk(sphere, { giDynamic: "static" })) === "static"],
+    ["legacy voxel → trace voxel", giTraceOf(mk(sphere, { giDynamic: "voxel" })) === "voxel"],
+    ["legacy voxel rejects the exact path", shapeOf(sphere, { giDynamic: "voxel" }) === null],
+    ["legacy bvh → mobility dynamic", giMobilityOf(mk(sphere, { giDynamic: "bvh" })) === "dynamic"],
+    ["legacy bvh → trace bvh", shapeOf(sphere, { giDynamic: "bvh" })?.type === "mesh"],
+    ["legacy obb → trace obb", shapeOf(torus, { giDynamic: "obb" })?.type === "obb"],
+    ["legacy dynamic → mobility dynamic, trace auto", giMobilityOf(mk(torus, { giDynamic: "dynamic" })) === "dynamic" &&
+      shapeOf(torus, { giDynamic: "dynamic" })?.type === "mesh"],
+    ["new tags win over a stale legacy tag", giMobilityOf(mk(sphere, { giDynamic: "dynamic", giMobility: "static" })) === "static"],
   ];
   for (const [label, ok] of tagChecks) {
     console.log(`${ok ? "PASS" : "FAIL"} tag: ${label}`);

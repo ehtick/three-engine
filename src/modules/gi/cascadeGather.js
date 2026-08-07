@@ -793,6 +793,24 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
   // Emitters stay on `shadowTrace` — they need the lamp-body exclusion and
   // their soft penumbrae, and they are not the leak path.
   const lightShadow = options.lightShadow ?? shadowTrace;
+  // EMITTER shadows in the FIELD get their own, SHORTER march (GISystem's
+  // traceBudget.feedbackEmitter). Measured 2026-08-07 with four moving
+  // emissive spheres (scripts/run-gi-emissive-cost.mjs): this pass costs
+  // 0.73ms PER EMITTER at a 128x32x128 volume, dead linear in emitter count
+  // (0 / 0.84 / 1.67 / 2.92ms at 0/1/2/4), and it is the single biggest term
+  // in "each emissive object is -15-20 fps" — the queue's other passes
+  // together grew 0.15ms per emitter. The cost is structural: every occupied
+  // cell marches a fresh soft shadow ray to every live emitter, every frame.
+  //
+  // The march can be shorter HERE and only here, because this term seeds
+  // BOUNCE. What the field injects is gathered by the cascades, blurred
+  // across a probe neighbourhood and EMA-blended — a sharper occlusion
+  // estimate cannot survive that chain. The shadow the user actually sees on
+  // a visible surface comes from the screen-side emitter pass, which keeps
+  // its full record-march + analytic width (GISystem #buildEmitterRecordTrace)
+  // and is a different, per-pixel budget entirely. Falls back to `shadowTrace`
+  // so a caller that does not split the budgets behaves exactly as before.
+  const emitterShadow = options.emitterShadowTrace ?? shadowTrace;
   // LIVE look control (uniform, 1 = physical): desaturates the FIELD-SIDE
   // albedo — the color bounced light carries — toward its own luminance.
   // Energy is preserved, only chroma drops, so dialling it down turns
@@ -1118,7 +1136,7 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
       // factor — SDF-shadowed with k from the emitter's angular size (the
       // SAME emitterSlotFactor the receiver-side material term uses, so the
       // two stay in agreement).
-      if (emitterSlots?.length && shadowTrace) {
+      if (emitterSlots?.length && emitterShadow) {
         const rawAlbedo = fieldAlbedo;
         for (const slot of emitterSlots) {
           If(slot.radius.greaterThan(0.001), () => {
@@ -1165,7 +1183,7 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
                   : null;
                 const traceDirE = jitter ? jitterDir(dir, eAngle) : dir;
                 shadow.assign(
-                  shadowTrace(
+                  emitterShadow(
                     origin, traceDirE, maxT, k, cosTheta.max(0),
                     vec3(slot.center), exRadius, exBox,
                   ),
