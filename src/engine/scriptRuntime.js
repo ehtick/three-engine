@@ -109,6 +109,35 @@ export function resolveRuntimeUrls() {
   return urlsPromise;
 }
 
+/**
+ * Which specifier actually exports `name`, or null if none does.
+ *
+ * Exists for one error message, and it is worth the lookup. The editor surface
+ * (`Editor`, `isEditor`, `@executeInEditMode`, `@menuItem`) lives behind
+ * `"editor"` while everything else lives behind `"engine"`, and importing one
+ * from the other fails with the browser's own wording — "the requested module
+ * '…/scriptRuntime/runtime.js' does not provide an export named
+ * 'executeInEditMode'". That names an internal proxy file the user has never
+ * seen and never mentions the specifier they actually typed, so the one fact
+ * needed to fix it is the one fact missing.
+ *
+ * Asked of the live proxy modules rather than a hard-coded list, so moving an
+ * export between surfaces can't leave this advising the old home.
+ */
+export async function specifierExporting(name) {
+  if (!name) return null;
+  for (const [specifier, load] of Object.entries(PROXY_LOADERS)) {
+    try {
+      const mod = await load();
+      if (name in mod) return specifier;
+    } catch {
+      // A proxy that won't load can't be the answer; the caller is already
+      // reporting a failure and a second one here would only bury it.
+    }
+  }
+  return null;
+}
+
 /** Escapes a specifier for literal use inside a RegExp. */
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
 

@@ -116,8 +116,25 @@ export function isEditor() {
  *
  *     @executeInEditMode()
  *     export default class Grid extends Script {}
+ *
+ * Putting it on a METHOD is the common mistake — it is the whole-script switch,
+ * and `@menuItem("Tools/…")` is the per-method one. TypeScript catches that
+ * ("Decorator function return type 'Function' is not assignable to type
+ * 'void | TypedPropertyDescriptor<…>'"), but the runtime consequence of
+ * ignoring it is much worse than the mistake deserves: the called-form branch
+ * below would hand `mark` back as the property DESCRIPTOR, and
+ * `Object.defineProperty` then throws "Property description must be an object"
+ * — an error naming neither this decorator nor the method it was written on.
+ * Hence the explicit guard.
  */
-export function executeInEditMode(target) {
+export function executeInEditMode(target, key) {
+  if (key !== undefined) {
+    throw new Error(
+      `@executeInEditMode goes on the class, not on "${String(key)}" — it marks the ` +
+        `whole script as running while the editor is stopped. To put one method in ` +
+        `the menu bar, use @menuItem("Tools/Label") instead.`,
+    );
+  }
   const mark = (cls) => {
     cls.executeInEditMode = true;
     return cls;

@@ -117,6 +117,98 @@ for (const [type, name] of tokenByType) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// editor.d.ts vs the real Editor facade.
+//
+// Same failure mode as ComponentMap above, one module over: `editor.d.ts` is
+// hand-written alongside `src/editor/api/index.js`, and nothing made them
+// agree. They drifted badly — the declarations described 9 namespaces while the
+// facade had 22, so two thirds of `Editor.*` (viewport, materials, prefabs,
+// modules, audio, library, textures, geometry, pipeline, git, build, batch,
+// console) was an error in the app's own code editor despite working fine at
+// runtime. `skipLibCheck` guarantees nothing reports that on its own.
+//
+// Checked BOTH ways on purpose. A facade method with no declaration is
+// invisible to autocomplete, so in practice it does not exist; a declaration
+// with no facade method is worse, because it type-checks and then throws.
+// ---------------------------------------------------------------------------
+console.log("script types — Editor facade");
+
+const FACADE = fileURLToPath(new URL("../src/editor/api/index.js", import.meta.url));
+const EDITOR_DTS = fileURLToPath(new URL("../src/engine/script-types/editor.d.ts", import.meta.url));
+
+/** Comments carry prose that looks like members ("`entities.create(...)`"). */
+const stripComments = (text) =>
+  text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^[ \t]*\/\/.*$/gm, "");
+
+/** The body lines of the `{ … }` opened on `openLine`, and where it closes. */
+function blockEnd(lines, openIndex, indent) {
+  const close = new RegExp(`^ {${indent}}\\}`);
+  for (let i = openIndex + 1; i < lines.length; i++) if (close.test(lines[i])) return i;
+  return lines.length;
+}
+
+/**
+ * Dotted member paths of an object/interface body — `entities.create`,
+ * `textures.atlas.pack`. Nested literals recurse; everything else is a leaf.
+ *
+ * Deliberately structural (indentation + the shape of a member line) rather
+ * than a real parser: both files are formatted by the same tooling, and a
+ * reformat that breaks this fails the test loudly instead of silently checking
+ * nothing.
+ */
+function memberPaths(lines, start, end, indent, prefix, out) {
+  const member = new RegExp(`^ {${indent}}(?:get\\s+|readonly\\s+)?([A-Za-z_$][\\w$]*)\\??\\s*[(:,]`);
+  for (let i = start; i < end; i++) {
+    const found = member.exec(lines[i]);
+    if (!found) continue;
+    const path = prefix ? `${prefix}.${found[1]}` : found[1];
+    // `foo: {` opens a nested namespace; `foo(` / `foo: value` is a leaf.
+    if (/[:=]\s*\{\s*$/.test(lines[i])) {
+      const close = blockEnd(lines, i, indent);
+      memberPaths(lines, i + 1, close, indent + 2, path, out);
+      i = close;
+    } else {
+      out.add(path);
+    }
+  }
+  return out;
+}
+
+/** Members of the block that `header` opens, at `indent` + 2. */
+function membersOf(source, header, indent) {
+  const lines = stripComments(source).split(/\r?\n/);
+  const open = lines.findIndex((line) => line.includes(header));
+  if (open < 0) return null;
+  return memberPaths(lines, open + 1, blockEnd(lines, open, indent), indent + 2, "", new Set());
+}
+
+const facade = membersOf(readFileSync(FACADE, "utf8"), "export const EditorApi = {", 0);
+const declared = membersOf(readFileSync(EDITOR_DTS, "utf8"), "export interface EditorApi {", 2);
+
+check("EditorApi is still declared in api/index.js", () => assert.ok(facade, "no `export const EditorApi = {`"));
+check("EditorApi is still declared in editor.d.ts", () => assert.ok(declared, "no `export interface EditorApi {`"));
+check("the facade has many members", () => assert.ok((facade?.size ?? 0) > 50, `found ${facade?.size}`));
+
+for (const path of facade ?? []) {
+  check(`Editor.${path} is declared in editor.d.ts`, () => {
+    assert.ok(
+      declared?.has(path),
+      `\`Editor.${path}\` exists in api/index.js but not in editor.d.ts — ` +
+        `it has no autocomplete and type-checks as an error in the Code panel.`,
+    );
+  });
+}
+for (const path of declared ?? []) {
+  check(`editor.d.ts's Editor.${path} exists in the facade`, () => {
+    assert.ok(
+      facade?.has(path),
+      `\`Editor.${path}\` is declared in editor.d.ts but api/index.js has no such member — ` +
+        `calling it type-checks and then throws at runtime.`,
+    );
+  });
+}
+
 if (failures) {
   console.error(`\n${failures} script-type check(s) failed`);
   process.exit(1);

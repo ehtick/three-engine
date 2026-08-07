@@ -356,6 +356,31 @@ function looksLikeHtml(source) {
 }
 
 /**
+ * Rewrites a module-import failure into the sentence that fixes it.
+ *
+ * The common one by far is importing an editor-only symbol from `"engine"`:
+ * the browser then complains that `scriptRuntime/runtime.js` has no export
+ * named `executeInEditMode` — an internal proxy path the user never wrote,
+ * and no mention of the specifier they did write. Every other failure passes
+ * through untouched.
+ */
+async function explainImportError(err) {
+  const message = err?.message ?? String(err);
+  const missing = /does not provide an export named ['"]?([A-Za-z_$][\w$]*)/.exec(message)?.[1];
+  if (!missing) return message;
+  try {
+    const { specifierExporting } = await import("../engine/scriptRuntime.js");
+    const home = await specifierExporting(missing);
+    if (home) {
+      return `"${missing}" comes from the "${home}" module — write \`import { ${missing} } from "${home}";\`.`;
+    }
+    return `nothing exports "${missing}". Check the spelling, or which module it belongs to.`;
+  } catch {
+    return message;
+  }
+}
+
+/**
  * Loads a script file as an ES module, keyed by mtime so unchanged files are
  * never re-imported (re-importing would reset any module-level state). This
  * is the hot-reload check: callers re-invoke it periodically and compare the
@@ -386,7 +411,7 @@ export async function loadScriptModule(path) {
     scriptModuleCache.set(path, entry);
     return entry;
   } catch (err) {
-    throw new Error(`Failed to import script "${path}": ${err.message ?? err}`);
+    throw new Error(`Failed to import script "${path}": ${await explainImportError(err)}`);
   } finally {
     URL.revokeObjectURL(url);
   }

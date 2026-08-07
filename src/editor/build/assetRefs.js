@@ -31,14 +31,67 @@ export const DOCUMENT_KINDS = {
   audio: "audio",
 };
 
-const extOf = (path) => {
+export const extOf = (path) => {
   const name = String(path).split(/[\\/]/).pop() ?? "";
   const i = name.lastIndexOf(".");
   return i > 0 ? name.slice(i + 1).toLowerCase() : "";
 };
 
+/**
+ * Every extension the exporter knows how to ship.
+ *
+ * Component asset fields are found by schema (`type: "asset"`), but a script's
+ * `@attribute({ type: "asset", exts: ["mat"] })` values live in an untyped
+ * `attributes` bag on a script slot — the component schema for `script`
+ * describes the slot list, not what any individual script declares. So for
+ * those the *value* is the only evidence, and a known asset extension is what
+ * identifies one. A false positive costs one extra copied file; a false
+ * negative ships `C:\Users\…\Thing.mat` to a browser, which fails with
+ * "Not allowed to load local resource" and no indication of which of the
+ * author's scripts is at fault.
+ */
+export const ASSET_EXTENSIONS = new Set([
+  "mat", "atlas", "timeline", "audio", "cubemap", "geom", "anim",
+  "glb", "gltf",
+  "png", "jpg", "jpeg", "webp", "basis", "ktx2", "hdr", "exr",
+  "ogg", "oga", "wav", "mp3", "flac", "m4a", "opus",
+  "ttf", "otf", "woff", "woff2",
+]);
+
+export const looksLikeAssetPath = (value) =>
+  typeof value === "string" && value !== "" && ASSET_EXTENSIONS.has(extOf(value));
+
 /** `.ts` authoring sources ship transpiled. */
 const scriptRename = (name) => name.replace(/\.ts$/i, ".js");
+
+/**
+ * Rewrites the asset and prefab references a SCRIPT declares.
+ *
+ * `@attribute({ type: "asset", exts: ["mat"] }) ballMaterial = "…"` is a
+ * documented part of the scripting API (see engine.d.ts), but its value is
+ * stored in an untyped `attributes` bag on the script slot, one level below
+ * anything the component schema or the prefab-path sweep reaches. Both walks
+ * missed it, so a script's material/texture/prefab reference shipped as the
+ * author's local absolute path and the browser refused to load it.
+ *
+ * Values are matched by shape rather than by declaration because the exporter
+ * has no access to the script's decorators: it reads serialized scenes, and a
+ * scene on disk records only the value. Nested objects and arrays are walked
+ * too — an attribute can be a list of spawn definitions.
+ */
+function rewriteScriptAttributes(attributes, { rewrite, rewritePrefab }, depth = 0) {
+  if (!attributes || typeof attributes !== "object" || depth > 6) return;
+  for (const [key, value] of Object.entries(attributes)) {
+    if (typeof value === "string") {
+      if (looksLikeAssetPath(value)) attributes[key] = rewrite(value);
+      // A prefab reference is a path in the editor and a guid in a build; the
+      // guid lookup returns the value untouched when it isn't a prefab path.
+      else attributes[key] = rewritePrefab(value);
+    } else if (value && typeof value === "object") {
+      rewriteScriptAttributes(value, { rewrite, rewritePrefab }, depth + 1);
+    }
+  }
+}
 
 /**
  * @param component  serialized `{ type, props }` (mutated in place)
@@ -47,13 +100,18 @@ const scriptRename = (name) => name.replace(/\.ts$/i, ".js");
  *   claim: (path: string) => string,
  *   claimDoc: (path: string, rename?: (name: string) => string) => string,
  *   add: (kind: string, path: string) => void,
+ *   rewritePrefab?: (value: string) => string,
  * }}
  *   `claim` copies a file into the build and returns its build-relative path;
  *   `claimDoc` reserves a destination for a re-emitted document; `add`
  *   registers the document's source under a `DOCUMENT_KINDS` bucket (or
- *   `"script"`) so the exporter reads and rewrites it later.
+ *   `"script"`) so the exporter reads and rewrites it later; `rewritePrefab`
+ *   swaps an authoring prefab path for the guid a build resolves by.
  */
-export function rewriteComponentAssets(component, { getSchema, claim, claimDoc, add }) {
+export function rewriteComponentAssets(
+  component,
+  { getSchema, claim, claimDoc, add, rewritePrefab = (v) => v },
+) {
   const props = component?.props;
   if (!props) return;
 
@@ -92,10 +150,12 @@ export function rewriteComponentAssets(component, { getSchema, claim, claimDoc, 
     if (Array.isArray(props.scripts)) {
       for (const slot of props.scripts) {
         if (slot?.path) slot.path = claimScript(slot.path);
+        rewriteScriptAttributes(slot?.attributes, { rewrite, rewritePrefab });
       }
       delete props.path;
     } else if (typeof props.path === "string" && props.path) {
       props.path = claimScript(props.path);
+      rewriteScriptAttributes(props.attributes, { rewrite, rewritePrefab });
     }
   }
 

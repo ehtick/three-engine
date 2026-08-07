@@ -391,7 +391,7 @@ console.log("\nComponent asset rewriting");
     script: [],
     sound: [],
   };
-  const run = (component) => {
+  const run = (component, { rewritePrefab } = {}) => {
     const added = [];
     const names = createAssetNames();
     rewriteComponentAssets(component, {
@@ -399,6 +399,7 @@ console.log("\nComponent asset rewriting");
       claim: (p) => names.claim(p),
       claimDoc: (p, rename) => names.claimGenerated(p, rename ? { rename } : undefined),
       add: (kind, p) => added.push([kind, p]),
+      ...(rewritePrefab ? { rewritePrefab } : {}),
     });
     return { added, component };
   };
@@ -465,6 +466,108 @@ console.log("\nComponent asset rewriting");
   const unknown = { type: "somefuturething", props: { texture: "C:/proj/tex/a.png" } };
   run(unknown);
   eq("a component without a schema is left untouched", unknown.props.texture, "C:/proj/tex/a.png");
+
+  // A script's @attribute({ type: "asset" }) values live in an untyped bag one
+  // level below anything the schema walk or the prefab sweep reached, so they
+  // shipped as absolute local paths and the browser refused to load them.
+  const attrs = {
+    type: "script",
+    props: {
+      scripts: [
+        {
+          path: "C:/proj/scripts/Launcher.ts",
+          attributes: {
+            ballMaterial: "C:/proj/materials/CannonBall.mat",
+            impact: "C:/proj/fx/hit.png",
+            speed: 12,
+            label: "Fire!",
+            spawn: "C:/proj/prefabs/Ball.prefab",
+            waves: [{ decal: "C:/proj/fx/scorch.png" }],
+          },
+        },
+      ],
+    },
+  };
+  const attrRun = run(attrs, { rewritePrefab: (v) => (v.endsWith(".prefab") ? "guid-123" : v) });
+  const slot = attrs.props.scripts[0].attributes;
+  eq("a script's asset attribute is claimed into the build", slot.ballMaterial, "assets/CannonBall.mat");
+  eq("…and is re-emitted like any other .mat", attrRun.added.some(([k, p]) => k === "material" && p.endsWith("CannonBall.mat")), true);
+  eq("a texture attribute is a plain copy", slot.impact, "assets/hit.png");
+  eq("non-path attributes are untouched", [slot.speed, slot.label], [12, "Fire!"]);
+  eq("a prefab attribute becomes its guid", slot.spawn, "guid-123");
+  eq("attributes nested in lists are walked too", slot.waves[0].decal, "assets/scorch.png");
+
+  // Same bag on the legacy single-script shape.
+  const legacyAttrs = {
+    type: "script",
+    props: { path: "C:/proj/scripts/Old.ts", attributes: { mat: "C:/proj/materials/Old.mat" } },
+  };
+  run(legacyAttrs);
+  eq("legacy script attributes are rewritten too", legacyAttrs.props.attributes.mat, "assets/Old.mat");
+}
+
+// --- Absolute paths baked into script SOURCE ---------------------------------
+{
+  console.log("\nScript source asset paths");
+  const { rewriteSourceAssetPaths, findLeakedAbsolutePaths } = await import(
+    "../src/editor/exportGame.js"
+  );
+  const claimed = [];
+  const rewriteAssetValue = (value) => {
+    claimed.push(value);
+    return `assets/${value.split(/[\\/]/).pop()}`;
+  };
+  const opts = { root: "C:/proj", rewriteAssetValue };
+
+  // The reported failure: the attribute keeps its DECLARED DEFAULT, so the path
+  // exists only here and the asset is never copied into the build at all.
+  const src = `class L { ballMaterial = "C:/proj/materials/CannonBall.mat"; }`;
+  eq(
+    "an absolute .mat default is rewritten",
+    rewriteSourceAssetPaths(src, opts),
+    `class L { ballMaterial = "assets/CannonBall.mat"; }`,
+  );
+  eq("…and the asset is claimed so it actually ships", claimed, ["C:/proj/materials/CannonBall.mat"]);
+
+  eq(
+    "an escaped Windows path is matched whole",
+    rewriteSourceAssetPaths(`const p = "C:\\\\proj\\\\tex\\\\a.png";`, opts),
+    `const p = "assets/a.png";`,
+  );
+  eq(
+    "single quotes and backticks work the same",
+    rewriteSourceAssetPaths("const p = 'C:/proj/tex/b.png';", opts),
+    "const p = 'assets/b.png';",
+  );
+  eq(
+    "a path outside the project is left alone",
+    rewriteSourceAssetPaths(`const p = "C:/elsewhere/c.png";`, opts),
+    `const p = "C:/elsewhere/c.png";`,
+  );
+  eq(
+    "a non-asset extension is left alone",
+    rewriteSourceAssetPaths(`const p = "C:/proj/notes/readme.txt";`, opts),
+    `const p = "C:/proj/notes/readme.txt";`,
+  );
+  eq(
+    "relative paths are never guessed at",
+    rewriteSourceAssetPaths(`const p = "materials/Thing.mat";`, opts),
+    `const p = "materials/Thing.mat";`,
+  );
+
+  // The safety net: whatever the walks miss must at least be reported.
+  const leaks = findLeakedAbsolutePaths(
+    [
+      ["scene.json", `{"material":"C:/proj/materials/Leaked.mat"}`],
+      ["assets/Fine.js", `const p = "assets/ok.png";`],
+      ["assets/icon.png", new Uint8Array([1, 2, 3])],
+    ],
+    "C:/proj",
+  );
+  eq("a leaked absolute path is reported", leaks, [
+    { file: "scene.json", path: "C:/proj/materials/Leaked.mat" },
+  ]);
+  eq("a clean build reports nothing", findLeakedAbsolutePaths([["a.js", "'assets/x.png'"]], "C:/proj"), []);
 }
 
 console.log(`\nBUILD-TEST ${fail ? "FAIL" : "PASS"} — ${pass}/${pass + fail} checks`);

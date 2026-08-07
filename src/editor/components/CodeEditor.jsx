@@ -104,13 +104,32 @@ export function CodeEditor({
   const [boxHeight, setBoxHeight] = useState(() => (resizable ? readHeight(storageKey, height) : null));
   const projectRoot = useProjectStore((state) => state.rootPath);
 
-  const markDirty = useCallback(
-    (value) => {
-      setDirty(value);
-      onDirtyChange?.(value);
-    },
-    [onDirtyChange],
-  );
+  /**
+   * `onDirtyChange` is read through a ref, and that is load-bearing rather than
+   * fussy.
+   *
+   * `markDirty` is a dependency of the effect that CONSTRUCTS the editor, so
+   * anything that changes its identity disposes Monaco and builds a new one.
+   * Callers pass an inline arrow (`onDirtyChange={(v) => store.setDirty(path, v)}`),
+   * which is a new function on every parent render — and the parent re-renders
+   * precisely *because* the dirty flag it was just told about changed. So the
+   * first keystroke rebuilt the editor, the rebuild's cleanup force-saved the
+   * buffer, the save cleared the dirty flag, and that rebuilt it again: the pane
+   * blinked and lost the cursor on every character, and a file that was supposed
+   * to save only on Ctrl+S was written to disk on each one — hot-reloading the
+   * user's game on half-typed identifiers, the exact thing the comment above
+   * says must not happen.
+   *
+   * A ref keeps the latest callback reachable while `markDirty` stays referentially
+   * stable for the life of the component, so the editor is built once per file.
+   */
+  const onDirtyChangeRef = useRef(onDirtyChange);
+  onDirtyChangeRef.current = onDirtyChange;
+
+  const markDirty = useCallback((value) => {
+    setDirty(value);
+    onDirtyChangeRef.current?.(value);
+  }, []);
 
   const save = useCallback(async () => {
     const model = modelRef.current;

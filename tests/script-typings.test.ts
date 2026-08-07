@@ -458,3 +458,269 @@ class UsesInjectedThree extends Script {
   }
 }
 void UsesInjectedThree;
+
+// ---------------------------------------------------------------------------
+// 10. The EDITOR surface. Everything below is what an in-editor tool script is
+//     made of, and none of it was type-checked before: `editor.d.ts` described
+//     nine namespaces while `src/editor/api/index.js` had twenty-two, so two
+//     thirds of `Editor.*` was a red squiggle in the app's own code editor.
+//
+//     Note the split, which is the thing people get wrong: the HOOKS are on
+//     `Script` (from "engine"), the DECORATORS and the API are from "editor".
+//     Importing `executeInEditMode` from "engine" is a compile error here and
+//     a load failure at runtime — which is the point of declaring it.
+// ---------------------------------------------------------------------------
+
+import {
+  Editor,
+  isEditor,
+  hasEditorApi,
+  executeInEditMode,
+  menuItem,
+  registerMenuItem,
+} from "editor";
+import type { Gizmos, EntityInfo, BatchStep } from "editor";
+
+@executeInEditMode
+export class SpawnVolume extends Script {
+  @attribute({ type: "number", default: 4, min: 0.1 })
+  radius = 4;
+
+  // Editor-only lifecycle: ticks while STOPPED. `onUpdate` above stays play-only.
+  onEditorUpdate(dt: number) {
+    void dt;
+  }
+
+  // No decorator needed for gizmos — they run on any loaded script.
+  onDrawGizmos(gizmos: Gizmos) {
+    gizmos
+      .color("#4af")
+      .sphere(this.entity.position, this.radius)
+      .transform(this.entity.object3D.matrixWorld)
+      .arrow([0, 0, 0], [0, 2, 0])
+      .capsule([0, 0, 0], 0.5, 2)
+      .axes(this.entity.object3D.matrixWorld, 0.5)
+      .transform(null);
+    gizmos.color(1, 0.5, 0).box(this.entity.position, [2, 1, 2]);
+  }
+
+  onDrawGizmosSelected(gizmos: Gizmos) {
+    gizmos.polyline([[0, 0, 0], [1, 0, 0], [1, 0, 1]], true).point([0, 0, 0], 0.2);
+  }
+
+  @menuItem("Tools/Snap To Ground")
+  snapToGround() {
+    // Bound to this instance, so `this.entity` is reachable from the menu.
+    Editor.entities.setTransform(this.entity.id, { position: [0, 0, 0] });
+  }
+}
+
+// A module-scope entry, for a tool not bound to any entity.
+const disposeMenu: () => void = registerMenuItem("Tools/Rebuild", () => {}, { order: 1 });
+void disposeMenu;
+
+// Bare and called forms of the class decorator both type-check.
+@executeInEditMode()
+class AlsoInEditMode extends Script {}
+void AlsoInEditMode;
+
+/** Every namespace of the facade, exercised against its real signature. */
+async function editorSurface() {
+  // Guarding is the whole reason `Editor.*` can live in a script that ships.
+  if (!isEditor() || !hasEditorApi()) return;
+
+  const version: string = Editor.version;
+  void version;
+  void Editor.ops()[0]?.name;
+  void Editor.tools({ readOnly: true })[0]?.inputSchema;
+  void (await Editor.call("entity.list", {}));
+  // Both fields must be reachable from the `else` too — see ToolCallResult's
+  // note on why this is not a discriminated union under `strict: false`.
+  const tool = await Editor.callTool("entity_list", {});
+  if (tool.ok) void tool.result;
+  else console.error(tool.error);
+  void Editor.resolveToolName("entity_create");
+
+  // entities / components / selection / history / play / scene / project
+  const made: EntityInfo = Editor.entities.create({ name: "Box", components: [{ type: "mesh" }] });
+  const all: EntityInfo[] = Editor.entities.all({ tag: "enemy" });
+  void all;
+  void Editor.entities.get(made.id).transform.position;
+  void Editor.entities.live(made.id)?.position.x;
+  void Editor.entities.rename(made.id, "Crate");
+  void Editor.entities.reparent(made.id, null, 0);
+  void Editor.entities.duplicate([made.id]);
+  void Editor.entities.setTransform(made.id, { position: [1, 2, 3], rotation: [0, 0, 0] });
+  void Editor.entities.setTags(made.id, ["prop"]);
+  void Editor.entities.getBounds(made.id).size;
+  void Editor.entities.delete(made.id).deleted;
+
+  void Editor.components.types()[0]?.schema;
+  void Editor.components.add(made.id, "mesh", { geometry: "sphere" });
+  void Editor.components.setProp(made.id, "mesh", "geometry", "box");
+  void Editor.components.remove(made.id, "mesh");
+
+  const ids: string[] = Editor.selection.ids;
+  void ids;
+  void Editor.selection.entities[0]?.name;
+  void Editor.selection.set(made.id);
+  void Editor.selection.selectAssets(["a.png"]);
+  void Editor.selection.clear();
+  void Editor.selection.get().assetPath;
+
+  const canUndo: boolean = Editor.history.get().canUndo;
+  void canUndo;
+  void Editor.history.undo();
+  void Editor.history.redo();
+
+  const playing: boolean = Editor.play.isPlaying;
+  void playing;
+  void (await Editor.play.start());
+  void (await Editor.play.stop());
+
+  void Editor.scene.get().entityCount;
+  void (await Editor.scene.save());
+  void (await Editor.scene.open("Main.scene"));
+  void (await Editor.scene.getSettings());
+  void (await Editor.scene.setSettings({ fog: true }, "Fog on"));
+
+  const root: string | null = Editor.project.rootPath;
+  void root;
+  void Editor.project.get().meta;
+
+  // sight
+  const shot = await Editor.viewport.screenshot({ width: 800, camera: "game", overlays: false });
+  const png: string = shot.__image.base64;
+  void png;
+  void Editor.viewport.getCamera().position;
+  void Editor.viewport.setCamera([5, 5, 5], [0, 0, 0]);
+  void Editor.viewport.focus(made.id, 1.5);
+  void Editor.viewport.freezeWhenUnfocused(true).enabled;
+  void Editor.console.read({ level: "error", limit: 10 }).entries;
+
+  // assets / fonts / code
+  void (await Editor.assets.list({ ext: "ts", depth: 2 }))[0]?.path;
+  void (await Editor.assets.read("a.ts"));
+  void (await Editor.assets.write("a.ts", "// hi"));
+  void (await Editor.assets.createScript("Tool", "scripts"));
+  void (await Editor.assets.openInIDE("a.ts"));
+  void (await Editor.assets.reveal("a.ts"));
+  void (await Editor.assets.rename("a.ts", "b.ts"));
+  void (await Editor.assets.move(["b.ts"], "scripts"));
+  void (await Editor.assets.createFolder("scripts/tools"));
+  void (await Editor.assets.refresh());
+  void Editor.assets.watchStatus();
+  void (await Editor.assets.actions("a.png")).actions;
+  void (await Editor.assets.runAction("a.png", "texture.material"));
+  void (await Editor.assets.delete(["b.ts"]));
+
+  void (await Editor.fonts.list());
+  void (await Editor.fonts.search("pixel", { category: "Display", limit: 5 }));
+  void (await Editor.fonts.import("Press Start 2P", ["400"])).files;
+  void (await Editor.fonts.inspect("f.ttf"));
+
+  void (await Editor.code.open("a.ts")).opened;
+  void (await Editor.code.openFiles()).unsaved;
+
+  // authoring
+  void (await Editor.materials.create("Rust", { color: "#c0392b", roughness: 0.8 })).path;
+  void (await Editor.materials.get("Rust.mat"));
+  void (await Editor.materials.set("Rust.mat", { metalness: 1 }));
+  void (await Editor.prefabs.list())[0]?.path;
+  void (await Editor.prefabs.instantiate("Tree.prefab", { position: [0, 0, 0] }));
+  void (await Editor.prefabs.createFrom(made.id, "prefabs"));
+  void (await Editor.modules.list())[0]?.enabled;
+  void (await Editor.modules.setEnabled("gi", true));
+
+  // sound
+  void (await Editor.audio.status());
+  void (await Editor.audio.search("gravel footsteps", { provider: "commons", kind: "sfx", cc0Only: true }));
+  void (await Editor.audio.import(1234, "freesound"));
+  void (await Editor.audio.credits());
+  void (await Editor.audio.info("step.wav"));
+  void (await Editor.audio.tracks("step.wav"));
+  void (await Editor.audio.edit("step.wav", "trimSilence", { thresholdDb: -50 }));
+  void (await Editor.audio.effects());
+  void (await Editor.audio.process("step.wav", "reverb", { mix: 0.3 }));
+  void (await Editor.audio.generate("tone.wav", "sine", { hz: 440 }));
+  void (await Editor.audio.addTrack("step.wav", "tail.wav"));
+  void (await Editor.audio.setTrack("step.wav", 0, { gain: 0.5 }));
+  void (await Editor.audio.removeTrack("step.wav", 1));
+  void (await Editor.audio.loop("amb.wav"));
+  void (await Editor.audio.variations("step.wav", { count: 4 }));
+  void (await Editor.audio.export("step.wav", { format: "ogg", bitrate: 64000, estimateOnly: true }));
+
+  // libraries
+  void (await Editor.library.status());
+  void (await Editor.library.search("polyhaven", "rock", { type: "texture", limit: 5 }));
+  void (await Editor.library.import("polyhaven", "rock_01", { type: "texture", resolution: "2k" }));
+  void (await Editor.library.setEnvironment("sky.hdr"));
+
+  // images
+  void (await Editor.textures.info("t.png"));
+  void (await Editor.textures.create("textures", "Grate.png", { width: 256, background: "#202020" })).path;
+  void (await Editor.textures.effects());
+  void (await Editor.textures.process("t.png", "blur", { radius: 2 }));
+  void (await Editor.textures.resize("t.png", 128, 128, { mode: "canvas", filter: "nearest" }));
+  void (await Editor.textures.setMeta("t.png", { colorSpace: "linear", wrap: "clamp" }));
+  void (await Editor.textures.addLayer("t.png", { name: "Detail", opacity: 0.5 }));
+  void (await Editor.textures.setLayer("t.png", 0, { visible: false, offset: [2, 2] }));
+  void (await Editor.textures.removeLayer("t.png", 1));
+  void (await Editor.textures.draw("t.png", "rect", { rect: [0, 0, 16, 16], color: "#fff", fill: true }));
+  void (await Editor.textures.draw("t.png", "flood", { x: 4, y: 4, tolerance: 0.2 }));
+  void (await Editor.textures.generate("t.png", "noise", { scale: 8 }));
+  void (await Editor.textures.atlas.pack(["a.png", "b.png"], { padding: 4, powerOfTwo: true }));
+  void (await Editor.textures.atlas.get("s.atlas"));
+  void (await Editor.textures.atlas.set("s.atlas", { pivot: [0.5, 0.5] }));
+  void (await Editor.textures.atlas.export("s.atlas", "out"));
+
+  // geometry (Edit Mode)
+  void (await Editor.geometry.begin(made.id));
+  void (await Editor.geometry.status());
+  void (await Editor.geometry.select("box", { mode: "face", min: [-1, -1, -1], max: [1, 1, 1] }));
+  void (await Editor.geometry.select("trait", { trait: "boundary", add: true }));
+  void (await Editor.geometry.operations());
+  void (await Editor.geometry.edit("extrude", { distance: 0.5 }));
+  void (await Editor.geometry.transform({ translate: [0, 1, 0], rotate: [0, 45, 0] }));
+  void (await Editor.geometry.addPrimitive("uvsphere", { at: [0, 2, 0], options: { radius: 0.5 } }));
+  void (await Editor.geometry.remesh({ voxelSize: 0.05, adaptivity: 0 }));
+  void (await Editor.geometry.commit(true));
+  void (await Editor.geometry.cancel());
+
+  // pipeline / build / git
+  void (await Editor.pipeline.compress("m.glb", "draco"));
+  void (await Editor.pipeline.compressAllTextures());
+  void (await Editor.pipeline.bakeNavMesh({ id: made.id }));
+  void (await Editor.pipeline.createTerrain({ size: 100, resolution: 256 }));
+
+  const repo = await Editor.git.status();
+  if (repo.isRepo) {
+    void (await Editor.git.stage());
+    void (await Editor.git.commit("wip", { all: true }));
+    void (await Editor.git.log({ limit: 5 }));
+    void (await Editor.git.branches());
+    void (await Editor.git.checkout("main", { create: false }));
+    void (await Editor.git.push({ setUpstream: true }));
+    void (await Editor.git.github.status());
+  }
+
+  void (await Editor.build.get());
+  void (await Editor.build.set({ target: "web" }));
+  void (await Editor.build.export("zip"));
+  void (await Editor.build.preview(true));
+
+  // batch — many ops, one undo step; "$0" is step 0's returned id.
+  const steps: BatchStep[] = [
+    { op: "entity.create", args: { name: "Parent" } },
+    { op: "entity.create", args: { name: "Child", parentId: "$0" } },
+  ];
+  void (await Editor.batch("Build rig", steps));
+
+  // chrome
+  const off: () => void = Editor.menu.add("Tools/Thing", () => {});
+  off();
+  void Editor.menu.list();
+  void Editor.menu.subscribe(() => {});
+  Editor.log("done");
+}
+void editorSurface;

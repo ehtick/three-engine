@@ -1,6 +1,6 @@
 import { ensureEngine } from "./engineInstance.js";
 import { createAssetNames, basename } from "./build/assetNames.js";
-import { rewriteComponentAssets } from "./build/assetRefs.js";
+import { rewriteComponentAssets, DOCUMENT_KINDS, extOf, ASSET_EXTENSIONS } from "./build/assetRefs.js";
 import { BUILD_DEFAULTS, resolveBuildScenes, normalizeRelPath, toProjectRelative } from "./build/buildSettings.js";
 import { themePlayerHtml, injectLivePreviewClient, PREVIEW_REVISION_PATH } from "./build/playerHtml.js";
 import { desktopScaffoldFiles } from "./build/desktopScaffold.js";
@@ -226,6 +226,15 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
     audio: audioSidecarPaths,
     script: scriptPaths,
   };
+  /** Claim one asset path by value, routing documents to their re-emit bucket
+   *  exactly as `rewriteComponentAssets` does internally. */
+  const rewriteAssetValue = (value) => {
+    const kind = DOCUMENT_KINDS[extOf(value)];
+    if (!kind) return claim(value);
+    documentBuckets[kind]?.add(sourcePath(value));
+    return claimDoc(value);
+  };
+
   /**
    * Schema-driven, same as the runtime's `collectSceneAssets`: every component
    * schema field of `type: "asset"` ships, the day the component is added. The
@@ -241,6 +250,7 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
       claim,
       claimDoc,
       add: (kind, p) => documentBuckets[kind]?.add(sourcePath(p)),
+      rewritePrefab: toPrefabGuid,
     });
   };
 
@@ -357,7 +367,17 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
       onProgress({ phase: "assets", message: `Reading script ${basename(src)}…` });
       try {
         const raw = await readRequiredText(src, "script");
-        files.push([claimDoc(src, (name) => name.replace(/\.ts$/i, ".js")), await transpileScript(raw)]);
+        const code = rewriteSourceAssetPaths(await transpileScript(raw), {
+          root,
+          rewriteAssetValue,
+          onFound: (original) =>
+            warnings.push(
+              `${basename(src)} hard-codes the absolute path "${original}". It was rewritten so the ` +
+                `build works, but the path is specific to this machine — prefer an ` +
+                `@attribute({ type: "asset" }) field and pick the asset in the Inspector.`,
+            ),
+        });
+        files.push([claimDoc(src, (name) => name.replace(/\.ts$/i, ".js")), code]);
       } catch (err) {
         warnings.push(`Skipped script ${src}: ${err?.message ?? err}`);
       }
@@ -582,6 +602,15 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
       // it just wears the engine's default title and colours.
       warnings.push(`Loading screen not customised: ${err?.message ?? err}`);
     }
+    // Last line of defence before the bytes leave the editor: nothing shipped
+    // may still name a file on this machine. See findLeakedAbsolutePaths.
+    for (const leak of findLeakedAbsolutePaths(shippedFiles, root)) {
+      warnings.push(
+        `${leak.file} still contains the local path "${leak.path}" — whatever reads it will ` +
+          `fail to load in a browser. This is an exporter gap: please report which asset ` +
+          `field it came from.`,
+      );
+    }
     const exportReport = await invoke("export_game", {
       outDir: contentDir,
       sceneJson: JSON.stringify(scene, null, 2),
@@ -626,16 +655,32 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
       } catch {
         // First build into this directory — nothing came before.
       }
-      const revision = Date.now();
-      const manifest = { revision, previous };
-      if (changedFiles) {
-        manifest.changed = changedFiles;
-        manifest.history = [...history, { revision, changed: changedFiles }].slice(-25);
+      // A rebuild that rewrote NOTHING must not publish a revision. Every edit
+      // schedules more than one flush (the debounce fires, then the reconcile's
+      // own `hierarchy-changed` schedules a trailing one), so roughly half of
+      // all exports are byte-for-byte no-ops. Publishing them anyway cost real
+      // robustness in two ways: every connected client did a pointless
+      // catch-up round trip, and — the one that bites — each no-op consumed a
+      // slot in the bounded `history` window that a client uses to rejoin after
+      // missing builds. Measured on a live session: 16 of the 25 history
+      // entries were empty, so a preview in a background tab (or a phone with
+      // its screen off, which is the whole reason the window exists) fell out
+      // of the window after ~9 real edits and hard-reloaded. Skipping no-ops
+      // roughly triples the effective window and costs nothing: a client whose
+      // revision is unchanged is, by definition, already up to date.
+      const noop = Array.isArray(changedFiles) && changedFiles.length === 0 && previous !== null;
+      if (!noop) {
+        const revision = Date.now();
+        const manifest = { revision, previous };
+        if (changedFiles) {
+          manifest.changed = changedFiles;
+          manifest.history = [...history, { revision, changed: changedFiles }].slice(-25);
+        }
+        await invoke("write_file_atomic", {
+          path: joinPath(contentDir, PREVIEW_REVISION_PATH),
+          contents: JSON.stringify(manifest),
+        });
       }
-      await invoke("write_file_atomic", {
-        path: joinPath(contentDir, PREVIEW_REVISION_PATH),
-        contents: JSON.stringify(manifest),
-      });
     }
 
     // --- Target-specific delivery -------------------------------------------
@@ -686,6 +731,78 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
   } catch (err) {
     return fail(err?.message ?? String(err));
   }
+}
+
+/** A quoted literal holding something that starts like an absolute path —
+ *  `C:\…`, `C:/…` or `/…`. Escaped characters inside are tolerated so a
+ *  Windows path written `"C:\\Users\\…"` in source is matched whole. */
+const ABSOLUTE_LITERAL_RE = /(['"`])((?:[A-Za-z]:[\\/]|\/)(?:\\.|[^\\\r\n])*?)\1/g;
+
+/**
+ * Rewrites absolute project asset paths that a SCRIPT hard-codes as string
+ * literals, claiming each one into the build.
+ *
+ * The structured fix (rewriting a script slot's saved `attributes`) only
+ * reaches values the author actually set in the Inspector. An
+ * `@attribute({ type: "asset" }) ballMaterial = "C:/…/CannonBall.mat"` that
+ * still holds its declared DEFAULT has no saved value anywhere — the path
+ * exists only in the script's own source, which the exporter transpiles
+ * verbatim. That build then ships a scene whose every reference is correct and
+ * one script that asks the browser for `file:///C:/Users/…`, which Chrome
+ * refuses outright ("Not allowed to load local resource"). The asset is not
+ * merely mis-addressed, it was never copied into the build at all, so claiming
+ * here is what makes it exist.
+ *
+ * Only ABSOLUTE paths are touched: they cannot work in a build under any
+ * circumstances, so rewriting them is strictly an improvement, while guessing
+ * at relative strings risks mangling something that is not a path.
+ *
+ * @param code   transpiled script source
+ * @param deps   { root, rewriteAssetValue, onFound }
+ */
+export function rewriteSourceAssetPaths(code, { root, rewriteAssetValue, onFound = noop }) {
+  if (!root || !code.includes(":") && !code.includes("/")) return code;
+  const rootKey = String(root).replaceAll("\\", "/").replace(/\/+$/, "").toLowerCase();
+  return String(code).replace(ABSOLUTE_LITERAL_RE, (match, quote, body) => {
+    // `"C:\\Users\\x"` is the two-character escape in source; the VALUE has one.
+    const value = body.replace(/\\(.)/g, "$1");
+    const key = value.replaceAll("\\", "/").toLowerCase();
+    if (!key.startsWith(`${rootKey}/`)) return match;
+    if (!ASSET_EXTENSIONS.has(extOf(value))) return match;
+    const rel = rewriteAssetValue(value);
+    if (!rel || rel === value) return match;
+    onFound(value, rel);
+    // Build-relative paths are plain `assets/name.ext` — no quotes, no
+    // backslashes — so they need no re-escaping for any quote style.
+    return `${quote}${rel}${quote}`;
+  });
+}
+
+/**
+ * Reports any absolute local path still present in the text files a build is
+ * about to ship.
+ *
+ * This class of bug has now been found three separate ways (a hand-maintained
+ * component ladder, a model's per-material map, a script attribute), and every
+ * time it was silent at build time and only visible as a failed fetch in
+ * someone's browser — usually long after, and usually blamed on the server.
+ * The check costs a regex over already-in-memory strings and turns "some
+ * materials just don't load" into a named warning at the moment it is created.
+ */
+export function findLeakedAbsolutePaths(files, root) {
+  if (!root) return [];
+  const rootKey = String(root).replaceAll("\\", "/").replace(/\/+$/, "").toLowerCase();
+  const leaks = [];
+  for (const [rel, contents] of files) {
+    if (typeof contents !== "string") continue;
+    for (const match of contents.matchAll(ABSOLUTE_LITERAL_RE)) {
+      const value = match[2].replace(/\\(.)/g, "$1");
+      if (!value.replaceAll("\\", "/").toLowerCase().startsWith(`${rootKey}/`)) continue;
+      leaks.push({ file: rel, path: value });
+      break; // One per file is enough to send someone to the right place.
+    }
+  }
+  return leaks;
 }
 
 async function pickOutputDirectory() {

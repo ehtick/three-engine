@@ -146,6 +146,25 @@ check("…and a changed scene never discards unsaved work", /dirty/.test(js) && 
 
 const assetOps = read("src/editor/api/ops/assets.js");
 check("asset.write invalidates the caches it just wrote past", /refreshAssetFromDisk\(full\)/.test(assetOps));
+
+// Enumerated rather than listed in prose, because the prose version of this
+// rule was already written down and still missed: `material.set` wrote `.mat`
+// files straight through `save_scene` with no invalidation, so a material
+// edited through the API stayed stale in the viewport AND never reached a
+// running browser preview (whose rebuild loop hangs off this very signal) until
+// some unrelated edit triggered the next export. Any op file that writes a
+// project file must also tell the caches about it.
+{
+  const opsDir = "src/editor/api/ops";
+  for (const name of fs.readdirSync(path.join(ROOT, opsDir)).filter((f) => f.endsWith(".js"))) {
+    const body = read(`${opsDir}/${name}`);
+    if (!/invoke\(\s*"(save_scene|write_binary_file|write_file_atomic)"/.test(body)) continue;
+    check(
+      `ops/${name} invalidates the caches it writes past`,
+      /refreshAssetFromDisk|invalidateBlobUrl/.test(body),
+    );
+  }
+}
 check("agents can force a re-read after writing files themselves", /name: "asset\.refresh"/.test(assetOps));
 check("…and can ask whether the watcher is running", /name: "asset\.watchStatus"/.test(assetOps));
 
