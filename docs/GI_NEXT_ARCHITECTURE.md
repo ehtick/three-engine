@@ -490,16 +490,86 @@ merge/reconstruction change, cheap relative to Phase 2, and each is A/B-able on 
 under a `__gi…` hatch. **This is where 0.1's remaining 4.8 points belong**, and after 1a it is
 where the next lateral gain is most likely to come from. Judge each on the bleed rig too.
 
-**1d. The merge visibility tolerance — the falloff contract. OPEN, and the highest-value item
-here.** §1.3 brackets it exactly: `rayHitMode auto` gives −2.18 (0.54 too flat), `occupancy-legacy`
-gives −2.97 (0.25 too steep), truth is −2.72. Both endpoints are already measured on the same rig
-with the same kernel, so this is an interpolation, not an investigation. The dial is
-`MERGE_VIS_TOLERANCE` / `__giMergeVisTol` (`cascadeMerge.js:58`) acting on the
-`penetration = dist − parentRay.w` smoothstep at `cascadeMerge.js:318-336`. Sweep the tolerance on
-the bleed rig with the shipped kernel, fit the exponent, and pick the value that lands on −2.72;
-then re-run the block rig to confirm the lateral number did not regress (1a's lesson). If no single
-tolerance satisfies both modes, the contract between `rayHitMode` and the merge — not the default
-— is what needs specifying.
+**1d. The merge visibility tolerance — the falloff contract. RAN, AND FALSIFIED. Do not restart
+it.** The plan was an interpolation, not an investigation: §1.3 brackets the target exactly
+(`rayHitMode auto` −2.18, `occupancy-legacy` −2.97, truth −2.72), both endpoints measured on the
+same rig with the same kernel, and the dial was `MERGE_VIS_TOLERANCE` / `__giMergeVisTol`
+(`cascadeMerge.js:58`) acting on the `penetration = dist − parentRay.w` smoothstep. It was written
+up here as the highest-value item in the document. It has no leverage at all. Bleed rig, white
+channel, against a baseline of −2.18:
+
+| arm | exponent |
+|---|---|
+| `__giVisTolModeAware=true`, kAngular 0 / 0.05 / 0.1 / 0.2 / 0.4 | all −2.18 |
+| kAngular 10 (absurdly permissive) | −2.18 |
+| `__giMergeVisTol=0` | −2.18 |
+| **`__giNoVisProxy=true` — the proxy disabled outright** | **−2.18** |
+
+Deleting the proxy entirely does not move the far field by one hundredth, so no tolerance value was
+ever going to recover the −2.18 → −2.97 swing that `rayHitMode` produces. The block rig is equally
+blind to it (9.38–9.39% across every arm). The two-term split shipped in `3dcff1c` is a correct
+decomposition and stays, but **the controls that killed this should have run before it was built,
+not after** — one `__giNoVisProxy` run costs minutes and would have saved the whole exercise. That
+is the transferable lesson: for any "sweep the dial to hit the target" item, first prove the dial
+is connected by disabling it entirely and checking the metric moves.
+
+Where that leaves the falloff: the −2.18 ↔ −2.97 swing is real and belongs to `rayHitMode` itself
+(§1.3), not to anything the merge does downstream of it. The two modes miss on opposite sides of
+truth, which means `occupancy-legacy` was never "right" — it was masking a bias with a second one.
+Whatever owns this is inside the hit classification, and it is **not yet identified**. The frozen
+receiver cosine is the standing suspect (the gather applies it at the c0 texel *centre*; the
+forward model predicts −2.095 against a measured −2.18) but the test for it is **inconclusive**:
+raising `c0DirRes` dims the far field faster than the rig's 8-bit bracket can follow, so the
+measurement runs out of dynamic range before the hypothesis resolves. That is an instrument
+problem, and it is the thing to fix before spending another session on falloff.
+
+**1g. THE SOLID-ANGLE NORMALIZATION — indirect is not invariant under `c0DirRes`. START HERE.**
+Changing the angular resolution changes the ANSWER, not just its detail, and a convergent transport
+cannot do that. Two independent measurements, one synthetic and one on the user's scene:
+
+*Bleed rig*, far-field radiance at 3 m, `EMIT` fixed:
+
+| `c0DirRes` | L3 | vs previous |
+|---|---|---|
+| 4 | 2.031e-3 | — |
+| 8 | 1.339e-3 | ×0.66 |
+| 16 | 6.864e-4 | ×0.51 |
+
+Four-fold refinement costs 66% of the energy (≈ N^−0.78). Doubling the direction count halves the
+solid angle each direction represents and doubles their number; the product must be invariant.
+
+*User's Sponza*, live, `c0DirRes` 2 → 4 (`scripts/run-gi-shot-diff.mjs`):
+
+| baseline luminance | share of frame | change |
+|---|---|---|
+| 0.0–0.1 (indirect-only) | 65% | **+73%** |
+| 0.1–0.4 (midtones) | 10% | −53% … −74% |
+| 0.4+ (direct-lit) | 25% | −13% |
+
+Note the mean went *down* 11% while the indirect-only mass went *up* 73% — the reason the diff tool
+buckets by baseline brightness instead of reporting a mean, and the reason this went unnoticed for
+so long. Anyone who checked a scalar mean concluded "that made it darker" and moved on.
+
+This is not new information, it is information that was written down and not acted on:
+`cascadeTrace.js:130-144` already records the same non-convergence from the BRANCH A/B ("exponent
+−1.44 → −2.03, which a convergent transport cannot do") and already names the suspect — "the
+falloff bias's real home is the gather/merge solid-angle normalization, not this ladder". That note
+sat there while 1b and 1d were scheduled and spent on other suspects.
+
+Why it is now the top item: it is the only open lead attached to a **measured user-visible symptom**
+(the "curtains too dark and contrasty" report, against a Blender reference), it explains why every
+absolute-brightness result in this document is quality-tier-dependent and therefore only comparable
+within a fixed `c0DirRes`, and it plausibly subsumes the falloff work — a normalization that is
+wrong by a direction-count-dependent factor bends the exponent exactly the way §1.3 measures.
+
+The acceptance test is sharp and needs no ground truth: **sweep `c0DirRes` over {2, 4, 8, 16} and
+require total gathered irradiance constant within a few percent.** Fix the normalization until that
+holds, then re-measure the exponent — do not tune the exponent first.
+
+Suspects, in order: the gather's per-direction weight (`cascadeGather.js`) not carrying the 4π/N
+solid angle; the merge's 2×2 angular-child accumulation (`cascadeMerge.js`) averaging where it
+should sum, or summing where it should average; and the receiver-cosine application at the c0 texel
+centre (§5/1d), which is a *separate* bias but lives in the same expression.
 
 **1e. Ringing.** If the residual's ACF goes *negative* (the voxel arms already cross zero around
 lag 28 px), that is ringing, not blocking, and it has its own fix in the same literature. Worth
@@ -993,7 +1063,9 @@ Each of these was proposed and killed by measurement. Re-proposing one costs a s
 | 0 | verify + commit the tree; the four missing numbers | — | **DONE 2026-08-07, all five items** |
 | 1a | parallax kernel — fix the second moment, not just the centre | 0 | **DONE**, `923cd78` — 9.39%, −2.18 |
 | 1b | find the 0.196 m block-size floor's owner | 0 | **RAN, NO OWNER** — bilateral, AO, normal-offset scale all cleared (§5) |
-| **1d** | **merge visibility tolerance → land falloff on −2.72** | 0 | **OPEN — highest value in this table, ≲ 1 session** |
+| 1d | merge visibility tolerance → land falloff on −2.72 | 0 | **RAN, FALSIFIED** — the proxy has zero falloff leverage; do not restart (§5) |
+| **1g** | **solid-angle normalization — indirect must be invariant under `c0DirRes`** | — | **OPEN — start here (§5)** |
+| 1f | bleed rig dynamic range — the falloff line is blocked on it | — | open, ~1 session; do 1g first |
 | 1c | RC literature fixes (bilinear fix, Bilinear 3D, non-linear accumulation) | 0 | open, 1 session |
 | 1e | ringing check on the stored ACF curves | 0 | open, ~1 hour |
 | 2a | surface cache, CPU half — card builder, atlas, packing, concavity | 0 | **DONE**, `7bc24f1` |
@@ -1009,16 +1081,27 @@ Each of these was proposed and killed by measurement. Re-proposing one costs a s
 Phases 5 and 8 are independent of the main line and can be picked up whenever the main line is
 blocked on a measurement.
 
-**Start at 1d (§5), out of numeric order and ahead of the rest of Phase 1.** It is the only open
-item in this document that lands directly on the user's stated complaint — "too strong, reaches
-too far" — the target (−2.72) is analytic, both bracketing endpoints are already measured on the
-shipped kernel (−2.18 and −2.97), the dial exists (`__giMergeVisTol`), and it is **tuning, not a
-rewrite**. Everything else in Phase 1 is worth less per session: 1b has already spent a run and
-returned no owner, and 1c is speculative literature work.
+**This paragraph used to say "start at 1d".** 1d ran and returned nothing (§5): the visibility
+proxy has no leverage on falloff whatsoever, and disabling it outright moves the exponent by zero.
+Phase 1 has now spent two scheduled items — 1b and 1d — on suspects that measured innocent, which
+is worth stating plainly rather than burying: **the falloff owner and the block-scale owner are
+both still unidentified**, and every cheap hypothesis is spent.
 
-After 1d: 1c, then 2b. 1b stays open but is no longer a scheduled item — pick it up only if a new
-suspect appears, because the three obvious ones are now eliminated and the block-scale floor is
-not what the user is complaining about.
+**Start at 1g — the solid-angle normalization (§5).** It is the only open lead attached to a
+measured user-visible symptom, its acceptance test needs no ground truth (invariance under
+`c0DirRes`), and it may subsume the falloff question outright. It also reframes 1f: "raising
+`c0DirRes` dims the far field below the 8-bit floor" was filed as an instrument problem, but the
+dimming is substantially REAL — it is this bug — so the rig's dynamic range is a smaller obstacle
+than it appeared. Fix the normalization first and re-measure; extend the exposure ladder (1f) only
+if the far field is still unresolvable afterwards.
+
+After 1g: the frozen-cosine test, which either names the residual falloff owner or eliminates the
+last cheap suspect and sends the question into 2b. Then 1c. 1b stays open but unscheduled — pick
+it up only if a new suspect appears, because the obvious ones are eliminated and the block-scale
+floor is not what the user is complaining about.
+
+**Do not schedule another falloff sweep before 1f lands.** Two of the three falloff sessions so far
+produced numbers that could not distinguish the hypothesis from the instrument.
 
 ---
 

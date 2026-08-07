@@ -110,6 +110,7 @@
     "test:gi-card-lookup": "node scripts/run-gi-card-lookup-test.mjs",
     "test:gi-lighttree": "node scripts/run-gi-light-tree-test.mjs",
     "test:gi-boot-ambient": "node scripts/run-gi-boot-ambient-test.mjs",
+    "gi:shot-diff": "node scripts/run-gi-shot-diff.mjs",
     "probe:gi-mover-bounce": "node scripts/run-gi-mover-bounce.mjs",
     "probe:gi-emissive-cost": "node scripts/run-gi-emissive-cost.mjs",
     "probe:gi-emitter-cap": "node scripts/run-gi-emitter-cap.mjs",

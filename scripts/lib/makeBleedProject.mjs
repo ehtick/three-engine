@@ -42,7 +42,15 @@ const emissive = (color, strength) => ({
   color: "#ffffff", roughness: 0.7, metalness: 0, map: "",
   shaderGraph: {
     nodes: [
-      { id: "em", type: "emission", props: { color, emissionStrength: strength }, position: { x: 228, y: 176 } },
+      // `strength`, NOT `emissionStrength`. The live compiler is tslGraph.js —
+      // its emission node declares `i("strength", "float", 1)` (tslGraph.js:480)
+      // and resolves inputs by exact prop key, so an unrecognised key silently
+      // falls back to the default. `emissionStrength` is the key in
+      // shaderGraph.js, which is DEAD CODE: nothing imports its
+      // compileShaderGraph, and the legacy-rename table has no entry mapping the
+      // two. So every EMIT= this rig has ever run emitted at exactly 1, and the
+      // sweep that "proved" EMIT had no effect was comparing 1 against 1.
+      { id: "em", type: "emission", props: { color, strength }, position: { x: 228, y: 176 } },
       { id: "output", type: "output", props: {}, position: { x: 560, y: 150 } },
     ],
     edges: [{ id: "e1", source: "em", sourceHandle: "out", target: "output", targetHandle: "surface" }],
