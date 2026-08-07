@@ -16,13 +16,20 @@
 // as a separator. This prints that ratio for every GI mesh in the scene,
 // plus the global field's own cell size, plus what actually seated.
 //
-//   npx vite --port 5234 --strictPort
-//   node scripts/run-gi-sdf-coverage.mjs [url]
+//   node node_modules/vite/bin/vite.js --port 5201 --strictPort
+//   node scripts/run-gi-sdf-coverage.mjs [url]   (or: npm run test:gi-coverage)
 import path from "node:path";
 import puppeteer from "puppeteer-core";
 import { installTauriShim } from "./lib/tauriShim.mjs";
 
-const url = process.argv[2] ?? "http://localhost:5234/";
+// 5201 IS THE GI FLEET'S PORT. run-gi-block-size.mjs, run-gi-bleed.mjs and every
+// other npm-wired GI probe default there. This script defaulted to :5234 — the
+// port the ad-hoc, hand-run `*-game`/`bvh-*` probes scope themselves onto — but
+// unlike those it IS wired into package.json (`test:gi-coverage`), which passes
+// no argv. So a suite run with the fleet server already up on :5201 still failed
+// here, and failed looking like a broken harness rather than a missing server.
+const DEFAULT_PORT = "5201";
+const url = process.argv[2] ?? `http://localhost:${DEFAULT_PORT}/`;
 const PROJECT = process.env.PROJECT ?? "C:/Users/Khudiiash/Documents/GAME";
 const SCENE = process.env.SCENE ?? "scenes/Main.scene";
 const scenePath = path.join(PROJECT, SCENE).replace(/\\/g, "/");
@@ -65,7 +72,25 @@ const fatal = async (message) => {
   process.exit(1);
 };
 
-await page.goto(url, { waitUntil: "load", timeout: 60000 }).catch((e) => fatal(`page load: ${e.message}`));
+// A MISSING SERVER SHOULD NAME ITSELF. Without this, no server produced a raw
+// puppeteer `net::ERR_CONNECTION_REFUSED at http://localhost:5234/` stack —
+// which says nothing about what the operator has to DO, and reads like a bug in
+// the probe. Same shape as run-gi-block-size.mjs's clearance check: one FATAL
+// line stating the diagnosis, then an indented line with the exact command.
+const portOf = (u) => {
+  try { return new URL(u).port || DEFAULT_PORT; } catch { return DEFAULT_PORT; }
+};
+await page.goto(url, { waitUntil: "load", timeout: 60000 }).catch((e) => {
+  const message = e?.message ?? String(e);
+  if (/ERR_CONNECTION_REFUSED|ECONNREFUSED/.test(message)) {
+    return fatal(
+      `nothing is listening at ${url} — the vite dev server is not running.\n` +
+        `       Start it with:  node node_modules/vite/bin/vite.js --port ${portOf(url)} --strictPort\n` +
+        `       Or point this probe at a server you already have:  node scripts/run-gi-sdf-coverage.mjs http://localhost:PORT/`,
+    );
+  }
+  return fatal(`page load: ${message}`);
+});
 
 console.log(`Opening ${PROJECT} / ${SCENE} ...`);
 const opened = await page.evaluate(
