@@ -382,13 +382,59 @@ export function createCascadeMerge(cascades, { sky = [0, 0, 0], occupancyVoxel =
             let parentRad;
             if (globalThis.__giParallaxMerge !== false) {
               const big = float(1e6);
-              const dHit = select(s0.w.greaterThan(0), s0.w, big)
-                .min(select(s1.w.greaterThan(0), s1.w, big))
-                .min(select(s2.w.greaterThan(0), s2.w, big))
-                .min(select(s3.w.greaterThan(0), s3.w, big))
-                .toVar();
+              // THE TWO DISCONTINUITIES THE SMOOTH TAP DID NOT FIX.
+              //
+              // Making the tap CENTRE continuous (below) recovered 39% of the
+              // structure this correction adds, and no more: measured on
+              // run-gi-block-size 2026-08-07, snapped 14.71%, smooth 10.79%,
+              // correction off entirely 4.58%. So 6.2 points still come from
+              // inside this block, and there are exactly two candidates left —
+              // both of which move the AIM POINT rather than the kernel around
+              // it, and smooth taps around a jumping centre still step:
+              //
+              //   (1) `dHit` is a min() over four candidates. Which of s0..s3
+              //       wins flips abruptly as a child probe slides, and `target`
+              //       jumps by the whole depth difference when it does.
+              //       `__giParallaxDepthMean = true` averages the VALID taps
+              //       instead (argmin flips stop mattering);
+              //       `__giParallaxDepthConst = <metres>` pins it outright,
+              //       which cannot produce lattice structure at all because a
+              //       constant is spatially constant — that arm is the clean
+              //       ablation, the mean is the candidate fix.
+              //   (2) the gate below is binary. With no own-interval hit in any
+              //       of the four, `reproj` snaps from the re-aimed box to
+              //       `naiveRad`, and the 4.58 ↔ 10.79 spread says those two
+              //       differ a lot. `__giParallaxGateFade = true` ramps between
+              //       them on the fraction of valid taps instead.
+              //
+              // BUILD-TIME, like every other hatch here, and all three default
+              // OFF: with none set this block is semantically identical to what
+              // it was (nValid > 0.5 ⇔ the old dHit < big).
+              const v0 = select(s0.w.greaterThan(0), float(1), float(0));
+              const v1 = select(s1.w.greaterThan(0), float(1), float(0));
+              const v2 = select(s2.w.greaterThan(0), float(1), float(0));
+              const v3 = select(s3.w.greaterThan(0), float(1), float(0));
+              const nValid = v0.add(v1).add(v2).add(v3).toVar();
+              const depthConst = Number(globalThis.__giParallaxDepthConst);
+              let dHit;
+              if (Number.isFinite(depthConst) && depthConst > 0) {
+                dHit = float(depthConst).toVar();
+              } else if (globalThis.__giParallaxDepthMean) {
+                dHit = s0.w.mul(v0)
+                  .add(s1.w.mul(v1))
+                  .add(s2.w.mul(v2))
+                  .add(s3.w.mul(v3))
+                  .div(max(nValid, 1))
+                  .toVar();
+              } else {
+                dHit = select(s0.w.greaterThan(0), s0.w, big)
+                  .min(select(s1.w.greaterThan(0), s1.w, big))
+                  .min(select(s2.w.greaterThan(0), s2.w, big))
+                  .min(select(s3.w.greaterThan(0), s3.w, big))
+                  .toVar();
+              }
               const reproj = vec3(naiveRad).toVar();
-              If(dHit.lessThan(big), () => {
+              If(nValid.greaterThan(0.5), () => {
                 const target = childPos.add(cascade.directionOf(dirIdx).mul(dHit));
                 const relAim = target.sub(parentPos).toVar();
                 const lenAim = relAim.length().max(1e-4);
@@ -413,21 +459,82 @@ export function createCascadeMerge(cascades, { sky = [0, 0, 0], occupancyVoxel =
                 //
                 // The continuous form is the same box mean, evaluated at a
                 // fractional centre: interpolate between the two integer-
-                // aligned boxes on each axis. Separably that is a 3-tap
-                // [(1−f)/2, 1/2, f/2] kernel per axis (weights sum to 1 by
-                // construction, so the box's WIDTH — and therefore the
-                // dilution — is unchanged; only its position is now smooth).
+                // aligned boxes on each axis, separably, as a 3-tap kernel.
+                //
+                // WHICH 3-TAP KERNEL IS NOT A FREE CHOICE, and the obvious one
+                // is wrong. Linearly blending the two boxes gives
+                // [(1−f)/2, 1/2, f/2], whose weights sum to 1 — but summing to
+                // 1 only fixes the kernel's MASS, and what sets small-source
+                // dilution is its SECOND MOMENT. That kernel's variance is
+                // 0.25 + f − f²: equal to the snapped 2-box (0.25) at f = 0 and
+                // f = 1, but DOUBLE it at f = 0.5. So it silently widened the
+                // angular box by up to 2× depending on sub-texel phase and
+                // mixed in far energy — the "colour bleed reaches metres too
+                // far" direction this whole correction exists to fix.
+                //
+                // The right kernel holds mean AND variance. Solving
+                // a + b + c = 1, b + 2c = f + ½, b + 4c − (f + ½)² = ¼ for taps
+                // at {0, 1, 2} gives
+                //
+                //     a = (1−f)²/2      b = ½ + f − f²      c = f²/2
+                //
+                // — the quadratic B-spline. At f = 0 it is (½, ½, 0), the
+                // snapped box exactly; at f = 1 it is (0, ½, ½), the snapped box
+                // one texel over; in between it slides without ever widening.
+                // All three weights stay ≥ 0 across f ∈ [0,1] (b ≥ ½), so no
+                // negative lobe can ring.
+                //
+                // MEASURED 2026-08-07, all four forms, same session, both rigs.
+                // run-gi-block-size floor modulation (lateral structure) and
+                // run-gi-bleed far-field falloff exponent (red/white; read
+                // WHITE — red bottoms out on the exposure bracket on the flatter
+                // arms, which is why it swings so much):
+                //
+                //   form                        modulation      falloff
+                //   snapped box                    14.71%    −1.16 / −1.88
+                //   linear [(1−f)/2, ½, f/2]       10.79%    −1.73 / −1.94
+                //   quadratic B-spline  ← SHIPPED   9.39%    −2.02 / −2.18
+                //   (correction off entirely)       4.58%    −1.09 / −1.09
+                //   analytic ground truth               —    −2.72
+                //
+                // So fixing the second moment is a strict win on BOTH axes: it
+                // removes 53% of the structure the correction adds (against the
+                // linear form's 39%) AND lands 0.24 steeper. Note red and white
+                // agree to 0.16 here and to 0.2…0.7 on every other arm — the
+                // profile is now steep enough to stay inside the bracket, which
+                // is independent evidence the transport improved rather than the
+                // fit getting luckier.
+                //
+                // THE BLOCK RIG ALONE WOULD HAVE SHIPPED THE WRONG THING. A
+                // `__giParallaxGateFade` arm (ramp reproj→naive on the fraction
+                // of valid taps instead of the hard gate below) measured 6.55%
+                // — far better than anything here — while falling to −1.39, i.e.
+                // handing back ~60% of the correction's falloff benefit. It was
+                // rejected on that basis. Judge any merge change on BOTH rigs;
+                // lateral structure and falloff trade against each other.
+                //
+                // The absolute falloff numbers above sit ~0.8 flatter than the
+                // ladder recorded 2026-08-04 (naive −1.44, snapped v2 −2.66).
+                // The offset is RIG-WIDE — every arm moved, including naive —
+                // so it is not a property of any estimator here, and the
+                // ordering is intact, so the rig still discriminates. Cause
+                // unknown and open; do not read these against the old ladder.
+                //
                 // Nine buffer reads instead of four, in a loop that is already
                 // reading eight parent probes.
                 //
-                // `__giParallaxMergeSmooth = false` restores the snapped box
-                // for an A/B. BUILD-TIME, like every other hatch here.
+                // BUILD-TIME hatches, like everything else here:
+                //   `__giParallaxMergeSmooth = false`    → the snapped box
+                //   `__giParallaxMergeSmooth = "linear"` → the variance-growing
+                //      [(1−f)/2, ½, f/2] form, kept only so its falloff
+                //      regression stays reproducible.
                 const gx = pu.sub(1).toVar();
                 const gy = pv.sub(1).toVar();
                 const i0 = gx.floor().toVar();
                 const j0 = gy.floor().toVar();
                 const fu = gx.sub(i0).toVar();
                 const fv = gy.sub(j0).toVar();
+                const boxRad = vec3(0).toVar();
                 if (globalThis.__giParallaxMergeSmooth === false) {
                   const bxA = pu.add(0.5).floor().sub(1).clamp(0, parent.dirRes - 2);
                   const byA = pv.add(0.5).floor().sub(1).clamp(0, parent.dirRes - 2);
@@ -436,10 +543,18 @@ export function createCascadeMerge(cascades, { sky = [0, 0, 0], occupancyVoxel =
                   const r1 = parent.merged.element(rowA.add(1).toInt()).xyz;
                   const r2 = parent.merged.element(rowA.add(parent.dirRes).toInt()).xyz;
                   const r3 = parent.merged.element(rowA.add(parent.dirRes).add(1).toInt()).xyz;
-                  reproj.assign(r0.add(r1).add(r2).add(r3).mul(0.25));
+                  boxRad.assign(r0.add(r1).add(r2).add(r3).mul(0.25));
                 } else {
-                  const wu = [fu.oneMinus().mul(0.5), float(0.5), fu.mul(0.5)];
-                  const wv = [fv.oneMinus().mul(0.5), float(0.5), fv.mul(0.5)];
+                  const kernel = (f) =>
+                    globalThis.__giParallaxMergeSmooth === "linear"
+                      ? [f.oneMinus().mul(0.5), float(0.5), f.mul(0.5)]
+                      : [
+                          f.oneMinus().mul(f.oneMinus()).mul(0.5),
+                          float(0.5).add(f).sub(f.mul(f)),
+                          f.mul(f).mul(0.5),
+                        ];
+                  const wu = kernel(fu);
+                  const wv = kernel(fv);
                   const box = vec3(0).toVar();
                   for (let a = 0; a < 3; a++) {
                     const ix = i0.add(a).clamp(0, parent.dirRes - 1);
@@ -449,7 +564,12 @@ export function createCascadeMerge(cascades, { sky = [0, 0, 0], occupancyVoxel =
                       box.addAssign(parent.merged.element(idx.toInt()).xyz.mul(wu[a].mul(wv[b])));
                     }
                   }
-                  reproj.assign(box);
+                  boxRad.assign(box);
+                }
+                if (globalThis.__giParallaxGateFade) {
+                  reproj.assign(mix(naiveRad, boxRad, nValid.mul(0.25)));
+                } else {
+                  reproj.assign(boxRad);
                 }
               });
               parentRad = reproj;
