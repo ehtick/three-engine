@@ -638,7 +638,22 @@ const sphereOcclusion = (P, N, sph) => {
   const di = sph.xyz.sub(P).toVar();
   const l = di.length().max(1e-4).toVar();
   const nl = N.dot(di.div(l)).toVar();
-  const h = l.div(sph.w.max(1e-4)).toVar();
+  // h < 1 MEANS THE RECEIVER IS INSIDE THE PROXY, AND IT MUST NOT MEAN "BLACK".
+  // The first version returned full occlusion there, which produced two very
+  // visible bugs at once:
+  //   · A MOVER OCCLUDING ITSELF. Its own surface shades through this same
+  //     gather, and a point ON the proxy has l == R, so the guard fired and the
+  //     object's own indirect light was zeroed — a solid black underside.
+  //   · A BLACK CONTACT PATCH. A cube's bounding sphere reaches below the floor,
+  //     so floor texels near the contact are INSIDE it and went to zero too.
+  // Both are backwards physically: a point on a CONVEX body with an OUTWARD
+  // normal sees none of that body, so its occlusion is 0, not 1. The formula
+  // already knows this — nl = -1 there, and max(0, nl) = 0 — so the fix is to
+  // stop overriding it. Clamping h just off 1 keeps (h²−1) positive for the
+  // horizon branch; an interior receiver is then evaluated as if just outside,
+  // which reads from its NORMAL (facing away → lit, facing in → shadowed)
+  // instead of from a constant. Wrong is possible there; black is not.
+  const h = l.div(sph.w.max(1e-4)).max(1.0001).toVar();
   const h2 = h.mul(h).toVar();
   const k2 = float(1).sub(h2.mul(nl).mul(nl)).toVar();
   // Sphere entirely above (or below) the horizon — the cheap branch.
@@ -650,8 +665,9 @@ const sphereOcclusion = (P, N, sph) => {
     .sub(sqrt(k2.max(0).mul(h2m1)));
   const near = inner.div(h2.max(1e-4)).add(atan(sqrt(k2.max(0).div(h2m1)))).div(Math.PI);
   const res = select(k2.greaterThan(0), near, far);
-  // Inside the sphere → fully blocked. Outside → clamp the integral to [0,1].
-  return select(h.lessThan(1), float(1), res.clamp(0, 1));
+  // No inside-the-sphere override — see the `h` clamp above for why that guard
+  // was the bug rather than a safety net.
+  return res.clamp(0, 1);
 };
 
 export function createIrradianceGather(cascades, probeIrradiance = null, fieldCellMax = null, name = "giGather", occupancy = null, depthMoments = null, activeRayHitMode = null, moverOccluders = null) {

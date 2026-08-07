@@ -292,8 +292,13 @@ const body = async ({ anchorId, moverId, frames, amp, rotate }) => {
 const measure = (amp, rotate) => page.evaluate(body, {
   anchorId: giEntity.id, moverId: sphere.id, frames: FRAMES, amp, rotate,
 });
-const still = await measure(0, false);
+// ORDER MATTERS AND IS CONTROLLED. The FIRST arm absorbs post-build settling
+// churn, so a still control run first is biased HIGH and would flatter any fix
+// measured against it. Moving runs first, still second — and a warmup arm runs
+// before both so neither carries the build transient.
+await measure(0, false);            // discarded warmup arm
 const result = await measure(AMP, ROTATE);
+const still = await measure(0, false);
 
 
 console.log(`\n=== PER-FRAME FLICKER (${result.width}x${result.height}, ${result.frames} frames, ${ROTATE ? "ROTATING box 2-axis 0.6rad/s" : "sub-voxel mover"}) ===`);

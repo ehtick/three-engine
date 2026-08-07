@@ -233,3 +233,83 @@ if (failures) {
   console.error(`gi-proxy-fit: ${failures} case(s) FAILED (shape section)`);
   process.exit(1);
 }
+
+// ── (8) THE OCCLUSION MATH ITSELF ────────────────────────────────────────────
+// A JS mirror of cascadeGather's `sphereOcclusion` (TSL, cannot run here),
+// transcribed operation for operation. This section exists because the first
+// shipped version had a guard that returned FULL occlusion for a receiver
+// inside the proxy, and that fired in two places nobody would guess from
+// reading it: on the MOVER'S OWN SURFACE (l == R, so it occluded itself and
+// went solid black) and on FLOOR TEXELS near a cube's contact point (inside its
+// bounding sphere, so the contact shadow became a black hexagon). Both shipped
+// and both were caught by eye, which is the expensive way.
+//
+// The physical anchor that makes these testable: a point on a CONVEX body with
+// an OUTWARD normal sees NONE of that body. Occlusion 0, never 1.
+const occ = (P, N, sph) => {
+  const di = [sph[0] - P[0], sph[1] - P[1], sph[2] - P[2]];
+  const l = Math.max(Math.hypot(di[0], di[1], di[2]), 1e-4);
+  const nl = (N[0] * di[0] + N[1] * di[1] + N[2] * di[2]) / l;
+  const h = Math.max(l / Math.max(sph[3], 1e-4), 1.0001);
+  const h2 = h * h;
+  const k2 = 1 - h2 * nl * nl;
+  const far = Math.max(nl, 0) / Math.max(h2, 1e-4);
+  const h2m1 = Math.max(h2 - 1, 1e-4);
+  const one = Math.max(1 - nl * nl, 1e-4);
+  const inner = nl * Math.acos(Math.min(1, Math.max(-1, -nl * Math.sqrt(h2m1 / one))))
+    - Math.sqrt(Math.max(k2, 0) * h2m1);
+  const near = (inner / Math.max(h2, 1e-4) + Math.atan(Math.sqrt(Math.max(k2, 0) / h2m1))) / Math.PI;
+  return Math.min(1, Math.max(0, k2 > 0 ? near : far));
+};
+
+{
+  const S = [0, 0, 0, 1]; // unit sphere at the origin
+  // THE SELF-OCCLUSION CASE — the black underside.
+  const onSurface = occ([0, -1, 0], [0, -1, 0], S);
+  console.log(`  [occ] on the proxy surface, outward normal: ${onSurface.toFixed(4)}`);
+  check("a body does not occlude its own surface", onSurface < 0.01, `${onSurface.toFixed(4)}`);
+
+  // THE CONTACT-PATCH CASE — a receiver INSIDE the proxy, facing away from it.
+  const inside = occ([0, -0.5, 0], [0, -1, 0], S);
+  console.log(`  [occ] inside the proxy, normal facing away: ${inside.toFixed(4)}`);
+  check("an interior receiver facing away is not blacked out", inside < 0.5, `${inside.toFixed(4)}`);
+
+  // Sanity in the other direction: a surface staring straight INTO the sphere
+  // from close range really is almost fully blocked.
+  const facing = occ([0, -1.2, 0], [0, 1, 0], S);
+  console.log(`  [occ] just below, normal facing the sphere: ${facing.toFixed(4)}`);
+  check("a surface facing the sphere IS occluded", facing > 0.5, `${facing.toFixed(4)}`);
+
+  // Far field must fall off like a solid angle, ~1/d².
+  const d4 = occ([0, -4, 0], [0, 1, 0], S);
+  const d8 = occ([0, -8, 0], [0, 1, 0], S);
+  console.log(`  [occ] falloff 4m ${d4.toFixed(5)} -> 8m ${d8.toFixed(5)} (ratio ${(d4 / d8).toFixed(2)}, 1/d² predicts 4)`);
+  check("far-field occlusion falls as ~1/d²", Math.abs(d4 / d8 - 4) < 0.6, `${(d4 / d8).toFixed(2)}`);
+
+  // CONTINUITY across the surface — the transition an object sweeping past a
+  // receiver actually crosses, and where a guard-shaped discontinuity hides.
+  let worst = 0;
+  let prev = null;
+  for (let i = 0; i <= 400; i++) {
+    const d = 0.5 + (i / 400) * 2.5; // sweeps from inside the proxy to outside
+    const v = occ([0, -d, 0], [0, 1, 0], S);
+    if (prev !== null) worst = Math.max(worst, Math.abs(v - prev));
+    prev = v;
+  }
+  console.log(`  [occ] worst step while crossing the proxy surface: ${worst.toFixed(4)}`);
+  check("occlusion is continuous across the proxy surface", worst < 0.05, `${worst.toFixed(4)} step`);
+
+  // And never NaN, at any angle, including the poles where 1-nl² -> 0.
+  let bad = 0;
+  for (let i = 0; i <= 64; i++) {
+    const t = (i / 64) * Math.PI;
+    const v = occ([0, -2, 0], [Math.sin(t), Math.cos(t), 0], S);
+    if (!Number.isFinite(v)) bad++;
+  }
+  check("finite at every normal orientation", bad === 0, `${bad} non-finite`);
+}
+
+if (failures) {
+  console.error(`gi-proxy-fit: ${failures} case(s) FAILED (occlusion section)`);
+  process.exit(1);
+}
