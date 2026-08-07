@@ -80,12 +80,34 @@ try {
     else console.log(tools.map((t) => t.name).sort().join("\n"));
   } else {
     const res = await withTimeout(client.callTool({ name: toolArg, arguments: args }), toolArg);
-    const text = (res?.content ?? [])
-      .filter((c) => c.type === "text")
-      .map((c) => c.text)
-      .join("\n");
+    const content = res?.content ?? [];
+    const text = content.filter((c) => c.type === "text").map((c) => c.text).join("\n");
     if (res?.isError) fail(text || `${toolArg} reported an error with no message`);
-    console.log(text);
+
+    // Image blocks (viewport_screenshot, texture previews) are the reason this
+    // needs more than a text join: the payload is base64 in an `image` block, and
+    // dropping it silently would make a screenshot look like an op that returned
+    // only its metadata. Write it where the caller asked, and keep stdout as the
+    // JSON text so the two halves still pipe.
+    const images = content.filter((c) => c.type === "image" && c.data);
+    if (images.length) {
+      const outArg = process.env.OUT;
+      if (!outArg) {
+        fail(
+          `${toolArg} returned ${images.length} image block(s); set OUT=<file> to write ` +
+            `(a .png path; an index is appended when there is more than one)`,
+        );
+      }
+      const { writeFileSync } = await import("node:fs");
+      images.forEach((img, i) => {
+        const dest = images.length === 1
+          ? outArg
+          : outArg.replace(/(\.\w+)?$/, (ext) => `-${i}${ext || ".png"}`);
+        writeFileSync(dest, Buffer.from(img.data, "base64"));
+        console.error(`wrote ${dest} (${(Buffer.from(img.data, "base64").length / 1024) | 0} KB)`);
+      });
+    }
+    if (text) console.log(text);
   }
   await client.close();
   process.exit(0);
