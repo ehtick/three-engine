@@ -84,7 +84,35 @@ export const BURIED_PROBE_WEIGHT = 0.02;
 // and legacy looks visibly better — but legacy OVERSHOOTS the analytic target
 // (−2.97 vs −2.72) and it disables surface records wholesale (GISystem.js:6180
 // gates them on activeMode >= HybridPlane), taking the record-aware shadow
-// oracle down with them. Reverting the mode is not the fix. The tolerance is.
+// oracle down with them. Reverting the mode is not the fix.
+//
+// ── AND NEITHER IS THE TOLERANCE. MEASURED 2026-08-07, AFTER BUILDING IT. ─────
+// The split below is a correct decomposition and it is kept for that reason, but
+// it does NOT recover the falloff, and nothing in this proxy does. On the bleed
+// rig, white channel, against baseline −2.18:
+//
+//     __giVisTolModeAware=true, kAngular 0 / 0.05 / 0.1 / 0.2 / 0.4   ALL −2.18
+//     __giVisTolModeAware=true, kAngular 10 (absurdly permissive)         −2.18
+//     __giMergeVisTol=0                                                   −2.18
+//     __giNoVisProxy=true   ← THE PROXY DISABLED ENTIRELY                 −2.18
+//
+// Disabling the visibility proxy outright does not move the far field by one
+// hundredth. So the proxy has NO LEVERAGE on falloff in this configuration, no
+// tolerance value was ever going to fix it, and the two-term work below was
+// aimed at the wrong stage. Recorded in full so nobody spends another session
+// sweeping it. (The block rig agrees and is equally blind: 9.38–9.39% across
+// every arm above, and across __giMergeVisTol 1.1…1.7.)
+//
+// WHERE IT ACTUALLY COMES FROM, therefore: `rayHitMode` changes WHAT THE RAYS
+// FOUND, not how parents are weighted. The conservative shell terminates a ray
+// at the voxel entry face, the hybrid modes run it to the fitted surface, and
+// the difference lands in `cascade.rays` before any merge weighting happens.
+// Note that the MORE ACCURATE hit test is the one that measures WORSE
+// (−2.18 vs −2.97 against −2.72), and that BOTH miss on opposite sides — so
+// legacy's early termination was masking a bias, not embodying a fix. The
+// codebase already says where that bias lives: cascadeTrace.js:143, "the falloff
+// bias's real home is the gather/merge solid-angle normalization, not this
+// ladder." That is the next place to look, and it is not here.
 //
 // ── THE TRAP ──────────────────────────────────────────────────────────────────
 // DO NOT simply shrink the tolerance to the hybrid modes' true radial error.
