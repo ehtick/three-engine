@@ -159,7 +159,7 @@ await wait(10000);
 await must("viewport.setCamera", { position: [11.8, 2.2, 0.73], target: [-3.2, 1.0, -1.47] });
 await wait(1500);
 
-const result = await page.evaluate(async ({ anchorId, moverId, frames, amp, rotate }) => {
+const body = async ({ anchorId, moverId, frames, amp, rotate }) => {
   const eng = globalThis.__editorApi.entities.live(anchorId)?.engine;
   if (!eng?.renderer) throw new Error("no live engine");
   const obj = globalThis.__editorApi.entities.live(moverId)?.object3D;
@@ -272,7 +272,29 @@ const result = await page.evaluate(async ({ anchorId, moverId, frames, amp, rota
     stepMax: maxSteps.length ? maxSteps[maxSteps.length - 1] : 0,
     meanWalk: maxSteps.length ? ampSum / maxSteps.length : 0,
   };
-}, { anchorId: giEntity.id, moverId: sphere.id, frames: FRAMES, amp: AMP, rotate: ROTATE });
+};
+
+
+// ── IN-RUN STILL CONTROL — the reason any of this is quotable ────────────────
+// THE ABSOLUTE NUMBERS FROM THIS HARNESS ARE NOT COMPARABLE ACROSS PROCESSES.
+// Measured 2026-08-07: the SAME baseline config read 1.404 reversals/px in one
+// run and 5.194 in another — a 3.7x spread, larger than any effect anyone has
+// tried to measure with it. It is rAF-driven, so machine load changes how far GI
+// converges between accumulator samples and the reversal count moves with it.
+// Two conclusions had already been drawn and REPORTED from cross-process
+// comparisons before this was noticed; both had to be withdrawn.
+//
+// So the harness measures its own control, in the SAME page, renderer and load:
+// an identical run with the mover held STILL (amp 0, no rotation). The page
+// persists between evaluate() calls, so this costs one extra pass and nothing
+// else. The ratio moving/still is the reportable quantity; a raw reversal count
+// from this instrument means nothing alone and must never be quoted alone.
+const measure = (amp, rotate) => page.evaluate(body, {
+  anchorId: giEntity.id, moverId: sphere.id, frames: FRAMES, amp, rotate,
+});
+const still = await measure(0, false);
+const result = await measure(AMP, ROTATE);
+
 
 console.log(`\n=== PER-FRAME FLICKER (${result.width}x${result.height}, ${result.frames} frames, ${ROTATE ? "ROTATING box 2-axis 0.6rad/s" : "sub-voxel mover"}) ===`);
 console.log(`  kept ${result.kept} px, excluded ${result.excluded} (mover footprint)`);
@@ -281,6 +303,14 @@ console.log(`  popped px (>=3 rev)     ${result.poppedPct.toFixed(1)}%`);
 console.log(`  mean changed frames/px  ${result.meanChangedFrames.toFixed(1)} of ${result.frames}`);
 console.log(`  histogram [0, 1-2, 3-5, 6-10, >10] = ${result.revHist.join(", ")}`);
 console.log(`  step amplitude: changedPx=${result.changedPx} p95=${result.stepP95.toFixed(4)} max=${result.stepMax.toFixed(4)} meanWalk=${result.meanWalk.toFixed(3)}   <- THE POPPING METRIC`);
+console.log(`
+=== STILL CONTROL (same page, same load) ===`);
+console.log(`  still reversals/px      ${still.meanReversals.toFixed(3)}   step p95 ${still.stepP95.toFixed(4)}`);
+const ex = (m, s2) => (s2 > 1e-9 ? ((m - s2) / s2) * 100 : NaN);
+console.log(`
+  MOTION-INDUCED EXCESS OVER THE STILL CONTROL — the only quotable figure:`);
+console.log(`    reversals  ${still.meanReversals.toFixed(3)} -> ${result.meanReversals.toFixed(3)}   +${ex(result.meanReversals, still.meanReversals).toFixed(0)}%`);
+console.log(`    step p95   ${still.stepP95.toFixed(4)} -> ${result.stepP95.toFixed(4)}   +${ex(result.stepP95, still.stepP95).toFixed(0)}%`);
 
 await browser.close();
 process.exit(0);

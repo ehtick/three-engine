@@ -96,6 +96,105 @@ const GI_IDLE_HEARTBEAT_FRAMES = 30;
  * read as solid dark until its parity came round.
  */
 const CHECKER_WARMUP_FRAMES = 8;
+/**
+ * GI PROXY FIT — a mover's `giProxy` choice turned into occluder spheres.
+ *
+ * The gather evaluates ONLY spheres, because the sphere is the one shape whose
+ * cosine-weighted occlusion has a cheap exact closed form (Quilez), and a closed
+ * form is the entire point: it is continuous in the transform, so a rotating
+ * proxy is analytically a no-op and cannot flicker. So a richer proxy is spent
+ * as MORE SPHERES rather than as new shader math — no branching, no per-shape
+ * kernels, and a capsule costs three iterations of a loop that already exists.
+ *
+ * The modes and why they are the right set: nearly every mover in a game is
+ * either an analytic primitive (crate, ball, barrel) or a GLB whose silhouette a
+ * capsule describes well (a character). "auto" separates those two by aspect
+ * ratio, which is the same rule a person would apply by eye.
+ *
+ * @param {*} mesh   the mover's render mesh (carries `userData.giProxy`)
+ * @param {*} bounds its CURRENT world bounds
+ * @param {number} budget slots left in the uniform array
+ * @returns {Array<[number, number, number, number]>} world spheres (x, y, z, r)
+ */
+export function giProxySpheres(mesh, bounds, budget, shapeKind = null) {
+  if (budget <= 0) return [];
+  const mode = mesh?.userData?.giProxy ?? "auto";
+  if (mode === "none") return [];
+  const cx = (bounds.min.x + bounds.max.x) * 0.5;
+  const cy = (bounds.min.y + bounds.max.y) * 0.5;
+  const cz = (bounds.min.z + bounds.max.z) * 0.5;
+  const h = [
+    (bounds.max.x - bounds.min.x) * 0.5,
+    (bounds.max.y - bounds.min.y) * 0.5,
+    (bounds.max.z - bounds.min.z) * 0.5,
+  ];
+  const rBound = Math.hypot(h[0], h[1], h[2]);
+  if (!(rBound > 1e-4)) return [];
+
+  // ── AN ACTUAL SPHERE GETS ITS ACTUAL RADIUS ────────────────────────────────
+  // The AABB's bounding sphere is sqrt(3) ≈ 1.73x a sphere's true radius, so
+  // fitting one to a ball mover casts a shadow 73% too wide. Measured: the
+  // step-amplitude excess over the still control ran +256% with the bounding
+  // sphere against +14% without any analytic term — not oscillation (reversals
+  // went DOWN over the same runs) but a much larger dark region sweeping the
+  // floor. An over-large shadow is a correctness error even when it is a
+  // perfectly smooth one.
+  //
+  // `shapeKind` is the classification the dynamic set ALREADY made from the
+  // geometry (dynamicObjects' classifyDynamicShape: SphereGeometry → "sphere"),
+  // so this costs a string compare and is exact rather than fitted. A sphere's
+  // AABB is a cube, so the true radius is any half-extent.
+  if (shapeKind === "sphere") {
+    const r = Math.min(h[0], h[1], h[2]);
+    if (r > 1e-5) return [[cx, cy, cz, r]];
+  }
+  if (mode === "sphere") return [[cx, cy, cz, rBound]];
+
+  // ── ONE CONTINUOUS FORMULA, NO MODE SWITCH ─────────────────────────────────
+  // An earlier version branched on aspect ratio ("elongated → capsule, else
+  // sphere") and the fit test caught a 0.18m step in the union radius right at
+  // the threshold — 10% of the object, appearing and disappearing as its
+  // proportions crossed a line. That is precisely the discontinuity this whole
+  // feature exists to remove, reintroduced one layer up, and a character's AABB
+  // crosses such a line constantly as its limbs move. So there is no threshold:
+  //
+  //   rCross = the cross-section corner distance from the long axis
+  //   o      = max(0, hAxis − rCross)          end-sphere offset from centre
+  //   r      = hypot(hAxis − o, rCross)        radius that covers the end corners
+  //
+  // As the shape becomes compact, hAxis → rCross, so o → 0 and r → the exact
+  // BOUNDING SPHERE — the sphere case falls out of the capsule case as a limit
+  // rather than being selected by a branch. `auto` and `capsule` are therefore
+  // the same code, and differ only in that `capsule` is the author saying "I
+  // know this is a character, keep it tight even when the pose is compact".
+  let axis = 0;
+  if (h[1] > h[axis]) axis = 1;
+  if (h[2] > h[axis]) axis = 2;
+  const cross = [0, 1, 2].filter((i) => i !== axis);
+  const rCross = Math.hypot(h[cross[0]], h[cross[1]]);
+  if (!(rCross > 1e-6)) return [[cx, cy, cz, rBound]];
+  const o = Math.max(0, h[axis] - rCross);
+  const rBase = Math.hypot(h[axis] - o, rCross);
+  if (o <= 1e-6) return [[cx, cy, cz, rBase]];
+
+  // COUNT scales with how far the end spheres sit apart; the RADIUS then
+  // absorbs whatever the budget could not buy. Coverage is the invariant —
+  // tightness is best-effort — because an uncovered waist is a hole light
+  // leaks through, while a slightly fat proxy is only a slightly soft shadow.
+  const MAX_SPHERES = 5;
+  const want = Math.max(1, Math.min(MAX_SPHERES, budget, 2 * Math.ceil(o / rBase) + 1));
+  if (want <= 1) return [[cx, cy, cz, Math.hypot(h[0], h[1], h[2])]];
+  const spacing = (2 * o) / (want - 1);
+  const r = Math.max(rBase, spacing * 0.5);
+  const out = [];
+  const c = [cx, cy, cz];
+  for (let i = 0; i < want; i++) {
+    const p = [c[0], c[1], c[2]];
+    p[axis] += -o + i * spacing;
+    out.push([p[0], p[1], p[2], r]);
+  }
+  return out;
+}
 
 // ── ASYNC COMPUTE PIPELINES — the computes' missing `isReady` ────────────────
 // three creates every compute pipeline with the SYNC device call, and Chrome's
@@ -6872,10 +6971,13 @@ export class GISystem {
    */
   #moverOccluders(lightSlots) {
     if (globalThis.__giDiffuseSkipMovers !== true) return null;
-    const max = Math.min(64, Math.max(4, Number(globalThis.__giMaxDynamicObjects) || 16));
+    const max = 2 * Math.min(64, Math.max(4, Number(globalThis.__giMaxDynamicObjects) || 16));
     this._moverOccluders ??= {
       max,
       count: uniform(0),
+      // 2x the mover cap: a capsule proxy spends up to 4 slots on ONE mover, so
+      // sizing this to the mover count would silently drop occluders as soon as
+      // a couple of characters were on screen.
       spheres: uniformArray(Array.from({ length: max }, () => new THREE.Vector4()), "vec4"),
       // Mean albedo / emissive per mover — the same two the dynamic-object
       // header carries at words 34..39 and that giField shades an exact hit
@@ -6912,24 +7014,26 @@ export class GISystem {
         if (n >= bundle.max || !entry?.boundsValid || entry.active === false) return;
         const b = entry.currBounds;
         if (!b || b.isEmpty?.()) return;
-        const cx = (b.min.x + b.max.x) * 0.5;
-        const cy = (b.min.y + b.max.y) * 0.5;
-        const cz = (b.min.z + b.max.z) * 0.5;
-        const r = Math.hypot(b.max.x - cx, b.max.y - cy, b.max.z - cz);
-        if (!(r > 1e-4)) return;
-        bundle.spheres.array[n].set(cx, cy, cz, r);
+        const spheres = giProxySpheres(entry.mesh, b, bundle.max - n, entry.type);
+        if (!spheres.length) return;
         // Colour, so the mover's BOUNCE comes back with it. `entry.surface` is
         // the diagnostics mirror writeSurface keeps of exactly the words the
         // header carries, so this cannot drift from what the exact-hit path
         // shades with. A promoted emitter's emissive is already zeroed there
         // (isPromotedEmitter), which keeps the analytic emitter slot from being
         // double-counted here too.
-        const s = entry.surface;
-        const a = s?.albedo;
-        const e = s?.emissive;
-        bundle.albedo.array[n].set(a?.[0] ?? 1, a?.[1] ?? 1, a?.[2] ?? 1, 0);
-        bundle.emissive.array[n].set(e?.[0] ?? 0, e?.[1] ?? 0, e?.[2] ?? 0, 0);
-        n++;
+        const a = entry.surface?.albedo;
+        const e = entry.surface?.emissive;
+        // ONE mover can occupy SEVERAL slots (a capsule is spheres along a
+        // segment), and every one of them carries that mover's colour — the
+        // shader has no notion of "these three belong together", it just sums
+        // spheres.
+        for (const s of spheres) {
+          bundle.spheres.array[n].set(s[0], s[1], s[2], s[3]);
+          bundle.albedo.array[n].set(a?.[0] ?? 1, a?.[1] ?? 1, a?.[2] ?? 1, 0);
+          bundle.emissive.array[n].set(e?.[0] ?? 0, e?.[1] ?? 0, e?.[2] ?? 0, 0);
+          n++;
+        }
       });
     }
     // Zero the tail: a stale radius in an unused slot is a shadow cast by an

@@ -62,6 +62,37 @@ export class MeshComponent extends Component {
     // "voxel": never go exact — keep the voxel path even while moving.
     // Ignored while giMobility is "static": static surfaces are already exact.
     giTrace: "auto",
+    // giProxy — the shape this mesh casts INDIRECT light and shadow with while
+    // it is a mover. Different question from `giTrace`, which is what a ray
+    // intersects; this is what the DIFFUSE field is told the object looks like.
+    //
+    // Why the two differ. Diffuse transport samples a small fixed set of
+    // directions, so testing a mover's real triangles is a hit-or-miss coin flip
+    // that re-flips every time the object turns — the "light randomly blinks
+    // when an object moves" artifact. A mover is therefore removed from those
+    // rays entirely and re-enters as a CLOSED FORM (cascadeGather's
+    // sphereOcclusion, which doubles as the form factor for its bounce). Closed
+    // forms are continuous in the transform, so a rotating proxy is analytically
+    // a no-op — which is exactly what the eye expects and what sampling could
+    // never deliver.
+    //
+    // The shader only ever evaluates SPHERES — exact, ~20 ALU, no branching —
+    // so a proxy is spent as a number of spheres rather than a new formula:
+    //   "auto"    fit from bounds. ONE continuous formula: spheres along the
+    //             longest axis, whose count and offset fall to a single
+    //             bounding sphere as the shape becomes compact. No threshold,
+    //             so a character whose AABB shifts as its limbs move cannot pop
+    //             between two fits. Right for a crate and a character alike.
+    //   "sphere"  force one bounding sphere. Exact for ball-like movers, and
+    //             the cheapest option at one slot.
+    //   "capsule" force the multi-sphere fit even when the pose is momentarily
+    //             compact — the character setting. A capsule is the standard
+    //             stand-in for a humanoid and keeps a walking figure's shadow
+    //             from ballooning to a sphere its full height. Also right for
+    //             planks and slabs; the fit is the same formula.
+    //   "none"    contributes NO indirect shadow or bounce. For decorative or
+    //             tiny movers whose GI contribution is not worth any slots.
+    giProxy: "auto",
     // LEGACY pre-split tag. Migrated to the pair above on attach, then left
     // alone; scenes written before the split still carry it.
     giDynamic: "auto",
@@ -87,6 +118,9 @@ export class MeshComponent extends Component {
     // Only meaningful for movers — a static mesh is traced exactly by the
     // world shadow BVH no matter what this says.
     { key: "giTrace", label: "GI Trace", type: "select", options: ["auto", "bvh", "obb", "voxel"], showIf: (props) => props.giMobility !== "static" },
+    // Same visibility rule as giTrace: a static mesh is voxelized and needs no
+    // proxy, so the control would be dead for it.
+    { key: "giProxy", label: "GI Proxy Shape", type: "select", options: ["auto", "sphere", "capsule", "none"], showIf: (props) => props.giMobility !== "static" },
     // `hidden` keeps this out of the inspector, but it does NOT cross the MCP
     // bridge: `component.types` projects key/label/type/options only, so an
     // assistant reading the schema sees THREE GI selects with nothing to rank
@@ -338,6 +372,11 @@ export class MeshComponent extends Component {
       this.#loadExtraMaterials();
     } else if (key === "castShadow" || key === "receiveShadow") {
       this.mesh[key] = !!this.props[key];
+    } else if (key === "giProxy") {
+      // Read fresh every frame by GISystem#syncMoverOccluders straight off
+      // userData — no rebuild, no slot churn, so switching a character from
+      // sphere to capsule is visible on the next frame.
+      if (this.mesh) this.mesh.userData.giProxy = this.props.giProxy;
     } else if (key === "giDynamic" || key === "giMobility" || key === "giTrace") {
       // Live: the GI system re-reads the tags every frame for adopted movers
       // and before every adoption, so no rebuild is needed here.
@@ -383,6 +422,7 @@ export class MeshComponent extends Component {
     };
     write("giMobility", this.props.giMobility);
     write("giTrace", this.props.giTrace);
+    write("giProxy", this.props.giProxy);
     // The legacy key is no longer read once either new tag is present, but a
     // stale value on the mesh would still answer giMobilityOf's fallback.
     delete this.mesh.userData.giDynamic;
