@@ -1112,6 +1112,24 @@ export class GISystem {
       this._giShadowHistWeightU.value = temporalOn
         ? Math.min(0.94, Math.max(0.86, 0.94 - motion * 30))
         : 0;
+      // The emitter channel gets the SAME motion-adaptive weight — it is the
+      // same camera, the same reprojection, and the same class of stochastic
+      // estimator, so there is no principled reason for the two to disagree. It
+      // is a separate uniform purely so the arms can be A/B'd independently
+      // (`__giEmitterHistWeight` pins it; `__giNoEmitterTemporal` removes the
+      // chain at build time).
+      //
+      // Null-guarded: the uniform only exists on builds where the emitter
+      // temporal chain was actually constructed — `emissiveShadows` off, or the
+      // hatch set, and there is no emitter pass at all.
+      if (this._giEmitterHistWeightU) {
+        const pin = Number(globalThis.__giEmitterHistWeight);
+        this._giEmitterHistWeightU.value = !temporalOn
+          ? 0
+          : Number.isFinite(pin)
+            ? Math.min(0.99, Math.max(0, pin))
+            : Math.min(0.94, Math.max(0.86, 0.94 - motion * 30));
+      }
     }
     // Receiver-gather surface bias (fractions of a probe cell — normal and
     // toward-camera components, see cascadeGather.gatherBias). Defaults
@@ -1498,7 +1516,15 @@ export class GISystem {
               // Emitter shadows are camera-dependent too (screen-space
               // texture) and the resolve consumes them — before it.
               ...(state.screen.emitterShadowPass
-                ? [state.screen.emitterShadowPass.compute, state.screen.emitterShadowFilterPass.compute]
+                ? [
+                    state.screen.emitterShadowPass.compute,
+                    state.screen.emitterShadowFilterPass.compute,
+                    // The temporal pair rides the idle path too: skipping it
+                    // would freeze the history at the last awake frame and then
+                    // reproject a stale accumulation against a moving camera.
+                    ...(state.screen.emitterShadowHistoryPass ? [state.screen.emitterShadowHistoryPass.compute] : []),
+                    ...(state.screen.emitterShadowPostPass ? [state.screen.emitterShadowPostPass.compute] : []),
+                  ]
                 : []),
               state.screen.resolve.compute,
               // The shadow pass is camera-dependent like the resolve — an
@@ -1539,6 +1565,10 @@ export class GISystem {
       if (!(this._emitterInfos?.length > 0) && state.screen?.emitterShadowPass) {
         skip.add(state.screen.emitterShadowPass.compute);
         skip.add(state.screen.emitterShadowFilterPass?.compute);
+        // The temporal pair is the same dead weight with zero emitters — and
+        // more of it, since it is two more full-texture passes.
+        skip.add(state.screen.emitterShadowHistoryPass?.compute);
+        skip.add(state.screen.emitterShadowPostPass?.compute);
       }
       // 2. No light asks for GI-traced direct shadows (the user's measured
       // finding, 2026-08-07: a directional light on three's shadow map runs
@@ -2813,10 +2843,95 @@ export class GISystem {
             cameraPosition: radiance?.cameraPosition ?? null,
           })
         : null;
+      // EMITTER TEMPORAL ACCUMULATION (2026-08-07). This channel had the
+      // spatial bilateral and nothing else — see `ensureEmitterTemporal` for why
+      // that is the "emissive still has dither" report. It now mirrors the
+      // analytic-light stochastic arm exactly: raw -> filter(+history) -> accum
+      // -> history snapshot -> a second, history-free filter into the sampled
+      // target. The split matters and is not cosmetic: post-filtering the
+      // fed-back signal would convolve it once per frame and wash every penumbra
+      // to flat grey, so presentation blur stays OUTSIDE the accumulation loop.
+      //
+      // The camera reprojection matrix is SHARED with the light channel — same
+      // camera, same frame — but the history weight is its own uniform so the
+      // two channels can be tuned (and A/B'd) independently.
+      // OFF BY DEFAULT, AND THE REASON IS THE INSTRUMENT, NOT THE CODE.
+      //
+      // The chain is complete and correct as far as anything here can tell: it
+      // builds, it survives resize, it type-checks, and it ran ~6 bleed-rig
+      // captures with no error. What does NOT exist is evidence that it improves
+      // anything, because the bleed rig cannot currently measure it.
+      //
+      // Eight runs of `EMISSIVE_SHADOWS=1 ARMS=white EMIT=5` land in exactly two
+      // clusters of mean linear luminance:
+      //     ~0.0810   et-on, et-f16, et-default(chain OFF), et-on2(chain ON)
+      //     ~0.0844   et-off(OFF), et-w0(ON, weight 0), et-final(ON)
+      // Cluster membership does NOT follow the hatch — the chain being on or off
+      // appears on both sides — and the two clusters differ by 4% of the mean and
+      // 20% of pixels, which is far larger than the effect under test. Same GI
+      // build line, same exposure gain (23.92 vs 23.90), same stitch decisions,
+      // so it is not the volume fit or the bracket. The rig is deterministic
+      // WITHIN a state (two consecutive identical configs read 0.00% apart) and
+      // bistable ACROSS runs.
+      //
+      // Two conclusions were drawn from this rig before that was noticed, and
+      // BOTH are withdrawn: that the chain halves emitter indirect (-49%), and
+      // that it is energy-neutral (0.0%). Each compared runs that happened to sit
+      // in different clusters. The -49% was especially convincing because its
+      // dark-hit/bright-spared shape is a textbook 8-bit EMA ratchet — a whole
+      // hypothesis, and the HalfFloatType change in giScreen, were built on it.
+      //
+      // So this stays off until the rig's bistability is found and fixed. That is
+      // the next item: an instrument that produces a 4% swing unrelated to the
+      // variable under test cannot certify a change of this size in either
+      // direction, and shipping on the strength of a reading it produced would be
+      // guessing with extra steps.
+      //
+      // `__giEmitterTemporal = true` opts in (build-time — set it, then touch a
+      // structural prop to force a rebuild). `__giEmitterHistWeight` pins the
+      // blend; at 0 the chain is a no-op to within 0.1%, which is the one thing
+      // measured here that both clusters agree on.
+      const emitterTemporal = emitterShadowPass && globalThis.__giEmitterTemporal === true;
+      if (emitterTemporal) {
+        targets.ensureEmitterTemporal?.();
+        this._giEmitterHistWeightU ??= uniform(0.9).setGroup(renderGroup);
+        this._giShadowPrevVPU ??= uniform(new THREE.Matrix4()).setGroup(renderGroup);
+      }
       const emitterShadowFilterPass = emitterShadowPass
         ? createGiLightShadowFilterPass({
             gbuffer,
             source: targets.emitterShadowRaw,
+            target: emitterTemporal ? targets.emitterShadowAccum : targets.emitterShadow,
+            width: emitterW,
+            height: emitterH,
+            resolveWidth: width,
+            resolveHeight: height,
+            planeEps: inputs.lightShadow?.voxMax ?? 0.1,
+            history: emitterTemporal ? {
+              histShadow: targets.emitterShadowHist,
+              histPos: targets.emitterShadowHistPos,
+              prevViewProj: this._giShadowPrevVPU,
+              weight: this._giEmitterHistWeightU,
+              validEps: inputs.lightShadow?.voxMax ?? 0.15,
+            } : null,
+          })
+        : null;
+      const emitterShadowHistoryPass = emitterTemporal && emitterShadowFilterPass
+        ? createGiLightShadowHistoryPass({
+            gbuffer,
+            source: targets.emitterShadowAccum,
+            histShadow: targets.emitterShadowHist,
+            histPos: targets.emitterShadowHistPos,
+            width: emitterW,
+            height: emitterH,
+            resolveWidth: width,
+            resolveHeight: height,
+          })
+        : null;
+      const emitterShadowPostPass = emitterTemporal && emitterShadowFilterPass
+        ? createGiLightShadowFilterPass({
+            gbuffer,
+            source: targets.emitterShadowAccum,
             target: targets.emitterShadow,
             width: emitterW,
             height: emitterH,
@@ -2835,7 +2950,7 @@ export class GISystem {
       // smearing white dots across the dark silhouette in front of it.
       light.giPositionNode = this._giShadowPosNode;
       light.giScreenTexel = this._giLightShadowTexel;
-      return { gbuffer, resolve, lightShadowPass, lightShadowFilterPass, lightShadowWidePass, lightShadowWidePass2, lightShadowHistoryPass, lightShadowPostPass, emitterShadowPass, emitterShadowFilterPass, targets, width, height, shadowWidth: shadowW, shadowHeight: shadowH, emitterShadowWidth: emitterW, emitterShadowHeight: emitterH, ...inputs };
+      return { gbuffer, resolve, lightShadowPass, lightShadowFilterPass, lightShadowWidePass, lightShadowWidePass2, lightShadowHistoryPass, lightShadowPostPass, emitterShadowPass, emitterShadowFilterPass, emitterShadowHistoryPass, emitterShadowPostPass, targets, width, height, shadowWidth: shadowW, shadowHeight: shadowH, emitterShadowWidth: emitterW, emitterShadowHeight: emitterH, ...inputs };
     } catch (error) {
       // Falling back to the in-material path keeps GI working (slowly) rather
       // than rendering an unlit scene.
@@ -2989,6 +3104,11 @@ export class GISystem {
       if (emitterIndexes[1] >= 0) state.queueNoFeedback[emitterIndexes[1]] = screen.emitterShadowPass.compute;
       if (emitterIndexes[2] >= 0) state.queueFeedbackOnly[emitterIndexes[2]] = screen.emitterShadowPass.compute;
     }
+    // The emitter temporal trio is sized to the EMITTER target, so a resize has
+    // to re-make it before the passes below bind it — same lazy contract the
+    // analytic arm gets a few dozen lines down.
+    const emitterTemporal = !!screen.emitterShadowHistoryPass;
+    if (emitterTemporal) screen.targets.ensureEmitterTemporal?.();
     if (screen.emitterShadowFilterPass) {
       const oldEmitterFilter = screen.emitterShadowFilterPass.compute;
       const emitterFilterIndexes = [
@@ -2999,6 +3119,58 @@ export class GISystem {
       screen.emitterShadowFilterPass = createGiLightShadowFilterPass({
         gbuffer: screen.gbuffer,
         source: screen.targets.emitterShadowRaw,
+        // Must match the BUILD's choice or the chain silently breaks: writing
+        // straight to `emitterShadow` while the history/post passes still read
+        // `emitterShadowAccum` leaves the post pass filtering a stale buffer.
+        target: emitterTemporal ? screen.targets.emitterShadowAccum : screen.targets.emitterShadow,
+        width: emitterW,
+        height: emitterH,
+        resolveWidth: width,
+        resolveHeight: height,
+        planeEps: screen.lightShadow?.voxMax ?? 0.1,
+        history: emitterTemporal ? {
+          histShadow: screen.targets.emitterShadowHist,
+          histPos: screen.targets.emitterShadowHistPos,
+          prevViewProj: this._giShadowPrevVPU,
+          weight: this._giEmitterHistWeightU,
+          validEps: screen.lightShadow?.voxMax ?? 0.15,
+        } : null,
+      });
+      if (emitterFilterIndexes[0] >= 0) state.queue[emitterFilterIndexes[0]] = screen.emitterShadowFilterPass.compute;
+      if (emitterFilterIndexes[1] >= 0) state.queueNoFeedback[emitterFilterIndexes[1]] = screen.emitterShadowFilterPass.compute;
+      if (emitterFilterIndexes[2] >= 0) state.queueFeedbackOnly[emitterFilterIndexes[2]] = screen.emitterShadowFilterPass.compute;
+    }
+    if (screen.emitterShadowHistoryPass) {
+      const oldEmitterHist = screen.emitterShadowHistoryPass.compute;
+      const idx = [
+        state.queue.indexOf(oldEmitterHist),
+        state.queueNoFeedback.indexOf(oldEmitterHist),
+        state.queueFeedbackOnly?.indexOf(oldEmitterHist) ?? -1,
+      ];
+      screen.emitterShadowHistoryPass = createGiLightShadowHistoryPass({
+        gbuffer: screen.gbuffer,
+        source: screen.targets.emitterShadowAccum,
+        histShadow: screen.targets.emitterShadowHist,
+        histPos: screen.targets.emitterShadowHistPos,
+        width: emitterW,
+        height: emitterH,
+        resolveWidth: width,
+        resolveHeight: height,
+      });
+      if (idx[0] >= 0) state.queue[idx[0]] = screen.emitterShadowHistoryPass.compute;
+      if (idx[1] >= 0) state.queueNoFeedback[idx[1]] = screen.emitterShadowHistoryPass.compute;
+      if (idx[2] >= 0) state.queueFeedbackOnly[idx[2]] = screen.emitterShadowHistoryPass.compute;
+    }
+    if (screen.emitterShadowPostPass) {
+      const oldEmitterPost = screen.emitterShadowPostPass.compute;
+      const idx = [
+        state.queue.indexOf(oldEmitterPost),
+        state.queueNoFeedback.indexOf(oldEmitterPost),
+        state.queueFeedbackOnly?.indexOf(oldEmitterPost) ?? -1,
+      ];
+      screen.emitterShadowPostPass = createGiLightShadowFilterPass({
+        gbuffer: screen.gbuffer,
+        source: screen.targets.emitterShadowAccum,
         target: screen.targets.emitterShadow,
         width: emitterW,
         height: emitterH,
@@ -3006,9 +3178,9 @@ export class GISystem {
         resolveHeight: height,
         planeEps: screen.lightShadow?.voxMax ?? 0.1,
       });
-      if (emitterFilterIndexes[0] >= 0) state.queue[emitterFilterIndexes[0]] = screen.emitterShadowFilterPass.compute;
-      if (emitterFilterIndexes[1] >= 0) state.queueNoFeedback[emitterFilterIndexes[1]] = screen.emitterShadowFilterPass.compute;
-      if (emitterFilterIndexes[2] >= 0) state.queueFeedbackOnly[emitterFilterIndexes[2]] = screen.emitterShadowFilterPass.compute;
+      if (idx[0] >= 0) state.queue[idx[0]] = screen.emitterShadowPostPass.compute;
+      if (idx[1] >= 0) state.queueNoFeedback[idx[1]] = screen.emitterShadowPostPass.compute;
+      if (idx[2] >= 0) state.queueFeedbackOnly[idx[2]] = screen.emitterShadowPostPass.compute;
     }
     // Same rebuild + splice for the shadow pass (its own size, its own
     // compute-count, the fresh targets).
@@ -4474,9 +4646,17 @@ export class GISystem {
       // Emitter shadow trace + filter FIRST — the resolve samples their
       // output texture in the same frame.
       if (screen.emitterShadowPass) {
-        queue.push(screen.emitterShadowPass.compute, screen.emitterShadowFilterPass.compute);
-        queueNoFeedback.push(screen.emitterShadowPass.compute, screen.emitterShadowFilterPass.compute);
-        queueFeedbackOnly.push(screen.emitterShadowPass.compute, screen.emitterShadowFilterPass.compute);
+        // trace -> filter(+history) -> [history snapshot -> post], the same
+        // order the analytic arm uses below. History snapshots the ACCUMULATED
+        // signal before the post filter reads it; both read accum, so the pair
+        // is order-independent, but keeping the two arms identical is worth more
+        // than the freedom.
+        const emitterChain = [screen.emitterShadowPass.compute, screen.emitterShadowFilterPass.compute];
+        if (screen.emitterShadowHistoryPass) emitterChain.push(screen.emitterShadowHistoryPass.compute);
+        if (screen.emitterShadowPostPass) emitterChain.push(screen.emitterShadowPostPass.compute);
+        queue.push(...emitterChain);
+        queueNoFeedback.push(...emitterChain);
+        queueFeedbackOnly.push(...emitterChain);
       }
       queue.push(screen.resolve.compute);
       queueNoFeedback.push(screen.resolve.compute);

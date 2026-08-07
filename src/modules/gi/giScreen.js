@@ -1420,6 +1420,57 @@ export function createGiTargets(width, height, shadowWidth = width, shadowHeight
       this.lightShadowHist = hist;
       this.lightShadowHistPos = histPos;
     },
+    // THE EMITTER CHANNEL'S OWN TEMPORAL TRIO — same shape, same laziness, and
+    // it did not exist until 2026-08-07.
+    //
+    // The analytic-light shadow channel gets a spatial bilateral AND ~0.9
+    // history accumulation, because its march is a stochastic estimator whose
+    // raw output "renders as a static IGN dither" (see the filter pass note).
+    // The emitter channel runs the SAME family of estimator — giLight's own
+    // comment says "the emitter arm joins the light arm's estimator family" —
+    // but was wired with `createGiLightShadowFilterPass` and NO `history`
+    // argument, so it got the spatial half and never the temporal half. One 5x5
+    // cross-bilateral, every frame, undamped.
+    //
+    // That is the user's "emissive lighting ... still has dither": a per-frame
+    // re-randomised estimate on emissive light only, while the sun channel next
+    // to it is temporally integrated over ~a dozen frames and looks clean. It
+    // shows up hardest under motion, when reprojection has real work to do.
+    emitterShadowAccum: null,
+    emitterShadowHist: null,
+    emitterShadowHistPos: null,
+    ensureEmitterTemporal() {
+      if (this.emitterShadowAccum) return;
+      const v = globalThis.__giNoTargetVersion ? 0 : ++targetGeneration;
+      // HALF FLOAT, NOT THE rgba8 DEFAULT. These two carry an EMA that feeds
+      // itself — out = 0.1·spatial + 0.9·hist, stored, re-read next frame — and
+      // at 8 bits every store re-quantises, so rounding bias can accumulate over
+      // the hundreds of frames the loop runs.
+      //
+      // HONESTY NOTE: this was introduced to fix a measured 49% energy loss that
+      // turned out not to exist (the baseline it was measured against came from
+      // a different build — see the method note in GISystem's emitterTemporal
+      // block). Promoting these to HalfFloatType changed the result by 0.0%, so
+      // the ratchet was NOT happening at the weights and frame counts in play.
+      // It stays because a self-feeding EMA in 8 bits is a real hazard and half
+      // float costs one extra byte per texel on two emitter-sized targets — but
+      // it is insurance, not a fix, and nothing measured has ever needed it.
+      const accum = new THREE.StorageTexture(emitterWidth, emitterHeight);
+      accum.type = THREE.HalfFloatType;
+      accum.name = "giEmitterShadowAccum";
+      accum.version = v;
+      const hist = new THREE.StorageTexture(emitterWidth, emitterHeight);
+      hist.type = THREE.HalfFloatType;
+      hist.name = "giEmitterShadowHist";
+      hist.version = v;
+      const histPos = new THREE.StorageTexture(emitterWidth, emitterHeight);
+      histPos.type = THREE.FloatType;
+      histPos.name = "giEmitterShadowHistPos";
+      histPos.version = v;
+      this.emitterShadowAccum = accum;
+      this.emitterShadowHist = hist;
+      this.emitterShadowHistPos = histPos;
+    },
     dispose() {
       irradiance.dispose();
       emitterShadow.dispose();
@@ -1432,6 +1483,9 @@ export function createGiTargets(width, height, shadowWidth = width, shadowHeight
       this.lightShadowAccum?.dispose();
       this.lightShadowHist?.dispose();
       this.lightShadowHistPos?.dispose();
+      this.emitterShadowAccum?.dispose();
+      this.emitterShadowHist?.dispose();
+      this.emitterShadowHistPos?.dispose();
       lightShadowDist.dispose();
     },
   };

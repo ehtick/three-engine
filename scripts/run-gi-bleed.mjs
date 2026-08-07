@@ -184,6 +184,19 @@ if (process.env.BOUNCE !== undefined) giOverrides.bounce = Number(process.env.BO
 // C0DIR is NOT set here — it goes on a global, and GLOBALS is declared further
 // down, so the wiring lives beside it. See the note there.
 if (process.env.CASCADES) giOverrides.cascadeCount = Number(process.env.CASCADES);
+// EMISSIVE_SHADOWS=1 turns on ANALYTIC EMITTER PROMOTION, and without it this
+// rig cannot exercise the emitter path AT ALL. The component default is
+// `emissiveShadows: false`, and GISystem gates the whole promotion loop on
+// `props.emissiveShadows !== false` — so with the default, no emissive is ever
+// promoted, `_emitterInfos` stays empty, and the per-frame skip drops the
+// emitter trace, its filter and (as of 2026-08-07) its temporal pair from the
+// queue. An emitter-path A/B run without this reads as byte-identical frames
+// and "proves" a change is inert when it was simply never dispatched. That
+// happened: the first validation of the emitter temporal chain compared two
+// runs that differed by 0 of 960000 pixels.
+if (process.env.EMISSIVE_SHADOWS !== undefined) {
+  giOverrides.emissiveShadows = process.env.EMISSIVE_SHADOWS !== "0";
+}
 if (VOXEL || PROBE) {
   giOverrides.quality = "custom";
   if (VOXEL) giOverrides.voxelSize = VOXEL;
