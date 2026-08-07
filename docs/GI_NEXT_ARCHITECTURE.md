@@ -2,32 +2,44 @@
 
 *Where radiance is STORED, not what rays HIT. Plus the hardware-ray-tracing question, answered.*
 
-*Written 2026-08-07, after the block-size sweep, and updated the same day once Phase 0 ran.
-Supersedes the "voxelSize sets the block size" hypothesis in the session-34/35 handoffs — **that
-hypothesis is now falsified by measurement** (§1). This document is the plan; `GI_PLAN.md`,
-`GI_SHADOWS_PLAN.md` and `dynamic_gi_exact_dynamic_objects.md` remain the history of what got us
-here.*
+*Written 2026-08-07, after the block-size sweep; updated the same day once Phase 0 ran, and again
+once Phase 1 ran. Supersedes the "voxelSize sets the block size" hypothesis in the session-34/35
+handoffs — **that hypothesis is now falsified by measurement** (§1.1). Phase 1 falsified two more
+things this document itself asserted: the far-field falloff shortfall is **not** an unexplained
+transport loss, it is attributed to a single default flip (§1.3); and emissive blockiness and
+mover blockiness are **not** the same artifact, they are 15× apart (§1.4). This document is the
+plan; `GI_PLAN.md`, `GI_SHADOWS_PLAN.md` and `dynamic_gi_exact_dynamic_objects.md` remain the
+history of what got us here.*
 
 ---
 
 ## 0. TL;DR
 
-Three claims, each backed by a number in §1:
+Four claims, each backed by a number in §1:
 
-1. **The blockiness is not the voxels.** A 5× sweep of `voxelSize` moves the measured block size
+1. **"Bleed too strong, reaches too far" is attributed, and it is a tuning question.** The
+   far-field falloff exponent is **−2.18** against an analytic **−2.72** on what ships today. The
+   whole ~0.78 shortfall belongs to commit `b5961d7`, which flipped the `rayHitMode` default from
+   `occupancy-legacy` to `auto`; `GLOBALS=__giRayHitMode=occupancy-legacy` reproduces the old
+   −2.63 and, stacked with the current merge kernel, **−2.97**. Both modes are wrong in opposite
+   directions — `auto` 0.54 too flat, legacy 0.25 too *steep* — so the answer is a merge visibility
+   *tolerance* between them, not a revert (§1.3). This is a direct hit on the user's original
+   complaint and it is the cheapest open item in this document.
+2. **The blockiness is not the voxels.** A 5× sweep of `voxelSize` moves the measured block size
    by 2%. A 3.2× sweep of `probeSpacing` moves it 1.39×. The voxel grid is innocent of *this*
    artifact; the c0 probe lattice and the cascade merge are not. **The post-fix sweep reproduces
    both slopes** — 1.02× and 1.38× (§1.1).
-2. **The one `floor()` in the parallax merge was worth a quarter of the amplitude, not two
-   thirds, and none of the block scale.** Turning the parallax correction off entirely takes
-   modulation 14.71% → 4.58%; the continuous form that replaced the `floor()` landed at
-   **10.79%**, i.e. it recovered 3.92 of those 10.13 points — 39%. It is measured, committed and
-   shipped. Phase 0's ≤ 8% gate **failed**, and 6.2 points of parallax-added structure are still
-   unexplained (§1.2, §4).
-3. **What is left after that is a radiance-STORAGE problem, and hardware ray tracing would not
+3. **The parallax merge's error was the kernel's second moment, not its centre.** Off entirely:
+   4.58% floor modulation. Snapped: 14.71%. The Phase-0 linear 3-tap fixed the tap *centre*:
+   10.79%. The quadratic B-spline that also matches the *variance* now ships: **9.39%**, with
+   falloff improving −1.88 → −1.94 → −2.18 on the same three arms — a strict win on both rigs
+   (§1.2). Phase 0's ≤ 8% gate still **fails** by 1.4 points, and 4.8 points of parallax-added
+   structure remain unattributed (§5).
+4. **What is left after that is a radiance-STORAGE problem, and hardware ray tracing would not
    touch it.** Every current system (Lumen, RTXGI/SHaRC, AMD GI-1.0, Sannikov's own Split
    Radiance Cascades) abandoned dense world-grid radiance storage. We should too. That is
-   Phase 2, and it is the structural work in this document.
+   Phase 2; its CPU half (card builder, atlas, packing, concavity) is **shipped and tested**
+   (`7bc24f1`), with six corrections to §6 forced by building it.
 
 Hardware RT: **not reachable, not soon, and not the fix** (§2). The Rust backend gets a real but
 *offline* job (§9).
@@ -64,7 +76,10 @@ monotonic. The dial was live in both sweeps — the arm-to-arm image `diff.rms` 
 the voxel arms, so the builds *did* change; they changed *brightness and energy*, not block scale.
 
 **Post-fix** — the identical sweep re-run with the continuous parallax merge as the shipped
-default (§4's 0.2). Same command, same rig:
+default (§4's 0.2). Same command, same rig. **This sweep was taken on the linear 3-tap**; the
+quadratic B-spline that superseded it (§1.2) moves the shared 0.15/0.375 point 10.79% → **9.39%**
+and the sweep has *not* been re-run on it — treat the amplitude column as an upper bound and the
+block column as unaffected, since no parallax kernel has ever moved block scale:
 
 | dial  | voxelSize | probeSpacing | **blockX (m)** | modulation |
 |-------|-----------|--------------|----------------|------------|
@@ -97,47 +112,135 @@ Two consequences the plan is built on:
   shrink.
 - **Block size is sub-proportional to probe spacing** — roughly `0.196 + 0.14·spacing` in x
   post-fix, `0.19 + 0.17·spacing` pre-fix. **The parallax fix moved neither term.** The ~0.196 m
-  intercept is a *floor* that does not follow either dial. That floor is a separate term
-  (candidates: the screen resolve's reconstruction footprint, the bilateral filter width) and it
-  needs its own measurement — see Phase 1.
+  intercept is a *floor* that does not follow either dial. **Phase 1b hunted its owner and did not
+  find it** — the bilateral filter and AO were both cleared, and the one term that moved anything
+  moved amplitude, not scale (§5's 1b). The intercept's owner is **still unidentified**.
 
 **The z axis is not trustworthy.** z is the depth axis in this framing, heavily foreshortened
 (122 px/m nominal but the patch spans a large depth range), and the z column is non-monotonic
 (0.50 → 0.53 → 0.38 → 0.48). Quote x. Fix the rig's z geometry or drop the z column before
 anyone builds an argument on it.
 
-**Flicker is not in this rig, and `MOVER=1` does not put it there.** Every arm has `adopted: 0`
+**Flicker is not in these arms, and `MOVER=1` does not put it there.** Every arm has `adopted: 0`
 and a static panel, and a settled frame is deterministic to 1e-4 — a baseline re-run against
 itself moves the residual by 0.01% rms. `MOVER=1` turns out **not to move the panel at all**: it
 only tags it `giMobility: "dynamic"`, which changes *which path lights it* and nothing about
-motion. The user's flicker complaint is about a *rotating* mover and about *emissive* meshes.
-**That is still unmeasured**; a rotating arm is being added to the rig separately (§4's 0.3).
+motion, so **every flicker number in this module taken before 2026-08-07 was taken on a still
+frame**. The rig now has a real `SPIN=<deg/s>` arm that rotates the panel; the numbers it returned
+are §1.4.
 
-### 1.2 The parallax merge's `floor()` — found, fixed, measured
+### 1.2 The parallax merge kernel — centre, then second moment
 
 `cascadeMerge.js:383-460`. The parallax correction re-aims a child probe's tap at its parent and
 then **snapped the tap to whole texels** (`floor(pu + 0.5) - 1`), so as a child probe slid across
 its parent's cell the tap *index* jumped a whole angular bin and the merged radiance stepped with
-it. Three-arm ablation on the block rig — emissive, voxelSize 0.15 / probeSpacing 0.375:
+it. Four-arm ablation on the block rig — emissive, voxelSize 0.15 / probeSpacing 0.375 — with the
+matching bleed-rig falloff (§1.3) beside each, because a merge change is not measured until both
+rigs have spoken:
 
-- `__giParallaxMerge = false` — correction off entirely: **4.58%**
-- `__giParallaxMergeSmooth = false` — the old snap: **14.71%**
-- baseline — the continuous form, now the shipped default: **10.79%**
+- `__giParallaxMerge = false` — correction off entirely: **4.58%**, falloff **−1.09**
+- `__giParallaxMergeSmooth = false` — the old snap: **14.71%**, falloff **−1.88**
+- the Phase-0 linear 3-tap: **10.79%**, falloff **−1.94**
+- baseline — the quadratic B-spline, now the shipped default (`923cd78`): **9.39%**,
+  falloff **−2.18**
 
 The ablation reproduces both recorded pre-fix numbers exactly, and a baseline re-run against
-itself moves 0.01% rms, so the rig is deterministic and these three are comparable.
+itself moves 0.01% rms, so the rig is deterministic and these four are comparable.
 
-**Read it:** the parallax correction *adds* 10.13 points of structure over having none, and the
-continuous form recovers **3.92 of them — 39%**. The "two thirds" the snap-vs-off gap suggested
-was the correction's whole contribution, not the `floor()`'s: the `floor()` was worth about a
-quarter of the amplitude, and **6.2 points of parallax-added structure remain**. The fix is real,
-measured and shipped, and it misses §4's ≤ 8% gate by 2.8 points.
+**The linear 3-tap fixed the tap centre and got the kernel wrong.** Linearly blending the two
+integer-aligned boxes gives weights `[(1−f)/2, ½, f/2]`. Its **mass** is 1 and its **mean** is
+right — but mass is not what sets small-source dilution, the **second moment** is, and that
+kernel's variance is `0.25 + f − f²`: equal to the snapped 2-box at `f = 0` and `f = 1`, and
+**double it at `f = 0.5`**. So the correction was smoothly widening and re-narrowing its own
+footprint as a child probe slid across its parent's cell — a different periodic error in place of
+the `floor()`'s. Solving mass + mean + variance simultaneously for taps at `{0, 1, 2}` has one
+solution, the quadratic B-spline:
 
-The continuous form is a separable 3-tap `[(1−f)/2, ½, f/2]` box per axis, same box *width*
-(dilution preserved), fractional *centre*; 9 reads instead of 4, in a loop already reading 8
-parent probes. Hatch `__giParallaxMergeSmooth = false` restores the snap.
+```
+a = (1−f)²/2      b = ½ + f − f²      c = f²/2
+```
 
-### 1.3 The other measured facts this plan inherits
+which is a constant-variance, fractional-centre, separable 3-tap — same read count as the linear
+form (9 instead of 4, in a loop already reading 8 parent probes).
+
+**Read it:** the parallax correction *adds* 10.13 points of structure over having none; the linear
+form recovered 3.92 of them (39%), the quadratic recovers **5.32 — 53%**, and it is a **strict win
+on both rigs**: 14.71 → 10.79 → 9.39% floor modulation *and* −1.88 → −1.94 → −2.18 falloff, never
+trading one for the other. That matters because Phase 1a found an arm that buys modulation by
+selling falloff (§5's 1a). **4.8 points of parallax-added structure remain**, and the shipped
+kernel misses §4's 0.1 gate of ≤ 8% by 1.4 points.
+
+Hatches: `__giParallaxMergeSmooth = false` restores the snap; `__giParallaxMerge = false` turns the
+correction off entirely. The linear form is superseded and is no longer reachable by a hatch.
+
+### 1.3 The far-field falloff — attributed to a default flip, and it overshoots both ways
+
+**This is the biggest single result in the document, and it lands on the user's original
+complaint**: "our colour bleed is too strong and reaches too far; in Blender it fades out
+quickly". `scripts/run-gi-bleed.mjs` measures exactly that as a far-field falloff exponent against
+an exactly-integrable analytic reference, which sits at **−2.72**. Read the **white** channel: the
+red channel is bracket-limited on this rig and the probe now flags that automatically, so red
+exponents are not comparable across arms.
+
+| arm | falloff |
+|---|---|
+| naive — `__giParallaxMerge = false` | **−1.09** |
+| snapped box, `rayHitMode` `auto` | **−1.88** |
+| linear 3-tap, `rayHitMode` `auto` | **−1.94** |
+| **quadratic B-spline, `rayHitMode` `auto` — ships today** | **−2.18** |
+| snapped box, `rayHitMode` `occupancy-legacy` | **−2.63** |
+| quadratic B-spline + `occupancy-legacy` | **−2.97** |
+| analytic ground truth | **−2.72** |
+
+The value recorded for the snapped arm on 2026-08-04 was −2.66, and
+`GLOBALS=__giRayHitMode=occupancy-legacy` reproduces it at −2.63. **So the ~0.78 exponent
+shortfall that has sat on this module since 2026-08-05 is entirely attributable to commit
+`b5961d7`**, which flipped the `GlobalIlluminationComponent` default `rayHitMode` from
+`occupancy-legacy` to `auto` (`GlobalIlluminationComponent.js:105`, `rayHit/RayHitConfig.js:60-75`).
+No transport term is missing; a default moved.
+
+**Mechanism.** Under `auto`, plane/coverage hits resolve at the *fitted surface* rather than the
+conservative voxel shell, so a grazing ray reports a **longer** free distance. At
+`cascadeMerge.js:318-336` that shrinks `penetration = dist − parentRay.w`, so the visibility
+proxy's smoothstep retains **more** coarse-parent weight, which inflates far-field energy. That
+block sits *upstream* of the parallax branch — which is why the flip moved the naive arm too, and
+why it shows up identically on every kernel in §1.2.
+
+**Do not write this up as "revert the default."** The two effects stack and **overshoot**: `auto`
+is 0.54 too flat, `occupancy-legacy` is 0.25 too **steep** — bleed dying too fast, the opposite
+error, and one the user would complain about in the other direction. Re-fitting the stored samples
+over nested windows (3–10 m, 3–8 m, 3–6 m) gives **−2.97 / −2.95 / −2.97** for the legacy arm, so
+the overshoot is stable and not a noise-floor artifact of the fit window.
+
+**The correct answer is between the two modes, which makes this a tolerance/contract question, not
+a binary flip.** The dial is the merge visibility tolerance — `MERGE_VIS_TOLERANCE`,
+`cascadeMerge.js:58`, hatched as `__giMergeVisTol`. **OPEN**, and per §12 it is arguably the
+highest-value open item in this document: it is a direct hit on the original complaint, both
+bracketing endpoints are already measured, and it is tuning rather than a rewrite.
+
+### 1.4 Flicker under rotation — measured at last, and §4's 0.4 hypothesis is falsified
+
+The rig gained a real `SPIN=<deg/s>` arm (`MOVER=1` only ever *tagged* the panel — §1.1).
+Emissive panel at 20 °/s, yaw 28° across 3 frames:
+
+| arm | flicker | size | **detrended flicker** | detrended size | level |
+|---|---|---|---|---|---|
+| `MODE=emissive` | 39.08% | 0.680 m | **7.48%** | **0.174 m** | 0.3478 |
+| `MODE=albedo` | 1.68% | 1.017 m | **0.48%** | 0.121 m | 1.0324 |
+
+"Detrended" = the same frame difference with a per-line cubic fitted out, so smooth aspect change
+lands in the fit and **what survives cannot be honest relighting**. **7.48% at 0.174 m is the
+user's "blocky and flickery indirect light", quantified for the first time.**
+
+**§4's 0.4 asked whether emissive blockiness and mover-bleed blockiness are the same artifact.
+They are not — 7.48% vs 0.48%, a 15× gap.** Two caveats, recorded so nobody over-reads the raw
+column: in the emissive arm the rotating object **is** the light source, so much of the raw 39% is
+legitimate; and the albedo arm is 3× brighter (level 1.0324 vs 0.3478), which flatters its
+percentage. The detrended pair is the honest comparison, and it still says the emissive path
+carries an order of magnitude more temporal structure than the mover path. Whatever fixes mover
+bleed will not fix emissive flicker.
+
+### 1.5 The other measured facts this plan inherits
 
 Established in earlier sessions, do not re-derive:
 
@@ -200,7 +303,7 @@ Separate the two representations. We have been arguing about the wrong one:
 
 | | what it is | ours | measured verdict |
 |---|---|---|---|
-| **(A) Visibility** | what a ray intersects | occupancy DDA + static BVH8 + analytic movers | not the cost (§1.3), not the block size (§1.1) |
+| **(A) Visibility** | what a ray intersects | occupancy DDA + static BVH8 + analytic movers | not the cost (§1.5), not the block size (§1.1) |
 | **(B) Radiance cache** | where light is **stored and read back** | `radianceBuffer`, `giField.js:92`, read via `createTrilinearRadianceSampler`, `voxelizeOnce.js:321` | the residual after §1.2 |
 
 Hardware RT replaces **(A)**. Swap in perfect ray-traced visibility and we still write radiance
@@ -249,7 +352,8 @@ Everyone converged on the same move:
                                         ▼
                        ┌─────────────────────────────────────────┐
   TRANSPORT            │ radiance cascades, c0…cN                 │  unchanged shape
-                       │   merge: continuous parallax (shipped)   │
+                       │   merge: quadratic-B-spline parallax     │  shipped
+                       │   merge: visibility tolerance ← OPEN     │  §1.3
                        │   probes: dense today → sparse (Phase 7) │
                        └─────────────────────────────────────────┘
 ```
@@ -263,21 +367,22 @@ jobs — empty-space skipping and penumbra width — which is what they are actu
 
 ## 4. Phase 0 — verify and land what is already in the tree
 
-**Nothing new is designed until these numbers exist.** Run 2026-08-07. 0.1, 0.2, 0.4 and 0.5 are
-done and their numbers are folded into §1.1 and §1.2; **0.3 is still open** because the rig cannot
-produce it yet. The two gate outcomes below are what scope Phase 1 (§5).
+**Nothing new is designed until these numbers exist.** Run 2026-08-07. **All five are now done** —
+0.3 and 0.4 closed once the rig gained a real rotating arm — and their numbers are folded into
+§1.1, §1.2 and §1.4. The gate outcomes below are what scoped Phase 1 (§5).
 
-**0.1 — The smooth-parallax number. GATE FAILED at 10.79%.**
+**0.1 — The smooth-parallax number. GATE FAILED at 10.79%, and still fails at 9.39%.**
 ```
 ABLATE="|__giParallaxMergeSmooth=false|__giParallaxMerge=false" node scripts/run-gi-block-size.mjs
 ```
 (emissive rig, voxelSize 0.15, probeSpacing 0.375; the user's server on :5201 is already up — do
 not start a second.) Returned **10.79%** smooth / 14.71% snap / 4.58% correction-off, reproducing
-both recorded numbers exactly. The gate was **≤ 8%** and it missed by 2.8 points: the smooth form
+both recorded numbers exactly. The gate was **≤ 8%** and it missed by 2.8 points: the linear form
 recovered 39% of the structure the parallax correction adds, not the ~two thirds the snap-vs-off
-gap implied. Per this section's own instruction, **Phase 1 therefore starts by finding out why,
-not by adding a second fix on top** — the residual 6.2 points are the first thing §5's 1a/1b have
-to account for.
+gap implied. Per this section's own instruction, **Phase 1 started by finding out why, not by
+adding a second fix on top** — and the answer was that the kernel's *second moment* was wrong, not
+just its centre (§1.2). The quadratic B-spline took it to **9.39%**, which still misses the gate
+by 1.4 points; 4.8 points remain for §5.
 
 **0.2 — Re-run the probe sweep with the fix on. A FOURTH OUTCOME: NEITHER TERM COLLAPSED.**
 Post-fix table in §1.1. The three predicted outcomes were intercept-collapses, intercept-survives,
@@ -287,19 +392,20 @@ quarter, uniformly across arms. So the branch that fired is **both at once**: Ph
 screen-side ablation for the fixed-width floor *and* the probe-lattice work. §5 is scoped
 accordingly; Phase 2 is not short-circuited.
 
-**0.3 — The flicker number that has never been taken. STILL OPEN — the rig cannot take it yet.**
-`MOVER=1` was believed to put the panel on the user's rotating-box case. It does not: it only tags
-the panel `giMobility: "dynamic"` and **leaves it static**, so it changes which path lights the
-panel and nothing about motion. Flicker duly read ~0 on every arm of both sweeps. A **rotating**
-arm is being added to the rig separately; until it lands, "jumpy" as opposed to "boxy" has no
-number. `run-gi-mover-bounce.mjs` and the `SPIN=1` arm in the real-shadow probe already have the
-pattern.
+**0.3 — The flicker number that had never been taken. DONE.** `MOVER=1` was believed to put the
+panel on the user's rotating-box case. It does not: it only tags the panel `giMobility: "dynamic"`
+and **leaves it static**, so it changes which path lights the panel and nothing about motion, and
+flicker duly read ~0 on every arm of both sweeps. The rig now has a real `SPIN=<deg/s>` arm plus a
+**detrended** flicker metric (per-line cubic fitted out, so smooth aspect change cannot masquerade
+as flicker). At 20 °/s the emissive arm reads **7.48% detrended at 0.174 m** — the first number
+this module has ever had for "jumpy" as opposed to "boxy". Full table and caveats: §1.4.
 
-**0.4 — Emissive arm.** Every number in §1.1's post-fix table and §1.2 is `MODE=emissive`, the rig
-default, and emissive modulation dropped by a quarter. The `MODE=albedo MOVER=1` half is blocked
-on the same missing rotating arm as 0.3 — with `MOVER=1` static it exercises the exact-mover
-*path*, not moving-mover *bleed*, so the user's "emissive and mover blockiness are the same
-artifact" claim stays untested.
+**0.4 — Emissive vs. mover. DONE, and the hypothesis is FALSIFIED.** Every number in §1.1's
+post-fix table and §1.2 is `MODE=emissive`, the rig default. With the rotating arm the
+`MODE=albedo` half finally ran, and the claim this section was written to test — "emissive
+blockiness and mover-bleed blockiness are the same artifact" — **is false**: 7.48% vs 0.48%
+detrended, a **15× gap** (§1.4). They are two artifacts and they need two fixes. Phase 2 targets
+the mover/emissive *fidelity* side; nothing in it is justified as an emissive-flicker fix.
 
 **0.5 — Commit. DONE.** Pushed to `origin/main` in three reviewable slices: the MCP multi-session
 broker + EditorApi 1.4.0; the editor/scripting typings + the schema-driven export asset walk; and
@@ -312,56 +418,119 @@ The standing MCP rule was **audited rather than assumed**: the prop surface is s
 to end (`component.setProp` is generic, `component.types` reflects `cls.schema` at runtime), so
 the mobility/trace split needed **no new ops** — `test:mcp` 26/26 and `test:mcp-coverage` 50/50.
 
-**Exit: met except 0.3.** The tree is committed, §1.1 has its post-fix twin, and both gates
-returned answers — one failed, one unforeseen. The flicker number carries into Phase 1 as an open
-input, not a blocker.
+**Exit: met.** The tree is committed, §1.1 has its post-fix twin, both gates returned answers —
+one failed, one unforeseen — and 0.3/0.4 closed once the rotating arm landed, taking one of this
+document's own hypotheses down with them (§1.4).
 
 ---
 
 ## 5. Phase 1 — the residual: the fixed-width floor *and* the probe lattice
 
 *Scope decided by Phase 0.2 — which returned **both branches**: the ~0.196 m intercept survived
-and the probe slope survived at 1.38×. 1a and 1b are both in scope, and 0.1's unexplained 6.2
-points is the first thing they have to account for. Do not pre-commit to a fix.*
+and the probe slope survived at 1.38×. **1a and 1b have run.** 1a attributed the parallax residual
+and shipped the kernel fix; 1b cleared three suspects and found no owner for the intercept. 1c is
+untouched. **1d is new, and it is the largest result Phase 1 produced.***
 
-The candidates, in the order the evidence would pick them:
+**1a. The parallax residual — isolated, one arm shipped, one arm REJECTED.** Two discontinuities
+remained in the parallax block after the linear 3-tap. Ablations, block rig, emissive,
+0.15/0.375:
 
-**1a. The reconstruction floor — live, because the ~0.196 m intercept survived the parallax fix.**
-Ablate the screen side with the block rig: resolve scale, the bilateral filter radius, the
-checker/rate cadence
-(`queue` / `queueNoFeedback` / `queueFeedbackOnly`), and the probe reconstruction in the resolve
-(`giScreen.js`, the ~0.59 ms pass — the single most expensive screen term). One dial at a time,
-one modulation number each. The rig's `GLOBALS=a=1,b=0` env sets live GI knobs before any module
-runs, which is what makes this a one-boot sweep rather than a rebuild per arm.
+| arm | floor modulation | verdict |
+|---|---|---|
+| baseline (quadratic B-spline) | 9.39% | ships |
+| `__giParallaxDepthMean` — mean instead of `min()` over the 4 depths | 11.53% | slightly **worse** |
+| `__giParallaxDepthConst=1.0` — depth signal destroyed | 18.89%, floor 26% dimmer | much worse |
+| `__giParallaxGateFade` — ramp reproj→naive on the valid-tap fraction | **6.55%** | **REJECTED** |
 
-**1b. The known RC fixes we have not applied.** The literature has named remedies for exactly
-this artifact class — the *bilinear fix* and *non-linear accumulation* (both catalogued on
+Read the depth pair first: **the `min()`-over-4 depth selection is innocent.** Destroying the
+depth signal *adds* structure rather than removing it, which means that signal is carrying real
+geometry, not noise. Neither hatch is a candidate; do not re-ablate them.
+
+`__giParallaxGateFade` is the important one. Replacing the hard reproject/naive gate with a ramp
+on the fraction of valid taps gave **6.55% — the best lateral number any arm has produced, and the
+only one ever to clear §4's 0.1 gate of ≤ 8%.** It was **rejected anyway**: its falloff fell to
+**−1.39**, between naive (−1.09) and snap (−1.88), handing back ~60% of the parallax correction's
+far-field benefit — the exact thing §1.3 says the user complains about. **This is the
+case where the block rig alone would have shipped the wrong thing** — a real 30% cut in visible
+blockiness bought by re-inflating the exact long-range bleed the user complains about. §11 now
+carries "judge every merge change on **both** rigs" as a standing trap.
+
+**1b. The fixed-metre floor — hunted, three suspects cleared, owner still unidentified.** Block
+size is `0.196 + 0.14·probeSpacing` m and the **0.196 m intercept follows neither lattice**.
+Ablated with new hatches, same rig:
+
+| arm | floor modulation | verdict |
+|---|---|---|
+| baseline | 9.39% | — |
+| `__giBilateralTapScale=0` — bilateral collapsed to a single centre tap | 9.40% | **innocent** |
+| `__giBilateralViewFrac=0,__giBilateralWorldEps=0.001` | 9.37% | **innocent** |
+| `PROPS=aoStrength=0` | 9.38% (vs 9.39% baseline) | **AO innocent** |
+| `__giNormalOffsetScale=0,__giNormalOffsetFloor=0.001` | **7.34%** (−2.05 points) | carries amplitude |
+
+The normal offset is the only term that moved anything — and **the honest reading is amplitude,
+not scale.** Three reasons it cannot be the 0.196 m intercept: the offset is voxel-proportional
+(`cellMax·1.2 max 0.1`); the voxel dial is provably inert for block *scale* (5× → 1.02×, §1.1);
+and zeroing it shifted the patch **mean by 4.28%**, so it is not a free win either — that lift
+exists to stop self-intersection and removing it trades one artifact for another. **The
+intercept's owner remains unidentified**, and the candidate list is now shorter by the bilateral
+filter and AO.
+
+**The methodology trap that cost a run, recorded so it does not cost another:** two of the first
+three ablation arms were **inert by construction**, because each hatch sits inside a `max()` whose
+*other* term dominated — `viewDist·0.02 ≈ 0.16 ≫ 0.001`, and `cellMax·1.2 = 0.18 ≫ 0.001`. Setting
+the hatched term to zero changed nothing at all. The tell was an **exact 0.00% change rms** paired
+with a garbage `−8195617107 m` block size, which is a divide-by-zero on an all-zero difference
+image. An exact zero is never a measurement; it is a broken arm.
+
+**1c. The known RC fixes we have not applied. UNTOUCHED.** The literature has named remedies for
+exactly this artifact class — the *bilinear fix* and *non-linear accumulation* (both catalogued on
 radiance.wiki), and Sannikov's post-publication depth-aware **"Bilinear 3D"** upscale, which the
 Chalmers thesis on RC optimisation adopts specifically for 3D reconstruction quality. Each is a
 merge/reconstruction change, cheap relative to Phase 2, and each is A/B-able on the block rig
-under a `__gi…` hatch like everything else in this module. **This is also where 0.1's residual
-belongs**: the continuous form took 39% of what the parallax correction adds and left 6.2 points,
-and these remedies act on the same merge stage.
+under a `__gi…` hatch. **This is where 0.1's remaining 4.8 points belong**, and after 1a it is
+where the next lateral gain is most likely to come from. Judge each on the bleed rig too.
 
-**1c. Ringing.** If the residual's ACF goes *negative* (the voxel arms already cross zero around
+**1d. The merge visibility tolerance — the falloff contract. OPEN, and the highest-value item
+here.** §1.3 brackets it exactly: `rayHitMode auto` gives −2.18 (0.54 too flat), `occupancy-legacy`
+gives −2.97 (0.25 too steep), truth is −2.72. Both endpoints are already measured on the same rig
+with the same kernel, so this is an interpolation, not an investigation. The dial is
+`MERGE_VIS_TOLERANCE` / `__giMergeVisTol` (`cascadeMerge.js:58`) acting on the
+`penetration = dist − parentRay.w` smoothstep at `cascadeMerge.js:318-336`. Sweep the tolerance on
+the bleed rig with the shipped kernel, fit the exponent, and pick the value that lands on −2.72;
+then re-run the block rig to confirm the lateral number did not regress (1a's lesson). If no single
+tolerance satisfies both modes, the contract between `rayHitMode` and the merge — not the default
+— is what needs specifying.
+
+**1e. Ringing.** If the residual's ACF goes *negative* (the voxel arms already cross zero around
 lag 28 px), that is ringing, not blocking, and it has its own fix in the same literature. Worth
 one look at the stored `curve` arrays before assuming "blocks".
 
-**Exit gate:** modulation ≤ 4% on the emissive arm — **10.79% today**, so this is a 2.7× further
-reduction, not a polish pass — and ≤ 6% on the `MOVER=1` arm, which needs the rotating arm 0.3 is
-waiting on. Or a written argument that the remaining structure is *not* lattice-shaped and
-therefore belongs to Phase 2.
+**Exit gate:** modulation ≤ 4% on the emissive arm — **9.39% today**, so this is still a 2.3×
+further reduction, not a polish pass — **and falloff within 0.15 of −2.72**, which no shipped arm
+has ever met and which 1a proved can be lost while the modulation gate is being passed. ≤ 6% on
+the mover-path arm still stands, and the rotating arm adds a third: **detrended flicker ≤ 6% on
+`MODE=emissive SPIN=20`, against 7.48% today** (§1.4). Or a written argument that the remaining
+structure is *not* lattice-shaped and therefore belongs to Phase 2.
 
 **Do NOT** start Phase 2 to fix blockiness if Phase 1 gets there. Phase 2's justification is
 mover/emissive *fidelity* and the emitter cap — it is worth doing on those grounds alone, but it
 is a much larger change and it must not be sold as a blockiness fix on the strength of the merge
-result: that fix took a quarter of the amplitude and none of the block scale.
+result: two kernel fixes took 36% of the amplitude between them and **none of the block scale**.
+0.4's falsification narrows the justification further — the **mover** path's detrended flicker is
+already 0.48% (§1.4), so Phase 2's mover half cannot be sold as a flicker fix at all. The 7.48%
+lives on the **emissive** path, and only the emissive half of Phase 2 (plus Phase 3) can claim it.
 
 ---
 
 ## 6. Phase 2 — Surface Radiance Cache (movers + emissive meshes)
 
 **The structural change. This is the "something better than voxels" the whole plan is for.**
+
+**Part 1 is shipped** (`7bc24f1`): `src/modules/gi/surfaceCache.js` — CPU card builder, atlas,
+rect packing, concavity detector — plus `scripts/run-gi-surface-cache-test.mjs`, mutation-tested.
+Nothing GPU-side exists yet. Building it forced **six corrections to this section**, each marked
+inline below; the design as written before 2026-08-07 was wrong on memory by 4×, self-contradictory
+on card count, and under-specified on three constants.
 
 ### 6.1 What it replaces
 
@@ -380,25 +549,62 @@ holds** — see §6.5.
 
 ### 6.2 Cards, not UVs
 
-Each cached object gets K orthographic **cards**. A card is a projection of the object onto one
-axis-aligned plane in *object space*, rasterized into a shared atlas rect.
+Each cached object gets a **fixed table of 6 orthographic cards** (±x, ±y, ±z). A card is a
+projection of the object onto one axis-aligned plane in *object space*, rasterized into a shared
+atlas rect.
 
 Why cards and not mesh UVs: a card lookup needs only the object's inverse world matrix and its
 half-extents — **both already in the header, words 0..15 and 16..18**. No mesh UV attribute, no
 per-triangle attribute fetch, no index indirection in the hot kernel. That is exactly why Lumen
 uses them.
 
-Card count by shape, reusing `classifyDynamicShape`'s existing taxonomy:
+**Correction (b): the slot table is ALWAYS 6. "plane: 2 cards" was wrong** — it contradicted
+§6.4's own `argmax` lookup, which indexes the table directly and therefore needs a **constant
+stride**. A variable card count means a per-object indirection in the hot kernel, which is the one
+thing §6.2 exists to avoid, and §6.3 already says 48 words. So: every object gets **6 slots**;
+what varies is how many are **active** and how many **atlas rects** are allocated. A plane
+activates 2 and allocates 2 rects; the other 4 slots are marked inactive and cost 4 words of
+zeros, not memory.
 
-| classified type | cards | note |
-|---|---|---|
-| OBB (box, plane) | 6 (plane: 2) | a zero-thickness OBB is the exact rectangle already |
-| sphere / capsule / frustum | 6 | analytic shapes, cheap to rasterize |
-| BVH mesh | 6 default, `__giSrcCards` to raise | Lumen's known failure mode is concave meshes; §6.7 |
+| classified type | active slots | atlas rects | note |
+|---|---|---|---|
+| OBB — box | 6 | 6 | |
+| OBB — plane | 2 | **2** | a zero-thickness OBB is the exact rectangle already; 4 slots inactive |
+| sphere / capsule / frustum | 6 | 6 | analytic shapes, cheap to rasterize |
+| BVH mesh | 6 | 6 | Lumen's known failure mode is concave meshes; §6.7 |
 
-Card resolution is **screen-projected**, allocated at adopt time and re-allocated on a large
-distance change: `res = clamp(round(k · worldSize / distance), 8, 128)`. A 30 m-away crate gets
-16², a 2 m-away one gets 128². This is the memory governor, and it is also the LOD story.
+**A hit that lands on an inactive slot takes the header mean-albedo fallback — the exact same path
+a §6.7-demoted object takes.** One fallback, not two. That is the whole reason inactive slots are
+cheap to allow.
+
+**Correction (c): `__giSrcCards` cannot raise the card count, and now means something else.**
+"6 default, `__giSrcCards` to raise" had nowhere to go: card-table word 4 is `axis|sign` = **6
+representable states**, and §6.4's lookup is an `argmax` over **3 axes**. A 7th *direction* is
+unrepresentable in both. Reinterpreted as **depth-peel layers in the same six directions**:
+
+```
+slot = layer·6 + axis·2 + signBit
+```
+
+which is also the only version of the knob that addresses the concave failure mode at all — on the
+fin-array test mesh, argmax-card coverage goes **28.5% → 65.6% at 4 layers**. **Default stays 1
+layer**, which keeps §6.4's ~15-ALU lookup exactly as written. **Layers > 1 need a layer-selection
+step in the hot path that §6.4's budget does not cover** — depth-compare against `srcGeometry.b`
+per layer — so multi-layer is §12's Phase 2c, not a flag anyone flips.
+
+**Correction (d): the resolution formula had no `k` and no aspect rule.** Written as
+`res = clamp(round(k · worldSize / distance), 8, 128)`, only **k = 480** satisfies both worked
+examples: a 1 m crate at 30 m → `480/30 = 16` → 16²; the same crate at 2 m → 240, which
+**reaches 128² only by hitting the clamp**, not by landing there. And a single `res` is wrong for
+anything non-cubic — the card table already carries `resU|resV` as separate half-words (§6.3), so
+the two in-plane extents are clamped **independently**:
+
+```
+resU = clamp(round(480 · extentU / distance), 8, 128)      // and likewise resV
+```
+
+Allocated at adopt time, re-allocated on a large distance change. This is the memory governor and
+it is also the LOD story.
 
 ### 6.3 Data layout
 
@@ -410,13 +616,31 @@ distance change: `res = clamp(round(k · worldSize / distance), 8, 128)`. A 30 m
 | `srcGeometry` | rgba16f — oct normal.rg + object-space depth.b + emissive luminance.a | once per mesh | lighting pass |
 | `srcRadiance` | rgba16f — outgoing radiance.rgb + age.a | **per frame** (staggered) | **the trace kernels** |
 
-Only `srcRadiance` is bound in the hot path — **one extra sampled texture**. Start at 2048²
-(≈ 25 MB across the three at rgba16f) and tier it like `dynamicObjectWords` already tiers.
+Only `srcRadiance` is bound in the hot path — **one extra sampled texture**.
+
+**Correction (a): the memory figure was wrong by 4×.** At rgba16f (8 B/texel), 2048² is 33.6 MB
+per texture and **100.7 MB across the three** — not the "≈ 25 MB" written here before. **25 MB is
+the 1024² figure.** That changes the default: **start at 1024²** and tier up like
+`dynamicObjectWords` already tiers, rather than opening at a tenth of a gigabyte of atlas on a
+laptop.
+
+| atlas | per texture | all three |
+|---|---|---|
+| 1024² | 8.4 MB | **25.2 MB** |
+| 2048² | 33.6 MB | **100.7 MB** |
 
 **Card table:** 8 words per card — `[u0, v0, du, dv, axis|sign, resU|resV, objIdx, flags]`.
-6 cards = 48 words per object. Lives in the **reserved tail of the occupancy bits buffer**,
-exactly where `OBJ_WORDS` and the BVH pool already live (`dynamicObjectWordOffset`). Object block
-word **+23 is free** — it becomes the card-table base offset. Zero new storage bindings.
+**6 slots always** (§6.2's correction b) = 48 words per object, constant stride. Lives in the
+**reserved tail of the occupancy bits buffer**, exactly where `OBJ_WORDS` and the BVH pool already
+live (`dynamicObjectWordOffset`). Object block word **+23** becomes the card-table base offset.
+Zero new storage bindings.
+
+**Correction (f): +23 is confirmed free, and now locked — but the comment beside it is stale.**
+The repo-wide scan came back clean: **no write, no read, anywhere**. `run-gi-surface-cache-test`
+**locks that with a source scan**, so a future writer to +23 fails the test instead of corrupting
+card lookups silently. The trap next door: the comment at `dynamicObjects.js:50-83` says
+`16 + i*40` while `DYN_HEADER_RESERVED = 48`, so anyone deriving the card word from the comment
+lands **32 bytes short**. Read the constant, not the comment.
 
 ### 6.4 The lookup (hot path, ~15 ALU)
 
@@ -426,10 +650,18 @@ riding the vec4's `pen` slot), the exact hit point, and an oct-packed normal. So
 ```
 pLocal  = invWorld · P                       // words 0..15, already loaded for the slab test
 axis    = argmax |dot(nLocal, ±e_k)|         // 3 compares, no branch
+slot    = axis·2 + signBit                   // constant stride 8 words; layer 0 (§6.2 correction c)
+if (!(flags & ACTIVE)) → header mean albedo  // inactive slot = the §6.7 fallback, same path
 (s, t)  = the two pLocal coords ⊥ axis, / halfExtents  →  [0,1]²
 uv      = cardRect.xy + (s, t) · cardRect.zw
 rad     = textureSampleLevel(srcRadiance, linearSampler, uv, 0).rgb
 ```
+
+The `argmax` is over 3 axes and the slot index is a constant-stride offset — **that is why §6.2's
+table cannot be variable-length and why word 4 cannot carry a 7th direction.** With
+`__giSrcCards` > 1 the index becomes `layer·6 + axis·2 + signBit` and a per-layer depth compare
+against `srcGeometry.b` has to be added; **that compare is not in this 15-ALU budget**, which is
+why layers default to 1.
 
 Bilinear filtering across the card is free (hardware) and is what makes the result *continuous* —
 the property the trilinear voxel read was trying and failing to provide.
@@ -513,17 +745,28 @@ already been made once in this module and is called out in `giField.js`.
 
 Cards are an orthographic projection. A **concave** mesh (Lumen's documented limit: "importing an
 entire room with furniture as a single mesh is not expected to work well") has interior surfaces
-no card sees. Detection is cheap and must be done at card-build time: compare rasterized card
-coverage against the mesh's true surface area. Below a threshold, the object **keeps the header
-mean-albedo path** (which stays, and stays correct). Log the demotion by name so a content author
-can act on it — "split this mesh" is a real and normal answer.
+no card sees. Detection is cheap and is done at card-build time: compare rasterized card coverage
+against the mesh's true surface area. Below a threshold, the object **keeps the header mean-albedo
+path** (which stays, and stays correct) — the same fallback an inactive slot takes (§6.2). Log the
+demotion by name so a content author can act on it — "split this mesh" is a real and normal answer.
+
+**Correction (e): the threshold was unspecified, and so was what "coverage" measures.** It is
+**0.65**, and it separates cleanly: the convex test mesh measures **100.0%**, the concave fin
+array **28.5%**. Coverage is computed against the **argmax card only** — *not* the union of all
+six — because the argmax slot is the one §6.4's lookup actually reads, so union coverage would
+pass meshes whose reads still land on nothing. This is also the number `__giSrcCards` layers move:
+28.5% → 65.6% at 4 layers, i.e. depth peeling is what pulls a concave mesh back over the bar
+(§6.2's correction c).
 
 ### 6.8 Test plan
 
-- **`test:gi-surface-cache`** (new, CPU ground truth in the `test:gi-dynobj` mould): build cards
-  for the six default geometries + a custom mesh, verify (a) every surface point's chosen card
-  and UV round-trips to within a texel, (b) atlas rects never overlap, (c) the concave detector
-  fires on a deliberately concave test mesh and not on a convex one. Split failures into
+- **`test:gi-surface-cache`** — **SHIPPED** (`7bc24f1`, `scripts/run-gi-surface-cache-test.mjs`,
+  CPU ground truth in the `test:gi-dynobj` mould). Builds cards for the six default geometries +
+  a custom mesh and verifies (a) every surface point's chosen card and UV round-trips to within a
+  texel, (b) atlas rects never overlap, (c) the concave detector fires at the 0.65 threshold on
+  the fin array (28.5%) and not on a convex mesh (100.0%), (d) **object block word +23 is
+  untouched repo-wide**, by source scan. Mutation-tested: each assertion was confirmed to fail
+  when the code under it is broken, so a green run means something. Failures split into
   *structure bugs* vs *epsilon class* — that diagnostic shape is what convicted the BVH8 stride
   bug in minutes.
 - **`probe:gi-mover-bounce`** — the existing hue rig. Voxel path 30.1% red excess, header path
@@ -531,8 +774,9 @@ can act on it — "split this mesh" is a real and normal answer.
   rotation, which the header path already does and the voxel path does not.
 - **`probe:gi-block-size` with `MOVER=1`** — the block size at a mover hit must now be the card
   texel, i.e. below the measurement floor. This arm is **static** (`MOVER=1` tags mobility, it does
-  not animate — §4's 0.3), so it measures block size only; stability under rotation needs the
-  rotating arm.
+  not animate — §1.1), so it measures block size only. Stability under rotation is a **separate,
+  now-available arm**: `SPIN=20`, detrended, against the mover baseline of **0.48%** (§1.4). That
+  baseline is already low, so the bar here is "does not regress", not "improves".
 - **`gi-gpu-smoke`** — new arm `?srccache=1`. **Do not gate on the `storage=8` banner: it cannot
   fail.** Every value on `scripts/gi-gpu-smoke.html:701` is interpolated except that one, which is
   a hard-coded string literal — the old instruction here was a tautology. What the harness really
@@ -675,6 +919,12 @@ Each of these was proposed and killed by measurement. Re-proposing one costs a s
 - **Do not build a TLAS on cost grounds.** +0.007 ms/mover. Cap and scale are the only arguments.
 - **Do not look for a calibration constant for the promoted-vs-past-cap emissive gap.** 22% at
   r = 0.4 vs 66% at r = 1.2 — it is size-dependent, so no scalar exists.
+- **Do not "fix" the falloff by reverting `rayHitMode` to `occupancy-legacy`.** It overshoots:
+  −2.97 against a truth of −2.72, stable across three fit windows (§1.3). Reverting trades "bleed
+  reaches too far" for "bleed dies too fast" and the user will report the new one. The answer is
+  the tolerance between the modes (§5's 1d).
+- **Do not ship a merge change on the block rig's number alone.** `__giParallaxGateFade` measured
+  6.55% — past the gate — and cost 0.55 of falloff exponent (§5's 1a).
 - **Do not re-propose the ReSTIR GI module.** Deleted 2026-07-16. Phase 3's light tree is
   deliberately *not* reservoir-based: reservoirs need storage bindings we do not have and
   reintroduce the stochastic noise that forces the bilateral blur the user already objects to.
@@ -695,8 +945,28 @@ Each of these was proposed and killed by measurement. Re-proposing one costs a s
   resolution back.
 - **`MOVER=1` in the block rig does not move anything.** It tags the panel
   `giMobility: "dynamic"`, which switches the *path* that lights it; the panel stays static. Any
-  arm that is supposed to measure motion needs the rotating arm, not this flag. The tell is
-  `flick.rms` reading ~0 exactly as it does on the static arms.
+  arm that is supposed to measure motion needs **`SPIN=<deg/s>`**, not this flag. The tell is
+  `flick.rms` reading ~0 exactly as it does on the static arms. Every flicker number recorded in
+  this module before 2026-08-07 was taken on a still frame; discard them.
+- **Judge every merge change on BOTH rigs — block size AND bleed falloff.** They are not
+  correlated and at least one arm improves one by wrecking the other (`__giParallaxGateFade`:
+  6.55% modulation, the best ever measured, at −1.39 falloff, §5's 1a). A merge change with only
+  one number attached is not measured, it is half-measured.
+- **In the bleed rig, read the WHITE channel.** The red channel is bracket-limited on this rig and
+  its exponent is not comparable across arms; the probe now flags this automatically, but the
+  older recorded red numbers do not carry the flag.
+- **A hatch inside a `max()` whose other term dominates is inert by construction.** Two of Phase
+  1b's first three arms measured nothing for this reason (`viewDist·0.02 ≈ 0.16 ≫ 0.001`,
+  `cellMax·1.2 = 0.18 ≫ 0.001`). The tell is an **exact 0.00% change rms**, often with a nonsense
+  size like `−8195617107 m` from a divide-by-zero on an all-zero difference image. Before trusting
+  an "innocent" verdict, confirm the hatch actually changed the value the shader uses.
+- **A prop key that is in neither `onComponentProp`'s live route list nor `#structuralSignature`
+  does nothing at all.** Found twice on 2026-08-07 and both now fixed: `aoStrength`/`aoRadius` were
+  in neither, so the Inspector slider was inert while two comments claimed it was live (Phase 1b's
+  AO ablation was meaningless until this was fixed); `resolveMaxPixels`/`lightShadowMaxPixels` were
+  read from `component.props` but declared in **neither defaults nor schema**, so they were
+  unreachable from both the Inspector and MCP. Same class of bug, two directions. Adding a prop
+  means: defaults + schema + (live route **or** structural signature).
 - **Headless numbers do not extrapolate.** The probe's GI resolve is ~315k px against a real
   editor's 1.6M cap, and every screen pass is per-resolve-pixel. Use `profile.giPasses` in the
   user's editor for anything per-frame. On HiDPI the drawing buffer is ~4× the CSS size, which is
@@ -718,13 +988,19 @@ Each of these was proposed and killed by measurement. Re-proposing one costs a s
 
 ## 12. Sequencing
 
-| phase | what | depends on | size |
+| phase | what | depends on | status / size |
 |---|---|---|---|
-| 0 | verify + commit the tree; the four missing numbers | — | **done 2026-08-07, except 0.3** |
-| 1 | reconstruction floor **and** probe lattice — 0.2 returned both | 0 | 1–2 sessions |
-| 2 | Surface Radiance Cache — movers + emissive | 0 | 3–4 sessions |
-| 3 | light tree + NEE; delete `MAX_EMITTERS` | 2 | 2 sessions |
-| 4 | extend cache to static slots; retire voxel radiance | 2, 3 | 2–3 sessions |
+| 0 | verify + commit the tree; the four missing numbers | — | **DONE 2026-08-07, all five items** |
+| 1a | parallax kernel — fix the second moment, not just the centre | 0 | **DONE**, `923cd78` — 9.39%, −2.18 |
+| 1b | find the 0.196 m block-size floor's owner | 0 | **RAN, NO OWNER** — bilateral, AO, normal-offset scale all cleared (§5) |
+| **1d** | **merge visibility tolerance → land falloff on −2.72** | 0 | **OPEN — highest value in this table, ≲ 1 session** |
+| 1c | RC literature fixes (bilinear fix, Bilinear 3D, non-linear accumulation) | 0 | open, 1 session |
+| 1e | ringing check on the stored ACF curves | 0 | open, ~1 hour |
+| 2a | surface cache, CPU half — card builder, atlas, packing, concavity | 0 | **DONE**, `7bc24f1` |
+| 2b | surface cache, GPU half — atlas textures, lighting pass, hot-path lookup | 2a | 2–3 sessions |
+| 2c | depth-peel layers (`__giSrcCards` > 1) for concave meshes | 2b | 1 session, only if demotions are common |
+| 3 | light tree + NEE; delete `MAX_EMITTERS` | 2b | 2 sessions |
+| 4 | extend cache to static slots; retire voxel radiance | 2b, 3 | 2–3 sessions |
 | 5 | subgroups | — (parallel) | 1 session |
 | 6 | TLAS over movers | — | 1 session, on demand |
 | 7 | sparse hashmap probes (Split RC) | 1 | 3+ sessions |
@@ -733,9 +1009,16 @@ Each of these was proposed and killed by measurement. Re-proposing one costs a s
 Phases 5 and 8 are independent of the main line and can be picked up whenever the main line is
 blocked on a measurement.
 
-**Phase 0 has returned. Start at Phase 1, both branches (§5)** — the screen-side ablation for the
-~0.196 m floor and the merge/reconstruction work for the 6.2 unexplained points, in that order,
-one dial at a time. 0.3's flicker number lands when the rotating arm does.
+**Start at 1d (§5), out of numeric order and ahead of the rest of Phase 1.** It is the only open
+item in this document that lands directly on the user's stated complaint — "too strong, reaches
+too far" — the target (−2.72) is analytic, both bracketing endpoints are already measured on the
+shipped kernel (−2.18 and −2.97), the dial exists (`__giMergeVisTol`), and it is **tuning, not a
+rewrite**. Everything else in Phase 1 is worth less per session: 1b has already spent a run and
+returned no owner, and 1c is speculative literature work.
+
+After 1d: 1c, then 2b. 1b stays open but is no longer a scheduled item — pick it up only if a new
+suspect appears, because the three obvious ones are now eliminated and the block-scale floor is
+not what the user is complaining about.
 
 ---
 
