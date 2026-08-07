@@ -3786,15 +3786,26 @@ export class GISystem {
       // so the default graph is unchanged. Powers of two only — dirRes doubles
       // per cascade level and a non-power-of-two would desynchronise the 2x2
       // angular-child block the merge indexes with `v*2*parent.dirRes + u*2`.
-      // `r >= 2` and not merely `Number.isFinite`: `Number(null)` and `Number("")`
-      // are 0, which IS finite, so a scene storing `c0DirRes: null` would fall
-      // through the clamp and land on 2 — the DIAGNOSTIC config that
-      // cascadeMerge.js:389-394 records as over-steepening the falloff to -5.38.
-      // Unset, null, empty and junk must all mean "the shipped 4".
+      // DO NOT COERCE `props.c0DirRes`. The `=== 2` is strict ON PURPOSE and the
+      // reason is a live scene, not a style preference: the user's Sponza stores
+      // `c0DirRes: "2"` — a STRING, almost certainly an Inspector serialization
+      // artifact — and `"2" === 2` is false, so that scene has always rendered at
+      // 4. Adding a `Number()` coercion here (tried 2026-08-07, reverted the same
+      // hour) makes the stale value take effect and drops the probe to 4
+      // directions total, which smears every bounce over a huge solid angle: the
+      // scene went visibly flat and bright. That is the exact mirror of the
+      // dead-knob bugs fixed elsewhere this session — a knob that was silently
+      // IGNORED becoming silently HONOURED is just as much a regression, and it
+      // changes what a user's saved project looks like without them touching it.
+      //
+      // The harness override lives on a global instead, so it can never reach a
+      // scene file. `scripts/run-gi-bleed.mjs`'s C0DIR env sets it.
       c0DirRes: (() => {
-        const r = Number(props.c0DirRes);
-        if (!Number.isFinite(r) || r < 2) return 4;
-        return Math.max(2, Math.min(16, 2 ** Math.round(Math.log2(Math.min(16, r)))));
+        const g = Number(globalThis.__giC0DirRes);
+        if (Number.isFinite(g) && g >= 2) {
+          return Math.max(2, Math.min(16, 2 ** Math.round(Math.log2(Math.min(16, g)))));
+        }
+        return props.c0DirRes === 2 ? 2 : 4;
       })(),
       t0: probeSpacing,
       farT: Math.max(sizeX, sizeY, sizeZ) * 2,

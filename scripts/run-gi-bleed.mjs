@@ -181,7 +181,8 @@ if (process.env.BOUNCE !== undefined) giOverrides.bounce = Number(process.env.BO
 // the base direction count must make it measurably WORSE and nothing else in
 // the rig changes. This is the discriminator between an angular-sampling cause
 // and a merge-weighting one.
-if (process.env.C0DIR) giOverrides.c0DirRes = Number(process.env.C0DIR);
+// C0DIR is NOT set here — it goes on a global, and GLOBALS is declared further
+// down, so the wiring lives beside it. See the note there.
 if (process.env.CASCADES) giOverrides.cascadeCount = Number(process.env.CASCADES);
 if (VOXEL || PROBE) {
   giOverrides.quality = "custom";
@@ -220,6 +221,14 @@ const HATCH = (process.env.HATCH ?? "").split(",").map((s) => s.trim()).filter(B
 // GLOBALS='__giGatherViewBias=0' — numeric live knobs, which HATCH (true only)
 // cannot express. Set before load because several are read at shader build time.
 const GLOBALS = (process.env.GLOBALS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+// C0DIR rides a GLOBAL, never the scene prop. GISystem deliberately does NOT
+// coerce `props.c0DirRes` — a real project stores the STRING "2", `"2" === 2` is
+// false, so that project has always rendered at 4; adding a Number() coercion
+// there (2026-08-07) made the stale value take effect, dropped it to 4 total
+// directions, and the scene went visibly flat and bright. A harness knob must not
+// be able to reach a scene file. Set AFTER the GLOBALS split so it survives an
+// empty GLOBALS env.
+if (process.env.C0DIR) GLOBALS.push(`__giC0DirRes=${Number(process.env.C0DIR)}`);
 await page.evaluateOnNewDocument((project, hatch, globals) => {
   localStorage.setItem("engine.projectRoot.v1", project);
   localStorage.setItem("engine.recentProjects.v1", JSON.stringify([project]));
