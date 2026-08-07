@@ -40,6 +40,23 @@
 // deterministic — anything left is the sampling cadence (traceParity /
 // feedbackParity / the checker), which is the "dithered" half of the report.
 //
+// …AND SPIN MAKES IT MEAN SOMETHING. A settled static scene answers "is a frame
+// reproducible", and the answer is yes (rms ~0). The user's complaint is about a
+// ROTATING box, so SPIN advances the panel's yaw BETWEEN the per-arm frames and
+// the same difference now answers "does a mover's rotation make the bleed jump,
+// and at what size". Frame 0 is still shot at yaw 0 in every arm, so the block
+// size, the modulation and the arm-vs-arm differential are measured on exactly
+// the pose the non-SPIN sweep measures — only `flicker%` and `flick size`
+// change meaning. (The panel is reset to yaw 0 at the top of each arm; letting
+// it accumulate across arms would make the arm ÷ finest-arm differential a
+// comparison of two ORIENTATIONS instead of two lattices.)
+//
+// A rotated panel also changes the floor's TRUE irradiance, so `flicker%` under
+// SPIN is mostly the panel honestly turning. The report therefore grows a
+// `detr` pair: the same frame difference with a per-line cubic fitted out, which
+// the smooth relighting goes into and a lattice pop does not. Believe `detr
+// size` over `flick size` whenever SPIN is on.
+//
 //   node node_modules/vite/bin/vite.js --port 5201 --strictPort
 //   node scripts/run-gi-block-size.mjs
 //
@@ -52,10 +69,39 @@
 //   MODE=emissive|albedo      panel emits, or a sun lights a green panel
 //   MOVER=1            pin the panel `giMobility: "dynamic"` (exact mover,
 //                      no voxels of its own — the user's rotating-box case)
+//   SPIN=<deg/s>       yaw the panel about Y between the per-arm frames, in
+//                      DEGREES PER SECOND of the FRAME_GAP (700 ms) between
+//                      them. Unset/0 = the old still-panel behaviour, byte for
+//                      byte. SPIN=1 is an ALIAS for the default 20 deg/s (14° of
+//                      yaw per frame gap, 28° across the default 3 frames) — a
+//                      literal one degree per second is therefore unreachable;
+//                      ask for 1.001 if you want it. The alias exists so that
+//                      `SPIN=1` keeps meaning "spin the mover" the way it
+//                      already does in run-gi-real-shadow-probe.mjs and
+//                      run-gi-shadow-perf-probe.mjs, which both read it as a
+//                      plain boolean and then spin at a hardcoded 0.6 rad/s
+//                      (~34 deg/s) on TWO axes. This rig is single-axis, in
+//                      degrees, and slower — see the clearance budget below.
+//                      SPIN implies MOVER=1: a rotating panel that still owns
+//                      voxels measures re-voxelization, not the mover path.
+//                      20 and not something brisker because the panel is 2m WIDE
+//                      and only 0.2m thick: yawing it swings its footprint from
+//                      x=0 towards the patch, which starts at x=0.6. It arrives
+//                      at ~38° of total yaw, so a sweep past that has the panel
+//                      standing in its own measurement. The harness computes the
+//                      swept footprint for the actual SPIN×FRAMES and refuses to
+//                      start when it crosses the patch edge.
 //   FRAMES=3           frames captured per arm for the flicker metric
 //   SETTLE=12000       ms after each rebuild
 //   SHOT=<dir>         frame dumps
 //   GLOBALS=a=1,b=0    live GI knobs set before any module runs
+//   PROPS=k=v,k=v      GlobalIlluminationComponent props, applied ONCE after
+//                      load and before any arm — the control-arm dial. Same
+//                      coercion as GLOBALS. `PROPS=aoStrength=0` is the AO
+//                      control arm: AO multiplies the gather output directly
+//                      (giScreen's obscurance ladder) and its radius is 0.6
+//                      FIXED METRES, which makes it a fixed-metre suspect in
+//                      exactly the way the material-side bilateral is.
 //   HEADED=1
 import path from "node:path";
 import { mkdir, writeFile } from "node:fs/promises";
@@ -72,10 +118,23 @@ const PROBES = nums(process.env.PROBES, "0.25,0.375,0.55,0.8");
 const BASE_VOXEL = Number(process.env.BASE_VOXEL ?? 0.15);
 const BASE_PROBE = Number(process.env.BASE_PROBE ?? 0.375);
 const MODE = process.env.MODE ?? "emissive";
-const MOVER = process.env.MOVER === "1";
+// SPIN, in degrees per second. `SPIN=1` is the alias for the default (see the
+// header) — everything else is taken literally, including a negative value,
+// which spins the other way. Unset, empty or unparseable is 0 = off.
+const SPIN_DEFAULT = 20;
+const SPIN_RAW = Number(process.env.SPIN ?? 0);
+const SPIN = !Number.isFinite(SPIN_RAW) ? 0 : SPIN_RAW === 1 ? SPIN_DEFAULT : SPIN_RAW;
+// A spinning panel that is NOT on the exact-mover path re-voxelizes every frame,
+// so the difference between two frames would be the voxelizer's own churn rather
+// than the mover's. Force it rather than measure the wrong thing quietly.
+const MOVER = process.env.MOVER === "1" || SPIN !== 0;
 const FRAMES = Number(process.env.FRAMES ?? 3);
 const SETTLE = Number(process.env.SETTLE ?? 12000);
 const SHOT = process.env.SHOT ?? ".gi-shots/block-size";
+// The gap between the per-arm frames, and — under SPIN — the interval the
+// angular speed is integrated over.
+const FRAME_GAP = 700;
+const SPIN_STEP_DEG = SPIN * (FRAME_GAP / 1000);
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Clamp warnings BEFORE the run rather than a puzzling flat curve after it:
@@ -86,9 +145,53 @@ const tooDense = PROBES.filter((v) => v < BLOCK_RIG.minProbe);
 if (tooFine.length) console.log(`  !! voxel sizes below ${BLOCK_RIG.minVoxel.toFixed(3)} clamp at MAX_AXIS_RES: ${tooFine.join(", ")}`);
 if (tooDense.length) console.log(`  !! probe spacings below ${BLOCK_RIG.minProbe.toFixed(3)} clamp at MAX_PROBE_AXIS: ${tooDense.join(", ")}`);
 
+// SPIN's own clamp, and the same kind of failure: the panel is a 2m x 0.2m box
+// centred at x = -panelT/2, so yawing it swings the wide face's corners towards
+// +x at (panelT/2)|cos| + (panelW/2)|sin|. The measured patch starts at x0 =
+// 0.6, and the footprint reaches it at ~38 deg. Past that the "flicker" is the
+// panel itself entering frame — the largest possible signal, and not a GI one.
+// (The panel's TOP corners lean the other way, to a ground-equivalent x of
+// -0.58 at rest, so the footprint is always the binding edge.)
+const sweptMaxX = (deg) => {
+  const t = (deg * Math.PI) / 180;
+  return -BLOCK_RIG.panelT / 2
+    + Math.abs((BLOCK_RIG.panelT / 2) * Math.cos(t))
+    + Math.abs((BLOCK_RIG.panelW / 2) * Math.sin(t));
+};
+if (SPIN) {
+  const yaws = Array.from({ length: Math.max(FRAMES, 1) }, (_, i) => Math.abs(i * SPIN_STEP_DEG));
+  const worst = Math.max(...yaws.map(sweptMaxX));
+  if (worst >= BLOCK_RIG.patch.x0) {
+    // Largest whole-degree step that still clears the patch, converted back to
+    // deg/s over the frame gap, so the operator gets a value and not a puzzle.
+    let maxStep = 0;
+    for (let d = 1; d <= 90; d++) {
+      if (sweptMaxX(d * (FRAMES - 1)) >= BLOCK_RIG.patch.x0) break;
+      maxStep = d;
+    }
+    console.log(
+      `FATAL: SPIN=${SPIN} deg/s over ${FRAMES} frames yaws the panel to ${Math.max(...yaws).toFixed(1)}°, ` +
+        `whose footprint reaches x=${worst.toFixed(3)} — the patch starts at x=${BLOCK_RIG.patch.x0}. ` +
+        `The panel would stand inside its own measurement.\n` +
+        `       Use SPIN<=${((maxStep * 1000) / FRAME_GAP).toFixed(1)} at FRAMES=${FRAMES}, or fewer FRAMES.`,
+    );
+    process.exit(1);
+  }
+  console.log(`  spin clearance: worst-frame footprint reaches x=${worst.toFixed(3)}, patch starts at x=${BLOCK_RIG.patch.x0} — clear by ${(BLOCK_RIG.patch.x0 - worst).toFixed(3)}m`);
+}
+
 await makeBlockRigProject(GEN_ROOT, { voxelSize: BASE_VOXEL, probeSpacing: BASE_PROBE, mover: MOVER });
 console.log(`  generated block rig at ${GEN_ROOT}`);
 console.log(`  mode ${MODE}${MOVER ? " (panel pinned as an EXACT MOVER)" : ""}   sweeps: ${SWEEP.join(", ")}`);
+if (SPIN) {
+  if (process.env.MOVER !== "1") console.log(`  SPIN forced MOVER=1 — a spinning panel has to be on the exact-mover path`);
+  console.log(
+    `  spin ${SPIN} deg/s${SPIN_RAW === 1 ? " (SPIN=1 → the default)" : ""}: the panel yaws ` +
+      `${SPIN_STEP_DEG.toFixed(2)}° between frames, ${(SPIN_STEP_DEG * (FRAMES - 1)).toFixed(2)}° across an arm. ` +
+      `Frame 0 is still yaw 0, so only the flicker columns change meaning.`,
+  );
+  if (FRAMES < 2) console.log(`  !! FRAMES=${FRAMES}: with fewer than 2 frames there is no difference to spin, and no flicker metric at all`);
+}
 await mkdir(SHOT, { recursive: true });
 
 const browser = await puppeteer.launch({
@@ -317,7 +420,11 @@ async function analyze(frameB64s) {
      * patch is absorbed by the cubic. The patch span is printed so that ceiling
      * is visible next to any number this produces.
      */
-    function lineResidual(field, axis) {
+    // `denomFixed > 0` overrides the per-line mean with a constant, which is
+    // what the FLICKER path needs: a frame difference is already a fraction of
+    // the level and its per-line mean is ~0, so dividing by that mean would
+    // explode. Omitted (the default) reproduces the original behaviour exactly.
+    function lineResidual(field, axis, denomFixed = 0) {
       const outer = axis === "x" ? h : w;
       const inner = axis === "x" ? w : h;
       const get = (o, i) => (axis === "x" ? field[o * w + i] : field[i * w + o]);
@@ -343,7 +450,7 @@ async function analyze(frameB64s) {
         lines++;
         if (mean < 2e-3) dark++;
         const coef = solve(A, bv);
-        const denom = Math.max(mean, 1e-6);
+        const denom = denomFixed > 0 ? denomFixed : Math.max(mean, 1e-6);
         for (let i = 0; i < inner; i++) {
           const t = (2 * i) / (inner - 1) - 1;
           const fit = coef ? coef[0] + coef[1] * t + coef[2] * t * t + coef[3] * t * t * t : mean;
@@ -435,7 +542,28 @@ async function analyze(frameB64s) {
       const real = rms > 3e-3;
       const dx = real ? acf(diff, "x", maxLagX) : null;
       const dz = real ? acf(diff, "z", maxLagZ) : null;
-      flick = { rms, halfX: dx?.halfC ?? NaN, halfZ: dz?.halfC ?? NaN, curveX: dx?.curve.slice(0, 16) ?? null };
+      // DETRENDED FLICKER — only ever non-null under SPIN, because a still
+      // scene's difference never clears `real`.
+      //
+      // A panel that has ROTATED between the two frames changes the floor's
+      // TRUE irradiance as well as whatever the machinery adds: the emitting
+      // face turns, its projected solid angle shrinks, the cosine term slides.
+      // All of that is smooth and patch-sized, it dominates `rms`, and it drags
+      // the raw ACF's half-width up towards the patch — so the raw pair alone
+      // cannot tell "the mover popped" from "the mover legitimately dimmed".
+      // Removing the same per-line cubic the single-frame residual removes (but
+      // NOT re-normalising — `diff` is already a fraction of the level) leaves
+      // only structure too small to be relighting. THAT is the pop.
+      const dtx = real ? lineResidual(diff, "x", 1) : null;
+      const dtz = real ? lineResidual(diff, "z", 1) : null;
+      const dxd = dtx ? acf(dtx.resid, "x", maxLagX) : null;
+      const dzd = dtz ? acf(dtz.resid, "z", maxLagZ) : null;
+      flick = {
+        rms, halfX: dx?.halfC ?? NaN, halfZ: dz?.halfC ?? NaN, curveX: dx?.curve.slice(0, 16) ?? null,
+        detrended: dxd
+          ? { rms: dxd.rms, halfX: dxd.halfC, halfZ: dzd?.halfC ?? NaN, curveX: dxd.curve.slice(0, 16) }
+          : null,
+      };
     }
 
     return {
@@ -562,11 +690,98 @@ async function shoot(tag) {
   return shot.__image.base64;
 }
 
+/**
+ * Absolute yaw, in degrees, about the panel's own centre (its local origin IS
+ * its centre — the box mesh is placed by `position`, not by an offset pivot),
+ * so a spin sweeps the emitting face past the patch without translating it.
+ *
+ * ABSOLUTE, not incremental: `entity.setTransform` is undoable and goes through
+ * the command bus, so an increment read back from a stale `panel.transform`
+ * would drift. The x and z channels are carried over from the rig's authored
+ * rotation instead of being zeroed, which keeps this correct if the rig ever
+ * ships a tilted panel.
+ *
+ * STEPPED, and deliberately not the rAF loop run-gi-real-shadow-probe.mjs uses.
+ * That probe wants CONTINUOUS motion because it is timing frames and watching
+ * the adoption lifecycle; this one measures the SIZE of structure in a settled
+ * image, and a continuously-spinning capture smears the thing being sized. So
+ * the panel jumps one step, holds for the whole FRAME_GAP, and is photographed
+ * at rest. The risk that buys — a mover demoted back to the voxel path while it
+ * sits still — is what the `movers N→N` readback per arm is there to catch, and
+ * an explicit `giMobility: "dynamic"` pin is supposed to hold through rest
+ * (gi-gpu-smoke's dynobj=7 arm asserts exactly that).
+ */
+const panelBaseRot = panel.transform?.rotation ?? [0, 0, 0];
+async function setPanelYawDeg(deg) {
+  await must("entity.setTransform", {
+    id: panel.id,
+    rotation: [panelBaseRot[0], panelBaseRot[1] + (deg * Math.PI) / 180, panelBaseRot[2]],
+  });
+}
+
 // ---- albedo mode needs the sun on --------------------------------------------
 if (MODE === "albedo") {
   await must("component.setProp", { id: panel.id, type: "mesh", key: "material", value: `${GEN_ROOT}/materials/PanelGreen.mat` });
   await must("component.setProp", { id: sun.id, type: "light", key: "intensity", value: BLOCK_RIG.sunIntensity });
   await wait(4000);
+}
+
+// ---- PROPS: arbitrary GI component props, applied once before any arm --------
+// The sweep only ever drives voxelSize/probeSpacing, and GLOBALS only reaches
+// the `__gi*` build-time hatches — every DECLARED prop was out of reach, which
+// made a control arm like `aoStrength=0` impossible without hand-editing the
+// generated project between runs. Applied ONCE here, so every arm of a run
+// shares the same component state and the sweep still measures only its dial.
+//
+// Coercion is GLOBALS' exactly (that parser lives inside evaluateOnNewDocument
+// and cannot be shared across the page boundary, so it is mirrored, not
+// factored): "true"/"false" → boolean, anything Number-parseable → Number,
+// everything else stays a string — so `debugProbes=occupancy` works too.
+const PROPS = (process.env.PROPS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+if (PROPS.length) {
+  const before = built;
+  const applied = [];
+  let propVoxel = null;
+  for (const spec of PROPS) {
+    const eq = spec.indexOf("=");
+    if (eq < 0) {
+      console.log(`  !! PROPS entry "${spec}" has no '=' — skipped`);
+      continue;
+    }
+    const key = spec.slice(0, eq).trim();
+    const raw = spec.slice(eq + 1).trim();
+    const value = raw === "true" ? true : raw === "false" ? false : Number.isFinite(Number(raw)) ? Number(raw) : raw;
+    await must("component.setProp", { id: giEntity.id, type: "global-illumination", key, value });
+    if (key === "voxelSize" && typeof value === "number") propVoxel = value;
+    applied.push(`${key}=${typeof value === "string" ? value : JSON.stringify(value)}`);
+  }
+  console.log(`  props: ${applied.join(" ")} → global-illumination`);
+  // THE STRUCTURAL-PROP GUARD. GISystem's onComponentProp routes a fixed key
+  // list to #applyLiveProps and sends everything else to a structural-signature
+  // comparison, so a prop that IS structural needs the signature to actually
+  // move before it means anything. Since PROPS takes arbitrary keys, force the
+  // rebuild rather than assume: give the writes a beat to rebuild on their own,
+  // and if they did not, nudge voxelSize by 1e-4 — a real value change (so the
+  // signature moves and #rebuild re-enters), but small enough that
+  // `round(size/0.1501) == round(size/0.15)` leaves the built grid identical.
+  // A rebuild also re-runs GICascadeLightNode.setup, which is where the
+  // material-side __gi* hatches are read — so a PROPS run and an ABLATE run
+  // land their settings by the same mechanism.
+  //
+  // BELT AND BRACES for AO specifically, not load-bearing: `aoStrength` and
+  // `aoRadius` used to be in NEITHER route (live uniforms that nothing ever
+  // wrote — the Inspector slider was dead too), which is what this nudge was
+  // originally written to work around. Fixed in GISystem 2026-08-07; they now
+  // reach #applyLiveProps directly and land the next frame. The nudge stays
+  // because it is still correct for genuinely structural keys.
+  await wait(1500);
+  if (built === before) {
+    const nudged = (propVoxel ?? BASE_VOXEL) + 1e-4;
+    console.log(`    no rebuild followed — nudging voxelSize to ${nudged} so the props actually take effect`);
+    await must("component.setProp", { id: giEntity.id, type: "global-illumination", key: "voxelSize", value: nudged });
+    for (let k = 0; k < 60 && built === before; k++) await wait(500);
+  }
+  await wait(SETTLE);
 }
 
 const f = (v, w = 7, p = 3) => (Number.isFinite(v) ? v.toFixed(p) : "-").padStart(w);
@@ -624,8 +839,11 @@ if (process.env.ABLATE) {
 
 // ---- the arms ----------------------------------------------------------------
 const arms = [];
-if (SWEEP.includes("voxel")) for (const v of VOXELS) arms.push({ dial: "voxel", voxelSize: v, probeSpacing: BASE_PROBE });
-if (SWEEP.includes("probe")) for (const p of PROBES) arms.push({ dial: "probe", voxelSize: BASE_VOXEL, probeSpacing: p });
+// `spin`/`spinStepDeg`/`mover` ride along on every arm so a JSON dump is
+// self-describing — a still sweep and a spinning one are the same shape.
+const armMeta = { mode: MODE, mover: MOVER, spin: SPIN, spinStepDeg: SPIN_STEP_DEG, frames: FRAMES, frameGapMs: FRAME_GAP };
+if (SWEEP.includes("voxel")) for (const v of VOXELS) arms.push({ dial: "voxel", voxelSize: v, probeSpacing: BASE_PROBE, ...armMeta });
+if (SWEEP.includes("probe")) for (const p of PROBES) arms.push({ dial: "probe", voxelSize: BASE_VOXEL, probeSpacing: p, ...armMeta });
 
 const results = [];
 for (const arm of arms) {
@@ -634,21 +852,38 @@ for (const arm of arms) {
   await must("component.setProp", { id: giEntity.id, type: "global-illumination", key: "voxelSize", value: arm.voxelSize });
   await must("component.setProp", { id: giEntity.id, type: "global-illumination", key: "probeSpacing", value: arm.probeSpacing });
   for (let i = 0; i < 60 && built === before; i++) await wait(500);
+  // Back to yaw 0 BEFORE the settle, so the arm settles on the pose frame 0 is
+  // shot at and the block-size/differential columns stay comparable across arms.
+  if (SPIN) await setPanelYawDeg(0);
   await wait(SETTLE);
   const state = await builtState();
   const shots = [];
   for (let f = 0; f < FRAMES; f++) {
+    // Same cadence as the still sweep — shoot, gap, shoot — with the yaw
+    // advanced at the top of each gap so the panel has the whole FRAME_GAP to
+    // re-adopt, re-trace and settle before the shutter opens.
+    if (f > 0) {
+      if (SPIN) await setPanelYawDeg(f * SPIN_STEP_DEG);
+      await wait(FRAME_GAP);
+    }
     shots.push(await shoot(f === 0 ? tag : `${tag}-f${f}`));
-    if (f < FRAMES - 1) await wait(700);
   }
   const m = await analyze(shots);
-  results.push({ arm, state, m, shot: shots[0] });
+  // Under SPIN the only thing that can silently void the arm is the mover
+  // falling off the exact path mid-spin, so read the adoption count back after
+  // the frames as well as before them.
+  const stateAfter = SPIN ? await builtState() : null;
+  results.push({ arm, state, ...(stateAfter ? { stateAfter } : {}), m, shot: shots[0] });
   const cell = state.cell?.x ?? NaN;
   console.log(
     `  ${tag.padEnd(26)} built cell ${cell?.toFixed?.(3) ?? "?"}m res ${state.res ? `${state.res.x}x${state.res.y}x${state.res.z}` : "?"} | ` +
       `probe ${state.probeSpacing?.toFixed?.(3)}m c0 ${state.c0Grid ? `${state.c0Grid.x}x${state.c0Grid.y}x${state.c0Grid.z}` : "?"}` +
+      (SPIN ? ` | movers ${state.adopted}→${stateAfter?.adopted}` : "") +
       (m.error ? `  !! ${m.error}` : ""),
   );
+  if (SPIN && !(state.adopted > 0 && stateAfter?.adopted > 0)) {
+    console.log(`    !! the panel is not on the exact-mover path for this arm — its flicker is re-voxelization, not a mover`);
+  }
 }
 
 // ---- report ------------------------------------------------------------------
@@ -658,13 +893,24 @@ const blockZ = (r) => (r.m.z?.halfC * 2) / pxPerMz;
 console.log(`\n=== BLOCK SIZE ON THE FLOOR (ACF half-width × 2, metres) ===`);
 console.log(`  patch spans ${(BLOCK_RIG.patch.x1 - BLOCK_RIG.patch.x0).toFixed(1)}m in x, ` +
   `${(BLOCK_RIG.patch.z1 - BLOCK_RIG.patch.z0).toFixed(1)}m in z — structure above ~1/3 of that is absorbed by the detrend.`);
-console.log(`  dial   requested   built cell   built probe |  block x   block z |  mod x%  mod z% |  level  flicker%  flick size`);
+if (SPIN) {
+  console.log(`  flicker = frame ${FRAMES - 1} (panel yawed ${(SPIN_STEP_DEG * (FRAMES - 1)).toFixed(1)}°) vs frame 0 (yaw 0) — ` +
+    `how much a ${SPIN} deg/s mover moves the floor, and at what size. Block/mod/level are still frame 0 and still comparable to a SPIN-less run.`);
+  console.log(`  detr = that same difference with a per-line cubic fitted out: the panel turning is a SMOOTH change of aspect and lands in the fit, ` +
+    `so what survives is the part that cannot be honest relighting. Believe detr size over flick size.`);
+}
+console.log(`  dial   requested   built cell   built probe |  block x   block z |  mod x%  mod z% |  level  flicker%  flick size` +
+  (SPIN ? ` | detr%  detr size x  detr size z` : ""));
 for (const r of results) {
   const req = r.arm.dial === "voxel" ? r.arm.voxelSize : r.arm.probeSpacing;
+  const dt = r.m.flick?.detrended;
   console.log(
     `  ${r.arm.dial.padEnd(6)} ${f(req, 9)}   ${f(r.state.cell?.x, 10)}   ${f(r.state.probeSpacing, 11)} | ` +
       `${f(blockX(r), 8)}  ${f(blockZ(r), 8)} | ${f(r.m.residRms * 100, 6, 2)}  ${f(r.m.residRmsZ * 100, 6, 2)} | ` +
       `${f(r.m.mean, 6, 4)}  ${f((r.m.flick?.rms ?? 0) * 100, 8, 3)}  ${f((r.m.flick?.halfX * 2) / pxPerMx, 10)}` +
+      // Under SPIN the raw flicker pair is mostly the panel's honest change of
+      // aspect; these two are what is left after that smooth part is removed.
+      (SPIN ? ` | ${f((dt?.rms ?? 0) * 100, 5, 2)}  ${f((dt?.halfX * 2) / pxPerMx, 11)}  ${f((dt?.halfZ * 2) / pxPerMz, 11)}` : "") +
       ((r.m.darkFrac ?? 0) > 0.1 ? `  !! ${((r.m.darkFrac ?? 0) * 100).toFixed(0)}% of lines are near-black` : ""),
   );
 }
@@ -736,7 +982,10 @@ console.log(`\n  frames: ${SHOT}`);
 await writeFile(
   path.join(SHOT, "block-size.json"),
   // `shot` is a whole base64 PNG per arm — the frames are already on disk.
-  JSON.stringify({ pxPerMx, pxPerMz, rect, results: results.map(({ shot, ...rest }) => rest) }, null, 1),
+  JSON.stringify({
+    mode: MODE, mover: MOVER, spin: SPIN, spinStepDeg: SPIN_STEP_DEG, frames: FRAMES, frameGapMs: FRAME_GAP,
+    pxPerMx, pxPerMz, rect, results: results.map(({ shot, ...rest }) => rest),
+  }, null, 1),
 );
 await browser.close();
 process.exit(0);

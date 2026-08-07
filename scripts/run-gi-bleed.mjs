@@ -25,15 +25,94 @@
 // editor reports), never assumed: a top-down perspective frame is NOT linear in
 // world x, and eyeballing sample positions is how a profile measurement lies.
 //
+// ---------------------------------------------------------------------------
+// CALIBRATION LADDER — what a fresh run is judged against.
+//
+// This rig is the acceptance gate for any change to the cascade merge's
+// PARALLAX ESTIMATOR, and the single number that decides is the FAR-FIELD
+// FALLOFF EXPONENT printed at the end (in full, and again as a compact block
+// that is the LAST thing on stdout, so a `tail` cannot lose it). These are the
+// values it has produced, so an operator can place a fresh result on the ladder
+// instead of guessing whether a number is good. (They lived only in a comment
+// in src/modules/gi/cascadeMerge.js and in docs/GI_NEXT_ARCHITECTURE.md until
+// 2026-08-07 — a measurement's home is its harness.)
+//
+// ► READ THE WHITE ARM. Red is not trustworthy at these defaults; see
+//   "THE RED ARM IS NOISE HERE" below. Every headline number here is white.
+//
+// THE LADDER — all four estimator arms measured on THIS rig on 2026-08-07 at
+// its defaults. White first, red in brackets and for reference only:
+//
+//   exponent        arm / how to reproduce it
+//   --------------  -------------------------------------------------------
+//   -1.09  (-1.09)  __giParallaxMerge=false — NAIVE, no parallax correction
+//                   at all. The floor of the ladder: this is the falloff bug
+//                   (colour bleed reaches metres too far while the room
+//                   under-fills). Any change that lands near here has
+//                   reintroduced it.
+//   -1.39  (-1.38)  __giParallaxGateFade=true — REJECTED. It sits between
+//                   naive and snap, i.e. it hands back roughly 60% of the
+//                   correction's falloff benefit ((1.39-1.09)/(1.88-1.09) of
+//                   the way up) in exchange for a lateral-blockiness win.
+//                   That trade is precisely what this rig exists to catch:
+//                   the blockiness metric alone would have shipped it.
+//   -1.88  (-1.16)  __giParallaxMergeSmooth=false — the SNAPPED v2 min-depth
+//                   block re-aim, the form the smooth tap replaced.
+//   -1.94  (-1.73)  SHIPPED: smooth 3-tap parallax merge (no globals) —
+//                   BEST OF THE FOUR, marginally steeper than the snap it
+//                   replaced. It regressed nothing on this metric.
+//   -2.72           analytic — GROUND TRUTH for this geometry. The rig
+//                   recomputes it every run; if a run's own `analytic` line
+//                   is not ≈ -2.72 then the RIG changed (DISTANCES / REF_D /
+//                   FIT_LO / FIT_HI / panel size) and NONE of the rows above
+//                   are comparable to that run.
+//
+// Ordering, as this rig reads it today:
+//   naive -1.09 < gate-fade -1.39 < snap -1.88 ≤ smooth (shipped) -1.94 < analytic -2.72
+//
+// THE ABSOLUTE VALUES MOVED; THE ORDER DID NOT. Historical values recorded
+// 2026-08-04 — naive -1.44, v1 endpoint+point-bilinear -2.35, v2 snapped
+// -2.66 — are NOT REPRODUCIBLE ON THIS RIG TODAY and must not be used as a
+// bar a fresh run should hit. Every arm now reads ~0.7-0.8 FLATTER than its
+// 2026-08-04 counterpart (naive -1.09 vs -1.44; snap -1.88 vs -2.66). The
+// offset is RIG-WIDE — it shifts every arm by about the same amount, and it
+// is NOT a property of any one estimator, so do not attribute it to the
+// shipped smooth form. Its cause is UNKNOWN and OPEN. Consequences:
+//
+//   • Judge a change by where it lands RELATIVE to the four arms above,
+//     re-measured in the same session — not by its distance from -2.72 and
+//     not against the 2026-08-04 numbers.
+//   • The ordering is monotone and well separated (0.3-0.5 between rungs),
+//     so the rig remains a valid A/B instrument for the estimator.
+//   • Before trusting an absolute exponent, re-run the naive arm
+//     (`GLOBALS=__giParallaxMerge=false`). If it no longer reads ≈ -1.09,
+//     the rig-wide offset has moved again and the whole ladder needs
+//     re-measuring.
+//
+// THE RED ARM IS NOISE HERE. At these defaults the red panel's per-distance
+// series flatlines at ~0.00006 from about 8m out and then hits exact 0 and 1 —
+// that is the EXPOSURE BRACKET bottoming out, not light. A fit over repeated
+// quantisation-floor values has no slope to find, which is why red swings
+// -1.09 / -1.16 / -1.38 / -1.73 across the four arms while white stays stable
+// and correctly ordered. So: red vs white disagreement on THIS rig at THESE
+// defaults is an instrument artifact and NOT evidence of colour-dependent
+// transport. To make the red arm mean something, raise EMIT or HIGH_EXPOSURE,
+// or pull FIT_HI in below where the series flattens, until the summary stops
+// flagging its bracket. The run flags this for you: the summary prints
+// `!! bracket` for any arm whose fit-window samples hit the bracket limits,
+// and `arms.<name>.bracket` in bleed.json carries the counts.
+// ---------------------------------------------------------------------------
+//
 //   node node_modules/vite/bin/vite.js --port 5201 --strictPort
-//   node scripts/run-gi-bleed.mjs
+//   node scripts/run-gi-bleed.mjs          (or: npm run probe:gi-falloff)
 //
 // Env:
 //   GEN_ROOT=<dir>     generated project location
 //   EMIT=5             panel emission strength
 //   QUALITY=high       GI preset
 //   ARMS=red,white     which panels to measure
-//   SHOT=<dir>         dump the frames it samples
+//   SHOT=<dir>         dump the frames it samples, AND `{SHOT}/bleed.json`
+//                      with every number below in machine-readable form
 //   HEADED=1
 import path from "node:path";
 import { mkdir, writeFile } from "node:fs/promises";
@@ -467,23 +546,161 @@ const fitExponent = (vals, flags = null) => {
 // own cosine (y/r) falls off with distance too and adds a power. The analytic
 // fit below is the reference — the measured arms are judged against it, not
 // against a remembered rule of thumb.
-console.log(`\n  FAR-FIELD FALLOFF EXPONENT (d ≥ ${(BLEED_RIG.panelH * 1.5).toFixed(1)}m; this geometry → ≈ -3)`);
-console.log(`    analytic ${fitExponent(analytic).toFixed(2)}`);
+// Computed ONCE into variables rather than inline in the console.log, because
+// these same numbers now go three places: the block below, the JSON dump, and
+// the compact summary that is reprinted LAST (see the tail of this file).
+const analyticExp = fitExponent(analytic);
+/** @type {Record<string, number>} */
+const armExp = {};
 for (const arm of ARMS) {
   if (!results[arm]) continue;
-  console.log(`    ${arm.padEnd(8)} ${fitExponent(results[arm].map((s) => s?.lum ?? 0), results[arm].map((s) => s?.from)).toFixed(2)}`);
+  armExp[arm] = fitExponent(results[arm].map((s) => s?.lum ?? 0), results[arm].map((s) => s?.from));
 }
 
+// IS THIS ARM'S EXPONENT A MEASUREMENT OR IS IT NOISE?
+//
+// The tell, learned from the red arm on 2026-08-07: its series flatlines at
+// ~0.00006 from ~8m out and then hits exact 0/1 — the exposure bracket
+// bottoming out, not light. A log-log fit over repeated quantisation-floor
+// values has no slope to find, and red consequently swung -1.09/-1.16/-1.38/
+// -1.73 across four estimator arms while white stayed stable and correctly
+// ordered. That is an instrument artifact, and without a flag it reads exactly
+// like a colour-dependent transport bug.
+//
+// So count, over the SAME window the fit uses, the three ways the bracket
+// fails: samples it could not place at any exposure (`none`), samples railed
+// at the very bottom or the clip, and REPEATS — distinct values below the
+// sample count means consecutive distances landed on one 8-bit code, which is
+// the flatline itself. Cheap (one pass over ~35 samples), and it turns "why do
+// the arms disagree" into a printed reason.
+const bracketHealth = (samples) => {
+  let inWindow = 0, none = 0, railed = 0, used = 0;
+  const seen = new Set();
+  let minUsed = Infinity;
+  for (let i = 0; i < DISTANCES.length; i++) {
+    if (DISTANCES[i] < FIT_LO || DISTANCES[i] > FIT_HI) continue;
+    inWindow++;
+    const s = samples[i];
+    const lum = s?.lum ?? 0;
+    if (s?.from === "none") { none++; continue; }      // fit skips these
+    if (!(lum > 1e-6)) { railed++; continue; }         // fit skips these too
+    if (lum >= 1) { railed++; continue; }              // clipped white
+    used++;
+    minUsed = Math.min(minUsed, lum);
+    seen.add(lum.toPrecision(6));
+  }
+  const repeats = Math.max(0, used - seen.size);
+  return {
+    inWindow, used, none, railed, repeats,
+    distinct: seen.size,
+    minLum: Number.isFinite(minUsed) ? minUsed : 0,
+    // Any of the three, and the exponent is a fit to the instrument's floor as
+    // much as to the scene. `repeats` is the softest of them, so allow one.
+    suspect: none > 0 || railed > 0 || repeats > 1,
+  };
+};
+/** @type {Record<string, ReturnType<typeof bracketHealth>>} */
+const armBracket = {};
+for (const arm of ARMS) if (results[arm]) armBracket[arm] = bracketHealth(results[arm]);
+console.log(`\n  FAR-FIELD FALLOFF EXPONENT (d ≥ ${(BLEED_RIG.panelH * 1.5).toFixed(1)}m; this geometry → ≈ -3)`);
+console.log(`    analytic ${analyticExp.toFixed(2)}`);
+for (const arm of ARMS) {
+  if (!(arm in armExp)) continue;
+  console.log(`    ${arm.padEnd(8)} ${armExp[arm].toFixed(2)}`);
+}
+
+/** @type {{ d: number, red: number, white: number, redOverWhite: number, sat: number }[] | null} */
+let satSeries = null;
 if (results.red && results.white) {
+  satSeries = [];
   console.log(`\n  COLOUR vs WHITE — do they fall off the same? (saturation of the red arm)`);
   for (let i = 0; i < DISTANCES.length; i++) {
     const rl = results.red[i]?.lum ?? 0, wl = results.white[i]?.lum ?? 0;
+    const rw = wl > 1e-6 ? rl / wl : 0;
+    satSeries.push({ d: DISTANCES[i], red: rl, white: wl, redOverWhite: rw, sat: results.red[i]?.sat ?? 0 });
     console.log(
-      `    ${DISTANCES[i].toFixed(1).padStart(5)}m  red ${rl.toFixed(5)}  white ${wl.toFixed(5)}  red/white ${(wl > 1e-6 ? rl / wl : 0).toFixed(3)}  sat ${(results.red[i]?.sat ?? 0).toFixed(3)}`,
+      `    ${DISTANCES[i].toFixed(1).padStart(5)}m  red ${rl.toFixed(5)}  white ${wl.toFixed(5)}  red/white ${rw.toFixed(3)}  sat ${(results.red[i]?.sat ?? 0).toFixed(3)}`,
     );
   }
 }
 console.log(`\n  frames: ${SHOT}`);
+
+// ---- machine-readable dump -------------------------------------------------
+// EVERY number above, on disk, because console-only output survives exactly as
+// long as the scrollback does — one `tail` of a run costs the whole run (that
+// is not hypothetical; it happened on 2026-08-07). Same conventions as
+// run-gi-block-size.mjs's block-size.json: `JSON.stringify(…, null, 1)`, and
+// NO image data — the frames are already PNGs in this same directory, and a
+// base64 payload in here would make the file unreadable for the numbers it
+// exists to carry.
+await writeFile(
+  path.join(SHOT, "bleed.json"),
+  JSON.stringify({
+    when: new Date().toISOString(),
+    env: {
+      EMIT, QUALITY, ARMS, REF_D, FIT_LO, FIT_HI, GLOBALS, HATCH,
+      // Not asked for, but they change what the numbers MEAN, and a dump you
+      // cannot date to a configuration is a dump you cannot compare.
+      VOXEL, PROBE, HIGH_EXPOSURE, GEN_ROOT, SHOT,
+      panelW: BLEED_RIG.panelW, panelH: BLEED_RIG.panelH,
+    },
+    distances: DISTANCES,
+    analytic,
+    // Normalised at REF_D — the curve the console table actually compares.
+    analyticNorm: analytic.map((a) => a / aRef),
+    control: { giOffMaxLum: offMax },
+    // Per-arm samples: the luminance the exponent is fitted to, plus WHICH
+    // exposure of the bracket each sample came from ("low"/"high"/"none").
+    // A fit that disagrees with a past run is usually a `from` difference.
+    arms: Object.fromEntries(
+      ARMS.filter((a) => results[a]).map((a) => [a, {
+        exponent: armExp[a],
+        // `bracket.suspect` true = this arm's exponent is a fit to the
+        // exposure bracket's floor as much as to the scene. Do not compare a
+        // suspect arm against the ladder in this file's header.
+        bracket: armBracket[a],
+        lum: results[a].map((s) => s?.lum ?? 0),
+        from: results[a].map((s) => s?.from ?? "none"),
+        sat: results[a].map((s) => s?.sat ?? 0),
+      }]),
+    ),
+    exponents: { analytic: analyticExp, ...armExp },
+    satSeries,
+  }, null, 1),
+);
+console.log(`  json:   ${path.join(SHOT, "bleed.json")}`);
+
+// ---- THE HEADLINE, REPRINTED LAST ------------------------------------------
+// The exponent block above is followed by a 69-row table and a 69-row colour
+// series, so a `tail` of this run's output loses the one number the run exists
+// to produce. Print it again here, compact, where truncation cannot reach it.
+// (Full output above is unchanged — this is additive.)
+console.log(`\n=== SUMMARY — FAR-FIELD FALLOFF EXPONENT (fit ${FIT_LO}–${FIT_HI}m, ref ${REF_D}m, quality ${QUALITY}, emit ${EMIT}) ===`);
+console.log(`  analytic ${analyticExp.toFixed(2)}   (ground truth; ≈ -2.72 at rig defaults — a different value means the RIG changed)`);
+for (const arm of ARMS) {
+  if (!(arm in armExp)) continue;
+  const e = armExp[arm];
+  const b = armBracket[arm];
+  console.log(
+    `  ${arm.padEnd(8)} ${e.toFixed(2)}   ×analytic ${(Number.isFinite(analyticExp) && Math.abs(analyticExp) > 1e-9 ? e / analyticExp : NaN).toFixed(3)}` +
+      `   (1.00 = matches ground truth; below 1 = falls off too slowly, bleed reaches too far)` +
+      // The tell that an exponent is noise rather than a measurement.
+      (b?.suspect
+        ? `\n           !! bracket — ${b.used}/${b.inWindow} fit samples usable` +
+          `${b.none ? `, ${b.none} unplaceable at any exposure` : ""}` +
+          `${b.railed ? `, ${b.railed} railed at the floor/clip` : ""}` +
+          `${b.repeats ? `, ${b.repeats} repeated 8-bit codes (series flatlining, min ${b.minLum.toExponential(1)})` : ""}` +
+          `. THIS EXPONENT IS NOISE — raise EMIT/HIGH_EXPOSURE or lower FIT_HI. Do not place it on the ladder.`
+        : ""),
+  );
+}
+// Measured on THIS rig 2026-08-07 at these defaults, white channel. The
+// 2026-08-04 doc values (naive -1.44 / v1 -2.35 / v2 -2.66) are deliberately
+// NOT here: every arm now reads ~0.7-0.8 flatter and they are not reproducible,
+// so quoting them next to a fresh number reads a correct run as a failure.
+console.log(`  ladder (2026-08-07, this rig, WHITE arm — red is bracket-limited, see header):`);
+console.log(`    naive -1.09  <  gate-fade -1.39  <  snap -1.88  <=  smooth/shipped -1.94  <  analytic -2.72`);
+console.log(`    Judge a change by where it lands BETWEEN those rungs, re-measured this session — not by its distance from -2.72.`);
 
 await browser.close();
 process.exit(0);

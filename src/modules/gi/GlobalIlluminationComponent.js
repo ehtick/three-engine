@@ -141,6 +141,25 @@ export class GlobalIlluminationComponent extends Component {
     // upsampled — "bad corners" under a bright sun. 1.0 removes that at
     // roughly 4× the resolve cost (still small next to the render).
     resolveScale: 0.5,
+    // TOTAL-PIXEL CEILINGS on the two screen-space GI passes, and the reason
+    // `resolveScale` alone is not enough: the resolve is sized from the
+    // DRAWING BUFFER (canvas CSS size × devicePixelRatio), so a maximized
+    // 4K/150% viewport quadruples the traced pixel count at an unchanged
+    // scale — probe-measured 9ms → 22ms GPU, which is the "larger screen -
+    // more ms, up to 70ms" report. A pixel BUDGET turns that into a flat cost
+    // ceiling: past it the resolve shrinks isotropically and the
+    // position-validated bilateral upsample reconstructs the full-res edges
+    // anyway. Both were read by GISystem (#screenResolveSize /
+    // #lightShadowSize) but declared NOWHERE until 2026-08-07, which made
+    // them invisible to the Inspector and unsettable from MCP; these values
+    // are the fallbacks that code already used, so nothing changes.
+    resolveMaxPixels: 1_600_000,
+    // The shadow channel's own ceiling, derived from (and never exceeding)
+    // the resolve's. Its trace is the most expensive per-pixel work in the
+    // module (~5-7ns/px measured) and every tap is re-validated against the
+    // full-res gbuffer position by the material-side bilateral, so its pixel
+    // count is a nearly-free cost knob.
+    lightShadowMaxPixels: 1_900_000,
     autoRebake: true,
     debugProbes: "off",
   };
@@ -201,6 +220,16 @@ export class GlobalIlluminationComponent extends Component {
     // Live (a resize rebuilds only the resolve compute): raise to 1.0 when
     // GI light shadows / AO fringe at silhouettes ("bad corners").
     { key: "resolveScale", label: "Resolve Scale", type: "number", min: 0.25, max: 1, step: 0.05, advanced: true },
+    // Cost CEILINGS, not quality levels — deliberately not `flipsToCustom`,
+    // for the same reason `resolveScale` and `probeSmoothing` are not: they
+    // are what the machine can afford, and switching preset must not silently
+    // reset them. The floor is 100k px (≈ 420×240 — below that the bilateral
+    // has nothing left to reconstruct from); the ceiling is 8M px, past which
+    // even a 4K drawing buffer at resolveScale 1.0 is never clamped, i.e.
+    // "off". A budget of 0 reads as "unset" and falls back to the default —
+    // use `resolveScale` to go smaller, not a zero budget.
+    { key: "resolveMaxPixels", label: "Resolve Pixel Budget", type: "number", min: 100_000, max: 8_000_000, step: 100_000, advanced: true },
+    { key: "lightShadowMaxPixels", label: "Shadow Pixel Budget", type: "number", min: 100_000, max: 8_000_000, step: 100_000, advanced: true },
     { key: "autoRebake", label: "Auto Re-bake", type: "boolean", advanced: true, flipsToCustom: "quality" },
     // "occupancy" marches the pyramid with the SAME hierarchical DDA the
     // transport rays use, so it is the instrument for "is this column

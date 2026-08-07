@@ -34,7 +34,15 @@
 //   · "albedo"   — a sun lights a GREEN diffuse panel; the floor is measured by
 //     its GREEN EXCESS 2g/(r+b), which the white direct term cannot fake.
 //   In both, the panel can be pinned `giMobility: "dynamic"` (MOVER=1) to ask
-//   the same question of an exact mover that owns no voxels at all.
+//   the same question of an exact mover that owns no voxels at all — and SPIN
+//   then yaws it between frames. The panel is authored STILL either way: SPIN
+//   drives the rotation LIVE through `entity.setTransform`, so a spinning run
+//   and a still run load exactly the same scene file. The harness owns the one
+//   geometric constraint that creates — the panel is `panelW` (2m) wide and
+//   centred at x = -panelT/2, so yaw swings its footprint towards the measured
+//   patch at x0 = 0.6 and arrives near 38 deg; widening the panel or moving
+//   `patch.x0` inwards tightens that budget, and run-gi-block-size.mjs recomputes
+//   it from these constants before every spinning run.
 //
 // The floor is deliberately EMPTY and OPEN — no ceiling, no side walls. A flat
 // floor cannot see itself, so what lands on it is single-bounce transport from

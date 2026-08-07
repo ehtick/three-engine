@@ -507,6 +507,26 @@ export class GISystem {
     this.#dispose();
   }
 
+  /**
+   * THIS LIST AND #applyLiveProps MUST AGREE. A key that is in neither this
+   * list nor #structuralSignature is written to the props object and then does
+   * NOTHING — no uniform write, no rebuild — which is a knob that looks alive
+   * in the Inspector and is dead in the scene. `aoStrength`/`aoRadius` were
+   * exactly that from the day AO shipped: #applyLiveProps has always written
+   * their uniforms correctly (see the bottom of it) and two comments in this
+   * file called them live, but nothing ever CALLED it for those keys, so
+   * dragging AO Strength did nothing until an unrelated edit or a rebuild
+   * happened to run a live pass. Fixed 2026-08-07.
+   *
+   * Audited at the same time — the rest of the props are accounted for:
+   * everything else #applyLiveProps writes (intensity, bounce, bleedSaturation,
+   * temporalBlend, probeSmoothing, skyColor, skyIntensity) is routed here;
+   * `resolveScale` and the two pixel budgets are re-read every frame by
+   * #syncScreenResolveSize; `peakSplit` is re-read every frame in #update;
+   * `debugProbes` and `autoRebake` have their own branches below; and the
+   * remainder are in #structuralSignature. If you add a prop, it belongs to
+   * exactly one of those five places.
+   */
   onComponentProp(component, key) {
     if (this.component !== component) return;
     if (
@@ -517,6 +537,11 @@ export class GISystem {
       key === "probeSmoothing" ||
       key === "skyColor" ||
       key === "skyIntensity" ||
+      // The AO uniforms. `ao` ITSELF is structural (off compiles the obscurance
+      // block out of the resolve entirely) and stays in #structuralSignature —
+      // only its two scalars are live.
+      key === "aoStrength" ||
+      key === "aoRadius" ||
       key === "enabled"
     ) {
       this.#applyLiveProps();
@@ -2765,7 +2790,23 @@ export class GISystem {
   #syncScreenResolveSize(state) {
     const screen = state.screen;
     const { width, height } = this.#screenResolveSize();
-    if (width === screen.width && height === screen.height) return;
+    // The SHADOW size is part of the comparison, not just a consequence of it.
+    // `lightShadowMaxPixels` can move while the resolve size does not (it is a
+    // budget on a channel derived from the resolve), and a resolve-only test
+    // would early-return — leaving a declared, Inspector-visible knob that
+    // does nothing until the window is resized. That is the `exactReflections`
+    // failure this file already warns about twice. `shadowWidth`/`shadowHeight`
+    // are set at build (see #buildScreenResolve's return), so this never
+    // reports a spurious resize on the first frame.
+    const { width: shadowW, height: shadowH } = this.#lightShadowSize({ width, height });
+    if (
+      width === screen.width &&
+      height === screen.height &&
+      shadowW === screen.shadowWidth &&
+      shadowH === screen.shadowHeight
+    ) {
+      return;
+    }
     // A RESIZE IS SUPPOSED TO BE RARE. It recreates every GI target, retires
     // the old ones 3 frames later, and REBUILDS + sync-compiles the resolve
     // pipeline. If this fires repeatedly on a static viewport (a size that
@@ -2777,7 +2818,6 @@ export class GISystem {
       this._resolveResizes = (this._resolveResizes ?? 0) + 1;
       console.log(`[gi] resolve target resized to ${width}x${height} (was ${screen.width}x${screen.height})`);
     }
-    const { width: shadowW, height: shadowH } = this.#lightShadowSize({ width, height });
     screen.width = width;
     screen.height = height;
     screen.shadowWidth = shadowW;
@@ -3311,9 +3351,11 @@ export class GISystem {
    * the resolve's. Its trace is the most expensive per-pixel work in the
    * module (~5-7ns/px measured), and the material-side bilateral validates
    * every tap against the full-res gbuffer position — so its pixel count is
-   * a nearly-free cost knob. Default 900k px ≈ today's look at a 1440p
-   * viewport; big monitors stop paying quadratically for penumbras.
-   * `lightShadowMaxPixels` prop / `__giShadowResolvePixels` override.
+   * a nearly-free cost knob. The shipped budget is 1.9M px (a 1440p viewport
+   * never reaches it; big monitors stop paying quadratically for penumbras).
+   * `lightShadowMaxPixels` prop — declared on the component since 2026-08-07,
+   * before which this fallback was the only value it could ever have — or
+   * `__giShadowResolvePixels` to override it without touching the scene.
    */
   #lightShadowSize(resolve) {
     const budget =
@@ -4116,7 +4158,24 @@ export class GISystem {
     light.gatherFn = gather;
     // World-scale light params are uniform-derived NODES (giLight composes
     // them into node math either way) so an in-place refit rescales them.
-    light.normalOffset = volume.world.cellMax.mul(1.2).max(0.1);
+    // NORMAL OFFSET — how far every gather/trace origin is lifted off the
+    // shading surface, along the normal, so a probe/ray does not immediately
+    // hit the surface it started on. `cellMax·1.2` rides the voxel lattice, but
+    // the `.max(0.1)` FLOOR does not: below a 0.083m cell the lift is a fixed
+    // 0.1m regardless of either lattice, and it displaces the gather point of
+    // EVERY pixel by that constant. Hatched 2026-08-07 for the ~0.196m
+    // block-size hunt (measured: 0.196 + 0.14·probeSpacing in x, with the
+    // voxelSize dial inert) — a fixed-metre displacement of the sample point is
+    // the other way a fixed-width footprint gets into the picture.
+    // `__giNormalOffsetFloor` (0.1, metres) and `__giNormalOffsetScale` (1.2,
+    // × the largest world cell) are read at BUILD time and default to exactly
+    // the shipped expression. Zero is the interesting ablation for both, so
+    // they go through Number.isFinite instead of `Number(...) || DEFAULT`.
+    const rawOffsetScale = Number(globalThis.__giNormalOffsetScale);
+    const offsetScale = Number.isFinite(rawOffsetScale) ? rawOffsetScale : 1.2;
+    const rawOffsetFloor = Number(globalThis.__giNormalOffsetFloor);
+    const offsetFloor = Number.isFinite(rawOffsetFloor) ? rawOffsetFloor : 0.1;
+    light.normalOffset = volume.world.cellMax.mul(offsetScale).max(offsetFloor);
     let deferredRadianceLookup = null;
     if (props.reflections !== false) {
       // Directional glossy GI is resolved once per screen pixel below and

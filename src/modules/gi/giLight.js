@@ -695,13 +695,85 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
     const bilateral =
       light.giPositionNode && light.giScreenTexel
         ? (texNode) => {
-            const threshold = positionWorld.sub(cameraPosition).length().mul(0.02).max(0.15);
-            const taps = [[-0.5, -0.5], [0.5, -0.5], [-0.5, 0.5], [0.5, 0.5]].map(([dx, dy]) => {
+            // FIXED-METRE HATCHES (2026-08-07, the ~0.196m block-size hunt).
+            // Measured: block size on the floor is 0.196 + 0.14·probeSpacing
+            // metres in x, and the voxelSize dial is inert (5× the dial moves
+            // the block by 1.02×). The 0.196m intercept therefore scales with
+            // NEITHER lattice, so it is a fixed-metre term DOWNSTREAM of both —
+            // and this is the last stage between the probe lattice and the
+            // shaded pixel. A 4-tap inverse-distance blend gated at a fixed
+            // 0.15m world radius is a fixed-width world-space reconstruction
+            // footprint by construction, which is exactly the shape of the
+            // thing being hunted.
+            //
+            // All three are read at BUILD time, so setting one only lands on
+            // the next rebuild — see the ABLATE note in
+            // scripts/run-gi-block-size.mjs for why an ablation has to nudge a
+            // structural prop as well. Each defaults to exactly the shipped
+            // number, so an unset global reproduces today's node graph.
+            //   __giBilateralWorldEps  0.15 — the near-field rejection floor,
+            //                                 in metres. THE PRIME SUSPECT.
+            //   __giBilateralViewFrac  0.02 — per metre of view distance, so
+            //                                 the gate grows with the half-res
+            //                                 texel's world footprint far away.
+            //   __giBilateralTapScale  1    — multiplies the ±0.5-texel tap
+            //                                 offsets; widens/narrows the
+            //                                 footprint at a FIXED tap count.
+            //                                 0 collapses to a single centre
+            //                                 tap = the clean "no bilateral"
+            //                                 arm (plain bilinear sample).
+            //   __giBilateralWeightEps 0.02 — the softening epsilon in the
+            //                                 inverse-distance weight below,
+            //                                 in metres: below it, taps stop
+            //                                 being distance-discriminated and
+            //                                 blend equally, so it is a 2cm
+            //                                 plateau inside the gate. A WEAK
+            //                                 suspect (an order of magnitude
+            //                                 under the 0.196m target) —
+            //                                 hatched to rule out, not because
+            //                                 it is likely. NOTE: 0 is settable
+            //                                 but DEGENERATE — it is pure 1/d,
+            //                                 and a tap landing exactly on the
+            //                                 shading point divides by zero,
+            //                                 giving an Inf weight and a NaN
+            //                                 blend. For a "no plateau" arm use
+            //                                 something tiny (1e-4), not 0.
+            //
+            // TRAP, and the reason __giBilateralWeightEps is named for the
+            // WEIGHT and not the distance: it and __giBilateralViewFrac both
+            // default to 0.02 and are UNRELATED. ViewFrac is dimensionless
+            // (metres of rejection radius per metre of view distance, i.e. it
+            // scales the gate with the camera); WeightEps is metres (it softens
+            // a division). Ablating one does not test the other, and reading
+            // `0.02` twice in this block is not a shared constant.
+            //
+            // Zero is a meaningful value for all four (it is the ablation), so
+            // each is read through Number.isFinite rather than the module's
+            // usual `Number(...) || DEFAULT`, which would swallow it.
+            const rawWorldEps = Number(globalThis.__giBilateralWorldEps);
+            const worldEps = Number.isFinite(rawWorldEps) ? rawWorldEps : 0.15;
+            const rawViewFrac = Number(globalThis.__giBilateralViewFrac);
+            const viewFrac = Number.isFinite(rawViewFrac) ? rawViewFrac : 0.02;
+            const rawTapScale = Number(globalThis.__giBilateralTapScale);
+            const tapScale = Number.isFinite(rawTapScale) ? rawTapScale : 1;
+            const rawWeightEps = Number(globalThis.__giBilateralWeightEps);
+            const weightEps = Number.isFinite(rawWeightEps) ? rawWeightEps : 0.02;
+            const threshold = positionWorld.sub(cameraPosition).length().mul(viewFrac).max(worldEps);
+            // At tapScale 0 the four offsets collapse onto the same texel, and
+            // four identical taps are the centre tap's answer for 4× the
+            // fetches (blend = v, darkest = v). Emit the one tap instead, so
+            // the ablation arm is honestly "no bilateral" and not "a bilateral
+            // that happens to agree with itself".
+            const offsets =
+              tapScale === 0
+                ? [[0, 0]]
+                : [[-0.5, -0.5], [0.5, -0.5], [-0.5, 0.5], [0.5, 0.5]].map(([dx, dy]) => [dx * tapScale, dy * tapScale]);
+            const taps = offsets.map(([dx, dy]) => {
               const uv = screenUV.add(vec2(light.giScreenTexel).mul(vec2(dx, dy)));
               const v = vec4(texNode.sample(uv)).toVar();
               const g = light.giPositionNode.sample(uv);
               const d = g.xyz.sub(positionWorld).length();
-              const w = select(g.w.greaterThan(0.5).and(d.lessThan(threshold)), float(1).div(d.add(0.02)), float(0)).toVar();
+              const w = select(g.w.greaterThan(0.5).and(d.lessThan(threshold)), float(1).div(d.add(weightEps)), float(0)).toVar();
               return { v, w };
             });
             const wSum = taps.reduce((a, t) => a.add(t.w), float(0));
