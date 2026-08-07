@@ -23,6 +23,7 @@ import { Fn, If, Loop, Return, cos, float, floor, fract, instanceIndex, instance
 import { octahedralTexelIndex, octahedralUV } from "./cascadeTrace.js";
 import { sharedFn } from "./giFn.js";
 import { emitterAngularRadius, emitterSlotFactor, emitterSurfaceT } from "./giLight.js";
+import { RayHitMode } from "./rayHit/RayHitConfig.js";
 
 
 
@@ -36,6 +37,169 @@ import { emitterAngularRadius, emitterSlotFactor, emitterSurfaceT } from "./giLi
 // zero would have blacked out receivers deep inside thick geometry at the low
 // preset, where probes are ~2 m apart.
 export const BURIED_PROBE_WEIGHT = 0.02;
+
+// ── THE VISIBILITY TOLERANCE IS TWO TERMS AND WAS ONLY EVER WRITTEN AS ONE ────
+//
+// Both halves of the visibility contract — the merge's PARENT-probe proxy
+// (cascadeMerge.js) and this file's CAGE-probe proxy — fade a probe out over
+// [visTol, 2·visTol] of blocker PENETRATION, where
+//     penetration = dist − storedRay.w
+// and `visTol = traceQuantization · 1.75`. `traceQuantization` is the level-0
+// occupancy voxel, i.e. the hit-distance quantization of the TRACE MEDIUM, and
+// both files state that as the justification in as many words. The
+// justification is now FALSE on every shipping preset, because the error in
+// `storedRay.w` is two independent things and one constant conflates them:
+//
+//   RADIAL — the hit-distance quantization. MODE-DEPENDENT. Under
+//     `occupancy-legacy` the march returns `t` at the ENTRY FACE of the occupied
+//     level-0 voxel (occupancyField.js:1789-1794), so the error is up to one
+//     voxel chord and it is ALWAYS EARLY — the value the tolerance must forgive.
+//     docs/radiance_cascades_ray_hit_phase_2.md:87 measures **0.750 cell units**
+//     on a flat floor for that occupied-box hit. The same line measures the
+//     hybrid record modes (plane / plane-coverage / exact-complex) at **2.6e-5
+//     cell units**: four orders of magnitude smaller, because the hit is solved
+//     against a fitted plane or a real triangle instead of a voxel face.
+//     `rayHitMode`'s default flipped from `occupancy-legacy` to `auto` in
+//     b5961d7, and RayHitConfig.js:60-75 resolves low/medium → HybridPlane and
+//     high/ultra/anything-else → HybridExactComplex — so on every shipping
+//     preset this tolerance has been ~4 orders of magnitude larger than its own
+//     stated reason for existing, on the permissive side.
+//
+//   ANGULAR — MODE-INDEPENDENT, and the term nobody wrote down. Neither proxy
+//     reads the stored ray toward the OTHER probe; both read
+//     `octahedralTexelIndex(rel/dist, dirRes)` — the NEAREST OF dirCount COARSE
+//     DIRECTIONS. On a grazing surface the distance along the sampled direction
+//     diverges from the distance along the true one, and that divergence grows
+//     with the probe↔probe separation: it scales with `dist`, not with the
+//     voxel. THIS IS THE DOTTED-LATTICE MECHANISM — the long note at
+//     cascadeMerge.js's use site describes exactly it (measured period 1.01 m at
+//     ultra where c0 spacing is 0.50 m; bandRMS 0.678 → 0.223 once the hard cut
+//     became this smoothstep), and it is why a fade exists at all.
+//
+// MEASURED CONSEQUENCE of the conflation (bleed rig, far-field falloff vs the
+// analytic −2.72, white channel; block rig floor modulation):
+//     rayHitMode auto (ships today)      falloff −2.18   modulation 9.39%
+//     __giRayHitMode=occupancy-legacy    falloff −2.97   modulation 5.65%
+// On the user's real Sponza the two are perf-neutral (queue 14.98 vs 14.90 ms)
+// and legacy looks visibly better — but legacy OVERSHOOTS the analytic target
+// (−2.97 vs −2.72) and it disables surface records wholesale (GISystem.js:6180
+// gates them on activeMode >= HybridPlane), taking the record-aware shadow
+// oracle down with them. Reverting the mode is not the fix. The tolerance is.
+//
+// ── THE TRAP ──────────────────────────────────────────────────────────────────
+// DO NOT simply shrink the tolerance to the hybrid modes' true radial error.
+// 2.6e-5 voxels is zero for practical purposes, and a zero tolerance collapses
+// the smoothstep back into the hard binary cut that PRODUCED the dotted lattice
+// this fade was written to remove. The radial term was accidentally paying the
+// angular term's bill; take it away and something has to take the bill over.
+// Hence the split:
+//
+//     visTol = radialQuantization(activeRayHitMode) · kRadial  +  dist · kAngular
+//
+// radial half mode-aware and in world units, angular half dimensionless.
+//
+// DEFAULTS REPRODUCE TODAY EXACTLY, on purpose: mode-awareness OFF,
+// kRadial = 1.75, kAngular = 0 — so the folded coefficients are `1.75` and `0`
+// and the emitted node graph is the pre-split one, node for node, in every mode.
+// The new behaviour is opt-in so it can be A/B'd like everything else here; a
+// change that silently moves the shipped look is not measurable.
+//
+// HATCHES (BUILD-TIME — the coefficients are folded into the node graph, so an
+// A/B has to force a rebuild: the voxelSize nudge in
+// scripts/run-gi-block-size.mjs's ABLATE path). All three are `Number.isFinite`
+// reads, never `Number(x) || default`, because **0 is meaningful for all of
+// them** — 0 radial is the pure-angular arm, 0 angular is today's behaviour, and
+// `Number(x) || d` would hand back the default and report it as the ablation
+// (the exact bug fixed in `__giMergeVisTol` on 2026-08-07):
+//   `__giVisTolModeAware`  default false → the radial term stays one whole
+//                          level-0 voxel regardless of mode, i.e. today.
+//   `__giVisTolRadial`     default 1.75 (= today's constant).
+//   `__giVisTolAngular`    default 0    (= today's absent term).
+// They apply to BOTH halves of the contract. `__giMergeVisTol` and
+// `__giGatherVisTol` survive unchanged as per-half OVERALL SCALES on top (see
+// resolveVisTolTerms) — including `= 0`, which still yields a hard cut.
+export const DEFAULT_VIS_TOL_RADIAL = 1.75;
+export const DEFAULT_VIS_TOL_ANGULAR = 0;
+
+// Radial hit-distance error, expressed in LEVEL-0 VOXELS so it can multiply the
+// existing `traceQuantization` node (a uniform-derived world length — an in-place
+// refit must rescale it, so this side stays a pure scalar).
+//
+// LEGACY IS 1, NOT the measured 0.750: 0.750 is one flat-floor sample of a
+// quantity whose bound is a full voxel chord, and 1 is what ships today —
+// changing it would move the default. HYBRID IS THE MEASURED 2.6e-5, verbatim
+// from docs/radiance_cascades_ray_hit_phase_2.md:87 (`test:gi-rayhit-phase2`,
+// deterministic, vs exact double-precision Möller-Trumbore).
+export const LEGACY_RADIAL_QUANT_VOXELS = 1;
+export const HYBRID_RADIAL_QUANT_VOXELS = 2.6e-5;
+
+/**
+ * Radial hit-distance error of the ACTIVE (resolved) ray-hit mode, in level-0
+ * voxels. Takes `rayHitConfig.activeMode`, never the component's raw prop —
+ * `"auto"` is not a mode, and the whole bug is that this term never knew which
+ * mode was actually running.
+ *
+ * The mode window is deliberately the SAME predicate GISystem.js:6180 uses to
+ * enable surface records (`>= HybridPlane && <= HybridExactComplex`), because
+ * the records ARE the reason the hit is sub-voxel: HybridBrickBox keeps the
+ * legacy occupied-box hit (docs/radiance_cascades_ray_hit_phase_2.md:27), so it
+ * belongs on the voxel-sized side with legacy, not with the record modes.
+ *
+ * @param {number|null|undefined} activeRayHitMode
+ */
+export function radialQuantizationVoxels(activeRayHitMode) {
+  const mode = Number(activeRayHitMode);
+  if (!Number.isFinite(mode)) return LEGACY_RADIAL_QUANT_VOXELS;
+  return mode >= RayHitMode.HybridPlane && mode <= RayHitMode.HybridExactComplex
+    ? HYBRID_RADIAL_QUANT_VOXELS
+    : LEGACY_RADIAL_QUANT_VOXELS;
+}
+
+/**
+ * Folds the two-term tolerance into the two JS scalars the node graph needs:
+ *
+ *     visTol = traceQuantization · radialCoef  +  dist · angularCoef
+ *
+ * Folding here rather than in TSL is what keeps the default graph IDENTICAL: at
+ * defaults `radialCoef === 1.75` and `angularCoef === 0`, and each use site skips
+ * emitting the angular add entirely when the coefficient is 0, so the shipped
+ * shader has the same nodes it had before the split.
+ *
+ * `overallTolerance` is this half's existing scale hatch (`__giMergeVisTol` /
+ * `__giGatherVisTol`, both default 1.75). It is applied as a RATIO against
+ * DEFAULT_VIS_TOL_RADIAL, so unset it is exactly 1 (x/x is exact in IEEE754) and
+ * the folded numbers are bit-identical to the literals they replace, while
+ * `__giMergeVisTol = 0` still zeroes BOTH terms — i.e. the hard-cut ablation arm
+ * keeps meaning what it meant.
+ *
+ * @param {number|null|undefined} activeRayHitMode `rayHitConfig.activeMode`
+ * @param {number} overallTolerance this half's `__gi*VisTol` value
+ */
+export function resolveVisTolTerms(activeRayHitMode = null, overallTolerance = DEFAULT_VIS_TOL_RADIAL) {
+  const rawRadial = Number(globalThis.__giVisTolRadial);
+  const kRadial = Number.isFinite(rawRadial) ? rawRadial : DEFAULT_VIS_TOL_RADIAL;
+  const rawAngular = Number(globalThis.__giVisTolAngular);
+  const kAngular = Number.isFinite(rawAngular) ? rawAngular : DEFAULT_VIS_TOL_ANGULAR;
+  // Boolean-or-numeric: the harnesses coerce `k=true` to a boolean and `k=1` to
+  // a Number (run-gi-block-size.mjs's GLOBALS/ABLATE parser), so accept both.
+  const rawModeAware = Number(globalThis.__giVisTolModeAware);
+  const modeAware = globalThis.__giVisTolModeAware === true ||
+    (Number.isFinite(rawModeAware) && rawModeAware !== 0);
+  const radialVoxels = modeAware
+    ? radialQuantizationVoxels(activeRayHitMode)
+    : LEGACY_RADIAL_QUANT_VOXELS;
+  const overallScale = Number.isFinite(overallTolerance)
+    ? overallTolerance / DEFAULT_VIS_TOL_RADIAL
+    : 1;
+  return {
+    modeAware,
+    radialVoxels,
+    kRadial,
+    kAngular,
+    radialCoef: radialVoxels * kRadial * overallScale,
+    angularCoef: kAngular * overallScale,
+  };
+}
 
 /**
  * Per-probe AMBIENT-CUBE irradiance, precomputed once per frame from the
@@ -361,7 +525,7 @@ export const gatherViewBias = uniform(0.5);
  * @param {Array} cascades from createRadianceCascades (uses cascades[0])
  * @returns {(P, N) => vec3} TSL irradiance sampler
  */
-export function createIrradianceGather(cascades, probeIrradiance = null, fieldCellMax = null, name = "giGather", occupancy = null, depthMoments = null) {
+export function createIrradianceGather(cascades, probeIrradiance = null, fieldCellMax = null, name = "giGather", occupancy = null, depthMoments = null, activeRayHitMode = null) {
   const occupancyVoxel = occupancy?.voxel ?? null;
   const c0 = cascades[0];
   const { world, grid, dirCount, dirRes } = c0;
@@ -418,8 +582,17 @@ export function createIrradianceGather(cascades, probeIrradiance = null, fieldCe
   // hard binary cut this soft fade replaced, which is the ablation arm. `||`
   // would silently hand back 1.75 and report the default as the ablation.
   const rawGatherVisTol = Number(globalThis.__giGatherVisTol);
-  const GATHER_VIS_TOLERANCE = Number.isFinite(rawGatherVisTol) ? rawGatherVisTol : 1.75;
-  const visTolerance = traceQuantization.mul(GATHER_VIS_TOLERANCE);
+  const GATHER_VIS_TOLERANCE = Number.isFinite(rawGatherVisTol) ? rawGatherVisTol : DEFAULT_VIS_TOL_RADIAL;
+  // TWO-TERM TOLERANCE — see the long decomposition note above BURIED_PROBE_WEIGHT.
+  // `radialCoef` multiplies the trace medium's quantization (mode-aware only
+  // when `__giVisTolModeAware` is on); `angularCoef` multiplies the cage-probe →
+  // receiver DISTANCE, which is the term that carries the grazing
+  // octahedral-direction quantization once the radial term stops over-paying for
+  // it. Both are 1.75 / 0 at defaults, so this line and the loop below emit
+  // exactly the nodes they emitted before the split.
+  const { radialCoef: GATHER_VIS_RADIAL, angularCoef: GATHER_VIS_ANGULAR } =
+    resolveVisTolTerms(activeRayHitMode, GATHER_VIS_TOLERANCE);
+  const visTolerance = traceQuantization.mul(GATHER_VIS_RADIAL);
   // GEOMETRY SCALE vs PROBE SCALE — the distinction the leak turned on.
   //
   // "How far behind my surface's plane can a probe sit and still be on MY side
@@ -552,6 +725,14 @@ export function createIrradianceGather(cascades, probeIrradiance = null, fieldCe
         const useChebyshev = depthMoments && !globalThis.__giNoChebyshev;
         const rel = P.sub(probePos).toVar();
         const dist = rel.length().toVar();
+        // ANGULAR half of the tolerance (see the decomposition note above
+        // BURIED_PROBE_WEIGHT): the proxy below reads the probe's ray toward the
+        // NEAREST OF dirCount coarse directions, not toward P, so the error in
+        // that ray's `w` grows with |P − probe| independently of the trace mode.
+        // Identity when `angularCoef === 0` (the default) — no extra node.
+        const visTolD = GATHER_VIS_ANGULAR !== 0
+          ? visTolV.add(dist.mul(GATHER_VIS_ANGULAR)).toVar()
+          : visTolV;
         If(dist.greaterThan(1e-4), () => {
           const towardP = octahedralTexelIndex(rel.div(dist), dirRes);
           const probeRay = useChebyshev
@@ -616,9 +797,9 @@ export function createIrradianceGather(cascades, probeIrradiance = null, fieldCe
                 mu.lessThan(nearGate)
                   .and(dist.greaterThan(minProbeCellV.mul(2)).or(behindPlane)),
                 () => {
-                  const halfTol = visTolV.mul(0.5);
+                  const halfTol = visTolD.mul(0.5);
                   const sigma2 = m.y.sub(mu.mul(mu)).max(halfTol.mul(halfTol)).toVar();
-                  const gap = dist.sub(mu).sub(visTolV).max(0).toVar();
+                  const gap = dist.sub(mu).sub(visTolD).max(0).toVar();
                   const cheb = sigma2.div(sigma2.add(gap.mul(gap)));
                   // DDGI light-leak trim (cut the tail, sharpen with a cube).
                   const vis = cheb.sub(0.05).div(0.95).clamp(0, 1).toVar();
@@ -632,7 +813,7 @@ export function createIrradianceGather(cascades, probeIrradiance = null, fieldCe
                   .and(dist.greaterThan(minProbeCellV.mul(2)).or(behindPlane)),
                 () => {
                   const penetration = dist.sub(probeRay.w);
-                  weight.mulAssign(smoothstep(visTolV, visTolV.mul(2), penetration).oneMinus());
+                  weight.mulAssign(smoothstep(visTolD, visTolD.mul(2), penetration).oneMinus());
                 },
               );
             }
@@ -838,6 +1019,11 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
     cascades, options.probeIrradiance ?? null, world.cellMax, "giFeedbackGather",
     volume.occupancyField ?? null,
     options.depthMoments ?? null,
+    // RESOLVED ray-hit mode (`rayHitConfig.activeMode`), for the radial half of
+    // the visibility tolerance. The feedback gather must agree with the resolve
+    // gather about visibility or the bounce it feeds back is not the light the
+    // screen shows.
+    options.rayHitMode ?? null,
   );
   const { res } = volume;
   const cellCount = res.x * res.y * res.z;

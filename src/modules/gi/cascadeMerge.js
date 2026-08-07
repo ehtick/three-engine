@@ -22,7 +22,7 @@
 // near field), same spirit as the reference's "flatland assumption" note.
 import { Fn, If, Loop, float, floor, instanceIndex, instancedArray, max, mix, mod, select, smoothstep, vec3, vec4 } from "three/tsl";
 import { octahedralTexelIndex, octahedralUV } from "./cascadeTrace.js";
-import { BURIED_PROBE_WEIGHT } from "./cascadeGather.js";
+import { BURIED_PROBE_WEIGHT, DEFAULT_VIS_TOL_RADIAL, resolveVisTolTerms } from "./cascadeGather.js";
 
 /**
  * Builds merged-result buffers + merge computes for a cascade array made by
@@ -58,9 +58,16 @@ import { BURIED_PROBE_WEIGHT } from "./cascadeGather.js";
 // and not the other applies half a tolerance change: the merge judges a
 // PARENT probe against a blocker, the gather judges a CAGE probe against the
 // same blocker one level finer. Sweep both, or state that you swept one.
-const DEFAULT_MERGE_VIS_TOLERANCE = 1.75;
+//
+// SINCE 2026-08-07 THIS IS THE OVERALL SCALE ON A TWO-TERM TOLERANCE, not the
+// tolerance itself — see the long decomposition note above BURIED_PROBE_WEIGHT
+// in cascadeGather.js for the radial/angular split, the measurements that forced
+// it, and the trap that shrinking the tolerance to the hybrid modes' true
+// radial error reinstates the dotted lattice. This value keeps its exact old
+// meaning at the shipped defaults (and `= 0` is still the hard-cut arm).
+const DEFAULT_MERGE_VIS_TOLERANCE = DEFAULT_VIS_TOL_RADIAL;
 
-export function createCascadeMerge(cascades, { sky = [0, 0, 0], occupancyVoxel = null, occupancy = null } = {}) {
+export function createCascadeMerge(cascades, { sky = [0, 0, 0], occupancyVoxel = null, occupancy = null, rayHitMode = null } = {}) {
   // FALSY-ZERO TRAP, fixed 2026-08-07. This was
   // `Number(globalThis.__giMergeVisTol) || DEFAULT_MERGE_VIS_TOLERANCE`, so
   // `__giMergeVisTol = 0` — a MEANINGFUL value, the hard-cut ablation, the same
@@ -77,6 +84,16 @@ export function createCascadeMerge(cascades, { sky = [0, 0, 0], occupancyVoxel =
   // key absent (or set 1.75) before its numbers mean anything again.
   const rawMergeVisTol = Number(globalThis.__giMergeVisTol);
   const MERGE_VIS_TOLERANCE = Number.isFinite(rawMergeVisTol) ? rawMergeVisTol : DEFAULT_MERGE_VIS_TOLERANCE;
+  // TWO-TERM TOLERANCE (`__giVisTolModeAware` / `__giVisTolRadial` /
+  // `__giVisTolAngular`) — the decomposition, the measurements and the trap are
+  // written out once, above BURIED_PROBE_WEIGHT in cascadeGather.js, because
+  // this proxy and the gather's are one contract. `rayHitMode` here is the
+  // RESOLVED `rayHitConfig.activeMode`, never the component's raw prop:
+  // `"auto"` is not a mode, and the entire bug is that the radial term never
+  // knew which mode had actually been resolved. At defaults these fold to
+  // 1.75 / 0 and the emitted graph is unchanged.
+  const { radialCoef: MERGE_VIS_RADIAL, angularCoef: MERGE_VIS_ANGULAR } =
+    resolveVisTolTerms(rayHitMode, MERGE_VIS_TOLERANCE);
   // See the use site: the visibility proxy's tolerance must track whatever the
   // rays actually traced. `min` with the field cell keeps it a tightening.
   const traceQuantization = occupancyVoxel
@@ -334,9 +351,24 @@ export function createCascadeMerge(cascades, { sky = [0, 0, 0], occupancyVoxel =
             // probe hidden behind anything thinner than ~0.6 m, which is most
             // floors — so a sun UNDER the floor merged its light straight up
             // into the room above.
+            //
+            // …AND THAT IS ONLY THE RADIAL HALF OF THE ERROR. The paragraph
+            // above this one already names the other half without costing it:
+            // "the ray toward the child is really the ray toward the nearest of
+            // dirCount coarse directions". That angular quantization is
+            // MODE-INDEPENDENT and scales with `dist`, while the radial
+            // quantization quoted above is ~one voxel under `occupancy-legacy`
+            // and 2.6e-5 cell units under the hybrid record modes that ship by
+            // default today (docs/radiance_cascades_ray_hit_phase_2.md:87). One
+            // constant cannot be both. See the decomposition note above
+            // BURIED_PROBE_WEIGHT in cascadeGather.js — including why shrinking
+            // this to the hybrid modes' true radial error would make the proxy
+            // binary again and bring the dotted lattice back.
             const rel = childPos.sub(parentPos).toVar();
             const dist = rel.length().toVar();
-            const visTol = float(traceQuantization).mul(MERGE_VIS_TOLERANCE);
+            const visTol = MERGE_VIS_ANGULAR !== 0
+              ? float(traceQuantization).mul(MERGE_VIS_RADIAL).add(dist.mul(MERGE_VIS_ANGULAR))
+              : float(traceQuantization).mul(MERGE_VIS_RADIAL);
             If(dist.greaterThan(1e-4), () => {
               const towardChild = octahedralTexelIndex(rel.div(dist), parent.dirRes);
               const parentRay = parent.rays.element(

@@ -3754,6 +3754,11 @@ export class GISystem {
       // coarse cascades are where a probe inside a floor is metres from the
       // children it feeds.
       occupancy: volume.occupancyField ?? null,
+      // RESOLVED mode, not `props.rayHitMode` — `"auto"` is not a mode, and the
+      // radial half of the merge's visibility tolerance is a property of what
+      // the rays ACTUALLY traced (voxel-face hit vs fitted-plane/triangle hit).
+      // See the decomposition note above BURIED_PROBE_WEIGHT in cascadeGather.js.
+      rayHitMode: rayHitConfig.activeMode,
     });
     // Per-probe ambient-cube irradiance, integrated once per frame — the
     // per-pixel/per-cell gather then reads 2 fetches per probe instead of
@@ -3779,6 +3784,10 @@ export class GISystem {
       // the buried-probe cut.
       volume.occupancyField ?? null,
       probeDepth.buffer,
+      // Same resolved ray-hit mode the merge gets — the two visibility proxies
+      // are one contract and must size their radial tolerance off the same
+      // trace medium.
+      rayHitConfig.activeMode,
     );
     // Volume diagonal as a uniform: shadow/mirror reach rescales with an
     // in-place refit (all world-scale shader inputs must be uniforms — a
@@ -3822,6 +3831,10 @@ export class GISystem {
       lightSlots,
       emitterSlots,
       bleedSaturation,
+      // Resolved ray-hit mode for this feedback pass's own gather instance (see
+      // the merge/resolve-gather call sites): all three visibility proxies must
+      // agree about the trace medium's radial quantization.
+      rayHitMode: rayHitConfig.activeMode,
       // COVERAGE-WEIGHTED INJECTION (GI_MOTION_PERF_PLAN §5.1): scale each
       // occupied field cell's injected radiance (emissive base + direct +
       // bounce) by the fraction of the cell the level-0 occupancy actually
