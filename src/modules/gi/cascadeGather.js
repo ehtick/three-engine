@@ -1082,6 +1082,12 @@ export function createIrradianceGather(cascades, probeIrradiance = null, fieldCe
       // continuously, with no ray to flicker. External shadowing of the mover
       // (it standing in a room's shade) is not modelled — a smooth over-estimate,
       // which is the only kind of error this change accepts.
+      // The FIELD irradiance before any mover touches it. The mover term needs
+      // it twice: once as the thing it occludes, and once as the light that
+      // falls on the mover itself.
+      const fieldE = (probeIrradiance
+        ? acc.div(max(cosAcc, 1e-3))
+        : acc.div(max(cosAcc, 1e-3)).mul(Math.PI)).toVar();
       const moverTerm = moverOccluders
         ? (() => {
             const vis = float(1).toVar();
@@ -1109,9 +1115,33 @@ export function createIrradianceGather(cascades, probeIrradiance = null, fieldCe
                         irr.addAssign(vec3(slot.color).mul(atten.mul(ndotl).mul(1 / Math.PI)));
                       });
                     }
+                    // ── AND THE INDIRECT LIGHT ON THE MOVER, WHICH IS USUALLY
+                    // ── MOST OF IT. Direct-only radiance produced a BLACK DISC
+                    // under a white sphere with the sun straight overhead: the
+                    // floor beneath sees the sphere's UNDERSIDE, whose ndotl to
+                    // an overhead sun is 0, so the mover contributed nothing
+                    // while its occlusion removed the field. Net: no direct (the
+                    // sphere really does shadow the sun), no field (occluded),
+                    // no bounce. Black — and physically wrong, because in
+                    // reality that underside is lit almost entirely by bounce
+                    // off the bright floor.
+                    //
+                    // `fieldE` at the RECEIVER is the estimate used for the
+                    // field at the mover's surface. They are metres apart and
+                    // see substantially the same room, and the alternative is a
+                    // recursive gather. What makes it more than a convenience is
+                    // that it makes the term ENERGY-CONSERVING in the limit: for
+                    // a white mover in a uniform field,
+                    //     E = fieldE·(1−f) + (albedo·fieldE/π)·f·π  →  fieldE
+                    // so a white object hides exactly as much light as it
+                    // returns and the degenerate black case cannot arise. A dark
+                    // mover still darkens, a bright one still brightens, both by
+                    // their albedo — which is the correct behaviour and the one
+                    // a single-bounce direct-only model could never produce.
                     const alb = moverOccluders.albedo.element(mo).toVar();
                     const ems = moverOccluders.emissive.element(mo).toVar();
-                    const radiance = ems.xyz.add(alb.xyz.mul(irr)).toVar();
+                    const litBy = irr.add(fieldE.mul(1 / Math.PI)).toVar();
+                    const radiance = ems.xyz.add(alb.xyz.mul(litBy)).toVar();
                     // Emission enters through the SAME visibility this mover has
                     // already been occluded by, so a mover behind another mover
                     // does not shine through it.
@@ -1124,11 +1154,10 @@ export function createIrradianceGather(cascades, probeIrradiance = null, fieldCe
             return { vis, emit };
           })()
         : null;
-      const shadowed = (e) => (moverTerm ? e.mul(moverTerm.vis).add(moverTerm.emit) : e);
-      if (probeIrradiance) {
-        return shadowed(acc.div(max(cosAcc, 1e-3))).mul(edgeFade);
-      }
-      return shadowed(acc.div(max(cosAcc, 1e-3)).mul(Math.PI)).mul(edgeFade);
+      // ONE definition of the field irradiance, computed above as `fieldE` and
+      // reused here — the mover term reads the same value it occludes, which is
+      // what makes the energy identity above hold exactly rather than nearly.
+      return (moverTerm ? fieldE.mul(moverTerm.vis).add(moverTerm.emit) : fieldE).mul(edgeFade);
     },
   });
   // V (unit toward-camera) is optional — omitted = vec3(0) = no view bias,

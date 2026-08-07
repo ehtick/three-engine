@@ -313,3 +313,41 @@ if (failures) {
   console.error(`gi-proxy-fit: ${failures} case(s) FAILED (occlusion section)`);
   process.exit(1);
 }
+
+// ── (9) ENERGY CONSERVATION — why the black disc cannot come back ────────────
+// The gather composes a mover as
+//     E = fieldE·(1−f) + (emissive + albedo·(irrDirect + fieldE/π))·f·π
+// The identity that matters: a WHITE, non-emissive mover in a uniform field must
+// return exactly the field, whatever f is. It hides as much light as it gives
+// back, so no configuration — including a sphere directly overhead with the sun
+// straight down, where irrDirect on the visible underside is 0 — can drive the
+// receiver to black. That case shipped and was screenshotted.
+{
+  const compose = (fieldE, albedo, emissive, irrDirect, f) =>
+    fieldE * (1 - f) + (emissive + albedo * (irrDirect + fieldE / Math.PI)) * f * Math.PI;
+
+  let worst = 0;
+  for (const f of [0, 0.1, 0.25, 0.5, 0.75, 0.9, 1]) {
+    // The exact screenshot case: overhead sun, so the underside sees no direct.
+    const out = compose(1, 1, 0, 0, f);
+    worst = Math.max(worst, Math.abs(out - 1));
+  }
+  console.log(`  [energy] white mover, no direct on the visible side: worst deviation from the field ${worst.toFixed(6)}`);
+  check("a white mover neither darkens nor brightens a uniform field", worst < 1e-9, `${worst}`);
+
+  // A dark mover must still darken, and in proportion to its albedo — the term
+  // must not be a no-op dressed up as conservation.
+  const dark = compose(1, 0.1, 0, 0, 0.5);
+  const bright = compose(1, 1.0, 0, 0, 0.5);
+  console.log(`  [energy] at f=0.5 — albedo 0.1 -> ${dark.toFixed(3)}, albedo 1.0 -> ${bright.toFixed(3)}`);
+  check("a dark mover darkens", dark < 0.6, `${dark.toFixed(3)}`);
+  check("and a white one does not", Math.abs(bright - 1) < 1e-9, `${bright.toFixed(3)}`);
+
+  // Full occlusion by a black body is the one case that SHOULD go to zero.
+  check("a black mover at f=1 fully occludes", Math.abs(compose(1, 0, 0, 0, 1)) < 1e-9);
+}
+
+if (failures) {
+  console.error(`gi-proxy-fit: ${failures} case(s) FAILED (energy section)`);
+  process.exit(1);
+}
