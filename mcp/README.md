@@ -55,17 +55,37 @@ box — permission prompts, `/` commands and Ctrl-C all work.
 ## How it fits together
 
 ```
-assistant ──stdio(MCP)──▶ mcp/server.mjs ──WebSocket──▶ editor (src/editor/api/mcpBridge.js)
-                                                             │
-                                                             ▼
-                                                     registry.js → commandBus
+assistant A ──stdio(MCP)──▶ mcp/server.mjs ─┐
+                                            ├─WebSocket─▶ mcp/broker.mjs ◀─WebSocket─ editor
+assistant B ──stdio(MCP)──▶ mcp/server.mjs ─┘            (owns the port)     (src/editor/api/mcpBridge.js)
+                                                                                      │
+                                                                                      ▼
+                                                                              registry.js → commandBus
 ```
 
-The server is a short-lived process the MCP client spawns; the editor is a long-
-lived browser/webview that cannot listen on a socket. So the server hosts the
-WebSocket on `127.0.0.1` and the editor dials in, reconnecting with backoff —
-expect the bridge to connect and disconnect repeatedly across a working session
-as conversations start and end.
+An MCP client spawns its own stdio server, so **N assistants are always N copies
+of `server.mjs`** — there is no way to attach a second client to a running one.
+The editor, meanwhile, is a browser/webview that cannot listen on a socket, so it
+has to dial out to a fixed port. Those two facts collide: if a session server
+owned that port, the second session lost the bind.
+
+So the port belongs to `mcp/broker.mjs`, a small daemon that outlives every
+session. It accepts the editor on one side and any number of session servers on
+the other, and routes calls between them. The first session to start spawns it
+(detached, so it survives that session ending); it exits on its own once nothing
+has been attached for a couple of minutes.
+
+Two consequences worth knowing:
+
+- **Several assistants can drive one editor at once.** `editor_status` reports
+  `attachedSessions` so each one can tell it has company — the scene, the undo
+  stack and play mode are all shared.
+- **The editor connects once and stays connected**, rather than following each
+  conversation's lifetime. Sessions come and go underneath it.
+
+Every mutating tool still runs through the editor's command bus, so anything an
+assistant does lands on the undo stack and can be reverted with Ctrl+Z (or the
+`history_undo` tool) exactly like a hand edit.
 
 Every mutating tool runs through the editor's command bus, so anything an
 assistant does lands on the undo stack and can be reverted with Ctrl+Z (or the
@@ -143,10 +163,22 @@ what `component_add` will accept.
 | `ENGINE_MCP_PORT` | `17325` | Bridge port. Must match the port in the Assistant (MCP) panel. |
 | `ENGINE_MCP_TIMEOUT_MS` | `30000` | How long a forwarded call may take. |
 | `ENGINE_MCP_GRACE_MS` | `10000` | How long `tools/list` waits for an editor at startup. |
+| `ENGINE_MCP_IDLE_MS` | `120000` | How long the broker waits, with nothing attached, before exiting. |
+| `ENGINE_MCP_LOG` | temp dir | Where the broker writes its log. |
 
-Two editors cannot share a port; the second server to start exits with an
-explanation. Run a second instance on another port by setting `ENGINE_MCP_PORT`
-on the server and matching it in that editor's Assistant (MCP) panel.
+Several sessions sharing one editor is the normal case and needs no
+configuration. What still needs a separate port is a second *editor*: give it its
+own `ENGINE_MCP_PORT` and match it in that editor's Assistant (MCP) panel, and it
+gets its own broker.
+
+The broker is detached, so it has nowhere to log but a file —
+`%TEMP%/three-engine-broker-<port>.log` (or `$TMPDIR`) is the first place to look
+when the bridge behaves oddly. It records every attach, detach and retirement.
+
+`server.mjs` and the broker carry a protocol version (`bridgeProtocol.mjs`). A
+session that finds an older broker on the port — a daemon left running from a
+previous checkout — retires it and starts a current one, so a stale process
+cannot quietly serve an obsolete protocol forever.
 
 ## Scope, deliberately
 
@@ -160,6 +192,7 @@ are not using it.
 
 ```sh
 npm run test:mcp         # server + protocol, against a fake editor — no browser
+npm run test:mcp-multi   # several sessions sharing one editor through the broker
 npm run smoke:mcp        # end-to-end: real server, real editor, real scene edits
 npm run smoke:editor-api # the ops themselves, incl. screenshot + batch (HEADED)
 npm run smoke:authoring  # materials, scene look, prefabs, import, modules

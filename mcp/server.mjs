@@ -19,15 +19,21 @@
  * The tools have to run INSIDE the editor: they mutate a live scene graph held
  * by a running WebGPU renderer, and every mutation goes through the editor's
  * command bus so it lands on the undo stack. This process cannot do any of
- * that — it is a short-lived stdio process the MCP client spawns, and the
- * editor is a browser/Tauri webview it has no handle on.
+ * that — it is a stdio process the MCP client spawns, and the editor is a
+ * browser/Tauri webview it has no handle on.
  *
- * A browser page can't listen on a socket, so the direction is forced: this
- * process hosts a WebSocket server on 127.0.0.1 and the editor dials in (see
- * `src/editor/api/mcpBridge.js`). Everything else follows from that — the
- * editor may connect after we start, disconnect on reload, and reconnect, which
- * is why the tool list is dynamic and why `notifications/tools/list_changed`
- * matters here rather than being a formality.
+ * A browser page can't listen on a socket, so the editor has to dial out (see
+ * `src/editor/api/mcpBridge.js`). What it dials is `mcp/broker.mjs`, NOT this
+ * file — and that indirection is the whole reason two assistants can drive one
+ * editor. An MCP client spawns its own stdio server, so N sessions are N copies
+ * of this process no matter what; when this file owned the port, the second copy
+ * lost the bind and died, and the client reported the dead pipe as `-32000`.
+ * Now every copy is a client of one long-lived broker that owns the port.
+ *
+ * So this process no longer holds any editor state of its own — it mirrors what
+ * the broker pushes. The editor may connect after we start, disconnect on
+ * reload, and reconnect, which is why the tool list is dynamic and why
+ * `notifications/tools/list_changed` matters here rather than being a formality.
  *
  * ## The tool list is the editor's, not ours
  *
@@ -38,15 +44,20 @@
  * facing an empty tool list has no way to distinguish "the editor is closed"
  * from "this server is broken".
  */
-import { WebSocketServer } from "ws";
+import { spawn } from "node:child_process";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { WebSocket } from "ws";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import { BRIDGE_PROTOCOL, bridgePort } from "./bridgeProtocol.mjs";
 
-const PORT = Number(process.env.ENGINE_MCP_PORT ?? 17325);
+const PORT = bridgePort();
+const BROKER_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "broker.mjs");
 /** How long a forwarded call may take before we give up on the editor. */
 const CALL_TIMEOUT_MS = Number(process.env.ENGINE_MCP_TIMEOUT_MS ?? 30_000);
 /**
@@ -65,15 +76,26 @@ const startedAt = Date.now();
 const log = (...args) => console.error("[three-engine]", ...args);
 
 // ---------------------------------------------------------------------------
-// Bridge: one editor at a time
+// Bridge: a client of the broker, which owns the editor
 // ---------------------------------------------------------------------------
 
-/** Current editor socket, or null. */
-let editor = null;
-/** Tool descriptors the editor advertised on connect. */
+/** Socket to the broker, once connected and welcomed. */
+let broker = null;
+/** Whether the broker says an editor is attached. Mirrored, never authoritative. */
+let editor = false;
+/** Tool descriptors the editor advertised, as relayed by the broker. */
 let editorTools = [];
-/** Editor-reported metadata (api version, project, scene) for `editor_status`. */
+/** Editor-reported metadata (api version, op count) for `editor_status`. */
 let editorInfo = null;
+/** How many sessions — including this one — are attached to the broker. */
+let sessionCount = 0;
+/** Why the bridge is unreachable, if it is. Surfaced by `editor_status`, which
+ *  is the only place an assistant can be told anything when no tools exist. */
+let bridgeFailure = null;
+/** Pending slow retry, so the chains below can never overlap. */
+let retryTimer = null;
+/** Whether a connect loop is already running. */
+let connecting = false;
 /** id -> { resolve, reject, timer } for calls in flight. */
 const pending = new Map();
 let nextId = 1;
@@ -105,11 +127,12 @@ function rejectAllPending(reason) {
   pending.clear();
 }
 
-/** Sends a request to the editor and resolves with its reply. */
+/** Sends a request to the editor, via the broker, and resolves with its reply. */
 function request(method, params = {}) {
+  if (!broker) return Promise.reject(new Error("The bridge broker is not connected."));
   if (!editor) return Promise.reject(new Error("The editor is not connected."));
   const id = nextId++;
-  const socket = editor;
+  const socket = broker;
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       pending.delete(id);
@@ -127,64 +150,115 @@ function request(method, params = {}) {
   });
 }
 
-const wss = new WebSocketServer({ host: "127.0.0.1", port: PORT });
-
-wss.on("listening", () => log(`bridge listening on ws://127.0.0.1:${PORT}`));
-
-wss.on("error", (err) => {
-  // EADDRINUSE almost always means a second copy of this server is already
-  // running (two MCP clients, or a stale process). Say so rather than dying
-  // with a bare stack, and exit — the editor will stay attached to the first.
-  if (err?.code === "EADDRINUSE") {
-    log(
-      `port ${PORT} is already in use — another engine MCP server is probably running. ` +
-        `Set ENGINE_MCP_PORT (and match it in the editor's Project Settings) to run a second one.`,
-    );
-    process.exit(1);
+/**
+ * Starts a broker daemon.
+ *
+ * Detached with `stdio: "ignore"` on purpose, and both halves matter. Inheriting
+ * our pipes would keep the daemon's stdout open against a dead session and, on
+ * Windows, tie it to our console — either way its lifetime would collapse back
+ * onto ours, which is the exact coupling this design removes. It logs to a file
+ * instead (`broker.mjs` says where).
+ *
+ * Racing is fine and expected: two sessions starting together both land here,
+ * and the broker that loses the bind exits 0 without complaint.
+ */
+function spawnBroker() {
+  try {
+    const child = spawn(process.execPath, [BROKER_PATH], {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+      env: process.env,
+    });
+    child.unref();
+    log(`started a bridge broker (pid ${child.pid}) on port ${PORT}`);
+    return true;
+  } catch (err) {
+    log("could not start a bridge broker:", err?.message ?? err);
+    return false;
   }
-  log("bridge error:", err?.message ?? err);
-});
+}
 
-wss.on("connection", (socket, req) => {
-  // Refuse anything that isn't loopback. `host: "127.0.0.1"` already binds
-  // locally, but a belt-and-braces check keeps a future config change from
-  // silently exposing scene mutation to the network.
-  const address = req.socket.remoteAddress ?? "";
-  if (!["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(address)) {
-    log(`refused non-local connection from ${address}`);
-    socket.close(1008, "local connections only");
-    return;
-  }
-
-  // A reloaded editor can connect before its old socket's close event lands.
-  // Newest wins — the old one is gone by definition.
-  if (editor && editor !== socket) {
-    log("a second editor connected; dropping the previous one");
+/** Resolves with an open, welcomed socket, or rejects. */
+function dialBroker() {
+  return new Promise((resolve, reject) => {
+    let socket;
     try {
-      editor.close(1000, "replaced by a newer editor");
-    } catch {
-      // already closing
+      socket = new WebSocket(`ws://127.0.0.1:${PORT}`);
+    } catch (err) {
+      reject(err);
+      return;
     }
-    rejectAllPending("The editor was replaced by a newer connection.");
-  }
-  editor = socket;
-  log("editor connected");
+    // A peer that accepts the TCP connection but never welcomes us is worse than
+    // one that refuses outright — without this the whole startup would hang on
+    // it rather than falling through to spawning a healthy one.
+    //
+    // In practice this has exactly one cause: a PRE-BROKER `server.mjs` from an
+    // older checkout, which hosted the port itself and treats any connection as
+    // the editor. It will never welcome anyone, and it cannot be retired over
+    // the protocol because it does not speak it. `silent` marks that case so the
+    // failure can name it instead of timing out anonymously.
+    const timer = setTimeout(() => {
+      try {
+        socket.close();
+      } catch {
+        // already closing
+      }
+      reject(Object.assign(new Error("the peer on the bridge port never welcomed us"), { silent: true }));
+    }, 1500);
+    timer.unref?.();
+
+    socket.on("open", () => {
+      socket.send(JSON.stringify({ type: "session", protocol: BRIDGE_PROTOCOL, client: "three-engine-mcp" }));
+    });
+    socket.once("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    socket.on("message", function onFirst(data) {
+      let message;
+      try {
+        message = JSON.parse(String(data));
+      } catch {
+        return;
+      }
+      if (message.type !== "welcome") return;
+      clearTimeout(timer);
+      socket.off("message", onFirst);
+      resolve({ socket, welcome: message });
+    });
+  });
+}
+
+const wait = (ms) => new Promise((r) => setTimeout(r, ms).unref?.());
+
+/** Wires an established broker socket up to our mirrored state. */
+function adoptBroker(socket) {
+  broker = socket;
 
   socket.on("message", (data) => {
     let message;
     try {
       message = JSON.parse(String(data));
     } catch {
-      log("ignored unparseable message from the editor");
+      log("ignored an unparseable message from the broker");
       return;
     }
 
-    // Unsolicited: the editor announcing itself and its tool list.
-    if (message.type === "hello") {
+    // The broker's view of the editor, pushed on every change. This is the only
+    // thing that moves `editor`/`editorTools` — we never observe the editor
+    // directly any more.
+    if (message.type === "editor") {
+      const had = editor;
+      editor = !!message.connected;
       editorTools = Array.isArray(message.tools) ? message.tools : [];
       editorInfo = message.info ?? null;
-      log(`editor advertised ${editorTools.length} tools (api ${editorInfo?.apiVersion ?? "?"})`);
-      settleWaiters();
+      sessionCount = Number(message.sessions) || 0;
+      if (editor !== had) {
+        log(editor ? `editor connected (${editorTools.length} tools)` : "editor disconnected");
+        if (!editor) rejectAllPending("The editor disconnected.");
+      }
+      if (editor) settleWaiters();
       notifyToolsChanged();
       return;
     }
@@ -198,17 +272,132 @@ wss.on("connection", (socket, req) => {
   });
 
   const drop = () => {
-    if (editor !== socket) return;
-    editor = null;
+    if (broker !== socket) return;
+    broker = null;
+    editor = false;
     editorTools = [];
     editorInfo = null;
-    rejectAllPending("The editor disconnected.");
-    log("editor disconnected");
+    rejectAllPending("The bridge broker disconnected.");
+    log("broker disconnected — reconnecting");
     notifyToolsChanged();
+    // The daemon idled out, crashed, or retired for a newer one. Any of those is
+    // recoverable: connect again, spawning a replacement if nothing answers.
+    connectToBroker().catch((err) => log("reconnect failed:", err?.message ?? err));
   };
   socket.on("close", drop);
   socket.on("error", drop);
-});
+}
+
+/**
+ * Connects to the broker, starting one if there isn't a usable one already.
+ *
+ * Retries rather than failing on the first refusal, because "nothing is
+ * listening yet" is the ordinary first-run state, not an error — the daemon we
+ * just spawned needs a moment to bind.
+ */
+async function connectToBroker(attempts = 12) {
+  // Two overlapping loops would both spawn brokers and both adopt a socket,
+  // leaving one orphaned and this session counted twice.
+  if (connecting || broker) return !!broker;
+  connecting = true;
+  try {
+    return await attemptConnect(attempts);
+  } finally {
+    connecting = false;
+  }
+}
+
+async function attemptConnect(attempts) {
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    let established;
+    try {
+      established = await dialBroker();
+    } catch (err) {
+      // Diagnose as soon as the condition is visible, not after the retries run
+      // out. A stale pre-broker server is not going to start behaving on attempt
+      // nine, and by then an assistant has long since called `editor_status` and
+      // been told only that something is not working yet. Retrying underneath a
+      // published explanation costs nothing; withholding it for half a minute
+      // costs the user the whole diagnosis.
+      if (err?.silent) {
+        bridgeFailure =
+          `Something is holding port ${PORT} but does not speak the bridge protocol. This is ` +
+          "almost always an MCP server from an older checkout of the engine, left running by a " +
+          "Claude or Codex session that is still open — it owned this port itself, before the " +
+          "broker existed. Close that session (or kill the stray `node .../mcp/server.mjs` " +
+          "process) and this will connect on its own.";
+        if (attempt === 0) log(bridgeFailure);
+      }
+      // Nothing (usable) is listening. Start one and give it a moment. Doing
+      // this on every failed attempt rather than only the first is deliberate:
+      // if two sessions race, the loser's broker exits, and whichever daemon
+      // survives may still be a moment from binding.
+      if (attempt === 0 || attempt === 3) spawnBroker();
+      await wait(Math.min(150 * (attempt + 1), 600));
+      continue;
+    }
+
+    const { socket, welcome } = established;
+    // An older daemon left over from a previous checkout speaks an older
+    // protocol. Retire it and take the port with a current one, rather than
+    // leaving the user to find a stale process by hand.
+    if (Number(welcome.protocol) < BRIDGE_PROTOCOL) {
+      log(`broker pid ${welcome.pid} speaks protocol ${welcome.protocol}; retiring it for ${BRIDGE_PROTOCOL}`);
+      try {
+        socket.send(JSON.stringify({ type: "retire", protocol: BRIDGE_PROTOCOL }));
+        socket.close();
+      } catch {
+        // already closing
+      }
+      await wait(300);
+      spawnBroker();
+      await wait(200);
+      continue;
+    }
+    if (Number(welcome.protocol) > BRIDGE_PROTOCOL) {
+      // The reverse skew: a NEWER broker, i.e. this session is the stale one.
+      // Retiring it would start a fight between two long-lived sessions, so
+      // attach anyway and say so — the shapes are usually still compatible, and
+      // a loud log beats a silent downgrade.
+      log(`warning: broker speaks protocol ${welcome.protocol}, this server speaks ${BRIDGE_PROTOCOL}`);
+    }
+
+    adoptBroker(socket);
+    bridgeFailure = null;
+    if (retryTimer) {
+      clearTimeout(retryTimer);
+      retryTimer = null;
+    }
+    log(`attached to bridge broker pid ${welcome.pid} on port ${PORT}`);
+    return true;
+  }
+  bridgeFailure ??=
+    `Could not start or reach a bridge broker on port ${PORT} after ${attempts} attempts. ` +
+    "Check that the port is free and that mcp/broker.mjs can run.";
+  // Back off, but NEVER stop. This process lives as long as the conversation
+  // does, and the thing blocking the port — a stale server from an older
+  // checkout, an editor mid-restart — is usually cleared by hand minutes later.
+  // An earlier version returned false here and simply stopped, so a session that
+  // started during that window stayed toolless until the whole client was
+  // restarted, with no way for the user to tell that clearing the blockage had
+  // done any good. Retrying quietly is what makes the fix take effect on its own.
+  scheduleBrokerRetry();
+  return false;
+}
+
+/** How long to wait before retrying a bridge connection that would not come up. */
+const RETRY_MS = Number(process.env.ENGINE_MCP_RETRY_MS ?? 10_000);
+
+/** Retries the connection later, unless one is already scheduled or live. */
+function scheduleBrokerRetry(ms = RETRY_MS) {
+  if (retryTimer || broker) return;
+  retryTimer = setTimeout(() => {
+    retryTimer = null;
+    if (broker) return;
+    connectToBroker().catch((err) => log("retry failed:", err?.message ?? err));
+  }, ms);
+  retryTimer.unref?.();
+}
 
 // ---------------------------------------------------------------------------
 // MCP surface
@@ -294,10 +483,14 @@ async function describeStatus() {
     return {
       connected: false,
       port: PORT,
-      hint:
-        "The engine editor is not connected. Start it (npm run dev, or the desktop app), " +
-        "open a project, and make sure Project Settings → MCP is enabled and set to port " +
-        `${PORT}. Tools will appear automatically once it connects.`,
+      brokerConnected: !!broker,
+      hint: broker
+        ? "The bridge is up but the engine editor is not attached to it. Start the editor " +
+          "(npm run dev, or the desktop app), open a project, and make sure Project Settings → " +
+          `MCP is enabled and set to port ${PORT}. Tools will appear automatically once it connects.`
+        : (bridgeFailure ??
+          `Could not reach the bridge broker on port ${PORT} yet, so nothing can be forwarded to ` +
+            "the editor. This normally resolves itself within a second or two of startup."),
     };
   }
   // Ask live rather than reporting the cached hello: the user has almost
@@ -331,6 +524,20 @@ async function describeStatus() {
     apiVersion: editorInfo?.apiVersion ?? null,
     toolCount: editorTools.length,
     toolFamilies: families,
+    // One editor can be driven by several assistants at once. That is a
+    // supported setup, not an anomaly — but it does mean the scene can change
+    // under you between two of your own calls, and that the undo stack is
+    // shared. An assistant that knows it has company can say so before making a
+    // large change; one that assumes it is alone will blame the editor.
+    attachedSessions: sessionCount,
+    ...(sessionCount > 1
+      ? {
+          sharedEditorHint:
+            `${sessionCount} assistant sessions are attached to this editor. The scene, the undo ` +
+            "stack and play mode are shared, so re-read state you depend on rather than trusting " +
+            "a cached read, and prefer narrow, reversible edits.",
+        }
+      : {}),
     staleListHint:
       "If a tool you expect is missing from your list, compare it with toolCount/toolFamilies above. " +
       "A tool list is fetched once per session, so it can predate the running editor; reconnecting " +
@@ -402,8 +609,12 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 });
 
 const shutdown = () => {
+  // Close our socket, never the broker: it is shared with every other session
+  // and is meant to outlive us. It reaps itself once nothing is attached.
+  const socket = broker;
+  broker = null;
   try {
-    wss.close();
+    socket?.close(1000, "session ending");
   } catch {
     // already closing
   }
@@ -413,21 +624,23 @@ process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 // The MCP client (claude) closes its end of stdin when IT exits — the normal
 // end of a `-p` turn, not an error. Without this, nothing here ever reacts to
-// that: the WebSocketServer keeps a live handle open, which keeps the event
-// loop (and therefore the process) alive indefinitely even with a completely
-// dead stdio channel. The orphan then squats on PORT forever, so every
-// SUBSEQUENT invocation's freshly-spawned server fails to bind it and reports
-// itself "failed" to connect — which is exactly the "no MCP tools" symptom a
-// one-shot headless run (aiStore.js's runWorkflow) hits on a second run,
-// since each one spawns a fresh `claude -p` with its own fresh server. Same
-// leak, same fix, for a long-lived interactive session killed uncleanly
-// (closed terminal, task-killed `claude`) rather than a clean exit.
+// that: the open WebSocket keeps a live handle open, which keeps the event loop
+// (and therefore the process) alive indefinitely even with a completely dead
+// stdio channel. That used to be actively destructive, because the orphan also
+// squatted on PORT and every subsequent session failed to bind it. Since the
+// port moved to the broker an orphan is merely a leak rather than a denial of
+// service — but it is still a leak, and this is still the fix.
 process.stdin.on("end", shutdown);
 process.stdin.on("close", shutdown);
 
 await server.connect(new StdioServerTransport());
 mcpConnected = true;
 log("MCP server ready on stdio");
+// Not awaited: `tools/list` blocks on the editor for us (see STARTUP_GRACE_MS),
+// so the client's very first request already covers the connect latency, and
+// holding up `server.connect` behind a broker spawn would only make a slow
+// bridge look like a slow handshake.
+connectToBroker().catch((err) => log("could not attach to a bridge broker:", err?.message ?? err));
 // If the editor was already waiting when we finished connecting, the
 // list_changed we skipped above still needs sending.
 if (editor) notifyToolsChanged();

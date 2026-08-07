@@ -5,21 +5,26 @@ import { vmSingleton } from "../singleton.js";
 /**
  * The editor's half of the MCP bridge.
  *
- * Dials the MCP server's local WebSocket (see `mcp/server.mjs`), advertises the
- * op registry as a tool manifest, and executes forwarded calls against the live
- * editor. The direction is dictated by the browser: a page cannot listen on a
- * socket, so the short-lived stdio process is the server and the long-lived
- * editor is the client.
+ * Dials the local bridge WebSocket (`mcp/broker.mjs`), advertises the op registry
+ * as a tool manifest, and executes forwarded calls against the live editor. The
+ * direction is dictated by the browser: a page cannot listen on a socket, so the
+ * editor is always the client.
+ *
+ * What is on the other end is a broker daemon, not any one assistant's MCP
+ * server — that indirection is what lets several assistants drive this editor at
+ * once (see `mcp/broker.mjs`). Nothing in this file had to change for that,
+ * which was the point: the greeting and the request/reply shapes below are the
+ * same ones the bridge has always spoken.
  *
  * ## Reconnecting is the normal case, not the error case
  *
- * The MCP server's lifetime is the assistant's, not the editor's — it is
- * spawned when a conversation starts and killed when it ends, possibly several
- * times while the editor stays open. So a failed connection is expected and
- * must be quiet: the backoff below tops out at 15s and logs only on the
- * transitions a user cares about (connected, and the first failure after a
- * successful connection). An earlier version logged every attempt and filled
- * the console with a line every two seconds whenever no assistant was running.
+ * The bridge outlives individual conversations now, but not the machine: the
+ * broker exits once nothing has been attached for a while, and comes back when
+ * the next assistant starts. So a failed connection is still expected and must
+ * be quiet: the backoff below tops out at 15s and logs only on the transitions a
+ * user cares about (connected, and the first failure after a successful
+ * connection). An earlier version logged every attempt and filled the console
+ * with a line every two seconds whenever no assistant was running.
  *
  * ## Everything runs through `EditorApi.callTool`
  *
@@ -39,6 +44,10 @@ export const useMcpStore = vmSingleton("mcpStore", () =>
     port: null,
     /** Number of tools advertised on the current connection. */
     toolCount: 0,
+    /** Assistant sessions attached to the bridge broker. Several can drive one
+     *  editor at once, and the panel says so — a scene changing under you is a
+     *  lot less alarming when you can see that something else is holding it. */
+    sessionCount: 0,
     /** Total calls served since this editor session started — a liveness signal
      *  the status chip can show, so "is it actually doing anything?" is visible. */
     callCount: 0,
@@ -89,6 +98,13 @@ async function handleMessage(raw) {
   } catch {
     return;
   }
+  // How many assistant sessions the broker currently has attached. Unsolicited
+  // and id-less, so it is handled before the request path below.
+  if (message.type === "sessions") {
+    useMcpStore.setState({ sessionCount: Number(message.count) || 0 });
+    return;
+  }
+
   const { id, method, params = {} } = message;
   if (id === undefined) return;
 
@@ -176,7 +192,7 @@ function connect() {
     if (state.socket !== ws) return;
     state.socket = null;
     const wasConnected = useMcpStore.getState().status === "connected";
-    useMcpStore.setState({ status: state.config.enabled ? "connecting" : "disabled", toolCount: 0 });
+    useMcpStore.setState({ status: state.config.enabled ? "connecting" : "disabled", toolCount: 0, sessionCount: 0 });
     if (wasConnected) console.log("MCP bridge disconnected");
     // Always keep trying while enabled — `scheduleReconnect` itself already
     // no-ops when disabled. This used to be gated on `state.hadConnection`,
@@ -211,7 +227,7 @@ function disconnect() {
   } catch {
     // already closed
   }
-  useMcpStore.setState({ status: "disabled", toolCount: 0 });
+  useMcpStore.setState({ status: "disabled", toolCount: 0, sessionCount: 0 });
 }
 
 /**

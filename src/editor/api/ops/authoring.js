@@ -19,6 +19,7 @@ import { commandBus } from "../../commands/CommandBus.js";
 import { SetSceneSettingsCommand } from "../../commands/settingsCommands.js";
 import { useProjectStore } from "../../store/projectStore.js";
 import { invoke } from "../../assetOps.js";
+import { refreshAssetFromDisk } from "../../projectWatcher.js";
 import { MATERIAL_DEFAULTS } from "../../../engine/materialAsset.js";
 import { SCENE_SETTINGS_DEFAULTS, TONE_MAPPINGS } from "../../../engine/sceneSettings.js";
 
@@ -73,6 +74,9 @@ defineOp({
     // renders fully opaque, which reads as "the tool ignored my opacity".
     if (typeof def.opacity === "number" && def.opacity < 1) def.transparent = true;
     await invoke("save_scene", { path, contents: JSON.stringify(def, null, 2) });
+    // See material.set: writing the bytes is not the same as the editor — or a
+    // live browser preview — seeing them.
+    await refreshAssetFromDisk(path);
     await useProjectStore.getState().refresh();
     return { path, definition: def };
   },
@@ -104,6 +108,14 @@ defineOp({
     const next = { ...current, ...patch };
     if (typeof next.opacity === "number" && next.opacity < 1) next.transparent = true;
     await invoke("save_scene", { path: target, contents: JSON.stringify(next, null, 2) });
+    // Writing a `.mat` past the caches that own it leaves the viewport — and,
+    // silently, every live browser preview — rendering the previous version.
+    // `save_scene` marks itself a self-write so the filesystem watcher will not
+    // notice either, and the browser preview's rebuild loop hangs off exactly
+    // this invalidation: without it a material edit made through the API never
+    // reaches the served build until some unrelated edit happens to trigger the
+    // next export. Measured: the `.mat` shipped one rebuild late, or never.
+    await refreshAssetFromDisk(target);
     return { path: target, definition: next };
   },
 });

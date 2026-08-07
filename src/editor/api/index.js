@@ -50,6 +50,7 @@ import "./ops/pipeline.js";
 import "./ops/git.js";
 import "./ops/fonts.js";
 import "./ops/batch.js";
+import "./ops/profile.js";
 
 /** Runs an op synchronously, asserting it isn't one of the async ones. Used by
  *  the sync accessors below, where returning a promise would be a footgun. */
@@ -68,7 +69,7 @@ export const EditorApi = {
    * MINOR bumps when tools are added — an assistant holding a tool list from an
    * older editor can compare this against what it was told at connect time.
    */
-  version: "1.3.0",
+  version: "1.4.0",
 
   // ---- raw registry access (the MCP-facing half) ----------------------------
 
@@ -110,6 +111,9 @@ export const EditorApi = {
     duplicate: (ids) => sync("entity.duplicate", { ids: Array.isArray(ids) ? ids : [ids] }),
     setTransform: (id, transform) => sync("entity.setTransform", { id, ...transform }),
     setTags: (id, tags) => sync("entity.setTags", { id, tags }),
+    /** World-space extents, children included — unknowable from transforms
+     *  alone, since a "box" mesh's real size depends on geometry and scale. */
+    getBounds: (id) => sync("entity.getBounds", { id }),
   },
 
   // ---- components -----------------------------------------------------------
@@ -164,6 +168,9 @@ export const EditorApi = {
     get: () => sync("scene.get"),
     save: () => callOp("scene.save"),
     open: (path) => callOp("scene.open", { path }),
+    /** Fog, environment, tone mapping, shadows — the scene's look. */
+    getSettings: () => callOp("scene.getSettings"),
+    setSettings: (patch, label) => callOp("scene.setSettings", label ? { patch, label } : { patch }),
   },
 
   project: {
@@ -189,6 +196,28 @@ export const EditorApi = {
     /** Re-read files changed outside the editor. Omit `paths` to just re-list. */
     refresh: (paths) => callOp("asset.refresh", paths ? { paths: Array.isArray(paths) ? paths : [paths] } : {}),
     watchStatus: () => sync("asset.watchStatus"),
+    /** What can be done with this asset — the Inspector's own action list. */
+    actions: (path) => callOp("asset.actions", { path }),
+    /** Run one of the ids `actions()` returned. */
+    runAction: (path, action) => callOp("asset.runAction", { path, action }),
+  },
+
+  /** Typefaces: what the project has, what Google Fonts offers, and importing one. */
+  fonts: {
+    list: () => callOp("font.list"),
+    inspect: (path) => callOp("font.inspect", { path }),
+    search: (query, options = {}) => callOp("font.search", { query, ...options }),
+    import: (family, weights) => callOp("font.import", weights ? { family, weights } : { family }),
+  },
+
+  /**
+   * The editor's own code editor. `open` is how a tool shows the user the file
+   * it is talking about; `openFiles` is worth checking before writing to one,
+   * since unsaved edits in the panel would be clobbered.
+   */
+  code: {
+    open: (path) => callOp("code.open", { path }),
+    openFiles: () => callOp("code.openFiles"),
   },
 
   // ---- viewport -------------------------------------------------------------

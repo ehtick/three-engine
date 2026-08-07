@@ -254,6 +254,7 @@ export function McpPanel() {
   const status = useMcpStore((s) => s.status);
   const toolCount = useMcpStore((s) => s.toolCount);
   const callCount = useMcpStore((s) => s.callCount);
+  const sessionCount = useMcpStore((s) => s.sessionCount);
   const enabled = useMcpPrefs((s) => s.enabled);
   const port = useMcpPrefs((s) => s.port);
   const clients = useMcpClientStore((s) => s.clients);
@@ -273,9 +274,14 @@ export function McpPanel() {
           <span className="mcp-hero-title">{state.label}</span>
           <span className="mcp-hero-sub">
             {status === "connected"
-              ? `${toolCount} tools · ${callCount} call${callCount === 1 ? "" : "s"} served`
+              ? // The session count is worth a line of its own only when there is
+                // more than one: "1 assistant" is the assumed case and would just
+                // be noise, but a scene being edited by two at once is something
+                // you want to have been told before you notice it happening.
+                `${toolCount} tools · ${callCount} call${callCount === 1 ? "" : "s"} served` +
+                (sessionCount > 1 ? ` · ${sessionCount} assistants attached` : "")
               : enabled
-                ? `Listening on port ${port}`
+                ? `Dialling port ${port}`
                 : "Assistants cannot reach this editor"}
           </span>
         </span>
