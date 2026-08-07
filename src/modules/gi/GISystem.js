@@ -6447,6 +6447,13 @@ export class GISystem {
         bits: field.bitsBuffer,
         baseWord: field.dynamicObjectWordOffset,
         capacityWords: field.dynamicObjectWords,
+        // Live, not a snapshot: `_emitterInfos` is rebuilt by #buildEntries on
+        // every rescan, and an adopted mover's header is re-published whenever
+        // this predicate's answer changes (it is part of the surface stamp). See
+        // writeSurface — without this the exact path double-counts a promoted
+        // emitter's own emissive, which #slotSurface has always zeroed on the
+        // voxel path.
+        isPromotedEmitter: (mesh) => this._emitterInfos?.some((e) => e.mesh === mesh) === true,
       });
       composeFieldDynamics(field, this._dynSet);
       if (staticBvhPacked && field.staticBvhWords > 0) {
@@ -6681,8 +6688,34 @@ export class GISystem {
       // that conflation is what put 30 static Sponza meshes (the user's
       // 2026-08-06 scene) into the per-ray mover loop, 16 of them adopted at
       // the cap, and cost every shadow ray 16 object BVHs instead of one.
+      // "static" MEANS "NEVER ADOPT AS AN EXACT MOVER" — IT DOES NOT MEAN
+      // "IGNORE THE TRANSFORM". Until 2026-08-07 this read
+      //     if (mobility === "static") continue;
+      // which skipped the whole block INCLUDING the matrix comparison, so a
+      // static-mobility mesh that actually moved never updated its occupancy
+      // footprint at all. It stayed frozen at its last-baked pose until some
+      // UNRELATED change (another mesh's material, an add/remove, a scene load)
+      // happened to run #refreshOccupancyContent, which re-reads every
+      // placement's matrixWorld and re-voxelizes the whole static side in one
+      // step — so the object's bounced light sat wrong for an arbitrary time and
+      // then teleported. That is the user's "indirect light still jumps from
+      // revoxelization when moving a standard object", and every mesh in their
+      // Sponza carries giMobility "static".
+      //
+      // It also cannot be smoothed away: occupancy transitions deliberately
+      // bypass every temporal EMA in the module (cascadeGather's `wasEmpty` ->
+      // alpha 0, and the bake ingest's occupancy-flip snap), because geometry
+      // presence is binary and blending it would make a mover's leading edge
+      // fade up from black.
+      //
+      // The perf reason the skip existed is real but narrower than the skip:
+      // adopting ~30 static Sponza meshes as exact movers cost every shadow ray
+      // 16 object BVHs instead of one. That argues against ADOPTION, which is
+      // what is now skipped. A moved static mesh takes the voxel static/dynamic
+      // split below instead — bounded cost, re-voxelizes only its own slot per
+      // frame of motion, and demotes back to the static snapshot after
+      // OCC_DYNAMIC_QUIET_FRAMES.
       const mobility = giMobilityOf(p.mesh);
-      if (mobility === "static") continue;
       if (mobility === "dynamic" && this.#tryAdoptDynamic(p, false)) continue;
       let changed = false;
       if (instanceId == null || !mesh.isInstancedMesh) {
@@ -6700,8 +6733,10 @@ export class GISystem {
         // leaves the voxel path here, permanently — its silhouette stops
         // being a per-frame voxel-membership function, which was the
         // measured popping mechanism (sessions 31/31d). Ineligible movers
-        // (skinned, over-budget, set full) keep the voxel split below.
-        if (this.#tryAdoptDynamic(p, true)) continue;
+        // (skinned, over-budget, set full) keep the voxel split below — as does
+        // anything the author pinned "static", which is the entire meaning of
+        // that setting (see the note above; it used to skip the transform too).
+        if (mobility !== "static" && this.#tryAdoptDynamic(p, true)) continue;
         // Static/dynamic split (occupancyField.staticBits): flag the mover
         // DYNAMIC *before* the matrix write — the flag flip re-snapshots the
         // static side once, and every further frame of this motion replays

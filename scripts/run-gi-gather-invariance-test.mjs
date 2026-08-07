@@ -418,6 +418,124 @@ console.log("gi-gather-invariance:");
   }
 }
 
+// ── (6) THE CASCADE LADDER'S ANGULAR FOOTPRINT ───────────────────────────────
+// Radiance Cascades' whole premise is that angular resolution rises with
+// distance exactly fast enough that the LINEAR footprint of one direction stays
+// roughly constant — that is what lets a coarse probe lattice resolve distant
+// geometry. Interval n has length t0·2^n and dirRes 2^n, so footprint
+// ≈ sqrt(4π/dirCount)·distance is invariant across the ladder. By construction.
+//
+// EXCEPT FOR THE LAST CASCADE. `cascadeTrace.js:163` reads
+//     const intervalLen = isLast ? float(farTU) : t0U.mul(BRANCH ** level);
+// so the outermost cascade is a CATCH-ALL: its interval is the whole volume
+// (farT = 2·max(size)) rather than its ladder value, while its direction count
+// is only the ladder's. Its angular resolution is therefore sized for the START
+// of its interval and used all the way to the far edge of the world.
+//
+// Anything beyond that break is under-resolved, which is precisely the
+// hit-or-miss regime measured in (4): a source smaller than the footprint is
+// sampled by luck, and moving it makes the luck change frame to frame. So this
+// computes where the break starts for a given config — i.e. how far away an
+// object has to be before it is allowed to flicker.
+{
+  const cfg = (name, t0, c0DirRes, cascadeCount, sizeMax, voxelSize) => {
+    console.log(`  [ladder] ${name}: probeSpacing ${t0}, c0DirRes ${c0DirRes}, cascades ${cascadeCount}, voxel ${voxelSize}, size ${sizeMax}`);
+    const farT = sizeMax * 2;
+    let worst = 0;
+    let best = Infinity;
+    let breakAt = null;
+    for (let n = 0; n < cascadeCount; n++) {
+      const tMin = t0 * (2 ** n - 1);
+      const isLast = n === cascadeCount - 1;
+      const len = isLast ? farT : t0 * 2 ** n;
+      const far = tMin + len;
+      const dirCount = (c0DirRes * 2 ** n) ** 2;
+      const ang = Math.sqrt((4 * Math.PI) / dirCount);
+      const fp = ang * far;
+      const ratio = fp / voxelSize;
+      if (ratio > 1.5 && breakAt === null) breakAt = tMin;
+      worst = Math.max(worst, ratio);
+      best = Math.min(best, ratio);
+      console.log(
+        `  [ladder]   c${n}: ${tMin.toFixed(2)}-${far.toFixed(2)}m  ${String(dirCount).padStart(5)} dirs  ` +
+          `footprint ${fp.toFixed(2)}m = ${ratio.toFixed(1)}x voxel${isLast ? "   <- CATCH-ALL interval" : ""}`,
+      );
+    }
+    return { worst, best, breakAt };
+  };
+  // REAL values, read from the running editor's build log — NOT the stored props.
+  // `autoFit` is on, so `probeSpacing` is whatever the fit chose and the stored
+  // 0.25 is ignored entirely:
+  //   [gi] built: 42.9x19.8x27.5m (auto-fit custom, voxel 0.34, probes 1.10),
+  //        128x59x82 cells, c0 39x18x25, 5 cascades (branch 2)
+  // Using the stored props here produced a footprint table that was wrong by 4x
+  // and a conclusion ("under-resolved only beyond 3.8m") that did not survive
+  // the real numbers.
+  const user = cfg("user Sponza (from the build log)", 1.1, 4, 5, 42.9, 0.34);
+  console.log(
+    `  [ladder] worst footprint ${user.worst.toFixed(1)}x voxel size — ` +
+      "a source SMALLER than the footprint is sampled hit-or-miss",
+  );
+  // NOT "footprint <= 1.5 voxels". That criterion is unreachable by construction
+  // and asserting it would condemn a correctly-configured RC field: closing it
+  // on this scene needs c0DirRes 32 (vs 4) or a 5.8x finer probe grid, i.e. 64x
+  // or 195x the cost. Footprint ~2-5 voxels IS the RC design point — the merge
+  // and the 8-probe trilinear gather are what make it work for area sources.
+  //
+  // What is NOT acceptable is relying on ray marching for sources smaller than
+  // the footprint. Those get sampled by luck (case 4), and moving them makes the
+  // luck change frame to frame. So the invariant is about the LADDER'S SHAPE:
+  // the footprint must be roughly CONSTANT across cascades, which is the entire
+  // premise of RC. A level that breaks that pattern is a real defect, and the
+  // catch-all last interval does exactly that.
+  const consistent = user.worst / user.best;
+  console.log(`  [ladder] footprint consistency across the ladder: ${consistent.toFixed(1)}x (RC premise: ~1x)`);
+  check(
+    "the angular footprint is CONSTANT across cascades (the RC invariant)",
+    consistent < 2,
+    `${consistent.toFixed(1)}x spread — the last interval is a catch-all (farT, not its ladder value), ` +
+      "so its direction count is sized for the START of an interval that runs to the edge of the world",
+  );
+
+  // HOW MANY CASCADES WOULD IT TAKE? The ladder reaches t0·(2^n − 1); once that
+  // covers farT the last interval is no longer a catch-all and the invariant
+  // holds all the way out. Cost is the reason this is not obviously free, so
+  // price it: directions go x4 per level while the probe grid goes /8 — until
+  // the grid floors at 1x1x1 (`Math.max(1, round(c0Grid/div))` in
+  // cascadeTrace.js), after which each level is a straight x4. Rays per level is
+  // the honest cost proxy.
+  // Real values from the build log, not the stored props (see above).
+  const t0 = 1.1;
+  const farT = 85.8; // 2 x max axis, 42.9m
+  const c0DirRes = 4;
+  const gx = 39;
+  const gy = 18;
+  const gz = 25; // c0 39x18x25, and MAX_PROBE_AXIS is 48 so this is not clamped
+  console.log("  [cost]   cascades needed for the ladder to cover the volume:");
+  let cum0 = null;
+  for (let count = 5; count <= 10; count++) {
+    const reach = t0 * (2 ** (count - 1) - 1);
+    let rays = 0;
+    let worstFp = 0;
+    for (let n = 0; n < count; n++) {
+      const div = 2 ** n;
+      const probes =
+        Math.max(1, Math.round(gx / div)) * Math.max(1, Math.round(gy / div)) * Math.max(1, Math.round(gz / div));
+      const dirCount = (c0DirRes * div) ** 2;
+      rays += probes * dirCount;
+      const tMin = t0 * (2 ** n - 1);
+      const len = n === count - 1 ? farT : t0 * 2 ** n;
+      worstFp = Math.max(worstFp, Math.sqrt((4 * Math.PI) / dirCount) * (tMin + len));
+    }
+    if (cum0 === null) cum0 = rays;
+    console.log(
+      `  [cost]     ${count} cascades: ladder reaches ${reach.toFixed(1).padStart(6)}m  ` +
+        `worst footprint ${(worstFp / 0.34).toFixed(1).padStart(5)}x voxel  ` +
+        `rays ${(rays / 1e6).toFixed(1)}M (${(rays / cum0).toFixed(2)}x of 5-cascade)`,
+    );
+  }
+}
+
 if (failures) {
   console.error(`gi-gather-invariance: ${failures} case(s) FAILED`);
   process.exit(1);

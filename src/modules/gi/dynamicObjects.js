@@ -1047,7 +1047,7 @@ export const OBJ_SLOT_STRIDE = 8;
  * per-build GPU state (header uniforms, header-sync compute, BVH pool
  * allocator, staged uploads) and the TSL/WGSL trace closures.
  */
-export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjects }) {
+export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjects, isPromotedEmitter = null }) {
   const MAX = Math.min(64, Math.max(4, maxObjects ?? (Number(globalThis.__giMaxDynamicObjects) || DEFAULT_MAX_OBJECTS)));
   const HEADER_WORDS = dynHeaderWords(MAX);
   const enabled = capacityWords >= HEADER_WORDS;
@@ -1139,7 +1139,23 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
   const writeSurface = (entry) => {
     const mesh = entry.mesh;
     const material = Array.isArray(mesh?.material) ? mesh.material[0] : mesh?.material;
-    const stamp = `${material?.id ?? -1}:${material?.version ?? 0}`;
+    // PROMOTED EMITTERS MUST NOT SHIP THEIR EMISSIVE HERE — this is the exact
+    // counterpart of GISystem's #slotSurface, which zeroes `emissive` for a
+    // promoted entry so the voxel field does not re-emit light the analytic
+    // emitter slot is already delivering. The exact-dynamic path had no such
+    // guard: `writeSurface` published the raw material emissive unconditionally,
+    // and giField shades an exact hit as `surf.emissive + albedo*irr`, so an
+    // emissive mesh that was BOTH promoted (peak >= 0.5, holds one of the four
+    // analytic slots) AND adoption-eligible had its own light counted twice from
+    // the moment it first moved — adoption is triggered by first motion, and
+    // outside Play it only demotes after ~30s at rest. Stationary: correct.
+    // Moving: a step change. Which is the shape of "sometimes emissive looks
+    // fine when moving, sometimes lighting jumps all over the place".
+    const promoted = isPromotedEmitter?.(mesh) === true;
+    // Promotion is part of the stamp: it can flip without the material changing
+    // (a brighter emissive elsewhere takes the slot), and the early-out below
+    // would otherwise keep publishing the stale emissive forever.
+    const stamp = `${material?.id ?? -1}:${material?.version ?? 0}:${promoted ? "P" : "-"}`;
     if (entry.surfaceStamp === stamp) return false;
     entry.surfaceStamp = stamp;
     const s = resolveMaterialSurface(mesh?.material, mesh?.name);
@@ -1149,7 +1165,7 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
     wm(i, 36, s.color?.b ?? 1);
     // Premultiplied: the shading site wants one number, and the voxel bake
     // already folds intensity in the same place.
-    const k = s.emissiveIntensity ?? 1;
+    const k = promoted ? 0 : (s.emissiveIntensity ?? 1);
     wm(i, 37, (s.emissive?.r ?? 0) * k);
     wm(i, 38, (s.emissive?.g ?? 0) * k);
     wm(i, 39, (s.emissive?.b ?? 0) * k);
