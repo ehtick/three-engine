@@ -918,9 +918,19 @@ export class GISystem {
     // lights hash, which forces a second full material-recompile wave — the
     // exact freeze this feature exists to paper over. A zero-intensity
     // hemisphere is a few dead uniforms per material.
-    if (!this.state && !this._bootAmbient && !this._everComposited) {
+    // THE FAILURE MODE THIS HAD NO WAY TO SHOW: the fade is gated on
+    // `state.statsLogged`, so if the field never reaches its first composite —
+    // a build that never completes, a scene that never ticks past the compile
+    // wave — the hemisphere NEVER fades and the scene sits under 0.6 of flat
+    // blue-grey forever. That reads exactly like "GI got too flat and bright",
+    // and until 2026-08-07 it was invisible: no log, no hatch, and the light is
+    // a raw three.js object rather than an entity, so it does not even appear in
+    // the outliner. `__giNoBootAmbient = true` skips it outright.
+    if (!this.state && !this._bootAmbient && !this._everComposited
+        && globalThis.__giNoBootAmbient !== true) {
       this._bootAmbient = new THREE.HemisphereLight(0xcfd8e6, 0x4a4238, 0.6);
       this._bootAmbient.name = "gi-boot-ambient";
+      this._bootAmbientTicks = 0;
       this.engine.scene.add(this._bootAmbient);
     } else if (this._bootAmbient && this.state?.statsLogged) {
       this._bootAmbient.intensity *= 0.9;
@@ -928,6 +938,22 @@ export class GISystem {
         this._bootAmbient.intensity = 0;
         this._everComposited = true;
         this._bootAmbient = null;
+      }
+    } else if (this._bootAmbient) {
+      // Still waiting on the first composite. The fade needs ~39 ticks once it
+      // starts, so anything past a few seconds of ticks means `statsLogged` is
+      // not coming and the ambient is now lighting the scene indefinitely. Say
+      // so ONCE, rather than leaving the user to notice their GI looks washed.
+      this._bootAmbientTicks = (this._bootAmbientTicks ?? 0) + 1;
+      if (this._bootAmbientTicks === 600 && !this._bootAmbientWarned) {
+        this._bootAmbientWarned = true;
+        console.warn(
+          "[gi] boot ambient has been up for 600 ticks without a first composite — "
+          + "the scene is being lit by the temporary hemisphere (intensity "
+          + `${this._bootAmbient.intensity.toFixed(2)}), not by GI. It fades only once `
+          + "the field composites (state.statsLogged). Set __giNoBootAmbient = true to "
+          + "remove it and see the real GI result.",
+        );
       }
     }
 
