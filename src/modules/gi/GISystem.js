@@ -18,6 +18,7 @@
 import * as THREE from "three/webgpu";
 import { Fn, If, cameraPosition, cos, float, fract, instanceIndex, mix, normalWorld, positionLocal, positionWorld, renderGroup, screenCoordinate, screenUV, select, sin, smoothstep, texture, uniform, vec2, vec3, vec4 } from "three/tsl";
 import { createRadianceCascades } from "./cascadeTrace.js";
+import { GI_BOOT_AMBIENT_MAX_TICKS, bootAmbientStep } from "./bootAmbient.js";
 import { createCascadeMerge } from "./cascadeMerge.js";
 import { createBounceFeedback, createIrradianceGather, createProbeDepthMoments, createProbeIrradiance, createRadianceLookup, depthMomentsAlpha, gatherBias, gatherViewBias, probeSnapAlpha } from "./cascadeGather.js";
 import { blitBvhAtlasTiles, createGiBvhReflect, createGiBvhTarget, createGiEmitterShadowPass, createGiGBuffer, createGiLightShadowFilterPass, createGiLightShadowHistoryPass, createGiLightShadowPass, createGiLightShadowWidePass, createGiResolve, createGiTargets, renderGiGBuffer } from "./giScreen.js";
@@ -525,8 +526,10 @@ export class GISystem {
    * everything else #applyLiveProps writes (intensity, bounce, bleedSaturation,
    * temporalBlend, probeSmoothing, skyColor, skyIntensity) is routed here;
    * `resolveScale` and the two pixel budgets are re-read every frame by
-   * #syncScreenResolveSize; `peakSplit` is re-read every frame in #update;
-   * `debugProbes` and `autoRebake` have their own branches below; and the
+   * #syncScreenResolveSize; `peakSplit` and `bootAmbient` are re-read every
+   * frame in #update; `debugProbes` and `autoRebake` have their own branches
+   * below (`bootAmbient` shares autoRebake's, to be explicit rather than
+   * relying on the no-op `else`); and the
    * remainder are in #structuralSignature. If you add a prop, it belongs to
    * exactly one of those five places.
    */
@@ -550,8 +553,11 @@ export class GISystem {
       this.#applyLiveProps();
     } else if (key === "debugProbes") {
       this.#applyDebugVisibility();
-    } else if (key === "autoRebake") {
-      // read on the fly, nothing to do
+    } else if (key === "autoRebake" || key === "bootAmbient") {
+      // read on the fly, nothing to do. `bootAmbient` is re-read every tick by
+      // the boot-ambient block in #update — including as a live OFF switch, so
+      // unticking it fades the hemisphere out immediately rather than waiting
+      // for a composite that may not be coming.
     } else {
       // Structural (size/resolution/cascade shape): grids and dispatch sizes
       // are baked into the compute graphs as constants — rebuild. But ONLY
@@ -918,42 +924,58 @@ export class GISystem {
     // lights hash, which forces a second full material-recompile wave — the
     // exact freeze this feature exists to paper over. A zero-intensity
     // hemisphere is a few dead uniforms per material.
-    // THE FAILURE MODE THIS HAD NO WAY TO SHOW: the fade is gated on
-    // `state.statsLogged`, so if the field never reaches its first composite —
-    // a build that never completes, a scene that never ticks past the compile
-    // wave — the hemisphere NEVER fades and the scene sits under 0.6 of flat
-    // blue-grey forever. That reads exactly like "GI got too flat and bright",
-    // and until 2026-08-07 it was invisible: no log, no hatch, and the light is
-    // a raw three.js object rather than an entity, so it does not even appear in
-    // the outliner. `__giNoBootAmbient = true` skips it outright.
-    if (!this.state && !this._bootAmbient && !this._everComposited
-        && globalThis.__giNoBootAmbient !== true) {
-      this._bootAmbient = new THREE.HemisphereLight(0xcfd8e6, 0x4a4238, 0.6);
+    //
+    // DEFAULT OFF as of 2026-08-07, and it took a user report to earn that.
+    // This shipped default-on and silently ADDS A LIGHT THE SCENE DOES NOT
+    // HAVE: it is a raw three.js object, not an entity, so it has no outliner
+    // row, no Inspector control and no log line. The report was "there is some
+    // weird ambient to the GI, even before the light itself loaded in ... yet
+    // scene does not have any ambient" — which is an exactly correct reading of
+    // the scene graph, and the renderer was the thing lying. A module may not
+    // put light in a scene the author cannot see or switch off, so this is now
+    // the `bootAmbient` prop and it starts off.
+    //
+    // WHY IT NEVER LEFT (the actual bug, independent of the default): the fade
+    // was gated on `state.statsLogged`, which is not a rendering predicate at
+    // all — it is the one-shot flag for the occupancy STATS LOG, and
+    // #maybeLogStats returns early unless `state.entries.length` is non-zero
+    // AND every entry is resident in the atlas. So a scene that composites GI
+    // perfectly well but has an empty entry list, or one entry that never lands
+    // in the atlas, keeps a 0.6 blue-grey hemisphere over it forever. The real
+    // "GI is on screen now" signal is `_compositedOnce`, which is what
+    // #maybeLogStats is itself gated on one level up (see its call site).
+    // Gate on that, and — because no predicate is worth trusting alone here —
+    // cap the whole thing in wall-clock ticks so "never fades" is not a
+    // reachable state no matter what the field does.
+    const bootStep = bootAmbientStep({
+      enabled: this.component?.props?.bootAmbient === true
+        && globalThis.__giNoBootAmbient !== true,
+      hasState: !!this.state,
+      hasLight: !!this._bootAmbient,
+      composited: !!this._compositedOnce,
+      everComposited: !!this._everComposited,
+      ticks: this._bootAmbientTicks ?? 0,
+      intensity: this._bootAmbient?.intensity ?? 0,
+    });
+    if (bootStep.action === "create") {
+      this._bootAmbient = new THREE.HemisphereLight(0xcfd8e6, 0x4a4238, bootStep.intensity);
       this._bootAmbient.name = "gi-boot-ambient";
       this._bootAmbientTicks = 0;
       this.engine.scene.add(this._bootAmbient);
-    } else if (this._bootAmbient && this.state?.statsLogged) {
-      this._bootAmbient.intensity *= 0.9;
-      if (this._bootAmbient.intensity < 0.01) {
-        this._bootAmbient.intensity = 0;
-        this._everComposited = true;
-        this._bootAmbient = null;
-      }
-    } else if (this._bootAmbient) {
-      // Still waiting on the first composite. The fade needs ~39 ticks once it
-      // starts, so anything past a few seconds of ticks means `statsLogged` is
-      // not coming and the ambient is now lighting the scene indefinitely. Say
-      // so ONCE, rather than leaving the user to notice their GI looks washed.
-      this._bootAmbientTicks = (this._bootAmbientTicks ?? 0) + 1;
-      if (this._bootAmbientTicks === 600 && !this._bootAmbientWarned) {
+    } else if (bootStep.action !== "none") {
+      this._bootAmbientTicks = bootStep.ticks;
+      this._bootAmbient.intensity = bootStep.intensity;
+      if (bootStep.expired && !this._bootAmbientWarned) {
         this._bootAmbientWarned = true;
         console.warn(
-          "[gi] boot ambient has been up for 600 ticks without a first composite — "
-          + "the scene is being lit by the temporary hemisphere (intensity "
-          + `${this._bootAmbient.intensity.toFixed(2)}), not by GI. It fades only once `
-          + "the field composites (state.statsLogged). Set __giNoBootAmbient = true to "
-          + "remove it and see the real GI result.",
+          `[gi] boot ambient hit its ${GI_BOOT_AMBIENT_MAX_TICKS}-tick cap without GI `
+          + "compositing — fading it out anyway. The scene will be dark until the field "
+          + "lands; that is the real GI result, not a bug in this light.",
         );
+      }
+      if (bootStep.action === "release") {
+        this._everComposited = true;
+        this._bootAmbient = null;
       }
     }
 

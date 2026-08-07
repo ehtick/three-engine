@@ -185,6 +185,17 @@ export class GlobalIlluminationComponent extends Component {
     // count is a nearly-free cost knob.
     lightShadowMaxPixels: 1_900_000,
     autoRebake: true,
+    // TEMPORARY LIGHT DURING COLD BOOT. In a GI-lit interior GI *is* the
+    // ambient, so the scene renders black from the first tick until the field's
+    // first composite — assets, then the shader compile wave, which can be tens
+    // of seconds. This puts a neutral hemisphere up for that window and fades it
+    // out the moment GI composites.
+    // DEFAULT OFF, and it is off because it shipped on and was reported as a
+    // bug: it adds a light the scene does not contain, with no outliner row and
+    // no control, so the only honest default is one the author opts into. Turn
+    // it on if you would rather see a flat-lit scene than a black one while the
+    // field builds. See the boot-ambient block in GISystem#update.
+    bootAmbient: false,
     debugProbes: "off",
   };
   // Every field below except `quality` and `intensity` carries `advanced:
@@ -255,6 +266,10 @@ export class GlobalIlluminationComponent extends Component {
     { key: "resolveMaxPixels", label: "Resolve Pixel Budget", type: "number", min: 100_000, max: 8_000_000, step: 100_000, advanced: true },
     { key: "lightShadowMaxPixels", label: "Shadow Pixel Budget", type: "number", min: 100_000, max: 8_000_000, step: 100_000, advanced: true },
     { key: "autoRebake", label: "Auto Re-bake", type: "boolean", advanced: true, flipsToCustom: "quality" },
+    // Deliberately NOT `flipsToCustom`: whether you want a placeholder light
+    // while the field builds is a preference about startup, not a quality tier,
+    // and switching preset must not silently put a light back in the scene.
+    { key: "bootAmbient", label: "Boot Ambient (until GI loads)", type: "boolean", advanced: true },
     // "occupancy" marches the pyramid with the SAME hierarchical DDA the
     // transport rays use, so it is the instrument for "is this column
     // actually in the field". "sdf" shows the composited distance field the
