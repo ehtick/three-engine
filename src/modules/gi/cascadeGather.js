@@ -2,8 +2,15 @@
 //
 // Turns the merged c0 field into per-surface irradiance:
 //   E(P, N) ≈ Σ_probes w_probe · Σ_dirs L_merged(dir) · max(dot(dir, N), 0) · Δω
-// over the 8 c0 probes surrounding P (trilinear), Δω = 4π / dirCount.
+// over the 8 c0 probes surrounding P (trilinear).
 // Diffuse response is then albedo · E / π at the material.
+//
+// Δω IS NOT 4π/dirCount, and this comment said it was until 2026-08-07. The
+// octahedral map is not equal-area: its texels vary 2.73x in solid angle, so the
+// uniform Δω the code assumed made the gather silently area-weighted — a 30°
+// source read 1.46x analytic at the pole and 0.75x at the map corner, and the
+// estimator converged to 1.18x truth rather than 1. Δω now comes from
+// `octahedralTexelWeight` and the constant cancels in the normalization.
 //
 // The probe weighting reuses the SAME distance-visibility proxy as the
 // merge (cascadeMerge.js): a probe whose own c0 ray toward P records a hit
@@ -20,10 +27,22 @@
 // bypasses any G-buffer/deferred-resolve layer (where the prior attempt's
 // never-root-caused stripe bug lived).
 import { Fn, If, Loop, Return, cos, float, floor, fract, instanceIndex, instancedArray, max, mix, mod, select, sin, smoothstep, sqrt, step, texture3D, uniform, vec2, vec3, vec4 } from "three/tsl";
-import { octahedralTexelIndex, octahedralUV } from "./cascadeTrace.js";
+import { octahedralTexelIndex, octahedralTexelWeight, octahedralUV } from "./cascadeTrace.js";
 import { sharedFn } from "./giFn.js";
 import { emitterAngularRadius, emitterSlotFactor, emitterSurfaceT } from "./giLight.js";
 import { RayHitMode } from "./rayHit/RayHitConfig.js";
+
+/**
+ * Per-direction solid angle for the gather sums, or a flat 1 under
+ * `__giNoTexelSolidAngle = true` (the pre-2026-08-07 behaviour, kept ONLY as an
+ * A/B arm — it is measurably wrong, see octahedralTexelWeight).
+ *
+ * BUILD-TIME, like every other `__gi…` hatch in the cascade graphs: this is read
+ * while the compute graph is being built, so setting it in the console does
+ * nothing until a STRUCTURAL prop forces a rebuild.
+ */
+const dwOf = (dir) =>
+  globalThis.__giNoTexelSolidAngle === true ? float(1) : octahedralTexelWeight(dir);
 
 
 
@@ -275,7 +294,11 @@ export function createProbeIrradiance(cascades, options = {}) {
     const rowBase = probe.toFloat().mul(dirCount).toVar();
     Loop({ start: 0, end: dirCount, name: "d" }, ({ d }) => {
       const dir = c0.directionOf(d.toFloat());
-      const cosTheta = max(dir.dot(axis), 0);
+      // cos·Δω, not cos. See octahedralTexelWeight — the octahedral texels vary
+      // 2.73x in solid angle and `Σ L·cos / Σ cos` is only a correct integral if
+      // they do not. Folding Δω into the SAME term both sums use keeps the
+      // estimator exact for uniform L while removing the area bias.
+      const cosTheta = max(dir.dot(axis), 0).mul(dwOf(dir));
       sumL.addAssign(c0.merged.element(rowBase.add(d).toInt()).xyz.mul(cosTheta));
       sumCos.addAssign(cosTheta);
     });
@@ -905,7 +928,8 @@ export function createIrradianceGather(cascades, probeIrradiance = null, fieldCe
           const rowBase = probeIdx.mul(dirCount).toVar();
           Loop({ start: 0, end: dirCount, name: "d" }, ({ d }) => {
             const dir = c0.directionOf(d.toFloat());
-            const cosTheta = max(dir.dot(N), 0);
+            // cos·Δω — see the identical note in createProbeIrradiance.
+            const cosTheta = max(dir.dot(N), 0).mul(dwOf(dir));
             probeE.addAssign(c0.merged.element(rowBase.add(d).toInt()).xyz.mul(cosTheta));
             probeCos.addAssign(cosTheta);
           });

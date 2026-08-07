@@ -59,6 +59,43 @@ export function octahedralUV(dir, res) {
 }
 
 /**
+ * RELATIVE SOLID ANGLE of the octahedral texel a NORMALIZED direction came from.
+ *
+ * WHY THIS EXISTS. Every gather in this module integrates as
+ * `Σ L·cos / Σ cos`, which is a solid-angle-weighted average ONLY if every
+ * direction carries the same Δω. The octahedral map's texels do not: measured by
+ * integrating the map's Jacobian, they vary **2.73x** in solid angle between the
+ * map centre and the diagonal midpoints. So the shipped gather was silently
+ * weighting by texel area — the same 30° source read 1.46x analytic at the pole
+ * and 0.75x at the map corner, a 1.95x error that depends only on WHERE the
+ * light sits, and it did not shrink with direction count (1.89x at 4096
+ * directions). It also converged to 1.18x analytic instead of 1.
+ *
+ * THE WEIGHT. For a parameterization projected onto the sphere,
+ * dω = (v · (∂v/∂fx × ∂v/∂fy)) / |v|³. On the upper sheet v = (fx, fy,
+ * 1−|fx|−|fy|), the cross product is (sign fx, sign fy, 1), and their dot is
+ * identically 1 — so dω ∝ 1/|v|³, with |v| taken BEFORE normalization.
+ *
+ * AND IT IS FREE. That needs the unnormalized vector, which the decode throws
+ * away — but the map places it on the octahedron |x|+|y|+|z| = 1 (upper sheet:
+ * |fx|+|fy|+(1−|fx|−|fy|) = 1; the folded lower sheet too, e.g. f = (0.8, 0.8)
+ * → v = (0.2, 0.2, −0.6)). So |v| = 1/(|dx|+|dy|+|dz|) for a normalized d, and
+ *
+ *     Δω ∝ (|dx| + |dy| + |dz|)³
+ *
+ * three abs, two adds, two muls, on a value the gather loop already holds. The
+ * identity is asserted exactly (< 1e-9) against the Jacobian form in
+ * `scripts/run-gi-gather-invariance-test.mjs`.
+ *
+ * Only RATIOS matter — every consumer divides by its own Σ of these — so the
+ * missing constant (2/res)² is deliberately omitted.
+ */
+export function octahedralTexelWeight(dir) {
+  const s = dir.x.abs().add(dir.y.abs()).add(dir.z.abs());
+  return s.mul(s).mul(s);
+}
+
+/**
  * Inverse of octahedralDirection: world direction → texel index (float) in a
  * res×res octahedral tile (nearest texel).
  */

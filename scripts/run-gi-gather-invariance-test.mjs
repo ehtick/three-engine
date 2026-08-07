@@ -92,15 +92,52 @@ function octDirUV(fx, fy) {
 const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 
 /**
- * THE ESTIMATOR UNDER TEST — cascadeGather.js:906-939, legacy path.
- * E = π · (Σ L·cos / Σ cos) over all dirCount directions, cos clamped at 0.
+ * SOLID ANGLE OF AN OCTAHEDRAL TEXEL — the closed form, and the proposed fix.
+ *
+ * The octahedral map sends (fx, fy) in [-1,1]² to the unnormalized direction
+ * v = (nx, ny, nz), then normalizes. For a parameterization projected onto the
+ * sphere, dω = (v · (∂v/∂fx × ∂v/∂fy)) / |v|³ · dfx dfy. On the upper sheet
+ * v = (fx, fy, 1-|fx|-|fy|), so ∂v/∂fx = (1,0,-sx), ∂v/∂fy = (0,1,-sy), their
+ * cross is (sx, sy, 1), and
+ *   v · (sx, sy, 1) = fx·sx + fy·sy + 1 - |fx| - |fy| = 1
+ * identically. The lower sheet is the mirror image and gives the same thing. So
+ *
+ *   dω ∝ 1 / |v|³
+ *
+ * with |v| taken BEFORE normalization. It is 1 at the map centre (+Z) and at the
+ * axis corners, and 1/0.707³ = 2.83 at the diagonal midpoints — which is the
+ * 2.73x spread the Jacobian integration measures, at 8x8 texel averaging.
+ *
+ * One reciprocal-cube per direction, from a quantity `octahedralDirection`
+ * already computes and throws away.
  */
-function gatherE(res, N, L) {
+function texelSolidAngle(idx, res) {
+  const u = idx % res;
+  const v = Math.floor(idx / res);
+  const fx = ((u + 0.5) / res) * 2 - 1;
+  const fy = ((v + 0.5) / res) * 2 - 1;
+  const nz = 1 - Math.abs(fx) - Math.abs(fy);
+  const fold = Math.max(-nz, 0);
+  const nx = fx - (fx >= 0 ? 1 : -1) * fold;
+  const ny = fy - (fy >= 0 ? 1 : -1) * fold;
+  const len = Math.hypot(nx, ny, nz);
+  return 1 / (len * len * len);
+}
+
+/**
+ * THE ESTIMATOR — cascadeGather.js:906-939, legacy path.
+ * E = π · (Σ L·cos·w / Σ cos·w). With w ≡ 1 this is the SHIPPED form, which
+ * assumes every direction carries the same solid angle. With w = texel solid
+ * angle it is the proposed fix. Both stay exact for uniform L by construction,
+ * so the fix cannot regress the one property the current form does have.
+ */
+function gatherE(res, N, L, weighted = false) {
   let sumL = 0;
   let sumCos = 0;
   for (let d = 0; d < res * res; d++) {
     const dir = octDir(d, res);
-    const c = Math.max(dot(dir, N), 0);
+    const w = weighted ? texelSolidAngle(d, res) : 1;
+    const c = Math.max(dot(dir, N), 0) * w;
     sumL += L(dir) * c;
     sumCos += c;
   }
@@ -108,6 +145,31 @@ function gatherE(res, N, L) {
 }
 
 console.log("gi-gather-invariance:");
+
+// ── (0) THE CHEAP FORM OF THE WEIGHT ─────────────────────────────────────────
+// 1/|v|³ needs the UNNORMALIZED direction, which the shader computes and throws
+// away. But the octahedral map places that vector on the octahedron |x|+|y|+|z| = 1
+// (upper sheet: |fx| + |fy| + (1-|fx|-|fy|) = 1; the folded lower sheet gives the
+// same, e.g. f = (0.8, 0.8) -> v = (0.2, 0.2, -0.6)). So for a NORMALIZED d,
+//   |v| = 1 / (|dx| + |dy| + |dz|)   and   Δω ∝ (|dx| + |dy| + |dz|)³
+// which is 3 abs, 2 adds and 2 muls on a value the gather loop already holds —
+// no second decode. Verify the identity before building on it.
+{
+  let worst = 0;
+  for (const res of [2, 4, 8, 16, 32]) {
+    for (let d = 0; d < res * res; d++) {
+      const dir = octDir(d, res);
+      const cheap = (Math.abs(dir[0]) + Math.abs(dir[1]) + Math.abs(dir[2])) ** 3;
+      const exact = texelSolidAngle(d, res);
+      worst = Math.max(worst, Math.abs(cheap / exact - 1));
+    }
+  }
+  check(
+    "(|dx|+|dy|+|dz|)³ equals 1/|v|³ — the weight is free from the normalized direction",
+    worst < 1e-9,
+    `worst relative error ${worst.toExponential(2)}`,
+  );
+}
 
 // ── (1) IS THE OCTAHEDRAL MAP EQUAL-AREA? ────────────────────────────────────
 // The estimator never writes Δω down, so it is only unbiased if every texel
@@ -182,20 +244,40 @@ console.log("gi-gather-invariance:");
   const alpha = (40 * Math.PI) / 180;
   const analytic = Math.PI * Math.sin(alpha) ** 2;
   const L = (d) => (dot(d, N) >= Math.cos(alpha) ? 1 : 0);
-  const ratios = [];
-  const row = [];
-  for (const res of [4, 8, 16, 32, 64]) {
-    const r = gatherE(res, N, L) / analytic;
-    ratios.push(r);
-    row.push(`${res * res}d:${r.toFixed(3)}`);
+  // TWO SEPARATE PROPERTIES, and conflating them is how a first draft of this
+  // test produced a meaningless failure for BOTH estimators. At 16 directions a
+  // 40° cap is genuinely under-resolved and no normalization can rescue it — so
+  // "invariant across 16..4096 directions" is not a property any correct gather
+  // has. What a correct gather must have is (a) the right LIMIT, and (b)
+  // invariance once the source is actually resolved.
+  const RESOLVED_FROM = 16; // res 16 = 256 directions
+  for (const weighted of [false, true]) {
+    const ratios = [];
+    const resolved = [];
+    const row = [];
+    for (const res of [4, 8, 16, 32, 64]) {
+      const r = gatherE(res, N, L, weighted) / analytic;
+      ratios.push(r);
+      if (res >= RESOLVED_FROM) resolved.push(r);
+      row.push(`${res * res}d:${r.toFixed(3)}`);
+    }
+    const limit = ratios[ratios.length - 1];
+    const drift = Math.max(...resolved) / Math.min(...resolved);
+    const tag = weighted ? "Δω-weighted" : "SHIPPED    ";
+    console.log(
+      `  [cap 40°] ${tag} estimate/analytic — ${row.join("  ")}   limit ${limit.toFixed(3)}  resolved-spread ${drift.toFixed(3)}x`,
+    );
+    check(
+      `converges to the ANALYTIC value (${weighted ? "Δω-weighted" : "shipped"})`,
+      Math.abs(limit - 1) < 0.05,
+      `limit is ${limit.toFixed(3)}x analytic — off by ${((limit - 1) * 100).toFixed(0)}%`,
+    );
+    check(
+      `is invariant once RESOLVED, 256..4096 directions (${weighted ? "Δω-weighted" : "shipped"})`,
+      drift < 1.08,
+      `spread ${drift.toFixed(3)}x`,
+    );
   }
-  console.log(`  [cap 40°] estimate/analytic — ${row.join("  ")}`);
-  const drift = Math.max(...ratios) / Math.min(...ratios);
-  check(
-    "a WELL-RESOLVED source is direction-count invariant",
-    drift < 1.15,
-    `spread ${drift.toFixed(3)}x across 16..4096 directions — the estimator itself drifts`,
-  );
 }
 
 // ── (4) A SUB-TEXEL SOURCE — isolates (B), AND MY FIRST PREDICTION WAS WRONG ──
@@ -299,19 +381,41 @@ console.log("gi-gather-invariance:");
     ["diagonal (map corner)", [1 / Math.sqrt(3), 1 / Math.sqrt(3), 1 / Math.sqrt(3)]],
     ["-Z (fold seam)", [0, 0, -1]],
   ];
-  const ratios = [];
-  for (const [name, N] of frames) {
-    const L = (d) => (dot(d, N) >= Math.cos(alpha) ? 1 : 0);
-    const r = gatherE(res, N, L) / analytic;
-    ratios.push(r);
-    console.log(`  [off-axis] ${name.padEnd(24)} estimate/analytic ${r.toFixed(4)}`);
+  // AT TWO RESOLUTIONS, to tell BIAS from QUANTIZATION. A genuine area-weighting
+  // bias is a property of the map and does not shrink when you add directions; a
+  // point-sampling residual does. Reporting one resolution cannot distinguish
+  // them, and the difference decides whether there is anything left to fix.
+  for (const weighted of [false, true]) {
+    const spreads = [];
+    for (const r0 of [res, res * 2]) {
+      const ratios = [];
+      for (const [name, N] of frames) {
+        const L = (d) => (dot(d, N) >= Math.cos(alpha) ? 1 : 0);
+        const r = gatherE(r0, N, L, weighted) / analytic;
+        ratios.push(r);
+        if (r0 === res) {
+          console.log(
+            `  [off-axis] ${weighted ? "Δω" : "  "} ${name.padEnd(24)} estimate/analytic ${r.toFixed(4)}`,
+          );
+        }
+      }
+      spreads.push(Math.max(...ratios) / Math.min(...ratios));
+    }
+    const tag = weighted ? "Δω-weighted" : "shipped";
+    console.log(
+      `  [off-axis] ${tag}: spread ${spreads[0].toFixed(3)}x at ${res * res}d, ` +
+        `${spreads[1].toFixed(3)}x at ${res * res * 4}d ` +
+        // Compare DEVIATIONS FROM 1, not the ratios themselves: 1.128 -> 1.031 is
+        // a 4x reduction in error but only a 9% reduction in the ratio, so a
+        // ratio comparison mislabels a converging estimator as biased.
+        `(${spreads[1] - 1 < (spreads[0] - 1) * 0.8 ? "SHRINKING -> quantization" : "PERSISTENT -> real bias"})`,
+    );
+    check(
+      `the answer does not depend on where the source sits (${tag})`,
+      spreads[1] < 1.1,
+      `${spreads[1].toFixed(3)}x spread at ${res * res * 4} directions`,
+    );
   }
-  const spread = Math.max(...ratios) / Math.min(...ratios);
-  check(
-    "the answer does not depend on where the source sits",
-    spread < 1.1,
-    `${spread.toFixed(3)}x spread across directions — area-weighting bias`,
-  );
 }
 
 if (failures) {
