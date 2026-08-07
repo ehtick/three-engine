@@ -64,6 +64,15 @@ page.on("pageerror", (e) => {
 await page.evaluateOnNewDocument((PROJECT, PRESET) => {
   localStorage.setItem("engine.projectRoot.v1", PROJECT);
   localStorage.setItem("engine.recentProjects.v1", JSON.stringify([PROJECT]));
+  // KEEP THE ENGINE TICKING. A headless page is never focused, and the editor's
+  // frame pacing can pause an unfocused viewport — at which point this harness
+  // runs its per-frame accumulator over a texture nothing is rewriting and
+  // reports PERFECT STABILITY. Measured before this line existed: 240 frames,
+  // "mean changed frames/px 0.0 of 240", every histogram bucket zero. That is
+  // not a quiet scene, it is a stopped one, and it reads exactly like "no
+  // flicker" — the most dangerous possible failure for a flicker instrument.
+  // Same hatch the bleed and block rigs already set for the same reason.
+  globalThis.__editorKeepRendering = true;
   for (const [k, v] of Object.entries(PRESET)) globalThis[k] = v;
 }, PROJECT, JSON.parse(process.env.PRESET_GLOBALS ?? "{}"));
 
