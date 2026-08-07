@@ -1045,22 +1045,70 @@ export function createIrradianceGather(cascades, probeIrradiance = null, fieldCe
       // overlap slightly. That is the standard trade in every capsule/sphere
       // shadow system and it is a smooth error, which is the only kind this
       // change is willing to introduce.
-      const occ = moverOccluders
+      // AND THE BOUNCE COMES BACK, ANALYTICALLY. `sphereOcclusion` is the FORM
+      // FACTOR — the cosine-weighted fraction f of the receiver's hemisphere the
+      // mover covers — so it is the same number for both directions of transport:
+      // the field it hides is scaled by (1 − f), and the light it emits is
+      // L·f·π (π being the cosine-weighted integral over a full hemisphere).
+      // Removing the mover from ray transport therefore costs nothing in energy,
+      // only in sampling.
+      //
+      // L IS COMPUTED THE WAY giField SHADES AN EXACT DYNAMIC HIT, term for term
+      // (`irr += color · atten · ndotl / π`, then `L = emissive + albedo · irr`),
+      // so a mover's bounce reads identically whether it arrives through this
+      // path or that one — a different normalisation here would make movers
+      // brighter or darker than the static geometry beside them.
+      //
+      // AND IT NEEDS NO SHADOW RAY, which is the whole reason this is stable: the
+      // shading point is the sphere point FACING THE RECEIVER, n = normalize(P−C),
+      // and for a CONVEX body `ndotl > 0` is exactly the self-shadowing test.
+      // The sun-facing side lights the floor; the underside goes dark on its own,
+      // continuously, with no ray to flicker. External shadowing of the mover
+      // (it standing in a room's shade) is not modelled — a smooth over-estimate,
+      // which is the only kind of error this change accepts.
+      const moverTerm = moverOccluders
         ? (() => {
             const vis = float(1).toVar();
+            const emit = vec3(0).toVar();
             Loop({ start: 0, end: moverOccluders.max, name: "mo" }, ({ mo }) => {
               If(float(mo).lessThan(moverOccluders.count), () => {
                 const sph = moverOccluders.spheres.element(mo).toVar();
                 // radius 0 = an empty slot; skip rather than divide by it.
                 If(sph.w.greaterThan(1e-4), () => {
-                  vis.mulAssign(float(1).sub(sphereOcclusion(P, N, sph)));
+                  const f = sphereOcclusion(P, N, sph).toVar();
+                  If(f.greaterThan(1e-5), () => {
+                    // The sphere point facing this receiver, and its outward normal.
+                    const toP = P.sub(sph.xyz).toVar();
+                    const n = toP.div(toP.length().max(1e-4)).toVar();
+                    const hp = sph.xyz.add(n.mul(sph.w)).toVar();
+                    const irr = vec3(0).toVar();
+                    for (const slot of moverOccluders.lightSlots ?? []) {
+                      If(float(slot.active).greaterThan(0.5), () => {
+                        const isDir = float(slot.kind).toVar();
+                        const rel = vec3(slot.vector).sub(hp).toVar();
+                        const pd = rel.length().max(1e-4).toVar();
+                        const L = mix(rel.div(pd), vec3(slot.vector), isDir).toVar();
+                        const atten = mix(float(1).div(pd.mul(pd).max(1)), float(1), isDir);
+                        const ndotl = L.dot(n).max(0).toVar();
+                        irr.addAssign(vec3(slot.color).mul(atten.mul(ndotl).mul(1 / Math.PI)));
+                      });
+                    }
+                    const alb = moverOccluders.albedo.element(mo).toVar();
+                    const ems = moverOccluders.emissive.element(mo).toVar();
+                    const radiance = ems.xyz.add(alb.xyz.mul(irr)).toVar();
+                    // Emission enters through the SAME visibility this mover has
+                    // already been occluded by, so a mover behind another mover
+                    // does not shine through it.
+                    emit.addAssign(radiance.mul(f).mul(Math.PI).mul(vis));
+                    vis.mulAssign(float(1).sub(f));
+                  });
                 });
               });
             });
-            return vis;
+            return { vis, emit };
           })()
         : null;
-      const shadowed = (e) => (occ ? e.mul(occ) : e);
+      const shadowed = (e) => (moverTerm ? e.mul(moverTerm.vis).add(moverTerm.emit) : e);
       if (probeIrradiance) {
         return shadowed(acc.div(max(cosAcc, 1e-3))).mul(edgeFade);
       }

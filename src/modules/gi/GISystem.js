@@ -4099,7 +4099,7 @@ export class GISystem {
       // uniform-buffer wall (see the §6.6 note directly below on why that wall
       // decides the shape of everything here). The CPU already holds every
       // mover's world bounds each frame, so the sphere is free.
-      this.#moverOccluders(),
+      this.#moverOccluders(lightSlots),
     );
     // ── §6.6's LIGHTING PASS, the only writer of the three atlas planes ──────
     // ITS OWN DISPATCH, and it must stay that way: 3 storage textures against a
@@ -6870,13 +6870,21 @@ export class GISystem {
    * shadows entirely, and the analytic term with rays still hitting them means
    * every mover shadow is applied twice.
    */
-  #moverOccluders() {
+  #moverOccluders(lightSlots) {
     if (globalThis.__giDiffuseSkipMovers !== true) return null;
     const max = Math.min(64, Math.max(4, Number(globalThis.__giMaxDynamicObjects) || 16));
     this._moverOccluders ??= {
       max,
       count: uniform(0),
       spheres: uniformArray(Array.from({ length: max }, () => new THREE.Vector4()), "vec4"),
+      // Mean albedo / emissive per mover — the same two the dynamic-object
+      // header carries at words 34..39 and that giField shades an exact hit
+      // with, so both paths agree about a mover's colour.
+      albedo: uniformArray(Array.from({ length: max }, () => new THREE.Vector4(1, 1, 1, 0)), "vec4"),
+      emissive: uniformArray(Array.from({ length: max }, () => new THREE.Vector4()), "vec4"),
+      // The SAME slot objects giField's dynamic shading loops over — shared
+      // uniforms, not a copy, so a light edit reaches both paths in one write.
+      lightSlots,
     };
     return this._moverOccluders;
   }
@@ -6910,6 +6918,17 @@ export class GISystem {
         const r = Math.hypot(b.max.x - cx, b.max.y - cy, b.max.z - cz);
         if (!(r > 1e-4)) return;
         bundle.spheres.array[n].set(cx, cy, cz, r);
+        // Colour, so the mover's BOUNCE comes back with it. `entry.surface` is
+        // the diagnostics mirror writeSurface keeps of exactly the words the
+        // header carries, so this cannot drift from what the exact-hit path
+        // shades with. A promoted emitter's emissive is already zeroed there
+        // (isPromotedEmitter), which keeps the analytic emitter slot from being
+        // double-counted here too.
+        const s = entry.surface;
+        const a = s?.albedo;
+        const e = s?.emissive;
+        bundle.albedo.array[n].set(a?.[0] ?? 1, a?.[1] ?? 1, a?.[2] ?? 1, 0);
+        bundle.emissive.array[n].set(e?.[0] ?? 0, e?.[1] ?? 0, e?.[2] ?? 0, 0);
         n++;
       });
     }
@@ -6917,6 +6936,8 @@ export class GISystem {
     // object that no longer exists, and the loop's `mo < count` gate is the
     // only thing standing between that and the screen.
     for (let i = n; i < bundle.max; i++) bundle.spheres.array[i].set(0, 0, 0, 0);
+    bundle.albedo.needsUpdate = true;
+    bundle.emissive.needsUpdate = true;
     bundle.count.value = n;
     bundle.spheres.needsUpdate = true;
   }
