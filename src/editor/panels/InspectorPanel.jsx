@@ -538,8 +538,19 @@ function PropField({ descriptor, value, onCommit, mixed = false, mixedAxes = [] 
       // otherwise render as a blank select that silently rewrites the prop on
       // the next change. Show it, marked, until the user picks something.
       const stale = !mixed && value != null && value !== "" && !options.includes(value);
+      // A DOM <select>'s value is ALWAYS a string, so committing `e.target.value`
+      // raw wrote "2" for a numeric option list of [2, 4]. Nothing matched it
+      // afterwards: the field rendered "2 (missing)" forever, and consumers doing
+      // the natural strict compare silently took their fallback branch —
+      // GISystem's `props.c0DirRes === 2 ? 2 : 4` read a user's saved "2" as 4 for
+      // as long as that scene existed. Map back onto the option's OWN value so a
+      // number stays a number and a string stays a string.
+      const commitOption = (raw) => {
+        const match = options.find((opt) => String(opt) === raw);
+        onCommit(match === undefined ? raw : match);
+      };
       return (
-        <select className="select-field" value={mixed ? "" : value} onChange={(e) => onCommit(e.target.value)}>
+        <select className="select-field" value={mixed ? "" : value} onChange={(e) => commitOption(e.target.value)}>
           {mixed && <option value="">— Mixed —</option>}
           {stale && <option value={value}>{`${value} (missing)`}</option>}
           {options.map((opt) => (
