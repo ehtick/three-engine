@@ -51,7 +51,12 @@
 //
 //   0            objectCount (f32 value, bitcast-stored like every word here)
 //   1..15        reserved
-//   16 + i*40    per-object block, OBJ_WORDS = 40:
+//   16..31       static-BVH slot-disable mask (raw u32 — STATIC_MASK_WORD_BASE)
+//   32..47       reserved
+//   DYN_HEADER_RESERVED + i*OBJ_WORDS   per-object block, OBJ_WORDS = 40.
+//   DYN_HEADER_RESERVED IS 48, not the 16 an earlier version of this block
+//   claimed — derive every offset from the exported constants, never from a
+//   number written here:
 //     +0..15     inverse OBB world matrix, column-major (obbWorld⁻¹ where
 //                obbWorld = mesh.matrixWorld × translate(localBoxCenter))
 //     +16..18    local half extents
@@ -60,7 +65,12 @@
 //     +20        BVH node base (word offset relative to baseWord)
 //     +21        BVH triangle base (relative)
 //     +22        max world scale factor (local→world distance approximation)
-//     +23        reserved
+//     +23        SURFACE-CACHE CARD TABLE base (word offset relative to
+//                baseWord, exactly like +20/+21) — 0 = no cards, take the
+//                mean-albedo fallback in +34..39. Written by setCardTable from
+//                surfaceCache.js's `cardTableRel`; read by cardFrameAt. This
+//                word was "reserved" until 2026-08-07; the surface radiance
+//                cache is its ONE claimant (docs/GI_NEXT_ARCHITECTURE.md §6.3).
 //     +24..26    swept-bounds world min (prev ∪ curr, pre-expanded)
 //     +27        swept retain factor: 0 = inactive · else the EMA retain
 //                scale for cells inside (translation-scaled — ~1 rotating
@@ -80,7 +90,9 @@
 //                would need textures bound in the compute pass, and the gap
 //                being closed here is wrong-vs-right, not right-vs-detailed.
 //     +37..39    MEAN EMISSIVE (rgb), premultiplied by emissiveIntensity
-//   HEADER_WORDS = 16 + maxObjects*40, then the BVH pool.
+//   HEADER_WORDS = dynHeaderWords(maxObjects) = DYN_HEADER_RESERVED +
+//   maxObjects*OBJ_WORDS, then the pool (BVH blocks + surface-cache card
+//   tables, one bump allocator — allocPoolWords).
 //
 // BVH4 node = 28 words: [ref0..ref3, then 4× (min.xyz,max.xyz) f32].
 // BVH8 node = 28 words (the COMPRESSED format, default): [origin.xyz f32,
@@ -1117,6 +1129,21 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
     return true;
   };
 
+  /**
+   * Publishes an object's SURFACE-CACHE CARD TABLE base into header word +23 —
+   * `buildSurfaceCache`'s `cardTableRel`, a word offset relative to `baseWord`,
+   * the same convention the BVH bases in words +20/+21 use. 0 is the "no cards"
+   * sentinel (a demoted or not-yet-built object), and word 0 of the region is
+   * the object-count word, so it can never be a legal table start.
+   *
+   * The card WORDS themselves go in through `allocPoolWords` + the existing
+   * `queueRegionUpload`; this only publishes where they are.
+   */
+  const setCardTableAt = (index, cardTableRel) => {
+    const rel = Number.isFinite(cardTableRel) ? Math.max(0, Math.trunc(cardTableRel)) : 0;
+    wm(index, 23, rel);
+  };
+
   const worldMatrixOf = (entry) => {
     const { mesh, instanceId } = entry;
     if (instanceId == null || !mesh.isInstancedMesh) return mesh.matrixWorld;
@@ -1308,6 +1335,45 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
     },
 
     /**
+     * Reserves `count` words in the region tail through the SAME bump allocator
+     * the BVH pool uses, and returns both offsets the callers need: `rel` (what
+     * goes into a header word, relative to `baseWord`) and `abs` (what
+     * `queueRegionUpload` takes). Null when the region is full.
+     *
+     * ONE allocator, deliberately: the surface cache's card tables and the BVH
+     * blocks share this region, and a second bump pointer over the same words
+     * would overlap silently. Never recycled inside a build — the next full
+     * field rebuild resets everything, same as the BVH pool.
+     */
+    allocPoolWords(count) {
+      const n = Number.isFinite(count) ? Math.max(0, Math.trunc(count)) : 0;
+      if (!enabled || n === 0) return null;
+      if (nextWord + n > capacityWords) {
+        set.stats.overflowRejected++;
+        if (globalThis.__giDynObjectsDebug) {
+          console.warn(`[gi] dynamic-objects: pool full (${nextWord}+${n} > ${capacityWords}) — allocation refused`);
+        }
+        return null;
+      }
+      const rel = nextWord;
+      nextWord += n;
+      set.stats.poolWordsUsed = nextWord - HEADER_WORDS;
+      return { rel, abs: baseWord + rel, words: n };
+    },
+
+    /**
+     * Publishes an adopted object's card-table base (header word +23). `key` is
+     * the adoption key; returns false when the object is not adopted, which is
+     * the normal race after a demotion.
+     */
+    setCardTable(key, cardTableRel) {
+      const entry = entries.get(key);
+      if (!entry) return false;
+      setCardTableAt(entry.index, cardTableRel);
+      return true;
+    },
+
+    /**
      * One-shot upload of arbitrary words into the bits buffer (the static
      * BVH's build/rebuild path — same staging pattern as geometry blocks).
      */
@@ -1440,6 +1506,9 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
       wm(index, 19, 0);
       wm(index, 20, geoBlock ? geoBlock.rel : 0);
       wm(index, 21, geoBlock ? geoBlock.rel + geoBlock.nodeWords : 0);
+      // No cards until a surface-cache build says otherwise — a freshly adopted
+      // mover shades from the mean albedo, which is the safe direction.
+      setCardTableAt(index, 0);
       const prm = shape.params ?? [0, 0, 0];
       wm(index, 31, prm[0] ?? 0);
       wm(index, 32, prm[1] ?? 0);
@@ -1685,6 +1754,39 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
       return {
         albedo: vec3(rf(ob.add(uint(34))), rf(ob.add(uint(35))), rf(ob.add(uint(36)))).toVar(),
         emissive: vec3(rf(ob.add(uint(37))), rf(ob.add(uint(38))), rf(ob.add(uint(39)))).toVar(),
+      };
+    },
+
+    /**
+     * Everything the SURFACE-CACHE card lookup needs about object `idx`, read
+     * in ONE object-block pass (surfaceCacheGpu.js's `createCardRadianceSampler`
+     * consumes exactly this):
+     *
+     *   cardTableRel — word +23, the card-table base relative to `baseWord`
+     *                  (0 = no cards → the words 34..39 mean-albedo fallback)
+     *   pLocal       — `invWorld · P`, words 0..15. The OBB-CENTRED local space
+     *                  the card packer projects in, and the same expression
+     *                  `traceDynBody` builds `roL` from.
+     *   halfExtents  — words 16..18, what the card's (s, t) normalises against.
+     *
+     * `idx` is the float index `trace({objId: true})` returns; like
+     * `surfaceAt`, a negative index reads object 0, so callers gate on the
+     * index themselves.
+     */
+    cardFrameAt(idx, P) {
+      const rf = (rel) => uintBitsToFloat(bits.element(uint(baseWord).add(rel)));
+      const ob = uint(DYN_HEADER_RESERVED)
+        .add(float(idx).max(0).toUint().min(uint(MAX - 1)).mul(uint(OBJ_WORDS)))
+        .toVar();
+      const c0 = vec3(rf(ob.add(uint(0))), rf(ob.add(uint(1))), rf(ob.add(uint(2)))).toVar();
+      const c1 = vec3(rf(ob.add(uint(4))), rf(ob.add(uint(5))), rf(ob.add(uint(6)))).toVar();
+      const c2 = vec3(rf(ob.add(uint(8))), rf(ob.add(uint(9))), rf(ob.add(uint(10)))).toVar();
+      const c3 = vec3(rf(ob.add(uint(12))), rf(ob.add(uint(13))), rf(ob.add(uint(14)))).toVar();
+      const p = vec3(P).toVar();
+      return {
+        cardTableRel: rf(ob.add(uint(23))).toVar(),
+        pLocal: c0.mul(p.x).add(c1.mul(p.y)).add(c2.mul(p.z)).add(c3).toVar(),
+        halfExtents: vec3(rf(ob.add(uint(16))), rf(ob.add(uint(17))), rf(ob.add(uint(18)))).toVar(),
       };
     },
 

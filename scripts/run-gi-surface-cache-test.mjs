@@ -424,19 +424,22 @@ for (const c of cases) {
     `OBJ_WORDS=${OBJ_WORDS}`,
   );
 
-  // Word +23 must still be UNCLAIMED in dynamicObjects.js. This is the
-  // assertion that keeps it reserved: the moment another feature writes or
-  // reads word 23 of an object block, this test goes red instead of two
-  // features silently sharing a word.
+  // Word +23 must be claimed by the CARD TABLE and by nothing else. This
+  // assertion started life as "still unclaimed" and was flipped the moment the
+  // surface cache took the word (`setCardTable` writes it, `cardFrameAt` reads
+  // it) — that transition is the one legitimate edit to this check, and it is
+  // allowed to happen exactly once. A second writer or a second reader means
+  // two features are sharing a word, which is the failure this guards, so the
+  // predicate is EQUALITY not "at most": both counts must be exactly 1.
   const src = readFileSync(
     fileURLToPath(new URL("../src/modules/gi/dynamicObjects.js", import.meta.url)), "utf8",
   );
   const writes = src.match(/\bwm\(\s*\w+\s*,\s*23\s*,/g) ?? [];
   const reads = src.match(/\bob\.add\(uint\(23\)\)/g) ?? [];
   check(
-    "object-block word +23 is still free in dynamicObjects.js",
-    writes.length === 0 && reads.length === 0,
-    `writes=${writes.length} reads=${reads.length}`,
+    "object-block word +23 is claimed exactly once, by the card table",
+    writes.length === 1 && reads.length === 1,
+    `writes=${writes.length} reads=${reads.length} (expected 1/1)`,
   );
 
   // §6.3 says "Start at 2048² (≈ 25 MB across the three at rgba16f)". The 25 MB
