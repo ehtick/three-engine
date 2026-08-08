@@ -84,6 +84,16 @@ export function EditorChrome() {
         // saved main/last scene was missing or moved.
         void restored;
         console.log("Editor ready");
+        // Serving is sticky per project: if the preview server was running
+        // when this project was last closed, bring it back. Deliberately not
+        // awaited — a build takes seconds and nothing below depends on it,
+        // and the toolbar subscribes to the preview state so the URLs appear
+        // as soon as they exist.
+        if (!cancelled) {
+          import("./browserPreview.js")
+            .then((m) => m.autoStartBrowserPreviewIfRemembered())
+            .catch((err) => console.warn(`Preview autostart: ${err?.message ?? err}`));
+        }
       }
       // Project settings (script hot reload, pixel ratio cap, grid/snap…)
       // apply once the engine exists.

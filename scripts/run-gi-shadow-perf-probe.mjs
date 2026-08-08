@@ -51,7 +51,8 @@ await page.evaluateOnNewDocument((PROJECT, G) => {
   localStorage.setItem("engine.recentProjects.v1", JSON.stringify([PROJECT]));
   for (const [k, v] of Object.entries(G)) globalThis[k] = v;
   // The viewport must keep rendering while unfocused or every sample is a
-  // paused frame (the snowflake pause is opt-in but headless has no focus).
+  // paused frame — the unfocused pause is on by default and headless is never
+  // focused.
   globalThis.__editorKeepRendering = true;
 }, PROJECT, { ...(ARMS[ARM] ?? {}), ...JSON.parse(process.env.PRESET_GLOBALS ?? "{}") });
 await page.goto(url, { waitUntil: "load", timeout: 60000 });

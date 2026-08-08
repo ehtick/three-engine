@@ -1621,7 +1621,14 @@ function createOccupancySceneTrace(
     //
     // NOT AFFECTED, deliberately: the screen-space light/emitter shadow channels
     // still trace movers per pixel and densely — that path never popped.
-    const skipMovers = globalThis.__giDiffuseSkipMovers === true;
+    //
+    // DEFAULT ON since 2026-08-08, measured on the user's real Sponza project
+    // (run-gi-flicker-frame, 240 frames, ultra): a moving sphere's per-pixel
+    // flicker reversals fell 0.574 → 0.003 — the still-scene floor is 0.002,
+    // i.e. a moving object is now indistinguishable from a static scene to
+    // the diffuse estimator — and a rotating box fell 2.239 → 0.386 (−83%).
+    // `__giDiffuseSkipMovers = false` restores sampled movers for A/B.
+    const skipMovers = globalThis.__giDiffuseSkipMovers !== false;
     const r = trace(o, d, tMin, float(tMaxWorld), {
       steps,
       macroSteps: MAX_MACRO_STEPS,

@@ -708,6 +708,8 @@ async function editorSurface() {
   void (await Editor.build.set({ target: "web" }));
   void (await Editor.build.export("zip"));
   void (await Editor.build.preview(true));
+  void (await Editor.build.serve());
+  void (await Editor.build.serve(true));
 
   // batch — many ops, one undo step; "$0" is step 0's returned id.
   const steps: BatchStep[] = [

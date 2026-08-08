@@ -333,17 +333,22 @@ const out = await page.evaluate(async () => {
   report.setCamera = { applied: aimed.position.map((v) => Math.round(v)).join(",") === "6,5,6" };
 
   // An agent watching something run unattended needs to be able to stop the
-  // viewport pausing itself — nothing is ever "focused" in a headless session.
-  const freezeDefault = Editor.viewport.freezeWhenUnfocused();
+  // viewport pausing itself — nothing is ever "focused" in a headless session,
+  // and pausing is now the default. Assert the round trip rather than a
+  // starting value: the setting is a persisted per-machine preference, so
+  // whatever it happens to be when the harness attaches is not a bug.
+  const freezeBefore = Editor.viewport.freezeWhenUnfocused().enabled;
+  const freezeOff = Editor.viewport.freezeWhenUnfocused(false);
+  const freezeReadBack = Editor.viewport.freezeWhenUnfocused().enabled;
   const freezeOn = Editor.viewport.freezeWhenUnfocused(true);
-  const freezeBack = Editor.viewport.freezeWhenUnfocused(false);
   report.freeze = {
-    defaultsOff: freezeDefault.enabled === false,
+    turnsOff: freezeOff.enabled === false,
     turnsOn: freezeOn.enabled === true,
-    turnsBackOff: freezeBack.enabled === false,
     // Reading without an argument must not change it.
-    readOnly: Editor.viewport.freezeWhenUnfocused().enabled === false,
+    readOnly: freezeReadBack === false,
   };
+  // Leave the user's preference as it was found.
+  Editor.viewport.freezeWhenUnfocused(freezeBefore);
 
   const shot = await Editor.viewport.screenshot({ width: 200, height: 120 });
   const decoded = shot.__image?.base64 ? atob(shot.__image.base64) : "";
@@ -582,8 +587,7 @@ check("entity.getBounds returns real extents", out.bounds.empty === false && out
 check("viewport.focus moves the camera", out.focus.moved === true);
 check("…and centres on the entity", out.focus.targetsProbe === true);
 check("viewport.setCamera applies exactly", out.setCamera.applied === true);
-check("viewport freezing is off by default", out.freeze.defaultsOff === true);
-check("…and an agent can turn it on and back off", out.freeze.turnsOn === true && out.freeze.turnsBackOff === true, JSON.stringify(out.freeze));
+check("an agent can turn viewport freezing off and back on", out.freeze.turnsOff === true && out.freeze.turnsOn === true, JSON.stringify(out.freeze));
 check("…while reading it alone changes nothing", out.freeze.readOnly === true);
 check("viewport.screenshot returns an image", out.screenshot.hasImage === true, `${out.screenshot.mime} ${out.screenshot.size}`);
 check("…that is really a PNG", out.screenshot.isPng === true, `${out.screenshot.bytes} bytes`);

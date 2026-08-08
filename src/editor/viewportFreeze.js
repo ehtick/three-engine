@@ -2,28 +2,27 @@
 /**
  * Whether an unfocused viewport stops rendering.
  *
- * OFF by default: a viewport that keeps drawing is the behaviour that can never
- * surprise you. Watching a sim settle, an animation loop or a bake converge from
- * another panel all need it, and none of them announce themselves — so the
- * editor cannot infer when pausing is safe. It is a switch you reach for when a
- * heavy scene is making the rest of the editor lag, which you notice
- * immediately; the reverse mistake (a viewport that silently stopped) is the one
- * that wastes an hour.
+ * ON by default: a viewport nobody is looking at is pure cost, and a heavy
+ * scene rendering behind a paint canvas or a node graph makes the WHOLE editor
+ * lag while buying nothing. `editorFramePacing` wakes a stopped viewport
+ * whenever something it draws actually changes, so the picture stays honest;
+ * the one thing it cannot do is keep an unattended simulation ticking, which is
+ * why the switch stays reachable in Project Settings → Editor.
  *
  * Per machine, not per project: it is about how heavy YOUR scene runs on YOUR
  * hardware, so it lives in localStorage next to the other `engine.*` editor
  * preferences rather than in project.json where it would follow the project
  * onto someone else's machine.
  *
- * Kept in its own module, free of engine and store imports, so the toolbar
- * button can read it without dragging the render loop in behind it.
+ * Kept in its own module, free of engine and store imports, so the settings
+ * panel can read it without dragging the render loop in behind it.
  */
 import { vmSingleton } from "./singleton.js";
 
 const KEY = "engine.viewport.freezeWhenUnfocused";
 
 const state = vmSingleton("viewportFreeze", () => ({
-  // Absent means "never set" — default off. Only an explicit "1" turns it on,
+  // Absent means "never set" — default on. Only an explicit "0" turns it off,
   // so a cleared localStorage comes back to the sane default rather than to
   // whatever `Boolean(null)` happens to be.
   enabled: readStored(),
@@ -33,11 +32,11 @@ const state = vmSingleton("viewportFreeze", () => ({
 
 function readStored() {
   try {
-    return localStorage.getItem(KEY) === "1";
+    return localStorage.getItem(KEY) !== "0";
   } catch {
     // Storage can be unavailable (a sandboxed harness, private mode). The
     // feature is a preference, not a requirement — fall back to the default.
-    return false;
+    return true;
   }
 }
 

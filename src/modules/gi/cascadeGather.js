@@ -26,10 +26,10 @@
 // second transport implementation. Direct material shading here deliberately
 // bypasses any G-buffer/deferred-resolve layer (where the prior attempt's
 // never-root-caused stripe bug lived).
-import { Fn, If, Loop, Return, acos, atan, cos, float, floor, fract, instanceIndex, instancedArray, max, mix, mod, select, sin, smoothstep, sqrt, step, texture3D, uniform, vec2, vec3, vec4 } from "three/tsl";
+import { Break, Fn, If, Loop, Return, acos, atan, cos, float, floor, fract, instanceIndex, instancedArray, max, mix, mod, select, sin, smoothstep, sqrt, step, texture3D, uniform, vec2, vec3, vec4 } from "three/tsl";
 import { octahedralTexelIndex, octahedralTexelWeight, octahedralUV } from "./cascadeTrace.js";
 import { sharedFn } from "./giFn.js";
-import { emitterAngularRadius, emitterSlotFactor, emitterSurfaceT } from "./giLight.js";
+import { boxLightFactor, emitterAngularRadius, emitterExclusion, emitterSlotFactor, emitterSurfaceT } from "./giLight.js";
 import { RayHitMode } from "./rayHit/RayHitConfig.js";
 
 /**
@@ -1093,18 +1093,77 @@ export function createIrradianceGather(cascades, probeIrradiance = null, fieldCe
             const vis = float(1).toVar();
             const emit = vec3(0).toVar();
             Loop({ start: 0, end: moverOccluders.max, name: "mo" }, ({ mo }) => {
-              If(float(mo).lessThan(moverOccluders.count), () => {
-                const sph = moverOccluders.spheres.element(mo).toVar();
-                // radius 0 = an empty slot; skip rather than divide by it.
+              // DYNAMIC TRIP COUNT. `count` slots are seated contiguously from
+              // 0 (GISystem sorts and packs them), so everything past it is
+              // empty — leave. The fixed `max` bound alone made every resolve
+              // PIXEL pay all 32 iterations however few movers were live
+              // (probe-measured on the cannonball scene: resolve 1.21 → 2.84ms
+              // at 111k px, ~×10 that at the user's window).
+              If(float(mo).greaterThanEqual(moverOccluders.count), () => {
+                Break();
+              });
+              const sph = moverOccluders.spheres.element(mo).toVar();
+              // w > 0 → sphere of radius w; w < 0 → ORIENTED BOX with
+              // bounding radius |w| (GISystem's slot encoding). |w| ≈ 0 is
+              // an empty slot; both branches skip it rather than divide.
+              //
+              // PROJECTED-SIZE GATE, both shapes, fade instead of cliff:
+              // below ~0.7° half-angle (ratio 0.012) neither the occlusion
+              // nor the bounce is resolvable against the probe
+              // reconstruction, so the far side costs one compare — but a
+              // hard cut popped a bright projectile's glow at the gate
+              // radius (emissive · f stays visible after occlusion alone has
+              // vanished), so the factor fades linearly over [0.012, 0.02].
+              // The box branch used to carry its own hard 0.02 gate; hoisted
+              // so the sphere path — 24 scattered cannonballs — stops paying
+              // sphereOcclusion per pixel for every distant ball.
+              const boundR = sph.w.abs().toVar();
+              const dist = P.sub(sph.xyz).length().max(1e-4).toVar();
+              const ratio = boundR.div(dist).toVar();
+              If(ratio.greaterThan(0.012), () => {
+                const f = float(0).toVar();
                 If(sph.w.greaterThan(1e-4), () => {
-                  const f = sphereOcclusion(P, N, sph).toVar();
-                  If(f.greaterThan(1e-5), () => {
-                    // The sphere point facing this receiver, and its outward normal.
+                  f.assign(sphereOcclusion(P, N, sph));
+                }).ElseIf(sph.w.lessThan(-1e-4), () => {
+                  // Box occlusion = the exact Lambert contour integral over π
+                  // (the same boxLightFactor the emitter slots use): exact for
+                  // box movers, C¹ under rotation, and IDENTICALLY ZERO for a
+                  // receiver on the box's own outward surface or inside it —
+                  // which is what kills the bounding-sphere proxy's gradient
+                  // across a big cube's own faces (rotating-cube screenshots,
+                  // 2026-08-08).
+                  const q = moverOccluders.quats.element(mo).toVar();
+                  const h = moverOccluders.halfs.element(mo).xyz.toVar();
+                  // v rotated by quaternion q: v + 2·q.xyz×(q.xyz×v + q.w·v)
+                  const qrot = (v) => {
+                    const t = q.xyz.cross(q.xyz.cross(v).add(v.mul(q.w)));
+                    return v.add(t.mul(2));
+                  };
+                  const bx = qrot(vec3(1, 0, 0)).toVar();
+                  const by = qrot(vec3(0, 1, 0)).toVar();
+                  const bz = qrot(vec3(0, 0, 1)).toVar();
+                  f.assign(boxLightFactor(P, N, sph.xyz, h, bx, by, bz).mul(1 / Math.PI).clamp(0, 1));
+                });
+                // 125 = 1 / (0.02 − 0.012): the fade ramp of the gate above.
+                f.mulAssign(ratio.sub(0.012).mul(125).clamp(0, 1));
+                If(f.greaterThan(1e-5), () => {
+                    // The shading surrogate: the proxy point facing this
+                    // receiver, at the bounding radius (|w| serves both
+                    // shapes — the bounce is a diffuse average and the
+                    // ENERGY is carried exactly by f above).
                     const toP = P.sub(sph.xyz).toVar();
                     const n = toP.div(toP.length().max(1e-4)).toVar();
-                    const hp = sph.xyz.add(n.mul(sph.w)).toVar();
+                    const hp = sph.xyz.add(n.mul(sph.w.abs())).toVar();
                     const irr = vec3(0).toVar();
-                    for (const slot of moverOccluders.lightSlots ?? []) {
+                    // Per-light DIRECT VISIBILITY of this mover (GISystem's
+                    // CPU shadow oracle, one component per slot): without it
+                    // a mover standing in a building's shade re-radiated the
+                    // full sun — "the cube does not consider direct light
+                    // occluders around it".
+                    const lightVis = moverOccluders.lightVis
+                      ? moverOccluders.lightVis.element(mo).toVar()
+                      : null;
+                    for (const [li, slot] of (moverOccluders.lightSlots ?? []).entries()) {
                       If(float(slot.active).greaterThan(0.5), () => {
                         const isDir = float(slot.kind).toVar();
                         const rel = vec3(slot.vector).sub(hp).toVar();
@@ -1112,7 +1171,10 @@ export function createIrradianceGather(cascades, probeIrradiance = null, fieldCe
                         const L = mix(rel.div(pd), vec3(slot.vector), isDir).toVar();
                         const atten = mix(float(1).div(pd.mul(pd).max(1)), float(1), isDir);
                         const ndotl = L.dot(n).max(0).toVar();
-                        irr.addAssign(vec3(slot.color).mul(atten.mul(ndotl).mul(1 / Math.PI)));
+                        const visL = lightVis && li < 4
+                          ? [lightVis.x, lightVis.y, lightVis.z, lightVis.w][li]
+                          : float(1);
+                        irr.addAssign(vec3(slot.color).mul(atten.mul(ndotl).mul(visL).mul(1 / Math.PI)));
                       });
                     }
                     // ── AND THE INDIRECT LIGHT ON THE MOVER, WHICH IS USUALLY
@@ -1147,7 +1209,6 @@ export function createIrradianceGather(cascades, probeIrradiance = null, fieldCe
                     // does not shine through it.
                     emit.addAssign(radiance.mul(f).mul(Math.PI).mul(vis));
                     vis.mulAssign(float(1).sub(f));
-                  });
                 });
               });
             });
@@ -1410,6 +1471,18 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
     const prevIndirect =
       fieldSmoothing && volume.indirectBuffer ? volume.indirectBuffer.element(instanceIndex).toVar() : null;
     const wasEmpty = prev.w.lessThan(0.5);
+    // Emitter-motion history cut: accumulated by the emitter arm inside the
+    // occupied branch, applied at the tail's EMA. Declared HERE because the
+    // two live in different TSL callbacks and the tail runs for every cell —
+    // the same scope split the swept-invalidation block documents below.
+    const motionCutStrength = (() => {
+      const v = Number(globalThis.__giEmitterMotionCut);
+      return Number.isFinite(v) ? Math.max(0, Math.min(1, v)) : 1;
+    })();
+    const movedLum =
+      emitterSlots?.length && motionCutStrength > 0 && fieldSmoothing && emitterSlots.some((s) => s.moved)
+        ? float(0).toVar()
+        : null;
     const alpha = float(1).toVar();
     If(staging.w.sub(prev.w).abs().lessThan(0.5), () => {
       alpha.assign(blendUniform);
@@ -1657,6 +1730,18 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
       // factor — SDF-shadowed with k from the emitter's angular size (the
       // SAME emitterSlotFactor the receiver-side material term uses, so the
       // two stay in agreement).
+      //
+      // EMITTER-MOTION HISTORY CUT (2026-08-08). The field EMA (retain 0.95,
+      // ~20 frames) exists to integrate NOISY terms; the analytic emitter
+      // direct is deterministic and needs none of it — yet its light pools
+      // land METRES from the lamp, far outside the mover swept-bounds cut,
+      // so a MOVING lamp dragged a ~330ms wake behind it ("everything breaks
+      // when I move the sphere"). Per cell, the retain is scaled down by the
+      // MOVING emitters' share of that cell's radiance (slot.moved is set by
+      // GISystem's refresh from actual pose deltas, decaying at rest):
+      // statically-lit cells keep full smoothing, a moving lamp's pool
+      // follows it the same frame. `__giEmitterMotionCut=0` disables; values
+      // in (0,1] scale the cut.
       if (emitterSlots?.length && emitterShadow) {
         const rawAlbedo = fieldAlbedo;
         for (const slot of emitterSlots) {
@@ -1684,17 +1769,14 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
               const shadow = float(1).toVar();
               If(maxT.greaterThan(normalLiftV), () => {
                 // Exclusion = lamp body + ~2 cells, NOT a fixed 2m — a
-                // fixed radius exempted nearby walls from occluding. Box
-                // slots dilate their OBB instead of the bounding sphere
-                // (a panel's sphere swallowed the ceiling above it → the
-                // field itself carried light into the next room).
-                const kindF = slot.kind ? float(slot.kind) : null;
-                const exRadius = kindF
-                  ? mix(float(slot.radius).mul(1.5).add(normalLiftV.mul(2)), normalLiftV.mul(2), kindF)
-                  : float(slot.radius).mul(1.5).add(normalLiftV.mul(2));
-                const exBox = kindF
-                  ? { half: mix(vec3(-1), vec3(slot.half), kindF), bx: slot.bx, by: slot.by, bz: slot.bz }
-                  : null;
+                // fixed radius exempted nearby walls from occluding. Shaped
+                // slots dilate a conservative OBB (exHalf) instead of the
+                // bounding sphere (a panel's sphere swallowed the ceiling
+                // above it → the field itself carried light into the next
+                // room).
+                const ex = emitterExclusion(slot, normalLiftV.mul(2));
+                const exRadius = ex.exRadius;
+                const exBox = ex.exBox;
                 // The emitter's own disc is the jitter cone (sinR = its
                 // angular radius from this cell) — the estimator still
                 // shapes each ray's penumbra; the jitter is what removes
@@ -1718,6 +1800,11 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
                 .mul(shadow)
                 .mul(smoothstep(0.002, 0.006, emitterCellLum));
               out.assign(vec4(out.xyz.add(direct), out.w));
+              if (movedLum && slot.moved) {
+                movedLum.addAssign(
+                  direct.dot(vec3(0.2126, 0.7152, 0.0722)).mul(float(slot.moved)),
+                );
+              }
             });
           });
         }
@@ -1771,6 +1858,14 @@ export function createBounceFeedback(cascades, volume, gainUniform, blendUniform
           floor(idxS.div(res.x * res.y)).add(0.5).mul(world.cell.z).add(world.min.z),
         );
         fieldAlpha.assign(fieldAlpha.mul(float(sweptInvalidationAt(cellCenterS))));
+      }
+      // Emitter-motion cut (see the emitter arm's note): the retain shrinks
+      // by the moving emitters' SHARE of this cell's radiance — contribution-
+      // weighted, so it is spatially smooth by construction and exactly zero
+      // when every lamp is at rest.
+      if (movedLum) {
+        const share = movedLum.div(out.xyz.dot(vec3(0.2126, 0.7152, 0.0722)).max(1e-5)).clamp(0, 1);
+        fieldAlpha.assign(fieldAlpha.mul(float(1).sub(share.mul(motionCutStrength))));
       }
       out.assign(vec4(mix(out.xyz, prevRadiance.xyz, fieldAlpha), out.w));
       if (prevIndirect) indirect.assign(mix(indirect, prevIndirect.xyz, fieldAlpha));

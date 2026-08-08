@@ -1844,14 +1844,14 @@ check("with the toggle on, an unfocused viewport is suspended outright", () => {
   assert.equal(shouldSuspendViewport({ freeze: true }), false, "the focused, visible case renders");
 });
 
-check("freezing is opt-in — the default keeps rendering", () => {
-  // The toolbar snowflake starts off: a viewport that keeps drawing can never
-  // surprise anyone, and pausing is what you reach for once a heavy scene is
-  // visibly costing you.
+check("a caller that says nothing about freezing keeps rendering", () => {
+  // The preference itself defaults ON (Project Settings → Editor), but this is
+  // a pure function and its unstated case has to be the conservative one:
+  // never suspend a viewport because a caller forgot to pass the flag.
   assert.equal(shouldSuspendViewport({ focused: false }), false);
   assert.equal(shouldSuspendViewport({}), false);
   // But a viewport with no box on screen stops either way: it cannot be being
-  // watched, whatever the preference says. Leaving the toggle off must not
+  // watched, whatever the preference says. Turning the setting off must not
   // resurrect a render loop behind a hidden dock tab.
   assert.equal(shouldSuspendViewport({ visible: false }), true);
 });

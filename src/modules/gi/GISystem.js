@@ -30,6 +30,8 @@ import { CARD_SLOTS, CARD_WORDS, buildSurfaceCache, cardLayerCount } from "./sur
 import { createSurfaceCacheAtlas, surfaceCachePoolWords } from "./surfaceCacheGpu.js";
 import { createSurfaceCacheLightPass } from "./surfaceCacheLight.js";
 import { fitPrimitive } from "./primitiveFit.js";
+import { fitEmitterShape } from "./emitterShapes.js";
+import { MeshBVH } from "three-mesh-bvh";
 import { describeGrid } from "./instanceGrid.js";
 import { BRICK_AXIS_BY_QUALITY, describeSparseField } from "./sparseField.js";
 import { UI_LAYER } from "../../engine/editorLayers.js";
@@ -541,6 +543,119 @@ const quantizeSpacing = (value) =>
  * reads (field gather, screen resolve, and the transport rays' exact-dynamic
  * shading). Light moves/edits update uniforms only — never a rebuild.
  */
+// ── MOVER DIRECT-LIGHT SHADOW ORACLE (CPU) ─────────────────────────────────
+// One ray per (mover × analytic light) per frame against the STATIC meshes,
+// via three-mesh-bvh — the answer to "is this mover actually lit by that
+// light", which the analytic mover bounce needs and no GPU path can deliver
+// to a UNIFORM without a frame-path readback. Scratches shared, no per-frame
+// allocation; the smoothing lives on the ENTRY (entry._giLightVis) so slot
+// reshuffles cannot smear one mover's ramp onto another.
+const _msoOrigin = new THREE.Vector3();
+const _msoDir = new THREE.Vector3();
+const _msoLocalRay = new THREE.Ray();
+const _msoWorldRay = new THREE.Ray();
+const _msoHit = new THREE.Vector3();
+const _msoBoundsC = new THREE.Vector3();
+const _msoBoundsS = new THREE.Vector3();
+const _mocCamera = new THREE.Vector3();
+const _mocCenter = new THREE.Vector3();
+// Geometry → MeshBVH, shared across oracle re-keys. The oracle rebuilds its
+// mesh list whenever the occupancy field object is replaced (any structural
+// rebuild), and the first shipped version rebuilt every BVH with it — the
+// cannonball probe counted 121 main-thread builds in one session because a
+// mid-game rebuild re-keyed it. Geometries survive rebuilds; the BVH is a
+// pure function of the geometry; cache it for the session.
+const moverOracleBvhCache = new WeakMap();
+function moverLightVisTarget(oracle, center, boundR, slot) {
+  if (!(slot.active.value > 0.5)) return 1;
+  const isDir = slot.kind.value >= 0.5;
+  let maxT;
+  if (isDir) {
+    // `vector` holds the normalized direction TOWARD the light.
+    _msoDir.copy(slot.vector.value).normalize();
+    maxT = 64;
+  } else {
+    _msoDir.copy(slot.vector.value).sub(center);
+    const d = _msoDir.length();
+    if (d < 1e-4) return 1;
+    _msoDir.divideScalar(d);
+    maxT = d - 1e-3;
+  }
+  // Start outside the mover's own body — it must not shadow itself here
+  // (the bounce term's ndotl already carries its self-shadowing).
+  const lift = boundR * 1.05;
+  _msoOrigin.copy(center).addScaledVector(_msoDir, lift);
+  maxT -= lift;
+  if (maxT <= 0) return 1;
+  _msoWorldRay.origin.copy(_msoOrigin);
+  _msoWorldRay.direction.copy(_msoDir);
+  for (const e of oracle.ready) {
+    // World-AABB slab test before the transform + BVH descent: a Sponza
+    // sun ray misses most of the 55 meshes' boxes outright, and this loop
+    // runs per (mover × light) per frame. `skip` = currently adopted as an
+    // exact mover (stale pose here would ghost-shadow).
+    if (e.skip) continue;
+    if (e.worldBox && !_msoWorldRay.intersectsBox(e.worldBox)) continue;
+    _msoLocalRay.origin.copy(_msoOrigin).applyMatrix4(e.inv);
+    _msoLocalRay.direction.copy(_msoDir).transformDirection(e.inv);
+    const hit = e.bvh.raycastFirst(_msoLocalRay, THREE.DoubleSide);
+    if (hit) {
+      _msoHit.copy(hit.point).applyMatrix4(e.mesh.matrixWorld);
+      if (_msoHit.distanceTo(_msoOrigin) <= maxT) return 0;
+    }
+  }
+  return 1;
+}
+
+// Oriented-box occluder record for #syncMoverOccluders — fills the shared
+// scratch record below (center/half/radius) + moverObbQuat with the mover's
+// world OBB from its LOCAL bounding box through matrixWorld, the same recipe
+// (and the same shear-out-of-scope caveat) as the emitter fitter's OBB
+// fallback. Returns false when the mover should keep its sphere-chain proxy:
+// exact spheres, user-pinned sphere/capsule proxies, instanced movers, or
+// `__giMoverObbOcclusion === false` (the A/B hatch back to bounding spheres).
+const moverObbQuat = new THREE.Quaternion();
+const _obbPos = new THREE.Vector3();
+const _obbScale = new THREE.Vector3();
+function moverObbRecord(entry, out) {
+  if (globalThis.__giMoverObbOcclusion === false) return false;
+  const mesh = entry.mesh;
+  if (!mesh || mesh.isInstancedMesh) return false;
+  const mode = mesh.userData?.giProxy ?? "auto";
+  if (mode === "sphere" || mode === "capsule" || mode === "none") return false;
+  if (entry.type === "sphere") return false;
+  const g = mesh.geometry;
+  if (!g) return false;
+  if (!g.boundingBox) g.computeBoundingBox();
+  const bb = g.boundingBox;
+  if (!bb || bb.isEmpty()) return false;
+  mesh.matrixWorld.decompose(_obbPos, moverObbQuat, _obbScale);
+  out.center
+    .set((bb.min.x + bb.max.x) / 2, (bb.min.y + bb.max.y) / 2, (bb.min.z + bb.max.z) / 2)
+    .applyMatrix4(mesh.matrixWorld);
+  out.half.set(
+    Math.max(((bb.max.x - bb.min.x) / 2) * Math.abs(_obbScale.x), 0.005),
+    Math.max(((bb.max.y - bb.min.y) / 2) * Math.abs(_obbScale.y), 0.005),
+    Math.max(((bb.max.z - bb.min.z) / 2) * Math.abs(_obbScale.z), 0.005),
+  );
+  out.radius = Math.hypot(out.half.x, out.half.y, out.half.z);
+  return out.radius > 1e-4;
+}
+
+// Reused by #refreshEmitterSlots every frame — fitEmitterShape fills it
+// in place so the per-slot refresh allocates nothing.
+const emitterFitScratch = {
+  kind: 0,
+  center: new THREE.Vector3(),
+  bx: new THREE.Vector3(),
+  by: new THREE.Vector3(),
+  bz: new THREE.Vector3(),
+  half: new THREE.Vector3(),
+  radius: 0,
+  reff: 0,
+  exHalf: new THREE.Vector3(),
+};
+
 function makeLightSlots() {
   return Array.from({ length: MAX_GI_LIGHTS }, () => ({
     active: uniform(0),
@@ -4074,16 +4189,29 @@ export class GISystem {
             radius: uniform(0),
             color: uniform(new THREE.Color(0, 0, 0)),
             // Slot SHAPE (see giLight emitterSlotFactor): kind 0 = sphere,
-            // 1 = oriented box; half = world half-extents; bx/by/bz = world
-            // axes; reff = mean-projected-area-equivalent radius (angular
-            // size for penumbra k and glow energy). radius stays the
-            // bounding sphere — trace self-exclusion and the active gate.
+            // 1 = oriented box, 2 = capsule, 3 = cylinder, 4 = frustum/cone,
+            // 5 = disc/ring, 6 = torus (fitted per frame by
+            // emitterShapes.js fitEmitterShape — `half` semantics per kind
+            // documented there; `by` is every shaped kind's symmetry axis).
+            // reff = mean-projected-area-equivalent radius (angular size for
+            // penumbra k and glow energy). radius stays the bounding
+            // sphere — trace self-exclusion and the active gate. exHalf =
+            // the conservative OBB the sphere-arm marchers exclude (a
+            // torus's spans ring+tube; a disc's is its thin plate).
             kind: uniform(0),
             half: uniform(new THREE.Vector3(0.1, 0.1, 0.1)),
             bx: uniform(new THREE.Vector3(1, 0, 0)),
             by: uniform(new THREE.Vector3(0, 1, 0)),
             bz: uniform(new THREE.Vector3(0, 0, 1)),
             reff: uniform(0),
+            exHalf: uniform(new THREE.Vector3(0.1, 0.1, 0.1)),
+            // 1 while this emitter is MOVING (translating or turning), decaying
+            // over a few frames at rest. The feedback pass cuts its history
+            // retain per cell by the moving emitters' share of that cell's
+            // light — a moving lamp's pool follows it instead of trailing a
+            // ~20-frame EMA wake, while statically-lit cells keep full
+            // smoothing (see createBounceFeedback's emitter-motion cut).
+            moved: uniform(0),
           }))
         : null;
     const { cascades, intervals } = createRadianceCascades({
@@ -5153,6 +5281,13 @@ export class GISystem {
       mix(slot.kind.value);
       const half = slot.half.value;
       mix(half.x); mix(half.y); mix(half.z);
+      // Axes too: a shaped lamp (kind ≥ 2) that spins in place keeps center
+      // AND half constant — the axes are the only signal its light moved.
+      // (The box panel woke the field by accident: a rotating OBB's world
+      // extents change. A cylinder's don't.)
+      const bx = slot.bx.value, by = slot.by.value;
+      mix(bx.x); mix(bx.y); mix(bx.z);
+      mix(by.x); mix(by.y); mix(by.z);
     }
     const sky = state.skyRadiance?.value;
     if (sky) { mix(sky.r); mix(sky.g); mix(sky.b); }
@@ -5721,6 +5856,11 @@ export class GISystem {
 
   #buildEntries(meshes) {
     const entries = [];
+    // Sub-voxel physics props (#analyticOnlyMover): no atlas entry — nothing
+    // to bake, composite, or promote to the voxel field — but the BRIGHT ones
+    // remain emitter-promotion candidates below, so a glowing projectile can
+    // still win an analytic slot and cast sharp light.
+    const analyticEmitterCands = [];
     for (const mesh of meshes) {
       const placements = this.#placementsOf(mesh);
       if (!placements.length) continue;
@@ -5729,6 +5869,13 @@ export class GISystem {
       const g = surface.emissive.g * surface.emissiveIntensity;
       const b = surface.emissive.b * surface.emissiveIntensity;
       const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      if (this.#analyticOnlyMover(mesh)) {
+        const peak = Math.max(r, g, b);
+        if (peak >= 0.5) {
+          analyticEmitterCands.push({ mesh, surface, r, g, b, luminance, peak, promoted: false });
+        }
+        continue;
+      }
       // PEAK radiance, the emitter-promotion QUALIFIER (2026-08-07). Luminance
       // is a perceptual weighting — green counts 10x more than blue — so it is
       // the right way to RANK lamps by power but the wrong way to decide
@@ -5830,33 +5977,91 @@ export class GISystem {
       // emissive geometry still emits through the FIELD (its emissive is
       // composited per instance); it just does not get an analytic slot.
       const seenEmitterMesh = new Set();
-      const bright = entries
-        .filter((entry) => entry.peak >= 0.5 && !entry.mesh.isInstancedMesh)
-        .sort((a, b) => powerOf(b) - powerOf(a));
+      const bright = [];
+      for (const entry of entries) {
+        if (entry.peak < 0.5 || entry.mesh.isInstancedMesh || seenEmitterMesh.has(entry.mesh)) continue;
+        seenEmitterMesh.add(entry.mesh);
+        bright.push(entry);
+      }
+      for (const cand of analyticEmitterCands) {
+        if (seenEmitterMesh.has(cand.mesh)) continue;
+        seenEmitterMesh.add(cand.mesh);
+        bright.push(cand);
+      }
+      bright.sort((a, b) => powerOf(b) - powerOf(a));
       if (bright.length > MAX_EMITTERS && !this._warnedEmitterBudget) {
         this._warnedEmitterBudget = true;
         console.warn(`[gi] ${bright.length} bright emitters; analytic slots cover the brightest ${MAX_EMITTERS}`);
       }
-      for (const entry of bright) {
-        if (this._emitterInfos.length >= MAX_EMITTERS) break;
-        if (seenEmitterMesh.has(entry.mesh)) continue;
-        seenEmitterMesh.add(entry.mesh);
-        entry.promoted = true;
-        this._emitterInfos.push({ mesh: entry.mesh, r: entry.r, g: entry.g, b: entry.b });
-      }
-      // DYNAMIC emitters (particle systems) claim whatever slots the emissive
-      // meshes left. They have no mesh — `#refreshEmitterSlots` reads their
-      // shape from a provider callback each frame instead. Meshes get priority
-      // because they are the scene's fixed lamps; a particle effect that wants
-      // a guaranteed slot has to out-rank them on power, which is a
-      // deliberately conservative default.
-      const free = MAX_EMITTERS - this._emitterInfos.length;
-      if (free > 0) {
-        for (const provider of this.engine.giEmitters ?? []) {
-          if (this._emitterInfos.length >= MAX_EMITTERS) break;
-          this._emitterInfos.push({ provider });
+      // ── STICKY SEATS (2026-08-08, the cannonball scene). Slots are
+      // POSITIONAL (#refreshEmitterSlots maps infos[i] → slot i), and the
+      // seat list used to be rebuilt from the power ranking on every
+      // fingerprint scan. With 24 identical strength-100 projectiles the
+      // ranking is a 24-way tie, so which four won — and in which order —
+      // changed per scan: every flip re-surfaced an atlas slot (a composite),
+      // re-posed a slot (moved = 1 → an EMA history cut where its light
+      // lands), and re-aimed the emitter-shadow channel. An incumbent now
+      // keeps its seat AND its index until it dims, despawns, or a
+      // challenger out-powers it by 1.5× — so identical lamps turn over at
+      // despawn cadence, never at scan cadence.
+      const byMesh = new Map();
+      for (const cand of bright) byMesh.set(cand.mesh, cand);
+      const prevSeats = this._promotedEmitterMeshes ?? [];
+      const chosen = new Array(MAX_EMITTERS).fill(null);
+      const taken = new Set();
+      for (let i = 0; i < MAX_EMITTERS; i++) {
+        const cand = prevSeats[i] ? byMesh.get(prevSeats[i]) : null;
+        if (cand && !taken.has(cand.mesh)) {
+          chosen[i] = cand;
+          taken.add(cand.mesh);
         }
-        void free;
+      }
+      for (const cand of bright) {
+        if (taken.has(cand.mesh)) continue;
+        const hole = chosen.indexOf(null);
+        if (hole !== -1) {
+          chosen[hole] = cand;
+          taken.add(cand.mesh);
+          continue;
+        }
+        let weakestAt = -1;
+        let weakestPower = Infinity;
+        for (let i = 0; i < MAX_EMITTERS; i++) {
+          const p = powerOf(chosen[i]);
+          if (p < weakestPower) {
+            weakestPower = p;
+            weakestAt = i;
+          }
+        }
+        if (weakestAt !== -1 && powerOf(cand) > weakestPower * 1.5) {
+          taken.delete(chosen[weakestAt].mesh);
+          chosen[weakestAt] = cand;
+          taken.add(cand.mesh);
+        }
+      }
+      this._promotedEmitterMeshes = chosen.map((cand) => cand?.mesh ?? null);
+      for (const cand of chosen) {
+        if (cand) cand.promoted = true;
+      }
+      this._emitterInfos = chosen.map((cand) =>
+        cand ? { mesh: cand.mesh, r: cand.r, g: cand.g, b: cand.b } : null,
+      );
+      // DYNAMIC emitters (particle systems) claim whatever seats the emissive
+      // meshes left — HOLES included, since the array is positional. They have
+      // no mesh — `#refreshEmitterSlots` reads their shape from a provider
+      // callback each frame instead. Meshes get priority because they are the
+      // scene's fixed lamps; a particle effect that wants a guaranteed slot
+      // has to out-rank them on power, which is a deliberately conservative
+      // default.
+      const providers = [...(this.engine.giEmitters ?? [])];
+      for (let i = 0; i < MAX_EMITTERS && providers.length; i++) {
+        if (!this._emitterInfos[i]) this._emitterInfos[i] = { provider: providers.shift() };
+      }
+      // Trailing holes are trimmed so every `length > 0` liveness check
+      // (emitter-pass dispatch, the profile op) still reads "no emitters"
+      // as an empty array; interior holes park their slot at radius 0.
+      while (this._emitterInfos.length && !this._emitterInfos[this._emitterInfos.length - 1]) {
+        this._emitterInfos.pop();
       }
     }
     return entries;
@@ -6072,11 +6277,27 @@ export class GISystem {
     const scratchPos = new THREE.Vector3();
     const scratchQuat = new THREE.Quaternion();
     const col = new THREE.Vector3();
+    const prevCenter = new THREE.Vector3();
+    const prevAxis = new THREE.Vector3();
+    // Motion → 1 within ~a tenth of the slot's own size per frame; decay 0.6
+    // per frame at rest so a stop settles the retain back over ~4 frames
+    // instead of on a hard edge. Distances are scaled by the slot's reff so
+    // "moving" means the same thing for a desk lamp and a two-metre panel.
+    const motionOf = (slot, dCenter, dAxis) => {
+      const scale = Math.max(slot.reff.value, 0.05);
+      const target = Math.min(1, (dCenter / (0.1 * scale) + dAxis * 6) * 1);
+      return Math.max(target, slot.moved.value * 0.6);
+    };
     for (let i = 0; i < state.emitterSlots.length; i++) {
       const slot = state.emitterSlots[i];
       const info = infos[i];
+      // Last frame's pose, captured BEFORE any writer below touches it.
+      prevCenter.copy(slot.center.value);
+      prevAxis.copy(slot.by.value);
+      const hadRadius = slot.radius.value > 0.001;
       if (!info) {
         slot.radius.value = 0;
+        slot.moved.value = 0;
         continue;
       }
       // Dynamic emitter (particle system): no mesh, no bounding sphere — the
@@ -6087,6 +6308,7 @@ export class GISystem {
         const shape = info.provider();
         if (!shape || !(shape.radius > 0)) {
           slot.radius.value = 0;
+          slot.moved.value = 0;
           continue;
         }
         slot.center.value.copy(shape.center);
@@ -6094,35 +6316,54 @@ export class GISystem {
         slot.color.value.setRGB(shape.r, shape.g, shape.b);
         slot.kind.value = 0;
         slot.reff.value = shape.radius;
+        slot.exHalf.value.setScalar(shape.radius);
+        slot.moved.value = hadRadius
+          ? motionOf(slot, prevCenter.distanceTo(slot.center.value), 0)
+          : 1;
         continue;
       }
-      if (!info.mesh.visible) {
+      // `!parent` = despawned between fingerprint scans (destroyEntity removes
+      // the object; the seat list refreshes at scan cadence) — park the slot
+      // now, not up to 250ms later at the ghost's last pose.
+      if (!info.mesh.visible || !info.mesh.parent) {
         slot.radius.value = 0;
+        slot.moved.value = 0;
         continue;
       }
       const geometry = info.mesh.geometry;
+      slot.color.value.setRGB(info.r, info.g, info.b);
+      // SHAPE. fitEmitterShape (emitterShapes.js) maps every default three
+      // geometry to its analytic kind — sphere, capsule, cylinder, frustum/
+      // cone, disc/ring, torus, equal-area spheres for the polyhedra — from
+      // the LIVE world matrix, so a moving or rotating lamp re-poses its
+      // analytic light every frame with no voxels anywhere in the loop.
+      // Everything it declines (partial arcs, radially non-uniform scale,
+      // unrecognised imports) takes the oriented-box fallback below —
+      // strictly closer than a bounding sphere for any non-spherical lamp.
+      if (fitEmitterShape(geometry, info.mesh.matrixWorld, emitterFitScratch)) {
+        slot.kind.value = emitterFitScratch.kind;
+        slot.center.value.copy(emitterFitScratch.center);
+        slot.radius.value = emitterFitScratch.radius;
+        slot.half.value.copy(emitterFitScratch.half);
+        slot.bx.value.copy(emitterFitScratch.bx);
+        slot.by.value.copy(emitterFitScratch.by);
+        slot.bz.value.copy(emitterFitScratch.bz);
+        slot.reff.value = emitterFitScratch.reff;
+        slot.exHalf.value.copy(emitterFitScratch.exHalf);
+        slot.moved.value = hadRadius
+          ? motionOf(
+              slot,
+              prevCenter.distanceTo(slot.center.value),
+              1 - Math.abs(prevAxis.dot(slot.by.value)),
+            )
+          : 1;
+        continue;
+      }
       if (!geometry.boundingSphere) geometry.computeBoundingSphere();
       slot.center.value.copy(geometry.boundingSphere.center).applyMatrix4(info.mesh.matrixWorld);
       info.mesh.matrixWorld.decompose(scratchPos, scratchQuat, scratchScale);
       slot.radius.value =
         geometry.boundingSphere.radius * Math.max(scratchScale.x, scratchScale.y, scratchScale.z);
-      slot.color.value.setRGB(info.r, info.g, info.b);
-      // SHAPE. Full spheres keep the exact sphere model; EVERYTHING ELSE is
-      // an oriented box from the geometry's local AABB carried through
-      // matrixWorld — strictly closer than a bounding sphere for any
-      // non-spherical lamp, and exact for the box/plane primitives users
-      // actually make lamps from ("my cube's reflection is a sphere").
-      const params = geometry.parameters;
-      const fullSphere =
-        geometry.type === "SphereGeometry" &&
-        (params?.phiLength ?? Math.PI * 2) > Math.PI * 2 - 1e-3 &&
-        (params?.thetaLength ?? Math.PI) > Math.PI - 1e-3;
-      // A/B escape hatch (dev/harness only): force the legacy sphere model.
-      if (fullSphere || globalThis.__giSphereEmitters) {
-        slot.kind.value = 0;
-        slot.reff.value = slot.radius.value;
-        continue;
-      }
       if (!geometry.boundingBox) geometry.computeBoundingBox();
       const bb = geometry.boundingBox;
       slot.kind.value = 1;
@@ -6149,10 +6390,18 @@ export class GISystem {
         halfWorld[a] = Math.max(halfLocal[a] * len, 0.005);
       }
       slot.half.value.set(halfWorld[0], halfWorld[1], halfWorld[2]);
+      slot.exHalf.value.set(halfWorld[0], halfWorld[1], halfWorld[2]);
       // Mean projected area of a convex body is surface/4 (Cauchy) — the
       // disc-equivalent radius drives penumbra k and glow energy.
       const [hx, hy, hz] = halfWorld;
       slot.reff.value = Math.sqrt(((hx * hy + hy * hz + hz * hx) * 2) / Math.PI);
+      slot.moved.value = hadRadius
+        ? motionOf(
+            slot,
+            prevCenter.distanceTo(slot.center.value),
+            1 - Math.abs(prevAxis.dot(slot.by.value)),
+          )
+        : 1;
     }
   }
 
@@ -6743,7 +6992,7 @@ export class GISystem {
         // writeSurface — without this the exact path double-counts a promoted
         // emitter's own emissive, which #slotSurface has always zeroed on the
         // voxel path.
-        isPromotedEmitter: (mesh) => this._emitterInfos?.some((e) => e.mesh === mesh) === true,
+        isPromotedEmitter: (mesh) => this._emitterInfos?.some((e) => e?.mesh === mesh) === true,
       });
       composeFieldDynamics(field, this._dynSet);
       if (staticBvhPacked && field.staticBvhWords > 0) {
@@ -6840,7 +7089,17 @@ export class GISystem {
     // renumbered every slot after it, which invalidated the static snapshot
     // and the whole per-slot bookkeeping on every scene change.
     const slotMap = (this._occSlotMap ??= new Map());
+    // Sub-voxel physics props (see #analyticOnlyMover): no placement, no slot
+    // ID, no voxels — they exist as analytic spheres in the mover-occluder
+    // bundle. Rebuilt every content scan so despawns fall out with the sweep;
+    // the surface is resolved here (scan cadence) because the per-frame
+    // bundle sync must not walk a shader-graph material 24 times a frame.
+    const analyticOnly = (this._analyticOnlyMovers = []);
     for (const mesh of meshes) {
+      if (this.#analyticOnlyMover(mesh)) {
+        analyticOnly.push({ mesh, surface: resolveMaterialSurface(mesh.material, mesh.name) });
+        continue;
+      }
       const record = serializeMeshForBake(mesh);
       if (!record) continue;
       if (!seen.has(record.geometryKey)) {
@@ -6920,13 +7179,20 @@ export class GISystem {
     // hits setSlotMatrix while the slot still reads static and forces the
     // full re-voxelize this whole path exists to avoid. (Chunk sizing does
     // not depend on the order: setGeometry reads p.matrix, not the uniform.)
+    // Did the placement SET actually change? Analytic-only movers
+    // (#analyticOnlyMover) churn the MESH set at spawn cadence without ever
+    // touching placements — re-arming the static-BVH rebuild for them queued
+    // a pointless full rebake 3s after every projectile volley.
+    const placementSetChanged =
+      placements.length !== (field.placements?.length ?? -1) ||
+      placements.some((p) => !prevBySlot.has(p.slot));
     field.setGeometry(geometries, placements);
     for (const p of placements) field.setSlotMatrix(p.slot, p.matrix);
     field.placements = placements;
     this.#refreshOccupancySlotRemap();
     // The static shadow BVH bakes world-space triangles — a changed mesh SET
     // means it no longer matches the scene.
-    if (this._dynSet?.staticBvh) this._staticBvhStale = this._frame;
+    if (placementSetChanged && this._dynSet?.staticBvh) this._staticBvhStale = this._frame;
   }
 
   /**
@@ -6970,7 +7236,9 @@ export class GISystem {
    * every mover shadow is applied twice.
    */
   #moverOccluders(lightSlots) {
-    if (globalThis.__giDiffuseSkipMovers !== true) return null;
+    // DEFAULT ON since 2026-08-08 (both halves flip together — see the
+    // transport half's measurement note in giField's createOccupancySceneTrace).
+    if (globalThis.__giDiffuseSkipMovers === false) return null;
     const max = 2 * Math.min(64, Math.max(4, Number(globalThis.__giMaxDynamicObjects) || 16));
     this._moverOccluders ??= {
       max,
@@ -6978,7 +7246,31 @@ export class GISystem {
       // 2x the mover cap: a capsule proxy spends up to 4 slots on ONE mover, so
       // sizing this to the mover count would silently drop occluders as soon as
       // a couple of characters were on screen.
+      //
+      // SLOT ENCODING: w > 0 → sphere of radius w (the original record).
+      // w < 0 → ORIENTED BOX with bounding radius |w| (the gate), half
+      // extents in `halfs` and world rotation in `quats`. Boxes exist because
+      // the bounding-sphere proxy painted a smooth normal-dependent gradient
+      // across a big box mover's OWN faces (its surface is deep inside its
+      // bounding sphere — the user's rotating-cube screenshots, 2026-08-08);
+      // the box contour integral is exact for boxes, C¹ under rotation, and
+      // IDENTICALLY ZERO for a receiver on the box's own outward surface or
+      // inside it, so the self-artifact cannot exist by construction.
       spheres: uniformArray(Array.from({ length: max }, () => new THREE.Vector4()), "vec4"),
+      halfs: uniformArray(Array.from({ length: max }, () => new THREE.Vector4()), "vec4"),
+      quats: uniformArray(Array.from({ length: max }, () => new THREE.Vector4(0, 0, 0, 1)), "vec4"),
+      // Per-occluder DIRECT-LIGHT VISIBILITY, one component per analytic
+      // light slot (x = slot 0 …). The analytic bounce used to give a mover
+      // its direct term UNSHADOWED ("external shadowing not modelled") —
+      // acceptable as a smooth over-estimate until a white cube stood in a
+      // dark nave and re-radiated the full sun ("the cube does not consider
+      // direct light occluders around it", user screenshot 2026-08-08).
+      // Filled by #syncMoverOccluders from ONE CPU shadow ray per
+      // (mover × light) per frame against the static-mesh BVH oracle,
+      // temporally smoothed so a mover crossing a shadow edge ramps over
+      // ~8 frames instead of popping — the only error class this term is
+      // allowed to add.
+      lightVis: uniformArray(Array.from({ length: max }, () => new THREE.Vector4(1, 1, 1, 1)), "vec4"),
       // Mean albedo / emissive per mover — the same two the dynamic-object
       // header carries at words 34..39 and that giField shades an exact hit
       // with, so both paths agree about a mover's colour.
@@ -7004,18 +7296,236 @@ export class GISystem {
    * now: a smooth, slightly-wrong shadow beats a sharp, randomly-flickering
    * one, and multi-sphere fitting for elongated shapes is the follow-up.
    */
+  /**
+   * Lazy, incrementally-built CPU BVH set over the STATIC meshes, for the
+   * mover direct-light shadow rays (moverLightVisTarget). One MeshBVH per
+   * frame so a Sponza-scale scene amortizes the build over ~a second with no
+   * rebuild hitch; until a mesh is in, rays pass through it — i.e. the term
+   * converges FROM the old unshadowed behavior, never past it. Keyed on the
+   * field object: any structural rebuild (which is what moves static meshes)
+   * starts a fresh set. Dynamic-mobility meshes are excluded — they move
+   * after the snapshot and a stale pose here would be a ghost occluder.
+   * `__giMoverDirectShadow = false` disables the whole term.
+   */
+  /**
+   * A PHYSICS-DRIVEN PROP SMALLER THAN ~A VOXEL never enters the voxel
+   * pipeline at all — no occupancy placement, no slot ID, no atlas entry. It
+   * exists to the GI as a pure analytic sphere in the mover-occluder bundle
+   * (occlusion + albedo/emissive bounce) and as an emitter-promotion
+   * candidate.
+   *
+   * WHY (cannonball probe, 2026-08-08): a 0.36m ball against a 0.34m cell is
+   * sub-voxel — voxelizing it ever produced a 1–2 cell blob (the "blocky
+   * flicker" class). Worse than useless, it was ruinous: each spawned ball
+   * consumed a stable-for-life occupancy slot ID, so a launcher recycling 24
+   * balls every 15s exhausted slot capacity in minutes and triggered a FULL
+   * GI REBUILD (17s materials + 22s computes measured) mid-game; balls that
+   * lost the 16-mover adoption race re-voxelized every frame; the ones that
+   * fought for seats forced whole-volume composites through cap-pressure
+   * eviction (1 per 90 frames). None of that machinery buys anything a
+   * closed-form sphere doesn't do better at this size.
+   *
+   * Rule: world diameter < minCell × 1.4 (`__giAnalyticMoverMaxCells`
+   * overrides the multiplier), not pinned giMobility "static", not
+   * instanced, and either carrying a non-fixed rigidbody or pinned
+   * giMobility "dynamic". Static small decor keeps the voxel path — it
+   * costs nothing per frame and contributes contact darkening.
+   * `__giAnalyticSmallMovers = false` disables the class entirely (A/B).
+   */
+  #analyticOnlyMover(mesh) {
+    if (globalThis.__giAnalyticSmallMovers === false) return false;
+    const cell = this.state?.volume?.minCell ?? 0;
+    if (!(cell > 0)) return false;
+    if (!mesh || mesh.isInstancedMesh) return false;
+    const mobility = mesh.userData?.giMobility ?? "auto";
+    if (mobility === "static") return false;
+    const g = mesh.geometry;
+    if (!g?.attributes?.position) return false;
+    if (!g.boundingSphere) g.computeBoundingSphere();
+    mesh.getWorldScale(_obbScale);
+    const diameter =
+      2 * (g.boundingSphere?.radius ?? 0) *
+      Math.max(Math.abs(_obbScale.x), Math.abs(_obbScale.y), Math.abs(_obbScale.z));
+    const maxCells = Number(globalThis.__giAnalyticMoverMaxCells) || 1.4;
+    if (!(diameter > 0) || diameter >= cell * maxCells) return false;
+    if (mobility === "dynamic") return true;
+    const entity = this.engine?.entities?.get?.(mesh.userData?.entityId);
+    const body = entity?.getComponent?.("rigidbody");
+    if (!body) return false;
+    const bodyType = body.bodyType ?? body.props?.bodyType;
+    return bodyType === "dynamic" || bodyType === "kinematic";
+  }
+
+  #moverShadowOracle() {
+    if (globalThis.__giMoverDirectShadow === false) return null;
+    const field = this.state?.volume?.occupancyField;
+    const placements = field?.placements;
+    if (!placements) return null;
+    let o = this._moverShadowOracle;
+    if (!o || o.key !== field) {
+      const seen = new Set();
+      const queue = [];
+      for (const p of placements) {
+        const mesh = p.mesh;
+        if (!mesh || mesh.isInstancedMesh || seen.has(mesh)) continue;
+        seen.add(mesh);
+        if ((mesh.userData?.giMobility ?? "auto") === "dynamic") continue;
+        if (!mesh.geometry?.attributes?.position) continue;
+        queue.push(mesh);
+      }
+      o = this._moverShadowOracle = { key: field, queue, ready: [] };
+    }
+    if (o.queue.length) {
+      const mesh = o.queue.shift();
+      try {
+        // Session-cached per geometry (see moverOracleBvhCache) — a re-key
+        // after a structural rebuild costs matrix inverts, not BVH builds.
+        let bvh = moverOracleBvhCache.get(mesh.geometry);
+        if (!bvh) {
+          bvh = new MeshBVH(mesh.geometry);
+          moverOracleBvhCache.set(mesh.geometry, bvh);
+        }
+        if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox();
+        o.ready.push({
+          bvh,
+          mesh,
+          inv: new THREE.Matrix4().copy(mesh.matrixWorld).invert(),
+          // For the per-ray slab pre-reject. Static meshes by construction
+          // (dynamic-mobility ones are excluded above), so a snapshot is safe.
+          worldBox: new THREE.Box3().copy(mesh.geometry.boundingBox).applyMatrix4(mesh.matrixWorld),
+        });
+      } catch {
+        // A geometry MeshBVH cannot digest simply stays un-shadowing.
+      }
+    }
+    // A mesh ADOPTED as an exact mover after this snapshot still sits here at
+    // its build pose — a ghost occluder (a knocked-away crate would keep
+    // shadowing its old corner). Skip-flag, refreshed per frame, instead of a
+    // re-key: adoption churn is play-mode-normal and the flag is ~55 Set
+    // lookups.
+    for (const e of o.ready) {
+      e.skip = this._dynAdoptedKeys?.has(slotKeyOf(e.mesh, null)) === true;
+    }
+    return o;
+  }
+
   #syncMoverOccluders() {
     const bundle = this._moverOccluders;
     if (!bundle) return;
     const dyn = this._dynSet;
-    let n = 0;
+    const oracle = this.#moverShadowOracle();
+    // ── CANDIDATES, TWO SOURCES, SEATED BY VISUAL WEIGHT ────────────────────
+    // The gather loop runs per resolve PIXEL, so every seat here is paid at
+    // screen resolution — and the first shipped version seated first-come
+    // until the array filled. With 15 crates + 24 cannonballs the cap became
+    // an arbitrary lottery AND the pixel loop ran full-length. Candidates are
+    // now ranked by projected size at the camera (boundR / distance) and only
+    // the top `__giMaxAnalyticOccluders` (default 16) are seated; the tail is
+    // exactly the movers whose occlusion the projected-size fade in the
+    // gather would have erased anyway.
+    const cand = (this._moverOccCand ??= []);
+    cand.length = 0;
+    const cam = this.engine?.camera;
+    if (cam?.getWorldPosition) cam.getWorldPosition(_mocCamera);
+    else _mocCamera.set(0, 0, 0);
+    const prioOf = (cx, cy, cz, r) => {
+      const dx = cx - _mocCamera.x;
+      const dy = cy - _mocCamera.y;
+      const dz = cz - _mocCamera.z;
+      return r / Math.max(Math.sqrt(dx * dx + dy * dy + dz * dz), 0.5);
+    };
     if (dyn?.enabled && dyn.forEachEntry) {
       dyn.forEachEntry((entry) => {
-        if (n >= bundle.max || !entry?.boundsValid || entry.active === false) return;
+        if (!entry?.boundsValid || entry.active === false) return;
         const b = entry.currBounds;
         if (!b || b.isEmpty?.()) return;
-        const spheres = giProxySpheres(entry.mesh, b, bundle.max - n, entry.type);
-        if (!spheres.length) return;
+        _msoBoundsC.copy(b.min).add(b.max).multiplyScalar(0.5);
+        const rB = _msoBoundsS.copy(b.max).sub(b.min).length() * 0.5;
+        if (!(rB > 1e-4)) return;
+        cand.push({
+          entry,
+          mesh: null,
+          surface: null,
+          cx: _msoBoundsC.x, cy: _msoBoundsC.y, cz: _msoBoundsC.z,
+          r: rB,
+          prio: prioOf(_msoBoundsC.x, _msoBoundsC.y, _msoBoundsC.z, rB),
+        });
+      });
+    }
+    // Sub-voxel analytic-only movers (#analyticOnlyMover): never voxelized,
+    // never adopted — this bundle is their ENTIRE existence to the GI.
+    for (const rec of this._analyticOnlyMovers ?? []) {
+      const mesh = rec.mesh;
+      if (!mesh || !mesh.parent || mesh.visible === false) continue;
+      const bs = mesh.geometry?.boundingSphere;
+      if (!bs) continue;
+      _mocCenter.copy(bs.center).applyMatrix4(mesh.matrixWorld);
+      mesh.getWorldScale(_obbScale);
+      const rW =
+        bs.radius * Math.max(Math.abs(_obbScale.x), Math.abs(_obbScale.y), Math.abs(_obbScale.z));
+      if (!(rW > 1e-4)) continue;
+      cand.push({
+        entry: null,
+        mesh,
+        surface: rec.surface,
+        cx: _mocCenter.x, cy: _mocCenter.y, cz: _mocCenter.z,
+        r: rW,
+        prio: prioOf(_mocCenter.x, _mocCenter.y, _mocCenter.z, rW),
+      });
+    }
+    cand.sort((a, b) => b.prio - a.prio);
+    const seatCap = Math.min(
+      bundle.max,
+      Math.max(1, Number(globalThis.__giMaxAnalyticOccluders) || 16),
+    );
+    const slots = bundle.lightSlots ?? [];
+    const lightCount = Math.min(4, slots.length);
+    const frame = this._frame ?? 0;
+    // Direct-light visibility rays are STAGGERED: each seated mover re-asks
+    // the oracle every 4th frame (stable per-mover phase), smoothed at 0.45
+    // per update ≈ the old 0.2-per-frame ramp. The rays were the sync loop's
+    // whole CPU cost — movers × lights × every static BVH, every frame.
+    const visFor = (holder, boundR) => {
+      const vis = (holder._giLightVis ??= [1, 1, 1, 1]);
+      if (!oracle) return vis;
+      const phase = (holder._giVisPhase ??= (this._moverVisPhase = ((this._moverVisPhase ?? 0) + 1) & 3));
+      if ((frame & 3) === phase) {
+        for (let li = 0; li < lightCount; li++) {
+          const target = moverLightVisTarget(oracle, _msoBoundsC, boundR, slots[li]);
+          vis[li] += (target - vis[li]) * 0.45;
+        }
+      }
+      return vis;
+    };
+    let n = 0;
+    const promoted = this._promotedEmitterMeshes;
+    for (const c of cand) {
+      if (n >= seatCap) break;
+      _msoBoundsC.set(c.cx, c.cy, c.cz);
+      if (c.entry) {
+        const entry = c.entry;
+        const vis = visFor(entry, c.r);
+        // ORIENTED-BOX record where the shape allows it (see the bundle's
+        // slot-encoding note): exact for box movers, tight for arbitrary
+        // meshes, and free of the bounding-sphere proxy's on-body gradient.
+        // Spheres keep their exact sphere; user-pinned sphere/capsule proxies
+        // are respected; instanced movers keep the AABB chain (their world
+        // matrix is per instance and not worth the decompose here).
+        if (moverObbRecord(entry, emitterFitScratch)) {
+          const r = emitterFitScratch;
+          const a2 = entry.surface?.albedo;
+          const e2 = entry.surface?.emissive;
+          bundle.spheres.array[n].set(r.center.x, r.center.y, r.center.z, -r.radius);
+          bundle.halfs.array[n].set(r.half.x, r.half.y, r.half.z, 0);
+          bundle.quats.array[n].copy(moverObbQuat);
+          bundle.albedo.array[n].set(a2?.[0] ?? 1, a2?.[1] ?? 1, a2?.[2] ?? 1, 0);
+          bundle.emissive.array[n].set(e2?.[0] ?? 0, e2?.[1] ?? 0, e2?.[2] ?? 0, 0);
+          bundle.lightVis.array[n].set(vis[0], vis[1], vis[2], vis[3]);
+          n++;
+          continue;
+        }
+        const spheres = giProxySpheres(entry.mesh, entry.currBounds, seatCap - n, entry.type);
+        if (!spheres.length) continue;
         // Colour, so the mover's BOUNCE comes back with it. `entry.surface` is
         // the diagnostics mirror writeSurface keeps of exactly the words the
         // header carries, so this cannot drift from what the exact-hit path
@@ -7032,18 +7542,43 @@ export class GISystem {
           bundle.spheres.array[n].set(s[0], s[1], s[2], s[3]);
           bundle.albedo.array[n].set(a?.[0] ?? 1, a?.[1] ?? 1, a?.[2] ?? 1, 0);
           bundle.emissive.array[n].set(e?.[0] ?? 0, e?.[1] ?? 0, e?.[2] ?? 0, 0);
+          bundle.lightVis.array[n].set(vis[0], vis[1], vis[2], vis[3]);
           n++;
         }
-      });
+        continue;
+      }
+      // Analytic-only: one exact sphere. Emissive comes from the scan-time
+      // surface — ZEROED while the mesh holds an emitter seat, or its light
+      // would arrive twice (once analytic-direct, once as bounce).
+      const holder = (this._analyticOnlyState ??= new WeakMap());
+      let st = holder.get(c.mesh);
+      if (!st) holder.set(c.mesh, (st = {}));
+      const vis = visFor(st, c.r);
+      const surf = c.surface;
+      const isSeatedEmitter = promoted ? promoted.indexOf(c.mesh) !== -1 : false;
+      const ei = surf?.emissiveIntensity ?? 1;
+      bundle.spheres.array[n].set(c.cx, c.cy, c.cz, c.r);
+      bundle.albedo.array[n].set(surf?.color?.r ?? 1, surf?.color?.g ?? 1, surf?.color?.b ?? 1, 0);
+      bundle.emissive.array[n].set(
+        isSeatedEmitter ? 0 : (surf?.emissive?.r ?? 0) * ei,
+        isSeatedEmitter ? 0 : (surf?.emissive?.g ?? 0) * ei,
+        isSeatedEmitter ? 0 : (surf?.emissive?.b ?? 0) * ei,
+        0,
+      );
+      bundle.lightVis.array[n].set(vis[0], vis[1], vis[2], vis[3]);
+      n++;
     }
     // Zero the tail: a stale radius in an unused slot is a shadow cast by an
-    // object that no longer exists, and the loop's `mo < count` gate is the
-    // only thing standing between that and the screen.
+    // object that no longer exists, and the loop's count gate is the only
+    // thing standing between that and the screen.
     for (let i = n; i < bundle.max; i++) bundle.spheres.array[i].set(0, 0, 0, 0);
     bundle.albedo.needsUpdate = true;
     bundle.emissive.needsUpdate = true;
     bundle.count.value = n;
     bundle.spheres.needsUpdate = true;
+    bundle.halfs.needsUpdate = true;
+    bundle.quats.needsUpdate = true;
+    bundle.lightVis.needsUpdate = true;
   }
 
   #refreshOccupancyTransforms(field) {

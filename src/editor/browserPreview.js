@@ -15,6 +15,10 @@ const state = vmSingleton("browserPreview", () => ({
    *  tab moves, and a remounted toolbar must find the running server again
    *  instead of offering to start a second one. */
   active: null,
+  /** Project root `active` was built from. A project switch has to take the
+   *  old server down: it serves the old project's output directory, and the
+   *  live-rebuild loop behind it would start writing the NEW scene into it. */
+  activeRoot: null,
   /** True while openBrowserPreview is mid-flight, so duplicate user clicks
    *  can't race two builds into the same output directory. */
   starting: false,
@@ -24,7 +28,55 @@ const state = vmSingleton("browserPreview", () => ({
   /** True while startShareTunnel is mid-flight — the first run downloads a
    *  ~55 MB binary, which is plenty of time for a second click. */
   sharing: false,
+  /** Whether a start/stop is in flight, and the progress line to show for it.
+   *  These used to live in the toolbar's own React state, which meant a
+   *  preview started from anywhere else (boot autostart, an agent) was
+   *  invisible until the panel happened to remount. */
+  busy: false,
+  message: "",
+  /** Immutable snapshot handed to subscribers; rebuilt on every mutation so
+   *  React sees a new identity and re-renders. */
+  snapshot: { busy: false, message: "", urls: null, share: null, sharing: false },
+  /** @type {Set<(snapshot: any) => void>} */
+  listeners: new Set(),
 }));
+
+function publish() {
+  state.snapshot = {
+    busy: state.busy,
+    message: state.message,
+    urls: state.active,
+    share: state.share,
+    sharing: state.sharing,
+  };
+  for (const listener of [...state.listeners]) listener(state.snapshot);
+}
+
+/** Sets any of busy/message/active/share/sharing and notifies subscribers. */
+function patch(fields) {
+  Object.assign(state, fields);
+  publish();
+}
+
+/**
+ * The current preview state: `{ busy, message, urls, share, sharing }`.
+ * `urls` is the running preview's `{ localUrl, lanUrl, report, … }` or null.
+ */
+export function getBrowserPreviewState() {
+  return state.snapshot;
+}
+
+/** Subscribes to preview state changes. Returns an unsubscribe. */
+export function onBrowserPreviewChanged(listener) {
+  state.listeners.add(listener);
+  return () => state.listeners.delete(listener);
+}
+
+/** Replaces the status line under the serve button — for callers that report
+ *  something about a running preview without changing whether it runs. */
+export function setBrowserPreviewMessage(message) {
+  patch({ message: message ?? "" });
+}
 
 /** The currently running preview's URLs/report, or null. */
 export function getActiveBrowserPreview() {
@@ -33,6 +85,7 @@ export function getActiveBrowserPreview() {
 
 export async function stopBrowserPreview(outDir) {
   state.active = null;
+  state.activeRoot = null;
   state.stop?.();
   state.stop = null;
   const { invoke } = await import("@tauri-apps/api/core");
@@ -42,6 +95,7 @@ export async function stopBrowserPreview(outDir) {
     state.share = null;
     await invoke("stop_share_tunnel").catch(() => {});
   }
+  publish();
   if (!outDir) return;
   await invoke("stop_build_lan", { dir: outDir });
 }
@@ -65,7 +119,7 @@ export async function startShareTunnel({ onProgress } = {}) {
     throw new Error("Start the browser preview before creating a share link.");
   }
   if (state.sharing) return null;
-  state.sharing = true;
+  patch({ sharing: true });
   try {
     const { invoke } = await import("@tauri-apps/api/core");
     const port = Number(new URL(state.active.localUrl).port);
@@ -78,15 +132,15 @@ export async function startShareTunnel({ onProgress } = {}) {
         : "Downloading Cloudflare Tunnel (one time, ~55 MB)…",
     });
     const url = await invoke("start_share_tunnel", { port });
-    state.share = { url };
+    patch({ share: { url } });
     return state.share;
   } finally {
-    state.sharing = false;
+    patch({ sharing: false });
   }
 }
 
 export async function stopShareTunnel() {
-  state.share = null;
+  patch({ share: null });
   const { invoke } = await import("@tauri-apps/api/core");
   await invoke("stop_share_tunnel");
 }
@@ -291,6 +345,192 @@ export async function openBrowserPreview({ onProgress, openBrowser = true } = {}
   }
 }
 
+// ---------------------------------------------------------------------------
+// Remembered "serve this project" switch
+// ---------------------------------------------------------------------------
+
+/**
+ * Serving is sticky: once you have turned it on for a project you want the
+ * URL and the QR code to be there the next time you open the editor, without
+ * rebuilding the habit of pressing the button. Only pressing it again turns it
+ * off.
+ *
+ * Keyed by project root, and per machine (localStorage, not project.json): the
+ * flag is about *this* checkout on *this* computer serving a port, which is
+ * meaningless to a teammate who pulls the repo.
+ */
+const AUTOSTART_KEY = "engine.browserPreview.autostart.v1";
+
+function readAutoStartMap() {
+  try {
+    const raw = localStorage.getItem(AUTOSTART_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+/** Whether the preview server should come back up on its own for `root`
+ *  (defaults to the open project). */
+export function isBrowserPreviewAutoStart(root = useProjectStore.getState().rootPath) {
+  if (!root) return false;
+  return readAutoStartMap()[root] === true;
+}
+
+/** Remembers (or forgets) that `root` wants its preview server running. */
+export function setBrowserPreviewAutoStart(enabled, root = useProjectStore.getState().rootPath) {
+  if (!root) return;
+  try {
+    const map = readAutoStartMap();
+    if (enabled) map[root] = true;
+    else delete map[root];
+    localStorage.setItem(AUTOSTART_KEY, JSON.stringify(map));
+  } catch {
+    // A preference: losing the write costs one button press next boot.
+  }
+}
+
+/**
+ * Starts or stops the preview, driving the shared state the toolbar renders.
+ * This is the single path — the toolbar button, the boot autostart and any
+ * future menu item all land here, so "is a server already running?" is asked
+ * in exactly one place.
+ *
+ * @param {{ remember?: boolean }} [opts] `remember: false` starts without
+ *   arming the autostart (used by the autostart itself, which is already
+ *   armed, and would otherwise re-arm on a start it did not choose).
+ */
+export async function toggleBrowserPreview({ remember = true } = {}) {
+  if (state.busy) return null;
+  if (state.active) {
+    patch({ busy: true, message: "Stopping browser preview…" });
+    try {
+      // stopBrowserPreview also takes the share tunnel down with it.
+      await stopBrowserPreview(state.active.report?.contentDir);
+      // An explicit stop is the "disabled manually" the sticky flag waits for.
+      if (remember) setBrowserPreviewAutoStart(false);
+      patch({ busy: false, message: "", active: null, share: null });
+    } catch (error) {
+      console.error(`Could not stop browser preview: ${error?.message ?? error}`);
+      patch({ busy: false, message: `Could not stop preview: ${error?.message ?? error}` });
+    }
+    return null;
+  }
+  return startBrowserPreview({ remember });
+}
+
+/** Starts the preview (no-op if one is already running) and reports progress
+ *  through the shared state. Returns the URLs, or null if it did not start. */
+export async function startBrowserPreview({ remember = true } = {}) {
+  if (state.active || state.busy || state.starting) return state.active;
+  patch({ busy: true, message: "Building browser preview…", active: null, share: null });
+  try {
+    // Export the authored snapshot, never a scene after gameplay scripts or
+    // physics have mutated it. This also makes the button useful while the
+    // user is already testing in the viewport.
+    const { usePlayStore } = await import("./store/playStore.js");
+    if (usePlayStore.getState().playing) {
+      patch({ message: "Stopping Play mode…" });
+      const { stop: stopPlay } = await import("./playMode.js");
+      await stopPlay();
+    }
+    // openBrowser: false — the endpoints appear in the toolbar instead of a
+    // tab stealing focus the moment the build lands.
+    const result = await openBrowserPreview({
+      openBrowser: false,
+      onProgress: ({ message }) => {
+        if (message) patch({ message });
+      },
+    });
+    if (!result) {
+      patch({ busy: false, message: "", active: null, share: null });
+      return null;
+    }
+    if (remember) setBrowserPreviewAutoStart(true);
+    patch({
+      busy: false,
+      message: result.lanUrl
+        ? `Live: ${result.localUrl} · Wi-Fi: ${result.lanUrl}`
+        : `Live: ${result.localUrl}`,
+    });
+    return result;
+  } catch (error) {
+    console.error(`Browser preview failed: ${error?.message ?? error}`);
+    pushToast({ level: "error", title: "Browser preview failed", detail: `${error?.message ?? error}` });
+    patch({ busy: false, message: `Preview failed: ${error?.message ?? error}`, active: null, share: null });
+    return null;
+  }
+}
+
+/**
+ * Brings the preview server back up on editor boot if this project had it
+ * running when it was last closed. Deliberately quiet: no browser tab, no
+ * success toast — the toolbar lighting up with a URL is the notification.
+ *
+ * A failure keeps the flag armed. The usual cause is transient (a port still
+ * held by the previous process, a script that doesn't transpile yet), and
+ * silently disarming would mean the setting appears to have forgotten itself.
+ */
+export async function autoStartBrowserPreviewIfRemembered() {
+  const root = useProjectStore.getState().rootPath;
+  if (state.busy || state.starting) return state.active;
+  // A project switch reaches here with the previous project's server still up.
+  // It serves the wrong build and its rebuild loop targets the wrong output
+  // directory, so it goes down whether or not the new project wants one.
+  if (state.active && state.activeRoot !== root) {
+    await toggleBrowserPreview({ remember: false });
+  }
+  if (!isBrowserPreviewAutoStart(root)) return null;
+  if (state.active) return state.active;
+  const result = await startBrowserPreview({ remember: false });
+  if (!result) {
+    pushToast({
+      level: "warn",
+      title: "Preview server did not restart",
+      detail: "This project is set to serve on startup. Press the serve button to retry, or press it twice to turn it off.",
+      key: "preview-autostart",
+    });
+  }
+  return result;
+}
+
+/**
+ * Starts or stops the public share tunnel, mirroring `toggleBrowserPreview`'s
+ * contract so the toolbar is a pair of one-line calls.
+ */
+export async function toggleShareTunnel() {
+  if (state.busy || state.sharing || !state.active) return;
+  if (state.share) {
+    patch({ message: "Stopping public link…" });
+    try {
+      await stopShareTunnel();
+      patch({ message: "" });
+    } catch (error) {
+      console.error(`Could not stop share link: ${error?.message ?? error}`);
+      patch({ share: null, message: `Could not stop share link: ${error?.message ?? error}` });
+    }
+    return;
+  }
+  patch({ message: "Creating public link…" });
+  try {
+    const share = await startShareTunnel({
+      onProgress: ({ message }) => {
+        if (message) patch({ message });
+      },
+    });
+    if (!share) return;
+    // The first thing anyone does with a share link is paste it somewhere.
+    navigator.clipboard?.writeText(share.url).catch(() => {});
+    patch({ message: `Public link (copied to clipboard): ${share.url}` });
+  } catch (error) {
+    console.error(`Share link failed: ${error?.message ?? error}`);
+    pushToast({ level: "error", title: "Share link failed", detail: `${error?.message ?? error}` });
+    patch({ message: `Share link failed: ${error?.message ?? error}` });
+  }
+}
+
 async function runOpenBrowserPreview({ root, onProgress, openBrowser }) {
   const { invoke } = await import("@tauri-apps/api/core");
   let outDir;
@@ -347,6 +587,7 @@ async function runOpenBrowserPreview({ root, onProgress, openBrowser }) {
       (openError ? `\nAutomatic browser launch failed: ${openError}` : ""),
   );
   await startLivePreview({ outDir, onProgress });
-  state.active = { ...urls, openError, report };
+  state.activeRoot = root;
+  patch({ active: { ...urls, openError, report } });
   return state.active;
 }

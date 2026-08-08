@@ -186,7 +186,21 @@ if (tooDense.length) console.log(`  !! probe spacings below ${BLOCK_RIG.minProbe
 // panel itself entering frame — the largest possible signal, and not a GI one.
 // (The panel's TOP corners lean the other way, to a ground-equivalent x of
 // -0.58 at rest, so the footprint is always the binding edge.)
+// PANEL_GEO=cylinder|cone|torus|sphere spins a SHAPED analytic emitter
+// instead of the box panel — same instrument, every emitter kind (specs and
+// sizing rationale live on BLOCK_RIG.panelGeos). Unknown names fail loudly
+// rather than silently measuring a box.
+const PANEL_GEO = process.env.PANEL_GEO ?? "box";
+if (!(PANEL_GEO in BLOCK_RIG.panelGeos)) {
+  console.error(`FATAL: PANEL_GEO=${PANEL_GEO} — known: ${Object.keys(BLOCK_RIG.panelGeos).join(", ")}`);
+  process.exit(1);
+}
+const PANEL_SPEC = BLOCK_RIG.panelGeos[PANEL_GEO];
 const sweptMaxX = (deg) => {
+  // Shaped panels use their precomputed yaw-worst footprint (rotation about
+  // Y never exceeds the XZ bounding radius); the box keeps the exact
+  // corner-sweep formula.
+  if (PANEL_SPEC) return -BLOCK_RIG.panelT / 2 + PANEL_SPEC.boundXZ;
   const t = (deg * Math.PI) / 180;
   return -BLOCK_RIG.panelT / 2
     + Math.abs((BLOCK_RIG.panelT / 2) * Math.cos(t))
@@ -214,9 +228,9 @@ if (SPIN) {
   console.log(`  spin clearance: worst-frame footprint reaches x=${worst.toFixed(3)}, patch starts at x=${BLOCK_RIG.patch.x0} — clear by ${(BLOCK_RIG.patch.x0 - worst).toFixed(3)}m`);
 }
 
-await makeBlockRigProject(GEN_ROOT, { voxelSize: BASE_VOXEL, probeSpacing: BASE_PROBE, mover: MOVER });
+await makeBlockRigProject(GEN_ROOT, { voxelSize: BASE_VOXEL, probeSpacing: BASE_PROBE, mover: MOVER, panelGeo: PANEL_GEO });
 console.log(`  generated block rig at ${GEN_ROOT}`);
-console.log(`  mode ${MODE}${MOVER ? " (panel pinned as an EXACT MOVER)" : ""}   sweeps: ${SWEEP.join(", ")}`);
+console.log(`  mode ${MODE}${MOVER ? " (panel pinned as an EXACT MOVER)" : ""}   panel geo: ${PANEL_GEO}   sweeps: ${SWEEP.join(", ")}`);
 if (SPIN) {
   if (process.env.MOVER !== "1") console.log(`  SPIN forced MOVER=1 — a spinning panel has to be on the exact-mover path`);
   console.log(
@@ -1306,7 +1320,7 @@ await writeFile(
   // that averages this file must be able to tell a hole from a measurement.
   JSON.stringify({
     mode: MODE, mover: MOVER, spin: SPIN, spinStepDeg: SPIN_STEP_DEG, frames: FRAMES, frameGapMs: FRAME_GAP,
-    quietEma: QUIET_EMA, keepRendering: true,
+    quietEma: QUIET_EMA, keepRendering: true, panelGeo: PANEL_GEO,
     failures,
     pxPerMx, pxPerMz, rect, results: results.map(({ shot, ...rest }) => rest),
   }, null, 1),

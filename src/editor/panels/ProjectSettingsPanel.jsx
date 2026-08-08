@@ -8,6 +8,11 @@ import {
 } from "../projectSettings.js";
 import { currentScenePath } from "../sceneIO.js";
 import { KEY_BINDING_ACTIONS, describeBinding } from "../keybindings.js";
+import {
+  isViewportFreezeEnabled,
+  onViewportFreezeChanged,
+  setViewportFreezeEnabled,
+} from "../viewportFreeze.js";
 
 const MAIN_SCENE_KEY = "mainScene";
 
@@ -260,6 +265,11 @@ export function ProjectSettingsPanel() {
   const mainScene = useProjectStore((s) => s.projectMeta?.mainScene ?? "");
   const [settings, setSettings] = useState(null);
   const [dirty, setDirty] = useState(false);
+  // Not part of `settings`: this one is a per-machine preference in
+  // localStorage (how heavy YOUR scene runs on YOUR hardware), so it applies
+  // the moment it is clicked and is untouched by Save. See viewportFreeze.js.
+  const [freezeUnfocused, setFreezeUnfocused] = useState(isViewportFreezeEnabled);
+  useEffect(() => onViewportFreezeChanged(setFreezeUnfocused), []);
   const [mainDraft, setMainDraft] = useState(mainScene);
   const [mainDirty, setMainDirty] = useState(false);
   // null = unknown/checking, true = exists, false = missing
@@ -395,6 +405,18 @@ export function ProjectSettingsPanel() {
         <Row label="Divisions">
           <Num value={editor.gridDivisions} min={1} step={1} onChange={(v) => patch("editor", { gridDivisions: v })} />
         </Row>
+        <Row label="Freeze unfocused viewport">
+          <input
+            type="checkbox"
+            checked={freezeUnfocused}
+            title="Stop rendering the viewport while another panel has focus. It wakes up whenever something it draws changes; turn this off if you need an unattended simulation to keep ticking."
+            onChange={(e) => setViewportFreezeEnabled(e.target.checked)}
+          />
+        </Row>
+        <div className="asset-hint" style={{ padding: "0 2px 6px" }}>
+          Freezing applies immediately and is remembered per machine, not saved
+          into the project.
+        </div>
       </div>
 
       <div className="inspector-section">

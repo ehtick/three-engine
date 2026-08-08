@@ -378,6 +378,10 @@ export const EditorApi = {
     export: (target) => callOp("build.export", target ? { target } : {}),
     publish: () => callOp("build.publish"),
     preview: (lan = false) => callOp("build.preview", { lan }),
+    /** The live, rebuild-on-every-edit server behind the viewport's Wi-Fi
+     *  button. Sticky per project — a project left serving serves again on the
+     *  next editor launch. Omit `enabled` to read the current state. */
+    serve: (enabled) => callOp("build.serve", enabled === undefined ? {} : { enabled }),
   },
 
   /**

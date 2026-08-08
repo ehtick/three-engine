@@ -103,6 +103,24 @@ export const BLOCK_RIG = {
   panelW: 2,      // z extent
   panelH: 2,      // y extent
   panelT: 0.2,    // x extent
+  // PANEL_GEO variants (2026-08-08, analytic emitter shapes): the same
+  // flicker instrument pointed at every analytic emitter kind. Each spec is
+  // sized so its worst-case yawed footprint (boundXZ, measured from the
+  // panel's centre at x = −panelT/2) clears the patch start at 0.6 — the
+  // runner uses boundXZ for the clearance FATAL instead of the box's
+  // corner-sweep formula. Rotations put the interesting axis IN the yaw
+  // plane (a cylinder spinning about its own axis is a null test; lying
+  // along X it tumbles). Scales keep the radial cross-section uniform so
+  // fitEmitterShape takes the analytic kind, not the OBB fallback.
+  panelGeos: {
+    box: null, // the classic thin panel; clearance via the corner sweep
+    // Engine primitives: cylinder r0.5 h1, cone r0.5 h1, torus R0.4 t0.15,
+    // sphere r0.5 (see MeshComponent geometryFactories).
+    cylinder: { geometry: "cylinder", scale: [0.5, 1.0, 0.5], rotation: [0, 0, Math.PI / 2], boundXZ: 0.56 },
+    cone: { geometry: "cone", scale: [0.5, 1.0, 0.5], rotation: [0, 0, Math.PI / 2], boundXZ: 0.56 },
+    torus: { geometry: "torus", scale: [1, 1, 1], rotation: [0, 0, 0], boundXZ: 0.55 },
+    sphere: { geometry: "sphere", scale: [1.2, 1.2, 1.2], rotation: [0, 0, 0], boundXZ: 0.6 },
+  },
   floorX0: -2, floorX1: 10,
   floorZ: 8,
   floorAlbedo: "#e8e8e8",
@@ -215,6 +233,7 @@ export async function makeBlockRigProject(root, opts = {}) {
     voxelSize = 0.15,
     probeSpacing = 0.375,
     mover = false,
+    panelGeo = "box",
   } = opts;
   await mkdir(path.join(root, "scenes"), { recursive: true });
   await mkdir(path.join(root, "materials"), { recursive: true });
@@ -243,9 +262,17 @@ export async function makeBlockRigProject(root, opts = {}) {
     // half of the patch clipped at GI intensity 3. White spreads the same
     // luminance over three channels and clips ~1.4x later. (MODE=albedo swaps
     // in PanelGreen, where the hue ratio is the point.)
-    mesh("Panel", "box", M("EmitWhite"),
-      [-panelT / 2, panelH / 2, 0], [panelT, panelH, panelW],
-      { giMobility: mover ? "dynamic" : "static", giTrace: "auto", giDynamic: "auto" }),
+    (() => {
+      const spec = BLOCK_RIG.panelGeos[panelGeo] ?? null;
+      const entity = mesh("Panel", spec?.geometry ?? "box", M("EmitWhite"),
+        [-panelT / 2, panelH / 2, 0], spec?.scale ?? [panelT, panelH, panelW],
+        { giMobility: mover ? "dynamic" : "static", giTrace: "auto", giDynamic: "auto" });
+      // Base rotation puts the shape's interesting axis into the yaw plane;
+      // the runner composes its per-frame yaw ON TOP of this (it reads the
+      // base rotation back before spinning — run-gi-block-size.mjs:881).
+      if (spec?.rotation) entity.rotation = spec.rotation;
+      return entity;
+    })(),
   ];
 
   const scene = {

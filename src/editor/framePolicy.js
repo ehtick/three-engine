@@ -22,11 +22,12 @@
  * Play is the exception and always will be: the game is the thing being watched
  * even when the pointer is in the Inspector.
  *
- * `freeze` is the user's toggle (the snowflake in the viewport toolbar), and it
- * is OFF unless they turned it on — a viewport that keeps drawing can never
- * surprise anyone, and pausing is the thing you reach for once a heavy scene is
- * visibly costing you. A hidden viewport still stops either way: an element with
- * no box on screen cannot be being watched, whatever the preference says.
+ * `freeze` is the user's preference (Project Settings → Editor, on by default —
+ * see `viewportFreeze.js`). It is a plain parameter here rather than a read of
+ * that module so this stays a pure function; the default below is "don't
+ * suspend", the conservative answer for a caller that didn't say. A hidden
+ * viewport still stops either way: an element with no box on screen cannot be
+ * being watched, whatever the preference says.
  */
 export function shouldSuspendViewport({
   playing = false,

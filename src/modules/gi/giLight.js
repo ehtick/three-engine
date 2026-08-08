@@ -259,39 +259,548 @@ export const boxRayEnter = sharedFn({
   },
 });
 
+// ---------------------------------------------------------------------------
+// SHAPED EMITTERS (2026-08-08). Kinds beyond sphere/box — capsule (2),
+// cylinder (3), frustum/cone (4), disc/ring (5), torus (6) — so a lamp made
+// from ANY default three.js geometry lights, shadows and reflects as ITSELF
+// instead of as its bounding box. Every body below is the expression-for-
+// expression twin of a scalar reference in emitterShapes.js, and THAT file is
+// arbitrated against Monte-Carlo surface integration by
+// scripts/run-gi-emitter-shapes-test.mjs — change them TOGETHER or the same
+// lamp disagrees with itself across the receiver/feedback/reflection paths.
+// Slot `half` semantics per kind are documented at emitterShapes.js's header.
+
 /**
- * Geometric irradiance factor of one emitter slot (E = slot.color · factor):
- * the sphere-area model for sphere slots, the exact box form factor for box
- * slots. ONE function used by the receiver direct term, the voxel feedback
- * inject, and reflection-hit lighting — divergence between those three shows
- * up as light that changes when a lamp is viewed via a different path.
+ * Tube-side factor: the lateral surface of a capsule/cylinder/frustum as a
+ * diffuse LINE of width 2·r(u) (energy-exact; near-field bound MC-measured).
+ * The receiver-horizon clip is EXACT — the horizon condition is linear in
+ * the axis parameter, so it clips the integration interval, where the box
+ * path can only clamp per face.
  */
-export function emitterSlotFactor(slot, P, N, cosTheta, sinR) {
-  const sphereF = float(Math.PI).mul(sinR).mul(sinR).mul(sphereLightFactor(cosTheta, sinR));
-  if (!slot.kind) return sphereF;
-  const factor = sphereF.toVar();
-  If(float(slot.kind).greaterThan(0.5), () => {
-    factor.assign(
-      boxLightFactor(P, N, vec3(slot.center), vec3(slot.half), vec3(slot.bx), vec3(slot.by), vec3(slot.bz)),
-    );
-  });
-  return factor;
+const tubeSideFactor = sharedFn({
+  name: "giTubeSideFactor",
+  type: "float",
+  inputs: [
+    { name: "P", type: "vec3" },
+    { name: "N", type: "vec3" },
+    { name: "A", type: "vec3" },
+    { name: "B", type: "vec3" },
+    { name: "ra", type: "float" },
+    { name: "rb", type: "float" },
+  ],
+  body: (P, N, A, B, ra, rb) => {
+    const Lv = B.sub(A).toVar();
+    const segLen = Lv.length().max(1e-6).toVar();
+    const lHat = Lv.div(segLen).toVar();
+    const rel = P.sub(A).toVar();
+    const tFoot = rel.dot(lHat).toVar();
+    const perp = rel.sub(lHat.mul(tFoot)).toVar();
+    const hRaw = perp.length().toVar();
+    // atan(u/h) cancellation guard (mirrors the scalar reference).
+    const h = hRaw.max(segLen.mul(1e-3)).max(1e-5).toVar();
+    const cHat = perp.div(hRaw.max(1e-9)).negate().toVar();
+    const Cn = cHat.dot(N).toVar();
+    const Ln = lHat.dot(N).toVar();
+    const u0r = tFoot.negate().toVar();
+    const u1r = segLen.sub(tFoot).toVar();
+    // Exact horizon clip: keep u where h·Cn + u·Ln > 0.
+    const uH = h.mul(Cn).negate().div(select(Ln.abs().greaterThan(1e-6), Ln, float(1))).toVar();
+    const u0 = select(Ln.greaterThan(1e-6), u0r.max(uH), u0r).toVar();
+    const u1 = select(Ln.lessThan(-1e-6), u1r.min(uH), u1r).toVar();
+    // Axis ⊥ receiver normal AND receiver below the line's plane → nothing.
+    const parallelGate = select(Ln.abs().greaterThan(1e-6), float(1), step(0, Cn));
+    const s = rb.sub(ra).div(segLen).toVar();
+    const raP = ra.add(s.mul(tFoot)).toVar(); // r(u) = raP + s·u
+    const evalA = (u) => u.div(h.mul(h).add(u.mul(u)).mul(2)).add(u.div(h).atan().div(h.mul(2)));
+    const evalB = (u) => float(-1).div(h.mul(h).add(u.mul(u)).mul(2));
+    const evalC = (u) => u.negate().div(h.mul(h).add(u.mul(u)).mul(2)).add(u.div(h).atan().div(h.mul(2)));
+    const dA = evalA(u1).sub(evalA(u0));
+    const dB = evalB(u1).sub(evalB(u0));
+    const dC = evalC(u1).sub(evalC(u0));
+    const F = raP.mul(Cn).mul(dA)
+      .add(raP.mul(Ln).add(s.mul(h).mul(Cn)).mul(h).mul(dB))
+      .add(s.mul(Ln).mul(h).mul(dC))
+      .mul(2);
+    return F.max(0)
+      .mul(step(u0, u1))
+      .mul(parallelGate)
+      .mul(step(1e-9, hRaw));
+  },
+});
+
+/**
+ * One disc's factor via its exact vector irradiance (V_ax toward the plane,
+ * V_rad toward the axis — derivation in emitterShapes.js). `rI` > 0 makes it
+ * a ring (exact by linearity), `twoSided` 1 flips the face to the receiver.
+ */
+const discFactor = sharedFn({
+  name: "giDiscFactor",
+  type: "float",
+  inputs: [
+    { name: "P", type: "vec3" },
+    { name: "N", type: "vec3" },
+    { name: "C", type: "vec3" },
+    { name: "axisIn", type: "vec3" },
+    { name: "rO", type: "float" },
+    { name: "rI", type: "float" },
+    { name: "twoSided", type: "float" },
+  ],
+  body: (P, N, C, axisIn, rO, rI, twoSided) => {
+    const rel = P.sub(C).toVar();
+    const Hs = rel.dot(axisIn).toVar();
+    const flip = select(twoSided.greaterThan(0.5).and(Hs.lessThan(0)), float(-1), float(1)).toVar();
+    const axis = axisIn.mul(flip).toVar();
+    const H = Hs.mul(flip).toVar();
+    const inPlane = rel.sub(axis.mul(H)).toVar();
+    const rho = inPlane.length().toVar();
+    const mHat = inPlane.div(rho.max(1e-9)).toVar();
+    const rhoS = rho.max(1e-5).toVar();
+    const one = (r) => {
+      const X = r.mul(r).add(rhoS.mul(rhoS)).add(H.mul(H)).toVar();
+      const Q = X.mul(X).sub(r.mul(r).mul(rhoS).mul(rhoS).mul(4)).max(1e-12).sqrt().toVar();
+      const vAx = float(Math.PI / 2).mul(float(1).sub(H.mul(H).add(rhoS.mul(rhoS)).sub(r.mul(r)).div(Q)));
+      const vRad = float(Math.PI / 2).mul(H).mul(float(1).sub(X.div(Q)).div(rhoS));
+      const gate = step(1e-6, r);
+      return { vAx: vAx.mul(gate), vRad: vRad.mul(gate) };
+    };
+    const outer = one(rO);
+    const inner = one(rI);
+    const vAx = outer.vAx.sub(inner.vAx);
+    const vRad = outer.vRad.sub(inner.vRad);
+    const F = vAx.mul(axis.dot(N).negate()).add(vRad.mul(mHat.dot(N)));
+    return F.max(0).mul(step(1e-5, H));
+  },
+});
+
+/**
+ * Shortest distance between segments [p,q] and [a,b] — the torus model's
+ * self-occlusion oracle. Twin of emitterShapes.js segSegDistance, with the
+ * branch cascade expressed as selects.
+ */
+const segSegDist = sharedFn({
+  name: "giSegSegDist",
+  type: "float",
+  inputs: [
+    { name: "p", type: "vec3" },
+    { name: "q", type: "vec3" },
+    { name: "a", type: "vec3" },
+    { name: "b", type: "vec3" },
+  ],
+  body: (p, q, a, b) => {
+    const d1 = q.sub(p).toVar();
+    const d2 = b.sub(a).toVar();
+    const r = p.sub(a).toVar();
+    const A = d1.dot(d1).toVar();
+    const E = d2.dot(d2).toVar();
+    const Fv = d2.dot(r).toVar();
+    const Cv = d1.dot(r).toVar();
+    const Bv = d1.dot(d2).toVar();
+    const denom = A.mul(E).sub(Bv.mul(Bv)).toVar();
+    const s0 = select(denom.greaterThan(1e-12), Bv.mul(Fv).sub(Cv.mul(E)).div(denom), float(0)).clamp(0, 1).toVar();
+    const tRaw = Bv.mul(s0).add(Fv).div(E.max(1e-12)).toVar();
+    const t = tRaw.clamp(0, 1).toVar();
+    // Re-clamp s against the clamped t (one Gauss-Seidel pass — what the
+    // scalar cascade does through its if/else chain).
+    const s = Bv.mul(t).sub(Cv).div(A.max(1e-12)).clamp(0, 1).toVar();
+    const c1 = p.add(d1.mul(s));
+    const c2 = a.add(d2.mul(t));
+    return c1.sub(c2).length();
+  },
+});
+
+/** Capsule caps: ½(1+cosχ) of a full sphere each (exact far field). */
+function capsuleFactorTSL(P, N, center, by, half) {
+  const axis = vec3(by).toVar();
+  const hl = half.y.toVar();
+  const r = half.x.toVar();
+  const A = vec3(center).sub(axis.mul(hl)).toVar();
+  const B = vec3(center).add(axis.mul(hl)).toVar();
+  const side = tubeSideFactor(P, N, A, B, r, r);
+  const capF = (capC, outwardSign) => {
+    const relC = P.sub(capC).toVar();
+    const dC = relC.length().max(1e-3).toVar();
+    const cosChi = relC.div(dC).dot(axis.mul(outwardSign));
+    const w = cosChi.add(1).mul(0.5);
+    const sinRC = r.div(dC).clamp(0, 1).toVar();
+    const cosTC = capC.sub(P).div(dC).dot(N);
+    return float(Math.PI).mul(sinRC).mul(sinRC).mul(sphereLightFactor(cosTC, sinRC)).mul(w);
+  };
+  return side.add(capF(A, -1)).add(capF(B, 1)).min(Math.PI);
+}
+
+/** Cylinder: tube side + two one-sided disc caps. */
+function cylinderFactorTSL(P, N, center, by, half) {
+  const axis = vec3(by).toVar();
+  const hl = half.y.toVar();
+  const r = half.x.toVar();
+  const A = vec3(center).sub(axis.mul(hl)).toVar();
+  const B = vec3(center).add(axis.mul(hl)).toVar();
+  const side = tubeSideFactor(P, N, A, B, r, r);
+  const capA = discFactor(P, N, A, axis.negate(), r, float(0), float(0));
+  const capB = discFactor(P, N, B, axis, r, float(0), float(0));
+  return side.add(capA).add(capB).min(Math.PI);
 }
 
 /**
- * The shadow ray's reach toward a slot: to the sphere surface, or to the
- * box's actual face (slab entry) for box slots.
+ * Frustum/cone: linear-radius tube side + caps with the silhouette-overlap
+ * correction on the WIDE end (subtract half its ring when facing, add the
+ * mirrored half-ring when backfacing — branchless via the one-sided/two-sided
+ * ring pair; full derivation at emitterShapes.js refFrustumFactor).
+ */
+function frustumFactorTSL(P, N, center, by, half) {
+  const axis = vec3(by).toVar();
+  const hl = half.y.toVar();
+  const rB = half.x.toVar(); // radius at −by
+  const rT = half.z.toVar(); // radius at +by
+  const A = vec3(center).sub(axis.mul(hl)).toVar();
+  const B = vec3(center).add(axis.mul(hl)).toVar();
+  const side = tubeSideFactor(P, N, A, B, rB, rT);
+  const capA = discFactor(P, N, A, axis.negate(), rB, float(0), float(0)).toVar();
+  const capB = discFactor(P, N, B, axis, rT, float(0), float(0)).toVar();
+  const rel = P.sub(vec3(center)).toVar();
+  const dC = rel.length().max(1e-6).toVar();
+  const cosG = rel.div(dC).dot(axis).abs();
+  const sinG = float(1).sub(cosG.mul(cosG)).max(0).sqrt().toVar();
+  const wideAtA = rB.greaterThanEqual(rT).toVar();
+  const cW = select(wideAtA, A, B).toVar();
+  const nW = select(wideAtA, axis.negate(), axis).toVar();
+  const rW = rB.max(rT).toVar();
+  const rN = rB.min(rT).toVar();
+  const oneW = select(wideAtA, capA, capB).toVar();
+  const oneN = discFactor(P, N, cW, nW, rN, float(0), float(0));
+  const twoW = discFactor(P, N, cW, nW, rW, float(0), float(1));
+  const twoN = discFactor(P, N, cW, nW, rN, float(0), float(1));
+  const ringOne = oneW.sub(oneN).max(0);
+  const ringTwo = twoW.sub(twoN).max(0);
+  const corrected = oneW.sub(sinG.mul(ringOne)).add(sinG.mul(ringTwo).mul(0.5)).toVar();
+  const capAF = select(wideAtA, corrected, capA);
+  const capBF = select(wideAtA, capB, corrected);
+  return side.add(capAF).add(capBF).min(Math.PI);
+}
+
+// Torus chord-segment count + arc/chord area compensation. MUST match
+// emitterShapes.js TORUS_SEGMENTS/TORUS_CHORD_COMP (the shape test grades the
+// scalar twin; a differing K here would be an unarbitrated shader).
+const TORUS_K = 8;
+const TORUS_COMP = (Math.PI / TORUS_K) / Math.sin(Math.PI / TORUS_K);
+
+/**
+ * Torus: TORUS_K chord tubes anchored to the receiver's in-plane azimuth
+ * (rotation-invariant by construction — a spinning torus lamp CANNOT flicker
+ * from this term) with near-chord self-occlusion per far segment.
+ */
+function torusFactorTSL(P, N, center, by, half) {
+  const axis = vec3(by).toVar();
+  const ringR = half.x.toVar();
+  const rt = half.y.mul(TORUS_COMP).toVar();
+  const rel = P.sub(vec3(center)).toVar();
+  const Hax = rel.dot(axis).toVar();
+  const inPlane = rel.sub(axis.mul(Hax)).toVar();
+  const eLen = inPlane.length().toVar();
+  // Receiver on the axis: any anchor gives the same answer by symmetry.
+  const fallback = select(axis.x.abs().lessThan(0.9), vec3(1, 0, 0), vec3(0, 0, 1));
+  const fb = fallback.sub(axis.mul(fallback.dot(axis)));
+  const e1 = select(eLen.greaterThan(1e-6), inPlane.div(eLen.max(1e-6)), fb.normalize()).toVar();
+  const e2 = axis.cross(e1).toVar();
+  const F = float(0).toVar();
+  const ringPoint = (phi) =>
+    vec3(center).add(e1.mul(Math.cos(phi) * 1).mul(ringR)).add(e2.mul(Math.sin(phi) * 1).mul(ringR));
+  const dPhi = (2 * Math.PI) / TORUS_K;
+  const nA = ringPoint(-0.5 * dPhi).toVar();
+  const nB = ringPoint(0.5 * dPhi).toVar();
+  for (let i = 0; i < TORUS_K; i++) {
+    const pA = i === 0 ? nA : ringPoint((i - 0.5) * dPhi).toVar();
+    const pB = i === 0 ? nB : ringPoint((i + 0.5) * dPhi).toVar();
+    const seg = tubeSideFactor(P, N, pA, pB, rt, rt);
+    if (i > 1 && i < TORUS_K - 1) {
+      // Sight line to this segment vs the near chord: penumbra centred on
+      // tangency (clear = rt → half the far tube hidden).
+      const mid = pA.add(pB).mul(0.5);
+      const clear = segSegDist(P, mid, nA, nB);
+      const vis = smoothstep(rt.mul(0.2), rt.mul(1.8), clear);
+      F.addAssign(seg.mul(vis));
+    } else {
+      F.addAssign(seg);
+    }
+  }
+  return F.min(Math.PI);
+}
+
+/**
+ * The full kind dispatch as ONE per-shader WGSL function (sharedFn): the
+ * chain below inlines seven shape evaluators, and stamping it out per slot
+ * per pass measurably stretched post-rebuild pipeline compiles (the block
+ * rig's black-frame detector caught rebuilt arms exceeding the reshoot
+ * window). As a layout'd function each shader carries it exactly once and
+ * every slot/call site is a plain call.
+ */
+const emitterFactorFn = sharedFn({
+  name: "giEmitterFactor",
+  type: "float",
+  inputs: [
+    { name: "P", type: "vec3" },
+    { name: "N", type: "vec3" },
+    { name: "cosTheta", type: "float" },
+    { name: "sinR", type: "float" },
+    { name: "kind", type: "float" },
+    { name: "center", type: "vec3" },
+    { name: "half", type: "vec3" },
+    { name: "bx", type: "vec3" },
+    { name: "by", type: "vec3" },
+    { name: "bz", type: "vec3" },
+  ],
+  body: (P, N, cosTheta, sinR, kind, center, half, bx, by, bz) => {
+    const factor = float(Math.PI).mul(sinR).mul(sinR).mul(sphereLightFactor(cosTheta, sinR)).toVar();
+    If(kind.greaterThan(0.5), () => {
+      If(kind.lessThan(1.5), () => {
+        factor.assign(boxLightFactor(P, N, center, half, bx, by, bz));
+      }).ElseIf(kind.lessThan(2.5), () => {
+        factor.assign(capsuleFactorTSL(P, N, center, by, half));
+      }).ElseIf(kind.lessThan(3.5), () => {
+        factor.assign(cylinderFactorTSL(P, N, center, by, half));
+      }).ElseIf(kind.lessThan(4.5), () => {
+        factor.assign(frustumFactorTSL(P, N, center, by, half));
+      }).ElseIf(kind.lessThan(5.5), () => {
+        factor.assign(discFactor(P, N, center, by, half.x, half.z, float(1)));
+      }).Else(() => {
+        factor.assign(torusFactorTSL(P, N, center, by, half));
+      });
+    });
+    return factor;
+  },
+});
+
+/**
+ * Geometric irradiance factor of one emitter slot (E = slot.color · factor).
+ * ONE function used by the receiver direct term, the voxel feedback inject,
+ * mover hit-shading and reflection-hit lighting — divergence between those
+ * shows up as light that changes when a lamp is viewed via a different path.
+ * Kinds: 0 sphere (horizon-aware), 1 oriented box (exact Lambert contour),
+ * 2 capsule, 3 cylinder, 4 frustum/cone, 5 disc/ring, 6 torus — see the
+ * SHAPED EMITTERS block above; scalar twins + MC arbiter in emitterShapes.js.
+ */
+export function emitterSlotFactor(slot, P, N, cosTheta, sinR) {
+  if (!slot.kind) return float(Math.PI).mul(sinR).mul(sinR).mul(sphereLightFactor(cosTheta, sinR));
+  return emitterFactorFn(
+    P, N, cosTheta, sinR,
+    float(slot.kind), vec3(slot.center), vec3(slot.half),
+    vec3(slot.bx), vec3(slot.by), vec3(slot.bz),
+  );
+}
+
+/**
+ * Ray-enter distance for the shaped kinds' shadow-ray caps (the twin duty of
+ * boxRayEnter): exact quadratics for capsule/cylinder/frustum, plane hit for
+ * discs, a short SDF march for the torus (its exact intersection is quartic —
+ * not worth it for a ray CAP that a margin is subtracted from anyway).
+ */
+const shapeRayEnter = sharedFn({
+  name: "giShapeRayEnter",
+  type: "float",
+  inputs: [
+    { name: "P", type: "vec3" },
+    { name: "dir", type: "vec3" },
+    { name: "dist", type: "float" },
+    { name: "kind", type: "float" },
+    { name: "center", type: "vec3" },
+    { name: "radius", type: "float" },
+    { name: "half", type: "vec3" },
+    { name: "bx", type: "vec3" },
+    { name: "by", type: "vec3" },
+    { name: "bz", type: "vec3" },
+  ],
+  body: (P, dir, dist, kind, center, radius, half, bx, by, bz) => {
+    const t = dist.sub(radius).toVar(); // bounding-sphere fallback
+    const rel = P.sub(center).toVar();
+    // Local frame (by = symmetry axis).
+    const lx = rel.dot(bx).toVar();
+    const ly = rel.dot(by).toVar();
+    const lz = rel.dot(bz).toVar();
+    const dx = dir.dot(bx).toVar();
+    const dy = dir.dot(by).toVar();
+    const dz = dir.dot(bz).toVar();
+    If(kind.greaterThan(1.5).and(kind.lessThan(4.5)), () => {
+      // Capsule/cylinder/frustum: infinite-cone/cylinder quadratic on the
+      // radial coordinates, entry clamped to the axial span, then cap tests.
+      const hl = half.y.toVar();
+      const rBot = half.x.toVar();
+      const rTop = select(kind.lessThan(3.5), half.x, half.z).toVar();
+      // r(y) = rBot + (rTop − rBot)·(y + hl)/(2hl) = m·y + c0
+      const m = rTop.sub(rBot).div(hl.mul(2)).toVar();
+      const c0 = rBot.add(rTop).mul(0.5).toVar();
+      // (lx+t·dx)² + (lz+t·dz)² = (m·(ly+t·dy)+c0)²
+      const rl = m.mul(ly).add(c0).toVar();
+      const A = dx.mul(dx).add(dz.mul(dz)).sub(m.mul(m).mul(dy).mul(dy)).toVar();
+      const Bq = lx.mul(dx).add(lz.mul(dz)).sub(rl.mul(m).mul(dy)).toVar();
+      const Cq = lx.mul(lx).add(lz.mul(lz)).sub(rl.mul(rl)).toVar();
+      const disc = Bq.mul(Bq).sub(A.mul(Cq)).toVar();
+      If(disc.greaterThan(0).and(A.abs().greaterThan(1e-8)), () => {
+        const tSide = Bq.negate().sub(disc.sqrt()).div(A).toVar();
+        const ySide = ly.add(dy.mul(tSide));
+        If(tSide.greaterThan(0).and(ySide.abs().lessThanEqual(hl.add(select(kind.lessThan(2.5), half.x, float(0))))), () => {
+          t.assign(tSide);
+        });
+      });
+      // Flat caps (cylinder/frustum) or sphere caps (capsule) can be nearer.
+      If(kind.greaterThan(2.5), () => {
+        const capT = (yPlane, rCap) => {
+          const tc = yPlane.sub(ly).div(select(dy.abs().greaterThan(1e-8), dy, float(1e-8))).toVar();
+          const cx = lx.add(dx.mul(tc));
+          const cz = lz.add(dz.mul(tc));
+          const inside = cx.mul(cx).add(cz.mul(cz)).lessThanEqual(rCap.mul(rCap));
+          return { tc, valid: tc.greaterThan(0).and(dy.abs().greaterThan(1e-8)).and(inside) };
+        };
+        const capA = capT(hl.negate(), rBot);
+        If(capA.valid.and(capA.tc.lessThan(t)), () => { t.assign(capA.tc); });
+        const capB = capT(hl, rTop);
+        If(capB.valid.and(capB.tc.lessThan(t)), () => { t.assign(capB.tc); });
+      }).Else(() => {
+        // Capsule end spheres.
+        const sph = (cy) => {
+          const ox = lx, oy = ly.sub(cy), oz = lz;
+          const b = ox.mul(dx).add(oy.mul(dy)).add(oz.mul(dz)).toVar();
+          const c = ox.mul(ox).add(oy.mul(oy)).add(oz.mul(oz)).sub(half.x.mul(half.x)).toVar();
+          const d2 = b.mul(b).sub(c).toVar();
+          return { tc: b.negate().sub(d2.max(0).sqrt()), valid: d2.greaterThan(0) };
+        };
+        const sA = sph(hl.negate());
+        If(sA.valid.and(sA.tc.greaterThan(0)).and(sA.tc.lessThan(t)), () => { t.assign(sA.tc); });
+        const sB = sph(hl);
+        If(sB.valid.and(sB.tc.greaterThan(0)).and(sB.tc.lessThan(t)), () => { t.assign(sB.tc); });
+      });
+    }).ElseIf(kind.lessThan(5.5), () => {
+      // Disc/ring: the shadow ray aims INTO the disc plane (at worst at the
+      // ring's centre hole) — the plane crossing is the honest cap either way.
+      const denom = select(dy.abs().greaterThan(1e-6), dy, float(1e-6));
+      const tp = ly.negate().div(denom).toVar();
+      If(tp.greaterThan(0), () => { t.assign(tp.min(dist)); });
+    }).Else(() => {
+      // Torus: sphere-trace its SDF a few steps from the bounding-sphere
+      // entry. Converges to mm-scale for hit rays; misses stay ≥ the
+      // bounding fallback which the caller's margin absorbs.
+      const tm = t.max(0).toVar();
+      for (let i = 0; i < 6; i++) {
+        const px = lx.add(dx.mul(tm)), py = ly.add(dy.mul(tm)), pz = lz.add(dz.mul(tm));
+        const qx = px.mul(px).add(pz.mul(pz)).sqrt().sub(half.x);
+        const sd = qx.mul(qx).add(py.mul(py)).sqrt().sub(half.y);
+        tm.addAssign(sd.max(0));
+      }
+      t.assign(tm.min(dist));
+    });
+    return t;
+  },
+});
+
+/**
+ * The shadow ray's reach toward a slot: to the sphere surface, the box's
+ * slab entry, or the shaped kinds' surface (shapeRayEnter above).
  */
 export function emitterSurfaceT(slot, P, dirToEmitter, dist) {
   const sphereT = dist.sub(slot.radius);
   if (!slot.kind) return sphereT;
   const t = sphereT.toVar();
-  If(float(slot.kind).greaterThan(0.5), () => {
+  const kind = float(slot.kind);
+  If(kind.greaterThan(0.5).and(kind.lessThan(1.5)), () => {
     t.assign(
       boxRayEnter(P, dirToEmitter, vec3(slot.center), vec3(slot.half), vec3(slot.bx), vec3(slot.by), vec3(slot.bz)),
     );
+  }).ElseIf(kind.greaterThan(1.5), () => {
+    t.assign(
+      shapeRayEnter(
+        P, dirToEmitter, dist, kind,
+        vec3(slot.center), float(slot.radius), vec3(slot.half),
+        vec3(slot.bx), vec3(slot.by), vec3(slot.bz),
+      ),
+    );
   });
   return t;
+}
+
+/**
+ * Angular miss distance of a reflection ray vs a SHAPED emitter's silhouette
+ * (the duty boxGlowMiss performs for boxes): the reflection of a cylinder
+ * lamp is a bar, of a torus a ring — not the box their OBB would draw.
+ * Method: closest approach to the slot centre, two sphere-trace refinement
+ * steps against the shape's SDF (rays that hit converge to sdf≈0), then
+ * sdf/t as the angular miss. Exact inside the silhouette, glow-grade soft
+ * at rims — the same contract boxGlowMiss documents.
+ */
+const shapeGlowMiss = sharedFn({
+  name: "giShapeGlowMiss",
+  type: "float",
+  inputs: [
+    { name: "P", type: "vec3" },
+    { name: "R", type: "vec3" },
+    { name: "kind", type: "float" },
+    { name: "center", type: "vec3" },
+    { name: "half", type: "vec3" },
+    { name: "bx", type: "vec3" },
+    { name: "by", type: "vec3" },
+    { name: "bz", type: "vec3" },
+  ],
+  body: (P, R, kind, center, half, bx, by, bz) => {
+    const rel = P.sub(center).toVar();
+    const ro = vec3(rel.dot(bx), rel.dot(by), rel.dot(bz)).toVar();
+    const rd = vec3(R.dot(bx), R.dot(by), R.dot(bz)).toVar();
+    const sdf = (p) => {
+      const d = float(0).toVar();
+      const radial = p.xz.length().toVar();
+      If(kind.lessThan(2.5), () => {
+        // Capsule: segment distance minus radius.
+        const yC = p.y.clamp(half.y.negate(), half.y);
+        d.assign(vec3(p.x, p.y.sub(yC), p.z).length().sub(half.x));
+      }).ElseIf(kind.lessThan(3.5), () => {
+        // Cylinder.
+        const q = vec2(radial.sub(half.x), p.y.abs().sub(half.y)).toVar();
+        d.assign(q.max(vec2(0)).length().add(q.x.max(q.y).min(0)));
+      }).ElseIf(kind.lessThan(4.5), () => {
+        // Frustum: radial vs the linearly varying r(y), capped — glow-grade.
+        const m = half.z.sub(half.x).div(half.y.mul(2));
+        const rAt = m.mul(p.y).add(half.x.add(half.z).mul(0.5));
+        d.assign(radial.sub(rAt).max(p.y.abs().sub(half.y)));
+      }).ElseIf(kind.lessThan(5.5), () => {
+        // Disc/ring plate: radial band [rI, rO] at thickness ~0.
+        const band = radial.sub(half.x).max(half.z.sub(radial)).max(0);
+        d.assign(vec2(band, p.y).length());
+      }).Else(() => {
+        // Torus.
+        const q = vec2(radial.sub(half.x), p.y).toVar();
+        d.assign(q.length().sub(half.y));
+      });
+      return d;
+    };
+    const t = ro.negate().dot(rd).clamp(0.05, 1e5).toVar();
+    // Two refinement steps walk t toward the surface for hit rays; misses
+    // stay near the closest approach, which is what the miss ratio wants.
+    for (let i = 0; i < 2; i++) {
+      const d = sdf(ro.add(rd.mul(t)));
+      t.assign(t.add(d.mul(0.9)).clamp(0.05, 1e5));
+    }
+    return sdf(ro.add(rd.mul(t))).max(0).div(t);
+  },
+});
+
+/**
+ * Self-exclusion region for the sphere-arm shadow marchers, kind-aware.
+ * Kind 0 excludes the bounding sphere ×1.5; every shaped kind excludes a
+ * CONSERVATIVE OBB (slot.exHalf, computed CPU-side per shape — a torus's
+ * spans ring+tube, a disc's is its thin plate). Replaces three copies of a
+ * `mix(..., kindF)` pattern that was linear in `kind` and therefore silently
+ * WRONG for any kind above 1 (mix extrapolates: kind 2 produced 2·half−1).
+ */
+export function emitterExclusion(slot, margin) {
+  if (!slot.kind) {
+    return { exRadius: slot.radius.mul(1.5).add(margin), exBox: null };
+  }
+  const shaped = step(0.5, float(slot.kind));
+  const exHalf = slot.exHalf ?? slot.half;
+  return {
+    exRadius: mix(slot.radius.mul(1.5).add(margin), margin, shaped),
+    exBox: {
+      half: mix(vec3(-1), vec3(exHalf), shaped),
+      bx: slot.bx, by: slot.by, bz: slot.bz,
+    },
+  };
 }
 
 /** Angular-size radius of a slot: exact for spheres, mean-projected-area
@@ -427,16 +936,15 @@ export function emitterSlotShadow(params, slot, P, N, samplePoint) {
       If(maxT.greaterThan(params.shadowMargin), () => {
         // Self-exclusion covers ONLY the lamp's own body + a couple of
         // field cells. Sphere slots: the bounding sphere ×1.5 (their body
-        // IS the sphere). Box slots: the OBB dilated by the margin — the
-        // bounding sphere of a big panel swallowed nearby ceilings/walls,
-        // which then stopped occluding (light poured through into the
-        // next room as a circle) and its boundary ringed the pool.
-        const kindF = slot.kind ? float(slot.kind) : null;
-        const exRadius = kindF
-          ? mix(slot.radius.mul(1.5).add(params.shadowMargin), float(params.shadowMargin), kindF)
-          : slot.radius.mul(1.5).add(params.shadowMargin);
-        const exBox = kindF
-          ? { half: mix(vec3(-1), vec3(slot.half), kindF), bx: slot.bx, by: slot.by, bz: slot.bz }
+        // IS the sphere). Shaped slots: a conservative OBB (exHalf) dilated
+        // by the margin — the bounding sphere of a big panel swallowed
+        // nearby ceilings/walls, which then stopped occluding (light poured
+        // through into the next room as a circle) and its boundary ringed
+        // the pool.
+        const ex = emitterExclusion(slot, float(params.shadowMargin));
+        const exRadius = ex.exRadius;
+        const exBox = ex.exBox
+          ? ex.exBox
           : null;
         // RECORD-MARCH EMITTER SHADOWS (2026-08-06, plan §6 unification —
         // the emitter arm joins the light arm's estimator family). The
@@ -553,9 +1061,10 @@ export class GICascadeLight extends THREE.Light {
     this.approximateReflections = false;
     // Optional emissive-area-shadow inputs (see GISystem #updateEmitters):
     // emitterSlots = MAX_EMITTERS × {center, radius, color, kind, half,
-    // bx/by/bz, reff} uniforms (kind 0 = sphere, 1 = oriented box — see
-    // emitterSlotFactor); shadowTraceFn = voxel DDA (origin, dir, maxT)
-    // => { rad, t }.
+    // bx/by/bz, reff, exHalf} uniforms (kind 0 = sphere, 1 = oriented box,
+    // 2 = capsule, 3 = cylinder, 4 = frustum/cone, 5 = disc/ring,
+    // 6 = torus — see emitterSlotFactor and emitterShapes.js);
+    // shadowTraceFn = voxel DDA (origin, dir, maxT) => { rad, t }.
     this.emitterSlots = null;
     this.shadowTraceFn = null;
     this.shadowMargin = 0.3;
@@ -1073,13 +1582,9 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
                     const k = dist.div(float(emitterAngularRadius(slot)).max(0.05)).clamp(1.2, 48);
                     const maxT = emitterSurfaceT(slot, hitOrigin, dirTo, dist).sub(light.shadowMargin).max(0);
                     If(maxT.greaterThan(light.shadowMargin), () => {
-                      const kindF = slot.kind ? float(slot.kind) : null;
-                      const exRadius = kindF
-                        ? mix(slot.radius.mul(1.5).add(light.shadowMargin), float(light.shadowMargin), kindF)
-                        : slot.radius.mul(1.5).add(light.shadowMargin);
-                      const exBox = kindF
-                        ? { half: mix(vec3(-1), vec3(slot.half), kindF), bx: slot.bx, by: slot.by, bz: slot.bz }
-                        : null;
+                      const ex = emitterExclusion(slot, float(light.shadowMargin));
+                      const exRadius = ex.exRadius;
+                      const exBox = ex.exBox;
                       shadowH.assign(
                         light.mirrorShadowFn(
                           hitOrigin, dirTo, maxT, k, cosH,
@@ -1160,12 +1665,21 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
         // from the reflected ray to the box's actual silhouette — the
         // reflection of a cube lamp is a cube, tilted the way the lamp is
         // tilted, not the disc the sphere model drew ("reflections from
-        // emissives look like a sphere" report).
+        // emissives look like a sphere" report). Shaped slots (capsule/
+        // cylinder/frustum/disc/torus): the same silhouette contract via
+        // their SDF (shapeGlowMiss) — a torus lamp reflects as a ring.
         const inCone = float(smoothstep(cosEff, mix(cosEff, 1, 0.35), cosAng)).toVar();
         if (slot.kind) {
-          If(float(slot.kind).greaterThan(0.5), () => {
+          const kindG = float(slot.kind);
+          If(kindG.greaterThan(0.5).and(kindG.lessThan(1.5)), () => {
             const miss = boxGlowMiss(
               positionWorld, reflected,
+              vec3(slot.center), vec3(slot.half), vec3(slot.bx), vec3(slot.by), vec3(slot.bz),
+            );
+            inCone.assign(smoothstep(0.0, spread, miss).oneMinus());
+          }).ElseIf(kindG.greaterThan(1.5), () => {
+            const miss = shapeGlowMiss(
+              positionWorld, reflected, kindG,
               vec3(slot.center), vec3(slot.half), vec3(slot.bx), vec3(slot.by), vec3(slot.bz),
             );
             inCone.assign(smoothstep(0.0, spread, miss).oneMinus());

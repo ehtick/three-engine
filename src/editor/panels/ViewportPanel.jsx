@@ -2,7 +2,7 @@
 // errors unrelated to events (Camera/Engine.scene typing too narrow, import.meta.env),
 // a follow-up outside the events-system pass.
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { Play, Square, Pause, StepForward, Move, Rotate3d, Scale3d, Layers as LayersIcon, Crosshair, Monitor, Wifi, Smartphone, QrCode, Share2, Link2, Loader2, Sparkles, Snowflake } from "lucide-react";
+import { Play, Square, Pause, StepForward, Move, Rotate3d, Scale3d, Layers as LayersIcon, Crosshair, Monitor, Wifi, Smartphone, QrCode, Share2, Link2, Loader2, Sparkles } from "lucide-react";
 import qrcode from "qrcode-generator";
 import * as THREE from "three/webgpu";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
@@ -10,20 +10,13 @@ import { TransformControls } from "three/addons/controls/TransformControls.js";
 import { ensureEngine, engine, isEngineReady } from "../engineInstance.js";
 import { installEditorFramePacing } from "../editorFramePacing.js";
 import {
-  isViewportFreezeEnabled,
-  onViewportFreezeChanged,
-  setViewportFreezeEnabled,
-} from "../viewportFreeze.js";
-import {
-  openBrowserPreview,
   openBrowserPreviewUrl,
-  stopBrowserPreview,
-  getActiveBrowserPreview,
-  startShareTunnel,
-  stopShareTunnel,
-  getActiveShareTunnel,
+  getBrowserPreviewState,
+  onBrowserPreviewChanged,
+  setBrowserPreviewMessage,
+  toggleBrowserPreview,
+  toggleShareTunnel,
 } from "../browserPreview.js";
-import { pushToast } from "../toasts.js";
 import { DEBUG_LAYER, EDITOR_LAYER, UI_LAYER } from "../../engine/editorLayers.js";
 import { StatsOverlay } from "../overlays/StatsOverlay.jsx";
 import { useSelectionStore } from "../store/selectionStore.js";
@@ -73,7 +66,7 @@ import { extOf, invalidateBlobUrl, MODEL_EXTENSIONS, TEXTURE_EXTENSIONS, SCRIPT_
 import { basename, useProjectStore } from "../store/projectStore.js";
 import { getEditorCameraStorageKey, loadEditorCamera, saveEditorCamera } from "../cameraPrefs.js";
 import { usePlayStore } from "../store/playStore.js";
-import { toggle as togglePlay, stop as stopPlay, togglePaused, stepFrame } from "../playMode.js";
+import { toggle as togglePlay, togglePaused, stepFrame } from "../playMode.js";
 import { useAssetDrop } from "../assetDrag.js";
 import { instantiatePrefab } from "../prefab.js";
 import { getProjectSettings, onProjectSettingsApplied, applyProjectSettings } from "../projectSettings.js";
@@ -3789,22 +3782,15 @@ export function ViewportPanel() {
   // subscribeLayers pub-sub.
   const [layers, setLayers] = useState(viewport.layers);
   const [layersOpen, setLayersOpen] = useState(false);
-  // Read from the pref rather than held here: the setting is per machine and
-  // outlives this panel, which dockview remounts on every tab move.
-  const [freezeUnfocused, setFreezeUnfocused] = useState(isViewportFreezeEnabled);
-  useEffect(() => onViewportFreezeChanged(setFreezeUnfocused), []);
-  // Seeded from the singleton: dockview remounts this panel on tab moves, and
-  // a remounted toolbar must show (and be able to stop) the server that is
-  // already running, not offer to start a second one.
-  const [browserPreview, setBrowserPreview] = useState(() => ({
-    busy: false,
-    message: "",
-    urls: getActiveBrowserPreview(),
-    share: getActiveShareTunnel(),
-  }));
+  // Mirrored from browserPreview.js rather than owned here: the server
+  // outlives this panel (dockview remounts it on every tab move) and can be
+  // started by things that are not this toolbar — the boot autostart, an
+  // agent. Subscribing is what makes those visible here.
+  const [browserPreview, setBrowserPreview] = useState(getBrowserPreviewState);
+  useEffect(() => onBrowserPreviewChanged(setBrowserPreview), []);
   // Separate from `busy`: only the share endpoint should spin while a tunnel
   // starts, not while the preview itself builds.
-  const [shareBusy, setShareBusy] = useState(false);
+  const shareBusy = browserPreview.sharing;
   // The public link wins the QR slot when it exists: it works from any phone
   // with no certificate warning, which is what a scanned code is for.
   const browserPreviewQrUrl = browserPreview.share?.url || browserPreview.urls?.lanUrl || "";
@@ -3817,113 +3803,13 @@ export function ViewportPanel() {
     return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
   }, [browserPreviewQrUrl]);
 
-  const launchBrowserPreview = async () => {
-    if (browserPreview.busy) return;
-    if (browserPreview.urls) {
-      setBrowserPreview((state) => ({ ...state, busy: true, message: "Stopping browser preview…" }));
-      try {
-        // stopBrowserPreview also takes the share tunnel down with it.
-        await stopBrowserPreview(browserPreview.urls.report?.contentDir);
-        setBrowserPreview({ busy: false, message: "", urls: null, share: null });
-      } catch (error) {
-        console.error(`Could not stop browser preview: ${error?.message ?? error}`);
-        setBrowserPreview((state) => ({
-          ...state,
-          busy: false,
-          message: `Could not stop preview: ${error?.message ?? error}`,
-        }));
-      }
-      return;
-    }
-    setBrowserPreview({ busy: true, message: "Building browser preview…", urls: null, share: null });
-    try {
-      // Export the authored snapshot, never a scene after gameplay scripts or
-      // physics have mutated it. This also makes the button useful while the
-      // user is already testing in the viewport.
-      if (playing) {
-        setBrowserPreview({ busy: true, message: "Stopping Play mode…", urls: null, share: null });
-        await stopPlay();
-      }
-      // openBrowser: false — the endpoints appear in the toolbar instead of a
-      // tab stealing focus the moment the build lands.
-      const result = await openBrowserPreview({
-        openBrowser: false,
-        onProgress: ({ message }) => setBrowserPreview((state) => ({ ...state, message })),
-      });
-      if (result) {
-        setBrowserPreview({
-          busy: false,
-          message: result.lanUrl
-            ? `Live: ${result.localUrl} · Wi-Fi: ${result.lanUrl}`
-            : `Live: ${result.localUrl}`,
-          urls: result,
-          share: null,
-        });
-      } else {
-        setBrowserPreview({ busy: false, message: "", urls: null, share: null });
-      }
-    } catch (error) {
-      console.error(`Browser preview failed: ${error?.message ?? error}`);
-      pushToast({ level: "error", title: "Browser preview failed", detail: `${error?.message ?? error}` });
-      setBrowserPreview({ busy: false, message: `Preview failed: ${error?.message ?? error}`, urls: null, share: null });
-    }
-  };
-
-  const toggleShareTunnel = async () => {
-    if (browserPreview.busy || shareBusy || !browserPreview.urls) return;
-    setShareBusy(true);
-    try {
-      if (browserPreview.share) {
-        setBrowserPreview((state) => ({ ...state, message: "Stopping public link…" }));
-        try {
-          await stopShareTunnel();
-          setBrowserPreview((state) => ({ ...state, message: "", share: null }));
-        } catch (error) {
-          console.error(`Could not stop share link: ${error?.message ?? error}`);
-          setBrowserPreview((state) => ({
-            ...state,
-            share: null,
-            message: `Could not stop share link: ${error?.message ?? error}`,
-          }));
-        }
-        return;
-      }
-      setBrowserPreview((state) => ({ ...state, message: "Creating public link…" }));
-      try {
-        const share = await startShareTunnel({
-          onProgress: ({ message }) => setBrowserPreview((state) => ({ ...state, message })),
-        });
-        if (!share) return;
-        // The first thing anyone does with a share link is paste it somewhere.
-        navigator.clipboard?.writeText(share.url).catch(() => {});
-        setBrowserPreview((state) => ({
-          ...state,
-          share,
-          message: `Public link (copied to clipboard): ${share.url}`,
-        }));
-      } catch (error) {
-        console.error(`Share link failed: ${error?.message ?? error}`);
-        pushToast({ level: "error", title: "Share link failed", detail: `${error?.message ?? error}` });
-        setBrowserPreview((state) => ({
-          ...state,
-          message: `Share link failed: ${error?.message ?? error}`,
-        }));
-      }
-    } finally {
-      setShareBusy(false);
-    }
-  };
-
   const openPreviewEndpoint = async (url) => {
     try {
       await openBrowserPreviewUrl(url);
     } catch (error) {
       console.error(`Could not open preview URL ${url}: ${error?.message ?? error}`);
       navigator.clipboard?.writeText(url).catch(() => {});
-      setBrowserPreview((state) => ({
-        ...state,
-        message: `Could not open URL; copied to clipboard: ${url}`,
-      }));
+      setBrowserPreviewMessage(`Could not open URL; copied to clipboard: ${url}`);
     }
   };
 
@@ -4212,11 +4098,11 @@ export function ViewportPanel() {
             className={`toolbar-btn icon-only ${browserPreview.urls ? "active" : ""}`}
             disabled={!rootPath || browserPreview.busy}
             title={browserPreview.urls
-              ? "Stop browser preview server"
+              ? "Stop browser preview server (this project stops serving on startup too)"
               : browserPreview.message || (playing
                 ? "Stop Play mode, then build and serve it"
-                : "Build and serve on localhost and local Wi-Fi over HTTPS")}
-            onClick={launchBrowserPreview}
+                : "Build and serve on localhost and local Wi-Fi over HTTPS — stays on across editor restarts")}
+            onClick={() => toggleBrowserPreview()}
           >
             <Wifi size={13} />
           </button>
@@ -4346,22 +4232,9 @@ export function ViewportPanel() {
             </>
           )}
         </div>
-        {/* Always-rendering is the default, so the button lights up only once
-            the user has turned pausing ON — a stopped viewport is the state
-            worth advertising, since it is the one that can look like a bug. */}
-        <button
-          className={`toolbar-btn icon-only ${freezeUnfocused ? "active" : ""}`}
-          title={
-            freezeUnfocused
-              ? "Viewport pauses when another panel is focused — click to keep it always rendering"
-              : "Viewport always renders — click to pause it when another panel is focused"
-          }
-          aria-pressed={freezeUnfocused}
-          disabled={playing}
-          onClick={() => setViewportFreezeEnabled(!freezeUnfocused)}
-        >
-          <Snowflake size={14} />
-        </button>
+        {/* The unfocused-viewport pause lives in Project Settings → Editor: it
+            is a set-once machine preference, not something worth a permanent
+            seat in a toolbar you look at every minute. */}
         {playing && <span className="backend-badge playing">Playing</span>}
         {backend && <span className={`backend-badge ${backend === "WebGPU" ? "webgpu" : "webgl"}`}>{backend}</span>}
       </div>

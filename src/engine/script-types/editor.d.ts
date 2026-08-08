@@ -799,6 +799,12 @@ declare module "editor" {
       publish(): Promise<OpResult>;
       /** `lan` serves on the LAN address (with TLS), for testing on a phone. */
       preview(lan?: boolean): Promise<OpResult>;
+      /**
+       * The live, rebuild-on-every-edit server behind the viewport's Wi-Fi
+       * button. Sticky per project: one left serving serves again on the next
+       * editor launch, until it is stopped. Omit `enabled` to read the state.
+       */
+      serve(enabled?: boolean): Promise<OpResult>;
     };
 
     /**

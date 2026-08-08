@@ -76,7 +76,9 @@ defineOp({
       // trace + filter are skipped per frame while the scene has no emissive
       // meshes. Timing them anyway is useful (it says what promoting one
       // would cost) but reporting the number bare would inflate the frame.
-      const emittersLive = (sys._emitterInfos?.length ?? 0) > 0;
+      // filter(Boolean): the seat array is positional and may carry interior
+      // holes (sticky promotion) — count occupants, not slots.
+      const emittersLive = (sys._emitterInfos?.filter(Boolean).length ?? 0) > 0;
       const giShadowLive = (sys.state?.lightSlots ?? []).some((s) => (s?.giShadow?.value ?? 0) > 0);
       const skipReason = (name) => {
         if (name.startsWith("emitter") && !emittersLive) return "0 emitters";
@@ -125,7 +127,7 @@ defineOp({
           shadow: [screen.shadowWidth, screen.shadowHeight],
           emitterShadow: [screen.emitterShadowWidth, screen.emitterShadowHeight],
         },
-        emitters: sys._emitterInfos?.length ?? 0,
+        emitters: sys._emitterInfos?.filter(Boolean).length ?? 0,
         screenPassesMs: passes,
         // What the frame ACTUALLY pays — passes marked "NOT dispatched" are
         // timed for reference (what enabling them would cost) but excluded.

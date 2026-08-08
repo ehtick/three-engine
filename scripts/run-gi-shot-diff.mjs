@@ -90,7 +90,7 @@ console.log(
 console.log(`mean linear luminance ${(sumA / n).toFixed(5)} -> ${(sumB / n).toFixed(5)}  (${pct(sumA, sumB)})`);
 if (changed === 0) {
   console.log("NOTHING CHANGED — identical frames. If you expected a change: the viewport");
-  console.log("  may be frozen (the toolbar snowflake / freeze-when-unfocused), in which case");
+  console.log("  may be frozen (Project Settings → Editor → freeze unfocused viewport), in which case");
   console.log("  the capture is stale rather than the render being unchanged.");
 }
 console.log("by BASELINE brightness — the dark buckets are the indirect-only pixels:");

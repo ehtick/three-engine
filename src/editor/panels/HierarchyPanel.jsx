@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Plus, Trash2, Box, Video, Lightbulb, Sparkles, FileCode2, Package, Circle, ChevronRight, Monitor, Type, Image as ImageIcon, MousePointerClick, Rows3, ScrollText, Square, Eye, EyeOff, Play, Pause, Mountain, Spline, Search, X } from "lucide-react";
 import { useSceneStore } from "../store/sceneStore.js";
 import { useSelectionStore } from "../store/selectionStore.js";
@@ -239,6 +239,42 @@ function isParentUiScreen(parentId) {
   if (!parentId) return false;
   const entity = useSceneStore.getState().entities[parentId];
   return !!entity?.components?.uiscreen;
+}
+
+/** Shared empty set so a scene with nothing collapsed doesn't allocate. */
+const NO_COLLAPSE = new Set();
+
+/** True when the mirrored entity table holds nothing — cheaper than
+ *  `Object.keys(...).length` on a scene-sized map, and this is asked on every
+ *  render of the panel. */
+function hasNoEntities(entities) {
+  for (const _ in entities) return false;
+  return true;
+}
+
+/** The collapse set a scene with no remembered state opens with: every entity
+ *  that has children, so only top-level rows show. */
+function defaultCollapsedFor(entities) {
+  const next = new Set();
+  for (const id in entities) {
+    if (entities[id]?.childIds?.length) next.add(id);
+  }
+  return next.size ? next : NO_COLLAPSE;
+}
+
+/** Drops ids that no longer name an entity — but only when there are entities
+ *  to check against, so a mid-load empty table can never erase the set. */
+function pruneCollapsed(ids, entities) {
+  const valid = Object.keys(entities);
+  if (!valid.length || !ids.size) return ids;
+  const validSet = new Set(valid);
+  let dropped = false;
+  const next = new Set();
+  for (const id of ids) {
+    if (validSet.has(id)) next.add(id);
+    else dropped = true;
+  }
+  return dropped ? next : ids;
 }
 
 // Tauri's `dragDropEnabled` (default true, needed by the Assets panel for OS
@@ -961,15 +997,18 @@ export function HierarchyPanel() {
   const [menuOpen, setMenuOpen] = useState(false);
   const [dropHint, setDropHint] = useState(null);
   const [contextMenu, setContextMenu] = useState(null); // {x, y}
-  const [collapsedIds, setCollapsedIds] = useState(() => new Set());
+  // The collapse set and the scene it belongs to are ONE piece of state.
+  // They used to be a `useState` set beside a `useRef` key, and the two could
+  // disagree for a render: the key advanced to the freshly-loaded scene while
+  // the ids still described the previous one, and the persist effect wrote
+  // that pairing to localStorage. The scene came back fully unfolded and its
+  // remembered folding was gone — which is exactly the "forgets on every
+  // startup" symptom. Bundled, a key change and its ids can never be out of
+  // step, because they are set in the same call.
+  const [collapse, setCollapse] = useState(() => ({ key: null, ids: NO_COLLAPSE }));
   const [draggingIds, setDraggingIds] = useState([]);
   const [ghostPos, setGhostPos] = useState(null); // {x, y}
   const [searchQuery, setSearchQuery] = useState("");
-  // Track which scene this collapse state belongs to so a project switch or
-  // a new/open-scene swap loads that scene's remembered collapse set (or, if
-  // it's a brand-new scene, defaults to fully collapsed). Persisted per
-  // scene in localStorage via `hierarchyPrefs.js`.
-  const lastSceneKey = useRef(null);
 
   // Assets dropped on empty tree space spawn at the scene root.
   const treeAssetDropRef = useAssetDrop({
@@ -978,43 +1017,47 @@ export function HierarchyPanel() {
   });
 
   // Whenever the scene swaps (boot, File → Open, File → New Scene, project
-  // switch), load that scene's remembered collapse state. If the scene has
-  // never been opened in this editor, fall back to the user's stated
-  // default: every entity that has children is collapsed, so only top-level
-  // rows show. The saved set is pruned against the current entities so a
-  // stale id from a previously-deleted entity doesn't pollute localStorage.
-  useEffect(() => {
-    const sceneKey = sceneName;
-    if (lastSceneKey.current === sceneKey) return;
-    lastSceneKey.current = sceneKey;
-    const entities = useSceneStore.getState().entities;
-    const validIds = new Set(Object.keys(entities));
-    const saved = loadCollapsed(sceneKey);
-    if (saved) {
-      const next = new Set();
-      for (const id of saved) if (validIds.has(id)) next.add(id);
-      setCollapsedIds(next);
-      return;
-    }
-    const next = new Set();
-    for (const id of rootIds) {
-      if (entities[id]?.childIds?.length) next.add(id);
-    }
-    setCollapsedIds(next);
-  }, [sceneName, rootIds]);
+  // switch), adopt that scene's remembered collapse state — DURING RENDER, not
+  // in an effect. An effect runs after the browser has painted the committed
+  // tree, which is why the hierarchy used to appear fully unfolded for a frame
+  // and then snap shut. Setting state while rendering is React's supported way
+  // to adjust state to a changed input: it throws this render away and redoes
+  // it immediately, so the first tree that reaches the screen is already
+  // folded.
+  //
+  // `rootIds` is not a trigger. It changes on every hierarchy edit, and the
+  // scene name is the thing that identifies which saved set applies.
+  //
+  // A saved set is adopted the moment the name changes — it needs no entities
+  // to be correct, and waiting would risk saving over it. A *default* waits
+  // until entities exist: a scene loads its name before its contents, and
+  // "nothing here has children" recorded as the user's folding is how a fresh
+  // scene would open flat forever after.
+  const entitiesNow = useSceneStore.getState().entities;
+  const savedCollapse = collapse.key === sceneName ? null : loadCollapsed(sceneName);
+  const pendingCollapse =
+    collapse.key === sceneName || (!savedCollapse && hasNoEntities(entitiesNow))
+      ? null
+      : { key: sceneName, ids: savedCollapse ?? defaultCollapsedFor(entitiesNow) };
+  if (pendingCollapse) setCollapse(pendingCollapse);
+  const collapsedIds = (pendingCollapse ?? collapse).ids;
 
-  // Persist the collapse set whenever it changes. We prune against the
-  // current entity table so deleted ids disappear from the saved state
-  // without waiting for the next scene swap. localStorage may be unavailable
-  // (private mode / quota) — `saveCollapsed` swallows that silently.
+  /** Applies an updater to the collapse set, keeping it bound to its scene.
+   *  Returning the same set is a no-op, so callers can bail without forcing a
+   *  render and a redundant localStorage write. */
+  const setCollapsedIds = (updater) =>
+    setCollapse((prev) => {
+      const ids = typeof updater === "function" ? updater(prev.ids) : updater;
+      return ids === prev.ids ? prev : { key: prev.key, ids };
+    });
+
+  // Persist whenever the pair changes. Stale ids are dropped here rather than
+  // on load: this runs after a commit, where an empty entity table means the
+  // scene really is empty and not merely still loading.
   useEffect(() => {
-    if (lastSceneKey.current === null) return;
-    const entities = useSceneStore.getState().entities;
-    const validIds = new Set(Object.keys(entities));
-    const pruned = new Set();
-    for (const id of collapsedIds) if (validIds.has(id)) pruned.add(id);
-    saveCollapsed(lastSceneKey.current, pruned);
-  }, [collapsedIds]);
+    if (collapse.key === null) return;
+    saveCollapsed(collapse.key, pruneCollapsed(collapse.ids, useSceneStore.getState().entities));
+  }, [collapse]);
 
   // Manual pointer-driven drag (see the DRAG_THRESHOLD_PX comment above):
   // pointerdown on a row arms a session; once the pointer moves past the

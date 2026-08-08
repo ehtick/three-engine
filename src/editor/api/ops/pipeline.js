@@ -249,3 +249,35 @@ defineOp({
     return { url, dir, lan };
   },
 });
+
+defineOp({
+  name: "build.serve",
+  description:
+    "Start, stop or inspect the LIVE preview server — the one behind the Wi-Fi button in the viewport toolbar. Unlike build.preview (a one-shot static serve of the last build), this rebuilds and re-serves the project on every edit, and it is STICKY: a project left serving starts serving again the next time the editor opens, until it is stopped. Omit `enabled` to read the current state. Starting it leaves Play mode, because it exports the authored scene rather than a scene gameplay has already mutated.",
+  params: {
+    enabled: {
+      type: "boolean",
+      description: "true to start serving (and remember it for this project), false to stop (and forget it).",
+    },
+  },
+  async run({ enabled }) {
+    const preview = await import("../../browserPreview.js");
+    if (enabled !== undefined) {
+      requireProject();
+      const running = !!preview.getActiveBrowserPreview();
+      // toggleBrowserPreview flips; call it only when the ask differs from the
+      // world, so `enabled: true` twice doesn't take a running server down.
+      if (!!enabled !== running) await preview.toggleBrowserPreview();
+    }
+    const state = preview.getBrowserPreviewState();
+    return {
+      running: !!state.urls,
+      localUrl: state.urls?.localUrl ?? null,
+      lanUrl: state.urls?.lanUrl ?? null,
+      shareUrl: state.share?.url ?? null,
+      startsWithEditor: preview.isBrowserPreviewAutoStart(),
+      busy: state.busy,
+      message: state.message,
+    };
+  },
+});

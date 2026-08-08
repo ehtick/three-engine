@@ -638,6 +638,67 @@ if (!graphReady.mounted || !graphReady.numberInputs) {
   }
 }
 
+// --- 9. the unfocused-viewport pause lives in Project Settings ---------------
+
+await page.evaluate(async () => {
+  const { openPanel } = await globalThis.__importLive("/src/editor/EditorShell.jsx");
+  openPanel("projectSettings");
+});
+await wait(1500);
+
+const freezeRow = await page.evaluate(async () => {
+  const { isViewportFreezeEnabled } = await globalThis.__importLive("/src/editor/viewportFreeze.js");
+  const row = [...document.querySelectorAll(".scene-settings-panel .field-row")].find(
+    (r) => /freeze/i.test(r.querySelector(".field-label")?.textContent ?? ""),
+  );
+  const box = row?.querySelector('input[type="checkbox"]');
+  return {
+    found: !!box,
+    label: row?.querySelector(".field-label")?.textContent?.trim() ?? "",
+    checkedOnOpen: box?.checked ?? null,
+    prefOnOpen: isViewportFreezeEnabled(),
+    // The old home: a snowflake button in the viewport toolbar.
+    snowflakes: document.querySelectorAll(".viewport-panel .toolbar-btn .lucide-snowflake").length,
+  };
+});
+check("Project Settings carries the freeze-unfocused row", freezeRow.found, freezeRow.label);
+check(
+  "…checked by default — pausing an unwatched viewport is the default now",
+  freezeRow.checkedOnOpen === true && freezeRow.prefOnOpen === true,
+  JSON.stringify(freezeRow),
+);
+check("…and it is gone from the viewport toolbar", freezeRow.snowflakes === 0, `${freezeRow.snowflakes} snowflake buttons`);
+
+const freezeToggled = await page.evaluate(async () => {
+  const { isViewportFreezeEnabled, setViewportFreezeEnabled } = await globalThis.__importLive(
+    "/src/editor/viewportFreeze.js",
+  );
+  const box = [...document.querySelectorAll(".scene-settings-panel .field-row")]
+    .find((r) => /freeze/i.test(r.querySelector(".field-label")?.textContent ?? ""))
+    ?.querySelector('input[type="checkbox"]');
+  box?.click();
+  const afterClick = { pref: isViewportFreezeEnabled(), stored: localStorage.getItem("engine.viewport.freezeWhenUnfocused") };
+  // Changing it from elsewhere has to reach the checkbox too — it is a shared
+  // preference, not this panel's private state.
+  setViewportFreezeEnabled(true);
+  return { afterClick, boxAfterExternalSet: box?.checked };
+});
+await wait(200);
+check(
+  "unticking it applies immediately and persists",
+  freezeToggled.afterClick.pref === false && freezeToggled.afterClick.stored === "0",
+  JSON.stringify(freezeToggled.afterClick),
+);
+check(
+  "the checkbox follows the preference when something else changes it",
+  (await page.evaluate(
+    () =>
+      [...document.querySelectorAll(".scene-settings-panel .field-row")]
+        .find((r) => /freeze/i.test(r.querySelector(".field-label")?.textContent ?? ""))
+        ?.querySelector('input[type="checkbox"]')?.checked === true,
+  )),
+);
+
 // ---------------------------------------------------------------------------
 
 const failed = results.filter((r) => !r.ok);

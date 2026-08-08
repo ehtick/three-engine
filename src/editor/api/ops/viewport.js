@@ -263,11 +263,11 @@ defineOp({
 defineOp({
   name: "viewport.setFreezeWhenUnfocused",
   description:
-    "Toggle whether the viewport stops rendering while another panel is focused (the snowflake in the viewport toolbar). Off by default, so the viewport always renders; turn it ON only to stop a heavy scene stealing the main thread from whatever panel the user is actually working in. Omit `enabled` to just read the current setting.",
+    "Toggle whether the viewport stops rendering while another panel is focused (Project Settings → Editor → 'Freeze unfocused viewport'). ON by default, so a heavy scene doesn't steal the main thread from whatever panel the user is working in; turn it OFF before watching something run unattended, since nothing is ever focused in a headless session. Omit `enabled` to just read the current setting.",
   params: {
     enabled: {
       type: "boolean",
-      description: "true to pause an unfocused viewport, false (the default) to always render.",
+      description: "true (the default) to pause an unfocused viewport, false to always render.",
     },
   },
   run({ enabled }) {
