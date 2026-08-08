@@ -533,3 +533,97 @@ enough to justify the rebuild.
   user's measured pivots stand; SRC replaces diffuse indirect transport only.
 - **Probe anchoring from pixels without trilinear-corner insertion** — paper measured the corner
   insertion as 2× probes for little gain; sparse renormalized interpolation instead.
+
+---
+
+## 12. Phase 0 results — DONE, and two plan corrections it forced
+
+**Status:** shipped 2026-08-08, commit `5cb804d`. `npm run test:gi-src-ref` — 79 checks, green,
+~2s, no GPU. Files: `srcConfig.js` (hierarchy), `srcMath.js` (math kernel), `srcRef.js` (full CPU
+reference + brute-force MC arbiter), `scripts/run-gi-src-ref-test.mjs`.
+
+Deviation from §7: the new files live in `src/modules/gi/` directly rather than a `src/`
+subdirectory. The `src` filename prefix already disambiguates them and the old backend is being
+deleted outright (§5 moved to the front at the user's direction), so a segregating subdir would
+only add a `gi/src/srcTrace.js` path stutter. A/B baseline is a git worktree pinned at `034d8b2`
+(`../engine-gi-baseline`) instead of a live backend flag.
+
+### 12.1 The 4→1 mapping's DIRECTION (corrects §2 item 5)
+
+§2 item 5 says the parent mapping is "integer halving `(x/2, y/2)`" without saying which cascade
+the halved index addresses, and the natural reading is wrong. **Bins get FINER as the cascade index
+rises** (`|D_i| = 2·w₀²·4^i`), so:
+
+- a cascade-`c` bin consumes the **pre-average of its four finer bins at cascade `c+1`**, at Morton
+  slots `4m … 4m+3`;
+- halving your own bin index to address the level above reads a bin pointing somewhere else
+  entirely. It costs no energy, throws no error, and delivers the wrong direction's radiance.
+
+Caught by the furnace arm (bins read 0 instead of 1) and the boundary sweep (collapse to zero past
+the first interval). Post-fix the furnace is **exact** — worst `|L−1|` = 0.00e+0 in f64.
+
+This is also the concrete payoff of the Morton requirement in §2 item 9: the four children are
+contiguous *because* `morton(2i+dx, 2j+dy) = 4·morton(i,j) + dx + 2dy`, proved in the suite.
+
+### 12.2 The octahedral border is a CORRECTNESS requirement (sharpens §2 item 10)
+
+§2 item 10 records the paper's "6×6 octahedral irradiance texture + 1-texel border" as a layout
+detail. It is not — it is load-bearing, and here is the measured size of skipping it:
+
+The octahedral square's centre is +Z and **all four of its corners are −Z**. Without a border, every
+bilinear tap for `n̂ = (0,0,−1)` clamps onto one interior corner texel whose own direction at 6×6 is
+`(0.236, 0.236, −0.943)` — **19.4° off axis**. The probe then reports a tilted normal's irradiance:
+**+32%** on a −Z-facing receiver, with a blue cast borrowed from the +X wall.
+
+It is an **axis-aligned** error, so an identical wall reads differently depending which way it
+faces; it does not average out, and no temporal accumulation touches it. Post-fix that receiver is
+5.8% and the pole-vs-equator penalty went **21.7pp → 2.4pp**.
+
+**How it was attributed, which is the transferable part:** the transport arm asserts **convergence**,
+not a tolerance. The error was invariant to probe spacing (29.2 → 25.5% over 4× refinement) *and* to
+angular resolution (26.9 → 25.1% over 4×), and a plateau where the model predicts convergence is a
+failure. A tolerance-based arm would have been set at 35% and shipped the bug. Add this to R13/R14:
+**for a biased estimator, gate on the refinement trend, not on an absolute number** — the absolute
+number can only ever encode today's build.
+
+### 12.3 Smaller things worth not re-deriving
+
+- **Bin cosine weights are a sub-sampled quadrature, not the cosine at the bin centre.** A c0 bin is
+  ~0.39 sr (≈40° across); one-point quadrature over that leaves an angular bias no spatial
+  refinement reaches. Because bins are equal-area in `(x,y)`, uniform sub-sampling in `(x,y)` *is*
+  the solid-angle average — no Jacobian. The table depends only on `(w, tileRes, sub)`, so on the GPU
+  it is a small read-only buffer (32 bins × 36 texels at c0), computed once.
+- **The 32-bit key stores LOD BIASED BY ONE.** Without the bias, cell `(−256,−256,−256)` at LOD 0 in
+  the primary cache packs to exactly `0` — the hashmap's EMPTY sentinel — i.e. a probe at the
+  camera's own cell that silently does not exist. Costs one of 16 LOD codes; `MAX_LODS` is 10.
+- **`lodBlend` is deliberately discontinuous at integer LOD; the SHELL WEIGHTS are continuous.**
+  Just below `lodF=1` the shells are `{LOD0:0, LOD1:1}`; just above, `{LOD1:1}` — same shell, same
+  weight. Testing `lodBlend` directly reports a 1.0 jump no pixel can see. `lodShells` /
+  `lodShellWeight` are the API and the R1 continuity gate measures those.
+- **`|D₀|=32` is not the accuracy floor** — with the border in place, w₀ 4→16 moves the worst
+  receiver only 7.6% → 9.2%. The `SRC_QUALITY.ultra` w₀=8 is cheap insurance, not a fix for
+  anything measured.
+
+### 12.4 Instrument faults, logged because they cost the most time
+
+Three arms had to be rewritten because the **instrument** was wrong, not the code — R14 in
+practice, and each is a trap the GPU phases can repeat verbatim:
+
+1. **A 1e-9 bar on f32 storage.** Tiles are `Float32Array` because the GPU atlas is; π is only
+   representable to ~6e-8 relative. The exactness claim belongs on the f64 merged bin value, not on
+   the tile.
+2. **An absolute R2-discrepancy threshold.** 256 points on 64 cells has mean 4, so a cell range of 4
+   is excellent — and my threshold of 3 failed it for no reason. The claim is "better than random";
+   the gate is a random control.
+3. **Pixel jitter that pushed samples through the walls.** A pixel outside the room is not a gbuffer
+   sample any renderer can produce, and the fixture traced it as an entry rather than an exit — so
+   the estimator was fed invalid geometry and then blamed for the result (a spurious 30%). Jitter is
+   now tangential, on the receiver's own plane.
+
+### 12.5 Next step
+
+`srcTrace.js` is extracted (geometry-only: `{hit, t, position, normal, dynObj}` — the old
+`createOccupancySceneTrace` fused trace with field-sampling hit shading, which SRC replaces). All
+existing GI suites still pass. **The §5 deletion sweep + the GISystem rewrite are the next unit of
+work**, and they are one unit: the dense transport's removal and the SRC orchestrator's arrival are
+the same edit to the same 8,326-line file.
