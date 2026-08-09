@@ -115,6 +115,37 @@ defineOp({
         // Duplicate labels (one merge per cascade level) keep their index.
         queueMs[queueMs[e.pass] === undefined ? e.pass : `${e.pass} #${queueEntries.indexOf(e)}`] = e.ms;
       }
+      // SRC probe population (opt-in via `__giSrcProbes`). Timed as ONE number
+      // rather than per-pass: the fourteen dispatches are a fixed chain whose
+      // boundaries are barriers, so the interesting question is what the chain
+      // costs, not which of two clears is slower. Its telemetry rides along
+      // because "3.1ms" and "3.1ms at load 0.94 with 900 dropped inserts" call
+      // for completely different responses.
+      let srcProbes = null;
+      if (screen.srcProbes) {
+        let srcMs = 0;
+        for (const pass of screen.srcProbes.passes) {
+          const ms = await timeOne(pass);
+          if (typeof ms === "number") srcMs += ms;
+        }
+        const stats = await screen.srcProbes.readStats(renderer);
+        srcProbes = {
+          totalMs: +srcMs.toFixed(3),
+          dispatches: screen.srcProbes.passes.length,
+          spacing0: stats.spacing0,
+          megabytes: +(stats.bytes / 1048576).toFixed(2),
+          reanchors: stats.reanchors,
+          cascades: stats.cascades.map((c) => ({
+            cascade: c.cascade,
+            live: c.live,
+            capacity: c.probeCapacity,
+            loadFactor: +c.loadFactor.toFixed(3),
+            meanProbeSteps: +c.meanProbeSteps.toFixed(2),
+            failedInserts: c.failed,
+          })),
+          note: "Produces no light yet — Phase 1 populates probes, Phase 2/3 make them shade.",
+        };
+      }
       // The canvas backing store IS the drawing buffer, and reading it avoids
       // both a three import and getDrawingBufferSize's Vector2 contract.
       const canvas = renderer.domElement;
@@ -132,6 +163,7 @@ defineOp({
         // What the frame ACTUALLY pays — passes marked "NOT dispatched" are
         // timed for reference (what enabling them would cost) but excluded.
         screenTotalMs: +liveTotal.toFixed(3),
+        srcProbes,
         queueMs,
         queueTotalMs: +queueEntries
           .map((e) => e.ms)

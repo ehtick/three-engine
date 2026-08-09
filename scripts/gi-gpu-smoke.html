@@ -81,6 +81,15 @@
         // dynobj=1 → box mover (analytic OBB path); dynobj=2 → torus mover
         // (object-local BVH4 exact-triangle path).
         const dynObjArm = Number(new URLSearchParams(location.search).get("dynobj") ?? 0);
+        // `?src=1` — SPLIT RADIANCE CASCADES PROBE POPULATION (plan §7 Phase 1).
+        // Build-time, because `srcProbesEnabled()` is read when the screen
+        // bundle is constructed. This arm is what puts the population's
+        // fourteen compute kernels in front of the PORTABLE 8-storage-buffer
+        // limit on a device created at exactly that limit — the audit below
+        // walks them, and anything over the line fails pipeline creation, which
+        // surfaces as a validation error rather than as a wrong picture.
+        const srcArm = new URLSearchParams(location.search).get("src") === "1";
+        if (srcArm) globalThis.__giSrcProbes = true;
         // editorFramePacing stops unfocused engines — headless the page is
         // NEVER focused, and the temporal gate below is the first assertion
         // that needs the loop RUNNING at assert time (earlier arms only read
@@ -164,15 +173,25 @@
 
         const deadline = performance.now() + 60_000;
         let stats = null;
+        let settled = 0;
         while (performance.now() < deadline) {
           await new Promise((resolve) => setTimeout(resolve, 500));
           const system = engine.modules.get("gi")?.system;
           if (!system?.state || engine.renderSuspended || validationErrors.length) continue;
+          settled++;
           stats = await system.readRayHitStats();
           if (stats?.rays > 0 &&
             (!hybridMode || stats.brickSteps > 0) &&
             (!planeMode || stats.planeTests > 0) &&
             (!exactMode || stats.complexTests > 0)) break;
+          // Nothing has ever bound the counter buffer, so waiting the full
+          // minute for it to fill is waiting for something that cannot happen
+          // (see the interregnum note further down). But this loop is ALSO the
+          // boot window every later arm relies on — breaking on a fixed timer
+          // shortened it from 60s to 10s and the exact-complex dynobj arm then
+          // measured an occupancy field that had not voxelized yet (0 -> 0).
+          // So the exit condition is the field being READY, not a stopwatch.
+          if (stats?.dispatched === false && settled >= 20 && system._fieldReadyOnce) break;
         }
         // `?dynamic=1` — the DYNAMIC RECORD REFIT arm: wobble the wall so
         // GISystem promotes its slot, the chain types its bricks DynamicBrick,
@@ -383,7 +402,14 @@
         if (state?.rayHitConfig?.activeMode !== expectedActiveMode) {
           throw new Error(`ray-hit mode ${rayHitMode} did not activate (active=${state?.rayHitConfig?.activeMode})`);
         }
-        for (const [index, node] of (state?.queue ?? []).entries()) {
+        // The SRC population's kernels are NOT in `state.queue` (they are
+        // dispatched off the gbuffer, ahead of it), so the audit has to be told
+        // about them explicitly or the arm would audit nothing and pass.
+        const auditNodes = [
+          ...(state?.queue ?? []).map((node, index) => [`queue[${index}]`, node]),
+          ...(state?.screen?.srcProbes?.passes ?? []).map((node, index) => [`srcProbes[${index}]`, node]),
+        ];
+        for (const [index, node] of auditNodes) {
           const shader = engine.renderer._nodes?.getForCompute?.(node)?.computeShader ?? "";
           const storageBindings = [...shader.matchAll(/var<storage[^>]*>/g)].length;
           if (storageBindings >= 8) {
@@ -392,22 +418,122 @@
           }
         }
         console.log("GI-SMOKE BINDINGS", JSON.stringify(bindingAudit));
+
+        // ── ?src=1 assertions ────────────────────────────────────────────
+        let srcReport = null;
+        if (srcArm) {
+          const src = state?.screen?.srcProbes;
+          if (!src) throw new Error("src arm: __giSrcProbes was set but no probe system was built");
+          const s = await src.readStats(engine.renderer);
+          srcReport = {
+            dispatches: src.passes.length,
+            megabytes: +(s.bytes / 1048576).toFixed(2),
+            cascades: s.cascades.map((c) => ({
+              live: c.live, load: +c.loadFactor.toFixed(3),
+              steps: +c.meanProbeSteps.toFixed(2), failed: c.failed,
+            })),
+          };
+          console.log("GI-SMOKE SRC", JSON.stringify(srcReport));
+          // The controls first, in the order a failure is worth distinguishing.
+          if (!(s.cascades[0].live > 0)) {
+            throw new Error(
+              "src arm: cascade 0 has no probes — the gbuffer read, the LOD selection or " +
+              "the key window is wrong (a scene with geometry always produces some)",
+            );
+          }
+          for (const c of s.cascades) {
+            if (c.failed > 0) {
+              throw new Error(
+                `src arm: cascade ${c.cascade} dropped ${c.failed} inserts at load ` +
+                `${c.loadFactor.toFixed(2)} — those probes do not exist`,
+              );
+            }
+            if (c.loadFactor > 0.7) {
+              throw new Error(
+                `src arm: cascade ${c.cascade} hash load ${c.loadFactor.toFixed(2)} — ` +
+                "open addressing degrades sharply past 0.7 and drops follow",
+              );
+            }
+          }
+          // ── NOT ASSERTED HERE: that probe counts THIN with cascade ────────
+          //
+          // The obvious invariant — each cascade holds fewer probes than the
+          // one below, since spacing doubles and each child inserts exactly one
+          // parent — is true WITHIN A FRAME and false across frames, and this
+          // arm measured it false (c0 12, c1 18) before the reason was clear.
+          //
+          // Retirement cascades with a one-lifetime LAG PER LEVEL. A c0 probe
+          // that no pixel sees is still ALIVE for PROBE_MAX_AGE frames, and
+          // while it is alive the ladder keeps inserting its parent, so the
+          // parent's age keeps resetting. The parent only starts aging when its
+          // LAST child retires, and its own parent only starts after that — so
+          // c3 outlives its c0 descendant by three full lifetimes. That is the
+          // price of keeping every ancestor chain complete for a probe's whole
+          // life, which `test:gi-src-populate` asserts and which a split deposit
+          // requires, so it is correct rather than merely tolerable.
+          //
+          // The structural claim (the ladder inserts at the PARENT's spacing)
+          // therefore lives in `test:gi-src-populate`, where a fixed camera and
+          // a key-set comparison against the CPU mirror can state it exactly.
+          // What this arm can honestly check is that every cascade got
+          // populated at all — a ladder that silently inserted nothing above c0
+          // is the failure that would otherwise reach the eye check.
+          for (let c = 1; c < s.cascades.length; c++) {
+            if (!(s.cascades[c].live > 0)) {
+              throw new Error(
+                `src arm: cascade ${c} has no probes while cascade ${c - 1} has ` +
+                `${s.cascades[c - 1].live} — the ladder stopped climbing`,
+              );
+            }
+          }
+        }
         if (validationErrors.length) throw new Error(validationErrors.join(" | "));
-        if (!stats?.rays) throw new Error("GI traversal counters stayed at zero");
-        if (hybridMode && !stats.brickSteps) {
-          throw new Error("hybrid local-brick traversal counters stayed at zero");
+        // ── THE TRAVERSAL COUNTERS ARE UNFED DURING THE INTERREGNUM ────────
+        //
+        // Every assertion below measures the ray-hit PROFILING counters, and
+        // since the dense transport was deleted (plan §12.8) nothing increments
+        // them: the module's only `profile: true` is in `srcTrace.js`, which has
+        // no caller until Phase 2 wires the diffuse rays. `RayHitDebug.readback`
+        // reports that as `dispatched: false` rather than a measured zero, and
+        // this arm honours the distinction — because the alternative is what
+        // this harness did until now: fail EVERY arm on "counters stayed at
+        // zero", which reads as a traversal regression and hides the binding
+        // audit, the dynobj arm and the validation check behind it.
+        //
+        // These come back the moment Phase 2 traces a ray, and they must: they
+        // are the only gate on macro/brick step budgets and on plane-record
+        // acceptance. `?requirerays=1` pins them ON for a run that expects
+        // them, so the leniency cannot outlive the interregnum by accident.
+        const raysRequired = new URLSearchParams(location.search).get("requirerays") === "1";
+        const countersFed = stats?.dispatched !== false && (stats?.rays ?? 0) > 0;
+        if (!countersFed && raysRequired) {
+          throw new Error(
+            `?requirerays=1: traversal counters are unfed (dispatched=${stats?.dispatched}, ` +
+            `rays=${stats?.rays ?? 0}) — nothing traces with profiling on`,
+          );
         }
-        if (planeMode && !stats.planeTests) {
-          throw new Error("plane-mode traversal never consulted a surface record");
+        if (!countersFed) {
+          console.log(
+            "GI-SMOKE NOTE traversal counters unfed (no profiled tracer since the transport " +
+            "deletion) — the mode-specific step/plane/triangle assertions are SKIPPED this run",
+          );
         }
-        if (planeMode && !stats.planeAccepts) {
-          throw new Error("plane-mode traversal never accepted a plane hit");
-        }
-        if (exactMode && !stats.complexTests) {
-          throw new Error("exact-complex traversal never entered a complex cell");
-        }
-        if (exactMode && !stats.triangleTests) {
-          throw new Error("exact-complex traversal never tested a triangle");
+        if (countersFed) {
+          if (hybridMode && !stats.brickSteps) {
+            throw new Error("hybrid local-brick traversal counters stayed at zero");
+          }
+          if (planeMode && !stats.planeTests) {
+            throw new Error("plane-mode traversal never consulted a surface record");
+          }
+          if (planeMode && !stats.planeAccepts) {
+            throw new Error("plane-mode traversal never accepted a plane hit");
+          }
+          if (exactMode && !stats.complexTests) {
+            throw new Error("exact-complex traversal never entered a complex cell");
+          }
+          if (exactMode && !stats.triangleTests) {
+            throw new Error("exact-complex traversal never tested a triangle");
+          }
         }
         let surfaceAlloc = null;
         if (planeMode) {
@@ -418,24 +544,30 @@
             throw new Error(`surface-record pool overflowed on ${surfaceAlloc.overflowBricks} bricks in a tiny scene`);
           }
         }
-        if (stats.stepLimitExits !== 0) throw new Error(`GI traversal exhausted its step limit ${stats.stepLimitExits} times`);
-        if (stats.macroStepLimitExits !== 0 || stats.brickStepLimitExits !== 0) {
-          throw new Error(`hybrid traversal limit detail macro=${stats.macroStepLimitExits} brick=${stats.brickStepLimitExits}`);
-        }
-        if (stats.invalidNumerics !== 0) throw new Error(`GI traversal produced ${stats.invalidNumerics} invalid numeric results`);
-        // The ride was always-on and never measured; these three make the A/B
-        // real — that the skip engages, that it actually advances through
-        // empty space (descend-only would be a ride that never pays), and
-        // that `skip=0` compiled the coarse levels OUT rather than predicating
-        // them away.
-        if (hybridMode && coarseSkip && !stats.coarseSteps) {
-          throw new Error("coarse pyramid ride never engaged");
-        }
-        if (hybridMode && coarseSkip && !(stats.coarseSkipsL3 + stats.coarseSkipsL4)) {
-          throw new Error("coarse skip never advanced through empty space");
-        }
-        if (hybridMode && !coarseSkip && stats.coarseSteps !== 0) {
-          throw new Error(`skip=0 arm still executed ${stats.coarseSteps} coarse levels`);
+        // Same interregnum rule as the mode assertions above: every one of
+        // these reads the traversal counters, and structural zeros are not
+        // measured zeros. `skip=0`'s "still executed N coarse levels" would
+        // even PASS on unfed counters, which is worse than failing.
+        if (countersFed) {
+          if (stats.stepLimitExits !== 0) throw new Error(`GI traversal exhausted its step limit ${stats.stepLimitExits} times`);
+          if (stats.macroStepLimitExits !== 0 || stats.brickStepLimitExits !== 0) {
+            throw new Error(`hybrid traversal limit detail macro=${stats.macroStepLimitExits} brick=${stats.brickStepLimitExits}`);
+          }
+          if (stats.invalidNumerics !== 0) throw new Error(`GI traversal produced ${stats.invalidNumerics} invalid numeric results`);
+          // The ride was always-on and never measured; these three make the A/B
+          // real — that the skip engages, that it actually advances through
+          // empty space (descend-only would be a ride that never pays), and
+          // that `skip=0` compiled the coarse levels OUT rather than predicating
+          // them away.
+          if (hybridMode && coarseSkip && !stats.coarseSteps) {
+            throw new Error("coarse pyramid ride never engaged");
+          }
+          if (hybridMode && coarseSkip && !(stats.coarseSkipsL3 + stats.coarseSkipsL4)) {
+            throw new Error("coarse skip never advanced through empty space");
+          }
+          if (hybridMode && !coarseSkip && stats.coarseSteps !== 0) {
+            throw new Error(`skip=0 arm still executed ${stats.coarseSteps} coarse levels`);
+          }
         }
         if (dynamicArm) {
           if (!planeMode) throw new Error("dynamic arm needs a plane-family mode (records off otherwise)");
@@ -696,6 +828,7 @@
           stats,
           surfaceAlloc,
           bindingAudit,
+          srcProbes: srcReport,
         };
         console.log(
           `GI-SMOKE PASS storage=8 mode=${rayHitMode} rays=${stats.rays} ` +

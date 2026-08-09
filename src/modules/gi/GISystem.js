@@ -33,6 +33,7 @@ import { blitBvhAtlasTiles, createGiBvhReflect, createGiBvhTarget, createGiEmitt
 import { resolveMaterialSurface, serializeMeshForBake } from "./voxelizeOnce.js";
 import { createSrcVolume } from "./srcVolume.js";
 import { createSrcDistanceView, createSrcOccupancyView } from "./srcDebugViews.js";
+import { createSrcProbeSystem, describeSrcProbeSystem, formatSrcProbeFrame, srcProbesEnabled } from "./srcSystem.js";
 import { createOccupancyField, describeOccupancyField, quantizeOccupancyRes } from "./occupancyField.js";
 import { BVH_STRATEGY, buildStaticSceneBvhWords, classifyDynamicShape, composeFieldDynamics, createDynamicObjectSet, dynHeaderWords, giMobilityOf, giTraceOf } from "./dynamicObjects.js";
 import { fitPrimitive } from "./primitiveFit.js";
@@ -1319,6 +1320,26 @@ export class GISystem {
       renderGiGBuffer(renderer, this.engine.scene, this.engine.camera, state.screen.gbuffer, {
         mirrorMask: wantsMirrorMask,
       });
+      // [A] → [B]: probe population reads the gbuffer that was just rendered,
+      // so it goes here and nowhere else. Ahead of every other compute for the
+      // same reason the gbuffer is ahead of the resolve — this is the frame's
+      // first consumer of this frame's geometry.
+      //
+      // NOT in `state.queue`: that queue is rate-gated, idle-skipped and
+      // freeze-bisected, and every one of those would be wrong here. Skipping
+      // population on an idle frame ages every probe toward retirement while
+      // the camera sits still, which is the opposite of what idle means.
+      if (state.screen.srcProbes) {
+        const reanchored = state.screen.srcProbes.syncCamera(this.engine.camera);
+        if (reanchored && state.screen.srcProbes.reanchorCount > 1) {
+          console.log(
+            `[gi] src probes: re-anchored (#${state.screen.srcProbes.reanchorCount}) — ` +
+            "every probe re-keys, which retires it; positions are unchanged",
+          );
+        }
+        giCompute(renderer, state.screen.srcProbes.passes);
+        this.#maybeLogSrcProbeStats(renderer, state);
+      }
       // BVH exact-reflection prepass: dispatched right after the gbuffer,
       // EVERY frame it's enabled — independent of the atlas-revision
       // composite gating above/below (that gating is about the SDF field
@@ -2934,7 +2955,29 @@ export class GISystem {
       // smearing white dots across the dark silhouette in front of it.
       light.giPositionNode = this._giShadowPosNode;
       light.giScreenTexel = this._giLightShadowTexel;
-      return { gbuffer, resolve, lightShadowPass, lightShadowFilterPass, lightShadowWidePass, lightShadowWidePass2, lightShadowHistoryPass, lightShadowPostPass, emitterShadowPass, emitterShadowFilterPass, emitterShadowHistoryPass, emitterShadowPostPass, targets, width, height, shadowWidth: shadowW, shadowHeight: shadowH, emitterShadowWidth: emitterW, emitterShadowHeight: emitterH, ...inputs };
+      // ── SRC PROBE POPULATION (plan §7 Phase 1) ────────────────────────────
+      // Opt-in via `__giSrcProbes`, and it will stay that way until Phase 6:
+      // the population produces no light yet (the diffuse indirect term is
+      // absent — §12.8), so enabling it by default would cost GPU time and
+      // change nothing on screen, while making every existing probe's numbers
+      // incomparable with the ones already recorded in §12.
+      //
+      // It hangs off the SCREEN bundle rather than off `state` because it is a
+      // pure function of the gbuffer: same lifetime, same resize, same dispose.
+      let srcProbes = null;
+      if (srcProbesEnabled()) {
+        try {
+          srcProbes = createSrcProbeSystem({
+            gbuffer, width, height, props: this.component?.props ?? null,
+          });
+          console.log(describeSrcProbeSystem(srcProbes));
+        } catch (error) {
+          // Never take the shipping chain down for an experimental branch.
+          console.warn("[gi] src probes unavailable:", error?.message ?? error);
+          srcProbes = null;
+        }
+      }
+      return { gbuffer, srcProbes, resolve, lightShadowPass, lightShadowFilterPass, lightShadowWidePass, lightShadowWidePass2, lightShadowHistoryPass, lightShadowPostPass, emitterShadowPass, emitterShadowFilterPass, emitterShadowHistoryPass, emitterShadowPostPass, targets, width, height, shadowWidth: shadowW, shadowHeight: shadowH, emitterShadowWidth: emitterW, emitterShadowHeight: emitterH, ...inputs };
     } catch (error) {
       // Falling back to the in-material path keeps GI working (slowly) rather
       // than rendering an unlit scene.
@@ -2986,6 +3029,10 @@ export class GISystem {
     screen.shadowWidth = shadowW;
     screen.shadowHeight = shadowH;
     screen.gbuffer.setSize(width, height);
+    // The probe population is one thread per gbuffer pixel and its dispatch
+    // counts are baked into the compute nodes, so a resize rebuilds it. Returns
+    // a NEW system and disposes the old one — the assignment is the point.
+    if (screen.srcProbes) screen.srcProbes = screen.srcProbes.setSize(width, height);
     // New targets at the new size; the persistent nodes are re-pointed at
     // them, which is a binding refresh rather than a shader rebuild (every
     // observed material has hasNode = true, so its bindings refresh per frame
@@ -3602,6 +3649,57 @@ export class GISystem {
    * filled reports a plausible wrong number rather than failing (measured 1 run in
    * 4 — see run-gi-emitter-shadow-probe.mjs). Renaming it means updating them.
    */
+  /**
+   * SRC probe telemetry (plan §8: ships with Phase 1 and is permanent).
+   *
+   * Rate-limited and NON-BLOCKING: `readSrcProbeStats` is a buffer readback, so
+   * awaiting it inside the frame loop would stall the submit it is measuring.
+   * The in-flight guard matters more than the frame interval — without it a
+   * readback that takes longer than the interval queues another every frame and
+   * the telemetry becomes the cost it is reporting.
+   *
+   * The numbers land on `this._srcProbeStats` for `profile.giPasses` and the
+   * MCP surface to read (R17), and on the console under `__giLogSrcProbes` for
+   * a person watching a scene change.
+   */
+  #maybeLogSrcProbeStats(renderer, state) {
+    const src = state.screen?.srcProbes;
+    if (!src || this._srcStatsPending) return;
+    const every = Number(globalThis.__giSrcProbeStatsEvery) || 60;
+    if (this._frame % every !== 0) return;
+    this._srcStatsPending = true;
+    src.readStats(renderer).then((stats) => {
+      this._srcStatsPending = false;
+      // A rebuild between the request and its resolution retires these numbers.
+      if (this.state !== state || state.screen?.srcProbes !== src) return;
+      this._srcProbeStats = stats;
+      if (globalThis.__giLogSrcProbes) console.log(formatSrcProbeFrame(stats));
+      // UNCONDITIONAL WARNINGS, because these are the two failures that are
+      // silent on screen. A dropped insert is a probe that does not exist —
+      // a dark patch that moves with the camera — and a load factor past 0.7
+      // is linear probing on the way to dropping them.
+      for (const c of stats.cascades) {
+        if (c.failed > 0) {
+          console.warn(
+            `[gi] src probes: cascade ${c.cascade} dropped ${c.failed} inserts ` +
+            `(${c.live}/${c.probeCapacity} probes, load ${c.loadFactor.toFixed(2)}) — ` +
+            "raise the probe capacity or s0; those probes simply do not exist",
+          );
+        } else if (c.loadFactor > 0.7 && !this._srcLoadWarned) {
+          this._srcLoadWarned = true;
+          console.warn(
+            `[gi] src probes: cascade ${c.cascade} hash load ${c.loadFactor.toFixed(2)} ` +
+            `(mean probe length ${c.meanProbeSteps.toFixed(1)}) — open addressing ` +
+            "degrades sharply past here, and drops follow",
+          );
+        }
+      }
+    }, (error) => {
+      this._srcStatsPending = false;
+      console.warn("[gi] src probe stats readback failed:", error?.message ?? error);
+    });
+  }
+
   #maybeLogStats(renderer) {
     const state = this.state;
     if (!state || state.statsLogged || !state.entries.length) return;
@@ -4829,6 +4927,9 @@ export class GISystem {
     // is still bound to them. Same rule for the BVH reflect target
     // (`_giBvhTarget`, see `#syncBvhScene`) — it is not touched here either.
     state.screen?.gbuffer?.dispose?.();
+    // Per-build like the gbuffer it reads, and unlike the resolve targets: no
+    // material is bound to a probe buffer, so nothing is stranded by this.
+    state.screen?.srcProbes?.dispose?.();
     state.light?.removeFromParent();
     for (const mesh of state.gizmos?.all ?? []) {
       mesh.removeFromParent();

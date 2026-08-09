@@ -123,9 +123,38 @@ export function createRayHitDebugBuffer({ countLegacyFallbacks = false } = {}) {
     buffer,
     resetCompute,
     recordTrace,
+    /**
+     * Counters, or a zeroed set with `dispatched: false` when no kernel has
+     * ever bound this buffer.
+     *
+     * ══ WHY THE UNDISPATCHED CASE IS HANDLED HERE AND NOT AT THE CALLER ═════
+     *
+     * These counters are only allocated on the GPU when a kernel that binds
+     * them is dispatched, and since the dense transport was deleted (plan §12.8)
+     * NOTHING does: `resetCompute` has no caller and the module's only
+     * `profile: true` is in the not-yet-wired `srcTrace.js`. `getArrayBufferAsync`
+     * on an unallocated attribute then throws `Cannot read properties of
+     * undefined (reading 'size')` from three's internals — which took down
+     * `smoke:gi-gpu` on EVERY arm, sixty seconds into a boot, with a stack
+     * naming neither GI nor the deletion that caused it.
+     *
+     * A diagnostic must not be able to do that. "Nothing fed these" is a real
+     * and currently CORRECT answer, so it is returned as data — and named, so a
+     * caller cannot mistake structural zeros for measured zeros.
+     */
     async readback(renderer) {
-      const values = new Uint32Array(await renderer.getArrayBufferAsync(buffer.value));
       const stats = {};
+      for (const name of COUNTER_NAMES) stats[name] = 0;
+      stats.averageMacroSteps = 0;
+      stats.averageBrickSteps = 0;
+      stats.hitRate = 0;
+      const allocated = !!renderer?.backend?.get?.(buffer.value)?.buffer;
+      if (!allocated) {
+        stats.dispatched = false;
+        return stats;
+      }
+      stats.dispatched = true;
+      const values = new Uint32Array(await renderer.getArrayBufferAsync(buffer.value));
       for (let i = 0; i < COUNTER_NAMES.length; i++) stats[COUNTER_NAMES[i]] = values[i] ?? 0;
       stats.averageMacroSteps = stats.rays > 0 ? stats.macroSteps / stats.rays : 0;
       stats.averageBrickSteps = stats.rays > 0 ? stats.brickSteps / stats.rays : 0;

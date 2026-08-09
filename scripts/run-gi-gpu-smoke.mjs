@@ -2,7 +2,11 @@
 // Usage: node drive-gi-gpu-smoke.mjs "<query1>" "<query2>" ...
 import puppeteer from "puppeteer-core";
 
-const base = "http://localhost:5201/scripts/gi-gpu-smoke.html";
+// `GI_SMOKE_PAGE` overrides the page — which exists so a suspected regression
+// can be A/B'd against a checked-out copy of the same harness at another
+// commit, on the same adapter, in the same session. Cross-session comparisons
+// of this smoke are not meaningful (compile waves swing several-fold).
+const base = process.env.GI_SMOKE_PAGE ?? "http://localhost:5201/scripts/gi-gpu-smoke.html";
 const arms = process.argv.slice(2);
 if (!arms.length) arms.push("?dynobj=2", "?mode=hybrid-exact-complex&dynobj=2");
 
@@ -23,6 +27,18 @@ for (const arm of arms) {
     const result = await page.evaluate("globalThis.__GI_SMOKE_RESULT__");
     if (result?.pass) {
       console.log(`PASS ${arm} — storage ${result.storageLimit}`);
+      // The `?src=1` arm's whole output is these numbers; a bare PASS would
+      // hide the probe counts and the hash load the arm exists to report.
+      if (result.srcProbes) {
+        console.log(`  src probes: ${result.srcProbes.dispatches} dispatches, ` +
+          `${result.srcProbes.megabytes}MB, ` +
+          result.srcProbes.cascades
+            .map((c, i) => `c${i} ${c.live} live/load ${c.load}/steps ${c.steps}` +
+              (c.failed ? ` FAILED ${c.failed}` : ""))
+            .join("  "));
+      }
+      const unfed = logs.find((l) => l.includes("traversal counters unfed"));
+      if (unfed) console.log(`  note: ${unfed.replace("GI-SMOKE NOTE ", "")}`);
     } else {
       failed++;
       console.error(`FAIL ${arm}:`, JSON.stringify(result).slice(0, 400));
