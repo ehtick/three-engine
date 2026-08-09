@@ -20,6 +20,7 @@ import { sharedFn } from "./giFn.js";
 import { createInstanceGrid, loopCandidates } from "./instanceGrid.js";
 import { createSparseField } from "./sparseField.js";
 import { createTrilinearRadianceSampler } from "./voxelizeOnce.js";
+import { createSrcVolume } from "./srcVolume.js";
 import { emitterSlotFactor, emitterSurfaceT } from "./giLight.js";
 import { SRC_ATLAS_SIZE } from "./surfaceCache.js";
 import { createCardRadianceSampler } from "./surfaceCacheGpu.js";
@@ -146,6 +147,35 @@ export function createGiField(bounds, res, atlas, options = {}) {
   // See createSceneTrace's note for exactly which rays moved and which did not.
   const occField = options.occupancyField ?? null;
   const rayHitMode = options.rayHitConfig?.activeMode ?? RayHitMode.OccupancyLegacy;
+  // ───────────────────────────────── §12.5 A/B SEAM: THE SHADOW ARMS' DISTANCE
+  // The two consumers below that survive the §5 deletion sweep —
+  // `createSoftShadowTrace` (`light.shadowTraceFn`, and the records-absent
+  // fallback of the GI-traced light shadows) and `createWidthProbe` (the
+  // analytic width term, on the DEFAULT path of both surviving arms) — are the
+  // only reason `distanceTexture` cannot die with the transport. `srcVolume.js`
+  // reimplements both against the occupancy oracle; this switch runs them.
+  //
+  // `__giSrcVolumeShadows` (build-time): "probe" | "trace" | "both" | unset.
+  // Separate arms on purpose, because the two consumers have different exposure
+  // — the width probe is on the shipping path and the sphere trace is mostly a
+  // fallback — so a regression must be attributable to one of them rather than
+  // to "the new shadows".
+  //
+  // IT SHARES GIFIELD'S OWN `world` BUNDLE, and that is the whole discipline of
+  // this seam: every tuned constant in both estimators (`planeCut`, `capCut`,
+  // `contactCut`, the step clamps, the fail-closed ramp) is derived from
+  // `minCell`/`capWorld`, so building a second bundle would A/B the constants
+  // and the distance source at once and no result would be attributable. The
+  // voxel-derived bundle is a SEPARATE arm — see `createSrcWorld` and the
+  // capWorld finding in `run-gi-src-volume-test.mjs`.
+  const srcShadowArm = String(globalThis.__giSrcVolumeShadows ?? "");
+  const srcArm = (which) =>
+    !!occField && (srcShadowArm === which || srcShadowArm === "both");
+  let srcVolumeCache = null;
+  const srcVolume = () => {
+    srcVolumeCache ??= createSrcVolume({ occField, world, rayHitMode });
+    return srcVolumeCache;
+  };
   // The composite's cell grid is chosen HERE, not by the pyramid (whose level-0
   // resolution is picked for tracing and is deliberately finer). Telling the
   // field about it before any graph is built is what lets the voxelizer write
@@ -646,6 +676,7 @@ export function createGiField(bounds, res, atlas, options = {}) {
     // in), and the raw global is read again so a harness that flips it AFTER
     // the config was resolved still takes effect. Default ON either way.
     createSoftShadowTrace: (lift, steps, name = undefined, stable = false) => {
+      if (srcArm("trace")) return srcVolume().createSoftShadowTrace(lift, steps, name, stable);
       const recordAware = occField?.hasSurfaceRecords === true && killSdf &&
         globalThis.__giRayHitShadowRecords !== false &&
         options.rayHitConfig?.enableShadowRecords !== false;
@@ -654,7 +685,10 @@ export function createGiField(bounds, res, atlas, options = {}) {
     // The analytic mid-field width term (docs/GI_SHADOWS_PLAN.md §5, behind
     // `__giShadowAnalyticWidth`) — see createWidthProbeFn. Each caller gets
     // its own instance; sharedFn keeps it one WGSL function per shader.
-    createWidthProbe: (name = undefined) => createWidthProbeFn(distanceTexture, world, occField, name),
+    createWidthProbe: (name = undefined) =>
+      srcArm("probe")
+        ? srcVolume().createWidthProbe(name)
+        : createWidthProbeFn(distanceTexture, world, occField, name),
     // MIRROR RAYS stay on the sphere trace deliberately. They were a voxel DDA
     // once and moved OFF it because binary cells give stair-stepped hit
     // silhouettes where continuous distance gives smooth ones — and the spec's

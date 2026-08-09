@@ -620,7 +620,11 @@ practice, and each is a trap the GPU phases can repeat verbatim:
    the estimator was fed invalid geometry and then blamed for the result (a spurious 30%). Jitter is
    now tangential, on the receiver's own plane.
 
-### 12.5 The deletion sweep is BLOCKED on a §4.2 assumption that does not hold
+### 12.5 The deletion sweep's blocker — recorded, then RESOLVED in §12.6
+
+> **Status: cleared.** The blocker below is preserved as written because its *reasoning* is the
+> thing to learn from; the premise it rests on turned out to be false, and §12.6 has the
+> measurements. Read both — the mistake is more instructive than the conclusion.
 
 `srcTrace.js` is extracted (geometry-only: `{hit, t, position, normal, dynObj}` — the old
 `createOccupancySceneTrace` fused trace with field-sampling hit shading, which SRC replaces).
@@ -667,10 +671,150 @@ distance field is allowed to die. That is a shadow-quality change, and it is sep
 must land before — the transport deletion. Note this also means the composited distance field is
 **not** pure transport machinery, which is the assumption §5's "Delete" column encodes.
 
-Order for the next session:
+### 12.6 §12.5 step 1 DONE — and the blocker's premise was false
 
-1. `srcVolume.js` + the soft-shadow A/B gate (above). Keep `giField.js` alive behind it.
-2. Then the §5 deletion + the GISystem rewrite as ONE edit — they are one unit, since the dense
-   transport's removal and the SRC orchestrator's arrival are the same edit to the same 8,326-line
-   file. Verify each step with the esbuild loop.
-3. Then Phase 1 (GPU probe population), diffed against `srcRef.js`'s mirror on a frozen frame.
+**Status:** shipped 2026-08-09. Files: `srcVolume.js` (world bundle + oracle-direct
+`createSoftShadowTrace`/`createWidthProbe`), `srcVolumeRef.js` (CPU mirror of both distance arms +
+the ground truth), `scripts/run-gi-src-volume-test.mjs` (`npm run test:gi-src-volume` — 17 checks,
+green, ~7s, no GPU). A/B seam: `__giSrcVolumeShadows = "probe" | "trace" | "both"` in `giField.js`,
+sharing giField's own `world` bundle so the arms differ in exactly one thing.
+
+#### 12.6.1 One line refutes the blocker
+
+§12.5 argued the oracle is "a staircase of voxel boxes" that cannot replace a continuous distance.
+That is true of the SDF-baking build. In the shipping build, `giField.js`'s composite is:
+
+```js
+minD.assign(occField.freeRadiusAtWorld(p, undefined, true, world.capWorld))   // giField.js:216
+```
+
+**The composited distance field IS the oracle** — resampled onto the 0.33m radiance lattice,
+quantized to fp16, read back through hardware trilinear. The two "different distance sources" are
+one function, one of them low-passed. So the question was never "can a staircase replace a smooth
+field"; it was "what does removing a blur cost". `killSdf` is `!!occField`, i.e. always on, so
+every SDF-era branch the §12.5 reasoning leaned on is unreachable code.
+
+The transferable rule: **before accepting a dependency as load-bearing, read what actually feeds
+it.** §4.2 called the oracle this consumer's "fallback"; §12.5 corrected that to "a refinement, not
+a fallback" and got closer but still wrong. It is neither — it is the *source*.
+
+#### 12.6.2 What the CPU arbiter measured
+
+Synthetic room, 64³ voxels @ 0.125m under a 24³ coarse lattice @ 0.333m (the shipped ratio); truth
+= exact distance to the nearest occupied level-0 voxel AABB, brute-forced. Every number is
+restricted to the band where the value is *used as a distance* (below `0.85·capWorld`), because
+every consumer gates saturated samples out of the estimator entirely.
+
+| | oracle-direct | composited texture |
+|---|---|---|
+| conservative in-band | **0 violations** | overshoots on 7.6% of samples |
+| …of which from a saturated corner | — | 77 samples, mean **0.64m**, max **1.86m** |
+| contact band `|d−truth|` (< 2 voxels) | **0.0178m** | 0.0411m |
+| hugging floor @ 1.5 vox | **0.0229m** | 0.0473m |
+| per-step `|Δd|`, mean / worst | 0.0040m / 0.248m | 0.0041m / 0.103m |
+| **penumbra width vs truth** (mean) | **0.185** | 0.210 |
+| penumbra closer to truth on | **524 rays** | 266 rays |
+
+- **Smoothness — the one real risk — costs 0.99× the mean step and 2.4× the worst step.** Nil.
+  The worst oracle jump is 0.248m (2 voxels), well inside the ladder's own predicted bound of
+  0.5·voxel·2^L = 1.0m, which is checked so a violation would mean a mirror bug rather than a
+  surprise.
+- **The composite is not conservative, and cannot be.** Trilinear interpolation of a 1-Lipschitz
+  function overshoots between samples (measured ≤ 0.098m, under a third of a cell — the Lipschitz
+  bound). The *large* overshoots are a different mechanism: interpolating a real distance against a
+  **saturated** neighbour blends in `capWorld` itself, so a cell a voxel from a wall reports metres
+  of free space. That is a leak the oracle structurally does not have.
+- **Whole-band `|d−truth|` marginally favours the composite (0.5375 vs 0.5571) and that is not a
+  point in its favour** — it wins on 990 samples, and it reached 67 of those by reporting more free
+  space than exists. Both arms are lower bounds, so averaging one upward moves it toward truth: the
+  blur buys mean absolute error with exactly the conservativeness it gives up. **A gate on
+  `|d−truth|` rewards the leak.** This is why the decisive arm is the estimator's *output*.
+
+#### 12.6.3 What the GPU A/B measured
+
+`run-gi-emitter-shadow-probe.mjs` — the waffle-grid instrument, chosen because its headline metrics
+*are* the failure class §12.5 predicts: `grain` is the voxel-lattice number, `leak` the seal. Reads
+back the emitterShadow texture materials sample, not a screenshot. New env `SRCVOL=probe|trace|both`,
+composes with `HATCH`.
+
+| arm | penumbraPx | grain | leak (`SLAB=1`) |
+|---|---|---|---|
+| record march + composited probe (**shipping**) | 16388 | 0.0305 | 0.2819 |
+| record march + **oracle** probe | 16601 (+1.3%) | 0.0307 (+0.7%) | 0.2819 (identical) |
+| sphere arm + composited | 11696 | 0.0162 | 0.2824 |
+| sphere arm + **oracle** | 12333 (+5.4%) | **0.0153 (−5.6%)** | 0.2836 (+0.4%) |
+
+No grain regression on the shipping path and a 5.6% grain *improvement* on the sphere arm — the
+opposite direction from the prediction. Both arms gain penumbra coverage, which is the expected sign:
+removing the composite's undershoot raises `d`, so `k·d/t` widens the soft band.
+
+**The identical leak on the probe arm is a positive result, not a dead branch** — the width probe is
+WIDTH ONLY NEVER ADMISSION, so it structurally cannot move the seal, and `grain`/`penumbraPx` both
+moved, which is the branch-ran control. (Byte-identical output = the branch never ran — the standing
+harness rule.)
+
+**Cost**, `run-gi-shadow-perf-probe.mjs` on the real project, 240 frames: GPU median
+**1.41ms → 1.56ms** (+0.15ms, +11%) for the probe arm; frame median 15.1 → 15.0ms (noise). The
+oracle is ~59 buffer fetches per tap against one texture fetch and it costs a tenth of a millisecond,
+because 12 taps × one light is not where the frame goes. Compile-wave numbers moved both directions
+(materials 9.8→17.0s, computes 37.2→34.5s) — headless wave timings are noise, per the session-15 trap.
+
+#### 12.6.4 Binding safety, checked rather than assumed
+
+`giLight.js:955` states a hard rule: the in-material emitter fallback "must never compile the
+occupancy bits buffer into fragment shaders", and that fallback (`giLight.js:1332`) uses
+`shadowTraceFn` = `createSoftShadowTrace`. So the `trace` arm looks like it violates it.
+
+It does not, and the reason matters: **the existing `createShadowTrace` already binds `bits`** — its
+refinement call `occField.freeRadiusAtWorld(p, 2, true, …)` (giField.js:1069) is unconditional under
+`killSdf`. Whatever shader compiles that trace today already has the buffer. The srcVolume arm reads
+the same buffer through the same `sharedFn`, so it adds **no new binding to any shader**. The width
+probe is the one that gains a `bits` read — and its three consumers (`#buildLightShadow`,
+`#buildEmitterRecordTrace`, the feedback compute) are all computes that already bind it; it never
+enters a material. Nothing moves against the 8-storage-buffer wall.
+
+#### 12.6.5 Two findings worth not re-deriving
+
+1. **`capWorld = 16·minCell` is 2.67× the oracle's real ceiling, and it costs a 23% false-open
+   rate.** The oracle's largest emptiness proof is `voxel · 2^(OCC_LEVELS−1)` = 16 *voxels*; the
+   consumers' `d < 0.85·capWorld` cut is sized off 16 *coarse cells*. Measured on the same scene:
+   samples reporting "open space" while truth says a wall is inside the cut fall from **23.3% → 4.1%**
+   when `capWorld` is the oracle's own ceiling, and the saturated-corner smear falls from 1.86m to
+   0.35m max. `createSrcWorld(bounds, null, occField)` derives it that way and the CPU suite runs both
+   settings end to end. Not adopted yet — it changes the width probe's reach (5.3m → 2.0m) and is
+   therefore its own A/B, not a free win to fold into this one.
+2. **The oracle is blunter than the composite in the 2–8 voxel band** (hugging @3 vox: 0.203m vs
+   0.148m) and this is structural, not a bug. The near field is a 3×3×3 at level 0, so it reaches
+   ~1.5 voxels; past that the ladder's *2×2×2* blocks give bounds in [0.5, 1]·voxel·2^L, a ~1.4×
+   average and 2× worst underestimate. **The fix, if the mid field ever needs it:** make each ladder
+   level a 3×3×3 (bounds move to [1, 1.5]·voxel·2^L) and add the near field's AABB-gap term to it —
+   27 taps per level instead of 8. Adding the gap term to the *current* 2×2×2 buys nothing, because
+   `min(gap, inset)` is already pinned by the smaller inset. Out of scope here: it is a change to
+   `occupancyField.js` shared with the composite, the AO taps and the burial gate.
+
+#### 12.6.6 What this did NOT do
+
+- **The sphere trace is the fallback arm, not the shipping one.** The shipping default for both
+  surviving consumers is the *record march* plus the analytic width probe; `createSoftShadowTrace`
+  survives as `light.shadowTraceFn` (resolve compute, four emitter slots), the in-material emitter
+  fallback, and the records-absent light arm. §12.5 listed both consumers without this ordering — the
+  **width probe is the load-bearing one**, and it is the arm to watch.
+- No user-eye check on the real project yet (R13). The numbers say the shipping path is unchanged to
+  within 1%, so this is a confirmation step, not a gate.
+- `run-gi-rc-penumbra.mjs` is **partly broken and was not used**: two of its three arms report
+  `shadowMin ≈ lit` (39 vs 40) and the first returns `edgeWidth null`. Pre-existing, unrelated to
+  this change, and worth fixing before it is trusted as a gate again. It gained `PRESET_GLOBALS`/`TAG`
+  support in the attempt, which is inert when unset.
+
+Order from here:
+
+1. **The §5 deletion + the GISystem rewrite as ONE edit** — unblocked. They are one unit, since the
+   dense transport's removal and the SRC orchestrator's arrival are the same edit to the same
+   8,326-line file. `giField.js` keeps `distanceTexture` alive only for the debug SDF view and the
+   mirror trace at that point; the two shadow consumers move to `createSrcVolume`. Verify each step
+   with the esbuild loop.
+2. Then Phase 1 (GPU probe population), diffed against `srcRef.js`'s mirror on a frozen frame.
+3. Deferred, each with its own A/B: the `capWorld` derivation (12.6.5 #1), the ladder's 3×3×3
+   widening (12.6.5 #2), and retuning `planeCut` 3.5→2.5 voxels and the width probe's
+   `0.6·planeHeight` gate now that the undershoot those numbers fight is measurably gone
+   (`__giSrcWidthPlaneFactor` exists for it).

@@ -95,7 +95,18 @@ const moverY = Number(process.env.MOVERY ?? 0.6);
 // SOURCEANGLE — the sun's authored source angle (default 10; 0 = the user's
 // razor-sun case where any visible softness is a bug).
 const sourceAngle = Number(process.env.SOURCEANGLE ?? 10);
-const result = await page.evaluate(async ({ hatch, quality, steps, slab, sunOn, profileOn, kindSub, sunPos, floorY, emitterCounts, moverOn, moverY, sourceAngle, intermitOn, pressure, intermitMs }) => {
+// SRCVOL=probe|trace|both — THE §12.5 A/B. Routes the analytic width probe
+// and/or the sphere shadow trace through `srcVolume.js`'s occupancy-oracle
+// versions instead of the composited `distanceTexture`, which is the one change
+// the §5 deletion sweep is blocked on. This probe is the right gate for it
+// because its two headline metrics ARE the failure class the blocker predicts:
+// `grain` is the waffle-lattice number (a voxel-quantized distance etching a
+// regular pattern into the floor) and `leak` is the seal. Composes with HATCH,
+// so `SRCVOL=trace HATCH=spherearm` puts the legacy sphere arm on the oracle
+// while `SRCVOL=probe` leaves the record march's admission untouched and swaps
+// only its softness term.
+const srcVol = process.env.SRCVOL ?? "";
+const result = await page.evaluate(async ({ hatch, quality, steps, slab, sunOn, profileOn, kindSub, sunPos, floorY, emitterCounts, moverOn, moverY, sourceAngle, intermitOn, pressure, intermitMs, srcVol }) => {
   globalThis.__probeFloorY = floorY;
   globalThis.__editorKeepRendering = true;
   if (hatch === "noselfcut") globalThis.__giNoOccSelfCut = true;
@@ -106,6 +117,7 @@ const result = await page.evaluate(async ({ hatch, quality, steps, slab, sunOn, 
   if (hatch === "kind") globalThis.__giEmitterShadowKindDebug = true;
   if (hatch === "noprobe") globalThis.__giShadowAnalyticWidth = false;
   if (hatch === "tap") globalThis.__giWidthProbeDebugTap = true;
+  if (srcVol) globalThis.__giSrcVolumeShadows = srcVol;
   if (kindSub) {
     globalThis.__giShadowKindDebug =
       kindSub === 10 ? "normy" :
@@ -782,7 +794,7 @@ const result = await page.evaluate(async ({ hatch, quality, steps, slab, sunOn, 
     }
   }
   return { W, H, emitters, grain: n ? sum / n : 0, penPx: n, leak, shadowPng: toPng(img), sunKinds, rayStats, bitsProfile };
-}, { hatch, quality, steps, slab, sunOn, profileOn, kindSub, sunPos, floorY, emitterCounts, moverOn, moverY, sourceAngle, intermitOn, pressure, intermitMs });
+}, { hatch, quality, steps, slab, sunOn, profileOn, kindSub, sunPos, floorY, emitterCounts, moverOn, moverY, sourceAngle, intermitOn, pressure, intermitMs, srcVol });
 
 if (result.fail) { console.log(`FAIL: ${result.fail}`); await browser.close(); process.exit(1); }
 if (result.intermit) {
@@ -812,7 +824,7 @@ if (result.costCurve) {
 }
 writeFileSync(`scripts/gi-diag-emissive-grid-${hatch}${slab ? "-slab" : ""}${steps ? `-s${steps}` : ""}.png`, Buffer.from(result.shadowPng.split(",")[1], "base64"));
 await page.screenshot({ path: `scripts/gi-diag-emissive-grid-${hatch}-view.png` });
-console.log(`PROBE hatch=${hatch}${slab ? "+slab" : ""} q=${quality} ${result.W}x${result.H} emitters=${result.emitters} penumbraPx=${result.penPx} grain=${result.grain.toFixed(4)} leak=${result.leak == null ? "n/a" : result.leak.toFixed(4)}`);
+console.log(`PROBE hatch=${hatch}${srcVol ? `+src:${srcVol}` : ""}${slab ? "+slab" : ""} q=${quality} ${result.W}x${result.H} emitters=${result.emitters} penumbraPx=${result.penPx} grain=${result.grain.toFixed(4)} leak=${result.leak == null ? "n/a" : result.leak.toFixed(4)}`);
 if (result.sunKinds) {
   const { png, ...counts } = result.sunKinds;
   if (png) writeFileSync(`scripts/gi-diag-sun-${kindSub || "raw"}.png`, Buffer.from(png.split(",")[1], "base64"));

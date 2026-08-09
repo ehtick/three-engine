@@ -2,6 +2,12 @@
 // large radius (energy-normalized: intensity scaled by 1/r² so the flux
 // matches). The floor shadow edge behind the pillar must be SMOOTH and its
 // transition width must GROW with the lamp radius.
+//
+// `PRESET_GLOBALS` sets build-time hatches before the page loads, so this gate
+// can be run as an A/B of any shadow-path change without a second script (added
+// for the §12.5 `__giSrcVolumeShadows` arms; inert when unset, so the baseline
+// numbers are the same ones this probe has always produced). `TAG` suffixes the
+// PNG names so two arms do not overwrite each other's shots.
 import puppeteer from "puppeteer-core";
 import sharp from "sharp";
 
@@ -18,6 +24,15 @@ page.on("console", (message) => {
   if (/\[gi\]|GI-PN|pageerror/.test(text)) console.log(`${message.type()}: ${text}`);
 });
 page.on("pageerror", (error) => console.log(`pageerror: ${error.stack ?? error.message}`));
+
+const TAG = process.env.TAG ? `-${process.env.TAG}` : "";
+const presetGlobals = JSON.parse(process.env.PRESET_GLOBALS ?? "{}");
+if (Object.keys(presetGlobals).length) console.log(`GI-PN presets: ${JSON.stringify(presetGlobals)}`);
+// BEFORE load, per the hatch rule: every flag these arms use is read while the
+// GI field's graphs are built, which happens inside the first evaluate below.
+await page.evaluateOnNewDocument((G) => {
+  for (const [k, v] of Object.entries(G)) globalThis[k] = v;
+}, presetGlobals);
 
 await page.goto(url, { waitUntil: "load", timeout: 30000 });
 await page.evaluate(() => {
@@ -122,7 +137,7 @@ async function profile(tag) {
     }
     return out;
   });
-  const shot = await page.screenshot({ path: `scripts/gi-diag-penumbra-${tag}.png` });
+  const shot = await page.screenshot({ path: `scripts/gi-diag-penumbra-${tag}${TAG}.png` });
   const { data, info } = await sharp(shot).raw().toBuffer({ resolveWithObject: true });
   const profile = points.map((point) => {
     const idx = (point.py * info.width + point.px) * info.channels;
