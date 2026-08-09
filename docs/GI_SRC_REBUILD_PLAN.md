@@ -1576,3 +1576,171 @@ gizmos over Sponza and the user's game scene — closes the phase.
 
 Nothing above is wired into `GISystem.js` yet, so the shipping build is byte-identical to `dfa868f`
 and the emitter-shadow probe does not need re-running for these two commits.
+
+### 12.12 Phase 1, part 2 — the driver, the engine, and the gizmos
+
+**Status:** three commits, `8ea0d25` → `711a8e1`. Phase 1 is code-complete; the only
+thing left in it is the **user-eye check in the editor**, which none of the below substitutes for.
+New gates: `test:gi-src-populate`, `smoke:gi-gpu?src=1`. The shipping build is unchanged and this
+is measured, not argued — `run-gi-emitter-shadow-probe` reports `penumbraPx=16601 grain=0.0307`
+and the `SUN=1` arm `floorIn=12865 miss=14573`, both EXACT matches to the recorded baseline, with
+all 12 GI CPU suites green.
+
+#### 12.12.1 The frame, and what it commits to
+
+`createSrcProbeFrame` assembles [K] + [B] + [C]: hash reset, survivors re-entering with the
+indices they already have, every gbuffer pixel inserting its nearest c0 cell, then the ladder —
+each c(i−1) probe inserting its nearest c(i) probe and keeping the link. Fourteen dispatches at
+N=4 (seventeen with the pixel resolve), each boundary a real barrier: WebGPU has no device-wide
+barrier inside a dispatch, so "fusing for speed" here produces a race, not a faster kernel.
+
+- **A pixel inserts the NEAREST cell only**, not the eight trilinear corners it will later
+  interpolate over. If a later phase reports interpolation holes the fix is the gather's
+  renormalization, not more probes here.
+- **A child's world position comes from its OWN KEY.** Three fewer words per probe, and — the real
+  reason — no second source of truth that a re-anchor could desynchronize from the key.
+- **The ladder climbs in CASCADE and never in LOD.** They are orthogonal axes (spacing doubles with
+  both) and mixing them hands a probe a parent whose interval boundaries do not line up with its
+  own. §4.5 forbids cross-LOD interaction anywhere; the gate asserts it directly.
+- **`PROBE_PARENT` transiently holds the parent's HASH SLOT** between the ladder's insert and its
+  resolve, because the index does not exist until compaction has run. Documented at the field.
+
+**Measured against `srcRef.buildProbes`** on 4,980 synthetic pixels (293 invalid), camera and
+anchor both off-lattice: probes **410 → 115 → 65 → 64**, key set IDENTICAL at every cascade, every
+valid pixel on the mirror's own probe with **zero LOD-boundary ties needed**, every parent link
+right, every c0 ancestor chain reaching the top, mean probe length 1.00, and a second identical
+frame creating nothing and moving nothing.
+
+The gate uses a SYNTHETIC gbuffer on purpose: the pixel set spans every LOD ring by construction
+instead of by luck, and when the real gbuffer is wired in a failure there cannot be the population
+math. Its ring arm reports what it actually proves — the slack is half a cell diagonal and the
+cell doubles per cascade, so by c2 it admits everything; the c0 rows are load-bearing and have
+their own assertion, and the higher cascades are constrained by the ladder arm, which checks keys
+rather than radii.
+
+**`u32(-1)` IS NOT A REPRESENTABLE WGSL LITERAL**, and it took the whole ladder with it. `onSlot(i,
+int(-1))` failed `CreateShaderModule` for every ladder kernel, so cascades 1–3 stayed at zero
+probes — and nothing threw, the passes were simply skipped. The "counts match" arm would have read
+a plausible 410 → 0 → 0 → 0 if the ancestor-chain arm had not been there. Every absence in
+`srcProbes.js` is now the unsigned `SLOT_EMPTY` end to end, which is also smaller: a signed
+sentinel forces a `select` at every store and an int/uint pair at every buffer.
+
+#### 12.12.2 The engine entry, and the anchor
+
+`srcSystem.js` is §7's "one branch that early-outs into srcSystem, not tentacles" — four arguments
+in, one object out, fifteen lines in GISystem next to the gbuffer render. It goes there because
+[A] → [B] is the frame's first consumer of the frame's own geometry, and **deliberately not in
+`state.queue`**: that queue is rate-gated, idle-skipped and freeze-bisected, and skipping
+population on an idle frame ages every probe toward retirement while the camera sits still.
+
+`__giSrcProbes` is OFF by default and stays off until Phase 6. The population produces no light, so
+enabling it would cost GPU time, change nothing on screen, and make every number already in §12
+incomparable.
+
+**THE ANCHOR IS THE ONE NON-OBVIOUS PIECE.** Probe keys carry 9 bits per axis RELATIVE to a lattice
+anchor, so an anchor pinned at the world origin makes every near-camera probe unrepresentable once
+the player walks ~130 m (±254·s₀ is the real window). `packProbeKey` returns EMPTY there, correctly
+and silently, so the symptom is a scene that lights at spawn and goes flat after a walk. The anchor
+follows the camera on a **64·s₀ threshold with a 16·s₀ quantum** — never per frame, because
+re-anchoring re-keys every probe, which retires it, which is the per-frame binary flip R1 forbids.
+
+One property makes that cheap and is worth knowing before anyone tries to make re-anchoring
+cleverer: `latticeOrigin(anchor, s) = round(anchor/s)·s` is ALWAYS a multiple of s, so every lattice
+is world-aligned regardless of where the anchor sits. **Re-anchoring never MOVES a probe; it only
+renumbers it.** The cost is a lost temporal history, not a spatial pop.
+
+Telemetry ships with it and is permanent (§8) — probe counts, load factor, mean probe length,
+dropped inserts — rate-limited with an **in-flight guard**, because a readback slower than its
+interval otherwise queues another every frame and becomes the cost it reports. Surfaced on
+`profile.giPasses` and warned about unconditionally: a dropped insert is a probe that does not
+exist, and a dark patch that moves with the camera is not a symptom anyone attributes quickly.
+
+#### 12.12.3 The counts do NOT thin monotonically, and that is correct
+
+The `?src=1` arm measured c0 = 12, c1 = 18 and I wrote it up as a ladder bug before working out that
+the arm was right. Each c0 probe inserts exactly one c1 probe, so |c1| ≤ |c0| **within a frame** —
+but retirement cascades with a **one-lifetime LAG PER LEVEL**. A c0 probe no pixel sees is still
+ALIVE for `PROBE_MAX_AGE` frames, and while it is alive the ladder keeps inserting its parent, so the
+parent's age keeps resetting. The parent only begins aging when its LAST child retires, and its own
+parent only after that: c3 outlives its c0 descendant by three full lifetimes (~4 s at 60 fps and
+the default 60-frame age).
+
+That is the price of every ancestor chain staying complete for a probe's whole life — which a split
+deposit requires and `test:gi-src-populate` asserts — so it is correct rather than tolerated. The
+structural claim (the ladder inserts at the PARENT's spacing) belongs in the population gate, where
+a fixed camera and a key-set comparison can state it exactly; the smoke checks only that every
+cascade got populated at all.
+
+#### 12.12.4 `smoke:gi-gpu` WAS ALREADY BROKEN, on every arm
+
+Not caused by any of this, and worth recording because the sweep's verification list did not
+include it. The deletion sweep removed every consumer of the ray-hit profiling counters —
+`resetCompute` has no caller and the module's only `profile: true` is in the un-wired
+`srcTrace.js` — so nothing binds the counter buffer, nothing allocates it, and
+`getArrayBufferAsync` threw `Cannot read properties of undefined (reading 'size')` from three's
+internals, sixty seconds into a boot, with a stack naming neither GI nor the deletion that caused
+it. Everything after that point in the harness — the binding audit, the dynobj arm, the validation
+check — never ran.
+
+Two fixes. `RayHitDebug.readback` reports `dispatched: false` instead of throwing, because **a
+diagnostic must not be able to take down the harness that calls it**, and "nothing fed these" is a
+real and currently correct answer that has to be distinguishable from a measured zero. And the
+smoke's counter assertions are gated on the counters actually being fed, loudly noted, and pinnable
+back on with `?requirerays=1` so the leniency cannot outlive the interregnum by accident. One of
+those assertions — `skip=0`'s "still executed N coarse levels" — would have PASSED on structural
+zeros, which is the worse failure mode.
+
+A related trap of my own making, recorded because it is the same shape: breaking the harness's
+counter-wait loop on a fixed 10-second timer shortened the BOOT WINDOW every later arm relies on,
+and the exact-complex dynobj arm then measured an occupancy field that had not voxelized yet
+(0 → 0). The exit condition is `_fieldReadyOnce`, not a stopwatch. `GI_SMOKE_PAGE` now lets the
+driver point at another copy of the harness, which is how the pre-existing break was attributed on
+the same adapter in the same session.
+
+#### 12.12.5 The gizmos, and two ways to draw nothing useful
+
+`srcGizmos.js`: one InstancedMesh per cascade, hue by LOD (golden-ratio stepped, so ADJACENT LODs
+are far apart in hue — a linear ramp puts lod 3 and 4 in neighbouring greens, which is exactly
+where a boundary artifact would hide), size by the probe's own spacing, white for newborn so churn
+reads as a shimmer against a still image. Debug View → "src-probes".
+
+The vertex stage reads the probe table directly rather than reading it back: 2.5 MB per frame at a
+realistic probe count, and a readback makes the view lag the membership churn it exists to show.
+Positions come from `srcMathTsl`'s own `keyCell`/`latticeOrigin`/`cellPosition` — the functions the
+population inserts with — and the gizmos share the population's anchor UNIFORM rather than a copy.
+A gizmo that re-derived either would be a second definition of where a probe is, and the first
+thing it would do is disagree silently.
+
+**Zero coverage and total coverage are the same failure.** The arm renders the same frame twice
+into an offscreen target, gizmos hidden then shown, and requires the images to differ AND to differ
+on less than 90% of pixels:
+
+- *Nothing drew*: a NaN `positionNode`, a collapsed radius, or — the real trap — instance matrices
+  left uninitialized. `positionNode` places every instance but three applies the instance matrix on
+  top, and an unset `InstancedMesh` matrix array is ZEROS, which collapses every sphere to the
+  origin and looks exactly like a bug in the population. They are explicitly set to identity.
+- *Everything drew*: the first run reported **9216 of 9216 pixels**. Radius was proportional to
+  probe spacing with no ceiling, and at cascade 3 / LOD 8 the spacing is ~900 m — a 125-metre ball
+  around the camera. An overlay that paints the whole frame hides the scene it annotates and passes
+  a did-anything-draw test. Radius is now capped at an ANGULAR size, keeping near probes
+  proportional (the LOD-ring reading the view is for) while distant ones settle into dots.
+  Coverage 9216 → **24 of 9216**.
+
+Also: `readRenderTargetPixelsAsync`'s sixth argument is the TEXTURE INDEX, not an output buffer,
+and the pixels are the return value. Passing a `Uint8Array` there throws "Invalid value used as
+weak map key" from inside three, which names nothing.
+
+#### 12.12.6 Where Phase 1 stands
+
+Code-complete. `smoke:gi-gpu?src=1` reports 17 dispatches, 1.12 MB, probes 13/10/10/10 at hash
+loads ≤ 0.005 with zero dropped inserts, gizmos at 24/9216 pixels, and the whole population inside
+the **portable 8-storage-buffer limit** with no validation errors — on both default modes.
+
+Outstanding, and it is the one thing the harness cannot do: **a person switching Debug View to
+"src-probes" over Sponza and over the emissive-projectile game, with `__giSrcProbes = true` set
+before the module builds, and judging the rings in motion.** [[gi-harness-viewport-traps]] is why
+that has to be a person: both existing debug views discard nearly every pixel in the headless rig,
+symptom-invariant across a byte-for-byte move, so the rig is the thing that is wrong.
+
+Then Phase 2: rays, trace, deposit, c0-only resolve. `srcTrace.js` is written and unwired, which is
+also why the ray-hit counters are unfed — wiring it closes both.
