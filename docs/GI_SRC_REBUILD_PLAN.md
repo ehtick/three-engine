@@ -826,3 +826,133 @@ Order from here:
    widening (12.6.5 #2), and retuning `planeCut` 3.5→2.5 voxels and the width probe's
    `0.6·planeHeight` gate now that the undershoot those numbers fight is measurably gone
    (`__giSrcWidthPlaneFactor` exists for it).
+
+---
+
+### 12.7 The deletion sweep, part 1 — two more §5 errors of the §12.5 kind
+
+**Status:** the sweep is UNDERWAY and green, not finished. Commits on `feature/gi-src`:
+`8fa692b` (octahedral rescue), `a41924f` (oracle becomes the default shadow distance),
+`4bbd28f` (debug views rehomed, SDF view rewritten), `9d4bd5e` (surface radiance cache deleted).
+Module: **33,355 → 30,398 lines**. Every commit passes the esbuild loop, the CPU suites, and the
+emitter-shadow GPU probe.
+
+Ordered leaf-first on purpose. §12.6 called the deletion and the GISystem rewrite "ONE edit"; that
+is true of the dense transport and false of everything around it, and the leaves are where the
+surprises were. Each stage below left the tree green and the GPU numbers unchanged, so any later
+regression is attributable.
+
+#### 12.7.1 Two more delete-list entries that a consumer actually needs
+
+Same failure mode as §12.5, found the same way — reading what feeds a thing before deleting it.
+**§5's delete column is not trustworthy as written; audit each entry against its callers.**
+
+1. **`#buildEmitterRecordTrace` MUST SURVIVE.** §5 deletes it in one bullet with the "emitter
+   promotion feedback march", but they are different machinery: the feedback march is transport, and
+   this is the **record-march emitter shadow** — the shipping default for emitter shadows at pixels
+   (§12.6.6 already named it the load-bearing consumer). It depends on `volume.occupancyField`,
+   `volume.rayHitMode`, `volume.createWidthProbe` and `this._dynSet` — every one of which survives.
+   Deleting it would have silently removed the good emitter-shadow arm and left the sphere fallback.
+2. **`createMirrorTrace` is ALREADY DEAD CODE.** §12.6's own closing order justified keeping
+   `distanceTexture` alive for "the debug SDF view and the mirror trace". There is no mirror-trace
+   caller — `volume.createMirrorTrace` appears nowhere outside its own definition and two comments.
+   Mirror rays moved to the BVH path. So the SDF debug view was the *only* remaining reason, and
+   rewriting it (12.7.3) removes the last one.
+
+#### 12.7.2 The octahedral map had to be rescued before its file died
+
+`cascadeTrace.js` owns the four TSL octahedral functions, and §5's keep-list wants them (SRC's ray
+bins are the paper's equal-area cylindrical ones, but its **irradiance tiles** are octahedral). Moved
+to `srcOctahedral.js` verbatim; `cascadeTrace` imports `octahedralDirection` back rather than keeping
+a second copy, so there is exactly one definition at every point in the sweep. The comments moved
+with them because they carry measured results (the 2.73× solid-angle Jacobian, the reciprocal-cube
+weight). `run-gi-gather-invariance-test.mjs` is the arbiter for the CPU/TSL pair.
+
+#### 12.7.3 The "SDF" debug view is now a DISTANCE view, and it shows more
+
+It marched `distanceTexture` and shaded from the normal the composite mirrored into `.gba`. Both die
+with the transport, so it now sphere-traces `volume.distance` — literally the closure the shadow arms
+take, which is what keeps the standing rule true (a debug view that renders a different field than
+the traces lies about the thing it exists to show). Normal comes from six central-difference taps of
+the oracle, at the hit only. Per §12.6 this is a fidelity *gain*: no lattice resample, no fp16 step,
+and it sees the sub-voxel plane fits the records carry.
+
+`srcDebugViews.js` takes both views (the occupancy one moved byte-for-byte, which turned out to be
+the control that mattered).
+
+#### 12.7.4 Harness findings, and why four of five failures were the instrument again
+
+`run-gi-debug-views-probe.mjs` (`probe:gi-debug-views`) exists because TSL graphs build eagerly but
+WGSL only compiles when a mesh first renders, and these views start hidden — so **the bundle check
+cannot see a broken overlay shader.** It immediately caught a real bug: `MeshBasicNodeMaterial` off
+`three` instead of `three/webgpu` throws "is not a constructor" at RENDER time.
+
+Then four instrument faults, each of which reported "the overlay shader is broken":
+
+1. **`gi.props.debugProbes = mode` does nothing.** A raw props write skips the component's prop
+   accessor, so `onPropChanged` → `onComponentProp` → `#applyDebugVisibility` never fires. Use
+   `setProp`. (Generalizes to every probe that pokes a component prop.)
+2. **A full-page screenshot measures the editor's chrome.** The viewport panel is a few hundred
+   pixels of a 1000×700 page, so every arm scored 98.9% coverage at identical mean luminance whether
+   the overlay drew or not — the panel LAYOUT was the measurement.
+3. **OrbitControls owns the camera's orientation**, so writing `engine.camera.position` + `lookAt` is
+   reverted on the controls' next update and the probe aims at a room it never sees.
+   `__editorApi.viewport.setCamera(pos, target)` is the supported path and calls `orbit.update()`.
+   `src/editor/api/ops/viewport.js:187` says this in a comment. **This is the leading suspect for
+   `run-gi-rc-penumbra.mjs`'s broken arms** (§12.6.6): it aims `engine.camera` and then projects
+   world→screen through it, so it samples pixels that are not where it thinks they are. Fixing that
+   probe should start here.
+4. **Diffing a no-gizmo control against a with-gizmo arm measures the GRID** — that produced a
+   meaningless Δ=1.55 that nearly read as "the overlay works".
+
+And one structural fact worth keeping: **`viewport.screenshot` disables `EDITOR_LAYER`, and these
+overlays are on it**, so the offscreen capture is a *structurally blind* instrument for them —
+every arm's Δ is exactly 0.00 there, which looks identical to a shader that never drew.
+
+OPEN, and deliberately not gated: in the headless rig **both** views march and then discard
+essentially every pixel (the mesh is drawn — draw calls 13→15, GPU 0.7→1.5ms — and the frame moves
+by less than the temporal-accumulation noise floor). This is equally true of the occupancy view,
+which this sweep only *moved*, byte-for-byte. **Symptom-invariance across the swap puts the cause in
+the rig, not the rewrite**, so the probe gates page errors and reports the picture. Two untested
+candidates: a storage buffer read from a FRAGMENT stage (giLight.js:955 forbids exactly this for the
+occupancy bits, and these overlay materials are the one place they deliberately do it), and headless
+WebGPU. The real check is a person switching Debug View in the editor.
+
+#### 12.7.5 What the surface-cache deletion cost, and what it left
+
+Taken first because it was **default off both ways** (`__giSurfaceCache`, the `surfaceCache` prop),
+so no shipped behaviour could depend on it, and §5 files it as Phase-2 scaffold superseded by SRC's
+secondary probe cache. −2,957 lines. GPU probe **16601 / grain 0.0307 — identical** to the commit
+before it, which is the intended result for a dead default and the control that says so.
+
+Two things left standing on purpose:
+
+- **`dynamicObjects.js` keeps card-table word +23** plus `setCardTable`/`cardFrameAt`. Inert now, but
+  removing them is an `OBJ_WORDS` layout change to a SURVIVING file with its own suite
+  (`test:gi-dynobj`) — its own unit. This is precisely the "decide before more accretes on card-table
+  word +23" that §5 flags, and the decision is: it goes, but not inside this sweep.
+- giField's mover-hit shading keeps an always-taken `cached` branch where the cache lookup was,
+  rather than unwrapping a TSL `If` inside a function that dies with the file.
+
+#### 12.7.6 Pre-existing RED gates — neither caused by this sweep
+
+- **`gate:gi-gather` fails 6 cases**, identically at the pinned baseline worktree (`034d8b2`).
+  Verified by running it there, not assumed.
+- `run-gi-rc-penumbra.mjs` still reports `shadowMin ~ lit` on two arms — see 12.7.4 #3 for the likely
+  cause.
+
+Do not read either as sweep damage, and do not treat them as green either.
+
+Order from here:
+
+1. **D2+D3 as one unit: the dense transport.** `cascadeTrace.js` (trace kernels), `cascadeMerge.js`,
+   `cascadeGather.js`, `giField.js`, and with them `sparseField.js`, `instanceGrid.js` and the
+   `slotRegistry.js` atlas spine — plus the GISystem half that drives them (most of `#rebuild`, the
+   transport part of `#tick`, and the ~2,500-line adoption lifecycle). These genuinely are one edit:
+   `giField.js` no longer has a single surviving consumer (12.7.1 #2 and 12.7.3 removed the last
+   two), so it dies as a unit, and the two shadow consumers move to `createSrcVolume`.
+   The surviving chain must keep working with NO diffuse indirect until Phase 3 — the screen chain,
+   AO, reflections, emitter direct and sun shadows all stay, so `#buildScreenResolve` needs to
+   tolerate a null gather. Check that first; it is the load-bearing unknown of the whole edit.
+2. Then Phase 1 (GPU probe population), diffed against `srcRef.js` on a frozen frame.
+3. The deferred A/Bs of §12.6.5, plus `dynamicObjects`' card words (12.7.5).
