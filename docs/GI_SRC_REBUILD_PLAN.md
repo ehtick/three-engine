@@ -2213,3 +2213,130 @@ deferred Phase-1 check is the first thing to rule out if the light lands in the 
 Gates at `975cd58`: `test:gi-src-deposit` ×3, `test:gi-src-{rays,populate,ref,math,probes,volume}`,
 `smoke:gi-gpu` on all four src arms and both non-src defaults, emitter shadow probe EXACT
 (`penumbraPx=16601 grain=0.0307`).
+
+### 12.17 Phase 2 unit 4 — the screen stops being dark, and what 46% of it was hiding
+
+`aabd237`. **PHASE 2 IS COMPLETE.** `srcGather.js` shades straight from raw cascade 0 with the merge
+disabled — guide §8.3's single-level sanity check, and the first thing in this rebuild a person can
+look at and judge.
+
+#### 12.17.1 What it computes, and why that is ambient occlusion
+
+A c0 bin holds `(L, T)`. Hit shading is Phase 5, so every `L` is zero and what survives is
+`sky · T` — how much of the hemisphere can see out. §7 calls Phase 2's look "AO-like short-range
+bounce" for exactly this reason. It is not a stand-in for the algorithm; it is the algorithm with one
+term still zero, which is why it is checkable now.
+
+**The sky is `skyIntensity`/`skyColor`** — a live uniform that lost its consumer when the dense
+transport died (§12.8) and gets one back here. It **defaults to zero**, so a project that never
+touched it renders exactly as before, and the eye check needs the Sky Light slider turned up. That
+is an authored control rather than a constant invented in the renderer.
+
+#### 12.17.2 THE π MUST BE ANALYTIC, and the 1% that proved it
+
+`E = π · (cosine-weighted mean radiance over the SAMPLED bins)`. The π is the analytic hemisphere
+integral of the cosine, NOT `Σ max(0,cos)·Δω` over the bins. They are the same integral and the
+discrete form carries a quadrature error that does not cancel: the first version measured a peak of
+**3.173 against π = 3.1416**, one percent of energy invented out of 32-bin discretization.
+
+Dividing by the sampled weight and multiplying by the exact π returns `π·L` identically, whatever
+the bin count and whichever bins happened to be sampled. That is what makes the smoke's
+`peak ≤ π·sky` a real CEILING rather than a tolerance — confirmed at two sky values, **3.1414 at
+sky=1 and 6.283 at sky=2**.
+
+#### 12.17.3 Its own pass, and the screen-space consequence stated rather than hidden
+
+`createGiResolve` inlines its `gather` closure, and that kernel already carries the gbuffer, the
+emitter slots, the occupancy pyramid for AO and the BVH against the PORTABLE eight-storage-buffer
+limit. SRC's version would have added the probe table, the payload and the hash. So the gather is its
+own pass writing a half-res texture, and the resolve SAMPLES it — a texture binding is free of that
+limit. `createGiResolve` gained a `screenGather` input alongside `gather` for this.
+
+The consequence: **this gather is SCREEN-SPACE.** It answers for the pixel, not for an arbitrary
+world point, so it is wired to the primary diffuse term only and the exact-reflection hit path keeps
+its documented `gather == null` behaviour. Phase 3's position-indexed probe gather is what fixes
+that.
+
+#### 12.17.4 THE BUG, AND THE THREE WRONG GUESSES BEFORE THE COUNTER FOUND IT
+
+46% of the smoke's pixels came back with no GI. In order:
+
+1. **Probe density** — wrong. A 3.2× finer `s₀` moved the count by 8 out of 8,809. (It also
+   re-taught something worth keeping: **`s₀` barely changes probe density at distance**, because
+   `lod = floor(log2(cheb/s₀))` and `probeSpacing = s₀·2^lod` — spacing is distance-proportional by
+   design. c0 went 11 → 15 probes for a 3.2× finer lattice.)
+2. **Back-facing normals** — wrong. Adding the face-forward flip changed the count by zero.
+3. **Hemisphere coverage** — wrong, and it was the plausible one: probes are position-only, so a
+   probe shared by opposing surfaces genuinely has bins in only one hemisphere.
+
+A **one-word bad-normal counter named it in a single run**: those 8,809 pixels had a valid
+`position.w` and a **ZERO NORMAL**. They are background. Every one of them inserted a probe at the
+world origin, was handed a ray budget, fired a hemisphere of rays around `normalize(0) = NaN`, and
+gathered nothing — because `NaN > 0` is false, so every bin was skipped and R1 correctly reported
+"no information".
+
+**`position.w > 0.5` is what `createGiResolve` tests, which is exactly why it looked like the right
+test to copy. It is not sufficient.** Validity now tests BOTH channels, in `readPixel`, so the
+population, the ray budget, the deposit and the gather all inherit one definition of "this pixel is
+real". Rays dropped **19,200 → 10,391**: 46% were being fired from the origin into a NaN hemisphere,
+polluting the origin probe on the way.
+
+The general lesson is the diagnostic one. Three hypotheses cost three runs each and none was right;
+a counter that could only be true or false cost one run and was decisive. **When a symptom has
+several plausible causes, add the instrument that separates them rather than testing them in
+order.**
+
+#### 12.17.5 THE FACE-FORWARD FLIP BELONGS AT THE BOUNDARY, and the gate proved it
+
+Putting the flip inside the deposit kernel made the GPU and the CPU mirror disagree about **28% of
+bins** in `test:gi-src-deposit`. That is correct behaviour from the gate: `srcRef.js`'s
+`traceAndDeposit` takes the normal it is handed, because the flip is a GBUFFER FACT and not an
+algorithm property.
+
+Moved into `readPixel`, where the deposit's ray hemisphere and the gather's query hemisphere are the
+same vector by construction. **A flip on one side only would have each read the half of the bin
+sphere the other never filled** — which is the same failure mode as the bad normals, arriving by a
+different route.
+
+#### 12.17.6 Step exhaustion is a RATE now, and that was measured not assumed
+
+`stepLimitExits !== 0` was written for the dense backend's short INTERVAL rays. SRC's are
+full-length and hemispherical from every pixel, so a few are tangent to the surface they were born
+on by construction — and occupancyField's own note says exhaustion "leaks worst exactly where the
+DDA descends most: a light raking along a floor or wall". Those rays fail CLOSED, which is designed.
+
+What makes it a ray class and not a budget: the count is **0 or 1 in ~10,400 rays and INSENSITIVE to
+the ceiling — 1 at 192 steps, still 1 at 256.** A budget problem would clear. The bound is 0.05%,
+tight enough that a real traversal regression still trips it. (This is §12.14.2's lesson a second
+time: an assertion written against one backend outlives it and reads as a regression in the next.)
+
+#### 12.17.7 Where it landed
+
+| arm | lit | peak | contrast |
+|---|---|---|---|
+| `sky=1` hybrid-plane | 10,391 / 10,391 | 3.1414 | 0.68 |
+| `sky=1` exact-complex | 10,391 / 10,391 | 3.1414 | 0.49 |
+| `sky=2` | — | 6.283 | 0.999 |
+| `sky=0` | **0 / 10,391** | 0 | 0 |
+
+Zero empty-probe, zero wrong-hemisphere, zero bad-normal on every arm. The `sky=0` row is asserted
+too: no hit shading and no sky means genuinely no light, so a lit pixel there would be light from
+nothing.
+
+#### 12.17.8 THE OUTSTANDING EYE CHECK — THE ONLY THING PHASE 2 STILL OWES
+
+Everything above is a number. What no number here establishes is that the light lands on the
+geometry a person sees.
+
+> **`__giSrcProbes = true` before the GI module builds, Sky Light above zero, over Sponza and the
+> emissive-projectile game.** Expect an AO-shaped short-range darkening in corners and under
+> geometry, with no bounce colour (hit shading is Phase 5) and no long-range term (the merge is
+> Phase 3). A shimmer on a still camera is membership churn, not noise.
+
+**§12.13.1's deferred Phase-1 gizmo check is the first thing to rule out if the light is misplaced,
+not the last.** It has been an assumption carried forward since `711a8e1`, and this is the commit
+where a wrong lattice would finally become visible.
+
+Gates at `aabd237`: `smoke:gi-gpu` on five src arms and both non-src defaults, `test:gi-src-deposit`
+×2, `-populate`, `-math`, `-rays`, `-ref`, `-volume`. Emitter shadow probe EXACT
+(`penumbraPx=16601 grain=0.0307`).
