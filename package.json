@@ -121,6 +121,7 @@
     "test:gi-src-ref": "node scripts/run-gi-src-ref-test.mjs",
     "test:gi-src-math": "node scripts/run-gi-src-math-test.mjs",
     "test:gi-src-probes": "node scripts/run-gi-src-probes-test.mjs",
+    "test:gi-src-populate": "node scripts/run-gi-src-populate-test.mjs",
     "test:gi-src-volume": "node scripts/run-gi-src-volume-test.mjs",
     "probe:gi-debug-views": "node scripts/run-gi-debug-views-probe.mjs"
   },

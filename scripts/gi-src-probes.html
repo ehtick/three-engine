@@ -70,7 +70,7 @@
         const { SrcProbeMap } = await import("/src/modules/gi/srcRef.js");
         const P = await import("/src/modules/gi/srcProbes.js");
 
-        const { Fn, instanceIndex, instancedArray, int, uint } = TSL;
+        const { instancedArray, uint } = TSL;
 
         const renderer = new THREE.WebGPURenderer({ canvas: document.querySelector("#view") });
         await renderer.init();
@@ -133,7 +133,7 @@
         // production this closure samples the gbuffer instead, which is exactly
         // why `createInsertPass` takes a closure and not a buffer.
         const keyBuf = instancedArray(new Uint32Array(INSERTS), "uint");
-        const slotOut = instancedArray(new Int32Array(INSERTS).fill(-1), "int");
+        const slotOut = instancedArray(new Uint32Array(INSERTS).fill(P.SLOT_EMPTY), "uint");
         const probeOut = instancedArray(new Uint32Array(INSERTS).fill(P.SLOT_EMPTY), "uint");
 
         const clearPass = P.createHashClearPass(store);
@@ -141,7 +141,7 @@
         const insertPass = P.createInsertPass(
           store, 0, INSERTS,
           (i) => keyBuf.element(i),
-          (i, slot) => { slotOut.element(i).assign(int(slot)); },
+          (i, slot) => { slotOut.element(i).assign(uint(slot)); },
         );
         const compactPass = P.createCompactPass(store, 0);
         const resolvePass = P.createResolvePass(

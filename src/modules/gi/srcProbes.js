@@ -59,17 +59,40 @@ import {
   atomicLoad,
   atomicStore,
   atomicSub,
+  float,
+  floor,
   instanceIndex,
   instancedArray,
   int,
   uint,
   wgslFn,
 } from "three/tsl";
-import { CASCADE_COUNT, PROBE_MAX_AGE } from "./srcConfig.js";
+import { CASCADE_COUNT, MAX_LODS, PROBE_MAX_AGE } from "./srcConfig.js";
 import { KEY_EMPTY } from "./srcMath.js";
-import { hashKey } from "./srcMathTsl.js";
+import {
+  cellPosition,
+  chebyshev,
+  hashKey,
+  keyCell,
+  keyLod,
+  keySecondary,
+  latticeOrigin,
+  lodAtDistance,
+  nearestCell,
+  packProbeKey,
+  probeSpacing,
+} from "./srcMathTsl.js";
 
-/** No probe assigned to this hash slot yet. Not a valid index, and not 0. */
+/**
+ * "Nothing here" — no probe behind this hash slot, no hash slot for this key,
+ * no parent for this probe. Not a valid index, and deliberately not 0.
+ *
+ * EVERY absence in this file is this u32 value and never `-1`. WGSL cannot
+ * const-convert a negative literal to u32 (`u32(-1)` is a compile error, and it
+ * takes the WHOLE shader module with it), so a signed sentinel forces a
+ * `select` at every store and an `int`/`uint` pair at every buffer. One
+ * unsigned sentinel end to end costs nothing and cannot be spelled wrong.
+ */
 export const SLOT_EMPTY = 0xffffffff;
 
 /**
@@ -89,7 +112,17 @@ export const PROBE_WORDS = 8;
 export const PROBE_KEY = 0;      // the packed key this entry answers to
 export const PROBE_AGE = 1;      // frames since last seen; > PROBE_MAX_AGE retires it
 export const PROBE_FLAGS = 2;    // bit0 alive, bit1 fresh (see below)
-export const PROBE_PARENT = 3;   // parent cascade's probe index, or SLOT_EMPTY
+/**
+ * The parent cascade's probe INDEX, or SLOT_EMPTY.
+ *
+ * Between the ladder's insert and its resolve this word transiently holds the
+ * parent's HASH SLOT instead, because the index does not exist until compaction
+ * has run and giving the handoff its own word would cost 4 bytes per probe
+ * across every cascade to carry a value that lives for two dispatches. Nothing
+ * reads it in that window; if anything ever needs to, it gets its own word
+ * rather than a rule about when this one is trustworthy.
+ */
+export const PROBE_PARENT = 3;
 export const PROBE_HASH = 4;     // the hash slot holding this key, for [K]
 export const PROBE_RAYS = 5;     // Alg. 3 ray count   (Phase 2)
 export const PROBE_RAYOFF = 6;   // Alg. 3 ray offset  (Phase 2)
@@ -405,10 +438,11 @@ export function createAgePass(store, cascade, { maxAge = PROBE_MAX_AGE } = {}) {
  * `keyOf` is a closure returning a packed-key node, so the same pass serves the
  * pixel scatter (key from the gbuffer) and the cascade ladder (key from the
  * child probe's own cell) without either knowing about the other. `onSlot(i,
- * hashSlotNode)` receives the absolute hash slot so the caller can remember
- * where its key landed; the PROBE INDEX is not known yet and asking for it here
- * is the race this two-pass split exists to avoid — the thread that loses the
- * CAS would have to spin until the winner allocated.
+ * hashSlotNode)` receives the absolute hash slot as a UINT — `SLOT_EMPTY` when
+ * there was no key or the insert failed — so the caller can remember where its
+ * key landed. The PROBE INDEX is not known yet and asking for it here is the
+ * race this two-pass split exists to avoid: the thread that loses the CAS would
+ * have to spin until the winner allocated.
  */
 export function createInsertPass(store, cascade, count, keyOf, onSlot = null) {
   const c = store.cascades[cascade];
@@ -420,7 +454,7 @@ export function createInsertPass(store, cascade, count, keyOf, onSlot = null) {
       // An unrepresentable cell, an invalid gbuffer pixel, or a dead child.
       // `packProbeKey` returns EMPTY for all three by design; inserting it
       // would claim the sentinel and make the whole map look full.
-      if (onSlot) onSlot(i, int(-1));
+      if (onSlot) onSlot(i, uint(SLOT_EMPTY));
       Return();
     });
     const r = hashInsertWgsl(
@@ -431,9 +465,9 @@ export function createInsertPass(store, cascade, count, keyOf, onSlot = null) {
     atomicAdd(counters.element(uint(cascade * COUNTER_WORDS + COUNTER_ATTEMPTS)), uint(1));
     If(r.x.lessThan(0), () => {
       atomicAdd(counters.element(uint(cascade * COUNTER_WORDS + COUNTER_FAILED)), uint(1));
-      if (onSlot) onSlot(i, int(-1));
+      if (onSlot) onSlot(i, uint(SLOT_EMPTY));
     }).Else(() => {
-      if (onSlot) onSlot(i, int(uint(c.hashBase).add(uint(r.x))));
+      if (onSlot) onSlot(i, uint(c.hashBase).add(uint(r.x)));
     });
   })().compute(count);
 }
@@ -499,9 +533,9 @@ export function createCompactPass(store, cascade) {
  * Resolve a remembered hash slot to a probe index. Runs after `[C]`, and it is
  * the reason `[B]` hands its caller a hash slot instead of an index.
  *
- * `slotOf(i)` returns the absolute hash slot node (or < 0), `write(i, indexNode)`
- * stores the result. `SLOT_EMPTY` means the key never got a probe — the caller
- * must treat that as "no probe", not as index 0.
+ * `slotOf(i)` returns the absolute hash slot as a UINT (`SLOT_EMPTY` for none),
+ * `write(i, indexNode)` stores the result. `SLOT_EMPTY` out means the key never
+ * got a probe — the caller must treat that as "no probe", not as index 0.
  *
  * ══ THIS PASS IS ALSO WHAT MAKES A PROBE "SEEN" ═══════════════════════════
  *
@@ -528,11 +562,11 @@ export function createResolvePass(store, count, slotOf, write, { touch = true } 
   const { hashSlot, probeTable } = store;
   return Fn(() => {
     const i = instanceIndex.toVar();
-    const h = int(slotOf(i)).toVar();
-    If(h.lessThan(0), () => {
+    const h = uint(slotOf(i)).toVar();
+    If(h.equal(uint(SLOT_EMPTY)), () => {
       write(i, uint(SLOT_EMPTY));
     }).Else(() => {
-      const p = hashSlot.element(uint(h)).toVar();
+      const p = hashSlot.element(h).toVar();
       write(i, p);
       if (touch) {
         If(p.notEqual(uint(SLOT_EMPTY)), () => {
@@ -564,6 +598,189 @@ export function createProbeLookup(store, cascade) {
       out.assign(hashSlot.element(uint(c.hashBase).add(uint(r.x))));
     });
     return out;
+  };
+}
+
+// ══════════════════════════════════════════════════════════ THE FRAME
+//
+// Steps [B] + [C] + [K] assembled: the hash resets, survivors re-enter it with
+// the indices they already have, every gbuffer pixel inserts its nearest c0
+// cell, and then the ladder walks up — each c(i−1) probe inserting its nearest
+// c(i) probe and keeping the link.
+//
+// ══ ONE PROBE PER PIXEL, NOT EIGHT ═════════════════════════════════════════
+//
+// A pixel inserts the NEAREST cell only, deliberately not the eight trilinear
+// corners it will later interpolate over. The authors measured corner insertion
+// as 2× the probes for little quality gain, and the renormalized sparse gather
+// is what makes the missing corners harmless (srcMath's `sparseGather`). If a
+// later phase reports interpolation holes, the fix is the gather's
+// renormalization, not inserting more probes here.
+//
+// ══ THE LINK IS THREE THINGS AT ONCE ═══════════════════════════════════════
+//
+// `PROBE_PARENT` is the merge's parent pointer, Alg. 3's count-propagation
+// edge, and the ancestor chain a split deposit walks. That is why it is
+// resolved once here, at population time, rather than re-derived per ray: the
+// deposit path in Phase 2 is the hottest loop in the module and a hash lookup
+// per ray per cascade would be four lookups per ray.
+
+/**
+ * Assemble one frame of probe population.
+ *
+ * @param {object} store  from `createSrcProbeStore`
+ * @param {object} options
+ * @param {Node|number} options.spacing0  s₀, the one spatial dial
+ * @param {Node} options.camera  world camera position — the LOD metric's centre
+ * @param {Node} options.anchor  the lattice origin, camera-quantized and
+ *   re-quantized only on large moves. NOT the camera: re-anchoring every frame
+ *   re-keys every probe, which is a per-frame full retirement, i.e. exactly the
+ *   binary flip R1 forbids.
+ * @param {number} options.pixelCount
+ * @param {(i: Node) => {position: Node, valid: Node}} options.readPixel
+ *   the gbuffer, as a closure. Production samples the half-res worldPos target;
+ *   the gate reads a storage buffer. Neither knows about the other.
+ */
+export function createSrcProbeFrame(store, {
+  spacing0,
+  camera,
+  anchor,
+  pixelCount,
+  readPixel,
+  maxLods = MAX_LODS,
+  maxAge = PROBE_MAX_AGE,
+} = {}) {
+  const { probeTable } = store;
+  const N = store.cascadeCount;
+
+  // Where each pixel's key landed in the hash, remembered across the [B]→[C]
+  // barrier. `SLOT_EMPTY`, not −1, for a pixel with no key.
+  const pixelHash = instancedArray(new Uint32Array(pixelCount).fill(SLOT_EMPTY), "uint");
+  /** Per-pixel c0 probe index, or SLOT_EMPTY. The output every later phase reads. */
+  const pixelProbe = instancedArray(new Uint32Array(pixelCount).fill(SLOT_EMPTY), "uint");
+
+  /** LOD, spacing and lattice origin for a world point — [B]'s whole geometry. */
+  const latticeAt = (position, cascade) => {
+    const cheb = chebyshev(position, camera).toVar();
+    // FLOOR of the fractional LOD picks the shell; the fraction is the ×0.9
+    // overlap blend and belongs to the gather, not here. A point within ~1e-6
+    // of a boundary may floor either way — see srcMathTsl's trap 3, and the
+    // population gate counts those rather than failing on them.
+    const lod = floor(lodAtDistance(cheb, spacing0, maxLods)).toVar();
+    const s = probeSpacing(cascade, lod, spacing0).toVar();
+    return { lod, spacing: s, origin: latticeOrigin(anchor, s).toVar() };
+  };
+
+  const passes = [];
+  passes.push(createHashClearPass(store));
+  for (let c = 0; c < N; c++) passes.push(createAgePass(store, c, { maxAge }));
+
+  // ── [B] cascade 0, from the gbuffer ───────────────────────────────────────
+  passes.push(createInsertPass(
+    store, 0, pixelCount,
+    (i) => {
+      const px = readPixel(i);
+      const key = uint(KEY_EMPTY).toVar();
+      If(px.valid, () => {
+        const L = latticeAt(px.position, 0);
+        const cell = nearestCell(px.position, L.origin, L.spacing).toVar();
+        // `secondary` is 0: the multibounce cache inserts into the same maps
+        // under the key's secondary bit, and it is Phase 5's caller, not this
+        // one's parameter — a flag here would be a knob nothing sets.
+        key.assign(packProbeKey(int(L.lod), uint(0), cell));
+      });
+      return key;
+    },
+    (i, slot) => { pixelHash.element(i).assign(uint(slot)); },
+  ));
+  passes.push(createCompactPass(store, 0));
+  passes.push(createResolvePass(
+    store, pixelCount,
+    (i) => pixelHash.element(i),
+    (i, probe) => { pixelProbe.element(i).assign(uint(probe)); },
+  ));
+
+  // ── the ladder ────────────────────────────────────────────────────────────
+  for (let c = 1; c < N; c++) {
+    const child = store.cascades[c - 1];
+    // A child's world position comes from its OWN KEY, not from a stored
+    // position: key → (lod, cell) → cell centre on the child lattice. Storing
+    // the position instead would be three more words per probe and a second
+    // source of truth that a re-anchor could desynchronize from the key.
+    const childPosition = (i) => {
+      const p = uint(child.probeBase).add(i).toVar();
+      const w = p.mul(PROBE_WORDS).toVar();
+      const key = probeTable.element(w.add(PROBE_KEY)).toVar();
+      const alive = probeTable.element(w.add(PROBE_FLAGS)).bitAnd(uint(FLAG_ALIVE)).notEqual(uint(0));
+      const lodI = keyLod(key).toVar();
+      const lod = float(lodI).toVar();
+      const s = probeSpacing(c - 1, lod, spacing0).toVar();
+      const origin = latticeOrigin(anchor, s).toVar();
+      return {
+        probe: p,
+        words: w,
+        alive,
+        lodI,
+        lod,
+        secondary: keySecondary(key),
+        position: cellPosition(keyCell(key), origin, s).toVar(),
+      };
+    };
+
+    passes.push(createInsertPass(
+      store, c, child.probeCapacity,
+      (i) => {
+        const ch = childPosition(i);
+        const key = uint(KEY_EMPTY).toVar();
+        If(ch.alive, () => {
+          // SAME LOD as the child. The cascade ladder climbs in cascade index,
+          // never in LOD — those are orthogonal axes (spacing doubles with
+          // both), and mixing them here would hand a probe a parent from a
+          // different shell whose interval boundaries do not line up with its
+          // own. §4.5: no cross-LOD interaction, anywhere.
+          const s = probeSpacing(c, ch.lod, spacing0).toVar();
+          const origin = latticeOrigin(anchor, s).toVar();
+          key.assign(packProbeKey(ch.lodI, ch.secondary, nearestCell(ch.position, origin, s)));
+        });
+        return key;
+      },
+      (i, slot) => {
+        probeTable.element(uint(child.probeBase).add(i).mul(PROBE_WORDS).add(PROBE_PARENT))
+          .assign(uint(slot));
+      },
+    ));
+    passes.push(createCompactPass(store, c));
+    passes.push(createResolvePass(
+      store, child.probeCapacity,
+      (i) => probeTable.element(
+        uint(child.probeBase).add(i).mul(PROBE_WORDS).add(PROBE_PARENT),
+      ),
+      (i, probe) => {
+        probeTable.element(uint(child.probeBase).add(i).mul(PROBE_WORDS).add(PROBE_PARENT))
+          .assign(uint(probe));
+      },
+    ));
+  }
+
+  return {
+    pixelProbe,
+    pixelHash,
+    passes,
+    /**
+     * Dispatch the frame in order. The order IS the algorithm — every gap
+     * between two passes is a barrier WebGPU can only express as a dispatch
+     * boundary, so a caller that batches these into one `renderer.compute([…])`
+     * call is relying on three preserving both the order and the implicit
+     * barrier between them. It does; the array form exists for callers that
+     * want to interleave GI's other queues, which GISystem does.
+     */
+    run(renderer, compute = (r, node) => r.compute(node)) {
+      for (const pass of passes) compute(renderer, pass);
+    },
+    dispose() {
+      pixelHash?.value?.dispose?.();
+      pixelProbe?.value?.dispose?.();
+    },
   };
 }
 

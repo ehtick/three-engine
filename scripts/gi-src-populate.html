@@ -1,0 +1,434 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>SRC probe population gate — createSrcProbeFrame vs buildProbes</title>
+    <style>html,body{margin:0;background:#111;color:#ddd;font:13px monospace}canvas{display:none}</style>
+  </head>
+  <body>
+    <canvas id="view" width="16" height="16"></canvas>
+    <pre id="log"></pre>
+    <script type="module">
+      // ══ THE PHASE-1 GATE, WITHOUT THE ENGINE ══════════════════════════════
+      //
+      // Plan §7 asks Phase 1 for "probe counts vs CPU mirror on a fixed camera"
+      // and "LOD rings hug surfaces at expected radii". Both are done here
+      // against a SYNTHETIC gbuffer — an array of world positions in a storage
+      // buffer — rather than against the real one, and that is strictly better
+      // for this purpose: the pixel set is chosen rather than whatever a scene
+      // happened to rasterize, it spans every LOD ring on purpose, and when the
+      // real gbuffer is wired up a failure there cannot be the population math.
+      //
+      // `srcRef.js`'s `buildProbes` is the mirror. It is compared as a KEY SET
+      // per cascade, never as an array: the GPU allocates indirection indices by
+      // `atomicAdd` in scheduler order and the mirror allocates in pixel order,
+      // so the two disagree about index assignment by construction and a gate
+      // that compared indices would fail for the wrong reason forever.
+      //
+      // ══ THE ARMS ══════════════════════════════════════════════════════════
+      //
+      //   counts    per-cascade probe count and key set vs the mirror.
+      //   pixels    every valid pixel must land on the probe whose KEY the
+      //             mirror gave it. A set match cannot see a pixel wired to the
+      //             wrong probe; this can.
+      //   ladder    every probe's parent must be the probe holding the parent
+      //             KEY the mirror computed — and the chain must reach the top
+      //             cascade unbroken, because a split deposit walks it.
+      //   rings     a probe at LOD L must sit in LOD L's shell. This is the
+      //             "rings hug surfaces at the expected radii" check, done
+      //             numerically instead of by looking at gizmos.
+      //   sameLod   a probe and its parent share a LOD. Cascade and LOD are
+      //             orthogonal axes and climbing both at once gives a probe a
+      //             parent whose interval boundaries do not line up with its
+      //             own — silent, and invisible until the merge leaks.
+      //   steady    run the same frame twice: nothing may be created the second
+      //             time. A frame that re-creates its own probes has no
+      //             temporal history at all.
+      //
+      // Run: node scripts/run-gi-src-populate-test.mjs
+      const out = document.querySelector("#log");
+      const say = (line) => { out.textContent += line + "\n"; };
+      let failures = 0;
+      const check = (label, ok, detail = "") => {
+        say(`  ${ok ? "PASS" : "FAIL"} ${label}${detail ? ` — ${detail}` : ""}`);
+        if (!ok) failures++;
+      };
+      const fail = (error) => {
+        console.error("SRC-POPULATE FAIL", error?.stack ?? error?.message ?? String(error));
+        globalThis.__SRC_POPULATE_RESULT__ = {
+          pass: false, error: error?.message ?? String(error), text: out.textContent,
+        };
+      };
+      globalThis.addEventListener("error", (event) => fail(event.error ?? event.message));
+      globalThis.addEventListener("unhandledrejection", (event) => fail(event.reason));
+
+      try {
+        const THREE = await import("three/webgpu");
+        const TSL = await import("three/tsl");
+        const cfgMod = await import("/src/modules/gi/srcConfig.js");
+        const refMath = await import("/src/modules/gi/srcMath.js");
+        const ref = await import("/src/modules/gi/srcRef.js");
+        const P = await import("/src/modules/gi/srcProbes.js");
+
+        const { instancedArray, uniform, vec3 } = TSL;
+
+        const renderer = new THREE.WebGPURenderer({ canvas: document.querySelector("#view") });
+        await renderer.init();
+        const device = renderer.backend.device;
+        const validationErrors = [];
+        device.addEventListener?.("uncapturederror", (event) => {
+          validationErrors.push(event.error?.message ?? String(event.error));
+          console.error("WebGPU validation error:", validationErrors.at(-1));
+        });
+
+        // ── the frozen camera and the synthetic gbuffer ───────────────────
+        const rng = (() => {
+          let s = 0x9e3779b9 >>> 0;
+          return () => {
+            s = (s + 0x6d2b79f5) >>> 0;
+            let t = s;
+            t = Math.imul(t ^ (t >>> 15), t | 1);
+            t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+            return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+          };
+        })();
+
+        const S0 = 0.5;
+        const CAM = [1.25, 1.6, -0.75];
+        // A deliberately NON-ZERO, non-lattice-aligned anchor. With anchor at
+        // the origin every `round(a/s)*s` is 0 and the lattice-snapping half of
+        // the geometry is never exercised — the first version of this file did
+        // that and would have passed with `latticeOrigin` returning a constant.
+        const ANCHOR = [0.37, -1.21, 2.93];
+
+        const pixels = [];
+        const addPixel = (p, n) => pixels.push({ position: p, normal: n });
+        // 1. A room: dense, clustered, many pixels per probe cell — the
+        //    contention pattern the real gbuffer produces.
+        for (let i = 0; i < 3000; i++) {
+          const u = (rng() - 0.5) * 16;
+          const v = (rng() - 0.5) * 16;
+          const face = Math.floor(rng() * 5);
+          if (face === 0) addPixel([u, -1, v], [0, 1, 0]);
+          else if (face === 1) addPixel([u, 5, v], [0, -1, 0]);
+          else if (face === 2) addPixel([-8, v * 0.4 + 1, u], [1, 0, 0]);
+          else if (face === 3) addPixel([8, v * 0.4 + 1, u], [-1, 0, 0]);
+          else addPixel([u, v * 0.4 + 1, 8], [0, 0, -1]);
+        }
+        // 2. Concentric Chebyshev shells: one band per LOD, so every ring is
+        //    populated on purpose instead of by luck. Placed just INSIDE each
+        //    boundary so the arm is about the ring and not about the tie.
+        for (let lod = 0; lod < 9; lod++) {
+          const r = S0 * Math.pow(2, lod) * 1.35;
+          for (let k = 0; k < 220; k++) {
+            const axis = Math.floor(rng() * 3);
+            const sign = rng() < 0.5 ? -1 : 1;
+            const a = (rng() * 2 - 1) * r;
+            const b = (rng() * 2 - 1) * r;
+            const p = [0, 0, 0];
+            p[axis] = sign * r;
+            p[(axis + 1) % 3] = a;
+            p[(axis + 2) % 3] = b;
+            addPixel([p[0] + CAM[0], p[1] + CAM[1], p[2] + CAM[2]], [0, 1, 0]);
+          }
+        }
+        // 3. Invalid pixels — sky, or a gbuffer texel nothing wrote. They must
+        //    produce no probe at all, and no `pixelProbe` entry.
+        const INVALID_EVERY = 17;
+        const PIXELS = pixels.length;
+        const valid = new Uint8Array(PIXELS).fill(1);
+        for (let i = 0; i < PIXELS; i += INVALID_EVERY) valid[i] = 0;
+
+        // Everything crosses to the GPU as f32, so the mirror must run on the
+        // f32 values — otherwise a pixel a hair either side of a lattice
+        // midpoint disagrees for a reason that has nothing to do with the code
+        // under test (srcMathTsl's trap 1).
+        const q = new Float32Array(1);
+        const f32 = (v) => { q[0] = v; return q[0]; };
+        for (const px of pixels) px.position = px.position.map(f32);
+
+        const positions = new Float32Array(PIXELS * 4);
+        for (let i = 0; i < PIXELS; i++) {
+          positions[i * 4] = pixels[i].position[0];
+          positions[i * 4 + 1] = pixels[i].position[1];
+          positions[i * 4 + 2] = pixels[i].position[2];
+          positions[i * 4 + 3] = valid[i];
+        }
+
+        // ── the store and the frame ───────────────────────────────────────
+        const store = P.createSrcProbeStore({ c0Probes: 16384, cascadeCount: cfgMod.CASCADE_COUNT });
+        const posBuf = instancedArray(positions, "vec4");
+        const cameraU = uniform(new THREE.Vector3(...CAM));
+        const anchorU = uniform(new THREE.Vector3(...ANCHOR));
+
+        const frame = P.createSrcProbeFrame(store, {
+          spacing0: S0,
+          camera: vec3(cameraU),
+          anchor: vec3(anchorU),
+          pixelCount: PIXELS,
+          readPixel: (i) => {
+            const t = posBuf.element(i).toVar();
+            return { position: t.xyz, valid: t.w.greaterThan(0.5) };
+          },
+        });
+
+        say(`pixels ${PIXELS} (${PIXELS - valid.reduce((a, b) => a + b, 0)} invalid)  ` +
+          `s0=${S0}  camera [${CAM}]  anchor [${ANCHOR}]`);
+        say(`store ${store.cascades.map((c) => `c${c.cascade}:${c.probeCapacity}/${c.hashCapacity}`).join(" ")}` +
+          `  ${(store.bytes / 1048576).toFixed(2)}MB`);
+        say("");
+
+        const runFrame = async () => {
+          for (const pass of frame.passes) await renderer.computeAsync(pass);
+          const [table, pp, stats] = await Promise.all([
+            renderer.getArrayBufferAsync(store.probeTable.value).then((b) => new Uint32Array(b)),
+            renderer.getArrayBufferAsync(frame.pixelProbe.value).then((b) => new Uint32Array(b)),
+            P.readSrcProbeStats(renderer, store),
+          ]);
+          const live = store.cascades.map((c) => {
+            const byKey = new Map();
+            const byIndex = new Map();
+            for (let k = 0; k < c.probeCapacity; k++) {
+              const p = c.probeBase + k;
+              const w = p * P.PROBE_WORDS;
+              if ((table[w + P.PROBE_FLAGS] & P.FLAG_ALIVE) === 0) continue;
+              const key = table[w + P.PROBE_KEY] >>> 0;
+              byKey.set(key, p);
+              byIndex.set(p, { key, parent: table[w + P.PROBE_PARENT] >>> 0 });
+            }
+            return { byKey, byIndex };
+          });
+          return { table, pixelProbe: pp, stats, live };
+        };
+
+        const gpu = await runFrame();
+
+        // ── the mirror, on the same pixels and the same camera ────────────
+        const mirrorPixels = pixels.map((px, i) => (valid[i] ? px : null)).filter(Boolean);
+        const cfg = ref.makeSrcConfig({
+          spacing0: S0, camera: CAM, anchor: ANCHOR,
+          cascadeCount: cfgMod.CASCADE_COUNT, maxLods: cfgMod.MAX_LODS,
+        });
+        const built = ref.buildProbes(cfg, mirrorPixels);
+
+        // ══ ARM 1: counts and key sets ═══════════════════════════════════
+        say("── COUNTS: probe population vs the CPU mirror, per cascade ──");
+        for (let c = 0; c < cfgMod.CASCADE_COUNT; c++) {
+          const mirrorKeys = new Set(built.cascades[c].probes.map((p) => p.key >>> 0));
+          const gpuKeys = gpu.live[c].byKey;
+          const missing = [...mirrorKeys].filter((k) => !gpuKeys.has(k));
+          const extra = [...gpuKeys.keys()].filter((k) => !mirrorKeys.has(k));
+          check(`c${c} probe count matches the mirror`,
+            gpuKeys.size === mirrorKeys.size,
+            `gpu ${gpuKeys.size} vs mirror ${mirrorKeys.size}`);
+          check(`c${c} key set matches the mirror exactly`,
+            missing.length === 0 && extra.length === 0,
+            `${missing.length} missing on the gpu, ${extra.length} the mirror does not have`);
+          check(`c${c} live counter agrees with the table`,
+            gpu.stats[c].live === gpuKeys.size,
+            `counter ${gpu.stats[c].live} vs ${gpuKeys.size} alive entries`);
+        }
+        say(`   ${P.formatSrcProbeStats(gpu.stats)}`);
+        // The plan's §4.2 prediction, measured rather than assumed: spacing
+        // doubles per cascade, so on a 2D surface manifold the probe count
+        // should fall roughly 4x per level. A cascade that does NOT shrink means
+        // the ladder is inserting at the wrong spacing.
+        say(`   probes per cascade: ${gpu.live.map((l) => l.byKey.size).join(" -> ")} ` +
+          `(plan §4.2 predicts ~/4 per level on a surface manifold)`);
+
+        // ══ ARM 2: every pixel on its own probe ══════════════════════════
+        say("");
+        say("── PIXELS: each pixel lands on the probe holding its own key ──");
+        let wrongPixel = 0;
+        let unresolved = 0;
+        let invalidLeaked = 0;
+        let lodTies = 0;
+        let mi = 0;
+        for (let i = 0; i < PIXELS; i++) {
+          if (!valid[i]) {
+            if (gpu.pixelProbe[i] !== P.SLOT_EMPTY) invalidLeaked++;
+            continue;
+          }
+          const mirrorSlot = built.pixelProbe[mi++];
+          const wantKey = built.cascades[0].probes[mirrorSlot].key >>> 0;
+          const got = gpu.pixelProbe[i];
+          if (got === P.SLOT_EMPTY) { unresolved++; continue; }
+          const gotKey = gpu.live[0].byIndex.get(got)?.key;
+          if (gotKey === wantKey) continue;
+          // A LOD-boundary tie is the ONE legitimate disagreement: the fractional
+          // LOD is a log2 and its floor can go either way within ~1e-6 of an
+          // integer. Admitted only when the reference is genuinely on a boundary
+          // AND the two keys differ by exactly one LOD — anything else is a bug.
+          const cheb = cfgMod.chebyshev(
+            pixels[i].position[0], pixels[i].position[1], pixels[i].position[2],
+            CAM[0], CAM[1], CAM[2],
+          );
+          const lodF = cfgMod.lodAtDistance(cheb, S0, cfgMod.MAX_LODS);
+          const onBoundary = Math.abs(lodF - Math.round(lodF)) < 1e-4;
+          const gu = refMath.unpackProbeKey(gotKey ?? 0);
+          const wu = refMath.unpackProbeKey(wantKey);
+          if (onBoundary && gu && wu && Math.abs(gu.lod - wu.lod) === 1) { lodTies++; continue; }
+          wrongPixel++;
+        }
+        check("no valid pixel is unresolved", unresolved === 0, `${unresolved}/${PIXELS}`);
+        check("no invalid pixel produced a probe", invalidLeaked === 0, `${invalidLeaked} leaked`);
+        check("every valid pixel resolved to the mirror's probe",
+          wrongPixel === 0, `${wrongPixel} wrong (${lodTies} LOD-boundary ties admitted)`);
+
+        // ══ ARM 3: the ladder ════════════════════════════════════════════
+        say("");
+        say("── LADDER: parent links, and the chain a split deposit walks ──");
+        for (let c = 0; c < cfgMod.CASCADE_COUNT - 1; c++) {
+          let wrongParent = 0;
+          let noParent = 0;
+          for (const [key, index] of gpu.live[c].byKey) {
+            const entry = gpu.live[c].byIndex.get(index);
+            // What the mirror says this probe's parent key should be, derived
+            // the same way the kernel derives it — from the child's own key.
+            const u = refMath.unpackProbeKey(key);
+            const sChild = cfgMod.probeSpacing(c, u.lod, S0);
+            const oChild = refMath.latticeOriginFor(ANCHOR[0], ANCHOR[1], ANCHOR[2], sChild);
+            const pos = refMath.cellPosition(u.cx, u.cy, u.cz, oChild[0], oChild[1], oChild[2], sChild);
+            const sParent = cfgMod.probeSpacing(c + 1, u.lod, S0);
+            const oParent = refMath.latticeOriginFor(ANCHOR[0], ANCHOR[1], ANCHOR[2], sParent);
+            const cellP = refMath.nearestCell(
+              pos[0], pos[1], pos[2], oParent[0], oParent[1], oParent[2], sParent,
+            );
+            const wantParentKey = refMath.packProbeKey(u.lod, u.secondary, cellP.cx, cellP.cy, cellP.cz);
+            if (entry.parent === P.SLOT_EMPTY) { noParent++; continue; }
+            const gotParentKey = gpu.live[c + 1].byIndex.get(entry.parent)?.key;
+            if (gotParentKey !== (wantParentKey >>> 0)) wrongParent++;
+          }
+          check(`c${c} -> c${c + 1} every parent link points at the right key`,
+            wrongParent === 0, `${wrongParent}/${gpu.live[c].byKey.size} wrong`);
+          check(`c${c} every probe has a parent`, noParent === 0,
+            `${noParent} probes with no parent — a broken ancestor chain drops that ray's deposit`);
+        }
+        // A c0 probe must be able to walk all the way to the top: the split
+        // deposit writes into the cascade-k probe of THIS chain, so a chain that
+        // stops early silently drops every deposit above the break.
+        let shortChains = 0;
+        for (const [, index] of gpu.live[0].byKey) {
+          let cur = index;
+          for (let c = 0; c < cfgMod.CASCADE_COUNT - 1; c++) {
+            const e = gpu.live[c].byIndex.get(cur);
+            if (!e || e.parent === P.SLOT_EMPTY) { shortChains++; break; }
+            cur = e.parent;
+          }
+        }
+        check("every c0 probe has a complete ancestor chain to the top cascade",
+          shortChains === 0, `${shortChains}/${gpu.live[0].byKey.size} chains stop early`);
+
+        // ══ ARM 4: LOD rings ═════════════════════════════════════════════
+        say("");
+        say("── RINGS: a probe at LOD L sits in LOD L's shell ──");
+        // HOW MUCH THIS ARM ACTUALLY CONSTRAINS, stated rather than implied.
+        // The slack below is half a cell diagonal, and the cell doubles per
+        // cascade — so by c2 the slack exceeds the band's own lower edge and
+        // the test admits everything. That is not a threshold to tighten: a
+        // cascade-2 probe legitimately sits up to half of a 4·s0·2^lod cell
+        // away from the surface that selected its LOD. The rows that carry
+        // weight are c0's; the higher cascades are constrained by the LADDER
+        // arm instead, which checks their positions against the mirror's exact
+        // keys rather than against a radius. `ringStrict` is the number that
+        // matters, and it is c0 only.
+        const ringRows = [];
+        let ringBad = 0;
+        let ringStrict = 0;
+        for (let c = 0; c < cfgMod.CASCADE_COUNT; c++) {
+          const perLod = new Map();
+          for (const key of gpu.live[c].byKey.keys()) {
+            const u = refMath.unpackProbeKey(key);
+            const s = cfgMod.probeSpacing(c, u.lod, S0);
+            const o = refMath.latticeOriginFor(ANCHOR[0], ANCHOR[1], ANCHOR[2], s);
+            const pos = refMath.cellPosition(u.cx, u.cy, u.cz, o[0], o[1], o[2], s);
+            const cheb = cfgMod.chebyshev(pos[0], pos[1], pos[2], CAM[0], CAM[1], CAM[2]);
+            const stat = perLod.get(u.lod) ?? { n: 0, lo: Infinity, hi: 0 };
+            stat.n++; stat.lo = Math.min(stat.lo, cheb); stat.hi = Math.max(stat.hi, cheb);
+            perLod.set(u.lod, stat);
+            // The band, with the ONE slack term that is actually justified: the
+            // probe is at a LATTICE CELL CENTRE, not at the surface point that
+            // selected the LOD, so it can sit up to half a diagonal (√3/2·s)
+            // outside its surface's band. Anything beyond that is a probe in
+            // the wrong ring.
+            const slack = s * Math.sqrt(3) * 0.5;
+            const lo = u.lod === 0 ? 0 : S0 * Math.pow(2, u.lod) - slack;
+            const hi = S0 * Math.pow(2, u.lod + 1) + slack;
+            if (cheb < lo || cheb > hi) ringBad++;
+            // c0 only: the probe is the nearest cell to the surface point that
+            // chose the LOD, so half a c0 cell diagonal is the whole budget and
+            // the band still bites.
+            if (c === 0) {
+              const r = cheb / (S0 * Math.pow(2, u.lod));
+              if (r < 1 - Math.sqrt(3) * 0.5 || r > 2 + Math.sqrt(3) * 0.5) ringStrict++;
+            }
+          }
+          for (const [lod, s] of [...perLod].sort((a, b) => a[0] - b[0])) {
+            ringRows.push(`   c${c} lod${lod}: ${String(s.n).padStart(5)} probes  ` +
+              `cheb ${s.lo.toFixed(2)}..${s.hi.toFixed(2)}m  ` +
+              `(band ${(lod === 0 ? 0 : S0 * 2 ** lod).toFixed(2)}..${(S0 * 2 ** (lod + 1)).toFixed(2)})`);
+          }
+        }
+        for (const row of ringRows.slice(0, 14)) say(row);
+        if (ringRows.length > 14) say(`   … ${ringRows.length - 14} more rows`);
+        check("c0 probes hug their LOD's shell (the arm the plan asks for)",
+          ringStrict === 0,
+          `${ringStrict}/${gpu.live[0].byKey.size} outside [0.13, 2.87]x their LOD radius`);
+        check("no probe at any cascade is outside its band by more than half a cell",
+          ringBad === 0,
+          `${ringBad} outside — NOTE this weakens to vacuous by c2, where the ` +
+          `cell diagonal exceeds the band; the ladder arm constrains those`);
+        check("more than one LOD ring is populated",
+          new Set([...gpu.live[0].byKey.keys()].map((k) => refMath.unpackProbeKey(k).lod)).size >= 6,
+          "a single-LOD run would make the ring arm vacuous");
+
+        // ══ ARM 5: a probe and its parent share a LOD ════════════════════
+        say("");
+        say("── ORTHOGONALITY: cascade climbs, LOD does not ──");
+        let lodDrift = 0;
+        for (let c = 0; c < cfgMod.CASCADE_COUNT - 1; c++) {
+          for (const [key, index] of gpu.live[c].byKey) {
+            const e = gpu.live[c].byIndex.get(index);
+            if (e.parent === P.SLOT_EMPTY) continue;
+            const pk = gpu.live[c + 1].byIndex.get(e.parent)?.key;
+            if (pk == null) continue;
+            if (refMath.unpackProbeKey(key).lod !== refMath.unpackProbeKey(pk).lod) lodDrift++;
+          }
+        }
+        check("a probe and its parent are always in the same LOD", lodDrift === 0,
+          `${lodDrift} links cross a LOD — §4.5 forbids cross-LOD interaction anywhere`);
+
+        // ══ ARM 6: the second frame creates nothing ══════════════════════
+        say("");
+        say("── STEADY STATE: the same frame twice must create nothing ──");
+        const gpu2 = await runFrame();
+        const created = gpu2.stats.reduce((a, s) => a + s.fresh, 0);
+        check("frame 2 creates no probes", created === 0,
+          `${created} fresh probes on an identical frame — the population is not idempotent`);
+        let moved = 0;
+        for (let c = 0; c < cfgMod.CASCADE_COUNT; c++) {
+          for (const [key, index] of gpu.live[c].byKey) {
+            if (gpu2.live[c].byKey.get(key) !== index) moved++;
+          }
+        }
+        check("every probe kept its index across the frame", moved === 0, `${moved} moved`);
+        check("no insert failed", gpu2.stats.every((s) => s.failed === 0),
+          gpu2.stats.map((s) => s.failed).join("/"));
+
+        if (validationErrors.length) check("no WebGPU validation errors", false, validationErrors[0]);
+
+        say("");
+        say(failures ? `gi-src-populate: ${failures} CHECKS FAILED` : "gi-src-populate: all cases PASS");
+        globalThis.__SRC_POPULATE_RESULT__ = {
+          pass: failures === 0,
+          failures,
+          probesPerCascade: gpu.live.map((l) => l.byKey.size),
+          storageLimit: device.limits.maxStorageBuffersPerShaderStage,
+          text: out.textContent,
+        };
+      } catch (error) {
+        fail(error);
+      }
+    </script>
+  </body>
+</html>
