@@ -6135,6 +6135,17 @@ export class GISystem {
    * every mover shadow is applied twice.
    */
   #moverOccluders(lightSlots) {
+    // PARKED, NOT DEAD — and nothing calls this right now. Its one consumer was
+    // the cascade gather (`createIrradianceGather`'s analytic occlusion loop),
+    // deleted with the transport, so the bundle is never created and
+    // #syncMoverOccluders early-returns every frame at zero cost. It is kept
+    // because Phase 1-3 needs exactly this the moment diffuse rays start
+    // skipping movers again: the two halves of `__giDiffuseSkipMovers` are ONE
+    // change, and shipping either alone is strictly worse than shipping neither
+    // (rays skipping movers with no analytic term back = movers cast no indirect
+    // shadow; the analytic term with rays still hitting them = every mover
+    // shadow applied twice). `giProxySpheres` and run-gi-proxy-fit-test hang off
+    // it and stay green meanwhile.
     // DEFAULT ON since 2026-08-08 (both halves flip together — see the
     // transport half's measurement note in giField's createOccupancySceneTrace).
     if (globalThis.__giDiffuseSkipMovers === false) return null;
