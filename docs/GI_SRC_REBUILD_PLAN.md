@@ -1074,3 +1074,227 @@ cutting; the count takes a minute and has been decisive every time.
    transport half of `#tick`, the ~2,500-line adoption lifecycle, and the five whole-file deletions.
    The screen chain is already ready for it (12.8.1).
 3. Then Phase 1 (GPU probe population), diffed against `srcRef.js` on a frozen frame.
+
+---
+
+### 12.9 The dense transport is GONE — what landed, and every constant it took with it
+
+**Status:** §12.8's unit is DONE, in three commits, `93a4a8e` → `25e1d09`. 30,498 → **24,634 lines**
+(33,355 at the start of the deletion sweep). Every gate green at every commit, and the emitter-shadow
+GPU probe reports `penumbraPx=16601 grain=0.0307` at all three — the same numbers as the four commits
+before them.
+
+**DIFFUSE INDIRECT IS NOW ABSENT.** Direct light, GI-traced light shadows, emitter shadows, AO and
+exact BVH reflections are live; bounce, sky and the glossy-environment term read zero. The build says
+so on its own console line, which is the point of it — "GI builds, logs happily, contributes no
+bounce" is the signature of at least three real bugs this module has shipped (a stale `backend`
+value, an empty field, an unregistered light), so the interregnum has to be distinguishable from
+them without reading the source.
+
+#### 12.9.1 What each commit did
+
+1. **`93a4a8e` — the cascades.** `cascadeTrace.js`, `cascadeMerge.js`, `cascadeGather.js` and the
+   GISystem half that drove them: the ~420-line construction chain, the transport's per-frame uniform
+   writes, the queue triplet's transport entries, the peak split, the `__giFreeze` stage bisect, the
+   probe gizmos, the trace-budget ladder. 3,401 lines.
+2. **`25e1d09` — the field.** `giField.js`, `sparseField.js`, `instanceGrid.js`; `createSrcVolume`
+   takes over as the volume provider at a ONE-LINE call site (which is what growing its spine first,
+   `1b20e93`, bought). The composite pass, the fp16 distance texture, six per-cell rgba32f buffers,
+   the instance grid, the sparse page table, the dirty-brick narrowing, `createSceneTrace` and
+   `readbackStats` all go. 2,463 lines.
+
+**The composite's removal is §12.6 confirmed by experiment rather than by argument.** §12.6 argued
+the composited `distanceTexture` WAS `freeRadiusAtWorld` resampled onto the coarse lattice and
+quantized to fp16; deleting it outright changed the probe by **zero** (`16601 / 0.0307` before and
+after). A resample was removed, not a source.
+
+`res` is passed to `createSrcVolume`, not `res: null`: the two lattices measure **3.61× apart** at
+the shipping presets and every tuned constant in the shadow estimators is expressed in coarse-cell
+units, so switching lattice and producer in one commit would make an eye-check unattributable. The
+`res: null` arm stays a separate A/B (§12.6.5).
+
+#### 12.9.2 The rule that decided what stayed: authored props park, mechanism dies
+
+Six uniforms survive with **no consumer** — `skyRadiance`, `probeSmoothing`, `bounceGain`,
+`bleedSaturation`, `temporalBlend`, `fieldSmoothing`. Each is written by `#applyLiveProps` from an
+Inspector prop that is **serialized into the user's scene**, each is mixed into `#fieldInputHash`,
+and Phase 1-3 consumes every one of them unchanged. Deleting them means deleting those writes, the
+schema entries and the saved values — and silently rewriting the user's authored numbers on the next
+save.
+
+The transport's MECHANISM uniforms went outright, because each addressed exactly one deleted kernel
+and had no authored surface to preserve: `normalLift`, `fieldShadowOff`, `shadowJitter`,
+`dynShadeAmbient`, both checkerboard parities, the cascade `intervals`, the field width probe.
+
+**The `__giFreeze` bisect's prefixes were DELETED rather than left to degrade.** `"field"`,
+`"transport"`, `"traces"` and `"merges"` named the feedback pass, the cascade traces, the merges and
+the probe integral. With none of them in the queue every cut would have silently become "run the
+whole thing" — a knob reporting success while doing nothing, which is the failure mode this module
+has paid for twice already (the coerced `c0DirRes` string; the stale `backend` value). `"all"`
+survives because it still means precisely what it says.
+
+**The queue TRIPLET survives with identical contents**, and that is deliberate: every screen pass is
+hot-swapped BY INDEX into all three arrays on resize (`#syncScreenResolveSize`, ~25 sites), and Phase
+1-3 gives them different contents again. Collapsing them means rewriting that path twice.
+
+#### 12.9.3 THE TUNING, transcribed — because these were measured, several against user reports
+
+Re-deriving any of this is strictly more expensive than reading it. Phase 1-3 should **re-tune from
+these numbers, not from scratch.**
+
+**Cascade geometry** (`cascadeTrace.js`)
+- `cascadeCount = min(6, max(2, props.cascadeCount || 5))`; `c0Grid` = volume size / probeSpacing per
+  axis, clamped to `MAX_PROBE_AXIS`.
+- `BRANCH = __giCascadeBranch ?? 2`. Interval *n* has length `t0·BRANCH^n`, starting at
+  `t0·(BRANCH^n − 1)/(BRANCH − 1)`. Footprint/spacing scales as `BRANCH/4` per level, i.e. it is
+  constant ONLY at `BRANCH = 4` — and 4 was A/B'd on the bleed rig and rejected. Ship 2.
+- `t0 = probeSpacing`, `farT = 2 × the longest volume axis`. Both were rescaled by the STRETCH refit;
+  Phase 1-3 must restore that, because moving the lattice without moving the ray lengths silently
+  changes what each level covers.
+- `c0DirRes = props.c0DirRes === 2 ? 2 : 4`, with `__giC0DirRes` clamped to a power of two in [2, 16].
+  **The `=== 2` is strict on purpose.** The user's Sponza stores `c0DirRes: "2"` — a STRING, an
+  Inspector serialization artifact — so that scene has always rendered at 4. Adding `Number()` here
+  (tried 2026-08-07, reverted the same hour) makes the stale value take effect: 4 directions on the
+  whole sphere, visibly flat and bright. A knob that was silently IGNORED becoming silently HONOURED
+  is the same class of regression as the reverse.
+- At `c0DirRes = 4` there are 16 texels on the whole sphere, so on the bleed rig the floor→panel
+  direction stays inside ONE texel across the entire 3–10 m fit window: the applied cosine freezes at
+  0.3162 while the true energy-weighted cosine decays as ~1/d. That is a bent EXPONENT, not a
+  brightness error — forward model predicts −2.095 against measured −2.18 (analytic −2.718).
+
+**Gather / merge / probe** (`cascadeGather.js`, `cascadeMerge.js`)
+- `gatherBias = 0.5`, `gatherViewBias = 0.5` (fractions of a probe cell, normal and toward-camera).
+  User-eye-tuned on their Sponza, 2026-08-03, as the closest match to the Blender reference for
+  curved receivers. `__giGatherBias` / `__giGatherViewBias`; 0/0 = the unbiased cage.
+- `probeSnapAlpha = 0.35` (adaptive-hysteresis snap; 0 = the old fixed-alpha EMA).
+  `depthMomentsAlpha = 0.12` (visibility integrator; 1 = this frame only).
+  `probeNoiseAlpha = 0.25`.
+- `BURIED_PROBE_WEIGHT = 0.02` — non-zero on purpose; a hard zero produced visible blotch/scallop.
+- `DEFAULT_VIS_TOL_RADIAL = 1.75`, `DEFAULT_VIS_TOL_ANGULAR = 0`,
+  `LEGACY_RADIAL_QUANT_VOXELS = 1`, `HYBRID_RADIAL_QUANT_VOXELS = 2.6e-5`. The merge's
+  `DEFAULT_MERGE_VIS_TOLERANCE` was the same 1.75 — the radial/angular split is ONE contract across
+  the merge, the resolve gather and the feedback gather, and all three must size their tolerance off
+  the same trace medium (`rayHitConfig.activeMode`, never `props.rayHitMode` — `"auto"` is not a mode).
+- `fieldSmoothing = 0.95`, user-confirmed live 2026-08-03; **squared under the peak split**, so the
+  per-run retain covers two frames and the time constant does not move.
+
+**Trace budgets, per quality** — the three that died were `feedback` 18/24/32/40,
+`feedbackEmitter` 8/10/14/20, `feedbackEmitterMacro` 16/20/28/40 (low/medium/high/ultra), overridable
+via `__giFieldEmitterSteps` / `__giFieldEmitterMacroSteps`. `shadow` 24/32/44/56 SURVIVES (the
+emitter shadow trace still uses it). `mirror` 32/40/56/64 was already dead.
+- **The emitter march is the scene's steepest per-object cost: 0.73 ms per live emitter** at a
+  128×32×128 volume, linear in count, because every occupied cell re-marched to every emitter every
+  frame (`scripts/run-gi-emissive-cost.mjs`).
+- Field sun shadow steps: `__giFieldShadowSteps || 96` on the record march, `|| 64` on the DDA.
+  `penWidth` floor `= cellMax × 0.5` — a razor sun traced 10–60 m through architecture read
+  centimetre clearances at aperture edges and multiplied whole regions to ~0 (MEASURED on the user's
+  Sponza: lit-strip cells 0.002 lum vs 0.18 with `__giNoFieldShadows`, while a CPU DDA over the
+  readback bits proved 52/60 paths CLEAR).
+- **The field width probe was OFF by default** from 2026-08-06: its min k·D/t over blurred distance
+  taps read ~0 wherever a long ray passes near aperture edges, a further ×3 energy loss on the same
+  slit. The SCREEN arm keeps its width probe (user-validated).
+- `normalLift = minCell × 1.2`. `shadowJitter.penAngle = 0.025` rad (`__giSunAngle`);
+  `shadowJitter.angle = 0` — the stochastic dither cone is OFF because any stochastic term flickers
+  under a static light unless Light Smoothing integrates it ("it flickers even when the light is not
+  moving").
+
+**Cadence and cost**
+- Peak split, MEASURED on the user's Sponza at ultra (2026-08-04, `run-gi-perf.mjs`): waking the
+  field cost **6.3 ms** of GPU compute per frame — feedback **3.86**, traces+merges+probes **2.44**.
+  Both ran every frame while a light moved, and 6.3 ms plus the rest of the frame crosses a 120 Hz
+  budget, at which point the compositor halves the presented rate in one step. That cliff was the
+  user's "FPS drops 2×". The two halves are a ping-pong (neither reads its own output within a
+  frame), so alternating them by STRICT frame parity converges to the same fixed point at half the
+  rate. Strict parity, not a free-running counter: an irregular feedback rate PULSES the lighting,
+  which is a bug this module shipped once (2 iterations, then 0, then 1, at low/medium only).
+- `CHECKER_WARMUP_FRAMES = 8`. Both checkerboards leave their skipped half holding whatever the
+  buffer had, and a fresh buffer holds ZEROS — which a cascade ray decodes as "hit at t=0, black",
+  not as "no data". Feedback checker default ON at low/medium (`__giFeedbackChecker`); trace checker
+  opt-in (`__giTraceChecker`).
+- Sparse bricks: `brickAxis = 6` (4/6/8 by tier), `maxBricks` 60k/120k/220k/260k. Sized from a
+  MEASURED scene: the user's Sponza wants 207,925 bricks at 0.33 m coarse cells
+  (`run-gi-sdf-coverage`). A budget under that is not a soft quality knob — the cells that miss out
+  keep the coarse field, so the building seals in some places and leaks in others.
+- Injection arms, all default ON: coverage-weighted injection (`__giCoverageInjection`),
+  record-true injection normals (`__giRecordInjectionNormals`), swept-bounds history invalidation
+  (`__giNoSweptInvalidation` to disable), `dynShadeAmbient = 0` (`__giDynShadeAmbient`; 1 = the
+  pre-2026-08-07 value).
+
+**THE DIRTY-BRICK LESSON, which is no longer learnable from the code.** The composite recomposited
+only the union AABB of changed slots. A narrowed recomposite **can permanently miss the pyramid
+arriving**: the first composite ran whole-volume against a pyramid whose voxelize dispatches were
+still skipped (async pipeline compiles), so every cell read empty — and every LATER composite was
+atlas-bumped with a small dirty AABB, recompositing only that region. The rest of the volume kept the
+empty boot result forever, and nudging the building 1 cm was what "fixed" it (probe-measured: 0.021
+lum settled boot → 0.105 after the nudge). **Anything incremental built over the SRC field has to
+answer that case before it ships.** An every-3rd-frame composite throttle was also tried and
+REVERTED — it staggered moving shadows into visible judder and bunched cost into spike frames.
+
+#### 12.9.4 Two findings the cut produced on its own
+
+**`sparseField` has been UNREACHABLE since 2026-08-02 — a week of sessions, not since §12.8.** Its
+gate was `!this.#killSdfEnabled() && (props.sparseField === true || __giSparseField === true)`. The
+gate itself is correct — the bricks RESAMPLE the per-mesh SDF grids, and with no grids to fill them
+they would overwrite the occupancy oracle's good answer with cap distances. But `#killSdfEnabled()`
+has returned an unconditional `true` ever since the bake pipeline was deleted, so the left operand is
+always false. The component's "Sparse Fine Field" checkbox and the `__giSparseField` hatch have both
+been inert while reading as live quality knobs, and `sparseField.js` was dead code behind them.
+Recorded in the component schema. **This is the fifth §5-adjacent entry to be wrong on inspection,
+and the first in the OTHER direction: not "a delete-column file a survivor needs", but "a file the
+column called live that had already died".**
+
+**The `debugProbes` menu lost `"raw"` and `"merged"`** rather than keeping them inert, and the
+distinction from the parked props is worth stating: those two sit inside a control whose other
+options still work, so keeping them means two of five entries silently doing nothing while the other
+two respond. A parked prop in a feature that is wholly absent is honest; a dead option beside live
+ones in the same dropdown is not.
+
+#### 12.9.5 An instrument fix that nearly cost a wrong conclusion
+
+Mid-sweep the emitter-shadow probe reported `penumbraPx=0 grain=0.0000` on code that gave
+`16601 / 0.0307` on the three runs around it — **1 run in 4**. A zero there is indistinguishable from
+"the emitter shadow chain is broken"; it is the same signature. The only thing separating them in the
+output was the ABSENCE of the field's readback log line, i.e. the readback had landed before the
+pyramid was voxelized.
+
+That log line is therefore now a **precondition** of the measurement, not a thing you notice missing:
+`[gi] field ready: <n> occupied voxels` (renamed from `[gi] composited field:` and re-sourced from
+the pyramid's own readback), and the probe FAILS rather than printing a number if it never appears.
+This is §12.4 again — the instrument is wrong before the code is — and the sharper form of it: an
+instrument that reports a plausible wrong number is worse than one that crashes, because this rig's
+entire purpose is A/B-ing a shadow chain against a recorded number.
+
+#### 12.9.6 Order from here — and why the slotRegistry split is NOT next
+
+§12.8.3 filed `slotRegistry.js`'s SDF-tile-atlas half as part of this unit. It is still correct that
+the file splits, and the atlas half is now **entirely unreachable**: under `killSdf` every entry gets
+an analytic shape (a fitted primitive, or a synthesized bounding box), so `contentKey` is always null
+and no tile is ever acquired — `acquireTile`, `releaseTile`, `setSlot`-with-a-grid, `sampleSlot`,
+`refineDetail`, `encodeMeshSdf`/`decodeMeshSdf`, `MESH_SDF_*`, `SLOTS_PER_LAYER`,
+`MAX_ATLAS_LAYERS`, `atlasCapacityFor`, `DETAIL_SLOTS`, `#selectHiResMeshes` and `atlas.detailBudget`
+are all dead in every shipping configuration.
+
+**But its payoff is hygiene only, and a previous session already took the win that mattered:** the
+40 MB tile texture is ALREADY a 4×4×4 token texture holding "far" (the user's scene had allocated
+7 layers ≈ 58 MB for data nothing wrote). So deleting the atlas half frees no VRAM and no GPU time —
+it removes ~500 lines of slotRegistry plus the GISystem tile paths, from the module's single
+most-referenced object (`atlas.*`), for clarity alone.
+
+So:
+
+1. **Phase 1 — GPU probe population**, diffed against `srcRef.js` on a frozen frame. This is the next
+   substantive unit: it is what puts diffuse light back, and it reads the occupancy field, not the
+   atlas, so the vestigial tile machinery does not shape it.
+2. **Phase 2/3** per §3, then the slotRegistry atlas sweep as hygiene whenever it is convenient. It
+   is no longer blocking anything.
+3. Deferred, each with its own A/B and none of them urgent now: the ladder's 3×3×3 widening
+   (§12.6.5 #2); `planeCut` 3.5→2.5 voxels and the width probe's `0.6·planeHeight` gate;
+   `dynamicObjects.js`'s inert card-table word; the `res: null` lattice (§12.6.5, measured 3.61×).
+4. Still outstanding and unchanged by this sweep: `gate:gi-gather` fails 6 cases and
+   `run-gi-rc-penumbra.mjs` reports `shadowMin ≈ lit` on two arms — both verified at the pinned
+   baseline worktree, so neither is sweep damage. `gate:gi-gather` measures the DELETED estimator and
+   should be retired or rewritten against SRC in Phase 1 rather than fixed.
+5. **No user-eye check has happened yet.** Both GI debug overlay views discard essentially every pixel
+   in the headless rig, and that symptom is invariant across a byte-for-byte move — so it is the rig.
+   The real check is a person switching Debug View in the editor, and now also confirming the
+   interregnum reads as expected: direct light and shadows present, bounce absent.
