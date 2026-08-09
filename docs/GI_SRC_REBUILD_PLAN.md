@@ -2707,11 +2707,50 @@ average colour needs a 1×1 downsample, so a coloured HDRI currently contributes
 NEUTRAL sky at the right brightness. Colour belongs with Phase 5's hit shading,
 which has to sample the environment per-direction anyway.
 
-#### 12.19.4 What is next
+#### 12.19.4 THE PHASE-1 EYE CHECK IS PASSED — and it was an assumption for three sessions
 
-§12.18.7's units 3-5, unchanged: **[G] the merge** (`srcMerge.js` against
-`mergeCascades`), **[H] irradiance tiles**, **[I] the screen gather** — and [I]
-is the one that makes the Cornell picture worth looking at, per §12.19.2. The
-eye check (§12.18.8) is still owed and is now cheaper to do: `__giSrcProbes =
-true`, the debug view via `globalThis.__giDebugView = "src-probes"`, and sky by
-giving the scene an environment.
+§12.13.1 recorded it as DEFERRED, NOT PASSED, on the user's "can't check the editor now, let's say
+it's correct". That assumption has been load-bearing ever since: **every Phase-1 and Phase-2 gate
+would have reported exactly what it reported if the gizmos drew a correct-looking lattice in the
+wrong place.** The user ran it on Sponza after `f2f0173` and confirmed the thing that could not be
+settled from a screenshot — **the probes HUG THE SURFACES**, rather than filling the volume, which
+is what one-probe-per-visible-cell is supposed to produce.
+
+Corroborated by the same frame:
+- the lattice is regular and axis-aligned, receding cleanly down the nave, so
+  `latticeOrigin = round(anchor/s)·s` is placing it where it claims to;
+- spacing ≈ s₀ ≈ 0.6 m at the `medium` preset;
+- **every probe is the same hue, i.e. all LOD 0** — correct under `LOD0_REACH = 64` (38 m of reach
+  against a shorter nave), and a direct visual confirmation of §12.19.2: under the OLD law the same
+  frame would have been a handful of enormous probes;
+- **89 FPS** with population, Algorithm 3 and the split deposit all live.
+
+So nothing downstream is resting on an assumption about the lattice any more, which matters most for
+[G]: a merge built on a mislocated parent lattice would have produced plausible, wrong light with no
+gate able to say so.
+
+**What is still unjudged is the LIGHT, and the reason is worth writing down**: the user's Sponza had
+no environment, so the sky term was exactly zero, and with hit shading still Phase 5 that means GI
+genuinely contributes nothing — which is what the smoke asserts rather than a fault. Judging the
+light is only worth doing after [I], because the current gather is one-probe-per-pixel with no
+interpolation, so the lit image is ~0.6 m rectangles however good the lattice is (§12.19.2).
+
+#### 12.19.5 What is next
+
+§12.18.7's units 3-5, unchanged and in this order: **[G] the merge**
+(`srcMerge.js` against `mergeCascades`), **[H] irradiance tiles**, **[I] the
+screen gather**.
+
+**[G] FIRST IS NOT NEGOTIABLE, AND THE REASON IS NOT THE PLAN'S ORDERING.** The
+tempting shortcut is to do [I] alone — a position-indexed sparse-trilinear
+gather over c0 would remove the blockiness a unit earlier and give a picture to
+look at. It does not work: cascade 0's interval is r₀ ≈ 1.6·s₀ ≈ 1 m, so a
+c0-only gather is smooth but SHORT-RANGE and reads as ambient occlusion rather
+than as GI. **The merge is what gives it range.** Anyone reaching for the
+shortcut to get a demo sooner will spend a unit and arrive somewhere less
+convincing than where they started.
+
+Everything [G] needs is already green in `srcRef.js` (§12.18.4) and the lattice
+it merges over is now VERIFIED rather than assumed (§12.19.4) — which matters
+specifically here, because a merge built on a mislocated parent lattice produces
+plausible, wrong light and no gate in the suite could say so.
