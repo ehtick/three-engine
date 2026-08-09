@@ -205,6 +205,28 @@ export class GlobalIlluminationComponent extends Component {
   // — see ComponentSection/MultiComponentSection's `renderField`). Selecting
   // a preset from the Quality dropdown itself never touches these values —
   // "custom" just means the preset name no longer implies any of them.
+  // ── INERT WHILE THE DIFFUSE TRANSPORT IS ABSENT ──────────────────────────
+  // The dense radiance cascades were deleted with the SRC rebuild's §12.8 unit
+  // and Split Radiance Cascades replaces them in Phase 1-3 (see
+  // `docs/GI_SRC_REBUILD_PLAN.md`). These keys have no consumer until then:
+  // `cascadeCount`, `c0DirRes`, `bounce`, `bleedSaturation`, `temporalBlend`,
+  // `probeSmoothing`, `peakSplit`, `skyColor`/`skyIntensity`.
+  //
+  // `sparseField` is a DIFFERENT and older case, found while making this cut and
+  // worth stating plainly: it has been inert since 2026-08-02, not since §12.8.
+  // Its gate in GISystem required `!killSdfEnabled()`, and that method has
+  // returned an unconditional `true` ever since the SDF bake pipeline was
+  // deleted — so this checkbox has done nothing for a week of sessions while
+  // reading as a live quality knob. Left in place for scene compatibility only.
+  // They are KEPT rather than removed because they are serialized into saved
+  // scenes, because #applyLiveProps still routes them to live uniforms, and
+  // because Phase 1-3 consumes every one of them unchanged — deleting them
+  // would silently rewrite the user's authored values on the next save. The
+  // module logs the absence at build (see GISystem's header); nothing here is
+  // relabelled, because with NO diffuse indirect at all the inertness of an
+  // individual bounce knob is not the thing a person would be confused by.
+  // `probeSpacing` is the exception and stays live: it sizes the probe lattice
+  // an auto-fit refit snaps to, whether or not anything traces it.
   static schema = [
     // ZERO-SETUP MODE: Auto Fit derives the volume from THIS component's
     // entity — a mesh entity uses its own bounding box (×1.05, so probes
@@ -272,9 +294,15 @@ export class GlobalIlluminationComponent extends Component {
     { key: "bootAmbient", label: "Boot Ambient (until GI loads)", type: "boolean", advanced: true },
     // "occupancy" marches the pyramid with the SAME hierarchical DDA the
     // transport rays use, so it is the instrument for "is this column
-    // actually in the field". "sdf" shows the composited distance field the
-    // shadow and mirror traces still read.
-    { key: "debugProbes", label: "Debug View", type: "select", options: ["off", "raw", "merged", "sdf", "occupancy"], advanced: true, flipsToCustom: "quality" },
+    // actually in the field". "sdf" shows the distance oracle the shadow and
+    // mirror traces read.
+    // "raw" and "merged" (the per-probe cascade gizmos) were REMOVED, not left
+    // inert: unlike the parked props above they sit inside a control whose
+    // other options still work, so keeping them would mean two of five menu
+    // entries silently doing nothing while the other two respond — the exact
+    // dead-knob confusion this module keeps paying for. Phase 1-3 re-adds them
+    // alongside the probes they visualize.
+    { key: "debugProbes", label: "Debug View", type: "select", options: ["off", "sdf", "occupancy"], advanced: true, flipsToCustom: "quality" },
 
     // Deliberately NOT `flipsToCustom` — it is a stability knob, not a quality
     // level, and switching preset must not silently reset it.
