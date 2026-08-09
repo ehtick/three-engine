@@ -66,7 +66,7 @@
 // else reads. 1.6 MB for zero risk.
 import * as THREE from "three/webgpu";
 import {
-  Break, Fn, If, Loop, Return, atomicAdd, atomicLoad, atomicMax, atomicOr, atomicStore, bitAnd, bitOr,
+  Break, Fn, If, Loop, Return, atomicAdd, atomicLoad, atomicOr, atomicStore, bitAnd, bitOr,
   countOneBits, exp2, float, floatBitsToUint, floor, instanceIndex, instancedArray, int, log2, mix, mod,
   packSnorm2x16, select, shiftLeft, shiftRight, smoothstep, uint, uintBitsToFloat, uniform, uniformArray,
   unpackSnorm2x16, vec2, vec3, vec4,
@@ -381,7 +381,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
   // The split: slots are STATIC by default; GISystem promotes a slot to
   // DYNAMIC when its matrix changes and demotes it after a quiet period.
   // Static slots voxelize ONCE into a level-0 snapshot (`staticBits`, plus
-  // `staticAttr` for the attribution grid); a frame where only dynamic slots
+  // the attribution grid used to snapshot alongside); a frame where only dynamic slots
   // moved replays the snapshot (2 buffer copies) and voxelizes ONLY the
   // dynamic slots on top. Bit-identical to the full pass by construction:
   // OR is commutative and the attribution uses atomicMax (deterministic
@@ -472,58 +472,23 @@ export function createOccupancyField(bounds, res0, options = {}) {
   // cell's radiance, not to shade a silhouette. Racing stores cost nothing and
   // an atomic would serialise the hot loop of the whole voxelizer.
   //
-  // `cellAttr`: ATLAS slot + 1 per coarse cell (the slotAtlas remap is applied
-  // at write time; 0 = "no surface" or unseated slot). ATOMIC u32, written
-  // with atomicMax so the winner in a shared cell is DETERMINISTIC (highest
-  // atlas slot): the old last-write-wins vec4 re-rolled the winner by GPU
-  // scheduling on EVERY dispatch, and a moving object re-voxelizes every
-  // frame — so all multi-mesh seam cells re-rolled their colour per frame,
-  // which the bounce amplified into visible flicker. (The vec4's yzw face
-  // normal was never read by anything — deleted with the conversion.)
-  let coarseRes = { x: 1, y: 1, z: 1 };
-  let cellAttr = instancedArray(new Uint32Array(1), "uint").toAtomic();
-  const coarseResU = uniform(new THREE.Vector3(1, 1, 1));
-  /**
-   * Points the attribute grid at the composite's cell resolution. Called by
-   * createGiField, which owns that resolution — the pyramid's own level-0 res
-   * is chosen for tracing and is deliberately finer.
-   */
-  const setCoarseRes = (res) => {
-    coarseRes = { x: res.x, y: res.y, z: res.z };
-    coarseResU.value.set(res.x, res.y, res.z);
-    cellAttr = instancedArray(new Uint32Array(res.x * res.y * res.z), "uint").toAtomic();
-    staticAttr = instancedArray(new Uint32Array(res.x * res.y * res.z), "uint");
-    computesRevision = -1; // the voxelize kernel closes over this buffer
-    staticDirty = true;
-    dirty = true;
-  };
-
-  // Occupancy slot → ATLAS slot bridge, uploaded by GISystem. The two
-  // numberings are independent (placements by mesh-walk order, atlas slots by
-  // #syncSlots priority), which is the crossed-numbering bug that got
-  // cellAttr's colours disabled in the composite. -1 = no atlas slot
-  // (unseated/overflow) — writes as cellAttr.x = 0, "no surface", so the
-  // composite keeps its nearest-slot answer there.
+  // THE COARSE SURFACE-ATTRIBUTION GRID IS GONE (SRC rebuild §12.9). `cellAttr`
+  // held "atlas slot + 1" per COMPOSITE cell — an atomic u32 the voxelizer
+  // stamped with atomicMax so a cell shared by several meshes picked a
+  // deterministic winner, plus `staticAttr` to snapshot it across the
+  // static/dynamic split, plus a `slotAtlas` uniform array bridging the
+  // pyramid's slot numbering to the atlas's. Its only consumer was the
+  // composite pass, which read it to give a cell a surface colour.
   //
-  // THE REMAP IS APPLIED HERE, IN THE VOXELIZER — NOT READ IN THE COMPOSITE.
-  // Binding this array in the composite kernel was one uniform buffer too
-  // many: that kernel already sits at the user GPU's 12-uniform-buffer
-  // per-stage limit, and buffer 13 fails CreateBindGroupLayout, which drops
-  // the WHOLE compute batch (the documented over-limit failure shape). The
-  // voxelizer binds ~3, so the remap rides here for free; a remap change
-  // marks the field dirty so the attribution re-bakes on the next dispatch.
-  const slotAtlas = uniformArray(Array.from({ length: slotCapacity }, () => -1), "float");
-  const setSlotAtlas = (slot, atlasSlot) => {
-    if (slot < 0 || slot >= slotCapacity) return;
-    if (slotAtlas.array[slot] === atlasSlot) return;
-    slotAtlas.array[slot] = atlasSlot;
-    // Attribution numbering changed. Only a STATIC slot's attr lives in the
-    // snapshot; dynamic (and disabled) slots re-stamp every dispatch, so
-    // their remap is a plain uniform write — this is what keeps pooled
-    // spawn/despawn (which reseats atlas slots) off the full re-voxelize.
-    if (slotDynamic.array[slot] === 0) staticDirty = true;
-    dirty = true;
-  };
+  // Two things went with it and are worth naming, because both were paid for:
+  // the crossed-numbering bug (two independent slot numberings fed the
+  // composite a different mesh's colour, and the remap was applied in the
+  // VOXELIZER rather than read in the composite because that kernel already sat
+  // at the user GPU's 12-uniform-buffer per-stage limit, where buffer 13 fails
+  // CreateBindGroupLayout and drops the whole compute batch); and the
+  // deterministic-winner fix (last-write-wins re-rolled every seam cell's
+  // colour per dispatch, which the bounce amplified into visible flicker).
+  // Anything that re-introduces per-cell surface attribution inherits both.
 
   // ───────────────────────────────────────────────────────── geometry buffers
   // Triangle soup for every UNIQUE geometry, concatenated, in LOCAL space —
@@ -737,17 +702,6 @@ export function createOccupancyField(bounds, res0, options = {}) {
   })().compute(level0.words);
 
   /**
-   * Zeroes the surface-attribution grid. Without this a mesh that moved or
-   * left keeps colouring its old cells forever — nothing overwrites a cell no
-   * triangle touches any more. A BUILDER (like buildVoxelizeCompute): it
-   * closes over the current `cellAttr` allocation, which `setCoarseRes`
-   * replaces, and the dispatch size is that allocation's cell count.
-   */
-  const buildClearAttrCompute = () => Fn(() => {
-    atomicStore(cellAttr.element(instanceIndex), uint(0));
-  })().compute(Math.max(1, coarseRes.x * coarseRes.y * coarseRes.z));
-
-  /**
    * One thread per WORK ITEM = (slot, triangle, chunk). Rebuilt whenever the
    * geometry buffers change, because the body closes over them and the
    * dispatch size is the work-item count.
@@ -818,20 +772,6 @@ export function createOccupancyField(bounds, res0, options = {}) {
           const word = vz.toUint().mul(uint(level0.res.y)).add(vy.toUint()).mul(uint(level0.wordsPerRow))
             .add(shiftRight(xi, uint(5)));
           atomicOr(atomicBits.element(word), shiftLeft(uint(1), bitAnd(xi, uint(31))));
-          // Surface attribution for the composite (see cellAttr's comment).
-          // The level-0 voxel maps into the coarse grid by ratio, which needs
-          // no extra state: both grids span the same world box.
-          const cx = vx.add(0.5).mul(coarseResU.x).div(float(level0.res.x)).floor().clamp(0, coarseResU.x.sub(1));
-          const cy = vy.add(0.5).mul(coarseResU.y).div(float(level0.res.y)).floor().clamp(0, coarseResU.y.sub(1));
-          const cz = vz.add(0.5).mul(coarseResU.z).div(float(level0.res.z)).floor().clamp(0, coarseResU.z.sub(1));
-          const cell = cz.mul(coarseResU.y).add(cy).mul(coarseResU.x).add(cx).toUint();
-          // ATLAS slot + 1, not occupancy slot + 1: slotAtlas applies the
-          // numbering bridge right here so the composite can read the value
-          // with no extra binding (it has none to spare — see slotAtlas's
-          // comment). An unseated slot (-1) writes 0 = "no surface".
-          // atomicMax = deterministic winner in shared cells (see cellAttr's
-          // comment; last-write-wins re-rolled per dispatch = motion flicker).
-          atomicMax(cellAttr.element(cell), slotAtlas.element(slot.toInt()).add(1).toUint());
         });
       });
     });
@@ -853,22 +793,15 @@ export function createOccupancyField(bounds, res0, options = {}) {
 
   // Static/dynamic split (see staticBits above): snapshot the level-0 scratch
   // right after the STATIC-only voxelize pass, and replay it in place of
-  // clear+static-voxelize on frames where only dynamic slots moved. The attr
-  // pair are BUILDERS like buildClearAttrCompute — they close over the
-  // current cellAttr/staticAttr allocations, which setCoarseRes replaces.
+  // clear+static-voxelize on frames where only dynamic slots moved. (The
+  // attribution grid had a matching snapshot/restore pair here; both went with
+  // it.)
   const snapStaticBitsCompute = Fn(() => {
     staticBits.element(instanceIndex).assign(atomicLoad(atomicBits.element(instanceIndex)));
   })().compute(level0.words);
   const restoreStaticBitsCompute = Fn(() => {
     atomicStore(atomicBits.element(instanceIndex), staticBits.element(instanceIndex));
   })().compute(level0.words);
-  let staticAttr = instancedArray(new Uint32Array(1), "uint");
-  const buildSnapStaticAttrCompute = () => Fn(() => {
-    staticAttr.element(instanceIndex).assign(atomicLoad(cellAttr.element(instanceIndex)));
-  })().compute(Math.max(1, coarseRes.x * coarseRes.y * coarseRes.z));
-  const buildRestoreStaticAttrCompute = () => Fn(() => {
-    atomicStore(cellAttr.element(instanceIndex), staticAttr.element(instanceIndex));
-  })().compute(Math.max(1, coarseRes.x * coarseRes.y * coarseRes.z));
 
   // ══════════════════════════════════════════════════════ SHADER: downsample
   // One thread per PARENT WORD. A parent word is 32 voxels along x, whose
@@ -4311,16 +4244,9 @@ export function createOccupancyField(bounds, res0, options = {}) {
   return {
     levels,
     res: res0,
-    // Surface attribution for the composite — see `cellAttr`'s comment. The
-    // getter matters: `setCoarseRes` REPLACES the buffer, so a consumer that
-    // captured the property at module scope would hold the 1-element
-    // placeholder forever.
-    get cellAttr() {
-      return cellAttr;
-    },
-    slotAtlas,
-    setSlotAtlas,
-    setCoarseRes,
+    // (`cellAttr`/`slotAtlas`/`setSlotAtlas`/`setCoarseRes` were exported here
+    // for the composite pass and went with it — see the note at their old
+    // declaration site.)
     bits,
     stats,
     voxel,
@@ -4380,7 +4306,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
     },
 
     /**
-     * The dispatch chain, in order: clear → clearAttr → voxelize → copy → downsample×4.
+     * The dispatch chain, in order: clear → voxelize → copy → downsample×4.
      * Returns null when there is no geometry, so an empty scene costs nothing
      * and cannot dispatch the voxelizer against a placeholder work item.
      */
@@ -4475,15 +4401,15 @@ export function createOccupancyField(bounds, res0, options = {}) {
             // Fresh clear per geometry change — see buildClearCompute's note:
             // a stale compiled clear executing ahead of skipped fresh
             // voxelize nodes is the spawn-blink's empty-pyramid window.
-            buildClearCompute(), buildClearAttrCompute(),
-            voxStatic, snapStaticBitsCompute, buildSnapStaticAttrCompute(),
+            buildClearCompute(),
+            voxStatic, snapStaticBitsCompute,
             ...surfaceChain,
             voxDynamic, copyCompute, ...downsampleComputes, ...densityComputes,
             ...(hybridBuildCompute ? [hybridBuildCompute] : []),
             ...dynamicSurfaceChain,
           ],
           fast: [
-            restoreStaticBitsCompute, buildRestoreStaticAttrCompute(),
+            restoreStaticBitsCompute,
             voxDynamic, copyCompute, ...downsampleComputes, ...densityComputes,
             ...(hybridBuildCompute ? [hybridBuildCompute] : []),
             ...dynamicSurfaceChain,

@@ -43,13 +43,8 @@ import { GICascadeLight, MAX_EMITTERS, giRoughnessBucketOf, registerGILight } fr
 import { buildBvhScene } from "./bvh/bvhScene.js";
 import { RayHitMode, rayHitModeName, resolveRayHitConfig } from "./rayHit/RayHitConfig.js";
 import {
-  DETAIL_SLOTS,
-  MAX_ATLAS_LAYERS,
   MAX_INSTANCE_SLOTS,
-  MAX_MESH_SDF_SLOTS,
   SlotRegistry,
-  SLOTS_PER_LAYER,
-  geometryContentHash,
   instanceCapacityFor,
   slotKeyOf,
 } from "./slotRegistry.js";
@@ -441,23 +436,6 @@ function meshWorldBox(mesh, target = new THREE.Box3()) {
  */
 const MAX_INSTANCES_PER_MESH = 256;
 
-/**
- * Identity of a baked distance grid: the bake cache's key AND the atlas
- * tile's. Two placements that agree here share one tile and one bake, which
- * is the whole instancing win, so this must be derived in exactly one place —
- * the build's atlas SIZING and the per-entry seating both call it.
- *
- * `assetPath@version` when the geometry came from an asset (stable across
- * sessions, so the Library cache hits cold), a content hash otherwise. The
- * resolution tag keeps a cached 64³ grid from satisfying a 128³ want.
- */
-function contentKeyOf(geometry, hiRes) {
-  const assetPath = geometry?.userData?.assetPath ?? null;
-  const version = geometry?.attributes?.position?.version ?? 0;
-  const base = assetPath ? `${assetPath}@${version}` : `sdf#${geometryContentHash(geometry)}`;
-  return base + (hiRes ? "@r128" : "");
-}
-
 // SDF bakes sample the surface, not every triangle cell — but a multi-
 // million-tri mesh still costs seconds of worker time on first bake.
 const MAX_TRIS_PER_MESH = 500_000;
@@ -736,12 +714,11 @@ export class GISystem {
    * everything else #applyLiveProps writes (intensity, bounce, bleedSaturation,
    * temporalBlend, probeSmoothing, skyColor, skyIntensity) is routed here;
    * `resolveScale` and the two pixel budgets are re-read every frame by
-   * #syncScreenResolveSize; `bootAmbient` is re-read every
-   * frame in #update; `debugProbes` and `autoRebake` have their own branches
-   * below (`bootAmbient` shares autoRebake's, to be explicit rather than
-   * relying on the no-op `else`); and the
-   * remainder are in #structuralSignature. If you add a prop, it belongs to
-   * exactly one of those five places.
+   * #syncScreenResolveSize; `bootAmbient` is re-read every frame in #update and
+   * has its own no-op branch below (explicit, rather than relying on the no-op
+   * `else`); `debugProbes` has a branch too; and the remainder are in
+   * #structuralSignature. If you add a prop, it belongs to exactly one of those
+   * four places.
    */
   onComponentProp(component, key) {
     if (this.component !== component) return;
@@ -763,11 +740,11 @@ export class GISystem {
       this.#applyLiveProps();
     } else if (key === "debugProbes") {
       this.#applyDebugVisibility();
-    } else if (key === "autoRebake" || key === "bootAmbient") {
-      // read on the fly, nothing to do. `bootAmbient` is re-read every tick by
-      // the boot-ambient block in #update — including as a live OFF switch, so
-      // unticking it fades the hemisphere out immediately rather than waiting
-      // for a composite that may not be coming.
+    } else if (key === "bootAmbient") {
+      // read on the fly, nothing to do: re-read every tick by the boot-ambient
+      // block in #update — including as a live OFF switch, so unticking it fades
+      // the hemisphere out immediately rather than waiting for a field that may
+      // not be coming.
     } else {
       // Structural (size/resolution/cascade shape): grids and dispatch sizes
       // are baked into the compute graphs as constants — rebuild. But ONLY
@@ -796,23 +773,19 @@ export class GISystem {
       p.autoFit,
       p.quality,
       p.hitLighting,
-      // The fine level allocates textures and changes every trace's compiled
-      // graph, so it can only change on a REBUILD. Leaving it out is the
-      // `exactReflections` bug: the Inspector toggle appears to do nothing
-      // until some unrelated edit happens to force a rebuild.
-      p.sparseField,
       // `exactReflections` decides whether `light.bvhReflectTexture` /
       // `bvhReflectColorTexture` are set, and giLight compiles a DIFFERENT
-      // mirror path depending on that — so it is structural in exactly the
-      // same way `sparseField` is. This was the actual `exactReflections`
-      // bug the comment above names: the toggle flipped the prop, nothing
-      // rebuilt, and the Inspector switch silently did nothing until some
-      // unrelated edit happened to force a rebuild — which also made every
-      // A/B evaluation of exact reflections untrustworthy.
+      // mirror path depending on that — so it can only change on a REBUILD.
+      // Leaving a structural prop out of this signature is a real shipped bug:
+      // the Inspector toggle flipped the prop, nothing rebuilt, and the switch
+      // silently did nothing until some unrelated edit forced a rebuild — which
+      // also made every A/B of exact reflections untrustworthy. (`sparseField`
+      // sat beside it for the same reason and is gone with its file.)
       p.exactReflections,
       // The backend decides which trace graph every GI shader compiles, so it
-      // cannot change without a rebuild. (`killSdf` used to sit beside it —
-      // the prop is gone; SDF-free is the only mode.)
+      // cannot change without a rebuild. (`killSdf` used to sit beside it — the
+      // prop went in 2026-08-02, the flag itself in the SRC rebuild: there has
+      // been exactly one distance source since the bake pipeline was deleted.)
       p.backend,
       p.rayHitMode,
       p.rayHitProfiling === true,
@@ -3521,30 +3494,6 @@ export class GISystem {
   }
 
   /**
-   * SDF-FREE MODE: no baked mesh SDF is read anywhere in the lighting path.
-   * The occupancy pyramid supplies the composited distance and the near-field
-   * refinement both traces used the per-mesh atlas for (see giField's
-   * `killSdf`), which is what retires the 40 MB atlas, the bake worker and the
-   * `.sdf` Library cache.
-   *
-   * WHY IT ALSO MATTERS FOR SHIPPING, not just VRAM: those caches live in the
-   * Tauri-only project `Library/`, so a hosted build either ships them or bakes
-   * every mesh from scratch in the browser. Occupancy voxelizes from triangles
-   * on the GPU at load, so an SDF-free build has nothing to ship and nothing to
-   * bake.
-   *
-   * Structural (it changes which graph every GI shader compiles) — see
-   * `#structuralSignature`.
-   */
-  #killSdfEnabled() {
-    // ALWAYS. The bake pipeline is deleted (2026-08-02) — there is no SDF path
-    // to fall back to, and the prop is gone from the component. Kept as a
-    // method because a dozen call sites read it, and the giField fallback for
-    // a device without an occupancy field still keys off it structurally.
-    return true;
-  }
-
-  /**
    * Old targets are destroyed a few frames LATE, never on the spot. A material
    * re-points at the new textures when its bind group is next refreshed, which
    * happens while the following frame is encoded — destroy the old pair before
@@ -3815,72 +3764,18 @@ export class GISystem {
       { low: { shadow: 24 }, medium: { shadow: 32 }, high: { shadow: 44 }, ultra: { shadow: 56 } }[quality]
       ?? { shadow: 44 };
 
-    // The authored representation: one atlas TILE per unique baked geometry,
-    // one INSTANCE SLOT per world placement. Sizing them apart is the point —
-    // a scene of 200 crates needs 200 transforms and exactly one distance
-    // grid, and it used to need 200 grids (and therefore did not fit).
-    this._hiResMeshes = this.#selectHiResMeshes(meshes);
-    // TILE capacity: unique baked geometries, not meshes. Analytic primitives
-    // (boxes, spheres, fitted GLB walls) hold no tile at all, and repeats of
-    // one geometry share one — so a scene that used to need eight atlas
-    // layers commonly needs one.
-    const tileKeys = new Set();
-    let hiResTiles = 0;
-    for (const mesh of meshes) {
-      const material = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
-      if (analyticShapeOf(mesh.geometry, material)) continue;
-      const hiRes = this._hiResMeshes.has(mesh);
-      // The SAME key #buildEntries derives — the estimate has to agree with
-      // what acquireTile is actually going to ask for, or the atlas is sized
-      // for a tile count the scene never requests (or, worse, one it exceeds
-      // and then rebuilds out of).
-      const key = contentKeyOf(mesh.geometry, hiRes);
-      if (tileKeys.has(key)) continue;
-      tileKeys.add(key);
-      if (hiRes) hiResTiles++;
-    }
-    // BLOCK-AWARE capacity. Hi-res blocks pack 4 per LAYER PAIR and singles
-    // fill layers from the tail (see #findTileSingle) — sizing by raw tile
-    // count alone left no aligned region for the last block (11 meshes +
-    // 14 block tiles = 2 layers, but 9 seated singles fragment every block
-    // region), and the overflow → rebuild → overflow loop spun forever.
-    const singleCount = tileKeys.size - hiResTiles;
-    const singleLayers = Math.max(1, Math.ceil(singleCount / SLOTS_PER_LAYER));
-    const maxBlocks = Math.max(0, Math.floor((MAX_ATLAS_LAYERS - singleLayers) / 2)) * 4;
-    if (hiResTiles > maxBlocks) {
-      // Drop the lowest-ranked hi-res grants (the set is built densest-first).
-      const keep = new Set();
-      for (const mesh of this._hiResMeshes) {
-        if (keep.size >= maxBlocks) break;
-        keep.add(mesh);
-      }
-      this._hiResMeshes = keep;
-      hiResTiles = Math.min(hiResTiles, maxBlocks);
-    }
-    const blockLayers = Math.ceil(hiResTiles / 4) * 2;
-    // INSTANCE capacity: every placement, including each InstancedMesh
-    // instance. Uniform-array length only — no texture memory rides on it.
+    // ONE SLOT PER WORLD PLACEMENT, and that is the whole sizing calculation
+    // now. The TILE half is gone: there is no atlas texture, so there are no
+    // 64³ tiles to pack, no 2x2x2 hi-res blocks to keep an aligned region free
+    // for, no per-quality detail budget, and no tile-vs-instance capacity to
+    // reconcile. (That packing arithmetic existed for a real bug — singles
+    // allocated from the tail fragmented every block-aligned region, so a
+    // hi-res grant could never seat, and the editor spun seat → overflow →
+    // rebuild → identical packing forever. Nothing can reproduce it without a
+    // texture to pack.)
     let placements = 0;
     for (const mesh of meshes) placements += this.#placementsOf(mesh).length;
-    const atlas = new SlotRegistry(
-      Math.min(MAX_ATLAS_LAYERS, blockLayers + singleLayers) * SLOTS_PER_LAYER,
-      instanceCapacityFor(placements),
-    );
-    // Per-quality refinement budget: every shadow/mirror trace STEP pays
-    // for these slots — set BEFORE any trace graph is built.
-    atlas.detailBudget = { low: 4, medium: 8, high: 10, ultra: 12 }[qualityTierOf(props)];
-    // THE SPARSE FINE (BRICK) LEVEL HAS BEEN UNREACHABLE SINCE 2026-08-02, and
-    // this cut is where that surfaced. Its gate read
-    // `!this.#killSdfEnabled() && (props.sparseField || __giSparseField)` — a
-    // correct gate, because the bricks RESAMPLE the per-mesh SDF grids and with
-    // no grids to fill them they would overwrite the occupancy oracle's good
-    // answer with cap distances. But `#killSdfEnabled()` has returned an
-    // unconditional `true` since the bake pipeline was deleted, so the left
-    // operand is always false: the component's "Sparse Fine Field" checkbox and
-    // the `__giSparseField` hatch have both been inert for a week of sessions,
-    // and `sparseField.js` has been dead code behind them. Nothing is lost by
-    // passing neither — see plan §12.9, and the component schema, which now says
-    // so.
+    const atlas = new SlotRegistry(instanceCapacityFor(placements));
     // (The CPU point-sampled occupancy PROTOTYPE that used to be buildable
     // here — `triangleOcclusion` opt-in, occupancyGrid.js — was deleted
     // 2026-08-02 with the bake pipeline it depended on. The SAT-conservative
@@ -3895,8 +3790,7 @@ export class GISystem {
     const occField = this.#buildOccupancyField(
       props, meshes, bounds, { sizeX, sizeY, sizeZ }, quality, rayHitConfig,
     );
-    const killSdf = this.#killSdfEnabled();
-    if (killSdf && !occField) {
+    if (!occField) {
       console.warn("[gi] occupancy was disabled by the diagnostic backend hatch; GI has no geometry transport");
     }
     // THE VOLUME IS NOW `srcVolume`, and `giField.js` is gone with it (§12.8.2).
@@ -3919,12 +3813,6 @@ export class GISystem {
       res,
       rayHitMode: rayHitConfig.activeMode,
     });
-    // Plane walls are zero-thickness; give them a solid interior sized to
-    // THIS field. Too thin and the trilinear distance texture cannot see
-    // them at all — sphere-traced mirror rays step through the walls and
-    // reflections read black. A quarter cell is resolvable without visibly
-    // displacing the surface.
-    atlas.minAnalyticHalfWorld = Math.max(0.01, volume.minCell * 0.5);
     // Entries + slot assignment + emitter promotion + SDF load-or-bake.
     const entries = this.#buildEntries(meshes);
 
@@ -4293,7 +4181,6 @@ export class GISystem {
     this.#compileWave();
     const resident = atlas.assignments.filter(Boolean).length;
     const analyticCount = atlas.assignments.filter((a) => a?.analytic).length;
-    const tilesUsed = atlas._tiles.size;
     if (autoFit && this._boundsSource) {
       console.log(
         `[gi] auto-fit bounds from ${this._boundsSource} (${analyticCount} analytic / ${resident - analyticCount} baked slots)`,
@@ -4304,9 +4191,7 @@ export class GISystem {
         `${autoFit ? ` (auto-fit ${props.quality ?? "high"}, voxel ${voxelSize.toFixed(2)}, probes ${probeSpacing.toFixed(2)})` : ""}, ` +
         `${res.x}x${res.y}x${res.z} cells, c0 ${c0Grid.x}x${c0Grid.y}x${c0Grid.z} (probe lattice, NOT traced), ` +
         `${meshes.length} meshes / ${entries.length} placements → ` +
-        `${atlas.capacity} instance slots over ${atlas.tileCapacity} tiles ` +
-        `(${resident} resident, ${entries.length - resident} pending, ` +
-        `${tilesUsed} unique tile${tilesUsed === 1 ? "" : "s"}), ` +
+        `${atlas.capacity} slots (${resident} resident, ${entries.length - resident} pending), ` +
         `${this._lightObjects.length} lights (GPU), ${this._emitterInfos?.length ?? 0} emitters, ` +
         `setup ${(performance.now() - t0).toFixed(0)}ms`,
     );
@@ -4361,15 +4246,8 @@ export class GISystem {
         `, skip ${rayHitConfig.enableSkipDistance !== false ? "ON" : "off"}` +
         (rayHitConfig.fallbackToLegacy ? " (requested phase not implemented; legacy fallback)" : ""),
     );
-    // Affirmative ground truth, same discipline as the BVH line: the ABSENCE
-    // of "SDF-free" means baked mesh SDFs are still being read, whatever the
-    // Inspector checkbox appears to say.
-    if (this.#killSdfEnabled()) {
-      console.log(
-        volume.occupancyField
-          ? "[gi] SDF-free: ON — distance from the occupancy pyramid, no mesh SDF bakes, no atlas"
-          : "[gi] SDF-free: requested but INACTIVE — no occupancy field to take the distance from",
-      );
+    if (!volume.occupancyField) {
+      console.warn("[gi] no occupancy field — nothing supplies distance, so GI has no geometry at all");
     }
     // WATERTIGHTNESS CHECK. The composited field gives thin geometry ONE
     // occupancy shell per side so a wall's lit face and its shadowed face
@@ -5009,50 +4887,6 @@ export class GISystem {
   // geometry stays, as occluder/albedo) and per-frame uniform slots carry
   // their light instead, so a moving lamp stays smooth and bake-free.
 
-  /**
-   * The meshes granted a 128³ hi-res SDF this build. Candidates are BAKED
-   * (non-analytic) meshes that are complex OR physically large — judged PER
-   * SUB-MESH, because GLB characters arrive split into many primitives that
-   * individually sit far below any whole-model triangle count. Ranked by
-   * tris and capped at 12 grants (12 blocks = 96 of 128 tiles) so blocks
-   * can never exhaust the atlas or flap between syncs.
-   */
-  #selectHiResMeshes(meshes) {
-    const granted = new Set();
-    if (globalThis.__giNoHiResSdf) return granted;
-    const scratch = new THREE.Vector3();
-    const candidates = [];
-    for (const mesh of meshes) {
-      const geometry = mesh.geometry;
-      const position = geometry?.attributes?.position;
-      if (!position) continue;
-      const material = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
-      if (analyticShapeOf(geometry, material)) continue; // exact already
-      const tris = (geometry.index?.count ?? position.count) / 3;
-      if (tris < 1500) continue;
-      if (!geometry.boundingBox) geometry.computeBoundingBox();
-      const bb = geometry.boundingBox;
-      mesh.getWorldScale(scratch);
-      const span = bb
-        ? Math.max(
-            (bb.max.x - bb.min.x) * Math.abs(scratch.x),
-            (bb.max.y - bb.min.y) * Math.abs(scratch.y),
-            (bb.max.z - bb.min.z) * Math.abs(scratch.z),
-          )
-        : 0;
-      if (tris >= 8000 || span >= 2.5) candidates.push({ mesh, tris });
-    }
-    candidates.sort((a, b) => b.tris - a.tris);
-    for (const candidate of candidates.slice(0, 12)) granted.add(candidate.mesh);
-    if (granted.size && globalThis.__giVerbose) {
-      // Legacy wording from the bake era — the grant now only prioritises
-      // detail slots, no 128³ texture exists. Verbose-only until the
-      // detail-slot machinery is retired with the emissive-shadow rework.
-      const names = [...granted].map((m) => m.name || "mesh").join(", ");
-      console.log(`[gi] hi-res 128³ SDFs (${granted.size}): ${names}`);
-    }
-    return granted;
-  }
 
   /**
    * Placements a mesh contributes: `[null]` for a plain mesh (itself), or one
@@ -5115,21 +4949,18 @@ export class GISystem {
         geometry,
         Array.isArray(mesh.material) ? mesh.material[0] : mesh.material,
       );
-      // SDF-FREE: EVERY MESH STILL NEEDS A SLOT, and a slot only becomes ACTIVE
-      // (`aabbMin.w = 1`) when it receives a baked grid or an analytic shape.
-      // With no bakes, a scene of ordinary meshes ends up with ZERO active
-      // slots — which costs far more than a distance field, because an inactive
-      // slot has no AABB for the composite to attribute a cell to and carries
-      // no mean albedo. **Indirect light is albedo**, so the whole bounce term
-      // goes to zero: direct light, and nothing else. That is exactly the
-      // reported "almost pitch black, no indirect".
+      // EVERY MESH STILL NEEDS A SLOT. A slot used to become ACTIVE only on
+      // receiving a baked grid or an analytic shape, and with no bake pipeline
+      // an ordinary mesh ended up with none — which cost far more than a
+      // distance field, because an inactive slot gave the composite no AABB to
+      // attribute a cell to and no mean albedo. **Indirect light is albedo**, so
+      // the bounce term went to zero: the reported "almost pitch black, no
+      // indirect". The synthesized bounding box below is the stand-in, and its
+      // DISTANCE was never the point — it was never sampled even then.
       //
-      // A bounding BOX is the right stand-in. It costs no bake, gives the
-      // composite a real AABB and the slot's colours, and its DISTANCE — the
-      // one part that would be a crude lie — is never sampled in this mode:
-      // the composite takes distance from the occupancy oracle and both traces
-      // do too (see giField's `killSdf`), so nothing ever calls `sampleSlot`.
-      if (!analytic && this.#killSdfEnabled()) {
+      // It survives the atlas's deletion because #syncSlots still classifies by
+      // shape and the pyramid still needs a placement per mesh.
+      if (!analytic) {
         if (!geometry.boundingBox) geometry.computeBoundingBox();
         const bb = geometry.boundingBox;
         if (bb) {
@@ -5149,23 +4980,20 @@ export class GISystem {
           entries.push({
             mesh, instanceId, key: slotKeyOf(mesh, instanceId),
             surface, tris, luminance, peak, r, g, b, analytic,
-            contentKey: null, sdfPath: null, promoted: false,
+            promoted: false,
           });
         }
         continue;
       }
-      // No bake pipeline any more — a mesh that reaches here (no fitted
-      // primitive) gets nothing extra; #buildEntries' killSdf path above
-      // synthesizes an analytic bounding box for it, so this branch exists
-      // only for the no-occupancy-device fallback. contentKey remains the
-      // instances-share-a-slot identity.
-      const hiRes = this._hiResMeshes?.has(mesh) === true;
-      const contentKey = contentKeyOf(geometry, hiRes);
+      // UNREACHABLE IN ANY BUILD WITH AN OCCUPANCY FIELD, which is every build
+      // (`killSdf` is unconditional). The synthesized bounding box above means
+      // a mesh always leaves with an analytic shape; this exists so a
+      // no-occupancy device still produces entries — for the emitter promotion
+      // and the BVH, which do not need a slot shape.
       for (const instanceId of placements) {
         entries.push({
           mesh, instanceId, key: slotKeyOf(mesh, instanceId),
-          surface, tris, luminance, peak, r, g, b, hiRes,
-          contentKey, promoted: false,
+          surface, tris, luminance, peak, r, g, b, promoted: false,
         });
       }
     }
@@ -5332,48 +5160,35 @@ export class GISystem {
       else atlas.clearSlot(i);
     }
     let overflow = 0;
-    let tileOverflow = 0;
     for (const entry of entries) {
       const existing = slotOfKey.get(entry.key);
       if (existing !== undefined) {
         atlas.setSlotSurface(existing, this.#slotSurface(entry));
         continue;
       }
-      // Analytic primitives seat immediately — no bake, no cache, no file,
-      // and no tile at all, so instancing them is free.
-      if (entry.analytic) {
-        const free = atlas.allocateSlot();
-        if (free < 0) {
-          overflow++;
-          continue;
-        }
-        atlas.setAnalyticSlot(free, entry.mesh, entry.analytic, this.#slotSurface(entry), entry.instanceId);
-        slotOfKey.set(entry.key, free);
+      // EVERY entry is analytic now: #buildEntries synthesizes a bounding box
+      // for anything `fitPrimitive` could not name, so a placement either seats
+      // or overflows the slot count. (The alternative used to be seating a
+      // baked 64³ grid into a texture tile, which could overflow independently
+      // of the instance count; both the grid and the tile pool are gone.)
+      if (!entry.analytic) continue;
+      const free = atlas.allocateSlot();
+      if (free < 0) {
+        overflow++;
         continue;
       }
-      // No bakes exist (the SDF pipeline is deleted): a non-analytic entry
-      // never seats a grid. Under the occupancy backend #buildEntries gives
-      // every such mesh an analytic box, so this is the no-occupancy-device
-      // fallback only — the mesh stays out of the composite rather than
-      // waiting for a bake that will never arrive. (The tile-seating path —
-      // atlas.setSlot with a baked grid, hi-res 2×2×2 tile blocks, tile
-      // overflow accounting — was deleted with the pipeline.)
-      continue;
+      atlas.setAnalyticSlot(free, entry.mesh, entry.analytic, this.#slotSurface(entry), entry.instanceId);
+      slotOfKey.set(entry.key, free);
     }
-    if (tileOverflow > 0) overflow += tileOverflow;
     if (overflow > 0) {
       // ONE rebuild attempt per (entry count, capacity) situation. An
       // unconditional request looped forever when the rebuilt atlas
       // reproduced the exact same packing failure — build, overflow,
       // build, overflow, at ~3s per compile wave.
-      const overflowSig = `${entries.length}:${atlas.capacity}:${atlas.tileCapacity}`;
-      // Retry only while a bigger tier could actually help: instance
-      // overflow needs headroom under MAX_INSTANCE_SLOTS, tile overflow
-      // under MAX_MESH_SDF_SLOTS. Asking for a rebuild that must fail the
-      // same way is the loop this signature guards against.
-      const canGrow = tileOverflow > 0
-        ? atlas.tileCapacity < MAX_MESH_SDF_SLOTS
-        : atlas.capacity < MAX_INSTANCE_SLOTS;
+      const overflowSig = `${entries.length}:${atlas.capacity}`;
+      // Retry only while a bigger tier could actually help — asking for a
+      // rebuild that must fail the same way is the loop this guards against.
+      const canGrow = atlas.capacity < MAX_INSTANCE_SLOTS;
       if (canGrow && this._overflowRebuildSig !== overflowSig) {
         this._overflowRebuildSig = overflowSig;
         this.requestRebuild();
@@ -5381,106 +5196,28 @@ export class GISystem {
         this._warnedSlotBudget = true;
         console.warn(
           `[gi] ${overflow} of ${entries.length} placements could not seat ` +
-            (tileOverflow > 0
-              ? `(${tileOverflow} lacked a free atlas tile of ${atlas.tileCapacity}) `
-              : `(instance slots ${atlas.capacity}) `) +
-            `— they are invisible to GI`,
+            `(slots ${atlas.capacity}) — they are invisible to GI`,
         );
       }
     } else {
       this._overflowRebuildSig = null;
       this._warnedSlotBudget = false;
     }
-    // Detail slots — per-step trace refinement. Priority order:
-    // 1. THIN analytic slots (plane walls, partitions, hollow room shells):
-    //    thinner than the field cell they are otherwise invisible to the
-    //    sphere trace between cell centers — the "light goes through the
-    //    partition" leak. Analytic distances are exact and fetch-free.
-    // 2. Densest baked meshes (sub-cell silhouettes: wings, fine props).
-    const minCell = state.volume?.minCell ?? 0.2;
-    const scratchScale = new THREE.Vector3();
-    const mapped = entries
-      .map((entry) => ({ entry, slot: slotOfKey.get(entry.key) ?? -1 }))
-      .filter((d) => d.slot >= 0);
-    const thinWalls = [];
-    const dense = [];
-    const thinThreshold = Math.max(2 * minCell, 0.4);
-    for (const d of mapped) {
-      const analytic = d.entry.analytic;
-      d.entry.mesh.getWorldScale(scratchScale);
-      if (analytic) {
-        const minDim =
-          2 *
-          Math.min(
-            analytic.half[0] * Math.abs(scratchScale.x),
-            analytic.half[1] * Math.abs(scratchScale.y),
-            analytic.half[2] * Math.abs(scratchScale.z),
-          );
-        // Hollow shells ARE walls regardless of their outer dimensions.
-        if (analytic.hollow || minDim < thinThreshold) thinWalls.push(d);
-      } else {
-        // BAKED thin slabs (geometry-editor / GLB walls — no primitive
-        // type, so no analytic slot) leak exactly like primitive ones:
-        // their local 64³ SDF is far finer than the global field, so
-        // detail-refining them seals sub-cell walls of ANY origin.
-        const geometry = d.entry.mesh.geometry;
-        if (!geometry.boundingBox) geometry.computeBoundingBox();
-        const bb = geometry.boundingBox;
-        const minDim = bb
-          ? Math.min(
-              (bb.max.x - bb.min.x) * Math.abs(scratchScale.x),
-              (bb.max.y - bb.min.y) * Math.abs(scratchScale.y),
-              (bb.max.z - bb.min.z) * Math.abs(scratchScale.z),
-            )
-          : Infinity;
-        if (minDim < thinThreshold) thinWalls.push(d);
-        else dense.push(d);
-      }
-    }
-    dense.sort((a, b) => b.entry.tris - a.entry.tris);
-    const budget = Math.min(DETAIL_SLOTS, atlas.detailBudget ?? DETAIL_SLOTS);
-    // RESERVE up to two slots for the densest baked meshes. Walls still come
-    // first (dropping one reopens sub-cell leak paths), but a wall-heavy
-    // room used to consume the WHOLE budget — the character's hi-res SDF
-    // was resident yet never sampled, so its shadows stayed field-coarse.
-    const denseReserve = Math.min(2, dense.length);
-    const picked = [
-      ...thinWalls.slice(0, Math.max(0, budget - denseReserve)),
-      ...dense,
-      ...thinWalls.slice(Math.max(0, budget - denseReserve)),
-    ].slice(0, budget);
-    atlas.setDetailSlots(picked.map((d) => d.slot));
-    // SAME ranking, published per slot for the instance grid — which spends
-    // this budget PER CELL rather than scene-wide. A cell keeps the highest
-    // ranked slots it is offered, so the ordering that used to decide "which
-    // 12 slots in the level" now decides "which few of the slots near this
-    // point", and the losers are only ever things that are far away.
-    const priority = new Float32Array(atlas.capacity);
-    for (const d of thinWalls) priority[d.slot] = 3;
-    for (const d of dense) priority[d.slot] = 2 - Math.min(1, 1 / Math.max(1, d.entry.tris / 1000));
-    atlas.slotPriority = priority;
-    atlas.grid?.invalidate();
-    const pickedNames = picked
-      .map((d) => `${d.entry.mesh.name || "mesh"}${d.entry.hiRes ? "*" : ""}`)
-      .join(", ");
-    if (pickedNames !== this._lastDetailLog && globalThis.__giVerbose) {
-      this._lastDetailLog = pickedNames;
-      // With the instance grid live the budget is spent PER CELL, so the
-      // scene-wide "over budget" count is not a shortfall any more — the
-      // named slots are only the fallback list. Saying "raise Quality" when
-      // the ray is already refining against its own neighbourhood would send
-      // people after a setting that no longer buys them anything.
-      const over = thinWalls.length + dense.length - budget;
-      console.log(
-        `[gi] detail slots (${picked.length}/${budget}, * = 128³ hi-res): ${pickedNames || "none"}` +
-          (atlas.grid
-            ? ` — ${budget} refined per ray position from the instance grid`
-            : over > 0
-              ? ` — ${over} more candidates over budget (raise Quality)`
-              : ""),
-      );
-    }
-    this.#refreshOccupancySlotRemap();
+    // THE DETAIL-SLOT RANKING WENT WITH THE TRACES THAT SPENT IT. Shadow and
+    // mirror rays used to min() a per-quality budget of 4-12 "detail" slots at
+    // every step, on top of the composited field, so that sub-cell geometry a
+    // 0.33m field cannot represent still occluded — a 0.1m partition is
+    // steppable-over otherwise, which was the "light through the wall" leak.
+    // This block chose which slots got that budget (thin analytic walls and
+    // hollow room shells first, then the densest baked meshes, with two slots
+    // reserved so a wall-heavy room could not starve a character's hi-res SDF)
+    // and published the same ranking per-slot for the instance grid to spend
+    // per cell.
+    //
+    // NONE OF THAT PROBLEM EXISTS NOW: the occupancy pyramid rasterizes at
+    // 0.10-0.25m voxels and marches them hierarchically, so sub-cell geometry
+    // is IN the medium rather than refined against on the side. The whole
+    // ranking was an artifact of the coarse composited field.
   }
 
   /**
@@ -5944,15 +5681,13 @@ export class GISystem {
   /** setBounds + everything that has to follow it (shared by both tiers). */
   #applyBounds(next, size) {
     const state = this.state;
-    state.volume.setBounds(next); // mutates state.bounds + world uniforms + atlas.aabbExpand
+    state.volume.setBounds(next); // mutates state.bounds + the world uniforms
     state.center.copy(next.min).add(next.max).multiplyScalar(0.5);
-    // A stretch changes the cell size, and flat primitives' solid thickness
-    // is derived from it (see the build).
-    state.atlas.minAnalyticHalfWorld = Math.max(0.01, state.volume.minCell * 0.5);
-    // Slot AABBs embed the old aabbExpand — refresh every slot and bump the
-    // revision so the next tick recomposites the whole field + full queue.
+    // Bump the slot revision so the next tick re-voxelizes the pyramid against
+    // the moved bounds. (This used to also re-derive every slot's world AABB,
+    // which embedded the volume's old cap reach, and re-pick the thin-wall
+    // detail slots from the new cell size — both went with the composite.)
     state.atlas.refreshAllSlots();
-    // Thin-wall detail-slot selection depends on the cell size.
     this.#syncSlots(state.entries);
     // The SDF debug box is a build-size BoxGeometry — reposition/rescale it.
     const occView = state.gizmos?.occView;
@@ -6377,33 +6112,9 @@ export class GISystem {
     field.setGeometry(geometries, placements);
     for (const p of placements) field.setSlotMatrix(p.slot, p.matrix);
     field.placements = placements;
-    this.#refreshOccupancySlotRemap();
     // The static shadow BVH bakes world-space triangles — a changed mesh SET
     // means it no longer matches the scene.
     if (placementSetChanged && this._dynSet?.staticBvh) this._staticBvhStale = this._frame;
-  }
-
-  /**
-   * Uploads the occupancy-slot → atlas-slot bridge (occupancyField.slotAtlas).
-   * The two numberings are assigned independently — placements by mesh-walk
-   * order, atlas slots by #syncSlots capacity/priority — which is exactly the
-   * crossed-numbering bug that once fed the composite a different mesh's
-   * colour and got cellAttr disabled there. Runs after every #syncSlots and
-   * after every occupancy content refresh: the two points where either
-   * numbering can change.
-   */
-  #refreshOccupancySlotRemap() {
-    const field = this.state?.volume?.occupancyField;
-    const atlas = this.state?.atlas;
-    if (!field?.placements || !atlas?.assignments || !field.setSlotAtlas) return;
-    const slotOfKey = new Map();
-    for (let i = 0; i < atlas.assignments.length; i++) {
-      const a = atlas.assignments[i];
-      if (a?.key != null) slotOfKey.set(a.key, i);
-    }
-    for (const p of field.placements) {
-      field.setSlotAtlas(p.slot, slotOfKey.get(slotKeyOf(p.mesh, p.instanceId)) ?? -1);
-    }
   }
 
   /**

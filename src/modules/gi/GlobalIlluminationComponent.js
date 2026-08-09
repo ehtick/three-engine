@@ -7,12 +7,11 @@ import { Component } from "../../engine/components/Component.js";
  * world-space AABB the GI covers. One component is active at a time (last
  * attached wins — same convention as Environment).
  *
- * Structural props (size, voxel size, probe spacing, cascade shape) rebuild
- * the GPU pipeline; `intensity` and `debugProbes` apply live. Scene changes
- * (moved meshes, edited materials, moved lights) re-bake the voxel grid
- * automatically (debounced) when `autoRebake` is on — lighting itself
- * re-traces every frame regardless, so it reacts within a frame of the
- * voxels updating.
+ * Structural props (size, voxel size, probe spacing) rebuild the GPU pipeline;
+ * `intensity` and `debugProbes` apply live. Scene changes (moved meshes, edited
+ * materials, moved lights) re-voxelize the occupancy pyramid automatically —
+ * lighting re-evaluates every frame regardless, so it reacts within a frame of
+ * the geometry updating.
  */
 export class GlobalIlluminationComponent extends Component {
   static type = "global-illumination";
@@ -61,46 +60,18 @@ export class GlobalIlluminationComponent extends Component {
     // Cost: indirect light trails a fast-moving light by up to ~1s. Direct
     // light and shadows are three's own and stay instant.
     probeSmoothing: 0.02,
-    // PEAK SPLIT — alternate the two halves of the awake pipeline (field
-    // feedback on even frames, cascade transport on odd) instead of running
-    // both every frame. Measured on Sponza/ultra: 6.3ms of GPU compute per
-    // awake frame becomes a 3.9ms peak, which is the difference between
-    // holding and missing a 120Hz frame budget while a light moves. The halves
-    // are a ping-pong (each reads the other's output, never its own), so this
-    // converges to the same answer at half the rate per half; `fieldSmoothing`
-    // is rate-compensated so light response is unchanged. Turn OFF for the
-    // absolute fastest GI RESPONSE at double the awake cost.
-    peakSplit: true,
     reflections: true,
     // Per-triangle BVH reflections are an explicit High/Ultra opt-in. The
     // trace is shared by the half-resolution screen resolve; materials only
     // sample its cached result, so imported scenes no longer pay the old
     // per-material reflection-ray cost.
     exactReflections: false,
-    // SPARSE FINE FIELD. The composited field is one cell per ~voxelSize, which
-    // on a building-sized volume is decimetres — wider than the columns and
-    // walls it has to occlude, so indirect light walks through them. This adds
-    // a fp16 brick per surface-adjacent cell, giving traces sub-cell occlusion
-    // for one extra texture fetch. Costs VRAM (the pool scales with quality),
-    // which is why it is opt-in rather than always on.
-    // TRACING BACKEND. "occupancy" hit-tests a conservative triangle-occupancy
-    // pyramid with a hierarchical DDA (occupancyField.js); "sdf-legacy" sphere-
-    // traces the composited per-mesh SDF field.
-    //
-    // OCCUPANCY IS THE DEFAULT because it is the one that does not leak: the
-    // composited field is ~0.33m on a building-sized volume, so a 0.5m column
-    // is one and a half cells wide and diffuse transport walks through it,
-    // while occupancy is rasterized straight from triangles.
-    //
-    // "sdf-legacy" IS KEPT ON PURPOSE, and this is the honest reason: occupancy
-    // costs a voxelization dispatch on every geometry change and a longer DDA
-    // on every transport ray, and on a large real scene that has been enough to
-    // hang a GPU outright (DXGI_ERROR_DEVICE_HUNG). It was deleted once, on the
-    // grounds that one transport path is better than two — which is true right
-    // up until the one path is the expensive one and there is nothing to fall
-    // back to. Delete it again when occupancy has been measured on a
-    // building-sized scene at every quality tier, not before.
-    backend: "occupancy",
+    // (`sparseField` and `backend` lived here. The sparse fp16 brick level was
+    // unreachable from 2026-08-02 and its file is deleted; `backend`'s only
+    // other value was "sdf-legacy", a transport that no longer exists — the
+    // occupancy pyramid, rasterized straight from triangles, is the only one.
+    // GISystem still coerces a saved "sdf-legacy" and warns, so old scenes load
+    // unchanged, and `__giBackend` survives as a diagnostic kill switch.)
     // Stable ray-hit switch. All hybrid phases are implemented (brick-box →
     // exact-complex). "auto" follows the quality preset — the ladder's trade is
     // memory/cost vs hit precision, which is exactly what the presets already
@@ -145,7 +116,6 @@ export class GlobalIlluminationComponent extends Component {
     // — bakeCore.js, bakeWorker.js, the Library/gi-sdf cache, export
     // packaging, runtime browser bakes — is deleted; there is no SDF mode to
     // toggle back to. Saved scenes carrying the old prop are ignored.)
-    sparseField: false,
     emissiveShadows: false,
     // AMBIENT OCCLUSION ON INDIRECT LIGHT (world-space, from the occupancy
     // pyramid's distance oracle — see giScreen's obscurance ladder). The
@@ -184,7 +154,6 @@ export class GlobalIlluminationComponent extends Component {
     // full-res gbuffer position by the material-side bilateral, so its pixel
     // count is a nearly-free cost knob.
     lightShadowMaxPixels: 1_900_000,
-    autoRebake: true,
     // TEMPORARY LIGHT DURING COLD BOOT. In a GI-lit interior GI *is* the
     // ambient, so the scene renders black from the first tick until the field's
     // first composite — assets, then the shader compile wave, which can be tens
@@ -205,28 +174,39 @@ export class GlobalIlluminationComponent extends Component {
   // — see ComponentSection/MultiComponentSection's `renderField`). Selecting
   // a preset from the Quality dropdown itself never touches these values —
   // "custom" just means the preset name no longer implies any of them.
-  // ── INERT WHILE THE DIFFUSE TRANSPORT IS ABSENT ──────────────────────────
+  // ── PARKED WHILE THE DIFFUSE TRANSPORT IS ABSENT ─────────────────────────
   // The dense radiance cascades were deleted with the SRC rebuild's §12.8 unit
   // and Split Radiance Cascades replaces them in Phase 1-3 (see
   // `docs/GI_SRC_REBUILD_PLAN.md`). These keys have no consumer until then:
   // `cascadeCount`, `c0DirRes`, `bounce`, `bleedSaturation`, `temporalBlend`,
-  // `probeSmoothing`, `peakSplit`, `skyColor`/`skyIntensity`.
+  // `probeSmoothing`, `skyColor`/`skyIntensity`.
   //
-  // `sparseField` is a DIFFERENT and older case, found while making this cut and
-  // worth stating plainly: it has been inert since 2026-08-02, not since §12.8.
-  // Its gate in GISystem required `!killSdfEnabled()`, and that method has
-  // returned an unconditional `true` ever since the SDF bake pipeline was
-  // deleted — so this checkbox has done nothing for a week of sessions while
-  // reading as a live quality knob. Left in place for scene compatibility only.
-  // They are KEPT rather than removed because they are serialized into saved
-  // scenes, because #applyLiveProps still routes them to live uniforms, and
-  // because Phase 1-3 consumes every one of them unchanged — deleting them
-  // would silently rewrite the user's authored values on the next save. The
-  // module logs the absence at build (see GISystem's header); nothing here is
-  // relabelled, because with NO diffuse indirect at all the inertness of an
-  // individual bounce knob is not the thing a person would be confused by.
+  // They are KEPT, not removed: they are serialized into saved scenes,
+  // #applyLiveProps still routes them to live uniforms, and Phase 1-3 consumes
+  // every one unchanged — deleting them would silently rewrite the author's
+  // values on the next save. Nothing is relabelled either, because with NO
+  // diffuse indirect at all the inertness of one bounce knob is not what a
+  // person would be confused by; the module says so on its own build line.
   // `probeSpacing` is the exception and stays live: it sizes the probe lattice
   // an auto-fit refit snaps to, whether or not anything traces it.
+  //
+  // FIVE KNOBS WERE REMOVED OUTRIGHT, because a parked prop and a dead one are
+  // different things — a parked prop belongs to a feature that is visibly
+  // absent, while these described machinery that no longer exists at all and
+  // would never come back:
+  //   · `peakSplit` — the transport's two-half ping-pong dispatch.
+  //   · `sparseField` — and this one had been inert since 2026-08-02, not
+  //     since §12.8: its gate required `!killSdfEnabled()`, and that method
+  //     returned an unconditional `true` from the day the bake pipeline was
+  //     deleted. A live-looking quality checkbox that did nothing for a week.
+  //   · `autoRebake` — there are no bakes to re-run; nothing has read it since
+  //     the same deletion.
+  //   · `backend` — its only non-default value was "sdf-legacy", a transport
+  //     that does not exist. GISystem still coerces the saved string and warns,
+  //     so old scenes load; `__giBackend` remains as a diagnostic kill switch.
+  //   · `debugProbes`' "raw"/"merged" options (below) — dead entries beside
+  //     live ones in the same dropdown.
+  // Saved scenes keep these values harmlessly: an unknown prop is ignored.
   static schema = [
     // ZERO-SETUP MODE: Auto Fit derives the volume from THIS component's
     // entity — a mesh entity uses its own bounding box (×1.05, so probes
@@ -267,7 +247,6 @@ export class GlobalIlluminationComponent extends Component {
 
     { key: "reflections", label: "GI Reflections", type: "boolean", advanced: true, flipsToCustom: "quality" },
     { key: "exactReflections", label: "Exact Reflections", type: "boolean", advanced: true, flipsToCustom: "quality" },
-    { key: "backend", label: "Tracing Backend", type: "select", options: ["occupancy", "sdf-legacy"], advanced: true, flipsToCustom: "quality" },
     // A LOOK control like Sky Light, deliberately not advanced/flipsToCustom:
     // contact darkening is the single most visible realism knob after
     // intensity, and it costs a few bitset fetches at half res.
@@ -287,7 +266,6 @@ export class GlobalIlluminationComponent extends Component {
     // use `resolveScale` to go smaller, not a zero budget.
     { key: "resolveMaxPixels", label: "Resolve Pixel Budget", type: "number", min: 100_000, max: 8_000_000, step: 100_000, advanced: true },
     { key: "lightShadowMaxPixels", label: "Shadow Pixel Budget", type: "number", min: 100_000, max: 8_000_000, step: 100_000, advanced: true },
-    { key: "autoRebake", label: "Auto Re-bake", type: "boolean", advanced: true, flipsToCustom: "quality" },
     // Deliberately NOT `flipsToCustom`: whether you want a placeholder light
     // while the field builds is a preference about startup, not a quality tier,
     // and switching preset must not silently put a light back in the scene.
@@ -307,11 +285,9 @@ export class GlobalIlluminationComponent extends Component {
     // Deliberately NOT `flipsToCustom` — it is a stability knob, not a quality
     // level, and switching preset must not silently reset it.
     { key: "probeSmoothing", label: "Light Smoothing (1=off)", type: "number", min: 0.02, max: 1, step: 0.01, advanced: true },
-    { key: "peakSplit", label: "Peak Split", type: "boolean", advanced: true },
     { key: "rayHitMode", label: "Ray Hit Mode", type: "select", options: ["auto", "occupancy-legacy", "hybrid-brick-box", "hybrid-plane", "hybrid-plane-coverage", "hybrid-exact-complex"], advanced: true },
     { key: "rayHitProfiling", label: "Ray Hit Profiling", type: "boolean", advanced: true },
     { key: "rayHitSkipDistance", label: "Ray Hit Empty-Space Skip", type: "boolean", advanced: true },
-    { key: "sparseField", label: "Sparse Fine Field", type: "boolean", advanced: true, flipsToCustom: "quality" },
     { key: "emissiveShadows", label: "Emissive Shadows", type: "boolean", advanced: true, flipsToCustom: "quality" },
   ];
 
