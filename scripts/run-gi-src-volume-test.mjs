@@ -74,6 +74,13 @@
 //
 // Run: node scripts/run-gi-src-volume-test.mjs
 import { readFileSync } from "node:fs";
+// THE REAL MODULE, not the CPU reference — the spine block at the bottom tests
+// `createSrcVolume` itself (§12.8.2). It imports `three/webgpu` and `three/tsl`,
+// which is fine in node for everything this suite touches: the world bundle is
+// `THREE.Vector3` + `uniform()`, and `sharedFn`'s graphs are built lazily and
+// never compiled here. Nothing in this file needs a device.
+import * as THREE from "three/webgpu";
+import { createSrcVolume } from "../src/modules/gi/srcVolume.js";
 import {
   REF_OCC_LEVELS,
   buildRefComposite,
@@ -548,6 +555,138 @@ console.log(
 console.log(
   `   in-band accuracy: ${parity.accuracy.o.mean.toFixed(4)}m → ${voxelCap.accuracy.o.mean.toFixed(4)}m; ` +
   `penumbra error ${parity.width.wo.mean.toFixed(4)} → ${voxelCap.width.wo.mean.toFixed(4)}`,
+);
+
+// ══ THE SPINE: srcVolume AS THE VOLUME PROVIDER (§12.8.2) ═════════════════════
+//
+// Everything above measures the DISTANCE SOURCE. This block measures the far
+// duller thing the deletion actually trips over: whether `createSrcVolume` can
+// stand in for `giField.js`'s volume object at the surviving call sites.
+//
+// It earns its place because of what the CPU reference above cannot see. The
+// arithmetic here is trivial — `cell = size/res`, `capWorld = 16·minCell` — and
+// trivial arithmetic behind a REFIT is exactly where a stale mirror hides: the
+// uniforms and `volume.cell` are live references that `world.refit` writes
+// through, so they cannot go stale, while `volume.minCell` and
+// `volume.capWorld` are PRIMITIVES that `setBounds` has to reassign by hand.
+// Three GISystem call sites read `volume.minCell` (two of them size the slot
+// registry's analytic half), and a stale one is not a crash — it is a volume
+// quietly lying about how big its cells are, which reads downstream as
+// mis-scaled contact shadows nobody traces back to a refit.
+//
+// The real reference is giField.js's own arithmetic, restated here from the
+// source rather than from srcVolume's, so the two are compared and not merely
+// echoed: `cell = size/res`, `minCell = min(cell)`, `capWorld = SDF_CAP·minCell`
+// with `SDF_CAP = 16` (giField.js:35, 49, 578), `cellMax = max(cell)`.
+console.log("");
+console.log("══ the spine: createSrcVolume standing in for giField's volume");
+
+const GIFIELD_SDF_CAP = 16; // giField.js:35 — restated, not imported, on purpose
+const spineOf = (bounds, res) => {
+  const size = [
+    bounds.max.x - bounds.min.x,
+    bounds.max.y - bounds.min.y,
+    bounds.max.z - bounds.min.z,
+  ];
+  const cell = [size[0] / res.x, size[1] / res.y, size[2] / res.z];
+  const minC = Math.min(...cell);
+  return { cell, minCell: minC, capWorld: GIFIELD_SDF_CAP * minC, cellMax: Math.max(...cell) };
+};
+
+// Deliberately ANISOTROPIC and not a cube: `minCell` vs `cellMax` is the whole
+// point of having both, and a cubic volume makes a swap of the two invisible.
+const spineBounds = new THREE.Box3(new THREE.Vector3(-3, 0, -5), new THREE.Vector3(5, 4.5, 7));
+const spineRes = { x: 24, y: 18, z: 40 };
+// A stub pyramid, because the spine does not consult the field's BITS at all —
+// only its `voxel` (for the `res: null` lattice) and its `refit`. Counting the
+// refits is the assertion; see below for why that one is easy to lose.
+const stubField = {
+  voxel: { value: new THREE.Vector3(0.1, 0.1, 0.1) },
+  hasSurfaceRecords: false,
+  refits: 0,
+  refit() { this.refits++; },
+};
+
+const vol = createSrcVolume({ occField: stubField, bounds: spineBounds, res: spineRes });
+const want0 = spineOf(spineBounds, spineRes);
+const near = (a, b, eps = 1e-12) => Math.abs(a - b) <= eps;
+
+check("the spine members the swap needs are all present",
+  ["res", "bounds", "cell", "minCell", "capWorld", "setBounds", "world", "occupancyField", "rayHitMode", "distance",
+    "createSoftShadowTrace", "createWidthProbe"].every((k) => k in vol),
+  `missing: ${["res", "bounds", "cell", "minCell", "capWorld", "setBounds", "world", "occupancyField", "rayHitMode",
+    "distance", "createSoftShadowTrace", "createWidthProbe"].filter((k) => !(k in vol)).join(", ") || "none"}`);
+
+check("cell/minCell/cellMax match giField's arithmetic at build",
+  near(vol.cell.x, want0.cell[0]) && near(vol.cell.y, want0.cell[1]) && near(vol.cell.z, want0.cell[2]) &&
+  near(vol.minCell, want0.minCell) && near(vol.world.cellMax.value, want0.cellMax),
+  `minCell ${vol.minCell.toFixed(4)} vs ${want0.minCell.toFixed(4)}, cellMax ${vol.world.cellMax.value.toFixed(4)} vs ${want0.cellMax.toFixed(4)}`);
+
+// §12.6.5 #1, closed as a no-op and now ASSERTED instead of eyeballed: giField's
+// `SDF_CAP · minCell` and srcVolume's `16 · minCell` are the same number, reached
+// from opposite ends (a byte-quantized texture's useful reach vs the pyramid's
+// own `voxel · 2^(LEVELS-1)` ceiling). If someone retunes either, this fails and
+// the deferred A/B is live again rather than silently resolved.
+check("capWorld is giField's SDF_CAP·minCell exactly (§12.6.5 #1 is a no-op)",
+  near(vol.capWorld, want0.capWorld) && near(vol.world.capWorld.value, want0.capWorld),
+  `${vol.capWorld.toFixed(4)}m = ${GIFIELD_SDF_CAP}×${vol.minCell.toFixed(4)}`);
+
+// THE REFIT. Non-uniform scale on purpose: a uniform one would let a swapped
+// axis through, and `setBounds` is the path an auto-fit takes every time the
+// scene's bounds move, i.e. routinely and unobserved.
+const refitBounds = new THREE.Box3(new THREE.Vector3(-6, -1, -9), new THREE.Vector3(10, 5.5, 15));
+const want1 = spineOf(refitBounds, spineRes);
+const refitsBefore = stubField.refits;
+vol.setBounds(refitBounds);
+
+check("setBounds reassigns the PRIMITIVE mirrors (the ones that can go stale)",
+  near(vol.minCell, want1.minCell) && near(vol.capWorld, want1.capWorld),
+  `minCell ${want0.minCell.toFixed(4)} → ${vol.minCell.toFixed(4)} (want ${want1.minCell.toFixed(4)}), ` +
+  `capWorld ${vol.capWorld.toFixed(4)} (want ${want1.capWorld.toFixed(4)})`);
+
+check("the live references followed the refit without being re-mirrored",
+  near(vol.cell.x, want1.cell[0]) && near(vol.cell.y, want1.cell[1]) && near(vol.cell.z, want1.cell[2]) &&
+  near(vol.world.minCell.value, want1.minCell) && near(vol.world.cellMax.value, want1.cellMax),
+  `cell [${vol.cell.toArray().map((v) => v.toFixed(3)).join(", ")}]`);
+
+// giField's setBounds MUTATES the Box3 the caller handed it (GISystem's refit
+// site relies on that: "mutates state.bounds + world uniforms"). A copy instead
+// of a mutation leaves GISystem's own `state.bounds` on the old volume.
+check("the caller's bounds object is mutated, as giField's setBounds does",
+  spineBounds.min.equals(refitBounds.min) && spineBounds.max.equals(refitBounds.max),
+  `[${spineBounds.max.toArray().join(", ")}]`);
+
+// The one easy thing to drop, and the reason it gets its own case: the pyramid
+// shares world.min/world.size as UNIFORMS, so its shaders need no touching and a
+// missing refit looks fine — but its voxel size is derived and every bit in it
+// was rasterized against the old bounds.
+check("occField.refit() ran (voxel size is derived, not uniform-shared)",
+  stubField.refits === refitsBefore + 1,
+  `${refitsBefore} → ${stubField.refits}`);
+
+// The A/B seam borrows giField's world bundle, which refits by having giField
+// write its uniforms directly and therefore has no `refit` of its own. A silent
+// no-op there would be a volume whose cells lie about their size, so the guard
+// throws. This is the arm the deletion removes; until then it must not pretend.
+let borrowedThrew = false;
+try {
+  createSrcVolume({
+    occField: stubField,
+    world: { ...vol.world, refit: undefined },
+  }).setBounds(refitBounds);
+} catch {
+  borrowedThrew = true;
+}
+check("a borrowed (giField) world bundle REFUSES setBounds instead of no-op'ing", borrowedThrew);
+
+// `res: null` is the design arm, and it is the surviving half of §12.6.5 #1:
+// same 16× multiplier, different LATTICE (the pyramid's voxel instead of the
+// coarse cell). Reported, not gated — the split takes the `res` arm.
+const voxVol = createSrcVolume({ occField: stubField, bounds: spineBounds.clone(), res: null });
+console.log(
+  `   lattice arms: res → minCell ${vol.minCell.toFixed(4)}m / cap ${vol.capWorld.toFixed(3)}m, ` +
+  `res:null → minCell ${voxVol.minCell.toFixed(4)}m / cap ${voxVol.capWorld.toFixed(3)}m ` +
+  `(${(vol.minCell / voxVol.minCell).toFixed(2)}× apart — the open half of §12.6.5 #1)`,
 );
 
 console.log("─────────────────────────────────────────────────────────────────");

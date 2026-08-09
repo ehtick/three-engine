@@ -463,16 +463,21 @@ export function createSrcSoftShadowTrace(occField, world, {
 }
 
 /**
- * The volume bundle SRC hands to the screen chain — the two shadow factories
- * plus the world uniforms, and nothing else. `giField.js`'s equivalent carries
- * six radiance buffers, a distance texture, a slot atlas, a sparse brick page
- * table and a composite pass; every one of those is transport and dies in §5.
+ * The volume bundle SRC hands to the screen chain: the two shadow factories, the
+ * world uniforms, and the spine every survivor stands on. `giField.js`'s
+ * equivalent carries six radiance buffers, a distance texture, a slot atlas, a
+ * sparse brick page table and a composite pass on top; every one of THOSE is
+ * transport and dies in §5.
  *
- * Signature-compatible with the `volume` object at the surviving call sites
- * (`volume.createSoftShadowTrace(lift, steps, name, stable)`,
- * `volume.createWidthProbe(name)`, `volume.world`, `volume.occupancyField`,
- * `volume.rayHitMode`) so the GISystem rewrite can swap the producer without
- * touching the consumers — which is what keeps that edit reviewable.
+ * Signature-compatible with the `volume` object at the surviving call sites —
+ * `createSoftShadowTrace(lift, steps, name, stable)`, `createWidthProbe(name)`,
+ * `world`, `occupancyField`, `rayHitMode`, `distance`, plus `res`/`bounds`/
+ * `cell`/`minCell`/`capWorld`/`setBounds` (§12.8.2) — so the GISystem rewrite
+ * can swap the producer without touching the consumers, which is what keeps that
+ * edit reviewable. NOT compatible with, and never will be: `compositeCompute`,
+ * `distanceTexture`, `grid`, `sparse`, `updateGrid`, `updateSparse`,
+ * `coarseLevel`, `atlas`, `createSceneTrace`, `readbackStats` and the six
+ * buffers. Those call sites are the deletion, not the swap.
  *
  * `world` may be supplied by the caller. The A/B seam passes giField's own
  * bundle so the two arms share one set of tuned constants and differ ONLY in
@@ -499,6 +504,61 @@ export function createSrcVolume({
     occupancyField: occField,
     rayHitMode,
     distance,
+
+    // ══ THE SPINE, i.e. what giField.js ADDS ON TOP OF THE WORLD BUNDLE ══════
+    //
+    // §12.7's closing order said giField "dies as a unit". It does not — its
+    // return object mixes the dense transport with the spine that 40-odd
+    // GISystem call sites stand on (28 × `occupancyField`, 12 × `world`), and
+    // these few members are the rest of it (§12.8.2). PLAIN VALUES, not
+    // uniforms, deliberately: that is what the surviving call sites read
+    // (`volume.minCell` at three of them, all CPU-side sizing), and giField
+    // mutates them in place on a refit. Matching its shape is what keeps the
+    // producer swap a one-line change at the call site instead of a sweep.
+    res,
+    bounds,
+    // LIVE REFERENCES into the world bundle, not copies — `world.refit` writes
+    // through `w.cell.value`, so a reader of `volume.cell` sees the refit
+    // without anyone having to remember to re-mirror it. The numbers below
+    // cannot work that way (they are primitives), which is why `setBounds`
+    // reassigns them explicitly and why they are the ones worth testing.
+    cell: w.cell.value,
+    minCell: w.minCellValue,
+    capWorld: w.capWorldValue,
+
+    /**
+     * In-place volume refit — the world/occupancy half of giField's `setBounds`.
+     *
+     * WHAT IS DELIBERATELY MISSING: giField's version also re-expanded the slot
+     * atlas's AABBs (`atlas.aabbExpand = capWorld`) and invalidated the instance
+     * grid and the sparse brick page table. All three are transport and die in
+     * §5 — the SDF tile atlas is the half of `slotRegistry.js` that goes
+     * (§12.8.3), and grid/sparse go whole. A refit that still had to poke them
+     * would mean the split had not actually happened.
+     *
+     * `occField.refit()` is NOT optional and is the one easy thing to drop here:
+     * the pyramid shares `world.min`/`world.size` as uniforms, so its shaders
+     * need no touching, but its voxel SIZE is derived rather than uniform-shared
+     * and every bit in it was rasterized against the old bounds.
+     */
+    setBounds(next) {
+      // A world supplied by the A/B seam is giField's own bundle, which refits
+      // by having giField.setBounds write its uniforms directly — it has no
+      // `refit` of its own. Nothing calls this on that arm (giField owns the
+      // refit there), so the honest response is to say so rather than no-op:
+      // a silently skipped refit is a volume whose cells lie about their size.
+      if (typeof w.refit !== "function") {
+        throw new Error(
+          "createSrcVolume.setBounds: this volume borrowed its world bundle (the giField A/B seam) — refit it through giField.setBounds instead",
+        );
+      }
+      bounds?.min.copy(next.min);
+      bounds?.max.copy(next.max);
+      w.refit(next);
+      this.minCell = w.minCellValue;
+      this.capWorld = w.capWorldValue;
+      occField?.refit();
+    },
     createSoftShadowTrace: (lift, steps, name = undefined, stable = false) =>
       createSrcSoftShadowTrace(occField, w, {
         lift, steps, name: name ?? "srcShadowTrace", stable, distance,
