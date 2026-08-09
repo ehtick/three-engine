@@ -1427,3 +1427,152 @@ now means nothing. `lightTree.js` (1,129 lines, plus a green suite) has **no imp
 is a built-but-unwired many-lights sampler from the superseded `GI_NEXT_ARCHITECTURE.md` §7, and it
 is flagged rather than deleted only because it is orthogonal to this rebuild; say the word and it goes.
 And the user-eye check in the editor is still outstanding.
+
+### 12.11 Phase 1, part 1 — the math twins and the probe hashmap
+
+**Status:** two commits, `7a85548` → `ceb9fbc`. Both halves of the foundation Phase 1 stands on are
+in and gated; the driver that feeds them (real gbuffer → c0, the cascade ladder, debug gizmos,
+`smoke:gi-gpu?src=1`, GISystem wiring) is not. New gates: `test:gi-src-math`, `test:gi-src-probes`.
+Both are browser-driven against the dev server on 5201 — headless WebGPU has never worked here, so
+a real adapter is the only place a WGSL transcription error is observable at all.
+
+#### 12.11.1 The twins, and the four things the twin gate found on its first run
+
+`srcMathTsl.js` is the TSL expression of `srcMath.js` plus srcConfig's scalar half.
+`scripts/gi-src-math.html` runs every twin in a real compute pass and diffs it against the JS
+original **in the same page**: 687 cases, 17 integer families held BIT-EXACT with no tolerance at
+all, 16 float families at 4e-6 with the worst observed error printed rather than only pass/fail.
+The integer families are exact because they are what the probe hashmap is keyed on — a one-bit
+difference there is a different probe, not a small error, and Phase 1's "probe counts vs the CPU
+mirror" gate would be comparing two different algorithms.
+
+The input set is adversarial deliberately. Random inputs pass all of this on the first run: every
+finding below came from a case chosen to sit exactly on a boundary.
+
+1. **THE R2 SEQUENCE CANNOT BE EVALUATED IN FLOATS, and the mirror could never have told us.**
+   `fract(0.5 + a*n)` in f32 has 16384 distinct values at n=1024, 256 at n=65536, 32 at n=500,000
+   and **EIGHT at n=2e6** — §9's ray count. A 16×16 coverage histogram over 4096 points starting at
+   n=2e6 goes from a uniform 13..19 occupancy to **0..66, with empty cells**. At that point cascade
+   3's 2048 bins are fed by eight azimuths. In f64 the mirror is perfect at every index, so this is
+   invisible to `test:gi-src-ref` by construction. Both sides now run the additive recurrence in
+   **u32 fixed point** (`R2_ALPHA1_FX = 3242174889`, `R2_ALPHA2_FX = 2447445414`, both odd so the
+   period is 2^32): exact on both sides, `Math.imul` and WGSL's u32 multiply are the same operation,
+   and the measured discrepancy is identical to the f64 float form on every arm. The per-frame
+   jitter is a **u32 phase**, not a float, for the same reason. A new Phase-0 arm pins it with the
+   f32 float form as an explicit canary, so the finding fails on the CPU, in bare node, forever.
+2. **`atan2(0, 0)` is UNDEFINED in WGSL and every exactly-axial ±Z direction hits it.** This adapter
+   returned pi/2 where JS returns 0, so a pole ray binned to a different azimuth wedge. The point is
+   not that one answer is better — at the pole every wedge is equally defensible — it is that
+   "implementation-defined" also means two GPUs may disagree, and a deposit that lands in a
+   different bin per vendor is not something a later gate can attribute. Pinned to 0.
+3. **`sqrt(1 - z^2)` cancels at the poles**: 1.3e-5 of absolute error in the decoded x/y at
+   y = 0.999999, three orders worse than anything else in the file. Both files now use
+   `sqrt((1-z)(1+z))`, where whichever factor goes small is computed exactly (Sterbenz). 400× better
+   in f32, and better in f64 too — it was simply never observable there.
+4. **The gate itself was wrong first.** It fed the mirror f64 inputs the GPU never received, so
+   every float family was partly measuring input quantization. `lodBlend` divides by the 0.1-wide
+   overlap band and therefore **multiplies its input's rounding by ten**, which is why it was the
+   first float family to fail — by 1.1×, which is exactly the kind of margin that gets "fixed" with
+   a looser tolerance. Cases are now rounded through f32 before either side runs; worst float error
+   across all sixteen families fell to 6.3e-7.
+
+Two ambiguities are **counted rather than tolerated**, because a tolerance wide enough to cover
+them would also cover a genuinely inverted fold or a wrong bin: a ray within 1e-5 of tangent has an
+f32-noise-decided hemisphere fold sign and the two sides emit antipodal rays (1/687), and a
+direction sitting exactly on a wedge seam may bin either side (2/687, e.g. exactly 45°). The
+downstream families are fed **the GPU's own bin index** so that `binMorton` tests Morton and not
+`dirToBin` — a shared input reported five failures for one seam and hid whether Morton was ever
+wrong.
+
+Also recorded, because it decides how every rounding in the twin is written: **WGSL `round()` is
+ties-to-EVEN and JS `Math.round` is ties-toward +inf.** `nearestCell` rounds, so a probe exactly
+halfway between two lattice cells would insert a different probe on each side. Every rounding in
+`srcMathTsl.js` is `floor(x + 0.5)`, and `latticeOriginFor` moved out of `srcRef.js` into
+`srcMath.js` so the reference, the twin and the gate share one definition.
+
+**A tolerance the Phase-1 probe gate has to carry, not a bug to chase:** LOD selection takes a
+`log2` and then a `floor`, so a world point within ~1e-6 of a LOD boundary can floor to different
+shells on the two sides. A handful of boundary pixels inserting the neighbouring LOD's probe is
+correct behaviour.
+
+#### 12.11.2 The hashmap — what the design commits to
+
+`srcProbes.js`. One buffer per role with all cascades at fixed offsets (R7, and AGENTS.md leads
+with the 8-storage-buffer limit for a reason): `hashKeys` (atomic), `hashSlot`, `probeTable`
+(8 words/probe), `counters` (atomic), `freeStack`, `freeTop` (atomic).
+
+- **CAS is a `wgslFn` island.** TSL has no `atomicCompareExchangeWeak` — three r185's
+  `AtomicFunctionNode` ships load/store/add/sub/max/min/and/or/xor and stops — and the insert is not
+  expressible with any of them: `atomicMax` on the key makes the LARGEST key win a contended slot,
+  which is not a hashmap, and a load-then-store loop has a window where two probes claim one slot.
+  The vehicle is the one `bvhGpu.js`/`dynamicObjects.js` already prove out, a
+  `ptr<storage, array<atomic<u32>>, read_write>` parameter that three's `FunctionCallNode` passes as
+  `&buffer` (`ptr<...>` maps to `pointer` in `WGSLNodeFunction`'s type table; the `isAtomic` flag on
+  the node is what emits `array<atomic<u32>>`, independent of how the buffer is used in that
+  shader). **The hash mix is NOT in the island** — `srcMathTsl.hashKey` computes it and it is passed
+  in, so there is no second WGSL copy to drift from the gated one.
+- **The "Weak" is load-bearing.** `atomicCompareExchangeWeak` may report `exchanged == false` with
+  `old_value == expected`. Advancing the probe sequence on that scatters one key across several
+  slots and gives one probe two indirection entries — two payloads, half the rays each. The loop
+  distinguishes all three outcomes and **retries the same slot** when the old value came back EMPTY.
+- **Indices never move.** Compacting the table each frame is the obvious way to keep it dense, and
+  it moves the payload — the expensive part — every frame. Instead the table is fixed, the age pass
+  pushes dead entries onto a free stack, and new probes pop. A surviving probe is not touched at
+  all, which is also why [K] costs nothing for the steady-state majority.
+- **A failed allocation leaves `SLOT_EMPTY`, never index 0.** "No probe here" is a state every
+  consumer already renormalizes around (R1); clamping to 0 would pour every overflowing probe's rays
+  into one record.
+- **`srcHashFind` stops at the first EMPTY slot**, which is sound ONLY because there is no deletion
+  path — the table is cleared and rebuilt, never tombstoned. That is a design rule, not an
+  implementation detail, and a future delete would break the scan silently.
+- `[B]` hands its caller a **hash slot**, not a probe index, and `[C]` allocates. Fusing them is the
+  race this split exists to avoid: the thread that loses the CAS would have to spin until the winner
+  allocated. Every boundary between the passes is a real barrier and WebGPU has no device-wide
+  barrier inside a dispatch, so "fusing for speed" here produces a race, not a faster kernel.
+
+#### 12.11.3 What the probe gate found, including one with a delayed fuse
+
+`scripts/gi-src-probes.html` holds the map to `SrcProbeMap` as a **SET** — the two cannot agree on
+index assignment (the GPU allocates by `atomicAdd` in scheduler order, the mirror in insertion
+order) and pretending otherwise is a gate that fails for the wrong reason.
+
+1. **Nothing marked a probe as SEEN.** `age` means frames-since-last-seen, but a key CAS'd into a
+   slot the age pass already re-populated finds the entry present and touches nothing — so a probe
+   looked up every single frame still aged out. It was then immediately re-created from the key
+   still sitting in the hash: **same probe, new index, every `maxAge` frames, forever.** The storm
+   arm passed. The stability arm (one frame) passed. Only "survivors STILL hold their original
+   indices AFTER the sweep" caught it, and the Phase-4 symptom would have been the entire frame's
+   temporal history resetting on a beat. Resolving is now the touch, because resolving is the only
+   moment in the pipeline that means "a consumer is using this probe".
+2. **The load instrument cried wolf at rest.** Steps ÷ live probes reported 10.66 mean probe steps
+   on a map whose real mean is 1.10 — off by exactly the pixels-to-probes ratio, and the mirror's
+   own `probeSteps/inserts` had the same wrong denominator. `COUNTER_ATTEMPTS` is the denominator
+   now. An instrument reading 10× over budget on a healthy map is worse than no instrument.
+3. **A bare JS `return` inside an `If` body is not an early exit.** It ends the builder callback and
+   emits an EMPTY branch, so the code below runs anyway; it compiles and it validates. Three of them
+   would have double-freed every dead slot. Caught by reading, not by the gate. `Return()` is the
+   TSL statement, and `occupancyField.js` has used it correctly at five sites for a year.
+
+**Measured, stable over three runs:** 4096 contended inserts over 400 distinct keys →
+**0 wrong resolutions**, key set identical to the mirror, no key inserted twice, mean probe length
+**1.10 vs the mirror's 1.05** (the sequential-cell run is in there specifically because adjacent
+probe keys differ by 1 in z and would cluster under a weak mix), survivors immobile across a full
+retirement sweep, retirement landing on exactly frame `maxAge + 1`, **134/134 retired indices
+recycled**, and 4× overflow counted (3472 failures) with `live == capacity` and no index handed out
+twice.
+
+One test-side trap worth the line: the recycle arm's "new" keys were originally `cx = 300 + i`,
+outside the ±256 key window, so `packProbeKey` correctly returned EMPTY for all 134 and the arm
+measured a recycle rate over an empty set. Both liveness assertions in front of it exist now.
+
+#### 12.11.4 What is left in Phase 1
+
+The driver, and it is the half that touches the engine: pixels → c0 keys off the real half-res
+gbuffer, the cascade ladder (each c(i-1) probe inserting its nearest c(i) probe and keeping the
+link, which is both the merge's parent pointer and Alg. 3's count-propagation edge), the debug
+gizmos (instanced spheres coloured by cascade/LOD), the `profile.giPasses` telemetry line, the
+GISystem entry point, and the `smoke:gi-gpu?src=1` arm with its binding audit. The eye check —
+gizmos over Sponza and the user's game scene — closes the phase.
+
+Nothing above is wired into `GISystem.js` yet, so the shipping build is byte-identical to `dfa868f`
+and the emitter-shadow probe does not need re-running for these two commits.
