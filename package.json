@@ -107,8 +107,6 @@
     "test:mcp-coverage": "node scripts/run-mcp-coverage-test.mjs",
     "smoke:mcp-tools": "node scripts/run-mcp-tools-smoke.mjs",
     "test:gi-dynobj": "node scripts/run-gi-dynobj-bvh4-test.mjs",
-    "test:gi-surface-cache": "node scripts/run-gi-surface-cache-test.mjs",
-    "test:gi-card-lookup": "node scripts/run-gi-card-lookup-test.mjs",
     "test:gi-lighttree": "node scripts/run-gi-light-tree-test.mjs",
     "test:gi-boot-ambient": "node scripts/run-gi-boot-ambient-test.mjs",
     "test:gi-proxy-fit": "node scripts/run-gi-proxy-fit-test.mjs",

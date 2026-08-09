@@ -22,8 +22,6 @@ import { createSparseField } from "./sparseField.js";
 import { createTrilinearRadianceSampler } from "./voxelizeOnce.js";
 import { createSrcVolume } from "./srcVolume.js";
 import { emitterSlotFactor, emitterSurfaceT } from "./giLight.js";
-import { SRC_ATLAS_SIZE } from "./surfaceCache.js";
-import { createCardRadianceSampler } from "./surfaceCacheGpu.js";
 import { RayHitMode } from "./rayHit/RayHitConfig.js";
 import { MAX_MACRO_STEPS } from "./rayHit/RayHitPacking.js";
 
@@ -1522,25 +1520,6 @@ function createOccupancySceneTrace(
   // drops it: unshadowed movers bounce sun colour everywhere, which is the
   // A/B that says whether the ray is worth its cost.
   const shadeShadow = shadeDynamic && globalThis.__giDynShadeShadow !== false;
-  // ── SURFACE RADIANCE CACHE (§6.4), DEFAULT OFF ─────────────────────────────
-  // When GISystem hands over an atlas, a mover hit reads its OWN surface's
-  // outgoing radiance out of one bilinear texture fetch instead of re-running
-  // the light loop below per ray. `dynamicShade.surfaceCache` is null unless the
-  // `__giSurfaceCache` hatch / `surfaceCache` prop is on, so the shipped look is
-  // byte-identical until it is measured.
-  //
-  // ONE sampled texture (`hotBindings()` is what says which of the three planes
-  // a trace kernel may bind) and ZERO new storage bindings — the card table
-  // rides the `bits` tail this kernel already holds.
-  const cardSampler = shadeDynamic && dynamicShade?.surfaceCache?.srcRadiance && occField.bitsBuffer
-    ? createCardRadianceSampler({
-        srcRadiance: dynamicShade.surfaceCache.srcRadiance,
-        bits: occField.bitsBuffer,
-        baseWord: occField.dynamicObjectWordOffset,
-        atlasSize: dynamicShade.surfaceCache.atlasSize ?? SRC_ATLAS_SIZE,
-        layer: dynamicShade.surfaceCache.layer ?? 0,
-      })
-    : null;
   const farT = Math.hypot(world.size?.x ?? 0, world.size?.y ?? 0, world.size?.z ?? 0) || 1e3;
   return (origin, dir, tMaxWorld) => {
     const o = vec3(origin).toVar();
@@ -1616,31 +1595,13 @@ function createOccupancySceneTrace(
         // lighting, and an exact triangle needs no such correction.
         const hp = o.add(d.mul(r.t)).toVar();
         const n = vec3(r.normal).toVar();
-        // ── THE CACHE HIT. `sampleAtSlot` takes the slot the trace already
-        // decided rather than re-deriving it from a world normal, which is the
-        // one thing §6.4's lookup cannot do correctly (M⁻¹·nWorld only ranks
-        // like Mᵀ·nWorld under uniform scale). `valid` is the SINGLE fallback
-        // flag: a demoted object (card table 0) and an inactive slot (a plane
-        // allocates 2 of its 6) take the same branch — the full shading below,
-        // which is also `surfaceAt`'s mean-albedo path, so there is one
-        // fallback and not two.
+        // The surface radiance cache that could satisfy a mover hit from one
+        // texture fetch was deleted with the rest of §6 (its replacement is
+        // SRC's secondary probe cache). `cached` stays 0, so this is now an
+        // always-taken branch around the only remaining path — left standing
+        // rather than unwrapped because this whole function is dense transport
+        // and goes with `giField.js` itself.
         const cached = float(0).toVar();
-        if (cardSampler) {
-          const frame = dyn.cardFrameAt(who.index, hp);
-          const card = cardSampler.sampleAtSlot({
-            cardTableRel: frame.cardTableRel,
-            slot: who.slot,
-            pLocal: frame.pLocal,
-            halfExtents: frame.halfExtents,
-          });
-          If(card.valid.greaterThan(0.5), () => {
-            rad.assign(card.radiance);
-            cached.assign(1);
-          });
-        }
-        // Everything below is the UNCACHED path, unchanged. It is skipped
-        // wholesale on a cache hit — which is where the win is: the per-ray
-        // light loop plus one shadow ray per light becomes one texture fetch.
         If(cached.lessThan(0.5), () => {
           // AMBIENT PROXY, DEFAULT OFF (2026-08-07). This was the neighbourhood
           // voxel radiance, kept at weight 1 so the change could only ADD the
