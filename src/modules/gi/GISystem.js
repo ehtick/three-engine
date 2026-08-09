@@ -1399,9 +1399,11 @@ export class GISystem {
     // material, editor layers excluded) that restores renderer state.
     if (state.screen) {
       this.#syncScreenResolveSize(state);
-      if (state.screen.radiance?.cameraPosition) {
-        this.engine.camera.getWorldPosition(state.screen.radiance.cameraPosition.value);
-      }
+      // UNCONDITIONAL where it used to be gated on the cascade radiance bundle
+      // existing: the resolve's back-face flip, its view bias and the emitter
+      // shadow pass all read this, and none of them is about reflections
+      // (see #buildScreenResolve's note on `_giResolveCamU`).
+      if (this._giResolveCamU) this.engine.camera.getWorldPosition(this._giResolveCamU.value);
       // The mirror-mask second pass is only worth its projection walk when
       // something will actually read the mask — i.e. when the sparse exact
       // prepass is about to run. Without exact reflections the gbuffer's
@@ -2869,12 +2871,20 @@ export class GISystem {
             distTarget: lightShadow.pcss ? targets.lightShadowDist : null,
           }
         : null;
-      const radiance = radianceLookup
-        ? {
-            lookup: radianceLookup,
-            cameraPosition: uniform(new THREE.Vector3()),
-          }
-        : null;
+      // THE RESOLVE'S CAMERA, owned by the system and persistent across
+      // rebuilds — like `_giShadowFrameU` and friends, and for the same reason:
+      // the tick writes it every frame and a rebuild must not orphan that ref.
+      //
+      // It used to be a field of the `radiance` bundle, created per build. That
+      // coupled the back-face `facing` flip of THREE passes (resolve diffuse,
+      // reflection-hit shading, emitter shadow) to whether cascade reflections
+      // existed — a build without them silently took the emitter pass's
+      // `cameraPosition = null` fallback and stopped flipping. Nothing shipped
+      // with radiance off, so nothing shipped broken; the SRC deletion is what
+      // makes `radiance` null for real (§12.8).
+      this._giResolveCamU ??= uniform(new THREE.Vector3());
+      inputs.cameraPosition = this._giResolveCamU;
+      const radiance = radianceLookup ? { lookup: radianceLookup } : null;
       inputs.radiance = radiance;
       // Exact-reflection hit shading rides along in this pass (see
       // createGiResolve's `bvhShade`). The BVH targets are created HERE, ahead
@@ -2886,7 +2896,6 @@ export class GISystem {
         ? {
             ...this.#ensureBvhTargets(width, height),
             lightSlots,
-            cameraPosition: radiance?.cameraPosition ?? uniform(new THREE.Vector3()),
           }
         : null;
       const resolve = createGiResolve({ gbuffer, targets, width, height, ...inputs });
@@ -3043,7 +3052,7 @@ export class GISystem {
             height: emitterH,
             resolveWidth: width,
             resolveHeight: height,
-            cameraPosition: radiance?.cameraPosition ?? null,
+            cameraPosition: this._giResolveCamU,
           })
         : null;
       // EMITTER TEMPORAL ACCUMULATION (2026-08-07). This channel had the
@@ -3272,6 +3281,9 @@ export class GISystem {
       width,
       height,
       gather: screen.gather,
+      // Same system-owned uniform the first build bound — the tick holds the
+      // only reference that matters, so a resize must not mint a new one.
+      cameraPosition: this._giResolveCamU,
       normalOffset: screen.normalOffset,
       intensity: screen.intensity,
       emitter: screen.emitter,
@@ -3301,7 +3313,7 @@ export class GISystem {
         height: emitterH,
         resolveWidth: width,
         resolveHeight: height,
-        cameraPosition: screen.radiance?.cameraPosition ?? null,
+        cameraPosition: this._giResolveCamU,
       });
       if (emitterIndexes[0] >= 0) state.queue[emitterIndexes[0]] = screen.emitterShadowPass.compute;
       if (emitterIndexes[1] >= 0) state.queueNoFeedback[emitterIndexes[1]] = screen.emitterShadowPass.compute;

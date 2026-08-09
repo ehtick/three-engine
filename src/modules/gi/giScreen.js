@@ -223,8 +223,9 @@ export function renderGiGBuffer(renderer, scene, camera, gbuffer, { mirrorMask =
  * exactly the per-material cost this pass exists to remove.
  *
  * `bvhShade` (optional, 2026-08-02) — LIGHTS THE EXACT-REFLECTION HITS the
- * BVH prepass traced earlier this frame: `{ hit, albedo, target, lightSlots,
- * cameraPosition }`. It reads that pass's hit distance + face normal + albedo,
+ * BVH prepass traced earlier this frame: `{ hit, albedo, target, lightSlots }`
+ * (the camera comes from this pass's own `cameraPosition` — see below). It reads
+ * that pass's hit distance + face normal + albedo,
  * reconstructs the hit point, and writes the reflected surface's outgoing
  * radiance to `target`, which the mirror materials then sample directly.
  *
@@ -254,8 +255,27 @@ export function renderGiGBuffer(renderer, scene, camera, gbuffer, { mirrorMask =
  * one per fragment per material, and material shaders that stay a texture
  * fetch. Bundle: `{ target, slots, trace, lift, span }` — GISystem owns all of
  * them because they need the volume (trace/lift/span) and the light slots.
+ *
+ * `cameraPosition` IS ITS OWN INPUT, not a field of `radiance`, and that
+ * separation is load-bearing rather than tidiness. Four things here need the
+ * camera — the back-face `facing` flip, the gather's view bias, the reflection
+ * incident ray, and (at the call site) the emitter shadow pass — while only ONE
+ * of them is about reflections. It used to live inside the `radiance` bundle, so
+ * a build with no cascade radiance lookup silently lost the back-face flip in
+ * three surviving passes: `facing` degenerates to +1, a double-sided wall seen
+ * from inside a room gathers the wrong hemisphere, and the emitter pass takes
+ * its own documented `cameraPosition = null` fallback. Found while making this
+ * chain survive the transport's deletion (GI_SRC_REBUILD_PLAN §12.8), where
+ * `radiance` becomes null for real.
+ *
+ * `gather` MAY BE NULL — a build with no diffuse indirect at all (the SRC
+ * rebuild's intermediate state: probes not yet populated). The diffuse term and
+ * the AO that modulates it are then compiled out, not multiplied by zero, and
+ * an exact-reflection hit is lit by its direct terms alone. Every other term
+ * here — emitter direct, analytic direct, reflections, sun shadows — is
+ * independent of it and keeps working.
  */
-export function createGiResolve({ gbuffer, targets, width, height, gather, normalOffset, intensity, emitter, radiance, bvhShade = null, ao = null }) {
+export function createGiResolve({ gbuffer, targets, width, height, gather = null, cameraPosition = null, normalOffset, intensity, emitter, radiance = null, bvhShade = null, ao = null }) {
   // The TARGETS are owned by the caller and outlive every rebuild: materials
   // sample them through persistent texture nodes, so recreating them here
   // would silently leave already-compiled materials bound to dead textures.
@@ -288,16 +308,14 @@ export function createGiResolve({ gbuffer, targets, width, height, gather, norma
     If(g0.w.greaterThan(0.5), () => {
       const P = g0.xyz.toVar();
       const rawN = g1.xyz.normalize().toVar();
-      const facing = step(0, rawN.dot(radiance?.cameraPosition?.sub(P) ?? rawN)).mul(2).sub(1);
+      const facing = step(0, rawN.dot(cameraPosition ? vec3(cameraPosition).sub(P) : rawN)).mul(2).sub(1);
       const N = rawN.mul(facing).toVar();
       const samplePoint = P.add(N.mul(normalOffset)).toVar();
       // Unit toward-camera vector for the gather's view-bias component
       // (silhouette fix — see cascadeGather.gatherViewBias). Zero when the
-      // resolve has no camera (radiance null), which disables it exactly.
-      const viewDir = radiance?.cameraPosition
-        ? vec3(radiance.cameraPosition).sub(P).normalize().toVar()
-        : vec3(0);
-      out.assign(vec3(gather(samplePoint, N, viewDir)).mul(intensity));
+      // resolve has no camera at all, which disables it exactly.
+      const viewDir = cameraPosition ? vec3(cameraPosition).sub(P).normalize().toVar() : vec3(0);
+      if (gather) out.assign(vec3(gather(samplePoint, N, viewDir)).mul(intensity));
       // AMBIENT OCCLUSION ON THE INDIRECT TERM (occupancy-oracle obscurance).
       //
       // The probe lattice is ~1m — indirect light arrives with NO small-scale
@@ -316,7 +334,9 @@ export function createGiResolve({ gbuffer, targets, width, height, gather, norma
       // dirt. Reflections keep their own visibility. `strength`/`radius`
       // are live uniforms (aoStrength/aoRadius props); the whole block is
       // compiled out when the component's `ao` prop is off (structural).
-      if (ao?.occupancy?.freeRadiusAtWorld) {
+      // Gated on `gather` as well: with no diffuse term `out` is zero here and
+      // the ladder's ~50 oracle fetches per pixel would buy a multiply by zero.
+      if (gather && ao?.occupancy?.freeRadiusAtWorld) {
         const occAcc = float(0).toVar();
         // 4 taps, linear spacing (¼..1 × radius), falloff halving per tap —
         // the standard 4-tap SDF-AO ladder against the oracle. Two voxel-
@@ -370,8 +390,8 @@ export function createGiResolve({ gbuffer, targets, width, height, gather, norma
         const obscurance = occAcc.div(norm.max(1e-4)).mul(float(ao.strength)).clamp(0, 1);
         out.mulAssign(obscurance.oneMinus());
       }
-      if (radiance) {
-        const incident = P.sub(radiance.cameraPosition).normalize().toVar();
+      if (radiance?.lookup && cameraPosition) {
+        const incident = P.sub(cameraPosition).normalize().toVar();
         const reflected = reflect(incident, N).toVar();
         reflectedOut.assign(vec3(radiance.lookup(samplePoint, reflected)).mul(intensity));
       }
@@ -410,7 +430,12 @@ export function createGiResolve({ gbuffer, targets, width, height, gather, norma
           // does not fail loudly — it shades a point slightly off the
           // surface, which reads as dim or striped reflections.
           const rawN = g1.xyz.normalize().toVar();
-          const incident = P.sub(bvhShade.cameraPosition).normalize().toVar();
+          // The resolve's own camera, deliberately not a second uniform on the
+          // bundle: this reconstruction must agree with the prepass that traced
+          // the hit, and two uniforms that merely happen to be written from the
+          // same camera each tick is one write-ordering bug away from striped
+          // reflections.
+          const incident = P.sub(vec3(cameraPosition)).normalize().toVar();
           const R = reflect(incident, rawN).toVar();
           const hitP = P.add(rawN.mul(normalOffset)).add(R.mul(hitTexel.x)).toVar();
           // The hit's true face normal, flipped to face the incoming ray: a
@@ -421,7 +446,10 @@ export function createGiResolve({ gbuffer, targets, width, height, gather, norma
           const nRaw = decodeOctNormal(hitTexel.zw).toVar();
           const nFace = select(nRaw.dot(R).lessThan(0), nRaw, nRaw.negate()).toVar();
           const shadePoint = hitP.add(nFace.mul(normalOffset)).toVar();
-          const hitE = vec3(gather(shadePoint, nFace, vec3(0))).toVar();
+          // Direct terms only when there is no gather — a reflected surface then
+          // shows its emitter/analytic lighting and no bounce, which is dim but
+          // correct, where a missing base would have been black.
+          const hitE = (gather ? vec3(gather(shadePoint, nFace, vec3(0))) : vec3(0)).toVar();
           if (emitter) {
             hitE.addAssign(emitterDirectAt(emitter, hitP, nFace, shadePoint).irradiance);
           }
