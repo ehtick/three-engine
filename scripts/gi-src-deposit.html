@@ -154,7 +154,11 @@
           else addPixel([u, v * 0.4 + 1, 8], [0, 0, -1]);
         }
         for (let lod = 0; lod < 7; lod++) {
-          const r = S0 * Math.pow(2, lod) * 1.35;
+          // `lodRadius` is the LAW'S OWN INVERSE, not `S0·2^lod` spelled out
+          // here: with the reach constant in place, an inline copy would put
+          // every one of these shells inside LOD 0 and the gate would keep
+          // passing while testing a single ring.
+          const r = cfgMod.lodRadius(lod, S0) * 1.35;
           for (let k = 0; k < 120; k++) {
             const axis = Math.floor(rng() * 3);
             const sign = rng() < 0.5 ? -1 : 1;
@@ -257,7 +261,28 @@
         };
 
         // ── the three frames ─────────────────────────────────────────────
-        const store = P.createSrcProbeStore({ c0Probes: C0_PROBES, cascadeCount: cfgMod.CASCADE_COUNT });
+        // ══ AN EXPLICIT BLOCK POOL, AND WHY THIS SET NEEDS ONE ══════════════
+        //
+        // `BIN_BUDGET`'s default splits bins EQUALLY across cascades, which is
+        // right exactly when probe counts fall 4× per cascade — the surface-
+        // manifold argument, and what a contiguous surface really does.
+        //
+        // THIS PIXEL SET DOES NOT, ON PURPOSE. Its LOD shells are 120 points
+        // scattered over a box whose area is thousands of cells wide at EVERY
+        // cascade, so nothing merges and the counts come out nearly flat:
+        // measured 1831 / 1405 / 997 / 825. Under the default pool that starved
+        // c2 and c3 (683 and 170 blocks) and 969 probes went without bins.
+        //
+        // That is a fact about scattered points, not about scenes, and the
+        // right response is to give the gate a pool shaped like its own set
+        // rather than to reshape the engine's budget around an adversarial one.
+        // The real check is `smoke:gi-gpu ?src=1` on a real gbuffer, and the
+        // `NOBLOCK` counter is what reports it there.
+        const store = P.createSrcProbeStore({
+          c0Probes: C0_PROBES,
+          cascadeCount: cfgMod.CASCADE_COUNT,
+          blockCapacity: [2048, 2048, 1024, 1024],
+        });
         const cameraU = uniform(new THREE.Vector3(...CAM));
         const anchorU = uniform(new THREE.Vector3(...ANCHOR));
         const lmaxU = uniform(LMAX);

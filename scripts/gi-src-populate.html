@@ -119,7 +119,10 @@
         //    populated on purpose instead of by luck. Placed just INSIDE each
         //    boundary so the arm is about the ring and not about the tie.
         for (let lod = 0; lod < 9; lod++) {
-          const r = S0 * Math.pow(2, lod) * 1.35;
+          // The LAW'S OWN INVERSE (`lodRadius`), never `S0·2^lod` inline —
+          // an inline copy of the old law would drop every shell into LOD 0
+          // and ARM 4 below would go vacuous without failing.
+          const r = cfgMod.lodRadius(lod, S0) * 1.35;
           for (let k = 0; k < 220; k++) {
             const axis = Math.floor(rng() * 3);
             const sign = rng() < 0.5 ? -1 : 1;
@@ -352,21 +355,30 @@
             // outside its surface's band. Anything beyond that is a probe in
             // the wrong ring.
             const slack = s * Math.sqrt(3) * 0.5;
-            const lo = u.lod === 0 ? 0 : S0 * Math.pow(2, u.lod) - slack;
-            const hi = S0 * Math.pow(2, u.lod + 1) + slack;
+            const lo = u.lod === 0 ? 0 : cfgMod.lodRadius(u.lod, S0) - slack;
+            const hi = cfgMod.lodRadius(u.lod + 1, S0) + slack;
             if (cheb < lo || cheb > hi) ringBad++;
             // c0 only: the probe is the nearest cell to the surface point that
             // chose the LOD, so half a c0 cell diagonal is the whole budget and
             // the band still bites.
+            // LOD 0 IS A BALL, NOT A SHELL, and this arm had the old law's
+            // shape baked in. `lodAtDistance` clamps everything closer than
+            // `lodRadius(0)` to zero, so LOD 0's band runs from the camera
+            // outward — under the old law that band was `[0, 2·s₀)` and
+            // indistinguishable from a shell, so the lower bound never bit.
+            // With the reach at 64·s₀ the whole room is legitimately LOD 0 at
+            // 2.6 m, and the shell test called 265 correct probes wrong.
             if (c === 0) {
-              const r = cheb / (S0 * Math.pow(2, u.lod));
-              if (r < 1 - Math.sqrt(3) * 0.5 || r > 2 + Math.sqrt(3) * 0.5) ringStrict++;
+              const r = cheb / cfgMod.lodRadius(u.lod, S0);
+              const floorR = u.lod === 0 ? 0 : 1 - Math.sqrt(3) * 0.5;
+              if (r < floorR || r > 2 + Math.sqrt(3) * 0.5) ringStrict++;
             }
           }
           for (const [lod, s] of [...perLod].sort((a, b) => a[0] - b[0])) {
             ringRows.push(`   c${c} lod${lod}: ${String(s.n).padStart(5)} probes  ` +
               `cheb ${s.lo.toFixed(2)}..${s.hi.toFixed(2)}m  ` +
-              `(band ${(lod === 0 ? 0 : S0 * 2 ** lod).toFixed(2)}..${(S0 * 2 ** (lod + 1)).toFixed(2)})`);
+              `(band ${(lod === 0 ? 0 : cfgMod.lodRadius(lod, S0)).toFixed(2)}..` +
+              `${cfgMod.lodRadius(lod + 1, S0).toFixed(2)})`);
           }
         }
         for (const row of ringRows.slice(0, 14)) say(row);

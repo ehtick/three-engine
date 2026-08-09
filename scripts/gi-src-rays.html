@@ -117,7 +117,8 @@
           else addPixel([u, v * 0.4 + 1, 8]);
         }
         for (let lod = 0; lod < 9; lod++) {
-          const r = S0 * Math.pow(2, lod) * 1.35;
+          // The law's own inverse — see gi-src-populate.html's note.
+          const r = cfgMod.lodRadius(lod, S0) * 1.35;
           for (let k = 0; k < 220; k++) {
             const axis = Math.floor(rng() * 3);
             const sign = rng() < 0.5 ? -1 : 1;

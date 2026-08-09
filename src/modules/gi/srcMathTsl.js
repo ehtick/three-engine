@@ -72,7 +72,7 @@ import {
   R2_FX_TO_UNIT,
   R2_HALF_FX,
 } from "./srcMath.js";
-import { KEY_MAX_LODS, LOD_OVERLAP, MAX_LODS, R0_OVER_S0, GAMMA } from "./srcConfig.js";
+import { KEY_MAX_LODS, LOD0_REACH, LOD_OVERLAP, MAX_LODS, R0_OVER_S0, GAMMA } from "./srcConfig.js";
 
 const TAU = Math.PI * 2;
 
@@ -383,7 +383,11 @@ export function chebyshev(a, b) {
  * floor either way.
  */
 export function lodAtDistance(cheb, spacing0, maxLods = MAX_LODS) {
-  const ratio = float(cheb).div(float(spacing0).max(1e-6)).toVar();
+  // `LOD0_REACH` is a power of two, so `s₀·64` is exact on both sides and the
+  // multiply this line introduces cannot make the twins drift — see the
+  // constant's own note in srcConfig. The order matters and is the mirror's:
+  // scale FIRST, then floor at 1e-6, then divide.
+  const ratio = float(cheb).div(float(spacing0).mul(LOD0_REACH).max(1e-6)).toVar();
   return select(
     ratio.greaterThan(1),
     log2(ratio).clamp(0, maxLods - 1),

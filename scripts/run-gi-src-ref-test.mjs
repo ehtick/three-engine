@@ -57,12 +57,14 @@ import {
   intervalLength,
   lodAtDistance,
   lodBlend,
+  lodRadius,
   lodShellWeight,
   lodShells,
   probeSpacing,
   describeSrcHierarchy,
   GAMMA,
   BETA,
+  LOD0_REACH,
 } from "../src/modules/gi/srcConfig.js";
 import {
   KEY_AXIS_OFFSET,
@@ -660,10 +662,35 @@ console.log("── RESOLVE + SPARSE INTERPOLATION ─────────�
 console.log("── LOD SELECTION + BLEND ────────────────────────────────────────");
 {
   const s0 = 0.5;
-  check("LOD 0 inside the first shell", lodAtDistance(0.4, s0) === 0);
-  check("LOD grows as log2 of Chebyshev/s0",
-    Math.abs(lodAtDistance(s0 * 8, s0) - 3) < 1e-12,
-    `lod(${s0 * 8}m) = ${lodAtDistance(s0 * 8, s0)}`);
+  // ── THE REACH IS PINNED HERE, AND THIS ARM CAUGHT ITS ARRIVAL ────────────
+  //
+  // This block used to read `lodAtDistance(s0·8) === 3`, which is the OLD law
+  // (`log2(cheb/s₀)`) written out as a number. Introducing `LOD0_REACH` turned
+  // it red, correctly and immediately, because 8·s₀ is now deep inside LOD 0.
+  // It is rewritten through `lodRadius` — the law's own inverse — so the next
+  // change to the law moves the expectation with it instead of turning a
+  // correct implementation into a failing test.
+  //
+  // The constant itself gets its own assertion rather than riding along
+  // implicitly: everything downstream (probe density, memory, the shape of the
+  // Cornell render) is a function of it, so a silent edit should not be a
+  // silent behaviour change.
+  check("LOD0_REACH is 64 — one quarter-degree of angular probe spacing",
+    LOD0_REACH === 64, `LOD0_REACH = ${LOD0_REACH}`);
+  check("LOD 0 is a BALL of radius LOD0_REACH·s₀, not a thin first shell",
+    lodAtDistance(0.4, s0) === 0 && lodAtDistance(lodRadius(0, s0) * 0.999, s0) === 0,
+    `lod(0.4m) = ${lodAtDistance(0.4, s0)}, ` +
+    `lod(${(lodRadius(0, s0) * 0.999).toFixed(2)}m) = ${lodAtDistance(lodRadius(0, s0) * 0.999, s0)}`);
+  check("LOD grows as log2 of Chebyshev/(LOD0_REACH·s0)",
+    Math.abs(lodAtDistance(lodRadius(3, s0), s0) - 3) < 1e-12,
+    `lod(${lodRadius(3, s0)}m) = ${lodAtDistance(lodRadius(3, s0), s0)}`);
+  // The whole point of the constant, stated as a number a reader can check:
+  // probe spacing at the far edge of a LOD is a fixed FRACTION of the distance,
+  // and that fraction is what used to be ~1 radian.
+  const edge = lodRadius(4, s0);
+  const angular = probeSpacing(0, 4, s0) / edge;
+  check("angular probe spacing is under a degree, not the old ~57°",
+    angular < 0.0175, `${(angular * 180 / Math.PI).toFixed(3)}° at ${edge}m`);
   check("LOD clamps to maxLods-1", lodAtDistance(1e9, s0, 10) === 9);
 
   // CONTINUITY — R1, measured on the quantity that actually matters.

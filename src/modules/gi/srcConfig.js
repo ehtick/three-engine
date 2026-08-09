@@ -246,6 +246,37 @@ export function cascadeReach(lod, spacing0, cascadeCount = CASCADE_COUNT) {
 }
 
 /**
+ * How far LOD 0 reaches, in units of s₀ — the distance at which s₀ stops being
+ * a fine enough probe spacing and the lattice is allowed to double.
+ *
+ * ══ THE CONSTANT THAT WAS MISSING, AND WHAT ITS ABSENCE DID ════════════════
+ *
+ * `lodAtDistance` used to be `log2(cheb / s₀)`, i.e. this constant fixed at 1.
+ * Compose that with `probeSpacing(0, lod, s₀) = s₀·2^lod` and the result is
+ * **spacing ≈ the camera distance**: LOD 0 applied within 0.45 m of the camera
+ * at the shipping s₀ and everything beyond it was coarsened in proportion to
+ * how far away it was. Angular probe spacing was therefore a constant ~1
+ * radian — 57° — where it needs to be a fraction of a degree, and that is why
+ * §12.17's Cornell render is made of rectangles. The capacity was never the
+ * problem; the LAW was.
+ *
+ * The value is derivable rather than tuned: `LOD0_REACH = s₀/α` for a target
+ * angular spacing α, and α ≈ 1/64 rad (0.9°) gives 64. It matches
+ * `REANCHOR_CHEBYSHEV`'s 64·s₀ and that is not a coincidence — both answer
+ * "how far out does the LOD-0 lattice have to stay usable".
+ *
+ * A POWER OF TWO ON PURPOSE. The twins must agree bit-for-bit
+ * (`test:gi-src-math`), and `s₀·64` is exact in f32 and f64 alike, so the two
+ * implementations cannot drift on the multiply this constant introduces.
+ *
+ * 128 was the other end of §12.18.2's range and is rejected by arithmetic:
+ * halving the angular spacing quadruples the probe count, which puts a
+ * Sponza-class interior at ~40,000 c0 probes — past both the 16,384 slot
+ * capacity and the block pool. 64 lands it at ~10,000.
+ */
+export const LOD0_REACH = 64;
+
+/**
  * LOD for a world point, from the CHEBYSHEV distance to the camera (paper
  * §4.1 — Chebyshev, not Euclidean: with grid-aligned probes the L∞ ball's
  * flat faces put LOD boundaries parallel to the probe planes, which produces
@@ -256,10 +287,25 @@ export function cascadeReach(lod, spacing0, cascadeCount = CASCADE_COUNT) {
  * sees a hard flip (R1).
  */
 export function lodAtDistance(cheb, spacing0, maxLods = MAX_LODS) {
-  const ratio = cheb / Math.max(spacing0, 1e-6);
+  const ratio = cheb / Math.max(spacing0 * LOD0_REACH, 1e-6);
   if (!(ratio > 1)) return 0;
   const lod = Math.log2(ratio);
   return Math.min(Math.max(lod, 0), maxLods - 1);
+}
+
+/**
+ * INVERSE of `lodAtDistance` — the Chebyshev distance at which LOD `lod`
+ * begins, so LOD k occupies `[lodRadius(k), lodRadius(k+1))` and LOD 0 extends
+ * down to zero.
+ *
+ * Exported because the gates need it and the alternative is worse: every gate
+ * that places test geometry per LOD, or asserts a probe sits in its own ring,
+ * was writing `s₀·2^lod` inline — the old law's inverse, spelled out in four
+ * files. Changing the law would have left them all compiling, passing, and
+ * silently testing a single LOD. One definition, inverted once.
+ */
+export function lodRadius(lod, spacing0) {
+  return spacing0 * LOD0_REACH * Math.pow(2, lod);
 }
 
 /** Chebyshev (L∞) distance — the LOD metric. */

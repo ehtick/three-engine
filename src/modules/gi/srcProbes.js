@@ -286,13 +286,37 @@ function pow2(n) {
 }
 
 /**
+ * Per-cascade divisor for probe SLOT capacity — 2, not the 4 that theory says.
+ *
+ * §4.2's argument is sound and is not what is being contradicted: spacing
+ * doubles per cascade, so on a 2D surface manifold that the lattice actually
+ * resolves, the probe count falls 4×. The measured counts say that limit is
+ * reached and then LEFT: 410 → 115 → 65 → 64 across the ladder (3.5×, 1.8×,
+ * 1.0×) and 13 → 10 → 10 → 10 on the smoke scene. Coarsening only merges
+ * probes while the lattice is finer than the scene's features; past that it
+ * relabels them and the count stops falling.
+ *
+ * At `/4` that flattening was harmless because everything was tiny in absolute
+ * terms. `LOD0_REACH` changed the scale, and the population gate found it
+ * immediately: **1,063 insert failures at cascade 2** on a set whose nine LOD
+ * shells never merge at any cascade. An insert failure is a silently missing
+ * probe, i.e. a hole in the light.
+ *
+ * A slot is ~40 bytes (record + its share of the hash at a 0.5 load factor), so
+ * bracketing the measured range costs about 0.4 MB at the engine default and
+ * buys 4× the headroom exactly where the flattening bites. It does NOT enlarge
+ * the bins: those come from the block pool, which is budget-sized and capped by
+ * this number rather than equal to it.
+ */
+const CASCADE_SLOT_FALLOFF = 2;
+
+/**
  * Allocate the probe store.
  *
  * @param {object} options
  * @param {number} options.c0Probes  expected live probes at cascade 0. Higher
- *   cascades are sized from it: spacing doubles per cascade, so on a 2D surface
- *   manifold the probe count falls ~4× (plan §4.2). The floor keeps the small
- *   cascades from being pathologically tight on a tiny scene.
+ *   cascades are sized from it — see `CASCADE_SLOT_FALLOFF` for why the divisor
+ *   is 2 rather than the 4 the surface-manifold argument predicts.
  * @param {number} options.cascadeCount
  * @param {number} options.loadFactor  probes ÷ hash capacity. 0.5 by default —
  *   open addressing with linear probing degrades sharply above ~0.7, and the
@@ -301,6 +325,11 @@ function pow2(n) {
  *   it, because a block IS `binCount(cascade, w0)` accumulators.
  * @param {number} options.binBudget  total bins the block pool may hold. See
  *   `srcConfig.BIN_BUDGET`; the bytes live in `createSrcBinStore`.
+ * @param {number[]} [options.blockCapacity]  explicit per-cascade block counts,
+ *   bypassing `binBudget`. For gates whose probe distribution is deliberately
+ *   unrepresentative — see the deposit gate, which needs a nearly FLAT pool
+ *   because its scattered LOD shells never merge at any cascade, and which
+ *   documents why that is a property of the test set rather than of scenes.
  */
 export function createSrcProbeStore({
   c0Probes = 65536,
@@ -308,12 +337,13 @@ export function createSrcProbeStore({
   loadFactor = 0.5,
   w0 = W0,
   binBudget = BIN_BUDGET,
+  blockCapacity = null,
 } = {}) {
   const cascades = [];
   let hashTotal = 0;
   let probeTotal = 0;
   for (let c = 0; c < cascadeCount; c++) {
-    const probes = Math.max(1024, pow2(Math.ceil(c0Probes / Math.pow(4, c))));
+    const probes = Math.max(1024, pow2(Math.ceil(c0Probes / Math.pow(CASCADE_SLOT_FALLOFF, c))));
     const capacity = pow2(Math.ceil(probes / loadFactor));
     cascades.push({
       cascade: c,
@@ -333,7 +363,9 @@ export function createSrcProbeStore({
   // the portable limit is EIGHT per stage, so two more would have put the pass
   // that creates every probe exactly at the ceiling with nothing left for the
   // merge. One buffer, two regions.
-  const blockCaps = blockCapacities(cascades.map((c) => c.probeCapacity), w0, binBudget);
+  const blockCaps = blockCapacity
+    ? cascades.map((c) => Math.max(1, Math.min(c.probeCapacity, blockCapacity[c.cascade] ?? 1)))
+    : blockCapacities(cascades.map((c) => c.probeCapacity), w0, binBudget);
   let blockTotal = 0;
   for (const c of cascades) {
     c.blockCapacity = blockCaps[c.cascade];

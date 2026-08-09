@@ -123,11 +123,20 @@
         for (const lod of [0, 1, 9, 14, 15, 16]) push({ cell: [7, -9, 11], lod });
 
         // 4. EXACT LOD BOUNDARIES. lodAtDistance is a log2 and its floor picks
-        //    the shell, so cheb = s0·2^k is the input that decides whether the
-        //    two sides agree about which shell a surface belongs to.
+        //    the shell, so the boundary distance is the input that decides
+        //    whether the two sides agree about which shell a surface belongs to.
+        //    `lodRadius` is the law's own inverse — writing `S0·2^k` here would
+        //    have kept passing after LOD0_REACH landed while feeding nothing but
+        //    sub-boundary distances that both twins clamp to zero.
         for (let k = -1; k < 11; k++) {
-          push({ cheb: S0 * Math.pow(2, k), spacing0: S0 });
-          push({ cheb: S0 * Math.pow(2, k) * 1.0000001, spacing0: S0 });
+          push({ cheb: cfg.lodRadius(k, S0), spacing0: S0 });
+          push({ cheb: cfg.lodRadius(k, S0) * 1.0000001, spacing0: S0 });
+        }
+        // ...and a band of sub-reach distances, which is now a large and very
+        // common region (everything within 64·s₀ of the camera) rather than the
+        // sliver it used to be. Both sides must return exactly 0 there.
+        for (const f of [0, 0.001, 0.1, 0.5, 0.9, 0.99, 1]) {
+          push({ cheb: cfg.lodRadius(0, S0) * f, spacing0: S0 });
         }
         for (const f of [0, 0.5, 0.89, 0.9, 0.9001, 0.95, 0.999, 1.0, 2.45]) push({ lodF: f });
 
