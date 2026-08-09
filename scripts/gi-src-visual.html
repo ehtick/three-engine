@@ -1,0 +1,336 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>SRC visual — the Cornell box through the c0-only resolve</title>
+    <style>html,body{margin:0;background:#111;color:#ddd;font:13px monospace}canvas{display:block}</style>
+  </head>
+  <body>
+    <canvas id="view" width="640" height="480"></canvas>
+    <pre id="log"></pre>
+    <script type="module">
+      // ══ THE EYE CHECK, MADE CAPTURABLE ═══════════════════════════════════
+      //
+      // Every other SRC gate reports numbers. This one renders frames and hands
+      // them back as PNGs, so "the screen stops being dark" can be looked at
+      // instead of inferred from a luminance histogram.
+      //
+      // It does NOT replace the check a person makes in the editor over Sponza
+      // and the real game (plan §12.17.8) — [[gi-harness-viewport-traps]] is a
+      // whole memory about headless rigs measuring something other than what
+      // they claim. What it does is make the failure it CAN see obvious: a
+      // three-arm A/B where the GI term is isolated in its own frame.
+      //
+      //   direct   the analytic light alone, sky 0 — SRC contributes nothing.
+      //   gi       the light OFF and sky up: every lit pixel is SRC's output
+      //            and nothing else. This is the frame that matters.
+      //   both     what a scene actually looks like with it on.
+      //
+      // The scene is a Cornell-style open box with a riser, a pillar and a
+      // floating slab, chosen so that the thing Phase 2 produces is legible:
+      // contact darkening in the corners, under the slab and where the pillar
+      // meets the floor. There is no bounce COLOUR to look for — hit shading is
+      // Phase 5 — and no long-range term — the merge is Phase 3.
+      //
+      // Run: node scripts/run-gi-src-visual.mjs [outDir]
+      const out = document.querySelector("#log");
+      const say = (line) => { out.textContent += line + "\n"; };
+      const fail = (error) => {
+        console.error("SRC-VISUAL FAIL", error?.stack ?? error?.message ?? String(error));
+        globalThis.__SRC_VISUAL_RESULT__ = {
+          pass: false, error: error?.message ?? String(error), text: out.textContent,
+        };
+      };
+      globalThis.addEventListener("error", (event) => fail(event.error ?? event.message));
+      globalThis.addEventListener("unhandledrejection", (event) => fail(event.reason));
+
+      // SQUARE, like every published Cornell render.
+      //
+      // 576 AND NOT 600, WHICH COST A RENDER: `readRenderTargetPixelsAsync`
+      // hands back rows PADDED TO 256 BYTES. 600 px x 4 B = 2400 is not a
+      // multiple of 256, so tight row indexing walks into the padding and the
+      // frame comes back as horizontal stripes — the readback trap
+      // [[webgpu-readback-padding]] records, arriving in a probe rather than in
+      // a diagnostic. 576 x 4 = 2304 = 9 x 256, so rows are flush.
+      const W = 640;
+      const H = 480;
+
+      try {
+        const q = new URLSearchParams(location.search);
+        const SKY = Number(q.get("sky") ?? 2);
+        const LAMP = Number(q.get("lamp") ?? 5);
+        const EXPOSURE = Number(q.get("exposure") ?? 1);
+        // Build-time, exactly as `smoke:gi-gpu` sets it: `srcProbesEnabled()` is
+        // read when the screen bundle is constructed.
+        globalThis.__giSrcProbes = q.get("src") !== "0";
+        globalThis.__editorKeepRendering = true;
+
+        const { Engine, THREE, registerBuiltInComponents } = await import("/src/engine/index.js");
+        await import("/src/modules/index.js");
+        const { enableEngineModule } = await import("/src/engine/modules.js");
+
+        registerBuiltInComponents();
+        const engine = new Engine();
+        engine.setSize(W, H);
+        await engine.init(document.querySelector("#view"));
+        if (engine.getBackendName() !== "WebGPU") throw new Error(`WebGPU unavailable (${engine.getBackendName()})`);
+        // TONE MAPPING, without which this whole probe is useless: the renderer
+        // is linear by default, so every value past 1.0 clips to pure white and
+        // a frame reads as "blown out" whatever the lighting actually did. The
+        // first Cornell render came back as a white rectangle for exactly this
+        // reason, at a mean of 149/255 — which is a display fault, not a GI one.
+        engine.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        engine.renderer.toneMappingExposure = 1.0;
+
+        // ── THE CORNELL BOX ───────────────────────────────────────────────
+        //
+        // The standard scene, at the standard proportions, because this is what
+        // Phase 3's merge and Phase 5's hit shading will be judged against and
+        // the baseline is worth having before either exists.
+        //
+        // It is OPEN AT THE FRONT, which is not a simplification — the original
+        // is too — and it is what gives SRC something to compute. With hit
+        // shading still Phase 5 the only radiance in the bins is the sky, so
+        // what the GI frame shows is how much of the front aperture each point
+        // can see: bright near the opening, falling off toward the back corners
+        // and under the boxes. That is a real global-illumination-shaped result
+        // arrived at honestly, not a stand-in.
+        //
+        // WHAT IT WILL NOT SHOW, and it matters that a reader is told rather
+        // than left to notice: NO COLOUR BLEED. The red and green walls light
+        // their own pixels red and green, because a surface's albedo multiplies
+        // the irradiance it receives — but no colour is TRANSPORTED from one
+        // surface to another. That transport is exactly what hit shading does,
+        // and it is Phase 5. A Cornell box without red on the left box is the
+        // correct picture of this commit.
+        const mat = (hex) => new THREE.MeshStandardNodeMaterial({ color: hex, roughness: 0.95 });
+        const WHITE = mat(0xd6d3cc);
+        const RED = mat(0xa11c14);
+        const GREEN = mat(0x2a7a1c);
+
+        const box = (material, w, h, d, x, y, z, ry = 0) => {
+          const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d).toNonIndexed(), material);
+          m.position.set(x, y, z);
+          m.rotation.y = ry;
+          m.updateMatrixWorld(true);
+          engine.scene.add(m);
+          return m;
+        };
+
+        // The room: 4 x 4 x 4, floor at y = 0, aperture at z = +2.
+        const T = 0.2;                       // wall thickness
+        box(WHITE, 4.4, T, 4, 0, -T / 2, 0);   // floor
+        box(WHITE, 4.4, T, 4, 0, 4 + T / 2, 0); // ceiling
+        box(WHITE, 4.4, 4, T, 0, 2, -2 - T / 2); // back
+        box(RED, T, 4, 4, -2.2 - T / 2, 2, 0);  // left  — red
+        box(GREEN, T, 4, 4, 2.2 + T / 2, 2, 0); // right — green
+
+        // The two boxes, at the canonical placement and rotation: a tall one
+        // back-left, a short one front-right.
+        box(WHITE, 1.0, 2.1, 1.0, -0.85, 1.05, -1.1, 0.29);
+        box(WHITE, 1.0, 1.0, 1.0, 0.8, 0.5, -0.1, -0.31);
+
+        // The ceiling luminaire. Emissive so it reads as the light source in
+        // frame; the ANALYTIC light below it is what actually shades, since an
+        // emissive surface only contributes indirectly through hit shading and
+        // that is Phase 5.
+        const lamp = new THREE.Mesh(
+          new THREE.BoxGeometry(1.3, 0.04, 1.3).toNonIndexed(),
+          new THREE.MeshStandardNodeMaterial({
+            color: 0x000000, emissive: 0xfff0d8, emissiveIntensity: 1.6, roughness: 1,
+          }),
+        );
+        lamp.position.set(0, 3.94, -0.2);
+        lamp.updateMatrixWorld(true);
+        engine.scene.add(lamp);
+
+        // THE CLASSIC VIEW: centred, level, looking straight in through the
+        // open front. Inside the room, so probe spacing sits at LOD 0-1 —
+        // spacing is s0*2^lod and lod grows with the CHEBYSHEV distance to the
+        // camera, so viewing this from outside the aperture would push every
+        // probe to LOD 2-3 and hand back a picture made of rectangles.
+        // The canonical framing, in the original's own proportions: the camera
+        // sits 5.75 room-widths-over-4 in front of the aperture with a 38.4°
+        // field, which is the distance/FOV pair at which the 4 m interior
+        // exactly fills a square frame. Inner walls land on the frame edge.
+        // ══ THE CAMERA, AND A REAL FINDING ABOUT THE LOD LAW ═══════════
+        //
+        // Classic framing: outside the aperture, square, narrow field, the 4 m
+        // interior exactly filling the frame. Standing where the original does
+        // (well back) produced THREE probes for the whole scene, and the reason
+        // is arithmetic rather than a bug:
+        //
+        //     lod     = floor(log2(cheb / s0))
+        //     spacing = s0 * 2^lod
+        //
+        // which composes to spacing ~= the CHEBYSHEV DISTANCE TO THE CAMERA.
+        // The s0 cancels, so a finer probe density dial does nothing at range:
+        // at 8 m out the lattice is 4-8 m coarse whatever it is set to, and the
+        // picture is made of rectangles. Only within s0 of the camera does
+        // spacing settle at s0.
+        //
+        // That is the tuning §4.5 owns and Phase 4 revisits. It is NOT changed
+        // here: every probe count, load factor and timing recorded in §12 was
+        // measured under this law, and moving it now would retire all of them.
+        // So the camera sits 2 m outside the aperture, which is close enough
+        // that the near half of the room is on a 1.2 m lattice and far enough
+        // that the framing is still the canonical one. The back wall is
+        // legitimately blockier than the foreground, and that IS the LOD law
+        // drawn to scale.
+        const camera = new THREE.PerspectiveCamera(52, W / H, 0.1, 60);
+        camera.position.set(0, 2.0, 1.75);
+        camera.lookAt(0, 2.0, -2);
+        camera.updateMatrixWorld(true);
+        engine.scene.add(camera);
+        engine.camera = camera;
+
+        const sunEnt = engine.createEntity({ name: "Lamp" });
+        const sunComp = sunEnt.addComponent("light", {
+          type: "point", intensity: LAMP, color: "#fff0d8", distance: 0,
+        });
+        sunEnt.object3D?.position?.set(0, 3.8, -0.2);
+
+        await enableEngineModule(engine, "gi");
+        const gi = engine.createEntity({ name: "GI" });
+        const giComp = gi.addComponent("global-illumination", {
+          autoFit: true,
+          quality: "medium",
+          reflections: false,
+          exactReflections: false,
+          // AO OFF. The obscurance ladder in `createGiResolve` is a SEPARATE
+          // screen-space effect that also darkens corners — leaving it on would
+          // put its contribution in the same frame as SRC's and make the picture
+          // unattributable, which is the one thing a visual check must not be.
+          ao: false,
+          skyIntensity: 0,
+          skyColor: "#ffffff",
+        });
+        const setProp = (comp, key, value) => {
+          if (typeof comp.setProp === "function") comp.setProp(key, value);
+          else comp.props[key] = value;
+        };
+
+        engine.start();
+
+        // ── settle ────────────────────────────────────────────────────────
+        // The occupancy field has to be voxelized before any ray means
+        // anything: `[gi] field ready: <n> occupied voxels` is the harness
+        // contract every GI probe waits on, and reading before it is the
+        // instrument fault §12's own notes record costing a session.
+        const system = () => engine.modules.get("gi")?.system;
+        const settle = (ms) => new Promise((r) => setTimeout(r, ms));
+        const deadline = performance.now() + 90_000;
+        while (performance.now() < deadline) {
+          await settle(400);
+          if (system()?._fieldReadyOnce && system()?.state?.screen?.srcProbes) break;
+        }
+        const src = system()?.state?.screen?.srcProbes;
+        if (globalThis.__giSrcProbes && !src) throw new Error("SRC never built — no probe system on the screen bundle");
+        // A few more frames so the probe set, the budget and the bins are all
+        // populated from a settled camera rather than mid-boot.
+        await settle(1500);
+
+        // ── capture ───────────────────────────────────────────────────────
+        const rt = new THREE.RenderTarget(W, H, { depthBuffer: true });
+        const scratch = document.createElement("canvas");
+        scratch.width = W;
+        scratch.height = H;
+        const ctx = scratch.getContext("2d");
+
+        const shoot = async (label) => {
+          // Two frames: the GI chain reads THIS frame's gbuffer, and the first
+          // render after a prop change is still resolving the previous one.
+          // Re-asserted per shot: the engine owns the renderer and resets its
+          // tone mapping on its own schedule, so setting it once at boot is not
+          // enough to survive a settle.
+          engine.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+          engine.renderer.toneMappingExposure = EXPOSURE;
+          for (let k = 0; k < 3; k++) {
+            const prev = engine.renderer.getRenderTarget();
+            engine.renderer.setRenderTarget(rt);
+            await engine.renderer.renderAsync(engine.scene, engine.camera);
+            engine.renderer.setRenderTarget(prev);
+            await settle(60);
+          }
+          // 6th arg is the TEXTURE INDEX, not an output buffer — the pixels are
+          // the RETURN value. (Passing an array throws "Invalid value used as
+          // weak map key" from inside three.)
+          const buf = await engine.renderer.readRenderTargetPixelsAsync(rt, 0, 0, W, H, 0);
+          const img = ctx.createImageData(W, H);
+          // Render targets read bottom-up; ImageData is top-down.
+          for (let y = 0; y < H; y++) {
+            const srcRow = (H - 1 - y) * W * 4;
+            const dstRow = y * W * 4;
+            for (let x = 0; x < W * 4; x++) img.data[dstRow + x] = buf[srcRow + x];
+          }
+          ctx.putImageData(img, 0, 0);
+          let sum = 0;
+          for (let i = 0; i < buf.length; i += 4) sum += buf[i] + buf[i + 1] + buf[i + 2];
+          const mean = sum / (buf.length / 4) / 3;
+          say(`  ${label}: mean ${mean.toFixed(2)}/255`);
+          return { label, mean: +mean.toFixed(2), png: scratch.toDataURL("image/png") };
+        };
+
+        say(`cornell box, ${W}x${H}, sky ${SKY}, src ${globalThis.__giSrcProbes ? "ON" : "OFF"}`);
+        const shots = [];
+
+        setProp(giComp, "skyIntensity", 0);
+        await settle(400);
+        shots.push(await shoot("direct"));
+
+        // GI ALONE: kill the analytic light and raise the sky. Every lit pixel
+        // in this frame came out of SRC's c0 resolve and nothing else, which is
+        // the only arrangement where a picture can be attributed to it.
+        setProp(sunComp, "intensity", 0);
+        // The luminaire's own emission is not SRC output either — it would sit
+        // in the middle of the frame as a bright quad and invite exactly the
+        // wrong reading. Hidden for this arm only.
+        lamp.visible = false;
+        setProp(giComp, "skyIntensity", SKY);
+        await settle(600);
+        shots.push(await shoot("gi"));
+
+        lamp.visible = true;
+        setProp(sunComp, "intensity", LAMP);
+        await settle(600);
+        shots.push(await shoot("both"));
+
+        const stats = src ? await src.readStats(engine.renderer) : null;
+        engine.stop();
+
+        const g = stats?.gather;
+        if (g) {
+          say(`  gather: ${g.lit}/${g.pixels} lit, lum ${g.minLum.toFixed(3)}..${g.maxLum.toFixed(3)}, ` +
+            `contrast ${g.contrast.toFixed(3)}, ${g.badNormals} bad normals`);
+        }
+        // The whole point of the "gi" frame is that it is not black. A mean of
+        // zero there means SRC produced nothing and the other two frames are
+        // just the analytic light — which would look completely fine.
+        const giShot = shots.find((s) => s.label === "gi");
+        if (globalThis.__giSrcProbes && !(giShot.mean > 1)) {
+          throw new Error(`the GI-only frame is black (mean ${giShot.mean}/255) — SRC rendered nothing`);
+        }
+
+        globalThis.__SRC_VISUAL_RESULT__ = {
+          pass: true,
+          sky: SKY,
+          src: !!globalThis.__giSrcProbes,
+          shots,
+          gather: g ? {
+            lit: g.lit, pixels: g.pixels,
+            minLum: +g.minLum.toFixed(3), maxLum: +g.maxLum.toFixed(3),
+            contrast: +g.contrast.toFixed(3), badNormals: g.badNormals,
+          } : null,
+          rays: stats?.rays ? {
+            traced: stats.rays.rays, budget: stats.totalRays,
+            deposits: stats.rays.deposits, hitRate: +stats.rays.hitRate.toFixed(3),
+          } : null,
+          probes: stats?.cascades?.map((c) => c.live) ?? null,
+          text: out.textContent,
+        };
+      } catch (error) {
+        fail(error);
+      }
+    </script>
+  </body>
+</html>
