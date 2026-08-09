@@ -1,0 +1,428 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>SRC ray budget gate — createSrcRayFrame vs assignRays</title>
+    <style>html,body{margin:0;background:#111;color:#ddd;font:13px monospace}canvas{display:none}</style>
+  </head>
+  <body>
+    <canvas id="view" width="16" height="16"></canvas>
+    <pre id="log"></pre>
+    <script type="module">
+      // ══ THE PHASE-2 UNIT-2 GATE: ALGORITHM 3, WITHOUT THE ENGINE ═════════
+      //
+      // Same shape as `gi-src-populate.html` and for the same reasons — its own
+      // `WebGPURenderer`, a synthetic gbuffer in a storage buffer, no engine, no
+      // scene. The population runs first because the ray budget is a function of
+      // it, and then `createSrcRayFrame` is diffed against `srcRef.js`'s
+      // `assignRays`.
+      //
+      // ══ WHAT CAN AND CANNOT BE COMPARED ═════════════════════════════════
+      //
+      // NOT the offsets. The GPU allocates them with atomic cursors in scheduler
+      // order and the mirror walks its probes in table order, so the same probe
+      // gets a different offset in the two — by construction, on every run, and
+      // even between two runs of the GPU. A gate comparing offsets would fail
+      // forever for a reason that is not a bug (plan §12.13.3).
+      //
+      // What IS comparable, and what Alg. 3 actually promises:
+      //
+      //   counts     per-probe ray counts, matched by KEY. A probe's count is
+      //              the sum of its children's, and at c0 the sum of its pixels'
+      //              — deterministic, so this is an exact match.
+      //   total      the length of the partition. One number, exact.
+      //   partition  every probe's [offset, offset+count) at the top cascade
+      //              tiles [0, total) with no gap and no overlap; and within
+      //              every parent, its children tile ITS range the same way.
+      //              This is the property the offsets exist to provide, and it
+      //              is checkable without agreeing on any single offset.
+      //   pixels     every pixel's slice lies inside its own c0 probe's segment,
+      //              and the pixel slices tile that segment exactly.
+      //   contiguity a probe's rays are a CONTIGUOUS run of the R2 sequence —
+      //              which is the entire reason for the algorithm, and would be
+      //              satisfied vacuously by a wrong-but-tidy allocator, so it is
+      //              checked together with the counts rather than alone.
+      //   reruns     two runs of the same frame may assign different indices but
+      //              must produce the same COUNTS and the same total. A rerun
+      //              that changes the total is an atomics race.
+      //
+      // Run: node scripts/run-gi-src-rays-test.mjs
+      const out = document.querySelector("#log");
+      const say = (line) => { out.textContent += line + "\n"; };
+      let failures = 0;
+      const check = (label, ok, detail = "") => {
+        say(`  ${ok ? "PASS" : "FAIL"} ${label}${detail ? ` — ${detail}` : ""}`);
+        if (!ok) failures++;
+      };
+      const fail = (error) => {
+        console.error("SRC-RAYS FAIL", error?.stack ?? error?.message ?? String(error));
+        globalThis.__SRC_RAYS_RESULT__ = {
+          pass: false, error: error?.message ?? String(error), text: out.textContent,
+        };
+      };
+      globalThis.addEventListener("error", (event) => fail(event.error ?? event.message));
+      globalThis.addEventListener("unhandledrejection", (event) => fail(event.reason));
+
+      try {
+        const THREE = await import("three/webgpu");
+        const TSL = await import("three/tsl");
+        const cfgMod = await import("/src/modules/gi/srcConfig.js");
+        const ref = await import("/src/modules/gi/srcRef.js");
+        const P = await import("/src/modules/gi/srcProbes.js");
+        const R = await import("/src/modules/gi/srcRays.js");
+
+        const { instancedArray, uniform, vec3 } = TSL;
+
+        const renderer = new THREE.WebGPURenderer({ canvas: document.querySelector("#view") });
+        await renderer.init();
+        const device = renderer.backend.device;
+        const validationErrors = [];
+        device.addEventListener?.("uncapturederror", (event) => {
+          validationErrors.push(event.error?.message ?? String(event.error));
+          console.error("WebGPU validation error:", validationErrors.at(-1));
+        });
+
+        const rng = (() => {
+          let s = 0x9e3779b9 >>> 0;
+          return () => {
+            s = (s + 0x6d2b79f5) >>> 0;
+            let t = s;
+            t = Math.imul(t ^ (t >>> 15), t | 1);
+            t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+            return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+          };
+        })();
+
+        const S0 = 0.5;
+        const CAM = [1.25, 1.6, -0.75];
+        const ANCHOR = [0.37, -1.21, 2.93];
+        // > 1 ON PURPOSE. With one ray per pixel a probe's count equals its pixel
+        // count and an implementation that forgot to multiply would pass every
+        // arm below. Two is the shipping value at high/ultra anyway.
+        const RAYS_PER_PIXEL = 2;
+
+        // The same pixel set as the population gate: a dense clustered room (the
+        // contention pattern — many pixels per probe, which is what makes the c0
+        // counts worth checking at all) plus one shell per LOD.
+        const pixels = [];
+        const addPixel = (p) => pixels.push({ position: p, normal: [0, 1, 0] });
+        for (let i = 0; i < 3000; i++) {
+          const u = (rng() - 0.5) * 16;
+          const v = (rng() - 0.5) * 16;
+          const face = Math.floor(rng() * 5);
+          if (face === 0) addPixel([u, -1, v]);
+          else if (face === 1) addPixel([u, 5, v]);
+          else if (face === 2) addPixel([-8, v * 0.4 + 1, u]);
+          else if (face === 3) addPixel([8, v * 0.4 + 1, u]);
+          else addPixel([u, v * 0.4 + 1, 8]);
+        }
+        for (let lod = 0; lod < 9; lod++) {
+          const r = S0 * Math.pow(2, lod) * 1.35;
+          for (let k = 0; k < 220; k++) {
+            const axis = Math.floor(rng() * 3);
+            const sign = rng() < 0.5 ? -1 : 1;
+            const a = (rng() * 2 - 1) * r;
+            const b = (rng() * 2 - 1) * r;
+            const p = [0, 0, 0];
+            p[axis] = sign * r;
+            p[(axis + 1) % 3] = a;
+            p[(axis + 2) % 3] = b;
+            addPixel([p[0] + CAM[0], p[1] + CAM[1], p[2] + CAM[2]]);
+          }
+        }
+        const INVALID_EVERY = 17;
+        const PIXELS = pixels.length;
+        const valid = new Uint8Array(PIXELS).fill(1);
+        for (let i = 0; i < PIXELS; i += INVALID_EVERY) valid[i] = 0;
+
+        const q = new Float32Array(1);
+        const f32 = (v) => { q[0] = v; return q[0]; };
+        for (const px of pixels) px.position = px.position.map(f32);
+
+        const positions = new Float32Array(PIXELS * 4);
+        for (let i = 0; i < PIXELS; i++) {
+          positions[i * 4] = pixels[i].position[0];
+          positions[i * 4 + 1] = pixels[i].position[1];
+          positions[i * 4 + 2] = pixels[i].position[2];
+          positions[i * 4 + 3] = valid[i];
+        }
+
+        // ── population, then the ray budget on top of it ──────────────────
+        const store = P.createSrcProbeStore({ c0Probes: 16384, cascadeCount: cfgMod.CASCADE_COUNT });
+        const posBuf = instancedArray(positions, "vec4");
+        const cameraU = uniform(new THREE.Vector3(...CAM));
+        const anchorU = uniform(new THREE.Vector3(...ANCHOR));
+
+        const frame = P.createSrcProbeFrame(store, {
+          spacing0: S0,
+          camera: vec3(cameraU),
+          anchor: vec3(anchorU),
+          pixelCount: PIXELS,
+          readPixel: (i) => {
+            const t = posBuf.element(i).toVar();
+            return { position: t.xyz, valid: t.w.greaterThan(0.5) };
+          },
+        });
+        const rayStore = R.createSrcRayStore(store, { pixelCount: PIXELS });
+        const rayFrame = R.createSrcRayFrame(store, rayStore, {
+          pixelProbe: frame.pixelProbe,
+          raysPerPixel: RAYS_PER_PIXEL,
+        });
+
+        say(`pixels ${PIXELS} (${PIXELS - valid.reduce((a, b) => a + b, 0)} invalid)  ` +
+          `raysPerPixel ${RAYS_PER_PIXEL}  s0=${S0}  camera [${CAM}]  anchor [${ANCHOR}]`);
+        say(`probe store ${(store.bytes / 1048576).toFixed(2)}MB  ` +
+          `ray store ${(rayStore.bytes / 1048576).toFixed(2)}MB  ` +
+          `dispatches ${frame.passes.length} + ${rayFrame.passes.length}`);
+        say("");
+
+        const runFrame = async () => {
+          for (const pass of frame.passes) await renderer.computeAsync(pass);
+          for (const pass of rayFrame.passes) await renderer.computeAsync(pass);
+          const [table, pp, base, total] = await Promise.all([
+            renderer.getArrayBufferAsync(store.probeTable.value).then((b) => new Uint32Array(b)),
+            renderer.getArrayBufferAsync(frame.pixelProbe.value).then((b) => new Uint32Array(b)),
+            renderer.getArrayBufferAsync(rayStore.pixelRayBase.value).then((b) => new Uint32Array(b)),
+            rayFrame.readTotal(renderer),
+          ]);
+          // One record per live probe: key, parent, count, offset.
+          const live = store.cascades.map((c) => {
+            const byKey = new Map();
+            const byIndex = new Map();
+            for (let k = 0; k < c.probeCapacity; k++) {
+              const p = c.probeBase + k;
+              const w = p * P.PROBE_WORDS;
+              if ((table[w + P.PROBE_FLAGS] & P.FLAG_ALIVE) === 0) continue;
+              const rec = {
+                index: p,
+                key: table[w + P.PROBE_KEY] >>> 0,
+                parent: table[w + P.PROBE_PARENT] >>> 0,
+                count: table[w + P.PROBE_RAYS] >>> 0,
+                offset: table[w + P.PROBE_RAYOFF] >>> 0,
+              };
+              byKey.set(rec.key, rec);
+              byIndex.set(p, rec);
+            }
+            return { byKey, byIndex };
+          });
+          return { table, pixelProbe: pp, pixelRayBase: base, total, live };
+        };
+
+        const gpu = await runFrame();
+
+        // ── the mirror on the same pixels ─────────────────────────────────
+        const mirrorPixels = pixels.map((px, i) => (valid[i] ? px : null)).filter(Boolean);
+        const cfg = ref.makeSrcConfig({
+          spacing0: S0, camera: CAM, anchor: ANCHOR, raysPerPixel: RAYS_PER_PIXEL,
+          cascadeCount: cfgMod.CASCADE_COUNT, maxLods: cfgMod.MAX_LODS,
+        });
+        const built = ref.buildProbes(cfg, mirrorPixels);
+        const mirrorRays = ref.assignRays(cfg, built);
+
+        // ══ ARM 1: the counts, matched by key ════════════════════════════
+        say("── COUNTS: per-probe ray budget vs the CPU mirror, by key ──");
+        let totalGpuRays = 0;
+        for (let c = 0; c < cfgMod.CASCADE_COUNT; c++) {
+          const mirrorByKey = new Map();
+          for (const p of built.cascades[c].probes) mirrorByKey.set(p.key >>> 0, p.rayCount);
+          let wrong = 0;
+          let worst = null;
+          let sum = 0;
+          for (const [key, rec] of gpu.live[c].byKey) {
+            sum += rec.count;
+            const want = mirrorByKey.get(key);
+            if (want === rec.count) continue;
+            wrong++;
+            if (!worst) worst = `key ${key} gpu ${rec.count} vs mirror ${want}`;
+          }
+          if (c === 0) totalGpuRays = sum;
+          check(`c${c} every probe's ray count matches the mirror`,
+            wrong === 0, wrong === 0 ? `${gpu.live[c].byKey.size} probes, ${sum} rays` : `${wrong} wrong — ${worst}`);
+          // Conservation, stated per level rather than only at the top: the
+          // budget must be neither created nor destroyed climbing the ladder. A
+          // level whose sum drops is a broken parent link eating rays silently.
+          check(`c${c} total equals c0's — the budget is conserved climbing`,
+            sum === totalGpuRays, `${sum} vs ${totalGpuRays}`);
+        }
+        check("the frame total matches the mirror's",
+          gpu.total === mirrorRays.totalRays, `gpu ${gpu.total} vs mirror ${mirrorRays.totalRays}`);
+        check("the total equals raysPerPixel x valid pixels",
+          gpu.total === RAYS_PER_PIXEL * mirrorPixels.length,
+          `${gpu.total} vs ${RAYS_PER_PIXEL} x ${mirrorPixels.length}`);
+
+        // ══ ARM 2: the top cascade tiles [0, total) ══════════════════════
+        say("");
+        say("── PARTITION: the top cascade tiles [0, total) exactly ──");
+        const topRecs = [...gpu.live[cfgMod.CASCADE_COUNT - 1].byKey.values()]
+          .filter((r) => r.offset !== P.SLOT_EMPTY)
+          .sort((a, b) => a.offset - b.offset);
+        let gap = 0;
+        let overlap = 0;
+        let cursor = 0;
+        for (const r of topRecs) {
+          if (r.offset > cursor) gap++;
+          else if (r.offset < cursor) overlap++;
+          cursor = Math.max(cursor, r.offset + r.count);
+        }
+        check("no gap between top-cascade segments", gap === 0, `${gap} gaps`);
+        check("no overlap between top-cascade segments", overlap === 0, `${overlap} overlaps`);
+        check("the segments end exactly at the total", cursor === gpu.total,
+          `covered [0, ${cursor}) of [0, ${gpu.total})`);
+        check("every top-cascade probe got an offset",
+          topRecs.length === gpu.live[cfgMod.CASCADE_COUNT - 1].byKey.size,
+          `${topRecs.length}/${gpu.live[cfgMod.CASCADE_COUNT - 1].byKey.size}`);
+
+        // ══ ARM 3: every parent's children tile ITS range ════════════════
+        say("");
+        say("── NESTING: each parent's children tile the parent's range ──");
+        // This is the arm that would catch the compaction the atomic cursor
+        // replaced. A cursor that was seeded from the wrong place, or read
+        // before its parent settled, produces children whose ranges are
+        // individually plausible and collectively outside the parent.
+        for (let c = 0; c < cfgMod.CASCADE_COUNT - 1; c++) {
+          const byParent = new Map();
+          let orphan = 0;
+          for (const rec of gpu.live[c].byKey.values()) {
+            if (rec.parent === P.SLOT_EMPTY) { orphan++; continue; }
+            if (rec.offset === P.SLOT_EMPTY) { orphan++; continue; }
+            const list = byParent.get(rec.parent) ?? [];
+            list.push(rec);
+            byParent.set(rec.parent, list);
+          }
+          let badTile = 0;
+          let escaped = 0;
+          let countMismatch = 0;
+          for (const [parentIndex, kids] of byParent) {
+            const parent = gpu.live[c + 1].byIndex.get(parentIndex);
+            if (!parent) { escaped += kids.length; continue; }
+            kids.sort((a, b) => a.offset - b.offset);
+            let cur = parent.offset;
+            let sum = 0;
+            for (const k of kids) {
+              if (k.offset !== cur) badTile++;
+              cur = k.offset + k.count;
+              sum += k.count;
+              if (k.offset < parent.offset || cur > parent.offset + parent.count) escaped++;
+            }
+            if (sum !== parent.count) countMismatch++;
+          }
+          check(`c${c} -> c${c + 1} children tile the parent contiguously`,
+            badTile === 0, `${badTile} children not flush with the previous one`);
+          check(`c${c} -> c${c + 1} no child escapes its parent's range`,
+            escaped === 0, `${escaped} outside`);
+          check(`c${c} -> c${c + 1} children's counts sum to the parent's`,
+            countMismatch === 0, `${countMismatch} parents disagree`);
+          check(`c${c} every probe has a parent and an offset`, orphan === 0,
+            `${orphan} orphaned — those rays exist in the total but no pixel can fire them`);
+        }
+
+        // ══ ARM 4: pixels tile their own c0 probe's segment ══════════════
+        say("");
+        say("── PIXELS: each pixel's slice sits inside its own probe's range ──");
+        const perProbe = new Map();
+        let noBase = 0;
+        let invalidLeaked = 0;
+        for (let i = 0; i < PIXELS; i++) {
+          const probe = gpu.pixelProbe[i];
+          const base = gpu.pixelRayBase[i];
+          if (!valid[i]) {
+            if (base !== P.SLOT_EMPTY) invalidLeaked++;
+            continue;
+          }
+          if (probe === P.SLOT_EMPTY) continue;
+          if (base === P.SLOT_EMPTY) { noBase++; continue; }
+          const list = perProbe.get(probe) ?? [];
+          list.push(base);
+          perProbe.set(probe, list);
+        }
+        check("no invalid pixel was given a ray slice", invalidLeaked === 0, `${invalidLeaked} leaked`);
+        check("every resolved pixel got a ray slice", noBase === 0, `${noBase} missing`);
+        let pxBadTile = 0;
+        let pxEscaped = 0;
+        for (const [probeIndex, bases] of perProbe) {
+          const probe = gpu.live[0].byIndex.get(probeIndex);
+          if (!probe) { pxEscaped += bases.length; continue; }
+          bases.sort((a, b) => a - b);
+          let cur = probe.offset;
+          for (const b of bases) {
+            if (b !== cur) pxBadTile++;
+            cur = b + RAYS_PER_PIXEL;
+            if (b < probe.offset || cur > probe.offset + probe.count) pxEscaped++;
+          }
+          if (cur !== probe.offset + probe.count) pxBadTile++;
+        }
+        check("pixel slices tile their probe's segment contiguously", pxBadTile === 0,
+          `${pxBadTile} slices out of place`);
+        check("no pixel slice escapes its probe's segment", pxEscaped === 0, `${pxEscaped} outside`);
+
+        // ══ ARM 5: the global index set is a permutation ═════════════════
+        say("");
+        say("── COVERAGE: [0, total) is used exactly once, end to end ──");
+        // The strongest single statement available, and the one the three arms
+        // above are decomposed FROM: if every ray index in the frame is claimed
+        // by exactly one pixel, the whole allocator is correct regardless of
+        // which probe got which offset. It is checked last because when it
+        // fails, the arms above say WHERE.
+        const seen = new Uint8Array(gpu.total);
+        let dup = 0;
+        let outOfRange = 0;
+        for (let i = 0; i < PIXELS; i++) {
+          const base = gpu.pixelRayBase[i];
+          if (base === P.SLOT_EMPTY) continue;
+          for (let r = 0; r < RAYS_PER_PIXEL; r++) {
+            const idx = base + r;
+            if (idx >= gpu.total) { outOfRange++; continue; }
+            if (seen[idx]) dup++;
+            seen[idx] = 1;
+          }
+        }
+        let uncovered = 0;
+        for (let i = 0; i < gpu.total; i++) if (!seen[i]) uncovered++;
+        check("no ray index is claimed twice", dup === 0, `${dup} duplicates`);
+        check("no ray index is past the total", outOfRange === 0, `${outOfRange} out of range`);
+        check("every ray index in [0, total) is claimed", uncovered === 0,
+          `${uncovered}/${gpu.total} unclaimed`);
+
+        // ══ ARM 6: rerun — different indices, identical budget ═══════════
+        say("");
+        say("── RERUN: the allocation may move, the budget may not ──");
+        const gpu2 = await runFrame();
+        check("the total is stable across runs", gpu2.total === gpu.total,
+          `${gpu2.total} vs ${gpu.total} — a moving total is an atomics race, not scheduler order`);
+        let countDrift = 0;
+        let offsetsMoved = 0;
+        for (let c = 0; c < cfgMod.CASCADE_COUNT; c++) {
+          for (const [key, rec] of gpu.live[c].byKey) {
+            const now = gpu2.live[c].byKey.get(key);
+            if (!now || now.count !== rec.count) countDrift++;
+            else if (now.offset !== rec.offset) offsetsMoved++;
+          }
+        }
+        check("every probe's ray count is identical on the second run",
+          countDrift === 0, `${countDrift} changed`);
+        // NOT a failure. Stated as an observation because it is the thing a
+        // reader will otherwise mistake for one, and because a run where
+        // NOTHING moved would mean the atomics happened to serialize — worth
+        // seeing rather than asserting either way.
+        say(`   ${offsetsMoved} probes were handed a different offset on the rerun ` +
+          `(scheduler order — expected, and why no arm compares offsets)`);
+
+        if (validationErrors.length) check("no WebGPU validation errors", false, validationErrors[0]);
+
+        say("");
+        say(failures ? `gi-src-rays: ${failures} CHECKS FAILED` : "gi-src-rays: all cases PASS");
+        globalThis.__SRC_RAYS_RESULT__ = {
+          pass: failures === 0,
+          failures,
+          totalRays: gpu.total,
+          probesPerCascade: gpu.live.map((l) => l.byKey.size),
+          offsetsMoved,
+          storageLimit: device.limits.maxStorageBuffersPerShaderStage,
+          text: out.textContent,
+        };
+      } catch (error) {
+        fail(error);
+      }
+    </script>
+  </body>
+</html>

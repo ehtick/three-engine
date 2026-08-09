@@ -52,6 +52,7 @@ import {
   readSrcProbeStats,
 } from "./srcProbes.js";
 import { createSrcRayPass } from "./srcRayPass.js";
+import { createSrcRayFrame, createSrcRayStore } from "./srcRays.js";
 import { createSrcSceneTrace } from "./srcTrace.js";
 
 /** Camera drift, in units of s₀, that triggers a re-anchor. */
@@ -146,6 +147,19 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null, vol
   // wrong place, which is the most misleading failure a debug view can have.
   const gizmos = createSrcProbeGizmos(store, { spacing0, anchor: vec3(anchorU) });
 
+  // ── ALGORITHM 3 (plan §12.13.5 unit 2) ────────────────────────────────────
+  //
+  // Built UNCONDITIONALLY, unlike the scaffold trace below, because the budget
+  // is not a diagnostic — it is the numbering every later phase's deposit is
+  // addressed by, and unit 3 needs it whether or not a scaffold exists. It also
+  // costs nothing to look at: `srcRays.js`'s passes are eight tiny dispatches
+  // over the probe table, no marching.
+  const rayStore = createSrcRayStore(store, { pixelCount });
+  const rayFrame = createSrcRayFrame(store, rayStore, {
+    pixelProbe: frame.pixelProbe,
+    raysPerPixel: tier.raysPerPixel,
+  });
+
   // ── THE SCAFFOLD RAY PASS (plan §12.13.5 unit 1) ─────────────────────────
   //
   // One profiled ray per participating pixel. It produces no light and it is
@@ -162,8 +176,9 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null, vol
   const jitterYU = uniform(0, "uint");
   const rayPass = volume?.occupancyField
     ? createSrcRayPass({
-        pixelProbe: frame.pixelProbe,
+        pixelRayBase: rayStore.pixelRayBase,
         pixelCount,
+        raysPerPixel: tier.raysPerPixel,
         trace: createSrcSceneTrace(volume.occupancyField, volume.world, {
           rayHitMode: volume.rayHitMode,
           // ── THE STEP BUDGET, MEASURED RATHER THAN INHERITED ──────────────
@@ -213,14 +228,20 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null, vol
     store,
     frame,
     gizmos,
+    rayStore,
+    rayFrame,
     rayPass,
     spacing0,
-    // The ray pass rides the SAME dispatch list, after the population, because
-    // it reads `pixelProbe` — which the population's last resolve writes. A
-    // separate `renderer.compute` call would be the same barrier at the cost of
-    // one more launch; a different ORDER would trace against last frame's
-    // membership, which is the kind of one-frame skew that looks like noise.
-    passes: rayPass ? [...frame.passes, rayPass.reset, rayPass.compute] : frame.passes,
+    raysPerPixel: tier.raysPerPixel,
+    // ONE dispatch list, in dependency order: population → budget → trace. Each
+    // stage reads what the previous one wrote (`pixelProbe`, then
+    // `pixelRayBase`), and every gap between two entries is the barrier that
+    // makes that legal. A different order would spend this frame's rays against
+    // last frame's membership, which is the kind of one-frame skew that reads as
+    // noise rather than as a bug.
+    passes: rayPass
+      ? [...frame.passes, ...rayFrame.passes, rayPass.reset, rayPass.compute]
+      : [...frame.passes, ...rayFrame.passes],
     pixelProbe: frame.pixelProbe,
     width,
     height,
@@ -264,9 +285,11 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null, vol
       return {
         cascades: stats,
         reanchors,
-        bytes: store.bytes,
+        bytes: store.bytes + rayStore.bytes,
         spacing0,
         pixelCount,
+        raysPerPixel: tier.raysPerPixel,
+        totalRays: await rayFrame.readTotal(renderer),
         rays: rayPass ? await rayPass.readback(renderer) : null,
       };
     },
@@ -296,6 +319,7 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null, vol
     dispose() {
       gizmos.dispose();
       rayPass?.dispose();
+      rayStore.dispose();
       frame.dispose();
       store.dispose();
     },
@@ -309,7 +333,8 @@ export function describeSrcProbeSystem(system) {
     .map((x) => `c${x.cascade} ${x.probeCapacity}/${x.hashCapacity}`)
     .join(" ");
   return `[gi] src probes: ${system.pixelCount} gbuffer pixels, s0=${system.spacing0}, ` +
-    `${c}, ${(system.store.bytes / 1048576).toFixed(2)}MB` +
+    `${c}, ${system.raysPerPixel} rays/px, ` +
+    `${((system.store.bytes + system.rayStore.bytes) / 1048576).toFixed(2)}MB` +
     // Named in the boot log because "SRC is populating but tracing nothing" and
     // "SRC is tracing" are two different builds with identical probe telemetry,
     // and the second one is the one whose step budgets are being measured.
@@ -321,8 +346,13 @@ export function formatSrcProbeFrame(stats) {
   const r = stats.rays;
   return `[gi] src probes — ${formatSrcProbeStats(stats.cascades)}` +
     (stats.reanchors > 1 ? `  reanchors ${stats.reanchors}` : "") +
+    `  |  budget ${stats.totalRays} rays` +
     (r?.dispatched
-      ? `  |  rays ${r.rays} hit ${(r.hitRate * 100).toFixed(1)}% ` +
+      // `traced` vs `budget`: these must be EQUAL, and printing both rather than
+      // one is what makes a divergence visible at a glance. They come from
+      // opposite ends — the budget from Alg. 3's global cursor, the traced count
+      // from an atomic in the marcher's own kernel.
+      ? ` traced ${r.rays} hit ${(r.hitRate * 100).toFixed(1)}% ` +
         `t̄ ${r.meanT.toFixed(2)}m max ${r.maxT.toFixed(2)}m`
       : "");
 }

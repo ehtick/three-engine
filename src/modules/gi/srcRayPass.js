@@ -39,6 +39,11 @@
 //     for "does this pixel participate". §12.13.6, and srcMathTsl's own header:
 //     offsetting the origin along the normal to fix a self-occlusion artifact IS
 //     the artifact. The self-bias lives in the marcher, off the VOXEL size.
+//   · THE R2 INDEX IS ALGORITHM 3's, not the pixel index. Unit 2 landed
+//     `srcRays.js`, so `pixelRayBase[i] + r` is this ray's place in the one
+//     global sequence — which makes the scaffold's own ray count equal the
+//     frame's `totalRays` exactly, and that equality is an end-to-end check
+//     tying the budget to the thing that spends it.
 //   · LENGTH IS c0's INTERVAL, read from `intervalBoundary(0, lod, s₀)` rather
 //     than re-derived — one definition of where cascade 0 stops. This is the
 //     ray unit 4's c0-only resolve will shade, so the budget measured here is
@@ -103,12 +108,15 @@ const T_FIXED = 1024;
  * One profiled ray per participating pixel.
  *
  * @param {object} options
- * @param {object} options.pixelProbe  the frame's per-pixel c0 probe index;
- *   SLOT_EMPTY means the pixel had no geometry or its insert failed. Read
- *   rather than the gbuffer's own validity bit ON PURPOSE — "this pixel has a
- *   probe" is the condition every later phase gates on, so it is the condition
- *   the budget should be measured under.
+ * @param {object} options.pixelRayBase  Alg. 3's per-pixel ray base, from
+ *   `createSrcRayFrame`. SLOT_EMPTY means the pixel had no geometry, its insert
+ *   failed, or its probe never got a range — read rather than the gbuffer's own
+ *   validity bit ON PURPOSE, because "this pixel owns rays" is the condition
+ *   every later phase gates on, so it is the condition the budget should be
+ *   measured under.
  * @param {number} options.pixelCount
+ * @param {number} options.raysPerPixel  unrolled — the marcher is a `sharedFn`,
+ *   so N rays are N call sites, not N copies of the DDA.
  * @param {(o, d, tMax) => object} options.trace  from `createSrcSceneTrace`
  * @param {(i) => {position, valid}} options.readPixel
  * @param {(i) => object} options.readNormal  world normal at the pixel
@@ -118,8 +126,9 @@ const T_FIXED = 1024;
  * @param {object} options.jitterY
  */
 export function createSrcRayPass({
-  pixelProbe,
+  pixelRayBase,
   pixelCount,
+  raysPerPixel = 1,
   trace,
   readPixel,
   readNormal,
@@ -138,7 +147,8 @@ export function createSrcRayPass({
 
   const compute = Fn(() => {
     const i = instanceIndex.toVar();
-    If(pixelProbe.element(i).equal(uint(SLOT_EMPTY)), () => {
+    const base = pixelRayBase.element(i).toVar();
+    If(base.equal(uint(SLOT_EMPTY)), () => {
       Return();
     });
     const px = readPixel(i);
@@ -156,19 +166,23 @@ export function createSrcRayPass({
     // same camera uniform, same `lodAtDistance`, same `floor`.
     const lod = floor(lodAtDistance(chebyshev(P, camera), spacing0, maxLods)).toVar();
     const reach = intervalBoundary(0, lod, spacing0).toVar();
-    // The R2 index is the PIXEL index here. Alg. 3's global ray numbering is
-    // unit 2's job (`srcRays.js`), and using it before it exists would mean
-    // writing a second, throwaway assignment scheme whose only consumer is a
-    // pass that is itself throwaway.
-    const dir = rayDirection(i, N, jitterX, jitterY).toVar();
-    const r = trace(P, dir, reach);
-
-    const hit = r.hit.greaterThan(0.5).toVar();
-    const tfx = select(hit, r.t.max(0).mul(T_FIXED), float(0)).toUint().toVar();
-    atomicAdd(sink.element(uint(SINK_RAYS)), uint(1));
-    atomicAdd(sink.element(uint(SINK_HITS)), select(hit, uint(1), uint(0)));
-    atomicAdd(sink.element(uint(SINK_TSUM)), tfx);
-    atomicMax(sink.element(uint(SINK_TMAX)), tfx);
+    // Unrolled in JS because `raysPerPixel` is a compile-time constant (1 at
+    // low/medium, 2 at high/ultra) and the marcher is a `sharedFn` — N rays are
+    // N call sites against one WGSL function, not N copies of the DDA.
+    for (let k = 0; k < raysPerPixel; k++) {
+      // `base + k` is this ray's place in the ONE global R2 sequence that Alg. 3
+      // partitioned. Not the pixel index, and not a per-pixel restart: the whole
+      // point of the budget is that every probe's rays are a contiguous run of
+      // this sequence, and a re-derived index would throw that away silently.
+      const dir = rayDirection(base.add(uint(k)), N, jitterX, jitterY).toVar();
+      const r = trace(P, dir, reach);
+      const hit = r.hit.greaterThan(0.5).toVar();
+      const tfx = select(hit, r.t.max(0).mul(T_FIXED), float(0)).toUint().toVar();
+      atomicAdd(sink.element(uint(SINK_RAYS)), uint(1));
+      atomicAdd(sink.element(uint(SINK_HITS)), select(hit, uint(1), uint(0)));
+      atomicAdd(sink.element(uint(SINK_TSUM)), tfx);
+      atomicMax(sink.element(uint(SINK_TMAX)), tfx);
+    }
   })().compute(pixelCount);
 
   return {

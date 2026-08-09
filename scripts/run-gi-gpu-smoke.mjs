@@ -40,7 +40,8 @@ for (const arm of arms) {
         // §12.13.4 left open, so they get printed rather than merely asserted.
         const r = result.srcProbes.rays;
         if (r) {
-          console.log(`  src rays: ${r.count} traced, hit ${(r.hitRate * 100).toFixed(1)}%, ` +
+          console.log(`  src rays: ${r.count} traced = ${r.budget} budgeted ` +
+            `(${r.perPixel}/px), hit ${(r.hitRate * 100).toFixed(1)}%, ` +
             `mean t ${r.meanT}m, max t ${r.maxT}m`);
         }
       }

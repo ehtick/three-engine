@@ -484,9 +484,28 @@
           const rays = await src.rayPass.readback(engine.renderer);
           srcReport.rays = {
             dispatched: rays.dispatched, count: rays.rays,
+            budget: s.totalRays, perPixel: s.raysPerPixel,
             hitRate: +rays.hitRate.toFixed(3),
             meanT: +rays.meanT.toFixed(3), maxT: +rays.maxT.toFixed(3),
           };
+          // ── THE BUDGET AND THE TRACER MUST AGREE ──────────────────────
+          //
+          // Algorithm 3 (`srcRays.js`, plan §12.13.5 unit 2) partitions
+          // [0, totalRays) and hands each pixel a slice; the scaffold fires
+          // exactly that slice. So the count the marcher's own atomic reports
+          // and the count the global cursor allocated are the SAME NUMBER
+          // arrived at from opposite ends of the frame.
+          //
+          // `test:gi-src-rays` proves the partition against the CPU mirror on a
+          // synthetic gbuffer. What it cannot see is the real one: a pixel whose
+          // probe exists but whose range never arrived keeps SLOT_EMPTY and
+          // simply does not fire, which is silent everywhere except here.
+          if (rays.rays !== s.totalRays) {
+            throw new Error(
+              `src arm: the budget and the tracer disagree — Alg. 3 allocated ${s.totalRays} rays, ` +
+              `the marcher fired ${rays.rays}. Pixels are being dropped between the two.`,
+            );
+          }
           if (!rays.dispatched || !(rays.rays > 0)) {
             throw new Error(`src arm: the scaffold ray pass traced nothing (dispatched=${rays.dispatched}, rays=${rays.rays})`);
           }
