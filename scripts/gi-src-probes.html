@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>SRC probe hashmap gate — srcProbes.js vs SrcProbeMap</title>
+    <style>html,body{margin:0;background:#111;color:#ddd;font:13px monospace}canvas{display:none}</style>
+  </head>
+  <body>
+    <canvas id="view" width="16" height="16"></canvas>
+    <pre id="log"></pre>
+    <script type="module">
+      // ══ WHAT THIS GATE IS FOR ═════════════════════════════════════════════
+      //
+      // `srcProbes.js` is a lock-free hashmap written in raw WGSL, and every
+      // way it can be wrong is a way that looks fine: a duplicate entry gives
+      // one probe two payloads and half the rays each; a lost insert gives a
+      // dark patch that moves with the camera; a recycled index gives a probe
+      // somebody else's temporal history. None of those throw, and none of them
+      // are visible in a screenshot of a static scene.
+      //
+      // `srcRef.js`'s `SrcProbeMap` is the mirror — first-writer-wins, same
+      // observable semantics — and the arms below hold the GPU to it as a SET,
+      // not as an array, because the two cannot agree on index ASSIGNMENT and
+      // pretending otherwise would be a gate that fails for the wrong reason.
+      // The GPU allocates by `atomicAdd` in whatever order the scheduler ran;
+      // the mirror allocates in insertion order. What must match is which keys
+      // exist, how many there are, and that no two share an index.
+      //
+      // ══ THE ARMS ══════════════════════════════════════════════════════════
+      //
+      //   storm      4096 inserts over 400 distinct keys, shuffled — the pixel
+      //              scatter in miniature, and the case where CAS contention is
+      //              real. Plus a run of sequential cells, whose keys differ
+      //              only in the low bits and would cluster under a weak mix.
+      //   stability  a second frame re-inserting a SUBSET: every survivor must
+      //              keep the index it had. This is the whole reason the free
+      //              stack exists instead of per-frame compaction, and nothing
+      //              else in the system checks it.
+      //   retire     keep going and the absent keys must age out at exactly
+      //              maxAge frames — not earlier (history lost) and not never
+      //              (the table fills and new probes stop being created).
+      //   recycle    a retired index must come back through the free stack and
+      //              be reused. If it does not, the map leaks slots and dies
+      //              after `probeCapacity` distinct probes have ever existed,
+      //              which is a bug with a delay fuse measured in minutes.
+      //   overflow   more distinct keys than the table can hold. The failure
+      //              must be COUNTED and bounded — live <= capacity, no index
+      //              handed out twice — never a clamp to index 0, which would
+      //              pour every overflowing probe into one record.
+      //
+      // Run: node scripts/run-gi-src-probes-test.mjs
+      const out = document.querySelector("#log");
+      const say = (line) => { out.textContent += line + "\n"; };
+      let failures = 0;
+      const check = (label, ok, detail = "") => {
+        say(`  ${ok ? "PASS" : "FAIL"} ${label}${detail ? ` — ${detail}` : ""}`);
+        if (!ok) failures++;
+      };
+      const fail = (error) => {
+        console.error("SRC-PROBES FAIL", error?.stack ?? error?.message ?? String(error));
+        globalThis.__SRC_PROBES_RESULT__ = { pass: false, error: error?.message ?? String(error), text: out.textContent };
+      };
+      globalThis.addEventListener("error", (event) => fail(event.error ?? event.message));
+      globalThis.addEventListener("unhandledrejection", (event) => fail(event.reason));
+
+      try {
+        const THREE = await import("three/webgpu");
+        const TSL = await import("three/tsl");
+        const refMath = await import("/src/modules/gi/srcMath.js");
+        const { SrcProbeMap } = await import("/src/modules/gi/srcRef.js");
+        const P = await import("/src/modules/gi/srcProbes.js");
+
+        const { Fn, instanceIndex, instancedArray, int, uint } = TSL;
+
+        const renderer = new THREE.WebGPURenderer({ canvas: document.querySelector("#view") });
+        await renderer.init();
+        const device = renderer.backend.device;
+        const validationErrors = [];
+        device.addEventListener?.("uncapturederror", (event) => {
+          validationErrors.push(event.error?.message ?? String(event.error));
+          console.error("WebGPU validation error:", validationErrors.at(-1));
+        });
+
+        // ── the key set ───────────────────────────────────────────────────
+        const rng = (() => {
+          let s = 0x1d0ffa11 >>> 0;
+          return () => {
+            s = (s + 0x6d2b79f5) >>> 0;
+            let t = s;
+            t = Math.imul(t ^ (t >>> 15), t | 1);
+            t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+            return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+          };
+        })();
+
+        const distinct = [];
+        // Sequential cells along one axis: adjacent probe keys differ by 1 in
+        // z and are therefore maximally correlated in their low bits. A modulo
+        // of the raw key would put this whole run in consecutive slots and turn
+        // lockless linear probing into a linear scan.
+        for (let z = 0; z < 256; z++) distinct.push(refMath.packProbeKey(2, false, 5, -7, z - 128));
+        // Scattered cells across LODs and both caches.
+        for (let i = 0; i < 144; i++) {
+          distinct.push(refMath.packProbeKey(
+            Math.floor(rng() * 10), rng() < 0.3,
+            Math.floor(rng() * 400) - 200, Math.floor(rng() * 400) - 200, Math.floor(rng() * 400) - 200,
+          ));
+        }
+        const uniqueKeys = [...new Set(distinct.filter((k) => k !== refMath.KEY_EMPTY))];
+
+        // The insert list: every distinct key repeated a variable number of
+        // times, shuffled, with a sprinkling of EMPTY (an invalid gbuffer pixel
+        // or an out-of-window cell) that must be dropped rather than inserted.
+        const INSERTS = 4096;
+        const inserts = [];
+        for (let i = 0; i < INSERTS; i++) {
+          inserts.push(rng() < 0.05 ? refMath.KEY_EMPTY : uniqueKeys[Math.floor(rng() * uniqueKeys.length)]);
+        }
+        // Guarantee every distinct key appears at least once, so the expected
+        // set is exactly `uniqueKeys` and not "whatever the shuffle happened to
+        // pick" — a gate whose expectation depends on its own RNG is not one.
+        for (let i = 0; i < uniqueKeys.length; i++) inserts[i] = uniqueKeys[i];
+
+        // ── the store: small on purpose, so overflow is reachable ─────────
+        const MAX_AGE = 3;
+        const store = P.createSrcProbeStore({ c0Probes: 1024, cascadeCount: 1, loadFactor: 0.5 });
+        const c0 = store.cascades[0];
+        say(`store: probeCapacity=${c0.probeCapacity} hashCapacity=${c0.hashCapacity} ` +
+          `bytes=${(store.bytes / 1024).toFixed(1)}kB  maxAge=${MAX_AGE}`);
+        say("");
+
+        // The key list lives in its own storage buffer; `keyOf` reads it. In
+        // production this closure samples the gbuffer instead, which is exactly
+        // why `createInsertPass` takes a closure and not a buffer.
+        const keyBuf = instancedArray(new Uint32Array(INSERTS), "uint");
+        const slotOut = instancedArray(new Int32Array(INSERTS).fill(-1), "int");
+        const probeOut = instancedArray(new Uint32Array(INSERTS).fill(P.SLOT_EMPTY), "uint");
+
+        const clearPass = P.createHashClearPass(store);
+        const agePass = P.createAgePass(store, 0, { maxAge: MAX_AGE });
+        const insertPass = P.createInsertPass(
+          store, 0, INSERTS,
+          (i) => keyBuf.element(i),
+          (i, slot) => { slotOut.element(i).assign(int(slot)); },
+        );
+        const compactPass = P.createCompactPass(store, 0);
+        const resolvePass = P.createResolvePass(
+          store, INSERTS,
+          (i) => slotOut.element(i),
+          (i, probe) => { probeOut.element(i).assign(uint(probe)); },
+        );
+
+        const uploadKeys = (list) => {
+          const arr = keyBuf.value.array;
+          for (let i = 0; i < INSERTS; i++) arr[i] = (list[i % list.length] ?? refMath.KEY_EMPTY) >>> 0;
+          keyBuf.value.needsUpdate = true;
+        };
+
+        const runFrame = async (list) => {
+          uploadKeys(list);
+          await renderer.computeAsync(clearPass);
+          await renderer.computeAsync(agePass);
+          await renderer.computeAsync(insertPass);
+          await renderer.computeAsync(compactPass);
+          await renderer.computeAsync(resolvePass);
+          const [table, probes, stats] = await Promise.all([
+            renderer.getArrayBufferAsync(store.probeTable.value).then((b) => new Uint32Array(b)),
+            renderer.getArrayBufferAsync(probeOut.value).then((b) => new Uint32Array(b)),
+            P.readSrcProbeStats(renderer, store),
+          ]);
+          // key -> probe index, read out of the live indirection table.
+          const byKey = new Map();
+          const alive = [];
+          for (let p = 0; p < c0.probeCapacity; p++) {
+            const w = p * P.PROBE_WORDS;
+            if ((table[w + P.PROBE_FLAGS] & P.FLAG_ALIVE) === 0) continue;
+            alive.push(p);
+            byKey.set(table[w + P.PROBE_KEY] >>> 0, p);
+          }
+          return { table, probes, stats: stats[0], byKey, alive };
+        };
+
+        // ══ ARM 1: the storm ═════════════════════════════════════════════
+        say("── STORM: 4096 contended inserts over " + uniqueKeys.length + " distinct keys ──");
+        const f1 = await runFrame(inserts);
+
+        // The mirror, run on the same list.
+        const mirror = new SrcProbeMap(c0.probeCapacity);
+        for (const k of inserts) mirror.insert(k, (key, index) => ({ key, index }));
+        const mirrorKeys = new Set(mirror.probes.map((p) => p.key >>> 0));
+
+        check("live probe count matches the CPU mirror",
+          f1.stats.live === mirror.probes.length,
+          `gpu ${f1.stats.live} vs mirror ${mirror.probes.length} (${uniqueKeys.length} distinct keys inserted)`);
+        check("the key SET matches the CPU mirror exactly",
+          f1.byKey.size === mirrorKeys.size && [...mirrorKeys].every((k) => f1.byKey.has(k)),
+          `gpu ${f1.byKey.size} keys, mirror ${mirrorKeys.size}, ` +
+          `${[...mirrorKeys].filter((k) => !f1.byKey.has(k)).length} missing on the gpu`);
+        check("no key was inserted twice (one probe, one index)",
+          f1.alive.length === f1.byKey.size,
+          `${f1.alive.length} live entries for ${f1.byKey.size} distinct keys`);
+        check("EMPTY was never inserted", !f1.byKey.has(0), "key 0 is the hashmap's own sentinel");
+        check("no insert failed at this load factor", f1.stats.failed === 0, `${f1.stats.failed} failures`);
+
+        // Every insert thread must have resolved to the probe that owns its key
+        // — this is the part a set comparison cannot see. A thread that lost the
+        // CAS and then read a stale `hashSlot` would land on the wrong probe,
+        // and its rays would be deposited into somebody else's bins.
+        let wrongResolve = 0;
+        let unresolved = 0;
+        for (let i = 0; i < INSERTS; i++) {
+          const key = inserts[i] >>> 0;
+          if (key === 0) { if (f1.probes[i] !== P.SLOT_EMPTY) wrongResolve++; continue; }
+          const want = f1.byKey.get(key);
+          if (f1.probes[i] === P.SLOT_EMPTY) unresolved++;
+          else if (f1.probes[i] !== want) wrongResolve++;
+        }
+        check("every insert resolved to the probe holding its own key",
+          wrongResolve === 0 && unresolved === 0,
+          `${wrongResolve} wrong, ${unresolved} unresolved of ${INSERTS}`);
+        // Both means are per ATTEMPT. The mirror counts its own probe steps the
+        // same way, so this is a like-for-like comparison of the two probe
+        // sequences and not just an absolute bar.
+        const mirrorMean = mirror.probeSteps / INSERTS;
+        say(`   load ${f1.stats.loadFactor.toFixed(3)}  mean probe steps ` +
+          `${f1.stats.meanProbeSteps.toFixed(2)} over ${f1.stats.attempts} attempts` +
+          `  (mirror ${mirrorMean.toFixed(2)})`);
+        check("the hash mix keeps the probe sequence short on correlated keys",
+          f1.stats.meanProbeSteps < 4,
+          `mean ${f1.stats.meanProbeSteps.toFixed(2)} steps — a weak mix clusters sequential cells`);
+        check("the GPU probe sequence is no worse than the mirror's",
+          f1.stats.meanProbeSteps <= mirrorMean + 0.5,
+          `gpu ${f1.stats.meanProbeSteps.toFixed(2)} vs mirror ${mirrorMean.toFixed(2)} — ` +
+          `a gap here means the two are not walking the same sequence`);
+
+        // ══ ARM 2: slot stability across a frame ═════════════════════════
+        say("");
+        say("── STABILITY + RETIREMENT: a survivor keeps its index; the absent age out ──");
+        const survivors = uniqueKeys.filter((_, i) => i % 3 !== 0);
+        const dropped = uniqueKeys.filter((_, i) => i % 3 === 0);
+        const before = new Map(f1.byKey);
+
+        const f2 = await runFrame(survivors);
+        let moved = 0;
+        for (const k of survivors) {
+          if (before.get(k >>> 0) !== f2.byKey.get(k >>> 0)) moved++;
+        }
+        check("every re-inserted probe kept its indirection index", moved === 0,
+          `${moved}/${survivors.length} moved — temporal history follows the index`);
+        check("the dropped keys are still alive one frame later (age 1 of 3)",
+          dropped.every((k) => f2.byKey.has(k >>> 0)),
+          `${dropped.filter((k) => !f2.byKey.has(k >>> 0)).length}/${dropped.length} already gone`);
+
+        // Age them out. One frame per age step; the retirement must land on the
+        // frame the constant says and not a frame either side of it.
+        let retiredAt = -1;
+        let last = f2;
+        for (let frame = 2; frame <= MAX_AGE + 2; frame++) {
+          last = await runFrame(survivors);
+          const goneNow = dropped.filter((k) => !last.byKey.has(k >>> 0)).length;
+          if (goneNow > 0 && retiredAt < 0) retiredAt = frame;
+          if (goneNow > 0 && goneNow < dropped.length) {
+            check(`retirement is uniform at frame ${frame}`, false,
+              `${goneNow}/${dropped.length} gone — a partial sweep means the age pass raced`);
+          }
+        }
+        check(`absent probes retire at exactly maxAge=${MAX_AGE} frames`, retiredAt === MAX_AGE + 1,
+          `first frame with retirements: ${retiredAt} (expected ${MAX_AGE + 1})`);
+        check("every survivor is still alive after the sweep",
+          survivors.every((k) => last.byKey.has(k >>> 0)),
+          `${survivors.filter((k) => !last.byKey.has(k >>> 0)).length} survivors were retired by mistake`);
+        check("survivors STILL hold their original indices after the sweep",
+          survivors.every((k) => before.get(k >>> 0) === last.byKey.get(k >>> 0)),
+          `${survivors.filter((k) => before.get(k >>> 0) !== last.byKey.get(k >>> 0)).length} moved`);
+        check("live count fell by exactly the retired set",
+          last.stats.live === survivors.length,
+          `live ${last.stats.live}, survivors ${survivors.length}`);
+
+        // ══ ARM 3: the free stack actually recycles ══════════════════════
+        say("");
+        say("── RECYCLE: a retired index must come back ──");
+        const freedIndices = new Set(dropped.map((k) => before.get(k >>> 0)));
+        // LOD 11 is used by nothing above (the sequential run is LOD 2, the
+        // scattered set is LOD 0..9), so these are guaranteed-new keys. The
+        // cells stay inside [−256, 256): the first version of this arm used
+        // `cx = 300 + i`, `packProbeKey` correctly returned EMPTY for every one
+        // of them, and the arm then measured a recycle rate over an empty set.
+        // Hence the liveness assertion before the interesting question.
+        const newKeys = [];
+        for (let i = 0; i < dropped.length; i++) {
+          newKeys.push(refMath.packProbeKey(11, false, i - 67, 200, -200));
+        }
+        check("the new keys are representable at all",
+          newKeys.every((k) => k !== refMath.KEY_EMPTY),
+          `${newKeys.filter((k) => k === refMath.KEY_EMPTY).length}/${newKeys.length} packed to EMPTY`);
+        const f4 = await runFrame([...survivors, ...newKeys]);
+        check("the new keys actually became probes",
+          newKeys.every((k) => f4.byKey.has(k >>> 0)),
+          `${newKeys.filter((k) => !f4.byKey.has(k >>> 0)).length}/${newKeys.length} never appeared`);
+        const reused = newKeys.filter((k) => freedIndices.has(f4.byKey.get(k >>> 0))).length;
+        check("new probes reuse retired indices from the free stack",
+          reused > 0,
+          `${reused}/${newKeys.length} new probes landed on a recycled index ` +
+          `(0 means the stack leaks and the table dies after ${c0.probeCapacity} probes ever)`);
+        check("no index is held by two probes after recycling",
+          new Set([...f4.byKey.values()]).size === f4.byKey.size,
+          `${f4.byKey.size} keys onto ${new Set([...f4.byKey.values()]).size} indices`);
+
+        // ══ ARM 4: overflow is counted, not corrupt ══════════════════════
+        say("");
+        say("── OVERFLOW: more distinct keys than the table can hold ──");
+        const flood = [];
+        for (let i = 0; i < INSERTS; i++) {
+          flood.push(refMath.packProbeKey(0, false, (i % 250) - 125, Math.floor(i / 250) - 8, i % 97));
+        }
+        const uniqueFlood = new Set(flood.filter((k) => k !== 0).map((k) => k >>> 0));
+        const f5 = await runFrame(flood);
+        check("live never exceeds the indirection capacity",
+          f5.stats.live <= c0.probeCapacity,
+          `live ${f5.stats.live} vs capacity ${c0.probeCapacity} (${uniqueFlood.size} distinct keys offered)`);
+        check("overflow is COUNTED rather than silently dropped",
+          uniqueFlood.size <= c0.probeCapacity || f5.stats.failed > 0,
+          `${uniqueFlood.size} distinct keys, capacity ${c0.probeCapacity}, failures ${f5.stats.failed}`);
+        check("no index is shared under overflow",
+          new Set([...f5.byKey.values()]).size === f5.byKey.size,
+          `${f5.byKey.size} keys onto ${new Set([...f5.byKey.values()]).size} indices`);
+        // The table is not empty when the flood arrives: the previous frame's
+        // probes are one frame old and have every right to still be there. So
+        // the admissible set is the flood UNION what was already alive — and
+        // stating it that way is the point, because "every live key was offered
+        // AT SOME POINT" is the property that fails if a torn read invents one.
+        const admissible = new Set([...uniqueFlood, ...f4.byKey.keys()]);
+        const invented = [...f5.byKey.keys()].filter((k) => !admissible.has(k));
+        check("every live entry's key was actually offered (this frame or last)",
+          invented.length === 0,
+          `${invented.length} keys nobody inserted — a torn read of the table`);
+        say(`   ${P.formatSrcProbeStats([f5.stats])}`);
+
+        if (validationErrors.length) {
+          check("no WebGPU validation errors", false, validationErrors[0]);
+        }
+
+        say("");
+        say(failures ? `gi-src-probes: ${failures} CHECKS FAILED` : "gi-src-probes: all cases PASS");
+        globalThis.__SRC_PROBES_RESULT__ = {
+          pass: failures === 0,
+          failures,
+          storageLimit: device.limits.maxStorageBuffersPerShaderStage,
+          text: out.textContent,
+        };
+      } catch (error) {
+        fail(error);
+      }
+    </script>
+  </body>
+</html>
