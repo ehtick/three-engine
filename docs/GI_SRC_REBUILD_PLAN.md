@@ -956,3 +956,121 @@ Order from here:
    tolerate a null gather. Check that first; it is the load-bearing unknown of the whole edit.
 2. Then Phase 1 (GPU probe population), diffed against `srcRef.js` on a frozen frame.
 3. The deferred A/Bs of §12.6.5, plus `dynamicObjects`' card words (12.7.5).
+
+---
+
+### 12.8 The dense transport, part 1 — the load-bearing question, answered; and the unit re-scoped
+
+**Status:** the prerequisite is landed and measured (`e9bffc9`); the deletion itself is NOT started.
+§12.7's closing order named one thing to check first and it turned out to be the smaller of the two
+things this section found.
+
+#### 12.8.1 Can the screen chain run with a null gather? Yes — but not for the reason it looked like
+
+§12.7 asked whether `#buildScreenResolve` tolerates a null `gather`. The material side already did:
+giLight's `light.gatherFn` is the **non-deferred fallback only** (giLight.js:1296), the deferred path
+keys off `giIrradianceNode`, and the guard at giLight.js:1163 accepts either. So the only live
+consumer was `createGiResolve` itself, and making it optional is four lines.
+
+**The real hazard was next to it, and it is a survivors'-plumbing bug, not a delete-list one.** The
+camera position was a field of the CASCADE RADIANCE bundle:
+
+    const radiance = radianceLookup ? { lookup, cameraPosition: uniform(new THREE.Vector3()) } : null;
+
+Four things read it and exactly one is about reflections — the resolve's back-face `facing` flip, the
+gather's view bias, the reflection-hit incident ray, and (via `radiance?.cameraPosition ?? null`) the
+**emitter shadow pass**. Delete the cascades and `radiance` is null, at which point three surviving
+passes stop flipping back-faces: `facing` degenerates to `+1`, the emitter pass takes its own
+documented `cameraPosition = null` fallback, and a double-sided wall seen from inside a room gathers
+the wrong hemisphere — the exact artifact giScreen.js:291 and giLight.js:1184 both exist to prevent.
+
+Nothing shipped with `radiance` off, so nothing shipped broken. **The deletion is what would have made
+it real — and as a "pure removal" of a dead field, with no diff to point at.** That is the §12.5
+failure mode relocated: not an entry in §5's delete column, but a survivor whose input arrives through
+the thing being deleted.
+
+Fixed ahead of the deletion, so the fix is measurable in isolation: one system-owned
+`_giResolveCamU`, persistent across rebuilds (the tick holds the only reference that matters, and the
+resize path re-binds the same one), passed explicitly to the resolve, the reflection-hit shading and
+both emitter-shadow-pass call sites. `radiance` keeps only `{ lookup }`; the tick's camera write is no
+longer gated on it. `bvhShade.cameraPosition` went the same way — two uniforms that merely happen to
+be written from the same camera each tick are one write-ordering bug away from striped reflections.
+
+Behaviour-preserving today, and **measured** rather than asserted: emitter-shadow GPU probe
+`penumbraPx=16601 grain=0.0307`, identical to the four commits before it. That is the whole point of
+doing it as its own commit — after the deletion there is no arm left to compare against.
+
+A null gather now compiles the diffuse term out rather than multiplying by zero, and takes the AO
+ladder with it (~50 oracle fetches per pixel to modulate a zero). An exact-reflection hit falls back
+to its direct terms: dim, but correct, where a missing base would have been black.
+
+#### 12.8.2 `giField.js` does NOT die as a unit — it SPLITS, and `createSrcVolume` is the survivor half
+
+§12.7's order says "`giField.js` no longer has a single surviving consumer … so it dies as a unit".
+**That is wrong**, and the count says so immediately: GISystem uses `volume.occupancyField` **28
+times** and `volume.world` **12 times**, and both reach it through giField's return object. Its
+return mixes two unrelated things:
+
+| survives (the spine) | dies (the dense transport) |
+| --- | --- |
+| `world` (the uniform bundle), `res`, `bounds`, `cell`, `minCell`, `capWorld` | `compositeCompute`, `distanceTexture` |
+| `occupancyField`, `occupancy`, `distance` | `staging`/`base`/`radiance`/`surface`/`normal`/`indirect` buffers |
+| `rayHitMode`, `createSoftShadowTrace`, `createWidthProbe` | `grid`, `sparse`, `updateGrid`, `updateSparse`, `coarseLevel` |
+| `setBounds` (the world/occupancy half of the refit) | `atlas`, `createSceneTrace`, `readbackStats` |
+
+The good news, and it makes this much smaller than the table suggests: **GISystem already builds the
+occupancy field itself** (`createOccupancyField` at GISystem.js:6827, with the whole binding-size
+degrade ladder around it). giField merely re-exports it. So the split is not a rehoming of the
+pyramid — it is `createSrcVolume` growing the handful of spine members giField currently adds, and
+GISystem calling it instead of `createGiField`.
+
+`srcVolume.js` already has the right nucleus: `createSrcWorld(bounds, res, occField)` builds the same
+uniform bundle **and already has `refit(nextBounds)`** — the world half of `setBounds`. What it needs
+is the top-level value mirrors (`res`/`bounds`/`cell`/`minCell`/`capWorld`, ~9 call sites between
+them) and a `setBounds` that calls `world.refit` + `occField.refit()` and drops the atlas/grid/sparse
+invalidation that dies with them.
+
+**And §12.6.5 #1 (the `capWorld` derivation A/B) is a no-op — close it.** giField: `SDF_CAP * minCell`
+with `SDF_CAP = 16` (giField.js:35). srcVolume: `16 * minCell` (srcVolume.js:113). Identical, by
+independent derivation from opposite ends — the byte-quantized texture's useful reach and the
+pyramid's own `voxel · 2^(OCC_LEVELS-1)` ceiling. The surviving question is **which lattice**, not
+which multiplier: `createSrcWorld` accepts `res: null`, in which case `cell` comes from
+`occField.voxel` (the voxel lattice) instead of `size/res` (the cell lattice), and those differ by a
+factor of ~3.3 at the shipping presets. Pass `res` and the two agree exactly; that is the arm to take
+into the split, and the `res: null` mode is a separate, later question.
+
+#### 12.8.3 `slotRegistry.js` splits too — the fourth §5 delete-column error
+
+§5 files `slotRegistry.js`'s "atlas spine" for deletion and §12.7's order repeated it as if the file
+went with it. **GISystem imports nine symbols from it** (GISystem.js:39-49), and they fall on both
+sides of the cut:
+
+- **Survives — slot/placement IDENTITY**, which the occupancy path stands on: the `SlotRegistry`
+  class's `allocateSlot`/`releaseSlot`/`setAnalyticSlot`/`worldMatrixOf`/`refreshSlotTransform`/
+  `refreshTransforms`, plus `slotKeyOf`, `geometryContentHash`, `instanceCapacityFor` and
+  `MAX_INSTANCE_SLOTS`. `field.setSlotMatrix(p.slot, …)` and `field.setGeometry(geometries,
+  placements)` are the occupancy field consuming exactly this.
+- **Dies — the SDF TILE ATLAS**: `acquireTile`/`releaseTile`, `setSlot(…, sdf, …)`, `sampleSlot`,
+  `refineDetail`, `encodeMeshSdf`/`decodeMeshSdf`, `MESH_SDF_*`, `SLOTS_PER_LAYER`,
+  `MAX_ATLAS_LAYERS`, `MAX_MESH_SDF_SLOTS`, `DETAIL_SLOTS`, `atlasCapacityFor`.
+
+So the corrected unit is **split two files, delete five** — not "delete seven". `cascade{Trace,Merge,
+Gather}.js`, `sparseField.js` and `instanceGrid.js` do die whole (and `cascadeTrace.js` is already
+down to 203 lines after §12.7.2 took the octahedral map out).
+
+Recorded as a pattern, because it is now four for four: **every §5 entry checked against its callers
+has been wrong in the same direction** — the delete column names files by what they were BUILT for and
+not by everything they ended up carrying. Read the return object and count the consumers before
+cutting; the count takes a minute and has been decisive every time.
+
+#### 12.8.4 Order from here
+
+1. **Grow `createSrcVolume` into the volume provider** — the spine members above, additive, with
+   `run-gi-src-volume-test.mjs` extended to cover the refit. Additive means it cannot regress the
+   shipping path, and it de-risks the big edit by moving the "what does the spine actually need"
+   question out of it.
+2. **Then the split proper**, as one edit because this half genuinely is one: GISystem's
+   `#rebuild` (cascades, merge, gather, probe irradiance, feedback, the queue assembly), the
+   transport half of `#tick`, the ~2,500-line adoption lifecycle, and the five whole-file deletions.
+   The screen chain is already ready for it (12.8.1).
+3. Then Phase 1 (GPU probe population), diffed against `srcRef.js` on a frozen frame.
