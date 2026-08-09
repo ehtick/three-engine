@@ -31,7 +31,7 @@ import { Fn, If, cameraPosition, cos, float, fract, mix, normalWorld, positionWo
 import { GI_BOOT_AMBIENT_MAX_TICKS, bootAmbientStep } from "./bootAmbient.js";
 import { blitBvhAtlasTiles, createGiBvhReflect, createGiBvhTarget, createGiEmitterShadowPass, createGiGBuffer, createGiLightShadowFilterPass, createGiLightShadowHistoryPass, createGiLightShadowPass, createGiLightShadowWidePass, createGiResolve, createGiTargets, renderGiGBuffer } from "./giScreen.js";
 import { resolveMaterialSurface, serializeMeshForBake } from "./voxelizeOnce.js";
-import { createGiField } from "./giField.js";
+import { createSrcVolume } from "./srcVolume.js";
 import { createSrcDistanceView, createSrcOccupancyView } from "./srcDebugViews.js";
 import { createOccupancyField, describeOccupancyField, quantizeOccupancyRes } from "./occupancyField.js";
 import { BVH_STRATEGY, buildStaticSceneBvhWords, classifyDynamicShape, composeFieldDynamics, createDynamicObjectSet, dynHeaderWords, giMobilityOf, giTraceOf } from "./dynamicObjects.js";
@@ -1139,7 +1139,7 @@ export class GISystem {
     // AND every entry is resident in the atlas. So a scene that composites GI
     // perfectly well but has an empty entry list, or one entry that never lands
     // in the atlas, keeps a 0.6 blue-grey hemisphere over it forever. The real
-    // "GI is on screen now" signal is `_compositedOnce`, which is what
+    // "GI is on screen now" signal is `_fieldReadyOnce`, which is what
     // #maybeLogStats is itself gated on one level up (see its call site).
     // Gate on that, and — because no predicate is worth trusting alone here —
     // cap the whole thing in wall-clock ticks so "never fades" is not a
@@ -1149,7 +1149,7 @@ export class GISystem {
         && globalThis.__giNoBootAmbient !== true,
       hasState: !!this.state,
       hasLight: !!this._bootAmbient,
-      composited: !!this._compositedOnce,
+      composited: !!this._fieldReadyOnce,
       everComposited: !!this._everComposited,
       ticks: this._bootAmbientTicks ?? 0,
       intensity: this._bootAmbient?.intensity ?? 0,
@@ -1419,15 +1419,16 @@ export class GISystem {
     if (
       this._atlasRevisionSeen !== state.atlas.revision ||
       this._occGeometrySeen !== occGeometryRevision ||
-      !this._compositedOnce
+      !this._fieldReadyOnce
     ) {
-      // FLICKER DIAGNOSTIC (`__giLogComposite`). A composite is supposed to be
-      // RARE — it runs when geometry changed, and it has a one-frame window
-      // where the pyramid is stale (see the OCCUPANCY FIRST note below), which
-      // the module's own comment describes as reading like flicker. If this
-      // reports a steady non-zero rate on a scene where only a LIGHT moves,
-      // something is bumping a revision it shouldn't and that cadence IS the
-      // flicker. Also records WHICH of the three triggers fired.
+      // FLICKER DIAGNOSTIC (`__giLogComposite`). A refresh is supposed to be
+      // RARE — it runs when geometry changed, and it has a one-frame window where
+      // the pyramid is stale, which the module's own comment describes as reading
+      // like flicker. If this reports a steady non-zero rate on a scene where only
+      // a LIGHT moves, something is bumping a revision it shouldn't and that
+      // cadence IS the flicker. Also records WHICH trigger fired.
+      // (Kept under its old name: the pass it counted WAS this branch, and it
+      // still answers the same question.)
       if (globalThis.__giLogComposite) {
         this._compositeCount = (this._compositeCount ?? 0) + 1;
         this._compositeWhy = this._compositeWhy ?? { atlas: 0, occ: 0, first: 0 };
@@ -1435,88 +1436,43 @@ export class GISystem {
         else if (this._occGeometrySeen !== occGeometryRevision) this._compositeWhy.occ++;
         else this._compositeWhy.first++;
       }
-      // Whole-volume triggers, decided BEFORE the gates are consumed: a
-      // re-voxelized pyramid (occ revision) invalidates EVERY cell, and so
-      // does a first composite or a retry after skipped dispatches — see the
-      // dirty-consumption note below.
-      // A composite frame is never quiet — geometry or the atlas moved.
+      // A refresh frame is never quiet — geometry or the atlas moved.
       this._fieldQuietFrames = 0;
-      const wholeVolume =
-        this._occGeometrySeen !== occGeometryRevision ||
-        !this._compositedOnce ||
-        this._forceWholeComposite === true;
-      this._forceWholeComposite = false;
       this._atlasRevisionSeen = state.atlas.revision;
       this._occGeometrySeen = occGeometryRevision;
-      this._compositedOnce = true;
-      // Dirty-brick: recomposite only the union AABB of changed slots — the
-      // SAME frame as the change. An every-3rd-frame throttle was tried here
-      // and REVERTED: on heavy scenes it staggered moving shadows into a
-      // visible judder and bunched the full-queue cost into spike frames
-      // (user report), and the dirty brick already makes the per-frame
-      // composite cheap. null dirty = whole volume (first build, refits, or
-      // any bump without a mark — the fail-safe), mapped to the permissive
-      // ±1e9 defaults. __giNoDirtyBrick forces whole-volume (A/B hatch);
-      // still consume so stale bounds can't accumulate.
-      // A DIRTY-BRICK COMPOSITE CAN PERMANENTLY MISS THE PYRAMID ARRIVING.
-      // The boot sequence that shipped as "GI is dark until I move the
-      // model": the first composite ran whole-volume against a pyramid whose
-      // voxelize dispatches were still skipped (async pipeline compiles), so
-      // every cell read empty — and every LATER composite was atlas-bumped
-      // with a small dirty AABB, recompositing only that region. The rest of
-      // the volume kept the empty boot result forever; moving the building
-      // marked its whole AABB dirty, which is why a nudge "fixed" it
-      // (probe-measured: 0.021 lum settled boot → 0.105 after a 1cm nudge).
-      // So: consume the marks ALWAYS (stale bounds must not accumulate), but
-      // ignore them in favour of whole-volume whenever the pyramid's content
-      // changed, this is the first composite, or the previous batch had
-      // skipped dispatches.
-      const consumedDirty = state.atlas.consumeDirtyBounds();
-      const dirty = wholeVolume ? null : consumedDirty;
-      // TOP-LEVEL lists first: the composite reads them to decide which
-      // slots a cell is allowed to skip, so they have to describe the same
-      // slot state the composite is about to sample. Rebuilds only when a
-      // slot actually moved (the same condition that got us into this
-      // branch), and is a few thousand array writes when it does.
-      state.volume.updateGrid();
-      // FINE level re-paging. Order matters and is the same as the grid's:
-      // the page table decides where bricks exist, the fill pass writes them,
-      // and every trace reads both — so a stale page table is geometry in the
-      // wrong place, not merely stale.
-      state.volume.updateSparse();
-      const world = state.volume.world;
-      if (dirty && globalThis.__giNoDirtyBrick !== true) {
-        world.dirtyMin.value.copy(dirty.min);
-        world.dirtyMax.value.copy(dirty.max);
-      } else {
-        world.dirtyMin.value.set(-1e9, -1e9, -1e9);
-        world.dirtyMax.value.set(1e9, 1e9, 1e9);
-      }
-      // OCCUPANCY FIRST, and it has to be: the composite reads the pyramid to
-      // force `occupied` where triangles pass, and every trace downstream reads
-      // it as the hit test. A stale pyramid is not a stale distance — it is
-      // geometry that is not there yet, which is a leak for exactly one frame
-      // and reads as flicker.
+      this._fieldReadyOnce = true;
+      // THE DIRTY-BRICK PATH WENT WITH THE COMPOSITE IT NARROWED. It
+      // recomposited only the union AABB of changed slots (`consumeDirtyBounds` →
+      // `world.dirtyMin/Max`), preceded by the instance-grid and sparse-page-table
+      // rebuilds the composite read to decide which slots a cell could skip. With
+      // no composite there is no per-cell pass to narrow — the pyramid's own
+      // voxelize is already incremental over the slots that moved.
+      //
+      // Its hard-won lesson is in plan §12.9 and is no longer learnable from this
+      // code: a narrowed recomposite could PERMANENTLY MISS THE PYRAMID ARRIVING.
+      // The first composite ran whole-volume against a pyramid whose dispatches
+      // were still compiling, and every later one was atlas-bumped with a small
+      // AABB — so the rest of the volume kept the empty boot result forever, and
+      // nudging the building 1cm "fixed" it (0.021 lum settled boot → 0.105).
+      // Anything incremental added over the SRC field has to answer that first.
       const occPasses = state.volume.occupancyField?.isDirty
         ? state.volume.occupancyField.passes()
         : null;
       const skippedBefore = giSkippedComputes.size;
-      // THE SPAWN-BLINK GUARD (2026-08-04, run-gi-spawn-blink measured it):
-      // a geometry change rebuilds the voxelizer's pair tables, so passes()
-      // mints FRESH compute nodes whose pipelines compile async for a few
-      // frames. Dispatching the ordered chain then executes the old,
-      // already-compiled CLEAR and skips the new voxelize — and a composite
-      // in the same batch reads that half-built pyramid as "empty
-      // everywhere", which makes the feedback's empty-clear zero the
-      // radiance field VOLUME-WIDE: the whole GI blinked black for ~6 frames
-      // (field probe read literal 0.0). Two rules fix it: while ANY compute
-      // pipeline is still compiling, do not dispatch the pyramid chain at
-      // all (its half-execution is the damage); and if a dispatch DID skip
-      // (the first tick is what triggers the new pipelines' compilation, so
-      // it cannot know in advance), bail out BEFORE the composite consumes
-      // the pyramid. Bail frames keep last-good staging/occupancy — the
-      // feedback sees unchanged flags, so radiance persists instead of
-      // clearing, and the EMA carries the couple of dim trace frames.
+      // THE SPAWN-BLINK GUARD (2026-08-04, run-gi-spawn-blink measured it), and
+      // it OUTLIVES the composite it was written for. A geometry change rebuilds
+      // the voxelizer's pair tables, so passes() mints FRESH compute nodes whose
+      // pipelines compile async for a few frames. Dispatching the ordered chain
+      // then executes the old, already-compiled CLEAR and skips the new voxelize,
+      // leaving a half-built pyramid that reads "empty everywhere". That used to
+      // blink the whole field black for ~6 frames through the feedback's
+      // empty-clear; now it is every shadow ray and every AO tap passing straight
+      // through geometry for those frames — the same bug in different clothes.
+      // Two rules fix it: while ANY compute pipeline is still compiling, do not
+      // dispatch the pyramid chain at all (its half-execution IS the damage); and
+      // if a dispatch DID skip (the first tick is what triggers compilation, so it
+      // cannot know in advance), bail out before anything consumes the pyramid.
+      // Bail frames keep last-good occupancy.
       const occWait = occPasses !== null && giPendingComputePipelines.size > 0;
       let occSkipped = false;
       if (occPasses && !occWait) {
@@ -1527,39 +1483,26 @@ export class GISystem {
         // Same re-arm the post-batch retry always used — but BEFORE anything
         // consumed the pyramid, which is the whole fix. Skipped dispatches
         // are near-free, so retrying until the pipelines land costs nothing.
-        this._compositedOnce = false;
+        this._fieldReadyOnce = false;
         state.volume.occupancyField?.invalidate();
-        // The retry must NOT be narrowed by whatever small dirty AABB an
-        // unrelated atlas touch queues meanwhile — see the dirty-consumption
-        // note above.
-        this._forceWholeComposite = true;
         giCompute(renderer, rateQueue);
       } else {
-        giCompute(renderer, [
-          state.volume.compositeCompute,
-          // Fine level AFTER the coarse composite and BEFORE anything traces:
-          // the bricks are the same min-over-candidates function at a sixth
-          // of the cell size, so they depend on nothing the composite writes,
-          // but every consumer downstream reads them.
-          ...(state.volume.sparse?.computes ?? []),
-          // `rateQueue`, not `state.queue`, so `__giFreeze = "all"` still holds
-          // on a composite frame — otherwise the bisect silently leaks the very
-          // stage it is meant to hold still.
-          ...rateQueue,
-        ]);
+        // `rateQueue`, not `state.queue`, so `__giFreeze = "all"` still holds on a
+        // refresh frame — otherwise the bisect silently leaks the very stage it is
+        // meant to hold still.
+        giCompute(renderer, rateQueue);
         if (giSkippedComputes.size > skippedBefore) {
-          // vis/composite/sparse pipelines can still be compiling on the very
-          // first builds — same re-arm, next tick retries the whole chain.
-          this._compositedOnce = false;
+          // Pipelines can still be compiling on the very first builds — same
+          // re-arm, and the next tick retries the whole chain.
+          this._fieldReadyOnce = false;
           state.volume.occupancyField?.invalidate();
-          this._forceWholeComposite = true;
         }
       }
-      // Only after a tick whose chain actually ran to completion: on bail/
-      // re-arm ticks (`_compositedOnce` false) the stats buffers may never
-      // have been dispatched, and reading them back throws from deep inside
-      // the frame loop (the user-reported "reading 'size'" uncaught promise).
-      if (this._compositedOnce) this.#maybeLogStats(renderer);
+      // Only after a tick whose chain actually ran to completion: on bail/re-arm
+      // ticks (`_fieldReadyOnce` false) the buffers may never have been
+      // dispatched, and reading them back throws from deep inside the frame loop
+      // (the user-reported "reading 'size'" uncaught promise).
+      if (this._fieldReadyOnce) this.#maybeLogStats(renderer);
     } else {
       // IDLE SLEEP: with the field input quiet past the threshold, only the
       // camera-dependent passes run. The heartbeat frame runs the full queue.
@@ -1946,13 +1889,7 @@ export class GISystem {
       // real so the first resumed frame finds everything warm AND the field
       // composited.
       if (state && this.state === state) {
-        state.volume.updateGrid();
-        state.volume.updateSparse();
-        const computeNodes = [
-          state.volume.compositeCompute,
-          ...(state.volume.sparse?.computes ?? []),
-          ...state.queue,
-        ];
+        const computeNodes = [...state.queue];
         const kernelSizes = [];
         for (const node of computeNodes) {
           await new Promise((resolve) => setTimeout(resolve, 0));
@@ -3700,16 +3637,33 @@ export class GISystem {
     this._mirrorBuckets.set(material, bucket);
   }
 
-  /** One-shot occupancy readback after the field first composites (log + harness signal). */
+  /**
+   * One-shot occupancy readback once the field's geometry has actually landed on
+   * the GPU (log + harness signal).
+   *
+   * The count now comes from the OCCUPANCY PYRAMID rather than from the deleted
+   * composite's stats buffer, and it is a voxel count rather than a cell count —
+   * the pyramid is the only geometry representation left, so this is the same
+   * question asked of the thing that answers it. The emissive-cell count is gone
+   * with the composite that produced it (nothing injects radiance into a field
+   * during the interregnum).
+   *
+   * THE LINE ITSELF IS A HARNESS CONTRACT, not just a log: probes gate their
+   * measurement on having seen it, because a readback taken before the pyramid is
+   * filled reports a plausible wrong number rather than failing (measured 1 run in
+   * 4 — see run-gi-emitter-shadow-probe.mjs). Renaming it means updating them.
+   */
   #maybeLogStats(renderer) {
     const state = this.state;
     if (!state || state.statsLogged || !state.entries.length) return;
     const resident = state.atlas.assignments.filter(Boolean).length;
     if (resident < Math.min(state.entries.length, state.atlas.capacity)) return;
+    const occ = state.volume.occupancyField;
+    if (!occ?.readbackStats) return;
     state.statsLogged = true;
-    state.volume.readbackStats(renderer).then((stats) => {
+    occ.readbackStats(renderer).then((stats) => {
       if (this.state === state) {
-        console.log(`[gi] composited field: occ ${stats.occupiedCells}, emissive ${stats.emissiveCells}`);
+        console.log(`[gi] field ready: ${stats.occupiedVoxels} occupied voxels`);
       }
     });
     // SURFACE-RECORD POOL AUDIT — starvation here is otherwise invisible: the
@@ -3930,8 +3884,8 @@ export class GISystem {
     // (The CPU point-sampled occupancy PROTOTYPE that used to be buildable
     // here — `triangleOcclusion` opt-in, occupancyGrid.js — was deleted
     // 2026-08-02 with the bake pipeline it depended on. The SAT-conservative
-    // pyramid below is its successor and the only occupancy.)
-    const occupancy = null;
+    // pyramid below is its successor and the only occupancy. giField carried a
+    // vestigial `occupancy: null` argument for it right up to its own deletion.)
     // THE OCCUPANCY BACKEND (spec phases 1+4) — since 2026-08-02 the ONLY
     // transport backend; the `backend` prop and the legacy SDF sphere trace it
     // selected are gone. Built here for the same reason the prototype above is
@@ -3945,11 +3899,25 @@ export class GISystem {
     if (killSdf && !occField) {
       console.warn("[gi] occupancy was disabled by the diagnostic backend hatch; GI has no geometry transport");
     }
-    const volume = createGiField(bounds, res, atlas, {
-      occupancy,
-      occupancyField: occField,
-      rayHitConfig,
-      killSdf,
+    // THE VOLUME IS NOW `srcVolume`, and `giField.js` is gone with it (§12.8.2).
+    // What changed underneath this one line: the composited fp16 distance texture,
+    // the six per-cell radiance/surface buffers, the instance grid, the sparse
+    // brick page table and the composite pass that filled them all. What did NOT
+    // change is the answer any survivor gets — §12.6 established that the
+    // composited `distanceTexture` WAS `freeRadiusAtWorld` resampled onto the
+    // coarse lattice and quantized, so both shadow factories have been reading the
+    // oracle directly (through giField's own delegation) since 2026-08-09. This
+    // removes the resample, not the source.
+    //
+    // `res` is passed, not `res: null`: the two lattices measure 3.61x apart at the
+    // shipping presets, every tuned constant in the shadow estimators is expressed
+    // in coarse-cell units, and switching lattice and producer in one commit would
+    // make an eye-check unattributable. `res: null` is a separate A/B (§12.6.5).
+    const volume = createSrcVolume({
+      occField,
+      bounds,
+      res,
+      rayHitMode: rayHitConfig.activeMode,
     });
     // Plane walls are zero-thickness; give them a solid interior sized to
     // THIS field. Too thin and the trilinear distance texture cannot see
@@ -4307,7 +4275,7 @@ export class GISystem {
     };
     this._atlasRevisionSeen = -1; // force a first composite
     this._occGeometrySeen = -1;
-    this._compositedOnce = false;
+    this._fieldReadyOnce = false;
     this._pendingFit = null; // refit debounce restarts against fresh bounds
     this.#syncSlots(entries);
     this.#syncBvhScene(entries);
@@ -6941,12 +6909,11 @@ export class GISystem {
       if (released) {
         // Force the next fingerprint scan to run its content pass — the
         // un-adopted mesh needs its placement + bits back, and nothing else
-        // signals that (userData is not in the fingerprint) — and force the
-        // composite branch, which is the only place the pyramid chain
-        // DISPATCHES (the same trigger the park path needs).
+        // signals that (userData is not in the fingerprint) — and re-arm the
+        // refresh branch, which is the only place the pyramid chain DISPATCHES
+        // (the same trigger the park path needs).
         this._fingerprint = null;
-        this._forceWholeComposite = true;
-        this._compositedOnce = false;
+        this._fieldReadyOnce = false;
         // The released mesh's static-BVH triangles are at the BUILD pose —
         // stale if it moved. Rebuild the static BVH at current poses
         // (debounced; edit-mode only, where demotions happen).
@@ -6971,15 +6938,12 @@ export class GISystem {
       const field = state.volume?.occupancyField;
       for (const slot of this._dynPendingDisable) field?.setSlotEnabled?.(slot, false);
       this._dynPendingDisable.length = 0;
-      // The pyramid chain only DISPATCHES inside the composite branch, and an
-      // adopted mover no longer bumps the atlas — without this the disable
-      // marks the field dirty and nothing ever consumes it, leaving the
-      // mover's stale bits in the world forever (measured: the dynobj=2
-      // smoke arm's occupancy never dropped). One forced whole-volume
-      // composite purges the bits and refreshes the distance/attr field the
-      // mover just left.
-      this._forceWholeComposite = true;
-      this._compositedOnce = false;
+      // The pyramid chain only DISPATCHES inside the refresh branch, and an
+      // adopted mover no longer bumps the atlas — without this the disable marks
+      // the field dirty and nothing ever consumes it, leaving the mover's stale
+      // bits in the world forever (measured: the dynobj=2 smoke arm's occupancy
+      // never dropped). One forced refresh purges the bits.
+      this._fieldReadyOnce = false;
     }
     // SURFACE RADIANCE CACHE, after the header sync AND gated on it: the
     // lighting pass fires a ray per texel through the object header, so on a
@@ -7232,10 +7196,9 @@ export class GISystem {
     this.#releaseAdoptee(victim.key);
     // Same post-release invalidation the rest-demotion sweep runs: the evicted
     // mesh needs its placement + bits back, and the pyramid chain only
-    // DISPATCHES inside the composite branch.
+    // DISPATCHES inside the refresh branch.
     this._fingerprint = null;
-    this._forceWholeComposite = true;
-    this._compositedOnce = false;
+    this._fieldReadyOnce = false;
     if (dyn.staticBvh) this._staticBvhStale = this._frame;
     this._dynLastEvictFrame = this._frame;
     return true;

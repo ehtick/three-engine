@@ -52,8 +52,8 @@ await page.setViewport({ width: 1200, height: 800, deviceScaleFactor: 1 });
 // on unchanged code that gave 16601/0.0307 on the three runs around it. A zero
 // here is indistinguishable from "the emitter shadow chain is broken" — it is the
 // same signature — and the ONLY thing separating them in the output was the
-// absence of the `[gi] composited field:` line, i.e. the field had not composited
-// before the measurement took its readback. That makes it an instrument fault, and
+// absence of the field-ready line, i.e. the pyramid had not been voxelized before
+// the measurement took its readback. That makes it an instrument fault, and
 // an instrument that reports a plausible wrong number is worse than one that
 // fails: this rig's whole purpose is A/B-ing a shadow chain against a recorded
 // number. So the composite log is now a PRECONDITION of the measurement.
@@ -64,8 +64,8 @@ await page.setViewport({ width: 1200, height: 800, deviceScaleFactor: 1 });
 let sawComposite = false;
 page.on("console", (m) => {
   const t = m.text();
-  if (/\[gi\] composited field:/.test(t)) sawComposite = true;
-  if (/\[gi\] (built|light shadows|emitters|composited|diffuse indirect)|PROBE/.test(t)) console.log(`  ${t.slice(0, 200)}`);
+  if (/\[gi\] field ready:/.test(t)) sawComposite = true;
+  if (/\[gi\] (built|light shadows|emitters|field ready|diffuse indirect)|PROBE/.test(t)) console.log(`  ${t.slice(0, 200)}`);
 });
 page.on("pageerror", (e) => console.log(`pageerror: ${e.message}`));
 await page.goto(url, { waitUntil: "load", timeout: 30000 });
@@ -820,7 +820,7 @@ if (result.fail) { console.log(`FAIL: ${result.fail}`); await browser.close(); p
 // was never filled, and every number below is meaningless rather than merely
 // small. Fail instead of printing one.
 if (!sawComposite) {
-  console.log("FAIL: the field never logged a composite — every measurement below would be pre-composite. Re-run.");
+  console.log("FAIL: the field never logged `field ready` — every measurement below would predate the pyramid. Re-run.");
   await browser.close();
   process.exit(1);
 }

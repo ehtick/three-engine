@@ -17,7 +17,7 @@
 // the light itself loaded in ... yet scene does not have any ambient". The
 // author was reading the scene graph correctly; the renderer was the liar.
 //
-// So: gate on `_compositedOnce` (the real signal, and the one #maybeLogStats is
+// So: gate on `_fieldReadyOnce` (the real signal, and the one #maybeLogStats is
 // itself gated on a level up), AND cap the whole thing in ticks. Two exits
 // rather than one, because the bug was not "the predicate was slightly wrong",
 // it was "there existed exactly one way out and it could fail to arrive".
@@ -55,7 +55,7 @@ export const GI_BOOT_AMBIENT_CUTOFF = 0.01;
  * @param {boolean} s.enabled       `props.bootAmbient` (and no kill hatch)
  * @param {boolean} s.hasState      GI has built its state object
  * @param {boolean} s.hasLight      we are currently holding a hemisphere
- * @param {boolean} s.composited    `_compositedOnce` — GI is on screen
+ * @param {boolean} s.composited    `_fieldReadyOnce` — GI is on screen
  * @param {boolean} s.everComposited  a previous boot already finished its fade
  * @param {number}  s.ticks         ticks this light has been up
  * @param {number}  s.intensity     its current intensity
