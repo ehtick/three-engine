@@ -21,7 +21,7 @@
 // Approximate on purpose (a parent's annular interval doesn't cover its own
 // near field), same spirit as the reference's "flatland assumption" note.
 import { Fn, If, Loop, float, floor, instanceIndex, instancedArray, max, mix, mod, select, smoothstep, vec3, vec4 } from "three/tsl";
-import { octahedralTexelIndex, octahedralUV } from "./cascadeTrace.js";
+import { octahedralTexelIndex, octahedralUV } from "./srcOctahedral.js";
 import { BURIED_PROBE_WEIGHT, DEFAULT_VIS_TOL_RADIAL, resolveVisTolTerms } from "./cascadeGather.js";
 
 /**

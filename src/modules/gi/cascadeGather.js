@@ -27,7 +27,7 @@
 // bypasses any G-buffer/deferred-resolve layer (where the prior attempt's
 // never-root-caused stripe bug lived).
 import { Break, Fn, If, Loop, Return, acos, atan, cos, float, floor, fract, instanceIndex, instancedArray, max, mix, mod, select, sin, smoothstep, sqrt, step, texture3D, uniform, vec2, vec3, vec4 } from "three/tsl";
-import { octahedralTexelIndex, octahedralTexelWeight, octahedralUV } from "./cascadeTrace.js";
+import { octahedralTexelIndex, octahedralTexelWeight, octahedralUV } from "./srcOctahedral.js";
 import { sharedFn } from "./giFn.js";
 import { boxLightFactor, emitterAngularRadius, emitterExclusion, emitterSlotFactor, emitterSurfaceT } from "./giLight.js";
 import { RayHitMode } from "./rayHit/RayHitConfig.js";

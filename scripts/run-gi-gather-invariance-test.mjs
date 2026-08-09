@@ -51,7 +51,7 @@
 // (B). If the large cases are invariant and only the small one drifts, the
 // normalization is CORRECT and the whole 1g framing changes.
 //
-// The direction set is a hand-mirror of `octahedralDirection` (cascadeTrace.js:25),
+// The direction set is a hand-mirror of `octahedralDirection` (srcOctahedral.js),
 // which is TSL and cannot run here. It is transcribed operation-for-operation;
 // `step(0, x)` is `x >= 0 ? 1 : 0`.
 
@@ -61,7 +61,7 @@ const check = (name, ok, detail = "") => {
   else { failures++; console.error(`  FAIL ${name}${detail ? ` — ${detail}` : ""}`); }
 };
 
-/** JS mirror of cascadeTrace.js's octahedralDirection. */
+/** JS mirror of srcOctahedral.js's octahedralDirection. */
 function octDir(idx, res) {
   const u = idx % res;
   const v = Math.floor(idx / res);
