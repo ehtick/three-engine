@@ -180,10 +180,11 @@ export function createSrcBinStore(store, { w0 = W0, maxBytes = 128 * 1024 * 1024
 /**
  * [E] + [F] as a dispatch list.
  *
- * Replaces `srcRayPass.js` — this kernel traces the same rays through the same
- * closure, and additionally does something with the answer. The scaffold's
- * counters live on inside `stats` because they were the only instrument on the
- * traversal's step budgets and losing them would un-gate `smoke:gi-gpu` again.
+ * Replaces the unit-1 scaffold pass (`srcRayPass.js`, deleted in this commit) —
+ * this kernel traces the same rays through the same closure, and additionally
+ * does something with the answer. The scaffold's counters live on inside
+ * `stats` because they were the only instrument on the traversal's step budgets
+ * and losing them would un-gate `smoke:gi-gpu` again.
  *
  * @param {object} store  from `createSrcProbeStore`
  * @param {object} bins   from `createSrcBinStore`
@@ -241,9 +242,13 @@ export function createSrcDepositFrame(store, bins, {
     const P = vec3(px.position).toVar();
     const Nrm = vec3(readNormal(i)).normalize().toVar();
 
-    // The pixel's LOD sets the interval ladder. Recomputed rather than read from
-    // the probe key for the same binding reason `srcRayPass` gives, and it
-    // agrees by construction — same camera uniform, same `lodAtDistance`.
+    // The pixel's LOD sets the interval ladder. Recomputed rather than read out
+    // of the probe key: the key read is free but this kernel already carries the
+    // occupancy pyramid, the probe table, the bins and the per-pixel buffers,
+    // and the portable 8-storage-buffer limit is the constraint AGENTS.md leads
+    // with. It agrees by construction — same camera uniform, same
+    // `lodAtDistance`, same `floor` — which is why it is a recompute and not a
+    // second source of truth.
     const lod = floor(lodAtDistance(chebyshev(P, camera), spacing0, maxLods)).toVar();
     const bounds = [];
     for (let c = 0; c < N; c++) bounds.push(intervalBoundary(c, lod, spacing0).toVar());

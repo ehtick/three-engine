@@ -2088,3 +2088,128 @@ already reports mean and max hit distance per frame, which is the instrument tha
 Gates at `85a2062`: `test:gi-src-rays` ×4, `test:gi-src-{math,probes,populate,ref,volume}`,
 `smoke:gi-gpu` on all four src arms and both non-src defaults, emitter shadow probe EXACT
 (`penumbraPx=16601 grain=0.0307`).
+
+### 12.16 Phase 2 unit 3 — the split scatter, and a gate with no scene to trace
+
+`975cd58`. `srcDeposit.js`: [E] the fixed-point scatter and [F] the resolve. Unit 1's scaffold ray
+pass is deleted — this kernel traces the same rays through the same closure and additionally does
+something with the answer.
+
+#### 12.16.1 What is fixed point and what deliberately is not
+
+Radiance accumulates as `round(L/Lmax · 2^16)`, per §12.13.4. **Transmittance does not.** Every
+deposit's T is exactly 0 or 1, so `sumT` is an integer COUNT of clear deposits and `T = sumT/count`
+is exact — spending fixed-point bits on a two-valued integer is precision theatre. Layout is five
+words per bin: R, G, B, sumT, count.
+
+Headroom, measured rather than assumed: the gate's worst bin held **21 deposits** and its worst
+accumulator reached **18,850 of 2^32** — a 2.28e5× margin against §12.13.4's predicted
+65,536-saturated-ray overflow bound.
+
+**`Lmax` is still open, and now it has an instrument.** The clamp counts itself (`STAT_CLAMPED`,
+`STAT_MAXL`), so the clamp-vs-auto-exposure decision gets made from a measured hit-radiance
+distribution as §12.13.4 required. `smoke:gi-gpu` asserts the count is ZERO while hit shading is
+null — the moment it stops being zero, that assertion says so instead of the clamp quietly eating
+energy at exactly the bright hits that matter.
+
+#### 12.16.2 No hit shading is the plan, not a gap
+
+`shadeHit` defaults to null and the engine passes null. §7 puts full hit shading in **Phase 5** and
+describes Phase 2's look as "AO-like short-range bounce" for precisely this reason: with radiance
+zero, what survives the resolve is TRANSMITTANCE, and a receiver lit by transmittance alone against
+the sky is ambient occlusion. That is not a placeholder standing in for the real thing — it is the
+real thing with one term still zero, which is exactly why it is checkable now.
+
+#### 12.16.3 THE BINS ARE SIZED BY PROBE CAPACITY, AND THAT IS A NAMED DEBT
+
+A bin's slot is `binBase[cascade] + localProbeIndex · binCount(cascade) + morton`. Direct, no
+indirection — and sized by probe CAPACITY rather than by live probes. §4.2's design says "only
+cascade-live slots", which needs a claimed bin block per probe (`PROBE_SPARE` is the reserved word).
+That indirection is NOT built here because it has to be claimed and released on the probe's
+lifetime, which is Phase 3/4 machinery, and unit 3 is about whether the scatter is correct.
+
+The cost is real, bounded, and asserted rather than hoped for:
+
+| c0 probes | bins | scratch + payload |
+|---|---|---|
+| 4,096 (the gate) | 2.88M | 99 MB |
+| 16,384 (the engine default) | 3.67M | 127 MB |
+
+`createSrcBinStore` throws by name past `maxStorageBufferBindingSize` (128 MiB), which is roughly
+32k c0 probes. **Past that, SRC cannot build until the bin-block claim exists** — so this is the
+thing Phase 3 has to do first, not an optimization to schedule later. The gate measures the waste
+directly: **0.24% of allocated bins were sampled.**
+
+#### 12.16.4 A gate with no scene: the trace is keyed on the RAY INDEX
+
+The standalone family has no occupancy field, which raises the obvious question of what the deposit
+traces. The answer is the interesting part of this unit.
+
+**Not geometry, and above all not anything keyed on the DIRECTION.** `rayDirection` runs through
+`decodeDir`'s sin/cos, which are not bit-identical between WGSL and JS, so a hit distance derived
+from `dir` disagrees in the last ulp — and a `t` a hair either side of an interval boundary lands in
+a DIFFERENT CASCADE on the two sides. That is a real disagreement about nothing, and it would make
+an exact diff impossible forever.
+
+The ray INDEX is a u32 both sides agree on exactly. So:
+- **the trace is `t = hash(n) · T_SPAN`** — `hash >> 8` is a 24-bit integer, exactly representable
+  in f32, and `2^-24` is exact, so the conversion is bit-identical;
+- **the shading is a 12-bit integer × `Lmax/65536` with `Lmax = 16`, a power of two** — so
+  `round(L/Lmax · 2^16)` recovers that integer exactly and **every RGB comparison is integer
+  arithmetic with no tolerance anywhere.** Without this the RGB accumulator would have no exercise
+  at all, since the engine's `shadeHit` is null until Phase 5.
+
+`srcRef.js`'s `traceAndDeposit` now passes the ray index to its trace closure — a third argument no
+real tracer uses and a synthetic one needs. And the mirror runs against **the GPU's own
+`pixelRayBase`**: unit 2's gate owns the partition, this one owns what happens to the rays in it.
+
+`t` is deliberately independent of the pixel's reach. A reach-scaled `t` would need the mirror's
+trace closure to know which pixel it was called for, which `traceAndDeposit` does not tell it — and
+the gate would then have to re-implement the very loop it exists to diff against.
+
+#### 12.16.5 The arm split that makes exactness possible
+
+**Per-PROBE aggregates are bin-INDEPENDENT and therefore exact.** Direction quantization can move a
+deposit between BINS of one probe; it can never move it between probes. So the arm that carries the
+split rule, the ancestor-chain walk and the fixed point compares per-probe totals — **0 wrong on
+count, sumT and fixed-point RGB across 460 probes.** The per-BIN arm is direction-dependent, so its
+ties are counted and bounded (0–3 of 6,889, ≤0.5% budget) rather than asserted to zero. Pinning that
+at zero would be pinning two transcendental implementations together, which is not a property this
+module has or needs.
+
+#### 12.16.6 The finding: stopping at the reach is the TRACE's job
+
+The first synthetic trace returned a bare positive `t` and let `splitDeposits` handle the past-reach
+case. Every deposit matched exactly — and the mirror reported **4,216 hits against the GPU's
+4,118**. Both are right about the deposits (a `t` past every bound makes `splitCascade` return
+`bounds.length`, which IS the escape case) and they disagree about whether the ray HIT. A real
+marcher stops at `tMax`; a synthetic one has to as well, and it can, because the reach is
+recoverable from the ray origin.
+
+#### 12.16.7 Deposits per ray, and why the number is a cross-check
+
+Bounded by `[1, N]` by construction — never 0 (even a hit inside cascade 0's interval deposits
+there) and never above N (nothing is deposited above the owning cascade). `smoke:gi-gpu` asserts
+both ends: 0 would mean the chain is not being walked, > N would mean the split deposits upward.
+
+On the real scene it tracks the hit rate coherently, which is the cheapest available confirmation
+that the split is doing what it claims:
+
+| rung | hit rate | mean t | deposits/ray |
+|---|---|---|---|
+| legacy occupancy | 77.2% | 0.65 m | 1.685 |
+| exact-complex | 35.4% | 2.19 m | 2.946 |
+
+Nearer hits mean fewer cascades below them. Nothing enforces that relationship — it falls out.
+
+#### 12.16.8 What unit 4 starts from
+
+Every bin now resolves to `(rgb, T)` with **T = -1 meaning UNKNOWN** — outside transmittance's
+[0,1] range, so it cannot be mistaken for data (2.88M bins checked). Unit 4 shades straight from raw
+c0 with the merge disabled, composites sky where transmittance survives, and is **the commit where
+the screen stops being dark**. It is also the first honest eye check of the rebuild, and §12.13.1's
+deferred Phase-1 check is the first thing to rule out if the light lands in the wrong place.
+
+Gates at `975cd58`: `test:gi-src-deposit` ×3, `test:gi-src-{rays,populate,ref,math,probes,volume}`,
+`smoke:gi-gpu` on all four src arms and both non-src defaults, emitter shadow probe EXACT
+(`penumbraPx=16601 grain=0.0307`).
