@@ -108,6 +108,11 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null, vol
   const store = createSrcProbeStore({
     c0Probes: expectedC0Probes(pixelCount),
     cascadeCount: CASCADE_COUNT,
+    w0: W0,
+    // The bin block pool is sized from here, so the A/B dial for GI's largest
+    // allocation lives next to the other two (`__giSrcSpacing0`, `__giSrcLmax`).
+    // In bins, not bytes — the byte count is srcDeposit's layout to know.
+    binBudget: Number(globalThis.__giSrcBinBudget) || undefined,
   });
 
   const cameraU = uniform(new THREE.Vector3());
@@ -404,12 +409,15 @@ export function describeSrcProbeSystem(system) {
   const bytes = system.store.bytes + system.rayStore.bytes + (system.binStore?.bytes ?? 0);
   return `[gi] src probes: ${system.pixelCount} gbuffer pixels, s0=${system.spacing0}, ` +
     `${c}, ${system.raysPerPixel} rays/px, ${(bytes / 1048576).toFixed(2)}MB` +
-    // The bin count is named because it is the memory, and because the buffer is
-    // sized by probe CAPACITY rather than by live probes — see createSrcBinStore.
+    // The BLOCK counts are named, not the probe capacities, because they are
+    // what the memory is a function of since the claim landed — and because a
+    // pool short for the scene shows up as `NOBLOCK` in the frame line, which
+    // only makes sense next to the capacity it fell short of.
     // "SRC is populating but tracing nothing" and "SRC is depositing" are two
     // builds with identical probe telemetry, so the log says which one this is.
     (system.binStore
-      ? `, ${(system.binStore.binTotal / 1e6).toFixed(2)}M bins, depositing`
+      ? `, ${(system.binStore.binTotal / 1e6).toFixed(2)}M bins in ` +
+        `${system.store.cascades.map((x) => x.blockCapacity).join("/")} blocks, depositing`
       : ", no volume — no deposit");
 }
 
@@ -429,6 +437,9 @@ export function formatSrcProbeFrame(stats) {
         `  |  ${r.deposits} deposits (${r.perRay.toFixed(2)}/ray)` +
         // Clamps are the open `Lmax` decision's evidence (§12.13.4). Printed
         // always, including at zero — "the clamp never fired" is the finding.
-        (r.clamped ? `  CLAMPED ${r.clamped}` : "")
+        (r.clamped ? `  CLAMPED ${r.clamped}` : "") +
+        // Deposits the block pool refused. The probe-side twin (`NOBLOCK n/cap`
+        // in the cascade line) says how many probes; this says what it cost.
+        (r.noBlock ? `  DROPPED ${r.noBlock}` : "")
       : "");
 }

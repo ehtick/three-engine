@@ -34,7 +34,9 @@ try {
     console.log(`gi-src-deposit: PASS — ${result.deposits} deposits from ${result.rays} rays ` +
       `(${result.perRay}/ray) into ${result.sampledBins} of ${result.binTotal} bins, ` +
       `${result.binTies} direction ties, ${result.headroom}x fixed-point headroom, ` +
-      `storage limit ${result.storageLimit}`);
+      `storage limit ${result.storageLimit}\n` +
+      `                 blocks ${result.blocks} for ${result.liveProbes} live probes ` +
+      `(${result.binBytes}MB); starved run dropped ${result.starvedDropped} deposits`);
     code = 0;
   } else {
     console.error(`gi-src-deposit: FAIL — ${result?.error ?? `${result?.failures} checks`}`);

@@ -64,6 +64,14 @@
       //             companion guide gets wrong, checked directly.
       //   unknown   zero-count bins resolve to UNKNOWN (T = -1), not to zero.
       //   overflow  measured headroom of the F = 16 accumulator against 2^32.
+      //   blocks    one bin block per live probe, distinct and in range. Two
+      //             probes sharing a block passes every arm above.
+      //   starved   a pool too small to serve every probe: the failure is an
+      //             ABSENCE, and the probes that did claim still match the
+      //             mirror exactly (which is what rules out a block-0 fallback).
+      //   retire    after every probe dies, each cascade's free stack is a
+      //             PERMUTATION of its blocks — one assertion for both a leak
+      //             and a double-free.
       //
       // Run: node scripts/run-gi-src-deposit-test.mjs
       const out = document.querySelector("#log");
@@ -280,7 +288,8 @@
         say(`pixels ${PIXELS} (${PIXELS - valid.reduce((a, b) => a + b, 0)} invalid)  ` +
           `raysPerPixel ${RAYS_PER_PIXEL}  Lmax ${LMAX}  F ${D.DEPOSIT_F}`);
         say(`bins ${(bins.binTotal / 1e6).toFixed(3)}M over ` +
-          `${store.cascades.map((c) => c.probeCapacity).join("/")} probe slots  ` +
+          `${store.cascades.map((c) => c.blockCapacity).join("/")} blocks ` +
+          `(${store.cascades.map((c) => c.probeCapacity).join("/")} probe slots)  ` +
           `${(bins.bytes / 1048576).toFixed(1)}MB  dispatches ` +
           `${frame.passes.length}+${rayFrame.passes.length}+${deposit.passes.length}`);
         say("");
@@ -298,21 +307,6 @@
           deposit.readStats(renderer),
         ]);
 
-        // Live probes, per cascade, keyed both ways.
-        const live = store.cascades.map((c) => {
-          const byKey = new Map();
-          const byIndex = new Map();
-          for (let k = 0; k < c.probeCapacity; k++) {
-            const p = c.probeBase + k;
-            const w = p * P.PROBE_WORDS;
-            if ((table[w + P.PROBE_FLAGS] & P.FLAG_ALIVE) === 0) continue;
-            const rec = { index: p, local: k, key: table[w + P.PROBE_KEY] >>> 0 };
-            byKey.set(rec.key, rec);
-            byIndex.set(p, rec);
-          }
-          return { byKey, byIndex };
-        });
-
         // ── the mirror, on the GPU's own ray assignment ──────────────────
         const mirrorPixels = [];
         const gpuIndexOf = [];
@@ -325,78 +319,124 @@
           spacing0: S0, camera: CAM, anchor: ANCHOR, raysPerPixel: RAYS_PER_PIXEL,
           cascadeCount: cfgMod.CASCADE_COUNT, maxLods: cfgMod.MAX_LODS,
         });
-        const built = ref.buildProbes(cfg, mirrorPixels);
-        const mirrorBases = new Int32Array(mirrorPixels.length);
-        for (let j = 0; j < mirrorPixels.length; j++) {
-          const b = pixelRayBase[gpuIndexOf[j]];
-          mirrorBases[j] = b === P.SLOT_EMPTY ? -1 : b;
-        }
-        // The mirror's own `assignRays` still runs — the deposit needs nothing
-        // from it, but running it and then OVERRIDING the bases is what makes
-        // the substitution explicit rather than a missing call.
-        const mirrorRays = ref.assignRays(cfg, built);
-        mirrorRays.pixelRayBase = mirrorBases;
-
-        // THE MIRROR'S OWN LOOP, not a re-implementation of it. Everything the
-        // arms below compare comes out of `probe.bins`, which is what
-        // `traceAndDeposit` filled.
-        const mStats = ref.traceAndDeposit(cfg, built, mirrorPixels, mirrorRays, jsSceneTrace);
-        const mAgg = new Map();          // `${cascade}:${key}` -> totals
-        const mBin = new Map();          // `${cascade}:${key}:${morton}` -> totals
-        for (let c = 0; c < cfgMod.CASCADE_COUNT; c++) {
-          const n = cfgMod.binCount(c, cfgMod.W0);
-          for (const probe of built.cascades[c].probes) {
-            if (!probe.bins) continue;
-            const key = `${c}:${probe.key >>> 0}`;
-            const agg = { r: 0, g: 0, b: 0, t: 0, n: 0 };
-            for (let m = 0; m < n; m++) {
-              const cnt = probe.bins.count[m];
-              if (cnt === 0) continue;
-              const e = {
-                r: probe.bins.sumR[m], g: probe.bins.sumG[m],
-                b: probe.bins.sumB[m], t: probe.bins.sumT[m], n: cnt,
-              };
-              mBin.set(`${key}:${m}`, e);
-              agg.r += e.r; agg.g += e.g; agg.b += e.b; agg.t += e.t; agg.n += cnt;
-            }
-            if (agg.n > 0) mAgg.set(key, agg);
+        // A FUNCTION rather than a straight-line block, because the starved-pool
+        // arm at the bottom runs a SECOND GPU pipeline whose ray partition is
+        // its own — the synthetic trace is keyed on the ray index, so a mirror
+        // fed the wrong partition would disagree about everything for a reason
+        // that has nothing to do with what is being tested. `buildProbes` is
+        // re-run per call: `traceAndDeposit` fills `probe.bins` in place, so
+        // reusing one build would accumulate two runs into one set of bins.
+        const runMirror = (gpuPixelRayBase) => {
+          const built = ref.buildProbes(cfg, mirrorPixels);
+          const mirrorBases = new Int32Array(mirrorPixels.length);
+          for (let j = 0; j < mirrorPixels.length; j++) {
+            const b = gpuPixelRayBase[gpuIndexOf[j]];
+            mirrorBases[j] = b === P.SLOT_EMPTY ? -1 : b;
           }
-        }
-        const mTraced = mStats.traced;
-        const mHits = mStats.hits;
-        const mDeposits = mStats.deposits;
+          // The mirror's own `assignRays` still runs — the deposit needs nothing
+          // from it, but running it and then OVERRIDING the bases is what makes
+          // the substitution explicit rather than a missing call.
+          const mirrorRays = ref.assignRays(cfg, built);
+          mirrorRays.pixelRayBase = mirrorBases;
+
+          // THE MIRROR'S OWN LOOP, not a re-implementation of it. Everything the
+          // arms below compare comes out of `probe.bins`, which is what
+          // `traceAndDeposit` filled.
+          const s = ref.traceAndDeposit(cfg, built, mirrorPixels, mirrorRays, jsSceneTrace);
+          const agg = new Map();          // `${cascade}:${key}` -> totals
+          const bin = new Map();          // `${cascade}:${key}:${morton}` -> totals
+          for (let c = 0; c < cfgMod.CASCADE_COUNT; c++) {
+            const n = cfgMod.binCount(c, cfgMod.W0);
+            for (const probe of built.cascades[c].probes) {
+              if (!probe.bins) continue;
+              const key = `${c}:${probe.key >>> 0}`;
+              const total = { r: 0, g: 0, b: 0, t: 0, n: 0 };
+              for (let m = 0; m < n; m++) {
+                const cnt = probe.bins.count[m];
+                if (cnt === 0) continue;
+                const e = {
+                  r: probe.bins.sumR[m], g: probe.bins.sumG[m],
+                  b: probe.bins.sumB[m], t: probe.bins.sumT[m], n: cnt,
+                };
+                bin.set(`${key}:${m}`, e);
+                total.r += e.r; total.g += e.g; total.b += e.b; total.t += e.t; total.n += cnt;
+              }
+              if (total.n > 0) agg.set(key, total);
+            }
+          }
+          return { agg, bin, traced: s.traced, hits: s.hits, deposits: s.deposits };
+        };
 
         // ── the GPU side, aggregated the same two ways ───────────────────
-        const gAgg = new Map();
-        const gBin = new Map();
-        let gDeposits = 0;
+        // Addressed through the CLAIMED BLOCK. A probe holding `SLOT_EMPTY` owns
+        // no bins at all and is skipped — which is also what makes this the
+        // instrument for "a blockless probe wrote into block 0": those deposits
+        // would land in whatever probe owns block 0 and show up as that probe
+        // exceeding its mirror twin.
+        const aggregateGpu = (probeStore, binStore, tableRaw, scratchRaw) => {
+          const agg = new Map();
+          const bin = new Map();
+          let deposits = 0;
+          let maxAcc = 0;
+          let maxCount = 0;
+          const blocked = [];
+          for (let c = 0; c < probeStore.cascades.length; c++) {
+            const info = binStore.cascades[c];
+            const pc = probeStore.cascades[c];
+            const seenBlocks = new Set();
+            let liveCount = 0;
+            let noBlock = 0;
+            for (let k = 0; k < pc.probeCapacity; k++) {
+              const p = pc.probeBase + k;
+              const w = p * P.PROBE_WORDS;
+              if ((tableRaw[w + P.PROBE_FLAGS] & P.FLAG_ALIVE) === 0) continue;
+              liveCount++;
+              const key = tableRaw[w + P.PROBE_KEY] >>> 0;
+              const block = tableRaw[w + P.PROBE_BLOCK] >>> 0;
+              if (block === P.SLOT_EMPTY) { noBlock++; continue; }
+              seenBlocks.add(block);
+              const blockBase = info.binBase + block * info.bins;
+              for (let m = 0; m < info.bins; m++) {
+                const b = (blockBase + m) * D.BIN_WORDS;
+                const n = scratchRaw[b + D.BIN_COUNT] >>> 0;
+                if (n === 0) continue;
+                const r = scratchRaw[b + D.BIN_R] >>> 0;
+                const g = scratchRaw[b + D.BIN_G] >>> 0;
+                const bl = scratchRaw[b + D.BIN_B] >>> 0;
+                const t = scratchRaw[b + D.BIN_T] >>> 0;
+                maxAcc = Math.max(maxAcc, r, g, bl);
+                maxCount = Math.max(maxCount, n);
+                deposits += n;
+                const kk = `${c}:${key}`;
+                const e = agg.get(kk) ?? { r: 0, g: 0, b: 0, t: 0, n: 0 };
+                e.r += r; e.g += g; e.b += bl; e.t += t; e.n += n;
+                agg.set(kk, e);
+                bin.set(`${kk}:${m}`, { r, g, b: bl, t, n });
+              }
+            }
+            blocked.push({
+              cascade: c, live: liveCount, noBlock,
+              distinctBlocks: seenBlocks.size,
+              blockCapacity: pc.blockCapacity,
+              maxBlock: seenBlocks.size ? Math.max(...seenBlocks) : -1,
+            });
+          }
+          return { agg, bin, deposits, maxAcc, maxCount, blocked };
+        };
+
+        const mirror = runMirror(pixelRayBase);
+        const { agg: mAgg, bin: mBin } = mirror;
+        const mTraced = mirror.traced;
+        const mHits = mirror.hits;
+        const mDeposits = mirror.deposits;
+
+        const gpu = aggregateGpu(store, bins, table, scratch);
+        const { agg: gAgg, bin: gBin } = gpu;
+        const gDeposits = gpu.deposits;
+        const maxAccum = gpu.maxAcc;
+        const maxBinCount = gpu.maxCount;
         let unknownBins = 0;
         let resolvedBins = 0;
-        let maxAccum = 0;
-        let maxBinCount = 0;
-        for (let c = 0; c < cfgMod.CASCADE_COUNT; c++) {
-          const info = bins.cascades[c];
-          for (const rec of live[c].byKey.values()) {
-            const blockBase = info.binBase + rec.local * info.bins;
-            for (let m = 0; m < info.bins; m++) {
-              const b = (blockBase + m) * D.BIN_WORDS;
-              const n = scratch[b + D.BIN_COUNT] >>> 0;
-              if (n === 0) continue;
-              const r = scratch[b + D.BIN_R] >>> 0;
-              const g = scratch[b + D.BIN_G] >>> 0;
-              const bl = scratch[b + D.BIN_B] >>> 0;
-              const t = scratch[b + D.BIN_T] >>> 0;
-              maxAccum = Math.max(maxAccum, r, g, bl);
-              maxBinCount = Math.max(maxBinCount, n);
-              gDeposits += n;
-              const key = `${c}:${rec.key}`;
-              const e = gAgg.get(key) ?? { r: 0, g: 0, b: 0, t: 0, n: 0 };
-              e.r += r; e.g += g; e.b += bl; e.t += t; e.n += n;
-              gAgg.set(key, e);
-              gBin.set(`${key}:${m}`, { r, g, b: bl, t, n });
-            }
-          }
-        }
         // Payload coverage, over the WHOLE buffer — unsampled slots included,
         // because "an untouched bin resolves to unknown" is the claim.
         for (let i = 0; i < bins.binTotal; i++) {
@@ -508,7 +548,8 @@
         check("some bins DID resolve", resolvedBins > 0,
           `${resolvedBins} resolved — zero here would make the arm above vacuous`);
         say(`   ${(100 * resolvedBins / bins.binTotal).toFixed(4)}% of allocated bins were sampled ` +
-          "(bins are sized by probe CAPACITY, not by live probes — plan §12.16)");
+          "(§12.16 read 0.24% of this when bins were sized by probe CAPACITY; the " +
+          "claimed block pool is what raised it, and the rest is angular sparsity)");
 
         // ══ ARM 6: the fixed point's headroom ═══════════════════════════
         say("");
@@ -527,6 +568,171 @@
           maxBinCount * 64 < saturatedCap,
           `${maxBinCount} deposits vs ${saturatedCap} saturated rays — 64x margin required`);
 
+        // ══ ARM 7: the block claim ══════════════════════════════════════
+        say("");
+        say("── BLOCKS: one block per live probe, distinct, in range ──");
+        // The property the whole scheme rests on. Two probes sharing a block
+        // would look EXACTLY like a correct run in every arm above — the
+        // deposits would all land, the totals would all match — while the two
+        // probes' bins were silently summed together. Nothing else here would
+        // catch it, which is why distinctness is asserted directly.
+        let sharedBlocks = 0;
+        let outOfRange = 0;
+        let unclaimed = 0;
+        for (const b of gpu.blocked) {
+          if (b.distinctBlocks !== b.live - b.noBlock) sharedBlocks++;
+          if (b.maxBlock >= b.blockCapacity) outOfRange++;
+          unclaimed += b.noBlock;
+          say(`   c${b.cascade}: ${b.live} live, ${b.distinctBlocks} distinct blocks ` +
+            `of ${b.blockCapacity}` + (b.noBlock ? `, ${b.noBlock} UNCLAIMED` : ""));
+        }
+        check("no two live probes hold the same block", sharedBlocks === 0,
+          `${sharedBlocks} cascades where distinct blocks != live probes with a block`);
+        check("every claimed block is inside its cascade's pool", outOfRange === 0,
+          `${outOfRange} cascades with a block index past capacity`);
+        check("the pool was big enough — no probe went without bins", unclaimed === 0,
+          `${unclaimed} probes unclaimed; ${stats.noBlock} deposits dropped`);
+        check("no deposit was dropped for want of a block", stats.noBlock === 0,
+          `${stats.noBlock} dropped`);
+
+        // ══ ARM 8: a pool too small to serve every probe ════════════════
+        say("");
+        say("── STARVED: a claim failure is an ABSENCE, never block 0 ──");
+        // `binBudget: 1` floors every cascade at `MIN_BLOCKS`, which is far
+        // under the live probe count — the exhaustion path taken for real
+        // rather than simulated by poking a counter.
+        //
+        // What this proves is the thing that cannot be proven on a healthy run:
+        // a probe that fails to claim writes NOTHING. If it fell back to block
+        // 0, block 0's owner would carry its own deposits plus the strays, and
+        // the per-probe comparison below would fail on exactly that probe.
+        const starvedStore = P.createSrcProbeStore({
+          c0Probes: C0_PROBES, cascadeCount: cfgMod.CASCADE_COUNT, binBudget: 1,
+        });
+        const starvedFrame = P.createSrcProbeFrame(starvedStore, {
+          spacing0: S0, camera: vec3(cameraU), anchor: vec3(anchorU),
+          pixelCount: PIXELS, readPixel,
+        });
+        const starvedRays = R.createSrcRayStore(starvedStore, { pixelCount: PIXELS });
+        const starvedRayFrame = R.createSrcRayFrame(starvedStore, starvedRays, {
+          pixelProbe: starvedFrame.pixelProbe, raysPerPixel: RAYS_PER_PIXEL,
+        });
+        const starvedBins = D.createSrcBinStore(starvedStore, { w0: cfgMod.W0 });
+        const starvedDeposit = D.createSrcDepositFrame(starvedStore, starvedBins, {
+          pixelProbe: starvedFrame.pixelProbe,
+          pixelRayBase: starvedRays.pixelRayBase,
+          pixelCount: PIXELS, raysPerPixel: RAYS_PER_PIXEL,
+          trace: synthTrace, shadeHit, readPixel, readNormal,
+          camera: vec3(cameraU), spacing0: S0, lmax: lmaxU, jitterX: 0, jitterY: 0,
+        });
+        for (const pass of starvedFrame.passes) await renderer.computeAsync(pass);
+        for (const pass of starvedRayFrame.passes) await renderer.computeAsync(pass);
+        for (const pass of starvedDeposit.passes) await renderer.computeAsync(pass);
+        const [sTable, sBase, sScratch, sStats, sProbeStats] = await Promise.all([
+          renderer.getArrayBufferAsync(starvedStore.probeTable.value).then((b) => new Uint32Array(b)),
+          renderer.getArrayBufferAsync(starvedRays.pixelRayBase.value).then((b) => new Uint32Array(b)),
+          renderer.getArrayBufferAsync(starvedBins.scratch.value).then((b) => new Uint32Array(b)),
+          starvedDeposit.readStats(renderer),
+          P.readSrcProbeStats(renderer, starvedStore),
+        ]);
+        const sGpu = aggregateGpu(starvedStore, starvedBins, sTable, sScratch);
+        const sMirror = runMirror(sBase);
+
+        const starvedUnclaimed = sGpu.blocked.reduce((a, b) => a + b.noBlock, 0);
+        say(`   ${starvedStore.cascades.map((c) => c.blockCapacity).join("/")} blocks for ` +
+          `${sGpu.blocked.map((b) => b.live).join("/")} live probes  ` +
+          `${(starvedBins.bytes / 1048576).toFixed(1)}MB`);
+        check("the pool really did run out", starvedUnclaimed > 0,
+          `${starvedUnclaimed} probes without a block — zero would make this arm vacuous`);
+        check("the shortfall is COUNTED by the probe store",
+          sProbeStats.reduce((a, s) => a + s.noBlock, 0) > 0,
+          `NOBLOCK ${sProbeStats.map((s) => s.noBlock).join("/")}`);
+        check("no two probes share a block under starvation",
+          sGpu.blocked.every((b) => b.distinctBlocks === b.live - b.noBlock),
+          sGpu.blocked.map((b) => `c${b.cascade} ${b.distinctBlocks}/${b.live - b.noBlock}`).join(" "));
+        check("no claimed block is past the (tiny) capacity",
+          sGpu.blocked.every((b) => b.maxBlock < b.blockCapacity),
+          sGpu.blocked.map((b) => `c${b.cascade} max ${b.maxBlock} of ${b.blockCapacity}`).join(" "));
+
+        // The one that matters: every probe that DID claim must still agree with
+        // its mirror twin exactly. A blockless probe redirecting to block 0
+        // shows up here and nowhere else.
+        let strayInto = 0;
+        let starvedMissing = 0;
+        for (const [k, g] of sGpu.agg) {
+          const m = sMirror.agg.get(k);
+          if (!m) { starvedMissing++; continue; }
+          if (g.n !== m.n || g.t !== m.t || g.r !== m.r || g.g !== m.g || g.b !== m.b) strayInto++;
+        }
+        check("every probe that HELD a block matches the mirror exactly", strayInto === 0,
+          `${strayInto}/${sGpu.agg.size} probes carry deposits that are not theirs`);
+        check("the GPU deposited into no probe the mirror did not", starvedMissing === 0,
+          `${starvedMissing} unexplained probes`);
+        // Exact accounting: what was dropped is precisely what the blockless
+        // probes would have deposited, so nothing went missing anywhere else.
+        const droppedExpected = sMirror.deposits - sGpu.deposits;
+        check("dropped deposits + landed deposits = the mirror's total",
+          sStats.noBlock === droppedExpected && sStats.deposits === sGpu.deposits,
+          `dropped ${sStats.noBlock} vs expected ${droppedExpected}, ` +
+          `landed ${sStats.deposits} vs binned ${sGpu.deposits}, mirror ${sMirror.deposits}`);
+
+        // ══ ARM 9: retirement returns every block ═══════════════════════
+        say("");
+        say("── RETIREMENT: the pool is a cycle, not a one-way allocation ──");
+        // A leak here is invisible for `blockCapacity` probe lifetimes and then
+        // permanent, which is the worst shape a bug can have — it survives every
+        // gate, ships, and turns into "GI stops working after a few minutes of
+        // walking". So the check is a PERMUTATION: after every probe has
+        // retired, each cascade's free region must hold each block index exactly
+        // once. That catches a leak and a double-free with the same assertion.
+        const AGED = 1;
+        const agedFrame = P.createSrcProbeFrame(starvedStore, {
+          spacing0: S0, camera: vec3(cameraU), anchor: vec3(anchorU),
+          pixelCount: PIXELS, readPixel, maxAge: AGED,
+        });
+        // Every pixel invalid — no key, no insert, nothing to keep alive.
+        const attrArr = posBuf.value.array;
+        for (let i = 0; i < PIXELS; i++) attrArr[i * 8 + 3] = 0;
+        posBuf.value.needsUpdate = true;
+        // RETIREMENT CASCADES WITH A ONE-LIFETIME LAG PER LEVEL, so this is not
+        // `maxAge + 1` frames — it is that per cascade. A live c0 probe keeps
+        // re-inserting its c1 parent, which keeps re-inserting its own, so the
+        // ladder only starts dying at the bottom and works up. §12.12 measured
+        // the same thing from the other side (c0 12 live < c1 18 across frames)
+        // and it is correct behaviour, not a leak: it is what keeps every
+        // ancestor chain complete while any descendant is still being used.
+        const SWEEP = 16;
+        for (let f = 0; f < SWEEP; f++) {
+          for (const pass of agedFrame.passes) await renderer.computeAsync(pass);
+        }
+        const [rTop, rStack, rProbeStats] = await Promise.all([
+          renderer.getArrayBufferAsync(starvedStore.freeTop.value).then((b) => new Uint32Array(b)),
+          renderer.getArrayBufferAsync(starvedStore.freeStack.value).then((b) => new Uint32Array(b)),
+          P.readSrcProbeStats(renderer, starvedStore),
+        ]);
+        // Block tops live in the SECOND half of `freeTop` — probe tops first,
+        // block tops at `cascadeCount + cascade`, one buffer for both.
+        const NC = starvedStore.cascadeCount;
+        check(`every probe retired within ${SWEEP} frames of its pixels going away`,
+          rProbeStats.every((s) => s.live === 0),
+          `live ${rProbeStats.map((s) => s.live).join("/")}`);
+        check("every block top is back at full capacity",
+          starvedStore.cascades.every((c) => rTop[NC + c.cascade] === c.blockCapacity),
+          starvedStore.cascades
+            .map((c) => `c${c.cascade} ${rTop[NC + c.cascade]}/${c.blockCapacity}`).join(" "));
+        let notPermutation = 0;
+        for (const c of starvedStore.cascades) {
+          const seen = new Set();
+          for (let i = 0; i < c.blockCapacity; i++) {
+            seen.add(rStack[starvedStore.blockStackBase + c.blockBase + i] >>> 0);
+          }
+          if (seen.size !== c.blockCapacity) notPermutation++;
+          else for (let i = 0; i < c.blockCapacity; i++) if (!seen.has(i)) { notPermutation++; break; }
+        }
+        check("each cascade's free stack is a PERMUTATION of its blocks",
+          notPermutation === 0,
+          `${notPermutation} cascades hold a duplicate or a gap — i.e. a double-free or a leak`);
+
         if (validationErrors.length) check("no WebGPU validation errors", false, validationErrors[0]);
 
         say("");
@@ -539,6 +745,10 @@
           perRay: +perRay.toFixed(3),
           binTies: binMismatch,
           binTotal: bins.binTotal,
+          binBytes: +(bins.bytes / 1048576).toFixed(1),
+          blocks: store.cascades.map((c) => c.blockCapacity).join("/"),
+          liveProbes: gpu.blocked.map((b) => b.live).join("/"),
+          starvedDropped: sStats.noBlock,
           sampledBins: gBin.size,
           headroom: +headroom.toPrecision(3),
           storageLimit: device.limits.maxStorageBuffersPerShaderStage,

@@ -860,8 +860,26 @@
               `in ${stats.rays} rays (${(exitRate * 100).toFixed(4)}%, budget 0.05%)`,
             );
           }
-          if (stats.macroStepLimitExits !== 0 || stats.brickStepLimitExits !== 0) {
-            throw new Error(`hybrid traversal limit detail macro=${stats.macroStepLimitExits} brick=${stats.brickStepLimitExits}`);
+          // THE SAME RATE, FOR THE SAME REASON — and this line stayed `!== 0`
+          // when the one above it became a rate, which made the arm FLAKE ONE
+          // RUN IN FOUR. Measured: `hybrid-exact-complex&src=1` reported
+          // `brick=1` once in four consecutive runs and `brick=0` the other
+          // three, on identical code. That is not nondeterminism in the
+          // traversal — it is the ray-index assignment, which is a scheduler-
+          // ordered atomic cursor (§12.15), so each run hands a given pixel a
+          // different R2 index and therefore a different direction. Whether any
+          // tangent grazer exists at all is a property of the DRAW.
+          //
+          // A budget that tolerates the ray class in aggregate and then forbids
+          // it per rung is not a tighter test, it is the same test with a coin
+          // toss attached — and an intermittent gate is worse than no gate,
+          // because the first thing it teaches is to re-run it.
+          const macroRate = stats.rays > 0 ? stats.macroStepLimitExits / stats.rays : 0;
+          const brickRate = stats.rays > 0 ? stats.brickStepLimitExits / stats.rays : 0;
+          if (macroRate > 0.0005 || brickRate > 0.0005) {
+            throw new Error(`hybrid traversal limit detail macro=${stats.macroStepLimitExits} ` +
+              `brick=${stats.brickStepLimitExits} in ${stats.rays} rays ` +
+              `(${(macroRate * 100).toFixed(4)}%/${(brickRate * 100).toFixed(4)}%, budget 0.05%)`);
           }
           if (stats.invalidNumerics !== 0) throw new Error(`GI traversal produced ${stats.invalidNumerics} invalid numeric results`);
           // The ride was always-on and never measured; these three make the A/B

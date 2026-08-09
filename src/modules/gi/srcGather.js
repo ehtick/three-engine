@@ -68,7 +68,7 @@ import {
 import { W0, binCount, binGridWidth } from "./srcConfig.js";
 import { binDir, mortonToBin } from "./srcMathTsl.js";
 import { PAYLOAD_UNKNOWN, PAYLOAD_WORDS } from "./srcDeposit.js";
-import { SLOT_EMPTY } from "./srcProbes.js";
+import { PROBE_BLOCK, PROBE_WORDS, SLOT_EMPTY } from "./srcProbes.js";
 
 // EQUAL-AREA BINS ARE WHY THIS IS A PLAIN WEIGHTED AVERAGE. `encodeDir` maps
 // azimuth to x and `(z+1)/2` to y — the Lambert cylindrical equal-area
@@ -99,6 +99,16 @@ const GS_SAMPLED = 6;   // Σ sampled bins over all pixels — see `sampled` bel
 // hemisphere. Structural, not a fault — see the note where it is incremented.
 const GS_FACING = 7;
 const GS_BADN = 8;      // pixels whose gbuffer normal is degenerate
+/**
+ * Pixels whose probe exists but holds no bin block.
+ *
+ * A third way to reach "no information", and the one that is neither a fault
+ * in this pass nor a fact about the geometry: the block pool ran short. Its own
+ * word because the fix is a config number (`BIN_BUDGET`) and not code, and
+ * folding it into `GS_UNKNOWN` would send anyone reading it hunting for an
+ * addressing bug that is not there.
+ */
+const GS_NOBLOCK = 9;
 const GS_WORDS = 12;
 const LUM_FIXED = 4096;
 
@@ -135,6 +145,11 @@ export function createSrcGatherPass(store, bins, {
 
   const widthU = width;
   const payload = bins.payload;
+  // `store` was an unused parameter until the block claim; now it is where the
+  // per-probe block index is read from. Four storage buffers in this pass
+  // (probes, payload, stats, pixelProbe) plus two textures, which is the reason
+  // it is a separate pass from the resolve at all — see the header.
+  const { probeTable } = store;
   const stats = instancedArray(new Uint32Array(GS_WORDS), "uint").toAtomic();
 
   // `GS_MIN` starts at u32 max so the first `atomicMin` wins; every other word
@@ -166,9 +181,13 @@ export function createSrcGatherPass(store, bins, {
         atomicAdd(stats.element(uint(GS_BADN)), uint(1));
       });
       const n = rawRead.normalize().toVar();
-      const block = uint(info.binBase)
-        .add(probe.sub(uint(info.probeBase)).mul(uint(info.bins)))
-        .toVar();
+      // THE PROBE'S CLAIMED BIN BLOCK. `SLOT_EMPTY` means the pool was short
+      // when this probe was born, so it has no bins at all — the pixel gets an
+      // absence, exactly as an all-unknown probe does, and never block 0's
+      // bins (which belong to somebody else). Counted separately because the
+      // cure is a bigger `BIN_BUDGET` rather than a fix in this file.
+      const claimed = probeTable.element(probe.mul(PROBE_WORDS).add(PROBE_BLOCK)).toVar();
+      const block = uint(info.binBase).add(claimed.mul(uint(info.bins))).toVar();
       // `known` accumulates the sampled bins' cosine-weighted radiance and
       // `wKnown` the cosine weight they carry. Dividing one by the other is the
       // renormalization R1 asks for — unknown bins are excluded from the
@@ -183,6 +202,7 @@ export function createSrcGatherPass(store, bins, {
       // whose normals oppose). Without this the first would be indistinguishable
       // from the second, and only one of them is a bug.
       const sampled = uint(0).toVar();
+      If(claimed.notEqual(uint(SLOT_EMPTY)), () => {
       Loop({ start: 0, end: nBins, type: "uint", name: "m" }, ({ m }) => {
         // Bins are stored in MORTON order, so the direction has to come back
         // through `mortonToBin` — reading `m` as a raster index would rotate
@@ -214,6 +234,7 @@ export function createSrcGatherPass(store, bins, {
           wKnown.addAssign(cosT);
         });
       });
+      });
       // ══ E = π · (cosine-weighted mean radiance over the SAMPLED bins) ═════
       //
       // `context.irradiance` in three's lighting model is E, and the Lambert
@@ -232,12 +253,17 @@ export function createSrcGatherPass(store, bins, {
       If(wKnown.greaterThan(0), () => {
         E.assign(known.div(wKnown).mul(Math.PI));
       }).Else(() => {
-        // TWO DIFFERENT THINGS, AND ONLY ONE IS A BUG.
+        // THREE DIFFERENT THINGS, AND ONLY ONE IS A BUG.
         //
-        // `sampled == 0` means the probe's bins are empty — an addressing fault
-        // between the deposit and here, or a probe nothing deposited into.
+        // `claimed == SLOT_EMPTY` means the block pool was short when this
+        // probe was born. Not an addressing fault and not geometry — a config
+        // number. The probe is otherwise entirely healthy.
         //
-        // `sampled > 0` means the probe HAS data and none of it is in this
+        // `sampled == 0` means the probe HAS a block and nothing is in it — an
+        // addressing fault between the deposit and here, or a probe nothing
+        // deposited into.
+        //
+        // `sampled > 0` means the probe has data and none of it is in this
         // pixel's hemisphere. That is structural: an SRC probe is POSITION-ONLY,
         // so its bins are populated only in the directions its contributing
         // pixels' hemispheres covered, and a receiver on a surface facing the
@@ -245,7 +271,9 @@ export function createSrcGatherPass(store, bins, {
         // absence, never a dark vote — so the pixel gets nothing rather than
         // black, and it is counted here so the size of the effect is visible
         // instead of being read off the screen as "GI is patchy".
-        If(sampled.equal(uint(0)), () => {
+        If(claimed.equal(uint(SLOT_EMPTY)), () => {
+          atomicAdd(stats.element(uint(GS_NOBLOCK)), uint(1));
+        }).ElseIf(sampled.equal(uint(0)), () => {
           atomicAdd(stats.element(uint(GS_UNKNOWN)), uint(1));
         }).Else(() => {
           atomicAdd(stats.element(uint(GS_FACING)), uint(1));
@@ -301,6 +329,7 @@ export function createSrcGatherPass(store, bins, {
         unknown: v[GS_UNKNOWN] >>> 0,
         facing: v[GS_FACING] >>> 0,
         badNormals: v[GS_BADN] >>> 0,
+        noBlock: v[GS_NOBLOCK] >>> 0,
         lit,
         meanLum: lit > 0 ? (v[GS_SUM] >>> 0) / lit / LUM_FIXED : 0,
         minLum: min,

@@ -49,6 +49,22 @@
 // probes pop from it. A surviving probe is not touched at all, which is also
 // why [K] costs nothing for the steady-state majority.
 //
+// ══ AND THE SAME LIFECYCLE CARRIES A SECOND RESOURCE ═══════════════════════
+//
+// Direction bins are the expensive per-probe payload — 32 bins at c0 rising to
+// 2,048 at c3, nine words each — and they used to be addressed by probe SLOT,
+// i.e. allocated for a capacity nothing ever fills. §12.16's gate measured
+// **0.24% of allocated bins ever sampled**, and at a half-res 1080p gbuffer the
+// scheme wanted 604 MB against a 128 MiB binding limit.
+//
+// So a probe CLAIMS a bin block when it is created and RELEASES it when it
+// retires — the same stack, the same two passes, one more pop and one more
+// push. `PROBE_BLOCK` holds the claim. The store owns the pool rather than
+// `srcDeposit.js` for one concrete reason: `createCompactPass` already binds
+// six storage buffers against a portable limit of eight, and a separate pair
+// of pool buffers would have left the pass that creates every probe with no
+// headroom at all. Plan §4.2, §12.18.3.
+//
 // docs/GI_SRC_REBUILD_PLAN.md §4.1, §4.2, §7 Phase 1.
 
 import {
@@ -67,7 +83,7 @@ import {
   uint,
   wgslFn,
 } from "three/tsl";
-import { CASCADE_COUNT, MAX_LODS, PROBE_MAX_AGE } from "./srcConfig.js";
+import { BIN_BUDGET, CASCADE_COUNT, MAX_LODS, PROBE_MAX_AGE, W0, blockCapacities } from "./srcConfig.js";
 import { KEY_EMPTY } from "./srcMath.js";
 import {
   cellPosition,
@@ -126,7 +142,18 @@ export const PROBE_PARENT = 3;
 export const PROBE_HASH = 4;     // the hash slot holding this key, for [K]
 export const PROBE_RAYS = 5;     // Alg. 3 ray count   (Phase 2)
 export const PROBE_RAYOFF = 6;   // Alg. 3 ray offset  (Phase 2)
-export const PROBE_SPARE = 7;    // pads to 8 words; irradiance tile slot (Phase 3)
+/**
+ * The BIN BLOCK this probe claimed, LOCAL to its cascade, or `SLOT_EMPTY`.
+ *
+ * Phase 1 reserved this word as "irradiance tile slot (Phase 3)"; this is that
+ * word being spent. One claim per probe covers both — the bins now and [H]'s
+ * octahedral tile later — because they have the same owner and the same
+ * lifetime, so a second pool would be a second thing to leak.
+ *
+ * `SLOT_EMPTY`, never 0: a probe that fails to claim has NO bins, and index 0
+ * is a block some other probe owns. Same rule as every other absence here.
+ */
+export const PROBE_BLOCK = 7;
 
 export const FLAG_ALIVE = 1;
 export const FLAG_FRESH = 2;
@@ -148,6 +175,18 @@ export const COUNTER_FRESH = 3;     // probes created this frame
  * rest is worse than no instrument — somebody eventually tunes against it.
  */
 export const COUNTER_ATTEMPTS = 4;
+/**
+ * Probes created this frame that could NOT claim a bin block.
+ *
+ * Its own counter rather than a fold into `COUNTER_FAILED`, because the two
+ * failures have opposite fixes: a failed INSERT means the hash is too small or
+ * too loaded, a failed CLAIM means `BIN_BUDGET` is too small for the scene. A
+ * probe that fails to claim is alive, keyed, resolvable and RAY-BUDGETED — it
+ * simply has nowhere to deposit, so it contributes an absence rather than dark
+ * (R1). Nonzero here is the one signal that says so before anyone tries to read
+ * it off the screen.
+ */
+export const COUNTER_NOBLOCK = 5;
 
 // ═════════════════════════════════════════════════════════ THE WGSL ISLAND
 
@@ -258,11 +297,17 @@ function pow2(n) {
  * @param {number} options.loadFactor  probes ÷ hash capacity. 0.5 by default —
  *   open addressing with linear probing degrades sharply above ~0.7, and the
  *   memory this buys back is one u32 per slot.
+ * @param {number} options.w0  c0 bin grid width — the block pool's sizing needs
+ *   it, because a block IS `binCount(cascade, w0)` accumulators.
+ * @param {number} options.binBudget  total bins the block pool may hold. See
+ *   `srcConfig.BIN_BUDGET`; the bytes live in `createSrcBinStore`.
  */
 export function createSrcProbeStore({
   c0Probes = 65536,
   cascadeCount = CASCADE_COUNT,
   loadFactor = 0.5,
+  w0 = W0,
+  binBudget = BIN_BUDGET,
 } = {}) {
   const cascades = [];
   let hashTotal = 0;
@@ -281,6 +326,21 @@ export function createSrcProbeStore({
     probeTotal += probes;
   }
 
+  // ── THE SECOND RESOURCE WITH THE SAME LIFETIME ────────────────────────────
+  // A bin block is claimed and released exactly where a probe index is, so it
+  // rides the SAME free stack rather than getting its own pair of buffers. That
+  // is not tidiness: `createCompactPass` already binds six storage buffers and
+  // the portable limit is EIGHT per stage, so two more would have put the pass
+  // that creates every probe exactly at the ceiling with nothing left for the
+  // merge. One buffer, two regions.
+  const blockCaps = blockCapacities(cascades.map((c) => c.probeCapacity), w0, binBudget);
+  let blockTotal = 0;
+  for (const c of cascades) {
+    c.blockCapacity = blockCaps[c.cascade];
+    c.blockBase = blockTotal;          // into the BLOCK index space, per cascade
+    blockTotal += c.blockCapacity;
+  }
+
   // ── ONE buffer per role, all cascades at fixed offsets (R7) ───────────────
   // The alternative — a buffer per cascade — is four times the bindings for
   // the same bytes, and the composed kernels in this module have died on the
@@ -291,24 +351,43 @@ export function createSrcProbeStore({
   // `atomicLoad` on a u32 is free on every target we ship to.
   const hashKeys = instancedArray(new Uint32Array(hashTotal), "uint").toAtomic();
   const hashSlot = instancedArray(new Uint32Array(hashTotal).fill(SLOT_EMPTY), "uint");
-  const probeTable = instancedArray(new Uint32Array(probeTotal * PROBE_WORDS), "uint");
+  const tableInit = new Uint32Array(probeTotal * PROBE_WORDS);
+  // A slot no probe has ever occupied must read "no block", not "block 0" —
+  // zero-fill would make every unborn probe look like the owner of block 0.
+  // Nothing reads a dead probe's word today (the chain and the pixel map are
+  // both resolved this frame), so this is the rule holding rather than a bug
+  // being fixed, and it costs one pass over a buffer built once.
+  for (let p = 0; p < probeTotal; p++) tableInit[p * PROBE_WORDS + PROBE_BLOCK] = SLOT_EMPTY;
+  const probeTable = instancedArray(tableInit, "uint");
   const counters = instancedArray(new Uint32Array(cascadeCount * COUNTER_WORDS), "uint").toAtomic();
 
-  // ── the free stack, seeded FULL and in reverse ────────────────────────────
+  // ── the free stacks, seeded FULL and in reverse ───────────────────────────
   // Reverse so the first pops are indices 0, 1, 2… on a cold boot. That is
   // cosmetic for correctness and load-bearing for debugging: a fresh frame's
   // probe 0 is at table entry 0, so a readback is readable by eye instead of
   // being a permutation nobody can check.
-  const freeInit = new Uint32Array(probeTotal);
+  //
+  // Two regions in one array: probe indices first (GLOBAL, because a probe
+  // index is global everywhere it appears), then block indices (LOCAL to their
+  // cascade, because a block index is only ever used to address that cascade's
+  // bin region and a local one keeps the addressing a single multiply).
+  const freeInit = new Uint32Array(probeTotal + blockTotal);
   for (const c of cascades) {
     for (let i = 0; i < c.probeCapacity; i++) {
       freeInit[c.probeBase + i] = c.probeBase + (c.probeCapacity - 1 - i);
     }
+    for (let i = 0; i < c.blockCapacity; i++) {
+      freeInit[probeTotal + c.blockBase + i] = c.blockCapacity - 1 - i;
+    }
   }
   const freeStack = instancedArray(freeInit, "uint");
   // Top-of-stack per cascade, atomic: `atomicSub` pops, `atomicAdd` pushes.
-  const freeTopInit = new Uint32Array(cascadeCount);
-  for (const c of cascades) freeTopInit[c.cascade] = c.probeCapacity;
+  // Probe tops in `[0, cascadeCount)`, block tops in `[cascadeCount, 2N)`.
+  const freeTopInit = new Uint32Array(cascadeCount * 2);
+  for (const c of cascades) {
+    freeTopInit[c.cascade] = c.probeCapacity;
+    freeTopInit[cascadeCount + c.cascade] = c.blockCapacity;
+  }
   const freeTop = instancedArray(freeTopInit, "uint").toAtomic();
 
   const store = {
@@ -316,6 +395,9 @@ export function createSrcProbeStore({
     cascades,
     hashTotal,
     probeTotal,
+    blockTotal,
+    /** Where the block region starts inside `freeStack`. */
+    blockStackBase: probeTotal,
     hashKeys,
     hashSlot,
     probeTable,
@@ -323,7 +405,8 @@ export function createSrcProbeStore({
     freeStack,
     freeTop,
     /** Bytes on the GPU, for the memory high-water telemetry (plan §8). */
-    bytes: (hashTotal * 2 + probeTotal * PROBE_WORDS + probeTotal + cascadeCount * (COUNTER_WORDS + 1)) * 4,
+    bytes: (hashTotal * 2 + probeTotal * PROBE_WORDS + probeTotal + blockTotal
+      + cascadeCount * (COUNTER_WORDS + 2)) * 4,
     dispose() {
       for (const b of [hashKeys, hashSlot, probeTable, counters, freeStack, freeTop]) {
         b?.value?.dispose?.();
@@ -363,6 +446,7 @@ export function createHashClearPass(store) {
       atomicStore(counters.element(base.add(COUNTER_STEPS)), uint(0));
       atomicStore(counters.element(base.add(COUNTER_FRESH)), uint(0));
       atomicStore(counters.element(base.add(COUNTER_ATTEMPTS)), uint(0));
+      atomicStore(counters.element(base.add(COUNTER_NOBLOCK)), uint(0));
     });
   })().compute(hashTotal);
 }
@@ -384,7 +468,11 @@ export function createHashClearPass(store) {
  */
 export function createAgePass(store, cascade, { maxAge = PROBE_MAX_AGE } = {}) {
   const c = store.cascades[cascade];
-  const { hashKeys, hashSlot, probeTable, counters, freeStack, freeTop } = store;
+  const { hashKeys, hashSlot, probeTable, counters, freeStack, freeTop, cascadeCount } = store;
+  // Where this cascade's block region starts inside the shared stack, and which
+  // top word owns it. Both are JS constants folded into the shader.
+  const blockStack = store.blockStackBase + c.blockBase;
+  const blockTopWord = cascadeCount + cascade;
   return Fn(() => {
     const p = instanceIndex.add(uint(c.probeBase)).toVar();
     const w = p.mul(PROBE_WORDS).toVar();
@@ -404,6 +492,20 @@ export function createAgePass(store, cascade, { maxAge = PROBE_MAX_AGE } = {}) {
     If(age.greaterThan(uint(maxAge)), () => {
       probeTable.element(w.add(PROBE_FLAGS)).assign(uint(0));
       probeTable.element(w.add(PROBE_AGE)).assign(uint(0));
+      // ── RELEASE THE BIN BLOCK ──────────────────────────────────────────
+      // Here rather than in a sweep of its own, for the same reason the index
+      // is released here: this is the one thread that knows this probe just
+      // died, and the compaction pass three dispatches later is what will hand
+      // the block to whoever is born next. A block released in this frame is
+      // claimable in this frame — the barrier between the two passes is what
+      // makes that legal, and it is why a burst of retirement does not cost a
+      // frame of darkness.
+      const block = probeTable.element(w.add(PROBE_BLOCK)).toVar();
+      If(block.notEqual(uint(SLOT_EMPTY)), () => {
+        const btop = atomicAdd(freeTop.element(uint(blockTopWord)), uint(1)).toVar();
+        freeStack.element(uint(blockStack).add(btop)).assign(block);
+        probeTable.element(w.add(PROBE_BLOCK)).assign(uint(SLOT_EMPTY));
+      });
       // Push. `atomicAdd` returns the OLD top, which is the index to write.
       const top = atomicAdd(freeTop.element(uint(cascade)), uint(1)).toVar();
       freeStack.element(uint(c.probeBase).add(top)).assign(p);
@@ -490,7 +592,9 @@ export function createInsertPass(store, cascade, count, keyOf, onSlot = null) {
  */
 export function createCompactPass(store, cascade) {
   const c = store.cascades[cascade];
-  const { hashKeys, hashSlot, probeTable, counters, freeStack, freeTop } = store;
+  const { hashKeys, hashSlot, probeTable, counters, freeStack, freeTop, cascadeCount } = store;
+  const blockStack = store.blockStackBase + c.blockBase;
+  const blockTopWord = cascadeCount + cascade;
   return Fn(() => {
     const h = instanceIndex.add(uint(c.hashBase)).toVar();
     const key = atomicLoad(hashKeys.element(h)).toVar();
@@ -515,6 +619,31 @@ export function createCompactPass(store, cascade) {
 
     const p = freeStack.element(uint(c.probeBase).add(top).sub(1)).toVar();
     const w = p.mul(PROBE_WORDS).toVar();
+
+    // ── CLAIM A BIN BLOCK, IN THE SAME THREAD AND THE SAME PASS ────────────
+    //
+    // A second pop off the same stack machinery, on the one thread that knows
+    // a probe has just come into existence. No new dispatch, no reverse map,
+    // and no window in which a probe is alive without having tried.
+    //
+    // A FAILED CLAIM IS `SLOT_EMPTY`, NEVER BLOCK 0. Clamping to zero would
+    // pour every overflowing probe's rays into one block — the same mistake
+    // the index pop above refuses to make, and worse here, because the bins it
+    // corrupted would belong to a probe that is working correctly. Downstream
+    // an empty block means "no bins": the deposit drops (and counts) its
+    // scatter, and the gather returns UNKNOWN, which is R1's absence rather
+    // than a dark vote.
+    const btop = atomicSub(freeTop.element(uint(blockTopWord)), uint(1)).toVar();
+    const block = uint(SLOT_EMPTY).toVar();
+    If(btop.equal(uint(0)).or(btop.greaterThan(uint(c.blockCapacity))), () => {
+      // Same undo as the index pop: a top walked down through zero wraps to
+      // four billion and every later pop reads garbage out of the array.
+      atomicAdd(freeTop.element(uint(blockTopWord)), uint(1));
+      atomicAdd(counters.element(uint(cascade * COUNTER_WORDS + COUNTER_NOBLOCK)), uint(1));
+    }).Else(() => {
+      block.assign(freeStack.element(uint(blockStack).add(btop).sub(1)));
+    });
+
     probeTable.element(w.add(PROBE_KEY)).assign(key);
     probeTable.element(w.add(PROBE_AGE)).assign(uint(0));
     probeTable.element(w.add(PROBE_FLAGS)).assign(uint(FLAG_ALIVE | FLAG_FRESH));
@@ -522,7 +651,7 @@ export function createCompactPass(store, cascade) {
     probeTable.element(w.add(PROBE_HASH)).assign(h);
     probeTable.element(w.add(PROBE_RAYS)).assign(uint(0));
     probeTable.element(w.add(PROBE_RAYOFF)).assign(uint(0));
-    probeTable.element(w.add(PROBE_SPARE)).assign(uint(0));
+    probeTable.element(w.add(PROBE_BLOCK)).assign(block);
     hashSlot.element(h).assign(p);
     atomicAdd(counters.element(uint(cascade * COUNTER_WORDS + COUNTER_LIVE)), uint(1));
     atomicAdd(counters.element(uint(cascade * COUNTER_WORDS + COUNTER_FRESH)), uint(1));
@@ -808,8 +937,10 @@ export async function readSrcProbeStats(renderer, store) {
       fresh,
       attempts,
       failed: raw[base + COUNTER_FAILED] >>> 0,
+      noBlock: raw[base + COUNTER_NOBLOCK] >>> 0,
       probeCapacity: c.probeCapacity,
       hashCapacity: c.hashCapacity,
+      blockCapacity: c.blockCapacity,
       loadFactor: live / c.hashCapacity,
       // Mean linear-probe length per INSERT ATTEMPT. 1.0 is a perfect hash;
       // past ~4 the map is saying its load factor is too high, and it says so
@@ -827,6 +958,10 @@ export function formatSrcProbeStats(stats) {
     .map((s) =>
       `c${s.cascade}: ${s.live}/${s.probeCapacity} probes (+${s.fresh} fresh) ` +
       `load ${s.loadFactor.toFixed(3)} steps ${s.meanProbeSteps.toFixed(2)}/${s.attempts}` +
-      (s.failed ? ` FAILED ${s.failed}` : ""))
+      (s.failed ? ` FAILED ${s.failed}` : "") +
+      // Printed only when it fires. A probe born without bins is invisible in
+      // every other number here — it is live, keyed and ray-budgeted — so this
+      // is the only place "the bin budget is too small for this scene" appears.
+      (s.noBlock ? ` NOBLOCK ${s.noBlock}/${s.blockCapacity}` : ""))
     .join("  |  ");
 }

@@ -146,6 +146,60 @@ export function binCount(cascade, w0 = W0) {
 }
 
 /**
+ * Total direction bins the per-probe block pool may hold, across all cascades.
+ *
+ * ══ WHY THIS IS A BUDGET AND NOT A CAPACITY ════════════════════════════════
+ *
+ * Bins used to be addressed by probe CAPACITY — one block per probe SLOT,
+ * whether or not a probe ever existed there. That sized the accumulators off a
+ * generous over-estimate (`expectedC0Probes` is a quarter of the pixel count,
+ * floored at 16,384) and it did not survive contact with a real viewport: at a
+ * half-res 1080p gbuffer the c0 capacity is 131,072 slots, which is 16.8 M bins
+ * and **604 MB** — past the 128 MiB binding limit by five times, i.e. the
+ * constructor would have thrown before the first frame.
+ *
+ * §12.16's gate measured the waste directly: **0.24% of allocated bins were
+ * ever sampled.** So blocks are claimed by LIVE probes out of a pool, and the
+ * pool is sized by this budget rather than by the slot count.
+ *
+ * ══ THE SPLIT IS EQUAL BINS PER CASCADE, AND THAT IS MEASURED ══════════════
+ *
+ * Probe counts fall ~4× per cascade (spacing doubles on a 2D surface manifold)
+ * while bins rise exactly 4× (β = 4). The two cancel, so every cascade wants
+ * the same TOTAL bin count — §12.13.4 measured the consequence as 0.78 rays per
+ * bin at every cascade, flat. An equal split is therefore the shape of the
+ * data, not a convenience.
+ *
+ * 1.4 M bins is ~48 MB at 9 words per bin (5 scratch + 4 payload), which is the
+ * §12.18.3 target, and it buys 10,937 c0 blocks — above the ~10,000 live c0
+ * probes §12.18.2 estimates for a Sponza-class interior after `LOD0_REACH`.
+ * That estimate is the thing to re-measure when the LOD law lands: the claim
+ * failure is COUNTED (`COUNTER_NOBLOCK`), so a pool that turns out too small
+ * says so instead of producing an unexplained dark patch.
+ */
+export const BIN_BUDGET = 1_400_000;
+/** Floor per cascade, so a one-cascade or tiny-w₀ configuration is not degenerate. */
+export const MIN_BLOCKS = 64;
+
+/**
+ * How many bin blocks each cascade's pool holds, given the probe slot counts.
+ *
+ * Capped by `probeCapacity` because a block no probe slot can ever claim is
+ * pure waste, and floored by `MIN_BLOCKS` so the arithmetic cannot produce a
+ * pool of one. Lives here rather than in `srcDeposit.js` because it is a
+ * property of the HIERARCHY — cascade count and w₀ — and this file is the one
+ * definition of that (a second place that computes bins per cascade is the leak
+ * this module's header warns about).
+ */
+export function blockCapacities(probeCapacities, w0 = W0, budget = BIN_BUDGET) {
+  const perCascade = Math.max(1, Math.floor(budget / Math.max(1, probeCapacities.length)));
+  return probeCapacities.map((slots, cascade) => Math.min(
+    slots,
+    Math.max(MIN_BLOCKS, Math.floor(perCascade / binCount(cascade, w0))),
+  ));
+}
+
+/**
  * Probe spacing at cascade `i`, LOD `lod`: s₀·2^i·2^lod.
  *
  * Spacing doubles per cascade (probes ÷4 on a 2D surface manifold, which is

@@ -80,6 +80,7 @@ import {
   rayDirection,
 } from "./srcMathTsl.js";
 import {
+  PROBE_BLOCK,
   PROBE_PARENT,
   PROBE_WORDS,
   SLOT_EMPTY,
@@ -109,27 +110,40 @@ export const STAT_CLAMPED = 3;   // deposits whose radiance hit the Lmax ceiling
 export const STAT_MAXL = 4;      // max observed radiance, in DEPOSIT_F fixed point
 export const STAT_TSUM = 5;      // hit-distance sum, 1/1024 m
 export const STAT_TMAX = 6;
+/**
+ * Scatters dropped because the probe holds no bin block.
+ *
+ * The other half of `COUNTER_NOBLOCK`: that one counts PROBES born without
+ * bins, this one counts the DEPOSITS they then failed to make, which is the
+ * number that says how much light the shortfall actually cost. Both are zero
+ * whenever the pool is big enough, and the gate asserts it.
+ */
+export const STAT_NOBLOCK = 7;
 export const STAT_WORDS = 8;
 const T_FIXED = 1024;
 
 /**
- * The bin accumulators and the resolved payload, sized from a probe store.
+ * The bin accumulators and the resolved payload, sized from a probe store's
+ * BLOCK POOL.
  *
- * ══ ADDRESSED BY PROBE INDEX, WHICH IS A KNOWN LIMIT ═══════════════════════
+ * ══ ADDRESSED BY CLAIMED BLOCK, NOT BY PROBE SLOT ══════════════════════════
  *
- * A bin's slot is `binBase[cascade] + localProbeIndex · binCount(cascade) + morton`
- * — direct, no indirection, and sized by probe CAPACITY rather than by live
- * probes. §4.2's design says "only cascade-live slots", which needs a claimed
- * bin-block per probe (`PROBE_SPARE` is the reserved word for it). That
- * indirection is not built here, and the reason is worth stating rather than
- * discovering: it has to be claimed and released on the probe's lifetime, which
- * is Phase 3/4 machinery, and unit 3 is about whether the scatter is CORRECT.
+ * A bin's slot is `binBase[cascade] + block · binCount(cascade) + morton`,
+ * where `block` is what the probe claimed at creation (`PROBE_BLOCK`) and the
+ * pool lives in `createSrcProbeStore` — see its header for why the pool shares
+ * the probe free stack rather than owning buffers of its own.
  *
- * The cost of not having it is real and bounded, so it is asserted rather than
- * hoped for: at the default 16,384 c0 probes the accumulators are ~73 MB, and
- * `maxStorageBufferBindingSize` is 128 MiB on every device we ship to. Past
- * roughly 32k c0 probes a single buffer stops fitting, and the constructor says
- * so by name instead of failing inside three with a binding error.
+ * The previous scheme indexed by the probe's own slot, which sized the
+ * accumulators off `expectedC0Probes` — a deliberate over-estimate. §12.16's
+ * gate measured the consequence: **0.24% of allocated bins were ever sampled**,
+ * 127 MB at the engine default, and 604 MB at a half-res 1080p gbuffer, which
+ * is five times the 128 MiB binding limit. The claim is therefore not a
+ * ceiling-raiser bought with complexity; it is a straight reduction that also
+ * removes a resolution at which the constructor used to throw.
+ *
+ * The throw stays as a backstop. It is unreachable through `BIN_BUDGET` alone
+ * now, which is the point — an assertion that has become impossible to trip by
+ * accident is cheaper to keep than to re-derive later.
  */
 export function createSrcBinStore(store, { w0 = W0, maxBytes = 128 * 1024 * 1024 } = {}) {
   const cascades = [];
@@ -141,10 +155,11 @@ export function createSrcBinStore(store, { w0 = W0, maxBytes = 128 * 1024 * 1024
       bins,
       width: binGridWidth(c.cascade, w0),
       binBase: binTotal,
+      blockCapacity: c.blockCapacity,
       probeBase: c.probeBase,
       probeCapacity: c.probeCapacity,
     });
-    binTotal += bins * c.probeCapacity;
+    binTotal += bins * c.blockCapacity;
   }
   const scratchBytes = binTotal * BIN_WORDS * 4;
   const payloadBytes = binTotal * PAYLOAD_WORDS * 4;
@@ -154,8 +169,7 @@ export function createSrcBinStore(store, { w0 = W0, maxBytes = 128 * 1024 * 1024
       `${(scratchBytes / 1048576).toFixed(0)}MB of scratch and ` +
       `${(payloadBytes / 1048576).toFixed(0)}MB of payload, past the ` +
       `${(maxBytes / 1048576).toFixed(0)}MB storage-buffer binding limit — ` +
-      "bins are addressed by probe CAPACITY here, so this needs the per-probe " +
-      "bin-block claim §4.2 describes (plan §12.16), not a bigger buffer",
+      "lower srcConfig's BIN_BUDGET, which is what sizes the block pool",
     );
   }
 
@@ -218,11 +232,23 @@ export function createSrcDepositFrame(store, bins, {
   const passes = [];
 
   // ── clear ─────────────────────────────────────────────────────────────────
-  // Every bin, every frame. §4.2's "cleared by slot on claim" is the version
-  // that comes with the bin-block indirection; without it there is no claim to
-  // hang the clear on, and a stale bin is worse than a wasted clear — it is last
-  // frame's radiance in this frame's probe, which is a temporal artifact that
-  // looks exactly like a history bug.
+  // Every allocated bin, every frame — and it STAYS that way now that blocks
+  // are claimed, which is worth stating because §12.18.3 predicted otherwise.
+  //
+  // The plan expected the claiming thread's own zeroing to delete this pass
+  // ("a freshly claimed block must be zeroed before the first deposit lands in
+  // it"). That is true and it is not sufficient: these accumulators are a
+  // SINGLE FRAME's estimate, so they need zeroing on every frame a probe
+  // survives, not only on the frame it was born. Claim-time zeroing would be
+  // correct for a persistent accumulator and this is not one — Phase 4's
+  // temporal blend belongs on the RESOLVED payload, where an EMA smooths values
+  // rather than sums.
+  //
+  // What the claim actually buys here is that the buffer is 2.6× smaller
+  // (3.67 M bins → 1.40 M at the engine default), so the pass costs 2.6× less
+  // for the same reason everything else does. The claiming thread does not zero
+  // its block either, and does not need to: compaction runs three dispatches
+  // before this, so every block claimed this frame is cleared by it anyway.
   passes.push(Fn(() => {
     const i = instanceIndex.toVar();
     const b = i.mul(BIN_WORDS).toVar();
@@ -269,6 +295,20 @@ export function createSrcDepositFrame(store, bins, {
         up.assign(probeTable.element(prev.mul(PROBE_WORDS).add(PROBE_PARENT)));
       });
       chain.push(up);
+    }
+
+    // The chain's BIN BLOCKS, read here for the same reason the chain itself is
+    // hoisted: a block is a property of the probe, not of the ray, so reading
+    // it inside the ray loop would be N dependent loads per ray for a value
+    // that cannot change. `SLOT_EMPTY` covers both "no probe" and "probe with
+    // no block", so the scatter below tests one condition instead of two.
+    const blocks = [];
+    for (let c = 0; c < N; c++) {
+      const blk = uint(SLOT_EMPTY).toVar();
+      If(chain[c].notEqual(uint(SLOT_EMPTY)), () => {
+        blk.assign(probeTable.element(chain[c].mul(PROBE_WORDS).add(PROBE_BLOCK)));
+      });
+      blocks.push(blk);
     }
 
     for (let k = 0; k < raysPerPixel; k++) {
@@ -318,13 +358,20 @@ export function createSrcDepositFrame(store, bins, {
       // SHAPE at every cascade, so this could not be a dynamic loop even if the
       // divergence were free.
       for (let c = 0; c < N; c++) {
-        const probe = chain[c];
+        const blk = blocks[c];
         const info = bins.cascades[c];
-        If(probe.notEqual(uint(SLOT_EMPTY)).and(int(c).lessThanEqual(own)), () => {
+        // A probe that failed to claim a block has NOWHERE to put this, and
+        // "nowhere" is dropped-and-counted rather than redirected: writing it
+        // into block 0 would corrupt the bins of a probe that is working.
+        If(blk.equal(uint(SLOT_EMPTY)).and(chain[c].notEqual(uint(SLOT_EMPTY)))
+          .and(int(c).lessThanEqual(own)), () => {
+          atomicAdd(stats.element(uint(STAT_NOBLOCK)), uint(1));
+        });
+        If(blk.notEqual(uint(SLOT_EMPTY)).and(int(c).lessThanEqual(own)), () => {
           const b = dirToBin(dir, info.width).toVar();
           const m = binMorton(b.x, b.y).toVar();
           const slot = uint(info.binBase)
-            .add(probe.sub(uint(info.probeBase)).mul(uint(info.bins)))
+            .add(blk.mul(uint(info.bins)))
             .add(m)
             .mul(BIN_WORDS)
             .toVar();
@@ -384,7 +431,7 @@ export function createSrcDepositFrame(store, bins, {
     async readStats(renderer) {
       const allocated = !!renderer?.backend?.get?.(stats.value)?.buffer;
       if (!allocated) {
-        return { dispatched: false, rays: 0, hits: 0, deposits: 0, clamped: 0 };
+        return { dispatched: false, rays: 0, hits: 0, deposits: 0, clamped: 0, noBlock: 0 };
       }
       const v = new Uint32Array(await renderer.getArrayBufferAsync(stats.value));
       const rays = v[STAT_RAYS] >>> 0;
@@ -395,6 +442,9 @@ export function createSrcDepositFrame(store, bins, {
         hits,
         deposits: v[STAT_DEPOSITS] >>> 0,
         clamped: v[STAT_CLAMPED] >>> 0,
+        // Deposits the block pool refused. Zero unless BIN_BUDGET is short for
+        // the scene — see STAT_NOBLOCK and its probe-side twin.
+        noBlock: v[STAT_NOBLOCK] >>> 0,
         hitRate: rays > 0 ? hits / rays : 0,
         // Deposits per ray. Bounded by the cascade count and equal to it only
         // when every ray escapes; a value near 1 means almost everything is
