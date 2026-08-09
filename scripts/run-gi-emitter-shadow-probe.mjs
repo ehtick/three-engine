@@ -225,10 +225,14 @@ const result = await page.evaluate(async ({ hatch, quality, steps, slab, sunOn, 
   }
 
   const gi = engine.createEntity({ name: "GI Emissive Probe" });
-  gi.addComponent("global-illumination", {
-    autoFit: true, quality, emissiveShadows: true,
-    ...(profileOn ? { rayHitProfiling: true } : {}),
-  });
+  // ONE PROPERTY on the component. `emissiveShadows` is the feature this probe
+  // MEASURES and no preset turns it on (it is a named component of the
+  // emissive-projectile frame cost), so it is forced through the measurement
+  // hatch — without it the emitter-shadow targets are never built and the
+  // readback below fails on an undefined texture rather than a wrong number.
+  globalThis.__giConfigOverride = { emissiveShadows: true };
+  if (profileOn) globalThis.__giRayHitProfiling = true;
+  gi.addComponent("global-illumination", { quality });
   const system = engine.modules.get("gi").system;
   const deadline = performance.now() + 90_000;
   let screen = null;

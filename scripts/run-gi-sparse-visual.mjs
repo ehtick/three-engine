@@ -84,13 +84,10 @@ const capture = async (sparse, tag) => {
     engine.scene.add(lamp);
 
     const gi = engine.createEntity({ name: "GI" });
-    gi.addComponent("global-illumination", {
-      autoFit: true,
-      quality: "high",
-      intensity: 1,
-      // THE instrument: raymarch of the field itself.
-      debugProbes: "sdf",
-    });
+    // THE instrument: raymarch of the field itself. It is a debug VIEW, not a
+    // lighting property, so it lives on a global now (giConfig's giDebugView).
+    globalThis.__giDebugView = "sdf";
+    gi.addComponent("global-illumination", { quality: "high" });
   }, sparse);
 
   // Wait for the build AND the async SDF bakes to land.

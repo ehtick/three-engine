@@ -192,19 +192,25 @@
 
         await enableEngineModule(engine, "gi");
         const gi = engine.createEntity({ name: "GI" });
-        const giComp = gi.addComponent("global-illumination", {
-          autoFit: true,
-          quality: "medium",
-          reflections: false,
-          exactReflections: false,
-          // AO OFF. The obscurance ladder in `createGiResolve` is a SEPARATE
-          // screen-space effect that also darkens corners — leaving it on would
-          // put its contribution in the same frame as SRC's and make the picture
-          // unattributable, which is the one thing a visual check must not be.
-          ao: false,
-          skyIntensity: 0,
-          skyColor: "#ffffff",
-        });
+        // ONE PROPERTY. Reflections, AO and the volume are derived from the
+        // preset now — "medium" has reflections and AO off, which is what this
+        // probe needs anyway: the obscurance ladder in `createGiResolve` is a
+        // SEPARATE screen-space effect that also darkens corners, and leaving
+        // it on would put its contribution in the same frame as SRC's and make
+        // the picture unattributable, which is the one thing a visual check
+        // must not be.
+        gi.addComponent("global-illumination", { quality: "medium" });
+        // SKY IS THE SCENE'S ENVIRONMENT NOW (giConfig's `sceneSkyRadiance`).
+        // A 1x1 float texture is a uniform environment of exactly the radiance
+        // asked for — no HDRI to decode, and analytically known, which is what
+        // makes `peak <= pi * sky` a real ceiling rather than a tolerance.
+        const skyTex = new THREE.DataTexture(
+          new Float32Array([1, 1, 1, 1]), 1, 1, THREE.RGBAFormat, THREE.FloatType,
+        );
+        skyTex.needsUpdate = true;
+        engine.scene.environment = skyTex;
+        const setSky = (intensity) => { engine.scene.environmentIntensity = intensity; };
+        setSky(0);
         const setProp = (comp, key, value) => {
           if (typeof comp.setProp === "function") comp.setProp(key, value);
           else comp.props[key] = value;
@@ -274,7 +280,7 @@
         say(`cornell box, ${W}x${H}, sky ${SKY}, src ${globalThis.__giSrcProbes ? "ON" : "OFF"}`);
         const shots = [];
 
-        setProp(giComp, "skyIntensity", 0);
+        setSky(0);
         await settle(400);
         shots.push(await shoot("direct"));
 
@@ -286,7 +292,7 @@
         // in the middle of the frame as a bright quad and invite exactly the
         // wrong reading. Hidden for this arm only.
         lamp.visible = false;
-        setProp(giComp, "skyIntensity", SKY);
+        setSky(SKY);
         await settle(600);
         shots.push(await shoot("gi"));
 

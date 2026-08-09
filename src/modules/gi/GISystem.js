@@ -29,6 +29,7 @@
 import * as THREE from "three/webgpu";
 import { Fn, If, cameraPosition, cos, float, fract, mix, normalWorld, positionWorld, renderGroup, screenCoordinate, screenUV, select, sin, smoothstep, texture, uniform, uniformArray, vec2, vec3, vec4 } from "three/tsl";
 import { GI_BOOT_AMBIENT_MAX_TICKS, bootAmbientStep } from "./bootAmbient.js";
+import { giDebugView, resolveGiConfig, sceneSkyRadiance } from "./giConfig.js";
 import { blitBvhAtlasTiles, createGiBvhReflect, createGiBvhTarget, createGiEmitterShadowPass, createGiGBuffer, createGiLightShadowFilterPass, createGiLightShadowHistoryPass, createGiLightShadowPass, createGiLightShadowWidePass, createGiResolve, createGiTargets, renderGiGBuffer } from "./giScreen.js";
 import { resolveMaterialSurface, serializeMeshForBake } from "./voxelizeOnce.js";
 import { createSrcVolume } from "./srcVolume.js";
@@ -462,6 +463,16 @@ const QUALITY_BUDGETS = {
 };
 const QUALITY_TIERS = new Set(["low", "medium", "high", "ultra"]);
 
+/**
+ * The volume used when auto-fit finds no geometry to fit — an empty scene.
+ *
+ * Not a setting: the old `sizeX/sizeY/sizeZ` properties are gone and auto-fit
+ * is unconditional, so nothing else in the module needs a world size. It exists
+ * so that a GI component added before any geometry builds something coherent
+ * instead of a NaN box, and it is replaced the moment a mesh appears.
+ */
+const FALLBACK_VOLUME = { x: 40, y: 12, z: 40 };
+
 // Per-probe temporal EMA toward each frame's freshly integrated irradiance
 // (createProbeIrradiance). 1 = off. Geometry is static and only light moves, so
 // this changes NOTHING about a settled image — it only stops the probe lattice
@@ -687,10 +698,33 @@ export class GISystem {
     ];
   }
 
+  /**
+   * THE SETTLED CONFIGURATION — what every consumer in this file reads instead
+   * of `component.props`.
+   *
+   * The component declares one property (`quality`); `resolveGiConfig` turns it
+   * into the props-shaped object the rest of this file was already written
+   * against, so the collapse changed WHICH object is read and not what anybody
+   * does with it. See `giConfig.js` for why there is only one knob.
+   *
+   * Cached on the quality string rather than rebuilt per access: this is read
+   * from `#tick` and `#applyLiveProps`, i.e. every frame, and the object is
+   * frozen so a cached reference cannot be scribbled on.
+   */
+  get config() {
+    const quality = this.component?.props?.quality;
+    if (this._cfg === undefined || this._cfgKey !== quality) {
+      this._cfgKey = quality;
+      this._cfg = resolveGiConfig(this.component?.props);
+    }
+    return this._cfg;
+  }
+
   /** One active component at a time (Environment convention: last wins). */
   attach(component) {
     if (this.component === component) return;
     this.component = component;
+    this._cfg = undefined;
     this.requestRebuild();
   }
 
@@ -701,79 +735,56 @@ export class GISystem {
   }
 
   /**
-   * THIS LIST AND #applyLiveProps MUST AGREE. A key that is in neither this
-   * list nor #structuralSignature is written to the props object and then does
-   * NOTHING — no uniform write, no rebuild — which is a knob that looks alive
-   * in the Inspector and is dead in the scene. `aoStrength`/`aoRadius` were
-   * exactly that from the day AO shipped: #applyLiveProps has always written
-   * their uniforms correctly (see the bottom of it) and two comments in this
-   * file called them live, but nothing ever CALLED it for those keys, so
-   * dragging AO Strength did nothing until an unrelated edit or a rebuild
-   * happened to run a live pass. Fixed 2026-08-07.
+   * A property changed. There is exactly ONE that can — `quality` — plus the
+   * component's own `enabled`.
    *
-   * Audited at the same time — the rest of the props are accounted for:
-   * everything else #applyLiveProps writes (intensity, bounce, bleedSaturation,
-   * temporalBlend, probeSmoothing, skyColor, skyIntensity) is routed here;
-   * `resolveScale` and the two pixel budgets are re-read every frame by
-   * #syncScreenResolveSize; `bootAmbient` is re-read every frame in #update and
-   * has its own no-op branch below (explicit, rather than relying on the no-op
-   * `else`); `debugProbes` has a branch too; and the remainder are in
-   * #structuralSignature. If you add a prop, it belongs to exactly one of those
-   * four places.
+   * This method used to route 27 keys into four buckets (live uniforms, the
+   * debug view, read-on-the-fly, and a structural rebuild) and carried a note
+   * saying "if you add a prop, it belongs to exactly one of those four places".
+   * The collapse to a single quality preset (`giConfig.js`) is what removed the
+   * bucketing problem rather than solving it again: a preset change is
+   * structural by definition — it moves cell budgets, probe budgets, trace step
+   * ladders and the ray-hit mode, all of which are baked into compiled graphs
+   * as constants — so it rebuilds.
+   *
+   * The rebuild is still gated on the SIGNATURE actually changing, because
+   * editor autosave rewrites props with unchanged values and a no-op write must
+   * not rebuild the module.
    */
   onComponentProp(component, key) {
     if (this.component !== component) return;
-    if (
-      key === "intensity" ||
-      key === "bounce" ||
-      key === "bleedSaturation" ||
-      key === "temporalBlend" ||
-      key === "probeSmoothing" ||
-      key === "skyColor" ||
-      key === "skyIntensity" ||
-      // The AO uniforms. `ao` ITSELF is structural (off compiles the obscurance
-      // block out of the resolve entirely) and stays in #structuralSignature —
-      // only its two scalars are live.
-      key === "aoStrength" ||
-      key === "aoRadius" ||
-      key === "enabled"
-    ) {
+    // Drop the memoized config first: everything below reads `this.config`, and
+    // a stale cache here would make a preset change apply to nothing.
+    this._cfg = undefined;
+    if (key === "enabled") {
       this.#applyLiveProps();
-    } else if (key === "debugProbes") {
-      this.#applyDebugVisibility();
-    } else if (key === "bootAmbient") {
-      // read on the fly, nothing to do: re-read every tick by the boot-ambient
-      // block in #update — including as a live OFF switch, so unticking it fades
-      // the hemisphere out immediately rather than waiting for a field that may
-      // not be coming.
-    } else {
-      // Structural (size/resolution/cascade shape): grids and dispatch sizes
-      // are baked into the compute graphs as constants — rebuild. But ONLY
-      // on a real value change: editor autosave re-writes props with
-      // unchanged values, and a no-op write must not trigger a rebuild.
-      const signature = this.#structuralSignature(component);
-      if (signature !== this._structuralSig) {
-        this._structuralSig = signature;
-        this.requestRebuild();
-      }
+      return;
+    }
+    const signature = this.#structuralSignature(component);
+    if (signature !== this._structuralSig) {
+      this._structuralSig = signature;
+      this.requestRebuild();
     }
   }
 
+
   #structuralSignature(component) {
-    const p = component.props;
+    // READS THE SETTLED CONFIG, NOT THE COMPONENT. With one authored property
+    // the signature is a function of `quality` alone — but it is still written
+    // out field by field rather than shortened to `[cfg.quality]`, because the
+    // fields are what the compiled graphs actually bake in, and the day a tier
+    // starts varying one of them the signature has to notice by itself.
+    // (`sizeX/Y/Z`, `voxelSize`, `probeSpacing`, `cascadeCount`, `c0DirRes`,
+    // `hitLighting` and `backend` used to sit here; the first five are derived
+    // from the quality budget now that auto-fit is unconditional, and the last
+    // two were never declared properties at all.)
+    void component;
+    const p = this.config;
     return JSON.stringify([
-      p.sizeX,
-      p.sizeY,
-      p.sizeZ,
-      p.voxelSize,
-      p.probeSpacing,
-      p.cascadeCount,
-      p.c0DirRes,
       p.reflections,
       p.emissiveShadows,
       p.autoFit,
       p.quality,
-      p.hitLighting,
       // `exactReflections` decides whether `light.bvhReflectTexture` /
       // `bvhReflectColorTexture` are set, and giLight compiles a DIFFERENT
       // mirror path depending on that — so it can only change on a REBUILD.
@@ -995,7 +1006,7 @@ export class GISystem {
     aabb.getCenter(center);
     const span = new THREE.Vector3();
     aabb.getSize(span);
-    const budget = QUALITY_BUDGETS[qualityTierOf(this.component?.props)];
+    const budget = QUALITY_BUDGETS[qualityTierOf(this.config)];
     // Spacing and margin depend on each other, so solve it: pick a spacing
     // from the content, snap the box onto that lattice, and step the spacing
     // up a rung if the snapped box would exceed the per-axis cap.
@@ -1118,8 +1129,19 @@ export class GISystem {
     // Gate on that, and — because no predicate is worth trusting alone here —
     // cap the whole thing in wall-clock ticks so "never fades" is not a
     // reachable state no matter what the field does.
+    // ── THE SKY, RE-READ EVERY FRAME ─────────────────────────────────────
+    // It comes from `scene.environment` + `environmentIntensity` now, and
+    // NOTHING NOTIFIES GI when those change: the scene owns them, Scene
+    // Settings and the HDRI Environment component write them directly, and
+    // there is no property change to hook. So it is polled — two field reads
+    // and a colour write, next to the boot-ambient poll that is here for the
+    // same reason. Without this the sky is only sampled at build time, which
+    // reads on screen as "the environment slider does nothing".
+    if (this.state?.skyRadiance) {
+      sceneSkyRadiance(this.engine?.scene, this.state.skyRadiance.value);
+    }
     const bootStep = bootAmbientStep({
-      enabled: this.component?.props?.bootAmbient === true
+      enabled: this.config.bootAmbient === true
         && globalThis.__giNoBootAmbient !== true,
       hasState: !!this.state,
       hasLight: !!this._bootAmbient,
@@ -2702,7 +2724,7 @@ export class GISystem {
       if (srcProbesEnabled()) {
         try {
           srcProbes = createSrcProbeSystem({
-            gbuffer, width, height, props: this.component?.props ?? null, volume, sky: skyRadiance,
+            gbuffer, width, height, props: this.config, volume, sky: skyRadiance,
           });
           console.log(describeSrcProbeSystem(srcProbes));
         } catch (error) {
@@ -2989,7 +3011,7 @@ export class GISystem {
         // voxelizer and the light tree — a gizmo that voxelized would occlude
         // the field it is drawing.
         this.engine.scene.add(srcProbes.gizmos.group);
-        srcProbes.gizmos.setVisible(this.component?.props?.debugProbes === "src-probes");
+        srcProbes.gizmos.setVisible(giDebugView() === "src-probes");
       }
       return { gbuffer, srcProbes, resolve, lightShadowPass, lightShadowFilterPass, lightShadowWidePass, lightShadowWidePass2, lightShadowHistoryPass, lightShadowPostPass, emitterShadowPass, emitterShadowFilterPass, emitterShadowHistoryPass, emitterShadowPostPass, targets, width, height, shadowWidth: shadowW, shadowHeight: shadowH, emitterShadowWidth: emitterW, emitterShadowHeight: emitterH, ...inputs };
     } catch (error) {
@@ -3409,8 +3431,9 @@ export class GISystem {
    * flipped live) — see `bvhReflectTexture`'s doc comment in giLight.js.
    */
   #bvhReflectionsEnabled() {
-    const props = this.component?.props;
-    if (!props || props.reflections === false) return false;
+    if (!this.component) return false;
+    const props = this.config;
+    if (props.reflections === false) return false;
     if (globalThis.__giNoBvhReflections === true) return false;
     // Exact BVH is a high/ultra feature. Presets are an actual performance
     // contract: a stale advanced flag stored by a previous high-quality edit
@@ -3580,7 +3603,7 @@ export class GISystem {
   #screenResolveSize() {
     const renderer = this.engine.renderer;
     const size = renderer.getDrawingBufferSize(new THREE.Vector2());
-    const scale = this.component?.props.resolveScale ?? 0.5;
+    const scale = this.config.resolveScale ?? 0.5;
     let width = Math.max(16, Math.round(size.x * scale));
     let height = Math.max(16, Math.round(size.y * scale));
     // TOTAL-PIXEL budget, not a per-axis clamp. Every screen-space GI pass
@@ -3595,7 +3618,7 @@ export class GISystem {
     // ceiling. `resolveMaxPixels` prop / `__giResolveMaxPixels` override.
     const budget =
       Number(globalThis.__giResolveMaxPixels) ||
-      this.component?.props.resolveMaxPixels ||
+      this.config.resolveMaxPixels ||
       1_600_000;
     const px = width * height;
     if (px > budget) {
@@ -3620,7 +3643,7 @@ export class GISystem {
   #lightShadowSize(resolve) {
     const budget =
       Number(globalThis.__giShadowResolvePixels) ||
-      this.component?.props.lightShadowMaxPixels ||
+      this.config.lightShadowMaxPixels ||
       1_900_000;
     let { width, height } = resolve;
     const px = width * height;
@@ -3776,7 +3799,7 @@ export class GISystem {
     const engine = this.engine;
     if (!component || !engine.scene) return;
 
-    const props = component.props;
+    const props = this.config;
     const rayHitConfig = resolveRayHitConfig(props);
     const meshes = this.#collectMeshes();
 
@@ -3785,9 +3808,20 @@ export class GISystem {
     // probe densities are derived from fixed budgets so any world size stays
     // performant (bigger world → coarser field, same cost).
     const center = new THREE.Vector3();
-    let sizeX = props.sizeX;
-    let sizeY = props.sizeY;
-    let sizeZ = props.sizeZ;
+    // THE DEGENERATE FALLBACK, and it is now the only reason a size literal
+    // exists in this module. Auto-fit is unconditional (giConfig's CONSTANT
+    // block), so `sceneAabb` is null only when there is no GI-relevant geometry
+    // at all — an empty scene, or one whose every mesh is excluded. The manual
+    // `sizeX/sizeY/sizeZ` properties that used to supply these are gone; left
+    // undefined they would make `half` NaN and the bounds with it, which is a
+    // silent way to build a volume that contains nothing.
+    // `??`, not a bare constant: the manual-volume path is unreachable from a
+    // scene (auto-fit is a constant `true`) but stays reachable from the
+    // measurement hatch, which `run-gi-bvh-reflect` needs — it sizes an 8x7x8
+    // volume by hand to guarantee the lamp is inside it.
+    let sizeX = props.sizeX ?? FALLBACK_VOLUME.x;
+    let sizeY = props.sizeY ?? FALLBACK_VOLUME.y;
+    let sizeZ = props.sizeZ ?? FALLBACK_VOLUME.z;
     const autoFit = props.autoFit === true;
     // Entity-authored bounds first; whole-scene AABB only as a fallback for
     // a component sitting on a bare entity in an unstructured scene.
@@ -3809,6 +3843,9 @@ export class GISystem {
       ? { min: fit.min.clone(), max: fit.max.clone() }
       : { min: center.clone().sub(half), max: center.clone().add(half) };
 
+    // Both are overwritten from the quality budget in the auto-fit branch
+    // below; these are the same degenerate-scene fallbacks the old
+    // `voxelSize`/`probeSpacing` properties used to default to.
     let voxelSize = Math.max(0.05, props.voxelSize || 0.3);
     let probeSpacing = Math.max(0.25, props.probeSpacing || 1.25);
     let c0Grid;
@@ -4971,40 +5008,43 @@ export class GISystem {
   #applyLiveProps() {
     const state = this.state;
     if (!state) return;
-    state.light.intensityUniform.value = this.component?.props.intensity ?? 1;
+    const cfg = this.config;
+    state.light.intensityUniform.value = cfg.intensity ?? 1;
     // Hard-clamped to [0,1]: bounce is "how much secondary energy survives
     // each pass", and any in-loop gain above 1 makes the feedback series
     // diverge (white-out) in enclosed scenes — old saved props may still
     // carry values up to 4 from the earlier schema. Artistic exaggeration
     // belongs to `intensity`, which sits OUTSIDE the loop.
-    state.bounceGain.value = Math.min(1, Math.max(0, this.component?.props.bounce ?? 1));
+    state.bounceGain.value = Math.min(1, Math.max(0, cfg.bounce ?? 1));
     if (state.bleedSaturation) {
-      state.bleedSaturation.value = Math.min(1, Math.max(0, this.component?.props.bleedSaturation ?? 1));
+      state.bleedSaturation.value = Math.min(1, Math.max(0, cfg.bleedSaturation ?? 1));
     }
-    state.temporalBlend.value = Math.min(1, Math.max(0.02, this.component?.props.temporalBlend ?? 0.25));
-    state.probeSmoothing.value = clampProbeSmoothing(this.component?.props.probeSmoothing);
-    // Sky radiance = colour x intensity, in the same linear units as an
-    // emitter's. Default intensity 0 means "no sky", which is byte-identical
-    // to the behaviour before this existed — every sealed-room baseline is
-    // unaffected until someone dials it up.
+    state.temporalBlend.value = Math.min(1, Math.max(0.02, cfg.temporalBlend ?? 0.25));
+    state.probeSmoothing.value = clampProbeSmoothing(cfg.probeSmoothing);
+    // SKY RADIANCE COMES FROM THE SCENE, NOT FROM GI. `scene.environment` +
+    // `environmentIntensity` — three's own image-based light, which Scene
+    // Settings and the HDRI Environment component already write. GI used to own
+    // a second, competing pair of properties (`skyColor`/`skyIntensity`); it
+    // reads the scene's instead, which is how it got to one authored property.
+    //
+    // No environment means exactly zero, which is what `skyIntensity: 0`
+    // defaulted to — so no existing scene changes brightness across this.
+    // Re-read every frame, so dragging the environment intensity is live.
     if (state.skyRadiance) {
-      const props = this.component?.props;
-      const intensity = Math.max(0, props?.skyIntensity ?? 0);
-      state.skyRadiance.value.set(props?.skyColor ?? "#ffffff").multiplyScalar(intensity);
+      sceneSkyRadiance(this.engine?.scene, state.skyRadiance.value);
     }
     // Indirect-AO knobs (giScreen's obscurance ladder) — live uniforms; the
     // resolve runs every frame (even in idle sleep), so edits land next frame.
     if (state.screen?.ao) {
-      const props = this.component?.props;
-      state.screen.ao.strength.value = Math.min(1, Math.max(0, props?.aoStrength ?? 0.6));
-      state.screen.ao.radius.value = Math.min(3, Math.max(0.1, props?.aoRadius ?? 0.6));
+      state.screen.ao.strength.value = Math.min(1, Math.max(0, cfg.aoStrength ?? 0.6));
+      state.screen.ao.radius.value = Math.min(3, Math.max(0.1, cfg.aoRadius ?? 0.6));
     }
   }
 
   #applyDebugVisibility() {
     const state = this.state;
     if (!state) return;
-    const mode = this.component?.props.debugProbes ?? "off";
+    const mode = giDebugView();
     if (state.gizmos.sdfView) state.gizmos.sdfView.visible = mode === "sdf";
     if (state.gizmos.occView) state.gizmos.occView.visible = mode === "occupancy";
     // "src-probes" is selectable whether or not `__giSrcProbes` is on; with the
@@ -5147,7 +5187,7 @@ export class GISystem {
     // bright trinket, and the slots should go to the lamps that actually
     // light the scene.
     this._emitterInfos = [];
-    if (this.component?.props.emissiveShadows !== false) {
+    if (this.config.emissiveShadows !== false) {
       const scratch = new THREE.Vector3();
       const powerOf = (entry) => {
         const geometry = entry.mesh.geometry;
@@ -5700,7 +5740,12 @@ export class GISystem {
     } else {
       const center = new THREE.Vector3();
       component.entity.object3D.getWorldPosition(center);
-      if (center.distanceTo(state.center) > Math.max(0.5, (component.props.probeSpacing || 1.25) * 0.5)) {
+      // `autoFit` is a constant `true` now, so this branch is unreachable —
+      // kept because it is the whole manual-volume path and deleting it would
+      // be a second change riding along with the property collapse. The spacing
+      // it compares against is the fitted lattice's, read off the built state
+      // rather than off a property that no longer exists.
+      if (center.distanceTo(state.center) > Math.max(0.5, (state.probeSpacing || 1.25) * 0.5)) {
         this.requestRebuild();
         return;
       }

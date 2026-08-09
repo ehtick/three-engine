@@ -69,13 +69,11 @@ await page.evaluate(async ({ LEGACY }) => {
   console.log(`GI-HR knot tris: ${knot.geometry.index.count / 3}`);
 
   const giEntity = engine.createEntity({ name: "GI" });
-  giEntity.addComponent("global-illumination", {
-    autoFit: true,
-    quality: "high",
-    intensity: 1,
-    emissiveShadows: true,
-    reflections: true,
-  });
+  // ONE PROPERTY on the component. `emissiveShadows` is not something any
+  // preset turns on, so a probe that needs it forces it through the
+  // measurement hatch — see src/modules/gi/giConfig.js.
+  globalThis.__giConfigOverride = { emissiveShadows: true, reflections: true };
+  giEntity.addComponent("global-illumination", { quality: "high" });
   console.log("GI-HR scene ready");
 }, { LEGACY });
 

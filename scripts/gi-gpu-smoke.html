@@ -196,26 +196,44 @@
         engine.scene.add(camera);
         engine.camera = camera;
 
+        // ══ SKY IS THE SCENE'S ENVIRONMENT NOW, NOT A GI PROPERTY ══════════
+        //
+        // GI declares one property (`quality`) and reads its sky term off
+        // `scene.environment` + `scene.environmentIntensity`, three's own
+        // image-based light — see src/modules/gi/giConfig.js. A 1x1 float
+        // texture is a uniform environment, which is exactly what a harness
+        // wants: an analytically known sky radiance with no HDRI to decode.
+        const setSky = (intensity) => {
+          if (intensity > 0 && !engine.scene.environment) {
+            const tex = new THREE.DataTexture(
+              new Float32Array([1, 1, 1, 1]), 1, 1, THREE.RGBAFormat, THREE.FloatType,
+            );
+            tex.needsUpdate = true;
+            engine.scene.environment = tex;
+          }
+          engine.scene.environmentIntensity = intensity;
+        };
+        // `?sky=N` — zero keeps every pre-existing baseline byte-identical,
+        // which is why it is the shipping default.
+        setSky(skyArm);
+
+        // The src arm selects the PROBE GIZMO view, because that is the only
+        // way its vertex-stage storage read gets compiled and rendered at all —
+        // a gizmo material that never draws is a shader that was never
+        // validated, and the eye check would be the first thing to find out.
+        // A global rather than a property: the debug view cannot change the lit
+        // image, so it is a developer instrument (giConfig's `giDebugView`).
+        globalThis.__giDebugView = srcArm ? "src-probes" : (hybridMode ? "occupancy" : "off");
+
         const gi = engine.createEntity({ name: "GI Smoke" });
-        gi.addComponent("global-illumination", {
-          autoFit: true,
-          quality: "low",
-          // `?sky=N` — see the note by `skyArm`. Zero keeps every pre-existing
-          // baseline byte-identical, which is why it is the shipping default.
-          skyIntensity: skyArm,
-          cascadeCount: 2,
-          c0DirRes: 2,
-          reflections: false,
-          exactReflections: false,
-          ao: false,
-          // The src arm selects the PROBE GIZMO view, because that is the only
-          // way its vertex-stage storage read gets compiled and rendered at
-          // all — a gizmo material that never draws is a shader that was never
-          // validated, and the eye check would be the first thing to find out.
-          debugProbes: srcArm ? "src-probes" : (hybridMode ? "occupancy" : "off"),
-          rayHitMode,
-          rayHitProfiling: true,
-        });
+        // ONE PROPERTY. The volume, densities, reflections, AO and ray-hit mode
+        // are all derived from it now; the debug view moved to a global.
+        // `rayHitMode` and `rayHitProfiling` used to be passed as properties
+        // TOO, redundantly: the globals at the top of this file already carried
+        // them, and `resolveRayHitConfig` reads `__giRayHitMode` /
+        // `__giRayHitProfiling` FIRST, ahead of the properties. So dropping the
+        // properties changes nothing here — it removes the second copy.
+        gi.addComponent("global-illumination", { quality: "low" });
         engine.start();
 
         const deadline = performance.now() + 60_000;

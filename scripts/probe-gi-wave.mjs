@@ -115,7 +115,12 @@ await page.evaluate(async (meshCount) => {
 await page.evaluate((props) => {
   const e = globalThis.__engine.createEntity({ name: "GI" });
   globalThis.__waveStart = performance.now();
-  globalThis.__gi = e.addComponent("global-illumination", { autoFit: true, quality: "high", intensity: 1, ...props });
+  // `reflections`/`emissiveShadows` are no longer properties — they go through
+  // the measurement hatch (src/modules/gi/giConfig.js). `quality` still does.
+  globalThis.__giConfigOverride = {
+    reflections: props.reflections, emissiveShadows: props.emissiveShadows,
+  };
+  globalThis.__gi = e.addComponent("global-illumination", { quality: props.quality });
 }, {
   reflections: !process.env.NOREFL,
   emissiveShadows: !process.env.NOEMSH,

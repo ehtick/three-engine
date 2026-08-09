@@ -147,20 +147,25 @@ async function runArm(hatch) {
     // volume by hand guarantees it covers the floor through the lamp.
     const giEntity = engine.createEntity({ name: "GI" });
     giEntity.object3D.position.set(0, 2.6, 0);
-    giEntity.addComponent("global-illumination", {
+    // ONE PROPERTY on the component. Everything this probe FORCES — the manual
+    // volume, exact BVH reflections (a tier feature, on at ultra only), emitter
+    // shadows and the exaggerated intensity — goes through the measurement
+    // hatch, which is not an authored surface: see src/modules/gi/giConfig.js.
+    // (`hitLighting` went with it; nothing had read that property in a long
+    // time, it only ever appeared in the structural signature.)
+    globalThis.__giConfigOverride = {
       autoFit: false,
       sizeX: 8,
       sizeY: 7,
       sizeZ: 8,
       voxelSize: 0.08,
       probeSpacing: 0.5,
-      quality: "high",
       intensity: 4,
       emissiveShadows: true,
       reflections: true,
-      exactReflections: true, // opt-in — the default is now OFF (see GISystem #bvhReflectionsEnabled)
-      hitLighting: true,
-    });
+      exactReflections: true,
+    };
+    giEntity.addComponent("global-illumination", { quality: "high" });
     console.log("GI-BR scene ready");
   }, { hatch, v1: process.env.V1 === "1" && !hatch, v1light: process.env.V1LIGHT === "1" && !hatch });
 
