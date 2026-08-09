@@ -620,10 +620,57 @@ practice, and each is a trap the GPU phases can repeat verbatim:
    the estimator was fed invalid geometry and then blamed for the result (a spurious 30%). Jitter is
    now tangential, on the receiver's own plane.
 
-### 12.5 Next step
+### 12.5 The deletion sweep is BLOCKED on a §4.2 assumption that does not hold
 
 `srcTrace.js` is extracted (geometry-only: `{hit, t, position, normal, dynObj}` — the old
-`createOccupancySceneTrace` fused trace with field-sampling hit shading, which SRC replaces). All
-existing GI suites still pass. **The §5 deletion sweep + the GISystem rewrite are the next unit of
-work**, and they are one unit: the dense transport's removal and the SRC orchestrator's arrival are
-the same edit to the same 8,326-line file.
+`createOccupancySceneTrace` fused trace with field-sampling hit shading, which SRC replaces).
+
+The deletion sweep was then attempted and **reverted**, because dry-running it surfaced a hard
+dependency the plan assumed away. Recording it here so the next attempt starts from the real
+constraint rather than rediscovering it.
+
+**What was verified first (all good news):**
+
+- The delete cluster is genuinely self-contained. `slotRegistry`, `instanceGrid`, `sparseField`,
+  `surfaceCache{,Gpu,Light}` are reachable ONLY through `giField.js` and `GISystem.js`. No surviving
+  file imports any of them; `giScreen.js` and `giLight.js` never touch `volume` at all — they take
+  what they need as parameters. Deleting the ten files costs **−9,797 lines** (33,333 → 23,536).
+- `npx esbuild src/modules/gi/index.js --bundle --external:three*` is a 16s verification loop, and
+  because JS requires private names to be declared, it also catches calls to deleted `#methods`.
+  That is the right harness for this surgery.
+
+**The blocker.** `giField.js` cannot be deleted as a unit, because it owns `distanceTexture` — the
+composited **continuous** distance field — and two of its consumers are in the **surviving screen
+chain**, not in the transport:
+
+- `createShadowTrace` → `volume.createSoftShadowTrace`, which is `light.shadowTraceFn` (emitter
+  shadows at pixels) and the GI-traced light shadows in `#buildLightShadow`;
+- `createWidthProbeFn` → `volume.createWidthProbe`, the mid-field penumbra width term.
+
+Both take their **base** distance from `texture3D(distanceTexture, …)` (`giField.js:1034` and
+`:808`). §4.2 says this consumer "moves to `freeRadiusAtWorld` off the occupancy pyramid, which is
+already its fallback" — **it is not a fallback, it is a refinement**: under `killSdf` the code reads
+`dRaw.assign(dRaw.min(occField.freeRadiusAtWorld(...)))`, i.e. the oracle only *sharpens* a distance
+the SDF texture supplied.
+
+Why that matters rather than being a detail: the penumbra estimator is `min(k·d/t)` with
+closest-approach interpolation, which **needs a continuous d**. `freeRadiusAtWorld`'s near field
+measures distance to occupied VOXEL AABBs — a staircase of boxes. Swapping it in wholesale is
+exactly the failure the surrounding comments were written to fight ("dirty shadows", "squarish light
+changes", the fp16-not-u8 note explaining that distance error becomes penumbra error amplified by
+k/t).
+
+**So the sweep needs one preceding piece of work, with its own gate:** a `srcVolume.js` holding the
+world uniform bundle plus an occupancy-only `createSoftShadowTrace` / `createWidthProbe`, and a
+measured A/B of soft-shadow quality against the current composited-distance version before the
+distance field is allowed to die. That is a shadow-quality change, and it is separable from — and
+must land before — the transport deletion. Note this also means the composited distance field is
+**not** pure transport machinery, which is the assumption §5's "Delete" column encodes.
+
+Order for the next session:
+
+1. `srcVolume.js` + the soft-shadow A/B gate (above). Keep `giField.js` alive behind it.
+2. Then the §5 deletion + the GISystem rewrite as ONE edit — they are one unit, since the dense
+   transport's removal and the SRC orchestrator's arrival are the same edit to the same 8,326-line
+   file. Verify each step with the esbuild loop.
+3. Then Phase 1 (GPU probe population), diffed against `srcRef.js`'s mirror on a frozen frame.
