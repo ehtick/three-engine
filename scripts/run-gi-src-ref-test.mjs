@@ -82,6 +82,8 @@ import {
   octahedralUV,
   packProbeKey,
   preAverage,
+  R2_ALPHA1,
+  R2_ALPHA2,
   r2Point,
   rayDirection,
   resolveBin,
@@ -359,6 +361,51 @@ console.log("── R2 SEQUENCE ────────────────
     `R2 worst cell range ${worstSegment} vs random ${worstRandom} (mean occupancy 4)`);
   check("no contiguous R2 segment leaves a cell empty at 8x8", worstSegment <= 6,
     `worst range ${worstSegment}`);
+
+  // ── THE HIGH-INDEX ARM: the sequence must survive f32, because the GPU has
+  //    nothing else. The float form `fract(0.5 + alpha*n)` loses the fractional
+  //    part to the integer part as alpha*n grows — at plan §9's ~2M rays/frame
+  //    an f32 evaluation can express EIGHT distinct values, so the last
+  //    cascade's 2048 bins would be fed by eight azimuths. The f64 mirror never
+  //    sees it, which is precisely why it is gated here rather than left to the
+  //    GPU twin test to discover: this arm fails against the float form on the
+  //    CPU, in bare node, with no adapter in the loop.
+  //
+  //    The control is the SAME measurement at n = 0, so the arm cannot pass by
+  //    being loose — it asserts that starting two million indices in changes
+  //    nothing, which for an exact fixed-point recurrence is true by
+  //    construction and for a float one is catastrophically false.
+  {
+    const f32 = new Float32Array(1);
+    const asF32 = (v) => { f32[0] = v; return f32[0]; };
+    const floatFormF32 = (n) => {
+      const x = asF32(asF32(0.5) + asF32(asF32(R2_ALPHA1) * n));
+      const y = asF32(asF32(0.5) + asF32(asF32(R2_ALPHA2) * n));
+      return { x: x - Math.floor(x), y: y - Math.floor(y) };
+    };
+    const coverage = (gen, base) => {
+      const g = new Uint32Array(G * G);
+      for (let n = 0; n < N; n++) {
+        const p = gen(base + n);
+        g[Math.min(G - 1, Math.floor(p.y * G)) * G + Math.min(G - 1, Math.floor(p.x * G))]++;
+      }
+      return spread(g);
+    };
+    const HIGH = 2_000_000;
+    const near = coverage((n) => r2Point(n), 0);
+    const far = coverage((n) => r2Point(n), HIGH);
+    const farFloat = coverage(floatFormF32, HIGH);
+    check("R2 coverage at n=2e6 is identical to n=0 (fixed point does not decay)",
+      far.lo === near.lo && far.hi === near.hi,
+      `n=0 ${near.lo}..${near.hi} vs n=${HIGH} ${far.lo}..${far.hi}`);
+    check("R2 leaves no empty cell at n=2e6", far.lo > 0, `min occupancy ${far.lo}`);
+    // The CANARY. A gate that cannot fail proves nothing: this is the form the
+    // GPU would run if anyone re-derived the sequence in floats, measured with
+    // the shader's own precision.
+    check("CANARY: the f32 FLOAT form does collapse at n=2e6 (this is why fixed point)",
+      farFloat.lo === 0 && (farFloat.hi - farFloat.lo) > 4 * (far.hi - far.lo),
+      `float-f32 ${farFloat.lo}..${farFloat.hi} vs fixed ${far.lo}..${far.hi} (expected ${N / (G * G)})`);
+  }
 
   // Hemisphere fold: every direction must be in the normal's hemisphere and unit.
   let foldOk = true;

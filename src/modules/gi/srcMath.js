@@ -36,11 +36,21 @@ export function binCenterXY(i, j, w) {
   return { x: (i + 0.5) / (2 * w), y: (j + 0.5) / w };
 }
 
-/** (x, y) ∈ [0,1)² → unit direction. Equal-area by construction. */
+/**
+ * (x, y) ∈ [0,1)² → unit direction. Equal-area by construction.
+ *
+ * `r = sqrt((1−z)(1+z))` rather than the textbook `sqrt(1 − z²)`: near the
+ * poles `z·z` rounds to within an ulp of 1 and the subtraction cancels nearly
+ * every significant bit. The factored form has no cancellation (`1 − z` is
+ * exact for z ∈ [0.5, 2] and `1 + z` for the mirror), which matters little in
+ * f64 and a great deal in the f32 twin, where the twin gate measured the naive
+ * form at 1.3e-5 of absolute error against this one. Both files carry the same
+ * expression because they are one definition.
+ */
 export function decodeDir(x, y) {
   const phi = 2 * Math.PI * x;
   const z = 2 * y - 1;
-  const r = Math.sqrt(Math.max(0, 1 - z * z));
+  const r = Math.sqrt(Math.max(0, (1 - z) * (1 + z)));
   return [r * Math.cos(phi), r * Math.sin(phi), z];
 }
 
@@ -145,11 +155,60 @@ export const PLASTIC = 1.32471795724474602596;
 export const R2_ALPHA1 = 1 / PLASTIC;
 export const R2_ALPHA2 = 1 / (PLASTIC * PLASTIC);
 
-/** The n-th R2 point in [0,1)², offset by a per-frame `jitter` in [0,1)². */
+// ══ THE RECURRENCE IS 32-BIT FIXED POINT, AND THAT IS NOT AN OPTIMIZATION ═══
+//
+// Written the textbook way — `fract(0.5 + α·n)` in floats — this sequence
+// DISINTEGRATES on the GPU at the ray counts SRC actually runs. f32 carries 24
+// mantissa bits total, so once `α·n` is large the fractional part is what gets
+// truncated, and the sequence degenerates to a handful of repeating values:
+//
+//     n = 1,024        16384 distinct fractional values
+//     n = 65,536         256
+//     n = 500,000         32
+//     n = 2,000,000        8      ← plan §9's ~2M rays/frame
+//
+// Measured, not estimated. At 2M rays the last cascade's 2048 bins would be
+// fed by EIGHT azimuths; a 16×16-cell coverage histogram over that range goes
+// from a uniform 13..19 occupancy to 0..66, i.e. empty cells. This is exactly
+// the class of failure a CPU mirror in f64 cannot see — the mirror is fine at
+// every index, the shader is not, and the symptom on screen (banded, rotating
+// directional structure that gets worse the longer a frame's ray list is)
+// looks like a merge bug.
+//
+// So the CANONICAL form is the additive recurrence in u32 fixed point:
+// exact on both sides, wraps for free (WGSL u32 arithmetic is mod 2^32,
+// `Math.imul` is the same multiply), period 2^32 because both multipliers are
+// odd, and — measured against the f64 float form on the same coverage and
+// contiguous-segment arms — identical discrepancy. The float pair below is
+// DERIVED from it, so `r2Point` keeps its old meaning and every caller is
+// unchanged; the fixed-point words are what the GPU twin must match BIT FOR
+// BIT, which is why `r2PointFx` is exported separately and gated exactly.
+
+/** round(2^32 / ρ) — the R2 x multiplier in u32 fixed point. */
+export const R2_ALPHA1_FX = 3242174889 >>> 0;
+/** round(2^32 / ρ²) — the R2 y multiplier in u32 fixed point. */
+export const R2_ALPHA2_FX = 2447445414 >>> 0;
+/** The sequence's 0.5 start offset, in the same fixed point. */
+export const R2_HALF_FX = 0x80000000 >>> 0;
+/** u32 → [0,1). Exact in f64; the GPU twin loses the low 8 bits to f32. */
+export const R2_FX_TO_UNIT = 1 / 4294967296;
+
+/**
+ * The n-th R2 point as RAW u32 fixed point, offset by a per-frame jitter that
+ * is itself a u32 phase (not a float — a float jitter would re-import the
+ * precision problem at the one place it is cheapest to avoid).
+ */
+export function r2PointFx(n, jitterX = 0, jitterY = 0) {
+  return {
+    x: (R2_HALF_FX + Math.imul(R2_ALPHA1_FX, n) + jitterX) >>> 0,
+    y: (R2_HALF_FX + Math.imul(R2_ALPHA2_FX, n) + jitterY) >>> 0,
+  };
+}
+
+/** The n-th R2 point in [0,1)², offset by a per-frame u32 jitter phase. */
 export function r2Point(n, jitterX = 0, jitterY = 0) {
-  const x = 0.5 + R2_ALPHA1 * n + jitterX;
-  const y = 0.5 + R2_ALPHA2 * n + jitterY;
-  return { x: x - Math.floor(x), y: y - Math.floor(y) };
+  const fx = r2PointFx(n, jitterX, jitterY);
+  return { x: fx.x * R2_FX_TO_UNIT, y: fx.y * R2_FX_TO_UNIT };
 }
 
 /**
@@ -421,6 +480,23 @@ export function nearestCell(px, py, pz, originX, originY, originZ, spacing) {
     cy: Math.round((py - originY) / spacing),
     cz: Math.round((pz - originZ) / spacing),
   };
+}
+
+/**
+ * The lattice origin for a spacing — the anchor snapped onto that lattice.
+ *
+ * Lives here rather than in `srcRef.js` (which wrapped it as `latticeOrigin(cfg,
+ * cascade, lod)`) so that the reference, the GPU twin and the twin gate all
+ * round the same way. `Math.round` is ties-toward-+∞ and WGSL's `round` is
+ * ties-to-EVEN, so this is exactly the function where two implementations
+ * quietly disagree about which cell a probe belongs to.
+ */
+export function latticeOriginFor(anchorX, anchorY, anchorZ, spacing) {
+  return [
+    Math.round(anchorX / spacing) * spacing,
+    Math.round(anchorY / spacing) * spacing,
+    Math.round(anchorZ / spacing) * spacing,
+  ];
 }
 
 /** World position of lattice cell (cx, cy, cz). */

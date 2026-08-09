@@ -42,6 +42,7 @@ import {
   decodeDir,
   dirToBin,
   hashKey,
+  latticeOriginFor,
   nearestCell,
   octahedralDirection,
   packProbeKey,
@@ -84,11 +85,7 @@ export function makeSrcConfig(options = {}) {
 /** Lattice origin for (cascade, lod) — the anchor snapped onto that lattice. */
 export function latticeOrigin(cfg, cascade, lod) {
   const s = probeSpacing(cascade, lod, cfg.spacing0);
-  return [
-    Math.round(cfg.anchor[0] / s) * s,
-    Math.round(cfg.anchor[1] / s) * s,
-    Math.round(cfg.anchor[2] / s) * s,
-  ];
+  return latticeOriginFor(cfg.anchor[0], cfg.anchor[1], cfg.anchor[2], s);
 }
 
 // ══════════════════════════════════════════════════════════ THE PROBE MAP

@@ -1,0 +1,523 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>SRC math twin gate — srcMathTsl.js vs srcMath.js on the GPU</title>
+    <style>html,body{margin:0;background:#111;color:#ddd;font:13px monospace}canvas{display:none}</style>
+  </head>
+  <body>
+    <canvas id="view" width="16" height="16"></canvas>
+    <pre id="log"></pre>
+    <script type="module">
+      // ══ THE THIRD THING ═══════════════════════════════════════════════════
+      //
+      // srcMath.js is the mirror; srcMathTsl.js is the kernel. Each is checked
+      // by its own suite and both can be green while they disagree with each
+      // other — that is not hypothetical, it is the failure `emitterShapes.js`
+      // and `giLight.js` live under the same contract to avoid. This page is
+      // the only thing that can see the disagreement: it runs the TSL twins in
+      // a real compute pass and diffs them against the JS originals over the
+      // same inputs, IN THE SAME PAGE, so no serialization sits between them.
+      //
+      // ══ WHAT IS EXACT AND WHAT HAS A TOLERANCE, AND WHY IT MATTERS ════════
+      //
+      // Everything integer-valued is compared BIT-EXACT, with no tolerance at
+      // all: probe keys, hashes, Morton indices, bin indices, cell coordinates
+      // and the R2 fixed-point words. Those are the values the hashmap is keyed
+      // on. A one-bit difference is not a small error there — it is a different
+      // probe, and Phase 1's "probe counts vs the CPU mirror" gate would be
+      // measuring two different algorithms.
+      //
+      // The float results carry an f32 tolerance, and the page PRINTS the worst
+      // observed error for each rather than only pass/fail. A tolerance test
+      // that reports nothing cannot distinguish "agrees to 1e-7" from "agrees
+      // to 9e-7 and drifting", and drift is what a twin gate is for.
+      //
+      // ══ THE INPUT SET IS ADVERSARIAL ON PURPOSE ═══════════════════════════
+      //
+      // Random inputs would pass every one of these on the first run and hide
+      // all four of the f32 traps srcMathTsl.js's header names. The cases below
+      // deliberately include exact rounding ties, the probe key window's edges
+      // and both sides of them, exact LOD boundaries, the octahedral poles and
+      // corners, and R2 indices past four million.
+      //
+      // Run: node scripts/run-gi-src-math-test.mjs
+      const out = document.querySelector("#log");
+      const say = (line) => { out.textContent += line + "\n"; };
+      const fail = (error) => {
+        console.error("SRC-MATH FAIL", error?.stack ?? error?.message ?? String(error));
+        globalThis.__SRC_MATH_RESULT__ = { pass: false, error: error?.message ?? String(error) };
+      };
+      globalThis.addEventListener("error", (event) => fail(event.error ?? event.message));
+      globalThis.addEventListener("unhandledrejection", (event) => fail(event.reason));
+
+      try {
+        const THREE = await import("three/webgpu");
+        const TSL = await import("three/tsl");
+        const ref = await import("/src/modules/gi/srcMath.js");
+        const cfg = await import("/src/modules/gi/srcConfig.js");
+        const gpu = await import("/src/modules/gi/srcMathTsl.js");
+
+        const { Fn, instanceIndex, instancedArray, uint, uvec4, vec4, float, int, ivec3, vec3 } = TSL;
+
+        // ────────────────────────────────────────────────── the input set
+        // mulberry32, the harness PRNG standard in this repo. Never Math.random:
+        // a twin gate that cannot be re-run on the same numbers cannot attribute
+        // a failure to anything.
+        const rng = (() => {
+          let s = 0x5121cade >>> 0;
+          return () => {
+            s = (s + 0x6d2b79f5) >>> 0;
+            let t = s;
+            t = Math.imul(t ^ (t >>> 15), t | 1);
+            t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+            return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+          };
+        })();
+        const unitDir = () => {
+          const z = rng() * 2 - 1;
+          const phi = rng() * 2 * Math.PI;
+          const r = Math.sqrt(Math.max(0, 1 - z * z));
+          return [r * Math.cos(phi), r * Math.sin(phi), z];
+        };
+
+        const S0 = 0.5;
+        const cases = [];
+        const push = (c) => cases.push({
+          pos: [0, 0, 0], dir: [0, 0, 1], anchor: [0, 0, 0], normal: [0, 1, 0],
+          spacing0: S0, spacing: S0, cheb: 1, lodF: 0.5,
+          decodeX: 0.25, decodeY: 0.5, texelU: 2, texelV: 3,
+          n: 0, lod: 0, secondary: 0, jitterX: 0, jitterY: 0,
+          cell: [0, 0, 0],
+          ...c,
+        });
+
+        // 1. AXIS AND POLE DIRECTIONS. The ±Z poles are where the octahedral map
+        //    folds and where encodeDir's clamp lives; the ±X/±Y equator points
+        //    are where atan2 changes branch. Every one of these is a place a
+        //    transcription error hides from random sampling.
+        for (const d of [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1],
+                         [0.577,0.577,0.577],[-0.577,-0.577,-0.577],[0.707,0.707,0],[0.707,-0.707,0]]) {
+          const l = Math.hypot(...d) || 1;
+          push({ dir: [d[0]/l, d[1]/l, d[2]/l], normal: [d[0]/l, d[1]/l, d[2]/l] });
+        }
+
+        // 2. EXACT ROUNDING TIES. `nearestCell` and `latticeOrigin` round, and
+        //    JS rounds ties up while WGSL rounds them to even. A probe exactly
+        //    halfway between two cells is the case that separates them.
+        for (const k of [-2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 3.5, 100.5]) {
+          push({ pos: [k * S0, -k * S0, k * S0], anchor: [k * S0, 0, -k * S0], spacing: S0 });
+          push({ pos: [k * S0, k * S0, k * S0], anchor: [0, 0, 0], spacing: S0 * 4 });
+        }
+
+        // 3. THE PROBE KEY WINDOW, both edges and both sides of both edges. An
+        //    out-of-window cell must pack to KEY_EMPTY on BOTH sides — a twin
+        //    that packs a wrong key instead produces a probe that exists at the
+        //    wrong place, which is strictly worse than one that does not exist.
+        for (const c of [-257, -256, -255, -1, 0, 1, 254, 255, 256]) {
+          push({ cell: [c, 0, 0], lod: 0 });
+          push({ cell: [0, c, 0], lod: 3, secondary: 1 });
+          push({ cell: [c, c, c], lod: cfg.MAX_LODS - 1 });
+        }
+        // LOD codes at and past the key's 4-bit ceiling.
+        for (const lod of [0, 1, 9, 14, 15, 16]) push({ cell: [7, -9, 11], lod });
+
+        // 4. EXACT LOD BOUNDARIES. lodAtDistance is a log2 and its floor picks
+        //    the shell, so cheb = s0·2^k is the input that decides whether the
+        //    two sides agree about which shell a surface belongs to.
+        for (let k = -1; k < 11; k++) {
+          push({ cheb: S0 * Math.pow(2, k), spacing0: S0 });
+          push({ cheb: S0 * Math.pow(2, k) * 1.0000001, spacing0: S0 });
+        }
+        for (const f of [0, 0.5, 0.89, 0.9, 0.9001, 0.95, 0.999, 1.0, 2.45]) push({ lodF: f });
+
+        // 5. R2 PAST THE POINT THE FLOAT FORM DIED. srcMath.js measures the
+        //    float form as having eight distinct values at n = 2e6; these are
+        //    the indices that prove the fixed-point twin does not.
+        for (const n of [0, 1, 2, 31, 1024, 65535, 100000, 1000000, 2000000, 4194303, 0xfffffff]) {
+          push({ n, jitterX: 0, jitterY: 0 });
+          push({ n, jitterX: 0x9e3779b9, jitterY: 0x7f4a7c15 });
+        }
+
+        // 6. OCTAHEDRAL TILE TEXELS — every texel of a 6×6 tile, including the
+        //    four corners that are all the −Z pole (the +32% receiver error
+        //    srcRef.js's border note was written for).
+        for (let v = 0; v < 6; v++) for (let u = 0; u < 6; u++) push({ texelU: u, texelV: v });
+
+        // 7. THE OPEN SQUARE, for decodeDir, including its edges.
+        for (const x of [0, 0.25, 0.5, 0.75, 0.999999]) {
+          for (const y of [0, 0.25, 0.5, 0.75, 0.999999]) push({ decodeX: x, decodeY: y });
+        }
+
+        // 8. RANDOM FILL. Not the interesting part, but it is what catches a
+        //    transcription error in an operand ordering that every structured
+        //    case above happens to be symmetric in.
+        for (let i = 0; i < 512; i++) {
+          push({
+            pos: [(rng() - 0.5) * 40, (rng() - 0.5) * 40, (rng() - 0.5) * 40],
+            dir: unitDir(),
+            normal: unitDir(),
+            anchor: [(rng() - 0.5) * 8, (rng() - 0.5) * 8, (rng() - 0.5) * 8],
+            spacing0: 0.2 + rng() * 0.8,
+            spacing: (0.2 + rng() * 0.8) * (1 << Math.floor(rng() * 4)),
+            cheb: rng() * 200,
+            lodF: rng() * 9,
+            decodeX: rng(), decodeY: rng(),
+            texelU: Math.floor(rng() * 6), texelV: Math.floor(rng() * 6),
+            n: Math.floor(rng() * 4000000),
+            lod: Math.floor(rng() * 12),
+            secondary: rng() < 0.5 ? 0 : 1,
+            jitterX: (rng() * 4294967296) >>> 0,
+            jitterY: (rng() * 4294967296) >>> 0,
+            cell: [Math.floor(rng() * 600) - 300, Math.floor(rng() * 600) - 300, Math.floor(rng() * 600) - 300],
+          });
+        }
+
+        // ── THE MIRROR MUST BE FED THE NUMBERS THE GPU ACTUALLY RECEIVED ────
+        //
+        // Every float crosses to the kernel through a Float32Array, so the GPU
+        // never sees the f64 the case list was written in. Comparing the twin
+        // against an f64 evaluation therefore measures INPUT QUANTIZATION, not
+        // the twins — and it does not measure it evenly: `lodBlend` divides by
+        // the 0.1-wide overlap band and so multiplies its input's rounding by
+        // TEN, which is precisely the family that first failed here by 1.1×.
+        // Rounding the case list through f32 up front makes every float family
+        // a statement about the two implementations and nothing else, and it is
+        // what lets the tolerance be tight enough to catch drift.
+        const q = new Float32Array(1);
+        const f32 = (v) => { q[0] = v; return q[0]; };
+        const f32v = (a) => a.map(f32);
+        for (const c of cases) {
+          c.pos = f32v(c.pos); c.dir = f32v(c.dir); c.anchor = f32v(c.anchor); c.normal = f32v(c.normal);
+          c.spacing0 = f32(c.spacing0); c.spacing = f32(c.spacing);
+          c.cheb = f32(c.cheb); c.lodF = f32(c.lodF);
+          c.decodeX = f32(c.decodeX); c.decodeY = f32(c.decodeY);
+          c.texelU = f32(c.texelU); c.texelV = f32(c.texelV);
+        }
+
+        const N = cases.length;
+        const FIN = 5;   // float input vec4s per case
+        const UIN = 2;   // uint  input uvec4s per case
+        const UOUT = 4;  // uint  output uvec4s per case
+        const FOUT = 8;  // float output vec4s per case
+        const BIAS = ref.KEY_AXIS_OFFSET;
+        const W_LO = 4;
+        const W_HI = 32;
+        const TILE = 6;
+        const SPLIT_CASCADE = 2; // the cascade probeSpacing/intervalBoundary are probed at
+
+        const inF = new Float32Array(N * FIN * 4);
+        const inU = new Uint32Array(N * UIN * 4);
+        for (let i = 0; i < N; i++) {
+          const c = cases[i];
+          const f = i * FIN * 4;
+          inF.set([c.pos[0], c.pos[1], c.pos[2], c.spacing0], f);
+          inF.set([c.dir[0], c.dir[1], c.dir[2], c.cheb], f + 4);
+          inF.set([c.anchor[0], c.anchor[1], c.anchor[2], c.spacing], f + 8);
+          inF.set([c.normal[0], c.normal[1], c.normal[2], c.lodF], f + 12);
+          inF.set([c.decodeX, c.decodeY, c.texelU, c.texelV], f + 16);
+          const u = i * UIN * 4;
+          inU.set([c.n >>> 0, c.lod >>> 0, c.secondary >>> 0, c.jitterX >>> 0], u);
+          inU.set([c.jitterY >>> 0, (c.cell[0] + BIAS) >>> 0, (c.cell[1] + BIAS) >>> 0, (c.cell[2] + BIAS) >>> 0], u + 4);
+        }
+
+        // ────────────────────────────────────────────────── the renderer
+        const renderer = new THREE.WebGPURenderer({ canvas: document.querySelector("#view") });
+        await renderer.init();
+        if (renderer.backend?.isWebGPUBackend !== true) throw new Error("not a WebGPU backend");
+        const device = renderer.backend.device;
+        const validationErrors = [];
+        device.addEventListener?.("uncapturederror", (event) => {
+          validationErrors.push(event.error?.message ?? String(event.error));
+          console.error("WebGPU validation error:", validationErrors.at(-1));
+        });
+
+        // ────────────────────────────────────────────────── the kernel
+        // FOUR storage bindings, which is the whole binding cost of this gate —
+        // well inside the portable 8 the module builds against (R7). The float
+        // and uint sides are separate buffers rather than one bitcast blob so a
+        // mismatch reads as the value it is, not as a hex word.
+        const inFBuf = instancedArray(inF, "vec4");
+        const inUBuf = instancedArray(inU, "uvec4");
+        const outUBuf = instancedArray(new Uint32Array(N * UOUT * 4), "uvec4");
+        const outFBuf = instancedArray(new Float32Array(N * FOUT * 4), "vec4");
+
+        const kernel = Fn(() => {
+          const i = instanceIndex.toVar();
+          const fb = i.mul(FIN);
+          const ub = i.mul(UIN);
+          const f0 = inFBuf.element(fb).toVar();
+          const f1 = inFBuf.element(fb.add(1)).toVar();
+          const f2 = inFBuf.element(fb.add(2)).toVar();
+          const f3 = inFBuf.element(fb.add(3)).toVar();
+          const f4 = inFBuf.element(fb.add(4)).toVar();
+          const u0 = inUBuf.element(ub).toVar();
+          const u1 = inUBuf.element(ub.add(1)).toVar();
+
+          const pos = f0.xyz.toVar();
+          const spacing0 = f0.w.toVar();
+          const dir = f1.xyz.toVar();
+          const cheb = f1.w.toVar();
+          const anchor = f2.xyz.toVar();
+          const spacing = f2.w.toVar();
+          const normal = f3.xyz.toVar();
+          const lodF = f3.w.toVar();
+          const n = u0.x.toVar();
+          const lod = int(u0.y).toVar();
+          const secondary = u0.z.toVar();
+          const jitterX = u0.w.toVar();
+          const jitterY = u1.x.toVar();
+          const cell = ivec3(int(u1.y).sub(BIAS), int(u1.z).sub(BIAS), int(u1.w).sub(BIAS)).toVar();
+
+          // ── integer family, compared bit-exact ────────────────────────────
+          const r2fx = gpu.r2PointFx(n, jitterX, jitterY).toVar();
+          const key = gpu.packProbeKey(lod, secondary, cell).toVar();
+          const hash = gpu.hashKey(key).toVar();
+          const binLo = gpu.dirToBin(dir, W_LO).toVar();
+          const binHi = gpu.dirToBin(dir, W_HI).toVar();
+          const mortonLo = gpu.binMorton(binLo.x, binLo.y).toVar();
+          const mortonHi = gpu.binMorton(binHi.x, binHi.y).toVar();
+          const backHi = gpu.mortonToBin(mortonHi).toVar();
+          const origin = gpu.latticeOrigin(anchor, spacing).toVar();
+          const near = gpu.nearestCell(pos, origin, spacing).toVar();
+          // Cell coordinates travel back BIASED so a negative index is not a
+          // u32 wrap the JS side has to guess the width of.
+          const nearB = near.add(ivec3(BIAS, BIAS, BIAS)).toVar();
+
+          const uo = i.mul(UOUT);
+          outUBuf.element(uo).assign(uvec4(r2fx.x, r2fx.y, hash, key));
+          outUBuf.element(uo.add(1)).assign(uvec4(
+            mortonLo, binLo.x, binLo.y, uint(gpu.keyLod(key).add(1)),
+          ));
+          outUBuf.element(uo.add(2)).assign(uvec4(
+            mortonHi, binHi.x, binHi.y, gpu.keySecondary(key),
+          ));
+          outUBuf.element(uo.add(3)).assign(uvec4(
+            uint(nearB.x), uint(nearB.y), uint(nearB.z),
+            backHi.x.mul(uint(1024)).add(backHi.y),
+          ));
+
+          // ── float family, compared to an f32 tolerance ────────────────────
+          const enc = gpu.encodeDir(dir).toVar();
+          const bounds = [0, 1, 2, 3].map((k) => gpu.intervalBoundary(k, float(lod), spacing0));
+          const fo = i.mul(FOUT);
+          outFBuf.element(fo).assign(vec4(
+            enc.x, enc.y, gpu.lodAtDistance(cheb, spacing0, cfg.MAX_LODS), gpu.lodBlend(lodF),
+          ));
+          outFBuf.element(fo.add(1)).assign(vec4(
+            origin, gpu.probeSpacing(SPLIT_CASCADE, float(lod), spacing0),
+          ));
+          outFBuf.element(fo.add(2)).assign(vec4(
+            gpu.rayDirection(n, normal, jitterX, jitterY),
+            gpu.intervalBoundary(SPLIT_CASCADE, float(lod), spacing0),
+          ));
+          outFBuf.element(fo.add(3)).assign(vec4(
+            gpu.cellPosition(cell, origin, spacing), gpu.chebyshev(pos, anchor),
+          ));
+          outFBuf.element(fo.add(4)).assign(vec4(
+            gpu.decodeDir(f4.x, f4.y), gpu.octahedralTexelWeight(dir),
+          ));
+          outFBuf.element(fo.add(5)).assign(vec4(
+            gpu.octahedralUV(dir, TILE),
+            float(gpu.splitCascade(cheb, bounds)),
+            float(0),
+          ));
+          outFBuf.element(fo.add(6)).assign(vec4(
+            gpu.octahedralDirection(f4.z, f4.w, TILE), float(0),
+          ));
+          outFBuf.element(fo.add(7)).assign(vec4(
+            gpu.binDir(binLo.x, binLo.y, W_LO), float(0),
+          ));
+        })().compute(N);
+
+        await renderer.computeAsync(kernel);
+        const gotU = new Uint32Array(await renderer.getArrayBufferAsync(outUBuf.value));
+        const gotF = new Float32Array(await renderer.getArrayBufferAsync(outFBuf.value));
+        if (validationErrors.length) throw new Error(`WebGPU validation: ${validationErrors[0]}`);
+
+        // ────────────────────────────────────────────────── the diff
+        let failures = 0;
+        const exact = new Map();   // label -> {bad, first}
+        const approx = new Map();  // label -> {worst, at}
+        const bitCheck = (label, i, got, want) => {
+          let e = exact.get(label);
+          if (!e) { e = { bad: 0, first: null }; exact.set(label, e); }
+          if ((got >>> 0) !== (want >>> 0)) {
+            e.bad++;
+            if (e.first === null) e.first = { i, got: got >>> 0, want: want >>> 0, input: cases[i] };
+          }
+        };
+        const nearCheck = (label, i, got, want, tol) => {
+          let a = approx.get(label);
+          if (!a) { a = { worst: 0, at: null, tol }; approx.set(label, a); }
+          const err = Math.abs(got - want) / Math.max(1, Math.abs(want));
+          if (err > a.worst) { a.worst = err; a.at = { i, got, want, input: cases[i] }; }
+        };
+        // f32 relative epsilon is 6e-8; 4e-6 leaves room for a handful of
+        // operations' accumulation and nothing like a transcription error.
+        const TOL = 4e-6;
+        // A ray this close to tangent has an f32-noise-decided fold sign.
+        const TANGENT_EPS = 1e-5;
+        let tangentFlips = 0;
+        let binTies = 0;
+
+        for (let i = 0; i < N; i++) {
+          const c = cases[i];
+          const uo = i * UOUT * 4;
+          const fo = i * FOUT * 4;
+
+          // integers — zero tolerance
+          const wantR2 = ref.r2PointFx(c.n, c.jitterX, c.jitterY);
+          bitCheck("r2PointFx.x", i, gotU[uo], wantR2.x);
+          bitCheck("r2PointFx.y", i, gotU[uo + 1], wantR2.y);
+          const wantKey = ref.packProbeKey(c.lod, c.secondary === 1, c.cell[0], c.cell[1], c.cell[2]);
+          bitCheck("packProbeKey", i, gotU[uo + 3], wantKey);
+          bitCheck("hashKey", i, gotU[uo + 2], ref.hashKey(wantKey));
+          const unpacked = ref.unpackProbeKey(wantKey);
+          bitCheck("keyLod (+1, 0 = EMPTY)", i, gotU[uo + 4 + 3], (unpacked ? unpacked.lod + 1 : 0) >>> 0);
+          bitCheck("keySecondary", i, gotU[uo + 8 + 3], unpacked?.secondary ? 1 : 0);
+          // ── A DIRECTION ON A BIN BOUNDARY IS A TIE, NOT A DISAGREEMENT ────
+          // An exactly-45° direction puts x at exactly 0.125, i.e. on the seam
+          // between two azimuth wedges, and f32's atan2 lands a hair below
+          // where f64's lands. Which side owns the seam is arbitrary — the two
+          // bins are ADJACENT, so a deposit differs by one wedge on a
+          // measure-zero set. `binTie` accepts exactly that and nothing else:
+          // the index must differ by one (azimuth wraps) AND the reference's
+          // own fractional bin coordinate must actually be sitting on an
+          // integer. An off-by-one anywhere else is still a hard failure.
+          const bLo = ref.dirToBin(c.dir[0], c.dir[1], c.dir[2], W_LO);
+          const bHi = ref.dirToBin(c.dir[0], c.dir[1], c.dir[2], W_HI);
+          const enc0 = ref.encodeDir(c.dir[0], c.dir[1], c.dir[2]);
+          const onSeam = (v, n) => Math.abs(v * n - Math.round(v * n)) < 1e-6;
+          const binTie = (got, want, span, seam) =>
+            seam && (Math.abs(got - want) === 1 || Math.abs(got - want) === span - 1);
+          const binCheck = (label, idx, got, want, span, seam) => {
+            if (binTie(got, want, span, seam)) { binTies++; return; }
+            bitCheck(label, idx, got, want);
+          };
+          const gLoI = gotU[uo + 4 + 1];
+          const gLoJ = gotU[uo + 4 + 2];
+          const gHiI = gotU[uo + 8 + 1];
+          const gHiJ = gotU[uo + 8 + 2];
+          binCheck(`dirToBin.i (w=${W_LO})`, i, gLoI, bLo.i, 2 * W_LO, onSeam(enc0.x, 2 * W_LO));
+          binCheck(`dirToBin.j (w=${W_LO})`, i, gLoJ, bLo.j, W_LO, onSeam(enc0.y, W_LO));
+          binCheck(`dirToBin.i (w=${W_HI})`, i, gHiI, bHi.i, 2 * W_HI, onSeam(enc0.x, 2 * W_HI));
+          binCheck(`dirToBin.j (w=${W_HI})`, i, gHiJ, bHi.j, W_HI, onSeam(enc0.y, W_HI));
+          // Everything downstream is fed the GPU'S OWN bin, so these families
+          // test the function named and not the one before it. A shared input
+          // would report five failures for one seam and hide whether Morton
+          // itself was ever wrong.
+          bitCheck(`binMorton (w=${W_LO})`, i, gotU[uo + 4], ref.binMorton(gLoI, gLoJ));
+          bitCheck(`binMorton (w=${W_HI})`, i, gotU[uo + 8], ref.binMorton(gHiI, gHiJ));
+          const backHi = ref.mortonToBin(ref.binMorton(gHiI, gHiJ));
+          bitCheck("mortonToBin round-trip", i, gotU[uo + 12 + 3], backHi.i * 1024 + backHi.j);
+          const wantOrigin = ref.latticeOriginFor(c.anchor[0], c.anchor[1], c.anchor[2], c.spacing);
+          const wantNear = ref.nearestCell(
+            c.pos[0], c.pos[1], c.pos[2], wantOrigin[0], wantOrigin[1], wantOrigin[2], c.spacing,
+          );
+          bitCheck("nearestCell.x", i, gotU[uo + 12], (wantNear.cx + BIAS) >>> 0);
+          bitCheck("nearestCell.y", i, gotU[uo + 12 + 1], (wantNear.cy + BIAS) >>> 0);
+          bitCheck("nearestCell.z", i, gotU[uo + 12 + 2], (wantNear.cz + BIAS) >>> 0);
+
+          // floats — f32 tolerance, worst error reported
+          const wantEnc = ref.encodeDir(c.dir[0], c.dir[1], c.dir[2]);
+          // Azimuth wraps: compare on the circle so a 0/1 seam is not a failure.
+          const dx = Math.min(Math.abs(gotF[fo] - wantEnc.x), 1 - Math.abs(gotF[fo] - wantEnc.x));
+          nearCheck("encodeDir.x (circular)", i, dx, 0, TOL);
+          nearCheck("encodeDir.y", i, gotF[fo + 1], wantEnc.y, TOL);
+          nearCheck("lodAtDistance", i, gotF[fo + 2], cfg.lodAtDistance(c.cheb, c.spacing0, cfg.MAX_LODS), TOL);
+          nearCheck("lodBlend", i, gotF[fo + 3], cfg.lodBlend(c.lodF), TOL);
+          for (let k = 0; k < 3; k++) nearCheck("latticeOrigin", i, gotF[fo + 4 + k], wantOrigin[k], TOL);
+          nearCheck("probeSpacing", i, gotF[fo + 4 + 3], cfg.probeSpacing(SPLIT_CASCADE, c.lod, c.spacing0), TOL);
+          // ── THE TANGENT FLIP IS AMBIGUOUS AND THAT IS NOT A BUG ───────────
+          // `rayDirection` folds into the hemisphere with `sign(d·n̂)`. When the
+          // R2 direction is very nearly tangent, d·n̂ is pure rounding noise and
+          // its SIGN differs between f64 and f32 — the two sides then emit
+          // antipodal rays. Both are legitimate (each is in the hemisphere to
+          // within 1e-7), so the check accepts either and COUNTS how often the
+          // antipode was taken. Silently widening the tolerance to 2.0 instead
+          // would also hide a genuinely inverted fold, which is the bug this
+          // family exists to catch.
+          const wantRay = ref.rayDirection(c.n, c.normal[0], c.normal[1], c.normal[2], c.jitterX, c.jitterY);
+          const rayDot = wantRay[0] * c.normal[0] + wantRay[1] * c.normal[1] + wantRay[2] * c.normal[2];
+          const flipped = Math.abs(gotF[fo + 8] + wantRay[0]) + Math.abs(gotF[fo + 9] + wantRay[1]) +
+            Math.abs(gotF[fo + 10] + wantRay[2]) <
+            Math.abs(gotF[fo + 8] - wantRay[0]) + Math.abs(gotF[fo + 9] - wantRay[1]) +
+            Math.abs(gotF[fo + 10] - wantRay[2]);
+          if (flipped && rayDot < TANGENT_EPS) {
+            tangentFlips++;
+            for (let k = 0; k < 3; k++) nearCheck("rayDirection", i, gotF[fo + 8 + k], -wantRay[k], 2e-5);
+          } else {
+            for (let k = 0; k < 3; k++) nearCheck("rayDirection", i, gotF[fo + 8 + k], wantRay[k], 2e-5);
+          }
+          const wantBounds = cfg.intervalBoundaries(c.lod, c.spacing0, cfg.CASCADE_COUNT);
+          nearCheck("intervalBoundary (closed form vs accumulate)", i, gotF[fo + 8 + 3], wantBounds[SPLIT_CASCADE], TOL);
+          const wantCellPos = ref.cellPosition(
+            c.cell[0], c.cell[1], c.cell[2], wantOrigin[0], wantOrigin[1], wantOrigin[2], c.spacing,
+          );
+          for (let k = 0; k < 3; k++) nearCheck("cellPosition", i, gotF[fo + 12 + k], wantCellPos[k], TOL);
+          nearCheck("chebyshev", i, gotF[fo + 12 + 3],
+            cfg.chebyshev(c.pos[0], c.pos[1], c.pos[2], c.anchor[0], c.anchor[1], c.anchor[2]), TOL);
+          const wantDecode = ref.decodeDir(c.decodeX, c.decodeY);
+          for (let k = 0; k < 3; k++) nearCheck("decodeDir", i, gotF[fo + 16 + k], wantDecode[k], TOL);
+          nearCheck("octahedralTexelWeight", i, gotF[fo + 16 + 3],
+            ref.octahedralTexelWeight(c.dir[0], c.dir[1], c.dir[2]), TOL);
+          const wantOct = ref.octahedralUV(c.dir[0], c.dir[1], c.dir[2], TILE);
+          nearCheck("octahedralUV.u", i, gotF[fo + 20], wantOct.u, TOL);
+          nearCheck("octahedralUV.v", i, gotF[fo + 20 + 1], wantOct.v, TOL);
+          // splitCascade is integer-valued but travels as a float, so it is
+          // compared as an integer once rounded — a half-step here would mean
+          // the two disagree about which cascade owns a hit distance.
+          bitCheck("splitCascade", i, Math.round(gotF[fo + 20 + 2]) >>> 0,
+            ref.splitCascade(c.cheb, wantBounds) >>> 0);
+          const wantOctDir = ref.octahedralDirection(c.texelU, c.texelV, TILE);
+          for (let k = 0; k < 3; k++) nearCheck("octahedralDirection", i, gotF[fo + 24 + k], wantOctDir[k], TOL);
+          const wantBinDir = ref.binDir(gLoI, gLoJ, W_LO);
+          for (let k = 0; k < 3; k++) nearCheck("binDir", i, gotF[fo + 28 + k], wantBinDir[k], TOL);
+        }
+
+        say(`SRC math twins — ${N} cases, ${exact.size} exact + ${approx.size} tolerance families`);
+        say("");
+        say("BIT-EXACT (integers the hashmap is keyed on — zero tolerance):");
+        const details = [];
+        for (const [label, e] of exact) {
+          const ok = e.bad === 0;
+          if (!ok) {
+            failures++;
+            details.push({ label, kind: "exact", bad: e.bad, first: e.first });
+          }
+          say(`  ${ok ? "PASS" : "FAIL"} ${label.padEnd(38)} ${ok ? "" : `${e.bad}/${N} differ — case ${e.first.i}: got ${e.first.got} want ${e.first.want}`}`);
+        }
+        say("");
+        say("f32 TOLERANCE (worst observed relative error):");
+        for (const [label, a] of approx) {
+          const ok = a.worst <= a.tol;
+          if (!ok) {
+            failures++;
+            details.push({ label, kind: "approx", worst: a.worst, at: a.at });
+          }
+          say(`  ${ok ? "PASS" : "FAIL"} ${label.padEnd(38)} worst ${a.worst.toExponential(2)} (tol ${a.tol.toExponential(1)})${ok ? "" : ` — case ${a.at.i}: got ${a.at.got} want ${a.at.want}`}`);
+        }
+        say("");
+        say(`  note: ${tangentFlips}/${N} rays within ${TANGENT_EPS} of tangent took the antipodal fold; ` +
+          `${binTies} bin indices sat exactly on a wedge seam`);
+        say(failures ? `gi-src-math: ${failures} FAMILIES FAILED` : "gi-src-math: all twins agree");
+
+        globalThis.__SRC_MATH_RESULT__ = {
+          pass: failures === 0,
+          cases: N,
+          tangentFlips,
+          binTies,
+          exactFamilies: exact.size,
+          approxFamilies: approx.size,
+          worst: Object.fromEntries([...approx].map(([k, v]) => [k, Number(v.worst.toExponential(2))])),
+          details,
+          storageLimit: device.limits.maxStorageBuffersPerShaderStage,
+          text: out.textContent,
+        };
+      } catch (error) {
+        fail(error);
+      }
+    </script>
+  </body>
+</html>
