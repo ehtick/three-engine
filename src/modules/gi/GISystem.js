@@ -2580,7 +2580,7 @@ export class GISystem {
    * rebuild, its shader stays in the pipeline cache, and a quality change or
    * an auto-fit refit no longer triggers a material recompile wave.
    */
-  #buildScreenResolve({ gather, light, emitterSlots, radianceLookup = null, lightSlots = null, ao = null, lightShadow = null, emitterRecordTrace = null, emitterCutoff = null }) {
+  #buildScreenResolve({ gather, light, emitterSlots, radianceLookup = null, lightSlots = null, ao = null, lightShadow = null, emitterRecordTrace = null, emitterCutoff = null, volume = null }) {
     const renderer = this.engine.renderer;
     if (!renderer?.backend?.device) return null;
     const { width, height } = this.#screenResolveSize();
@@ -2968,7 +2968,7 @@ export class GISystem {
       if (srcProbesEnabled()) {
         try {
           srcProbes = createSrcProbeSystem({
-            gbuffer, width, height, props: this.component?.props ?? null,
+            gbuffer, width, height, props: this.component?.props ?? null, volume,
           });
           // The gizmos go in the scene rather than on `state.gizmos`, because
           // they belong to the SCREEN bundle's lifetime (they read its probe
@@ -4134,6 +4134,10 @@ export class GISystem {
     });
     const screen = this.#buildScreenResolve({
       gather, light, emitterSlots, radianceLookup: deferredRadianceLookup, ao, lightShadow,
+      // For the SRC scaffold ray pass ONLY (plan §12.13.5 unit 1) — it is the
+      // first thing in SRC that traces, and the medium it traces has to be the
+      // same one every other ray class in this build uses.
+      volume,
       emitterRecordTrace: emitterSlots ? this.#buildEmitterRecordTrace(volume, quality) : null,
       // EMITTER REACH PER PRESET. Falloff is 1/d², so the pixels that pay for
       // an emitter's shadow march scale as 1/cutoff — this is the dominant

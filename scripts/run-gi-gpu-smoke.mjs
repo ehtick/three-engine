@@ -36,6 +36,13 @@ for (const arm of arms) {
             .map((c, i) => `c${i} ${c.live} live/load ${c.load}/steps ${c.steps}` +
               (c.failed ? ` FAILED ${c.failed}` : ""))
             .join("  "));
+        // The scaffold ray pass's numbers are the input to the `Lmax` decision
+        // §12.13.4 left open, so they get printed rather than merely asserted.
+        const r = result.srcProbes.rays;
+        if (r) {
+          console.log(`  src rays: ${r.count} traced, hit ${(r.hitRate * 100).toFixed(1)}%, ` +
+            `mean t ${r.meanT}m, max t ${r.maxT}m`);
+        }
       }
       const unfed = logs.find((l) => l.includes("traversal counters unfed"));
       if (unfed) console.log(`  note: ${unfed.replace("GI-SMOKE NOTE ", "")}`);

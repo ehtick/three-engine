@@ -44,12 +44,15 @@ import * as THREE from "three/webgpu";
 import { ivec2, texture, uniform, vec3 } from "three/tsl";
 import { CASCADE_COUNT, MAX_LODS, SRC_QUALITY, srcQualityTier } from "./srcConfig.js";
 import { createSrcProbeGizmos } from "./srcGizmos.js";
+import { R2_ALPHA1_FX, R2_ALPHA2_FX } from "./srcMath.js";
 import {
   createSrcProbeFrame,
   createSrcProbeStore,
   formatSrcProbeStats,
   readSrcProbeStats,
 } from "./srcProbes.js";
+import { createSrcRayPass } from "./srcRayPass.js";
+import { createSrcSceneTrace } from "./srcTrace.js";
 
 /** Camera drift, in units of s₀, that triggers a re-anchor. */
 const REANCHOR_CHEBYSHEV = 64;
@@ -88,8 +91,14 @@ function expectedC0Probes(pixelCount) {
  *   viewport's
  * @param {number} options.height
  * @param {object} [options.props]  the component props, for the quality tier
+ * @param {object} [options.volume]  `createSrcVolume`'s bundle. OPTIONAL, and
+ *   the population is fully functional without it — it buys exactly one thing,
+ *   the scaffold ray pass below, which needs `occupancyField` + `world` and is
+ *   the only part of SRC that touches the medium so far. The standalone gate
+ *   pages have no engine and therefore no volume; they build the frame and
+ *   nothing else, which is what keeps them standalone.
  */
-export function createSrcProbeSystem({ gbuffer, width, height, props = null } = {}) {
+export function createSrcProbeSystem({ gbuffer, width, height, props = null, volume = null } = {}) {
   const tier = SRC_QUALITY[srcQualityTier(props)];
   const spacing0 = Number(globalThis.__giSrcSpacing0) || tier.spacing0;
   const pixelCount = width * height;
@@ -106,6 +115,22 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null } = 
   // the frame — see `setSize` on the returned object.
   const widthU = uniform(width, "uint");
   const positionNode = texture(gbuffer.position);
+  const normalNode = texture(gbuffer.normal);
+
+  /** Texel coords for a linear pixel index — the one decode both readers use. */
+  const texelOf = (i) => ivec2(i.mod(widthU).toInt(), i.div(widthU).toInt());
+  const readPixel = (i) => {
+    const g0 = positionNode.load(texelOf(i)).toVar();
+    // `w > 0.5` is the gbuffer's own "geometry here" mark (createGiGBuffer
+    // writes `vec4(positionWorld, 1)` and leaves untouched texels at 0). Using
+    // the same test as `createGiResolve` is deliberate: a second definition of
+    // "this pixel is real" is a second definition of what GI covers.
+    return { position: g0.xyz, valid: g0.w.greaterThan(0.5) };
+  };
+  // `normal.w` is the MIRROR MASK, not a validity bit (giScreen's second pass
+  // writes 1 there for reflective pixels) — read `.xyz` and let `position.w`
+  // stay the single validity test.
+  const readNormal = (i) => normalNode.load(texelOf(i)).xyz;
 
   const frame = createSrcProbeFrame(store, {
     spacing0,
@@ -113,22 +138,72 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null } = 
     anchor: vec3(anchorU),
     pixelCount,
     maxLods: MAX_LODS,
-    readPixel: (i) => {
-      const px = i.mod(widthU);
-      const py = i.div(widthU);
-      const g0 = positionNode.load(ivec2(px.toInt(), py.toInt())).toVar();
-      // `w > 0.5` is the gbuffer's own "geometry here" mark (createGiGBuffer
-      // writes `vec4(positionWorld, 1)` and leaves untouched texels at 0). Using
-      // the same test as `createGiResolve` is deliberate: a second definition of
-      // "this pixel is real" is a second definition of what GI covers.
-      return { position: g0.xyz, valid: g0.w.greaterThan(0.5) };
-    },
+    readPixel,
   });
 
   // The gizmos share the SAME anchor uniform, not a copy. A gizmo lattice
   // drawn from a second anchor would look perfectly plausible and be in the
   // wrong place, which is the most misleading failure a debug view can have.
   const gizmos = createSrcProbeGizmos(store, { spacing0, anchor: vec3(anchorU) });
+
+  // ── THE SCAFFOLD RAY PASS (plan §12.13.5 unit 1) ─────────────────────────
+  //
+  // One profiled ray per participating pixel. It produces no light and it is
+  // meant to be deleted by unit 3 — what it produces is the ray-hit counters,
+  // which have had no producer since the dense transport died and which are the
+  // only gate on the traversal's step budgets. See `srcRayPass.js`.
+  //
+  // The R2 PHASE advances by the two plastic-constant increments each frame, so
+  // frame f traces the sequence shifted by f points. That is a scaffold-grade
+  // choice deliberately: Alg. 3 owns the real global ray numbering (unit 2), and
+  // inventing a second one here would be a throwaway scheme inside a throwaway
+  // pass. What it must NOT be is a float — §12.11.1.
+  const jitterXU = uniform(0, "uint");
+  const jitterYU = uniform(0, "uint");
+  const rayPass = volume?.occupancyField
+    ? createSrcRayPass({
+        pixelProbe: frame.pixelProbe,
+        pixelCount,
+        trace: createSrcSceneTrace(volume.occupancyField, volume.world, {
+          rayHitMode: volume.rayHitMode,
+          // ── THE STEP BUDGET, MEASURED RATHER THAN INHERITED ──────────────
+          //
+          // `createSrcSceneTrace`'s 96 is the dense backend's number, and
+          // srcTrace's own header warns that SRC's rays are LONGER than the
+          // interval rays it was tuned for. It is: on the smoke scene the
+          // legacy occupancy rung exhausts 274 times out of 19,200 rays at 96,
+          // once at 128, and never at 192 or 256. The HIT RATE converges on the
+          // same schedule (77.2% → 77.0% → 77.0%), which is the confirmation
+          // that matters — an exhausted ray fails CLOSED from detail, so those
+          // 274 were counting as hits.
+          //
+          // 192 rather than "as low as passes" because the budget is a LOOP
+          // CEILING, not a cost: a ray that resolves in twenty steps pays twenty
+          // whatever the bound is. The only thing a higher ceiling buys is that
+          // the rays which would have given up finish instead. The plane rung
+          // clears 96 on its own (0 exhaustions) — this is sized for the rung
+          // that does not.
+          //
+          // Measured on an 8 m scene. A real one has to be re-measured when unit
+          // 3 makes this the production ray, and `?raysteps=N` is the A/B.
+          steps: Number(globalThis.__giSrcRaySteps) || 192,
+          // Movers are IN. They are hit geometry for every other ray class in
+          // this module (`composeFieldDynamics`), and a budget measured with
+          // them excluded would be a budget for a medium nothing else traces.
+          skipMovers: false,
+          // Nothing here shades a mover hit, and asking for the packed id costs
+          // the marcher its dynamic-object bookkeeping on every ray.
+          wantDynObj: false,
+        }),
+        readPixel,
+        readNormal,
+        camera: vec3(cameraU),
+        spacing0,
+        jitterX: jitterXU,
+        jitterY: jitterYU,
+        maxLods: MAX_LODS,
+      })
+    : null;
 
   let anchored = false;
   let reanchors = 0;
@@ -138,8 +213,14 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null } = 
     store,
     frame,
     gizmos,
+    rayPass,
     spacing0,
-    passes: frame.passes,
+    // The ray pass rides the SAME dispatch list, after the population, because
+    // it reads `pixelProbe` — which the population's last resolve writes. A
+    // separate `renderer.compute` call would be the same barrier at the cost of
+    // one more launch; a different ORDER would trace against last frame's
+    // membership, which is the kind of one-frame skew that looks like noise.
+    passes: rayPass ? [...frame.passes, rayPass.reset, rayPass.compute] : frame.passes,
     pixelProbe: frame.pixelProbe,
     width,
     height,
@@ -153,6 +234,12 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null } = 
      */
     syncCamera(camera) {
       camera.getWorldPosition(cameraU.value);
+      // Advance the R2 phase before the re-anchor early-out below, not after —
+      // a still camera is exactly the case where every frame takes that return,
+      // and it is also the only case where a frozen ray set would be invisible
+      // (the picture would simply stop improving).
+      jitterXU.value = (jitterXU.value + R2_ALPHA1_FX) >>> 0;
+      jitterYU.value = (jitterYU.value + R2_ALPHA2_FX) >>> 0;
       const a = anchorU.value;
       const drift = Math.max(
         Math.abs(cameraU.value.x - a.x),
@@ -174,7 +261,14 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null } = 
     /** Telemetry for `profile.giPasses` and the boot log. Async — off the hot path. */
     async readStats(renderer) {
       const stats = await readSrcProbeStats(renderer, store);
-      return { cascades: stats, reanchors, bytes: store.bytes, spacing0, pixelCount };
+      return {
+        cascades: stats,
+        reanchors,
+        bytes: store.bytes,
+        spacing0,
+        pixelCount,
+        rays: rayPass ? await rayPass.readback(renderer) : null,
+      };
     },
 
     /**
@@ -187,7 +281,7 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null } = 
     setSize(nextWidth, nextHeight) {
       if (nextWidth === system.width && nextHeight === system.height) return system;
       const next = createSrcProbeSystem({
-        gbuffer, width: nextWidth, height: nextHeight, props,
+        gbuffer, width: nextWidth, height: nextHeight, props, volume,
       });
       // Carry the debug view's on/off state across the rebuild. Losing it means
       // a viewport resize silently turns the gizmos off mid-inspection, which
@@ -201,6 +295,7 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null } = 
 
     dispose() {
       gizmos.dispose();
+      rayPass?.dispose();
       frame.dispose();
       store.dispose();
     },
@@ -214,11 +309,20 @@ export function describeSrcProbeSystem(system) {
     .map((x) => `c${x.cascade} ${x.probeCapacity}/${x.hashCapacity}`)
     .join(" ");
   return `[gi] src probes: ${system.pixelCount} gbuffer pixels, s0=${system.spacing0}, ` +
-    `${c}, ${(system.store.bytes / 1048576).toFixed(2)}MB`;
+    `${c}, ${(system.store.bytes / 1048576).toFixed(2)}MB` +
+    // Named in the boot log because "SRC is populating but tracing nothing" and
+    // "SRC is tracing" are two different builds with identical probe telemetry,
+    // and the second one is the one whose step budgets are being measured.
+    (system.rayPass ? ", scaffold rays ON" : ", no volume — scaffold rays OFF");
 }
 
 /** The per-frame telemetry line (plan §8: permanent, MCP-readable). */
 export function formatSrcProbeFrame(stats) {
+  const r = stats.rays;
   return `[gi] src probes — ${formatSrcProbeStats(stats.cascades)}` +
-    (stats.reanchors > 1 ? `  reanchors ${stats.reanchors}` : "");
+    (stats.reanchors > 1 ? `  reanchors ${stats.reanchors}` : "") +
+    (r?.dispatched
+      ? `  |  rays ${r.rays} hit ${(r.hitRate * 100).toFixed(1)}% ` +
+        `t̄ ${r.meanT.toFixed(2)}m max ${r.maxT.toFixed(2)}m`
+      : "");
 }

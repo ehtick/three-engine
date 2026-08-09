@@ -29,6 +29,27 @@
         const hybridMode = expectedActiveMode >= 1;
         const planeMode = expectedActiveMode >= 2;
         const exactMode = expectedActiveMode >= 4;
+        // ── SRC'S TRACE LADDER IS NOT THE ENGINE'S ────────────────────────
+        //
+        // `pickOccTrace` (srcTrace.js) ships TWO rungs, not five (plan §4.3):
+        // the plane marcher for modes 2-4, and the legacy occupancy march for
+        // anything below — brick-box and plane-coverage are gone, because box
+        // hits quantize silhouettes to whole voxels and coverage was superseded
+        // by the triangle pool.
+        //
+        // That matters HERE because SRC's scaffold pass is now the only profiled
+        // tracer in the build. The counters that get written are the ones SRC's
+        // rung writes, not the ones the requested mode implies: `traceOccupancy`
+        // feeds rays/hits/macroSteps and nothing else, so `?mode=hybrid-brick-box`
+        // legitimately reports brickSteps = 0. Asserting otherwise — which this
+        // file did, and which is how the scaffold's first green run failed — is
+        // asserting a property of a tracer that no longer runs.
+        //
+        // Every quality tier ships HybridPlane or above (RayHitConfig), so the
+        // rungs SRC dropped are not rungs any user is on.
+        const srcPlaneTrace = expectedActiveMode >= ACTIVE_MODES["hybrid-plane"] &&
+          expectedActiveMode <= ACTIVE_MODES["hybrid-exact-complex"];
+        const srcExactTrace = expectedActiveMode === ACTIVE_MODES["hybrid-exact-complex"];
         // Phase 5 A/B: `?skip=0` compiles the no-coarse-level arm. Default on,
         // matching the runtime default, so the plain URL still smokes shipping
         // behaviour.
@@ -90,6 +111,13 @@
         // surfaces as a validation error rather than as a wrong picture.
         const srcArm = new URLSearchParams(location.search).get("src") === "1";
         if (srcArm) globalThis.__giSrcProbes = true;
+        // `?raysteps=N` — the scaffold ray pass's per-ray step budget. An A/B
+        // rather than a constant because SRC's rays are LONGER than the interval
+        // rays every existing budget was tuned against (srcTrace.js's header
+        // says so), and `stepLimitExits` is the only instrument that can say by
+        // how much. Build-time: the budget is baked into the WGSL.
+        const raySteps = Number(new URLSearchParams(location.search).get("raysteps") ?? 0);
+        if (raySteps > 0) globalThis.__giSrcRaySteps = raySteps;
         // editorFramePacing stops unfocused engines — headless the page is
         // NEVER focused, and the temporal gate below is the first assertion
         // that needs the loop RUNNING at assert time (earlier arms only read
@@ -188,10 +216,11 @@
             (!hybridMode || stats.brickSteps > 0) &&
             (!planeMode || stats.planeTests > 0) &&
             (!exactMode || stats.complexTests > 0)) break;
-          // Nothing has ever bound the counter buffer, so waiting the full
-          // minute for it to fill is waiting for something that cannot happen
-          // (see the interregnum note further down). But this loop is ALSO the
-          // boot window every later arm relies on — breaking on a fixed timer
+          // Without `?src=1` nothing binds the counter buffer at all (SRC's
+          // scaffold ray pass is the module's only profiled tracer), so waiting
+          // the full minute for it to fill is waiting for something that cannot
+          // happen. But this loop is ALSO the boot window every later arm
+          // relies on — breaking on a fixed timer
           // shortened it from 60s to 10s and the exact-complex dynobj arm then
           // measured an occupancy field that had not voxelized yet (0 -> 0).
           // So the exit condition is the field being READY, not a stopwatch.
@@ -437,6 +466,37 @@
               steps: +c.meanProbeSteps.toFixed(2), failed: c.failed,
             })),
           };
+          // ── THE SCAFFOLD RAY PASS (plan §12.13.5 unit 1) ────────────────
+          //
+          // Its own sink, not the ray-hit counters: those are shared with every
+          // other profiled trace in the build, so a nonzero `rays` there does
+          // not prove THIS pass ran. This buffer has exactly one writer.
+          //
+          // The HIT RATE is the assertion worth having. A pass that dispatched
+          // but traced garbage — a zero direction, a zero-length interval, a
+          // normal read out of the wrong channel — reports rays and zero hits,
+          // and this scene is a floor plus a wall at c0 reach, so some rays
+          // must land and some must escape. Both bounds, because 100% is the
+          // signature of a trace that hits its own origin voxel.
+          if (!src.rayPass) {
+            throw new Error("src arm: no scaffold ray pass — the volume never reached the probe system");
+          }
+          const rays = await src.rayPass.readback(engine.renderer);
+          srcReport.rays = {
+            dispatched: rays.dispatched, count: rays.rays,
+            hitRate: +rays.hitRate.toFixed(3),
+            meanT: +rays.meanT.toFixed(3), maxT: +rays.maxT.toFixed(3),
+          };
+          if (!rays.dispatched || !(rays.rays > 0)) {
+            throw new Error(`src arm: the scaffold ray pass traced nothing (dispatched=${rays.dispatched}, rays=${rays.rays})`);
+          }
+          if (!(rays.hitRate > 0)) {
+            throw new Error("src arm: every scaffold ray missed — the medium, the direction or the interval is wrong");
+          }
+          if (rays.hitRate >= 1) {
+            throw new Error("src arm: every scaffold ray hit — rays are almost certainly hitting their own origin voxel");
+          }
+          if (!(rays.maxT > 0)) throw new Error("src arm: every hit was at distance zero");
           // The gizmos must have RENDERED, not merely been constructed. Their
           // vertex stage reads the probe table out of a storage buffer, which
           // is the one thing in this file that a compute-only gate cannot
@@ -563,50 +623,53 @@
           }
         }
         if (validationErrors.length) throw new Error(validationErrors.join(" | "));
-        // ── THE TRAVERSAL COUNTERS ARE UNFED DURING THE INTERREGNUM ────────
+        // ── WHO FEEDS THE TRAVERSAL COUNTERS, AND WHEN ────────────────────
         //
-        // Every assertion below measures the ray-hit PROFILING counters, and
-        // since the dense transport was deleted (plan §12.8) nothing increments
-        // them: the module's only `profile: true` is in `srcTrace.js`, which has
-        // no caller until Phase 2 wires the diffuse rays. `RayHitDebug.readback`
-        // reports that as `dispatched: false` rather than a measured zero, and
-        // this arm honours the distinction — because the alternative is what
-        // this harness did until now: fail EVERY arm on "counters stayed at
-        // zero", which reads as a traversal regression and hides the binding
-        // audit, the dynobj arm and the validation check behind it.
+        // Every assertion below measures the ray-hit PROFILING counters, and the
+        // module has exactly one profiled trace: `srcTrace.js`, reached through
+        // the SRC scaffold ray pass. So the counters are fed if and only if the
+        // SRC arm is on — which means `?src=1` is not merely allowed to demand
+        // them, it is REQUIRED to. The leniency below is now scoped to the arms
+        // where nothing traces at all, and it is the deletion §12.13.5 unit 1
+        // asks for: what remains is not "the interregnum", it is the honest
+        // statement that a build with SRC compiled out has no profiled tracer.
         //
-        // These come back the moment Phase 2 traces a ray, and they must: they
-        // are the only gate on macro/brick step budgets and on plane-record
-        // acceptance. `?requirerays=1` pins them ON for a run that expects
-        // them, so the leniency cannot outlive the interregnum by accident.
-        const raysRequired = new URLSearchParams(location.search).get("requirerays") === "1";
+        // Before the scaffold landed this leniency covered EVERY arm, and the
+        // alternative it replaced was worse — failing all of them on "counters
+        // stayed at zero", which reads as a traversal regression and hid the
+        // binding audit, the dynobj arm and the validation check behind it.
+        // `?requirerays=1` still pins the demand on explicitly.
+        const raysRequired =
+          srcArm || new URLSearchParams(location.search).get("requirerays") === "1";
         const countersFed = stats?.dispatched !== false && (stats?.rays ?? 0) > 0;
         if (!countersFed && raysRequired) {
           throw new Error(
-            `?requirerays=1: traversal counters are unfed (dispatched=${stats?.dispatched}, ` +
-            `rays=${stats?.rays ?? 0}) — nothing traces with profiling on`,
+            `traversal counters are unfed (dispatched=${stats?.dispatched}, ` +
+            `rays=${stats?.rays ?? 0}) — nothing traced with profiling on` +
+            (srcArm ? " despite ?src=1, so the scaffold ray pass never dispatched" : ""),
           );
         }
         if (!countersFed) {
           console.log(
-            "GI-SMOKE NOTE traversal counters unfed (no profiled tracer since the transport " +
-            "deletion) — the mode-specific step/plane/triangle assertions are SKIPPED this run",
+            "GI-SMOKE NOTE traversal counters unfed (SRC is the only profiled tracer and this " +
+            "arm has it compiled out) — the mode-specific step/plane/triangle assertions are SKIPPED",
           );
         }
+        // Gated on SRC's RUNG, not the engine's mode — see `srcPlaneTrace`.
         if (countersFed) {
-          if (hybridMode && !stats.brickSteps) {
+          if (srcPlaneTrace && !stats.brickSteps) {
             throw new Error("hybrid local-brick traversal counters stayed at zero");
           }
-          if (planeMode && !stats.planeTests) {
+          if (srcPlaneTrace && !stats.planeTests) {
             throw new Error("plane-mode traversal never consulted a surface record");
           }
-          if (planeMode && !stats.planeAccepts) {
+          if (srcPlaneTrace && !stats.planeAccepts) {
             throw new Error("plane-mode traversal never accepted a plane hit");
           }
-          if (exactMode && !stats.complexTests) {
+          if (srcExactTrace && !stats.complexTests) {
             throw new Error("exact-complex traversal never entered a complex cell");
           }
-          if (exactMode && !stats.triangleTests) {
+          if (srcExactTrace && !stats.triangleTests) {
             throw new Error("exact-complex traversal never tested a triangle");
           }
         }
@@ -634,13 +697,13 @@
           // empty space (descend-only would be a ride that never pays), and
           // that `skip=0` compiled the coarse levels OUT rather than predicating
           // them away.
-          if (hybridMode && coarseSkip && !stats.coarseSteps) {
+          if (srcPlaneTrace && coarseSkip && !stats.coarseSteps) {
             throw new Error("coarse pyramid ride never engaged");
           }
-          if (hybridMode && coarseSkip && !(stats.coarseSkipsL3 + stats.coarseSkipsL4)) {
+          if (srcPlaneTrace && coarseSkip && !(stats.coarseSkipsL3 + stats.coarseSkipsL4)) {
             throw new Error("coarse skip never advanced through empty space");
           }
-          if (hybridMode && !coarseSkip && stats.coarseSteps !== 0) {
+          if (srcPlaneTrace && !coarseSkip && stats.coarseSteps !== 0) {
             throw new Error(`skip=0 arm still executed ${stats.coarseSteps} coarse levels`);
           }
         }
