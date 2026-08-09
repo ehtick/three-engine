@@ -2580,7 +2580,7 @@ export class GISystem {
    * rebuild, its shader stays in the pipeline cache, and a quality change or
    * an auto-fit refit no longer triggers a material recompile wave.
    */
-  #buildScreenResolve({ gather, light, emitterSlots, radianceLookup = null, lightSlots = null, ao = null, lightShadow = null, emitterRecordTrace = null, emitterCutoff = null, volume = null }) {
+  #buildScreenResolve({ gather, light, emitterSlots, radianceLookup = null, lightSlots = null, ao = null, lightShadow = null, emitterRecordTrace = null, emitterCutoff = null, volume = null, skyRadiance = null }) {
     const renderer = this.engine.renderer;
     if (!renderer?.backend?.device) return null;
     const { width, height } = this.#screenResolveSize();
@@ -2691,6 +2691,32 @@ export class GISystem {
             lightSlots,
           }
         : null;
+      // ── SRC (plan §7 Phase 1-2) ───────────────────────────────────────────
+      //
+      // Opt-in via `__giSrcProbes`, and it will stay that way until Phase 6.
+      // Built HERE, ahead of the resolve, because since unit 4 it has something
+      // the resolve wants: a c0-only irradiance texture. It hangs off the SCREEN
+      // bundle rather than off `state` because it is a pure function of the
+      // gbuffer — same lifetime, same resize, same dispose.
+      let srcProbes = null;
+      if (srcProbesEnabled()) {
+        try {
+          srcProbes = createSrcProbeSystem({
+            gbuffer, width, height, props: this.component?.props ?? null, volume, sky: skyRadiance,
+          });
+          console.log(describeSrcProbeSystem(srcProbes));
+        } catch (error) {
+          // Never take the shipping chain down for an experimental branch.
+          console.warn("[gi] src probes unavailable:", error?.message ?? error);
+          srcProbes = null;
+        }
+      }
+      // SCREEN-SPACE, hence its own input rather than `gather`. `createGiResolve`
+      // also calls `gather` at an exact-reflection HIT, which is an arbitrary
+      // world point this texture cannot answer for; that call site keeps its
+      // `gather == null` behaviour until Phase 3's position-indexed probe
+      // gather exists. See srcGather.js's header.
+      inputs.screenGather = srcProbes?.gather?.node ?? null;
       const resolve = createGiResolve({ gbuffer, targets, width, height, ...inputs });
       // The shadow trace as its own pass at its own budget — see
       // createGiLightShadowPass for why it left the resolve kernel.
@@ -2955,35 +2981,15 @@ export class GISystem {
       // smearing white dots across the dark silhouette in front of it.
       light.giPositionNode = this._giShadowPosNode;
       light.giScreenTexel = this._giLightShadowTexel;
-      // ── SRC PROBE POPULATION (plan §7 Phase 1) ────────────────────────────
-      // Opt-in via `__giSrcProbes`, and it will stay that way until Phase 6:
-      // the population produces no light yet (the diffuse indirect term is
-      // absent — §12.8), so enabling it by default would cost GPU time and
-      // change nothing on screen, while making every existing probe's numbers
-      // incomparable with the ones already recorded in §12.
-      //
-      // It hangs off the SCREEN bundle rather than off `state` because it is a
-      // pure function of the gbuffer: same lifetime, same resize, same dispose.
-      let srcProbes = null;
-      if (srcProbesEnabled()) {
-        try {
-          srcProbes = createSrcProbeSystem({
-            gbuffer, width, height, props: this.component?.props ?? null, volume,
-          });
-          // The gizmos go in the scene rather than on `state.gizmos`, because
-          // they belong to the SCREEN bundle's lifetime (they read its probe
-          // table) and `state.gizmos` is disposed on a different schedule.
-          // `__giDebug` on each mesh keeps them out of the gbuffer prepass, the
-          // voxelizer and the light tree — a gizmo that voxelized would occlude
-          // the field it is drawing.
-          this.engine.scene.add(srcProbes.gizmos.group);
-          srcProbes.gizmos.setVisible(this.component?.props?.debugProbes === "src-probes");
-          console.log(describeSrcProbeSystem(srcProbes));
-        } catch (error) {
-          // Never take the shipping chain down for an experimental branch.
-          console.warn("[gi] src probes unavailable:", error?.message ?? error);
-          srcProbes = null;
-        }
+      if (srcProbes) {
+        // The gizmos go in the scene rather than on `state.gizmos`, because
+        // they belong to the SCREEN bundle's lifetime (they read its probe
+        // table) and `state.gizmos` is disposed on a different schedule.
+        // `__giDebug` on each mesh keeps them out of the gbuffer prepass, the
+        // voxelizer and the light tree — a gizmo that voxelized would occlude
+        // the field it is drawing.
+        this.engine.scene.add(srcProbes.gizmos.group);
+        srcProbes.gizmos.setVisible(this.component?.props?.debugProbes === "src-probes");
       }
       return { gbuffer, srcProbes, resolve, lightShadowPass, lightShadowFilterPass, lightShadowWidePass, lightShadowWidePass2, lightShadowHistoryPass, lightShadowPostPass, emitterShadowPass, emitterShadowFilterPass, emitterShadowHistoryPass, emitterShadowPostPass, targets, width, height, shadowWidth: shadowW, shadowHeight: shadowH, emitterShadowWidth: emitterW, emitterShadowHeight: emitterH, ...inputs };
     } catch (error) {
@@ -4134,10 +4140,15 @@ export class GISystem {
     });
     const screen = this.#buildScreenResolve({
       gather, light, emitterSlots, radianceLookup: deferredRadianceLookup, ao, lightShadow,
-      // For the SRC scaffold ray pass ONLY (plan §12.13.5 unit 1) — it is the
-      // first thing in SRC that traces, and the medium it traces has to be the
-      // same one every other ray class in this build uses.
+      // SRC traces against the SAME medium every other ray class in this build
+      // uses — that is the whole reason `srcTrace.js` is an extraction of the
+      // occupancy marcher rather than a second one.
       volume,
+      // The scene's authored Sky Light, which lost its consumer when the dense
+      // transport died (§12.8) and gets one back in unit 4: SRC's c0-only resolve
+      // composites it where a bin's transmittance survived. Default intensity is
+      // 0, so a project that never touched it still renders exactly as it did.
+      skyRadiance,
       emitterRecordTrace: emitterSlots ? this.#buildEmitterRecordTrace(volume, quality) : null,
       // EMITTER REACH PER PRESET. Falloff is 1/d², so the pixels that pay for
       // an emitter's shadow march scale as 1/cutoff — this is the dominant
@@ -4235,6 +4246,11 @@ export class GISystem {
 
     this.state = {
       volume,
+      // The scene's authored Sky Light, which lost its consumer when the dense
+      // transport died (§12.8) and gets one back in unit 4: SRC's c0-only resolve
+      // composites it where a bin's transmittance survived. Default intensity is
+      // 0, so a project that never touched it still renders exactly as it did.
+      skyRadiance,
       atlas,
       diagU,
       queue,

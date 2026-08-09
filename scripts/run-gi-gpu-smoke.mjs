@@ -46,6 +46,12 @@ for (const arm of arms) {
           console.log(`  src deposits: ${r.deposits} (${r.perRay}/ray) into ` +
             `${(r.bins / 1e6).toFixed(2)}M bins, ${r.clamped} clamped`);
         }
+        const g = result.srcProbes.gather;
+        if (g) {
+          console.log(`  src c0 gather: sky ${g.sky}, ${g.lit}/${g.pixels} pixels lit ` +
+            `(${g.unknown} empty-probe, ${g.facing} wrong-hemisphere, ${g.badN} bad-normal), lum ${g.minLum}..${g.maxLum} mean ${g.meanLum}, ` +
+            `contrast ${g.contrast}, ${g.sampled}/${g.totalBins} bins sampled per pixel`);
+        }
       }
       const unfed = logs.find((l) => l.includes("traversal counters unfed"));
       if (unfed) console.log(`  note: ${unfed.replace("GI-SMOKE NOTE ", "")}`);

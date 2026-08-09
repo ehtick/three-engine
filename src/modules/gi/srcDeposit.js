@@ -240,6 +240,9 @@ export function createSrcDepositFrame(store, bins, {
 
     const px = readPixel(i);
     const P = vec3(px.position).toVar();
+    // The normal arrives ALREADY faced toward the camera (srcSystem's
+    // `readPixel`) — one definition, shared with the gather, so the
+    // hemisphere these rays fill is the hemisphere that reads them back.
     const Nrm = vec3(readNormal(i)).normalize().toVar();
 
     // The pixel's LOD sets the interval ladder. Recomputed rather than read out

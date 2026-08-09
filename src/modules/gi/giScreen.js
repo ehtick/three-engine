@@ -275,7 +275,7 @@ export function renderGiGBuffer(renderer, scene, camera, gbuffer, { mirrorMask =
  * here — emitter direct, analytic direct, reflections, sun shadows — is
  * independent of it and keeps working.
  */
-export function createGiResolve({ gbuffer, targets, width, height, gather = null, cameraPosition = null, normalOffset, intensity, emitter, radiance = null, bvhShade = null, ao = null }) {
+export function createGiResolve({ gbuffer, targets, width, height, gather = null, screenGather = null, cameraPosition = null, normalOffset, intensity, emitter, radiance = null, bvhShade = null, ao = null }) {
   // The TARGETS are owned by the caller and outlive every rebuild: materials
   // sample them through persistent texture nodes, so recreating them here
   // would silently leave already-compiled materials bound to dead textures.
@@ -316,6 +316,22 @@ export function createGiResolve({ gbuffer, targets, width, height, gather = null
       // resolve has no camera at all, which disables it exactly.
       const viewDir = cameraPosition ? vec3(cameraPosition).sub(P).normalize().toVar() : vec3(0);
       if (gather) out.assign(vec3(gather(samplePoint, N, viewDir)).mul(intensity));
+      // ── SCREEN-SPACE DIFFUSE INDIRECT (SRC's c0-only resolve) ───────────
+      //
+      // A TEXTURE, not a closure, and that is the whole reason it is a separate
+      // input. `gather` is inlined into this kernel, which already carries the
+      // gbuffer, the emitter slots, the occupancy pyramid and the BVH against a
+      // PORTABLE limit of eight storage buffers per stage — SRC's version would
+      // have added the probe table, the payload and the hash. Its own pass
+      // writes a half-res texture instead, and a texture binding is free of that
+      // limit (srcGather.js's header).
+      //
+      // It answers for THIS PIXEL only, so it is deliberately not wired into the
+      // reflection-hit shading below: that call site asks about an arbitrary
+      // world point, which a screen-space texture cannot answer, and it keeps
+      // its documented `gather == null` behaviour until Phase 3's
+      // position-indexed probe gather exists.
+      if (screenGather) out.addAssign(screenGather.load(coord).xyz.mul(intensity));
       // AMBIENT OCCLUSION ON THE INDIRECT TERM (occupancy-oracle obscurance).
       //
       // The probe lattice is ~1m — indirect light arrives with NO small-scale

@@ -41,7 +41,7 @@
 // docs/GI_SRC_REBUILD_PLAN.md §4.1, §4.2, §7 Phase 1.
 
 import * as THREE from "three/webgpu";
-import { ivec2, texture, uniform, vec3 } from "three/tsl";
+import { ivec2, step, texture, uniform, vec3 } from "three/tsl";
 import { CASCADE_COUNT, MAX_LODS, SRC_QUALITY, W0, srcQualityTier } from "./srcConfig.js";
 import { createSrcProbeGizmos } from "./srcGizmos.js";
 import { R2_ALPHA1_FX, R2_ALPHA2_FX } from "./srcMath.js";
@@ -52,6 +52,7 @@ import {
   readSrcProbeStats,
 } from "./srcProbes.js";
 import { createSrcBinStore, createSrcDepositFrame } from "./srcDeposit.js";
+import { createSrcGatherPass } from "./srcGather.js";
 import { createSrcRayFrame, createSrcRayStore } from "./srcRays.js";
 import { createSrcSceneTrace } from "./srcTrace.js";
 
@@ -99,7 +100,7 @@ function expectedC0Probes(pixelCount) {
  *   pages have no engine and therefore no volume; they build the frame and
  *   nothing else, which is what keeps them standalone.
  */
-export function createSrcProbeSystem({ gbuffer, width, height, props = null, volume = null } = {}) {
+export function createSrcProbeSystem({ gbuffer, width, height, props = null, volume = null, sky = null } = {}) {
   const tier = SRC_QUALITY[srcQualityTier(props)];
   const spacing0 = Number(globalThis.__giSrcSpacing0) || tier.spacing0;
   const pixelCount = width * height;
@@ -121,17 +122,51 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null, vol
   /** Texel coords for a linear pixel index — the one decode both readers use. */
   const texelOf = (i) => ivec2(i.mod(widthU).toInt(), i.div(widthU).toInt());
   const readPixel = (i) => {
-    const g0 = positionNode.load(texelOf(i)).toVar();
-    // `w > 0.5` is the gbuffer's own "geometry here" mark (createGiGBuffer
-    // writes `vec4(positionWorld, 1)` and leaves untouched texels at 0). Using
-    // the same test as `createGiResolve` is deliberate: a second definition of
-    // "this pixel is real" is a second definition of what GI covers.
-    return { position: g0.xyz, valid: g0.w.greaterThan(0.5) };
+    const t = texelOf(i);
+    const g0 = positionNode.load(t).toVar();
+    // ══ `position.w > 0.5` IS NOT SUFFICIENT, MEASURED ═══════════════════════
+    //
+    // It is the gbuffer's own "geometry here" mark and it is what
+    // `createGiResolve` tests, so the first version of this used it alone. On
+    // the smoke scene that admitted **8,809 of 19,200 pixels (46%)** which have
+    // no geometry at all: their position is the origin and their NORMAL IS
+    // ZERO. Every one of them inserted a probe at the world origin, was handed
+    // a ray budget, fired a hemisphere of rays around `normalize(0)` = NaN, and
+    // then gathered nothing — the failure presented as "GI is patchy" and took
+    // three wrong hypotheses (probe density, back-facing normals, hemisphere
+    // coverage) before a bad-normal counter named it in one run.
+    //
+    // A pixel with no normal cannot be shaded and cannot define a hemisphere,
+    // so it is not a pixel GI covers. Testing BOTH channels here rather than in
+    // each consumer is the point: one definition of "this pixel is real", which
+    // the population, the ray budget, the deposit and the gather all inherit.
+    const nrm = normalNode.load(t).xyz.toVar();
+    // ── FACE FORWARD TOWARD THE CAMERA, HERE AND NOWHERE ELSE ─────────────
+    //
+    // The same flip `createGiResolve` and `giLight` apply: a double-sided wall
+    // seen from inside a room has a normal pointing OUT, and firing a
+    // hemisphere of rays into that direction samples the outside of the room.
+    //
+    // It lives at the ENGINE BOUNDARY rather than in the kernels, and that
+    // placement is the point. It is a gbuffer fact, not an algorithm property —
+    // `srcRef.js`'s `traceAndDeposit` takes the normal it is handed. Putting it
+    // in the deposit kernel made the GPU and the mirror disagree about 28% of
+    // bins in one run of `test:gi-src-deposit`, which is exactly the kind of
+    // divergence a second definition produces. Here, the deposit's ray
+    // hemisphere and the gather's query hemisphere are the same vector by
+    // construction — and a flip on one side only would have each read the half
+    // of the bin sphere the other never filled.
+    const facing = step(0, nrm.dot(vec3(cameraU).sub(g0.xyz))).mul(2).sub(1).toVar();
+    return {
+      position: g0.xyz,
+      valid: g0.w.greaterThan(0.5).and(nrm.dot(nrm).greaterThan(0.25)),
+      normal: nrm.mul(facing),
+    };
   };
   // `normal.w` is the MIRROR MASK, not a validity bit (giScreen's second pass
   // writes 1 there for reflective pixels) — read `.xyz` and let `position.w`
   // stay the single validity test.
-  const readNormal = (i) => normalNode.load(texelOf(i)).xyz;
+  const readNormal = (i) => readPixel(i).normal;
 
   const frame = createSrcProbeFrame(store, {
     spacing0,
@@ -232,6 +267,24 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null, vol
       })
     : null;
 
+  // ── [G-lite]: THE c0-ONLY RESOLVE (plan §7 Phase 2, §12.13.5 unit 4) ─────
+  //
+  // The merge is ABSENT, not disabled — cascades 1-3 are populated, budgeted and
+  // deposited into every frame and this reads none of it. That is what makes it
+  // a sanity check: if the picture is wrong here, the merge cannot be why.
+  const gather = binStore
+    ? createSrcGatherPass(store, binStore, {
+        pixelProbe: frame.pixelProbe,
+        readNormal,
+        // The scene's own Sky Light. Zero when a project never set it, which
+        // means this build still renders exactly as it did — see srcGather.js.
+        sky: sky ? vec3(sky) : vec3(0),
+        width,
+        height,
+        w0: W0,
+      })
+    : null;
+
   let anchored = false;
   let reanchors = 0;
   const scratch = new THREE.Vector3();
@@ -244,6 +297,7 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null, vol
     rayFrame,
     binStore,
     deposit,
+    gather,
     spacing0,
     raysPerPixel: tier.raysPerPixel,
     // ONE dispatch list, in dependency order: population → budget → trace and
@@ -253,7 +307,7 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null, vol
     // order would spend this frame's rays against last frame's membership, which
     // is the kind of one-frame skew that reads as noise rather than as a bug.
     passes: deposit
-      ? [...frame.passes, ...rayFrame.passes, ...deposit.passes]
+      ? [...frame.passes, ...rayFrame.passes, ...deposit.passes, gather.reset, gather.compute]
       : [...frame.passes, ...rayFrame.passes],
     pixelProbe: frame.pixelProbe,
     width,
@@ -304,6 +358,7 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null, vol
         raysPerPixel: tier.raysPerPixel,
         totalRays: await rayFrame.readTotal(renderer),
         rays: deposit ? await deposit.readStats(renderer) : null,
+        gather: gather ? await gather.readStats(renderer) : null,
       };
     },
 
@@ -317,7 +372,7 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null, vol
     setSize(nextWidth, nextHeight) {
       if (nextWidth === system.width && nextHeight === system.height) return system;
       const next = createSrcProbeSystem({
-        gbuffer, width: nextWidth, height: nextHeight, props, volume,
+        gbuffer, width: nextWidth, height: nextHeight, props, volume, sky,
       });
       // Carry the debug view's on/off state across the rebuild. Losing it means
       // a viewport resize silently turns the gizmos off mid-inspection, which
@@ -331,6 +386,7 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null, vol
 
     dispose() {
       gizmos.dispose();
+      gather?.dispose();
       binStore?.dispose();
       rayStore.dispose();
       frame.dispose();

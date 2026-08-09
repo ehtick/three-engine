@@ -118,6 +118,18 @@
         // how much. Build-time: the budget is baked into the WGSL.
         const raySteps = Number(new URLSearchParams(location.search).get("raysteps") ?? 0);
         if (raySteps > 0) globalThis.__giSrcRaySteps = raySteps;
+        // `?sky=N` — SRC's c0-only resolve composites the scene's own Sky Light
+        // where a bin's transmittance survived, and `skyIntensity` DEFAULTS TO
+        // ZERO. So without this the whole gather is a correct, verifiable,
+        // entirely black picture — which is exactly what unit 4 must not be
+        // allowed to ship as. Set on the component below, not here.
+        const skyArm = Number(new URLSearchParams(location.search).get("sky") ?? 0);
+        // `?s0=N` — probe spacing at LOD 0, overriding the quality tier. The A/B
+        // for the wrong-hemisphere count: an SRC probe is position-only, so one
+        // shared by two surfaces facing opposite ways has bins in only one of
+        // their hemispheres. Fewer, larger probes should make that worse.
+        const s0Arm = Number(new URLSearchParams(location.search).get("s0") ?? 0);
+        if (s0Arm > 0) globalThis.__giSrcSpacing0 = s0Arm;
         // editorFramePacing stops unfocused engines — headless the page is
         // NEVER focused, and the temporal gate below is the first assertion
         // that needs the loop RUNNING at assert time (earlier arms only read
@@ -188,6 +200,9 @@
         gi.addComponent("global-illumination", {
           autoFit: true,
           quality: "low",
+          // `?sky=N` — see the note by `skyArm`. Zero keeps every pre-existing
+          // baseline byte-identical, which is why it is the shipping default.
+          skyIntensity: skyArm,
           cascadeCount: 2,
           c0DirRes: 2,
           reflections: false,
@@ -516,6 +531,96 @@
               "still zero — something is depositing radiance from somewhere",
             );
           }
+
+          // ── THE c0-ONLY RESOLVE (plan §12.13.5 unit 4) ──────────────────
+          //
+          // The output is a StorageTexture, and reading one back headlessly is
+          // the rig problem [[gi-harness-viewport-traps]] records — so the
+          // gather writes the numbers a gate needs into a buffer alongside the
+          // pixels. These four failures look identical on screen and different
+          // here: no probe, every bin unknown, lit but flat, lit and varying.
+          const g = s.gather;
+          if (!g?.dispatched) throw new Error("src arm: the c0-only gather never dispatched");
+          srcReport.gather = {
+            pixels: g.pixels, unknown: g.unknown, facing: g.facing, badN: g.badNormals, lit: g.lit,
+            meanLum: +g.meanLum.toFixed(4), minLum: +g.minLum.toFixed(4),
+            maxLum: +g.maxLum.toFixed(4), contrast: +g.contrast.toFixed(3),
+            sampled: +g.meanSampledBins.toFixed(1), totalBins: g.totalBins,
+            sky: skyArm,
+          };
+          if (!(g.pixels > 0)) {
+            throw new Error("src arm: the gather saw no pixel with a c0 probe");
+          }
+          // Deposits landed, so a pixel whose every bin is unknown means its
+          // probe got none of them — a broken probe/bin address, not sparsity.
+          // `unknown` is now the FAULT case only (the probe holds no sampled bin
+          // at all); `facing` is the structural one, split out in the kernel.
+          // Deposits landed this frame, so an empty probe means the bins the
+          // deposit wrote and the bins the gather reads are not the same bins.
+          // STRUCTURALLY IMPOSSIBLE SINCE THE VALIDITY FIX, and pinned here so
+          // it stays that way: a pixel with a degenerate normal no longer gets a
+          // probe at all (srcSystem's readPixel). Before that, 46% of this
+          // scene's pixels had one, fired a hemisphere of rays around NaN and
+          // gathered nothing.
+          if (g.badNormals !== 0) {
+            throw new Error(
+              `src arm: ${g.badNormals}/${g.pixels} gathered pixels have a degenerate gbuffer normal — ` +
+              "the validity test admitted a pixel with no geometry",
+            );
+          }
+          if (g.unknown > g.pixels * 0.02) {
+            throw new Error(
+              `src arm: ${g.unknown}/${g.pixels} pixels found their probe EMPTY while ` +
+              `${rays.deposits} deposits landed — the deposit and the gather disagree about addresses`,
+            );
+          }
+          if (skyArm > 0) {
+            // THE PAYOFF ASSERTION. With hit shading still zero the only term
+            // is sky·transmittance, so this is ambient occlusion — and the two
+            // things that must both be true are that light arrives at all, and
+            // that it is NOT uniform. A flat result would mean the occlusion
+            // term is doing nothing, which looks like plain ambient on screen
+            // and passes every other check in this file.
+            // Every pixel that has a probe should end up lit in an open scene:
+            // the only way not to is a fully enclosed hemisphere, and this scene
+            // has none. A shortfall here is the wrong-hemisphere effect, which
+            // is REAL in general (probes are position-only) but should be zero
+            // on a scene this simple.
+            if (g.facing > g.pixels * 0.02) {
+              throw new Error(
+                `src arm: ${g.facing}/${g.pixels} pixels found their probe's bins entirely ` +
+                "outside their own hemisphere on a scene with no enclosed surfaces",
+              );
+            }
+            if (!(g.lit > 0)) {
+              throw new Error(`src arm: sky=${skyArm} and not one pixel came out lit`);
+            }
+            if (!(g.contrast > 0.05)) {
+              throw new Error(
+                `src arm: irradiance is flat (min ${g.minLum.toFixed(4)}, max ` +
+                `${g.maxLum.toFixed(4)}, contrast ${g.contrast.toFixed(3)}) — with no hit ` +
+                "shading the only term is sky x transmittance, so no contrast means no occlusion",
+              );
+            }
+            // A fully open hemisphere under uniform sky radiance L returns pi*L
+            // (equal-area bins, Sum max(0,cos)*dOmega = pi). Anything past that
+            // is energy the gather invented — a renormalization that overshoots,
+            // or a solid angle counted twice.
+            const ceiling = Math.PI * skyArm * 1.05;
+            if (g.maxLum > ceiling) {
+              throw new Error(
+                `src arm: peak irradiance ${g.maxLum.toFixed(3)} exceeds pi x sky = ` +
+                `${(Math.PI * skyArm).toFixed(3)} — the gather is creating energy`,
+              );
+            }
+          } else if (g.lit !== 0) {
+            // Sky off and hit shading absent means there is genuinely no light.
+            // A lit pixel here is light from nowhere.
+            throw new Error(
+              `src arm: ${g.lit} pixels are lit with skyIntensity 0 and no hit shading — ` +
+              "the gather is producing light from nothing",
+            );
+          }
           // ── THE BUDGET AND THE TRACER MUST AGREE ──────────────────────
           //
           // Algorithm 3 (`srcRays.js`, plan §12.13.5 unit 2) partitions
@@ -734,7 +839,27 @@
         // measured zeros. `skip=0`'s "still executed N coarse levels" would
         // even PASS on unfed counters, which is worse than failing.
         if (countersFed) {
-          if (stats.stepLimitExits !== 0) throw new Error(`GI traversal exhausted its step limit ${stats.stepLimitExits} times`);
+          // ── A RATE, NOT AN ABSOLUTE ZERO, AND THE MEASUREMENT THAT FORCED IT ──
+          //
+          // This was `!== 0` for the dense backend, whose profiled rays were
+          // short INTERVAL rays. SRC's are full-length and hemispherical from
+          // every pixel, so a few are tangent to the surface they were born on
+          // by construction — and occupancyField's own note says exhaustion
+          // "leaks worst exactly where the DDA descends most: a light raking
+          // along a floor or wall". Those rays fail CLOSED, which is designed.
+          //
+          // It is a rate rather than a budget problem, and that was measured
+          // rather than assumed: the count is 0 or 1 out of ~10,400 rays and is
+          // INSENSITIVE to the ceiling (1 at 192 steps, still 1 at 256), which
+          // is what rules out "the ray is too long". The bound stays tight
+          // enough that a real traversal regression still trips it.
+          const exitRate = stats.rays > 0 ? stats.stepLimitExits / stats.rays : 0;
+          if (exitRate > 0.0005) {
+            throw new Error(
+              `GI traversal exhausted its step limit ${stats.stepLimitExits} times ` +
+              `in ${stats.rays} rays (${(exitRate * 100).toFixed(4)}%, budget 0.05%)`,
+            );
+          }
           if (stats.macroStepLimitExits !== 0 || stats.brickStepLimitExits !== 0) {
             throw new Error(`hybrid traversal limit detail macro=${stats.macroStepLimitExits} brick=${stats.brickStepLimitExits}`);
           }
