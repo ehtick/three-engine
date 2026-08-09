@@ -1995,3 +1995,96 @@ Gates at `4c004ee`, all green: `smoke:gi-gpu` on `?src=1`, `+mode=hybrid-plane`,
 as designed. `test:gi-src-{math,probes,populate}` ×2, `test:gi-src-{ref,volume}`, `test:gi-dynobj`,
 proxy-fit, boot-ambient, light-tree. **Emitter shadow probe EXACT on both arms** —
 `penumbraPx=16601 grain=0.0307`, `floorIn=12865 miss=14573`, unchanged from `711a8e1`.
+
+### 12.15 Phase 2 unit 2 — Algorithm 3, and the two passes it does not need
+
+`85a2062`. `srcRays.js`: counts UP the ladder, offsets DOWN, ten dispatches. §12.13.3 pre-decided
+the shape and it survived contact — what follows is what it cost and what the gate had to be.
+
+#### 12.15.1 An atomic cursor IS an offset allocator
+
+Read as written, Alg. 3 wants two things the GPU is bad at: a prefix scan over the top cascade, and
+a child list per parent (a compaction, since "the children of probe P" is not a contiguous range
+anywhere). One trick removes BOTH, and it is worth stating in that generality because the second use
+was not in §12.13.3:
+
+> Seed a cursor with a range's start, and `atomicAdd(cursor, n)` returns a slice of it. The claims
+> partition the range exactly — no gaps, no overlaps — and it costs one atomic per claimant.
+
+- **Down the ladder**: each parent's cursor starts at its own `rayOffset`; each child claims.
+- **The top cascade**: one GLOBAL cursor starting at 0; each top probe claims. That is the scan.
+- **The pixels**: each c0 probe's cursor, already seeded, hands out `raysPerPixel` per pixel. Same
+  allocator, third use.
+
+**Each probe seeds its OWN cursor in the same pass that claims its slice**, which is safe rather
+than lucky: its children read that cursor in the NEXT dispatch, so it is a write-then-read across a
+barrier. That collapses what looked like two passes per level (init, then claim) into one.
+
+#### 12.15.2 THE COUNTS CANNOT LIVE IN `probeTable`, AND THE REASON IS THE DEBUG VIEW
+
+`PROBE_RAYS`/`PROBE_RAYOFF` were reserved for this in Phase 1 and both are still written — but as
+PLAIN copies by the owning thread, after the fact. The accumulator has to be atomic (every pixel
+adds into its c0 probe, every child into its parent), and **`probeTable` cannot become an atomic
+buffer: `srcGizmos.js` reads it from a VERTEX stage, where WebGPU binds storage buffers read-only
+and an atomic needs `read_write`.** Converting the table would have compiled, then failed the gizmo
+pipeline — i.e. it would have cost the debug view that §12.13.1's outstanding eye check depends on.
+
+Aliasing one buffer behind an atomic and a non-atomic node is the other obvious escape, and
+`srcProbes.js` had already considered and rejected it ("one buffer, one definition of what it is").
+So the accumulators are their own buffers (`rayCount`, `rayCursor`, one atomic word for the total)
+and the table keeps the settled answer, which is what every non-atomic reader wants anyway.
+
+`rayCursor` is deliberately NOT cleared per frame: every live probe overwrites it before any child
+reads it, and a dead probe's stale cursor is never read. `PROBE_RAYOFF` clears to **SLOT_EMPTY, not
+0** — zero is a VALID offset that exactly one probe per frame owns, so a dead probe left at 0 is
+indistinguishable from the probe owning the start of the sequence, and a consumer walking a broken
+chain would deposit into ray 0.
+
+#### 12.15.3 The gate compares the partition, and proves the non-determinism is real
+
+`test:gi-src-rays` — standalone page, own renderer, synthetic gbuffer, no engine, same isolation
+`gi-src-populate` gets. Six arms: counts by KEY, top-cascade tiling of `[0, total)`, each parent's
+children tiling ITS range, pixel slices tiling their probe's segment, `[0, total)` as a permutation
+end to end, and a rerun. `raysPerPixel` is pinned to **2**, because at 1 a probe's count equals its
+pixel count and an implementation that forgot the multiply passes every arm.
+
+Result: **9,374 rays over 410 → 115 → 65 → 64 probes**, matching the mirror exactly, with
+conservation checked at EVERY level rather than only at the top (a level whose sum drops is a broken
+parent link eating rays silently).
+
+The rerun arm is the one worth copying. It asserts the total and the counts are identical, and
+**REPORTS the number of probes handed a different offset rather than asserting anything about it** —
+measured at 169 / 93 / 115 / 54 across four runs. A run where NOTHING moved would mean the atomics
+happened to serialize, and the gate would be passing without ever exercising the scheduler
+non-determinism its whole design is built around. Printing it is how a future session can tell a
+green from a vacuous green.
+
+#### 12.15.4 The scaffold now fires the real indices, which buys an end-to-end invariant
+
+`srcRayPass.js` used the PIXEL index as its R2 index because Alg. 3 did not exist yet. It now uses
+`pixelRayBase[i] + k`, unrolled `raysPerPixel` times (the marcher is a `sharedFn`, so N rays are N
+call sites, not N copies of the DDA). That makes the scaffold's own ray count equal the frame's
+`totalRays`, and the two numbers come from OPPOSITE ENDS of the frame — one from Alg. 3's global
+cursor on the CPU readback, one from an atomic inside the marcher's kernel. The smoke asserts they
+match: **19,200 traced = 19,200 budgeted on every arm.**
+
+That check covers exactly what the standalone gate cannot: the REAL gbuffer. A pixel whose probe
+exists but whose range never arrived keeps `SLOT_EMPTY` and simply does not fire — silent
+everywhere else.
+
+The ray frame is built UNCONDITIONALLY (unlike the scaffold trace, which needs a volume): the budget
+is not a diagnostic, it is the numbering every later deposit is addressed by, and unit 3 needs it
+either way. Ten tiny dispatches over the probe table, no marching — the smoke's SRC arm went 19 → 29
+dispatches and the binding audit still finds nothing near the portable limit.
+
+#### 12.15.5 What unit 3 starts from
+
+Everything it addresses now exists: a probe set, a complete ancestor chain per probe, a bound and
+budget-measured tracer, and a global ray numbering whose partition is proven against the mirror. The
+deposit's remaining decisions are §12.13.4's — F = 16, and the `Lmax` clamp-vs-auto-exposure question
+that is deliberately still open pending a measured hit-radiance distribution. The scaffold's sink
+already reports mean and max hit distance per frame, which is the instrument that question needs.
+
+Gates at `85a2062`: `test:gi-src-rays` ×4, `test:gi-src-{math,probes,populate,ref,volume}`,
+`smoke:gi-gpu` on all four src arms and both non-src defaults, emitter shadow probe EXACT
+(`penumbraPx=16601 grain=0.0307`).
