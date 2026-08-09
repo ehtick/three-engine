@@ -23,7 +23,8 @@ import { createCascadeMerge } from "./cascadeMerge.js";
 import { createBounceFeedback, createIrradianceGather, createProbeDepthMoments, createProbeIrradiance, createRadianceLookup, depthMomentsAlpha, gatherBias, gatherViewBias, probeSnapAlpha } from "./cascadeGather.js";
 import { blitBvhAtlasTiles, createGiBvhReflect, createGiBvhTarget, createGiEmitterShadowPass, createGiGBuffer, createGiLightShadowFilterPass, createGiLightShadowHistoryPass, createGiLightShadowPass, createGiLightShadowWidePass, createGiResolve, createGiTargets, renderGiGBuffer } from "./giScreen.js";
 import { resolveMaterialSurface, serializeMeshForBake } from "./voxelizeOnce.js";
-import { createOccupancyDebugMaterial, createSdfDebugMaterial, createGiField } from "./giField.js";
+import { createGiField } from "./giField.js";
+import { createSrcDistanceView, createSrcOccupancyView } from "./srcDebugViews.js";
 import { createOccupancyField, describeOccupancyField, quantizeOccupancyRes } from "./occupancyField.js";
 import { BVH_STRATEGY, buildStaticSceneBvhWords, classifyDynamicShape, composeFieldDynamics, createDynamicObjectSet, dynHeaderWords, giMobilityOf, giTraceOf } from "./dynamicObjects.js";
 import { CARD_SLOTS, CARD_WORDS, buildSurfaceCache, cardLayerCount } from "./surfaceCache.js";
@@ -4959,7 +4960,7 @@ export class GISystem {
 
     const gizmos = this.#buildGizmos(cascades, bounds);
     gizmos.sdfView = this.#buildSdfView(volume, bounds, center);
-    gizmos.all.push(gizmos.sdfView);
+    if (gizmos.sdfView) gizmos.all.push(gizmos.sdfView);
     gizmos.occView = this.#buildOccupancyView(volume, bounds, center);
     if (gizmos.occView) gizmos.all.push(gizmos.occView);
     for (const mesh of gizmos.all) engine.scene.add(mesh);
@@ -8299,7 +8300,7 @@ export class GISystem {
     const size = new THREE.Vector3().subVectors(bounds.max, bounds.min);
     const mesh = new THREE.Mesh(
       new THREE.BoxGeometry(size.x, size.y, size.z),
-      createOccupancyDebugMaterial(volume),
+      createSrcOccupancyView(volume),
     );
     mesh.position.copy(center);
     mesh.frustumCulled = false;
@@ -8309,12 +8310,18 @@ export class GISystem {
     return mesh;
   }
 
-  /** Debug "SDF" view: a volume box raymarching the composited field. */
+  /**
+   * Debug "SDF" view: a volume box sphere-tracing the DISTANCE ORACLE (§12.6 —
+   * it marched the composited texture, which was only this oracle low-passed
+   * onto the radiance lattice, and died with the transport). Returns null
+   * without an occupancy field, which is the only state with no distance at all.
+   */
   #buildSdfView(volume, bounds, center) {
+    if (!volume.distance) return null;
     const size = new THREE.Vector3().subVectors(bounds.max, bounds.min);
     const mesh = new THREE.Mesh(
       new THREE.BoxGeometry(size.x, size.y, size.z),
-      createSdfDebugMaterial(volume),
+      createSrcDistanceView(volume),
     );
     mesh.position.copy(center);
     mesh.frustumCulled = false;

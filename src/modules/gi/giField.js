@@ -540,6 +540,10 @@ export function createGiField(bounds, res, atlas, options = {}) {
     occupancy,
     occupancyField: occField,
     coarseLevel,
+    // The oracle closure the "Distance" debug view marches (srcDebugViews.js).
+    // Deliberately the SAME instance the shadow arms take, so the view cannot
+    // show a sharper or blunter medium than the shadows consume.
+    distance: occField ? srcVolume().distance : null,
 
     /**
      * Re-pages the fine level if any slot moved. Returns true when the page
@@ -1366,92 +1370,6 @@ function createShadowTrace(distanceTexture, world, res, lift, atlas, steps = 56,
 }
 
 /**
- * Debug material for the "SDF" view: raymarches the composited distance
- * field (+ detail slots — the ACTUAL per-mesh SDFs) from the camera and
- * shades hits with the field's own gradient normals plus distance-band
- * rings, so a broken/missing/misplaced mesh SDF is immediately visible.
- * Applied to a camera-facing volume box rendered from the inside.
- */
-export function createSdfDebugMaterial(volume) {
-  const { world, distanceTexture, atlas, sparse } = volume;
-  const minCell = world.minCell;
-  const capWorld = world.capWorld;
-
-  const material = new THREE.MeshBasicNodeMaterial();
-  material.side = THREE.BackSide;
-  // Overlay: the raymarch replaces the scene view entirely — scene depth
-  // would otherwise occlude the box's backfaces and hide the debug.
-  material.depthTest = false;
-  material.depthWrite = false;
-  material.fragmentNode = Fn(() => {
-    // Uniform-derived values hoisted before the loop (driver compile cost).
-    const minCellV = float(minCell).toVar();
-    const capWorldV = float(capWorld).toVar();
-    const minV = vec3(world.min).toVar();
-    const sizeV = vec3(world.size).toVar();
-    const dir = positionWorld.sub(cameraPosition).normalize().toVar();
-    // Slab entry so an outside camera starts marching AT the volume.
-    const invEps = (component) => component.sign().mul(component.abs().max(1e-6));
-    const bmax = minV.add(sizeV).toVar();
-    const t1x = minV.x.sub(cameraPosition.x).div(invEps(dir.x));
-    const t2x = bmax.x.sub(cameraPosition.x).div(invEps(dir.x));
-    const t1y = minV.y.sub(cameraPosition.y).div(invEps(dir.y));
-    const t2y = bmax.y.sub(cameraPosition.y).div(invEps(dir.y));
-    const t1z = minV.z.sub(cameraPosition.z).div(invEps(dir.z));
-    const t2z = bmax.z.sub(cameraPosition.z).div(invEps(dir.z));
-    const tEnter = t1x.min(t2x).max(t1y.min(t2y)).max(t1z.min(t2z));
-    const tExit = t1x.max(t2x).min(t1y.max(t2y)).min(t1z.max(t2z));
-
-    const t = tEnter.max(0).add(minCellV.mul(0.25)).toVar();
-    const out = vec4(0, 0, 0, 0).toVar();
-    Loop({ start: 0, end: 128, name: "sdfDebug" }, () => {
-      If(t.greaterThan(tExit), () => {
-        Break();
-      });
-      const p = cameraPosition.add(dir.mul(t)).toVar();
-      const uvw = p.sub(minV).div(sizeV).clamp(0, 1).toVar();
-      const sample = texture3D(distanceTexture, uvw).level(0).toVar();
-      const d = sample.r.mul(capWorldV).toVar();
-      // The debug view must march the SAME field the traces do, fine level
-      // included — otherwise it keeps showing the coarse blobs while the GI
-      // has stopped using them, and the one instrument for "is my SDF any
-      // good" lies about the thing it exists to show.
-      if (sparse) {
-        const fine = sparse.sample(p);
-        d.assign(select(fine.valid.and(d.lessThan(sparse.params.band)), fine.d, d));
-      }
-      d.assign(atlas.refineDetail(d, p));
-      // HIT CUT AND STEP FLOOR AND ITERATION BUDGET ARE A TRIPLE, not a pair.
-      // Scaling the cut down to the fine cell (÷ brickAxis-1) and the floor
-      // with it left the 128-step budget untouched, so every grazing ray ran
-      // out of iterations before reaching its surface: the colonnade rendered
-      // as vertical shreds with the floor intact, which reads as "the sparse
-      // field is broken" when the field was fine and the MARCHER was starved.
-      // Held identical to the coarse path on purpose — then any difference in
-      // this view is the field's accuracy, which is the thing being judged.
-      // Sharpening the contact is a separate change with its own budget.
-      const hitCut = minCellV.mul(0.4);
-      If(d.lessThan(hitCut), () => {
-        const n = sample.gba.mul(2).sub(1).toVar();
-        // Normal-colored surface with a headlight lambert — a missing,
-        // misplaced, or garbage mesh SDF is immediately visible.
-        const lambert = n.dot(dir.negate()).abs().mul(0.6).add(0.4);
-        out.assign(vec4(n.mul(0.5).add(0.5).mul(lambert), 1));
-        Break();
-      });
-      // Floor stays paired with the cut above (a ray whose distance lands
-      // between them steps clean over the hit band and punches a hole).
-      t.addAssign(d.mul(0.9).clamp(minCellV.mul(0.3), capWorldV));
-    });
-    If(out.w.lessThan(0.5), () => {
-      Discard();
-    });
-    return out;
-  })();
-  return material;
-}
-
-/**
  * SDF sphere-traced CASCADE ray: (origin, dir, tMaxWorld) → { rad, t },
  * t < 0 = miss. Replaces the voxel DDA the transport used to march —
  * steps scale with distance-to-geometry (fast in open space), silhouettes
@@ -1807,104 +1725,6 @@ function createOccupancySceneTrace(
     const hitT = select(r.hit.greaterThan(0.5), r.t.max(1e-4), float(-1)).toVar();
     return { rad, t: hitT };
   };
-}
-
-/**
- * Debug material for the "Occupancy" view: hierarchical-DDA the pyramid from
- * the camera and shade hits by voxel face normal, tinted by which pyramid level
- * the ray was on when it descended. This is the instrument for "is a column
- * actually in the field" — the one question every leak in this module has come
- * down to — and it marches EXACTLY what the transport rays march, because a
- * debug view that renders a different field than the traces lies about the
- * thing it exists to show.
- */
-export function createOccupancyDebugMaterial(volume) {
-  const occField = volume.occupancyField;
-  const { world } = volume;
-  const hybrid = volume.rayHitMode === RayHitMode.HybridBrickBox && occField.traceHybridBrick;
-  // Plane modes shade by the DECODED record normal — the doc's required
-  // "plane-normal visualization". Flat surfaces render flat colour instead of
-  // the voxel-face quantization, which is exactly the Phase-2 acceptance look
-  // (and in exact-complex mode, curved silhouettes come from real triangles).
-  const plane = volume.rayHitMode >= RayHitMode.HybridPlane &&
-    volume.rayHitMode <= RayHitMode.HybridExactComplex && occField.traceHybridPlane;
-
-  const material = new THREE.MeshBasicNodeMaterial();
-  material.side = THREE.BackSide;
-  material.depthTest = false;
-  material.depthWrite = false;
-  material.fragmentNode = Fn(() => {
-    const minV = vec3(world.min).toVar();
-    const sizeV = vec3(world.size).toVar();
-    const dir = positionWorld.sub(cameraPosition).normalize().toVar();
-    // Slab entry so an outside camera starts marching AT the volume.
-    const invEps = (component) => component.sign().mul(component.abs().max(1e-6));
-    const bmax = minV.add(sizeV).toVar();
-    const t1x = minV.x.sub(cameraPosition.x).div(invEps(dir.x));
-    const t2x = bmax.x.sub(cameraPosition.x).div(invEps(dir.x));
-    const t1y = minV.y.sub(cameraPosition.y).div(invEps(dir.y));
-    const t2y = bmax.y.sub(cameraPosition.y).div(invEps(dir.y));
-    const t1z = minV.z.sub(cameraPosition.z).div(invEps(dir.z));
-    const t2z = bmax.z.sub(cameraPosition.z).div(invEps(dir.z));
-    const tEnter = t1x.min(t2x).max(t1y.min(t2y)).max(t1z.min(t2z));
-    const tExit = t1x.max(t2x).min(t1y.max(t2y)).min(t1z.max(t2z));
-
-    // A generous budget: this view exists to show what IS there, so it must not
-    // report a hole the transport rays would not see just because it ran out of
-    // iterations (the failure that made the sparse field look broken when the
-    // MARCHER was starved).
-    // `dynamics: "obb"` — this is a FRAGMENT shader, and the exact-dynamic
-    // BVH4 traversal is compute-only by policy (its raw-WGSL storage pointer
-    // is annotated for the compute kernels' binding mode). Analytic OBB
-    // movers still show up in the debug view — which is the instrument for
-    // "is the exact box actually where the mesh is".
-    const r = plane
-      ? occField.traceHybridPlane(
-          cameraPosition,
-          dir,
-          tEnter.max(0),
-          tExit.max(0),
-          {
-            macroSteps: MAX_MACRO_STEPS,
-            coverage: volume.rayHitMode >= RayHitMode.HybridPlaneCoverage,
-            exact: volume.rayHitMode === RayHitMode.HybridExactComplex,
-            dynamics: "obb",
-          },
-        )
-      : hybrid
-        ? occField.traceHybridBrick(
-            cameraPosition,
-            dir,
-            tEnter.max(0),
-            tExit.max(0),
-            { macroSteps: MAX_MACRO_STEPS, dynamics: "obb" },
-          )
-        : occField.traceOccupancy(
-            cameraPosition, dir, tEnter.max(0), tExit.max(0), { steps: 256, dynamics: "obb" },
-          );
-    If(r.hit.lessThan(0.5), () => {
-      Discard();
-    });
-    // Normal-coloured with a headlight lambert — a missing, misplaced or
-    // one-voxel-thin piece of geometry is immediately readable.
-    const lambert = r.normal.dot(dir.negate()).abs().mul(0.6).add(0.4);
-    if (hybrid) {
-      // Alternating macrocell tint + local 4^3 coordinates makes both levels
-      // of the Phase-1 hierarchy visible. Red rises with coarse traversal
-      // work, so bounded-step hot spots are apparent without GPU readback.
-      const macro = r.voxel.div(4).floor().toVar();
-      const parity = mod(macro.x.add(macro.y).add(macro.z), 2).toVar();
-      const local = vec3(
-        mod(r.voxel.x, 4), mod(r.voxel.y, 4), mod(r.voxel.z, 4),
-      ).div(3).toVar();
-      const base = mix(vec3(0.12, 0.32, 0.85), vec3(0.12, 0.75, 0.42), parity);
-      const heat = r.macroSteps.div(MAX_MACRO_STEPS).clamp(0, 1);
-      const color = mix(base, local, 0.35).add(vec3(heat.mul(0.7), 0, 0));
-      return vec4(color.mul(lambert), 1);
-    }
-    return vec4(r.normal.mul(0.5).add(0.5).mul(lambert), 1);
-  })();
-  return material;
 }
 
 /**
