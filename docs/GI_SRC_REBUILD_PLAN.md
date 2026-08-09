@@ -2524,3 +2524,194 @@ if the light is misplaced.
 
 `npm run probe:gi-src-visual` renders the Cornell box to `artifacts/gi-src-visual/` (direct / gi /
 both) if a picture is wanted without launching the editor.
+
+### 12.19 Phase 3, units 1-2 — the block claim, the LOD law, and one property
+
+Two of §12.18.7's five units, in the order §12.18.1 insisted on, plus a config
+change that came from the user mid-session and belongs in the same record.
+
+#### 12.19.1 Unit 1 — the bin-block claim (`3bfde7c`)
+
+Landed as §12.18.3 describes: `PROBE_SPARE` became `PROBE_BLOCK`, a probe claims
+a block in `createCompactPass` and releases it in `createAgePass`, and a failed
+claim is `SLOT_EMPTY` rather than block 0.
+
+**Measured: 3.67M bins → 1.40M, 133MB → 49.41MB on the engine smoke.** The
+deposit gate fell 99.0MB → 33.0MB. §12.18.3 predicted 127 → ~47; the difference
+is the probe store's own growth, which is the pool plus the wider slot ladder
+below.
+
+**THE POOL LIVES IN THE PROBE STORE, SHARING THE FREE STACK — and the reason is
+the binding budget, not tidiness.** `createCompactPass` already binds six
+storage buffers against a portable limit of EIGHT. A separate pair of pool
+buffers would have put the pass that creates every probe exactly at the ceiling
+with nothing left for the merge. One buffer, two regions: probe indices (global)
+first, block indices (local to their cascade) after, with block tops at
+`[cascadeCount, 2N)` in the same `freeTop`.
+
+**§12.18.3'S "THE CLAIM DELETES THE WHOLE-BUFFER CLEAR" IS WRONG, and this is
+the correction.** Claim-time zeroing is right for a PERSISTENT accumulator.
+These are a single frame's estimate, so they need zeroing on every frame a probe
+survives, not only the frame it was born. What the claim actually buys the clear
+is that the buffer is 2.6× smaller. The claiming thread does not zero its block
+either, and does not need to: compaction runs three dispatches before the clear,
+so a block claimed this frame is covered by it anyway. Folding the clear INTO
+the resolve would delete a full pass over `binTotal` and was not taken — the
+deposit gate reads `bins.scratch` after every pass has run, and a
+resolve-and-zero would hand it a buffer of zeros.
+
+**Three new gate arms, because nothing in the existing suite could see any of
+this:**
+- **BLOCKS** — one block per live probe, distinct, in range. Two probes sharing
+  a block passes every pre-existing arm while their bins are silently summed
+  together, which is why distinctness is asserted directly rather than inferred.
+- **STARVED** — `binBudget: 1` floors every cascade at `MIN_BLOCKS` and really
+  runs the pool out (283 probes unclaimed at the time). The probes that DID
+  claim still match the mirror exactly, which is what rules out a block-0
+  fallback; dropped + landed reconciles to the mirror's total exactly.
+- **RETIREMENT** — after every probe dies, each cascade's free stack must be a
+  PERMUTATION of its blocks. One assertion covering both a leak and a
+  double-free. A leak here is invisible for `blockCapacity` probe lifetimes and
+  then permanent, which is the worst shape a bug can have: it survives every
+  gate, ships, and becomes "GI stops working after a few minutes of walking".
+
+**A SMOKE ARM WAS FLAKING ONE RUN IN FOUR and running it is what found it.**
+§12.17 made `stepLimitExits` a 0.05% rate for SRC's tangent grazers but left the
+macro/brick detail line a hard `!== 0`, so the same tolerated ray class still
+tripped it: `hybrid-exact-complex&src=1` reported `brick=1` once in four
+consecutive runs on identical code. Whether a grazer exists at all is a property
+of the DRAW — the ray index comes from a scheduler-ordered atomic cursor
+(§12.15) — so the two checks now share one budget. A budget that tolerates a ray
+class in aggregate and then forbids it per rung is the same test with a coin
+toss attached.
+
+#### 12.19.2 Unit 2 — `LOD0_REACH`, and the new baseline (`ee2efde`)
+
+`lodAtDistance` is now `log2(cheb / (LOD0_REACH · s₀))` with **LOD0_REACH = 64**,
+in both twins. 128 — §12.18.2's other end — is rejected by arithmetic: it
+quadruples the probe count and puts a Sponza-class interior at ~40,000 c0
+probes, past both the slot capacity and the block pool. A power of two, so
+`s₀·64` is exact in f32 and f64 alike and the twins cannot drift on the new
+multiply.
+
+**THE NEW BASELINE. Every probe count, load factor and timing in §12.11–§12.17
+is retired by this line.** Real gbuffer, `smoke:gi-gpu ?src=1`:
+
+| | before | after |
+|---|---|---|
+| probes c0/c1/c2/c3 | 13 / 10 / 10 / 10 | **184 / 45 / 18 / 8** |
+| gizmo pixels | 24 | 412 |
+| rays | 10,630 | 10,849 |
+| deposits | 13,353 (1.256/ray) | 15,040 (1.386/ray) |
+| memory | 49.41MB | 49.88MB |
+
+14× the c0 probes, against §12.18.2's estimate of 15×. The population gate reads
+**3,637 → 2,637 → 2,080 → 1,862** on its own set and the deposit gate
+1,831 → 1,405 → 997 → 825.
+
+**THE FALL ACROSS CASCADES IS THE LOAD-BEARING NUMBER, and the two sets
+disagree about it.** On the real scene it is 4.1× / 2.5× / 2.3× — the
+surface-manifold argument holding. On the synthetic sets it is nearly FLAT. That
+matters well beyond tidiness, because the block pool's equal-bins-per-cascade
+split IS that argument: bins rise 4× per cascade, so if probes do not fall 4×
+the top cascade dominates and the budget stops working (c3 at 10,000 probes
+would want 737MB). The reason the gates flatten is specific and does not
+generalise: their LOD shells are 120-220 scattered points on a box whose area is
+thousands of cells wide at EVERY cascade, so nothing ever merges. A contiguous
+surface merges. `createSrcProbeStore` gained a `blockCapacity` override so a
+gate can size a pool shaped like its own set rather than the engine's budget
+being reshaped around an adversarial one — and `COUNTER_NOBLOCK`/`STAT_NOBLOCK`
+are what will say so if a real scene ever disagrees.
+
+**FOUR GATES ENCODED THE OLD LAW IN THEIR OWN GEOMETRY.** All four caught the
+change, which is the system working, but they are now written through
+`lodRadius` — the law's own inverse — so the next change moves them with it:
+- `test:gi-src-ref` FAILED on `lodAtDistance(8·s₀) === 3`, the old law spelled
+  out as a number. It now tests through the inverse, pins `LOD0_REACH` itself,
+  and asserts the angular spacing is under a degree — the property the constant
+  exists for, as something a reader can check.
+- populate/rays/deposit placed their LOD shells at `s₀·2^lod`, which under the
+  new law is entirely inside LOD 0. **They would have KEPT PASSING while testing
+  a single ring.**
+- The populate gate's ring arm called 265 correct probes wrong, because **LOD 0
+  is a BALL now and the arm assumed a shell**. Under the old law that band was
+  `[0, 2·s₀)` and the lower bound never bit.
+
+**TWO REAL CAPACITY FINDINGS, both from the population gate:**
+1. **1,063 INSERT FAILURES AT CASCADE 2** — silently missing probes, i.e. holes
+   in the light. `c0Probes / 4^c` assumes the 4× fall; the measured ladder
+   reaches that limit and then leaves it (410→115→65→64 = 3.5×/1.8×/1.0×). A
+   slot is ~40 bytes, so `CASCADE_SLOT_FALLOFF = 2` brackets the measured range
+   for ~0.4MB and does not touch bin memory, which is capped by the block pool.
+2. The deposit gate's set starved c2/c3 (997 live for 683 blocks, 825 for 170) —
+   the flat-profile artifact above, fixed with the explicit pool.
+
+**THE PICTURE IS STILL BLOCKY, AND THE CAUSE IS NOT DENSITY.**
+`probe:gi-src-visual` re-shot at the canonical framing gives 67 → 24 → 9 → 4
+probes (19 at best before) and 75,760/76,800 lit at contrast 0.912 — but the
+frame is made of ~0.6 m rectangles, and those rectangles ARE the probe cells at
+the correct new spacing. `srcGather.js` assigns ONE probe per pixel and reads
+its bins directly; there is no interpolation anywhere in it. **Unit 5 ([I], the
+sparse-trilinear gather) is what removes the blocks, not a smaller s₀** —
+`sparseGather`/`trilinearCorners` are already green in `srcMath.js`. Worth
+knowing before anyone reads the picture as a probe-density failure and spends a
+session on the LOD constant again.
+
+#### 12.19.3 The config surface — §6, done properly, at the user's instruction
+
+Mid-session the user made the call §6 had been circling: **"GI must not have any
+params except the quality preset. GI is either correct or wrong. Having 20
+params turns it into a puzzle — whenever something is wrong we have a headache
+about which parameter broke our lighting."**
+
+That is right, and it is a sharper statement of the problem than §6 had. The
+component declared **27 properties**; it declares **one**. Everything else is
+derived in the new `giConfig.js` — one table, four rows.
+
+The distinction that makes it coherent: a preset trades COST against ACCURACY
+and every level of it is meant to be correct, whereas a knob that can make the
+lighting wrong is a bug generator with a label on it. Two things were neither
+and moved rather than died — **sky light** to the scene's own environment
+(`scene.environment` + `environmentIntensity`, where three.js and Scene Settings
+already keep IBL), and **the debug view** to `globalThis.__giDebugView`, since it
+draws an overlay and has no path to the lit image at all.
+
+**Behaviour is unchanged and it is checked rather than asserted:** every value
+sits at exactly the default the 27-property component shipped, so the two
+tier-varying entries (`resolveScale`, `exactReflections`) differ only at
+`ultra`. `penumbraPx=16601 grain=0.0307` and the SUN arm's `floorIn=12865
+miss=14573` both pinned; smoke probes and memory identical; the sky arm peaks at
+lum 6.283 = 2π exactly, so §12.17's analytic-π ceiling survives the new sky path.
+
+**Two findings worth carrying:**
+- **A LIVE PROPERTY WAS THE ONLY THING KEEPING THE SKY CURRENT.**
+  `#applyLiveProps` runs on property change, and nothing notifies GI when the
+  SCENE's environment changes — so the first version sampled the sky once at
+  build and the visual probe went from 75,760 lit pixels to zero. Polled per
+  frame now, beside the boot-ambient poll that exists for the same reason.
+- **A SILENTLY-IGNORED PROPERTY IS THE EXACT FAILURE THE COLLAPSE IS AIMED AT,
+  and the collapse created a dozen of them in the harnesses.**
+  `run-gi-emitter-shadow-probe` passed `emissiveShadows: true` and would have
+  gone on measuring a feature that was no longer built — it failed loudly only
+  because the readback hit an undefined texture, which is luck rather than
+  design. The component now NAMES the retired properties it ignores, once, and
+  nine probes are converted to `globalThis.__giConfigOverride`: ONE measurement
+  hatch that forces any derived value, deliberately not authored, not
+  serialized, not in the Inspector and not reachable from a scene — the same
+  category as the fifteen `__gi*` flags the module already carries. One hatch
+  rather than one global per field, so the list cannot quietly grow back into a
+  parameter surface.
+
+**Sky chroma is open and stated rather than hidden:** an environment map's
+average colour needs a 1×1 downsample, so a coloured HDRI currently contributes
+NEUTRAL sky at the right brightness. Colour belongs with Phase 5's hit shading,
+which has to sample the environment per-direction anyway.
+
+#### 12.19.4 What is next
+
+§12.18.7's units 3-5, unchanged: **[G] the merge** (`srcMerge.js` against
+`mergeCascades`), **[H] irradiance tiles**, **[I] the screen gather** — and [I]
+is the one that makes the Cornell picture worth looking at, per §12.19.2. The
+eye check (§12.18.8) is still owed and is now cheaper to do: `__giSrcProbes =
+true`, the debug view via `globalThis.__giDebugView = "src-probes"`, and sky by
+giving the scene an environment.
