@@ -165,7 +165,11 @@
           reflections: false,
           exactReflections: false,
           ao: false,
-          debugProbes: hybridMode ? "occupancy" : "off",
+          // The src arm selects the PROBE GIZMO view, because that is the only
+          // way its vertex-stage storage read gets compiled and rendered at
+          // all — a gizmo material that never draws is a shader that was never
+          // validated, and the eye check would be the first thing to find out.
+          debugProbes: srcArm ? "src-probes" : (hybridMode ? "occupancy" : "off"),
           rayHitMode,
           rayHitProfiling: true,
         });
@@ -433,6 +437,77 @@
               steps: +c.meanProbeSteps.toFixed(2), failed: c.failed,
             })),
           };
+          // The gizmos must have RENDERED, not merely been constructed. Their
+          // vertex stage reads the probe table out of a storage buffer, which
+          // is the one thing in this file that a compute-only gate cannot
+          // cover — and a vertex shader that fails to compile shows up as a
+          // validation error, which the check after this loop catches.
+          const giz = src.gizmos;
+          if (!giz?.meshes?.length) throw new Error("src arm: no probe gizmos were built");
+          if (!giz.group.parent) throw new Error("src arm: the gizmo group was never added to the scene");
+          for (const mesh of giz.meshes) {
+            if (!mesh.visible) throw new Error(`src arm: ${mesh.name} stayed hidden — the debug view never engaged`);
+            if (!mesh.userData.__giDebug) {
+              throw new Error(`src arm: ${mesh.name} is missing __giDebug — it would voxelize into the field it draws`);
+            }
+          }
+          srcReport.gizmos = giz.meshes.map((m) => m.count);
+
+          // ── DID THEY PUT PIXELS ON THE SCREEN? ────────────────────────────
+          //
+          // Everything above proves the gizmos exist, are visible, are in the
+          // scene and compile without a validation error. None of that is the
+          // same as RASTERIZING: a `positionNode` that resolves to NaN, an
+          // instance matrix left at zeros, or a radius that collapses for every
+          // probe all produce a silently empty draw. So render the same frame
+          // twice into an offscreen target, once with the gizmos hidden and
+          // once shown, and require the images to differ. This is the closest a
+          // headless harness gets to the eye check, and it is the difference
+          // between "the debug view is wired" and "the debug view works".
+          const rt = new THREE.RenderTarget(96, 96, { depthBuffer: true });
+          const shot = async () => {
+            const prev = engine.renderer.getRenderTarget();
+            engine.renderer.setRenderTarget(rt);
+            await engine.renderer.renderAsync(engine.scene, engine.camera);
+            // 6th arg is the TEXTURE INDEX, not an output buffer — the pixels
+            // are the return value.
+            const buf = await engine.renderer.readRenderTargetPixelsAsync(rt, 0, 0, 96, 96, 0);
+            engine.renderer.setRenderTarget(prev);
+            return buf;
+          };
+          giz.setVisible(false);
+          const without = await shot();
+          giz.setVisible(true);
+          const withGizmos = await shot();
+          let changed = 0;
+          for (let i = 0; i < without.length; i += 4) {
+            if (Math.abs(without[i] - withGizmos[i]) > 8 ||
+              Math.abs(without[i + 1] - withGizmos[i + 1]) > 8 ||
+              Math.abs(without[i + 2] - withGizmos[i + 2]) > 8) changed++;
+          }
+          rt.dispose();
+          const total = 96 * 96;
+          srcReport.gizmoPixels = changed;
+          srcReport.gizmoCoverage = +(changed / total).toFixed(3);
+          if (changed === 0) {
+            throw new Error(
+              "src arm: showing the probe gizmos changed ZERO pixels — they compile, they are " +
+              "visible and they are in the scene, so the draw itself produced nothing " +
+              "(NaN position, zero radius, or uninitialized instance matrices)",
+            );
+          }
+          // AND THEY MUST NOT PAINT THE WHOLE FRAME. The first version of this
+          // check reported 9216/9216: the radius was proportional to probe
+          // spacing with no ceiling, so a cascade-3 LOD-8 probe was a
+          // 125-metre ball around the camera. Total coverage is the same
+          // failure as zero coverage — an overlay that hides the scene it
+          // annotates — and it passes a "did anything draw" test.
+          if (changed > total * 0.9) {
+            throw new Error(
+              `src arm: the probe gizmos cover ${changed}/${total} pixels — they are painting ` +
+              "over the scene rather than annotating it (unbounded radius at the coarse cascades)",
+            );
+          }
           console.log("GI-SMOKE SRC", JSON.stringify(srcReport));
           // The controls first, in the order a failure is worth distinguishing.
           if (!(s.cascades[0].live > 0)) {

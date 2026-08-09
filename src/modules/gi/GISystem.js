@@ -2970,6 +2970,14 @@ export class GISystem {
           srcProbes = createSrcProbeSystem({
             gbuffer, width, height, props: this.component?.props ?? null,
           });
+          // The gizmos go in the scene rather than on `state.gizmos`, because
+          // they belong to the SCREEN bundle's lifetime (they read its probe
+          // table) and `state.gizmos` is disposed on a different schedule.
+          // `__giDebug` on each mesh keeps them out of the gbuffer prepass, the
+          // voxelizer and the light tree — a gizmo that voxelized would occlude
+          // the field it is drawing.
+          this.engine.scene.add(srcProbes.gizmos.group);
+          srcProbes.gizmos.setVisible(this.component?.props?.debugProbes === "src-probes");
           console.log(describeSrcProbeSystem(srcProbes));
         } catch (error) {
           // Never take the shipping chain down for an experimental branch.
@@ -4979,6 +4987,19 @@ export class GISystem {
     const mode = this.component?.props.debugProbes ?? "off";
     if (state.gizmos.sdfView) state.gizmos.sdfView.visible = mode === "sdf";
     if (state.gizmos.occView) state.gizmos.occView.visible = mode === "occupancy";
+    // "src-probes" is selectable whether or not `__giSrcProbes` is on; with the
+    // population off there is simply nothing to show. Saying so beats a silent
+    // no-op, because "I picked the probe view and nothing happened" is
+    // otherwise indistinguishable from "the probe view is broken".
+    if (mode === "src-probes" && !state.screen?.srcProbes && !this._srcGizmoHintShown) {
+      this._srcGizmoHintShown = true;
+      console.log(
+        "[gi] Debug View \"src-probes\": the SRC probe population is off. " +
+        "Set `__giSrcProbes = true` before the GI module builds (plan §7 Phase 1) — " +
+        "it is opt-in until the transport lands.",
+      );
+    }
+    state.screen?.srcProbes?.gizmos?.setVisible(mode === "src-probes");
   }
 
   // -------------------------------------------------------------------------

@@ -31,7 +31,7 @@ for (const arm of arms) {
       // hide the probe counts and the hash load the arm exists to report.
       if (result.srcProbes) {
         console.log(`  src probes: ${result.srcProbes.dispatches} dispatches, ` +
-          `${result.srcProbes.megabytes}MB, ` +
+          `${result.srcProbes.megabytes}MB, gizmoPixels ${result.srcProbes.gizmoPixels}, ` +
           result.srcProbes.cascades
             .map((c, i) => `c${i} ${c.live} live/load ${c.load}/steps ${c.steps}` +
               (c.failed ? ` FAILED ${c.failed}` : ""))

@@ -43,6 +43,7 @@
 import * as THREE from "three/webgpu";
 import { ivec2, texture, uniform, vec3 } from "three/tsl";
 import { CASCADE_COUNT, MAX_LODS, SRC_QUALITY, srcQualityTier } from "./srcConfig.js";
+import { createSrcProbeGizmos } from "./srcGizmos.js";
 import {
   createSrcProbeFrame,
   createSrcProbeStore,
@@ -124,6 +125,11 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null } = 
     },
   });
 
+  // The gizmos share the SAME anchor uniform, not a copy. A gizmo lattice
+  // drawn from a second anchor would look perfectly plausible and be in the
+  // wrong place, which is the most misleading failure a debug view can have.
+  const gizmos = createSrcProbeGizmos(store, { spacing0, anchor: vec3(anchorU) });
+
   let anchored = false;
   let reanchors = 0;
   const scratch = new THREE.Vector3();
@@ -131,6 +137,7 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null } = 
   const system = {
     store,
     frame,
+    gizmos,
     spacing0,
     passes: frame.passes,
     pixelProbe: frame.pixelProbe,
@@ -182,11 +189,18 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null } = 
       const next = createSrcProbeSystem({
         gbuffer, width: nextWidth, height: nextHeight, props,
       });
+      // Carry the debug view's on/off state across the rebuild. Losing it means
+      // a viewport resize silently turns the gizmos off mid-inspection, which
+      // reads as "the probes vanished when I dragged the panel".
+      next.gizmos.setVisible(gizmos.group.visible);
+      const parent = gizmos.group.parent;
       system.dispose();
+      parent?.add(next.gizmos.group);
       return next;
     },
 
     dispose() {
+      gizmos.dispose();
       frame.dispose();
       store.dispose();
     },

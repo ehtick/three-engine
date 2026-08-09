@@ -280,7 +280,12 @@ export class GlobalIlluminationComponent extends Component {
     // entries silently doing nothing while the other two respond — the exact
     // dead-knob confusion this module keeps paying for. Phase 1-3 re-adds them
     // alongside the probes they visualize.
-    { key: "debugProbes", label: "Debug View", type: "select", options: ["off", "sdf", "occupancy"], advanced: true, flipsToCustom: "quality" },
+    // "src-probes" draws the Split Radiance Cascades probe population as
+    // instanced spheres — hue by LOD, size by the probe's own spacing, white
+    // for newborn. It needs `__giSrcProbes = true` at build time (the
+    // population is opt-in until the transport lands); selecting it without
+    // that logs what to set rather than showing an empty scene.
+    { key: "debugProbes", label: "Debug View", type: "select", options: ["off", "sdf", "occupancy", "src-probes"], advanced: true, flipsToCustom: "quality" },
 
     // Deliberately NOT `flipsToCustom` — it is a stability knob, not a quality
     // level, and switching preset must not silently reset it.
