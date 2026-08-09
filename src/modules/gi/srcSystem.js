@@ -42,7 +42,7 @@
 
 import * as THREE from "three/webgpu";
 import { ivec2, texture, uniform, vec3 } from "three/tsl";
-import { CASCADE_COUNT, MAX_LODS, SRC_QUALITY, srcQualityTier } from "./srcConfig.js";
+import { CASCADE_COUNT, MAX_LODS, SRC_QUALITY, W0, srcQualityTier } from "./srcConfig.js";
 import { createSrcProbeGizmos } from "./srcGizmos.js";
 import { R2_ALPHA1_FX, R2_ALPHA2_FX } from "./srcMath.js";
 import {
@@ -51,7 +51,7 @@ import {
   formatSrcProbeStats,
   readSrcProbeStats,
 } from "./srcProbes.js";
-import { createSrcRayPass } from "./srcRayPass.js";
+import { createSrcBinStore, createSrcDepositFrame } from "./srcDeposit.js";
 import { createSrcRayFrame, createSrcRayStore } from "./srcRays.js";
 import { createSrcSceneTrace } from "./srcTrace.js";
 
@@ -160,25 +160,37 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null, vol
     raysPerPixel: tier.raysPerPixel,
   });
 
-  // ── THE SCAFFOLD RAY PASS (plan §12.13.5 unit 1) ─────────────────────────
+  // ── [E] + [F]: THE SPLIT SCATTER AND THE RESOLVE (plan §12.13.5 unit 3) ──
   //
-  // One profiled ray per participating pixel. It produces no light and it is
-  // meant to be deleted by unit 3 — what it produces is the ray-hit counters,
-  // which have had no producer since the dense transport died and which are the
-  // only gate on the traversal's step budgets. See `srcRayPass.js`.
+  // This replaced unit 1's scaffold ray pass, which existed only to give
+  // `srcTrace.js` a caller and feed the ray-hit counters. It traces the same
+  // rays through the same closure and additionally does something with the
+  // answer; the scaffold's tallies live on inside the deposit's own `stats`,
+  // because they were the only instrument on the traversal's step budgets.
   //
   // The R2 PHASE advances by the two plastic-constant increments each frame, so
-  // frame f traces the sequence shifted by f points. That is a scaffold-grade
-  // choice deliberately: Alg. 3 owns the real global ray numbering (unit 2), and
-  // inventing a second one here would be a throwaway scheme inside a throwaway
-  // pass. What it must NOT be is a float — §12.11.1.
+  // frame f traces the sequence shifted by f points — which under temporal
+  // accumulation is the coverage a single frame's R2 run cannot give on its own.
+  // What it must NOT be is a float — §12.11.1.
   const jitterXU = uniform(0, "uint");
   const jitterYU = uniform(0, "uint");
-  const rayPass = volume?.occupancyField
-    ? createSrcRayPass({
+  // The radiance the fixed-point accumulator saturates at. Live, because
+  // §12.13.4 deliberately left clamp-vs-auto-exposure open, and the deposit
+  // COUNTS its own clamps so the decision gets made from a measurement.
+  const lmaxU = uniform(Number(globalThis.__giSrcLmax) || 16);
+  const binStore = volume?.occupancyField ? createSrcBinStore(store, { w0: W0 }) : null;
+  const deposit = binStore
+    ? createSrcDepositFrame(store, binStore, {
+        pixelProbe: frame.pixelProbe,
         pixelRayBase: rayStore.pixelRayBase,
         pixelCount,
         raysPerPixel: tier.raysPerPixel,
+        lmax: lmaxU,
+        // NO HIT SHADING YET — Phase 5 (plan §7). With radiance zero, what
+        // survives the resolve is transmittance, and a receiver lit by
+        // transmittance alone against the sky is ambient occlusion. That is
+        // §7's "AO-like short-range bounce", not a placeholder.
+        shadeHit: null,
         trace: createSrcSceneTrace(volume.occupancyField, volume.world, {
           rayHitMode: volume.rayHitMode,
           // ── THE STEP BUDGET, MEASURED RATHER THAN INHERITED ──────────────
@@ -199,8 +211,8 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null, vol
           // clears 96 on its own (0 exhaustions) — this is sized for the rung
           // that does not.
           //
-          // Measured on an 8 m scene. A real one has to be re-measured when unit
-          // 3 makes this the production ray, and `?raysteps=N` is the A/B.
+          // Measured on an 8 m scene; `?raysteps=N` is the A/B, and a real scene
+          // still owes a re-measurement.
           steps: Number(globalThis.__giSrcRaySteps) || 192,
           // Movers are IN. They are hit geometry for every other ray class in
           // this module (`composeFieldDynamics`), and a budget measured with
@@ -230,17 +242,18 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null, vol
     gizmos,
     rayStore,
     rayFrame,
-    rayPass,
+    binStore,
+    deposit,
     spacing0,
     raysPerPixel: tier.raysPerPixel,
-    // ONE dispatch list, in dependency order: population → budget → trace. Each
-    // stage reads what the previous one wrote (`pixelProbe`, then
-    // `pixelRayBase`), and every gap between two entries is the barrier that
-    // makes that legal. A different order would spend this frame's rays against
-    // last frame's membership, which is the kind of one-frame skew that reads as
-    // noise rather than as a bug.
-    passes: rayPass
-      ? [...frame.passes, ...rayFrame.passes, rayPass.reset, rayPass.compute]
+    // ONE dispatch list, in dependency order: population → budget → trace and
+    // scatter → resolve. Each stage reads what the previous one wrote
+    // (`pixelProbe`, then `pixelRayBase`, then the bin accumulators), and every
+    // gap between two entries is the barrier that makes that legal. A different
+    // order would spend this frame's rays against last frame's membership, which
+    // is the kind of one-frame skew that reads as noise rather than as a bug.
+    passes: deposit
+      ? [...frame.passes, ...rayFrame.passes, ...deposit.passes]
       : [...frame.passes, ...rayFrame.passes],
     pixelProbe: frame.pixelProbe,
     width,
@@ -285,12 +298,12 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null, vol
       return {
         cascades: stats,
         reanchors,
-        bytes: store.bytes + rayStore.bytes,
+        bytes: store.bytes + rayStore.bytes + (binStore?.bytes ?? 0),
         spacing0,
         pixelCount,
         raysPerPixel: tier.raysPerPixel,
         totalRays: await rayFrame.readTotal(renderer),
-        rays: rayPass ? await rayPass.readback(renderer) : null,
+        rays: deposit ? await deposit.readStats(renderer) : null,
       };
     },
 
@@ -318,7 +331,7 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null, vol
 
     dispose() {
       gizmos.dispose();
-      rayPass?.dispose();
+      binStore?.dispose();
       rayStore.dispose();
       frame.dispose();
       store.dispose();
@@ -332,13 +345,16 @@ export function describeSrcProbeSystem(system) {
   const c = system.store.cascades
     .map((x) => `c${x.cascade} ${x.probeCapacity}/${x.hashCapacity}`)
     .join(" ");
+  const bytes = system.store.bytes + system.rayStore.bytes + (system.binStore?.bytes ?? 0);
   return `[gi] src probes: ${system.pixelCount} gbuffer pixels, s0=${system.spacing0}, ` +
-    `${c}, ${system.raysPerPixel} rays/px, ` +
-    `${((system.store.bytes + system.rayStore.bytes) / 1048576).toFixed(2)}MB` +
-    // Named in the boot log because "SRC is populating but tracing nothing" and
-    // "SRC is tracing" are two different builds with identical probe telemetry,
-    // and the second one is the one whose step budgets are being measured.
-    (system.rayPass ? ", scaffold rays ON" : ", no volume — scaffold rays OFF");
+    `${c}, ${system.raysPerPixel} rays/px, ${(bytes / 1048576).toFixed(2)}MB` +
+    // The bin count is named because it is the memory, and because the buffer is
+    // sized by probe CAPACITY rather than by live probes — see createSrcBinStore.
+    // "SRC is populating but tracing nothing" and "SRC is depositing" are two
+    // builds with identical probe telemetry, so the log says which one this is.
+    (system.binStore
+      ? `, ${(system.binStore.binTotal / 1e6).toFixed(2)}M bins, depositing`
+      : ", no volume — no deposit");
 }
 
 /** The per-frame telemetry line (plan §8: permanent, MCP-readable). */
@@ -351,8 +367,12 @@ export function formatSrcProbeFrame(stats) {
       // `traced` vs `budget`: these must be EQUAL, and printing both rather than
       // one is what makes a divergence visible at a glance. They come from
       // opposite ends — the budget from Alg. 3's global cursor, the traced count
-      // from an atomic in the marcher's own kernel.
+      // from an atomic in the deposit kernel itself.
       ? ` traced ${r.rays} hit ${(r.hitRate * 100).toFixed(1)}% ` +
-        `t̄ ${r.meanT.toFixed(2)}m max ${r.maxT.toFixed(2)}m`
+        `t̄ ${r.meanT.toFixed(2)}m max ${r.maxT.toFixed(2)}m` +
+        `  |  ${r.deposits} deposits (${r.perRay.toFixed(2)}/ray)` +
+        // Clamps are the open `Lmax` decision's evidence (§12.13.4). Printed
+        // always, including at zero — "the clamp never fired" is the finding.
+        (r.clamped ? `  CLAMPED ${r.clamped}` : "")
       : "");
 }

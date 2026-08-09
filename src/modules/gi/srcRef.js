@@ -344,9 +344,16 @@ export function ancestorChain(built, c0Slot, cascadeCount) {
 /**
  * Trace every ray and scatter its split deposits.
  *
- * `sceneTrace(origin, dir)` returns `{ t, radiance }` with `t < 0` for a miss —
- * the same contract `srcTrace.js` exposes on the GPU, so this function's body
- * is the kernel's body.
+ * `sceneTrace(origin, dir, rayIndex)` returns `{ t, radiance }` with `t < 0` for
+ * a miss — the same contract `srcTrace.js` exposes on the GPU, so this
+ * function's body is the kernel's body.
+ *
+ * `rayIndex` is the ray's place in the global R2 sequence, and a real tracer has
+ * no use for it. It is passed because a SYNTHETIC one does: a trace keyed on the
+ * index is bit-exact across the CPU/GPU boundary (the index is a u32 both sides
+ * agree on), where one keyed on the direction is not — `decodeDir`'s sin/cos are
+ * not bit-identical between WGSL and JS. That is what lets `test:gi-src-rays`'
+ * deposit sibling diff the scatter EXACTLY instead of within a tolerance.
  */
 export function traceAndDeposit(cfg, built, pixels, rays, sceneTrace) {
   const stats = { traced: 0, hits: 0, escapes: 0, deposits: 0 };
@@ -364,7 +371,7 @@ export function traceAndDeposit(cfg, built, pixels, rays, sceneTrace) {
         px.normal[0], px.normal[1], px.normal[2],
         cfg.jitter[0], cfg.jitter[1],
       );
-      const hit = sceneTrace(px.position, dir);
+      const hit = sceneTrace(px.position, dir, base + r);
       stats.traced++;
       if (hit.t >= 0) stats.hits++;
       else stats.escapes++;

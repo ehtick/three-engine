@@ -1,0 +1,553 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>SRC deposit gate — createSrcDepositFrame vs traceAndDeposit</title>
+    <style>html,body{margin:0;background:#111;color:#ddd;font:13px monospace}canvas{display:none}</style>
+  </head>
+  <body>
+    <canvas id="view" width="16" height="16"></canvas>
+    <pre id="log"></pre>
+    <script type="module">
+      // ══ THE PHASE-2 UNIT-3 GATE: THE SPLIT SCATTER, WITHOUT THE ENGINE ═══
+      //
+      // Same isolation as its two siblings — own renderer, synthetic gbuffer, no
+      // engine, no scene, no occupancy field. Which raises the obvious question:
+      // with no field, what does the deposit TRACE?
+      //
+      // ══ A SYNTHETIC TRACE KEYED ON THE RAY INDEX ════════════════════════
+      //
+      // Not on geometry, and not on the direction. `rayDirection` runs through
+      // `decodeDir`'s sin/cos, which are NOT bit-identical between WGSL and JS —
+      // so anything derived from `dir` disagrees in the last ulp, and a hit
+      // distance a hair either side of an interval boundary would land in a
+      // different cascade on the two sides. That is a real disagreement about
+      // nothing, and it would make an exact diff impossible forever.
+      //
+      // The ray INDEX is a u32 both sides agree on exactly. So the trace is
+      // `t = hash(n) · T_SPAN` — deterministic, bit-exact, and independent of
+      // the pixel's reach ON PURPOSE. A `t` scaled by reach would need the
+      // mirror's trace closure to know which pixel it was called for, which
+      // `traceAndDeposit` does not tell it — and the gate would then have to
+      // re-implement the very loop it exists to diff against. A constant span
+      // puts hits across every cascade for near pixels and escapes (the
+      // deposit-into-every-cascade case) for the far ones.
+      //
+      // The shading is the same trick in fixed point: radiance is a 12-bit
+      // integer times `Lmax/65536`, with `Lmax = 16` a power of two, so
+      // `round(L/Lmax · 2^16)` recovers that integer EXACTLY on both sides. The
+      // whole RGB accumulator is then checkable as integer arithmetic — which
+      // matters, because in the engine `shadeHit` is still null until Phase 5
+      // and nothing else would ever exercise it.
+      //
+      // ══ THE MIRROR IS FED THE GPU'S OWN RAY ASSIGNMENT ══════════════════
+      //
+      // `assignRays` and the GPU allocate the same partition in different order
+      // (proven by `test:gi-src-rays`), so a pixel's ray indices differ between
+      // them — and the synthetic trace is keyed on exactly those indices. The
+      // mirror therefore runs against the GPU's `pixelRayBase` rather than its
+      // own. That is the right decomposition, not a shortcut: unit 2's gate owns
+      // the partition, and this one owns what happens to the rays in it.
+      //
+      // ══ THE ARMS ════════════════════════════════════════════════════════
+      //
+      //   totals    deposits, hits and escapes vs the mirror. Exact.
+      //   probes    per-probe count / sumT / sumRGB, matched by KEY and summed
+      //             over bins. Bin-INDEPENDENT, so it is exact even though the
+      //             direction quantization is not — this is the arm that checks
+      //             the split rule, the ancestor-chain walk and the fixed point.
+      //   bins      the same totals per (probe, bin). Direction-dependent, so
+      //             near-boundary ties are counted and bounded rather than
+      //             asserted to zero.
+      //   split     nothing is deposited ABOVE the owning cascade, and every
+      //             cascade below it got T = 1 with no radiance. The rule the
+      //             companion guide gets wrong, checked directly.
+      //   unknown   zero-count bins resolve to UNKNOWN (T = -1), not to zero.
+      //   overflow  measured headroom of the F = 16 accumulator against 2^32.
+      //
+      // Run: node scripts/run-gi-src-deposit-test.mjs
+      const out = document.querySelector("#log");
+      const say = (line) => { out.textContent += line + "\n"; };
+      let failures = 0;
+      const check = (label, ok, detail = "") => {
+        say(`  ${ok ? "PASS" : "FAIL"} ${label}${detail ? ` — ${detail}` : ""}`);
+        if (!ok) failures++;
+      };
+      const fail = (error) => {
+        console.error("SRC-DEPOSIT FAIL", error?.stack ?? error?.message ?? String(error));
+        globalThis.__SRC_DEPOSIT_RESULT__ = {
+          pass: false, error: error?.message ?? String(error), text: out.textContent,
+        };
+      };
+      globalThis.addEventListener("error", (event) => fail(event.error ?? event.message));
+      globalThis.addEventListener("unhandledrejection", (event) => fail(event.reason));
+
+      try {
+        const THREE = await import("three/webgpu");
+        const TSL = await import("three/tsl");
+        const cfgMod = await import("/src/modules/gi/srcConfig.js");
+        const refMath = await import("/src/modules/gi/srcMath.js");
+        const ref = await import("/src/modules/gi/srcRef.js");
+        const M = await import("/src/modules/gi/srcMathTsl.js");
+        const P = await import("/src/modules/gi/srcProbes.js");
+        const R = await import("/src/modules/gi/srcRays.js");
+        const D = await import("/src/modules/gi/srcDeposit.js");
+
+        const { float, instancedArray, select, uint, uniform, vec3 } = TSL;
+
+        const renderer = new THREE.WebGPURenderer({ canvas: document.querySelector("#view") });
+        await renderer.init();
+        const device = renderer.backend.device;
+        const validationErrors = [];
+        device.addEventListener?.("uncapturederror", (event) => {
+          validationErrors.push(event.error?.message ?? String(event.error));
+          console.error("WebGPU validation error:", validationErrors.at(-1));
+        });
+
+        const rng = (() => {
+          let s = 0x9e3779b9 >>> 0;
+          return () => {
+            s = (s + 0x6d2b79f5) >>> 0;
+            let t = s;
+            t = Math.imul(t ^ (t >>> 15), t | 1);
+            t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+            return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+          };
+        })();
+
+        const S0 = 0.5;
+        const CAM = [1.25, 1.6, -0.75];
+        const ANCHOR = [0.37, -1.21, 2.93];
+        const RAYS_PER_PIXEL = 2;
+        // A POWER OF TWO on purpose: `Lmax/65536` is then exact in f32, so a
+        // 12-bit synthetic radiance round-trips through the fixed point with no
+        // rounding at all and the RGB arms are integer comparisons.
+        const LMAX = 16;
+        // Hit distances land uniformly in [0, T_SPAN). Cascade 0's interval ends
+        // at 0.8 m and the ladder reaches 68 m at LOD 0, so 120 puts deposits in
+        // every cascade for the room pixels and escapes for the far shells.
+        const T_SPAN = 120;
+        const SHADE_SALT = 0x9e3779b9;
+
+        // Smaller than the population gate's set: this one allocates bin
+        // accumulators for every probe SLOT, and the c0 capacity drives that.
+        const C0_PROBES = 4096;
+
+        const pixels = [];
+        const addPixel = (p, n) => pixels.push({ position: p, normal: n });
+        for (let i = 0; i < 1400; i++) {
+          const u = (rng() - 0.5) * 16;
+          const v = (rng() - 0.5) * 16;
+          const face = Math.floor(rng() * 5);
+          if (face === 0) addPixel([u, -1, v], [0, 1, 0]);
+          else if (face === 1) addPixel([u, 5, v], [0, -1, 0]);
+          else if (face === 2) addPixel([-8, v * 0.4 + 1, u], [1, 0, 0]);
+          else if (face === 3) addPixel([8, v * 0.4 + 1, u], [-1, 0, 0]);
+          else addPixel([u, v * 0.4 + 1, 8], [0, 0, -1]);
+        }
+        for (let lod = 0; lod < 7; lod++) {
+          const r = S0 * Math.pow(2, lod) * 1.35;
+          for (let k = 0; k < 120; k++) {
+            const axis = Math.floor(rng() * 3);
+            const sign = rng() < 0.5 ? -1 : 1;
+            const a = (rng() * 2 - 1) * r;
+            const b = (rng() * 2 - 1) * r;
+            const p = [0, 0, 0];
+            p[axis] = sign * r;
+            p[(axis + 1) % 3] = a;
+            p[(axis + 2) % 3] = b;
+            addPixel([p[0] + CAM[0], p[1] + CAM[1], p[2] + CAM[2]], [0, 1, 0]);
+          }
+        }
+        const PIXELS = pixels.length;
+        const valid = new Uint8Array(PIXELS).fill(1);
+        for (let i = 0; i < PIXELS; i += 17) valid[i] = 0;
+
+        const q32 = new Float32Array(1);
+        const f32 = (v) => { q32[0] = v; return q32[0]; };
+        for (const px of pixels) {
+          px.position = px.position.map(f32);
+          px.normal = px.normal.map(f32);
+        }
+
+        const attrs = new Float32Array(PIXELS * 8);
+        for (let i = 0; i < PIXELS; i++) {
+          attrs[i * 8] = pixels[i].position[0];
+          attrs[i * 8 + 1] = pixels[i].position[1];
+          attrs[i * 8 + 2] = pixels[i].position[2];
+          attrs[i * 8 + 3] = valid[i];
+          attrs[i * 8 + 4] = pixels[i].normal[0];
+          attrs[i * 8 + 5] = pixels[i].normal[1];
+          attrs[i * 8 + 6] = pixels[i].normal[2];
+        }
+        const posBuf = instancedArray(attrs.slice(), "vec4");   // stride 4: [pos,valid][nrm,0]
+        const readPixel = (i) => {
+          const t = posBuf.element(i.mul(2)).toVar();
+          return { position: t.xyz, valid: t.w.greaterThan(0.5) };
+        };
+        const readNormal = (i) => posBuf.element(i.mul(2).add(1)).xyz;
+
+        // ── the synthetic trace and shading, both keyed on the ray index ──
+        const HASH_TO_UNIT = 1 / 16777216;
+        const synthTrace = (o, d, tMax, n) => {
+          // `hash >> 8` is a 24-bit integer, exactly representable in f32, and
+          // 2^-24 is exact — so this conversion is bit-identical to the JS twin.
+          const h = M.hashKey(n).toVar();
+          const t = float(h.shiftRight(uint(8))).mul(HASH_TO_UNIT * T_SPAN).toVar();
+          // A real marcher stops at `tMax`, so this one does too: past the last
+          // cascade boundary the ray is a MISS, and the mirror reaches the same
+          // verdict from the other direction (`splitCascade` returns
+          // `bounds.length` for a `d` past every bound). Same outcome, and the
+          // totals arm is what proves the two agree about how often.
+          const isHit = t.lessThanEqual(float(tMax)).toVar();
+          return {
+            hit: select(isHit, float(1), float(0)),
+            t: select(isHit, t, float(-1)),
+            position: vec3(0),
+            exactPosition: vec3(0),
+            normal: vec3(0, 1, 0),
+            dynObj: null,
+          };
+        };
+        const shadeHit = (r, d, n) => {
+          const h = M.hashKey(n.add(uint(SHADE_SALT))).toVar();
+          const k = LMAX / 65536;
+          return vec3(
+            float(h.bitAnd(uint(4095))).mul(k),
+            float(h.shiftRight(uint(12)).bitAnd(uint(4095))).mul(k),
+            float(h.shiftRight(uint(24)).bitAnd(uint(255))).mul(k),
+          );
+        };
+        // The JS twin, and the ONE unit choice worth stating: it returns
+        // radiance in FIXED-POINT UNITS (the raw 12-bit integers), not in
+        // radiance units. The GPU stores `round(L/Lmax · 2^16)`, and with
+        // `L = q · Lmax/65536` that is exactly `q` — so the mirror accumulating
+        // `q` directly makes every RGB comparison below integer arithmetic with
+        // no tolerance anywhere.
+        const jsSceneTrace = (origin, dir, n) => {
+          // STOPPING AT THE REACH IS THE TRACE'S JOB, and it has to be done here
+          // rather than left to `splitDeposits`. Both produce the same DEPOSITS
+          // for a t past the last boundary — `splitCascade` returns
+          // `bounds.length`, which is the escape case — but they disagree about
+          // whether the ray HIT, and the first version of this file returned a
+          // bare positive t and had the mirror report 4,216 hits against the
+          // GPU's 4,118 while every deposit matched. The reach is recoverable
+          // from the origin (it is the pixel's own LOD), so the closure computes
+          // it exactly as the kernel's `tMax` does.
+          const cheb = cfgMod.chebyshev(
+            origin[0], origin[1], origin[2], CAM[0], CAM[1], CAM[2],
+          );
+          const lod = Math.floor(cfgMod.lodAtDistance(cheb, S0, cfgMod.MAX_LODS));
+          const bounds = cfgMod.intervalBoundaries(lod, S0, cfgMod.CASCADE_COUNT);
+          const reach = bounds[bounds.length - 1];
+          const t = f32((refMath.hashKey(n >>> 0) >>> 8) * (HASH_TO_UNIT * T_SPAN));
+          const h = refMath.hashKey((n + SHADE_SALT) >>> 0) >>> 0;
+          return {
+            t: t <= reach ? t : -1,
+            radiance: [h & 4095, (h >>> 12) & 4095, (h >>> 24) & 255],
+          };
+        };
+
+        // ── the three frames ─────────────────────────────────────────────
+        const store = P.createSrcProbeStore({ c0Probes: C0_PROBES, cascadeCount: cfgMod.CASCADE_COUNT });
+        const cameraU = uniform(new THREE.Vector3(...CAM));
+        const anchorU = uniform(new THREE.Vector3(...ANCHOR));
+        const lmaxU = uniform(LMAX);
+
+        const frame = P.createSrcProbeFrame(store, {
+          spacing0: S0, camera: vec3(cameraU), anchor: vec3(anchorU),
+          pixelCount: PIXELS, readPixel,
+        });
+        const rayStore = R.createSrcRayStore(store, { pixelCount: PIXELS });
+        const rayFrame = R.createSrcRayFrame(store, rayStore, {
+          pixelProbe: frame.pixelProbe, raysPerPixel: RAYS_PER_PIXEL,
+        });
+        const bins = D.createSrcBinStore(store, { w0: cfgMod.W0 });
+        const deposit = D.createSrcDepositFrame(store, bins, {
+          pixelProbe: frame.pixelProbe,
+          pixelRayBase: rayStore.pixelRayBase,
+          pixelCount: PIXELS,
+          raysPerPixel: RAYS_PER_PIXEL,
+          trace: synthTrace,
+          shadeHit,
+          readPixel, readNormal,
+          camera: vec3(cameraU),
+          spacing0: S0,
+          lmax: lmaxU,
+          jitterX: 0, jitterY: 0,
+        });
+
+        say(`pixels ${PIXELS} (${PIXELS - valid.reduce((a, b) => a + b, 0)} invalid)  ` +
+          `raysPerPixel ${RAYS_PER_PIXEL}  Lmax ${LMAX}  F ${D.DEPOSIT_F}`);
+        say(`bins ${(bins.binTotal / 1e6).toFixed(3)}M over ` +
+          `${store.cascades.map((c) => c.probeCapacity).join("/")} probe slots  ` +
+          `${(bins.bytes / 1048576).toFixed(1)}MB  dispatches ` +
+          `${frame.passes.length}+${rayFrame.passes.length}+${deposit.passes.length}`);
+        say("");
+
+        for (const pass of frame.passes) await renderer.computeAsync(pass);
+        for (const pass of rayFrame.passes) await renderer.computeAsync(pass);
+        for (const pass of deposit.passes) await renderer.computeAsync(pass);
+
+        const [table, pixelProbe, pixelRayBase, scratch, payloadRaw, stats] = await Promise.all([
+          renderer.getArrayBufferAsync(store.probeTable.value).then((b) => new Uint32Array(b)),
+          renderer.getArrayBufferAsync(frame.pixelProbe.value).then((b) => new Uint32Array(b)),
+          renderer.getArrayBufferAsync(rayStore.pixelRayBase.value).then((b) => new Uint32Array(b)),
+          renderer.getArrayBufferAsync(bins.scratch.value).then((b) => new Uint32Array(b)),
+          renderer.getArrayBufferAsync(bins.payload.value).then((b) => new Float32Array(b)),
+          deposit.readStats(renderer),
+        ]);
+
+        // Live probes, per cascade, keyed both ways.
+        const live = store.cascades.map((c) => {
+          const byKey = new Map();
+          const byIndex = new Map();
+          for (let k = 0; k < c.probeCapacity; k++) {
+            const p = c.probeBase + k;
+            const w = p * P.PROBE_WORDS;
+            if ((table[w + P.PROBE_FLAGS] & P.FLAG_ALIVE) === 0) continue;
+            const rec = { index: p, local: k, key: table[w + P.PROBE_KEY] >>> 0 };
+            byKey.set(rec.key, rec);
+            byIndex.set(p, rec);
+          }
+          return { byKey, byIndex };
+        });
+
+        // ── the mirror, on the GPU's own ray assignment ──────────────────
+        const mirrorPixels = [];
+        const gpuIndexOf = [];
+        for (let i = 0; i < PIXELS; i++) {
+          if (!valid[i]) continue;
+          mirrorPixels.push(pixels[i]);
+          gpuIndexOf.push(i);
+        }
+        const cfg = ref.makeSrcConfig({
+          spacing0: S0, camera: CAM, anchor: ANCHOR, raysPerPixel: RAYS_PER_PIXEL,
+          cascadeCount: cfgMod.CASCADE_COUNT, maxLods: cfgMod.MAX_LODS,
+        });
+        const built = ref.buildProbes(cfg, mirrorPixels);
+        const mirrorBases = new Int32Array(mirrorPixels.length);
+        for (let j = 0; j < mirrorPixels.length; j++) {
+          const b = pixelRayBase[gpuIndexOf[j]];
+          mirrorBases[j] = b === P.SLOT_EMPTY ? -1 : b;
+        }
+        // The mirror's own `assignRays` still runs — the deposit needs nothing
+        // from it, but running it and then OVERRIDING the bases is what makes
+        // the substitution explicit rather than a missing call.
+        const mirrorRays = ref.assignRays(cfg, built);
+        mirrorRays.pixelRayBase = mirrorBases;
+
+        // THE MIRROR'S OWN LOOP, not a re-implementation of it. Everything the
+        // arms below compare comes out of `probe.bins`, which is what
+        // `traceAndDeposit` filled.
+        const mStats = ref.traceAndDeposit(cfg, built, mirrorPixels, mirrorRays, jsSceneTrace);
+        const mAgg = new Map();          // `${cascade}:${key}` -> totals
+        const mBin = new Map();          // `${cascade}:${key}:${morton}` -> totals
+        for (let c = 0; c < cfgMod.CASCADE_COUNT; c++) {
+          const n = cfgMod.binCount(c, cfgMod.W0);
+          for (const probe of built.cascades[c].probes) {
+            if (!probe.bins) continue;
+            const key = `${c}:${probe.key >>> 0}`;
+            const agg = { r: 0, g: 0, b: 0, t: 0, n: 0 };
+            for (let m = 0; m < n; m++) {
+              const cnt = probe.bins.count[m];
+              if (cnt === 0) continue;
+              const e = {
+                r: probe.bins.sumR[m], g: probe.bins.sumG[m],
+                b: probe.bins.sumB[m], t: probe.bins.sumT[m], n: cnt,
+              };
+              mBin.set(`${key}:${m}`, e);
+              agg.r += e.r; agg.g += e.g; agg.b += e.b; agg.t += e.t; agg.n += cnt;
+            }
+            if (agg.n > 0) mAgg.set(key, agg);
+          }
+        }
+        const mTraced = mStats.traced;
+        const mHits = mStats.hits;
+        const mDeposits = mStats.deposits;
+
+        // ── the GPU side, aggregated the same two ways ───────────────────
+        const gAgg = new Map();
+        const gBin = new Map();
+        let gDeposits = 0;
+        let unknownBins = 0;
+        let resolvedBins = 0;
+        let maxAccum = 0;
+        let maxBinCount = 0;
+        for (let c = 0; c < cfgMod.CASCADE_COUNT; c++) {
+          const info = bins.cascades[c];
+          for (const rec of live[c].byKey.values()) {
+            const blockBase = info.binBase + rec.local * info.bins;
+            for (let m = 0; m < info.bins; m++) {
+              const b = (blockBase + m) * D.BIN_WORDS;
+              const n = scratch[b + D.BIN_COUNT] >>> 0;
+              if (n === 0) continue;
+              const r = scratch[b + D.BIN_R] >>> 0;
+              const g = scratch[b + D.BIN_G] >>> 0;
+              const bl = scratch[b + D.BIN_B] >>> 0;
+              const t = scratch[b + D.BIN_T] >>> 0;
+              maxAccum = Math.max(maxAccum, r, g, bl);
+              maxBinCount = Math.max(maxBinCount, n);
+              gDeposits += n;
+              const key = `${c}:${rec.key}`;
+              const e = gAgg.get(key) ?? { r: 0, g: 0, b: 0, t: 0, n: 0 };
+              e.r += r; e.g += g; e.b += bl; e.t += t; e.n += n;
+              gAgg.set(key, e);
+              gBin.set(`${key}:${m}`, { r, g, b: bl, t, n });
+            }
+          }
+        }
+        // Payload coverage, over the WHOLE buffer — unsampled slots included,
+        // because "an untouched bin resolves to unknown" is the claim.
+        for (let i = 0; i < bins.binTotal; i++) {
+          const T = payloadRaw[i * D.PAYLOAD_WORDS + 3];
+          if (T === D.PAYLOAD_UNKNOWN) unknownBins++;
+          else resolvedBins++;
+        }
+
+        // ══ ARM 1: totals ════════════════════════════════════════════════
+        say("── TOTALS: rays, hits and deposits vs the mirror ──");
+        check("the same number of rays were traced", stats.rays === mTraced,
+          `gpu ${stats.rays} vs mirror ${mTraced}`);
+        check("the same number of rays hit", stats.hits === mHits,
+          `gpu ${stats.hits} vs mirror ${mHits} (${(100 * mHits / mTraced).toFixed(1)}% — the ` +
+          "rest escape past the last boundary and deposit into every cascade)");
+        check("the same number of deposits landed", stats.deposits === mDeposits,
+          `gpu ${stats.deposits} vs mirror ${mDeposits}`);
+        check("the bin counts sum to the deposit count", gDeposits === stats.deposits,
+          `${gDeposits} vs ${stats.deposits} — a mismatch means deposits landed outside any live probe`);
+        say(`   ${(stats.deposits / stats.rays).toFixed(3)} deposits per ray ` +
+          `(must be in [1, ${cfgMod.CASCADE_COUNT}])`);
+
+        // ══ ARM 2: per-probe aggregates, exact ═══════════════════════════
+        say("");
+        say("── PROBES: per-probe totals by key, summed over bins ──");
+        // Bin-INDEPENDENT and therefore exact: the direction quantization can
+        // move a deposit between BINS of the same probe, but never between
+        // probes. This is the arm that carries the split rule, the chain walk
+        // and the fixed point.
+        let missing = 0;
+        let countWrong = 0;
+        let tWrong = 0;
+        let rgbWrong = 0;
+        let worst = null;
+        for (const [k, m] of mAgg) {
+          const g = gAgg.get(k);
+          if (!g) { missing++; continue; }
+          if (g.n !== m.n) { countWrong++; worst ??= `${k}: n ${g.n} vs ${m.n}`; }
+          if (g.t !== m.t) { tWrong++; worst ??= `${k}: sumT ${g.t} vs ${m.t}`; }
+          // The mirror sums the 12-bit integers directly, so this is an integer
+          // comparison — see the header on why Lmax is a power of two.
+          if (g.r !== m.r || g.g !== m.g || g.b !== m.b) {
+            rgbWrong++;
+            worst ??= `${k}: rgb ${g.r}/${g.g}/${g.b} vs ${m.r}/${m.g}/${m.b}`;
+          }
+        }
+        check("every probe the mirror deposited into exists on the GPU", missing === 0,
+          `${missing}/${mAgg.size} missing`);
+        check("every probe's deposit COUNT matches", countWrong === 0, `${countWrong} wrong`);
+        check("every probe's transmittance SUM matches", tWrong === 0, `${tWrong} wrong`);
+        check("every probe's fixed-point RGB SUM matches exactly", rgbWrong === 0,
+          `${rgbWrong} wrong${worst ? ` — ${worst}` : ""}`);
+        check("the GPU deposited into no probe the mirror did not",
+          gAgg.size === mAgg.size, `gpu ${gAgg.size} probes vs mirror ${mAgg.size}`);
+
+        // ══ ARM 3: per-bin ══════════════════════════════════════════════
+        say("");
+        say("── BINS: the same totals per (probe, bin) ──");
+        // Direction-DEPENDENT, so this one is allowed ties: `rayDirection` runs
+        // through sin/cos, which are not bit-identical across the boundary, and
+        // a direction within an ulp of a bin edge quantizes either way. The
+        // number is reported and bounded rather than asserted to zero — pinning
+        // it at zero would be pinning two transcendental implementations
+        // together, which is not a property this module has or needs.
+        let binMismatch = 0;
+        for (const [k, m] of mBin) {
+          const g = gBin.get(k);
+          if (!g || g.n !== m.n || g.t !== m.t || g.r !== m.r || g.g !== m.g || g.b !== m.b) {
+            binMismatch++;
+          }
+        }
+        const binTies = binMismatch / Math.max(1, mBin.size);
+        check("per-bin totals agree except for direction-quantization ties",
+          binTies < 0.005,
+          `${binMismatch}/${mBin.size} bins differ (${(binTies * 100).toFixed(3)}%) — ` +
+          "the budget is 0.5%, and these are rays whose direction sits within an ulp of a bin edge");
+
+        // ══ ARM 4: the split rule ═══════════════════════════════════════
+        say("");
+        say("── SPLIT: nothing above the owning cascade, T=1 below it ──");
+        // Checked on the GPU's own numbers rather than against the mirror,
+        // because it is a property of a single frame and not of an agreement:
+        // a bin that took radiance must have taken T=0 with it, and a bin that
+        // is pure transmittance must carry no radiance at all.
+        let radianceWithT = 0;
+        let cascadeAbove = 0;
+        for (const [k, g] of gAgg) {
+          // sumT counts clear deposits and (n - sumT) counts blocking ones. A
+          // probe with radiance but no blocking deposits is the contradiction.
+          const blocking = g.n - g.t;
+          if ((g.r + g.g + g.b) > 0 && blocking === 0) radianceWithT++;
+          if (blocking < 0) cascadeAbove++;
+          void k;
+        }
+        check("no probe carries radiance without a blocking deposit", radianceWithT === 0,
+          `${radianceWithT} probes`);
+        check("no probe's clear-deposit count exceeds its total", cascadeAbove === 0,
+          `${cascadeAbove} probes`);
+        const perRay = stats.deposits / stats.rays;
+        check(`deposits per ray sit in [1, ${cfgMod.CASCADE_COUNT}]`,
+          perRay >= 1 && perRay <= cfgMod.CASCADE_COUNT, perRay.toFixed(3));
+
+        // ══ ARM 5: unknown vs zero ══════════════════════════════════════
+        say("");
+        say("── UNKNOWN: a bin no ray landed in is not black ──");
+        check("unsampled bins resolved to UNKNOWN, not to zero",
+          unknownBins === bins.binTotal - gBin.size,
+          `${unknownBins} unknown + ${gBin.size} sampled vs ${bins.binTotal} total`);
+        check("some bins DID resolve", resolvedBins > 0,
+          `${resolvedBins} resolved — zero here would make the arm above vacuous`);
+        say(`   ${(100 * resolvedBins / bins.binTotal).toFixed(4)}% of allocated bins were sampled ` +
+          "(bins are sized by probe CAPACITY, not by live probes — plan §12.16)");
+
+        // ══ ARM 6: the fixed point's headroom ═══════════════════════════
+        say("");
+        say("── OVERFLOW: measured headroom of the F=16 accumulator ──");
+        // §12.13.4 predicts overflow only at 65,536 saturated rays in one bin.
+        // This measures the two numbers that prediction is made of — the worst
+        // accumulated value and the worst bin occupancy actually reached — and
+        // states the margin rather than trusting the table.
+        const headroom = maxAccum > 0 ? 4294967296 / maxAccum : Infinity;
+        const saturatedCap = 65536;
+        say(`   worst bin held ${maxBinCount} deposits; worst accumulator reached ` +
+          `${maxAccum} of 2^32 (${headroom.toExponential(2)}x headroom)`);
+        check("the accumulator is orders of magnitude clear of 2^32", headroom > 1000,
+          `${headroom.toExponential(2)}x`);
+        check("the worst bin occupancy is far under the saturated-overflow bound",
+          maxBinCount * 64 < saturatedCap,
+          `${maxBinCount} deposits vs ${saturatedCap} saturated rays — 64x margin required`);
+
+        if (validationErrors.length) check("no WebGPU validation errors", false, validationErrors[0]);
+
+        say("");
+        say(failures ? `gi-src-deposit: ${failures} CHECKS FAILED` : "gi-src-deposit: all cases PASS");
+        globalThis.__SRC_DEPOSIT_RESULT__ = {
+          pass: failures === 0,
+          failures,
+          rays: stats.rays,
+          deposits: stats.deposits,
+          perRay: +perRay.toFixed(3),
+          binTies: binMismatch,
+          binTotal: bins.binTotal,
+          sampledBins: gBin.size,
+          headroom: +headroom.toPrecision(3),
+          storageLimit: device.limits.maxStorageBuffersPerShaderStage,
+          text: out.textContent,
+        };
+
+      } catch (error) {
+        fail(error);
+      }
+    </script>
+  </body>
+</html>

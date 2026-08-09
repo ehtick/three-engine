@@ -43,6 +43,8 @@ for (const arm of arms) {
           console.log(`  src rays: ${r.count} traced = ${r.budget} budgeted ` +
             `(${r.perPixel}/px), hit ${(r.hitRate * 100).toFixed(1)}%, ` +
             `mean t ${r.meanT}m, max t ${r.maxT}m`);
+          console.log(`  src deposits: ${r.deposits} (${r.perRay}/ray) into ` +
+            `${(r.bins / 1e6).toFixed(2)}M bins, ${r.clamped} clamped`);
         }
       }
       const unfed = logs.find((l) => l.includes("traversal counters unfed"));

@@ -478,16 +478,44 @@
           // and this scene is a floor plus a wall at c0 reach, so some rays
           // must land and some must escape. Both bounds, because 100% is the
           // signature of a trace that hits its own origin voxel.
-          if (!src.rayPass) {
-            throw new Error("src arm: no scaffold ray pass — the volume never reached the probe system");
+          if (!src.deposit) {
+            throw new Error("src arm: no deposit frame — the volume never reached the probe system");
           }
-          const rays = await src.rayPass.readback(engine.renderer);
+          const rays = s.rays;
           srcReport.rays = {
             dispatched: rays.dispatched, count: rays.rays,
             budget: s.totalRays, perPixel: s.raysPerPixel,
+            deposits: rays.deposits, perRay: +rays.perRay.toFixed(3),
+            clamped: rays.clamped, bins: src.binStore.binTotal,
             hitRate: +rays.hitRate.toFixed(3),
             meanT: +rays.meanT.toFixed(3), maxT: +rays.maxT.toFixed(3),
           };
+          // ── THE SPLIT RULE, AS AN INEQUALITY THE SCENE CANNOT BREAK ─────
+          //
+          // Every ray deposits into cascades 0..k where k owns its hit, and into
+          // all N on a miss. So deposits per ray is in [1, N] — never zero (even
+          // a hit inside cascade 0's interval deposits there) and never more
+          // than the cascade count (nothing is deposited ABOVE the owning
+          // cascade, which is the rule the companion guide gets wrong).
+          //
+          // Both ends are real failures: 0 would mean the ancestor chain is not
+          // being walked, and > N would mean the split is depositing upward.
+          if (!(rays.perRay >= 1 && rays.perRay <= src.store.cascadeCount)) {
+            throw new Error(
+              `src arm: ${rays.perRay.toFixed(2)} deposits per ray is outside [1, ` +
+              `${src.store.cascadeCount}] — the split rule or the ancestor chain is wrong`,
+            );
+          }
+          // With no hit shading yet (Phase 5) every deposited radiance is zero,
+          // so a clamp is structurally impossible. When it becomes possible this
+          // assertion is what will say so, rather than the clamp quietly eating
+          // energy — which is exactly the failure §12.13.4 left open.
+          if (rays.clamped !== 0) {
+            throw new Error(
+              `src arm: ${rays.clamped} deposits hit the Lmax ceiling while hit shading is ` +
+              "still zero — something is depositing radiance from somewhere",
+            );
+          }
           // ── THE BUDGET AND THE TRACER MUST AGREE ──────────────────────
           //
           // Algorithm 3 (`srcRays.js`, plan §12.13.5 unit 2) partitions
