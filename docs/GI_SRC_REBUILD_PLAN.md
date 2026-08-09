@@ -1744,3 +1744,146 @@ symptom-invariant across a byte-for-byte move, so the rig is the thing that is w
 
 Then Phase 2: rays, trace, deposit, c0-only resolve. `srcTrace.js` is written and unwired, which is
 also why the ray-hit counters are unfed — wiring it closes both.
+
+### 12.13 Phase 2 entry brief — and one thing that is assumed, not verified
+
+#### 12.13.1 THE EYE CHECK IS DEFERRED, NOT PASSED
+
+Phase 1 closes with the user's call: *"Cant check on the editor now. Lets says its correct."* That
+is a decision to proceed, and it is recorded here as an **assumption carried forward**, because in
+this module the difference has bitten before — "GI builds, logs happily, contributes no bounce" is
+the signature of three shipped bugs, and every automated gate in Phase 1 would report exactly what
+it reports today if the gizmos were drawing a correct-looking lattice in the wrong place.
+
+What is actually verified: the probe SET matches the CPU mirror exactly, every parent link and
+ancestor chain is right, the LOD rings sit in their bands numerically, the gizmos rasterize
+somewhere between 0% and 90% of the frame, and nothing exceeds the portable binding limit. What is
+NOT verified: that the spheres land on the geometry a person sees. The cheapest thing that would
+falsify it is one look, and it stays on the list:
+
+> **Outstanding eye check.** `__giSrcProbes = true` before the GI module builds, then Inspector →
+> GI → Advanced → Debug View → "src-probes", over Sponza and the emissive-projectile game. Hue is
+> LOD, size is probe spacing (angular-capped), white is newborn — a steady scene should be a still
+> image, and a shimmer is membership churn.
+
+If Phase 2 produces light that is subtly misplaced, this is the first thing to rule out, not the
+last.
+
+#### 12.13.2 What Phase 2 starts from
+
+**The CPU mirror is already complete and already gated.** `srcRef.js` has `assignRays` (Alg. 3),
+`traceAndDeposit`, `resolveProbes`, and `srcMath.js` has `splitDeposits`/`resolveBin` — all green
+under `test:gi-src-ref`, including the split arm's three properties and the furnace. Phase 2 is
+therefore a pure "make the GPU agree with a mirror that already exists" job, which is the cheapest
+shape this rebuild has had so far.
+
+**`srcTrace.js` is written and unwired.** It is the geometry-only extraction of the occupancy
+trace, with `pickOccTrace`, the record march and `composeFieldDynamics` intact. Wiring it is Phase
+2's first act — and it also closes §12.12.4's interregnum, because `srcTrace` is the module's only
+`profile: true` and the ray-hit counters have been unfed since the transport died. When
+`smoke:gi-gpu ?requirerays=1` passes again, the leniency added in `711a8e1` can come back out.
+
+**Missing:** `srcRays.js` (Alg. 3 on the GPU), the deposit's fixed-point atomics, the resolve, and
+the c0-only shading path.
+
+#### 12.13.3 The one hard structural question, answered before it costs a session
+
+Alg. 3 propagates ray COUNTS up (a parent's count is the sum of its children's) and hands OFFSETS
+down, so that every probe sharing a parent occupies a contiguous segment of the one global R2
+sequence. Up is trivial on the GPU — one `atomicAdd` from each child into its parent, and the
+parent pointer is already resolved (§12.12.1).
+
+Down looks like it needs a **child list per parent**, i.e. a compaction pass, because "the children
+of probe P" is not a contiguous range anywhere. It does not. Give each parent an atomic CURSOR
+initialized to its own `rayOffset`, and let each child claim its slice with a single
+`atomicAdd(cursor, childCount)` — the returned value IS the child's offset. That produces an exact
+partition of the parent's range with no gaps and no overlaps, which is the property the mirror
+tests, and it costs one atomic per probe instead of a compaction.
+
+**What it does NOT preserve is ORDER within a parent**, and that has one consequence worth writing
+down now rather than discovering in a diff: the assignment is scheduler-dependent, so a probe's ray
+INDICES differ between two runs of the same frame. The mirror comparison must therefore check the
+PARTITION (every index used exactly once, every parent's children covering its range contiguously)
+and not the specific indices — exactly as `test:gi-src-probes` compares key sets rather than
+indirection indices, and for the same underlying reason. Under temporal accumulation the
+non-determinism is a mild positive: a probe's directions vary frame to frame, which is extra
+coverage the R2 sequence would not otherwise give.
+
+#### 12.13.4 The fixed-point deposit, with the headroom measured
+
+`binScratch` is per (probe, bin) 3×u32 RGB + u32 T + u32 count (§4.2), because WGSL has no float
+atomics. The question is how many fractional bits, and the answer depends on how many rays can land
+in one bin.
+
+The plan's §4.2 claim that per-cascade bin totals stay roughly constant is **confirmed
+arithmetically** at §9's 2M rays/frame — the probes÷4 and bins×4 per level cancel almost exactly:
+
+| cascade | probes | bins | rays/probe | rays/bin |
+|---|---|---|---|---|
+| c0 | 80,000 | 32 | 25 | 0.78 |
+| c1 | 20,000 | 128 | 100 | 0.78 |
+| c2 | 5,000 | 512 | 400 | 0.78 |
+| c3 | 1,250 | 2,048 | 1,600 | 0.78 |
+
+So the AVERAGE bin sees well under one ray per frame — the payload is sparse, which is why
+zero-count bins are "unknown" rather than zero (srcMath's `resolveBin`) and why that rule is
+load-bearing rather than fastidious. Storing `round(L/Lmax · 2^F)` overflows at `2^32 / 2^F`
+saturated rays in a single bin:
+
+| F | resolution (of Lmax) | overflows at |
+|---|---|---|
+| 12 | 2.4e-4 | 1,048,576 rays/bin |
+| **16** | **1.5e-5** | **65,536 rays/bin** |
+| 20 | 9.5e-7 | 4,096 rays/bin |
+
+**Recommend F = 16.** It leaves ~84,000× headroom over the measured average — enough that even a
+pathological cluster (one c0 probe owning a large flat screen region, every ray in one bin) cannot
+reach it — while giving 1.5e-5 relative resolution, which is finer than the f16 payload the resolve
+writes into anyway. The Phase-2 gate should still fuzz it (§7 asks for exactly that) rather than
+trust the table.
+
+**Left open deliberately, because it is an energy decision and not an implementation one:** `Lmax`
+implies a per-ray radiance CLAMP, and a clamp loses energy at exactly the bright hits that matter
+most. The guide argues fireflies are impossible here by construction, which would mean the clamp
+never binds — but "never binds" is a claim to measure, not to assume, and the alternative (a
+per-frame auto-exposure driving Lmax as a uniform) is more machinery. Decide it with a measurement
+of the actual hit-radiance distribution on the user's scenes, not in advance.
+
+#### 12.13.5 The unit decomposition
+
+Four commits, in this order, each gated before the next:
+
+1. **Wire `srcTrace.js`** — the trace closure built against `srcVolume`'s world bundle and the
+   occupancy field, fired from a throwaway kernel over the existing probe set. Gate: the ray-hit
+   counters come back (`smoke:gi-gpu ?requirerays=1` green), and the interregnum leniency is
+   removed in the same commit. This is deliberately its own unit because §7 calls the extraction
+   "this phase's riskiest edit" and the full `test:gi-rayhit-*` suite has to prove the old backend
+   unaffected — which is now cheap, since all twelve are green as of `711a8e1`.
+2. **`srcRays.js`** — Alg. 3: the pixel histogram into per-probe counts, the up-propagation, the
+   atomic-cursor down-pass of §12.13.3. Gate: a new standalone page in the
+   `gi-src-{math,probes,populate}` family, diffing the PARTITION against `assignRays`.
+3. **Trace + split + deposit** — [E] and [F], the fixed-point scatter and the resolve. Gate:
+   deposits-vs-mirror on a frozen frame, plus the overflow fuzz. **Sparkle is an atomics race** —
+   guide §8.7 says fireflies are impossible by construction here, so any sparkle at all is a bug
+   with a specific cause, not a tuning problem.
+4. **c0-only resolve** — shade straight from raw c0 with the merge disabled, which the guide's §8.3
+   calls the single-level sanity check and which produces an AO-like short-range bounce. **This is
+   the commit where the screen stops being dark**, and the first honest eye check of the rebuild.
+
+#### 12.13.6 Traps carried into Phase 2, all already paid for
+
+- **The R2 sequence is u32 fixed point** (§12.11.1). `srcRays.js` must use `r2PointFx`, never a
+  re-derived float form — the float one has eight distinct values at the ray counts this phase will
+  actually run at, and the f64 mirror cannot see it.
+- **`u32(-1)` is not a representable WGSL literal** (§12.12.1) and it kills the whole shader module
+  silently. Absences are `SLOT_EMPTY`.
+- **A bare JS `return` inside a TSL `If` is not an early exit** (§12.11.3) — use `Return()`.
+- **`atomicCompareExchangeWeak` can fail spuriously**; anything new that CASes must retry the same
+  slot (§12.11.2).
+- **Zero-count bins are UNKNOWN, not zero** — the single most consequential line in `resolveBin`,
+  and the sparsity table above is why.
+- **Deposits go into the ANCESTOR CHAIN of the pixel's c0 probe**, and nothing is deposited ABOVE
+  the owning cascade. The companion guide has this wrong; the authors rejected upward extension for
+  bias (srcMath's `splitDeposits` header).
+- **Rays originate at PIXELS, never at probe positions.** Offsetting the origin along the normal to
+  fix a self-occlusion artifact IS the artifact (srcMathTsl's `rayDirection`).
