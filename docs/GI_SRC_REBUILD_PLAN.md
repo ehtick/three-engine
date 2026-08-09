@@ -2340,3 +2340,187 @@ where a wrong lattice would finally become visible.
 Gates at `aabd237`: `smoke:gi-gpu` on five src arms and both non-src defaults, `test:gi-src-deposit`
 ×2, `-populate`, `-math`, `-rays`, `-ref`, `-volume`. Emitter shadow probe EXACT
 (`penumbraPx=16601 grain=0.0307`).
+
+### 12.18 Phase 3 entry brief — read this before writing anything
+
+Phase 2 is complete and green (§12.14–§12.17). This section is to Phase 3 what §12.13 was to
+Phase 2: what exists, what is already decided, and the two things that must happen in a specific
+order before [G] is touched at all.
+
+#### 12.18.1 THE ORDER IS NOT §7's ORDER, AND THIS IS THE MAIN POINT
+
+§7 lists Phase 3 as "[G] merge + [H] irradiance tiles + [I] screen gather". **Do not start there.**
+Two findings from Phase 2 sit in front of it, they are coupled, and doing them in the wrong order
+means doing the second one twice:
+
+1. **The bin-block claim** (§12.16.3). Bins are addressed by probe CAPACITY, 127 MB at the engine
+   default, and `createSrcBinStore` throws past the 128 MiB binding limit at roughly 32k c0 probes.
+2. **The LOD-0 reach constant** (§12.17.4, and the arithmetic below). Probe spacing is currently
+   ≈ the camera distance, which is why the Cornell render is made of rectangles.
+
+They are coupled because **fixing the LOD constant multiplies the probe count, and the probe count
+is what the bin memory is a function of.** Fix LOD first and the bin store immediately refuses to
+build. So: block claim, then LOD, then the merge.
+
+#### 12.18.2 The LOD constant — the fix is one number, and it is derivable
+
+`lodAtDistance` returns 0 only while `cheb ≤ s₀`, and `probeSpacing(0, lod, s₀) = s₀·2^lod`.
+Composed, spacing ≈ cheb: LOD 0 applies **within 0.45 m of the camera** at the shipping s₀, and
+everything beyond it is coarser in proportion to its distance. Angular probe spacing is therefore a
+constant ~1 radian, about 57°, where it needs to be a fraction of a degree.
+
+The correct form introduces the distance at which s₀ stops being fine enough:
+
+> `lod = log2(cheb / (LOD0_REACH · s₀))`, clamped at 0.
+
+`LOD0_REACH` is `s₀ / α` for a target angular spacing α. At α ≈ 1/100 rad (0.57°), that is
+**64–128** — the same order as `REANCHOR_CHEBYSHEV`'s 64·s₀, which is not a coincidence: both are
+"how far out does the LOD-0 lattice have to stay usable".
+
+What it does to the probe count, estimated from visible surface area (probes ≈ area / spacing²):
+
+| scene | visible area | today | at LOD0_REACH = 64 |
+|---|---|---|---|
+| Cornell (§12.17's render) | ~100 m² | **19** | ~280 |
+| Sponza-class interior | ~2,000 m² | order 100s | ~10,000 |
+
+Both land under the 16,384 c0 capacity `expectedC0Probes` already allocates, which is the useful
+part: **the capacity was sized for the right answer all along, and only the LOD law was wrong.**
+
+**Do not change this before the block claim lands, and do not change it in the same commit.** Every
+probe count, load factor, mean-probe-step and timing in §12.11–§12.17 was measured under the current
+law. Land it alone, re-measure the whole Phase-1/2 gate set, and record the new baseline — otherwise
+every number in this document silently retires and nothing says so.
+
+Suggested shape: a `LOD0_REACH` constant in `srcConfig.js` used by BOTH twins (`srcConfig`'s
+`lodAtDistance` and `srcMathTsl`'s), because `test:gi-src-math` holds them bit-identical and a
+one-sided change fails it — which is the gate doing its job.
+
+**The framing conflict, which is worth knowing before anyone tries to make a demo picture.** The
+visual probe (`probe:gi-src-visual`) currently renders something that does not read as a Cornell
+box, and that is not only bad camera work. The two requirements fight:
+
+- the canonical framing needs the camera well back from the aperture with a narrow field, and there
+  the LOD law gives **3 probes** — the frame is literally three flat rectangles;
+- pulling the camera inside the room raises it to ~19 probes and the shapes become legible, but the
+  camera is then inside the box and the room reads as a corner rather than as the scene.
+
+So **there is no camera placement that both frames the scene and shows structure**, and chasing one
+is wasted effort until §12.18.2 lands. After it, the canonical framing should give a few hundred
+probes and the picture becomes worth looking at. Re-shoot the probe then; it is the cheapest
+before/after this rebuild will get.
+
+#### 12.18.3 The bin-block claim — and it REDUCES memory rather than costing it
+
+The instinct is that per-live-probe bin blocks are a ceiling-raiser bought with complexity. They are
+not: they are a straight saving, and a large one, because the current scheme allocates for capacity
+while §12.16's gate measured **0.24% of allocated bins ever sampled**.
+
+| scheme | probes | bins | scratch + payload |
+|---|---|---|---|
+| by capacity (today) | 16,384 cap / 19 live | 3.67 M | **127 MB** |
+| by claimed block | 10,000 live (post-LOD-fix Sponza) | ~1.3 M | **~47 MB** |
+
+So the claim makes the LOD fix affordable *and* cuts the default footprint. Design, which is already
+implied by the existing machinery:
+
+- **`PROBE_SPARE` (word 7) is the reserved slot** — Phase 1 named it "irradiance tile slot (Phase
+  3)" and this is that.
+- **Reuse the free-stack pattern from `createSrcProbeStore`** verbatim: a pool of block indices, an
+  atomic top, `atomicSub` to pop and `atomicAdd` to push. It is already written, already gated, and
+  already handles exhaustion by leaving `SLOT_EMPTY` rather than clamping to 0.
+- **Claim in the COMPACTION pass** (`createCompactPass`), which is where a probe is created and
+  already pops a free index — one more pop in the same thread, no new dispatch.
+- **Release in the AGE pass**, where a probe retires.
+- **R10 says clear-shares-freshness-with-deposit**: a freshly claimed block must be zeroed before
+  the first deposit lands in it. The claiming thread can do it (it owns the block and no one else
+  can reach it yet), which also deletes the whole-buffer clear the deposit currently runs every
+  frame over 3.67 M bins.
+- **Failure mode to write down before it bites:** a probe that fails to claim a block must be
+  treated as having no bins — i.e. its deposits are dropped and its gather returns UNKNOWN. NOT
+  block 0. The `SLOT_EMPTY`-not-index-0 rule is already the module's convention (§12.15.2) and this
+  is the same rule in a new place.
+
+#### 12.18.4 What Phase 3 proper starts from — the mirror is complete
+
+Same happy situation Phase 2 had. `srcRef.js` already has, all green under `test:gi-src-ref`:
+
+- `mergeCascades` — Eq. 6/7, cascade N−1 → 0, with the top merging against the sky.
+- `preAverage` / `preAverageChildBins` — the 4→1 pre-averaged cone, with unknown children SKIPPED
+  and the average renormalized over what was found.
+- `bakeProbeIrradiance`, `fillOctahedralBorder`, `binCosineWeights` — [H], the 6×6+border tiles.
+- `sampleTile`, `gatherPixel` — [I].
+- `sparseGather` / `trilinearCorners` in `srcMath.js` — the sparse-trilinear reader.
+
+So Phase 3 is again "make the GPU agree with an existing mirror", and the gate family
+(`gi-src-{math,probes,populate,rays,deposit}.html`) is the template: own renderer, synthetic
+gbuffer, no engine.
+
+#### 12.18.5 The gather this replaces, and the invariants it inherits
+
+`srcGather.js` is the **c0-only, screen-space** placeholder and Phase 3 deletes it. Two things it
+established should carry forward rather than be rediscovered:
+
+- **The analytic π** (§12.17.2). `E = π · (cosine-weighted mean over sampled bins)`. Using the
+  discrete `Σ max(0,cos)·Δω` instead invented 1% of energy. Whatever [I] looks like, it must keep
+  the property that uniform radiance returns exactly π·L.
+- **A real probe gather fixes the screen-space limitation** §12.17.3 records: `createGiResolve`
+  calls `gather` at an exact-reflection HIT, an arbitrary world point that a screen texture cannot
+  answer for. That call site has been on `gather == null` since the transport died. Phase 3 is when
+  it comes back, and `screenGather` in `createGiResolve` should go away with it.
+
+**§12.10.1 archives the retired `gate:gi-gather`'s four invariants and says to write a FRESH gate
+rather than repair the old one.** They still apply: c0DirRes 2 is degenerate; texels varying 2.73×
+in solid angle with Δω never written; a 40° source drifting 2.1× instead of converging. SRC's
+equal-area bins already satisfy the solid-angle one by construction — say so in the gate rather than
+assuming it.
+
+#### 12.18.6 Traps carried in
+
+- **The 4→1 parent mapping's DIRECTION** (§12.1): bins get FINER as cascade rises. The merge reads
+  a parent whose grid is 2× wider per axis, and `preAverage` is what collapses four child bins into
+  the one value the parent level consumes.
+- **The octahedral border is CORRECTNESS, not layout** (§12.2) — +32% on a −Z receiver. `[H]`'s
+  tiles are 6×6 interior + 1 border for this reason and `fillOctahedralBorder` is the mirror.
+- **Zero-count bins are UNKNOWN, not zero**, through the merge as well as the resolve. `mergeBin`
+  and `preAverage` both skip unknowns and renormalize; a merge that treats them as black
+  reintroduces the cliff at every sparsely-sampled edge.
+- **Accuracy gates measure the REFINEMENT TREND, not a tolerance** (§12.2).
+- **`atomicLoad` on an atomic buffer** — WGSL will not implicitly convert `atomic<u32>` to `u32`
+  and it fails at `CreateShaderModule`, which surfaces as a validation error rather than a wrong
+  picture (§12.16, the resolve pass).
+- **`probeTable` cannot become atomic** — `srcGizmos.js` reads it from a VERTEX stage (§12.15.2).
+  Anything the merge wants to accumulate needs its own buffer.
+- **The portable limit is 8 storage buffers per stage.** The merge will want probeTable, the
+  payload, the hash and its own output; the resolve is already full, which is why `srcGather` runs
+  as its own pass and hands over a texture (§12.17.3).
+- **Row padding to 256 B** on any readback a new gate does (§12.17's visual probe paid for it).
+
+#### 12.18.7 Suggested unit decomposition
+
+1. **Bin-block claim.** No behaviour change, memory falls, `test:gi-src-deposit` and the smoke stay
+   green on identical numbers. Gate: the existing suite, plus a new arm asserting blocks are
+   released on retirement and that a claim failure yields UNKNOWN rather than block 0.
+2. **`LOD0_REACH`, alone.** Both twins together. Re-measure and re-record the whole Phase-1/2 gate
+   set — this is the commit that retires §12's probe numbers, so it should replace them.
+3. **[G] the merge** — `srcMerge.js`, cascade N−1 → 0, against `mergeCascades`. Gate: a fresh
+   standalone page in the family.
+4. **[H] irradiance tiles** — the atlas, the border, the cosine weights. Gate: vs
+   `bakeProbeIrradiance` + the furnace.
+5. **[I] screen gather** — sparse-trilinear, position-indexed, replacing `srcGather.js` and
+   `screenGather`. Gate: §12.10.1's four invariants, freshly written.
+
+Then §7's Phase-3 gates: GPU furnace, `probe:gi-falloff` against analytic −2.72 (the metric the
+current default fails at −2.18 — **this time a test guards the default**), `run-gi-rc-splitroom`
+leak rows, and the interval-boundary ring check.
+
+#### 12.18.8 Still owed from Phase 2
+
+**The eye check.** `__giSrcProbes = true` before the GI module builds, **Sky Light above zero**, over
+Sponza and the projectile game. Expect AO-shaped short-range darkening; no bounce colour (Phase 5),
+no long-range term (Phase 3), and — until §12.18.2 lands — a visibly coarse lattice, which is
+expected rather than a fault. §12.13.1's deferred Phase-1 gizmo check is the first thing to rule out
+if the light is misplaced.
+
+`npm run probe:gi-src-visual` renders the Cornell box to `artifacts/gi-src-visual/` (direct / gi /
+both) if a picture is wanted without launching the editor.
