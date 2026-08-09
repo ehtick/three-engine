@@ -1298,3 +1298,132 @@ So:
    in the headless rig, and that symptom is invariant across a byte-for-byte move — so it is the rig.
    The real check is a person switching Debug View in the editor, and now also confirming the
    interregnum reads as expected: direct light and shadows present, bounce absent.
+
+---
+
+### 12.10 The SDF goes too — and where the line between "delete" and "park" fell
+
+**Status:** done, `fd1300b` → `c75fba5`, on the user's call ("we have all of it in git if we ever
+need it — delete everything we don't need, sdf included"). 24,634 → **23,404 lines**, i.e. 33,355 →
+23,404 across the whole sweep, a 30% cut. Every gate green at every commit and the emitter-shadow
+probe at `penumbraPx=16601 grain=0.0307` throughout, including the SUN arm's `floorIn=12865
+miss=14573`.
+
+#### 12.10.1 What went
+
+**`slotRegistry.js`: 911 → 231 lines.** The tile texture and its pool (`acquireTile`/`releaseTile`/
+`#findTileBlock`/`#findTileSingle` and the tail-first single allocation that existed only to stop
+block fragmentation), `setSlot`-with-a-baked-grid, the `.sdf` file format
+(`encodeMeshSdf`/`decodeMeshSdf`/`geometryFingerprintOf`), all NINE per-slot uniform arrays,
+`sampleSlot`'s five-branch analytic SDF (grid / box / ellipsoid / box-shell / ellipsoid-shell), the
+per-step `refineDetail`, the detail-slot list, the dirty-bounds accumulator, and the
+`grid`/`sparse`/`slotPriority` attachment points.
+
+**`occupancyField.js`: 4,645 → 4,571 lines**, and this is the part with a runtime cost attached. The
+coarse SURFACE-ATTRIBUTION grid is gone: `cellAttr` (atomic u32 over composite cells — 2.6 MB at high
+on the probe rig), `staticAttr`, the `slotAtlas` numbering bridge, `setCoarseRes`, and a clear +
+snapshot + restore pass. **The voxelizer's hot loop drops three divides and an `atomicMax` per
+(triangle, voxel) overlap.**
+
+**`GISystem.js`:** `#killSdfEnabled()` itself (a method returning unconditional `true`, read at four
+sites), the hi-res 128³ grant selection (`#selectHiResMeshes`), `contentKeyOf`, the tile/instance
+capacity tiering, `#refreshOccupancySlotRemap`, the detail-slot ranking block, and `atlas.aabbExpand`/
+`minAnalyticHalfWorld`.
+
+**`voxelizeOnce.js`: 399 → 205 lines.** `createVoxelSceneTrace` (the TSL Amanatides-Woo DDA) and
+`createTrilinearRadianceSampler` (the side-aware trilinear read every transport hit shaded through).
+The file now imports nothing from three at all — it is pure CPU material/mesh resolution.
+
+**`scripts/run-gi-gather-invariance-test.mjs` and its `gate:gi-gather` entry.** This is the "two RED
+gates" item from §12.9, resolved rather than carried: the gate was a CPU port of
+`cascadeGather.js:939`'s estimator, written as an acceptance criterion for a fix that will never land
+because the estimator is deleted. Its four findings are worth keeping in mind for Phase 1-3 and are
+the reason it is recorded here rather than merely dropped: **`c0DirRes = 2` is DEGENERATE** (all four
+octahedral texel centres land on the equator, so a ±Z-facing surface gathers exactly zero);
+**octahedral texels vary 2.73× in solid angle** and the estimator never wrote Δω down, so it was
+silently area-weighted (1.46× at the pole vs 0.75× at the map corner); a well-resolved 40° source
+**drifted 2.1× across 16…4096 directions instead of converging**; and sub-texel sources were
+hit-or-miss, which was the emissive flicker under motion. An SRC gather has to satisfy these
+invariants, and a fresh gate should be written against SRC rather than this one repaired.
+
+#### 12.10.2 What proved it dead — "unreferenced" is not "unreachable"
+
+Two independent facts, and the second is the one that made this safe:
+
+1. **No tile is ever acquired.** Under `killSdf` — unconditional since the bake pipeline was deleted —
+   `#buildEntries` synthesizes a bounding box for anything `fitPrimitive` cannot name, so every entry
+   is analytic, `contentKey` is always null, and the tile path is never entered.
+2. **No GPU reader was left for the per-slot uniform arrays.** `bvhScene.js` keeps its OWN
+   `worldToLocal`/`aabbMin`/`aabbMax` (bvhScene.js:549-551) — the `atlas.albedo` mentions in that file
+   are comments and its `atlasTexture` is a separate per-mesh albedo CanvasTexture. The composite that
+   bound slotRegistry's arrays went with the transport.
+
+A prior session had already replaced the 40 MB tile texture with a **4×4×4 token** holding "far"
+(their scene had allocated 7 layers ≈ 58 MB for data nothing wrote), so this deletion frees code and
+one hot-loop atomic, not VRAM. That was worth knowing BEFORE deciding, and is why §12.9 filed the
+sweep as hygiene.
+
+#### 12.10.3 WHAT SURVIVES, and the rule
+
+`slotRegistry.js` is not deleted, because something load-bearing was hiding under the atlas: the
+census must know which placements exist, hold each one's surface, and **notice when one MOVES**.
+`revision` is the wake signal the pyramid's refresh branch triggers on, so without it a dragged mesh
+marks the field dirty and nothing ever consumes it. `refreshSlotTransform` now does exactly one thing
+— re-cache the world matrix — because that cache is what `#matrixChanged` compares.
+
+**The rule this sweep converged on, stated once:**
+
+> A REPRESENTATION that is gone forever gets deleted. MECHANISM for a feature that returns gets
+> parked, with a comment saying so.
+
+Applied:
+
+| deleted | parked |
+| --- | --- |
+| the SDF atlas, tiles, `.sdf` format, `sampleSlot`/`refineDetail` | the six authored transport props (bounce, bleed, temporal/probe/field smoothing, sky) |
+| the coarse attribution grid | the mover-occluder bundle (`#moverOccluders`, `#syncMoverOccluders`, `giProxySpheres`) |
+| the dense-field readers (`createVoxelSceneTrace`, `createTrilinearRadianceSampler`) | the queue triplet |
+| `peakSplit`, `sparseField`, `autoRebake`, `backend`, `debugProbes`' raw/merged | the idle-sleep branch |
+
+The mover-occluder bundle is the interesting case: `#moverOccluders` has **no caller** right now, so
+the bundle is never created and `#syncMoverOccluders` early-returns at zero cost. It stays because the
+two halves of `__giDiffuseSkipMovers` are ONE change and shipping either alone is strictly worse than
+shipping neither (rays skipping movers with no analytic term back = movers cast no indirect shadow;
+the analytic term with rays still hitting them = every mover shadow applied twice). Phase 1-3 needs
+precisely this bundle the moment diffuse rays skip movers again, `giProxySpheres` and
+`run-gi-proxy-fit-test` hang off it and stay green, and the code now SAYS it is parked — because
+inert-but-intentional is otherwise indistinguishable from forgotten.
+
+Five Inspector knobs were removed outright on the same rule, and a parked prop is not one of them: a
+parked prop belongs to a feature that is visibly absent, while `peakSplit` (the transport's two-half
+ping-pong), `sparseField` (inert since 2026-08-02), `autoRebake` (no bakes to re-run), `backend` (its
+only other value named a deleted transport — the coercion and warning stay so old scenes load, and
+`__giBackend` survives as a diagnostic kill switch) and `debugProbes`' raw/merged described machinery
+that no longer exists at all. Saved scenes keep the values harmlessly: an unknown prop is ignored.
+
+#### 12.10.4 Two facts transcribed out of the attribution grid, because both were paid for
+
+- **The crossed-numbering bug.** Placement slots and atlas slots were numbered independently
+  (mesh-walk order vs `#syncSlots` priority), which once fed the composite a different mesh's colour.
+  The remap was applied in the VOXELIZER rather than read in the composite for a hard reason: the
+  composite kernel already sat at the user GPU's **12-uniform-buffer per-stage limit**, and buffer 13
+  fails `CreateBindGroupLayout`, which drops the WHOLE compute batch.
+- **The deterministic-winner fix.** Last-write-wins re-rolled every multi-mesh seam cell's colour by
+  GPU scheduling on every dispatch, and a moving object re-voxelizes every frame — so the bounce
+  amplified it into visible flicker. `atomicMax` made the winner in a shared cell deterministic.
+
+Anything that re-introduces per-cell surface attribution inherits both.
+
+#### 12.10.5 Order from here, unchanged
+
+**Phase 1 — GPU probe population**, diffed against `srcRef.js` on a frozen frame. Then Phase 2/3.
+
+Still open, and now the complete list: `run-gi-rc-penumbra.mjs` reports `shadowMin ≈ lit` on two arms
+(pre-existing at the pinned baseline). The GPU rigs that measure DIFFUSE indirect —
+`run-gi-bleed`, `run-gi-block-size`, `run-gi-flicker`, `run-gi-emissive`, `run-gi-mover-bounce`,
+`run-gi-rc-lattice`, `run-gi-rc-splitroom`, `run-gi-perf` — all measure a term that is currently zero;
+they are instruments for a feature that returns, so they are kept, and a zero from any of them right
+now means nothing. `lightTree.js` (1,129 lines, plus a green suite) has **no importer in `src/`** — it
+is a built-but-unwired many-lights sampler from the superseded `GI_NEXT_ARCHITECTURE.md` §7, and it
+is flagged rather than deleted only because it is orthogonal to this rebuild; say the word and it goes.
+And the user-eye check in the editor is still outstanding.
