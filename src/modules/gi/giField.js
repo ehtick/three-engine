@@ -168,7 +168,18 @@ export function createGiField(bounds, res, atlas, options = {}) {
   // and the distance source at once and no result would be attributable. The
   // voxel-derived bundle is a SEPARATE arm — see `createSrcWorld` and the
   // capWorld finding in `run-gi-src-volume-test.mjs`.
-  const srcShadowArm = String(globalThis.__giSrcVolumeShadows ?? "");
+  //
+  // DEFAULT FLIPPED TO THE ORACLE (§12.6 — the A/B is in). Both arms measured
+  // BETTER without the composite's low-pass, not merely equal: contact-band
+  // accuracy 0.0178m vs 0.0411m, penumbra-vs-truth 0.185 vs 0.210 (closer on
+  // 524 rays to 266), zero conservativeness violations against the composite's
+  // 7.6% — because interpolating a real distance against a SATURATED neighbour
+  // blends in `capWorld` and reports metres of free space a voxel from a wall.
+  // Cost was +0.15ms GPU median and 0.99x the mean smoothness step.
+  // `__giSrcVolumeShadows = "legacy"` restores the composited arms; they remain
+  // reachable until `giField.js` dies with the transport, and automatically for
+  // the (never-observed) no-occupancy device, which has no oracle to ask.
+  const srcShadowArm = String(globalThis.__giSrcVolumeShadows ?? "both");
   const srcArm = (which) =>
     !!occField && (srcShadowArm === which || srcShadowArm === "both");
   let srcVolumeCache = null;

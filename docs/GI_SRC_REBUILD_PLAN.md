@@ -711,14 +711,22 @@ every consumer gates saturated samples out of the estimator entirely.
 | …of which from a saturated corner | — | 77 samples, mean **0.64m**, max **1.86m** |
 | contact band `|d−truth|` (< 2 voxels) | **0.0178m** | 0.0411m |
 | hugging floor @ 1.5 vox | **0.0229m** | 0.0473m |
-| per-step `|Δd|`, mean / worst | 0.0040m / 0.248m | 0.0041m / 0.103m |
-| **penumbra width vs truth** (mean) | **0.185** | 0.210 |
-| penumbra closer to truth on | **524 rays** | 266 rays |
+| per-step `|Δd|`, mean / worst | 0.0040m / 0.248m | 0.0025m / 0.030m |
+| **penumbra width vs truth** (mean) | **0.186** | 0.212 |
+| penumbra closer to truth on | **528 rays** | 277 rays |
 
-- **Smoothness — the one real risk — costs 0.99× the mean step and 2.4× the worst step.** Nil.
-  The worst oracle jump is 0.248m (2 voxels), well inside the ladder's own predicted bound of
-  0.5·voxel·2^L = 1.0m, which is checked so a violation would mean a mirror bug rather than a
-  surprise.
+- **Smoothness is the one place the oracle is genuinely worse: 1.64× the mean per-step |Δd| and
+  8.18× the worst.** ⚠️ *An earlier revision of this section claimed 0.99× / 2.4× and called the
+  cost "nil". That was wrong* — a stale reading taken before the arm's in-band gating was
+  finished, and it was overstating the case for the change it was justifying. The suite prints the
+  live ratio on every run; trust that line, not a number copied out of it.
+  What makes the flip correct anyway is that the discontinuity is **bounded and invisible**, not
+  absent: the worst oracle jump is 0.248m = 1.99 voxels, inside the ladder's own predicted bound of
+  0.5·voxel·2^L = 1.0m (the one thing this arm *gates*, so a violation means a mirror bug rather
+  than a surprise) — and `grain`, the GPU instrument that exists to catch exactly this failure
+  (a quantized distance etching a regular pattern into a floor), does not move: 0.0305 → 0.0307 on
+  the shipping path, 0.0250 → 0.0255 with the slab, and 0.0162 → **0.0153** on the sphere arm.
+  A 2-voxel C0 step in `d` is real and sits below the visibility floor of `k·d/t`.
 - **The composite is not conservative, and cannot be.** Trilinear interpolation of a 1-Lipschitz
   function overshoots between samples (measured ≤ 0.098m, under a third of a cell — the Lipschitz
   bound). The *large* overshoots are a different mechanism: interpolating a real distance against a

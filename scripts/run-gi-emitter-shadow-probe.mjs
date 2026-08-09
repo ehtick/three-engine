@@ -95,16 +95,16 @@ const moverY = Number(process.env.MOVERY ?? 0.6);
 // SOURCEANGLE — the sun's authored source angle (default 10; 0 = the user's
 // razor-sun case where any visible softness is a bug).
 const sourceAngle = Number(process.env.SOURCEANGLE ?? 10);
-// SRCVOL=probe|trace|both — THE §12.5 A/B. Routes the analytic width probe
-// and/or the sphere shadow trace through `srcVolume.js`'s occupancy-oracle
-// versions instead of the composited `distanceTexture`, which is the one change
-// the §5 deletion sweep is blocked on. This probe is the right gate for it
-// because its two headline metrics ARE the failure class the blocker predicts:
-// `grain` is the waffle-lattice number (a voxel-quantized distance etching a
-// regular pattern into the floor) and `leak` is the seal. Composes with HATCH,
-// so `SRCVOL=trace HATCH=spherearm` puts the legacy sphere arm on the oracle
-// while `SRCVOL=probe` leaves the record march's admission untouched and swaps
-// only its softness term.
+// SRCVOL=legacy|probe|trace|both — THE §12.6 A/B, now inverted. The oracle
+// arms (`srcVolume.js`) are the DEFAULT as of §12.6, so **`SRCVOL=legacy` is
+// the baseline** and an unset SRCVOL measures the shipping oracle path; `probe`
+// and `trace` still isolate one consumer each when the default is overridden
+// elsewhere. This probe is the right gate for the pair because its two headline
+// metrics ARE the failure class the (refuted) blocker predicted: `grain` is the
+// waffle-lattice number (a voxel-quantized distance etching a regular pattern
+// into the floor) and `leak` is the seal. Composes with HATCH, so
+// `SRCVOL=legacy HATCH=spherearm` is the legacy sphere arm on the composited
+// distance — the pre-§12.6 shipping shadow.
 const srcVol = process.env.SRCVOL ?? "";
 const result = await page.evaluate(async ({ hatch, quality, steps, slab, sunOn, profileOn, kindSub, sunPos, floorY, emitterCounts, moverOn, moverY, sourceAngle, intermitOn, pressure, intermitMs, srcVol }) => {
   globalThis.__probeFloorY = floorY;
