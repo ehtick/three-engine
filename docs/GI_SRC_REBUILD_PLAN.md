@@ -1887,3 +1887,111 @@ Four commits, in this order, each gated before the next:
   bias (srcMath's `splitDeposits` header).
 - **Rays originate at PIXELS, never at probe positions.** Offsetting the origin along the normal to
   fix a self-occlusion artifact IS the artifact (srcMathTsl's `rayDirection`).
+
+### 12.14 Phase 2 unit 1 — `srcTrace` gets a caller, and three things the gate caught
+
+`4c004ee`. `srcRayPass.js` fires one profiled ray per gbuffer pixel that owns a c0 probe, traced
+against the occupancy medium through `createSrcSceneTrace`. It deposits nothing, merges nothing and
+shades nothing — **the screen is still dark, and unit 4 is where that changes.** It is its own file
+so unit 3 deletes it in one line rather than unpicking it from a kernel that grew around it.
+
+The ray already obeys the three standing rules, because getting them wrong in a scaffold is how they
+get inherited: origin is the PIXEL (never the probe position), length is `intervalBoundary(0, lod,
+s₀)` read rather than re-derived, direction is `rayDirection` on the u32 R2 sequence.
+
+#### 12.14.1 What it costs in bindings, and why the probe table is not in it
+
+The kernel reads `pixelProbe` and nothing else from the store. The LOD is RECOMPUTED from the camera
+uniform rather than read out of `PROBE_KEY`, because the probe table would be a second storage
+binding in a kernel already carrying the occupancy pyramid, and this module has died on the portable
+8-buffer limit often enough that AGENTS.md leads with it. The two agree by construction — same
+camera uniform, same `lodAtDistance`, same `floor`. The binding audit walks the pass (it is in
+`system.passes`) and it stays under the line.
+
+The SINK is four atomic words in its own buffer, not the ray-hit counters: those are shared with
+every other profiled trace in a build, so a nonzero `rays` there would not prove THIS pass ran. It
+also exists so the trace has an observable side effect at all — a traced result nothing reads is a
+traced result a compiler may delete, and the deletion would present as a pass that dispatches, costs
+nothing and reports zero.
+
+#### 12.14.2 THE SMOKE WAS ASSERTING A TRACER THAT NO LONGER RUNS
+
+The first green run failed on `hybrid local-brick traversal counters stayed at zero`, and the
+assertion was wrong rather than the code. `pickOccTrace` ships TWO rungs, not five (§4.3): the plane
+marcher for modes 2-4, the legacy occupancy march below it. Since the scaffold is now the module's
+ONLY profiled tracer, the counters that get written are the ones **SRC's rung** writes —
+`traceOccupancy` feeds rays/hits/macroSteps and nothing else, so `?mode=hybrid-brick-box` reports
+`brickSteps = 0` legitimately.
+
+The mode assertions now key off `srcPlaneTrace`/`srcExactTrace` rather than the engine's requested
+mode. Nothing user-facing lost a gate: every quality tier ships HybridPlane or above (RayHitConfig),
+so the rungs SRC dropped are not rungs any user is on. **The general lesson is worth more than the
+fix — an assertion written against a backend outlives the backend, and reads as a regression in the
+one that replaced it.**
+
+The leniency §12.12.4 added SHRINKS rather than vanishing, and that is the honest end state: the
+counters are fed if and only if `?src=1`, so that arm now REQUIRES them without needing
+`?requirerays=1`, and the skip survives only where SRC is compiled out. `?requirerays=1` alone still
+FAILS, which is the check that the pin itself still works.
+
+#### 12.14.3 THE STEP BUDGET WAS THE DENSE BACKEND'S — 274 → 1 → 0
+
+`createSrcSceneTrace`'s default 96 is the interval-ray number, and srcTrace's own header warns SRC's
+rays are longer. They are. On the smoke scene (8 m, 19,200 rays), the legacy rung:
+
+| steps | stepLimitExits | hit rate |
+|---|---|---|
+| 96 | **274** | 77.2% |
+| 128 | 1 | 77.0% |
+| **192** | **0** | **77.0%** |
+| 256 | 0 | 77.0% |
+
+**The hit rate converging on the same schedule is the confirmation that matters.** An exhausted ray
+fails CLOSED from detail (occupancyField's "fail closed on step exhaustion" note), so those 274 were
+arriving as hits — the budget was not merely tight, it was manufacturing geometry.
+
+Shipped at 192, not at the lowest passing value, because **the budget is a loop CEILING and not a
+cost**: a ray that resolves in twenty steps pays twenty whatever the bound is. The only thing a
+higher ceiling buys is that the rays which would have given up finish instead. The plane rung clears
+96 on its own — 192 is sized for the rung that does not. `?raysteps=N` keeps the A/B, and **this was
+measured on an 8 m scene, so unit 3 has to re-measure it on a real one.**
+
+#### 12.14.4 A u32 SUM WRAPPED AND REPORTED A PLAUSIBLE BUG
+
+The sink first accumulated since boot, exactly as `RayHitDebug` does. The boot window reported
+**136,012,800 rays at a mean hit distance of 0.027 m** — below the trace's own `tMin` self-bias, so
+arithmetically impossible. The sum had wrapped a u32 twenty-odd times.
+
+Recorded because the surviving number looked like a REAL failure: an implausibly small mean hit
+distance is the signature of rays hitting their own origin voxel, which is precisely what this pass
+exists to detect. A diagnostic whose overflow mode impersonates the fault it is watching for is
+worse than no diagnostic. Now cleared per frame by a 1-thread dispatch ahead of the trace, which
+also makes `rays` a number a reader can check by hand against the pixel count.
+
+#### 12.14.5 The refinement trend, which is the closest thing to an eye check here
+
+Same scene, same rays, three intersection backends:
+
+| rung | hit rate | mean hit t | max t |
+|---|---|---|---|
+| legacy occupancy (whole-voxel) | 77.1% | 0.643 m | 7.10 m |
+| hybrid-plane (surface records) | 41.0% | 1.945 m | 9.17 m |
+| exact-complex (triangle pool) | 34.7% | 2.101 m | 8.35 m |
+
+Each sharper rung rejects more conservative-voxelization bulge and finds the real surface further
+out. That is §12.2's rule applied to a new instrument — **the gate measures the refinement TREND,
+not a tolerance** — and it is the strongest available evidence that the rays are geometrically
+sane before anything shades them. It is NOT a substitute for §12.13.1's outstanding eye check.
+
+#### 12.14.6 What unit 2 starts from
+
+Unchanged from §12.13: the CPU mirror is complete and green, `srcRays.js` is Alg. 3 with the
+atomic-cursor down-pass, and the mirror diff compares the PARTITION rather than the indices.
+One thing is now settled that was not: the trace closure exists, is bound, and its budget is
+measured — so unit 3's deposit is wiring a known-good tracer into a known-good probe set.
+
+Gates at `4c004ee`, all green: `smoke:gi-gpu` on `?src=1`, `+mode=hybrid-plane`,
+`+mode=hybrid-exact-complex`, `+dynobj=2`, both non-src defaults, and `?requirerays=1` alone failing
+as designed. `test:gi-src-{math,probes,populate}` ×2, `test:gi-src-{ref,volume}`, `test:gi-dynobj`,
+proxy-fit, boot-ambient, light-tree. **Emitter shadow probe EXACT on both arms** —
+`penumbraPx=16601 grain=0.0307`, `floorIn=12865 miss=14573`, unchanged from `711a8e1`.
