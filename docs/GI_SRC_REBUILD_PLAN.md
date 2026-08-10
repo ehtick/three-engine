@@ -3382,3 +3382,228 @@ Phase 4 is next per §7. `run-gi-rc-penumbra.mjs`'s `shadowMin ≈ lit` remains 
 and pre-existing; the diffuse-measuring GPU rigs (`run-gi-bleed`/`block-size`/
 `flicker`/`emissive`/`mover-bounce`/`rc-lattice`/`rc-splitroom`) measure a term
 that is still partly zero, so a number from them means nothing until Phase 5.
+
+### 12.23 Phase 4, unit 1 — the temporal blend, one stage earlier than planned
+
+§4.6's exponential accumulation. `test:gi-src-temporal` is the new gate; the
+mechanism is ~40 lines across `srcMath.js`, `srcDeposit.js` and `srcProbes.js`,
+and every one of the findings below came out of holding it to a measurement.
+
+#### 12.23.1 THE PLAN'S PLACEMENT WAS NO LONGER AVAILABLE, and the replacement is better
+
+§4.1 step [F] says "temporal blend with resident probe history" and §4.2 sizes
+`binPayload` to match — "the resolved payload PLUS the pre-averaged cone mirror
+written by the merge", i.e. the merge had a destination of its own. **[G] merged
+IN PLACE** (§12.20.1, worth 22 MB), so the resolved payload does not survive its
+own frame: by the time the next frame could blend against it, the merge has
+overwritten it with `own + T·parent`.
+
+**Blending the merged payload in place is not merely inelegant — it multiplies
+the parent's light by 1/α.** With `H ← (1−α)H + αS` followed by `H ← H + T·P`,
+the fixed point is
+
+    H = L + T·P/α
+
+so at α = 0.1 the entire cascade above a probe arrives TEN TIMES OVER. Keeping
+the plan's placement therefore means giving back exactly the 22 MB [G] saved.
+
+So the blend moved one stage earlier, onto the fixed-point deposit
+ACCUMULATORS: decay every word by `keep = 1 − α` before the frame's rays land on
+top, so `ΣR/Σcount` is an exponentially-weighted mean over RAYS. Better on three
+counts and worse on none:
+
+1. **It weights by EVIDENCE.** A payload EMA gives one frame's single ray the
+   same weight as another frame's twenty. At §12.13.4's measured **0.78 rays per
+   bin** that is the difference between an average and a lottery.
+2. **It needs no warmup path, and R6 comes free.** The plan carried
+   `ALPHA_FRESH = 0.3` / `FRESH_FRAMES = 8` because a payload EMA starting from
+   `H = 0` gives a newborn probe `0.1·S` and makes it crawl up from black over
+   ~20 frames — precisely R6's "smooths MEMBERSHIP, not values". A fresh block's
+   sums are ZERO, so its first frame resolves to that frame's own rays at full
+   weight. **Both constants are deleted.**
+3. **α = 1 is the code, not a branch.** `keep = 0` zeroes every word, which is
+   the clear pass this replaced. §4.6's quality-gate configuration is one
+   uniform — and every single-frame gate in the suite is unaffected at ANY α,
+   because frame one has no history either way.
+
+It costs a read where the clear only wrote, one word per bin block, and nothing
+in the dispatch count (43, unchanged).
+
+#### 12.23.2 COUNT AND TRANSMITTANCE BECAME FIXED POINT, and the resolve got simpler
+
+`floor(1 · 0.9) = 0`. A count of ONE — which at 0.78 rays/bin is the common case
+and not the corner — would drop to zero on the next frame and the bin would go
+back to UNKNOWN having just been sampled. So `BIN_T` and `BIN_COUNT` carry
+`DEPOSIT_F` fractional bits like radiance, and are no longer counts but WEIGHTS;
+one ray deposits `2^16` rather than `1`.
+
+The scale then **cancels out of `L = ΣR/Σcount` exactly** — `toL` is `Lmax/count`
+with no `2^F` in it at all — so the resolve lost a term rather than gaining one.
+The cost is one order of magnitude of overflow headroom, because a steady state
+is `1/α` frames' worth: §12.13.4's 84,000× becomes 8,400×, measured at 123,000×
+on the gate's own set.
+
+#### 12.23.3 IT ROUNDS, AND THE FIRST VERSION TRUNCATED — WHICH ATE DIM LIGHT
+
+The first implementation truncated, on the argument that rounding has a fixed
+point (`round(x·0.9) = x` for every `x ≤ 5`) and would leave a bin reporting a
+ray it saw a thousand frames ago. The STEADY arm failed at **1.8% relative**, and
+chasing it produced the sharper statement.
+
+A decaying integer accumulator does not settle on a point but inside an
+INTERVAL, and the intervals differ in width AND in placement:
+
+    truncation   x ∈ ( r/α − 1/α ,  r/α ]           entirely BELOW the truth
+    rounding     x ∈ [ r/α − 0.5/α, r/α + 0.5/α )   half as wide, STRADDLING it
+
+Either way the error is a fixed number of QUANTA, which makes it a RELATIVE
+error inversely proportional to the signal — measured, converging from zero as a
+fresh bin does:
+
+    influx r/frame      6       65      650     6500    65536
+    truncated       -15.0%   -1.39%   -0.14%  -0.014%  -0.001%
+    rounded          -6.7%   -0.62%   -0.06%  -0.006%  -0.001%
+
+`r` is `(L/Lmax)·2^F` per deposit, so **truncation is a systematic darkening that
+gets worse as the light gets dimmer** — the worst possible direction for a term
+whose whole subject is dim and indirect. And the width is only half the story:
+the gather AVERAGES many bins, so a two-sided error cancels there and a one-sided
+one accumulates into a darkening of the entire image. Measured after the change:
+per-bin spread −0.479%..+0.033%, **mean −0.013%** — 36× smaller than the spread,
+which is the cancellation itself.
+
+Rounding's fixed point stops mattering because the resolve tests a WEIGHT FLOOR
+rather than zero (§12.23.4). `MIN_WEIGHT` is 1024 against a residue of 5, a 205×
+margin, asserted rather than assumed.
+
+**And the mirror decays in f32 explicitly.** It happens to be unnecessary at
+α = 0.1 — the f32 product's half-ulp is wider than the gap between `0.9_f32` and
+`0.9_f64`, so both land on the same integer, verified over 285k values — but that
+is a property of one α, and a twin that agrees for a reason nobody wrote down
+stops agreeing when somebody changes the number.
+
+#### 12.23.4 THE TAIL VOTES BLACK, and that is R1 broken by arithmetic
+
+A bin that stops being sampled does not stop reporting: its weight fades
+geometrically and `ΣR/Σcount` renormalizes by that same fading weight, so it
+keeps FULL confidence in an ever-staler answer. That alone is defensible. Where
+it ends up is not.
+
+**The radiance word retires before the count does.** `R` is `L/Lmax` of `count`,
+so for any bin dimmer than the ceiling it is the smaller number and rounding
+kills it first. The last frames of a bin's life resolve to `almost-nothing /
+small` — full-confidence BLACK, from a bin that was merely old, arriving by
+arithmetic rather than by anyone deciding it. That is exactly the dark vote R1
+forbids.
+
+`MIN_WEIGHT` = a sixty-fourth of one ray retires the bin while `R` still has
+bits. Measured over 1,208 tracked bins: **4.48% worst error on the last readable
+frame, 3,177% one frame past the floor.** The guarantee holds while
+`L/Lmax > 1/MIN_WEIGHT`; below that a bin fades out first, and by then it is
+1/64 of a ray old and worth a thousandth of Lmax.
+
+At α = 1 every count is a whole number of rays, so the floor never binds and the
+test is the zero test it always was.
+
+#### 12.23.5 A RECLAIMED BLOCK, AND A `NaN` THAT COMPILED
+
+Persistent accumulators need something a cleared one does not: a block handed to
+a new probe still holds the DEAD probe's history, geometrically unrelated, and
+would fade in over ~1/α frames rather than being discarded.
+
+`createCompactPass` now stamps the frame number onto every block it claims, and
+a stamp equal to THIS frame makes `keep` zero. No fresh-block list, no second
+dispatch, no ordering subtlety — the claim runs three dispatches before the decay
+and the stamp goes stale by itself. It rides the pool buffer's tail rather than
+taking a binding of its own (R7), because the pass that writes it already binds
+six storage buffers against a limit of eight.
+
+**The first version indexed `freeStack[NaN]`.** `createSrcBinStore` copies four
+fields off each probe-store cascade and `blockBase` was not one of them, so
+`stampBase + info.blockBase` was `undefined`; `uint(NaN)` compiled, ran, and read
+the PROBE free stack, comparing probe indices against a frame number. It cleared
+a scattering of blocks by coincidence. Only the RECLAIM arm caught it, and only
+after that arm's own bug was fixed (below). The builder now throws on a
+non-integer base — the cheapest possible guard against a class of failure that
+produces no error at all.
+
+#### 12.23.6 The gate, and the two arms that were measuring the wrong thing
+
+Nine arms: `exact` (every word of a pure decay against `decayFixed`, bit-exact),
+`forget`, `bias`, `dark`, `steady`, `single`, `bounded`, `reclaim`, `variance`.
+
+**The trace is CONSTANT, and that is the whole design.** The deposit gate keys
+its synthetic trace on the ray INDEX, which is right there and useless here:
+§12.13.3's partition is scheduler-dependent, so an index-keyed trace feeds a
+different signal every frame — the one thing a test of temporal convergence
+cannot have. With every ray hitting at the same distance with the same radiance,
+a bin's resolved value is independent of how many rays landed in it, so the
+steady arm is exact UNDER the shuffle rather than in spite of it. And the arms
+that test the decay do not trace at all.
+
+Two arms had to be corrected, both for the same underlying reason — asserting a
+property of the *model* rather than of the thing measured:
+
+1. **"No bin was BRIGHTENED by the decay"** failed at −0.479%. I had mistaken the
+   from-below convergence of the constant-influx orbit (which does land at the
+   bottom of the interval) for a property of the operator. The per-bin error is
+   two-sided; only the MEAN is systematic. The arm now checks that the errors
+   CANCEL — |mean| < spread/10 — which is the property that actually matters
+   downstream.
+2. **The reclaim arm summed the whole pool** and read 3,068 bins holding decayed
+   weights. Correct behaviour: a freed block nobody has claimed keeps its history,
+   because the stamp fires at CLAIM and nothing walks the free list. That memory
+   is unreachable and is zeroed by whoever claims it next. An arm that counts it
+   is measuring the pool rather than the transport; it now walks live probes'
+   blocks.
+
+**And one arm exists because none of the others would have failed on a feature
+that did nothing.** Every arm above tests that the blend is ARITHMETICALLY right;
+a decay computing a flawless weighted mean of a signal with no variance would
+pass all of them and buy nothing. `variance` feeds a genuinely noisy signal and
+measures the frame-to-frame RMS of the resolved payload at α = 1 against α = 0.1,
+against the `sqrt(α/(2−α))` an EMA of i.i.d. samples predicts:
+
+    frame-to-frame RMS  4.023e-1 at α=1  →  8.673e-2 at α=0.1
+    4.64x, against a predicted 4.36x
+
+#### 12.23.7 The numbers
+
+Gate (`test:gi-src-temporal`):
+
+    20,963 bins held a constant signal to 2.34e-3 (0.033% relative, mean 0.013%)
+    pure decay matched decayFixed word for word over 118 frames, 0 wrong
+    1,208 tracked bins all retired BEFORE going dark; 4.48% vs 3,177% past the floor
+    17.4 rays of accumulated weight (123,000x headroom), R <= count everywhere
+    3,350 stale bins discarded on reclaim, 0 inherited
+    frame-to-frame variation fell 4.64x against a predicted 4.36x
+
+Smoke (`?src=1&sky=1`): 43 dispatches (unchanged), 56.32 MB (+0.06 for the
+stamps), 10,573/10,573 pixels lit, peak **3.1406 ≈ π·sky** — the furnace ceiling
+still holds end to end. Cornell: 53,853/53,853 lit, `lum 0.144..4.096`; the floor
+rose from 0.095, which is the accumulation smoothing the darkest single-frame
+estimates over the probe's three frames.
+
+Shipping path pinned: `penumbraPx=16601 grain=0.0307`.
+
+#### 12.23.8 What is left in Phase 4
+
+§7's Phase 4 is "LODs + temporal accumulation", and the LOD half is already
+done — the ladder and `LOD0_REACH` at §12.19.2, the ×0.9 overlap blend in [I],
+re-anchoring at §12.12.2. Fresh-probe warmup is deleted rather than built
+(§12.23.1). So what remains is §7's own gate list, which is measurement rather
+than mechanism:
+
+- **`run-gi-flicker-frame` ROTATE + fly-through arms** against the old-backend
+  baseline. The `variance` arm proves the blend reduces variance on a synthetic
+  signal; this is the same claim on a real one, in motion, where probe MEMBERSHIP
+  changes too — and membership is the half an EMA cannot smooth (R6).
+- **`probe:gi-block-size` ACF**, expecting block scale to track s₀·LOD (R14).
+- **Memory high-water on an open-world scene**, which needs a rig built.
+
+Phase 5 (hit shading) is where the radiance words stop being zero — and it
+inherits one number from this unit rather than a surprise: the decay's relative
+error is `~0.5·α/r` quanta with `r = (L/Lmax)·2^F` per deposit, so `Lmax` is the
+exposure that sets it. §12.13.4 left clamp-versus-auto-exposure open pending a
+measurement of the hit-radiance distribution; this is a second reason to close
+it, and it does not bind until Phase 5 makes those words non-zero.
