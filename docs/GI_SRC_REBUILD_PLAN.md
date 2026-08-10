@@ -4449,6 +4449,247 @@ the swept per-probe mover invalidation, and every GPU probe gate in §7's Phase 
 list. `__giSrcNeeSamples` is the A/B for the sample count; the tiers have no
 measurement to set it from and deliberately do not carry one.
 
+### 12.29 Phase 5, unit 3 — STATIC SURFACE ATTRIBUTION. §12.26.10 ITEM 3, THE ONE THAT IS NOT A SHADER CHANGE.
+
+**Status:** landed on `feature/gi-src` — `srcSurface.js` (new),
+`occupancyField.js`, `slotRegistry.js`, plus `scripts/gi-src-surface.html` and
+its driver. `npm run test:gi-src-surface` is **30 checks, green three runs
+running**, ~35 s on a real WebGPU device. `test:gi-src-ref`,
+`test:gi-src-deposit`, `test:gi-src-shade`, `test:gi-src-merge`,
+`test:gi-src-tiles`, all seven `test:gi-rayhit-*`, `test:gi-dynobj` and
+`smoke:gi-gpu` (both default arms plus `?src=1&sky=1`) all stay green.
+
+This is the half §12.28 named as absent: `srcShade.js`'s `surfaceAt` had no
+static answer, so every static hit shaded at `defaultAlbedo` with no emission.
+
+#### 12.29.1 The premise, confirmed before anything was designed
+
+All three legs of it held:
+
+- `occupancyField.js` had no `surfaceAt` — the coarse attribution grid
+  (`cellAttr`/`staticAttr`/`slotAtlas`) went with the field in §12.9, and its
+  epitaph is still in the file at the declaration site;
+- `SURFACE_MATERIAL_ID_WORD` (word 2 of the 4-word surface record) is genuinely
+  taken — `packComplexRange` writes it at `RayHitPacking.js:1053` and `:1346` and
+  both traces read it back;
+- and **the two slot numberings §12.9's crossed-numbering bug came from are
+  still live**. `GISystem#occupancyContentOf` hands out occupancy slots from a
+  stable monotonic map (`:6270`); `SlotRegistry.allocateSlot` pops a free stack
+  (`slotRegistry.js:98`). They are different numbers for the same mesh today.
+
+#### 12.29.2 KEYED ON THE SURFACE RECORD — the 100 MB objection answered by moving the key
+
+§12.9 rejected per-level-0 attribution at 12.6M voxels × 8 B = 100 MB and
+settled for a COARSE cell, accepting that a 0.5 m cell shared by a column and a
+floor gets one colour. That trade does not have to be made. Surface RECORDS
+already exist per OCCUPIED level-0 voxel — `surfaceCapacity` is
+`level0VoxelCount / 12` precisely because surfaces are ~2D — so **one u32 per
+record is level-0 precision at surface-manifold cost**, and it is also the
+resolution the intersection was computed at, which is R2 applied to attribution
+rather than to a bias.
+
+Measured on the gate's field (128×64×128, 92,844 records): attribution
+**0.71 MB of the occupancy allocation's 6.45 MB, 11.0%**. Arithmetic projection
+to Sponza-ultra (432×192×272 ⇒ 1,945,600 records): **14.84 MB** — the persistent
+stamp, its build scratch, and a 512-entry palette. Against 100 MB, and against
+the 121 MB that same pool already spends on records + fit scratch.
+
+#### 12.29.3 IT COSTS ZERO BINDINGS, AND THAT IS THE POINT RATHER THAN A BONUS
+
+Both the stamp and the palette are tail regions of the `bits` allocation, the
+pattern that file already uses for macro cells, records, the triangle pool,
+density, dynamic objects and the static BVH. A consumer that already traces
+reads them through a binding it already holds: **zero new storage buffers and
+zero new uniform buffers on the deposit kernel** (R7).
+
+That is not tidiness, and §12.9 says why: the last attribution grid had its slot
+remap applied *in the voxelizer rather than read in the consumer* **because that
+kernel had already reached the user GPU's 12-uniform-buffer per-stage limit**. A
+design that needs a binding here does not get to be correct later.
+
+The palette cannot be a CPU-written buffer for the same reason it cannot be its
+own binding: it has to live in `bits`, and `bits` is GPU-written every chain, so
+a CPU upload would clobber the pyramid. It is a `uniformArray` landed by a
+512-thread compute — one binding, in a pass nowhere near any wall.
+
+#### 12.29.4 THE TWO BUGS §12.9 PAID FOR, AND THE ARM THAT PASSES BY FAILING
+
+**Crossed numbering — deleted, not remapped.** The stamp is the OCCUPANCY slot
+(`pairSlot`, the number the voxelizer already holds when it sets a bit) and the
+palette is indexed by that same number, built from `field.placements`. The
+registry is reached by KEY — `slotKeyOf(mesh, instanceId)` — never by index. One
+numbering on the GPU, nothing left to get backwards.
+
+Asserting that needed the failure to be reproducible, so the gate seats the two
+boxes as an exact PERMUTATION (occupancy A=0 B=1, registry A=1 B=0) and
+`crossNumbering: true` writes the palette under the registry's index. Result, and
+this is the arm that proves the one above it can see anything at all:
+**1366/1366 clear-of-seam rays went wrong, and 1366/1366 read the OTHER mesh's
+albedo** — the bug, exactly, not merely an absence.
+
+**The deterministic winner — `atomicMax` on the stamp.** A level-0 voxel shared
+by several meshes picks the highest occupancy slot every dispatch, whatever order
+the threads arrive in. Measured: **0 of 6144 ray comparisons differ over four
+re-voxelizes.**
+
+#### 12.29.5 ⚠ THE DETERMINISM ARM FAILED FOR THE HARNESS'S REASON, AND READ 44,106
+
+Its first version compared the attribution buffer word-for-word across
+re-voxelizes and reported **44,106 of 262,146 words differing** on a stamp that
+was in fact perfectly deterministic.
+
+`surfAllocCompute` claims each brick's record offset with a racing `atomicAdd`,
+so **RECORD INDICES PERMUTE EVERY DISPATCH BY DESIGN.** A buffer whose addressing
+is order-dependent cannot be diffed by address. What has to be stable is the
+attribution AT A VOXEL — which is also the only thing a consumer can observe — so
+the arm re-probes the same rays instead and compares the slot each one reports.
+
+The lesson is the reverse of the usual one: "byte-identical" is the standard
+proof in this module, and here it was the wrong instrument because the address
+space is not stable. **Diff what the consumer sees, not where the answer lives.**
+
+#### 12.29.6 ⚠ AND ITS VACUITY GUARD IS THE HARD PART, NOT THE ASSERTION
+
+Determinism only means something where two meshes actually CONTEST a level-0
+voxel. With no shared voxel the stamp is a constant and four identical readbacks
+prove nothing — this is §12.27.2's "a null from a noisy instrument is free",
+wearing a different costume. Overlapping the boxes by 1.5 voxels is not enough
+either: the conservative SAT decides whether a voxel is contested, not the
+arithmetic in the fixture.
+
+So it is MEASURED. Swap the two occupancy slot NUMBERS and re-probe: a ray on
+uncontested geometry follows its mesh and its reported slot flips, while a ray on
+a contested voxel reports the SAME number both times, because `atomicMax` picks
+the higher id and that id now belongs to the other box. **335 rays keep their
+slot, 1713 follow their mesh, 0 lose attribution.** The 335 are the contested
+set, and the arm is sharper than a rerun as well: a non-atomic winner would put
+uncontested rays in the count too.
+
+#### 12.29.7 ⚠ `a.mix(b, t)` IS NOT `mix(a, b, t)` IN THIS TSL — AND IT LOOKS LIKE A PARTIAL FAILURE
+
+The unattributed fallback was written `vec3(fallback).mix(p.albedo, valid)`.
+Every clear ray came back wrong, and the wrongness was *plausible*: box A's
+`[0.820, 0.110, 0.090]` read `[0.893, 0.451, 0.408]`, box B's
+`[0.100, 0.740, 0.160]` read `[0.466, 0.840, 0.454]` — every surface washed
+toward the fallback grey, which reads as "the attribution is partly missing"
+rather than as an operator bug.
+
+Solving it componentwise settles what was emitted: `fallback·(1−albedo) +
+valid·albedo`, i.e. **`mix(a, t, b)` — the method's two arguments consumed in the
+wrong roles**, with the ALBEDO as the interpolant and `valid` as the far
+endpoint. It reproduces to three decimals on both boxes. `select` is used
+instead, and `valid` is exactly 0 or 1 here so there was never anything to
+interpolate.
+
+**WHAT FOUND IT WAS THE INSTRUMENT, NOT THE READING** — §12.17.4's rule, and it
+took one run instead of a session. Three things can be wrong here and they are
+indistinguishable from a shaded ray: the CPU palette, the upload into `bits`, and
+the lookup. The gate now separates all three permanently (a CPU-side palette
+readback plus per-ray `stamp` / `slot` / palette `base` / pre-mix albedo debug
+lanes), and the answer came back unambiguous: stamp 1 and 2, slots 0 and 1, base
+637500 and 637508 *exactly* as predicted, pre-mix albedo *exactly* A's and B's —
+so everything except the blend was already right.
+
+One footnote worth keeping, because it briefly looked like a second bug: the raw
+palette word read back as **1062333312 against an expected 1062333317**. That is
+the diagnostic lane itself — a u32 above 2^24 rounds on its way into an f32, so a
+bit pattern cannot be carried in a float channel. The lane is fine for "is the
+address right"; it is not fine for equality.
+
+#### 12.29.8 THE FACE RETRY, AND WHY THE PASSTHROUGH IS NOT ONE LINE
+
+`createSrcSceneTrace` hands over `voxel` rather than letting a consumer re-derive
+it, because `position` is lifted and floors to the SHELL cell. That fixes the
+lift, not the face: `voxelAtHit` is `floor(q0 + dq·t)`, and a hit landing exactly
+ON a cell face floors either side of it.
+
+The marcher's own record index would settle it, and the parallel session offered
+the passthrough. **It is not a one-line change:** `traceHybridPlane`'s inner
+`sharedFn` returns a `vec4` with all four components spoken for (hit, t, oct.x,
+oct.y), so surfacing the record is a return-type change to the most-measured code
+in the module. Declined, and instrumented instead — R13, rather than surgery on
+the strength of a predicted precision problem.
+
+So `surfaceAt` asks at `voxel` first and, when that has no stamp, once more a
+quarter voxel along −n (R2, the same fraction of the medium the trace's own
+self-bias uses), which is inside the surface cell whichever side the floor fell.
+
+**Measured: 0 retries in 2048 real hits.** The hazard did not occur in this
+scene at all. Which makes the retry an untested branch reporting a healthy zero —
+the vacuous-arm shape — so the gate checks that it EXECUTES: an unstamped
+empty-space query has no stamp, and **16 of 64 of them cross a cell boundary
+(25.0%, which is the geometry for a point dropped anywhere inside a cell** — a
+real hit lies ON a face, so its step always crosses).
+
+#### 12.29.9 R5: THE FLAG SHIPS, THE ZEROING DOES NOT MOVE
+
+This unit raised the `STAT_EMIT_ZEROED` problem and §12.28.6 vetoed the remedy;
+the veto is right and it simplified this side. The palette carries
+`#slotSurface`'s output VERBATIM — already zeroed for a promoted entry — so there
+is no second implementation of R5 here and no third source of truth. `emitter` is
+the NEE index, and it is a flag the consumer can assert against rather than a
+mechanism it depends on. Round-trip: **666/666 hits on the seated emitter report
+emitter 0, 0 false flags on the non-emitter, 0 emissive hits on the NEE light.**
+
+What the veto leaves is a failure mode **no GPU counter can see**, precisely
+because nothing carries emission to notice it: a surface whose material emits,
+whose published emissive is zero, and whose emitter id is −1 — light deleted from
+BOTH paths. `stats.emissiveOrphans` checks it on the CPU. The gate seats a third
+box that emits and is unclaimed (**orphans = 1**) and then claims it
+(**orphans = 0, emitters = 2**) — the control that proves the counter tracks the
+claim rather than the geometry.
+
+The ENERGY arm stays where §12.28.6 put it. A mean over a region needs the
+deposit and the gather; what this gate owns is the input to it being right.
+
+#### 12.29.10 A RECOLOUR NO LONGER RE-VOXELIZES ANYTHING
+
+The deleted grid held COLOURS per cell, so the only way to change one was to
+re-run the voxelizer that wrote it. Here the stamp is a slot id and colour lives
+in the palette, so `SlotRegistry` grew a separate `surfaceRevision`:
+`setSlotSurface` bumps only that, and `revision` — the signal `GISystem#tick`'s
+field-refresh branch triggers on — no longer moves for a colour. Nothing else was
+reading `revision` for colour (the composite that did is gone, `bvhScene.js`
+keeps its own per-mesh table, `writeSurface` runs off its own material stamp).
+
+Gated end to end: after a `setSlotSurface` that changes a colour, `revision`
+4 → 4, `geometryRevision` 1 → 1, `isDirty` false, the attribution region **0
+words changed**, and **700/700 rays read the new albedo**. So the claim is not
+"it skips work" but "the new colour reaches the GPU without any of it".
+
+#### 12.29.11 The numbers, and what is logged rather than chased
+
+Gate: 2048 rays, 2048 hits, **1366 clear-of-seam all correct, 0 unattributed**,
+682 seam rays measured and deliberately not asserted (which of two overlapping
+boxes owns a shared voxel is a choice, not a fact). 21,984 of 92,844 static
+records stamped. Fallback albedo `[0.407, 0.383, 0.350]` = the scene's own mean,
+matched to 1e-5. Empty space: 0/64 claim valid, 0/64 come back black, 0 claim an
+emitter. `smoke:gi-gpu?src=1&sky=1` unchanged at **56.32 MB**, storage 8.
+
+**Two RED gates are PRE-EXISTING, verified by running and not assumed** (§12.7.6
+discipline): `test:gi-occupancy` fails "composite clamps from a level at least as
+coarse as its cell" — it reads `volume.coarseLevel`, a property of the composite
+§12.9 deleted, i.e. §12.14.2's "an assertion written against a backend outlives
+the backend" again — and `test:gi-spawn` fails "field never quiesced after boot".
+Both fail IDENTICALLY in a clean worktree at `5cc52c8` with its own dev server.
+
+Logged, not chased (R16):
+
+1. **The mover half of the emitter id is deliberately absent** and §12.28.6 is
+   why: a mover wants no flag, because the bake already zeroed it and the
+   promotion set is the NEE set. Nothing to do unless that ruling changes.
+2. **`_occSlotNext` is monotonic and never reused**, so a long session of spawns
+   and despawns can hand out an occupancy slot past the 512-entry palette. It
+   lands as UNATTRIBUTED and counted (`stats.slotOverflow`), which is the correct
+   direction for an aliasing failure — another mesh's colour would be worse than
+   the scene mean — but the ceiling is real and it is the same slot-ID exhaustion
+   that forced a mid-game full rebuild in the gi-module session-38 work.
+3. **`enableSurfaceAttribution` is opt-in and nothing passes it yet.** The field
+   allocates zero words and emits no extra WGSL when it is off, so the old
+   backend pays nothing; wiring it is one option on `GISystem`'s
+   `createOccupancyField` call plus `srcSystem` constructing the module — the
+   parallel session's side of the seam.
+
 ---
 
 ## 13. Startup budget — GI must initialize in ≤ 1 second

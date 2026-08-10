@@ -19,3 +19,14 @@ The number of storage buffers (9) in the Compute stage exceeds the maximum per-s
 ```
 
 Treat this as a graph binding-budget regression, not as a reason to raise device limits.
+
+## Test index
+
+Not exhaustive yet — `package.json`'s `scripts` is the full list. Entries land here
+as they are added, newest first.
+
+| Script | What it gates |
+|---|---|
+| `npm run test:gi-src-surface` | SRC static surface attribution (`srcSurface.js`): a traced hit reads its own mesh's albedo, the stamp is deterministic across dispatches, the NEE emitter flag round-trips, a recolour costs no re-voxelize. Real occupancy field + real rays; race-sensitive, run 2-3×. |
+| `npm run test:gi-src-shade` | SRC hit shading (`srcShade.js`) against `srcRef.js`'s `makeHitShader`. |
+| `npm run test:gi-src-ref` | The SRC CPU mirror — no GPU, ~9s, the reference every SRC gate is diffed against. |

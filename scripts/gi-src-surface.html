@@ -1,0 +1,675 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>SRC surface-attribution gate — createSrcSurfaceAttribution</title>
+    <style>html,body{margin:0;background:#111;color:#ddd;font:13px monospace}canvas{display:none}</style>
+  </head>
+  <body>
+    <canvas id="view" width="16" height="16"></canvas>
+    <pre id="log"></pre>
+    <script type="module">
+      // ══ THE PHASE-5 ATTRIBUTION GATE ═════════════════════════════════════
+      //
+      // Its siblings synthesize everything. This one cannot: attribution is
+      // written BY THE VOXELIZER and read THROUGH THE MARCHER, so a gate with a
+      // synthetic trace would be checking a buffer against itself. So it builds
+      // a real `createOccupancyField`, voxelizes two real boxes into it, and
+      // fires real rays — still no engine, no scene, no gbuffer, which is the
+      // isolation the other src gates have.
+      //
+      // ══ THE ARMS, AND WHAT EACH ONE WOULD HAVE CAUGHT ═══════════════════
+      //
+      //   own       every ray that hits box A reads A's albedo, every ray that
+      //             hits box B reads B's. This is §12.9's CROSSED-NUMBERING arm.
+      //   crossed   the same rays with `crossNumbering: true`, which writes the
+      //             palette under the REGISTRY's index instead of the occupancy
+      //             field's. The two boxes are seated so the permutation is an
+      //             exact swap, so the failure is "every surface wears the other
+      //             one's colour" — the bug, reproduced, so the arm above is
+      //             proven able to see it. THIS ARM PASSES BY FAILING.
+      //   stable    the attribution region is BIT-IDENTICAL across four full
+      //             re-voxelizes. §12.9's DETERMINISTIC-WINNER arm — and it is
+      //             gated on the seam being non-empty, because two boxes that
+      //             share no voxel make it vacuous.
+      //   emitter   the NEE flag round-trips, and the invariant that makes the
+      //             energy arm meaningful: never emissive-zero AND emitter < 0
+      //             for a material that emits. That third state is light deleted
+      //             from BOTH paths, and no GPU counter can see it (nothing
+      //             carries emission to notice).
+      //   valid     an unattributed query returns the palette MEAN and valid 0,
+      //             not black. R1.
+      //   recolour  a colour change moves NEITHER `slots.revision` NOR the
+      //             field's `geometryRevision`, leaves the attribution region
+      //             bit-identical, and still reaches the GPU.
+      //   memory    the high-water, printed, with the Sponza-class projection.
+      //
+      // THE ENERGY ARM IS NOT HERE, ON PURPOSE. §12.26.7's R5 handoff is a mean
+      // over a REGION of a shaded field (it measured 2.60×, and a single gather
+      // point read 1.00× while the double count was happening) — that needs the
+      // deposit and the gather, so it lives in `test:gi-src-shade`. What this
+      // gate owns is the INPUT to it being right.
+      //
+      // Race-sensitive: the stamp is an atomic written by a scheduler-ordered
+      // voxelizer. Run it more than once before believing a green.
+      //
+      // Run: node scripts/run-gi-src-surface-test.mjs
+      const out = document.querySelector("#log");
+      const say = (line) => { out.textContent += line + "\n"; };
+      let failures = 0;
+      const check = (label, ok, detail = "") => {
+        say(`  ${ok ? "PASS" : "FAIL"} ${label}${detail ? ` — ${detail}` : ""}`);
+        if (!ok) failures++;
+      };
+      const fail = (error) => {
+        console.error("SRC-SURFACE FAIL", error?.stack ?? error?.message ?? String(error));
+        globalThis.__SRC_SURFACE_RESULT__ = {
+          pass: false, error: error?.message ?? String(error), text: out.textContent,
+        };
+      };
+      globalThis.addEventListener("error", (event) => fail(event.error ?? event.message));
+      globalThis.addEventListener("unhandledrejection", (event) => fail(event.reason));
+
+      try {
+        const THREE = await import("three/webgpu");
+        const TSL = await import("three/tsl");
+        const OF = await import("/src/modules/gi/occupancyField.js");
+        const SR = await import("/src/modules/gi/slotRegistry.js");
+        const SS = await import("/src/modules/gi/srcSurface.js");
+        const PACK = await import("/src/modules/gi/rayHit/RayHitPacking.js");
+
+        const { Fn, If, float, instanceIndex, instancedArray, uint, uniform, vec3 } = TSL;
+
+        const renderer = new THREE.WebGPURenderer({ canvas: document.querySelector("#view") });
+        await renderer.init();
+        const device = renderer.backend.device;
+        const validationErrors = [];
+        device.addEventListener?.("uncapturederror", (event) => {
+          validationErrors.push(event.error?.message ?? String(event.error));
+          console.error("WebGPU validation error:", validationErrors.at(-1));
+        });
+
+        // mulberry32. NEVER Math.random — a gate that cannot be replayed cannot
+        // be bisected, and this suite's convention is older than this file.
+        const rng = (() => {
+          let s = 0x2545f491 >>> 0;
+          return () => {
+            s = (s + 0x6d2b79f5) >>> 0;
+            let t = s;
+            t = Math.imul(t ^ (t >>> 15), t | 1);
+            t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+            return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+          };
+        })();
+
+        // ── the scene ───────────────────────────────────────────────────────
+        //
+        // Two adjacent boxes, OVERLAPPING by a voxel rather than merely
+        // touching: the seam has to contain level-0 voxels claimed by both
+        // meshes or the determinism arm has nothing to be non-deterministic
+        // about. `seamRecords` below asserts that it does.
+        const BOUNDS = { min: new THREE.Vector3(-4, -2, -4), max: new THREE.Vector3(4, 2, 4) };
+        const RES = { x: 128, y: 64, z: 128 };
+        const VOXEL = (BOUNDS.max.x - BOUNDS.min.x) / RES.x;   // 0.0625 m, cubic here
+        const OVERLAP = VOXEL * 1.5;
+
+        const boxGeo = (hx, hy, hz) => {
+          const positions = new Float32Array([
+            -hx, -hy, -hz, hx, -hy, -hz, hx, hy, -hz, -hx, hy, -hz,
+            -hx, -hy, hz, hx, -hy, hz, hx, hy, hz, -hx, hy, hz,
+          ]);
+          const index = new Uint32Array([
+            0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4,
+            3, 7, 6, 3, 6, 2, 0, 4, 7, 0, 7, 3, 1, 2, 6, 1, 6, 5,
+          ]);
+          return { positions, index };
+        };
+
+        const makeMesh = (name, colour, emissive, emissiveIntensity) => {
+          const material = new THREE.MeshStandardMaterial({ color: new THREE.Color(...colour) });
+          material.emissive = new THREE.Color(...emissive);
+          material.emissiveIntensity = emissiveIntensity;
+          const mesh = new THREE.Mesh(new THREE.BufferGeometry(), material);
+          mesh.name = name;
+          return mesh;
+        };
+
+        // A is red, B is green-and-emissive (it will hold the NEE seat), C is
+        // the orphan probe: it emits and nobody claims it.
+        const ALBEDO_A = [0.82, 0.11, 0.09];
+        const ALBEDO_B = [0.10, 0.74, 0.16];
+        const ALBEDO_C = [0.30, 0.30, 0.80];
+        const meshA = makeMesh("boxA", ALBEDO_A, [0, 0, 0], 1);
+        const meshB = makeMesh("boxB", ALBEDO_B, [1, 0.9, 0.7], 6);
+        const meshC = makeMesh("boxC", ALBEDO_C, [0.4, 0.4, 1.0], 3);
+
+        // OCCUPANCY slots and REGISTRY indices are deliberately a PERMUTATION of
+        // each other — B is seated in the registry first. Both numbers are
+        // small, both are valid slot ids, and under `crossNumbering` the palette
+        // writes each box's colour at the other's index exactly. If they agreed,
+        // the crossed arm would be untestable and the "own" arm would be green
+        // on a design that remaps wrongly.
+        const SLOT_A = 0, SLOT_B = 1, SLOT_C = 2;
+        const geo = boxGeo(1, 0.5, 1);
+        const geometries = [{ key: "box", positions: geo.positions, index: geo.index }];
+        const placementOf = (slot, mesh, x, z) => ({
+          slot, mesh, instanceId: null, geometryKey: "box",
+          matrix: new THREE.Matrix4().makeTranslation(x, 0, z),
+        });
+        const placements = [
+          placementOf(SLOT_A, meshA, -1, 0),
+          placementOf(SLOT_B, meshB, 1 - OVERLAP, 0),
+          placementOf(SLOT_C, meshC, 0, 2.6),
+        ];
+
+        const field = OF.createOccupancyField(BOUNDS, RES, {
+          slotCapacity: 16,
+          enableHybridBrick: true,
+          enableSurfaceRecords: true,
+          // Off: the triangle pool would be 25 MB of readback for a feature
+          // attribution does not touch (a complex cell still has a record).
+          enableComplexTriangles: false,
+          enableSurfaceAttribution: true,
+        });
+        if (!field.surfaceAttribution) throw new Error("field has no attribution region");
+        field.setGeometry(geometries, placements);
+        for (const p of placements) field.setSlotMatrix(p.slot, p.matrix);
+        // GISystem publishes this and `srcSurface` reads it for the numbering.
+        field.placements = placements;
+
+        const runField = async () => {
+          const passes = field.passes();
+          if (!passes) throw new Error("field.passes() returned null — no geometry");
+          await renderer.computeAsync(passes);
+        };
+        await runField();
+
+        // ── the registry, seated the way GISystem seats it ─────────────────
+        //
+        // Registry order is B, A, C — see the permutation note above. The
+        // surfaces are `#slotSurface`'s OUTPUT, i.e. emissive already zeroed for
+        // the promoted entry, because the user's ruling is that the CPU zeroing
+        // stays the single source of truth and `emitter` is a flag to assert
+        // against rather than a mechanism to depend on.
+        const slots = new SR.SlotRegistry(16);
+        const seat = (mesh, surface) => {
+          const i = slots.allocateSlot();
+          slots.setAnalyticSlot(i, mesh, { half: [1, 0.5, 1] }, surface, null);
+          return i;
+        };
+        const black = { r: 0, g: 0, b: 0 };
+        const IDX_B = seat(meshB, { color: { r: ALBEDO_B[0], g: ALBEDO_B[1], b: ALBEDO_B[2] }, emissive: black });
+        const IDX_A = seat(meshA, { color: { r: ALBEDO_A[0], g: ALBEDO_A[1], b: ALBEDO_A[2] }, emissive: black });
+        const IDX_C = seat(meshC, { color: { r: ALBEDO_C[0], g: ALBEDO_C[1], b: ALBEDO_C[2] }, emissive: black });
+        say(`  slots: occupancy A=${SLOT_A} B=${SLOT_B} C=${SLOT_C} · registry A=${IDX_A} B=${IDX_B} C=${IDX_C}`);
+
+        const world = { minCell: uniform(VOXEL) };
+        let emitterList = [meshB];
+        const counters = { retried: 0, missed: 0 };
+        const countBuf = instancedArray(new Uint32Array(4), "uint").toAtomic();
+        const count = {
+          retried: (n) => { TSL.atomicAdd(countBuf.element(uint(0)), uint(n)); },
+          missed: (n) => { TSL.atomicAdd(countBuf.element(uint(1)), uint(n)); },
+        };
+
+        const makeAttr = (opts = {}) => SS.createSrcSurfaceAttribution(field, world, slots, {
+          emitterMeshes: () => emitterList,
+          count,
+          ...opts,
+        });
+        const surf = makeAttr();
+        await renderer.computeAsync(surf.passes);
+
+        // ── the probe kernel ────────────────────────────────────────────────
+        //
+        // Real rays through the real marcher, straight down onto the two top
+        // faces. Ground truth is analytic (the boxes are axis-aligned), so the
+        // arm compares against geometry rather than against another buffer.
+        const RAYS = 2048;
+        const SEAM_HALF = VOXEL * 3;
+        const origins = new Float32Array(RAYS * 4);
+        const truth = new Int8Array(RAYS);       // 0 = A, 1 = B, -1 = seam (not asserted)
+        for (let i = 0; i < RAYS; i++) {
+          // Two thirds land clear of the seam, one third straddles it — the
+          // seam rays are MEASURED, not asserted, because which of two
+          // overlapping boxes owns a shared voxel is a choice and not a fact.
+          const seam = i % 3 === 2;
+          const x = seam
+            ? (rng() * 2 - 1) * SEAM_HALF
+            : (rng() < 0.5 ? -1.85 + rng() * 1.6 : 0.25 + rng() * 1.6);
+          const z = (rng() * 2 - 1) * 0.85;
+          origins[i * 4] = x;
+          origins[i * 4 + 1] = 1.7;
+          origins[i * 4 + 2] = z;
+          origins[i * 4 + 3] = 1;
+          truth[i] = seam ? -1 : (x < 0 ? 0 : 1);
+        }
+        const originBuf = instancedArray(origins, "vec4");
+        const OUT_WORDS = 16;  // albedo3, emissive3, emitter, valid, stamp, slot, rawWord0, base, paletteAlbedo3
+        const results = instancedArray(new Float32Array(RAYS * OUT_WORDS), "float");
+        const probePass = Fn(() => {
+          const i = instanceIndex.toVar();
+          const o = originBuf.element(i).xyz.toVar();
+          const d = vec3(0, -1, 0).toVar();
+          const r = field.traceHybridPlane(o, d, float(VOXEL * 0.25), float(6), {
+            steps: 128, macroSteps: PACK.MAX_MACRO_STEPS, coverage: false, exact: false,
+          });
+          const base = i.mul(uint(OUT_WORDS)).toVar();
+          // A miss writes emitter = -9, which no attributed surface can produce,
+          // so "the ray never hit anything" and "the hit was unattributed" are
+          // different readings. A gate that conflates them reports a broken
+          // palette when the scene simply moved.
+          results.element(base.add(uint(6))).assign(float(-9));
+          If(r.hit.greaterThan(0.5), () => {
+            const p = o.add(d.mul(r.t)).toVar();
+            const s = surf.surfaceAt(r.voxel, p, r.normal);
+            results.element(base).assign(s.albedo.x);
+            results.element(base.add(uint(1))).assign(s.albedo.y);
+            results.element(base.add(uint(2))).assign(s.albedo.z);
+            results.element(base.add(uint(3))).assign(s.emissive.x);
+            results.element(base.add(uint(4))).assign(s.emissive.y);
+            results.element(base.add(uint(5))).assign(s.emissive.z);
+            results.element(base.add(uint(6))).assign(s.emitter);
+            results.element(base.add(uint(7))).assign(s.valid);
+            results.element(base.add(uint(8))).assign(s.debug.stamp);
+            results.element(base.add(uint(9))).assign(s.debug.slot);
+            results.element(base.add(uint(10))).assign(s.debug.rawWord0);
+            results.element(base.add(uint(11))).assign(s.debug.base);
+            results.element(base.add(uint(12))).assign(s.debug.paletteAlbedo.x);
+            results.element(base.add(uint(13))).assign(s.debug.paletteAlbedo.y);
+            results.element(base.add(uint(14))).assign(s.debug.paletteAlbedo.z);
+          });
+        })().compute(RAYS);
+
+        const readProbe = async () => {
+          await renderer.computeAsync([probePass]);
+          const v = new Float32Array(await renderer.getArrayBufferAsync(results.value));
+          return v;
+        };
+        const readCounts = async () => {
+          const v = new Uint32Array(await renderer.getArrayBufferAsync(countBuf.value));
+          return { retried: v[0] >>> 0, missed: v[1] >>> 0 };
+        };
+        const near = (a, b, tol = 2e-3) => Math.abs(a - b) <= tol;
+
+        // ══ ARM: palette ═══════════════════════════════════════════════════
+        //
+        // THREE THINGS CAN BE WRONG AND THEY LOOK IDENTICAL FROM A RAY: the CPU
+        // palette, the upload pass that lands it in `bits`, and the lookup that
+        // reads it back. §12.17.4's lesson is to add the instrument that
+        // SEPARATES them rather than testing them in order, and this one is
+        // three lines of readback.
+        say("\nARM palette — the CPU palette, the upload, and the lookup, separated");
+        const readPalette = async () => {
+          const all = new Uint32Array(await renderer.getArrayBufferAsync(field.bits.value));
+          const info = field.surfaceAttribution;
+          const view = new DataView(new ArrayBuffer(4));
+          const asFloat = (w) => { view.setUint32(0, w, true); return view.getFloat32(0, true); };
+          const entries = [];
+          for (let s = 0; s < info.paletteSlots; s++) {
+            const b = info.paletteWordOffset + s * info.paletteWords;
+            entries.push({
+              albedo: [asFloat(all[b]), asFloat(all[b + 1]), asFloat(all[b + 2])],
+              emitter: all[b + 3] - 1,
+              emissive: [asFloat(all[b + 4]), asFloat(all[b + 5]), asFloat(all[b + 6])],
+              live: all[b + 7],
+            });
+          }
+          return entries;
+        };
+        const uploaded = await readPalette();
+        const cpuA = surf.debug.paletteEntry(SLOT_A);
+        const cpuB = surf.debug.paletteEntry(SLOT_B);
+        check("the CPU palette holds A's albedo at A's OCCUPANCY slot",
+          near(cpuA.albedo[0], ALBEDO_A[0], 1e-6) && near(cpuA.albedo[1], ALBEDO_A[1], 1e-6),
+          `slot ${SLOT_A} = [${cpuA.albedo.map((v) => v.toFixed(3)).join(",")}]`);
+        check("the CPU palette holds B's at B's",
+          near(cpuB.albedo[0], ALBEDO_B[0], 1e-6) && near(cpuB.albedo[1], ALBEDO_B[1], 1e-6),
+          `slot ${SLOT_B} = [${cpuB.albedo.map((v) => v.toFixed(3)).join(",")}]`);
+        check("the upload landed it in `bits` unchanged",
+          near(uploaded[SLOT_A].albedo[0], ALBEDO_A[0], 1e-6) &&
+          near(uploaded[SLOT_B].albedo[1], ALBEDO_B[1], 1e-6),
+          `A [${uploaded[SLOT_A].albedo.map((v) => v.toFixed(3)).join(",")}] ` +
+          `B [${uploaded[SLOT_B].albedo.map((v) => v.toFixed(3)).join(",")}] ` +
+          `live ${uploaded[SLOT_A].live}/${uploaded[SLOT_B].live} ` +
+          `emitter ${uploaded[SLOT_A].emitter}/${uploaded[SLOT_B].emitter}`);
+
+        // ══ ARM: own ═══════════════════════════════════════════════════════
+        say("\nARM own — a traced hit reads its OWN mesh's albedo");
+        let probe = await readProbe();
+        counters.retried = (await readCounts()).retried;
+        let hits = 0, seamHits = 0, wrong = 0, unattributed = 0;
+        const wrongExamples = [];
+        for (let i = 0; i < RAYS; i++) {
+          const b = i * OUT_WORDS;
+          if (probe[b + 6] === -9) continue;
+          hits++;
+          if (truth[i] < 0) { seamHits++; continue; }
+          const want = truth[i] === 0 ? ALBEDO_A : ALBEDO_B;
+          if (probe[b + 7] < 0.5) { unattributed++; continue; }
+          if (!near(probe[b], want[0]) || !near(probe[b + 1], want[1]) || !near(probe[b + 2], want[2])) {
+            wrong++;
+            if (wrongExamples.length < 3) {
+              wrongExamples.push(`${truth[i] === 0 ? "A" : "B"}@${origins[i * 4].toFixed(2)} read ` +
+                `[${probe[b].toFixed(2)},${probe[b + 1].toFixed(2)},${probe[b + 2].toFixed(2)}]`);
+            }
+          }
+        }
+        const clearHits = hits - seamHits;
+        check("every ray hit something", hits > RAYS * 0.9, `${hits}/${RAYS} hits`);
+        check("clear-of-seam rays are attributed", unattributed === 0,
+          `${unattributed} unattributed of ${clearHits}`);
+        check("every clear ray reads its own mesh's albedo", wrong === 0,
+          wrong === 0 ? `${clearHits} rays, 0 wrong` : `${wrong} wrong — ${wrongExamples.join("; ")}`);
+        say(`       face retries ${counters.retried} (${(100 * counters.retried / Math.max(1, hits)).toFixed(2)}% of hits)` +
+          ` · seam rays ${seamHits} (measured, not asserted)`);
+        {
+          // The separation, printed whether or not the arm passed: which stamp,
+          // which palette address, and what the raw word was NUMERICALLY. A
+          // rawWord0 that matches the CPU's float bit pattern means the address
+          // is right and the DECODE is wrong; anything else means the address.
+          const view = new DataView(new ArrayBuffer(4));
+          const bitsOf = (f) => { view.setFloat32(0, f, true); return view.getUint32(0, true); };
+          const info = field.surfaceAttribution;
+          const sample = (want) => {
+            for (let i = 0; i < RAYS; i++) {
+              if (truth[i] === want && probe[i * OUT_WORDS + 6] !== -9) return i * OUT_WORDS;
+            }
+            return -1;
+          };
+          for (const [name, want, albedo] of [["A", 0, ALBEDO_A], ["B", 1, ALBEDO_B]]) {
+            const b = sample(want);
+            if (b < 0) continue;
+            const expectBase = info.paletteWordOffset + (want === 0 ? SLOT_A : SLOT_B) * info.paletteWords;
+            say(`       ${name}: stamp ${probe[b + 8]} slot ${probe[b + 9]} base ${probe[b + 11]} ` +
+              `(expect ${expectBase}) rawWord0 ${probe[b + 10]} (expect ${bitsOf(albedo[0])})`);
+            say(`          paletteAlbedo [${probe[b+12].toFixed(3)},${probe[b+13].toFixed(3)},${probe[b+14].toFixed(3)}] ` +
+              `valid ${probe[b+7]} mixed [${probe[b].toFixed(3)},${probe[b+1].toFixed(3)},${probe[b+2].toFixed(3)}]`);
+          }
+        }
+
+        // ══ ARM: crossed — PASSES BY FAILING ═══════════════════════════════
+        say("\nARM crossed — the deliberate re-introduction of §12.9's crossed numbering");
+        const crossed = makeAttr({ crossNumbering: true });
+        await renderer.computeAsync(crossed.passes);
+        const crossedProbe = await readProbe();
+        let swapped = 0, crossedWrong = 0;
+        for (let i = 0; i < RAYS; i++) {
+          const b = i * OUT_WORDS;
+          if (crossedProbe[b + 6] === -9 || truth[i] < 0) continue;
+          const own = truth[i] === 0 ? ALBEDO_A : ALBEDO_B;
+          const other = truth[i] === 0 ? ALBEDO_B : ALBEDO_A;
+          if (!near(crossedProbe[b], own[0]) || !near(crossedProbe[b + 1], own[1])) crossedWrong++;
+          if (near(crossedProbe[b], other[0]) && near(crossedProbe[b + 1], other[1])) swapped++;
+        }
+        check("crossing the numbering DOES break the arm above", crossedWrong > clearHits * 0.9,
+          `${crossedWrong}/${clearHits} now wrong`);
+        check("and it breaks it the documented way (each box wears the other's colour)",
+          swapped > clearHits * 0.9, `${swapped}/${clearHits} read the other mesh's albedo`);
+        crossed.dispose();
+        // Restore the correct palette before anything else reads it. FORCED:
+        // `surf`'s revisions never moved, so its own early-out would leave the
+        // crossed palette in place and every arm below would silently be
+        // testing the corruption.
+        surf.sync(true);
+        await renderer.computeAsync(surf.passes);
+
+        // ══ ARM: stable ════════════════════════════════════════════════════
+        //
+        // ⚠ THE FIRST VERSION OF THIS ARM COMPARED THE ATTRIBUTION BUFFER
+        // WORD-FOR-WORD ACROSS RE-VOXELIZES, AND IT FAILED FOR THE HARNESS'S
+        // REASON. `surfAllocCompute` claims each brick's record offset with a
+        // racing `atomicAdd`, so RECORD INDICES PERMUTE every dispatch — 44,106
+        // of 262,146 words differed on a stamp that was in fact perfectly
+        // deterministic. A buffer whose addressing is order-dependent cannot be
+        // diffed by address; what has to be stable is the attribution AT A
+        // VOXEL, which is also the only thing a consumer can observe.
+        //
+        // So the arm re-probes instead. Same rays, four dispatches, compare the
+        // SLOT each ray reports.
+        say("\nARM stable — the same ray reports the same slot across re-voxelizes");
+        const attrInfo = field.surfaceAttribution;
+        const readAttr = async () => {
+          const all = new Uint32Array(await renderer.getArrayBufferAsync(field.bits.value));
+          return all.slice(attrInfo.attrWordOffset, attrInfo.attrWordOffset + attrInfo.staticRecordCapacity);
+        };
+        const slotsOf = (v) => {
+          const arr = new Int32Array(RAYS).fill(-1);
+          for (let i = 0; i < RAYS; i++) {
+            const b = i * OUT_WORDS;
+            if (v[b + 6] !== -9 && v[b + 7] >= 0.5) arr[i] = Math.round(v[b + 9]);
+          }
+          return arr;
+        };
+        probe = await readProbe();
+        const slots0 = slotsOf(probe);
+        const attr0 = await readAttr();
+        let stamped = 0;
+        const stampCounts = new Map();
+        for (const s of attr0) {
+          if (s === 0) continue;
+          stamped++;
+          stampCounts.set(s - 1, (stampCounts.get(s - 1) ?? 0) + 1);
+        }
+        let drift = 0;
+        for (let run = 0; run < 3; run++) {
+          field.invalidate();
+          await runField();
+          const again = slotsOf(await readProbe());
+          for (let i = 0; i < RAYS; i++) if (again[i] !== slots0[i]) drift++;
+        }
+        check("both meshes own records (the arm is not vacuous)",
+          (stampCounts.get(SLOT_A) ?? 0) > 0 && (stampCounts.get(SLOT_B) ?? 0) > 0,
+          `A ${stampCounts.get(SLOT_A) ?? 0}, B ${stampCounts.get(SLOT_B) ?? 0}, C ${stampCounts.get(SLOT_C) ?? 0} records`);
+        check("every ray reports the same slot across 4 dispatches", drift === 0,
+          `${drift} of ${RAYS * 3} ray comparisons differ`);
+
+        // THE VACUITY GUARD, AND IT IS THE HARD PART. Determinism only means
+        // anything where two meshes actually contest a level-0 voxel; with no
+        // shared voxel the stamp is a constant and four identical readbacks
+        // prove nothing. Assuming the overlap produces one is not enough — the
+        // conservative SAT decides that, not the arithmetic above.
+        //
+        // So MEASURE it: swap the two occupancy slot NUMBERS and re-probe. A
+        // ray on uncontested geometry follows its mesh, so its reported slot
+        // flips. A ray on a CONTESTED voxel reports the same number both times,
+        // because `atomicMax` picks the higher slot id and that id now belongs
+        // to the other box. Rays whose slot does not move are exactly the
+        // contested set — and that is a sharper determinism check too, since a
+        // non-atomic winner would put uncontested rays in the count as well.
+        const swapPlacements = [
+          placementOf(SLOT_B, meshA, -1, 0),
+          placementOf(SLOT_A, meshB, 1 - OVERLAP, 0),
+          placementOf(SLOT_C, meshC, 0, 2.6),
+        ];
+        field.setGeometry(geometries, swapPlacements);
+        for (const p of swapPlacements) field.setSlotMatrix(p.slot, p.matrix);
+        field.invalidate();
+        await runField();
+        const slotsSwapped = slotsOf(await readProbe());
+        let contested = 0, followed = 0, lost = 0;
+        for (let i = 0; i < RAYS; i++) {
+          if (slots0[i] < 0 || slotsSwapped[i] < 0) { lost++; continue; }
+          if (slots0[i] === slotsSwapped[i]) contested++;
+          else followed++;
+        }
+        field.setGeometry(geometries, placements);
+        for (const p of placements) field.setSlotMatrix(p.slot, p.matrix);
+        field.invalidate();
+        await runField();
+        check("the overlap column is contested (the arm has a race to lose)",
+          contested > 0, `${contested} rays keep their slot under a swap, ${followed} follow their mesh`);
+        check("no ray lost its attribution across the swap", lost === 0, `${lost} rays`);
+        say(`       ${stamped} of ${attrInfo.staticRecordCapacity} static records stamped`);
+        say("       (record INDICES permute every dispatch — the record allocator races by design;");
+        say("        this arm compares what a ray SEES, not where the stamp lives)");
+
+        // ══ ARM: emitter ═══════════════════════════════════════════════════
+        say("\nARM emitter — the NEE flag round-trips, and light is never deleted from both paths");
+        surf.sync();
+        await renderer.computeAsync(surf.passes);
+        probe = await readProbe();
+        let flaggedB = 0, flaggedA = 0, emissiveOnB = 0;
+        for (let i = 0; i < RAYS; i++) {
+          const b = i * OUT_WORDS;
+          if (probe[b + 6] === -9 || truth[i] < 0 || probe[b + 7] < 0.5) continue;
+          if (truth[i] === 1) {
+            if (Math.round(probe[b + 6]) === 0) flaggedB++;
+            if (probe[b + 3] + probe[b + 4] + probe[b + 5] > 1e-4) emissiveOnB++;
+          } else if (Math.round(probe[b + 6]) >= 0) flaggedA++;
+        }
+        const bHits = [...Array(RAYS).keys()].filter(
+          (i) => truth[i] === 1 && probe[i * OUT_WORDS + 6] !== -9 && probe[i * OUT_WORDS + 7] >= 0.5,
+        ).length;
+        check("every hit on the seated emitter reports its NEE index", flaggedB === bHits && bHits > 0,
+          `${flaggedB}/${bHits} report emitter 0`);
+        check("no hit on a non-emitter reports one", flaggedA === 0, `${flaggedA} false flags`);
+        check("the bake already zeroed the emitter's contact emission (R5, CPU-side)",
+          emissiveOnB === 0, `${emissiveOnB} emissive hits on the NEE light`);
+        check("box C is the orphan: emits, published dark, unclaimed", surf.stats.emissiveOrphans === 1,
+          `emissiveOrphans = ${surf.stats.emissiveOrphans}`);
+        // The healthy control. Seating C makes the orphan disappear, which is
+        // what proves the counter is measuring the claim and not the geometry.
+        emitterList = [meshB, meshC];
+        surf.sync();
+        check("and seating it clears the orphan (the counter tracks the claim)",
+          surf.stats.emissiveOrphans === 0 && surf.stats.emitters === 2,
+          `orphans ${surf.stats.emissiveOrphans}, emitters ${surf.stats.emitters}`);
+        emitterList = [meshB];
+        surf.sync();
+
+        // ══ ARM: valid ═════════════════════════════════════════════════════
+        say("\nARM valid — an unattributed hit is the palette MEAN and says so");
+        const meanExpect = [
+          (ALBEDO_A[0] + ALBEDO_B[0] + ALBEDO_C[0]) / 3,
+          (ALBEDO_A[1] + ALBEDO_B[1] + ALBEDO_C[1]) / 3,
+          (ALBEDO_A[2] + ALBEDO_B[2] + ALBEDO_C[2]) / 3,
+        ];
+        const meanGot = surf.debug.fallbackAlbedo;
+        check("the fallback is the scene's own mean albedo, not a constant grey",
+          near(meanGot[0], meanExpect[0], 1e-5) && near(meanGot[1], meanExpect[1], 1e-5),
+          `[${meanGot.map((v) => v.toFixed(3)).join(",")}] vs [${meanExpect.map((v) => v.toFixed(3)).join(",")}]`);
+        // An empty-space query: valid 0, mean albedo, emitter -1. Not black.
+        const EMPTY = 64;
+        const emptyOrigins = new Float32Array(EMPTY * 4);
+        for (let i = 0; i < EMPTY; i++) {
+          emptyOrigins[i * 4] = -3.4 + rng() * 0.6;
+          emptyOrigins[i * 4 + 1] = 1.2 + rng() * 0.4;
+          emptyOrigins[i * 4 + 2] = -3.4 + rng() * 0.6;
+        }
+        const emptyBuf = instancedArray(emptyOrigins, "vec4");
+        const emptyOut = instancedArray(new Float32Array(EMPTY * OUT_WORDS), "float");
+        const emptyPass = Fn(() => {
+          const i = instanceIndex.toVar();
+          const p = emptyBuf.element(i).xyz.toVar();
+          const v = p.sub(vec3(attrInfo.gridOrigin)).mul(vec3(attrInfo.voxelInv)).floor().toVar();
+          const s = surf.surfaceAt(v, p, vec3(0, 1, 0));
+          const base = i.mul(uint(OUT_WORDS)).toVar();
+          emptyOut.element(base).assign(s.albedo.x);
+          emptyOut.element(base.add(uint(1))).assign(s.albedo.y);
+          emptyOut.element(base.add(uint(2))).assign(s.albedo.z);
+          emptyOut.element(base.add(uint(6))).assign(s.emitter);
+          emptyOut.element(base.add(uint(7))).assign(s.valid);
+        })().compute(EMPTY);
+        await renderer.computeAsync([emptyPass]);
+        const ev = new Float32Array(await renderer.getArrayBufferAsync(emptyOut.value));
+        let emptyValid = 0, emptyBlack = 0, emptyFlagged = 0;
+        for (let i = 0; i < EMPTY; i++) {
+          const b = i * OUT_WORDS;
+          if (ev[b + 7] > 0.5) emptyValid++;
+          if (ev[b] + ev[b + 1] + ev[b + 2] < 1e-5) emptyBlack++;
+          if (ev[b + 6] >= 0) emptyFlagged++;
+        }
+        check("empty space reports valid = 0", emptyValid === 0, `${emptyValid}/${EMPTY} claimed valid`);
+        check("and shades at the mean rather than at BLACK", emptyBlack === 0,
+          `${emptyBlack}/${EMPTY} came back black`);
+        check("and claims no emitter", emptyFlagged === 0, `${emptyFlagged} flagged`);
+        // THE FACE-RETRY PATH IS OTHERWISE UNEXERCISED. It measured ZERO on
+        // real hits above — `voxelAtHit` landed on a stamped record every
+        // single time, so the boundary hazard the retry exists for did not
+        // occur in this scene. A branch that never runs and reports 0 is the
+        // vacuous-arm shape, so this checks that it runs AT ALL: an empty-space
+        // query has no stamp, so every one of them takes the retry.
+        // Not `>= EMPTY`: the retry only fires when the quarter-voxel step
+        // actually CROSSES a cell boundary, which for a point dropped anywhere
+        // inside a cell is a quarter of the time — measured at 16/64, which is
+        // 25.0% and is the geometry rather than a bug. A real hit lies ON a
+        // face, so its step always crosses; an interior point mostly does not.
+        const afterEmpty = await readCounts();
+        check("the face-retry branch actually executes", afterEmpty.retried > 0,
+          `${afterEmpty.retried} of ${EMPTY} unstamped queries crossed a cell boundary ` +
+          `(${(100 * afterEmpty.retried / EMPTY).toFixed(0)}%, expected ~25% for interior points)`);
+
+        // ══ ARM: recolour ══════════════════════════════════════════════════
+        say("\nARM recolour — a material edit costs no re-voxelize");
+        const revBefore = slots.revision;
+        const geoRevBefore = field.geometryRevision;
+        const surfRevBefore = slots.surfaceRevision;
+        const attrBefore = await readAttr();
+        const NEW_A = [0.05, 0.22, 0.91];
+        slots.setSlotSurface(IDX_A, { color: { r: NEW_A[0], g: NEW_A[1], b: NEW_A[2] }, emissive: black });
+        check("`revision` (the re-voxelize signal) did not move", slots.revision === revBefore,
+          `${revBefore} → ${slots.revision}`);
+        check("`surfaceRevision` did", slots.surfaceRevision === surfRevBefore + 1,
+          `${surfRevBefore} → ${slots.surfaceRevision}`);
+        check("the field is not dirty", field.isDirty === false, `isDirty ${field.isDirty}`);
+        surf.sync();
+        await renderer.computeAsync(surf.passes);
+        probe = await readProbe();
+        let recoloured = 0, aHits = 0;
+        for (let i = 0; i < RAYS; i++) {
+          const b = i * OUT_WORDS;
+          if (probe[b + 6] === -9 || truth[i] !== 0 || probe[b + 7] < 0.5) continue;
+          aHits++;
+          if (near(probe[b], NEW_A[0]) && near(probe[b + 1], NEW_A[1])) recoloured++;
+        }
+        check("the new colour reached the GPU", recoloured === aHits && aHits > 0,
+          `${recoloured}/${aHits} rays read the new albedo`);
+        check("`geometryRevision` did not move", field.geometryRevision === geoRevBefore,
+          `${geoRevBefore} → ${field.geometryRevision}`);
+        const attrAfter = await readAttr();
+        let attrDrift = 0;
+        for (let i = 0; i < attrBefore.length; i++) if (attrBefore[i] !== attrAfter[i]) attrDrift++;
+        check("and the attribution region is untouched", attrDrift === 0, `${attrDrift} words changed`);
+
+        // ══ ARM: memory ════════════════════════════════════════════════════
+        say("\nARM memory — the high-water, for §9's budget line");
+        const attrMB = field.stats.attributionBytes / 1048576;
+        const fieldMB = field.stats.bytes / 1048576;
+        // The projection is arithmetic on the same formula, labelled as such —
+        // it is NOT a measurement of Sponza, it is what this design costs there.
+        const sponzaVoxels = 432 * 192 * 272;
+        const sponzaRecords = Math.min(1 << 21, Math.max(1 << 14, Math.ceil(sponzaVoxels / 12)))
+          + Math.min(1 << 16, Math.max(1 << 12, Math.ceil(Math.min(1 << 21, Math.ceil(sponzaVoxels / 12)) / 16)));
+        const sponzaMB = (sponzaRecords * 2 + 16 * 8) * 4 / 1048576;
+        say(`       gate field: ${attrInfo.recordCapacity} records → attribution ${attrMB.toFixed(2)}MB ` +
+          `of ${fieldMB.toFixed(2)}MB total (${(100 * attrMB / fieldMB).toFixed(1)}%)`);
+        say(`       Sponza-ultra projection (432x192x272): ${sponzaRecords} records → ` +
+          `${sponzaMB.toFixed(2)}MB — stamp + build scratch + a 512-entry palette`);
+        check("attribution stays a minority of the field it rides in", attrMB < fieldMB * 0.35,
+          `${(100 * attrMB / fieldMB).toFixed(1)}% of the occupancy allocation`);
+
+        check("no WebGPU validation errors", validationErrors.length === 0,
+          validationErrors.slice(0, 2).join(" | "));
+
+        say(`\n${failures === 0 ? "PASS" : "FAIL"} — ${failures} failed checks`);
+        globalThis.__SRC_SURFACE_RESULT__ = {
+          pass: failures === 0,
+          failures,
+          text: out.textContent,
+          hits, clearHits, seamHits,
+          retries: counters.retried,
+          stamped,
+          records: attrInfo.recordCapacity,
+          attrMB: attrMB.toFixed(2),
+          fieldMB: fieldMB.toFixed(2),
+          sponzaMB: sponzaMB.toFixed(2),
+          crossedWrong,
+          swapped,
+        };
+      } catch (error) {
+        fail(error);
+      }
+    </script>
+  </body>
+</html>

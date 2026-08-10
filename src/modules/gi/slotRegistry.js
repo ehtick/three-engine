@@ -83,10 +83,25 @@ export class SlotRegistry {
   /** @param {number} [capacity] world placements this registry can seat. */
   constructor(capacity = SLOT_BLOCK) {
     this.capacity = Math.min(MAX_INSTANCE_SLOTS, Math.max(SLOT_BLOCK, capacity));
-    // Bumped whenever any placement is seated, cleared, moved or recoloured.
-    // GISystem#tick's field-refresh branch triggers on a change here, so this
-    // counter is the ONLY thing that turns a mesh drag into a re-voxelize.
+    // Bumped whenever any placement is seated, cleared or moved — NOT when one
+    // is merely recoloured. GISystem#tick's field-refresh branch triggers on a
+    // change here, so this counter is the ONLY thing that turns a mesh drag
+    // into a re-voxelize.
     this.revision = 1;
+    // ── AND A RECOLOUR IS NOT A RE-VOXELIZE (SRC Phase 5) ──────────────────
+    //
+    // Colour used to bump `revision` too, which woke the pyramid: the deleted
+    // coarse attribution grid held COLOURS per cell, so the only way to change
+    // one was to re-run the voxelizer that wrote it. Its successor
+    // (`srcSurface.js`) stamps a SLOT ID per surface record and keeps colour in
+    // a 512-entry palette, so a material edit is a uniform write and a
+    // 512-thread dispatch — nothing re-rasterizes, nothing re-fits, no bricks
+    // move. Splitting the counter is what lets a consumer say that.
+    //
+    // Nothing else was reading `revision` for colour: the composite that used
+    // to is gone (§12.9), `bvhScene.js` keeps its own per-mesh table, and
+    // `dynamicObjects.writeSurface` is driven by its own material stamp.
+    this.surfaceRevision = 1;
     // { mesh, instanceId, key, analytic, analyticHalf, matrixCache, surface }
     this.assignments = new Array(this.capacity).fill(null);
     this._freeSlots = [];
@@ -132,9 +147,10 @@ export class SlotRegistry {
   }
 
   /**
-   * Live surface update (material edits). Bumps the revision only on a real
-   * change: the editor re-publishes surfaces every sync, and an unconditional
-   * bump would wake the pyramid every frame.
+   * Live surface update (material edits). Bumps `surfaceRevision` — and ONLY
+   * that — on a real change: the editor re-publishes surfaces every sync, so an
+   * unconditional bump would re-upload the palette every frame, and a bump of
+   * `revision` would re-voxelize the scene for a colour change.
    */
   setSlotSurface(i, surface) {
     const assignment = this.assignments[i];
@@ -152,7 +168,7 @@ export class SlotRegistry {
       color: { r: surface.color.r, g: surface.color.g, b: surface.color.b },
       emissive: { r: surface.emissive.r, g: surface.emissive.g, b: surface.emissive.b },
     };
-    if (changed) this.revision++;
+    if (changed) this.surfaceRevision++;
   }
 
   clearSlot(i) {
@@ -160,6 +176,10 @@ export class SlotRegistry {
     this.assignments[i] = null;
     this._freeSlots.push(i);
     this.revision++;
+    // A cleared slot changes what the palette holds as well as what the pyramid
+    // holds: its entry has to go back to "unattributed" or the next mesh to
+    // take the slot inherits the old one's colour for a frame.
+    this.surfaceRevision++;
   }
 
   /**

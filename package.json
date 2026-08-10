@@ -129,6 +129,7 @@
     "test:gi-src-tiles": "node scripts/run-gi-src-tiles-test.mjs",
     "test:gi-src-gather": "node scripts/run-gi-src-gather-test.mjs",
     "test:gi-src-temporal": "node scripts/run-gi-src-temporal-test.mjs",
+    "test:gi-src-surface": "node scripts/run-gi-src-surface-test.mjs",
     "probe:gi-src-worldscale": "node scripts/run-gi-src-worldscale-test.mjs",
     "probe:gi-src-lattice": "node scripts/run-gi-src-lattice-test.mjs",
     "probe:gi-src-visual": "node scripts/run-gi-src-visual.mjs",

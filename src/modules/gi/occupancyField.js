@@ -66,7 +66,7 @@
 // else reads. 1.6 MB for zero risk.
 import * as THREE from "three/webgpu";
 import {
-  Break, Fn, If, Loop, Return, atomicAdd, atomicLoad, atomicOr, atomicStore, bitAnd, bitOr,
+  Break, Fn, If, Loop, Return, atomicAdd, atomicLoad, atomicMax, atomicOr, atomicStore, bitAnd, bitOr,
   countOneBits, exp2, float, floatBitsToUint, floor, instanceIndex, instancedArray, int, log2, mix, mod,
   packSnorm2x16, select, shiftLeft, shiftRight, smoothstep, uint, uintBitsToFloat, uniform, uniformArray,
   unpackSnorm2x16, vec2, vec3, vec4,
@@ -121,6 +121,19 @@ import {
 
 /** Pyramid depth. Level L voxels are 2^L × the level-0 voxel. */
 export const OCC_LEVELS = 5;
+/**
+ * Words per palette entry in the surface-attribution palette (see
+ * `enableSurfaceAttribution`). Eight, and only six carry data: a palette entry
+ * is read once per shaded hit and the two spares keep the stride a power of two
+ * so the index is a shift rather than a multiply.
+ *
+ *   +0..2  albedo rgb, f32 bits          +4..6  emissive rgb, f32 bits
+ *   +3     emitter id + 1 (0 = not a NEE light)
+ *   +7     spare
+ */
+export const SURFACE_PALETTE_WORDS = 8;
+/** Palette word 3's "this slot is not one of the NEE lights" value. */
+export const SURFACE_PALETTE_NO_EMITTER = 0;
 /** Level-0 resolution is rounded up to a multiple of this so every level halves exactly. */
 const RES_QUANTUM = 1 << (OCC_LEVELS - 1);
 /**
@@ -287,6 +300,23 @@ export function createOccupancyField(bounds, res0, options = {}) {
         options.dynamicComplexTriangleCapacity ?? dynamicSurfaceCapacity * 2))
     : 0;
   const totalComplexTriangleCapacity = complexTriangleCapacity + dynamicComplexTriangleCapacity;
+  // ── STATIC SURFACE ATTRIBUTION (SRC Phase 5) ──────────────────────────────
+  //
+  // Opt-in, because it is the ONLY consumer's feature: the old backend read a
+  // hit's colour out of the dense radiance field, which is gone, and SRC's hit
+  // shading has no other path from a static hit to its material (plan §12.29).
+  // Off, this allocates zero words and emits no extra WGSL.
+  //
+  // KEYED ON THE SURFACE RECORD, NOT ON A COARSE CELL — that is the whole
+  // design and it is what makes the number affordable. §12.9's epitaph (below,
+  // at the old attribution grid's declaration site) rejected per-level-0
+  // attributes at 12.6M voxels × 8 B = 100 MB and settled for a coarse grid.
+  // Records already exist per OCCUPIED level-0 voxel (`surfaceCapacity` is
+  // `level0VoxelCount / 12` — surfaces are ~2D), so one u32 per record buys
+  // level-0 precision for a few MB instead of a hundred, and buys it at exactly
+  // the resolution the intersection was computed at (R2).
+  const attributionEnabled = surfaceEnabled && options.enableSurfaceAttribution === true;
+  const paletteSlots = attributionEnabled ? slotCapacity : 0;
   // Phase 5: the conservative pyramid ride (levels 3-4) has been ALWAYS-ON
   // since Phase 1, so its cost/benefit was never isolable. This is the A/B
   // kill switch, default on: disabled the traces start at level 2 and the
@@ -347,10 +377,34 @@ export function createOccupancyField(bounds, res0, options = {}) {
   // zero-new-bindings reason.
   const staticBvhWords = Math.max(0, options.staticBvhWords | 0);
   const staticBvhWordOffset = dynamicObjectWordOffset + dynamicObjectWords;
+  // SURFACE-ATTRIBUTION region: one u32 per surface record holding
+  // `occupancySlot + 1` (0 = never stamped), then the per-slot palette. Both
+  // ride THIS allocation for the reason every other tail does, and here the
+  // reason is load-bearing rather than tidy: the SRC deposit kernel that reads
+  // them already binds the occupancy pyramid, the probe table, the bins and the
+  // per-pixel buffers, and R7's portable limit is eight storage buffers per
+  // stage. Riding `bits` costs the consumer ZERO new bindings — a separate
+  // attribution buffer plus a separate palette buffer would have been two, and
+  // §12.9 records that the last attribution grid was contorted (the slot remap
+  // applied in the VOXELIZER rather than read in the consumer) precisely
+  // because it had run out of binding slots.
+  const attrWordOffset = staticBvhWordOffset + staticBvhWords;
+  const attrWords = attributionEnabled ? totalSurfaceCapacity : 0;
+  const paletteWordOffset = attrWordOffset + attrWords;
+  const paletteWords = paletteSlots * SURFACE_PALETTE_WORDS;
   const bits = instancedArray(new Uint32Array(
-    staticBvhWordOffset + staticBvhWords,
+    paletteWordOffset + paletteWords,
   ), "uint");
   const atomicBits = instancedArray(new Uint32Array(level0.words), "uint").toAtomic();
+  // Build-time scratch for the attribution stamp. Separate from `surfScratch`
+  // rather than an eleventh word of it: widening the shared stride would cost
+  // the OLD backend the same 8.6 MB for a feature it does not have, and this
+  // way the whole thing is genuinely free when `attributionEnabled` is false.
+  // ATOMIC because two meshes can share a level-0 voxel at a seam — see the
+  // deterministic-winner half of §12.9's epitaph.
+  const attrScratch = attributionEnabled
+    ? instancedArray(new Uint32Array(totalSurfaceCapacity), "uint").toAtomic()
+    : null;
   // Phase-1 macrocell/brick records, the Phase-2 surface-record pool and the
   // Phase-4 triangle pool are appended to this same allocation, never exposed
   // as a second storage binding: the composed cascade kernel already sits at
@@ -489,6 +543,26 @@ export function createOccupancyField(bounds, res0, options = {}) {
   // deterministic-winner fix (last-write-wins re-rolled every seam cell's
   // colour per dispatch, which the bounce amplified into visible flicker).
   // Anything that re-introduces per-cell surface attribution inherits both.
+  //
+  // ── ITS SUCCESSOR, AND HOW IT ANSWERS BOTH (SRC Phase 5, plan §12.29) ─────
+  //
+  // `enableSurfaceAttribution` re-introduces exactly this, and had to answer
+  // the two bugs above before a line of it was written:
+  //
+  //   · CROSSED NUMBERING — killed by DELETION, not by a remap. The stamp is
+  //     the OCCUPANCY slot (`pairSlot`, the number the voxelizer already holds)
+  //     and the palette is indexed by that same number, built from
+  //     `field.placements`. `SlotRegistry`'s free-stack numbering — a genuinely
+  //     different number, still, `GISystem:6270` vs `SlotRegistry:98` — is
+  //     bridged by KEY (`slotKeyOf(mesh, instanceId)`) and never by index, so
+  //     there is one numbering on the GPU and nothing to get backwards.
+  //   · DETERMINISTIC WINNER — `atomicMax` on the stamp, the same fix as
+  //     before. A cell shared by several meshes picks the highest occupancy
+  //     slot, every dispatch, whatever order the threads arrive in.
+  //
+  // The resolution objection is answered by moving the KEY rather than by
+  // accepting the coarse cell: per surface RECORD, which is level-0 precision
+  // at surface-manifold cost. See the sizing block at `attributionEnabled`.
 
   // ───────────────────────────────────────────────────────── geometry buffers
   // Triangle soup for every UNIQUE geometry, concatenated, in LOCAL space —
@@ -533,8 +607,16 @@ export function createOccupancyField(bounds, res0, options = {}) {
       totalWords + level0.words + (hybridEnabled ? hybridLayout.totalWords : 0) +
       totalSurfaceCapacity * (SURFACE_RECORD_WORDS + SURFACE_SCRATCH_WORDS) +
       totalComplexTriangleCapacity * COMPLEX_TRIANGLE_WORDS +
-      densityPlan.totalWords + dynamicObjectWords
+      densityPlan.totalWords + dynamicObjectWords +
+      // Attribution: the persistent per-record stamp, its build scratch, and
+      // the palette. Zero when the feature is off. §12.25 found that the
+      // occupancy field is the term that scales with the world, so anything
+      // added here is counted rather than assumed.
+      attrWords * 2 + paletteWords
     ) * 4,
+    /** Attribution's own share of `bytes`, so a gate can price it separately. */
+    attributionBytes: (attrWords * 2 + paletteWords) * 4,
+    attributionRecords: attrWords,
     surfaceCapacity,
     dynamicSurfaceCapacity,
     complexTriangleCapacity,
@@ -1087,6 +1169,15 @@ export function createOccupancyField(bounds, res0, options = {}) {
         If(instanceIndex.lessThan(uint(4)), () => {
           atomicStore(surfAlloc.element(instanceIndex), uint(0));
         });
+        // The attribution stamp rides this dispatch rather than its own: the
+        // scratch clear already runs SURFACE_SCRATCH_WORDS threads per record,
+        // so one record's stamp is covered ten times over by the first tenth of
+        // them. Free, and it cannot get out of step with the fit it belongs to.
+        if (attributionEnabled) {
+          If(instanceIndex.lessThan(uint(surfaceCapacity)), () => {
+            atomicStore(attrScratch.element(instanceIndex), uint(0));
+          });
+        }
       })().compute(surfaceCapacity * SURFACE_SCRATCH_WORDS)
     : null;
 
@@ -1222,6 +1313,21 @@ export function createOccupancyField(bounds, res0, options = {}) {
                   const rank = countOneBits(bitAnd(low, belowLow)).add(countOneBits(bitAnd(high, belowHigh)));
                   const record = surfOffset.add(rank).toVar();
                   If(record.lessThan(uint(totalSurfaceCapacity)), () => {
+                    // THE ATTRIBUTION STAMP. This thread is the (slot,
+                    // triangle, voxel) visit §12.9's epitaph named — it already
+                    // knows the owning slot and has just resolved the record —
+                    // so attribution costs one atomic and no second traversal.
+                    //
+                    // `slot + 1`, so word 0 means "never stamped" and an
+                    // unattributed record is distinguishable from one attributed
+                    // to slot 0 (R1: the absence has to be a value, not a
+                    // colour). `atomicMax` and not a plain store: two meshes
+                    // meeting inside one level-0 voxel is the SEAM case, and a
+                    // last-write-wins seam re-rolled its colour every dispatch
+                    // and the bounce amplified that into visible flicker.
+                    if (attributionEnabled) {
+                      atomicMax(attrScratch.element(record), slot.add(uint(1)));
+                    }
                     const sBase = record.mul(uint(SURFACE_SCRATCH_WORDS)).toVar();
                     const cellOrigin = vec3(vx, vy, vz).toVar();
                     const dLocal = nHat.dot(centroid.sub(cellOrigin)).toVar();
@@ -1420,6 +1526,14 @@ export function createOccupancyField(bounds, res0, options = {}) {
         bits.element(rBase.add(uint(1))).assign(packedPlane);
         bits.element(rBase.add(uint(2))).assign(packedMaterial);
         bits.element(rBase.add(uint(3))).assign(packedFlags);
+        // Land the stamp beside the record it belongs to. Unconditional: a
+        // record with no stamp writes 0, which is what the reader treats as
+        // unattributed, so a record that stops being covered cannot serve the
+        // previous chain's answer.
+        if (attributionEnabled) {
+          bits.element(uint(attrWordOffset).add(record))
+            .assign(atomicLoad(attrScratch.element(record)));
+        }
       })().compute(recordCount);
   const surfFinalizeCompute = surfaceEnabled
     ? makeSurfFinalizeCompute(0, surfaceCapacity, complexEnabled
@@ -1610,6 +1724,15 @@ export function createOccupancyField(bounds, res0, options = {}) {
         If(instanceIndex.lessThan(uint(4)), () => {
           atomicStore(surfAlloc.element(instanceIndex.add(uint(4))), uint(0));
         });
+        // The dynamic tail's stamps must clear EVERY chain, not just full ones:
+        // dynamic record ids are reused (the tail cursor resets per dispatch),
+        // so a stamp left behind would attribute this frame's record to last
+        // frame's mesh.
+        if (attributionEnabled) {
+          If(instanceIndex.lessThan(uint(dynamicSurfaceCapacity)), () => {
+            atomicStore(attrScratch.element(instanceIndex.add(uint(surfaceCapacity))), uint(0));
+          });
+        }
       })().compute(dynamicSurfaceCapacity * SURFACE_SCRATCH_WORDS)
     : null;
 
@@ -4241,13 +4364,185 @@ export function createOccupancyField(bounds, res0, options = {}) {
   let computesRevision = -1;
   let jitterFrame = 0;
 
+  // ══════════════════════════════════ SURFACE ATTRIBUTION: read side + palette
+  //
+  // Everything above WRITES the stamp. These two are what a consumer needs to
+  // read it, and they live here rather than in `srcSurface.js` because both are
+  // arithmetic over layout constants this file owns — a second copy of the
+  // brick walk is exactly how a consumer ends up reading a different record
+  // than the marcher did.
+
+  /**
+   * Surface-record index for level-0 voxel `v`, or −1 when the voxel has no
+   * record (outside the volume, an empty voxel, a macro cell that is not a
+   * Brick/DynamicBrick, a brick the record pool could not seat, or an index
+   * past capacity).
+   *
+   * The same macro → brick → rank walk `traceHybridPlane` and the record-aware
+   * shadow oracle do inline, factored out so there is ONE definition of "which
+   * record owns this voxel". Rank-addressing means it returns the record the
+   * tracer would have read for the same voxel by construction.
+   *
+   * ⚠ A CONSUMER'S `voxel` CAN BE THE NEIGHBOUR. `traceHybridPlane` returns
+   * `floor(q0 + dq·t)` at the hit, and a hit that lands exactly ON a cell face
+   * floors either side of it. The record is still the marcher's for every hit
+   * strictly inside its cell; the caller handles the face case (srcSurface.js
+   * re-asks a quarter voxel along −n, and counts how often it had to).
+   *
+   * f32 carries an exact integer to 2^24 and `totalSurfaceCapacity` tops out at
+   * 2^21 + 2^16, so the float return is exact — it is a float only because a
+   * "no record" answer wants a sentinel outside the index range.
+   */
+  const recordIndexAt = attributionEnabled
+    ? sharedFn({
+        name: "giOccRecordAt",
+        type: "float",
+        inputs: [{ name: "v", type: "vec3" }],
+        body: (v) => {
+          const out = float(-1).toVar();
+          const inside = v.x.greaterThanEqual(0).and(v.y.greaterThanEqual(0)).and(v.z.greaterThanEqual(0))
+            .and(v.x.lessThan(level0.res.x)).and(v.y.lessThan(level0.res.y)).and(v.z.lessThan(level0.res.z));
+          If(inside, () => {
+            const macro = v.div(float(BRICK_RESOLUTION)).floor().toVar();
+            const mx = macro.x.max(0).min(hybridLayout.macroResolution.x - 1).toUint().toVar();
+            const my = macro.y.max(0).min(hybridLayout.macroResolution.y - 1).toUint().toVar();
+            const mz = macro.z.max(0).min(hybridLayout.macroResolution.z - 1).toUint().toVar();
+            const macroIndex = mz.mul(uint(hybridLayout.macroResolution.y)).add(my)
+              .mul(uint(hybridLayout.macroResolution.x)).add(mx).toVar();
+            const macroBase = uint(hybridWordOffset)
+              .add(macroIndex.mul(uint(MACRO_CELL_WORDS))).toVar();
+            const cellType = bitAnd(
+              shiftRight(bits.element(macroBase.add(uint(MACRO_CELL_METADATA_WORD))), uint(MACRO_CELL_TYPE_SHIFT)),
+              uint(MACRO_CELL_TYPE_MASK),
+            ).toVar();
+            // A DynamicBrick's STATIC records are stale by design (the tracer
+            // reads its per-chain dynamic tail there), so attribution follows
+            // the same offset word the tracer would.
+            const isStaticBrick = cellType.equal(uint(MacroCellType.Brick)).toVar();
+            If(isStaticBrick.or(cellType.equal(uint(MacroCellType.DynamicBrick))), () => {
+              const brickIndex = bits.element(macroBase.add(uint(MACRO_CELL_BRICK_INDEX_WORD))).toVar();
+              If(
+                brickIndex.lessThan(uint(hybridLayout.brickCount))
+                  .and(brickIndex.notEqual(uint(INVALID_RAY_HIT_INDEX))),
+                () => {
+                  const brickBase = uint(hybridWordOffset + hybridLayout.brickHeaderOffset)
+                    .add(brickIndex.mul(uint(BRICK_HEADER_WORDS))).toVar();
+                  const surfOffset = select(
+                    isStaticBrick,
+                    bits.element(brickBase.add(uint(BRICK_SURFACE_OFFSET_WORD))),
+                    bits.element(brickBase.add(uint(BRICK_DYNAMIC_OFFSET_WORD))),
+                  ).toVar();
+                  If(surfOffset.notEqual(uint(INVALID_RAY_HIT_INDEX)), () => {
+                    const localCell = v.sub(macro.mul(float(BRICK_RESOLUTION)))
+                      .clamp(vec3(0), vec3(BRICK_RESOLUTION - 1)).toVar();
+                    const cellIndex = localCell.z.toUint().mul(uint(16))
+                      .add(localCell.y.toUint().mul(uint(4)))
+                      .add(localCell.x.toUint()).toVar();
+                    const low = bits.element(brickBase.add(uint(BRICK_OCCUPANCY_LOW_WORD))).toVar();
+                    const high = bits.element(brickBase.add(uint(BRICK_OCCUPANCY_HIGH_WORD))).toVar();
+                    const inLow = cellIndex.lessThan(uint(32));
+                    const word = select(inLow, low, high).toVar();
+                    // An EMPTY voxel has no record — its rank would be some
+                    // other voxel's, which is the shape of "a hit reads the
+                    // colour of the surface next to it".
+                    If(bitAnd(shiftRight(word, bitAnd(cellIndex, uint(31))), uint(1)).notEqual(uint(0)), () => {
+                      const belowLow = select(
+                        inLow,
+                        shiftLeft(uint(1), bitAnd(cellIndex, uint(31))).sub(uint(1)),
+                        uint(0xffffffff),
+                      );
+                      const belowHigh = select(
+                        inLow,
+                        uint(0),
+                        shiftLeft(uint(1), bitAnd(cellIndex, uint(31))).sub(uint(1)),
+                      );
+                      const rank = countOneBits(bitAnd(low, belowLow)).add(countOneBits(bitAnd(high, belowHigh)));
+                      const record = surfOffset.add(rank).toVar();
+                      If(record.lessThan(uint(totalSurfaceCapacity)), () => {
+                        out.assign(record.toFloat());
+                      });
+                    });
+                  });
+                },
+              );
+            });
+          });
+          return out;
+        },
+      })
+    : null;
+
+  /**
+   * The palette's CPU side: two vec4s per slot, uploaded as a uniform array and
+   * landed into the `bits` tail by a 512-thread compute.
+   *
+   * WHY A PASS AND NOT A BUFFER THE CPU WRITES DIRECTLY: the palette has to be
+   * readable from the deposit kernel, which is at R7's wall, so it has to live
+   * in `bits` — and `bits` is GPU-written every chain, so a CPU upload of it
+   * would clobber the pyramid. A uniform array plus a trivial dispatch keeps
+   * the consumer's binding count at zero and pays for it in 512 threads.
+   *
+   * WHAT THIS BUYS: a material recolour is a uniform write and this dispatch.
+   * It does NOT touch the stamp, because the stamp is a slot id — so a recolour
+   * no longer re-voxelizes anything, which is the thing the deleted grid could
+   * not do (its cells held colours).
+   */
+  const paletteUniform = attributionEnabled
+    ? uniformArray(Array.from({ length: paletteSlots * 2 }, () => new THREE.Vector4()), "vec4")
+    : null;
+  const palettePass = attributionEnabled
+    ? Fn(() => {
+        const s = instanceIndex.toVar();
+        const a = paletteUniform.element(s.mul(uint(2)).toInt()).toVar();
+        const e = paletteUniform.element(s.mul(uint(2)).add(uint(1)).toInt()).toVar();
+        const base = uint(paletteWordOffset).add(s.mul(uint(SURFACE_PALETTE_WORDS))).toVar();
+        bits.element(base).assign(floatBitsToUint(a.x));
+        bits.element(base.add(uint(1))).assign(floatBitsToUint(a.y));
+        bits.element(base.add(uint(2))).assign(floatBitsToUint(a.z));
+        // Emitter id + 1, carried through a float lane. Slot counts are ≤ 512
+        // and emitter ids ≤ MAX_EMITTERS, so the round-trip is exact.
+        bits.element(base.add(uint(3))).assign(a.w.max(0).round().toUint());
+        bits.element(base.add(uint(4))).assign(floatBitsToUint(e.x));
+        bits.element(base.add(uint(5))).assign(floatBitsToUint(e.y));
+        bits.element(base.add(uint(6))).assign(floatBitsToUint(e.z));
+        // LIVE: 1 when this slot has a real resolved surface. An occupancy
+        // placement whose mesh never seated an atlas slot has a stamp but no
+        // colour, and without this word its palette entry would read as black —
+        // R1's silent dark vote, arriving as data rather than as an absence.
+        bits.element(base.add(uint(7))).assign(e.w.max(0).round().toUint());
+      })().compute(Math.max(1, paletteSlots))
+    : null;
+
   return {
     levels,
     res: res0,
     // (`cellAttr`/`slotAtlas`/`setSlotAtlas`/`setCoarseRes` were exported here
     // for the composite pass and went with it — see the note at their old
-    // declaration site.)
+    // declaration site. Their successor is `surfaceAttribution` below, keyed on
+    // the surface record instead of a coarse cell.)
     bits,
+    /**
+     * Static surface attribution (SRC Phase 5), or null when the field was
+     * built without `enableSurfaceAttribution`. `srcSurface.js` is the only
+     * consumer and owns the policy; this is the storage and the two readers.
+     */
+    surfaceAttribution: attributionEnabled
+      ? {
+          bits,
+          gridOrigin,
+          voxelInv,
+          recordIndexAt,
+          palettePass,
+          paletteUniform,
+          paletteSlots,
+          paletteWordOffset,
+          paletteWords: SURFACE_PALETTE_WORDS,
+          attrWordOffset,
+          recordCapacity: totalSurfaceCapacity,
+          staticRecordCapacity: surfaceCapacity,
+          bytes: (attrWords * 2 + paletteWords) * 4,
+        }
+      : null,
     stats,
     voxel,
     voxelInv,
