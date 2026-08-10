@@ -34,6 +34,7 @@ import {
   lodAtDistance,
   lodShells,
   probeSpacing,
+  MAX_LOOP_ALBEDO,
 } from "./srcConfig.js";
 import {
   KEY_EMPTY,
@@ -910,6 +911,457 @@ export function gatherPixel(cfg, built, tiles, position, normal, interior = IRRA
     out[2] /= totalShell;
   }
   return out;
+}
+
+// ══════════════════════════════════════════════════════ [E] HIT SHADING
+//
+// PLAN §4.4, PHASE 5. This is the term that has been zero since the transport
+// was rebuilt: `srcDeposit.js`'s `shadeHit` is `null`, so every deposited
+// radiance is 0 and what the frame shows is sky VISIBILITY with no bounce
+// colour. Everything below is the reference for what it must return.
+//
+//     L_hit = emissive(H) + ρ(H)/π · [ Σ_lights direct(H) + E_secondary(H) ]
+//
+// Five terms, and each one has a rule that is easy to get wrong in a way no
+// energy check would notice:
+//
+//   SUN        analytic irradiance × cosθ × ONE shadow ray through the same
+//              marcher. Not three's shadow map: that is view-frustum bound and
+//              half of SRC's hits are off screen (`createSrcVisibility`'s
+//              header makes the same point from the GPU side).
+//   EMITTERS   light-tree NEE — pick ONE emitter by importance, evaluate its
+//              closed-form irradiance, cast ONE shadow ray, divide by the pick
+//              probability. Sum-over-all-emitters is kept here as the arbiter
+//              the estimator is measured against, not as the shipping path.
+//   EMISSIVE   a hit ON an emitter deposits its emission directly — EXCEPT
+//              when that emitter is in the NEE set, or the same light arrives
+//              twice (R5). The flag is the whole mechanism; there is no
+//              arithmetic that can recover from getting it wrong.
+//   SECONDARY  E from the secondary probe cache, 0 where no probe exists.
+//              Never a fixed-radius fallback (R1).
+//   ALBEDO     clamped to `MAX_LOOP_ALBEDO` INSIDE the loop (R4). This is what
+//              makes the multibounce iteration a contraction; artistic gain
+//              belongs outside it, on `intensity`.
+//
+// Movers are not a branch. §4.4 calls for "header mean albedo/emissive Lambert
+// shading" and that is the SAME expression with the surface read from a mover
+// header instead of a surface record — so the provenance lives in `surfaceAt`
+// and `shadeHit` never asks. A mover-shaped `if` in here is the shape of the
+// bug where a moving object lights the room differently from an identical
+// static one.
+//
+// The SKY is deliberately absent: a ray that escapes composites the sky in
+// `mergeCascades`, at the top cascade, exactly once. Adding it here would
+// double it for every ray that both misses and merges.
+
+/**
+ * Face the record normal toward the incoming ray.
+ *
+ * ══ WHY THIS FLIP IS NOT THE ONE THE GBUFFER'S FLIP WAS ════════════════════
+ *
+ * §12.17 concluded that the face-forward flip "belongs at the engine boundary"
+ * — in `readPixel`, never in a kernel — because the gbuffer normal is a fact
+ * handed IN from outside, and flipping it on one side of the CPU/GPU boundary
+ * only made each side fill the half of the bin sphere the other never read.
+ *
+ * This normal is not that. It is produced by the trace INSIDE the same kernel
+ * that consumes it, one line earlier, and the consumer needs the hemisphere the
+ * ray arrived from. A record normal is sign-aligned to the occupancy gradient,
+ * which points out of the medium and knows nothing about which side a
+ * particular ray approached from; unflipped, every hit on the far face of a
+ * wall returns cos < 0 for every light and shades BLACK. That is not a subtle
+ * bias — it is half the geometry in a closed room going dark.
+ *
+ * The flip has a real cost and it is bounded by the shadow ray, not by this
+ * function: a hit on the back of a ONE-VOXEL wall gets a normal pointing at the
+ * sun, and only the visibility trace stops the sun from coming through. That
+ * makes the shadow ray's lift (0.75 · voxel, per R2) a correctness parameter
+ * rather than an acne tweak, and the suite measures where it stops working.
+ */
+export function faceForward(normal, dir) {
+  const d = normal[0] * dir[0] + normal[1] * dir[1] + normal[2] * dir[2];
+  // A ray travelling along `dir` arrives at the surface, so the outward normal
+  // is the one OPPOSING `dir`.
+  return d > 0 ? [-normal[0], -normal[1], -normal[2]] : [normal[0], normal[1], normal[2]];
+}
+
+/**
+ * R4's albedo ceiling, and it scales rather than clamping per channel.
+ *
+ * ══ WHAT R4 ACTUALLY REQUIRES ══════════════════════════════════════════════
+ *
+ * The secondary cache makes the bounce a temporal fixed-point iteration:
+ * frame k's hit shading reads frame k−1's irradiance. `bakeProbeIrradiance`
+ * returns EXACTLY π·L̄ for uniform radiance (that is what the analytic-π
+ * normalization buys, §12.17.2), so one turn of the loop maps
+ *
+ *     L → ρ/π · (π · L) = ρ · L
+ *
+ * and the iteration's gain is the spectral radius of ρ, i.e. its LARGEST
+ * channel. Bounding that below 1 is the entire requirement, and `0.9` gives a
+ * worst-case amplification of 1/(1−0.9) = 10× rather than a divergence. Three
+ * separate divergences in the dense backend taught this; every one of them was
+ * an albedo that reached 1 somewhere in the loop.
+ *
+ * ══ WHY SCALE AND NOT `min(ρ, 0.9)` PER CHANNEL ════════════════════════════
+ *
+ * Both satisfy the bound. A per-channel clamp changes CHROMATICITY whenever
+ * more than one channel exceeds the ceiling: (1.0, 0.95, 0.90) becomes neutral
+ * (0.9, 0.9, 0.9), so a warm white wall bounces cold — and colour bleed is the
+ * entire product of this module, so a clamp that quietly desaturates the
+ * brightest surfaces is spending exactly the thing being bought. Scaling by
+ * `ceiling / peak` preserves the ratio between channels, touches nothing at or
+ * below the ceiling, and satisfies the same bound. The suite measures the
+ * chromaticity shift of both forms so the choice is on the record with a
+ * number.
+ */
+export function clampLoopAlbedo(albedo, ceiling = MAX_LOOP_ALBEDO) {
+  const r = Math.max(0, albedo[0]);
+  const g = Math.max(0, albedo[1]);
+  const b = Math.max(0, albedo[2]);
+  const peak = Math.max(r, g, b);
+  if (!(peak > ceiling)) return [r, g, b];
+  const k = ceiling / peak;
+  return [r * k, g * k, b * k];
+}
+
+/**
+ * Deterministic [0, 1) from a ray index — the mirror of a WGSL hash.
+ *
+ * NEE needs one random number per shading point and the GPU has no RNG state to
+ * carry, so the sample is a pure function of the ray's place in the global R2
+ * sequence: same ray index, same emitter picked, both sides of the boundary.
+ * That is the same reason `traceAndDeposit` keys its synthetic trace on the ray
+ * INDEX rather than the direction (§12.16) — a u32 is bit-identical in WGSL and
+ * JS where a sin/cos is not.
+ *
+ * Integer-only by construction, for the §12.11 reason: R2 evaluated in f32 has
+ * 8 distinct values at 2e6 rays. This never leaves u32 until the final divide.
+ */
+export function hashUnitFloat(n) {
+  let h = (n >>> 0) ^ 0x9e3779b9;
+  h = Math.imul(h ^ (h >>> 16), 0x21f0aaad) >>> 0;
+  h = Math.imul(h ^ (h >>> 15), 0x735a2d97) >>> 0;
+  h = (h ^ (h >>> 15)) >>> 0;
+  return h / 4294967296;
+}
+
+/** Rec. 709 luminance — the scalar an importance heuristic ranks on. */
+function luminance(c) {
+  return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+}
+
+/**
+ * Mirror of `createSrcVisibility`: binary occlusion through the SAME geometry
+ * trace the primary ray used.
+ *
+ * ══ THE LIFT IS THE VOXEL'S, AND R2 SAYS IT CAN BE NOTHING ELSE ════════════
+ *
+ * `0.75 · voxelSize` is what the GPU twin uses, and the rule behind the number
+ * is R2: every bias in this module tracks the quantization of whatever traced
+ * the ray. That is the OCCUPANCY VOXEL here — not probe spacing, not the field
+ * cell, not a tuned epsilon. A lift derived from `spacing0` would appear to
+ * work at one quality tier and produce shadow acne or peter-panning at another,
+ * because the two dials move independently.
+ *
+ * So `voxelSize` is required and there is no default: a caller that does not
+ * know its medium's quantization cannot cast a correct shadow ray, and
+ * inventing a number for it is how the wrong bias ships.
+ *
+ * Movers are excluded from the GPU twin (`dynamics: false`) so a surface cannot
+ * shadow itself; the CPU fixtures have no movers, and a caller that adds them
+ * owes this closure the same exclusion.
+ */
+export function makeVisibility(geometryTrace, voxelSize) {
+  if (!(voxelSize > 0)) {
+    throw new Error(
+      "makeVisibility: voxelSize is required — the shadow lift tracks the DDA " +
+      "medium's quantization (R2), never probe spacing and never a tuned epsilon",
+    );
+  }
+  const lift = 0.75 * voxelSize;
+  return (point, normal, toLight, maxT = Infinity) => {
+    const origin = [
+      point[0] + normal[0] * lift,
+      point[1] + normal[1] * lift,
+      point[2] + normal[2] * lift,
+    ];
+    const hit = geometryTrace(origin, toLight);
+    if (!hit || hit.t < 0) return 1;
+    return hit.t < maxT ? 0 : 1;
+  };
+}
+
+/**
+ * A directional light's contribution to the irradiance at a hit.
+ *
+ * `sun.direction` points TOWARD the light (the convention `createSrcVisibility`
+ * takes as `toLight`), and `sun.irradiance` is the irradiance on a surface
+ * facing it square-on — so this is `E⊥ · cosθ · V` and nothing else. The cosine
+ * is clamped at zero before the shadow ray is cast, because a back-facing
+ * surface needs no trace to know the answer, and that early-out is most of what
+ * the sun term costs on the GPU.
+ */
+export function sunIrradiance(sun, position, normal, visibility) {
+  if (!sun) return [0, 0, 0];
+  const l = sun.direction;
+  const cos = normal[0] * l[0] + normal[1] * l[1] + normal[2] * l[2];
+  if (!(cos > 0)) return [0, 0, 0];
+  const v = visibility ? visibility(position, normal, l, Infinity) : 1;
+  if (!(v > 0)) return [0, 0, 0];
+  const k = cos * v;
+  return [sun.irradiance[0] * k, sun.irradiance[1] * k, sun.irradiance[2] * k];
+}
+
+/**
+ * The EMITTER ARBITER: every emitter, closed form, one shadow ray each.
+ *
+ * This is what NEE estimates, and it is kept as a separate function rather than
+ * folded in as a `samples === emitters.length` special case because the suite
+ * has to be able to say "the estimator agrees with the sum" without the two
+ * sharing the code path that would make that vacuous.
+ *
+ * An emitter supplies `irradianceAt(P, n̂)` — the UNSHADOWED closed-form
+ * irradiance for its kind, which is `emitterShapes.js`'s `refShapeFactor`
+ * family in the engine — and `sampleTarget(P)`, the point the shadow ray aims
+ * at. Splitting the analytic form factor from a single-ray visibility is
+ * approximate by construction (a half-occluded emitter reads fully lit or fully
+ * dark), and it is the SAME approximation the screen chain's analytic emitter
+ * direct already makes. That is the point: R5 asks the two representations to
+ * agree at the handoff, and they cannot agree if one of them is unbiased and
+ * the other is not.
+ */
+export function emitterIrradianceExact(emitters, position, normal, visibility) {
+  const out = [0, 0, 0];
+  for (const e of emitters) {
+    const E = e.irradianceAt(position, normal);
+    if (!(E[0] > 0 || E[1] > 0 || E[2] > 0)) continue;
+    let v = 1;
+    if (visibility) {
+      const target = e.sampleTarget(position);
+      const d = [target[0] - position[0], target[1] - position[1], target[2] - position[2]];
+      const dist = Math.hypot(d[0], d[1], d[2]);
+      if (!(dist > 0)) continue;
+      v = visibility(position, normal, [d[0] / dist, d[1] / dist, d[2] / dist], dist);
+    }
+    if (!(v > 0)) continue;
+    out[0] += E[0] * v;
+    out[1] += E[1] * v;
+    out[2] += E[2] * v;
+  }
+  return out;
+}
+
+/**
+ * NEE over the emitter set: pick by importance, evaluate, ONE shadow ray,
+ * divide by the pick probability.
+ *
+ * ══ THE IMPORTANCE IS THE CONTRIBUTION, AND THAT MAKES ONE SAMPLE EXACT ════
+ *
+ * `p_i ∝ luminance(E_i)` — the emitter's own unshadowed closed form. Then
+ * `E_i/p_i = Σ_j E_j` for whichever i is drawn, so with every emitter visible
+ * the one-sample estimator returns the exact sum with ZERO variance, and all
+ * remaining variance is visibility. The suite asserts that identity, because it
+ * is the sharpest possible statement about the estimator and it holds to
+ * floating point.
+ *
+ * That is also the honest description of what `lightTree.js` buys and what it
+ * costs. The tree cannot afford the exact factor at every node, so it descends
+ * on CLUSTER bounds — an APPROXIMATION of this importance — and the gap between
+ * the two is the variance a real scene pays. Passing `importance` here lets the
+ * suite price that gap instead of asserting it away.
+ *
+ * ══ A ZERO PROBABILITY FOR A NONZERO CONTRIBUTION IS A LOST LIGHT ══════════
+ *
+ * R1's rule about rejection weights, in its sampling costume: any emitter with
+ * a nonzero contribution must be reachable. So the normalization runs over the
+ * emitters that CAN contribute, and an emitter with zero importance but nonzero
+ * irradiance would be a silent energy loss no energy check could attribute —
+ * which is exactly why `importance` defaults to the contribution itself and why
+ * the suite checks the two agree on their support.
+ */
+export function emitterIrradianceNee(emitters, position, normal, visibility, rayIndex, {
+  samples = 1,
+  importance = null,
+} = {}) {
+  const weights = [];
+  const values = [];
+  let total = 0;
+  for (const e of emitters) {
+    const E = e.irradianceAt(position, normal);
+    const contribution = luminance(E);
+    // Importance is allowed to be a worse ranking than the contribution — that
+    // is what a light tree is — but never zero where the contribution is not.
+    const w = contribution > 0 ? Math.max(1e-12, importance ? importance(e, position, normal) : contribution) : 0;
+    weights.push(w);
+    values.push(E);
+    total += w;
+  }
+  if (!(total > 0)) return [0, 0, 0];
+
+  const out = [0, 0, 0];
+  for (let s = 0; s < samples; s++) {
+    // One stratified draw per sample, offset by the ray index so two rays at the
+    // same point do not pick the same light. `hashUnitFloat` keeps this a pure
+    // function of (rayIndex, s) — no state to carry onto the GPU.
+    const u = (s + hashUnitFloat(rayIndex * 0x9e37 + s)) / samples;
+    let acc = 0;
+    let picked = -1;
+    for (let i = 0; i < weights.length; i++) {
+      acc += weights[i] / total;
+      if (u < acc) { picked = i; break; }
+    }
+    if (picked < 0) picked = weights.length - 1;
+    if (!(weights[picked] > 0)) continue;
+    const pdf = weights[picked] / total;
+    const E = values[picked];
+    let v = 1;
+    if (visibility) {
+      const e = emitters[picked];
+      const target = e.sampleTarget(position);
+      const d = [target[0] - position[0], target[1] - position[1], target[2] - position[2]];
+      const dist = Math.hypot(d[0], d[1], d[2]);
+      if (!(dist > 0)) continue;
+      v = visibility(position, normal, [d[0] / dist, d[1] / dist, d[2] / dist], dist);
+    }
+    if (!(v > 0)) continue;
+    const k = v / (pdf * samples);
+    out[0] += E[0] * k;
+    out[1] += E[1] * k;
+    out[2] += E[2] * k;
+  }
+  return out;
+}
+
+/**
+ * §4.4's hit shading, assembled. Returns `shadeHit(hit, dir, rayIndex)` with a
+ * `stats` object hung off it — the same shape `srcDeposit.js` takes as its
+ * `shadeHit` option, so this function IS the executable spec for that kernel.
+ *
+ * `surfaceAt(hit)` is the one place provenance lives:
+ *
+ *     { position, normal, albedo, emissive, emitter, mover }
+ *
+ * `emitter` is the index into `emitters` when the surface hit IS one of the NEE
+ * lights, and −1 otherwise. **That flag is R5's entire mechanism.** An emitter
+ * that is both sampled by NEE and emissive on contact delivers its energy
+ * twice, and the failure is invisible to every check that does not compare the
+ * two paths against each other: the image is simply brighter around lights,
+ * which reads as an artistic choice. `neeEmitters: false` is the arm that
+ * measures the handoff — the same scene shaded by the geometry path alone must
+ * land on the same number.
+ *
+ * `secondary(P, n̂)` is the secondary cache's irradiance, `[0,0,0]` where no
+ * probe exists. NOT a fallback radius, NOT the primary cache: reading the
+ * primary here would close the loop on itself within one frame and re-derive
+ * the divergence R4 exists to prevent.
+ */
+export function makeHitShader({
+  surfaceAt,
+  sun = null,
+  emitters = [],
+  visibility = null,
+  secondary = null,
+  neeEmitters = true,
+  neeSamples = 1,
+  importance = null,
+  maxLoopAlbedo = MAX_LOOP_ALBEDO,
+} = {}) {
+  if (typeof surfaceAt !== "function") {
+    throw new Error("makeHitShader: surfaceAt is required — it is where mover/static provenance lives");
+  }
+  const stats = {
+    shaded: 0,
+    shadowRays: 0,
+    emissiveHits: 0,
+    emissiveZeroed: 0,
+    albedoClamped: 0,
+    secondaryHits: 0,
+    secondaryMisses: 0,
+  };
+  // Wrap the visibility so the shadow-ray count is a property of the shader and
+  // not something every arm has to instrument for itself. The clamp counter is
+  // the same idea as `STAT_CLAMPED` in the deposit: a ceiling that never binds
+  // is the evidence for keeping it.
+  const vis = visibility
+    ? (p, n, l, maxT) => { stats.shadowRays++; return visibility(p, n, l, maxT); }
+    : null;
+
+  const shadeHit = (hit, dir, rayIndex = 0) => {
+    const s = surfaceAt(hit, dir);
+    if (!s) return [0, 0, 0];
+    stats.shaded++;
+    const P = s.position;
+    const n = faceForward(s.normal, dir);
+
+    // ── E: irradiance arriving at the hit ────────────────────────────────────
+    const E = sunIrradiance(sun, P, n, vis);
+    if (emitters.length) {
+      const Ee = neeEmitters
+        ? emitterIrradianceNee(emitters, P, n, vis, rayIndex, { samples: neeSamples, importance })
+        : [0, 0, 0];
+      E[0] += Ee[0]; E[1] += Ee[1]; E[2] += Ee[2];
+    }
+    if (secondary) {
+      const Es = secondary(P, n);
+      if (Es && (Es[0] !== 0 || Es[1] !== 0 || Es[2] !== 0)) stats.secondaryHits++;
+      else stats.secondaryMisses++;
+      if (Es) { E[0] += Es[0]; E[1] += Es[1]; E[2] += Es[2]; }
+    }
+
+    // ── ρ/π · E, with R4's ceiling ───────────────────────────────────────────
+    const rho = clampLoopAlbedo(s.albedo ?? [0, 0, 0], maxLoopAlbedo);
+    if (Math.max(...(s.albedo ?? [0, 0, 0])) > maxLoopAlbedo) stats.albedoClamped++;
+    const k = 1 / Math.PI;
+    const out = [rho[0] * E[0] * k, rho[1] * E[1] * k, rho[2] * E[2] * k];
+
+    // ── emission, and R5's zeroing ───────────────────────────────────────────
+    const Le = s.emissive;
+    if (Le && (Le[0] > 0 || Le[1] > 0 || Le[2] > 0)) {
+      const isNeeLight = neeEmitters && s.emitter >= 0 && s.emitter < emitters.length;
+      if (isNeeLight) stats.emissiveZeroed++;
+      else {
+        stats.emissiveHits++;
+        out[0] += Le[0]; out[1] += Le[1]; out[2] += Le[2];
+      }
+    }
+    return out;
+  };
+  shadeHit.stats = stats;
+  return shadeHit;
+}
+
+/**
+ * Compose a GEOMETRY trace and a hit shader into the `sceneTrace` the rest of
+ * this file already takes.
+ *
+ * The two halves are separate on the GPU as well — `createSrcSceneTrace`
+ * returns a record and `createSrcDepositFrame` takes `shadeHit` as its own
+ * option — and keeping them separate here is what lets the brute-force MC
+ * arbiter share the EXACT shading the estimator used. An arbiter with its own
+ * copy of the shading measures the difference between two shading
+ * implementations, which is not the question.
+ */
+export function shadeTrace(geometryTrace, shadeHit) {
+  return (origin, dir, rayIndex = 0) => {
+    const hit = geometryTrace(origin, dir, rayIndex);
+    if (!hit || hit.t < 0) return { t: -1, radiance: [0, 0, 0] };
+    return { t: hit.t, radiance: shadeHit(hit, dir, rayIndex) };
+  };
+}
+
+/**
+ * The secondary cache [J] as `shadeHit` sees it: last frame's merged tiles,
+ * sampled at an arbitrary world point.
+ *
+ * It is `gatherPixel` and nothing else, which is the finding worth writing down
+ * — the secondary cache is not a new structure, it is the SAME probe field
+ * re-run over hit points (plan §4.1 step [J]: "steps B–H re-run over last
+ * frame's hit points, 2 LODs coarser"). A missing probe returns exactly zero
+ * and lets temporal accumulation fill it, per R1.
+ */
+export function makeSecondaryCache(cfg, built, tiles, coverage = null, interior = IRRADIANCE_TILE_INTERIOR) {
+  return (position, normal) => gatherPixel(cfg, built, tiles, position, normal, interior, coverage);
 }
 
 // ════════════════════════════════════════════════════════ THE WHOLE FRAME
