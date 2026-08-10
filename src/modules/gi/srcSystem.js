@@ -303,7 +303,31 @@ export function createSrcProbeSystem({
         // shape of the bug where a moving crate lights the room differently from
         // the identical static one beside it (§12.26.1).
         surfaceAt: (hit, dir) => {
-          const s = staticSurfaceAt(hit, dir);
+          // ⚠ `srcSurface.js`'s signature is `(voxel, worldPos, normal)`, NOT
+          // `(hit, dir)`. The first version of this call passed the hit record
+          // straight through, and `vec3(hitRecord)` is a TSL type error a long
+          // way from its cause — "Invalid parameter for the type vec3" pointing
+          // at srcSurface, in a file that is correct.
+          //
+          // `voxel` is the level-0 cell the MARCHER found, which is why
+          // `createSrcSceneTrace` passes it through rather than letting a
+          // consumer re-derive it: `position` is lifted half a coarse cell along
+          // the normal, so flooring it lands on the shell cell instead.
+          //
+          // The normal here is the RAW record normal, deliberately NOT the
+          // face-forwarded one. The face retry steps INWARD along it to find the
+          // cell the surface belongs to, so it needs the normal that points out
+          // of the GEOMETRY — a normal flipped to oppose the ray would step the
+          // wrong way on every back-face hit and silently attribute the cell
+          // behind the wall.
+          if (hit.voxel == null) {
+            throw new Error(
+              "srcSystem: the scene trace produced no `voxel`, so static hits have no " +
+              "attribution key. `createSrcSceneTrace` passes it through from the marcher — " +
+              "a trace built without it cannot shade a static surface",
+            );
+          }
+          const s = staticSurfaceAt(hit.voxel, hit.exactPosition, hit.normal);
           const albedo = vec3(s.albedo).toVar();
           const emissive = vec3(s.emissive).toVar();
           const emitter = float(s.emitter).toVar();
