@@ -175,12 +175,14 @@ memory (`gi-module.md`); the ones that bind hardest here:
 - R17. Every new component prop ships schema-declared (auto-MCP) with `test:mcp` coverage in the
   same change; typed `editor.d.ts` surface stays complete.
 - R18. **GI initialization is ≤ 1 second to first correct frame** — measured by `probe:gi-boot` on
-  the user's real project, never asserted. As of 2026-08-10 it is **45–90 s, and ~98% of that is
-  WGSL compilation**: the CPU side (voxelize 49ms for 262k tris, BVH 777ms, setup 873ms) already
-  fits with room to spare, while one compute pipeline costs 30–40s. So this rule constrains SHADER
-  SHAPE first and algorithms second — every new kernel is a startup cost, every branch in a hot
-  kernel is compile time, and "one more mode in the big kernel" is the decision it exists to make
-  expensive. Full budget, measurement and levers: **§13**.
+  the user's real project, never asserted. As of 2026-08-10 it is **55 s**, reproducible across
+  back-to-back runs. **83% of that window is inside pipeline creation and 3.4% is GI's CPU work**
+  (voxelize 41ms for 262k tris, BVH 807ms, setup 885ms) — so the CPU side already fits the budget
+  and is not where any effort goes. The driver SERIALIZES pipeline compilation (§13.3: eight equal
+  kernels return in a ~4s arithmetic ladder), which makes the cost **pipeline COUNT × average**, not
+  kernel size — a 154kB kernel compiles 85× faster than a 16kB one. So this rule constrains HOW MANY
+  KERNELS A DESIGN SHIPS, and "one more compute pass" is the decision it exists to make expensive.
+  Full budget, measurement, re-ranked levers and **the four things its first version got wrong**: **§13**.
 
 ---
 
@@ -4694,134 +4696,173 @@ Logged, not chased (R16):
 
 ## 13. Startup budget — GI must initialize in ≤ 1 second
 
-Added 2026-08-10, at the user's request, mid-Phase-5. It is a REQUIREMENT and not
-a nice-to-have: a GI system that takes a minute to appear is one the user cannot
-iterate against, and every measurement in §12 was taken on a build whose GI took
-longer to compile than to design.
+Added 2026-08-10 at the user's request, mid-Phase-5. A REQUIREMENT, not a
+nice-to-have: a GI system that takes a minute to appear is one the user cannot
+iterate against.
+
+**§13.2–§13.4 were rewritten the same day, after `probe:gi-boot` contradicted
+them.** The first version was written from the engine's own aggregate log lines
+and got the headline number, the ranked levers and the cold/warm verdict wrong.
+§13.8 records how, because the way it was wrong is reusable.
 
 ### 13.1 The definition, because "initialized" has three candidates
 
-**The budget is on TIME-TO-FIRST-CORRECT-FRAME**: from GI attach (scene open,
-Play entry, or the component being enabled) to the first frame in which GI's own
-light is on screen and is the right light. Not to a *converged* image — a
-temporally-accumulated system is still resolving noise for tens of frames after
-that, and holding the first frame back until it is quiet would be strictly worse
-for the person watching. Convergence is a separate curve and gets a separate
-number (§12.24 already measures it).
+**The budget is on TIME-TO-FIRST-CORRECT-FRAME**: from the start of GI's
+initialization burst to the first frame in which GI's own light is on screen and
+is the right light. Not to a *converged* image — a temporally-accumulated system
+is still resolving noise for tens of frames after that, and holding the frame
+back until it is quiet would be worse for the person watching. Convergence is a
+separate curve with a separate number (§12.24).
 
-The distinction is not pedantry: it says the boot-ambient hemisphere
-(`bootAmbient.js`) is a *bridge over a compile*, not a substitute for one — and
-that a build which hits the budget should have no use for it at all.
+It says the boot-ambient hemisphere (`bootAmbient.js`) is a *bridge over a
+compile*, not a substitute for one — and that a build meeting R18 has no use for
+it at all.
 
-### 13.2 THE MEASUREMENT, AND IT SETTLES THE QUESTION IMMEDIATELY
+### 13.2 THE MEASUREMENT — `probe:gi-boot`, user's Sponza, 262k tris
 
-Real console output from the user's own Sponza project (2026-08-10, 262k
-triangles, 72 entities, medium quality, SRC probes on):
+Two consecutive warm runs in one invocation (so nothing outside them could
+change), plus the cold arm. Reproducible to within 8%:
 
-| stage | cost |
-|---|---|
-| occupancy voxelize — 262,279 tris in 25 slots → 1.5M work items | **49 ms** (CPU) |
-| static shadow BVH — 262,267 tris, 11.6 MB, SAH splits | **777 ms** |
-| whole GI setup (bounds fit, slots, lights, emitters) | **873 ms** |
-| SRC probe store — 318k gbuffer pixels, 1.40M bins, 63.38 MB | inside the above |
-| material compile wave | **903 ms** – 3,238 ms |
-| **compute pipeline compilation** | **42,607 ms** (1 pipeline) / **86,841 ms** (3 pipelines) |
-| first frame after the wave (pipelines recompiled at resume) | **603 ms** – 701 ms |
+| | cold | warm #1 | warm #2 |
+|---|---|---|---|
+| **time to first correct frame** | 54,451 ms | **59,329 ms** | **54,943 ms** |
+| slowest single pipeline | 27,339 ms | 31,007 ms | 28,287 ms |
+| GI CPU work (voxelize + BVH + setup) | 1,783 ms | ~2,000 ms | ~1,900 ms |
+| span first-creation → last-completion | — | 60,204 ms | 55,789 ms |
+| …of which SOME pipeline was busy | — | **83%** | **83%** |
+| …idle between compiles | — | 17% | 17% |
 
-`[gi] compute kernels: 5 totaling 183kB WGSL (sizes 3/73/33/37/37kB)`
+Per-stage, from the engine's own lines: voxelize **41 ms**, static shadow BVH
+**807 ms**, GI setup **885 ms**. 29 compute pipelines and ~40 render pipelines.
 
-**Shader compilation is ~98% of GI startup.** Everything that intuition says
-should be slow is already fast — voxelizing a quarter-million triangles costs 49
-milliseconds. The entire CPU side fits inside the 1-second budget today with 127
-ms to spare. There is exactly one problem and it is the driver's WGSL compiler.
+**The CPU side is 3.4% of startup and already fits the budget with room to
+spare.** Do not go optimizing voxelization, the BVH, slot fitting or probe
+allocation — voxelizing a quarter-million triangles costs 41 milliseconds.
 
-Per-pipeline that is **30–40 seconds for a 37 kB kernel**, which is far outside
-anything a shader compiler should cost and is itself the first thing to explain.
+**The wall clock is inside pipeline creation: 83% busy, 17% idle.** That kills
+the "it is really TSL node-graph generation in JS between compiles" hypothesis
+the timeline instrument was built to test. It is shader compilation.
 
-### 13.3 What has ALREADY been ruled out — do not re-derive these
+### 13.3 ⚠ THE PER-PIPELINE NUMBER IS LATENCY, NOT COMPILE TIME — THE DRIVER SERIALIZES
 
-- **Not naive loop unrolling.** R11's rule is being followed: `occupancyField.js`
-  uses 18 runtime `Loop()`s and there is no JS `for` emitting nodes over `steps`
-  or `macroSteps`; the module has 25 `sharedFn`s. A 192-step DDA is not being
-  written out 192 times.
-- **Not the CPU work.** See the table. Voxelize, BVH, slot fitting, probe
-  allocation and the hashmap together are under a second.
-- **Not a missing async path.** Pipeline creation is already async
-  (`installAsyncComputePipelines`), the wave already keeps frames flowing, and
-  the wait already costs the LONGEST compile rather than their sum. The
-  concurrency win has been taken; the remaining cost is one kernel's compile.
-- **Not the material wave.** 903 ms, and already the subject of a paid-for fix
-  (warming the postprocess override's MRT variant — the user confirmed disabling
-  Post Processing halved startup, which is why `#warmOverridePass` exists).
+The single most misleading thing in this data, and the reason "which kernel costs
+the 40 seconds" has no answer as asked.
 
-### 13.4 The levers, in the order they should be measured
+Eight 16 kB kernels came back at **5,295 / 6,111 / 9,082 / 13,620 / 17,336 /
+20,323 / 24,600 / 29,897 ms** — an arithmetic ladder in ~4 s steps. That is not
+eight kernels of differing difficulty; it is one queue. Every pipeline's measured
+`ms` is *request-to-completion*, so it includes waiting for the ones ahead of it.
 
-1. **COLD VS WARM, AND NOTHING ELSE MATTERS UNTIL THIS IS SEPARATED.** Chrome
-   keeps a disk cache of compiled shaders. Both readings above are from a
-   session where the kernels were being edited between runs, so both may be cold
-   misses. If a *warm* run is already sub-second, the budget is met for users and
-   the problem is a developer-iteration problem with a different fix (ship a
-   warm cache) than the one a cold 40 s implies. **This is the first thing
-   `probe:gi-boot` must report, and every other item here is conditional on it.**
-2. **Kernel BREADTH.** 73 kB in one kernel is the ray-hit mode ladder, the
-   emitter shape family, the dynamic-object path, the surface records and the
-   pyramid, all reachable from one entry point. Compile cost is superlinear in
-   live-range and branch count, so splitting one fat kernel into two thin ones
-   can beat both. SRC is already structurally better here — §12.9/§12.10 deleted
-   the dense transport and the SDF, and Phase 7's sweep removes the rayHit ladder
-   — so **part of this budget is already bought and just needs measuring**. The
-   SRC path's own kernel sizes have never been printed; that is an instrument
-   gap, not a result.
-3. **THE 603–701 ms RESUME RECOMPILE ALONE IS 60–70% OF THE BUDGET.** The log
-   already flags it: *"pipelines recompiled at resume (likely the postprocess
-   render path; report this)"*. A known, named, unfixed bug that is now
-   load-bearing — it must be fixed whatever else is true.
-4. **Compile only what frame 1 needs.** The wave currently prewarms every kernel
-   before resuming. A staged ramp — population and gather first, merge and tiles
-   in the background — trades a partial first frame for latency. This is a
-   startup RAMP and not a per-frame flip, so R1 does not forbid it, but it must
-   degrade continuously (a missing kernel means a dimmer frame, never a black
-   one or a popping one).
-5. **Permutations.** Any kernel compiled once per quality tier, per material
-   bucket or per ray-hit mode multiplies the whole cost. SRC ships two ray-hit
-   modes rather than five (§4.3) — verify that survives to the pipeline count.
+Consequences that change what a fix looks like:
 
-### 13.5 The instrument, which does not exist yet
+- **"The slowest pipeline" is mostly the one that queued last.** In warm #2 it is
+  a **16 kB kernel with 1 loop and 18 ifs** at 28,287 ms. Nothing that small
+  compiles for 28 seconds on its own merit.
+- **Async concurrency buys no wall clock.** `installAsyncComputePipelines` keeps
+  frames flowing — which is real and worth having — but it does not shorten
+  startup, because the driver compiles them one at a time anyway.
+- **The lever is TOTAL COMPILE WORK, which for a serialized queue means PIPELINE
+  COUNT × average cost.** ~70 pipelines over a ~50 s busy window is ~0.7 s each.
+  Halving the count halves startup; making one kernel smaller does almost
+  nothing.
 
-**`probe:gi-boot`** (`scripts/run-gi-boot-probe.mjs`), owed before any fix, per
-R14 — run the isolation arm before the first fix:
+### 13.4 ⚠ WGSL SIZE DOES NOT PREDICT COMPILE COST — SO "KERNEL BREADTH" WAS THE WRONG LEVER
 
-- cold vs warm split, by clearing the browser's shader cache between arms. **The
-  headline number, and the one that decides which lever matters.**
-- per-kernel WGSL size AND per-kernel compile time, for BOTH backends. Today the
-  size line exists for the dense path only and no per-kernel timing exists at
-  all — so "which kernel costs the 40 seconds" is currently unanswerable.
-- the stage table of §13.2, reproduced automatically, so a regression names its
-  own stage.
-- time-to-first-correct-frame end to end, which is the number the budget is
-  actually on.
-- run on the SAME scene as `run-gi-game-perf-probe` so startup and steady-state
-  costs are comparable within one session (R15).
+The first version of this section ranked "kernel breadth" second and reasoned
+that a 73 kB kernel must be the problem because it was the biggest. Measured, in
+the same run, same device:
 
-### 13.6 Where this lands in the phase plan
+| kernel | size | time |
+|---|---|---|
+| the "slowest" | 16 kB | 28,287 ms |
+| the biggest | 154 kB | **366 ms** |
 
-R18 (below) is a **cross-cutting gate**, not a phase. Specifically:
+**85× faster at 9.4× the size.** Whatever costs the time, it is not code volume,
+and a kernel diet aimed at byte count would have been effort spent in the wrong
+place. (Part of that gap is queueing per §13.3 — but a 154 kB kernel finishing in
+366 ms while a 16 kB one takes 28 s cannot be explained by size under any
+apportionment.)
 
-- **Now, in Phase 5:** build `probe:gi-boot` and record the cold/warm split. Do
-  not fix anything yet. If SRC's kernels are already thin, this budget may be
-  mostly bought by Phase 7 and the remaining work is item 3 alone.
-- **Phase 6 (parity sign-off):** startup is a sign-off metric alongside falloff,
-  flicker and game perf. A backend that renders identically but takes 40 s to
-  appear does not ship as the default.
-- **Phase 7 (deletion sweep):** re-measure. The sweep's whole point is removing
-  code, and this is where the kernel-breadth lever is collected.
+### 13.5 THE CACHE: IT WORKED ONCE, SPECTACULARLY, AND WILL NOT DO IT AGAIN
 
-### 13.7 The rule (append to §3)
+§13.4's first version made cold-vs-warm item 1, on the reasoning that everything
+else was conditional on it. That was right, and the answer is genuinely strange.
 
-> **R18. GI initialization is ≤ 1 second to first correct frame.** Measured, not
-> asserted, by `probe:gi-boot`, on the user's real project. As of 2026-08-10 the
-> figure is 45–90 s and **~98% of it is WGSL compilation** — the CPU side (voxelize
-> 49 ms, BVH 777 ms, setup 873 ms) already fits with room to spare. So this rule
-> constrains SHADER SHAPE first and algorithms second: every new kernel is a
-> startup cost, every branch in a hot kernel is compile time, and "one more mode
-> in the big kernel" is the decision this rule exists to make expensive.
+- Reproducibly, **warm ≈ cold**: 54,451 ms vs 54,943 ms, and two back-to-back
+  warm runs agree. On that evidence the cache does nothing.
+- But **one run compiled the whole set warm**: slowest pipeline **474 ms**, all
+  70 summed to 7.8 s — against 43,876 ms for the same kernel a run earlier. That
+  is a ~90× cache hit, so the mechanism plainly exists and works.
+
+So the finding is not "the cache does not help" but **"the cache does not
+reliably engage"**, which is a lever in its own right and an open question:
+Chrome may flush its GPU disk cache only on clean shutdown (puppeteer's
+`browser.close()` may not qualify), or it may be size-capped and thrashing on a
+~180 kB working set. Worth answering, because a reliably warm cache is the
+difference between 55 s and ~8 s without touching a single kernel.
+
+### 13.6 The levers, re-ranked from the measurement
+
+1. **PIPELINE COUNT.** §13.3: a serialized queue makes total work ≈ count ×
+   average. 29 compute pipelines is the number to attack, and SRC is
+   structurally better placed than the dense backend here — §12.9/§12.10 already
+   deleted the dense transport and the SDF, and Phase 7 collapses the rayHit
+   ladder. **This is the measurement Phase 7 owes.**
+2. **MAKE THE CACHE ENGAGE RELIABLY** (§13.5). Potentially ~7× for zero
+   algorithmic change, and it is a question, not yet a fix.
+3. **Compile only what frame 1 needs.** The wave prewarms every kernel before
+   resuming. A staged ramp trades a partial first frame for latency — a startup
+   RAMP, not a per-frame flip, so R1 permits it, but it must degrade continuously
+   (a missing kernel means a dimmer frame, never a black or popping one).
+4. **The 603–701 ms resume recompile** the log has been flagging as unfixed
+   (*"pipelines recompiled at resume… report this"*). It is 60–70% of the budget
+   on its own once the rest is fixed, so it matters last and blocks last.
+5. **Permutations** — anything compiled per quality tier, material bucket or
+   ray-hit mode multiplies the count that item 1 is about.
+
+**Explicitly NOT levers, measured:** the CPU work (3.4%), WGSL byte count
+(§13.4), and async concurrency (§13.3).
+
+### 13.7 Where this lands in the phase plan
+
+R18 is a cross-cutting gate, not a phase:
+
+- **Phase 5 (now):** `probe:gi-boot` exists and the baseline is recorded. No fix
+  yet — item 1's answer is mostly a Phase 7 outcome, and fixing before the sweep
+  would be optimizing code that is about to be deleted.
+- **Phase 6:** startup is a sign-off metric beside falloff, flicker and game
+  perf. A backend that renders identically but takes 55 s to appear does not ship
+  as the default.
+- **Phase 7:** re-measure. The sweep is where pipeline count actually falls.
+
+### 13.8 ⚠ WHAT THE FIRST VERSION OF THIS SECTION GOT WRONG, AND HOW
+
+Written from the engine's own aggregate log lines, published, and then
+contradicted by the probe built to confirm it. Four errors, all of one kind:
+
+- **"~98% of startup is the WGSL compiler."** Came from `[gi] compile wave:
+  computes 86880ms` — a log that measures the whole compute phase, not pipeline
+  creation. Directionally survivable (83% of the span is pipeline-busy) but the
+  number was not measured, and R18's rule text quoted it as if it were.
+- **"5 kernels, 183 kB."** `[gi] compute kernels` counts only `state.queue`.
+  There are **29** compute pipelines. 24 were invisible to the instrument that
+  the conclusion was drawn from — which is why a "3-pipeline" wave took 86 s.
+- **"Kernel breadth is lever 2."** Refuted by §13.4: size does not predict cost.
+- **"Cold vs warm: 1.0×, the cache is not the lever."** An artifact of the
+  harness: the parallel session was landing `occupancyField.js` edits *during*
+  those runs, so the WGSL changed between them and every "warm" arm was cold.
+  R15 says never edit `src/modules/gi` while a harness runs; it applies to the
+  OTHER session's edits too, which is a rule this project had not needed before
+  two sessions shared a branch.
+
+And three bugs in the probe itself, each of which produced a confident wrong
+number before it was caught — recorded in `run-gi-boot-probe.mjs`'s header: the
+sum of concurrent async compiles reported as a cost (149% of TTFF), a `t0`
+anchored on the first `[gi]` line of the whole session (which made TTFF read 50 s
+on a run where every pipeline finished in 550 ms), and a `\b` that survived three
+layers of quoting as a literal backspace byte.
+
+**The transferable lesson is the one §12.26 keeps re-teaching:** an aggregate
+number that names a stage is not a measurement of that stage, and the instrument
+that would have said so is usually one level finer than the one already in the
+log.
