@@ -41,7 +41,7 @@
 // docs/GI_SRC_REBUILD_PLAN.md §4.1, §4.2, §7 Phase 1.
 
 import * as THREE from "three/webgpu";
-import { ivec2, step, texture, uniform, vec3 } from "three/tsl";
+import { float, ivec2, step, texture, uniform, vec3 } from "three/tsl";
 import { CASCADE_COUNT, MAX_LODS, SRC_QUALITY, TEMPORAL_ALPHA, W0, srcQualityTier } from "./srcConfig.js";
 import { createSrcProbeGizmos } from "./srcGizmos.js";
 import { R2_ALPHA1_FX, R2_ALPHA2_FX } from "./srcMath.js";
@@ -52,12 +52,13 @@ import {
   formatSrcProbeStats,
   readSrcProbeStats,
 } from "./srcProbes.js";
-import { createSrcBinStore, createSrcDepositFrame } from "./srcDeposit.js";
+import { createSrcBinStore, createSrcDepositFrame, createSrcShadeCounters } from "./srcDeposit.js";
+import { createSrcHitShader } from "./srcShade.js";
 import { createSrcMergeFrame, formatSrcMerge } from "./srcMerge.js";
 import { createSrcScreenGather, formatSrcGather } from "./srcScreenGather.js";
 import { createSrcTileAtlas, formatSrcTiles } from "./srcTiles.js";
 import { createSrcRayFrame, createSrcRayStore } from "./srcRays.js";
-import { createSrcSceneTrace } from "./srcTrace.js";
+import { createSrcSceneTrace, createSrcVisibility, ifMoverHit, moverSurfaceAt } from "./srcTrace.js";
 
 /** Camera drift, in units of s₀, that triggers a re-anchor. */
 const REANCHOR_CHEBYSHEV = 64;
@@ -102,8 +103,18 @@ function expectedC0Probes(pixelCount) {
  *   the only part of SRC that touches the medium so far. The standalone gate
  *   pages have no engine and therefore no volume; they build the frame and
  *   nothing else, which is what keeps them standalone.
+ * @param {object} [options.lighting]  `{ sun, emitters }` for hit shading —
+ *   `sun` is `{direction, irradiance}` (direction TOWARD the light), `emitters`
+ *   is `giLight.js`'s slot array. Phase 5. See `shadeHit` below for why this and
+ *   `staticSurfaceAt` are two arguments rather than one switch.
+ * @param {(hit, dir) => object} [options.staticSurfaceAt]  albedo/emissive/
+ *   emitter for a STATIC hit — `srcSurface.js`. Movers do not need it; they
+ *   carry their surface in their own object header.
  */
-export function createSrcProbeSystem({ gbuffer, width, height, props = null, volume = null, sky = null } = {}) {
+export function createSrcProbeSystem({
+  gbuffer, width, height, props = null, volume = null, sky = null,
+  lighting = null, staticSurfaceAt = null,
+} = {}) {
   const tier = SRC_QUALITY[srcQualityTier(props)];
   const spacing0 = Number(globalThis.__giSrcSpacing0) || tier.spacing0;
   const pixelCount = width * height;
@@ -252,6 +263,77 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null, vol
   // COUNTS its own clamps so the decision gets made from a measurement.
   const lmaxU = uniform(Number(globalThis.__giSrcLmax) || 16);
   const binStore = volume?.occupancyField ? createSrcBinStore(store, { w0: W0 }) : null;
+
+  // ── [E']: HIT SHADING (plan §7 Phase 5, §12.26) ───────────────────────────
+  //
+  // OPT-IN, and gated on having something to shade WITH as well as a flag.
+  // `__giSrcShade` off, or no `lighting`, or no `staticSurfaceAt`, and
+  // `shadeHit` stays null — which keeps this build byte-identical and keeps
+  // every gate written before Phase 5 comparable, exactly as `__giSrcProbes`
+  // does for the population.
+  //
+  // **THE TWO ARGUMENTS ARE NOT ONE SWITCH.** `staticSurfaceAt` is the other
+  // half of Phase 5 and lives in `srcSurface.js`: §12.9 deleted the coarse
+  // surface-attribution grid, so there is currently no path on the GPU from a
+  // static hit to its material. Shading with `lighting` alone would light the
+  // whole static world at one default albedo — a grey-box bounce that looks
+  // plausible, is wrong everywhere, and would be read as a shader bug rather
+  // than a missing input. `STAT_UNATTRIBUTED` counts it if it ever happens.
+  const shadeEnabled = globalThis.__giSrcShade === true && !!lighting && !!staticSurfaceAt;
+  const shadeHit = shadeEnabled && binStore
+    ? createSrcHitShader({
+        // Provenance lives HERE and nowhere else — `srcShade.js` never asks
+        // whether a hit moved. A mover-shaped `if` inside the shader is the
+        // shape of the bug where a moving crate lights the room differently from
+        // the identical static one beside it (§12.26.1).
+        surfaceAt: (hit, dir) => {
+          const s = staticSurfaceAt(hit, dir);
+          const albedo = vec3(s.albedo).toVar();
+          const emissive = vec3(s.emissive).toVar();
+          const emitter = float(s.emitter).toVar();
+          const valid = float(s.valid ?? 1).toVar();
+          // A mover overwrites all four. Its emissive is ALREADY zeroed at bake
+          // time when it was promoted to an analytic emitter slot
+          // (`dynamicObjects`' `writeSurface`, `promoted ? 0 : k`), so it wants
+          // no flag: the promotion set is the NEE set, and the surface it
+          // publishes is the half of the handoff the ray path is meant to carry.
+          ifMoverHit(hit.dynObj, () => {
+            const m = moverSurfaceAt(volume.occupancyField, hit.dynObj);
+            if (m) {
+              albedo.assign(m.surface.albedo);
+              emissive.assign(m.surface.emissive);
+              emitter.assign(float(-1));
+              valid.assign(float(1));
+            }
+          });
+          return { position: hit.exactPosition, normal: hit.normal, albedo, emissive, emitter, valid };
+        },
+        sun: lighting.sun ?? null,
+        emitters: lighting.emitters ?? [],
+        visibility: createSrcVisibility(volume.occupancyField, volume.world, {
+          rayHitMode: volume.rayHitMode,
+          // A shadow ray is SHORTER than a diffuse one by construction — it
+          // stops at its source — so it does not inherit the 192 the primary
+          // budget was measured to need. Its own number is owed a measurement on
+          // a real scene; until then this is the marcher's own default.
+          steps: Number(globalThis.__giSrcShadowSteps) || 64,
+        }),
+        voxelSize: volume.world.minCell,
+        // [J] is not built yet, so this is a single bounce and R4's ceiling has
+        // no loop to bound. It still applies — the ceiling is a property of the
+        // albedo, not of the loop, and turning it on later must not change what
+        // one bounce looks like.
+        secondary: null,
+        // One NEE sample, and it is not a quality dial yet. With importance =
+        // contribution the one-sample estimator IS the exact sum (§12.26.5), so
+        // every extra sample buys only visibility variance — and the tiers have
+        // no measurement to set it from. `__giSrcNeeSamples` is the A/B until
+        // one exists; stratification means 1 → 4 cuts the standard error 2.61×
+        // where independent draws would give 2.00×.
+        neeSamples: Math.max(1, Number(globalThis.__giSrcNeeSamples) || 1),
+        count: createSrcShadeCounters(binStore),
+      })
+    : null;
   const deposit = binStore
     ? createSrcDepositFrame(store, binStore, {
         pixelProbe: frame.pixelProbe,
@@ -259,11 +341,11 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null, vol
         pixelCount,
         raysPerPixel: tier.raysPerPixel,
         lmax: lmaxU,
-        // NO HIT SHADING YET — Phase 5 (plan §7). With radiance zero, what
-        // survives the resolve is transmittance, and a receiver lit by
-        // transmittance alone against the sky is ambient occlusion. That is
-        // §7's "AO-like short-range bounce", not a placeholder.
-        shadeHit: null,
+        // Null unless [E'] above was built. With radiance zero, what survives
+        // the resolve is transmittance, and a receiver lit by transmittance
+        // alone against the sky is ambient occlusion. That is §7's "AO-like
+        // short-range bounce", not a placeholder.
+        shadeHit,
         trace: createSrcSceneTrace(volume.occupancyField, volume.world, {
           rayHitMode: volume.rayHitMode,
           // ── THE STEP BUDGET, MEASURED RATHER THAN INHERITED ──────────────
@@ -291,9 +373,10 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null, vol
           // this module (`composeFieldDynamics`), and a budget measured with
           // them excluded would be a budget for a medium nothing else traces.
           skipMovers: false,
-          // Nothing here shades a mover hit, and asking for the packed id costs
-          // the marcher its dynamic-object bookkeeping on every ray.
-          wantDynObj: false,
+          // The packed mover id costs the marcher its dynamic-object bookkeeping
+          // on every ray, so it is asked for only when something reads it — and
+          // the only reader is the hit shader's `surfaceAt`.
+          wantDynObj: shadeEnabled,
         }),
         readPixel,
         readNormal,
