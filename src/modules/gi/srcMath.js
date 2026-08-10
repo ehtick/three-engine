@@ -395,6 +395,70 @@ export function mergeBin(selfL, selfT, parentL, parentT) {
 }
 
 /**
+ * One frame of temporal decay on one fixed-point accumulator word.
+ *
+ * The whole of the temporal blend is this line, applied to every word of every
+ * bin before the frame's deposits land on top. Radiance, transmittance and
+ * count all decay by the same factor, so `ΣL/Σcount` comes out an
+ * exponentially-weighted mean over RAYS — every ray carrying the weight of the
+ * frame it was cast in. `srcDeposit.js`'s decay pass is the TSL twin.
+ *
+ * ══ IT ROUNDS, AND THE FIRST VERSION TRUNCATED — WHICH ATE DIM LIGHT ════════
+ *
+ * A decaying integer accumulator does not settle on a point but inside an
+ * INTERVAL: `x = decay(x) + r` holds for a range of `x`, and which value a bin
+ * lands on depends on its own history. The intervals are what separate the two
+ * operators, in width and in placement:
+ *
+ *     truncation   x ∈ ( r/α − 1/α ,  r/α ]          entirely BELOW the truth
+ *     rounding     x ∈ [ r/α − 0.5/α, r/α + 0.5/α )  half as wide, STRADDLING it
+ *
+ * Either way the error is a fixed number of QUANTA, which makes it a RELATIVE
+ * error inversely proportional to the signal. But a gather averages many bins,
+ * so a two-sided error cancels there and a one-sided one accumulates into a
+ * systematic darkening of the whole image. `test:gi-src-temporal` measures both
+ * — converging from zero, as a fresh bin does, lands at the bottom of each
+ * interval, and the shape is the point:
+ *
+ *      influx r/frame     6      65     650    6500   65536
+ *      truncated     -15.0%   -1.39%  -0.14%  -0.014%  -0.001%
+ *      rounded        -6.7%   -0.62%  -0.06%  -0.006%  -0.001%
+ *
+ * `r` is `(L/Lmax)·2^F` per deposit, so truncation is a systematic DARKENING
+ * that grows as the light gets dimmer — the worst possible direction for a
+ * global illumination term, where dim and indirect is the whole subject.
+ * Rounding halves the magnitude and, more usefully, makes what is left cancel. The rest of the lever is `Lmax`: it is the exposure the
+ * fixed point is measured against, and §12.13.4 left clamp-versus-auto-exposure
+ * open pending a measurement. This is a second reason to close it, and it does
+ * not bind yet — hit shading is Phase 5, so every radiance word is currently
+ * zero and only `T` and `count` accumulate, both at full scale and both under
+ * 0.002%.
+ *
+ * ══ ROUNDING HAS A FIXED POINT, AND `MIN_WEIGHT` ALREADY COVERS IT ══════════
+ *
+ * `round(x·keep) = x` for every `x ≤ 0.5/(1−keep)` — five, at keep = 0.9 — so a
+ * rounded accumulator decays into single digits and STOPS. Truncation has no
+ * such fixed point, and that was the whole argument for it. It stops mattering
+ * once the resolve tests a WEIGHT FLOOR rather than zero, which `srcDeposit.js`
+ * needs for an unrelated reason (its resolve header: the radiance word retires
+ * before the count does, so an unfloored tail votes black). `MIN_WEIGHT` is 1024
+ * against a residue of 5 — a 200× margin, asserted rather than assumed.
+ *
+ * ══ f32, EXPLICITLY, BECAUSE THE GPU'S `keep` IS AN f32 UNIFORM ═════════════
+ *
+ * `Math.fround` at every step, so the mirror computes what the kernel computes
+ * rather than what the same expression means in f64. It happens to be
+ * unnecessary at keep = 0.9 — the f32 product's half-ulp is wider than the gap
+ * between the two constants, so both land on the same integer — but that is a
+ * property of one α, and a twin that agrees for a reason nobody wrote down is a
+ * twin that stops agreeing when somebody changes the number.
+ */
+export function decayFixed(x, keep) {
+  const p = Math.fround(Math.fround(x) * Math.fround(keep));
+  return Math.floor(Math.fround(p + 0.5));
+}
+
+/**
  * Resolve a fixed-point deposit accumulator into a filterable value.
  *
  * ZERO-COUNT BINS ARE NOT ZERO — they are UNKNOWN, and the difference is the

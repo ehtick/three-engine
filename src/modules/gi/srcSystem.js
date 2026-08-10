@@ -42,7 +42,7 @@
 
 import * as THREE from "three/webgpu";
 import { ivec2, step, texture, uniform, vec3 } from "three/tsl";
-import { CASCADE_COUNT, MAX_LODS, SRC_QUALITY, W0, srcQualityTier } from "./srcConfig.js";
+import { CASCADE_COUNT, MAX_LODS, SRC_QUALITY, TEMPORAL_ALPHA, W0, srcQualityTier } from "./srcConfig.js";
 import { createSrcProbeGizmos } from "./srcGizmos.js";
 import { R2_ALPHA1_FX, R2_ALPHA2_FX } from "./srcMath.js";
 import {
@@ -176,6 +176,27 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null, vol
   // stay the single validity test.
   const readNormal = (i) => readPixel(i).normal;
 
+  // ── THE TEMPORAL BLEND (plan §4.6) ────────────────────────────────────────
+  //
+  // `keep` is 1 − α, applied to every deposit accumulator before this frame's
+  // rays land on top; `srcDeposit.js`'s header argues the placement. The frame
+  // stamp goes to the probe frame AND the deposit frame as ONE node, because
+  // its whole job is to let the decay recognize a block the compaction claimed
+  // moments earlier — two counters that agreed most of the time would be worse
+  // than none, since the disagreement shows up as a new probe wearing a dead
+  // one's light rather than as anything that looks like a bug.
+  //
+  // `__giSrcAlpha` is the harness override, and `1` is single-frame mode.
+  const alpha = Number.isFinite(Number(globalThis.__giSrcAlpha))
+    ? Math.min(1, Math.max(0, Number(globalThis.__giSrcAlpha)))
+    : TEMPORAL_ALPHA;
+  const keepU = uniform(1 - alpha);
+  // Starts at 1, not 0: an unclaimed block's stamp is 0, and a frame counter
+  // that also started there would call every block in the pool fresh on frame
+  // zero. Harmless in fact (an unclaimed block holds zeros, which zero to
+  // zeros) and not worth relying on.
+  const frameStampU = uniform(1, "uint");
+
   const frame = createSrcProbeFrame(store, {
     spacing0,
     camera: vec3(cameraU),
@@ -183,6 +204,7 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null, vol
     pixelCount,
     maxLods: MAX_LODS,
     readPixel,
+    frameStamp: frameStampU,
   });
 
   // The gizmos share the SAME anchor uniform, not a copy. A gizmo lattice
@@ -271,6 +293,8 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null, vol
         spacing0,
         jitterX: jitterXU,
         jitterY: jitterYU,
+        keep: keepU,
+        frameStamp: frameStampU,
         maxLods: MAX_LODS,
       })
     : null;
@@ -404,6 +428,12 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null, vol
       // (the picture would simply stop improving).
       jitterXU.value = (jitterXU.value + R2_ALPHA1_FX) >>> 0;
       jitterYU.value = (jitterYU.value + R2_ALPHA2_FX) >>> 0;
+      // The stamp advances with the jitter and for the same reason: both are
+      // "which frame is this", and the decay pass compares against it exactly.
+      // It wraps at 2^32 — 2.2 years at 60 fps, and the only consequence of a
+      // wrap is that a block untouched since the last lap gets zeroed instead
+      // of decayed, which is what a block untouched for 2.2 years deserves.
+      frameStampU.value = (frameStampU.value + 1) >>> 0;
       const a = anchorU.value;
       const drift = Math.max(
         Math.abs(cameraU.value.x - a.x),

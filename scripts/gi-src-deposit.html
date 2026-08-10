@@ -423,12 +423,17 @@
               const blockBase = info.binBase + block * info.bins;
               for (let m = 0; m < info.bins; m++) {
                 const b = (blockBase + m) * D.BIN_WORDS;
-                const n = scratchRaw[b + D.BIN_COUNT] >>> 0;
+                // COUNT AND T ARE FIXED-POINT WEIGHTS since the temporal blend
+                // (`srcDeposit.js`'s header). Dividing here rather than at every
+                // comparison keeps the mirror diff in RAYS, which is the unit
+                // the mirror counts in — and on a single frame with no history
+                // the division is exact, so the arms stay integer comparisons.
+                const n = (scratchRaw[b + D.BIN_COUNT] >>> 0) / D.DEPOSIT_SCALE;
                 if (n === 0) continue;
                 const r = scratchRaw[b + D.BIN_R] >>> 0;
                 const g = scratchRaw[b + D.BIN_G] >>> 0;
                 const bl = scratchRaw[b + D.BIN_B] >>> 0;
-                const t = scratchRaw[b + D.BIN_T] >>> 0;
+                const t = (scratchRaw[b + D.BIN_T] >>> 0) / D.DEPOSIT_SCALE;
                 maxAcc = Math.max(maxAcc, r, g, bl);
                 maxCount = Math.max(maxCount, n);
                 deposits += n;

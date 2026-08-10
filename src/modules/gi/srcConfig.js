@@ -85,13 +85,25 @@ export const IRRADIANCE_TILE_SIZE =
 export const SECONDARY_LOD_OFFSET = 2;
 
 /**
- * Temporal blend rates (plan §4.6). `FRESH` is the fast-α warmup path for a
- * probe younger than FRESH_FRAMES — R6: an EMA smooths VALUES, not
- * MEMBERSHIP, so a newborn probe must not crawl up from zero.
+ * Temporal blend rate (plan §4.6), applied to the DEPOSIT ACCUMULATORS rather
+ * than to the resolved payload — see `srcDeposit.js`'s decay pass for why the
+ * plan's placement stopped being available once [G] merged in place, and why
+ * this placement is the better one anyway.
+ *
+ * **THERE IS NO FAST-α WARMUP, AND R6 IS SATISFIED WITHOUT ONE.** The plan
+ * carried `ALPHA_FRESH = 0.3` / `FRESH_FRAMES = 8` because a payload EMA
+ * (`H ← (1−α)·H + α·S`) starting from `H = 0` gives a newborn probe `0.1·S` on
+ * its first frame and makes it crawl up from black over ~20 frames — exactly
+ * the "smooths MEMBERSHIP, not values" failure R6 names. Decaying the
+ * accumulators has no such state: a fresh block's sums are zero, so its first
+ * frame resolves to `ΣL/Σcount` over that frame's own rays and nothing else.
+ * The estimate is weighted by EVIDENCE rather than by frame count, which is
+ * what makes the warmup unnecessary rather than merely cheap.
+ *
+ * `1` is single-frame mode — the quality-gate configuration of §4.6, and here
+ * it is not a code path but the α = 1 case of the same multiply.
  */
-export const ALPHA_STEADY = 0.1;
-export const ALPHA_FRESH = 0.3;
-export const FRESH_FRAMES = 8;
+export const TEMPORAL_ALPHA = 0.1;
 
 /** Frames a probe survives unseen before the per-frame rebuild stops re-inserting it. */
 export const PROBE_MAX_AGE = 60;

@@ -26,10 +26,53 @@
 // cascade** (the probes÷4 and bins×4 per level cancel), and F=16 overflows only
 // at 65,536 saturated rays in ONE bin — about 84,000× the measured average.
 //
-// TRANSMITTANCE IS NOT FIXED POINT. Every deposit's T is exactly 0 or 1, so
-// `sumT` is an integer count of clear deposits and `T = sumT/count` is exact.
-// Spending fixed-point bits on a value that only ever takes two integer values
-// would be precision theatre.
+// TRANSMITTANCE AND COUNT ARE FIXED POINT TOO — but only since the temporal
+// blend, and for a reason that has nothing to do with precision. Every deposit's
+// T is exactly 0 or 1, so before Phase 4 `sumT` was an integer count of clear
+// deposits and `T = sumT/count` was exact with no scale at all. Then the decay
+// arrived, and `floor(1 · 0.9) = 0`: a count of ONE — which at 0.78 rays/bin is
+// the common case, not the corner — would drop to zero on the very next frame
+// and the bin would go back to UNKNOWN having just been sampled. So both words
+// carry `DEPOSIT_F` fractional bits, the same as radiance, and they are no
+// longer counts but WEIGHTS. The scale then cancels out of `L = ΣR/Σcount`
+// exactly (`toL` is `Lmax/count`, with no `2^F` in it at all), so the resolve
+// got simpler rather than more complicated.
+//
+// ══ THE TEMPORAL BLEND LIVES HERE, NOT ON THE RESOLVED PAYLOAD ══════════════
+//
+// Plan §4.1 [F] put it on the payload — "temporal blend with resident probe
+// history" — and §4.2 sized `binPayload` to match, as "the resolved payload plus
+// the pre-averaged cone mirror written by the merge". [G] then merged IN PLACE
+// (§12.20.1, worth 22 MB), which means the resolved payload does not survive its
+// own frame: by the time the next frame could blend against it, the merge has
+// overwritten it with `own + T · parent`.
+//
+// **Blending the merged payload in place is not merely inelegant, it multiplies
+// the parent's light by 1/α.** With `H ← (1−α)H + αS` and then `H ← H + T·P`,
+// the fixed point is `H = L + T·P/α` — at α = 0.1 the whole cascade above a
+// probe arrives ten times over. The alternative that keeps the plan's placement
+// is a second payload buffer, giving back exactly the 22 MB [G] saved.
+//
+// So the blend moves one stage EARLIER, onto the accumulators, where it is
+// better on three counts and worse on none:
+//
+//   1. **It weights by EVIDENCE.** A payload EMA gives one frame's single ray
+//      the same weight as another frame's twenty. Decaying the sums and the
+//      count together makes `ΣR/Σcount` an exponentially-weighted mean over
+//      RAYS. At §12.13.4's measured 0.78 rays/bin this is the difference
+//      between an average and a lottery.
+//   2. **It needs no warmup path.** See `TEMPORAL_ALPHA` in srcConfig — a fresh
+//      block's sums are zero, so its first frame resolves to that frame's own
+//      rays, at full weight, with nothing to crawl up from. R6 for free.
+//   3. **α = 1 is the code, not a branch.** `keep = 0` zeroes every word, which
+//      is precisely the clear pass this replaced. Single-frame mode — §4.6's
+//      quality-gate configuration — is one uniform, and every single-frame gate
+//      in the suite is unaffected whatever α is set to, because frame one has no
+//      history either way.
+//
+// It costs a read where the clear only wrote, and one word per bin block (the
+// claim stamp, in the probe store's pool buffer) so a reclaimed block starts
+// empty instead of inheriting a dead probe's answer.
 //
 // ══ Lmax IS STILL AN OPEN DECISION, AND THIS FILE MEASURES IT ═══════════════
 //
@@ -90,13 +133,20 @@ import {
 export const BIN_R = 0;
 export const BIN_G = 1;
 export const BIN_B = 2;
-export const BIN_T = 3;     // integer COUNT of clear deposits, not fixed point
-export const BIN_COUNT = 4;
+export const BIN_T = 3;     // fixed-point WEIGHT of clear deposits
+export const BIN_COUNT = 4;  // fixed-point WEIGHT of all deposits
 export const BIN_WORDS = 5;
 
 /** Fractional bits in the radiance accumulator. §12.13.4 measured this. */
 export const DEPOSIT_F = 16;
-const DEPOSIT_SCALE = 1 << DEPOSIT_F;
+export const DEPOSIT_SCALE = 1 << DEPOSIT_F;
+
+/**
+ * Accumulated weight below which a bin is UNKNOWN rather than dim — one
+ * sixty-fourth of a single ray. Only reachable under temporal decay; the
+ * resolve's header says what goes wrong without it.
+ */
+export const MIN_WEIGHT = DEPOSIT_SCALE >> 6;
 
 /** Resolved payload: rgb + transmittance, with T < 0 meaning UNKNOWN. */
 export const PAYLOAD_WORDS = 4;
@@ -156,6 +206,13 @@ export function createSrcBinStore(store, { w0 = W0, maxBytes = 128 * 1024 * 1024
       width: binGridWidth(c.cascade, w0),
       binBase: binTotal,
       blockCapacity: c.blockCapacity,
+      // Where this cascade's blocks start in the pool's INDEX space, which is
+      // not the same as `binBase` (bin space) and is what addresses the claim
+      // stamps. Copied from the probe store rather than recomputed — the decay
+      // pass read `undefined` here for one round of the temporal gate and
+      // silently indexed `freeStack[NaN]`, which resolves to the probe free
+      // stack and compares probe indices against a frame number.
+      blockBase: c.blockBase,
       probeBase: c.probeBase,
       probeCapacity: c.probeCapacity,
     });
@@ -209,6 +266,11 @@ export function createSrcBinStore(store, { w0 = W0, maxBytes = 128 * 1024 * 1024
  * @param {(hit, dir) => object} [options.shadeHit]  vec3 radiance at a hit.
  *   Phase 5. Default black — see the header.
  * @param {object} options.lmax  uniform: the radiance the fixed point saturates at
+ * @param {Node} [options.keep]  the temporal blend's `1 − α`, applied to every
+ *   accumulator before this frame's deposits land. Default 0, which is the
+ *   single-frame behaviour every gate written before Phase 4 assumes.
+ * @param {Node} [options.frameStamp]  the frame number `createSrcProbeFrame`
+ *   stamps onto freshly claimed blocks. Must be the same node.
  */
 export function createSrcDepositFrame(store, bins, {
   pixelProbe,
@@ -224,35 +286,68 @@ export function createSrcDepositFrame(store, bins, {
   lmax,
   jitterX,
   jitterY,
+  keep = null,
+  frameStamp = null,
   maxLods = MAX_LODS,
 } = {}) {
-  const { probeTable } = store;
+  const { probeTable, freeStack } = store;
   const { scratch, payload, stats, binTotal, w0 } = bins;
   const N = store.cascadeCount ?? CASCADE_COUNT;
+  const stampBase = store.blockStampBase;
   const passes = [];
 
-  // ── clear ─────────────────────────────────────────────────────────────────
-  // Every allocated bin, every frame — and it STAYS that way now that blocks
-  // are claimed, which is worth stating because §12.18.3 predicted otherwise.
+  // ── decay ─────────────────────────────────────────────────────────────────
+  // Every allocated bin, every frame, exactly where the clear pass used to be —
+  // it is the clear pass, with `0` generalized to `keep`. See the header for why
+  // the temporal blend is here rather than on the resolved payload.
   //
-  // The plan expected the claiming thread's own zeroing to delete this pass
-  // ("a freshly claimed block must be zeroed before the first deposit lands in
-  // it"). That is true and it is not sufficient: these accumulators are a
-  // SINGLE FRAME's estimate, so they need zeroing on every frame a probe
-  // survives, not only on the frame it was born. Claim-time zeroing would be
-  // correct for a persistent accumulator and this is not one — Phase 4's
-  // temporal blend belongs on the RESOLVED payload, where an EMA smooths values
-  // rather than sums.
+  // **A CLAIMED BLOCK IS ZEROED, NOT DECAYED, AND THE STAMP IS HOW IT KNOWS.**
+  // The accumulators are persistent now, so a block handed to a new probe still
+  // holds the dead probe's history — geometrically unrelated, and it would fade
+  // in over ~1/α frames rather than being discarded. `createCompactPass` stamps
+  // the frame number onto every block it claims, and a stamp that equals THIS
+  // frame's makes `keep` zero. No fresh-block list, no second dispatch, no
+  // ordering subtlety: the claim runs three dispatches before this one and the
+  // stamp goes stale by itself.
   //
-  // What the claim actually buys here is that the buffer is 2.6× smaller
-  // (3.67 M bins → 1.40 M at the engine default), so the pass costs 2.6× less
-  // for the same reason everything else does. The claiming thread does not zero
-  // its block either, and does not need to: compaction runs three dispatches
-  // before this, so every block claimed this frame is cleared by it anyway.
+  // ROUND, DO NOT TRUNCATE — `srcMath.js`'s `decayFixed` header carries the
+  // measurement. A truncating decay settles one quantum per frame short of its
+  // true steady state, which is an ABSOLUTE deficit and therefore a relative
+  // darkening that grows as the light dims: −15% at a six-quantum influx. The
+  // fixed point rounding brings with it (an accumulator parks at ≤ 5 and stops)
+  // is covered 200× over by `MIN_WEIGHT`, which the resolve needs anyway.
+  //
+  // f32 is exact enough for the multiply. A u32 past 2^24 loses bits on the way
+  // into a float, but the loss is relative-2e-7 against a rounding deficit three
+  // orders larger.
   passes.push(Fn(() => {
     const i = instanceIndex.toVar();
     const b = i.mul(BIN_WORDS).toVar();
-    for (let w = 0; w < BIN_WORDS; w++) atomicStore(scratch.element(b.add(uint(w))), uint(0));
+    const k = float(keep ?? 0).toVar();
+    if (keep && frameStamp) {
+      // Which block owns this bin. The cascades partition `binTotal` at bases
+      // known when the graph is built, so this is a chain of at most four
+      // comparisons against JS constants, not a search.
+      for (const info of bins.cascades) {
+        const lo = info.binBase;
+        const hi = lo + info.bins * info.blockCapacity;
+        const base = stampBase + info.blockBase;
+        // A NaN here compiles, runs, and reads the probe free stack — see
+        // `blockBase`'s note in `createSrcBinStore`. Cheap to make impossible.
+        if (!Number.isInteger(base)) {
+          throw new Error(`createSrcDepositFrame: cascade ${info.cascade} has no block base`);
+        }
+        If(i.greaterThanEqual(uint(lo)).and(i.lessThan(uint(hi))), () => {
+          const block = i.sub(uint(lo)).div(uint(info.bins)).toVar();
+          const stamp = freeStack.element(uint(base).add(block)).toVar();
+          If(stamp.equal(frameStamp), () => { k.assign(float(0)); });
+        });
+      }
+    }
+    for (let w = 0; w < BIN_WORDS; w++) {
+      const e = scratch.element(b.add(uint(w)));
+      atomicStore(e, uint(floor(float(atomicLoad(e)).mul(k).add(0.5))));
+    }
     If(i.lessThan(uint(STAT_WORDS)), () => { atomicStore(stats.element(i), uint(0)); });
   })().compute(binTotal));
 
@@ -379,14 +474,18 @@ export function createSrcDepositFrame(store, bins, {
           // radiance. `c == own` — blocked here: the radiance, T = 0. Both
           // increment `count`, because a bin's count is how many rays SAMPLED
           // it, and a blocked sample is a sample.
+          //
+          // ONE RAY IS `DEPOSIT_SCALE`, not 1 — count and T are fixed-point
+          // weights so that the decay can take a fraction of them. A fresh ray
+          // therefore arrives at full weight, 2^F, and decays from there.
           If(int(c).lessThan(own), () => {
-            atomicAdd(scratch.element(slot.add(uint(BIN_T))), uint(1));
+            atomicAdd(scratch.element(slot.add(uint(BIN_T))), uint(DEPOSIT_SCALE));
           }).Else(() => {
             atomicAdd(scratch.element(slot.add(uint(BIN_R))), fx[0]);
             atomicAdd(scratch.element(slot.add(uint(BIN_G))), fx[1]);
             atomicAdd(scratch.element(slot.add(uint(BIN_B))), fx[2]);
           });
-          atomicAdd(scratch.element(slot.add(uint(BIN_COUNT))), uint(1));
+          atomicAdd(scratch.element(slot.add(uint(BIN_COUNT))), uint(DEPOSIT_SCALE));
           atomicAdd(stats.element(uint(STAT_DEPOSITS)), uint(1));
         });
       }
@@ -400,6 +499,26 @@ export function createSrcDepositFrame(store, bins, {
   // a hard cliff at the edge of every sparsely-sampled region, and the sparsity
   // table in §12.13.4 (0.78 rays per bin on average) is why that edge is
   // everywhere rather than exotic.
+  //
+  // ══ AND UNDER DECAY THE TEST IS A WEIGHT FLOOR, NOT A ZERO TEST ════════════
+  //
+  // A bin that stops being sampled does not stop reporting: its weight fades
+  // geometrically and `L = ΣR/Σcount` renormalizes by that same fading weight,
+  // so the bin keeps FULL confidence in an ever-staler answer. That alone would
+  // be defensible (it is the best information there is, and R1 prefers it to an
+  // absence). What is not defensible is where it ends up.
+  //
+  // **THE RADIANCE HITS ZERO BEFORE THE COUNT DOES.** `R` is `L/Lmax` of
+  // `count`, so for any bin dimmer than the ceiling `R` is the smaller number
+  // and truncation retires it first. The last few frames of a bin's life
+  // therefore read `R = 0, count = small` — full-confidence BLACK, which is
+  // precisely the dark vote R1 forbids, arriving by arithmetic rather than by
+  // anyone deciding it. `MIN_WEIGHT` retires the bin while `R` still has bits:
+  // a sixty-fourth of one ray, which is ~40 frames of not being sampled at
+  // α = 0.1, and quantizes `L` no coarser than `Lmax/1024`.
+  //
+  // At α = 1 every count is a whole number of rays, so the floor never binds and
+  // this is the zero test it always was.
   passes.push(Fn(() => {
     const i = instanceIndex.toVar();
     const b = i.mul(BIN_WORDS).toVar();
@@ -410,12 +529,15 @@ export function createSrcDepositFrame(store, bins, {
     // wrong picture. Free on every target we ship to (srcProbes.js says the
     // same about its own counters).
     const count = atomicLoad(scratch.element(b.add(uint(BIN_COUNT)))).toVar();
-    If(count.equal(uint(0)), () => {
+    If(count.lessThan(uint(MIN_WEIGHT)), () => {
       payload.element(o.add(uint(3))).assign(float(PAYLOAD_UNKNOWN));
       Return();
     });
     const inv = float(1).div(float(count)).toVar();
-    const toL = float(lmax).div(DEPOSIT_SCALE).mul(inv).toVar();
+    // `Lmax/count`, with NO `2^F` in it: radiance carries `2^F` per ray and
+    // count now carries `2^F` per ray as well, so the two scales cancel exactly
+    // and this stays a single multiply however the fixed point is retuned.
+    const toL = float(lmax).mul(inv).toVar();
     payload.element(o).assign(float(atomicLoad(scratch.element(b.add(uint(BIN_R))))).mul(toL));
     payload.element(o.add(uint(1))).assign(float(atomicLoad(scratch.element(b.add(uint(BIN_G))))).mul(toL));
     payload.element(o.add(uint(2))).assign(float(atomicLoad(scratch.element(b.add(uint(BIN_B))))).mul(toL));
@@ -425,6 +547,14 @@ export function createSrcDepositFrame(store, bins, {
 
   return {
     passes,
+    /**
+     * The decay pass on its own — `passes[0]`, named so a gate can age the
+     * accumulators without tracing anything. Nothing in the engine dispatches
+     * it separately, and the temporal gate's exact arm needs precisely that:
+     * one frame of deposits, then pure decay, where the recurrence is
+     * `floor(x·keep)` with no ray nondeterminism in it at all.
+     */
+    decay: passes[0],
     raysPerPixel,
 
     /** One frame's tallies. The `Lmax` decision's instrument — see the header. */

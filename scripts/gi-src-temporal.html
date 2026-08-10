@@ -1,0 +1,800 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>SRC temporal gate — the decaying deposit accumulator</title>
+    <style>html,body{margin:0;background:#111;color:#ddd;font:13px monospace}canvas{display:none}</style>
+  </head>
+  <body>
+    <canvas id="view" width="16" height="16"></canvas>
+    <pre id="log"></pre>
+    <script type="module">
+      // ══ THE PHASE-4 UNIT-1 GATE: TEMPORAL ACCUMULATION ═══════════════════
+      //
+      // Plan §4.6's exponential blend, which `srcDeposit.js` puts on the deposit
+      // ACCUMULATORS rather than on the resolved payload — its header argues the
+      // placement, and this file is what holds the arithmetic to it.
+      //
+      // ══ THE TRACE IS CONSTANT, AND THAT IS THE WHOLE DESIGN ═════════════
+      //
+      // The deposit gate keys its synthetic trace on the RAY INDEX, which is
+      // exactly right there and useless here: §12.13.3 established that the ray
+      // partition is scheduler-dependent, so a probe's ray indices differ
+      // between two runs of the same frame — and an index-keyed trace therefore
+      // feeds a DIFFERENT signal every frame, which is the one thing a test of
+      // temporal convergence cannot have.
+      //
+      // So every ray here hits at the same distance with the same radiance. Two
+      // properties follow, and both are load-bearing:
+      //
+      //   1. A bin's resolved value is INDEPENDENT of how many rays landed in
+      //      it, because `ΣR/Σcount` of a constant is that constant. The steady
+      //      arm is then exact under the shuffle rather than in spite of it —
+      //      the temporal twin of the furnace test.
+      //   2. The hit sits in cascade 2's interval, so c0 and c1 bins see only
+      //      pass-through deposits (L = 0, T = 1), c2 bins see only blocking
+      //      ones (L, T = 0), and c3 sees nothing. No bin mixes the two, so
+      //      every expected value is a closed form and not an average.
+      //
+      // And the arms that test the DECAY do not trace at all: one frame of
+      // deposits, then the decay pass alone, where the recurrence is exactly
+      // `decayFixed` and can be diffed word-for-word against `srcMath.js`'s own
+      // copy of it with no tolerance anywhere.
+      //
+      // ══ THE ARMS ════════════════════════════════════════════════════════
+      //
+      //   exact     every accumulator word, every frame of a pure decay, equal
+      //             to `decayFixed` iterated in JS. The mirror diff.
+      //   forget    the same run to the end: every bin goes UNKNOWN, and the
+      //             residue the rounding fixed point leaves behind is 200x
+      //             under the weight floor that retires it.
+      //   bias      the measurement that chose rounding over truncation: a
+      //             decaying accumulator settles a fixed number of QUANTA
+      //             short, which is a relative darkening that grows as the
+      //             light dims. Truncation costs 15% at a six-quantum influx.
+      //   dark      the tail's failure mode: `R` degrades before `count` does,
+      //             so an unfloored resolve reports full-confidence BLACK for
+      //             the last frames of a bin's life. Measures the error on the
+      //             last readable frame against the error just past it.
+      //   steady    a constant signal, K frames, α = 0.1: every known bin
+      //             resolves to exactly the single-frame value. This is what
+      //             proves the count and radiance scales cancel.
+      //   single    α = 1 leaves exactly one frame in the accumulators — the
+      //             clear pass this replaced, as a special case rather than a
+      //             branch.
+      //   bounded   `R ≤ count` in every bin at every readback, i.e. `L ≤ Lmax`
+      //             — the tail cannot manufacture a firefly.
+      //   reclaim   a block handed to a new probe starts EMPTY. Counts must be
+      //             whole rays; an inherited history is a fraction, and the
+      //             arm reports how much history the stamp actually discarded.
+      //   variance  the one arm that tests whether any of it is WORTH doing:
+      //             a genuinely noisy signal, and the frame-to-frame RMS of the
+      //             resolved payload at α = 1 against α = 0.1, held to the
+      //             `sqrt(α/(2−α))` an EMA of i.i.d. samples predicts.
+      //
+      // Run: node scripts/run-gi-src-temporal-test.mjs
+      const out = document.querySelector("#log");
+      const say = (line) => { out.textContent += line + "\n"; };
+      let failures = 0;
+      const check = (label, ok, detail = "") => {
+        say(`  ${ok ? "PASS" : "FAIL"} ${label}${detail ? ` — ${detail}` : ""}`);
+        if (!ok) failures++;
+      };
+      const fail = (error) => {
+        console.error("SRC-TEMPORAL FAIL", error?.stack ?? error?.message ?? String(error));
+        globalThis.__SRC_TEMPORAL_RESULT__ = {
+          pass: false, error: error?.message ?? String(error), text: out.textContent,
+        };
+      };
+      globalThis.addEventListener("error", (event) => fail(event.error ?? event.message));
+      globalThis.addEventListener("unhandledrejection", (event) => fail(event.reason));
+
+      try {
+        const THREE = await import("three/webgpu");
+        const TSL = await import("three/tsl");
+        const cfgMod = await import("/src/modules/gi/srcConfig.js");
+        const refMath = await import("/src/modules/gi/srcMath.js");
+        const M = await import("/src/modules/gi/srcMathTsl.js");
+        const P = await import("/src/modules/gi/srcProbes.js");
+        const R = await import("/src/modules/gi/srcRays.js");
+        const D = await import("/src/modules/gi/srcDeposit.js");
+
+        const { float, instancedArray, uint, uniform, vec3 } = TSL;
+
+        const renderer = new THREE.WebGPURenderer({ canvas: document.querySelector("#view") });
+        await renderer.init();
+        const device = renderer.backend.device;
+        const validationErrors = [];
+        device.addEventListener?.("uncapturederror", (event) => {
+          validationErrors.push(event.error?.message ?? String(event.error));
+          console.error("WebGPU validation error:", validationErrors.at(-1));
+        });
+
+        const rng = (() => {
+          let s = 0x1234567 >>> 0;
+          return () => {
+            s = (s + 0x6d2b79f5) >>> 0;
+            let t = s;
+            t = Math.imul(t ^ (t >>> 15), t | 1);
+            t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+            return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+          };
+        })();
+
+        const S0 = 0.5;
+        const CAM = [0, 1.4, -3];
+        const ANCHOR = [0.11, -0.37, 0.53];
+        const RAYS_PER_PIXEL = 1;
+        const LMAX = 16;
+        const PIXELS = 512;
+        const ALPHA = cfgMod.TEMPORAL_ALPHA;
+        const KEEP = 1 - ALPHA;
+        const SCALE = D.DEPOSIT_SCALE;
+
+        // The synthetic radiance, as the 12-bit integer the fixed point stores.
+        // 2000 of 65536 is 3% of Lmax — comfortably above the 1/1024 where the
+        // weight floor stops being the thing that retires a bin (see the DARK
+        // arm, which measures that boundary rather than assuming it).
+        const Q = 2000;
+        const L_CONST = Q * (LMAX / 65536);
+
+        // Every pixel inside LOD 0 (reach is 64·s₀ = 32 m since §12.19.2), on
+        // two facing planes so the probe set is compact and stable.
+        const pixels = [];
+        for (let i = 0; i < PIXELS; i++) {
+          const u = (rng() - 0.5) * 6;
+          const v = (rng() - 0.5) * 6;
+          pixels.push(i & 1
+            ? { position: [u, 0, v], normal: [0, 1, 0] }
+            : { position: [u, 2.6, v], normal: [0, -1, 0] });
+        }
+        // A SECOND, DISJOINT set for the reclaim arm — far enough that not one
+        // probe key survives, so every block really is handed on.
+        const pixels2 = [];
+        for (let i = 0; i < PIXELS; i++) {
+          const u = (rng() - 0.5) * 6;
+          const v = (rng() - 0.5) * 6;
+          pixels2.push(i & 1
+            ? { position: [u + 40, 0, v], normal: [0, 1, 0] }
+            : { position: [u + 40, 2.6, v], normal: [0, -1, 0] });
+        }
+
+        const attrs = new Float32Array(PIXELS * 8);
+        const loadPixels = (set) => {
+          for (let i = 0; i < PIXELS; i++) {
+            attrs[i * 8 + 0] = set[i].position[0];
+            attrs[i * 8 + 1] = set[i].position[1];
+            attrs[i * 8 + 2] = set[i].position[2];
+            attrs[i * 8 + 3] = 1;
+            attrs[i * 8 + 4] = set[i].normal[0];
+            attrs[i * 8 + 5] = set[i].normal[1];
+            attrs[i * 8 + 6] = set[i].normal[2];
+          }
+        };
+        loadPixels(pixels);
+        const posBuf = instancedArray(attrs.slice(), "vec4");
+        const setPixels = (set, valid = true) => {
+          const a = posBuf.value.array;
+          if (set) {
+            loadPixels(set);
+            a.set(attrs);
+          }
+          if (!valid) for (let i = 0; i < PIXELS; i++) a[i * 8 + 3] = 0;
+          posBuf.value.needsUpdate = true;
+        };
+        const readPixel = (i) => {
+          const t = posBuf.element(i.mul(2)).toVar();
+          return { position: t.xyz, valid: t.w.greaterThan(0.5) };
+        };
+        const readNormal = (i) => posBuf.element(i.mul(2).add(1)).xyz;
+
+        // ── the constant trace, in cascade 2's interval ──────────────────
+        const BOUNDS = cfgMod.intervalBoundaries(0, S0, cfgMod.CASCADE_COUNT);
+        const T_HIT = (BOUNDS[1] + BOUNDS[2]) / 2;
+        const OWN = cfgMod.CASCADE_COUNT - 2;   // = 2
+        const constTrace = () => ({
+          hit: float(1), t: float(T_HIT),
+          position: vec3(0), exactPosition: vec3(0), normal: vec3(0, 1, 0), dynObj: null,
+        });
+        const constShade = () => vec3(L_CONST, L_CONST, L_CONST);
+
+        const store = P.createSrcProbeStore({
+          c0Probes: 1024,
+          cascadeCount: cfgMod.CASCADE_COUNT,
+          blockCapacity: [512, 256, 128, 64],
+        });
+        const cameraU = uniform(new THREE.Vector3(...CAM));
+        const anchorU = uniform(new THREE.Vector3(...ANCHOR));
+        const lmaxU = uniform(LMAX);
+        const keepU = uniform(KEEP);
+        const frameStampU = uniform(1, "uint");
+        const jitterXU = uniform(0, "uint");
+        const jitterYU = uniform(0, "uint");
+
+        const frame = P.createSrcProbeFrame(store, {
+          spacing0: S0, camera: vec3(cameraU), anchor: vec3(anchorU),
+          pixelCount: PIXELS, readPixel, frameStamp: frameStampU,
+        });
+        const rayStore = R.createSrcRayStore(store, { pixelCount: PIXELS });
+        const rayFrame = R.createSrcRayFrame(store, rayStore, {
+          pixelProbe: frame.pixelProbe, raysPerPixel: RAYS_PER_PIXEL,
+        });
+        const bins = D.createSrcBinStore(store, { w0: cfgMod.W0 });
+        const deposit = D.createSrcDepositFrame(store, bins, {
+          pixelProbe: frame.pixelProbe,
+          pixelRayBase: rayStore.pixelRayBase,
+          pixelCount: PIXELS,
+          raysPerPixel: RAYS_PER_PIXEL,
+          trace: constTrace,
+          shadeHit: constShade,
+          readPixel, readNormal,
+          camera: vec3(cameraU),
+          spacing0: S0,
+          lmax: lmaxU,
+          jitterX: jitterXU, jitterY: jitterYU,
+          keep: keepU,
+          frameStamp: frameStampU,
+        });
+
+        // ── the noisy twin, for the VARIANCE arm ────────────────────────
+        // Same trace distance, same probes, same everything except that the
+        // radiance is a hash of the RAY INDEX — which is exactly the property
+        // the constant trace was chosen to avoid, and exactly what the variance
+        // arm needs. §12.13.3's scheduler-dependent partition and the per-frame
+        // R2 phase together mean a bin sees a different sample of the same
+        // distribution every frame, which is what temporal accumulation exists
+        // to average and what nothing above this line can measure.
+        const noisyShade = (r, d, n) => {
+          const h = M.hashKey(n).toVar();
+          const k = LMAX / 65536;
+          return vec3(
+            float(h.bitAnd(uint(4095))).mul(k),
+            float(h.shiftRight(uint(12)).bitAnd(uint(4095))).mul(k),
+            float(h.shiftRight(uint(24)).bitAnd(uint(255))).mul(k),
+          );
+        };
+        const noisyKeepU = uniform(KEEP);
+        const noisy = D.createSrcDepositFrame(store, bins, {
+          pixelProbe: frame.pixelProbe,
+          pixelRayBase: rayStore.pixelRayBase,
+          pixelCount: PIXELS,
+          raysPerPixel: RAYS_PER_PIXEL,
+          trace: constTrace,
+          shadeHit: noisyShade,
+          readPixel, readNormal,
+          camera: vec3(cameraU),
+          spacing0: S0,
+          lmax: lmaxU,
+          jitterX: jitterXU, jitterY: jitterYU,
+          keep: noisyKeepU,
+          frameStamp: frameStampU,
+        });
+
+        // One frame, exactly as `srcSystem.syncCamera` sequences it: the stamp
+        // and the R2 phase advance TOGETHER, before anything dispatches.
+        const runFrame = async ({ populate = true, trace = true } = {}) => {
+          frameStampU.value = (frameStampU.value + 1) >>> 0;
+          jitterXU.value = (jitterXU.value + refMath.R2_ALPHA1_FX) >>> 0;
+          jitterYU.value = (jitterYU.value + refMath.R2_ALPHA2_FX) >>> 0;
+          if (populate) {
+            for (const pass of frame.passes) await renderer.computeAsync(pass);
+            for (const pass of rayFrame.passes) await renderer.computeAsync(pass);
+          }
+          if (trace) {
+            for (const pass of (trace === "noisy" ? noisy : deposit).passes) {
+              await renderer.computeAsync(pass);
+            }
+          } else await renderer.computeAsync(deposit.decay);
+        };
+        const readScratch = async () =>
+          new Uint32Array(await renderer.getArrayBufferAsync(bins.scratch.value));
+        const readPayload = async () =>
+          new Float32Array(await renderer.getArrayBufferAsync(bins.payload.value));
+
+        say(`pixels ${PIXELS}  raysPerPixel ${RAYS_PER_PIXEL}  Lmax ${LMAX}  ` +
+          `F ${D.DEPOSIT_F}  alpha ${ALPHA} (keep ${KEEP})`);
+        say(`hit at t=${T_HIT.toFixed(2)}m — cascade ${OWN} of ` +
+          `[${BOUNDS.map((b) => b.toFixed(1)).join(", ")}]  radiance ${Q}/65536 of Lmax`);
+        say(`bins ${(bins.binTotal / 1e3).toFixed(0)}k  ` +
+          `${(bins.bytes / 1048576).toFixed(1)}MB  minWeight ${D.MIN_WEIGHT} ` +
+          `(1/${SCALE / D.MIN_WEIGHT} of a ray)`);
+        say("");
+
+        // ══ ARM 1: STEADY STATE ═════════════════════════════════════════
+        say("── STEADY: a constant signal resolves to itself, to the predicted bias ──");
+        // The temporal furnace. `ΣR/Σcount` of a constant is that constant
+        // however the rays shuffle and however old the history is — up to ONE
+        // known error, which this arm predicts per bin rather than absorbing
+        // into a tolerance.
+        //
+        // A decaying integer accumulator settles where its rounding loss
+        // balances its influx, so it sits `(mean loss)/α` QUANTA short: about 4
+        // at round-half-up. `count` carries 2^16 per ray and does not notice;
+        // `R` carries `(L/Lmax)·2^16` and does, by `4/r` relative. Recovering
+        // `r` from the bin's own weight (`count ≈ 2^16·d/α`, `r = Q·d`) gives
+        //
+        //     predicted relative error  ≈  4·2^16 / (Q · count)
+        //
+        // which is a PER-BIN number, so the arm checks the shape of the error
+        // and not just its size. A count scaled differently from the radiance, a
+        // decay applied to some words and not others, or a `keep` leaking into
+        // the resolve would all miss this curve by orders of magnitude.
+        const K_STEADY = 24;
+        const expectedL = Q * (LMAX / 65536);
+        let steadyWorst = 0;
+        let steadyBins = 0;
+        let steadyTWorst = 0;
+        // The rounding deficit an accumulator settles at, in quanta: the mean
+        // per-frame loss of `floor(x·keep + 0.5)` divided by α. Measured in the
+        // BIAS arm below rather than asserted here — this is the number that arm
+        // confirms, used ahead of it so the two cannot drift apart.
+        const DEFICIT = 4;
+        let worstRatio = 0;          // |observed| / predicted, per bin
+        let worstRel = 0;
+        let bestRel = Infinity;
+        let relSum = 0;
+        let relN = 0;
+        let boundedViolations = 0;
+        let maxAccum = 0;
+        let maxCount = 0;
+        const CHECKPOINTS = new Set([1, 2, 3, 8, 16, K_STEADY]);
+        for (let f = 1; f <= K_STEADY; f++) {
+          await runFrame();
+          if (!CHECKPOINTS.has(f)) continue;
+          const [scratch, payload] = await Promise.all([readScratch(), readPayload()]);
+          for (const info of bins.cascades) {
+            const first = info.binBase;
+            const last = info.binBase + info.bins * info.blockCapacity;
+            for (let i = first; i < last; i++) {
+              const b = i * D.BIN_WORDS;
+              const count = scratch[b + D.BIN_COUNT] >>> 0;
+              if (count === 0) continue;
+              maxCount = Math.max(maxCount, count);
+              for (const w of [D.BIN_R, D.BIN_G, D.BIN_B]) {
+                const v = scratch[b + w] >>> 0;
+                maxAccum = Math.max(maxAccum, v);
+                // `L ≤ Lmax` as an integer statement about the accumulators.
+                if (v > count) boundedViolations++;
+              }
+              if (scratch[b + D.BIN_T] > count) boundedViolations++;
+              if (count < D.MIN_WEIGHT) continue;
+              steadyBins++;
+              const o = i * D.PAYLOAD_WORDS;
+              // c2 blocks: the hit's own cascade — full radiance, T = 0.
+              // c0/c1:     pass-through only — no radiance, T = 1.
+              const isOwn = info.cascade === OWN;
+              const wantL = isOwn ? expectedL : 0;
+              const wantT = isOwn ? 0 : 1;
+              steadyWorst = Math.max(steadyWorst, Math.abs(payload[o] - wantL));
+              steadyTWorst = Math.max(steadyTWorst, Math.abs(payload[o + 3] - wantT));
+              if (isOwn) {
+                // Signed: POSITIVE is the darkening the model predicts, and a
+                // negative value would mean the decay had brightened a bin,
+                // which no mechanism in this pass can do.
+                const rel = (wantL - payload[o]) / wantL;
+                worstRel = Math.max(worstRel, rel);
+                bestRel = Math.min(bestRel, rel);
+                relSum += rel;
+                relN++;
+                const predicted = DEFICIT * SCALE / (Q * count);
+                worstRatio = Math.max(worstRatio, Math.abs(rel) / predicted);
+              }
+            }
+          }
+        }
+        say(`   ${steadyBins} known bins over ${CHECKPOINTS.size} checkpoints of ` +
+          `${K_STEADY} frames; worst |L − ${expectedL.toFixed(6)}| = ` +
+          `${steadyWorst.toExponential(2)} (${(100 * worstRel).toFixed(3)}% relative)`);
+        // TWO NUMBERS, AND THE DISTINCTION IS THE WHOLE POINT OF ROUNDING.
+        //
+        // A decaying accumulator settles inside an INTERVAL, not on a point:
+        // `x = round(x·k) + r` holds for every `x ∈ [r/α − 0.5/α, r/α + 0.5/α)`,
+        // and which one a bin lands on depends on its own history of influx. So
+        // the per-bin error is two-sided and bounded by `0.5/α` quanta, which
+        // against a small radiance word is a fraction of a percent.
+        //
+        // Truncation's interval is `(r/α − 1/α, r/α]` — twice as wide and
+        // entirely BELOW the truth. That is the difference that matters here:
+        // the gather averages many bins, so a two-sided error cancels and a
+        // one-sided one accumulates into a systematic darkening of the whole
+        // image. The mean below is the measurement of that cancellation.
+        //
+        // (The first version of this arm asserted "no bin was BRIGHTENED",
+        // having mistaken the from-below convergence of the BIAS arm's constant-
+        // influx orbit — which does land at the bottom of the interval — for a
+        // property of the operator.)
+        const meanRel = relSum / Math.max(1, relN);
+        const spread = Math.max(worstRel, -bestRel);
+        say(`   mean ${(100 * meanRel).toFixed(4)}% against a per-bin spread of ` +
+          `${(100 * bestRel).toFixed(3)}%..${(100 * worstRel).toFixed(3)}%`);
+        check("the per-bin errors CANCEL — they are two-sided noise, not a bias",
+          Math.abs(meanRel) < spread / 10,
+          `mean ${(100 * meanRel).toFixed(4)}% vs spread ${(100 * spread).toFixed(3)}%`);
+        check("no bin strays past its own predicted rounding interval",
+          worstRatio <= 2,
+          `worst ${worstRatio.toFixed(2)}x the ${DEFICIT}-quantum prediction`);
+        check("the darkening is small in absolute terms at this exposure",
+          Math.max(worstRel, -bestRel) < 0.01,
+          `${(100 * Math.max(worstRel, -bestRel)).toFixed(3)}% of Lmax·${Q}/65536`);
+        check("transmittance is exactly 0 in the hit's cascade and 1 below it",
+          steadyTWorst <= 1e-5, `worst ${steadyTWorst.toExponential(2)}`);
+        check("the arm saw bins at all", steadyBins > 1000, `${steadyBins}`);
+
+        // ══ ARM 2: BOUNDED ══════════════════════════════════════════════
+        say("");
+        say("── BOUNDED: R ≤ count in every bin, so L ≤ Lmax ──");
+        // Not a tautology under decay. Each word is truncated INDEPENDENTLY, so
+        // "the radiance sum never exceeds the weight" has to survive two
+        // separate `floor`s — it does, because `floor` is monotone, and if it
+        // ever stopped the tail of a fading bin would divide a surviving
+        // radiance by a vanished count and produce an arbitrarily bright pixel
+        // out of a bin nobody had sampled for a hundred frames.
+        check("no bin's radiance or transmittance sum exceeds its weight",
+          boundedViolations === 0, `${boundedViolations} words over`);
+        say(`   worst accumulator ${maxAccum} of 2^32 ` +
+          `(${(4294967296 / Math.max(1, maxAccum)).toExponential(2)}x headroom), ` +
+          `worst weight ${maxCount} = ${(maxCount / SCALE).toFixed(2)} rays`);
+        check("the decayed accumulator is still orders of magnitude clear of 2^32",
+          4294967296 / Math.max(1, maxAccum) > 1000,
+          `${(4294967296 / Math.max(1, maxAccum)).toExponential(2)}x`);
+        // The EMA's cost in headroom, stated rather than assumed: a steady
+        // state is 1/α frames' worth, so the §12.13.4 margin divides by ten.
+        check("the accumulated weight sits near the predicted 1/alpha frames",
+          maxCount / SCALE < 4 / ALPHA,
+          `${(maxCount / SCALE).toFixed(2)} rays vs the 1/alpha = ${(1 / ALPHA).toFixed(0)}x ` +
+          "inflation of a single frame's");
+
+        // ══ ARM 3: EXACT DECAY ══════════════════════════════════════════
+        say("");
+        say("── EXACT: pure decay, word for word, against decayFixed ──");
+        // No tracing at all from here: the recurrence is `floor(x·keep)` and
+        // nothing else, so this is a bit-exact diff of the GPU against
+        // `srcMath.js` — the same twin discipline every other unit runs under,
+        // at the one place where the ray shuffle cannot muddy it.
+        const FADE = 220;
+        let expect = await readScratch();
+        expect = Uint32Array.from(expect);
+        const prev = Uint32Array.from(expect);
+        let exactWrong = 0;
+        let firstWrong = "";
+        let settledFrame = -1;
+        let residue = 0;
+        // Per-bin history the DARK arm needs: when the bin stopped being
+        // readable, how wrong it was on its last readable frame, and how wrong
+        // it would have gone had the floor not retired it.
+        const retiredAt = new Map();    // bin -> frame count first fell under MIN_WEIGHT
+        const lastGoodErr = new Map();  // bin -> |L − truth|/truth while still readable
+        const afterErr = new Map();     // bin -> the worst the same bin reached past the floor
+        const tracked = [];
+        for (const info of bins.cascades) {
+          if (info.cascade !== OWN) continue;
+          const first = info.binBase;
+          const last = info.binBase + info.bins * info.blockCapacity;
+          for (let i = first; i < last && tracked.length < 4096; i++) {
+            if ((expect[i * D.BIN_WORDS + D.BIN_COUNT] >>> 0) >= D.MIN_WEIGHT) tracked.push(i);
+          }
+        }
+        for (let f = 1; f <= FADE; f++) {
+          await runFrame({ populate: false, trace: false });
+          for (let j = 0; j < expect.length; j++) {
+            expect[j] = refMath.decayFixed(expect[j] >>> 0, KEEP);
+          }
+          const got = await readScratch();
+          let moved = false;
+          let peak = 0;
+          for (let j = 0; j < expect.length; j++) {
+            const g = got[j] >>> 0;
+            if (g !== expect[j]) {
+              exactWrong++;
+              if (!firstWrong) firstWrong = `word ${j} frame ${f}: ${g} vs ${expect[j]}`;
+            }
+            if (g !== prev[j]) moved = true;
+            if (g > peak) peak = g;
+          }
+          prev.set(got);
+          for (const i of tracked) {
+            const b = i * D.BIN_WORDS;
+            const c = got[b + D.BIN_COUNT] >>> 0;
+            if (c === 0) continue;
+            // What the resolve would write for this bin at this age, floor or
+            // no floor: `L = R·Lmax/count`.
+            const err = Math.abs((got[b + D.BIN_R] >>> 0) * LMAX / c - expectedL) / expectedL;
+            if (c >= D.MIN_WEIGHT) lastGoodErr.set(i, err);
+            else {
+              if (!retiredAt.has(i)) retiredAt.set(i, f);
+              afterErr.set(i, Math.max(afterErr.get(i) ?? 0, err));
+            }
+          }
+          // SETTLED, not empty: the whole buffer has reached the rounding fixed
+          // point and no further decay changes anything. `peak` is what it
+          // settled AT, which is the number the FORGET arm holds to 5.
+          if (!moved) { settledFrame = f; residue = peak; break; }
+        }
+        check("every accumulator word matches decayFixed exactly, every frame",
+          exactWrong === 0, firstWrong || `${exactWrong} words`);
+
+        // ══ ARM 4: FORGETTING ═══════════════════════════════════════════
+        say("");
+        say("── FORGET: every bin goes UNKNOWN, and the residue is 200x under ──");
+        // A rounded decay does NOT reach zero: `round(x·keep) = x` for every
+        // `x ≤ 0.5/(1−keep)`, so each word parks in single digits and stops.
+        // What has to be true is not that the buffer empties but that every bin
+        // stops being READ, which is `count < MIN_WEIGHT` — and the margin
+        // between the two is what makes the residue harmless rather than
+        // tolerated.
+        check("every tracked bin goes UNKNOWN within the fade",
+          retiredAt.size === tracked.length,
+          `${tracked.length - retiredAt.size} of ${tracked.length} still readable ` +
+          `after ${FADE} frames`);
+        let worstRetire = 0;
+        for (const f of retiredAt.values()) worstRetire = Math.max(worstRetire, f);
+        const predicted = Math.ceil(
+          Math.log(D.MIN_WEIGHT / Math.max(1, maxCount)) / Math.log(KEEP),
+        );
+        say(`   slowest bin retired on frame ${worstRetire} (predicted ~${predicted} ` +
+          `from the worst weight); settled after ${settledFrame > 0 ? settledFrame : FADE} frames`);
+        check("the residue parks below the rounding fixed point",
+          residue > 0 && residue <= 5,
+          `worst word settles at ${residue}, against MIN_WEIGHT ${D.MIN_WEIGHT} ` +
+          `(${(D.MIN_WEIGHT / Math.max(1, residue)).toFixed(0)}x)`);
+
+        // ══ ARM 4b: WHY IT ROUNDS ═══════════════════════════════════════
+        say("");
+        say("── BIAS: what truncation cost, measured on the recurrence itself ──");
+        // The measurement that chose round over floor, run here rather than
+        // written into a comment, because it is the justification for accepting
+        // rounding's fixed point above. Both operators settle inside an interval
+        // of width `1/α` (floor) or `0.5/α` (round) QUANTA around `r/α` — an
+        // absolute error, and therefore a relative one inversely proportional to
+        // the signal. Converging from zero, as a fresh bin does, lands at the
+        // BOTTOM of that interval, which is what this table measures: floor's
+        // bottom is a full `1/α` low and round's is half that. `DEFICIT` is the
+        // constant ARM 1 predicts each bin's interval from.
+        const settle = (r, op) => { let x = 0; for (let i = 0; i < 4000; i++) x = op(x) + r; return x; };
+        const fl = (x) => Math.floor(Math.fround(Math.fround(x) * Math.fround(KEEP)));
+        const rd = (x) => refMath.decayFixed(x, KEEP);
+        let worstDeficit = 0;
+        const rows = [];
+        for (const r of [6, 65, 650, 6500, 65536]) {
+          const truth = r / ALPHA;
+          const a = settle(r, fl);
+          const b = settle(r, rd);
+          worstDeficit = Math.max(worstDeficit, truth - b);
+          rows.push(`   influx ${String(r).padStart(6)}/frame: ` +
+            `floor ${((100 * (a - truth)) / truth).toFixed(3).padStart(8)}%   ` +
+            `round ${((100 * (b - truth)) / truth).toFixed(3).padStart(8)}%`);
+        }
+        for (const row of rows) say(row);
+        check("rounding beats truncation at every influx, and the interval is bounded",
+          worstDeficit <= DEFICIT + 0.5,
+          `worst settled deficit ${worstDeficit.toFixed(1)} quanta vs the ` +
+          `${DEFICIT} ARM 1 predicts from (0.5/alpha = ${(0.5 / ALPHA).toFixed(0)})`);
+
+        // ══ ARM 5: THE DARK TAIL ════════════════════════════════════════
+        say("");
+        say("── DARK: the weight floor, and exactly what it is protecting ──");
+        // `R` carries `L/Lmax` of what `count` carries, so for any bin dimmer
+        // than the ceiling it is the smaller number and it degrades FIRST: the
+        // last frames of a bin's life resolve to `almost-nothing / small` —
+        // black, at full confidence, from a bin that was merely old. That is the
+        // dark vote R1 forbids, arriving by arithmetic rather than by decision.
+        //
+        // The floor is what stops it, and the two numbers below are what it
+        // buys: how wrong a bin is on its last READABLE frame, against how wrong
+        // the same bin goes once it is past the floor.
+        let worstGood = 0;
+        let worstAfter = 0;
+        let retiredCount = 0;
+        for (const i of tracked) {
+          worstGood = Math.max(worstGood, lastGoodErr.get(i) ?? 0);
+          if (retiredAt.has(i)) retiredCount++;
+          worstAfter = Math.max(worstAfter, afterErr.get(i) ?? 0);
+        }
+        say(`   ${tracked.length} bins tracked, ${retiredCount} retired; worst error on the ` +
+          `last readable frame ${(100 * worstGood).toFixed(2)}%, ` +
+          `worst past the floor ${(100 * worstAfter).toFixed(2)}%`);
+        check("a bin is still accurate on the last frame it is readable",
+          worstGood < 0.05, `${(100 * worstGood).toFixed(2)}%`);
+        check("and it degrades badly straight after, which is what the floor removes",
+          worstAfter > 0.5,
+          `only ${(100 * worstAfter).toFixed(2)}% — if this is small the floor is ` +
+          "not buying anything and MIN_WEIGHT is set too high");
+        // Where the floor STOPS protecting, said out loud rather than left to be
+        // discovered: it retires at `count < MIN_WEIGHT` and `R` degrades at
+        // `count ≈ Lmax/L`, so the guarantee holds while `L/Lmax > 1/MIN_WEIGHT`.
+        // A bin dimmer than that fades out first — by then it is a sixty-fourth
+        // of one ray old and worth a thousandth of Lmax.
+        say(`   the guarantee holds for L/Lmax > 1/${D.MIN_WEIGHT} ` +
+          `(${(100 / D.MIN_WEIGHT).toFixed(3)}%); this arm's signal is ` +
+          `${(100 * Q / 65536).toFixed(2)}%`);
+
+        // ══ ARM 6: SINGLE-FRAME MODE ════════════════════════════════════
+        say("");
+        say("── SINGLE: alpha = 1 leaves exactly one frame in the buffer ──");
+        // §4.6 calls single-frame mode the quality-gate configuration. Here it
+        // is not a mode: `keep = 0` zeroes every word, which is the clear pass
+        // this replaced. The assertion is that after several frames the weights
+        // are WHOLE RAYS — a decayed history is a fraction of one and cannot
+        // hide in an integer count.
+        keepU.value = 0;
+        setPixels(pixels);
+        for (let f = 0; f < 3; f++) await runFrame();
+        const singleScratch = await readScratch();
+        const singleStats = await deposit.readStats(renderer);
+        let fractional = 0;
+        let weightSum = 0;
+        for (let i = 0; i < bins.binTotal; i++) {
+          const c = singleScratch[i * D.BIN_WORDS + D.BIN_COUNT] >>> 0;
+          if (c === 0) continue;
+          weightSum += c;
+          if (c % SCALE !== 0) fractional++;
+        }
+        check("every weight is a whole number of rays at alpha = 1",
+          fractional === 0, `${fractional} fractional weights`);
+        check("the buffer holds exactly one frame's deposits",
+          weightSum / SCALE === singleStats.deposits,
+          `${weightSum / SCALE} ray-weights vs ${singleStats.deposits} deposits this frame`);
+
+        // ══ ARM 7: A RECLAIMED BLOCK STARTS EMPTY ═══════════════════════
+        say("");
+        say("── RECLAIM: a block handed on does not carry the dead probe's light ──");
+        // The one thing a persistent accumulator needs that a cleared one does
+        // not. Without the claim stamp a new probe inherits whatever the last
+        // owner left and fades it in over ~1/α frames — geometrically unrelated
+        // light, arriving smoothly, in a scene that looks otherwise fine.
+        keepU.value = KEEP;
+        for (let f = 0; f < 6; f++) await runFrame();       // build real history
+        setPixels(null, false);                              // every pixel invalid
+        const agedFrame = P.createSrcProbeFrame(store, {
+          spacing0: S0, camera: vec3(cameraU), anchor: vec3(anchorU),
+          pixelCount: PIXELS, readPixel, maxAge: 1, frameStamp: frameStampU,
+        });
+        for (let f = 0; f < 16; f++) {
+          frameStampU.value = (frameStampU.value + 1) >>> 0;
+          for (const pass of agedFrame.passes) await renderer.computeAsync(pass);
+        }
+        // What the freed blocks still hold, measured BEFORE anyone claims them.
+        const stale = await readScratch();
+        let staleWords = 0;
+        let staleBins = 0;
+        for (let i = 0; i < bins.binTotal; i++) {
+          const b = i * D.BIN_WORDS;
+          if ((stale[b + D.BIN_COUNT] >>> 0) === 0) continue;
+          staleBins++;
+          for (let w = 0; w < D.BIN_WORDS; w++) if (stale[b + w] !== 0) staleWords++;
+        }
+        setPixels(pixels2);
+        await runFrame();
+        const reclaimed = await readScratch();
+        const reclaimStats = await deposit.readStats(renderer);
+        const reclaimTable = new Uint32Array(
+          await renderer.getArrayBufferAsync(store.probeTable.value),
+        );
+        // ONLY THE BLOCKS A LIVE PROBE HOLDS. The first version of this arm
+        // summed the whole pool and failed for a reason that is correct
+        // behaviour: a freed block nobody has claimed yet keeps its decayed
+        // history, because the stamp fires at CLAIM and there is nothing else in
+        // the frame that walks the free list. That memory is unreachable — no
+        // probe addresses it, and whoever claims it next zeroes it — but it is
+        // still there, and an arm that counts it is measuring the pool rather
+        // than the transport.
+        let inherited = 0;
+        let reclaimWeight = 0;
+        let reclaimBins = 0;
+        for (const info of bins.cascades) {
+          const pc = store.cascades[info.cascade];
+          for (let k = 0; k < pc.probeCapacity; k++) {
+            const w = (pc.probeBase + k) * P.PROBE_WORDS;
+            if ((reclaimTable[w + P.PROBE_FLAGS] & P.FLAG_ALIVE) === 0) continue;
+            const block = reclaimTable[w + P.PROBE_BLOCK] >>> 0;
+            if (block === P.SLOT_EMPTY) continue;
+            const base = info.binBase + block * info.bins;
+            for (let m = 0; m < info.bins; m++) {
+              const c = reclaimed[(base + m) * D.BIN_WORDS + D.BIN_COUNT] >>> 0;
+              if (c === 0) continue;
+              reclaimBins++;
+              reclaimWeight += c;
+              if (c % SCALE !== 0) inherited++;
+            }
+          }
+        }
+        say(`   ${staleBins} bins (${staleWords} words) of dead history were sitting in the ` +
+          `pool when the new probes claimed it; ${reclaimBins} bins came back live`);
+        check("the pool really did still hold history — otherwise this arm is vacuous",
+          staleBins > 0, `${staleBins} bins`);
+        check("no reclaimed bin carries a fraction of a ray from its last owner",
+          inherited === 0, `${inherited} bins hold a decayed weight`);
+        check("the reclaimed blocks hold exactly the new probes' first frame",
+          reclaimWeight / SCALE === reclaimStats.deposits,
+          `${reclaimWeight / SCALE} ray-weights vs ${reclaimStats.deposits} deposits`);
+
+        // ══ ARM 8: WHAT THE WHOLE THING IS FOR ══════════════════════════
+        say("");
+        say("── VARIANCE: the reason temporal accumulation exists ──");
+        // Every arm above tests that the blend is ARITHMETICALLY right. None of
+        // them tests that it is WORTH anything — a decay that computed a
+        // flawless weighted mean of a signal with no variance would pass all of
+        // them and buy nothing. So this one feeds a genuinely noisy signal (a
+        // hash of the ray index, resampled every frame by the shuffle and the
+        // R2 phase) and measures the frame-to-frame RMS change in the resolved
+        // payload at α = 1 against α = 0.1.
+        //
+        // The prediction is not a guess: an EMA of an i.i.d. signal has
+        // `Var(EMA)/Var(single) = α/(2−α)`, so the successive-difference RMS
+        // should fall by `sqrt(α/(2−α))` — 4.4× at α = 0.1. Measuring against
+        // that rather than against "less" is what makes it a gate.
+        const K_VAR = 14;
+        const rmsRun = async (alpha) => {
+          // Reset: keep = 0 wipes every accumulator, so the two runs start from
+          // the same state and neither inherits the other's history.
+          noisyKeepU.value = 0;
+          await runFrame({ trace: "noisy" });
+          noisyKeepU.value = 1 - alpha;
+          let prevPayload = await readPayload();
+          let sum = 0;
+          let n = 0;
+          for (let f = 0; f < K_VAR; f++) {
+            await runFrame({ trace: "noisy" });
+            const now = await readPayload();
+            for (const info of bins.cascades) {
+              if (info.cascade !== OWN) continue;
+              const first = info.binBase;
+              const last = first + info.bins * info.blockCapacity;
+              for (let i = first; i < last; i++) {
+                const o = i * D.PAYLOAD_WORDS;
+                // Known in BOTH frames — a bin appearing or vanishing is a
+                // membership change, and R6 is explicit that this is measuring
+                // values and not membership.
+                if (prevPayload[o + 3] < 0 || now[o + 3] < 0) continue;
+                const d = now[o] - prevPayload[o];
+                sum += d * d;
+                n++;
+              }
+            }
+            prevPayload = now;
+          }
+          return { rms: Math.sqrt(sum / Math.max(1, n)), samples: n };
+        };
+        const single = await rmsRun(1);
+        const blended = await rmsRun(ALPHA);
+        const reduction = single.rms / Math.max(1e-12, blended.rms);
+        const predictedDrop = 1 / Math.sqrt(ALPHA / (2 - ALPHA));
+        say(`   frame-to-frame RMS: ${single.rms.toExponential(3)} at alpha 1, ` +
+          `${blended.rms.toExponential(3)} at alpha ${ALPHA} ` +
+          `(${single.samples} bin-pairs)`);
+        check("accumulation reduces frame-to-frame variation, by the predicted factor",
+          reduction >= predictedDrop * 0.6 && reduction <= predictedDrop * 1.6,
+          `${reduction.toFixed(2)}x against a predicted sqrt(a/(2-a)) = ${predictedDrop.toFixed(2)}x`);
+        check("the single-frame arm really was noisy — otherwise this is vacuous",
+          single.rms > expectedL * 0.01,
+          `${single.rms.toExponential(2)} against a mean signal near ${expectedL.toFixed(3)}`);
+
+        if (validationErrors.length) check("no WebGPU validation errors", false, validationErrors[0]);
+
+        say("");
+        say(failures ? `gi-src-temporal: ${failures} CHECKS FAILED` : "gi-src-temporal: all cases PASS");
+        globalThis.__SRC_TEMPORAL_RESULT__ = {
+          pass: failures === 0,
+          failures,
+          alpha: ALPHA,
+          steadyBins,
+          steadyWorst: steadyWorst.toExponential(2),
+          fadeFrames: settledFrame,
+          tracked: tracked.length,
+          darkGood: +(100 * worstGood).toFixed(2),
+          darkAfter: +(100 * worstAfter).toFixed(2),
+          maxRays: +(maxCount / SCALE).toFixed(2),
+          headroom: +(4294967296 / Math.max(1, maxAccum)).toPrecision(3),
+          staleBins,
+          varReduction: +reduction.toFixed(2),
+          varPredicted: +predictedDrop.toFixed(2),
+          storageLimit: device.limits.maxStorageBuffersPerShaderStage,
+          text: out.textContent,
+        };
+
+      } catch (error) {
+        fail(error);
+      }
+    </script>
+  </body>
+</html>

@@ -403,7 +403,26 @@ export function createSrcProbeStore({
   // index is global everywhere it appears), then block indices (LOCAL to their
   // cascade, because a block index is only ever used to address that cascade's
   // bin region and a local one keeps the addressing a single multiply).
-  const freeInit = new Uint32Array(probeTotal + blockTotal);
+  //
+  // ── AND A THIRD: THE BLOCK CLAIM STAMPS ──────────────────────────────────
+  //
+  // One word per block, holding the frame number on which that block was last
+  // claimed, GLOBAL across cascades (block indices are cascade-local, so the
+  // stamp region is indexed `stampBase + blockBase[c] + block` exactly as the
+  // stack region is). It rides this buffer rather than getting one of its own
+  // because R7 says fold, don't multiply bindings — and the pass that WRITES
+  // it is the compaction, which already binds six storage buffers against a
+  // portable limit of eight.
+  //
+  // Its consumer is `srcDeposit.js`'s decay pass, which must tell "this block
+  // holds a probe's accumulated history" from "this block holds the DEAD
+  // PROBE'S history and was handed to somebody else this frame". A stamp
+  // answers that with no clear pass, no fresh-block list and no ordering
+  // subtlety: the decay compares against the current frame number, and a stamp
+  // goes stale on its own. `0` is safe as the initial value — a block that has
+  // never been claimed holds zeros, which decay to zeros.
+  const stampBase = probeTotal + blockTotal;
+  const freeInit = new Uint32Array(stampBase + blockTotal);
   for (const c of cascades) {
     for (let i = 0; i < c.probeCapacity; i++) {
       freeInit[c.probeBase + i] = c.probeBase + (c.probeCapacity - 1 - i);
@@ -430,6 +449,8 @@ export function createSrcProbeStore({
     blockTotal,
     /** Where the block region starts inside `freeStack`. */
     blockStackBase: probeTotal,
+    /** Where the per-block claim stamps start inside `freeStack`. */
+    blockStampBase: stampBase,
     hashKeys,
     hashSlot,
     probeTable,
@@ -437,7 +458,7 @@ export function createSrcProbeStore({
     freeStack,
     freeTop,
     /** Bytes on the GPU, for the memory high-water telemetry (plan §8). */
-    bytes: (hashTotal * 2 + probeTotal * PROBE_WORDS + probeTotal + blockTotal
+    bytes: (hashTotal * 2 + probeTotal * PROBE_WORDS + probeTotal + blockTotal * 2
       + cascadeCount * (COUNTER_WORDS + 2)) * 4,
     dispose() {
       for (const b of [hashKeys, hashSlot, probeTable, counters, freeStack, freeTop]) {
@@ -622,10 +643,11 @@ export function createInsertPass(store, cascade, count, keyOf, onSlot = null) {
  * absence of information, never a dark vote). The alternative, clamping to
  * index 0, would silently pour every overflowing probe's rays into one record.
  */
-export function createCompactPass(store, cascade) {
+export function createCompactPass(store, cascade, { frameStamp = null } = {}) {
   const c = store.cascades[cascade];
   const { hashKeys, hashSlot, probeTable, counters, freeStack, freeTop, cascadeCount } = store;
   const blockStack = store.blockStackBase + c.blockBase;
+  const blockStamp = store.blockStampBase + c.blockBase;
   const blockTopWord = cascadeCount + cascade;
   return Fn(() => {
     const h = instanceIndex.add(uint(c.hashBase)).toVar();
@@ -674,6 +696,15 @@ export function createCompactPass(store, cascade) {
       atomicAdd(counters.element(uint(cascade * COUNTER_WORDS + COUNTER_NOBLOCK)), uint(1));
     }).Else(() => {
       block.assign(freeStack.element(uint(blockStack).add(btop).sub(1)));
+      // STAMP THE CLAIM. The block may have belonged to a probe that died, and
+      // its accumulators still hold that probe's history — which the decay pass
+      // would otherwise fade in rather than discard, lighting a new probe with
+      // a dead one's answer for ~1/α frames. Writing the frame here is the
+      // whole of the fix: the decay reads it, sees "claimed THIS frame", and
+      // multiplies by zero instead of by keep.
+      if (frameStamp) {
+        freeStack.element(uint(blockStamp).add(block)).assign(frameStamp);
+      }
     });
 
     probeTable.element(w.add(PROBE_KEY)).assign(key);
@@ -861,6 +892,10 @@ export function createSrcHashBlockFrame(store, cascade = 0) {
  * @param {(i: Node) => {position: Node, valid: Node}} options.readPixel
  *   the gbuffer, as a closure. Production samples the half-res worldPos target;
  *   the gate reads a storage buffer. Neither knows about the other.
+ * @param {Node} [options.frameStamp]  the current frame number, stamped onto
+ *   every bin block claimed this frame so `srcDeposit.js`'s decay can tell a
+ *   freshly claimed block from one carrying real history. Omit it and blocks
+ *   go unstamped, which is correct only for a single-frame harness.
  */
 export function createSrcProbeFrame(store, {
   spacing0,
@@ -870,6 +905,7 @@ export function createSrcProbeFrame(store, {
   readPixel,
   maxLods = MAX_LODS,
   maxAge = PROBE_MAX_AGE,
+  frameStamp = null,
 } = {}) {
   const { probeTable } = store;
   const N = store.cascadeCount;
@@ -914,7 +950,7 @@ export function createSrcProbeFrame(store, {
     },
     (i, slot) => { pixelHash.element(i).assign(uint(slot)); },
   ));
-  passes.push(createCompactPass(store, 0));
+  passes.push(createCompactPass(store, 0, { frameStamp }));
   passes.push(createResolvePass(
     store, pixelCount,
     (i) => pixelHash.element(i),
@@ -970,7 +1006,7 @@ export function createSrcProbeFrame(store, {
           .assign(uint(slot));
       },
     ));
-    passes.push(createCompactPass(store, c));
+    passes.push(createCompactPass(store, c, { frameStamp }));
     passes.push(createResolvePass(
       store, child.probeCapacity,
       (i) => probeTable.element(
