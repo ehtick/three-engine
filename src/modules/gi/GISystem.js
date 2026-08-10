@@ -4373,17 +4373,43 @@ export class GISystem {
     if (volume.occupancyField) {
       console.log(`[gi] occupancy backend: ${describeOccupancyField(volume.occupancyField)}`);
     }
-    // AFFIRMATIVE GROUND TRUTH FOR THE ABSENT TRANSPORT, and it is the most
+    // AFFIRMATIVE GROUND TRUTH FOR THE DIFFUSE TERM, and it is the most
     // important line this build prints. Without it the interregnum is
     // indistinguishable from every failure mode this module has ever had — a
     // stale `backend` value, an empty field, a light that never registered — all
     // of which present as "GI builds, logs happily, contributes no bounce".
-    console.log(
-      "[gi] diffuse indirect: ABSENT — the dense radiance cascades were deleted for the " +
-        "SRC rebuild (docs/GI_SRC_REBUILD_PLAN.md §12.8) and Split Radiance Cascades lands in " +
-        "Phase 1-3. Direct light, GI/emitter shadows, AO and exact reflections are live; bounce, " +
-        "sky and every other diffuse term read ZERO. This is expected, not a broken field.",
-    );
+    //
+    // IT USED TO SAY "ABSENT" UNCONDITIONALLY, which quietly cost it that job:
+    // once SRC's transport landed (Phases 1-4) the line went on reporting that
+    // "bounce, sky and every other diffuse term read ZERO" whether or not the
+    // transport was running, so the one instrument for "is this expected?"
+    // could no longer tell the two states apart. There are THREE now, and only
+    // the last of them is a picture with light in it.
+    const sky = skyRadiance.value;
+    const skyLit = Math.max(sky.r, sky.g, sky.b) > 0;
+    if (!srcProbesEnabled()) {
+      console.log(
+        "[gi] diffuse indirect: ABSENT — the dense radiance cascades were deleted for the SRC " +
+          "rebuild (docs/GI_SRC_REBUILD_PLAN.md §12.8) and Split Radiance Cascades is OPT-IN " +
+          "until Phase 6. Direct light, GI/emitter shadows, AO and exact reflections are live; " +
+          "bounce, sky and every other diffuse term read ZERO. This is expected, not a broken " +
+          "field — set `__giSrcProbes = true` before the GI module builds to turn the transport on.",
+      );
+    } else if (!skyLit) {
+      console.log(
+        "[gi] diffuse indirect: LIVE BUT UNLIT — SRC transport is running, and with hit shading " +
+          "still Phase 5 the ONLY radiance in the system is the scene's Sky Light, which is 0. " +
+          "So the diffuse term is correctly black. Raise Sky Light above zero to see it.",
+      );
+    } else {
+      console.log(
+        "[gi] diffuse indirect: SKY VISIBILITY — SRC transport is running against Sky Light " +
+          `${sky.r.toFixed(2)}/${sky.g.toFixed(2)}/${sky.b.toFixed(2)}. Hit shading is Phase 5, ` +
+          "so every deposited radiance is zero and what you are seeing is how much sky each point " +
+          "can see over the whole cascade reach — long-range, AO-shaped darkening with NO bounce " +
+          "colour. A Cornell box with no red on the white block is the correct picture.",
+      );
+    }
     // Affirmative ground truth for the gi-shadow feature, same discipline as
     // the ray-hit and SDF-free lines below: "I set Shadow Source to gi and
     // nothing changed" is unreadable without knowing whether the resolve even
