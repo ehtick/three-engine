@@ -523,6 +523,14 @@ export function createSrcProbeSystem({
         ]
       : [...frame.passes, ...rayFrame.passes],
     pixelProbe: frame.pixelProbe,
+    /** Non-null only when `shadeHit` was actually built — see `describeSrcProbeSystem`. */
+    shading: shadeHit
+      ? {
+          lights: (lighting?.lights ?? []).length,
+          emitters: (lighting?.emitters ?? []).length,
+          attributed: !!surfaces,
+        }
+      : null,
     width,
     height,
     pixelCount,
@@ -650,6 +658,18 @@ export function describeSrcProbeSystem(system) {
         // probe telemetry and a range difference of four cascades, so the boot
         // line names which one this is.
         (system.merge ? "depositing + merging" : "depositing") +
+        // ── WHETHER HIT SHADING IS ON, SAID OUT LOUD ────────────────────────
+        //
+        // Added after an eye check could not tell. `shadeHit` needs THREE things
+        // to line up — the flag, the lighting bundle and the surface attribution
+        // — and any one of them missing leaves a system that populates, deposits
+        // and merges exactly as before while shading black. That is
+        // indistinguishable from "Phase 5 is not written yet" in every log line
+        // this module prints, so the log now names it.
+        (system.shading
+          ? `, SHADING (${system.shading.lights} lights, ${system.shading.emitters} emitters` +
+            `${system.shading.attributed ? ", static surfaces attributed" : ""})`
+          : ", NO hit shading (radiance is sky-only)") +
         (system.tiles
           ? `, ${system.tiles.layout.width}x${system.tiles.layout.height} tile atlas ` +
             `(${system.tiles.blocks} x ${system.tiles.tileSize}²)`

@@ -4222,6 +4222,12 @@ export class GISystem {
     });
     const screen = this.#buildScreenResolve({
       gather, light, emitterSlots, radianceLookup: deferredRadianceLookup, ao, lightShadow,
+      // The punctual light slots. `#buildScreenResolve` has always destructured
+      // them (`lightSlots = null`) and the caller never passed them, so SRC's hit
+      // shading came up with `0 lights` on a scene the field log calls "1 lights
+      // (GPU)" — and `bvhShade.lightSlots`, in the same function, has been
+      // reading the same null.
+      lightSlots,
       // The SlotRegistry, for SRC's surface-attribution palette (§12.28). It is
       // the SAME registry the voxelizer seated, which is what makes the palette
       // indexable by occupancy slot with no remap — §12.9's crossed-numbering

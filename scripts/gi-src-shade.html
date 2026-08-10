@@ -359,6 +359,55 @@
           `${cpuShadowed.values.reduce((a, v) => a + luma(v), 0).toFixed(3)} vs unshadowed ${cpuPlain.values.reduce((a, v) => a + luma(v), 0).toFixed(3)}`,
         );
 
+        // ══ ARM: lights — the slot path vs the sun path ═════════════════════
+        //
+        // `createSrcHitShader` has two ways in for punctual light: `sun`
+        // (`srcRef.js`'s shape, one directional source, what the mirror gates)
+        // and `lights` (`giLight.js`'s slot array, what the ENGINE passes —
+        // point AND directional, one shadow ray each). A directional slot is the
+        // one input both accept, so they must agree on it exactly. Without this
+        // arm the engine path ships untested: the mirror never exercises it.
+        say("");
+        say("── THE ENGINE'S LIGHT SLOTS: a directional slot IS the sun ──");
+        {
+          const DIAG = 32;
+          const sunAsSlot = [{
+            kind: 0,               // plain JS 0 = directional in this fixture's
+                                   // reading of `mix(..., isDir)`; see below.
+            vector: uniform(new THREE.Vector3(...SUN.direction)),
+            color: uniform(new THREE.Color(...SUN.irradiance)),
+            range: 0,
+            active: 1,
+          }];
+          // `lightTermsAt` selects on `kind` as a FLOAT (1 = directional), so the
+          // slot has to say so numerically rather than by JS truthiness — the
+          // emitter path's `if (!slot.kind)` convention is the opposite one, and
+          // mixing them up is a silent wrong-light-model bug.
+          sunAsSlot[0].kind = 1;
+          const viaSlot = await runGpu({ visibility: null, sun: null, lights: sunAsSlot, maxRay: DIAG });
+          const viaSun = await runGpu({ visibility: null });
+          // `viaSun` still carries NEE; isolate by running the sun alone too.
+          const sunOnly = await runGpu({ visibility: null, neeEmitters: false });
+          const slotOnly = await runGpu({
+            visibility: null, sun: null, lights: sunAsSlot, maxRay: DIAG, neeEmitters: false,
+          });
+          compare("a directional LIGHT SLOT shades identically to the `sun` path",
+            slotOnly, sunOnly, 2e-4);
+          check("and the arm has a subject — the sun alone lights most of the fixture",
+            sunOnly.filter((v) => luma(v) > 1e-6).length > N_HITS * 0.3,
+            `${sunOnly.filter((v) => luma(v) > 1e-6).length}/${N_HITS} hits lit by the sun alone`);
+          // A POINT slot must NOT match it — otherwise `kind` is being ignored
+          // and every directional light in a scene would fall off with distance.
+          const asPoint = [{ ...sunAsSlot[0], kind: 0, vector: uniform(new THREE.Vector3(0, 6, 0)) }];
+          const pointOnly = await runGpu({
+            visibility: null, sun: null, lights: asPoint, maxRay: DIAG, neeEmitters: false,
+          });
+          let differs = 0;
+          for (let i = 0; i < N_HITS; i++) if (relErr(luma(pointOnly[i]), luma(sunOnly[i])) > 0.01) differs++;
+          check("a POINT slot does NOT — `kind` is read, not ignored",
+            differs > N_HITS * 0.5, `${differs}/${N_HITS} hits differ`);
+        }
+
         // ══ ARM: faceward — §12.26.4 ════════════════════════════════════════
         say("\n── THE FACE-FORWARD FLIP: at the hit, and only the sign ──");
         const gpuFlipped = await runGpu({ visibility: null }, { normalSign: -1 });
