@@ -19,6 +19,16 @@
 //   FRAMES=240          measured frames (after 30 warmup frames)
 //   AMP=0.5             sphere sinusoid amplitude (m); one period per run
 //   PRESET_GLOBALS='{"__giNoChebyshev":true,"__giDepthAlpha":1}'  A/B arm
+//   SRC=1               turn Split Radiance Cascades on (`__giSrcProbes`) AND
+//                       give the scene a sky, because with hit shading still
+//                       Phase 5 the sky is the ONLY radiance SRC has — without
+//                       it the resolve is uniformly zero and this instrument
+//                       reports a flawless absence of flicker.
+//   ALPHA_AB=1          second moving arm at alpha=1 (single-frame), IN THE
+//                       SAME PAGE. The whole point of the still control below
+//                       is that this harness's absolute numbers do not survive
+//                       a process boundary; a temporal A/B across two runs
+//                       would be exactly the invalid comparison it warns about.
 //   HEADED=1
 import puppeteer from "puppeteer-core";
 import { installTauriShim } from "./lib/tauriShim.mjs";
@@ -35,6 +45,8 @@ const AMP = Number(process.env.AMP ?? 0.5);
 // STEP-AMPLITUDE metric (p95 per-pixel max |Δlum|): popping is a step, not
 // an oscillation, so reversals alone under-report it.
 const ROTATE = process.env.ROTATE === "1";
+const SRC = process.env.SRC === "1";
+const ALPHA_AB = process.env.ALPHA_AB === "1";
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const browser = await puppeteer.launch({
@@ -74,7 +86,11 @@ await page.evaluateOnNewDocument((PROJECT, PRESET) => {
   // Same hatch the bleed and block rigs already set for the same reason.
   globalThis.__editorKeepRendering = true;
   for (const [k, v] of Object.entries(PRESET)) globalThis[k] = v;
-}, PROJECT, JSON.parse(process.env.PRESET_GLOBALS ?? "{}"));
+}, PROJECT, {
+  ...JSON.parse(process.env.PRESET_GLOBALS ?? "{}"),
+  // SRC is opt-in until Phase 6 and must be set before the GI module builds.
+  ...(process.env.SRC === "1" ? { __giSrcProbes: true } : {}),
+});
 
 await page.goto(url, { waitUntil: "load", timeout: 60000 });
 await page.waitForSelector(".hub-recent-open-btn", { timeout: 30000 });
@@ -158,6 +174,36 @@ await wait(10000);
 
 await must("viewport.setCamera", { position: [11.8, 2.2, 0.73], target: [-3.2, 1.0, -1.47] });
 await wait(1500);
+
+// ── THE SKY, WHICH SRC CANNOT BE MEASURED WITHOUT ───────────────────────────
+// `sceneSkyRadiance` (giConfig.js) is `scene.environment ? environmentIntensity
+// : 0`, and it does NOT sample the texture — the sky's chroma is deliberately
+// unread until Phase 5. So any truthy environment gives the right radiometry
+// here, and a 1x1 equirect costs nothing and needs no HDRI in the project.
+//
+// It has to exist at all, though: with hit shading still Phase 5 every
+// deposited radiance is zero, so the sky is the only light SRC transports. A
+// run without it measures a uniformly black resolve texture and reports a
+// flawless absence of flicker — the same shape of lie the `__editorKeepRendering`
+// note above documents, and just as convincing.
+if (SRC) {
+  const skyInfo = await page.evaluate(async (anchorId) => {
+    const eng = globalThis.__editorApi.entities.live(anchorId)?.engine;
+    if (!eng?.scene) return { ok: false, why: "no live engine" };
+    if (!eng.scene.environment) {
+      const THREE = await import("/node_modules/three/build/three.module.js");
+      const tex = new THREE.DataTexture(new Uint8Array([255, 255, 255, 255]), 1, 1);
+      tex.mapping = THREE.EquirectangularReflectionMapping;
+      tex.needsUpdate = true;
+      eng.scene.environment = tex;
+    }
+    eng.scene.environmentIntensity = 1;
+    return { ok: true, intensity: eng.scene.environmentIntensity };
+  }, giEntity.id);
+  console.log(`  sky: ${skyInfo.ok ? `environment set, intensity ${skyInfo.intensity}` : `FAILED (${skyInfo.why})`}`);
+  if (!skyInfo.ok) { await browser.close(); process.exit(1); }
+  await wait(2000);
+}
 
 const body = async ({ anchorId, moverId, frames, amp, rotate }) => {
   const eng = globalThis.__editorApi.entities.live(anchorId)?.engine;
@@ -296,9 +342,36 @@ const measure = (amp, rotate) => page.evaluate(body, {
 // churn, so a still control run first is biased HIGH and would flatter any fix
 // measured against it. Moving runs first, still second — and a warmup arm runs
 // before both so neither carries the build transient.
+// α IS LIVE (`srcSystem.js`'s `readAlpha`, polled in `syncCamera`), which is
+// what makes a temporal A/B expressible here at all. `body()`'s own 30-frame
+// warmup covers the transition in both directions: going to α=1 clears the
+// accumulators on the first decay pass, and coming back needs ~1/α = 10 frames
+// to re-accumulate.
+const setAlpha = (a) => page.evaluate((v) => { globalThis.__giSrcAlpha = v; }, a);
+
 await measure(0, false);            // discarded warmup arm
 const result = await measure(AMP, ROTATE);
 const still = await measure(0, false);
+// ── THE TEMPORAL A/B, INTERLEAVED AND REPEATED ────────────────────────────
+// Running α=1 after α=0.1 once would confound the comparison with whatever
+// drifts over a five-minute page — which, on an instrument whose own header
+// records a 3.7x spread between processes, is not a hypothetical. Two rounds
+// alternating the two α values makes that drift VISIBLE: if round 1 and round 2
+// disagree by more than the effect, there is no effect to report.
+const rounds = [];
+if (ALPHA_AB) {
+  for (let r = 0; r < 2; r++) {
+    await setAlpha(1);
+    await wait(300);
+    const oneMove = await measure(AMP, ROTATE);
+    const oneStill = await measure(0, false);
+    await setAlpha(undefined);
+    await wait(300);
+    const dfltMove = await measure(AMP, ROTATE);
+    const dfltStill = await measure(0, false);
+    rounds.push({ oneMove, oneStill, dfltMove, dfltStill });
+  }
+}
 
 
 console.log(`\n=== PER-FRAME FLICKER (${result.width}x${result.height}, ${result.frames} frames, ${ROTATE ? "ROTATING box 2-axis 0.6rad/s" : "sub-voxel mover"}) ===`);
@@ -316,6 +389,61 @@ console.log(`
   MOTION-INDUCED EXCESS OVER THE STILL CONTROL — the only quotable figure:`);
 console.log(`    reversals  ${still.meanReversals.toFixed(3)} -> ${result.meanReversals.toFixed(3)}   +${ex(result.meanReversals, still.meanReversals).toFixed(0)}%`);
 console.log(`    step p95   ${still.stepP95.toFixed(4)} -> ${result.stepP95.toFixed(4)}   +${ex(result.stepP95, still.stepP95).toFixed(0)}%`);
+
+if (rounds.length) {
+  // ══ AND THE MOTION-EXCESS RATIO IS THE WRONG STATISTIC FOR THIS A/B ══════
+  //
+  // "Excess over the still control" is the right figure for comparing two
+  // BUILDS at one α, which is what it was written for: the control cancels the
+  // page's load. It falls apart across α, because temporal accumulation moves
+  // the CONTROL — at α=1 every pixel churns every frame from the R2 jitter
+  // alone, so the still floor saturates and the moving arm has nothing to rise
+  // above (measured: still 6.919, moving 6.815, i.e. MINUS 2%). Dividing the
+  // two excesses then yields whatever the noise near zero happens to give;
+  // the first version of this block printed -15.6 and meant nothing by it.
+  //
+  // Within ONE page the raw counts are comparable — that is exactly the
+  // condition the still-control note above establishes — so the A/B reports
+  // them directly, at both α, moving AND still, over two interleaved rounds.
+  console.log(`
+=== TEMPORAL A/B (alpha 1 = single-frame vs the shipping default) ===`);
+  console.log("  round  arm       reversals mv/still   stepP95 mv/still   walk mv/still");
+  const row = (i, name, mv, st) => console.log(
+    `  ${i}      ${name.padEnd(9)} ${mv.meanReversals.toFixed(3)} / ${st.meanReversals.toFixed(3)}` +
+    `        ${mv.stepP95.toFixed(4)} / ${st.stepP95.toFixed(4)}` +
+    `     ${mv.meanWalk.toFixed(3)} / ${st.meanWalk.toFixed(3)}`);
+  for (const [i, r] of rounds.entries()) {
+    row(i + 1, "alpha 1", r.oneMove, r.oneStill);
+    row(i + 1, "default", r.dfltMove, r.dfltStill);
+  }
+  const mean = (f) => rounds.reduce((a, r) => a + f(r), 0) / rounds.length;
+  const revRatio = mean((r) => r.oneMove.meanReversals) / Math.max(1e-9, mean((r) => r.dfltMove.meanReversals));
+  const stillRatio = mean((r) => r.oneStill.meanReversals) / Math.max(1e-9, mean((r) => r.dfltStill.meanReversals));
+  const stepRatio = mean((r) => r.oneMove.stepP95) / Math.max(1e-9, mean((r) => r.dfltMove.stepP95));
+  const walkRatio = mean((r) => r.oneMove.meanWalk) / Math.max(1e-9, mean((r) => r.dfltMove.meanWalk));
+  const spread = (f) => {
+    const v = rounds.map(f);
+    return Math.abs(v[0] - v[1]) / Math.max(1e-9, (v[0] + v[1]) / 2) * 100;
+  };
+  console.log(`
+  round-to-round spread: ${spread((r) => r.oneMove.meanReversals).toFixed(0)}% (alpha 1), ` +
+    `${spread((r) => r.dfltMove.meanReversals).toFixed(0)}% (default) — the effect must clear this`);
+  console.log(`  ACCUMULATION DIVIDES per-frame reversals by ${revRatio.toFixed(2)}x moving, ${stillRatio.toFixed(2)}x still`);
+  console.log(`  step p95 x${stepRatio.toFixed(2)} moving   mean walk x${walkRatio.toFixed(2)} moving`);
+  // ══ THE STEP METRIC IS A SIGNAL DETECTOR, NOT A NOISE ONE ═══════════════
+  // If the worst per-pixel step were value noise, α would cut it and the STILL
+  // arm would show it too. The 2x2 below is what separates the two readings:
+  // a step amplitude that barely moves with α but collapses when the mover
+  // stops is REAL geometric change — a rotating box genuinely alters what a
+  // probe sees — and smoothing it would be smoothing the signal.
+  const stillStep1 = mean((r) => r.oneStill.stepP95);
+  const stillStepD = mean((r) => r.dfltStill.stepP95);
+  const moveStep1 = mean((r) => r.oneMove.stepP95);
+  const moveStepD = mean((r) => r.dfltMove.stepP95);
+  console.log(`  step p95 2x2:  alpha1 ${moveStep1.toFixed(4)} moving / ${stillStep1.toFixed(4)} still ` +
+    `(x${(moveStep1 / Math.max(1e-9, stillStep1)).toFixed(1)})   ` +
+    `default ${moveStepD.toFixed(4)} / ${stillStepD.toFixed(4)} (x${(moveStepD / Math.max(1e-9, stillStepD)).toFixed(1)})`);
+}
 
 await browser.close();
 process.exit(0);

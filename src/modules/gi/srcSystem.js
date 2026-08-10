@@ -186,11 +186,19 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null, vol
   // than none, since the disagreement shows up as a new probe wearing a dead
   // one's light rather than as anything that looks like a bug.
   //
-  // `__giSrcAlpha` is the harness override, and `1` is single-frame mode.
-  const alpha = Number.isFinite(Number(globalThis.__giSrcAlpha))
+  // `__giSrcAlpha` is the harness override, and `1` is single-frame mode. It is
+  // POLLED PER FRAME (`syncCamera`), not read once at build, for a reason the
+  // flicker instrument makes concrete: `run-gi-flicker-frame.mjs`'s own header
+  // records that the SAME baseline config read 1.404 and 5.194 reversals/px in
+  // two processes — a 3.7x spread, larger than any effect anyone has tried to
+  // measure with it — so its numbers are only comparable WITHIN one page. An α
+  // read at build time can only be A/B'd by reloading, which is exactly the
+  // comparison that instrument forbids. Polling costs a global read per frame
+  // and is the same convention `__giDebugView` runs under.
+  const readAlpha = () => (Number.isFinite(Number(globalThis.__giSrcAlpha))
     ? Math.min(1, Math.max(0, Number(globalThis.__giSrcAlpha)))
-    : TEMPORAL_ALPHA;
-  const keepU = uniform(1 - alpha);
+    : TEMPORAL_ALPHA);
+  const keepU = uniform(1 - readAlpha());
   // Starts at 1, not 0: an unclaimed block's stamp is 0, and a frame counter
   // that also started there would call every block in the pool fresh on frame
   // zero. Harmless in fact (an unclaimed block holds zeros, which zero to
@@ -428,6 +436,11 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null, vol
       // (the picture would simply stop improving).
       jitterXU.value = (jitterXU.value + R2_ALPHA1_FX) >>> 0;
       jitterYU.value = (jitterYU.value + R2_ALPHA2_FX) >>> 0;
+      // α is live — see `readAlpha`. Assigning unconditionally would dirty the
+      // uniform every frame; the compare keeps a still scene's upload count at
+      // zero, which the frame-pacing work cares about.
+      const keep = 1 - readAlpha();
+      if (keepU.value !== keep) keepU.value = keep;
       // The stamp advances with the jitter and for the same reason: both are
       // "which frame is this", and the decay pass compares against it exactly.
       // It wraps at 2^32 — 2.2 years at 60 fps, and the only consequence of a
