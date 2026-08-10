@@ -3818,9 +3818,331 @@ structure — but the only dial left is `quality`, whose four tiers set s₀ to
 0.8 / 0.6 / 0.45 / 0.35. That is the sweep to rebuild it around, and the
 prediction §12.22 already made is that it finds NO period at s₀ at all.
 
-### 12.27 Phase 4, unit 4 — the lattice probe. PHASE 4 IS COMPLETE.
+### 12.26 Phase 5, unit 1 — hit shading in the CPU mirror. THE REFERENCE FOR `shadeHit`.
 
-(§12.26 is reserved for a parallel session working the Phase-5 CPU mirror.)
+**Status:** landed on `feature/gi-src`, three commits, CPU only — `srcRef.js` +
+`scripts/run-gi-src-ref-test.mjs`, nothing else touched. `npm run test:gi-src-ref`
+is **124 checks, green, ~9s, no GPU**. `srcDeposit.js`'s `shadeHit` is still
+`null`; this section is the executable spec it has to be filled from, and every
+number below is the mirror's, not a GPU measurement.
+
+#### 12.26.1 What §4.4 turns into, in code
+
+    L_hit = emissive(H) + ρ(H)/π · [ Σ_lights direct(H) + E_secondary(H) ]
+
+New in `srcRef.js`: `faceForward`, `clampLoopAlbedo`, `hashUnitFloat`,
+`makeVisibility`, `sunIrradiance`, `emitterIrradianceExact` (the arbiter),
+`emitterIrradianceNee`, `makeHitShader`, `shadeTrace`, `makeSecondaryCache`,
+`IMPORTANCE_FLOOR_FRACTION`. `traceAndDeposit` needed **no change**: on the CPU
+the geometry trace and the shading compose (`shadeTrace`), which is the same
+split the GPU has (`createSrcSceneTrace` returns a record, `shadeHit` is
+`createSrcDepositFrame`'s own option) and it is what lets the brute-force
+arbiter run the EXACT shading the estimator ran.
+
+Two structural calls worth stating because they are absences:
+
+- **Movers are not a branch.** §4.4 asks for "header mean albedo/emissive
+  Lambert shading", which is the same expression with the surface read from
+  somewhere else — so provenance lives entirely in `surfaceAt` and `shadeHit`
+  never asks. A mover-shaped `if` is the shape of the bug where a moving crate
+  lights the room differently from the identical static one beside it, and that
+  bug is invisible until someone picks the crate up. Gated as an invariance.
+- **The sky is not here.** A ray that escapes composites the sky in
+  `mergeCascades`, at the top cascade, exactly once. Adding it at the hit would
+  double it for every ray that both misses and merges.
+
+#### 12.26.2 R4 IS NOW A MEASUREMENT, AND IT LANDS ON 0.9000 EXACTLY
+
+The multibounce loop is run for real: a closed box, the secondary cache wired to
+the previous iteration's tiles, eleven iterations. In a closed enclosure the
+form-factor matrix has row sums of 1, so the operator is ρ·F and its spectral
+radius is ρ — and `bakeProbeIrradiance` returning exactly π·L̄ for uniform
+radiance (§12.17.2's analytic π) is what makes one turn of the loop exactly ρ·L.
+
+| authored ρ | ceiling | E over 11 iterations | tail increment ratio |
+|---|---|---|---|
+| 1.0 | `MAX_LOOP_ALBEDO` = 0.9 | 0.686 → 3.418 | 0.8988 0.9004 0.8999 **0.9000** |
+| 1.0 | 1.0 (canary) | 0.686 → 5.390 | 0.9986 1.0004 0.9999 **1.0000** |
+
+The clamped series stays under its bound `E₀/(1−ρ)` = 6.86; the canary does not
+converge at all. **The measured rate IS the ceiling, to four figures** — which
+is the strongest form R4 can take, because it says the clamp is not merely
+present but is the thing setting the rate.
+
+**THE CLAIM IS ASYMPTOTIC AND THE FIRST VERSION ASSERTED MORE.** "Every
+increment ratio < 1" failed on the SECOND increment at 1.2494, and the assertion
+was the thing that was wrong: this is a power iteration, and the ratio converges
+to the spectral radius rather than starting there. Bounce 0 is a small bright
+ceiling seen directly; bounce 1 redistributes it over every wall, a larger
+transfer than bounce 0 was. The early ratios carry the geometry of each
+successive redistribution; only the tail carries ρ.
+
+**THE CLAMP SCALES, IT DOES NOT CLIP PER CHANNEL.** Both forms satisfy the
+bound; only one keeps the colour, and colour bleed is the entire product. A
+per-channel `min(ρ, 0.9)` shifts the chromaticity of a warm white (1.0, 0.95,
+0.90) by **1.75e-2**; scaling by `ceiling/peak` shifts it by 5.6e-17 and touches
+nothing at or below the ceiling.
+
+**A BRIGHTENING CANARY GETS EATEN BY THE CEILING.** The transport arm's injected
+fault was ×1.6 on a 0.75 albedo — which is 1.2, which the clamp returns to 0.9,
+a ×1.2 fault worth 11.6% of error and comfortably inside the bar. R4 absorbing
+an injected fault is R4 working; it just makes a brightening canary a poor
+instrument for anything else. It darkens (×0.55) now, and reads 52.9%.
+
+#### 12.26.3 ⚠ THE SHADOW LIFT MOVES THE ORIGIN, SO IT MOVES `maxT` — AND THE WHOLE ANALYTIC EMITTER TERM VANISHES
+
+The single most expensive finding in this unit, and it is one `srcTrace.js` has
+to answer for too.
+
+`createSrcVisibility` starts its shadow ray **0.75 voxels off the surface**
+(R2: every bias tracks the DDA medium's quantization). Its `maxT` is supplied by
+the caller and is naturally measured from the SURFACE point, because that is
+where the light's distance is known. Those two facts do not compose: the same
+world point sits at a different `t` once the origin has moved, and **the emitter
+is the very next thing along the ray past its own `maxT`**. So the shadow ray
+hits the light itself — every light, every hit.
+
+Measured in the mirror as exactly that: **100% of the analytic emitter term
+lost, on three receivers**, while the geometric emission path read correct
+values right beside it. No NaN, no warning, a shadow-ray count that looks
+perfectly healthy, and a scene that is simply black.
+
+The fix needs nothing the GPU does not already have — the endpoint is
+recoverable from `(point, toLight, maxT)` alone, so `makeVisibility` reconstructs
+it and re-measures from the lifted origin. **`createSrcVisibility` in
+`srcTrace.js` needs the same three lines** (not made here; that file belongs to
+another session's working set as of this write).
+
+The lift's other consequence is now measured rather than assumed: **an occluder
+closer to a surface than 0.75 · voxel is stepped over and its contact shadow is
+lost**. Swept at voxel 0.2m (lift 0.150m): lit at 0.02 / 0.08 / 0.14, shadowed at
+0.16 / 0.20 / 0.35 — the threshold is exactly the lift. That is not an epsilon to
+tune down (a smaller one re-acnes at the same voxel scale); it is the medium
+showing through, and the value of having the number is that a lost contact
+shadow becomes recognizable instead of investigable.
+
+`makeVisibility` **throws without a voxel size**. A caller that does not know its
+medium's quantization cannot cast a correct shadow ray, and inventing a default
+is how the wrong bias ships.
+
+#### 12.26.4 THE FACE-FORWARD FLIP BELONGS HERE, AND NOT FOR THE REASON §12.17 GAVE
+
+§12.17 concluded that the face-forward flip belongs at the engine boundary
+(`readPixel`) and never in a kernel, because a flip on one side of the CPU/GPU
+boundary made each side fill the half of the bin sphere the other never read.
+**The hit normal is not that normal.** It is produced by the trace inside the
+same kernel that consumes it, one line earlier, and a record normal is
+sign-aligned to the occupancy gradient — it knows nothing about which side a
+particular ray approached from. Unflipped, every hit on the far face of a wall
+returns cos < 0 for every light and shades black: half the geometry in a closed
+room, dark.
+
+Gated two ways: `faceForward` only ever flips the SIGN (2,000 random pairs), and
+a scene whose record normals are all reported the other way round shades
+**bit-identically**.
+
+#### 12.26.5 ONE-SAMPLE NEE IS EXACT IN LUMINANCE AND NOT PER CHANNEL
+
+With `p_i ∝ luminance(E_i)`, `E_i/p_i` is the SUM in luminance for whichever i is
+drawn: one sample is not an unbiased estimate of the total, it **is** the total,
+to 2.28e-16, for every ray index.
+
+It does not hold per channel, and the first version of the arm asserted that it
+did (it failed at 7.4×). The reason is a property of every importance-sampled
+NEE and it will arrive on the GPU as coloured noise nobody predicted: **the pdf
+is one scalar and the signal has three components**, so a draw that is exact in
+the ranked quantity redistributes the other two. A red emitter drawn in place of
+a blue one of equal luminance returns the right amount of light in the wrong
+hue. Measured spread over the same 4,000 draws: **740% per channel, 2.28e-16 in
+luminance.** The control that turns the paragraph into a measurement is a
+grey-emitter arm, where the per-channel error collapses to 1.14e-16 too.
+
+Consequences worth carrying into the GPU work: compare estimators in the
+quantity they estimate (a per-channel standard error reported **1.17×** for a
+change actually worth 3.00×), and if chromatic noise ever matters, the fix is to
+rank per channel or spend samples — not to blame the tree.
+
+**What a knows-nothing ranking costs: 3.00× the standard error at equal sample
+count, i.e. 9× the samples for equal noise.** That is the ceiling on what
+`lightTree.js`'s bounds-based descent can lose against the exact factor, and the
+reason the reference takes `importance` as a parameter instead of asserting the
+exact one.
+
+**`neeSamples` is stratified** (`(s + hash)/S`, one draw per stratum):
+1 → 4 samples cuts the standard error **2.61×** where independent draws would
+give 2.00×. Asserting only "the mean is still right" would have passed on a loop
+that draws the same light S times and divides by S.
+
+#### 12.26.6 THE IMPORTANCE FLOOR IS A DIAGNOSIS, NOT A REPAIR
+
+R1 in its sampling costume: an emitter with a nonzero contribution and a zero
+pick probability is energy that vanishes with nothing to attribute it to. The
+first version floored the weight at a fixed `1e-12` — which trades a lost light
+for a **firefly**, because the estimator divides by the pdf, and "fireflies are
+impossible by construction here" is a property this module relies on.
+
+The floor is now `IMPORTANCE_FLOOR_FRACTION` (1/1024) of the **mean importance
+among contributors** — scale-invariant, because a light tree's importance is in
+units of its own and not comparable to an irradiance. It binds only when an
+importance function is wrong, so the exact-pdf case is untouched and the
+zero-variance property survives, and `stats.importanceFloored` counts the times
+it bound.
+
+Measured on a zero-ranked VISIBLE emitter, 200,000 draws: energy survives
+(2.08% off, inside its own 3σ), worst single-sample weight **3577× the mean
+against the 4096 = contributors/floorFraction analytic bound**, standard error
+**37×** the correct ranking's. So: the floor keeps the energy, bounds the
+firefly, and hands back the variance. It does not make a broken ranking usable
+— the counter is what says one is broken.
+
+**The first version of that arm zero-ranked an OCCLUDED emitter** and passed
+with the floor doing no work at all: an arm whose subject contributes zero
+cannot fail.
+
+#### 12.26.7 R5: THE HANDOFF, MEASURED AT 1.45% — AND THE FIRST COMPARISON WAS OF TWO DIFFERENT QUANTITIES
+
+The two representations of one emitter only meet **at a shading point**. The
+first version of this arm measured a floor receiver's irradiance with NEE off
+(the light arriving *directly* from the emitter) against the same receiver with
+NEE on and the emission zeroed (the light arriving *after bouncing off the
+walls*) — the direct and indirect terms, which have no reason to be equal. It
+read a 100% gap while both halves were correct.
+
+Stated properly, at a point H:
+
+- **analytic** — `refSphereAt`'s closed form (imported from `emitterShapes.js`,
+  not re-derived: the horizon-faded factor NEE actually evaluates) × one binary
+  visibility ray;
+- **geometric** — brute-force MC over H's hemisphere with the emitter as the
+  only emissive surface and every albedo zero.
+
+Worst gap over three receivers: **1.45%** (0.17% under the luminaire, 0.29% off
+to one side, 1.45% on a wall). That is R5's calibration and it is the number the
+GPU's emitter handoff has to reproduce. It is approximate by construction — an
+analytic form factor times a single binary visibility cannot resolve a
+partially-occluded emitter — and it is the SAME approximation the screen chain's
+analytic emitter direct already makes, which is precisely why they can agree.
+
+**The flag, through the whole transport.** SRC feeds indirect only; the pixel's
+direct emitter light comes from the screen chain. A ray that lands on a
+NEE-sampled emitter and reports its emission delivers that direct light a second
+time. Flagged vs unflagged, mean floor irradiance over the whole floor:
+**0.666 vs 1.734 — 2.60×.**
+
+**A single gather point could not see it.** The first version read one floor
+point and found 1.00×: the ~57 rays that land on the emitter are spread thinly
+across the floor's probes, and the sampled point's eight probes happened to hold
+none of them. The double count was there the whole time. **An energy claim wants
+an energy statistic** — the mean over the floor, not a sample of it.
+
+#### 12.26.8 BOUNCE COLOUR REACHES THE SCREEN, AND A BOUNCE NEEDS SOMETHING TO BOUNCE
+
+The headline arm: a 4m box, one red wall, one green wall, a spherical luminaire,
+NEE, flagged. Floor chromaticity —
+
+| where | r | g | b |
+|---|---|---|---|
+| near the red wall | **0.402** | 0.319 | 0.278 |
+| centre | 0.372 | 0.346 | 0.282 |
+| near the green wall | 0.333 | **0.389** | 0.278 |
+
+with the R14 control first: **`shadeHit` absent gives the floor exactly zero.**
+
+Against the brute-force arbiter over the same shading, receivers ≥ 2·s₀ from
+every wall: **14.4% at s₀=0.4, 11.1% at s₀=0.2** — bounded and non-diverging,
+the same discipline (and the same reason) as the unshaded transport arm, with a
+×0.55 albedo canary at 52.9%.
+
+Three instrument findings, all of which read as transport failures:
+
+- **A BOUNCE NEEDS SOMETHING TO BOUNCE.** The first version lit the room with an
+  emissive CEILING and no analytic light. A wall hit then shades
+  `emissive + ρ/π·E` with E = 0 — every wall returns black, the only nonzero
+  radiance in the room is the ceiling's own emission, and the floor reads a
+  flawless neutral 3.12. That is a correct single bounce of a light that reaches
+  surfaces by no path. **Colour bleed is a second transport**: something has to
+  light the wall before the wall can tint anything, and in SRC that something is
+  the hit shading's own direct term.
+- **THE PIXEL GRID HAS TO FOLLOW s₀.** A fixed 0.4m grid feeding a 0.2m lattice
+  leaves lattice nodes with no pixel on them, and a query point sitting exactly
+  ON such a node puts all eight trilinear weights on corners that do not exist —
+  the gather renormalizes over an empty set and returns 0, which the refinement
+  sweep read as "halving s₀ made the error 100%". A gbuffer is denser than the
+  probe lattice by construction, so the fixture has to be too.
+- **A SUN CANNOT BE TESTED INSIDE A CLOSED BOX.** Every shadow ray reported
+  occluded — correctly, because a ceiling is between every point and the sun.
+  Every sun measurement read zero, which is indistinguishable from a broken
+  shadow ray. `makeOpenScene` exists for this now.
+
+The centre-vs-wall chromaticity was also **sampling noise until the ray budget
+quadrupled**: at 24 rays/pixel the room's centre read *redder* than the point
+beside the red wall. A chromaticity difference of a few points is well inside the
+per-probe noise of a sparse field, so a bleed arm needs a budget chosen for the
+statistic, not for the runtime.
+
+#### 12.26.9 THE COARSE SECONDARY CACHE BRIGHTENS — AND THAT IS THE LEAK, IN A FEEDBACK LOOP
+
+§4.1 step [J] runs the secondary cache "2 LODs coarser". That needs no parameter:
+a coarser cache **is** a frame built at a coarser `spacing0`, handed to the same
+`makeSecondaryCache`. What matters is what survives it.
+
+| cache spacing (2m box, s₀ = 0.5) | E_final | contraction rate |
+|---|---|---|
+| 0.5 (same) | 3.4176 | 0.9000 |
+| 1.0 (1 LOD coarser) | 3.4347 | 0.9001 |
+| 2.0 (2 LODs coarser) | 3.5539 | 0.9001 |
+
+**R4 survives the coarsening exactly** — the fixed point moves, the rate does
+not. But the direction is the opposite of the one I asserted first: I claimed a
+coarse cache "costs energy monotonically, never gains any", reasoning that
+averaging over a bigger cell can only blur light away. It failed at **+3.99%**.
+
+The cause is a limitation this suite already has an arm for: **the near-geometry
+interpolation leak is proportional to PROBE SPACING**, so a 4× coarser cache has
+4× the spacing over which its trilinear corners can straddle a wall, and leak is
+one-sided BRIGHT. Coarsening [J] does not lose energy — it invents some. That
+matters more here than at the primary field because this one is **in a feedback
+loop**: a leak that brightens the cache brightens the next bounce that reads it.
+R4 is what stops it running away, and the flat 0.9001 column is the evidence.
+
+The other half of the finding: **the coarsening is bounded by SCENE SCALE, not
+chosen freely.** A 2m box at 2 LODs coarser has a 2m cache lattice — one probe
+for the whole room — so the +3.99% is a property of the ratio (cache spacing /
+scene size) and not a verdict on the 4×. On a Sponza-scale scene the same 4× is
+a 2m cache in a 30m nave. Pick it against a real scene.
+
+#### 12.26.10 WHAT THE GPU SIDE NEEDS FROM THIS, AND WHAT IS NOT DONE
+
+Handoff list, in the order a Phase-5 GPU unit would want it:
+
+1. **`shadeHit(hitRecord, dir, rayIndex) → vec3`** in `srcDeposit.js` —
+   `makeHitShader` is the body, line for line. `rayIndex` is already threaded
+   through the kernel (it is `n`), and NEE needs it for exactly the reason the
+   synthetic trace does: a pure function of a u32 is bit-identical across the
+   boundary where an RNG state is not.
+2. **`createSrcVisibility` must re-measure `maxT` from the lifted origin**
+   (§12.26.3). Three lines, no new bindings. Without it the analytic emitter
+   term is exactly zero and nothing says so.
+3. **The emitter flag has to reach the hit.** R5's zeroing needs `surfaceAt` to
+   report *which* emitter a hit landed on, which means the voxelize-time surface
+   record (and the mover header) carry an emitter id, not just an emissive
+   colour. This is the one item that is not a shader change.
+4. `MAX_LOOP_ALBEDO` is applied **scaled, not clipped per channel**, and it is
+   applied at the hit — inside the loop — never at the `intensity` prop.
+5. The face-forward flip is at the HIT, in the kernel (§12.26.4) — which is a
+   deliberate exception to §12.17's rule, for a stated reason.
+
+**Not done, and not claimed:** `lightTree.js` is still unwired. The reference
+defines the interface NEE needs (`irradianceAt`, `sampleTarget`, a pluggable
+`importance`) and prices what a bounds-based ranking can cost (3.00×), but it
+does not build or descend a tree — that is GPU-side integration with its own
+suite (`run-gi-light-tree-test.mjs`). Neither is the swept per-probe mover
+invalidation from §7's Phase-5 list, nor any of that phase's GPU probe gates
+(`probe:gi-mover-bounce`, `probe:gi-emissive-cost`, `probe:gi-emitter-cap`,
+`run-gi-game-perf-probe`) — those measure a GPU that has no hit shading yet.
+This unit is the mirror, and the mirror is green.
+
+### 12.27 Phase 4, unit 4 — the lattice probe. PHASE 4 IS COMPLETE.
 
 §7's last Phase 4 gate item: *"`probe:gi-block-size` ACF (expect block scale to
 track s₀·LOD — measure the world period, R14)."*
