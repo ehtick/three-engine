@@ -550,66 +550,162 @@
             );
           }
 
-          // ── THE c0-ONLY RESOLVE (plan §12.13.5 unit 4) ──────────────────
+          // ── [G] THE MERGE (plan §12.18.7 unit 3) ────────────────────────
           //
-          // The output is a StorageTexture, and reading one back headlessly is
-          // the rig problem [[gi-harness-viewport-traps]] records — so the
-          // gather writes the numbers a gate needs into a buffer alongside the
-          // pixels. These four failures look identical on screen and different
-          // here: no probe, every bin unknown, lit but flat, lit and varying.
+          // `test:gi-src-merge` owns the arithmetic, against `mergeCascades` on
+          // a synthesized field. What it cannot see is the REAL population: its
+          // gbuffer is 620 scattered synthetic pixels, and whether cascade 3
+          // actually has probes where cascade 2 looks for them is a property of
+          // a real frame. So this arm checks the CONNECTIVITY of the ladder and
+          // leaves the values to the gate.
+          const mg = s.merge;
+          if (!mg?.dispatched) throw new Error("src arm: the merge never dispatched");
+          srcReport.merge = {
+            bins: mg.bins, merged: mg.merged, orphans: mg.orphans, sky: mg.sky,
+            corners: +mg.meanCorners.toFixed(2),
+            orphanRate: +(mg.orphanRate * 100).toFixed(2),
+            resolvedRate: +(mg.resolvedRate * 100).toFixed(1),
+          };
+          if (!(mg.bins > 0)) {
+            throw new Error(
+              "src arm: the merge visited no known bin — [F] resolved nothing, or the " +
+              "merge is addressing a different block region than the deposit",
+            );
+          }
+          if (mg.merged + mg.orphans !== mg.bins) {
+            throw new Error(
+              `src arm: the merge visited ${mg.bins} known bins but accounted for ` +
+              `${mg.merged} + ${mg.orphans} — a bin took neither branch`,
+            );
+          }
+          // THE ARM THAT MATTERS, and it is about RANGE rather than energy. A
+          // merge whose parent lookups all miss is arithmetically perfect and
+          // completely pointless: every bin keeps its own one-metre interval and
+          // the picture is the c0-only one this unit exists to replace. The
+          // orphan rate is what says whether the ladder is connected, and on a
+          // scene whose cascades are all populated it should be near zero.
+          if (mg.orphanRate > 0.25) {
+            throw new Error(
+              `src arm: ${(mg.orphanRate * 100).toFixed(1)}% of known bins found no parent ` +
+              `value (mean ${mg.meanCorners.toFixed(2)}/8 corners) — the cascade ladder is ` +
+              "not connected, so the merge is buying no range",
+            );
+          }
+          if (!(mg.sky > 0)) {
+            throw new Error("src arm: the top cascade composited the sky into no bin at all");
+          }
+          // ── [H] THE IRRADIANCE TILES (plan §12.18.7 unit 4) ─────────────
+          //
+          // NOTHING READS THE ATLAS YET — [I] is the unit that swaps the gather
+          // over — so this arm is about the bake being connected to a REAL
+          // population rather than about the picture. `test:gi-src-tiles` owns
+          // the integral, the border and the sampler against the mirror.
+          const tl = s.tiles;
+          if (!tl?.dispatched) throw new Error("src arm: the tile bake never dispatched");
+          // `owned` is the denominator that means something: a probe holds one
+          // tile, so texels in tiles nobody claimed are pool headroom rather
+          // than a bake shortfall. Raw coverage reads 1.6% here and 93% of
+          // claimed, and only the second is about [H].
+          const owned = s.cascades[0].live * tl.texelsPerTile;
+          srcReport.tiles = {
+            tiles: tl.tiles, texels: tl.texels, lit: tl.lit, empty: tl.empty, owned,
+            coverage: +(tl.coverage * 100).toFixed(2),
+            claimed: owned > 0 ? +(100 * tl.lit / owned).toFixed(1) : 0,
+            knownBins: +tl.meanKnownBins.toFixed(1), totalBins: tl.totalBins,
+            minLum: +tl.minLum.toFixed(4), maxLum: +tl.maxLum.toFixed(4),
+          };
+          // THE ACCOUNTING CLOSES: every texel took exactly one branch. Cheap,
+          // and it is the one thing here that cannot be true by accident.
+          if (tl.lit + tl.empty !== tl.texels) {
+            throw new Error(
+              `src arm: the bake visited ${tl.texels} texels but accounted for ` +
+              `${tl.lit} + ${tl.empty} — a texel took neither branch`,
+            );
+          }
+          // A CEILING, NOT AN EQUALITY, AND THE FIRST VERSION OF THIS ARM GOT IT
+          // WRONG. It asserted the lit count was a whole number of 64-texel
+          // tiles — true on the gate's dense synthetic field, false on a real
+          // one, and it failed at 10,965/64 = 171.3 tiles. A probe is
+          // POSITION-only: its bins are populated only in the directions its
+          // contributing pixels' hemispheres covered, so a texel whose cosine
+          // lobe points into the unsampled half legitimately finds nothing and
+          // a real tile is PARTIALLY lit. What is still bounded is that no
+          // texel outside a claimed tile can be lit at all.
+          const perTile = tl.texels / tl.tiles;
+          if (tl.lit > s.cascades[0].live * perTile) {
+            throw new Error(
+              `src arm: ${tl.lit} lit tile texels exceeds ${s.cascades[0].live} claimed ` +
+              `blocks x ${perTile} — the bake is writing tiles no probe owns`,
+            );
+          }
+          if (!(tl.lit > 0)) {
+            throw new Error(
+              "src arm: not one tile texel found a known bin — the bake is reading a " +
+              "different block region than the merge wrote",
+            );
+          }
+          // The bake reads MERGED bins, so its peak is the same energy the
+          // gather's is bounded by. A tile brighter than pi*sky is the
+          // normalization overshooting, and it would arrive in [I] as light
+          // from nowhere rather than as a number anyone could trace.
+          if (skyArm > 0 && tl.maxLum > Math.PI * skyArm * 1.05) {
+            throw new Error(
+              `src arm: peak tile irradiance ${tl.maxLum.toFixed(3)} exceeds pi x sky = ` +
+              `${(Math.PI * skyArm).toFixed(3)} — the tile bake is creating energy`,
+            );
+          }
+          if (skyArm === 0 && tl.maxLum !== 0) {
+            throw new Error(
+              `src arm: tiles carry ${tl.maxLum} irradiance with skyIntensity 0 and no hit ` +
+              "shading — the bake is producing light from nothing",
+            );
+          }
+          // ── [I] THE SCREEN GATHER (plan §12.18.7 unit 5) ────────────────
+          //
+          // `test:gi-src-gather` owns the arithmetic against `gatherPixel` and,
+          // crucially, the SMOOTHNESS measurement — a scan line at 3.9 cm steps
+          // inside one 0.5 m cell, which a synthetic gbuffer can pose and a real
+          // one cannot. What this arm owns is the real population: whether the
+          // trilinear stencil finds probes on an actual frame, and whether the
+          // energy ceiling still holds end to end.
           const g = s.gather;
-          if (!g?.dispatched) throw new Error("src arm: the c0-only gather never dispatched");
+          if (!g?.dispatched) throw new Error("src arm: the screen gather never dispatched");
           srcReport.gather = {
-            pixels: g.pixels, unknown: g.unknown, facing: g.facing, badN: g.badNormals, lit: g.lit,
+            pixels: g.pixels, lit: g.lit, empty: g.empty,
+            corners: +g.meanCorners.toFixed(2),
             meanLum: +g.meanLum.toFixed(4), minLum: +g.minLum.toFixed(4),
             maxLum: +g.maxLum.toFixed(4), contrast: +g.contrast.toFixed(3),
-            sampled: +g.meanSampledBins.toFixed(1), totalBins: g.totalBins,
             sky: skyArm,
           };
           if (!(g.pixels > 0)) {
-            throw new Error("src arm: the gather saw no pixel with a c0 probe");
+            throw new Error("src arm: the gather saw no valid gbuffer pixel");
           }
-          // Deposits landed, so a pixel whose every bin is unknown means its
-          // probe got none of them — a broken probe/bin address, not sparsity.
-          // `unknown` is now the FAULT case only (the probe holds no sampled bin
-          // at all); `facing` is the structural one, split out in the kernel.
-          // Deposits landed this frame, so an empty probe means the bins the
-          // deposit wrote and the bins the gather reads are not the same bins.
-          // STRUCTURALLY IMPOSSIBLE SINCE THE VALIDITY FIX, and pinned here so
-          // it stays that way: a pixel with a degenerate normal no longer gets a
-          // probe at all (srcSystem's readPixel). Before that, 46% of this
-          // scene's pixels had one, fired a hemisphere of rays around NaN and
-          // gathered nothing.
-          if (g.badNormals !== 0) {
+          // MORE THAN ONE PROBE PER PIXEL IS THE WHOLE UNIT. At 1.0 this is the
+          // old one-probe-per-pixel resolve wearing a new name, and the picture
+          // is still ~0.6 m rectangles — which is a thing no energy assertion in
+          // this file can see.
+          if (!(g.meanCorners > 1.2)) {
             throw new Error(
-              `src arm: ${g.badNormals}/${g.pixels} gathered pixels have a degenerate gbuffer normal — ` +
-              "the validity test admitted a pixel with no geometry",
+              `src arm: only ${g.meanCorners.toFixed(2)} probes contribute per pixel — the ` +
+              "gather is not interpolating, so the probe-cell blocks are still there",
             );
           }
-          if (g.unknown > g.pixels * 0.02) {
+          // Pixels whose whole trilinear stencil found nothing. Structural when
+          // the population is thin, a fault when it is not — and it is counted
+          // rather than read off the screen as darkness.
+          if (g.empty > g.pixels * 0.02) {
             throw new Error(
-              `src arm: ${g.unknown}/${g.pixels} pixels found their probe EMPTY while ` +
-              `${rays.deposits} deposits landed — the deposit and the gather disagree about addresses`,
+              `src arm: ${g.empty}/${g.pixels} pixels found no probe at all in their ` +
+              "stencil on a scene whose c0 population covers the frame",
             );
           }
           if (skyArm > 0) {
-            // THE PAYOFF ASSERTION. With hit shading still zero the only term
-            // is sky·transmittance, so this is ambient occlusion — and the two
-            // things that must both be true are that light arrives at all, and
-            // that it is NOT uniform. A flat result would mean the occlusion
-            // term is doing nothing, which looks like plain ambient on screen
-            // and passes every other check in this file.
-            // Every pixel that has a probe should end up lit in an open scene:
-            // the only way not to is a fully enclosed hemisphere, and this scene
-            // has none. A shortfall here is the wrong-hemisphere effect, which
-            // is REAL in general (probes are position-only) but should be zero
-            // on a scene this simple.
-            if (g.facing > g.pixels * 0.02) {
-              throw new Error(
-                `src arm: ${g.facing}/${g.pixels} pixels found their probe's bins entirely ` +
-                "outside their own hemisphere on a scene with no enclosed surfaces",
-              );
-            }
+            // THE PAYOFF ASSERTION. With hit shading still zero the only term is
+            // sky x transmittance, so this is ambient occlusion over the whole
+            // cascade reach — and the two things that must both be true are that
+            // light arrives at all, and that it is NOT uniform. A flat result
+            // means the occlusion term is doing nothing, which looks like plain
+            // ambient on screen and passes every other check here.
             if (!(g.lit > 0)) {
               throw new Error(`src arm: sky=${skyArm} and not one pixel came out lit`);
             }
@@ -620,10 +716,10 @@
                 "shading the only term is sky x transmittance, so no contrast means no occlusion",
               );
             }
-            // A fully open hemisphere under uniform sky radiance L returns pi*L
-            // (equal-area bins, Sum max(0,cos)*dOmega = pi). Anything past that
-            // is energy the gather invented — a renormalization that overshoots,
-            // or a solid angle counted twice.
+            // A fully open hemisphere under uniform sky radiance L returns pi*L,
+            // and every renormalization from the deposit through the merge, the
+            // bake and the trilinear gather preserves that exactly. Anything past
+            // it is energy some stage invented.
             const ceiling = Math.PI * skyArm * 1.05;
             if (g.maxLum > ceiling) {
               throw new Error(

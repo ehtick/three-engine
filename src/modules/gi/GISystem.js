@@ -2733,12 +2733,24 @@ export class GISystem {
           srcProbes = null;
         }
       }
-      // SCREEN-SPACE, hence its own input rather than `gather`. `createGiResolve`
-      // also calls `gather` at an exact-reflection HIT, which is an arbitrary
-      // world point this texture cannot answer for; that call site keeps its
-      // `gather == null` behaviour until Phase 3's position-indexed probe
-      // gather exists. See srcGather.js's header.
+      // ── TWO INPUTS, ONE INTEGRAL (plan §12.18.7 unit 5) ─────────────────
+      //
+      // `screenGather` is the PRIMARY diffuse term: computed once per gbuffer
+      // pixel in SRC's own pass and handed over as a texture, because the
+      // resolve kernel is already near the portable eight-storage-buffer limit
+      // and cannot afford the gather's bindings per pixel on top of the
+      // gbuffer, the emitter slots, the occupancy pyramid and the BVH.
+      //
+      // `gather` is the SAME closure, inlined once for the exact-reflection
+      // HIT — an arbitrary world point no screen texture can answer for. That
+      // call site has been on `gather == null` since the transport died
+      // (§12.17.3); [I] is what brings it back, and it is affordable exactly
+      // once because `createSrcHashBlockFrame` collapsed the corner lookup from
+      // three storage buffers to two.
       inputs.screenGather = srcProbes?.gather?.node ?? null;
+      inputs.gather = srcProbes?.gather
+        ? (point, normal) => srcProbes.gather.gatherAt(point, normal).irradiance
+        : null;
       const resolve = createGiResolve({ gbuffer, targets, width, height, ...inputs });
       // The shadow trace as its own pass at its own budget — see
       // createGiLightShadowPass for why it left the resolve kernel.

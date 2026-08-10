@@ -124,6 +124,9 @@
     "test:gi-src-populate": "node scripts/run-gi-src-populate-test.mjs",
     "test:gi-src-rays": "node scripts/run-gi-src-rays-test.mjs",
     "test:gi-src-deposit": "node scripts/run-gi-src-deposit-test.mjs",
+    "test:gi-src-merge": "node scripts/run-gi-src-merge-test.mjs",
+    "test:gi-src-tiles": "node scripts/run-gi-src-tiles-test.mjs",
+    "test:gi-src-gather": "node scripts/run-gi-src-gather-test.mjs",
     "probe:gi-src-visual": "node scripts/run-gi-src-visual.mjs",
     "test:gi-src-volume": "node scripts/run-gi-src-volume-test.mjs",
     "probe:gi-debug-views": "node scripts/run-gi-debug-views-probe.mjs"

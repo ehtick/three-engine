@@ -1,0 +1,646 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>SRC gather gate — createSrcScreenGather vs gatherPixel</title>
+    <style>html,body{margin:0;background:#111;color:#ddd;font:13px monospace}canvas{display:none}</style>
+  </head>
+  <body>
+    <canvas id="view" width="16" height="16"></canvas>
+    <pre id="log"></pre>
+    <script type="module">
+      // ══ THE PHASE-3 UNIT-5 GATE: [I], THE SCREEN GATHER ══════════════════
+      //
+      // Same isolation as the family: own renderer, synthetic gbuffer, no
+      // engine, and a SYNTHESIZED merged c0 field written straight into the
+      // payload buffer so the gate chooses its own inputs.
+      //
+      // ══ §12.10.1's FOUR RETIRED INVARIANTS, FRESHLY WRITTEN ═════════════
+      //
+      // The plan says to write a NEW gather gate rather than repair the dense
+      // backend's, and to carry its four findings forward. Their status here:
+      //
+      //   · "c0DirRes 2 is DEGENERATE" — not applicable: SRC's angular
+      //     resolution is w₀ (32 bins at c0), and there is no dirRes knob.
+      //   · "texels vary 2.73× in solid angle with Δω never written" — SATISFIED
+      //     BY CONSTRUCTION, not by a test. SRC's ray bins are equal-area
+      //     cylindrical, so a bin average IS a solid-angle average; the only
+      //     octahedral surface left is the irradiance tile, which is sampled by
+      //     a NORMAL and carries no Δω weighting by design. Said here rather
+      //     than asserted, because asserting it would test nothing.
+      //   · "a 40° source drifted 2.1× instead of converging" — the FURNACE arm
+      //     below is the strict version: uniform radiance must return exactly
+      //     π·L at every pixel, at any probe density.
+      //   · "accuracy gates measure the REFINEMENT TREND, not a tolerance"
+      //     (§12.2) — the GRADIENT arm, which is what this whole unit exists
+      //     for.
+      //
+      // ══ THE ARMS ════════════════════════════════════════════════════════
+      //
+      //   pixels    every gathered pixel vs `gatherPixel`, over the same
+      //             synthesized field and the same probe set.
+      //   smooth    THE POINT OF THE UNIT. Two pixels a few centimetres apart
+      //             inside one probe cell must differ — a one-probe-per-pixel
+      //             gather is piecewise CONSTANT across a cell, and that is
+      //             exactly what the blocks were. Measured as the share of
+      //             adjacent sample pairs that differ at all, against the same
+      //             measurement made with interpolation disabled.
+      //   furnace   uniform radiance in every bin ⇒ exactly π·L at every
+      //             pixel, whatever the stencil found.
+      //   coverage  a probe that knows NOTHING about a direction must drop out
+      //             of the interpolation, not vote black. Built by making one
+      //             corner's probe one-sided and checking the pixel still reads
+      //             what its informed neighbours say.
+      //   shells    across a LOD boundary the result is continuous — the
+      //             property `lodShells` exists for.
+      //   empty     a point with no probes at all reads exactly zero, and says
+      //             so through its own counter rather than as darkness.
+      //
+      // Run: node scripts/run-gi-src-gather-test.mjs
+      const out = document.querySelector("#log");
+      const say = (line) => { out.textContent += line + "\n"; };
+      let failures = 0;
+      const check = (label, ok, detail = "") => {
+        say(`  ${ok ? "PASS" : "FAIL"} ${label}${detail ? ` — ${detail}` : ""}`);
+        if (!ok) failures++;
+      };
+      const fail = (error) => {
+        console.error("SRC-GATHER FAIL", error?.stack ?? error?.message ?? String(error));
+        globalThis.__SRC_GATHER_RESULT__ = {
+          pass: false, error: error?.message ?? String(error), text: out.textContent,
+        };
+      };
+      globalThis.addEventListener("error", (event) => fail(event.error ?? event.message));
+      globalThis.addEventListener("unhandledrejection", (event) => fail(event.reason));
+
+      try {
+        const THREE = await import("three/webgpu");
+        const TSL = await import("three/tsl");
+        const cfgMod = await import("/src/modules/gi/srcConfig.js");
+        const refMath = await import("/src/modules/gi/srcMath.js");
+        const ref = await import("/src/modules/gi/srcRef.js");
+        const P = await import("/src/modules/gi/srcProbes.js");
+        const D = await import("/src/modules/gi/srcDeposit.js");
+        const H = await import("/src/modules/gi/srcTiles.js");
+        const I = await import("/src/modules/gi/srcScreenGather.js");
+
+        const { instancedArray, uniform, vec3 } = TSL;
+
+        const renderer = new THREE.WebGPURenderer({ canvas: document.querySelector("#view") });
+        await renderer.init();
+        const device = renderer.backend.device;
+        const validationErrors = [];
+        device.addEventListener?.("uncapturederror", (event) => {
+          validationErrors.push(event.error?.message ?? String(event.error));
+          console.error("WebGPU validation error:", validationErrors.at(-1));
+        });
+
+        const rng = (() => {
+          let s = 0x9e3779b9 >>> 0;
+          return () => {
+            s = (s + 0x6d2b79f5) >>> 0;
+            let t = s;
+            t = Math.imul(t ^ (t >>> 15), t | 1);
+            t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+            return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+          };
+        })();
+
+        const S0 = 0.5;
+        const CAM = [1.25, 1.5, -0.75];
+        const ANCHOR = [0.5, -1, 3];
+        const N = cfgMod.CASCADE_COUNT;
+        const W0 = cfgMod.W0;
+        const INTERIOR = cfgMod.IRRADIANCE_TILE_INTERIOR;
+        const NBINS = cfgMod.binCount(0, W0);
+
+        const q32 = new Float32Array(1);
+        const f32 = (v) => { q32[0] = v; return q32[0]; };
+
+        // ══ THE PIXEL SET IS A DENSE STRIP, AND THAT IS FOR THE SMOOTH ARM ══
+        //
+        // The gbuffer here is not a picture — it is a list of query points. Most
+        // of it is a fine SCAN LINE stepping ~4 cm across a floor, which is well
+        // inside one 0.5 m probe cell, because "does the answer vary WITHIN a
+        // cell" is the question this whole unit exists to answer and a scattered
+        // point set cannot ask it.
+        const pixels = [];
+        const addPixel = (p, n) => pixels.push({ position: p.map(f32), normal: n.map(f32) });
+        // Group 0: the scan line. 512 samples over 20 m along +X at y = -1.
+        const SCAN = 512;
+        const SCAN_X0 = -10;
+        const SCAN_STEP = 20 / SCAN;
+        for (let i = 0; i < SCAN; i++) {
+          addPixel([SCAN_X0 + i * SCAN_STEP, -1, 0.3], [0, 1, 0]);
+        }
+        // Group 1: a room's worth of surfaces, so the probe population is a
+        // real lattice rather than a line of collinear cells.
+        for (let i = 0; i < 400; i++) {
+          const u = (rng() - 0.5) * 16;
+          const v = (rng() - 0.5) * 16;
+          const face = Math.floor(rng() * 5);
+          if (face === 0) addPixel([u, -1, v], [0, 1, 0]);
+          else if (face === 1) addPixel([u, 4, v], [0, -1, 0]);
+          else if (face === 2) addPixel([-8, v * 0.4 + 1, u], [1, 0, 0]);
+          else if (face === 3) addPixel([8, v * 0.4 + 1, u], [-1, 0, 0]);
+          else addPixel([u, v * 0.4 + 1, 8], [0, 0, -1]);
+        }
+        // Group 2: a radial line crossing a LOD boundary, for the shell arm.
+        // `lodRadius` is the law's own inverse — an inline `S0·2^lod` would put
+        // every one of these inside LOD 0 (§12.19.2).
+        const SHELL_N = 256;
+        const shellStart = pixels.length;
+        const rBoundary = cfgMod.lodRadius(0, S0);
+        for (let i = 0; i < SHELL_N; i++) {
+          const r = rBoundary * (0.75 + 0.5 * (i / (SHELL_N - 1)));
+          addPixel([CAM[0] + r, -1, CAM[2]], [0, 1, 0]);
+        }
+        // THERE IS NO "FAR FROM EVERY PROBE" GROUP IN HERE, and the first
+        // version's was a gate bug worth recording: the population inserts a
+        // probe at EVERY valid gbuffer pixel, so 16 points at (900, 900, 900)
+        // created 16 probes at (900, 900, 900) and then gathered from them.
+        // "A point with no probes" cannot be expressed as a gbuffer pixel at
+        // all. It gets its own query gather below — which is also the shape
+        // `createGiResolve` uses for a reflection hit.
+        const emptyStart = pixels.length;
+        const PIXELS = pixels.length;
+
+        const attrs = new Float32Array(PIXELS * 8);
+        for (let i = 0; i < PIXELS; i++) {
+          attrs[i * 8] = pixels[i].position[0];
+          attrs[i * 8 + 1] = pixels[i].position[1];
+          attrs[i * 8 + 2] = pixels[i].position[2];
+          // Group 3 is VALID as a gbuffer sample — it must reach the gather and
+          // come back empty, not be skipped before it gets there.
+          attrs[i * 8 + 3] = 1;
+          attrs[i * 8 + 4] = pixels[i].normal[0];
+          attrs[i * 8 + 5] = pixels[i].normal[1];
+          attrs[i * 8 + 6] = pixels[i].normal[2];
+        }
+        const posBuf = instancedArray(attrs.slice(), "vec4");
+        const readPixel = (i) => {
+          const t = posBuf.element(i.mul(2)).toVar();
+          const n = posBuf.element(i.mul(2).add(1)).toVar();
+          return { position: t.xyz, valid: t.w.greaterThan(0.5), normal: n.xyz };
+        };
+
+        const store = P.createSrcProbeStore({
+          c0Probes: 4096, cascadeCount: N, blockCapacity: [2048, 1024, 512, 512],
+        });
+        const cameraU = uniform(new THREE.Vector3(...CAM));
+        const anchorU = uniform(new THREE.Vector3(...ANCHOR));
+        const skyU = uniform(new THREE.Vector3(0, 0, 0));
+
+        const frame = P.createSrcProbeFrame(store, {
+          spacing0: S0, camera: vec3(cameraU), anchor: vec3(anchorU),
+          pixelCount: PIXELS, readPixel,
+        });
+        const bins = D.createSrcBinStore(store, { w0: W0 });
+        const tiles = H.createSrcTileAtlas(store, bins, { w0: W0, sky: vec3(skyU) });
+        const hashBlock = P.createSrcHashBlockFrame(store, 0);
+        const gather = I.createSrcScreenGather(store, tiles, {
+          lookup: hashBlock.lookup,
+          spacing0: S0,
+          camera: vec3(cameraU),
+          anchor: vec3(anchorU),
+          readPixel,
+          // The "screen" is a 1-D strip here: the pass writes one texel per
+          // query point, which is all the gather's own output shape requires.
+          width: PIXELS,
+          height: 1,
+          maxLods: cfgMod.MAX_LODS,
+          w0: W0,
+        });
+
+        // ══ A SECOND GATHER OVER ARBITRARY QUERY POINTS ══════════════════
+        //
+        // Not part of the gbuffer, so nothing in the population knows these
+        // points exist — which is the only way to ask "what does a point with
+        // no probes read?" and get an honest answer.
+        //
+        // It is also the exact shape `createGiResolve` uses for an
+        // EXACT-REFLECTION HIT: `gatherAt` at an arbitrary world point, through
+        // the same closure, with no screen texture in sight. So this arm covers
+        // the call site that has been on `gather == null` since the transport
+        // died, and it costs one more instance of the same builder.
+        const NQ = 32;
+        const queryArr = new Float32Array(NQ * 8);
+        for (let i = 0; i < NQ; i++) {
+          queryArr[i * 8] = 900 + i * 40;
+          queryArr[i * 8 + 1] = 900;
+          queryArr[i * 8 + 2] = 900;
+          queryArr[i * 8 + 3] = 1;
+          queryArr[i * 8 + 5] = 1;
+        }
+        const queryBuf = instancedArray(queryArr, "vec4");
+        const queryRead = (i) => {
+          const t = queryBuf.element(i.mul(2)).toVar();
+          const n = queryBuf.element(i.mul(2).add(1)).toVar();
+          return { position: t.xyz, valid: t.w.greaterThan(0.5), normal: n.xyz };
+        };
+        const queryGather = I.createSrcScreenGather(store, tiles, {
+          lookup: hashBlock.lookup,
+          spacing0: S0, camera: vec3(cameraU), anchor: vec3(anchorU),
+          readPixel: queryRead, width: NQ, height: 1,
+          maxLods: cfgMod.MAX_LODS, w0: W0,
+        });
+        const queryDump = instancedArray(new Float32Array(NQ * 4), "float");
+        const queryRead2 = TSL.texture(queryGather.target);
+        const queryDumpPass = TSL.Fn(() => {
+          const i = TSL.instanceIndex.toVar();
+          const c = queryRead2.load(TSL.ivec2(i.toInt(), TSL.int(0))).toVar();
+          const o = i.mul(4).toVar();
+          queryDump.element(o).assign(c.x);
+          queryDump.element(o.add(TSL.uint(1))).assign(c.y);
+          queryDump.element(o.add(TSL.uint(2))).assign(c.z);
+        })().compute(NQ);
+
+        // Readback of the gather's output texture — a compute pass rather than
+        // `copyTextureToBuffer`, whose rows pad to 256 B
+        // ([[webgpu-readback-padding]]).
+        const dump = instancedArray(new Float32Array(PIXELS * 4), "float");
+        const gatherRead = TSL.texture(gather.target);
+        const dumpPass = TSL.Fn(() => {
+          const i = TSL.instanceIndex.toVar();
+          const c = gatherRead.load(TSL.ivec2(i.toInt(), TSL.int(0))).toVar();
+          const o = i.mul(4).toVar();
+          dump.element(o).assign(c.x);
+          dump.element(o.add(TSL.uint(1))).assign(c.y);
+          dump.element(o.add(TSL.uint(2))).assign(c.z);
+        })().compute(PIXELS);
+
+        say(`pixels ${PIXELS} (${SCAN} scan @ ${(SCAN_STEP * 100).toFixed(1)}cm, ` +
+          `${SHELL_N} shell, 16 empty)  s0 ${S0}  |D0| ${NBINS} bins`);
+        say(`atlas ${tiles.layout.width}x${tiles.layout.height}, hashBlock ` +
+          `${(hashBlock.bytes / 1024).toFixed(0)}KB, ${(tiles.bytes / 1048576).toFixed(2)}MB`);
+        say("");
+
+        for (const pass of frame.passes) await renderer.computeAsync(pass);
+        const table = new Uint32Array(await renderer.getArrayBufferAsync(store.probeTable.value));
+        const keyToBlock = new Map();
+        {
+          const pc = store.cascades[0];
+          for (let k = 0; k < pc.probeCapacity; k++) {
+            const w = (pc.probeBase + k) * P.PROBE_WORDS;
+            if ((table[w + P.PROBE_FLAGS] & P.FLAG_ALIVE) === 0) continue;
+            const block = table[w + P.PROBE_BLOCK] >>> 0;
+            if (block === P.SLOT_EMPTY) continue;
+            keyToBlock.set(table[w + P.PROBE_KEY] >>> 0, block);
+          }
+        }
+
+        const info = bins.cascades[0];
+        const payloadArray = bins.payload.value.array;
+        const writeField = (fill) => {
+          for (let i = 0; i < bins.binTotal; i++) {
+            const o = i * D.PAYLOAD_WORDS;
+            payloadArray[o] = 0;
+            payloadArray[o + 1] = 0;
+            payloadArray[o + 2] = 0;
+            payloadArray[o + 3] = D.PAYLOAD_UNKNOWN;
+          }
+          for (const [key, block] of keyToBlock) {
+            for (let m = 0; m < NBINS; m++) {
+              const v = fill(key, m);
+              if (!v) continue;
+              const o = (info.binBase + block * NBINS + m) * D.PAYLOAD_WORDS;
+              payloadArray[o] = v.radiance[0];
+              payloadArray[o + 1] = v.radiance[1];
+              payloadArray[o + 2] = v.radiance[2];
+              payloadArray[o + 3] = v.transmittance;
+            }
+          }
+          bins.payload.value.needsUpdate = true;
+        };
+        const run = async () => {
+          for (const pass of tiles.passes) await renderer.computeAsync(pass);
+          await renderer.computeAsync(hashBlock.pass);
+          await renderer.computeAsync(gather.reset);
+          await renderer.computeAsync(gather.compute);
+          await renderer.computeAsync(dumpPass);
+          return new Float32Array(await renderer.getArrayBufferAsync(dump.value));
+        };
+
+        // A merged c0 field: strongly DIRECTION-dependent and strongly
+        // PROBE-dependent, because a gather that ignored either would still
+        // look plausible against a smooth one. T = 0 is the post-merge shape.
+        const synthBin = (key, m) => {
+          const seed = (key + Math.imul(m, 0x85ebca6b)) >>> 0;
+          const h = refMath.hashKey(seed) >>> 0;
+          if (h % 7 === 0) return null;
+          return {
+            radiance: [
+              ((h >>> 3) & 255) / 256,
+              ((h >>> 11) & 255) / 256,
+              ((h >>> 19) & 255) / 256,
+            ],
+            transmittance: 0,
+          };
+        };
+
+        writeField(synthBin);
+        const got = await run();
+        const gStats = await gather.readStats(renderer);
+
+        // ── the mirror ───────────────────────────────────────────────────
+        const cfg = ref.makeSrcConfig({
+          spacing0: S0, camera: CAM, anchor: ANCHOR, cascadeCount: N,
+          maxLods: cfgMod.MAX_LODS, sky: [0, 0, 0],
+        });
+        const built = ref.buildProbes(cfg, pixels);
+        const merged = [built.cascades[0].probes.map((probe) => {
+          const values = new Array(NBINS);
+          for (let m = 0; m < NBINS; m++) values[m] = synthBin(probe.key >>> 0, m);
+          return values;
+        })];
+        const mirrorTiles = ref.bakeProbeIrradiance(cfg, built, merged, 0, INTERIOR);
+        const mirrorCover = ref.bakeProbeCoverage(cfg, built, merged, 0, INTERIOR);
+        const want = pixels.map((px) =>
+          ref.gatherPixel(cfg, built, mirrorTiles, px.position, px.normal, INTERIOR, mirrorCover));
+
+        const mirrorFailures = built.cascades.reduce((a, m) => a + m.insertFailures, 0);
+        check("the mirror's probe maps had room for every key", mirrorFailures === 0,
+          `${mirrorFailures} dropped`);
+        check("the GPU and mirror agree on the c0 probe set",
+          built.cascades[0].probes.length === keyToBlock.size,
+          `${keyToBlock.size} gpu vs ${built.cascades[0].probes.length} mirror`);
+
+        // ══ ARM 1: every pixel vs gatherPixel ═══════════════════════════
+        say("");
+        say("── PIXELS: every gathered point against gatherPixel ──");
+        // The bound is the tile atlas's f16 storage plus the hardware bilinear
+        // weights' reduced precision, both measured in §12.21 (2.4e-4 and
+        // 1/256 of the tile's range). Stated against the SCENE's scale rather
+        // than each pixel's own value — the same metric lesson §12.21.7 paid
+        // for, where dividing by a near-zero value manufactured 6.2%.
+        let scale = 0;
+        for (const w of want) scale = Math.max(scale, w[0], w[1], w[2]);
+        const TOL = 0.01;
+        let wrong = 0;
+        let worst = 0;
+        let checked = 0;
+        let worstDetail = null;
+        for (let i = 0; i < emptyStart; i++) {
+          checked++;
+          for (let ch = 0; ch < 3; ch++) {
+            const err = Math.abs(got[i * 4 + ch] - want[i][ch]) / Math.max(1e-4, scale);
+            worst = Math.max(worst, err);
+            if (err > TOL) {
+              wrong++;
+              worstDetail ??= `px ${i}: gpu ${got[i * 4 + ch].toFixed(5)} vs ` +
+                `mirror ${want[i][ch].toFixed(5)}`;
+            }
+          }
+        }
+        check("every pixel matches gatherPixel", wrong === 0,
+          `${wrong}/${checked * 3} channels differ${worstDetail ? ` — ${worstDetail}` : ""}`);
+        say(`   worst ${(worst * 100).toFixed(2)}% of the scene's peak (${scale.toFixed(3)}) ` +
+          `against a ${TOL * 100}% bound — f16 tiles + hardware filter weights`);
+        check("the comparison was not vacuous", checked > 500 && scale > 0.1,
+          `${checked} pixels, peak ${scale.toFixed(3)}`);
+
+        // ══ ARM 2: THE POINT OF THE UNIT ═══════════════════════════════
+        say("");
+        say("── SMOOTH: the answer varies WITHIN a probe cell ──");
+        // §12.17's picture was ~0.6 m rectangles and §12.19 established they
+        // were the probe cells at the CORRECT spacing — one probe per pixel
+        // with no interpolation is piecewise CONSTANT across a cell, so no
+        // probe density could ever remove them.
+        //
+        // The instrument is the scan line: consecutive samples 3.9 cm apart,
+        // far inside a 0.5 m cell. A piecewise-constant gather leaves long runs
+        // of IDENTICAL values broken by cliffs at cell boundaries; an
+        // interpolated one changes at every step. So the measurement is the
+        // share of adjacent pairs that differ at all, and the CONTROL is the
+        // same measurement over the mirror with interpolation switched off —
+        // which is what makes the number mean something rather than being a
+        // statistic with no scale.
+        let varied = 0;
+        let jumps = 0;
+        let maxStep = 0;
+        for (let i = 1; i < SCAN; i++) {
+          let d = 0;
+          for (let ch = 0; ch < 3; ch++) d = Math.max(d, Math.abs(got[i * 4 + ch] - got[(i - 1) * 4 + ch]));
+          if (d > 1e-5) varied++;
+          maxStep = Math.max(maxStep, d);
+          // A CLIFF: a step bigger than a fifth of the scene's peak between two
+          // samples 3.9 cm apart is a discontinuity, not a gradient.
+          if (d > scale * 0.2) jumps++;
+        }
+        // The control: nearest-probe, no interpolation, over the same points.
+        let ctrlVaried = 0;
+        for (let i = 1; i < SCAN; i++) {
+          const at = (k) => {
+            const p = pixels[k].position;
+            const origin = ref.latticeOrigin(cfg, 0, 0);
+            const c = refMath.nearestCell(p[0], p[1], p[2], origin[0], origin[1], origin[2], S0);
+            const key = refMath.packProbeKey(0, false, c.cx, c.cy, c.cz);
+            const slot = built.cascades[0].find(key);
+            return slot < 0 ? null : ref.sampleTile(
+              mirrorTiles[slot], INTERIOR,
+              pixels[k].normal[0], pixels[k].normal[1], pixels[k].normal[2],
+            );
+          };
+          const a = at(i);
+          const b = at(i - 1);
+          if (!a || !b) continue;
+          let d = 0;
+          for (let ch = 0; ch < 3; ch++) d = Math.max(d, Math.abs(a[ch] - b[ch]));
+          if (d > 1e-5) ctrlVaried++;
+        }
+        const variedPct = 100 * varied / (SCAN - 1);
+        const ctrlPct = 100 * ctrlVaried / (SCAN - 1);
+        say(`   interpolated: ${variedPct.toFixed(1)}% of 3.9cm steps change value` +
+          `   |   nearest-probe control: ${ctrlPct.toFixed(1)}%`);
+        check("nearly every step inside a cell changes the answer", variedPct > 90,
+          `${variedPct.toFixed(1)}% — below this the gather is piecewise constant, ` +
+          "i.e. the blocks are still there");
+        check("the control really is piecewise constant", ctrlPct < 25,
+          `${ctrlPct.toFixed(1)}% — a high number would mean the scan line crosses cells ` +
+          "often enough that the arm above proves nothing");
+        check("no cliffs inside the scan", jumps === 0,
+          `${jumps} steps jump more than 20% of the scene peak in 3.9cm`);
+
+        // ══ ARM 3: the furnace ═════════════════════════════════════════
+        say("");
+        say("── FURNACE: uniform radiance returns exactly π·L everywhere ──");
+        // §12.10.1's "a 40° source drifted 2.1× instead of converging", in its
+        // strict form. Every renormalization in the chain — the bake's
+        // Σ(L·W)/Σ(W), the tile's coverage, the trilinear Σw, the shell blend —
+        // must preserve a constant exactly, at ANY probe density and whatever
+        // the stencil found. Anything that divides by the wrong denominator
+        // shows up here and nowhere else.
+        const FURNACE_L = [0.75, 0.5, 0.25];
+        writeField(() => ({ radiance: FURNACE_L, transmittance: 0 }));
+        const furnace = await run();
+        let furnaceWrong = 0;
+        let furnaceWorst = 0;
+        let furnaceChecked = 0;
+        for (let i = 0; i < emptyStart; i++) {
+          // Only points that found a probe at all — an empty point is arm 6.
+          if (furnace[i * 4] === 0 && furnace[i * 4 + 1] === 0 && furnace[i * 4 + 2] === 0) continue;
+          furnaceChecked++;
+          for (let ch = 0; ch < 3; ch++) {
+            const w = Math.PI * FURNACE_L[ch];
+            const rel = Math.abs(furnace[i * 4 + ch] - w) / w;
+            furnaceWorst = Math.max(furnaceWorst, rel);
+            if (rel > 0.005) furnaceWrong++;
+          }
+        }
+        check("every gathered pixel reads exactly π·L", furnaceWrong === 0,
+          `${furnaceWrong}/${furnaceChecked * 3} channels differ, worst relative ` +
+          `${furnaceWorst.toExponential(2)} (π·L = ${(Math.PI * FURNACE_L[0]).toFixed(5)})`);
+        check("the furnace covered essentially every point", furnaceChecked > emptyStart * 0.9,
+          `${furnaceChecked}/${emptyStart}`);
+
+        // ══ ARM 4: an uninformed probe drops out, it does not vote black ══
+        say("");
+        say("── COVERAGE: a probe that knows nothing is ABSENT, not dark ──");
+        // R1, at the level [I] operates on. A quarter of the probes are given a
+        // narrow cap of known bins (§12.21.5 — a hemisphere is not enough to
+        // leave a texel uncovered), so a downward-facing query hits tiles that
+        // are uncovered in that direction. With coverage folded into the weight
+        // those probes drop out and the informed ones carry the pixel; without
+        // it, the pixel is dimmed by the fraction of its stencil that had
+        // nothing to say.
+        //
+        // The CONTROL is the same field gathered with coverage IGNORED, which
+        // is what the mirror does when handed no coverage array — so the arm
+        // reports the size of the effect rather than asserting into air.
+        const capped = (key, m) => {
+          const base = synthBin(key, m);
+          if (!base) return null;
+          // DOWNWARD-facing bins only, and the axis is the whole point. The
+          // first version capped on +Z, which changed nothing measurable: the
+          // scan line's normals are (0, 1, 0) and a +Z cap still leaves plenty
+          // of bins with a positive dot against +Y, so every texel these
+          // queries read was covered anyway and the coverage-blind gather gave
+          // the same answer. A cap OPPOSITE the query normal is what makes a
+          // contributing probe genuinely uninformed about the direction asked.
+          if ((key & 3) === 0) {
+            const bin = refMath.mortonToBin(m);
+            if (refMath.binDir(bin.i, bin.j, cfgMod.binGridWidth(0, W0))[1] > -0.5) return null;
+          }
+          return base;
+        };
+        writeField(capped);
+        const cappedGot = await run();
+        const cappedMerged = [built.cascades[0].probes.map((probe) => {
+          const values = new Array(NBINS);
+          for (let m = 0; m < NBINS; m++) values[m] = capped(probe.key >>> 0, m);
+          return values;
+        })];
+        const cappedTiles = ref.bakeProbeIrradiance(cfg, built, cappedMerged, 0, INTERIOR);
+        const cappedCover = ref.bakeProbeCoverage(cfg, built, cappedMerged, 0, INTERIOR);
+        let covWrong = 0;
+        let covWorst = 0;
+        let effect = 0;
+        let effectN = 0;
+        for (let i = 0; i < emptyStart; i++) {
+          const w = ref.gatherPixel(cfg, built, cappedTiles, pixels[i].position, pixels[i].normal,
+            INTERIOR, cappedCover);
+          // The same gather with coverage IGNORED — the pre-[I] behaviour.
+          const naive = ref.gatherPixel(cfg, built, cappedTiles, pixels[i].position,
+            pixels[i].normal, INTERIOR, null);
+          for (let ch = 0; ch < 3; ch++) {
+            const err = Math.abs(cappedGot[i * 4 + ch] - w[ch]) / Math.max(1e-4, scale);
+            covWorst = Math.max(covWorst, err);
+            if (err > TOL) covWrong++;
+            if (w[ch] > 1e-4) {
+              effect = Math.max(effect, Math.abs(w[ch] - naive[ch]) / w[ch]);
+              if (Math.abs(w[ch] - naive[ch]) > 1e-5) effectN++;
+            }
+          }
+        }
+        check("the GPU matches the coverage-weighted mirror", covWrong === 0,
+          `${covWrong} channels differ, worst ${(covWorst * 100).toFixed(2)}% of peak`);
+        check("ignoring coverage would have changed the answer", effectN > 0,
+          `${effectN} channels differ from the coverage-blind gather, by up to ` +
+          `${(effect * 100).toFixed(1)}% — zero would make the arm above vacuous`);
+
+        // ══ ARM 5: continuity across a LOD boundary ════════════════════
+        say("");
+        say("── SHELLS: no seam where the LOD changes ──");
+        // `lodShells` exists so a fly-through does not pop. The radial line
+        // crosses lodF = 1 with samples ~2mm apart in the crossing region, so a
+        // discontinuity in the blend shows up as a step far larger than its
+        // neighbours'.
+        writeField(synthBin);
+        const shellGot = await run();
+        let shellMax = 0;
+        let shellMedian = [];
+        for (let i = shellStart + 1; i < emptyStart; i++) {
+          let d = 0;
+          for (let ch = 0; ch < 3; ch++) {
+            d = Math.max(d, Math.abs(shellGot[i * 4 + ch] - shellGot[(i - 1) * 4 + ch]));
+          }
+          shellMax = Math.max(shellMax, d);
+          shellMedian.push(d);
+        }
+        shellMedian.sort((a, b) => a - b);
+        const med = shellMedian[Math.floor(shellMedian.length / 2)];
+        check("the worst step across the LOD boundary is not a cliff",
+          shellMax < Math.max(1e-3, med * 40),
+          `worst step ${shellMax.toExponential(2)} vs median ${med.toExponential(2)} — ` +
+          "a blend discontinuity reads as one step orders of magnitude above the rest");
+        say(`   ${SHELL_N} samples across lodF = 1 at r ≈ ${rBoundary.toFixed(2)}m`);
+
+        // ══ ARM 6: no probes means zero, and it says so ════════════════
+        say("");
+        say("── EMPTY: an arbitrary point with no probes reads zero and is COUNTED ──");
+        await renderer.computeAsync(queryGather.reset);
+        await renderer.computeAsync(queryGather.compute);
+        await renderer.computeAsync(queryDumpPass);
+        const qGot = new Float32Array(await renderer.getArrayBufferAsync(queryDump.value));
+        const qStats = await queryGather.readStats(renderer);
+        let emptyNonZero = 0;
+        for (let i = 0; i < NQ; i++) {
+          for (let ch = 0; ch < 3; ch++) if (qGot[i * 4 + ch] !== 0) emptyNonZero++;
+        }
+        check("a point far from every probe reads exactly zero", emptyNonZero === 0,
+          `${emptyNonZero} channels non-zero over ${NQ} query points`);
+        check("the kernel counted every one as empty", qStats.empty === NQ,
+          `${qStats.empty}/${NQ} counted — the counter is what separates 'GI is dark here' ` +
+          "from 'GI has nothing here'");
+        check("no query point came out lit", qStats.lit === 0, `${qStats.lit} lit`);
+        say(`   scan gather: ${gStats.lit}/${gStats.pixels} lit, ` +
+          `${gStats.meanCorners.toFixed(2)} corners per pixel, ` +
+          `E ${gStats.minLum.toFixed(3)}..${gStats.maxLum.toFixed(3)}`);
+        // MORE THAN ONE PROBE IS THE CLAIM, not eight. The first version
+        // asserted > 3 and read 1.84, which is correct for this set rather than
+        // a fault: a floor point sits EXACTLY on the lattice in y (t.y = 0), so
+        // four of the eight corners carry zero weight before any lookup, and of
+        // the four that remain only the cells some pixel actually landed in have
+        // probes. Two probes with sliding weights is still linear interpolation
+        // along the scan, which is what the smooth arm measures directly.
+        check("more than one probe contributes to the average", gStats.meanCorners > 1.2,
+          `${gStats.meanCorners.toFixed(2)}/8 — at 1.0 this would be the old ` +
+          "one-probe-per-pixel gather wearing a new name");
+
+        if (validationErrors.length) check("no WebGPU validation errors", false, validationErrors[0]);
+
+        say("");
+        say(failures ? `gi-src-gather: ${failures} CHECKS FAILED` : "gi-src-gather: all cases PASS");
+        globalThis.__SRC_GATHER_RESULT__ = {
+          pass: failures === 0,
+          failures,
+          pixels: PIXELS,
+          probes: keyToBlock.size,
+          checked,
+          worst: +(worst * 100).toFixed(2),
+          varied: +variedPct.toFixed(1),
+          control: +ctrlPct.toFixed(1),
+          furnaceWorst: +furnaceWorst.toExponential(2),
+          coverageEffect: +(effect * 100).toFixed(1),
+          corners: +gStats.meanCorners.toFixed(2),
+          shellMax: +shellMax.toExponential(2),
+          storageLimit: device.limits.maxStorageBuffersPerShaderStage,
+          text: out.textContent,
+        };
+
+      } catch (error) {
+        fail(error);
+      }
+    </script>
+  </body>
+</html>

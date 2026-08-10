@@ -315,7 +315,14 @@ export function createGiResolve({ gbuffer, targets, width, height, gather = null
       // (silhouette fix — see cascadeGather.gatherViewBias). Zero when the
       // resolve has no camera at all, which disables it exactly.
       const viewDir = cameraPosition ? vec3(cameraPosition).sub(P).normalize().toVar() : vec3(0);
-      if (gather) out.assign(vec3(gather(samplePoint, N, viewDir)).mul(intensity));
+      // ── THE PRIMARY DIFFUSE TERM COMES FROM EXACTLY ONE OF THESE ────────
+      //
+      // `!screenGather` is load-bearing, not defensive. Since [I] both inputs
+      // are the SAME integral — SRC hands over a closure for the reflection hit
+      // below AND a texture its own pass already evaluated per pixel — so
+      // running both here would add the pixel's own irradiance to itself. The
+      // texture wins because it is the one that has already been paid for.
+      if (gather && !screenGather) out.assign(vec3(gather(samplePoint, N, viewDir)).mul(intensity));
       // ── SCREEN-SPACE DIFFUSE INDIRECT (SRC's c0-only resolve) ───────────
       //
       // A TEXTURE, not a closure, and that is the whole reason it is a separate
@@ -324,7 +331,7 @@ export function createGiResolve({ gbuffer, targets, width, height, gather = null
       // PORTABLE limit of eight storage buffers per stage — SRC's version would
       // have added the probe table, the payload and the hash. Its own pass
       // writes a half-res texture instead, and a texture binding is free of that
-      // limit (srcGather.js's header).
+      // limit (srcScreenGather.js's header).
       //
       // It answers for THIS PIXEL only, so it is deliberately not wired into the
       // reflection-hit shading below: that call site asks about an arbitrary
@@ -350,9 +357,12 @@ export function createGiResolve({ gbuffer, targets, width, height, gather = null
       // dirt. Reflections keep their own visibility. `strength`/`radius`
       // are live uniforms (aoStrength/aoRadius props); the whole block is
       // compiled out when the component's `ao` prop is off (structural).
-      // Gated on `gather` as well: with no diffuse term `out` is zero here and
-      // the ladder's ~50 oracle fetches per pixel would buy a multiply by zero.
-      if (gather && ao?.occupancy?.freeRadiusAtWorld) {
+      // Gated on having a diffuse term at all: with none, `out` is zero here
+      // and the ladder's ~50 oracle fetches per pixel would buy a multiply by
+      // zero. `screenGather` counts — it IS the diffuse term since [I], and
+      // testing only `gather` meant SRC's indirect went un-obscured for the
+      // whole of Phase 2 and 3, which is not a decision anybody made.
+      if ((gather || screenGather) && ao?.occupancy?.freeRadiusAtWorld) {
         const occAcc = float(0).toVar();
         // 4 taps, linear spacing (¼..1 × radius), falloff halving per tap —
         // the standard 4-tap SDF-AO ladder against the oracle. Two voxel-

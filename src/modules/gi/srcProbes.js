@@ -762,6 +762,66 @@ export function createProbeLookup(store, cascade) {
   };
 }
 
+/**
+ * A key → BIN BLOCK lookup that costs TWO storage buffers instead of three.
+ *
+ * ══ WHY IT EXISTS, AND IT IS ENTIRELY A BINDING-BUDGET DECISION ════════════
+ *
+ * The natural lookup is three fetches — `hashKeys` → hash slot, `hashSlot` →
+ * probe index, `probeTable[probe].block` → the block. Three storage buffers,
+ * inside a kernel (`createGiResolve`, via [I]'s `gatherAt`) that already carries
+ * the gbuffer, the emitter slots, the occupancy pyramid and the BVH against the
+ * portable limit of EIGHT.
+ *
+ * So this publishes one word per hash slot holding that slot's block directly,
+ * written by a pass that runs after compaction has settled both halves. The
+ * probe INDEX is never wanted by a gather — only its tile — so carrying it
+ * through was pure indirection. 128 KB at the engine default, and it buys back
+ * a binding on the fattest kernel in the module.
+ *
+ * ORDER MATTERS: this must run AFTER `createCompactPass` and the resolve for
+ * its cascade, because both `hashSlot` and `PROBE_BLOCK` are written there. It
+ * is a separate dispatch for exactly that reason.
+ */
+export function createSrcHashBlockFrame(store, cascade = 0) {
+  const c = store.cascades[cascade];
+  const { hashKeys, hashSlot, probeTable } = store;
+  const hashBlock = instancedArray(new Uint32Array(c.hashCapacity).fill(SLOT_EMPTY), "uint");
+
+  const pass = Fn(() => {
+    const i = instanceIndex.toVar();
+    const p = hashSlot.element(uint(c.hashBase).add(i)).toVar();
+    const block = uint(SLOT_EMPTY).toVar();
+    If(p.notEqual(uint(SLOT_EMPTY)), () => {
+      block.assign(probeTable.element(p.mul(uint(PROBE_WORDS)).add(uint(PROBE_BLOCK))));
+    });
+    // SLOT_EMPTY covers both "no probe behind this slot" and "probe with no
+    // block", so the consumer tests one condition rather than two — the same
+    // collapse `srcDeposit.js` makes for the ancestor chain.
+    hashBlock.element(i).assign(block);
+  })().compute(c.hashCapacity);
+
+  /** key → bin block, or SLOT_EMPTY. Two storage buffers: `hashKeys`, `hashBlock`. */
+  const lookup = (key) => {
+    const k = uint(key).toVar();
+    const r = hashFindWgsl(
+      k, hashKey(k), uint(c.hashBase), uint(c.hashCapacity),
+      uint(MAX_PROBE_STEPS), hashKeys,
+    ).toVar();
+    const out = uint(SLOT_EMPTY).toVar();
+    If(r.x.greaterThanEqual(0), () => { out.assign(hashBlock.element(uint(r.x))); });
+    return out;
+  };
+
+  return {
+    pass,
+    lookup,
+    hashBlock,
+    bytes: c.hashCapacity * 4,
+    dispose() { hashBlock?.value?.dispose?.(); },
+  };
+}
+
 // ══════════════════════════════════════════════════════════ THE FRAME
 //
 // Steps [B] + [C] + [K] assembled: the hash resets, survivors re-enter it with

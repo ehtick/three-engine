@@ -1,0 +1,816 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>SRC tile gate — createSrcTileAtlas vs bakeProbeIrradiance</title>
+    <style>html,body{margin:0;background:#111;color:#ddd;font:13px monospace}canvas{display:none}</style>
+  </head>
+  <body>
+    <canvas id="view" width="16" height="16"></canvas>
+    <pre id="log"></pre>
+    <script type="module">
+      // ══ THE PHASE-3 UNIT-4 GATE: [H], THE IRRADIANCE TILES ═══════════════
+      //
+      // Same isolation as the rest of the family — own renderer, synthetic
+      // gbuffer, no engine — and the same trick as the merge gate: the resolved
+      // payload is SYNTHESIZED into the buffer rather than deposited and
+      // merged, so the gate chooses its own awkward inputs (unknown bins,
+      // all-unknown probes, uniform furnaces, a single lit tile in a field of
+      // black ones) instead of waiting for a real frame to produce them.
+      //
+      // ══ HOW A StorageTexture IS READ BACK ═══════════════════════════════
+      //
+      // Not with `readRenderTargetPixelsAsync` (whose 6th argument is a texture
+      // INDEX, not an output buffer) and not with `copyTextureToBuffer` (whose
+      // rows are padded to 256 B, and indexing it tightly reads padding as
+      // data — [[webgpu-readback-padding]]). A gate-only compute pass
+      // `textureLoad`s every texel into a storage buffer instead, which has no
+      // padding and no row stride to get wrong. It is a separate dispatch from
+      // the bake, so the texture is never readable and writable at once.
+      //
+      // ══ THE ARMS ════════════════════════════════════════════════════════
+      //
+      //   table     the uploaded weights, on the CPU: border rows ARE the
+      //             mirrored interior rows, and the quadrature is materially
+      //             different from a centre-cosine (the §12.2 bias — so the
+      //             arm shows what it is worth rather than asserting into air).
+      //   interior  every interior texel vs `bakeProbeIrradiance`.
+      //   border    every border texel EXACTLY equals the interior texel it
+      //             mirrors. Exact, because the GPU computes both from the same
+      //             table row in the same order — so this arm is about
+      //             ADDRESSING, and it is the one that would catch an atlas
+      //             laid out wrong.
+      //   pole      the four corners are the diagonally opposite interior
+      //             corners, and a −Z sample is their MEAN. The arm reports
+      //             the spread of those four, which is what a border-less tile
+      //             would have returned one of (§12.2's +32%).
+      //   furnace   uniform radiance in every bin ⇒ every texel EXACTLY π·L,
+      //             whatever the bin count and whichever bins were sampled.
+      //   bleed     one lit tile in a field of black ones: sampling any
+      //             neighbour at any normal must return exactly zero. This is
+      //             what makes hardware bilinear over a PACKED atlas safe.
+      //   sampler   the GPU's `sampleTile` closure — the one [I] will gather
+      //             with — against `srcRef.js`'s CPU `sampleTile` on the
+      //             read-back atlas, over random (probe, normal) pairs.
+      //
+      // Run: node scripts/run-gi-src-tiles-test.mjs
+      const out = document.querySelector("#log");
+      const say = (line) => { out.textContent += line + "\n"; };
+      let failures = 0;
+      const check = (label, ok, detail = "") => {
+        say(`  ${ok ? "PASS" : "FAIL"} ${label}${detail ? ` — ${detail}` : ""}`);
+        if (!ok) failures++;
+      };
+      const fail = (error) => {
+        console.error("SRC-TILES FAIL", error?.stack ?? error?.message ?? String(error));
+        globalThis.__SRC_TILES_RESULT__ = {
+          pass: false, error: error?.message ?? String(error), text: out.textContent,
+        };
+      };
+      globalThis.addEventListener("error", (event) => fail(event.error ?? event.message));
+      globalThis.addEventListener("unhandledrejection", (event) => fail(event.reason));
+
+      try {
+        const THREE = await import("three/webgpu");
+        const TSL = await import("three/tsl");
+        const cfgMod = await import("/src/modules/gi/srcConfig.js");
+        const refMath = await import("/src/modules/gi/srcMath.js");
+        const ref = await import("/src/modules/gi/srcRef.js");
+        const P = await import("/src/modules/gi/srcProbes.js");
+        const D = await import("/src/modules/gi/srcDeposit.js");
+        const H = await import("/src/modules/gi/srcTiles.js");
+
+        const { Fn, instanceIndex, instancedArray, ivec2, texture, uint, uniform, vec3 } = TSL;
+
+        const renderer = new THREE.WebGPURenderer({ canvas: document.querySelector("#view") });
+        await renderer.init();
+        const device = renderer.backend.device;
+        const validationErrors = [];
+        device.addEventListener?.("uncapturederror", (event) => {
+          validationErrors.push(event.error?.message ?? String(event.error));
+          console.error("WebGPU validation error:", validationErrors.at(-1));
+        });
+
+        const rng = (() => {
+          let s = 0x9e3779b9 >>> 0;
+          return () => {
+            s = (s + 0x6d2b79f5) >>> 0;
+            let t = s;
+            t = Math.imul(t ^ (t >>> 15), t | 1);
+            t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+            return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+          };
+        })();
+
+        const S0 = 0.5;
+        const CAM = [1.25, 1.5, -0.75];
+        const ANCHOR = [0.5, -1, 3];
+        const N = cfgMod.CASCADE_COUNT;
+        const W0 = cfgMod.W0;
+        const INTERIOR = cfgMod.IRRADIANCE_TILE_INTERIOR;
+        const BORDER = cfgMod.IRRADIANCE_TILE_BORDER;
+        const TILE = cfgMod.IRRADIANCE_TILE_SIZE;
+        const W = cfgMod.binGridWidth(0, W0);
+        const NBINS = cfgMod.binCount(0, W0);
+
+        // ══ ARM 1: the table, before any GPU work ═════════════════════════
+        //
+        // Pure CPU. It runs first because everything downstream is an integral
+        // weighted by this table — if the border rows are not the mirrored
+        // interior rows, every later arm fails in a way that looks like an
+        // addressing bug in the atlas.
+        say("── TABLE: the uploaded cosine weights ──");
+        const innerTable = refMath.binCosineWeights(W, INTERIOR, H.COSINE_SUB);
+        const borderMap = refMath.octahedralBorderMap(INTERIOR, BORDER);
+        const tileTable = refMath.tileCosineWeights(W, INTERIOR, H.COSINE_SUB, BORDER);
+        const texels = INTERIOR * INTERIOR;
+        let tableWrong = 0;
+        for (let t = 0; t < TILE * TILE; t++) {
+          for (let m = 0; m < NBINS; m++) {
+            const want = Math.fround(innerTable[m * texels + borderMap[t]]);
+            if (tileTable[t * NBINS + m] !== want) tableWrong++;
+          }
+        }
+        check("every tile row is its mapped interior row", tableWrong === 0,
+          `${tableWrong}/${TILE * TILE * NBINS} weights differ`);
+        // Interior texels map to themselves — otherwise the "border" rule would
+        // be quietly rewriting the payload too.
+        let identityWrong = 0;
+        for (let v = 0; v < INTERIOR; v++) {
+          for (let u = 0; u < INTERIOR; u++) {
+            if (borderMap[(v + BORDER) * TILE + (u + BORDER)] !== v * INTERIOR + u) identityWrong++;
+          }
+        }
+        check("interior texels map to themselves", identityWrong === 0, `${identityWrong} wrong`);
+        // THE ARM HAS TEETH. A centre-cosine table (`max(0, ω_centre·n̂)`) is the
+        // one-point quadrature §12.2 caught as an ANGULAR bias that refining s0
+        // cannot reduce. If it were indistinguishable from the sub-sampled
+        // table, everything above would be proving nothing.
+        let worstCentre = 0;
+        for (let m = 0; m < NBINS; m++) {
+          const bin = refMath.mortonToBin(m);
+          const c = refMath.binCenterXY(bin.i, bin.j, W);
+          const d = refMath.decodeDir(c.x, c.y);
+          for (let t = 0; t < texels; t++) {
+            const n = refMath.octahedralDirection(t % INTERIOR, Math.floor(t / INTERIOR), INTERIOR);
+            const centre = Math.max(0, d[0] * n[0] + d[1] * n[1] + d[2] * n[2]);
+            const quad = innerTable[m * texels + t];
+            worstCentre = Math.max(worstCentre, Math.abs(centre - quad));
+          }
+        }
+        check("the quadrature differs materially from a centre-cosine",
+          worstCentre > 0.05,
+          `worst |centre − quadrature| = ${worstCentre.toFixed(4)} — a small number here ` +
+          "would mean the sub-sampling is not doing anything and §12.2's bias is back");
+
+        // ── the GPU side ─────────────────────────────────────────────────
+        const pixels = [];
+        const addPixel = (p, n) => pixels.push({ position: p, normal: n });
+        for (let i = 0; i < 260; i++) {
+          const u = (rng() - 0.5) * 10;
+          const v = (rng() - 0.5) * 10;
+          const face = Math.floor(rng() * 5);
+          if (face === 0) addPixel([u, -1, v], [0, 1, 0]);
+          else if (face === 1) addPixel([u, 4, v], [0, -1, 0]);
+          else if (face === 2) addPixel([-5, v * 0.4 + 1, u], [1, 0, 0]);
+          else if (face === 3) addPixel([5, v * 0.4 + 1, u], [-1, 0, 0]);
+          else addPixel([u, v * 0.4 + 1, 5], [0, 0, -1]);
+        }
+        for (let lod = 0; lod < 4; lod++) {
+          const r = cfgMod.lodRadius(lod, S0) * 1.35;
+          for (let k = 0; k < 40; k++) {
+            const axis = Math.floor(rng() * 3);
+            const sign = rng() < 0.5 ? -1 : 1;
+            const p = [0, 0, 0];
+            p[axis] = sign * r;
+            p[(axis + 1) % 3] = (rng() * 2 - 1) * r;
+            p[(axis + 2) % 3] = (rng() * 2 - 1) * r;
+            addPixel([p[0] + CAM[0], p[1] + CAM[1], p[2] + CAM[2]], [0, 1, 0]);
+          }
+        }
+        const PIXELS = pixels.length;
+        const valid = new Uint8Array(PIXELS).fill(1);
+        for (let i = 0; i < PIXELS; i += 11) valid[i] = 0;
+
+        const q32 = new Float32Array(1);
+        const f32 = (v) => { q32[0] = v; return q32[0]; };
+        for (const px of pixels) {
+          px.position = px.position.map(f32);
+          px.normal = px.normal.map(f32);
+        }
+        const attrs = new Float32Array(PIXELS * 8);
+        for (let i = 0; i < PIXELS; i++) {
+          attrs[i * 8] = pixels[i].position[0];
+          attrs[i * 8 + 1] = pixels[i].position[1];
+          attrs[i * 8 + 2] = pixels[i].position[2];
+          attrs[i * 8 + 3] = valid[i];
+        }
+        const posBuf = instancedArray(attrs.slice(), "vec4");
+        const readPixel = (i) => {
+          const t = posBuf.element(i.mul(2)).toVar();
+          return { position: t.xyz, valid: t.w.greaterThan(0.5) };
+        };
+
+        const store = P.createSrcProbeStore({
+          c0Probes: 2048, cascadeCount: N, blockCapacity: [512, 512, 256, 256],
+        });
+        const cameraU = uniform(new THREE.Vector3(...CAM));
+        const anchorU = uniform(new THREE.Vector3(...ANCHOR));
+        const frame = P.createSrcProbeFrame(store, {
+          spacing0: S0, camera: vec3(cameraU), anchor: vec3(anchorU),
+          pixelCount: PIXELS, readPixel,
+        });
+        const bins = D.createSrcBinStore(store, { w0: W0 });
+        const tiles = H.createSrcTileAtlas(store, bins, { w0: W0 });
+        const AW = tiles.layout.width;
+        const AH = tiles.layout.height;
+
+        say("");
+        say(`pixels ${PIXELS}  s0 ${S0}  |D0| ${NBINS} bins  tile ${TILE}² (${INTERIOR}+2·${BORDER})`);
+        say(`atlas ${AW}x${AH} for ${tiles.blocks} blocks, ${tiles.layout.perRow}/row  ` +
+          `table ${tileTable.length} floats  ${(tiles.bytes / 1048576).toFixed(2)}MB`);
+        say("");
+
+        // The gate-only readback — see the header on why it is a compute pass.
+        const dump = instancedArray(new Float32Array(AW * AH * 4), "float");
+        const atlasRead = texture(tiles.atlas);
+        const dumpPass = Fn(() => {
+          const i = instanceIndex.toVar();
+          const c = atlasRead.load(ivec2(
+            i.mod(uint(AW)).toInt(), i.div(uint(AW)).toInt(),
+          )).toVar();
+          const o = i.mul(4).toVar();
+          dump.element(o).assign(c.x);
+          dump.element(o.add(uint(1))).assign(c.y);
+          dump.element(o.add(uint(2))).assign(c.z);
+          dump.element(o.add(uint(3))).assign(c.w);
+        })().compute(AW * AH);
+
+        // The sampler probe: (normal.xyz, block) in, filtered irradiance out.
+        // This exercises `tiles.sampleTile` — the closure [I] gathers with —
+        // rather than re-deriving the addressing in the gate, which would have
+        // tested the gate's arithmetic instead of the shipping code's.
+        const QUERIES = 4096;
+        const queryArr = new Float32Array(QUERIES * 4);
+        const queryBuf = instancedArray(queryArr, "vec4");
+        const answerBuf = instancedArray(new Float32Array(QUERIES * 4), "vec4");
+        const samplePass = Fn(() => {
+          const i = instanceIndex.toVar();
+          const q = queryBuf.element(i).toVar();
+          const c = tiles.sampleTile(q.w.toUint(), q.xyz).toVar();
+          answerBuf.element(i).assign(TSL.vec4(c, 1));
+        })().compute(QUERIES);
+
+        for (const pass of frame.passes) await renderer.computeAsync(pass);
+        const table = new Uint32Array(await renderer.getArrayBufferAsync(store.probeTable.value));
+
+        const keyToBlock = new Map();
+        const blockToKey = new Map();
+        {
+          const pc = store.cascades[0];
+          for (let k = 0; k < pc.probeCapacity; k++) {
+            const w = (pc.probeBase + k) * P.PROBE_WORDS;
+            if ((table[w + P.PROBE_FLAGS] & P.FLAG_ALIVE) === 0) continue;
+            const block = table[w + P.PROBE_BLOCK] >>> 0;
+            if (block === P.SLOT_EMPTY) continue;
+            keyToBlock.set(table[w + P.PROBE_KEY] >>> 0, block);
+            blockToKey.set(block, table[w + P.PROBE_KEY] >>> 0);
+          }
+        }
+
+        const info = bins.cascades[0];
+        const payloadArray = bins.payload.value.array;
+        const writeField = (fill) => {
+          for (let i = 0; i < bins.binTotal; i++) {
+            const o = i * D.PAYLOAD_WORDS;
+            payloadArray[o] = 0;
+            payloadArray[o + 1] = 0;
+            payloadArray[o + 2] = 0;
+            payloadArray[o + 3] = D.PAYLOAD_UNKNOWN;
+          }
+          for (const [key, block] of keyToBlock) {
+            for (let m = 0; m < NBINS; m++) {
+              const v = fill(key, m, block);
+              if (!v) continue;
+              const o = (info.binBase + block * NBINS + m) * D.PAYLOAD_WORDS;
+              payloadArray[o] = v.radiance[0];
+              payloadArray[o + 1] = v.radiance[1];
+              payloadArray[o + 2] = v.radiance[2];
+              payloadArray[o + 3] = v.transmittance;
+            }
+          }
+          bins.payload.value.needsUpdate = true;
+        };
+        const bake = async () => {
+          for (const pass of tiles.passes) await renderer.computeAsync(pass);
+          await renderer.computeAsync(dumpPass);
+          return new Float32Array(await renderer.getArrayBufferAsync(dump.value));
+        };
+        /** Atlas float index of (block, tile texel x, tile texel y). */
+        const texelAt = (block, tx, ty) => {
+          const bx = block % tiles.layout.perRow;
+          const by = Math.floor(block / tiles.layout.perRow);
+          return ((by * TILE + ty) * AW + (bx * TILE + tx)) * 4;
+        };
+
+        // A merged c0 field. Post-merge transmittance is normally 0 (the sky is
+        // composited at the top and multiplied down), so `t: 0` is the honest
+        // shape here — and the bake reads radiance only, so what matters is
+        // that some bins are UNKNOWN and the rest carry direction-dependent
+        // colour. 1 bin in 6 unknown puts partial hemispheres in front of the
+        // normalization at every texel.
+        const synthBin = (key, m) => {
+          const seed = (key + Math.imul(m, 0x85ebca6b)) >>> 0;
+          const h = refMath.hashKey(seed) >>> 0;
+          if (h % 6 === 0) return null;
+          // ══ A QUARTER OF THE PROBES KNOW ONLY A NARROW CAP ══════════════
+          //
+          // Without this the coverage arm below was VACUOUS: a field with 5/6
+          // of bins known everywhere leaves no texel uncovered, so "alpha is 1
+          // exactly where the mirror wrote something" reduced to "alpha is 1".
+          //
+          // A HEMISPHERE IS NOT ENOUGH, and finding that out was worth the
+          // detour: restricting a probe to `z > 0` still covered every texel,
+          // because a 6×6 tile has no texel AT the −Z pole — its four corners
+          // sit 19.4° off it (the same 19.4° the border exists for), and a lobe
+          // tilted 19.4° off the pole still reaches bins on the far side of the
+          // equator. So at this tile resolution a probe that saw a full
+          // hemisphere has an answer for every normal, which is a reassuring
+          // thing to know and not what this arm needs.
+          //
+          // What produces genuinely uncovered texels is a probe whose bins span
+          // much LESS than a hemisphere — which is the real case at 0.78 rays
+          // per bin (§12.13.4), not an adversarial invention. One z band of
+          // four is that.
+          if ((key & 3) === 0) {
+            const bin = refMath.mortonToBin(m);
+            if (refMath.binDir(bin.i, bin.j, W)[2] < 0.5) return null;
+          }
+          return {
+            radiance: [
+              ((h >>> 3) & 255) / 256,
+              ((h >>> 11) & 255) / 256,
+              ((h >>> 19) & 255) / 256,
+            ],
+            transmittance: 0,
+          };
+        };
+
+        writeField(synthBin);
+        const atlas = await bake();
+        const bakeStats = await tiles.readStats(renderer);
+
+        // ── the mirror ───────────────────────────────────────────────────
+        const mirrorPixels = pixels.filter((_, i) => valid[i]);
+        const cfg = ref.makeSrcConfig({
+          spacing0: S0, camera: CAM, anchor: ANCHOR, cascadeCount: N, maxLods: cfgMod.MAX_LODS,
+        });
+        const built = ref.buildProbes(cfg, mirrorPixels);
+        const merged = [built.cascades[0].probes.map((probe) => {
+          const values = new Array(NBINS);
+          for (let m = 0; m < NBINS; m++) values[m] = synthBin(probe.key >>> 0, m);
+          return values;
+        })];
+        const mirrorTiles = ref.bakeProbeIrradiance(cfg, built, merged, 0, INTERIOR);
+
+        const mirrorFailures = built.cascades.reduce((a, m) => a + m.insertFailures, 0);
+        check("the mirror's probe maps had room for every key", mirrorFailures === 0,
+          `${mirrorFailures} inserts dropped by a full map — see buildProbes' capacity note`);
+        check("the GPU and mirror agree on the c0 probe set",
+          built.cascades[0].probes.length === keyToBlock.size &&
+            built.cascades[0].probes.every((p) => keyToBlock.has(p.key >>> 0)),
+          `${keyToBlock.size} gpu vs ${built.cascades[0].probes.length} mirror`);
+
+        // ══ ARM 2: the interior integral ═════════════════════════════════
+        say("");
+        say("── INTERIOR: every texel vs bakeProbeIrradiance ──");
+        // HALF FLOAT is the tolerance's whole story: the atlas is RGBA16F
+        // because that is the only storage format that is also FILTERABLE, and
+        // filtering is why the tiles are octahedral at all. 11 significant bits
+        // is a 2.4e-4 worst relative rounding, so the bound is 1e-3 and the
+        // measured worst is printed rather than trusted.
+        const TOL = 1e-3;
+        let interiorWrong = 0;
+        let interiorChecked = 0;
+        let worstRel = 0;
+        let worstDetail = null;
+        for (let i = 0; i < built.cascades[0].probes.length; i++) {
+          const probe = built.cascades[0].probes[i];
+          const block = keyToBlock.get(probe.key >>> 0);
+          if (block === undefined) continue;
+          const tile = mirrorTiles[i];
+          for (let v = 0; v < INTERIOR; v++) {
+            for (let u = 0; u < INTERIOR; u++) {
+              const src = ((v + BORDER) * TILE + (u + BORDER)) * 3;
+              const dst = texelAt(block, u + BORDER, v + BORDER);
+              interiorChecked++;
+              let bad = false;
+              for (let ch = 0; ch < 3; ch++) {
+                const want = tile[src + ch];
+                const got = atlas[dst + ch];
+                const allowance = TOL + TOL * Math.abs(want);
+                // REPORTED AS A FRACTION OF ITS OWN ALLOWANCE, not as a bare
+                // relative error. The first version divided by the value, which
+                // reads 9.7e-4 against a 1e-3 "bound" — alarming, and pure
+                // arithmetic: a texel whose irradiance is 1e-4 carries an f16
+                // rounding that is large RELATIVELY and irrelevant absolutely.
+                // A headroom number cannot mislead that way, and it is also the
+                // number a reader actually wants when deciding whether the
+                // bound has started to slip.
+                worstRel = Math.max(worstRel, Math.abs(got - want) / allowance);
+                if (Math.abs(got - want) > allowance) bad = true;
+              }
+              if (bad) {
+                interiorWrong++;
+                worstDetail ??= `block ${block} texel ${u},${v}: ` +
+                  `gpu ${atlas[dst].toFixed(5)} vs mirror ${tile[src].toFixed(5)}`;
+              }
+            }
+          }
+        }
+        check("every interior texel matches the mirror", interiorWrong === 0,
+          `${interiorWrong}/${interiorChecked} differ${worstDetail ? ` — ${worstDetail}` : ""}`);
+        check("the comparison was not vacuous", interiorChecked > 5000,
+          `${interiorChecked} texels`);
+        say(`   worst deviation used ${(worstRel * 100).toFixed(1)}% of its ` +
+          `${TOL.toExponential(0)} allowance — f32-into-f16 against the mirror's f64`);
+
+        // ══ ARM 3: the border, exactly ═══════════════════════════════════
+        say("");
+        say("── BORDER: every border texel IS its mirrored interior texel ──");
+        // EXACT, and that is the point: the GPU computes a border texel from
+        // the same table row, over the same bins, in the same order as the
+        // interior texel it mirrors, so the two must be bit-identical. Any
+        // difference is an ADDRESSING fault — a tile laid out at the wrong
+        // atlas offset, or a border map that disagrees with the table.
+        let borderWrong = 0;
+        let borderChecked = 0;
+        for (const [, block] of keyToBlock) {
+          for (let ty = 0; ty < TILE; ty++) {
+            for (let tx = 0; tx < TILE; tx++) {
+              const inside = tx >= BORDER && tx < BORDER + INTERIOR
+                && ty >= BORDER && ty < BORDER + INTERIOR;
+              if (inside) continue;
+              borderChecked++;
+              const src = borderMap[ty * TILE + tx];
+              const sx = src % INTERIOR;
+              const sy = (src - sx) / INTERIOR;
+              const a = texelAt(block, tx, ty);
+              const b = texelAt(block, sx + BORDER, sy + BORDER);
+              for (let ch = 0; ch < 3; ch++) if (atlas[a + ch] !== atlas[b + ch]) borderWrong++;
+            }
+          }
+        }
+        check("every border texel is bit-identical to its interior twin",
+          borderWrong === 0, `${borderWrong}/${borderChecked * 3} channels differ`);
+        say(`   ${borderChecked} border texels over ${keyToBlock.size} tiles ` +
+          `(${TILE * TILE - INTERIOR * INTERIOR} per tile)`);
+
+        // ══ ARM 3b: alpha carries coverage ══════════════════════════════
+        say("");
+        say("── COVERAGE: alpha is 1 where a known bin was found, 0 where none ──");
+        // The channel [I] will renormalize with, if it chooses to. Checked
+        // against the MIRROR's own notion of coverage rather than against the
+        // GPU's alpha alone: `bakeProbeIrradiance` leaves a texel at exactly
+        // zero when it found no known bin, so "the mirror wrote nothing here"
+        // and "the GPU said uncovered" must be the same set.
+        //
+        // Nothing divides by alpha yet — the RGB above is bit-for-bit the
+        // mirror's, which is what keeps [H] a make-the-GPU-agree unit.
+        let alphaWrong = 0;
+        let uncovered = 0;
+        let alphaChecked = 0;
+        for (let i = 0; i < built.cascades[0].probes.length; i++) {
+          const probe = built.cascades[0].probes[i];
+          const block = keyToBlock.get(probe.key >>> 0);
+          if (block === undefined) continue;
+          const tile = mirrorTiles[i];
+          for (let ty = 0; ty < TILE; ty++) {
+            for (let tx = 0; tx < TILE; tx++) {
+              const src = (ty * TILE + tx) * 3;
+              const a = atlas[texelAt(block, tx, ty) + 3];
+              const mirrorHas = tile[src] !== 0 || tile[src + 1] !== 0 || tile[src + 2] !== 0;
+              alphaChecked++;
+              if (!mirrorHas) uncovered++;
+              if ((a === 1) !== mirrorHas) alphaWrong++;
+            }
+          }
+        }
+        check("alpha agrees with the mirror about which texels have information",
+          alphaWrong === 0, `${alphaWrong}/${alphaChecked} texels disagree`);
+        check("some texel really was uncovered", uncovered > 0,
+          `${uncovered}/${alphaChecked} texels of claimed tiles found NO known bin ` +
+          `(${(100 * uncovered / alphaChecked).toFixed(1)}%) — zero would make the arm above ` +
+          "vacuous; the one-sided probes in the synthetic field are what produce them");
+        check("the bake's own empty counter agrees with the mirror",
+          bakeStats.lit === alphaChecked - uncovered,
+          `gpu counted ${bakeStats.lit} covered, mirror says ${alphaChecked - uncovered}`);
+
+        // ══ ARM 4: the −Z pole ══════════════════════════════════════════
+        say("");
+        say("── POLE: the four corners are −Z, and a −Z sample is their mean ──");
+        // §12.2's finding, restated as an assertion. Without a border all four
+        // bilinear taps at n̂ = (0,0,−1) collapse onto ONE interior corner whose
+        // own direction is 19.4° off axis; with it they are the four corners
+        // symmetric about −Z and their x/y biases cancel. So the check is that
+        // the sample equals their MEAN — and the arm prints the spread of those
+        // four values, which is the size of the error a border-less tile would
+        // have made.
+        let cornerWrong = 0;
+        let poleWrong = 0;
+        let worstSpread = 0;
+        let poleChecked = 0;
+        for (const [, block] of keyToBlock) {
+          const c00 = texelAt(block, BORDER, BORDER);
+          const c10 = texelAt(block, BORDER + INTERIOR - 1, BORDER);
+          const c01 = texelAt(block, BORDER, BORDER + INTERIOR - 1);
+          const c11 = texelAt(block, BORDER + INTERIOR - 1, BORDER + INTERIOR - 1);
+          // Border corner (0,0) carries interior corner (N-1,N-1), and so on
+          // diagonally — all four of them are the −Z pole.
+          const pairs = [
+            [texelAt(block, 0, 0), c11],
+            [texelAt(block, TILE - 1, 0), c01],
+            [texelAt(block, 0, TILE - 1), c10],
+            [texelAt(block, TILE - 1, TILE - 1), c00],
+          ];
+          for (const [a, b] of pairs) {
+            for (let ch = 0; ch < 3; ch++) if (atlas[a + ch] !== atlas[b + ch]) cornerWrong++;
+          }
+          // Read the tile out of the atlas and let the CPU `sampleTile` — the
+          // mirror of the closure [I] uses — do the −Z lookup.
+          const tile = new Float32Array(TILE * TILE * 3);
+          for (let ty = 0; ty < TILE; ty++) {
+            for (let tx = 0; tx < TILE; tx++) {
+              const s = texelAt(block, tx, ty);
+              const d = (ty * TILE + tx) * 3;
+              tile[d] = atlas[s]; tile[d + 1] = atlas[s + 1]; tile[d + 2] = atlas[s + 2];
+            }
+          }
+          const got = ref.sampleTile(tile, INTERIOR, 0, 0, -1);
+          poleChecked++;
+          for (let ch = 0; ch < 3; ch++) {
+            const four = [atlas[c00 + ch], atlas[c10 + ch], atlas[c01 + ch], atlas[c11 + ch]];
+            const mean = (four[0] + four[1] + four[2] + four[3]) / 4;
+            const spread = Math.max(...four) - Math.min(...four);
+            worstSpread = Math.max(worstSpread, spread / Math.max(1e-4, mean));
+            if (Math.abs(got[ch] - mean) > 1e-5 + 1e-5 * Math.abs(mean)) poleWrong++;
+          }
+        }
+        check("all four border corners carry the diagonally opposite interior corner",
+          cornerWrong === 0, `${cornerWrong} channels differ`);
+        check("a −Z sample is the mean of the four interior corners", poleWrong === 0,
+          `${poleWrong}/${poleChecked * 3} channels differ`);
+        check("the four corners actually disagree, so the mean matters",
+          worstSpread > 0.1,
+          `worst corner spread ${(worstSpread * 100).toFixed(1)}% of the mean — this is the ` +
+          "error a border-less tile would make by returning one of them (§12.2 measured +32%)");
+
+        // ══ ARM 5: the furnace ══════════════════════════════════════════
+        say("");
+        say("── FURNACE: uniform radiance returns exactly π·L ──");
+        // R4. `E = π·Σ(L·W)/Σ(W)` is exact for uniform L at ANY bin count and
+        // whichever bins happened to be sampled — so this is a statement about
+        // the ESTIMATOR, not about discretization. A `Δω·Σ L·cos` form instead
+        // of the normalized one lands near π and not on it, which is exactly
+        // the 1% §12.17.2 caught in the c0 gather.
+        const FURNACE_L = [0.75, 0.5, 0.25];
+        writeField(() => ({ radiance: FURNACE_L, transmittance: 0 }));
+        const furnace = await bake();
+        let furnaceWrong = 0;
+        let furnaceWorst = 0;
+        let furnaceTexels = 0;
+        for (const [, block] of keyToBlock) {
+          for (let ty = 0; ty < TILE; ty++) {
+            for (let tx = 0; tx < TILE; tx++) {
+              const o = texelAt(block, tx, ty);
+              furnaceTexels++;
+              for (let ch = 0; ch < 3; ch++) {
+                const want = Math.PI * FURNACE_L[ch];
+                const rel = Math.abs(furnace[o + ch] - want) / want;
+                furnaceWorst = Math.max(furnaceWorst, rel);
+                if (rel > TOL) furnaceWrong++;
+              }
+            }
+          }
+        }
+        check("every texel of every lit tile is exactly π·L", furnaceWrong === 0,
+          `${furnaceWrong}/${furnaceTexels * 3} channels differ, worst relative ` +
+          `${furnaceWorst.toExponential(2)} (π·L = ${(Math.PI * FURNACE_L[0]).toFixed(5)})`);
+        // An unclaimed block took no deposits, so [F] left its bins UNKNOWN and
+        // the bake must produce black rather than whatever the texture happened
+        // to contain. An atlas slot nobody owns is the one place a stale value
+        // would be read as light by [I].
+        let unclaimedNonZero = 0;
+        let unclaimedTiles = 0;
+        for (let block = 0; block < tiles.blocks; block++) {
+          if (blockToKey.has(block)) continue;
+          unclaimedTiles++;
+          for (let ty = 0; ty < TILE; ty++) {
+            for (let tx = 0; tx < TILE; tx++) {
+              const o = texelAt(block, tx, ty);
+              for (let ch = 0; ch < 3; ch++) if (furnace[o + ch] !== 0) unclaimedNonZero++;
+            }
+          }
+        }
+        check("an unclaimed block bakes to exactly black", unclaimedNonZero === 0,
+          `${unclaimedNonZero} channels non-zero over ${unclaimedTiles} unowned tiles`);
+
+        // ══ ARM 6: no bleed between tiles in the atlas ══════════════════
+        say("");
+        say("── BLEED: a filtered tap can never leave its own tile ──");
+        // The property the packed atlas rests on: `sampleTile`'s coordinate
+        // spans [0.5, interior+0.5] within the tile, so the four bilinear taps
+        // land in [0, interior+1] — the tile's own texels, at every normal.
+        // Proved by construction here rather than by argument: ONE tile is lit
+        // and every other is black, so any leak into a neighbour is a non-zero
+        // read, and any leak OUT of the lit tile darkens it below π·L.
+        const litKey = [...keyToBlock.keys()][Math.floor(keyToBlock.size / 2)];
+        const litBlock = keyToBlock.get(litKey);
+        writeField((key) => (key === litKey ? { radiance: FURNACE_L, transmittance: 0 } : null));
+        const isolated = await bake();
+
+        // Random normals over the whole sphere, on the lit tile and on its
+        // neighbours in the atlas — including the ones that share an EDGE with
+        // it, which are the only ones a bilinear tap could reach.
+        const neighbours = [];
+        for (const d of [-1, 1, -tiles.layout.perRow, tiles.layout.perRow]) {
+          const nb = litBlock + d;
+          if (nb >= 0 && nb < tiles.blocks) neighbours.push(nb);
+        }
+        for (let i = 0; i < QUERIES; i++) {
+          const z = rng() * 2 - 1;
+          const a = rng() * 2 * Math.PI;
+          const r = Math.sqrt(Math.max(0, 1 - z * z));
+          queryArr[i * 4] = f32(r * Math.cos(a));
+          queryArr[i * 4 + 1] = f32(r * Math.sin(a));
+          queryArr[i * 4 + 2] = f32(z);
+          // Half the queries on the lit tile, half spread over its neighbours.
+          queryArr[i * 4 + 3] = i % 2 === 0
+            ? litBlock
+            : neighbours[(i >> 1) % Math.max(1, neighbours.length)];
+        }
+        queryBuf.value.array.set(queryArr);
+        queryBuf.value.needsUpdate = true;
+        await renderer.computeAsync(samplePass);
+        const answers = new Float32Array(await renderer.getArrayBufferAsync(answerBuf.value));
+
+        let bledIn = 0;
+        let bledOut = 0;
+        let litQueries = 0;
+        let darkQueries = 0;
+        let worstLit = 0;
+        for (let i = 0; i < QUERIES; i++) {
+          const block = queryArr[i * 4 + 3];
+          const o = i * 4;
+          if (block === litBlock) {
+            litQueries++;
+            for (let ch = 0; ch < 3; ch++) {
+              const want = Math.PI * FURNACE_L[ch];
+              const rel = Math.abs(answers[o + ch] - want) / want;
+              worstLit = Math.max(worstLit, rel);
+              // A tap reaching a black neighbour shows up as a DEFICIT here, and
+              // at up to 3/4 of the value — far outside any filter-precision
+              // slack, so the bound can stay tight.
+              if (rel > 0.02) bledOut++;
+            }
+          } else {
+            darkQueries++;
+            for (let ch = 0; ch < 3; ch++) if (answers[o + ch] !== 0) bledIn++;
+          }
+        }
+        check("a neighbouring tile reads exactly zero at every normal", bledIn === 0,
+          `${bledIn}/${darkQueries * 3} channels non-zero — a non-zero read here is the ` +
+          "lit tile bleeding across an atlas boundary");
+        check("the lit tile reads π·L at every normal", bledOut === 0,
+          `${bledOut}/${litQueries * 3} channels off, worst relative ${worstLit.toExponential(2)} — ` +
+          "a deficit here is a tap escaping INTO a black neighbour");
+        check("the bleed arm had neighbours to bleed into", neighbours.length >= 2,
+          `${neighbours.length} adjacent blocks around block ${litBlock}`);
+
+        // ══ ARM 7: the sampler closure [I] will gather with ═════════════
+        say("");
+        say("── SAMPLER: tiles.sampleTile vs srcRef's sampleTile ──");
+        // The closure itself, not a re-derivation of it: a gate that recomputed
+        // the atlas addressing would be checking its own arithmetic, and [I]
+        // would inherit an untested lookup on the hottest path in the module.
+        writeField(synthBin);
+        const atlas2 = await bake();
+        const blocksList = [...keyToBlock.values()];
+        for (let i = 0; i < QUERIES; i++) {
+          const z = rng() * 2 - 1;
+          const a = rng() * 2 * Math.PI;
+          const r = Math.sqrt(Math.max(0, 1 - z * z));
+          queryArr[i * 4] = f32(r * Math.cos(a));
+          queryArr[i * 4 + 1] = f32(r * Math.sin(a));
+          queryArr[i * 4 + 2] = f32(z);
+          queryArr[i * 4 + 3] = blocksList[i % blocksList.length];
+        }
+        queryBuf.value.array.set(queryArr);
+        queryBuf.value.needsUpdate = true;
+        await renderer.computeAsync(samplePass);
+        const answers2 = new Float32Array(await renderer.getArrayBufferAsync(answerBuf.value));
+
+        const tileCache = new Map();
+        const tileOf = (block) => {
+          let t = tileCache.get(block);
+          if (t) return t;
+          t = new Float32Array(TILE * TILE * 3);
+          for (let ty = 0; ty < TILE; ty++) {
+            for (let tx = 0; tx < TILE; tx++) {
+              const s = texelAt(block, tx, ty);
+              const d = (ty * TILE + tx) * 3;
+              t[d] = atlas2[s]; t[d + 1] = atlas2[s + 1]; t[d + 2] = atlas2[s + 2];
+            }
+          }
+          tileCache.set(block, t);
+          return t;
+        };
+        // ══ THE ERROR IS MEASURED AGAINST THE TILE'S RANGE, NOT THE VALUE ══
+        //
+        // The first version divided by the interpolated value and failed on 6
+        // of 12,288 channels at 6.2%. Not a bug, and not filter precision being
+        // worse than advertised — a METRIC problem. WebGPU lets an
+        // implementation compute bilinear weights at reduced precision
+        // (commonly 8 fractional bits), so the absolute error scales with the
+        // SPREAD of the four taps. Next to an uncovered texel that spread is
+        // the tile's full range while the interpolated value is near zero, and
+        // dividing one by the other manufactures a large number out of a small
+        // error. Those six samples were all in that neighbourhood — the
+        // one-sided probes are what put hard zero-to-π·L edges in the tiles.
+        //
+        // A bound stated as a fraction of the tile's own range says what is
+        // actually being claimed, and it keeps its teeth: an addressing fault
+        // reads a different texel, which is an error of order the whole range,
+        // i.e. a hundred times this bound.
+        const RANGE_TOL = 0.01;
+        const tileMaxCache = new Map();
+        const tileMaxOf = (block) => {
+          let mx = tileMaxCache.get(block);
+          if (mx !== undefined) return mx;
+          mx = 0;
+          const t = tileOf(block);
+          for (let k = 0; k < t.length; k++) mx = Math.max(mx, t[k]);
+          tileMaxCache.set(block, mx);
+          return mx;
+        };
+        let sampleWrong = 0;
+        let worstSample = 0;
+        for (let i = 0; i < QUERIES; i++) {
+          const block = queryArr[i * 4 + 3];
+          const want = ref.sampleTile(
+            tileOf(block), INTERIOR,
+            queryArr[i * 4], queryArr[i * 4 + 1], queryArr[i * 4 + 2],
+          );
+          const range = Math.max(1e-3, tileMaxOf(block));
+          for (let ch = 0; ch < 3; ch++) {
+            const err = Math.abs(answers2[i * 4 + ch] - want[ch]) / range;
+            worstSample = Math.max(worstSample, err);
+            if (err > RANGE_TOL) sampleWrong++;
+          }
+        }
+        check("the GPU sampler matches the CPU mirror over the whole sphere",
+          sampleWrong === 0,
+          `${sampleWrong}/${QUERIES * 3} channels differ, worst ` +
+          `${(worstSample * 100).toFixed(2)}% of the tile's range against a ` +
+          `${RANGE_TOL * 100}% bound (hardware filter-weight precision)`);
+
+        say("");
+        say(`   bake: ${bakeStats.lit}/${bakeStats.texels} texels covered ` +
+          `(${(bakeStats.coverage * 100).toFixed(1)}% of the pool, ` +
+          `${(100 * bakeStats.lit / (keyToBlock.size * TILE * TILE)).toFixed(1)}% of claimed), ` +
+          `${bakeStats.meanKnownBins.toFixed(1)}/${bakeStats.totalBins} known bins per texel, ` +
+          `E ${bakeStats.minLum.toFixed(3)}..${bakeStats.maxLum.toFixed(3)}`);
+        check("the bake's accounting closes over every atlas texel",
+          bakeStats.lit + bakeStats.empty === bakeStats.texels,
+          `${bakeStats.lit} + ${bakeStats.empty} vs ${bakeStats.texels}`);
+
+        if (validationErrors.length) check("no WebGPU validation errors", false, validationErrors[0]);
+
+        say("");
+        say(failures ? `gi-src-tiles: ${failures} CHECKS FAILED` : "gi-src-tiles: all cases PASS");
+        globalThis.__SRC_TILES_RESULT__ = {
+          pass: failures === 0,
+          failures,
+          tiles: keyToBlock.size,
+          blocks: tiles.blocks,
+          atlas: `${AW}x${AH}`,
+          interiorChecked,
+          borderChecked,
+          worstRel: +(worstRel * 100).toFixed(1),
+          furnaceWorst: +furnaceWorst.toExponential(2),
+          cornerSpread: +(worstSpread * 100).toFixed(1),
+          worstSample: +(worstSample * 100).toFixed(2),
+          uncovered: +(100 * uncovered / alphaChecked).toFixed(1),
+          queries: QUERIES,
+          coverage: +(bakeStats.coverage * 100).toFixed(1),
+          megabytes: +(tiles.bytes / 1048576).toFixed(2),
+          storageLimit: device.limits.maxStorageBuffersPerShaderStage,
+          text: out.textContent,
+        };
+
+      } catch (error) {
+        fail(error);
+      }
+    </script>
+  </body>
+</html>

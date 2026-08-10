@@ -46,11 +46,33 @@ for (const arm of arms) {
           console.log(`  src deposits: ${r.deposits} (${r.perRay}/ray) into ` +
             `${(r.bins / 1e6).toFixed(2)}M bins, ${r.clamped} clamped`);
         }
+        // The merge's own line. `to sky` is the range instrument — the share of
+        // merged bins whose parent chain reached the top cascade, i.e. how much
+        // of the frame gets the full-reach answer rather than a c0-only one.
+        const mg = result.srcProbes.merge;
+        if (mg) {
+          console.log(`  src merge: ${mg.merged}/${mg.bins} known bins merged ` +
+            `(${mg.corners}/8 corners, ${mg.orphanRate}% orphan, ` +
+            `${mg.resolvedRate}% to sky), ${mg.sky} top-cascade bins skied`);
+        }
+        // [H]. Nothing reads the atlas until [I], so `coverage` is the number
+        // that says the bake is connected: it is bounded above by the share of
+        // blocks a live probe holds, and `knownBins` separates "few probes"
+        // from "probes with no merged data".
+        const tl = result.srcProbes.tiles;
+        if (tl) {
+          console.log(`  src tiles: ${tl.lit}/${tl.owned} texels lit in claimed tiles ` +
+            `(${tl.claimed}%; ${tl.coverage}% of the ${tl.tiles}-tile pool), ` +
+            `${tl.knownBins}/${tl.totalBins} known bins per texel, E ${tl.minLum}..${tl.maxLum}`);
+        }
+        // [I]. `corners` is the number that says the picture is INTERPOLATED:
+        // at 1.0 this is the old one-probe-per-pixel resolve and the ~0.6m
+        // probe-cell blocks are still there.
         const g = result.srcProbes.gather;
         if (g) {
-          console.log(`  src c0 gather: sky ${g.sky}, ${g.lit}/${g.pixels} pixels lit ` +
-            `(${g.unknown} empty-probe, ${g.facing} wrong-hemisphere, ${g.badN} bad-normal), lum ${g.minLum}..${g.maxLum} mean ${g.meanLum}, ` +
-            `contrast ${g.contrast}, ${g.sampled}/${g.totalBins} bins sampled per pixel`);
+          console.log(`  src gather: sky ${g.sky}, ${g.lit}/${g.pixels} pixels lit ` +
+            `(${g.empty} no-probe), ${g.corners}/8 probes per pixel, ` +
+            `lum ${g.minLum}..${g.maxLum} mean ${g.meanLum}, contrast ${g.contrast}`);
         }
       }
       const unfed = logs.find((l) => l.includes("traversal counters unfed"));

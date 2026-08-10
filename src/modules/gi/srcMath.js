@@ -587,3 +587,158 @@ export function octahedralTexelIndex(dx, dy, dz, res) {
   const vi = Math.min(res - 1, Math.max(0, Math.floor(v)));
   return vi * res + ui;
 }
+
+// ══════════════════════════════════════════ [H] IRRADIANCE-TILE LAYOUT
+//
+// The two scene-independent tables the tile bake needs. Both live here rather
+// than beside the bake because they are pure LAYOUT — functions of (w,
+// interior, sub) and nothing else — and because putting them here is what
+// lets the GPU bake and the CPU mirror share ONE definition instead of
+// growing a twin each.
+
+/**
+ * For every texel of a BORDERED tile, the INTERIOR texel index whose value it
+ * carries. The one definition of the octahedral wrap rule.
+ *
+ * ══ THE WRAP RULE ══════════════════════════════════════════════════════════
+ *
+ * Crossing an edge of the octahedral square continues onto the sphere at the
+ * mirrored position on the SAME edge with the other axis negated. In texel
+ * terms: an edge's border row is that edge's own texels in REVERSE order, and
+ * each corner border texel is the DIAGONALLY OPPOSITE interior corner.
+ *
+ * Interior texels map to themselves, which is what makes the returned array a
+ * complete description of the tile: **every texel, border or not, is the
+ * irradiance integral evaluated at exactly one interior direction.** The GPU
+ * bake spends that: it dispatches one thread per tile texel and each thread
+ * runs the integral for `map[texel]`, so the border needs no copy pass, no
+ * read-after-write on the atlas, and no wrap logic in WGSL at all.
+ *
+ * @param {number} interior  payload resolution (6)
+ * @param {number} [border]  border width (1)
+ * @returns {Int32Array} length `(interior + 2·border)²`
+ */
+export function octahedralBorderMap(interior, border = 1) {
+  const N = interior;
+  const size = N + 2 * border;
+  const map = new Int32Array(size * size);
+  const inner = (x, y) => y * N + x;
+  for (let py = 0; py < size; py++) {
+    for (let px = 0; px < size; px++) {
+      const x = px - border;
+      const y = py - border;
+      const insideX = x >= 0 && x < N;
+      const insideY = y >= 0 && y < N;
+      let src;
+      if (insideX && insideY) src = inner(x, y);
+      // Left/right borders mirror their own edge vertically; top/bottom mirror
+      // theirs horizontally.
+      else if (insideY) src = inner(px === 0 ? 0 : N - 1, N - 1 - y);
+      else if (insideX) src = inner(N - 1 - x, py === 0 ? 0 : N - 1);
+      // All four corners are the −Z pole, which is exactly why this line
+      // matters more than it looks — see `fillOctahedralBorder`'s header for
+      // the 32% it is worth on a −Z receiver.
+      else src = inner(px === 0 ? N - 1 : 0, py === 0 ? N - 1 : 0);
+      map[py * size + px] = src;
+    }
+  }
+  return map;
+}
+
+/**
+ * The per-(bin, tile-texel) cosine weight table:
+ *
+ *     W(bin, n̂) = ⟨max(0, ω·n̂)⟩ over the bin's solid angle
+ *
+ * NOT `max(0, ω_centre·n̂)`, and that distinction is worth an essay because it
+ * is a bias the convergence sweep caught red-handed.
+ *
+ * A c0 bin is 4π/32 ≈ 0.39 sr — about 40° across. Evaluating the cosine at its
+ * CENTRE and calling that the bin's contribution is a one-point quadrature over
+ * a 40° cone, and the error it leaves is ANGULAR: refining probe spacing cannot
+ * reduce it, because s0 buys spatial resolution and this is a directional
+ * integral. The Phase-0 sweep showed exactly that fingerprint — 32.2% → 30.0%
+ * → 28.6% across two halvings of s0, i.e. flat. A blur shrinks; a bias sits
+ * there, and telling them apart is the entire reason that arm measures
+ * convergence instead of comparing against a tolerance.
+ *
+ * (This is the same class as the "frozen texel-centre cosine" the plan's §1
+ * table blames for the dense backend's settled-panel residual. It survived the
+ * architecture change because it was never in the transport — it was in the
+ * bake.)
+ *
+ * The fix is a proper quadrature: sub-sample each bin. Because the bins are
+ * EQUAL-AREA in (x, y), uniform sub-sampling in (x, y) is uniform in solid
+ * angle, so a plain mean over sub-samples IS the solid-angle average — no
+ * Jacobian, no weights. The table depends only on (w, tileRes, sub), never on
+ * the scene, so it is computed once and shared by every probe.
+ *
+ * Layout is `[bin·texels + texel]`. `tileCosineWeights` below transposes it
+ * into the bordered layout the GPU wants.
+ */
+const cosWeightCache = new Map();
+export function binCosineWeights(w, tileRes, sub = 4) {
+  const key = `${w}|${tileRes}|${sub}`;
+  const hit = cosWeightCache.get(key);
+  if (hit) return hit;
+  const nBins = 2 * w * w;
+  const texels = tileRes * tileRes;
+  const table = new Float64Array(nBins * texels);
+  // Texel normals, hoisted.
+  const normals = new Array(texels);
+  for (let v = 0; v < tileRes; v++) {
+    for (let u = 0; u < tileRes; u++) normals[v * tileRes + u] = octahedralDirection(u, v, tileRes);
+  }
+  const invSub = 1 / (sub * sub);
+  for (let j = 0; j < w; j++) {
+    for (let i = 0; i < 2 * w; i++) {
+      const m = binMorton(i, j);
+      for (let sy = 0; sy < sub; sy++) {
+        for (let sx = 0; sx < sub; sx++) {
+          const x = (i + (sx + 0.5) / sub) / (2 * w);
+          const y = (j + (sy + 0.5) / sub) / w;
+          const d = decodeDir(x, y);
+          for (let t = 0; t < texels; t++) {
+            const n = normals[t];
+            const cos = d[0] * n[0] + d[1] * n[1] + d[2] * n[2];
+            if (cos > 0) table[m * texels + t] += cos * invSub;
+          }
+        }
+      }
+    }
+  }
+  cosWeightCache.set(key, table);
+  return table;
+}
+
+/**
+ * `binCosineWeights`, transposed into the BORDERED tile layout and indexed
+ * `[texel·nBins + bin]` — the exact table the GPU bake reads.
+ *
+ * Two changes from the interior table, and both remove work from WGSL:
+ *
+ * - **Border rows are the mirrored interior rows.** A border texel's weights
+ *   are its wrapped interior texel's weights, so a thread that owns a border
+ *   texel computes the same integral and stores it in the border position.
+ *   The wrap therefore lives in a CPU-built table rather than in shader
+ *   control flow, which is why the bake kernel has no octahedral math in it at
+ *   all.
+ * - **Bin-major within a texel**, so the kernel's inner loop over bins walks
+ *   contiguous memory.
+ *
+ * f32 rather than f64 because it is uploaded — and it is the same value the
+ * mirror uses, rounded once, in one place.
+ */
+export function tileCosineWeights(w, interior, sub = 4, border = 1) {
+  const nBins = 2 * w * w;
+  const size = interior + 2 * border;
+  const inner = binCosineWeights(w, interior, sub);
+  const map = octahedralBorderMap(interior, border);
+  const texels = interior * interior;
+  const out = new Float32Array(size * size * nBins);
+  for (let t = 0; t < size * size; t++) {
+    const src = map[t];
+    for (let m = 0; m < nBins; m++) out[t * nBins + m] = inner[m * texels + src];
+  }
+  return out;
+}

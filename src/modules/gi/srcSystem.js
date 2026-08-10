@@ -46,13 +46,16 @@ import { CASCADE_COUNT, MAX_LODS, SRC_QUALITY, W0, srcQualityTier } from "./srcC
 import { createSrcProbeGizmos } from "./srcGizmos.js";
 import { R2_ALPHA1_FX, R2_ALPHA2_FX } from "./srcMath.js";
 import {
+  createSrcHashBlockFrame,
   createSrcProbeFrame,
   createSrcProbeStore,
   formatSrcProbeStats,
   readSrcProbeStats,
 } from "./srcProbes.js";
 import { createSrcBinStore, createSrcDepositFrame } from "./srcDeposit.js";
-import { createSrcGatherPass } from "./srcGather.js";
+import { createSrcMergeFrame, formatSrcMerge } from "./srcMerge.js";
+import { createSrcScreenGather, formatSrcGather } from "./srcScreenGather.js";
+import { createSrcTileAtlas, formatSrcTiles } from "./srcTiles.js";
 import { createSrcRayFrame, createSrcRayStore } from "./srcRays.js";
 import { createSrcSceneTrace } from "./srcTrace.js";
 
@@ -272,20 +275,72 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null, vol
       })
     : null;
 
-  // ── [G-lite]: THE c0-ONLY RESOLVE (plan §7 Phase 2, §12.13.5 unit 4) ─────
+  // ── [G]: THE MERGE (plan §12.18.7 unit 3) ────────────────────────────────
   //
-  // The merge is ABSENT, not disabled — cascades 1-3 are populated, budgeted and
-  // deposited into every frame and this reads none of it. That is what makes it
-  // a sanity check: if the picture is wrong here, the merge cannot be why.
-  const gather = binStore
-    ? createSrcGatherPass(store, binStore, {
-        pixelProbe: frame.pixelProbe,
-        readNormal,
-        // The scene's own Sky Light. Zero when a project never set it, which
-        // means this build still renders exactly as it did — see srcGather.js.
+  // Cascade 3 → 0, in place over the resolved payload. This is what turns a
+  // one-metre answer into a whole-reach one: before it, a c0 bin knew only
+  // about cascade 0's interval; after it, the same bin carries the product of
+  // transmittance and the sum of radiance along the entire cascade chain.
+  //
+  // The SKY IS ITS PARENT AT THE TOP and nowhere else — a per-cascade sky
+  // deposit would multiply it by the cascade count.
+  const merge = binStore
+    ? createSrcMergeFrame(store, binStore, {
+        spacing0,
+        // The SAME anchor uniform the population and the gizmos use. A merge
+        // that interpolates over a lattice placed from a second anchor produces
+        // plausible light in the wrong place, and no energy check can see it.
+        anchor: vec3(anchorU),
         sky: sky ? vec3(sky) : vec3(0),
+        w0: W0,
+      })
+    : null;
+
+  // ── [H]: THE IRRADIANCE TILES (plan §12.18.7 unit 4) ─────────────────────
+  //
+  // c0 only, and only because [G] has already run: a merged c0 bin carries the
+  // whole cascade chain's answer at the finest spacing the hierarchy has, so
+  // tiles for cascades 1-3 would bake the same light more coarsely and nothing
+  // would read them.
+  //
+  // [I] below is what reads them: one filtered tap per trilinear corner, in
+  // the shading point's normal direction.
+  const tiles = binStore
+    ? createSrcTileAtlas(store, binStore, {
+        w0: W0,
+        // The scene's own Sky Light, composited against a bin's RESIDUAL
+        // transmittance — zero for every merged bin, so it only ever fires for
+        // the orphans. Zero when a project never set it, which means this build
+        // still renders exactly as it did.
+        sky: sky ? vec3(sky) : vec3(0),
+      })
+    : null;
+
+  // ── [I]: THE SCREEN GATHER (plan §12.18.7 unit 5) ────────────────────────
+  //
+  // Sparse-trilinear over the ≤8 nearest c0 probes, one filtered tile tap each,
+  // blended across the LOD overlap. This is what removes the ~0.6 m rectangles
+  // that every frame since §12.17 has had: `srcGather.js` (deleted with this
+  // unit) assigned ONE probe per pixel with no interpolation, so the blocks
+  // were the probe cells at the correct spacing and no probe density was ever
+  // going to remove them.
+  //
+  // `hashBlockFrame` is what makes the closure affordable inside the resolve —
+  // see its header for the three-buffers-to-two argument.
+  const hashBlockFrame = tiles ? createSrcHashBlockFrame(store, 0) : null;
+  const gather = tiles
+    ? createSrcScreenGather(store, tiles, {
+        lookup: hashBlockFrame.lookup,
+        spacing0,
+        camera: vec3(cameraU),
+        // The SAME anchor the population, the gizmos and the merge use. A
+        // gather that interpolates over a lattice placed from a second anchor
+        // reads plausible light from the wrong probes.
+        anchor: vec3(anchorU),
+        readPixel,
         width,
         height,
+        maxLods: MAX_LODS,
         w0: W0,
       })
     : null;
@@ -302,17 +357,33 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null, vol
     rayFrame,
     binStore,
     deposit,
+    merge,
+    tiles,
+    hashBlockFrame,
     gather,
     spacing0,
     raysPerPixel: tier.raysPerPixel,
     // ONE dispatch list, in dependency order: population → budget → trace and
-    // scatter → resolve. Each stage reads what the previous one wrote
-    // (`pixelProbe`, then `pixelRayBase`, then the bin accumulators), and every
-    // gap between two entries is the barrier that makes that legal. A different
-    // order would spend this frame's rays against last frame's membership, which
-    // is the kind of one-frame skew that reads as noise rather than as a bug.
+    // scatter → resolve → merge → gather. Each stage reads what the previous one
+    // wrote (`pixelProbe`, then `pixelRayBase`, then the bin accumulators, then
+    // the resolved payload), and every gap between two entries is the barrier
+    // that makes that legal. A different order would spend this frame's rays
+    // against last frame's membership, which is the kind of one-frame skew that
+    // reads as noise rather than as a bug.
+    //
+    // THE MERGE'S OWN INTERNAL ORDER IS ALSO LOAD-BEARING and lives inside its
+    // pass list: cascade c reads the region cascade c+1 wrote one dispatch ago,
+    // so the ladder is only correct top-down and only because these are separate
+    // dispatches (srcMerge.js's header).
     passes: deposit
-      ? [...frame.passes, ...rayFrame.passes, ...deposit.passes, gather.reset, gather.compute]
+      ? [
+          ...frame.passes, ...rayFrame.passes, ...deposit.passes,
+          ...merge.passes, ...tiles.passes,
+          // `hashBlock` sits here and not with the population because it reads
+          // BOTH halves of what compaction settles (`hashSlot` and
+          // `PROBE_BLOCK`), and because its only consumer is the gather below.
+          hashBlockFrame.pass, gather.reset, gather.compute,
+        ]
       : [...frame.passes, ...rayFrame.passes],
     pixelProbe: frame.pixelProbe,
     width,
@@ -357,12 +428,15 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null, vol
       return {
         cascades: stats,
         reanchors,
-        bytes: store.bytes + rayStore.bytes + (binStore?.bytes ?? 0),
+        bytes: store.bytes + rayStore.bytes + (binStore?.bytes ?? 0)
+          + (merge?.bytes ?? 0) + (tiles?.bytes ?? 0) + (hashBlockFrame?.bytes ?? 0),
         spacing0,
         pixelCount,
         raysPerPixel: tier.raysPerPixel,
         totalRays: await rayFrame.readTotal(renderer),
         rays: deposit ? await deposit.readStats(renderer) : null,
+        merge: merge ? await merge.readStats(renderer) : null,
+        tiles: tiles ? await tiles.readStats(renderer) : null,
         gather: gather ? await gather.readStats(renderer) : null,
       };
     },
@@ -392,6 +466,9 @@ export function createSrcProbeSystem({ gbuffer, width, height, props = null, vol
     dispose() {
       gizmos.dispose();
       gather?.dispose();
+      hashBlockFrame?.dispose();
+      tiles?.dispose();
+      merge?.dispose();
       binStore?.dispose();
       rayStore.dispose();
       frame.dispose();
@@ -417,7 +494,15 @@ export function describeSrcProbeSystem(system) {
     // builds with identical probe telemetry, so the log says which one this is.
     (system.binStore
       ? `, ${(system.binStore.binTotal / 1e6).toFixed(2)}M bins in ` +
-        `${system.store.cascades.map((x) => x.blockCapacity).join("/")} blocks, depositing`
+        `${system.store.cascades.map((x) => x.blockCapacity).join("/")} blocks, ` +
+        // "depositing" and "depositing + merging" are two builds with identical
+        // probe telemetry and a range difference of four cascades, so the boot
+        // line names which one this is.
+        (system.merge ? "depositing + merging" : "depositing") +
+        (system.tiles
+          ? `, ${system.tiles.layout.width}x${system.tiles.layout.height} tile atlas ` +
+            `(${system.tiles.blocks} x ${system.tiles.tileSize}²)`
+          : "")
       : ", no volume — no deposit");
 }
 
@@ -441,5 +526,16 @@ export function formatSrcProbeFrame(stats) {
         // Deposits the block pool refused. The probe-side twin (`NOBLOCK n/cap`
         // in the cascade line) says how many probes; this says what it cost.
         (r.noBlock ? `  DROPPED ${r.noBlock}` : "")
-      : "");
+      : "") +
+    // The merge's range instrument. `to sky` is the fraction of merged bins
+    // whose parent chain reached the top — i.e. how much of the frame is
+    // getting the full-reach answer rather than a partial one.
+    (stats.merge?.dispatched ? `  |  ${formatSrcMerge(stats.merge)}` : "") +
+    (stats.tiles?.dispatched
+      ? `  |  ${formatSrcTiles(stats.tiles, stats.cascades[0]?.live ?? 0)}`
+      : "") +
+    // [I]'s instrument. `corners` is the one that says whether the picture is
+    // INTERPOLATED: at 1 per pixel this is the old one-probe-per-pixel gather
+    // wearing a new name, and the blocks are still there.
+    (stats.gather?.dispatched ? `  |  ${formatSrcGather(stats.gather)}` : "");
 }

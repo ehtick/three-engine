@@ -37,14 +37,14 @@ import {
 } from "./srcConfig.js";
 import {
   KEY_EMPTY,
+  binCosineWeights,
   binMorton,
   cellPosition,
-  decodeDir,
   dirToBin,
   hashKey,
   latticeOriginFor,
   nearestCell,
-  octahedralDirection,
+  octahedralBorderMap,
   packProbeKey,
   preAverage,
   rayDirection,
@@ -110,6 +110,17 @@ export class SrcProbeMap {
     this.probes = []; // indirection buffer: the actual per-probe records
     this.probeSteps = 0; // telemetry: total probe-sequence steps taken
     this.inserts = 0;
+    /**
+     * Inserts this map had no room for — the GPU's `COUNTER_FAILED`, on the CPU.
+     *
+     * A full map answers `insert` with −1 and `buildProbes` stores that as "no
+     * parent", so an undersized map does not throw, does not warn, and produces
+     * a REFERENCE that is missing probes. That happened (see `buildProbes`'s
+     * capacity note) and it cost a session's worth of confusion in the merge
+     * gate, where the GPU was right and the mirror was not. A counter is what
+     * turns that into one line of output.
+     */
+    this.insertFailures = 0;
   }
 
   /** Find-or-create. Returns the indirection slot index, or -1 when full. */
@@ -131,6 +142,7 @@ export class SrcProbeMap {
       }
       slot = (slot + 1) & mask;
     }
+    this.insertFailures++;
     return -1;
   }
 
@@ -171,7 +183,23 @@ export class SrcProbeMap {
 export function buildProbes(cfg, pixels) {
   const cascades = [];
   for (let c = 0; c < cfg.cascadeCount; c++) {
-    cascades.push(new SrcProbeMap(Math.max(64, pixels.length >> c)));
+    // ══ EVERY CASCADE GETS THE PIXEL COUNT, AND THE `>> c` WAS A BUG ═══════
+    //
+    // This used to be `pixels.length >> c` — the surface-manifold prediction
+    // that probe counts fall per cascade, spent as a capacity. Measurement has
+    // twice said otherwise: §12.19.2 recorded ladders flattening to 410 → 115 →
+    // 65 → 64, and `test:gi-src-merge`'s scattered set runs 548 → 480 → 377 →
+    // 305. At `>> 3` that gave cascade 3 a 256-slot map for 305 keys, and
+    // `insert` answers a full map with −1 — so the REFERENCE quietly dropped 49
+    // probes and then disagreed with the GPU about the merge, which is the
+    // worst possible place for the mirror to be the wrong one.
+    //
+    // The pixel count is not a guess, it is a BOUND: a cascade-c probe exists
+    // only because some c(c−1) probe inserted it, back to a pixel, so no
+    // cascade can hold more probes than there are pixels. A CPU-side map is
+    // two typed arrays, so paying the bound at every level costs nothing worth
+    // trading a correctness assumption for.
+    cascades.push(new SrcProbeMap(Math.max(64, pixels.length)));
   }
   const pixelProbe = new Int32Array(pixels.length).fill(-1);
 
@@ -567,69 +595,12 @@ export function preAverageChildBins(values, parentMorton) {
 // statement about the estimator rather than about discretization error, and it
 // is what bounds the multibounce loop's gain below 1 by construction.
 
-/**
- * The per-(bin, tile-texel) cosine weight table:
- *
- *     W(bin, n̂) = ⟨max(0, ω·n̂)⟩ over the bin's solid angle
- *
- * NOT `max(0, ω_centre·n̂)`, and that distinction is worth an essay because it
- * is a bias the convergence sweep caught red-handed.
- *
- * A c0 bin is 4π/32 ≈ 0.39 sr — about 40° across. Evaluating the cosine at its
- * CENTRE and calling that the bin's contribution is a one-point quadrature over
- * a 40° cone, and the error it leaves is ANGULAR: refining probe spacing cannot
- * reduce it, because s0 buys spatial resolution and this is a directional
- * integral. The Phase-0 sweep showed exactly that fingerprint — 32.2% → 30.0%
- * → 28.6% across two halvings of s0, i.e. flat. A blur shrinks; a bias sits
- * there, and telling them apart is the entire reason that arm measures
- * convergence instead of comparing against a tolerance.
- *
- * (This is the same class as the "frozen texel-centre cosine" the plan's §1
- * table blames for the dense backend's settled-panel residual. It survived the
- * architecture change because it was never in the transport — it was in the
- * bake.)
- *
- * The fix is a proper quadrature: sub-sample each bin. Because the bins are
- * EQUAL-AREA in (x, y), uniform sub-sampling in (x, y) is uniform in solid
- * angle, so a plain mean over sub-samples IS the solid-angle average — no
- * Jacobian, no weights. The table depends only on (w, tileRes, sub), never on
- * the scene, so it is computed once and shared by every probe; on the GPU it is
- * a small read-only buffer (32 bins × 36 texels at c0).
- */
-const cosWeightCache = new Map();
-export function binCosineWeights(w, tileRes, sub = 4) {
-  const key = `${w}|${tileRes}|${sub}`;
-  const hit = cosWeightCache.get(key);
-  if (hit) return hit;
-  const nBins = 2 * w * w;
-  const texels = tileRes * tileRes;
-  const table = new Float64Array(nBins * texels);
-  // Texel normals, hoisted.
-  const normals = new Array(texels);
-  for (let v = 0; v < tileRes; v++) {
-    for (let u = 0; u < tileRes; u++) normals[v * tileRes + u] = octahedralDirection(u, v, tileRes);
-  }
-  const invSub = 1 / (sub * sub);
-  for (let j = 0; j < w; j++) {
-    for (let i = 0; i < 2 * w; i++) {
-      const m = binMorton(i, j);
-      for (let sy = 0; sy < sub; sy++) {
-        for (let sx = 0; sx < sub; sx++) {
-          const x = (i + (sx + 0.5) / sub) / (2 * w);
-          const y = (j + (sy + 0.5) / sub) / w;
-          const d = decodeDir(x, y);
-          for (let t = 0; t < texels; t++) {
-            const n = normals[t];
-            const cos = d[0] * n[0] + d[1] * n[1] + d[2] * n[2];
-            if (cos > 0) table[m * texels + t] += cos * invSub;
-          }
-        }
-      }
-    }
-  }
-  cosWeightCache.set(key, table);
-  return table;
-}
+// `binCosineWeights` MOVED to `srcMath.js` when [H] landed, and re-exported
+// here so this file's public surface is unchanged. It is pure layout — a
+// function of (w, tileRes, sub) and nothing else — and the GPU bake needs it to
+// build its own table. Leaving a copy behind would have been a twin of a table
+// that has no reason ever to have two implementations.
+export { binCosineWeights };
 
 /**
  * Fill the 1-texel border of an octahedral tile (paper §6: "6×6 octahedral
@@ -664,31 +635,25 @@ export function binCosineWeights(w, tileRes, sub = 4) {
  * that in place the four taps around −Z become the four directions symmetric
  * about it, and their x/y biases cancel exactly.
  */
-export function fillOctahedralBorder(tile, interior, size) {
-  const at = (x, y) => (y * size + x) * 3;
-  const inner = (x, y) => ((y + 1) * size + (x + 1)) * 3;
-  const copy = (dst, src) => {
-    tile[dst] = tile[src];
-    tile[dst + 1] = tile[src + 1];
-    tile[dst + 2] = tile[src + 2];
-  };
+export function fillOctahedralBorder(tile, interior, size, channels = 3) {
+  // THE RULE ITSELF LIVES IN `octahedralBorderMap` (srcMath.js) — this walks
+  // it. The GPU bake spends the same map to give every tile texel, border or
+  // not, the interior direction whose integral it carries, so there is one
+  // description of the wrap rather than a copy loop here and a shader twin
+  // there. The map is interior-index-valued; the +1 shifts into the bordered
+  // array, and interior texels map to themselves so the copy is a no-op for
+  // them rather than a special case.
+  const map = octahedralBorderMap(interior, IRRADIANCE_TILE_BORDER);
   const N = interior;
-  for (let j = 0; j < N; j++) {
-    // Left/right borders mirror their own edge vertically.
-    copy(at(0, j + 1), inner(0, N - 1 - j));
-    copy(at(N + 1, j + 1), inner(N - 1, N - 1 - j));
+  for (let t = 0; t < size * size; t++) {
+    const src = map[t];
+    const sx = src % N;
+    const sy = (src - sx) / N;
+    const from = ((sy + 1) * size + (sx + 1)) * channels;
+    const to = t * channels;
+    if (from === to) continue;
+    for (let c = 0; c < channels; c++) tile[to + c] = tile[from + c];
   }
-  for (let i = 0; i < N; i++) {
-    // Top/bottom borders mirror their own edge horizontally.
-    copy(at(i + 1, 0), inner(N - 1 - i, 0));
-    copy(at(i + 1, N + 1), inner(N - 1 - i, N - 1));
-  }
-  // Corners take the diagonally opposite interior corner — all four of them are
-  // the −Z pole, which is exactly why this line matters more than it looks.
-  copy(at(0, 0), inner(N - 1, N - 1));
-  copy(at(N + 1, 0), inner(0, N - 1));
-  copy(at(0, N + 1), inner(N - 1, 0));
-  copy(at(N + 1, N + 1), inner(0, 0));
 }
 
 /**
@@ -702,6 +667,7 @@ export function bakeProbeIrradiance(cfg, built, merged, cascade = 0, interior = 
   const size = interior + 2 * IRRADIANCE_TILE_BORDER;
   const texels = interior * interior;
   const cosTable = binCosineWeights(w, interior);
+  const sky = cfg.sky ?? [0, 0, 0];
   const tiles = [];
   for (let i = 0; i < built.cascades[cascade].probes.length; i++) {
     const values = merged[cascade][i];
@@ -719,9 +685,22 @@ export function bakeProbeIrradiance(cfg, built, merged, cascade = 0, interior = 
           const cw = cosTable[m * texels + t];
           if (!(cw > 0)) continue;
           wr += cw;
-          sr += value.radiance[0] * cw;
-          sg += value.radiance[1] * cw;
-          sb += value.radiance[2] * cw;
+          // ── L + T·sky, AND IT IS CORRECT IN BOTH CASES IT CAN MEET ───────
+          //
+          // `mergeCascades` composites the sky ONCE at the top and multiplies
+          // its transmittance down, so a bin that merged arrives here with
+          // T = 0 and this reduces to `L` — no double count. A bin whose parent
+          // chain BROKE keeps its own T, and `L + T·sky` is exactly the answer
+          // the c0-only gather gave it.
+          //
+          // Without this term an orphaned bin contributes zero radiance where
+          // it used to contribute `T·sky`, and §12.21.9 measured 17.9% orphans
+          // on the smoke scene — not a rounding difference. Adding it changes
+          // nothing for a fully merged field, which is why every existing
+          // furnace arm is unaffected.
+          sr += (value.radiance[0] + value.transmittance * sky[0]) * cw;
+          sg += (value.radiance[1] + value.transmittance * sky[1]) * cw;
+          sb += (value.radiance[2] + value.transmittance * sky[2]) * cw;
         }
         const o = ((v + 1) * size + (u + 1)) * 3;
         if (wr > 0) {
@@ -740,6 +719,56 @@ export function bakeProbeIrradiance(cfg, built, merged, cascade = 0, interior = 
 }
 
 /**
+ * The COVERAGE twin of `bakeProbeIrradiance`: 1 where a texel found at least
+ * one known bin, 0 where it found none.
+ *
+ * ══ WHY AN ABSENCE NEEDS ITS OWN CHANNEL ═══════════════════════════════════
+ *
+ * A tile texel with no known bin is stored as BLACK, and black is a value. Every
+ * other absence in this module is renormalized around (R1: "rejection weights
+ * are epsilons, never zeros") and this one was not, because there was nowhere to
+ * put the distinction. §12.21 measured the size of the gap: **6.7% of the texels
+ * of claimed tiles on the smoke scene have no information at all**, and a
+ * receiver whose normal points at one of them was taking a dark vote.
+ *
+ * With coverage separated, `gatherPixel` weights each probe by the coverage its
+ * bilinear tap actually found, so a probe that knows nothing about a direction
+ * drops OUT of the interpolation and the probes that do know carry the pixel —
+ * which is the same rule `sparseGather` applies to a missing probe, extended to
+ * a probe that is present but uninformed.
+ *
+ * A separate array rather than a fourth channel on the tiles, deliberately: the
+ * tile stride is 3 in `sampleTile`, in `fillOctahedralBorder` and in the Phase-0
+ * suite's own arms, and widening it would rewrite all of them to buy nothing.
+ * On the GPU there is no such cost — it rides the atlas's unused alpha.
+ */
+export function bakeProbeCoverage(cfg, built, merged, cascade = 0, interior = IRRADIANCE_TILE_INTERIOR) {
+  const w = binGridWidth(cascade, cfg.w0);
+  const nBins = binCount(cascade, cfg.w0);
+  const size = interior + 2 * IRRADIANCE_TILE_BORDER;
+  const texels = interior * interior;
+  const cosTable = binCosineWeights(w, interior);
+  const tiles = [];
+  for (let i = 0; i < built.cascades[cascade].probes.length; i++) {
+    const values = merged[cascade][i];
+    const tile = new Float32Array(size * size);
+    for (let v = 0; v < interior; v++) {
+      for (let u = 0; u < interior; u++) {
+        const t = v * interior + u;
+        let found = 0;
+        for (let m = 0; m < nBins && !found; m++) {
+          if (values[m] && cosTable[m * texels + t] > 0) found = 1;
+        }
+        tile[(v + 1) * size + (u + 1)] = found;
+      }
+    }
+    fillOctahedralBorder(tile, interior, size, 1);
+    tiles.push(tile);
+  }
+  return tiles;
+}
+
+/**
  * Bilinear sample of a bordered probe tile in direction `n̂`.
  *
  * `interior` is the payload resolution (6); the backing array is
@@ -748,7 +777,7 @@ export function bakeProbeIrradiance(cfg, built, merged, cascade = 0, interior = 
  * correct wrapped value instead of a clamped duplicate — see
  * `fillOctahedralBorder` for why that distinction is worth 32% at the poles.
  */
-export function sampleTile(tile, interior, nx, ny, nz) {
+export function sampleTile(tile, interior, nx, ny, nz, channels = 3) {
   const size = interior + 2 * IRRADIANCE_TILE_BORDER;
   const inv = 1 / (Math.abs(nx) + Math.abs(ny) + Math.abs(nz));
   const px = nx * inv;
@@ -771,15 +800,17 @@ export function sampleTile(tile, interior, nx, ny, nz) {
   const at = (uu, vv) => {
     const cu = Math.min(size - 1, Math.max(0, uu));
     const cv = Math.min(size - 1, Math.max(0, vv));
-    const o = (cv * size + cu) * 3;
-    return [tile[o], tile[o + 1], tile[o + 2]];
+    const o = (cv * size + cu) * channels;
+    const px = new Array(channels);
+    for (let i = 0; i < channels; i++) px[i] = tile[o + i];
+    return px;
   };
   const a = at(u0, v0);
   const b = at(u0 + 1, v0);
   const c = at(u0, v0 + 1);
   const d = at(u0 + 1, v0 + 1);
-  const out = [0, 0, 0];
-  for (let i = 0; i < 3; i++) {
+  const out = new Array(channels).fill(0);
+  for (let i = 0; i < channels; i++) {
     const top = a[i] * (1 - tu) + b[i] * tu;
     const bot = c[i] * (1 - tu) + d[i] * tu;
     out[i] = top * (1 - tv) + bot * tv;
@@ -793,7 +824,30 @@ export function sampleTile(tile, interior, nx, ny, nz) {
 // contributing a filtered tile sample in the pixel's normal direction. LOD
 // blending rides on top via `lodBlend` across the ×0.9 overlap.
 
-export function gatherPixel(cfg, built, tiles, position, normal, interior = IRRADIANCE_TILE_INTERIOR) {
+/**
+ * ══ COVERAGE-WEIGHTED, AND IT IS ONE RULE APPLIED TWICE ════════════════════
+ *
+ * `coverage` is optional. Passed, each probe contributes `E · (its bilinear
+ * coverage)` to the numerator and that same coverage to the denominator, so:
+ *
+ *   • a probe with NO information in this direction (coverage 0) drops out of
+ *     the interpolation entirely and the remaining probes renormalize — the
+ *     same treatment `sparseGather` already gives a probe that does not exist;
+ *   • a probe with PARTIAL coverage (its bilinear tap straddles the edge of
+ *     what it knows) contributes in proportion to what it knows.
+ *
+ * The second is why coverage rides the accumulation rather than being a
+ * per-tap divide: the tile's filtered rgb is `Σ_taps w·E` over covered taps and
+ * its filtered coverage is `Σ_taps w` over the same taps, so accumulating both
+ * and dividing ONCE at the end computes the coverage-weighted mean over every
+ * contributing texel of every contributing probe at the same time. Dividing per
+ * tap instead would give each probe an equal vote regardless of how much of its
+ * tap was real.
+ *
+ * Without it a probe that knows nothing about a direction votes BLACK, which is
+ * the one thing R1 forbids — see `bakeProbeCoverage` for the measured size.
+ */
+export function gatherPixel(cfg, built, tiles, position, normal, interior = IRRADIANCE_TILE_INTERIOR, coverage = null) {
   const cheb = Math.max(
     Math.abs(position[0] - cfg.camera[0]),
     Math.abs(position[1] - cfg.camera[1]),
@@ -821,15 +875,28 @@ export function gatherPixel(cfg, built, tiles, position, normal, interior = IRRA
       },
       (acc, slot, weight) => {
         const c = sampleTile(tiles[slot], interior, normal[0], normal[1], normal[2]);
-        acc.r += c[0] * weight;
-        acc.g += c[1] * weight;
-        acc.b += c[2] * weight;
+        // The probe's own coverage in this direction, folded into its weight.
+        // 1 when no coverage array was supplied, which is the pre-[I] behaviour
+        // exactly — so a caller that does not pass one gets the old answer.
+        const cov = coverage
+          ? sampleTile(coverage[slot], interior, normal[0], normal[1], normal[2], 1)[0]
+          : 1;
+        const w = weight * cov;
+        acc.r += c[0] * w;
+        acc.g += c[1] * w;
+        acc.b += c[2] * w;
+        acc.w += w;
         return acc;
       },
-      () => ({ r: 0, g: 0, b: 0 }),
+      () => ({ r: 0, g: 0, b: 0, w: 0 }),
     );
-    if (!gathered) continue;
-    const inv = 1 / gathered.weight;
+    // `gathered.weight` counts corners that EXISTED; `value.w` counts the
+    // coverage they actually carried, and it is the one to divide by — a shell
+    // whose every probe exists but knows nothing about this direction has
+    // `weight > 0` and `w == 0`, and dividing by the former would hand the
+    // pixel a black vote from a probe that never claimed to know.
+    if (!gathered || !(gathered.value.w > 0)) continue;
+    const inv = 1 / gathered.value.w;
     out[0] += gathered.value.r * inv * shell.weight;
     out[1] += gathered.value.g * inv * shell.weight;
     out[2] += gathered.value.b * inv * shell.weight;

@@ -1,0 +1,766 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>SRC merge gate — createSrcMergeFrame vs mergeCascades</title>
+    <style>html,body{margin:0;background:#111;color:#ddd;font:13px monospace}canvas{display:none}</style>
+  </head>
+  <body>
+    <canvas id="view" width="16" height="16"></canvas>
+    <pre id="log"></pre>
+    <script type="module">
+      // ══ THE PHASE-3 UNIT-3 GATE: [G], WITHOUT THE DEPOSIT ════════════════
+      //
+      // Same isolation as its four siblings — own renderer, synthetic gbuffer,
+      // no engine, no scene, no occupancy field. And one step further: it does
+      // not run the DEPOSIT either.
+      //
+      // ══ WHY THE PAYLOAD IS SYNTHESIZED RATHER THAN DEPOSITED ════════════
+      //
+      // The merge's input is `[F]`'s resolved payload, and `test:gi-src-deposit`
+      // already owns the question of whether that payload is right. Running the
+      // deposit here would make every merge failure arrive wearing a deposit
+      // failure's clothes, and — worse — it would leave the gate unable to
+      // CHOOSE its input. The interesting inputs for a merge are the awkward
+      // ones: bins that are unknown, parents whose four children are only
+      // partly known, probes whose parent lattice has holes. A real deposit
+      // produces those by luck; this gate produces them by construction.
+      //
+      // So the payload is written straight into the buffer from a hash of
+      // `(cascade, probe key, morton)`. Both sides read the SAME function, so
+      // the CPU mirror and the GPU start from an identical field with no
+      // agreement to prove first. Every synthesized value is a multiple of
+      // 1/256, exactly representable in f32 and f64.
+      //
+      // ══ THE WEIGHTS ARE EXACT, AND THAT IS A PROPERTY OF THE LATTICE ════
+      //
+      // The parent lattice is exactly 2× coarser than the child's, and both are
+      // anchored by `round(anchor/s)·s`. A child probe therefore sits either ON
+      // a parent lattice point or exactly HALFWAY between two, on every axis —
+      // so the trilinear fractions are exactly {0, 0.5} and the eight weights
+      // are exact products of halves. With `s₀` a power of two nothing in that
+      // chain rounds, on either side. The corner arm can therefore demand bit
+      // equality rather than a tolerance, which is worth having: an off-by-one
+      // in the corner stencil would otherwise hide inside an epsilon.
+      //
+      // ══ THE ARMS ════════════════════════════════════════════════════════
+      //
+      //   keys       the GPU and mirror populations agree, per cascade, as SETS.
+      //              Everything below matches probes BY KEY, so this arm is what
+      //              stops a wholesale mismatch from reading as a merge fault.
+      //   corners    the 8 trilinear corner probes and their weights, per probe,
+      //              in order, exact.
+      //   sky        the top cascade composites the sky exactly once and CONSUMES
+      //              its transmittance; unknown bins stay unknown.
+      //   merged     every (cascade, probe, bin) against `mergeCascades`.
+      //   preavg     the 4→1 direction, checked WITHOUT the mirror — and the arm
+      //              reports how many bins the reversed mapping would have
+      //              changed, so a green cannot be vacuous.
+      //   monotone   T can only fall and L can only rise. Structural, on the
+      //              GPU's own numbers.
+      //   unknown    an unknown self bin is still unknown after the merge, and
+      //              an orphaned bin is UNTOUCHED rather than zeroed.
+      //   furnace    every bin (L=0, T=1): every merged bin must come out
+      //              EXACTLY the sky with T=0. Uniform in, uniform out — which
+      //              is what proves the renormalization, since a merge that
+      //              divided by the full stencil weight instead of the weight
+      //              FOUND would dim every probe with a missing corner.
+      //
+      // Run: node scripts/run-gi-src-merge-test.mjs
+      const out = document.querySelector("#log");
+      const say = (line) => { out.textContent += line + "\n"; };
+      let failures = 0;
+      const check = (label, ok, detail = "") => {
+        say(`  ${ok ? "PASS" : "FAIL"} ${label}${detail ? ` — ${detail}` : ""}`);
+        if (!ok) failures++;
+      };
+      const fail = (error) => {
+        console.error("SRC-MERGE FAIL", error?.stack ?? error?.message ?? String(error));
+        globalThis.__SRC_MERGE_RESULT__ = {
+          pass: false, error: error?.message ?? String(error), text: out.textContent,
+        };
+      };
+      globalThis.addEventListener("error", (event) => fail(event.error ?? event.message));
+      globalThis.addEventListener("unhandledrejection", (event) => fail(event.reason));
+
+      try {
+        const THREE = await import("three/webgpu");
+        const TSL = await import("three/tsl");
+        const cfgMod = await import("/src/modules/gi/srcConfig.js");
+        const refMath = await import("/src/modules/gi/srcMath.js");
+        const ref = await import("/src/modules/gi/srcRef.js");
+        const P = await import("/src/modules/gi/srcProbes.js");
+        const D = await import("/src/modules/gi/srcDeposit.js");
+        const G = await import("/src/modules/gi/srcMerge.js");
+
+        const { instancedArray, uniform, vec3 } = TSL;
+
+        const renderer = new THREE.WebGPURenderer({ canvas: document.querySelector("#view") });
+        await renderer.init();
+        const device = renderer.backend.device;
+        const validationErrors = [];
+        device.addEventListener?.("uncapturederror", (event) => {
+          validationErrors.push(event.error?.message ?? String(event.error));
+          console.error("WebGPU validation error:", validationErrors.at(-1));
+        });
+
+        const rng = (() => {
+          let s = 0x9e3779b9 >>> 0;
+          return () => {
+            s = (s + 0x6d2b79f5) >>> 0;
+            let t = s;
+            t = Math.imul(t ^ (t >>> 15), t | 1);
+            t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+            return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+          };
+        })();
+
+        // A POWER OF TWO, so every spacing, lattice origin and trilinear
+        // fraction below is exact in f32 — see the header.
+        const S0 = 0.5;
+        const CAM = [1.25, 1.5, -0.75];
+        const ANCHOR = [0.5, -1, 3];
+        // Exact in f32 and f64, and distinct per channel so a channel swap
+        // anywhere in the composite is visible rather than symmetric.
+        const SKY = [0.75, 0.5, 0.25];
+        const N = cfgMod.CASCADE_COUNT;
+        const TOP = N - 1;
+        const W0 = cfgMod.W0;
+
+        // ══ SMALLER THAN THE DEPOSIT GATE'S SET, AND DELIBERATELY ══════════
+        //
+        // The mirror materializes `resolved` and `merged` as JS objects, one per
+        // (probe, bin) — and cascade 3 has 2,048 bins per probe. A few hundred
+        // probes per cascade exercises every case the merge has (full stencils,
+        // partial stencils, orphans, partial pre-averages) at a few hundred
+        // thousand objects instead of several million.
+        const pixels = [];
+        const addPixel = (p, n) => pixels.push({ position: p, normal: n });
+        for (let i = 0; i < 320; i++) {
+          const u = (rng() - 0.5) * 12;
+          const v = (rng() - 0.5) * 12;
+          const face = Math.floor(rng() * 5);
+          if (face === 0) addPixel([u, -1, v], [0, 1, 0]);
+          else if (face === 1) addPixel([u, 4, v], [0, -1, 0]);
+          else if (face === 2) addPixel([-6, v * 0.4 + 1, u], [1, 0, 0]);
+          else if (face === 3) addPixel([6, v * 0.4 + 1, u], [-1, 0, 0]);
+          else addPixel([u, v * 0.4 + 1, 6], [0, 0, -1]);
+        }
+        // Shells at several LODs. `lodRadius` is the LAW'S OWN INVERSE — an
+        // inline `S0·2^lod` would put every one of these inside LOD 0 now that
+        // `LOD0_REACH` is in place, and the gate would pass while testing a
+        // single ring (§12.19.2).
+        for (let lod = 0; lod < 5; lod++) {
+          const r = cfgMod.lodRadius(lod, S0) * 1.35;
+          for (let k = 0; k < 60; k++) {
+            const axis = Math.floor(rng() * 3);
+            const sign = rng() < 0.5 ? -1 : 1;
+            const a = (rng() * 2 - 1) * r;
+            const b = (rng() * 2 - 1) * r;
+            const p = [0, 0, 0];
+            p[axis] = sign * r;
+            p[(axis + 1) % 3] = a;
+            p[(axis + 2) % 3] = b;
+            addPixel([p[0] + CAM[0], p[1] + CAM[1], p[2] + CAM[2]], [0, 1, 0]);
+          }
+        }
+        const PIXELS = pixels.length;
+        const valid = new Uint8Array(PIXELS).fill(1);
+        for (let i = 0; i < PIXELS; i += 13) valid[i] = 0;
+
+        const q32 = new Float32Array(1);
+        const f32 = (v) => { q32[0] = v; return q32[0]; };
+        for (const px of pixels) {
+          px.position = px.position.map(f32);
+          px.normal = px.normal.map(f32);
+        }
+
+        const attrs = new Float32Array(PIXELS * 8);
+        for (let i = 0; i < PIXELS; i++) {
+          attrs[i * 8] = pixels[i].position[0];
+          attrs[i * 8 + 1] = pixels[i].position[1];
+          attrs[i * 8 + 2] = pixels[i].position[2];
+          attrs[i * 8 + 3] = valid[i];
+          attrs[i * 8 + 4] = pixels[i].normal[0];
+          attrs[i * 8 + 5] = pixels[i].normal[1];
+          attrs[i * 8 + 6] = pixels[i].normal[2];
+        }
+        const posBuf = instancedArray(attrs.slice(), "vec4");
+        const readPixel = (i) => {
+          const t = posBuf.element(i.mul(2)).toVar();
+          return { position: t.xyz, valid: t.w.greaterThan(0.5) };
+        };
+
+        // ══ THE SYNTHETIC RESOLVED FIELD ══════════════════════════════════
+        //
+        // Keyed on the probe KEY rather than on its slot index, because the CPU
+        // and GPU populations agree about keys and not about indices (the same
+        // rule `test:gi-src-deposit` matches probes under). Values are k/256 and
+        // k/16 — exact on both sides, so the only inexactness anywhere in this
+        // gate is the merge's own divisions.
+        //
+        // One bin in eight is UNKNOWN, which is what puts partial pre-averages
+        // (parents with 1-3 known children of 4) in front of the kernel at every
+        // level. That case is the one the renormalization exists for and a
+        // deposit would produce it only incidentally.
+        const synthBin = (cascade, key, m) => {
+          const seed = ((key ^ Math.imul(cascade + 1, 0x9e3779b9)) + Math.imul(m, 0x85ebca6b)) >>> 0;
+          const h = refMath.hashKey(seed) >>> 0;
+          if ((h & 7) === 0) return null;
+          return {
+            radiance: [
+              ((h >>> 3) & 255) / 256,
+              ((h >>> 11) & 255) / 256,
+              ((h >>> 19) & 255) / 256,
+            ],
+            transmittance: ((h >>> 27) & 15) / 16,
+          };
+        };
+
+        // ── the GPU side ─────────────────────────────────────────────────
+        const store = P.createSrcProbeStore({
+          c0Probes: 4096,
+          cascadeCount: N,
+          // Sized like the deposit gate's: scattered LOD shells do not merge
+          // 4× per cascade, so the default equal-bin split would starve the top
+          // of the ladder and put blockless probes in front of a kernel that
+          // treats them as absent parents (srcMerge.js). Every arm below wants
+          // that divergence at zero.
+          blockCapacity: [1024, 1024, 512, 512],
+        });
+        const cameraU = uniform(new THREE.Vector3(...CAM));
+        const anchorU = uniform(new THREE.Vector3(...ANCHOR));
+        const skyU = uniform(new THREE.Vector3(...SKY));
+
+        const frame = P.createSrcProbeFrame(store, {
+          spacing0: S0, camera: vec3(cameraU), anchor: vec3(anchorU),
+          pixelCount: PIXELS, readPixel,
+        });
+        const bins = D.createSrcBinStore(store, { w0: W0 });
+        const merge = G.createSrcMergeFrame(store, bins, {
+          spacing0: S0, anchor: vec3(anchorU), sky: vec3(skyU), w0: W0,
+        });
+
+        say(`pixels ${PIXELS}  s0 ${S0}  sky ${SKY.join("/")}  cascades ${N}  w0 ${W0}`);
+        say(`bins ${(bins.binTotal / 1e6).toFixed(3)}M over ` +
+          `${store.cascades.map((c) => c.blockCapacity).join("/")} blocks  ` +
+          `${(bins.bytes / 1048576).toFixed(1)}MB payload+scratch, ` +
+          `${(merge.bytes / 1024).toFixed(0)}KB corner records  ` +
+          `dispatches ${frame.passes.length}+${merge.passes.length}`);
+        say("");
+
+        for (const pass of frame.passes) await renderer.computeAsync(pass);
+        const table = new Uint32Array(await renderer.getArrayBufferAsync(store.probeTable.value));
+
+        // Live probes, by cascade: key → block, and block → key.
+        const gpuProbes = [];
+        let unclaimed = 0;
+        for (let c = 0; c < N; c++) {
+          const pc = store.cascades[c];
+          const keyToBlock = new Map();
+          const blockToKey = new Map();
+          for (let k = 0; k < pc.probeCapacity; k++) {
+            const w = (pc.probeBase + k) * P.PROBE_WORDS;
+            if ((table[w + P.PROBE_FLAGS] & P.FLAG_ALIVE) === 0) continue;
+            const key = table[w + P.PROBE_KEY] >>> 0;
+            const block = table[w + P.PROBE_BLOCK] >>> 0;
+            if (block === P.SLOT_EMPTY) { unclaimed++; continue; }
+            keyToBlock.set(key, block);
+            blockToKey.set(block, key);
+          }
+          gpuProbes.push({ keyToBlock, blockToKey });
+        }
+
+        /** Payload word offset of (cascade, block, morton). */
+        const slotOf = (c, block, m) =>
+          (bins.cascades[c].binBase + block * bins.cascades[c].bins + m) * D.PAYLOAD_WORDS;
+
+        // Write a resolved field into the payload buffer. `fill(c, key, m)`
+        // returns a bin or null; every bin the caller does not claim stays
+        // UNKNOWN, which is also what [F] writes for an untouched block.
+        const payloadArray = bins.payload.value.array;
+        const writeField = (fill) => {
+          for (let i = 0; i < bins.binTotal; i++) {
+            const o = i * D.PAYLOAD_WORDS;
+            payloadArray[o] = 0;
+            payloadArray[o + 1] = 0;
+            payloadArray[o + 2] = 0;
+            payloadArray[o + 3] = D.PAYLOAD_UNKNOWN;
+          }
+          for (let c = 0; c < N; c++) {
+            const nb = bins.cascades[c].bins;
+            for (const [key, block] of gpuProbes[c].keyToBlock) {
+              for (let m = 0; m < nb; m++) {
+                const v = fill(c, key, m);
+                if (!v) continue;
+                const o = slotOf(c, block, m);
+                payloadArray[o] = v.radiance[0];
+                payloadArray[o + 1] = v.radiance[1];
+                payloadArray[o + 2] = v.radiance[2];
+                payloadArray[o + 3] = v.transmittance;
+              }
+            }
+          }
+          bins.payload.value.needsUpdate = true;
+        };
+
+        writeField(synthBin);
+        // The pre-merge field, kept for the arms that compare against the INPUT
+        // rather than against the mirror (`preavg`, `monotone`, `unknown`).
+        const before = Float32Array.from(payloadArray);
+        for (const pass of merge.passes) await renderer.computeAsync(pass);
+        const [after, cornerBlock, cornerWeight, mergeStats] = await Promise.all([
+          renderer.getArrayBufferAsync(bins.payload.value).then((b) => new Float32Array(b)),
+          renderer.getArrayBufferAsync(merge.cornerBlock.value).then((b) => new Uint32Array(b)),
+          renderer.getArrayBufferAsync(merge.cornerWeight.value).then((b) => new Float32Array(b)),
+          merge.readStats(renderer),
+        ]);
+
+        // ── the mirror ───────────────────────────────────────────────────
+        const mirrorPixels = pixels.filter((_, i) => valid[i]);
+        const cfg = ref.makeSrcConfig({
+          spacing0: S0, camera: CAM, anchor: ANCHOR, sky: SKY,
+          cascadeCount: N, maxLods: cfgMod.MAX_LODS,
+        });
+        const built = ref.buildProbes(cfg, mirrorPixels);
+        const resolved = [];
+        for (let c = 0; c < N; c++) {
+          const nb = cfgMod.binCount(c, W0);
+          resolved.push(built.cascades[c].probes.map((probe) => {
+            const values = new Array(nb);
+            for (let m = 0; m < nb; m++) values[m] = synthBin(c, probe.key >>> 0, m);
+            return values;
+          }));
+        }
+        const mirror = ref.mergeCascades(cfg, built, resolved);
+
+        // ══ ARM 1: the populations agree ═════════════════════════════════
+        say("── KEYS: the GPU and mirror probe sets, per cascade ──");
+        // Everything below is matched BY KEY. If the populations disagree the
+        // merge arms would report a flood of "missing" that has nothing to do
+        // with the merge, so this is checked first and reported as sets.
+        let keyMismatch = 0;
+        const liveCounts = [];
+        for (let c = 0; c < N; c++) {
+          const gpu = gpuProbes[c].keyToBlock;
+          const cpu = new Set(built.cascades[c].probes.map((p) => p.key >>> 0));
+          liveCounts.push(gpu.size);
+          let diff = 0;
+          for (const k of cpu) if (!gpu.has(k)) diff++;
+          for (const k of gpu.keys()) if (!cpu.has(k)) diff++;
+          keyMismatch += diff;
+          say(`   c${c}: ${gpu.size} gpu / ${cpu.size} mirror probes, ` +
+            `${cfgMod.binCount(c, W0)} bins each` + (diff ? `  ${diff} DIFFER` : ""));
+        }
+        check("the GPU and mirror populate the same probe keys", keyMismatch === 0,
+          `${keyMismatch} keys differ`);
+        // THE MIRROR'S OWN CAPACITY, ASSERTED. `SrcProbeMap.insert` answers a
+        // full map with −1 and `buildProbes` stores that as "no parent" — so an
+        // undersized reference is missing probes, silently, and then disagrees
+        // with a GPU that is right. That is exactly what this gate's first run
+        // found (49 c3 probes short), and it is worth a permanent arm because
+        // the failure presents as a merge bug three arms further down.
+        const mirrorFailures = built.cascades.reduce((a, m) => a + m.insertFailures, 0);
+        check("the mirror's probe maps had room for every key", mirrorFailures === 0,
+          `${mirrorFailures} inserts dropped by a full map — see buildProbes' capacity note`);
+        check("no probe went without a bin block", unclaimed === 0,
+          `${unclaimed} unclaimed — a blockless parent reads as ABSENT to the merge ` +
+          "and the mirror has no such case, so this must be zero for the diff to mean anything");
+
+        // ══ ARM 2: the trilinear corner stencil ══════════════════════════
+        say("");
+        say("── CORNERS: the 8 parent probes and their weights, exact ──");
+        // Exact because the parent lattice is exactly 2× the child's, so the
+        // fractions are {0, 0.5} — see the header.
+        let cornerWrong = 0;
+        let weightWrong = 0;
+        let cornerChecked = 0;
+        let cornersFound = 0;
+        let cornerWorst = null;
+        for (let c = 0; c < TOP; c++) {
+          const recordBase = merge.cornerCascades[c].base;
+          for (const probe of built.cascades[c].probes) {
+            const key = probe.key >>> 0;
+            const block = gpuProbes[c].keyToBlock.get(key);
+            if (block === undefined) continue;
+            const s = cfgMod.probeSpacing(c + 1, probe.lod, S0);
+            const origin = ref.latticeOrigin(cfg, c + 1, probe.lod);
+            const corners = refMath.trilinearCorners(
+              probe.position[0], probe.position[1], probe.position[2],
+              origin[0], origin[1], origin[2], s,
+            );
+            for (let k = 0; k < corners.length; k++) {
+              cornerChecked++;
+              const want = corners[k];
+              const wantKey = refMath.packProbeKey(
+                probe.lod, probe.secondary, want.cx, want.cy, want.cz,
+              );
+              const wantSlot = built.cascades[c + 1].find(wantKey);
+              const wantProbeKey = wantSlot >= 0
+                ? built.cascades[c + 1].probes[wantSlot].key >>> 0 : null;
+              const gotBlock = cornerBlock[recordBase + block * G.MERGE_CORNERS + k] >>> 0;
+              const gotKey = gotBlock === P.SLOT_EMPTY
+                ? null : (gpuProbes[c + 1].blockToKey.get(gotBlock) ?? -1);
+              if (gotKey !== null) cornersFound++;
+              if (gotKey !== wantProbeKey) {
+                cornerWrong++;
+                cornerWorst ??= `c${c} probe ${key} corner ${k}: gpu ${gotKey} vs mirror ${wantProbeKey}`;
+              }
+              const gotW = cornerWeight[recordBase + block * G.MERGE_CORNERS + k];
+              if (gotW !== f32(want.weight)) {
+                weightWrong++;
+                cornerWorst ??= `c${c} probe ${key} corner ${k}: w ${gotW} vs ${want.weight}`;
+              }
+            }
+          }
+        }
+        check("every trilinear corner resolves to the same parent probe", cornerWrong === 0,
+          `${cornerWrong}/${cornerChecked} corners differ${cornerWorst ? ` — ${cornerWorst}` : ""}`);
+        check("every corner weight is bit-identical to the mirror's", weightWrong === 0,
+          `${weightWrong}/${cornerChecked} weights differ`);
+        say(`   ${cornersFound}/${cornerChecked} corners found a parent ` +
+          `(${(100 * cornersFound / Math.max(1, cornerChecked)).toFixed(1)}%) — ` +
+          `the rest are the sparse population the renormalization exists for`);
+        check("the kernel's own corner tally agrees",
+          Math.abs(mergeStats.meanCorners * mergeStats.probes - cornersFound) < 1,
+          `stats ${(mergeStats.meanCorners * mergeStats.probes).toFixed(0)} vs ${cornersFound}`);
+
+        // ══ ARM 3: the sky, at the top and nowhere else ══════════════════
+        say("");
+        say("── SKY: composited once at the top, and its T consumed ──");
+        // Checked directly against the input rather than through the mirror,
+        // because "the sky was added twice" and "the sky was added once to a
+        // different value" are indistinguishable in a merged c0 bin.
+        let skyWrong = 0;
+        let skyUnknownChanged = 0;
+        let skyBins = 0;
+        {
+          const info = bins.cascades[TOP];
+          for (let i = 0; i < info.bins * info.blockCapacity; i++) {
+            const o = (info.binBase + i) * D.PAYLOAD_WORDS;
+            const T = before[o + 3];
+            if (T < 0) {
+              if (after[o + 3] !== D.PAYLOAD_UNKNOWN) skyUnknownChanged++;
+              continue;
+            }
+            skyBins++;
+            for (let ch = 0; ch < 3; ch++) {
+              if (after[o + ch] !== f32(before[o + ch] + T * SKY[ch])) skyWrong++;
+            }
+            if (after[o + 3] !== 0) skyWrong++;
+          }
+        }
+        check("every known top-cascade bin is L + T·sky with T consumed", skyWrong === 0,
+          `${skyWrong} words wrong over ${skyBins} bins`);
+        check("unknown top-cascade bins were left unknown", skyUnknownChanged === 0,
+          `${skyUnknownChanged} changed`);
+        check("the kernel counted the same top-cascade bins", mergeStats.sky === skyBins,
+          `stats ${mergeStats.sky} vs ${skyBins}`);
+
+        // ══ ARM 4: the merged field vs mergeCascades ════════════════════
+        say("");
+        say("── MERGED: every (cascade, probe, bin) against the mirror ──");
+        // A TOLERANCE, and only here. The merge divides by the number of KNOWN
+        // children (1-4) and by the found stencil weight, so f32 and f64 part
+        // company in the last few ulps; everything else in this gate is exact.
+        // The bound is relative-plus-absolute and the worst deviation is
+        // reported, because a bound nobody measures is a bound nobody can tell
+        // has started to slip.
+        const TOL = 2e-5;
+        let mergedWrong = 0;
+        let mergedChecked = 0;
+        let unknownWrong = 0;
+        let worstErr = 0;
+        let mergedWorst = null;
+        for (let c = 0; c < N; c++) {
+          const nb = cfgMod.binCount(c, W0);
+          for (let i = 0; i < built.cascades[c].probes.length; i++) {
+            const probe = built.cascades[c].probes[i];
+            const block = gpuProbes[c].keyToBlock.get(probe.key >>> 0);
+            if (block === undefined) continue;
+            for (let m = 0; m < nb; m++) {
+              const want = mirror[c][i][m];
+              const o = slotOf(c, block, m);
+              const gotT = after[o + 3];
+              if (!want) {
+                if (gotT !== D.PAYLOAD_UNKNOWN) unknownWrong++;
+                continue;
+              }
+              mergedChecked++;
+              let bad = false;
+              for (let ch = 0; ch < 3; ch++) {
+                const err = Math.abs(after[o + ch] - want.radiance[ch]);
+                worstErr = Math.max(worstErr, err);
+                if (err > TOL + TOL * Math.abs(want.radiance[ch])) bad = true;
+              }
+              const errT = Math.abs(gotT - want.transmittance);
+              worstErr = Math.max(worstErr, errT);
+              if (errT > TOL + TOL * Math.abs(want.transmittance)) bad = true;
+              if (bad) {
+                mergedWrong++;
+                mergedWorst ??= `c${c} probe ${probe.key >>> 0} bin ${m}: ` +
+                  `gpu ${after[o].toFixed(6)}/${gotT.toFixed(6)} vs ` +
+                  `mirror ${want.radiance[0].toFixed(6)}/${want.transmittance.toFixed(6)}`;
+              }
+            }
+          }
+        }
+        check("every merged bin matches mergeCascades", mergedWrong === 0,
+          `${mergedWrong}/${mergedChecked} differ${mergedWorst ? ` — ${mergedWorst}` : ""}`);
+        check("an UNKNOWN bin is still unknown after the merge", unknownWrong === 0,
+          `${unknownWrong} unknown bins were written`);
+        say(`   worst deviation ${worstErr.toExponential(2)} against a ${TOL.toExponential(0)} ` +
+          "bound — f32 against the mirror's f64, in the two divisions the merge makes");
+        check("the comparison was not vacuous", mergedChecked > 10000,
+          `${mergedChecked} bins compared`);
+
+        // ══ ARM 5: the 4→1 direction, without the mirror ════════════════
+        say("");
+        say("── PREAVG: the parent's four children are 4m…4m+3, not m>>2 ──");
+        // §12.18.6's first carried trap. A reversed mapping delivers the wrong
+        // DIRECTION's radiance: it costs no energy, throws nothing, and reads as
+        // a hue rotation that survives every conservation check. So it is
+        // checked here directly against the parent's OWN merged values, and the
+        // arm also computes what the reversed mapping WOULD have produced — a
+        // green is worthless if the two agree.
+        let dirChecked = 0;
+        let dirWrong = 0;
+        let dirWouldDiffer = 0;
+        for (let c = 0; c < TOP; c++) {
+          const nb = bins.cascades[c].bins;
+          const parentInfo = bins.cascades[c + 1];
+          const recordBase = merge.cornerCascades[c].base;
+          for (const [key, block] of gpuProbes[c].keyToBlock) {
+            void key;
+            // Only probes sitting exactly ON a parent lattice point, so the
+            // stencil is a single unit-weight corner and the expected value is
+            // one pre-average with no interpolation to unpick.
+            let single = -1;
+            let others = 0;
+            for (let k = 0; k < G.MERGE_CORNERS; k++) {
+              const w = cornerWeight[recordBase + block * G.MERGE_CORNERS + k];
+              const b = cornerBlock[recordBase + block * G.MERGE_CORNERS + k] >>> 0;
+              if (w === 1 && b !== P.SLOT_EMPTY) single = b;
+              else if (w > 0 && b !== P.SLOT_EMPTY) others++;
+            }
+            if (single < 0 || others > 0) continue;
+            for (let m = 0; m < nb; m++) {
+              const o = slotOf(c, block, m);
+              const selfT = before[o + 3];
+              if (selfT < 0) continue;
+              const meanOf = (firstChild) => {
+                let r = 0; let g = 0; let b = 0; let t = 0; let n = 0;
+                for (let j = 0; j < 4; j++) {
+                  const op = (parentInfo.binBase + single * parentInfo.bins + firstChild + j)
+                    * D.PAYLOAD_WORDS;
+                  if (after[op + 3] < 0) continue;
+                  r += after[op]; g += after[op + 1]; b += after[op + 2]; t += after[op + 3];
+                  n++;
+                }
+                return n === 0 ? null : { r: r / n, g: g / n, b: b / n, t: t / n, n };
+              };
+              const right = meanOf(m * 4);
+              // The reversed mapping, clamped into range the way a plausible
+              // bug would be — this is only used to prove the arm has teeth.
+              const wrong = meanOf((m >> 2) * 4);
+              if (!right) continue;
+              dirChecked++;
+              const expect = before[o] + selfT * right.r;
+              if (Math.abs(after[o] - expect) > 1e-5 + 1e-5 * Math.abs(expect)) dirWrong++;
+              if (wrong && Math.abs(wrong.r - right.r) > 1e-4) dirWouldDiffer++;
+            }
+          }
+        }
+        check("the merge reads the parent's children at 4m…4m+3", dirWrong === 0,
+          `${dirWrong}/${dirChecked} unit-weight bins disagree`);
+        check("the reversed mapping would have been caught",
+          dirWouldDiffer > dirChecked * 0.5,
+          `${dirWouldDiffer}/${dirChecked} bins would have changed under m>>2 — ` +
+          "a low number here would mean the arm above proves nothing");
+
+        // ══ ARM 6: structural invariants on the GPU's own numbers ═══════
+        say("");
+        say("── MONOTONE: transmittance only falls, radiance only rises ──");
+        // Independent of both the mirror and the input's shape: T_merged =
+        // T_self·T_parent with T_parent in [0,1], and L_merged = L_self +
+        // T_self·L_parent with every term non-negative. A merge that dropped
+        // `L_self`, or that let a parent's T exceed 1, breaks one of these
+        // without necessarily breaking the average.
+        let tRose = 0;
+        let lFell = 0;
+        let outOfRange = 0;
+        let touched = 0;
+        for (let c = 0; c < N; c++) {
+          const info = bins.cascades[c];
+          for (let i = 0; i < info.bins * info.blockCapacity; i++) {
+            const o = (info.binBase + i) * D.PAYLOAD_WORDS;
+            if (before[o + 3] < 0) continue;
+            touched++;
+            if (after[o + 3] > before[o + 3] + 1e-6) tRose++;
+            if (after[o + 3] < -1e-6 || after[o + 3] > 1 + 1e-6) outOfRange++;
+            for (let ch = 0; ch < 3; ch++) {
+              if (after[o + ch] < before[o + ch] - 1e-6) lFell++;
+            }
+          }
+        }
+        check("no bin's transmittance rose", tRose === 0, `${tRose}/${touched} bins`);
+        check("no bin's radiance fell", lFell === 0, `${lFell} channels`);
+        check("every merged transmittance is in [0,1]", outOfRange === 0, `${outOfRange} bins`);
+
+        // ══ ARM 7: an orphaned bin is untouched, not zeroed ═════════════
+        say("");
+        say("── ORPHANS: no parent information means keep your own interval ──");
+        // The R1 case. A bin the merge could not find a parent VALUE for must
+        // come out exactly as it went in — NOT dark, and NOT with its
+        // transmittance consumed, because `srcGather`'s `L + T·sky` is what
+        // gives it the c0-only answer meanwhile (srcMerge.js's header).
+        //
+        // TWO FALSE STARTS ARE RECORDED HERE BECAUSE BOTH ARE INSTRUCTIVE.
+        //
+        // First this looked for probes whose whole STENCIL was empty and found
+        // none, so it passed while proving nothing — the real orphan is finer
+        // than that: a probe with corners, every one of whose four parent
+        // child-bins in this direction happens to be unknown.
+        //
+        // Then it asserted that the bins left byte-identical ARE the orphans,
+        // and read 14,895 against the kernel's 44. That is not a bug either: a
+        // bin whose own `T_self` is ZERO merges to `L + 0·L_parent` and
+        // `0·T_parent`, which is byte-identical to what it was. One known bin in
+        // sixteen carries T = 0 in the synthetic field, and 237,926/16 ≈ 14,870.
+        // **"Unchanged" is not "orphaned"**, and the difference is exactly the
+        // fully-blocked bins.
+        //
+        // So orphan-hood is RE-DERIVED here instead of inferred: a bin is an
+        // orphan when no corner of its stencil yields a known pre-average, which
+        // is the kernel's own test run over the same merged parent payload the
+        // kernel read. Then both directions are checkable — every orphan must be
+        // byte-identical, and every non-orphan with T > 0 must have changed.
+        let orphanKnown = 0;
+        let orphanFound = 0;
+        let orphanChanged = 0;
+        let mergedUnchanged = 0;
+        for (let c = 0; c < TOP; c++) {
+          const nb = bins.cascades[c].bins;
+          const parentInfo = bins.cascades[c + 1];
+          const recordBase = merge.cornerCascades[c].base;
+          for (const [, block] of gpuProbes[c].keyToBlock) {
+            for (let m = 0; m < nb; m++) {
+              const o = slotOf(c, block, m);
+              const selfT = before[o + 3];
+              if (selfT < 0) continue;
+              orphanKnown++;
+              let any = false;
+              for (let k = 0; k < G.MERGE_CORNERS && !any; k++) {
+                const w = cornerWeight[recordBase + block * G.MERGE_CORNERS + k];
+                const pb = cornerBlock[recordBase + block * G.MERGE_CORNERS + k] >>> 0;
+                if (!(w > 0) || pb === P.SLOT_EMPTY) continue;
+                for (let j = 0; j < 4; j++) {
+                  const op = (parentInfo.binBase + pb * parentInfo.bins + m * 4 + j)
+                    * D.PAYLOAD_WORDS;
+                  if (after[op + 3] >= 0) { any = true; break; }
+                }
+              }
+              let same = true;
+              for (let ch = 0; ch < 4; ch++) if (after[o + ch] !== before[o + ch]) same = false;
+              if (!any) {
+                orphanFound++;
+                if (!same) orphanChanged++;
+              } else if (same && selfT > 0) {
+                mergedUnchanged++;
+              }
+            }
+          }
+        }
+        check("the kernel's orphan count is exactly the bins with no parent value",
+          orphanFound === mergeStats.orphans,
+          `${orphanFound} derived of ${orphanKnown} known vs ${mergeStats.orphans} counted`);
+        check("every orphan is byte-identical afterwards", orphanChanged === 0,
+          `${orphanChanged} orphans were written to`);
+        check("every merged bin with T > 0 actually changed", mergedUnchanged === 0,
+          `${mergedUnchanged} bins merged to their own value — the parent chain reaches ` +
+          "the sky, so a T > 0 bin cannot come back unchanged");
+        check("some bin really was orphaned", orphanFound > 0,
+          `${orphanFound} — zero would make the two arms above vacuous; the synthetic ` +
+          "field's 1-in-8 unknown rate is what produces them (all four of a parent's " +
+          "children unknown, at every found corner)");
+        say(`   ${mergeStats.merged}/${mergeStats.bins} known bins merged, ` +
+          `${mergeStats.orphans} orphaned (${(mergeStats.orphanRate * 100).toFixed(2)}%), ` +
+          `${(mergeStats.resolvedRate * 100).toFixed(1)}% of merged bins reached the sky`);
+        check("the merge actually ran on most of the field",
+          mergeStats.merged > 0 && mergeStats.orphanRate < 0.5,
+          `${mergeStats.merged} merged, orphan rate ${(mergeStats.orphanRate * 100).toFixed(2)}%`);
+
+        // ══ ARM 8: the furnace ═════════════════════════════════════════
+        say("");
+        say("── FURNACE: an open medium must return exactly the sky ──");
+        // EVERY bin (L = 0, T = 1) — a medium that blocks nothing. Then the
+        // merge has one correct answer at every level and it is EXACT: the
+        // pre-average of four identical values is that value, and a weighted
+        // mean renormalized by the weight FOUND is that value again whatever
+        // the stencil looked like. So every merged bin must equal the sky with
+        // T = 0, and every orphan must be untouched (0, 1). Nothing in between.
+        //
+        // This is the arm that catches a renormalization dividing by the FULL
+        // stencil weight instead of the found weight: that error is invisible
+        // wherever all eight corners exist and dims every probe where they do
+        // not, which is precisely the "plausible but wrong" failure §12.18.5
+        // says the retired gather gate was written for.
+        writeField(() => ({ radiance: [0, 0, 0], transmittance: 1 }));
+        for (const pass of merge.passes) await renderer.computeAsync(pass);
+        const furnace = new Float32Array(await renderer.getArrayBufferAsync(bins.payload.value));
+        let furnaceLit = 0;
+        let furnaceOrphan = 0;
+        let furnaceWrong = 0;
+        let furnaceWorst = 0;
+        for (let c = 0; c < N; c++) {
+          const nb = bins.cascades[c].bins;
+          for (const [, block] of gpuProbes[c].keyToBlock) {
+            for (let m = 0; m < nb; m++) {
+              const o = slotOf(c, block, m);
+              const T = furnace[o + 3];
+              if (T === 1 && furnace[o] === 0 && furnace[o + 1] === 0 && furnace[o + 2] === 0) {
+                furnaceOrphan++;
+                continue;
+              }
+              furnaceLit++;
+              let err = Math.abs(T);
+              for (let ch = 0; ch < 3; ch++) err = Math.max(err, Math.abs(furnace[o + ch] - SKY[ch]));
+              furnaceWorst = Math.max(furnaceWorst, err);
+              if (err > 1e-6) furnaceWrong++;
+            }
+          }
+        }
+        check("every merged bin returns exactly the sky, with T = 0", furnaceWrong === 0,
+          `${furnaceWrong}/${furnaceLit} bins wrong, worst error ${furnaceWorst.toExponential(2)}`);
+        check("the furnace lit essentially the whole field",
+          furnaceLit > 0 && furnaceOrphan / (furnaceLit + furnaceOrphan) < 0.5,
+          `${furnaceLit} lit, ${furnaceOrphan} orphaned (no parent probe at all)`);
+
+        if (validationErrors.length) check("no WebGPU validation errors", false, validationErrors[0]);
+
+        say("");
+        say(failures ? `gi-src-merge: ${failures} CHECKS FAILED` : "gi-src-merge: all cases PASS");
+        globalThis.__SRC_MERGE_RESULT__ = {
+          pass: failures === 0,
+          failures,
+          probes: liveCounts.join("/"),
+          bins: mergeStats.bins,
+          merged: mergeStats.merged,
+          orphanRate: +(mergeStats.orphanRate * 100).toFixed(2),
+          resolvedRate: +(mergeStats.resolvedRate * 100).toFixed(1),
+          meanCorners: +mergeStats.meanCorners.toFixed(2),
+          mergedChecked,
+          worstErr: +worstErr.toExponential(2),
+          furnaceLit,
+          furnaceWorst: +furnaceWorst.toExponential(2),
+          cornerBytes: merge.bytes,
+          storageLimit: device.limits.maxStorageBuffersPerShaderStage,
+          text: out.textContent,
+        };
+
+      } catch (error) {
+        fail(error);
+      }
+    </script>
+  </body>
+</html>
