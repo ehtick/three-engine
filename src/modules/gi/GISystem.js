@@ -34,7 +34,8 @@ import { blitBvhAtlasTiles, createGiBvhReflect, createGiBvhTarget, createGiEmitt
 import { resolveMaterialSurface, serializeMeshForBake } from "./voxelizeOnce.js";
 import { createSrcVolume } from "./srcVolume.js";
 import { createSrcDistanceView, createSrcOccupancyView } from "./srcDebugViews.js";
-import { createSrcProbeSystem, describeSrcProbeSystem, formatSrcProbeFrame, srcProbesEnabled } from "./srcSystem.js";
+import { createSrcProbeSystem, describeSrcProbeSystem, formatSrcProbeFrame, srcProbesEnabled, srcShadeEnabled } from "./srcSystem.js";
+import { createSrcSurfaceAttribution } from "./srcSurface.js";
 import { createOccupancyField, describeOccupancyField, quantizeOccupancyRes } from "./occupancyField.js";
 import { BVH_STRATEGY, buildStaticSceneBvhWords, classifyDynamicShape, composeFieldDynamics, createDynamicObjectSet, dynHeaderWords, giMobilityOf, giTraceOf } from "./dynamicObjects.js";
 import { fitPrimitive } from "./primitiveFit.js";
@@ -2602,7 +2603,7 @@ export class GISystem {
    * rebuild, its shader stays in the pipeline cache, and a quality change or
    * an auto-fit refit no longer triggers a material recompile wave.
    */
-  #buildScreenResolve({ gather, light, emitterSlots, radianceLookup = null, lightSlots = null, ao = null, lightShadow = null, emitterRecordTrace = null, emitterCutoff = null, volume = null, skyRadiance = null }) {
+  #buildScreenResolve({ gather, light, emitterSlots, radianceLookup = null, lightSlots = null, ao = null, lightShadow = null, emitterRecordTrace = null, emitterCutoff = null, volume = null, skyRadiance = null, atlas = null }) {
     const renderer = this.engine.renderer;
     if (!renderer?.backend?.device) return null;
     const { width, height } = this.#screenResolveSize();
@@ -2723,8 +2724,40 @@ export class GISystem {
       let srcProbes = null;
       if (srcProbesEnabled()) {
         try {
+          // ── PHASE 5: LIGHTING + STATIC SURFACE (plan §12.28) ───────────
+          //
+          // Two arguments and not one switch — `srcSystem` refuses to shade
+          // without BOTH, because lighting alone would light the whole static
+          // world at one default albedo: plausible, wrong everywhere, and read
+          // as a shader bug rather than a missing input.
+          //
+          // The attribution throws if the field was built without its region,
+          // so it is gated on the same `srcShadeEnabled()` the field build reads
+          // — one function, two call sites, separated by a full rebuild.
+          let surfaces = null;
+          if (srcShadeEnabled() && volume?.occupancyField && atlas) {
+            try {
+              surfaces = createSrcSurfaceAttribution(volume.occupancyField, volume.world, atlas);
+            } catch (error) {
+              console.warn("[gi] src surface attribution unavailable:", error?.message ?? error);
+            }
+          }
           srcProbes = createSrcProbeSystem({
             gbuffer, width, height, props: this.config, volume, sky: skyRadiance,
+            surfaces,
+            lighting: surfaces
+              ? {
+                  // The engine's punctual lights, straight through — same slots
+                  // the screen chain's `analyticDirectAt` reads, so a hit and a
+                  // pixel cannot disagree about what a light is.
+                  lights: lightSlots ?? [],
+                  emitters: emitterSlots ?? [],
+                  // A directional slot's shadow ray runs the whole medium, and
+                  // `kind` is a uniform, so the bound cannot be a build-time
+                  // choice. The volume diagonal is the finite stand-in.
+                  maxRay: volume.world.size.value.length(),
+                }
+              : null,
           });
           console.log(describeSrcProbeSystem(srcProbes));
         } catch (error) {
@@ -4189,6 +4222,11 @@ export class GISystem {
     });
     const screen = this.#buildScreenResolve({
       gather, light, emitterSlots, radianceLookup: deferredRadianceLookup, ao, lightShadow,
+      // The SlotRegistry, for SRC's surface-attribution palette (§12.28). It is
+      // the SAME registry the voxelizer seated, which is what makes the palette
+      // indexable by occupancy slot with no remap — §12.9's crossed-numbering
+      // bug was exactly a second numbering being introduced here.
+      atlas,
       // SRC traces against the SAME medium every other ray class in this build
       // uses — that is the whole reason `srcTrace.js` is an extraction of the
       // occupancy marcher rather than a second one.
@@ -6086,6 +6124,14 @@ export class GISystem {
       // trace-time variants.
       enableSurfaceRecords: (rayHitConfig?.activeMode ?? RayHitMode.OccupancyLegacy) >= RayHitMode.HybridPlane &&
         (rayHitConfig?.activeMode ?? RayHitMode.OccupancyLegacy) <= RayHitMode.HybridExactComplex,
+      // ── SRC HIT SHADING NEEDS A STATIC SURFACE (plan §12.28, Phase 5) ─────
+      //
+      // One u32 per surface record plus a 512-entry palette, both riding the
+      // `bits` tail. Allocated HERE because a region cannot be added to a built
+      // field, and gated on the shading flag because it is bytes a scene that
+      // never turns SRC shading on should not pay: 0.71MB on the gate field,
+      // ~14.8MB projected to Sponza-ultra.
+      enableSurfaceAttribution: srcShadeEnabled(),
       // Phase 4: complex cells store short exact triangle lists in the same
       // allocation instead of degrading to occupied-box hits.
       enableComplexTriangles: rayHitConfig?.activeMode === RayHitMode.HybridExactComplex,

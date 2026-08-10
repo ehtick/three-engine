@@ -71,6 +71,18 @@ export function srcProbesEnabled() {
 }
 
 /**
+ * Is SRC HIT SHADING on? Opt-in, and the single source of truth for it, because
+ * the flag is read in two places that must not disagree: here, to build the
+ * shader, and in `GISystem`'s field construction, to allocate the surface
+ * attribution region the shader reads. A field built without the region and a
+ * shader built expecting one is a throw at best and a grey world at worst, and
+ * they are separated by a full rebuild — so they read one function.
+ */
+export function srcShadeEnabled() {
+  return globalThis.__giSrcShade === true;
+}
+
+/**
  * Expected live c0 probes, from the gbuffer's pixel count.
  *
  * A c0 probe is a unique visible SURFACE CELL, so the count is bounded by
@@ -107,13 +119,16 @@ function expectedC0Probes(pixelCount) {
  *   `sun` is `{direction, irradiance}` (direction TOWARD the light), `emitters`
  *   is `giLight.js`'s slot array. Phase 5. See `shadeHit` below for why this and
  *   `staticSurfaceAt` are two arguments rather than one switch.
- * @param {(hit, dir) => object} [options.staticSurfaceAt]  albedo/emissive/
- *   emitter for a STATIC hit — `srcSurface.js`. Movers do not need it; they
- *   carry their surface in their own object header.
+ * @param {object} [options.surfaces]  `srcSurface.js`'s bundle — `{surfaceAt,
+ *   passes, sync}`. The whole bundle rather than the read closure alone, because
+ *   the attribution owns a compute pass (the palette upload) that must run
+ *   BEFORE the deposit reads it, and a `sync` that makes a material recolour a
+ *   512-entry buffer write instead of a re-voxelize. Movers need none of it;
+ *   they carry their surface in their own object header.
  */
 export function createSrcProbeSystem({
   gbuffer, width, height, props = null, volume = null, sky = null,
-  lighting = null, staticSurfaceAt = null,
+  lighting = null, surfaces = null,
 } = {}) {
   const tier = SRC_QUALITY[srcQualityTier(props)];
   const spacing0 = Number(globalThis.__giSrcSpacing0) || tier.spacing0;
@@ -279,7 +294,8 @@ export function createSrcProbeSystem({
   // whole static world at one default albedo — a grey-box bounce that looks
   // plausible, is wrong everywhere, and would be read as a shader bug rather
   // than a missing input. `STAT_UNATTRIBUTED` counts it if it ever happens.
-  const shadeEnabled = globalThis.__giSrcShade === true && !!lighting && !!staticSurfaceAt;
+  const staticSurfaceAt = surfaces?.surfaceAt ?? null;
+  const shadeEnabled = srcShadeEnabled() && !!lighting && !!staticSurfaceAt;
   const shadeHit = shadeEnabled && binStore
     ? createSrcHitShader({
         // Provenance lives HERE and nowhere else — `srcShade.js` never asks
@@ -309,7 +325,9 @@ export function createSrcProbeSystem({
           return { position: hit.exactPosition, normal: hit.normal, albedo, emissive, emitter, valid };
         },
         sun: lighting.sun ?? null,
+        lights: lighting.lights ?? [],
         emitters: lighting.emitters ?? [],
+        maxRay: lighting.maxRay ?? null,
         visibility: createSrcVisibility(volume.occupancyField, volume.world, {
           rayHitMode: volume.rayHitMode,
           // A shadow ray is SHORTER than a diffuse one by construction — it
@@ -492,6 +510,10 @@ export function createSrcProbeSystem({
     // dispatches (srcMerge.js's header).
     passes: deposit
       ? [
+          // The attribution palette FIRST: the deposit's `shadeHit` reads it, and
+          // a palette written after the rays that sample it is a frame of stale
+          // colour on every material edit.
+          ...(shadeEnabled ? surfaces?.passes ?? [] : []),
           ...frame.passes, ...rayFrame.passes, ...deposit.passes,
           ...merge.passes, ...tiles.passes,
           // `hashBlock` sits here and not with the population because it reads
@@ -522,6 +544,9 @@ export function createSrcProbeSystem({
       // α is live — see `readAlpha`. Assigning unconditionally would dirty the
       // uniform every frame; the compare keeps a still scene's upload count at
       // zero, which the frame-pacing work cares about.
+      // Cheap when `SlotRegistry.revision` is unchanged, which is every frame
+      // that is not a material edit.
+      if (shadeEnabled) surfaces?.sync?.();
       const keep = 1 - readAlpha();
       if (keepU.value !== keep) keepU.value = keep;
       // The stamp advances with the jitter and for the same reason: both are

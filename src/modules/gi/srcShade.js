@@ -60,7 +60,7 @@
 //
 // docs/GI_SRC_REBUILD_PLAN.md §4.4, §7 Phase 5, §12.26.
 
-import { If, float, int, select, step, uint, vec3 } from "three/tsl";
+import { If, float, int, mix, select, step, uint, vec3 } from "three/tsl";
 import { MAX_LOOP_ALBEDO } from "./srcConfig.js";
 import { hashKey } from "./srcMathTsl.js";
 import { emitterSlotFactor, emitterSurfaceT } from "./giLight.js";
@@ -169,6 +169,60 @@ function emitterTermsAt(slot, P, n, margin) {
   const E = vec3(slot.color).mul(emitterSlotFactor(slot, P, n, cosTheta, sinR)).mul(active).toVar();
   const maxT = emitterSurfaceT(slot, P, dirTo, dist).sub(margin).max(0).toVar();
   return { E, dirTo, maxT, luma: E.dot(vec3(...LUMA)).max(0).toVar() };
+}
+
+/**
+ * One `giLight.js` LIGHT SLOT's irradiance at a hit, plus what a shadow ray
+ * toward it needs. The engine's punctual lights — `analyticDirectAt`'s subject,
+ * up to `MAX_GI_LIGHTS` of them, point and directional in one array.
+ *
+ * `vector` holds the world POSITION for a point light and the normalized
+ * direction TOWARD the light for a directional one; `kind` selects between them
+ * (the same convention `cascadeGather` and `analyticDirectAt` use, and reusing
+ * it rather than re-deriving is what keeps SRC's hits agreeing with the screen
+ * chain's pixels).
+ *
+ * ⚠ **THE COSINE IS CLAMPED HERE, NOT ABSOLUTE.** `analyticDirectAt` takes
+ * `dot(dirTo, N).abs()` because it shades a FIELD CELL, which has no definite
+ * side — a cell straddling a wall must light from either. A hit has a side: the
+ * normal was face-forwarded against the ray one line earlier (§12.26.4), so
+ * `abs()` here would light the back of every wall from a lamp in front of it and
+ * do it smoothly enough to read as a leak rather than a sign error.
+ *
+ * The shadow ray is what SRC can do and the screen chain structurally cannot:
+ * three's shadow map is view-frustum bound, and half of SRC's hits are behind
+ * the camera or off screen entirely.
+ */
+function lightTermsAt(slot, P, n, margin, maxRay) {
+  const isDir = float(slot.kind).toVar();
+  const rel = vec3(slot.vector).sub(P).toVar();
+  const dist = rel.length().max(1e-4).toVar();
+  const dirTo = mix(rel.div(dist), vec3(slot.vector), isDir).toVar();
+  // Inverse-square for a point light, none for a directional. `max(1)` is
+  // `analyticDirectAt`'s own guard against a receiver inside the source.
+  const atten = mix(float(1).div(dist.mul(dist).max(1)), float(1), isDir).toVar();
+  if (slot.range) {
+    // three's PointLight `distance` cutoff (0 = infinite). GI must die exactly
+    // where the renderer's own direct light does, or the mismatch reads as light
+    // being "cut" at a circle.
+    const range = float(slot.range);
+    const ratio = dist.div(range.max(1e-4)).clamp(0, 1);
+    const r2 = ratio.mul(ratio);
+    const win = r2.mul(r2).oneMinus().clamp(0, 1);
+    atten.mulAssign(mix(float(1), win.mul(win), step(1e-3, range).mul(isDir.oneMinus())));
+  }
+  const cos = dirTo.dot(n).max(0).toVar();
+  const active = float(slot.active ?? 1);
+  return {
+    E: vec3(slot.color).mul(atten).mul(cos).mul(active).toVar(),
+    dirTo,
+    cos,
+    // A directional source has no distance, so its shadow ray runs the whole
+    // medium. `kind` is a UNIFORM, so this cannot be a build-time choice between
+    // a number and `null` — it has to be a node either way, and the volume
+    // diagonal is the finite stand-in for infinity that WGSL can actually hold.
+    maxT: mix(dist.sub(margin).max(0), float(maxRay), isDir).toVar(),
+  };
 }
 
 /**
@@ -327,9 +381,15 @@ function neeIrradiance(slots, P, n, rayIndex, {
  *   gather point could NOT see it (one floor point read 1.00×, because the ~57
  *   rays landing on the emitter spread thinly across the floor's probes and that
  *   point's eight held none). An energy claim wants an energy statistic.
- * @param {{direction: Node, irradiance: Node}} [options.sun]  `direction` points
- *   TOWARD the light; `irradiance` is the irradiance on a surface facing it
- *   square-on.
+ * @param {{direction: Node, irradiance: Node}} [options.sun]  a single
+ *   directional source — `direction` points TOWARD it, `irradiance` is what a
+ *   surface facing it square-on receives. This is `srcRef.js`'s `sunIrradiance`
+ *   shape, kept so the CPU mirror stays the reference for this term.
+ * @param {object[]} [options.lights]  `giLight.js` LIGHT slots (point and
+ *   directional, `MAX_GI_LIGHTS` of them) — the engine path, one shadow ray per
+ *   active slot. Independent of `sun`; the gate uses `sun`, the engine uses this.
+ * @param {Node|number} [options.maxRay]  whole-medium ray bound, for a
+ *   directional slot's shadow ray. Required when `lights` is non-empty.
  * @param {object[]} [options.emitters]  `giLight.js` emitter slots.
  * @param {(P, n, toLight, maxT) => Node} [options.visibility]  from
  *   `createSrcVisibility`. Its `maxT` is measured from the SURFACE point; the
@@ -345,10 +405,12 @@ function neeIrradiance(slots, P, n, rayIndex, {
 export function createSrcHitShader({
   surfaceAt,
   sun = null,
+  lights = [],
   emitters = [],
   visibility = null,
   secondary = null,
   voxelSize = null,
+  maxRay = null,
   neeEmitters = true,
   neeSamples = 1,
   importance = null,
@@ -368,6 +430,13 @@ export function createSrcHitShader({
   // The shadow ray must stop short of the emitter's own surface. Half a voxel,
   // for the same reason the trace's self-bias is a quarter of one: the
   // intersection was quantized by that voxel and nothing smaller is meaningful.
+  if (lights.length && maxRay == null) {
+    throw new Error(
+      "createSrcHitShader: maxRay is required when `lights` are supplied — a " +
+      "directional slot's shadow ray runs the whole medium, and `kind` is a " +
+      "uniform, so the bound cannot be chosen at build time",
+    );
+  }
   const margin = float(voxelSize).mul(0.5);
   const useNee = neeEmitters && emitters.length > 0;
 
@@ -396,6 +465,25 @@ export function createSrcHitShader({
         const v = visibility ? float(visibility(P, n, l, null)).toVar() : float(1).toVar();
         if (count) count.shadowRays(1);
         E.addAssign(vec3(sun.irradiance).mul(cos).mul(v));
+      });
+    }
+
+    // The engine's punctual lights, ONE SHADOW RAY EACH. Unrolled because
+    // `MAX_GI_LIGHTS` is 4 and compile-time; gated on the cosine for the same
+    // reason the sun is, which is what keeps the cost proportional to the lights
+    // a hit can actually see rather than to the lights the scene has.
+    //
+    // Four rays per hit is the honest parity-first cost and it is NOT where this
+    // ends up: folding the light slots into the NEE set below collapses it to
+    // one ray for lights AND emitters together, which is what `lightTree.js`
+    // does and what §7's Phase 5 asks for. Measure before assuming it matters —
+    // the cosine gate means most hits pay for one or none.
+    for (const slot of lights) {
+      const t = lightTermsAt(slot, P, n, margin, maxRay);
+      If(t.cos.greaterThan(0).and(t.E.x.max(t.E.y).max(t.E.z).greaterThan(0)), () => {
+        const v = visibility ? float(visibility(P, n, t.dirTo, t.maxT)).toVar() : float(1).toVar();
+        if (count) count.shadowRays(1);
+        E.addAssign(t.E.mul(v));
       });
     }
 
