@@ -58,7 +58,13 @@
       try {
         const q = new URLSearchParams(location.search);
         const SKY = Number(q.get("sky") ?? 2);
-        const LAMP = Number(q.get("lamp") ?? 5);
+        // Chosen from the render, not from radiometry: the measured luminaire
+        // emits (18.4, 15.6, 8.0) W/sr/m2, but this harness lights the box with
+        // an ANALYTIC point light standing in for it (an emissive surface only
+        // contributes through hit shading, which is Phase 5) and then tone-maps
+        // with ACES, so an absolute calibration would be a fiction. 70 puts the
+        // direct arm near 84/255 with the ceiling hot around the aperture.
+        const LAMP = Number(q.get("lamp") ?? 70);
         const EXPOSURE = Number(q.get("exposure") ?? 1);
         // Build-time, exactly as `smoke:gi-gpu` sets it: `srcProbesEnabled()` is
         // read when the screen bundle is constructed.
@@ -84,9 +90,28 @@
 
         // ── THE CORNELL BOX ───────────────────────────────────────────────
         //
-        // The standard scene, at the standard proportions, because this is what
-        // Phase 3's merge and Phase 5's hit shading will be judged against and
+        // The standard scene, from the standard MEASUREMENTS, because this is
+        // what Phase 3's merge and Phase 5's hit shading are judged against and
         // the baseline is worth having before either exists.
+        //
+        // ══ REBUILDING IT PROPERLY FOUND TWO HARNESS BUGS ══════════════════
+        //
+        // Both had been silently wrong for the whole of Phase 2 and 3, and both
+        // were invisible until a scene with a known correct appearance arrived.
+        //
+        //  1. **EVERY IMAGE THIS PROBE WROTE WAS UPSIDE DOWN.** The capture
+        //     flipped rows on the strength of "render targets read bottom-up",
+        //     which is the WebGL convention and not this backend's. A grey room
+        //     with a plain slab at each end looks the same either way; a Cornell
+        //     box does not, and the flip was caught within one render of it.
+        //  2. **THE LIGHT WAS NEVER A POINT LIGHT.** The component's prop is
+        //     `kind`, not `type`, so `type: "point"` was accepted, stored, and
+        //     ignored — leaving the default DIRECTIONAL light lighting the
+        //     "direct" arm. It read as plausible (the old arm rendered at
+        //     203/255) right up until the arm stopped responding to the lamp's
+        //     POSITION or INTENSITY at all: 11.75/255, unchanged from intensity
+        //     5 to 400 and from the ceiling to the room's centre. An arm whose
+        //     output does not move when its input moves is the signature.
         //
         // It is OPEN AT THE FRONT, which is not a simplification — the original
         // is too — and it is what gives SRC something to compute. With hit
@@ -103,93 +128,159 @@
         // surface to another. That transport is exactly what hit shading does,
         // and it is Phase 5. A Cornell box without red on the left box is the
         // correct picture of this commit.
-        const mat = (hex) => new THREE.MeshStandardNodeMaterial({ color: hex, roughness: 0.95 });
-        const WHITE = mat(0xd6d3cc);
-        const RED = mat(0xa11c14);
-        const GREEN = mat(0x2a7a1c);
+        // ══ THE MEASURED GEOMETRY, NOT AN APPROXIMATION ═════════════════
+        //
+        // The vertex data below IS the Cornell University Program of Computer
+        // Graphics' 1985 measurement of the physical box — the same quads every
+        // published Cornell render is built from — rather than a stack of
+        // `BoxGeometry` at roughly the right proportions, which is what this
+        // harness used to have. It matters here specifically: the two blocks are
+        // ROTATED and NOT axis-aligned, and an axis-aligned stand-in hides
+        // exactly the failure a probe LATTICE is prone to — light leaking along
+        // the lattice axes, which is invisible when every occluder is parallel
+        // to one.
+        //
+        // ══ THE SCALE, AND WHY IT IS NOT 1:1 ══════════════════════════
+        //
+        // The measurements are in millimetres: the room is 552.8 x 548.8 x
+        // 559.2, i.e. **0.55 m**. At that size the whole box fits inside ONE
+        // probe cell (s0 is 0.45-0.8 m by tier) and the scene would be a single
+        // probe. Scaling by 100 puts it at 5.5 m — a real room, ~11 probe cells
+        // across — and changes nothing about the proportions, which are what
+        // the reference is for.
+        const U = 1 / 100;
+        // Standard RGB approximations of the measured spectral reflectances.
+        const mat = (r, g, b) => new THREE.MeshStandardNodeMaterial({
+          color: new THREE.Color(r, g, b), roughness: 1,
+        });
+        const WHITE = mat(0.725, 0.710, 0.680);
+        const RED = mat(0.630, 0.065, 0.050);
+        const GREEN = mat(0.140, 0.450, 0.091);
 
-        const box = (material, w, h, d, x, y, z, ry = 0) => {
-          const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d).toNonIndexed(), material);
-          m.position.set(x, y, z);
-          m.rotation.y = ry;
+        /**
+         * One measured quad, as two triangles, with the data's own winding —
+         * which puts every room normal INWARD, so front-face culling shows the
+         * interior and nothing needs to be double-sided. Verified by the render
+         * rather than assumed: a wall lost to culling is a missing wall, and
+         * this scene has five.
+         */
+        const quad = (material, a, b, c, d) => {
+          const v = [a, b, c, d].map((q2) => [q2[0] * U, q2[1] * U, q2[2] * U]);
+          const pos = new Float32Array([
+            ...v[0], ...v[1], ...v[2],
+            ...v[0], ...v[2], ...v[3],
+          ]);
+          const geom = new THREE.BufferGeometry();
+          geom.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+          // A UV attribute even though nothing samples a texture: three builds
+          // its standard-material graph around one, and a geometry without it
+          // renders unlit black under every analytic light while still showing
+          // up in the gbuffer — which reads as "the lamp is broken" and is not.
+          geom.setAttribute("uv", new THREE.BufferAttribute(new Float32Array([
+            0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1,
+          ]), 2));
+          geom.computeVertexNormals();
+          const m = new THREE.Mesh(geom, material);
           m.updateMatrixWorld(true);
           engine.scene.add(m);
           return m;
         };
 
-        // The room: 4 x 4 x 4, floor at y = 0, aperture at z = +2.
-        const T = 0.2;                       // wall thickness
-        box(WHITE, 4.4, T, 4, 0, -T / 2, 0);   // floor
-        box(WHITE, 4.4, T, 4, 0, 4 + T / 2, 0); // ceiling
-        box(WHITE, 4.4, 4, T, 0, 2, -2 - T / 2); // back
-        box(RED, T, 4, 4, -2.2 - T / 2, 2, 0);  // left  — red
-        box(GREEN, T, 4, 4, 2.2 + T / 2, 2, 0); // right — green
+        // ── the room ──────────────────────────────────────────────
+        // Left/right are named as the ORIGINAL names them, which is from the
+        // camera's point of view: the camera sits at −Z looking toward +Z, so
+        // its screen-right is −X. The x = 0 wall is therefore on the right of
+        // the image (green) and the x ≈ 552.8 wall on the left (red), which is
+        // the canonical picture.
+        quad(WHITE, [552.8, 0, 0], [0, 0, 0], [0, 0, 559.2], [549.6, 0, 559.2]);
+        quad(WHITE, [556, 548.8, 0], [556, 548.8, 559.2], [0, 548.8, 559.2], [0, 548.8, 0]);
+        quad(WHITE, [549.6, 0, 559.2], [0, 0, 559.2], [0, 548.8, 559.2], [556, 548.8, 559.2]);
+        quad(GREEN, [0, 0, 559.2], [0, 0, 0], [0, 548.8, 0], [0, 548.8, 559.2]);
+        quad(RED, [552.8, 0, 0], [549.6, 0, 559.2], [556, 548.8, 559.2], [556, 548.8, 0]);
+        // NO FRONT WALL — the original has none either. The open aperture is
+        // what lets the sky in, and with hit shading still Phase 5 the sky is
+        // the only radiance there is, so the GI frame is a picture of how much
+        // of that opening each point can see.
 
-        // The two boxes, at the canonical placement and rotation: a tall one
-        // back-left, a short one front-right.
-        box(WHITE, 1.0, 2.1, 1.0, -0.85, 1.05, -1.1, 0.29);
-        box(WHITE, 1.0, 1.0, 1.0, 0.8, 0.5, -0.1, -0.31);
+        // ── the two blocks, 5 quads each (the bottom sits on the floor) ──────
+        const SHORT = [
+          [[130, 165, 65], [82, 165, 225], [240, 165, 272], [290, 165, 114]],
+          [[290, 0, 114], [290, 165, 114], [240, 165, 272], [240, 0, 272]],
+          [[130, 0, 65], [130, 165, 65], [290, 165, 114], [290, 0, 114]],
+          [[82, 0, 225], [82, 165, 225], [130, 165, 65], [130, 0, 65]],
+          [[240, 0, 272], [240, 165, 272], [82, 165, 225], [82, 0, 225]],
+        ];
+        const TALL = [
+          [[423, 330, 247], [265, 330, 296], [314, 330, 456], [472, 330, 406]],
+          [[423, 0, 247], [423, 330, 247], [472, 330, 406], [472, 0, 406]],
+          [[472, 0, 406], [472, 330, 406], [314, 330, 456], [314, 0, 456]],
+          [[314, 0, 456], [314, 330, 456], [265, 330, 296], [265, 0, 296]],
+          [[265, 0, 296], [265, 330, 296], [423, 330, 247], [423, 0, 247]],
+        ];
+        for (const f of SHORT) quad(WHITE, ...f);
+        for (const f of TALL) quad(WHITE, ...f);
 
-        // The ceiling luminaire. Emissive so it reads as the light source in
-        // frame; the ANALYTIC light below it is what actually shades, since an
-        // emissive surface only contributes indirectly through hit shading and
-        // that is Phase 5.
-        const lamp = new THREE.Mesh(
-          new THREE.BoxGeometry(1.3, 0.04, 1.3).toNonIndexed(),
+        // ── the luminaire ───────────────────────────────────────
+        // The measured light quad: 130 x 105 in the ceiling, centred at
+        // (278, 279.5). Dropped a hair below y = 548.8 so it is not coplanar
+        // with the ceiling it sits in — coplanar surfaces z-fight, and a
+        // flickering light source would be read as GI noise.
+        const LIGHT_Y = 548.8 - 0.5;
+        const lamp = quad(
           new THREE.MeshStandardNodeMaterial({
-            color: 0x000000, emissive: 0xfff0d8, emissiveIntensity: 1.6, roughness: 1,
+            color: 0x000000, emissive: 0xfff0e6, emissiveIntensity: 1.6,
+            roughness: 1, side: THREE.DoubleSide,
           }),
+          [343, LIGHT_Y, 227], [343, LIGHT_Y, 332], [213, LIGHT_Y, 332], [213, LIGHT_Y, 227],
         );
-        lamp.position.set(0, 3.94, -0.2);
-        lamp.updateMatrixWorld(true);
-        engine.scene.add(lamp);
 
-        // THE CLASSIC VIEW: centred, level, looking straight in through the
-        // open front. Inside the room, so probe spacing sits at LOD 0-1 —
-        // spacing is s0*2^lod and lod grows with the CHEBYSHEV distance to the
-        // camera, so viewing this from outside the aperture would push every
-        // probe to LOD 2-3 and hand back a picture made of rectangles.
-        // The canonical framing, in the original's own proportions: the camera
-        // sits 5.75 room-widths-over-4 in front of the aperture with a 38.4°
-        // field, which is the distance/FOV pair at which the 4 m interior
-        // exactly fills a square frame. Inner walls land on the frame edge.
-        // ══ THE CAMERA, AND A REAL FINDING ABOUT THE LOD LAW ═══════════
+        // ══ THE CANONICAL CAMERA, WHICH ONLY BECAME USABLE AT §12.19.2 ═════
         //
-        // Classic framing: outside the aperture, square, narrow field, the 4 m
-        // interior exactly filling the frame. Standing where the original does
-        // (well back) produced THREE probes for the whole scene, and the reason
-        // is arithmetic rather than a bug:
+        // The original's viewpoint: eye (278, 273, −800), target (278, 273, 0),
+        // up +Y, and an image plane 0.025 across at 0.035 — a 39.3° field.
         //
-        //     lod     = floor(log2(cheb / s0))
-        //     spacing = s0 * 2^lod
-        //
-        // which composes to spacing ~= the CHEBYSHEV DISTANCE TO THE CAMERA.
-        // The s0 cancels, so a finer probe density dial does nothing at range:
-        // at 8 m out the lattice is 4-8 m coarse whatever it is set to, and the
-        // picture is made of rectangles. Only within s0 of the camera does
-        // spacing settle at s0.
-        //
-        // That is the tuning §4.5 owns and Phase 4 revisits. It is NOT changed
-        // here: every probe count, load factor and timing recorded in §12 was
-        // measured under this law, and moving it now would retire all of them.
-        // So the camera sits 2 m outside the aperture, which is close enough
-        // that the near half of the room is on a 1.2 m lattice and far enough
-        // that the framing is still the canonical one. The back wall is
-        // legitimately blockier than the foreground, and that IS the LOD law
-        // drawn to scale.
-        const camera = new THREE.PerspectiveCamera(52, W / H, 0.1, 60);
-        camera.position.set(0, 2.0, 1.75);
-        camera.lookAt(0, 2.0, -2);
+        // This harness used to sit 2 m from the aperture with a 52° field, and
+        // the comment explaining why is worth preserving as a RETIRED finding:
+        // under the old LOD law `spacing ≈ the Chebyshev distance to the
+        // camera`, so standing where the original does produced three probes for
+        // the whole scene and a picture made of rectangles. `LOD0_REACH`
+        // (§12.19.2) replaced that law with `lod = log2(cheb / (64·s0))`, which
+        // at s0 = 0.6 keeps everything inside 38 m at LOD 0 — and the far corner
+        // of this box is 14 m from the canonical eye. So the original framing is
+        // simply correct now, and using anything else would be carrying a
+        // workaround for a bug that has been fixed.
+        const camera = new THREE.PerspectiveCamera(
+          2 * Math.atan(0.0125 / 0.035) * 180 / Math.PI, W / H, 0.05, 200,
+        );
+        camera.position.set(278 * U, 273 * U, -800 * U);
+        camera.lookAt(278 * U, 273 * U, 0);
         camera.updateMatrixWorld(true);
         engine.scene.add(camera);
         engine.camera = camera;
 
+        // The analytic light, at the measured luminaire's own centre and just
+        // below its plane. An EMISSIVE surface only contributes through hit
+        // shading, which is Phase 5, so the quad above reads as the light source
+        // in frame while this is what actually shades — the same split the
+        // previous version of this harness used, now at the canonical position.
         const sunEnt = engine.createEntity({ name: "Lamp" });
         const sunComp = sunEnt.addComponent("light", {
-          type: "point", intensity: LAMP, color: "#fff0d8", distance: 0,
+          kind: "point", intensity: LAMP, color: "#fff0e6", distance: 0, decay: 2,
         });
-        sunEnt.object3D?.position?.set(0, 3.8, -0.2);
+        // ── 25 UNITS BELOW THE CEILING, AND THE FIRST TRY WAS BURIED ────────
+        //
+        // At 6 units (6 cm) the direct arm rendered at 11.75/255 — essentially
+        // black — and the cause is not the intensity. GI traces this light's
+        // shadow against the OCCUPANCY FIELD, whose voxels are ~10 cm, so a
+        // light 6 cm under the ceiling sits inside the ceiling's own voxel and
+        // every shadow ray leaves it already occluded. The old harness never met
+        // this because its light hung 20 cm clear.
+        //
+        // A quarter of a metre is two voxels of clearance and still inside the
+        // luminaire's own footprint, so the geometry stays canonical.
+        sunEnt.object3D?.position?.set(278 * U, (548.8 - 25) * U, 279.5 * U);
 
+        sunEnt.object3D.updateMatrixWorld(true);
         await enableEngineModule(engine, "gi");
         const gi = engine.createEntity({ name: "GI" });
         // ONE PROPERTY. Reflections, AO and the volume are derived from the
@@ -263,12 +354,21 @@
           // weak map key" from inside three.)
           const buf = await engine.renderer.readRenderTargetPixelsAsync(rt, 0, 0, W, H, 0);
           const img = ctx.createImageData(W, H);
-          // Render targets read bottom-up; ImageData is top-down.
-          for (let y = 0; y < H; y++) {
-            const srcRow = (H - 1 - y) * W * 4;
-            const dstRow = y * W * 4;
-            for (let x = 0; x < W * 4; x++) img.data[dstRow + x] = buf[srcRow + x];
-          }
+          // ══ NO FLIP, AND THE FLIP THAT USED TO BE HERE WAS A REAL BUG ═══
+          //
+          // This used to copy rows in reverse on the strength of "render
+          // targets read bottom-up", which is the WebGL convention. Three's
+          // WebGPU `readRenderTargetPixelsAsync` hands back TOP-DOWN rows, so
+          // the flip was introducing one — **every image this probe has ever
+          // written was upside down**. It went unnoticed for as long as the
+          // scene was a grey room with a plain slab at each end, and it was
+          // caught within one render of the Cornell box arriving, because a
+          // Cornell box has its light in the CEILING and its blocks on the
+          // FLOOR and there is no reading of a flipped one that looks right.
+          //
+          // A reference scene earns its keep before anyone measures anything
+          // with it.
+          img.data.set(buf.subarray(0, W * H * 4));
           ctx.putImageData(img, 0, 0);
           let sum = 0;
           for (let i = 0; i < buf.length; i += 4) sum += buf[i] + buf[i + 1] + buf[i + 2];
@@ -307,7 +407,7 @@
         const g = stats?.gather;
         if (g) {
           say(`  gather: ${g.lit}/${g.pixels} lit, lum ${g.minLum.toFixed(3)}..${g.maxLum.toFixed(3)}, ` +
-            `contrast ${g.contrast.toFixed(3)}, ${g.badNormals} bad normals`);
+            `contrast ${g.contrast.toFixed(3)}, ${g.meanCorners.toFixed(2)}/8 probes per pixel`);
         }
         // The whole point of the "gi" frame is that it is not black. A mean of
         // zero there means SRC produced nothing and the other two frames are
@@ -325,7 +425,7 @@
           gather: g ? {
             lit: g.lit, pixels: g.pixels,
             minLum: +g.minLum.toFixed(3), maxLum: +g.maxLum.toFixed(3),
-            contrast: +g.contrast.toFixed(3), badNormals: g.badNormals,
+            contrast: +g.contrast.toFixed(3), corners: +g.meanCorners.toFixed(2),
           } : null,
           rays: stats?.rays ? {
             traced: stats.rays.rays, budget: stats.totalRays,

@@ -46,7 +46,7 @@ try {
     if (result.gather) {
       const g = result.gather;
       console.log(`gi-src-visual: PASS — ${g.lit}/${g.pixels} pixels lit, ` +
-        `lum ${g.minLum}..${g.maxLum}, contrast ${g.contrast}, ${g.badNormals} bad normals`);
+        `lum ${g.minLum}..${g.maxLum}, contrast ${g.contrast}, ${g.corners}/8 probes per pixel`);
     }
     if (result.rays) {
       console.log(`  rays ${result.rays.traced}/${result.rays.budget}, ` +
