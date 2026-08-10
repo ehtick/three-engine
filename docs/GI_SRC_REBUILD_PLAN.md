@@ -2754,3 +2754,631 @@ Everything [G] needs is already green in `srcRef.js` (§12.18.4) and the lattice
 it merges over is now VERIFIED rather than assumed (§12.19.4) — which matters
 specifically here, because a merge built on a mislocated parent lattice produces
 plausible, wrong light and no gate in the suite could say so.
+
+### 12.20 Phase 3, unit 3 — [G] the merge, and the mirror that was the wrong one
+
+§12.18.7's third unit: `srcMerge.js`, cascade N−1 → 0 against `mergeCascades`,
+with `test:gi-src-merge` as its gate. This is the commit where GI stops being a
+one-metre effect.
+
+#### 12.20.1 What it does, and what changes on screen
+
+Eq. 6/7, in place over `[F]`'s resolved payload:
+
+    L_merged = L_self + T_self · L_parent
+    T_merged = T_self · T_parent
+
+with the top cascade merging against the sky and `L_parent` the sparse-trilinear,
+4→1 pre-averaged value from the cascade above.
+
+**THE VISIBLE PAYOFF IS RANGE, AND IT ARRIVES EVEN THOUGH EVERY `L` IS ZERO.**
+Hit shading is still Phase 5, so run the ladder with `L = 0` everywhere: the top
+gives `L = T_top·sky, T = 0`, and each level below multiplies its own
+transmittance in. Cascade 0 comes out holding `sky · Π T_i` — sky visibility over
+the WHOLE reach — where the c0-only gather computed `sky · T_c0`, sky visibility
+over about a metre. Same estimator, four levels of range. The Cornell probe shows
+it directly: `lum 0.190..1.242` against a `π·sky = 6.28` ceiling, i.e. a sealed
+box now correctly admits almost no sky, where before every direction unoccluded
+at one metre voted full brightness.
+
+#### 12.20.2 `srcGather.js` NEEDED NO CHANGE, and that is a property
+
+The gather composites `L + T·sky` per bin. After the merge that expression is
+correct in both cases it can now meet, which is why the file was not touched:
+
+- a fully merged bin has **T = 0**, so the sky term vanishes and the `L` that
+  already carries the sky down the chain stands alone — no double count;
+- a bin whose parent chain broke keeps its own `T`, and `L_self + T_self·sky` is
+  **exactly its old c0-only answer**.
+
+So a missing parent degrades to the previous behaviour rather than to black. R1
+falls out of the arithmetic instead of being coded for. Worth carrying into unit
+5: [I] replaces this gather and has to preserve the same property.
+
+#### 12.20.3 The three structural decisions
+
+1. **IT MERGES IN PLACE.** Cascade c's dispatch reads cascade c+1's region —
+   written by the previous dispatch — and writes only its own. No thread reads
+   the region it writes, and the dispatch boundary is the barrier that makes the
+   read legal. A second payload buffer would be another 22 MB at the engine
+   default to hold values that die the moment the level below consumes them.
+
+2. **THE 8 CORNERS ARE RESOLVED ONCE PER PROBE, NOT ONCE PER BIN**, in their own
+   pass. The stencil is a property of the probe's POSITION, so hoisting it turns
+   8 hash lookups per bin into 8 per probe — a factor of `binCount`, which is 32
+   at c0 and 2,048 at c3. The records are indexed by **BIN BLOCK**, not probe
+   slot: smaller (a cascade has fewer blocks than slots) and already the index
+   the merge kernel holds, so no reverse map is needed.
+
+3. **THE RECORD STORES THE PARENT'S BLOCK, NOT ITS PROBE INDEX.** One
+   dereference moved out of the inner loop, and it keeps `probeTable` out of the
+   merge kernel entirely — which matters at a portable limit of 8 storage
+   buffers, since the kernel already wants payload + two corner buffers + stats.
+
+Cost: 8 dispatches, ~0.9 MB of corner records (50.75 MB total, from 49.88).
+
+#### 12.20.4 A STALE CORNER RECORD CANNOT BE READ, and the argument is the frame order
+
+The corner pass writes records only for blocks a live probe currently holds, so a
+block sitting in the free pool keeps whatever it was told last time it was
+claimed — a dangling parent pointer, if anything read it. Nothing does: an
+unclaimed block took no deposits this frame, the deposit's clear zeroed its
+accumulators, and `[F]` therefore wrote UNKNOWN into every one of its bins, so
+the merge takes its `selfT < 0` early-out before it ever looks at the record.
+
+**The safety comes from the frame order, not from a clear.** Worth stating rather
+than assuming: it is exactly the kind of invariant a later reordering breaks
+silently.
+
+#### 12.20.5 THE GATE SYNTHESIZES ITS OWN INPUT, and that is the design
+
+`gi-src-merge.html` runs the probe population and then **does not run the
+deposit**. It writes the resolved field straight into the payload buffer from a
+hash of `(cascade, probe key, morton)`, and the CPU mirror reads the same
+function.
+
+Two reasons, and the second is the real one. First, `test:gi-src-deposit` already
+owns whether the payload is right, so running it here would make every merge
+failure arrive wearing a deposit failure's clothes. Second — **the interesting
+inputs for a merge are the awkward ones**: unknown bins, parents whose four
+children are only partly known, probes whose parent lattice has holes. A real
+deposit produces those by luck; a synthesized field produces them by
+construction, at a chosen rate (1 bin in 8 unknown).
+
+**THE TRILINEAR WEIGHTS ARE EXACT, AND IT IS A PROPERTY OF THE LATTICE, NOT OF
+THE GATE.** The parent lattice is exactly 2× coarser than the child's and both
+are anchored by `round(anchor/s)·s`, so a child sits either ON a parent lattice
+point or exactly HALFWAY between two on every axis. The fractions are exactly
+{0, 0.5} and the eight weights are exact products of halves; with `s0` a power of
+two nothing in that chain rounds on either side. So the corner arm demands **bit
+equality** rather than a tolerance — an off-by-one in the stencil would otherwise
+hide inside an epsilon. The merged-value arm is the only place in the gate with a
+tolerance at all, because the merge's two divisions (by the known-child count
+1-4, and by the found stencil weight) are where f32 and f64 finally part company:
+**worst deviation 2.65e-7 against a 2e-5 bound, over 784,128 bins.**
+
+#### 12.20.6 THE FURNACE ARM, and the one bug it exists for
+
+Every bin `(L = 0, T = 1)` — a medium that blocks nothing. Then the merge has one
+correct answer at every level and it is EXACT: the pre-average of four identical
+values is that value, and a weighted mean renormalized by the weight FOUND is
+that value again whatever the stencil looked like. So every merged bin must come
+out **exactly the sky with T = 0**, and every orphan untouched at `(0, 1)`.
+Nothing in between. Measured: **896,640 bins, worst error 0.**
+
+That arm exists for one specific bug. A renormalization dividing by the FULL
+stencil weight instead of the weight FOUND is invisible wherever all eight
+corners exist and dims every probe where they do not — and on this set only
+**2.03 of 8 corners** are found on average, so it would be wrong nearly
+everywhere and still pass a per-bin diff against a mirror carrying the same bug.
+Uniform-in-uniform-out is the check that does not care.
+
+#### 12.20.7 THE MIRROR WAS THE ONE THAT WAS WRONG — `buildProbes` dropped probes
+
+First run: `c3: 305 gpu / 256 mirror probes, 49 DIFFER`, and 27,065 of 696,253
+merged bins disagreed. **The GPU was right.**
+
+`buildProbes` sized each cascade's CPU map as `pixels.length >> c` — the
+surface-manifold prediction that probe counts fall per cascade, spent as a
+capacity. §12.19.2 had already measured that prediction failing (ladders flatten:
+410 → 115 → 65 → 64), and this gate's scattered set runs **548 → 480 → 377 →
+305**. At `>> 3` cascade 3 got a 256-slot map for 305 keys, `SrcProbeMap.insert`
+answers a full map with −1, and `buildProbes` stores that as "no parent". So the
+REFERENCE silently lost 49 probes, its merge then found fewer parent corners, and
+the error propagated down the ladder into every c0 bin.
+
+Two fixes, and the second is the one that matters:
+
+- capacity is now **`pixels.length` at every cascade** — not a better guess, a
+  BOUND: a cascade-c probe exists only because some c(c−1) probe inserted it,
+  back to a pixel, so no cascade can hold more probes than there are pixels. A
+  CPU-side map is two typed arrays.
+- **`SrcProbeMap.insertFailures` now counts**, and the gate asserts it is zero.
+  This is the GPU's `COUNTER_FAILED` on the CPU side, and it turns "the mirror is
+  quietly incomplete" into one line of output.
+
+**THE LESSON IS NOT "SIZE YOUR MAPS".** It is that a reference implementation
+carrying a performance heuristic will eventually be wrong about the very thing it
+is the reference for — and when it is, every gate reports the GPU as broken.
+§12.19.2 had ALREADY published the measurement that invalidated this heuristic;
+nothing connected it to the mirror, because the mirror's capacity looked like an
+allocation detail rather than a correctness assumption.
+
+#### 12.20.8 Two more findings, both from arms that were quietly vacuous
+
+- **`atomicStore`, not `.assign`, on the stats clear.** WGSL will not implicitly
+  convert `u32` to `atomic<u32>`; it fails at `CreateShaderModule`. The counters
+  still LOOKED right, because a fresh buffer is already zero and the gate reads
+  them after one frame — the bug's real shape is telemetry that doubles on frame
+  two. Same trap `srcDeposit.js` records from the other side (`atomicLoad` on a
+  read). It surfaced only because the gate asserts on `uncapturederror`.
+
+- **"UNCHANGED" IS NOT "ORPHANED".** The orphan arm went through two false
+  starts. It first looked for probes whose whole STENCIL was empty, found none,
+  and passed while proving nothing. Rewritten to assert that the byte-identical
+  bins ARE the orphans, it read **14,895 against the kernel's 44** — and that is
+  not a bug either: a bin whose own `T_self` is ZERO merges to `L + 0·L_parent`
+  and `0·T_parent`, byte-identical to what it was. One known bin in sixteen
+  carries T = 0 in the synthetic field, and 237,926/16 ≈ 14,870.
+
+  The arm now RE-DERIVES orphan-hood — a bin is an orphan when no corner of its
+  stencil yields a known pre-average — and checks both directions: every orphan
+  byte-identical, every non-orphan with T > 0 changed. **44 derived, 44 counted.**
+
+#### 12.20.9 The numbers
+
+Gate (`test:gi-src-merge`, three identical runs):
+
+    probes 548/480/377/305     2.03/8 corners found (scattered synthetic set)
+    784,128 bins diffed vs mergeCascades, worst 2.65e-7 against a 2e-5 bound
+    237,882/237,926 known bins merged, 44 orphaned (0.02%), 100% reached the sky
+    furnace: 896,640 bins, worst error 0
+    11,240 corners and weights, bit-exact
+
+Smoke (`?src=1&sky=1`, real gbuffer):
+
+    40 dispatches (was 32), 50.75MB (was 49.88)
+    3,575/4,352 known bins merged, 4.53/8 corners, 17.9% orphan, 100% to sky
+    gather: 10,664/10,849 lit, lum 0.0007..3.1414, contrast 1.000
+
+`peak = 3.1414 = π·sky` **exactly**, unchanged by the merge — the §12.17.2
+ceiling is still a ceiling, which is the energy statement that matters.
+
+Cornell (`probe:gi-src-visual`): 75,663/76,800 lit, `lum 0.190..1.242`, contrast
+0.847.
+
+**⚠ CORRECTION, MEASURED IN §12.21: DO NOT READ THAT CONTRAST AS A TREND.** This
+section first said "contrast FELL from 0.912, and that is the merge working". It
+is not supported. Four runs of the probe over an unchanged screen path give
+`minLum` 0.031 / 0.035 / 0.062 / 0.190 and contrast 0.847 / 0.952 / 0.973 /
+0.976 — a min over 76,800 pixels is a single-pixel extremum and one probe's
+membership churn moves it. **`lit` (75,7xx) and the GI mean (≈53.5/255) are the
+stable statistics here; `minLum` and `contrast` are not.** The merge's effect is
+evidenced by the telemetry that does hold still — 100% of merged bins reaching
+the sky, 4.53/8 corners found — and by the arithmetic, not by this number.
+
+Shipping path unchanged — `run-gi-emitter-shadow-probe` still reads
+`penumbraPx=16601 grain=0.0307`, and `__giSrcProbes` is still opt-in.
+
+**THE PICTURE IS STILL BLOCKY AND [G] WAS NEVER GOING TO FIX THAT** — one probe
+per pixel with no interpolation is unit 5 ([I]). Do not read the blocks as a
+merge fault.
+
+#### 12.20.10 New assertions, and what is next
+
+`smoke:gi-gpu ?src=1` gained a merge block. The gate owns the arithmetic on a
+synthesized field; what it cannot see is the REAL population, so the smoke checks
+the ladder's CONNECTIVITY instead: the accounting closes
+(`merged + orphans == bins`), the top cascade skied something, and — the arm that
+matters — **the orphan rate is under 25%**. A merge whose parent lookups all miss
+is arithmetically perfect and completely pointless: every bin keeps its own
+one-metre interval and the picture is the c0-only one this unit exists to
+replace.
+
+Next: §12.18.7's units 4 and 5 — **[H] irradiance tiles** (the 6×6+border
+octahedral atlas, against `bakeProbeIrradiance` + the furnace; the border is
+CORRECTNESS, §12.2), then **[I] the screen gather** (sparse-trilinear,
+position-indexed, replacing `srcGather.js` and `createGiResolve`'s `screenGather`
+— and with it the `gather == null` on the exact-reflection hit path). [I] is what
+removes the blocks.
+
+### 12.21 Phase 3, unit 4 — [H] the irradiance tiles, and a kernel with no octahedral math
+
+§12.18.7's fourth unit: `srcTiles.js`, the per-probe 6×6+border octahedral
+irradiance atlas, gated by `test:gi-src-tiles` against `bakeProbeIrradiance`.
+
+#### 12.21.1 What it bakes, and why cascade 0 alone
+
+`E(n̂) = π · Σ L_bin·W(bin, n̂) / Σ W(bin, n̂)` per texel, over merged c0 bins,
+into one `RGBA16F` atlas — 8×8 tiles, 128 per row, 1024×688 and 5.6 MB at the
+engine default.
+
+**c0 ONLY, and only because [G] already happened.** A merged c0 bin carries the
+whole cascade chain's radiance and transmittance, so cascade 0 is not "the near
+field" any more — it is the complete answer at the finest spacing the hierarchy
+has. Tiles for cascades 1-3 would bake the same light more coarsely and nothing
+would read them.
+
+The normalization is the analytic-π form `srcGather.js` had to be corrected to
+(§12.17.2). It is EXACT for uniform radiance at any bin count and whichever bins
+were sampled, which is what makes the furnace arm a statement about the
+estimator rather than about discretization, and what bounds Phase 5's
+multibounce gain below 1 by construction.
+
+#### 12.21.2 THE KERNEL HAS NO OCTAHEDRAL MATH AND NO BORDER PASS
+
+Two facts collapse into one uploaded table, and the result is the smallest
+kernel in the module:
+
+1. `W(bin, n̂)` depends only on `(w, interior, sub)` — never on the scene — so it
+   is computed once on the CPU by `binCosineWeights`, the SAME function the
+   mirror calls. **There is no twin to keep in sync because there is no second
+   implementation.**
+2. A BORDER texel's value is by definition the interior integral at its wrapped
+   texel. So instead of copying values after the fact, the border texel's table
+   ROW is its wrapped interior row — and the thread that owns it simply computes
+   that integral.
+
+`tileCosineWeights` folds both into a `[texel · nBins + bin]` array covering all
+64 texels of the bordered tile. What is left in WGSL is a loop multiplying two
+numbers. No fold, no wrap, no copy pass — and, the part that actually mattered,
+**no read-after-write on the atlas**, which a border-copy pass would have needed
+and which WebGPU forbids for a texture bound writable in the same dispatch.
+
+To get there, `binCosineWeights` MOVED from `srcRef.js` to `srcMath.js` and the
+wrap rule became `octahedralBorderMap`, which `fillOctahedralBorder` now walks
+rather than open-coding. One definition, two consumers, and the existing
+`test:gi-src-ref` arms (including the −Z antisymmetry one, which reads
+−8.88e-16) gate the refactor.
+
+#### 12.21.3 THE TAPS CANNOT LEAVE THEIR OWN TILE, which is what makes a packed atlas safe
+
+`sampleTile`'s interior-space coordinate is `(f·0.5 + 0.5)·interior − 0.5 +
+border` with `f ∈ [−1, 1]`, so it spans `[0.5, interior + 0.5]` and the four
+bilinear taps land in `[0, interior + 1]` — exactly the tile's own `interior + 2`
+texels. No tap can reach a neighbouring tile, at any normal, for any probe.
+
+That is asserted rather than argued: the `bleed` arm lights ONE tile in a field
+of black ones and samples its four atlas neighbours at 4,096 normals. Any leak
+in reads non-zero; any leak out darkens the lit tile below π·L. **0 of 6,144
+channels either way.**
+
+Hardware bilinear IS available here — `.sample(uv).level(0)`, with the explicit
+level required because a compute stage has no derivatives to pick a mip with
+(`bvhScene.js` pays the same tax). That is why the atlas is `RGBA16F` and not
+`RGBA32F`: `rgba32float` is a storage format but is NOT filterable without an
+optional feature, and filtering is the entire reason the tiles are octahedral.
+
+#### 12.21.4 ALPHA IS COVERAGE, and it is there for [I]
+
+1 where a texel found at least one known bin, 0 where it found none. The channel
+was otherwise wasted, and what it buys is R1 implemented in the texture unit:
+bilinear over RGB gives `Σ w_i·E_i` (empty texels store 0 and contribute
+nothing), bilinear over alpha gives `Σ w_i` over the same taps, so `rgb / a` is
+the renormalized average over the taps that HAD information — exactly
+`sparseGather`'s rule, at the filter hardware's cost of nothing.
+
+**NOTHING DIVIDES BY IT YET, deliberately.** The RGB written is bit-for-bit what
+`bakeProbeIrradiance` produces, so [H] stays a make-the-GPU-agree unit and the
+gate can diff it exactly. Whether [I] renormalizes — and whether the mirror's
+`sampleTile` grows a coverage channel to match — is unit 5's decision, to be made
+with the measured rate in hand: **6.7% of the texels of claimed tiles on the
+smoke scene find no known bin.**
+
+#### 12.21.5 A HEMISPHERE IS NOT ENOUGH TO LEAVE A TEXEL UNCOVERED
+
+The coverage arm was vacuous on its first two attempts and the second failure is
+the interesting one. Restricting a quarter of the probes to `z > 0` — a full
+hemisphere, the shape a probe on a flat surface really has — still covered every
+texel.
+
+**Because a 6×6 tile has no texel AT the −Z pole.** Its four corners sit 19.4°
+off it — the same 19.4° the border exists for — and a cosine lobe tilted 19.4°
+off the pole still reaches bins on the far side of the equator. So at this tile
+resolution a probe that saw a full hemisphere has an answer for every normal,
+which is a reassuring thing to know and not what the arm needed. What produces
+genuinely uncovered texels is a probe whose bins span much LESS than a
+hemisphere — the real case at 0.78 rays per bin. One z band of four does it:
+**8.6% uncovered, and the GPU's own empty counter agrees with the mirror
+exactly (21,064 covered both sides).**
+
+#### 12.21.6 The −Z arm, restated as an assertion
+
+§12.2's finding was that without a border all four bilinear taps at
+`n̂ = (0,0,−1)` collapse onto ONE interior corner texel whose own direction is
+19.4° off axis — a systematic, orientation-dependent **+32%** on a −Z receiver,
+invisible to any test that does not vary surface orientation and invariant to
+probe spacing, ray count and angular resolution.
+
+The gate now asserts the mechanism directly: all four border corners carry the
+diagonally opposite interior corner, and a −Z sample equals the MEAN of the four
+interior corners. And it prints what that is worth — **the four corners differ
+by 51.3% of their mean** on the synthetic field, which is the size of the error a
+border-less tile would make by returning one of them.
+
+#### 12.21.7 THREE ARMS WERE WRONG BEFORE THE CODE WAS
+
+Every one was a measurement mistake, not a bug, and each is worth its line:
+
+- **"Lit texels must be a whole number of tiles."** True on the gate's dense
+  synthetic field, false on a real one, and the smoke failed at 10,965/64 =
+  171.3. A probe is POSITION-only: its bins are populated only in the directions
+  its contributing pixels' hemispheres covered, so **a real tile is PARTIALLY
+  lit**. Replaced with a ceiling (`lit ≤ liveProbes · 64`) plus an accounting
+  identity (`lit + empty == texels`).
+
+- **A relative error divided by the value.** The interior arm read 9.69e-4
+  against a "1e-3 bound" — 97% of the way to failing, and pure arithmetic: a
+  texel whose irradiance is 1e-4 carries an f16 rounding that is large
+  relatively and irrelevant absolutely. Now reported as a fraction of its own
+  ALLOWANCE (64.8%), which is the number a reader actually wants and cannot
+  mislead that way.
+
+- **The sampler's relative error, next to a zero texel.** Failed 6 of 12,288
+  channels at 6.2% once the one-sided probes put hard `0 → π·L` edges in the
+  tiles. Also not a bug: WebGPU permits bilinear weights at reduced precision
+  (commonly 8 fractional bits), so the absolute error scales with the SPREAD of
+  the four taps — and next to an uncovered texel that spread is the tile's whole
+  range while the interpolated value is near zero. Restated as a fraction of the
+  tile's RANGE, it measures **0.36%, against a 1% bound and a predicted 1/256**.
+  The arm keeps its teeth: an addressing fault reads a different texel, which is
+  an error of order the whole range.
+
+**The pattern across all three: an invariant that holds for a DENSE field and
+fails for a sparse one, and a relative error whose denominator can go to zero.**
+Both are worth checking for in the next gate before running it.
+
+#### 12.21.8 The numbers
+
+Gate (`test:gi-src-tiles`, two identical runs):
+
+    360 tiles of 512 blocks, 256×128 atlas, 0.26MB
+    12,960 interior texels vs bakeProbeIrradiance — worst used 64.8% of its allowance
+    10,080 border texels BIT-EXACT against their interior twins
+    furnace 69,120 channels, worst 3.08e-4 relative (π·L, f16 rounding)
+    corner spread 51.3%; 8.6% of texels uncovered, GPU counter == mirror
+    4,096 sampler queries, worst 0.36% of tile range
+    bleed: 0/6,144 in, 0/6,144 out
+
+Smoke (`?src=1&sky=1`, real gbuffer):
+
+    42 dispatches (was 40), 56.13MB (was 50.75) — the 5.6MB atlas
+    10,990/11,776 texels lit in claimed tiles (93.3%), 8.8/32 known bins per texel
+    peak tile E = 3.1414 = π·sky EXACTLY
+
+Shipping path untouched — `penumbraPx=16601 grain=0.0307`, and the screen still
+goes through `srcGather`.
+
+**⚠ `probe:gi-src-visual`'s `minLum` AND `contrast` ARE NOISY.** Four runs over
+an unchanged screen path: min 0.031 / 0.035 / 0.062 / 0.190, contrast 0.847 /
+0.952 / 0.973 / 0.976. A min over 76,800 pixels is a single-pixel extremum and
+one probe's membership churn moves it. **`lit` (75,7xx) and the GI mean
+(≈53.5/255) are the stable statistics; do not read a single sample of the other
+two as a trend** — §12.20.9 did, and has been corrected.
+
+#### 12.21.9 What is next
+
+§12.18.7's unit 5 — **[I] the screen gather**: sparse-trilinear, position-indexed,
+replacing `srcGather.js` and `createGiResolve`'s `screenGather`. It is what
+removes the blocks, and it carries three decisions this unit deliberately left
+open:
+
+1. **Does it renormalize by the coverage alpha?** The channel is written and
+   measured (6.7% of claimed-tile texels uncovered on the smoke scene). Doing so
+   diverges from `sampleTile` unless the mirror grows the same channel.
+2. **What happens to the residual-transmittance sky term?** `srcGather`'s
+   `L + T·sky` is what gives an ORPHANED c0 bin its answer today (§12.20.2), and
+   the tile bake reads radiance only — so an orphan currently contributes zero
+   through the tiles where it contributed `T·sky` through the gather. At 17.9%
+   orphan on the smoke scene that is not a rounding difference.
+3. **The exact-reflection hit path.** `createGiResolve` calls `gather` at an
+   arbitrary world point and has been on `gather == null` since the transport
+   died (§12.17.3). A position-indexed gather is what brings it back.
+
+§12.10.1's four retired gather invariants apply to [I] and say to write a FRESH
+gate rather than repair the old one.
+
+### 12.22 Phase 3, unit 5 — [I] the screen gather. PHASE 3 IS COMPLETE.
+
+§12.18.7's last unit: `srcScreenGather.js`, the sparse-trilinear, coverage-
+weighted, LOD-blended probe gather, against `srcRef.js`'s `gatherPixel`.
+`srcGather.js` is deleted.
+
+#### 12.22.1 THE BLOCKS ARE GONE, and the measurement says so before the eye does
+
+Every frame since §12.17 has been ~0.6 m rectangles, and §12.19 established they
+were the probe cells at the CORRECT spacing — one probe per pixel with no
+interpolation is piecewise CONSTANT across a cell, so no probe density could ever
+have removed them.
+
+The gate measures it directly rather than asking anyone to look: a scan line of
+512 samples at **3.9 cm steps**, well inside one 0.5 m cell.
+
+    interpolated:    100.0% of steps change value
+    nearest-probe:     7.8%   (the same measurement, interpolation off)
+
+The control is what makes the number mean something — 7.8% is the rate at which
+that scan line crosses a cell boundary at all. And the Cornell render confirms
+it: smooth gradients, contact darkening under and between the blocks, no cell
+structure anywhere.
+
+#### 12.22.2 ONE INTEGRAL, TWO CALL SITES
+
+`gatherAt(position, normal)` answers for an ARBITRARY world point, and both
+consumers inline the same closure:
+
+- the **primary diffuse term**, once per gbuffer pixel, in this file's own
+  compute pass, handed to `createGiResolve` as a texture;
+- the **exact-reflection HIT**, at a world point no screen texture can answer
+  for. That call site has been on `gather == null` since the transport died
+  (§12.17.3). It is back.
+
+Why the primary term still goes through a texture: the resolve kernel already
+carries the gbuffer, the emitter slots, the occupancy pyramid and the BVH against
+a portable limit of EIGHT storage buffers per stage. The closure costs two of
+them, which is affordable ONCE and not per-pixel on top of all that.
+
+**`createSrcHashBlockFrame` is what made even one affordable.** The natural
+corner lookup is three fetches — `hashKeys` → hash slot, `hashSlot` → probe
+index, `probeTable[probe].block` → the tile. The frame now publishes one word per
+c0 hash slot holding that slot's BIN BLOCK directly, written by a pass that runs
+after compaction has settled both halves. 128 KB at the engine default, and the
+probe INDEX turns out never to be wanted by a gather at all — only its tile — so
+carrying it through was pure indirection.
+
+**A double-count nearly shipped with it.** `createGiResolve` applies `gather` to
+the primary term AND adds `screenGather`, and since [I] those are the same
+integral — so with both wired the pixel's irradiance was added to itself. The
+primary line is now `if (gather && !screenGather)`. While there, the AO gate went
+from `if (gather && ao…)` to `if ((gather || screenGather) && ao…)`: testing only
+`gather` meant SRC's indirect went un-obscured for the whole of Phase 2 and 3,
+which is not a decision anybody made.
+
+#### 12.22.3 THE THREE DECISIONS §12.21.9 LEFT, ALL SETTLED, ALL MEASURED
+
+**1. Coverage IS folded in, and it is worth up to 55%.** The atlas's alpha is
+`Σ w_tap` over the covered taps exactly as its rgb is `Σ w_tap·E`, so each corner
+contributes `rgb·w` to the numerator and `a·w` to the denominator and ONE division
+at the end is the coverage-weighted mean over every contributing texel of every
+contributing probe. Two consequences, both wanted: a probe that knows NOTHING
+about a direction drops out of the interpolation (the same treatment
+`sparseGather` gives a probe that does not exist), and a probe whose tap straddles
+the edge of what it knows contributes in proportion to what it knows. Dividing per
+tap instead would give every probe an equal vote regardless of how much of its tap
+was real. The gate measures the alternative directly: **12 channels differ from
+the coverage-blind gather, by up to 55%.**
+
+`srcRef.js` grew `bakeProbeCoverage` and an optional `coverage` argument to
+`gatherPixel` to match — a separate array rather than a fourth channel, because
+the tile stride is 3 in `sampleTile`, in `fillOctahedralBorder` and in the Phase-0
+suite's own arms. On the GPU it rides the atlas's otherwise-unused alpha.
+
+**2. The residual-transmittance sky term moved INTO the bake**, in both twins:
+`L + T·sky` per bin. Correct in both cases it can meet, for the same reason
+§12.20.2 records — a merged bin has T = 0 so it reduces to `L`, and an ORPHANED
+bin keeps its own T and gets exactly the answer the c0-only gather gave it.
+Without it an orphan contributes zero where it used to contribute `T·sky`, and
+§12.21.9 measured 17.9% orphans on the smoke scene. It changes nothing for a
+fully merged field, which is why every existing furnace arm is unaffected.
+
+**3. The reflection-hit path is wired** — see §12.22.2.
+
+#### 12.22.4 What the gate checks, and §12.10.1's four retired invariants
+
+`test:gi-src-gather` carries the retired gather gate's findings forward rather
+than repairing it, as §12.10.1 instructs:
+
+- *"c0DirRes 2 is DEGENERATE"* — not applicable; SRC's angular resolution is w₀
+  and there is no dirRes knob.
+- *"texels vary 2.73× in solid angle with Δω never written"* — satisfied BY
+  CONSTRUCTION and said so rather than asserted: SRC's ray bins are equal-area
+  cylindrical, so a bin average IS a solid-angle average, and the only octahedral
+  surface left is the irradiance tile, which is sampled by a NORMAL.
+- *"a 40° source drifted 2.1× instead of converging"* — the FURNACE arm is the
+  strict form: uniform radiance returns exactly π·L at every pixel, at any probe
+  density and whatever the stencil found. **Worst 1.14e-3.**
+- *"accuracy gates measure the REFINEMENT TREND"* — the smooth arm, above.
+
+Plus: every point against `gatherPixel` (**0 of 3,504 channels differ, worst
+0.14% of the scene's peak**), LOD-shell continuity across `lodF = 1`, and a point
+with no probes reading exactly zero AND being counted as empty rather than being
+read off the screen as darkness.
+
+**THE EMPTY ARM NEEDED ITS OWN GATHER, and the first version was a gate bug.**
+Sixteen "far from every probe" points were put in the gbuffer — where the
+population promptly inserted sixteen probes at exactly those positions and
+gathered from them. A point with no probes cannot be expressed as a gbuffer
+pixel. It gets a second `createSrcScreenGather` over query points the population
+never saw — which is also the exact shape the reflection-hit call site uses, so
+the arm covers that path too.
+
+**AND THE COVERAGE ARM'S CAP AXIS MATTERED.** Capping a quarter of the probes to
+`z > 0.5` changed nothing measurable, because the scan line's normals are
+(0, 1, 0) and a +Z cap still leaves bins with a positive dot against +Y. A cap
+OPPOSITE the query normal is what makes a contributing probe genuinely uninformed
+about the direction being asked.
+
+#### 12.22.5 THE CORNELL BOX IS NOW THE CORNELL BOX, and it found two harness bugs
+
+At the user's request the visual probe was rebuilt from the Cornell University
+Program of Computer Graphics' 1985 MEASUREMENT — the same quads every published
+Cornell render uses — rather than a stack of `BoxGeometry` at roughly the right
+proportions. Scaled ×100 (the measurements are millimetres: at 0.55 m the whole
+box fits inside one probe cell), with the measured reflectances, the measured
+130×105 ceiling luminaire, and the original's own camera.
+
+**The canonical camera only became usable at §12.19.2.** The old harness sat 2 m
+from the aperture with a 52° field and a comment explaining that standing where
+the original does produced three probes for the whole scene — because under the
+old LOD law `spacing ≈ the Chebyshev distance to the camera`. `LOD0_REACH`
+replaced that law, the far corner of this box is 14 m from the canonical eye, and
+everything is now LOD 0: **441 c0 probes, up from 67.**
+
+Two bugs fell out, both silently wrong for the whole of Phase 2 and 3, both
+invisible until a scene with a KNOWN CORRECT APPEARANCE existed:
+
+1. **EVERY IMAGE THIS PROBE EVER WROTE WAS UPSIDE DOWN.** The capture flipped
+   rows on the strength of "render targets read bottom-up" — the WebGL
+   convention, not this backend's. A grey room with a plain slab at each end
+   looks the same either way. A Cornell box has its light in the CEILING and its
+   blocks on the FLOOR, and the flip was caught within one render of it arriving.
+
+2. **THE LIGHT WAS NEVER A POINT LIGHT.** The component's prop is `kind`, not
+   `type`, so `type: "point"` was accepted, stored in props, and ignored —
+   leaving the DEFAULT DIRECTIONAL light lighting the "direct" arm. It read as
+   plausible (the old arm rendered at 203/255) right up until the arm stopped
+   responding to the lamp at all: **11.75/255, unchanged from intensity 5 to 400
+   and from the ceiling to the room's centre.** An arm whose output does not move
+   when its input moves is the signature, and it is worth more than any amount of
+   staring at the number itself.
+
+**The lesson is the reference scene's, not the bugs'.** Neither was found by a
+test; both were found by a picture whose correct appearance was known in advance.
+That is what a canonical scene is FOR, and this module went three phases without
+one.
+
+#### 12.22.6 The numbers
+
+Gate (`test:gi-src-gather`, two runs):
+
+    1,168 points vs gatherPixel over 437 probes — worst 0.14% of peak
+    SMOOTH 100.0% of 3.9cm steps vary, against a 7.8% nearest-probe control
+    furnace worst 1.14e-3; coverage worth up to 55%; LOD step 0.117 vs 0.068 median
+    32 no-probe query points: 0 lit, 32 counted empty
+
+Smoke (`?src=1&sky=1`, real gbuffer):
+
+    43 dispatches, 56.26MB
+    10,838/10,849 pixels lit, 0 no-probe, 4.54/8 probes per pixel
+    peak 3.1406 ≈ π·sky — the ceiling still holds end to end
+    exact-complex arm: 10,849/10,849 lit, contrast 0.973
+
+Cornell (`probe:gi-src-visual`, canonical scene): 53,853/53,853 lit,
+`lum 0.095..4.149`, contrast 0.977, 4.3/8 probes per pixel, probes
+441 → 153 → 58 → 26.
+
+Shipping path untouched — `penumbraPx=16601 grain=0.0307`, `__giSrcProbes` still
+opt-in.
+
+#### 12.22.7 Where Phase 3 stands, and what is next
+
+**[G], [H] and [I] are done. Phase 3 is complete.** SRC now runs end to end:
+population → ray budget → split scatter → resolve → merge → irradiance tiles →
+smooth position-indexed gather, with the exact-reflection hit path restored.
+
+What is still ABSENT, by plan rather than by omission:
+
+- **Hit shading (Phase 5).** Every deposited radiance is zero, so the only term
+  is transmittance and what the frame shows is sky visibility over the whole
+  cascade reach. No bounce COLOUR — a Cornell box with no red on the white block
+  is the correct picture of this commit.
+- **Temporal accumulation (Phase 4).** Every frame is a fresh estimate; §12.13.4
+  reserved the EMA for the resolved payload.
+- **The eye check on Sponza and the projectile game**, which is a person's job.
+  `__giSrcProbes = true`, Sky Light above zero. Expect smooth AO-shaped
+  long-range darkening and no bounce colour.
+
+Phase 4 is next per §7. `run-gi-rc-penumbra.mjs`'s `shadowMin ≈ lit` remains open
+and pre-existing; the diffuse-measuring GPU rigs (`run-gi-bleed`/`block-size`/
+`flicker`/`emissive`/`mover-bounce`/`rc-lattice`/`rc-splitroom`) measure a term
+that is still partly zero, so a number from them means nothing until Phase 5.
