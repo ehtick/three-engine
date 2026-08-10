@@ -75,6 +75,15 @@ export function pickOccTrace(occField, rayHitMode = RayHitMode.HybridPlane) {
  *   `position` the hit point, lifted off the surface by the RECORD-AWARE bias
  *   `normal`   surface normal at the hit, pointing back along the ray
  *   `dynObj`   packed mover id when the hit was an exact dynamic object, else <0
+ *   `voxel`    level-0 voxel coords at the hit — the STATIC ATTRIBUTION KEY
+ *
+ * `voxel` is passed through rather than recomputed by consumers because both
+ * marcher rungs already produce it (`traceOccupancy` and `traceHybridPlane`
+ * each return it) and a consumer that re-derives `floor((o + d·t − origin)/cell)`
+ * from the LIFTED `position` lands one cell out along the normal exactly where
+ * the lift was meant to put it — the shell cell, not the surface cell. Static
+ * surface attribution keys on the surface cell, so the trace hands over the one
+ * the intersection actually found.
  *
  * @param {object} occField      the occupancy field (already `composeFieldDynamics`-wrapped)
  * @param {object} world         `{ minCell }` and friends — UNIFORM nodes, so a
@@ -130,6 +139,7 @@ export function createSrcSceneTrace(occField, world, {
       exactPosition,
       normal: vec3(r.normal).toVar(),
       dynObj: reportObj && r.dynObj != null ? r.dynObj : null,
+      voxel: r.voxel != null ? vec3(r.voxel).toVar() : null,
     };
   };
 }
@@ -142,16 +152,62 @@ export function createSrcSceneTrace(occField, world, {
  * This is what makes the sun correct at OFF-SCREEN hits, which three's shadow
  * map structurally cannot do — it is view-frustum bound, and half of SRC's ray
  * hits are behind the camera or outside the frustum.
+ *
+ * ══ THE LIFT MOVES THE ORIGIN, SO IT MOVES `maxT` ══════════════════════════
+ *
+ * Plan §12.26.3, measured in the CPU mirror and fixed here from it. `maxT` is
+ * supplied by the caller and is naturally measured from the SURFACE point,
+ * because that is where the light's distance is known. The trace starts 0.75
+ * voxels away from there, so the same world point sits at a different `t` — and
+ * the emitter is the very next thing along the ray past its own `maxT`. Compare
+ * the shortened distance against the unshortened budget and the shadow ray hits
+ * the light itself: every light, every hit.
+ *
+ * The mirror measured that as **100% of the analytic emitter term lost**, on
+ * three receivers, while the geometric emission path read correct values right
+ * beside it — no NaN, no warning, a shadow-ray count that looks perfectly
+ * healthy, and a scene that is simply black. The endpoint is recoverable from
+ * `(point, toLight, maxT)` alone, so the correction needs no new binding.
+ *
+ * ══ AN OCCLUDER INSIDE THE LIFT IS STEPPED OVER, AND THAT IS THE MEDIUM ════
+ *
+ * The lift's other consequence, swept in the mirror at voxel 0.2 m: an occluder
+ * closer to the surface than 0.75 · voxel loses its contact shadow, with the
+ * threshold landing exactly ON the lift. Not an epsilon to tune down — a
+ * smaller one re-acnes at the same voxel scale — but the DDA medium's
+ * quantization showing through. The value of having the number is that a lost
+ * contact shadow becomes recognizable instead of investigable.
+ *
+ * @param {Node} point    surface point, UNLIFTED
+ * @param {Node} normal   surface normal (face-forwarded by the caller)
+ * @param {Node} toLight  unit direction toward the source
+ * @param {Node} [maxT]   distance to the source FROM `point`. Omitted means
+ *   "as far as the medium goes" — the volume diagonal, not `Infinity`, because
+ *   an unbounded literal is not a legal float in the emitted WGSL.
  */
 export function createSrcVisibility(occField, world, {
   steps = 64,
   rayHitMode = RayHitMode.HybridPlane,
 } = {}) {
   const trace = pickOccTrace(occField, rayHitMode);
-  return (point, normal, toLight, maxT) => {
+  // The whole-medium bound a directional source wants. `world.size` is a
+  // uniform, so a refit (R11) moves it without a recompile.
+  const diagonal = () => vec3(world.size).length();
+  return (point, normal, toLight, maxT = null) => {
     const lift = float(world.minCell).mul(0.75).toVar();
+    const p = vec3(point).toVar();
+    const l = vec3(toLight).toVar();
+    const origin = p.add(vec3(normal).mul(lift)).toVar();
+    // Re-measure the budget from the LIFTED origin. Reconstructing the endpoint
+    // and taking its distance is exact for any `maxT` and costs one length();
+    // subtracting `dot(normal, toLight) · lift` would be the same thing only for
+    // a straight-line geometry that a lift along the normal does not give.
+    const budget = (maxT == null
+      ? diagonal()
+      : p.add(l.mul(float(maxT))).sub(origin).length()
+    ).toVar();
     const v = float(1).toVar();
-    const sh = trace(vec3(point).add(vec3(normal).mul(lift)), toLight, lift, maxT, {
+    const sh = trace(origin, l, lift, budget, {
       steps,
       macroSteps: MAX_MACRO_STEPS,
       dynamics: false,
