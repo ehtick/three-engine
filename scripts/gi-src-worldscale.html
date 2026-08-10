@@ -1,0 +1,336 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>SRC world-scale probe — does the transport cost what the world costs?</title>
+    <style>html,body{margin:0;background:#111;color:#ddd;font:13px monospace}canvas{width:320px;height:240px}</style>
+  </head>
+  <body>
+    <canvas id="view" width="320" height="240"></canvas>
+    <pre id="log"></pre>
+    <script type="module">
+      // ══ THE REBUILD'S CENTRAL CLAIM, MEASURED ════════════════════════════
+      //
+      // Plan §1's whole case for SRC over the dense backend is that its cost is
+      // SCREEN-proportional: "order 5M live bins … ~60MB typical, and unlike
+      // today it does not scale with world size" (§4.2). Every §12 number so far
+      // was taken on an 8-metre room. This sweeps the WORLD and holds the SCREEN
+      // fixed — the only experiment that can falsify the claim.
+      //
+      // ══ WHAT IS AND IS NOT UNDER TEST ═══════════════════════════════════
+      //
+      // SRC's own buffers are sized from the pixel count and `BIN_BUDGET`, so
+      // "memory is flat" is true BY CONSTRUCTION and the arm that checks it is
+      // a regression guard, not a discovery. The interesting quantities are the
+      // ones a bigger world could genuinely break:
+      //
+      //   probes    c0 population is "unique visible surface cells, LOD-bounded"
+      //             (§4.2). If the LOD law fails to coarsen with distance, a
+      //             wider world means more distinct cells on the same screen and
+      //             the count climbs toward one probe per pixel. §12.19.2
+      //             replaced that law wholesale (`LOD0_REACH`), and nothing has
+      //             tested it past 14 m.
+      //   pool      a probe that cannot claim an index or a bin block is an
+      //             ABSENCE — correct by R1, invisible in the log, and a dark
+      //             patch on screen. `failed` and `noBlock` must stay at zero.
+      //   lit       the frame must keep resolving. A world that outgrows the
+      //             hashmap shows up here first, as pixels with no probe.
+      //
+      // THE OCCUPANCY FIELD IS NOT UNDER TEST AND IS REPORTED ANYWAY. It is the
+      // one part of the system that DOES scale with world size, §4.5 says so
+      // explicitly (R16: "the occupancy volume still needs bounds — that stays,
+      // and is the remaining scene-scale limit to solve separately"), and a
+      // report that quietly omitted it would be claiming a win the architecture
+      // has not earned yet.
+      //
+      // Run: node scripts/run-gi-src-worldscale-test.mjs
+      const out = document.querySelector("#log");
+      const say = (line) => { out.textContent += line + "\n"; };
+      let failures = 0;
+      const check = (label, ok, detail = "") => {
+        say(`  ${ok ? "PASS" : "FAIL"} ${label}${detail ? ` — ${detail}` : ""}`);
+        if (!ok) failures++;
+      };
+      const fail = (error) => {
+        console.error("SRC-WORLDSCALE FAIL", error?.stack ?? error?.message ?? String(error));
+        globalThis.__SRC_WORLDSCALE_RESULT__ = {
+          pass: false, error: error?.message ?? String(error), text: out.textContent,
+        };
+      };
+      globalThis.addEventListener("error", (event) => fail(event.error ?? event.message));
+      globalThis.addEventListener("unhandledrejection", (event) => fail(event.reason));
+
+      try {
+        globalThis.__giSrcProbes = true;
+        globalThis.__editorKeepRendering = true;
+        const { Engine, THREE, registerBuiltInComponents } = await import("/src/engine/index.js");
+        await import("/src/modules/index.js");
+        const { enableEngineModule } = await import("/src/engine/modules.js");
+
+        registerBuiltInComponents();
+        const engine = new Engine();
+        engine.setSize(320, 240);
+        await engine.init(document.querySelector("#view"));
+        if (engine.getBackendName() !== "WebGPU") throw new Error(`WebGPU unavailable (${engine.getBackendName()})`);
+        const device = engine.renderer.backend.device;
+        const validationErrors = [];
+        device.addEventListener?.("uncapturederror", (event) => {
+          validationErrors.push(event.error?.message ?? String(event.error));
+          console.error("WebGPU validation error:", validationErrors.at(-1));
+        });
+
+        await enableEngineModule(engine, "gi");
+        // THE MODULE IS NOT THE SYSTEM. `enableEngineModule` compiles GI in;
+        // the system only builds once an entity carries a `global-illumination`
+        // component, and without one `state` stays null forever — which reads
+        // exactly like "SRC failed to build" and cost this file one run.
+        const giEnt = engine.createEntity({ name: "GI" });
+        giEnt.addComponent("global-illumination", { quality: "medium" });
+        // AND THE ENGINE HAS TO BE RUNNING. GI does its per-frame work from the
+        // Engine's own preRender callbacks, so driving `renderer.renderAsync`
+        // by hand renders the scene and advances NOTHING — `state` stays null,
+        // which reads as "SRC failed to build" and cost this file a second run.
+        engine.start();
+
+        // A uniform sky, which is the only radiance SRC has until Phase 5 —
+        // without it every pixel resolves to zero and "lit" measures nothing.
+        const skyTex = new THREE.DataTexture(
+          new Float32Array([1, 1, 1, 1]), 1, 1, THREE.RGBAFormat, THREE.FloatType,
+        );
+        skyTex.mapping = THREE.EquirectangularReflectionMapping;
+        skyTex.needsUpdate = true;
+        engine.scene.environment = skyTex;
+        engine.scene.environmentIntensity = 1;
+
+        const camera = new THREE.PerspectiveCamera(60, 320 / 240, 0.1, 4000);
+        engine.scene.add(camera);
+        engine.camera = camera;
+
+        const material = new THREE.MeshStandardNodeMaterial({ color: 0x888888, roughness: 0.9 });
+        const built = [];
+        // ── ONE WORLD, AT SCALE ─────────────────────────────────────────
+        // A floor of S x S and a grid of blocks over it, with the DENSITY held
+        // constant in world units — so a wider world is more geometry over more
+        // ground, not the same scene stretched. The camera stays at the same
+        // height with the same field, looking along the ground, so what changes
+        // between arms is how much world is in front of it and nothing else.
+        //
+        // Blocks rather than bare floor because a floor alone is one plane at
+        // one LOD: the probe ladder needs vertical structure at a range of
+        // distances or the population never exercises its shells.
+        const buildWorld = (S) => {
+          for (const m of built) {
+            engine.scene.remove(m);
+            m.geometry.dispose();
+          }
+          built.length = 0;
+          const floor = new THREE.Mesh(new THREE.BoxGeometry(S, 0.4, S).toNonIndexed(), material);
+          floor.position.y = -0.2;
+          built.push(floor);
+          const PITCH = 4;                      // metres between blocks, CONSTANT
+          const n = Math.max(1, Math.floor(S / PITCH));
+          for (let i = 0; i < n; i++) {
+            for (let j = 0; j < n; j++) {
+              const h = 1 + ((i * 7 + j * 13) % 5) * 0.6;
+              const b = new THREE.Mesh(new THREE.BoxGeometry(1.4, h, 1.4).toNonIndexed(), material);
+              b.position.set(-S / 2 + (i + 0.5) * PITCH, h / 2, -S / 2 + (j + 0.5) * PITCH);
+              built.push(b);
+            }
+          }
+          for (const m of built) { m.updateMatrixWorld(true); engine.scene.add(m); }
+          // Eye height fixed, looking down the ground plane from one corner.
+          camera.position.set(-S / 2 + 2, 1.7, -S / 2 + 2);
+          camera.lookAt(S / 2, 1.0, S / 2);
+          camera.updateMatrixWorld(true);
+          return built.length;
+        };
+
+        // `engine.start()` owns the loop; a frame here is a wait, not a render.
+        const frame = (n = 6) => new Promise((r) => setTimeout(r, n * 60));
+        const system = () => engine.modules.get("gi")?.system;
+
+        const SCALES = [8, 24, 72, 216];
+        const rows = [];
+        for (const S of SCALES) {
+          const meshes = buildWorld(S);
+          // `_fieldReadyOnce` IS THE CONTRACT EVERY GI PROBE WAITS ON, and the
+          // §12 notes record reading before it costing a session. A scale change
+          // moves the scene AABB, so auto-fit refits and the whole screen bundle
+          // is rebuilt — the wait is per arm, not once at boot.
+          const deadline = performance.now() + 120_000;
+          let src = null;
+          while (performance.now() < deadline) {
+            await frame(2);
+            if (system()?._fieldReadyOnce && system()?.state?.screen?.srcProbes) {
+              src = system().state.screen.srcProbes;
+              break;
+            }
+          }
+          if (!src) throw new Error(`no srcProbes system at scale ${S} after 120s — is __giSrcProbes set before the module builds?`);
+          // Settled frames AFTER the field is ready: the probe set, the ray
+          // budget and the bins all have to be populated from a still camera,
+          // and under temporal accumulation that now takes ~1/alpha frames.
+          await frame(14);
+          const stats = await src.readStats(engine.renderer);
+          // `stats.bytes`, not `.bytes` — the field's byte count lives on its
+          // stats record, and reading the wrong path silently reported 0.0MB
+          // for every scale, which is a stronger claim than the true one and in
+          // the wrong direction. A missing number has to fail loudly here.
+          const occ = system()?.state?.volume?.occupancyField ?? null;
+          const occStats = occ?.stats ?? null;
+          if (!occStats || !(occStats.bytes > 0)) {
+            throw new Error(`no occupancy byte count at scale ${S} — this arm reports the ` +
+              "one cost SRC does NOT fix, and a zero here would misreport it as free");
+          }
+          rows.push({
+            S, meshes,
+            bytes: stats.bytes,
+            spacing0: stats.spacing0,
+            cascades: stats.cascades.map((c) => ({
+              live: c.live, cap: c.probeCapacity, load: c.loadFactor,
+              failed: c.failed, noBlock: c.noBlock, steps: c.meanProbeSteps ?? 0,
+            })),
+            depositNoBlock: stats.rays?.noBlock ?? 0,
+            gather: stats.gather ?? null,
+            occBytes: occStats.bytes,
+            occVoxel: occStats.voxelSize,
+            occRes: occStats.res,
+          });
+          say(`  scale ${String(S).padStart(4)}m  ${String(meshes).padStart(5)} meshes  ` +
+            `src ${(stats.bytes / 1048576).toFixed(2)}MB  s0 ${stats.spacing0?.toFixed?.(2) ?? "?"}  ` +
+            `probes ${stats.cascades.map((c) => c.live).join("/")}  ` +
+            `load ${stats.cascades.map((c) => c.loadFactor.toFixed(3)).join("/")}`);
+        }
+        say("");
+
+        // ══ ARM 1: MEMORY IS FLAT ═══════════════════════════════════════
+        say("── MEMORY: SRC's buffers are sized by the SCREEN, not the world ──");
+        const bytes = rows.map((r) => r.bytes);
+        const flat = bytes.every((b) => b === bytes[0]);
+        say(`   ${(bytes[0] / 1048576).toFixed(2)}MB at every scale from ${SCALES[0]}m to ${SCALES.at(-1)}m ` +
+          `(${(SCALES.at(-1) / SCALES[0]) ** 2}x the ground area)`);
+        check("SRC's own memory does not move with world size", flat,
+          bytes.map((b) => (b / 1048576).toFixed(2)).join(" / "));
+        // The honest other half. §4.5 (R16) says the occupancy volume is the
+        // remaining scene-scale limit and is out of SRC's scope; reporting it
+        // next to the flat line is the difference between a measurement and a
+        // press release.
+        const occMB = rows.map((r) => r.occBytes / 1048576);
+        // ── AND THE OTHER HALF, WHICH IS THE HEADLINE ────────────────────
+        // §4.5 calls the occupancy volume "the remaining scene-scale limit"
+        // (R16) and leaves it out of scope. This is the first time it has been
+        // priced. It is not a rounding error next to the win above: at 216 m the
+        // field costs more than TWICE the transport it exists to serve, and it
+        // is still coarsening as it grows — so the resolution is degrading and
+        // the memory is climbing at the same time.
+        //
+        // NOTHING IS ASSERTED ABOUT ITS DIRECTION, deliberately. An arm that
+        // failed unless the occupancy field kept growing would lock in the
+        // defect and go red the day somebody fixes it with clipmaps. The guard
+        // is a ceiling on the TOTAL, so a regression that explodes either term
+        // is caught without anyone having to predict which one.
+        const voxels = rows.map((r) => r.occVoxel);
+        say(`   occupancy field (R16's open scope, NOT fixed by SRC): ` +
+          `${occMB.map((m) => m.toFixed(1)).join(" / ")}MB at voxel ` +
+          `${voxels.map((v) => v.toFixed(2)).join(" / ")}m`);
+        const worstTotal = Math.max(...rows.map((r) => (r.bytes + r.occBytes) / 1048576));
+        say(`   SO THE WORLD-DEPENDENT TERM IS THE FIELD, NOT THE TRANSPORT: ` +
+          `${(occMB.at(-1) / (bytes[0] / 1048576)).toFixed(1)}x SRC's own footprint at ` +
+          `${SCALES.at(-1)}m, and coarsening (${voxels[0].toFixed(2)}m -> ${voxels.at(-1).toFixed(2)}m) ` +
+          "as it climbs");
+        check("total GI memory stays inside a sane ceiling at every tested scale",
+          worstTotal < 512, `worst ${worstTotal.toFixed(0)}MB of 512MB — a ceiling on this TEST, ` +
+          "not a claim about the architecture");
+
+        // ══ ARM 2: THE POPULATION IS LOD-BOUNDED ════════════════════════
+        say("");
+        say("── PROBES: does the population track the SCREEN or the WORLD? ──");
+        // The claim under test. Ground area grows 729x across this sweep; if the
+        // LOD law works, the c0 count is bounded by visible surface cells and
+        // barely moves. If it fails, the count climbs toward one probe per
+        // gbuffer pixel and the pool runs out — which is what the next arm sees.
+        const c0 = rows.map((r) => r.cascades[0].live);
+        const areaRatio = (SCALES.at(-1) / SCALES[0]) ** 2;
+        const probeRatio = c0.at(-1) / Math.max(1, c0[0]);
+        say(`   c0 probes ${c0.join(" -> ")} over a ${areaRatio}x area growth ` +
+          `(${probeRatio.toFixed(2)}x)`);
+        for (const r of rows) {
+          say(`     ${String(r.S).padStart(4)}m: ${r.cascades.map((c) => `${c.live}/${c.cap}`).join("  ")}`);
+        }
+        check("the probe count grows far slower than the world does",
+          probeRatio < areaRatio / 20,
+          `${probeRatio.toFixed(2)}x probes against ${areaRatio}x area — the LOD law is what bounds this`);
+        check("no cascade came close to its probe capacity",
+          rows.every((r) => r.cascades.every((c) => c.live < c.cap * 0.9)),
+          rows.map((r) => r.cascades.map((c) => (c.live / c.cap).toFixed(2)).join("/")).join("  "));
+
+        // ══ ARM 3: NOTHING WENT WITHOUT ═════════════════════════════════
+        say("");
+        say("── POOL: a probe that cannot claim is an ABSENCE, and absences hide ──");
+        // R1 makes a failed claim silent by design — the gather renormalizes
+        // around it and the frame looks fine except for a dark patch that moves
+        // with the camera. The counters are the only way this is ever seen.
+        const failed = rows.flatMap((r) => r.cascades.map((c) => c.failed));
+        const noBlock = rows.flatMap((r) => r.cascades.map((c) => c.noBlock));
+        const dropped = rows.map((r) => r.depositNoBlock);
+        check("no insert ever exhausted its probe budget", failed.every((f) => f === 0),
+          `failed ${failed.join("/")}`);
+        check("no probe went without a bin block", noBlock.every((f) => f === 0),
+          `noBlock ${noBlock.join("/")}`);
+        check("no deposit was dropped for want of a block", dropped.every((d) => d === 0),
+          `dropped ${dropped.join("/")}`);
+        const worstLoad = Math.max(...rows.flatMap((r) => r.cascades.map((c) => c.load)));
+        check("the hashmap stayed under its 0.5 load factor at every scale",
+          worstLoad < 0.5, `worst ${worstLoad.toFixed(3)}`);
+
+        // ══ ARM 4: THE FRAME STAYS LIT ══════════════════════════════════
+        say("");
+        say("── LIT: the transport still answers, at every scale ──");
+        // The end-to-end check. Everything above can be healthy while the gather
+        // returns nothing, and a pixel with no probe reads as darkness rather
+        // than as an error.
+        for (const r of rows) {
+          const g = r.gather;
+          say(`     ${String(r.S).padStart(4)}m: ${g ? `${g.lit}/${g.pixels} lit, ${g.empty ?? 0} no-probe, ` +
+            `${(g.meanCorners ?? 0).toFixed(2)}/8 probes per pixel, peak ${(g.maxLum ?? 0).toFixed(4)}` : "no gather stats"}`);
+        }
+        const litFrac = rows.map((r) => (r.gather ? r.gather.lit / Math.max(1, r.gather.pixels) : 0));
+        check("every scale resolves nearly the whole gbuffer",
+          litFrac.every((f) => f > 0.97), litFrac.map((f) => (100 * f).toFixed(1) + "%").join(" / "));
+        check("no pixel at any scale was left without a probe",
+          rows.every((r) => (r.gather?.empty ?? 0) === 0),
+          rows.map((r) => r.gather?.empty ?? 0).join("/"));
+        // The furnace ceiling, which must hold whatever the world does: uniform
+        // sky in, at most pi*sky out.
+        const peaks = rows.map((r) => r.gather?.maxLum ?? 0);
+        check("the pi*sky ceiling holds at every scale",
+          peaks.every((p) => p <= Math.PI * 1.001 && p > 0),
+          peaks.map((p) => p.toFixed(4)).join(" / "));
+
+        if (validationErrors.length) check("no WebGPU validation errors", false, validationErrors[0]);
+
+        say("");
+        say(failures ? `gi-src-worldscale: ${failures} CHECKS FAILED` : "gi-src-worldscale: all cases PASS");
+        globalThis.__SRC_WORLDSCALE_RESULT__ = {
+          pass: failures === 0,
+          failures,
+          scales: SCALES,
+          srcMB: +(bytes[0] / 1048576).toFixed(2),
+          occMB: occMB.map((m) => +m.toFixed(1)),
+          occVoxel: rows.map((r) => +r.occVoxel.toFixed(2)),
+          occRatio: +(occMB.at(-1) / (bytes[0] / 1048576)).toFixed(1),
+          c0,
+          areaRatio,
+          probeRatio: +probeRatio.toFixed(2),
+          worstLoad: +worstLoad.toFixed(3),
+          litFrac: litFrac.map((f) => +(100 * f).toFixed(1)),
+          storageLimit: device.limits.maxStorageBuffersPerShaderStage,
+          text: out.textContent,
+        };
+
+      } catch (error) {
+        fail(error);
+      }
+    </script>
+  </body>
+</html>

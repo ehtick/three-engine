@@ -3730,3 +3730,90 @@ line now distinguishes the three states it can be in (absent / live but unlit /
 sky visibility) rather than reporting ABSENT unconditionally — it had stopped
 being able to tell them apart the moment the transport landed, which is the one
 job its own comment claims for it.
+
+### 12.25 Phase 4, unit 3 — the world-scale probe. THE CENTRAL CLAIM HOLDS, AND R16 IS NOW PRICED.
+
+§7's last Phase 4 gate item, and §1's whole case for the rebuild: SRC's cost is
+SCREEN-proportional and "unlike today it does not scale with world size" (§4.2).
+Every §12 number until now was taken on an eight-metre room.
+`probe:gi-src-worldscale` sweeps the world 8 m → 216 m — **729× the ground
+area** — with the screen pinned at 320×240 and the block pitch constant, so a
+wider world is more geometry over more ground rather than the same scene
+stretched.
+
+#### 12.25.1 What it measured
+
+    scale     meshes   SRC      c0 probes   load    lit      occupancy
+      8 m          5   56.32MB        105   0.003   100%     2.7MB @ 0.14m
+     24 m         37   56.32MB        487   0.018   100%     8.2MB @ 0.15m
+     72 m        325   56.32MB       1047   0.031   99.9%  107.5MB @ 0.16m
+    216 m       2917   56.32MB        563   0.032   100%   143.1MB @ 0.26m
+
+**The transport is flat to the byte**, which is true by construction (SRC's
+buffers are sized from the pixel count and `BIN_BUDGET`) and is therefore a
+regression guard rather than a discovery. The arms that could have failed are
+the other three, and none did: probe population grew ~5–10× against 729× area,
+the hashmap never passed a 0.034 load factor against its 0.5 budget, **zero
+failed inserts and zero probes without a bin block at any scale**, and the
+gather resolved essentially the whole gbuffer every time with the π·sky ceiling
+intact.
+
+The probe count is worth reading carefully. It is **not monotonic** — 1047 at
+72 m against 563 at 216 m — because what drives it is how much distinct surface
+falls in the near LOD shells, not how much world exists. At 216 m most of the
+frame is far enough away to be coarsely sampled, which is exactly what the LOD
+law is for and what §12.19.2 rewrote. This is the first evidence it holds past
+14 m.
+
+#### 12.25.2 THE HEADLINE IS THE OTHER TERM
+
+§4.5 leaves the occupancy volume out of scope as "the remaining scene-scale
+limit to solve separately" (R16). This is the first time it has been priced, and
+it is not a rounding error beside the win:
+
+**At 216 m the occupancy field costs 143 MB — 2.5× SRC's entire footprint — and
+it is coarsening (0.14 m → 0.26 m voxels) while it climbs.** Resolution degrades
+and memory grows at the same time.
+
+So the accurate statement of the rebuild's central claim is narrower than "GI no
+longer scales with the world": **the TRANSPORT no longer does, and the MEDIUM it
+traces through still does, now dominantly.** Both halves belong in the same
+sentence. A report that quoted the flat 56.32 MB alone would be true and
+misleading at once, which is why this arm exists at all.
+
+Nothing is asserted about the field's direction, deliberately — an arm that
+failed unless the occupancy kept growing would lock in the defect and go red the
+day somebody fixes it with the clipmaps §4.5 gestures at. The guard is a ceiling
+on the TOTAL, so a regression in either term is caught without anyone having to
+predict which.
+
+#### 12.25.3 Two harness faults, both of which read as "SRC is broken"
+
+Neither was a transport bug and both produced the same symptom — `state` null,
+no probe system, 120 seconds of waiting:
+
+1. **A `global-illumination` COMPONENT is what builds the system**, not
+   `enableEngineModule`. The module compiles GI in; the system stays null until
+   an entity carries the component.
+2. **`engine.start()` is what runs it.** GI does its per-frame work from the
+   Engine's preRender callbacks, so driving `renderer.renderAsync` by hand
+   renders the scene and advances nothing at all.
+
+And a third that was worse because it PASSED: the occupancy byte count lives on
+`occupancyField.stats.bytes`, and reading `occupancyField.bytes` returned
+`undefined` → 0.0 MB at every scale. The arm reported the field as free, which
+is a stronger claim than the true one and in the wrong direction. It throws on a
+missing count now — the honest half of a result has to fail loudly when it goes
+missing, or it quietly becomes a press release.
+
+#### 12.25.4 Phase 4 is complete except for one re-read
+
+Mechanism (§12.23), motion (§12.24) and scale (this section) are done.
+
+`probe:gi-block-size` is the one §7 item left, and it needs **re-reading rather
+than re-running**: it sweeps `voxelSize` and `probeSpacing` with `autoFit` off,
+and all three were retired when GI collapsed to one property (§12.19.5). Its ACF
+metric is still the right instrument — the world period of the residual
+structure — but the only dial left is `quality`, whose four tiers set s₀ to
+0.8 / 0.6 / 0.45 / 0.35. That is the sweep to rebuild it around, and the
+prediction §12.22 already made is that it finds NO period at s₀ at all.

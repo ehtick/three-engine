@@ -128,6 +128,7 @@
     "test:gi-src-tiles": "node scripts/run-gi-src-tiles-test.mjs",
     "test:gi-src-gather": "node scripts/run-gi-src-gather-test.mjs",
     "test:gi-src-temporal": "node scripts/run-gi-src-temporal-test.mjs",
+    "probe:gi-src-worldscale": "node scripts/run-gi-src-worldscale-test.mjs",
     "probe:gi-src-visual": "node scripts/run-gi-src-visual.mjs",
     "test:gi-src-volume": "node scripts/run-gi-src-volume-test.mjs",
     "probe:gi-debug-views": "node scripts/run-gi-debug-views-probe.mjs"
