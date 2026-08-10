@@ -4277,3 +4277,164 @@ deliberately not chased here, because Phase 5 changes what a bin contains.
 being sky visibility: `shadeHit` is still `null`, every deposited radiance is
 still zero, and a Cornell box with no red on the white block remains the correct
 picture until it lands.
+
+### 12.28 Phase 5, unit 2 — `shadeHit` ON THE GPU. THE MIRROR READS 0.0000%.
+
+**Status:** landed on `feature/gi-src`, three commits — `srcShade.js` (new),
+`srcTrace.js`, `srcDeposit.js`, `srcSystem.js`, plus `scripts/gi-src-shade.html`
+and its driver. `npm run test:gi-src-shade` is **33 checks, green**, ~40s on a
+real WebGPU device. `test:gi-src-ref`, `test:gi-src-deposit` and
+`test:gi-src-temporal` all stay green. Static surface attribution is another
+session's unit and is NOT here; `__giSrcShade` defaults OFF and requires it.
+
+#### 12.28.1 The headline, and what it is a headline about
+
+`createSrcHitShader` is §12.26's `makeHitShader` line for line, and the two arms
+that say so read **0.0000%** — unshadowed and shadowed, at 96 synthetic hits over
+three analytic emitters. That number is the whole point of having built the
+mirror first: the port had no design decisions left in it, and every arm below
+that failed, failed on the INSTRUMENT rather than on the shader.
+
+The gate needs no occupancy field and no engine. Both things it has to check
+about a shadow ray are properties of its BUDGET, so `createSrcVisibility` is
+handed a fake medium whose `traceOccupancy` reports a hit wherever the fixture
+puts one. That also means it never imports the file the parallel unit is editing,
+which is why the two sessions could run at once.
+
+#### 12.28.2 ⚠ THE SHADOW BIAS WAS APPLIED TWICE, AND EVERY COMMENT SAID 0.75
+
+§12.26.3's fix (re-measure `maxT` from the lifted origin) went in first and its
+arm passes: the shadow ray no longer hits the light it is aiming at. The sweep
+NEXT to it is what found the second bug.
+
+`createSrcVisibility` moved the origin 0.75 voxels along the normal **and**
+started the march at `t0 = lift` along the ray. Two biases. The lost-contact-
+shadow threshold was therefore **1.5 voxels** — double what the mirror measured,
+double what this document said, and double what the function's own comment
+claimed. Measured at voxel 0.2 m: lit at 0.16 and 0.20, which should both have
+been shadowed.
+
+The along-ray term is **not** redundant and does not simply get deleted: 0.75
+along a body-diagonal normal is only 0.43 per axis, so a grazing shadow ray from
+a lifted origin can still sit inside the surface's own voxel. It stays, as the
+SAME quarter-cell self-bias `createSrcSceneTrace` uses — derived from the same
+quantity (R2) rather than being a second lift. Threshold is now `0.75 + 0.25 =
+1.0` voxel, and `SHADOW_LIFT_CELLS`/`SHADOW_SELF_BIAS_CELLS` are exported so the
+gate asserts their SUM. **A threshold written down twice is one that drifts**,
+and this one had already drifted before anyone measured it.
+
+#### 12.28.3 A COLOURED ALBEDO BREAKS THE LUMINANCE EXACTNESS. THAT IS THE FORM THAT MATTERS.
+
+§12.26.5 established that one-sample NEE with `p ∝ luminance(E)` returns the
+exact sum in luminance, to 2.28e-16. The GPU arm asserting it failed at
+**31.17%**, and the shader was right.
+
+The identity is exact in the luminance of the **irradiance**. Reflected radiance
+is `ρ ⊙ E`, and a COLOURED ρ re-weights the three channels *before* the luminance
+is taken — so §12.26.5's own measured 740% per-channel spread leaks straight into
+luminance. Grey albedo: 0.0000%. Coloured: 31.17%.
+
+This is not a technicality about a test fixture. **What reaches the screen is the
+reflected radiance**, so the operative statement is: one-sample NEE is exact in
+luminance on a grey surface and is not on a coloured one, and every coloured
+surface in the scene pays chromatic noise the estimator's error bars do not show.
+§12.26.5's rule — compare estimators in the quantity they estimate — is what
+makes the arm readable; it is also what makes the SCREEN's error a different
+number from the estimator's.
+
+Both forms are now gated: exact on grey, and a third check asserting the coloured
+case does NOT collapse to it, so nobody can quietly grey the fixture and lose the
+finding.
+
+#### 12.28.4 AN ENERGY CLAIM ABOUT THE FLOOR NEEDS ~1/floorFraction SAMPLES
+
+§12.26.6 measured the importance floor's energy survival at 200,000 draws and
+read 2.08%. The GPU gate's first version compared two ONE-sample estimates over
+96 hits, read **26.1%** against a 5% bar, and that was not a defect — it was 96
+draws of an estimator whose entire subject is excess variance.
+
+The floor is 1/1024 of the mean importance among contributors, so a floored
+emitter is drawn about once per `1024 · contributors` samples. Swept rather than
+asserted, because the shape IS the finding:
+
+| samples/hit | energy gap | rms per-hit |
+|---|---|---|
+| 64 | 30.99% | 40.6% |
+| 256 | 8.13% | 42.4% |
+| 1024 | 3.76% | 39.2% |
+| 4096 | 1.30% | 11.7% |
+| 16384 | **0.25%** | 3.63% |
+
+So the energy does survive, and **the sample count that can say so is set by the
+floor fraction itself**. Below that scale the arm measures its own noise, and a
+bar picked without knowing this passes or fails on where the fixture's seed
+landed.
+
+The cost, stated in the units a sample budget is actually spent in: **the correct
+ranking is exact at ONE sample (9.8e-14); the broken one is still 3.63% per hit
+at 16,384.** That is §12.26.6's 37× standard error, re-expressed. The control had
+to be rewritten too — the first version compared the correct ranking's values
+against themselves, which is 0 by construction; it now compares 1 sample against
+16,384, so "exact" is measured rather than restated.
+
+#### 12.28.5 `dot(n, dir) == 0` IS THE ONE INPUT THE FLIP CANNOT ANSWER
+
+The face-forward arm (§12.26.4: reversing every record normal must shade
+identically) failed at 100% on hit 0. `faceForward` tests `dot > 0`, so at
+exactly grazing incidence **n and −n both return themselves** — the flip is a
+no-op on both and the two runs genuinely differ.
+
+Measure zero in a real trace; unmissable in a fixture built from trig on
+face-aligned normals, which produces exact zeros. The fixture now asserts its own
+minimum `|n·d|`, with a bar set from f32 sign determinacy (1e-4 against a 1.2e-7
+epsilon) rather than from steep incidence, because the requirement is that the
+SIGN is decidable and nothing more.
+
+#### 12.28.6 `STAT_EMIT_ZEROED` IS REDEFINED RATHER THAN FED — AND ZERO IS THE HEALTHY READING
+
+The parallel unit raised this and was right about the symptom: with the counter
+as §12.26 specified it, it would read 0 forever and the 2.60× arm would pass
+while measuring nothing. The proposed remedy — ship unzeroed emissive in the
+attribution palette so the shader has something to withhold — is **vetoed**, and
+the reason generalises.
+
+R5's zeroing already happens at bake time. `GISystem#slotSurface` and
+`dynamicObjects`' `writeSurface` both publish a promoted emitter's emissive as
+zero, and that guard is itself the fix for this exact double count:
+`writeSurface`'s own comment records that it once published raw material emissive
+unconditionally, so a mesh that was both promoted AND traced delivered its light
+twice. **The promotion set IS the NEE set**, so the bake zeroes exactly what the
+sampler will deliver.
+
+Unzeroing to feed a counter would put R5 in a third implementation and give one
+fact two sources of truth — the crossed-numbering shape §12.9 warns every
+successor about, and an instrument dictating a design.
+
+So the shader keeps its zeroing branch and the counter changes meaning: it now
+counts hits that landed on a NEE-flagged emitter **and still carried emission**,
+i.e. surfaces the bake missed. Nonzero is a promotion-bookkeeping bug, caught
+before it reaches the image as light delivered twice. The handoff's real gate
+stays an ENERGY arm (§12.26.7's analytic-on vs analytic-off, mean over a region),
+which measures the same property under either design — and which this gate runs
+on the mirror at 1.176× on its own fixture.
+
+#### 12.28.7 What is wired, and what is deliberately not
+
+`createSrcProbeSystem` takes `lighting` and `staticSurfaceAt`, and builds the
+shader only when `__giSrcShade` is on and BOTH are supplied. Two arguments and
+not one switch, because shading with `lighting` alone would light the entire
+static world at one default albedo — plausible, wrong everywhere, and read as a
+shader bug rather than a missing input. `wantDynObj` now follows `shadeEnabled`
+rather than being pinned false; the packed mover id costs the marcher its
+dynamic-object bookkeeping per ray and the hit shader is its only reader.
+
+Provenance lives in `srcSystem`'s `surfaceAt` and nowhere else. `srcShade.js`
+never asks whether a hit moved (§12.26.1), and a mover wants no emitter flag for
+the §12.28.6 reason.
+
+**Not done, and not claimed:** static surface attribution (the parallel unit),
+the secondary cache [J] — so this is a single bounce and R4's ceiling has no loop
+to bound yet, though it applies at the hit either way — `lightTree.js`'s ranking,
+the swept per-probe mover invalidation, and every GPU probe gate in §7's Phase 5
+list. `__giSrcNeeSamples` is the A/B for the sample count; the tiers have no
+measurement to set it from and deliberately do not carry one.
