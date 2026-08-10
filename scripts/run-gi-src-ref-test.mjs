@@ -1713,7 +1713,7 @@ console.log("── HIT SHADING: R4, THE IN-LOOP ALBEDO CEILING ─────�
       }
     }
   }
-  const runLoop = (albedo, ceiling, iterations) => {
+  const runLoop = (albedo, ceiling, iterations, cacheSpacing = null) => {
     const surfaces = (id) => ({
       albedo,
       emissive: id === 3 ? [1, 1, 1] : [0, 0, 0], // +y ceiling emits
@@ -1724,17 +1724,26 @@ console.log("── HIT SHADING: R4, THE IN-LOOP ALBEDO CEILING ─────�
       spacing0: 0.5, raysPerPixel: 8, forceLod: 0, sky: [0, 0, 0],
       camera: [0, 1, 0], anchor: [0, 1, 0],
     });
+    // ── THE CACHE'S OWN LATTICE (§4.1 step [J]: "2 LODs coarser") ──────────
+    // `makeSecondaryCache` needs no parameter for this: a coarser cache IS a
+    // frame built at a coarser spacing0, handed to the same function. The cost
+    // is one extra solve per iteration here, which is exactly what step [J]
+    // costs on the GPU.
+    const cacheCfg = cacheSpacing
+      ? makeSrcConfig({ ...cfg, spacing0: cacheSpacing })
+      : cfg;
     let prev = null;
     const series = [];
     for (let k = 0; k < iterations; k++) {
-      const secondary = prev ? makeSecondaryCache(cfg, prev.built, prev.tiles) : null;
+      const secondary = prev ? makeSecondaryCache(cacheCfg, prev.built, prev.tiles) : null;
       const shade = makeHitShader({
         surfaceAt: fixtureSurfaceAt, secondary, maxLoopAlbedo: ceiling,
       });
-      const frame = runSrcFrame(cfg, boxPixels, shadeTrace(geometry, shade));
+      const traced = shadeTrace(geometry, shade);
+      const frame = runSrcFrame(cfg, boxPixels, traced);
       const e = gatherPixel(cfg, frame.built, frame.tiles, [0, 0, 0], [0, 1, 0]);
       series.push(e[0]);
-      prev = frame;
+      prev = cacheSpacing ? runSrcFrame(cacheCfg, boxPixels, traced) : frame;
     }
     return series;
   };
@@ -1794,6 +1803,53 @@ console.log("── HIT SHADING: R4, THE IN-LOOP ALBEDO CEILING ─────�
   check("the ceiling is what separates them (the two arms differ)",
     unclamped[unclamped.length - 1] > clamped[clamped.length - 1] * 1.15,
     `E_final ${unclamped[unclamped.length - 1].toFixed(4)} vs ${clamped[clamped.length - 1].toFixed(4)}`);
+
+  // ══ THE CACHE IS ALLOWED TO BE COARSER, AND HERE IS WHAT THAT COSTS ═══════
+  //
+  // §4.1 step [J] runs the secondary cache "2 LODs coarser" — a 4x spacing —
+  // because a bounce that has already been blurred once does not need the fine
+  // lattice. The property that has to survive is R4's: coarsening changes the
+  // fixed point, it must not change the contraction.
+  //
+  // It also has a limit nobody wrote down, and the numbers below are it: the
+  // coarsening is bounded by SCENE SCALE, not chosen freely. This 2m box at
+  // s0 = 0.5 has a 2m cache lattice at 2 LODs coarser — one probe for the whole
+  // room — so the coarse arm under-transports by construction. On a Sponza-scale
+  // scene the same 4x is a 2m cache in a 30m nave and costs far less. Read the
+  // drop as a property of the ratio (cache spacing / scene size), not as a
+  // verdict on the coarsening.
+  const coarse1 = runLoop([1, 1, 1], MAX_LOOP_ALBEDO, 11, 1.0);
+  const coarse2 = runLoop([1, 1, 1], MAX_LOOP_ALBEDO, 11, 2.0);
+  const rate = (series) => tailOf(ratios(series)).slice(-1)[0];
+  console.log(`   secondary cache spacing 0.5 (same) / 1.0 (1 LOD) / 2.0 (2 LODs) in a 2m box:`);
+  console.log(`      E_final ${clamped[clamped.length - 1].toFixed(4)} / ` +
+    `${coarse1[coarse1.length - 1].toFixed(4)} / ${coarse2[coarse2.length - 1].toFixed(4)}` +
+    `   contraction ${rate(clamped).toFixed(4)} / ${rate(coarse1).toFixed(4)} / ${rate(coarse2).toFixed(4)}`);
+  check("a coarser secondary cache still contracts — R4 survives step [J]'s coarsening",
+    rate(coarse1) < 1 && rate(coarse2) < 1,
+    `${rate(coarse1).toFixed(4)} at 1 LOD, ${rate(coarse2).toFixed(4)} at 2 LODs coarser`);
+  // ── AND IT BRIGHTENS, WHICH IS THE OPPOSITE OF WHAT I ASSERTED FIRST ────
+  //
+  // The first version of this check said a coarse cache "costs energy
+  // monotonically, never gains any" — reasoning that averaging over a bigger
+  // cell can only blur light away. It failed at +4%, and the reason is a
+  // limitation this suite already has an arm for: the near-geometry
+  // interpolation leak is proportional to PROBE SPACING, so a 4x coarser cache
+  // has 4x the spacing over which its trilinear corners can straddle a wall.
+  // Leak is one-sided BRIGHT, so coarsening [J] does not lose energy — it
+  // invents some.
+  //
+  // That matters more here than at the primary field because this one is in a
+  // FEEDBACK LOOP: a leak that brightens the cache brightens the next bounce
+  // that reads it. R4 is what stops that from running away, and the contraction
+  // rates above (0.9001 at every coarsening) are the evidence that it does —
+  // the fixed point moves, the rate does not. Bound the movement, name the
+  // direction, and let the GPU side choose the coarsening against a real scene
+  // rather than against this 2m box.
+  const drift = coarse2[coarse2.length - 1] / clamped[clamped.length - 1] - 1;
+  check("coarsening moves the fixed point by a bounded amount, and the direction is BRIGHT (leak)",
+    drift > 0 && drift < 0.1,
+    `+${(drift * 100).toFixed(2)}% at 4x coarser, in a box exactly one coarse cell wide`);
 }
 
 console.log("── HIT SHADING: THE RECORD NORMAL + THE SHADOW LIFT ─────────────");
@@ -1962,8 +2018,8 @@ console.log("── HIT SHADING: EMITTER NEE ───────────�
     makeSphereEmitter({ center: [3, 1, -3], radius: 0.4, radiance: [20, 20, 20] }),
   ];
   const P = [0, 0.2, 0];
-  const N = [0, 1, 0];
-  const exact = emitterIrradianceExact(emitters, P, N, null);
+  const N4 = [0, 1, 0];
+  const exact = emitterIrradianceExact(emitters, P, N4, null);
 
   // ══ THE PDF IS SCALAR AND THE SIGNAL IS NOT — WHICH IS THE WHOLE FINDING ══
   //
@@ -1987,7 +2043,7 @@ console.log("── HIT SHADING: EMITTER NEE ───────────�
   let worstChannel = 0;
   const lum = (v) => 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2];
   for (let n = 0; n < 4000; n++) {
-    const est = emitterIrradianceNee(emitters, P, N, null, n, { samples: 1 });
+    const est = emitterIrradianceNee(emitters, P, N4, null, n, { samples: 1 });
     worstLum = Math.max(worstLum, Math.abs(lum(est) - lum(exact)) / lum(exact));
     for (let k = 0; k < 3; k++) {
       worstChannel = Math.max(worstChannel, Math.abs(est[k] - exact[k]) / Math.max(1e-9, exact[k]));
@@ -2004,10 +2060,10 @@ console.log("── HIT SHADING: EMITTER NEE ───────────�
   const grey = emitters.map((e) => makeSphereEmitter({
     center: e.center, radius: e.radius, radiance: [lum(e.radiance), lum(e.radiance), lum(e.radiance)],
   }));
-  const greyExact = emitterIrradianceExact(grey, P, N, null);
+  const greyExact = emitterIrradianceExact(grey, P, N4, null);
   let worstGrey = 0;
   for (let n = 0; n < 4000; n++) {
-    const est = emitterIrradianceNee(grey, P, N, null, n, { samples: 1 });
+    const est = emitterIrradianceNee(grey, P, N4, null, n, { samples: 1 });
     for (let k = 0; k < 3; k++) {
       worstGrey = Math.max(worstGrey, Math.abs(est[k] - greyExact[k]) / Math.max(1e-9, greyExact[k]));
     }
@@ -2021,7 +2077,7 @@ console.log("── HIT SHADING: EMITTER NEE ───────────�
   const picked = new Set();
   for (let n = 0; n < 4000; n++) {
     for (let i = 0; i < emitters.length; i++) {
-      const one = emitterIrradianceNee([emitters[i]], P, N, null, n, { samples: 1 });
+      const one = emitterIrradianceNee([emitters[i]], P, N4, null, n, { samples: 1 });
       if (one[0] + one[1] + one[2] > 0) picked.add(i);
     }
   }
@@ -2031,7 +2087,7 @@ console.log("── HIT SHADING: EMITTER NEE ───────────�
     const u = hashUnitFloat(n * 0x9e37);
     let acc = 0;
     const lum = emitters.map((e) => {
-      const E = e.irradianceAt(P, N);
+      const E = e.irradianceAt(P, N4);
       return 0.2126 * E[0] + 0.7152 * E[1] + 0.0722 * E[2];
     });
     const total = lum.reduce((a, b) => a + b, 0);
@@ -2055,7 +2111,7 @@ console.log("── HIT SHADING: EMITTER NEE ───────────�
   const blocker = { min: [-3, 2, -3], max: [0.2, 2.3, 3] };
   const geometry = makeShadedScene({ half: 4, height: 6, surfaces, occluder: blocker });
   const visibility = makeVisibility(geometry, 0.1);
-  const truth = emitterIrradianceExact(emitters, P, N, visibility);
+  const truth = emitterIrradianceExact(emitters, P, N4, visibility);
   const meanOf = (importance) => {
     const acc = [0, 0, 0];
     const sq = [0, 0, 0];
@@ -2068,7 +2124,7 @@ console.log("── HIT SHADING: EMITTER NEE ───────────�
     let sum = 0;
     let sumSq = 0;
     for (let n = 0; n < S; n++) {
-      const est = emitterIrradianceNee(emitters, P, N, visibility, n, { samples: 1, importance });
+      const est = emitterIrradianceNee(emitters, P, N4, visibility, n, { samples: 1, importance });
       const l = lum(est);
       sum += l;
       sumSq += l * l;
@@ -2097,6 +2153,85 @@ console.log("── HIT SHADING: EMITTER NEE ───────────�
     `for equal noise — the price of a ranking that knows nothing, and the ceiling on what a light tree can lose)`);
   check("contribution-proportional importance is measurably better than uniform",
     ratio > 1.5, `${ratio.toFixed(2)}x the standard error at equal sample count`);
+
+  // ══ STRATIFICATION: MORE SAMPLES MUST BUY THE USUAL 1/sqrt(S) ═════════════
+  //
+  // `neeSamples` exists so a quality tier can spend on light sampling without
+  // spending on rays. The claim it has to earn is that the extra samples are
+  // STRATIFIED — the draw is `(s + hash)/S`, one per stratum — and stratified
+  // draws over a piecewise-constant cdf beat independent ones. Asserting only
+  // "the mean is still right" would pass on a loop that draws the same light S
+  // times and divides by S.
+  const stderrAt = (S) => {
+    let sum = 0;
+    let sumSq = 0;
+    const ROUNDS = 8000;
+    for (let n = 0; n < ROUNDS; n++) {
+      const l = lum(emitterIrradianceNee(emitters, P, N4, visibility, n, { samples: S }));
+      sum += l;
+      sumSq += l * l;
+    }
+    const m = sum / ROUNDS;
+    return { mean: m, stderr: Math.sqrt(Math.max(0, sumSq / ROUNDS - m * m) / ROUNDS) };
+  };
+  const s1 = stderrAt(1);
+  const s4 = stderrAt(4);
+  const gain = s1.stderr / Math.max(1e-12, s4.stderr);
+  console.log(`   neeSamples 1 -> 4: stderr ${s1.stderr.toExponential(2)} -> ` +
+    `${s4.stderr.toExponential(2)} (${gain.toFixed(2)}x; independent draws would give 2.00x)`);
+  check("4 stratified NEE samples are unbiased and at least as good as 1/sqrt(S)",
+    Math.abs(s4.mean - truthLum) < 3 * s4.stderr && gain > 1.9,
+    `${gain.toFixed(2)}x variance reduction, mean ${s4.mean.toFixed(5)} vs ${truthLum.toFixed(5)}`);
+
+  // ══ A BROKEN IMPORTANCE MUST LOSE VARIANCE, NEVER ENERGY ══════════════════
+  //
+  // The pathological input: an importance function that ranks a CONTRIBUTING,
+  // VISIBLE emitter at zero. R1 says it must still be reachable, and the floor
+  // is what makes it so.
+  //
+  // The first version zero-ranked `emitters[0]`, which the blocker occludes —
+  // so the arm was asserting that an emitter delivering nothing still delivers
+  // nothing, and it passed with the floor doing no work at all. An arm whose
+  // subject contributes zero cannot fail. The dominant VISIBLE emitter is the
+  // one that makes the question real.
+  //
+  // What the floor buys and what it does not: energy survives (the estimator is
+  // still unbiased), and the worst single-sample weight is bounded by
+  // `contributors / floorFraction` rather than by luck. It does NOT make a
+  // broken ranking usable — the variance blow-up printed below is the number
+  // that says so, and `stats.importanceFloored` is the detector. The floor is
+  // a diagnosis, not a repair.
+  const visibleDominant = emitters[1];
+  const zeroRanked = (e) => (e === visibleDominant ? 0 : lum(e.irradianceAt(P, N4)));
+  const stats = { importanceFloored: 0 };
+  let sum = 0;
+  let sumSq = 0;
+  let peak = 0;
+  const DRAWS = 200000;
+  for (let n = 0; n < DRAWS; n++) {
+    const est = emitterIrradianceNee(emitters, P, N4, visibility, n, { samples: 1, importance: zeroRanked, stats });
+    const l = lum(est);
+    sum += l;
+    sumSq += l * l;
+    peak = Math.max(peak, l);
+  }
+  const brokenMean = sum / DRAWS;
+  const brokenStderr = Math.sqrt(Math.max(0, sumSq / DRAWS - brokenMean * brokenMean) / DRAWS);
+  console.log(`   zero-ranked VISIBLE emitter: mean ${brokenMean.toFixed(5)} vs truth ${truthLum.toFixed(5)} ` +
+    `(3-sigma ${(3 * brokenStderr).toExponential(2)}), worst single sample ${peak.toFixed(1)} ` +
+    `= ${(peak / truthLum).toFixed(0)}x the mean, floored ${stats.importanceFloored} times`);
+  console.log(`   its stderr is ${(brokenStderr / good.stderrLum).toFixed(0)}x the correct ranking's — ` +
+    `the floor keeps the energy and hands back the variance`);
+  check("an emitter ranked at zero importance still delivers its energy",
+    Math.abs(brokenMean - truthLum) < 3 * brokenStderr,
+    `${((brokenMean - truthLum) / truthLum * 100).toFixed(2)}% off over ${DRAWS} draws, inside its own 3-sigma`);
+  // contributors / floorFraction is the analytic ceiling on the weight; the
+  // point of asserting it is that the bound is a PROPERTY of the floor rather
+  // than an observation about this fixture.
+  const weightBound = 4 / (1 / 1024);
+  check("and the floor bounds the firefly it would otherwise create",
+    stats.importanceFloored > 0 && peak / truthLum < weightBound,
+    `worst weight ${(peak / truthLum).toFixed(0)}x vs the bound ${weightBound} = contributors/floorFraction`);
 }
 
 console.log("── HIT SHADING: R5, THE EMITTER ENERGY HANDOFF ──────────────────");

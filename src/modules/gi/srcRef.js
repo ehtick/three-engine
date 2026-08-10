@@ -1425,6 +1425,10 @@ export function shadeTrace(geometryTrace, shadeHit) {
  * re-run over hit points (plan §4.1 step [J]: "steps B–H re-run over last
  * frame's hit points, 2 LODs coarser"). A missing probe returns exactly zero
  * and lets temporal accumulation fill it, per R1.
+ *
+ * The "2 LODs coarser" part needs no parameter either: hand this function a
+ * frame built at a coarser `spacing0` and it is the coarse cache. The suite
+ * runs the multibounce loop both ways and reports what the coarsening costs.
  */
 export function makeSecondaryCache(cfg, built, tiles, coverage = null, interior = IRRADIANCE_TILE_INTERIOR) {
   return (position, normal) => gatherPixel(cfg, built, tiles, position, normal, interior, coverage);
