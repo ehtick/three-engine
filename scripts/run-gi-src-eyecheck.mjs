@@ -32,6 +32,19 @@
 //
 // A pass is: probes-only ≈ shade-on, both ~5× shade-off, and noshadow above
 // both. The one number that matters most is `lit` — shade-off sits at 4%.
+//
+// ⚠ THIS IS A WITHIN-RUN INSTRUMENT. Compare arms to each other inside one
+// invocation; do NOT compare a number here against one from a previous run.
+// Three solo `shade-on` runs — same flags, same position, same scene — read
+// 0.11213, 0.11180 and 0.05921. Inside a single run the shaded arms hold to
+// ~4% (0.11303 / 0.11762 / 0.11239 / 0.11242).
+//
+// I previously claimed the opposite ("reproduces to 0.07%, so any gap between
+// arms is real signal") and it was generalized from `shade-off`, which is
+// stable across runs for the uninteresting reason that it is nearly black and
+// has almost nothing that can vary. A precision claim measured on the one arm
+// that cannot move is not a precision claim. The gbuffer-coverage assert below
+// catches the largest known cause; it is not proof there are no others.
 import puppeteer from "puppeteer-core";
 import sharp from "sharp";
 import { installTauriShim } from "./lib/tauriShim.mjs";
@@ -244,6 +257,26 @@ for (const arm of arms) {
     // can refuse to compare two arms that did not see the same amount of
     // geometry — see `assertComparable`.
     const gbuf = Number(/src probes: (\d+) gbuffer pixels/.exec(gi.find((t) => /src probes:/.test(t)) ?? "")?.[1]) || null;
+    // `PROFILE=1` adds the per-group GPU cost of the SRC chain. Opt-in because
+    // `profile.giPasses` suspends rendering for a few hundred ms per pass and
+    // there are 44 of them — it would treble the runtime of a look check.
+    if (process.env.PROFILE === "1" && !arm.warmup) {
+      const p = await call("profile.giPasses", { samples: 20 });
+      const src = p.value?.srcProbes;
+      if (src) {
+        console.log(`      · SRC chain ${src.totalMs}ms over ${src.dispatches} dispatches:`);
+        for (const [label, g] of Object.entries(src.groupMs ?? {})) {
+          if (typeof g === "string") { console.log(`          ✗ ${g}`); continue; }
+          console.log(`          ${label.padEnd(32)} ${String(g.ms).padStart(8)}ms  ${String(g.dispatches).padStart(3)} dispatches  worst ${g.worstPassMs}ms`);
+        }
+      } else console.log(`      · profile.giPasses returned no srcProbes — ${p.error ?? "(no error)"}`);
+      // ⚠ `src.groupMs ?? {}` above CANNOT distinguish two very different
+      // failures — a stale `profile.js` that never emits the key, and a live
+      // one whose `passGroups` lookup came back empty. Both print nothing.
+      // The KEY LIST separates them in one line, which a second guess would
+      // not have.
+      console.log(`      · srcProbes keys: ${Object.keys(src ?? {}).join(",") || "(none)"}`);
+    }
     const frames = gi.filter((t) => /src probes —/.test(t));
     const last = frames.at(-1) ?? "";
     const maxL = /maxL ([\d.]+)/.exec(last)?.[1] ?? "n/a";

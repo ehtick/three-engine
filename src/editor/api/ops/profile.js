@@ -115,23 +115,65 @@ defineOp({
         // Duplicate labels (one merge per cascade level) keep their index.
         queueMs[queueMs[e.pass] === undefined ? e.pass : `${e.pass} #${queueEntries.indexOf(e)}`] = e.ms;
       }
-      // SRC probe population (opt-in via `__giSrcProbes`). Timed as ONE number
-      // rather than per-pass: the fourteen dispatches are a fixed chain whose
-      // boundaries are barriers, so the interesting question is what the chain
-      // costs, not which of two clears is slower. Its telemetry rides along
-      // because "3.1ms" and "3.1ms at load 0.94 with 900 dropped inserts" call
-      // for completely different responses.
+      // SRC probe population (opt-in via `__giSrcProbes`), timed PER GROUP.
+      //
+      // It used to be one number, on the stated grounds that "the interesting
+      // question is what the chain costs, not which of two clears is slower".
+      // That held while this was fourteen tiny dispatches. It stopped holding at
+      // 44 dispatches and 91ms on the user's Sponza — ~50x the entire screen
+      // total — at which point "what does the chain cost" has an obvious answer
+      // and the only useful question is which group owns it. Its telemetry still
+      // rides along because "3.1ms" and "3.1ms at load 0.94 with 900 dropped
+      // inserts" call for completely different responses.
       let srcProbes = null;
       if (screen.srcProbes) {
         let srcMs = 0;
+        const perPass = [];
         for (const pass of screen.srcProbes.passes) {
           const ms = await timeOne(pass);
+          perPass.push(typeof ms === "number" ? ms : 0);
           if (typeof ms === "number") srcMs += ms;
+        }
+        // Group boundaries come from srcSystem in `passes` order. Asserted
+        // rather than trusted: a group list that has drifted from the pass list
+        // would silently attribute cost to the wrong stage, which is worse than
+        // the single sum this replaced.
+        const groups = screen.srcProbes.passGroups ?? [];
+        const groupTotal = groups.reduce((n, g) => n + g.count, 0);
+        const groupMs = {};
+        if (groups.length && groupTotal === perPass.length) {
+          let at = 0;
+          for (const g of groups) {
+            const slice = perPass.slice(at, at + g.count);
+            at += g.count;
+            groupMs[g.label] = {
+              ms: +slice.reduce((a, b) => a + b, 0).toFixed(3),
+              dispatches: g.count,
+              worstPassMs: +Math.max(0, ...slice).toFixed(3),
+            };
+          }
+        } else if (groups.length) {
+          groupMs.ERROR = `passGroups sum ${groupTotal} != ${perPass.length} passes — ` +
+            "srcSystem's group list has drifted from its pass list; per-group numbers withheld.";
+        } else {
+          // AND SAY SO. This branch used to fall through silently, so a missing
+          // `passGroups` produced `{}` — indistinguishable from "every group
+          // measured 0ms", and it cost three runs to tell those apart. An
+          // absent input is a louder failure than a wrong one, not a quieter.
+          groupMs.ERROR = "srcProbes.passGroups is absent — the per-group breakdown cannot be " +
+            "computed. Either srcSystem did not publish it, or this editor is running a stale " +
+            `module. Object has ${perPass.length} passes totalling ${srcMs.toFixed(3)}ms.`;
         }
         const stats = await screen.srcProbes.readStats(renderer);
         srcProbes = {
           totalMs: +srcMs.toFixed(3),
           dispatches: screen.srcProbes.passes.length,
+          // Sorted most-expensive-first, same discipline as `queueMs`: the
+          // point of this op is to find what owns the frame, and an unsorted
+          // map of eight entries hides it.
+          groupMs: Object.fromEntries(
+            Object.entries(groupMs).sort((a, b) => (b[1]?.ms ?? 0) - (a[1]?.ms ?? 0)),
+          ),
           spacing0: stats.spacing0,
           megabytes: +(stats.bytes / 1048576).toFixed(2),
           reanchors: stats.reanchors,

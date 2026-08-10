@@ -575,6 +575,33 @@ export function createSrcProbeSystem({
           hashBlockFrame.pass, gather.reset, gather.compute,
         ]
       : [...frame.passes, ...rayFrame.passes],
+    // ── WHO OWNS THE FRAME ──────────────────────────────────────────────────
+    //
+    // Group boundaries, in the SAME order as `passes`, so `profile.giPasses`
+    // can attribute the chain instead of reporting one sum. It reported one
+    // sum on the grounds that "the interesting question is what the chain
+    // costs, not which of two clears is slower" — true when this was fourteen
+    // tiny dispatches, and false at 44 dispatches costing 91ms on the user's
+    // Sponza, which is ~50x the entire screen-pass total. A cost with no owner
+    // is a cost nobody can act on.
+    //
+    // Counts are derived from the same arrays spread above, so the two cannot
+    // drift without the assert in `profile.giPasses` firing.
+    passGroups: deposit
+      ? [
+          { label: "surfaces (attribution palette)", count: (shadeEnabled ? surfaces?.passes ?? [] : []).length },
+          { label: "populate", count: frame.passes.length },
+          { label: "rays", count: rayFrame.passes.length },
+          { label: "deposit (trace + shade)", count: deposit.passes.length },
+          { label: "merge", count: merge.passes.length },
+          { label: "tiles", count: tiles.passes.length },
+          { label: "hashBlock", count: 1 },
+          { label: "gather", count: 2 },
+        ].filter((g) => g.count > 0)
+      : [
+          { label: "populate", count: frame.passes.length },
+          { label: "rays", count: rayFrame.passes.length },
+        ],
     pixelProbe: frame.pixelProbe,
     /** Non-null only when `shadeHit` was actually built — see `describeSrcProbeSystem`. */
     shading: shadeHit
@@ -696,7 +723,14 @@ export function describeSrcProbeSystem(system) {
     .map((x) => `c${x.cascade} ${x.probeCapacity}/${x.hashCapacity}`)
     .join(" ");
   const bytes = system.store.bytes + system.rayStore.bytes + (system.binStore?.bytes ?? 0);
-  return `[gi] src probes: ${system.pixelCount} gbuffer pixels, s0=${system.spacing0}, ` +
+  // `passes/groups` is not decoration: `profile.giPasses` attributes the chain
+  // by walking `passGroups`, and when that came back absent there was no way to
+  // tell a system that never published it from an editor running a stale
+  // module. The boot line now carries both counts, so the answer is in the log
+  // that is already being read rather than in another instrumented run.
+  const groups = Array.isArray(system.passGroups) ? system.passGroups.length : "ABSENT";
+  return `[gi] src probes: ${system.pixelCount} gbuffer pixels, ${system.passes.length} passes / ` +
+    `${groups} groups, s0=${system.spacing0}, ` +
     `${c}, ${system.raysPerPixel} rays/px, ${(bytes / 1048576).toFixed(2)}MB` +
     // The BLOCK counts are named, not the probe capacities, because they are
     // what the memory is a function of since the claim landed — and because a
