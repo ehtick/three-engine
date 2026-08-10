@@ -1,0 +1,738 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>SRC hit-shading gate — createSrcHitShader vs makeHitShader</title>
+    <style>html,body{margin:0;background:#111;color:#ddd;font:13px monospace}canvas{display:none}</style>
+  </head>
+  <body>
+    <canvas id="view" width="16" height="16"></canvas>
+    <pre id="log"></pre>
+    <script type="module">
+      // ══ THE PHASE-5 UNIT-2 GATE: HIT SHADING, WITHOUT THE ENGINE ═════════
+      //
+      // `srcShade.js`'s `createSrcHitShader` diffed against `srcRef.js`'s
+      // `makeHitShader` — the CPU mirror §12.26 built first and proved out over
+      // 124 checks — at the same synthetic hit points, with the same emitters,
+      // the same sun and the same surfaces.
+      //
+      // ══ NO OCCUPANCY FIELD, ON PURPOSE, AND IT COSTS NOTHING ════════════
+      //
+      // Every sibling gate in this suite is standalone (own renderer, no engine,
+      // no scene), and this one has a second reason to be: the two things it has
+      // to check about a shadow ray are both properties of the RAY BUDGET, not
+      // of the medium. So `createSrcVisibility` is handed a fake `occField`
+      // whose `traceOccupancy` reports a hit at a distance the fixture chooses.
+      // That turns "does the shadow ray hit the light it is aiming at" into an
+      // exact, medium-free assertion — see the `maxT` arms.
+      //
+      // ══ WHERE THE TWO SIDES CAN LEGALLY DISAGREE ════════════════════════
+      //
+      //   · f32 vs f64. The mirror runs in doubles. Everything here is compared
+      //     at a relative tolerance, not bit-exactly, and the fixture is
+      //     f32-rounded on the way in so the INPUTS at least are identical.
+      //   · the NEE hash. `hashKey(n)/2^32` rounds on the u32→f32 conversion
+      //     above 2^24, so `u` can differ by ~2e-7 relative and flip a pick that
+      //     lands that close to a CDF boundary. The pick arms therefore compare
+      //     STATISTICS (how often each emitter is drawn) and the identity arm
+      //     compares the estimator's VALUE, which is invariant to which emitter
+      //     was drawn — that invariance is the whole point of the identity.
+      //
+      // ══ THE ARMS ════════════════════════════════════════════════════════
+      //
+      //   mirror     GPU vs CPU radiance at every fixture hit, unshadowed.
+      //   shadowed   the same, with a visibility that occludes half the set.
+      //   faceward   §12.26.4 — reversing every record normal shades identically.
+      //   clamp      R4's ceiling SCALES; a saturated colour keeps its hue.
+      //   emitflag   R5 — a NEE-sampled emitter contributes no emission on
+      //              contact, and an unflagged one does.
+      //   neeexact   §12.26.5 — with importance = contribution, one sample IS
+      //              the sum, in LUMINANCE. Checked on the GPU's own numbers.
+      //   floor      §12.26.6 — a zero-ranked contributor is floored, counted,
+      //              and its energy survives.
+      //   maxT       §12.26.3 — the shadow ray does not hit the light it aims
+      //              at, and an occluder inside the lift is stepped over.
+      //   stats      the shade tallies are wired and agree with the mirror's.
+      //
+      // Run: node scripts/run-gi-src-shade-test.mjs
+      const out = document.querySelector("#log");
+      const say = (line) => { out.textContent += line + "\n"; };
+      let failures = 0;
+      let checks = 0;
+      const check = (label, ok, detail = "") => {
+        checks++;
+        say(`  ${ok ? "PASS" : "FAIL"} ${label}${detail ? ` — ${detail}` : ""}`);
+        if (!ok) failures++;
+      };
+      const fail = (error) => {
+        console.error("SRC-SHADE FAIL", error?.stack ?? error?.message ?? String(error));
+        globalThis.__SRC_SHADE_RESULT__ = {
+          pass: false, error: error?.message ?? String(error), text: out.textContent,
+        };
+      };
+      globalThis.addEventListener("error", (event) => fail(event.error ?? event.message));
+      globalThis.addEventListener("unhandledrejection", (event) => fail(event.reason));
+
+      try {
+        const THREE = await import("three/webgpu");
+        const TSL = await import("three/tsl");
+        const ref = await import("/src/modules/gi/srcRef.js");
+        const shapes = await import("/src/modules/gi/emitterShapes.js");
+        const S = await import("/src/modules/gi/srcShade.js");
+        const T = await import("/src/modules/gi/srcTrace.js");
+        const cfg = await import("/src/modules/gi/srcConfig.js");
+
+        const { Fn, float, instanceIndex, instancedArray, select, uniform, vec3, vec4 } = TSL;
+
+        const renderer = new THREE.WebGPURenderer({ canvas: document.querySelector("#view") });
+        await renderer.init();
+        const device = renderer.backend.device;
+        const validationErrors = [];
+        device.addEventListener?.("uncapturederror", (event) => {
+          validationErrors.push(event.error?.message ?? String(event.error));
+          console.error("WebGPU validation error:", validationErrors.at(-1));
+        });
+
+        // mulberry32 — the harness PRNG standard in this repo. Never Math.random.
+        const makeRng = (seed) => {
+          let s = seed >>> 0;
+          return () => {
+            s = (s + 0x6d2b79f5) >>> 0;
+            let t = s;
+            t = Math.imul(t ^ (t >>> 15), t | 1);
+            t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+            return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+          };
+        };
+        const q32 = new Float32Array(1);
+        const f32 = (v) => { q32[0] = v; return q32[0]; };
+        const f32v = (v) => v.map(f32);
+        const luma = (c) => 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+        const relErr = (a, b) => {
+          const scale = Math.max(Math.abs(a), Math.abs(b), 1e-6);
+          return Math.abs(a - b) / scale;
+        };
+        /** Per-hit relative spread of one estimator against another, in luminance. */
+        const rms = (vals, refVals) => {
+          const errs = PLAIN_IDX.map((i) => relErr(luma(vals[i]), luma(refVals[i])));
+          return Math.sqrt(errs.reduce((a, e) => a + e * e, 0) / errs.length);
+        };
+
+        // ── THE FIXTURE ────────────────────────────────────────────────────
+        //
+        // Hits scattered over a 4 m box's faces, with normals pointing INTO the
+        // room and — for a third of them — deliberately reversed, so the
+        // face-forward arm has something to flip. Albedo spans past the R4
+        // ceiling on purpose; two hits are flagged as NEE emitters.
+        const VOXEL = 0.2;
+        const HITS = [];
+        {
+          const rng = makeRng(0x51ade);
+          const faces = [
+            [[0, 1, 0], (u, v) => [u, -2, v]],
+            [[0, -1, 0], (u, v) => [u, 2, v]],
+            [[1, 0, 0], (u, v) => [-2, u, v]],
+            [[-1, 0, 0], (u, v) => [2, u, v]],
+            [[0, 0, 1], (u, v) => [u, v, -2]],
+            [[0, 0, -1], (u, v) => [u, v, 2]],
+          ];
+          for (let i = 0; i < 96; i++) {
+            const f = faces[i % faces.length];
+            const u = (rng() - 0.5) * 3.2;
+            const v = (rng() - 0.5) * 3.2;
+            // Every third normal arrives REVERSED — a record normal is aligned
+            // to the occupancy gradient and knows nothing about which side a ray
+            // came from, which is exactly the §12.26.4 case.
+            const flip = i % 3 === 0 ? -1 : 1;
+            HITS.push({
+              position: f32v(f[1](u, v)),
+              normal: f32v(f[0].map((c) => c * flip)),
+              albedo: f32v([0.2 + rng() * 0.9, 0.2 + rng() * 0.9, 0.2 + rng() * 0.9]),
+              emissive: i % 11 === 0 ? f32v([rng() * 2, rng() * 2, rng() * 2]) : [0, 0, 0],
+              // Two hits land ON a NEE emitter. R5 zeroes their emission.
+              emitter: i % 11 === 0 && i % 22 === 0 ? 1 : -1,
+            });
+          }
+          // The ray each hit was reached by.
+          //
+          // ⚠ `dot(normal, dir) == 0` IS THE ONE INPUT THE FLIP CANNOT ANSWER,
+          // and the first version of this fixture generated it. `faceForward`
+          // tests `dot > 0`, so at exactly grazing incidence n and −n return
+          // themselves — the flip is a no-op on BOTH, and the "reversed normals
+          // shade identically" arm reads 100% error on a shader that is correct.
+          // Measure zero in a real trace, unmissable in a fixture built from
+          // trig on face-aligned normals. Every ray here arrives at a
+          // well-defined side, and the gate asserts that it does.
+          for (const [i, h] of HITS.entries()) {
+            const d = f32v([Math.cos(i * 0.7) + 0.31, Math.sin(i * 1.3) - 0.27, Math.cos(i * 2.1) + 0.19]);
+            const len = Math.hypot(...d);
+            h.dir = f32v(d.map((c) => c / len));
+          }
+        }
+        // Hits with no emission of their own: where the NEE estimator IS the
+        // whole signal, so an arm about the estimator can be read cleanly.
+        const PLAIN_IDX = HITS.map((h, i) => (luma(h.emissive) > 0 ? -1 : i)).filter((i) => i >= 0);
+        // A grey albedo, for every arm whose subject is the ESTIMATOR. `ρ ⊙ E`
+        // with a coloured ρ re-weights the channels before luminance is taken,
+        // so a one-sample identity that is exact in irradiance reads ~31% off in
+        // reflected radiance — measured below, and a confound in any arm that is
+        // not about colour.
+        const GREY = [1, 1, 1];
+        {
+          say("── THE FIXTURE ──");
+          const grazing = HITS.map((h) => Math.abs(h.normal.reduce((a, c, k) => a + c * h.dir[k], 0)));
+          // The bar is about f32 SIGN determinacy, not about steep incidence:
+          // `faceForward` tests `dot > 0`, so all that is required is that no
+          // dot sits within rounding distance of zero (f32 eps ~1.2e-7). 1e-4 is
+          // three orders clear of that and still catches a fixture built from
+          // face-aligned normals and trig, which produces exact zeros.
+          check("no fixture ray arrives exactly along a surface — the flip is well-defined everywhere",
+            Math.min(...grazing) > 1e-4, `min |n·d| = ${Math.min(...grazing).toExponential(2)} (f32 eps 1.2e-7)`);
+        }
+        const N_HITS = HITS.length;
+
+        // Three sphere emitters. `kind` is a plain JS 0 so `emitterSlotFactor`
+        // takes its sphere path — `refSphereFactor` is that path's exact CPU
+        // twin, which is what lets the two sides be compared at all.
+        const EMITTERS = [
+          { center: [0, 1.6, 0], radius: 0.35, color: [8, 6.4, 4.8] },
+          { center: [-1.4, 0.2, 1.1], radius: 0.22, color: [1.2, 6.0, 2.0] },
+          { center: [1.5, -1.0, -1.3], radius: 0.5, color: [5.0, 1.0, 1.4] },
+        ].map((e) => ({ ...e, center: f32v(e.center), color: f32v(e.color), radius: f32(e.radius) }));
+        const SUN = {
+          direction: f32v([0.36, 0.87, 0.33].map((c) => c / Math.hypot(0.36, 0.87, 0.33))),
+          irradiance: f32v([3.1, 2.85, 2.4]),
+        };
+        // `createSrcHitShader`'s own margin, and the mirror has to use the same
+        // one or the two sides aim their shadow rays at different points.
+        const MARGIN = f32(VOXEL * 0.5);
+
+        // ── THE GPU SIDE ───────────────────────────────────────────────────
+        // stride 4 vec4: [pos, emitter][normal, 0][albedo, 0][emissive, 0]
+        const attrs = new Float32Array(N_HITS * 16);
+        HITS.forEach((h, i) => {
+          const b = i * 16;
+          attrs.set([...h.position, h.emitter], b);
+          attrs.set([...h.normal, 0], b + 4);
+          attrs.set([...h.albedo, 0], b + 8);
+          attrs.set([...h.emissive, 0], b + 12);
+        });
+        const surfBuf = instancedArray(attrs, "vec4");
+        const dirBuf = instancedArray(
+          new Float32Array(HITS.flatMap((h) => [...h.dir, 0])), "vec4",
+        );
+
+        const emitterSlots = EMITTERS.map((e) => ({
+          kind: 0,
+          center: uniform(new THREE.Vector3(...e.center)),
+          radius: uniform(e.radius),
+          color: uniform(new THREE.Color(...e.color)),
+        }));
+        const sunSlot = {
+          direction: uniform(new THREE.Vector3(...SUN.direction)),
+          irradiance: uniform(new THREE.Color(...SUN.irradiance)),
+        };
+
+        /** Reads the fixture surface for the hit this invocation is shading. */
+        const gpuSurfaceAt = (i) => () => {
+          const b = i.mul(4);
+          const s0 = surfBuf.element(b).toVar();
+          return {
+            position: s0.xyz,
+            emitter: s0.w,
+            normal: surfBuf.element(b.add(1)).xyz,
+            albedo: surfBuf.element(b.add(2)).xyz,
+            emissive: surfBuf.element(b.add(3)).xyz,
+            valid: float(1),
+          };
+        };
+
+        /**
+         * Run the shader over the whole fixture and read the radiance back.
+         * `visibility` and the shader options are the arm's to choose.
+         */
+        const runGpu = async (options = {}, { normalSign = 1, albedo = null, unflag = false } = {}) => {
+          const dst = instancedArray(new Float32Array(N_HITS * 4), "vec4");
+          const kernel = Fn(() => {
+            const i = instanceIndex.toVar();
+            const base = gpuSurfaceAt(i);
+            const surfaceAt = () => {
+              const s = base();
+              return {
+                ...s,
+                normal: normalSign < 0 ? vec3(s.normal).negate() : s.normal,
+                ...(albedo ? { albedo: vec3(...albedo) } : {}),
+                ...(unflag ? { emitter: float(-1) } : {}),
+              };
+            };
+            const shade = S.createSrcHitShader({
+              surfaceAt,
+              sun: sunSlot,
+              emitters: emitterSlots,
+              voxelSize: VOXEL,
+              ...options,
+            });
+            const dir = dirBuf.element(i).xyz;
+            // The ray index IS the fixture index: a pure function of a u32,
+            // bit-identical to what the mirror is handed.
+            dst.element(i).assign(vec4(shade({}, dir, i), 1));
+          })().compute(N_HITS);
+          await renderer.computeAsync(kernel);
+          const raw = new Float32Array((await renderer.getArrayBufferAsync(dst.value)).slice(0, N_HITS * 16));
+          return Array.from({ length: N_HITS }, (_, i) => [raw[i * 4], raw[i * 4 + 1], raw[i * 4 + 2]]);
+        };
+
+        // ── THE CPU MIRROR ─────────────────────────────────────────────────
+        const cpuEmitters = EMITTERS.map((e) => ({
+          irradianceAt: (P, n) => {
+            const f = shapes.refSphereAt(P, n, e.center, e.radius);
+            return [e.color[0] * f, e.color[1] * f, e.color[2] * f];
+          },
+          // The point the shadow ray stops at: the emitter's own surface, less
+          // the same margin `createSrcHitShader` subtracts. `emitterSurfaceT`
+          // for a sphere is `dist − radius`, so this is its exact twin.
+          sampleTarget: (P) => {
+            const d = [e.center[0] - P[0], e.center[1] - P[1], e.center[2] - P[2]];
+            const dist = Math.max(Math.hypot(...d), 1e-3);
+            const t = Math.max(dist - e.radius - MARGIN, 0);
+            return [P[0] + (d[0] / dist) * t, P[1] + (d[1] / dist) * t, P[2] + (d[2] / dist) * t];
+          },
+        }));
+        const cpuShade = (options = {}, { normalSign = 1, albedo = null, unflag = false } = {}) => {
+          const shade = ref.makeHitShader({
+            surfaceAt: (hit) => {
+              const h = HITS[hit.index];
+              return {
+                position: h.position,
+                normal: normalSign < 0 ? h.normal.map((c) => -c) : h.normal,
+                albedo: albedo ?? h.albedo,
+                emissive: h.emissive,
+                emitter: unflag ? -1 : h.emitter,
+              };
+            },
+            sun: SUN,
+            emitters: cpuEmitters,
+            ...options,
+          });
+          const values = HITS.map((h, i) => shade({ index: i }, h.dir, i));
+          return { values, stats: shade.stats };
+        };
+
+        const compare = (label, gpu, cpu, tol) => {
+          let worst = 0;
+          let worstAt = -1;
+          for (let i = 0; i < N_HITS; i++) {
+            for (let k = 0; k < 3; k++) {
+              const e = relErr(gpu[i][k], cpu[i][k]);
+              if (e > worst) { worst = e; worstAt = i; }
+            }
+          }
+          check(label, worst <= tol, `worst ${(worst * 100).toFixed(4)}% at hit ${worstAt} (bar ${(tol * 100).toFixed(2)}%)`);
+          return worst;
+        };
+
+        // ══ ARM: mirror — unshadowed ════════════════════════════════════════
+        say("\n── THE MIRROR: the same function on both sides ──");
+        const gpuPlain = await runGpu({ visibility: null });
+        const cpuPlain = cpuShade({ visibility: null });
+        compare("GPU hit shading matches the CPU reference, unshadowed", gpuPlain, cpuPlain.values, 2e-4);
+        check(
+          "the fixture is not trivially zero — something is actually being shaded",
+          cpuPlain.values.filter((v) => luma(v) > 1e-6).length > N_HITS * 0.7,
+          `${cpuPlain.values.filter((v) => luma(v) > 1e-6).length}/${N_HITS} hits carry light ` +
+          `(the rest face away from every source, which is the correct answer and not a dead arm)`,
+        );
+
+        // ══ ARM: shadowed ═══════════════════════════════════════════════════
+        //
+        // A visibility keyed on the SIGN of the light direction's y. A sign is
+        // robust to the last ulp in a way a hash of a float is not, and the
+        // fixture keeps every |dirTo.y| well clear of zero.
+        const gpuVis = (P, n, l) => select(vec3(l).y.greaterThan(0), float(1), float(0));
+        const cpuVis = (P, n, l) => (l[1] > 0 ? 1 : 0);
+        const gpuShadowed = await runGpu({ visibility: gpuVis });
+        const cpuShadowed = cpuShade({ visibility: cpuVis });
+        compare("and with half the sources occluded", gpuShadowed, cpuShadowed.values, 2e-4);
+        check(
+          "the occlusion actually removed light (the arm has a subject)",
+          cpuShadowed.values.reduce((a, v) => a + luma(v), 0) < cpuPlain.values.reduce((a, v) => a + luma(v), 0) * 0.95,
+          `${cpuShadowed.values.reduce((a, v) => a + luma(v), 0).toFixed(3)} vs unshadowed ${cpuPlain.values.reduce((a, v) => a + luma(v), 0).toFixed(3)}`,
+        );
+
+        // ══ ARM: faceward — §12.26.4 ════════════════════════════════════════
+        say("\n── THE FACE-FORWARD FLIP: at the hit, and only the sign ──");
+        const gpuFlipped = await runGpu({ visibility: null }, { normalSign: -1 });
+        compare("a scene whose record normals all point the other way shades identically",
+          gpuFlipped, gpuPlain, 1e-6);
+        {
+          // The flip only ever changes the SIGN — never the magnitude, never a
+          // substitution. 2,000 random pairs, on the GPU's own arithmetic.
+          const rng = makeRng(0xfacef);
+          const pairs = Array.from({ length: 2000 }, () => {
+            const n = f32v([rng() * 2 - 1, rng() * 2 - 1, rng() * 2 - 1]);
+            const d = f32v([rng() * 2 - 1, rng() * 2 - 1, rng() * 2 - 1]);
+            return [...n, 0, ...d, 0];
+          }).flat();
+          const src = instancedArray(new Float32Array(pairs), "vec4");
+          const dst = instancedArray(new Float32Array(2000 * 4), "vec4");
+          const kernel = Fn(() => {
+            const i = instanceIndex.toVar();
+            const n = src.element(i.mul(2)).xyz;
+            const d = src.element(i.mul(2).add(1)).xyz;
+            dst.element(i).assign(vec4(S.faceForward(n, d), 1));
+          })().compute(2000);
+          await renderer.computeAsync(kernel);
+          const raw = new Float32Array((await renderer.getArrayBufferAsync(dst.value)).slice(0, 2000 * 16));
+          let signOnly = true;
+          let opposes = true;
+          for (let i = 0; i < 2000; i++) {
+            const n = [pairs[i * 8], pairs[i * 8 + 1], pairs[i * 8 + 2]];
+            const d = [pairs[i * 8 + 4], pairs[i * 8 + 5], pairs[i * 8 + 6]];
+            const o = [raw[i * 4], raw[i * 4 + 1], raw[i * 4 + 2]];
+            for (let k = 0; k < 3; k++) if (Math.abs(Math.abs(o[k]) - Math.abs(n[k])) > 1e-6) signOnly = false;
+            if (o[0] * d[0] + o[1] * d[1] + o[2] * d[2] > 1e-6) opposes = false;
+          }
+          check("faceForward changes only the SIGN, over 2,000 random pairs", signOnly);
+          check("and the result always opposes the ray", opposes);
+        }
+
+        // ══ ARM: clamp — R4 scales, it does not clip ════════════════════════
+        say("\n── R4's CEILING: scaled, so the colour survives ──");
+        {
+          const dst = instancedArray(new Float32Array(4 * 4), "vec4");
+          const cases = [[1.0, 0.95, 0.90], [0.5, 0.4, 0.3], [2.0, 0.2, 0.2], [0.9, 0.9, 0.9]];
+          const src = instancedArray(new Float32Array(cases.flatMap((c) => [...c, 0])), "vec4");
+          const kernel = Fn(() => {
+            const i = instanceIndex.toVar();
+            dst.element(i).assign(vec4(S.clampLoopAlbedo(src.element(i).xyz).albedo, 1));
+          })().compute(4);
+          await renderer.computeAsync(kernel);
+          const raw = new Float32Array((await renderer.getArrayBufferAsync(dst.value)).slice(0, 64));
+          const chroma = (c) => { const s = c[0] + c[1] + c[2]; return s > 0 ? c.map((v) => v / s) : c; };
+          let worstShift = 0;
+          let bounded = true;
+          let untouched = true;
+          cases.forEach((c, i) => {
+            const o = [raw[i * 4], raw[i * 4 + 1], raw[i * 4 + 2]];
+            const cpu = ref.clampLoopAlbedo(c);
+            const a = chroma(c);
+            const b = chroma(o);
+            worstShift = Math.max(worstShift, ...a.map((v, k) => Math.abs(v - b[k])));
+            if (Math.max(...o) > cfg.MAX_LOOP_ALBEDO + 1e-5) bounded = false;
+            if (Math.max(...c) <= cfg.MAX_LOOP_ALBEDO) {
+              for (let k = 0; k < 3; k++) if (Math.abs(o[k] - c[k]) > 1e-6) untouched = false;
+            }
+            for (let k = 0; k < 3; k++) if (relErr(o[k], cpu[k]) > 1e-5) bounded = bounded && false;
+          });
+          check("every clamped albedo is bounded by MAX_LOOP_ALBEDO and matches the mirror", bounded);
+          check("and an albedo at or below the ceiling is returned untouched", untouched);
+          // A per-channel min() shifts a warm white's chromaticity by 1.75e-2;
+          // scaling shifts it by 5.6e-17. Anything near the former is a clip.
+          check("the clamp SCALES — chromaticity survives", worstShift < 1e-6,
+            `worst chromaticity shift ${worstShift.toExponential(2)} (a per-channel clip gives 1.75e-2)`);
+        }
+
+        // ══ ARM: emitflag — R5 ══════════════════════════════════════════════
+        say("\n── R5: two representations of one light, and only one of them delivers ──");
+        {
+          const flagged = HITS.filter((h) => h.emitter >= 0 && luma(h.emissive) > 0);
+          const unflagged = HITS.filter((h) => h.emitter < 0 && luma(h.emissive) > 0);
+          check("the fixture HAS both kinds of emissive hit (else the arm cannot fail)",
+            flagged.length > 0 && unflagged.length > 0,
+            `${flagged.length} flagged, ${unflagged.length} unflagged`);
+
+          // THE ONLY HONEST FORM OF THIS ARM IS A DIFFERENCE. The first version
+          // asserted `radiance < emissive` for a flagged hit, which is a claim
+          // about the ALBEDO (a bright enough bounce beats a dim emission) and
+          // not about the flag at all. Change one thing — the flag — and the
+          // difference must be exactly the emission that was withheld.
+          const flagOn = cpuShade({ visibility: null });
+          const flagOff = cpuShade({ visibility: null }, { unflag: true });
+          let worstWithheld = 0;
+          let worstUntouched = 0;
+          HITS.forEach((h, i) => {
+            const d = [0, 1, 2].map((k) => flagOff.values[i][k] - flagOn.values[i][k]);
+            const expect = h.emitter >= 0 ? h.emissive : [0, 0, 0];
+            const e = Math.max(...[0, 1, 2].map((k) => relErr(d[k], expect[k])));
+            if (h.emitter >= 0) worstWithheld = Math.max(worstWithheld, e);
+            else worstUntouched = Math.max(worstUntouched, e);
+          });
+          check("a NEE-sampled emitter withholds EXACTLY its own emission, and nothing else",
+            worstWithheld < 1e-9, `worst ${worstWithheld.toExponential(2)}`);
+          check("and an unflagged surface is untouched by the flag",
+            worstUntouched < 1e-9, `worst ${worstUntouched.toExponential(2)}`);
+
+          // §12.26.7's energy statistic: the double count is 2.60x on the MEAN
+          // over a region, and a single gather point read 1.00x while it was
+          // happening. So this is a mean, not a sample.
+          const meanOn = flagOn.values.reduce((a, v) => a + luma(v), 0) / N_HITS;
+          const meanOff = flagOff.values.reduce((a, v) => a + luma(v), 0) / N_HITS;
+          check("the double count is visible in the MEAN (an energy claim wants an energy statistic)",
+            meanOff > meanOn * 1.02, `${meanOff.toFixed(4)} unflagged vs ${meanOn.toFixed(4)} flagged (${(meanOff / meanOn).toFixed(3)}x)`);
+
+          // And the GPU withholds the same emission on the same hits.
+          const gpuUnflag = await runGpu({ visibility: null }, { unflag: true });
+          compare("and the GPU agrees, flag off", gpuUnflag, flagOff.values, 2e-4);
+        }
+
+        // ══ ARM: neeexact — §12.26.5 ════════════════════════════════════════
+        say("\n── ONE-SAMPLE NEE IS EXACT IN LUMINANCE, AND ONLY IN LUMINANCE ──");
+        {
+          // Sun off, emission off, no shadows: what is left is the estimator.
+          //
+          // ⚠ AND A **GREY** ALBEDO, WHICH IS THE WHOLE POINT OF THIS ARM'S
+          // FIRST FAILURE. The identity is exact in the luminance of the
+          // IRRADIANCE. Reflected radiance is `ρ ⊙ E`, and a COLOURED ρ
+          // re-weights the three channels before the luminance is taken — so
+          // the per-channel spread §12.26.5 measured at 740% leaks straight into
+          // the luminance and the identity reads 31% off on a shader that is
+          // exactly right. The mirror measured the identity on
+          // `emitterIrradianceNee`'s output directly and never met this.
+          //
+          // It is not a technicality: what reaches the screen IS the reflected
+          // radiance, so one-sample NEE is exact in luminance for a grey surface
+          // and NOT for a coloured one. "Compare estimators in the quantity they
+          // estimate" is why this fixture goes grey rather than why the bar goes
+          // up.
+          const rhoGrey = ref.clampLoopAlbedo(GREY);
+          const exact = HITS.map((h) => {
+            const n = ref.faceForward(h.normal, h.dir);
+            const E = [0, 0, 0];
+            for (const e of cpuEmitters) {
+              const v = e.irradianceAt(h.position, n);
+              E[0] += v[0]; E[1] += v[1]; E[2] += v[2];
+            }
+            return [0, 1, 2].map((k) => rhoGrey[k] * E[k] / Math.PI);
+          });
+          const estimate = await runGpu(
+            { visibility: null, sun: null, neeSamples: 1 },
+            { albedo: GREY },
+          );
+          const plain = PLAIN_IDX;
+          let worstL = 0;
+          let worstC = 0;
+          for (const i of plain) {
+            worstL = Math.max(worstL, relErr(luma(estimate[i]), luma(exact[i])));
+            for (let k = 0; k < 3; k++) worstC = Math.max(worstC, relErr(estimate[i][k], exact[i][k]));
+          }
+          check("one NEE sample IS the exact sum, in luminance, on a grey surface", worstL < 5e-4,
+            `worst ${(worstL * 100).toFixed(4)}% over ${plain.length} hits`);
+          // The finding, asserted as a finding: per channel it is NOT exact, and
+          // the mirror's first version claimed it was (and failed at 7.4x). If
+          // this ever collapses to the luminance number, someone has made the
+          // emitters grey and the arm has stopped measuring anything.
+          check("and it is NOT exact per channel — the pdf is one scalar, the signal is three",
+            worstC > worstL * 10,
+            `per-channel ${(worstC * 100).toFixed(2)}% vs luminance ${(worstL * 100).toFixed(4)}%`);
+
+          // And the corollary that costs real accuracy on screen: put the
+          // fixture's COLOURED albedo back and the luminance identity dies too.
+          const coloured = await runGpu({ visibility: null, sun: null, neeSamples: 1 });
+          const exactC = HITS.map((h, i) => {
+            const rho = ref.clampLoopAlbedo(h.albedo);
+            return [0, 1, 2].map((k) => rho[k] * exact[i][k] * Math.PI / (rhoGrey[k] * Math.PI));
+          });
+          let worstCol = 0;
+          for (const i of plain) worstCol = Math.max(worstCol, relErr(luma(coloured[i]), luma(exactC[i])));
+          check("...and a COLOURED albedo breaks the luminance identity too — ρ re-weights the channels",
+            worstCol > worstL * 100,
+            `coloured ${(worstCol * 100).toFixed(2)}% vs grey ${(worstL * 100).toFixed(4)}%`);
+        }
+
+        // ══ ARM: floor — §12.26.6 ═══════════════════════════════════════════
+        say("\n── THE IMPORTANCE FLOOR: keeps the energy, bounds the firefly, counts itself ──");
+        {
+          // A ranking that gives emitter 0 — a VISIBLE, contributing one — zero
+          // importance. The mirror's first version zero-ranked an OCCLUDED
+          // emitter and passed with the floor doing no work at all: an arm whose
+          // subject contributes zero cannot fail.
+          const contributing = HITS.filter((h) => {
+            const n = ref.faceForward(h.normal, h.dir);
+            return luma(cpuEmitters[0].irradianceAt(h.position, n)) > 0;
+          }).length;
+          check("emitter 0 contributes at a real share of the fixture (the arm has a subject)",
+            contributing > N_HITS * 0.2, `${contributing}/${N_HITS} hits see it`);
+
+          const gpuImportance = (slot, P, n) => (slot === emitterSlots[0]
+            ? float(0)
+            : vec3(slot.color).mul(
+                // The same closed form the estimator ranks on, so only emitter 0
+                // is mis-ranked and everything else keeps the exact pdf.
+                float(shapesFactorGpu(slot, P, n)),
+              ).dot(vec3(0.2126, 0.7152, 0.0722)).max(0));
+          // A tiny GPU twin of refSphereAt, local to this arm.
+          function shapesFactorGpu(slot, P, n) {
+            const toE = vec3(slot.center).sub(P).toVar();
+            const dist = toE.length().max(1e-3).toVar();
+            const cosTheta = toE.div(dist).dot(n).toVar();
+            const sinR = float(slot.radius).div(dist).clamp(0, 1).toVar();
+            const t = cosTheta.add(sinR).div(sinR.mul(2).max(1e-4)).clamp(0, 1);
+            const horizon = sinR.mul(t).mul(t);
+            const factor = select(cosTheta.greaterThanEqual(sinR), cosTheta, horizon);
+            return float(Math.PI).mul(sinR).mul(sinR).mul(factor);
+          }
+          const cpuImportance = (e, P, n) => (e === cpuEmitters[0] ? 0 : luma(e.irradianceAt(P, n)));
+
+          const gpuFloored = await runGpu({ visibility: null, sun: null, importance: gpuImportance });
+          const cpuFloored = cpuShade({ visibility: null, sun: null, importance: cpuImportance });
+          compare("a broken ranking still shades the same on both sides", gpuFloored, cpuFloored.values, 2e-3);
+          check("the floor BOUND — and the counter is what says a ranking is broken",
+            (cpuFloored.stats.importanceFloored ?? 0) > 0,
+            `${cpuFloored.stats.importanceFloored} floored picks over ${N_HITS} hits`);
+          // ══ THE ENERGY SURVIVES — AND THE SAMPLE COUNT THAT SHOWS IT IS
+          //    SET BY THE FLOOR FRACTION ITSELF ═══════════════════════════════
+          //
+          // The first version of this arm compared two ONE-sample estimates over
+          // 96 hits and read 26.1% against a 5% bar. That is not a defect; it is
+          // 96 draws of an estimator whose entire subject is excess variance.
+          // The floor is 1/1024 of the mean importance, so a floored emitter is
+          // picked about once per 1024·contributors draws — an energy claim
+          // about the floor cannot say anything until the sample count reaches
+          // that order. Swept here rather than asserted, because the SHAPE is
+          // the finding and a single number would hide it:
+          const sweep = [64, 256, 1024, 4096, 16384];
+          const gaps = sweep.map((NS) => {
+            const bad = cpuShade({ visibility: null, sun: null, neeSamples: NS, importance: cpuImportance }, { albedo: GREY });
+            const good = cpuShade({ visibility: null, sun: null, neeSamples: NS }, { albedo: GREY });
+            const eA = bad.values.reduce((a, v) => a + luma(v), 0);
+            const eB = good.values.reduce((a, v) => a + luma(v), 0);
+            return { NS, gap: relErr(eA, eB), rms: rms(bad.values, good.values), good };
+          });
+          for (const g of gaps) {
+            say(`   ${String(g.NS).padStart(5)} samples/hit: energy gap ${(g.gap * 100).toFixed(2).padStart(6)}%  rms per-hit ${(g.rms * 100).toFixed(2)}%`);
+          }
+          check("the energy survives a broken ranking, once the sample count reaches the floor's own scale",
+            gaps.at(-1).gap < 0.02,
+            `${(gaps.at(-1).gap * 100).toFixed(2)}% at ${gaps.at(-1).NS} samples/hit`);
+          check("and it does NOT at 64 — an energy claim below 1/floorFraction measures its own noise",
+            gaps[0].gap > 0.2,
+            `${(gaps[0].gap * 100).toFixed(2)}% at 64 (this arm is why the bar is a sweep and not a number)`);
+          // ── AND WHAT IT COSTS, STATED IN THE ONLY WAY THAT LANDS ──────────
+          //
+          // The correct ranking is EXACT at one sample — that is the
+          // zero-variance property, and it is what the exact-contribution
+          // importance buys. The broken one is still 3.6% off per hit at 16,384.
+          // §12.26.6 priced the same thing as 37x the standard error; this is
+          // that number in the units a sample budget is actually spent in.
+          //
+          // The first version asserted `rms > 5%` at the HIGHEST sample count,
+          // which is backwards — variance is exactly the thing samples buy down.
+          // What does not change with the budget is the RATIO.
+          // The control, and it must not be vacuous: the CORRECT ranking's own
+          // spread between 1 sample and 16,384. Exact means those are the same
+          // numbers — which is the zero-variance property, measured rather than
+          // restated.
+          const goodOne = cpuShade({ visibility: null, sun: null, neeSamples: 1 }, { albedo: GREY });
+          const rmsGood = rms(goodOne.values, gaps.at(-1).good.values);
+          check("but the variance stays — the correct ranking is exact at ONE sample, the broken one is not at 16,384",
+            gaps.at(-1).rms > 0.01 && rmsGood < 1e-9,
+            `rms per-hit ${(gaps.at(-1).rms * 100).toFixed(2)}% at ${gaps.at(-1).NS} samples vs a correct ranking's ${rmsGood.toExponential(1)}`);
+        }
+
+        // ══ ARM: maxT — §12.26.3 ════════════════════════════════════════════
+        say("\n── THE SHADOW LIFT MOVES maxT: the bug that lost 100% of the emitter term ──");
+        {
+          // A fake medium. `pickOccTrace` falls through to `traceOccupancy` when
+          // there is no `traceHybridPlane`, so this is the whole field: an
+          // occluder at world distance `occAt` FROM THE RAY'S OWN ORIGIN, which
+          // is what a real DDA reports too.
+          const occAt = uniform(0);
+          const fakeField = {
+            traceOccupancy: (o, d, t0, t1) => {
+              const t = float(occAt).toVar();
+              const hit = t.greaterThanEqual(float(t0)).and(t.lessThan(float(t1)));
+              return { hit: select(hit, float(1), float(0)), t, normal: vec3(0, 1, 0), voxel: vec3(0) };
+            },
+          };
+          const world = { minCell: uniform(VOXEL), size: uniform(new THREE.Vector3(8, 8, 8)) };
+          const vis = T.createSrcVisibility(fakeField, world);
+          const LIFT = VOXEL * 0.75;
+
+          const probe = async (distances, maxTOf) => {
+            const dst = instancedArray(new Float32Array(distances.length * 4), "vec4");
+            const results = [];
+            for (const [k, dWorld] of distances.entries()) {
+              occAt.value = dWorld;
+              const kernel = Fn(() => {
+                const P = vec3(0, 0, 0);
+                const n = vec3(0, 1, 0);
+                const l = vec3(0, 1, 0);
+                dst.element(0).assign(vec4(vis(P, n, l, maxTOf), 0, 0, 1));
+              })().compute(1);
+              await renderer.computeAsync(kernel);
+              const raw = new Float32Array((await renderer.getArrayBufferAsync(dst.value)).slice(0, 16));
+              results.push(raw[0]);
+            }
+            return results;
+          };
+
+          // THE BUG. The emitter's surface sits at `maxT` from the SURFACE
+          // point; measured from the lifted origin it is `maxT − LIFT`. With the
+          // budget uncorrected the trace would look all the way to `maxT` from
+          // the lifted origin — past the light — and report it as an occluder.
+          const LIGHT_T = 3.0;
+          const atLight = await probe([LIGHT_T - LIFT], LIGHT_T);
+          check("the shadow ray does NOT hit the light it is aiming at",
+            atLight[0] === 1,
+            `visibility ${atLight[0]} for an emitter surface at t=${LIGHT_T} (uncorrected: 0, and every light in the scene goes black)`);
+          // Just inside the light: a real occluder standing in front of it.
+          const justInside = await probe([LIGHT_T - LIFT - 0.05], LIGHT_T);
+          check("but an occluder just short of the light still shadows",
+            justInside[0] === 0,
+            `visibility ${justInside[0]} — the budget is shortened, not removed`);
+
+          // ══ THE LIFT'S OTHER CONSEQUENCE, AND IT FOUND A DOUBLED BIAS ═════
+          //
+          // An occluder closer to the surface than the shadow ray's bias is
+          // stepped over and its contact shadow is lost. §12.26.3 swept that in
+          // the mirror and found the threshold landing exactly on the 0.75-voxel
+          // lift. On the GPU it landed at 0.30 m — TWICE the lift — because
+          // `createSrcVisibility` moved the origin 0.75 voxels along the normal
+          // AND started the march at `t0 = lift` along the ray. Two biases, one
+          // of them undocumented, and every comment in the file claimed 0.75.
+          //
+          // The along-ray term is not redundant (a grazing ray from a lifted
+          // origin can still sit inside the surface's own voxel — 0.75 along a
+          // body diagonal is only 0.43 per axis), so it stays, as the SAME
+          // quarter-cell self-bias the primary trace uses. The threshold is
+          // therefore the SUM, and this arm asserts the sum rather than a
+          // literal, because a threshold written down twice is one that drifts.
+          const THRESHOLD = VOXEL * (T.SHADOW_LIFT_CELLS + T.SHADOW_SELF_BIAS_CELLS);
+          const heights = [0.02, 0.10, 0.18, 0.19, 0.22, 0.35];
+          // The DDA reports from the ray's origin, so an occluder `x` above the
+          // surface is at `x − LIFT` along this ray.
+          const swept = await probe(heights.map((x) => x - LIFT), LIGHT_T);
+          const lit = heights.filter((_, i) => swept[i] === 1);
+          const dark = heights.filter((_, i) => swept[i] === 0);
+          check("an occluder inside the shadow bias loses its contact shadow, at exactly lift + self-bias",
+            lit.every((x) => x < THRESHOLD) && dark.every((x) => x >= THRESHOLD),
+            `threshold ${THRESHOLD.toFixed(3)}m = ${T.SHADOW_LIFT_CELLS}+${T.SHADOW_SELF_BIAS_CELLS} cells at voxel ${VOXEL} — ` +
+            `lit at ${lit.join("/")}, shadowed at ${dark.join("/")}`);
+        }
+
+        // ══ ARM: stats ══════════════════════════════════════════════════════
+        say("\n── THE TALLIES ──");
+        {
+          const s = cpuPlain.stats;
+          check("every fixture hit was shaded", s.shaded === N_HITS, `${s.shaded}/${N_HITS}`);
+          check("the albedo ceiling counted itself", s.albedoClamped > 0,
+            `${s.albedoClamped} hits past MAX_LOOP_ALBEDO — a ceiling that never binds is the evidence for keeping it`);
+          check("R5 zeroed the flagged emitters and passed the rest",
+            s.emissiveZeroed > 0 && s.emissiveHits > 0,
+            `${s.emissiveZeroed} zeroed, ${s.emissiveHits} delivered`);
+          check("no importance floored under the exact pdf (the zero-variance property survives)",
+            (s.importanceFloored ?? 0) === 0, `${s.importanceFloored ?? 0}`);
+        }
+
+        check("no WebGPU validation errors", validationErrors.length === 0, validationErrors.join(" | "));
+        say(`\n${failures ? `gi-src-shade: ${failures} of ${checks} FAILED` : "gi-src-shade: all cases PASS"}`);
+        globalThis.__SRC_SHADE_RESULT__ = {
+          pass: failures === 0, failures, checks, hits: N_HITS,
+          emitters: EMITTERS.length, text: out.textContent,
+        };
+      } catch (error) {
+        fail(error);
+      }
+    </script>
+  </body>
+</html>

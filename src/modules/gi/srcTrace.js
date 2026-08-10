@@ -41,6 +41,19 @@ import { RayHitMode } from "./rayHit/RayHitConfig.js";
 import { MAX_MACRO_STEPS } from "./rayHit/RayHitPacking.js";
 
 /**
+ * The shadow ray's two biases, in OCCUPANCY CELLS, exported because the gate
+ * asserts their SUM rather than a literal — a threshold written down twice is a
+ * threshold that drifts, and this pair already drifted once (see
+ * `createSrcVisibility`).
+ *
+ * `LIFT` moves the origin off the surface along the normal; `SELF_BIAS` starts
+ * the march along the ray, for the grazing case the lift alone does not clear.
+ * Together they are the distance below which a contact shadow is lost.
+ */
+export const SHADOW_LIFT_CELLS = 0.75;
+export const SHADOW_SELF_BIAS_CELLS = 0.25;
+
+/**
  * The one place the ray-hit mode swaps trace implementations. Interval
  * semantics and the return contract are identical across modes.
  *
@@ -178,6 +191,17 @@ export function createSrcSceneTrace(occField, world, {
  * quantization showing through. The value of having the number is that a lost
  * contact shadow becomes recognizable instead of investigable.
  *
+ * ⚠ **THIS FUNCTION USED TO APPLY THAT BIAS TWICE**, and `test:gi-src-shade`'s
+ * sweep is what found it: the origin moved 0.75 voxels along the normal AND the
+ * trace was started at `t0 = lift` along the ray, so the real threshold was
+ * **1.5 voxels**, double what the mirror measured and double what any comment
+ * here claimed. The along-ray term is not redundant — a grazing shadow ray from
+ * a lifted origin can still be inside the surface's own voxel, since 0.75 along
+ * a body-diagonal normal is only 0.43 per axis — but it is not a second lift
+ * either. It is now the SAME self-bias `createSrcSceneTrace` uses, a quarter of
+ * a cell, derived from the same quantity (R2). Threshold: `0.75 + 0.25 = 1.0`
+ * voxel, and the gate asserts exactly that sum rather than a literal.
+ *
  * @param {Node} point    surface point, UNLIFTED
  * @param {Node} normal   surface normal (face-forwarded by the caller)
  * @param {Node} toLight  unit direction toward the source
@@ -194,7 +218,9 @@ export function createSrcVisibility(occField, world, {
   // uniform, so a refit (R11) moves it without a recompile.
   const diagonal = () => vec3(world.size).length();
   return (point, normal, toLight, maxT = null) => {
-    const lift = float(world.minCell).mul(0.75).toVar();
+    const lift = float(world.minCell).mul(SHADOW_LIFT_CELLS).toVar();
+    // Along the ray, and NOT a second lift — see the header.
+    const selfBias = float(world.minCell).mul(SHADOW_SELF_BIAS_CELLS).toVar();
     const p = vec3(point).toVar();
     const l = vec3(toLight).toVar();
     const origin = p.add(vec3(normal).mul(lift)).toVar();
@@ -207,7 +233,7 @@ export function createSrcVisibility(occField, world, {
       : p.add(l.mul(float(maxT))).sub(origin).length()
     ).toVar();
     const v = float(1).toVar();
-    const sh = trace(origin, l, lift, budget, {
+    const sh = trace(origin, l, selfBias, budget, {
       steps,
       macroSteps: MAX_MACRO_STEPS,
       dynamics: false,

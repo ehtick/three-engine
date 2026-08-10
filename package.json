@@ -119,6 +119,7 @@
     "test:gi-emitter-shapes": "node scripts/run-gi-emitter-shapes-test.mjs",
     "smoke:gi-gpu": "node scripts/run-gi-gpu-smoke.mjs",
     "test:gi-src-ref": "node scripts/run-gi-src-ref-test.mjs",
+    "test:gi-src-shade": "node scripts/run-gi-src-shade-test.mjs",
     "test:gi-src-math": "node scripts/run-gi-src-math-test.mjs",
     "test:gi-src-probes": "node scripts/run-gi-src-probes-test.mjs",
     "test:gi-src-populate": "node scripts/run-gi-src-populate-test.mjs",

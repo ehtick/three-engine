@@ -84,15 +84,21 @@
 // instrument that decision needs. A clamp that never fires is the evidence for
 // keeping it.
 //
-// ══ WHAT SHADES A HIT — NOTHING, YET, AND THAT IS THE PLAN ══════════════════
+// ══ WHAT SHADES A HIT — `srcShade.js`, AND STILL NOTHING BY DEFAULT ═════════
 //
-// `shadeHit` defaults to black. Full hit shading (light-tree NEE, sun shadow
-// rays at hits, mover surfaces, the secondary cache) is **Phase 5**, and §7
-// describes Phase 2's look as "AO-like short-range bounce" for exactly this
-// reason: with no hit radiance, what survives the resolve is TRANSMITTANCE, and
-// a receiver lit by transmittance alone against the sky is ambient occlusion.
-// That is not a placeholder standing in for the real thing — it is the real
-// thing with one term still zero, which is why it is checkable now.
+// `shadeHit` defaults to black, and with it black what survives the resolve is
+// TRANSMITTANCE: a receiver lit by transmittance alone against the sky is
+// ambient occlusion, which is §7's "AO-like short-range bounce" for Phase 2.
+// That was never a placeholder standing in for the real thing — it is the real
+// thing with one term zero, which is why it was checkable before this existed.
+//
+// Phase 5 fills it from `srcShade.js`'s `createSrcHitShader`, whose body is
+// `srcRef.js`'s `makeHitShader` line for line. This file stays agnostic about
+// what a hit is worth: it takes a `vec3` and a ray index, and everything about
+// lights, surfaces, shadow rays and the bounce loop lives on the other side of
+// that call. The one thing it does own is the SHADE TALLIES — see
+// `createSrcShadeCounters`, which exists so the shader needs no binding of its
+// own on the kernel closest to the eight-storage-buffer limit.
 //
 // docs/GI_SRC_REBUILD_PLAN.md §4.2, §12.13.4, §12.13.5 unit 3.
 
@@ -169,8 +175,84 @@ export const STAT_TMAX = 6;
  * whenever the pool is big enough, and the gate asserts it.
  */
 export const STAT_NOBLOCK = 7;
-export const STAT_WORDS = 8;
+
+/**
+ * Hit-shading tallies (Phase 5). Every one of these is an instrument §12.26
+ * asked for by name, and none of them is decoration:
+ *
+ * · `SHADED` / `UNATTRIBUTED` — R1. A hit whose surface could not be identified
+ *   shades at the default albedo with no emission, which is a plausible-looking
+ *   grey. The ratio is the only thing that says how much of the frame that is.
+ * · `SHADOWRAYS` — the cost of the whole phase, in the only unit that matters.
+ * · `EMISSIVE` — hits that delivered their own emission, the ray-hit half of R5's
+ *   handoff.
+ * · `EMIT_ZEROED` — **ZERO IS THE HEALTHY READING, and that is not the sense
+ *   §12.26 wrote it in.** R5's zeroing already happens on the CPU, at bake time:
+ *   `GISystem#slotSurface` and `dynamicObjects`' `writeSurface` both publish a
+ *   promoted emitter's emissive as 0, and that guard is itself a paid-for fix —
+ *   `writeSurface` once published the raw emissive unconditionally, and an
+ *   emissive mesh that was both promoted AND traced delivered its light twice.
+ *   The promotion set IS the NEE set, so the bake zeroes exactly what the
+ *   sampler will deliver, and the hit has nothing left to withhold.
+ *
+ *   The shader keeps its zeroing branch anyway, and this counter is what makes
+ *   that branch worth having: it counts hits that landed on a NEE-flagged
+ *   emitter and STILL carried emission — i.e. surfaces the bake missed. A
+ *   nonzero reading is a bug in the promotion bookkeeping, caught before it
+ *   reaches the image as light delivered twice.
+ *
+ *   **Do not "fix" a zero here by shipping unzeroed emissive to the palette.**
+ *   That moves R5 to a third implementation and makes the flag and the
+ *   promotion set two sources of truth for one fact, which is the crossed-
+ *   numbering shape §12.9 warns any successor about. The handoff's real gate is
+ *   an ENERGY arm (§12.26.7: analytic-on vs analytic-off, mean over a region,
+ *   2.60×), which measures the same property under either design.
+ * · `ALBEDO_CLAMPED` — R4's ceiling, counting itself, exactly as `STAT_CLAMPED`
+ *   does for Lmax. A ceiling that never binds is the evidence for keeping it.
+ * · `IMPORTANCE_FLOORED` — the instrument that says a light ranking is broken.
+ *   The floor keeps the energy and bounds the firefly; it does NOT make a bad
+ *   ranking usable, and this counter is the difference between knowing that and
+ *   shipping 37× the standard error.
+ */
+export const STAT_SHADED = 8;
+export const STAT_UNATTRIBUTED = 9;
+export const STAT_SHADOWRAYS = 10;
+export const STAT_EMISSIVE = 11;
+export const STAT_EMIT_ZEROED = 12;
+export const STAT_ALBEDO_CLAMPED = 13;
+export const STAT_IMPORTANCE_FLOORED = 14;
+export const STAT_WORDS = 15;
 const T_FIXED = 1024;
+
+/**
+ * The `count` object `srcShade.js`'s hit shader increments, bound to a bin
+ * store's stats buffer.
+ *
+ * It exists so `srcShade.js` owns no buffer. The hit shader is CONSTRUCTED by
+ * `srcSystem.js` (it needs the sun, the emitter slots and the visibility closure,
+ * none of which this file knows about) but RUNS inside the deposit kernel, so a
+ * shader that allocated its own atomics would be a ninth storage binding on the
+ * kernel already closest to the portable limit of eight (R7). Instead the words
+ * live in the deposit's existing stats buffer and the shader is handed writers.
+ *
+ * Every method takes a node or a plain number; a `select(cond, 1, 0)` is the
+ * expected idiom for a conditional tally, so nothing here needs a branch.
+ */
+export function createSrcShadeCounters(bins) {
+  const { stats } = bins;
+  const bump = (word) => (amount) => {
+    atomicAdd(stats.element(uint(word)), uint(amount));
+  };
+  return {
+    shaded: bump(STAT_SHADED),
+    unattributed: bump(STAT_UNATTRIBUTED),
+    shadowRays: bump(STAT_SHADOWRAYS),
+    emissiveHits: bump(STAT_EMISSIVE),
+    emissiveZeroed: bump(STAT_EMIT_ZEROED),
+    albedoClamped: bump(STAT_ALBEDO_CLAMPED),
+    importanceFloored: bump(STAT_IMPORTANCE_FLOORED),
+  };
+}
 
 /**
  * The bin accumulators and the resolved payload, sized from a probe store's
@@ -263,8 +345,12 @@ export function createSrcBinStore(store, { w0 = W0, maxBytes = 128 * 1024 * 1024
  * @param {object} options.pixelProbe    per-pixel c0 probe index
  * @param {object} options.pixelRayBase  Alg. 3's per-pixel ray base
  * @param {(o, d, tMax) => object} options.trace  from `createSrcSceneTrace`
- * @param {(hit, dir) => object} [options.shadeHit]  vec3 radiance at a hit.
- *   Phase 5. Default black — see the header.
+ * @param {(hit, dir, rayIndex) => object} [options.shadeHit]  vec3 radiance at a
+ *   hit, from `srcShade.js`'s `createSrcHitShader`. Default black — see the
+ *   header. `rayIndex` is `n`, the ray's place in the global R2 sequence, and
+ *   the shader needs it for the same reason the gate's synthetic trace does: a
+ *   pure function of a u32 is bit-identical across a boundary where an RNG state
+ *   is not.
  * @param {object} options.lmax  uniform: the radiance the fixed point saturates at
  * @param {Node} [options.keep]  the temporal blend's `1 − α`, applied to every
  *   accumulator before this frame's deposits land. Default 0, which is the
