@@ -4694,6 +4694,135 @@ Logged, not chased (R16):
 
 ---
 
+### 12.30 THE EYE CHECK, ON PIXELS — AND THE FOOTGUN IT FOUND
+
+2026-08-11. `npm run eyecheck:gi-src` (`scripts/run-gi-src-eyecheck.mjs`), the
+user's own project and scene, the verified nave pose, `viewport.screenshot` at
+700×460, four arms differing by one flag each.
+
+| arm | screen mean | lit (L>12) | `maxL` | vs sky-only |
+| --- | --- | --- | --- | --- |
+| `shade-off` — SRC probes, sky-only radiance | 0.02891 | **4.0%** | — | — |
+| `bias-0.25` | 0.14806 | 68.2% | 0.4387 | **5.12×** |
+| `bias-0.75` | 0.14769 | 68.2% | 0.7891 | **5.11×** |
+| `noshadow` — visibility dropped, the ceiling | 0.59304 | 97.1% | 0.5644 | 20.5× |
+
+Phase 5's hit shading works and is worth 5.1× the sky-only frame. Shadows take it
+to 0.249× of the unshadowed ceiling, which is what an interior arcade should cost.
+
+#### 12.30.1 ⚠ `__giSrcProbes` WITHOUT `__giSrcShade` RENDERS A BLACK SCENE
+
+Look at the first row again: **4% of pixels lit**. That is not "dimmer". The
+`shade-off` capture is black but for the sliver of sky through the opening, and
+it is the exact picture the user reported as "no GI after enabling flags".
+
+It is structural, not a bug in either half. `createGiResolve` takes the SRC
+screen gather as the PRIMARY diffuse term and the legacy closure is switched off
+against it — `if (gather && !screenGather)` in giScreen.js, deliberately, because
+since [I] both are the same integral and running both adds a pixel's irradiance
+to itself. So `__giSrcProbes = true` REPLACES the working diffuse term with SRC's,
+and until Phase 5 SRC's carried sky only. One flag on, one flag off is a state in
+which the renderer is working perfectly and the screen is black.
+
+Two flags where one of the four combinations is guaranteed-black is a footgun,
+and it cost this session most of a day: the black frame was read as a transport
+failure and chased through `maxL`, step budgets, attribution and the shadow bias,
+none of which were broken. **`srcShadeEnabled()` now follows `srcProbesEnabled()`**
+— shading is on whenever probes are, and `__giSrcShade = false` is the explicit
+opt-out that keeps the sky-only arm available for the gates that need it. The
+combination that renders black is now one nobody reaches by accident.
+
+#### 12.30.2 ⚠ §12.28.2's "THE BIAS WAS APPLIED TWICE" WAS A MISREADING. RETRACTED.
+
+`bias-0.25` and `bias-0.75` differ by 0.25% of screen mean — **noise**. The
+along-ray self-bias does not measurably affect the rendered frame at either
+value, and the session's confident "my change to the along-ray `tMin` broke every
+shadow ray, confirmed and reproduced" was wrong.
+
+What produced that false confirmation is worth more than the fix:
+
+1. **The instrument had no camera.** The predecessor harness never called
+   `viewport.setCamera`, so it measured whatever pose the editor booted with —
+   58,653 shaded hits against this file's 249,860. Its `maxL` readings across
+   runs (0.0000, 0.0485, 0.0877, 0.3037) were not a bias sweep. They were four
+   different views.
+2. **`maxL` is an extremum, and extrema are the noisiest thing to A/B.** It is a
+   fine "is anything alive" tripwire — that is why §12.28 added it — and a bad
+   difference detector. Note the table: `noshadow` has a LOWER `maxL` than
+   `bias-0.75` while being 4× brighter on screen. Nothing is wrong with either
+   number; one hit's maximum simply does not order two frames.
+3. **A model disagreed and I believed the machine.** `scratchpad/biasderive.mjs`,
+   400k samples: a 0.75-cell lift leaves the origin inside its own cell for 19.9%
+   of hits, and a 0.25-cell along-ray bias clears 51.7% of those — so ~9.6% of
+   hits are spuriously self-shadowed, a RAMP. The observation was a CLIFF
+   (`maxL` exactly 0). A ramp-vs-cliff disagreement is not a detail to reconcile
+   later; it means one of the two is measuring something else, and here it was
+   the machine. R13 says no fix on code-reading evidence. This is its complement:
+   **no fix on measurement that contradicts a derivation, until the contradiction
+   is resolved.**
+
+The constant stays at the quarter cell `createSrcSceneTrace` uses — derived from
+one quantity rather than written down twice — and the `__giSrcSelfBias` A/B hatch
+is removed now that it has answered. The lost-contact-shadow threshold really is
+`0.75 + 0.25 = 1.0` voxel, and the gate still asserts the SUM of the two exported
+constants rather than a literal.
+
+#### 12.30.3 What the gates could not have caught, and what fixes that
+
+`test:gi-src-shade` hands `createSrcVisibility` a FAKE occupancy field in which
+"inside the surface's own voxel" does not exist. It measured the budget
+arithmetic — correctly — and was structurally incapable of seeing a self-bias
+problem. Same shape as §12.29's seam: **both units pass; the thing between them
+is untested.** The eye check is now that missing arm, and it is cheap: four boots,
+one screenshot each, one number per arm that a person can also just look at.
+
+#### 12.30.4 ⚠ THE FIRST ARM IN A FRESH BROWSER IS NOT COMPARABLE TO THE REST
+
+The eye check's own instrument fault, found by the eye check, and it produced two
+more wrong conclusions before it was caught.
+
+Arm 1 on a cold process reports **157,976 hits shaded** and a visibly dark frame.
+The SAME configuration in position ≥2 reports **249,860** and the correct one.
+Fifteen seconds after the camera move is convergence for a warm arm and not for a
+cold one.
+
+The confound is perfect whenever the arm you put first is also the arm whose
+configuration you are questioning, and twice it was:
+
+1. `probes-only` ran first and read 0.773× of `shade-on` — written up as "the
+   footgun fix leaves a residual gap". It does not; in a fair position the two
+   agree.
+2. `runtime` ran alone (so, first) and read 0.06059 against 0.14721 — written up
+   as "setting the flags in the console and toggling the component is NOT
+   equivalent to a reload, and the toggle/reload gap is a real defect". **It is
+   not a defect.** Re-run in position 5 the same path reads 0.14759, i.e. equal
+   to a reload. Retracted.
+
+Both survived a first pass because each had a plausible mechanism ready to
+explain it — a half-engaged rebuild, a stale resolve. **A mechanism you can tell
+a story about is not evidence**; the arm that settles it is the same
+configuration in a different position, and it costs one boot.
+
+Fixed by capturing on the SIGNAL rather than a timer: poll the frame line's own
+hit count until it stops moving (3 stable polls), which costs a warm arm ~2 polls
+and gives a cold one the time it actually needs.
+
+Open follow-ups this run surfaced, none of them today's job:
+- `occupancyField.traceHybridPlane` already has an `excludePoint` mode that skips
+  any accept whose plane CONTAINS the receiving point — written for exactly the
+  self-shadow-staircase problem. It is gated behind the penumbra variant, so
+  `createSrcVisibility` cannot reach it. **Excluding the receiver's own plane is
+  the principled replacement for a fat along-ray bias**, and it would let the
+  threshold shrink toward the quantization instead of away from it.
+- `count.shadowRays(1)` fires whether or not `visibility` exists, so the
+  `noshadow` arm reports 249,860 shadow rays it never cast. Fixed; an instrument
+  that reports work it did not do is the same defect class as the eye check that
+  printed `NO SCREENSHOT` for two sessions.
+- A black diamond-shaped object sits unlit in every shaded arm, and 1.5% of hits
+  land UNATTRIBUTED. Both are small, both are real, and neither is the footgun.
+
+---
+
 ## 13. Startup budget — GI must initialize in ≤ 1 second
 
 Added 2026-08-10 at the user's request, mid-Phase-5. A REQUIREMENT, not a

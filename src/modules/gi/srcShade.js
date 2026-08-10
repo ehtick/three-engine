@@ -355,7 +355,13 @@ function neeIrradiance(slots, P, n, rayIndex, {
 
         If(w.greaterThan(0), () => {
           const v = visibility ? float(visibility(P, n, dirTo, maxT)).toVar() : float(1).toVar();
-          if (count) count.shadowRays(1);
+          // ONLY WHEN A RAY WAS ACTUALLY CAST. With `visibility` null the
+          // `__giSrcNoShadow` arm reported a quarter of a million shadow rays it
+          // never fired — the counter measured OPPORTUNITIES. Same defect class
+          // as an eye check that prints `NO SCREENSHOT`: an instrument that
+          // reports work it did not do is worse than no instrument, because the
+          // number is used to rule causes OUT.
+          if (count && visibility) count.shadowRays(1);
           // k = v / (pdf · S), with pdf = w/total.
           out.addAssign(E.mul(v.mul(total).div(w.mul(samples))));
         });
@@ -463,7 +469,8 @@ export function createSrcHitShader({
         // `createSrcVisibility` reads the omission as "as far as the medium
         // goes" rather than as an unbounded literal WGSL cannot express.
         const v = visibility ? float(visibility(P, n, l, null)).toVar() : float(1).toVar();
-        if (count) count.shadowRays(1);
+        // Only when a ray was cast — see the NEE site's note.
+        if (count && visibility) count.shadowRays(1);
         E.addAssign(vec3(sun.irradiance).mul(cos).mul(v));
       });
     }
@@ -482,7 +489,8 @@ export function createSrcHitShader({
       const t = lightTermsAt(slot, P, n, margin, maxRay);
       If(t.cos.greaterThan(0).and(t.E.x.max(t.E.y).max(t.E.z).greaterThan(0)), () => {
         const v = visibility ? float(visibility(P, n, t.dirTo, t.maxT)).toVar() : float(1).toVar();
-        if (count) count.shadowRays(1);
+        // Only when a ray was cast — see the NEE site's note.
+        if (count && visibility) count.shadowRays(1);
         E.addAssign(t.E.mul(v));
       });
     }

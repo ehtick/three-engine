@@ -647,15 +647,38 @@ export function createSrcDepositFrame(store, bins, {
     async readStats(renderer) {
       const allocated = !!renderer?.backend?.get?.(stats.value)?.buffer;
       if (!allocated) {
-        return { dispatched: false, rays: 0, hits: 0, deposits: 0, clamped: 0, noBlock: 0 };
+        return { dispatched: false, rays: 0, hits: 0, deposits: 0, clamped: 0, noBlock: 0, shaded: 0 };
       }
       const v = new Uint32Array(await renderer.getArrayBufferAsync(stats.value));
       const rays = v[STAT_RAYS] >>> 0;
       const hits = v[STAT_HITS] >>> 0;
+      const shaded = v[STAT_SHADED] >>> 0;
       return {
         dispatched: true,
         rays,
         hits,
+        // ── THE SHADE TALLIES (Phase 5) ─────────────────────────────────────
+        //
+        // Read here because a black frame has SIX distinct causes and they are
+        // indistinguishable on screen: nothing shaded (no `shadeHit`), nothing
+        // hit (the trace), nothing attributed (no palette), nothing lit (no
+        // light reached the hit), everything shadowed (the visibility ray), or
+        // radiance produced and lost downstream. Each of these separates one.
+        //
+        // ⚠ `shaded` MUST be a number and not `undefined` — the formatter's
+        // `r.shaded ? … : "NO HIT SHADING"` reads a missing field exactly like a
+        // zero, so an earlier half-landed edit had the log confidently reporting
+        // "NO HIT SHADING" on a frame whose shader was built and running. An
+        // instrument that is only partly wired lies with the same confidence as
+        // one that is not wired at all.
+        shaded,
+        unattributed: v[STAT_UNATTRIBUTED] >>> 0,
+        shadowRays: v[STAT_SHADOWRAYS] >>> 0,
+        emissiveHits: v[STAT_EMISSIVE] >>> 0,
+        emitZeroed: v[STAT_EMIT_ZEROED] >>> 0,
+        albedoClamped: v[STAT_ALBEDO_CLAMPED] >>> 0,
+        importanceFloored: v[STAT_IMPORTANCE_FLOORED] >>> 0,
+        unattributedRate: shaded > 0 ? (v[STAT_UNATTRIBUTED] >>> 0) / shaded : 0,
         deposits: v[STAT_DEPOSITS] >>> 0,
         clamped: v[STAT_CLAMPED] >>> 0,
         // Deposits the block pool refused. Zero unless BIN_BUDGET is short for

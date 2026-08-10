@@ -71,15 +71,37 @@ export function srcProbesEnabled() {
 }
 
 /**
- * Is SRC HIT SHADING on? Opt-in, and the single source of truth for it, because
- * the flag is read in two places that must not disagree: here, to build the
- * shader, and in `GISystem`'s field construction, to allocate the surface
- * attribution region the shader reads. A field built without the region and a
- * shader built expecting one is a throw at best and a grey world at worst, and
- * they are separated by a full rebuild — so they read one function.
+ * Is SRC HIT SHADING on? The single source of truth for it, because the flag is
+ * read in two places that must not disagree: here, to build the shader, and in
+ * `GISystem`'s field construction, to allocate the surface attribution region
+ * the shader reads. A field built without the region and a shader built
+ * expecting one is a throw at best and a grey world at worst, and they are
+ * separated by a full rebuild — so they read one function.
+ *
+ * ⚠ **IT FOLLOWS `__giSrcProbes`, AND THAT IS A FIX, NOT A CONVENIENCE.**
+ *
+ * These were two independent opt-ins, and one of the four combinations —
+ * probes ON, shading OFF — RENDERS A BLACK SCENE. Not dimmer: the eye check
+ * measures 4.0% of pixels lit against 68.2% with shading on (§12.30.1).
+ *
+ * It is nobody's bug. `createGiResolve` takes SRC's screen gather as the
+ * PRIMARY diffuse term and switches the legacy closure off against it
+ * (`if (gather && !screenGather)`, giScreen.js) because since [I] the two are
+ * the same integral and running both would add a pixel's irradiance to itself.
+ * So turning probes on REPLACES the working diffuse term with SRC's — and
+ * before Phase 5, SRC's carried sky only. The renderer is behaving perfectly
+ * and the screen is black.
+ *
+ * That state cost a full day: the black frame was read as a broken transport
+ * and chased through `maxL`, step budgets, attribution and the shadow bias,
+ * none of which were wrong. A flag combination that is guaranteed-black is not
+ * a diagnostic state worth preserving by default, so shading is on whenever
+ * probes are. `__giSrcShade = false` stays as the EXPLICIT opt-out the sky-only
+ * gates still need — the difference is that you now have to ask for it.
  */
 export function srcShadeEnabled() {
-  return globalThis.__giSrcShade === true;
+  if (globalThis.__giSrcShade === false) return false;
+  return globalThis.__giSrcShade === true || srcProbesEnabled();
 }
 
 /**
@@ -352,7 +374,14 @@ export function createSrcProbeSystem({
         lights: lighting.lights ?? [],
         emitters: lighting.emitters ?? [],
         maxRay: lighting.maxRay ?? null,
-        visibility: createSrcVisibility(volume.occupancyField, volume.world, {
+        // ── THE ISOLATION HATCH (R12/R14) ────────────────────────────────
+        //
+        // `__giSrcNoShadow` drops the visibility ray entirely, which separates
+        // the two causes of a black frame that the tallies cannot tell apart:
+        // "no light reaches the hit" (the lighting term is zero) from "every
+        // hit is occluded" (the ray says so). With it on, `maxL` still zero
+        // means the lighting; `maxL` nonzero means the visibility.
+        visibility: globalThis.__giSrcNoShadow === true ? null : createSrcVisibility(volume.occupancyField, volume.world, {
           rayHitMode: volume.rayHitMode,
           // A shadow ray is SHORTER than a diffuse one by construction — it
           // stops at its source — so it does not inherit the 192 the primary
@@ -720,7 +749,30 @@ export function formatSrcProbeFrame(stats) {
         (r.clamped ? `  CLAMPED ${r.clamped}` : "") +
         // Deposits the block pool refused. The probe-side twin (`NOBLOCK n/cap`
         // in the cascade line) says how many probes; this says what it cost.
-        (r.noBlock ? `  DROPPED ${r.noBlock}` : "")
+        (r.noBlock ? `  DROPPED ${r.noBlock}` : "") +
+        // ── WHY THE FRAME IS THE BRIGHTNESS IT IS ─────────────────────────
+        //
+        // `maxL` is the most diagnostic number this module has and it was
+        // computed and never printed: the brightest radiance any hit produced,
+        // as a fraction of `Lmax`. **Zero means no hit shaded to anything**,
+        // which separates "the transport is broken" from "the lighting is" in
+        // one glance — and on screen those two are the same black frame.
+        //
+        // Printed at zero on purpose, with the shade tallies beside it, so a
+        // black frame names its own cause: `NO HIT SHADING` = the shader was
+        // never built; `UNATTRIBUTED` high = the palette is not answering;
+        // shadow rays ≈ shaded with `maxL 0` = every hit is occluded from every
+        // light.
+        (r.shaded
+          ? `  |  shaded ${r.shaded}` +
+            (r.unattributedRate > 0.001 ? ` (${(r.unattributedRate * 100).toFixed(1)}% UNATTRIBUTED)` : "") +
+            `, ${r.shadowRays} shadow rays, maxL ${r.maxRadianceFraction.toFixed(4)}` +
+            (r.maxRadianceFraction === 0 ? " ← NO HIT PRODUCED ANY RADIANCE" : "") +
+            (r.emissiveHits ? `, ${r.emissiveHits} emissive` : "") +
+            (r.emitZeroed ? `, ${r.emitZeroed} R5-ZEROED` : "") +
+            (r.albedoClamped ? `, ${r.albedoClamped} albedo-clamped` : "") +
+            (r.importanceFloored ? `, ${r.importanceFloored} IMPORTANCE-FLOORED` : "")
+          : "  |  NO HIT SHADING")
       : "") +
     // The merge's range instrument. `to sky` is the fraction of merged bins
     // whose parent chain reached the top — i.e. how much of the frame is

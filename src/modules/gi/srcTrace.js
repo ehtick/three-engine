@@ -191,16 +191,28 @@ export function createSrcSceneTrace(occField, world, {
  * quantization showing through. The value of having the number is that a lost
  * contact shadow becomes recognizable instead of investigable.
  *
- * ⚠ **THIS FUNCTION USED TO APPLY THAT BIAS TWICE**, and `test:gi-src-shade`'s
- * sweep is what found it: the origin moved 0.75 voxels along the normal AND the
- * trace was started at `t0 = lift` along the ray, so the real threshold was
- * **1.5 voxels**, double what the mirror measured and double what any comment
- * here claimed. The along-ray term is not redundant — a grazing shadow ray from
- * a lifted origin can still be inside the surface's own voxel, since 0.75 along
- * a body-diagonal normal is only 0.43 per axis — but it is not a second lift
- * either. It is now the SAME self-bias `createSrcSceneTrace` uses, a quarter of
- * a cell, derived from the same quantity (R2). Threshold: `0.75 + 0.25 = 1.0`
- * voxel, and the gate asserts exactly that sum rather than a literal.
+ * The two terms are DIFFERENT GEOMETRIC QUANTITIES and both are needed. The
+ * lift moves the origin off the surface plane; the along-ray self-bias skips the
+ * remainder of the origin's own cell, which the lift does not clear on a grazing
+ * ray — 0.75 along a body-diagonal normal is only 0.43 per axis. The along-ray
+ * term is the SAME quarter-cell self-bias `createSrcSceneTrace` uses, derived
+ * from the same quantity (R2). Threshold: `0.75 + 0.25 = 1.0` voxel, and the
+ * gate asserts exactly that sum rather than a literal.
+ *
+ * ⚠ **A PREVIOUS VERSION OF THIS COMMENT CALLED THAT PAIR "THE BIAS APPLIED
+ * TWICE" AND THE 1.5-VOXEL THRESHOLD A BUG. IT WAS A MISREADING** — retracted in
+ * plan §12.30.2, and the retraction is the useful part. The eye check renders the
+ * two candidate values at 0.14806 and 0.14769 screen mean: a 0.25% difference,
+ * i.e. noise. The along-ray bias does not measurably change the frame at 0.25 OR
+ * 0.75, and a day was spent believing it had turned the scene black.
+ *
+ * What produced that false confirmation: `maxL` — a MAXIMUM over hits — was read
+ * as a difference detector across runs of a harness that never set a camera, so
+ * four different views were compared as if they were a bias sweep. Meanwhile a
+ * 400k-sample grid derivation said the effect should be a ~10% RAMP and the
+ * machine reported a CLIFF, and the machine was believed. R13 forbids a fix on
+ * code-reading evidence; its complement belongs here — **no fix on a measurement
+ * that contradicts a derivation, until the contradiction itself is resolved.**
  *
  * @param {Node} point    surface point, UNLIFTED
  * @param {Node} normal   surface normal (face-forwarded by the caller)
