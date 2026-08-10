@@ -3817,3 +3817,141 @@ metric is still the right instrument — the world period of the residual
 structure — but the only dial left is `quality`, whose four tiers set s₀ to
 0.8 / 0.6 / 0.45 / 0.35. That is the sweep to rebuild it around, and the
 prediction §12.22 already made is that it finds NO period at s₀ at all.
+
+### 12.27 Phase 4, unit 4 — the lattice probe. PHASE 4 IS COMPLETE.
+
+(§12.26 is reserved for a parallel session working the Phase-5 CPU mirror.)
+
+§7's last Phase 4 gate item: *"`probe:gi-block-size` ACF (expect block scale to
+track s₀·LOD — measure the world period, R14)."*
+
+#### 12.27.1 The old rig could not answer it, so the FINDINGS moved and the code did not
+
+`run-gi-block-size.mjs` sweeps `voxelSize` and `probeSpacing` with `autoFit`
+OFF, and all three were retired when GI collapsed to one property (§12.19.5).
+§12.10.1's instruction for the retired gather gate applies unchanged — carry the
+findings forward, not the file:
+
+- **The metric survives intact.** A piecewise-constant field of block size `b`
+  has a triangular ACF, `1 − k/b`, so the half-crossing is at `b/2` and
+  `blockSize = 2 × (lag where the ACF crosses one half)`. Detrend with a CUBIC
+  first, because a polynomial has no length scale of its own.
+- **The sweep axis does not.** The only dial left is `quality`, whose four tiers
+  set s₀ to 0.8 / 0.6 / 0.45 / 0.35 m — and that is a BETTER sweep for this
+  question than the one it replaces, because it moves the probe lattice and
+  nothing else. The old rig's two dials each moved a different lattice and
+  telling them apart was the whole point.
+- **The `autoFit` trap dies with the props.** It cost the previous attempt at
+  this question an entire run of identical builds.
+
+The view is orthographic, straight down at the floor, so "lag → metres" is exact
+and constant rather than a projected pixel scale, and a row of texels IS a line
+of constant z.
+
+#### 12.27.2 A NULL FROM A NOISY INSTRUMENT IS WORTHLESS, so the probe self-tests
+
+§12.22 already measured the blocks gone, so this expects to find nothing — and
+that is exactly the result a broken instrument returns for free. **White noise
+decorrelates at lag 1**, which drives the half-width to ~1 texel and reports "no
+blocks" whatever the frame contains.
+
+Three things answer it. Frames are AVERAGED (16) before the fit; the surviving
+frame-to-frame noise is measured and reported; and the estimator is run against
+SYNTHETIC piecewise-constant fields at each tier's own s₀, carrying the same
+noise, to prove it finds a period that IS there.
+
+**The control failed three times before it was worth trusting, and each failure
+was the control's fault rather than the estimator's:**
+
+1. **Noise at the wrong stage.** The first version added RAW frame-to-frame
+   noise to blocks of the same amplitude — SNR 1 — and failed at 95%. The
+   measurement averages 16 frames, so the noise it actually carries is smaller
+   by sqrt(16), and that is the regime the control has to reproduce.
+2. **A weak cell hash.** `((cx·73856093) ^ (cy·19349663)) & 1023` correlates
+   strongly between ADJACENT cells, which widens the ACF and makes synthetic
+   blocks read BIGGER than they are. The control was measuring its own field's
+   defect and billing the estimator for it.
+3. **Too few blocks per line.** The residual bias is monotone in
+   blocks-per-line and nothing else — 40% at 8.7, 22% at 11.6, 9.6% at 15.6 —
+   because a cubic detrend absorbs block-scale variance when the blocks are
+   large relative to the line. Blocks per line is `window · WORLD / s₀` and does
+   NOT depend on resolution, so a bigger target does not help; a bigger WORLD
+   does. At 16 m the coarsest tier gets 14 blocks and the finest 32, while
+   768 px keeps the finest s₀ at 8.4 texels. Both ends have to stay resolved,
+   which pins the choice to a compromise rather than a maximum.
+
+Settled control: **the estimator recovers synthetic blocks to 7.2–16.2%**, and
+the residual error is still monotone in blocks-per-line, which is the signature
+that says the remaining bias is the detrend and not something unexplained.
+
+#### 12.27.3 What it measured, and the statistic that actually answers R14
+
+    tier     s0      block x   block z   block/s0
+    low     0.80m     1.037m    0.884m   1.30 / 1.10
+    medium  0.60m     1.139m    0.826m   1.90 / 1.38
+    high    0.45m     1.201m    0.796m   2.67 / 1.77
+    ultra   0.35m     1.302m    0.961m   3.72 / 2.75
+
+**"Is the block small" is the wrong test and the first version asked it**, with
+`block/s₀ < 0.5`, and failed at 1.67 having proved nothing either way. R14 asks
+whether the structure's length SCALES WITH the lattice, and no single ratio can
+answer that at any value.
+
+The statistic that does needs no threshold pulled from the air:
+
+    s0 divides by 2.29 from low to ultra.
+    The measured length MULTIPLIES by 1.18 (0.96m -> 1.13m).
+    Tracking would have predicted 0.42m.
+
+It moves the wrong way. A probe-cell artifact cannot get LARGER as the probe
+cells get smaller, so whatever this ~1 m correlation length is, it is not the
+lattice. `block/s₀` spreads 3.37× across the sweep; a lattice would hold it
+near constant, which is what "tracking" means.
+
+**Left open, and named rather than explained away:** there IS a residual
+structure at ~1 m, 17× above the averaged noise floor and independent of s₀. The
+scene is a floor and two walls, so it is not geometry. Phase 5 is the right time
+to chase it — hit shading changes what a bin CONTAINS, and a correlation length
+measured on transmittance alone is measuring half the signal.
+
+#### 12.27.4 Two harness faults, and one that cost a run by looking like a real bug
+
+- **A `global-illumination` COMPONENT builds the system; `engine.start()` runs
+  it.** Same pair as §12.25.3 — recorded twice because both probes hit it.
+- **`quality` CHANGES THE GI TARGET RESOLUTION** (256² at low/medium/high here,
+  512² at ultra), and GISystem rebuilds `_giTargets` when the size changes. A
+  `texture(targets.irradiance)` node captured once therefore points at a
+  DISPOSED target from the second tier onward — **and a disposed target reads as
+  zero**. The ultra arm produced a uniformly black frame and reported a block
+  size of 0.000 m, which the ratio arm then divided by.
+
+  It read exactly like SRC being broken at ultra. The counters said otherwise in
+  the same breath: **262,144 of 262,144 pixels lit, zero empty, 1.9 M deposits,
+  zero dropped.** The frame was fine and the handle was dead. That is why the
+  "never lit" path now DIAGNOSES — SRC-refused-to-build, pool-starved and
+  gather-found-nothing are three different failures and the counters separate
+  them — instead of only failing.
+- **The occluders had to be 1.5 m thick.** Auto-fit sizes the occupancy voxel
+  from the scene AABB, and GI warns when a mesh is thinner than two cells
+  because the field cannot keep its faces apart. A 0.5 m wall tripped that at
+  0.30 m voxels, and an occluder that does not occlude leaves the floor
+  uniformly lit — at which point this probe is measuring the ACF of a flat
+  field, which is noise wearing a result's clothes.
+
+#### 12.27.5 PHASE 4 IS COMPLETE
+
+Mechanism (§12.23), motion (§12.24), scale (§12.25) and the lattice (this
+section). §7's Phase 4 gate list is discharged, and the LOD half of the phase
+landed earlier at §12.19.2 and in [I].
+
+What Phase 4 did NOT do, by plan rather than omission: **membership**. §12.24
+measured the per-frame reversal rate halving while the worst-case per-pixel STEP
+did not move, and closed the 2×2 that shows the step floor is bin-level
+membership rather than value noise — R6 said an EMA smooths values and not
+membership, and it was right. That is not a smaller-alpha problem and it is
+deliberately not chased here, because Phase 5 changes what a bin contains.
+
+**Next is Phase 5 — hit shading.** It is the phase that makes the picture stop
+being sky visibility: `shadeHit` is still `null`, every deposited radiance is
+still zero, and a Cornell box with no red on the white block remains the correct
+picture until it lands.

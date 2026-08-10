@@ -1046,6 +1046,13 @@ export function hashUnitFloat(n) {
   return h / 4294967296;
 }
 
+/**
+ * How far below the mean importance a contributing emitter may be ranked before
+ * NEE floors it. See `emitterIrradianceNee` — the number bounds the worst
+ * single-sample weight, so it is a firefly ceiling, not a tolerance.
+ */
+export const IMPORTANCE_FLOOR_FRACTION = 1 / 1024;
+
 /** Rec. 709 luminance — the scalar an importance heuristic ranks on. */
 function luminance(c) {
   return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
@@ -1205,19 +1212,55 @@ export function emitterIrradianceExact(emitters, position, normal, visibility) {
 export function emitterIrradianceNee(emitters, position, normal, visibility, rayIndex, {
   samples = 1,
   importance = null,
+  floorFraction = IMPORTANCE_FLOOR_FRACTION,
+  stats = null,
 } = {}) {
   const weights = [];
   const values = [];
-  let total = 0;
+  let contributors = 0;
   for (const e of emitters) {
     const E = e.irradianceAt(position, normal);
     const contribution = luminance(E);
-    // Importance is allowed to be a worse ranking than the contribution — that
-    // is what a light tree is — but never zero where the contribution is not.
-    const w = contribution > 0 ? Math.max(1e-12, importance ? importance(e, position, normal) : contribution) : 0;
+    const w = contribution > 0
+      ? Math.max(0, importance ? importance(e, position, normal) : contribution)
+      : 0;
+    if (contribution > 0) contributors++;
     weights.push(w);
     values.push(E);
-    total += w;
+  }
+  if (contributors === 0) return [0, 0, 0];
+
+  // ══ THE FLOOR IS RELATIVE TO THE IMPORTANCE'S OWN SCALE ═══════════════════
+  //
+  // R1 in its sampling costume: an emitter with a nonzero contribution and a
+  // zero pick probability is energy that vanishes with nothing to attribute it
+  // to. So a contributing emitter's weight is floored — but the first version
+  // floored at a fixed 1e-12, which trades a lost light for a FIREFLY: the
+  // estimator divides by the pdf, so a 1e-12 probability that does come up
+  // returns a 1e12 multiple of that emitter's irradiance. "Fireflies are
+  // impossible by construction here" is a property this module relies on, and a
+  // hard-coded epsilon in a denominator is exactly how it stops being true.
+  //
+  // The floor is therefore a FRACTION of the mean importance among contributors
+  // — scale-invariant, because a light tree's importance is in units of its own
+  // and not comparable to an irradiance — which bounds the worst single-sample
+  // weight at `contributors / floorFraction` times the mean. It binds only when
+  // an importance function is wrong, so the exact-pdf case is untouched and the
+  // zero-variance property survives; `stats.importanceFloored` counts the times
+  // it did bind, which is the instrument that says an importance is broken.
+  let sum = 0;
+  for (let i = 0; i < weights.length; i++) if (values[i] && weights[i] > 0) sum += weights[i];
+  const floor = sum > 0 ? (floorFraction * sum) / contributors : 1;
+  let total = 0;
+  for (let i = 0; i < weights.length; i++) {
+    const contributes = luminance(values[i]) > 0;
+    if (contributes && weights[i] < floor) {
+      weights[i] = floor;
+      if (stats) stats.importanceFloored = (stats.importanceFloored ?? 0) + 1;
+    } else if (!contributes) {
+      weights[i] = 0;
+    }
+    total += weights[i];
   }
   if (!(total > 0)) return [0, 0, 0];
 
@@ -1300,6 +1343,7 @@ export function makeHitShader({
     albedoClamped: 0,
     secondaryHits: 0,
     secondaryMisses: 0,
+    importanceFloored: 0,
   };
   // Wrap the visibility so the shadow-ray count is a property of the shader and
   // not something every arm has to instrument for itself. The clamp counter is
@@ -1320,7 +1364,7 @@ export function makeHitShader({
     const E = sunIrradiance(sun, P, n, vis);
     if (emitters.length) {
       const Ee = neeEmitters
-        ? emitterIrradianceNee(emitters, P, n, vis, rayIndex, { samples: neeSamples, importance })
+        ? emitterIrradianceNee(emitters, P, n, vis, rayIndex, { samples: neeSamples, importance, stats })
         : [0, 0, 0];
       E[0] += Ee[0]; E[1] += Ee[1]; E[2] += Ee[2];
     }

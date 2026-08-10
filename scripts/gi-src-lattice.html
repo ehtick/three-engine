@@ -1,0 +1,532 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>SRC lattice probe — is there a probe-sized period in the frame?</title>
+    <style>html,body{margin:0;background:#111;color:#ddd;font:13px monospace}canvas{width:512px;height:512px}</style>
+  </head>
+  <body>
+    <canvas id="view" width="512" height="512"></canvas>
+    <pre id="log"></pre>
+    <script type="module">
+      // ══ §7's LAST PHASE-4 GATE ITEM, REBUILT RATHER THAN REPAIRED ═══════
+      //
+      // "`probe:gi-block-size` ACF (expect block scale to track s₀·LOD —
+      // measure the world period, R14)."
+      //
+      // `run-gi-block-size.mjs` cannot answer it any more and the reason is not
+      // decay: it sweeps `voxelSize` and `probeSpacing` with `autoFit` OFF, and
+      // all three were retired when GI collapsed to one property (§12.19.5).
+      // Its findings carry forward instead of its code, exactly as §12.10.1
+      // instructs for the retired gather gate:
+      //
+      //   - THE METRIC SURVIVES INTACT. A piecewise-constant field of block
+      //     size b has a triangular autocorrelation, 1 − k/b, so ACF = 0.5 at
+      //     k = b/2 and `blockSize = 2 × (lag where the ACF crosses one half)`.
+      //     Subtract a fitted CUBIC first — a polynomial has no length scale of
+      //     its own, unlike the blur a high-pass would need.
+      //   - THE SWEEP AXIS DOES NOT. The only dial left is `quality`, and its
+      //     four tiers set s₀ to 0.8 / 0.6 / 0.45 / 0.35 m. That is a better
+      //     sweep than the old one for this question anyway: it moves the probe
+      //     lattice and nothing else, where the old rig's two dials each moved a
+      //     different lattice and the whole point was telling them apart.
+      //   - THE `autoFit` TRAP IS GONE WITH THE PROPS. It cost the previous
+      //     attempt at this question an entire run of identical builds.
+      //
+      // ══ AND THE PREDICTION IS A NULL, WHICH IS WHY THE CONTROL MATTERS ══
+      //
+      // §12.22 measured the blocks gone — 100% of 3.9 cm steps change value
+      // against a 7.8% nearest-probe control. So this expects to find NO period
+      // at s₀, and a null result from a noisy instrument is worthless: white
+      // noise decorrelates at lag 1, which drives the half-width to ~1 texel and
+      // reports "no blocks" WHATEVER the frame contains.
+      //
+      // Two things answer that. Frames are AVERAGED before the fit, and the
+      // frame-to-frame noise that survives is measured and reported. And the
+      // estimator is run against SYNTHETIC fields — piecewise-constant at each
+      // tier's own s₀, with noise added at the level actually measured — to show
+      // it recovers a period that is there. An instrument that cannot find the
+      // block it was given has not proved anything by failing to find one.
+      //
+      // ══ THE VIEW IS ORTHOGRAPHIC ON PURPOSE ═════════════════════════════
+      //
+      // The old rig converted lags to metres through a projected pixel scale. An
+      // orthographic camera straight down at the floor makes that conversion
+      // exact and constant across the frame: metres per texel is the ortho width
+      // over the target width, and a row of texels IS a line of constant z.
+      //
+      // Run: node scripts/run-gi-src-lattice-test.mjs
+      const out = document.querySelector("#log");
+      const say = (line) => { out.textContent += line + "\n"; };
+      let failures = 0;
+      const check = (label, ok, detail = "") => {
+        say(`  ${ok ? "PASS" : "FAIL"} ${label}${detail ? ` — ${detail}` : ""}`);
+        if (!ok) failures++;
+      };
+      const fail = (error) => {
+        console.error("SRC-LATTICE FAIL", error?.stack ?? error?.message ?? String(error));
+        globalThis.__SRC_LATTICE_RESULT__ = {
+          pass: false, error: error?.message ?? String(error), text: out.textContent,
+        };
+      };
+      globalThis.addEventListener("error", (event) => fail(event.error ?? event.message));
+      globalThis.addEventListener("unhandledrejection", (event) => fail(event.reason));
+
+      // ── THE ESTIMATOR, SHARED BY THE REAL FRAME AND THE SYNTHETIC ONES ──
+      /** Least-squares cubic in the index, subtracted in place. */
+      const detrendCubic = (row) => {
+        const n = row.length;
+        const A = Array.from({ length: 4 }, () => new Float64Array(5));
+        for (let i = 0; i < n; i++) {
+          const x = (2 * i) / (n - 1) - 1;          // [-1, 1], conditions the fit
+          const p = [1, x, x * x, x * x * x];
+          for (let a = 0; a < 4; a++) {
+            for (let b = 0; b < 4; b++) A[a][b] += p[a] * p[b];
+            A[a][4] += p[a] * row[i];
+          }
+        }
+        for (let c = 0; c < 4; c++) {                // Gaussian elimination, 4x4
+          let piv = c;
+          for (let r = c + 1; r < 4; r++) if (Math.abs(A[r][c]) > Math.abs(A[piv][c])) piv = r;
+          [A[c], A[piv]] = [A[piv], A[c]];
+          if (Math.abs(A[c][c]) < 1e-12) continue;
+          for (let r = 0; r < 4; r++) {
+            if (r === c) continue;
+            const f = A[r][c] / A[c][c];
+            for (let k = c; k < 5; k++) A[r][k] -= f * A[c][k];
+          }
+        }
+        const co = [0, 1, 2, 3].map((c) => (Math.abs(A[c][c]) < 1e-12 ? 0 : A[c][4] / A[c][c]));
+        const res = new Float64Array(n);
+        for (let i = 0; i < n; i++) {
+          const x = (2 * i) / (n - 1) - 1;
+          res[i] = row[i] - (co[0] + co[1] * x + co[2] * x * x + co[3] * x * x * x);
+        }
+        return res;
+      };
+
+      /**
+       * ACF half-width of a set of detrended lines, in LAGS.
+       *
+       * Accumulated across lines before the ratio, not averaged after: a line
+       * whose residual is nearly zero has an ACF that is nearly noise, and
+       * averaging per-line ratios would give it the same vote as a line with
+       * real structure.
+       */
+      const acfHalfWidth = (lines, maxLag) => {
+        const num = new Float64Array(maxLag + 1);
+        for (const res of lines) {
+          for (let k = 0; k <= maxLag; k++) {
+            let s = 0;
+            for (let i = 0; i + k < res.length; i++) s += res[i] * res[i + k];
+            num[k] += s / (res.length - k);
+          }
+        }
+        if (!(num[0] > 0)) return { lag: 0, acf: [] };
+        const acf = Array.from(num, (v) => v / num[0]);
+        for (let k = 1; k <= maxLag; k++) {
+          if (acf[k] < 0.5) {
+            // Linear interpolation for a sub-texel crossing.
+            const t = (acf[k - 1] - 0.5) / Math.max(1e-12, acf[k - 1] - acf[k]);
+            return { lag: k - 1 + t, acf };
+          }
+        }
+        return { lag: maxLag, acf };
+      };
+
+      /** Rows (constant z) and columns (constant x) of a WxH luminance field. */
+      const linesOf = (buf, W, H, axis, x0, x1, y0, y1) => {
+        const lines = [];
+        if (axis === "x") {
+          for (let y = y0; y < y1; y++) {
+            const row = new Float64Array(x1 - x0);
+            for (let x = x0; x < x1; x++) row[x - x0] = buf[y * W + x];
+            lines.push(detrendCubic(row));
+          }
+        } else {
+          for (let x = x0; x < x1; x++) {
+            const col = new Float64Array(y1 - y0);
+            for (let y = y0; y < y1; y++) col[y - y0] = buf[y * W + x];
+            lines.push(detrendCubic(col));
+          }
+        }
+        return lines;
+      };
+
+      try {
+        globalThis.__giSrcProbes = true;
+        globalThis.__editorKeepRendering = true;
+        const { Engine, THREE, registerBuiltInComponents } = await import("/src/engine/index.js");
+        await import("/src/modules/index.js");
+        const { enableEngineModule } = await import("/src/engine/modules.js");
+        const TSL = await import("three/tsl");
+        const cfgMod = await import("/src/modules/gi/srcConfig.js");
+        const { Fn, instanceIndex, instancedArray, ivec2, texture, uniform, vec3 } = TSL;
+
+        registerBuiltInComponents();
+        const engine = new Engine();
+        engine.setSize(768, 768);
+        await engine.init(document.querySelector("#view"));
+        if (engine.getBackendName() !== "WebGPU") throw new Error(`WebGPU unavailable (${engine.getBackendName()})`);
+        const device = engine.renderer.backend.device;
+        const validationErrors = [];
+        device.addEventListener?.("uncapturederror", (event) => {
+          validationErrors.push(event.error?.message ?? String(event.error));
+        });
+
+        await enableEngineModule(engine, "gi");
+        const giEnt = engine.createEntity({ name: "GI" });
+        const giComp = giEnt.addComponent("global-illumination", { quality: "medium" });
+
+        const skyTex = new THREE.DataTexture(
+          new Float32Array([1, 1, 1, 1]), 1, 1, THREE.RGBAFormat, THREE.FloatType,
+        );
+        skyTex.mapping = THREE.EquirectangularReflectionMapping;
+        skyTex.needsUpdate = true;
+        engine.scene.environment = skyTex;
+        engine.scene.environmentIntensity = 1;
+
+        // ── THE SCENE: a floor with a smooth sky-visibility gradient ────
+        // Two walls, both OUTSIDE the viewed patch, so what the camera sees is
+        // pure gradient with no geometric edge in it. The cubic removes the
+        // gradient; anything left over is the machinery, which is the whole
+        // measurement. A flat floor with no occluder at all would have nothing
+        // to detrend and would make the arm vacuous in the other direction.
+        const material = new THREE.MeshStandardNodeMaterial({ color: 0x999999, roughness: 1 });
+        // THE WALLS ARE 1.5 m THICK, WHICH IS NOT COSMETIC. Auto-fit sizes the
+        // occupancy voxel from the scene AABB, and GI warns when a mesh is
+        // thinner than two cells because the field cannot then keep its two
+        // faces apart and light passes straight through. A 0.5 m wall tripped
+        // that warning at 0.30 m voxels — an occluder that does not occlude
+        // would leave the floor uniformly lit, and this probe would then be
+        // measuring the ACF of a flat field, which is noise by another name.
+        // The floor is kept just wide enough for the 16 m view plus margin, for
+        // the same reason: a bigger AABB means coarser cells.
+        const floor = new THREE.Mesh(new THREE.BoxGeometry(22, 0.4, 22).toNonIndexed(), material);
+        floor.position.y = -0.2;
+        const wallA = new THREE.Mesh(new THREE.BoxGeometry(1.5, 5, 22).toNonIndexed(), material);
+        wallA.position.set(-9.5, 2.5, 0);
+        const wallB = new THREE.Mesh(new THREE.BoxGeometry(22, 5, 1.5).toNonIndexed(), material);
+        wallB.position.set(0, 2.5, -9.5);
+        for (const m of [floor, wallA, wallB]) { m.updateMatrixWorld(true); engine.scene.add(m); }
+
+        // Orthographic, straight down over exactly WORLD x WORLD metres.
+        // ══ WORLD SIZE IS SET BY BLOCKS-PER-LINE, NOT BY TASTE ═════════════
+        //
+        // The estimator has one real weakness and the control found it: a cubic
+        // detrend absorbs block-scale variance, so the fewer blocks a line
+        // contains the more it UNDER-reads the period. Measured at WORLD = 10:
+        // 40% low at 8.7 blocks/line, 22% at 11.6, 9.6% at 15.6 — monotone in
+        // blocks-per-line and nothing else.
+        //
+        // Blocks per line is `window x WORLD / s₀` and does NOT depend on
+        // resolution, so a bigger target does not fix it; a bigger WORLD does.
+        // 16 m gives 14 blocks at the coarsest tier and 32 at the finest, while
+        // 768 px keeps the finest s₀ at 8.4 texels — both ends of the sweep have
+        // to stay resolved, which is what pins this to a compromise rather than
+        // a maximum.
+        const WORLD = 16;
+        const camera = new THREE.OrthographicCamera(
+          -WORLD / 2, WORLD / 2, WORLD / 2, -WORLD / 2, 0.1, 40,
+        );
+        camera.position.set(0, 12, 0);
+        camera.up.set(0, 0, -1);              // +x right, +z DOWN the image
+        camera.lookAt(0, 0, 0);
+        camera.updateMatrixWorld(true);
+        engine.scene.add(camera);
+        engine.camera = camera;
+        engine.start();
+
+        const settle = (ms) => new Promise((r) => setTimeout(r, ms));
+        const system = () => engine.modules.get("gi")?.system;
+        const deadline = performance.now() + 120_000;
+        while (performance.now() < deadline) {
+          await settle(400);
+          if (system()?._fieldReadyOnce && system()?.state?.screen?.srcProbes) break;
+        }
+        if (!system()?.state?.screen?.srcProbes) throw new Error("SRC never built");
+
+        // ══ THE TARGET IS RE-ACQUIRED PER TIER, AND THAT IS NOT PARANOIA ═══
+        //
+        // `quality` changes the GI RESOLUTION: `low`/`medium`/`high` resolve at
+        // 256x256 here and `ultra` at 512x512. GISystem rebuilds `_giTargets`
+        // when the size changes, so a `texture(targets.irradiance)` node captured
+        // once points at a DISPOSED target from the second tier onward — and a
+        // disposed target reads as ZERO, i.e. a uniformly black frame.
+        //
+        // That cost this file a run and is worth stating plainly, because the
+        // symptom is indistinguishable from the thing the probe is testing for:
+        // "the ultra frame is black" reads as SRC being broken at ultra, and the
+        // counters said otherwise in the same breath (262,144 of 262,144 pixels
+        // lit, zero empty, 1.9M deposits). The frame was fine. The handle was
+        // dead. A cached GPU handle across a resolution change is a stale-read
+        // bug in any harness, and this module's own §12 notes record two others.
+        let W = 0, H = 0, METRES_PER_TEXEL = 0, X0 = 0, X1 = 0, Y0 = 0, Y1 = 0, MAX_LAG = 0;
+        let lumBuf = null, copyLum = null;
+        const bindTargets = () => {
+          const targets = system()?._giTargets;
+          const size = system()?._giTargetSize;
+          if (!targets?.irradiance || !size) throw new Error("no GI resolve targets");
+          if (size.width === W && size.height === H && copyLum) return false;
+          W = size.width;
+          H = size.height;
+          METRES_PER_TEXEL = WORLD / W;
+          const M = Math.floor(W * 0.15);
+          X0 = M; X1 = W - M; Y0 = M; Y1 = H - M;
+          MAX_LAG = Math.floor((X1 - X0) / 3);
+          lumBuf = instancedArray(new Float32Array(W * H), "float");
+          const irrNode = texture(targets.irradiance);
+          const widthU = uniform(W, "uint");
+          copyLum = Fn(() => {
+            const px = instanceIndex.mod(widthU);
+            const py = instanceIndex.div(widthU);
+            const t = irrNode.load(ivec2(px.toInt(), py.toInt()));
+            lumBuf.element(instanceIndex).assign(t.xyz.dot(vec3(0.2126, 0.7152, 0.0722)));
+          })().compute(W * H);
+          return true;
+        };
+        const grabLum = async () => {
+          bindTargets();
+          engine.renderer.compute(copyLum);
+          return new Float32Array(await engine.renderer.getArrayBufferAsync(lumBuf.value));
+        };
+        bindTargets();
+        say(`ortho ${WORLD}m, GI target ${W}x${H} = ${(METRES_PER_TEXEL * 100).toFixed(2)}cm/texel ` +
+          "(re-read per tier — quality changes it)");
+        say("");
+
+        // ── THE SWEEP ────────────────────────────────────────────────────
+        const TIERS = ["low", "medium", "high", "ultra"];
+        const AVG = 16;
+        const rows = [];
+        // A WARMUP ARM, DISCARDED. The first measurement after boot carried
+        // frame-to-frame noise of 6.0e-1 against 2.2e-3 for every arm after it —
+        // two hundred times the steady value, and enough on its own to bury the
+        // structure this probe exists to find. Same discipline as the flicker
+        // rig's discarded first arm, and for the same reason.
+        for (const tier of ["medium", ...TIERS]) {
+          const warmup = rows.length === 0 && tier === "medium";
+          giComp.setProp?.("quality", tier) ?? (giComp.props.quality = tier);
+          // A tier change rebuilds the field. `_fieldReadyOnce` is STICKY — it
+          // is already true from the previous tier — so waiting on it returns
+          // instantly and reads the old build mid-teardown. The `ultra` arm read
+          // a uniformly BLACK frame that way (mean 0.000) and reported a block
+          // size of zero, which the ratio arm then divided by. Waiting for a LIT
+          // frame is the condition that actually distinguishes the two.
+          await settle(2000);
+          const d2 = performance.now() + 90_000;
+          let lit = false;
+          while (performance.now() < d2) {
+            await settle(400);
+            if (!system()?._fieldReadyOnce) continue;
+            const g = await grabLum();
+            let m = 0;
+            for (let y = Y0; y < Y1; y++) for (let x = X0; x < X1; x++) m += g[y * W + x];
+            if (m / ((X1 - X0) * (Y1 - Y0)) > 0.05) { lit = true; break; }
+          }
+          if (!lit) {
+            // DIAGNOSE, do not just fail. "Never lit" has three very different
+            // causes — SRC refused to build, the pool starved, or the gather
+            // found nothing — and they are told apart by counters that are all
+            // right here.
+            const src = system()?.state?.screen?.srcProbes;
+            let detail = src ? "" : "no srcProbes system at all (SRC refused to build)";
+            if (src) {
+              const st = await src.readStats(engine.renderer);
+              detail = `probes ${st.cascades.map((c) => c.live).join("/")}, ` +
+                `noBlock ${st.cascades.map((c) => c.noBlock).join("/")}, ` +
+                `failed ${st.cascades.map((c) => c.failed).join("/")}, ` +
+                `rays ${st.rays?.rays ?? "?"}, deposits ${st.rays?.deposits ?? "?"}, ` +
+                `dropped ${st.rays?.noBlock ?? "?"}, ` +
+                `gather ${st.gather ? `${st.gather.lit}/${st.gather.pixels} lit, ${st.gather.empty} empty` : "none"}, ` +
+                `bins ${(st.bytes / 1048576).toFixed(1)}MB`;
+            }
+            throw new Error(`tier ${tier} never produced a lit frame — ${detail}`);
+          }
+          await settle(2500);
+
+          // AVERAGE FIRST. Temporal noise decorrelates at lag 1 and would drive
+          // the half-width to ~1 texel whatever the spatial content is — the
+          // exact mechanism that would manufacture the null this arm expects.
+          const acc = new Float64Array(W * H);
+          let prev = null;
+          let noiseSum = 0;
+          let noiseN = 0;
+          for (let f = 0; f < AVG; f++) {
+            const g = await grabLum();
+            for (let i = 0; i < acc.length; i++) acc[i] += g[i];
+            if (prev) {
+              for (let y = Y0; y < Y1; y++) {
+                for (let x = X0; x < X1; x++) {
+                  const d = g[y * W + x] - prev[y * W + x];
+                  noiseSum += d * d;
+                  noiseN++;
+                }
+              }
+            }
+            prev = g;
+            await settle(70);
+          }
+          for (let i = 0; i < acc.length; i++) acc[i] /= AVG;
+          const noiseRms = Math.sqrt(noiseSum / Math.max(1, noiseN));
+
+          let mean = 0;
+          for (let y = Y0; y < Y1; y++) for (let x = X0; x < X1; x++) mean += acc[y * W + x];
+          mean /= (X1 - X0) * (Y1 - Y0);
+
+          const linesX = linesOf(acc, W, H, "x", X0, X1, Y0, Y1);
+          const linesZ = linesOf(acc, W, H, "z", X0, X1, Y0, Y1);
+          const hx = acfHalfWidth(linesX, MAX_LAG);
+          const hz = acfHalfWidth(linesZ, MAX_LAG);
+          const s0 = cfgMod.SRC_QUALITY[tier].spacing0;
+          const bx = 2 * hx.lag * METRES_PER_TEXEL;
+          const bz = 2 * hz.lag * METRES_PER_TEXEL;
+          // Residual RMS, so a block size measured on nothing is visible as such.
+          let rss = 0, rn = 0;
+          for (const l of linesX) for (const v of l) { rss += v * v; rn++; }
+          const resRms = Math.sqrt(rss / Math.max(1, rn));
+          if (warmup) {
+            say(`  (warmup ${tier}, discarded: noise ${noiseRms.toExponential(1)})`);
+            continue;
+          }
+          // THE GEOMETRY TRAVELS WITH THE ROW. `quality` changes the target
+          // resolution, so the texel scale and the analysis window differ
+          // between tiers — and the synthetic control below has to rebuild each
+          // field at the SAME scale its real counterpart was measured at, or it
+          // is calibrating the estimator against a resolution nothing used.
+          rows.push({ tier, s0, bx, bz, mean, resRms, noiseRms,
+            W, H, mpt: METRES_PER_TEXEL, X0, X1, Y0, Y1, MAX_LAG });
+          say(`  ${tier.padEnd(7)} s0 ${s0.toFixed(2)}m   block x ${bx.toFixed(3)}m  z ${bz.toFixed(3)}m   ` +
+            `(x/s0 ${(bx / s0).toFixed(2)}, z/s0 ${(bz / s0).toFixed(2)})   ` +
+            `${W}x${H} @ ${(METRES_PER_TEXEL * 100).toFixed(2)}cm   ` +
+            `mean ${mean.toFixed(3)} residual ${resRms.toExponential(1)} noise ${noiseRms.toExponential(1)}`);
+        }
+        say("");
+
+        // ══ ARM 1: THE INSTRUMENT FINDS A BLOCK THAT IS THERE ═══════════
+        say("── CONTROL: the estimator, against synthetic fields it must resolve ──");
+        // Without this the whole probe is unfalsifiable. Piecewise-constant at
+        // each tier's own s₀, plus a smooth gradient for the cubic to remove,
+        // plus Gaussian noise at the level the real frames actually carried.
+        let worstCtl = 0;
+        const rng = (() => { let s = 12345; return () => { s = (s * 1103515245 + 12345) & 0x7fffffff; return s / 0x7fffffff; }; })();
+        // A REAL HASH FOR THE CELL VALUES. The first version used
+        // `((cx*73856093) ^ (cy*19349663)) & 1023`, whose low ten bits are
+        // strongly correlated between ADJACENT cells — which widens the ACF and
+        // makes the synthetic blocks read bigger than they are. The control was
+        // then measuring its own field's defect and blaming the estimator.
+        const cellValue = (cx, cy) => {
+          let h = Math.imul(cx | 0, 0x27d4eb2d) ^ Math.imul(cy | 0, 0x165667b1);
+          h = Math.imul(h ^ (h >>> 15), 0x2545f491);
+          h ^= h >>> 13;
+          h = Math.imul(h, 0x27d4eb2d);
+          return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+        };
+        for (const r of rows) {
+          const period = r.s0 / r.mpt;
+          const synth = new Float64Array(r.W * r.H);
+          for (let y = 0; y < r.H; y++) {
+            for (let x = 0; x < r.W; x++) {
+              const cell = cellValue(Math.floor(x / period), Math.floor(y / period));
+              // block + gradient + noise, at the measured noise amplitude
+              // AMPLITUDE FROM THE REAL RESIDUAL, NOISE FROM THE AVERAGED
+              // FRAME. The first version added the RAW frame-to-frame noise to
+              // a field whose blocks were that same size, i.e. SNR 1, and the
+              // control failed at 95% for a reason that had nothing to do with
+              // the estimator. `AVG` frames of independent noise average down
+              // by sqrt(AVG), and that is the noise the measurement actually
+              // carries — so this is the regime the real arm runs in.
+              synth[y * r.W + x] = (cell - 0.5) * r.resRms * 2.83
+                + (x / r.W) * r.mean * 0.5
+                + (rng() - 0.5) * (r.noiseRms / Math.sqrt(AVG));
+            }
+          }
+          const h = acfHalfWidth(linesOf(synth, r.W, r.H, "x", r.X0, r.X1, r.Y0, r.Y1), r.MAX_LAG);
+          const got = 2 * h.lag * r.mpt;
+          const err = Math.abs(got - r.s0) / r.s0;
+          worstCtl = Math.max(worstCtl, err);
+          say(`   ${r.tier.padEnd(7)} synthetic blocks at ${r.s0.toFixed(2)}m read as ` +
+            `${got.toFixed(3)}m (${(100 * err).toFixed(1)}% off), with the arm's own noise added`);
+        }
+        check("the estimator recovers a block period that IS present",
+          worstCtl < 0.25,
+          `worst ${(100 * worstCtl).toFixed(1)}% — if this fails the null below means nothing`);
+
+        // ══ ARM 2: THE REAL FRAME HAS NO PERIOD AT s₀ ═══════════════════
+        say("");
+        say("── LATTICE: does the residual's period track the probe spacing? ──");
+        // R14's question, and §12.22's prediction. If the frame were piecewise
+        // constant across probe cells, block/s₀ would sit near 1 at every tier
+        // and would TRACK s₀ across a 2.3x sweep. The failure mode to rule out
+        // is the opposite of the usual one: a null that is really noise, which
+        // is what ARM 1 exists to exclude.
+        // ══ AND "SMALL" IS THE WRONG TEST — "DOES NOT TRACK" IS THE RIGHT ONE
+        //
+        // The first version asserted `block/s₀ < 0.5` and failed at 1.67, which
+        // proved nothing either way: R14 asks whether the structure's length
+        // SCALES WITH the probe lattice, and a single ratio cannot answer that
+        // at any value. If the frame were piecewise-constant across probe cells
+        // the measured length would follow s₀ across the sweep — 2.29x from low
+        // to ultra. If it is anything else (a texel, a trace footprint, the
+        // noise floor) the length stays put while s₀ moves under it.
+        //
+        // So the statistic is the RANGE of the measured length against the range
+        // of s₀, which needs no calibration and no threshold pulled from the air.
+        const ratios = rows.flatMap((r) => [r.bx / r.s0, r.bz / r.s0]);
+        const sizes = rows.flatMap((r) => [r.bx, r.bz]);
+        const s0Span = rows[0].s0 / rows.at(-1).s0;
+        const sizeSpan = Math.max(...sizes) / Math.max(1e-9, Math.min(...sizes));
+        const worstRatio = Math.max(...ratios);
+        say(`   block size ${sizes.map((v) => v.toFixed(2)).join(", ")}m ` +
+          `while s0 sweeps ${rows[0].s0} -> ${rows.at(-1).s0} (${s0Span.toFixed(2)}x)`);
+        say(`   block/s0: ${ratios.map((v) => v.toFixed(2)).join(", ")}`);
+        // Tracking would make sizeSpan >= s0Span AND the ratios nearly equal.
+        const ratioSpan = Math.max(...ratios) / Math.max(1e-9, Math.min(...ratios));
+        check("the structure's length does NOT scale with the probe spacing",
+          ratioSpan > 1.5,
+          `block/s0 spreads ${ratioSpan.toFixed(2)}x across the sweep; a lattice would ` +
+          "hold it near constant (that is what tracking MEANS)");
+        check("and the length itself barely moves while s0 moves 2.3x",
+          sizeSpan < s0Span * 1.4,
+          `size spans ${sizeSpan.toFixed(2)}x against s0's ${s0Span.toFixed(2)}x`);
+        // THE DECISIVE STATEMENT, because it is not a spread but a DIRECTION.
+        // Tracking would divide the measured length by s0Span as the tiers get
+        // finer. It multiplies instead — the structure gets LARGER as the probe
+        // lattice gets smaller, which no probe-cell artifact can do.
+        const coarse = (rows[0].bx + rows[0].bz) / 2;
+        const fine = (rows.at(-1).bx + rows.at(-1).bz) / 2;
+        say(`   low -> ultra: s0 divides by ${s0Span.toFixed(2)}, the measured length ` +
+          `${fine >= coarse ? "MULTIPLIES" : "divides"} by ${(Math.max(fine, coarse) / Math.min(fine, coarse)).toFixed(2)}`);
+        check("the length does not shrink WITH the lattice, which is what tracking would do",
+          fine > coarse / 1.2,
+          `${coarse.toFixed(2)}m at s0 ${rows[0].s0} -> ${fine.toFixed(2)}m at s0 ${rows.at(-1).s0}; ` +
+          `tracking would predict ${(coarse / s0Span).toFixed(2)}m`);
+        check("the residual is well below the signal it sits on",
+          rows.every((r) => r.resRms < r.mean * 0.2),
+          rows.map((r) => (r.resRms / r.mean).toFixed(3)).join(" / "));
+
+        if (validationErrors.length) check("no WebGPU validation errors", false, validationErrors[0]);
+
+        say("");
+        say(failures ? `gi-src-lattice: ${failures} CHECKS FAILED` : "gi-src-lattice: all cases PASS");
+        globalThis.__SRC_LATTICE_RESULT__ = {
+          pass: failures === 0,
+          failures,
+          cmPerTexel: rows.map((r) => +(r.mpt * 100).toFixed(2)).join("/"),
+          tiers: rows.map((r) => ({
+            tier: r.tier, s0: r.s0,
+            bx: +r.bx.toFixed(3), bz: +r.bz.toFixed(3),
+            ratio: +(r.bx / r.s0).toFixed(2),
+          })),
+          worstRatio: +worstRatio.toFixed(2),
+          worstControl: +(100 * worstCtl).toFixed(1),
+          storageLimit: device.limits.maxStorageBuffersPerShaderStage,
+          text: out.textContent,
+        };
+
+      } catch (error) {
+        fail(error);
+      }
+    </script>
+  </body>
+</html>
