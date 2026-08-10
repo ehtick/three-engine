@@ -1086,9 +1086,31 @@ export function makeVisibility(geometryTrace, voxelSize) {
       point[1] + normal[1] * lift,
       point[2] + normal[2] * lift,
     ];
+    // ══ THE LIFT MOVES THE ORIGIN, SO IT MOVES `maxT` — AND FORGETTING THAT
+    //    MAKES EVERY LIGHT SELF-OCCLUDED ═══════════════════════════════════
+    //
+    // `maxT` is measured by the caller from the SURFACE point, because that is
+    // where the light's distance is known. The trace starts 0.75 voxels away
+    // from there, so the same world point sits at a different `t` — and the
+    // emitter is the very next thing along the ray past its own `maxT`. Compare
+    // the shortened distance against the unshortened budget and the shadow ray
+    // hits the light itself, every light, every hit: the scene goes black with
+    // no NaN, no warning, and a shadow-ray count that looks perfectly healthy.
+    //
+    // Measured here as exactly that — 100% of the analytic emitter term lost,
+    // on three receivers, while the geometric path read correct values beside
+    // it. The endpoint is recoverable from `(point, toLight, maxT)` alone, so
+    // the correction needs nothing the GPU twin does not already have.
+    let budget = maxT;
+    if (Number.isFinite(maxT)) {
+      const tx = point[0] + toLight[0] * maxT - origin[0];
+      const ty = point[1] + toLight[1] * maxT - origin[1];
+      const tz = point[2] + toLight[2] * maxT - origin[2];
+      budget = Math.hypot(tx, ty, tz);
+    }
     const hit = geometryTrace(origin, toLight);
     if (!hit || hit.t < 0) return 1;
-    return hit.t < maxT ? 0 : 1;
+    return hit.t < budget ? 0 : 1;
   };
 }
 
@@ -1421,7 +1443,15 @@ export function brutePointIrradiance(position, normal, sceneTrace, sky, samples 
       t1[1] * x + t2[1] * y + normal[1] * z,
       t1[2] * x + t2[2] * y + normal[2] * z,
     ];
-    const hit = sceneTrace(position, dir);
+    // ══ THE SAMPLE INDEX IS THE RAY INDEX, AND IT IS NOT COSMETIC ═══════════
+    //
+    // A shaded trace (`shadeTrace`) makes NEE's light choice a pure function of
+    // the ray index — no RNG state, so the GPU can reproduce it. An arbiter that
+    // omits the argument hands every one of its 200,000 samples ray index 0,
+    // picks the SAME emitter every time, and converges beautifully onto the
+    // wrong answer: `E_i/p_i` for one i is only unbiased in expectation over i.
+    // Passing `i` costs nothing here and every geometry-only trace ignores it.
+    const hit = sceneTrace(position, dir, i);
     const L = hit.t >= 0 ? (hit.radiance ?? [0, 0, 0]) : sky;
     for (let k = 0; k < 3; k++) {
       acc[k] += L[k];

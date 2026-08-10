@@ -65,7 +65,14 @@ import {
   GAMMA,
   BETA,
   LOD0_REACH,
+  MAX_LOOP_ALBEDO,
 } from "../src/modules/gi/srcConfig.js";
+// THE REAL CLOSED FORM, not a local re-derivation. `refSphereAt` is what the
+// engine's NEE evaluates per emitter kind (plan §4.4), so the Phase-5 arms use
+// it directly — a private copy of pi*sin^2(alpha)*cos(theta) would have passed
+// this suite while the engine shipped the horizon-faded version. It costs one
+// `three/webgpu` import in bare node (~100ms) and buys the absence of a twin.
+import { refSphereAt } from "../src/modules/gi/emitterShapes.js";
 import {
   KEY_AXIS_OFFSET,
   KEY_AXIS_RANGE,
@@ -102,13 +109,23 @@ import {
   bakeProbeIrradiance,
   brutePointIrradiance,
   buildProbes,
+  clampLoopAlbedo,
+  emitterIrradianceExact,
+  emitterIrradianceNee,
+  faceForward,
   fillOctahedralBorder,
   gatherPixel,
+  hashUnitFloat,
+  makeHitShader,
+  makeSecondaryCache,
   makeSrcConfig,
+  makeVisibility,
   mergeCascades,
   resolveProbes,
   runSrcFrame,
   sampleTile,
+  shadeTrace,
+  sunIrradiance,
   traceAndDeposit,
 } from "../src/modules/gi/srcRef.js";
 
@@ -1459,6 +1476,964 @@ console.log("── OCCLUSION IS ACTUALLY TRANSPORTED ────────�
     dark < lit * 0.75, `open=${lit.toFixed(4)} blocked=${dark.toFixed(4)}`);
   check("the open arm is still a furnace (1.0 to f32 precision)", Math.abs(lit - 1) < 1e-6,
     `${lit.toFixed(12)}`);
+}
+
+// ═══════════════════════════════════════════ PHASE 5: HIT SHADING FIXTURES
+//
+// Everything above traces a room whose faces carry CONSTANT radiance, which is
+// deliberate: it makes those arms pure transport tests, because shading is not
+// in the loop. Phase 5 puts shading in the loop, so it needs a scene that
+// reports SURFACES rather than radiance — position, normal, albedo, emissive,
+// and whether the surface hit IS one of the NEE lights (R5's flag).
+//
+// The split is the same one the GPU has: `createSrcSceneTrace` returns a
+// record and `createSrcDepositFrame` takes `shadeHit` separately. Composing
+// them with `shadeTrace` is what lets the brute-force arbiter run the EXACT
+// shading the estimator ran — an arbiter with its own copy of the shading
+// measures the difference between two shading implementations, which is not
+// the question anyone is asking.
+
+/** Faces 0..5 = -x,+x,-y,+y,-z,+z, with the OUTWARD (out-of-medium) normal. */
+const FACE_NORMAL = [
+  [1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1],
+];
+
+/**
+ * A closed room with an optional emissive sphere and an optional occluder box.
+ * Returns a GEOMETRY trace: `{ t, position, normal, surface }`, never radiance.
+ *
+ * `flipNormals` returns every normal the other way round. Nothing physical
+ * changes — a record normal's sign is a property of how the gradient was
+ * sampled, not of the surface — so shading must be invariant to it, and that is
+ * what `faceForward` is for.
+ */
+function makeShadedScene({
+  half = 4, height = 6, surfaces, sphere = null, occluder = null, flipNormals = false,
+}) {
+  const min = [-half, 0, -half];
+  const max = [half, height, half];
+  const orient = (n) => (flipNormals ? [-n[0], -n[1], -n[2]] : [n[0], n[1], n[2]]);
+  return function geometryTrace(origin, dir) {
+    let best = Infinity;
+    let normal = null;
+    let id = -1;
+    for (let a = 0; a < 3; a++) {
+      const d = dir[a];
+      if (Math.abs(d) < 1e-12) continue;
+      const lo = (min[a] - origin[a]) / d;
+      const hi = (max[a] - origin[a]) / d;
+      if (lo > 1e-6 && lo < best) { best = lo; id = a * 2; }
+      if (hi > 1e-6 && hi < best) { best = hi; id = a * 2 + 1; }
+    }
+    if (id >= 0) normal = FACE_NORMAL[id];
+    if (sphere) {
+      // Ray-sphere, nearest positive root (works from inside and outside).
+      const o = [origin[0] - sphere.center[0], origin[1] - sphere.center[1], origin[2] - sphere.center[2]];
+      const b = o[0] * dir[0] + o[1] * dir[1] + o[2] * dir[2];
+      const c = o[0] * o[0] + o[1] * o[1] + o[2] * o[2] - sphere.radius * sphere.radius;
+      const disc = b * b - c;
+      if (disc > 0) {
+        const sq = Math.sqrt(disc);
+        const t = -b - sq > 1e-6 ? -b - sq : -b + sq;
+        if (t > 1e-6 && t < best) {
+          best = t;
+          id = 6; // the sphere
+          const px = origin[0] + dir[0] * t;
+          const py = origin[1] + dir[1] * t;
+          const pz = origin[2] + dir[2] * t;
+          const inv = 1 / sphere.radius;
+          normal = [
+            (px - sphere.center[0]) * inv,
+            (py - sphere.center[1]) * inv,
+            (pz - sphere.center[2]) * inv,
+          ];
+        }
+      }
+    }
+    if (occluder) {
+      let t0 = -Infinity;
+      let t1 = Infinity;
+      let axis = -1;
+      let sign = 1;
+      for (let a = 0; a < 3; a++) {
+        const d = dir[a];
+        if (Math.abs(d) < 1e-12) {
+          if (origin[a] < occluder.min[a] || origin[a] > occluder.max[a]) { t0 = Infinity; break; }
+          continue;
+        }
+        let lo = (occluder.min[a] - origin[a]) / d;
+        let hi = (occluder.max[a] - origin[a]) / d;
+        let s = -1;
+        if (lo > hi) { const t = lo; lo = hi; hi = t; s = 1; }
+        if (lo > t0) { t0 = lo; axis = a; sign = s; }
+        t1 = Math.min(t1, hi);
+      }
+      if (t0 <= t1 && t0 > 1e-6 && t0 < best) {
+        best = t0;
+        id = 7; // the occluder
+        normal = [0, 0, 0];
+        normal[axis] = sign;
+      }
+    }
+    if (id < 0) return { t: -1 };
+    return {
+      t: best,
+      position: [
+        origin[0] + dir[0] * best,
+        origin[1] + dir[1] * best,
+        origin[2] + dir[2] * best,
+      ],
+      normal: orient(normal),
+      surface: surfaces(id),
+    };
+  };
+}
+
+/**
+ * An OPEN scene: a ground plane, an optional occluder, an optional sphere, and
+ * sky above. Rays that go up escape.
+ *
+ * ══ A SUN CANNOT BE TESTED INSIDE A CLOSED BOX, AND THAT COST AN ARM ═══════
+ *
+ * The first version of the sun arms used `makeShadedScene`'s room, and every
+ * shadow ray reported OCCLUDED — correctly, because the room has a ceiling and
+ * a ceiling is between every point and the sun. Every sun measurement read
+ * zero, which looks exactly like a broken shadow ray and is in fact a correct
+ * one in a fixture that cannot admit sunlight. The fixture is the thing that
+ * has to change; the physics was right the whole time.
+ */
+function makeOpenScene({ surfaces, occluder = null, sphere = null, flipNormals = false }) {
+  const room = makeShadedScene({
+    half: 1e6, height: 1e6, surfaces, occluder, sphere, flipNormals,
+  });
+  return function geometryTrace(origin, dir) {
+    const hit = room(origin, dir);
+    if (!hit || hit.t < 0) return { t: -1 };
+    // A hit on the far walls of a 1e6 box is the sky: nothing is there.
+    if (hit.t > 1e5) return { t: -1 };
+    return hit;
+  };
+}
+
+/** `surfaceAt` for the fixture: the trace already resolved it. */
+const fixtureSurfaceAt = (hit) => ({
+  position: hit.position,
+  normal: hit.normal,
+  albedo: hit.surface.albedo ?? [0, 0, 0],
+  emissive: hit.surface.emissive ?? [0, 0, 0],
+  emitter: hit.surface.emitter ?? -1,
+  mover: hit.surface.mover ?? false,
+});
+
+/**
+ * A sphere emitter in the form `emitterIrradianceNee` consumes, backed by
+ * `emitterShapes.js`'s OWN closed form.
+ *
+ * Importing the real `refSphereAt` rather than re-deriving `π·sin²α·cosθ` here
+ * is the point: §12.21 spent a unit learning that two implementations of one
+ * table drift, and the closed form NEE evaluates in the engine is this one,
+ * horizon fade and all. A local copy would have passed this suite while the
+ * engine used something else.
+ */
+function makeSphereEmitter({ center, radius, radiance }) {
+  return {
+    center, radius, radiance,
+    irradianceAt(P, N) {
+      const f = refSphereAt(P, N, center, radius);
+      return [radiance[0] * f, radiance[1] * f, radiance[2] * f];
+    },
+    // The near surface point, pulled a hair toward the receiver so the shadow
+    // ray stops SHORT of the emitter's own geometry. Aiming at the centre with
+    // `maxT = |c-P|` makes every light self-occluded — the emitter is the first
+    // thing the ray hits — and the scene goes black with no error anywhere.
+    sampleTarget(P) {
+      const d = [center[0] - P[0], center[1] - P[1], center[2] - P[2]];
+      const dist = Math.max(1e-6, Math.hypot(d[0], d[1], d[2]));
+      const k = (dist - radius * 1.001) / dist;
+      return [P[0] + d[0] * k, P[1] + d[1] * k, P[2] + d[2] * k];
+    },
+  };
+}
+
+console.log("── HIT SHADING: R4, THE IN-LOOP ALBEDO CEILING ──────────────────");
+{
+  // R4 is a claim about a FIXED-POINT ITERATION, so it gets tested three ways:
+  // the clamp's algebra, the gain it implies, and the iteration actually run.
+  const below = [0.8, 0.5, 0.2];
+  const clampedBelow = clampLoopAlbedo(below);
+  check("an albedo at or under the ceiling is passed through bit-exactly",
+    clampedBelow.every((v, i) => v === below[i]), `[${clampedBelow.join(", ")}]`);
+
+  const cases = [[1, 1, 1], [1.4, 0.2, 0.05], [0.95, 0.9, 0.91], [3, -1, 0.5]];
+  let worstPeak = 0;
+  for (const a of cases) worstPeak = Math.max(worstPeak, Math.max(...clampLoopAlbedo(a)));
+  check("no albedo survives the ceiling — peak <= MAX_LOOP_ALBEDO",
+    worstPeak <= MAX_LOOP_ALBEDO + 1e-12,
+    `worst peak ${worstPeak.toFixed(6)} vs ceiling ${MAX_LOOP_ALBEDO}`);
+
+  // CHROMATICITY. Both a per-channel clamp and a scale satisfy the bound; only
+  // one of them keeps the colour, and colour bleed is what this module is FOR.
+  // The number is what makes the choice a decision rather than a preference.
+  const chroma = (v) => { const s = v[0] + v[1] + v[2]; return s > 0 ? v.map((c) => c / s) : [0, 0, 0]; };
+  const warmWhite = [1.0, 0.95, 0.9];
+  const scaled = clampLoopAlbedo(warmWhite);
+  const perChannel = warmWhite.map((v) => Math.min(v, MAX_LOOP_ALBEDO));
+  const shiftScaled = Math.max(...chroma(scaled).map((v, i) => Math.abs(v - chroma(warmWhite)[i])));
+  const shiftClamp = Math.max(...chroma(perChannel).map((v, i) => Math.abs(v - chroma(warmWhite)[i])));
+  check("scaling preserves chromaticity where a per-channel clamp does not",
+    shiftScaled < 1e-12 && shiftClamp > 1e-3,
+    `scale shift ${shiftScaled.toExponential(1)} vs per-channel clamp ${shiftClamp.toExponential(2)} on ${warmWhite.join("/")}`);
+
+  // ── THE ITERATION ITSELF ────────────────────────────────────────────────
+  //
+  // A closed box, every wall diffuse, one emissive ceiling, and the secondary
+  // cache wired to the PREVIOUS frame's tiles. That is plan §4.1 step [J] in
+  // miniature, and it is the only configuration in which R4 can actually fail.
+  //
+  // In a closed enclosure the form-factor matrix has row sums of exactly 1, so
+  // the multibounce operator is `rho * F` and its spectral radius is `rho`. The
+  // increments must therefore fall geometrically with ratio -> rho, and the sum
+  // must be finite. The unclamped rho = 1 arm is the same measurement with the
+  // ceiling removed, and it is what proves the instrument can see a divergence
+  // rather than merely reporting convergence.
+  const boxPixels = [];
+  {
+    const H = 1;
+    const step = 0.25;
+    for (let a = -H + step * 0.5; a < H; a += step) {
+      for (let b = step * 0.5; b < 2 * H; b += step) {
+        boxPixels.push({ position: [-H, b, a], normal: [1, 0, 0] });
+        boxPixels.push({ position: [H, b, a], normal: [-1, 0, 0] });
+        boxPixels.push({ position: [a, b, -H], normal: [0, 0, 1] });
+        boxPixels.push({ position: [a, b, H], normal: [0, 0, -1] });
+      }
+      for (let b = -H + step * 0.5; b < H; b += step) {
+        boxPixels.push({ position: [a, 0, b], normal: [0, 1, 0] });
+        boxPixels.push({ position: [a, 2 * H, b], normal: [0, -1, 0] });
+      }
+    }
+  }
+  const runLoop = (albedo, ceiling, iterations) => {
+    const surfaces = (id) => ({
+      albedo,
+      emissive: id === 3 ? [1, 1, 1] : [0, 0, 0], // +y ceiling emits
+      emitter: -1,
+    });
+    const geometry = makeShadedScene({ half: 1, height: 2, surfaces });
+    const cfg = makeSrcConfig({
+      spacing0: 0.5, raysPerPixel: 8, forceLod: 0, sky: [0, 0, 0],
+      camera: [0, 1, 0], anchor: [0, 1, 0],
+    });
+    let prev = null;
+    const series = [];
+    for (let k = 0; k < iterations; k++) {
+      const secondary = prev ? makeSecondaryCache(cfg, prev.built, prev.tiles) : null;
+      const shade = makeHitShader({
+        surfaceAt: fixtureSurfaceAt, secondary, maxLoopAlbedo: ceiling,
+      });
+      const frame = runSrcFrame(cfg, boxPixels, shadeTrace(geometry, shade));
+      const e = gatherPixel(cfg, frame.built, frame.tiles, [0, 0, 0], [0, 1, 0]);
+      series.push(e[0]);
+      prev = frame;
+    }
+    return series;
+  };
+  const ratios = (series) => {
+    const out = [];
+    for (let k = 2; k < series.length; k++) {
+      const num = series[k] - series[k - 1];
+      const den = series[k - 1] - series[k - 2];
+      out.push(Math.abs(den) > 1e-12 ? num / den : 0);
+    }
+    return out;
+  };
+
+  const clamped = runLoop([1, 1, 1], MAX_LOOP_ALBEDO, 11);
+  const clampedRatios = ratios(clamped);
+  const tailOf = (r) => r.slice(-4);
+  console.log(`   rho=1 clamped to ${MAX_LOOP_ALBEDO}: E = ${clamped.map((v) => v.toFixed(4)).join(" -> ")}`);
+  console.log(`      increment ratios: ${clampedRatios.map((v) => v.toFixed(4)).join(" ")}`);
+
+  // ══ THE CLAIM IS ASYMPTOTIC, AND THE FIRST VERSION ASSERTED MORE ══════════
+  //
+  // "every increment ratio < 1" failed at 1.2494 on the SECOND increment, and
+  // the assertion was the thing that was wrong. This is a power iteration: the
+  // ratio converges to the operator's spectral radius, it does not start there.
+  // Bounce 0 is a small bright ceiling seen directly; bounce 1 redistributes it
+  // over every wall, which is a larger transfer than bounce 0 was — so the
+  // early ratios carry the GEOMETRY of each successive redistribution and only
+  // the tail carries rho. R4 is a statement about the fixed point, so the tail
+  // is where it lives.
+  const tail = tailOf(clampedRatios);
+  check("the multibounce iteration CONTRACTS in the tail — every late ratio < 1 (R4)",
+    tail.every((r) => r < 1), `tail ${tail.map((v) => v.toFixed(4)).join(" ")}`);
+  check("and the contraction rate IS the clamped albedo, not the authored one",
+    Math.abs(tail[tail.length - 1] - MAX_LOOP_ALBEDO) < 0.05,
+    `tail ratio ${tail[tail.length - 1].toFixed(4)} vs ceiling ${MAX_LOOP_ALBEDO} (authored albedo was 1.0)`);
+  // The bound the ratio implies, checked as a bound: a geometric series with
+  // ratio rho starting at E_0 sums to at most E_0/(1-rho). 10x, not infinity —
+  // that is the entire content of "provably < 1".
+  const bound = clamped[0] / (1 - MAX_LOOP_ALBEDO);
+  check("the accumulated series stays under E_0/(1-rho), the bound the ceiling buys",
+    clamped[clamped.length - 1] < bound,
+    `E = ${clamped[clamped.length - 1].toFixed(4)} vs bound ${bound.toFixed(4)} (= ${clamped[0].toFixed(4)}/${(1 - MAX_LOOP_ALBEDO).toFixed(1)})`);
+
+  // CANARY: the same box with the ceiling lifted to 1.0. A closed enclosure at
+  // albedo 1 conserves every photon forever, so the series must NOT converge —
+  // and if the instrument reports contraction here, its green above is worth
+  // nothing.
+  const unclamped = runLoop([1, 1, 1], 1.0, 11);
+  const unclampedRatios = ratios(unclamped);
+  const unclampedTail = tailOf(unclampedRatios);
+  console.log(`   rho=1 UNCLAMPED: E = ${unclamped.map((v) => v.toFixed(4)).join(" -> ")}`);
+  console.log(`      increment ratios: ${unclampedRatios.map((v) => v.toFixed(4)).join(" ")}`);
+  const unclampedRate = unclampedTail[unclampedTail.length - 1];
+  check("CANARY: at albedo 1 with no ceiling the loop does NOT contract",
+    unclampedRate > 0.97,
+    `tail ratio ${unclampedRate.toFixed(4)} unclamped vs ${tail[tail.length - 1].toFixed(4)} clamped`);
+  check("the ceiling is what separates them (the two arms differ)",
+    unclamped[unclamped.length - 1] > clamped[clamped.length - 1] * 1.15,
+    `E_final ${unclamped[unclamped.length - 1].toFixed(4)} vs ${clamped[clamped.length - 1].toFixed(4)}`);
+}
+
+console.log("── HIT SHADING: THE RECORD NORMAL + THE SHADOW LIFT ─────────────");
+{
+  // faceForward is one line and it decides whether half the geometry in a
+  // closed room is lit at all.
+  let flipOk = true;
+  const rng = makeRng(0x51de);
+  for (let k = 0; k < 2000; k++) {
+    const n = randomDir(rng);
+    const d = randomDir(rng);
+    const f = faceForward(n, d);
+    if (f[0] * d[0] + f[1] * d[1] + f[2] * d[2] > 1e-12) flipOk = false;
+    // It is a SIGN choice, never a new direction.
+    const same = f.every((v, i) => v === n[i]);
+    const opp = f.every((v, i) => v === -n[i]);
+    if (!same && !opp) flipOk = false;
+  }
+  check("faceForward always opposes the incoming ray, and only ever flips the sign",
+    flipOk, "2000 random (normal, dir) pairs");
+
+  // The invariance that matters: a scene whose record normals are all reported
+  // the other way round must shade IDENTICALLY. This is the arm that fails if
+  // faceForward is dropped, and it fails by a factor of two-ish rather than a
+  // rounding difference — the far face of every wall goes black.
+  const surfaces = () => ({ albedo: [0.6, 0.6, 0.6], emissive: [0, 0, 0], emitter: -1 });
+  // TILTED, so more than one face of the slab is lit — a sun straight up lights
+  // exactly the top face and the invariance below would be asserting that three
+  // black hits are equal to three black hits.
+  const sunDir = [0.5, 0.75, 0.35];
+  const sunLen = Math.hypot(...sunDir);
+  const sun = { direction: sunDir.map((v) => v / sunLen), irradiance: [3, 3, 3] };
+  // A slab the rays can hit from BOTH sides — the whole point of the arm is the
+  // face whose record normal points away from the ray. A ground plane alone
+  // only ever gets hit from above and the flip is untestable on it.
+  const slab = { min: [-2, 2, -2], max: [2, 2.4, 2] };
+  const outward = makeOpenScene({ surfaces, occluder: slab });
+  const inward = makeOpenScene({ surfaces, occluder: slab, flipNormals: true });
+  const shadeOf = (geometry) => makeHitShader({
+    surfaceAt: fixtureSurfaceAt, sun, visibility: makeVisibility(geometry, 0.1),
+  });
+  const shots = [
+    { from: [0, 6, 0], dir: [0, -1, 0] },      // onto the slab's top
+    { from: [0, 0.1, 0], dir: [0, 1, 0] },     // onto its UNDERSIDE
+    { from: [5, 2.2, 0], dir: [-1, 0, 0] },    // its +x side
+    { from: [0, 0.2, 5], dir: [-0.2, 0.35, -1] },
+  ];
+  let worstFlip = 0;
+  let lit = 0;
+  for (const shot of shots) {
+    const len = Math.hypot(...shot.dir);
+    const d = shot.dir.map((v) => v / len);
+    const a = shadeTrace(outward, shadeOf(outward))(shot.from, d, 1);
+    const b = shadeTrace(inward, shadeOf(inward))(shot.from, d, 1);
+    if (a.radiance[0] > 0) lit++;
+    for (let k = 0; k < 3; k++) worstFlip = Math.max(worstFlip, Math.abs(a.radiance[k] - b.radiance[k]));
+  }
+  check("shading is invariant to the record normal's reported SIGN",
+    worstFlip === 0 && lit >= 2,
+    `worst channel difference ${worstFlip.toExponential(2)} over ${shots.length} hits, ${lit} of them lit`);
+
+  // ── THE LIFT IS THE VOXEL'S (R2), AND THIS MEASURES WHAT THAT COSTS ─────
+  //
+  // `createSrcVisibility` starts its shadow ray 0.75 voxels off the surface. So
+  // an occluder CLOSER to a surface than that is stepped over and its contact
+  // shadow is lost. That is not a bug to fix with a smaller epsilon — a smaller
+  // one re-acnes the surface at the same voxel scale — it is the medium's
+  // quantization showing through, and R2's whole point is that the number comes
+  // from the voxel rather than from probe spacing or from taste.
+  //
+  // What is worth having is the THRESHOLD, measured, so a lost contact shadow
+  // can be recognized instead of investigated.
+  check("makeVisibility refuses to invent a bias when it is not told the voxel size",
+    (() => { try { makeVisibility(outward, 0); return false; } catch { return true; } })(),
+    "a caller that does not know its medium cannot cast a correct shadow ray");
+
+  const VOXEL = 0.2;
+  const lift = 0.75 * VOXEL;
+  const heights = [0.02, 0.08, 0.14, 0.16, 0.2, 0.35];
+  const lost = [];
+  for (const h of heights) {
+    const plate = { min: [-1, h, -1], max: [1, h + 0.02, 1] };
+    const geometry = makeOpenScene({ surfaces, occluder: plate });
+    const visibility = makeVisibility(geometry, VOXEL);
+    const shade = makeHitShader({ surfaceAt: fixtureSurfaceAt, sun, visibility });
+    // The ground point directly under the plate. The hit record is built here
+    // rather than traced: a ray aimed down at it would hit the PLATE first, and
+    // the question is what the ground beneath the plate receives.
+    const r = shade({
+      position: [0, 0, 0], normal: [0, 1, 0], surface: surfaces(2),
+    }, [0, -1, 0], 1);
+    lost.push({ h, lit: r[0] > 1e-9 });
+  }
+  const firstShadowed = lost.find((r) => !r.lit);
+  console.log(`   voxel ${VOXEL}m, lift ${lift.toFixed(3)}m: ` +
+    lost.map((r) => `${r.h.toFixed(2)}m:${r.lit ? "LIT" : "shadowed"}`).join(" "));
+  check("contact shadows survive exactly where the occluder clears the lift",
+    lost.every((r) => r.lit === (r.h < lift)) && !!firstShadowed,
+    `threshold at ${lift.toFixed(3)}m = 0.75 x voxel — occluders nearer than that are stepped over, by construction`);
+}
+
+console.log("── HIT SHADING: THE SUN ─────────────────────────────────────────");
+{
+  const surfaces = () => ({ albedo: [1, 1, 1], emissive: [0, 0, 0], emitter: -1 });
+  const geometry = makeOpenScene({ surfaces });
+  const sun = { direction: [0, 1, 0], irradiance: [2, 2, 2] };
+
+  // The cosine law, exactly — not within a tolerance. E = E_perp * cos(theta).
+  let worstCos = 0;
+  const rng = makeRng(0x5a11);
+  let backFacing = 0;
+  for (let k = 0; k < 500; k++) {
+    const n = randomDir(rng);
+    const e = sunIrradiance(sun, [0, 3, 0], n, null);
+    const cos = n[1];
+    const expect = cos > 0 ? 2 * cos : 0;
+    if (cos <= 0) backFacing++;
+    worstCos = Math.max(worstCos, Math.abs(e[0] - expect));
+  }
+  check("the sun term is E_perp x cos(theta), exactly", worstCos < 1e-15,
+    `worst ${worstCos.toExponential(2)} over 500 normals (${backFacing} back-facing)`);
+
+  // A BACK-FACING surface must cost NOTHING. The early-out is most of what the
+  // sun term costs on the GPU, and an implementation that traces first and
+  // multiplies by cos afterward is correct and twice the price.
+  const counting = { rays: 0 };
+  const countingVis = (p, n, l, m) => { counting.rays++; return makeVisibility(geometry, 0.1)(p, n, l, m); };
+  sunIrradiance(sun, [0, 3, 0], [0, -1, 0], countingVis);
+  check("a back-facing surface casts no shadow ray at all", counting.rays === 0,
+    `${counting.rays} shadow rays for cos < 0`);
+  sunIrradiance(sun, [0, 3, 0], [0, 1, 0], countingVis);
+  check("a front-facing surface casts exactly one", counting.rays === 1, `${counting.rays}`);
+
+  // Shadowed vs lit, through the geometry — the R14 control. If these do not
+  // differ, the shadow ray never entered the calculation and every sun number
+  // above is measuring an unoccluded analytic formula.
+  const plate = { min: [-1, 2, -1], max: [1, 2.2, 1] };
+  const shadowed = makeOpenScene({ surfaces, occluder: plate });
+  const litE = sunIrradiance(sun, [0, 0.5, 0], [0, 1, 0], makeVisibility(geometry, 0.1));
+  const darkE = sunIrradiance(sun, [0, 0.5, 0], [0, 1, 0], makeVisibility(shadowed, 0.1));
+  check("the shadow ray actually occludes (control: same point, occluder on/off)",
+    litE[0] > 1.9 && darkE[0] === 0, `lit ${litE[0].toFixed(4)} vs shadowed ${darkE[0].toFixed(4)}`);
+
+  // And end to end: albedo/pi * E_sun at a hit.
+  const shade = makeHitShader({
+    surfaceAt: fixtureSurfaceAt, sun, visibility: makeVisibility(geometry, 0.1),
+  });
+  const r = shadeTrace(geometry, shade)([0, 3, 0], [0, -1, 0], 1);
+  // ALBEDO 1 DOES NOT SURVIVE THE LOOP — the expected value carries R4's
+  // ceiling, and that is the cross-check: an implementation that forgot the
+  // clamp lands on 2/pi = 0.6366 here, which is 11% brighter and looks fine.
+  const expect = MAX_LOOP_ALBEDO * 2 / Math.PI;
+  check("a sunlit hit returns clamp(albedo)/pi x E", Math.abs(r.radiance[0] - expect) < 1e-12,
+    `${r.radiance[0].toFixed(9)} vs ${expect.toFixed(9)} (unclamped would be ${(2 / Math.PI).toFixed(4)})`);
+  check("CONTROL: the same hit with no sun is black",
+    shadeTrace(geometry, makeHitShader({ surfaceAt: fixtureSurfaceAt }))([0, 3, 0], [0, -1, 0], 1)
+      .radiance.every((v) => v === 0), "sun on/off differ");
+}
+
+console.log("── HIT SHADING: EMITTER NEE ─────────────────────────────────────");
+{
+  const emitters = [
+    makeSphereEmitter({ center: [-2, 4, -2], radius: 0.3, radiance: [40, 8, 8] }),
+    makeSphereEmitter({ center: [2, 4.5, 1], radius: 0.5, radiance: [6, 30, 6] }),
+    makeSphereEmitter({ center: [0, 5, 3], radius: 0.2, radiance: [8, 8, 50] }),
+    makeSphereEmitter({ center: [3, 1, -3], radius: 0.4, radiance: [20, 20, 20] }),
+  ];
+  const P = [0, 0.2, 0];
+  const N = [0, 1, 0];
+  const exact = emitterIrradianceExact(emitters, P, N, null);
+
+  // ══ THE PDF IS SCALAR AND THE SIGNAL IS NOT — WHICH IS THE WHOLE FINDING ══
+  //
+  // With `p_i ∝ luminance(E_i)`, `E_i/p_i = Σ_j E_j` holds in LUMINANCE for
+  // whichever i is drawn: one sample is not an unbiased estimate of the total
+  // luminance, it IS the total luminance, exactly, for every ray index.
+  //
+  // It does NOT hold per channel, and the first version of this arm asserted
+  // that it did (it failed at 7.4x). The reason is worth writing down because
+  // it is a property of every importance-sampled NEE and it will show up on the
+  // GPU as coloured noise nobody expected: the pdf is one scalar and the signal
+  // has three components, so a draw that is exact in the ranked quantity
+  // redistributes the OTHER two. A red emitter drawn in place of a blue one of
+  // equal luminance returns the right amount of light in the wrong hue.
+  //
+  // So: variance in a monochrome scene is zero, and all residual variance under
+  // full visibility is CHROMATIC. That also says what the fix is if it ever
+  // matters — rank on the channel being estimated, or spend more samples — and
+  // it says the noise floor cannot be blamed on the tree.
+  let worstLum = 0;
+  let worstChannel = 0;
+  const lum = (v) => 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2];
+  for (let n = 0; n < 4000; n++) {
+    const est = emitterIrradianceNee(emitters, P, N, null, n, { samples: 1 });
+    worstLum = Math.max(worstLum, Math.abs(lum(est) - lum(exact)) / lum(exact));
+    for (let k = 0; k < 3; k++) {
+      worstChannel = Math.max(worstChannel, Math.abs(est[k] - exact[k]) / Math.max(1e-9, exact[k]));
+    }
+  }
+  check("one-sample NEE is EXACT in the quantity its pdf ranks on (luminance)",
+    worstLum < 1e-12, `worst relative ${worstLum.toExponential(2)} over 4000 ray indices`);
+  console.log(`   per-channel spread of the same 4000 draws: ${(worstChannel * 100).toFixed(0)}% ` +
+    `— chromatic variance, not energy loss (the pdf is scalar, the signal is not)`);
+
+  // The monochrome control, which is what turns the paragraph above into a
+  // measurement: make every emitter grey and the per-channel error collapses to
+  // the luminance error. If it did not, the explanation would be wrong.
+  const grey = emitters.map((e) => makeSphereEmitter({
+    center: e.center, radius: e.radius, radiance: [lum(e.radiance), lum(e.radiance), lum(e.radiance)],
+  }));
+  const greyExact = emitterIrradianceExact(grey, P, N, null);
+  let worstGrey = 0;
+  for (let n = 0; n < 4000; n++) {
+    const est = emitterIrradianceNee(grey, P, N, null, n, { samples: 1 });
+    for (let k = 0; k < 3; k++) {
+      worstGrey = Math.max(worstGrey, Math.abs(est[k] - greyExact[k]) / Math.max(1e-9, greyExact[k]));
+    }
+  }
+  check("CONTROL: with grey emitters the per-channel error collapses to zero too",
+    worstGrey < 1e-12, `worst relative ${worstGrey.toExponential(2)} — the spread above is chroma and nothing else`);
+
+  // Every emitter must be REACHABLE. A light with a nonzero contribution and a
+  // zero pick probability is energy that vanishes with no error anywhere — R1's
+  // rule about rejection weights, wearing a sampling costume.
+  const picked = new Set();
+  for (let n = 0; n < 4000; n++) {
+    for (let i = 0; i < emitters.length; i++) {
+      const one = emitterIrradianceNee([emitters[i]], P, N, null, n, { samples: 1 });
+      if (one[0] + one[1] + one[2] > 0) picked.add(i);
+    }
+  }
+  // ...and, in the multi-emitter draw, that all four are actually drawn.
+  const drawn = new Set();
+  for (let n = 0; n < 4000; n++) {
+    const u = hashUnitFloat(n * 0x9e37);
+    let acc = 0;
+    const lum = emitters.map((e) => {
+      const E = e.irradianceAt(P, N);
+      return 0.2126 * E[0] + 0.7152 * E[1] + 0.0722 * E[2];
+    });
+    const total = lum.reduce((a, b) => a + b, 0);
+    for (let i = 0; i < emitters.length; i++) {
+      acc += lum[i] / total;
+      if (u < acc) { drawn.add(i); break; }
+    }
+  }
+  check("every contributing emitter is reachable by the sampler",
+    picked.size === emitters.length && drawn.size === emitters.length,
+    `${drawn.size}/${emitters.length} drawn, ${picked.size}/${emitters.length} deliver`);
+
+  // ══ WITH OCCLUSION: CONVERGENCE, AND WHAT A WORSE IMPORTANCE COSTS ════════
+  //
+  // Visibility is the only source of variance here, so this is the number that
+  // says what the light tree's bounds-based ranking will actually pay. Uniform
+  // importance is the worst-case stand-in for "a ranking that knows nothing".
+  const surfaces = (id) => ({
+    albedo: [0.5, 0.5, 0.5], emissive: [0, 0, 0], emitter: id === 6 ? 0 : -1,
+  });
+  const blocker = { min: [-3, 2, -3], max: [0.2, 2.3, 3] };
+  const geometry = makeShadedScene({ half: 4, height: 6, surfaces, occluder: blocker });
+  const visibility = makeVisibility(geometry, 0.1);
+  const truth = emitterIrradianceExact(emitters, P, N, visibility);
+  const meanOf = (importance) => {
+    const acc = [0, 0, 0];
+    const sq = [0, 0, 0];
+    // THE VARIANCE IS MEASURED IN LUMINANCE, because that is what the pdf ranks
+    // on. A per-channel standard error mixes in the chromatic spread the arm
+    // above just isolated, and that spread is the SAME for both importances —
+    // so it swamps the difference and reports 1.17x for a change that is worth
+    // much more. Compare estimators in the quantity they estimate.
+    const S = 20000;
+    let sum = 0;
+    let sumSq = 0;
+    for (let n = 0; n < S; n++) {
+      const est = emitterIrradianceNee(emitters, P, N, visibility, n, { samples: 1, importance });
+      const l = lum(est);
+      sum += l;
+      sumSq += l * l;
+      for (let k = 0; k < 3; k++) { acc[k] += est[k]; sq[k] += est[k] * est[k]; }
+    }
+    const meanLum = sum / S;
+    return {
+      meanLum,
+      stderrLum: Math.sqrt(Math.max(0, sumSq / S - meanLum * meanLum) / S),
+      mean: acc.map((v) => v / S),
+    };
+  };
+  const good = meanOf(null);
+  const flat = meanOf(() => 1);
+  const truthLum = lum(truth);
+  check("NEE converges to the all-emitters answer within its own standard error",
+    Math.abs(good.meanLum - truthLum) < 3 * good.stderrLum,
+    `${good.meanLum.toFixed(5)} vs ${truthLum.toFixed(5)} (3-sigma = ${(3 * good.stderrLum).toExponential(2)})`);
+  check("a uniform importance is unbiased too — the cost is variance, not energy",
+    Math.abs(flat.meanLum - truthLum) < 3 * flat.stderrLum,
+    `${flat.meanLum.toFixed(5)} vs ${truthLum.toFixed(5)} (3-sigma = ${(3 * flat.stderrLum).toExponential(2)})`);
+  const ratio = flat.stderrLum / Math.max(1e-12, good.stderrLum);
+  console.log(`   luminance stderr: contribution-importance ${good.stderrLum.toExponential(2)}, ` +
+    `uniform ${flat.stderrLum.toExponential(2)} — ${ratio.toFixed(2)}x`);
+  console.log(`   (a ${ratio.toFixed(1)}x standard error is ${(ratio * ratio).toFixed(0)}x the samples ` +
+    `for equal noise — the price of a ranking that knows nothing, and the ceiling on what a light tree can lose)`);
+  check("contribution-proportional importance is measurably better than uniform",
+    ratio > 1.5, `${ratio.toFixed(2)}x the standard error at equal sample count`);
+}
+
+console.log("── HIT SHADING: R5, THE EMITTER ENERGY HANDOFF ──────────────────");
+{
+  // ══ ONE LIGHT, TWO REPRESENTATIONS, ONE ENERGY ════════════════════════════
+  //
+  // R5: "two representations of one light must agree on energy before caps or
+  // clustering matter." §4.4 puts an emissive mesh in two places at once — NEE
+  // samples it analytically at every hit, and a ray that lands ON it picks up
+  // its emission — and resolves the double count with a flag: the hit emission
+  // is ZEROED when the surface is an NEE light.
+  //
+  // ══ THE FIRST VERSION OF THIS ARM COMPARED TWO DIFFERENT QUANTITIES ═══════
+  //
+  // It measured a floor receiver's irradiance with NEE off (which is the light
+  // arriving DIRECTLY from the emitter) against the same receiver with NEE on
+  // and the emission zeroed (which is the light arriving after bouncing off the
+  // walls). Those are the direct and indirect terms; they have no reason to be
+  // equal, and the arm read a 100% gap while both halves were correct.
+  //
+  // The two representations only meet AT A SHADING POINT. So:
+  //
+  //   analytic:   emitterIrradianceExact(H, n̂)  — the closed form + one
+  //               visibility ray, which is what NEE evaluates
+  //   geometric:  MC over H's hemisphere with the emitter as the ONLY emissive
+  //               surface and every albedo zero, which is what a ray that lands
+  //               on the emitter reports
+  //
+  // Both are "the irradiance the emitter delivers to H", and R5 is the claim
+  // that swapping one for the other changes no energy. It is an approximation
+  // by construction — an analytic form factor times a single binary visibility
+  // cannot resolve a partially-occluded emitter — and it is the SAME
+  // approximation the screen chain's analytic emitter direct already makes, so
+  // the arm bounds the gap rather than abolishing it.
+  const emitter = makeSphereEmitter({ center: [0, 4, 0], radius: 0.9, radiance: [12, 10, 8] });
+  const sphere = { center: emitter.center, radius: emitter.radius };
+  // Every albedo ZERO: the geometric arm must measure the emitter and nothing
+  // else. With reflective walls the MC would also carry the bounce, which the
+  // analytic form factor does not claim to include, and the "gap" would be the
+  // whole indirect term.
+  const emissiveOnly = (id) => ({
+    albedo: [0, 0, 0],
+    emissive: id === 6 ? emitter.radiance : [0, 0, 0],
+    emitter: id === 6 ? 0 : -1,
+  });
+  const geometry = makeShadedScene({ half: 4, height: 6, surfaces: emissiveOnly, sphere });
+  const visibility = makeVisibility(geometry, 0.1);
+  const emissionPath = makeHitShader({ surfaceAt: fixtureSurfaceAt });
+
+  const points = [
+    { position: [0, 0.05, 0], normal: [0, 1, 0], where: "under it" },
+    { position: [2.2, 0.05, 1.4], normal: [0, 1, 0], where: "off to one side" },
+    { position: [-3.9, 2.5, 0], normal: [1, 0, 0], where: "on a wall" },
+  ];
+  let worstGap = 0;
+  const rows = [];
+  for (const p of points) {
+    const geometric = brutePointIrradiance(p.position, p.normal,
+      shadeTrace(geometry, emissionPath), [0, 0, 0], 400000, 11);
+    const analytic = emitterIrradianceExact([emitter], p.position, p.normal, visibility);
+    const gap = Math.max(...[0, 1, 2].map((k) =>
+      Math.abs(analytic[k] - geometric.irradiance[k]) / Math.max(1e-9, geometric.irradiance[k])));
+    worstGap = Math.max(worstGap, gap);
+    rows.push(`${p.where}: analytic ${analytic[0].toFixed(5)} vs geometric ` +
+      `${geometric.irradiance[0].toFixed(5)} (${(gap * 100).toFixed(2)}%)`);
+  }
+  for (const row of rows) console.log(`   ${row}`);
+  check("the analytic and hit-emission representations agree on energy within 4%",
+    worstGap < 0.04,
+    `worst handoff gap ${(worstGap * 100).toFixed(2)}% (closed form + 1 visibility ray vs direct hits)`);
+
+  // ── THE DOUBLE COUNT AT FRAME LEVEL ─────────────────────────────────────
+  //
+  // Now the flag itself, through the whole transport. NEE lights the walls, the
+  // walls bounce, and the floor collects — that is SRC's job, indirect only,
+  // because the pixel's own direct emitter light comes from the screen chain
+  // (§4.4: "analytic emitter direct + emitter shadows at pixels stay in the
+  // screen chain unchanged"). If a ray that lands on the emitter ALSO reports
+  // its emission, that direct light is delivered a second time through SRC, and
+  // the flag is the only thing standing between the two.
+  //
+  // The excess is not a factor of two — direct and indirect are not equal — so
+  // the arm asserts a LARGE, one-sided excess and prints the size. A number
+  // this big is not a tuning question.
+  const room = (flagged) => (id) => ({
+    albedo: [0.6, 0.6, 0.6],
+    emissive: id === 6 ? emitter.radiance : [0, 0, 0],
+    emitter: id === 6 && flagged ? 0 : -1,
+  });
+  const cfg = makeSrcConfig({
+    spacing0: 0.5, raysPerPixel: 12, forceLod: 0, sky: [0, 0, 0],
+    camera: [0, 2, 0], anchor: [0, 2, 0],
+  });
+  const pixels = floorPixels(4, 0.5);
+  const frameFor = (flagged) => {
+    const g = makeShadedScene({ half: 4, height: 6, surfaces: room(flagged), sphere });
+    const shade = makeHitShader({
+      surfaceAt: fixtureSurfaceAt, emitters: [emitter],
+      visibility: makeVisibility(g, 0.1), neeEmitters: true,
+    });
+    const frame = runSrcFrame(cfg, pixels, shadeTrace(g, shade));
+    // THE MEAN OVER THE WHOLE FLOOR, not one point. A single gather sees the
+    // ~8 probes around it, and the rays that land on a small emitter are spread
+    // thinly across the floor's probes — the first version read one point,
+    // found 1.00x, and the double count was really there the whole time in
+    // probes the sample never touched. An energy claim wants an energy
+    // statistic.
+    let sum = 0;
+    for (const px of pixels) {
+      sum += gatherPixel(cfg, frame.built, frame.tiles, px.position, px.normal)[0];
+    }
+    return { E: [sum / pixels.length], shade };
+  };
+  const flagged = frameFor(true);
+  const unflagged = frameFor(false);
+  const excess = unflagged.E[0] / Math.max(1e-12, flagged.E[0]);
+  console.log(`   floor E: flagged ${flagged.E[0].toFixed(5)} (indirect only) ` +
+    `vs unflagged ${unflagged.E[0].toFixed(5)} — ${excess.toFixed(2)}x`);
+  check("CANARY: an unflagged emitter delivers its light through SRC as well",
+    excess > 1.5, `${excess.toFixed(2)}x the indirect-only answer`);
+  check("the flag is what suppresses it — the shader counts the zeroings",
+    flagged.shade.stats.emissiveZeroed > 0 && unflagged.shade.stats.emissiveZeroed === 0,
+    `flagged zeroed ${flagged.shade.stats.emissiveZeroed} hits, unflagged zeroed ${unflagged.shade.stats.emissiveZeroed}`);
+}
+
+console.log("── HIT SHADING: MOVERS ARE NOT A BRANCH ─────────────────────────");
+{
+  // §4.4 gives movers "header mean albedo/emissive Lambert shading", which is
+  // the same expression with the surface read from a different place. So the
+  // testable claim is an ABSENCE: two hits with identical albedo/emissive must
+  // shade identically whatever `mover` says. A mover-shaped `if` in the shader
+  // is the shape of the bug where a moving crate lights the room differently
+  // from the identical static one beside it, and that bug is invisible until
+  // someone picks the crate up.
+  const sun = { direction: [0.3, 0.9, 0.2], irradiance: [4, 3.5, 3] };
+  const len = Math.hypot(...sun.direction);
+  sun.direction = sun.direction.map((v) => v / len);
+  const shade = makeHitShader({ surfaceAt: fixtureSurfaceAt, sun });
+  const base = {
+    position: [1, 2, -0.5], normal: [0, 0, 1],
+    surface: { albedo: [0.7, 0.3, 0.2], emissive: [0.1, 0.1, 0.1], emitter: -1 },
+  };
+  const asStatic = shade({ ...base, surface: { ...base.surface, mover: false } }, [0, 0, -1], 3);
+  const asMover = shade({ ...base, surface: { ...base.surface, mover: true } }, [0, 0, -1], 3);
+  check("a mover hit and a static hit with the same surface shade identically",
+    asStatic.every((v, i) => v === asMover[i]),
+    `[${asStatic.map((v) => v.toFixed(6))}] vs [${asMover.map((v) => v.toFixed(6))}]`);
+}
+
+console.log("── HIT SHADING: BOUNCE COLOUR REACHES THE SCREEN ────────────────");
+{
+  // ══ THE HEADLINE, AND THE CONTROL THAT MAKES IT MEAN ANYTHING ═════════════
+  //
+  // `shadeHit` being null is why the current frame shows sky visibility with no
+  // bounce colour, and a Cornell box with no red on the white block is the
+  // CORRECT picture of Phase 4. This is the picture of Phase 5: one red wall,
+  // one green wall, a luminaire, and a floor that must pick up their hue.
+  //
+  // ══ A BOUNCE NEEDS SOMETHING TO BOUNCE, AND THE FIRST VERSION HAD NOTHING ═
+  //
+  // The first version lit the room with an emissive CEILING and no analytic
+  // light at all. A hit on a wall then shades `emissive + rho/pi * E` with
+  // E = 0 — every wall returns black, the only nonzero radiance in the room is
+  // the ceiling's own emission, and the floor reads a flawless neutral 3.12.
+  // That is a correct single bounce of a light that reaches surfaces by no
+  // path. Colour bleed is a SECOND transport: something has to light the wall
+  // before the wall can tint anything, and in SRC that "something" is the hit
+  // shading's own direct term — NEE, here — or the secondary cache.
+  const RED = [0.8, 0.08, 0.08];
+  const GREEN = [0.08, 0.8, 0.08];
+  const WHITE = [0.75, 0.75, 0.75];
+  // A BROAD, DIM luminaire rather than a small bright one. Both deliver the same
+  // power; a point-like source is a high-frequency term that a probe averaging
+  // over a 0.4m cell cannot represent, so it would put the arbiter comparison
+  // below into the paper's own blur limitation instead of measuring transport.
+  const emitter = makeSphereEmitter({ center: [0, 3.2, 0], radius: 0.6, radiance: [11, 11, 11] });
+  const sphere = { center: emitter.center, radius: emitter.radius };
+  const surfaces = (id) => ({
+    albedo: id === 6 ? [0, 0, 0] : id === 0 ? RED : id === 1 ? GREEN : WHITE,
+    emissive: id === 6 ? emitter.radiance : [0, 0, 0],
+    // FLAGGED: the luminaire is represented analytically (R5), so a ray landing
+    // on it must not also report its emission.
+    emitter: id === 6 ? 0 : -1,
+  });
+  const geometry = makeShadedScene({ half: 2, height: 4, surfaces, sphere });
+  const shade = makeHitShader({
+    surfaceAt: fixtureSurfaceAt, emitters: [emitter],
+    visibility: makeVisibility(geometry, 0.1),
+  });
+  const cfg = makeSrcConfig({
+    spacing0: 0.4, raysPerPixel: 96, forceLod: 0, sky: [0, 0, 0],
+    camera: [0, 2, 0], anchor: [0, 2, 0],
+  });
+  // Receivers on all six faces so the transport has something to carry between.
+  //
+  // ══ THE PIXEL GRID HAS TO FOLLOW s0, AND NOT DOING IT READ AS 100% ═══════
+  //
+  // A fixed 0.4m pixel grid feeding a 0.2m lattice leaves lattice nodes with no
+  // pixel on them, and a query point sitting exactly ON such a node puts all
+  // eight of its trilinear weights on corners that do not exist — the gather
+  // renormalizes over an empty set and returns 0, which the sweep read as
+  // "refining s0 made the error 100%". The transport was fine; the instrument
+  // had starved the finer level. A gbuffer is denser than the probe lattice by
+  // construction, so the fixture has to be too.
+  const shellPixels = (step) => {
+    const out = [];
+    const H = 2;
+    for (let a = -H + step * 0.5; a < H; a += step) {
+      for (let b = step * 0.5; b < 2 * H; b += step) {
+        out.push({ position: [-H, b, a], normal: [1, 0, 0] });
+        out.push({ position: [H, b, a], normal: [-1, 0, 0] });
+        out.push({ position: [a, b, -H], normal: [0, 0, 1] });
+        out.push({ position: [a, b, H], normal: [0, 0, -1] });
+      }
+      for (let b = -H + step * 0.5; b < H; b += step) {
+        out.push({ position: [a, 0, b], normal: [0, 1, 0] });
+        out.push({ position: [a, 2 * H, b], normal: [0, -1, 0] });
+      }
+    }
+    return out;
+  };
+  const pixels = shellPixels(0.2);
+  const dark = runSrcFrame(cfg, pixels, shadeTrace(geometry, () => [0, 0, 0]));
+  const lit = runSrcFrame(cfg, pixels, shadeTrace(geometry, shade));
+  const at = (frame, p) => gatherPixel(cfg, frame.built, frame.tiles, p, [0, 1, 0]);
+  const darkFloor = at(dark, [0, 0, 0]);
+  const litFloor = at(lit, [0, 0, 0]);
+  check("CONTROL: with hit shading absent the floor receives exactly zero",
+    darkFloor.every((v) => v === 0), `[${darkFloor.join(", ")}]`);
+  check("with hit shading the floor is lit", litFloor[0] > 0.05,
+    `centre floor E = [${litFloor.map((v) => v.toFixed(4))}]`);
+
+  // THE HUE. Near the red wall the floor must be redder than at the centre, and
+  // near the green wall greener — a scalar brightness check cannot tell bounce
+  // colour from a global gain, and a global gain is what a broken merge looks
+  // like.
+  const chroma = (v) => { const s = v[0] + v[1] + v[2]; return s > 1e-12 ? v.map((c) => c / s) : [0, 0, 0]; };
+  const nearRed = chroma(at(lit, [-1.5, 0, 0]));
+  const centre = chroma(litFloor);
+  const nearGreen = chroma(at(lit, [1.5, 0, 0]));
+  console.log(`   floor chromaticity: near-red [${nearRed.map((v) => v.toFixed(3))}]  ` +
+    `centre [${centre.map((v) => v.toFixed(3))}]  near-green [${nearGreen.map((v) => v.toFixed(3))}]`);
+  check("the floor picks up the red wall's hue near it",
+    nearRed[0] > centre[0] + 0.01 && nearRed[0] > nearGreen[0] + 0.02,
+    `r fraction ${nearRed[0].toFixed(4)} vs centre ${centre[0].toFixed(4)} vs near-green ${nearGreen[0].toFixed(4)}`);
+  check("and the green wall's, on the other side",
+    nearGreen[1] > centre[1] + 0.01 && nearGreen[1] > nearRed[1] + 0.02,
+    `g fraction ${nearGreen[1].toFixed(4)} vs centre ${centre[1].toFixed(4)} vs near-red ${nearRed[1].toFixed(4)}`);
+
+  // ── AND THE TRANSPORT, AGAINST THE ARBITER, WITH SHADING IN THE LOOP ────
+  //
+  // Everything above this line is structure; this is the only arm in the suite
+  // where the estimator and the arbiter disagree about SHADING as well as
+  // transport, and it is the one that would catch a hit shader that is
+  // self-consistent and wrong.
+  //
+  // The bar is the same one the unshaded transport arm uses and for the same
+  // reason: the estimator is blurred at the s0 scale BY DESIGN, so an absolute
+  // tolerance would be a number chosen to make today's build pass. What
+  // separates blur from a bug is whether the error falls as s0 shrinks. Rays
+  // scale x4 per halving so rays-per-probe stays constant — otherwise the finer
+  // arm is starved rather than sharper and the sweep measures noise.
+  //
+  // Receivers stay >= 2*s0 from every wall for the reason the unshaded arm
+  // spells out; nearer than that measures the paper's own interpolation leak,
+  // which has its own arm and its own bound.
+  const shadedTrace = shadeTrace(geometry, shade);
+  const points = [
+    { position: [0, 0.02, 0], normal: [0, 1, 0] },
+    { position: [-1.0, 0.02, 0.6], normal: [0, 1, 0] },
+    { position: [0.6, 0.02, -1.0], normal: [0, 1, 0] },
+  ];
+  const refs = points.map((p) =>
+    brutePointIrradiance(p.position, p.normal, shadedTrace, [0, 0, 0], 200000, 23));
+  const SWEEP = [
+    { spacing0: 0.4, step: 0.2, rpp: 96 },
+    { spacing0: 0.2, step: 0.1, rpp: 96 },
+  ];
+  const worstByLevel = [];
+  for (const level of SWEEP) {
+    const levelCfg = makeSrcConfig({
+      spacing0: level.spacing0, raysPerPixel: level.rpp, forceLod: 0, sky: [0, 0, 0],
+      camera: [0, 2, 0], anchor: [0, 2, 0],
+    });
+    // Pixels scale with s0, so rays-per-probe is held constant by the GRID
+    // rather than by the ray budget — which is what a real gbuffer does when
+    // resolveScale follows quality, and it avoids the starvation above.
+    const levelPixels = level.step === 0.2 ? pixels : shellPixels(level.step);
+    const frame = level.spacing0 === 0.4 ? lit : runSrcFrame(levelCfg, levelPixels, shadedTrace);
+    let worstLevel = 0;
+    const rows = [];
+    for (let i = 0; i < points.length; i++) {
+      const est = gatherPixel(levelCfg, frame.built, frame.tiles, points[i].position, points[i].normal);
+      const e = Math.max(...[0, 1, 2].map((k) =>
+        Math.abs(est[k] - refs[i].irradiance[k]) / Math.max(1e-6, refs[i].irradiance[k])));
+      worstLevel = Math.max(worstLevel, e);
+      rows.push(`(${points[i].position.map((v) => v.toFixed(1))}):${(e * 100).toFixed(1)}%`);
+    }
+    worstByLevel.push(worstLevel);
+    console.log(`   s0=${level.spacing0} step=${level.step} rpp=${String(level.rpp).padStart(3)} ` +
+      `vs brute-force MC over the same shading: ${rows.join(" ")}`);
+  }
+  check("shaded transport is bounded against the arbiter at every spacing",
+    worstByLevel.every((v) => v < 0.2),
+    worstByLevel.map((v) => `${(v * 100).toFixed(1)}%`).join(" -> "));
+  check("and refining s0 does not diverge (blur, not a structural fault)",
+    worstByLevel[1] < worstByLevel[0] * 1.5,
+    `${(worstByLevel[0] * 100).toFixed(1)}% -> ${(worstByLevel[1] * 100).toFixed(1)}% over a halving`);
+
+  // CANARY, the same shape the unshaded transport arm uses: a scale fault in
+  // the SHADING (not the merge) must be far outside the converged bar, or the
+  // two checks above are passing on a range wide enough to hide one.
+  //
+  // IT DARKENS RATHER THAN BRIGHTENS, and the first version did the opposite
+  // and nearly passed: x1.6 on a 0.75 albedo is 1.2, which MAX_LOOP_ALBEDO
+  // clamps straight back to 0.9 — a 1.2x fault, 11.6% of error, inside the bar.
+  // R4's ceiling absorbing an injected fault is the ceiling working; it just
+  // makes a brightening canary a poor instrument for anything else.
+  {
+    const brightShade = makeHitShader({
+      surfaceAt: (hit, dir) => {
+        const s0 = fixtureSurfaceAt(hit, dir);
+        return { ...s0, albedo: s0.albedo.map((v) => v * 0.55) };
+      },
+      emitters: [emitter], visibility: makeVisibility(geometry, 0.1),
+    });
+    const broken = runSrcFrame(cfg, pixels, shadeTrace(geometry, brightShade));
+    let worstBroken = 0;
+    for (let i = 0; i < points.length; i++) {
+      const est = gatherPixel(cfg, broken.built, broken.tiles, points[i].position, points[i].normal);
+      worstBroken = Math.max(worstBroken, ...[0, 1, 2].map((k) =>
+        Math.abs(est[k] - refs[i].irradiance[k]) / Math.max(1e-6, refs[i].irradiance[k])));
+    }
+    check("CANARY: a 0.55x albedo fault in the hit shading is far outside the bar",
+      worstBroken > 0.35,
+      `broken worst ${(worstBroken * 100).toFixed(1)}% vs converged ${(worstByLevel[1] * 100).toFixed(1)}%`);
+  }
 }
 
 console.log("─────────────────────────────────────────────────────────────────");
