@@ -3607,3 +3607,126 @@ error is `~0.5·α/r` quanta with `r = (L/Lmax)·2^F` per deposit, so `Lmax` is 
 exposure that sets it. §12.13.4 left clamp-versus-auto-exposure open pending a
 measurement of the hit-radiance distribution; this is a second reason to close
 it, and it does not bind until Phase 5 makes those words non-zero.
+
+### 12.24 Phase 4, unit 2 — the flicker measurement, on a real scene in motion
+
+§7's Phase 4 gate: `run-gi-flicker-frame` against the temporal blend. §12.23's
+`variance` arm measured 4.64× on a synthetic signal with STABLE probe
+membership; this is the same claim on Sponza, with a rotating box, where
+membership churns — and R6 is explicit that membership is the half an EMA
+cannot smooth.
+
+#### 12.24.1 THE INSTRUMENT FORBADE THE OBVIOUS A/B, so α became live
+
+`run-gi-flicker-frame.mjs`'s own header records that the SAME baseline config
+read **1.404 and 5.194 reversals/px in two processes** — a 3.7× spread, larger
+than any effect anyone has tried to measure with it — and that two conclusions
+had already been drawn from cross-process comparisons and had to be withdrawn.
+
+An α read once at GI build time can only be A/B'd by reloading the page, which
+is exactly that forbidden comparison. So `__giSrcAlpha` is now **polled per frame
+in `syncCamera`**, the same convention `__giDebugView` runs under, and the A/B
+happens in one page, one renderer, one load. The uniform is written only when the
+value changes, so a still scene's upload count stays at zero.
+
+#### 12.24.2 TWO THINGS THE RIG NEEDED, and one of them is a lie detector
+
+**A sky.** With hit shading still Phase 5 the sky is the ONLY radiance SRC
+transports, so a run without one measures a uniformly black resolve texture and
+reports a flawless absence of flicker — the same shape of failure the harness's
+own `__editorKeepRendering` note documents ("that is not a quiet scene, it is a
+stopped one, and it reads exactly like no flicker"). `sceneSkyRadiance` never
+samples the environment texture (chroma is deliberately unread until Phase 5), so
+a 1×1 white equirect is radiometrically exact here and needs no HDRI in the
+project.
+
+**Interleaving.** Running α=1 after α=0.1 once confounds the comparison with
+whatever drifts over a five-minute page. Two rounds alternating the two values
+make that drift visible instead: the first attempt read a **21% round-to-round
+spread at α=1** against 3% at the default, which is most of the effect being
+claimed. The reported run has 3% on both.
+
+#### 12.24.3 THE MOTION-EXCESS RATIO IS THE WRONG STATISTIC ACROSS α
+
+"Excess over the still control" is the right figure for comparing two BUILDS at
+one α — the control cancels the page's load, which is what it was written for.
+It falls apart across α, because **temporal accumulation moves the control**. At
+α = 1 every pixel churns every frame from the R2 jitter alone, so the still floor
+saturates and the moving arm has nothing to rise above:
+
+    alpha 1     moving 6.815   still 6.919   "excess" -2%
+    alpha 0.1   moving 3.318   still 2.688   "excess" +23%
+
+Dividing those two excesses gave **−15.6**, which the first version of the block
+printed and meant nothing by. Within one page the RAW counts are comparable —
+that is precisely the condition the still-control note establishes — so the A/B
+reports them directly, at both α, moving and still, over two rounds.
+
+#### 12.24.4 What it measures: the noise halves, the STEPS do not move
+
+Sponza, rotating box on two axes at 0.6 rad/s, 403×196 half-res, 150 frames per
+arm, `QUALITY=high`, SRC on, sky 1:
+
+    round  arm       reversals mv/still   stepP95 mv/still   walk mv/still
+    1      alpha 1   5.886 / 5.357        0.1484 / 0.0567    0.333 / 0.292
+    1      default   2.745 / 2.487        0.1410 / 0.0519    0.119 / 0.103
+    2      alpha 1   6.071 / 6.225        0.1122 / 0.0646    0.312 / 0.335
+    2      default   2.677 / 2.701        0.1515 / 0.0628    0.123 / 0.114
+
+    round-to-round spread 3% at both alpha — the effect clears it
+    reversals  /2.21 moving, /2.23 still
+    mean walk  /2.67 moving
+    step p95   x0.89 moving  — UNCHANGED
+
+**Accumulation halves the per-frame churn and does not touch the worst-case
+step.** Both halves of that are worth having in one sentence, because they answer
+different questions and only the first is what the blend was built for.
+
+#### 12.24.5 THE STEP FLOOR IS MEMBERSHIP, AND R6 NAMED IT IN ADVANCE
+
+The 2×2 is what separates the two readings, and it needed the STILL arm's step
+amplitude to close:
+
+    step p95   alpha 1   0.1303 moving / 0.0607 still   (x2.1)
+               default   0.1463 moving / 0.0573 still   (x2.6)
+
+Two facts fall out. The moving step is ~2× the still step at BOTH α, so most of
+it is real geometric change — a rotating box genuinely alters what a probe sees,
+and smoothing that would be smoothing the SIGNAL. But the STILL step floor is
+~0.06 at both α as well, and **if it were value noise α would have cut it by
+four**. It did not, so it is not value noise.
+
+The mechanism is bin-level membership. A bin that stops being sampled leaves the
+readable set — at α = 1 the frame it is not sampled, at α = 0.1 about forty
+frames later when its weight crosses `MIN_WEIGHT` — and the merge and the gather
+renormalize over the bins they FOUND (R1). A bin flipping between "known dim" and
+"absent" therefore changes the denominator, which is a step no accumulator on the
+VALUES can smooth. R6 says exactly this and says it about probes; the same
+argument holds one level down, at bins.
+
+**This is the gap between the two measurements**, and it is the useful number:
+the synthetic gate's 4.64× and this scene's 2.67× differ by what membership
+contributes. It is not a defect discovered late — it is R6 being right — but it
+does mean the tool for the remaining half is not a smaller α. Deliberately NOT
+chased here: hit shading (Phase 5) changes what a bin CONTAINS, so the sampling
+density that drives bin membership is about to change, and tuning against the
+current distribution would be tuning against a distribution that is going away.
+
+#### 12.24.6 Where Phase 4 stands
+
+Mechanism (§12.23) and the motion measurement (this section) are done. Still open
+from §7's gate list:
+
+- **`probe:gi-block-size` ACF** — block scale should track s₀·LOD (R14). Note
+  §12.22's finding stands in front of it: the blocks that probe was built to
+  measure are gone, so it needs re-reading rather than re-running.
+- **Memory high-water on an open-world scene**, which needs a rig built. SRC's
+  envelope is screen-proportional by construction (§4.2), so this is a check of a
+  claim rather than a search for a number: 56.32 MB at the engine default on the
+  smoke scene, against §4.2's ~180 MB worst case.
+
+`__giSrcProbes` remains opt-in until Phase 6, and the "diffuse indirect" build
+line now distinguishes the three states it can be in (absent / live but unlit /
+sky visibility) rather than reporting ABSENT unconditionally — it had stopped
+being able to tell them apart the moment the transport landed, which is the one
+job its own comment claims for it.
