@@ -46,23 +46,28 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 const POSE = { position: [11.8, 2.2, 0.73], target: [-3.2, 1.0, -1.47] };
 
 const ARMS = [
-  // ── A DISCARDED WARM-UP BOOT, AND IT IS NOT OPTIONAL ────────────────────
+  // ── A DISCARDED WARM-UP BOOT ────────────────────────────────────────────
   //
-  // The first page in a fresh browser does not merely converge slower — it
-  // BUILDS A DIFFERENT SYSTEM. Its mechanism readout says `78988 gbuffer
-  // pixels, c0 32768/65536` where a later arm says `58653, c0 16384/32768`, so
-  // no amount of waiting makes arm 1 comparable and the convergence poll below
-  // cannot rescue it. Measured: `shade-on` reads 0.11213/157,976 in position 1
-  // and 0.14721/249,860 in position 3 — the same flags, the same scene.
+  // Cheap insurance, and NOT the real defence — see `assertComparable` below.
+  //
+  // ⚠ THE MECHANISM HERE IS NOT PINNED DOWN, and an earlier version of this
+  // comment claimed it was ("the first page in a fresh browser BUILDS A
+  // DIFFERENT SYSTEM"). What is actually established: the editor sometimes
+  // builds a gbuffer with **78,988** valid pixels and sometimes **124,930**,
+  // which changes `shaded` (2 rays/px, so exactly 2×) and the frame's mean by
+  // ~30%. It is NOT simply "arm 1 vs the rest": one run read 78,988 on arms 1-2
+  // and 124,930 from arm 3 on; the next read 78,988 on all six. Viewport/canvas
+  // layout settling is the leading suspect and it has not been proven.
   //
   // Two wrong conclusions came out of that gap (§12.30.4), both because the arm
-  // that happened to run first was also the one under suspicion. One throwaway
-  // boot removes the whole class.
+  // that ran first was also the one under suspicion. The fix that does not
+  // depend on knowing the cause is to REFUSE the comparison when the coverage
+  // differs, which is what the assert does.
   { name: "warmup", shade: true, warmup: true },
   // THE FOOTGUN ARM. Sets ONE flag — `__giSrcProbes` — and nothing else, which
   // is what a person reaching for SRC actually types. Before §12.30.1 this
   // rendered at 4% lit (a black scene) because probes REPLACE the legacy diffuse
-  // term and, without shading, carry sky only. It must now match `bias-0.25`.
+  // term and, without shading, carry sky only. It must now match `shade-on`.
   { name: "probes-only", probesOnly: true },
   { name: "shade-off", shade: false },
   { name: "shade-on", shade: true },
@@ -235,6 +240,10 @@ for (const arm of arms) {
     for (const l of gi.filter((t) => /src probes:|built \(voxel/.test(t))) {
       console.log(`      · ${l.slice(0, 200)}`);
     }
+    // THE COVERAGE THIS ARM ACTUALLY MEASURED. Recorded per arm so the verdict
+    // can refuse to compare two arms that did not see the same amount of
+    // geometry — see `assertComparable`.
+    const gbuf = Number(/src probes: (\d+) gbuffer pixels/.exec(gi.find((t) => /src probes:/.test(t)) ?? "")?.[1]) || null;
     const frames = gi.filter((t) => /src probes —/.test(t));
     const last = frames.at(-1) ?? "";
     const maxL = /maxL ([\d.]+)/.exec(last)?.[1] ?? "n/a";
@@ -242,7 +251,7 @@ for (const arm of arms) {
     const unatt = /([\d.]+)% UNATTRIBUTED/.exec(last)?.[1] ?? "0.0";
     // A warm-up arm is measured and PRINTED — silently dropping it would hide
     // the very effect it exists for — but never enters the verdict.
-    if (!arm.warmup) results.push({ arm: arm.name, mean, lit, p99, maxL, shaded, unatt, errors: errors.slice(0, 3) });
+    if (!arm.warmup) results.push({ arm: arm.name, mean, lit, p99, maxL, shaded, unatt, gbuf, errors: errors.slice(0, 3) });
     console.log(
       `  ${(arm.warmup ? arm.name + " (discarded)" : arm.name).padEnd(20)} screen mean ${mean == null ? "  n/a " : mean.toFixed(5)}  ` +
       `lit ${lit == null ? " n/a " : (lit * 100).toFixed(1) + "%"}  p99 ${p99 == null ? "n/a" : p99.toFixed(4)}  ` +
@@ -263,6 +272,24 @@ for (const arm of arms) {
 await browser.close();
 
 console.log("\n── VERDICT ─────────────────────────────────────────────────────");
+// ── REFUSE TO COMPARE ARMS THAT DID NOT SEE THE SAME SCENE ────────────────
+//
+// Every ratio below divides one arm's mean by another's, which is only
+// meaningful if both rendered the same amount of geometry. Twice this harness
+// produced a confident wrong answer because they had not (§12.30.4), and both
+// times the numbers looked perfectly reasonable — a 30% difference reads as an
+// effect, not as an instrument fault. So it is asserted, not assumed: the
+// verdict is WITHHELD rather than printed with a caveat nobody reads.
+const coverages = [...new Set(results.map((r) => r.gbuf).filter(Boolean))];
+if (coverages.length > 1) {
+  console.log("  ✗ ARMS ARE NOT COMPARABLE — they rendered different gbuffer coverage:");
+  for (const r of results) console.log(`      ${r.arm.padEnd(14)} ${r.gbuf} valid pixels`);
+  console.log("    Every ratio below would divide two different scenes. Re-run; if it recurs,");
+  console.log("    pin the editor's viewport size before the GI module builds.");
+  console.log("    VERDICT WITHHELD.");
+  process.exit(1);
+}
+if (coverages.length === 1) console.log(`  (all arms at ${coverages[0]} valid gbuffer pixels — comparable)`);
 const by = Object.fromEntries(results.map((r) => [r.arm, r]));
 const rel = (a, b) => (by[a]?.mean && by[b]?.mean ? (by[a].mean / by[b].mean).toFixed(3) + "×" : "n/a (arm missing)");
 console.log(`  shading gain   (shade-on vs sky-only):     ${rel("shade-on", "shade-off")}`);

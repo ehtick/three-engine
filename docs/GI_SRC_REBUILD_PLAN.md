@@ -4776,15 +4776,21 @@ problem. Same shape as §12.29's seam: **both units pass; the thing between them
 is untested.** The eye check is now that missing arm, and it is cheap: four boots,
 one screenshot each, one number per arm that a person can also just look at.
 
-#### 12.30.4 ⚠ THE FIRST ARM IN A FRESH BROWSER IS NOT COMPARABLE TO THE REST
+#### 12.30.4 ⚠ ARMS THAT RENDER DIFFERENT GBUFFER COVERAGE ARE NOT COMPARABLE
 
 The eye check's own instrument fault, found by the eye check, and it produced two
 more wrong conclusions before it was caught.
 
-Arm 1 on a cold process reports **157,976 hits shaded** and a visibly dark frame.
-The SAME configuration in position ≥2 reports **249,860** and the correct one.
-Fifteen seconds after the camera move is convergence for a warm arm and not for a
-cold one.
+The editor sometimes builds a gbuffer with **78,988** valid pixels and sometimes
+**124,930**. At 2 rays/px that is exactly the 157,976-vs-249,860 split in the hit
+count, and it moves the frame mean by ~30%.
+
+**The cause is NOT pinned down and this section twice said it was.** First
+diagnosis: "arm 1 has not converged" — refuted, the convergence poll settles at
+157,976 and stays there. Second: "the first page in a fresh browser builds a
+different system" — refuted by the next run, which read 78,988 on *all six* arms
+where its predecessor had read 78,988 on arms 1–2 and 124,930 from arm 3 on.
+Viewport/canvas layout settling is the leading suspect and it is a suspect.
 
 The confound is perfect whenever the arm you put first is also the arm whose
 configuration you are questioning, and twice it was:
@@ -4803,9 +4809,13 @@ explain it — a half-engaged rebuild, a stale resolve. **A mechanism you can te
 a story about is not evidence**; the arm that settles it is the same
 configuration in a different position, and it costs one boot.
 
-Fixed by capturing on the SIGNAL rather than a timer: poll the frame line's own
-hit count until it stops moving (3 stable polls), which costs a warm arm ~2 polls
-and gives a cold one the time it actually needs.
+**The fix does not depend on knowing the cause, which is the point.** The harness
+records each arm's gbuffer pixel count and the verdict is WITHHELD — non-zero
+exit, ratios not printed — when two arms disagree. A caveat would not have
+helped: a 30% difference reads as an effect, and both wrong conclusions were
+drawn from numbers that looked entirely reasonable. Also kept, as cheap
+insurance rather than as the defence: a discarded warm-up boot, and capture on a
+settled hit count instead of a fixed timer.
 
 Open follow-ups this run surfaced, none of them today's job:
 - `occupancyField.traceHybridPlane` already has an `excludePoint` mode that skips
