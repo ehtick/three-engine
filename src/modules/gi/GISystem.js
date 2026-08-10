@@ -4429,9 +4429,30 @@ export class GISystem {
     // transport was running, so the one instrument for "is this expected?"
     // could no longer tell the two states apart. There are THREE now, and only
     // the last of them is a picture with light in it.
+    // ⚠ AND IT WENT STALE AGAIN THE MOMENT PHASE 5 LANDED. Both of the
+    // transport-on branches below were written when `shadeHit` was null and
+    // both assert, in so many words, that GI produces no light — one of them
+    // calls a lit diffuse term "correctly black". The user read that line
+    // while looking at a frame the eye check measures at 3.879× the sky-only
+    // one. **A diagnostic that describes a state the code has left is worse
+    // than no diagnostic**, because it is trusted: it is the thing you consult
+    // to decide whether what you are seeing is expected. The shading branch is
+    // now the FIRST test, so the message tracks the build instead of the plan.
     const sky = skyRadiance.value;
     const skyLit = Math.max(sky.r, sky.g, sky.b) > 0;
-    if (!srcProbesEnabled()) {
+    if (srcProbesEnabled() && srcShadeEnabled()) {
+      console.log(
+        "[gi] diffuse indirect: LIVE AND SHADED — SRC transport is running with Phase 5 hit " +
+          `shading, so hits carry albedo, sun, lights and emission. Sky Light is ` +
+          `${skyLit ? `${sky.r.toFixed(2)}/${sky.g.toFixed(2)}/${sky.b.toFixed(2)}` : "0"}` +
+          (skyLit
+            ? "."
+            : " — the scene has NO environment, so every photon here comes from a lamp and " +
+              "ONE bounce. That is a legal but very dark setup: shadowed regions have no fill " +
+              "at all, which reads as crushed blacks next to a blown sunlit strip. Give the " +
+              "scene an environment (Scene → Environment) to get sky fill."),
+      );
+    } else if (!srcProbesEnabled()) {
       console.log(
         "[gi] diffuse indirect: ABSENT — the dense radiance cascades were deleted for the SRC " +
           "rebuild (docs/GI_SRC_REBUILD_PLAN.md §12.8) and Split Radiance Cascades is OPT-IN " +
@@ -4441,17 +4462,21 @@ export class GISystem {
       );
     } else if (!skyLit) {
       console.log(
-        "[gi] diffuse indirect: LIVE BUT UNLIT — SRC transport is running, and with hit shading " +
-          "still Phase 5 the ONLY radiance in the system is the scene's Sky Light, which is 0. " +
-          "So the diffuse term is correctly black. Raise Sky Light above zero to see it.",
+        "[gi] diffuse indirect: LIVE BUT UNLIT — SRC transport is running, hit shading is OFF " +
+          "(`__giSrcShade = false`), and the only radiance left is the scene's Sky Light, which " +
+          "is 0. So the diffuse term is correctly black. Turn hit shading back on, or raise Sky " +
+          "Light above zero. ⚠ Note that probes-without-shading REPLACES the diffuse term with a " +
+          "sky-only one (plan §12.30.1) — at Sky Light 0 that is a BLACK SCENE, measured at 4% of " +
+          "pixels lit against 68% with shading on.",
       );
     } else {
       console.log(
-        "[gi] diffuse indirect: SKY VISIBILITY — SRC transport is running against Sky Light " +
-          `${sky.r.toFixed(2)}/${sky.g.toFixed(2)}/${sky.b.toFixed(2)}. Hit shading is Phase 5, ` +
-          "so every deposited radiance is zero and what you are seeing is how much sky each point " +
-          "can see over the whole cascade reach — long-range, AO-shaped darkening with NO bounce " +
-          "colour. A Cornell box with no red on the white block is the correct picture.",
+        "[gi] diffuse indirect: SKY VISIBILITY ONLY — SRC transport is running against Sky Light " +
+          `${sky.r.toFixed(2)}/${sky.g.toFixed(2)}/${sky.b.toFixed(2)}, with hit shading OFF ` +
+          "(`__giSrcShade = false`). Every deposited radiance is zero, so what you are seeing is " +
+          "how much sky each point can see over the whole cascade reach — long-range, AO-shaped " +
+          "darkening with NO bounce colour. A Cornell box with no red on the white block is the " +
+          "correct picture for this arm.",
       );
     }
     // Affirmative ground truth for the gi-shadow feature, same discipline as

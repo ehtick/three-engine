@@ -143,7 +143,21 @@ defineOp({
             meanProbeSteps: +c.meanProbeSteps.toFixed(2),
             failedInserts: c.failed,
           })),
-          note: "Produces no light yet — Phase 1 populates probes, Phase 2/3 make them shade.",
+          // Read from the RUN, not from the phase plan. This note said
+          // "Produces no light yet" for as long as that was true and then for a
+          // while after it stopped being true, which is the failure mode that
+          // matters: it is consulted precisely when someone is deciding whether
+          // a dark frame is expected. `shaded` is the deposit kernel's own
+          // per-frame tally, so the note now reports what the GPU did.
+          shadedHitsPerFrame: stats.shaded ?? 0,
+          unattributedRate: stats.unattributedRate != null
+            ? +(stats.unattributedRate * 100).toFixed(2) + "%"
+            : null,
+          note: stats.shaded
+            ? `Hit shading is LIVE — ${stats.shaded} hits shaded last frame. Radiance carries ` +
+              "albedo, sun, lights and emission."
+            : "Populating probes but shading NO hits — every deposited radiance is zero, so the " +
+              "diffuse term is sky-visibility only. Check `__giSrcShade`.",
         };
       }
       // The canvas backing store IS the drawing buffer, and reading it avoids
