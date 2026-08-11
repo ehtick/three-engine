@@ -50,8 +50,8 @@
 import * as THREE from "three/webgpu";
 import { float, ivec2, step, texture, uint, uniform, vec3 } from "three/tsl";
 import {
-  CASCADE_COUNT, MAX_LODS, PROBE_RAY_CAP_OFF, SRC_QUALITY, TEMPORAL_ALPHA, TEMPORAL_ALPHA_STILL, W0,
-  srcProbeRayCap, srcQualityTier, srcTransportRays,
+  CASCADE_COUNT, MAX_LODS, PROBE_RAY_CAP_OFF, SRC_QUALITY, TEMPORAL_ALPHA,
+  TEMPORAL_ALPHA_STILL, W0, srcProbeRayCap, srcQualityTier, srcTransportRays,
 } from "./srcConfig.js";
 import { createSrcProbeGizmos } from "./srcGizmos.js";
 import { R2_ALPHA1_FX, R2_ALPHA2_FX } from "./srcMath.js";
@@ -161,7 +161,7 @@ function expectedC0Probes(pixelCount) {
  */
 export function createSrcProbeSystem({
   gbuffer, width, height, props = null, volume = null, sky = null,
-  lighting = null, surfaces = null, sceneMotion = null,
+  lighting = null, surfaces = null, sceneMotion = null, trackMotion = null,
 } = {}) {
   const tier = SRC_QUALITY[srcQualityTier(props)];
   const spacing0 = Number(globalThis.__giSrcSpacing0) || tier.spacing0;
@@ -333,12 +333,18 @@ export function createSrcProbeSystem({
   // get lift 1 = the exact pre-compensation decay they were written against.
   // `__giSrcAlphaComp = false` is the explicit opt-out, polled per frame like
   // every other hatch here.
-  const liftFor = (alpha) => {
-    if (globalThis.__giSrcAlphaComp === false) return 1;
+  // Where α sits on the still→moving ramp, in [0,1]. Two consumers with
+  // DIFFERENT opt-outs, so it is its own function: the compensation lift
+  // (opted out by `__giSrcAlphaComp = false`) and the tracking root below
+  // (opted out by `__giSrcMotionTrack = false`) — coupling them through one
+  // switch would make "disable compensation" silently mean "always decay at
+  // the tracking rate".
+  const motionOf = (alpha) => {
     const span = TEMPORAL_ALPHA - TEMPORAL_ALPHA_STILL;
     if (!(span > 0)) return 1;
     return Math.min(1, Math.max(0, (alpha - TEMPORAL_ALPHA_STILL) / span));
   };
+  const liftFor = (alpha) => (globalThis.__giSrcAlphaComp === false ? 1 : motionOf(alpha));
   const influxLiftU = uniform(liftFor(readAlpha()));
   // Starts at 1, not 0: an unclaimed block's stamp is 0, and a frame counter
   // that also started there would call every block in the pool fresh on frame
@@ -949,7 +955,24 @@ export function createSrcProbeSystem({
       // in, so no page could read back what α the motion signal actually
       // produced, and the intensity-delta fix would have shipped on faith.
       globalThis.__giSrcAlphaLive = alpha;
-      const keep = (1 - alpha) ** (1 / Math.max(1, rayStride));
+      // ── THE ROOT RELAXES WITH MOTION (§12.43) ────────────────────────────
+      // At m = 0 this is §12.32's root exactly — preserve evidence across
+      // sparse refreshes, the still scene's variance shield. At m = 1 it is
+      // no root at all: history is KNOWN-WRONG the moment the scene changes,
+      // and preserving it multiplied a light step's convergence time by the
+      // stride (measured 7.42 s at stride 12, `probe:gi-src-converge`).
+      // GISystem's peak-hold keeps m up for the window the field needs.
+      // `trackMotion` is nonzero ONLY while GISystem's light-event window is
+      // open (a light matrix/luminance/emitter peak armed it — never mover
+      // churn, never sub-threshold jitter; the gating lives THERE, one
+      // definition). Standalone gates pass no getter and keep §12.32's root
+      // identically. The first draft derived this from α itself and TRACK_AB
+      // refuted it: any spurious motion spike became a 1.2 s burst of
+      // relaxed-root fast decay, and the rig's still controls read 21.2 vs
+      // 0.92 rev/px — the user saw it as water caustics on a parked floor.
+      const tr = trackMotion ? Math.min(1, Math.max(0, Number(trackMotion()) || 0)) : 0;
+      const rootS = 1 + (Math.max(1, rayStride) - 1) * (1 - tr);
+      const keep = (1 - alpha) ** (1 / rootS);
       if (keepU.value !== keep) keepU.value = keep;
       // The compensation lift rides the same α, published for the same
       // reason α is: the rig's CAP arms need to SEE that compensation was

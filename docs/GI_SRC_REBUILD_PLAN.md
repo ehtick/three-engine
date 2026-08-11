@@ -7086,3 +7086,115 @@ The §12.38/§12.40 harness pins are unchanged in meaning: non-cap sweeps
 and the histogram pin `__giSrcProbeRayCap = 0`, which now means "force
 off" rather than "restate the default" — the instruments survive the
 default flipping under them.
+
+### 12.43 THE TRACKING WINDOW — "TEMPORAL IS TOO SLOW" WAS THE STRIDE ROOT,
+### MEASURED, AND THE FIELD NOW CONVERGES 8× FASTER AT THE USER'S REGIME
+
+The user re-reported after §12.41+§12.42 shipped: "temporal being too slow —
+not fixed". The α RAMP was exact (its probe said so); what nobody had
+measured was the FIELD — how long the resolved lighting takes to reach its
+new steady state after a light steps. `probe:gi-src-converge` (new) measures
+exactly that: Cornell, a probe-owned light stepping 2→6, mean resolve
+luminance per frame, t90 in wall-clock seconds, four arms in one page:
+
+```
+                                     t90 BEFORE      t90 AFTER the window
+default (cap 16 + comp, stride 1)      1.65 s              0.56 s
+comp-off                               0.60 s              0.57 s
+cap-off                                0.34..0.48 s        0.34 s
+strided ~12 (ultra fullscreen)         7.42 s              0.92 s   ← 8×
+```
+
+Two mechanisms owned the slowness, in proportion the arms separate cleanly:
+
+1. **The α spike from a step is ~ONE FRAME long** (a toggle is one frame of
+   luminance delta), so the field's convergence ran at the STILL floor —
+   with §12.42's compensation re-engaged on capped blocks. That is the
+   1.65 vs 0.60 gap at stride 1: the compensation tail.
+2. **The stride root multiplies the convergence time constant by S.**
+   `keep = (1−α)^(1/S)` is the §12.32 fix that stopped the decay destroying
+   evidence between sparse refreshes — and it equally preserves STALE
+   evidence after a step: per-frame α at ultra's stride ≈ 12 is 0.0087, and
+   t90 ≈ ln10/0.0087 ≈ 263 frames ≈ 7.4 s measured. The user's standing
+   complaint, twice reported across two fixes, was this line.
+
+The fix (`__giSrcMotionTrack = false` opts both halves out, polled):
+
+- **PEAK-HOLD** (GISystem's `sceneMotion` closure): a motion peak ≥
+  ALPHA_TRACK_THRESHOLD (0.5) arms an ALPHA_TRACK_HOLD_MS (1200 ms) window
+  reporting the held peak — α and the §12.42 lift stay up while the field
+  converges, instead of for one frame.
+- **THE ROOT RELAXES WITH MOTION** (srcSystem.syncCamera):
+  `keep = (1−α)^(1/(1+(S−1)·(1−mRoot)))` with mRoot the THRESHOLDED remap
+  of m — at a step the root is gone (history is known-wrong; preserving it
+  is not stability, it is lag), and below the threshold the exponent is
+  §12.32's EXACTLY, so a parked scene's jitter (the rig reads m ≈ 0.13 on
+  still Sponza) cannot perturb the still-scene arithmetic. The same
+  threshold discipline as the hold, for the same reason, stated once in
+  srcConfig.
+- The two opt-outs are DECOUPLED (`motionOf` vs `liftFor` in srcSystem):
+  `__giSrcAlphaComp = false` disables compensation only — routing it
+  through the lift would have made "disable compensation" silently mean
+  "always decay at the tracking rate".
+
+Verified: `probe:gi-src-alpha` all-exact under the window (the hold expires
+at 1.2 s, the recovery arm samples at 3 s — still 0.05/0.10/0.05); the
+converge probe's after-column above. The moving-scene price of the relaxed
+root is TRACK_AB's job (the rig gained interleaved moving arms on the
+hatch + still controls), run before this section's commit.
+
+#### 12.43.2 TRACK_AB REFUTED THE FIRST DRAFT THE DAY IT WAS WRITTEN —
+#### THE WINDOW NOW ARMS ON LIGHT EVENTS ONLY
+
+The draft above tied the hold and the root to the BLENDED motion signal
+(any peak ≥ threshold, root from α's own ramp position). TRACK_AB, ultra:
+
+```
+  moving rev/px: on 21.537  vs off 0.997      still control: on 21.210
+  moving p95:    on 0.0370  vs off 0.0557                    off  0.916
+```
+
+The still controls are the disqualifier — 23× on a PARKED scene. The mover
+term spikes spuriously on still ultra Sponza (§12.42.4's lift snapshot had
+already recorded 0.944 on a still arm, before any tracking code existed),
+and the hold amplifies each spike from one frame of raised α into a 1.2 s
+burst of relaxed-root fast decay. The user, whose editor runs the working
+tree, reported the draft live: "GI is jumpy, like the floor is covered in
+water and there are sun glints moving everywhere" — the instrument and the
+eye agreeing within the hour.
+
+The redesign is a scoping, not a retreat, and it is the physically right
+scope: **a LIGHT change (matrix, luminance, emitter) invalidates the whole
+field; a moving OBJECT invalidates it locally while the sources stay
+true.** So `sceneMotion` splits: light-side terms arm the hold and are
+what the window holds; mover displacement keeps §12.38's shipped behaviour
+in full and can never arm anything. The root relaxation moved off α onto a
+dedicated `trackMotion` getter that is nonzero ONLY while the light-event
+window is open (gating lives in ONE place, GISystem's closure; standalone
+gates pass no getter and keep §12.32's root identically). The two
+mechanisms remain one switch: `__giSrcMotionTrack = false`.
+
+Verification of the redesign: converge probe (the window still fires on
+its light step — that is the point), alpha probe, and TRACK_AB re-run
+(moving AND still arms must now agree on ≈ off) — results below.
+
+#### 12.43.3 The redesign's numbers, and what the instrument taught back
+
+- **TRACK_AB (the §12.43.2 disqualifier), redesigned build:** moving on
+  1.388 vs off 1.053 rev/px (+32%, ≈2× the 0.153 round spread — borderline,
+  logged), step p95 on 0.0274 vs off 0.0488 (−44%), and the STILL controls
+  **0.949 vs 0.843 — inside the round spread**. A parked scene cannot arm
+  the window any more, by construction and now by measurement.
+- **`probe:gi-src-alpha`:** exact through the window (0.05 / 0.10 / 0.05).
+- **Converge, clean run:** strided t90 **2.52 s vs 7.42 s pre-fix**, and
+  strided/default fell 4.5× → 1.9×. The comp tail at stride 1 is down to
+  1.30 vs 0.93 s (was 1.65 vs 0.60).
+- ⚠ **The instrument's sampling rate varies by boot** (the same script read
+  ~49 samples/s on one boot and ~14 on two others), and t90 is wall-clock
+  against a FIXED 1200 ms window — on a slow page the window covers fewer
+  engine frames and expires before 90%, inflating every arm (the 0.92 s
+  strided reading came from the fast boot). Within-run ratios are the
+  quotable currency, same rule as the flicker rig's header. At the user's
+  30–60 fps the window covers 36–70 frames ≈ full convergence inside it.
+  If a future unit needs the tail gone entirely, the window can retrigger
+  while the field's own delta remains large — not built now (R16).

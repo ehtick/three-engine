@@ -140,6 +140,7 @@
     "probe:gi-src-cost": "node scripts/run-gi-src-cost-probe.mjs",
     "probe:gi-src-emissive": "node scripts/run-gi-src-emissive-probe.mjs",
     "probe:gi-src-alpha": "node scripts/run-gi-src-alpha-signal-probe.mjs",
+    "probe:gi-src-converge": "node scripts/run-gi-src-converge-probe.mjs",
     "test:gi-src-secondary": "node scripts/run-gi-src-secondary-probe.mjs",
     "test:gi-src-volume": "node scripts/run-gi-src-volume-test.mjs",
     "probe:gi-debug-views": "node scripts/run-gi-debug-views-probe.mjs"

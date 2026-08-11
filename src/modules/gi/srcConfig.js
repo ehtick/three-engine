@@ -143,6 +143,46 @@ export const TEMPORAL_ALPHA_STILL = 0.05;
  */
 export const ALPHA_MOTION_SAT = (0.94 - 0.86) / 30;
 
+/**
+ * ══ THE TRACKING WINDOW — WHY A SEEN CHANGE HOLDS α UP (§12.43) ═════════════
+ *
+ * The motion signal is INSTANTANEOUS: a lamp toggle is one frame of luminance
+ * delta, so α spiked for ~a frame and the field's actual convergence ran at
+ * the still floor — with §12.42's compensation re-engaged on capped blocks.
+ * Measured (`probe:gi-src-converge`, Cornell, intensity 2→6): t90 = 0.48 s
+ * with cap+comp off, 1.65 s shipped at stride 1, and **7.42 s at stride 12**,
+ * the ultra/fullscreen regime — the user's "temporal is way too slow", twice
+ * reported, in one table.
+ *
+ * Two coupled mechanisms, one switch (`__giSrcMotionTrack = false` restores
+ * both old behaviours), and both arm on LIGHT EVENTS ONLY — light matrix
+ * motion, luminance deltas, emitter changes — NEVER on mover displacement:
+ *
+ *  1. PEAK-HOLD (GISystem's `sceneMotion` closure): a light-side peak ≥
+ *     ALPHA_TRACK_THRESHOLD arms a window of ALPHA_TRACK_HOLD_MS during
+ *     which the closure reports the held peak — α (and §12.42's lift) stay
+ *     at the change's level while the field actually converges instead of
+ *     for the one frame the delta itself lasts.
+ *  2. THE STRIDE ROOT RELAXES INSIDE THE WINDOW (srcSystem.syncCamera,
+ *     via the `trackMotion` getter): `keep = (1−α)^(1/(1+(S−1)·(1−tr)))`,
+ *     `tr` = the held light peak while the window is open, 0 otherwise. At
+ *     tr = 1 the root is gone — a LIGHT change invalidates the WHOLE field,
+ *     so preserving its history is not stability, it is lag.
+ *
+ * ⚠ WHY LIGHT-SIDE ONLY IS LOAD-BEARING, NOT A PREFERENCE. The first draft
+ * armed on ANY motion peak and tied the root to α's own ramp position, and
+ * TRACK_AB refuted it the day it was written: moving arms 21.5 vs 1.0
+ * rev/px, and the STILL controls 21.2 vs 0.92 — the mover term spikes
+ * spuriously on a parked ultra scene (§12.42.4's lift snapshot read 0.944
+ * on a still arm before any tracking code existed), and a hold turns every
+ * spike from one frame of raised α into a 1.2 s burst of relaxed-root fast
+ * decay. The user saw that build as "the floor is covered in water". An
+ * object's motion also only invalidates the field LOCALLY (the sources are
+ * unchanged); movers keep §12.38's shipped behaviour exactly.
+ */
+export const ALPHA_TRACK_HOLD_MS = 1200;
+export const ALPHA_TRACK_THRESHOLD = 0.5;
+
 /** Frames a probe survives unseen before the per-frame rebuild stops re-inserting it. */
 export const PROBE_MAX_AGE = 60;
 

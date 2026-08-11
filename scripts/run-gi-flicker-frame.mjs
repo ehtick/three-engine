@@ -57,6 +57,13 @@ const CEILING_AB = process.env.CEILING_AB === "1";
 // directly (same stride both arms), the α-sweep's discipline.
 const CAP_AB = process.env.CAP_AB === "1";
 const CAP_VALUE = Number(process.env.CAP_VALUE ?? 16);
+// TRACK_AB=1 — §12.43's tracking window: MOVING arms, tracking on vs
+// `__giSrcMotionTrack = false`, interleaved in one page. The risk it prices
+// is the root relaxing during continuous motion (keep = 1−α instead of the
+// stride root): faster tracking of a moving light field, bought with per-
+// frame variance while things move. Still arms ride along as the control —
+// the sub-threshold path is supposed to be untouched.
+const TRACK_AB = process.env.TRACK_AB === "1";
 // ALPHA_SWEEP="0.1,0.05,0.02" — interleaved arms at several α values, both
 // still and moving, in ONE page. Exists to answer the mechanism question the
 // CEILING_AB left open (§12.32): the still-scene instability is nearly
@@ -484,6 +491,31 @@ if (CAP_AB) {
   }
   await setCap(undefined);
 }
+// ── THE TRACKING-WINDOW A/B (§12.43) ────────────────────────────────────────
+// Moving arms, because that is where the root now relaxes; a full discarded
+// arm after every switch (the accumulators re-equilibrate at the new keep),
+// and a still control per config so an accidental sub-threshold change
+// cannot hide.
+const setTrack = (v) => page.evaluate((x) => { globalThis.__giSrcMotionTrack = x; }, v);
+const trackRounds = [];
+if (TRACK_AB) {
+  for (let r = 0; r < 2; r++) {
+    await setTrack(undefined);
+    await wait(300);
+    await measure(AMP, ROTATE);
+    const on = await measure(AMP, ROTATE);
+    await measure(0, false);
+    const onStill = await measure(0, false);
+    await setTrack(false);
+    await wait(300);
+    await measure(AMP, ROTATE);
+    const off = await measure(AMP, ROTATE);
+    await measure(0, false);
+    const offStill = await measure(0, false);
+    trackRounds.push({ on, off, onStill, offStill });
+  }
+  await setTrack(undefined);
+}
 // ── THE α SWEEP, SAME DISCIPLINE ────────────────────────────────────────────
 // Round 2 walks the α list in REVERSE so a slow page drift loads each α at
 // both ends of the run — the same cancellation the interleave buys the two-arm
@@ -692,6 +724,23 @@ if (capRounds.length) {
   } else {
     console.log("  ⇒ §12.38's calm SURVIVES the cap: the excess is inside the rig's own noise.");
   }
+}
+
+// ── THE TRACKING-WINDOW VERDICT ─────────────────────────────────────────────
+if (trackRounds.length) {
+  console.log(`
+=== TRACKING WINDOW A/B (moving arms, tracking on vs off, interleaved x${trackRounds.length}) ===`);
+  const mean = (k, field) => trackRounds.reduce((s, r) => s + r[k][field], 0) / trackRounds.length;
+  console.log(`  moving reversals/px: on ${mean("on", "meanReversals").toFixed(3)}  vs  off ${mean("off", "meanReversals").toFixed(3)}   ` +
+    `(${((mean("on", "meanReversals") / mean("off", "meanReversals") - 1) * 100).toFixed(0)}%)`);
+  console.log(`  moving step p95:     on ${mean("on", "stepP95").toFixed(4)}  vs  off ${mean("off", "stepP95").toFixed(4)}   ` +
+    `(${((mean("on", "stepP95") / mean("off", "stepP95") - 1) * 100).toFixed(0)}%)`);
+  console.log(`  still control:       on ${mean("onStill", "meanReversals").toFixed(3)}  vs  off ${mean("offStill", "meanReversals").toFixed(3)} rev/px ` +
+    `(sub-threshold path — these must agree within round spread)`);
+  const spread = trackRounds.length > 1
+    ? Math.abs(trackRounds[0].off.meanReversals - trackRounds[1].off.meanReversals)
+    : NaN;
+  console.log(`  round-to-round spread on the moving OFF arm: ${spread.toFixed(3)}`);
 }
 
 // ── THE α SWEEP VERDICT ─────────────────────────────────────────────────────

@@ -35,7 +35,7 @@ import { resolveMaterialSurface, serializeMeshForBake } from "./voxelizeOnce.js"
 import { createSrcVolume } from "./srcVolume.js";
 import { createSrcDistanceView, createSrcOccupancyView } from "./srcDebugViews.js";
 import { createSrcProbeSystem, describeSrcProbeSystem, formatSrcProbeFrame, srcProbesEnabled, srcShadeEnabled } from "./srcSystem.js";
-import { ALPHA_MOTION_SAT } from "./srcConfig.js";
+import { ALPHA_MOTION_SAT, ALPHA_TRACK_HOLD_MS, ALPHA_TRACK_THRESHOLD } from "./srcConfig.js";
 import { createSrcSurfaceAttribution } from "./srcSurface.js";
 import { createOccupancyField, describeOccupancyField, quantizeOccupancyRes } from "./occupancyField.js";
 import { BVH_STRATEGY, buildStaticSceneBvhWords, classifyDynamicShape, composeFieldDynamics, createDynamicObjectSet, dynHeaderWords, giMobilityOf, giTraceOf } from "./dynamicObjects.js";
@@ -3212,16 +3212,54 @@ export class GISystem {
             // deliberately absent: probe evidence is world-anchored, so a
             // camera move stales nothing and must not cost the still scene
             // its calm.
-            sceneMotion: () => Math.min(1, Math.max(
-              (this._giShadowLastMotion ?? 0) / ALPHA_MOTION_SAT,
-              this._giEmitterLastMotion ?? 0,
-              ((this._dynSet?.lastMotion ?? 0) * 0.05) / ALPHA_MOTION_SAT,
-              // Relative light-luminance delta (see the hoisted light loop):
-              // same saturation constant as the other terms, so a lamp
-              // toggle rides α at 0.1 instead of crawling in at the 0.05
-              // still floor — §12.38.3's blind spot, closed.
-              (this._giLightLumMotion ?? 0) / ALPHA_MOTION_SAT,
-            )),
+            sceneMotion: () => {
+              // ── THE TRACKING WINDOW ARMS ON LIGHT EVENTS ONLY (§12.43) ──
+              // A LIGHT change (matrix, luminance, emitter) invalidates the
+              // whole field — every probe's history is evidence about a world
+              // that no longer exists. A moving OBJECT invalidates locally:
+              // the sources are unchanged and most of the field stays true.
+              // So light-side peaks arm the hold below and drive the root
+              // relaxation; mover displacement keeps §12.38's shipped
+              // behaviour exactly. TRACK_AB forced this split: the first
+              // draft held on ANY motion peak, and the rig's still controls
+              // read 21.2 vs 0.92 rev/px — the mover term spikes spuriously
+              // on a parked ultra scene (the §12.42 lift snapshots saw 0.944
+              // on a still arm before any tracking code existed), and a hold
+              // amplifies every spike from one frame of α to a 1.2 s burst
+              // of relaxed-root fast decay.
+              const mLight = Math.min(1, Math.max(
+                (this._giShadowLastMotion ?? 0) / ALPHA_MOTION_SAT,
+                this._giEmitterLastMotion ?? 0,
+                // Relative light-luminance delta (see the hoisted light
+                // loop): same saturation constant as the other terms, so a
+                // lamp toggle rides α at 0.1 instead of crawling in at the
+                // 0.05 still floor — §12.38.3's blind spot, closed.
+                (this._giLightLumMotion ?? 0) / ALPHA_MOTION_SAT,
+              ));
+              const m = Math.max(
+                mLight,
+                Math.min(1, ((this._dynSet?.lastMotion ?? 0) * 0.05) / ALPHA_MOTION_SAT),
+              );
+              if (globalThis.__giSrcMotionTrack === false) {
+                this._giTrackMotion = 0;
+                return m;
+              }
+              const now = performance.now();
+              if (mLight >= ALPHA_TRACK_THRESHOLD) {
+                this._giMotionHeld = Math.max(
+                  mLight,
+                  now < (this._giMotionHoldUntil ?? 0) ? (this._giMotionHeld ?? 0) : 0,
+                );
+                this._giMotionHoldUntil = now + ALPHA_TRACK_HOLD_MS;
+              }
+              const windowOpen = now < (this._giMotionHoldUntil ?? 0);
+              // What srcSystem's root relaxation reads (`trackMotion`): the
+              // held LIGHT peak while the window is open, zero otherwise —
+              // sub-threshold jitter and mover churn never reach the root.
+              this._giTrackMotion = windowOpen ? (this._giMotionHeld ?? 0) : 0;
+              return windowOpen ? Math.max(m, this._giMotionHeld ?? 0) : m;
+            },
+            trackMotion: () => this._giTrackMotion ?? 0,
             lighting: surfaces
               ? {
                   // The engine's punctual lights, straight through — same slots
