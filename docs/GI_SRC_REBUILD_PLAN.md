@@ -5486,3 +5486,42 @@ If that is it, GI's cost depends on how far back the camera sits, which is worth
 knowing independently of this rebuild — and it is one `viewport.getCamera` away.
 Do not attribute the gap to cache pressure or clocks (the two guesses so far)
 until this one has been ruled out.
+
+### 12.34 WHAT ULTRA'S FULL-RES RESOLVE BUYS — AND WHY THE MEAN CANNOT ANSWER IT
+
+With the ceiling holding ray count constant, a `resolveScale` sweep finally
+isolates resolve resolution alone. Ultra, same tier, same 249,860 rays:
+
+| scale | transport px | deposit ms | screen mean | lit |
+|---|---|---|---|---|
+| 1.00 | 499,720 | 3.735 | 0.16325 | 71.6% |
+| 0.50 | 124,930 | 3.381 | 0.16094 | 70.6% |
+
+Four times fewer resolve pixels for **1.4%** of screen mean. Also confirms the
+thread-sized dispatch is free: 4.696 → 3.735 ms at 499,720 px with the mean
+IDENTICAL at 0.16325, i.e. it changed cost and not the image.
+
+**⚠ DO NOT FLIP THE TIER ON THAT 1.4%.** `giConfig.js` justifies ultra's
+`resolveScale: 1` as removing "bad corners under a bright sun" — an EDGE
+artifact along silhouettes. A frame mean is nearly blind to edges: a thin rim of
+wrong pixels around every object moves it by a fraction of a percent while being
+exactly the thing a person notices. The statistic and the claim are about
+different quantities, which is the §12.28 `maxL` mistake in a new costume, and
+1.4% is what it looks like when you make it. The measurement that would settle
+this is an edge-localized one (or a person), and neither has been run.
+
+What the sweep does establish is the SIZE of the prize: gather (7.55 ms) +
+resolve (4.54 ms) + populate (2.06 ms) on the user's editor are all
+per-resolve-pixel, so ~14 ms rides on this tier flag. The principled version
+keeps the resolve at full res — it is the AO/shadow composite, and it is what
+ultra is FOR — and runs only SRC's gather at half res into a texture the resolve
+samples by UV instead of `load(coord)`. That preserves the edge quality the flag
+was chosen for and still takes 7.55 ms to ~1.9 ms.
+
+**Not done, and deliberately ranked below the next item:** the deposit at the
+user's resolution is still ~16–22 ms and is RAY-bound at 61–85 ns/ray against
+the harness's ~13. Closing that gap is worth ~18 ms; the gather is worth ~5.6 ms.
+So §12.33.2's camera-distance hypothesis gets tested first — `SWEEP=camera` in
+`probe:gi-src-cost`, which holds tier, resolveScale and the ceiling (so ray
+count is constant and ns/ray is pure traversal cost) and moves the camera
+straight back along its own view axis at 1×/3×/6×.

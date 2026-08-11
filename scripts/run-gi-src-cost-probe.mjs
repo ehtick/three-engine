@@ -89,6 +89,30 @@ const SCALE_ARMS = [
   { name: "scale 0.50", scale: 0.5 },
   { name: "scale 0.25", scale: 0.25 },
 ];
+// ── `SWEEP=camera` — DOES PULLING BACK COST RAYS? ───────────────────────────
+//
+// The same kernel measures ~13 ns/ray here and 61–85 in the user's editor, same
+// machine, same tier. §12.33.2's candidate is not a bug at all: ray LENGTH is a
+// function of camera distance. `reach = intervalBoundary(N-1, lod, s0)` and
+// `lod = floor(lodAtDistance(chebyshev(P, camera)))`, so a camera further out
+// raises every probe's LOD at once and lengthens every ray it fires.
+//
+// Everything is held except the camera: same tier, same resolveScale, same
+// ceiling, so the RAY COUNT is identical across arms and any change in ns/ray
+// is per-ray traversal cost. That is the whole experiment — if ns/ray climbs
+// with distance, GI's cost depends on where the user is standing, which is a
+// product fact worth knowing and is not something a probe pinned to one pose
+// could ever have surfaced.
+const NAVE = { position: [11.8, 2.2, 0.73], target: [-3.2, 1.0, -1.47] };
+const CAMERA_ARMS = [
+  { name: "warmup", scale: 1, pose: NAVE, warmup: true },
+  { name: "nave (1x)", scale: 1, pose: NAVE },
+  // Straight back along the same view axis, so the SUBJECT is unchanged and
+  // only the distance moves. A different target would change which geometry is
+  // on screen and therefore the gbuffer, which is a second variable.
+  { name: "back 3x", scale: 1, pose: { position: [42.2, 4.8, 7.4], target: [-3.2, 1.0, -1.47] } },
+  { name: "back 6x", scale: 1, pose: { position: [83.2, 8.2, 15.4], target: [-3.2, 1.0, -1.47] } },
+];
 // `ceiling: null` means "do not set the hatch" — the tier's own number. The
 // unlimited arm is the REFERENCE the others are judged against, and it is a
 // huge finite number rather than Infinity because the hatch takes a count.
@@ -99,7 +123,7 @@ const CEILING_ARMS = [
   { name: "ceiling 65536", scale: 1, ceiling: 65536 },
   { name: "ceiling 16384", scale: 1, ceiling: 16384 },
 ];
-const ALL = SWEEP === "ceiling" ? CEILING_ARMS : SCALE_ARMS;
+const ALL = SWEEP === "ceiling" ? CEILING_ARMS : SWEEP === "camera" ? CAMERA_ARMS : SCALE_ARMS;
 const only = process.env.SCALE;
 const arms = only ? ALL.filter((a) => String(a.scale) === only) : ALL;
 
@@ -176,7 +200,7 @@ for (const arm of arms) {
     // the compiler.
     for (let i = 0; i < 300 && !waveDone; i++) await wait(1000);
     if (!waveDone) console.log(`  ${arm.name}: compile wave never logged — measuring anyway`);
-    await call("viewport.setCamera", POSE);
+    await call("viewport.setCamera", arm.pose ?? POSE);
 
     // Converge on the published signal rather than a timer.
     const shadedOf = () => {
@@ -331,6 +355,34 @@ if (SWEEP === "ceiling") {
       );
     }
     console.log("  A ceiling is affordable when the deposit ratio is large and the look moves a few %.");
+  }
+}
+// ── THE CAMERA SWEEP'S VERDICT ──────────────────────────────────────────────
+//
+// Ray COUNT is held by the ceiling across these arms, so ns/ray is per-ray
+// traversal cost and nothing else. A flat column kills §12.33.2's hypothesis; a
+// climbing one explains a 5× gap that two previous guesses did not.
+if (SWEEP === "camera") {
+  const ref = ok.find((r) => r.arm.startsWith("nave"));
+  console.log("");
+  if (!ref) {
+    console.log("  No `nave` reference arm — nothing to compare distances against.");
+  } else {
+    const rayCounts = [...new Set(ok.map((r) => r.rays))];
+    if (rayCounts.length > 1) {
+      console.log(`  ⚠ ray count moved across arms (${rayCounts.join(", ")}) — the ceiling did not`);
+      console.log("    hold it, so ns/ray mixes traversal cost with budget. Read with care.");
+    }
+    console.log(`  vs the nave pose (${ref.nsPerRay.toFixed(1)} ns/ray):`);
+    for (const r of ok) {
+      if (r === ref) continue;
+      console.log(
+        `    ${r.arm.padEnd(14)} ${(r.nsPerRay / ref.nsPerRay).toFixed(2)}× ns/ray` +
+        `   (${r.nsPerRay.toFixed(1)} ns, deposit ${r.deposit}ms, ${r.live} live probes)`,
+      );
+    }
+    console.log("  If this climbs, GI's cost depends on how far back the camera sits — and the");
+    console.log("  editor/harness gap is a POSE difference, not cache pressure or clocks.");
   }
 }
 console.log("");
