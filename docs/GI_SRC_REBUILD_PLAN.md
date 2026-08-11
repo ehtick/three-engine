@@ -7314,3 +7314,40 @@ post-step churn within its page (the pre-fix run priced the ceiling at
 36%), directions balanced (2→6 and 6→2 agree within 0.6 rev/px on every
 config). `no-lift` (`__giSrcCapWindowLift = false`) reproduces the
 pre-§12.45 behavior and is the standing regression arm.
+
+#### 12.45.2 THE PAN GLINTS WERE THE SUN FOLLOWING THE CAMERA
+
+The camera-lift verify (tier cap unpinned, `__giSrcCamCapLift` on/off)
+first read NO EFFECT — and its per-frame cap sampling showed why: the cap
+was lifted in BOTH arms, 118-120/120 frames, pans AND holds, with
+`tr = 1.00` held open while sh/em/lum maxima read 0.012/0/0. The §12.43
+window was arming on every pan. The jitter probe
+(`run-gi-light-jitter-probe.mjs`) exonerated the parked scene — one
+directional sun, zero matrix motion, window closed, cap 16 live — which
+left the arithmetic: sh 0.012 = posDelta·0.05 at 0.24 m/frame, exactly a
+±25° pan's eye speed. THE SUN'S POSITION TRACKS THE CAMERA (cascade
+shadow fitting), and the light-motion loop's position term counted that
+as a light event. Every pan → "light moved" → 1.2 s of fast α + relaxed
+root — field-wide fast decay over history that was WORLD-VALID. The
+user's report was literal: "as the camera starts moving, lights are
+moving all over again."
+
+Fix: one line — a DIRECTIONAL light's position is radiometrically
+meaningless, so `posDelta` no longer contributes for directionals
+(rotation still arms: the script-driven day cycle is the design case;
+point/spot dollying still arms). Side effect, deliberate: the GI shadow
+chain's velocity-scaled memory also stops flushing on pans (same
+measurement, one definition — a camera-tracking sun position never made
+shadows stale either).
+
+Verify (same rig, same page discipline): pans no longer arm (`tr` 0.00,
+lift-off arm 0/120 lifted frames), and pan-hold churn COLLAPSED 9.1-9.7 →
+2.9-3.5 rev/px — pans now read BELOW their own stills (negative pan
+excess, both rounds). The §12.45.2 camera cap lift (srcSystem tracks its
+own per-frame camera deltas; 5 mm / 0.1° per-frame thresholds; same
+1200 ms hold; `__giSrcCamCapLift = false` opts out; pinned caps never
+lift) survives as a small real margin on top: lift-on 2.89 vs lift-off
+3.40 (≈4× the 0.13 round spread) — the cold-block burst-fill. The
+§12.45 CAMERA_AB numbers (pan excess 6.66 capped / 1.66 off) were
+measured UNDER the coupling — fast decay ran in all those arms; the
+turnover diagnosis stands but its magnitude was mostly the window's.

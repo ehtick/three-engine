@@ -50,7 +50,7 @@
 import * as THREE from "three/webgpu";
 import { float, ivec2, step, texture, uint, uniform, vec3 } from "three/tsl";
 import {
-  CASCADE_COUNT, MAX_LODS, PROBE_RAY_CAP_OFF, SRC_QUALITY, TEMPORAL_ALPHA,
+  ALPHA_TRACK_HOLD_MS, CASCADE_COUNT, MAX_LODS, PROBE_RAY_CAP_OFF, SRC_QUALITY, TEMPORAL_ALPHA,
   TEMPORAL_ALPHA_STILL, W0, srcProbeRayCap, srcQualityTier, srcTransportRays,
 } from "./srcConfig.js";
 import { createSrcProbeGizmos } from "./srcGizmos.js";
@@ -74,6 +74,11 @@ import { createSrcSceneTrace, createSrcVisibility, ifMoverHit, moverSurfaceAt } 
 const REANCHOR_CHEBYSHEV = 64;
 /** The anchor snaps to multiples of this many s₀, so it moves in whole steps. */
 const ANCHOR_QUANTUM = 16;
+/** Per-frame camera deltas that count as "panning" for the §12.45.2 cap lift:
+ *  5 mm translation, 0.1° rotation — above orbit-damping jitter, below any
+ *  deliberate pan. */
+const CAM_LIFT_POS = 0.005;
+const CAM_LIFT_ROT = 0.0017;
 
 /** Is the SRC probe population compiled into this build? ON unless explicitly
  *  opted out — see the header. `__giSrcProbes = false` is the hatch. */
@@ -799,6 +804,15 @@ export function createSrcProbeSystem({
   let anchored = false;
   let reanchors = 0;
   const scratch = new THREE.Vector3();
+  // Camera-pan lift state (§12.45.2). Thresholds are per-FRAME deltas chosen
+  // above orbit-damping jitter and below any deliberate pan: 5 mm translation,
+  // 0.1° rotation. Frame-rate dependence only widens the margin (slower frames
+  // → larger deltas).
+  const camPrevPos = new THREE.Vector3();
+  const camPrevQ = new THREE.Quaternion();
+  const camScratchQ = new THREE.Quaternion();
+  let camSeen = false;
+  let camHoldUntil = 0;
 
   const system = {
     store,
@@ -912,6 +926,28 @@ export function createSrcProbeSystem({
      */
     syncCamera(camera) {
       camera.getWorldPosition(cameraU.value);
+      // ── THE CAMERA-PAN LIFT WINDOW (§12.45.2) ────────────────────────────
+      // The camera is DELIBERATELY absent from the α signal (§12.38) and from
+      // the tracking window (§12.43's refutation) — probe evidence is world-
+      // anchored, so a pan stales nothing and must not buy fast decay. But a
+      // pan CREATES probes: newly revealed surfaces allocate cold blocks, and
+      // CAMERA_AB priced the cap's starvation of exactly those at ×4.0
+      // (pan-excess 6.66 capped vs 1.66 off, noise 0.009). Lifting the CAP on
+      // camera motion is variance-REDUCING by construction — it only adds
+      // evidence — so the §12.43 spurious-spike hazard does not apply. The
+      // hold state feeds ONLY the cap poll below; α, root and comp never see
+      // the camera.
+      camera.getWorldQuaternion(camScratchQ);
+      if (camSeen) {
+        const posDelta = camPrevPos.distanceTo(cameraU.value);
+        const rotDelta = 2 * Math.acos(Math.min(1, Math.abs(camScratchQ.dot(camPrevQ))));
+        if (posDelta > CAM_LIFT_POS || rotDelta > CAM_LIFT_ROT) {
+          camHoldUntil = performance.now() + ALPHA_TRACK_HOLD_MS;
+        }
+      }
+      camPrevPos.copy(cameraU.value);
+      camPrevQ.copy(camScratchQ);
+      camSeen = true;
       // Advance the R2 phase before the re-anchor early-out below, not after —
       // a still camera is exactly the case where every frame takes that return,
       // and it is also the only case where a frozen ray set would be invisible
@@ -1028,8 +1064,16 @@ export function createSrcProbeSystem({
       // instruments (§12.42: non-cap sweeps pin the cap off), and a pin that
       // drifted with scene state would un-A/B every arm that set it.
       // `__giSrcCapWindowLift = false` opts out (the rig's no-lift arm).
+      // The CAMERA window (state maintained at the top of this function) lifts
+      // for the same reason with the opposite trigger: a pan creates cold
+      // probes, and burst-filling them at natural rate for the hold's 1.2 s is
+      // what the CAMERA_AB off arm priced at −75% pan glints (§12.45.2).
+      // `__giSrcCamCapLift = false` opts out.
       const capPinned = Number.isFinite(Number(globalThis.__giSrcProbeRayCap));
-      const capLifted = !capPinned && tr > 0 && globalThis.__giSrcCapWindowLift !== false;
+      const capLifted = !capPinned && (
+        (tr > 0 && globalThis.__giSrcCapWindowLift !== false)
+        || (performance.now() < camHoldUntil && globalThis.__giSrcCamCapLift !== false)
+      );
       const nextCap = capLifted ? PROBE_RAY_CAP_OFF : readCap();
       if (nextCap !== probeRayCap) {
         probeRayCap = nextCap;

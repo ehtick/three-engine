@@ -72,6 +72,11 @@ const TRACK_AB = process.env.TRACK_AB === "1";
 // and the post-pan settle churn shows it where a parked still cannot.
 const CAMERA_AB = process.env.CAMERA_AB === "1";
 const CAM_ANGLE = (Number(process.env.CAM_ANGLE ?? 25) * Math.PI) / 180;
+// CAMERA_VERIFY=1 — §12.45.2's fix A/B: the TIER cap stays UNPINNED in both
+// arms (a pinned cap never lifts, so CAMERA_AB's pinned arms cannot see the
+// fix) and only `__giSrcCamCapLift` differs. Expected: lift-on pan-excess
+// lands near the off arm's 1.66, lift-off near the capped arm's 6.66.
+const CAMERA_VERIFY = process.env.CAMERA_VERIFY === "1";
 // LIGHT_STEP=1 — the same report's other half: "anytime light updates, it
 // starts flickering". A REAL intensity step lands mid-arm through the
 // editor's own prop path (GISystem's light events fire exactly as live, the
@@ -375,20 +380,51 @@ const body = async ({ anchorId, moverId, frames, amp, rotate, pan = null, light 
     // evolution only, never the pan's own reprojection step. Two cycles per
     // arm; even cycle pans out, odd pans home, so the arm ends at base.
     const seg = Math.floor(frames / (pan.cycles * 2));
+    // Sample the LIVE cap every frame (`__giSrcTransport.probeRayCap` — the
+    // §12.45.2 lift publishes through publishTransport): `panLift`/`holdLift`
+    // count frames where the cap read lifted (> 100k ⇒ PROBE_RAY_CAP_OFF).
+    // A verify arm that never saw a lifted frame measured a fix that never
+    // ran — the §12.42 lift-snapshot lesson, promoted to a per-frame count.
+    let panLift = 0, holdLift = 0, panN = 0, holdN = 0;
+    const capNow = () => (globalThis.__giSrcTransport?.probeRayCap ?? 0) > 100000;
+    // WHICH term holds the §12.43 window open is readable straight off the
+    // GISystem instance — sample maxima per segment kind so the verdict can
+    // name the owner instead of guessing (tr = the window itself; sh/em/lum =
+    // its three arming terms).
+    const mot = { panTr: 0, holdTr: 0, sh: 0, em: 0, lum: 0, holdSh: 0, holdEm: 0, holdLum: 0 };
+    const sampleMotion = (hold) => {
+      const tr = system._giTrackMotion ?? 0;
+      if (hold) {
+        mot.holdTr = Math.max(mot.holdTr, tr);
+        mot.holdSh = Math.max(mot.holdSh, system._giShadowLastMotion ?? 0);
+        mot.holdEm = Math.max(mot.holdEm, system._giEmitterLastMotion ?? 0);
+        mot.holdLum = Math.max(mot.holdLum, system._giLightLumMotion ?? 0);
+      } else {
+        mot.panTr = Math.max(mot.panTr, tr);
+        mot.sh = Math.max(mot.sh, system._giShadowLastMotion ?? 0);
+        mot.em = Math.max(mot.em, system._giEmitterLastMotion ?? 0);
+        mot.lum = Math.max(mot.lum, system._giLightLumMotion ?? 0);
+      }
+    };
     for (let cyc = 0; cyc < pan.cycles; cyc++) {
       armed.value = 0;
       for (let i = 0; i < seg; i++) {
         await new Promise((r) => requestAnimationFrame(r));
         await setCam(((cyc % 2 === 0 ? i + 1 : seg - 1 - i) / seg) * pan.angle);
         renderer.compute(accumulator);
+        panN++; if (capNow()) panLift++;
+        sampleMotion(false);
       }
       armed.value = 1;
       for (let i = 0; i < seg; i++) {
         await new Promise((r) => requestAnimationFrame(r));
         renderer.compute(accumulator);
+        holdN++; if (capNow()) holdLift++;
+        sampleMotion(true);
       }
     }
     await setCam(0);
+    globalThis.__flickerCapLift = { panLift, panN, holdLift, holdN, ...mot };
   } else {
     for (let i = 0; i < frames; i++) {
       await new Promise((r) => requestAnimationFrame(r));
@@ -635,6 +671,28 @@ if (CAMERA_AB) {
     camRounds.push({ cappedPan, cappedStill, cappedStill2, offPan, offStill, offStill2, capComp });
   }
   await setCap(undefined);
+}
+// ── THE CAMERA-LIFT VERIFY (§12.45.2) ───────────────────────────────────────
+const setCamLift = (v) => page.evaluate((x) => { globalThis.__giSrcCamCapLift = x; }, v);
+const camVerifyRounds = [];
+if (CAMERA_VERIFY) {
+  await setCap(undefined); // tier cap, UNPINNED — the lift can act
+  for (let r = 0; r < 2; r++) {
+    await setCamLift(undefined);
+    await wait(300);
+    await measure(0, false);
+    const liftPan = await measure(0, false, { pan: { angle: CAM_ANGLE, cycles: 2 } });
+    const liftPanCap = await page.evaluate(() => globalThis.__flickerCapLift ?? null);
+    const liftStill = await measure(0, false);
+    await setCamLift(false);
+    await wait(300);
+    await measure(0, false);
+    const noPan = await measure(0, false, { pan: { angle: CAM_ANGLE, cycles: 2 } });
+    const noPanCap = await page.evaluate(() => globalThis.__flickerCapLift ?? null);
+    const noStill = await measure(0, false);
+    camVerifyRounds.push({ liftPan, liftStill, noPan, noStill, liftPanCap, noPanCap });
+  }
+  await setCamLift(undefined);
 }
 // ── THE LIGHT-STEP A/B ──────────────────────────────────────────────────────
 // Direction alternates 2↔6 arm to arm, so over 2 rounds every config sees one
@@ -937,6 +995,36 @@ if (camRounds.length) {
   } else {
     console.log("  ⇒ pan settle churn is CAP-INVARIANT at this pose — the glints are not the");
     console.log("     cap's starvation; look at fresh-probe seeding/α, not the ray budget.");
+  }
+}
+
+// ── THE CAMERA-LIFT VERIFY VERDICT ──────────────────────────────────────────
+if (camVerifyRounds.length) {
+  console.log(`
+=== CAMERA LIFT VERIFY (tier cap unpinned; __giSrcCamCapLift on vs off, x${camVerifyRounds.length}) ===`);
+  console.log("  round  arm       pan rev/px   still rev/px   lifted frames (pan / hold)");
+  const capStr = (c) => (c
+    ? `${c.panLift}/${c.panN} pan, ${c.holdLift}/${c.holdN} hold` +
+      `  tr ${c.panTr?.toFixed(2)}/${c.holdTr?.toFixed(2)} sh ${c.sh?.toFixed(3)}/${c.holdSh?.toFixed(3)}` +
+      ` em ${c.em?.toFixed(2)}/${c.holdEm?.toFixed(2)} lum ${c.lum?.toFixed(3)}/${c.holdLum?.toFixed(3)}`
+    : "-");
+  for (const [i, r] of camVerifyRounds.entries()) {
+    console.log(`  ${i + 1}      lift-on   ${r.liftPan.meanReversals.toFixed(3).padEnd(12)} ${r.liftStill.meanReversals.toFixed(3).padEnd(14)} ${capStr(r.liftPanCap)}`);
+    console.log(`  ${i + 1}      lift-off  ${r.noPan.meanReversals.toFixed(3).padEnd(12)} ${r.noStill.meanReversals.toFixed(3).padEnd(14)} ${capStr(r.noPanCap)}`);
+  }
+  const mean = (k, f) => camVerifyRounds.reduce((s, r) => s + r[k][f], 0) / camVerifyRounds.length;
+  const exOn = mean("liftPan", "meanReversals") - mean("liftStill", "meanReversals");
+  const exOff = mean("noPan", "meanReversals") - mean("noStill", "meanReversals");
+  const spread = camVerifyRounds.length > 1
+    ? Math.abs(camVerifyRounds[0].noPan.meanReversals - camVerifyRounds[1].noPan.meanReversals)
+    : NaN;
+  console.log(`  PAN EXCESS over own still: lift-on ${exOn.toFixed(3)}  vs  lift-off ${exOff.toFixed(3)}` +
+    `   (spread on lift-off pan: ${spread.toFixed(3)})`);
+  if (exOff - exOn > Math.max(spread * 1.5, Math.abs(exOn) * 0.25)) {
+    console.log("  ⇒ THE CAMERA LIFT HOLDS: pans burst-fill cold probes at natural rate.");
+  } else {
+    console.log("  ⇒ NO MEASURABLE EFFECT — check the lift armed at all (per-frame deltas vs");
+    console.log("     CAM_LIFT_POS/ROT thresholds; a too-slow scripted pan can sit under them).");
   }
 }
 

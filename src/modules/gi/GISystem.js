@@ -1401,7 +1401,18 @@ export class GISystem {
           // in at 5cm ≈ 1° so dollying a point light shortens memory too.
           const dirDelta = Math.hypot(e[8] - prev.dir.x, e[9] - prev.dir.y, e[10] - prev.dir.z);
           const posDelta = Math.hypot(e[12] - prev.pos.x, e[13] - prev.pos.y, e[14] - prev.pos.z);
-          motion = Math.max(motion, dirDelta + posDelta * 0.05);
+          // A DIRECTIONAL light's position is radiometrically MEANINGLESS —
+          // and the sun's world matrix is moved per frame by shadow fitting
+          // that TRACKS THE CAMERA. Measured (§12.45.2 jitter probe): a pan
+          // read 0.24 m/frame of sun "motion" through this term and armed the
+          // §12.43 tracking window on every camera move — field-wide fast
+          // decay during pans, the user's "as the camera starts moving,
+          // lights are moving all over again". Rotation still arms (the
+          // script-driven day cycle is the design case); position stays a
+          // term for point/spot lights, where dollying genuinely changes the
+          // field. A parked scene reads exactly zero either way (probe:
+          // run-gi-light-jitter-probe.mjs).
+          motion = Math.max(motion, dirDelta + (light.isDirectionalLight ? 0 : posDelta * 0.05));
           lumMotion = Math.max(lumMotion,
             Math.abs(lum - prev.lum) / Math.max(prev.lum, lum, 1e-3));
         }
