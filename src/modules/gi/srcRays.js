@@ -127,12 +127,42 @@ function probeAlive(probeTable, probe) {
  * @param {object} options
  * @param {object} options.pixelProbe  the population's per-pixel c0 probe index
  * @param {number} options.raysPerPixel
+ * @param {Node} [options.stride]  ray-ceiling stride, a UNIFORM — see below.
+ * @param {Node} [options.phase]   which residue class this frame fires.
  */
-export function createSrcRayFrame(store, rays, { pixelProbe, raysPerPixel = 1 } = {}) {
+export function createSrcRayFrame(
+  store, rays, { pixelProbe, raysPerPixel = 1, stride = null, phase = null } = {},
+) {
   const { probeTable, probeTotal, cascades } = store;
   const { rayCount, rayCursor, rayTotal, pixelRayBase, pixelCount } = rays;
   const N = store.cascadeCount ?? CASCADE_COUNT;
   const top = cascades[N - 1];
+
+  // ══ THE RAY CEILING'S STRIDE — ONE PREDICATE, TWO CALLERS ══════════════════
+  //
+  // `srcConfig.js`'s `transportRays` caps rays per frame; above the cap only
+  // every `stride`-th pixel participates, and `phase` rotates each frame so the
+  // whole screen is covered over `stride` frames into the Phase-4 accumulator.
+  // That is the same move `jitterX/Y` already makes on the R2 sequence — shift
+  // per frame, let accumulation do the covering — applied to the pixel domain.
+  //
+  // ⚠ IT MUST BE ONE EXPRESSION AND THIS IS NOT A STYLE PREFERENCE. [D1] counts
+  // a probe's rays and [D5] hands each pixel a slice of exactly that count. If
+  // [D5] admitted a pixel [D1] did not count, its `atomicAdd` would return an
+  // offset PAST the probe's segment and it would write into the next probe's
+  // rays — silent cross-probe corruption, no assertion anywhere, and it would
+  // present as a few wrongly-lit probes rather than as a crash. The reverse
+  // (counted but not claimed) merely wastes slots. So both call THIS closure;
+  // neither open-codes it. Same discipline as `latticeOriginFor` living in
+  // srcMath so the two twins cannot drift.
+  //
+  // Stride is a UNIFORM, so changing the ceiling is a uniform write, not a
+  // rebuild (R11) — the dispatch counts stay `pixelCount` and every pipeline
+  // survives a resize of the budget. `stride = 1` makes this identically false,
+  // which is the configuration every gate runs and why they are unaffected.
+  const strideSkips = stride && phase
+    ? (i) => i.add(phase).mod(stride).notEqual(uint(0))
+    : null;
 
   const passes = [];
 
@@ -162,6 +192,7 @@ export function createSrcRayFrame(store, rays, { pixelProbe, raysPerPixel = 1 } 
   // makes the budget follow screen coverage instead of probe count.
   passes.push(Fn(() => {
     const i = instanceIndex.toVar();
+    if (strideSkips) If(strideSkips(i), () => { Return(); });
     const probe = pixelProbe.element(i).toVar();
     If(probe.equal(uint(SLOT_EMPTY)), () => { Return(); });
     atomicAdd(rayCount.element(probe), uint(raysPerPixel));
@@ -236,7 +267,12 @@ export function createSrcRayFrame(store, rays, { pixelProbe, raysPerPixel = 1 } 
   passes.push(Fn(() => {
     const i = instanceIndex.toVar();
     const probe = pixelProbe.element(i).toVar();
-    If(probe.equal(uint(SLOT_EMPTY)), () => {
+    // A strided-out pixel takes the SAME exit as a pixel with no probe:
+    // `pixelRayBase = SLOT_EMPTY`. That is what makes the deposit need no edit
+    // at all — its [E] already returns on that value, so "this pixel is not
+    // sampled this frame" reuses the path for "this pixel has no probe".
+    const skip = strideSkips ? probe.equal(uint(SLOT_EMPTY)).or(strideSkips(i)) : probe.equal(uint(SLOT_EMPTY));
+    If(skip, () => {
       pixelRayBase.element(i).assign(uint(SLOT_EMPTY));
       Return();
     });

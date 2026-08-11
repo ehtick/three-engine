@@ -292,13 +292,43 @@ export function buildProbes(cfg, pixels) {
 // On the GPU this is a hierarchical prefix sum. Here it is two ordinary loops,
 // which is the point: the property is checkable without the scan.
 
+/**
+ * THE RAY CEILING'S STRIDE — the mirror of `srcRays.js`'s `strideSkips`.
+ *
+ * `stride = 1` (the default, and what every gate runs) makes this always false,
+ * so the reference is unchanged by the ceiling's existence. Above 1, a pixel
+ * participates only when `(index + phase) % stride === 0`, exactly as the
+ * kernel tests it. Both call sites below use THIS function for the same reason
+ * the GPU has one closure: the count and the claim must admit the same pixel
+ * set, or a pixel claims a slice of a segment never sized for it.
+ *
+ * ⚠ `index` IS THE GBUFFER'S LINEAR PIXEL INDEX, NOT THE MIRROR'S SLOT. This
+ * mirror runs on a COMPACTED list — `buildProbes` is handed only the valid
+ * pixels — while the kernel dispatches over every texel and strides on
+ * `instanceIndex`. Those two numberings coincide only when nothing is invalid,
+ * which is true of a synthetic fixture and false of every real gbuffer. Striding
+ * on the mirror's own slot would select a DIFFERENT set of pixels, and the
+ * symptom would be a totals mismatch in the gate with both sides internally
+ * consistent — the §12.20 shape, where the reference carried the fault.
+ *
+ * `pixelIndexOf` is that mapping; the identity default keeps every existing
+ * caller correct, because a caller that has not compacted anything IS the
+ * identity.
+ */
+function strideSkips(cfg, p) {
+  const stride = cfg.rayStride ?? 1;
+  if (stride <= 1) return false;
+  const index = cfg.pixelIndexOf ? cfg.pixelIndexOf(p) : p;
+  return (index + (cfg.rayPhase ?? 0)) % stride !== 0;
+}
+
 export function assignRays(cfg, built) {
   const { cascades } = built;
   // Counts at c0 come from the pixels that landed on each probe.
   for (const probe of cascades[0].probes) probe.rayCount = 0;
   for (let p = 0; p < built.pixelProbe.length; p++) {
     const slot = built.pixelProbe[p];
-    if (slot >= 0) cascades[0].probes[slot].rayCount += cfg.raysPerPixel;
+    if (slot >= 0 && !strideSkips(cfg, p)) cascades[0].probes[slot].rayCount += cfg.raysPerPixel;
   }
   // Propagate up.
   for (let c = 1; c < cfg.cascadeCount; c++) {
@@ -330,7 +360,7 @@ export function assignRays(cfg, built) {
   const cursors = new Map();
   for (let p = 0; p < built.pixelProbe.length; p++) {
     const slot = built.pixelProbe[p];
-    if (slot < 0) continue;
+    if (slot < 0 || strideSkips(cfg, p)) continue;
     const probe = cascades[0].probes[slot];
     const cursor = cursors.get(slot) ?? probe.rayOffset;
     pixelRayBase[p] = cursor;

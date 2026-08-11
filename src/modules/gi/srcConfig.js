@@ -124,11 +124,57 @@ export const MAX_LOOP_ALBEDO = 0.9;
  * half-res gbuffer pixel. `w0` raises c0 angular resolution on the top tiers.
  */
 export const SRC_QUALITY = {
-  low: { spacing0: 0.8, raysPerPixel: 1, w0: 4, secondary: false },
-  medium: { spacing0: 0.6, raysPerPixel: 1, w0: 4, secondary: true },
-  high: { spacing0: 0.45, raysPerPixel: 2, w0: 4, secondary: true },
-  ultra: { spacing0: 0.35, raysPerPixel: 2, w0: 8, secondary: true },
+  low: { spacing0: 0.8, raysPerPixel: 1, w0: 4, secondary: false, transportRays: 32_768 },
+  medium: { spacing0: 0.6, raysPerPixel: 1, w0: 4, secondary: true, transportRays: 65_536 },
+  high: { spacing0: 0.45, raysPerPixel: 2, w0: 4, secondary: true, transportRays: 131_072 },
+  ultra: { spacing0: 0.35, raysPerPixel: 2, w0: 8, secondary: true, transportRays: 262_144 },
 };
+
+/**
+ * ══ THE RAY CEILING, AND WHY THE TRANSPORT CANNOT BE PRICED IN PIXELS ═══════
+ *
+ * `transportRays` is the most rays one frame may fire, full stop. Above it the
+ * pixel set is STRIDED (`srcRays.js`'s [D1]/[D5]) with a per-frame rotating
+ * phase, so the whole screen is still covered — over several frames, into an
+ * accumulator that was built for exactly that (§12.23).
+ *
+ * It exists because everything else here is per-pixel and that turned out to be
+ * a cost model, not just an addressing scheme. Population inserts a probe per
+ * gbuffer pixel, [D1] gives each pixel `raysPerPixel` rays, and the deposit is
+ * dispatched per pixel — so the transport's cost is the SCREEN's size, and
+ * `giConfig.js` hands ultra `resolveScale: 1`. On the user's Sponza that is
+ * 1,573,200 px × 2 = 3,146,400 rays per frame to service 5,692 live probes:
+ * ~553 rays per probe, against the **0.78 rays/bin** §12.13 measured as this
+ * design's own operating point. Measured cost, `profile.giPasses` on that
+ * editor: the deposit is **249 ms of a 260 ms** SRC chain — 95.7% of it.
+ *
+ * `probe:gi-src-cost` swept transport pixels at ultra with the tier pinned:
+ *
+ *     rays      deposit ms   ns/ray   screen mean
+ *     631,904      9.037      14.3      0.12733
+ *     157,976      2.339      14.8      0.12380
+ *
+ *     least squares: deposit ms ≈ 0.547 + 13.4 ns × rays  ⇒ rays are 94% of it
+ *
+ * Four times fewer rays cost **2.8%** of screen mean. So this is a ceiling on
+ * the thing that is 94% of the cost, bought at ~3% of the look.
+ *
+ * ⚠ THESE ARE CEILINGS, NOT TARGETS. `stride = max(1, ceil(rays / ceiling))`,
+ * so a small viewport whose natural ray count is already under the ceiling gets
+ * `stride = 1` and is bit-identical to the old behaviour. Every gate runs there.
+ *
+ * ⚠ AND THEY ARE NOT YET TUNED AGAINST THE USER'S MACHINE. The same kernel
+ * measured **79 ns/ray** in their editor against **13.4** in the harness, both
+ * at ultra — 5.5×, cause unestablished (thread-count cache pressure over the
+ * 218 MB occupancy field and sustained-load clocks are the candidates; the
+ * harness cannot see either). So the ms these ceilings buy THERE has to be
+ * re-measured there. `globalThis.__giSrcTransportRays` is the A/B.
+ */
+export function srcTransportRays(tier) {
+  const forced = Number(globalThis.__giSrcTransportRays);
+  if (Number.isFinite(forced) && forced > 0) return Math.round(forced);
+  return SRC_QUALITY[tier]?.transportRays ?? SRC_QUALITY.high.transportRays;
+}
 const QUALITY_TIERS = new Set(Object.keys(SRC_QUALITY));
 
 /**

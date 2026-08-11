@@ -42,7 +42,9 @@
 
 import * as THREE from "three/webgpu";
 import { float, ivec2, step, texture, uniform, vec3 } from "three/tsl";
-import { CASCADE_COUNT, MAX_LODS, SRC_QUALITY, TEMPORAL_ALPHA, W0, srcQualityTier } from "./srcConfig.js";
+import {
+  CASCADE_COUNT, MAX_LODS, SRC_QUALITY, TEMPORAL_ALPHA, W0, srcQualityTier, srcTransportRays,
+} from "./srcConfig.js";
 import { createSrcProbeGizmos } from "./srcGizmos.js";
 import { R2_ALPHA1_FX, R2_ALPHA2_FX } from "./srcMath.js";
 import {
@@ -276,9 +278,23 @@ export function createSrcProbeSystem({
   // costs nothing to look at: `srcRays.js`'s passes are eight tiny dispatches
   // over the probe table, no marching.
   const rayStore = createSrcRayStore(store, { pixelCount });
+  // ── THE RAY CEILING (srcConfig's `transportRays`) ─────────────────────────
+  //
+  // Uniforms, not build-time constants, so the ceiling is an A/B and a resize
+  // is a uniform write rather than a rebuild (R11). `natural` is what this
+  // resolution would fire unstrided — the number that was 3,146,400 on the
+  // user's editor and 94% of a 260 ms SRC chain.
+  const strideU = uniform(1, "uint");
+  const phaseU = uniform(0, "uint");
+  const naturalRays = pixelCount * tier.raysPerPixel;
+  const rayCeiling = srcTransportRays(srcQualityTier(props));
+  const rayStride = Math.max(1, Math.ceil(naturalRays / Math.max(1, rayCeiling)));
+  strideU.value = rayStride;
   const rayFrame = createSrcRayFrame(store, rayStore, {
     pixelProbe: frame.pixelProbe,
     raysPerPixel: tier.raysPerPixel,
+    stride: strideU,
+    phase: phaseU,
   });
 
   // ── [E] + [F]: THE SPLIT SCATTER AND THE RESOLVE (plan §12.13.5 unit 3) ──
@@ -614,6 +630,14 @@ export function createSrcProbeSystem({
     width,
     height,
     pixelCount,
+    // The ray ceiling, published so the boot line and `profile.giPasses` report
+    // what the transport ACTUALLY fires rather than what the resolution implies.
+    // `natural` is the pre-ceiling number: reading only `rays/px` off the log
+    // was how a 3,146,400-ray frame looked like "2 rays/px" for a whole phase.
+    rayStride,
+    rayCeiling,
+    naturalRays,
+    tracedRays: Math.ceil(naturalRays / rayStride),
     get reanchorCount() { return reanchors; },
 
     /**
@@ -643,6 +667,15 @@ export function createSrcProbeSystem({
       // wrap is that a block untouched since the last lap gets zeroed instead
       // of decayed, which is what a block untouched for 2.2 years deserves.
       frameStampU.value = (frameStampU.value + 1) >>> 0;
+      // The ray ceiling's residue class, rotated by the same counter. Over
+      // `stride` frames every pixel is sampled exactly once, which is what
+      // makes this a temporal subsample rather than a permanent crop — and the
+      // accumulator it feeds is the one §12.23 built to weight by evidence.
+      // Read from `frameStampU` rather than a second counter so there is one
+      // definition of "which frame is this" (the decay pass compares against it
+      // exactly, and two counters that drift would silently decorrelate the
+      // stride from the decay).
+      if (rayStride > 1) phaseU.value = frameStampU.value % rayStride;
       const a = anchorU.value;
       const drift = Math.max(
         Math.abs(cameraU.value.x - a.x),
@@ -731,7 +764,16 @@ export function describeSrcProbeSystem(system) {
   const groups = Array.isArray(system.passGroups) ? system.passGroups.length : "ABSENT";
   return `[gi] src probes: ${system.pixelCount} gbuffer pixels, ${system.passes.length} passes / ` +
     `${groups} groups, s0=${system.spacing0}, ` +
-    `${c}, ${system.raysPerPixel} rays/px, ${(bytes / 1048576).toFixed(2)}MB` +
+    `${c}, ${system.raysPerPixel} rays/px, ` +
+    // ⚠ SAY THE RAY COUNT, NOT JUST THE RATE. "2 rays/px" read as a small
+    // number for a whole phase while it meant 3,146,400 rays a frame and 94% of
+    // the GI cost; the rate is only a cost once multiplied by a resolution the
+    // reader has to find elsewhere in the same line. Both now, plus the stride
+    // that separates them, so a ceiling that is or is not biting is visible.
+    (system.rayStride > 1
+      ? `${system.tracedRays} rays/frame (ceiling ${system.rayCeiling}, stride ${system.rayStride} of ${system.naturalRays}), `
+      : `${system.tracedRays} rays/frame (under the ${system.rayCeiling} ceiling), `) +
+    `${(bytes / 1048576).toFixed(2)}MB` +
     // The BLOCK counts are named, not the probe capacities, because they are
     // what the memory is a function of since the claim landed — and because a
     // pool short for the scene shows up as `NOBLOCK` in the frame line, which

@@ -212,7 +212,13 @@
         const gpu = await runFrame();
 
         // ── the mirror on the same pixels ─────────────────────────────────
-        const mirrorPixels = pixels.map((px, i) => (valid[i] ? px : null)).filter(Boolean);
+        // `mirrorSlotToPixel[slot]` is the gbuffer's LINEAR index for the
+        // mirror's compacted slot. Only ARM 7 needs it — a stride is a function
+        // of the index, and the two numberings differ by exactly the invalid
+        // pixels this list drops.
+        const mirrorSlotToPixel = [];
+        for (let i = 0; i < pixels.length; i++) if (valid[i]) mirrorSlotToPixel.push(i);
+        const mirrorPixels = mirrorSlotToPixel.map((i) => pixels[i]);
         const cfg = ref.makeSrcConfig({
           spacing0: S0, camera: CAM, anchor: ANCHOR, raysPerPixel: RAYS_PER_PIXEL,
           cascadeCount: cfgMod.CASCADE_COUNT, maxLods: cfgMod.MAX_LODS,
@@ -407,6 +413,86 @@
         // seeing rather than asserting either way.
         say(`   ${offsetsMoved} probes were handed a different offset on the rerun ` +
           `(scheduler order — expected, and why no arm compares offsets)`);
+
+        // ══ ARM 7: THE RAY CEILING'S STRIDE ══════════════════════════════
+        say("");
+        say("── STRIDE: a ray ceiling subsamples pixels without breaking the allocator ──");
+        // Every arm above runs at stride 1, where `strideSkips` is identically
+        // false — so without this one the ceiling ships ungated, and the arms
+        // would all still pass. What makes it worth its lines is the specific
+        // failure it is aimed at: [D1] counts a probe's rays and [D5] hands out
+        // slices of exactly that count. If the two admitted different pixel
+        // sets, [D5]'s atomicAdd would return an offset PAST its probe's
+        // segment and write into the NEXT probe's rays. Nothing throws. The
+        // total still looks plausible. It surfaces as a few wrongly-lit probes
+        // in a scene, which is indistinguishable from ordinary GI noise.
+        //
+        // ARM 5's permutation is the statement that catches it, so this arm is
+        // ARM 5 re-run against a strided frame plus the two facts specific to
+        // striding: the mirror agrees on the smaller total, and the pixels that
+        // got a slice are EXACTLY the residue class.
+        const STRIDE = 3;
+        const PHASE = 1;
+        const strideU = TSL.uniform(STRIDE, "uint");
+        const phaseU = TSL.uniform(PHASE, "uint");
+        const strideFrame = R.createSrcRayFrame(store, rayStore, {
+          pixelProbe: frame.pixelProbe,
+          raysPerPixel: RAYS_PER_PIXEL,
+          stride: strideU,
+          phase: phaseU,
+        });
+        for (const pass of frame.passes) await renderer.computeAsync(pass);
+        for (const pass of strideFrame.passes) await renderer.computeAsync(pass);
+        const sBase = new Uint32Array(await renderer.getArrayBufferAsync(rayStore.pixelRayBase.value));
+        const sProbe = new Uint32Array(await renderer.getArrayBufferAsync(frame.pixelProbe.value));
+        const sTotal = await strideFrame.readTotal(renderer);
+        const sMirror = ref.assignRays({
+          ...cfg, rayStride: STRIDE, rayPhase: PHASE,
+          pixelIndexOf: (p) => mirrorSlotToPixel[p],
+        }, built);
+        check("the strided total matches the mirror's",
+          sTotal === sMirror.totalRays, `gpu ${sTotal} vs mirror ${sMirror.totalRays}`);
+        // The ceiling has to actually bite, or every check here is vacuous —
+        // the same reason the deposit gate pins raysPerPixel above 1.
+        check("striding actually cut the budget", sTotal > 0 && sTotal < gpu.total,
+          `${sTotal} of ${gpu.total} (stride ${STRIDE})`);
+        // Split the two directions rather than counting mismatches: they are
+        // different bugs. A pixel OUT of the class that got a slice means [D5]
+        // is admitting what [D1] did not count (the corruption). A pixel IN the
+        // class that got none is the benign direction — its probe is not
+        // resolvable this frame — and lumping them cost a round.
+        let firedOutOfClass = 0;
+        let silentInClass = 0;
+        for (let i = 0; i < PIXELS; i++) {
+          const inClass = (i + PHASE) % STRIDE === 0;
+          const got = sBase[i] !== P.SLOT_EMPTY;
+          if (got && !inClass) firedOutOfClass++;
+          if (!got && inClass && valid[i] && sProbe[i] !== P.SLOT_EMPTY) silentInClass++;
+        }
+        check("no pixel outside the residue class fired", firedOutOfClass === 0,
+          `${firedOutOfClass} fired out of class — [D5] admitted what [D1] never counted`);
+        check("every in-class pixel with a live probe fired", silentInClass === 0,
+          `${silentInClass} in-class pixels with a probe got no slice`);
+        const sSeen = new Uint8Array(sTotal);
+        let sDup = 0;
+        let sOut = 0;
+        for (let i = 0; i < PIXELS; i++) {
+          const base = sBase[i];
+          if (base === P.SLOT_EMPTY) continue;
+          for (let r = 0; r < RAYS_PER_PIXEL; r++) {
+            const idx = base + r;
+            if (idx >= sTotal) { sOut++; continue; }
+            if (sSeen[idx]) sDup++;
+            sSeen[idx] = 1;
+          }
+        }
+        let sUncovered = 0;
+        for (let i = 0; i < sTotal; i++) if (!sSeen[i]) sUncovered++;
+        check("strided: no ray index is claimed twice", sDup === 0, `${sDup} duplicates`);
+        check("strided: no ray index is past the total", sOut === 0,
+          `${sOut} out of range — [D5] admitted a pixel [D1] never counted`);
+        check("strided: every ray index in [0, total) is claimed", sUncovered === 0,
+          `${sUncovered}/${sTotal} unclaimed`);
 
         if (validationErrors.length) check("no WebGPU validation errors", false, validationErrors[0]);
 

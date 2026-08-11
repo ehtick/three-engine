@@ -205,9 +205,17 @@ for (const arm of arms) {
       lit = count / n;
     } else console.log(`      · screenshot FAILED — ${shot.error ?? "no image"}`);
 
-    const rays = px && rpp ? px * rpp : null;
+    // TRACED rays, not `px × raysPerPixel`. Since the ray ceiling landed those
+    // are different numbers, and dividing a deposit time by the pre-ceiling
+    // count would report a per-ray cost that fell by exactly the stride — an
+    // instrument that makes the fix look like it improved the kernel rather
+    // than reduced the work. The boot line publishes both; parse the real one
+    // and fall back only for a build that predates it.
+    const traced = Number(/(\d+) rays\/frame/.exec(boot)?.[1]) || null;
+    const stride = Number(/stride (\d+) of/.exec(boot)?.[1]) || 1;
+    const rays = traced ?? (px && rpp ? px * rpp : null);
     const row = {
-      arm: arm.name, scale: arm.scale, px, rpp, rays, s0, tier, live,
+      arm: arm.name, scale: arm.scale, px, rpp, rays, stride, s0, tier, live,
       deposit, total: src?.totalMs ?? null, resolvePx, mean, lit,
       nsPerRay: deposit && rays ? (deposit * 1e6) / rays : null,
     };
@@ -251,11 +259,11 @@ if (tiers.length > 1) {
 }
 console.log(`  (all arms at tier ${ok[0].tier}, s₀=${ok[0].s0}, ${ok[0].rpp} rays/px — only resolveScale moved)`);
 console.log("");
-console.log("  scale   transport px      rays    deposit ms   ns/ray   screen mean   lit");
+console.log("  scale   transport px   traced rays  stride  deposit ms   ns/ray   screen mean   lit");
 for (const r of ok) {
   console.log(
-    `  ${String(r.scale).padEnd(6)} ${String(r.px).padStart(11)} ${String(r.rays).padStart(10)} ` +
-    `${r.deposit.toFixed(3).padStart(12)} ${r.nsPerRay.toFixed(1).padStart(8)} ` +
+    `  ${String(r.scale).padEnd(6)} ${String(r.px).padStart(11)} ${String(r.rays).padStart(13)} ` +
+    `${String(r.stride).padStart(7)} ${r.deposit.toFixed(3).padStart(11)} ${r.nsPerRay.toFixed(1).padStart(8)} ` +
     `${r.mean == null ? "     n/a" : r.mean.toFixed(5).padStart(13)} ${r.lit == null ? " n/a" : (r.lit * 100).toFixed(1) + "%"}`,
   );
 }
