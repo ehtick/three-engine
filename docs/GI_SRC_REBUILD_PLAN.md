@@ -5170,3 +5170,56 @@ far away; the work is at the top of the ladder.
   drops well down the list.
 - **The 44 SRC dispatches are not in the compile wave** — see §13.9. That is the
   startup half of the same report and it has a different cause.
+
+### 13.10 THE CACHE WORKS, 72×, AND STARTUP DID NOT MOVE
+
+`probe:gi-boot`, 2026-08-11, after SRC's passes joined the warm set:
+
+```
+cold  TTFF 49360ms   slowest pipeline 44157ms
+warm  TTFF 52474ms   slowest pipeline   611ms
+```
+
+**The slowest pipeline compiled 72× faster warm and TTFF moved −6%.** §13.5 left
+"make the cache engage" as lever 2 and estimated 55 s → ~8 s from it. That
+estimate is now refuted by the thing it was an estimate about: the cache engaged,
+completely, and bought nothing. So pipeline compilation is not what startup is
+made of — which also retires §13.2's ranking of PIPELINE COUNT as lever 1, since
+count only matters through compile time.
+
+Where the wall clock actually is, same run:
+
+```
+first creation → last completion   53384ms
+  of which SOME pipeline was busy    969ms   2%
+  idle between compiles            52415ms  98%
+all pipelines, summed               8317ms   (concurrent, hence 969ms of span)
+GI CPU work (voxelize+BVH+setup)    1670ms   3.2%
+```
+
+8.3 s of pipeline work overlapped into 969 ms of wall clock, inside a 53 s span.
+Fifty-two seconds is neither the driver nor the GI CPU work this plan has
+measured three times.
+
+**⚠ AND THAT LAST SENTENCE IS WHERE THIS COULD GO WRONG AGAIN.** "Idle between
+compiles" is computed by ELIMINATION — it is whatever is left after subtracting
+spans that were measured. The probe labels it "TSL node-graph build + WGSL
+generation", which is a hypothesis wearing a measurement's clothes, and naming a
+stage from a leftover is exactly the §13.8 mistake that put four wrong claims
+into the first version of this section. Candidates the subtraction cannot
+separate: TSL graph construction, WGSL codegen, the material compile wave, JS GC,
+the prewarm loop's own per-node macrotask yields, asset work on the same thread.
+
+So it is now measured directly rather than inferred: the prewarm loop times the
+SYNCHRONOUS part of each `giCompute` — which is precisely where three builds the
+node graph and generates WGSL, before anything reaches the device — and logs
+`[gi] node-graph build + WGSL codegen (JS, synchronous): Nms over K kernels,
+worst Mms at #i`. If that number is tens of seconds the attribution is
+established and the lever changes completely (fewer/smaller TSL graphs, not
+fewer/smaller shaders). If it is small, the 52 s is somewhere else and the next
+instrument goes there.
+
+**What is already safe to say:** a shader cache cannot fix this, a kernel diet by
+byte count cannot fix this (§13.4 again — 154 kB in 172 ms vs 2 kB in 611 ms,
+4× faster at 69× the size), and the cold arm's single 44 s pipeline is a COMPILER
+PATHOLOGY in one 2 kB / 0-loop / 5-if kernel rather than a volume problem.

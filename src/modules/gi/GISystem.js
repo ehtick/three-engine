@@ -211,6 +211,12 @@ export function giProxySpheres(mesh, bounds, budget, shapeKind = null) {
 let giDispatchDepth = 0;
 const giSkippedComputes = new Set();
 const giPendingComputePipelines = new Set();
+// Every GPUShaderModule this process has built a pipeline from. three keys its
+// ProgrammableStage cache on WGSL SOURCE, so a repeat module means byte-identical
+// source — and therefore a pipeline compile that a content-keyed cache could
+// have skipped. See the counting site in `installAsyncComputePipelines`.
+const giSeenShaderModules = new WeakSet();
+let giPipelineReuseHits = 0;
 if (import.meta.env?.DEV) {
   // Harness diagnostics (run-gi-spawn-test and friends): lets a probe see
   // whether the dispatch loop is stuck waiting on pipelines / skipping.
@@ -255,6 +261,28 @@ function installAsyncComputePipelines(renderer) {
     // in `device.createComputePipeline(desc)` — intercept just that call.
     const rawDeviceCreate = device.createComputePipeline;
     device.createComputePipeline = (descriptor) => {
+      // ── IS THIS A SHADER WE HAVE ALREADY COMPILED? ────────────────────────
+      //
+      // three caches ProgrammableStages by WGSL SOURCE (`programs.compute` is
+      // keyed on the string), so an identical kernel reuses its GPUShaderModule
+      // object. But the PIPELINE cache key is `computeNode.id + ',' +
+      // stageCompute.id` (three.webgpu.js `_getComputeCacheKey`), and a GI
+      // rebuild constructs fresh compute nodes — new ids. So a rebuild whose
+      // WGSL has not changed by one byte still misses the pipeline cache and
+      // pays `createComputePipelineAsync` again, on a serializing driver, for
+      // every kernel.
+      //
+      // That is a hypothesis about why the user saw three compile waves in five
+      // minutes (62,926 / 134,891 / 68,250 ms). Counting module REUSE tests it
+      // without building anything: a module we have seen before can only have
+      // come from identical source, so `reused` is exactly the number of
+      // recompiles that a content-keyed cache could have avoided. If it comes
+      // back zero on a rebuild the hypothesis is dead and no cache gets written.
+      const mod = descriptor?.compute?.module;
+      if (mod) {
+        if (giSeenShaderModules.has(mod)) giPipelineReuseHits++;
+        else giSeenShaderModules.add(mod);
+      }
       const promise = device.createComputePipelineAsync(descriptor).then(
         (pipelineGPU) => {
           const data = backend.get(computePipeline);
@@ -1907,11 +1935,55 @@ export class GISystem {
       // composited.
       if (state && this.state === state) {
         const computeNodes = [...state.queue];
+        // ══ SRC'S PASSES BELONG IN THE WAVE, AND WERE NOT IN IT ═══════════
+        //
+        // `state.queue` is the SCREEN chain and nothing else — resolve, the
+        // light-shadow passes, the emitter chain: five nodes on the user's
+        // Sponza. SRC is dispatched separately (`giCompute(renderer,
+        // state.screen.srcProbes.passes)` in the frame callback) and its
+        // passes were therefore never prewarmed, never awaited, and never
+        // counted. `profile.giPasses` says how many that is: **44**.
+        //
+        // The consequence is not "startup is a bit slower". A dispatch whose
+        // pipeline has not landed is SKIPPED (see `installAsyncComputePipelines`),
+        // and since [I] made SRC's screen gather the PRIMARY diffuse term,
+        // skipping it means the scene has no indirect light at all. So the wave
+        // printed `computes 68312ms` and declared itself done, the first frame
+        // after it kicked off 44 more pipeline creations, the driver serialized
+        // them (§13.3 — the per-pipeline number is latency, not compile time),
+        // and GI stayed absent for the whole of that second, uncounted wave.
+        // That is the user's "the GI appears after like 3-4 minutes of wait".
+        //
+        // This does not make the compiling faster. It makes it HAPPEN INSIDE
+        // the window that is designed for it — the one the wave holds, that
+        // `bootAmbient` exists to bridge, and that the log reports honestly.
+        // Cutting the 44 is §13.9's other half and is a separate measurement.
+        const srcPasses = state.screen?.srcProbes?.passes ?? [];
+        const warmNodes = [...computeNodes, ...srcPasses];
         const kernelSizes = [];
-        for (const node of computeNodes) {
+        // ── HOW MUCH OF THE WAVE IS JS, NOT THE DRIVER? ───────────────────
+        //
+        // `probe:gi-boot` now reports 98% of the boot span as "idle between
+        // compiles" and labels it TSL node-graph build + WGSL generation. The
+        // cold/warm arm makes the first half of that credible on its own — the
+        // slowest pipeline fell 44,157ms → 611ms warm (72×) while TTFF moved
+        // −6%, so pipeline compilation cannot be what startup is made of. But
+        // "idle" is measured by ELIMINATION, and naming a stage from a
+        // leftover is the §13.8 mistake that put four wrong claims in this
+        // plan. So: time the synchronous part of the dispatch, which IS the
+        // graph build and the codegen (three does both inside `renderer.
+        // compute` before handing anything to the device), and report it next
+        // to the pipeline number it is being compared against.
+        let buildMs = 0;
+        let worstBuild = { ms: 0, i: -1 };
+        for (const node of warmNodes) {
           await new Promise((resolve) => setTimeout(resolve, 0));
           if (this.state !== state) break;
+          const tBuild = performance.now();
           giCompute(renderer, node);
+          const dt = performance.now() - tBuild;
+          buildMs += dt;
+          if (dt > worstBuild.ms) worstBuild = { ms: dt, i: kernelSizes.length };
           try {
             const wgsl = renderer._nodes?.getForCompute?.(node)?.computeShader;
             if (wgsl) kernelSizes.push(Math.round(wgsl.length / 1024));
@@ -1919,30 +1991,64 @@ export class GISystem {
             /* diagnostics only */
           }
         }
+        // UNCONDITIONAL. The first version gated this on `> 250ms`, which meant
+        // a SMALL number printed nothing — indistinguishable from the block not
+        // running at all, and that is the exact ambiguity the measurement
+        // exists to remove. A cheap graph build is the more interesting result
+        // here, because it refutes the label `probe:gi-boot` puts on its 98%.
+        console.log(
+          `[gi] node-graph build + WGSL codegen (JS, synchronous): ${buildMs.toFixed(0)}ms ` +
+            `over ${warmNodes.length} kernels, worst ${worstBuild.ms.toFixed(0)}ms at #${worstBuild.i}. ` +
+            "No shader cache touches this — it is CPU work on every run.",
+        );
         // Ticks may have started compiles before this loop did — wait for the
         // whole in-flight set, including anything that joins meanwhile.
         if (giPendingComputePipelines.size) {
           const tPipe = performance.now();
+          const reuseBefore = giPipelineReuseHits;
           let waited = 0;
           while (giPendingComputePipelines.size) {
             waited += giPendingComputePipelines.size;
             await Promise.all([...giPendingComputePipelines]);
           }
+          // `recompiled` is the count of pipelines built from a shader module
+          // this process had ALREADY built one from — i.e. byte-identical WGSL
+          // recompiled because three's pipeline cache key carries the compute
+          // NODE's id and a rebuild makes new nodes. On a first boot it is 0 by
+          // construction; on a rebuild it is the size of the win a content-keyed
+          // cache would buy, stated before anyone builds one.
+          const recompiled = giPipelineReuseHits - reuseBefore;
           console.log(
             `[gi] ${waited} compute pipelines compiled concurrently in ` +
-              `${(performance.now() - tPipe).toFixed(0)}ms (frames kept flowing)`,
+              `${(performance.now() - tPipe).toFixed(0)}ms (frames kept flowing)` +
+              (recompiled > 0
+                ? ` — ${recompiled} of them recompiled UNCHANGED WGSL (three keys its pipeline ` +
+                  "cache on the compute node's id, and a rebuild makes new nodes)"
+                : ""),
           );
         }
         // The guarded dispatches above did no field work where a pipeline was
         // still compiling — dispatch each node for real now that every
         // pipeline resolved (all cache hits, no creates).
+        //
+        // `computeNodes`, NOT `warmNodes`: SRC's chain is ordered and its
+        // geometry comes from uniforms `syncCamera` writes at the top of each
+        // frame. Running it here would populate one frame's probes against an
+        // unset anchor. Harmless in fact (they age out and re-populate
+        // immediately) but it is a frame of work with no reader, and the point
+        // of adding SRC above was to compile its pipelines, not to run it early
+        // — the real dispatch is the frame callback, one tick later, in order.
         if (this.state === state) {
           for (const node of computeNodes) giCompute(renderer, node);
         }
         if (kernelSizes.length) {
           console.log(
             `[gi] compute kernels: ${kernelSizes.length} totaling ${kernelSizes.reduce((s, n) => s + n, 0)}kB WGSL ` +
-              `(sizes ${kernelSizes.join("/")}kB — [0] composite, then sparse, then the frame queue)`,
+              `(${computeNodes.length} screen chain + ${srcPasses.length} SRC; ` +
+              // The sizes list is capped: 49 numbers is not a log line anyone
+              // reads, and the tail was always the uninformative half.
+              `sizes ${kernelSizes.slice(0, 8).join("/")}${kernelSizes.length > 8 ? "/…" : ""}kB — ` +
+              "[0] composite, then sparse, then the frame queue, then SRC)",
           );
         }
       }

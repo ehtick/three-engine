@@ -68,14 +68,40 @@ const POSE = { position: [11.8, 2.2, 0.73], target: [-3.2, 1.0, -1.47] };
 // A discarded warm-up first: on a cold process the first arm has not converged
 // when a fixed timer expires, and twice that has been read as an effect of
 // whatever configuration happened to run first. Same defence as the eye check.
-const SCALES = [
+// ── TWO SWEEPS, AND THEY ANSWER DIFFERENT QUESTIONS ─────────────────────────
+//
+// `SWEEP=scale` (default) moves `resolveScale`: it prices the COST of the
+// transport's domain, which is what found that rays are 94% of the deposit.
+// What it cannot do is price the LOOK, because `resolveScale` also sizes the
+// screen resolve and the AO — a 202x155 resolve reads BRIGHTER (0.15589) than a
+// 806x392 one (0.12733) on the same transport, purely from upsampling a blurrier
+// occlusion term. Reading the ceiling's visual cost off that column would credit
+// the stride with a change the resolve made.
+//
+// `SWEEP=ceiling` holds `resolveScale` at 1 and moves ONLY
+// `__giSrcTransportRays`, so every arm renders at the same resolution with the
+// same AO and differs in exactly one thing: how many rays the transport fired.
+// That is the arm that says whether a ceiling is affordable to look at.
+const SWEEP = process.env.SWEEP ?? "scale";
+const SCALE_ARMS = [
   { name: "warmup", scale: 0.5, warmup: true },
   { name: "scale 1.00", scale: 1 },
   { name: "scale 0.50", scale: 0.5 },
   { name: "scale 0.25", scale: 0.25 },
 ];
+// `ceiling: null` means "do not set the hatch" — the tier's own number. The
+// unlimited arm is the REFERENCE the others are judged against, and it is a
+// huge finite number rather than Infinity because the hatch takes a count.
+const CEILING_ARMS = [
+  { name: "warmup", scale: 1, ceiling: 1e9, warmup: true },
+  { name: "unlimited", scale: 1, ceiling: 1e9 },
+  { name: "ceiling 262144", scale: 1, ceiling: 262144 },
+  { name: "ceiling 65536", scale: 1, ceiling: 65536 },
+  { name: "ceiling 16384", scale: 1, ceiling: 16384 },
+];
+const ALL = SWEEP === "ceiling" ? CEILING_ARMS : SCALE_ARMS;
 const only = process.env.SCALE;
-const arms = only ? SCALES.filter((a) => String(a.scale) === only) : SCALES;
+const arms = only ? ALL.filter((a) => String(a.scale) === only) : ALL;
 
 const browser = await puppeteer.launch({
   executablePath: "C:/Program Files/Google/Chrome/Application/chrome.exe",
@@ -102,7 +128,7 @@ for (const arm of arms) {
     if (/compile wave: materials \d+ms, computes/.test(t)) waveDone = true;
   });
   page.on("pageerror", (e) => errors.push(String(e?.message ?? e).slice(0, 200)));
-  await page.evaluateOnNewDocument((project, scale, qualityTier) => {
+  await page.evaluateOnNewDocument((project, scale, qualityTier, ceiling) => {
     localStorage.setItem("engine.projectRoot.v1", project);
     localStorage.setItem("engine.recentProjects.v1", JSON.stringify([project]));
     globalThis.__editorKeepRendering = true;
@@ -129,7 +155,8 @@ for (const arm of arms) {
     // was not wrong about its own numbers; it was drawn from a different
     // experiment than the one the header describes.
     globalThis.__giConfigOverride = { quality: qualityTier, resolveScale: scale };
-  }, PROJECT, arm.scale, QUALITY);
+    if (ceiling) globalThis.__giSrcTransportRays = ceiling;
+  }, PROJECT, arm.scale, QUALITY, arm.ceiling ?? null);
   await page.goto(URL_BASE, { waitUntil: "load", timeout: 60000 });
   await page.waitForSelector(".hub-recent-open-btn", { timeout: 60000 });
   await page.evaluate((project) => {
@@ -174,6 +201,18 @@ for (const arm of arms) {
     const s0 = /s0=([\d.]+)/.exec(boot)?.[1] ?? "?";
     const built = gi.find((t) => /built \(voxel/.test(t)) ?? "";
     const tier = /auto-fit (\w+)/.exec(built)?.[1] ?? "?";
+    // ── THE STARTUP LINES, ECHOED VERBATIM ──────────────────────────────────
+    //
+    // `probe:gi-boot` parses a known set of log lines into its report and drops
+    // everything else, so an engine log line added after it was written is
+    // invisible there — which is how a measurement built specifically to test
+    // that probe's "98% is TSL node-graph build" attribution produced no output
+    // twice. This probe keeps every `[gi]` line, so it is the cheaper place to
+    // read one. Echo verbatim rather than parse: the point is to see a number
+    // nobody has seen yet, and a parser can only find what it already expects.
+    for (const l of gi.filter((t) => /node-graph build|compiled concurrently|compute kernels:|compile wave:/.test(t))) {
+      console.log(`      · ${l.slice(0, 190)}`);
+    }
 
     // ── THE COST ────────────────────────────────────────────────────────────
     // `samples` is deliberately small. At 249 ms a dispatch, the default 40
@@ -192,7 +231,7 @@ for (const arm of arms) {
     let mean = null; let lit = null;
     if (shot.ok && shot.value?.__image?.base64) {
       const png = Buffer.from(shot.value.__image.base64, "base64");
-      await sharp(png).toFile(`${OUT}/src-cost-${QUALITY}-${String(arm.scale).replace(".", "_")}.png`);
+      await sharp(png).toFile(`${OUT}/src-cost-${QUALITY}-${arm.name.replace(/[^\w]+/g, "_")}.png`);
       const { data, info } = await sharp(png).raw().toBuffer({ resolveWithObject: true });
       const n = data.length / info.channels;
       let sum = 0; let count = 0;
@@ -259,13 +298,40 @@ if (tiers.length > 1) {
 }
 console.log(`  (all arms at tier ${ok[0].tier}, s₀=${ok[0].s0}, ${ok[0].rpp} rays/px — only resolveScale moved)`);
 console.log("");
-console.log("  scale   transport px   traced rays  stride  deposit ms   ns/ray   screen mean   lit");
+console.log("  arm              transport px   traced rays  stride  deposit ms   ns/ray   screen mean   lit");
 for (const r of ok) {
   console.log(
-    `  ${String(r.scale).padEnd(6)} ${String(r.px).padStart(11)} ${String(r.rays).padStart(13)} ` +
+    `  ${r.arm.padEnd(16)} ${String(r.px).padStart(11)} ${String(r.rays).padStart(13)} ` +
     `${String(r.stride).padStart(7)} ${r.deposit.toFixed(3).padStart(11)} ${r.nsPerRay.toFixed(1).padStart(8)} ` +
     `${r.mean == null ? "     n/a" : r.mean.toFixed(5).padStart(13)} ${r.lit == null ? " n/a" : (r.lit * 100).toFixed(1) + "%"}`,
   );
+}
+// ── THE CEILING SWEEP'S OWN VERDICT: WHAT DID THE LOOK COST? ────────────────
+//
+// Only meaningful here, where every arm rendered at the same resolution — which
+// is the entire reason this sweep exists separately from the scale one.
+if (SWEEP === "ceiling") {
+  const ref = ok.find((r) => r.arm === "unlimited");
+  const pxSet = [...new Set(ok.map((r) => r.px))];
+  console.log("");
+  if (!ref) {
+    console.log("  No `unlimited` reference arm — nothing to judge the ceilings against.");
+  } else if (pxSet.length > 1) {
+    console.log(`  ✗ arms rendered at different transport pixel counts (${pxSet.join(", ")}) —`);
+    console.log("    the resolve moved under the sweep, so the look column is not a ceiling effect.");
+  } else {
+    console.log(`  vs the unlimited arm (${ref.rays} rays, ${ref.deposit}ms, mean ${ref.mean?.toFixed(5)}):`);
+    for (const r of ok) {
+      if (r === ref) continue;
+      const dLook = ref.mean ? ((r.mean - ref.mean) / ref.mean) * 100 : NaN;
+      const speed = r.deposit ? ref.deposit / r.deposit : NaN;
+      console.log(
+        `    ${r.arm.padEnd(16)} ${speed.toFixed(2)}× faster deposit  for  ` +
+        `${dLook >= 0 ? "+" : ""}${dLook.toFixed(1)}% screen mean`,
+      );
+    }
+    console.log("  A ceiling is affordable when the deposit ratio is large and the look moves a few %.");
+  }
 }
 console.log("");
 // ── FIT A FLOOR AND A SLOPE, DO NOT THRESHOLD A RATIO ───────────────────────
