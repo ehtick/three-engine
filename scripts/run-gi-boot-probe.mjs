@@ -168,11 +168,30 @@ async function runArm(arm) {
   });
 
   await page.evaluateOnNewDocument(pageHook);
-  await page.evaluateOnNewDocument((project) => {
+  // SRC must be set before the GI module builds, and it changes what this probe
+  // is measuring: the user's editor boots with SRC ON and 44 of its 45 kernels
+  // are SRC's, so a probe run without it is measuring a different program than
+  // the one whose startup is being complained about.
+  // FLAGS is a JSON object of page globals set before any engine code runs, so
+  // a startup A/B can turn a feature off WITHOUT a code change (R12). The whole
+  // startup hunt has been "which object costs the two minutes", and every
+  // answer so far has been a kernel compiled for a feature the scene does not
+  // use — that hypothesis is only testable if arbitrary gates can be flipped
+  // from outside.
+  let FLAGS = {};
+  try {
+    FLAGS = process.env.FLAGS ? JSON.parse(process.env.FLAGS) : {};
+  } catch (e) {
+    console.log(`  FLAGS is not valid JSON, ignoring: ${e.message}`);
+  }
+  await page.evaluateOnNewDocument((project, src, flags) => {
     localStorage.setItem("engine.projectRoot.v1", project);
     localStorage.setItem("engine.recentProjects.v1", JSON.stringify([project]));
     globalThis.__editorKeepRendering = true;
-  }, PROJECT);
+    if (src) globalThis.__giSrcProbes = true;
+    for (const [k, v] of Object.entries(flags)) globalThis[k] = v;
+  }, PROJECT, process.env.SRC === "1", FLAGS);
+  if (Object.keys(FLAGS).length) console.log(`  flags: ${JSON.stringify(FLAGS)}`);
 
   const tOpen = Date.now();
   await page.goto(url, { waitUntil: "load", timeout: 60000 });

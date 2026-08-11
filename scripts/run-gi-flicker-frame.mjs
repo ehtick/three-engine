@@ -47,6 +47,12 @@ const AMP = Number(process.env.AMP ?? 0.5);
 const ROTATE = process.env.ROTATE === "1";
 const SRC = process.env.SRC === "1";
 const ALPHA_AB = process.env.ALPHA_AB === "1";
+const CEILING_AB = process.env.CEILING_AB === "1";
+// Low enough to force a LARGE stride at this harness's resolution — the regime
+// the user's editor is in (stride 7) and the one the per-frame decay had to be
+// corrected for. The tier default here produces stride 2, which barely
+// exercises it.
+const TIGHT_CEILING = Number(process.env.TIGHT_CEILING ?? 16384);
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const browser = await puppeteer.launch({
@@ -64,7 +70,11 @@ await installTauriShim(page, {});
 let built = false;
 page.on("console", (m) => {
   const t = m.text();
-  if (/\[gi\] built|\[gi\] occupancy backend/.test(t)) console.log(`  ${t.slice(0, 160)}`);
+  // ⚠ `src probes` is in this filter because leaving it out cost a whole run.
+  // It is the line that carries pixelCount and the built stride, and without it
+  // the ceiling A/B could only INFER what it had changed. A console filter that
+  // excludes the line the run exists to read is the recurring failure here.
+  if (/\[gi\] built|\[gi\] occupancy backend|\[gi\] src probes/.test(t)) console.log(`  ${t.slice(0, 200)}`);
   if (/\[gi\] built/.test(t)) built = true;
   if (m.type() === "error" && !/favicon|404/.test(t)) console.log(`  console.error: ${t.slice(0, 250)}`);
 });
@@ -348,6 +358,21 @@ const measure = (amp, rotate) => page.evaluate(body, {
 // accumulators on the first decay pass, and coming back needs ~1/α = 10 frames
 // to re-accumulate.
 const setAlpha = (a) => page.evaluate((v) => { globalThis.__giSrcAlpha = v; }, a);
+// ── THE RAY CEILING, LIVE, FOR THE SAME REASON α IS ─────────────────────────
+//
+// `srcTransportRays` is polled per frame (srcSystem's `readCeiling`), so the
+// stride can be changed without a rebuild — which is the only way to A/B it,
+// because this instrument's own header records the same config reading 1.404
+// and 5.194 reversals/px in two different processes. A before/after across runs
+// would be exactly the invalid comparison it warns about.
+//
+// Why this arm exists: the ceiling makes a probe receive rays every S-th frame
+// while the decay pass still runs every frame, and if the decay is not slowed
+// to match, a bin loses most of its evidence between refreshes, drops under
+// MIN_WEIGHT, retires and returns — which is bin-level MEMBERSHIP churn, the
+// thing §12.24 identified as the step floor. `keep = (1-α)^(1/S)` is meant to
+// remove it. This measures whether it does.
+const setCeiling = (v) => page.evaluate((x) => { globalThis.__giSrcTransportRays = x; }, v);
 
 await measure(0, false);            // discarded warmup arm
 const result = await measure(AMP, ROTATE);
@@ -370,6 +395,33 @@ if (ALPHA_AB) {
     const dfltMove = await measure(AMP, ROTATE);
     const dfltStill = await measure(0, false);
     rounds.push({ oneMove, oneStill, dfltMove, dfltStill });
+  }
+}
+// ── THE RAY-CEILING A/B, SAME DISCIPLINE ───────────────────────────────────
+// Interleaved and repeated for the reason the α block above spells out: one
+// pass would confound the comparison with whatever drifts over a five-minute
+// page. Two rounds make that drift visible — if the rounds disagree by more
+// than the effect, there is no effect.
+//
+// STILL arms only. The still control is already the worse number here (11.257
+// against the moving arm's 10.110), so whatever this is, it is not motion
+// churn, and adding a mover would only add variance to the thing being read.
+const ceilRounds = [];
+// Read the stride the engine actually derived, rather than re-deriving it from
+// an assumed pixelCount. See `publishTransport` in srcSystem.js — the boot line
+// reports the BUILT stride and the runtime hatch moves it silently afterwards.
+const readTransport = () => page.evaluate(() => globalThis.__giSrcTransport ?? null);
+if (CEILING_AB) {
+  for (let r = 0; r < 2; r++) {
+    await setCeiling(TIGHT_CEILING);
+    await wait(300);
+    const tightT = await readTransport();
+    const tight = await measure(0, false);
+    await setCeiling(undefined);
+    await wait(300);
+    const dfltT = await readTransport();
+    const dflt = await measure(0, false);
+    ceilRounds.push({ tight, dflt, tightT, dfltT });
   }
 }
 
@@ -443,6 +495,80 @@ if (rounds.length) {
   console.log(`  step p95 2x2:  alpha1 ${moveStep1.toFixed(4)} moving / ${stillStep1.toFixed(4)} still ` +
     `(x${(moveStep1 / Math.max(1e-9, stillStep1)).toFixed(1)})   ` +
     `default ${moveStepD.toFixed(4)} / ${stillStepD.toFixed(4)} (x${(moveStepD / Math.max(1e-9, stillStepD)).toFixed(1)})`);
+}
+
+// ── THE RAY-CEILING VERDICT ─────────────────────────────────────────────────
+//
+// Reported as RAW still-arm counts per round, never as a ratio of excesses:
+// §12.24 recorded that the motion-excess statistic BREAKS across a temporal
+// change (it moves the control as well as the arm, and printed −15.6 once).
+// Here both arms are still, so the raw number is the comparable one.
+if (ceilRounds.length) {
+  console.log(`
+=== RAY CEILING A/B (still arms, interleaved x${ceilRounds.length}) ===`);
+  for (const [i, r] of ceilRounds.entries()) {
+    console.log(
+      `  round ${i + 1}:  tight(${TIGHT_CEILING}) ${r.tight.meanReversals.toFixed(3)} rev/px ` +
+      `(popped ${r.tight.poppedPct.toFixed(1)}%, step p95 ${r.tight.stepP95.toFixed(4)})` +
+      `   vs   default ${r.dflt.meanReversals.toFixed(3)} rev/px ` +
+      `(popped ${r.dflt.poppedPct.toFixed(1)}%, step p95 ${r.dflt.stepP95.toFixed(4)})`,
+    );
+  }
+  const tightMean = ceilRounds.reduce((s, r) => s + r.tight.meanReversals, 0) / ceilRounds.length;
+  const dfltMean = ceilRounds.reduce((s, r) => s + r.dflt.meanReversals, 0) / ceilRounds.length;
+  // ⚠ THE RAW REVERSAL COUNT IS CONFOUNDED BY THE THING BEING TESTED.
+  // A pixel can only reverse on a frame where its value CHANGED, and a stride-S
+  // transport refreshes each pixel once every S frames. So the count falls with
+  // S for a purely mechanical reason — "refreshed less often" and "more stable"
+  // are the same number here. Dividing by the refresh count separates them, and
+  // THAT is the statistic the decay correction makes a claim about: `keep =
+  // (1-alpha)^(1/S)` says a refresh should land the same step at any S, not
+  // that there should be fewer of them.
+  const strideOf = (t) => (t && t.stride > 0 ? t.stride : NaN);
+  const tightStride = strideOf(ceilRounds[0].tightT);
+  const dfltStride = strideOf(ceilRounds[0].dfltT);
+  // The arm's OWN frame count, not the FRAMES env var — `measure` is free to
+  // return fewer, and a normalisation divided by a number the run did not use
+  // is the same class of error as the confound it is correcting.
+  const perRefresh = (arm, stride) => (arm.meanReversals * stride) / arm.frames;
+  const tightPR = ceilRounds.reduce((s, r) => s + perRefresh(r.tight, tightStride), 0) / ceilRounds.length;
+  const dfltPR = ceilRounds.reduce((s, r) => s + perRefresh(r.dflt, dfltStride), 0) / ceilRounds.length;
+  const tightP95 = ceilRounds.reduce((s, r) => s + r.tight.stepP95, 0) / ceilRounds.length;
+  const dfltP95 = ceilRounds.reduce((s, r) => s + r.dflt.stepP95, 0) / ceilRounds.length;
+  // Round-to-round spread on the SAME configuration is the noise floor. An
+  // effect smaller than it is not an effect, and saying so here is cheaper than
+  // rediscovering it from a table later.
+  const spread = ceilRounds.length > 1
+    ? Math.abs(ceilRounds[0].dflt.meanReversals - ceilRounds[1].dflt.meanReversals)
+    : NaN;
+  console.log(`  strides: tight ${tightStride} (ceiling ${ceilRounds[0].tightT?.ceiling}), ` +
+    `default ${dfltStride} (ceiling ${ceilRounds[0].dfltT?.ceiling}), ` +
+    `pixelCount ${ceilRounds[0].dfltT?.pixelCount}, threads ${ceilRounds[0].dfltT?.threads}`);
+  console.log(`  raw reversals/px: tight ${tightMean.toFixed(3)}  vs  default ${dfltMean.toFixed(3)}   ` +
+    `(${((tightMean / dfltMean - 1) * 100).toFixed(0)}%)  <- CONFOUNDED, see above`);
+  console.log(`  round-to-round spread on the DEFAULT arm: ${spread.toFixed(3)} — the noise floor`);
+  console.log(`  reversals per REFRESH: tight ${tightPR.toFixed(4)}  vs  default ${dfltPR.toFixed(4)}   ` +
+    `(${((tightPR / dfltPR - 1) * 100).toFixed(0)}%)  <- THE UNCONFOUNDED ONE`);
+  console.log(`  step p95 (magnitude of a change, already per-change): ` +
+    `tight ${tightP95.toFixed(4)}  vs  default ${dfltP95.toFixed(4)}   ` +
+    `(${((tightP95 / dfltP95 - 1) * 100).toFixed(0)}%)`);
+  // Both surviving statistics must agree before this says the correction holds.
+  // Per-refresh reversal RATE and per-change step MAGNITUDE fail differently: an
+  // under-corrected decay inflates the magnitude (a bin loses more evidence
+  // between refreshes, so the refresh lands a bigger jump) without necessarily
+  // changing how often the sign flips.
+  const prExcess = tightPR / dfltPR - 1;
+  const p95Excess = tightP95 / dfltP95 - 1;
+  const TOL = 0.25;
+  if (prExcess > TOL || p95Excess > TOL) {
+    console.log("  ⇒ A LARGER STRIDE STILL FLICKERS MORE PER REFRESH. The per-frame decay");
+    console.log("     correction is not sufficient — look at MIN_WEIGHT retirement, not at alpha.");
+  } else {
+    console.log("  ⇒ PER-REFRESH FLICKER IS STRIDE-INVARIANT, which is exactly what");
+    console.log("     `keep = (1-alpha)^(1/stride)` claims to buy. The stride is NOT the flicker");
+    console.log(`     source; the residual ${dfltPR.toFixed(3)} reversals and ${dfltP95.toFixed(4)} step per refresh are`);
+    console.log("     what a refresh costs at this sample count, i.e. MONTE CARLO NOISE.");
+  }
 }
 
 await browser.close();

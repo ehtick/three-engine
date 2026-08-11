@@ -5744,3 +5744,127 @@ the loops or to not build the kernel, not to warm it earlier.
 So the open item is precise: **one BVH-descent kernel costs 47–132 s to compile,
 it is created outside every prewarm list, and its identity is one enumeration
 away.** Everything else about GI startup is now either fixed or measured.
+
+### 13.14 THE PREWARM FIX HELD, AND STARTUP IS NOW ONE PIPELINE
+
+The user's editor, reloaded 2026-08-11 08:43 with every startup commit in it:
+
+```
+[gi] compile wave: materials warmed safely in 4133ms while viewport remained live
+[gi] skipping 4 light-shadow pipelines at warm-up — no light uses Shadow Source "gi"
+[gi] prewarm loop 2ms over 45 kernels = 2ms node-graph build + WGSL codegen
+      (worst 0ms at #0) + 0ms YIELDING
+[gi] 2 compute pipelines compiled concurrently in 178005ms (frames kept flowing)
+[gi] SLOWEST PIPELINE: #47 took 181.6s (?kB WGSL, "computePipeline_compute")
+      of 233.2s summed over 51 pipelines
+[gi] field ready: 753995 occupied voxels          ← 3 min 10 s after boot
+```
+
+Three of the four startup findings are now closed in the shipping build:
+
+| stage | before | now |
+|---|---|---|
+| prewarm loop (§13.12, yield budget) | 24,468 ms | **2 ms** |
+| materials wave | 5.6–42 s | 4,133 ms |
+| never-dispatched shadow kernels (§13.13) | compiled | **skipped, 4 of them** |
+| **one unwarmed compute pipeline** | 47–132 s | **181.6 s** |
+
+**Startup is now exactly one object.** 178 of the 190 seconds between boot and
+`field ready` are a single `createComputePipelineAsync`, and the other pipeline
+in that wave accounts for the rest. Nothing else in the boot is above 5 s.
+
+⚠ **THE COST IS NOT STABLE — 47 s, 132 s, 181.6 s FOR THE SAME KERNEL.** It grew
+when a player-runtime build ran concurrently (autosave at 10 s triggers one every
+~20 s, and one landed at 08:44:19 inside this wave). So the driver's compile of
+this shader is contending for CPU with everything else on the machine, which
+means a measurement of it taken under different load is not comparable — the
+same trap §13.3 recorded for pipeline latency, one level up.
+
+#### 13.14.1 `?kB WGSL` was the blocker, and it was self-inflicted
+
+`kernelSizes` is collected only inside the prewarm loop, so the zip
+`kernelSizes[slowest.order]` is defined only for warmed kernels — and the slow one
+has been outside the prewarm every single time. **The instrument could name every
+kernel except the one it existed to name.** three's own label for it is the
+generic `computePipeline_compute`, so the log carried an index into a list the
+kernel is not a member of.
+
+Fixed by recording the WGSL against the shader module itself
+(`device.createShaderModule` → `WeakMap<GPUShaderModule, string>`), so the
+pipeline descriptor becomes self-describing regardless of which list built it.
+The report now prints size, entry point, loop/if counts and the first storage
+bindings — **the bindings name a kernel; the index does not.**
+
+### 12.32 THE STRIDE'S FLICKER, MEASURED — AND WHY THE VERDICT LINE LIED FIRST
+
+The ray ceiling (§12.31) refreshes a pixel every `S`-th frame while the decay pass
+runs every frame, so `keep = (1-α)^(1/S)` was added to make the decay follow the
+REFRESH rate. `test:gi-src-temporal` only covers the `S = 1` no-op, so the strided
+arm needed its own measurement: `CEILING_AB=1` on `run-gi-flicker-frame.mjs`, two
+interleaved rounds of still-only arms, tight ceiling 16,384 against the tier's.
+
+```
+strides: tight 10 (ceiling 16384), default 2 (ceiling 131072), pixelCount 78988
+raw reversals/px:      tight 0.837   vs   default 3.090   (-73%)
+reversals per REFRESH: tight 0.0465  vs   default 0.0343  (+35%)
+step p95:              tight 0.0383  vs   default 0.0485  (-21%)
+round-to-round spread on the DEFAULT arm: 0.287 of 3.090 = 9.3%
+```
+
+⚠ **THE RAW REVERSAL COUNT IS CONFOUNDED BY THE VARIABLE UNDER TEST.** A pixel can
+only reverse on a frame where its value CHANGED, and a stride-`S` transport
+refreshes it once every `S` frames — so the count falls with `S` mechanically.
+"More stable" and "refreshed less often" are the same number. The first run's
+verdict block printed **the opposite of its own data** on top of that, because the
+effect size was `Math.abs(tight − dflt)` compared against a noise floor: an 80%
+DECREASE tripped the "flickers more" branch. Two failures stacked — a confounded
+statistic and a sign-blind test — and they happened to cancel into a conclusion
+that read plausibly.
+
+Dividing by the refresh count separates them, and that ratio is what the
+correction actually claims: a refresh should land the same step at any `S`, not
+that there should be fewer of them. **Per-refresh flicker is +35% at 5× the
+stride, against a 9% round-to-round noise floor.** Small, real, and nowhere near
+what an UNCORRECTED decay would give — at `S = 10` without the root, a bin keeps
+`0.9¹⁰ = 0.35` of its evidence between refreshes and each refresh is close to a
+reset. So the correction does the bulk of its job; a residual remains.
+
+⚠ `step p95` is NOT usable at this sample count. The DEFAULT arm read 0.0307 and
+0.0663 in the two rounds of one page — a 2.2× spread on an unchanged config. Its
+noise floor is ~100%, so the "-21%" above is not evidence of anything and must not
+be quoted as the correction improving magnitude.
+
+#### 12.32.1 THE STRIDE IS A FREQUENCY CHANGE, AND THE METRIC CANNOT SEE THAT
+
+The finding that matters for the user's report is not the +35%. It is that
+**the stride moves the GI update rate into the eye's most sensitive temporal
+band.** At the user's stride of 7 and 60 fps, every pixel's indirect term steps
+8.6 times a second with a p95 step of ~5% luminance. At stride 1 the same
+per-refresh noise arrives at 60 Hz, where the eye integrates it away.
+
+Human temporal contrast sensitivity peaks around 5–15 Hz. So the ray ceiling —
+a pure performance fix that took the SRC chain from 260 ms to 34 ms — bought its
+speed by moving noise from an invisible frequency to the worst possible one, at
+roughly constant amplitude. **`reversals/px` counts events and therefore scores
+that trade as an IMPROVEMENT.** No pixel statistic in this harness can represent
+"same amplitude, worse frequency"; the metric is blind by construction to the
+mechanism most likely to explain what the user is looking at.
+
+That reframes the fix. Neither α nor MIN_WEIGHT is the lever, because the problem
+is not that a refresh is too big — it is that refreshes are too far apart and land
+as steps. The candidates, in order of how well they fit the mechanism:
+
+1. **Price the transport in PROBES, not screen pixels.** The boot line reads
+   `421132 gbuffer pixels … 2 rays/px` for a field of ~5,692 probes. The ceiling
+   is a band-aid over a cost model that scales with resolution instead of with the
+   thing being estimated. Fixing this removes the stride entirely at 60 fps, which
+   removes the frequency problem AND the perf problem in one change.
+2. **Ramp between refreshes** — let the resolve lerp toward a probe's new value
+   over the following `S` frames instead of adopting it instantly, converting a
+   step train into a piecewise-linear signal. Cheap, but it adds `S` frames of lag
+   and is a treatment of the symptom.
+3. Spatially decorrelate which probes refresh on which frame, so the existing
+   spatial interpolation averages several refresh phases per pixel.
+
+(1) is the one that serves both of the user's stated requirements. It is a Phase 6
+cost-model change, not a Phase 5 unit, and is recorded here rather than started.

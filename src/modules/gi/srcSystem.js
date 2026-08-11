@@ -385,6 +385,22 @@ export function createSrcProbeSystem({
   let rayCeiling = readCeiling();
   let rayStride = strideFor(rayCeiling);
   strideU.value = rayStride;
+  // ⚠ A DERIVED NUMBER THAT NOTHING PRINTS IS A NUMBER PROBES WILL GUESS.
+  // The ceiling A/B measured two arms 5.0x apart in flicker and the only way to
+  // tell "5x more stable" from "refreshed 5x less often" was the stride ratio —
+  // which no probe could read, because the boot line is emitted once at build
+  // and the runtime hatch moves the stride silently afterwards. So publish it.
+  const publishTransport = () => {
+    globalThis.__giSrcTransport = {
+      pixelCount,
+      threads: transportThreads,
+      naturalRays,
+      ceiling: rayCeiling,
+      stride: rayStride,
+      tracedRays: Math.ceil(naturalRays / rayStride),
+    };
+  };
+  publishTransport();
   const rayFrame = createSrcRayFrame(store, rayStore, {
     pixelProbe: frame.pixelProbe,
     raysPerPixel: tier.raysPerPixel,
@@ -832,6 +848,13 @@ export function createSrcProbeSystem({
         rayCeiling = nextCeiling;
         rayStride = strideFor(rayCeiling);
         strideU.value = rayStride;
+        // Publish the derived stride. The boot line reports the stride the
+        // system was BUILT with, and `__giSrcTransportRays` moves it afterwards
+        // without logging — so a probe that changes the ceiling at runtime had
+        // no way to read what it actually bought and was reduced to re-deriving
+        // it from an assumed `pixelCount`. Written only on change, so a still
+        // scene still writes nothing.
+        publishTransport();
       }
       phaseU.value = rayStride > 1 ? frameStampU.value % rayStride : 0;
       const a = anchorU.value;

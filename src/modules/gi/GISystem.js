@@ -260,6 +260,28 @@ function installAsyncComputePipelines(renderer) {
   if (!backend || typeof device?.createComputePipelineAsync !== "function") return;
   if (backend.__giAsyncComputePipelines) return;
   backend.__giAsyncComputePipelines = true;
+  // ── THE SOURCE OF THE SLOW ONE, NOT ITS INDEX ──────────────────────────────
+  //
+  // `SLOWEST PIPELINE: #47 took 181.6s (?kB WGSL)` — the `?` is the whole
+  // problem. Sizes are collected only inside the prewarm loop, so any pipeline
+  // created outside it (which is exactly the slow one, every time) has no size,
+  // no name and no source, and three's label for it is the generic
+  // `computePipeline_compute`. An index into a list it is not a member of
+  // cannot identify a shader.
+  //
+  // The module carries the source. three builds every GPUShaderModule from a
+  // WGSL string, so recording that string against the module object makes the
+  // pipeline descriptor self-describing: `descriptor.compute.module` → code.
+  // A WeakMap so nothing here retains a module the renderer has dropped.
+  if (typeof device.createShaderModule === "function" && !device.__giShaderSource) {
+    const rawShaderModule = device.createShaderModule.bind(device);
+    device.__giShaderSource = new WeakMap();
+    device.createShaderModule = (desc) => {
+      const module = rawShaderModule(desc);
+      if (module && typeof desc?.code === "string") device.__giShaderSource.set(module, desc.code);
+      return module;
+    };
+  }
   const rawCreate = backend.createComputePipeline;
   const rawCompute = backend.compute;
   backend.createComputePipeline = function (computePipeline, bindings) {
@@ -305,7 +327,26 @@ function installAsyncComputePipelines(renderer) {
       // in the chain rather than guessed at from a total.
       const order = giPipelineTimings.length;
       const tCreate = performance.now();
-      giPipelineTimings.push({ order, ms: null, label: descriptor?.label ?? "" });
+      const wgsl = mod ? device.__giShaderSource?.get(mod) : null;
+      giPipelineTimings.push({
+        order,
+        ms: null,
+        label: descriptor?.label ?? "",
+        // Kept as a fingerprint, never as the source: a 77 kB string per
+        // pipeline held for the life of the page is a leak, and the three
+        // numbers below are what actually distinguishes one kernel from
+        // another when the compiler pathology is loops-and-branches (§13.4
+        // showed byte size alone does not predict compile time).
+        kb: typeof wgsl === "string" ? Math.round(wgsl.length / 1024) : null,
+        entry: descriptor?.compute?.entryPoint ?? "",
+        loops: typeof wgsl === "string" ? (wgsl.match(/\bloop\s*\{/g) ?? []).length : null,
+        ifs: typeof wgsl === "string" ? (wgsl.match(/\bif\s*\(/g) ?? []).length : null,
+        // The first storage binding a kernel declares names it better than any
+        // index does — `srcBins`, `surfaceRecords`, `bvhNodes` are all distinct.
+        binds: typeof wgsl === "string"
+          ? (wgsl.match(/var<storage[^>]*>\s*(\w+)/g) ?? []).slice(0, 4).map((s) => s.split(/\s+/).pop()).join(",")
+          : "",
+      });
       const record = () => { giPipelineTimings[order].ms = performance.now() - tCreate; };
       const promise = device.createComputePipelineAsync(descriptor).then(
         (pipelineGPU) => {
@@ -2185,12 +2226,31 @@ export class GISystem {
           const slowest = timed.reduce((a, b) => (b.ms > a.ms ? b : a));
           const total = timed.reduce((s, p) => s + p.ms, 0);
           if (slowest.ms > 1000) {
+            // `kb` comes from the module the pipeline was actually built from,
+            // so it is present for kernels created OUTSIDE the prewarm too —
+            // which is where the slow one has been every single time. The
+            // `kernelSizes` zip stays only as a fallback for the warmed range.
+            const kb = slowest.kb ?? kernelSizes[slowest.order] ?? "?";
             console.log(
               `[gi] SLOWEST PIPELINE: #${slowest.order} took ${(slowest.ms / 1000).toFixed(1)}s ` +
-                `(${kernelSizes[slowest.order] ?? "?"}kB WGSL${slowest.label ? `, "${slowest.label}"` : ""}) ` +
+                `(${kb}kB WGSL${slowest.label ? `, "${slowest.label}"` : ""}` +
+                `${slowest.entry ? `, entry ${slowest.entry}` : ""}` +
+                `${slowest.loops != null ? `, ${slowest.loops} loops / ${slowest.ifs} ifs` : ""}` +
+                `${slowest.binds ? `, binds ${slowest.binds}` : ""}) ` +
                 `of ${(total / 1000).toFixed(1)}s summed over ${timed.length} pipelines. ` +
-                "Size does not predict this (§13.4) — the INDEX is the handle.",
+                "Size does not predict this (§13.4) — the BINDINGS name it.",
             );
+            // The runner-up matters as much as the winner: "one pathological
+            // kernel" and "every kernel of this shape is slow" are different
+            // problems with different fixes, and the top line alone cannot
+            // tell them apart.
+            const rest = timed.filter((p) => p !== slowest).sort((a, b) => b.ms - a.ms).slice(0, 3);
+            if (rest.length) {
+              console.log(
+                `[gi] next slowest: ${rest.map((p) => `#${p.order} ${(p.ms / 1000).toFixed(1)}s` +
+                  `${p.kb != null ? ` (${p.kb}kB${p.binds ? `, ${p.binds.split(",")[0]}` : ""})` : ""}`).join(", ")}`,
+              );
+            }
           }
         }
         if (kernelSizes.length) {
