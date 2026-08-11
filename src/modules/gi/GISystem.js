@@ -1976,8 +1976,38 @@ export class GISystem {
         // to the pipeline number it is being compared against.
         let buildMs = 0;
         let worstBuild = { ms: 0, i: -1 };
+        // The loop's WALL time, against the sum of its `giCompute` calls. The
+        // gap between them is the yields — one macrotask per kernel, which lets
+        // the browser run a whole frame each time. That is the feature ("frames
+        // kept flowing"), but it prices the wave at `kernels × frameTime`, and
+        // §13.9 just took the kernel count from 5 to 49.
+        const tLoop = performance.now();
+        // ══ YIELD ON A BUDGET, NOT ONCE PER KERNEL ════════════════════════
+        //
+        // This used to `await setTimeout(0)` before EVERY kernel, so the loop
+        // cost `kernels × frameTime` rather than the work it actually does.
+        // Measured: 49 kernels, **10 ms** of node-graph build and codegen,
+        // **24,468 ms of yielding** — 499 ms per kernel, because a macrotask
+        // lets the browser run a whole frame and a frame is not cheap while the
+        // scene is still warming. 99.96% of the loop was waiting.
+        //
+        // §13.9's fix made that ten times worse by construction: putting SRC's
+        // 44 passes in the warm set took the kernel count from 5 to 49, and the
+        // yield count with it. Correct fix, wrong cost, and the cost was
+        // invisible until the loop was timed against its own work.
+        //
+        // The budget is the same shape the MATERIAL wave already uses in this
+        // file ("270 skipped by the 40ms budget"): keep the viewport alive by
+        // yielding when we have actually held the thread a while, not on a
+        // fixed cadence. At 10 ms of total work this yields about once — the
+        // viewport loses one frame instead of forty-nine.
+        const YIELD_BUDGET_MS = 8;
+        let sinceYield = performance.now();
         for (const node of warmNodes) {
-          await new Promise((resolve) => setTimeout(resolve, 0));
+          if (performance.now() - sinceYield >= YIELD_BUDGET_MS) {
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            sinceYield = performance.now();
+          }
           if (this.state !== state) break;
           const tBuild = performance.now();
           giCompute(renderer, node);
@@ -1996,10 +2026,13 @@ export class GISystem {
         // running at all, and that is the exact ambiguity the measurement
         // exists to remove. A cheap graph build is the more interesting result
         // here, because it refutes the label `probe:gi-boot` puts on its 98%.
+        const loopMs = performance.now() - tLoop;
         console.log(
-          `[gi] node-graph build + WGSL codegen (JS, synchronous): ${buildMs.toFixed(0)}ms ` +
-            `over ${warmNodes.length} kernels, worst ${worstBuild.ms.toFixed(0)}ms at #${worstBuild.i}. ` +
-            "No shader cache touches this — it is CPU work on every run.",
+          `[gi] prewarm loop ${loopMs.toFixed(0)}ms over ${warmNodes.length} kernels = ` +
+            `${buildMs.toFixed(0)}ms node-graph build + WGSL codegen (worst ${worstBuild.ms.toFixed(0)}ms ` +
+            `at #${worstBuild.i}) + ${(loopMs - buildMs).toFixed(0)}ms YIELDING ` +
+            `(${((loopMs - buildMs) / Math.max(1, warmNodes.length)).toFixed(0)}ms per kernel — ` +
+            "one macrotask each, so one rendered frame each).",
         );
         // Ticks may have started compiles before this loop did — wait for the
         // whole in-flight set, including anything that joins meanwhile.
@@ -2064,7 +2097,17 @@ export class GISystem {
         engine.renderSuspended = true;
         engine.scene.add(pendingLight);
       }
+      // The other unmeasured half of `computes`. Already suspected once — the
+      // engine logs "first frame after compile wave took 655ms — pipelines
+      // recompiled at resume (likely the postprocess render path)" — and it is
+      // inside this window, so it has been silently included in every "compute
+      // pipeline compile" number this plan has quoted.
+      const tWarmPass = performance.now();
       await this.#warmOverridePass(renderer);
+      const warmPassMs = performance.now() - tWarmPass;
+      if (warmPassMs > 100) {
+        console.log(`[gi] postprocess pass warm: ${warmPassMs.toFixed(0)}ms (inside "computes")`);
+      }
       console.log(
         `[gi] compile wave: materials ${(t1 - t0).toFixed(0)}ms, computes ${(performance.now() - t1).toFixed(0)}ms ` +
           `(${backgroundCompile ? "viewport remained live" : "render suspended, app interactive"})`,

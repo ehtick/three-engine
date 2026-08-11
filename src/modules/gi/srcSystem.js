@@ -287,8 +287,24 @@ export function createSrcProbeSystem({
   const strideU = uniform(1, "uint");
   const phaseU = uniform(0, "uint");
   const naturalRays = pixelCount * tier.raysPerPixel;
-  const rayCeiling = srcTransportRays(srcQualityTier(props));
-  const rayStride = Math.max(1, Math.ceil(naturalRays / Math.max(1, rayCeiling)));
+  // ── THE CEILING IS POLLED PER FRAME, NOT READ AT BUILD ────────────────────
+  //
+  // Same rule `__giSrcAlpha` follows two dozen lines up, and for the reason
+  // §12.23 wrote down: a build-time value can only be A/B'd by RELOADING, and a
+  // reload is the comparison this module has repeatedly got wrong. The first
+  // attempt to price this ceiling used one page per arm and the arms came back
+  // at 315,952 and 499,720 transport pixels — the editor's viewport panel
+  // settles to different sizes across loads, so the "hold the resolve, move
+  // only the ceiling" sweep moved both. Polling makes the whole A/B happen
+  // inside ONE page, one build, one viewport, which is the only version of it
+  // that means anything.
+  //
+  // It is also free: `readCeiling` is a global read and a divide on the CPU,
+  // once per frame, and the kernels see a uniform. Nothing rebuilds (R11).
+  const readCeiling = () => srcTransportRays(srcQualityTier(props));
+  const strideFor = (ceiling) => Math.max(1, Math.ceil(naturalRays / Math.max(1, ceiling)));
+  let rayCeiling = readCeiling();
+  let rayStride = strideFor(rayCeiling);
   strideU.value = rayStride;
   const rayFrame = createSrcRayFrame(store, rayStore, {
     pixelProbe: frame.pixelProbe,
@@ -634,10 +650,14 @@ export function createSrcProbeSystem({
     // what the transport ACTUALLY fires rather than what the resolution implies.
     // `natural` is the pre-ceiling number: reading only `rays/px` off the log
     // was how a 3,146,400-ray frame looked like "2 rays/px" for a whole phase.
-    rayStride,
-    rayCeiling,
+    // GETTERS, because the ceiling is polled per frame — a snapshot taken here
+    // would report the value the system was BUILT with and go stale the moment
+    // a probe moved it, which is the reading error this whole section keeps
+    // paying for in a different costume.
+    get rayStride() { return rayStride; },
+    get rayCeiling() { return rayCeiling; },
     naturalRays,
-    tracedRays: Math.ceil(naturalRays / rayStride),
+    get tracedRays() { return Math.ceil(naturalRays / rayStride); },
     get reanchorCount() { return reanchors; },
 
     /**
@@ -675,7 +695,17 @@ export function createSrcProbeSystem({
       // definition of "which frame is this" (the decay pass compares against it
       // exactly, and two counters that drift would silently decorrelate the
       // stride from the decay).
-      if (rayStride > 1) phaseU.value = frameStampU.value % rayStride;
+      // The ceiling is live (see `readCeiling`), so re-derive the stride before
+      // using it. Compare-then-assign for the same reason `keepU` does: a
+      // uniform written every frame is uploaded every frame, and a still scene
+      // should upload nothing.
+      const nextCeiling = readCeiling();
+      if (nextCeiling !== rayCeiling) {
+        rayCeiling = nextCeiling;
+        rayStride = strideFor(rayCeiling);
+        strideU.value = rayStride;
+      }
+      phaseU.value = rayStride > 1 ? frameStampU.value % rayStride : 0;
       const a = anchorU.value;
       const drift = Math.max(
         Math.abs(cameraU.value.x - a.x),

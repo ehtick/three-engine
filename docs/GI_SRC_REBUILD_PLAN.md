@@ -5223,3 +5223,198 @@ instrument goes there.
 byte count cannot fix this (§13.4 again — 154 kB in 172 ms vs 2 kB in 611 ms,
 4× faster at 69× the size), and the cold arm's single 44 s pipeline is a COMPILER
 PATHOLOGY in one 2 kB / 0-loop / 5-if kernel rather than a volume problem.
+
+### 13.11 IT IS NOT TSL EITHER — 6 ms OF 40,832 ms
+
+The direct measurement §13.10 asked for, warm boot, user's Sponza:
+
+```
+[gi] node-graph build + WGSL codegen (JS, synchronous): 6ms over 49 kernels, worst 0ms at #48
+[gi] 1 compute pipelines compiled concurrently in 70ms (frames kept flowing)
+[gi] compile wave: materials 7315ms, computes 40832ms (viewport remained live)
+```
+
+**Six milliseconds.** `probe:gi-boot`'s "idle between compiles ← TSL node-graph
+build + WGSL generation (JS; no shader cache touches it)" is refuted. So is the
+version of it §13.10 was written around. Building all 49 node graphs and
+generating 630 kB of WGSL costs 6 ms; draining every pending pipeline costs 70
+ms; and the phase those two live inside reports **40,832 ms**.
+
+That label has now cost two rounds and it was never a measurement — it is the
+name the probe prints on a subtraction. §13.8 recorded four wrong claims of
+exactly this shape and the fix written down then was "measure the stage
+directly". It worked; it just needed doing a third time, because the leftover
+had been relabelled rather than measured.
+
+**What is left inside `computes`** — the window is `t1` (materials done) to the
+log line, and it contains, in order: the prewarm creation loop (49 iterations,
+each `await new Promise(setTimeout(0))` **then** `giCompute`), the pipeline
+drain, the re-dispatch loop, and `#warmOverridePass`. Two of those four are now
+measured at 76 ms combined. The remaining candidates are the **yields** and the
+**postprocess pass warm**, and they are very different problems:
+
+- **The yields.** One macrotask per kernel, deliberately — "frames kept
+  flowing" is the feature. But a yield lets the browser run a whole frame, so
+  the loop's wall time is ≈ `kernels × frameTime`, and this scene's frames were
+  not cheap while GI was unoptimized. **⚠ AND THIS SECTION'S OWN CHANGE
+  MULTIPLIED THE KERNEL COUNT BY TEN** (5 → 49, §13.9). If the yields dominate,
+  putting SRC's passes in the wave made the wave roughly 10× longer while fixing
+  the accounting — a regression introduced by a fix, which is worth stating
+  plainly before any number is claimed for it.
+- **`#warmOverridePass`.** Already suspected once: the engine logs "first frame
+  after compile wave took 655ms — pipelines recompiled at resume (likely the
+  postprocess render path; report this)".
+
+Both are inside `computes` and neither is timed. That is the next instrument,
+and this time the two candidates get separate timers rather than one label.
+
+**⚠ A METHOD NOTE THAT KEEPS EARNING ITS KEEP.** The `node-graph build` line was
+invisible for two runs: `probe:gi-boot` parses a fixed set of log lines into its
+report and drops everything else, so a log line added *after* the probe was
+written cannot reach it. It was read by echoing it from
+`run-gi-src-cost-probe.mjs`, which keeps every `[gi]` line verbatim. Same family
+as yesterday's grep filter that hid working per-group output for three rounds:
+in both cases the instrument was correct and the READER was discarding it.
+Prefer a probe that echoes unrecognised lines over one that parses only what it
+already expects.
+
+### 12.32 WHAT THE CEILING COSTS TO LOOK AT
+
+Three arms at the SAME 499,720 transport pixels and the same 806×620 resolve,
+differing only in `__giSrcTransportRays`:
+
+| ceiling | traced rays | stride | deposit ms | screen mean | lit |
+|---|---|---|---|---|---|
+| 262,144 | 249,860 | 4 | 4.696 | 0.16325 | 71.2% |
+| 65,536 | 62,465 | 16 | 2.548 | 0.15241 | 67.9% |
+| 16,384 | 16,120 | 62 | 1.509 | 0.15163 | 68.2% |
+
+**16× fewer rays costs 7.1% of screen mean and buys 3.1× on the deposit.** The
+shape matters more than the endpoints: the image falls 6.6% between 262k and 65k
+and then **stops** (−0.5% over the next 4× cut) while cost keeps dropping. So
+there is a knee, the tier defaults sit above it, and the region below 65k is
+paying real time for a difference the picture has already stopped registering.
+
+**The deposit does not fall 16×, and the reason is now the binding constraint.**
+Least squares: `deposit ms ≈ 1.930 + 8.2 ns × rays`. That 1.9 ms floor is the
+strided dispatch still launching **every pixel's thread** so that 15 of 16 can
+compute one modulo and return. The ray ceiling caps the ray work and leaves the
+thread work untouched.
+
+Scaled to the user's 1,573,200 px that floor is ~4.7 ms of pure launch overhead,
+which no ceiling can remove. **The next lever is therefore the dispatch count**:
+`.compute(ceil(pixelCount/stride))` with thread → pixel mapping instead of
+`.compute(pixelCount)`. It was deferred when the ceiling landed on the grounds
+that a baked dispatch count costs a rebuild to change; the honest version of
+that trade is now visible — bake the count off the TIER's ceiling (a build-time
+constant) and keep a uniform stride for movement inside it, which also makes
+every SRC dispatch count independent of the viewport and stops a window resize
+rebuilding the frame.
+
+**⚠ AND THE REST OF THE CHAIN IS STILL PER-PIXEL.** At the user's resolution the
+non-deposit groups measured 11.3 ms — gather 6.15, populate 1.88, rays 1.89,
+merge 0.88, tiles 0.48 — none of which the ray ceiling touches, plus a 5.66 ms
+screen resolve. **So ~17 ms of GI survives a perfect deposit at 1,573,200 px,
+which is already past a 60 fps frame budget before the scene is drawn.** 60 fps
+at ultra needs SRC's transport resolution decoupled from `resolveScale` as well
+— the fix identified when this started and not yet done. Stating it now so the
+ceiling is not mistaken for the whole answer.
+
+#### 12.32.1 Two instrument faults, one of them mine to own
+
+- **The sweep could not hold its own control.** `SWEEP=ceiling` exists to fix
+  the resolve and move only the ceiling, and its arms still came back at 315,952
+  and 499,720 px — the editor's viewport panel settles to different sizes across
+  page loads, so one-arm-per-page cannot hold a resolution. The verdict withheld
+  (correctly), and three of four arms happened to agree, which is luck, not
+  method. **Fixed properly: the ceiling is now POLLED PER FRAME**, the same rule
+  `__giSrcAlpha` follows and for the reason §12.23 wrote down — a build-time
+  value can only be A/B'd by reloading, and a reload is the comparison this
+  module keeps getting wrong. The whole sweep can now run inside one page, one
+  build, one viewport.
+- **R15 was violated, by me, mid-run.** `srcSystem.js` was edited while that
+  sweep was still executing. The edit is behaviourally identical at build time
+  (a fixed global polls to the value it was read as), so the numbers above are
+  believed sound — but a Vite reload landing mid-arm kills an arm outright, and
+  "believed sound" is a weaker claim than these tables usually carry. Recorded
+  rather than quietly re-run, because the rule exists precisely because this
+  failure is invisible when it does not happen to break anything.
+
+### 13.12 THE WAVE WAS WAITING, NOT WORKING — 10 ms OF WORK IN 24,478 ms
+
+The decomposition §13.11 asked for, warm boot, ultra:
+
+```
+[gi] prewarm loop 24478ms over 49 kernels
+       = 10ms node-graph build + WGSL codegen (worst 5ms at #34)
+       + 24468ms YIELDING (499ms per kernel — one macrotask each, so one rendered frame each)
+[gi] 1 compute pipelines compiled concurrently in 294ms
+[gi] compile wave: materials 25754ms, computes 24778ms
+```
+
+**99.96% of the loop is the yield.** The prewarm did `await new Promise(setTimeout(0))`
+before every kernel; a macrotask lets the browser run a whole frame, and a frame
+during startup costs ~499 ms. So the loop's wall time was `kernels × frameTime`
+and had nothing to do with how much work it had to do — which is 10 ms.
+
+That closes the chain §13.10 opened. Warm boots are not pipeline-bound (the
+cache works, 44×), not TSL-bound (§13.11, 6 ms), and not GI-CPU-bound (1.6 ms,
+3.2%). They were bound by a yield cadence.
+
+**⚠ AND §13.9's FIX MADE IT TEN TIMES WORSE.** Putting SRC's 44 passes into the
+warm set was correct — without it a skipped dispatch meant no diffuse light at
+all — but it took the kernel count from 5 to 49 and the yield count with it. A
+right fix with a cost that was invisible because nothing timed the loop against
+its own work. Worth keeping as the example: the change was reviewed, reasoned
+about, documented, committed, and it carried a 10× regression in the number the
+user actually complains about.
+
+**The fix is a budget, and it is the shape this file already uses** — the
+material wave yields "270 skipped by the 40ms budget". The prewarm now yields
+only after holding the thread ≥ 8 ms. At 10 ms of total work that is about one
+yield: the viewport loses one frame instead of forty-nine.
+
+**⚠ TWO REGIMES, AND THE HARNESS ONLY SHOWS ONE.** The user's editor logged
+`3 compute pipelines compiled concurrently in 68250ms` — the DRAIN, not the
+yields, because their cache was cold. The harness's drain is 70–294 ms because
+it is warm. So:
+
+| | warm (harness) | cold (user's editor) |
+|---|---|---|
+| dominant term | prewarm yields, 24.5 s | pipeline drain, 68 s |
+| what fixes it | the yield budget | nothing here — see §13.4 |
+
+Both are real and they are different problems. The yield budget cannot help a
+cold boot, and the shader cache cannot help a warm one. R18's ≤1 s needs both,
+and the cold half still has no lever that has survived measurement — §13.4's one
+2 kB / 0-loop / 5-if kernel taking 24–44 s is a compiler pathology, not a volume
+problem, and it is the next thing to isolate.
+
+#### 13.12.1 Verified, and the win is smaller than the loop's own number
+
+```
+                    before      after
+prewarm loop      24478ms        2ms     (yielding 24468ms → 0ms)
+pipeline drain      294ms     8347ms
+compile wave "computes"
+                  24778ms     8356ms     = 2.97×, saving 16.4s
+```
+
+**The drain grew by 8 s and that is not noise — it is the yields' one real
+service, now withdrawn.** Yielding between kernels handed the driver time to
+compile *while the loop was still running*, so by the time the drain started
+most pipelines had landed and it measured 294 ms. Without the yields every
+creation fires in one burst and the drain waits for all of them.
+
+So the honest accounting is 24.8 s → 8.4 s, **not** the 24.5 s the loop's own
+line would suggest. Quoting the loop's saving alone would have been true about
+the loop and wrong about startup, which is the failure this section has now
+recorded three times in three different costumes.
+
+**What is now the largest term, and it is not GI's compute at all:** the
+MATERIAL wave, and it is wildly unstable across otherwise identical boots —
+5,606 / 7,315 / 8,369 / 16,798 / 25,754 / **42,015** ms. That spread is bigger
+than everything this section just fixed. It is the next thing to measure, and
+nothing about it should be guessed at from here: §13.8's four wrong claims and
+§13.10/§13.11's two wrong labels all came from reasoning about a stage instead of
+timing it.
