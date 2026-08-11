@@ -27,6 +27,9 @@ for (const arm of arms) {
     const result = await page.evaluate("globalThis.__GI_SMOKE_RESULT__");
     if (result?.pass) {
       console.log(`PASS ${arm} — storage ${result.storageLimit}`);
+      // Near-limit kernels (the page logs any at ≥6 storage buffers, named) —
+      // the planning constraint for adding a binding to an existing kernel.
+      for (const l of logs) if (l.startsWith("GI-SMOKE STORAGE")) console.log(`  ${l}`);
       // The `?src=1` arm's whole output is these numbers; a bare PASS would
       // hide the probe counts and the hash load the arm exists to report.
       if (result.srcProbes) {

@@ -4958,7 +4958,15 @@ export class GISystem {
     // now the FIRST test, so the message tracks the build instead of the plan.
     const sky = skyRadiance.value;
     const skyLit = Math.max(sky.r, sky.g, sky.b) > 0;
-    if (srcProbesEnabled() && srcShadeEnabled()) {
+    // ⚠ CONSULT THE BUILT SYSTEM, NOT THE FLAGS. `srcShadeEnabled()` says what
+    // was ASKED FOR; `screen.srcProbes.shading` says what was BUILT — and they
+    // part ways whenever the socket declines (no surface records at this
+    // ray-hit mode, attribution threw, no lighting bundle). The first version
+    // of this branch read the flags and printed "LIVE AND SHADED" over a
+    // sky-only transport — a diagnostic describing a state the code had left,
+    // found by the smoke's tile assertion reading E 0..0 underneath it.
+    const builtShading = screen?.srcProbes?.shading ?? null;
+    if (srcProbesEnabled() && builtShading) {
       console.log(
         "[gi] diffuse indirect: LIVE AND SHADED — SRC transport is running with Phase 5 hit " +
           `shading, so hits carry albedo, sun, lights and emission. Sky Light is ` +
@@ -4969,6 +4977,14 @@ export class GISystem {
               "ONE bounce. That is a legal but very dark setup: shadowed regions have no fill " +
               "at all, which reads as crushed blacks next to a blown sunlit strip. Give the " +
               "scene an environment (Scene → Environment) to get sky fill."),
+      );
+    } else if (srcProbesEnabled() && srcShadeEnabled() && screen?.srcProbes) {
+      console.log(
+        "[gi] diffuse indirect: LIVE, SHADING UNAVAILABLE — SRC transport is running but the " +
+          "hit-shading socket was not built: static attribution needs SURFACE RECORDS, which " +
+          "this ray-hit mode does not create (hybrid-plane and above do), or the attribution/" +
+          "lighting bundle failed above (a warning names it). Radiance is sky-only" +
+          (skyLit ? "." : ", and Sky Light is 0 — so the diffuse term is correctly black."),
       );
     } else if (!srcProbesEnabled()) {
       console.log(

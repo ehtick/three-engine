@@ -486,6 +486,13 @@
             const names = shader.split("\n").filter((line) => line.includes("var<storage"));
             bindingAudit.push({ index, storageBindings, bytes: shader.length, names });
           }
+          // Near-limit kernels, NAMED — the number that decides whether a new
+          // consumer (e.g. [J]'s hit-side gather, +2 buffers) fits a kernel or
+          // needs a buffer fold first. ≥6 because the portable limit is 8 and
+          // nothing smaller is a planning constraint.
+          if (storageBindings >= 6) {
+            console.log(`GI-SMOKE STORAGE ${index}: ${storageBindings} storage buffers, ${(shader.length / 1024).toFixed(0)}kB`);
+          }
         }
         console.log("GI-SMOKE BINDINGS", JSON.stringify(bindingAudit));
 
@@ -658,10 +665,27 @@
               `${(Math.PI * skyArm).toFixed(3)} — the tile bake is creating energy`,
             );
           }
-          if (skyArm === 0 && tl.maxLum !== 0) {
+          // SHADING-AWARE since Phase 5 landed and went default-on. Consult
+          // the BUILT system, not the flags: at brick-box ray-hit modes there
+          // are no surface records, so attribution — and therefore shading —
+          // correctly declines, and the old zero-energy meaning still holds
+          // there. With shading BUILT the scene's sun (this page always adds
+          // one) makes tile energy legal at sky 0 — and its ABSENCE becomes
+          // the failure: shading + an active light + all-black tiles is the
+          // lighting socket delivering zero, which is precisely the state the
+          // stale version of this check could not see.
+          const shadingBuilt = !!state?.screen?.srcProbes?.shading;
+          if (skyArm === 0 && !shadingBuilt && tl.maxLum !== 0) {
             throw new Error(
               `src arm: tiles carry ${tl.maxLum} irradiance with skyIntensity 0 and no hit ` +
-              "shading — the bake is producing light from nothing",
+              "shading built — the bake is producing light from nothing",
+            );
+          }
+          if (skyArm === 0 && shadingBuilt && tl.maxLum === 0) {
+            throw new Error(
+              "src arm: hit shading is BUILT and the scene has a sun, yet every tile is " +
+              "black — the lighting socket is delivering zero (dead slots, a zeroed " +
+              "attribution palette, or shadow rays occluding everything)",
             );
           }
           // ── [I] THE SCREEN GATHER (plan §12.18.7 unit 5) ────────────────
@@ -731,9 +755,11 @@
                 `${(Math.PI * skyArm).toFixed(3)} — the gather is creating energy`,
               );
             }
-          } else if (g.lit !== 0) {
+          } else if (!shadingBuilt && g.lit !== 0) {
             // Sky off and hit shading absent means there is genuinely no light.
-            // A lit pixel here is light from nowhere.
+            // A lit pixel here is light from nowhere. (With shading BUILT the
+            // sun's bounce legitimately lights pixels at sky 0 — the tile
+            // check above owns the both-directions assertion for that case.)
             throw new Error(
               `src arm: ${g.lit} pixels are lit with skyIntensity 0 and no hit shading — ` +
               "the gather is producing light from nothing",
