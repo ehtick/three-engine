@@ -138,6 +138,22 @@ function pageHook() {
   }
 }
 
+// ── WHICH OPTIONAL CHAINS DID THIS BOOT ACTUALLY COMPILE? ──────────────────
+//
+// §13.14.6, the most expensive lesson in this section: three sessions of
+// "which kernel is the slow one" produced three different answers, and every
+// wrong one came from a harness that did not reproduce the user's GATES. The
+// shadow marcher and the reflection prepass share a function fingerprint
+// (both descend the same BVH), so a run where the marcher compiles looks
+// identical to one where the prepass does — and the marcher is skipped in the
+// user's editor and not in this harness. An attribution taken under an
+// unstated gate state is not a measurement of anything.
+const GATES = [
+  ["light-shadow chain", /skipping \d+ light-shadow pipelines/, "SKIPPED", "COMPILED"],
+  ["exact reflections", /bvh: exact reflections ON/, "COMPILED", "off"],
+  ["SRC hit shading", /SHADING \(/, "ON", "off"],
+];
+
 /** Numbers the engine already prints, harvested rather than re-derived. */
 const STAGE_PATTERNS = [
   ["voxelize (CPU)", /occupancy backend:.*?\((\d+)ms CPU\)/],
@@ -325,6 +341,14 @@ function report(r) {
   const render = r.pipelines.filter((p) => p.kind === "render");
   const sum = (a) => a.reduce((s, p) => s + p.ms, 0);
   console.log(`\n${"═".repeat(78)}\n  ARM: ${r.arm.toUpperCase()}${r.timedOut ? "  ⚠ TIMED OUT before the compile wave finished" : ""}\n${"═".repeat(78)}`);
+
+  // Printed FIRST, above every timing, because it decides whether the timings
+  // below describe the build anyone cares about (§13.14.6).
+  console.log("\n  ── GATE STATE (which optional chains this boot compiled) ──");
+  for (const [name, re, whenSeen, whenNot] of GATES) {
+    const seen = (r.lines ?? []).some(({ t }) => re.test(t));
+    console.log(`    ${name.padEnd(22)} ${seen ? whenSeen : whenNot}`);
+  }
 
   console.log("\n  ── STAGES, as the engine reports them ──");
   for (const [name] of STAGE_PATTERNS) {

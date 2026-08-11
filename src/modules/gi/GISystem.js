@@ -3815,7 +3815,44 @@ export class GISystem {
     // `custom` intentionally follows the high tier via qualityTierOf().
     const quality = qualityTierOf(props);
     if (quality !== "high" && quality !== "ultra") return false;
-    return props.exactReflections === true;
+    if (props.exactReflections !== true) return false;
+    // ── AND SOMETHING IN THE SCENE MUST ACTUALLY READ IT ────────────────────
+    //
+    // §13.14.6: the user's Sponza logs `bvh: exact reflections ON — DENSE
+    // (full-screen), hit-shaded` next to `material GI buckets: 0 mirror, 0
+    // specular, 27 diffuse-only, 0 dynamic-roughness`, and their slowest
+    // pipeline — 82.1 s of a 136.8 s total, index #48, OUTSIDE the 46 warmed
+    // kernels — is that prepass. **A full-screen exact-reflection BVH trace,
+    // compiled for a scene in which nothing consumes reflections.**
+    //
+    // Exactly the shape §13.13 found for the light-shadow chain, and the same
+    // fix: gate on a consumer, not on the tier. `exactReflections` derives from
+    // `quality` alone, so high/ultra turned this on for every scene regardless
+    // of content.
+    //
+    // ⚠ A RAMP, NOT A REMOVAL (R1). Buckets 0 (mirror) and 3
+    // (dynamic-roughness) are the shaders that read `bvhShade`; give any
+    // material a low enough roughness and `#refreshMirrorBucket` moves it into
+    // one, which flips this back on and rebuilds. The feature is not gone, it
+    // is deferred to the scene that asks for it.
+    return this.#hasReflectionConsumer();
+  }
+
+  /**
+   * Is any material in the scene in a bucket that reads the exact-reflection
+   * target? Buckets 0 and 3 are "mirror" and "dynamic-roughness" — the two the
+   * bucket log already calls "the expensive shaders".
+   *
+   * ⚠ UNKNOWN MEANS YES. `_bucketTally` is filled by the mesh walk, and a build
+   * that somehow reaches here before the walk must not silently ship a scene
+   * without its reflections — a missing feature reads as a rendering bug, while
+   * a slow first build reads as the slow first build it already is.
+   */
+  #hasReflectionConsumer() {
+    if (globalThis.__giReflectConsumerGate === false) return true;
+    const bt = this._bucketTally;
+    if (!bt) return true;
+    return bt[0] + bt[3] > 0;
   }
 
   /**
@@ -4040,7 +4077,25 @@ export class GISystem {
     if (!material) return;
     const bucket = giRoughnessBucketOf(material);
     const previous = this._mirrorBuckets.get(material);
-    if (previous !== undefined && previous !== bucket) material.needsUpdate = true;
+    if (previous !== undefined && previous !== bucket) {
+      material.needsUpdate = true;
+      // ── THE OTHER HALF OF `#hasReflectionConsumer`'s RAMP ──────────────────
+      //
+      // A material moving INTO bucket 0/3 is the moment a scene starts wanting
+      // exact reflections. The gate is evaluated at BUILD time, so noticing the
+      // change here and doing nothing would leave reflections off until some
+      // unrelated edit happened to trigger a rebuild — "I made it a mirror and
+      // nothing happened", which is worse than the compile it is avoiding.
+      //
+      // Only 0→consumer flips it. Leaving the bucket needs no rebuild: the
+      // prepass is already built and simply stops having a reader, which costs
+      // one dispatch and no correctness.
+      const nowConsumer = bucket === 0 || bucket === 3;
+      const wasConsumer = previous === 0 || previous === 3;
+      if (nowConsumer && !wasConsumer && !this.#hasReflectionConsumer()) {
+        this._reflectionConsumerAppeared = true;
+      }
+    }
     this._mirrorBuckets.set(material, bucket);
   }
 
@@ -6107,6 +6162,19 @@ export class GISystem {
     const nowMs = performance.now();
     if (nowMs - (this._lastScanAt ?? 0) < FINGERPRINT_MIN_INTERVAL_MS) return;
     this._lastScanAt = nowMs;
+
+    // A material became a mirror while reflections were gated off for want of
+    // one (`#hasReflectionConsumer`). Rebuild so the prepass exists — this is
+    // the deferred half of that gate's ramp, and it is checked here rather than
+    // acted on inside `#refreshMirrorBucket` because that runs inside the mesh
+    // walk, and rebuilding from inside the walk that a rebuild will re-run is
+    // how you get a loop.
+    if (this._reflectionConsumerAppeared) {
+      this._reflectionConsumerAppeared = false;
+      console.log("[gi] a material became reflective — rebuilding to bring exact reflections online");
+      this.#rebuild();
+      return;
+    }
 
     if (state.autoFit) {
       // Refit ONLY when the live volume has stopped covering the content.

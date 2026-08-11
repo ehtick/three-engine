@@ -60,7 +60,7 @@
 //
 // docs/GI_SRC_REBUILD_PLAN.md §4.4, §7 Phase 5, §12.26.
 
-import { If, float, int, mix, select, step, uint, vec3 } from "three/tsl";
+import { If, Loop, float, int, mix, select, step, uint, vec3 } from "three/tsl";
 import { MAX_LOOP_ALBEDO } from "./srcConfig.js";
 import { hashKey } from "./srcMathTsl.js";
 import { emitterSlotFactor, emitterSurfaceT } from "./giLight.js";
@@ -485,14 +485,67 @@ export function createSrcHitShader({
     // one ray for lights AND emitters together, which is what `lightTree.js`
     // does and what §7's Phase 5 asks for. Measure before assuming it matters —
     // the cosine gate means most hits pay for one or none.
-    for (const slot of lights) {
-      const t = lightTermsAt(slot, P, n, margin, maxRay);
-      If(t.cos.greaterThan(0).and(t.E.x.max(t.E.y).max(t.E.z).greaterThan(0)), () => {
-        const v = visibility ? float(visibility(P, n, t.dirTo, t.maxT)).toVar() : float(1).toVar();
-        // Only when a ray was cast — see the NEE site's note.
-        if (count && visibility) count.shadowRays(1);
-        E.addAssign(t.E.mul(v));
-      });
+    // ⚠ THE LOOP BELOW IS A GPU LOOP, AND THAT IS THE WHOLE POINT (§13.14.5).
+    //
+    // It used to be `for (const slot of lights)` — a JS loop, so it unrolled at
+    // graph-build time and each iteration inlined `visibility(...)`, i.e. a
+    // whole 2-nested-loop BVH8 descent. `makeLightSlots()` always builds
+    // MAX_GI_LIGHTS = 4 slots (correctly — that is R11: adding a light updates a
+    // uniform and never recompiles), so this kernel emitted FOUR descents no
+    // matter how many lights the scene had. Measured by stubbing call sites one
+    // at a time — 4/3/2/1/0 inlinings gave 11814/11704/9739/8526/6938 ms — it is
+    // ~1.2 s of shader COMPILE per call site, and this kernel is 66% of all the
+    // compile work in a GI boot (26.1 s of 39.3 s across 75 kernels).
+    //
+    // Rolling it keeps every property that mattered: still one shadow ray per
+    // light, still gated so an unlit or back-facing light costs no ray, still 4
+    // uniform slots so a light edit never recompiles. The only thing that
+    // changes is that the descent is written into the shader ONCE.
+    //
+    // The predicated gather is the shape `neeIrradiance` already uses below for
+    // exactly this reason: funnel N cheap alternatives into ONE expensive call.
+    // Here the funnel sits inside a loop so all N still get their own ray —
+    // this is an EMISSION change, not an estimator change. Folding the lights
+    // into the NEE set (which §7 Phase 5 does want) trades four deterministic
+    // rays for one stochastic sample, and that is a variance change that needs
+    // its own energy A/B and its own flicker arm. Not here.
+    if (lights.length) {
+      const terms = lights.map((slot) => lightTermsAt(slot, P, n, margin, maxRay));
+      if (!visibility || terms.length === 1) {
+        // Nothing to win: with no ray there is no expensive call to share, and
+        // with one light there is already exactly one call site. Kept as the
+        // straight-line form so those two cases stay byte-identical to before.
+        for (const t of terms) {
+          If(t.E.x.max(t.E.y).max(t.E.z).greaterThan(0), () => {
+            const v = visibility ? float(visibility(P, n, t.dirTo, t.maxT)).toVar() : float(1).toVar();
+            if (count && visibility) count.shadowRays(1);
+            E.addAssign(t.E.mul(v));
+          });
+        }
+      } else {
+        Loop({ start: int(0), end: int(terms.length), type: "int", condition: "<" }, ({ i }) => {
+          // `E` already carries cos and `active` (see `lightTermsAt`), so a
+          // slot that is off, out of range, or behind the surface arrives here
+          // as zero and the gate below skips its ray. That is why the old
+          // `cos > 0 &&` half of the gate is gone rather than moved: it was
+          // redundant with the `E > 0` half, and keeping both would suggest
+          // they test different things.
+          const Ei = vec3(0).toVar();
+          const dirTo = vec3(0, 1, 0).toVar();
+          const maxT = float(0).toVar();
+          for (let k = 0; k < terms.length; k++) {
+            const take = i.equal(int(k));
+            Ei.assign(select(take, terms[k].E, Ei));
+            dirTo.assign(select(take, terms[k].dirTo, dirTo));
+            maxT.assign(select(take, terms[k].maxT, maxT));
+          }
+          If(Ei.x.max(Ei.y).max(Ei.z).greaterThan(0), () => {
+            const v = float(visibility(P, n, dirTo, maxT)).toVar();
+            if (count) count.shadowRays(1);
+            E.addAssign(Ei.mul(v));
+          });
+        });
+      }
     }
 
     if (useNee) {

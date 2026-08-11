@@ -6062,3 +6062,62 @@ replaces four deterministic shadow rays with one stochastic sample: fewer rays,
 higher variance, and §12.32.1 has the user reporting flicker already. Rolling the
 loop is an emission change with byte-identical results; NEE folding is an
 estimator change that needs its own energy A/B and its own flicker arm.
+
+#### 13.14.6 ⚠ CORRECTION — §13.14.2 THROUGH §13.14.5 BISECTED A KERNEL THE USER NEVER COMPILES
+
+The 77 kB / 4-loop / 204-if kernel that §13.14 named, §13.14.4 bisected and §13.14.5
+attributed to `srcShade.js:488` is **the GI light-shadow marcher**. The tell was in
+its own function list the whole time: `srcShadowWidthProbe`, which is built at
+`GISystem.js:2457` (`analyticWidth ? volume.createWidthProbe() : null`) inside the
+shadow marcher and nowhere else.
+
+**The user's editor skips it.** Their boot logs `skipping 4 light-shadow pipelines
+at warm-up — no light uses Shadow Source "gi", so they are never dispatched`. The
+harness does not skip it, so every cold boot here was dominated by a shader that
+does not exist in the build being complained about.
+
+Consequences, stated plainly:
+
+1. **§13.14.2's "REFUTED: it is not `bvhReflect`" IS NOT VALID.** That arm turned
+   reflections off and observed the 77 kB kernel still present — but that kernel is
+   the shadow marcher, which the flag does not touch and which masked whatever
+   reflections cost behind it. The hypothesis is UNTESTED, not refuted.
+2. **§13.14.4's bisection is sound as measurement and misattributed as cause.** The
+   numbers (call-site cost ~1.2 s, stack depth irrelevant, 6.9 s floor) are real and
+   reproducible; they describe the shadow marcher.
+3. **§13.14.5's fix targets the wrong file.** Rolling `srcShade.js`'s light loop was
+   verified by dumping the kernel before and after — **byte-identical, same md5** —
+   which is exactly what a change to a file that does not build this shader looks
+   like. The edit is kept (it removes four inlined descents from the kernel it *does*
+   build, and `test:gi-src-shade` is green), but it is **unmeasured**, and the gate
+   has zero coverage of the `lights` path (`grep -c "lights:" ` → 0).
+
+##### What the user's editor actually says
+
+```
+[gi] bvh: exact reflections ON — 25 meshes, 262267 tris, DENSE (full-screen), hit-shaded
+[gi] material GI buckets: 0 mirror, 0 specular, 27 diffuse-only, 0 dynamic-roughness (0/27)
+[gi] skipping 4 light-shadow pipelines at warm-up
+[gi] prewarm loop 1ms over 46 kernels
+```
+
+A full-screen exact-reflection BVH pass, in a scene with **zero materials in the
+buckets that consume it** — and `#bvhReflectionsEnabled()` gates only on
+`quality ∈ {high, ultra}` and `exactReflections`, never on whether a consumer
+exists. That is the shadow-chain pattern verbatim, and §13.13.2 already recorded
+that `bvhReflect` carries `giStaticBvh8`/`giDynBvh8`/`giFreeRadius…` — the same
+function set, which is precisely why the fingerprint could not tell the two apart.
+
+##### The methodological rule this earns
+
+**A HARNESS THAT DOES NOT REPRODUCE THE USER'S GATES IS NOT MEASURING THE USER'S
+BUILD.** `probe:gi-boot` must report which optional chains it compiled — shadow
+marcher, reflections, hit shading — beside its timings, and any attribution must
+name the gate state it was taken under. Three sessions of "which kernel is the slow
+one" have now been answered three different ways, and every wrong answer came from
+comparing across configurations that were never the same.
+
+And: **"slowest single pipeline" must stop being quoted as a cost.** It is latency
+(§13.3), it selects whatever queued last, and it is what pointed at the shadow
+marcher here. The defensible statistic is the SUM of isolated compiles
+(`DUMP_ALL` + `probe:wgsl-compile`), which is why that pair exists.
