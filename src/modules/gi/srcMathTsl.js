@@ -341,6 +341,39 @@ export function probeSpacing(cascade, lod, spacing0) {
   return float(spacing0).mul(1 << cascade).mul(float(lod).exp2());
 }
 
+/**
+ * ══ THE TRANSPORT'S THREAD → PIXEL MAP ══════════════════════════════════════
+ *
+ * SRC's per-pixel passes used to dispatch one thread per gbuffer pixel, which
+ * made the transport's cost the SCREEN's size (§12.31). The ray ceiling capped
+ * the RAYS by making most of those threads return immediately — and the
+ * returning threads turned out to cost real time: a 1.930 ms floor at 499,720
+ * px, ~6 ms at the user's 1,599,840, purely to launch threads that compute one
+ * modulo and exit (§12.32).
+ *
+ * So the dispatch shrinks instead. Thread `t` of `transportThreads` handles
+ * pixel `t·stride + phase`, with `phase ∈ [0, stride)` rotating per frame, so
+ * over `stride` frames every pixel is visited exactly once — into an
+ * accumulator built for precisely that (§12.23).
+ *
+ * `t·stride + phase` and NOT `(t·stride + phase) % pixelCount`: with
+ * `stride = floor(pixelCount / threads)` the largest index is
+ * `(threads−1)·stride + phase`, which is below `pixelCount` whenever
+ * `phase < stride` — so the wrap can only fire when there are MORE threads than
+ * pixels, and there it would make two threads share a pixel. Two threads on one
+ * pixel is not a wasted thread, it is a DOUBLE DEPOSIT: the pixel's rays get
+ * counted twice by [D1] and claimed twice by [D5]. Hence the bound below is a
+ * hard skip, never a wrap.
+ *
+ * @param {Node} thread   `instanceIndex`
+ * @param {Node} stride   uniform, ≥ 1
+ * @param {Node} phase    uniform, in `[0, stride)`
+ * @returns {Node} the gbuffer pixel index this thread owns, as u32
+ */
+export function transportPixel(thread, stride, phase) {
+  return uint(thread).mul(uint(stride)).add(uint(phase));
+}
+
 /** Lattice origin for a spacing — the anchor snapped onto that lattice. */
 export function latticeOrigin(anchor, spacing) {
   const s = float(spacing).toVar();

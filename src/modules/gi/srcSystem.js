@@ -302,7 +302,42 @@ export function createSrcProbeSystem({
   // It is also free: `readCeiling` is a global read and a divide on the CPU,
   // once per frame, and the kernels see a uniform. Nothing rebuilds (R11).
   const readCeiling = () => srcTransportRays(srcQualityTier(props));
-  const strideFor = (ceiling) => Math.max(1, Math.ceil(naturalRays / Math.max(1, ceiling)));
+  // ── THE DISPATCH SIZE IS BAKED; THE STRIDE INSIDE IT IS NOT ───────────────
+  //
+  // three bakes `.compute(n)`, so the thread count cannot be a uniform. It is
+  // therefore derived from the TIER's ceiling — a build-time constant — and NOT
+  // from the resolution or from the live hatch. Two consequences, both wanted:
+  // the transport's dispatch size is resolution-INDEPENDENT (a viewport resize
+  // stops rebuilding these three passes), and `__giSrcTransportRays` can still
+  // move the ceiling at runtime *within* that budget by changing the stride.
+  //
+  // A hatch set ABOVE the tier's ceiling therefore cannot buy more rays than
+  // the baked thread count allows — it clamps. Said out loud because a probe
+  // that raises the hatch and sees no change would otherwise read that as "the
+  // ceiling does nothing".
+  const transportThreads = Math.max(
+    1,
+    Math.ceil(SRC_QUALITY[srcQualityTier(props)].transportRays / Math.max(1, tier.raysPerPixel)),
+  );
+  // Two terms, and the `max` is what makes both directions of the hatch work.
+  //
+  //  `fill`  = floor(pixelCount / threads) — the stride that spreads the baked
+  //            thread count across the WHOLE screen. `floor`, not `ceil`: the
+  //            largest pixel touched is `(threads-1)·stride + phase`, which must
+  //            stay under `pixelCount` for every `phase < stride`.
+  //  `want`  = ceil(naturalRays / ceiling) — the stride the live ceiling asks
+  //            for. TIGHTER than the tier's: threads run off the end and skip,
+  //            which is how a runtime A/B buys fewer rays without a rebuild.
+  //
+  // Taking the max clamps a LOOSER hatch to the baked budget. Without it, a
+  // ceiling above the tier's would produce a stride too small to reach the far
+  // side of the screen and the transport would quietly sample a CROP — the top
+  // strip lit, the rest dark, which reads as a GI bug rather than as a budget.
+  const strideFor = (ceiling) => Math.max(
+    1,
+    Math.floor(pixelCount / transportThreads),
+    Math.ceil(naturalRays / Math.max(1, ceiling)),
+  );
   let rayCeiling = readCeiling();
   let rayStride = strideFor(rayCeiling);
   strideU.value = rayStride;
@@ -311,6 +346,7 @@ export function createSrcProbeSystem({
     raysPerPixel: tier.raysPerPixel,
     stride: strideU,
     phase: phaseU,
+    threads: transportThreads,
   });
 
   // ── [E] + [F]: THE SPLIT SCATTER AND THE RESOLVE (plan §12.13.5 unit 3) ──
@@ -443,6 +479,12 @@ export function createSrcProbeSystem({
         pixelRayBase: rayStore.pixelRayBase,
         pixelCount,
         raysPerPixel: tier.raysPerPixel,
+        // The SAME mapping srcRays' [D1]/[D5] use — same uniforms, same thread
+        // count. [D5] writes `pixelRayBase` only for the pixels it owns, so a
+        // deposit walking a different set reads an older frame's base.
+        stride: strideU,
+        phase: phaseU,
+        threads: transportThreads,
         lmax: lmaxU,
         // Null unless [E'] above was built. With radiance zero, what survives
         // the resolve is transmittance, and a receiver lit by transmittance

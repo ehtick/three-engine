@@ -63,6 +63,7 @@ import {
   uint,
 } from "three/tsl";
 import { CASCADE_COUNT } from "./srcConfig.js";
+import { transportPixel } from "./srcMathTsl.js";
 import {
   FLAG_ALIVE,
   PROBE_FLAGS,
@@ -131,38 +132,49 @@ function probeAlive(probeTable, probe) {
  * @param {Node} [options.phase]   which residue class this frame fires.
  */
 export function createSrcRayFrame(
-  store, rays, { pixelProbe, raysPerPixel = 1, stride = null, phase = null } = {},
+  store, rays, { pixelProbe, raysPerPixel = 1, stride = null, phase = null, threads = 0 } = {},
 ) {
   const { probeTable, probeTotal, cascades } = store;
   const { rayCount, rayCursor, rayTotal, pixelRayBase, pixelCount } = rays;
   const N = store.cascadeCount ?? CASCADE_COUNT;
   const top = cascades[N - 1];
 
-  // ══ THE RAY CEILING'S STRIDE — ONE PREDICATE, TWO CALLERS ══════════════════
+  // ══ THE RAY CEILING — A SMALLER DISPATCH, NOT A SKIPPED ONE ════════════════
   //
-  // `srcConfig.js`'s `transportRays` caps rays per frame; above the cap only
-  // every `stride`-th pixel participates, and `phase` rotates each frame so the
-  // whole screen is covered over `stride` frames into the Phase-4 accumulator.
-  // That is the same move `jitterX/Y` already makes on the R2 sequence — shift
-  // per frame, let accumulation do the covering — applied to the pixel domain.
+  // `srcConfig.js`'s `transportRays` caps rays per frame. The first version of
+  // this kept the dispatch at `pixelCount` and had non-participating threads
+  // return; measured, those returning threads cost a 1.930 ms floor at 499,720
+  // px and ~6 ms at the user's resolution (§12.32). So the DISPATCH shrinks:
+  // `threads` threads, thread `t` owning pixel `t·stride + phase`, with `phase`
+  // rotating per frame so the screen is covered over `stride` frames. Same move
+  // `jitterX/Y` makes on the R2 sequence, applied to the pixel domain.
   //
-  // ⚠ IT MUST BE ONE EXPRESSION AND THIS IS NOT A STYLE PREFERENCE. [D1] counts
-  // a probe's rays and [D5] hands each pixel a slice of exactly that count. If
-  // [D5] admitted a pixel [D1] did not count, its `atomicAdd` would return an
-  // offset PAST the probe's segment and it would write into the next probe's
-  // rays — silent cross-probe corruption, no assertion anywhere, and it would
-  // present as a few wrongly-lit probes rather than as a crash. The reverse
-  // (counted but not claimed) merely wastes slots. So both call THIS closure;
-  // neither open-codes it. Same discipline as `latticeOriginFor` living in
-  // srcMath so the two twins cannot drift.
+  // ⚠ ONE MAPPING, THREE CALLERS, AND THIS IS NOT A STYLE PREFERENCE. [D1]
+  // counts a probe's rays, [D5] hands each pixel a slice of exactly that count,
+  // and the deposit's [E] fires them. If [D5] admitted a pixel [D1] had not
+  // counted, its `atomicAdd` returns an offset PAST the probe's segment and
+  // writes into the NEXT probe's rays — no assertion anywhere, no crash, and it
+  // presents as a few wrongly-lit probes. So all three go through
+  // `transportPixel` in srcMathTsl, the same discipline that put
+  // `latticeOrigin` there so the twins could not drift.
   //
-  // Stride is a UNIFORM, so changing the ceiling is a uniform write, not a
-  // rebuild (R11) — the dispatch counts stay `pixelCount` and every pipeline
-  // survives a resize of the budget. `stride = 1` makes this identically false,
-  // which is the configuration every gate runs and why they are unaffected.
-  const strideSkips = stride && phase
-    ? (i) => i.add(phase).mod(stride).notEqual(uint(0))
+  // `threads` is baked into `.compute()` (three bakes dispatch counts), and it
+  // is derived from the TIER's ceiling rather than from the resolution — so it
+  // is resolution-INDEPENDENT, and a viewport resize no longer rebuilds these
+  // passes. `stride` and `phase` stay uniforms, so moving the ceiling inside
+  // that budget is still a uniform write and not a rebuild (R11).
+  const strided = stride && phase && threads > 0;
+  const pixelOf = strided
+    ? (t) => transportPixel(t, stride, phase).toVar()
+    : (t) => t;
+  // With `threads > pixelCount` (a small viewport under a generous ceiling)
+  // `t·stride + phase` runs past the end. Skip, never wrap — see
+  // `transportPixel`'s header for why a wrap is a double deposit rather than a
+  // wasted thread.
+  const outOfRange = strided
+    ? (p) => p.greaterThanEqual(uint(pixelCount))
     : null;
+  const dispatchCount = strided ? threads : pixelCount;
 
   const passes = [];
 
@@ -191,12 +203,12 @@ export function createSrcRayFrame(
   // gets forty times the rays of one covering a single pixel, which is what
   // makes the budget follow screen coverage instead of probe count.
   passes.push(Fn(() => {
-    const i = instanceIndex.toVar();
-    if (strideSkips) If(strideSkips(i), () => { Return(); });
+    const i = pixelOf(instanceIndex.toVar());
+    if (outOfRange) If(outOfRange(i), () => { Return(); });
     const probe = pixelProbe.element(i).toVar();
     If(probe.equal(uint(SLOT_EMPTY)), () => { Return(); });
     atomicAdd(rayCount.element(probe), uint(raysPerPixel));
-  })().compute(pixelCount));
+  })().compute(dispatchCount));
 
   // ── [D2] propagate counts UP, one cascade per dispatch ────────────────────
   // Strictly one level at a time. Cascade 2's total is not correct until every
@@ -265,19 +277,23 @@ export function createSrcRayFrame(
   // whose probe is SLOT_EMPTY keeps SLOT_EMPTY here, which is how the trace
   // knows not to fire.
   passes.push(Fn(() => {
-    const i = instanceIndex.toVar();
+    const i = pixelOf(instanceIndex.toVar());
+    if (outOfRange) If(outOfRange(i), () => { Return(); });
     const probe = pixelProbe.element(i).toVar();
-    // A strided-out pixel takes the SAME exit as a pixel with no probe:
-    // `pixelRayBase = SLOT_EMPTY`. That is what makes the deposit need no edit
-    // at all — its [E] already returns on that value, so "this pixel is not
-    // sampled this frame" reuses the path for "this pixel has no probe".
-    const skip = strideSkips ? probe.equal(uint(SLOT_EMPTY)).or(strideSkips(i)) : probe.equal(uint(SLOT_EMPTY));
-    If(skip, () => {
+    If(probe.equal(uint(SLOT_EMPTY)), () => {
       pixelRayBase.element(i).assign(uint(SLOT_EMPTY));
       Return();
     });
     pixelRayBase.element(i).assign(atomicAdd(rayCursor.element(probe), uint(raysPerPixel)));
-  })().compute(pixelCount));
+  })().compute(dispatchCount));
+  // ⚠ `pixelRayBase` IS NO LONGER FULLY REWRITTEN EACH FRAME. With a strided
+  // dispatch only this frame's residue class is touched, so every other entry
+  // holds a base from whichever frame last owned it. That is safe for exactly
+  // one reason: the deposit's [E] walks the SAME mapping with the SAME uniforms
+  // in the same frame, so it reads only entries this pass just wrote. It is not
+  // safe for a consumer that scans the whole buffer, and there is no such
+  // consumer today — `pixelRayBase` is read by [E] and nothing else. A future
+  // full-buffer reader needs a clear pass, not a bug report.
 
   return {
     passes,

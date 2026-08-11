@@ -319,7 +319,21 @@ function strideSkips(cfg, p) {
   const stride = cfg.rayStride ?? 1;
   if (stride <= 1) return false;
   const index = cfg.pixelIndexOf ? cfg.pixelIndexOf(p) : p;
-  return (index + (cfg.rayPhase ?? 0)) % stride !== 0;
+  const phase = cfg.rayPhase ?? 0;
+  // The kernel enumerates `t·stride + phase` for `t ∈ [0, threads)`, so a pixel
+  // participates iff it is ON that arithmetic progression AND inside its span.
+  //
+  // ⚠ THIS IS NOT `(index + phase) % stride === 0`, which is what it said while
+  // the kernel still dispatched one thread per pixel and skipped the rest. That
+  // form selects the residue class `−phase`, this one selects `+phase`, and
+  // they coincide only at `phase = 0` — so the mirror agreed with the GPU on
+  // frame 0 of every gate and disagreed on every other frame. The span bound is
+  // the second half: with a thread count baked from the tier, a large enough
+  // `stride` runs the last threads off the end of the image and those pixels
+  // are NOT sampled, however well they fit the residue.
+  if ((index - phase) % stride !== 0 || index < phase) return true;
+  const threads = cfg.rayThreads ?? Infinity;
+  return (index - phase) / stride >= threads;
 }
 
 export function assignRays(cfg, built) {

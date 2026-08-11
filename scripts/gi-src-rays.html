@@ -433,21 +433,41 @@
         // got a slice are EXACTLY the residue class.
         const STRIDE = 3;
         const PHASE = 1;
+        // Threads, not pixels: the transport dispatches a baked thread count and
+        // thread `t` owns pixel `t·STRIDE + PHASE`. Sized so the last thread
+        // lands inside the image — `floor((PIXELS - PHASE) / STRIDE)` — which is
+        // exactly what srcSystem computes from the tier's ceiling.
+        const THREADS = Math.floor((PIXELS - PHASE) / STRIDE);
         const strideU = TSL.uniform(STRIDE, "uint");
         const phaseU = TSL.uniform(PHASE, "uint");
-        const strideFrame = R.createSrcRayFrame(store, rayStore, {
+        // ⚠ A FRESH RAY STORE, AND THE FIRST VERSION OF THIS ARM DID NOT HAVE
+        // ONE. A strided [D5] writes `pixelRayBase` only for the pixels it owns,
+        // so the buffer keeps whatever the earlier full-dispatch runs left in
+        // every other slot — and the checks below scan the WHOLE buffer. Reusing
+        // `rayStore` therefore reported 3,125 pixels "fired out of class", 2,062
+        // duplicate ray indices and 4,188 out of range: all of them stale reads,
+        // none of them a kernel fault, and every message pointed confidently at
+        // the [D1]/[D5] disagreement this arm exists to catch.
+        //
+        // A new store is `fill(SLOT_EMPTY)`, so anything not SLOT_EMPTY was
+        // written by THIS frame. That is what makes a whole-buffer scan mean
+        // something, and it keeps the arm able to see a [D5] that writes outside
+        // its own set — which masking the scan to the owned pixels would not.
+        const strideRayStore = R.createSrcRayStore(store, { pixelCount: PIXELS });
+        const strideFrame = R.createSrcRayFrame(store, strideRayStore, {
           pixelProbe: frame.pixelProbe,
           raysPerPixel: RAYS_PER_PIXEL,
           stride: strideU,
           phase: phaseU,
+          threads: THREADS,
         });
         for (const pass of frame.passes) await renderer.computeAsync(pass);
         for (const pass of strideFrame.passes) await renderer.computeAsync(pass);
-        const sBase = new Uint32Array(await renderer.getArrayBufferAsync(rayStore.pixelRayBase.value));
+        const sBase = new Uint32Array(await renderer.getArrayBufferAsync(strideRayStore.pixelRayBase.value));
         const sProbe = new Uint32Array(await renderer.getArrayBufferAsync(frame.pixelProbe.value));
         const sTotal = await strideFrame.readTotal(renderer);
         const sMirror = ref.assignRays({
-          ...cfg, rayStride: STRIDE, rayPhase: PHASE,
+          ...cfg, rayStride: STRIDE, rayPhase: PHASE, rayThreads: THREADS,
           pixelIndexOf: (p) => mirrorSlotToPixel[p],
         }, built);
         check("the strided total matches the mirror's",
@@ -464,7 +484,11 @@
         let firedOutOfClass = 0;
         let silentInClass = 0;
         for (let i = 0; i < PIXELS; i++) {
-          const inClass = (i + PHASE) % STRIDE === 0;
+          // ON the progression `t·STRIDE + PHASE` and inside its span. Written
+          // as the kernel enumerates it, not as a modulo: `(i + PHASE) % STRIDE`
+          // picks the residue `−PHASE` and would agree only at PHASE = 0.
+          const t = (i - PHASE) / STRIDE;
+          const inClass = i >= PHASE && Number.isInteger(t) && t < THREADS;
           const got = sBase[i] !== P.SLOT_EMPTY;
           if (got && !inClass) firedOutOfClass++;
           if (!got && inClass && valid[i] && sProbe[i] !== P.SLOT_EMPTY) silentInClass++;

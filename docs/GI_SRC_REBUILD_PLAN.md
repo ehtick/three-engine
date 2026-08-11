@@ -5418,3 +5418,71 @@ than everything this section just fixed. It is the next thing to measure, and
 nothing about it should be guessed at from here: §13.8's four wrong claims and
 §13.10/§13.11's two wrong labels all came from reasoning about a stage instead of
 timing it.
+
+### 12.33 THE DISPATCH SHRINKS — AND A HYPOTHESIS FOR THE 5× ns/ray GAP
+
+§12.32 left the ray ceiling capping rays while the dispatch still launched one
+thread per gbuffer pixel, 15 of 16 of which computed a modulo and returned: a
+1.930 ms floor at 499,720 px, ~6 ms at the user's 1,599,840. Now [D1], [D5] and
+the deposit's [E] dispatch **transport threads**, and thread `t` owns pixel
+`t·stride + phase` (`transportPixel`, srcMathTsl — one definition, three
+callers, because a mismatch between [D5]'s write set and [E]'s read set is a
+silent cross-probe corruption rather than a crash).
+
+The thread count is **baked from the TIER's ceiling**, not from the resolution:
+three bakes `.compute(n)`, so it cannot be a uniform, and deriving it from the
+tier makes the transport's dispatch size **resolution-independent** — a viewport
+resize no longer rebuilds these three passes. The stride stays a uniform, so the
+live `__giSrcTransportRays` A/B still works *inside* that budget; a hatch set
+above the tier's ceiling clamps, which is stated in the code because a probe
+that raises it and sees nothing change would otherwise conclude the ceiling is
+inert.
+
+`stride = max(1, floor(pixelCount/threads), ceil(naturalRays/ceiling))`. The
+middle term is what spreads a baked thread count across the whole screen; drop
+it and a *looser* ceiling produces a stride too small to reach the far side of
+the image, so the transport samples a CROP — top strip lit, rest dark, which
+reads as a GI bug rather than as a budget.
+
+#### 12.33.1 The gate found the bug, and it was the gate's
+
+ARM 7 failed on the first run: 3,125 pixels "fired out of class", 2,062
+duplicate ray indices, 4,188 out of range — every message pointing confidently
+at the [D1]/[D5] disagreement the arm exists to catch. All of it stale reads.
+
+A strided [D5] writes `pixelRayBase` only for the pixels it owns, so every other
+slot keeps whatever the earlier full-dispatch runs left there, and the arm scans
+the WHOLE buffer. The production code is fine — [E] walks the same mapping with
+the same uniforms in the same frame, so it reads only what [D5] just wrote — and
+the comment saying "not safe for a consumer that scans the whole buffer" was
+already in `srcRays.js` when its first such consumer failed. The arm now takes a
+fresh `createSrcRayStore` (`fill(SLOT_EMPTY)`), which keeps the whole-buffer scan
+meaningful rather than masking it to the owned pixels; masking would have made
+the arm blind to a [D5] writing outside its own set, which is the one thing it
+is for.
+
+**And the mirror was wrong in a way only a non-zero phase could show.**
+`srcRef`'s predicate was `(index + phase) % stride === 0` — the residue class
+`−phase` — while the kernel enumerates `+phase`. They coincide **exactly at
+phase 0**, so the mirror agreed on frame 0 of every gate and disagreed on every
+other frame. Now written as the kernel enumerates it, plus the span bound
+(`t < threads`), and the totals match exactly (3124 = 3124) across three runs.
+
+#### 12.33.2 The unexplained 5×, and a testable guess
+
+The same kernel measures **~13 ns/ray in the harness and 61–85 ns/ray in the
+user's editor**, both at ultra, both on the same machine. §12.31 recorded this as
+unexplained. A candidate that has not been tested and should be, because it is
+cheap and it would be a product fact rather than a bug:
+
+**Ray LENGTH is a function of camera distance.** `reach = intervalBoundary(N−1,
+lod, s₀)` and `lod = floor(lodAtDistance(chebyshev(P, camera), …))`, so a probe
+further from the camera sits at a higher LOD and its rays are ~2^lod longer. The
+harness pins the verified nave pose; the user's editor camera is wherever they
+left it. A view from outside the model would raise every LOD at once and
+multiply per-ray traversal cost across the whole frame.
+
+If that is it, GI's cost depends on how far back the camera sits, which is worth
+knowing independently of this rebuild — and it is one `viewport.getCamera` away.
+Do not attribute the gap to cache pressure or clocks (the two guesses so far)
+until this one has been ruled out.

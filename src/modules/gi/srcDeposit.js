@@ -127,6 +127,7 @@ import {
   intervalBoundary,
   lodAtDistance,
   rayDirection,
+  transportPixel,
 } from "./srcMathTsl.js";
 import {
   PROBE_BLOCK,
@@ -375,12 +376,23 @@ export function createSrcDepositFrame(store, bins, {
   keep = null,
   frameStamp = null,
   maxLods = MAX_LODS,
+  stride = null,
+  phase = null,
+  threads = 0,
 } = {}) {
   const { probeTable, freeStack } = store;
   const { scratch, payload, stats, binTotal, w0 } = bins;
   const N = store.cascadeCount ?? CASCADE_COUNT;
   const stampBase = store.blockStampBase;
   const passes = [];
+
+  // The transport's thread → pixel map, identical to srcRays' by construction:
+  // same helper, same uniforms, and `threads` comes from the same caller. The
+  // fallback is the old pixel-sized dispatch, which is what every gate runs.
+  const strided = stride && phase && threads > 0;
+  const pixelOf = strided ? (t) => transportPixel(t, stride, phase).toVar() : (t) => t;
+  const outOfRange = strided ? (p) => p.greaterThanEqual(uint(pixelCount)) : null;
+  const dispatchCount = strided ? threads : pixelCount;
 
   // ── decay ─────────────────────────────────────────────────────────────────
   // Every allocated bin, every frame, exactly where the clear pass used to be —
@@ -438,8 +450,21 @@ export function createSrcDepositFrame(store, bins, {
   })().compute(binTotal));
 
   // ── [E] trace and scatter ─────────────────────────────────────────────────
+  //
+  // Dispatched over TRANSPORT THREADS, not pixels — see `transportPixel` in
+  // srcMathTsl. This pass is 22.3 ms of a 34 ms SRC chain on the user's editor
+  // and roughly 6 ms of that was launching threads that immediately returned,
+  // which is what a pixel-sized dispatch under a ray ceiling costs (§12.32).
+  //
+  // ⚠ THE MAPPING MUST MATCH srcRays' [D1]/[D5] EXACTLY — same helper, same
+  // `stride`/`phase` uniforms, same frame. [D5] writes `pixelRayBase` only for
+  // the pixels it owns, so a mismatch here reads an entry from an OLDER frame:
+  // a stale-but-plausible base pointing into a segment this frame allocated to
+  // a different probe. No crash, no assertion — a handful of probes lit with
+  // another probe's rays.
   passes.push(Fn(() => {
-    const i = instanceIndex.toVar();
+    const i = pixelOf(instanceIndex.toVar());
+    if (outOfRange) If(outOfRange(i), () => { Return(); });
     const base = pixelRayBase.element(i).toVar();
     If(base.equal(uint(SLOT_EMPTY)), () => { Return(); });
     const probe0 = pixelProbe.element(i).toVar();
@@ -576,7 +601,7 @@ export function createSrcDepositFrame(store, bins, {
         });
       }
     }
-  })().compute(pixelCount));
+  })().compute(dispatchCount));
 
   // ── [F] resolve ───────────────────────────────────────────────────────────
   // ZERO-COUNT BINS ARE UNKNOWN, NOT ZERO — `srcMath.js`'s `resolveBin` returns
