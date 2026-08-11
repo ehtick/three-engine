@@ -5611,3 +5611,136 @@ look at a 7.55 ms gather will have exactly this idea, and the useful thing to
 inherit is not "don't" — it is the measured size (5.6 ms), the specific artifact,
 the control image that proves it is not a bug in the mapping, and the name of
 the filter that fixes it.
+
+### 13.13 THE MOST EXPENSIVE OBJECT IN THE BOOT IS A KERNEL THAT NEVER RUNS
+
+`probe:gi-boot`, cold, user's Sponza, SRC off — their editor's exact
+configuration:
+
+```
+TIME TO FIRST CORRECT FRAME       141,107 ms
+slowest SINGLE pipeline           132,803 ms   94.1% of TTFF
+  77 kB WGSL, 4 loops, 204 ifs
+  fns: giDynBvh8, dynNz8, giDynShapeHit_1, giFreeRadius4nsr1_3,
+       giStaticBvh8, statNz8, giDynTrace00100_0, tsl_mod_float
+GI CPU work                         2,719 ms    1.9%
+```
+
+Those function names are the **GI-traced light shadow marcher**
+(`static-bvh8 + exact-dynamics + analytic-width`). And `profile.giPasses`,
+against the same live editor, says of that exact pass:
+
+> `lightShadowPass: "1.7206 (NOT dispatched — no light uses Shadow Source \"gi\")"`
+
+**Ninety-four percent of GI startup is compiling a kernel the scene never
+dispatches.** Their editor logs the same shape independently: `1 compute
+pipelines compiled concurrently in 62046ms`.
+
+The frame loop has skipped these six passes since 2026-08-07 when no light asks
+for GI shadows (`anyGiShadow`) — worth ~0.4 ms a frame, and the comment says so.
+Nothing ever skipped *compiling* them, and nobody looked, because every startup
+measurement this plan has taken reported a total.
+
+**Why code-reading could not have found it.** §13.4's rule holds: a **154 kB**
+kernel compiles in **4.5 s** in the same run while this **77 kB** one takes
+**132 s** — 29× slower at half the size. The fingerprint that separates them is
+**4 loops against 0**. That is the BVH descent, and a shader compiler unrolling
+four nested loops over 204 branches is where two minutes go. No amount of
+staring at WGSL byte counts gets there; the per-pipeline timer plus the
+loops/ifs readout does it in one run.
+
+**The fix is a RAMP, not a removal (R1).** The passes are still built. They are
+only left out of the prewarm when `anyGiShadow` is false. Flag a light with
+Shadow Source "gi" and the pipeline is created on first dispatch — async, frames
+keep flowing, the dispatch is skipped until it lands, which is the path every GI
+pipeline already takes. The cost moves from *every boot of every scene* to *the
+first frames after you ask for it*.
+
+⚠ Filtered out of BOTH prewarm loops. The second one re-dispatches "for real"
+after the drain, and leaving it unfiltered would trigger the very creation the
+first loop skipped — a fix that measures as no change and reads as a mystery.
+
+**This also re-ranks §13 one final time.** The levers, as measured rather than
+assumed:
+
+| claim | status |
+|---|---|
+| "83% is pipeline creation" | true of the *span*, useless as a lever |
+| "PIPELINE COUNT is lever 1" | refuted (§13.10) — the cache engaged 44× and TTFF did not move |
+| "make the cache engage" (55 s → 8 s) | refuted (§13.10) — it engaged, completely |
+| "98% is TSL node-graph build" | refuted (§13.11) — 6 ms |
+| the prewarm's yield cadence | REAL, 24.8 s → 8.4 s (§13.12) |
+| **compiling undispatched passes** | **REAL, 94% of a cold boot** |
+
+Six explanations, two of them real, and the two real ones were both found by
+timing a thing directly after an aggregate had already been read three ways.
+
+#### 13.13.1 CORRECTION: two kernels share that fingerprint, and only one was skipped
+
+§13.13 above names the 132,803 ms kernel as the GI-traced light shadow marcher.
+**That attribution is not established, and the evidence now says at least one
+more kernel wears the same fingerprint.**
+
+The skip works — proven, not assumed:
+
+```
+[gi] skipping 4 light-shadow pipelines at warm-up — no light uses Shadow Source "gi"
+[gi] compute kernels: 45 totaling 516kB WGSL (1 screen chain of 5 + 44 SRC; …)
+[gi] compile wave: materials 52016ms, computes 30ms
+```
+
+One of five screen kernels warmed, and the compute leg of the wave is **30 ms**.
+But:
+
+```
+[gi] SLOWEST PIPELINE: #48 took 51.1s (?kB WGSL) of 292.1s over 61 pipelines
+```
+
+**#48 is past the 45 warmed kernels** — that is what the `?kB` means, there is no
+`kernelSizes[48]` — so this pipeline is created OUTSIDE the prewarm, and the
+boot probe's post-skip run shows it with the identical 77 kB / 4 loops / 204 ifs
+/ `giStaticBvh8`+`giDynBvh8`+`giFreeRadius…` signature at 50,137 ms.
+
+Both the shadow marcher and the **BVH exact-reflection prepass** descend the
+same BVH through the same shared functions, so the fingerprint cannot tell them
+apart. What separates them is dispatch: the reflection prepass runs EVERY frame
+that `exactReflections` is on (a tier property, true at ultra), so it cannot be
+skipped — only warmed honestly. It is now in the prewarm, same reasoning as
+SRC's 44 in §13.9.
+
+**So the boot-probe drop from 141,107 ms to 57,053 ms is NOT yet attributable to
+the skip.** This probe has reported 49 s, 141 s and 57 s for nominally the same
+cold configuration; a single before/after pair across runs that vary 3× is not a
+measurement, and treating it as one would be the §12.31.1 mistake again. What IS
+established: the skip fires, four kernels leave the wave, and `computes` reads
+30 ms. What is NOT established: how much of TTFF that bought, and which of the
+two BVH kernels owned the original 132 s.
+
+The next honest step is a within-run A/B — the same page, the ceiling-sweep
+pattern — not another cold boot compared against a remembered number.
+
+#### 13.13.2 The BVH reflect pass was also unwarmed — and it is still not #48
+
+Adding `screen.bvhReflect` to the prewarm (same reasoning as SRC's 44):
+
+```
+[gi] compute kernels: 46 … (2 screen chain of 5 + 44 SRC; sizes 72/16/2/2/5/…kB)
+[gi] SLOWEST PIPELINE: #48 took 47.5s (?kB) of 262.3s over 61 pipelines
+```
+
+The reflect pass is the 16 kB entry and is now warmed. **#48 is still outside the
+prewarm** — 61 compute pipelines exist in the process and only 46 are warmed, so
+roughly fifteen GI compute passes are created somewhere other than `state.queue`,
+`srcProbes.passes` or `bvhReflect`. Candidates not yet enumerated: the occupancy
+pyramid build, the composite, the dynamic-object passes, the BVH atlas blit.
+
+**Stopping the chase here, deliberately.** Warming a pipeline does not make it
+compile faster — §13.9 said so when SRC's 44 went in and it is still true. It
+moves the cost inside the wave and makes the log honest, which is worth doing,
+but the 47–132 s belongs to a COMPILER PATHOLOGY (77 kB, **4 loops**, 204 ifs,
+against a 154 kB / 0-loop kernel at 2.2 s) and the fix for that is to restructure
+the loops or to not build the kernel, not to warm it earlier.
+
+So the open item is precise: **one BVH-descent kernel costs 47–132 s to compile,
+it is created outside every prewarm list, and its identity is one enumeration
+away.** Everything else about GI startup is now either fixed or measured.

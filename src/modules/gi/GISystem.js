@@ -1986,7 +1986,80 @@ export class GISystem {
         // `bootAmbient` exists to bridge, and that the log reports honestly.
         // Cutting the 44 is §13.9's other half and is a separate measurement.
         const srcPasses = state.screen?.srcProbes?.passes ?? [];
-        const warmNodes = [...computeNodes, ...srcPasses];
+        // ══ DO NOT COMPILE THE SHADOW CHAIN NOBODY DISPATCHES ═════════════
+        //
+        // The frame loop already skips these six passes when no light is set to
+        // Shadow Source "gi" (`anyGiShadow`, ~1,660 lines down) — it has done
+        // for a while, and it saves ~0.4 ms a frame. What nothing skipped was
+        // COMPILING them, and that turns out to be the whole of startup.
+        //
+        // Measured, user's Sponza, `probe:gi-boot` cold, SRC off:
+        //
+        //   TIME TO FIRST CORRECT FRAME   141,107 ms
+        //   slowest SINGLE pipeline       132,803 ms   94.1% of TTFF
+        //     77 kB WGSL, 4 loops, 204 ifs
+        //     fns: giStaticBvh8, giDynBvh8, giDynShapeHit, giFreeRadius…
+        //
+        // Those function names are the GI-traced light shadow marcher, and
+        // `profile.giPasses` on the same editor says of it, in as many words:
+        // `lightShadowPass: NOT dispatched — no light uses Shadow Source "gi"`.
+        // **The most expensive object in the entire boot is a kernel that never
+        // runs.** Their editor logs the same shape at 62,046 ms for one pipeline.
+        //
+        // §13.4's rule holds and is worth restating, because it is why nobody
+        // found this by looking at code: a 154 kB kernel compiles in 4.5 s here
+        // while this 77 kB one takes 132 s. Size does not predict it. The
+        // difference in the fingerprint is LOOPS — 4 against 0 — which is the
+        // BVH descent, and a shader compiler unrolling four nested loops over
+        // 204 branches is where the two minutes go.
+        //
+        // ⚠ THIS IS A RAMP, NOT A REMOVAL (R1). The passes still exist and are
+        // still built; they are only left out of the PREWARM. Flag a light with
+        // Shadow Source "gi" and the pipeline is created on first dispatch —
+        // async, frames keep flowing, and the dispatch is skipped until it
+        // lands, which is the same graceful path every GI pipeline already
+        // takes. The cost moves from "every boot of every scene" to "the first
+        // frames after you ask for it".
+        const anyGiShadow = (state.lightSlots ?? []).some((s) => (s?.giShadow?.value ?? 0) > 0);
+        const coldShadow = new Set();
+        if (!anyGiShadow) {
+          for (const name of [
+            "lightShadowPass", "lightShadowFilterPass", "lightShadowWidePass",
+            "lightShadowWidePass2", "lightShadowHistoryPass", "lightShadowPostPass",
+          ]) {
+            const node = state.screen?.[name]?.compute;
+            if (node) coldShadow.add(node);
+          }
+        }
+        // Filtered out of BOTH loops. The re-dispatch below would otherwise
+        // trigger the very creation this skipped, which is the kind of fix that
+        // measures as no change and reads as a mystery.
+        const queueWarm = computeNodes.filter((n) => !coldShadow.has(n));
+        // ── AND THE BVH REFLECTION PREPASS, WHICH IS ALSO OUTSIDE THE QUEUE ──
+        //
+        // Same shape as SRC's 44 (§13.9): dispatched from the frame callback
+        // rather than from `state.queue`, so it was never prewarmed, never
+        // awaited, and invisible to the kernel count. With the shadow chain no
+        // longer compiled, the per-pipeline timer named what was left —
+        // `SLOWEST PIPELINE: #48 took 51.1s`, an index PAST the 45 warmed
+        // kernels, which is how a pipeline says "nobody warmed me".
+        //
+        // It is `giStaticBvh8`/`giDynBvh8`/`giFreeRadius…` — the same function
+        // set as the shadow marcher, because both descend the same BVH — and
+        // unlike the shadow chain this one IS dispatched every frame that
+        // exact reflections are on. So it cannot be skipped, only warmed
+        // honestly: inside the wave, where `bootAmbient` covers it and the log
+        // counts it, instead of stalling the first frames after the wave says
+        // it is finished.
+        const reflectNode = this.#bvhReflectionsEnabled() ? state.screen?.bvhReflect?.compute : null;
+        if (reflectNode) queueWarm.push(reflectNode);
+        const warmNodes = [...queueWarm, ...srcPasses];
+        if (coldShadow.size) {
+          console.log(
+            `[gi] skipping ${coldShadow.size} light-shadow pipelines at warm-up — no light uses ` +
+              'Shadow Source "gi", so they are never dispatched. They compile on first use.',
+          );
+        }
         const kernelSizes = [];
         // ── HOW MUCH OF THE WAVE IS JS, NOT THE DRIVER? ───────────────────
         //
@@ -2099,7 +2172,7 @@ export class GISystem {
         // of adding SRC above was to compile its pipelines, not to run it early
         // — the real dispatch is the frame callback, one tick later, in order.
         if (this.state === state) {
-          for (const node of computeNodes) giCompute(renderer, node);
+          for (const node of queueWarm) giCompute(renderer, node);
         }
         // ── NAME THE SLOW KERNEL ─────────────────────────────────────────
         //
@@ -2123,7 +2196,8 @@ export class GISystem {
         if (kernelSizes.length) {
           console.log(
             `[gi] compute kernels: ${kernelSizes.length} totaling ${kernelSizes.reduce((s, n) => s + n, 0)}kB WGSL ` +
-              `(${computeNodes.length} screen chain + ${srcPasses.length} SRC; ` +
+              `(${queueWarm.length} screen chain${coldShadow.size ? ` of ${computeNodes.length}` : ""} ` +
+              `+ ${srcPasses.length} SRC; ` +
               // The sizes list is capped: 49 numbers is not a log line anyone
               // reads, and the tail was always the uninformative half.
               `sizes ${kernelSizes.slice(0, 8).join("/")}${kernelSizes.length > 8 ? "/…" : ""}kB — ` +
