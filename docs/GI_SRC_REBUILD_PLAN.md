@@ -6291,3 +6291,41 @@ identical code).
 A quiet-machine cold boot after this fix is the number the user's F5 will
 report; the harness cannot produce it while their editor is open, and saying so
 beats inventing one.
+
+## 13.15 The material wave, measured — 27 same-bucket materials mint 26 distinct shaders
+
+With the boot's compute side solved (§13.14.9), the wave is the top term:
+3.6-4.8 s on the user's quiet machine, 9-96 s under contention. The probe now
+groups render pipelines by fragment-source signature (`moduleOf` was reading the
+VERTEX module — every material looked like 2 kB boilerplate and hid this):
+
+```
+36 render pipelines over 26 distinct fragment shaders (10 reuse an already-seen one)
+sizes 24-27 kB   driver compile 0-191 ms each
+material GI buckets: 0 mirror, 0 specular, 27 diffuse-only, 0 dynamic-roughness
+```
+
+Three facts fall out:
+
+1. **The "180-250 kB fragment" era is over** — SRC-mode injection emits 24-27 kB.
+   The wave's cost is not shader size and not the driver (0-191 ms/pipeline).
+2. **The cost is 26 × main-thread JS** — node-graph build + WGSL codegen per
+   material, 300-1000 ms each in the user's own `wave breakdown` line. That is
+   what `compileAsync`-per-object measures once the pipeline promises are
+   intercepted (the driver wait is hoisted out).
+3. **27 materials in ONE bucket should compile to a HANDFUL of programs, not 26.**
+   Factors ride uniforms and textures are bindings; only structure (has-map,
+   alphaTest, vertex colors) should fork the text. Something per-material leaks
+   into the WGSL. **Next step is mechanical: dump two same-size fragments and
+   diff them.** If it is an inlined per-material literal, the fix is small and
+   the wave collapses to ~a few codegens; the übermaterial is then a runtime
+   draw-call feature, not a boot necessity.
+
+The material-merge ladder, for when the diff answers (user request, Tiny
+Glade-style): **T1** content-hash dedupe of identical imported material
+instances (safe, automatic, also cuts per-frame binds); **T2** byte-identical
+WGSL per structural family (the diff decides how); **T3** one übermaterial per
+bucket — textures in `texture_2d_array`s (arrays, NOT atlases: layers keep
+native UV repeat, which Sponza's tiling needs), per-instance material index,
+factors in a storage buffer. T3 composes with the batcher and is a draw-call
+win independent of boot time.

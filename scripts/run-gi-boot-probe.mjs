@@ -78,6 +78,11 @@ function pageHook() {
         fns: (code.match(/fn\s+([A-Za-z0-9_]+)/g) ?? []).slice(0, 8).join(","),
         loops: code.split("loop {").length - 1,
         branches: code.split("if (").length - 1,
+        // Content signature, for the material-merge question: how many of the
+        // scene's N materials produce byte-distinct shaders? A cheap rolling
+        // hash suffices — this distinguishes sources, it does not fingerprint
+        // them for security.
+        sig: (() => { let h = 0; for (let i = 0; i < code.length; i += 127) h = ((h * 33) ^ code.charCodeAt(i)) >>> 0; return `${code.length}:${h.toString(36)}`; })(),
         // The SOURCE, kept so the slow kernel can be lifted out of the editor
         // and compiled on its own. A cold boot costs 2-5 minutes and the same
         // kernel has measured 47s, 109s, 132s, 182s and 238s depending on what
@@ -89,7 +94,12 @@ function pageHook() {
     return mod;
   };
 
-  const moduleOf = (kind, desc) => (kind === "ComputePipeline" ? desc?.compute?.module : desc?.vertex?.module);
+  // Render pipelines: the FRAGMENT module, where a GI-injected material's bulk
+  // lives (~200kB historically) — the vertex stage is boilerplate. Grabbing the
+  // vertex module made every material look like a 2kB shader and hid the whole
+  // material-wave question.
+  const moduleOf = (kind, desc) =>
+    kind === "ComputePipeline" ? desc?.compute?.module : (desc?.fragment?.module ?? desc?.vertex?.module);
   for (const kind of ["ComputePipeline", "RenderPipeline"]) {
     for (const suffix of ["", "Async"]) {
       const name = `create${kind}${suffix}`;
@@ -104,6 +114,7 @@ function pageHook() {
           // A pipeline label is often empty; the shader module's is not.
           label: desc?.label || info?.label || "(unlabelled)",
           bytes: info?.bytes ?? 0,
+          sig: info?.sig ?? "",
           head: info?.head ?? "",
           fns: info?.fns ?? "",
           loops: info?.loops ?? 0,
@@ -347,6 +358,32 @@ function report(r) {
   const compute = r.pipelines.filter((p) => p.kind === "compute");
   const render = r.pipelines.filter((p) => p.kind === "render");
   const sum = (a) => a.reduce((s, p) => s + p.ms, 0);
+
+  // ── THE MATERIAL-MERGE QUESTION (§13.15) ──────────────────────────────────
+  //
+  // The material wave costs seconds of per-material JS (node build + WGSL
+  // codegen). Whether merging materials pays hinges on THIS: how many
+  // byte-distinct fragment shaders do the scene's materials actually produce?
+  // N materials → K unique shaders means (N−K) codegen runs and (N−K)
+  // pipeline compiles are pure duplication a shared material would delete.
+  {
+    const bySig = new Map();
+    for (const p of render) {
+      if (!p.sig) continue;
+      const e = bySig.get(p.sig) ?? { count: 0, bytes: p.bytes, ms: 0 };
+      e.count++; e.ms += p.ms;
+      bySig.set(p.sig, e);
+    }
+    const groups = [...bySig.values()].sort((a, b) => b.bytes - a.bytes);
+    const dupes = groups.reduce((s, g) => s + (g.count - 1), 0);
+    console.log(`\n  ── RENDER SHADERS (the material-merge question) ──`);
+    console.log(`    ${render.length} render pipelines over ${groups.length} distinct fragment shaders ` +
+      `(${dupes} pipeline${dupes === 1 ? "" : "s"} reuse an already-seen shader)`);
+    for (const g of groups.slice(0, 6)) {
+      console.log(`    ${String(Math.round(g.bytes / 1024)).padStart(6)}kB  ×${g.count}  ${ms(g.ms).padStart(9)} summed`);
+    }
+    if (groups.length > 6) console.log(`    … ${groups.length - 6} more`);
+  }
   console.log(`\n${"═".repeat(78)}\n  ARM: ${r.arm.toUpperCase()}${r.timedOut ? "  ⚠ TIMED OUT before the compile wave finished" : ""}\n${"═".repeat(78)}`);
 
   // Printed FIRST, above every timing, because it decides whether the timings
