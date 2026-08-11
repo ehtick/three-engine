@@ -311,6 +311,77 @@ async function runArm(arm) {
     }
     console.log(`\n  dumped ${written} compute kernels → ${dir}`);
   }
+  // ── DUMP_RENDER: ONE FILE PER DISTINCT FRAGMENT SHADER ────────────────────
+  //
+  // The material-merge question (§13.15): 27 same-bucket materials minted 26
+  // distinct fragment programs, and the wave cost is 26× main-thread codegen.
+  // Materials differing only in texture bindings and uniform factors should
+  // emit byte-identical WGSL, so something per-material leaks into the TEXT.
+  // Dumping one file per `sig` lets a plain diff of two same-size fragments
+  // name the leak — which decides between a small engine fix (~5 programs)
+  // and the full übermaterial merge.
+  if (process.env.DUMP_RENDER) {
+    const dir = path.resolve(process.env.DUMP_RENDER);
+    fs.mkdirSync(dir, { recursive: true });
+    const bySig = new Map();
+    for (const p of pipelines) {
+      if (p.kind !== "render" || p.id == null || !p.sig) continue;
+      const g = bySig.get(p.sig) ?? { first: p, count: 0 };
+      g.count++;
+      bySig.set(p.sig, g);
+    }
+    let written = 0;
+    for (const [sig, g] of [...bySig.entries()].sort((a, b) => b[1].first.bytes - a[1].first.bytes)) {
+      const code = await page.evaluate((id) => globalThis.__giBootProbe?.sources?.get(id) ?? "", g.first.id);
+      if (!code) continue;
+      const nm = `m${String(written).padStart(2, "0")}-${Math.round(g.first.bytes / 1024)}kB-x${g.count}-${sig.split(":")[1]}.wgsl`;
+      fs.writeFileSync(path.join(dir, nm), code, "utf8");
+      written++;
+    }
+    console.log(`\n  dumped ${written} distinct render fragments → ${dir}`);
+  }
+  // SHOT=<path>: one PNG of the whole page after the wave — an eyeball check
+  // that a codegen-path change (e.g. §13.15's stock-PBR expression) still
+  // renders the scene, textures and normal maps present. Not an A/B statistic:
+  // the camera is wherever the editor left it.
+  if (process.env.SHOT) {
+    // CAM=auto pins the editor camera inside the biggest entity's bounds
+    // before shooting — the saved scene camera is arbitrary, and a shot of
+    // the void says nothing about materials.
+    if (process.env.CAM === "auto") {
+      const placed = await page.evaluate(async () => {
+        const api = globalThis.__editorApi;
+        if (!api) return "no api";
+        const entities = await api.call("entity.list", {});
+        let best = null;
+        for (const e of entities ?? []) {
+          try {
+            const b = await api.call("entity.getBounds", { id: e.id });
+            if (b?.radius && (!best || b.radius > best.radius)) best = b;
+          } catch { /* boundless entity (light, camera) */ }
+        }
+        if (!best) return "no bounds";
+        const [cx, cy, cz] = best.center;
+        // Inside the volume, slightly off-center and above, looking across —
+        // for an architectural scene this lands in the walkable space.
+        await api.call("viewport.setCamera", {
+          position: [cx + best.radius * 0.25, cy + best.radius * 0.12, cz],
+          target: [cx - best.radius * 0.4, cy, cz],
+        });
+        return `at ${best.center.map((v) => v.toFixed(1)).join(",")} r=${best.radius.toFixed(1)}`;
+      });
+      console.log(`  camera: ${placed}`);
+    }
+    // GI (legacy AND SRC) replaces the diffuse term, so right after the wave
+    // the viewport is legitimately black until the compute chain lands — under
+    // driver contention that is tens of seconds. SHOT_DELAY waits it out so
+    // the image shows lit materials, not the mid-boot state.
+    const delay = Number(process.env.SHOT_DELAY ?? 0) * 1000;
+    if (delay > 0) await wait(delay);
+    const out = path.resolve(process.env.SHOT);
+    await page.screenshot({ path: out });
+    console.log(`  screenshot → ${out}`);
+  }
   await browser.close();
 
   const stages = {};

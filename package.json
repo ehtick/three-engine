@@ -57,6 +57,7 @@
     "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml --lib",
     "smoke:authoring": "node scripts/run-authoring-smoke.mjs",
     "test:saves": "node scripts/run-save-system-test.mjs",
+    "test:stockpbr": "node scripts/run-stock-pbr-test.mjs",
     "smoke:saves": "node scripts/run-player-save-smoke.mjs",
     "smoke:gameview": "node scripts/run-game-view-smoke.mjs",
     "test:timeline": "node scripts/run-timeline-test.mjs",

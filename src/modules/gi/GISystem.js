@@ -6221,7 +6221,20 @@ export class GISystem {
    */
   #markObservedMaterial(material) {
     if (!material || material.giMonitorNode?.isNode) return;
-    material.giMonitorNode = float(0);
+    // ONE SHARED marker instance for every material (§13.15.2). The observer
+    // only needs SOME own property with `.isNode`; but `customProgramCacheKey`
+    // walks own node properties and hashes each node's IDENTITY
+    // (Node.customCacheKey() → this.id), so a fresh `float(0)` per material
+    // put a unique id into every key and silently defeated the sharing this
+    // very override promises below — the entire material compile wave stayed
+    // one codegen per material (26× for Sponza) even after the stock-PBR
+    // expression removed the per-material graph nodes. A shared instance
+    // contributes the SAME id to every key, so same-bucket materials collide
+    // and share one build, which is the documented intent.
+    // A/B hatch (R12): __noSharedGiMarker restores the per-material marker.
+    material.giMonitorNode = globalThis.__noSharedGiMarker
+      ? float(0)
+      : (GISystem._giMonitorMarker ??= float(0));
     // CACHE-KEY OVERRIDE: three's material cache key reduces numeric
     // properties to on/off, so same-structure materials with different
     // static roughness hash IDENTICALLY — and since the GI light node

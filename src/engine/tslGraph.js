@@ -554,6 +554,135 @@ export function setUniformValue(uniformNode, value) {
   else if (cur?.set && Array.isArray(value)) cur.set(...value);
 }
 
+/** Shared graph-texture loader, exported so the stock-PBR path in
+ *  materialAsset loads the SAME cached instance (same SRGB default, same .meta
+ *  override, same Basis handling) a graph compile would — pixel parity between
+ *  the two paths is what makes the stock expression an invisible swap. */
+export const loadShaderTexture = loadTexture;
+
+/**
+ * Recognizes the canonical imported-PBR graph — the shape every GLB import
+ * produces — and returns its stock-material expression, or null.
+ *
+ * WHY (§13.15): compileShaderGraph mints fresh uniform/texture nodes per
+ * material, and three r185 keys programs on node IDENTITY
+ * (`Node.customCacheKey() → this.id`), so 26 structurally identical imported
+ * materials compile 26 programs: the whole material wave is N× main-thread
+ * codegen for ONE program's worth of structure (WGSL proven identical modulo
+ * node-id naming and emission order). Materials expressed through PLAIN
+ * properties instead share three's stock program cache key (type + property
+ * walk — no node ids), so every material this matcher accepts costs zero
+ * extra codegens after the first of its feature set.
+ *
+ * Deliberately conservative: exactly one Principled BSDF into Output.surface,
+ * textures only as `texture.out → color` and `texture.out → normalMap → normal`
+ * with default UVs, everything else constant. Any other wire, swizzle, prop on
+ * a wire-only channel, non-opaque opacity, constant AO ≠ 1, or non-black
+ * emissive keeps the graph on the compile path unchanged. (Texture-fed
+ * emissive must NEVER be stock-expressed: GI's resolveMaterialSurface guards
+ * area-light wash via `emissiveNode`'s texture, and `material.emissiveMap`
+ * would bypass that guard.)
+ */
+export function matchStockPbr(graph) {
+  // A/B hatch (R12): boot with __noStockPbr = true to force every graph onto
+  // the compile path — one flag isolates this optimization in any comparison.
+  if (globalThis.__noStockPbr) return null;
+  const nodes = graph?.nodes ?? [];
+  const edges = graph?.edges ?? [];
+  if (!nodes.length) return null;
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const counts = { texture: 0, normalMap: 0, principledBsdf: 0, output: 0 };
+  for (const n of nodes) {
+    if (!(n.type in counts)) return null;
+    counts[n.type]++;
+  }
+  if (counts.principledBsdf !== 1 || counts.output !== 1 || counts.normalMap > 1) return null;
+  const bsdf = nodes.find((n) => n.type === "principledBsdf");
+  const output = nodes.find((n) => n.type === "output");
+  const nm = nodes.find((n) => n.type === "normalMap") ?? null;
+
+  // Classify every edge; anything unrecognized disqualifies the graph.
+  let surfaceWired = false;
+  let colorTex = null;
+  let normalFeed = null; // texture node feeding the normalMap node
+  let normalWired = false;
+  const texUses = new Map(); // texture node -> use count
+  for (const e of edges) {
+    const src = byId.get(e.source);
+    const dst = byId.get(e.target);
+    if (!src || !dst) return null;
+    if (src === bsdf && dst === output && e.targetHandle === "surface") {
+      if (surfaceWired) return null;
+      surfaceWired = true;
+      continue;
+    }
+    if (src.type === "texture" && e.sourceHandle === "out" && dst === bsdf && e.targetHandle === "color") {
+      if (colorTex) return null;
+      colorTex = src;
+      texUses.set(src, (texUses.get(src) ?? 0) + 1);
+      continue;
+    }
+    if (src.type === "texture" && e.sourceHandle === "out" && dst === nm && e.targetHandle === "color") {
+      if (normalFeed) return null;
+      normalFeed = src;
+      texUses.set(src, (texUses.get(src) ?? 0) + 1);
+      continue;
+    }
+    if (src === nm && dst === bsdf && e.targetHandle === "normal") {
+      if (normalWired) return null;
+      normalWired = true;
+      continue;
+    }
+    return null;
+  }
+  if (!surfaceWired) return null;
+  // A normalMap node must be a complete texture → normal chain, textures must
+  // each be consumed exactly once, and none may have a wired UV (an edge INTO
+  // a texture was already rejected above — every allowed edge targets bsdf,
+  // nm, or output).
+  if (nm && (!normalFeed || !normalWired)) return null;
+  for (const n of nodes) {
+    if (n.type !== "texture") continue;
+    if ((texUses.get(n) ?? 0) !== 1) return null;
+    if (!n.props?.path) return null;
+  }
+
+  // Constants: props ?? registry default, straight from the same specs the
+  // compiler reads, so the two paths can never drift on a default.
+  const specs = NODE_TYPES.principledBsdf.inputs;
+  const valueOf = (key) => {
+    const spec = specs.find((s) => s.key === key);
+    return bsdf.props?.[key] ?? spec?.default ?? null;
+  };
+  // Wire-only channels (default null): a stored prop value would compile to a
+  // live uniform on the graph path, which stock props cannot express.
+  for (const spec of specs) {
+    if (spec.default !== null) continue;
+    if (spec.key === "normal") continue; // handled structurally above
+    if (bsdf.props?.[spec.key] != null) return null;
+  }
+  const opacity = valueOf("opacity");
+  const ao = valueOf("ao");
+  if (opacity !== 1 || ao !== 1) return null;
+  const emissive = new THREE.Color(valueOf("emissive") ?? "#000000");
+  const emissiveStrength = valueOf("emissiveStrength") ?? 1;
+  if ((emissive.r > 0 || emissive.g > 0 || emissive.b > 0) && emissiveStrength !== 0) return null;
+
+  return {
+    // A wired color input is the texture ALONE on the graph path (no factor
+    // multiply), so the stock expression must pin the factor to white.
+    color: colorTex ? "#ffffff" : valueOf("color"),
+    roughness: valueOf("roughness"),
+    metalness: valueOf("metalness"),
+    ior: valueOf("ior"),
+    specularIntensity: valueOf("specularIntensity"),
+    specularColor: valueOf("specularColor"),
+    map: colorTex?.props?.path ?? null,
+    normalMap: normalFeed?.props?.path ?? null,
+    normalScale: nm ? (nm.props?.scale ?? 1) : 1,
+  };
+}
+
 /**
  * `uvNode` replaces the graph's default `uv()` source wherever a node falls
  * back to it (texture nodes, most notably). Terrain needs this: it blends

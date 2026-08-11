@@ -6,7 +6,7 @@ import { fract, interleavedGradientNoise, screenCoordinate, viewportDepthTexture
 import { resolveAssetUrl } from "./assetResolver.js";
 import { migrateLegacyGraph } from "./shaderGraph.js";
 
-import { compileShaderGraph, invalidateShaderTextureCache, migrateGraph } from "./tslGraph.js";
+import { compileShaderGraph, invalidateShaderTextureCache, loadShaderTexture, matchStockPbr, migrateGraph } from "./tslGraph.js";
 import { loadTextureAsset } from "./textureAsset.js";
 
 
@@ -423,6 +423,66 @@ function createMaterialFor(def) {
 
 
 
+/** Express a stock-matched imported-PBR graph (see `matchStockPbr`) through
+ *  plain material properties. No `*Node` slot is assigned, so the material
+ *  keeps three's stock program cache key and shares its compiled program with
+ *  every other stock material of the same feature set — this is what collapses
+ *  the N-material compile wave to one codegen per feature set. Textures load
+ *  through the graph path's own cached loader for pixel parity. */
+function applyStockPbr(entry, material, stock, generation) {
+
+  entry.stockPbr = true;
+
+  const setColor = (target, v) => (Array.isArray(v) ? target.setRGB(v[0], v[1], v[2]) : target.set(v));
+
+  setColor(material.color, stock.color ?? "#ffffff");
+
+  material.roughness = stock.roughness ?? 0.5;
+
+  material.metalness = stock.metalness ?? 0;
+
+  material.ior = stock.ior ?? 1.5;
+
+  material.specularIntensity = stock.specularIntensity ?? 1;
+
+  if (material.specularColor) setColor(material.specularColor, stock.specularColor ?? "#ffffff");
+
+  material.normalScale?.set(stock.normalScale, stock.normalScale);
+
+  const assign = (slot, path) => {
+
+    if (!path) {
+
+      material[slot] = null;
+
+      return;
+
+    }
+
+    loadShaderTexture(path)
+      .then((texture) => {
+        if (generation !== entry.generation) return;
+        material[slot] = texture;
+        material.needsUpdate = true;
+        // Same second notify the def-map path does: subscribers that adopted
+        // the material before the async texture landed re-read it now.
+        entry.renderable = computeRenderable(entry.def?.shaderGraph);
+        notifyMaterial(entry.path);
+      })
+      .catch((err) => console.error(`Material texture "${path}": ${err.message}`));
+
+  };
+
+  assign("map", stock.map);
+
+  assign("normalMap", stock.normalMap);
+
+  material.needsUpdate = true;
+
+}
+
+
+
 export function applyMaterialDef(entry, def) {
 
   // If the new def switches the material kind (surface ↔ volume), swap the
@@ -455,6 +515,18 @@ export function applyMaterialDef(entry, def) {
 
 
 
+  // Migrate once, up front — the stock-PBR matcher and the compiler must read
+  // the same graph shape. §13.15: an imported-PBR graph expressed as plain
+  // material properties shares three's stock program cache key, so N identical
+  // imports cost ONE codegen instead of N (the entire material compile wave).
+  const graph = def.shaderGraph
+    ? (entry.migrated ? def.shaderGraph : migrateGraph(migrateLegacyGraph(def.shaderGraph, def)))
+    : null;
+  if (graph) entry.migrated = true;
+  const stock = graph && !wantVolume ? matchStockPbr(graph) : null;
+
+
+
   if (!wantVolume) {
 
     material.color.set(def.color ?? MATERIAL_DEFAULTS.color);
@@ -463,7 +535,14 @@ export function applyMaterialDef(entry, def) {
 
     material.metalness = def.metalness ?? MATERIAL_DEFAULTS.metalness;
 
-    if (def.map) {
+    // A stock-matched graph owns every texture slot including `map`; letting
+    // the def-level map race the graph's color texture would leave whichever
+    // async load lands last.
+    if (stock) {
+
+      /* map handled by applyStockPbr below */
+
+    } else if (def.map) {
 
       loadTextureAsset(def.map, { colorSpace: THREE.SRGBColorSpace })
         .then((texture) => {
@@ -501,13 +580,30 @@ export function applyMaterialDef(entry, def) {
 
 
 
-  if (def.shaderGraph) {
+  if (stock) {
 
-    // Two-step migration: v0 color-output → BSDF (legacy), then BSDF → slot Output.
+    applyStockPbr(entry, material, stock, generation);
 
-    const graph = entry.migrated ? def.shaderGraph : migrateGraph(migrateLegacyGraph(def.shaderGraph, def));
+  } else if (entry.stockPbr) {
 
-    entry.migrated = true;
+    // Leaving the stock expression (graph edited into a real custom graph, or
+    // deleted): drop the stock-only props it managed so nothing lingers under
+    // the node slots about to be applied.
+    entry.stockPbr = false;
+
+    material.normalMap = null;
+
+    material.normalScale?.set(1, 1);
+
+    material.ior = 1.5;
+
+    material.specularIntensity = 1;
+
+    material.specularColor?.set("#ffffff");
+
+  }
+
+  if (!stock && def.shaderGraph) {
 
     compileShaderGraph(graph)
 

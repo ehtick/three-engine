@@ -6329,3 +6329,87 @@ bucket — textures in `texture_2d_array`s (arrays, NOT atlases: layers keep
 native UV repeat, which Sponza's tiling needs), per-instance material index,
 factors in a storage buffer. T3 composes with the batcher and is a draw-call
 win independent of boot time.
+
+### 13.15.1 The diff verdict: nothing leaks by VALUE — three keys programs on node IDENTITY
+
+`DUMP_RENDER` (one file per distinct fragment signature) + a normalizer that
+canonicalizes the node-id families (`nodeVarN`/`nodeUniformN`/…) settles it in
+three steps:
+
+1. Raw same-family pairs differ by thousands of bytes — but normalized,
+   sorted, and number-erased, a 419-line pair (`m12`/`m13`, the 17 kB Sponza
+   map-only family) differs in **8 shape-lines**: two trailing commas (struct
+   member order) and ONE temp-materialization choice (`a = u*x; b = c*a` vs
+   `b = c*(u*x)`). Same math, same uniforms, same textures. **No value, factor,
+   or texture parameter is inlined anywhere.** The leak is IDENTITY and ORDER:
+   `Node.customCacheKey() → this.id` (r185 Node.js:472) plus emission order.
+2. The in-page key probe (`run-material-key-probe.mjs`, reconstructing r185's
+   `getMaterialCacheKey` walk WITH property names kept) shows the 26-member
+   `MeshPhysicalNodeMaterial[map]` family: **26 distinct keys, and the ONLY
+   differing component is `customProgramCacheKey`** — every walked property
+   (texture mapping/filters/wraps included) is identical. Zero instancing
+   involved.
+3. The reason the materials carry per-instance nodes at all: every imported
+   .mat is a shader graph, and `compileShaderGraph` mints fresh
+   uniform/texture nodes per material (`makeUniform` per unwired input — even
+   two identical constants-only materials never share).
+
+Two fixes, both landed:
+
+- **Stock-PBR expression** (`matchStockPbr` in tslGraph.js + `applyStockPbr`
+  in materialAsset.js): the canonical import shapes — `texture→principledBsdf
+  →output`, optional `texture→normalMap→normal`, constants elsewhere — are
+  expressed as PLAIN material properties (map/normalMap/color/roughness/…)
+  with NO `*Node` slots, so the material keeps three's stock program key.
+  Conservative bail on anything else (wire-only props, swizzles, wired UVs,
+  opacity≠1, ao≠1, non-black emissive — texture-fed emissive must stay on the
+  graph path or it bypasses `resolveMaterialSurface`'s area-light guard).
+  32/46 GAME .mats match, including all 24 Sponza. Wired-color pins the color
+  factor to white (the graph path had no factor multiply). Textures load via
+  the graph path's own cached loader (same SRGB default + .meta override) for
+  pixel parity. Terrain unaffected (it compiles layer graphs itself via
+  `compileMaterialGraph`); GI's `resolveMaterialSurface` reads props as its
+  fallback and now sees graph-true values instead of stale def ones.
+- **The saboteur the first measurement caught**: after the stock expression,
+  the wave DIDN'T collapse (30→30 distinct). The key probe named it:
+  `#markObservedMaterial` attached `giMonitorNode = float(0)` — a FRESH node
+  per material — and `_getNodeChildren()` walks ANY own `.isNode` property, so
+  the marker's instance id re-forked every key. The very override installed
+  five lines below documents "still letting same-bucket materials share one
+  build" — defeated by its own marker since the day it shipped. Fix: ONE
+  shared marker instance (`GISystem._giMonitorMarker ??= float(0)`); the
+  observer only needs `.isNode` to exist, and the roughness-bucket suffix in
+  the key keeps mirror/diffuse variants separate as designed.
+
+### 13.15.2 Measured: 26 material program keys → 3, the wave 53-95 s (contended) → 1.7 s
+
+The key probe after both fixes, live scene:
+
+```
+MeshPhysicalNodeMaterial[map]            members 14   DISTINCT KEYS 1
+MeshPhysicalNodeMaterial[map+normalMap]  members 12   DISTINCT KEYS 2   (side: 0 vs 2 — front vs double-sided, a REAL program fork)
+```
+
+26 imported materials → 3 program keys. The boot probe, same machine state
+(driver so contended the compute queue showed 30 s latencies — the state that
+previously produced 53-95 s material waves):
+
+```
+material compile wave        1656 ms
+render pipelines             33, driver 241 ms summed
+idle between compiles        53% → 14% of the compile span
+```
+
+The remaining distinct render fragments (28) are per-family × per-CONTEXT
+variants — the live base-light render, the wave's GI-light variant, the
+postprocess MRT variant — plus the graph-path stragglers (the two dragonkin
+multiply-chain materials, Floor.mat's legacy-props BSDF, emissives, volumes)
+and editor UI. Per-material minting is gone; a family's sig set no longer
+scales with material count.
+
+Found along the way, not yet fixed: **Floor.mat carries legacy prop names**
+(`baseColor`/`specular`/`sheenTint`/`alpha`…) and its stray numeric values on
+wire-only channels (`sheen: 0`, `clearcoat: 0`) compile to LIVE uniform nodes
+— the floor renders through sheen+clearcoat lighting paths for zero visual
+effect. The matcher correctly bails (preserves behavior); a def migration
+would both fix the material and let it stock-express.
