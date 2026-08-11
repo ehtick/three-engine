@@ -226,11 +226,15 @@ const result = await page.evaluate(async ({ hatch, quality, steps, slab, sunOn, 
 
   const gi = engine.createEntity({ name: "GI Emissive Probe" });
   // ONE PROPERTY on the component. `emissiveShadows` is the feature this probe
-  // MEASURES and no preset turns it on (it is a named component of the
-  // emissive-projectile frame cost), so it is forced through the measurement
-  // hatch — without it the emitter-shadow targets are never built and the
-  // readback below fails on an undefined texture rather than a wrong number.
+  // MEASURES; it is forced through the measurement hatch so the probe stays
+  // pinned to a known state whatever the preset table says (it defaults ON
+  // since 2026-08-11, but a probe that borrows a default is a probe whose
+  // meaning changes when the default does).
   globalThis.__giConfigOverride = { emissiveShadows: true };
+  // PIN SRC OFF: this probe's exact-match numbers (penumbraPx/grain) were
+  // captured against the legacy-only screen chain, and SRC is on by default
+  // since Phase 5 — its diffuse term would land in the same luminance readback.
+  globalThis.__giSrcProbes = false;
   if (profileOn) globalThis.__giRayHitProfiling = true;
   gi.addComponent("global-illumination", { quality });
   const system = engine.modules.get("gi").system;

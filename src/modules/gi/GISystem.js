@@ -3136,7 +3136,8 @@ export class GISystem {
         : null;
       // ── SRC (plan §7 Phase 1-2) ───────────────────────────────────────────
       //
-      // Opt-in via `__giSrcProbes`, and it will stay that way until Phase 6.
+      // ON by default since Phase 5 (`__giSrcProbes = false` is the opt-out —
+      // see srcSystem.js's header for why the Phase 1–4 rationale died).
       // Built HERE, ahead of the resolve, because since unit 4 it has something
       // the resolve wants: a c0-only irradiance texture. It hangs off the SCREEN
       // bundle rather than off `state` because it is a pure function of the
@@ -4942,11 +4943,11 @@ export class GISystem {
       );
     } else if (!srcProbesEnabled()) {
       console.log(
-        "[gi] diffuse indirect: ABSENT — the dense radiance cascades were deleted for the SRC " +
-          "rebuild (docs/GI_SRC_REBUILD_PLAN.md §12.8) and Split Radiance Cascades is OPT-IN " +
-          "until Phase 6. Direct light, GI/emitter shadows, AO and exact reflections are live; " +
-          "bounce, sky and every other diffuse term read ZERO. This is expected, not a broken " +
-          "field — set `__giSrcProbes = true` before the GI module builds to turn the transport on.",
+        "[gi] diffuse indirect: ABSENT — this build is OPTED OUT of Split Radiance Cascades " +
+          "(`__giSrcProbes = false`; it is ON by default since Phase 5). Direct light, " +
+          "GI/emitter shadows, AO and exact reflections are live; bounce, sky and every other " +
+          "diffuse term read ZERO. Expected under the opt-out, not a broken field — remove the " +
+          "flag before the GI module builds to get the transport back.",
       );
     } else if (!skyLit) {
       console.log(
@@ -5650,8 +5651,9 @@ export class GISystem {
       this._srcGizmoHintShown = true;
       console.log(
         "[gi] Debug View \"src-probes\": the SRC probe population is off. " +
-        "Set `__giSrcProbes = true` before the GI module builds (plan §7 Phase 1) — " +
-        "it is opt-in until the transport lands.",
+        "It is ON by default since Phase 5 — this build was opted out " +
+        "(`__giSrcProbes = false`, or the build predates the flip). Remove the " +
+        "flag and rebuild GI to get probes back.",
       );
     }
     state.screen?.srcProbes?.gizmos?.setVisible(mode === "src-probes");

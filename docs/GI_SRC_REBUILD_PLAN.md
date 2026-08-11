@@ -6413,3 +6413,88 @@ wire-only channels (`sheen: 0`, `clearcoat: 0`) compile to LIVE uniform nodes
 — the floor renders through sheen+clearcoat lighting paths for zero visual
 effect. The matcher correctly bails (preserves behavior); a def migration
 would both fix the material and let it stock-express.
+
+### 12.37 SRC GOES DEFAULT-ON, AND THE EMITTER SLOTS REACH THE SOCKET — "EMISSIVES DO NOT WORK" WAS A CONFIG CONSTANT
+
+User, 2026-08-11: "enable the SRC GI by default so I don't have to enable it via
+console flags every time. Also, notice that light flickers and emissives do not
+work currently." This section is the first two; the flicker is §12.32's
+standing verdict and gets its own unit.
+
+#### 12.37.1 The default flip
+
+`srcProbesEnabled()` is now `__giSrcProbes !== false`. The Phase 1–4 rationale
+for off-by-default — the population produced no light, so it was pure cost —
+died with Phase 5: SRC is the ONLY diffuse-indirect term this module has, so
+off-by-default meant every project shipped with no bounce unless someone typed
+a console flag before boot. `__giSrcProbes = false` is the explicit opt-out
+(R12), and it is load-bearing for four harnesses whose numbers or meanings were
+recorded against the legacy-only chain:
+
+- `gi-gpu-smoke.html` non-src arms now PIN false (they mean "the legacy screen
+  chain in isolation" — that is what their assertions were written against).
+- `run-gi-emitter-shadow-probe.mjs` pins false: its exact-match numbers
+  (`penumbraPx=16601 grain=0.0307`) would otherwise gain SRC's diffuse term in
+  the same luminance readback.
+- `run-gi-flicker-frame.mjs` pins false unless `SRC=1`, because the SRC arm
+  also sets the sky the instrument needs — "SRC by default without the sky"
+  is exactly the §12.23 flawless-absence-of-flicker trap.
+- `run-gi-boot-probe.mjs` is three-state (`SRC=1`/`SRC=0`/unset = shipping
+  default), so its headline TTFF keeps measuring what a user actually boots.
+  Any comparison against pre-flip numbers must set `SRC=0`.
+
+#### 12.37.2 "Emissives do not work" — the whole feature hung off `emissiveShadows: false`
+
+The live editor said it plainly: the SRC boot line read **"SHADING (4 lights,
+0 emitters"**. `GISystem` only creates the MAX_EMITTERS uniform slots when
+`props.emissiveShadows !== false`, and giConfig's CONSTANT table said `false`
+for every tier — so `srcSystem` got `emitters: []`, and `createSrcHitShader`
+compiles NEE out at BUILD time (`useNee = emitters.length > 0`). The name
+undersells the flag: it gates the slots, the per-frame promotion, the analytic
+receiver-direct term AND the NEE set. Per R5 (§12.29) the promotion set IS the
+NEE set and the analytic-direct set — bake-time zeroing hands a promoted
+emitter's energy to exactly those two consumers — so with the slots absent, a
+promoted emitter's light would be deleted from BOTH paths. Worse for the
+user's actual game: session 38's sub-voxel projectiles are ANALYTIC-ONLY
+(no voxel placement, no surface record), so the slots are their ONLY
+representation — with `emissiveShadows: false` they are invisible to lighting
+entirely, which is precisely "emissives do not work".
+
+`emissiveShadows: true` in CONSTANT now. What OFF used to buy is still bought
+elsewhere: with zero PROMOTED emitters the warm-up skips the emitter-shadow
+chain and the per-frame "CAPABILITY IS NOT USE" checks drop the trace and its
+bilateral — a scene with no emissive meshes pays uniforms, not passes.
+`__giConfigOverride = { emissiveShadows: false }` is the hatch.
+
+#### 12.37.3 The end-to-end gate, and the assertion that had R5 backwards
+
+`probe:gi-src-emissive` (new, `run-gi-src-emissive-probe.mjs`): boots the
+generated Cornell project (emissive cube, NO other light) with **no flags at
+all**, reads the MECHANISM through the engine object before any pixel (socket
+slot count, promoted count — gi-harness-viewport-traps' rule), then measures
+wall patches, then reruns with the opt-out override. All PASS:
+
+```
+defaults: srcBuilt=true shading={lights:4, emitters:4, attributed:true} promoted=1
+          walls lit by the cube alone, mean 0.1292
+optout:   shading.emitters=0 promoted=0 — the override flows
+R5 live:  defaults 0.1292 vs optout 0.1605 wall energy — 19.5% apart
+```
+
+⚠ **The first version of the last check asserted the two arms DIFFER by >10%,
+which is asserting R5 is broken.** Promoted (analytic direct + NEE, emission
+zeroed at hits) and unpromoted (emission on the ray path) are two
+representations of ONE light, calibrated to agree (§12.26.7: 1.45% worst at a
+shading point). The model SWITCH is proven by the mechanism readout; the
+pixels owe us AGREEMENT — asserted at <25%, the slack being the soft path's
+one-sided-bright leak at coarse probe spacing (§12.26.9) plus run noise.
+
+Other gates re-run at the flip: `test:gi-src-ref` (124) PASS,
+`test:gi-src-shade` (36, incl. R5 zeroing + real-slot-shaped emitter terms)
+PASS, `smoke:gi-gpu` all four arms PASS (non-src arms log "SRC compiled out",
+src arms hold the π·sky ceiling and the 8-storage-buffer audit).
+
+Also retired quietly: `run-gi-emissive.mjs`'s arms set the `emissiveShadows`
+COMPONENT PROP, which the one-property collapse turned into a no-op — its
+off/on arms have measured the same configuration since then. The new probe
+uses `__giConfigOverride`, which is the only remaining way to force the value.

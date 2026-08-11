@@ -98,8 +98,12 @@ await page.evaluateOnNewDocument((PROJECT, PRESET) => {
   for (const [k, v] of Object.entries(PRESET)) globalThis[k] = v;
 }, PROJECT, {
   ...JSON.parse(process.env.PRESET_GLOBALS ?? "{}"),
-  // SRC is opt-in until Phase 6 and must be set before the GI module builds.
-  ...(process.env.SRC === "1" ? { __giSrcProbes: true } : {}),
+  // Must be set before the GI module builds. SRC is ON by default since
+  // Phase 5, but this rig PINS it off unless SRC=1: the SRC=1 arm also sets
+  // the sky environment this instrument needs (§12.23 — without a sky the
+  // resolve is uniformly black and the rig reports a flawless absence of
+  // flicker), so "SRC by default without the sky" would be exactly that trap.
+  __giSrcProbes: process.env.SRC === "1",
 });
 
 await page.goto(url, { waitUntil: "load", timeout: 60000 });

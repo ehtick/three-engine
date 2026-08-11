@@ -110,7 +110,11 @@
         // walks them, and anything over the line fails pipeline creation, which
         // surfaces as a validation error rather than as a wrong picture.
         const srcArm = new URLSearchParams(location.search).get("src") === "1";
-        if (srcArm) globalThis.__giSrcProbes = true;
+        // Set BOTH ways: SRC is on by default since Phase 5, so the non-src
+        // arms must PIN it off or they stop meaning "the legacy screen chain
+        // in isolation" — which is the state all their assertions were
+        // written against.
+        globalThis.__giSrcProbes = srcArm;
         // `?raysteps=N` — the scaffold ray pass's per-ray step budget. An A/B
         // rather than a constant because SRC's rays are LONGER than the interval
         // rays every existing budget was tuned against (srcTrace.js's header

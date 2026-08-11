@@ -240,9 +240,13 @@ async function runArm(arm) {
     localStorage.setItem("engine.projectRoot.v1", project);
     localStorage.setItem("engine.recentProjects.v1", JSON.stringify([project]));
     globalThis.__editorKeepRendering = true;
-    if (src) globalThis.__giSrcProbes = true;
+    // Three-state since SRC went default-on: SRC=1 pins on, SRC=0 pins off,
+    // unset follows the shipping default (ON) — so the headline TTFF measures
+    // what a user actually boots. Any comparison against numbers recorded
+    // before the flip must set SRC=0.
+    if (src != null) globalThis.__giSrcProbes = src;
     for (const [k, v] of Object.entries(flags)) globalThis[k] = v;
-  }, PROJECT, process.env.SRC === "1", FLAGS);
+  }, PROJECT, process.env.SRC === "1" ? true : process.env.SRC === "0" ? false : null, FLAGS);
   if (Object.keys(FLAGS).length) console.log(`  flags: ${JSON.stringify(FLAGS)}`);
 
   const tOpen = Date.now();

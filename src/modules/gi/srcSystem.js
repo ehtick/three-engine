@@ -7,14 +7,21 @@
 // else about the other, which is the only reason the Phase-2/3 work can grow
 // underneath this without turning into a sweep through a 7,000-line file.
 //
-// ══ WHY THIS IS OPT-IN AND WILL STAY OPT-IN UNTIL PHASE 6 ══════════════════
+// ══ ON BY DEFAULT SINCE PHASE 5 LANDED (user decision, 2026-08-11) ═════════
 //
-// `__giSrcProbes` defaults OFF. The probe population produces no light — the
-// diffuse indirect term is still absent (plan §12.8) — so switching it on today
-// costs GPU time and changes nothing on screen. It is on the frame so a person
-// can look at the gizmos and so `smoke:gi-gpu?src=1` can audit the bindings; it
-// is off by default so the shipping build is byte-identical, which is what
-// makes every existing probe's numbers still comparable.
+// `__giSrcProbes` defaulted OFF through Phases 1–4 because the population
+// produced no light — the transport deposited zeros, so on-by-default would
+// have cost GPU time for nothing and made every §12 number incomparable. That
+// rationale died with Phase 5: hit shading is landed and wired (§12.28–§12.29),
+// SRC is the ONLY diffuse-indirect term this module has (§12.8 deleted the
+// dense cascades), so off-by-default meant every project shipped with no bounce
+// unless someone typed a console flag before boot.
+//
+// `__giSrcProbes = false` is the EXPLICIT opt-out (R12: the hatch is a flag,
+// not a rebuild) — it is what a harness pins to measure the legacy-only screen
+// chain, and any comparison against numbers recorded before this flip must pin
+// it. `smoke:gi-gpu`'s non-src arms and the emitter-shadow probe do exactly
+// that.
 //
 // ══ THE ANCHOR, WHICH IS THE ONE THING HERE THAT IS NOT OBVIOUS ════════════
 //
@@ -67,9 +74,10 @@ const REANCHOR_CHEBYSHEV = 64;
 /** The anchor snaps to multiples of this many s₀, so it moves in whole steps. */
 const ANCHOR_QUANTUM = 16;
 
-/** Is the SRC probe population compiled into this build? Opt-in — see the header. */
+/** Is the SRC probe population compiled into this build? ON unless explicitly
+ *  opted out — see the header. `__giSrcProbes = false` is the hatch. */
 export function srcProbesEnabled() {
-  return globalThis.__giSrcProbes === true;
+  return globalThis.__giSrcProbes !== false;
 }
 
 /**

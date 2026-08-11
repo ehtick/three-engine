@@ -109,11 +109,27 @@ const CONSTANT = {
   rayHitProfiling: false,
   rayHitSkipDistance: true,
 
-  // Emitter shadow rays. OFF, unchanged: session 38 measured them as a named
-  // component of the emissive-projectile frame cost, and the reference Cornell
-  // runs without them. Turning them on for a tier is a measurable decision, not
-  // a refactor.
-  emissiveShadows: false,
+  // The emitter SYSTEM — despite the name, this gates far more than shadow
+  // rays: the MAX_EMITTERS uniform slots, the per-frame promotion of emissive
+  // meshes into them, the analytic receiver-direct term, and the slots SRC's
+  // hit shader samples with NEE (`useNee = emitters.length > 0` is a
+  // BUILD-time decision in srcShade.js).
+  //
+  // ON, and under SRC it cannot be otherwise: the promotion set is the NEE set
+  // AND the analytic-direct set (R5, plan §12.29 — bake-time zeroing hands an
+  // emitter's energy to exactly these two consumers), so with the slots absent
+  // an emissive mesh's light is deleted from BOTH paths. That was the shipped
+  // state this line fixes: "emissives do not work" (user, 2026-08-11) — SRC
+  // compiled with `emitters: []` and the boot line read "4 lights, 0 emitters".
+  //
+  // What OFF used to buy is still bought elsewhere: with zero PROMOTED
+  // emitters the warm-up skips the emitter-shadow chain outright and the
+  // per-frame skips drop the trace and its bilateral (the "CAPABILITY IS NOT
+  // USE" checks in GISystem) — so a scene with no emissive meshes pays
+  // uniforms, not passes. Session 38's frame-cost concern was the cost of
+  // emitters that EXIST, which is the feature working, not overhead.
+  // `__giConfigOverride = { emissiveShadows: false }` remains the hatch.
+  emissiveShadows: true,
 
   // Indirect-only ambient occlusion from the occupancy pyramid. OFF, unchanged
   // — it only ever removes light, and it shipped default-on once in the same
