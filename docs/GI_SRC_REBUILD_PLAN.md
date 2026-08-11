@@ -5525,3 +5525,89 @@ So §12.33.2's camera-distance hypothesis gets tested first — `SWEEP=camera` i
 `probe:gi-src-cost`, which holds tier, resolveScale and the ceiling (so ray
 count is constant and ns/ray is pure traversal cost) and moves the camera
 straight back along its own view axis at 1×/3×/6×.
+
+### 12.35 THE CAMERA HYPOTHESIS IS REFUTED, AND THE ARM THAT REFUTED IT IS ALSO CONFOUNDED
+
+§12.33.2 guessed that the 5× ns/ray gap between the harness and the user's
+editor was ray LENGTH via camera distance. `SWEEP=camera`, ultra, ceiling
+holding ray count:
+
+| arm | rays | deposit ms | ns/ray | hits shaded | screen mean |
+|---|---|---|---|---|---|
+| nave (1×) | 210,635 | 3.064 | 14.5 | 210,636 | 0.11819 |
+| back 3× | 249,860 | 1.471 | 5.9 | 69,756 | 0.77573 |
+
+Pulling back made it **2.5× CHEAPER per ray**, the opposite of the prediction.
+The hypothesis in its "longer rays cost more" form is dead.
+
+**And the arm cannot be read as a distance measurement anyway.** `hits shaded`
+falls from 210,636 to 69,756 — a **28% hit rate against the nave's ~100%** — and
+the screen mean goes 0.118 → 0.776. The camera left the building. From outside,
+most rays escape to sky in a few DDA steps instead of crossing a colonnade, so
+the arm changed WHAT the rays traverse and not merely how far. Moving straight
+back along the view axis was chosen to hold the subject fixed and it does not,
+once the camera passes the wall.
+
+**The transferable result is the one that was not being looked for: per-ray cost
+varies 2.5× with camera pose in a single scene.** So an ns/ray figure is only
+meaningful next to the pose that produced it — which retroactively voids
+comparing this harness's pinned nave pose against the user's unknown one. The
+5× "gap" may be partly or entirely that comparison, and no amount of re-running
+the harness can tell, because the harness cannot see their camera.
+
+**What that changes:** stop attributing the gap. It has now survived three
+guesses — cache pressure, sustained-load clocks, camera distance — and not one
+was measured against the thing it claimed. The next step is not another
+hypothesis; it is a `profile.giPasses` **and** a `viewport.getCamera` from the
+user's editor in the same breath, so cost and pose are read together. Their
+editor is detached from the MCP bridge at the time of writing.
+
+Two lesser facts from the same run, recorded because they cost nothing to keep:
+- Enclosure, not distance, is what makes a ray expensive here. A scene where
+  most rays escape is cheap; an interior is not. That is a property of the
+  content, and it means "GI costs N ms" is not a per-scene constant.
+- The prewarm loop reads 2–3 ms on every arm now (was 24,478 ms), and `computes`
+  is dominated by the pipeline drain again (30–44 s cold) — the harness gets a
+  fresh Chrome profile per run, so it is cold every time by construction and
+  **cannot measure a warm restart**. Do not read its material/compute wave
+  numbers as what the user experiences on a re-open.
+
+### 12.36 THE HALF-RES GATHER: MEASURED, VISIBLE, AND BACKED OUT
+
+The gather is the #2 cost on the user's editor — **7.55 ms of a 34 ms SRC
+chain** — and unlike the deposit it cannot be strided, because every output
+pixel needs a value this frame. The only lever is producing fewer of them.
+
+Landed: the gather has its own grid (`SRC_GATHER_SCALE`, `gatherWidth ×
+gatherHeight`) with an index map into the full-res gbuffer, and `giScreen`'s
+resolve reads it with a **UV sample** instead of `load(coord)` so the hardware
+bilinear does the upsample. Deliberately NOT `resolveScale`: that would take the
+AO/shadow composite's silhouette edges down with it, which is the thing ultra
+pays for (§12.34).
+
+It works. No validation errors, no page errors, the chain drops.
+
+**And it is set to 1.** At 2 it bleeds irradiance across silhouettes, and not
+theoretically — a box in the Sponza nave renders **pure black with sharp edges
+at 1:1 and soft mid-grey at 2:1**, having picked up its neighbours' light. The
+control that settles the attribution is a shot taken *before this code existed*:
+`resolveScale 0.5` with a full-res gather shows the **same grey box**. So the
+artifact belongs to a coarse irradiance carrier in general, this change
+reproduces it faithfully, and it is not a mapping bug.
+
+Shipping it would trade a measured 5.6 ms for light leaking onto every
+silhouette — the same artifact class ultra's `resolveScale: 1` exists to avoid,
+which makes it a strange thing to introduce two sections after declining to flip
+that flag for the same reason.
+
+**What unlocks it is already in the codebase.** `giConfig.js` describes the
+resolve→screen path as upsampling through "the position-validated bilateral".
+The gather→resolve step is a *second* upsample with no such filter. Give it the
+same treatment and the 5.6 ms is available; the plumbing, the index map and the
+UV sample are all in place and gated behind one constant.
+
+**Why this is written down rather than quietly reverted:** the next person to
+look at a 7.55 ms gather will have exactly this idea, and the useful thing to
+inherit is not "don't" — it is the measured size (5.6 ms), the specific artifact,
+the control image that proves it is not a bug in the mapping, and the name of
+the filter that fixes it.

@@ -234,7 +234,15 @@ for (const arm of arms) {
     // twice. This probe keeps every `[gi]` line, so it is the cheaper place to
     // read one. Echo verbatim rather than parse: the point is to see a number
     // nobody has seen yet, and a parser can only find what it already expects.
-    for (const l of gi.filter((t) => /node-graph build|compiled concurrently|compute kernels:|compile wave:/.test(t))) {
+    // `occupancy backend` and `built (voxel` are here for a specific open
+    // question: the same kernel measures ~13 ns/ray in this harness and 61–85
+    // in the user's editor, and per-ray cost is DDA steps through the occupancy
+    // pyramid. If the two are building different-sized fields — different
+    // auto-fit bounds, different cell counts — that is the gap, and neither
+    // number was ever printed side by side. Cheap to echo, and it rules a
+    // candidate in or out without another run.
+    const echo = /node-graph build|compiled concurrently|compute kernels:|compile wave:|occupancy backend|built \(voxel/;
+    for (const l of gi.filter((t) => echo.test(t))) {
       console.log(`      · ${l.slice(0, 190)}`);
     }
 

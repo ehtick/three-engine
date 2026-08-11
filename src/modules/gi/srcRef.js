@@ -293,7 +293,15 @@ export function buildProbes(cfg, pixels) {
 // which is the point: the property is checkable without the scan.
 
 /**
- * THE RAY CEILING'S STRIDE — the mirror of `srcRays.js`'s `strideSkips`.
+ * THE RAY CEILING'S STRIDE — the mirror of `srcMathTsl.js`'s `transportPixel`.
+ *
+ * The twins are shaped differently on purpose and it is worth knowing why. The
+ * kernel ENUMERATES its pixel set (thread `t` → pixel `t·stride + phase`,
+ * `t ∈ [0, threads)`), because a dispatch has to know how many threads to
+ * launch. This mirror walks the mirror's own pixel list and asks of each one
+ * "were you in that set?", because it has no dispatch. Enumeration and
+ * membership are inverses, and getting the inverse wrong is invisible at
+ * `phase = 0` — see below.
  *
  * `stride = 1` (the default, and what every gate runs) makes this always false,
  * so the reference is unchanged by the ceiling's existence. Above 1, a pixel

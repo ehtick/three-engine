@@ -338,7 +338,25 @@ export function createGiResolve({ gbuffer, targets, width, height, gather = null
       // world point, which a screen-space texture cannot answer, and it keeps
       // its documented `gather == null` behaviour until Phase 3's
       // position-indexed probe gather exists.
-      if (screenGather) out.addAssign(screenGather.load(coord).xyz.mul(intensity));
+      // ── SAMPLED BY UV, NOT FETCHED BY TEXEL, SO IT CAN BE SMALLER ────────
+      //
+      // This was `screenGather.load(coord)`, which requires the gather texture
+      // to be exactly resolve-sized. It no longer is: SRC runs its gather at
+      // `SRC_GATHER_SCALE` (srcSystem) because the gather is per-output-pixel
+      // work and measured 7.55 ms of a 34 ms SRC chain at the user's 1,599,840
+      // px. A UV sample lets the hardware bilinear do the upsample for free,
+      // and it keeps the RESOLVE at full resolution — which is what ultra's
+      // `resolveScale: 1` is actually for (the AO/shadow composite's silhouette
+      // edges), and what a `resolveScale` change would have thrown away with it.
+      //
+      // Same `(px + 0.5) / size` form the AO block below already uses. It works
+      // at any gather size including 1:1, so nothing is conditional on the
+      // scale — a texture the same size as the resolve samples its own texel
+      // centres and returns exactly what `load` did.
+      if (screenGather) {
+        const guv = vec2(px.toFloat().add(0.5).div(width), py.toFloat().add(0.5).div(height));
+        out.addAssign(screenGather.sample(guv).level(0).xyz.mul(intensity));
+      }
       // AMBIENT OCCLUSION ON THE INDIRECT TERM (occupancy-oracle obscurance).
       //
       // The probe lattice is ~1m — indirect light arrives with NO small-scale

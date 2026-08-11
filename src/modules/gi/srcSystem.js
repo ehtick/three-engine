@@ -41,7 +41,7 @@
 // docs/GI_SRC_REBUILD_PLAN.md §4.1, §4.2, §7 Phase 1.
 
 import * as THREE from "three/webgpu";
-import { float, ivec2, step, texture, uniform, vec3 } from "three/tsl";
+import { float, ivec2, step, texture, uint, uniform, vec3 } from "three/tsl";
 import {
   CASCADE_COUNT, MAX_LODS, SRC_QUALITY, TEMPORAL_ALPHA, W0, srcQualityTier, srcTransportRays,
 } from "./srcConfig.js";
@@ -179,6 +179,50 @@ export function createSrcProbeSystem({
 
   /** Texel coords for a linear pixel index — the one decode both readers use. */
   const texelOf = (i) => ivec2(i.mod(widthU).toInt(), i.div(widthU).toInt());
+  // ── THE GATHER'S OWN GRID ─────────────────────────────────────────────────
+  //
+  // `SRC_GATHER_SCALE` is a divisor on the gather's resolution only — see the
+  // call site for why this is not `resolveScale`. Its thread `i` indexes a
+  // gatherWidth × gatherHeight grid, so it needs a map into the FULL-res
+  // gbuffer; `readPixel` decodes against `widthU` and would otherwise read a
+  // pixel `SRC_GATHER_SCALE`× too far left on a row `SRC_GATHER_SCALE`× too far
+  // up — a plausible image, subtly sheared, of a scene that is not there.
+  //
+  // The multipliers are JS constants, not uniforms, and that is safe for the
+  // reason `setSize` already documents: the dispatch counts are baked into the
+  // compute nodes, so a resolution change rebuilds this whole frame anyway.
+  // ⚠ **1, NOT 2, AND THE 2 WAS MEASURED BEFORE IT WAS BACKED OUT.**
+  //
+  // At 2 this is worth ~5.6 ms on the user's editor (gather 7.55 → ~1.9 ms) and
+  // it works — no validation errors, no page errors, the chain drops. What it
+  // also does is bleed irradiance ACROSS SILHOUETTES, and that is visible on a
+  // real object rather than theoretical: a box in the Sponza nave renders pure
+  // black with sharp edges at 1:1 and soft mid-grey at 2:1, having picked up its
+  // neighbours' light. The control that settles it is a shot taken BEFORE this
+  // code existed — `resolveScale 0.5`, full-res gather — which shows the SAME
+  // grey box. So the artifact belongs to a coarse irradiance carrier in
+  // general, this change reproduces it faithfully, and it is not a mapping bug.
+  //
+  // The engine already knows the answer: `giConfig.js` says the resolve→screen
+  // step upsamples through "the position-validated bilateral", which is exactly
+  // the filter this gather→resolve step lacks. Shipping 2 without it would be
+  // trading a measured 5.6 ms for light leaking onto every silhouette — the
+  // same class of artifact ultra's `resolveScale: 1` is chosen to avoid, which
+  // would make it a strange thing to introduce while defending that flag
+  // (§12.34).
+  //
+  // So the plumbing lands and the scale does not. At 1 the UV sample in
+  // giScreen returns exactly what `load(coord)` did (texel centres, 1:1), the
+  // gather grid equals the resolve grid, and nothing about the image moves.
+  // Raising this to 2 is a one-token change once the bilateral exists, and the
+  // 5.6 ms is already priced.
+  const SRC_GATHER_SCALE = 1;
+  const gatherWidth = Math.max(1, Math.ceil(width / SRC_GATHER_SCALE));
+  const gatherHeight = Math.max(1, Math.ceil(height / SRC_GATHER_SCALE));
+  const gatherReadPixel = (i) => readPixel(
+    i.div(uint(gatherWidth)).mul(uint(SRC_GATHER_SCALE * width))
+      .add(i.mod(uint(gatherWidth)).mul(uint(SRC_GATHER_SCALE))),
+  );
   const readPixel = (i) => {
     const t = texelOf(i);
     const g0 = positionNode.load(t).toVar();
@@ -597,9 +641,25 @@ export function createSrcProbeSystem({
         // gather that interpolates over a lattice placed from a second anchor
         // reads plausible light from the wrong probes.
         anchor: vec3(anchorU),
-        readPixel,
-        width,
-        height,
+        // ── THE GATHER RUNS COARSER THAN THE RESOLVE ─────────────────────
+        //
+        // It is per-OUTPUT-pixel work — one probe-lattice interpolation per
+        // screen pixel — and it measured **7.55 ms of a 34 ms SRC chain** on
+        // the user's editor at 1,599,840 px, second only to the deposit. Unlike
+        // the deposit it cannot be strided, because every output pixel needs a
+        // value this frame; the only lever is producing fewer of them and
+        // letting the resolve's UV sample upsample (giScreen).
+        //
+        // This is NOT `resolveScale`. Dropping that would take the AO/shadow
+        // composite down with it, and its silhouette edges are the thing ultra
+        // pays for. Irradiance is the smooth term — it is already a trilinear
+        // interpolation over a ~0.35 m probe lattice, so a half-resolution
+        // carrier is far below the frequency it can represent. Halving the
+        // resolve is a visible change; halving THIS should not be, and
+        // `probe:gi-src-cost` measures whether that holds rather than assuming.
+        readPixel: gatherReadPixel,
+        width: gatherWidth,
+        height: gatherHeight,
         maxLods: MAX_LODS,
         w0: W0,
       })
