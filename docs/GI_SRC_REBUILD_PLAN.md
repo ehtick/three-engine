@@ -6232,3 +6232,62 @@ compile then (async, non-blocking, but emitter shadows are absent until it
 lands). The follow-up that shrinks that window is rolling the 4-slot unroll into
 a GPU loop — one descent instead of four — which §13.14.4's call-site bisection
 already priced. Separate change, separate measurement.
+
+#### 13.14.9 THE ANSWER: `#47 [lightShadowPass]`, DISPATCHED THROUGH A LEAK — AND WHY "PREVIOUS GI TOOK 2-3 s"
+
+The naming instrument's first run ended the hunt: **`SLOWEST PIPELINE: #47
+[lightShadowPass] took 43.8s`** (the user's editor: 133.6 s). The gi-traced
+light-shadow trace — `MAX_GI_LIGHTS` slots × a full BVH8 any-hit descent + exact
+dynamic trace + analytic width probe — compiled on every boot of every scene,
+**for a feature enabled by flagging a light Shadow Source "gi", which nothing in
+the scene had done.** The texture it writes is sampled only by gi-flagged lights.
+It was, exactly, the §13.13 sentence again: the most expensive object in the boot
+was a kernel that never runs — and §13.13 had already "skipped" this very chain,
+which is why nobody looked at it again.
+
+The falsifier: the warm-up skip removes it from the WARM list, and the frame
+loop's `anyGiShadow` filter removes it from the MAIN dispatch — but the
+occupancy-wait branch dispatched `rateQueue = state.queue` **unfiltered**, and
+every boot takes that branch while pipelines are pending. First occ-wait frame →
+full queue → pipeline created → the wave's drain waits 44-133 s for it. Fixed by
+hoisting one skip set above every dispatch site (c68b1c1).
+
+Verified cold with gate state printed: **75 → 71 pipelines, the 77 kB kernel
+absent, compute wave 130,400 ms → 11 ms.** (That run's 97 s TTFF is 96 s of
+material wave under cross-process contention — the user's live editor was
+compiling beside the harness; the structural facts are load-independent.)
+
+This also answers the user's question "why did the previous GI take 2-3 s":
+the old backend never carried an always-compiled BVH8 estimator at light-slot
+capacity. The 2026-08-06 estimator unification (static-bvh8 + exact-dynamics +
+analytic-width, "up to 4 lights") made the light-shadow kernel a monster, and the
+rateQueue leak made every scene pay it. The regression was the INTERACTION of an
+upgrade and a leak, which is why neither's author saw it.
+
+##### The five wrong owners, and the two rules that survive
+
+shadow-marcher (§13.13, right pass, wrong dispatch story) → `bvhReflect`
+(§13.13.2) → `srcShade`'s light loop (§13.14.5, byte-identical dump) → the
+resolve (§13.14.7, un-weakened then re-weakened) → the emitter chain (§13.14.8,
+gate shipped, monster stayed). All five died on one fact: **the estimator family
+shares a WGSL fingerprint, so only a name recorded at the dispatch site
+attributes anything.** Rule one: `giCurrentComputeNode` + `__giPassName` is now
+the ONLY accepted attribution; fingerprints corroborate, never conclude. Rule
+two: no boot number taken while any other WebGPU process is compiling is
+comparable to anything (`[occupancy#4]` read 1.5 s and 30.5 s across two runs of
+identical code).
+
+##### What R18 still owes, by name
+
+| item | measured | next lever |
+|---|---|---|
+| light-shadow chain at boot | **0 ms (eliminated)** | roll the 4-slot unroll so first-flag compile shrinks |
+| emitter chain at boot | **0 ms (eliminated)** | same roll, same reason |
+| exact reflections at boot | 0 ms without a consumer (d9fe69a) | — |
+| material wave | 3.6-96 s, load-dominated | own session; §13.12's instability is now the top term |
+| occupancy chain | ~1.5-6.3 s quiet | `[occupancy#4]` 154 kB, 324 ifs |
+| SRC's 44 kernels | ~2 s summed isolated | fine |
+
+A quiet-machine cold boot after this fix is the number the user's F5 will
+report; the harness cannot produce it while their editor is open, and saying so
+beats inventing one.
