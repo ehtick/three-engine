@@ -1540,7 +1540,49 @@ export class GISystem {
     // (#syncScreenResolveSize, ~25 sites), and Phase 1-3 gives them different
     // contents again. Collapsing them here means rewriting that path twice.
     const freeze = globalThis.__giFreeze;
-    const rateQueue = freeze === "all" ? [] : state.queue;
+    // ── THE FRAME SKIP SET, HOISTED ABOVE EVERY DISPATCH SITE (§13.14.8) ────
+    //
+    // It used to be built just before the MAIN dispatch (the block further
+    // down), which left the occupancy-wait path dispatching `state.queue` RAW
+    // — and every boot takes that path while pipelines are pending. So the
+    // light-shadow chain, "skipped at warm-up, never dispatched", had its
+    // pipeline created by the first occ-wait frame anyway: 44-133 s of
+    // compile for a chain no light uses, which the naming instrument finally
+    // pinned as `#47 [lightShadowPass]` after five fingerprint-based
+    // misattributions. One skip set, computed once, applied to EVERY dispatch
+    // of the queue — a second dispatch site must never re-derive it.
+    const frameSkip = new Set();
+    // 1. No emitters: the trace early-outs at 0.018ms but its bilateral
+    // FILTER still blurred a whole 695x227 texture for 0.119ms — 6x the
+    // trace it was filtering — on a scene logging "0 emitters".
+    if (!(this._emitterInfos?.length > 0) && state.screen?.emitterShadowPass) {
+      frameSkip.add(state.screen.emitterShadowPass.compute);
+      frameSkip.add(state.screen.emitterShadowFilterPass?.compute);
+      // The temporal pair is the same dead weight with zero emitters — and
+      // more of it, since it is two more full-texture passes.
+      frameSkip.add(state.screen.emitterShadowHistoryPass?.compute);
+      frameSkip.add(state.screen.emitterShadowPostPass?.compute);
+    }
+    // 2. No light asks for GI-traced direct shadows (the user's measured
+    // finding, 2026-08-07: a directional light on three's shadow map runs
+    // 2.6ms vs 5.4ms and looks better, so `map` is the normal case now).
+    // `giShadow` is cleared per frame for every off/hidden/map-mode light,
+    // which makes it an exact live signal — and when every slot reads 0 the
+    // trace writes the inert 1 into a texture only gi-mode lights sample.
+    // Flipping a light's Shadow Source stays a UNIFORM WRITE: the pass is
+    // still there, dispatch resumes next frame, and its pipeline compiles
+    // async on first use while frames keep flowing.
+    const anyGiShadowLive = (state.lightSlots ?? []).some((s) => (s?.giShadow?.value ?? 0) > 0);
+    if (!anyGiShadowLive && state.screen?.lightShadowPass) {
+      for (const name of [
+        "lightShadowPass", "lightShadowFilterPass", "lightShadowWidePass",
+        "lightShadowWidePass2", "lightShadowHistoryPass", "lightShadowPostPass",
+      ]) frameSkip.add(state.screen[name]?.compute);
+    }
+    frameSkip.delete(undefined);
+    const rateQueue = freeze === "all"
+      ? []
+      : (frameSkip.size ? state.queue.filter((node) => !frameSkip.has(node)) : state.queue);
     let frameQueue = rateQueue;
     // Converged-idle sleep (see GI_IDLE_AFTER_FRAMES): count frames of
     // bit-identical field input. The composite branch below resets the count
@@ -1719,35 +1761,13 @@ export class GISystem {
       // document: flipping a light's Shadow Source stays a UNIFORM WRITE, never
       // a GI rebuild. The pass is still there; it just stops being dispatched
       // on frames where nothing reads it.
-      const skip = new Set();
-      // 1. No emitters: the trace early-outs at 0.018ms but its bilateral
-      // FILTER still blurred a whole 695x227 texture for 0.119ms — 6x the
-      // trace it was filtering — on a scene logging "0 emitters".
-      if (!(this._emitterInfos?.length > 0) && state.screen?.emitterShadowPass) {
-        skip.add(state.screen.emitterShadowPass.compute);
-        skip.add(state.screen.emitterShadowFilterPass?.compute);
-        // The temporal pair is the same dead weight with zero emitters — and
-        // more of it, since it is two more full-texture passes.
-        skip.add(state.screen.emitterShadowHistoryPass?.compute);
-        skip.add(state.screen.emitterShadowPostPass?.compute);
-      }
-      // 2. No light asks for GI-traced direct shadows (the user's measured
-      // finding, 2026-08-07: a directional light on three's shadow map runs
-      // 2.6ms vs 5.4ms and looks better, so `map` is the normal case now).
-      // `giShadow` is cleared per frame for every off/hidden/map-mode light,
-      // which makes it an exact live signal — and when every slot reads 0 the
-      // trace writes the inert 1 into a texture only gi-mode lights sample.
-      // Measured worth ~0.4ms of a 1.13ms screen chain at 983x321, and it
-      // scales with resolve pixels like everything else here.
-      const anyGiShadow = (state.lightSlots ?? []).some((s) => (s?.giShadow?.value ?? 0) > 0);
-      if (!anyGiShadow && state.screen?.lightShadowPass) {
-        for (const name of [
-          "lightShadowPass", "lightShadowFilterPass", "lightShadowWidePass",
-          "lightShadowWidePass2", "lightShadowHistoryPass", "lightShadowPostPass",
-        ]) skip.add(state.screen[name]?.compute);
-      }
-      skip.delete(undefined);
-      if (skip.size) frameQueue = frameQueue.filter((node) => !skip.has(node));
+      // The skip set is FRAMESKIP now, hoisted above rateQueue's construction
+      // (see the §13.14.8 comment there) so the occupancy-wait path cannot
+      // dispatch what this path skips. rateQueue is already filtered; this
+      // second filter only matters when frameQueue was rebuilt from another
+      // source above (idle lists), and re-applying a Set is cheaper than
+      // proving it never is.
+      if (frameSkip.size) frameQueue = frameQueue.filter((node) => !frameSkip.has(node));
       // Guard the empty case: `__giFreeze = "all"` produces no computes, and
       // three's renderer.compute([]) throws "expects a ComputeNode".
       if (frameQueue.length) giCompute(renderer, frameQueue);
