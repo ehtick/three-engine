@@ -359,6 +359,11 @@ export function createSrcBinStore(store, { w0 = W0, maxBytes = 128 * 1024 * 1024
  *   single-frame behaviour every gate written before Phase 4 assumes.
  * @param {Node} [options.frameStamp]  the frame number `createSrcProbeFrame`
  *   stamps onto freshly claimed blocks. Must be the same node.
+ * @param {object} [options.rayWork]  the ray store's winner worklist — word 0
+ *   the count, entries after it, ONE buffer (its store doc carries the
+ *   binding-budget measurement behind that). [E] traces densely from it
+ *   instead of striding the pixel set (§12.44); omitted, [E] keeps the
+ *   classic thread → pixel mapping every pre-compaction gate runs.
  * @param {Node} [options.influxLift]  uniform in [0,1] — how much of the per
  *   block α compensation is LIFTED (§12.40.4). At 0 the decay slows on capped
  *   blocks to hold `influx/(1−keep′)` at its uncapped value (variance-neutral
@@ -393,6 +398,7 @@ export function createSrcDepositFrame(store, bins, {
   keep = null,
   frameStamp = null,
   influxLift = null,
+  rayWork = null,
   maxLods = MAX_LODS,
   stride = null,
   phase = null,
@@ -500,15 +506,33 @@ export function createSrcDepositFrame(store, bins, {
   // and roughly 6 ms of that was launching threads that immediately returned,
   // which is what a pixel-sized dispatch under a ray ceiling costs (§12.32).
   //
-  // ⚠ THE MAPPING MUST MATCH srcRays' [D1]/[D5] EXACTLY — same helper, same
-  // `stride`/`phase` uniforms, same frame. [D5] writes `pixelRayBase` only for
-  // the pixels it owns, so a mismatch here reads an entry from an OLDER frame:
-  // a stale-but-plausible base pointing into a segment this frame allocated to
+  // WITH A WORKLIST (`rayWork`, §12.44) the thread → pixel map is [D5]'s own
+  // winner list, dense: thread i traces worklist pixel i and the trailing
+  // threads return in WHOLE warps. This is what converts the per-probe cap's
+  // ray cut into wall-clock — with the classic mapping the ~19% winners were
+  // SCATTERED, so nearly every 32-wide warp still contained a tracer and the
+  // pass ran at full width (19 ms for 25k rays, the user's editor). The
+  // mapping-agreement hazard below also DISSOLVES on this path: the list is
+  // written by [D5] in the same frame, so [E] cannot enumerate a pixel [D5]
+  // did not own.
+  //
+  // ⚠ ON THE CLASSIC PATH (no worklist — gates built before it) THE MAPPING
+  // MUST MATCH srcRays' [D1]/[D5] EXACTLY — same helper, same `stride`/
+  // `phase` uniforms, same frame. [D5] writes `pixelRayBase` only for the
+  // pixels it owns, so a mismatch here reads an entry from an OLDER frame: a
+  // stale-but-plausible base pointing into a segment this frame allocated to
   // a different probe. No crash, no assertion — a handful of probes lit with
   // another probe's rays.
+  const compacted = !!rayWork;
   passes.push(Fn(() => {
-    const i = pixelOf(instanceIndex.toVar());
-    if (outOfRange) If(outOfRange(i), () => { Return(); });
+    let i;
+    if (compacted) {
+      If(instanceIndex.greaterThanEqual(atomicLoad(rayWork.element(uint(0)))), () => { Return(); });
+      i = atomicLoad(rayWork.element(instanceIndex.add(uint(1)))).toVar();
+    } else {
+      i = pixelOf(instanceIndex.toVar());
+      if (outOfRange) If(outOfRange(i), () => { Return(); });
+    }
     const base = pixelRayBase.element(i).toVar();
     If(base.equal(uint(SLOT_EMPTY)), () => { Return(); });
     const probe0 = pixelProbe.element(i).toVar();

@@ -96,15 +96,38 @@ export function createSrcRayStore(store, { pixelCount }) {
   const rayCursor = instancedArray(new Uint32Array(probeTotal), "uint").toAtomic();
   const rayTotal = instancedArray(new Uint32Array(1), "uint").toAtomic();
   const pixelRayBase = instancedArray(new Uint32Array(pixelCount).fill(SLOT_EMPTY), "uint");
+  // ── THE WORKLIST (§12.44 — ray compaction) ────────────────────────────────
+  // The pixels [D5] actually granted a slice this frame, DENSE. The deposit's
+  // [E] used to map thread → pixel and early-return on the losers; under the
+  // per-probe cap the winners are ~19% of threads SCATTERED across warps, so
+  // nearly every warp still contained a tracer and the cap's 5× ray cut
+  // bought almost no wall-clock (measured: 19 ms for 25k rays on the user's
+  // editor — warp-density, not work). [E] reading this list traces at full
+  // warp density; the trailing threads return in WHOLE warps, which is the
+  // cheap kind of idle. Capacity is `pixelCount` — winners are a subset of
+  // pixels in every path.
+  //
+  // ⚠ ONE BUFFER — word 0 is the count, entries follow — NOT a count buffer
+  // plus a list buffer. [E] sits at 7 of 8 storage buffers in the smoke's
+  // profiled ray-hit config (§12.39's measurement, and the smoke IS the
+  // binding-budget gate): the two-buffer draft pushed it to 9, the pipeline
+  // failed VALIDATION, and [E] silently never dispatched — the smoke read
+  // zero deposits against a full worklist for exactly as long as anyone
+  // waited. R7 said fold, don't multiply bindings; this is that rule with a
+  // measurement attached.
+  const rayWork = instancedArray(new Uint32Array(1 + pixelCount), "uint").toAtomic();
   return {
     rayCount,
     rayCursor,
     rayTotal,
     pixelRayBase,
+    rayWork,
     pixelCount,
-    bytes: (probeTotal * 2 + 1 + pixelCount) * 4,
+    bytes: (probeTotal * 2 + 2 + pixelCount * 2) * 4,
     dispose() {
-      for (const b of [rayCount, rayCursor, rayTotal, pixelRayBase]) b?.value?.dispose?.();
+      for (const b of [rayCount, rayCursor, rayTotal, pixelRayBase, rayWork]) {
+        b?.value?.dispose?.();
+      }
     },
   };
 }
@@ -143,7 +166,7 @@ export function createSrcRayFrame(
   store, rays, { pixelProbe, raysPerPixel = 1, stride = null, phase = null, threads = 0, cap = null } = {},
 ) {
   const { probeTable, probeTotal, cascades } = store;
-  const { rayCount, rayCursor, rayTotal, pixelRayBase, pixelCount } = rays;
+  const { rayCount, rayCursor, rayTotal, pixelRayBase, rayWork, pixelCount } = rays;
   const N = store.cascadeCount ?? CASCADE_COUNT;
   const top = cascades[N - 1];
 
@@ -210,7 +233,10 @@ export function createSrcRayFrame(
     const w = i.mul(PROBE_WORDS).toVar();
     probeTable.element(w.add(PROBE_RAYS)).assign(uint(0));
     probeTable.element(w.add(PROBE_RAYOFF)).assign(uint(SLOT_EMPTY));
-    If(i.equal(uint(0)), () => { atomicStore(rayTotal.element(uint(0)), uint(0)); });
+    If(i.equal(uint(0)), () => {
+      atomicStore(rayTotal.element(uint(0)), uint(0));
+      atomicStore(rayWork.element(uint(0)), uint(0));
+    });
   })().compute(probeTotal));
 
   // ── [D1] c0 counts, from the pixels ───────────────────────────────────────
@@ -389,8 +415,14 @@ export function createSrcRayFrame(
       pixelRayBase.element(i).assign(uint(SLOT_EMPTY));
       Return();
     });
+    // Winners append themselves to the WORKLIST (`rayWork`) — the store doc
+    // carries why. Written here rather than in a separate pass because [D5]
+    // is the one place "this pixel fires this frame" is decided; a second
+    // pass would be a second definition of the winner set, the exact
+    // mismatch the transportPixel discipline exists to prevent.
     if (!cap) {
       pixelRayBase.element(i).assign(atomicAdd(rayCursor.element(probe), uint(raysPerPixel)));
+      atomicStore(rayWork.element(atomicAdd(rayWork.element(uint(0)), uint(1)).add(uint(1))), i);
       return;
     }
     // Under the cap, more pixels want slices than the segment holds, so a
@@ -412,8 +444,11 @@ export function createSrcRayFrame(
     const off = atomicAdd(rayCursor.element(probe), uint(raysPerPixel)).toVar();
     const denied = rayOff.equal(uint(SLOT_EMPTY)).or(
       off.add(uint(raysPerPixel)).greaterThan(rayOff.add(probeTable.element(w.add(PROBE_RAYS)))),
-    );
+    ).toVar();
     pixelRayBase.element(i).assign(select(denied, uint(SLOT_EMPTY), off));
+    If(denied.not(), () => {
+      atomicStore(rayWork.element(atomicAdd(rayWork.element(uint(0)), uint(1)).add(uint(1))), i);
+    });
   })().compute(dispatchCount));
   // ⚠ `pixelRayBase` IS NO LONGER FULLY REWRITTEN EACH FRAME. With a strided
   // dispatch only this frame's residue class is touched, so every other entry

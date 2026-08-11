@@ -501,7 +501,32 @@
         if (srcArm) {
           const src = state?.screen?.srcProbes;
           if (!src) throw new Error("src arm: __giSrcProbes was set but no probe system was built");
-          const s = await src.readStats(engine.renderer);
+          // POLL until the tallies are live, don't read once. The dynobj arm
+          // above can trigger a GI rebuild, and during the rebuilt system's
+          // pipeline-compile wave frames keep flowing WITHOUT the still-
+          // compiling kernels — the decay (small, compiled) clears the stats
+          // every frame while [E] (200kB, tens of seconds) cannot dispatch
+          // yet, so a single read lands on zeros that mean "compiling", not
+          // "broken". The §12.39 rule verbatim: a probe here needs stability
+          // polling, and all-zeros is an instrument fault until it survives
+          // the wait.
+          let s = await src.readStats(engine.renderer);
+          {
+            const until = performance.now() + 60_000;
+            while ((s.rays?.rays ?? 0) === 0 && performance.now() < until) {
+              await new Promise((resolve) => setTimeout(resolve, 1000));
+              s = await src.readStats(engine.renderer);
+              // Self-reporting, because this poll has already caught one
+              // instrument fault and one real bug wearing its costume: the
+              // worklist count says whether [D5] is appending winners, the
+              // ray total whether the budget ran at all.
+              const wc = new Uint32Array(
+                await engine.renderer.getArrayBufferAsync(src.rayStore.rayWork.value),
+              )[0];
+              const rt = await src.rayFrame.readTotal(engine.renderer);
+              console.log(`GI-SMOKE src poll: statRays=${s.rays?.rays ?? 0} worklist=${wc} rayTotal=${rt} suspended=${engine.renderSuspended}`);
+            }
+          }
           srcReport = {
             dispatches: src.passes.length,
             megabytes: +(s.bytes / 1048576).toFixed(2),
@@ -547,7 +572,10 @@
           if (!(rays.perRay >= 1 && rays.perRay <= src.store.cascadeCount)) {
             throw new Error(
               `src arm: ${rays.perRay.toFixed(2)} deposits per ray is outside [1, ` +
-              `${src.store.cascadeCount}] — the split rule or the ancestor chain is wrong`,
+              `${src.store.cascadeCount}] — the split rule or the ancestor chain is wrong ` +
+              `(rays ${rays.count}, hits ${s.hits}, deposits ${rays.deposits}, ` +
+              `noBlock ${s.noBlock}, shaded ${s.shaded ?? s.rays?.shaded}, ` +
+              `dispatched ${rays.dispatched})`,
             );
           }
           // With no hit shading yet (Phase 5) every deposited radiance is zero,

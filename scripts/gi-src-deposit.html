@@ -332,6 +332,49 @@
           deposit.readStats(renderer),
         ]);
 
+        // ══ ARM 0b: COMPACTION (§12.44) ══════════════════════════════════
+        say("── COMPACT: the worklist [E] IS the classic [E], bit for bit ──");
+        // Same store, same bins, same UNTOUCHED transport frame — the ray
+        // partition is scheduler-dependent, so re-running [D] would change
+        // the synthetic trace's keys and the diff would measure the shuffle,
+        // not the mapping. Both deposits clear at their start (keep = 0), so
+        // each readback holds exactly its own frame. Integer atomics make
+        // the sums order-independent: the compacted pass must reproduce the
+        // classic accumulators EXACTLY, not approximately.
+        const depositCompact = D.createSrcDepositFrame(store, bins, {
+          pixelProbe: frame.pixelProbe,
+          pixelRayBase: rayStore.pixelRayBase,
+          rayWork: rayStore.rayWork,
+          pixelCount: PIXELS,
+          raysPerPixel: RAYS_PER_PIXEL,
+          trace: synthTrace,
+          shadeHit,
+          readPixel, readNormal,
+          camera: vec3(cameraU),
+          spacing0: S0,
+          lmax: lmaxU,
+          jitterX: 0, jitterY: 0,
+        });
+        for (const pass of depositCompact.passes) await renderer.computeAsync(pass);
+        const [scratchC, statsC, workCount] = await Promise.all([
+          renderer.getArrayBufferAsync(bins.scratch.value).then((b) => new Uint32Array(b)),
+          depositCompact.readStats(renderer),
+          renderer.getArrayBufferAsync(rayStore.rayWork.value).then((b) => new Uint32Array(b)[0]),
+        ]);
+        let compactDiff = 0;
+        for (let i = 0; i < scratch.length; i++) {
+          if (scratch[i] !== scratchC[i]) compactDiff++;
+        }
+        let winners = 0;
+        for (let i = 0; i < PIXELS; i++) if (pixelRayBase[i] !== P.SLOT_EMPTY) winners++;
+        check("the worklist holds exactly the winners", workCount === winners,
+          `${workCount} listed vs ${winners} pixels with a ray base`);
+        check("compacted accumulators are bit-identical to classic", compactDiff === 0,
+          `${compactDiff} of ${scratch.length} words differ`);
+        check("compacted deposits equal classic", statsC.deposits === stats.deposits,
+          `${statsC.deposits} vs ${stats.deposits}`);
+        say("");
+
         // ── the mirror, on the GPU's own ray assignment ──────────────────
         const mirrorPixels = [];
         const gpuIndexOf = [];

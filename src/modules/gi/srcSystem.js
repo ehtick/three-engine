@@ -710,11 +710,12 @@ export function createSrcProbeSystem({
     ? createSrcDepositFrame(store, binStore, {
         pixelProbe: frame.pixelProbe,
         pixelRayBase: rayStore.pixelRayBase,
+        // [D5]'s winner worklist — [E] traces densely from it (§12.44); the
+        // stride/phase uniforms below stay because the dispatch SIZE is still
+        // the transport's and a live ceiling change must keep moving it.
+        rayWork: rayStore.rayWork,
         pixelCount,
         raysPerPixel: tier.raysPerPixel,
-        // The SAME mapping srcRays' [D1]/[D5] use — same uniforms, same thread
-        // count. [D5] writes `pixelRayBase` only for the pixels it owns, so a
-        // deposit walking a different set reads an older frame's base.
         stride: strideU,
         phase: phaseU,
         threads: transportThreads,

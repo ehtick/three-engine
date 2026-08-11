@@ -7198,3 +7198,66 @@ its light step — that is the point), alpha probe, and TRACK_AB re-run
   30–60 fps the window covers 36–70 frames ≈ full convergence inside it.
   If a future unit needs the tail gone entirely, the window can retrigger
   while the field's own delta remains large — not built now (R16).
+
+### 12.44 RAY COMPACTION — THE CAP'S RAY CUT FINALLY REACHES THE WALL CLOCK
+
+§12.42 shipped the cap and the user's fps roughly doubled — but the live
+profile (their editor, ultra, 1776×862) read **deposit 19.0 ms for 25,038
+rays**: 760 ns/ray against the 138 the same machine measures when every
+thread traces. The cap cuts RAYS, not WARP OCCUPANCY: at ~19% surviving
+density the winners are SCATTERED over the thread → pixel stride, so
+essentially every 32-wide warp still contains a tracer (1 − 0.81³² ≈ 100%)
+and [E] runs at full width. The cut bought bandwidth, not latency.
+
+The fix is the classic one: a WORKLIST. [D5] — the one place "this pixel
+fires this frame" is decided — appends each winner to `rayWork` (dense,
+atomic cursor, capacity `pixelCount`, cleared in [D0]); [E] traces
+`rayWork[instanceIndex]` and the threads past the count return in WHOLE
+warps, the cheap kind of idle. No indirect dispatch needed: the dispatch
+size stays the transport's baked thread count. Written in [D5] rather than
+a separate pass because a second pass would be a second definition of the
+winner set — the exact class of mismatch the `transportPixel` discipline
+exists to prevent; on the worklist path that hazard DISSOLVES (the list is
+written by [D5] in the same frame, so [E] cannot enumerate a pixel [D5]
+did not own). The classic mapping survives for every gate built before
+compaction: pass neither buffer and [E] is byte-identical to §12.33's.
+
+Gate (`test:gi-src-deposit` ARM 0b): classic and compacted [E] run on the
+SAME untouched transport frame (re-running [D] would reshuffle the
+scheduler-dependent partition and the synthetic trace's keys — the diff
+would measure the shuffle); integer atomics make sums order-independent,
+so the bar is EXACT: worklist = winners (2,108 = 2,108), accumulators
+bit-identical (0 of 14,745,600 words differ), deposits equal. Regression:
+rays, temporal, smoke — green.
+
+#### 12.44.1 THE TWO-BUFFER DRAFT FAILED PIPELINE VALIDATION, AND ONLY THE
+#### SMOKE COULD SEE IT
+
+The first worklist was a list buffer plus a count buffer: +2 storage
+bindings on [E], which sits at **7 of 8** in the smoke's profiled ray-hit
+config (§12.39's own measurement — and the smoke IS the binding-budget
+gate, its header says so). 9 > 8 → pipeline creation fails → **[E]
+silently never dispatches**: the smoke read `0.00 deposits per ray`
+against a worklist provably holding all 10,849 winners, for as long as
+anyone polled. Three instrument layers earned their keep in one failure:
+the deposit gate PASSED (its tiny fixture binds fewer buffers), the
+editor page WORKED (unprofiled [E] had one slot spare — lit 19.9%, caps
+scaling), and only the smoke's profiled config crossed the line. A
+feature that works everywhere but the binding-budget gate is a feature
+that is over the budget.
+
+Fold, don't multiply (R7): `rayWork[0]` is the atomic count, entries
+follow, ONE buffer. [E] compiles at exactly 8/8 in the profiled config
+(the smoke's storage report line), the gate is still bit-exact
+(2,108 = 2,108 winners, 0 of 14.7M words differ), deposits 1.394/ray.
+The smoke's src-arm read also gained the §12.39 stability poll with
+self-reporting (statRays/worklist/rayTotal per second) — the zeros-vs-
+full-worklist line is what turned "the split rule is wrong" into "the
+pipeline never compiled" in one read.
+
+Harness cap sweep with compaction (ultra, Sponza, 315,952 px — the
+floor-dominated pose, so the RATIO is the message): cap 16 deposit
+2.128 ms vs off 4.363 ms — **2.05× where §12.40.4 measured 1.62×** — and
+cap 8 ≈ cap 16 says what remains is the floor, not rays. The user-editor
+number (19 ms deposit for 25k rays, the unit's whole motivation) owes its
+re-measurement after their next reload.
