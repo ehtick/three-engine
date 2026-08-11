@@ -78,6 +78,12 @@ function pageHook() {
         fns: (code.match(/fn\s+([A-Za-z0-9_]+)/g) ?? []).slice(0, 8).join(","),
         loops: code.split("loop {").length - 1,
         branches: code.split("if (").length - 1,
+        // The SOURCE, kept so the slow kernel can be lifted out of the editor
+        // and compiled on its own. A cold boot costs 2-5 minutes and the same
+        // kernel has measured 47s, 109s, 132s, 182s and 238s depending on what
+        // else the machine was doing — that is not an instrument you can bisect
+        // a compiler pathology with. One WGSL string in a bare page is.
+        code,
       });
     } catch { /* frozen */ }
     return mod;
@@ -105,6 +111,18 @@ function pageHook() {
           at: start - rec.t0,
           ms: 0,
         };
+        // Held on the record, NOT on the entry: `rec.pipelines` is serialised
+        // back to node in one go, and 75 kernels of source would make every
+        // read of the summary move megabytes. The dump fetches one by id.
+        //
+        // ⚠ Keyed by a COUNTER, not by `rec.pipelines.length`. Entries are
+        // pushed on COMPLETION and async compiles finish out of order, so the
+        // array length at creation time is not this entry's final index — it
+        // would hand back another kernel's source, which is the worst possible
+        // failure for an instrument whose whole job is naming the right one.
+        rec.sources ??= new Map();
+        entry.id = rec.nextId = (rec.nextId ?? 0) + 1;
+        rec.sources.set(entry.id, info?.code ?? "");
         if (suffix !== "Async") {
           const out = raw.call(this, desc);
           entry.ms = performance.now() - start;
@@ -214,6 +232,26 @@ async function runArm(arm) {
   await wait(2000);
 
   const pipelines = await page.evaluate(() => globalThis.__giBootProbe?.pipelines ?? []);
+  // ── LIFT THE SLOW KERNEL OUT OF THE EDITOR ────────────────────────────────
+  //
+  // Fetched by id BEFORE the browser closes, and only the one asked for. With
+  // the WGSL on disk, `probe:wgsl-compile` can time this exact shader in a bare
+  // page in seconds — which is the difference between bisecting a compiler
+  // pathology and guessing at it, given the same kernel has measured anywhere
+  // from 47s to 238s depending on machine load.
+  if (process.env.DUMP) {
+    const worst = pipelines.reduce((a, p) => (p.ms > (a?.ms ?? -1) ? p : a), null);
+    if (worst?.id != null) {
+      const code = await page.evaluate((id) => globalThis.__giBootProbe?.sources?.get(id) ?? "", worst.id);
+      if (code) {
+        const out = path.resolve(process.env.DUMP);
+        fs.writeFileSync(out, code, "utf8");
+        console.log(`\n  dumped slowest kernel (${Math.round(code.length / 1024)}kB) → ${out}`);
+      } else {
+        console.log(`\n  DUMP: no source recorded for pipeline id ${worst.id}`);
+      }
+    }
+  }
   await browser.close();
 
   const stages = {};

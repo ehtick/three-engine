@@ -5868,3 +5868,127 @@ as steps. The candidates, in order of how well they fit the mechanism:
 
 (1) is the one that serves both of the user's stated requirements. It is a Phase 6
 cost-model change, not a Phase 5 unit, and is recorded here rather than started.
+
+#### 13.14.2 It is NOT the reflection prepass — and the A/B that refuted it also
+#### showed why every boot measurement so far is untrustworthy
+
+The kernel's function set (`giStaticBvh8`, `giDynBvh8`, `giDynShapeHit`,
+`giFreeRadius…`) is the same one §13.13 attributed to the shadow marcher and
+§13.13.2 to `bvhReflect` — both descend the same BVH, so the fingerprint does not
+distinguish them. The scene's own material buckets made reflections the obvious
+suspect: **`0 mirror, 1 specular, 27 diffuse-only, 0 dynamic-roughness`**, and
+`exactReflections` is derived from `quality`, so high/ultra turns the prepass on
+whether or not any material consumes it. Exactly the shadow-chain pattern.
+
+`FLAGS='{"__giNoBvhReflections":true}'` (new, `probe:gi-boot`) tests it without a
+code change (R12):
+
+```
+                            reflections ON        reflections OFF
+  slowest single pipeline        109,409 ms            237,990 ms
+  its fingerprint            77kB, 4 loops         77kB, 4 loops   ← unchanged
+  TTFF                           113,469 ms            259,048 ms
+  a TYPICAL other pipeline         ~1,800 ms             ~15,500 ms
+```
+
+**REFUTED.** The kernel compiles with the reflection prepass disabled, so it
+belongs to neither reflections nor shadows — both of which are now excluded from
+this boot. `giDynTrace00100` decodes as `pen=0, penWidth=0, meshes=1, excl=0,
+objId=0` (`dynamicObjects.js` `trace()`), a plain nearest-exact-hit query, and it
+sits next to `giFreeRadius4nsr1_3` — the occupancy marcher. That pairing is the
+`hybrid-exact-complex` ray-hit path the boot log reports as active: **march the
+field, resolve the hit exactly.** It is the main GI trace, it has no consumer to
+switch off, and it must run.
+
+⚠ **THE TWO ARMS ABOVE ARE NOT COMPARABLE, AND THE ROW THAT SAYS SO IS THE LAST
+ONE.** Every *other* pipeline in the second run read ~15.5 s against ~1.8 s in the
+first — 8.6x, uniformly, on kernels the flag does not touch. §13.3 already
+recorded why: `createComputePipelineAsync` returns LATENCY, and the driver
+serializes, so a slower monster inflates every number in the same process. The
+only claim the A/B supports is the within-run one — *the kernel is still there* —
+and the 109 → 238 s figure is not evidence of anything.
+
+Same kernel, five measurements, one machine: **47 s / 109 s / 132 s / 182 s /
+238 s.** Any conclusion drawn from a single cold boot compared against a
+remembered number is worthless, and several in §13.13 were.
+
+#### 13.14.3 `probe:wgsl-compile` — the instrument the rest of this needs
+
+A 5-minute run with 5x spread cannot bisect a compiler pathology. `DUMP=<path>`
+on `probe:gi-boot` writes the slowest kernel's WGSL to disk (keyed by a creation
+COUNTER, not by array position — async pipelines resolve out of order and the
+length-at-creation would hand back a different kernel's source), and
+`probe:wgsl-compile <file.wgsl> [more…]` compiles it in an empty page: no engine,
+no other pipelines, a fresh profile so §13.5's 72x shader cache cannot answer for
+it, `getCompilationInfo()` checked first so a validation failure cannot be
+reported as a fast compile.
+
+⚠ Its absolute number is NOT the editor's — no engine bind-group layout, nothing
+else competing. It exists for RATIOS between variants of the same shader, which
+is the only comparison the fix needs.
+
+#### 13.14.4 THE KERNEL, BISECTED — AND WHY R18 IS NOT REACHABLE BY TRIMMING IT
+
+`probe:wgsl-compile`, 3 reps each, all arms in ONE process. Within-file spread is
+**under 2%** once each rep gets unique source text (see the trap below), which is
+the first time anything in §13 has been precise enough to bisect with.
+
+| arm | median | vs baseline |
+|---|---|---|
+| baseline (as dumped) | 11,886 ms | — |
+| `giDynBvh8` body stubbed | 12,069 ms | **no change** |
+| stack `array<u32,44>` → 16 | 12,272 ms | **no change** |
+| stack `array<u32,44>` → 8 | 12,332 ms | **no change** |
+| `giStaticBvh8` body stubbed | 6,833 ms | −43% |
+| both descents stubbed | 6,680 ms | −44% |
+
+Then, holding everything else byte-identical and stubbing call sites one at a
+time — 4 / 3 / 2 / 1 / 0 inlinings of `giStaticBvh8`:
+
+```
+  11,814ms   11,704ms   9,739ms   8,526ms   6,938ms
+```
+
+**THE LEVER IS THE NUMBER OF INLINED DESCENTS, ~1.2 s EACH.** `giStaticBvh8` has
+**four** call sites at lines 2559 / 2704 / 2849 / 2994 — 145 lines apart, identical
+arguments, variable numbering in strides of 40, sitting next to four calls to
+`srcShadowWidthProbe`. That is **the 4-light shadow loop, unrolled at TSL graph-build
+time**, each copy inlining a whole 2-nested-loop BVH8 descent. `giDynBvh8` has one
+call site and costs nothing measurable, which is the same finding from the other
+direction.
+
+⚠ **NOT the traversal stack.** `array<u32, 44>` looked like the classic
+dynamically-indexed-local-array pathology and it is not: 44 → 16 → 8 moves nothing.
+An earlier single-rep run said 16 and 8 were **2.4× SLOWER**, which was noise.
+
+⚠ **EVERY REP NEEDS UNIQUE SOURCE TEXT.** The first isolated run read 28,087 ms
+then 13 ms for the same file — the device answers a byte-identical module from its
+in-process cache, so reps 2..N time the cache and the median of `[28087, 13]` is
+meaningless. Fixed with a trailing `// rep N` comment, which changes the string and
+not one instruction of the result. ⚠ And `about:blank` is not a secure context, so
+the first version reported `no navigator.gpu` — which reads as "this machine has no
+WebGPU" rather than "this page may not have it". It serves a blank page from
+127.0.0.1 now.
+
+##### The conclusion R18 has to absorb
+
+Rolling that light loop is worth **~3.7 s of 11.8 s (31%)** on this kernel, and it
+is worth doing. But **stubbing BOTH BVH descents entirely still leaves 6.9 s**, for
+ONE kernel, in an empty page with nothing else competing. R18's budget is 1 s for
+all of GI.
+
+**So this kernel cannot be trimmed into the budget, and no further diet on it
+should be attempted on the theory that it can.** The remaining candidates are
+architectural, and each needs its own measurement before it is believed:
+
+1. **Persistent compiled-pipeline cache.** §13.5 measured Chrome's own at 72× when
+   it engages, and §13.10 measured it engaging 44× with TTFF unmoved — so "the
+   cache works" and "the cache helps startup" are separate claims and the second
+   one is currently false. Why is the open question.
+2. **Boot on a cheaper ray-hit mode and upgrade in the background** (R1 ramp).
+   `hybrid-exact-complex` is one rung of an existing ladder; if a lower rung
+   compiles in ~1 s, GI is correct-but-coarse immediately and sharpens when the
+   exact pipeline lands. This is the only candidate that reaches ≤1 s *by
+   construction* rather than by hoping a compiler gets faster.
+3. Fewer boot-time kernels — Phase 7's deletion sweep, whose value here is now
+   measurable rather than assumed.

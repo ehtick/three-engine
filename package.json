@@ -115,6 +115,7 @@
     "probe:gi-emissive-cost": "node scripts/run-gi-emissive-cost.mjs",
     "probe:gi-emitter-cap": "node scripts/run-gi-emitter-cap.mjs",
     "probe:gi-boot": "node scripts/run-gi-boot-probe.mjs",
+    "probe:wgsl-compile": "node scripts/run-wgsl-compile-probe.mjs",
     "probe:gi-block-size": "node scripts/run-gi-block-size.mjs",
     "probe:gi-falloff": "node scripts/run-gi-bleed.mjs",
     "test:gi-emitter-shapes": "node scripts/run-gi-emitter-shapes-test.mjs",
