@@ -1614,6 +1614,11 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
      * anything changed (the caller mixes `version` into the wake hash).
      */
     sync(sweptExpand = 0.5) {
+      // Largest per-frame mover translation, metres — consumed by SRC's
+      // motion-adaptive α (§12.38) as the occluder half of "is the scene
+      // moving". Reset on every path, including the empty ones, or a released
+      // last mover would leave the scene reading "moving" forever.
+      this.lastMotion = 0;
       if (!enabled) return false;
       if (entries.size === 0) {
         // A released-last-object header still has to reach the GPU, or the
@@ -1629,6 +1634,17 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
         if (!moved) entry.restFrames = (entry.restFrames ?? 0) + 1;
         if (moved) {
           entry.restFrames = 0;
+          const pe = entry.prev.elements, me = M.elements;
+          // Translation, plus rotation expressed as CORNER displacement
+          // (basis-column delta × the largest half-extent) — a box spinning in
+          // place translates nothing yet re-shadows everything around it, and
+          // the rotating-cube arm is this module's named worst case (§12.24).
+          const rotDelta = Math.hypot(me[0] - pe[0], me[1] - pe[1], me[2] - pe[2]) *
+            Math.max(entry.halfExtents.x, entry.halfExtents.y, entry.halfExtents.z);
+          this.lastMotion = Math.max(
+            this.lastMotion,
+            Math.hypot(me[12] - pe[12], me[13] - pe[13], me[14] - pe[14]) + rotDelta,
+          );
           entry.prev.copy(M);
           // obbWorld = M × translate(center): the local box becomes symmetric
           // ±halfExtents around the object-space origin.

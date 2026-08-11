@@ -35,6 +35,7 @@ import { resolveMaterialSurface, serializeMeshForBake } from "./voxelizeOnce.js"
 import { createSrcVolume } from "./srcVolume.js";
 import { createSrcDistanceView, createSrcOccupancyView } from "./srcDebugViews.js";
 import { createSrcProbeSystem, describeSrcProbeSystem, formatSrcProbeFrame, srcProbesEnabled, srcShadeEnabled } from "./srcSystem.js";
+import { ALPHA_MOTION_SAT } from "./srcConfig.js";
 import { createSrcSurfaceAttribution } from "./srcSurface.js";
 import { createOccupancyField, describeOccupancyField, quantizeOccupancyRes } from "./occupancyField.js";
 import { BVH_STRATEGY, buildStaticSceneBvhWords, classifyDynamicShape, composeFieldDynamics, createDynamicObjectSet, dynHeaderWords, giMobilityOf, giTraceOf } from "./dynamicObjects.js";
@@ -1351,31 +1352,28 @@ export class GISystem {
     // moving (a rotating sun makes every pixel's history semantically stale;
     // position validation can't see that, so the system flushes instead —
     // grain during rotation, converges the moment it stops).
-    // (Analytic-width arm: `_giShadowFrameU` is never created, the whole
-    // block compiles out of the frame — no motion tracking, no phase.)
-    if (state.screen?.lightShadowPass && this._giShadowFrameU) {
-      const camera = this.engine.camera;
-      if (camera) {
-        if (this._giPrevVPStore) this._giShadowPrevVPU.value.copy(this._giPrevVPStore);
-        (this._giPrevVPStore ??= new THREE.Matrix4()).multiplyMatrices(
-          camera.projectionMatrix,
-          camera.matrixWorldInverse,
-        );
-      }
-      // VELOCITY-SCALED MEMORY. Moving lights are the DESIGN CASE here, not
-      // an edge case — the user's sun is script-driven ("we never meant to
-      // do those lights static"). Two earlier designs failed it: a flush on
-      // any transform change turned a per-frame script write into a
-      // PERMANENT flush (accumulation never engaged — the "grainy, dirty,
-      // hard dithered edge" trio is the un-accumulated estimator), and a
-      // binary moved/still split would still gut the memory for a slow day
-      // cycle whose shadow edge moves sub-pixel per frame. A moving light
-      // only makes history STALE, never wrong-surface, so the memory depth
-      // follows the measured angular velocity: imperceptible motion keeps
-      // ~32 effective sun samples (0.94), a fast gizmo drag drops to ~7
-      // (0.86 → a few frames of trailing softness on the sweeping edge,
-      // the standard real-time-shadows trade). Intensity changes are
-      // deliberately ignored — the shadow factor is pure visibility.
+    // VELOCITY-SCALED MEMORY. Moving lights are the DESIGN CASE here, not
+    // an edge case — the user's sun is script-driven ("we never meant to
+    // do those lights static"). Two earlier designs failed it: a flush on
+    // any transform change turned a per-frame script write into a
+    // PERMANENT flush (accumulation never engaged — the "grainy, dirty,
+    // hard dithered edge" trio is the un-accumulated estimator), and a
+    // binary moved/still split would still gut the memory for a slow day
+    // cycle whose shadow edge moves sub-pixel per frame. A moving light
+    // only makes history STALE, never wrong-surface, so the memory depth
+    // follows the measured angular velocity: imperceptible motion keeps
+    // ~32 effective sun samples (0.94), a fast gizmo drag drops to ~7
+    // (0.86 → a few frames of trailing softness on the sweeping edge,
+    // the standard real-time-shadows trade). Intensity changes are
+    // deliberately ignored — the shadow factor is pure visibility.
+    //
+    // HOISTED out of the shadow-pass gate below (§12.38): SRC's motion-
+    // adaptive α reads the same measurement, in scenes where no light asks
+    // for gi shadows at all. ONE computation on purpose — the WeakMap prev is
+    // CONSUMED by the delta (each read overwrites it), so a second loop
+    // "for SRC" would read zeros forever and the two memories would disagree
+    // about whether the scene is moving.
+    {
       let motion = 0;
       this._giShadowLightPrev ??= new WeakMap();
       for (const light of this._lightObjects ?? []) {
@@ -1396,6 +1394,20 @@ export class GISystem {
         prev.pos.set(e[12], e[13], e[14]);
         prev.seeded = true;
       }
+      this._giShadowLastMotion = motion;
+    }
+    // (Analytic-width arm: `_giShadowFrameU` is never created, the whole
+    // block compiles out of the frame — no phase, no history weights.)
+    if (state.screen?.lightShadowPass && this._giShadowFrameU) {
+      const camera = this.engine.camera;
+      if (camera) {
+        if (this._giPrevVPStore) this._giShadowPrevVPU.value.copy(this._giPrevVPStore);
+        (this._giPrevVPStore ??= new THREE.Matrix4()).multiplyMatrices(
+          camera.projectionMatrix,
+          camera.matrixWorldInverse,
+        );
+      }
+      const motion = this._giShadowLastMotion ?? 0;
       const temporalOn = globalThis.__giShadowTemporal !== false;
       // DEDICATED phase counter — NOT `this._frame`, which is a scan-cadence
       // counter that #queueRebakeCheck RESETS to -1 on every change event. A
@@ -1407,7 +1419,6 @@ export class GISystem {
       // filthy, exactly the user's "still grainy" verdict.
       this._giShadowPhase = ((this._giShadowPhase ?? 0) + 1) % 4096;
       this._giShadowFrameU.value = temporalOn ? this._giShadowPhase : 0;
-      this._giShadowLastMotion = motion;
       this._giShadowHistWeightU.value = temporalOn
         ? Math.min(0.94, Math.max(0.86, 0.94 - motion * 30))
         : 0;
@@ -3166,6 +3177,24 @@ export class GISystem {
           srcProbes = createSrcProbeSystem({
             gbuffer, width, height, props: this.config, volume, sky: skyRadiance,
             surfaces,
+            // ── MOTION-ADAPTIVE α's SIGNAL (§12.38) ─────────────────────
+            //
+            // Normalized [0,1]; 1 = "fully moving", where α sits at the
+            // TEMPORAL_ALPHA every §12 measurement used. Three sources, all
+            // computed once per frame by machinery that already existed:
+            // the light-motion loop (hoisted from the shadow chain — radians,
+            // normalized by the same saturation its hist-weight uses), the
+            // emitter slots' own decayed retains (already [0,1]), and the
+            // mover set's largest translation+corner displacement (metres,
+            // through the light loop's own 5 cm ≈ 1° folding). The CAMERA is
+            // deliberately absent: probe evidence is world-anchored, so a
+            // camera move stales nothing and must not cost the still scene
+            // its calm.
+            sceneMotion: () => Math.min(1, Math.max(
+              (this._giShadowLastMotion ?? 0) / ALPHA_MOTION_SAT,
+              this._giEmitterLastMotion ?? 0,
+              ((this._dynSet?.lastMotion ?? 0) * 0.05) / ALPHA_MOTION_SAT,
+            )),
             lighting: surfaces
               ? {
                   // The engine's punctual lights, straight through — same slots
@@ -6138,6 +6167,15 @@ export class GISystem {
           )
         : 1;
     }
+    // SRC's motion-adaptive α (§12.38) reads the emitter half of "is the
+    // scene moving" from the same per-slot retains the emitter history uses —
+    // one definition of emitter motion, two consumers. Already [0,1] and
+    // already decayed (0.6/frame at rest), so it needs no normalization.
+    let emitterMotion = 0;
+    for (const slot of state.emitterSlots) {
+      emitterMotion = Math.max(emitterMotion, slot.moved.value ?? 0);
+    }
+    this._giEmitterLastMotion = emitterMotion;
   }
 
   // -------------------------------------------------------------------------

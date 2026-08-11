@@ -48,6 +48,17 @@ const ROTATE = process.env.ROTATE === "1";
 const SRC = process.env.SRC === "1";
 const ALPHA_AB = process.env.ALPHA_AB === "1";
 const CEILING_AB = process.env.CEILING_AB === "1";
+// ALPHA_SWEEP="0.1,0.05,0.02" — interleaved arms at several α values, both
+// still and moving, in ONE page. Exists to answer the mechanism question the
+// CEILING_AB left open (§12.32): the still-scene instability is nearly
+// stride-independent, and Phase 5's hit shading multiplied per-ray variance
+// (binary shadow-visibility flips at <1 ray/bin/frame) after §12.23 tuned
+// α=0.1 against transmittance-only deposits. If still-arm flicker falls with
+// α while the moving arm's step p95 holds (real geometric signal), the base
+// flicker is VARIANCE and α is the lever; if it doesn't fall, the churn is
+// structural (bin membership) and α is not the lever.
+const ALPHA_SWEEP = (process.env.ALPHA_SWEEP ?? "")
+  .split(",").map(Number).filter((x) => x > 0 && x <= 1);
 // Low enough to force a LARGE stride at this harness's resolution — the regime
 // the user's editor is in (stride 7) and the one the per-frame decay had to be
 // corrected for. The tier default here produces stride 2, which barely
@@ -428,6 +439,35 @@ if (CEILING_AB) {
     ceilRounds.push({ tight, dflt, tightT, dfltT });
   }
 }
+// ── THE α SWEEP, SAME DISCIPLINE ────────────────────────────────────────────
+// Round 2 walks the α list in REVERSE so a slow page drift loads each α at
+// both ends of the run — the same cancellation the interleave buys the two-arm
+// A/Bs above. The stride is CONSTANT across these arms (the ceiling is not
+// touched), so refresh rates are identical and the raw counts compare
+// directly — none of the per-refresh normalization the ceiling A/B needs.
+const alphaRounds = [];
+if (ALPHA_SWEEP.length) {
+  for (let r = 0; r < 2; r++) {
+    const order = r % 2 === 0 ? ALPHA_SWEEP : [...ALPHA_SWEEP].reverse();
+    const round = {};
+    for (const a of order) {
+      await setAlpha(a);
+      await wait(300);
+      // ⚠ A FULL DISCARDED ARM AFTER EVERY α SWITCH, not just body()'s 30-frame
+      // warmup. The accumulator re-equilibrates over ~1/α REFRESHES — at
+      // α=0.02 and stride 3 that is ~150 frames, 5× the warmup — and the first
+      // sweep measured the transient as flicker: the α=0.02 row read a step
+      // p95 of 26 LUMINANCE UNITS with a 7.7× round-to-round spread, which is
+      // an equilibration wave, not instability. The α=0.05 rows agreed at 6%
+      // BECAUSE 1/α was inside the warmup there. 240 discarded frames cover
+      // 3× the slowest time constant this sweep reaches.
+      await measure(0, false);
+      round[a] = { moving: await measure(AMP, ROTATE), still: await measure(0, false) };
+    }
+    alphaRounds.push(round);
+  }
+  await setAlpha(undefined);
+}
 
 
 console.log(`\n=== PER-FRAME FLICKER (${result.width}x${result.height}, ${result.frames} frames, ${ROTATE ? "ROTATING box 2-axis 0.6rad/s" : "sub-voxel mover"}) ===`);
@@ -573,6 +613,34 @@ if (ceilRounds.length) {
     console.log(`     source; the residual ${dfltPR.toFixed(3)} reversals and ${dfltP95.toFixed(4)} step per refresh are`);
     console.log("     what a refresh costs at this sample count, i.e. MONTE CARLO NOISE.");
   }
+}
+
+// ── THE α SWEEP VERDICT ─────────────────────────────────────────────────────
+// Stride is constant across these arms, so raw counts compare directly. What
+// each column means: still reversals = the base instability (variance if it
+// falls with α, structural churn if it does not); moving step p95 = the real
+// geometric signal (if α eats IT, smoothing is trading ghosting for calm).
+if (alphaRounds.length) {
+  console.log(`
+=== ALPHA SWEEP (still + moving per α, interleaved x${alphaRounds.length}, round 2 reversed) ===`);
+  console.log("  α        still rev/px (r1/r2)   still p95 (r1/r2)     moving rev/px   moving p95 (r1/r2)");
+  for (const a of ALPHA_SWEEP) {
+    const r = alphaRounds.map((round) => round[a]);
+    console.log(
+      `  ${String(a).padEnd(7)} ${r.map((x) => x.still.meanReversals.toFixed(3)).join(" / ").padEnd(21)} ` +
+      `${r.map((x) => x.still.stepP95.toFixed(4)).join(" / ").padEnd(21)} ` +
+      `${r.map((x) => x.moving.meanReversals.toFixed(3)).join(" / ").padEnd(15)} ` +
+      `${r.map((x) => x.moving.stepP95.toFixed(4)).join(" / ")}`);
+  }
+  const meanOf = (a, f) => alphaRounds.reduce((s, round) => s + f(round[a]), 0) / alphaRounds.length;
+  const hi = ALPHA_SWEEP[0], lo = ALPHA_SWEEP[ALPHA_SWEEP.length - 1];
+  const stillFall = meanOf(hi, (x) => x.still.meanReversals) / Math.max(1e-9, meanOf(lo, (x) => x.still.meanReversals));
+  const signalHold = meanOf(lo, (x) => x.moving.stepP95) / Math.max(1e-9, meanOf(hi, (x) => x.moving.stepP95));
+  console.log(`
+  still reversals fall ${stillFall.toFixed(2)}x from α=${hi} to α=${lo}; ` +
+    `moving step p95 at α=${lo} is ${(signalHold * 100).toFixed(0)}% of α=${hi}'s`);
+  console.log("  (fall >> 1 with p95 held ⇒ variance-driven flicker, α is the lever;");
+  console.log("   fall ≈ 1 ⇒ structural churn — look at MIN_WEIGHT membership, not α)");
 }
 
 await browser.close();

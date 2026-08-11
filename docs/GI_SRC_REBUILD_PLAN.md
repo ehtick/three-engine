@@ -6498,3 +6498,125 @@ Also retired quietly: `run-gi-emissive.mjs`'s arms set the `emissiveShadows`
 COMPONENT PROP, which the one-property collapse turned into a no-op — its
 off/on arms have measured the same configuration since then. The new probe
 uses `__giConfigOverride`, which is the only remaining way to force the value.
+
+### 12.38 THE FLICKER IS VARIANCE, AND α BECOMES A FUNCTION OF SCENE MOTION
+
+User ask 2 of 3 (2026-08-11): "notice that light flickers." §12.32 had already
+established the stride is NOT the source (per-refresh instability is nearly
+stride-invariant, and the STILL control out-flickers the moving arm), and its
+frequency-band reframing pointed at Phase 6's re-pricing as the fix. Before
+building a scheduler, this unit asked the cheaper question first: what IS the
+still-scene instability?
+
+#### 12.38.1 The suspicion, and why the schedule survived
+
+The §12.32.1 story ("stride moves each pixel's refresh into the eye's 5–15 Hz
+band") quietly assumes a pixel's VALUE refreshes when its own rays fire. It
+does not: a pixel reads its probe's accumulators through a 4.5-probe gather,
+and a typical Sponza c0 probe covers ~55 gbuffer pixels whose linear indices
+span every stride residue class — so the accumulators of a well-covered probe
+receive evidence EVERY frame at any shipping stride. Only small-footprint
+probes (silhouettes, grazing surfaces) skip frames. The stride was convicted
+on a mechanism most probes don't have; what §12.32 measured as "+35% per
+refresh, small" is what it was.
+
+The alternative suspect: **Phase 5 multiplied per-ray variance.** §12.23 tuned
+α = 0.1 against transmittance-only deposits — every deposit 0 or 1, variance
+bounded. Hit shading made a deposit's radiance depend on a binary sun-shadow
+ray and a one-sample NEE draw, at ~0.7 rays/bin/frame — and nobody re-measured
+α after the estimator under it changed.
+
+#### 12.38.2 ALPHA_SWEEP — and the settle arm that saved it from itself
+
+`run-gi-flicker-frame.mjs` grew `ALPHA_SWEEP="0.1,0.05,0.02"`: still + moving
+arms per α, interleaved ×2 with round 2 walking the list in reverse, all in ONE
+page (`__giSrcAlpha` is polled per frame — the same property that made the
+ceiling A/B possible).
+
+⚠ **THE FIRST SWEEP MEASURED THE ACCUMULATOR'S OWN RE-EQUILIBRATION AND CALLED
+IT FLICKER.** After an α switch the sums converge over ~1/α refreshes — ~150
+frames at α = 0.02 and stride 3, five times `body()`'s 30-frame warmup. The
+α = 0.02 row read a step p95 of **26 luminance units** with a 7.7× round
+spread; the α = 0.05 rows agreed at 6% only because 1/α fit inside the warmup
+there. One full discarded measure (240 frames) after every switch fixed it —
+and the fixed rows agree across rounds at 3–9%:
+
+```
+α        still rev/px   still p95   moving rev/px   moving p95
+0.1      4.32           0.25        4.48            0.49
+0.05     1.15  (÷3.75)  0.61        1.64            0.67
+0.02     0.40  (÷10.9)  0.82        0.92            0.63
+```
+
+**The still-scene shimmer falls monotonically with α — it is MONTE CARLO
+VARIANCE, and α is the lever.** The rising per-change p95 is a selection
+effect: at low α most changes drop below the instrument's 0.002 threshold, and
+the counted set shrinks toward the sparse structural events α cannot touch —
+§12.24's bin-membership floor, a separate and already-named debt. The moving
+arms get calmer too (4.48 → 1.64 rev/px at 0.05) at a modest +35% step p95.
+
+#### 12.38.3 The fix: velocity-scaled α, on the shadow chain's own precedent
+
+Flat 0.05 would double every convergence lag; flat 0.02 would put a light
+toggle at ~2.5 s. The light-shadow chain already solved this exact tension —
+"VELOCITY-SCALED MEMORY", whose comment records why a flush-on-change and a
+binary moved/still split both failed a script-driven sun — so SRC's α takes
+the same shape:
+
+    α = ALPHA_STILL + m · (TEMPORAL_ALPHA − ALPHA_STILL),   m ∈ [0,1]
+
+- `TEMPORAL_ALPHA_STILL = 0.05` (srcConfig, with the sweep table in its
+  docstring); `TEMPORAL_ALPHA = 0.1` unchanged — a fully-moving scene runs at
+  exactly the α every §12 measurement used.
+- `m` = max of three normalized sources, each computed once per frame by
+  machinery that already existed: the light-motion loop (HOISTED out of the
+  shadow-pass gate — one computation, because the WeakMap prev is consumed by
+  the delta and a second loop would read zeros forever), the emitter slots'
+  own decayed `moved` retains, and the mover set's largest per-frame
+  displacement (translation + basis-column delta × half-extent, so a box
+  spinning in place — §12.24's named worst case — registers).
+- **The camera is deliberately NOT a source.** Probe evidence is
+  world-anchored; a camera move changes which probes are visible, not what
+  they know. Charging the still scene for looking around would forfeit the
+  3.75× for nothing.
+- All CPU: `readAlpha()` was already polled per frame and already feeds the
+  §12.32 stride-root (`keep = (1−α)^(1/S)`), so the adaptive value composes
+  with the ceiling with no kernel or uniform changes. `__giSrcAlpha` outranks
+  the ramp (R12) — the sweep itself depends on that. A standalone gate that
+  passes no `sceneMotion` gets flat TEMPORAL_ALPHA: every pre-existing gate
+  measures exactly what it measured before (`test:gi-src-temporal` re-run
+  green).
+- Known blind spot, stated: INTENSITY changes are invisible to all three
+  sources (the light loop reads matrices only), so a lamp toggling in a still
+  scene converges at the 0.05 floor — ~1 s. That is the argument for 0.05
+  over 0.02; an intensity-delta joining the signal is what unlocks the
+  remaining 2.9×.
+
+#### 12.38.4 Verified — the ramp lands where it predicts, in one page
+
+Re-run with the ADAPTIVE default as the base arms and pinned `__giSrcAlpha`
+rows as in-page references (the pinned rows also prove the hatch still
+outranks the ramp):
+
+```
+pinned 0.1:   still 4.42 rev/px    moving 4.60      (matches the sweep: 4.32/4.48)
+pinned 0.05:  still 1.20           moving 1.68      (matches: 1.15/1.64; fall 3.69×)
+ADAPTIVE:     still 1.49           moving 2.29
+```
+
+The adaptive still arm sits at the 0.05 floor (its +0.3 over the pinned row is
+the moving→still transition tail — the base arms have no discarded settle arm
+between them). The adaptive moving arm lands BETWEEN the pinned rows exactly
+as the ramp predicts for a ~13 mm/frame mover (m ≈ 0.24 → α ≈ 0.062). Against
+the old flat 0.1, the shipped behaviour is **~3× calmer still and ~2× calmer
+even while moving**.
+
+`eyecheck:gi-src` after the change: shading gain 4.696×, shadow cost 0.243×,
+footgun 1.083×, toggle path 1.018× — all in band, nave pose renders correctly.
+`test:gi-src-temporal` green (it pins its own α; standalone gates get flat
+TEMPORAL_ALPHA by construction).
+
+Still open after this unit, in flicker terms: the STRUCTURAL residue (§12.24's
+bin-membership floor — the sparse pops that dominate the counted set at low
+α), and §12.32's option (1) transport re-pricing, which is now a PERF unit
+rather than a flicker unit.

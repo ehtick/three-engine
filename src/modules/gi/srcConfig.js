@@ -105,6 +105,44 @@ export const SECONDARY_LOD_OFFSET = 2;
  */
 export const TEMPORAL_ALPHA = 0.1;
 
+/**
+ * The α a STILL scene settles to (§12.38). The shipping α is a continuous ramp
+ * `ALPHA_STILL + motion·(TEMPORAL_ALPHA − ALPHA_STILL)` driven by a scene-motion
+ * signal (lights + emitters + movers, NOT the camera — probe evidence is
+ * world-anchored, so a camera move stales nothing), the exact velocity-scaled-
+ * memory shape the GI light-shadow chain already ships and for the same two
+ * measured reasons: a flush-on-change guts the memory under a per-frame script
+ * write, and a binary moved/still split guts it for slow motion.
+ *
+ * The value is from `run-gi-flicker-frame.mjs`'s ALPHA_SWEEP (still + moving
+ * arms, interleaved ×2 with a full discarded settle arm per α switch — without
+ * the settle arm the sweep measures the accumulator's own ~1/α-refresh
+ * re-equilibration and calls it flicker):
+ *
+ *     α       still rev/px   still p95   moving rev/px   moving p95
+ *     0.1     4.32           0.25        4.48            0.49
+ *     0.05    1.15 (÷3.75)   0.61        1.64            0.67
+ *     0.02    0.40 (÷10.9)   0.82        0.92            0.63
+ *
+ * The still-scene shimmer is VARIANCE (it falls monotonically with α); the
+ * rising per-change p95 is the counted set shrinking to the sparse structural
+ * events α cannot touch (§12.24's bin-membership floor — a separate, named
+ * debt). 0.05 rather than 0.02 because the still floor still governs how fast
+ * a light TOGGLE converges (intensity changes are invisible to the motion
+ * signal): ~1 s at 0.05 and stride 3 against ~2.5 s at 0.02. The extra 2.9× is
+ * headroom for when an intensity-delta joins the motion signal.
+ */
+export const TEMPORAL_ALPHA_STILL = 0.05;
+
+/**
+ * The motion at which the α ramp saturates at TEMPORAL_ALPHA — derived from
+ * the light-shadow chain's own saturation ((0.94 − 0.86)/30 in its hist-weight
+ * formula), so "moving" means the same thing to both temporal memories. In the
+ * signal's units: ~0.0027 rad of light swing, an emitter retain of 1, or a
+ * ~5.3 cm/frame mover translation.
+ */
+export const ALPHA_MOTION_SAT = (0.94 - 0.86) / 30;
+
 /** Frames a probe survives unseen before the per-frame rebuild stops re-inserting it. */
 export const PROBE_MAX_AGE = 60;
 

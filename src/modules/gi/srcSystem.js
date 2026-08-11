@@ -50,7 +50,8 @@
 import * as THREE from "three/webgpu";
 import { float, ivec2, step, texture, uint, uniform, vec3 } from "three/tsl";
 import {
-  CASCADE_COUNT, MAX_LODS, SRC_QUALITY, TEMPORAL_ALPHA, W0, srcQualityTier, srcTransportRays,
+  CASCADE_COUNT, MAX_LODS, SRC_QUALITY, TEMPORAL_ALPHA, TEMPORAL_ALPHA_STILL, W0,
+  srcQualityTier, srcTransportRays,
 } from "./srcConfig.js";
 import { createSrcProbeGizmos } from "./srcGizmos.js";
 import { R2_ALPHA1_FX, R2_ALPHA2_FX } from "./srcMath.js";
@@ -160,7 +161,7 @@ function expectedC0Probes(pixelCount) {
  */
 export function createSrcProbeSystem({
   gbuffer, width, height, props = null, volume = null, sky = null,
-  lighting = null, surfaces = null,
+  lighting = null, surfaces = null, sceneMotion = null,
 } = {}) {
   const tier = SRC_QUALITY[srcQualityTier(props)];
   const spacing0 = Number(globalThis.__giSrcSpacing0) || tier.spacing0;
@@ -297,9 +298,25 @@ export function createSrcProbeSystem({
   // read at build time can only be A/B'd by reloading, which is exactly the
   // comparison that instrument forbids. Polling costs a global read per frame
   // and is the same convention `__giDebugView` runs under.
-  const readAlpha = () => (Number.isFinite(Number(globalThis.__giSrcAlpha))
-    ? Math.min(1, Math.max(0, Number(globalThis.__giSrcAlpha)))
-    : TEMPORAL_ALPHA);
+  // ── MOTION-ADAPTIVE α (§12.38) ────────────────────────────────────────────
+  //
+  // A still scene settles to TEMPORAL_ALPHA_STILL (the ALPHA_SWEEP measured
+  // 3.75× fewer still-scene reversals there — srcConfig's table); any scene
+  // motion ramps continuously back to TEMPORAL_ALPHA, so a moving light,
+  // emitter or occluder gets exactly the adaptation every §12 measurement ran
+  // at. `sceneMotion` is a NORMALIZED [0,1] getter supplied by GISystem (null
+  // in every standalone gate, which therefore keep the flat TEMPORAL_ALPHA
+  // they were written against). The hatch outranks the ramp: a forced
+  // `__giSrcAlpha` is a forced α, else the flicker instrument could not pin
+  // its arms.
+  const readAlpha = () => {
+    if (Number.isFinite(Number(globalThis.__giSrcAlpha))) {
+      return Math.min(1, Math.max(0, Number(globalThis.__giSrcAlpha)));
+    }
+    if (!sceneMotion) return TEMPORAL_ALPHA;
+    const m = Math.min(1, Math.max(0, Number(sceneMotion()) || 0));
+    return TEMPORAL_ALPHA_STILL + m * (TEMPORAL_ALPHA - TEMPORAL_ALPHA_STILL);
+  };
   const keepU = uniform(1 - readAlpha());
   // Starts at 1, not 0: an unclaimed block's stamp is 0, and a frame counter
   // that also started there would call every block in the pool fresh on frame
