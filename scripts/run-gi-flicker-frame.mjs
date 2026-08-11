@@ -457,6 +457,15 @@ if (CEILING_AB) {
 // `0` disables the cap (srcProbeRayCap's contract); `undefined` restores the
 // tier default at exit.
 const setCap = (v) => page.evaluate((x) => { globalThis.__giSrcProbeRayCap = x; }, v);
+// The α compensation's state, recorded per arm rather than assumed (§12.40.4:
+// a derived number nothing prints is a number probes will guess). Lift 0 =
+// full compensation (still floor), 1 = suspended — a cap arm measured at
+// lift 1 is measuring the UNCOMPENSATED cap and its verdict says nothing
+// about the shipped configuration.
+const readComp = () => page.evaluate(() => ({
+  lift: globalThis.__giSrcCompLiftLive ?? null,
+  alpha: globalThis.__giSrcAlphaLive ?? null,
+}));
 const capRounds = [];
 if (CAP_AB) {
   for (let r = 0; r < 2; r++) {
@@ -465,12 +474,13 @@ if (CAP_AB) {
     const capT = await readTransport();
     await measure(0, false);
     const capped = await measure(0, false);
+    const capComp = await readComp();
     await setCap(0);
     await wait(300);
     const offT = await readTransport();
     await measure(0, false);
     const off = await measure(0, false);
-    capRounds.push({ capped, off, capT, offT });
+    capRounds.push({ capped, off, capT, offT, capComp });
   }
   await setCap(undefined);
 }
@@ -667,6 +677,9 @@ if (capRounds.length) {
     : NaN;
   console.log(`  published cap: ${capRounds[0].capT?.probeRayCap} vs ${capRounds[0].offT?.probeRayCap} ` +
     `(stride ${capRounds[0].capT?.stride} both arms — the cap must not move it)`);
+  const lifts = capRounds.map((r) => r.capComp?.lift);
+  console.log(`  compensation lift during capped stills: ${lifts.map((l) => l?.toFixed?.(3) ?? l).join(", ")} ` +
+    `(0 = fully compensated; ~1 means the arm measured the UNCOMPENSATED cap)`);
   console.log(`  still reversals/px: capped ${capMean.toFixed(3)}  vs  off ${offMean.toFixed(3)}   ` +
     `(${((capMean / offMean - 1) * 100).toFixed(0)}%)`);
   console.log(`  still step p95:     capped ${capP95.toFixed(4)}  vs  off ${offP95.toFixed(4)}   ` +

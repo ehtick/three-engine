@@ -14,7 +14,7 @@
 //
 // docs/GI_SRC_REBUILD_PLAN.md §2 items 2, 3, 5, 7, 8; §4.2.
 
-import { KEY_MAX_LODS } from "./srcConfig.js";
+import { INFLUX_ONE, KEY_MAX_LODS } from "./srcConfig.js";
 
 // ═══════════════════════════════════════════════ EQUAL-AREA CYLINDRICAL BINS
 //
@@ -456,6 +456,37 @@ export function mergeBin(selfL, selfT, parentL, parentT) {
 export function decayFixed(x, keep) {
   const p = Math.fround(Math.fround(x) * Math.fround(keep));
   return Math.floor(Math.fround(p + 0.5));
+}
+
+/**
+ * The per-block α compensation's `keep′` (§12.40.4) — mirror of the branch in
+ * `srcDeposit.js`'s decay pass, `Math.fround` at every step that rounds on the
+ * GPU. `influxWord` is the fixed-point capped/natural ratio the transport
+ * published for the block (`INFLUX_ONE` = uncapped); `lift` suspends the
+ * compensation (1 = fully — the exact pre-compensation `keep`, bit for bit,
+ * because the kernel SKIPS the branch rather than computing through it).
+ *
+ * `keep′ = 1 − (1−keep)·(ratio·(1−lift) + lift)`: the effective sample count
+ * `influx/(1−keep′)` is held at its uncapped value at lift 0, and interpolates
+ * back to the plain decay as the motion lift rises.
+ */
+export function keepCompensated(keep, influxWord, lift) {
+  const l = Math.fround(lift);
+  if (!(influxWord < INFLUX_ONE) || !(l < 1)) return keep;
+  const ratio = Math.fround(influxWord / INFLUX_ONE);
+  const lifted = Math.fround(Math.fround(ratio * Math.fround(1 - l)) + l);
+  return Math.fround(1 - Math.fround(Math.fround(1 - Math.fround(keep)) * lifted));
+}
+
+/**
+ * The transport's influx word for one probe (`srcRays.js` [D1'']):
+ * `floor(fl32(capped/natural)·65536 + 0.5)`, `INFLUX_ONE` when nothing was
+ * demanded. The `·65536 + 0.5` is exact in f64 given an f32 quotient, which is
+ * why only the divide is frounded.
+ */
+export function influxWordFor(capped, natural) {
+  if (!(natural > 0)) return INFLUX_ONE;
+  return Math.floor(Math.fround(capped / natural) * INFLUX_ONE + 0.5);
 }
 
 /**

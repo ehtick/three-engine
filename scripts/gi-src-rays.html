@@ -542,6 +542,14 @@
           raysPerPixel: RAYS_PER_PIXEL,
           cap: capU,
         });
+        // Read the influx region BEFORE any capped frame touches it: the
+        // uncapped frames above built no publish passes at all, so every word
+        // must still hold its INFLUX_ONE init — the structural half of "an
+        // uncapped build decays bit-identically". (ARM 9 reads it again after
+        // the capped frame, when it must NOT be all ones.)
+        const influxBefore = new Uint32Array(
+          await renderer.getArrayBufferAsync(store.freeStack.value),
+        ).slice(store.blockInfluxBase, store.blockInfluxBase + store.blockTotal);
         for (const pass of frame.passes) await renderer.computeAsync(pass);
         for (const pass of capFrame.passes) await renderer.computeAsync(pass);
         const [cTable, cProbe, cBase, cTotal] = await Promise.all([
@@ -640,6 +648,57 @@
         check("denials happened (the arithmetic above is not vacuous)", denied > 0,
           `${denied} pixels denied across ${membersBy.size} probes`);
         check("no probe's winners exceed its segment", escaped2 === 0, `${escaped2} over`);
+
+        // ══ ARM 9: THE INFLUX WORDS (§12.40.4's α compensation) ══════════
+        say("");
+        say("── INFLUX: capped/natural per block, exact vs the mirror ──");
+        // [D1''] publishes `floor(fl32(capped/natural)·65536 + 0.5)` into the
+        // store's per-block region for every probe holding a block, on EVERY
+        // cascade — a parent's deposits are its children's rays, so a capped
+        // child starves its ancestors and their blocks carry the ratio too.
+        // The mirror computes the same word per probe (`influxWordFor`, same
+        // f32 divide); probe → block goes through the GPU's own table, since
+        // the mirror has no block allocator to agree with.
+        let initWrong = 0;
+        for (const w of influxBefore) if (w !== P.INFLUX_ONE) initWrong++;
+        check("before any capped frame, every word is INFLUX_ONE", initWrong === 0,
+          initWrong === 0 ? `${influxBefore.length} words` : `${initWrong} touched`);
+        const influxAfter = new Uint32Array(
+          await renderer.getArrayBufferAsync(store.freeStack.value),
+        ).slice(store.blockInfluxBase, store.blockInfluxBase + store.blockTotal);
+        let iWrong = 0;
+        let iWorst = null;
+        let iCompared = 0;
+        let iBelowOne = 0;
+        let iOverOne = 0;
+        for (let c = 0; c < cfgMod.CASCADE_COUNT; c++) {
+          const mirrorWordByKey = new Map();
+          for (const p of built.cascades[c].probes) mirrorWordByKey.set(p.key >>> 0, p.influxWord);
+          const info = store.cascades[c];
+          for (let k = 0; k < info.probeCapacity; k++) {
+            const pi = info.probeBase + k;
+            const w = pi * P.PROBE_WORDS;
+            if ((cTable[w + P.PROBE_FLAGS] & P.FLAG_ALIVE) === 0) continue;
+            const block = cTable[w + P.PROBE_BLOCK] >>> 0;
+            if (block === P.SLOT_EMPTY) continue;
+            const got = influxAfter[info.blockBase + block];
+            const want = mirrorWordByKey.get(cTable[w + P.PROBE_KEY] >>> 0);
+            if (want === undefined) continue;
+            iCompared++;
+            if (got < P.INFLUX_ONE) iBelowOne++;
+            if (got > P.INFLUX_ONE) iOverOne++;
+            if (got !== want) {
+              iWrong++;
+              if (!iWorst) iWorst = `c${c} block ${block} gpu ${got} vs mirror ${want}`;
+            }
+          }
+        }
+        check("every live block's influx word matches the mirror exactly", iWrong === 0,
+          iWrong === 0 ? `${iCompared} blocks` : `${iWrong} wrong — ${iWorst}`);
+        check("capped probes published words below ONE (not vacuous)", iBelowOne > 0,
+          `${iBelowOne} of ${iCompared} below, cap ${CAP}`);
+        check("no word exceeds INFLUX_ONE — capped never exceeds natural", iOverOne === 0,
+          `${iOverOne} over`);
 
         if (validationErrors.length) check("no WebGPU validation errors", false, validationErrors[0]);
 

@@ -71,6 +71,14 @@
       //             a genuinely noisy signal, and the frame-to-frame RMS of the
       //             resolved payload at α = 1 against α = 0.1, held to the
       //             `sqrt(α/(2−α))` an EMA of i.i.d. samples predicts.
+      //   comp      §12.40.4's per-block α compensation: seeded influx words
+      //             decay word-for-word against `keepCompensated` at lift 0,
+      //             0.5 and 1 (1 must be BIT-identical to the plain decay);
+      //             then the physics — a REAL capped transport publishing real
+      //             words, where the uncapped steady state must be a FIXED
+      //             POINT of the compensated capped frame, and releasing the
+      //             lift must let the sums fall toward the capped level
+      //             (which is what proves the cap actually cut something).
       //
       // Run: node scripts/run-gi-src-temporal-test.mjs
       const out = document.querySelector("#log");
@@ -99,7 +107,7 @@
         const R = await import("/src/modules/gi/srcRays.js");
         const D = await import("/src/modules/gi/srcDeposit.js");
 
-        const { float, instancedArray, uint, uniform, vec3 } = TSL;
+        const { Fn, float, instanceIndex, instancedArray, select, uint, uniform, vec3 } = TSL;
 
         const renderer = new THREE.WebGPURenderer({ canvas: document.querySelector("#view") });
         await renderer.init();
@@ -769,6 +777,176 @@
           single.rms > expectedL * 0.01,
           `${single.rms.toExponential(2)} against a mean signal near ${expectedL.toFixed(3)}`);
 
+        // ══ ARM 9: THE α COMPENSATION (§12.40.4) ════════════════════════
+        say("");
+        say("── COMP: capped blocks keep proportionally more history ──");
+        // `keep′ = 1 − (1−keep)·(ratio·(1−lift) + lift)` per block, ratio from
+        // the influx word the transport publishes. Three exactness arms on
+        // SEEDED words (so every ratio value is exercised, not just the ones
+        // this fixture's cap happens to produce), then the physics on REAL
+        // ones.
+        const liftU = uniform(0);
+        const capValU = uniform(1, "uint");           // rpp = 1, so cap 1 bites hard
+        const compRayStore = R.createSrcRayStore(store, { pixelCount: PIXELS });
+        const compRayFrame = R.createSrcRayFrame(store, compRayStore, {
+          pixelProbe: frame.pixelProbe, raysPerPixel: RAYS_PER_PIXEL, cap: capValU,
+        });
+        const compDeposit = D.createSrcDepositFrame(store, bins, {
+          pixelProbe: frame.pixelProbe,
+          pixelRayBase: compRayStore.pixelRayBase,
+          pixelCount: PIXELS,
+          raysPerPixel: RAYS_PER_PIXEL,
+          trace: constTrace,
+          shadeHit: constShade,
+          readPixel, readNormal,
+          camera: vec3(cameraU),
+          spacing0: S0,
+          lmax: lmaxU,
+          jitterX: jitterXU, jitterY: jitterYU,
+          keep: keepU,
+          frameStamp: frameStampU,
+          influxLift: liftU,
+        });
+        // Deterministic seeded words: every 5th block INFLUX_ONE (the skip
+        // path), the rest spread over [1, 65535].
+        const seedWordFor = (b) => (b % 5 === 0 ? P.INFLUX_ONE : ((b * 40503) % 65535) + 1);
+        const seedInflux = Fn(() => {
+          const b = instanceIndex.toVar();
+          const word = select(
+            b.mod(uint(5)).equal(uint(0)),
+            uint(P.INFLUX_ONE),
+            b.mul(uint(40503)).mod(uint(65535)).add(uint(1)),
+          );
+          store.freeStack.element(uint(store.blockInfluxBase).add(b)).assign(word);
+        })().compute(store.blockTotal);
+        // The per-word expected keep′, laid out bin-block by bin-block.
+        const kPrimeFor = (lift) => {
+          const arr = new Float64Array(bins.binTotal);
+          for (const info of bins.cascades) {
+            for (let blk = 0; blk < info.blockCapacity; blk++) {
+              const w = refMath.keepCompensated(KEEP, seedWordFor(info.blockBase + blk), lift);
+              const first = info.binBase + blk * info.bins;
+              arr.fill(w, first, first + info.bins);
+            }
+          }
+          return arr;
+        };
+        // History to decay: a few constant-trace frames on the current pixels.
+        keepU.value = KEEP;
+        for (let f = 0; f < 4; f++) await runFrame();
+        await renderer.computeAsync(seedInflux);
+        const compDecay = async () => {
+          frameStampU.value = (frameStampU.value + 1) >>> 0;
+          await renderer.computeAsync(compDeposit.decay);
+        };
+        const compExact = async (lift, frames) => {
+          liftU.value = lift;
+          const kPrime = kPrimeFor(lift);
+          let cur = Uint32Array.from(await readScratch());
+          let wrong = 0;
+          let first = "";
+          for (let f = 0; f < frames; f++) {
+            await compDecay();
+            const got = await readScratch();
+            for (let j = 0; j < cur.length; j++) {
+              const bin = Math.floor(j / D.BIN_WORDS);
+              const want = refMath.decayFixed(cur[j] >>> 0, kPrime[bin]);
+              if ((got[j] >>> 0) !== want) {
+                wrong++;
+                if (!first) first = `word ${j} frame ${f}: ${got[j] >>> 0} vs ${want}`;
+              }
+              cur[j] = want;
+            }
+          }
+          return { wrong, first };
+        };
+        const e0 = await compExact(0, 3);
+        check("lift 0: every word matches keepCompensated + decayFixed, every frame",
+          e0.wrong === 0, e0.first || `${e0.wrong} words`);
+        const eHalf = await compExact(0.5, 2);
+        check("lift 0.5: the partial mix is exact too",
+          eHalf.wrong === 0, eHalf.first || `${eHalf.wrong} words`);
+        // lift 1 must be BIT-identical to the plain decay — the kernel skips
+        // the branch, so kPrimeFor(1) collapsing to KEEP for every block IS
+        // the claim (keepCompensated returns `keep` untouched at lift 1).
+        const e1 = await compExact(1, 2);
+        check("lift 1: bit-identical to the uncompensated decay",
+          e1.wrong === 0, e1.first || `${e1.wrong} words`);
+
+        // ── the physics: the uncapped steady state is a FIXED POINT ──────
+        // Real transport, real cap, real published words. Uncapped frames
+        // reach steady state; then compensated capped frames must HOLD the
+        // sums there (the compensation is exactly what makes the capped
+        // frame's fixed point coincide with the uncapped one); then lifting
+        // the compensation must let the sums fall toward the capped level —
+        // without that leg, a compensation that simply froze the buffer
+        // (keep′ = 1) would pass the hold.
+        keepU.value = KEEP;
+        liftU.value = 0;
+        // 30, not a token few: at keep = 0.9 the sums reach 1 − 0.9^30 ≈ 96%
+        // of steady state. Captured short of steady, the hold leg would keep
+        // CLIMBING toward S∞ under the compensated (slow) keep′ and read as a
+        // spurious 15%+ "drift up" — the arm would fail on its own transient.
+        for (let f = 0; f < 30; f++) await runFrame();   // uncapped steady state
+        const steadyScratch = await readScratch();
+        const compFrame = async () => {
+          frameStampU.value = (frameStampU.value + 1) >>> 0;
+          jitterXU.value = (jitterXU.value + refMath.R2_ALPHA1_FX) >>> 0;
+          jitterYU.value = (jitterYU.value + refMath.R2_ALPHA2_FX) >>> 0;
+          for (const pass of frame.passes) await renderer.computeAsync(pass);
+          for (const pass of compRayFrame.passes) await renderer.computeAsync(pass);
+          for (const pass of compDeposit.passes) await renderer.computeAsync(pass);
+        };
+        const K_HOLD = 40;
+        for (let f = 0; f < K_HOLD; f++) await compFrame();
+        const heldScratch = await readScratch();
+        // Which bins sit on genuinely capped blocks, by the transport's own
+        // words — the vacuous-arm guard and the comparison set in one.
+        const influxNow = new Uint32Array(
+          await renderer.getArrayBufferAsync(store.freeStack.value),
+        ).slice(store.blockInfluxBase, store.blockInfluxBase + store.blockTotal);
+        const ratioOf = (bin) => {
+          for (const info of bins.cascades) {
+            const lo = info.binBase;
+            const hi = lo + info.bins * info.blockCapacity;
+            if (bin >= lo && bin < hi) {
+              return influxNow[info.blockBase + Math.floor((bin - lo) / info.bins)] / P.INFLUX_ONE;
+            }
+          }
+          return 1;
+        };
+        const sumOver = (scratch, filter) => {
+          let sum = 0;
+          let bins2 = 0;
+          for (let i = 0; i < bins.binTotal; i++) {
+            const c = scratch[i * D.BIN_WORDS + D.BIN_COUNT] >>> 0;
+            if (c < D.MIN_WEIGHT) continue;
+            if (!filter(i)) continue;
+            sum += c;
+            bins2++;
+          }
+          return { sum, bins: bins2 };
+        };
+        const capped = (i) => ratioOf(i) < 0.9;
+        const steadyCapped = sumOver(steadyScratch, capped);
+        const heldCapped = sumOver(heldScratch, capped);
+        const holdRatio = heldCapped.sum / Math.max(1, steadyCapped.sum);
+        check("the cap really cut something (capped blocks exist)",
+          steadyCapped.bins > 32, `${steadyCapped.bins} bins on capped blocks`);
+        check("compensated capped frames HOLD the uncapped steady state",
+          holdRatio > 0.88 && holdRatio < 1.12,
+          `held/steady weight = ${holdRatio.toFixed(3)} over ${heldCapped.bins} bins, ${K_HOLD} frames`);
+        // Release the lift: the same capped frames now drift DOWN toward the
+        // capped steady state, which is ratio × the uncapped one.
+        liftU.value = 1;
+        for (let f = 0; f < K_HOLD; f++) await compFrame();
+        const driftScratch = await readScratch();
+        const driftCapped = sumOver(driftScratch, capped);
+        const driftRatio = driftCapped.sum / Math.max(1, steadyCapped.sum);
+        check("releasing the lift lets the sums fall toward the capped level",
+          driftRatio < holdRatio - 0.15,
+          `drifted to ${driftRatio.toFixed(3)} of steady (held at ${holdRatio.toFixed(3)})`);
+
         if (validationErrors.length) check("no WebGPU validation errors", false, validationErrors[0]);
 
         say("");
@@ -787,6 +965,8 @@
           headroom: +(4294967296 / Math.max(1, maxAccum)).toPrecision(3),
           staleBins,
           varReduction: +reduction.toFixed(2),
+          compHold: +holdRatio.toFixed(3),
+          compDrift: +driftRatio.toFixed(3),
           varPredicted: +predictedDrop.toFixed(2),
           storageLimit: device.limits.maxStorageBuffersPerShaderStage,
           text: out.textContent,

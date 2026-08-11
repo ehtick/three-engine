@@ -83,7 +83,7 @@ import {
   uint,
   wgslFn,
 } from "three/tsl";
-import { BIN_BUDGET, CASCADE_COUNT, MAX_LODS, PROBE_MAX_AGE, W0, blockCapacities } from "./srcConfig.js";
+import { BIN_BUDGET, CASCADE_COUNT, INFLUX_ONE, MAX_LODS, PROBE_MAX_AGE, W0, blockCapacities } from "./srcConfig.js";
 import { KEY_EMPTY } from "./srcMath.js";
 import {
   cellPosition,
@@ -157,6 +157,22 @@ export const PROBE_BLOCK = 7;
 
 export const FLAG_ALIVE = 1;
 export const FLAG_FRESH = 2;
+
+/**
+ * Fixed-point ONE for the per-block INFLUX WORD (§12.40.4's α compensation).
+ *
+ * One word per block, riding `freeStack`'s tail beside the claim stamps,
+ * holding `round(65536 · cappedRays / naturalRays)` for the owning probe this
+ * frame — the fraction of its natural evidence stream the per-probe ray cap
+ * let through. The decay reads it and slows to match (`keep′ = 1 − (1−keep)·
+ * ratio`), which holds `influx/(1−keep′)` — the accumulator's effective
+ * sample count — at its UNCAPPED value: the cap becomes variance-neutral by
+ * construction. `INFLUX_ONE` means "uncapped" and is the initial value, so a
+ * block nobody has published decays exactly as before. The constant itself
+ * lives in `srcConfig.js` so the bare-Node mirror can share it; re-exported
+ * here beside the region it describes.
+ */
+export { INFLUX_ONE };
 
 /** Per-cascade counter block. 8 words, four spare — a counter is one atomic. */
 export const COUNTER_WORDS = 8;
@@ -442,7 +458,17 @@ export function createSrcProbeStore({
   // goes stale on its own. `0` is safe as the initial value — a block that has
   // never been claimed holds zeros, which decay to zeros.
   const stampBase = probeTotal + blockTotal;
-  const freeInit = new Uint32Array(stampBase + blockTotal);
+  // ── AND A FOURTH: THE PER-BLOCK INFLUX WORDS ─────────────────────────────
+  //
+  // `INFLUX_ONE`'s doc above carries the design (§12.40.4's α compensation).
+  // Indexed `influxBase + blockBase[c] + block` exactly as the stamps are,
+  // riding this buffer for the same R7 reason. Written by Alg. 3's publish
+  // passes (srcRays.js, built only when a cap is passed), read by the decay.
+  // Initialized to INFLUX_ONE — "uncapped" — so an unpublished block decays
+  // bit-identically to the pre-compensation build.
+  const influxBase = stampBase + blockTotal;
+  const freeInit = new Uint32Array(influxBase + blockTotal);
+  freeInit.fill(INFLUX_ONE, influxBase);
   for (const c of cascades) {
     for (let i = 0; i < c.probeCapacity; i++) {
       freeInit[c.probeBase + i] = c.probeBase + (c.probeCapacity - 1 - i);
@@ -471,6 +497,8 @@ export function createSrcProbeStore({
     blockStackBase: probeTotal,
     /** Where the per-block claim stamps start inside `freeStack`. */
     blockStampBase: stampBase,
+    /** Where the per-block influx words start inside `freeStack` (§12.40.4). */
+    blockInfluxBase: influxBase,
     /** Where the c0 hash→block words start inside `hashKeys` (§12.39). */
     hashBlockBase,
     hashKeys,
@@ -481,7 +509,7 @@ export function createSrcProbeStore({
     freeTop,
     /** Bytes on the GPU, for the memory high-water telemetry (plan §8). */
     bytes: (hashTotal * 2 + cascades[0].hashCapacity + probeTotal * PROBE_WORDS + probeTotal
-      + blockTotal * 2 + cascadeCount * (COUNTER_WORDS + 2)) * 4,
+      + blockTotal * 3 + cascadeCount * (COUNTER_WORDS + 2)) * 4,
     dispose() {
       for (const b of [hashKeys, hashSlot, probeTable, counters, freeStack, freeTop]) {
         b?.value?.dispose?.();

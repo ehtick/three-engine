@@ -6957,3 +6957,132 @@ frames, one `setProp` halving intensity spikes the same frame's α to
 0.1000 (the sampler starts BEFORE the setProp — the spike is transient and
 a loop started after the await can miss it), and 3 s later it is back at
 0.0500. All three arms exact.
+
+### 12.42 PER-BLOCK α COMPENSATION — THE CAP'S UNLOCK, BUILT AND GATED
+
+§12.40.4 priced the cap's flicker at √(ray cut) and named the unlock:
+hold `influx/(1−keep′)` — the accumulator's effective sample count — at its
+UNCAPPED value, per block, so the cap stops buying variance with its ray
+cut. That is now in, riding the machinery the cap already built.
+
+#### 12.42.1 The mechanism, in the order the frame runs it
+
+- **[D1'] saves the natural count** into `rayCursor` before clamping —
+  the cursor is dead storage between [D0] and [D3], and after the clamp
+  the natural value exists nowhere else. Under a cap [D0] clears the
+  cursor (parents need a zero accumulator); uncapped it stays uncleared,
+  the old header's argument intact.
+- **[D1''] propagates the naturals up** ([D2]'s exact shape on the cursor
+  buffer) and **publishes one INFLUX WORD per block**:
+  `floor(fl32(capped/natural)·65536 + 0.5)`, `INFLUX_ONE` (= 0x10000) when
+  nothing was demanded. ALL cascades — a capped child starves its whole
+  ancestor chain, so parent blocks carry their aggregate ratio too. The
+  words ride `freeStack`'s tail beside the claim stamps (fourth region,
+  `blockInfluxBase`, R7: fold, don't multiply bindings), initialized to
+  INFLUX_ONE so an unpublished block decays bit-identically.
+- **The decay compensates per block**: `keep′ = 1 − (1−keep)·(ratio·
+  (1−lift) + lift)`, computed BEFORE the claim-stamp check so a fresh
+  block's `k = 0` always wins (the reverse order would fade a dead probe's
+  history into its successor at `1 − lift`). The `INFLUX_ONE` skip and the
+  lift-at-1 path are exact in f32 (`1−k` and `1−(1−k)` are exact
+  subtractions for k ∈ [0.5, 1]), so uncapped and fully-lifted frames are
+  bit-identical to the pre-compensation kernel.
+- **The LIFT rides the motion-adaptive α** (`srcSystem.liftFor`): 0 at the
+  still floor (full compensation), 1 at the moving α (none), derived from
+  α itself so a pinned `__giSrcAlpha` pins the lift and gates with no
+  motion getter (flat TEMPORAL_ALPHA) get the exact pre-compensation
+  decay. Published per frame as `__giSrcCompLiftLive`;
+  `__giSrcAlphaComp = false` is the polled opt-out.
+
+#### 12.42.2 Why the lift exists at all — the rounding fixed point
+
+Exact compensation on a hard-cut probe pushes `keep′` so close to 1 that
+the integer decay's rounding fixed point `0.5/(1−keep′)` can park a
+no-longer-sampled bin ABOVE `MIN_WEIGHT` (cap 16 on a 1,794-ray probe at
+stride 7: parked ≈ 7,900 quanta ≈ 0.12 ray vs the floor's 1/64) — a
+forever-readable stale bin, R1's dark vote by arithmetic, §12.23.4's exact
+hazard resurfacing. The lift dissolves it: full compensation exists only
+while the scene is STILL, where a stale value is by definition still true;
+any change the motion signal can see raises α, lifts the compensation,
+restores the fast decay and retires the bin normally. The same coupling is
+the responsiveness answer — a light toggle raises α to 0.10 AND suspends
+the compensation, so capped probes converge at the fast rate exactly when
+the user is looking at a change (and the transient noise a change unmasks
+is §12.38's own moving-α trade, unchanged). The one gap is a change the
+signal misses — §12.38.3's blind-spot list (now shorter by §12.41) is the
+authoritative price tag.
+
+#### 12.42.3 The gates
+
+- **`test:gi-src-rays` ARM 9** (mirror exactness): before any capped frame
+  every word reads INFLUX_ONE (14,524 words); after one, every live
+  block's word matches `influxWordFor` — the `Math.fround`-on-the-divide
+  twin — EXACTLY, 7,127 blocks, 444 genuinely below ONE at the fixture's
+  cap, 0 above (capped never exceeds natural). Probe → block goes through
+  the GPU's own table; the mirror has no block allocator to agree with.
+- **`test:gi-src-temporal` ARM 9** (decay exactness + the physics):
+  seeded words decay word-for-word against `keepCompensated`+`decayFixed`
+  at lift 0, 0.5 and 1 — lift 1 BIT-identical to the plain decay. Then
+  the leg that makes it physics: a real capped transport (cap 1, rpp 1)
+  publishing real words, where the UNCAPPED steady state must be a FIXED
+  POINT of the compensated capped frame — held at **1.018** over 8,290
+  bins for 40 frames (window 0.88–1.12; captured at 30 uncapped frames =
+  96% of S∞, because a state captured short of steady CLIMBS under the
+  slow keep′ and fails the window on its own transient) — and releasing
+  the lift must let the sums fall toward the capped level: **0.464**,
+  which is also the proof the cap was really cutting ~2× on those blocks
+  and only the compensation held the level. A compensation that merely
+  froze the buffer (keep′ = 1) passes the hold and fails the release.
+- Regression: rays/probes/deposit/ref/temporal all green; both SRC smoke
+  arms PASS at 8 storage buffers (the influx read rides the freeStack
+  binding the decay already had).
+
+#### 12.42.4 The rig's verdict — the regression FLIPS, and the cap ships
+
+Same instrument, same interleaved discipline as §12.40.4, compensation in
+the loop (the rig now records `__giSrcCompLiftLive` per capped arm —
+a derived number nothing prints is a number probes will guess):
+
+```
+                     capped vs off rev/px    §12.40.4 (uncomp)   noise floor
+high,  cap 16        3.771 vs 5.152  −27%        2.57× WORSE        0.178
+ultra, cap 16        1.284 vs 1.509  −15%        3.06× WORSE        0.110
+ultra, cap 32        1.354 vs 1.512  −10%        1.78× WORSE        0.048
+```
+
+Not merely inside the band — BELOW the off arm at every point, and the
+mechanism is real rather than luck: the compensated (slower) decay carries
+a starved block's bins THROUGH influx gaps that used to drop them below
+`MIN_WEIGHT`, so §12.24's membership churn falls alongside the variance.
+The high/16 delta is 7.8× the rig's own round-to-round noise.
+
+**Tier defaults ship: `probeRayCap: 16` on high AND ultra** (ultra/16 beat
+ultra/32 on reversals with the same p95, and its ray cut is deeper —
+0.171× vs 0.261× of the natural budget). low/medium ship none: their fps
+was never the complaint and no arm measured them. On the user's own
+profile (§12.40.4: 126,008 rays at 138 ns/ray = 21.2 ms deposit) the 5.8×
+cut is worth ~14 ms of the deposit — the fps fix, now on by default.
+`__giSrcProbeRayCap = 0` forces OFF over the tier (the harness pins keep
+their instruments); a positive hatch still overrides live.
+
+Recorded honestly, not tuned away:
+
+- **step p95 reads +23–31% capped, at every point** (0.1200 vs 0.0914
+  high; 0.7263/0.7376 vs ~0.59 ultra). Fewer membership events, chunkier
+  each — the same §12.24 floor, now the dominant residual. That queue item
+  was already open; this is its number.
+- **the lift snapshot is post-measure, not an in-measure integral** — one
+  ultra round read `lift 0.944` after its capped still arm (a motion
+  retain caught mid-decay) while the arm's numbers sat with its clean
+  round. A future rig improvement is to integrate the lift across the
+  measured window; the verdicts above stand on interleaved means whose
+  clean-lift rounds agree.
+- the alpha probe (`probe:gi-src-alpha`) re-ran green under the default
+  cap end to end (0.05 still / 0.10 toggle / 0.05 recovery, exact), and
+  the boot chain grew 45 → 52 passes — [D1'']'s three natural propagates
+  and four publishes, visible in the pass count as designed.
+
+The §12.38/§12.40 harness pins are unchanged in meaning: non-cap sweeps
+and the histogram pin `__giSrcProbeRayCap = 0`, which now means "force
+off" rather than "restate the default" — the instruments survive the
+default flipping under them.

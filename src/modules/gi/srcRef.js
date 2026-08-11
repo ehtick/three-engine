@@ -43,6 +43,7 @@ import {
   cellPosition,
   dirToBin,
   hashKey,
+  influxWordFor,
   latticeOriginFor,
   nearestCell,
   octahedralBorderMap,
@@ -352,6 +353,12 @@ export function assignRays(cfg, built) {
     const slot = built.pixelProbe[p];
     if (slot >= 0 && !strideSkips(cfg, p)) cascades[0].probes[slot].rayCount += cfg.raysPerPixel;
   }
+  // The NATURAL demand, kept beside the capped count exactly as the GPU keeps
+  // it (in `rayCursor`'s dead window): the α compensation's influx word is
+  // capped/natural per probe, and after the clamp the natural value exists
+  // nowhere else. Tracked capped or not — uncapped the two are equal and the
+  // word comes out INFLUX_ONE, the same statement the kernel makes.
+  for (const probe of cascades[0].probes) probe.naturalRays = probe.rayCount;
   // The per-probe cap, exactly where the GPU's [D1'] clamps: at the source,
   // before anything propagates or partitions. `probeRayCap` arrives already
   // floored to a multiple of `raysPerPixel` (srcConfig.srcProbeRayCap), which
@@ -361,11 +368,23 @@ export function assignRays(cfg, built) {
       probe.rayCount = Math.min(probe.rayCount, cfg.probeRayCap);
     }
   }
-  // Propagate up.
+  // Propagate up — both counts, one statement each: a parent's demand is the
+  // sum of its children's, capped or natural.
   for (let c = 1; c < cfg.cascadeCount; c++) {
-    for (const probe of cascades[c].probes) probe.rayCount = 0;
+    for (const probe of cascades[c].probes) { probe.rayCount = 0; probe.naturalRays = 0; }
     for (const child of cascades[c - 1].probes) {
-      if (child.parent >= 0) cascades[c].probes[child.parent].rayCount += child.rayCount;
+      if (child.parent >= 0) {
+        cascades[c].probes[child.parent].rayCount += child.rayCount;
+        cascades[c].probes[child.parent].naturalRays += child.naturalRays;
+      }
+    }
+  }
+  // The influx words ([D1''] publishes these per BLOCK; the mirror has no
+  // blocks, so they live on the probes and a gate maps probe → block through
+  // the GPU's own table).
+  for (let c = 0; c < cfg.cascadeCount; c++) {
+    for (const probe of cascades[c].probes) {
+      probe.influxWord = influxWordFor(probe.rayCount, probe.naturalRays);
     }
   }
   // Offsets top-down. The top cascade's probes partition [0, total).

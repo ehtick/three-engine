@@ -58,6 +58,7 @@ import {
   atomicAdd,
   atomicLoad,
   atomicStore,
+  float,
   instanceIndex,
   instancedArray,
   select,
@@ -67,6 +68,8 @@ import { CASCADE_COUNT } from "./srcConfig.js";
 import { transportPixel } from "./srcMathTsl.js";
 import {
   FLAG_ALIVE,
+  INFLUX_ONE,
+  PROBE_BLOCK,
   PROBE_FLAGS,
   PROBE_PARENT,
   PROBE_RAYOFF,
@@ -184,10 +187,13 @@ export function createSrcRayFrame(
   const passes = [];
 
   // ── [D0] clear ────────────────────────────────────────────────────────────
-  // `rayCursor` is NOT cleared: every live probe overwrites it with its own
-  // offset before any child reads it, and a dead probe's stale cursor is never
-  // read (nothing claims from a parent that is SLOT_EMPTY). Clearing it anyway
-  // would be a second, weaker statement of the same invariant.
+  // `rayCursor` is NOT cleared (uncapped): every live probe overwrites it with
+  // its own offset before any child reads it, and a dead probe's stale cursor
+  // is never read (nothing claims from a parent that is SLOT_EMPTY). Clearing
+  // it anyway would be a second, weaker statement of the same invariant.
+  // UNDER A CAP it IS cleared — not to restate that invariant but because the
+  // cursor moonlights as the natural-count accumulator until [D3] (see [D1'']),
+  // and an accumulator must start at zero.
   //
   // `PROBE_RAYOFF` goes to SLOT_EMPTY rather than 0. Zero is a VALID offset —
   // exactly one probe per frame legitimately owns it — so a dead probe left at
@@ -196,6 +202,11 @@ export function createSrcRayFrame(
   passes.push(Fn(() => {
     const i = instanceIndex.toVar();
     atomicStore(rayCount.element(i), uint(0));
+    // Under a cap the cursor's dead window ([D0]..[D3]) is spent as the
+    // NATURAL-count accumulator — see [D1'']. Parent slots must start at zero
+    // for the natural propagate's adds; without a cap the cursor stays
+    // uncleared for the reason the header below gives.
+    if (cap) atomicStore(rayCursor.element(i), uint(0));
     const w = i.mul(PROBE_WORDS).toVar();
     probeTable.element(w.add(PROBE_RAYS)).assign(uint(0));
     probeTable.element(w.add(PROBE_RAYOFF)).assign(uint(SLOT_EMPTY));
@@ -233,6 +244,11 @@ export function createSrcRayFrame(
     passes.push(Fn(() => {
       const i = instanceIndex.add(uint(c0.probeBase)).toVar();
       const n = atomicLoad(rayCount.element(i)).toVar();
+      // Save the NATURAL count before clamping — into `rayCursor`, which is
+      // dead storage until [D3] seeds it. The α compensation needs
+      // capped/natural per probe ([D1''] below), and after this store the
+      // natural value exists nowhere else.
+      atomicStore(rayCursor.element(i), n);
       If(n.greaterThan(uint(cap)), () => {
         atomicStore(rayCount.element(i), uint(cap));
       });
@@ -253,6 +269,66 @@ export function createSrcRayFrame(
       If(parent.equal(uint(SLOT_EMPTY)), () => { Return(); });
       atomicAdd(rayCount.element(parent), atomicLoad(rayCount.element(i)));
     })().compute(child.probeCapacity));
+  }
+
+  // ── [D1''] the influx words (§12.40.4's α compensation) ───────────────────
+  // Only under a cap, like [D1']. Two stages, both in `rayCursor`'s dead
+  // window and both BEFORE [D3] repurposes it as the offset allocator:
+  //
+  //   1. propagate the NATURAL counts up, exactly [D2]'s shape on the cursor
+  //      buffer — a parent's natural demand is the sum of its children's,
+  //      the same statement [D2] makes about the capped counts;
+  //   2. per probe, publish `round(65536 · capped/natural)` into the store's
+  //      per-block influx region, where the decay reads it (srcDeposit.js)
+  //      and slows to hold `influx/(1−keep′)` at its uncapped value.
+  //
+  // The publish covers ALL cascades: a parent's deposits are its children's
+  // rays, so a capped child starves its whole ancestor chain and every block
+  // on it needs the ratio, not just c0's. `natural == 0` publishes
+  // INFLUX_ONE — no evidence was cut if none was demanded — which is also
+  // what keeps a probe whose pixels sit outside this frame's residue class
+  // from freezing its block's decay. Dead probes that still hold a block get
+  // INFLUX_ONE the same way (their counts are zero), and a FREED block's
+  // stale word is unreachable memory: the claim stamp zeroes it before any
+  // new owner accumulates (§12.23.5).
+  //
+  // With the cap at PROBE_RAY_CAP_OFF the clamp never binds, capped == natural
+  // everywhere, and every word is exactly INFLUX_ONE — the decay's
+  // compensation branch never fires and the build is behaviourally the
+  // uncapped one, same statement [D1'] makes.
+  if (cap) {
+    const { freeStack, blockInfluxBase } = store;
+    for (let c = 1; c < N; c++) {
+      const child = cascades[c - 1];
+      passes.push(Fn(() => {
+        const i = instanceIndex.add(uint(child.probeBase)).toVar();
+        If(probeAlive(probeTable, i).not(), () => { Return(); });
+        const parent = probeTable.element(i.mul(PROBE_WORDS).add(PROBE_PARENT)).toVar();
+        If(parent.equal(uint(SLOT_EMPTY)), () => { Return(); });
+        atomicAdd(rayCursor.element(parent), atomicLoad(rayCursor.element(i)));
+      })().compute(child.probeCapacity));
+    }
+    for (let c = 0; c < N; c++) {
+      const info = cascades[c];
+      const base = blockInfluxBase + info.blockBase;
+      passes.push(Fn(() => {
+        const i = instanceIndex.add(uint(info.probeBase)).toVar();
+        const block = probeTable.element(i.mul(PROBE_WORDS).add(PROBE_BLOCK)).toVar();
+        If(block.equal(uint(SLOT_EMPTY)), () => { Return(); });
+        const slot = freeStack.element(uint(base).add(block));
+        const natural = atomicLoad(rayCursor.element(i)).toVar();
+        If(natural.equal(uint(0)), () => {
+          slot.assign(uint(INFLUX_ONE));
+          Return();
+        });
+        const capped = atomicLoad(rayCount.element(i)).toVar();
+        // f32 is exact here: counts are far under 2^24, the divide is the one
+        // correctly-rounded op, and ·65536 (+0.5, then truncate) shifts the
+        // exponent without touching the mantissa — `Math.fround` on the
+        // divide is all the mirror needs to match bit for bit.
+        slot.assign(uint(float(capped).div(float(natural)).mul(INFLUX_ONE).add(0.5)));
+      })().compute(info.probeCapacity));
+    }
   }
 
   // ── [D3] the top cascade partitions [0, totalRays) ────────────────────────

@@ -318,6 +318,28 @@ export function createSrcProbeSystem({
     return TEMPORAL_ALPHA_STILL + m * (TEMPORAL_ALPHA - TEMPORAL_ALPHA_STILL);
   };
   const keepU = uniform(1 - readAlpha());
+  // ── THE α COMPENSATION'S LIFT (§12.40.4) ──────────────────────────────────
+  //
+  // How much of the per-block influx compensation is SUSPENDED, derived from
+  // the same α the motion signal produces: at the still floor the lift is 0
+  // (full compensation — capped blocks keep proportionally more history and
+  // the ray cap is variance-neutral), at the moving α it is 1 (no
+  // compensation — the fast decay wins, which is both the responsiveness the
+  // user asked for and the mechanism that retires stale bins; the deposit's
+  // `influxLift` doc carries the rounding-fixed-point argument). Deriving
+  // from α rather than from `sceneMotion` directly means a pinned
+  // `__giSrcAlpha` pins the lift too — 0.05 IS "still", 0.1 IS "moving",
+  // whoever says so — and gates with no motion getter (flat TEMPORAL_ALPHA)
+  // get lift 1 = the exact pre-compensation decay they were written against.
+  // `__giSrcAlphaComp = false` is the explicit opt-out, polled per frame like
+  // every other hatch here.
+  const liftFor = (alpha) => {
+    if (globalThis.__giSrcAlphaComp === false) return 1;
+    const span = TEMPORAL_ALPHA - TEMPORAL_ALPHA_STILL;
+    if (!(span > 0)) return 1;
+    return Math.min(1, Math.max(0, (alpha - TEMPORAL_ALPHA_STILL) / span));
+  };
+  const influxLiftU = uniform(liftFor(readAlpha()));
   // Starts at 1, not 0: an unclaimed block's stamp is 0, and a frame counter
   // that also started there would call every block in the pool fresh on frame
   // zero. Harmless in fact (an unclaimed block holds zeros, which zero to
@@ -736,6 +758,7 @@ export function createSrcProbeSystem({
         jitterY: jitterYU,
         keep: keepU,
         frameStamp: frameStampU,
+        influxLift: influxLiftU,
         maxLods: MAX_LODS,
       })
     : null;
@@ -928,6 +951,13 @@ export function createSrcProbeSystem({
       globalThis.__giSrcAlphaLive = alpha;
       const keep = (1 - alpha) ** (1 / Math.max(1, rayStride));
       if (keepU.value !== keep) keepU.value = keep;
+      // The compensation lift rides the same α, published for the same
+      // reason α is: the rig's CAP arms need to SEE that compensation was
+      // active, not assume it. Compare-then-assign, still scene uploads
+      // nothing.
+      const lift = liftFor(alpha);
+      globalThis.__giSrcCompLiftLive = lift;
+      if (influxLiftU.value !== lift) influxLiftU.value = lift;
       // The stamp advances with the jitter and for the same reason: both are
       // "which frame is this", and the decay pass compares against it exactly.
       // It wraps at 2^32 — 2.2 years at 60 fps, and the only consequence of a

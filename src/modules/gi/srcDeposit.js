@@ -130,6 +130,7 @@ import {
   transportPixel,
 } from "./srcMathTsl.js";
 import {
+  INFLUX_ONE,
   PROBE_BLOCK,
   PROBE_PARENT,
   PROBE_WORDS,
@@ -358,6 +359,22 @@ export function createSrcBinStore(store, { w0 = W0, maxBytes = 128 * 1024 * 1024
  *   single-frame behaviour every gate written before Phase 4 assumes.
  * @param {Node} [options.frameStamp]  the frame number `createSrcProbeFrame`
  *   stamps onto freshly claimed blocks. Must be the same node.
+ * @param {Node} [options.influxLift]  uniform in [0,1] — how much of the per
+ *   block α compensation is LIFTED (§12.40.4). At 0 the decay slows on capped
+ *   blocks to hold `influx/(1−keep′)` at its uncapped value (variance-neutral
+ *   still scene); at 1 the compensation is fully suspended and the decay is
+ *   bit-identical to the uncompensated build. srcSystem drives it from the
+ *   motion-adaptive α's own motion term, which is what retires stale bins:
+ *   full compensation makes `keep′` close enough to 1 that the integer
+ *   decay's rounding fixed point (0.5/(1−keep′)) can park a no-longer
+ *   sampled bin ABOVE `MIN_WEIGHT` — a forever-readable stale bin, R1's dark
+ *   vote — but a still scene is precisely the case where a stale value is
+ *   still the true one, and any change the motion signal can see raises the
+ *   lift, restores the fast decay, and retires the bin normally. The one gap
+ *   is a change the signal misses (its floor is §12.38.3's blind-spot list),
+ *   which is a property of the signal, not of this pass. Omitted, the branch
+ *   is not built and the decay is byte-identical to the pre-compensation
+ *   kernel — where every gate written before it runs.
  */
 export function createSrcDepositFrame(store, bins, {
   pixelProbe,
@@ -375,6 +392,7 @@ export function createSrcDepositFrame(store, bins, {
   jitterY,
   keep = null,
   frameStamp = null,
+  influxLift = null,
   maxLods = MAX_LODS,
   stride = null,
   phase = null,
@@ -435,8 +453,34 @@ export function createSrcDepositFrame(store, bins, {
         if (!Number.isInteger(base)) {
           throw new Error(`createSrcDepositFrame: cascade ${info.cascade} has no block base`);
         }
+        const influxB = store.blockInfluxBase + info.blockBase;
+        if (influxLift && !Number.isInteger(influxB)) {
+          throw new Error(`createSrcDepositFrame: cascade ${info.cascade} has no influx base`);
+        }
         If(i.greaterThanEqual(uint(lo)).and(i.lessThan(uint(hi))), () => {
           const block = i.sub(uint(lo)).div(uint(info.bins)).toVar();
+          // ── the α compensation (§12.40.4) — BEFORE the stamp check, which
+          // must win: a freshly claimed block is zeroed whatever its (stale)
+          // influx word says; the reverse order would turn `k = 0` back into
+          // `1 − lift` and fade a dead probe's history into its successor.
+          //
+          // `keep′ = 1 − (1−keep)·ratio` holds the accumulator's effective
+          // sample count `influx/(1−keep′)` at its UNCAPPED value, so the
+          // per-probe ray cap stops buying variance with its ray cut. The
+          // lift interpolates the ratio toward 1 (`r·(1−lift) + lift`), and
+          // both the `INFLUX_ONE` skip and the lift-at-1 path are EXACT:
+          // `1−k` and `1−(1−k)` are exact f32 subtractions for k ∈ [0.5, 1]
+          // (the result's mantissa always fits), so an uncapped word or a
+          // fully lifted frame decays bit-identically to the plain branch.
+          if (influxLift) {
+            const infl = freeStack.element(uint(influxB).add(block)).toVar();
+            If(infl.lessThan(uint(INFLUX_ONE)).and(float(influxLift).lessThan(1.0)), () => {
+              const lift = float(influxLift).toVar();
+              const ratio = float(infl).div(INFLUX_ONE).toVar();
+              const lifted = ratio.mul(float(1.0).sub(lift)).add(lift).toVar();
+              k.assign(float(1.0).sub(float(1.0).sub(k).mul(lifted)));
+            });
+          }
           const stamp = freeStack.element(uint(base).add(block)).toVar();
           If(stamp.equal(frameStamp), () => { k.assign(float(0)); });
         });
