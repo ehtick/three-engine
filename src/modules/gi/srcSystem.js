@@ -920,7 +920,13 @@ export function createSrcProbeSystem({
       // ⚠ It is a root, not a division. `keep/S` or `1 − α/S` both look
       // plausible and neither composes: decay is MULTIPLICATIVE across frames,
       // so the only function whose S-fold product is `1 − α` is its S-th root.
-      const keep = (1 - readAlpha()) ** (1 / Math.max(1, rayStride));
+      const alpha = readAlpha();
+      // Published every frame for probes — a plain number write. The α ramp
+      // was UNGATEABLE end-to-end before this: `keepU` folds the stride root
+      // in, so no page could read back what α the motion signal actually
+      // produced, and the intensity-delta fix would have shipped on faith.
+      globalThis.__giSrcAlphaLive = alpha;
+      const keep = (1 - alpha) ** (1 / Math.max(1, rayStride));
       if (keepU.value !== keep) keepU.value = keep;
       // The stamp advances with the jitter and for the same reason: both are
       // "which frame is this", and the decay pass compares against it exactly.

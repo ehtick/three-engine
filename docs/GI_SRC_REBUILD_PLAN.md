@@ -6929,3 +6929,31 @@ across its per-arm pages (78,988/315,952/499,720 px), the §12.30.4
 instability again; its header's "pin the viewport before the GI module
 builds" hardening is now a named harness errand, and the withhold is the
 guard working, not a regression signal.
+
+### 12.41 THE α SIGNAL LEARNS TO SEE A LAMP — §12.38.3's BLIND SPOT, CLOSED
+
+The user hit the documented blind spot in as many words ("temporal is way
+too slow, making light too slow to change"): the motion signal read light
+MATRICES, emitter retains and mover displacement, so an intensity or color
+change registered as a perfectly still scene and converged at the 0.05
+floor. Now the hoisted light loop tracks each light's emitted luminance
+(intensity × color luma) beside its matrix, and the RELATIVE per-frame
+delta joins `sceneMotion` under the same saturation constant — a one-frame
+toggle saturates the ramp outright, a fade holds it up for its duration,
+sub-0.1%/frame flicker stays under the floor.
+
+Two deliberate boundaries: the luminance term is a SEPARATE track
+(`_giLightLumMotion`) because `_giShadowLastMotion` also drives the GI
+shadow pass's temporal weights and the shadow factor is pure visibility —
+a fade must shorten radiance memory, never shadow memory. And the α the
+frame actually uses is now published (`__giSrcAlphaLive`, one number write
+in `syncCamera`) because the ramp was UNGATEABLE end to end before — §12.38
+was verified only through downstream flicker statistics, and this fix
+would otherwise have shipped on faith.
+
+`run-gi-src-alpha-signal-probe.mjs` (`probe:gi-src-alpha`) gates it on the
+Cornell project with a probe-owned point light: still max α 0.0500 over 60
+frames, one `setProp` halving intensity spikes the same frame's α to
+0.1000 (the sampler starts BEFORE the setProp — the spike is transient and
+a loop started after the await can miss it), and 3 s later it is back at
+0.0500. All three arms exact.

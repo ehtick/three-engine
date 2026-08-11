@@ -1375,26 +1375,48 @@ export class GISystem {
     // about whether the scene is moving.
     {
       let motion = 0;
+      let lumMotion = 0;
       this._giShadowLightPrev ??= new WeakMap();
       for (const light of this._lightObjects ?? []) {
         const e = light.matrixWorld.elements;
         let prev = this._giShadowLightPrev.get(light);
         if (!prev) {
-          prev = { dir: new THREE.Vector3(), pos: new THREE.Vector3(), seeded: false };
+          prev = { dir: new THREE.Vector3(), pos: new THREE.Vector3(), lum: 0, seeded: false };
           this._giShadowLightPrev.set(light, prev);
         }
+        // Emitted luminance, tracked beside the matrix. §12.38.3 named the
+        // blind spot and the user then hit it in as many words ("temporal is
+        // way too slow, making light too slow to change"): the matrix terms
+        // cannot see a lamp toggling or a color fade, so those converge at
+        // the STILL floor. The delta is RELATIVE (a toggle reads 1.0 whatever
+        // the absolute intensity), which drops it into the same saturation
+        // constant as the matrix terms: a one-frame toggle saturates the α
+        // ramp outright, a fade holds it up for its own duration, sub-0.1%
+        // per-frame flicker stays under the floor.
+        const c = light.color;
+        const lum = (light.intensity ?? 0) *
+          (c ? 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b : 1);
         if (prev.seeded) {
           // z-column delta ≈ radians for small rotations; translation folds
           // in at 5cm ≈ 1° so dollying a point light shortens memory too.
           const dirDelta = Math.hypot(e[8] - prev.dir.x, e[9] - prev.dir.y, e[10] - prev.dir.z);
           const posDelta = Math.hypot(e[12] - prev.pos.x, e[13] - prev.pos.y, e[14] - prev.pos.z);
           motion = Math.max(motion, dirDelta + posDelta * 0.05);
+          lumMotion = Math.max(lumMotion,
+            Math.abs(lum - prev.lum) / Math.max(prev.lum, lum, 1e-3));
         }
         prev.dir.set(e[8], e[9], e[10]);
         prev.pos.set(e[12], e[13], e[14]);
+        prev.lum = lum;
         prev.seeded = true;
       }
       this._giShadowLastMotion = motion;
+      // SEPARATE track, deliberately: `_giShadowLastMotion` also drives the
+      // GI shadow pass's temporal weights, and the shadow factor is PURE
+      // VISIBILITY — an intensity fade must not shorten shadow memory, only
+      // SRC's radiance memory (the sceneMotion closure below is its one
+      // consumer).
+      this._giLightLumMotion = lumMotion;
     }
     // (Analytic-width arm: `_giShadowFrameU` is never created, the whole
     // block compiles out of the frame — no phase, no history weights.)
@@ -3194,6 +3216,11 @@ export class GISystem {
               (this._giShadowLastMotion ?? 0) / ALPHA_MOTION_SAT,
               this._giEmitterLastMotion ?? 0,
               ((this._dynSet?.lastMotion ?? 0) * 0.05) / ALPHA_MOTION_SAT,
+              // Relative light-luminance delta (see the hoisted light loop):
+              // same saturation constant as the other terms, so a lamp
+              // toggle rides α at 0.1 instead of crawling in at the 0.05
+              // still floor — §12.38.3's blind spot, closed.
+              (this._giLightLumMotion ?? 0) / ALPHA_MOTION_SAT,
             )),
             lighting: surfaces
               ? {
