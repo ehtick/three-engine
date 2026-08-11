@@ -217,6 +217,12 @@ const giPendingComputePipelines = new Set();
 // have skipped. See the counting site in `installAsyncComputePipelines`.
 const giSeenShaderModules = new WeakSet();
 let giPipelineReuseHits = 0;
+// One entry per compute pipeline created this process, in creation order — the
+// same order the prewarm collects `kernelSizes`, so the two can be zipped and
+// the slow kernel named with its size. Exists because `N pipelines compiled
+// concurrently in Xms` is a DRAIN total and cannot say which one owned it, and
+// on the user's editor that total is 62,046 ms for a single pipeline.
+const giPipelineTimings = [];
 if (import.meta.env?.DEV) {
   // Harness diagnostics (run-gi-spawn-test and friends): lets a probe see
   // whether the dispatch loop is stuck waiting on pipelines / skipping.
@@ -283,8 +289,27 @@ function installAsyncComputePipelines(renderer) {
         if (giSeenShaderModules.has(mod)) giPipelineReuseHits++;
         else giSeenShaderModules.add(mod);
       }
+      // ── WHICH KERNEL IS THE SLOW ONE? ────────────────────────────────────
+      //
+      // The user's editor, SRC off, five kernels: `1 compute pipelines compiled
+      // concurrently in 62046ms`. ONE pipeline, 62 seconds — that is now the
+      // whole of startup, with the prewarm loop at 1 ms, TSL at 1 ms and
+      // materials at 5.7 s. §13.4 already showed size does not predict this (a
+      // 154 kB kernel compiled 4× faster than a 2 kB one), so it is a compiler
+      // pathology in ONE shader and the only useful question is which.
+      //
+      // The aggregate line cannot answer it: it reports the drain, summed. Each
+      // pipeline is therefore timed individually and tagged with its creation
+      // ORDER, which is the same order `kernelSizes` is collected in during the
+      // prewarm — so the slow one can be named against its size and its place
+      // in the chain rather than guessed at from a total.
+      const order = giPipelineTimings.length;
+      const tCreate = performance.now();
+      giPipelineTimings.push({ order, ms: null, label: descriptor?.label ?? "" });
+      const record = () => { giPipelineTimings[order].ms = performance.now() - tCreate; };
       const promise = device.createComputePipelineAsync(descriptor).then(
         (pipelineGPU) => {
+          record();
           const data = backend.get(computePipeline);
           data.pipeline = pipelineGPU;
           const replay = data.giReplayNodes;
@@ -293,11 +318,13 @@ function installAsyncComputePipelines(renderer) {
             for (const node of replay) renderer.compute(node);
           }
         },
-        (error) =>
+        (error) => {
+          record();
           console.warn(
             `[gi] compute pipeline "${descriptor?.label ?? ""}" failed to compile:`,
             error?.message ?? error,
-          ),
+          );
+        },
       );
       const tracked = promise.finally(() => giPendingComputePipelines.delete(tracked));
       giPendingComputePipelines.add(tracked);
@@ -2073,6 +2100,25 @@ export class GISystem {
         // — the real dispatch is the frame callback, one tick later, in order.
         if (this.state === state) {
           for (const node of computeNodes) giCompute(renderer, node);
+        }
+        // ── NAME THE SLOW KERNEL ─────────────────────────────────────────
+        //
+        // Zipped against `kernelSizes` by creation order. This is the line that
+        // turns "62 seconds of compiling" into "62 seconds in kernel #1, 77 kB"
+        // — and §13.4 says the size will probably NOT explain it, which is
+        // exactly why the index matters more than the byte count.
+        const timed = giPipelineTimings.filter((p) => typeof p.ms === "number");
+        if (timed.length) {
+          const slowest = timed.reduce((a, b) => (b.ms > a.ms ? b : a));
+          const total = timed.reduce((s, p) => s + p.ms, 0);
+          if (slowest.ms > 1000) {
+            console.log(
+              `[gi] SLOWEST PIPELINE: #${slowest.order} took ${(slowest.ms / 1000).toFixed(1)}s ` +
+                `(${kernelSizes[slowest.order] ?? "?"}kB WGSL${slowest.label ? `, "${slowest.label}"` : ""}) ` +
+                `of ${(total / 1000).toFixed(1)}s summed over ${timed.length} pipelines. ` +
+                "Size does not predict this (§13.4) — the INDEX is the handle.",
+            );
+          }
         }
         if (kernelSizes.length) {
           console.log(
