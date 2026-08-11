@@ -6121,3 +6121,44 @@ And: **"slowest single pipeline" must stop being quoted as a cost.** It is laten
 (§13.3), it selects whatever queued last, and it is what pointed at the shadow
 marcher here. The defensible statistic is the SUM of isolated compiles
 (`DUMP_ALL` + `probe:wgsl-compile`), which is why that pair exists.
+
+#### 13.14.7 THE GATE LADDER, MEASURED — AND THE KERNEL THAT SURVIVES ALL OF IT
+
+`probe:gi-boot` prints GATE STATE first now (§13.14.6). With it, the optional
+chains can finally be priced one variable at a time on one harness:
+
+| shadow chain | exact reflections | SRC hit shading | TTFF |
+|---|---|---|---|
+| SKIPPED | **ON** | ON | 113,469 ms |
+| SKIPPED | off | ON | 89,925 ms |
+| SKIPPED | off | **off** | **54,314 ms** |
+
+**Exact reflections ≈ 23 s. SRC hit shading ≈ 35 s.** The reflection half is
+gated and shipped (§13.14.6). Hit shading is not — it changes what GI *looks*
+like, so it needs a ramp rather than a gate.
+
+⚠ **AND WITH ALL THREE OFF, THE 77 kB / 4-LOOP / 204-IF KERNEL IS STILL THERE**,
+at 47,836 ms and 88% of a 54 s TTFF, across 74 compute pipelines. So it is none of
+the three optional chains: it is a **core, always-built** kernel. Every earlier
+attribution of it — shadow marcher (§13.13), `bvhReflect` (§13.13.2), the
+`srcShade` light loop (§13.14.5) — is now excluded by direct measurement under a
+printed gate state.
+
+##### The remaining candidate, and why it fits
+
+`state.queue[0]` is `screen.resolve.compute` (`GISystem.js:4658`) — the deferred GI
+resolve, and the engine's own kernel list calls index 0 the 72 kB "composite". It
+is built in every configuration because it *is* the GI output. `GISystem.js:4573`
+gives **every light slot** its own `light.shadowTraceFn =
+volume.createSoftShadowTrace(…, "giResolveShadowTrace")`, and `MAX_GI_LIGHTS = 4`.
+
+That predicts exactly what the fingerprint shows — four inlined BVH descents in a
+kernel nothing can switch off — and it explains why §13.14.5's fix did nothing:
+**the mechanism was identified correctly and the file was not.** §13.14.4's
+measurement (≈1.2 s of compile per inlined descent, stack depth irrelevant, a
+~6.9 s floor) stands and now has a plausible owner.
+
+**Not yet confirmed.** The confirmation is a binding-level match between the dumped
+77 kB WGSL and the resolve's own buffers, or a `MAX_GI_LIGHTS = 1` arm. Given this
+section's record — three wrong owners for one fingerprint — it is recorded as the
+leading candidate and nothing is built on it until that arm runs.
