@@ -174,9 +174,23 @@ try {
       console.log(`    ${r.name.padEnd(34)} median ${ms(med).padStart(9)}   ` +
         `runs ${r.runs.map((v) => ms(v)).join(", ")}   entry ${r.entry}`);
     }
-    // The point of more than one file is the ratio between them, so print it
-    // rather than leaving it to be done by eye against a wrong baseline.
+    // ── THE SUM ─────────────────────────────────────────────────────────────
+    // With a whole boot's kernels on the command line this is the number that
+    // matters: if the driver compiles one at a time, startup is the SUM and the
+    // "slowest single pipeline" was never the target — it was just whichever
+    // one queued last (§13.3). Printed always, because a total that has to be
+    // added up by hand from 75 rows is a total nobody checks.
     const ok = results.out.filter((r) => !r.error && r.runs.length);
+    if (ok.length > 2) {
+      const medOfAll = (r) => [...r.runs].sort((a, b) => a - b)[Math.floor(r.runs.length / 2)];
+      const total = ok.reduce((s, r) => s + medOfAll(r), 0);
+      const worst = ok.reduce((a, r) => (medOfAll(r) > medOfAll(a) ? r : a));
+      console.log(`\n  ── THE SUM OVER ${ok.length} KERNELS ──`);
+      console.log(`    total isolated compile   ${ms(total).padStart(10)}`);
+      console.log(`    slowest single           ${ms(medOfAll(worst)).padStart(10)}  ` +
+        `${(medOfAll(worst) / total * 100).toFixed(1)}% of the total  (${worst.name})`);
+      console.log(`    median kernel            ${ms([...ok.map(medOfAll)].sort((a, b) => a - b)[Math.floor(ok.length / 2)]).padStart(10)}`);
+    }
     if (ok.length > 1) {
       const medOf = (r) => [...r.runs].sort((a, b) => a - b)[Math.floor(r.runs.length / 2)];
       const base = ok[0];

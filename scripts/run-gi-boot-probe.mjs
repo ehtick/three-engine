@@ -252,6 +252,31 @@ async function runArm(arm) {
       }
     }
   }
+  // ── DUMP_ALL: EVERY COMPUTE KERNEL, FOR THE SUM ───────────────────────────
+  //
+  // `SLOWEST PIPELINE #47 took 181.6s of 233.2s summed over 51` while the same
+  // kernel compiles in 12s alone. §13.3 says the per-pipeline number is LATENCY,
+  // not compile time, and if the driver compiles one at a time then startup is
+  // the SUM over every pipeline and "the slow kernel" was never the target.
+  // Dumping all of them lets `probe:wgsl-compile` add up the real compile times
+  // and compare that total against the wave — which decides whether the lever is
+  // one kernel or the whole set.
+  if (process.env.DUMP_ALL) {
+    const dir = path.resolve(process.env.DUMP_ALL);
+    fs.mkdirSync(dir, { recursive: true });
+    const compute = pipelines.filter((p) => p.kind === "compute" && p.id != null);
+    let written = 0;
+    for (const [i, p] of compute.entries()) {
+      const code = await page.evaluate((id) => globalThis.__giBootProbe?.sources?.get(id) ?? "", p.id);
+      if (!code) continue;
+      // Name carries the editor's latency and the size, so the per-kernel rows
+      // in the compile probe can be lined up against the boot list by eye.
+      const nm = `k${String(i).padStart(2, "0")}-${Math.round(p.bytes / 1024)}kB-lat${Math.round(p.ms)}ms.wgsl`;
+      fs.writeFileSync(path.join(dir, nm), code, "utf8");
+      written++;
+    }
+    console.log(`\n  dumped ${written} compute kernels → ${dir}`);
+  }
   await browser.close();
 
   const stages = {};

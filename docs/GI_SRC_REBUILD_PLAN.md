@@ -5992,3 +5992,73 @@ architectural, and each needs its own measurement before it is believed:
    construction* rather than by hoping a compiler gets faster.
 3. Fewer boot-time kernels — Phase 7's deletion sweep, whose value here is now
    measurable rather than assumed.
+
+#### 13.14.5 THE SUM, MEASURED — IT IS ONE KERNEL, AND ITS COST IS FOUR COPIES OF ONE CALL
+
+§13.3's "the per-pipeline number is LATENCY, not compile time" raises an obvious
+possibility: if the driver compiles one at a time, startup is the SUM over every
+pipeline and "the slowest" was never the target. `DUMP_ALL=<dir>` writes all 75
+compute kernels; `probe:wgsl-compile` compiles the lot in one empty page:
+
+```
+  total isolated compile      39,264 ms   over 75 kernels
+  slowest single              26,061 ms   66.4% of the total
+  median kernel                   40 ms
+```
+
+**The sum hypothesis is REFUTED and the one-kernel finding is now quantitative.**
+74 kernels together are 13.2 s; one is 26.1 s. And a kernel that compiles in 40 ms
+alone appears in the boot list as `lat2586ms` — 65× its own cost, spent waiting
+behind the monster, which is §13.3 confirmed from the other side and the reason
+every "slowest pipeline" attribution in §13.13 pointed at whatever queued last.
+
+(The editor's wave is ~99 s against 39 s of real compile work — a 2.5× overhead
+from everything else the boot is doing. Worth its own measurement; not the lever.)
+
+##### Where the 26 s comes from: `MAX_GI_LIGHTS` copies of a BVH descent
+
+`srcShade.js:488` — `for (const slot of lights)`, a **JS** loop, so it unrolls at
+graph-build time and each iteration inlines `visibility(...)`, i.e. a whole
+2-nested-loop BVH8 descent. §13.14.4 measured those four inlinings at ~1.2 s each.
+
+The scene has **one** light (`[gi] built … 1 lights (GPU)`). It emits **four**
+descents anyway, because `makeLightSlots()` always builds `MAX_GI_LIGHTS = 4`
+uniform slots and gates them on an `active` uniform at runtime. That is R11 done
+correctly for *updates* — adding a light never recompiles — and it is why the
+compile cost is fixed at four descents no matter what the scene contains.
+
+The comment above the loop already names the fix and attributes it to Phase 5:
+
+> *folding the light slots into the NEE set below collapses it to one ray for
+> lights AND emitters together, which is what `lightTree.js` does*
+
+`neeIrradiance` (same file, line 278) already does exactly this for emitters —
+"Four predicated copies, so the one expensive thing below — the shadow ray — is
+issued once and not once per emitter." The punctual lights simply do not go
+through it yet.
+
+##### The chosen design, and why not the cheaper one
+
+Two ways to stop emitting four descents:
+
+1. **Emit only as many light blocks as the scene has.** One line, ~3.7 s saved
+   immediately. **Rejected: it violates R11** — the light count becomes part of
+   the shader, so adding or removing a light triggers a rebuild, and a rebuild
+   currently costs the very 26 s this is trying to remove. Trading a one-time
+   boot cost for a per-edit one is a worse product.
+2. **A uniform ARRAY of light slots plus a TSL `Loop`**, so the descent is inlined
+   once and iterated at runtime, gated on `active` exactly as now. Keeps R11,
+   costs the same at runtime, and is the shape `neeIrradiance` already uses.
+
+**(2), scoped narrowly**: a compact array packed for the SRC hit shader only,
+rather than re-laying-out `makeLightSlots` and every consumer of it
+(`analyticDirectAt`, GISystem's direct term, the shadow marcher). Duplicating four
+lights' worth of uniforms is free; a data-layout change across all consumers is
+not, and it would put the shadow marcher — a kernel this is not trying to touch —
+in the blast radius.
+
+⚠ **DO NOT fold lights into the NEE *estimator* in the same change.** That
+replaces four deterministic shadow rays with one stochastic sample: fewer rays,
+higher variance, and §12.32.1 has the user reporting flicker already. Rolling the
+loop is an emission change with byte-identical results; NEE folding is an
+estimator change that needs its own energy A/B and its own flicker arm.
