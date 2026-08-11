@@ -454,6 +454,76 @@ export function createSrcProbeSystem({
   const lmaxU = uniform(Number(globalThis.__giSrcLmax) || 16);
   const binStore = volume?.occupancyField ? createSrcBinStore(store, { w0: W0 }) : null;
 
+  // ── [H]: THE IRRADIANCE TILES (plan §12.18.7 unit 4) ─────────────────────
+  //
+  // c0 only, and only because [G] runs before the bake each frame: a merged c0
+  // bin carries the whole cascade chain's answer at the finest spacing the
+  // hierarchy has, so tiles for cascades 1-3 would bake the same light more
+  // coarsely and nothing would read them.
+  //
+  // CONSTRUCTED HERE — above the hit shader — since §12.39: [J]'s secondary
+  // term is `gatherAt` at the hit, so the shader needs the gather closure at
+  // build time. Dispatch order is the `passes` list below and is unchanged;
+  // at the moment the deposit's shadeHit samples a tile, the atlas holds LAST
+  // frame's bake, which is exactly the temporal feedback R4 models (§12.26.9).
+  const tiles = binStore
+    ? createSrcTileAtlas(store, binStore, {
+        w0: W0,
+        // The scene's own Sky Light, composited against a bin's RESIDUAL
+        // transmittance — zero for every merged bin, so it only ever fires for
+        // the orphans. Zero when a project never set it, which means this build
+        // still renders exactly as it did.
+        sky: sky ? vec3(sky) : vec3(0),
+      })
+    : null;
+
+  // ── [I]: THE SCREEN GATHER (plan §12.18.7 unit 5) ────────────────────────
+  //
+  // Sparse-trilinear over the ≤8 nearest c0 probes, one filtered tile tap each,
+  // blended across the LOD overlap. This is what removes the ~0.6 m rectangles
+  // that every frame since §12.17 has had: `srcGather.js` (deleted with this
+  // unit) assigned ONE probe per pixel with no interpolation, so the blocks
+  // were the probe cells at the correct spacing and no probe density was ever
+  // going to remove them.
+  //
+  // `hashBlockFrame` is what makes the closure affordable inside the resolve —
+  // and since §12.39 its words ride `hashKeys`' TAIL, so the lookup is ONE
+  // storage buffer: the price at which the deposit kernel (7 of 8 bindings)
+  // can afford it too.
+  const hashBlockFrame = tiles ? createSrcHashBlockFrame(store, 0) : null;
+  const gather = tiles
+    ? createSrcScreenGather(store, tiles, {
+        lookup: hashBlockFrame.lookup,
+        spacing0,
+        camera: vec3(cameraU),
+        // The SAME anchor the population, the gizmos and the merge use. A
+        // gather that interpolates over a lattice placed from a second anchor
+        // reads plausible light from the wrong probes.
+        anchor: vec3(anchorU),
+        // ── THE GATHER RUNS COARSER THAN THE RESOLVE ─────────────────────
+        //
+        // It is per-OUTPUT-pixel work — one probe-lattice interpolation per
+        // screen pixel — and it measured **7.55 ms of a 34 ms SRC chain** on
+        // the user's editor at 1,599,840 px, second only to the deposit. Unlike
+        // the deposit it cannot be strided, because every output pixel needs a
+        // value this frame; the only lever is producing fewer of them and
+        // letting the resolve's UV sample upsample (giScreen).
+        //
+        // This is NOT `resolveScale`. Dropping that would take the AO/shadow
+        // composite down with it, and its silhouette edges are the thing ultra
+        // pays for. Irradiance is the smooth term — it is already a trilinear
+        // interpolation over a ~0.35 m probe lattice, so a half-resolution
+        // carrier is far below the frequency it can represent. Halving the
+        // resolve is a visible change; halving THIS should not be, and
+        // `probe:gi-src-cost` measures whether that holds rather than assuming.
+        readPixel: gatherReadPixel,
+        width: gatherWidth,
+        height: gatherHeight,
+        maxLods: MAX_LODS,
+        w0: W0,
+      })
+    : null;
+
   // ── [E']: HIT SHADING (plan §7 Phase 5, §12.26) ───────────────────────────
   //
   // OPT-IN, and gated on having something to shade WITH as well as a flag.
@@ -471,6 +541,22 @@ export function createSrcProbeSystem({
   // than a missing input. `STAT_UNATTRIBUTED` counts it if it ever happens.
   const staticSurfaceAt = surfaces?.surfaceAt ?? null;
   const shadeEnabled = srcShadeEnabled() && !!lighting && !!staticSurfaceAt;
+  // [J]'s gate, named once — the shader option and the telemetry both read it,
+  // because a boot line that disagrees with the built kernel is the §12.30
+  // failure this file keeps re-finding.
+  //
+  // ⚠⚠ OPT-IN (`__giSrcSecondary = true`) UNTIL [J] IS A SEPARATE PASS. The
+  // first wiring inlined `gatherAt` — 16 hash-find loops and 16 filtered tile
+  // taps — into the deposit kernel's hit shader, and the user's editor
+  // measured the consequence the same hour: the kernel went 58 kB → 323 kB
+  // WGSL (2 → 3 loops, 642 ifs) and its pipeline compile went to 48 SECONDS,
+  // the exact §13.14 unroll pathology this module already paid to learn.
+  // The plan's own [J] line said the architecture out loud — "steps B–H
+  // re-run over LAST FRAME'S HIT POINTS" — a pass of its own over a compact
+  // hit list, whose gather compiles ONCE in a ~20 kB kernel, not once per
+  // call site of the fattest kernel in the module.
+  const secondaryOn = !!(tiles && gather && tier.secondary !== false
+    && globalThis.__giSrcSecondary === true);
   const shadeHit = shadeEnabled && binStore
     ? createSrcHitShader({
         // Provenance lives HERE and nowhere else — `srcShade.js` never asks
@@ -543,11 +629,26 @@ export function createSrcProbeSystem({
           steps: Number(globalThis.__giSrcShadowSteps) || 64,
         }),
         voxelSize: volume.world.minCell,
-        // [J] is not built yet, so this is a single bounce and R4's ceiling has
-        // no loop to bound. It still applies — the ceiling is a property of the
-        // albedo, not of the loop, and turning it on later must not change what
-        // one bounce looks like.
-        secondary: null,
+        // ── [J]: THE SECONDARY TERM (§12.39) ─────────────────────────────
+        //
+        // `gatherAt` at the hit — the SAME position-indexed gather the screen
+        // and the exact-reflection path read, over the PRIMARY tile atlas.
+        // There is no separate coarser cache: the atlas already exists, is
+        // re-baked after the deposit each frame, and so holds LAST frame's
+        // irradiance when a hit samples it — a temporal fixed-point iteration,
+        // which is R4's own model. §12.26.9 measured the same-spacing cache as
+        // the LEAST-leaky row of its table (coarsening BRIGHTENS: the
+        // trilinear near-geometry leak scales with probe spacing, one-sided,
+        // inside a feedback loop), so reusing the primary lattice is the
+        // accurate choice, not just the free one. The loop's gain is bounded
+        // by `clampLoopAlbedo` at this very call site — the ceiling that was
+        // "a property of the albedo, not of the loop" while [J] was null now
+        // has its loop.
+        //
+        // `tier.secondary` is the low-tier opt-out (srcConfig — low ships
+        // single-bounce); `__giSrcSecondary = false` is the R12 hatch, and
+        // every pre-[J] gate result is reproduced by it.
+        secondary: secondaryOn ? (P, n) => gather.gatherAt(P, n).irradiance : null,
         // One NEE sample, and it is not a quality dial yet. With importance =
         // contribution the one-sample estimator IS the exact sum (§12.26.5), so
         // every extra sample buys only visibility variance — and the tiers have
@@ -641,70 +742,10 @@ export function createSrcProbeSystem({
       })
     : null;
 
-  // ── [H]: THE IRRADIANCE TILES (plan §12.18.7 unit 4) ─────────────────────
-  //
-  // c0 only, and only because [G] has already run: a merged c0 bin carries the
-  // whole cascade chain's answer at the finest spacing the hierarchy has, so
-  // tiles for cascades 1-3 would bake the same light more coarsely and nothing
-  // would read them.
-  //
-  // [I] below is what reads them: one filtered tap per trilinear corner, in
-  // the shading point's normal direction.
-  const tiles = binStore
-    ? createSrcTileAtlas(store, binStore, {
-        w0: W0,
-        // The scene's own Sky Light, composited against a bin's RESIDUAL
-        // transmittance — zero for every merged bin, so it only ever fires for
-        // the orphans. Zero when a project never set it, which means this build
-        // still renders exactly as it did.
-        sky: sky ? vec3(sky) : vec3(0),
-      })
-    : null;
-
-  // ── [I]: THE SCREEN GATHER (plan §12.18.7 unit 5) ────────────────────────
-  //
-  // Sparse-trilinear over the ≤8 nearest c0 probes, one filtered tile tap each,
-  // blended across the LOD overlap. This is what removes the ~0.6 m rectangles
-  // that every frame since §12.17 has had: `srcGather.js` (deleted with this
-  // unit) assigned ONE probe per pixel with no interpolation, so the blocks
-  // were the probe cells at the correct spacing and no probe density was ever
-  // going to remove them.
-  //
-  // `hashBlockFrame` is what makes the closure affordable inside the resolve —
-  // see its header for the three-buffers-to-two argument.
-  const hashBlockFrame = tiles ? createSrcHashBlockFrame(store, 0) : null;
-  const gather = tiles
-    ? createSrcScreenGather(store, tiles, {
-        lookup: hashBlockFrame.lookup,
-        spacing0,
-        camera: vec3(cameraU),
-        // The SAME anchor the population, the gizmos and the merge use. A
-        // gather that interpolates over a lattice placed from a second anchor
-        // reads plausible light from the wrong probes.
-        anchor: vec3(anchorU),
-        // ── THE GATHER RUNS COARSER THAN THE RESOLVE ─────────────────────
-        //
-        // It is per-OUTPUT-pixel work — one probe-lattice interpolation per
-        // screen pixel — and it measured **7.55 ms of a 34 ms SRC chain** on
-        // the user's editor at 1,599,840 px, second only to the deposit. Unlike
-        // the deposit it cannot be strided, because every output pixel needs a
-        // value this frame; the only lever is producing fewer of them and
-        // letting the resolve's UV sample upsample (giScreen).
-        //
-        // This is NOT `resolveScale`. Dropping that would take the AO/shadow
-        // composite down with it, and its silhouette edges are the thing ultra
-        // pays for. Irradiance is the smooth term — it is already a trilinear
-        // interpolation over a ~0.35 m probe lattice, so a half-resolution
-        // carrier is far below the frequency it can represent. Halving the
-        // resolve is a visible change; halving THIS should not be, and
-        // `probe:gi-src-cost` measures whether that holds rather than assuming.
-        readPixel: gatherReadPixel,
-        width: gatherWidth,
-        height: gatherHeight,
-        maxLods: MAX_LODS,
-        w0: W0,
-      })
-    : null;
+  // ([H]'s tile atlas, [I]'s gather and the hash→block frame are CONSTRUCTED
+  // above the hit shader now — [J]'s secondary term needs `gatherAt` at
+  // shadeHit build time. Their DISPATCH position is unchanged; the `passes`
+  // list below is the frame order, and construction order never was.)
 
   let anchored = false;
   let reanchors = 0;
@@ -742,12 +783,22 @@ export function createSrcProbeSystem({
           // a palette written after the rays that sample it is a frame of stale
           // colour on every material edit.
           ...(shadeEnabled ? surfaces?.passes ?? [] : []),
-          ...frame.passes, ...rayFrame.passes, ...deposit.passes,
+          ...frame.passes,
+          // ⚠ `hashBlock` MOVED UP for [J] (§12.39), and the move is
+          // correctness, not taste. The hash slot LAYOUT is rebuilt every
+          // frame by [K] with scheduler-dependent contention, so a key's slot
+          // index does not survive the rebuild — a tail written at the END of
+          // last frame is misaligned with THIS frame's keys the moment the
+          // population runs. The deposit's secondary term looks keys up
+          // per hit, so the words must be republished after compaction and
+          // BEFORE the first ray. Both inputs are settled by then (`hashSlot`
+          // and `PROBE_BLOCK` are compaction's outputs), and neither changes
+          // again within the frame, so the gather far below reads the same
+          // truth it always did.
+          hashBlockFrame.pass,
+          ...rayFrame.passes, ...deposit.passes,
           ...merge.passes, ...tiles.passes,
-          // `hashBlock` sits here and not with the population because it reads
-          // BOTH halves of what compaction settles (`hashSlot` and
-          // `PROBE_BLOCK`), and because its only consumer is the gather below.
-          hashBlockFrame.pass, gather.reset, gather.compute,
+          gather.reset, gather.compute,
         ]
       : [...frame.passes, ...rayFrame.passes],
     // ── WHO OWNS THE FRAME ──────────────────────────────────────────────────
@@ -766,11 +817,11 @@ export function createSrcProbeSystem({
       ? [
           { label: "surfaces (attribution palette)", count: (shadeEnabled ? surfaces?.passes ?? [] : []).length },
           { label: "populate", count: frame.passes.length },
+          { label: "hashBlock", count: 1 },
           { label: "rays", count: rayFrame.passes.length },
           { label: "deposit (trace + shade)", count: deposit.passes.length },
           { label: "merge", count: merge.passes.length },
           { label: "tiles", count: tiles.passes.length },
-          { label: "hashBlock", count: 1 },
           { label: "gather", count: 2 },
         ].filter((g) => g.count > 0)
       : [
@@ -784,6 +835,7 @@ export function createSrcProbeSystem({
           lights: (lighting?.lights ?? []).length,
           emitters: (lighting?.emitters ?? []).length,
           attributed: !!surfaces,
+          secondary: secondaryOn,
         }
       : null,
     width,
@@ -1003,7 +1055,8 @@ export function describeSrcProbeSystem(system) {
         // this module prints, so the log now names it.
         (system.shading
           ? `, SHADING (${system.shading.lights} lights, ${system.shading.emitters} emitters` +
-            `${system.shading.attributed ? ", static surfaces attributed" : ""})`
+            `${system.shading.attributed ? ", static surfaces attributed" : ""}` +
+            `${system.shading.secondary ? ", MULTIBOUNCE via the tile atlas" : ", single bounce"})`
           : ", NO hit shading (radiance is sky-only)") +
         (system.tiles
           ? `, ${system.tiles.layout.width}x${system.tiles.layout.height} tile atlas ` +

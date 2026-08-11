@@ -6620,3 +6620,125 @@ Still open after this unit, in flicker terms: the STRUCTURAL residue (§12.24's
 bin-membership floor — the sparse pops that dominate the counted set at low
 α), and §12.32's option (1) transport re-pricing, which is now a PERF unit
 rather than a flicker unit.
+
+### 12.39 [J] THE MULTIBOUNCE — THE PRIMARY ATLAS IS THE CACHE, AND THE INLINE VERSION COST 48 SECONDS OF COMPILE
+
+Phase 5's last open unit. §4.1's [J] prescribed "steps B–H re-run over last
+frame's hit points (2 LODs coarser)"; what landed is smaller and, on §12.26.9's
+own numbers, more accurate — and its first wiring re-taught §13.14's compile
+lesson at the user's expense within the hour.
+
+#### 12.39.1 No second cache — the tile atlas already is one
+
+`shadeHit`'s `secondary` socket is `gatherAt(P, n)` over the PRIMARY tile
+atlas. Three facts make that the right cache:
+- The atlas is re-baked AFTER the deposit each frame, so a hit samples LAST
+  frame's irradiance — a temporal fixed-point iteration, which is R4's model,
+  not the within-frame closure §12.26 forbade (that warning was about the
+  mirror's single-frame `runSrcFrame`).
+- §12.26.9 measured the SAME-SPACING cache as the least-leaky row of its table
+  (coarsening BRIGHTENS — the trilinear near-geometry leak scales with probe
+  spacing, one-sided, inside the loop). "2 LODs coarser" was a COST choice
+  from before [H] existed; the primary lattice is the accuracy choice.
+- `clampLoopAlbedo` was already applied at the hit "so turning [J] on later
+  must not change what one bounce looks like" — the ceiling was waiting for
+  its loop.
+
+Two structural changes carry it:
+- **The hash→block words moved into `hashKeys`' TAIL** (`hashBlockBase`), so
+  the key→block lookup costs ONE storage buffer. The deposit kernel is at 7 of
+  the portable 8 in both ray-hit modes (measured by the smoke's new ≥6
+  storage report), so the old two-buffer lookup did not fit it at all. One
+  buffer, one atomic node, atomic ops throughout — the store's own fold
+  pattern, not the rejected atomic/non-atomic aliasing. `test:gi-src-gather`
+  and `test:gi-src-tiles` re-run green through the folded lookup (borders
+  still bit-exact).
+- **`hashBlockFrame.pass` MOVED to directly after the population**, and the
+  move is correctness: [K] rebuilds the hash every frame with
+  scheduler-dependent contention, so a key's SLOT does not survive the
+  rebuild — a tail written at the END of last frame is misaligned with THIS
+  frame's keys, and a consumer would read the wrong probe's block with no
+  error anywhere (the §12.31 cross-probe shape). After compaction both of the
+  pass's inputs are settled and neither changes within the frame, so the
+  gather far below reads the same truth it always did.
+
+First pictures: the Cornell probe now shows red/green bleed on the white
+blocks — the picture §12.22.5 said a bounce-less build could not draw — and
+the smoke's exact-complex arm's tiles rose 0.3992 → 0.4478 peak irradiance
+(the deeper bounces accumulating) with the π·sky ceiling still exact on the
+no-shading sky arm.
+
+#### 12.39.2 ⚠⚠ THE INLINE WIRING PUT 48 SECONDS INTO THE DEPOSIT'S PIPELINE COMPILE
+
+`gatherAt` inlined into the hit shader — 16 hash-find LOOPS and 16 filtered
+tile taps at the shading site — took the deposit kernel from 58 kB / 2 loops
+to **323 kB / 3 loops / 642 ifs**, and the user's editor measured the
+pipeline compile at **48.1 s** (`#32 [src#30]`, their own boot log) inside a
+46 s compute wave. That is §13.14's unroll pathology re-created by hand: the
+WGSL cost of a kernel is not its runtime cost, and a loop-bearing helper
+inlined into the fattest kernel in the module multiplies compile time, not
+frame time. The runtime cost was fine — the COMPILE cost is disqualifying
+(R18 is a 1 s budget, and every quality toggle pays it again).
+
+**So [J] is OPT-IN (`__giSrcSecondary = true`) until it is a SEPARATE PASS**
+— which is what §4.1's own line prescribed all along: "re-run over last
+frame's HIT POINTS". The shape for the next unit: the deposit records compact
+hit points; a small dedicated kernel (the gather compiles ONCE, ~20 kB, like
+the screen gather's own pass) shades the secondary term and adds it into the
+bins. Everything landed here — the fold, the pass order, the socket, the R4
+gate — is what that pass plugs into.
+
+`test:gi-src-secondary` (`run-gi-src-secondary-probe.mjs`) is the R4 gate
+either way: closed Cornell box, the bounce arm opted in from boot, tail
+contraction asserted on the ROUND INCREMENTS (§12.26's lesson — a power
+iteration overshoots early, so only the tail is a contraction claim), the
+fixed point bounded between +8% over the single-bounce arm and R4's ×10 hard
+ceiling, and the boot line's MULTIBOUNCE/single-bounce wording asserted
+against the BUILT system.
+
+#### 12.39.3 The user's live ladder, profiled in the same breath as the pose
+
+`profile.giPasses` + `viewport.getCamera` on their editor (§12.35's named next
+step), quality high, camera inside the nave at (7.6, 1.3, −1.1):
+
+```
+SRC chain 26.6 ms of which deposit 21.2 (worst pass 17.4) — gather 2.0,
+populate 1.0, tiles 1.0, merge 0.8, rays 0.5; screen passes 0.3.
+126,008 rays at stride 5 ⇒ ~138 ns/ray INSIDE the nave.
+```
+
+Their fps ladder (ultra 15–20, high 35–40, medium 60, low 80–90) attributes
+cleanly to the deposit's marching cost — and 138 ns/ray against the harness's
+13–14 confirms §12.35's finding that per-ray cost is a property of ENCLOSURE:
+the pinned harness pose is cheap, their inside-the-nave pose is not. The
+transport re-pricing (§12.32 option 1, rays ∝ probes not pixels) is now the
+top open unit by user priority, with the ns/ray content-dependence measured
+here as its second axis.
+
+One diagnostic caveat from the same profile: it reported `shadedHitsPerFrame:
+0` while the boot line says SHADING and the frame visibly carries bounce —
+the profiler suspends rendering to measure, and the stat words it reads are
+per-frame cleared, so a suspended-frame readback can catch them empty. The
+counter needs a read-before-clear or the note will cry wolf. Logged, not yet
+fixed.
+
+#### 12.39.4 The R4 gate, hardened by its own first failure — and green
+
+The first run of `test:gi-src-secondary` read 0.0000 on every round of BOTH
+arms and reported "the loop adds no energy": it had measured its eight rounds
+INSIDE the bounce arm's 48 s pipeline compile, with no field-ready wait and no
+stability polling — the instrument-not-looking family the harness-traps memory
+exists for. Hardened (per-arm `[gi] field ready` wait, rounds polled to a 2%
+tail over a 150 s ceiling, and a BOTH-ARMS-BLACK result is a named instrument
+fault rather than a loop verdict), it passes:
+
+```
+multibounce  tail increments 0.0003 → 0.0003 → 0.0004 (noise floor 0.0031)
+energy       0.1541 vs single 0.1365  (+12.8% in a closed box)
+R4           1.13× — inside the 1/(1−0.9) = 10× hard ceiling
+telemetry    boot line says MULTIBOUNCE opted-in, single bounce opted-out
+```
+
+Smoke re-run at the shipping default: both src arms green, the exact arm's
+tiles back at single-bounce energy (0.41), the brick-box arm at zero. The
+loop exists, converges, is bounded, and costs nothing until asked for.

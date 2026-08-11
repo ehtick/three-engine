@@ -381,7 +381,27 @@ export function createSrcProbeStore({
   // behind an atomic node and a non-atomic node would save an `atomicLoad` in
   // the compaction pass and cost a second definition of what the buffer IS;
   // `atomicLoad` on a u32 is free on every target we ship to.
-  const hashKeys = instancedArray(new Uint32Array(hashTotal), "uint").toAtomic();
+  // ── AND A TAIL: THE c0 HASH→BLOCK WORDS (§12.39, [J]) ────────────────────
+  //
+  // One word per c0 hash slot, holding that slot's BIN BLOCK — what
+  // `createSrcHashBlockFrame` used to publish into its own buffer. It rides
+  // `hashKeys`' tail for the same R7 reason every other fold in this store
+  // exists: the tail turns the gather's key→block lookup into a ONE-buffer
+  // read, and the deposit kernel — [J]'s new caller — sits at 7 of the
+  // portable 8 storage buffers, so the two-buffer lookup does not fit there
+  // at all. (One buffer, one atomic node, atomic ops throughout — this is the
+  // fold pattern above, NOT the rejected atomic/non-atomic aliasing.)
+  //
+  // Initialized to SLOT_EMPTY, not zero: an unwritten tail word must read
+  // "absent", never "block 0" — the same rule PROBE_BLOCK's init states below.
+  // The block-frame pass rewrites the whole tail every frame before any
+  // consumer, so this covers exactly one thing: a consumer that somehow runs
+  // before the first block-frame dispatch reads a miss instead of stealing
+  // block 0's light.
+  const hashBlockBase = hashTotal;
+  const hashKeysInit = new Uint32Array(hashTotal + cascades[0].hashCapacity);
+  hashKeysInit.fill(SLOT_EMPTY, hashBlockBase);
+  const hashKeys = instancedArray(hashKeysInit, "uint").toAtomic();
   const hashSlot = instancedArray(new Uint32Array(hashTotal).fill(SLOT_EMPTY), "uint");
   const tableInit = new Uint32Array(probeTotal * PROBE_WORDS);
   // A slot no probe has ever occupied must read "no block", not "block 0" —
@@ -451,6 +471,8 @@ export function createSrcProbeStore({
     blockStackBase: probeTotal,
     /** Where the per-block claim stamps start inside `freeStack`. */
     blockStampBase: stampBase,
+    /** Where the c0 hash→block words start inside `hashKeys` (§12.39). */
+    hashBlockBase,
     hashKeys,
     hashSlot,
     probeTable,
@@ -458,8 +480,8 @@ export function createSrcProbeStore({
     freeStack,
     freeTop,
     /** Bytes on the GPU, for the memory high-water telemetry (plan §8). */
-    bytes: (hashTotal * 2 + probeTotal * PROBE_WORDS + probeTotal + blockTotal * 2
-      + cascadeCount * (COUNTER_WORDS + 2)) * 4,
+    bytes: (hashTotal * 2 + cascades[0].hashCapacity + probeTotal * PROBE_WORDS + probeTotal
+      + blockTotal * 2 + cascadeCount * (COUNTER_WORDS + 2)) * 4,
     dispose() {
       for (const b of [hashKeys, hashSlot, probeTable, counters, freeStack, freeTop]) {
         b?.value?.dispose?.();
@@ -816,8 +838,12 @@ export function createProbeLookup(store, cascade) {
  */
 export function createSrcHashBlockFrame(store, cascade = 0) {
   const c = store.cascades[cascade];
-  const { hashKeys, hashSlot, probeTable } = store;
-  const hashBlock = instancedArray(new Uint32Array(c.hashCapacity).fill(SLOT_EMPTY), "uint");
+  const { hashKeys, hashSlot, probeTable, hashBlockBase } = store;
+  if (cascade !== 0) {
+    // The tail is sized for c0 only — the one cascade any gather reads. A
+    // second cascade would need its own region, and nothing wants one.
+    throw new Error("createSrcHashBlockFrame: the hashKeys tail carries c0 only");
+  }
 
   const pass = Fn(() => {
     const i = instanceIndex.toVar();
@@ -829,10 +855,16 @@ export function createSrcHashBlockFrame(store, cascade = 0) {
     // SLOT_EMPTY covers both "no probe behind this slot" and "probe with no
     // block", so the consumer tests one condition rather than two — the same
     // collapse `srcDeposit.js` makes for the ancestor chain.
-    hashBlock.element(i).assign(block);
+    //
+    // The words live in `hashKeys`' TAIL (§12.39): the lookup below becomes a
+    // ONE-buffer read, which is what lets the deposit kernel — at 7 of 8
+    // storage buffers — afford [J]'s hit-side gather at all. `atomicStore` on
+    // the shared atomic node; the CAS inserts never range past `hashTotal`,
+    // so the two regions cannot race.
+    atomicStore(hashKeys.element(uint(hashBlockBase).add(i)), block);
   })().compute(c.hashCapacity);
 
-  /** key → bin block, or SLOT_EMPTY. Two storage buffers: `hashKeys`, `hashBlock`. */
+  /** key → bin block, or SLOT_EMPTY. ONE storage buffer: `hashKeys` (keys + tail). */
   const lookup = (key) => {
     const k = uint(key).toVar();
     const r = hashFindWgsl(
@@ -840,16 +872,18 @@ export function createSrcHashBlockFrame(store, cascade = 0) {
       uint(MAX_PROBE_STEPS), hashKeys,
     ).toVar();
     const out = uint(SLOT_EMPTY).toVar();
-    If(r.x.greaterThanEqual(0), () => { out.assign(hashBlock.element(uint(r.x))); });
+    If(r.x.greaterThanEqual(0), () => {
+      out.assign(atomicLoad(hashKeys.element(uint(hashBlockBase).add(uint(r.x)))));
+    });
     return out;
   };
 
   return {
     pass,
     lookup,
-    hashBlock,
-    bytes: c.hashCapacity * 4,
-    dispose() { hashBlock?.value?.dispose?.(); },
+    /** The tail rides the store's `hashKeys` — accounted there, nothing owned here. */
+    bytes: 0,
+    dispose() {},
   };
 }
 
