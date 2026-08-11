@@ -135,6 +135,7 @@
     "probe:gi-src-worldscale": "node scripts/run-gi-src-worldscale-test.mjs",
     "probe:gi-src-lattice": "node scripts/run-gi-src-lattice-test.mjs",
     "probe:gi-src-visual": "node scripts/run-gi-src-visual.mjs",
+    "probe:gi-src-cost": "node scripts/run-gi-src-cost-probe.mjs",
     "test:gi-src-volume": "node scripts/run-gi-src-volume-test.mjs",
     "probe:gi-debug-views": "node scripts/run-gi-debug-views-probe.mjs"
   },

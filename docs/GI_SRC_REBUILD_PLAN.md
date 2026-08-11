@@ -5005,3 +5005,168 @@ layers of quoting as a literal backspace byte.
 number that names a stage is not a measurement of that stage, and the instrument
 that would have said so is usually one level finer than the one already in the
 log.
+
+### 13.9 THE 44 PIPELINES NOBODY WAS WAITING FOR
+
+**User report, 2026-08-11: "the GI appears after like 3-4 minutes of wait, and
+performs at 3 fps on ultra."** §13's budget said 55 s. The gap is not drift — it
+is a set of pipelines that the startup instrument cannot see, and the mechanism
+is fully determined by code that was read, not guessed.
+
+`installAsyncComputePipelines` makes every GI compute pipeline creation async
+and non-blocking, and a dispatch whose pipeline has not landed is **SKIPPED**
+(`backend.compute`, GISystem.js — `if (!data.pipeline) … return`). That is the
+right design: frames keep flowing while the driver compiles. It also means a
+pipeline nobody awaits is invisible *and* its pass silently does nothing.
+
+The prewarm loop awaits exactly one list:
+
+```js
+const computeNodes = [...state.queue];        // GISystem.js:1909
+```
+
+`state.queue` is assembled at GISystem.js:4110–4327 and contains **only the
+screen chain** — resolve, the four light-shadow passes, the emitter chain.
+`profile.giPasses` confirms it from the running editor: `queueMs` has **5**
+entries. SRC's passes are not in it. They are dispatched directly:
+
+```js
+giCompute(renderer, state.screen.srcProbes.passes);   // GISystem.js:1363
+```
+
+and `profile.giPasses` counts them separately: **`dispatches: 44`**.
+
+So on the user's machine:
+
+| | pipelines | awaited by the wave? | counted in the log? |
+|---|---|---|---|
+| `state.queue` | 5 | yes | yes (`compute kernels: 5`) |
+| **SRC** | **44** | **no** | **no** |
+
+The wave prints `compile wave: materials 1647ms, computes 68312ms` and declares
+itself finished. The first frame after it then triggers 44 async pipeline
+creations, the driver serializes them (§13.3, and the per-pipeline number is
+LATENCY not compile time), and every SRC dispatch is skipped until the last one
+resolves. Since [I] made SRC's screen gather the **primary** diffuse term
+(§12.30.1), skipped SRC dispatches mean no indirect light at all.
+
+**That is the whole of "GI appears after 3-4 minutes":** 68 s of counted wave,
+then an uncounted second wave of 44 more pipelines during which GI is
+structurally absent. Neither log line is wrong about what it measures; between
+them they cover 5 pipelines out of 49 and imply completion at the point where
+90% of the work starts.
+
+Two more things the same console dump shows, worth separating from the above so
+they are not conflated with it:
+
+- **Two GI systems compiled concurrently.** `4 compute pipelines … 62926ms` and
+  `2 compute pipelines … 134891ms` printed at the same millisecond, from two
+  waves whose `materials` legs differ (896 ms vs 4000 ms). A rebuild does not
+  cancel the outgoing system's in-flight compiles, so the second wave queues
+  behind the first on a serializing driver and pays 135 s for 2 pipelines.
+- **`resolveMaxPixels: 1_600_000` is not biting but is close.** The editor's
+  drawing buffer is 1656×950 = 1,573,200. A slightly larger viewport crosses the
+  ceiling and the resolve shrinks isotropically — which would change SRC's
+  entire cost model as a side effect of a window drag. Recorded because the next
+  person to measure a frame at a different window size needs to know.
+
+**The fix has two independent halves and only the first is cheap.** (1) Put
+SRC's passes in the prewarm set and in the kernel count, so the wave covers what
+it claims and the number is honest — this does not make startup faster, it makes
+it *measured*, and it moves the stall inside the window `bootAmbient` exists to
+cover. (2) R18's ≤1 s needs the pipeline COUNT down or the disk cache reliably
+engaged (§13.5); 49 pipelines at the measured ~0.7 s of serialized latency each
+is ~34 s no matter how small each kernel is, and §13.4 already showed a 154 kB
+kernel compiling 85× faster than a 16 kB one. **Merging dispatches is therefore
+the direction, not splitting them** — but every merge candidate has to survive
+the barrier argument in `srcRays.js`'s [D] header, which is why this is a
+measurement task and not a refactor.
+
+### 12.31 WHERE THE 3 FPS IS — AND THE TIER THE FIRST SWEEP MEASURED
+
+**User report, 2026-08-11: "3 fps on ultra… we need <1 sec startup for GI and at
+least stable 60 fps on ultra, 120 fps on low."** (The sky is deliberately at
+zero: "first we make lights right, then the sky." So the §12.30.3 environment
+note is answered and closed — it is not a bug, it is the order of work.)
+
+`profile.giPasses` against the live editor, Sponza, ultra, drawing buffer
+1656×950:
+
+| group | ms | dispatches |
+|---|---|---|
+| **deposit (trace + shade)** | **249.048** | **3** |
+| gather | 6.151 | 2 |
+| rays | 1.888 | 10 |
+| populate | 1.877 | 17 |
+| merge | 0.877 | 8 |
+| tiles | 0.481 | 2 |
+| hashBlock / surfaces | 0.021 | 2 |
+| **SRC chain** | **260.343** | 44 |
+| screen resolve | 5.661 | — |
+
+One group is the frame: **95.7%**. The other 41 dispatches total 11.3 ms.
+
+The transport's domain is the screen. `srcSystem` sets `pixelCount = width *
+height`; the population inserts a probe per gbuffer pixel, `srcRays`'s [D1]
+gives each pixel `raysPerPixel` rays, and the deposit is dispatched **per pixel**
+with the ray loop unrolled inside (`srcDeposit.js`'s [E]). At ultra that is
+1,573,200 px × 2 = **3,146,400 rays per frame**, servicing **5,692 live probes** —
+about 553 rays per probe per frame, against the 0.78 rays/bin this design
+measured for itself in §12.13.
+
+`srcConfig.js` says the intended domain in as many words — "`raysPerPixel` counts
+full-length rays per **half-res** gbuffer pixel" — but `giConfig.js`'s tier table
+gives ultra `resolveScale: 1`, and its comment prices that choice with the DENSE
+backend's cost model: *"Half-res resolve… Ultra pays ~4× the resolve to remove
+it"* (measured then at 9 ms → 22 ms). Under SRC `resolveScale` is no longer the
+price of a resolve pass — the resolve pass still costs 5.66 ms at full res — it
+is the size of the entire transport. **The tier table was never re-derived when
+the backend under it was replaced.**
+
+#### 12.31.1 The first sweep measured tier LOW and answered a different question
+
+`probe:gi-src-cost` sweeps `resolveScale` through `__giConfigOverride` with
+everything else held. Run 1, four arms:
+
+```
+scale   transport px      rays    deposit ms   ns/ray   screen mean   lit
+1           315952     315952        1.598      5.1       0.07585 31.8%
+0.5          78988      78988        1.642     20.8       0.06853 29.0%
+0.25         19796      19796        0.763     38.5       0.06792 29.4%
+```
+
+and it printed, confidently: *"NOT a clean per-ray cost — ns/ray moves across
+the sweep."*
+
+Every number there is real and the conclusion does not apply, because **all
+three arms ran at tier `low`** (s₀=0.8, w₀=4, 1 ray/px, secondary cache off) —
+the tier the scene happened to be saved at, not the ultra the question was
+about. The probe forced `resolveScale` and inherited `quality`. It is now
+pinned: `resolveGiConfig` applies `BY_TIER[quality]` *before* the override, so
+`{quality, resolveScale}` sets the SRC tier and the pixel count independently.
+
+**The instrument fault underneath is worth more than the run.** The verdict
+thresholded `max(ns/ray) / min(ns/ray)` against 1.35. But the deposit is
+`floor + slope·rays`, and when the floor is comparable to the ray term ns/ray
+*must* climb as rays fall **on a perfectly linear cost**. At tier low the whole
+deposit is 1.6 ms, so the floor is nearly all of it — the statistic measured the
+floor and reported it as a refutation of linearity. It now fits both terms by
+least squares and prices the fix off the SLOPE, because cutting rays can never
+buy back a floor. Same family as §12.28's `maxL`: a summary statistic chosen
+before the cost model was written down.
+
+**One thing run 1 did establish, and it is good news:** at tier low the entire
+SRC chain is **2.43 ms** over 44 dispatches. The 120 fps-on-low target is not
+far away; the work is at the top of the ladder.
+
+#### 12.31.2 Two corrections to what was said about the deposit
+
+- **"NEE fires four shadow rays per hit" — WRONG for this scene.** `MAX_GI_LIGHTS`
+  is 4 and `srcShade.js` unrolls four *slots*, but each is gated on
+  `cos > 0 AND E > 0`, and the user's Sponza has **1 active light and 0
+  emitters**. A hit casts at most one shadow ray. The code says so at the loop:
+  *"Measure before assuming it matters — the cosine gate means most hits pay for
+  one or none."* `lightTree.js` is therefore NOT the lever it was billed as, and
+  drops well down the list.
+- **The 44 SRC dispatches are not in the compile wave** — see §13.9. That is the
+  startup half of the same report and it has a different cause.
