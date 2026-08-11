@@ -781,7 +781,33 @@ export function createSrcProbeSystem({
       // Cheap when `SlotRegistry.revision` is unchanged, which is every frame
       // that is not a material edit.
       if (shadeEnabled) surfaces?.sync?.();
-      const keep = 1 - readAlpha();
+      // ══ THE DECAY MUST FOLLOW THE REFRESH RATE, NOT THE FRAME RATE ═══════
+      //
+      // α is "how much of a probe's estimate is replaced by new evidence", and
+      // §12.23 measured the whole temporal design at α = 0.1 PER REFRESH, back
+      // when every pixel fired every frame so refresh rate == frame rate.
+      //
+      // The ray ceiling broke that identity and I did not notice: with a stride
+      // of S a probe receives rays every S-th frame, while the decay pass still
+      // runs over every allocated bin EVERY frame. At the user's resolution
+      // S ≈ 12, so between two refreshes a bin's sums are multiplied by
+      // 0.9^12 = 0.28 — **72% of the accumulated evidence destroyed before
+      // anything arrives to replace it.** Bins sink under `MIN_WEIGHT`, retire,
+      // and return a frame later, and §12.24 already named what that looks
+      // like: the step floor is bin-level MEMBERSHIP, because a bin leaving the
+      // readable set changes the renormalization denominator the gather divides
+      // by. On screen it is flicker, and the user reported exactly that.
+      //
+      // So decay per FRAME becomes the S-th root of the intended decay per
+      // REFRESH: over S frames the product is exactly `1 − α` again, which is
+      // the number every §12.23 measurement was taken at. At S = 1 this is
+      // identically `1 − α` and nothing changes, which is where all the gates
+      // run.
+      //
+      // ⚠ It is a root, not a division. `keep/S` or `1 − α/S` both look
+      // plausible and neither composes: decay is MULTIPLICATIVE across frames,
+      // so the only function whose S-fold product is `1 − α` is its S-th root.
+      const keep = (1 - readAlpha()) ** (1 / Math.max(1, rayStride));
       if (keepU.value !== keep) keepU.value = keep;
       // The stamp advances with the jitter and for the same reason: both are
       // "which frame is this", and the decay pass compares against it exactly.
