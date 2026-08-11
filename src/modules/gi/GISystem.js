@@ -243,12 +243,40 @@ function staticBvhStrategy() {
   return BVH_STRATEGY[name] ?? BVH_STRATEGY.sah;
 }
 
+/** The node whose dispatch is currently on the stack. Pipeline creation happens
+ *  synchronously inside `renderer.compute(node)` on the node's FIRST dispatch,
+ *  so this is readable from the `device.createComputePipeline` wrapper — which
+ *  is how a pipeline learns which PASS it belongs to. §13.14.8: five sessions
+ *  of "which kernel is the slow one" failed because the shadow-estimator family
+ *  shares one WGSL fingerprint (light-shadow, emitter-shadow, feedback — all
+ *  descend the same BVH with the same width probe). Names end that permanently. */
+let giCurrentComputeNode = null;
+
 /** Dispatch wrapper for GISystem's own renderer.compute calls — marks skips
  *  as GI-owned so they take the ordered-retry path, not the replay path. */
 function giCompute(renderer, nodes) {
   giDispatchDepth++;
   try {
-    renderer.compute(nodes);
+    if (Array.isArray(nodes)) {
+      // One at a time, so the current-node tracker stays truthful for the
+      // pipeline each dispatch creates. three accepts arrays, but an array
+      // dispatch would leave every pipeline in it attributed to the ARRAY.
+      for (const node of nodes) {
+        giCurrentComputeNode = node;
+        try {
+          renderer.compute(node);
+        } finally {
+          giCurrentComputeNode = null;
+        }
+      }
+      return;
+    }
+    giCurrentComputeNode = nodes;
+    try {
+      renderer.compute(nodes);
+    } finally {
+      giCurrentComputeNode = null;
+    }
   } finally {
     giDispatchDepth--;
   }
@@ -332,6 +360,13 @@ function installAsyncComputePipelines(renderer) {
         order,
         ms: null,
         label: descriptor?.label ?? "",
+        // The PASS, from the dispatch that is synchronously on the stack right
+        // now (see giCurrentComputeNode). "gi:unnamed" = dispatched through
+        // giCompute by a site that never stamped a name; "non-gi" = a dispatch
+        // that bypassed giCompute entirely — both localize a kernel harder
+        // than any fingerprint has managed.
+        pass: giCurrentComputeNode?.__giPassName
+          ?? (giDispatchDepth > 0 ? "gi:unnamed" : "non-gi"),
         // Kept as a fingerprint, never as the source: a 77 kB string per
         // pipeline held for the life of the page is a leak, and the three
         // numbers below are what actually distinguishes one kernel from
@@ -1571,6 +1606,9 @@ export class GISystem {
       const occPasses = state.volume.occupancyField?.isDirty
         ? state.volume.occupancyField.passes()
         : null;
+      // Freshly minted nodes each rebuild (see the spawn-blink comment below),
+      // so the stamp has to happen at use, not at some one-time build site.
+      occPasses?.forEach((n, i) => { if (n && typeof n === "object") n.__giPassName ??= `occupancy#${i}`; });
       const skippedBefore = giSkippedComputes.size;
       // THE SPAWN-BLINK GUARD (2026-08-04, run-gi-spawn-blink measured it), and
       // it OUTLIVES the composite it was written for. A geometry change rebuilds
@@ -2072,6 +2110,32 @@ export class GISystem {
             if (node) coldShadow.add(node);
           }
         }
+        // ── AND THE EMITTER CHAIN, WHICH IS THE SAME DISEASE ONE TWIN OVER ──
+        //
+        // §13.14.8: the frame loop dispatch-skips the emitter shadow chain
+        // whenever the scene has 0 emitters (the `skip` set above, ~line 1688)
+        // — but the chain sits in `state.queue`, so THIS warm-up compiled it
+        // anyway. Its trace kernel is the light-shadow marcher's twin (same
+        // estimator family, 4 slots × a full BVH8 any-hit descent + width
+        // probe, two 4-scalar stores), it fingerprints at 77 kB / 4 loops /
+        // 204 ifs, and it measured 47-133 s across boots — THE dominant term
+        // of the user's "GI takes minutes" wave, compiled for a pass the very
+        // next frame refuses to dispatch on a "0 emitters" scene.
+        //
+        // Same remedy as the light chain, and the ramp is already built: when
+        // an emitter appears, the runtime skip lifts, the first dispatch
+        // creates the pipeline asynchronously, and frames keep flowing while
+        // it compiles (installAsyncComputePipelines' skip-until-ready path).
+        // Nothing here needs a rebuild.
+        if (!(this._emitterInfos?.length > 0)) {
+          for (const name of [
+            "emitterShadowPass", "emitterShadowFilterPass",
+            "emitterShadowHistoryPass", "emitterShadowPostPass",
+          ]) {
+            const node = state.screen?.[name]?.compute;
+            if (node) coldShadow.add(node);
+          }
+        }
         // Filtered out of BOTH loops. The re-dispatch below would otherwise
         // trigger the very creation this skipped, which is the kind of fix that
         // measures as no change and reads as a mystery.
@@ -2096,9 +2160,15 @@ export class GISystem {
         if (reflectNode) queueWarm.push(reflectNode);
         const warmNodes = [...queueWarm, ...srcPasses];
         if (coldShadow.size) {
+          // Named per chain, because "which optional chains did this boot
+          // compile" is the gate-state question §13.14.6 made mandatory.
+          const emitterSkipped = !(this._emitterInfos?.length > 0);
           console.log(
-            `[gi] skipping ${coldShadow.size} light-shadow pipelines at warm-up — no light uses ` +
-              'Shadow Source "gi", so they are never dispatched. They compile on first use.',
+            `[gi] skipping ${coldShadow.size} pipelines at warm-up — ` +
+              (anyGiShadow ? "" : 'light-shadow chain (no light uses Shadow Source "gi")') +
+              (!anyGiShadow && emitterSkipped ? " + " : "") +
+              (emitterSkipped ? "emitter-shadow chain (0 emitters)" : "") +
+              ". Never dispatched while unused; they compile on first use.",
           );
         }
         const kernelSizes = [];
@@ -2232,13 +2302,14 @@ export class GISystem {
             // `kernelSizes` zip stays only as a fallback for the warmed range.
             const kb = slowest.kb ?? kernelSizes[slowest.order] ?? "?";
             console.log(
-              `[gi] SLOWEST PIPELINE: #${slowest.order} took ${(slowest.ms / 1000).toFixed(1)}s ` +
+              `[gi] SLOWEST PIPELINE: #${slowest.order}` +
+                `${slowest.pass ? ` [${slowest.pass}]` : ""} took ${(slowest.ms / 1000).toFixed(1)}s ` +
                 `(${kb}kB WGSL${slowest.label ? `, "${slowest.label}"` : ""}` +
                 `${slowest.entry ? `, entry ${slowest.entry}` : ""}` +
                 `${slowest.loops != null ? `, ${slowest.loops} loops / ${slowest.ifs} ifs` : ""}` +
                 `${slowest.binds ? `, binds ${slowest.binds}` : ""}) ` +
                 `of ${(total / 1000).toFixed(1)}s summed over ${timed.length} pipelines. ` +
-                "Size does not predict this (§13.4) — the BINDINGS name it.",
+                "The [pass] tag is the dispatch site's own name — trust it over any fingerprint.",
             );
             // The runner-up matters as much as the winner: "one pathological
             // kernel" and "every kernel of this shape is slow" are different
@@ -2247,7 +2318,7 @@ export class GISystem {
             const rest = timed.filter((p) => p !== slowest).sort((a, b) => b.ms - a.ms).slice(0, 3);
             if (rest.length) {
               console.log(
-                `[gi] next slowest: ${rest.map((p) => `#${p.order} ${(p.ms / 1000).toFixed(1)}s` +
+                `[gi] next slowest: ${rest.map((p) => `#${p.order}${p.pass ? ` [${p.pass}]` : ""} ${(p.ms / 1000).toFixed(1)}s` +
                   `${p.kb != null ? ` (${p.kb}kB${p.binds ? `, ${p.binds.split(",")[0]}` : ""})` : ""}`).join(", ")}`,
               );
             }
@@ -4640,6 +4711,19 @@ export class GISystem {
         { low: 0.02, medium: 0.012, high: 0.006, ultra: 0.002 }[quality] ?? 0.006,
     });
     if (screen) {
+      // ── NAME EVERY PASS'S COMPUTE NODE (§13.14.8) ────────────────────────
+      //
+      // The pipeline timing reads these via giCurrentComputeNode, which is how
+      // `[gi] SLOWEST PIPELINE` finally says WHICH pass instead of an index.
+      // Five sessions failed to attribute one kernel because the shadow
+      // estimator family shares a WGSL fingerprint; a name at the dispatch
+      // site is immune to that.
+      for (const [key, bundle] of Object.entries(screen)) {
+        if (bundle?.compute?.isNode ?? bundle?.compute) bundle.compute.__giPassName = key;
+      }
+      screen.srcProbes?.passes?.forEach((p, i) => {
+        if (p && typeof p === "object") p.__giPassName ??= `src#${i}`;
+      });
       // Emitter shadow trace + filter FIRST — the resolve samples their
       // output texture in the same frame.
       if (screen.emitterShadowPass) {

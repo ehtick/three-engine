@@ -6181,3 +6181,54 @@ Two facts, both free, both against it:
 So: recorded, and the resolve candidate goes back on the pile rather than into a
 fix. The identification is now a bounded task — the tooling names outputs — and
 the rule from §13.14.6 applies to it too: no fix until the owner is confirmed.
+
+#### 13.14.8 TWO SETTLED NEGATIVES, THEN THE OWNER
+
+**The DXC hypothesis is dead.** `probe:wgsl-compile` grew a `DAWN=<toggles>` env
+(`--enable-dawn-features=…`) to test whether the minutes were FXC-vs-DXC — the
+classic Windows explanation for loop-heavy shaders compiling pathologically.
+Same kernel, same process shape: default **11.4 s**, `use_dxc` **12.3 s**. No
+compiler-flag rescue exists; the cost is real work in whatever backend Chrome
+already uses.
+
+**The "reflections ≈ 23 s / hit shading ≈ 35 s" ladder (§13.14.7) is VOID.** The
+90 s "shading ON" arm ran while the user's editor was compiling its own 133.6 s
+wave — the same config re-measured on a quiet machine reads 52.5 s. The driver
+queue is effectively machine-wide, so §13.3's rule ("the per-pipeline number is
+latency") extends across PROCESSES: no boot-probe number taken while any other
+WebGPU process is compiling is comparable to anything. The reflection consumer
+gate (§13.14.6) remains correct — the pass compiles for nobody — but its measured
+price on a quiet machine is TBD.
+
+##### The owner, pinned by dispatch logic rather than fingerprint
+
+The dumped kernel's tail is two `textureStore`s of FOUR SCALARS each — a
+shadow-channel pair (filtered/raw or shadow/dist), not a resolve's color. Two
+passes have that shape and the same estimator family: `createGiLightShadowPass`
+and `createGiEmitterShadowPass`. The fingerprint cannot separate them — but the
+dispatch logic can:
+
+* the light-shadow chain is in `coldShadow` (§13.13) — never warmed, never
+  dispatched with no gi-flagged light, so its pipeline is NEVER CREATED;
+* the emitter chain is dispatch-skipped at runtime on 0-emitter scenes
+  (`GISystem.js:1688`, shipped for a 0.119 ms filter cost) — **but it sits in
+  `state.queue`, so the warm-up compiled it anyway.**
+
+A pipeline that exists but is never frame-dispatched must have been created by
+the warm-up: **the monster is the emitter shadow chain's trace kernel.** Four
+`MAX_EMITTERS` slots, each with a full BVH8 any-hit descent + exact dynamic
+trace + analytic width probe (the 2026-08-06 estimator unification), compiled at
+capacity for a scene logging `0 emitters` — while the very next frame refuses to
+dispatch it. §13.13's sentence recurs one twin over: the most expensive object
+in the boot is a kernel that never runs.
+
+Fix: the emitter chain joins the same `coldShadow` warm-up filter when
+`_emitterInfos` is empty. The ramp costs nothing new — the moment an emitter
+appears, the 1688 skip lifts, the first dispatch creates the pipeline
+asynchronously, and frames keep flowing while it compiles. No rebuild involved.
+
+Residual named honestly: a scene that GAINS its first emitter mid-game pays the
+compile then (async, non-blocking, but emitter shadows are absent until it
+lands). The follow-up that shrinks that window is rolling the 4-slot unroll into
+a GPU loop — one descent instead of four — which §13.14.4's call-site bisection
+already priced. Separate change, separate measurement.

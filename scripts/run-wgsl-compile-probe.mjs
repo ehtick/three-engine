@@ -83,6 +83,13 @@ const browser = await puppeteer.launch({
     "--enable-unsafe-webgpu", "--enable-features=WebGPU", "--no-sandbox", "--disable-dev-shm-usage",
     "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows",
     "--disable-renderer-backgrounding",
+    // DAWN=use_dxc (or any comma list) forwards Dawn toggles. THE hypothesis
+    // this exists for: on Windows, Dawn's D3D12 backend has historically
+    // compiled HLSL through FXC unless DXC is toggled on, and FXC on
+    // loop-heavy shaders is notoriously minutes-slow — which would explain a
+    // 26s/77kB kernel better than anything in the WGSL itself. One env var,
+    // one A/B, no engine change.
+    ...(process.env.DAWN ? [`--enable-dawn-features=${process.env.DAWN}`] : []),
     // A fresh profile each run, so nothing is answered out of Chrome's
     // compiled-shader disk cache. §13.5 measured that cache at 72x — leaving it
     // on would make the second arm of any A/B win for the wrong reason.

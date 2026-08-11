@@ -149,7 +149,10 @@ function pageHook() {
 // user's editor and not in this harness. An attribution taken under an
 // unstated gate state is not a measurement of anything.
 const GATES = [
-  ["light-shadow chain", /skipping \d+ light-shadow pipelines/, "SKIPPED", "COMPILED"],
+  // Both spellings of the skip line: pre-§13.14.8 ("N light-shadow pipelines")
+  // and current ("N pipelines at warm-up — … light-shadow chain").
+  ["light-shadow chain", /skipping \d+ (?:light-shadow pipelines|pipelines at warm-up.*light-shadow chain)/, "SKIPPED", "COMPILED"],
+  ["emitter-shadow chain", /skipping \d+ pipelines at warm-up.*emitter-shadow chain/, "SKIPPED", "COMPILED"],
   ["exact reflections", /bvh: exact reflections ON/, "COMPILED", "off"],
   ["SRC hit shading", /SHADING \(/, "ON", "off"],
 ];
@@ -192,6 +195,10 @@ async function runArm(arm) {
     if (!/\[gi\]/.test(t)) return;
     const at = Date.now();
     lines.push({ at, t });
+    // Echo the engine's own attribution lines verbatim — the [pass] tag in
+    // SLOWEST PIPELINE is the whole point of §13.14.8's naming instrument,
+    // and a probe that swallows it forces another run.
+    if (/SLOWEST PIPELINE|next slowest|skipping \d+ /.test(t)) console.log(`  ${t.slice(0, 300)}`);
     if (/compile wave started/.test(t)) marks.waveStart = at;
     if (/compile wave: materials \d+ms, computes \d+ms/.test(t)) { marks.waveDone = at; waveDone = true; }
     if (/first frame after compile wave/.test(t)) { marks.firstFrame = at; firstFrame = true; }
