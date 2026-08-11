@@ -123,7 +123,35 @@ const CEILING_ARMS = [
   { name: "ceiling 65536", scale: 1, ceiling: 65536 },
   { name: "ceiling 16384", scale: 1, ceiling: 16384 },
 ];
-const ALL = SWEEP === "ceiling" ? CEILING_ARMS : SWEEP === "camera" ? CAMERA_ARMS : SCALE_ARMS;
+// ── `SWEEP=cap` — WHAT DOES THE PER-PROBE RAY CAP BUY, IN ONE PAGE? ─────────
+//
+// The cap is a POLLED uniform (`__giSrcProbeRayCap`), so unlike every sweep
+// above this one runs all its arms inside ONE page, one build, one viewport —
+// the comparison §12.32.1 said the ceiling sweep should have been. Arms:
+// cap OFF (0), then 32 / 16 / 8. Each arm reads the FIRED ray count from the
+// deposit kernel's own tally (`raysPerFrame`) — the boot line's `rays/frame`
+// is an upper bound once a cap is live, and dividing deposit ms by the bound
+// would overstate the kernel by exactly the savings under test.
+const CAP_ARMS = [{ name: "cap sweep", scale: 1 }];
+const CAP_VALUES = [0, 32, 16, 8];
+// ── `SWEEP=histo` — HOW SKEWED IS PER-PROBE SCREEN COVERAGE? ────────────────
+//
+// §12.32.1's option (1) prices the transport in PROBES: cap each c0 probe's
+// per-frame ray count at B instead of letting it ride pixel membership. The
+// entire win of that cap is the SKEW of the membership distribution — a probe
+// covering 500 pixels pays 500·rpp rays for bins a few dozen would converge —
+// and the skew is not knowable from the code: the distance-adaptive lattice
+// (§12.29) deliberately grows cells with distance, which pushes per-probe
+// footprint TOWARD constant. If it got there, Σ min(count, B) ≈ Σ count and
+// the cap buys nothing. So measure the distribution before designing around
+// it: read `probeTable`'s PROBE_RAYS for live c0 probes over a few frames
+// (each frame is one stride phase) and price Σ min(count, B) for candidate B.
+const HISTO_ARMS = [{ name: "histo", scale: 1 }];
+const ALL = SWEEP === "ceiling" ? CEILING_ARMS
+  : SWEEP === "camera" ? CAMERA_ARMS
+  : SWEEP === "histo" ? HISTO_ARMS
+  : SWEEP === "cap" ? CAP_ARMS
+  : SCALE_ARMS;
 const only = process.env.SCALE;
 const arms = only ? ALL.filter((a) => String(a.scale) === only) : ALL;
 
@@ -152,13 +180,21 @@ for (const arm of arms) {
     if (/compile wave: materials \d+ms, computes/.test(t)) waveDone = true;
   });
   page.on("pageerror", (e) => errors.push(String(e?.message ?? e).slice(0, 200)));
-  await page.evaluateOnNewDocument((project, scale, qualityTier, ceiling) => {
+  await page.evaluateOnNewDocument((project, scale, qualityTier, ceiling, pinCapOff) => {
     localStorage.setItem("engine.projectRoot.v1", project);
     localStorage.setItem("engine.recentProjects.v1", JSON.stringify([project]));
     globalThis.__editorKeepRendering = true;
     globalThis.__giLogSrcProbes = true;
     globalThis.__giSrcProbes = true;
     globalThis.__giSrcShade = true;
+    // Every sweep EXCEPT `cap` pins the per-probe cap OFF. Two instruments
+    // break silently without this: the scale/ceiling/camera sweeps divide
+    // deposit ms by the boot line's `rays/frame`, which is only the FIRED
+    // count when no cap is live (under a cap it is a bound, and ns/ray would
+    // underreport); and `SWEEP=histo` histograms PROBE_RAYS, which [D1']
+    // clamps in place — a capped histogram of min(count, B) reads as "the
+    // skew is gone" when what is gone is the instrument.
+    if (pinCapOff) globalThis.__giSrcProbeRayCap = 0;
     // THE ONE VARIABLE. `resolveScale` is a `giConfig` field, so the documented
     // measurement hatch reaches it without a code change and without adding a
     // knob — which is the whole point of there being exactly one hatch.
@@ -180,7 +216,7 @@ for (const arm of arms) {
     // experiment than the one the header describes.
     globalThis.__giConfigOverride = { quality: qualityTier, resolveScale: scale };
     if (ceiling) globalThis.__giSrcTransportRays = ceiling;
-  }, PROJECT, arm.scale, QUALITY, arm.ceiling ?? null);
+  }, PROJECT, arm.scale, QUALITY, arm.ceiling ?? null, SWEEP !== "cap");
   await page.goto(URL_BASE, { waitUntil: "load", timeout: 60000 });
   await page.waitForSelector(".hub-recent-open-btn", { timeout: 60000 });
   await page.evaluate((project) => {
@@ -258,6 +294,98 @@ for (const arm of arms) {
     const resolvePx = (p.value?.pixels?.resolve ?? []).join("x");
     if (!src) console.log(`      · profile.giPasses returned no srcProbes — ${p.error ?? "(no error)"}`);
 
+    // ── THE CAP ARMS (SWEEP=cap only) — one page, uniform writes ────────────
+    if (SWEEP === "cap") {
+      const shotStats = async (name) => {
+        const shot2 = await call("viewport.screenshot", { width: 700, height: 460, includeGizmos: false });
+        if (!shot2.ok || !shot2.value?.__image?.base64) return { mean: null, lit: null };
+        const png = Buffer.from(shot2.value.__image.base64, "base64");
+        await sharp(png).toFile(`${OUT}/src-cost-${QUALITY}-cap-${name}.png`);
+        const { data, info } = await sharp(png).raw().toBuffer({ resolveWithObject: true });
+        const n2 = data.length / info.channels;
+        let sum = 0; let count = 0;
+        for (let i = 0; i < n2; i++) {
+          const j = i * info.channels;
+          const v = 0.2126 * data[j] + 0.7152 * data[j + 1] + 0.0722 * data[j + 2];
+          sum += v; if (v > 12) count++;
+        }
+        return { mean: sum / n2 / 255, lit: count / n2 };
+      };
+      const rows = [];
+      for (const capVal of CAP_VALUES) {
+        await page.evaluate((v) => { globalThis.__giSrcProbeRayCap = v; }, capVal);
+        // The uniform lands next frame; the MEAN needs ~stride/α frames to
+        // re-converge (~1.7 s here) — 6 s is ~3.5 of those time constants.
+        await wait(6000);
+        const pr = await call("profile.giPasses", { samples: 6 });
+        const sp = pr.value?.srcProbes;
+        if (!sp) { console.log(`      · cap ${capVal}: no srcProbes — ${pr.error ?? ""}`); continue; }
+        const { mean: m2, lit: l2 } = await shotStats(capVal === 0 ? "off" : String(capVal));
+        const row2 = {
+          cap: capVal,
+          publishedCap: sp.probeRayCap,
+          fired: sp.raysPerFrame ?? null,
+          shaded: sp.shadedHitsPerFrame ?? null,
+          deposit: sp.groupMs?.["deposit (trace + shade)"]?.ms ?? null,
+          chain: sp.totalMs ?? null,
+          mean: m2,
+          lit: l2,
+        };
+        rows.push(row2);
+        console.log(
+          `  cap ${String(capVal === 0 ? "off" : capVal).padEnd(4)} (published ${row2.publishedCap})  ` +
+          `${String(row2.fired ?? "?").padStart(8)} rays fired  ${String(row2.shaded ?? "?").padStart(8)} shaded  ` +
+          `deposit ${String(row2.deposit ?? "?").padStart(7)}ms  chain ${String(row2.chain ?? "?").padStart(7)}ms  ` +
+          `mean ${m2 == null ? " n/a " : m2.toFixed(5)}  lit ${l2 == null ? "n/a" : (l2 * 100).toFixed(1) + "%"}`);
+      }
+      results.push({ arm: "cap-data", rows });
+    }
+
+    // ── THE MEMBERSHIP READBACK (SWEEP=histo only) ──────────────────────────
+    // `PROBE_RAYS` on a c0 probe is exactly `members-in-this-frame's-residue-
+    // class × raysPerPixel` — written by [D4]'s last hand-down, cleared by
+    // [D0] every frame. Reading it across a few frames samples a few stride
+    // phases. Probes alive with zero count are real (visible last frame, not
+    // this one) and stay in the distribution — min(0, B) charges them nothing.
+    if (SWEEP === "histo") {
+      const histo = await page.evaluate(async (frames) => {
+        const { ensureEngine } = await import("/src/editor/engineInstance.js");
+        const eng = await ensureEngine();
+        const sys = eng.modules?.get?.("gi")?.system;
+        const sp = sys?.state?.screen?.srcProbes;
+        if (!sp?.store) return { error: "no srcProbes store on the built system" };
+        const P = await import("/src/modules/gi/srcProbes.js");
+        const c0 = sp.store.cascades[0];
+        const samples = [];
+        for (let f = 0; f < frames; f++) {
+          const table = new Uint32Array(
+            await eng.renderer.getArrayBufferAsync(sp.store.probeTable.value));
+          const counts = [];
+          for (let i = 0; i < c0.probeCapacity; i++) {
+            const w = (c0.probeBase + i) * P.PROBE_WORDS;
+            if (!(table[w + P.PROBE_FLAGS] & P.FLAG_ALIVE)) continue;
+            counts.push(table[w + P.PROBE_RAYS] >>> 0);
+          }
+          samples.push(counts);
+          await new Promise((r) => setTimeout(r, 250));
+        }
+        return { samples, stride: sp.rayStride, natural: sp.naturalRays, rpp: sp.raysPerPixel };
+      }, 4);
+      if (histo.error) {
+        console.log(`      · HISTO FAILED — ${histo.error}`);
+      } else {
+        results.push({ arm: "histo-data", histo, deposit, live });
+        for (const [f, counts] of histo.samples.entries()) {
+          const sorted = [...counts].sort((a, b) => a - b);
+          const q = (p2) => sorted[Math.min(sorted.length - 1, Math.floor(p2 * sorted.length))] ?? 0;
+          const total = counts.reduce((a, c2) => a + c2, 0);
+          console.log(
+            `      · frame ${f}: ${counts.length} live c0, Σrays ${total}, ` +
+            `p10 ${q(0.1)}  p50 ${q(0.5)}  p90 ${q(0.9)}  p99 ${q(0.99)}  max ${sorted.at(-1)}`);
+        }
+      }
+    }
+
     // ── THE PICTURE ─────────────────────────────────────────────────────────
     const shot = await call("viewport.screenshot", { width: 700, height: 460, includeGizmos: false });
     let mean = null; let lit = null;
@@ -313,6 +441,74 @@ for (const arm of arms) {
 await browser.close();
 
 console.log("\n── VERDICT ─────────────────────────────────────────────────────");
+// ── THE CAP VERDICT: FIRED RAYS, DEPOSIT, AND THE LOOK, PER CAP ─────────────
+if (SWEEP === "cap") {
+  const rows = results.find((r) => r.arm === "cap-data")?.rows ?? [];
+  const ref = rows.find((r) => r.cap === 0);
+  if (!ref || rows.length < 2) {
+    console.log("  Not enough cap arms measured. VERDICT WITHHELD.");
+    process.exit(1);
+  }
+  if (!rows.every((r) => (r.shaded ?? 0) > 0)) {
+    console.log("  ⚠ an arm reported 0 shaded hits — the profile relay or the shading is broken;");
+    console.log("    the deposit numbers below are then not measuring the shaded kernel.");
+  }
+  console.log("  cap      fired rays   deposit ms   chain ms   vs off (deposit)   Δ mean");
+  for (const r of rows) {
+    const speed = ref.deposit && r.deposit ? ref.deposit / r.deposit : NaN;
+    const dLook = ref.mean && r.mean != null ? ((r.mean - ref.mean) / ref.mean) * 100 : NaN;
+    console.log(
+      `  ${String(r.cap === 0 ? "off" : r.cap).padEnd(6)} ${String(r.fired ?? "?").padStart(11)} ` +
+      `${String(r.deposit ?? "?").padStart(12)} ${String(r.chain ?? "?").padStart(10)} ` +
+      `${(r.cap === 0 ? "—" : speed.toFixed(2) + "× faster").padStart(17)} ` +
+      `${r.cap === 0 ? "     —" : (dLook >= 0 ? "+" : "") + dLook.toFixed(1) + "%"}`);
+  }
+  console.log("");
+  console.log("  The cap is shippable at a value where the deposit ratio is large and Δ mean");
+  console.log("  is a few % — the flicker rig's CAP arms are the OTHER half of that verdict.");
+  process.exit(0);
+}
+// ── THE HISTO VERDICT: WHAT WOULD A PER-PROBE CAP SAVE? ─────────────────────
+// Σ min(count, B) against Σ count, per frame, averaged over the sampled stride
+// phases. The RATIO is the transferable number (ns/ray is pose-dependent,
+// §12.35); the refresh column says what the cap costs in evidence — a probe at
+// the cap gets exactly B rays EVERY frame, which is the frequency fix, and a
+// probe under it keeps what it has today.
+if (SWEEP === "histo") {
+  const h = results.find((r) => r.histo)?.histo;
+  if (!h) {
+    console.log("  No membership readback. VERDICT WITHHELD.");
+    process.exit(1);
+  }
+  const cand = [2, 4, 6, 8, 12, 16, 24, 32, 48, 64];
+  const perFrame = h.samples.map((counts) => {
+    const total = counts.reduce((a, c) => a + c, 0);
+    return { counts, total };
+  });
+  const meanTotal = perFrame.reduce((a, f) => a + f.total, 0) / perFrame.length;
+  const meanLive = perFrame.reduce((a, f) => a + f.counts.length, 0) / perFrame.length;
+  console.log(`  stride ${h.stride} of ${h.natural} natural rays (${h.rpp} rays/px); ` +
+    `mean per frame: ${Math.round(meanLive)} live c0 probes, ${Math.round(meanTotal)} rays ` +
+    `(${(meanTotal / meanLive).toFixed(1)} rays/probe)`);
+  console.log("");
+  console.log("  cap B    Σmin(count,B)   vs today   probes AT cap (refreshed 60Hz)");
+  for (const B of cand) {
+    let capped = 0; let atCap = 0;
+    for (const f of perFrame) {
+      for (const c of f.counts) { capped += Math.min(c, B); if (c >= B) atCap++; }
+    }
+    capped /= perFrame.length; atCap /= perFrame.length;
+    console.log(
+      `  ${String(B).padStart(5)} ${String(Math.round(capped)).padStart(14)} ` +
+      `${(capped / meanTotal).toFixed(3).padStart(9)}× ` +
+      `${String(Math.round(atCap)).padStart(10)} of ${Math.round(meanLive)} (${((atCap / meanLive) * 100).toFixed(0)}%)`);
+  }
+  console.log("");
+  console.log("  A cap is worth building when a small B keeps most probes AT it (uniform");
+  console.log("  60Hz refresh) while the ratio column pays for the deposit. A ratio near 1");
+  console.log("  at every useful B means the lattice already flattened the skew — stop.");
+  process.exit(0);
+}
 const ok = results.filter((r) => r.deposit && r.rays);
 if (ok.length < 2) {
   console.log("  Not enough arms produced a deposit time. VERDICT WITHHELD.");

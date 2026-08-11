@@ -6742,3 +6742,190 @@ telemetry    boot line says MULTIBOUNCE opted-in, single bounce opted-out
 Smoke re-run at the shipping default: both src arms green, the exact arm's
 tiles back at single-bounce energy (0.41), the brick-box arm at zero. The
 loop exists, converges, is bounded, and costs nothing until asked for.
+
+### 12.40 THE PER-PROBE RAY CAP — §12.32.1's OPTION (1), DELIVERED THROUGH THE
+### EXISTING MACHINERY, AND THE HISTOGRAM THAT SIZED IT FIRST
+
+Phase 6's first unit, promoted to the top by the user's report ("performance
+is very poor … must have been faster than the previous"). §12.32.1 named the
+fix — price the transport in PROBES, not screen pixels — and the temptation
+was to rebuild the transport around it (ray-major dispatch, reservoir
+origins, a new allocation). What landed is ~40 lines inside Alg. 3, because
+the measurement that was supposed to justify the rebuild justified something
+much smaller instead.
+
+#### 12.40.1 Measure before designing: the membership histogram
+
+`SWEEP=histo` (new, `probe:gi-src-cost`) reads `PROBE_RAYS` off the live
+probe table for a few frames — each frame is one stride phase — before any
+design decision. Sponza, high, the pinned nave pose:
+
+```
+2,432 live c0 probes, 126,381 rays/frame (the boot line's traced count ÷1)
+per-probe rays/frame:  p10 0   p50 8   p90 137   p99 763   max 1,794
+```
+
+The MEDIAN probe fires 8 rays a frame; the fattest fires 1,794. The
+distance-adaptive lattice (§12.29) does NOT flatten screen coverage — a wall
+filling the viewport still concentrates hundreds of rays on bins that
+converged long ago, which is §12.32.1's "553 rays per probe" scandal
+surviving the ray ceiling in miniature. Capping each c0 probe at B:
+
+```
+cap B    Σ min(count, B)   probes AT the cap
+  8         0.105×             41%
+ 16         0.171×             28%
+ 32         0.261×             19%
+```
+
+Two design facts fall out, and the first one KILLED the rebuild: at the
+knee, most saved rays come from a few hundred probes — so a CAP on the
+existing pixel-priced counts captures ~80–90% of what full probe-pricing
+could ever capture, without touching the dispatch shape, the origins, or the
+allocator. And a capped probe still receives B fresh rays EVERY frame (its
+members span the stride's residue classes), so the cap converts the fat tail
+to uniform per-frame refresh — rays ∝ probes exactly where membership is
+high, which is what option (1) meant.
+
+#### 12.40.2 What landed: a clamp, a denial, and one uniform
+
+- **[D1'] clamps at the source** (`srcRays.js`): after [D1] counts, a pass
+  over c0 stores `min(count, cap)`. [D2] then propagates capped sums, [D3]/
+  [D4] partition capped sums, [D5] hands out capped segments — one clamp,
+  four consumers, no second definition of the budget anywhere.
+- **[D5] denies whole slices**: a claim past the probe's (capped) segment
+  writes SLOT_EMPTY instead of a base. The cap is floored to a multiple of
+  `raysPerPixel` (`srcProbeRayCap`), so `off < end` and `off + rpp ≤ end`
+  are the same statement and the winners tile the capped segment EXACTLY —
+  the coverage gate's "every index claimed once" survives capping intact.
+  The deposit's [E] needed NOTHING: a denied pixel's SLOT_EMPTY base is the
+  same early-return an empty-probe pixel always took.
+- **The cap is a POLLED UNIFORM** (`__giSrcProbeRayCap` — positive caps
+  live, 0/unset is OFF; tiers ship NO default, §12.40.4 is why). Same rule
+  as the ceiling and α, same reason: every A/B in one page, no rebuild.
+  Scheduler order picks WHICH members win each frame, so origins rotate
+  over the probe's footprint for free. (The first tier values — 8/16/16/32,
+  chosen per-bin — lasted exactly as long as it took the flicker rig to
+  price them; the model error is written down in §12.40.4.)
+- The mirror (`assignRays`) clamps and denies identically; winners differ by
+  order (pixel order vs scheduler order), so gates compare counts, totals
+  and claimed-slot sets, never who claimed them.
+
+`test:gi-src-rays` ARM 8 (new): capped counts match the mirror BY KEY on all
+four cascades (parents hold sums of capped children — a clamp applied after
+propagation would pass c0 and fail c1), totals match, the permutation holds
+under denial (0 duplicates / 0 out of range / 0 unclaimed of 8,714), winners
+are exactly count/rpp on every probe, 330 denials balanced. All PASS; the
+uncapped arms are bit-identical to before (no cap → no clamp pass built).
+
+Live confirmation at the shipping default: the settled per-frame line reads
+**21,520 hits shaded under cap 16 vs 126,382 uncapped** on the same
+scene/pose — a 5.87× ray cut, within 0.5% of the histogram's Σ min
+prediction (21,615).
+
+#### 12.40.3 ⚠ THE CAP BROKE `profile.giPasses`, BECAUSE THE PROFILER WAS
+#### TIMING GARBAGE ALL ALONG
+
+The first cap sweep read `deposit 0.68 ms, 0 rays fired` on every arm —
+against a live frame provably shading 21,520 hits. The op timed each pass in
+ISOLATION, K reps each: [D1]'s counts inflate K× (the clear is a different
+pass), [D3]'s partition marches K× past the buffer, and [D5] hands the
+deposit garbage offsets. **The old numbers survived by luck** — a deposit
+tracing from garbage offsets costs the same as one tracing from real ones,
+so every deposit figure in §12.31–§12.36 was timed on corrupted state that
+happened not to matter. The cap's denial ended the luck: against inflated
+state every claim is out of segment, so [E] timed an EMPTY dispatch. An
+instrument that breaks when the code gets safer is mis-built.
+
+Fixed rep-major: each rep dispatches the whole SRC chain in frame order
+(uniforms don't advance — the same frame re-run), per-pass timestamps
+accumulate across reps, attribution unchanged, reps capped at 8. Two
+artifacts die at once: the deposit now times real work under any cap, and
+`readStats` afterwards reads a REAL frame's tallies — which also closes
+§12.39.3's `shadedHitsPerFrame: 0`, whose second layer was a wrong path in
+the relay (`stats.shaded` for `stats.rays.shaded`, an `undefined ?? 0`
+wearing an empty readback's costume — fixed in the same commit).
+
+Instrument guards that earned their lines: the cap sweep refuses its own
+verdict when an arm reports 0 shaded hits (it did, and said so); the histo
+and every non-cap sweep PIN the cap off — a capped histogram of
+min(count, B) reads as "the skew is gone" when what is gone is the
+instrument, and ns/ray divided by the boot line's now-upper-bound would
+underreport by exactly the savings under test.
+
+Second casualty, found by the fix's own first output (negative chain
+totals): `info.compute.timestamp` is ASSIGNED per resolve — the batch just
+resolved, not a running total — so the op's before/after subtraction was
+computing `thisBatch − prevBatch` everywhere. For K same-pass dispatches
+behind a 1-dispatch warm batch that is a clean-looking **−1/K bias**, and
+the new unbiased instrument confirms it arithmetically: the biased reading
+was 2.571 ms where the unbiased one reads 2.99 — a ratio of 0.860 against
+(K−1)/K = 0.857 at the probe's K=7. Every deposit millisecond in
+§12.31–§12.36 is uniformly ~14% low; every RATIO in those tables stands.
+`resolveTimestampsAsync`'s return value is the batch duration, and both
+timing paths now use it directly.
+
+#### 12.40.4 The flicker price, measured — and the cap ships OPT-IN
+
+The cost sweep's in-page arms (fired counts kernel-tallied; the harness pose
+is floor-dominated so ns/ray does not transfer, the CUT does):
+
+```
+cap      fired rays      deposit ms
+off        126,382          2.99          least squares vs the capped arms:
+ 32         32,996*         2.58            ≈ 1.7 ms floor + ~10 ns × rays
+ 16         21,706*         1.85            (harness pose; the user's editor
+  8         13,318*         2.17             measured 138 ns/ray in-nave)
+      * pose-matched run; every arm within 0.6% of the histogram's Σ min
+```
+
+On the user's own profile (21.2 ms deposit, 126,008 rays at 138 ns/ray),
+cap 16's 5.8× cut is worth ~14 ms of the deposit and roughly halves the SRC
+chain — the fps ladder's fix, sized. Δ screen mean across arms sat inside
+the sweep's own noise (−7.5/−0.7/+1.0%, non-monotonic; one run's camera
+never reached the nave and is recorded as a pose fault, not data).
+
+**And the flicker rig said no — at every value tried.** CAP arms (new,
+`CAP_AB=1 CAP_VALUE=n`, still arms interleaved ×2, full discarded settle
+after every switch):
+
+```
+                      still rev/px          vs off      rig noise floor
+high,  cap 16      6.051 vs 2.356           2.57×            0.451
+ultra, cap 16      4.952 vs 1.620           3.06×            0.049
+ultra, cap 32      2.889 vs 1.620           1.78×         (in-run control)
+```
+
+Step p95 is UNCHANGED (+7% at high) — the steps are the same size, there
+are 2.5× more of them. The regression tracks **√(ray cut)**, which is what
+variance arithmetic predicts when the cut lands on the near-field,
+screen-filling probes: a 700-ray probe capped to 16 loses 44× its evidence
+stream exactly where one probe's noise covers the most pixels. The per-bin
+framing that chose the tier values (0.5 rays·bin⁻¹·frame⁻¹ ≥ the median
+probe's rate) was the wrong model — the median probe's noise is spread over
+a few pixels; the capped probe's is not.
+
+At the current α floor there is NO cap value with a meaningful cut inside
+§12.38's band, and "light is still popping" is the user's own open item —
+so no tier ships a default cap. The mechanism, the gates, the sweeps and
+the rig arms all stay (`__giSrcProbeRayCap = 32` is live in any page,
+in-page A/B, no rebuild), because they are the harness the unlock needs:
+
+**Next unit: per-probe α compensation.** A capped probe keeps
+proportionally more history — `keep′` chosen so influx/(1−keep′) is held
+constant — making the cap variance-NEUTRAL by construction and paid in
+responsiveness only where evidence was cut (the motion-adaptive α already
+covers the moving case; the still case's lag bound is the lamp-toggle blind
+spot §12.38.3 already carries). That needs a per-block influx word and its
+own gates; it is the difference between this cap being a measurement lever
+and being the fps fix the user asked for.
+
+Verification of the shipped (cap-off) defaults: the rays gate's uncapped
+arms are byte-identical and green; the live editor page fires and shades
+exactly `natural/stride` (126,382) with the hatch unset; the rig's off arms
+sit in §12.38's band. `eyecheck:gi-src` WITHHELD twice on its own
+coverage guard — the editor viewport settled at three different sizes
+across its per-arm pages (78,988/315,952/499,720 px), the §12.30.4
+instability again; its header's "pin the viewport before the GI module
+builds" hardening is now a named harness errand, and the withhold is the
+guard working, not a regression signal.

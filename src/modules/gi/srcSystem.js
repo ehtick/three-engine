@@ -50,8 +50,8 @@
 import * as THREE from "three/webgpu";
 import { float, ivec2, step, texture, uint, uniform, vec3 } from "three/tsl";
 import {
-  CASCADE_COUNT, MAX_LODS, SRC_QUALITY, TEMPORAL_ALPHA, TEMPORAL_ALPHA_STILL, W0,
-  srcQualityTier, srcTransportRays,
+  CASCADE_COUNT, MAX_LODS, PROBE_RAY_CAP_OFF, SRC_QUALITY, TEMPORAL_ALPHA, TEMPORAL_ALPHA_STILL, W0,
+  srcProbeRayCap, srcQualityTier, srcTransportRays,
 } from "./srcConfig.js";
 import { createSrcProbeGizmos } from "./srcGizmos.js";
 import { R2_ALPHA1_FX, R2_ALPHA2_FX } from "./srcMath.js";
@@ -410,6 +410,19 @@ export function createSrcProbeSystem({
   let rayCeiling = readCeiling();
   let rayStride = strideFor(rayCeiling);
   strideU.value = rayStride;
+  // ── THE PER-PROBE RAY CAP (srcConfig's `probeRayCap`, §12.32.1 option 1) ──
+  //
+  // The ceiling bounds the FRAME and prices rays by screen coverage; the cap
+  // bounds each PROBE, which is the thing actually being estimated. Measured
+  // before building (SWEEP=histo, Sponza, high): the median c0 probe fires 8
+  // rays/frame while the fattest fires 1,794 — so capping at the tier's B cuts
+  // the traced set to 0.10–0.26× with every capped probe still receiving B
+  // fresh rays EVERY frame. Same polling rule as the ceiling and α: a build
+  // value can only be A/B'd by reloading, so `__giSrcProbeRayCap` is read per
+  // frame and the kernels see a uniform.
+  const readCap = () => srcProbeRayCap(srcQualityTier(props), tier.raysPerPixel);
+  let probeRayCap = readCap();
+  const capU = uniform(probeRayCap, "uint");
   // ⚠ A DERIVED NUMBER THAT NOTHING PRINTS IS A NUMBER PROBES WILL GUESS.
   // The ceiling A/B measured two arms 5.0x apart in flicker and the only way to
   // tell "5x more stable" from "refreshed 5x less often" was the stride ratio —
@@ -422,7 +435,12 @@ export function createSrcProbeSystem({
       naturalRays,
       ceiling: rayCeiling,
       stride: rayStride,
+      // With a cap this is an UPPER BOUND, not the fired count — the real
+      // total is per-probe-capped on the GPU and only `readStats().totalRays`
+      // knows it. Kept under its old name because probes ratio it against the
+      // ceiling; the cap field beside it says when it is a bound.
       tracedRays: Math.ceil(naturalRays / rayStride),
+      probeRayCap,
     };
   };
   publishTransport();
@@ -432,6 +450,7 @@ export function createSrcProbeSystem({
     stride: strideU,
     phase: phaseU,
     threads: transportThreads,
+    cap: capU,
   });
 
   // ── [E] + [F]: THE SPLIT SCATTER AND THE RESOLVE (plan §12.13.5 unit 3) ──
@@ -853,6 +872,7 @@ export function createSrcProbeSystem({
     get rayCeiling() { return rayCeiling; },
     naturalRays,
     get tracedRays() { return Math.ceil(naturalRays / rayStride); },
+    get probeRayCap() { return probeRayCap; },
     get reanchorCount() { return reanchors; },
 
     /**
@@ -931,6 +951,14 @@ export function createSrcProbeSystem({
         // no way to read what it actually bought and was reduced to re-deriving
         // it from an assumed `pixelCount`. Written only on change, so a still
         // scene still writes nothing.
+        publishTransport();
+      }
+      // The cap polls on the same schedule and for the same reason as the
+      // ceiling. Compare-then-assign: a still scene uploads nothing.
+      const nextCap = readCap();
+      if (nextCap !== probeRayCap) {
+        probeRayCap = nextCap;
+        capU.value = nextCap;
         publishTransport();
       }
       phaseU.value = rayStride > 1 ? frameStampU.value % rayStride : 0;
@@ -1031,6 +1059,13 @@ export function describeSrcProbeSystem(system) {
     (system.rayStride > 1
       ? `${system.tracedRays} rays/frame (ceiling ${system.rayCeiling}, stride ${system.rayStride} of ${system.naturalRays}), `
       : `${system.tracedRays} rays/frame (under the ${system.rayCeiling} ceiling), `) +
+    // The cap makes `rays/frame` above an UPPER BOUND — the fired total is
+    // per-probe-capped on the GPU (`readStats().totalRays` has it). Printed
+    // with the bound so nobody divides a deposit time by the wrong count,
+    // which is the exact instrument mistake the traced/natural split fixed.
+    (system.probeRayCap && system.probeRayCap < PROBE_RAY_CAP_OFF
+      ? `probe cap ${system.probeRayCap} (rays/frame is a bound; readStats has the fired total), `
+      : "") +
     `${(bytes / 1048576).toFixed(2)}MB` +
     // The BLOCK counts are named, not the probe capacities, because they are
     // what the memory is a function of since the claim landed — and because a

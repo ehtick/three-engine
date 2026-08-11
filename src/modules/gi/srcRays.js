@@ -60,6 +60,7 @@ import {
   atomicStore,
   instanceIndex,
   instancedArray,
+  select,
   uint,
 } from "three/tsl";
 import { CASCADE_COUNT } from "./srcConfig.js";
@@ -130,9 +131,13 @@ function probeAlive(probeTable, probe) {
  * @param {number} options.raysPerPixel
  * @param {Node} [options.stride]  ray-ceiling stride, a UNIFORM — see below.
  * @param {Node} [options.phase]   which residue class this frame fires.
+ * @param {Node} [options.cap]  per-probe ray cap, a UNIFORM floored to a
+ *   multiple of `raysPerPixel` — see [D1'] and the [D5] denial. Omitted, the
+ *   frame is bit-identical to the uncapped build, which is where every gate
+ *   written before the cap runs.
  */
 export function createSrcRayFrame(
-  store, rays, { pixelProbe, raysPerPixel = 1, stride = null, phase = null, threads = 0 } = {},
+  store, rays, { pixelProbe, raysPerPixel = 1, stride = null, phase = null, threads = 0, cap = null } = {},
 ) {
   const { probeTable, probeTotal, cascades } = store;
   const { rayCount, rayCursor, rayTotal, pixelRayBase, pixelCount } = rays;
@@ -210,6 +215,30 @@ export function createSrcRayFrame(
     atomicAdd(rayCount.element(probe), uint(raysPerPixel));
   })().compute(dispatchCount));
 
+  // ── [D1'] the per-probe cap (srcConfig's `probeRayCap`) ───────────────────
+  // Clamped AT THE SOURCE, before anything reads a count: [D2] then propagates
+  // capped sums, [D3]/[D4] partition capped sums, and [D5] hands out slices of
+  // a capped segment — one clamp, four consumers, no second definition. The
+  // load-then-store is not a race: this pass is the only writer of `rayCount`
+  // between the [D1] barrier and [D2], and each thread owns one slot.
+  //
+  // `cap` is a UNIFORM (srcSystem polls the hatch per frame), so capping is an
+  // in-page A/B. The off value is srcConfig's PROBE_RAY_CAP_OFF, at which the
+  // min never binds and this build is behaviourally the uncapped one.
+  //
+  // c0 only. Upper cascades hold SUMS of capped children — capping them again
+  // would be a second, different budget with no owner.
+  if (cap) {
+    const c0 = cascades[0];
+    passes.push(Fn(() => {
+      const i = instanceIndex.add(uint(c0.probeBase)).toVar();
+      const n = atomicLoad(rayCount.element(i)).toVar();
+      If(n.greaterThan(uint(cap)), () => {
+        atomicStore(rayCount.element(i), uint(cap));
+      });
+    })().compute(c0.probeCapacity));
+  }
+
   // ── [D2] propagate counts UP, one cascade per dispatch ────────────────────
   // Strictly one level at a time. Cascade 2's total is not correct until every
   // cascade-1 probe has finished adding into it, so a fused loop over levels
@@ -284,7 +313,31 @@ export function createSrcRayFrame(
       pixelRayBase.element(i).assign(uint(SLOT_EMPTY));
       Return();
     });
-    pixelRayBase.element(i).assign(atomicAdd(rayCursor.element(probe), uint(raysPerPixel)));
+    if (!cap) {
+      pixelRayBase.element(i).assign(atomicAdd(rayCursor.element(probe), uint(raysPerPixel)));
+      return;
+    }
+    // Under the cap, more pixels want slices than the segment holds, so a
+    // claim can come back PAST the probe's end — deny it, never shrink it.
+    // The claim happens first (the cursor is the allocator; a denied pixel
+    // advancing it past `end` is harmless overrun in a region nothing owns),
+    // and the check is whole-slice: `cap` is floored to a multiple of
+    // `raysPerPixel` (srcConfig.srcProbeRayCap), so `off < end` and
+    // `off + rpp <= end` are the same statement and the winning claims tile
+    // the capped segment EXACTLY — the coverage gate still holds under caps.
+    //
+    // `end` reads the table AFTER [D4] settled it, same barrier argument as
+    // the cursor seeds. A probe with no offset (broken ancestor chain —
+    // `test:gi-src-populate` asserts none exist) denies here too, where the
+    // uncapped path would have written rays into whatever segment the stale
+    // cursor pointed at.
+    const w = probe.mul(PROBE_WORDS).toVar();
+    const rayOff = probeTable.element(w.add(PROBE_RAYOFF)).toVar();
+    const off = atomicAdd(rayCursor.element(probe), uint(raysPerPixel)).toVar();
+    const denied = rayOff.equal(uint(SLOT_EMPTY)).or(
+      off.add(uint(raysPerPixel)).greaterThan(rayOff.add(probeTable.element(w.add(PROBE_RAYS)))),
+    );
+    pixelRayBase.element(i).assign(select(denied, uint(SLOT_EMPTY), off));
   })().compute(dispatchCount));
   // ⚠ `pixelRayBase` IS NO LONGER FULLY REWRITTEN EACH FRAME. With a strided
   // dispatch only this frame's residue class is touched, so every other entry

@@ -48,6 +48,15 @@ const ROTATE = process.env.ROTATE === "1";
 const SRC = process.env.SRC === "1";
 const ALPHA_AB = process.env.ALPHA_AB === "1";
 const CEILING_AB = process.env.CEILING_AB === "1";
+// CAP_AB=1 — the PER-PROBE RAY CAP's flicker arm (§12.32.1 option 1): tier
+// cap vs cap off, still arms, interleaved ×2 in one page. The cap leaves the
+// stride (refresh cadence) untouched and cuts the EVIDENCE RATE at capped
+// probes — at CAP_VALUE=16 a capped probe runs 0.5 rays/bin/frame where the
+// fattest ran ~50 — so the risk it measures is variance flicker returning on
+// exactly the near-field walls §12.38 just calmed. Raw counts compare
+// directly (same stride both arms), the α-sweep's discipline.
+const CAP_AB = process.env.CAP_AB === "1";
+const CAP_VALUE = Number(process.env.CAP_VALUE ?? 16);
 // ALPHA_SWEEP="0.1,0.05,0.02" — interleaved arms at several α values, both
 // still and moving, in ONE page. Exists to answer the mechanism question the
 // CEILING_AB left open (§12.32): the still-scene instability is nearly
@@ -439,6 +448,32 @@ if (CEILING_AB) {
     ceilRounds.push({ tight, dflt, tightT, dfltT });
   }
 }
+// ── THE PER-PROBE CAP A/B ───────────────────────────────────────────────────
+// Still arms only (the ceiling A/B's reasoning: the still control is the worse
+// number, and a mover would add variance to the thing being read). A FULL
+// discarded arm after every switch, the α-sweep's lesson verbatim: a capped
+// probe's accumulators re-equilibrate to the lower evidence rate over ~1/α
+// refreshes, and measuring that transient reports equilibration as flicker.
+// `0` disables the cap (srcProbeRayCap's contract); `undefined` restores the
+// tier default at exit.
+const setCap = (v) => page.evaluate((x) => { globalThis.__giSrcProbeRayCap = x; }, v);
+const capRounds = [];
+if (CAP_AB) {
+  for (let r = 0; r < 2; r++) {
+    await setCap(CAP_VALUE);
+    await wait(300);
+    const capT = await readTransport();
+    await measure(0, false);
+    const capped = await measure(0, false);
+    await setCap(0);
+    await wait(300);
+    const offT = await readTransport();
+    await measure(0, false);
+    const off = await measure(0, false);
+    capRounds.push({ capped, off, capT, offT });
+  }
+  await setCap(undefined);
+}
 // ── THE α SWEEP, SAME DISCIPLINE ────────────────────────────────────────────
 // Round 2 walks the α list in REVERSE so a slow page drift loads each α at
 // both ends of the run — the same cancellation the interleave buys the two-arm
@@ -612,6 +647,37 @@ if (ceilRounds.length) {
     console.log("     `keep = (1-alpha)^(1/stride)` claims to buy. The stride is NOT the flicker");
     console.log(`     source; the residual ${dfltPR.toFixed(3)} reversals and ${dfltP95.toFixed(4)} step per refresh are`);
     console.log("     what a refresh costs at this sample count, i.e. MONTE CARLO NOISE.");
+  }
+}
+
+// ── THE CAP A/B VERDICT ─────────────────────────────────────────────────────
+// Same stride both arms, so raw counts compare directly. The claim under test
+// is §12.38's calm SURVIVING the cap: still reversals and step p95 within the
+// rig's own round-to-round noise. A capped arm clearly above it says the tier
+// value is buying its deposit ms with the flicker the user just reported.
+if (capRounds.length) {
+  console.log(`
+=== PER-PROBE CAP A/B (still arms, cap ${CAP_VALUE} vs off, interleaved x${capRounds.length}) ===`);
+  const capMean = capRounds.reduce((s, r) => s + r.capped.meanReversals, 0) / capRounds.length;
+  const offMean = capRounds.reduce((s, r) => s + r.off.meanReversals, 0) / capRounds.length;
+  const capP95 = capRounds.reduce((s, r) => s + r.capped.stepP95, 0) / capRounds.length;
+  const offP95 = capRounds.reduce((s, r) => s + r.off.stepP95, 0) / capRounds.length;
+  const spread = capRounds.length > 1
+    ? Math.abs(capRounds[0].off.meanReversals - capRounds[1].off.meanReversals)
+    : NaN;
+  console.log(`  published cap: ${capRounds[0].capT?.probeRayCap} vs ${capRounds[0].offT?.probeRayCap} ` +
+    `(stride ${capRounds[0].capT?.stride} both arms — the cap must not move it)`);
+  console.log(`  still reversals/px: capped ${capMean.toFixed(3)}  vs  off ${offMean.toFixed(3)}   ` +
+    `(${((capMean / offMean - 1) * 100).toFixed(0)}%)`);
+  console.log(`  still step p95:     capped ${capP95.toFixed(4)}  vs  off ${offP95.toFixed(4)}   ` +
+    `(${((capP95 / offP95 - 1) * 100).toFixed(0)}%)`);
+  console.log(`  round-to-round spread on the OFF arm: ${spread.toFixed(3)} — the noise floor`);
+  const excess = capMean - offMean;
+  if (excess > Math.max(spread * 1.5, offMean * 0.15)) {
+    console.log("  ⇒ THE CAP COSTS FLICKER at this value. Raise the tier's probeRayCap (or lower");
+    console.log("     the still α floor) before shipping it — the deposit win is real either way.");
+  } else {
+    console.log("  ⇒ §12.38's calm SURVIVES the cap: the excess is inside the rig's own noise.");
   }
 }
 

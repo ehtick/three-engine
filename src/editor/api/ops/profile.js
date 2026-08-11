@@ -59,17 +59,25 @@ defineOp({
     engine.renderSuspended = true;
     await new Promise((r) => setTimeout(r, 250));
     try {
+      // ⚠ `info.compute.timestamp` is ASSIGNED per resolve, not accumulated —
+      // `Backend.resolveTimestampsAsync` does `info[type].timestamp =
+      // duration` where `duration` is the batch it just resolved. So the
+      // before/after subtraction this op used to do computed `thisBatch −
+      // prevBatch`: for K same-pass dispatches after a 1-dispatch warm batch
+      // that is K·d − d, a −1/K bias that read as clean numbers for a whole
+      // phase, and for the rep-major chain below it was the DIFFERENCE
+      // between successive passes — negative chain totals on a live frame.
+      // The resolve's RETURN VALUE is the batch duration; use it directly.
       const timeOne = async (compute) => {
         if (!compute) return null;
         // Warm first: the very first dispatch pays pipeline + bind-group setup,
-        // which is not what "cost per frame" means.
+        // which is not what "cost per frame" means. The resolve flushes it out
+        // of the next batch.
         renderer.compute(compute);
         await renderer.resolveTimestampsAsync("compute");
-        const before = renderer.info.compute.timestamp ?? 0;
         for (let i = 0; i < K; i++) renderer.compute(compute);
-        await renderer.resolveTimestampsAsync("compute");
-        const after = renderer.info.compute.timestamp ?? 0;
-        return +((after - before) / K).toFixed(4);
+        const dur = await renderer.resolveTimestampsAsync("compute");
+        return +(((dur ?? 0)) / K).toFixed(4);
       };
 
       // A pass that EXISTS is not necessarily a pass that RUNS: the emitter
@@ -127,12 +135,46 @@ defineOp({
       // inserts" call for completely different responses.
       let srcProbes = null;
       if (screen.srcProbes) {
+        // ══ REP-MAJOR, NOT PASS-MAJOR — THE CHAIN'S STATE IS PART OF ITS COST ═
+        //
+        // `timeOne` dispatches one pass K times in isolation, and the SRC chain
+        // is a per-frame ALGORITHM: [D1] accumulates counts a clear pass resets,
+        // [D3] partitions a cursor it expects zeroed, [D5] hands out slices of
+        // exactly what [D1] counted. K isolated reps of each violate all of
+        // that — counts inflate K×, the partition marches K× past the buffer,
+        // and [D5] hands the deposit garbage offsets. The old numbers survived
+        // by luck: a deposit tracing from garbage offsets COSTS the same as one
+        // tracing from real ones, so the timing held while the state lied.
+        //
+        // The per-probe ray cap ended the luck. Its [D5] DENIES claims outside
+        // the probe's segment, and against K×-inflated state that is every
+        // claim — so the deposit timed an empty dispatch: `0.68 ms, 0 rays
+        // fired` on a frame whose live telemetry says 21,520 shaded hits.
+        // An instrument that breaks when the code gets safer is mis-built.
+        //
+        // So the chain is timed REP-MAJOR: each rep dispatches every pass in
+        // frame order, per-pass timestamps accumulate across reps. Every rep is
+        // a legal frame (uniforms don't advance, so it is the SAME frame
+        // re-run), the per-group attribution is unchanged, and the stats
+        // buffer afterwards holds a real frame's tallies — which is what
+        // `readStats` below relays. Reps are capped at 8: one rep already
+        // times 44 dispatches, and a timestamp resolve per dispatch makes
+        // reps linearly expensive wall-clock.
+        const chain = screen.srcProbes.passes;
+        for (const pass of chain) renderer.compute(pass);
+        await renderer.resolveTimestampsAsync("compute");
+        const reps = Math.min(K, 8);
+        const perPass = new Array(chain.length).fill(0);
+        for (let rep = 0; rep < reps; rep++) {
+          for (let i = 0; i < chain.length; i++) {
+            renderer.compute(chain[i]);
+            perPass[i] += (await renderer.resolveTimestampsAsync("compute")) ?? 0;
+          }
+        }
         let srcMs = 0;
-        const perPass = [];
-        for (const pass of screen.srcProbes.passes) {
-          const ms = await timeOne(pass);
-          perPass.push(typeof ms === "number" ? ms : 0);
-          if (typeof ms === "number") srcMs += ms;
+        for (let i = 0; i < perPass.length; i++) {
+          perPass[i] = +(perPass[i] / reps).toFixed(4);
+          srcMs += perPass[i];
         }
         // Group boundaries come from srcSystem in `passes` order. Asserted
         // rather than trusted: a group list that has drifted from the pass list
@@ -191,12 +233,26 @@ defineOp({
           // matters: it is consulted precisely when someone is deciding whether
           // a dark frame is expected. `shaded` is the deposit kernel's own
           // per-frame tally, so the note now reports what the GPU did.
-          shadedHitsPerFrame: stats.shaded ?? 0,
-          unattributedRate: stats.unattributedRate != null
-            ? +(stats.unattributedRate * 100).toFixed(2) + "%"
+          //
+          // ⚠ THE TALLIES LIVE UNDER `stats.rays`, NOT ON `stats`. This op read
+          // `stats.shaded` for a whole phase and reported `shadedHitsPerFrame:
+          // 0` against frames that were visibly shading — §12.39.3 logged it as
+          // a suspend-race in the counters, and it was never a race at all: an
+          // `undefined ?? 0` wearing the same costume as an empty readback. The
+          // deposit's `readStats` is the one place these words are decoded;
+          // this op only relays it.
+          shadedHitsPerFrame: stats.rays?.shaded ?? 0,
+          // The transport's fired count, kernel-tallied. Under the per-probe
+          // ray cap this is the REAL total — the boot line's `rays/frame` is an
+          // upper bound there, and dividing a deposit time by the bound would
+          // overstate the kernel by exactly the cap's savings.
+          raysPerFrame: stats.rays?.rays ?? 0,
+          probeRayCap: screen.srcProbes.probeRayCap ?? null,
+          unattributedRate: stats.rays?.unattributedRate != null
+            ? +(stats.rays.unattributedRate * 100).toFixed(2) + "%"
             : null,
-          note: stats.shaded
-            ? `Hit shading is LIVE — ${stats.shaded} hits shaded last frame. Radiance carries ` +
+          note: stats.rays?.shaded
+            ? `Hit shading is LIVE — ${stats.rays.shaded} hits shaded last frame. Radiance carries ` +
               "albedo, sun, lights and emission."
             : "Populating probes but shading NO hits — every deposited radiance is zero, so the " +
               "diffuse term is sky-visibility only. Check `__giSrcShade`.",

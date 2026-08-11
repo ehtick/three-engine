@@ -213,6 +213,47 @@ export function srcTransportRays(tier) {
   if (Number.isFinite(forced) && forced > 0) return Math.round(forced);
   return SRC_QUALITY[tier]?.transportRays ?? SRC_QUALITY.high.transportRays;
 }
+
+/**
+ * ══ THE PER-PROBE RAY CAP — §12.32.1's OPTION (1), OPT-IN (§12.40) ═════════
+ *
+ * The ceiling above bounds the FRAME; this bounds the PROBE. `probe:gi-src-cost
+ * SWEEP=histo` measured why it exists (Sponza, high, nave pose): 2,432 live c0
+ * probes shared 126,381 rays/frame with the MEDIAN probe firing 8 and the
+ * fattest 1,794 — membership pricing sends ~80% of the budget to the few
+ * probes whose bins converged long ago. Capping each c0 probe at B rays/frame:
+ *
+ *     cap B    Σmin(count,B) vs today     probes AT the cap
+ *       8          0.105×                 41%
+ *      16          0.171×                 28%
+ *      32          0.261×                 19%
+ *
+ * ⚠ NO TIER SHIPS A DEFAULT CAP, AND THAT IS A MEASURED DECISION, NOT A
+ * MISSING FEATURE. The flicker rig's CAP arms priced it (§12.40.4): a hard
+ * cap concentrates its evidence cut on exactly the near-field, screen-filling
+ * probes, and still-scene reversals rise like √(ray cut) — 2.57× at high/16,
+ * 3.06× at ultra/16, 1.78× at ultra/32, every one far above the rig's own
+ * noise floor and squarely on the axis §12.38 just fixed for the user. At the
+ * current α floor there is NO cap value that buys a meaningful cut inside
+ * that band. What unlocks a default is PER-PROBE α COMPENSATION — a capped
+ * probe keeps proportionally more history, holding its evidence window
+ * constant by construction — which is its own unit with its own gates.
+ *
+ * Until then the cap is the A/B lever the follow-up needs: a UNIFORM polled
+ * per frame (`__giSrcProbeRayCap` — a positive number caps live, 0/unset is
+ * OFF), so every experiment is in-page. It is floored to a multiple of
+ * raysPerPixel because [D5] hands out whole per-pixel slices; a non-multiple
+ * cap would leave the tail of every capped probe's segment
+ * allocated-but-unclaimed, which the coverage gate reads as lost rays.
+ */
+export const PROBE_RAY_CAP_OFF = 0x3fffffff;
+export function srcProbeRayCap(tier, raysPerPixel = 1) {
+  const forced = Number(globalThis.__giSrcProbeRayCap);
+  let cap = SRC_QUALITY[tier]?.probeRayCap ?? PROBE_RAY_CAP_OFF;
+  if (Number.isFinite(forced)) cap = forced > 0 ? Math.round(forced) : PROBE_RAY_CAP_OFF;
+  const rpp = Math.max(1, raysPerPixel);
+  return Math.max(rpp, cap - (cap % rpp));
+}
 const QUALITY_TIERS = new Set(Object.keys(SRC_QUALITY));
 
 /**

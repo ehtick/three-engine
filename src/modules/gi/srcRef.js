@@ -352,6 +352,15 @@ export function assignRays(cfg, built) {
     const slot = built.pixelProbe[p];
     if (slot >= 0 && !strideSkips(cfg, p)) cascades[0].probes[slot].rayCount += cfg.raysPerPixel;
   }
+  // The per-probe cap, exactly where the GPU's [D1'] clamps: at the source,
+  // before anything propagates or partitions. `probeRayCap` arrives already
+  // floored to a multiple of `raysPerPixel` (srcConfig.srcProbeRayCap), which
+  // is what keeps the pixel handout below whole-slice.
+  if (cfg.probeRayCap > 0) {
+    for (const probe of cascades[0].probes) {
+      probe.rayCount = Math.min(probe.rayCount, cfg.probeRayCap);
+    }
+  }
   // Propagate up.
   for (let c = 1; c < cfg.cascadeCount; c++) {
     for (const probe of cascades[c].probes) probe.rayCount = 0;
@@ -377,7 +386,11 @@ export function assignRays(cfg, built) {
       }
     }
   }
-  // Finally hand each pixel its own slice of its c0 probe's segment.
+  // Finally hand each pixel its own slice of its c0 probe's segment. Under a
+  // cap, claims past the probe's (capped) count are DENIED — the pixel keeps
+  // -1, mirroring [D5]. The mirror's winners are the FIRST members in pixel
+  // order where the GPU's are scheduler order, so a gate may compare which
+  // slots were claimed and how many, never which pixel claimed them.
   const pixelRayBase = new Int32Array(built.pixelProbe.length).fill(-1);
   const cursors = new Map();
   for (let p = 0; p < built.pixelProbe.length; p++) {
@@ -385,6 +398,7 @@ export function assignRays(cfg, built) {
     if (slot < 0 || strideSkips(cfg, p)) continue;
     const probe = cascades[0].probes[slot];
     const cursor = cursors.get(slot) ?? probe.rayOffset;
+    if (cursor + cfg.raysPerPixel > probe.rayOffset + probe.rayCount) continue;
     pixelRayBase[p] = cursor;
     cursors.set(slot, cursor + cfg.raysPerPixel);
   }

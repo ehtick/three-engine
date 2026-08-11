@@ -518,6 +518,129 @@
         check("strided: every ray index in [0, total) is claimed", sUncovered === 0,
           `${sUncovered}/${sTotal} unclaimed`);
 
+        // ══ ARM 8: THE PER-PROBE RAY CAP ═════════════════════════════════
+        say("");
+        say("── CAP: min(count, B) at the source, whole-slice denial at [D5] ──");
+        // The cap changes WHO gets rays, not how the allocator works — so the
+        // strong claims are the old ones re-asserted on a capped frame: the
+        // partition still tiles, the claimed slices still cover [0, total)
+        // exactly once (whole-slice denial means a capped segment is SHORTER,
+        // never fragmented), and the counts are exactly min(natural, B) by
+        // key against the mirror. What is NEW is the denial itself: per
+        // probe, exactly `members − count/rpp` pixels come back empty-handed.
+        // Scheduler order picks WHICH — that is never compared (the header's
+        // rule), only how many and which slots.
+        // 2 pixels' worth: small enough to deny on every ≥3-member probe of
+        // this sparse synthetic field (~1.3 px/probe — at 4 px the denial path
+        // ran only 29 times), big enough that a capped segment still tiles
+        // MULTIPLE winner slices, which 1 px worth would never exercise.
+        const CAP = 2 * RAYS_PER_PIXEL;
+        const capU = TSL.uniform(CAP, "uint");
+        const capRayStore = R.createSrcRayStore(store, { pixelCount: PIXELS });
+        const capFrame = R.createSrcRayFrame(store, capRayStore, {
+          pixelProbe: frame.pixelProbe,
+          raysPerPixel: RAYS_PER_PIXEL,
+          cap: capU,
+        });
+        for (const pass of frame.passes) await renderer.computeAsync(pass);
+        for (const pass of capFrame.passes) await renderer.computeAsync(pass);
+        const [cTable, cProbe, cBase, cTotal] = await Promise.all([
+          renderer.getArrayBufferAsync(store.probeTable.value).then((b) => new Uint32Array(b)),
+          renderer.getArrayBufferAsync(frame.pixelProbe.value).then((b) => new Uint32Array(b)),
+          renderer.getArrayBufferAsync(capRayStore.pixelRayBase.value).then((b) => new Uint32Array(b)),
+          capFrame.readTotal(renderer),
+        ]);
+        // The mirror with the same cap. `assignRays` overwrites the built
+        // probes' counts/offsets in place, so this arm runs after every use
+        // of the uncapped mirror above (ARM 7 already relies on the same).
+        const cMirror = ref.assignRays({ ...cfg, probeRayCap: CAP }, built);
+        check("the capped total matches the mirror's", cTotal === cMirror.totalRays,
+          `gpu ${cTotal} vs mirror ${cMirror.totalRays}`);
+        check("the cap actually bit", cTotal > 0 && cTotal < gpu.total,
+          `${cTotal} of ${gpu.total} (cap ${CAP})`);
+        // Counts by key, all cascades — parents must hold SUMS OF CAPPED
+        // children, which is what clamping at the source and propagating up
+        // means. A clamp applied after propagation would pass c0 and fail c1.
+        const cLive = store.cascades.map((c) => {
+          const byKey = new Map();
+          const byIndex = new Map();
+          for (let k = 0; k < c.probeCapacity; k++) {
+            const p = c.probeBase + k;
+            const w = p * P.PROBE_WORDS;
+            if ((cTable[w + P.PROBE_FLAGS] & P.FLAG_ALIVE) === 0) continue;
+            const rec = {
+              key: cTable[w + P.PROBE_KEY] >>> 0,
+              count: cTable[w + P.PROBE_RAYS] >>> 0,
+              offset: cTable[w + P.PROBE_RAYOFF] >>> 0,
+            };
+            byKey.set(rec.key, rec);
+            byIndex.set(p, rec);
+          }
+          return { byKey, byIndex };
+        });
+        for (let c = 0; c < cfgMod.CASCADE_COUNT; c++) {
+          const mirrorByKey = new Map();
+          for (const p of built.cascades[c].probes) mirrorByKey.set(p.key >>> 0, p.rayCount);
+          let wrong = 0;
+          let worst = null;
+          let over = 0;
+          for (const [key, rec] of cLive[c].byKey) {
+            if (c === 0 && rec.count > CAP) over++;
+            const want = mirrorByKey.get(key);
+            if (want === rec.count) continue;
+            wrong++;
+            if (!worst) worst = `key ${key} gpu ${rec.count} vs mirror ${want}`;
+          }
+          check(`c${c} capped counts match the mirror by key`, wrong === 0,
+            wrong === 0 ? `${cLive[c].byKey.size} probes` : `${wrong} wrong — ${worst}`);
+          if (c === 0) check("no c0 probe exceeds the cap", over === 0, `${over} over ${CAP}`);
+        }
+        // Coverage + segment containment + the denial arithmetic, one sweep.
+        const cSeen = new Uint8Array(cTotal);
+        let cDup = 0;
+        let cOut = 0;
+        const claimedBy = new Map();
+        const membersBy = new Map();
+        for (let i = 0; i < PIXELS; i++) {
+          const probe = cProbe[i];
+          if (probe === P.SLOT_EMPTY) continue;
+          membersBy.set(probe, (membersBy.get(probe) ?? 0) + 1);
+          const base = cBase[i];
+          if (base === P.SLOT_EMPTY) continue;
+          claimedBy.set(probe, (claimedBy.get(probe) ?? 0) + 1);
+          for (let r = 0; r < RAYS_PER_PIXEL; r++) {
+            const idx = base + r;
+            if (idx >= cTotal) { cOut++; continue; }
+            if (cSeen[idx]) cDup++;
+            cSeen[idx] = 1;
+          }
+        }
+        let cUncovered = 0;
+        for (let i = 0; i < cTotal; i++) if (!cSeen[i]) cUncovered++;
+        check("capped: no ray index is claimed twice", cDup === 0, `${cDup} duplicates`);
+        check("capped: no ray index is past the total", cOut === 0, `${cOut} out of range`);
+        check("capped: every ray index in [0, total) is claimed", cUncovered === 0,
+          `${cUncovered}/${cTotal} unclaimed — a partial slice slipped the whole-slice denial`);
+        let denialWrong = 0;
+        let denied = 0;
+        let escaped2 = 0;
+        for (const [probeIndex, members] of membersBy) {
+          const rec = cLive[0].byIndex.get(probeIndex);
+          if (!rec) { denialWrong++; continue; }
+          const winners = claimedBy.get(probeIndex) ?? 0;
+          if (winners !== rec.count / RAYS_PER_PIXEL) denialWrong++;
+          denied += members - winners;
+          if (rec.offset !== P.SLOT_EMPTY && rec.count > 0) {
+            // Spot containment per probe: winners × rpp must fit the segment.
+            if (winners * RAYS_PER_PIXEL > rec.count) escaped2++;
+          }
+        }
+        check("every probe's winners are exactly count/raysPerPixel", denialWrong === 0,
+          `${denialWrong} probes disagree`);
+        check("denials happened (the arithmetic above is not vacuous)", denied > 0,
+          `${denied} pixels denied across ${membersBy.size} probes`);
+        check("no probe's winners exceed its segment", escaped2 === 0, `${escaped2} over`);
+
         if (validationErrors.length) check("no WebGPU validation errors", false, validationErrors[0]);
 
         say("");
