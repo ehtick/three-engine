@@ -64,6 +64,23 @@ const CAP_VALUE = Number(process.env.CAP_VALUE ?? 16);
 // frame variance while things move. Still arms ride along as the control —
 // the sub-threshold path is supposed to be untouched.
 const TRACK_AB = process.env.TRACK_AB === "1";
+// CAMERA_AB=1 — the 2026-08-12 report: "glints settle when the camera does
+// not move, as it starts moving lights are moving all over again". Still
+// scene, tier cap vs cap FORCED off, pan–hold cycles per arm (see body():
+// a during-pan count would be 100% reprojection, so the holds are counted).
+// The priced claim: the cap starves FRESH probes — the ones a pan reveals —
+// and the post-pan settle churn shows it where a parked still cannot.
+const CAMERA_AB = process.env.CAMERA_AB === "1";
+const CAM_ANGLE = (Number(process.env.CAM_ANGLE ?? 25) * Math.PI) / 180;
+// LIGHT_STEP=1 — the same report's other half: "anytime light updates, it
+// starts flickering". A REAL intensity step lands mid-arm through the
+// editor's own prop path (GISystem's light events fire exactly as live, the
+// §12.43 tracking window arms), and three configs separate the suspects:
+// shipped / cap forced off (what LIFTING the cap inside the window would
+// buy — the queued fix, priced before it is built) / window off (the
+// window's own noise cost, as a reference).
+const LIGHT_STEP = process.env.LIGHT_STEP === "1";
+const STEP_AT = Number(process.env.STEP_AT ?? 60);
 // ALPHA_SWEEP="0.1,0.05,0.02" — interleaved arms at several α values, both
 // still and moving, in ONE page. Exists to answer the mechanism question the
 // CEILING_AB left open (§12.32): the still-scene instability is nearly
@@ -246,7 +263,26 @@ if (SRC) {
   await wait(2000);
 }
 
-const body = async ({ anchorId, moverId, frames, amp, rotate }) => {
+// ── THE STEP LIGHT (LIGHT_STEP arms only) ───────────────────────────────────
+// Probe-owned, the converge probe's pattern: the scene's own sun saves
+// intensity 0 (2026-08-06), so the step must be a light this rig owns.
+// Placed above the mover, inside the verified camera's view, so the stepped
+// illumination lands on floor the metric reads.
+let stepLightId = null;
+let lightNow = 2;
+if (LIGHT_STEP) {
+  const le = await call("entity.create", {
+    name: "__flicker_step_light", transform: { position: [7.5, 3.5, 0] },
+  });
+  stepLightId = le.ok ? (le.value?.id ?? le.value) : null;
+  if (!stepLightId) { console.log(`FATAL: step light create failed (${le.error})`); await browser.close(); process.exit(1); }
+  await must("component.add", { id: stepLightId, type: "light" });
+  await must("component.setProp", { id: stepLightId, type: "light", key: "intensity", value: 2 });
+  console.log(`  step light created (${stepLightId}), intensity 2`);
+  await wait(8000);
+}
+
+const body = async ({ anchorId, moverId, frames, amp, rotate, pan = null, light = null }) => {
   const eng = globalThis.__editorApi.entities.live(anchorId)?.engine;
   if (!eng?.renderer) throw new Error("no live engine");
   const obj = globalThis.__editorApi.entities.live(moverId)?.object3D;
@@ -298,6 +334,24 @@ const body = async ({ anchorId, moverId, frames, amp, rotate }) => {
   })().compute(width * height);
 
   const base = obj.position.clone();
+  // Camera pan support (CAMERA_AB): rotate the eye about the orbit target on
+  // Y between the verified base pose and base+angle. Uses the viewport OPS
+  // rather than writing camera.position — OrbitControls owns the camera (the
+  // gi-harness-viewport-traps lesson) and viewport.setCamera is the path that
+  // calls orbit.update(); a raw position write "moves" nothing.
+  let setCam = null;
+  if (pan) {
+    const cam = await globalThis.__editorApi.call("viewport.getCamera", {});
+    const [tx, ty, tz] = cam.target;
+    const dx = cam.position[0] - tx, dz = cam.position[2] - tz;
+    setCam = (theta) => {
+      const c = Math.cos(theta), s = Math.sin(theta);
+      return globalThis.__editorApi.call("viewport.setCamera", {
+        position: [tx + dx * c - dz * s, cam.position[1], tz + dx * s + dz * c],
+        target: [tx, ty, tz],
+      });
+    };
+  }
   // Warmup: seed prevLum at rest (armed=0 → no counting).
   for (let i = 0; i < 30; i++) {
     await new Promise((r) => requestAnimationFrame(r));
@@ -309,19 +363,54 @@ const body = async ({ anchorId, moverId, frames, amp, rotate }) => {
   // realistic slow mover). ROTATE arm: the user's MeshScript verbatim —
   // rotation.x/y += dt·0.6, per rendered frame.
   let lastT = performance.now();
-  for (let i = 0; i < frames; i++) {
-    await new Promise((r) => requestAnimationFrame(r));
-    if (rotate) {
-      const now = performance.now();
-      const dt = Math.min(0.1, (now - lastT) / 1000);
-      lastT = now;
-      obj.rotation.x += dt * 0.6;
-      obj.rotation.y += dt * 0.6;
-    } else {
-      obj.position.x = base.x + amp * Math.sin((2 * Math.PI * i) / frames);
+  if (pan) {
+    // PAN–HOLD CYCLES, COUNTING THE HOLDS ONLY. During a pan the resolve is
+    // screen-space and every pixel changes every frame for the mechanical
+    // reason that the scene slides across it — a during-motion count would be
+    // 100% reprojection and 0% GI. What the glints report describes is the
+    // field being WRONG (cold, noisy probes) where the camera newly looks,
+    // and that is measurable the moment the camera stops: sweep (armed=0,
+    // accumulator still seeding prevLum every frame), then park and COUNT the
+    // re-settle churn (armed=1). The first counted frame therefore sees GI
+    // evolution only, never the pan's own reprojection step. Two cycles per
+    // arm; even cycle pans out, odd pans home, so the arm ends at base.
+    const seg = Math.floor(frames / (pan.cycles * 2));
+    for (let cyc = 0; cyc < pan.cycles; cyc++) {
+      armed.value = 0;
+      for (let i = 0; i < seg; i++) {
+        await new Promise((r) => requestAnimationFrame(r));
+        await setCam(((cyc % 2 === 0 ? i + 1 : seg - 1 - i) / seg) * pan.angle);
+        renderer.compute(accumulator);
+      }
+      armed.value = 1;
+      for (let i = 0; i < seg; i++) {
+        await new Promise((r) => requestAnimationFrame(r));
+        renderer.compute(accumulator);
+      }
     }
-    obj.updateMatrixWorld(true);
-    renderer.compute(accumulator);
+    await setCam(0);
+  } else {
+    for (let i = 0; i < frames; i++) {
+      await new Promise((r) => requestAnimationFrame(r));
+      // LIGHT_STEP: the step lands mid-window through the editor's own prop
+      // path, so the light events GISystem listens for fire exactly as live.
+      if (light && i === light.at) {
+        await globalThis.__editorApi.call("component.setProp", {
+          id: light.id, type: "light", key: "intensity", value: light.to,
+        });
+      }
+      if (rotate) {
+        const now = performance.now();
+        const dt = Math.min(0.1, (now - lastT) / 1000);
+        lastT = now;
+        obj.rotation.x += dt * 0.6;
+        obj.rotation.y += dt * 0.6;
+      } else {
+        obj.position.x = base.x + amp * Math.sin((2 * Math.PI * i) / frames);
+      }
+      obj.updateMatrixWorld(true);
+      renderer.compute(accumulator);
+    }
   }
   obj.position.copy(base);
   obj.updateMatrixWorld(true);
@@ -376,8 +465,8 @@ const body = async ({ anchorId, moverId, frames, amp, rotate }) => {
 // persists between evaluate() calls, so this costs one extra pass and nothing
 // else. The ratio moving/still is the reportable quantity; a raw reversal count
 // from this instrument means nothing alone and must never be quoted alone.
-const measure = (amp, rotate) => page.evaluate(body, {
-  anchorId: giEntity.id, moverId: sphere.id, frames: FRAMES, amp, rotate,
+const measure = (amp, rotate, extra = {}) => page.evaluate(body, {
+  anchorId: giEntity.id, moverId: sphere.id, frames: FRAMES, amp, rotate, ...extra,
 });
 // ORDER MATTERS AND IS CONTROLLED. The FIRST arm absorbs post-build settling
 // churn, so a still control run first is biased HIGH and would flatter any fix
@@ -515,6 +604,77 @@ if (TRACK_AB) {
     trackRounds.push({ on, off, onStill, offStill });
   }
   await setTrack(undefined);
+}
+// ── THE CAMERA-PAN A/B ──────────────────────────────────────────────────────
+// Cap CAP_VALUE vs FORCED off, interleaved ×2, a full discarded arm after
+// every switch (the α-sweep's re-equilibration lesson). The quotable figure
+// is each config's PAN EXCESS over its OWN parked still, because §12.42
+// already moved the still floor between capped and off — a raw pan-to-pan
+// comparison would re-litigate the cap A/B, not the pan.
+const camRounds = [];
+if (CAMERA_AB) {
+  for (let r = 0; r < 2; r++) {
+    await setCap(CAP_VALUE);
+    await wait(300);
+    await measure(0, false);
+    const cappedPan = await measure(0, false, { pan: { angle: CAM_ANGLE, cycles: 2 } });
+    const cappedStill = await measure(0, false);
+    // A SECOND still, because the first run's stills read 3.2× the page's clean
+    // pre-pan floor — the pan's churn OUTLIVED a whole 270-frame arm and
+    // contaminated the "own still" baseline. still2 separates a convergence
+    // TAIL (decays toward the floor ⇒ cold blocks re-converging) from a
+    // LATCHED state (stays elevated ⇒ something keeps re-invalidating).
+    const cappedStill2 = await measure(0, false);
+    const capComp = await readComp();
+    await setCap(0);
+    await wait(300);
+    await measure(0, false);
+    const offPan = await measure(0, false, { pan: { angle: CAM_ANGLE, cycles: 2 } });
+    const offStill = await measure(0, false);
+    const offStill2 = await measure(0, false);
+    camRounds.push({ cappedPan, cappedStill, cappedStill2, offPan, offStill, offStill2, capComp });
+  }
+  await setCap(undefined);
+}
+// ── THE LIGHT-STEP A/B ──────────────────────────────────────────────────────
+// Direction alternates 2↔6 arm to arm, so over 2 rounds every config sees one
+// rising and one falling step and the per-config means are balanced. A
+// discarded settle arm precedes each measured one — it doubles as the
+// re-settle from the PREVIOUS arm's step (§12.43's t90 at stride 1 is well
+// inside 240 frames + body's warmup).
+const stepRounds = [];
+// The three arms moved once §12.45 landed: `shipped` is now the TIER cap
+// (unset — a pinned cap deliberately never lifts) WITH the window lift;
+// `no-lift` is the same config with `__giSrcCapWindowLift = false`, i.e. the
+// pre-§12.45 behavior (it measured 24.1 rev/px; cap-off measured 15.3 — the
+// lift's ceiling — and window-off 3.7, in the 2026-08-12 pre-fix run).
+const setLift = (v) => page.evaluate((x) => { globalThis.__giSrcCapWindowLift = x; }, v);
+const STEP_NAMES = ["shipped", "no-lift", "window-off"];
+if (LIGHT_STEP) {
+  const stepConfigs = [
+    { name: "shipped", track: undefined, cap: undefined, lift: undefined },
+    { name: "no-lift", track: undefined, cap: undefined, lift: false },
+    { name: "window-off", track: false, cap: undefined, lift: undefined },
+  ];
+  for (let r = 0; r < 2; r++) {
+    const round = {};
+    for (const cfg of stepConfigs) {
+      await setTrack(cfg.track);
+      await setCap(cfg.cap);
+      await setLift(cfg.lift);
+      await wait(300);
+      await measure(0, false);
+      const to = lightNow === 2 ? 6 : 2;
+      const arm = await measure(0, false, { light: { id: stepLightId, at: STEP_AT, to } });
+      round[cfg.name] = { arm, dir: `${lightNow}->${to}` };
+      lightNow = to;
+    }
+    stepRounds.push(round);
+  }
+  await setTrack(undefined);
+  await setCap(undefined);
+  await setLift(undefined);
+  await must("component.setProp", { id: stepLightId, type: "light", key: "intensity", value: 2 });
 }
 // ── THE α SWEEP, SAME DISCIPLINE ────────────────────────────────────────────
 // Round 2 walks the α list in REVERSE so a slow page drift loads each α at
@@ -741,6 +901,74 @@ if (trackRounds.length) {
     ? Math.abs(trackRounds[0].off.meanReversals - trackRounds[1].off.meanReversals)
     : NaN;
   console.log(`  round-to-round spread on the moving OFF arm: ${spread.toFixed(3)}`);
+}
+
+// ── THE CAMERA-PAN VERDICT ──────────────────────────────────────────────────
+if (camRounds.length) {
+  console.log(`
+=== CAMERA PAN A/B (±${((CAM_ANGLE * 180) / Math.PI).toFixed(0)}° pan–hold ×2, holds counted; cap ${CAP_VALUE} vs off, interleaved x${camRounds.length}) ===`);
+  console.log("  round  arm      pan rev/px   still rev/px   still2 rev/px   pan p95   still p95");
+  const row = (i, name, p, s, s2) => console.log(
+    `  ${i}      ${name.padEnd(8)} ${p.meanReversals.toFixed(3).padEnd(12)} ${s.meanReversals.toFixed(3).padEnd(14)} ` +
+    `${(s2 ? s2.meanReversals.toFixed(3) : "-").padEnd(15)} ${p.stepP95.toFixed(4).padEnd(9)} ${s.stepP95.toFixed(4)}`);
+  for (const [i, r] of camRounds.entries()) {
+    row(i + 1, "capped", r.cappedPan, r.cappedStill, r.cappedStill2);
+    row(i + 1, "off", r.offPan, r.offStill, r.offStill2);
+  }
+  const mean = (k, f) => camRounds.reduce((s, r) => s + r[k][f], 0) / camRounds.length;
+  const exCap = mean("cappedPan", "meanReversals") - mean("cappedStill", "meanReversals");
+  const exOff = mean("offPan", "meanReversals") - mean("offStill", "meanReversals");
+  const p95Cap = mean("cappedPan", "stepP95") - mean("cappedStill", "stepP95");
+  const p95Off = mean("offPan", "stepP95") - mean("offStill", "stepP95");
+  const spread = camRounds.length > 1
+    ? Math.abs(camRounds[0].offPan.meanReversals - camRounds[1].offPan.meanReversals)
+    : NaN;
+  const lifts = camRounds.map((r) => r.capComp?.lift);
+  console.log(`  lift after capped arms: ${lifts.map((l) => l?.toFixed?.(3) ?? l).join(", ")} (post-measure snapshot — §12.42's caveat)`);
+  console.log(`  the page's CLEAN pre-pan still (tier cap): ${still.meanReversals.toFixed(3)} rev/px — post-pan stills read against THIS floor`);
+  console.log(`  PAN EXCESS over own still — reversals: capped ${exCap.toFixed(3)}  vs  off ${exOff.toFixed(3)}` +
+    `   (x${(exCap / Math.max(1e-9, exOff)).toFixed(2)})`);
+  console.log(`  PAN EXCESS — step p95:               capped ${p95Cap.toFixed(4)}  vs  off ${p95Off.toFixed(4)}`);
+  console.log(`  round-to-round spread on the OFF pan arm: ${spread.toFixed(3)} — the noise floor`);
+  if (exCap - exOff > Math.max(spread * 1.5, Math.abs(exOff) * 0.25)) {
+    console.log("  ⇒ THE CAP MULTIPLIES POST-PAN SETTLE CHURN: fresh/newly-visible probes are");
+    console.log("     evidence-starved at the cap. The queued fix (a warm-up exemption in [D1'] —");
+    console.log("     fresh blocks skip the clamp until converged) has a priced target.");
+  } else {
+    console.log("  ⇒ pan settle churn is CAP-INVARIANT at this pose — the glints are not the");
+    console.log("     cap's starvation; look at fresh-probe seeding/α, not the ray budget.");
+  }
+}
+
+// ── THE LIGHT-STEP VERDICT ──────────────────────────────────────────────────
+if (stepRounds.length) {
+  console.log(`
+=== LIGHT STEP A/B (intensity toggles at frame ${STEP_AT}; shipped(lift) vs no-lift vs window-off, x${stepRounds.length}) ===`);
+  console.log("  round  config      dir     rev/px    p95      meanWalk");
+  for (const [i, r] of stepRounds.entries()) {
+    for (const name of STEP_NAMES) {
+      const a = r[name];
+      console.log(`  ${i + 1}      ${name.padEnd(11)} ${a.dir.padEnd(7)} ${a.arm.meanReversals.toFixed(3).padEnd(9)} ` +
+        `${a.arm.stepP95.toFixed(4).padEnd(8)} ${a.arm.meanWalk.toFixed(3)}`);
+    }
+  }
+  const mean = (name, f) => stepRounds.reduce((s, r) => s + r[name].arm[f], 0) / stepRounds.length;
+  const spread = stepRounds.length > 1
+    ? Math.abs(stepRounds[0].shipped.arm.meanReversals - stepRounds[1].shipped.arm.meanReversals)
+    : NaN;
+  console.log(`  means — shipped ${mean("shipped", "meanReversals").toFixed(3)}, no-lift ${mean("no-lift", "meanReversals").toFixed(3)}, ` +
+    `window-off ${mean("window-off", "meanReversals").toFixed(3)} rev/px (shipped round spread ${spread.toFixed(3)})`);
+  const liftWin = mean("no-lift", "meanReversals") - mean("shipped", "meanReversals");
+  console.log(`  what the window cap lift bought: ${liftWin.toFixed(3)} rev/px (no-lift − shipped;`);
+  console.log("     the pre-fix run priced the ceiling at 8.76 — cap-off read 15.3 vs shipped-then 24.1)");
+  console.log("     (window-off is the slow-convergence reference, not a target — §12.43's t90)");
+  if (liftWin > Math.max(spread * 1.5, mean("shipped", "meanReversals") * 0.15)) {
+    console.log("  ⇒ THE WINDOW CAP LIFT HOLDS: shipped now converges at uncapped evidence rate");
+    console.log("     during the tracking window and re-caps after.");
+  } else {
+    console.log("  ⇒ NO MEASURABLE LIFT EFFECT — check `__giSrcTransport.probeRayCap` flips during");
+    console.log("     the window (a pinned cap never lifts; is the arm accidentally pinning?).");
+  }
 }
 
 // ── THE α SWEEP VERDICT ─────────────────────────────────────────────────────

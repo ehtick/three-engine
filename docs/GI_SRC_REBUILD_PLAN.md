@@ -7261,3 +7261,56 @@ floor-dominated pose, so the RATIO is the message): cap 16 deposit
 cap 8 ≈ cap 16 says what remains is the floor, not rays. The user-editor
 number (19 ms deposit for 25k rays, the unit's whole motivation) owes its
 re-measurement after their next reload.
+
+### 12.45 THE GLINTS HAVE TWO OWNERS — THE WINDOW LIFTS THE CAP, AND THE
+### PAN CHURN OUTLIVES ITS OWN INSTRUMENT ARM
+
+The 2026-08-12 re-report named two symptoms: "glint movement settles when
+the camera does not move, as it starts moving — lights are moving all over
+again" and "anytime light updates, it starts flickering." Two new rig arms
+(R13 — instrument before fix) priced them separately, and they turned out
+to be DIFFERENT mechanisms.
+
+**LIGHT_STEP (interleaved ×2, a real intensity step 2↔6 through the
+editor's own prop path at frame 60, directions balanced per config):**
+post-step churn read **shipped 24.08 / cap-off 15.32 / window-off 3.71
+rev/px** (shipped round spread 0.394 — 22× under the effect). The §12.43
+tracking window converges fast by decaying fast, and the §12.42 cap denies
+it evidence at exactly the moment it needs the most: the cap owned 8.76
+rev/px — 36% — of the light-update flicker. Window-off's calm 3.71 is the
+slow-convergence reference (t90 7.4 s, the complaint §12.43 fixed), not a
+target.
+
+**THE FIX (this section's commit): the tier cap LIFTS to OFF while the
+tracking window is open** — CPU-only, in `syncCamera`'s existing cap poll,
+riding the same `tr` the root relaxation already reads. The deposit pays
+uncapped cost for the window's 1.2 s, which is the point: spend rays when
+evidence is stale, save them when it isn't. A cap PINNED via
+`__giSrcProbeRayCap` NEVER lifts (pins belong to instruments — §12.42's
+non-cap-sweep rule would silently break otherwise); `__giSrcCapWindowLift
+= false` opts out, and is the rig's `no-lift` arm.
+
+**CAMERA_AB (pan–hold cycles ±25°, counting holds only — a during-pan
+count is 100% reprojection; capped 16 vs forced off, interleaved ×2):**
+the headline statistic said "cap-invariant" (pan excess over own still:
+capped 2.08 vs off 1.28, against a 0.86 noise threshold) — but its OWN
+BASELINE was the finding. Post-pan still arms read 13.2–14.7 (capped) and
+8.2–8.9 (off) against the same page's clean pre-pan floor of 4.18: the
+pan's churn OUTLIVED a full 270-frame arm in both configs. Re-anchor is
+ruled out by arithmetic (threshold 64·s₀ = 28.8 m; the pan moves the eye
+~6.5 m; zero re-anchor log lines). The standing suspect is probe
+POPULATION turnover — newly revealed surfaces allocate cold blocks, and
+blocks reclaimed while off-screen return cold when the camera pans back.
+The cap multiplies the tail ~1.6× but is not its source. still2 arm added
+to time the tail's decay; diagnosis continues before any fix is designed.
+
+#### 12.45.1 VERIFY
+
+Post-fix LIGHT_STEP rerun (same rig, fresh page — absolute numbers do not
+cross the process boundary, ratios do): **shipped-with-lift 11.45 /
+no-lift 17.07 / window-off 4.75 rev/px**, shipped round spread 0.294 —
+the effect is 19× the rig's own noise. The lift removed **33%** of
+post-step churn within its page (the pre-fix run priced the ceiling at
+36%), directions balanced (2→6 and 6→2 agree within 0.6 rev/px on every
+config). `no-lift` (`__giSrcCapWindowLift = false`) reproduces the
+pre-§12.45 behavior and is the standing regression arm.

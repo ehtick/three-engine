@@ -1,5 +1,9 @@
 # Engine development invariants
 
+## Response style
+
+Respond short: main thesis first, 2-3 sentences with the key information. Detail belongs in plan docs and memory, not in chat replies.
+
 ## WebGPU GI binding budget
 
 - Every GI compute shader must stay within WebGPU's portable limit of **8 storage buffers per shader stage** (`maxStorageBuffersPerShaderStage = 8`).

@@ -1015,7 +1015,22 @@ export function createSrcProbeSystem({
       }
       // The cap polls on the same schedule and for the same reason as the
       // ceiling. Compare-then-assign: a still scene uploads nothing.
-      const nextCap = readCap();
+      // ── AND IT LIFTS INSIDE THE TRACKING WINDOW (§12.45) ─────────────────
+      // Measured before built (rig LIGHT_STEP, interleaved ×2): post-step
+      // churn 24.1 rev/px shipped vs 15.3 with the cap off vs 3.7 window-off
+      // — the cap owns 36% of the light-update flicker, because the window's
+      // fast decay needs evidence at exactly the rate the cap denies. So
+      // while GISystem's light-event window is open (`tr` above — never mover
+      // churn, never camera pans), the tier cap lifts to OFF and the fat
+      // probes feed the fast α; it re-engages when the window closes. The
+      // deposit pays uncapped cost for the window's 1.2 s, which is the point.
+      // A cap PINNED via `__giSrcProbeRayCap` NEVER lifts — pins belong to
+      // instruments (§12.42: non-cap sweeps pin the cap off), and a pin that
+      // drifted with scene state would un-A/B every arm that set it.
+      // `__giSrcCapWindowLift = false` opts out (the rig's no-lift arm).
+      const capPinned = Number.isFinite(Number(globalThis.__giSrcProbeRayCap));
+      const capLifted = !capPinned && tr > 0 && globalThis.__giSrcCapWindowLift !== false;
+      const nextCap = capLifted ? PROBE_RAY_CAP_OFF : readCap();
       if (nextCap !== probeRayCap) {
         probeRayCap = nextCap;
         capU.value = nextCap;
