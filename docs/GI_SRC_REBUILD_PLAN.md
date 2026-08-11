@@ -6162,3 +6162,22 @@ measurement (≈1.2 s of compile per inlined descent, stack depth irrelevant, a
 77 kB WGSL and the resolve's own buffers, or a `MAX_GI_LIGHTS = 1` arm. Given this
 section's record — three wrong owners for one fingerprint — it is recorded as the
 leading candidate and nothing is built on it until that arm runs.
+
+##### And the resolve candidate is already weakened — read the outputs
+
+Two facts, both free, both against it:
+
+* **Sizes disagree.** The engine's own kernel list calls index 0 (the resolve /
+  "composite") **72 kB**; the slow kernel is **77 kB**. In the user's boot both
+  appear — `sizes 72/16/2/2/5/…` for the warmed set and `#48 … 77kB` outside it.
+  They are different shaders.
+* **The outputs are wrong for a resolve.** The 77 kB kernel declares
+  `texture_storage_2d<rgba8unorm, write>` **twice** and one storage buffer, and
+  dispatches `@workgroup_size(64,1,1)` — a 1-D dispatch over a list. A GI resolve
+  writes HDR irradiance over a screen-shaped grid, not a pair of 8-bit textures
+  over a 1-D index. Two LDR atlas writes plus an exact BVH trace plus the
+  free-radius marcher reads as an **atlas bake**, not as the resolve.
+
+So: recorded, and the resolve candidate goes back on the pile rather than into a
+fix. The identification is now a bounded task — the tooling names outputs — and
+the rule from §13.14.6 applies to it too: no fix until the owner is confirmed.
