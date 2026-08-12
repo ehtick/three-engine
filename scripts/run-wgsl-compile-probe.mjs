@@ -93,7 +93,17 @@ const browser = await puppeteer.launch({
     // A fresh profile each run, so nothing is answered out of Chrome's
     // compiled-shader disk cache. §13.5 measured that cache at 72x — leaving it
     // on would make the second arm of any A/B win for the wrong reason.
-    `--user-data-dir=${path.join(process.env.TEMP ?? "/tmp", `wgsl-probe-${process.pid}`)}`,
+    //
+    // PROFILE=<dir> DELIBERATELY KEEPS ONE, and is the instrument for §13.18's
+    // question: "would byte-stable WGSL actually be SERVED by the disk cache?"
+    // Run the same file twice against the same PROFILE — if run 2 collapses,
+    // the cache can serve this kernel and stabilizing its text is worth the
+    // refactor; if run 2 matches run 1, the cache never had an answer for it
+    // and uniformizing the baked offsets buys nothing. Measure before fixing:
+    // this exact kernel already refuted five fingerprint-based owner guesses.
+    `--user-data-dir=${process.env.PROFILE
+      ? path.resolve(process.env.PROFILE)
+      : path.join(process.env.TEMP ?? "/tmp", `wgsl-probe-${process.pid}`)}`,
   ],
 });
 

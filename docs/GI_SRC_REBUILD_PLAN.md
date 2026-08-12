@@ -7841,3 +7841,67 @@ editor restart after the first would hit it. It does NOT help a first-ever
 boot or a shader edit, so **R18's ≤1 s still needs §13.14.6's ramp** (boot a
 cheaper ray-hit rung, upgrade in the background). The two compose: the ramp
 covers the cold case, the cache covers every case after it.
+
+### 13.19 THE CACHE SERVES THE KERNEL 200× — IT JUST NEVER GOT THE CHANCE
+
+§13.18 hypothesised that stabilizing the deposit's WGSL would let Chrome's
+content-keyed disk cache serve it. **Tested before fixing** (new `PROFILE=<dir>`
+arm on `probe:wgsl-compile`, which otherwise uses a throwaway profile so a
+cache can never answer an A/B): the SAME file, the SAME profile, three
+separate processes —
+
+| run | compile |
+|---|---|
+| 1 (cold profile) | 3,665 ms |
+| 2 (same profile) | **18 ms** |
+| 3 (same profile) | **22 ms** |
+
+**~200×.** The cache has always been able to serve this kernel. It never got
+the chance because the text moved between boots.
+
+**THE FIX IS PADDING, NOT UNIFORMS.** §13.18 proposed uniformizing the baked
+offsets; that would have traded shader speed for text stability
+(`occupiedAtLevel0` bakes its constants deliberately — the oracle calls it 27×
+per sample) and touched ~10 sites. The actual variance has a narrower source:
+the bases are a chain of cumulative JS sums, and two links wobble —
+`staticBvhWords` (a BVH build) and `dynamicObjectWords` (whichever movers were
+adopted). Everything after them moves, including the attribution/palette pair
+the SRC deposit reads. So each region base is now rounded up to
+`LAYOUT_GRANULE = 1 << 16` words: a sub-granule wobble moves nothing, the
+offsets stay literal (no uniform, no lost constant folding), and the cost is
+≤1 granule of padding per region — **~1 MB against a 157 MB allocation.**
+
+**GATE — a re-diff of two fresh cold boots, not a code reading:** the deposit
+WGSL is now **byte-identical** across boots (it differed by 6 lines before).
+Correctness gates green: `test:gi-src-surface`, `test:gi-rayhit-phase4`,
+`test:gi-rayhit-dynamic` (the three that read the moved regions), plus
+`test:gi-src-deposit`.
+
+**RESULT, WARM BOOT — which is the developer's loop, since every editor
+restart after the first is warm:**
+
+| | before | after |
+|---|---|---|
+| **compute pipeline compile** | 19,082 ms | **9 ms** |
+| slowest single pipeline | 19,450 ms | **545 ms** |
+| all pipelines, summed | 118,642 ms | 26,902 ms |
+| **TTFF** | 27,142 ms | **12,675 ms** |
+
+⚠ The cold arm of that run TIMED OUT (429 s) and is NOT usable — it was
+contending with the user's live editor and this session's own background jobs,
+which is §13.5's "no boot number beside another compiling WebGPU process is
+comparable" landing again. Warm is the trustworthy half and warm is the point.
+
+**WHAT IS LEFT IN THE WARM 12.7 s** (and it is no longer shader compilation):
+the material wave 1,762 ms, render pipelines 1,390 ms, GI CPU work (BVH ~1.3 s
++ setup ~1.5 s), and first-frame. That 12.7 s was also measured under load, so
+a quiet machine should read lower — re-measure before optimizing any of it.
+
+**AND THE NEXT LEVER IS NOW VISIBLE.** 18 kernels still differ between cold
+boots, and diffing one shows why: they are the PER-SLOT voxelize kernels, with
+grid dimensions baked per slot (`% 12u` in one boot, `% 96u` in the other),
+so slot assignment order changes the text. Uniformizing those dims would
+stabilize them AND collapse ~15 distinct pipelines into one — which is §13.5's
+lever 1 (PIPELINE COUNT), still never measured, worth ~20 s of cold latency by
+their summed in-boot times. That is the cold-boot unit, and it composes with
+the §13.14.6 ramp rather than replacing it.

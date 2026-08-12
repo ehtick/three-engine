@@ -369,14 +369,51 @@ export function createOccupancyField(bounds, res0, options = {}) {
   // kernels sit at the 8-storage-buffer wall, so dynamic-object data must be
   // readable through the binding they already have. Zero words unless the
   // feature is on; all existing offsets stay byte-identical.
+  // ══ REGION BASES ARE QUANTIZED, AND IT IS A STARTUP FIX (§13.18) ══════════
+  //
+  // Every base below is a JS number added into the graph, so it CONSTANT-FOLDS
+  // into the WGSL: `bits.element(uint(attrWordOffset).add(...))` emits a
+  // literal. Two consequences, and the second is the expensive one:
+  //
+  //  1. R11 ("grid/world params in uniforms, never baked; a refit must not
+  //     recompile") is violated by construction.
+  //  2. **A shader whose TEXT changes between boots can never hit a
+  //     content-keyed disk cache.** Chrome keys compiled shaders on WGSL
+  //     source, and the measurement is not subtle: the SAME deposit kernel
+  //     compiled against the SAME browser profile reads 3,665 ms on the first
+  //     process and **18 ms / 22 ms on the next two — ~200×** (§13.18's
+  //     `PROFILE=<dir>` arm of `probe:wgsl-compile`). The cache serves this
+  //     kernel perfectly. It simply never gets the chance, because two cold
+  //     boots of IDENTICAL code produced WGSL differing in exactly three baked
+  //     offsets (delta 3024 words).
+  //
+  // The regions above this line are sized from `res0` and are already stable.
+  // The ones below are not: `staticBvhWords` comes from a BVH build and
+  // `dynamicObjectWords` from whichever movers were adopted, so both wobble
+  // run to run — and EVERY base after them wobbles with them, including the
+  // attribution/palette pair the SRC deposit reads.
+  //
+  // So each base is rounded up to `LAYOUT_GRANULE`. A wobble smaller than the
+  // granule now moves NOTHING, the offsets stay literal (no uniform, no lost
+  // constant folding, no shader-speed trade — which is why this beats
+  // uniformizing them), and the cost is at most one granule of padding per
+  // region: ~1 MB against a 157 MB allocation.
+  //
+  // ⚠ This makes the text stable, NOT constant: a real change (different
+  // scene, a region crossing a granule) still shifts the layout and still
+  // recompiles, correctly. ⚠ And it is only worth anything if EVERY varying
+  // base is covered — one survivor keeps the text unstable and buys nothing,
+  // so the gate is a re-diff of two cold boots, not a code reading.
+  const LAYOUT_GRANULE = 1 << 16;
+  const alignRegion = (n) => Math.ceil(n / LAYOUT_GRANULE) * LAYOUT_GRANULE;
   const dynamicObjectWords = Math.max(0, options.dynamicObjectWords | 0);
-  const dynamicObjectWordOffset = densityWordOffset + densityPlan.totalWords;
+  const dynamicObjectWordOffset = alignRegion(densityWordOffset + densityPlan.totalWords);
   // STATIC-SCENE SHADOW BVH region ("light by voxels, shadows by BVH"):
   // world-space BVH8 + slot-tagged exact triangles for the screen shadow
   // channels, appended after the dynamic-object region for the same
   // zero-new-bindings reason.
   const staticBvhWords = Math.max(0, options.staticBvhWords | 0);
-  const staticBvhWordOffset = dynamicObjectWordOffset + dynamicObjectWords;
+  const staticBvhWordOffset = alignRegion(dynamicObjectWordOffset + dynamicObjectWords);
   // SURFACE-ATTRIBUTION region: one u32 per surface record holding
   // `occupancySlot + 1` (0 = never stamped), then the per-slot palette. Both
   // ride THIS allocation for the reason every other tail does, and here the
@@ -388,9 +425,9 @@ export function createOccupancyField(bounds, res0, options = {}) {
   // §12.9 records that the last attribution grid was contorted (the slot remap
   // applied in the VOXELIZER rather than read in the consumer) precisely
   // because it had run out of binding slots.
-  const attrWordOffset = staticBvhWordOffset + staticBvhWords;
+  const attrWordOffset = alignRegion(staticBvhWordOffset + staticBvhWords);
   const attrWords = attributionEnabled ? totalSurfaceCapacity : 0;
-  const paletteWordOffset = attrWordOffset + attrWords;
+  const paletteWordOffset = alignRegion(attrWordOffset + attrWords);
   const paletteWords = paletteSlots * SURFACE_PALETTE_WORDS;
   const bits = instancedArray(new Uint32Array(
     paletteWordOffset + paletteWords,
