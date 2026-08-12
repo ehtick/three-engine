@@ -7615,3 +7615,85 @@ endpoint** of a 10 s half-swing, comfortably past the dwell, so each turn
 is expected to arm one legitimate window — a ~12% lift duty rather than
 100%. `ROT_EASE=1` reproduces their composition and span so that number is
 measured rather than asserted.
+
+### 13.16 STARTUP IS ONE KERNEL AGAIN — AND IT IS THE EMITTER SLOT UNROLL,
+### NOT THE BVH DESCENT EVERY PREVIOUS SESSION SUSPECTED
+
+Cold `probe:gi-boot` on the user's Sponza, 2026-08-12, gates reported first
+(light-shadow SKIPPED, emitter-shadow SKIPPED, reflections off, SRC hit
+shading ON):
+
+| stage | ms |
+|---|---|
+| voxelize (CPU) | 66 |
+| static shadow BVH | 1,274 |
+| GI setup | 1,465 |
+| material compile wave | 3,070 |
+| **compute pipeline compile** | **46,731** |
+| first frame after wave | 2,708 |
+| **TIME TO FIRST CORRECT FRAME** | **58,794** (58.8× over R18) |
+
+79 compute pipelines. **One is 49,114 ms of it — 83.5% of TTFF, the
+wall-clock floor** — 200 kB, 2 loops, 498 ifs, `giDynBvh8` + `giDynShapeHit`
++ `giHybridPlaneTrace192x` + the analytic emitter shapes: the SRC deposit
+(trace + shade). Second is 37 kB at 22,646 ms; everything else is ~2-3 s.
+The material wave holding at 3.1 s confirms §13.15.2 is still shipping.
+
+**Isolated (`probe:wgsl-compile`, empty page, 3 reps — the defensible
+statistic, since in-boot latency includes queue serialization):** deposit
+**13,603 ms**, the 37 kB kernel 2,085 ms, a 154 kB kernel 1,611 ms. So the
+deposit alone is 78.6% of the isolated sum, and §13.5's "WGSL SIZE DOES NOT
+PREDICT COST" holds again — 154 kB compiles 8.4× faster than 200 kB.
+
+**THE BISECTION (text surgery on the DUMPED kernel, so no engine edit and no
+disturbing the user's live editor; each arm paired against the baseline in
+the SAME page because absolute numbers do not survive a process boundary —
+baseline read 12.2-13.1 s across five pages, ~3% within-page spread):**
+
+| variant | median | vs baseline |
+|---|---|---|
+| baseline | 12.7 s | — |
+| `giDynBvh8` body gutted | 11.5 s | 1.1× |
+| `giHybridPlaneTrace` call sites 6→1 | 9.3 s | 1.4× |
+| **emitter trio call sites 8→2** | **5.6 s** | **2.3×** |
+| both cuts | 3.5 s | 3.5× |
+
+**THE BVH DESCENT IS WORTH 1 SECOND.** It has been the prime suspect since
+§13.13 and it is not the cost here — and its arm is generous, since gutting
+the body also removed both loops (`2 loops`→`0`), so 1.1× is an UPPER bound.
+The cost is `giEmitterFactor_4` / `giShapeRayEnter_10` / `giBoxRayEnter_9`,
+**each inlined 8× in `main` = MAX_EMITTERS(4) × two consumers**, at ~0.9 s
+per call site — the same per-inline law §13.14.5 measured at ~1.2 s for the
+light slots, in the one loop that was never rolled. `neeIrradiance`
+(`srcShade.js:287`) still does `slots.map(...)`, a JS map, while the LIGHT
+loop right below it at :512 was rolled and carries the comment explaining
+exactly why.
+
+**AND THE SCENE HAS ZERO EMITTERS.** `profile.giPasses` reports `emitters: 0`
+and the boot gates report the emitter-shadow chain SKIPPED, yet all four
+slots are compiled into the kernel, because §12.37 made `emissiveShadows`
+true so that MAX_EMITTERS uniform slots always exist and an emitter appearing
+later never forces a rebuild (R11). That is a defensible design — but the
+price was never measured, and it is **7.5 s of compile in a scene with no
+emissive surface at all.** This is §13.14.9's shape exactly (a chain compiled
+for a feature nothing in the scene uses), one level down.
+
+**TWO FIXES, AND THEY COMPOSE.** (A) **Roll the emitter loop**, as the light
+loop already is — universal, keeps R11 intact, helps scenes that DO have
+emitters. ⚠ Its one real obstacle: `neeIrradiance` needs every slot's `luma`
+at once to build the importance CDF, so the funnel cannot be a plain copy of
+the light loop's shape. Weighted-reservoir sampling would collapse it to one
+pass but CHANGES THE ESTIMATOR (§12.26 measured stratified at 2.61× vs 2.00×
+for independent), so it owes an energy A/B and a flicker arm; a fixed-size
+indexable local for the weights preserves the estimator exactly and is the
+first thing to try. (B) **Gate emitter support on the scene having an
+emissive surface**, with the `_reflectionConsumerAppeared` rebuild pattern
+§13.14 already uses for reflections — trivial, precedented, and worth the
+whole 7.5 s on this user's scene today, at the cost of one rebuild when a
+scene gains its first emitter.
+
+⚠ Neither reaches R18. Even both cuts leave 3.5 s for ONE kernel in an empty
+page, and §13.14.6's conclusion stands: ≤1 s is architectural (boot a cheaper
+ray-hit rung and upgrade in the background), not reachable by trimming this
+kernel. What these buy is 58.8 s → plausibly the high teens, which is the
+difference between "the editor is broken" and "the editor is slow".
