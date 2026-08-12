@@ -906,8 +906,15 @@ export function emitterDirectAt(params, P, N, samplePoint) {
  * hit-shading path evaluate the IDENTICAL estimator. Trace gates: below
  * cosθ 0.05 the grazing fade discards the traced result entirely, and a
  * contribution too dim to see doesn't earn a march either.
+ *
+ * `penumbraOut` (optional TSL var) collects the ANALYTIC PENUMBRA HALF-WIDTH
+ * in metres when the bundle's trace advertises `withPenumbra` — the emitter
+ * shadow pass's second target (2026-08-13). It is written INSIDE the same
+ * gates as the shadow, so a slot that never traced keeps 0 = no blur, and it
+ * carries the same grazing fade: a shadow faded back to 1 must not leave a
+ * blur radius behind for the wide pass to smear.
  */
-export function emitterSlotShadow(params, slot, P, N, samplePoint) {
+export function emitterSlotShadow(params, slot, P, N, samplePoint, penumbraOut = null) {
   const center = vec3(slot.center);
   const toEmitter = center.sub(P).toVar();
   const dist = toEmitter.length().max(1e-3).toVar();
@@ -958,8 +965,17 @@ export function emitterSlotShadow(params, slot, P, N, samplePoint) {
         // so it keeps the sphere arm. The lamp's own body is excluded by
         // maxT (surface slab entry minus margin), not by a region test —
         // admission is exact, so a wall hugging the lamp still occludes.
+        // ANALYTIC-PENUMBRA ARM: the trace returns vec2(visibility, penumbra
+        // half-width in metres) instead of a bare visibility, because the
+        // blocker distance it needs for the width is a by-product of the hit
+        // it already computes. `dist` and the slot's angular radius ride
+        // along — `k` cannot stand in for them, it is CLAMPED to [1.2, 48]
+        // and the clamp is exactly where a big close lamp lives.
         const traced = params.recordShadowTrace
-          ? params.recordShadowTrace(P, N, dirToEmitter, maxT, k, cosTheta)
+          ? params.recordShadowTrace(
+              P, N, dirToEmitter, maxT, k, cosTheta,
+              dist, float(emitterAngularRadius(slot)).max(1e-3),
+            )
           : params.shadowTraceFn(
               samplePoint, dirToEmitter, maxT, k, cosTheta,
               center, exRadius, exBox,
@@ -968,7 +984,14 @@ export function emitterSlotShadow(params, slot, P, N, samplePoint) {
         // the trace hugs the surface's own field and flickers in terraced
         // rings around the emitter. E already carries cosθ, so at grazing
         // angles the shadow contributes nothing but rings.
-        shadow.assign(mix(float(1), traced, smoothstep(0.05, 0.2, cosTheta)));
+        const graze = smoothstep(0.05, 0.2, cosTheta).toVar();
+        if (params.recordShadowTrace?.withPenumbra === true) {
+          const pair = vec2(traced).toVar();
+          shadow.assign(mix(float(1), pair.x, graze));
+          if (penumbraOut) penumbraOut.assign(pair.y.mul(graze));
+        } else {
+          shadow.assign(mix(float(1), traced, graze));
+        }
       });
     },
   );

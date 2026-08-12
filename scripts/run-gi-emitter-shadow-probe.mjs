@@ -8,6 +8,8 @@
 // Arms: none (record-march default) | spherearm (__giEmitterRecordShadows=false,
 // the legacy sphere trace) | noprobe (__giShadowAnalyticWidth=false — march+pen
 // only) | kind (verdict-kind map) | tap (width-probe argmin-tap map) |
+// nopenumbra (__giEmitterAnalyticPenumbra=false — the pre-2026-08-13 width
+// probe) | nowide (__giEmitterWidePass=false — analytic width, no blur) |
 // noselfcut | norecords | sphere. STEPS=n overrides the macro budget.
 //   HATCH=none node scripts/run-gi-emitter-shadow-probe.mjs <url>
 import puppeteer from "puppeteer-core";
@@ -65,7 +67,10 @@ let sawComposite = false;
 page.on("console", (m) => {
   const t = m.text();
   if (/\[gi\] field ready:/.test(t)) sawComposite = true;
-  if (/\[gi\] (built|light shadows|emitters|field ready|diffuse indirect)|PROBE/.test(t)) console.log(`  ${t.slice(0, 200)}`);
+  // SLOWEST PIPELINE rides along: this probe A/Bs emitter-shadow ARMS, and
+  // the marcher's WGSL size / if-count is the other half of every such A/B
+  // (compile time is a startup cost this module has paid dearly for).
+  if (/\[gi\] (built|light shadows|emitters|field ready|diffuse indirect|SLOWEST PIPELINE)|PROBE/.test(t)) console.log(`  ${t.slice(0, 220)}`);
 });
 page.on("pageerror", (e) => console.log(`pageerror: ${e.message}`));
 await page.goto(url, { waitUntil: "load", timeout: 30000 });
@@ -129,8 +134,22 @@ const srcVol = process.env.SRCVOL ?? "";
 // rejection gate (`__giShadowWidthCapCut`; shipping default 0.5 since
 // 2026-08-13, CAPCUT=0.85 is the pre-change arm for the SLAB leak A/B).
 const capCut = process.env.CAPCUT ?? "";
-const result = await page.evaluate(async ({ hatch, quality, steps, slab, sunOn, profileOn, kindSub, sunPos, floorY, emitterCounts, moverOn, moverY, sourceAngle, intermitOn, pressure, intermitMs, srcVol, capCut }) => {
+// CRATEY — the crate's centre height (default 0.6 = resting on the floor).
+// THE BLOCKER-DISTANCE AXIS, and the gate on the analytic penumbra: the
+// width of an area light's shadow edge is `reff · t_blocker / (dist −
+// t_blocker)`, so lifting the SAME occluder off the floor must widen its
+// penumbra and nothing else. Read `soft` (penumbra ÷ shadow footprint), not
+// `penumbraPx` — a floating crate also casts a slightly bigger shadow.
+const crateY = Number(process.env.CRATEY ?? 0.6);
+// ZOOM=n — nearest-neighbour magnification of the written shadow PNG (see
+// `toPng`). Measurement is unaffected; only the artifact is.
+const zoom = Number(process.env.ZOOM ?? 1);
+// WIDTHSCALE — metres of penumbra half-width that map to white in the
+// `widthmap` arm (default 2).
+const widthScale = Number(process.env.WIDTHSCALE ?? 2);
+const result = await page.evaluate(async ({ hatch, quality, steps, slab, sunOn, profileOn, kindSub, sunPos, floorY, emitterCounts, moverOn, moverY, sourceAngle, intermitOn, pressure, intermitMs, srcVol, capCut, crateY, zoom, widthScale }) => {
   globalThis.__probeFloorY = floorY;
+  globalThis.__probeZoom = zoom;
   globalThis.__editorKeepRendering = true;
   if (hatch === "noselfcut") globalThis.__giNoOccSelfCut = true;
   if (hatch === "norecords") globalThis.__giRayHitShadowRecords = false;
@@ -139,6 +158,31 @@ const result = await page.evaluate(async ({ hatch, quality, steps, slab, sunOn, 
   if (steps) globalThis.__giDirectShadowSteps = steps;
   if (hatch === "kind") globalThis.__giEmitterShadowKindDebug = true;
   if (hatch === "noprobe") globalThis.__giShadowAnalyticWidth = false;
+  // THE ANALYTIC-PENUMBRA A/B (2026-08-13, plan §12.52.1 unit 2). Default ON:
+  // the static-BVH arm's softness comes from the blocker distance + the two
+  // wide passes. `nopenumbra` restores the 12-tap width probe (the pre-change
+  // shipping arm, and the source of the waffle `grain`); `nowide` keeps the
+  // analytic width but skips the reconstruction, which separates "the width
+  // is wrong" from "the blur is wrong" — with it the shadow should read HARD
+  // (binary hit) with no grain at all.
+  if (hatch === "nopenumbra") globalThis.__giEmitterAnalyticPenumbra = false;
+  if (hatch === "nowide") globalThis.__giEmitterWidePass = false;
+  // widthmap — the ANALYTIC WIDTH ITSELF, painted into the shadow channel in
+  // units of WIDTHSCALE metres (default 2). The wide passes are disabled with
+  // it, or they would blur the very map being read. This is the monotonicity
+  // instrument: the width is `reff · t/(dist − t)`, so the map must run from
+  // ~0 where the occluder meets the floor to its maximum at the far end of
+  // the shadow, and the printed WIDTHMAP line is that gradient as numbers.
+  // temporal — the opt-in emitter history chain (`__giEmitterTemporal`,
+  // default OFF since 2026-08-07). It is here as a COMPILE guard: the chain
+  // re-targets the same textures the analytic-penumbra passes hand off
+  // through, so "does the other arm still build" needs one command, not a
+  // code read.
+  if (hatch === "temporal") globalThis.__giEmitterTemporal = true;
+  if (hatch === "widthmap") {
+    globalThis.__giEmitterWidePass = false;
+    globalThis.__giEmitterWidthDebug = Number(widthScale);
+  }
   if (hatch === "tap") globalThis.__giWidthProbeDebugTap = true;
   if (srcVol) globalThis.__giSrcVolumeShadows = srcVol;
   if (capCut !== "") globalThis.__giShadowWidthCapCut = Number(capCut);
@@ -164,7 +208,7 @@ const result = await page.evaluate(async ({ hatch, quality, steps, slab, sunOn, 
   // editor grid at y=0 — which z-fights in the gbuffer; see SUN-KINDS notes).
   floor.position.y = -0.15 + Number(globalThis.__probeFloorY ?? 0);
   const crate = new THREE.Mesh(anon(new THREE.BoxGeometry(1.2, 1.2, 1.2)), grey);
-  crate.position.set(0, 0.6, 0);
+  crate.position.set(0, crateY, 0);
   // The panel: a tall emissive slab standing behind the crate, like the
   // user's screenshot.
   const glowMat = new THREE.MeshStandardNodeMaterial({ color: 0x111111, roughness: 0.9 });
@@ -547,20 +591,80 @@ const result = await page.evaluate(async ({ hatch, quality, steps, slab, sunOn, 
     for (let x = 0; x < W; x++) img[y * W + x] = data[row + x * 4] / 255;
   }
   const inPen = (v) => v > 0.08 && v < 0.92;
-  let sum = 0, n = 0;
+  let sum = 0, n = 0, umbra = 0, allSum = 0, allN = 0;
   for (let y = 1; y < H - 1; y++) for (let x = 1; x < W - 1; x++) {
     const i = y * W + x;
+    // WHOLE-IMAGE STRUCTURE, on a denominator that does not move. `grain`
+    // averages over PENUMBRA pixels, so it is not comparable across arms that
+    // disagree about which pixels those are — and that is exactly what the
+    // analytic-penumbra change did: it deleted ~8000 partial-shadow pixels on
+    // open floor (the mud), leaving `grain` averaged over a smaller, steeper
+    // population and reading WORSE while the picture got strictly cleaner.
+    // `grainAll` has the same denominator on every arm: flat regions
+    // contribute zero, so a lattice etched across an unoccluded floor shows
+    // up here and a legitimately steep shadow edge barely does.
+    allSum += Math.abs(img[i] * 4 - img[i - 1] - img[i + 1] - img[i - W] - img[i + W]); allN++;
+    // UMBRA COUNT — the denominator `penumbraPx` never had. A raw penumbra
+    // pixel count conflates "the penumbra is wide" with "the shadow is big",
+    // and the two arms this probe A/Bs differ in BOTH: the width-probe arm
+    // paints partial shadow across floors with no occluder at all (the mud),
+    // which inflates penumbraPx by thousands while the actual shadow is
+    // unchanged. `soft = penumbra/(penumbra+umbra)` is the shape number:
+    // the fraction of a shadow's own footprint that is a soft edge.
+    if (img[i] <= 0.08) { umbra++; continue; }
     if (!inPen(img[i])) continue;
     sum += Math.abs(img[i] * 4 - img[i - 1] - img[i + 1] - img[i - W] - img[i + W]); n++;
   }
+  // ZOOM=n writes the shadow map at n× with NEAREST-NEIGHBOUR replication.
+  // The emitter buffer is ~180×100 on this rig, and every question this probe
+  // is actually asked ("is that a penumbra or is it dither", "is the lattice
+  // still there") is a per-TEXEL question that a 180px image cannot answer
+  // when it is displayed. Nearest, never smooth: a resampled artifact is a
+  // different artifact.
+  // WIDTHMAP STATS — the monotonicity readout. Over the painted (non-zero)
+  // texels, split the vertical extent into thirds: on this rig the crate sits
+  // at the TOP of its own shadow and the wedge runs away from it downward, so
+  // blocker distance grows with row. `near` must be smaller than `far` — that
+  // ordering IS the analytic width doing its job, and a flat pair means the
+  // width collapsed to a constant (the failure the wide passes would then
+  // faithfully render as a uniform blur).
+  let widthMap = null;
+  if (hatch === "widthmap") {
+    let y0 = H, y1 = -1;
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+      if (img[y * W + x] > 0.004) { if (y < y0) y0 = y; if (y > y1) y1 = y; }
+    }
+    if (y1 > y0) {
+      const band = (a, b) => {
+        let s2 = 0, c2 = 0, mx = 0;
+        for (let y = a; y <= b; y++) for (let x = 0; x < W; x++) {
+          const v = img[y * W + x];
+          if (v > 0.004) { s2 += v; c2++; if (v > mx) mx = v; }
+        }
+        return { mean: c2 ? s2 / c2 : 0, max: mx, n: c2 };
+      };
+      const third = Math.max(1, Math.round((y1 - y0) / 3));
+      widthMap = {
+        rows: [y0, y1],
+        near: band(y0, y0 + third),
+        far: band(y1 - third, y1),
+        scaleM: widthScale,
+      };
+    }
+  }
   const toPng = (im) => {
+    const z = Math.max(1, Math.min(8, Math.round(Number(globalThis.__probeZoom) || 1)));
     const c = document.createElement("canvas");
-    c.width = W; c.height = H;
+    c.width = W * z; c.height = H * z;
     const ctx = c.getContext("2d");
-    const id = ctx.createImageData(W, H);
-    for (let i = 0; i < W * H; i++) {
-      const v = Math.max(0, Math.min(255, Math.round(im[i] * 255)));
-      id.data[i * 4] = v; id.data[i * 4 + 1] = v; id.data[i * 4 + 2] = v; id.data[i * 4 + 3] = 255;
+    const id = ctx.createImageData(W * z, H * z);
+    for (let y = 0; y < H * z; y++) {
+      const sy = (y / z) | 0;
+      for (let x = 0; x < W * z; x++) {
+        const v = Math.max(0, Math.min(255, Math.round(im[sy * W + ((x / z) | 0)] * 255)));
+        const o = (y * W * z + x) * 4;
+        id.data[o] = v; id.data[o + 1] = v; id.data[o + 2] = v; id.data[o + 3] = 255;
+      }
     }
     ctx.putImageData(id, 0, 0);
     return c.toDataURL("image/png");
@@ -825,8 +929,8 @@ const result = await page.evaluate(async ({ hatch, quality, steps, slab, sunOn, 
       bitsProfile = { fail: String(err?.message ?? err) };
     }
   }
-  return { W, H, emitters, grain: n ? sum / n : 0, penPx: n, leak, shadowPng: toPng(img), sunKinds, rayStats, bitsProfile };
-}, { hatch, quality, steps, slab, sunOn, profileOn, kindSub, sunPos, floorY, emitterCounts, moverOn, moverY, sourceAngle, intermitOn, pressure, intermitMs, srcVol, capCut });
+  return { W, H, emitters, grain: n ? sum / n : 0, grainAll: allN ? allSum / allN : 0, penPx: n, umbraPx: umbra, widthMap, leak, shadowPng: toPng(img), sunKinds, rayStats, bitsProfile };
+}, { hatch, quality, steps, slab, sunOn, profileOn, kindSub, sunPos, floorY, emitterCounts, moverOn, moverY, sourceAngle, intermitOn, pressure, intermitMs, srcVol, capCut, crateY, zoom, widthScale });
 
 if (result.fail) { console.log(`FAIL: ${result.fail}`); await browser.close(); process.exit(1); }
 // See the console-hook note: no composite ⇒ the readback measured a field that
@@ -864,7 +968,12 @@ if (result.costCurve) {
 }
 writeFileSync(`scripts/gi-diag-emissive-grid-${hatch}${slab ? "-slab" : ""}${steps ? `-s${steps}` : ""}.png`, Buffer.from(result.shadowPng.split(",")[1], "base64"));
 await page.screenshot({ path: `scripts/gi-diag-emissive-grid-${hatch}-view.png` });
-console.log(`PROBE hatch=${hatch}${srcVol ? `+src:${srcVol}` : ""}${slab ? "+slab" : ""} q=${quality} ${result.W}x${result.H} emitters=${result.emitters} penumbraPx=${result.penPx} grain=${result.grain.toFixed(4)} leak=${result.leak == null ? "n/a" : result.leak.toFixed(4)}`);
+const softFrac = result.penPx + result.umbraPx ? result.penPx / (result.penPx + result.umbraPx) : 0;
+console.log(`PROBE hatch=${hatch}${srcVol ? `+src:${srcVol}` : ""}${slab ? "+slab" : ""} q=${quality} crateY=${crateY} ${result.W}x${result.H} emitters=${result.emitters} penumbraPx=${result.penPx} umbraPx=${result.umbraPx} soft=${softFrac.toFixed(4)} grain=${result.grain.toFixed(4)} grainAll=${result.grainAll.toFixed(4)} leak=${result.leak == null ? "n/a" : result.leak.toFixed(4)}`);
+if (result.widthMap) {
+  const { near, far, rows, scaleM } = result.widthMap;
+  console.log(`PROBE WIDTHMAP scale=${scaleM}m rows=${rows[0]}..${rows[1]} near(mean=${(near.mean * scaleM).toFixed(3)}m max=${(near.max * scaleM).toFixed(3)}m n=${near.n}) far(mean=${(far.mean * scaleM).toFixed(3)}m max=${(far.max * scaleM).toFixed(3)}m n=${far.n}) ratio=${near.mean ? (far.mean / near.mean).toFixed(2) : "inf"}`);
+}
 if (result.sunKinds) {
   const { png, ...counts } = result.sunKinds;
   if (png) writeFileSync(`scripts/gi-diag-sun-${kindSub || "raw"}.png`, Buffer.from(png.split(",")[1], "base64"));

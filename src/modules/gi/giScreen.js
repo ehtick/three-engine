@@ -799,10 +799,17 @@ export function createGiLightShadowPass({ gbuffer, lightShadow, width, height, r
  * `cameraPosition` (optional) reproduces the resolve's facing flip so both
  * kernels shade the same side of double-sided geometry; without a camera
  * the raw gbuffer normal is used, exactly like the resolve's own fallback.
+ *
+ * `distTarget` (optional, 2026-08-13) is the ANALYTIC-PENUMBRA channel: one
+ * world-space penumbra HALF-WIDTH in metres per slot, computed from the
+ * blocker distance the static-BVH trace already returns (see GISystem's
+ * #buildEmitterRecordTrace). It exists only on the arm whose trace advertises
+ * `withPenumbra`; with the width-probe arm the marcher carries softness in
+ * the shadow value itself and this channel would be all zeros.
  */
 export function createGiEmitterShadowPass({
   gbuffer, emitter, normalOffset, target, width, height, resolveWidth, resolveHeight,
-  cameraPosition = null,
+  cameraPosition = null, distTarget = null,
 }) {
   const widthU = uniform(width, "uint");
   const positionNode = texture(gbuffer.position);
@@ -824,6 +831,22 @@ export function createGiEmitterShadowPass({
     // pass: every no-geometry / inactive-slot path must leave the emitter's
     // light untouched.
     const shadowVars = Array.from({ length: MAX_EMITTERS }, () => float(1).toVar());
+    // WIDTH-MAP PAINT (`__giEmitterWidthDebug = <metres>`): stamps the
+    // analytic penumbra half-width into the SHADOW channel, normalized by
+    // that many metres, instead of the visibility. It is how the width is
+    // inspected at all — the dist target is rgba16float, which no readback in
+    // this repo decodes, and the whole claim of this arm ("the penumbra grows
+    // with blocker distance") is a claim about this number's gradient. Pair
+    // it with `__giEmitterWidePass = false` or the wide passes blur the map.
+    const widthDebug = Number(globalThis.__giEmitterWidthDebug);
+    const widthPaint = Number.isFinite(widthDebug) && widthDebug > 0 ? widthDebug : 0;
+    // DEFAULT 0 = no penumbra = no blur, the fail-SHARP direction and the
+    // right one here: every path that does not trace (no geometry, inactive
+    // slot, grazing receiver) already leaves a shadow of 1, and blurring a
+    // constant costs texture reads for nothing.
+    const distVars = distTarget || widthPaint
+      ? Array.from({ length: MAX_EMITTERS }, () => float(0).toVar())
+      : null;
     If(g0.w.greaterThan(0.5), () => {
       const P = g0.xyz.toVar();
       const rawN = g1.xyz.normalize().toVar();
@@ -833,10 +856,18 @@ export function createGiEmitterShadowPass({
       const N = rawN.mul(facing).toVar();
       const samplePoint = P.add(N.mul(normalOffset)).toVar();
       emitter.emitterSlots.slice(0, MAX_EMITTERS).forEach((slot, index) => {
-        shadowVars[index].assign(emitterSlotShadow(emitter, slot, P, N, samplePoint));
+        shadowVars[index].assign(
+          emitterSlotShadow(emitter, slot, P, N, samplePoint, distVars ? distVars[index] : null),
+        );
       });
     });
-    textureStore(target, coord, vec4(shadowVars[0], shadowVars[1], shadowVars[2], shadowVars[3]));
+    const paint = widthPaint
+      ? distVars.map((v) => v.div(widthPaint).clamp(0, 1))
+      : shadowVars;
+    textureStore(target, coord, vec4(paint[0], paint[1], paint[2], paint[3]));
+    if (distTarget) {
+      textureStore(distTarget, coord, vec4(distVars[0], distVars[1], distVars[2], distVars[3]));
+    }
   })().compute(width * height);
 
   return { compute, widthU };
@@ -1049,10 +1080,23 @@ export function createGiLightShadowFilterPass({
  *
  * Point lights keep radius 0 for now (their angular size is per-pixel;
  * same deliberate deferral as the material disc).
+ *
+ * WORLD-WIDTH MODE (`slots: null`, 2026-08-13) — how the EMITTER channel uses
+ * this same pass. Area emitters have no single source angle to reconstruct a
+ * width from (it is per-pixel: reff/dist), so their marcher stores the
+ * finished penumbra HALF-WIDTH IN METRES in the dist channel and this pass
+ * only projects it to texels. That removes `span`, `tanHalf`, `slot.kind` and
+ * the whole slot table from the emitter arm's bindings — the radius is one
+ * multiply. `searchFrac` widens the blocker search to match the pass's own
+ * radius cap: a pass that may blur by r texels has to look r texels out for
+ * the blocker, or the penumbra clips at the geometric silhouette instead of
+ * spanning both sides of it (the light arm's fixed 3 texels is sized for a
+ * marcher that already softened the miss side; the emitter arm's raw is a
+ * hard binary hit).
  */
 export function createGiLightShadowWidePass({
-  gbuffer, source, dist, target, slots, span, width, height, resolveWidth, resolveHeight,
-  cameraPosition, capFrac = 0.1,
+  gbuffer, source, dist, target, slots = null, span = 1, width, height, resolveWidth, resolveHeight,
+  cameraPosition, capFrac = 0.1, searchFrac = null,
 }) {
   const widthU = uniform(width, "uint");
   const positionNode = texture(gbuffer.position);
@@ -1081,21 +1125,72 @@ export function createGiLightShadowWidePass({
       const P = g0.xyz.toVar();
       const N = vec3(normalNode.load(gCoord).xyz).normalize().toVar();
       const viewDist = P.sub(vec3(cameraPosition)).length().max(0.05).toVar();
-      // Blocker distance per channel: own texel plus a 4-tap max search so
-      // the penumbra extends OUTSIDE the geometric silhouette instead of
-      // clipping at its edge (misses write 0).
       const texelUv = vec2(1 / width, 1 / height);
-      const t3 = texelUv.mul(3);
-      const blocker = vec4(distNode.load(coord))
-        .max(distNode.sample(uv0.add(vec2(t3.x, 0))).level(0))
-        .max(distNode.sample(uv0.sub(vec2(t3.x, 0))).level(0))
-        .max(distNode.sample(uv0.add(vec2(0, t3.y))).level(0))
-        .max(distNode.sample(uv0.sub(vec2(0, t3.y))).level(0))
-        .toVar();
+      const searchTx = searchFrac ? Math.max(3, Math.round(height * searchFrac)) : 3;
+      const t3 = texelUv.mul(searchTx);
+      const blocker = vec4(distNode.load(coord)).toVar();
+      if (searchFrac) {
+        // THE PCSS BLOCKER SEARCH, and the rule that keeps contact shadows
+        // contact shadows:
+        //   · a pixel WITH a blocker of its own uses ITS OWN width. It has the
+        //     exact answer — the trace measured its blocker — so nothing may
+        //     override it. This is what makes the result monotone in blocker
+        //     distance by construction, and it is why the marcher floors a hit
+        //     at 1 mm: the channel doubles as the occupancy mask, so "contact,
+        //     width ≈ 0" stays distinguishable from "lit, width = 0".
+        //   · a LIT pixel has no blocker, so it borrows the AVERAGE width of
+        //     the shadowed taps around it — the textbook estimator — which is
+        //     what carries a penumbra to the lit side of the silhouette
+        //     instead of clipping it there.
+        // The first version took a plain MAX over the search, like the light
+        // arm's 3-texel cross. At the tens of texels an area light's penumbra
+        // needs, that propagated the far end of a wedge (metres of width) into
+        // the contact band at its root and washed the whole umbra to light
+        // grey — measured on the crate rig as an umbra that survived
+        // `nowide` and dissolved under the blur.
+        const own = blocker.toVar();
+        const d3 = t3.mul(0.7071);
+        const acc = vec4(0).toVar();
+        const cnt = vec4(0).toVar();
+        // Eight taps, cross + diagonals. A 4-tap cross at tens of texels
+        // leaves 45° gaps a corner blocker escapes through entirely, which
+        // reads as a hard notch in the penumbra.
+        for (const [ox, oy] of [
+          [t3.x, null], [t3.x.negate(), null], [null, t3.y], [null, t3.y.negate()],
+          [d3.x, d3.y], [d3.x, d3.y.negate()], [d3.x.negate(), d3.y], [d3.x.negate(), d3.y.negate()],
+        ]) {
+          const uv = uv0.add(vec2(ox ?? float(0), oy ?? float(0))).toVar();
+          const s = vec4(distNode.sample(uv).level(0)).toVar();
+          // Shadowed mask from the 1 mm sentinel — a comparison-free
+          // `s > 0` that stays a plain vec4 through the accumulation.
+          const m = s.mul(1000).clamp(0, 1).toVar();
+          acc.addAssign(s.mul(m));
+          cnt.addAssign(m);
+        }
+        blocker.assign(mix(acc.div(cnt.max(1e-3)), own, own.mul(1000).clamp(0, 1)));
+      } else {
+        // The light arm, unchanged: a 4-tap max at a fixed 3 texels. Its
+        // marcher already softens the miss side, so the search only has to
+        // stop the penumbra clipping at the silhouette by a few texels.
+        blocker.assign(blocker
+          .max(distNode.sample(uv0.add(vec2(t3.x, 0))).level(0))
+          .max(distNode.sample(uv0.sub(vec2(t3.x, 0))).level(0))
+          .max(distNode.sample(uv0.add(vec2(0, t3.y))).level(0))
+          .max(distNode.sample(uv0.sub(vec2(0, t3.y))).level(0)));
+      }
       // Per-slot radius in SHADOW texels. World width → screen fraction is
       // w/(2·tan(fov/2)·viewDist); 1.2 ≈ that fov term at a 60° camera.
       const blockerCh = [blocker.x, blocker.y, blocker.z, blocker.w];
       const radii = Array.from({ length: 4 }, (_, i) => {
+        // WORLD-WIDTH MODE: the channel already holds metres of penumbra
+        // half-width (see the header) — project and cap, nothing else.
+        if (!slots) {
+          return blockerCh[i].max(0)
+            .mul(1.2).div(viewDist)
+            .mul(height)
+            .clamp(0, height * capFrac)
+            .toVar();
+        }
         const slot = slots[i];
         if (!slot) return float(0).toVar();
         const tanHalf = tan(float(slot.soft).min(1.0472)); // ≤60° half-angle
@@ -1126,7 +1221,7 @@ export function createGiLightShadowWidePass({
         // pass changes nothing" bugs.
         const paint =
           dbgMode === "blocker" ? blocker.x
-          : dbgMode === "tan" ? float(slots[0] ? tan(float(slots[0].soft).min(1.0472)) : 0).div(2)
+          : dbgMode === "tan" ? float(slots?.[0] ? tan(float(slots[0].soft).min(1.0472)) : 0).div(2)
           : dbgMode === "vd" ? viewDist.div(30)
           : dbgMode === "span" ? float(span).div(30)
           : dbgMode === "soft" ? null
@@ -1153,12 +1248,29 @@ export function createGiLightShadowWidePass({
             .and(N.dot(rel).abs().lessThan(rel.length().mul(0.2).add(0.15)));
           // Each channel accepts the tap only within ITS radius — one
           // spiral serves four different penumbra widths.
-          const chanOk = vec4(
-            select(ok.and(tapR.lessThanEqual(radii[0])), 1, 0),
-            select(ok.and(tapR.lessThanEqual(radii[1])), 1, 0),
-            select(ok.and(tapR.lessThanEqual(radii[2])), 1, 0),
-            select(ok.and(tapR.lessThanEqual(radii[3])), 1, 0),
-          ).toVar();
+          //
+          // WORLD-WIDTH MODE RAMPS THAT ACCEPTANCE over one texel instead of
+          // cutting it. With a hard cutoff the tap COUNT is a step function of
+          // the radius, so a penumbra whose radius grows smoothly across a
+          // wedge (which is what an analytic width does — it is proportional
+          // to blocker distance) renders as 16 concentric contour bands.
+          // The light arm keeps the hard cut: its radius comes from a source
+          // angle and is near-constant across a shadow, so it never crosses
+          // enough tap radii to band, and changing it would move a shipping
+          // look for nothing.
+          const chanOk = slots
+            ? vec4(
+                select(ok.and(tapR.lessThanEqual(radii[0])), 1, 0),
+                select(ok.and(tapR.lessThanEqual(radii[1])), 1, 0),
+                select(ok.and(tapR.lessThanEqual(radii[2])), 1, 0),
+                select(ok.and(tapR.lessThanEqual(radii[3])), 1, 0),
+              ).toVar()
+            : vec4(
+                radii[0].sub(tapR).clamp(0, 1),
+                radii[1].sub(tapR).clamp(0, 1),
+                radii[2].sub(tapR).clamp(0, 1),
+                radii[3].sub(tapR).clamp(0, 1),
+              ).mul(select(ok, 1, 0)).toVar();
           acc.addAssign(s.mul(chanOk));
           wSum.addAssign(chanOk);
         }
@@ -1394,6 +1506,32 @@ export function createGiTargets(width, height, shadowWidth = width, shadowHeight
   const emitterShadowRaw = new THREE.StorageTexture(emitterWidth, emitterHeight);
   emitterShadowRaw.name = "giEmitterShadowRaw";
   emitterShadowRaw.version = version;
+  // ANALYTIC-PENUMBRA CHAIN (2026-08-13, plan §12.52.1 unit 2) — the emitter
+  // twins of lightShadowMid/lightShadowWide/lightShadowDist. The marcher
+  // stopped computing softness (the 12-tap free-radius width probe, whose
+  // lattice-inset bounds were the Cornell waffle grain) and now emits a
+  // BLOCKER-DERIVED PENUMBRA WIDTH instead; the wide passes turn that width
+  // into the actual soft edge. Chain: raw → filter → MID → wide₁ → WIDE →
+  // wide₂ → emitterShadow.
+  //
+  // HALF FLOAT, and unlike its light-channel sibling that is not a
+  // preference: `lightShadowDist` stores a distance normalized by the volume
+  // span, but this channel stores a WORLD PENUMBRA HALF-WIDTH in metres, and
+  // the widths that matter (centimetres to a couple of metres) against a
+  // 12-64 m span would quantize to 8-bit steps of up to 25 cm — tens of
+  // texels of blur radius per step, i.e. visible radius banding. Storing
+  // metres directly also keeps the wide pass free of every emitter uniform:
+  // it needs no slot table, no span, no angular size.
+  const emitterShadowDist = new THREE.StorageTexture(emitterWidth, emitterHeight);
+  emitterShadowDist.type = THREE.HalfFloatType;
+  emitterShadowDist.name = "giEmitterShadowDist";
+  emitterShadowDist.version = version;
+  const emitterShadowMid = new THREE.StorageTexture(emitterWidth, emitterHeight);
+  emitterShadowMid.name = "giEmitterShadowMid";
+  emitterShadowMid.version = version;
+  const emitterShadowWide = new THREE.StorageTexture(emitterWidth, emitterHeight);
+  emitterShadowWide.name = "giEmitterShadowWide";
+  emitterShadowWide.version = version;
   const radiance = new THREE.StorageTexture(width, height);
   radiance.type = THREE.HalfFloatType;
   radiance.name = "giRadiance";
@@ -1450,6 +1588,9 @@ export function createGiTargets(width, height, shadowWidth = width, shadowHeight
     irradiance,
     emitterShadow,
     emitterShadowRaw,
+    emitterShadowDist,
+    emitterShadowMid,
+    emitterShadowWide,
     radiance,
     lightShadow,
     lightShadowRaw,
@@ -1547,6 +1688,9 @@ export function createGiTargets(width, height, shadowWidth = width, shadowHeight
       irradiance.dispose();
       emitterShadow.dispose();
       emitterShadowRaw.dispose();
+      emitterShadowDist.dispose();
+      emitterShadowMid.dispose();
+      emitterShadowWide.dispose();
       radiance.dispose();
       lightShadow.dispose();
       lightShadowRaw.dispose();
