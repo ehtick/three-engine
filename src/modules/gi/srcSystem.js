@@ -66,7 +66,7 @@ import {
 import {
   DEPOSIT_SCALE, createSrcBinStore, createSrcDepositFrame, createSrcShadeCounters,
 } from "./srcDeposit.js";
-import { createSrcHitShader } from "./srcShade.js";
+import { createSrcHitAttribution, createSrcHitLighting, createSrcHitShader } from "./srcShade.js";
 import { createSrcMergeFrame, formatSrcMerge } from "./srcMerge.js";
 import { createSrcSecondaryFrame, formatSrcSecondary } from "./srcSecondary.js";
 import { createSrcScreenGather, formatSrcGather } from "./srcScreenGather.js";
@@ -545,36 +545,53 @@ export function createSrcProbeSystem({
   //
   // DECIDED HERE, ABOVE THE BIN STORE, because [J]'s hit list is a REGION of
   // the store's `scratch` buffer (R7) and the store therefore has to be built
-  // knowing whether the multibounce is on.
+  // knowing whether anything will shade.
   const staticSurfaceAt = surfaces?.surfaceAt ?? null;
   const shadeEnabled = srcShadeEnabled() && !!lighting && !!staticSurfaceAt;
-  // ── [J]'s GATE — DEFAULT ON, FROM THE TIER (§12.39) ───────────────────────
+  // ── [J] IS THE SHADING PASS NOW, AND THE HIT LIST IS ITS INPUT (§12.53) ───
+  //
+  // The list used to exist only for the SECOND BOUNCE, so it was gated on the
+  // multibounce flag. Since the whole of `shadeHit` moved out of [E] the list
+  // is how ANY hit gets shaded, so it is gated on `shadeEnabled` — and the
+  // bounce flag now gates one TERM inside [J] (`bounceOn` below), not the pass.
+  //
+  // ⚠ Getting this wrong is a black frame, not a dim one: gate the pass on the
+  // multibounce flag and the low tier renders with no direct light at any hit.
+  //
+  // `volume?.occupancyField` stands in for `tiles && gather && binStore` — each
+  // of those is built if and only if the one before it was, and this decision
+  // has to be made before the first of them exists.
+  //
+  // ── `__giSrcSplitShade = false` IS THE R12 HATCH FOR THE SPLIT ITSELF ─────
+  //
+  // It rebuilds the ONE-KERNEL deposit (`createSrcHitShader` inline in [E], no
+  // [J], single bounce) — the shape every measurement before §12.53 was taken
+  // on. The unit's whole claim is a COMPILE claim, and a compile claim across
+  // two processes is worthless in this module (§13.14: the same kernel has read
+  // 47 s and 238 s in different runs because the driver serializes). So the
+  // arms have to exist in one page, which means the old shape has to still be
+  // buildable, which is what this flag is for. `smoke:gi-gpu` A/Bs on it.
+  const splitShade = globalThis.__giSrcSplitShade !== false;
+  const shadingPass = !!(volume?.occupancyField && shadeEnabled && splitShade);
+  // ── THE MULTIBOUNCE GATE — DEFAULT ON, FROM THE TIER (§12.39) ─────────────
   //
   // It was opt-in (`__giSrcSecondary === true`) for exactly as long as [J] was
   // a LINE INSIDE THE DEPOSIT: inlining `gatherAt` into the hit shader took
   // that kernel from 58 kB to 323 kB of WGSL and its pipeline compile to 48
   // seconds, so multibounce cost every boot half a minute whether or not the
-  // scene needed it. Now that [J] is its own ~20 kB dispatch (`srcSecondary.js`)
-  // the deposit is within ~2% of the single-bounce build (`smoke:gi-gpu`
-  // asserts it), so the reason for the opt-in is gone and the flag flips to an
-  // OPT-OUT: `tier.secondary` is the low-tier one (low ships single-bounce) and
-  // `__giSrcSecondary = false` is the R12 hatch that reproduces every pre-[J]
-  // gate result.
-  //
-  // `shadeEnabled` is a HARD requirement, not a coincidence: the hit list is
-  // filled by the hit shader's sink, so with no shader there are no entries and
-  // [J] would be a dispatch over an always-empty list.
-  //
-  // `volume?.occupancyField` stands in for `tiles && gather && binStore` — each
-  // of those is built if and only if the one before it was, and this decision
-  // has to be made before the first of them exists.
-  const secondaryOn = !!(volume?.occupancyField && shadeEnabled
-    && tier.secondary !== false && globalThis.__giSrcSecondary !== false);
+  // scene needed it. Now that [J] is its own dispatch (`srcSecondary.js`) the
+  // reason for the opt-in is gone and the flag is an OPT-OUT: `tier.secondary`
+  // is the low-tier one (low ships single-bounce) and `__giSrcSecondary = false`
+  // is the R12 hatch that reproduces every pre-[J] gate result. Off, [J] still
+  // SHADES — it just does not build the gather, which also costs it the
+  // `hashKeys` binding.
+  const bounceOn = !!(shadingPass && tier.secondary !== false
+    && globalThis.__giSrcSecondary !== false);
   // EXACTLY the rays this dispatch can fire, so the list can never overflow:
   // [E] runs `transportThreads` threads at `raysPerPixel` rays each, and one
   // ray produces at most one entry. `STAT_SEC_OVERFLOW` counts the bound being
   // wrong rather than trusting it.
-  const secondaryCapacity = secondaryOn ? transportThreads * tier.raysPerPixel : 0;
+  const secondaryCapacity = shadingPass ? transportThreads * tier.raysPerPixel : 0;
   const binStore = volume?.occupancyField
     ? createSrcBinStore(store, { w0: W0, secondaryCapacity })
     : null;
@@ -682,42 +699,32 @@ export function createSrcProbeSystem({
       })
     : null;
 
-  // ── [J]: THE SECOND BOUNCE (plan §4.1 [J], §12.39) ───────────────────────
+  // ── [E']: THE ATTRIBUTION HALF, WHICH STAYS IN [E] ────────────────────────
   //
-  // Its own dispatch over the hit list [E] appends, gathering the SAME tile
-  // atlas the screen does — see `srcSecondary.js`'s header for why it is a pass
-  // rather than a line in the hit shader, why it costs three storage bindings,
-  // and why it must run between [E] and [F]. Built here because it needs the
-  // gather's inputs (`tiles`, the hash→block lookup) and the deposit needs to
-  // know it exists.
-  const secondary = secondaryOn && binStore
-    ? createSrcSecondaryFrame(store, binStore, {
-        tiles,
-        lookup: hashBlockFrame.lookup,
-        spacing0,
-        // The same three uniforms the screen gather reads. A second camera or
-        // anchor here would gather over a lattice placed differently from the
-        // one [E] filled — plausible light from the wrong probes.
-        camera: vec3(cameraU),
-        anchor: vec3(anchorU),
-        lmax: lmaxU,
-        maxLods: MAX_LODS,
-        w0: W0,
-        capacity: secondaryCapacity,
-      })
-    : null;
-
-  // ── [E']: THE HIT SHADER ITSELF ───────────────────────────────────────────
+  // surfaceAt + the face-forward flip + R4's albedo ceiling. It needs the trace's
+  // hit record, so it cannot leave the deposit; it is also cheap to compile,
+  // which is why leaving it there costs nothing (§12.53).
   //
-  // `shadeEnabled` and `secondaryOn` are decided above the bin store (the hit
-  // list is a region of it); this is only the construction.
-  const shadeHit = shadeEnabled && binStore
-    ? createSrcHitShader({
-        // Provenance lives HERE and nowhere else — `srcShade.js` never asks
-        // whether a hit moved. A mover-shaped `if` inside the shader is the
-        // shape of the bug where a moving crate lights the room differently from
-        // the identical static one beside it (§12.26.1).
-        surfaceAt: (hit, dir) => {
+  // `shadeEnabled` is decided above the bin store (the hit list is a region of
+  // it); this is only the construction.
+  //
+  // ONE counter bundle for BOTH halves. They write different words of the same
+  // `stats` buffer from two kernels — the surface tallies from [E], the light
+  // tallies from [J] — and both kernels already bind it, so the split costs no
+  // binding on either side (R7, exactly what `createSrcShadeCounters` exists
+  // for). A second bundle would be a second buffer.
+  const shadeCounters = binStore ? createSrcShadeCounters(binStore) : null;
+  // Provenance lives HERE and nowhere else — `srcShade.js` never asks whether a
+  // hit moved. A mover-shaped `if` inside the shader is the shape of the bug
+  // where a moving crate lights the room differently from the identical static
+  // one beside it (§12.26.1).
+  //
+  // ONE definition, handed to whichever arrangement is built — the split's
+  // attribution half or the one-kernel `createSrcHitShader` behind the R12
+  // hatch. Two copies would be two `surfaceAt`s to keep in step, which is the
+  // §12.9 crossed-numbering shape.
+  const srcSurfaceAt = shadeEnabled && binStore
+    ? (hit, dir) => {
           // ⚠ `srcSurface.js`'s signature is `(voxel, worldPos, normal)`, NOT
           // `(hit, dir)`. The first version of this call passed the hit record
           // straight through, and `vec3(hitRecord)` is a TSL type error a long
@@ -762,7 +769,18 @@ export function createSrcProbeSystem({
             }
           });
           return { position: hit.exactPosition, normal: hit.normal, albedo, emissive, emitter, valid };
-        },
+        }
+    : null;
+
+  // ── THE LIGHTING HALF'S ARGUMENTS, ONCE ───────────────────────────────────
+  //
+  // The same object feeds `createSrcHitLighting` (split, in [J]) and
+  // `createSrcHitShader` (one-kernel, behind the R12 hatch). Built here rather
+  // than spelled twice so the two arrangements can never disagree about what
+  // "the lighting" is — the whole point of the hatch is that they differ only
+  // in WHICH KERNEL compiles it.
+  const lightingOptions = srcSurfaceAt
+    ? {
         sun: lighting.sun ?? null,
         lights: lighting.lights ?? [],
         emitters: lighting.emitters ?? [],
@@ -778,16 +796,11 @@ export function createSrcProbeSystem({
           rayHitMode: volume.rayHitMode,
           // A shadow ray is SHORTER than a diffuse one by construction — it
           // stops at its source — so it does not inherit the 192 the primary
-          // budget was measured to need. Its own number is owed a measurement on
-          // a real scene; until then this is the marcher's own default.
+          // budget was measured to need. Its own number is owed a measurement
+          // on a real scene; until then this is the marcher's own default.
           steps: Number(globalThis.__giSrcShadowSteps) || 64,
         }),
         voxelSize: volume.world.minCell,
-        // NO `secondary` OPTION — [J] IS A PASS. The shader hands its hit,
-        // normal and clamped ρ to the deposit's sink instead, and
-        // `srcSecondary.js` finishes the expression in a kernel of its own. The
-        // R4 ceiling that bounds the loop is still applied here, at the hit,
-        // and it is the ρ the sink publishes.
         // One NEE sample, and it is not a quality dial yet. With importance =
         // contribution the one-sample estimator IS the exact sum (§12.26.5), so
         // every extra sample buys only visibility variance — and the tiers have
@@ -795,7 +808,55 @@ export function createSrcProbeSystem({
         // one exists; stratification means 1 → 4 cuts the standard error 2.61×
         // where independent draws would give 2.00×.
         neeSamples: Math.max(1, Number(globalThis.__giSrcNeeSamples) || 1),
-        count: createSrcShadeCounters(binStore),
+        count: shadeCounters,
+      }
+    : null;
+
+  // THE SPLIT FORM: [E] gets attribution only.
+  const attribute = srcSurfaceAt && splitShade
+    ? createSrcHitAttribution({ surfaceAt: srcSurfaceAt, count: shadeCounters })
+    : null;
+  // THE ONE-KERNEL FORM, behind `__giSrcSplitShade = false` — the pre-§12.53
+  // deposit, every measurement before the split was taken on it, and it is
+  // single-bounce because [J] (which carried the gather) does not exist on this
+  // arm at all.
+  const shadeHit = srcSurfaceAt && !splitShade
+    ? createSrcHitShader({ surfaceAt: srcSurfaceAt, ...lightingOptions })
+    : null;
+
+  // ── [J]: THE SHADING PASS, AND THE SECOND BOUNCE INSIDE IT ────────────────
+  //
+  // Its own dispatch over the hit list [E] appends: the lighting half of §4.4
+  // (visibility marcher, four rolled light slots, the NEE emitter set and its
+  // analytic shapes) plus, when `bounceOn`, the SAME tile atlas the screen
+  // gathers. See `srcSecondary.js`'s header for why the shading moved here from
+  // [E], what it costs in bindings, and why it must run between [E] and [F].
+  //
+  // Built here because it needs the gather's inputs (`tiles`, the hash→block
+  // lookup) and the deposit needs to know it exists.
+  const secondary = shadingPass && binStore
+    ? createSrcSecondaryFrame(store, binStore, {
+        // THE MOVED HALF. Every one of `lightingOptions`' entries used to be an
+        // argument to `createSrcHitShader` inside the deposit's ray loop.
+        shade: createSrcHitLighting(lightingOptions),
+        // The multibounce TERM. False keeps the shading and drops the gather —
+        // see `bounceOn` above for why that is not the same switch as the pass.
+        bounce: bounceOn,
+        tiles: bounceOn ? tiles : null,
+        lookup: bounceOn ? hashBlockFrame.lookup : null,
+        spacing0,
+        // The same three uniforms the screen gather reads. A second camera or
+        // anchor here would gather over a lattice placed differently from the
+        // one [E] filled — plausible light from the wrong probes.
+        camera: vec3(cameraU),
+        anchor: vec3(anchorU),
+        lmax: lmaxU,
+        maxLods: MAX_LODS,
+        w0: W0,
+        // §12.52's LUMA half, at the address [E] put in the record. Null with
+        // the bundle off, and then not one node of it is built.
+        surprise: surpriseBundle ? { statBase: binStore.blockStatBase } : null,
+        capacity: secondaryCapacity,
       })
     : null;
   const deposit = binStore
@@ -812,14 +873,20 @@ export function createSrcProbeSystem({
         phase: phaseU,
         threads: transportThreads,
         lmax: lmaxU,
-        // Null unless [E'] above was built. With radiance zero, what survives
-        // the resolve is transmittance, and a receiver lit by transmittance
-        // alone against the sky is ambient occlusion. That is §7's "AO-like
-        // short-range bounce", not a placeholder.
+        // ── THE SPLIT FORM (§12.53) ─────────────────────────────────────────
+        //
+        // Null unless [E'] above was built. With no attribution the deposit
+        // shades nothing at all and what survives the resolve is transmittance
+        // — a receiver lit by transmittance alone against the sky is ambient
+        // occlusion, which is §7's "AO-like short-range bounce" and not a
+        // placeholder. Exactly one of these is ever non-null — the constructor
+        // refuses both, because a kernel that shades inline AND appends would
+        // have [J] shade the same hit again.
+        attribute,
         shadeHit,
-        // [J]'s hit list. Passed ONLY when the secondary pass exists, and that
-        // is what keeps the opted-out kernel byte-identical to the pre-[J] one:
-        // with this null, not a node of the capture or the append is built.
+        // [J]'s hit list. Passed ONLY when [J] exists, and that is what keeps
+        // the un-split kernel byte-identical to the pre-[J] one: with this
+        // null, not a node of the record or the append is built.
         secondary: secondary
           ? { base: binStore.hitListBase, capacity: secondaryCapacity }
           : null,
@@ -1005,8 +1072,8 @@ export function createSrcProbeSystem({
           // would withhold every per-group number rather than mislabel one.
           ...(secondary
             ? [
-                { label: "deposit (decay + trace + shade)", count: 2 },
-                { label: "secondary [J]", count: 1 },
+                { label: "deposit (decay + trace + attribute)", count: 2 },
+                { label: "shade + bounce [J]", count: 1 },
                 { label: "deposit (resolve)", count: 1 },
               ]
             : [{ label: "deposit (trace + shade)", count: deposit.passes.length }]),
@@ -1019,16 +1086,21 @@ export function createSrcProbeSystem({
           { label: "rays", count: rayFrame.passes.length },
         ],
     pixelProbe: frame.pixelProbe,
-    /** Non-null only when `shadeHit` was actually built — see `describeSrcProbeSystem`. */
-    shading: shadeHit
+    /** Non-null only when the hit shading was actually built — see `describeSrcProbeSystem`. */
+    shading: (attribute && secondary) || shadeHit
       ? {
           lights: (lighting?.lights ?? []).length,
           emitters: (lighting?.emitters ?? []).length,
           attributed: !!surfaces,
-          // THE BUILT PASS, not the gate that asked for it — a boot line that
+          // WHICH ARRANGEMENT COMPILED, so the boot line cannot claim the split
+          // on a build running the hatch.
+          split: !!attribute,
+          // THE BUILT TERM, not the gate that asked for it — a boot line that
           // disagrees with the built kernel is the §12.30 failure this file
-          // keeps re-finding.
-          secondary: !!secondary,
+          // keeps re-finding. ⚠ `!!secondary` stopped being this answer at
+          // §12.53: [J] is built whenever anything shades, so the multibounce
+          // question is `secondary.bounce` and nothing else.
+          secondary: !!secondary?.bounce,
         }
       : null,
     width,
@@ -1439,6 +1511,10 @@ export function describeSrcProbeSystem(system) {
         (system.shading
           ? `, SHADING (${system.shading.lights} lights, ${system.shading.emitters} emitters` +
             `${system.shading.attributed ? ", static surfaces attributed" : ""}` +
+            // WHICH KERNEL SHADES. `__giSrcSplitShade = false` rebuilds the
+            // pre-§12.53 one-kernel deposit, and a boot line that did not say
+            // so would leave a 179 kB kernel looking like an 88 kB one.
+            `${system.shading.split ? ", shaded in [J]" : ", SHADED INLINE IN [E] (pre-split hatch)"}` +
             `${system.shading.secondary ? ", MULTIBOUNCE via the tile atlas" : ", single bounce"})`
           : ", NO hit shading (radiance is sky-only)") +
         (system.tiles

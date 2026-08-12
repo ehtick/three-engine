@@ -486,11 +486,13 @@
           ...(state?.screen?.srcProbes?.passes ?? []).map((node, index) => [`srcProbes[${index}]`, node]),
         ];
         // [J] BY IDENTITY, NOT BY INDEX. Its binding count is the number the
-        // whole design rests on — three, because the hit list rides `scratch`'s
-        // tail and the hash→block words ride `hashKeys`' — and reading it off a
-        // position in the pass list would silently follow the wrong kernel the
-        // next time a dispatch is inserted.
+        // whole design rests on — the hit list rides `scratch`'s tail, the
+        // hash→block words ride `hashKeys`', the counters ride the deposit's
+        // `stats`, and the whole medium rides the occupancy field's `bits` —
+        // and reading it off a position in the pass list would silently follow
+        // the wrong kernel the next time a dispatch is inserted.
         const secondaryPass = state?.screen?.srcProbes?.secondary?.pass ?? null;
+        const secondaryBounce = !!state?.screen?.srcProbes?.secondary?.bounce;
         let secondaryAudit = null;
         for (const [index, node] of auditNodes) {
           const shader = engine.renderer._nodes?.getForCompute?.(node)?.computeShader ?? "";
@@ -520,16 +522,29 @@
           // a number the next planning decision will guess at instead.
           console.log(
             `GI-SMOKE STORAGE [J] ${secondaryAudit.index}: ${secondaryAudit.storageBindings} ` +
-            `storage buffers, ${(secondaryAudit.bytes / 1024).toFixed(0)}kB`,
+            `storage buffers, ${(secondaryAudit.bytes / 1024).toFixed(0)}kB` +
+            `${secondaryBounce ? " (shade + bounce)" : " (shade only)"}`,
           );
-          // THREE, exactly. Fewer means a binding this pass needs was optimized
-          // away (a gather that reads no keys resolves every corner to EMPTY
-          // and deposits nothing, silently); more means a fold was undone and
-          // the R7 budget that lets [E] carry the hit list is gone.
-          if (secondaryAudit.storageBindings !== 3) {
+          // FOUR with the bounce, THREE without, exactly.
+          //
+          //   scratch   the hit list, the bins and the per-block evidence
+          //   stats     the deposit's counters (`createSrcShadeCounters`)
+          //   bits      the occupancy field — the visibility marcher, which
+          //             arrived with the shading in §12.53. ONE buffer for the
+          //             whole medium: pyramid + surface records + triangle pool
+          //   hashKeys  the corner lookup, and ONLY when the gather is built
+          //
+          // Fewer means a binding this pass needs was optimized away (a gather
+          // that reads no keys resolves every corner to EMPTY and deposits
+          // nothing, silently; a marcher with no medium reports every hit lit);
+          // more means a fold was undone and the R7 budget that lets [E] carry
+          // the hit list at 8 of 8 is gone.
+          const wantBindings = secondaryBounce ? 4 : 3;
+          if (secondaryAudit.storageBindings !== wantBindings) {
             throw new Error(
-              `[J] compiled with ${secondaryAudit.storageBindings} storage buffers, not 3 — ` +
-              "the hit list must ride `scratch` and the corner lookup must ride `hashKeys`",
+              `[J] compiled with ${secondaryAudit.storageBindings} storage buffers, not ` +
+              `${wantBindings} (bounce ${secondaryBounce}) — the hit list must ride \`scratch\`, ` +
+              "the corner lookup `hashKeys`, the counters `stats` and the medium `bits`",
             );
           }
         }
@@ -1359,12 +1374,23 @@
             }
           }
         }
-        // ── [J]'s THESIS, AS A SIZE A/B — LAST, BECAUSE IT DISPOSES SRC ────
+        // ── THE SPLIT'S THESIS, AS A SIZE A/B — LAST, BECAUSE IT DISPOSES SRC ─
         //
-        // The claim the whole unit rests on is that the multibounce no longer
-        // FATTENS THE DEPOSIT: inlined, it took [E] from 58 kB to 323 kB of
-        // WGSL and its pipeline compile to 48 seconds (§12.39). Split out, the
-        // deposit gains only the hit-list capture, which must be noise.
+        // TWO claims, and the arms differ from §12.49's because the pass does.
+        //
+        //   1. THE MULTIBOUNCE FLAG DOES NOT TOUCH [E]. Since §12.53 the hit
+        //      list is how ANY hit gets shaded, so [E] appends the same record
+        //      either way and the two deposit kernels differ only by the
+        //      RESOLUTION-DERIVED LITERALS of the ±2-pixel twin (`pixelCount`,
+        //      `binTotal`, `hitListBase`, the capacity) — a few hundred bytes,
+        //      not §12.49's 2% headroom for an inlined gather. Asserted at
+        //      0.5%, which the measured 0.17% clears and which a single
+        //      bounce-conditional node in the ray loop would not.
+        //   2. THE HATCH IS STILL AN OPT-OUT, but of the BOUNCE and not of the
+        //      pass: `alt.secondary` must still exist (or the low tier renders
+        //      with no direct light at any hit — a black frame, not a dim one)
+        //      while `alt.secondary.bounce` must be false, and [J]'s own WGSL
+        //      must SHRINK, which is the gather actually not being built.
         //
         // Both arms in ONE page and on one adapter, because a cross-page
         // comparison of this module has been wrong every time it was tried. The
@@ -1379,34 +1405,114 @@
           if (!sp?.secondary) {
             console.log(
               "GI-SMOKE NOTE [J] is not built in this arm (no surface attribution at this " +
-              "ray-hit mode, or the tier/hatch turned it off) — the deposit size A/B is SKIPPED " +
-              "rather than reported as a 1.00x that compared a build to itself",
+              "ray-hit mode, or hit shading is off) — the size A/B is SKIPPED rather than " +
+              "reported as a 1.00x that compared a build to itself",
+            );
+          } else if (!sp.secondary.bounce) {
+            console.log(
+              "GI-SMOKE NOTE this arm's tier/hatch already has the bounce off — the size A/B " +
+              "is SKIPPED rather than comparing a build to itself",
             );
           } else {
             const withSecondary = wgslOf(sp.deposit.scatter).length;
+            const jWith = wgslOf(sp.secondary.pass).length;
             globalThis.__giSrcSecondary = false;
             const alt = sp.setSize(sp.width + 2, sp.height);
             const withoutSecondary = wgslOf(alt.deposit.scatter).length;
-            const altSecondary = !!alt.secondary;
+            const altPass = !!alt.secondary;
+            const altBounce = !!alt.secondary?.bounce;
+            const jWithout = altPass ? wgslOf(alt.secondary.pass).length : 0;
             alt.dispose();
             globalThis.__giSrcSecondary = undefined;
             const ratio = withSecondary / Math.max(1, withoutSecondary);
             srcReport.depositWgsl = {
               withSecondary, withoutSecondary, ratio: +ratio.toFixed(4),
+              secondaryWith: jWith, secondaryWithout: jWithout,
             };
             console.log(
               `GI-SMOKE STORAGE deposit-wgsl ${(withSecondary / 1024).toFixed(1)}kB default vs ` +
               `${(withoutSecondary / 1024).toFixed(1)}kB opted out ` +
-              `(${((ratio - 1) * 100).toFixed(2)}%)`,
+              `(${((ratio - 1) * 100).toFixed(2)}%)  |  [J]-wgsl ` +
+              `${(jWith / 1024).toFixed(1)}kB vs ${(jWithout / 1024).toFixed(1)}kB`,
             );
-            if (altSecondary) {
-              throw new Error("the `__giSrcSecondary = false` rebuild still built [J] — the hatch is not an opt-out");
-            }
-            if (!(ratio < 1.02)) {
+            if (!altPass) {
               throw new Error(
-                `the multibounce build's deposit kernel is ${((ratio - 1) * 100).toFixed(1)}% larger than ` +
-                `the single-bounce one (${withSecondary} vs ${withoutSecondary} bytes) — [J]'s gather has ` +
-                "leaked back into the deposit, which is the 48-second compile this unit exists to remove",
+                "the `__giSrcSecondary = false` rebuild built NO [J] — since §12.53 that pass " +
+                "carries the PRIMARY shading, so a build without it renders black, and the " +
+                "hatch must drop the bounce term only",
+              );
+            }
+            if (altBounce) {
+              throw new Error("the `__giSrcSecondary = false` rebuild kept the bounce — the hatch is not an opt-out");
+            }
+            if (!(Math.abs(ratio - 1) < 0.005)) {
+              throw new Error(
+                `the multibounce flag moved the deposit kernel by ${((ratio - 1) * 100).toFixed(2)}% ` +
+                `(${withSecondary} vs ${withoutSecondary} bytes) — since the shading split, [E] ` +
+                "appends the same record either way, so anything past the ±2-pixel twin's own " +
+                "literals is a bounce node back inside the fat kernel",
+              );
+            }
+            if (!(jWithout < jWith)) {
+              throw new Error(
+                `[J] did not shrink with the bounce off (${jWith} vs ${jWithout} bytes) — the ` +
+                "gather is being built regardless of the flag",
+              );
+            }
+
+            // ── THE SPLIT ITSELF, AS A SIZE A/B (§12.53) ──────────────────
+            //
+            // The unit's claim is that the deposit stopped being the monster:
+            // ONE pipeline of it measured 49-56 s of a cold boot, and moving
+            // `shadeHit` into [J] is what was supposed to fix it. So the
+            // pre-split kernel is rebuilt HERE, in the same page and on the
+            // same adapter, and the shrink is asserted rather than remembered
+            // from another process (§13.14: the same kernel has read 47 s and
+            // 238 s across runs — a cross-process compile comparison in this
+            // module has never once been meaningful).
+            //
+            // The number to watch is the CRITICAL PATH: kernels compile in
+            // parallel, so what a boot waits on is the biggest one, and the
+            // split only pays if `max([E], [J])` beats the un-split [E].
+            globalThis.__giSrcSplitShade = false;
+            const uns = sp.setSize(sp.width + 4, sp.height);
+            const unsplitDeposit = wgslOf(uns.deposit.scatter).length;
+            const unsplitJ = uns.secondary ? wgslOf(uns.secondary.pass).length : 0;
+            const unsplitShades = !!uns.shading && !uns.shading.split;
+            uns.dispose();
+            globalThis.__giSrcSplitShade = undefined;
+            const splitPath = Math.max(withSecondary, jWith);
+            srcReport.shadeSplit = {
+              unsplitDeposit, unsplitJ, splitDeposit: withSecondary, splitJ: jWith,
+              criticalPath: splitPath, criticalRatio: +(splitPath / Math.max(1, unsplitDeposit)).toFixed(4),
+            };
+            console.log(
+              `GI-SMOKE STORAGE shade-split [E] ${(withSecondary / 1024).toFixed(1)}kB + [J] ` +
+              `${(jWith / 1024).toFixed(1)}kB vs UNSPLIT [E] ${(unsplitDeposit / 1024).toFixed(1)}kB` +
+              ` — critical path ${(splitPath / 1024).toFixed(1)}kB ` +
+              `(${(splitPath / Math.max(1, unsplitDeposit)).toFixed(3)}x)`,
+            );
+            if (!unsplitShades) {
+              throw new Error(
+                "`__giSrcSplitShade = false` did not rebuild the one-kernel deposit — the R12 " +
+                "hatch for the shading split is dead, and with it the only in-process A/B of it",
+              );
+            }
+            if (unsplitJ) {
+              throw new Error("the un-split arm built a [J] — it has nothing to put in one, and its hit list is not filled");
+            }
+            // The whole point, as one inequality.
+            if (!(withSecondary < unsplitDeposit * 0.75)) {
+              throw new Error(
+                `the split left [E] at ${(withSecondary / 1024).toFixed(1)}kB against the un-split ` +
+                `${(unsplitDeposit / 1024).toFixed(1)}kB — the shading did not actually leave the deposit`,
+              );
+            }
+            if (!(splitPath < unsplitDeposit)) {
+              throw new Error(
+                `the split's biggest kernel (${(splitPath / 1024).toFixed(1)}kB) is no smaller than ` +
+                `the un-split deposit (${(unsplitDeposit / 1024).toFixed(1)}kB) — the monster moved ` +
+                "instead of shrinking, and a boot waits on the biggest kernel",
               );
             }
           }

@@ -197,7 +197,13 @@ const readSecondary = () =>
     const s = await sp.readStats(engine.renderer);
     return {
       built: true,
+      // ⚠ TWO DIFFERENT QUESTIONS SINCE §12.53. `pass` is "does [J] exist",
+      // which is now true whenever ANYTHING shades (the pass carries the
+      // primary lighting); `bounce` is "is the multibounce term built", which
+      // is what the flag and the tier decide. Reading the first as the second
+      // is how the opted-out arm would silently compare the loop to itself.
       pass: !!sp.secondary,
+      bounce: !!sp.secondary?.bounce,
       passes: sp.passes?.length ?? 0,
       groups: (sp.passGroups ?? []).reduce((n, g) => n + g.count, 0),
       capacity: sp.secondary?.capacity ?? 0,
@@ -263,6 +269,7 @@ check(mA < mB * 10,
 // with each other whether or not a kernel dispatched; this counter is written
 // by the kernel itself.
 check(secA.pass === true, `the multibounce arm BUILT [J] (${secA.passes} passes)`);
+check(secA.bounce === true, "and built the BOUNCE term inside it (the atlas gather)");
 // `profile.giPasses` asserts this sum and WITHHOLDS every per-group number when
 // it fails, so a drifted group list costs the whole cost breakdown rather than
 // mislabelling one row — worth catching here, where inserting [J] is exactly
@@ -274,7 +281,16 @@ check(secA.hits > 0,
   `(${secA.shadedHits} shaded hits that frame)`);
 check(secA.overflow === 0,
   `the hit list held every hit — overflow ${secA.overflow} (capacity is transportThreads x raysPerPixel, an exact bound)`);
-check(secB.pass === false, `and the opted-out arm built no [J] pass (${secB.passes} passes)`);
+// ── THE OPT-OUT DROPS THE BOUNCE AND KEEPS THE SHADING (§12.53) ────────────
+//
+// Before the shading split this read `secB.pass === false`, because [J] WAS
+// the bounce. It is now the shading pass, so the single-bounce arm must still
+// build and still dispatch it — a build that skipped [J] would render with no
+// direct light at any hit, which is a BLACK arm, not a single-bounce one, and
+// `mA > mB * 1.08` would pass on it for the wrong reason.
+check(secB.pass === true, `the opted-out arm still built [J] (${secB.passes} passes) — it carries the primary shading`);
+check(secB.bounce === false, "and dropped the bounce term (the atlas gather is not built)");
+check(secB.hits > 0, `and it still shaded: ${secB.hits} hits of ${secB.capacity} capacity`);
 const lineA = giLines.find((l) => /MULTIBOUNCE via the tile atlas/.test(l));
 const lineB = giLines.slice().reverse().find((l) => /single bounce/.test(l));
 check(!!lineA, "the boot line names the multibounce (built-state telemetry, not flags)");

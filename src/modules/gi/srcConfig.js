@@ -99,15 +99,36 @@ export const SECONDARY_LOD_OFFSET = 0;
 
 /**
  * Words per entry in [J]'s hit list — the compact record [E] appends for every
- * shaded hit and [J] re-shades from. Unpacked floats via `floatBitsToUint`
- * (`dynamicObjects.js` uses the same idiom for its BVH triangle pool): 0-2 the
- * hit position, 3-5 the face-forwarded normal, 6-8 the CLAMPED albedo, 9 the
- * destination bin's word base, 10-11 reserved.
+ * attributed hit and [J] SHADES from (§12.53: the whole of `shadeHit` moved out
+ * of the deposit into [J], so this record is now the entire interface between
+ * "what the ray found" and "what it is worth"). Unpacked floats via
+ * `floatBitsToUint` (`dynamicObjects.js` uses the same idiom for its BVH
+ * triangle pool):
+ *
+ *    0-2   hit position P (the EXACT, unlifted intersection)
+ *    3-5   face-forwarded normal n̂
+ *    6-8   albedo ρ, AFTER `clampLoopAlbedo` — R4's in-loop ceiling
+ *    9     destination bin's WORD base, already ×BIN_WORDS
+ *   10-12  raw emissive Le (R5's zeroing is [J]'s, it needs the NEE set)
+ *   13     the R5 emitter flag, as float bits (< 0 = not an NEE light)
+ *   14     the ray's index in the global R2 sequence — NEE's stratified draw
+ *          is a pure function of it, which is what keeps the pick identical to
+ *          the one the un-split shader made
+ *   15     the owning block's `BSTAT_SUM_L` WORD ADDRESS, or SLOT_EMPTY when
+ *          the surprise bundle is off. [E] cannot sum a luma it no longer
+ *          computes, so the per-block evidence word follows the radiance into
+ *          [J] — and the ADDRESS is what travels, because `own`, the ancestor
+ *          chain and the block claim are all [E]'s frame-local knowledge.
+ *
+ * 16 words = a 64-byte stride, which is also why the layout has no padding
+ * word: the four §12.49 reserved/pad words were exactly the four this unit
+ * needed.
  *
  * The list rides the tail of the bin store's `scratch` buffer (R7 — see
- * `createSrcBinStore`), so a wider entry costs memory but never a binding.
+ * `createSrcBinStore`), so a wider entry costs memory but never a binding: at
+ * the high tier's 131,072-entry capacity, 6.29 MB → 8.39 MB.
  */
-export const SECONDARY_HIT_WORDS = 12;
+export const SECONDARY_HIT_WORDS = 16;
 
 /**
  * Temporal blend rate (plan §4.6), applied to the DEPOSIT ACCUMULATORS rather

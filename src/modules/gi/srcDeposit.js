@@ -192,12 +192,29 @@ export const PAYLOAD_UNKNOWN = -1;
  * a gather at the wrong point reads a plausible irradiance from the wrong side
  * of a wall, which no energy check downstream can see.
  *
- * Words 10-11 are reserved, which also pads the stride to 48 bytes.
+ * ══ SINCE §12.53 THIS RECORD IS THE WHOLE [E] → [J] INTERFACE ══════════════
+ *
+ * It used to carry the three things the SECOND BOUNCE could not recompute.
+ * Now it carries everything ANY shading needs, because `shadeHit` itself moved:
+ * [E] traces and attributes, [J] shades, gathers and deposits. The four words
+ * §12.49 left reserved/padding are exactly the four that bought it (emissive,
+ * the R5 flag, the ray index, and the block's evidence-word address).
  */
 export const SEC_P = 0;     // world position of the hit
 export const SEC_N = 3;     // face-forwarded normal (srcShade's `faceForward`)
 export const SEC_RHO = 6;   // albedo AFTER `clampLoopAlbedo` — R4's in-loop ρ
 export const SEC_SLOT = 9;  // destination bin's WORD base, already ×BIN_WORDS
+export const SEC_LE = 10;   // raw emissive — R5's zeroing is [J]'s (it owns the NEE set)
+export const SEC_EMITTER = 13; // R5 flag as float bits; < 0 = not an NEE light
+export const SEC_RAY = 14;  // the ray's index in the global R2 sequence (a u32, not float bits)
+/**
+ * The owning block's `BSTAT_SUM_L` word address, or `SLOT_EMPTY` when the
+ * surprise bundle is off. §12.52's per-block evidence sums a deposit's LUMA,
+ * and [E] no longer computes one — so the address travels and [J] does the add.
+ * The WEIGHT half (`BSTAT_SUM_W`) stays in [E]: it is `DEPOSIT_SCALE` per
+ * deposit and knows nothing about radiance.
+ */
+export const SEC_SUML = 15;
 export const SEC_HIT_WORDS = SECONDARY_HIT_WORDS;
 
 /** Diagnostic words — the `Lmax` decision's instrument, plus the ray tallies. */
@@ -220,7 +237,26 @@ export const STAT_NOBLOCK = 7;
 
 /**
  * Hit-shading tallies (Phase 5). Every one of these is an instrument §12.26
- * asked for by name, and none of them is decoration:
+ * asked for by name, and none of them is decoration.
+ *
+ * ══ SINCE §12.53 THEY ARE WRITTEN BY TWO KERNELS, NOT ONE ══════════════════
+ *
+ * The shading split put the surface half in [E] and the light half in [J], and
+ * these words follow their own half. One `stats` buffer, two writers, no new
+ * binding on either side (both kernels already bind it):
+ *
+ *   [E]  SHADED · UNATTRIBUTED · ALBEDO_CLAMPED   — properties of a SURFACE,
+ *        counted for every ray the deposit attributes, hit or miss, exactly as
+ *        before, so `unattributedRate` keeps its historical denominator.
+ *   [J]  SHADOWRAYS · EMISSIVE · EMIT_ZEROED · IMPORTANCE_FLOORED · CLAMPED ·
+ *        MAXL — properties of the LIGHTING, counted for hits that reached a
+ *        destination bin. ⚠ These three DENOMINATORS SHRANK at the split: the
+ *        un-split kernel shaded every ray including the ~76% that miss (their
+ *        radiance was computed and then discarded by `own == N`), so it counted
+ *        shadow rays and emissive hits for garbage attributions of empty space.
+ *        The estimator never used them; the counters did.
+ *
+ * The list itself:
  *
  * · `SHADED` / `UNATTRIBUTED` — R1. A hit whose surface could not be identified
  *   shades at the default albedo with no emission, which is a plausible-looking
@@ -274,11 +310,15 @@ export const STAT_IMPORTANCE_FLOORED = 14;
  * · `SECONDARY` and `SEC_CLAMPED` are written by [J]. `SECONDARY` is the
  *   instrument that says THE PASS RAN: a pipeline that fails to create
  *   dispatches nothing, and the frame it produces looks exactly like a scene
- *   whose second bounce happens to be dim. No image statistic separates those
- *   two, so the gate asserts this counter rather than a brightness.
- * · `SEC_CLAMPED` counts the split clamp's own residual — see `srcSecondary.js`
- *   on why the secondary term saturates against `Lmax` separately from the
- *   primary one, and why that is accepted rather than fixed.
+ *   whose second bounce happens to be dim — and since §12.53 it also looks like
+ *   a scene with no DIRECT light at the hits, because [J] shades. No image
+ *   statistic separates those, so the gate asserts this counter.
+ * · `SEC_CLAMPED` counted the SPLIT clamp's residual while the two terms
+ *   saturated in different kernels. §12.53 put them in one kernel and one
+ *   clamp — the inline form §12.49 recorded a difference from — so the word now
+ *   counts the BOUNCE TERM ALONE reaching the ceiling, which is the same
+ *   instrument's real subject: R4's loop gain running away is exactly the
+ *   condition where `ρ/π · E_atlas` saturates on its own.
  *
  * They live here because `srcSecondary.js` owns no buffer: three storage
  * bindings, all of them load-bearing, exactly as `createSrcShadeCounters`
@@ -445,19 +485,30 @@ export function createSrcBinStore(store, {
  * @param {object} options.pixelProbe    per-pixel c0 probe index
  * @param {object} options.pixelRayBase  Alg. 3's per-pixel ray base
  * @param {(o, d, tMax) => object} options.trace  from `createSrcSceneTrace`
- * @param {(hit, dir, rayIndex, sink) => object} [options.shadeHit]  vec3 radiance
+ * @param {(hit, dir, rayIndex) => object} [options.shadeHit]  vec3 radiance
  *   at a hit, from `srcShade.js`'s `createSrcHitShader`. Default black — see the
  *   header. `rayIndex` is `n`, the ray's place in the global R2 sequence, and
  *   the shader needs it for the same reason the gate's synthetic trace does: a
  *   pure function of a u32 is bit-identical across a boundary where an RNG state
- *   is not. `sink` is passed ONLY when `secondary` is — see below.
+ *   is not.
+ *
+ *   THE ONE-KERNEL FORM. Mutually exclusive with `attribute` below, and the
+ *   constructor refuses both: a kernel that shades inline AND appends would
+ *   have [J] shade the same hit a second time and deposit it twice.
+ * @param {(hit, dir) => {P, n, rho, emissive, emitter}} [options.attribute]
+ *   THE SPLIT FORM (§12.53), from `srcShade.js`'s `createSrcHitAttribution`.
+ *   With it, this kernel does NOT shade: it traces, attributes, and appends the
+ *   record `srcSecondary.js` shades from. The radiance words of the owning bin
+ *   are left for [J]; every other deposit (transmittance below the hit, the
+ *   count on the whole chain, a miss's all-clear) is made here, unchanged.
+ *   Requires `secondary` — there is nowhere to put an entry without it.
  * @param {{base: number, capacity: number}} [options.secondary]  [J]'s hit list
  *   in `scratch`'s tail (`createSrcBinStore`'s `hitListBase`/`hitCapacity`).
- *   Supplied, this kernel appends one entry per shaded hit that has somewhere to
- *   deposit; omitted, NOT ONE NODE OF THAT IS BUILT and the emitted WGSL is
- *   byte-identical to the pre-[J] kernel — which is what keeps every gate
- *   written before the multibounce (and `scripts/gi-src-deposit.html`, whose
- *   synthetic shader ignores extra arguments) comparable rather than merely
+ *   Supplied, this kernel appends one entry per attributed hit that has
+ *   somewhere to deposit; omitted, NOT ONE NODE OF THAT IS BUILT and the emitted
+ *   WGSL is byte-identical to the pre-[J] kernel — which is what keeps every
+ *   gate written before the multibounce (and `scripts/gi-src-deposit.html`,
+ *   whose synthetic shader shades inline) comparable rather than merely
  *   passing.
  * @param {object} options.lmax  uniform: the radiance the fixed point saturates at
  * @param {Node} [options.keep]  the temporal blend's `1 − α`, applied to every
@@ -505,6 +556,7 @@ export function createSrcDepositFrame(store, bins, {
   raysPerPixel = 1,
   trace,
   shadeHit = null,
+  attribute = null,
   secondary = null,
   readPixel,
   readNormal,
@@ -529,6 +581,24 @@ export function createSrcDepositFrame(store, bins, {
   // a base that disagrees with the store's would corrupt real bins at a bin
   // index nothing else in the frame would ever produce — silent, and not
   // reproducible from an image. Cheap to make impossible.
+  // ── WHICH KERNEL SHADES, AND IT IS EXACTLY ONE OF THEM (§12.53) ───────────
+  //
+  // `shadeHit` shades inline and deposits the radiance here; `attribute`
+  // appends a record and [J] does both. Both together would shade every hit
+  // TWICE and deposit it twice — a 2× brightening with no counter that says so,
+  // because every tally would read exactly as healthy as it does now.
+  if (shadeHit && attribute) {
+    throw new Error(
+      "createSrcDepositFrame: `shadeHit` and `attribute` are the two halves of the same " +
+      "expression in two different arrangements — supplying both deposits every hit twice",
+    );
+  }
+  if (attribute && !secondary) {
+    throw new Error(
+      "createSrcDepositFrame: `attribute` defers shading to [J], which reads the hit list — " +
+      "so it requires `secondary`, or every hit's radiance is computed by nobody",
+    );
+  }
   if (secondary) {
     if (secondary.base !== bins.hitListBase || !(secondary.capacity > 0)
       || secondary.capacity > bins.hitCapacity) {
@@ -868,59 +938,79 @@ export function createSrcDepositFrame(store, bins, {
         own.assign(k2);
       });
 
-      // ── [J]'s CAPTURE (§12.39) ────────────────────────────────────────────
+      // ── [J]'s RECORD (§12.39 as a capture, §12.53 as the whole interface) ──
       //
-      // The shader hands back the three things the secondary pass cannot
-      // recompute — the hit point, the normal it faced-forward, and the albedo
-      // AFTER R4's in-loop ceiling — through a sink rather than a return value,
-      // because everything else about `shadeHit` is a `vec3` and widening that
-      // contract would touch every caller including the gate's synthetic one.
-      // `want` is set for every shaded ray; the SLOT below is what decides
-      // whether an entry is appended, so a miss (which never reaches the
-      // radiance branch) falls out with no test of its own.
-      const sec = secondary && shadeHit
+      // ATTRIBUTE-AND-APPEND. The record is everything [J] needs to finish the
+      // expression at this hit — the point, the flipped normal, R4's clamped ρ,
+      // the raw emission and its R5 flag, and the ray index NEE's stratified
+      // draw is a pure function of. The SLOT below is what decides whether an
+      // entry is appended at all: a miss never reaches the radiance branch, so
+      // its slot stays EMPTY and it falls out with no test of its own — which
+      // is also why the deferred build does no shading work for the ~76% of
+      // rays that miss, where the inline one shaded every single one and threw
+      // the answer away.
+      //
+      // The attribution runs for EVERY ray, hit or miss, exactly as the inline
+      // shader did, so `shaded` / `unattributed` / `albedoClamped` keep the
+      // denominators every reading of `unattributedRate` has ever used.
+      const sec = secondary && attribute
         ? {
             P: vec3(0).toVar(),
             N: vec3(0).toVar(),
             rho: vec3(0).toVar(),
-            want: uint(0).toVar(),
+            Le: vec3(0).toVar(),
+            emitter: float(-1).toVar(),
             slot: uint(SLOT_EMPTY).toVar(),
+            sumL: uint(SLOT_EMPTY).toVar(),
           }
         : null;
-      const sink = sec
-        ? (hitP, hitN, rho) => {
-            sec.P.assign(vec3(hitP));
-            sec.N.assign(vec3(hitN));
-            sec.rho.assign(vec3(rho));
-            sec.want.assign(uint(1));
-          }
-        : null;
+      if (attribute) {
+        const a = attribute(r, dir);
+        sec.P.assign(vec3(a.P));
+        sec.N.assign(vec3(a.n));
+        sec.rho.assign(vec3(a.rho));
+        sec.Le.assign(vec3(a.emissive));
+        if (a.emitter != null) sec.emitter.assign(float(a.emitter));
+      }
 
-      // Radiance at the hit, in fixed point. Phase 5 fills `shadeHit`; until
-      // then the whole RGB path is exercised only by the gate, which injects a
-      // synthetic shading both sides of the mirror agree on.
-      const L = shadeHit ? vec3(shadeHit(r, dir, n, sink)).toVar() : vec3(0).toVar();
-      const unit = L.div(float(lmax).max(1e-6)).toVar();
-      const clamped = unit.x.max(unit.y).max(unit.z).greaterThan(1).toVar();
-      const fx = [
-        unit.x.clamp(0, 1).mul(DEPOSIT_SCALE).add(0.5).floor().toUint().toVar(),
-        unit.y.clamp(0, 1).mul(DEPOSIT_SCALE).add(0.5).floor().toUint().toVar(),
-        unit.z.clamp(0, 1).mul(DEPOSIT_SCALE).add(0.5).floor().toUint().toVar(),
-      ];
+      // Radiance at the hit, in fixed point — the INLINE form ONLY. With
+      // `attribute` not one node of this is built: [J] owns the radiance, the
+      // `Lmax` conversion and both of that conversion's instruments
+      // (`STAT_CLAMPED`, `STAT_MAXL`). Everything below is verbatim what it was
+      // before the split, which is what keeps the un-split kernel — the one
+      // `scripts/gi-src-deposit.html` gates bit-exactly against the CPU mirror —
+      // byte-identical.
+      const deferred = !!attribute;
+      let fx = null;
+      let lumaFx = null;
+      if (!deferred) {
+        const L = shadeHit ? vec3(shadeHit(r, dir, n)).toVar() : vec3(0).toVar();
+        const unit = L.div(float(lmax).max(1e-6)).toVar();
+        const clamped = unit.x.max(unit.y).max(unit.z).greaterThan(1).toVar();
+        fx = [
+          unit.x.clamp(0, 1).mul(DEPOSIT_SCALE).add(0.5).floor().toUint().toVar(),
+          unit.y.clamp(0, 1).mul(DEPOSIT_SCALE).add(0.5).floor().toUint().toVar(),
+          unit.z.clamp(0, 1).mul(DEPOSIT_SCALE).add(0.5).floor().toUint().toVar(),
+        ];
 
-      // The ray's luma in the SAME fixed point the RGB words carry, shifted
-      // into the sum's scale ONCE per ray rather than per cascade — the shift
-      // is what keeps a top-cascade block's whole-frame sum clear of u32 (the
-      // `SUM_SHIFT` docstring carries the arithmetic).
-      const lumaFx = surprise
-        ? float(fx[0]).mul(0.2126).add(float(fx[1]).mul(0.7152)).add(float(fx[2]).mul(0.0722))
-          .toUint().shiftRight(uint(SUM_SHIFT)).toVar()
-        : null;
+        // The ray's luma in the SAME fixed point the RGB words carry, shifted
+        // into the sum's scale ONCE per ray rather than per cascade — the shift
+        // is what keeps a top-cascade block's whole-frame sum clear of u32 (the
+        // `SUM_SHIFT` docstring carries the arithmetic). Deferred, [J] does this
+        // add instead, against the address the record's word 15 carries.
+        lumaFx = surprise
+          ? float(fx[0]).mul(0.2126).add(float(fx[1]).mul(0.7152)).add(float(fx[2]).mul(0.0722))
+            .toUint().shiftRight(uint(SUM_SHIFT)).toVar()
+          : null;
 
-      atomicAdd(stats.element(uint(STAT_RAYS)), uint(1));
-      atomicAdd(stats.element(uint(STAT_HITS)), select(hit, uint(1), uint(0)));
-      atomicAdd(stats.element(uint(STAT_CLAMPED)), select(clamped, uint(1), uint(0)));
-      atomicMax(stats.element(uint(STAT_MAXL)), fx[0].max(fx[1]).max(fx[2]));
+        atomicAdd(stats.element(uint(STAT_RAYS)), uint(1));
+        atomicAdd(stats.element(uint(STAT_HITS)), select(hit, uint(1), uint(0)));
+        atomicAdd(stats.element(uint(STAT_CLAMPED)), select(clamped, uint(1), uint(0)));
+        atomicMax(stats.element(uint(STAT_MAXL)), fx[0].max(fx[1]).max(fx[2]));
+      } else {
+        atomicAdd(stats.element(uint(STAT_RAYS)), uint(1));
+        atomicAdd(stats.element(uint(STAT_HITS)), select(hit, uint(1), uint(0)));
+      }
       const tfx = select(hit, d.max(0).mul(T_FIXED), float(0)).toUint().toVar();
       atomicAdd(stats.element(uint(STAT_TSUM)), tfx);
       atomicMax(stats.element(uint(STAT_TMAX)), tfx);
@@ -955,18 +1045,46 @@ export function createSrcDepositFrame(store, bins, {
           // ONE RAY IS `DEPOSIT_SCALE`, not 1 — count and T are fixed-point
           // weights so that the decay can take a fraction of them. A fresh ray
           // therefore arrives at full weight, 2^F, and decays from there.
+          // ── THE DEPOSIT SPLIT, AND ONLY THE RADIANCE MOVES (§12.53) ────
+          //
+          // `c < own` — the ray crossed this interval unblocked: T = 1, no
+          // radiance. `c == own` — blocked here: the radiance, T = 0. Both
+          // increment `count`, because a bin's count is how many rays SAMPLED
+          // it, and a blocked sample is a sample.
+          //
+          // ONE RAY IS `DEPOSIT_SCALE`, not 1 — count and T are fixed-point
+          // weights so that the decay can take a fraction of them. A fresh ray
+          // therefore arrives at full weight, 2^F, and decays from there.
+          //
+          // DEFERRED, the `c == own` branch deposits NOTHING and merely
+          // remembers where the radiance goes. Everything else on this line —
+          // the below-hit T = 1 deposits, the count on the whole chain up to
+          // and including the owner, a miss's all-clear at `own == N`, the
+          // `DEPOSITS` tally — is unchanged and stays here, because none of it
+          // is a function of what the hit is WORTH.
           If(int(c).lessThan(own), () => {
             atomicAdd(scratch.element(slot.add(uint(BIN_T))), uint(DEPOSIT_SCALE));
           }).Else(() => {
-            atomicAdd(scratch.element(slot.add(uint(BIN_R))), fx[0]);
-            atomicAdd(scratch.element(slot.add(uint(BIN_G))), fx[1]);
-            atomicAdd(scratch.element(slot.add(uint(BIN_B))), fx[2]);
-            // THE SAME BIN THE SECONDARY TERM MUST LAND IN. Exactly one cascade
+            if (!deferred) {
+              atomicAdd(scratch.element(slot.add(uint(BIN_R))), fx[0]);
+              atomicAdd(scratch.element(slot.add(uint(BIN_G))), fx[1]);
+              atomicAdd(scratch.element(slot.add(uint(BIN_B))), fx[2]);
+            }
+            // THE SAME BIN THE RADIANCE MUST LAND IN. Exactly one cascade
             // takes this branch (`c == own`), so this assigns once per ray, and
             // it is captured HERE rather than recomputed in [J] because `own`,
             // the ancestor chain and the block claim are all this frame's and
             // none of them survives into a second dispatch.
             if (sec) sec.slot.assign(slot);
+            // Same argument for the block's evidence word: [J] cannot re-derive
+            // `blockBase[own] + blk` without the chain, so the ADDRESS travels.
+            if (sec && surprise) {
+              sec.sumL.assign(
+                uint(surprise.statBase + BSTAT_WORDS * info.blockBase)
+                  .add(blk.mul(uint(BSTAT_WORDS)))
+                  .add(uint(BSTAT_SUM_L)),
+              );
+            }
           });
           atomicAdd(scratch.element(slot.add(uint(BIN_COUNT))), uint(DEPOSIT_SCALE));
           atomicAdd(stats.element(uint(STAT_DEPOSITS)), uint(1));
@@ -978,13 +1096,22 @@ export function createSrcDepositFrame(store, bins, {
           // ones, so the block's mean luma FALLS and the statistic sees an
           // occlusion change no radiance-only sum could. `own` is what
           // separates them, and it is the same test the branch above makes.
+          //
+          // Deferred, the WEIGHT half stays here (it is `DEPOSIT_SCALE` per
+          // deposit and knows nothing about radiance) and the LUMA half is [J]'s
+          // — which is exactly the same partition the bins themselves take. The
+          // `c < own` luma add is dropped rather than moved because it adds
+          // ZERO: `select(c < own, 0, lumaFx)` is a no-op atomic on every clear
+          // deposit, so no evidence changes hands.
           if (surprise) {
             const sb = uint(surprise.statBase + BSTAT_WORDS * info.blockBase)
               .add(blk.mul(uint(BSTAT_WORDS))).toVar();
-            atomicAdd(
-              scratch.element(sb.add(uint(BSTAT_SUM_L))),
-              select(int(c).lessThan(own), uint(0), lumaFx),
-            );
+            if (!deferred) {
+              atomicAdd(
+                scratch.element(sb.add(uint(BSTAT_SUM_L))),
+                select(int(c).lessThan(own), uint(0), lumaFx),
+              );
+            }
             atomicAdd(scratch.element(sb.add(uint(BSTAT_SUM_W))), uint(DEPOSIT_SCALE >> SUM_SHIFT));
           }
         });
@@ -992,10 +1119,12 @@ export function createSrcDepositFrame(store, bins, {
 
       // ── the hit list append ───────────────────────────────────────────────
       //
-      // A shaded hit with a destination bin, and nothing else: a MISS never
+      // An attributed hit with a destination bin, and nothing else: a MISS never
       // reaches the radiance branch so its slot stays EMPTY, and a hit whose
-      // owning probe never claimed a block has nowhere to put a second bounce
-      // either (it is already counted as a `NOBLOCK` deposit above).
+      // owning probe never claimed a block has nowhere to put its radiance
+      // either (it is already counted as a `NOBLOCK` deposit above). The SLOT is
+      // the whole test — `want` was redundant with it from the day the append
+      // was written, because the sink and the slot were set by the same rays.
       //
       // The count is claimed with an atomic and the entry written only if it
       // fits. An over-capacity list is not supposed to happen — the capacity is
@@ -1003,7 +1132,7 @@ export function createSrcDepositFrame(store, bins, {
       // dispatch can fire — so the counter exists to say the bound was wrong
       // rather than to make dropping acceptable.
       if (sec) {
-        If(sec.want.equal(uint(1)).and(sec.slot.notEqual(uint(SLOT_EMPTY))), () => {
+        If(sec.slot.notEqual(uint(SLOT_EMPTY)), () => {
           const idx = atomicAdd(scratch.element(uint(secondary.base)), uint(1)).toVar();
           If(idx.lessThan(uint(secondary.capacity)), () => {
             const e = uint(secondary.base + 1).add(idx.mul(uint(SEC_HIT_WORDS))).toVar();
@@ -1018,11 +1147,21 @@ export function createSrcDepositFrame(store, bins, {
             put(SEC_RHO + 1, floatBitsToUint(sec.rho.y));
             put(SEC_RHO + 2, floatBitsToUint(sec.rho.z));
             put(SEC_SLOT, sec.slot);
-            // The reserved pair, written rather than left as whatever the last
-            // frame's entry held — a reader added later gets zeros instead of a
-            // stale value that happens to decode.
-            put(10, uint(0));
-            put(11, uint(0));
+            // ── THE §12.53 WORDS ──────────────────────────────────────────
+            //
+            // Written unconditionally, including as zeros on the inline build,
+            // rather than left as whatever last frame's entry held: a reader
+            // added later gets a defined value instead of a stale one that
+            // happens to decode (the rule the reserved pair shipped under).
+            put(SEC_LE + 0, floatBitsToUint(sec.Le.x));
+            put(SEC_LE + 1, floatBitsToUint(sec.Le.y));
+            put(SEC_LE + 2, floatBitsToUint(sec.Le.z));
+            put(SEC_EMITTER, floatBitsToUint(sec.emitter));
+            // The ray index is a u32 and is stored as one — [J] hands it
+            // straight to `hashKey`, which is where NEE's stratified draw comes
+            // from, so a float round-trip here would move the pick.
+            put(SEC_RAY, n);
+            put(SEC_SUML, sec.sumL);
           }).Else(() => {
             atomicAdd(stats.element(uint(STAT_SEC_OVERFLOW)), uint(1));
           });

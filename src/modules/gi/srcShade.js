@@ -56,11 +56,28 @@
 //   the sum — but the `E_secondary` half is computed by `srcSecondary.js` in a
 //   PASS OF ITS OWN and added into the same bin. Inlining it cost 48 seconds of
 //   pipeline compile (§12.39): `gatherAt` is 16 hash-find loops and 16 filtered
-//   taps, and this shader is instantiated inside the deposit's ray loop, which
-//   is the fattest kernel in the module. What survives here is the `sink` below
-//   — three vectors handed out so the other pass can finish the expression at
-//   the same hit, with the same ρ, on the same frame. R4's ceiling still binds
-//   the loop's gain because the ρ [J] multiplies by is the one clamped here.
+//   taps, and this shader used to be instantiated inside the deposit's ray loop,
+//   which was the fattest kernel in the module.
+//
+// ══ THE FILE IS TWO HALVES NOW, AND THEY COMPILE IN DIFFERENT KERNELS ═══════
+//
+// §12.53. `createSrcHitShader` is still the whole expression and still the
+// thing `test:gi-src-shade` gates against `srcRef.js` — but it is now a
+// COMPOSITION of two factories that the engine builds separately:
+//
+//   · `createSrcHitAttribution` — surfaceAt, the face-forward flip, R4's albedo
+//     ceiling. Cheap, and it needs the trace's hit record, so it stays in [E].
+//   · `createSrcHitLighting` — the visibility marcher, the four rolled light
+//     slots, the NEE emitter set and the analytic shapes. Expensive to COMPILE
+//     (the marcher is ~1.2 s of shader compile per call site and this half has
+//     two of them), and it needs nothing from the trace but P, n̂, ρ, Le and the
+//     ray index — five values that fit in a hit-list entry. So it moves to [J].
+//
+// That is the whole of §12.49's named follow-on: the deposit was 179 kB and one
+// pipeline of it measured 49-56 s of a cold boot, and §13.17 says two ~75 kB
+// kernels compiling in parallel beat one monster by MORE than the byte ratio.
+// The estimator is untouched — the same nodes are emitted, in two kernels
+// instead of one, and the ρ [J] multiplies by is still the one clamped here.
 // · `importance` defaults to the exact contribution. `lightTree.js` is unwired;
 //   when it lands it supplies a bounds-based ranking, and §12.26.5 prices what
 //   that can cost at **3.00× the standard error** — 9× the samples for equal
@@ -380,20 +397,29 @@ function neeIrradiance(slots, P, n, rayIndex, {
 }
 
 /**
- * §4.4's hit shading, assembled. Returns
- * `shadeHit(hit, dir, rayIndex, sink?) → vec3`, the exact shape
- * `createSrcDepositFrame` takes as its `shadeHit` option.
+ * THE ATTRIBUTION HALF — everything that needs the TRACE's hit record, and
+ * nothing that needs a light. Runs in [E].
  *
- * ══ THE OPTIONAL FOURTH ARGUMENT, AND WHY IT IS AN ARGUMENT ════════════════
+ * Returns `attribute(hit, dir) → { P, n, rho, emissive, emitter }`:
  *
- * `sink(P, n, ρ)` is called once, after R4's ceiling, with the hit position,
- * the face-forwarded normal and the CLAMPED albedo — the three quantities [J]
- * cannot recompute from a bin index. It is a per-CALL argument rather than a
- * build option because the deposit passes it only when it was itself built with
- * a hit list, and that is what makes the no-secondary kernel byte-identical:
- * with no `sink` the branch below is not built, and a caller that ignores extra
- * arguments (`scripts/gi-src-deposit.html`'s synthetic shader) is unaffected
- * either way.
+ *   · `P`        the shading point (the EXACT, unlifted hit)
+ *   · `n`        the face-forwarded normal (see the header — the flip is here,
+ *                on purpose, and §12.26.4 gates it two ways)
+ *   · `rho`      the albedo AFTER R4's in-loop ceiling. **This is the value the
+ *                whole fixed point rests on**: [J] multiplies its gathered
+ *                irradiance by exactly this, so the loop's gain is the bounded
+ *                one and the contraction is proven rather than hoped for.
+ *   · `emissive` the raw emission. R5's zeroing is NOT applied here — it is a
+ *                function of the NEE set, which is the lighting half's business
+ *                (`createSrcHitLighting` takes the flag and does it there).
+ *   · `emitter`  the R5 flag, `null` when the surface record has none.
+ *
+ * The three counters it owns are the three that describe a SURFACE rather than
+ * a light: `shaded`, `unattributed` and `albedoClamped`. They stay on the same
+ * dispatch that already counted them, so `unattributedRate` keeps its
+ * historical denominator — every ray the deposit attributes, hit or miss —
+ * across the §12.53 split. (Misses attribute garbage and always did; the
+ * radiance is discarded by `own == N`, and only the DENOMINATOR sees them.)
  *
  * @param {object} options
  * @param {(hit, dir) => {albedo, emissive, emitter, valid}} options.surfaceAt
@@ -407,6 +433,57 @@ function neeIrradiance(slots, P, n, rayIndex, {
  *   gather point could NOT see it (one floor point read 1.00×, because the ~57
  *   rays landing on the emitter spread thinly across the floor's probes and that
  *   point's eight held none). An energy claim wants an energy statistic.
+ * @param {object} [options.count]  per-statistic incrementers; see
+ *   `srcDeposit.js`'s STAT words.
+ */
+export function createSrcHitAttribution({
+  surfaceAt,
+  maxLoopAlbedo = MAX_LOOP_ALBEDO,
+  count = null,
+} = {}) {
+  if (typeof surfaceAt !== "function") {
+    throw new Error("createSrcHitAttribution: surfaceAt is required — it is where mover/static provenance lives");
+  }
+  return (hit, dir) => {
+    const s = surfaceAt(hit, dir);
+    const P = vec3(s.position ?? hit.exactPosition ?? hit.position).toVar();
+    const n = faceForward(s.normal ?? hit.normal, dir);
+    if (count) {
+      count.shaded(1);
+      if (s.valid != null) count.unattributed(select(float(s.valid).greaterThan(0.5), 0, 1));
+    }
+    const rho = clampLoopAlbedo(s.albedo, maxLoopAlbedo);
+    if (count) count.albedoClamped(select(rho.clamped, 1, 0));
+    return {
+      P,
+      n,
+      rho: rho.albedo,
+      emissive: vec3(s.emissive).toVar(),
+      emitter: s.emitter != null ? float(s.emitter).toVar() : null,
+    };
+  };
+}
+
+/**
+ * THE LIGHTING HALF — the sun, the punctual slots, the NEE emitter set, the
+ * visibility marcher and R5's emission handoff. Runs in [J] since §12.53.
+ *
+ * Returns `light(P, n, rho, emissive, emitter, rayIndex) → vec3`, i.e.
+ *
+ *     Le' + ρ/π · Σ_lights direct(P, n̂)
+ *
+ * — the DIRECT half of §4.4's expression. The `E_secondary` half is added by
+ * `srcSecondary.js` around this call, as `ρ/π · E_atlas`, so that the two terms
+ * saturate against `Lmax` TOGETHER (one clamp, the inline form; §12.49's split
+ * clamp is retired by the move, because both terms are now computed in one
+ * kernel and there is nothing left to split).
+ *
+ * ⚠ **THIS IS THE EXPENSIVE HALF TO COMPILE, NOT TO RUN.** `visibility` is a
+ * two-nested-loop BVH8 descent and it is instantiated at TWO call sites here
+ * (the rolled light loop and NEE's single ray) — §13.14.5 measured ~1.2 s of
+ * shader compile per call site. That is why it lives in a 64 kB kernel of its
+ * own instead of inside the deposit's ray loop.
+ *
  * @param {{direction: Node, irradiance: Node}} [options.sun]  a single
  *   directional source — `direction` points TOWARD it, `irradiance` is what a
  *   surface facing it square-on receives. This is `srcRef.js`'s `sunIrradiance`
@@ -425,8 +502,7 @@ function neeIrradiance(slots, P, n, rayIndex, {
  * @param {object} [options.count]  per-statistic incrementers; see
  *   `srcDeposit.js`'s STAT words.
  */
-export function createSrcHitShader({
-  surfaceAt,
+export function createSrcHitLighting({
   sun = null,
   lights = [],
   emitters = [],
@@ -437,15 +513,11 @@ export function createSrcHitShader({
   neeSamples = 1,
   importance = null,
   floorFraction = IMPORTANCE_FLOOR_FRACTION,
-  maxLoopAlbedo = MAX_LOOP_ALBEDO,
   count = null,
 } = {}) {
-  if (typeof surfaceAt !== "function") {
-    throw new Error("createSrcHitShader: surfaceAt is required — it is where mover/static provenance lives");
-  }
   if (voxelSize == null) {
     throw new Error(
-      "createSrcHitShader: voxelSize is required — every bias here tracks the DDA " +
+      "createSrcHitLighting: voxelSize is required — every bias here tracks the DDA " +
       "medium's quantization (R2), and inventing a default is how the wrong one ships",
     );
   }
@@ -454,7 +526,7 @@ export function createSrcHitShader({
   // intersection was quantized by that voxel and nothing smaller is meaningful.
   if (lights.length && maxRay == null) {
     throw new Error(
-      "createSrcHitShader: maxRay is required when `lights` are supplied — a " +
+      "createSrcHitLighting: maxRay is required when `lights` are supplied — a " +
       "directional slot's shadow ray runs the whole medium, and `kind` is a " +
       "uniform, so the bound cannot be chosen at build time",
     );
@@ -462,14 +534,9 @@ export function createSrcHitShader({
   const margin = float(voxelSize).mul(0.5);
   const useNee = neeEmitters && emitters.length > 0;
 
-  return (hit, dir, rayIndex, sink = null) => {
-    const s = surfaceAt(hit, dir);
-    const P = vec3(s.position ?? hit.exactPosition ?? hit.position).toVar();
-    const n = faceForward(s.normal ?? hit.normal, dir);
-    if (count) {
-      count.shaded(1);
-      if (s.valid != null) count.unattributed(select(float(s.valid).greaterThan(0.5), 0, 1));
-    }
+  return (Pin, nIn, rhoIn, emissiveIn, emitterIn, rayIndex) => {
+    const P = vec3(Pin).toVar();
+    const n = vec3(nIn).toVar();
 
     // ── E: irradiance arriving at the hit ───────────────────────────────────
     const E = vec3(0).toVar();
@@ -570,22 +637,18 @@ export function createSrcHitShader({
       }));
     }
 
-    // ── ρ/π · E, with R4's ceiling — applied AT THE HIT, inside the loop, and
-    //    never at an `intensity` prop where an artistic gain belongs ─────────
-    const rho = clampLoopAlbedo(s.albedo, maxLoopAlbedo);
-    if (count) count.albedoClamped(select(rho.clamped, 1, 0));
-    // [J]'s handoff, AFTER the clamp: the ρ the secondary pass multiplies its
-    // gathered irradiance by must be the one R4 bounded, or the loop's gain is
-    // the raw albedo and the fixed-point iteration has no proven contraction.
-    if (sink) sink(P, n, rho.albedo);
-    const out = rho.albedo.mul(E).mul(1 / Math.PI).toVar();
+    // ── ρ/π · E, with R4's ceiling — applied AT THE HIT (in [E], by
+    //    `createSrcHitAttribution`) and never at an `intensity` prop where an
+    //    artistic gain belongs. The ρ arriving here is ALREADY bounded. ──────
+    const rho = vec3(rhoIn).toVar();
+    const out = rho.mul(E).mul(1 / Math.PI).toVar();
 
     // ── emission, and R5's zeroing ──────────────────────────────────────────
-    const Le = vec3(s.emissive).toVar();
+    const Le = vec3(emissiveIn).toVar();
     const emits = Le.x.max(Le.y).max(Le.z).greaterThan(0).toVar();
-    if (useNee && s.emitter != null) {
-      const isNeeLight = float(s.emitter).greaterThanEqual(0)
-        .and(float(s.emitter).lessThan(emitters.length))
+    if (useNee && emitterIn != null) {
+      const isNeeLight = float(emitterIn).greaterThanEqual(0)
+        .and(float(emitterIn).lessThan(emitters.length))
         .toVar();
       If(emits, () => {
         if (count) {
@@ -601,5 +664,33 @@ export function createSrcHitShader({
       });
     }
     return out;
+  };
+}
+
+/**
+ * §4.4's hit shading, ASSEMBLED — attribution then lighting, one call, one
+ * `vec3`. Returns `shadeHit(hit, dir, rayIndex) → vec3`, the exact shape
+ * `createSrcDepositFrame` takes as its `shadeHit` option.
+ *
+ * This is the ONE-KERNEL form. The engine has not used it since §12.53 (it
+ * builds the two halves separately and puts them in [E] and [J]), and what
+ * keeps it is that it is the form `test:gi-src-shade` gates against
+ * `srcRef.js`'s `makeHitShader` and the form `scripts/gi-src-deposit.html`
+ * traces with — one expression, comparable to the mirror line for line, with no
+ * hit list or second dispatch in the way. A divergence between this and the
+ * split pair is therefore a divergence between two compositions of the SAME two
+ * factories, which is a class of bug the composition cannot have.
+ */
+export function createSrcHitShader({
+  surfaceAt,
+  maxLoopAlbedo = MAX_LOOP_ALBEDO,
+  count = null,
+  ...lighting
+} = {}) {
+  const attribute = createSrcHitAttribution({ surfaceAt, maxLoopAlbedo, count });
+  const light = createSrcHitLighting({ ...lighting, count });
+  return (hit, dir, rayIndex) => {
+    const a = attribute(hit, dir);
+    return light(a.P, a.n, a.rho, a.emissive, a.emitter, rayIndex);
   };
 }

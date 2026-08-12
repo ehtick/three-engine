@@ -1,18 +1,43 @@
-// SPLIT RADIANCE CASCADES — [J] THE SECOND BOUNCE, AS A PASS OF ITS OWN.
+// SPLIT RADIANCE CASCADES — [J] THE SHADING PASS (and the second bounce in it).
 //
-// One dispatch over the hit list [E] appended this frame. Per entry: gather the
-// tile atlas at the hit, multiply by the clamped ρ over π, and atomically add
-// the result into the SAME bin [E] already deposited the direct term into.
+// One dispatch over the hit list [E] appended this frame. Per entry: shade the
+// hit against every light, gather the tile atlas at it for the bounce, and
+// atomically add the whole radiance into the bin [E] reserved for it.
 //
-//     L_secondary(H) = ρ_clamped(H)/π · E_atlas(H, n̂)
+//     L(H) = Le'(H) + ρ_clamped(H)/π · [ Σ_lights direct(H) + E_atlas(H, n̂) ]
 //
-// docs/GI_SRC_REBUILD_PLAN.md §4.1 [J], §12.39, §12.26.9.
+// docs/GI_SRC_REBUILD_PLAN.md §4.1 [J], §4.4, §12.39, §12.26.9, §12.53.
 //
-// ══ WHY THIS IS A PASS AND NOT A LINE IN `srcShade.js` ══════════════════════
+// ══ WHY THE SHADING IS HERE AND NOT IN [E] (§12.53) ═════════════════════════
+//
+// [E] traced, shaded and scattered in one kernel, and that kernel was 179 kB of
+// WGSL — ONE pipeline measured at 49-56 s of a cold boot, which is the user's
+// entire "GI takes 30 s to 3 minutes to start" complaint in one number. The
+// shading is what made it big: the visibility marcher is a two-nested-loop BVH8
+// descent instantiated at two call sites (§13.14.5 priced a call site at ~1.2 s
+// of compile), plus four rolled light slots, plus the NEE emitter set and its
+// analytic shapes. None of it needs the trace — it needs a point, a normal, an
+// albedo, an emission and a ray index, which is a 16-word record.
+//
+// §13.17's measurement is the argument: two ~75 kB kernels compiling in
+// parallel beat one 177 kB monster by MORE than the byte ratio. So [E] traces,
+// attributes and appends; [J] shades, gathers and deposits. Same estimator,
+// same frame, same bins — the partition is drawn through the DEPOSIT, not
+// through the physics:
+//
+//     below the hit (c < own)   T = 1, no radiance         [E]
+//     at the hit    (c == own)  count now, radiance here   [E] + [J]
+//     a miss        (own == N)  T = 1 everywhere           [E]
+//     the sky                   composited once at [G]     unchanged
+//
+// It also stops paying for the ~76% of rays that MISS: the un-split kernel
+// called `shadeHit` on every ray and let `own == N` throw the answer away.
+//
+// ══ WHY THE BOUNCE IS A PASS AND NOT A LINE IN `srcShade.js` ════════════════
 //
 // It was a line in `srcShade.js`, for one session, and the user's editor priced
 // it the same hour: `gatherAt` is 16 hash-find loops and 16 filtered tile taps,
-// and the hit shader is instantiated INSIDE the deposit's ray loop — the
+// and the hit shader was instantiated INSIDE the deposit's ray loop — the
 // fattest kernel in the module. The deposit went 58 kB → 323 kB of WGSL (2 → 3
 // loops, 642 ifs) and its pipeline compile went to **48 SECONDS**, the §13.14
 // unroll pathology this module has now paid to learn three times.
@@ -22,15 +47,26 @@
 // gather compiled ONCE, in a small kernel, dispatched over hits instead of over
 // (rays × call sites). Same estimator, same frame, same bins.
 //
-// ══ THREE STORAGE BINDINGS, AND EACH ONE IS LOAD-BEARING (R7) ═══════════════
+// ══ FOUR STORAGE BINDINGS, AND EACH ONE IS LOAD-BEARING (R7) ════════════════
 //
-//   1. `scratch` — the hit list AND the bins. ONE buffer, because [J]'s inputs
-//      ride the tail of the accumulators it writes (`srcDeposit.js`'s SEC_*
-//      layout). A separate list buffer would have cost [E] its last binding.
+//   1. `scratch` — the hit list AND the bins AND the per-block evidence words.
+//      ONE buffer, because [J]'s inputs ride the tail of the accumulators it
+//      writes (`srcDeposit.js`'s SEC_* layout). A separate list buffer would
+//      have cost [E] its last binding.
 //   2. `hashKeys` — the whole corner lookup, keys and the hash→block words
-//      together, via `createSrcHashBlockFrame`'s single-buffer `lookup`.
+//      together, via `createSrcHashBlockFrame`'s single-buffer `lookup`. BUILT
+//      ONLY WHEN THE BOUNCE IS ON: with `__giSrcSecondary = false` there is no
+//      gather, so this binding does not exist and [J] compiles with three.
 //   3. `stats` — the deposit's counters. [J] owns no buffer, exactly as
 //      `createSrcShadeCounters` arranged for the hit shader.
+//   4. the occupancy field's `bits` — the visibility marcher, which arrived
+//      with the shading in §12.53. ONE buffer for the whole medium: the
+//      pyramid, the surface-record pool and the triangle pool are regions of a
+//      single allocation (`occupancyField.js` says why, and it is the same R7
+//      argument as the hit list riding `scratch`).
+//
+// [E] was at 8 of 8 before this unit and is still at 8 — it keeps the marcher
+// for its primary rays, so nothing was taken off it and nothing was added.
 //
 // The tile atlas is a TEXTURE and textures are not part of the 8-storage-buffer
 // budget, which is the whole reason the atlas exists in that form.
@@ -61,17 +97,19 @@
 // is one-sided inside a feedback loop), so re-reading the primary lattice is
 // the accurate choice rather than merely the free one.
 //
-// ══ THE SPLIT CLAMP, WHICH IS A REAL DIFFERENCE FROM THE INLINE FORM ════════
+// ══ THE SPLIT CLAMP IS GONE, AND §12.53 IS WHY ═════════════════════════════
 //
-// Inline, `L_primary + L_secondary` was clamped against `Lmax` ONCE. Split, each
-// term saturates on its own, so a bin can receive up to 2·Lmax where the inline
-// version would have received Lmax. Accepted, and counted rather than hidden:
-// `STAT_SEC_CLAMPED` says how often the secondary term alone hit the ceiling,
-// which is the reading that says whether the difference is ever reachable. It
-// is bounded by construction — the secondary term is ρ/π·E with ρ ≤ 0.9 — and
-// the alternative (carrying the primary's headroom into a second dispatch)
-// means a fourth binding or a second pass over the bins, for a case the counter
-// is there to prove empty.
+// §12.39-§12.49 clamped the primary term in [E] and the secondary term here,
+// separately, so a bin could receive up to 2·Lmax where the inline form gave
+// Lmax. That was accepted and counted. It is now moot: both terms are computed
+// in THIS kernel, so they are summed and clamped ONCE — the inline arithmetic,
+// recovered as a side effect of moving the shading rather than as a fix.
+//
+// `STAT_SEC_CLAMPED` keeps its slot with its real subject: the BOUNCE TERM
+// ALONE reaching the ceiling. That is the R4 reading — `ρ/π · E_atlas` with
+// ρ ≤ 0.9 saturating on its own means the loop's gain is running away — and it
+// costs one compare, because the term is already held separately so that the
+// direct half can be handed to the shared `srcShade.js` closure unchanged.
 //
 // ⛔ THE DISPATCH IS DIRECT AND STAYS DIRECT. An indirect dispatch over the
 // count word is the obvious optimization and it has been refuted TWICE on this
@@ -86,6 +124,7 @@ import {
   Return,
   atomicAdd,
   atomicLoad,
+  atomicMax,
   float,
   instanceIndex,
   select,
@@ -94,21 +133,28 @@ import {
   uniform,
   vec3,
 } from "three/tsl";
-import { MAX_LODS, SECONDARY_LOD_OFFSET, W0 } from "./srcConfig.js";
+import { MAX_LODS, SECONDARY_LOD_OFFSET, SUM_SHIFT, W0 } from "./srcConfig.js";
 import {
   BIN_B,
   BIN_G,
   BIN_R,
   DEPOSIT_SCALE,
+  SEC_EMITTER,
   SEC_HIT_WORDS,
+  SEC_LE,
   SEC_N,
   SEC_P,
+  SEC_RAY,
   SEC_RHO,
   SEC_SLOT,
+  SEC_SUML,
+  STAT_CLAMPED,
+  STAT_MAXL,
   STAT_SECONDARY,
   STAT_SEC_CLAMPED,
   STAT_SEC_OVERFLOW,
 } from "./srcDeposit.js";
+import { SLOT_EMPTY } from "./srcProbes.js";
 import { createSrcScreenGather } from "./srcScreenGather.js";
 
 /**
@@ -119,26 +165,44 @@ import { createSrcScreenGather } from "./srcScreenGather.js";
  *   `secondaryCapacity` — this pass reads the hit list out of its `scratch`
  *   tail and deposits into its bins.
  * @param {object} options
- * @param {object} options.tiles   `createSrcTileAtlas`'s bundle — the atlas is
- *   sampled as a texture, so it costs no storage binding.
- * @param {(key) => Node} options.lookup  `createSrcHashBlockFrame`'s
- *   single-buffer key → block closure.
+ * @param {(P, n, rho, emissive, emitter, rayIndex) => Node} options.shade  the
+ *   DIRECT half of §4.4's expression, from `srcShade.js`'s
+ *   `createSrcHitLighting`. Required: [J] is the shading pass since §12.53, and
+ *   a [J] without it would deposit a bounce on top of a hit nobody lit.
+ * @param {boolean} [options.bounce]  include the `E_atlas` term. FALSE is the
+ *   single-bounce build (`low` tier, or the `__giSrcSecondary = false` hatch) —
+ *   the hit is still SHADED here, only the gather is not built, which is why the
+ *   flag costs this kernel its `hashKeys` binding and costs the frame nothing
+ *   else. ⚠ The flag must never gate the whole pass: primary shading lives here
+ *   now, and a build that skipped [J] would render black.
+ * @param {object} [options.tiles]   `createSrcTileAtlas`'s bundle — the atlas is
+ *   sampled as a texture, so it costs no storage binding. Required with `bounce`.
+ * @param {(key) => Node} [options.lookup]  `createSrcHashBlockFrame`'s
+ *   single-buffer key → block closure. Required with `bounce`.
  * @param {Node|number} options.spacing0
  * @param {Node} options.camera  the LOD metric's centre — the SAME uniform the
  *   population and the screen gather read, or [J] would gather over a lattice
  *   placed differently from the one [E] filled.
  * @param {Node} options.anchor
  * @param {Node} options.lmax  the fixed point's saturation radiance, the same
- *   uniform [E] converts with. A second value here would make the two terms in
- *   one bin carry different units.
+ *   uniform [F] resolves with. A second value here would make the radiance and
+ *   the count in one bin carry different units.
  * @param {Node} [options.lodBias]  an EXPLICIT bias node, for a gate that wants
  *   to pin one. Omitted, this pass owns a polled uniform seeded from srcConfig's
  *   `SECONDARY_LOD_OFFSET` — see `poll` below.
+ * @param {{statBase: number}} [options.surprise]  §12.52's per-block evidence.
+ *   Supplied, [J] adds each deposit's LUMA into the block's `BSTAT_SUM_L` at the
+ *   address the record's word 15 carries — [E] keeps the WEIGHT half, which is
+ *   the same partition the bins take. Omitted, not one node of it is built.
+ * @param {object} [options.count]  the shade counters (`createSrcShadeCounters`),
+ *   for the tallies that moved here with the lighting.
  * @param {number} options.capacity  hit-list entries — the dispatch width.
  */
 export function createSrcSecondaryFrame(store, bins, {
-  tiles,
-  lookup,
+  shade = null,
+  bounce = true,
+  tiles = null,
+  lookup = null,
   spacing0,
   camera,
   anchor,
@@ -146,6 +210,7 @@ export function createSrcSecondaryFrame(store, bins, {
   lodBias = null,
   maxLods = MAX_LODS,
   w0 = W0,
+  surprise = null,
   capacity = 0,
 } = {}) {
   const { scratch, stats, hitListBase, hitCapacity } = bins;
@@ -155,8 +220,20 @@ export function createSrcSecondaryFrame(store, bins, {
       `list (${hitCapacity}) — the store must be built with \`secondaryCapacity\``,
     );
   }
-  if (typeof lookup !== "function") {
-    throw new Error("createSrcSecondaryFrame: `lookup` is required — [J] resolves probe corners per hit");
+  if (typeof shade !== "function") {
+    throw new Error(
+      "createSrcSecondaryFrame: `shade` is required — [J] has owned the hit shading since " +
+      "§12.53, and a pass without it deposits a second bounce onto an unlit hit",
+    );
+  }
+  if (bounce && typeof lookup !== "function") {
+    throw new Error("createSrcSecondaryFrame: `lookup` is required with `bounce` — the gather resolves probe corners per hit");
+  }
+  if (surprise && surprise.statBase !== bins.blockStatBase) {
+    throw new Error(
+      `createSrcSecondaryFrame: the surprise bundle's statBase ${surprise.statBase} does not ` +
+      `match the bin store's ${bins.blockStatBase}`,
+    );
   }
 
   // ── THE LOD BIAS IS A POLLED UNIFORM, NOT A BUILD CONSTANT ────────────────
@@ -181,9 +258,15 @@ export function createSrcSecondaryFrame(store, bins, {
   // allocate a storage texture nothing samples. The bias node is the only thing
   // that differs from the screen instance, and the screen instance passes none,
   // which keeps its graph byte-identical to every pre-[J] measurement.
-  const gather = createSrcScreenGather(store, tiles, {
-    lookup, spacing0, camera, anchor, maxLods, w0, lodBias: lodBiasU,
-  });
+  //
+  // NOT BUILT WITHOUT `bounce`: that is what makes the single-bounce build cost
+  // this kernel one storage binding and ~zero WGSL rather than a runtime branch
+  // nobody can see the size of.
+  const gather = bounce
+    ? createSrcScreenGather(store, tiles, {
+        lookup, spacing0, camera, anchor, maxLods, w0, lodBias: lodBiasU,
+      })
+    : null;
 
   const base = hitListBase;
   const pass = Fn(() => {
@@ -196,20 +279,38 @@ export function createSrcSecondaryFrame(store, bins, {
     // `atomicLoad`, not a plain read: `scratch` is declared atomic and WGSL
     // will not implicitly convert `atomic<u32>` to `u32` — it fails at
     // CreateShaderModule rather than producing a wrong picture.
-    const word = (w) => uintBitsToFloat(atomicLoad(scratch.element(e.add(uint(w)))));
+    const raw = (w) => atomicLoad(scratch.element(e.add(uint(w))));
+    const word = (w) => uintBitsToFloat(raw(w));
     const P = vec3(word(SEC_P + 0), word(SEC_P + 1), word(SEC_P + 2)).toVar();
     const n = vec3(word(SEC_N + 0), word(SEC_N + 1), word(SEC_N + 2)).toVar();
     const rho = vec3(word(SEC_RHO + 0), word(SEC_RHO + 1), word(SEC_RHO + 2)).toVar();
-    const slot = atomicLoad(scratch.element(e.add(uint(SEC_SLOT)))).toVar();
+    const slot = raw(SEC_SLOT).toVar();
+    const Le = vec3(word(SEC_LE + 0), word(SEC_LE + 1), word(SEC_LE + 2)).toVar();
+    const emitter = word(SEC_EMITTER).toVar();
+    // A u32 all the way through — `hashKey` is `Math.imul`-exact on the ray
+    // index and a float round-trip past 2^24 would move NEE's pick.
+    const rayIndex = raw(SEC_RAY).toVar();
 
-    // ρ/π · E, finishing the expression `srcShade.js` started at this same hit
-    // with this same ρ.
-    const E = gather.gatherAt(P, n).irradiance;
-    const L = rho.mul(E).mul(1 / Math.PI).toVar();
+    // ── THE DIRECT HALF, in the shared `srcShade.js` closure ────────────────
+    //
+    // Le' + ρ/π · Σ_lights, with the visibility marcher, the rolled light slots
+    // and the NEE emitter set — the whole of what used to be inlined into [E]'s
+    // ray loop, compiled ONCE here.
+    const Ld = vec3(shade(P, n, rho, Le, emitter, rayIndex)).toVar();
 
-    // The fixed point conversion, IDENTICAL to [E]'s — same `lmax`, same
-    // rounding, same clamp — because the two terms land in the same
-    // accumulator and `ΣR/Σcount` cannot tell them apart afterwards.
+    // ── THE BOUNCE ─────────────────────────────────────────────────────────
+    //
+    // ρ/π · E_atlas, against LAST frame's bake ([H] runs after the deposit), the
+    // temporal fixed point R4 models. Held separately from `Ld` so that
+    // `SEC_CLAMPED` can report the loop's own saturation.
+    const Lb = gather
+      ? rho.mul(gather.gatherAt(P, n).irradiance).mul(1 / Math.PI).toVar()
+      : null;
+    const L = (Lb ? Ld.add(Lb) : Ld).toVar();
+
+    // The fixed point conversion, IDENTICAL to the one [E] used to do — same
+    // `lmax`, same rounding, same clamp — because [F] resolves `ΣR/Σcount` and
+    // the count [E] deposited is in the same units.
     const unit = L.div(float(lmax).max(1e-6)).toVar();
     const clamped = unit.x.max(unit.y).max(unit.z).greaterThan(1).toVar();
     const fx = [
@@ -219,23 +320,55 @@ export function createSrcSecondaryFrame(store, bins, {
     ];
 
     // ⚠ **`BIN_COUNT` IS NOT TOUCHED, AND THAT IS THE WHOLE NORMALIZATION.**
-    // [E] already counted this ray when it deposited the direct term into this
-    // same slot, and the resolve computes `L = ΣR/Σcount`. Adding a second
-    // count here would halve the bin instead of brightening it; adding radiance
-    // alone makes the bounce arrive as extra radiance on an unchanged weight,
-    // which is exactly what "the same ray carried more light" means.
+    // [E] already counted this ray when it deposited the transmittance and the
+    // weight into this same slot, and the resolve computes `L = ΣR/Σcount`.
+    // Adding a second count here would halve the bin instead of filling it.
     atomicAdd(scratch.element(slot.add(uint(BIN_R))), fx[0]);
     atomicAdd(scratch.element(slot.add(uint(BIN_G))), fx[1]);
     atomicAdd(scratch.element(slot.add(uint(BIN_B))), fx[2]);
 
+    // ── §12.52's per-block evidence, the LUMA half ──────────────────────────
+    //
+    // The address is [E]'s (it owns `own`, the chain and the claim); the value
+    // is this kernel's, for the same reason the radiance is. `SLOT_EMPTY` is
+    // the "no block / no bundle" sentinel, and the guard is what keeps a
+    // build without the bundle from scattering an atomic into the bins.
+    if (surprise) {
+      const sumL = raw(SEC_SUML).toVar();
+      If(sumL.notEqual(uint(SLOT_EMPTY)), () => {
+        const lumaFx = float(fx[0]).mul(0.2126).add(float(fx[1]).mul(0.7152))
+          .add(float(fx[2]).mul(0.0722)).toUint().shiftRight(uint(SUM_SHIFT)).toVar();
+        atomicAdd(scratch.element(sumL), lumaFx);
+      });
+    }
+
+    // ── the `Lmax` decision's instruments, which followed the conversion ────
+    atomicAdd(stats.element(uint(STAT_CLAMPED)), select(clamped, uint(1), uint(0)));
+    atomicMax(stats.element(uint(STAT_MAXL)), fx[0].max(fx[1]).max(fx[2]));
     atomicAdd(stats.element(uint(STAT_SECONDARY)), uint(1));
-    atomicAdd(stats.element(uint(STAT_SEC_CLAMPED)), select(clamped, uint(1), uint(0)));
+    // The BOUNCE TERM ALONE at the ceiling — R4's loop gain running away. Not
+    // the same event as `STAT_CLAMPED` above, which is the whole radiance.
+    if (Lb) {
+      const ub = Lb.div(float(lmax).max(1e-6)).toVar();
+      atomicAdd(
+        stats.element(uint(STAT_SEC_CLAMPED)),
+        select(ub.x.max(ub.y).max(ub.z).greaterThan(1), uint(1), uint(0)),
+      );
+    }
   })().compute(capacity);
 
   return {
     pass,
     capacity,
     lodBias: lodBiasU,
+    /**
+     * Whether the MULTIBOUNCE term is built — NOT whether the pass exists.
+     * Since §12.53 [J] is the shading pass and is built whenever hit shading
+     * is, so `!!system.secondary` no longer answers "is this multibounce?".
+     * Every telemetry line, boot log and gate that used to read the pass's
+     * existence reads this instead.
+     */
+    bounce: !!gather,
     /** The tail and the counters both ride buffers this pass does not own. */
     bytes: 0,
 
@@ -261,10 +394,13 @@ export function createSrcSecondaryFrame(store, bins, {
      */
     async readStats(renderer) {
       const allocated = !!renderer?.backend?.get?.(stats.value)?.buffer;
-      if (!allocated) return { dispatched: false, hits: 0, clamped: 0, overflow: 0, capacity };
+      if (!allocated) {
+        return { dispatched: false, bounce: !!gather, hits: 0, clamped: 0, overflow: 0, capacity };
+      }
       const v = new Uint32Array(await renderer.getArrayBufferAsync(stats.value));
       return {
         dispatched: true,
+        bounce: !!gather,
         hits: v[STAT_SECONDARY] >>> 0,
         clamped: v[STAT_SEC_CLAMPED] >>> 0,
         overflow: v[STAT_SEC_OVERFLOW] >>> 0,
@@ -273,15 +409,18 @@ export function createSrcSecondaryFrame(store, bins, {
     },
 
     dispose() {
-      gather.dispose?.();
+      gather?.dispose?.();
     },
   };
 }
 
-/** The per-frame secondary line, for the telemetry log. */
+/** The per-frame [J] line, for the telemetry log. */
 export function formatSrcSecondary(s) {
   if (!s?.dispatched) return "";
-  return `bounce ${s.hits}/${s.capacity} hits` +
-    (s.clamped ? ` (${s.clamped} CLAMPED)` : "") +
+  // `shaded` and not `bounce`, because that is what the counter measures since
+  // §12.53: every entry [J] shaded, whether or not the atlas term was built.
+  return `[J] ${s.hits}/${s.capacity} shaded` +
+    (s.bounce ? " +bounce" : " (single)") +
+    (s.clamped ? ` (${s.clamped} BOUNCE-CLAMPED)` : "") +
     (s.overflow ? `  SEC-OVERFLOW ${s.overflow}` : "");
 }
