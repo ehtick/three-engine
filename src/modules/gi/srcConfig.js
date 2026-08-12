@@ -229,8 +229,8 @@ export const MAX_LOOP_ALBEDO = 0.9;
  * half-res gbuffer pixel. `w0` raises c0 angular resolution on the top tiers.
  */
 export const SRC_QUALITY = {
-  low: { spacing0: 0.8, raysPerPixel: 1, w0: 4, secondary: false, transportRays: 32_768 },
-  medium: { spacing0: 0.6, raysPerPixel: 1, w0: 4, secondary: true, transportRays: 65_536 },
+  low: { spacing0: 0.8, raysPerPixel: 1, w0: 4, secondary: false, transportRays: 32_768, probeRayCap: 16 },
+  medium: { spacing0: 0.6, raysPerPixel: 1, w0: 4, secondary: true, transportRays: 65_536, probeRayCap: 16 },
   high: { spacing0: 0.45, raysPerPixel: 2, w0: 4, secondary: true, transportRays: 131_072, probeRayCap: 16 },
   ultra: { spacing0: 0.35, raysPerPixel: 2, w0: 8, secondary: true, transportRays: 262_144, probeRayCap: 16 },
 };
@@ -306,7 +306,11 @@ export function srcTransportRays(tier) {
  * through influx gaps — §12.24's membership churn drops with it. Ship a cap
  * change ONLY through that rig; step p95 (+23–31%, fewer-but-chunkier
  * membership events) is the recorded residual, §12.24's floor. low/medium
- * ship none — their fps was never the complaint and no arm measured them.
+ * gained cap 16 on 2026-08-12: "25 fps with any emissive at low" was a
+ * 10.1 ms UNCAPPED deposit (62k rays for 1,046 live c0 probes — the coarse
+ * low lattice concentrates ~60 rays on a mean probe, so the cap cuts MORE
+ * here than the high/ultra arms it was priced on), and the α compensation
+ * that makes the cut variance-neutral is tier-independent.
  *
  * The cap is a UNIFORM polled per frame (`__giSrcProbeRayCap` — a positive
  * number caps live, 0 forces OFF over the tier default, unset = the tier),

@@ -3251,11 +3251,9 @@ export class GISystem {
     const { width: shadowW, height: shadowH } = this.#lightShadowSize({ width, height });
     try {
       const gbuffer = createGiGBuffer(width, height);
-      // Emitter shadows at HALF the direct arm's pixel budget (1/sqrt2 per
-      // axis): soft area-light shadows survive the lower res behind the
-      // bilateral + UV upsample, and per-slot cost was the user's fps cliff.
-      const emitterW = Math.max(64, Math.round(shadowW * 0.7071));
-      const emitterH = Math.max(64, Math.round(shadowH * 0.7071));
+      const emitterScale = this.#emitterShadowScale();
+      const emitterW = Math.max(64, Math.round(shadowW * emitterScale));
+      const emitterH = Math.max(64, Math.round(shadowH * emitterScale));
       if (!this._giTargets) {
         this._giTargets = createGiTargets(width, height, shadowW, shadowH, { emitterWidth: emitterW, emitterHeight: emitterH });
         this._giTargetSize = { width, height };
@@ -3861,11 +3859,19 @@ export class GISystem {
     // are set at build (see #buildScreenResolve's return), so this never
     // reports a spurious resize on the first frame.
     const { width: shadowW, height: shadowH } = this.#lightShadowSize({ width, height });
+    // TOLERANCE, NOT EQUALITY (2026-08-12). A resize costs ~56 pipelines and
+    // all temporal accumulation, and #screenResolveSize now divides dynamic
+    // resolution back out via a rounded reconstruction — which can wobble the
+    // result by a pixel across DRS steps. Every consumer samples these
+    // targets by UV or reads size through a uniform, so a texture 1-2px off
+    // the ideal size is invisible; a 2px band swallows the wobble while any
+    // real resize (window drag, dpr change, renderScale) sails through.
+    const close = (a, b) => Math.abs(a - b) <= 2;
     if (
-      width === screen.width &&
-      height === screen.height &&
-      shadowW === screen.shadowWidth &&
-      shadowH === screen.shadowHeight
+      close(width, screen.width) &&
+      close(height, screen.height) &&
+      close(shadowW, screen.shadowWidth) &&
+      close(shadowH, screen.shadowHeight)
     ) {
       return;
     }
@@ -3894,8 +3900,9 @@ export class GISystem {
     // observed material has hasNode = true, so its bindings refresh per frame
     // — see #markObservedMaterial).
     const previousTargets = screen.targets;
-    const emitterW = Math.max(64, Math.round(shadowW * 0.7071));
-    const emitterH = Math.max(64, Math.round(shadowH * 0.7071));
+    const emitterScale = this.#emitterShadowScale();
+    const emitterW = Math.max(64, Math.round(shadowW * emitterScale));
+    const emitterH = Math.max(64, Math.round(shadowH * emitterScale));
     screen.targets = createGiTargets(width, height, shadowW, shadowH, { emitterWidth: emitterW, emitterHeight: emitterH });
     screen.emitterShadowWidth = emitterW;
     screen.emitterShadowHeight = emitterH;
@@ -3950,12 +3957,27 @@ export class GISystem {
     const index = state.queue.indexOf(screen.resolve.compute);
     const indexNoFeedback = state.queueNoFeedback.indexOf(screen.resolve.compute);
     const indexFeedbackOnly = state.queueFeedbackOnly?.indexOf(screen.resolve.compute) ?? -1;
+    // BOTH gather inputs re-derive from the srcProbes the resize JUST rebuilt
+    // (line above), exactly as #buildScreenResolve derives them at build time.
+    // The first version passed only `gather: screen.gather` — the build-time
+    // CLOSURE over a srcProbes that setSize had just disposed — and omitted
+    // `screenGather` entirely. createGiResolve's `gather && !screenGather`
+    // fallback then INLINED the whole gatherAt into the resolve (the 58→323kB
+    // kernel pathology this module documents everywhere), bound to DEAD
+    // buffers nothing writes. Every post-resize resolve since [I] shipped was
+    // that: a monster compile whose diffuse term read zeros. Found 2026-08-12
+    // tracing the dynamic-resolution churn.
+    screen.screenGather = screen.srcProbes?.gather?.node ?? null;
+    screen.gather = screen.srcProbes?.gather
+      ? (point, normal) => screen.srcProbes.gather.gatherAt(point, normal).irradiance
+      : null;
     screen.resolve = createGiResolve({
       gbuffer: screen.gbuffer,
       targets: screen.targets,
       width,
       height,
       gather: screen.gather,
+      screenGather: screen.screenGather,
       // Same system-owned uniform the first build bound — the tick holds the
       // only reference that matters, so a resize must not mint a new one.
       cameraPosition: this._giResolveCamU,
@@ -4460,7 +4482,19 @@ export class GISystem {
   #screenResolveSize() {
     const renderer = this.engine.renderer;
     const size = renderer.getDrawingBufferSize(new THREE.Vector2());
-    const scale = this.config.resolveScale ?? 0.5;
+    // DYNAMIC RESOLUTION IS DIVIDED BACK OUT (2026-08-12). The DRS controller
+    // nudges `_drsScale` up to 2×/sec hunting its GPU budget, every step lands
+    // here as a new integer size, and a GI resize is ~56 fresh pipelines plus
+    // the loss of all temporal accumulation (427 pipelines in one session vs
+    // 79 on a clean boot). GI already owns its cost knobs (`resolveScale`,
+    // `resolveMaxPixels`) — letting DRS scale it too was double-dipping, and
+    // since GI dominates the GPU frame DRS was reacting to, the loop hunted
+    // forever. GI now sizes off the DRS-free buffer: DRS keeps scaling the
+    // scene render it was built for, and a manual renderScale drag still
+    // resizes GI (it moves the buffer AND is not in `_drsScale`).
+    // `__giFollowDrs = true` restores the old coupling.
+    const drs = globalThis.__giFollowDrs === true ? 1 : (this.engine?._drsScale || 1);
+    const scale = (this.config.resolveScale ?? 0.5) / drs;
     let width = Math.max(16, Math.round(size.x * scale));
     let height = Math.max(16, Math.round(size.y * scale));
     // TOTAL-PIXEL budget, not a per-axis clamp. Every screen-space GI pass
@@ -4510,6 +4544,23 @@ export class GISystem {
       height = Math.max(16, Math.round(height * s));
     }
     return { width, height };
+  }
+
+  /**
+   * Emitter-shadow buffer scale, applied per axis to the light-shadow size.
+   * Was a bare 0.7071 (half the direct arm's pixel budget) at both allocation
+   * sites, tier-blind — and the marcher behind this buffer is BVH8 any-hit at
+   * ~65ns/px, which priced ONE static emissive at ~14ms of a 40ms LOW frame
+   * (the user's "25 fps with any emissive"). Soft area-light shadows survive
+   * the lower res behind the bilateral + UV upsample — the trade the 0.7071
+   * comment always claimed, now taken further where the tier says cheap.
+   * `__giEmitterShadowScale` overrides for experiments (in-page A/B).
+   */
+  #emitterShadowScale() {
+    const forced = Number(globalThis.__giEmitterShadowScale);
+    if (Number.isFinite(forced) && forced > 0) return Math.min(1, forced);
+    const quality = qualityTierOf(this.config);
+    return { low: 0.45, medium: 0.5, high: 0.6, ultra: 0.7071 }[quality] ?? 0.7071;
   }
 
   /**
@@ -6410,24 +6461,63 @@ export class GISystem {
     const scratchPos = new THREE.Vector3();
     const scratchQuat = new THREE.Quaternion();
     const col = new THREE.Vector3();
-    const prevCenter = new THREE.Vector3();
-    const prevAxis = new THREE.Vector3();
+    // ── POSE MEMORY LIVES ON THE EMITTER OBJECT, NOT THE SLOT (2026-08-12).
+    // The slot uniforms are recreated at radius 0 by every GI rebuild, so
+    // slot-based history read each rebuild as a fresh seat: `moved` spiked to
+    // 1 for a PARKED lamp, the §12.43 light-track window armed off it
+    // (`armed by emitter, peak 1.00` in the live counter), and an open window
+    // lifts the per-probe ray cap to OFF — a 3.8× deposit swing. Under
+    // dynamic resolution that closes a loop: window → slow frame → resize →
+    // rebuild → fresh seat → window, seen as "gpu time constantly ballooning"
+    // with a single static emissive. This map survives rebuilds and dies with
+    // the mesh/provider, so only a genuinely new emitter or a real pose
+    // change reads as motion.
+    const poseCache = (this._emitterPoseCache ??= new WeakMap());
     // Motion → 1 within ~a tenth of the slot's own size per frame; decay 0.6
     // per frame at rest so a stop settles the retain back over ~4 frames
     // instead of on a hard edge. Distances are scaled by the slot's reff so
     // "moving" means the same thing for a desk lamp and a two-metre panel.
-    const motionOf = (slot, dCenter, dAxis) => {
-      const scale = Math.max(slot.reff.value, 0.05);
-      const target = Math.min(1, (dCenter / (0.1 * scale) + dAxis * 6) * 1);
-      return Math.max(target, slot.moved.value * 0.6);
+    const motionOf = (prev, dCenter, dAxis, reff) => {
+      const scale = Math.max(reff, 0.05);
+      const target = Math.min(1, dCenter / (0.1 * scale) + dAxis * 6);
+      return Math.max(target, prev.moved * 0.6);
+    };
+    // One line per ≥threshold spike (throttled to 1/500ms): the arm counter
+    // names `emitter` as a family; this names WHICH slot and WHY — a real
+    // move prints its deltas, a fresh promotion prints "new emitter".
+    // `__giLogTrackArm = false` silences it with the rest of the family.
+    const logSpike = (i, moved, why) => {
+      if (globalThis.__giLogTrackArm === false || moved < ALPHA_TRACK_THRESHOLD) return;
+      const now = performance.now();
+      if (now - (this._emitterSpikeLogAt ?? 0) < 500) return;
+      this._emitterSpikeLogAt = now;
+      console.log(`[gi] emitter slot ${i} motion ${moved.toFixed(2)} — ${why}`);
+    };
+    // Publish one seated slot's motion from the pose memory. Every pose
+    // uniform must already be written; `useAxis` is false for shapes with no
+    // meaningful orientation (provider spheres).
+    const publishMoved = (i, slot, key, useAxis) => {
+      let prev = poseCache.get(key);
+      let moved;
+      if (!prev) {
+        prev = { center: new THREE.Vector3(), axis: new THREE.Vector3(), moved: 0 };
+        poseCache.set(key, prev);
+        moved = 1;
+        logSpike(i, moved, "new emitter");
+      } else {
+        const dCenter = prev.center.distanceTo(slot.center.value);
+        const dAxis = useAxis ? 1 - Math.abs(prev.axis.dot(slot.by.value)) : 0;
+        moved = motionOf(prev, dCenter, dAxis, slot.reff.value);
+        logSpike(i, moved, `pose delta dC=${dCenter.toFixed(4)} dA=${dAxis.toFixed(4)}`);
+      }
+      prev.center.copy(slot.center.value);
+      prev.axis.copy(slot.by.value);
+      prev.moved = moved;
+      slot.moved.value = moved;
     };
     for (let i = 0; i < state.emitterSlots.length; i++) {
       const slot = state.emitterSlots[i];
       const info = infos[i];
-      // Last frame's pose, captured BEFORE any writer below touches it.
-      prevCenter.copy(slot.center.value);
-      prevAxis.copy(slot.by.value);
-      const hadRadius = slot.radius.value > 0.001;
       if (!info) {
         slot.radius.value = 0;
         slot.moved.value = 0;
@@ -6442,6 +6532,8 @@ export class GISystem {
         if (!shape || !(shape.radius > 0)) {
           slot.radius.value = 0;
           slot.moved.value = 0;
+          const prev = poseCache.get(info.provider);
+          if (prev) prev.moved = 0;
           continue;
         }
         slot.center.value.copy(shape.center);
@@ -6450,9 +6542,7 @@ export class GISystem {
         slot.kind.value = 0;
         slot.reff.value = shape.radius;
         slot.exHalf.value.setScalar(shape.radius);
-        slot.moved.value = hadRadius
-          ? motionOf(slot, prevCenter.distanceTo(slot.center.value), 0)
-          : 1;
+        publishMoved(i, slot, info.provider, false);
         continue;
       }
       // `!parent` = despawned between fingerprint scans (destroyEntity removes
@@ -6461,6 +6551,8 @@ export class GISystem {
       if (!info.mesh.visible || !info.mesh.parent) {
         slot.radius.value = 0;
         slot.moved.value = 0;
+        const prev = poseCache.get(info.mesh);
+        if (prev) prev.moved = 0;
         continue;
       }
       const geometry = info.mesh.geometry;
@@ -6483,13 +6575,7 @@ export class GISystem {
         slot.bz.value.copy(emitterFitScratch.bz);
         slot.reff.value = emitterFitScratch.reff;
         slot.exHalf.value.copy(emitterFitScratch.exHalf);
-        slot.moved.value = hadRadius
-          ? motionOf(
-              slot,
-              prevCenter.distanceTo(slot.center.value),
-              1 - Math.abs(prevAxis.dot(slot.by.value)),
-            )
-          : 1;
+        publishMoved(i, slot, info.mesh, true);
         continue;
       }
       if (!geometry.boundingSphere) geometry.computeBoundingSphere();
@@ -6528,13 +6614,7 @@ export class GISystem {
       // disc-equivalent radius drives penumbra k and glow energy.
       const [hx, hy, hz] = halfWorld;
       slot.reff.value = Math.sqrt(((hx * hy + hy * hz + hz * hx) * 2) / Math.PI);
-      slot.moved.value = hadRadius
-        ? motionOf(
-            slot,
-            prevCenter.distanceTo(slot.center.value),
-            1 - Math.abs(prevAxis.dot(slot.by.value)),
-          )
-        : 1;
+      publishMoved(i, slot, info.mesh, true);
     }
     // SRC's motion-adaptive α (§12.38) reads the emitter half of "is the
     // scene moving" from the same per-slot retains the emitter history uses —

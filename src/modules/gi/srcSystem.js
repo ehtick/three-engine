@@ -1146,8 +1146,15 @@ export function createSrcProbeSystem({
      */
     setSize(nextWidth, nextHeight) {
       if (nextWidth === system.width && nextHeight === system.height) return system;
+      // EVERY create arg forwards. The first version passed only the six it
+      // could see, so `lighting`/`surfaces`/`sceneMotion`/`trackMotion`
+      // defaulted to null and the FIRST viewport resize silently rebuilt the
+      // deposit without hit shading (radiance degraded to sky-only, and the
+      // reshaped kernel was a fresh compile on top). Found 2026-08-12 while
+      // tracing the dynamic-resolution rebuild churn.
       const next = createSrcProbeSystem({
         gbuffer, width: nextWidth, height: nextHeight, props, volume, sky,
+        lighting, surfaces, sceneMotion, trackMotion,
       });
       // Carry the debug view's on/off state across the rebuild. Losing it means
       // a viewport resize silently turns the gizmos off mid-inspection, which
