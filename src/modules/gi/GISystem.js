@@ -3450,8 +3450,9 @@ export class GISystem {
               // arm exactly as before.
               const above = mLight >= ALPHA_TRACK_THRESHOLD;
               const belowFor = now - (this._giMotionBelowSince ?? -1e9);
-              if (above && (globalThis.__giSrcTrackLevelArm === true ||
-                  (!this._giMotionAbovePrev && belowFor >= ALPHA_TRACK_REARM_MS))) {
+              const armed = above && (globalThis.__giSrcTrackLevelArm === true ||
+                  (!this._giMotionAbovePrev && belowFor >= ALPHA_TRACK_REARM_MS));
+              if (armed) {
                 this._giMotionHeld = Math.max(
                   mLight,
                   now < (this._giMotionHoldUntil ?? 0) ? (this._giMotionHeld ?? 0) : 0,
@@ -3461,6 +3462,57 @@ export class GISystem {
               if (!above && this._giMotionAbovePrev) this._giMotionBelowSince = now;
               this._giMotionAbovePrev = above;
               const windowOpen = now < (this._giMotionHoldUntil ?? 0);
+              // ── WHO KEEPS RE-ARMING THIS WINDOW? (diagnostic, log-only) ──
+              //
+              // An open window lifts the per-probe ray cap to OFF (srcSystem
+              // ~1091), and that is a 3.8x swing on the deposit: measured live
+              // on the user's ultra Sponza with ONE emissive, seconds apart —
+              // cap OFF 369,159 rays / 133.3 ms, cap 16 53,352 rays / 34.8 ms.
+              // Their report was "gpu time constantly ballooning", which is
+              // that swing seen from outside.
+              //
+              // §12.46 armed on rising edges precisely so a CONTINUOUS signal
+              // could not pin the window open, and a static emissive appears to
+              // re-arm it anyway. This counts the arms and names the term that
+              // was largest when each fired, because the three candidates want
+              // three different fixes: `emitter` is `slot.moved` decaying 0.6/
+              // frame and re-crossing on a seat re-publish, `lightLum` is a
+              // luminance delta that should be zero on a parked lamp, and
+              // `shadow` is the light matrix, which the sun's camera-tracking
+              // has spoofed before (§12.45.2).
+              //
+              // Reports the DUTY CYCLE too — arms/second is meaningless without
+              // it, since one arm per 1.2 s hold is already a permanent lift.
+              // Silent on a quiet scene: no arms and a closed window print
+              // nothing. `__giLogTrackArm = false` silences it outright.
+              if (globalThis.__giLogTrackArm !== false) {
+                const a = (this._trackArmTally ??= { arms: 0, open: 0, frames: 0, why: {}, t0: now });
+                a.frames++;
+                if (windowOpen) a.open++;
+                if (armed) {
+                  a.arms++;
+                  const terms = [
+                    ["shadow", (this._giShadowLastMotion ?? 0) / ALPHA_MOTION_SAT],
+                    ["emitter", this._giEmitterLastMotion ?? 0],
+                    ["lightLum", (this._giLightLumMotion ?? 0) / ALPHA_MOTION_SAT],
+                  ].sort((x, y) => y[1] - x[1]);
+                  a.why[terms[0][0]] = (a.why[terms[0][0]] ?? 0) + 1;
+                  a.peak = Math.max(a.peak ?? 0, terms[0][1]);
+                }
+                const span = now - a.t0;
+                if (span >= 2000) {
+                  if (a.arms > 0 || a.open > 0) {
+                    const by = Object.entries(a.why).map(([k, n]) => `${k} ${n}`).join(", ") || "none";
+                    console.log(
+                      `[gi] light-track window: ${a.arms} arms in ${(span / 1000).toFixed(1)}s ` +
+                        `(${(a.arms / (span / 1000)).toFixed(1)}/s), open ${((a.open / Math.max(1, a.frames)) * 100).toFixed(0)}% ` +
+                        `of ${a.frames} frames — armed by ${by}, peak ${(a.peak ?? 0).toFixed(2)} ` +
+                        `(threshold ${ALPHA_TRACK_THRESHOLD}). An open window lifts the probe ray cap to OFF.`,
+                    );
+                  }
+                  this._trackArmTally = null;
+                }
+              }
               // What srcSystem's root relaxation reads (`trackMotion`): the
               // held LIGHT peak while the window is open, zero otherwise —
               // sub-threshold jitter and mover churn never reach the root.
