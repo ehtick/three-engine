@@ -257,6 +257,15 @@ if (import.meta.env?.DEV) {
   // whether the dispatch loop is stuck waiting on pipelines / skipping.
   globalThis.__giPendingComputePipelines = giPendingComputePipelines;
   globalThis.__giSkippedComputesSet = giSkippedComputes;
+  // WHICH PASS IS CREATING THIS PIPELINE — readable from OUTSIDE the module.
+  // `probe:gi-boot` wraps `GPUDevice.prototype.createComputePipelineAsync` at
+  // document start, long before this file loads, and every GI pipeline carries
+  // the same label (`computePipeline_compute`). Without this the probe can
+  // report 79 compute pipelines and 306 s of summed latency while being unable
+  // to say which of them belong to the chain that lights the scene — which is
+  // exactly the question the boot is stuck on.
+  globalThis.__giCurrentPassName = () =>
+    giCurrentComputeNode?.__giPassName ?? (giDispatchDepth > 0 ? "gi:unnamed" : "non-gi");
 }
 
 /**
@@ -1539,6 +1548,36 @@ export class GISystem {
     // geometry uploads, deferred voxel-slot parking. Before the gbuffer/
     // compute work so this frame's rays see this frame's pose.
     this.#refreshDynamicObjects(renderer, state);
+    // ══ WHILE THE FIELD'S OWN KERNELS COMPILE, THIS TICK IS ALL COST ═════════
+    //
+    // Everything below — the gbuffer prepass (a full scene render), SRC, the
+    // reflection prepass, the occupancy chain, the rate queue — feeds a field
+    // that does not exist yet. The chain itself is already guarded (`occWait`,
+    // ~200 lines down), so on these frames it dispatches nothing; the rest of
+    // the tick runs at full price for a result nobody can read.
+    //
+    // And the price is not just wasted work, it is THE thing keeping the field
+    // waiting. `probe:gi-boot`'s turn tracker: over the 6.0s between the
+    // occupancy pipelines being created and landing, a `setTimeout(0)` chain
+    // ran ZERO times — one 7,966 ms gap swallowed the whole window, and all 25
+    // pipelines resolved within 2 ms of its end. A WebGPU async create resolves
+    // only when the renderer process runs a task to receive the reply, and an
+    // rAF loop this expensive leaves no room for one. So the field's frame loop
+    // was starving the delivery of the very pipelines the field was blocked on.
+    //
+    // Standing still costs nothing here: `bootAmbient` (or the previous field,
+    // on a rebuild) is what is on screen either way, and the first tick after
+    // the pipelines land runs the full chain in order.
+    //
+    // `__giNoBootIdle = true` restores the old always-tick behaviour for A/B.
+    if (!this._fieldEverReady && globalThis.__giNoBootIdle !== true) {
+      const occNodes = state.volume.occupancyField?.prewarmComputes?.();
+      if (occNodes?.length && giNodesPending(occNodes)) {
+        this._occTally ??= { wait: 0, skip: 0, ran: 0, idle: 0, revs: new Set(), t0: performance.now() };
+        this._occTally.idle = (this._occTally.idle ?? 0) + 1;
+        return;
+      }
+    }
     // The deferred resolve reads THIS frame's gbuffer, so the prepass renders
     // before any compute is dispatched. It is a nested render (one override
     // material, editor layers excluded) that restores renderer state.
@@ -1574,8 +1613,36 @@ export class GISystem {
             "every probe re-keys, which retires it; positions are unchanged",
           );
         }
-        giCompute(renderer, state.screen.srcProbes.passes);
-        this.#maybeLogSrcProbeStats(renderer, state);
+        // ══ NOT UNTIL THE FIELD EXISTS ══════════════════════════════════════
+        //
+        // SRC traces the occupancy pyramid. Until the pyramid has been built
+        // once there is nothing to trace, and every dispatch below was ALREADY
+        // a no-op during that window for a second reason: its pipelines were
+        // still compiling, and a dispatch whose pipeline has not landed is
+        // skipped. So these frames did no SRC work either way.
+        //
+        // What they DID do is create 52 compute pipelines, and that is the cost.
+        // `probe:gi-boot` measured every GI compute pipeline of a boot — 78 of
+        // them, 2 kB to 37 kB, created across a 1.1 s spread — resolving within
+        // 3 ms of each other, several seconds after the first was created. They
+        // drain as one batch, so the field's 25 kernels cannot land before
+        // SRC's 52 have compiled too, and the field is what lights the scene.
+        //
+        // Deferring SRC's FIRST dispatch to the frame after the pyramid exists
+        // takes those 52 out of the batch the field is stuck behind. Nothing is
+        // lost: they compile immediately afterwards, while the lit scene is
+        // already on screen, on the same skip-until-ready path they always took.
+        //
+        // `syncCamera` still runs every frame — it is uniform writes and the
+        // re-anchor bookkeeping, and letting the anchor drift while the field
+        // builds would retire every probe on the first real dispatch.
+        //
+        // `__giSrcBeforeField = true` restores the old order for A/B.
+        if (this._fieldEverReady || globalThis.__giSrcBeforeField === true
+          || !state.volume.occupancyField) {
+          giCompute(renderer, state.screen.srcProbes.passes);
+          this.#maybeLogSrcProbeStats(renderer, state);
+        }
       }
       // BVH exact-reflection prepass: dispatched right after the gbuffer,
       // EVERY frame it's enabled — independent of the atlas-revision
@@ -1823,7 +1890,15 @@ export class GISystem {
       // ticks (`_fieldReadyOnce` false) the buffers may never have been
       // dispatched, and reading them back throws from deep inside the frame loop
       // (the user-reported "reading 'size'" uncaught promise).
-      if (this._fieldReadyOnce) this.#maybeLogStats(renderer);
+      if (this._fieldReadyOnce) {
+        // LATCHED, unlike `_fieldReadyOnce` — which is cleared by every re-arm
+        // and is therefore a statement about THIS tick, not about whether a
+        // pyramid has ever existed. The SRC gate above needs the latter: once
+        // there is something to trace, SRC runs for good, including through the
+        // re-arms a later geometry change causes.
+        this._fieldEverReady = true;
+        this.#maybeLogStats(renderer);
+      }
     } else {
       // IDLE SLEEP: with the field input quiet past the threshold, only the
       // camera-dependent passes run. The heartbeat frame runs the full queue.
@@ -2171,6 +2246,23 @@ export class GISystem {
     let compileSucceeded = false;
     try {
       console.log("[gi] compile wave started");
+      // ── REFUTED: WARMING THE FIELD'S KERNELS HERE, BEFORE THE MATERIALS ──
+      //
+      // A `#warmFieldKernels` used to sit on this line: create the occupancy
+      // chain's 25 pipelines at wave start and drain them with the event loop
+      // free, so the field would not queue behind the material compiles. The
+      // reasoning was sound and the mechanism worked — the pass-family table
+      // showed the field's kernels created first — and it bought NOTHING.
+      //
+      // Measured, 3 runs per arm (`ARMS=warm`, medians): the field's own span
+      // (occupancy backend → field ready) fell 6,062 → 5,638 ms, and the user's
+      // wait went 11,040 → 11,291 ms. The warm's own node-graph build is
+      // ~700 ms of synchronous JS, and running it here simply moved that cost
+      // from after the `occupancy backend` log to before it. A wash, plus a
+      // 700 ms hitch and a method to maintain.
+      //
+      // Kept as a comment because "create the pipelines earlier" is the obvious
+      // next idea for anyone reading the boot timeline, and it has been tried.
       // Compile against the render path that will actually draw at resume.
       // With a postprocess override active, the scene renders through the
       // override's PassNode target + MRT — a DIFFERENT pipeline-cache
@@ -4510,12 +4602,27 @@ export class GISystem {
       const t = this._occTally;
       console.log(
         `[gi] occupancy chain to first field: ${Math.round(performance.now() - t.t0)}ms over ` +
-        `${t.wait + t.skip + t.ran} frames = ${t.wait} BLOCKED (pipelines compiling) + ` +
+        `${t.wait + t.skip + t.ran + (t.idle ?? 0)} frames = ${t.idle ?? 0} IDLED (whole tick skipped ` +
+        `while the field's kernels compiled) + ${t.wait} BLOCKED (chain guard) + ` +
         `${t.skip} skipped-dispatch re-arms + ${t.ran} ran; ` +
         `${t.revs.size} geometry revision(s) — each one re-mints the whole chain`,
       );
       this._occTally = null;
     }
+    // ── THE MILESTONE IS THE DISPATCH, NOT THE READBACK ────────────────────
+    //
+    // `field ready` below resolves a GPU→CPU buffer map, and that map has
+    // measured **1,077 ms** on the user's Sponza. It exists to print a voxel
+    // count. Every startup number this project has recorded used that line as
+    // "the scene is lit", so every one of them was ~1 s pessimistic — the
+    // scene lights on the first frame presented after THIS point, when the
+    // chain has been dispatched in full.
+    //
+    // Both lines stay: this one is the milestone, the readback keeps the count.
+    console.log(
+      `[gi] field first pass dispatched${this._stateBuiltAt ? ` ${Math.round(performance.now() - this._stateBuiltAt)}ms after build` : ""}` +
+        " — the scene lights on the next presented frame (the voxel count below is a readback, not the wait)",
+    );
     occ.readbackStats(renderer).then((stats) => {
       if (this.state === state) {
         console.log(`[gi] field ready: ${stats.occupiedVoxels} occupied voxels`);
@@ -5122,6 +5229,14 @@ export class GISystem {
     this._atlasRevisionSeen = -1; // force a first composite
     this._occGeometrySeen = -1;
     this._fieldReadyOnce = false;
+    // Stamped for the "field first pass dispatched Nms after build" milestone —
+    // the one number that says how long the field itself took, independent of
+    // how long the editor took to get here.
+    this._stateBuiltAt = performance.now();
+    // A rebuild mints fresh compute nodes, and three keys its pipeline cache on
+    // the node's id — so a rebuild recompiles everything and has exactly the
+    // boot's problem. Re-arm the SRC gate with it (see the dispatch site).
+    this._fieldEverReady = false;
     this._pendingFit = null; // refit debounce restarts against fresh bounds
     this.#syncSlots(entries);
     this.#syncBvhScene(entries);

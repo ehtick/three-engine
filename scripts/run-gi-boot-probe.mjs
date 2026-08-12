@@ -59,9 +59,41 @@ function pageHook() {
   // A page without WebGPU has no `GPUDevice`, and a ReferenceError at document
   // start would take the whole editor down rather than skipping the probe.
   if (typeof GPUDevice === "undefined") return;
-  const rec = { pipelines: [], t0: performance.now() };
+  // `epochAtT0` bridges the two clocks this probe reads: everything the page
+  // records is `performance.now()` relative to t0, while `[gi]` console lines
+  // arrive as CDP epoch timestamps. Without it a main-thread block can be
+  // located to the millisecond and still not be attributable to a stage.
+  const rec = { pipelines: [], t0: performance.now(), epochAtT0: Date.now() };
   const bytesOf = new WeakMap();
   globalThis.__giBootProbe = rec;
+
+  // ── MAIN-THREAD AVAILABILITY, AS A TRACE ──────────────────────────────────
+  //
+  // Settles "the driver is slow" vs "the main thread never looked". A WebGPU
+  // async create resolves only when the renderer process runs a task to receive
+  // the GPU process's reply, so a promise can sit finished-but-undelivered for
+  // as long as JS holds the thread. The boot's signature demands the
+  // distinction: 78 compute pipelines created across 1.1 s, sized 2 kB to 37 kB,
+  // ALL resolving within 3 ms of each other — no compiler finishes a
+  // heterogeneous batch simultaneously, but a starved event loop delivers one
+  // exactly that way.
+  //
+  // A self-rescheduling `setTimeout(0)` is the cheapest honest probe of that:
+  // each entry is [when the previous turn ended, how long until this one ran].
+  // Gaps ARE main-thread blocks. If a pipeline's window contains hundreds of
+  // turns and it still did not resolve, the wait is the driver's and no amount
+  // of yielding will help.
+  rec.turns = [];
+  let lastTurn = performance.now();
+  const tick = () => {
+    const now = performance.now();
+    // Capped: a 15 s boot is a few thousand turns, and an unbounded array in a
+    // page that might be left open is a leak in an instrument.
+    if (rec.turns.length < 20000) rec.turns.push([Math.round(lastTurn - rec.t0), Math.round(now - lastTurn)]);
+    lastTurn = now;
+    setTimeout(tick, 0);
+  };
+  setTimeout(tick, 0);
 
   const rawModule = GPUDevice.prototype.createShaderModule;
   GPUDevice.prototype.createShaderModule = function (desc) {
@@ -127,6 +159,12 @@ function pageHook() {
           branches: info?.branches ?? 0,
           at: start - rec.t0,
           ms: 0,
+          // The GI PASS that dispatched this, read from GISystem's live
+          // `giCurrentComputeNode` (DEV-only global). Every GI compute pipeline
+          // shares one label, so without this the table can rank 79 kernels by
+          // latency and still not say which belong to the occupancy chain — the
+          // one chain whose readiness gates "the scene is lit".
+          pass: globalThis.__giCurrentPassName?.() ?? "",
         };
         // Held on the record, NOT on the entry: `rec.pipelines` is serialised
         // back to node in one go, and 75 kernels of source would make every
@@ -253,13 +291,20 @@ async function runArm(arm) {
     if (/compile wave started/.test(t)) marks.waveStart = at;
     if (/compile wave: materials \d+ms, computes \d+ms/.test(t)) { marks.waveDone = at; waveDone = true; }
     if (/first frame after compile wave/.test(t)) marks.firstFrame = at;
-    // ⚠ THE END MARKER IS `field ready`, AND ONLY IT. Releasing on `first frame
-    // after compile wave` too meant the probe could stop BEFORE the field
-    // finished — the report then silently dropped its own last row and the
-    // total measured to whatever happened to have printed. Waiting on the
-    // marker the report ends at is the only self-consistent rule; the deadline
-    // below is what keeps a genuinely broken boot from hanging.
-    if (/field ready:/.test(t)) { marks.fieldReady = at; firstFrame = true; }
+    // ⚠ THE END MARKER IS THE FIELD'S FIRST DISPATCH, AND ONLY IT. Releasing on
+    // `first frame after compile wave` too meant the probe could stop BEFORE the
+    // field finished — the report then silently dropped its own last row and the
+    // total measured to whatever happened to have printed. Waiting on the marker
+    // the report ends at is the only self-consistent rule; the deadline below is
+    // what keeps a genuinely broken boot from hanging.
+    //
+    // ⚠ AND IT IS `field first pass dispatched`, NOT `field ready`. The latter
+    // resolves a GPU→CPU buffer map that exists to print a voxel count, measured
+    // at 1,077 ms on the user's Sponza — so every startup number recorded before
+    // 2026-08-12 included ~1 s of diagnostics in "the scene is lit". The old line
+    // is still accepted so a run against an older build still terminates.
+    if (/field first pass dispatched/.test(t)) { marks.fieldReady = at; firstFrame = true; }
+    if (/field ready:/.test(t)) { marks.fieldReadback = at; marks.fieldReady ??= at; firstFrame = true; }
   });
   page.on("pageerror", (e) => {
     const msg = e.message ?? String(e);
@@ -440,6 +485,8 @@ async function runArm(arm) {
     ms: globalThis.__giBootProbe?.moduleMs ?? 0,
     count: globalThis.__giBootProbe?.moduleCount ?? 0,
   }));
+  const turns = await page.evaluate(() => globalThis.__giBootProbe?.turns ?? []);
+  const epochAtT0 = await page.evaluate(() => globalThis.__giBootProbe?.epochAtT0 ?? null);
   // ── LIFT THE SLOW KERNEL OUT OF THE EDITOR ────────────────────────────────
   //
   // Fetched by id BEFORE the browser closes, and only the one asked for. With
@@ -590,7 +637,8 @@ async function runArm(arm) {
   // moved the finish line whenever a run got faster, shortening TTFF twice for
   // one improvement. `field ready` is unconditional and is the moment GI's
   // field actually holds the scene, which is what "GI is up" means to a person.
-  const fieldReady = lines.find((l) => /field ready:/.test(l.t))?.at;
+  const fieldReady = lines.find((l) => /field first pass dispatched/.test(l.t))?.at
+    ?? lines.find((l) => /field ready:/.test(l.t))?.at;
   const end = fieldReady ?? marks.firstFrame ?? marks.waveDone ?? Date.now();
 
   // ══ THE START OF GI INIT IS THE START OF ITS BURST, NOT THE FIRST `[gi]`
@@ -629,6 +677,8 @@ async function runArm(arm) {
     timedOut: !waveDone,
     pipelines,
     modules,
+    turns,
+    epochAtT0,
     cpuRows,
     traceRows,
     compileSpans,
@@ -711,7 +761,7 @@ function report(r) {
       ["scene assets ready", at(/scene assets ready after/)],
       ["static shadow BVH done", at(/static shadow bvh:/)],
       ["compile wave ends", at(/compile wave: materials \d+ms, computes/)],
-      ["field ready (scene is lit)", at(/field ready:/)],
+      ["field lit (first pass dispatched)", at(/field first pass dispatched/) ?? at(/field ready:/)],
     ].filter(([, t]) => t != null).sort((a, b) => a[1] - b[1]);
     console.log(`\n  ══ THE USER'S WAIT: ${ms(r.userWait)} ══  (project open → scene lit)`);
     let prev = r.projectOpen;
@@ -742,6 +792,98 @@ function report(r) {
       `${(p.async ? `${p.kind}*` : p.kind).padEnd(8)} ${String(p.label).slice(0, 44)}${p.error ? `  ERROR ${p.error.slice(0, 40)}` : ""}`);
   }
   if (r.pipelines.length > top.length) console.log(`    … ${r.pipelines.length - top.length} more`);
+
+  // ── WHO IS ON THE CRITICAL PATH, BY PASS FAMILY ───────────────────────────
+  //
+  // The table above ranks by latency, and latency overlaps — so it has never
+  // been able to answer the only question that matters at boot: the occupancy
+  // chain is what lights the scene, so WHEN were ITS pipelines created and when
+  // did the LAST of them land? Everything else can compile whenever it likes.
+  //
+  // `pass` comes from GISystem's live dispatch tracker, so the families are the
+  // engine's own names (`occupancy#3`, `src#17`, a screen bundle key) rather
+  // than a guess from WGSL text. Grouped on the prefix: 20 `occupancy#N` rows
+  // is noise, "occupancy, 20 pipelines, created t+3.6s, last landed t+6.6s" is
+  // the finding.
+  if (r.pipelines.some((p) => p.pass)) {
+    const fam = new Map();
+    for (const p of r.pipelines) {
+      const key = String(p.pass || "(untracked)").split("#")[0];
+      const e = fam.get(key) ?? { n: 0, first: Infinity, last: 0, worst: 0, kb: 0 };
+      e.n++;
+      e.first = Math.min(e.first, p.at);
+      e.last = Math.max(e.last, p.at + p.ms);
+      e.worst = Math.max(e.worst, p.ms);
+      e.kb += (p.bytes ?? 0) / 1024;
+      fam.set(key, e);
+    }
+    const rows = [...fam.entries()].sort((a, b) => a[1].first - b[1].first);
+    console.log(`\n  ── BY PASS FAMILY (page clock; "span" is created → last landed) ──`);
+    console.log(`    ${"family".padEnd(20)} ${"n".padStart(3)} ${"created".padStart(9)} ${"landed".padStart(9)} ${"span".padStart(9)} ${"worst".padStart(9)}`);
+    for (const [name, e] of rows) {
+      console.log(`    ${name.slice(0, 20).padEnd(20)} ${String(e.n).padStart(3)} ` +
+        `${ms(e.first).padStart(9)} ${ms(e.last).padStart(9)} ${ms(e.last - e.first).padStart(9)} ${ms(e.worst).padStart(9)}`);
+    }
+    // ── WAS THE WAIT THE DRIVER, OR THE EVENT LOOP? ─────────────────────────
+    //
+    // For the family that gates "the scene is lit", count the main-thread turns
+    // inside its window. Hundreds of turns and it still did not resolve ⇒ the
+    // driver had the reply and was not sitting on the wire, so yielding more is
+    // not the fix. A window made mostly of one long block ⇒ delivery was
+    // starved and the wave is holding the thread.
+    const occ = fam.get("occupancy");
+    if (occ && r.turns?.length) {
+      const inWin = r.turns.filter(([at]) => at >= occ.first && at <= occ.last);
+      const blocked = inWin.reduce((s, [, gap]) => s + gap, 0);
+      const worstGap = inWin.reduce((m, [, gap]) => Math.max(m, gap), 0);
+      const span = occ.last - occ.first;
+      console.log(
+        `\n    occupancy's ${ms(span)} window contained ${inWin.length} main-thread turns; ` +
+        `${ms(blocked)} of it (${((blocked / Math.max(1, span)) * 100).toFixed(0)}%) was ` +
+        `JS holding the thread, longest single block ${ms(worstGap)}.`,
+      );
+      console.log(
+        inWin.length > 50 && blocked < span * 0.75
+          ? "    → THE EVENT LOOP WAS FREE. The wait is the driver's; yielding more cannot help."
+          : "    → THE THREAD WAS HELD. Completions could not be delivered — something is blocking.",
+      );
+    }
+  }
+
+  // ── WHAT HOLDS THE MAIN THREAD, AND WHEN ──────────────────────────────────
+  //
+  // "The thread was held" is only half an answer; the other half is BY WHAT,
+  // and the timestamp is what identifies it. Each row is one uninterrupted
+  // block between two macrotask turns, tagged with the `[gi]` log line that was
+  // most recently printed before it — which names the stage that owns it
+  // without needing a CPU profile.
+  if (r.turns?.length) {
+    const blocks = r.turns
+      .map(([at, gap]) => ({ at, gap }))
+      .filter((b) => b.gap >= 150)
+      .sort((a, b) => b.gap - a.gap)
+      .slice(0, 10);
+    if (blocks.length) {
+      const held = r.turns.reduce((s, [, gap]) => s + (gap >= 150 ? gap : 0), 0);
+      const span = r.turns.length ? r.turns[r.turns.length - 1][0] - r.turns[0][0] : 0;
+      // The turn COUNT is itself a finding, and a guard against reading this
+      // table wrong: a ticker that ran 4,000 times over the boot is a free event
+      // loop punctuated by blocks, while one that ran 40 times means timers are
+      // being starved wholesale and every "block" here is a lower bound.
+      console.log(`\n  ── MAIN-THREAD BLOCKS ≥150ms (${ms(held)} total, top 10) ──`);
+      console.log(`    ticker ran ${r.turns.length} times over ${ms(span)} ` +
+        `(${(r.turns.length / Math.max(1, span / 1000)).toFixed(0)}/s; an unblocked loop is 200-250/s)`);
+      for (const b of blocks) {
+        // `turns` are page-relative, `[gi]` lines are CDP epoch — `epochAtT0`
+        // is the exact offset between them, recorded in the page at t0.
+        const prior = r.epochAtT0
+          ? (r.lines ?? []).filter((l) => l.at <= r.epochAtT0 + b.at).pop()
+          : null;
+        console.log(`    ${ms(b.gap).padStart(9)}  at page t+${ms(b.at)}` +
+          (prior ? `  after "${prior.t.replace(/^\[gi\]\s*/, "").slice(0, 52)}"` : ""));
+      }
+    }
+  }
 
   // ⚠ THE SUM IS NOT WALL TIME. These compiles are async and overlap, so their
   // sum EXCEEDS TTFF — which is itself the proof that they run concurrently.

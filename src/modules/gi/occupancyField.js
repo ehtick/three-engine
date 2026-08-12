@@ -4401,6 +4401,88 @@ export function createOccupancyField(bounds, res0, options = {}) {
   let computesRevision = -1;
   let jitterFrame = 0;
 
+  /**
+   * Builds (and caches) the two dispatch chains, both valid until the geometry
+   * buffers change. Split out of `passes()` so `prewarmComputes()` can force the
+   * kernels into existence WITHOUT dispatching them or touching a dirty flag —
+   * see that method for why the compile wave needs to.
+   *
+   *   FULL — clear, voxelize the static side, snapshot it, then add the dynamic
+   *          side. With no dynamic slots the static pass covers everything and
+   *          the snapshot is simply the whole scene.
+   *   FAST — replay the snapshot (2 copies) + dynamic side only. Runs on every
+   *          frame where only dynamic transforms changed — the game steady
+   *          state this split exists for.
+   *
+   * The Phase-2 surface build (and the Phase-4 triangle pool that hangs off it)
+   * rides the FULL chain only, wedged between the static voxelize and the
+   * dynamic one: an extra copy+hybridBuild lands the STATIC-ONLY state in the
+   * pyramid/brick tail, the surface passes allocate and fit against those static
+   * masks, and only then does the dynamic side stack on top. Fast chains never
+   * touch the STATIC records or their pool — static bits cannot have changed.
+   *
+   * The DYNAMIC record tail is the opposite: it rides EVERY chain, after the
+   * final hybridBuild, so bricks typed DynamicBrick get fresh fitted-plane
+   * records ranked against the merged masks that same dispatch. That is what
+   * keeps a mover's shadow silhouette exact while it moves — before this,
+   * DynamicBrick meant box semantics for the whole promote window.
+   */
+  function ensureComputes() {
+    if (computesRevision === geometryRevision) return;
+    const voxStatic = buildVoxelizeCompute("static");
+    const voxDynamic = buildVoxelizeCompute("dynamic");
+    const surfAccumStatic = surfaceEnabled ? buildSurfAccumCompute() : null;
+    const surfAccumDynamic = surfaceEnabled ? buildSurfAccumCompute("dynamic") : null;
+    const complexStatic = surfaceEnabled && buildComplexWriteCompute ? buildComplexWriteCompute() : null;
+    const complexDynamic = surfaceEnabled && buildComplexWriteCompute ? buildComplexWriteCompute("dynamic") : null;
+    // Every compute dispatched over the pair work-list, so the incremental
+    // setGeometry path can bump their live dispatch count (ComputeNode
+    // .count is read per dispatch; its bounds guard is a uniform).
+    pairComputes = [voxStatic, voxDynamic, surfAccumStatic, surfAccumDynamic, complexStatic, complexDynamic]
+      .filter(Boolean);
+    const surfaceChain = surfaceEnabled
+      ? [
+          copyCompute, hybridBuildCompute,
+          surfClearCompute, surfAllocCompute,
+          surfAccumStatic, surfFinalizeCompute,
+          // Phase 4 rides the same FULL chain: finalize reserves the
+          // triangle ranges, this fills them.
+          ...(complexStatic ? [complexStatic] : []),
+        ]
+      : [];
+    const dynamicSurfaceChain = surfaceEnabled
+      ? [
+          dynSurfClearCompute, dynSurfAllocCompute,
+          surfAccumDynamic, dynSurfFinalizeCompute,
+          // Exact mode: the dynamic finalize reserved tail triangle
+          // ranges; this fills them — mover edge cells resolve to real
+          // triangles instead of boxes.
+          ...(complexDynamic ? [complexDynamic] : []),
+        ]
+      : [];
+    computes = {
+      full: [
+        // Fresh clear per geometry change — see buildClearCompute's note:
+        // a stale compiled clear executing ahead of skipped fresh
+        // voxelize nodes is the spawn-blink's empty-pyramid window.
+        buildClearCompute(),
+        voxStatic, snapStaticBitsCompute,
+        ...surfaceChain,
+        voxDynamic, copyCompute, ...downsampleComputes, ...densityComputes,
+        ...(hybridBuildCompute ? [hybridBuildCompute] : []),
+        ...dynamicSurfaceChain,
+      ],
+      fast: [
+        restoreStaticBitsCompute,
+        voxDynamic, copyCompute, ...downsampleComputes, ...densityComputes,
+        ...(hybridBuildCompute ? [hybridBuildCompute] : []),
+        ...dynamicSurfaceChain,
+      ],
+    };
+    computesRevision = geometryRevision;
+    staticDirty = true; // fresh kernels → fresh snapshot before any fast replay
+  }
+
   // ══════════════════════════════════ SURFACE ATTRIBUTION: read side + palette
   //
   // Everything above WRITES the stamp. These two are what a consumer needs to
@@ -4674,82 +4756,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
           bounds.min.z + jz * jitterAmp * voxel.value.z,
         );
       }
-      if (computesRevision !== geometryRevision) {
-        // Two chains, both cached until the geometry buffers change:
-        //   FULL — clear, voxelize the static side, snapshot it, then add the
-        //          dynamic side. With no dynamic slots the static pass covers
-        //          everything and the snapshot is simply the whole scene.
-        //   FAST — replay the snapshot (2 copies) + dynamic side only. Runs
-        //          on every frame where only dynamic transforms changed —
-        //          the game steady state this split exists for.
-        //
-        // The Phase-2 surface build (and the Phase-4 triangle pool that hangs
-        // off it) rides the FULL chain only, wedged between the static
-        // voxelize and the dynamic one: an extra copy+hybridBuild lands the
-        // STATIC-ONLY state in the pyramid/brick tail, the surface passes
-        // allocate and fit against those static masks, and only then does the
-        // dynamic side stack on top. Fast chains never touch the STATIC
-        // records or their pool — static bits cannot have changed.
-        //
-        // The DYNAMIC record tail is the opposite: it rides EVERY chain, after
-        // the final hybridBuild, so bricks typed DynamicBrick get fresh
-        // fitted-plane records ranked against the merged masks that same
-        // dispatch. That is what keeps a mover's shadow silhouette exact
-        // while it moves — before this, DynamicBrick meant box semantics for
-        // the whole promote window.
-        const voxStatic = buildVoxelizeCompute("static");
-        const voxDynamic = buildVoxelizeCompute("dynamic");
-        const surfAccumStatic = surfaceEnabled ? buildSurfAccumCompute() : null;
-        const surfAccumDynamic = surfaceEnabled ? buildSurfAccumCompute("dynamic") : null;
-        const complexStatic = surfaceEnabled && buildComplexWriteCompute ? buildComplexWriteCompute() : null;
-        const complexDynamic = surfaceEnabled && buildComplexWriteCompute ? buildComplexWriteCompute("dynamic") : null;
-        // Every compute dispatched over the pair work-list, so the incremental
-        // setGeometry path can bump their live dispatch count (ComputeNode
-        // .count is read per dispatch; its bounds guard is a uniform).
-        pairComputes = [voxStatic, voxDynamic, surfAccumStatic, surfAccumDynamic, complexStatic, complexDynamic]
-          .filter(Boolean);
-        const surfaceChain = surfaceEnabled
-          ? [
-              copyCompute, hybridBuildCompute,
-              surfClearCompute, surfAllocCompute,
-              surfAccumStatic, surfFinalizeCompute,
-              // Phase 4 rides the same FULL chain: finalize reserves the
-              // triangle ranges, this fills them.
-              ...(complexStatic ? [complexStatic] : []),
-            ]
-          : [];
-        const dynamicSurfaceChain = surfaceEnabled
-          ? [
-              dynSurfClearCompute, dynSurfAllocCompute,
-              surfAccumDynamic, dynSurfFinalizeCompute,
-              // Exact mode: the dynamic finalize reserved tail triangle
-              // ranges; this fills them — mover edge cells resolve to real
-              // triangles instead of boxes.
-              ...(complexDynamic ? [complexDynamic] : []),
-            ]
-          : [];
-        computes = {
-          full: [
-            // Fresh clear per geometry change — see buildClearCompute's note:
-            // a stale compiled clear executing ahead of skipped fresh
-            // voxelize nodes is the spawn-blink's empty-pyramid window.
-            buildClearCompute(),
-            voxStatic, snapStaticBitsCompute,
-            ...surfaceChain,
-            voxDynamic, copyCompute, ...downsampleComputes, ...densityComputes,
-            ...(hybridBuildCompute ? [hybridBuildCompute] : []),
-            ...dynamicSurfaceChain,
-          ],
-          fast: [
-            restoreStaticBitsCompute,
-            voxDynamic, copyCompute, ...downsampleComputes, ...densityComputes,
-            ...(hybridBuildCompute ? [hybridBuildCompute] : []),
-            ...dynamicSurfaceChain,
-          ],
-        };
-        computesRevision = geometryRevision;
-        staticDirty = true; // fresh kernels → fresh snapshot before any fast replay
-      }
+      ensureComputes();
       stats.dispatches++;
       const canFast =
         !staticDirty && dynamicCount > 0 && globalThis.__giNoStaticSplit !== true;
@@ -4759,6 +4766,36 @@ export function createOccupancyField(bounds, res0, options = {}) {
       }
       staticDirty = false;
       return computes.full;
+    },
+
+    /**
+     * EVERY kernel `passes()` can return, built but NOT dispatched and with
+     * none of that function's side effects (`dirty`, `staticDirty`, the jitter
+     * origin, the dispatch counters all stay exactly as they were).
+     *
+     * Exists so the compile wave can create these pipelines while the event
+     * loop is still free. The frame loop's first occupancy dispatch is what
+     * used to create them, and it lands mid-wave: measured, the chain's 24
+     * pipelines sat 3,063 ms between creation and resolution while the main
+     * thread ran ONE macrotask turn in the whole window — the driver had
+     * finished and nobody was listening. Warming them ahead of the materials
+     * costs the same compiles at a moment when their completions can actually
+     * be delivered.
+     *
+     * Returns the FULL chain plus anything only the fast chain uses, because a
+     * pipeline warmed is a pipeline neither chain has to wait for later.
+     */
+    prewarmComputes() {
+      if (pairCount === 0) return [];
+      ensureComputes();
+      const out = [];
+      const seen = new Set();
+      for (const node of [...computes.full, ...computes.fast]) {
+        if (!node || typeof node !== "object" || seen.has(node)) continue;
+        seen.add(node);
+        out.push(node);
+      }
+      return out;
     },
 
     traceOccupancy,
