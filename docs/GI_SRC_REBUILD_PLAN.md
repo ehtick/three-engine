@@ -7450,6 +7450,14 @@ the open window being counted — it is the field re-equilibrating from an
 uncapped fast-decay state back to the capped slow-decay one. Under a
 ping-pong cycle that transient never got to finish before the next swing.
 
+**REPRODUCED IN A SECOND PAGE** (the α-sweep run's own config block, a
+fresh process): shipped **12.50 @ capLift 0%** / level-arm **12.90 @
+capLift 100%** / no-lift 23.90 / window-off 12.49, round spread 0.173,
+still-after 2.07 vs 6.30 (**3.0× calmer**, against 3.4× in the first
+page). The absolutes moved 2.7× between pages — the documented
+cross-process spread, which is exactly why this rig only ever quotes
+within-page comparisons — and every ratio and every capLift held.
+
 **HONEST RESIDUAL, AND IT IS THE NEXT UNIT.** Churn *during* rotation is
 ~4.7 rev/px in every arm that has a window at all — 6.5× the page's 0.718
 still floor — and window-off's 5.00 shows removing the window does not
@@ -7463,4 +7471,96 @@ fast α at all — per-frame innovation is small and monotone, so a slower α
 should cost a bounded angular LAG rather than accuracy, which is a very
 different trade from a step. That is an α sweep under LIGHT_ROT, and it
 wants a lag statistic as well as a churn one (§12.38's lesson: a
-smoothing change that eats real signal passes every calm metric).
+smoothing change that eats real signal passes every calm metric). Worth
+knowing before designing it: the paper's own §8.1 future-work names this
+exact trade and proposes "a multi-scale mean estimator or other methods
+of adaptive averaging" — several accumulators at different rates rather
+than one tuned α — which is the principled fallback if the trade is real.
+
+#### 12.46.2 FOUR INSTRUMENT TRAPS THE α SWEEP PAID FOR
+
+Recorded because each one produced a plausible-looking table, and three
+of the four would have biased the answer toward the hypothesis:
+
+1. **The decisive column came back `NaN`.** `netSettle` was computed
+   inside `body()` and never added to its return object. The churn column
+   looked perfect, the verdict line printed confidently, and the verdict
+   logic divided `NaN`s without complaint. A sweep whose *deciding* metric
+   is silently absent still reads as a result.
+2. **The settle window was sized for the FASTEST α.** The post-stop slide
+   takes ~1/α refreshes × stride frames — 150 at α=0.02, stride 3 — so a
+   90-frame window truncated the slowest arm's slide and would have
+   reported it as LESS lag. Now 480 frames (≥3× the slowest constant), the
+   SAME window every arm. This is §12.38's discarded-arm lesson in its
+   mirror image: there the transient was counted as flicker, here it would
+   have gone uncounted as lag.
+3. **`rev/px` and `step p95` are conditioned on α.** The accumulator only
+   counts a frame when `|Δlum|` clears `max(0.002, 1% of lum)`, and
+   per-frame innovation scales with α — so a lower α pushes pixels under
+   the visibility threshold and shrinks the population both metrics are
+   computed over. Part of any collapse is real (sub-visible change is not
+   flicker) and part is the denominator moving. `changedPx` prints beside
+   them now, and **step p95 must never be quoted across α rows** — it is a
+   p95 over a different pixel set per row.
+4. **The eased-curve mode crashed every non-rotating arm.** `ROT_EASE`'s
+   `rotLight.halfFrames` was read at definition time, but still and base
+   arms pass `rotLight: null`. Every `rotLight.*` read now stays inside a
+   callback that only fires when one exists.
+
+#### 12.46.3 THE α SWEEP RAN, AND ITS DECIDING COLUMN REFUTED ITSELF
+
+`ROT_ALPHA=0.1,0.05,0.02` under the shipping config (rising-edge arming ⇒
+window closed, tier cap engaged, so α is the only variable), interleaved
+×2, round 2 reversed, a full discarded rotating arm per switch:
+
+| α | churn rev/px (r1/r2) | changedPx | post-stop displacement |
+|---|---|---|---|
+| 0.10 | 14.32 / 14.31 | 252k / 243k | 0.0214 / 0.0161 |
+| 0.05 | 0.93 / 0.84 | 74k / 56k | 0.0159 / 0.0142 |
+| 0.02 | 0.42 / 0.39 | 32k / 30k | 0.0112 / 0.0117 |
+
+**The churn side is unambiguous: 34× between α=0.1 and α=0.02**, far
+outside any spread this rig has ever shown. Part of that is real and part
+is trap 3 above (the count threshold), and `changedPx` shows the
+conditioning moving with it.
+
+**But the accuracy side is not measured, and the sweep proves it rather
+than merely leaving it open.** The post-stop displacement column FALLS as
+α falls — 0.0188 → 0.0150 → 0.0115 averaged over rounds. EMA lag for a
+ramp input scales as (1−α)/α, so α=0.02 should read ~5× MORE than α=0.1;
+it reads 1.6× LESS. **A column that moves the wrong way with α is
+measuring the wrong quantity** — here σ, because `mean |Δ|` over pixels
+does not cancel zero-mean noise (E|X| > 0 and grows with σ), which is the
+error in the reasoning that built it.
+
+**SO NO α CHANGE SHIPS ON THIS.** What can be said: lag is not LARGE at
+α=0.02 (a (1−α)/α lag would have dominated the column and did not), and
+the churn win is real. What cannot be said is the trade-off, which is the
+whole decision. The rig now refuses to print an α verdict and prints the
+self-refutation instead; an earlier revision did print "sustained motion
+does not need the fast α" off exactly these numbers.
+
+**THE CORRECT INSTRUMENT — average over PASSES, not over time.** Park the
+sun at a test angle, converge, time-average to get a noise-free TRUTH for
+that angle; then let the ping-pong carry the sun through that same angle N
+times and sample the live field at each crossing. Lag is identical every
+pass while noise falls as 1/√N, so they separate. Time-averaging the live
+field instead does NOT work: the sun sweeps ~17° through a 60-frame
+window, smearing the very signal being measured, and shortening the window
+reintroduces an α-dependent convergence bias (20 frames is ~2 time
+constants at α=0.1 and nearly none at α=0.02). The paper's §8.1 already
+points past a single tuned α to "a multi-scale mean estimator or other
+methods of adaptive averaging", which is the design to reach for if the
+proper arm confirms the trade.
+
+And the reason `ROT_EASE` exists at all is a fifth, subtler one: **the
+constant-rate triangle cannot test the re-arm dwell.** Its per-frame delta
+never dips below the arming threshold, so it can only ever report 0% or
+100% lift — it validates the pin and the fix, but says nothing about
+whether the 800 ms dwell is long enough for a real curve. Their double
+ease (`cos` ∘ `quadInOut`) goes as frac⁴ near a turn: solving for the
+threshold crossing puts the sun sub-threshold for **~2.6 s at each
+endpoint** of a 10 s half-swing, comfortably past the dwell, so each turn
+is expected to arm one legitimate window — a ~12% lift duty rather than
+100%. `ROT_EASE=1` reproduces their composition and span so that number is
+measured rather than asserted.

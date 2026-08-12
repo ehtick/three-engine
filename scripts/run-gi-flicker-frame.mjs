@@ -113,7 +113,22 @@ const ROT_RATE = Number(process.env.ROT_RATE ?? 0.005);
 // is exactly what the post-stop net displacement measures.
 const ROT_ALPHA = (process.env.ROT_ALPHA ?? "")
   .split(",").map(Number).filter((x) => x > 0 && x <= 1);
-const SETTLE_FRAMES = Number(process.env.SETTLE_FRAMES ?? 90);
+// ⚠ SIZE THIS FOR THE SLOWEST α IN THE SWEEP, NOT THE FASTEST. The post-stop
+// slide takes ~1/α refreshes (×stride frames) to complete, so a window that
+// fits α=0.1 truncates α=0.02's slide and reports it as LESS lag — biasing
+// the sweep toward exactly the conclusion it is meant to test. 480 frames
+// covers 3× the time constant at α=0.02, stride 3. Same window for every arm.
+const SETTLE_FRAMES = Number(process.env.SETTLE_FRAMES ?? 480);
+// ROT_EASE=1 — drive the sun with the user's OWN double-eased ping-pong
+// instead of the constant-rate triangle. This is the arm that can actually
+// see §12.46's re-arm dwell: a triangle never dips below the arming
+// threshold, so it reports 0% or 100% lift and nothing in between, whereas
+// their curve is flat enough at each turn to sit sub-threshold for seconds.
+// Use FRAMES=2*ROT_HALF so a measured arm contains whole turns.
+const ROT_EASE = process.env.ROT_EASE === "1";
+// Frames per half-swing. 300 puts the peak at ~0.0128 rad/frame — their
+// 10 s half-period at 30 fps, i.e. 4.8x ALPHA_MOTION_SAT at mid-swing.
+const ROT_HALF = Number(process.env.ROT_HALF ?? 300);
 // ALPHA_SWEEP="0.1,0.05,0.02" — interleaved arms at several α values, both
 // still and moving, in ONE page. Exists to answer the mechanism question the
 // CEILING_AB left open (§12.32): the still-scene instability is nearly
@@ -466,15 +481,40 @@ const body = async ({ anchorId, moverId, frames, amp, rotate, pan = null, light 
     // Triangle ping-pong whose phase starts AT the base elevation, so the
     // first measured frame moves by exactly radPerFrame — an absolute ramp
     // that began at base−A would land a hidden STEP inside the measured arm.
-    // |Δ| per frame is radPerFrame everywhere except the two turn frames,
-    // which is the user's LightScript regime (eased ping-pong, saturated
-    // mid-swing, brief sub-threshold dwell at the extremes).
+    // |Δ| per frame is radPerFrame everywhere except the two turn frames.
     const half = Math.max(2, Math.floor(frames / 2));
-    const rotAngle = (i) => {
+    const triAngle = (i) => {
       const p = (i + Math.floor(half / 2)) % (2 * half);
       const steps = p < half ? p : 2 * half - p;
       return rotLight.base + (steps - Math.floor(half / 2)) * rotLight.radPerFrame;
     };
+    // ── THE USER'S ACTUAL CURVE (`ease: true`) ────────────────────────────
+    // LightScript.ts composes TWO eases — `0.5−0.5cos(frac·π)` then
+    // `quadInOut` — so near a turn the angle goes as frac⁴ and the sun is
+    // nearly STOPPED for seconds. The triangle above never dips below the
+    // arming threshold at all, which makes it the wrong instrument for the
+    // §12.46 dwell: it can only ever show 0% or 100% lift. This mode
+    // reproduces the composition and the span (their remap sends swing∈[0,1]
+    // to MIDPOINT..end, i.e. 70° of the declared 140°), so the per-frame rate
+    // PROFILE matches theirs. Matching per-frame rate is the faithful thing
+    // and frame rate drops out: GISystem's signal is a frame-to-frame matrix
+    // delta, not a velocity.
+    // ⚠ Every `rotLight.*` read stays INSIDE a callback: these definitions are
+    // evaluated on the non-rotating arms too (`rotLight` null), and hoisting
+    // one out crashed a whole run at the first still arm.
+    const quadInOut = (s) => (s < 0.5 ? 2 * s * s : 1 - 2 * (1 - s) * (1 - s));
+    const easeAngle = (i) => {
+      const H = Math.max(4, rotLight.halfFrames ?? 300);
+      const SPAN = rotLight.span ?? 1.222; // 70° in radians
+      // Phase so the arm STARTS mid-swing (saturated) and reaches a turn
+      // inside the measured window — an arm that began at the turn would
+      // spend its first frames sub-threshold and arm once for trivial
+      // reasons.
+      const p = (i + Math.floor(H / 2)) % (2 * H);
+      const frac = (p < H ? p : 2 * H - p) / H;
+      return rotLight.base + SPAN * quadInOut(0.5 - 0.5 * Math.cos(frac * Math.PI));
+    };
+    const rotAngle = rotLight?.ease ? easeAngle : triAngle;
     for (let i = 0; i < frames; i++) {
       await new Promise((r) => requestAnimationFrame(r));
       // LIGHT_STEP: the step lands mid-window through the editor's own prop
@@ -524,15 +564,34 @@ const body = async ({ anchorId, moverId, frames, amp, rotate, pan = null, light 
   obj.position.copy(base);
   obj.updateMatrixWorld(true);
 
-  // ── THE LAG STATISTIC (α-under-rotation sweep) ────────────────────────────
-  // Churn alone cannot judge a smoothing change: §12.38's lesson is that a
-  // slower α passes every calm metric while quietly eating real signal. Under
-  // SUSTAINED motion the signal α trades away is LAG — the field trailing the
-  // true lighting by some angle — and lag is directly observable the moment
-  // the light stops: a lagging field SLIDES monotonically into place, while
-  // per-frame variance is zero-mean and cancels over the same window. So the
-  // statistic is NET displacement |lum_after − lum_at_stop|, not the walked
-  // distance (walk sums both and would let the two effects hide each other).
+  // ── THE POST-STOP DISPLACEMENT — ⚠⚠ NOT A LAG STATISTIC ───────────────────
+  //
+  // ⚠⚠ READ THIS BEFORE QUOTING `netSettle` AS LAG. IT IS CONFOUNDED AND THE
+  // 2026-08-12 sweep proved it by its own numbers. The intent was: a lagging
+  // field slides monotonically into place when the light stops, while
+  // per-frame variance is zero-mean and cancels. The second half is FALSE as
+  // implemented — variance is zero-mean in the SIGNED difference, but this
+  // averages |Δ| over pixels, and E|X| for zero-mean noise is positive and
+  // grows with σ. So the statistic reads the NOISE of its two endpoint
+  // snapshots, not the systematic displacement between them.
+  //
+  // The measurement refutes itself, which is the only reason it is trustworthy
+  // as a negative: EMA lag for a ramp input scales as (1−α)/α, so α=0.02
+  // should read ~5× MORE lag than α=0.1. It read 1.6× LESS (0.0115 vs 0.0188),
+  // tracking σ instead. A column that moves the wrong way with α is measuring
+  // the wrong quantity.
+  //
+  // THE CORRECT INSTRUMENT, for whoever builds it next: average over PASSES,
+  // not over time. Park the sun at a test angle, converge, and time-average to
+  // get a noise-free TRUTH for that angle; then let the ping-pong carry the
+  // sun through that same angle N times, sampling the live field at each
+  // crossing. Lag is identical every pass while noise falls as 1/√N, so the
+  // two separate. Do NOT try to time-average the live field instead — the sun
+  // sweeps ~17° through a 60-frame window, so the averaging smears exactly the
+  // signal being measured, and shortening the window to fix that reintroduces
+  // an α-dependent convergence bias (20 frames is ~2 time constants at α=0.1
+  // and nearly none at α=0.02).
+  //
   // Counting stays disarmed here, so the arm's own churn numbers are the
   // rotation's alone; `stateBuf.x` tracks luminance regardless of `armed`.
   let netSettle = null;
@@ -593,6 +652,7 @@ const body = async ({ anchorId, moverId, frames, amp, rotate, pan = null, light 
     stepP95: maxSteps.length ? maxSteps[Math.floor(maxSteps.length * 0.95)] : 0,
     stepMax: maxSteps.length ? maxSteps[maxSteps.length - 1] : 0,
     meanWalk: maxSteps.length ? ampSum / maxSteps.length : 0,
+    netSettle,
   };
 };
 
@@ -860,7 +920,9 @@ const rotRounds = [];
 // no-lift (30.9 pre-fix) and window-off (5.07) keep their §12.45 meanings.
 const ROT_NAMES = ["shipped", "level-arm", "no-lift", "window-off"];
 const setLevelArm = (v) => page.evaluate((x) => { globalThis.__giSrcTrackLevelArm = x; }, v);
-if (LIGHT_ROT) {
+// Skipped when ROT_ALPHA is set — the config A/B is twice-verified and each
+// full pass is 24 arms; an α sweep run should spend its page on the α axis.
+if (LIGHT_ROT && !ROT_ALPHA.length) {
   const rotConfigs = [
     { name: "shipped", track: undefined, lift: undefined, level: undefined },
     { name: "level-arm", track: undefined, lift: undefined, level: true },
@@ -868,7 +930,7 @@ if (LIGHT_ROT) {
     { name: "window-off", track: false, lift: undefined, level: undefined },
   ];
   // Base elevation ~57° (−1 rad): sun-like over the verified camera's floor.
-  const rotOpts = { rotLight: { id: stepLightId, radPerFrame: ROT_RATE, base: -1.0 } };
+  const rotOpts = { rotLight: { id: stepLightId, radPerFrame: ROT_RATE, base: -1.0, ease: ROT_EASE, halfFrames: ROT_HALF } };
   for (let r = 0; r < 2; r++) {
     const round = {};
     for (const cfg of rotConfigs) {
@@ -897,7 +959,7 @@ if (LIGHT_ROT) {
 // that transient once as if it were flicker.
 const rotAlphaRounds = [];
 if (LIGHT_ROT && ROT_ALPHA.length) {
-  const rotOpts = { rotLight: { id: stepLightId, radPerFrame: ROT_RATE, base: -1.0 } };
+  const rotOpts = { rotLight: { id: stepLightId, radPerFrame: ROT_RATE, base: -1.0, ease: ROT_EASE, halfFrames: ROT_HALF } };
   for (let r = 0; r < 2; r++) {
     const order = r % 2 === 0 ? ROT_ALPHA : [...ROT_ALPHA].reverse();
     const round = {};
@@ -1282,30 +1344,51 @@ if (rotAlphaRounds.length) {
   console.log(`
 === ROT ALPHA SWEEP (continuous sun, shipping window/cap config, x${rotAlphaRounds.length}, round 2 reversed) ===`);
   console.log(`  settle = NET |Δlum| over ${SETTLE_FRAMES} frames after the sun stops = the LAG`);
-  console.log("  α        churn rev/px (r1/r2)   step p95 (r1/r2)      LAG mean (r1/r2)      LAG p95");
+  // ⚠ changedPx IS PRINTED BECAUSE IT CONDITIONS THE OTHER TWO COLUMNS. The
+  // accumulator only counts a frame when |Δlum| clears max(0.002, 1% of lum),
+  // and per-frame innovation scales with α — so a lower α moves pixels UNDER
+  // the visibility threshold and shrinks the set that `rev/px` and `step p95`
+  // are computed over. Part of the churn collapse is therefore real
+  // (sub-visible change is not flicker, which is the metric behaving
+  // correctly) and part is the conditioning set shrinking. Read rev/px
+  // TOGETHER with changedPx, and never quote step p95 across α rows: it is a
+  // p95 over "pixels that changed at all", i.e. a different population per
+  // row. §12.38 read that artifact as an equilibration wave once already.
+  console.log("  α        churn rev/px (r1/r2)   changedPx (r1/r2)     LAG mean (r1/r2)      LAG p95");
   for (const a of ROT_ALPHA) {
     const r = rotAlphaRounds.map((round) => round[a]);
     console.log(
       `  ${String(a).padEnd(7)} ${r.map((x) => x.meanReversals.toFixed(3)).join(" / ").padEnd(21)} ` +
-      `${r.map((x) => x.stepP95.toFixed(4)).join(" / ").padEnd(21)} ` +
+      `${r.map((x) => x.changedPx).join(" / ").padEnd(21)} ` +
       `${r.map((x) => (x.netSettle?.mean ?? NaN).toFixed(5)).join(" / ").padEnd(21)} ` +
       `${r.map((x) => (x.netSettle?.p95 ?? NaN).toFixed(4)).join(" / ")}`);
   }
   const meanOf = (a, f) => rotAlphaRounds.reduce((s, round) => s + f(round[a]), 0) / rotAlphaRounds.length;
   const hi = ROT_ALPHA[0], lo = ROT_ALPHA[ROT_ALPHA.length - 1];
   const churnGain = meanOf(hi, (x) => x.meanReversals) / Math.max(1e-9, meanOf(lo, (x) => x.meanReversals));
-  const lagCost = meanOf(lo, (x) => x.netSettle?.mean ?? 0) / Math.max(1e-9, meanOf(hi, (x) => x.netSettle?.mean ?? 0));
-  console.log(`  α ${hi} → ${lo}: churn ×${(1 / churnGain).toFixed(2)} (lower is calmer), lag ×${lagCost.toFixed(2)} (lower is truer)`);
-  if (churnGain > 1.5 && lagCost < 1.5) {
-    console.log("  ⇒ SUSTAINED MOTION DOES NOT NEED THE FAST α: churn falls faster than lag rises,");
-    console.log("     so the §12.38 ramp is mispriced for smooth motion (it was tuned on STEPS).");
-  } else if (lagCost >= 1.5) {
-    console.log(`  ⇒ A REAL TRADE: the slower α trails the sun ${lagCost.toFixed(2)}× further. Any change here`);
-    console.log("     needs a rate-aware α (innovation per frame), not a flat reduction.");
+  const dispRatio = meanOf(lo, (x) => x.netSettle?.mean ?? 0) / Math.max(1e-9, meanOf(hi, (x) => x.netSettle?.mean ?? 0));
+  console.log(`  α ${hi} → ${lo}: churn ×${(1 / churnGain).toFixed(2)} (lower is calmer), ` +
+    `post-stop displacement ×${dispRatio.toFixed(2)}`);
+  // ⚠ NO α VERDICT IS PRINTED HERE, DELIBERATELY. The displacement column is
+  // noise-dominated (see body()'s header), so this rig can measure the churn
+  // side of the trade and NOT the accuracy side — and a one-sided reading is
+  // exactly how a smoothing change that eats real signal gets shipped. An
+  // earlier revision did print "sustained motion does not need the fast α"
+  // off these numbers; it was wrong to, and the self-refutation below is what
+  // caught it.
+  if (dispRatio < 1) {
+    console.log(`  ⇒ ⚠ THE DISPLACEMENT COLUMN IS SELF-REFUTING: EMA lag for a ramp goes as (1−α)/α,`);
+    console.log(`     so α=${lo} should show ~${(ROT_ALPHA[0] / ROT_ALPHA[ROT_ALPHA.length - 1]).toFixed(0)}× MORE than α=${hi} and it shows ${(1 / dispRatio).toFixed(1)}× LESS.`);
+    console.log("     It is tracking σ, not lag. DO NOT change α on this evidence — build the");
+    console.log("     multi-pass converged-reference arm described in body()'s header first.");
   } else {
-    console.log("  ⇒ α IS NOT THE LEVER HERE — churn barely moves with it, so the rotating churn is");
-    console.log("     structural (bin membership, §12.24) rather than variance.");
+    console.log("  ⇒ displacement rises with lower α as lag theory predicts — but it still contains");
+    console.log("     the endpoint noise term, so treat it as an UPPER BOUND on lag, not a measurement.");
   }
+  console.log(`  churn side (robust): rev/px ${meanOf(hi, (x) => x.meanReversals).toFixed(2)} → ` +
+    `${meanOf(lo, (x) => x.meanReversals).toFixed(2)}, changedPx ` +
+    `${Math.round(meanOf(hi, (x) => x.changedPx))} → ${Math.round(meanOf(lo, (x) => x.changedPx))} ` +
+    "(both fall partly because a lower α pushes pixels under the count threshold).");
 }
 
 // ── THE α SWEEP VERDICT ─────────────────────────────────────────────────────
