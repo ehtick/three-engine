@@ -7450,6 +7450,18 @@ the open window being counted — it is the field re-equilibrating from an
 uncapped fast-decay state back to the capped slow-decay one. Under a
 ping-pong cycle that transient never got to finish before the next swing.
 
+**✅ CONFIRMED LIVE IN THE USER'S EDITOR.** Same scene playing with the day
+cycle running, same tier (s₀ = 0.45), same 889×461 resolve, same 81 draws
+/ 786,852 tris, camera 5% further from target than the before-reading (if
+anything costlier): **frame GPU 26.81 → 16.78 ms (−37%), fps 30 → 50** —
+while the PROFILED chain stayed flat, 21.67 → 22.28 ms. That combination
+is the signature rather than a puzzle: `profile.giPasses` suspends the
+tick, so the sun parks and the tracking window closes during measurement
+in BOTH builds, and the only frames that changed are the ones the profiler
+never sees. **⚠ Corollary: giPasses cannot A/B this fix** — it measures
+the window-closed state either way. (jsHeap 1701 → 566 MB is the restart
+clearing their sun script's per-frame `console.log` flood, not the fix.)
+
 **REPRODUCED IN A SECOND PAGE** (the α-sweep run's own config block, a
 fresh process): shipped **12.50 @ capLift 0%** / level-arm **12.90 @
 capLift 100%** / no-lift 23.90 / window-off 12.49, round spread 0.173,
