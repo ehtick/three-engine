@@ -260,9 +260,72 @@ export function createOccupancyField(bounds, res0, options = {}) {
   // ×1.5 headroom at ultra and ×1.36 at high. Overflow still degrades bricks
   // to box fallback and increments the diagnostic — it can never become a
   // miss — and GISystem now logs the pool state after the first full chain.
+  //
+  // ══ /12 IS A BIG-SCENE RATIO, AND A SMALL ENCLOSED GRID BREAKS IT ═════════
+  //
+  // "Surfaces are ~2D" is true of an OPEN scene measured at Sponza's scale. It
+  // is false of a closed room at fine voxels: the occupied fraction is roughly
+  // (shell thickness in voxels) × (surface area) / volume, and a 5 m Cornell
+  // box at ultra's 0.1 m voxels rasterizes to **33,792 of 262,144 level-0
+  // voxels = 12.9%**, against a /12 = 8.3% pool. MEASURED, 2026-08-13, on the
+  // generated Cornell project through `probe:gi-attribution`:
+  //
+  //   tier    pool before   occupied level-0   unattributedRate
+  //   ultra        21,846             33,792              75.3%
+  //   high         16,384             18,979              54.2%
+  //   medium       16,384             18,370              25.9%
+  //
+  // (high and medium sit on the `1 << 14` FLOOR, not on /12 — their grids are
+  // small enough that the floor was already the binding constraint, and it is
+  // still 15% short of a 5 m room's shell.)
+  //
+  // The stamps saturate at the pool ceiling (21,833 of 21,846 at ultra), every
+  // stamped record resolves to a live palette entry, and three quarters of the
+  // frame's static hits still shade at the palette MEAN albedo — the "weird
+  // lighting" report, and it was misfiled as a tier-SWITCH staleness because
+  // the healthy 3% it was compared against came from a different scene. Nothing
+  // goes stale; the pool is simply short, and it is short on a FRESH boot too.
+  //
+  // SO THE POOL GETS AS MUCH OF THE GRID AS A FIXED BYTE BUDGET ALLOWS, and
+  // never less than the /12 baseline. Records cost
+  // `(SURFACE_RECORD_WORDS + SURFACE_SCRATCH_WORDS) × 4 = 56 B`, so on a small
+  // grid a pool that covers a THIRD of the volume is a few MB — while on a big
+  // one the budget is exhausted long before /12 is reached and the number is
+  // exactly today's, byte for byte. The crossover sits near 1.8M level-0
+  // voxels: Cornell-ultra (262k) is raised 21,846 → 87,382 (+3.7 MB),
+  // Sponza-ultra (22.5M) is UNCHANGED at 1,880,064 — which also keeps §13.18's
+  // byte-identical deposit WGSL on the scene that gate was measured on.
+  //
+  // /3 is the ceiling because a surface field that wants more than a third of
+  // its own grid is not a surface field, and raising the budget would be the
+  // honest remedy there rather than uncapping this.
+  //
+  // RESULT, same probe, same scene — and it is a PARTIAL fix, stated as one:
+  //
+  //   tier      before   after   pool after
+  //   ultra      75.3%   43.9%   33,792/87,382, 0 bricks denied
+  //   high       54.2%   42.3%   18,979/36,864, 0 bricks denied
+  //   medium     25.9%    8.6%   18,370/36,864, 0 bricks denied
+  //
+  // Every brick now gets its records (`0 bricks DENIED`, and the stamp count
+  // equals the occupied-voxel count EXACTLY rather than clipping at the
+  // ceiling), so the pool is no longer a cause. **The residual 44% at ultra has
+  // a different owner and is OPEN** — it is not the palette (every stamp
+  // resolves to a live entry), not the pool, and not the face-retry step
+  // (fixed separately in `srcSurface.js`, measured: no change). Sponza reads
+  // 0.00% throughout and is untouched by any of this.
   const level0VoxelCount = res0.x * res0.y * res0.z;
+  const RECORD_BYTES = (SURFACE_RECORD_WORDS + SURFACE_SCRATCH_WORDS) * 4;
+  const RECORD_POOL_BUDGET_BYTES = 8 << 20;
+  const surfaceRecordDemand = Math.max(
+    Math.ceil(level0VoxelCount / 12),
+    Math.min(
+      Math.ceil(level0VoxelCount / 3),
+      Math.floor(RECORD_POOL_BUDGET_BYTES / RECORD_BYTES),
+    ),
+  );
   const surfaceCapacity = surfaceEnabled
-    ? Math.min(1 << 21, Math.max(1 << 14, options.surfaceRecordCapacity ?? Math.ceil(level0VoxelCount / 12)))
+    ? Math.min(1 << 21, Math.max(1 << 14, options.surfaceRecordCapacity ?? surfaceRecordDemand))
     : 0;
   // Phase 4: complex cells keep their SHORT exact triangle list instead of
   // degrading to an occupied box. The pool is capped for the same reason the
@@ -311,10 +374,16 @@ export function createOccupancyField(bounds, res0, options = {}) {
   // design and it is what makes the number affordable. §12.9's epitaph (below,
   // at the old attribution grid's declaration site) rejected per-level-0
   // attributes at 12.6M voxels × 8 B = 100 MB and settled for a coarse grid.
-  // Records already exist per OCCUPIED level-0 voxel (`surfaceCapacity` is
-  // `level0VoxelCount / 12` — surfaces are ~2D), so one u32 per record buys
-  // level-0 precision for a few MB instead of a hundred, and buys it at exactly
-  // the resolution the intersection was computed at (R2).
+  // Records already exist per OCCUPIED level-0 voxel (`surfaceCapacity`, sized
+  // at `surfaceRecordDemand` above), so one u32 per record buys level-0
+  // precision for a few MB instead of a hundred, and buys it at exactly the
+  // resolution the intersection was computed at (R2).
+  //
+  // ⚠ ATTRIBUTION INHERITS THE RECORD POOL'S CEILING. A brick whose record
+  // claim is denied has no records, so no stamps, so every hit in it shades at
+  // the palette MEAN — the pool is not only a shadow-silhouette budget, it is
+  // the attribution budget too. That coupling is why the /12 ratio's failure on
+  // a small enclosed grid presented as "the lighting went weird".
   const attributionEnabled = surfaceEnabled && options.enableSurfaceAttribution === true;
   const paletteSlots = attributionEnabled ? slotCapacity : 0;
   // Phase 5: the conservative pyramid ride (levels 3-4) has been ALWAYS-ON

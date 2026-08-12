@@ -26,10 +26,25 @@
 // attributes cost 12.6M voxels × 8 B = 100 MB, so it settled for the composite
 // cell and accepted that a 0.5 m cell shared by a column and a floor gets one
 // colour. Records dodge the trade entirely — they already exist per OCCUPIED
-// level-0 voxel (`surfaceCapacity = level0VoxelCount / 12`, because surfaces
-// are ~2D), so one u32 per record is level-0 precision at surface-manifold
-// cost. It is also the resolution the intersection was computed at, which is
-// R2 applied to attribution rather than to a bias.
+// level-0 voxel, so one u32 per record is level-0 precision at
+// surface-manifold cost. It is also the resolution the intersection was
+// computed at, which is R2 applied to attribution rather than to a bias.
+//
+// **AND IT INHERITS THAT POOL'S CEILING, WHICH IS A REAL FAILURE MODE.** A
+// brick whose record claim the voxelizer denied has no records, therefore no
+// stamps, therefore every hit inside it comes back unattributed — so
+// `unattributedRate` reports on `surfaceRecordCapacity` as much as on this
+// file. Measured 2026-08-13: the generated Cornell room at ultra had 33,792
+// occupied level-0 voxels against a pool of 21,846 records and read **75.3%
+// unattributed ON A FRESH BOOT**. That was misfiled for a session as a
+// tier-SWITCH staleness, because the healthy 3% it was compared against came
+// from a DIFFERENT SCENE (Sponza, whose pool is at 66% and reads 0.00%) — a
+// switch only moves this number because the tier moves the voxel size.
+// `occupancyField.js`'s `surfaceRecordDemand` carries the table and the sizing
+// fix (75.3% → 43.9% at ultra; the pool is no longer a cause, and **the
+// residual is OPEN**); `probe:gi-attribution` is the instrument. When this rate
+// is high, read `[gi] surface records: … POOL STARVED` before suspecting the
+// palette — and check `stamp&live == stamps` before suspecting either.
 //
 // **2. IT RIDES THE `bits` BUFFER.** Both the stamp and the palette are tail
 // regions of the occupancy allocation, so a consumer that already traces reads
@@ -127,6 +142,24 @@
 // the normal points out of it. Both outcomes are counted (`retried`), so the
 // rate is a measurement rather than an assumption.
 //
+// ⚠ A QUARTER OF **WHICH** VOXEL. The step is taken in the ATTRIBUTION GRID's
+// own units, and it used to be taken in the VOLUME's: `world.minCell` is the
+// coarse SRC lattice cell, which has no fixed relationship to the occupancy
+// level-0 voxel this lookup indexes. On Sponza-ultra the two are 0.33 m and
+// 0.10 m, so the step was 0.83 voxels and the retry worked by accident; on the
+// generated Cornell room they are 0.05 m and 0.094 m, so the step was **0.13
+// voxels and could not cross a cell boundary at all**. The gate could never
+// see it: `gi-src-surface.html` passes `world = { minCell: VOXEL }`, i.e. the
+// field's own voxel, so the harness had the correct step all along and only
+// the shipped call site had the wrong one.
+//
+// **AND FIXING IT BOUGHT NOTHING MEASURABLE, WHICH IS THE POINT OF SAYING SO.**
+// Cornell after the record-pool fix read 43.85/43.94% unattributed at ultra
+// with the broken step and 43.85/43.94% with the correct one (high 42.3→42.3,
+// medium 9.1→8.6 — noise). So the retry is now what its comment claims and the
+// residual unattributed fraction on that scene is NOT the face hazard. Whatever
+// owns it is still open; do not re-derive this step looking for it.
+//
 // docs/GI_SRC_REBUILD_PLAN.md §4.4, §12.9, §12.26.10, §12.29.
 
 import * as THREE from "three/webgpu";
@@ -166,10 +199,15 @@ export function createSrcSurfaceAttribution(occField, world, slots, options = {}
       "failure mode §12.9's epitaph exists to prevent",
     );
   }
+  // The medium this attribution belongs to. Kept as a REQUIRED argument (and
+  // asserted) even though the face retry no longer measures its step in coarse
+  // cells: a caller that cannot name the volume its hits came from is wiring
+  // attribution to a field the trace does not use, and that is worth refusing.
+  // See the header for why the step moved into the attribution grid's units.
   if (world?.minCell == null) {
     throw new Error(
-      "createSrcSurfaceAttribution: world.minCell is required — the face-retry step is " +
-      "derived from the DDA medium's quantization (R2) and there is no default worth having",
+      "createSrcSurfaceAttribution: world is required — it identifies the DDA medium these " +
+      "hits were traced through, and attribution keyed to a different field is silently wrong",
     );
   }
   const { emitterMeshes = () => [], count = null, crossNumbering = false } = options;
@@ -382,12 +420,19 @@ export function createSrcSurfaceAttribution(occField, world, slots, options = {}
     const stamp = stampAt(v).toVar();
     // THE FACE RETRY. See the header: `floor()` at a hit lying exactly on a
     // cell face lands either side of it, and the surface cell is the one the
-    // normal points OUT of. A quarter voxel is the same fraction of the medium
-    // the trace's own self-bias uses (R2), and it is inside the cell for any
-    // wall at least one voxel thick.
+    // normal points OUT of. A quarter of a LEVEL-0 VOXEL is enough by
+    // construction — a hit on the boundary between cells k and k+1 that floored
+    // to the wrong side lands back at k+0.75 — and it is inside the cell for
+    // any wall at least one voxel thick.
     If(stamp.equal(uint(0)), () => {
-      const inward = vec3(worldPos).sub(vec3(normal).mul(float(world.minCell).mul(0.25))).toVar();
-      const q = inward.sub(vec3(gridOrigin)).mul(vec3(voxelInv)).floor().toVar();
+      // IN GRID UNITS (see the header): transform the hit AND the normal into
+      // the attribution grid, then step a quarter of a CELL. `normal · voxelInv`
+      // is the world→grid map applied to a direction; normalizing it makes the
+      // 0.25 a quarter of a grid cell rather than a quarter of whatever the
+      // volume's coarse lattice happens to measure.
+      const g = vec3(worldPos).sub(vec3(gridOrigin)).mul(vec3(voxelInv)).toVar();
+      const nGrid = vec3(normal).mul(vec3(voxelInv)).normalize().toVar();
+      const q = g.sub(nGrid.mul(0.25)).floor().toVar();
       // Only when it actually moved us — otherwise this is a second identical
       // lookup, and an arm measuring the retry rate would read it as a retry
       // that found nothing rather than as a retry that never happened.
