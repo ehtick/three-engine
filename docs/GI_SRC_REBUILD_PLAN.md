@@ -7757,3 +7757,87 @@ call sites and not four: `neeIrradiance` is called once, so the ×2 is a
 second inlining of the whole hit shader somewhere in the deposit, and if
 that inlining is itself removable it is a free 2× with no estimator change
 at all.
+
+### 13.17 THE RAY LOOP WAS A JS LOOP — 2.3× ON THE KERNEL THAT OWNS THE BOOT
+
+`srcDeposit.js`'s per-ray loop was `for (let k = 0; k < raysPerPixel; k++)`,
+a JS loop, so the WHOLE body — trace, hit shading, NEE set, analytic emitter
+shapes, cascade scatter — was emitted once per ray. At the shipping
+`raysPerPixel = 2` that is two complete copies, and the dumped WGSL showed
+it plainly: `giEmitterFactor` appeared **8× in `main`, in two byte-identical
+clusters 1,700 lines apart** differing only in which hit point they read.
+That is where §13.16's "8 call sites = 4 slots × two consumers" reading was
+wrong — the ×2 is the RAY loop, not a second consumer.
+
+Rolled into a GPU `Loop`. **Nothing about the estimator changes**: iterations
+are independent, each ray keeps its own R2 index, its own trace and its own
+scatter, in the same order — which is what makes this much cheaper than the
+emitter-slot roll (an importance CDF to preserve) or slot gating (§12.47.1's
+mid-game rebuild). `k` was used in exactly ONE place (`base.add(uint(k))`),
+audited before the change because a JS-indexed array in the body would not
+survive becoming a GPU index; the cascade scatter still unrolls on its own
+JS `c`, deliberately (N=4 iterations of a few atomics over captured nodes).
+
+**Measured, isolated and paired in one page:** 13,907 → **6,054 ms, 2.3×**.
+Kernel 200 kB/498 ifs → 150 kB/373 ifs; call sites emitter 8→4, trace 6→3,
+exactly as predicted. Cold boot: slowest pipeline 49,114 → 42,993 ms,
+**summed pipeline work 177,003 → 116,626 ms (−34%, more than the kernel
+shrank — the monster inflates everything it contends with)**, TTFF 58,794 →
+~52,800 ms. Gates green: `test:gi-src-deposit` (including its bit-exact
+CPU-mirror arms), `test:gi-src-rays`, `test:gi-src-temporal`.
+
+### 13.18 WHY THE SHADER CACHE NEVER HELPED: THE DEPOSIT'S WGSL IS NOT
+### BYTE-STABLE ACROSS BOOTS, AND IT IS THREE BAKED BUFFER OFFSETS
+
+§13.5 left "make the cache engage" as lever 2 and recorded that warm ≈ cold
+"reproducibly, yet ONE run compiled the whole set warm". Measured now,
+`ARMS=cold,warm` in one process:
+
+| | cold | warm |
+|---|---|---|
+| TTFF | 42,228 ms | **27,142 ms** |
+| material compile wave | 2,019 ms | 748 ms |
+| all pipelines, summed | 559,205 ms | 118,642 ms |
+| **slowest SINGLE pipeline** | 21,981 ms | **19,450 ms** |
+
+**The cache works — for everything except the kernel that matters.** The
+material wave is served (2.7×), the summed pipeline work collapses 4.7×,
+and the slowest compute pipeline does not move. So warm boots are still
+~27 s and the deposit is ~72% of that.
+
+**The reason, found by diffing the dumped deposit WGSL from two cold boots
+of identical code: they differ, and by exactly SIX LINES holding THREE
+BAKED BUFFER OFFSETS** — `37714886u` vs `37711862u` (twice) and `39660486u`
+vs `39657462u`, both a delta of 3024:
+
+```
+nodeVar95  = NodeBuffer_5345.value[ ( 37714886u + u32( nodeVar96 ) ) ];
+nodeVar104 = ( 39660486u + ( nodeVar103 * 8u ) );      // stride 8 = PROBE_WORDS
+```
+
+These are sub-buffer bases — the `hashBlockBase` / `blockStampBase` /
+`blockInfluxBase` tail regions (`srcProbes.js:417,460,469`) and the probe
+table — added as JS NUMBERS and therefore constant-folded into the shader.
+**That is an R11 violation** ("grid/world params in uniforms, never baked
+into the graph; a refit must not recompile"), and its second consequence is
+the one that costs the user: a shader whose text changes between boots can
+never hit a content-keyed disk cache. Chrome's cache is keyed on WGSL
+source; three's own pipeline cache is keyed on node ids and misses on every
+rebuild anyway (§13.5).
+
+**THE FIX: make those bases uniforms.** They are scalars in the shared
+uniform struct, not new buffers, so R7's binding budget is untouched. ⚠ Do
+it for ALL of them at once and re-diff two cold boots — one surviving baked
+offset keeps the text unstable and buys nothing, which is the shape of
+partial fix this section exists to prevent. ⚠ And `blockInfluxBase +
+info.blockBase` (srcRays.js:339, srcDeposit.js:463) is a JS sum of TWO
+JS numbers: the per-cascade `blockBase` bakes as well, so the uniform has to
+absorb the sum or be added on the GPU.
+
+**What this buys, and what it does not.** If the deposit becomes
+cache-servable, a warm boot loses its 19.5 s pole and lands near the
+~8 s §13.5 predicted — which is the developer's actual loop, since every
+editor restart after the first would hit it. It does NOT help a first-ever
+boot or a shader edit, so **R18's ≤1 s still needs §13.14.6's ramp** (boot a
+cheaper ray-hit rung, upgrade in the background). The two compose: the ramp
+covers the cold case, the cache covers every case after it.
