@@ -105,6 +105,7 @@
 import {
   Fn,
   If,
+  Loop,
   Return,
   atomicAdd,
   atomicLoad,
@@ -585,12 +586,35 @@ export function createSrcDepositFrame(store, bins, {
       blocks.push(blk);
     }
 
-    for (let k = 0; k < raysPerPixel; k++) {
+    // ══ THE RAY LOOP IS A GPU LOOP, AND IT HALVES THE KERNEL (§13.17) ═══════
+    //
+    // It used to be `for (let k = 0; k < raysPerPixel; k++)` — a JS loop, so
+    // it unrolled at graph-build time and emitted the WHOLE body once per ray:
+    // the trace, the hit shading, the NEE set, the analytic emitter shapes and
+    // the cascade scatter. At the shipping `raysPerPixel = 2` that is two
+    // complete copies, and this kernel is 83.5% of a GI boot (§13.16: 49.1 s
+    // of a 58.8 s TTFF, 13.6 s isolated). The dumped WGSL showed it plainly —
+    // `giEmitterFactor` appeared 8× in `main`, in two byte-identical clusters
+    // 1,700 lines apart differing only in which hit point they read.
+    //
+    // Rolling it changes NOTHING about the estimator: iterations are
+    // independent, each ray still gets its own R2 index, its own trace and its
+    // own scatter, in the same order. That is what makes this the cheapest
+    // startup win available here — unlike the emitter-slot roll (§13.16 fix A),
+    // which has to preserve an importance CDF, and unlike gating the slots on
+    // scene content (§12.47.1), which re-introduces a mid-game rebuild.
+    //
+    // ⚠ `k` was used in exactly ONE place (`base.add(uint(k))`) — audited
+    // before the change, because a JS-indexed array inside the body would not
+    // survive becoming a GPU index. The cascade scatter below still unrolls on
+    // its own JS `c`, deliberately: N=4 iterations of a few atomics, and those
+    // read `chain[c]`/`blocks[c]`/`bounds[c]`, JS arrays of captured nodes.
+    Loop({ start: uint(0), end: uint(raysPerPixel), type: "uint", condition: "<" }, ({ i: k }) => {
       // `n` is the ray's place in the global R2 sequence. It is handed to the
       // trace and the shading as a fourth/third argument that neither real
       // implementation uses — a SYNTHETIC one does, and that is what makes the
       // gate's diff bit-exact (see `srcRef.js`'s `traceAndDeposit` header).
-      const n = base.add(uint(k)).toVar();
+      const n = base.add(k).toVar();
       const dir = rayDirection(n, Nrm, jitterX, jitterY).toVar();
       const r = trace(P, dir, reach, n);
       const hit = r.hit.greaterThan(0.5).toVar();
@@ -668,7 +692,7 @@ export function createSrcDepositFrame(store, bins, {
           atomicAdd(stats.element(uint(STAT_DEPOSITS)), uint(1));
         });
       }
-    }
+    });
   })().compute(dispatchCount));
 
   // ── [F] resolve ───────────────────────────────────────────────────────────
