@@ -65,7 +65,13 @@ function pageHook() {
 
   const rawModule = GPUDevice.prototype.createShaderModule;
   GPUDevice.prototype.createShaderModule = function (desc) {
+    const tMod = performance.now();
     const mod = rawModule.call(this, desc);
+    // WGSL PARSE + VALIDATE, on the main thread, before any pipeline exists.
+    // Counted separately because it is the one part of the shader path that no
+    // amount of pipeline concurrency can overlap.
+    rec.moduleMs = (rec.moduleMs ?? 0) + (performance.now() - tMod);
+    rec.moduleCount = (rec.moduleCount ?? 0) + 1;
     try {
       const code = desc?.code ?? "";
       // Every GI pipeline label is `computePipeline_compute`, so the WGSL
@@ -136,11 +142,20 @@ function pageHook() {
         rec.sources.set(entry.id, info?.code ?? "");
         if (suffix !== "Async") {
           const out = raw.call(this, desc);
-          entry.ms = performance.now() - start;
+          entry.ms = entry.syncMs = performance.now() - start;
           rec.pipelines.push(entry);
           return out;
         }
-        return raw.call(this, desc).then(
+        // ⚠ `ms` IS LATENCY, `syncMs` IS MAIN-THREAD COST — and until this line
+        // existed the probe could not tell them apart. An Async create returns
+        // a promise, so `ms` (start → resolve) can overlap freely across 79
+        // kernels; what actually blocks the boot is the part that runs BEFORE
+        // the call returns. If the two sums are close, "async" is a fiction on
+        // this backend and merging pipelines is the lever; if syncMs is small,
+        // the wall clock is elsewhere and merging buys nothing.
+        const p = raw.call(this, desc);
+        entry.syncMs = performance.now() - start;
+        return p.then(
           (v) => { entry.ms = performance.now() - start; rec.pipelines.push(entry); return v; },
           (e) => { entry.ms = performance.now() - start; entry.error = String(e?.message ?? e); rec.pipelines.push(entry); throw e; },
         );
@@ -201,10 +216,35 @@ async function runArm(arm) {
   const marks = {};
   let waveDone = false;
   let firstFrame = false;
+  // ── RENDERER-SIDE TIMESTAMPS, NOT RECEIPT TIMES ───────────────────────────
+  //
+  // `Date.now()` in a `page.on("console")` handler is when NODE saw the line.
+  // Console events cross CDP from the renderer's main thread, so a long
+  // synchronous task on that thread queues every message behind it and they all
+  // arrive together the moment it ends. That turns "seven lines, then 16s of
+  // silence, then ten lines" into a story about GI stalling when it may be a
+  // story about delivery — and the two demand opposite fixes.
+  //
+  // `Runtime.consoleAPICalled` carries the renderer's own `timestamp` (epoch
+  // ms, stamped at the call), which is immune to that. Kept as a SEPARATE
+  // lookup rather than replacing the puppeteer handler, so the existing
+  // gate/stage matching is untouched and only the times get better.
+  const rendererAt = new Map();
+  try {
+    const cdp = await page.target().createCDPSession();
+    await cdp.send("Runtime.enable");
+    cdp.on("Runtime.consoleAPICalled", (e) => {
+      const text = (e.args ?? []).map((a) => a.value ?? a.description ?? "").join(" ");
+      if (!/\[gi\]/.test(text) || e.timestamp == null) return;
+      // Keyed on the text: two identical lines would collide, and the FIRST
+      // occurrence is the honest one for a startup narrative.
+      if (!rendererAt.has(text)) rendererAt.set(text, e.timestamp);
+    });
+  } catch { /* older CDP; falls back to receipt times */ }
   page.on("console", (m) => {
     const t = m.text();
     if (!/\[gi\]/.test(t)) return;
-    const at = Date.now();
+    const at = rendererAt.get(t) ?? Date.now();
     lines.push({ at, t });
     // Echo the engine's own attribution lines verbatim — the [pass] tag in
     // SLOWEST PIPELINE is the whole point of §13.14.8's naming instrument,
@@ -252,6 +292,69 @@ async function runArm(arm) {
   const tOpen = Date.now();
   await page.goto(url, { waitUntil: "load", timeout: 60000 });
   await page.waitForSelector(".hub-recent-open-btn", { timeout: 60000 });
+
+  // ── CPU=1: WHOSE JAVASCRIPT IS THE IDLE? ──────────────────────────────────
+  //
+  // The timeline block below reports ~90% of the pipeline window as idle and
+  // attributes it to "TSL node-graph build + WGSL generation" — which was a
+  // GUESS, sound only because nothing else was known to run there. With 79 GI
+  // kernels the natural next step is "merge pipelines", and that is a large,
+  // correctness-critical refactor to make on the strength of a guess.
+  //
+  // A sampling profiler answers it directly and costs one flag. Started at the
+  // project-open click and stopped at first frame, so the samples cover exactly
+  // the span TTFF measures, and self-time is summed from `timeDeltas` rather
+  // than hit counts (hit counts assume a uniform interval the sampler does not
+  // promise under load).
+  //
+  // ⚠ The GPU driver's compile threads are NOT in this profile — it samples the
+  // renderer's main JS thread only. A row here is main-thread JS; the absence
+  // of a row is not proof that nothing else ran.
+  // ── TRACE=1: WHAT IS `(program)`? ─────────────────────────────────────────
+  //
+  // CPU=1 answered "the main thread is 78% in native non-JS code" and stopped
+  // there, because `(program)` is V8's bucket for everything with no JS frame
+  // on the stack — script compile, browser IPC, decode, layout. That is one
+  // bucket holding 43s, i.e. the same aggregate problem the whole §13 hunt
+  // started with, one level down.
+  //
+  // The devtools trace names those tasks directly. Aggregated by event name,
+  // so `v8.compile` / `EvaluateScript` / `Decode Image` / `GPUTask` separate
+  // instead of collapsing.
+  //
+  // ⚠ NESTED EVENTS DOUBLE-COUNT. `RunTask` contains `EvaluateScript` contains
+  // `v8.compile`; summing all three exceeds wall time. Read one level at a
+  // time, and treat `RunTask` as the denominator, never as another row.
+  let tracePath = null;
+  let traceAnchor = null;
+  if (process.env.TRACE) {
+    tracePath = path.join(os.tmpdir(), `gi-boot-trace-${arm}.json`);
+    await page.tracing.start({
+      path: tracePath,
+      categories: [
+        "devtools.timeline", "v8", "v8.execute", "disabled-by-default-v8.compile",
+        "toplevel", "blink.user_timing",
+      ],
+    });
+    // ── THE CLOCK BRIDGE ────────────────────────────────────────────────────
+    // Trace `ts` is a raw monotonic microsecond clock; pipeline `at` is ms
+    // since the probe's own `performance.now()` origin. Without a shared point
+    // the two series cannot be overlaid, and "is the V8 compile time INSIDE
+    // GI's window?" — the only question that separates "GI is slow" from "the
+    // dev server is slow" — stays unanswerable. One mark answers it.
+    traceAnchor = await page.evaluate(() => {
+      const t = performance.now();
+      performance.mark("giBootAnchor");
+      return t;
+    });
+  }
+  let profiler = null;
+  if (process.env.CPU) {
+    profiler = await page.target().createCDPSession();
+    await profiler.send("Profiler.enable");
+    await profiler.send("Profiler.setSamplingInterval", { interval: 200 });
+    await profiler.send("Profiler.start");
+  }
   await page.evaluate((project) => {
     const rows = [...document.querySelectorAll(".hub-recent")];
     const row = rows.find((r) => (r.getAttribute("title") ?? "").replaceAll("\\", "/") === project) ?? rows[0];
@@ -269,7 +372,67 @@ async function runArm(arm) {
   // Let any straggling async pipeline resolve into the record.
   await wait(2000);
 
+  let traceRows = null;
+  let compileSpans = null;
+  if (tracePath) {
+    await page.tracing.stop();
+    try {
+      const raw = JSON.parse(fs.readFileSync(tracePath, "utf8"));
+      const events = Array.isArray(raw) ? raw : (raw.traceEvents ?? []);
+      const byName = new Map();
+      for (const e of events) {
+        if (e.ph !== "X" || !(e.dur > 0)) continue;
+        // Renderer main thread only — the compositor and worker threads have
+        // their own RunTasks and would inflate every row.
+        const k = e.name;
+        const cur = byName.get(k) ?? { us: 0, n: 0 };
+        cur.us += e.dur; cur.n++;
+        byName.set(k, cur);
+      }
+      traceRows = [...byName.entries()].sort((a, b) => b[1].us - a[1].us);
+      // Bridge to the pipeline timeline via the mark, so compile time can be
+      // charged to the window it lands in rather than to the whole boot.
+      const mark = events.find((e) => e.name === "giBootAnchor" && e.ts > 0);
+      if (mark && traceAnchor != null) {
+        const t0 = await page.evaluate(() => globalThis.__giBootProbe?.t0 ?? 0);
+        const offset = (traceAnchor - t0) - mark.ts / 1000;   // trace-ms → pipeline `at`
+        compileSpans = events
+          .filter((e) => e.ph === "X" && e.dur > 0
+            && (e.name === "V8.CompileCode" || e.name === "V8.ParseProgram"))
+          .map((e) => ({ at: e.ts / 1000 + offset, ms: e.dur / 1000 }));
+      }
+    } catch (e) {
+      console.log(`  TRACE: could not parse ${tracePath}: ${e.message}`);
+    }
+  }
+  let cpuRows = null;
+  if (profiler) {
+    const { profile } = await profiler.send("Profiler.stop");
+    // Self time per node from the sample stream. `timeDeltas[i]` is the µs that
+    // elapsed BEFORE sample i, so it is charged to the node sampled at i.
+    const selfUs = new Map();
+    const { samples = [], timeDeltas = [], nodes = [] } = profile ?? {};
+    for (let i = 0; i < samples.length; i++) {
+      selfUs.set(samples[i], (selfUs.get(samples[i]) ?? 0) + Math.max(0, timeDeltas[i] ?? 0));
+    }
+    // Group by function identity, not node id: a hot function called from ten
+    // places is ten nodes, and ten 1.5s rows read as "nothing is expensive".
+    const byFn = new Map();
+    for (const n of nodes) {
+      const us = selfUs.get(n.id) ?? 0;
+      if (!us) continue;
+      const f = n.callFrame ?? {};
+      const file = String(f.url ?? "").split("/").slice(-1)[0].split("?")[0] || "(native)";
+      const key = `${f.functionName || "(anonymous)"} @ ${file}:${(f.lineNumber ?? -1) + 1}`;
+      byFn.set(key, (byFn.get(key) ?? 0) + us);
+    }
+    cpuRows = [...byFn.entries()].sort((a, b) => b[1] - a[1]);
+  }
   const pipelines = await page.evaluate(() => globalThis.__giBootProbe?.pipelines ?? []);
+  const modules = await page.evaluate(() => ({
+    ms: globalThis.__giBootProbe?.moduleMs ?? 0,
+    count: globalThis.__giBootProbe?.moduleCount ?? 0,
+  }));
   // ── LIFT THE SLOW KERNEL OUT OF THE EDITOR ────────────────────────────────
   //
   // Fetched by id BEFORE the browser closes, and only the one asked for. With
@@ -395,6 +558,26 @@ async function runArm(arm) {
       if (m) stages[name] = Number(m[1]);
     }
   }
+  // Re-stamp with renderer times now that every message has certainly arrived.
+  // Done here rather than in the handler because the two CDP sessions deliver
+  // independently — the puppeteer `console` event can beat `consoleAPICalled`
+  // for the same line, and a lookup that misses silently falls back to the
+  // receipt time it was meant to replace.
+  let restamped = 0;
+  for (const l of lines) {
+    const at = rendererAt.get(l.t);
+    if (at != null && at !== l.at) { l.at = at; restamped++; }
+  }
+  if (restamped) {
+    lines.sort((a, b) => a.at - b.at);
+    for (const k of ["waveStart", "waveDone", "firstFrame"]) {
+      const hit = lines.find((l) => (
+        k === "waveStart" ? /compile wave started/.test(l.t)
+          : k === "waveDone" ? /compile wave: materials \d+ms, computes \d+ms/.test(l.t)
+            : /first frame after compile wave/.test(l.t)));
+      if (hit) marks[k] = hit.at;
+    }
+  }
   const end = marks.firstFrame ?? marks.waveDone ?? Date.now();
 
   // ══ THE START OF GI INIT IS THE START OF ITS BURST, NOT THE FIRST `[gi]`
@@ -420,6 +603,10 @@ async function runArm(arm) {
     arm,
     timedOut: !waveDone,
     pipelines,
+    modules,
+    cpuRows,
+    traceRows,
+    compileSpans,
     stages,
     lines,
     ttff: burstStart != null ? end - burstStart : null,
@@ -503,6 +690,17 @@ function report(r) {
     console.log(`    all pipelines, summed   ${ms(compileTotal).padStart(9)}  ` +
       `${(compileTotal / r.ttff * 100).toFixed(0)}% of TTFF  (>100% ⇒ concurrent)`);
     console.log(`    GI CPU work             ${ms(cpu).padStart(9)}  ${(cpu / r.ttff * 100).toFixed(1)}% of TTFF`);
+    // ── THE ONLY SUM THAT CANNOT OVERLAP ──────────────────────────────────
+    // `all pipelines, summed` regularly reads 200-280% of TTFF, which proves
+    // the creations overlap and therefore says nothing about the wall clock.
+    // These two do not overlap with anything: they are main-thread time inside
+    // the WebGPU calls themselves. If they are small, no amount of merging
+    // pipelines shortens the boot, and the wall clock is somewhere else.
+    const syncTotal = r.pipelines.reduce((s, p) => s + (p.syncMs ?? 0), 0);
+    console.log(`    pipeline calls, SYNC    ${ms(syncTotal).padStart(9)}  ${(syncTotal / r.ttff * 100).toFixed(1)}% of TTFF  ← blocks the main thread`);
+    if (r.modules?.count) {
+      console.log(`    createShaderModule      ${ms(r.modules.ms).padStart(9)}  ${(r.modules.ms / r.ttff * 100).toFixed(1)}% of TTFF  (${r.modules.count} modules, WGSL parse)`);
+    }
   }
   // ══ WHERE THE WALL CLOCK ACTUALLY GOES ═══════════════════════════════════
   //
@@ -535,9 +733,97 @@ function report(r) {
     console.log(`\n  ── THE TIMELINE (is the wall clock IN the compiler, or between compiles?) ──`);
     console.log(`    first creation → last completion  ${ms(span).padStart(9)}`);
     console.log(`    of which SOME pipeline was busy   ${ms(busy).padStart(9)}  ${(busy / Math.max(span, 1) * 100).toFixed(0)}%`);
+    // ⚠ "IDLE" IS NOT "BUILDING THE NEXT NODE GRAPH". This line carried that
+    // label for two sessions and it was a guess that survived because nothing
+    // measured it. It does not hold: `pipeline calls, SYNC` is single-digit ms
+    // over ~80 kernels, `prewarm loop` reports ~3 ms of node-graph build and
+    // codegen for all 53, and a CPU profile of the window finds no TSL frames.
+    // The span simply outlives first-frame — SRC's passes create their
+    // pipelines as they first dispatch, over the frames AFTER the boot — so
+    // most of this gap is ordinary rendering, not work on the critical path.
     console.log(`    idle between compiles             ${ms(span - busy).padStart(9)}  ${((span - busy) / Math.max(span, 1) * 100).toFixed(0)}%` +
-      `   ← TSL node-graph build + WGSL generation (JS; no shader cache touches it)`);
+      `   ← NOT all on the critical path: this span outlives TTFF`);
     console.log(`    largest single gap                ${ms(biggestGap).padStart(9)}  at t+${ms(gapAt)}`);
+    // ── WHOSE GRAPH IS THE IDLE? ────────────────────────────────────────────
+    //
+    // The line above says 85% of the pipeline window is idle JS, and then stops
+    // exactly where the question starts: idle building WHAT. A gap ends when
+    // the next pipeline is created, and the thing that ran during the gap is
+    // that pipeline's TSL graph build + WGSL generation — so the kernel AFTER
+    // the gap owns it. Attributing to the one BEFORE (which is what `gapAt`
+    // alone invites) blames the kernel that had already finished.
+    //
+    // ⚠ This is an ATTRIBUTION, not a measurement of the builder. A gap also
+    // absorbs anything else on the main thread between two creations — a BVH
+    // build, an asset decode, a GC. Treat a named row as "look here first",
+    // and confirm with a direct timer before deleting anything.
+    const gaps = [];
+    for (let i = 1; i < byStart.length; i++) {
+      gaps.push({ gap: byStart[i].at - (byStart[i - 1].at + byStart[i - 1].ms), next: byStart[i], at: byStart[i - 1].at });
+    }
+    gaps.sort((a, b) => b.gap - a.gap);
+    const idleTop = gaps.slice(0, 8);
+    if (idleTop.length && idleTop[0].gap > 50) {
+      console.log(`\n  ── THE IDLE, BY THE KERNEL THAT FOLLOWS IT (its graph build) ──`);
+      for (const g of idleTop) {
+        if (g.gap < 20) continue;
+        const p = g.next;
+        // How much of this gap was V8 parsing and compiling JAVASCRIPT — the
+        // Vite dev server's per-module cost, which has nothing to do with GI
+        // and would vanish in a bundled build. Without this column the gap
+        // reads as "GI's node-graph build" by default, which is the assumption
+        // the annotation above made for two sessions with nothing behind it.
+        let jsCol = "";
+        if (r.compileSpans) {
+          const a = g.at + (g.next.at - g.at - g.gap);   // gap start = prev end
+          const b = g.next.at;
+          const inGap = r.compileSpans.reduce((s, c) =>
+            s + Math.max(0, Math.min(b, c.at + c.ms) - Math.max(a, c.at)), 0);
+          jsCol = `  [${ms(inGap)} JS parse/compile = ${(inGap / Math.max(g.gap, 1) * 100).toFixed(0)}%]`;
+        }
+        console.log(`    ${ms(g.gap).padStart(8)} before  #${String(p.id).padEnd(3)} ` +
+          `${String(Math.round(p.bytes / 1024) + "kB").padStart(6)}  ${String(p.fns || p.label || "?").slice(0, 46)}${jsCol}`);
+      }
+      const namedIdle = gaps.reduce((s, g) => s + Math.max(0, g.gap), 0);
+      console.log(`    ${ms(idleTop.reduce((s, g) => s + g.gap, 0)).padStart(8)} in the top ${idleTop.length}, ` +
+        `of ${ms(namedIdle)} total idle across ${gaps.length} gaps`);
+    }
+  }
+  // ── THE ENGINE'S OWN NARRATIVE, WITH THE GAPS BETWEEN ITS LINES ───────────
+  //
+  // STAGES above only reports the six numbers the engine happens to print, and
+  // on this scene they sum to ~7s of a ~22s TTFF. The other 15s is between two
+  // consecutive `[gi]` lines — and which two is a fact the log already contains
+  // and the report was throwing away.
+  if (process.env.LINES && r.lines?.length) {
+    const t0 = r.lines[0].at;
+    console.log(`\n  ── [gi] LOG, BY GAP TO THE PREVIOUS LINE ──`);
+    const rows = r.lines.map((l, i) => ({ ...l, gap: i ? l.at - r.lines[i - 1].at : 0 }));
+    // CHRONOLOGICAL, not sorted by gap. The sorted-top-N form printed two rows
+    // and read as "the log has two gaps"; it actually means every OTHER line is
+    // under the threshold, and the order — which line the silence follows — is
+    // the whole content of the finding.
+    for (const l of rows) {
+      console.log(`    +${ms(l.gap).padStart(7)}  at t+${ms(l.at - t0).padStart(7)}  ${l.t.slice(0, 110)}`);
+    }
+  }
+  if (r.traceRows?.length) {
+    console.log(`\n  ── DEVTOOLS TRACE, BY EVENT NAME (⚠ nested events double-count) ──`);
+    for (const [name, v] of r.traceRows.slice(0, 18)) {
+      if (v.us / 1000 < 40) break;
+      console.log(`    ${ms(v.us / 1000).padStart(8)}  ×${String(v.n).padStart(5)}  ${name.slice(0, 70)}`);
+    }
+  }
+  if (r.cpuRows?.length) {
+    // Self time only. A parent that spends all its time in a child shows 0 here
+    // and that is correct — this names the code doing the work, not the code
+    // that asked for it. `(program)`/`(garbage collector)` are V8's own buckets.
+    const totalUs = r.cpuRows.reduce((s, [, us]) => s + us, 0);
+    console.log(`\n  ── MAIN-THREAD JS, BY SELF TIME (${ms(totalUs / 1000)} sampled) ──`);
+    for (const [name, us] of r.cpuRows.slice(0, 22)) {
+      if (us / 1000 < 20) break;
+      console.log(`    ${ms(us / 1000).padStart(8)}  ${(us / totalUs * 100).toFixed(1).padStart(5)}%  ${name.slice(0, 90)}`);
+    }
   }
   if (slowest) {
     console.log(`\n  ── SLOWEST SINGLE PIPELINE ──`);
