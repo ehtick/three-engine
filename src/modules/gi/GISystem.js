@@ -4591,7 +4591,14 @@ export class GISystem {
     const forced = Number(globalThis.__giEmitterShadowScale);
     if (Number.isFinite(forced) && forced > 0) return Math.min(1, forced);
     const quality = qualityTierOf(this.config);
-    return { low: 0.45, medium: 0.5, high: 0.6, ultra: 0.7071 }[quality] ?? 0.7071;
+    // Ultra dropped 0.7071 → 0.55 (2026-08-13): at a full-res ultra resolve
+    // the emitter buffer was 786k px and the marcher measured 9.95 ms of a
+    // 17.6 ms REST frame on the discrete GPU — 56% of the whole frame for
+    // one emissive's shadow. 0.55 halves the pixels; the analytic-penumbra
+    // rewrite (blocker distance from the BVH the arm already traces, no
+    // field probes) is the real fix and owns both the residual cost and the
+    // waffle-grain artifact class.
+    return { low: 0.45, medium: 0.5, high: 0.6, ultra: 0.55 }[quality] ?? 0.55;
   }
 
   /**
