@@ -62,8 +62,10 @@ import {
   instanceIndex,
   instancedArray,
   select,
+  storage,
   uint,
 } from "three/tsl";
+import { IndirectStorageBufferAttribute } from "three/webgpu";
 import { CASCADE_COUNT } from "./srcConfig.js";
 import { transportPixel } from "./srcMathTsl.js";
 import {
@@ -77,6 +79,15 @@ import {
   PROBE_WORDS,
   SLOT_EMPTY,
 } from "./srcProbes.js";
+
+/**
+ * Workgroup size assumed when [D6] converts the worklist length into an
+ * indirect dispatch argument. Three's `.compute(count)` defaults to `[64]` and
+ * nothing in this module overrides it; the constant exists so the assumption is
+ * WRITTEN DOWN rather than implied, because getting it wrong does not fail —
+ * it silently launches too few workgroups and drops the tail of the worklist.
+ */
+export const RAY_DISPATCH_WG = 64;
 
 /**
  * The per-probe ray budget, bound to one probe store.
@@ -116,12 +127,36 @@ export function createSrcRayStore(store, { pixelCount }) {
   // waited. R7 said fold, don't multiply bindings; this is that rule with a
   // measurement attached.
   const rayWork = instancedArray(new Uint32Array(1 + pixelCount), "uint").toAtomic();
+  // ══ THE DISPATCH ARGUMENT FOR [E], WRITTEN BY THE GPU ═══════════════════
+  //
+  // The worklist above made the WORK dense; this makes the DISPATCH dense, and
+  // without it the first was half a fix. [E] was launched over a baked
+  // `transportThreads` (the tier's `transportRays / raysPerPixel` — 65,536 at
+  // high) no matter how many pixels actually won a slice, so the per-probe ray
+  // cap could cut the worklist 9.5× and the pass still cost the same.
+  //
+  // Measured before this existed (`probe:gi-src-cost SWEEP=cap`, high):
+  //   cap off  126,382 rays  deposit 2.545 ms
+  //   cap 32    32,838 rays  deposit 1.530 ms
+  //   cap 16    21,740 rays  deposit 1.498 ms
+  //   cap 8     13,240 rays  deposit 1.560 ms
+  // Flat from 32 down — 2.5× fewer rays for 0 ms, because the thread count
+  // never moved. That floor is the dispatch width, not the tracing.
+  //
+  // `[count, 1, 1]` in the WebGPU indirect layout. `[0]` is recomputed each
+  // frame by [D6]; the two trailing 1s are uploaded once and never written.
+  // Three dispatches [x,y,z] verbatim from this buffer, so the value is
+  // WORKGROUPS, not threads — [D6] divides by the workgroup size.
+  const rayDispatchAttr = new IndirectStorageBufferAttribute(new Uint32Array([0, 1, 1]), 1);
+  const rayDispatch = storage(rayDispatchAttr, "uint", 3);
   return {
     rayCount,
     rayCursor,
     rayTotal,
     pixelRayBase,
     rayWork,
+    rayDispatch,
+    rayDispatchAttr,
     pixelCount,
     bytes: (probeTotal * 2 + 2 + pixelCount * 2) * 4,
     dispose() {
@@ -166,7 +201,7 @@ export function createSrcRayFrame(
   store, rays, { pixelProbe, raysPerPixel = 1, stride = null, phase = null, threads = 0, cap = null } = {},
 ) {
   const { probeTable, probeTotal, cascades } = store;
-  const { rayCount, rayCursor, rayTotal, pixelRayBase, rayWork, pixelCount } = rays;
+  const { rayCount, rayCursor, rayTotal, pixelRayBase, rayWork, rayDispatch, pixelCount } = rays;
   const N = store.cascadeCount ?? CASCADE_COUNT;
   const top = cascades[N - 1];
 
@@ -450,6 +485,25 @@ export function createSrcRayFrame(
       atomicStore(rayWork.element(atomicAdd(rayWork.element(uint(0)), uint(1)).add(uint(1))), i);
     });
   })().compute(dispatchCount));
+  // ── [D6] the worklist length, as a workgroup count ────────────────────────
+  //
+  // One thread, three instructions, and it is what lets [E] be dispatched over
+  // the rays that exist instead of the rays the tier budgeted for. Runs after
+  // [D5] because that is the pass that finishes appending winners.
+  //
+  // ⚠ WORKGROUPS, NOT THREADS. `dispatchWorkgroupsIndirect` reads [x,y,z]
+  // straight out of this buffer and multiplies by the workgroup size itself, so
+  // writing the ray count here would launch 64× too many. `RAY_DISPATCH_WG` must
+  // track [E]'s workgroup size — both are three's default `[64]`, and there is
+  // no override anywhere in the module (checked); if one is ever added, this
+  // constant is the thing that silently under-dispatches and drops rays.
+  if (rayDispatch) {
+    passes.push(Fn(() => {
+      If(instanceIndex.greaterThan(uint(0)), () => { Return(); });
+      const n = atomicLoad(rayWork.element(uint(0))).toVar();
+      rayDispatch.element(uint(0)).assign(n.add(uint(RAY_DISPATCH_WG - 1)).div(uint(RAY_DISPATCH_WG)));
+    })().compute(1));
+  }
   // ⚠ `pixelRayBase` IS NO LONGER FULLY REWRITTEN EACH FRAME. With a strided
   // dispatch only this frame's residue class is touched, so every other entry
   // holds a base from whichever frame last owned it. That is safe for exactly

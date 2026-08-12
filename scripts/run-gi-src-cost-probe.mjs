@@ -277,7 +277,11 @@ for (const arm of arms) {
     // auto-fit bounds, different cell counts — that is the gap, and neither
     // number was ever printed side by side. Cheap to echo, and it rules a
     // candidate in or out without another run.
-    const echo = /node-graph build|compiled concurrently|compute kernels:|compile wave:|occupancy backend|built \(voxel|light-shadow pipelines|SLOWEST PIPELINE/;
+    // `deposit dispatch` is a GATE-STATE line, not a timing one: it says which
+    // dispatch arm [E] is on. Echoed because a cap sweep that reads flat means
+    // two completely different things depending on it, and the sweep is the
+    // whole reason this probe exists.
+    const echo = /node-graph build|compiled concurrently|compute kernels:|compile wave:|occupancy backend|built \(voxel|light-shadow pipelines|SLOWEST PIPELINE|deposit dispatch/;
     for (const l of gi.filter((t) => echo.test(t))) {
       console.log(`      · ${l.slice(0, 190)}`);
     }
