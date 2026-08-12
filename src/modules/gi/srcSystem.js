@@ -926,19 +926,39 @@ export function createSrcProbeSystem({
      */
     syncCamera(camera) {
       camera.getWorldPosition(cameraU.value);
-      // ── THE CAMERA-PAN LIFT WINDOW (§12.45.2) ────────────────────────────
+      // ── THE CAMERA-PAN LIFT WINDOW — NOW OPT-IN (§12.47) ─────────────────
       // The camera is DELIBERATELY absent from the α signal (§12.38) and from
       // the tracking window (§12.43's refutation) — probe evidence is world-
       // anchored, so a pan stales nothing and must not buy fast decay. But a
       // pan CREATES probes: newly revealed surfaces allocate cold blocks, and
-      // CAMERA_AB priced the cap's starvation of exactly those at ×4.0
-      // (pan-excess 6.66 capped vs 1.66 off, noise 0.009). Lifting the CAP on
-      // camera motion is variance-REDUCING by construction — it only adds
-      // evidence — so the §12.43 spurious-spike hazard does not apply. The
-      // hold state feeds ONLY the cap poll below; α, root and comp never see
-      // the camera.
+      // §12.45.2 lifted the CAP for them on the argument that adding evidence
+      // is variance-reducing by construction.
+      //
+      // ⚠⚠ THAT ARGUMENT IGNORED THE PRICE, AND THE PRICE IS HALF THE FRAME
+      // RATE. This arming is LEVEL-triggered — every moving frame re-pushes
+      // the 1200 ms hold — so the cap is lifted for the WHOLE of any camera
+      // movement, not for a window after it. Uncapped deposit is ~2× capped
+      // (§12.42: the cap is ~14 ms of a 21 ms deposit), and the user reported
+      // exactly that shape: "60 fps when still, 30 fps when moving camera."
+      // It is §12.46's pathology in the camera path — sustained motion held
+      // an emergency window open — and it survived that fix because §12.46
+      // only re-armed the LIGHT side.
+      //
+      // Rising-edge arming does not rescue this one the way it rescued the
+      // light window: a pan reveals cold blocks CONTINUOUSLY, so a one-shot
+      // burst at the start of the movement would buy a 1.2 s hitch and then
+      // stop helping exactly when the pan is still revealing geometry. So the
+      // honest choice is on-or-off, and the measurement decides it: §12.45.2
+      // priced the benefit at 2.89 vs 3.40 rev/px on pan-holds — marginal
+      // against its own round spread — against a halved frame rate during the
+      // single most common interaction in the editor. OFF by default;
+      // `__giSrcCamCapLift = true` opts back in (the rig's lift-on arm).
+      // The per-block form (lift the cap for NEWLY ALLOCATED blocks only,
+      // rather than globally) is the version worth building — it is the same
+      // targeting §12.42's per-block α compensation already does — and it
+      // needs the cap to stop being one global uniform first.
       camera.getWorldQuaternion(camScratchQ);
-      if (camSeen) {
+      if (camSeen && globalThis.__giSrcCamCapLift === true) {
         const posDelta = camPrevPos.distanceTo(cameraU.value);
         const rotDelta = 2 * Math.acos(Math.min(1, Math.abs(camScratchQ.dot(camPrevQ))));
         if (posDelta > CAM_LIFT_POS || rotDelta > CAM_LIFT_ROT) {
@@ -1064,15 +1084,14 @@ export function createSrcProbeSystem({
       // instruments (§12.42: non-cap sweeps pin the cap off), and a pin that
       // drifted with scene state would un-A/B every arm that set it.
       // `__giSrcCapWindowLift = false` opts out (the rig's no-lift arm).
-      // The CAMERA window (state maintained at the top of this function) lifts
-      // for the same reason with the opposite trigger: a pan creates cold
-      // probes, and burst-filling them at natural rate for the hold's 1.2 s is
-      // what the CAMERA_AB off arm priced at −75% pan glints (§12.45.2).
-      // `__giSrcCamCapLift = false` opts out.
+      // The CAMERA window is OPT-IN as of §12.47 — `camHoldUntil` only ever
+      // advances when `__giSrcCamCapLift === true`, so this term is false in
+      // the shipping config and the test below costs one clock read. See the
+      // block at the top of this function for why it cost half the frame rate.
       const capPinned = Number.isFinite(Number(globalThis.__giSrcProbeRayCap));
       const capLifted = !capPinned && (
         (tr > 0 && globalThis.__giSrcCapWindowLift !== false)
-        || (performance.now() < camHoldUntil && globalThis.__giSrcCamCapLift !== false)
+        || performance.now() < camHoldUntil
       );
       const nextCap = capLifted ? PROBE_RAY_CAP_OFF : readCap();
       if (nextCap !== probeRayCap) {

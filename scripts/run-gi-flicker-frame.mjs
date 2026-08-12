@@ -848,7 +848,11 @@ const camVerifyRounds = [];
 if (CAMERA_VERIFY) {
   await setCap(undefined); // tier cap, UNPINNED — the lift can act
   for (let r = 0; r < 2; r++) {
-    await setCamLift(undefined);
+    // §12.47 flipped the default: the camera lift is OPT-IN now, so the
+    // "lift on" arm must set `true` explicitly. Leaving it `undefined` here
+    // would run TWO IDENTICAL ARMS and report the fix as "no effect" — the
+    // shape of null result this rig has produced before.
+    await setCamLift(true);
     await wait(300);
     await measure(0, false);
     const liftPan = await measure(0, false, { pan: { angle: CAM_ANGLE, cycles: 2 } });

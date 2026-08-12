@@ -7697,3 +7697,63 @@ page, and §13.14.6's conclusion stands: ≤1 s is architectural (boot a cheaper
 ray-hit rung and upgrade in the background), not reachable by trimming this
 kernel. What these buy is 58.8 s → plausibly the high teens, which is the
 difference between "the editor is broken" and "the editor is slow".
+
+### 12.47 THE CAMERA CAP LIFT WAS HALVING THE FRAME RATE — NOW OPT-IN
+
+User, 2026-08-12, after §12.46 shipped: "**30 fps on high when moving
+camera, 60 fps when still**." That is §12.46's pathology in the camera
+path, and it survived that fix because §12.46 only re-armed the LIGHT side.
+
+`syncCamera`'s camera lift is LEVEL-triggered — every frame with
+`posDelta > CAM_LIFT_POS` or `rotDelta > CAM_LIFT_ROT` re-pushes a 1200 ms
+hold — so the cap is lifted for the **whole duration** of any camera
+movement, not for a window after it. §12.42 priced uncapped deposit at
+~14 ms of a 21 ms deposit, so lifting it doubles GI cost, and a 60 fps
+still scene lands on 30 while the camera moves. The reported ratio is the
+mechanism's prediction exactly.
+
+**Rising-edge arming does NOT rescue this one**, unlike §12.46: a pan
+reveals cold blocks CONTINUOUSLY, so a one-shot burst at the start of the
+movement buys a 1.2 s hitch and then stops helping precisely while the pan
+is still revealing geometry. The honest choice is on-or-off, and the
+measurement decides it: §12.45.2 priced the benefit at **2.89 vs 3.40
+rev/px** on pan-holds — marginal against its own round spread — against a
+**halved frame rate during the single most common interaction in the
+editor**. So: OFF by default, `__giSrcCamCapLift = true` opts back in.
+
+⚠ The rig's `CAMERA_VERIFY` lift-on arm now sets `true` explicitly. Left as
+`undefined` it would run two identical arms and report the fix as "no
+effect" — the null-result shape this instrument has produced before.
+
+**The version worth building** is per-block: lift the cap for NEWLY
+ALLOCATED blocks only rather than globally, which is the same targeting
+§12.42's per-block α compensation already does. It needs the cap to stop
+being one global uniform first.
+
+#### 12.47.1 AND WHY §13.16's FIX (B) IS WITHDRAWN
+
+§13.16 proposed gating emitter slot compilation on the scene actually
+having an emissive surface, on the `_reflectionConsumerAppeared` precedent,
+worth 7.5 s of startup on this scene. **Withdrawn: it re-introduces the
+exact failure session 38 removed.** A scene that SPAWNS its first emissive
+object — the emissive-projectile game — would trigger a full GI rebuild
+mid-game, and "kills the slot-exhaustion MID-GAME FULL REBUILD" is
+precisely what that session's analytic-only path was built to achieve.
+Gating on project-wide emissive material assets rather than live meshes
+weakens the trigger without removing it (a prefab's material need not be in
+the scene graph before it spawns).
+
+So **fix (A), rolling the loop, is the only startup fix here** — it keeps
+the capability always compiled, so no rebuild can ever fire. Its constraint
+stands from §13.16: `neeIrradiance` needs every slot's `luma` for the
+importance CDF, and `luma` comes FROM the expensive `giEmitterFactor`. The
+way out is that importance sampling is unbiased under ANY positive weight
+function: use a CHEAP analytic proxy (colour luma × inverse square ×
+cosine gate, no shape functions) for the weights and evaluate the exact
+`E`/`maxT` for the PICKED slot only — one call each instead of four. That
+is a variance change, not a bias change, so it owes a variance A/B rather
+than an energy one. ⚠ Before building it, resolve why `main` holds EIGHT
+call sites and not four: `neeIrradiance` is called once, so the ×2 is a
+second inlining of the whole hit shader somewhere in the deposit, and if
+that inlining is itself removable it is a free 2× with no estimator change
+at all.
