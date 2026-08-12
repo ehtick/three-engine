@@ -632,6 +632,16 @@ async function runArm(arm) {
     compileSpans,
     stages,
     lines,
+    // ── THE NUMBER THE PERSON IN FRONT OF THE EDITOR IS COUNTING ────────────
+    //
+    // Everything else in this report is a span INSIDE GI. The user counts from
+    // the moment they open the project to the moment the scene is lit, and told
+    // me "still 12+ seconds" against a report that proudly said 4.0s — because
+    // 4.0s was GI's own bill and the other two thirds were never in the report
+    // at all. A startup instrument that cannot state the user's number is
+    // measuring the wrong thing no matter how precise it is.
+    userWait: end - marks.projectOpen,
+    projectOpen: marks.projectOpen,
     ttff: burstStart != null ? end - burstStart : null,
     // Kept so a contaminated reading is recognizable rather than invisible.
     sessionSpan: lines.length ? end - lines[0].at : null,
@@ -677,6 +687,39 @@ function report(r) {
   for (const [name, re, whenSeen, whenNot] of GATES) {
     const seen = (r.lines ?? []).some(({ t }) => re.test(t));
     console.log(`    ${name.padEnd(22)} ${seen ? whenSeen : whenNot}`);
+  }
+
+  // ── THE USER'S CLOCK, ITEMISED ────────────────────────────────────────────
+  //
+  // Project-open click → the scene is lit. Printed FIRST and in full, because
+  // every other number here is a slice of it and reporting only the slices is
+  // how a report can say "4.0s" to someone who is watching 12s go by. Segments
+  // are wall-clock consecutive, so they add up to the total by construction —
+  // no stage may be quoted without the ones on either side of it.
+  if (r.userWait != null && r.projectOpen != null) {
+    const at = (re) => r.lines?.find((l) => re.test(l.t))?.at ?? null;
+    // ⚠ SORTED BY TIME, NOT BY THE ORDER I EXPECT THEM IN. The first version
+    // walked a hand-written list and subtracted consecutive marks, which
+    // printed `field ready -2500ms  -20%` the moment the field finished DURING
+    // the compile wave instead of after it. A negative segment is the table
+    // telling you its model of the boot is wrong; sorting makes it report the
+    // order that actually happened, which is itself a finding worth seeing.
+    const marksList = [
+      ["GI module starts", r.lines?.[0]?.at],
+      ["scene assets ready", at(/scene assets ready after/)],
+      ["static shadow BVH done", at(/static shadow bvh:/)],
+      ["compile wave ends", at(/compile wave: materials \d+ms, computes/)],
+      ["field ready (scene is lit)", at(/field ready:/)],
+    ].filter(([, t]) => t != null).sort((a, b) => a[1] - b[1]);
+    console.log(`\n  ══ THE USER'S WAIT: ${ms(r.userWait)} ══  (project open → scene lit)`);
+    let prev = r.projectOpen;
+    for (const [name, t] of marksList) {
+      const d = t - prev;
+      const pct = (d / r.userWait) * 100;
+      console.log(`    → ${name.padEnd(32)} ${ms(d).padStart(9)}  ${pct.toFixed(0).padStart(3)}%  ` +
+        `${"█".repeat(Math.max(0, Math.round(pct / 2)))}`);
+      prev = t;
+    }
   }
 
   console.log("\n  ── STAGES, as the engine reports them ──");

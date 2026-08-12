@@ -123,15 +123,33 @@ function handle(cmd, args = {}, writableRoot = null) {
     case "read_text_file":
     case "load_scene":
       return fs.readFileSync(args.path, "utf8");
+    // ══ BASE64, NOT A NUMBER ARRAY ══════════════════════════════════════════
+    //
+    // This used to return `{ __bytes: [...buffer] }`. `exposeFunction` ships
+    // its result as JSON over CDP, so every byte became up to four characters
+    // of text ("255," ) built by Node, parsed by V8, and then walked AGAIN by
+    // `new Uint8Array(array)` — for a scene whose textures and .geom files run
+    // to tens of megabytes. The real Tauri command hands back raw bytes.
+    //
+    // It mattered far beyond "the harness is a bit slow". `probe:gi-boot`
+    // reported 4,745ms of "GI waits for scene assets" — 42% of an 11.4s boot,
+    // the largest single bar — and a CPU profile put 4.37s of self time in
+    // `createObjectURL`, i.e. in the blob built from those arrays. That number
+    // was the shim measuring itself, and it was about to be reported to the
+    // user as where their startup goes.
+    //
+    // Base64 is ~1.33 chars/byte instead of ~4, and the page-side decode is a
+    // native `fetch("data:…")` rather than a JS loop. The harness measures the
+    // engine again.
     case "read_binary_file":
-      return { __bytes: [...fs.readFileSync(args.path)] };
+      return { __b64: fs.readFileSync(args.path).toString("base64") };
     case "read_binary_file_head": {
       const fd = fs.openSync(args.path, "r");
       const max = Number(args.maxBytes ?? args.max_bytes ?? 65536);
       const buf = Buffer.alloc(max);
       const read = fs.readSync(fd, buf, 0, max, 0);
       fs.closeSync(fd);
-      return { __bytes: [...buf.subarray(0, read)] };
+      return { __b64: buf.subarray(0, read).toString("base64") };
     }
     case "file_size":
       return fs.statSync(args.path).size;
@@ -202,6 +220,17 @@ export async function installTauriShim(
         if (!ok) throw new Error(error);
         // `read_binary_file` resolves to an ArrayBuffer over the real IPC
         // channel; callers feed it straight to `new Blob([...])`.
+        //
+        // The base64 path decodes through a `data:` URL because that is the
+        // only NATIVE bytes-from-base64 route in a browser — `atob` returns a
+        // string that still has to be walked one char at a time in JS, which
+        // is the cost this encoding exists to avoid.
+        if (result && typeof result === "object" && typeof result.__b64 === "string") {
+          const res = await fetch(`data:application/octet-stream;base64,${result.__b64}`);
+          return await res.arrayBuffer();
+        }
+        // Legacy number-array form, kept so a harness pinned to an older shim
+        // keeps working rather than silently handing callers a plain object.
         if (result && typeof result === "object" && Array.isArray(result.__bytes)) {
           return new Uint8Array(result.__bytes).buffer;
         }
