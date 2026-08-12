@@ -39,7 +39,14 @@ try {
       `                 ${result.maxRays} rays of accumulated weight (${result.headroom}x headroom); ` +
       `${result.staleBins} stale bins discarded on reclaim\n` +
       `                 frame-to-frame variation fell ${result.varReduction}x against the ` +
-      `${result.varPredicted}x an EMA predicts; storage limit ${result.storageLimit}`);
+      `${result.varPredicted}x an EMA predicts; storage limit ${result.storageLimit}\n` +
+      `                 surprise: ${result.surpFired}/${result.surpBlocks} seeded blocks fired ` +
+      `(${result.surpExact} bit-exact vs the mirror, worst ${result.surpRel} relative), ` +
+      `noise ${result.surpNoise}/ray (${result.surpNoiseRatio}x the shot model), ` +
+      `${result.surpFpModel} false positives at the model sigma and ` +
+      `${result.surpFalsePositives}/6400 at the measured one\n` +
+      `                 detection at ${result.surpDetectAny} sigma, saturation at ` +
+      `${result.surpDetectFull} sigma, self-terminated ${result.surpTerminate} frames after the step`);
     code = 0;
   } else {
     console.error(`gi-src-temporal: FAIL — ${result?.error ?? `${result?.failures} checks`}`);

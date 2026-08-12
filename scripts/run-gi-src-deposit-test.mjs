@@ -36,7 +36,9 @@ try {
       `${result.binTies} direction ties, ${result.headroom}x fixed-point headroom, ` +
       `storage limit ${result.storageLimit}\n` +
       `                 blocks ${result.blocks} for ${result.liveProbes} live probes ` +
-      `(${result.binBytes}MB); starved run dropped ${result.starvedDropped} deposits`);
+      `(${result.binBytes}MB); starved run dropped ${result.starvedDropped} deposits\n` +
+      `                 per-block evidence: ${result.statBlocks} blocks summed ` +
+      `${result.statLuma} of shifted luma, exact against the walk`);
     code = 0;
   } else {
     console.error(`gi-src-deposit: FAIL — ${result?.error ?? `${result?.failures} checks`}`);

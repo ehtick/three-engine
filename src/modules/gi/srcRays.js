@@ -59,14 +59,39 @@ import {
   atomicLoad,
   atomicStore,
   float,
+  floatBitsToUint,
   instanceIndex,
   instancedArray,
   select,
+  sqrt,
   uint,
+  uintBitsToFloat,
 } from "three/tsl";
-import { CASCADE_COUNT } from "./srcConfig.js";
+import {
+  BSTAT_ACC_L,
+  BSTAT_ACC_W,
+  BSTAT_DRIFT,
+  BSTAT_SUM_L,
+  BSTAT_SUM_W,
+  BSTAT_WORDS,
+  CASCADE_COUNT,
+  COLD_CAP_SHIFT,
+  COLD_FILL_FRAMES,
+  SUM_SCALE,
+  SURPRISE_CAP_MIN,
+  SURPRISE_CAP_SHIFT,
+  SURPRISE_FLOOR,
+  SURPRISE_MIN_EVIDENCE,
+  SURPRISE_ONE,
+  SURPRISE_RATE,
+  SURPRISE_SHOT_K,
+  SURPRISE_T0,
+  SURPRISE_T1,
+} from "./srcConfig.js";
 import { transportPixel } from "./srcMathTsl.js";
 import {
+  COUNTER_BOOSTED,
+  COUNTER_WORDS,
   FLAG_ALIVE,
   INFLUX_ONE,
   PROBE_BLOCK,
@@ -132,6 +157,82 @@ export function createSrcRayStore(store, { pixelCount }) {
   };
 }
 
+/**
+ * One block's surprise advance, inlined into the [D1''] publish — the TSL twin
+ * of `srcMath.js`'s `blockSurpriseUpdate`, step for step and rounding for
+ * rounding. THEY ARE ONE DEFINITION and must change together (the contract
+ * `srcMathTsl.js`'s header states, for the reason it states: when the mirror
+ * and the kernel disagree, the mirror test goes green while the screen is
+ * wrong).
+ *
+ * Single-writer by construction — one probe owns one block, and this runs on
+ * that probe's thread — which is what lets three of the five words be plain f32
+ * bits read-modify-written rather than atomics.
+ */
+function publishSurprise(surprise, { freeStack, block, oldInfluxWord, stampB, surpriseB, statB }) {
+  const { scratch, keep, lift, gain, frameStamp, rayWeight } = surprise;
+  const sb = uint(statB).add(block.mul(uint(BSTAT_WORDS))).toVar();
+  // LAST frame's deposits: [E] fills these, the decay clears them, and both of
+  // those happen after this pass in the frame order.
+  const sL = float(atomicLoad(scratch.element(sb.add(uint(BSTAT_SUM_L))))).toVar();
+  const sW = float(atomicLoad(scratch.element(sb.add(uint(BSTAT_SUM_W))))).toVar();
+  const accL = uintBitsToFloat(atomicLoad(scratch.element(sb.add(uint(BSTAT_ACC_L))))).toVar();
+  const accW = uintBitsToFloat(atomicLoad(scratch.element(sb.add(uint(BSTAT_ACC_W))))).toVar();
+  const drift = uintBitsToFloat(atomicLoad(scratch.element(sb.add(uint(BSTAT_DRIFT))))).toVar();
+  const stamp = freeStack.element(uint(stampB).add(block)).toVar();
+  // A block claimed THIS frame carries a DEAD probe's belief. Discarded, not
+  // decayed: fading a stranger's mean in is exactly what would make the new
+  // owner's first real frame read as a surprise.
+  If(stamp.equal(frameStamp), () => {
+    accL.assign(float(0));
+    accW.assign(float(0));
+    drift.assign(float(0));
+  });
+  const age = frameStamp.sub(stamp).toVar();
+  // The rate the accumulators ACTUALLY decayed at last frame — `keep′` from the
+  // influx word this pass is about to overwrite. Structurally identical to
+  // `srcDeposit.js`'s compensation branch and to `keepCompensated`.
+  const kPrev = float(keep).toVar();
+  If(oldInfluxWord.lessThan(uint(INFLUX_ONE)).and(float(lift).lessThan(1.0)), () => {
+    const l = float(lift).toVar();
+    const ratio = float(oldInfluxWord).div(INFLUX_ONE).toVar();
+    const lifted = ratio.mul(float(1.0).sub(l)).add(l).toVar();
+    kPrev.assign(float(1.0).sub(float(1.0).sub(float(keep)).mul(lifted)));
+  });
+  // PRE-update mean — see the mirror's header for why folding this frame in
+  // first would mute the step being looked for.
+  const M = select(accW.greaterThan(float(0)), accL.div(accW.max(float(1e-20))), float(0)).toVar();
+  // ⚠ EVERY MULTIPLY-THEN-ADD IS SPLIT ACROSS A `toVar()`. WGSL permits a
+  // backend to contract `a·b + c` into a single-rounding fma, and the CPU
+  // mirror cannot reproduce a rounding the spec leaves to the compiler — so the
+  // intermediate is materialized. `srcMath.js`'s twin frounds at exactly these
+  // boundaries; the two lists must stay the same length.
+  const decL = accL.mul(kPrev).toVar();
+  const decW = accW.mul(kPrev).toVar();
+  accL.assign(decL.add(sL.div(float(SUM_SCALE))));
+  accW.assign(decW.add(sW.div(float(SUM_SCALE))));
+  const n = sW.div(float(rayWeight)).toVar();
+  const I = select(sW.greaterThan(float(0)), sL.div(sW.max(float(1e-20))), M).toVar();
+  const step = float(SURPRISE_RATE).mul(I.sub(M).sub(drift)).toVar();
+  drift.assign(drift.add(step));
+  const shot = M.mul(sqrt(float(SURPRISE_SHOT_K).div(n.max(float(1))))).toVar();
+  const noise = shot.add(float(SURPRISE_FLOOR)).toVar();
+  const u = drift.abs().div(noise).sub(float(SURPRISE_T0))
+    .div(float(SURPRISE_T1 - SURPRISE_T0)).clamp(0, 1).toVar();
+  If(accW.lessThan(float(SURPRISE_MIN_EVIDENCE))
+    .or(n.lessThanEqual(float(0)))
+    .or(age.lessThan(uint(COLD_FILL_FRAMES))), () => { u.assign(float(0)); });
+  // THE GOVERNOR, APPLIED ONCE — srcConfig's one-switch rule. Both consumers
+  // read the word written below, so `gain = 0` is `u = 0` is "the decay skips
+  // its branch AND [D1'] never exempts", with no second place to disagree.
+  u.assign(u.mul(float(gain)));
+  atomicStore(scratch.element(sb.add(uint(BSTAT_ACC_L))), floatBitsToUint(accL));
+  atomicStore(scratch.element(sb.add(uint(BSTAT_ACC_W))), floatBitsToUint(accW));
+  atomicStore(scratch.element(sb.add(uint(BSTAT_DRIFT))), floatBitsToUint(drift));
+  freeStack.element(uint(surpriseB).add(block))
+    .assign(uint(u.mul(float(SURPRISE_ONE)).add(0.5).floor()));
+}
+
 /** Is this probe index alive? The one spelling, so no pass invents a second. */
 function probeAlive(probeTable, probe) {
   return probeTable
@@ -161,14 +262,51 @@ function probeAlive(probeTable, probe) {
  *   multiple of `raysPerPixel` — see [D1'] and the [D5] denial. Omitted, the
  *   frame is bit-identical to the uncapped build, which is where every gate
  *   written before the cap runs.
+ * @param {object} [options.capBoost]  the CAP EXEMPTION bundle — [D1'] only.
+ *   `{ frameStamp, boostEnable, counters }`, all uniforms/nodes. With it, a
+ *   probe whose block is COLD (claimed within `COLD_FILL_FRAMES`) or SURPRISED
+ *   (`u ≥ SURPRISE_CAP_MIN`) gets `cap << shift` instead of `cap`. Omitted, NOT
+ *   ONE NODE OF IT IS BUILT and [D1'] is byte-identical to the plain clamp —
+ *   which is where ARMs 8 and 9 of `test:gi-src-rays` run.
+ *
+ *   ⚠ IT EDITS [D1'] AND NOTHING ELSE, AND THAT IS LOAD-BEARING. [D5]'s denial
+ *   tests against `probeTable[PROBE_RAYS]`, which [D4] copies from the ALREADY
+ *   CLAMPED `rayCount` — one clamp, four consumers. [D5] therefore never has to
+ *   learn that a block is exempt, and an exemption cannot desynchronize the
+ *   partition from the handout.
+ * @param {object} [options.surprise]  the SURPRISE PUBLISH bundle — the [D1'']
+ *   leg that advances each block's statistics and writes its `u` word.
+ *   `{ scratch, statBase, keep, lift, gain, frameStamp, rayWeight }`. Requires
+ *   `cap` (it rides the publish dispatch, which only exists under a cap).
+ *   Omitted, not a node of it is built and the publish is byte-identical to the
+ *   influx-only version. `rayWeight` is what ONE deposit adds to the block's
+ *   weight sum (`DEPOSIT_SCALE >> SUM_SHIFT`), passed in rather than imported
+ *   so this module stays independent of the deposit's fixed point.
  */
 export function createSrcRayFrame(
-  store, rays, { pixelProbe, raysPerPixel = 1, stride = null, phase = null, threads = 0, cap = null } = {},
+  store, rays, {
+    pixelProbe, raysPerPixel = 1, stride = null, phase = null, threads = 0, cap = null,
+    capBoost = null, surprise = null,
+  } = {},
 ) {
-  const { probeTable, probeTotal, cascades } = store;
+  const { probeTable, probeTotal, cascades, freeStack } = store;
   const { rayCount, rayCursor, rayTotal, pixelRayBase, rayWork, pixelCount } = rays;
   const N = store.cascadeCount ?? CASCADE_COUNT;
   const top = cascades[N - 1];
+  if (surprise && !cap) {
+    throw new Error(
+      "createSrcRayFrame: the surprise publish rides [D1''], which only exists under a `cap`",
+    );
+  }
+  // A NaN or fractional `rayWeight` makes `n` (deposits this frame) garbage and
+  // the σ estimate with it — silently, because every downstream value is still
+  // a finite float. Same class as the `blockBase` NaN in `srcDeposit.js`.
+  if (surprise && !(Number.isInteger(surprise.rayWeight) && surprise.rayWeight > 0)) {
+    throw new Error(
+      `createSrcRayFrame: the surprise bundle needs a positive integer rayWeight, got ` +
+      `${surprise.rayWeight}`,
+    );
+  }
 
   // ══ THE RAY CEILING — A SMALLER DISPATCH, NOT A SKIPPED ONE ════════════════
   //
@@ -265,8 +403,33 @@ export function createSrcRayFrame(
   //
   // c0 only. Upper cascades hold SUMS of capped children — capping them again
   // would be a second, different budget with no owner.
+  //
+  // ── THE EXEMPTION (`capBoost`) ────────────────────────────────────────────
+  //
+  // A steady-state budget priced on probes whose bins converged long ago, and
+  // two kinds of block for which that pricing is simply wrong:
+  //
+  //   COLD      claimed within COLD_FILL_FRAMES. Its accumulators are zero, so
+  //             its first frames ARE its estimate and there is no steady state
+  //             to be economical about. `cap << COLD_CAP_SHIFT` (×4), paid once
+  //             per block rather than per frame.
+  //   SURPRISED its own deposits say the block's truth moved (`srcConfig`'s
+  //             SURPRISE block). `cap << SURPRISE_CAP_SHIFT` (×2), for as long
+  //             as the drift stays above the σ ramp — self-terminating, because
+  //             the evidence it buys is what collapses the drift.
+  //
+  // SHIFT, NEVER MULTIPLY. `cap` is floored to a multiple of `raysPerPixel`
+  // (srcConfig.srcProbeRayCap) and [D5] hands out WHOLE per-pixel slices; a
+  // non-multiple `capEff` would leave the tail of every exempted probe's
+  // segment allocated-but-unclaimed, which the coverage gate reads as lost
+  // rays. A shift preserves the multiple for free; a `×1.5` would not.
   if (cap) {
     const c0 = cascades[0];
+    const stampBase0 = capBoost ? store.blockStampBase + c0.blockBase : 0;
+    const surpriseBase0 = capBoost ? store.blockSurpriseBase + c0.blockBase : 0;
+    if (capBoost && (!Number.isInteger(stampBase0) || !Number.isInteger(surpriseBase0))) {
+      throw new Error("createSrcRayFrame: cascade 0 has no stamp/surprise base for the cap boost");
+    }
     passes.push(Fn(() => {
       const i = instanceIndex.add(uint(c0.probeBase)).toVar();
       const n = atomicLoad(rayCount.element(i)).toVar();
@@ -275,8 +438,43 @@ export function createSrcRayFrame(
       // capped/natural per probe ([D1''] below), and after this store the
       // natural value exists nowhere else.
       atomicStore(rayCursor.element(i), n);
-      If(n.greaterThan(uint(cap)), () => {
-        atomicStore(rayCount.element(i), uint(cap));
+      if (!capBoost) {
+        If(n.greaterThan(uint(cap)), () => {
+          atomicStore(rayCount.element(i), uint(cap));
+        });
+        return;
+      }
+      const block = probeTable.element(i.mul(PROBE_WORDS).add(PROBE_BLOCK)).toVar();
+      const shift = uint(0).toVar();
+      If(block.notEqual(uint(SLOT_EMPTY)).and(capBoost.boostEnable.equal(uint(1))), () => {
+        // u32 wrap is the arithmetic, not an accident: the stamp counter wraps
+        // at 2^32 and `frameStamp − stamp` stays correct across the wrap for
+        // every age this test cares about.
+        const age = capBoost.frameStamp.sub(freeStack.element(uint(stampBase0).add(block))).toVar();
+        If(age.lessThan(uint(COLD_FILL_FRAMES)), () => {
+          shift.assign(uint(COLD_CAP_SHIFT));
+        }).Else(() => {
+          // ONE FRAME STALE, DELIBERATELY. The word this reads was published by
+          // [D1''] on the PREVIOUS frame from the frame before that's deposits
+          // — the publish runs after this pass in the same frame, and closing
+          // the loop inside one frame would need a barrier between two passes
+          // that are already ordered the other way. A surprise that begins one
+          // frame late is a frame of the ramp, not a wrong answer.
+          If(freeStack.element(uint(surpriseBase0).add(block))
+            .greaterThanEqual(uint(SURPRISE_CAP_MIN)), () => {
+            shift.assign(uint(SURPRISE_CAP_SHIFT));
+          });
+        });
+      });
+      If(shift.greaterThan(uint(0)), () => {
+        atomicAdd(
+          capBoost.counters.element(uint(c0.cascade * COUNTER_WORDS + COUNTER_BOOSTED)),
+          uint(1),
+        );
+      });
+      const capEff = uint(cap).shiftLeft(shift).toVar();
+      If(n.greaterThan(capEff), () => {
+        atomicStore(rayCount.element(i), capEff);
       });
     })().compute(c0.probeCapacity));
   }
@@ -322,8 +520,17 @@ export function createSrcRayFrame(
   // everywhere, and every word is exactly INFLUX_ONE — the decay's
   // compensation branch never fires and the build is behaviourally the
   // uncapped one, same statement [D1'] makes.
+  //
+  // ── AND THE SURPRISE STATE, ON THE SAME THREAD (`surprise`) ───────────────
+  //
+  // The publish is already "the one thread that owns this block", which is what
+  // a read-modify-write of the block's f32 belief needs — so the statistics
+  // advance HERE rather than in a dispatch of their own. It runs BEFORE the
+  // influx word is overwritten, because the rate the accumulators actually
+  // decayed at last frame is `keepCompensated(keep, THAT word, lift)`, and
+  // after the overwrite that number exists nowhere.
   if (cap) {
-    const { freeStack, blockInfluxBase } = store;
+    const { blockInfluxBase } = store;
     for (let c = 1; c < N; c++) {
       const child = cascades[c - 1];
       passes.push(Fn(() => {
@@ -337,11 +544,24 @@ export function createSrcRayFrame(
     for (let c = 0; c < N; c++) {
       const info = cascades[c];
       const base = blockInfluxBase + info.blockBase;
+      const stampB = surprise ? store.blockStampBase + info.blockBase : 0;
+      const surpriseB = surprise ? store.blockSurpriseBase + info.blockBase : 0;
+      const statB = surprise ? surprise.statBase + BSTAT_WORDS * info.blockBase : 0;
+      if (surprise && !(Number.isInteger(stampB) && Number.isInteger(surpriseB)
+        && Number.isInteger(statB))) {
+        throw new Error(`createSrcRayFrame: cascade ${c} has no block base for the surprise publish`);
+      }
       passes.push(Fn(() => {
         const i = instanceIndex.add(uint(info.probeBase)).toVar();
         const block = probeTable.element(i.mul(PROBE_WORDS).add(PROBE_BLOCK)).toVar();
         If(block.equal(uint(SLOT_EMPTY)), () => { Return(); });
         const slot = freeStack.element(uint(base).add(block));
+        // ⚠ `slot.toVar()` SNAPSHOTS THE OLD WORD, and the order is the point:
+        // the influx branch below overwrites it, and `keepPrev` needs the one
+        // the decay actually used last frame.
+        if (surprise) publishSurprise(surprise, {
+          freeStack, block, oldInfluxWord: slot.toVar(), stampB, surpriseB, statB,
+        });
         const natural = atomicLoad(rayCursor.element(i)).toVar();
         If(natural.equal(uint(0)), () => {
           slot.assign(uint(INFLUX_ONE));

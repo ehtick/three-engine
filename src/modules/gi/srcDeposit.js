@@ -122,9 +122,14 @@ import {
   vec3,
 } from "three/tsl";
 import {
+  BSTAT_SUM_L,
+  BSTAT_SUM_W,
+  BSTAT_WORDS,
   CASCADE_COUNT,
   MAX_LODS,
   SECONDARY_HIT_WORDS,
+  SUM_SHIFT,
+  SURPRISE_ONE,
   W0,
   binCount,
   binGridWidth,
@@ -365,27 +370,40 @@ export function createSrcBinStore(store, {
     });
     binTotal += bins * c.blockCapacity;
   }
-  // The bins, then [J]'s hit list — one buffer, in that order, so every bin
-  // index keeps the address it had before the tail existed. `hitListBase` is
-  // the count word; entries start one word after it.
+  // The bins, then [J]'s hit list, then the per-block statistics — one buffer,
+  // in that order, so every bin index keeps the address it had before the tails
+  // existed. `hitListBase` is the count word; entries start one word after it.
+  //
+  // ── AND WHY THE STATISTICS RIDE HERE RATHER THAN GETTING A BUFFER ────────
+  //
+  // [E] is the pass that fills them (one atomicAdd pair per deposit) and [E] is
+  // at 8 of the portable 8 storage buffers in the profiled ray-hit config. A
+  // ninth binding does not fail loudly: the pipeline fails VALIDATION and the
+  // kernel silently never dispatches (§12.44.1 — the smoke read zero deposits
+  // against a full worklist for exactly as long as anyone waited). So the
+  // record rides `scratch`, which [E] already binds, exactly as [J]'s hit list
+  // does and for the same measured reason.
   const binWords = binTotal * BIN_WORDS;
   const hitCapacity = Math.max(0, Math.floor(secondaryCapacity));
   const hitListBase = binWords;
   const hitWords = hitCapacity > 0 ? 1 + hitCapacity * SEC_HIT_WORDS : 0;
-  const scratchBytes = (binWords + hitWords) * 4;
+  const blockStatBase = hitListBase + hitWords;
+  const statWords = store.blockTotal * BSTAT_WORDS;
+  const scratchBytes = (binWords + hitWords + statWords) * 4;
   const payloadBytes = binTotal * PAYLOAD_WORDS * 4;
   if (scratchBytes > maxBytes || payloadBytes > maxBytes) {
     throw new Error(
       `createSrcBinStore: ${(binTotal / 1e6).toFixed(2)}M bins needs ` +
       `${(scratchBytes / 1048576).toFixed(0)}MB of scratch (including ` +
-      `${(hitWords * 4 / 1048576).toFixed(0)}MB of [J] hit list) and ` +
+      `${(hitWords * 4 / 1048576).toFixed(0)}MB of [J] hit list and ` +
+      `${(statWords * 4 / 1048576).toFixed(0)}MB of per-block statistics) and ` +
       `${(payloadBytes / 1048576).toFixed(0)}MB of payload, past the ` +
       `${(maxBytes / 1048576).toFixed(0)}MB storage-buffer binding limit — ` +
       "lower srcConfig's BIN_BUDGET, which is what sizes the block pool",
     );
   }
 
-  const scratch = instancedArray(new Uint32Array(binWords + hitWords), "uint").toAtomic();
+  const scratch = instancedArray(new Uint32Array(binWords + hitWords + statWords), "uint").toAtomic();
   const payload = instancedArray(new Float32Array(binTotal * PAYLOAD_WORDS), "float");
   const stats = instancedArray(new Uint32Array(STAT_WORDS), "uint").toAtomic();
 
@@ -399,6 +417,12 @@ export function createSrcBinStore(store, {
     /** [J]'s region. `hitCapacity` 0 means the tail was not allocated. */
     hitListBase,
     hitCapacity,
+    /**
+     * Where the per-block statistics start in `scratch` — `BSTAT_WORDS` per
+     * block, indexed by the GLOBAL block index (`blockBase[c] + block`), the
+     * same addressing the claim stamps and influx words use in `freeStack`.
+     */
+    blockStatBase,
     bytes: scratchBytes + payloadBytes + STAT_WORDS * 4,
     dispose() {
       for (const b of [scratch, payload, stats]) b?.value?.dispose?.();
@@ -462,6 +486,17 @@ export function createSrcBinStore(store, {
  *   which is a property of the signal, not of this pass. Omitted, the branch
  *   is not built and the decay is byte-identical to the pre-compensation
  *   kernel — where every gate written before it runs.
+ * @param {object} [options.surprise]  the per-block surprise bundle
+ *   (`srcConfig.js`'s SURPRISE block). Two effects, both optional together:
+ *   [E] sums each deposit's luma and weight into the block's `BSTAT` record,
+ *   and the DECAY reads the block's surprise word `u` and mixes `keep′` toward
+ *   `surpriseF`. Omitted, NOT ONE NODE OF EITHER IS BUILT and both kernels are
+ *   byte-identical to the pre-surprise build — the discipline `secondary`
+ *   above already runs under, and what keeps every gate written before this
+ *   comparable rather than merely passing.
+ *   `{ statBase, surpriseF }`, where `statBase` must be the store's
+ *   `blockStatBase` and `surpriseF` is a uniform ≥ 1 (`1` = no acceleration,
+ *   which srcSystem uses when α is pinned).
  */
 export function createSrcDepositFrame(store, bins, {
   pixelProbe,
@@ -481,6 +516,7 @@ export function createSrcDepositFrame(store, bins, {
   keep = null,
   frameStamp = null,
   influxLift = null,
+  surprise = null,
   rayWork = null,
   maxLods = MAX_LODS,
   stride = null,
@@ -502,6 +538,27 @@ export function createSrcDepositFrame(store, bins, {
         `${bins.hitListBase}, capacity ${bins.hitCapacity}) — the store must be ` +
         "built with `secondaryCapacity` before the deposit can append to it",
       );
+    }
+  }
+  // Same rule as [J]'s base: the statistics are a REGION of the buffer this
+  // kernel writes bins into, so a base that disagrees with the store's would
+  // corrupt real bins at an index nothing else in the frame produces.
+  if (surprise) {
+    if (surprise.statBase !== bins.blockStatBase) {
+      throw new Error(
+        `createSrcDepositFrame: the surprise bundle's statBase ${surprise.statBase} does ` +
+        `not match the bin store's ${bins.blockStatBase}`,
+      );
+    }
+    // A NaN base compiles, runs, and scatters atomics into the BIN region —
+    // the `blockBase` precedent one function up, which spent a round of the
+    // temporal gate indexing `freeStack[NaN]`. Cheap to make impossible.
+    for (const info of bins.cascades) {
+      if (!Number.isInteger(surprise.statBase + BSTAT_WORDS * info.blockBase)) {
+        throw new Error(
+          `createSrcDepositFrame: cascade ${info.cascade} has no block base for its statistics`,
+        );
+      }
     }
   }
   const N = store.cascadeCount ?? CASCADE_COUNT;
@@ -582,8 +639,17 @@ export function createSrcDepositFrame(store, bins, {
         if (influxLift && !Number.isInteger(influxB)) {
           throw new Error(`createSrcDepositFrame: cascade ${info.cascade} has no influx base`);
         }
+        const surpriseB = store.blockSurpriseBase + info.blockBase;
+        if (surprise && !Number.isInteger(surpriseB)) {
+          throw new Error(`createSrcDepositFrame: cascade ${info.cascade} has no surprise base`);
+        }
         If(i.greaterThanEqual(uint(lo)).and(i.lessThan(uint(hi))), () => {
           const block = i.sub(uint(lo)).div(uint(info.bins)).toVar();
+          // The ratio the compensation multiplied `1−keep` by, 1 when the
+          // branch below is skipped. Hoisted only when the surprise mix needs
+          // something to interpolate FROM; without the bundle this var does
+          // not exist and the emitted decay is byte-identical.
+          const lifted = surprise ? float(1).toVar() : null;
           // ── the α compensation (§12.40.4) — BEFORE the stamp check, which
           // must win: a freshly claimed block is zeroed whatever its (stale)
           // influx word says; the reverse order would turn `k = 0` back into
@@ -602,8 +668,35 @@ export function createSrcDepositFrame(store, bins, {
             If(infl.lessThan(uint(INFLUX_ONE)).and(float(influxLift).lessThan(1.0)), () => {
               const lift = float(influxLift).toVar();
               const ratio = float(infl).div(INFLUX_ONE).toVar();
-              const lifted = ratio.mul(float(1.0).sub(lift)).add(lift).toVar();
-              k.assign(float(1.0).sub(float(1.0).sub(k).mul(lifted)));
+              const l = ratio.mul(float(1.0).sub(lift)).add(lift).toVar();
+              if (lifted) lifted.assign(l);
+              k.assign(float(1.0).sub(float(1.0).sub(k).mul(l)));
+            });
+          }
+          // ── SURPRISE: A BLOCK WHOSE TRUTH MOVED FORGETS FASTER ──────────
+          //
+          // `keep′ = 1 − (1−keep)·mix(lifted, surpriseF, u)` — from THIS
+          // block's own compensated rate at u = 0 to the fast-α rate at u = 1.
+          // Written against `keep` and `lifted` rather than against the `k` the
+          // branch above produced, so the two mechanisms compose instead of the
+          // second one re-compensating the first one's answer.
+          //
+          // `u == 0` SKIPS THE WHOLE BRANCH, which is the compatibility claim
+          // and not an arithmetic identity: the surprise words init to zero and
+          // a build with nothing publishing them decays bit-for-bit as before
+          // (the `INFLUX_ONE` skip above is the same move for the same reason).
+          //
+          // Before the stamp check, which must win — a freshly claimed block is
+          // zeroed whatever its (stale) surprise word says.
+          if (surprise) {
+            const u = freeStack.element(uint(surpriseB).add(block)).toVar();
+            If(u.greaterThan(uint(0)), () => {
+              const t = float(u).div(float(SURPRISE_ONE)).toVar();
+              // WGSL `mix(a,b,t)` written out — the mirror (`keepCompensated`)
+              // must reproduce this rounding, and `a + (b−a)·t` does not.
+              const f = lifted.mul(float(1.0).sub(t))
+                .add(float(surprise.surpriseF).mul(t)).toVar();
+              k.assign(float(1.0).sub(float(1.0).sub(float(keep)).mul(f)));
             });
           }
           const stamp = freeStack.element(uint(base).add(block)).toVar();
@@ -616,6 +709,22 @@ export function createSrcDepositFrame(store, bins, {
       atomicStore(e, uint(floor(float(atomicLoad(e)).mul(k).add(0.5))));
     }
     If(i.lessThan(uint(STAT_WORDS)), () => { atomicStore(stats.element(i), uint(0)); });
+    // ── the per-block SUM words, cleared beside the stats ───────────────────
+    //
+    // ONLY the two SUM words. `ACC_L`/`ACC_W`/`DRIFT` are the block's
+    // persistent belief and clearing them here would reset the statistic every
+    // frame — the mechanism would never accumulate enough evidence to say
+    // anything, and it would look exactly like a scene that is never
+    // surprising. The frame order is what makes this the right pass: the
+    // publish ([D1''], srcRays) reads LAST frame's sums BEFORE this decay runs,
+    // so a clear here is a clear of already-consumed evidence.
+    if (surprise) {
+      If(i.lessThan(uint(store.blockTotal)), () => {
+        const s = uint(surprise.statBase).add(i.mul(uint(BSTAT_WORDS))).toVar();
+        atomicStore(scratch.element(s.add(uint(BSTAT_SUM_L))), uint(0));
+        atomicStore(scratch.element(s.add(uint(BSTAT_SUM_W))), uint(0));
+      });
+    }
     // [J]'s hit list is a WITHIN-FRAME structure — every entry carries a bin
     // slot that stops meaning anything the moment [C] re-claims blocks — so its
     // count is cleared here, in the pass that already runs first and already
@@ -799,6 +908,15 @@ export function createSrcDepositFrame(store, bins, {
         unit.z.clamp(0, 1).mul(DEPOSIT_SCALE).add(0.5).floor().toUint().toVar(),
       ];
 
+      // The ray's luma in the SAME fixed point the RGB words carry, shifted
+      // into the sum's scale ONCE per ray rather than per cascade — the shift
+      // is what keeps a top-cascade block's whole-frame sum clear of u32 (the
+      // `SUM_SHIFT` docstring carries the arithmetic).
+      const lumaFx = surprise
+        ? float(fx[0]).mul(0.2126).add(float(fx[1]).mul(0.7152)).add(float(fx[2]).mul(0.0722))
+          .toUint().shiftRight(uint(SUM_SHIFT)).toVar()
+        : null;
+
       atomicAdd(stats.element(uint(STAT_RAYS)), uint(1));
       atomicAdd(stats.element(uint(STAT_HITS)), select(hit, uint(1), uint(0)));
       atomicAdd(stats.element(uint(STAT_CLAMPED)), select(clamped, uint(1), uint(0)));
@@ -852,6 +970,23 @@ export function createSrcDepositFrame(store, bins, {
           });
           atomicAdd(scratch.element(slot.add(uint(BIN_COUNT))), uint(DEPOSIT_SCALE));
           atomicAdd(stats.element(uint(STAT_DEPOSITS)), uint(1));
+          // ── the block's evidence, beside its bins ──────────────────────
+          //
+          // CLEAR (transmittance-only) deposits carry ZERO luma but still add
+          // their WEIGHT, and that asymmetry is the whole point: a mover
+          // crossing in front of a wall turns radiance deposits into clear
+          // ones, so the block's mean luma FALLS and the statistic sees an
+          // occlusion change no radiance-only sum could. `own` is what
+          // separates them, and it is the same test the branch above makes.
+          if (surprise) {
+            const sb = uint(surprise.statBase + BSTAT_WORDS * info.blockBase)
+              .add(blk.mul(uint(BSTAT_WORDS))).toVar();
+            atomicAdd(
+              scratch.element(sb.add(uint(BSTAT_SUM_L))),
+              select(int(c).lessThan(own), uint(0), lumaFx),
+            );
+            atomicAdd(scratch.element(sb.add(uint(BSTAT_SUM_W))), uint(DEPOSIT_SCALE >> SUM_SHIFT));
+          }
         });
       }
 

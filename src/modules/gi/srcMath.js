@@ -14,7 +14,19 @@
 //
 // docs/GI_SRC_REBUILD_PLAN.md §2 items 2, 3, 5, 7, 8; §4.2.
 
-import { INFLUX_ONE, KEY_MAX_LODS } from "./srcConfig.js";
+import {
+  COLD_FILL_FRAMES,
+  INFLUX_ONE,
+  KEY_MAX_LODS,
+  SUM_SCALE,
+  SURPRISE_FLOOR,
+  SURPRISE_MIN_EVIDENCE,
+  SURPRISE_ONE,
+  SURPRISE_RATE,
+  SURPRISE_SHOT_K,
+  SURPRISE_T0,
+  SURPRISE_T1,
+} from "./srcConfig.js";
 
 // ═══════════════════════════════════════════════ EQUAL-AREA CYLINDRICAL BINS
 //
@@ -470,12 +482,97 @@ export function decayFixed(x, keep) {
  * `influx/(1−keep′)` is held at its uncapped value at lift 0, and interpolates
  * back to the plain decay as the motion lift rises.
  */
-export function keepCompensated(keep, influxWord, lift) {
+export function keepCompensated(keep, influxWord, lift, surpriseWord = 0, surpriseF = 1) {
   const l = Math.fround(lift);
-  if (!(influxWord < INFLUX_ONE) || !(l < 1)) return keep;
-  const ratio = Math.fround(influxWord / INFLUX_ONE);
-  const lifted = Math.fround(Math.fround(ratio * Math.fround(1 - l)) + l);
-  return Math.fround(1 - Math.fround(Math.fround(1 - Math.fround(keep)) * lifted));
+  const compensated = influxWord < INFLUX_ONE && l < 1;
+  // The ratio the compensation branch multiplied by — 1 when the branch is
+  // skipped, which is what the kernel's `lifted` var holds there. The surprise
+  // mix interpolates FROM this, so the two mechanisms compose instead of the
+  // later one discarding the earlier one's answer.
+  let lifted = 1;
+  let k = keep;
+  if (compensated) {
+    const ratio = Math.fround(influxWord / INFLUX_ONE);
+    lifted = Math.fround(Math.fround(ratio * Math.fround(1 - l)) + l);
+    k = Math.fround(1 - Math.fround(Math.fround(1 - Math.fround(keep)) * lifted));
+  }
+  // `u == 0` returns the compensated keep UNTOUCHED rather than computing
+  // `mix(lifted, F, 0)`: the kernel skips the branch, so this is the same
+  // skip and not an arithmetic identity that happens to agree.
+  if (!(surpriseWord > 0)) return k;
+  const t = Math.fround(surpriseWord / SURPRISE_ONE);
+  // WGSL's `mix(a, b, t)` is `a·(1−t) + b·t`. Written out rather than as
+  // `a + (b−a)·t`, which is a different rounding and would drift from the
+  // kernel by an ulp at exactly the values a gate would call equal.
+  const f = Math.fround(
+    Math.fround(lifted * Math.fround(1 - t)) + Math.fround(Math.fround(surpriseF) * t),
+  );
+  return Math.fround(1 - Math.fround(Math.fround(1 - Math.fround(keep)) * f));
+}
+
+/**
+ * One block's surprise state advance — the mirror of the [D1''] publish's
+ * per-block leg (`srcRays.js`), `Math.fround` at every step the GPU rounds at.
+ *
+ * ══ WHAT IS BEING MEASURED, AND WHY IT IS A DRIFT AND NOT A DIFFERENCE ══════
+ *
+ * `I` is THIS frame's mean luma per unit weight; `M` is the accumulator's mean
+ * BEFORE this frame lands. Their difference is one noisy sample of "the block's
+ * truth moved", and comparing it against a threshold directly would fire on
+ * shot noise every time a sparse block happened to draw a bright ray. So the
+ * difference feeds a SIGNED EMA (`drift`): noise cancels across frames because
+ * its sign is symmetric, while a real change is one-signed and accumulates.
+ * That is the entire reason surprise is not `|I − M| > k·σ`.
+ *
+ * `noise` is the shot-noise scale of `M` at `n` deposits, floored so a block
+ * whose mean is zero does not have zero σ. `u` is where `|drift|/noise` sits on
+ * the T0→T1 σ ramp, zeroed while the block has too little evidence to have a
+ * mean at all, and finally scaled by the governor's gain — ONCE, here, because
+ * both consumers read the word this writes (srcConfig's one-switch rule).
+ *
+ * @param {{accL: number, accW: number, drift: number}} state  the block's f32 words
+ * @param {{sumL: number, sumW: number}} sums  LAST frame's [E] deposits, in
+ *   `SUM_SCALE` fixed point
+ * @param {number} keepPrev  the block's own `keepCompensated` from the influx
+ *   word it published LAST frame — the accumulators decayed at that rate, so
+ *   this must too, or the mean drifts against its own history
+ * @param {object} [opts]
+ * @param {number} [opts.gain]  the governor's `surpriseGain`
+ * @param {number} [opts.age]  frames since the block was claimed
+ * @param {number} [opts.rayWeight]  what one deposit adds to `sumW`
+ *   (`DEPOSIT_SCALE / SUM_SCALE`) — passed in rather than imported, because
+ *   `DEPOSIT_SCALE` lives in a module that imports `three` and this one may not
+ * @param {boolean} [opts.reclaimed]  the block was claimed THIS frame, so the
+ *   state belongs to a DEAD probe and is discarded rather than decayed
+ */
+export function blockSurpriseUpdate(state, sums, keepPrev, opts = {}) {
+  const { gain = 1, age = Infinity, rayWeight = 64, reclaimed = false } = opts;
+  const k = Math.fround(keepPrev);
+  const sL = Math.fround(sums?.sumL ?? 0);
+  const sW = Math.fround(sums?.sumW ?? 0);
+  let accL = reclaimed ? 0 : Math.fround(state?.accL ?? 0);
+  let accW = reclaimed ? 0 : Math.fround(state?.accW ?? 0);
+  let drift = reclaimed ? 0 : Math.fround(state?.drift ?? 0);
+  // PRE-update mean. Taken before the new sums land, because the question is
+  // whether THIS frame surprised the history — folding it in first would make
+  // every frame partly its own baseline and mute exactly the step being
+  // looked for.
+  const M = accW > 0 ? Math.fround(accL / accW) : 0;
+  accL = Math.fround(Math.fround(accL * k) + Math.fround(sL / SUM_SCALE));
+  accW = Math.fround(Math.fround(accW * k) + Math.fround(sW / SUM_SCALE));
+  const n = Math.fround(sW / rayWeight);
+  const I = sW > 0 ? Math.fround(sL / sW) : M;
+  drift = Math.fround(drift + Math.fround(SURPRISE_RATE * Math.fround(Math.fround(I - M) - drift)));
+  const noise = Math.fround(
+    Math.fround(M * Math.fround(Math.sqrt(Math.fround(SURPRISE_SHOT_K / Math.max(n, 1)))))
+    + SURPRISE_FLOOR,
+  );
+  const z = Math.fround(Math.abs(drift) / noise);
+  let u = Math.fround(Math.fround(z - SURPRISE_T0) / (SURPRISE_T1 - SURPRISE_T0));
+  u = Math.min(1, Math.max(0, u));
+  if (accW < SURPRISE_MIN_EVIDENCE || !(n > 0) || age < COLD_FILL_FRAMES) u = 0;
+  u = Math.fround(u * Math.fround(gain));
+  return { accL, accW, drift, u, word: Math.floor(Math.fround(u * SURPRISE_ONE + 0.5)) };
 }
 
 /**

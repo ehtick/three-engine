@@ -203,6 +203,16 @@ export const COUNTER_ATTEMPTS = 4;
  * it off the screen.
  */
 export const COUNTER_NOBLOCK = 5;
+/**
+ * c0 probes [D1'] exempted from the ray cap this frame (cold fill or surprise).
+ *
+ * One of the four spare words rather than a buffer of its own, for the reason
+ * the block above gives about every counter here. It is the ONLY readback that
+ * separates "the exemption never fired" from "it fired and bought nothing" —
+ * both render identically, and a boost that silently stopped arming is exactly
+ * the failure the cold guard and the governor can produce between them.
+ */
+export const COUNTER_BOOSTED = 6;
 
 // ═════════════════════════════════════════════════════════ THE WGSL ISLAND
 
@@ -467,8 +477,22 @@ export function createSrcProbeStore({
   // Initialized to INFLUX_ONE — "uncapped" — so an unpublished block decays
   // bit-identically to the pre-compensation build.
   const influxBase = stampBase + blockTotal;
-  const freeInit = new Uint32Array(influxBase + blockTotal);
-  freeInit.fill(INFLUX_ONE, influxBase);
+  // ── AND A FIFTH: THE PER-BLOCK SURPRISE WORDS ────────────────────────────
+  //
+  // `SURPRISE_ONE` fixed point, one plain u32 per block, indexed
+  // `surpriseBase + blockBase[c] + block` exactly as the stamps and the influx
+  // words are. Written by Alg. 3's publish pass (srcRays.js, built only when a
+  // surprise bundle is passed), read by the DECAY (a surprised block forgets
+  // faster) and by [D1'] (a surprised block's probe is exempted from the cap).
+  //
+  // ZERO-FILLED, and that is the whole compatibility argument: `u = 0` makes
+  // the decay skip its surprise branch entirely and the cap exemption never
+  // arm, so a build that publishes nothing here is bit-for-bit the build
+  // before the mechanism existed — the same statement `INFLUX_ONE` makes one
+  // region up, by the same mechanism (a skip, not a computed identity).
+  const surpriseBase = influxBase + blockTotal;
+  const freeInit = new Uint32Array(surpriseBase + blockTotal);
+  freeInit.fill(INFLUX_ONE, influxBase, surpriseBase);
   for (const c of cascades) {
     for (let i = 0; i < c.probeCapacity; i++) {
       freeInit[c.probeBase + i] = c.probeBase + (c.probeCapacity - 1 - i);
@@ -499,6 +523,8 @@ export function createSrcProbeStore({
     blockStampBase: stampBase,
     /** Where the per-block influx words start inside `freeStack` (§12.40.4). */
     blockInfluxBase: influxBase,
+    /** Where the per-block surprise words start inside `freeStack`. */
+    blockSurpriseBase: surpriseBase,
     /** Where the c0 hash→block words start inside `hashKeys` (§12.39). */
     hashBlockBase,
     hashKeys,
@@ -508,8 +534,10 @@ export function createSrcProbeStore({
     freeStack,
     freeTop,
     /** Bytes on the GPU, for the memory high-water telemetry (plan §8). */
+    // `blockTotal * 4` — the block free stack plus the three per-block regions
+    // riding this buffer's tail (stamps, influx words, surprise words).
     bytes: (hashTotal * 2 + cascades[0].hashCapacity + probeTotal * PROBE_WORDS + probeTotal
-      + blockTotal * 3 + cascadeCount * (COUNTER_WORDS + 2)) * 4,
+      + blockTotal * 4 + cascadeCount * (COUNTER_WORDS + 2)) * 4,
     dispose() {
       for (const b of [hashKeys, hashSlot, probeTable, counters, freeStack, freeTop]) {
         b?.value?.dispose?.();
@@ -550,6 +578,10 @@ export function createHashClearPass(store) {
       atomicStore(counters.element(base.add(COUNTER_FRESH)), uint(0));
       atomicStore(counters.element(base.add(COUNTER_ATTEMPTS)), uint(0));
       atomicStore(counters.element(base.add(COUNTER_NOBLOCK)), uint(0));
+      // Cleared HERE and not in [D1'] that writes it: [D1'] is one dispatch
+      // whose threads all add into this word, so a thread clearing it would
+      // race the ones already counting. This pass runs frames earlier.
+      atomicStore(counters.element(base.add(COUNTER_BOOSTED)), uint(0));
     });
   })().compute(hashTotal);
 }
@@ -1128,6 +1160,10 @@ export async function readSrcProbeStats(renderer, store) {
       attempts,
       failed: raw[base + COUNTER_FAILED] >>> 0,
       noBlock: raw[base + COUNTER_NOBLOCK] >>> 0,
+      // Only c0 can be nonzero — [D1'] is a c0 pass — but it is read per
+      // cascade anyway, because a nonzero here on c1+ would mean the counter
+      // block's stride and the pass's cascade disagree.
+      boosted: raw[base + COUNTER_BOOSTED] >>> 0,
       probeCapacity: c.probeCapacity,
       hashCapacity: c.hashCapacity,
       blockCapacity: c.blockCapacity,

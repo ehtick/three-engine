@@ -363,9 +363,17 @@ export function assignRays(cfg, built) {
   // before anything propagates or partitions. `probeRayCap` arrives already
   // floored to a multiple of `raysPerPixel` (srcConfig.srcProbeRayCap), which
   // is what keeps the pixel handout below whole-slice.
+  //
+  // `cfg.capOf(probe)` is the EXEMPTION hook — the mirror of [D1']'s cold-fill
+  // and surprise shifts. It returns the effective cap for one probe, and a gate
+  // that passes nothing gets `cfg.probeRayCap` for every probe, i.e. the exact
+  // clamp above. It must return a multiple of `raysPerPixel` for the same
+  // reason the kernel SHIFTS rather than multiplies: the handout below is
+  // whole-slice, and a non-multiple cap leaves an unclaimable tail.
   if (cfg.probeRayCap > 0) {
     for (const probe of cascades[0].probes) {
-      probe.rayCount = Math.min(probe.rayCount, cfg.probeRayCap);
+      const cap = cfg.capOf ? cfg.capOf(probe) : cfg.probeRayCap;
+      probe.rayCount = Math.min(probe.rayCount, cap);
     }
   }
   // Propagate up — both counts, one statement each: a parent's demand is the

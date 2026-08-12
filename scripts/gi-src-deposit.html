@@ -518,6 +518,152 @@
           else resolvedBins++;
         }
 
+        // ══ ARM 0c: THE PER-BLOCK EVIDENCE SUMS ══════════════════════════
+        say("── SUMS: [E]'s per-block luma/weight record vs a CPU walk ──");
+        // The surprise statistic's raw material. [E] adds two words per deposit
+        // into the block's `BSTAT` record — the deposit's LUMA (zero on the
+        // transmittance-only branch) and its WEIGHT (always) — and everything
+        // downstream is a ratio of those two, so an error here is invisible in
+        // every image and shows up only as a block that never (or always)
+        // surprises.
+        //
+        // ⚠ THE SHIFT IS PER DEPOSIT, so this cannot be checked against the
+        // mirror's bin aggregates: `Σ floor(luma/1024)` is not
+        // `floor(Σ luma / 1024)`. The walk below therefore re-derives the
+        // per-ray values — and is itself tied to the mirror first, by the two
+        // counts it must reproduce (`n` and `n − t` per probe, the mirror's own
+        // totals), so a walk that disagreed about which cascade owns a hit
+        // would fail before its sums were believed.
+        //
+        // Placed here, after the aggregation, for exactly that tie; it runs a
+        // THIRD deposit over the same untouched ray partition, like ARM 0b.
+        const surpriseFU = uniform(1);
+        const depositSums = D.createSrcDepositFrame(store, bins, {
+          pixelProbe: frame.pixelProbe,
+          pixelRayBase: rayStore.pixelRayBase,
+          pixelCount: PIXELS,
+          raysPerPixel: RAYS_PER_PIXEL,
+          trace: synthTrace,
+          shadeHit,
+          readPixel, readNormal,
+          camera: vec3(cameraU),
+          spacing0: S0,
+          lmax: lmaxU,
+          jitterX: 0, jitterY: 0,
+          surprise: { statBase: bins.blockStatBase, surpriseF: surpriseFU },
+        });
+        for (const pass of depositSums.passes) await renderer.computeAsync(pass);
+        const scratchS = new Uint32Array(await renderer.getArrayBufferAsync(bins.scratch.value));
+        // f32 at every step, because the kernel is: the weights are f32
+        // constants, the three products and two adds are f32, and `.toUint()`
+        // TRUNCATES. A one-ulp disagreement here moves a truncated integer.
+        const W_R = Math.fround(0.2126);
+        const W_G = Math.fround(0.7152);
+        const W_B = Math.fround(0.0722);
+        const lumaShifted = (r, g, b) => {
+          const x = Math.fround(
+            Math.fround(Math.fround(r * W_R) + Math.fround(g * W_G)) + Math.fround(b * W_B),
+          );
+          return Math.trunc(x) >>> cfgMod.SUM_SHIFT;
+        };
+        const RAY_WEIGHT = D.DEPOSIT_SCALE >>> cfgMod.SUM_SHIFT;
+        const walkAll = new Map();       // global block -> deposits
+        const walkOwn = new Map();       // global block -> deposits at c == own
+        const walkLuma = new Map();      // global block -> Σ shifted luma
+        const bump = (m, k, v) => m.set(k, (m.get(k) ?? 0) + v);
+        for (let i = 0; i < PIXELS; i++) {
+          if (!valid[i]) continue;
+          const base = pixelRayBase[i];
+          if (base === P.SLOT_EMPTY) continue;
+          const probe0 = pixelProbe[i];
+          if (probe0 === P.SLOT_EMPTY) continue;
+          // The ancestor chain and its blocks, out of the GPU's own table —
+          // the same walk [E] hoists out of its ray loop.
+          const chain = [probe0];
+          for (let c = 1; c < cfgMod.CASCADE_COUNT; c++) {
+            const prev = chain[c - 1];
+            chain.push(prev === P.SLOT_EMPTY
+              ? P.SLOT_EMPTY
+              : table[prev * P.PROBE_WORDS + P.PROBE_PARENT] >>> 0);
+          }
+          const pos = pixels[i].position;
+          const cheb = cfgMod.chebyshev(pos[0], pos[1], pos[2], CAM[0], CAM[1], CAM[2]);
+          const lod = Math.floor(cfgMod.lodAtDistance(cheb, S0, cfgMod.MAX_LODS));
+          const bounds = cfgMod.intervalBoundaries(lod, S0, cfgMod.CASCADE_COUNT);
+          for (let k = 0; k < RAYS_PER_PIXEL; k++) {
+            const n = base + k;
+            const { t, radiance } = jsSceneTrace(pos, null, n);
+            let own = cfgMod.CASCADE_COUNT;
+            if (t >= 0) {
+              own = 0;
+              for (const b of bounds) if (t > b) own++;
+            }
+            const luma = lumaShifted(radiance[0], radiance[1], radiance[2]);
+            for (let c = 0; c < cfgMod.CASCADE_COUNT; c++) {
+              if (chain[c] === P.SLOT_EMPTY || c > own) continue;
+              const block = table[chain[c] * P.PROBE_WORDS + P.PROBE_BLOCK] >>> 0;
+              if (block === P.SLOT_EMPTY) continue;
+              const g = store.cascades[c].blockBase + block;
+              bump(walkAll, g, 1);
+              if (c === own) { bump(walkOwn, g, 1); bump(walkLuma, g, luma); }
+            }
+          }
+        }
+        // ── the tie: the walk must reproduce the mirror's own two counts ──
+        let walkWrong = 0;
+        let walkWorst = null;
+        let sumWrong = 0;
+        let sumWorst = null;
+        let sumBlocks = 0;
+        let lumaTotal = 0;
+        for (let c = 0; c < cfgMod.CASCADE_COUNT; c++) {
+          const pc = store.cascades[c];
+          for (let k = 0; k < pc.probeCapacity; k++) {
+            const w = (pc.probeBase + k) * P.PROBE_WORDS;
+            if ((table[w + P.PROBE_FLAGS] & P.FLAG_ALIVE) === 0) continue;
+            const block = table[w + P.PROBE_BLOCK] >>> 0;
+            if (block === P.SLOT_EMPTY) continue;
+            const g = pc.blockBase + block;
+            const all = walkAll.get(g) ?? 0;
+            const own = walkOwn.get(g) ?? 0;
+            const m = mAgg.get(`${c}:${table[w + P.PROBE_KEY] >>> 0}`) ?? { n: 0, t: 0 };
+            if (all !== m.n || own !== m.n - m.t) {
+              walkWrong++;
+              if (!walkWorst) walkWorst = `c${c} block ${block}: walk ${all}/${own} vs mirror ${m.n}/${m.n - m.t}`;
+            }
+            const s = bins.blockStatBase + g * cfgMod.BSTAT_WORDS;
+            const gotL = scratchS[s + cfgMod.BSTAT_SUM_L] >>> 0;
+            const gotW = scratchS[s + cfgMod.BSTAT_SUM_W] >>> 0;
+            const wantL = walkLuma.get(g) ?? 0;
+            const wantW = all * RAY_WEIGHT;
+            if (all > 0) sumBlocks++;
+            lumaTotal += wantL;
+            if (gotL !== wantL || gotW !== wantW) {
+              sumWrong++;
+              if (!sumWorst) sumWorst = `c${c} block ${block}: gpu L${gotL}/W${gotW} vs walk L${wantL}/W${wantW}`;
+            }
+          }
+        }
+        check("the CPU walk reproduces the mirror's deposit and own-deposit counts",
+          walkWrong === 0, walkWorst ?? `${sumBlocks} blocks`);
+        check("every block's SUM_L and SUM_W match the walk exactly", sumWrong === 0,
+          sumWorst ?? `${sumBlocks} blocks, ${lumaTotal} shifted luma total`);
+        check("the sums are not all zero (the arm is not vacuous)",
+          sumBlocks > 0 && lumaTotal > 0, `${sumBlocks} blocks, ${lumaTotal} luma`);
+        // No block outside the live set may have been written — an off-by-one
+        // in the stat base would scatter atomics into the BIN region, which is
+        // the failure the `Number.isInteger` throw exists for.
+        let strayStat = 0;
+        for (let g = 0; g < store.blockTotal; g++) {
+          if (walkAll.has(g)) continue;
+          const s = bins.blockStatBase + g * cfgMod.BSTAT_WORDS;
+          if ((scratchS[s + cfgMod.BSTAT_SUM_L] >>> 0) !== 0
+            || (scratchS[s + cfgMod.BSTAT_SUM_W] >>> 0) !== 0) strayStat++;
+        }
+        check("no block outside the deposited set holds a sum", strayStat === 0,
+          `${strayStat} blocks written that took no deposit`);
+        say("");
+
         // ══ ARM 1: totals ════════════════════════════════════════════════
         say("── TOTALS: rays, hits and deposits vs the mirror ──");
         check("the same number of rays were traced", stats.rays === mTraced,
@@ -824,6 +970,8 @@
           starvedDropped: sStats.noBlock,
           sampledBins: gBin.size,
           headroom: +headroom.toPrecision(3),
+          statBlocks: sumBlocks,
+          statLuma: lumaTotal,
           storageLimit: device.limits.maxStorageBuffersPerShaderStage,
           text: out.textContent,
         };

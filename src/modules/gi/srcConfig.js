@@ -357,6 +357,138 @@ export const PROBE_RAY_CAP_OFF = 0x3fffffff;
  * on the one operation that rounds (the divide).
  */
 export const INFLUX_ONE = 0x10000;
+
+/**
+ * ══ SURPRISE — THE CAP'S ESCAPE HATCH, AND ITS ONE SWITCH ══════════════════
+ *
+ * The per-probe cap above is a STEADY-STATE budget: a probe whose bins settled
+ * long ago does not need 1,794 rays a frame. What it cannot price is a block
+ * whose truth just MOVED — a light toggled, a mover crossed the wall behind it
+ * — because the cap denies exactly the evidence rate that would let the
+ * accumulator follow. §12.45 lifts the cap globally inside the light-event
+ * window; this is the per-BLOCK version, driven by the block's own deposits
+ * rather than by a scene-wide signal, so an occlusion change no light event can
+ * see still gets its evidence.
+ *
+ * `u` ∈ [0,1] in `SURPRISE_ONE` fixed point, one word per block, is that
+ * signal. It reaches two consumers:
+ *
+ *   DECAY   `keep′ = 1 − (1−keep)·mix(liftedRatio, SURPRISE_F, u)` — a
+ *           surprised block forgets FASTER, up to the fast-α rate.
+ *   CAP     `u ≥ SURPRISE_CAP_MIN` exempts the block's probe from the cap by
+ *           `SURPRISE_CAP_SHIFT` (a SHIFT, so the exempted cap is still a
+ *           multiple of raysPerPixel — see [D1']).
+ *
+ * ⚠ THEY ARE ONE SWITCH, AND THE CODE ENFORCES IT BY CONSTRUCTION. The
+ * governor's `surpriseGain` multiplies `u` ONCE, in the publish that writes the
+ * word — so both consumers read the same gained number and `gain = 0` means
+ * `keep′ == keepCompensated` bit for bit AND no surprise-driven boost. A gain
+ * applied at either consumer instead would let "forget faster" and "trace more"
+ * drift apart, which is a decay that outruns its own evidence: the exact
+ * mechanism §12.45 measured as 36% of the light-update flicker.
+ */
+export const SURPRISE_ONE = 0x10000;
+/** Signed-EMA rate for the drift term. Fast enough to see a step inside the T0→T1 ramp. */
+export const SURPRISE_RATE = 0.25;
+/**
+ * Shot-noise coefficient: the per-frame standard error of a block's mean is
+ * `M·sqrt(K/n)` for `n` deposits. K is empirical (§12.13.4's 0.78 rays/bin
+ * against the bin-count spread), not a physical constant — it sets what counts
+ * as "one σ" and therefore where the T0/T1 ramp begins.
+ */
+export const SURPRISE_SHOT_K = 0.143;
+/** Ramp ends, in σ. Below T0 nothing is surprising; at T1 the block is fully surprised. */
+export const SURPRISE_T0 = 2;
+export const SURPRISE_T1 = 4;
+/**
+ * Noise floor, in units of unit luma — 1/1024, one quantum of the SUM_SCALE the
+ * deposits arrive in. Without it a block whose mean is zero has zero noise and
+ * every quantum of drift reads as infinite σ.
+ */
+export const SURPRISE_FLOOR = 1 / 1024;
+/**
+ * Minimum accumulated evidence before `u` may be nonzero. A block with two
+ * deposits of history has no mean to be surprised AGAINST, and letting it
+ * surprise would make every sparsely-sampled bin permanently uncapped — the
+ * cap's whole win, spent on the blocks that need it least.
+ */
+export const SURPRISE_MIN_EVIDENCE = 4;
+/** `u ≥ 0.5` in word scale — the cap exemption's threshold. */
+export const SURPRISE_CAP_MIN = SURPRISE_ONE >> 1;
+/** ×2. The cap exemption is a SHIFT so the exempted cap stays a multiple of raysPerPixel. */
+export const SURPRISE_CAP_SHIFT = 1;
+/**
+ * How long a freshly claimed block counts as COLD — exempt from the cap by
+ * `COLD_CAP_SHIFT` (×4), and barred from surprising (it has no mean yet).
+ *
+ * A newborn block's accumulators are zero, so its first frames ARE its estimate
+ * — and the cap's steady-state argument does not apply to a block that has no
+ * steady state. Four frames at ×4 is one capped probe's worth of extra rays,
+ * paid once per block rather than per frame.
+ */
+export const COLD_FILL_FRAMES = 4;
+export const COLD_CAP_SHIFT = 2;
+/**
+ * Frames after a re-anchor (or a system build) during which NOTHING boosts.
+ *
+ * A re-anchor re-keys every probe, so every block is claimed on the same frame
+ * and every one of them would be COLD at once — the cold fill would multiply
+ * the whole frame's ray budget by four on precisely the frame that already
+ * rebuilt the lattice. The guard is not a quality dial; it is the difference
+ * between a cold fill and a periodic 4× cost spike whenever the camera walks.
+ */
+export const COLD_GUARD_FRAMES = 8;
+
+/**
+ * The per-block statistics record, in the bin store's `scratch` tail
+ * (`createSrcBinStore`'s `blockStatBase`). Five words, and the split is by
+ * WRITER, not by meaning:
+ *
+ *   SUM_L/SUM_W  u32 fixed point, `atomicAdd`ed by [E] from many threads.
+ *   ACC_L/ACC_W/DRIFT  f32 bits (`floatBitsToUint`), read-modify-written by the
+ *                      ONE thread that owns the block in the [D1''] publish.
+ *
+ * A single-writer f32 cannot be an atomicAdd target and a many-writer sum
+ * cannot be an f32 — that is the whole reason for two kinds of word in one
+ * record.
+ */
+export const BSTAT_SUM_L = 0;
+export const BSTAT_SUM_W = 1;
+export const BSTAT_ACC_L = 2;
+export const BSTAT_ACC_W = 3;
+export const BSTAT_DRIFT = 4;
+export const BSTAT_WORDS = 5;
+/**
+ * [E]'s deposits are shifted right by `SUM_SHIFT` before they are summed, and
+ * the shift is sized by an OVERFLOW, not by precision.
+ *
+ * A top-cascade block can take an entire frame's deposits — 126,381 of them on
+ * the §12.32.1 measurement — and one deposit's luma is up to `DEPOSIT_SCALE`
+ * (65,536). Unshifted that is 8.3e9, past u32's 4.29e9: the sum WRAPS, and a
+ * wrapped mean reads as a giant drift, i.e. permanent surprise on exactly the
+ * busiest block. Shifted by 10 the same frame sums to 8.1e6 — 500× of headroom.
+ * The cost is that each deposit's luma quantizes to 1/1024 of full scale, which
+ * is under the `SURPRISE_FLOOR` the σ estimate already carries.
+ *
+ * `SUM_SCALE` is derived from the shift rather than written twice: the mirror
+ * divides where the kernel shifts, and two constants that must be powers of the
+ * same two is a drift waiting to happen.
+ */
+export const SUM_SHIFT = 10;
+export const SUM_SCALE = 1 << SUM_SHIFT;
+
+/**
+ * The governor's band on the scene-motion term: `surpriseGain =
+ * 1 − smoothstep(GOV_LO, GOV_HI, mLight)`.
+ *
+ * Surprise and the global light-event window (§12.45) solve the SAME problem,
+ * and both firing at once means a block pays for uncapped evidence twice while
+ * the window's relaxed root is already decaying at the fast rate. So the
+ * per-block mechanism fades out exactly as the scene-wide one fades in.
+ */
+export const GOV_LO = 0.3;
+export const GOV_HI = 0.8;
+
 export function srcProbeRayCap(tier, raysPerPixel = 1) {
   const forced = Number(globalThis.__giSrcProbeRayCap);
   let cap = SRC_QUALITY[tier]?.probeRayCap ?? PROBE_RAY_CAP_OFF;

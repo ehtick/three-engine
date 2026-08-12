@@ -700,6 +700,180 @@
         check("no word exceeds INFLUX_ONE — capped never exceeds natural", iOverOne === 0,
           `${iOverOne} over`);
 
+        // ══ ARM 10: THE CAP EXEMPTION (cold fill + surprise) ════════════
+        say("");
+        say("── BOOST: cap << shift for cold and surprised blocks ──");
+        // [D1'] is the ONLY pass the exemption edits, and that is the claim
+        // worth testing hardest. [D5]'s denial reads `probeTable[PROBE_RAYS]`,
+        // which [D4] copies from the already-clamped `rayCount` — so the
+        // exemption reaches the handout through the SAME single clamp, and
+        // ARM 8's partition statements must hold unchanged under it. Anything
+        // less would be an allocator that hands out slices of a segment length
+        // it disagrees with, which is the silent corruption ARM 7's header
+        // describes.
+        //
+        // The state is SEEDED rather than produced: a real cold block needs a
+        // claim this frame and a real surprised one needs a whole deposit
+        // history, neither of which this fixture has. Seeding also exercises
+        // every branch on the same frame — cold, surprised, and neither — which
+        // a real population would only reach one at a time.
+        const BOOST_FRAME = 1000;
+        const boostStampU = TSL.uniform(BOOST_FRAME, "uint");
+        const boostOnU = TSL.uniform(1, "uint");
+        // block % 3: 0 stamped THIS frame (COLD), 1 given a full surprise word,
+        // 2 neither. Written over the whole region; [D1'] reads only cascade
+        // 0's, whose LOCAL block index is its global one (blockBase[0] = 0).
+        const seedBoost = TSL.Fn(() => {
+          const b = TSL.instanceIndex.toVar();
+          store.freeStack.element(TSL.uint(store.blockStampBase).add(b)).assign(
+            TSL.select(b.mod(TSL.uint(3)).equal(TSL.uint(0)),
+              TSL.uint(BOOST_FRAME), TSL.uint(BOOST_FRAME - 100)));
+          store.freeStack.element(TSL.uint(store.blockSurpriseBase).add(b)).assign(
+            TSL.select(b.mod(TSL.uint(3)).equal(TSL.uint(1)),
+              TSL.uint(cfgMod.SURPRISE_ONE), TSL.uint(0)));
+        })().compute(store.blockTotal);
+        const boostRayStore = R.createSrcRayStore(store, { pixelCount: PIXELS });
+        const boostFrame = R.createSrcRayFrame(store, boostRayStore, {
+          pixelProbe: frame.pixelProbe,
+          raysPerPixel: RAYS_PER_PIXEL,
+          cap: capU,
+          capBoost: {
+            frameStamp: boostStampU, boostEnable: boostOnU, counters: store.counters,
+          },
+        });
+        for (const pass of frame.passes) await renderer.computeAsync(pass);
+        // AFTER the population, because the population's own clear pass zeroes
+        // the counter this arm reads and (in the engine) the compaction is what
+        // stamps a claim. Nothing here stamps — the harness's probe frame is
+        // built without a `frameStamp` — so the seed is the whole state.
+        await renderer.computeAsync(seedBoost);
+        for (const pass of boostFrame.passes) await renderer.computeAsync(pass);
+        const [bTable, bBase, bTotal, bCounters] = await Promise.all([
+          renderer.getArrayBufferAsync(store.probeTable.value).then((b) => new Uint32Array(b)),
+          renderer.getArrayBufferAsync(boostRayStore.pixelRayBase.value).then((b) => new Uint32Array(b)),
+          boostFrame.readTotal(renderer),
+          renderer.getArrayBufferAsync(store.counters.value).then((b) => new Uint32Array(b)),
+        ]);
+        // The seeded shift, as the kernel derives it: cold wins over surprise,
+        // and a probe with no block is never exempt.
+        const shiftOf = (block) => {
+          if (block === P.SLOT_EMPTY) return 0;
+          if (block % 3 === 0) return cfgMod.COLD_CAP_SHIFT;
+          if (block % 3 === 1) return cfgMod.SURPRISE_CAP_SHIFT;
+          return 0;
+        };
+        const blockOfKey = new Map();
+        let boostExpect = 0;
+        for (let k = 0; k < store.cascades[0].probeCapacity; k++) {
+          const p = store.cascades[0].probeBase + k;
+          const w = p * P.PROBE_WORDS;
+          const block = bTable[w + P.PROBE_BLOCK] >>> 0;
+          if (block !== P.SLOT_EMPTY && shiftOf(block) > 0) boostExpect++;
+          if ((bTable[w + P.PROBE_FLAGS] & P.FLAG_ALIVE) === 0) continue;
+          blockOfKey.set(bTable[w + P.PROBE_KEY] >>> 0, block);
+        }
+        const capEffOfKey = (key) => CAP << shiftOf(blockOfKey.get(key) ?? P.SLOT_EMPTY);
+        // The mirror's exemption hook — `srcRef.assignRays`'s `capOf`. Every
+        // arm above passes nothing and gets `cfg.probeRayCap` for every probe,
+        // which is the exact clamp they were written against.
+        const bMirror = ref.assignRays(
+          { ...cfg, probeRayCap: CAP, capOf: (probe) => capEffOfKey(probe.key >>> 0) },
+          built,
+        );
+        check("the exempted total matches the mirror's", bTotal === bMirror.totalRays,
+          `gpu ${bTotal} vs mirror ${bMirror.totalRays}`);
+        check("the exemption actually raised the budget", bTotal > cTotal && bTotal <= gpu.total,
+          `${bTotal} against ${cTotal} capped and ${gpu.total} uncapped`);
+        // The per-probe statement, spelled out against the NATURAL counts
+        // rather than only against the mirror — a mirror that shared the bug
+        // would agree with the kernel and this would not.
+        let capWrong = 0;
+        let capWorst = null;
+        let notMultiple = 0;
+        let exempted = 0;
+        const bLive0 = new Map();
+        for (let k = 0; k < store.cascades[0].probeCapacity; k++) {
+          const p = store.cascades[0].probeBase + k;
+          const w = p * P.PROBE_WORDS;
+          if ((bTable[w + P.PROBE_FLAGS] & P.FLAG_ALIVE) === 0) continue;
+          bLive0.set(bTable[w + P.PROBE_KEY] >>> 0, bTable[w + P.PROBE_RAYS] >>> 0);
+        }
+        for (const probe of built.cascades[0].probes) {
+          const key = probe.key >>> 0;
+          const got = bLive0.get(key);
+          if (got === undefined) continue;
+          const capEff = capEffOfKey(key);
+          if (capEff % RAYS_PER_PIXEL !== 0) notMultiple++;
+          if (capEff > CAP) exempted++;
+          const want = Math.min(probe.naturalRays, capEff);
+          if (got !== want) {
+            capWrong++;
+            if (!capWorst) capWorst = `key ${key} gpu ${got} vs min(${probe.naturalRays}, ${capEff})`;
+          }
+        }
+        check("every c0 count is min(natural, cap << shift)", capWrong === 0,
+          capWorst ?? `${bLive0.size} probes`);
+        check("every effective cap is a multiple of raysPerPixel", notMultiple === 0,
+          `${notMultiple} of ${bLive0.size} — a shift preserves the multiple, a scale would not`);
+        check("probes were actually exempted (the arm is not vacuous)", exempted > 0,
+          `${exempted} of ${bLive0.size} probes exempt`);
+        check("the boosted counter matches the exempted set",
+          (bCounters[P.COUNTER_BOOSTED] >>> 0) === boostExpect,
+          `counter ${bCounters[P.COUNTER_BOOSTED] >>> 0} vs ${boostExpect} blocks with a shift`);
+        // Counts by key on EVERY cascade: parents hold sums of exempted
+        // children, the same statement ARM 8 makes about capped ones.
+        for (let c = 0; c < cfgMod.CASCADE_COUNT; c++) {
+          const mirrorByKey = new Map();
+          for (const p of built.cascades[c].probes) mirrorByKey.set(p.key >>> 0, p.rayCount);
+          const info = store.cascades[c];
+          let wrong = 0;
+          let worst = null;
+          for (let k = 0; k < info.probeCapacity; k++) {
+            const w = (info.probeBase + k) * P.PROBE_WORDS;
+            if ((bTable[w + P.PROBE_FLAGS] & P.FLAG_ALIVE) === 0) continue;
+            const want = mirrorByKey.get(bTable[w + P.PROBE_KEY] >>> 0);
+            const got = bTable[w + P.PROBE_RAYS] >>> 0;
+            if (want === got) continue;
+            wrong++;
+            if (!worst) worst = `c${c} key ${bTable[w + P.PROBE_KEY] >>> 0} gpu ${got} vs ${want}`;
+          }
+          check(`c${c} exempted counts match the mirror by key`, wrong === 0, worst ?? "");
+        }
+        // ARM 8's partition, re-run under exemption. This is the arm that would
+        // catch an exemption applied anywhere but at the source.
+        const bSeen = new Uint8Array(bTotal);
+        let bDup = 0;
+        let bOut = 0;
+        for (let i = 0; i < PIXELS; i++) {
+          const base = bBase[i];
+          if (base === P.SLOT_EMPTY) continue;
+          for (let r = 0; r < RAYS_PER_PIXEL; r++) {
+            const idx = base + r;
+            if (idx >= bTotal) { bOut++; continue; }
+            if (bSeen[idx]) bDup++;
+            bSeen[idx] = 1;
+          }
+        }
+        let bUncovered = 0;
+        for (let i = 0; i < bTotal; i++) if (!bSeen[i]) bUncovered++;
+        check("exempted: no ray index is claimed twice", bDup === 0, `${bDup} duplicates`);
+        check("exempted: no ray index is past the total", bOut === 0, `${bOut} out of range`);
+        check("exempted: every ray index in [0, total) is claimed", bUncovered === 0,
+          `${bUncovered}/${bTotal} unclaimed — an exempted segment did not tile`);
+        // And the switch: `boostEnable = 0` must reproduce ARM 8 EXACTLY, with
+        // the same seeded state still in place. Without this leg the exemption
+        // could be unconditional and every check above would still pass.
+        boostOnU.value = 0;
+        for (const pass of frame.passes) await renderer.computeAsync(pass);
+        await renderer.computeAsync(seedBoost);
+        for (const pass of boostFrame.passes) await renderer.computeAsync(pass);
+        const offTotal = await boostFrame.readTotal(renderer);
+        const offCounters = new Uint32Array(await renderer.getArrayBufferAsync(store.counters.value));
+        check("boostEnable = 0 reproduces the plain capped total", offTotal === cTotal,
+          `${offTotal} vs ${cTotal}`);
+        check("boostEnable = 0 exempts nobody", (offCounters[P.COUNTER_BOOSTED] >>> 0) === 0,
+          `${offCounters[P.COUNTER_BOOSTED] >>> 0} boosted`);
+
         if (validationErrors.length) check("no WebGPU validation errors", false, validationErrors[0]);
 
         say("");
@@ -710,6 +884,9 @@
           totalRays: gpu.total,
           probesPerCascade: gpu.live.map((l) => l.byKey.size),
           offsetsMoved,
+          cappedRays: cTotal,
+          boostedRays: bTotal,
+          boostedProbes: exempted,
           storageLimit: device.limits.maxStorageBuffersPerShaderStage,
           text: out.textContent,
         };

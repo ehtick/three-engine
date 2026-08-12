@@ -40,7 +40,9 @@ try {
     console.log(`gi-src-rays: PASS — ${result.totalRays} rays over ` +
       `${result.probesPerCascade?.join(" -> ")} probes, ` +
       `${result.offsetsMoved} offsets moved on the rerun, ` +
-      `storage limit ${result.storageLimit}`);
+      `storage limit ${result.storageLimit}\n` +
+      `                 cap ${result.cappedRays} rays -> ${result.boostedRays} with the ` +
+      `exemption (${result.boostedProbes} probes cold or surprised)`);
     code = 0;
   } else {
     console.error(`gi-src-rays: FAIL — ${result?.error ?? `${result?.failures} checks`}`);

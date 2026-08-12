@@ -820,11 +820,16 @@
           store.freeStack.element(uint(store.blockInfluxBase).add(b)).assign(word);
         })().compute(store.blockTotal);
         // The per-word expected keep′, laid out bin-block by bin-block.
-        const kPrimeFor = (lift) => {
+        // `uWord`/`sF` are ARM 10's surprise leg: at the default 0/1 this is the
+        // 3-argument `keepCompensated` every check above was written against,
+        // and the mirror returns the compensated keep untouched.
+        const kPrimeFor = (lift, uWord = 0, sF = 1) => {
           const arr = new Float64Array(bins.binTotal);
           for (const info of bins.cascades) {
             for (let blk = 0; blk < info.blockCapacity; blk++) {
-              const w = refMath.keepCompensated(KEEP, seedWordFor(info.blockBase + blk), lift);
+              const w = refMath.keepCompensated(
+                KEEP, seedWordFor(info.blockBase + blk), lift, uWord, sF,
+              );
               const first = info.binBase + blk * info.bins;
               arr.fill(w, first, first + info.bins);
             }
@@ -839,16 +844,21 @@
           frameStampU.value = (frameStampU.value + 1) >>> 0;
           await renderer.computeAsync(compDeposit.decay);
         };
-        const compExact = async (lift, frames) => {
+        // BIN WORDS ONLY. `scratch` has tails past the bins ([J]'s hit list and
+        // the per-block statistics), the decay never touches them, and
+        // `kPrimeFor` is a per-BIN array — so a loop over `cur.length` would
+        // ask for `kPrime[undefined]` and diff every tail word against NaN.
+        const BIN_WORDS_TOTAL = bins.binTotal * D.BIN_WORDS;
+        const compExact = async (lift, frames, decayOf = compDecay, uWord = 0, sF = 1) => {
           liftU.value = lift;
-          const kPrime = kPrimeFor(lift);
+          const kPrime = kPrimeFor(lift, uWord, sF);
           let cur = Uint32Array.from(await readScratch());
           let wrong = 0;
           let first = "";
           for (let f = 0; f < frames; f++) {
-            await compDecay();
+            await decayOf();
             const got = await readScratch();
-            for (let j = 0; j < cur.length; j++) {
+            for (let j = 0; j < BIN_WORDS_TOTAL; j++) {
               const bin = Math.floor(j / D.BIN_WORDS);
               const want = refMath.decayFixed(cur[j] >>> 0, kPrime[bin]);
               if ((got[j] >>> 0) !== want) {
@@ -947,6 +957,443 @@
           driftRatio < holdRatio - 0.15,
           `drifted to ${driftRatio.toFixed(3)} of steady (held at ${holdRatio.toFixed(3)})`);
 
+        // ══ ARM 10: SURPRISE (srcConfig's SURPRISE block) ════════════════
+        say("");
+        say("── SURPRISE: a block whose truth MOVED forgets faster ──");
+        // Five legs, and the FIRST is what licenses the shape of the other
+        // four: (a) proves the kernel and `srcMath.blockSurpriseUpdate` are one
+        // definition, word for word on seeded state, so (b)/(c)/(d) — which
+        // need hundreds of frames of a controlled signal — may run on the
+        // mirror at no GPU cost. (e) closes the loop back on the kernel by
+        // showing the DECAY's new branch is a skip at u = 0 and the mirror's
+        // 5-argument `keepCompensated` at u = 1.
+        //
+        // The estimator being tested is: is this block's latest evidence
+        // inconsistent with its own accumulated mean by more than shot noise
+        // explains? Its two failure modes are opposite and both fatal —
+        // firing on noise (the cap's win evaporates and the decay outruns its
+        // evidence) and not firing on a real change (the mechanism is dead
+        // weight). (b) and (c) are those two.
+        const RAY_WEIGHT = D.DEPOSIT_SCALE >>> cfgMod.SUM_SHIFT;
+        const SURP_F = 2;
+        const SURP_GAIN = 0.75;
+        const gainU = uniform(SURP_GAIN);
+        const surpriseFU = uniform(SURP_F);
+        const surpRayStore = R.createSrcRayStore(store, { pixelCount: PIXELS });
+        const surpRayFrame = R.createSrcRayFrame(store, surpRayStore, {
+          pixelProbe: frame.pixelProbe, raysPerPixel: RAYS_PER_PIXEL, cap: capValU,
+          surprise: {
+            scratch: bins.scratch,
+            statBase: bins.blockStatBase,
+            keep: keepU, lift: liftU, gain: gainU,
+            frameStamp: frameStampU,
+            rayWeight: RAY_WEIGHT,
+          },
+        });
+        const surpDeposit = D.createSrcDepositFrame(store, bins, {
+          pixelProbe: frame.pixelProbe,
+          pixelRayBase: surpRayStore.pixelRayBase,
+          pixelCount: PIXELS,
+          raysPerPixel: RAYS_PER_PIXEL,
+          trace: constTrace,
+          // ⚠ RESAMPLED PER FRAME, and ARM 8's `noisyShade` is NOT. Keyed on
+          // the ray index alone, a BLOCK's sum is the same every frame however
+          // the rays shuffle: the index set is a permutation of [0, total) and
+          // a block's segment is contiguous, so `Σ hash(n)` over it barely
+          // moves. The first version of this arm measured a per-ray spread of
+          // 0.000 and leg (b) became "noise that does not exist never
+          // surprises". Folding in the R2 phase — which advances every frame —
+          // makes each frame an independent draw, which is what leg (b) needs
+          // to be a test. ARM 8 measures the PAYLOAD, where the jitter already
+          // resamples through bin membership, so it needs none of this.
+          shadeHit: (r, d, n) => {
+            const h = M.hashKey(n.add(jitterXU)).toVar();
+            const k = LMAX / 65536;
+            return vec3(
+              float(h.bitAnd(uint(4095))).mul(k),
+              float(h.shiftRight(uint(12)).bitAnd(uint(4095))).mul(k),
+              float(h.shiftRight(uint(24)).bitAnd(uint(255))).mul(k),
+            );
+          },
+          readPixel, readNormal,
+          camera: vec3(cameraU),
+          spacing0: S0,
+          lmax: lmaxU,
+          jitterX: jitterXU, jitterY: jitterYU,
+          keep: keepU,
+          frameStamp: frameStampU,
+          influxLift: liftU,
+          surprise: { statBase: bins.blockStatBase, surpriseF: surpriseFU },
+        });
+
+        // ── (a) THE MIRROR DIFF, ON SEEDED STATE ─────────────────────────
+        // Seeded rather than grown, for the reason ARM 9's exactness legs are:
+        // a real population reaches a handful of the estimator's branches, and
+        // this reaches all of them on one frame — zero evidence, zero deposits,
+        // a reclaimed block, a cold block, and every ratio in between.
+        keepU.value = KEEP;
+        liftU.value = 0;
+        gainU.value = SURP_GAIN;
+        frameStampU.value = (frameStampU.value + 1) >>> 0;
+        const FS = frameStampU.value;
+        const fbuf = new ArrayBuffer(4);
+        const fbF = new Float32Array(fbuf);
+        const fbU = new Uint32Array(fbuf);
+        const f32bits = (v) => { fbF[0] = v; return fbU[0] >>> 0; };
+        // The seed, as a pure function of the block index. Written twice — TSL
+        // and JS — deliberately: every value is exactly representable in f32
+        // (integers, and divides by powers of two), so the two agree without
+        // either of them being the other's readback.
+        const seedStateOf = (b) => {
+          const h = refMath.hashKey(b >>> 0) >>> 0;
+          const accW = h & 63;                            // 0 exercises the M = 0 path
+          const mSel = ((h >>> 6) & 63) + 1;
+          const nDep = (h >>> 20) & 63;                   // 0 exercises the n = 0 path
+          return {
+            accL: Math.fround(Math.fround(accW * mSel) / 128),
+            accW,
+            drift: Math.fround((((h >>> 12) & 255) - 128) / 1024),
+            sumL: nDep * (((h >>> 26) & 63) + 1),
+            sumW: nDep * RAY_WEIGHT,
+          };
+        };
+        const seedStampOf = (b) => (b % 7 === 0 ? FS : (b % 7 === 1 ? FS - 2 : FS - 50));
+        const seedState = TSL.Fn(() => {
+          const b = instanceIndex.toVar();
+          const h = M.hashKey(b).toVar();
+          const accW = float(h.bitAnd(uint(63))).toVar();
+          const mSel = float(h.shiftRight(uint(6)).bitAnd(uint(63)).add(uint(1))).toVar();
+          const accL = accW.mul(mSel).div(128).toVar();
+          const drift = float(TSL.int(h.shiftRight(uint(12)).bitAnd(uint(255))).sub(TSL.int(128)))
+            .div(1024).toVar();
+          const nDep = h.shiftRight(uint(20)).bitAnd(uint(63)).toVar();
+          const s = uint(bins.blockStatBase).add(b.mul(uint(cfgMod.BSTAT_WORDS))).toVar();
+          TSL.atomicStore(bins.scratch.element(s.add(uint(cfgMod.BSTAT_SUM_L))),
+            nDep.mul(h.shiftRight(uint(26)).bitAnd(uint(63)).add(uint(1))));
+          TSL.atomicStore(bins.scratch.element(s.add(uint(cfgMod.BSTAT_SUM_W))),
+            nDep.mul(uint(RAY_WEIGHT)));
+          TSL.atomicStore(bins.scratch.element(s.add(uint(cfgMod.BSTAT_ACC_L))),
+            TSL.floatBitsToUint(accL));
+          TSL.atomicStore(bins.scratch.element(s.add(uint(cfgMod.BSTAT_ACC_W))),
+            TSL.floatBitsToUint(accW));
+          TSL.atomicStore(bins.scratch.element(s.add(uint(cfgMod.BSTAT_DRIFT))),
+            TSL.floatBitsToUint(drift));
+          store.freeStack.element(uint(store.blockStampBase).add(b)).assign(
+            select(b.mod(uint(7)).equal(uint(0)), uint(FS),
+              select(b.mod(uint(7)).equal(uint(1)), uint(FS - 2), uint(FS - 50))),
+          );
+        })().compute(store.blockTotal);
+        for (const pass of frame.passes) await renderer.computeAsync(pass);
+        await renderer.computeAsync(seedState);
+        // The influx words the publish must read BEFORE overwriting — the
+        // rate the accumulators actually decayed at last frame.
+        await renderer.computeAsync(seedInflux);
+        for (const pass of surpRayFrame.passes) await renderer.computeAsync(pass);
+        const aScratch = await readScratch();
+        const aFree = new Uint32Array(await renderer.getArrayBufferAsync(store.freeStack.value));
+        const aTable = new Uint32Array(await renderer.getArrayBufferAsync(store.probeTable.value));
+        let aWrong = 0;
+        let aWorst = null;
+        let aBlocks = 0;
+        let aFired = 0;
+        let aExact = 0;
+        let aUlp = 0;
+        for (const info of bins.cascades) {
+          const pc = store.cascades[info.cascade];
+          for (let k = 0; k < pc.probeCapacity; k++) {
+            const w = (pc.probeBase + k) * P.PROBE_WORDS;
+            if ((aTable[w + P.PROBE_FLAGS] & P.FLAG_ALIVE) === 0) continue;
+            const block = aTable[w + P.PROBE_BLOCK] >>> 0;
+            if (block === P.SLOT_EMPTY) continue;
+            const g = info.blockBase + block;
+            const st = seedStateOf(g);
+            const stamp = seedStampOf(g);
+            const want = refMath.blockSurpriseUpdate(
+              st, { sumL: st.sumL, sumW: st.sumW },
+              refMath.keepCompensated(KEEP, seedWordFor(g), 0),
+              {
+                gain: SURP_GAIN, age: (FS - stamp) >>> 0,
+                rayWeight: RAY_WEIGHT, reclaimed: stamp === FS,
+              },
+            );
+            const s = bins.blockStatBase + g * cfgMod.BSTAT_WORDS;
+            const gotL = aScratch[s + cfgMod.BSTAT_ACC_L] >>> 0;
+            const gotW = aScratch[s + cfgMod.BSTAT_ACC_W] >>> 0;
+            const gotD = aScratch[s + cfgMod.BSTAT_DRIFT] >>> 0;
+            const gotU = aFree[store.blockSurpriseBase + g] >>> 0;
+            aBlocks++;
+            if (want.word > 0) aFired++;
+            // ⚠ **BITWISE IS THE WRONG TEST HERE, AND WGSL SAYS SO.** `+`, `−`
+            // and `×` on f32 are correctly rounded, but DIVISION is specified
+            // only to 2.5 ULP — and this estimator is built out of quotients
+            // (`M = accL/accW`, `I = sL/sW`). Worse, `drift` tracks `I − M`,
+            // which near convergence is a CANCELLATION: one ulp of `M` at 0.5
+            // is 6e-8, and a quarter of that lands on a drift of ~0.02 as ~8
+            // ulps. Measured here: 2 of 380 blocks, worst 7.1e-7 relative. A
+            // gate that failed on that would be measuring the driver's divider,
+            // which is exactly the mistake `gi-src-surface-attribution` names.
+            //
+            // So: a relative budget 14x above the measured worst, floored so a
+            // drift near zero is not held to an impossible ratio — and the
+            // count of BIT-EXACT blocks reported beside it, because that number
+            // moving is the real regression signal.
+            const REL = 1e-5;
+            const near = (a, b) => Math.abs(a - b) <= REL * Math.max(Math.abs(a), Math.abs(b), 1 / 1024);
+            const dec = (bits) => { fbU[0] = bits >>> 0; return fbF[0]; };
+            const rel = (a, b) => Math.abs(a - b) / Math.max(Math.abs(a), Math.abs(b), 1 / 1024);
+            aUlp = Math.max(aUlp, rel(dec(gotL), want.accL), rel(dec(gotW), want.accW),
+              rel(dec(gotD), want.drift));
+            if (gotL === f32bits(want.accL) && gotW === f32bits(want.accW)
+              && gotD === f32bits(want.drift) && gotU === want.word) aExact++;
+            if (!near(dec(gotL), want.accL) || !near(dec(gotW), want.accW)
+              || !near(dec(gotD), want.drift) || Math.abs(gotU - want.word) > 1) {
+              aWrong++;
+              if (!aWorst) {
+                aWorst = `block ${g}: gpu ${gotL}/${gotW}/${gotD}/u${gotU} vs mirror ` +
+                  `${f32bits(want.accL)}/${f32bits(want.accW)}/${f32bits(want.drift)}/u${want.word}`;
+              }
+            }
+          }
+        }
+        check("(a) every block's state matches blockSurpriseUpdate to WGSL's own accuracy",
+          aWrong === 0,
+          aWorst ?? `${aBlocks} blocks, ${aExact} bit-exact, worst ${aUlp.toExponential(1)} relative`);
+        check("(a) some blocks actually surprised — otherwise the diff is of zeros",
+          aFired > 0, `${aFired} of ${aBlocks} blocks published u > 0`);
+
+        // ── the NOISE, measured rather than assumed ──────────────────────
+        // The estimator's σ model is `M·sqrt(SHOT_K/n)`. What the arms below
+        // need is the REAL frame-to-frame spread of a block's mean under a
+        // signal that is only noisy — the noisy shade, the capped transport,
+        // and nothing changing. Measured here so leg (b) drives the mirror at
+        // the noise the pipeline actually produces rather than at the noise the
+        // model hopes for.
+        const surpFrame = async () => {
+          frameStampU.value = (frameStampU.value + 1) >>> 0;
+          jitterXU.value = (jitterXU.value + refMath.R2_ALPHA1_FX) >>> 0;
+          jitterYU.value = (jitterYU.value + refMath.R2_ALPHA2_FX) >>> 0;
+          for (const pass of frame.passes) await renderer.computeAsync(pass);
+          for (const pass of surpRayFrame.passes) await renderer.computeAsync(pass);
+          for (const pass of surpDeposit.passes) await renderer.computeAsync(pass);
+        };
+        const SIG_FRAMES = 16;
+        const series = new Map();
+        for (let f = 0; f < SIG_FRAMES; f++) {
+          await surpFrame();
+          const sc = await readScratch();
+          for (let g = 0; g < store.blockTotal; g++) {
+            const s = bins.blockStatBase + g * cfgMod.BSTAT_WORDS;
+            const wgt = sc[s + cfgMod.BSTAT_SUM_W] >>> 0;
+            if (wgt < 4 * RAY_WEIGHT) continue;
+            const rec = series.get(g) ?? [];
+            rec.push([(sc[s + cfgMod.BSTAT_SUM_L] >>> 0) / wgt, wgt / RAY_WEIGHT]);
+            series.set(g, rec);
+          }
+        }
+        let sigSum = 0;
+        let sigN = 0;
+        let nSum = 0;
+        for (const rec of series.values()) {
+          if (rec.length < SIG_FRAMES) continue;
+          const mean = rec.reduce((a, r) => a + r[0], 0) / rec.length;
+          if (!(mean > 0)) continue;
+          const varI = rec.reduce((a, r) => a + (r[0] - mean) ** 2, 0) / (rec.length - 1);
+          const nMean = rec.reduce((a, r) => a + r[1], 0) / rec.length;
+          // Per-RAY relative spread, so the leg below can re-scale it to any
+          // deposit count: `σ_I = s/sqrt(n)`.
+          sigSum += (Math.sqrt(varI) / mean) * Math.sqrt(nMean);
+          nSum += nMean;
+          sigN++;
+        }
+        // Rounded, because the ray partition is scheduler-ordered and this
+        // number must not make the mirror legs below drift between runs.
+        const sPerRay = sigN > 0 ? Math.round((sigSum / sigN) * 1000) / 1000 : 0;
+        const nMedian = sigN > 0 ? nSum / sigN : 0;
+        const sModelPerRay = Math.sqrt(cfgMod.SURPRISE_SHOT_K);
+        say(`   measured per-ray relative spread ${sPerRay.toFixed(3)} over ${sigN} blocks ` +
+          `(mean ${nMedian.toFixed(1)} deposits/frame) against the shot model's ` +
+          `sqrt(SHOT_K) = ${sModelPerRay.toFixed(3)} — ratio ${(sPerRay / sModelPerRay).toFixed(2)}x`);
+        check("the noise measurement is not degenerate", sigN >= 4 && sPerRay > 0,
+          `${sigN} blocks tracked for ${SIG_FRAMES} frames`);
+
+        // ── (b) FALSE POSITIVE: noise alone must (nearly) never surprise ──
+        // i.i.d. draws on a block with plenty of evidence and nothing changing,
+        // 200 frames × 32 blocks, at TWO noise levels — and the pair is the
+        // arm, because they answer different questions:
+        //
+        //   MODEL   the σ the estimator is calibrated for (`M·sqrt(K/n)`).
+        //           Zero firings, no budget: this is what T0 = 2 on a drift EMA
+        //           at rate 0.25 buys, and anything above zero here means the
+        //           threshold or the rate has been loosened.
+        //   MEASURED what the pipeline actually produces. **It is 1.8× the
+        //           model on this fixture, and the cause is SUM_SHIFT**: each
+        //           deposit's luma is quantized to 1/1024 of full scale, and a
+        //           GI-realistic signal at ~3% of Lmax lands on ONE OR TWO
+        //           QUANTA per deposit — so the sum carries quantization noise
+        //           comparable to the shot noise it is meant to measure. That
+        //           is a recorded residual of the SUM_SHIFT = 10 overflow
+        //           argument, not a bug in the estimator, and it is gated as a
+        //           RATE rather than pretended away.
+        //
+        // A mechanism that fires freely here spends the cap's whole win on
+        // shot noise, and §12.45 measured what a decay that outruns its own
+        // evidence looks like on screen.
+        const N_USE = Math.max(16, Math.round(nMedian));
+        const SW_USE = N_USE * RAY_WEIGHT;
+        const M0 = 0.4;
+        const sigmaI = sPerRay / Math.sqrt(N_USE);
+        // The estimator's own σ at this deposit count — the denominator of `z`,
+        // and leg (b)'s calibrated arm.
+        const sModel = Math.sqrt(cfgMod.SURPRISE_SHOT_K / N_USE);
+        const evidence = (SW_USE / cfgMod.SUM_SCALE) / (1 - KEEP);
+        const gauss = (() => {
+          let spare = null;
+          return () => {
+            if (spare !== null) { const s = spare; spare = null; return s; }
+            let u = 0;
+            let v = 0;
+            let r = 0;
+            do { u = rng() * 2 - 1; v = rng() * 2 - 1; r = u * u + v * v; } while (r <= 0 || r >= 1);
+            const f = Math.sqrt(-2 * Math.log(r) / r);
+            spare = v * f;
+            return u * f;
+          };
+        })();
+        const FP_BLOCKS = 32;
+        const FP_FRAMES = 200;
+        // The rate a noisy block may fire at before the cap's win is being
+        // spent on noise: one block-frame in 200 across the whole set.
+        const FP_BUDGET = 0.005;
+        const falsePositives = (sigma) => {
+          let fires = 0;
+          let maxZ = 0;
+          for (let b = 0; b < FP_BLOCKS; b++) {
+            let st = { accL: M0 * evidence, accW: evidence, drift: 0 };
+            for (let f = 0; f < FP_FRAMES; f++) {
+              const I = M0 * (1 + sigma * gauss());
+              st = refMath.blockSurpriseUpdate(
+                st, { sumL: Math.max(0, Math.round(I * SW_USE)), sumW: SW_USE }, KEEP,
+                { rayWeight: RAY_WEIGHT, age: 1e6 },
+              );
+              if (st.u > 0) fires++;
+              maxZ = Math.max(maxZ, Math.abs(st.drift) / (M0 * sModel));
+            }
+          }
+          return { fires, maxZ, rate: fires / (FP_BLOCKS * FP_FRAMES) };
+        };
+        const fpModel = falsePositives(sModel);
+        const fpMeasured = falsePositives(sigmaI);
+        check("(b) noise at the estimator's own sigma never surprises", fpModel.fires === 0,
+          `${fpModel.fires} of ${FP_BLOCKS * FP_FRAMES} block-frames fired; worst z reached ` +
+          `${fpModel.maxZ.toFixed(2)} of the ${cfgMod.SURPRISE_T0} it takes`);
+        check(`(b) noise at the MEASURED spread fires under ${(FP_BUDGET * 100).toFixed(1)}% of frames`,
+          fpMeasured.rate <= FP_BUDGET,
+          `${(fpMeasured.rate * 100).toFixed(3)}% (${fpMeasured.fires} of ` +
+          `${FP_BLOCKS * FP_FRAMES}) at ${(sigmaI / sModel).toFixed(2)}x the model, worst z ` +
+          `${fpMeasured.maxZ.toFixed(2)}`);
+        check("(b) the evidence floor was NOT what suppressed it — otherwise vacuous",
+          evidence > cfgMod.SURPRISE_MIN_EVIDENCE,
+          `accW settles at ${evidence.toFixed(2)} against a floor of ${cfgMod.SURPRISE_MIN_EVIDENCE}`);
+
+        // ── (c) DETECTION: a real step must saturate the ramp, fast ──────
+        // ⚠ THE PLAN SAID "a 3σ step reaches u = 1 within 6 frames" AND THE
+        // ARITHMETIC DOES NOT CLOSE, which is worth stating rather than
+        // quietly re-tuning around. `drift` is an EMA at rate 0.25 of `I − M`,
+        // and `M` is the ACCUMULATOR's mean, which chases the step at `1−keep`
+        // — so the tracked difference is already shrinking while the EMA is
+        // still rising and `drift` peaks at ~0.62·Δ (keep = 0.9), never at Δ.
+        // With T1 = 4 that puts full saturation well past 3σ — MEASURED at 9σ
+        // on this fixture, with the ramp opening at 4σ. So the leg measures the
+        // smallest step that saturates and gates a BOUND on it: the number is
+        // the regression instrument, and a constants change that broke
+        // detection moves it.
+        const DETECT_MAX = 12;
+        const DETECT_FRAMES = 6;
+        const stepRun = (mult, frames) => {
+          let st = { accL: M0 * evidence, accW: evidence, drift: 0 };
+          const target = M0 * (1 + mult * sModel);
+          const us = [];
+          for (let f = 0; f < frames; f++) {
+            st = refMath.blockSurpriseUpdate(
+              st, { sumL: Math.round(target * SW_USE), sumW: SW_USE }, KEEP,
+              { rayWeight: RAY_WEIGHT, age: 1e6 },
+            );
+            us.push(st.u);
+          }
+          return { st, us, target };
+        };
+        let detectFull = Infinity;
+        let detectAny = Infinity;
+        for (let mult = 1; mult <= 24; mult++) {
+          const r = stepRun(mult, DETECT_FRAMES);
+          const peak = Math.max(...r.us);
+          if (detectAny === Infinity && peak > 0) detectAny = mult;
+          if (peak >= 1) { detectFull = mult; break; }
+        }
+        say(`   smallest step reaching u > 0 in ${DETECT_FRAMES} frames: ${detectAny}sigma; ` +
+          `u = 1: ${detectFull}sigma (the ramp is T0 ${cfgMod.SURPRISE_T0} to T1 ${cfgMod.SURPRISE_T1})`);
+        check(`(c) a step of at most ${DETECT_MAX} sigma saturates u within ${DETECT_FRAMES} frames`,
+          detectFull <= DETECT_MAX, `${detectFull} sigma`);
+        check("(c) and the ramp opens well below that", detectAny <= DETECT_MAX / 2,
+          `${detectAny} sigma`);
+
+        // ── (d) SELF-TERMINATION: surprise ends by curing itself ─────────
+        // The evidence a surprised block buys is exactly what collapses the
+        // drift, so `u` must fall back to 0 once the accumulator has caught up
+        // — and `keep′` back to the uncompensated `keep`, BIT for bit, because
+        // the kernel skips the branch at u = 0 rather than computing through
+        // it. A mechanism that latched would uncap a block forever.
+        const term = stepRun(detectFull, DETECT_FRAMES);
+        let tSt = term.st;
+        let tFrames = 0;
+        const TERM_MAX = 200;
+        while (tSt.u > 0 && tFrames < TERM_MAX) {
+          tSt = refMath.blockSurpriseUpdate(
+            tSt, { sumL: Math.round(term.target * SW_USE), sumW: SW_USE }, KEEP,
+            { rayWeight: RAY_WEIGHT, age: 1e6 },
+          );
+          tFrames++;
+        }
+        check("(d) u returns to 0 once the accumulator catches up", tSt.u === 0 && tSt.word === 0,
+          `u ${tSt.u} after ${tFrames} frames past the step`);
+        check("(d) and keep' returns to the uncompensated keep, bit for bit",
+          refMath.keepCompensated(KEEP, P.INFLUX_ONE, 1, tSt.word, SURP_F) === KEEP,
+          `${refMath.keepCompensated(KEEP, P.INFLUX_ONE, 1, tSt.word, SURP_F)} vs ${KEEP}`);
+        check("(d) the run really was surprised first — otherwise vacuous",
+          Math.max(...term.us) >= 1, `peak u ${Math.max(...term.us)}`);
+
+        // ── (e) THE DECAY'S BRANCH, ON THE GPU ───────────────────────────
+        // u = 0 must be a SKIP, not an identity computed through the mix, and
+        // u = ONE must be exactly `keepCompensated`'s 5-argument form. Both
+        // diffed word for word against `decayFixed`, like ARM 9's legs — the
+        // same instrument, with the surprise word as the only difference.
+        const setSurpriseWord = (word) => TSL.Fn(() => {
+          store.freeStack.element(uint(store.blockSurpriseBase).add(instanceIndex))
+            .assign(uint(word));
+        })().compute(store.blockTotal);
+        const zeroSurprise = setSurpriseWord(0);
+        const oneSurprise = setSurpriseWord(cfgMod.SURPRISE_ONE);
+        const surpDecay = async () => {
+          frameStampU.value = (frameStampU.value + 1) >>> 0;
+          await renderer.computeAsync(surpDeposit.decay);
+        };
+        surpriseFU.value = SURP_F;
+        await renderer.computeAsync(zeroSurprise);
+        await renderer.computeAsync(seedInflux);
+        const eZero = await compExact(0, 3, surpDecay);
+        check("(e) u = 0: bit-identical to the decay without the branch",
+          eZero.wrong === 0, eZero.first || `${eZero.wrong} words`);
+        await renderer.computeAsync(oneSurprise);
+        await renderer.computeAsync(seedInflux);
+        const eOne = await compExact(0, 2, surpDecay, cfgMod.SURPRISE_ONE, SURP_F);
+        check(`(e) u = ONE: matches keepCompensated at surpriseF ${SURP_F}`,
+          eOne.wrong === 0, eOne.first || `${eOne.wrong} words`);
+        // Non-vacuity: the two arms above must not be the same arithmetic.
+        const kZero = kPrimeFor(0)[0];
+        const kOne = kPrimeFor(0, cfgMod.SURPRISE_ONE, SURP_F)[0];
+        check("(e) and the two arms are genuinely different rates", kOne < kZero,
+          `keep' ${kOne.toFixed(4)} surprised vs ${kZero.toFixed(4)} not`);
+
         if (validationErrors.length) check("no WebGPU validation errors", false, validationErrors[0]);
 
         say("");
@@ -967,6 +1414,17 @@
           varReduction: +reduction.toFixed(2),
           compHold: +holdRatio.toFixed(3),
           compDrift: +driftRatio.toFixed(3),
+          surpBlocks: aBlocks,
+          surpFired: aFired,
+          surpExact: aExact,
+          surpRel: aUlp.toExponential(1),
+          surpNoise: +sPerRay.toFixed(3),
+          surpNoiseRatio: +(sPerRay / sModelPerRay).toFixed(2),
+          surpFalsePositives: fpMeasured.fires,
+          surpFpModel: fpModel.fires,
+          surpDetectAny: detectAny,
+          surpDetectFull: detectFull,
+          surpTerminate: tFrames,
           varPredicted: +predictedDrop.toFixed(2),
           storageLimit: device.limits.maxStorageBuffersPerShaderStage,
           text: out.textContent,

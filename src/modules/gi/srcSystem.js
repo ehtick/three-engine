@@ -50,7 +50,8 @@
 import * as THREE from "three/webgpu";
 import { float, ivec2, step, texture, uint, uniform, vec3 } from "three/tsl";
 import {
-  ALPHA_TRACK_HOLD_MS, CASCADE_COUNT, MAX_LODS, PROBE_RAY_CAP_OFF, SRC_QUALITY, TEMPORAL_ALPHA,
+  ALPHA_TRACK_HOLD_MS, CASCADE_COUNT, COLD_GUARD_FRAMES, GOV_HI, GOV_LO, MAX_LODS,
+  PROBE_RAY_CAP_OFF, SRC_QUALITY, SUM_SHIFT, SURPRISE_ONE, TEMPORAL_ALPHA,
   TEMPORAL_ALPHA_STILL, W0, srcProbeRayCap, srcQualityTier, srcTransportRays,
 } from "./srcConfig.js";
 import { createSrcProbeGizmos } from "./srcGizmos.js";
@@ -62,7 +63,9 @@ import {
   formatSrcProbeStats,
   readSrcProbeStats,
 } from "./srcProbes.js";
-import { createSrcBinStore, createSrcDepositFrame, createSrcShadeCounters } from "./srcDeposit.js";
+import {
+  DEPOSIT_SCALE, createSrcBinStore, createSrcDepositFrame, createSrcShadeCounters,
+} from "./srcDeposit.js";
 import { createSrcHitShader } from "./srcShade.js";
 import { createSrcMergeFrame, formatSrcMerge } from "./srcMerge.js";
 import { createSrcSecondaryFrame, formatSrcSecondary } from "./srcSecondary.js";
@@ -352,6 +355,28 @@ export function createSrcProbeSystem({
   };
   const liftFor = (alpha) => (globalThis.__giSrcAlphaComp === false ? 1 : motionOf(alpha));
   const influxLiftU = uniform(liftFor(readAlpha()));
+  // ── SURPRISE (srcConfig's SURPRISE block) ─────────────────────────────────
+  //
+  // Read ONCE, at build, unlike every other hatch here — because it decides
+  // whether the bundles are PASSED, and a bundle is a set of nodes in a kernel
+  // rather than a uniform. `false` builds the pre-surprise kernels byte for
+  // byte, which is the only form of "off" that can back a bit-exactness claim.
+  // The two live dials (`__giSrcSurpriseGain`, `__giSrcColdFill`) are polled
+  // per frame like the rest, and gain 0 is the in-page A/B.
+  const surpriseOn = globalThis.__giSrcSurprise !== false;
+  // How much faster a fully surprised block decays: `keepFast = 1 − α_moving`
+  // expressed as a multiplier on THIS frame's `1 − keep`. Never below 1 — the
+  // mechanism may only ever forget faster, never slower, so a pinned α (where
+  // `keep` is already the fast one) makes this exactly 1 and the mix a no-op.
+  const surpriseFU = uniform(1);
+  // The governor. One multiply, applied in the publish, reaching both consumers
+  // through the word it writes — srcConfig's one-switch rule.
+  const surpriseGainU = uniform(1);
+  // [D1']'s exemption master switch, 0 for the COLD_GUARD_FRAMES after a build
+  // or a re-anchor (when EVERY block is cold at once) and whenever the cap is
+  // pinned by an instrument.
+  const boostEnableU = uniform(0, "uint");
+  let coldGuard = COLD_GUARD_FRAMES;
   // Starts at 1, not 0: an unclaimed block's stamp is 0, and a frame counter
   // that also started there would call every block in the pool fresh on frame
   // zero. Harmless in fact (an unclaimed block holds zeros, which zero to
@@ -478,14 +503,11 @@ export function createSrcProbeSystem({
     };
   };
   publishTransport();
-  const rayFrame = createSrcRayFrame(store, rayStore, {
-    pixelProbe: frame.pixelProbe,
-    raysPerPixel: tier.raysPerPixel,
-    stride: strideU,
-    phase: phaseU,
-    threads: transportThreads,
-    cap: capU,
-  });
+  // ⚠ `createSrcRayFrame` IS CALLED BELOW THE BIN STORE, not here where the ray
+  // store is built. The surprise publish reads the per-block statistics, and
+  // those live in the bin store's `scratch` tail (R7 — [E] is at the portable
+  // 8-buffer ceiling, so they could not have a buffer of their own). Order of
+  // CONSTRUCTION only; the dispatch order in `passes` is unchanged.
 
   // ── [E] + [F]: THE SPLIT SCATTER AND THE RESOLVE (plan §12.13.5 unit 3) ──
   //
@@ -556,6 +578,39 @@ export function createSrcProbeSystem({
   const binStore = volume?.occupancyField
     ? createSrcBinStore(store, { w0: W0, secondaryCapacity })
     : null;
+
+  // ── ALGORITHM 3'S FRAME, now that the statistics have somewhere to live ───
+  //
+  // The surprise bundle needs the bin store, so this sits below it (see the
+  // note at `publishTransport`). Both bundles are `null` without a bin store or
+  // with `__giSrcSurprise = false`, and that is the byte-identical build.
+  const surpriseBundle = surpriseOn && binStore
+    ? {
+        scratch: binStore.scratch,
+        statBase: binStore.blockStatBase,
+        keep: keepU,
+        lift: influxLiftU,
+        gain: surpriseGainU,
+        frameStamp: frameStampU,
+        // What ONE deposit adds to a block's weight sum. [E] shifts each
+        // deposit by SUM_SHIFT before summing, so this is `DEPOSIT_SCALE`
+        // through the same shift — the divisor that turns the weight sum back
+        // into a deposit COUNT for the shot-noise term.
+        rayWeight: DEPOSIT_SCALE >> SUM_SHIFT,
+      }
+    : null;
+  const rayFrame = createSrcRayFrame(store, rayStore, {
+    pixelProbe: frame.pixelProbe,
+    raysPerPixel: tier.raysPerPixel,
+    stride: strideU,
+    phase: phaseU,
+    threads: transportThreads,
+    cap: capU,
+    capBoost: surpriseBundle
+      ? { frameStamp: frameStampU, boostEnable: boostEnableU, counters: store.counters }
+      : null,
+    surprise: surpriseBundle,
+  });
 
   // ── [H]: THE IRRADIANCE TILES (plan §12.18.7 unit 4) ─────────────────────
   //
@@ -809,6 +864,12 @@ export function createSrcProbeSystem({
         keep: keepU,
         frameStamp: frameStampU,
         influxLift: influxLiftU,
+        // The other half of the same bundle: [E] fills the per-block sums and
+        // the decay reads the `u` word the publish wrote from them. Null and
+        // neither node exists — see `createSrcDepositFrame`'s `surprise` doc.
+        surprise: surpriseBundle
+          ? { statBase: binStore.blockStatBase, surpriseF: surpriseFU }
+          : null,
         maxLods: MAX_LODS,
       })
     : null;
@@ -1107,6 +1168,31 @@ export function createSrcProbeSystem({
       const lift = liftFor(alpha);
       globalThis.__giSrcCompLiftLive = lift;
       if (influxLiftU.value !== lift) influxLiftU.value = lift;
+      // ── SURPRISE'S TWO CPU DIALS ─────────────────────────────────────────
+      //
+      // `surpriseF` is the fast-α decay expressed against THIS frame's own
+      // `keep` — the stride root is already folded into `keep`, so a surprised
+      // block reaches the rate the moving scene would have used at stride 1
+      // rather than a rate that happens to be faster. Floored at 1: surprise
+      // may only accelerate forgetting. With α pinned to the moving value the
+      // ratio IS 1 and the mix becomes a no-op, which is the instrument rule
+      // (a pin must not be quietly overridden by a scene-derived term).
+      const decayNow = Math.max(1e-6, 1 - keep);
+      const surpriseF = Math.max(1, TEMPORAL_ALPHA / decayNow);
+      if (surpriseFU.value !== surpriseF) surpriseFU.value = surpriseF;
+      // THE GOVERNOR. Surprise and §12.45's scene-wide light window solve the
+      // same problem, and both at once pays for uncapped evidence twice while
+      // the window's relaxed root already decays fast. So the per-block term
+      // fades out across [GOV_LO, GOV_HI] of the same motion signal the α ramp
+      // rides. Smoothstep rather than a threshold for R1's reason: a binary
+      // handover would step the ray budget on the frame it crossed.
+      const mLight = motionOf(alpha);
+      const govT = Math.min(1, Math.max(0, (mLight - GOV_LO) / Math.max(1e-6, GOV_HI - GOV_LO)));
+      const forcedGain = Number(globalThis.__giSrcSurpriseGain);
+      const gain = Number.isFinite(forcedGain)
+        ? Math.min(1, Math.max(0, forcedGain))
+        : 1 - govT * govT * (3 - 2 * govT);
+      if (surpriseGainU.value !== gain) surpriseGainU.value = gain;
       // The stamp advances with the jitter and for the same reason: both are
       // "which frame is this", and the decay pass compares against it exactly.
       // It wraps at 2^32 — 2.2 years at 60 fps, and the only consequence of a
@@ -1168,6 +1254,24 @@ export function createSrcProbeSystem({
         capU.value = nextCap;
         publishTransport();
       }
+      // ── [D1']'s EXEMPTION SWITCH ─────────────────────────────────────────
+      //
+      // Off for COLD_GUARD_FRAMES after a build or a re-anchor: a re-anchor
+      // re-keys every probe, so EVERY block is claimed on one frame and the
+      // cold fill would multiply the whole frame's ray budget by four on
+      // exactly the frame that already rebuilt the lattice.
+      //
+      // A PINNED CAP NEVER LIFTS, the same instrument rule §12.45 states for
+      // the window lift: pins belong to instruments, and a pin that drifted
+      // with scene state would un-A/B every arm that set it.
+      //
+      // `__giSrcColdFill = false` turns off BOTH legs — one uniform gates the
+      // whole exemption path in [D1'], and splitting it would cost a second
+      // uniform to disable a leg no measurement has separated yet.
+      if (coldGuard > 0) coldGuard--;
+      const boostOn = surpriseOn && globalThis.__giSrcColdFill !== false
+        && !capPinned && coldGuard === 0 ? 1 : 0;
+      if (boostEnableU.value !== boostOn) boostEnableU.value = boostOn;
       // [J]'s LOD-bias hatch, polled beside the others for the same §12.23
       // reason: a build-time read can only be A/B'd by reloading.
       secondary?.poll();
@@ -1187,12 +1291,37 @@ export function createSrcProbeSystem({
       a.copy(scratch);
       anchored = true;
       reanchors++;
+      // Every probe is about to be re-keyed, so every block will be claimed on
+      // one frame and every one of them COLD. Re-arm the guard — see the switch
+      // above for what the unguarded version costs.
+      coldGuard = COLD_GUARD_FRAMES;
       return true;
     },
 
     /** Telemetry for `profile.giPasses` and the boot log. Async — off the hot path. */
     async readStats(renderer) {
       const stats = await readSrcProbeStats(renderer, store);
+      // ── SURPRISE'S TWO INSTRUMENTS, PUBLISHED HERE AND NOT PER FRAME ─────
+      //
+      // Both are GPU readbacks, and §13's startup work priced what a readback
+      // on the frame path costs (the `field ready` diagnostic was 1.0–1.8 s of
+      // every startup number this project ever recorded). `readStats` is
+      // already async and already off the hot path, so a probe polls the
+      // instrument rather than the renderer paying for it every frame.
+      //
+      // They separate the three ways this mechanism renders identically to
+      // being absent: never armed (`boosted` 0 with a nonzero mean u — the
+      // guard or the pin), never surprised (mean u 0 — the governor or the
+      // evidence floor), or working.
+      if (surpriseBundle) {
+        globalThis.__giSrcBoostedLive = stats.reduce((a, s) => a + (s.boosted ?? 0), 0);
+        const free = new Uint32Array(await renderer.getArrayBufferAsync(store.freeStack.value));
+        let sum = 0;
+        for (let b = 0; b < store.blockTotal; b++) sum += free[store.blockSurpriseBase + b] >>> 0;
+        globalThis.__giSrcSurpriseLive = store.blockTotal > 0
+          ? sum / store.blockTotal / SURPRISE_ONE
+          : 0;
+      }
       return {
         cascades: stats,
         reanchors,
