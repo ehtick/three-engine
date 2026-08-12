@@ -719,10 +719,6 @@ export function createSrcProbeSystem({
         // stride/phase uniforms below stay because the dispatch SIZE is still
         // the transport's and a live ceiling change must keep moving it.
         rayWork: rayStore.rayWork,
-        // [D6]'s GPU-written workgroup count — makes [E] as wide as the
-        // worklist instead of as wide as the tier's ray budget. Passed beside
-        // `rayWork` because the deposit refuses one without the other.
-        rayDispatchAttr: rayStore.rayDispatchAttr,
         pixelCount,
         raysPerPixel: tier.raysPerPixel,
         stride: strideU,

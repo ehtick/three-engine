@@ -121,7 +121,6 @@ import {
   vec3,
 } from "three/tsl";
 import { CASCADE_COUNT, MAX_LODS, W0, binCount, binGridWidth } from "./srcConfig.js";
-import { RAY_DISPATCH_WG } from "./srcRays.js";
 import {
   binMorton,
   chebyshev,
@@ -401,7 +400,6 @@ export function createSrcDepositFrame(store, bins, {
   frameStamp = null,
   influxLift = null,
   rayWork = null,
-  rayDispatchAttr = null,
   maxLods = MAX_LODS,
   stride = null,
   phase = null,
@@ -419,49 +417,28 @@ export function createSrcDepositFrame(store, bins, {
   const strided = stride && phase && threads > 0;
   const pixelOf = strided ? (t) => transportPixel(t, stride, phase).toVar() : (t) => t;
   const outOfRange = strided ? (p) => p.greaterThanEqual(uint(pixelCount)) : null;
-  // ── HOW WIDE IS [E] DISPATCHED? ───────────────────────────────────────────
+  const dispatchCount = strided ? threads : pixelCount;
+  // ── HOW WIDE IS [E] DISPATCHED, SAID OUT LOUD ─────────────────────────────
   //
-  // `rayDispatchAttr` is [D6]'s GPU-written workgroup count, and passing it to
-  // `.compute()` (three routes a non-number to `dispatchWorkgroupsIndirect`)
-  // makes [E] exactly as wide as the worklist. Without it the pass ran at the
-  // tier's baked `threads` — 65,536 at high against 25,251 real rays on the
-  // user's editor — and the per-probe cap's ray cut could not reach the clock
-  // at all (the flat cap sweep in srcRays' store doc).
+  // ⛔ AN INDIRECT DISPATCH LIVED HERE AND WAS REVERTED — twice-refuted, and the
+  // second time it broke the editor outright. [E] launches the tier's baked
+  // `threads` (65,536 at high) however few rays the worklist holds, so making
+  // the dispatch as wide as the worklist looked like free money. It is not:
+  //   · `probe:gi-src-cost SWEEP=cap`, indirect CONFIRMED live by this line —
+  //     off 126,382 rays 3.353 ms · cap 32 1.931 · 16 1.920 · 8 1.977. Flat
+  //     below 32, exactly as before. Dispatch width is NOT the floor.
+  //   · Then the user's editor read `shadedHitsPerFrame: 0` against 51,397 rays
+  //     with NO console error: probes populating, [E] dispatching ZERO
+  //     workgroups. It worked in headless Chrome and produced nothing in
+  //     WebView2 — the same harness-vs-editor divide that has the deposit at
+  //     1.5 ms here and 16.5 ms there, and it is unexplained in both directions.
+  // Anyone re-attempting it: prove the indirect buffer's contents on the EDITOR,
+  // not in the harness, before trusting a single number from it.
   //
-  // The number path stays for every gate built before the worklist: those
-  // builds have no `rayWork`, so [E] still maps thread → pixel by stride and
-  // early-returns on the losers.
-  //
-  // ⚠ GATED ON `rayWork`, NOT ON THE ATTRIBUTE ALONE. Indirect only makes
-  // sense with the worklist mapping: thread i traces worklist entry i. On the
-  // classic mapping thread i owns PIXEL `i·stride + phase`, so shrinking the
-  // dispatch to the winner count would silently stop tracing most of the
-  // screen — a correctness bug that presents as "GI got dimmer", not a crash.
-  const dispatchCount = (rayWork && rayDispatchAttr)
-    ? rayDispatchAttr
-    : (strided ? threads : pixelCount);
-  // WHICH ARM RAN, said out loud at build time. A null result from an indirect
-  // dispatch is only worth believing if the indirect dispatch happened, and
-  // "the image is unchanged" cannot tell the two apart — [E] early-returns past
-  // the worklist either way, so a silently-direct build renders identically and
-  // measures identically. This line is the difference between "dispatch width
-  // was not the cost" and "I never changed the dispatch width".
-  console.log(
-    `[gi] src deposit dispatch: ${dispatchCount === rayDispatchAttr
-      ? "INDIRECT (workgroups from the worklist)"
-      : `DIRECT ${dispatchCount} threads${strided ? " (strided)" : ""}`}`,
-  );
-  // ⚠ REFUTED AS A PERFORMANCE LEVER, KEPT AS CORRECTNESS. [E] used to launch
-  // the tier's baked `threads` (65,536 at high) against as few as 13k real
-  // rays; this makes it launch the worklist's own width. The gate-state line
-  // above confirmed INDIRECT was live, and the cap sweep did not move:
-  //   cap off 126,382 rays 3.353 ms · 32 → 1.931 · 16 → 1.920 · 8 → 1.977
-  // Still flat below 32, so the dispatch width was NOT the floor. What the
-  // sweep DOES now say is the marginal ray cost: 113k fewer rays buys 1.37 ms,
-  // i.e. **~14 ns/ray** — tracing is cheap. The ~1.8 ms that survives at cap 8
-  // is fixed cost, and the remaining candidates are this group's other two
-  // dispatches, both sized by `binTotal` (allocated bins) rather than by rays.
-  // Look there before touching the tracer again.
+  // The line itself stays. A null result from a dispatch change is unreadable
+  // without it — [E] early-returns past the worklist either way, so a build on
+  // the wrong arm renders AND measures identically to one on the right arm.
+  console.log(`[gi] src deposit dispatch: DIRECT ${dispatchCount} threads${strided ? " (strided)" : ""}`);
 
   // ── decay ─────────────────────────────────────────────────────────────────
   // Every allocated bin, every frame, exactly where the clear pass used to be —
@@ -738,30 +715,6 @@ export function createSrcDepositFrame(store, bins, {
       }
     });
   })().compute(dispatchCount));
-  // ── THE WORKGROUP-SIZE COUPLING, CHECKED RATHER THAN ASSUMED ──────────────
-  //
-  // [D6] converts the worklist length into WORKGROUPS by dividing by
-  // `DISPATCH_WG`. If [E]'s workgroup size ever stops being three's default 64
-  // — an override here, or a change upstream — that divisor is wrong and the
-  // dispatch silently covers the wrong fraction of the worklist. Too few
-  // workgroups drops the tail of the rays: no error, no crash, just less light,
-  // which is the hardest class of bug this module produces.
-  //
-  // So read the size back off the node three actually built and fall back to
-  // the direct dispatch if it disagrees. A loud, correct, slower build beats a
-  // quiet wrong one.
-  if (dispatchCount === rayDispatchAttr) {
-    const node = passes[passes.length - 1];
-    const wg = (node?.workgroupSize ?? []).reduce((a, b) => a * b, 1);
-    if (wg !== RAY_DISPATCH_WG) {
-      console.warn(
-        `[gi] src deposit: [E] workgroup size is ${wg}, but [D6] divides the worklist by ` +
-          `${RAY_DISPATCH_WG} — falling back to the direct dispatch. Fix RAY_DISPATCH_WG in srcRays.js.`,
-      );
-      node.dispatchSize = null;
-      node.count = strided ? threads : pixelCount;
-    }
-  }
 
   // ── [F] resolve ───────────────────────────────────────────────────────────
   // ZERO-COUNT BINS ARE UNKNOWN, NOT ZERO — `srcMath.js`'s `resolveBin` returns
