@@ -12,16 +12,19 @@
 //
 // ══ IT IS A CLOSURE FIRST AND A PASS SECOND, AND THAT IS THE POINT ═════════
 //
-// `gatherAt(position, normal)` answers for an ARBITRARY WORLD POINT. Two call
+// `gatherAt(position, normal)` answers for an ARBITRARY WORLD POINT. Three call
 // sites want that and they are not the same shape:
 //
 //   • the primary diffuse term, once per gbuffer pixel — which runs here, in
 //     its own compute pass, and hands `createGiResolve` a texture;
 //   • the EXACT-REFLECTION HIT, at a world point no screen texture can answer
 //     for. That call site has been on `gather == null` since the transport died
-//     (§12.17.3) and this is the unit that brings it back.
+//     (§12.17.3) and this is the unit that brings it back;
+//   • [J]'s SECOND BOUNCE (`srcSecondary.js`), once per entry of the deposit's
+//     hit list — a set of world points with no screen grid at all, which is why
+//     omitting `readPixel` here builds the closure and nothing else.
 //
-// One definition, two call sites. The alternative — a screen pass plus a
+// One definition, three call sites. The alternative — a screen pass plus a
 // separate closure for reflections — is two implementations of the same
 // integral, and the one nobody looks at drifts.
 //
@@ -132,18 +135,28 @@ const CORNERS = Array.from({ length: 8 }, (_, k) => [k & 1, (k >> 1) & 1, (k >> 
  * @param {Node|number} options.spacing0
  * @param {Node} options.camera  world camera position; the LOD metric's centre
  * @param {Node} options.anchor  the SAME lattice anchor the population used
- * @param {(i) => object} options.readPixel  the gbuffer, as a closure
- * @param {number} options.width  gbuffer width
- * @param {number} options.height
+ * @param {Node} [options.lodBias]  added to the fractional LOD before the shell
+ *   split — [J]'s dial for reading the field COARSER than the shading point's
+ *   own LOD (srcConfig's `SECONDARY_LOD_OFFSET`). ABSENT on the screen pass,
+ *   deliberately: no node is added and the graph is byte-identical to the one
+ *   every pre-[J] gate measured.
+ * @param {(i) => object} [options.readPixel]  the gbuffer, as a closure. Omit
+ *   it (with `width`/`height`) to build the CLOSURE ONLY — `gatherAt` and
+ *   nothing else. `srcSecondary.js` wants the integral at a hit list, not at a
+ *   screen grid, and building the pass anyway would allocate a storage texture
+ *   nothing ever samples and a dispatch nothing ever runs.
+ * @param {number} [options.width]  gbuffer width
+ * @param {number} [options.height]
  */
 export function createSrcScreenGather(store, tiles, {
   lookup,
   spacing0,
   camera,
   anchor,
-  readPixel,
-  width,
-  height,
+  readPixel = null,
+  width = 0,
+  height = 0,
+  lodBias = null,
   maxLods = MAX_LODS,
   w0 = W0,
 } = {}) {
@@ -161,6 +174,11 @@ export function createSrcScreenGather(store, tiles, {
     const P = vec3(position).toVar();
     const N = vec3(normal).normalize().toVar();
     const lodF = lodAtDistance(chebyshev(P, camera), spacing0, maxLods).toVar();
+    // The bias is RE-CLAMPED to the same window `lodAtDistance` returns. A
+    // negative bias would otherwise select a lattice finer than any the
+    // population inserts at (every corner misses, silently) and a positive one
+    // past the last shell would index a LOD the 4-bit key cannot hold.
+    if (lodBias) lodF.assign(lodF.add(float(lodBias)).clamp(0, maxLods - 1));
     // `lodShells` on the CPU returns one or two shells; a GPU kernel cannot
     // branch on a list length, so both are written out and the second is
     // guarded by its own weight. `min(maxLods - 1)` matches the mirror's clamp
@@ -235,6 +253,16 @@ export function createSrcScreenGather(store, tiles, {
     If(shellTotal.greaterThan(0), () => { out.assign(out.div(shellTotal)); });
     return { irradiance: out, corners: cornersHit };
   };
+
+  // CLOSURE-ONLY, and the header's first section is the whole argument for it:
+  // this module is a gather that HAPPENS to own a screen pass, not a screen
+  // pass that exposes a gather. [J] wants the integral over a hit list, so it
+  // takes the closure and stops here — no storage texture, no dispatch, and
+  // (importantly) no `__giSrcTargetVersion` bump, which would make the
+  // resolve's texture look re-created to a build that never asked for one.
+  if (!readPixel) {
+    return { gatherAt, width: 0, height: 0, dispose() {} };
+  }
 
   // ── the screen pass ───────────────────────────────────────────────────────
   const target = new THREE.StorageTexture(width, height);

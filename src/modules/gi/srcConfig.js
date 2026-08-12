@@ -77,12 +77,37 @@ export const IRRADIANCE_TILE_SIZE =
   IRRADIANCE_TILE_INTERIOR + 2 * IRRADIANCE_TILE_BORDER; // 8
 
 /**
- * Secondary (multibounce) probe cache sits this many LODs coarser than the
- * primary probes that spawned it (paper §6). No third-bounce cache exists —
- * the secondary cache samples ITSELF temporally, which is what makes the
- * bounce count effectively infinite at one cache's cost.
+ * DEFAULT for [J]'s LOD-bias uniform, and it ships at ZERO rather than at the
+ * paper's 2.
+ *
+ * The paper's §6 secondary cache sits two LODs coarser than the probes that
+ * spawned it, and this constant carried that 2 for as long as [J] was a hook.
+ * SRC has no separate secondary cache — [J] re-reads the PRIMARY tile atlas
+ * (§12.26.9 measured the same-spacing cache as the least-leaky option, because
+ * coarsening BRIGHTENS a feedback loop) — and on that lattice a positive bias
+ * has nothing to read: [B] inserts keys only at the CAMERA-DERIVED LOD, so
+ * there are no probes at LOD+2 and every biased corner lookup misses. The
+ * gather renormalizes a missing shell away, so the bias would cost eight hash
+ * finds per hit and change nothing.
+ *
+ * It stays a live uniform rather than a deleted idea because "nothing exists
+ * up there" is a property of the POPULATION, not of the estimator, and a
+ * future coarse-shell population would make the bias meaningful again.
+ * `__giSrcSecondaryLodBias` is the A/B hatch (see `srcSecondary.js`).
  */
-export const SECONDARY_LOD_OFFSET = 2;
+export const SECONDARY_LOD_OFFSET = 0;
+
+/**
+ * Words per entry in [J]'s hit list — the compact record [E] appends for every
+ * shaded hit and [J] re-shades from. Unpacked floats via `floatBitsToUint`
+ * (`dynamicObjects.js` uses the same idiom for its BVH triangle pool): 0-2 the
+ * hit position, 3-5 the face-forwarded normal, 6-8 the CLAMPED albedo, 9 the
+ * destination bin's word base, 10-11 reserved.
+ *
+ * The list rides the tail of the bin store's `scratch` buffer (R7 — see
+ * `createSrcBinStore`), so a wider entry costs memory but never a binding.
+ */
+export const SECONDARY_HIT_WORDS = 12;
 
 /**
  * Temporal blend rate (plan §4.6), applied to the DEPOSIT ACCUMULATORS rather

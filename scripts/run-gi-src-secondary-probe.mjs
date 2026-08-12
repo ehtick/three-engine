@@ -12,20 +12,26 @@
 // feedback loop: nothing escapes) whose only light is an emissive cube.
 //
 // Arms, in ONE page (a temporal A/B across processes is the comparison the
-// flicker rig's header forbids). [J] is OPT-IN (`__giSrcSecondary = true`)
-// until it is a separate pass — the inline wiring put 48 SECONDS of pipeline
-// compile into the deposit kernel (§12.39) — so the BOUNCE arm carries the
-// flag from boot and the SINGLE arm is the shipping default:
-//   multibounce  `__giSrcSecondary = true` before the first build. Settle,
-//                then measure wall patches over K rounds: the round
-//                increments must CONTRACT at the tail, and the fixed point
-//                must sit ABOVE the single-bounce arm (in a closed box the
-//                series 1 + ρ̄ + ρ̄² … is worth +10% at the very least) and
-//                BELOW R4's hard ceiling (×10 at ρ = 0.9 — in practice ~×2;
-//                past it the loop is not contracting).
-//   single       flag cleared + a quality toggle to force the rebuild (the
-//                eyecheck's runtime arm measured toggle ≡ reload at 1.018×),
-//                then the same settle + measure.
+// flicker rig's header forbids). [J] IS NOW A PASS OF ITS OWN
+// (`srcSecondary.js`) and therefore DEFAULT ON from the tier — the opt-in
+// existed only while the bounce was inlined into the hit shader, where it cost
+// 48 seconds of pipeline compile per boot (§12.39). So the arms swap roles: the
+// BOUNCE arm is the plain build, and the SINGLE arm is the one carrying a flag.
+//   multibounce  the shipping default. Settle, then measure wall patches over
+//                K rounds: the round increments must CONTRACT at the tail, and
+//                the fixed point must sit ABOVE the single-bounce arm (in a
+//                closed box the series 1 + ρ̄ + ρ̄² … is worth +10% at the very
+//                least) and BELOW R4's hard ceiling (×10 at ρ = 0.9 — in
+//                practice ~×2; past it the loop is not contracting).
+//   single       `__giSrcSecondary = false` + a quality toggle to force the
+//                rebuild (the eyecheck's runtime arm measured toggle ≡ reload
+//                at 1.018×), then the same settle + measure.
+//
+// ⚠ THE IMAGE ARMS ALONE CANNOT PASS THIS. A [J] whose pipeline silently fails
+// to create dispatches nothing and renders a frame that looks single-bounce,
+// and two arms of temporal noise can clear a +8% bar by themselves. So the
+// COUNTERS are asserted too: `secondaryHits > 0` says the pass ran, and
+// `secondaryOverflow === 0` says the hit list held every hit it was handed.
 //
 //   node scripts/run-gi-src-secondary-probe.mjs [url]
 // Env: EMIT (default 4), SHOT (default scripts), HEADED=1
@@ -97,8 +103,9 @@ await page.evaluateOnNewDocument((P) => {
   localStorage.setItem("engine.projectRoot.v1", P);
   localStorage.setItem("engine.recentProjects.v1", JSON.stringify([P]));
   globalThis.__editorKeepRendering = true;
-  // The bounce arm's opt-in, set before the FIRST build (secondaryOn is a
-  // build-time gate).
+  // Redundant since [J] became a pass and the gate flipped to default-on, and
+  // kept deliberately: it pins the ARM rather than inheriting it, so this run
+  // still means "multibounce" if the default ever moves again.
   globalThis.__giSrcSecondary = true;
 }, GEN_ROOT);
 await page.goto(url, { waitUntil: "load", timeout: 60000 });
@@ -174,13 +181,44 @@ const rounds = async (label) => {
   return out;
 };
 
-console.log("== ARM multibounce (opted in from boot)");
+/**
+ * [J]'s counters, off the built system — the half of this gate no screenshot
+ * can supply. `secondaryHits` is written by the secondary kernel itself, so it
+ * is zero exactly when the pass did not run (missing from `passes`, a pipeline
+ * that failed to create, an empty hit list), and a build in that state produces
+ * the same image as a scene whose second bounce is genuinely faint.
+ */
+const readSecondary = () =>
+  page.evaluate(async () => {
+    const { ensureEngine } = await import("/src/editor/engineInstance.js");
+    const engine = await ensureEngine();
+    const sp = engine.modules.get("gi")?.system?.state?.screen?.srcProbes;
+    if (!sp) return { built: false };
+    const s = await sp.readStats(engine.renderer);
+    return {
+      built: true,
+      pass: !!sp.secondary,
+      passes: sp.passes?.length ?? 0,
+      groups: (sp.passGroups ?? []).reduce((n, g) => n + g.count, 0),
+      capacity: sp.secondary?.capacity ?? 0,
+      hits: s.rays?.secondaryHits ?? 0,
+      clamped: s.rays?.secondaryClamped ?? 0,
+      overflow: s.rays?.secondaryOverflow ?? 0,
+      shadedHits: s.rays?.shaded ?? 0,
+    };
+  });
+
+console.log("== ARM multibounce (the shipping default)");
 await waitReady("multibounce", 0);
 const A = await rounds("multibounce");
+const secA = await readSecondary();
+console.log(`  [J] multibounce: ${JSON.stringify(secA)}`);
 await writeFile(path.join(SHOT, "gi-src-secondary-multibounce.png"), A[A.length - 1].buf);
 
-console.log("== ARM single (flag cleared, rebuild via quality toggle)");
-await page.evaluate(() => { globalThis.__giSrcSecondary = undefined; });
+console.log("== ARM single (opted out, rebuild via quality toggle)");
+// `= false` and not `undefined`: under the default-on gate an unset flag IS
+// multibounce, so clearing it would compare the loop to itself.
+await page.evaluate(() => { globalThis.__giSrcSecondary = false; });
 const toggleMark = giLines.length;
 await must("component.setProp", { id: gi.id, type: "global-illumination", key: "quality", value: "medium" });
 await waitBuilt("toggle-out");
@@ -188,6 +226,8 @@ await must("component.setProp", { id: gi.id, type: "global-illumination", key: "
 await waitBuilt("toggle-back");
 await waitReady("single", toggleMark);
 const B = await rounds("single");
+const secB = await readSecondary();
+console.log(`  [J] single: ${JSON.stringify(secB)}`);
 await writeFile(path.join(SHOT, "gi-src-secondary-single.png"), B[B.length - 1].buf);
 
 let failed = 0;
@@ -217,6 +257,24 @@ check(mA > mB * 1.08,
   `the loop adds energy in a closed box: multibounce ${mA.toFixed(4)} vs single ${mB.toFixed(4)} (+${((mA / mB - 1) * 100).toFixed(1)}%)`);
 check(mA < mB * 10,
   `and R4 bounds it: ${(mA / mB).toFixed(2)}x is inside the 1/(1-0.9) = 10x hard ceiling`);
+// ── THE PASS RAN, AND IT IS NOT AN IMAGE CLAIM ─────────────────────────────
+//
+// Asserted before the boot lines below because a flag and a log line agree
+// with each other whether or not a kernel dispatched; this counter is written
+// by the kernel itself.
+check(secA.pass === true, `the multibounce arm BUILT [J] (${secA.passes} passes)`);
+// `profile.giPasses` asserts this sum and WITHHOLDS every per-group number when
+// it fails, so a drifted group list costs the whole cost breakdown rather than
+// mislabelling one row — worth catching here, where inserting [J] is exactly
+// the edit that can drift it.
+check(secA.groups === secA.passes,
+  `passGroups still accounts for every dispatch: ${secA.groups} of ${secA.passes}`);
+check(secA.hits > 0,
+  `[J] actually dispatched: ${secA.hits} secondary deposits of ${secA.capacity} capacity ` +
+  `(${secA.shadedHits} shaded hits that frame)`);
+check(secA.overflow === 0,
+  `the hit list held every hit — overflow ${secA.overflow} (capacity is transportThreads x raysPerPixel, an exact bound)`);
+check(secB.pass === false, `and the opted-out arm built no [J] pass (${secB.passes} passes)`);
 const lineA = giLines.find((l) => /MULTIBOUNCE via the tile atlas/.test(l));
 const lineB = giLines.slice().reverse().find((l) => /single bounce/.test(l));
 check(!!lineA, "the boot line names the multibounce (built-state telemetry, not flags)");

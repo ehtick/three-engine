@@ -65,6 +65,7 @@ import {
 import { createSrcBinStore, createSrcDepositFrame, createSrcShadeCounters } from "./srcDeposit.js";
 import { createSrcHitShader } from "./srcShade.js";
 import { createSrcMergeFrame, formatSrcMerge } from "./srcMerge.js";
+import { createSrcSecondaryFrame, formatSrcSecondary } from "./srcSecondary.js";
 import { createSrcScreenGather, formatSrcGather } from "./srcScreenGather.js";
 import { createSrcTileAtlas, formatSrcTiles } from "./srcTiles.js";
 import { createSrcRayFrame, createSrcRayStore } from "./srcRays.js";
@@ -504,7 +505,57 @@ export function createSrcProbeSystem({
   // §12.13.4 deliberately left clamp-vs-auto-exposure open, and the deposit
   // COUNTS its own clamps so the decision gets made from a measurement.
   const lmaxU = uniform(Number(globalThis.__giSrcLmax) || 16);
-  const binStore = volume?.occupancyField ? createSrcBinStore(store, { w0: W0 }) : null;
+
+  // ── [E']: HIT SHADING (plan §7 Phase 5, §12.26) ───────────────────────────
+  //
+  // Gated on having something to shade WITH as well as a flag. `__giSrcShade`
+  // off, or no `lighting`, or no `staticSurfaceAt`, and `shadeHit` stays null —
+  // which keeps this build byte-identical and keeps every gate written before
+  // Phase 5 comparable, exactly as `__giSrcProbes` does for the population.
+  //
+  // **THE TWO ARGUMENTS ARE NOT ONE SWITCH.** `staticSurfaceAt` is the other
+  // half of Phase 5 and lives in `srcSurface.js`: §12.9 deleted the coarse
+  // surface-attribution grid, so there is currently no path on the GPU from a
+  // static hit to its material. Shading with `lighting` alone would light the
+  // whole static world at one default albedo — a grey-box bounce that looks
+  // plausible, is wrong everywhere, and would be read as a shader bug rather
+  // than a missing input. `STAT_UNATTRIBUTED` counts it if it ever happens.
+  //
+  // DECIDED HERE, ABOVE THE BIN STORE, because [J]'s hit list is a REGION of
+  // the store's `scratch` buffer (R7) and the store therefore has to be built
+  // knowing whether the multibounce is on.
+  const staticSurfaceAt = surfaces?.surfaceAt ?? null;
+  const shadeEnabled = srcShadeEnabled() && !!lighting && !!staticSurfaceAt;
+  // ── [J]'s GATE — DEFAULT ON, FROM THE TIER (§12.39) ───────────────────────
+  //
+  // It was opt-in (`__giSrcSecondary === true`) for exactly as long as [J] was
+  // a LINE INSIDE THE DEPOSIT: inlining `gatherAt` into the hit shader took
+  // that kernel from 58 kB to 323 kB of WGSL and its pipeline compile to 48
+  // seconds, so multibounce cost every boot half a minute whether or not the
+  // scene needed it. Now that [J] is its own ~20 kB dispatch (`srcSecondary.js`)
+  // the deposit is within ~2% of the single-bounce build (`smoke:gi-gpu`
+  // asserts it), so the reason for the opt-in is gone and the flag flips to an
+  // OPT-OUT: `tier.secondary` is the low-tier one (low ships single-bounce) and
+  // `__giSrcSecondary = false` is the R12 hatch that reproduces every pre-[J]
+  // gate result.
+  //
+  // `shadeEnabled` is a HARD requirement, not a coincidence: the hit list is
+  // filled by the hit shader's sink, so with no shader there are no entries and
+  // [J] would be a dispatch over an always-empty list.
+  //
+  // `volume?.occupancyField` stands in for `tiles && gather && binStore` — each
+  // of those is built if and only if the one before it was, and this decision
+  // has to be made before the first of them exists.
+  const secondaryOn = !!(volume?.occupancyField && shadeEnabled
+    && tier.secondary !== false && globalThis.__giSrcSecondary !== false);
+  // EXACTLY the rays this dispatch can fire, so the list can never overflow:
+  // [E] runs `transportThreads` threads at `raysPerPixel` rays each, and one
+  // ray produces at most one entry. `STAT_SEC_OVERFLOW` counts the bound being
+  // wrong rather than trusting it.
+  const secondaryCapacity = secondaryOn ? transportThreads * tier.raysPerPixel : 0;
+  const binStore = volume?.occupancyField
+    ? createSrcBinStore(store, { w0: W0, secondaryCapacity })
+    : null;
 
   // ── [H]: THE IRRADIANCE TILES (plan §12.18.7 unit 4) ─────────────────────
   //
@@ -513,11 +564,11 @@ export function createSrcProbeSystem({
   // hierarchy has, so tiles for cascades 1-3 would bake the same light more
   // coarsely and nothing would read them.
   //
-  // CONSTRUCTED HERE — above the hit shader — since §12.39: [J]'s secondary
-  // term is `gatherAt` at the hit, so the shader needs the gather closure at
-  // build time. Dispatch order is the `passes` list below and is unchanged;
-  // at the moment the deposit's shadeHit samples a tile, the atlas holds LAST
-  // frame's bake, which is exactly the temporal feedback R4 models (§12.26.9).
+  // CONSTRUCTED HERE — above the hit shader — since §12.39: [J] gathers this
+  // atlas, and it is built between the shader and the deposit. Dispatch order
+  // is the `passes` list below and is unchanged; at the moment [J] samples a
+  // tile the atlas holds LAST frame's bake, which is exactly the temporal
+  // feedback R4 models (§12.26.9).
   const tiles = binStore
     ? createSrcTileAtlas(store, binStore, {
         w0: W0,
@@ -576,39 +627,35 @@ export function createSrcProbeSystem({
       })
     : null;
 
-  // ── [E']: HIT SHADING (plan §7 Phase 5, §12.26) ───────────────────────────
+  // ── [J]: THE SECOND BOUNCE (plan §4.1 [J], §12.39) ───────────────────────
   //
-  // OPT-IN, and gated on having something to shade WITH as well as a flag.
-  // `__giSrcShade` off, or no `lighting`, or no `staticSurfaceAt`, and
-  // `shadeHit` stays null — which keeps this build byte-identical and keeps
-  // every gate written before Phase 5 comparable, exactly as `__giSrcProbes`
-  // does for the population.
+  // Its own dispatch over the hit list [E] appends, gathering the SAME tile
+  // atlas the screen does — see `srcSecondary.js`'s header for why it is a pass
+  // rather than a line in the hit shader, why it costs three storage bindings,
+  // and why it must run between [E] and [F]. Built here because it needs the
+  // gather's inputs (`tiles`, the hash→block lookup) and the deposit needs to
+  // know it exists.
+  const secondary = secondaryOn && binStore
+    ? createSrcSecondaryFrame(store, binStore, {
+        tiles,
+        lookup: hashBlockFrame.lookup,
+        spacing0,
+        // The same three uniforms the screen gather reads. A second camera or
+        // anchor here would gather over a lattice placed differently from the
+        // one [E] filled — plausible light from the wrong probes.
+        camera: vec3(cameraU),
+        anchor: vec3(anchorU),
+        lmax: lmaxU,
+        maxLods: MAX_LODS,
+        w0: W0,
+        capacity: secondaryCapacity,
+      })
+    : null;
+
+  // ── [E']: THE HIT SHADER ITSELF ───────────────────────────────────────────
   //
-  // **THE TWO ARGUMENTS ARE NOT ONE SWITCH.** `staticSurfaceAt` is the other
-  // half of Phase 5 and lives in `srcSurface.js`: §12.9 deleted the coarse
-  // surface-attribution grid, so there is currently no path on the GPU from a
-  // static hit to its material. Shading with `lighting` alone would light the
-  // whole static world at one default albedo — a grey-box bounce that looks
-  // plausible, is wrong everywhere, and would be read as a shader bug rather
-  // than a missing input. `STAT_UNATTRIBUTED` counts it if it ever happens.
-  const staticSurfaceAt = surfaces?.surfaceAt ?? null;
-  const shadeEnabled = srcShadeEnabled() && !!lighting && !!staticSurfaceAt;
-  // [J]'s gate, named once — the shader option and the telemetry both read it,
-  // because a boot line that disagrees with the built kernel is the §12.30
-  // failure this file keeps re-finding.
-  //
-  // ⚠⚠ OPT-IN (`__giSrcSecondary = true`) UNTIL [J] IS A SEPARATE PASS. The
-  // first wiring inlined `gatherAt` — 16 hash-find loops and 16 filtered tile
-  // taps — into the deposit kernel's hit shader, and the user's editor
-  // measured the consequence the same hour: the kernel went 58 kB → 323 kB
-  // WGSL (2 → 3 loops, 642 ifs) and its pipeline compile went to 48 SECONDS,
-  // the exact §13.14 unroll pathology this module already paid to learn.
-  // The plan's own [J] line said the architecture out loud — "steps B–H
-  // re-run over LAST FRAME'S HIT POINTS" — a pass of its own over a compact
-  // hit list, whose gather compiles ONCE in a ~20 kB kernel, not once per
-  // call site of the fattest kernel in the module.
-  const secondaryOn = !!(tiles && gather && tier.secondary !== false
-    && globalThis.__giSrcSecondary === true);
+  // `shadeEnabled` and `secondaryOn` are decided above the bin store (the hit
+  // list is a region of it); this is only the construction.
   const shadeHit = shadeEnabled && binStore
     ? createSrcHitShader({
         // Provenance lives HERE and nowhere else — `srcShade.js` never asks
@@ -681,26 +728,11 @@ export function createSrcProbeSystem({
           steps: Number(globalThis.__giSrcShadowSteps) || 64,
         }),
         voxelSize: volume.world.minCell,
-        // ── [J]: THE SECONDARY TERM (§12.39) ─────────────────────────────
-        //
-        // `gatherAt` at the hit — the SAME position-indexed gather the screen
-        // and the exact-reflection path read, over the PRIMARY tile atlas.
-        // There is no separate coarser cache: the atlas already exists, is
-        // re-baked after the deposit each frame, and so holds LAST frame's
-        // irradiance when a hit samples it — a temporal fixed-point iteration,
-        // which is R4's own model. §12.26.9 measured the same-spacing cache as
-        // the LEAST-leaky row of its table (coarsening BRIGHTENS: the
-        // trilinear near-geometry leak scales with probe spacing, one-sided,
-        // inside a feedback loop), so reusing the primary lattice is the
-        // accurate choice, not just the free one. The loop's gain is bounded
-        // by `clampLoopAlbedo` at this very call site — the ceiling that was
-        // "a property of the albedo, not of the loop" while [J] was null now
-        // has its loop.
-        //
-        // `tier.secondary` is the low-tier opt-out (srcConfig — low ships
-        // single-bounce); `__giSrcSecondary = false` is the R12 hatch, and
-        // every pre-[J] gate result is reproduced by it.
-        secondary: secondaryOn ? (P, n) => gather.gatherAt(P, n).irradiance : null,
+        // NO `secondary` OPTION — [J] IS A PASS. The shader hands its hit,
+        // normal and clamped ρ to the deposit's sink instead, and
+        // `srcSecondary.js` finishes the expression in a kernel of its own. The
+        // R4 ceiling that bounds the loop is still applied here, at the hit,
+        // and it is the ρ the sink publishes.
         // One NEE sample, and it is not a quality dial yet. With importance =
         // contribution the one-sample estimator IS the exact sum (§12.26.5), so
         // every extra sample buys only visibility variance — and the tiers have
@@ -730,6 +762,12 @@ export function createSrcProbeSystem({
         // alone against the sky is ambient occlusion. That is §7's "AO-like
         // short-range bounce", not a placeholder.
         shadeHit,
+        // [J]'s hit list. Passed ONLY when the secondary pass exists, and that
+        // is what keeps the opted-out kernel byte-identical to the pre-[J] one:
+        // with this null, not a node of the capture or the append is built.
+        secondary: secondary
+          ? { base: binStore.hitListBase, capacity: secondaryCapacity }
+          : null,
         trace: createSrcSceneTrace(volume.occupancyField, volume.world, {
           rayHitMode: volume.rayHitMode,
           // ── THE STEP BUDGET, MEASURED RATHER THAN INHERITED ──────────────
@@ -797,9 +835,9 @@ export function createSrcProbeSystem({
     : null;
 
   // ([H]'s tile atlas, [I]'s gather and the hash→block frame are CONSTRUCTED
-  // above the hit shader now — [J]'s secondary term needs `gatherAt` at
-  // shadeHit build time. Their DISPATCH position is unchanged; the `passes`
-  // list below is the frame order, and construction order never was.)
+  // above the hit shader now — [J] needs the atlas and the lookup at build
+  // time. Their DISPATCH position is unchanged; the `passes` list below is the
+  // frame order, and construction order never was.)
 
   let anchored = false;
   let reanchors = 0;
@@ -822,6 +860,8 @@ export function createSrcProbeSystem({
     rayFrame,
     binStore,
     deposit,
+    /** [J], or null when the tier or the hatch turned the second bounce off. */
+    secondary,
     merge,
     tiles,
     hashBlockFrame,
@@ -859,7 +899,23 @@ export function createSrcProbeSystem({
           // again within the frame, so the gather far below reads the same
           // truth it always did.
           hashBlockFrame.pass,
-          ...rayFrame.passes, ...deposit.passes,
+          ...rayFrame.passes,
+          // ── [J] SITS BETWEEN [E] AND [F], AND BOTH SIDES ARE FORCED ───────
+          //
+          // AFTER [E]: the hit list does not exist until the scatter writes it.
+          // BEFORE [F]: the resolve reads the accumulators once, so a bounce
+          // deposited after it is a frame late — and worse than late, because
+          // an entry's bin slot expires with the frame ([C] re-claims blocks
+          // every frame, so the slot is only valid inside the frame that
+          // produced it). The atlas [J] samples is still LAST frame's bake
+          // ([H] runs below), which is the temporal fixed point R4 models.
+          //
+          // `hashBlockFrame.pass` does NOT move for this: it already runs
+          // before the first ray, for the reason above it, and that is exactly
+          // where [J]'s corner lookups need it.
+          ...(secondary
+            ? [deposit.decay, deposit.scatter, secondary.pass, deposit.resolve]
+            : deposit.passes),
           ...merge.passes, ...tiles.passes,
           gather.reset, gather.compute,
         ]
@@ -882,7 +938,17 @@ export function createSrcProbeSystem({
           { label: "populate", count: frame.passes.length },
           { label: "hashBlock", count: 1 },
           { label: "rays", count: rayFrame.passes.length },
-          { label: "deposit (trace + shade)", count: deposit.passes.length },
+          // SPLIT AROUND [J] when it runs, because "the deposit" is no longer
+          // three contiguous dispatches — and `profile.giPasses` asserts these
+          // counts sum to `passes.length`, so a group list that did not split
+          // would withhold every per-group number rather than mislabel one.
+          ...(secondary
+            ? [
+                { label: "deposit (decay + trace + shade)", count: 2 },
+                { label: "secondary [J]", count: 1 },
+                { label: "deposit (resolve)", count: 1 },
+              ]
+            : [{ label: "deposit (trace + shade)", count: deposit.passes.length }]),
           { label: "merge", count: merge.passes.length },
           { label: "tiles", count: tiles.passes.length },
           { label: "gather", count: 2 },
@@ -898,7 +964,10 @@ export function createSrcProbeSystem({
           lights: (lighting?.lights ?? []).length,
           emitters: (lighting?.emitters ?? []).length,
           attributed: !!surfaces,
-          secondary: secondaryOn,
+          // THE BUILT PASS, not the gate that asked for it — a boot line that
+          // disagrees with the built kernel is the §12.30 failure this file
+          // keeps re-finding.
+          secondary: !!secondary,
         }
       : null,
     width,
@@ -1099,6 +1168,9 @@ export function createSrcProbeSystem({
         capU.value = nextCap;
         publishTransport();
       }
+      // [J]'s LOD-bias hatch, polled beside the others for the same §12.23
+      // reason: a build-time read can only be A/B'd by reloading.
+      secondary?.poll();
       phaseU.value = rayStride > 1 ? frameStampU.value % rayStride : 0;
       const a = anchorU.value;
       const drift = Math.max(
@@ -1131,6 +1203,7 @@ export function createSrcProbeSystem({
         raysPerPixel: tier.raysPerPixel,
         totalRays: await rayFrame.readTotal(renderer),
         rays: deposit ? await deposit.readStats(renderer) : null,
+        secondary: secondary ? await secondary.readStats(renderer) : null,
         merge: merge ? await merge.readStats(renderer) : null,
         tiles: tiles ? await tiles.readStats(renderer) : null,
         gather: gather ? await gather.readStats(renderer) : null,
@@ -1168,6 +1241,7 @@ export function createSrcProbeSystem({
 
     dispose() {
       gizmos.dispose();
+      secondary?.dispose();
       gather?.dispose();
       hashBlockFrame?.dispose();
       tiles?.dispose();
@@ -1289,6 +1363,10 @@ export function formatSrcProbeFrame(stats) {
             (r.importanceFloored ? `, ${r.importanceFloored} IMPORTANCE-FLOORED` : "")
           : "  |  NO HIT SHADING")
       : "") +
+    // [J]'s own line. `bounce 0/N` with the boot line claiming MULTIBOUNCE is
+    // the reading that separates "the second bounce is dim here" from "the
+    // pass did not dispatch", which are the same picture.
+    (stats.secondary?.dispatched ? `  |  ${formatSrcSecondary(stats.secondary)}` : "") +
     // The merge's range instrument. `to sky` is the fraction of merged bins
     // whose parent chain reached the top — i.e. how much of the frame is
     // getting the full-reach answer rather than a partial one.

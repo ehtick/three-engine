@@ -51,8 +51,16 @@
 //   bounce, correct in shape and wrong in colour, and `STAT_UNATTRIBUTED` counts
 //   every hit it happened to. Movers already have theirs
 //   (`moverSurfaceAt` → header words 34..39).
-// · `secondary` is [J] and is a hook here. Without it this is a single bounce,
-//   and R4's ceiling has nothing to bound because there is no loop yet.
+// · THE SECONDARY TERM IS NOT EVALUATED HERE AND MUST NOT BE. The formula above
+//   is still the model — `E` gains the cache's irradiance and ρ/π multiplies
+//   the sum — but the `E_secondary` half is computed by `srcSecondary.js` in a
+//   PASS OF ITS OWN and added into the same bin. Inlining it cost 48 seconds of
+//   pipeline compile (§12.39): `gatherAt` is 16 hash-find loops and 16 filtered
+//   taps, and this shader is instantiated inside the deposit's ray loop, which
+//   is the fattest kernel in the module. What survives here is the `sink` below
+//   — three vectors handed out so the other pass can finish the expression at
+//   the same hit, with the same ρ, on the same frame. R4's ceiling still binds
+//   the loop's gain because the ρ [J] multiplies by is the one clamped here.
 // · `importance` defaults to the exact contribution. `lightTree.js` is unwired;
 //   when it lands it supplies a bounds-based ranking, and §12.26.5 prices what
 //   that can cost at **3.00× the standard error** — 9× the samples for equal
@@ -372,8 +380,20 @@ function neeIrradiance(slots, P, n, rayIndex, {
 }
 
 /**
- * §4.4's hit shading, assembled. Returns `shadeHit(hit, dir, rayIndex) → vec3`,
- * the exact shape `createSrcDepositFrame` takes as its `shadeHit` option.
+ * §4.4's hit shading, assembled. Returns
+ * `shadeHit(hit, dir, rayIndex, sink?) → vec3`, the exact shape
+ * `createSrcDepositFrame` takes as its `shadeHit` option.
+ *
+ * ══ THE OPTIONAL FOURTH ARGUMENT, AND WHY IT IS AN ARGUMENT ════════════════
+ *
+ * `sink(P, n, ρ)` is called once, after R4's ceiling, with the hit position,
+ * the face-forwarded normal and the CLAMPED albedo — the three quantities [J]
+ * cannot recompute from a bin index. It is a per-CALL argument rather than a
+ * build option because the deposit passes it only when it was itself built with
+ * a hit list, and that is what makes the no-secondary kernel byte-identical:
+ * with no `sink` the branch below is not built, and a caller that ignores extra
+ * arguments (`scripts/gi-src-deposit.html`'s synthetic shader) is unaffected
+ * either way.
  *
  * @param {object} options
  * @param {(hit, dir) => {albedo, emissive, emitter, valid}} options.surfaceAt
@@ -400,9 +420,6 @@ function neeIrradiance(slots, P, n, rayIndex, {
  * @param {(P, n, toLight, maxT) => Node} [options.visibility]  from
  *   `createSrcVisibility`. Its `maxT` is measured from the SURFACE point; the
  *   lift correction is that function's own (§12.26.3).
- * @param {(P, n) => Node} [options.secondary]  the secondary cache [J], `vec3`.
- *   NOT the primary cache: reading the primary here would close the loop on
- *   itself within one frame and re-derive the divergence R4 exists to prevent.
  * @param {Node} options.voxelSize  the DDA medium's quantization — every bias
  *   here tracks it (R2), and there is deliberately no default.
  * @param {object} [options.count]  per-statistic incrementers; see
@@ -414,7 +431,6 @@ export function createSrcHitShader({
   lights = [],
   emitters = [],
   visibility = null,
-  secondary = null,
   voxelSize = null,
   maxRay = null,
   neeEmitters = true,
@@ -446,7 +462,7 @@ export function createSrcHitShader({
   const margin = float(voxelSize).mul(0.5);
   const useNee = neeEmitters && emitters.length > 0;
 
-  return (hit, dir, rayIndex) => {
+  return (hit, dir, rayIndex, sink = null) => {
     const s = surfaceAt(hit, dir);
     const P = vec3(s.position ?? hit.exactPosition ?? hit.position).toVar();
     const n = faceForward(s.normal ?? hit.normal, dir);
@@ -554,12 +570,14 @@ export function createSrcHitShader({
       }));
     }
 
-    if (secondary) E.addAssign(vec3(secondary(P, n)));
-
     // ── ρ/π · E, with R4's ceiling — applied AT THE HIT, inside the loop, and
     //    never at an `intensity` prop where an artistic gain belongs ─────────
     const rho = clampLoopAlbedo(s.albedo, maxLoopAlbedo);
     if (count) count.albedoClamped(select(rho.clamped, 1, 0));
+    // [J]'s handoff, AFTER the clamp: the ρ the secondary pass multiplies its
+    // gathered irradiance by must be the one R4 bounded, or the loop's gain is
+    // the raw albedo and the fixed-point iteration has no proven contraction.
+    if (sink) sink(P, n, rho.albedo);
     const out = rho.albedo.mul(E).mul(1 / Math.PI).toVar();
 
     // ── emission, and R5's zeroing ──────────────────────────────────────────

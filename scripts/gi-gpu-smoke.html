@@ -237,7 +237,13 @@
         // them, and `resolveRayHitConfig` reads `__giRayHitMode` /
         // `__giRayHitProfiling` FIRST, ahead of the properties. So dropping the
         // properties changes nothing here — it removes the second copy.
-        gi.addComponent("global-illumination", { quality: "low" });
+        // `?quality=high` — the TIER, and it exists for exactly one reason:
+        // `low` ships single-bounce (srcConfig's table), so [J] cannot be built
+        // at the default and the binding/size gates below would have nothing to
+        // audit. Default unchanged, so every pre-existing arm is byte-identical.
+        gi.addComponent("global-illumination", {
+          quality: new URLSearchParams(location.search).get("quality") ?? "low",
+        });
         engine.start();
 
         const deadline = performance.now() + 60_000;
@@ -479,9 +485,19 @@
           ...(state?.queue ?? []).map((node, index) => [`queue[${index}]`, node]),
           ...(state?.screen?.srcProbes?.passes ?? []).map((node, index) => [`srcProbes[${index}]`, node]),
         ];
+        // [J] BY IDENTITY, NOT BY INDEX. Its binding count is the number the
+        // whole design rests on — three, because the hit list rides `scratch`'s
+        // tail and the hash→block words ride `hashKeys`' — and reading it off a
+        // position in the pass list would silently follow the wrong kernel the
+        // next time a dispatch is inserted.
+        const secondaryPass = state?.screen?.srcProbes?.secondary?.pass ?? null;
+        let secondaryAudit = null;
         for (const [index, node] of auditNodes) {
           const shader = engine.renderer._nodes?.getForCompute?.(node)?.computeShader ?? "";
           const storageBindings = [...shader.matchAll(/var<storage[^>]*>/g)].length;
+          if (secondaryPass && node === secondaryPass) {
+            secondaryAudit = { index, storageBindings, bytes: shader.length };
+          }
           if (storageBindings >= 8) {
             const names = shader.split("\n").filter((line) => line.includes("var<storage"));
             bindingAudit.push({ index, storageBindings, bytes: shader.length, names });
@@ -495,6 +511,28 @@
           }
         }
         console.log("GI-SMOKE BINDINGS", JSON.stringify(bindingAudit));
+        if (secondaryPass) {
+          if (!secondaryAudit) {
+            throw new Error("[J] exists on the system but is not in `passes` — it would never dispatch");
+          }
+          // `GI-SMOKE STORAGE` prefix on purpose: that is the line the runner
+          // echoes on a PASS, and a binding count nobody sees on a green run is
+          // a number the next planning decision will guess at instead.
+          console.log(
+            `GI-SMOKE STORAGE [J] ${secondaryAudit.index}: ${secondaryAudit.storageBindings} ` +
+            `storage buffers, ${(secondaryAudit.bytes / 1024).toFixed(0)}kB`,
+          );
+          // THREE, exactly. Fewer means a binding this pass needs was optimized
+          // away (a gather that reads no keys resolves every corner to EMPTY
+          // and deposits nothing, silently); more means a fold was undone and
+          // the R7 budget that lets [E] carry the hit list is gone.
+          if (secondaryAudit.storageBindings !== 3) {
+            throw new Error(
+              `[J] compiled with ${secondaryAudit.storageBindings} storage buffers, not 3 — ` +
+              "the hit list must ride `scratch` and the corner lookup must ride `hashKeys`",
+            );
+          }
+        }
 
         // ── ?src=1 assertions ────────────────────────────────────────────
         let srcReport = null;
@@ -1318,6 +1356,58 @@
               console.log(`GI-SMOKE KINDMAP-MANUAL nonZero=${nz2} ${JSON.stringify(buckets2)}`);
             } catch (err) {
               console.log(`GI-SMOKE KINDMAP-MANUAL threw: ${err?.message ?? err}`);
+            }
+          }
+        }
+        // ── [J]'s THESIS, AS A SIZE A/B — LAST, BECAUSE IT DISPOSES SRC ────
+        //
+        // The claim the whole unit rests on is that the multibounce no longer
+        // FATTENS THE DEPOSIT: inlined, it took [E] from 58 kB to 323 kB of
+        // WGSL and its pipeline compile to 48 seconds (§12.39). Split out, the
+        // deposit gains only the hit-list capture, which must be noise.
+        //
+        // Both arms in ONE page and on one adapter, because a cross-page
+        // comparison of this module has been wrong every time it was tried. The
+        // opt-out build comes from `setSize`, the only path that forwards every
+        // construction argument — it DISPOSES the live system, which is why
+        // this sits after every readback above and immediately before the
+        // result. No pipeline is created for the throwaway build: reading
+        // `computeShader` builds the WGSL and nothing more.
+        if (srcArm && srcReport) {
+          const sp = state?.screen?.srcProbes;
+          const wgslOf = (node) => engine.renderer._nodes?.getForCompute?.(node)?.computeShader ?? "";
+          if (!sp?.secondary) {
+            console.log(
+              "GI-SMOKE NOTE [J] is not built in this arm (no surface attribution at this " +
+              "ray-hit mode, or the tier/hatch turned it off) — the deposit size A/B is SKIPPED " +
+              "rather than reported as a 1.00x that compared a build to itself",
+            );
+          } else {
+            const withSecondary = wgslOf(sp.deposit.scatter).length;
+            globalThis.__giSrcSecondary = false;
+            const alt = sp.setSize(sp.width + 2, sp.height);
+            const withoutSecondary = wgslOf(alt.deposit.scatter).length;
+            const altSecondary = !!alt.secondary;
+            alt.dispose();
+            globalThis.__giSrcSecondary = undefined;
+            const ratio = withSecondary / Math.max(1, withoutSecondary);
+            srcReport.depositWgsl = {
+              withSecondary, withoutSecondary, ratio: +ratio.toFixed(4),
+            };
+            console.log(
+              `GI-SMOKE STORAGE deposit-wgsl ${(withSecondary / 1024).toFixed(1)}kB default vs ` +
+              `${(withoutSecondary / 1024).toFixed(1)}kB opted out ` +
+              `(${((ratio - 1) * 100).toFixed(2)}%)`,
+            );
+            if (altSecondary) {
+              throw new Error("the `__giSrcSecondary = false` rebuild still built [J] — the hatch is not an opt-out");
+            }
+            if (!(ratio < 1.02)) {
+              throw new Error(
+                `the multibounce build's deposit kernel is ${((ratio - 1) * 100).toFixed(1)}% larger than ` +
+                `the single-bounce one (${withSecondary} vs ${withoutSecondary} bytes) — [J]'s gather has ` +
+                "leaked back into the deposit, which is the 48-second compile this unit exists to remove",
+              );
             }
           }
         }

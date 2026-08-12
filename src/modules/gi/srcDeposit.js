@@ -112,6 +112,7 @@ import {
   atomicMax,
   atomicStore,
   float,
+  floatBitsToUint,
   floor,
   instanceIndex,
   instancedArray,
@@ -120,7 +121,14 @@ import {
   uint,
   vec3,
 } from "three/tsl";
-import { CASCADE_COUNT, MAX_LODS, W0, binCount, binGridWidth } from "./srcConfig.js";
+import {
+  CASCADE_COUNT,
+  MAX_LODS,
+  SECONDARY_HIT_WORDS,
+  W0,
+  binCount,
+  binGridWidth,
+} from "./srcConfig.js";
 import {
   binMorton,
   chebyshev,
@@ -160,6 +168,32 @@ export const MIN_WEIGHT = DEPOSIT_SCALE >> 6;
 /** Resolved payload: rgb + transmittance, with T < 0 meaning UNKNOWN. */
 export const PAYLOAD_WORDS = 4;
 export const PAYLOAD_UNKNOWN = -1;
+
+/**
+ * ══ [J]'s HIT LIST — A REGION OF `scratch`, NOT A BUFFER OF ITS OWN ═════════
+ *
+ * The multibounce pass re-shades last frame's hits against the tile atlas, so
+ * it needs to know WHERE each hit was and WHERE its radiance goes. That is a
+ * per-frame list, and a list is a buffer — except that [E] is at 7 of the 8
+ * storage bindings a portable stage gets, and [J] itself must read the bins to
+ * deposit into them anyway. So the list rides the TAIL of `scratch`: word
+ * `hitListBase` is the atomic count, entries follow it, and BOTH passes see one
+ * buffer where a separate list would have cost [E] its last binding (R7 —
+ * `hashKeys` carries the hash→block words for the same reason).
+ *
+ * Entries are UNPACKED floats through `floatBitsToUint`, not a quantized
+ * encoding: `dynamicObjects.js`'s triangle pool sets the precedent, and the
+ * one thing [J] must not do is re-derive a hit's position approximately —
+ * a gather at the wrong point reads a plausible irradiance from the wrong side
+ * of a wall, which no energy check downstream can see.
+ *
+ * Words 10-11 are reserved, which also pads the stride to 48 bytes.
+ */
+export const SEC_P = 0;     // world position of the hit
+export const SEC_N = 3;     // face-forwarded normal (srcShade's `faceForward`)
+export const SEC_RHO = 6;   // albedo AFTER `clampLoopAlbedo` — R4's in-loop ρ
+export const SEC_SLOT = 9;  // destination bin's WORD base, already ×BIN_WORDS
+export const SEC_HIT_WORDS = SECONDARY_HIT_WORDS;
 
 /** Diagnostic words — the `Lmax` decision's instrument, plus the ray tallies. */
 export const STAT_RAYS = 0;
@@ -224,7 +258,31 @@ export const STAT_EMISSIVE = 11;
 export const STAT_EMIT_ZEROED = 12;
 export const STAT_ALBEDO_CLAMPED = 13;
 export const STAT_IMPORTANCE_FLOORED = 14;
-export const STAT_WORDS = 15;
+
+/**
+ * [J]'s three words, and they are split across two passes on purpose:
+ *
+ * · `SEC_OVERFLOW` is written by [E] — the only pass that can know a hit did
+ *   not fit. Nonzero means the hit list is smaller than the rays that can
+ *   produce entries (`transportThreads × raysPerPixel`) and bounce light is
+ *   being dropped where nothing on screen would say so.
+ * · `SECONDARY` and `SEC_CLAMPED` are written by [J]. `SECONDARY` is the
+ *   instrument that says THE PASS RAN: a pipeline that fails to create
+ *   dispatches nothing, and the frame it produces looks exactly like a scene
+ *   whose second bounce happens to be dim. No image statistic separates those
+ *   two, so the gate asserts this counter rather than a brightness.
+ * · `SEC_CLAMPED` counts the split clamp's own residual — see `srcSecondary.js`
+ *   on why the secondary term saturates against `Lmax` separately from the
+ *   primary one, and why that is accepted rather than fixed.
+ *
+ * They live here because `srcSecondary.js` owns no buffer: three storage
+ * bindings, all of them load-bearing, exactly as `createSrcShadeCounters`
+ * arranged for the hit shader.
+ */
+export const STAT_SECONDARY = 15;
+export const STAT_SEC_CLAMPED = 16;
+export const STAT_SEC_OVERFLOW = 17;
+export const STAT_WORDS = 18;
 const T_FIXED = 1024;
 
 /**
@@ -280,7 +338,11 @@ export function createSrcShadeCounters(bins) {
  * now, which is the point — an assertion that has become impossible to trip by
  * accident is cheaper to keep than to re-derive later.
  */
-export function createSrcBinStore(store, { w0 = W0, maxBytes = 128 * 1024 * 1024 } = {}) {
+export function createSrcBinStore(store, {
+  w0 = W0,
+  maxBytes = 128 * 1024 * 1024,
+  secondaryCapacity = 0,
+} = {}) {
   const cascades = [];
   let binTotal = 0;
   for (const c of store.cascades) {
@@ -303,19 +365,27 @@ export function createSrcBinStore(store, { w0 = W0, maxBytes = 128 * 1024 * 1024
     });
     binTotal += bins * c.blockCapacity;
   }
-  const scratchBytes = binTotal * BIN_WORDS * 4;
+  // The bins, then [J]'s hit list — one buffer, in that order, so every bin
+  // index keeps the address it had before the tail existed. `hitListBase` is
+  // the count word; entries start one word after it.
+  const binWords = binTotal * BIN_WORDS;
+  const hitCapacity = Math.max(0, Math.floor(secondaryCapacity));
+  const hitListBase = binWords;
+  const hitWords = hitCapacity > 0 ? 1 + hitCapacity * SEC_HIT_WORDS : 0;
+  const scratchBytes = (binWords + hitWords) * 4;
   const payloadBytes = binTotal * PAYLOAD_WORDS * 4;
   if (scratchBytes > maxBytes || payloadBytes > maxBytes) {
     throw new Error(
       `createSrcBinStore: ${(binTotal / 1e6).toFixed(2)}M bins needs ` +
-      `${(scratchBytes / 1048576).toFixed(0)}MB of scratch and ` +
+      `${(scratchBytes / 1048576).toFixed(0)}MB of scratch (including ` +
+      `${(hitWords * 4 / 1048576).toFixed(0)}MB of [J] hit list) and ` +
       `${(payloadBytes / 1048576).toFixed(0)}MB of payload, past the ` +
       `${(maxBytes / 1048576).toFixed(0)}MB storage-buffer binding limit — ` +
       "lower srcConfig's BIN_BUDGET, which is what sizes the block pool",
     );
   }
 
-  const scratch = instancedArray(new Uint32Array(binTotal * BIN_WORDS), "uint").toAtomic();
+  const scratch = instancedArray(new Uint32Array(binWords + hitWords), "uint").toAtomic();
   const payload = instancedArray(new Float32Array(binTotal * PAYLOAD_WORDS), "float");
   const stats = instancedArray(new Uint32Array(STAT_WORDS), "uint").toAtomic();
 
@@ -326,6 +396,9 @@ export function createSrcBinStore(store, { w0 = W0, maxBytes = 128 * 1024 * 1024
     scratch,
     payload,
     stats,
+    /** [J]'s region. `hitCapacity` 0 means the tail was not allocated. */
+    hitListBase,
+    hitCapacity,
     bytes: scratchBytes + payloadBytes + STAT_WORDS * 4,
     dispose() {
       for (const b of [scratch, payload, stats]) b?.value?.dispose?.();
@@ -348,12 +421,20 @@ export function createSrcBinStore(store, { w0 = W0, maxBytes = 128 * 1024 * 1024
  * @param {object} options.pixelProbe    per-pixel c0 probe index
  * @param {object} options.pixelRayBase  Alg. 3's per-pixel ray base
  * @param {(o, d, tMax) => object} options.trace  from `createSrcSceneTrace`
- * @param {(hit, dir, rayIndex) => object} [options.shadeHit]  vec3 radiance at a
- *   hit, from `srcShade.js`'s `createSrcHitShader`. Default black — see the
+ * @param {(hit, dir, rayIndex, sink) => object} [options.shadeHit]  vec3 radiance
+ *   at a hit, from `srcShade.js`'s `createSrcHitShader`. Default black — see the
  *   header. `rayIndex` is `n`, the ray's place in the global R2 sequence, and
  *   the shader needs it for the same reason the gate's synthetic trace does: a
  *   pure function of a u32 is bit-identical across a boundary where an RNG state
- *   is not.
+ *   is not. `sink` is passed ONLY when `secondary` is — see below.
+ * @param {{base: number, capacity: number}} [options.secondary]  [J]'s hit list
+ *   in `scratch`'s tail (`createSrcBinStore`'s `hitListBase`/`hitCapacity`).
+ *   Supplied, this kernel appends one entry per shaded hit that has somewhere to
+ *   deposit; omitted, NOT ONE NODE OF THAT IS BUILT and the emitted WGSL is
+ *   byte-identical to the pre-[J] kernel — which is what keeps every gate
+ *   written before the multibounce (and `scripts/gi-src-deposit.html`, whose
+ *   synthetic shader ignores extra arguments) comparable rather than merely
+ *   passing.
  * @param {object} options.lmax  uniform: the radiance the fixed point saturates at
  * @param {Node} [options.keep]  the temporal blend's `1 − α`, applied to every
  *   accumulator before this frame's deposits land. Default 0, which is the
@@ -389,6 +470,7 @@ export function createSrcDepositFrame(store, bins, {
   raysPerPixel = 1,
   trace,
   shadeHit = null,
+  secondary = null,
   readPixel,
   readNormal,
   camera,
@@ -407,6 +489,21 @@ export function createSrcDepositFrame(store, bins, {
 } = {}) {
   const { probeTable, freeStack } = store;
   const { scratch, payload, stats, binTotal, w0 } = bins;
+  // The hit list is a REGION of a buffer this kernel also writes bins into, so
+  // a base that disagrees with the store's would corrupt real bins at a bin
+  // index nothing else in the frame would ever produce — silent, and not
+  // reproducible from an image. Cheap to make impossible.
+  if (secondary) {
+    if (secondary.base !== bins.hitListBase || !(secondary.capacity > 0)
+      || secondary.capacity > bins.hitCapacity) {
+      throw new Error(
+        `createSrcDepositFrame: [J]'s hit list (base ${secondary.base}, capacity ` +
+        `${secondary.capacity}) does not match the bin store's tail (base ` +
+        `${bins.hitListBase}, capacity ${bins.hitCapacity}) — the store must be ` +
+        "built with `secondaryCapacity` before the deposit can append to it",
+      );
+    }
+  }
   const N = store.cascadeCount ?? CASCADE_COUNT;
   const stampBase = store.blockStampBase;
   const passes = [];
@@ -519,6 +616,16 @@ export function createSrcDepositFrame(store, bins, {
       atomicStore(e, uint(floor(float(atomicLoad(e)).mul(k).add(0.5))));
     }
     If(i.lessThan(uint(STAT_WORDS)), () => { atomicStore(stats.element(i), uint(0)); });
+    // [J]'s hit list is a WITHIN-FRAME structure — every entry carries a bin
+    // slot that stops meaning anything the moment [C] re-claims blocks — so its
+    // count is cleared here, in the pass that already runs first and already
+    // clears the stats, rather than in a dispatch of its own. Same idiom
+    // `srcRays.js` uses for the ray worklist's count word.
+    if (secondary) {
+      If(i.equal(uint(0)), () => {
+        atomicStore(scratch.element(uint(secondary.base)), uint(0));
+      });
+    }
   })().compute(binTotal));
 
   // ── [E] trace and scatter ─────────────────────────────────────────────────
@@ -652,10 +759,38 @@ export function createSrcDepositFrame(store, bins, {
         own.assign(k2);
       });
 
+      // ── [J]'s CAPTURE (§12.39) ────────────────────────────────────────────
+      //
+      // The shader hands back the three things the secondary pass cannot
+      // recompute — the hit point, the normal it faced-forward, and the albedo
+      // AFTER R4's in-loop ceiling — through a sink rather than a return value,
+      // because everything else about `shadeHit` is a `vec3` and widening that
+      // contract would touch every caller including the gate's synthetic one.
+      // `want` is set for every shaded ray; the SLOT below is what decides
+      // whether an entry is appended, so a miss (which never reaches the
+      // radiance branch) falls out with no test of its own.
+      const sec = secondary && shadeHit
+        ? {
+            P: vec3(0).toVar(),
+            N: vec3(0).toVar(),
+            rho: vec3(0).toVar(),
+            want: uint(0).toVar(),
+            slot: uint(SLOT_EMPTY).toVar(),
+          }
+        : null;
+      const sink = sec
+        ? (hitP, hitN, rho) => {
+            sec.P.assign(vec3(hitP));
+            sec.N.assign(vec3(hitN));
+            sec.rho.assign(vec3(rho));
+            sec.want.assign(uint(1));
+          }
+        : null;
+
       // Radiance at the hit, in fixed point. Phase 5 fills `shadeHit`; until
       // then the whole RGB path is exercised only by the gate, which injects a
       // synthetic shading both sides of the mirror agree on.
-      const L = shadeHit ? vec3(shadeHit(r, dir, n)).toVar() : vec3(0).toVar();
+      const L = shadeHit ? vec3(shadeHit(r, dir, n, sink)).toVar() : vec3(0).toVar();
       const unit = L.div(float(lmax).max(1e-6)).toVar();
       const clamped = unit.x.max(unit.y).max(unit.z).greaterThan(1).toVar();
       const fx = [
@@ -708,9 +843,54 @@ export function createSrcDepositFrame(store, bins, {
             atomicAdd(scratch.element(slot.add(uint(BIN_R))), fx[0]);
             atomicAdd(scratch.element(slot.add(uint(BIN_G))), fx[1]);
             atomicAdd(scratch.element(slot.add(uint(BIN_B))), fx[2]);
+            // THE SAME BIN THE SECONDARY TERM MUST LAND IN. Exactly one cascade
+            // takes this branch (`c == own`), so this assigns once per ray, and
+            // it is captured HERE rather than recomputed in [J] because `own`,
+            // the ancestor chain and the block claim are all this frame's and
+            // none of them survives into a second dispatch.
+            if (sec) sec.slot.assign(slot);
           });
           atomicAdd(scratch.element(slot.add(uint(BIN_COUNT))), uint(DEPOSIT_SCALE));
           atomicAdd(stats.element(uint(STAT_DEPOSITS)), uint(1));
+        });
+      }
+
+      // ── the hit list append ───────────────────────────────────────────────
+      //
+      // A shaded hit with a destination bin, and nothing else: a MISS never
+      // reaches the radiance branch so its slot stays EMPTY, and a hit whose
+      // owning probe never claimed a block has nowhere to put a second bounce
+      // either (it is already counted as a `NOBLOCK` deposit above).
+      //
+      // The count is claimed with an atomic and the entry written only if it
+      // fits. An over-capacity list is not supposed to happen — the capacity is
+      // `transportThreads × raysPerPixel`, an exact bound on the rays this
+      // dispatch can fire — so the counter exists to say the bound was wrong
+      // rather than to make dropping acceptable.
+      if (sec) {
+        If(sec.want.equal(uint(1)).and(sec.slot.notEqual(uint(SLOT_EMPTY))), () => {
+          const idx = atomicAdd(scratch.element(uint(secondary.base)), uint(1)).toVar();
+          If(idx.lessThan(uint(secondary.capacity)), () => {
+            const e = uint(secondary.base + 1).add(idx.mul(uint(SEC_HIT_WORDS))).toVar();
+            const put = (w, v) => { atomicStore(scratch.element(e.add(uint(w))), v); };
+            put(SEC_P + 0, floatBitsToUint(sec.P.x));
+            put(SEC_P + 1, floatBitsToUint(sec.P.y));
+            put(SEC_P + 2, floatBitsToUint(sec.P.z));
+            put(SEC_N + 0, floatBitsToUint(sec.N.x));
+            put(SEC_N + 1, floatBitsToUint(sec.N.y));
+            put(SEC_N + 2, floatBitsToUint(sec.N.z));
+            put(SEC_RHO + 0, floatBitsToUint(sec.rho.x));
+            put(SEC_RHO + 1, floatBitsToUint(sec.rho.y));
+            put(SEC_RHO + 2, floatBitsToUint(sec.rho.z));
+            put(SEC_SLOT, sec.slot);
+            // The reserved pair, written rather than left as whatever the last
+            // frame's entry held — a reader added later gets zeros instead of a
+            // stale value that happens to decode.
+            put(10, uint(0));
+            put(11, uint(0));
+          }).Else(() => {
+            atomicAdd(stats.element(uint(STAT_SEC_OVERFLOW)), uint(1));
+          });
         });
       }
     });
@@ -779,13 +959,24 @@ export function createSrcDepositFrame(store, bins, {
      * `floor(x·keep)` with no ray nondeterminism in it at all.
      */
     decay: passes[0],
+    /**
+     * [E] and [F] by name, because [J] DISPATCHES BETWEEN THEM (srcSystem's
+     * `passes` list) and slicing the array by index at the call site would put
+     * the frame order at the mercy of this list's length. `passes` stays the
+     * whole chain for every caller that has no [J].
+     */
+    scatter: passes[1],
+    resolve: passes[2],
     raysPerPixel,
 
     /** One frame's tallies. The `Lmax` decision's instrument — see the header. */
     async readStats(renderer) {
       const allocated = !!renderer?.backend?.get?.(stats.value)?.buffer;
       if (!allocated) {
-        return { dispatched: false, rays: 0, hits: 0, deposits: 0, clamped: 0, noBlock: 0, shaded: 0 };
+        return {
+          dispatched: false, rays: 0, hits: 0, deposits: 0, clamped: 0, noBlock: 0, shaded: 0,
+          secondaryHits: 0, secondaryClamped: 0, secondaryOverflow: 0,
+        };
       }
       const v = new Uint32Array(await renderer.getArrayBufferAsync(stats.value));
       const rays = v[STAT_RAYS] >>> 0;
@@ -816,6 +1007,17 @@ export function createSrcDepositFrame(store, bins, {
         emitZeroed: v[STAT_EMIT_ZEROED] >>> 0,
         albedoClamped: v[STAT_ALBEDO_CLAMPED] >>> 0,
         importanceFloored: v[STAT_IMPORTANCE_FLOORED] >>> 0,
+        // ── [J]'s three ────────────────────────────────────────────────────
+        //
+        // `secondaryHits` is the one that says the multibounce pass RAN, and it
+        // is read from the deposit's buffer because [J] writes into it (R7 —
+        // the secondary kernel owns no buffer of its own). Zero with hit
+        // shading on and `shading.secondary` true means the pass exists in
+        // `passes` and produced nothing, which is a dispatch or pipeline
+        // failure and NOT a dim second bounce.
+        secondaryHits: v[STAT_SECONDARY] >>> 0,
+        secondaryClamped: v[STAT_SEC_CLAMPED] >>> 0,
+        secondaryOverflow: v[STAT_SEC_OVERFLOW] >>> 0,
         unattributedRate: shaded > 0 ? (v[STAT_UNATTRIBUTED] >>> 0) / shaded : 0,
         deposits: v[STAT_DEPOSITS] >>> 0,
         clamped: v[STAT_CLAMPED] >>> 0,
