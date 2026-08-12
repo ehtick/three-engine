@@ -1565,6 +1565,33 @@ export function createGiTargets(width, height, shadowWidth = width, shadowHeight
 }
 
 /**
+ * One-shot clear of a shadow storage texture to WHITE (unshadowed).
+ *
+ * The emitter-shadow targets are StorageTextures, which WebGPU
+ * ZERO-initializes — and 0 in a visibility channel means FULLY OCCLUDED.
+ * The marcher that writes them compiles asynchronously (it is the module's
+ * 110kB monster, deliberately not in the warm-up wave at 0 emitters), and
+ * while it compiles its dispatch is SKIPPED — so between (re)build and the
+ * pipeline landing, every emitter's direct light was multiplied by zero.
+ * The user saw it as "the emissive's light and shadows kick in seconds
+ * late" (Cornell box, 2026-08-13). A visibility term must fail OPEN: this
+ * pass stamps 1 everywhere, once, right after target creation — the same
+ * default the marcher itself starts each pixel from. Its own tiny pipeline
+ * also compiles async, but at ~1kB it lands orders of magnitude sooner,
+ * and the replay guard re-dispatches it on resolution either way.
+ */
+export function createGiShadowClearPass(target, width, height) {
+  const w = Math.max(1, width | 0);
+  const total = w * Math.max(1, height | 0);
+  const clear = Fn(() => {
+    const x = instanceIndex.mod(uint(w)).toInt();
+    const y = instanceIndex.div(uint(w)).toInt();
+    textureStore(target, ivec2(x, y), vec4(1));
+  });
+  return { compute: clear().compute(total) };
+}
+
+/**
  * Sibling of createGiTargets for the BVH reflect pass's output (see
  * createGiBvhReflect above) — created/retired separately because it is
  * OPTIONAL (quality-gated, runtime-hatchable — see GISystem's

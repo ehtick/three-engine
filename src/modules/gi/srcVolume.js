@@ -207,7 +207,22 @@ export function createSrcWidthProbe(occField, world, {
       const minV = vec3(world.min).toVar();
       const bmaxV = minV.add(vec3(world.size)).toVar();
       const capWorldV = float(world.capWorld).toVar();
-      const capCut = capWorldV.mul(0.85).toVar();
+      // 0.5·capWorld (8 voxels), tightened from 0.85 on 2026-08-13. The 0.85
+      // cut was sized to recognise a SATURATING distance as open space, but
+      // `freeRadiusAtWorld` in open space returns lattice-inset bounds — for
+      // each empty 2×2×2 level-L block, [0.5, 1.0]·2^L voxels — so levels
+      // 1-3 emit 4-16-voxel "occluders" on a 0.75m-period world lattice that
+      // slip under 13.6 voxels. In a small tight-fit volume (the Cornell
+      // box) those taps put `cand = k·D/t` right in the darkening band and
+      // painted world-locked 30-70% clouds on open ceilings. Real width-
+      // relevant occluders live where `k·D/t < 1` actually bites — under
+      // ~8 voxels at any k this probe serves — so the tighter cut discards
+      // only lattice artifacts. `__giShadowWidthCapCut` overrides (a finite
+      // number, fraction of capWorld; 0 is a valid ablation = reject all).
+      const capCutFrac = Number.isFinite(Number(globalThis.__giShadowWidthCapCut))
+        ? Number(globalThis.__giShadowWidthCapCut)
+        : 0.5;
+      const capCut = capWorldV.mul(capCutFrac).toVar();
       const minCellV = float(world.minCell).toVar();
       const occVox = occField?.voxel
         ? vec3(occField.voxel).x.max(vec3(occField.voxel).y).max(vec3(occField.voxel).z).toVar()

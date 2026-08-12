@@ -125,7 +125,11 @@ const sourceAngle = Number(process.env.SOURCEANGLE ?? 10);
 // `SRCVOL=legacy HATCH=spherearm` is the legacy sphere arm on the composited
 // distance — the pre-§12.6 shipping shadow.
 const srcVol = process.env.SRCVOL ?? "";
-const result = await page.evaluate(async ({ hatch, quality, steps, slab, sunOn, profileOn, kindSub, sunPos, floorY, emitterCounts, moverOn, moverY, sourceAngle, intermitOn, pressure, intermitMs, srcVol }) => {
+// CAPCUT — fraction of capWorld for the width probe's lattice-inset
+// rejection gate (`__giShadowWidthCapCut`; shipping default 0.5 since
+// 2026-08-13, CAPCUT=0.85 is the pre-change arm for the SLAB leak A/B).
+const capCut = process.env.CAPCUT ?? "";
+const result = await page.evaluate(async ({ hatch, quality, steps, slab, sunOn, profileOn, kindSub, sunPos, floorY, emitterCounts, moverOn, moverY, sourceAngle, intermitOn, pressure, intermitMs, srcVol, capCut }) => {
   globalThis.__probeFloorY = floorY;
   globalThis.__editorKeepRendering = true;
   if (hatch === "noselfcut") globalThis.__giNoOccSelfCut = true;
@@ -137,6 +141,7 @@ const result = await page.evaluate(async ({ hatch, quality, steps, slab, sunOn, 
   if (hatch === "noprobe") globalThis.__giShadowAnalyticWidth = false;
   if (hatch === "tap") globalThis.__giWidthProbeDebugTap = true;
   if (srcVol) globalThis.__giSrcVolumeShadows = srcVol;
+  if (capCut !== "") globalThis.__giShadowWidthCapCut = Number(capCut);
   if (kindSub) {
     globalThis.__giShadowKindDebug =
       kindSub === 10 ? "normy" :
@@ -821,7 +826,7 @@ const result = await page.evaluate(async ({ hatch, quality, steps, slab, sunOn, 
     }
   }
   return { W, H, emitters, grain: n ? sum / n : 0, penPx: n, leak, shadowPng: toPng(img), sunKinds, rayStats, bitsProfile };
-}, { hatch, quality, steps, slab, sunOn, profileOn, kindSub, sunPos, floorY, emitterCounts, moverOn, moverY, sourceAngle, intermitOn, pressure, intermitMs, srcVol });
+}, { hatch, quality, steps, slab, sunOn, profileOn, kindSub, sunPos, floorY, emitterCounts, moverOn, moverY, sourceAngle, intermitOn, pressure, intermitMs, srcVol, capCut });
 
 if (result.fail) { console.log(`FAIL: ${result.fail}`); await browser.close(); process.exit(1); }
 // See the console-hook note: no composite ⇒ the readback measured a field that

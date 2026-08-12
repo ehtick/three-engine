@@ -30,7 +30,7 @@ import * as THREE from "three/webgpu";
 import { Fn, If, cameraPosition, cos, float, fract, mix, normalWorld, positionWorld, renderGroup, screenCoordinate, screenUV, select, sin, smoothstep, texture, uniform, uniformArray, vec2, vec3, vec4 } from "three/tsl";
 import { GI_BOOT_AMBIENT_MAX_TICKS, bootAmbientStep } from "./bootAmbient.js";
 import { giDebugView, resolveGiConfig, sceneSkyRadiance } from "./giConfig.js";
-import { blitBvhAtlasTiles, createGiBvhReflect, createGiBvhTarget, createGiEmitterShadowPass, createGiGBuffer, createGiLightShadowFilterPass, createGiLightShadowHistoryPass, createGiLightShadowPass, createGiLightShadowWidePass, createGiResolve, createGiTargets, renderGiGBuffer } from "./giScreen.js";
+import { blitBvhAtlasTiles, createGiBvhReflect, createGiBvhTarget, createGiEmitterShadowPass, createGiGBuffer, createGiLightShadowFilterPass, createGiLightShadowHistoryPass, createGiLightShadowPass, createGiLightShadowWidePass, createGiResolve, createGiShadowClearPass, createGiTargets, renderGiGBuffer } from "./giScreen.js";
 import { resolveMaterialSurface, serializeMeshForBake } from "./voxelizeOnce.js";
 import { createSrcVolume } from "./srcVolume.js";
 import { createSrcDistanceView, createSrcOccupancyView } from "./srcDebugViews.js";
@@ -3152,6 +3152,19 @@ export class GISystem {
       // (≥ 2 field cells); one extra voxel keeps grazing rays out of the
       // lamp's own conservatively-bulged shell.
       const tEnd = float(maxT).sub(voxMax).max(0).toVar();
+      // LAMP EXCLUSION for the WIDTH PROBE, hoisted above BOTH arms
+      // (2026-08-13). The emissive mesh IS occupancy geometry, so D → 0 as
+      // taps approach the lamp face; the probe's reach must end at
+      // maxT·(1 − 1/k) minus a voxel of bulge (k = dist/reff ⇒ the lamp's
+      // D-footprint along the ray is exactly maxT/k). The records arm below
+      // always had this; the static-BVH arm was added later as a copy of the
+      // DIRECT-light arm's call — which passes maxT unchanged because
+      // analytic gi lights have no body in the field — and inherited a bug
+      // the records arm's comment describes verbatim: last taps read
+      // lamp-proximal k·d/t ≈ 0, a 30-70% darkening switching on a float
+      // coin-toss at the final tap, smeared by the bilateral into the
+      // Cornell-box ceiling mud (2026-08-13 user report).
+      const tProbe = tEnd.mul(float(1).sub(float(1).div(float(k).max(1.05)))).sub(voxMax).max(0).toVar();
       // STATIC-BVH ARM (see the direct arm's note): exact triangles for the
       // emitter's occlusion too. The tEnd trim above already excludes the
       // lamp's own surface; the width probe supplies area-light softness.
@@ -3171,8 +3184,10 @@ export class GISystem {
         if (widthProbe) {
           const w = float(1).toVar();
           If(hit.not(), () => {
+            // tProbe, not tEnd — admission (the BVH trace above) keeps the
+            // full ray; only the width probe stops short of the lamp.
             w.assign(widthProbe(
-              origin, dir, voxMax.mul(3), tEnd, k,
+              origin, dir, voxMax.mul(3), tProbe, k,
               cosRayNormal != null ? float(cosRayNormal) : float(1),
               lift,
             ));
@@ -3210,20 +3225,10 @@ export class GISystem {
         // misses and exhaustions only (the true umbra still skips it).
         const exhausted = float(r.kind).greaterThan(3.5).toVar();
         const w = float(1).toVar();
-        // LAMP EXCLUSION, width-probe form. The emissive mesh IS occupancy
-        // geometry, so D → 0 as taps approach the lamp face — without a
-        // pullback the LAST taps of every ray read k·d/t ≈ 0 and the whole
-        // receiver plane went near-black (the probe rig's waffle floor;
-        // neither the plane gate nor step budget moved it — the darkening
-        // samples were lamp-proximal, not floor-proximal). The lamp's
-        // D-footprint along the ray is its own effective radius, which is
-        // exactly maxT/k (emitter k = dist/reff) — so the probe's reach
-        // ends at maxT·(1 − 1/k) minus a voxel of bulge. The march still
-        // owns admission over the FULL ray, so an occluder hugging the
-        // lamp keeps its (hard) shadow; only its extra width is forgone.
-        // Analytic gi lights need no such pullback: they have no body in
-        // the field (the direct arm passes maxT unchanged).
-        const tProbe = tEnd.mul(float(1).sub(float(1).div(float(k).max(1.05)))).sub(voxMax).max(0).toVar();
+        // Lamp exclusion: `tProbe` is hoisted above both arms — see the
+        // comment at its declaration. The march still owns admission over
+        // the FULL ray, so an occluder hugging the lamp keeps its (hard)
+        // shadow; only its extra width is forgone.
         If(float(r.hit).lessThan(0.5).or(exhausted), () => {
           w.assign(widthProbe(origin, dir, voxMax.mul(3), tProbe, float(k), float(cosRayNormal), lift));
         });
@@ -3260,6 +3265,7 @@ export class GISystem {
         this._giIrradianceNode = texture(this._giTargets.irradiance);
         this._giEmitterShadowNode = texture(this._giTargets.emitterShadow);
         this._giRadianceNode = texture(this._giTargets.radiance);
+        this.#clearEmitterShadowTargets(this._giTargets, emitterW, emitterH);
       }
       const targets = this._giTargets;
       // PERSISTENT, created once per system and repointed on resize — exactly
@@ -3768,6 +3774,18 @@ export class GISystem {
         this._giEmitterHistWeightU ??= uniform(0.9).setGroup(renderGroup);
         this._giShadowPrevVPU ??= uniform(new THREE.Matrix4()).setGroup(renderGroup);
       }
+      // Mid-σ for the emitter channel (σ ≈ 1.1 at 0.5, vs the hardcoded 1.6
+      // this pass got when `softness` was absent): the emitter raw is a
+      // DETERMINISTIC analytic-width march, not stochastic dither — the wide
+      // kernel was tuned for the latter and converted the width probe's
+      // structured error into the Cornell "mud" (2026-08-13). Penumbra
+      // softness lives in the width values themselves; the filter only
+      // despeckles. `__giEmitterFilterSoftness` overrides (0 razor → 1 wide).
+      this._giEmitterSoftnessU ??= uniform(
+        Number.isFinite(Number(globalThis.__giEmitterFilterSoftness))
+          ? Number(globalThis.__giEmitterFilterSoftness)
+          : 0.5,
+      );
       const emitterShadowFilterPass = emitterShadowPass
         ? createGiLightShadowFilterPass({
             gbuffer,
@@ -3778,6 +3796,7 @@ export class GISystem {
             resolveWidth: width,
             resolveHeight: height,
             planeEps: inputs.lightShadow?.voxMax ?? 0.1,
+            softness: this._giEmitterSoftnessU,
             history: emitterTemporal ? {
               histShadow: targets.emitterShadowHist,
               histPos: targets.emitterShadowHistPos,
@@ -3809,6 +3828,7 @@ export class GISystem {
             resolveWidth: width,
             resolveHeight: height,
             planeEps: inputs.lightShadow?.voxMax ?? 0.1,
+            softness: this._giEmitterSoftnessU,
           })
         : null;
       light.giIrradianceNode = this._giIrradianceNode;
@@ -3821,6 +3841,12 @@ export class GISystem {
       // smearing white dots across the dark silhouette in front of it.
       light.giPositionNode = this._giShadowPosNode;
       light.giScreenTexel = this._giLightShadowTexel;
+      // The emitter pack is a SMALLER buffer (emitterShadowScale × shadow
+      // size) — its bilateral taps need its own texel or they collapse onto
+      // one texel and stop discriminating (see giLight's tap comment).
+      this._giEmitterShadowTexel ??= uniform(new THREE.Vector2());
+      this._giEmitterShadowTexel.value.set(1 / emitterW, 1 / emitterH);
+      light.giEmitterShadowTexel = this._giEmitterShadowTexel;
       if (srcProbes) {
         // The gizmos go in the scene rather than on `state.gizmos`, because
         // they belong to the SCREEN bundle's lifetime (they read its probe
@@ -3906,6 +3932,9 @@ export class GISystem {
     screen.targets = createGiTargets(width, height, shadowW, shadowH, { emitterWidth: emitterW, emitterHeight: emitterH });
     screen.emitterShadowWidth = emitterW;
     screen.emitterShadowHeight = emitterH;
+    // Fresh targets are zero = fully occluded; fail OPEN until the marcher's
+    // first dispatch lands (see #clearEmitterShadowTargets).
+    this.#clearEmitterShadowTargets(screen.targets, emitterW, emitterH);
     // The stochastic arm's accumulate/history textures are lazy now — a
     // resize on that arm must re-materialize them before the pass rebuilds
     // below bind them (the history pass's existence records the arm).
@@ -3918,6 +3947,7 @@ export class GISystem {
     // The shadowNode's tap offsets are SHADOW-CHANNEL texels — this path
     // skips #buildScreenResolve, so the uniform must follow the size here too.
     this._giLightShadowTexel?.value.set(1 / shadowW, 1 / shadowH);
+    this._giEmitterShadowTexel?.value.set(1 / emitterW, 1 / emitterH);
     // Same swap for the gi light-shadow channel pack. The node is what every
     // gi light's compiled shadow branch holds, so re-pointing it (rather than
     // rebuilding it) is what keeps a viewport resize free of material
@@ -4040,6 +4070,7 @@ export class GISystem {
         resolveWidth: width,
         resolveHeight: height,
         planeEps: screen.lightShadow?.voxMax ?? 0.1,
+        softness: this._giEmitterSoftnessU,
         history: emitterTemporal ? {
           histShadow: screen.targets.emitterShadowHist,
           histPos: screen.targets.emitterShadowHistPos,
@@ -4561,6 +4592,29 @@ export class GISystem {
     if (Number.isFinite(forced) && forced > 0) return Math.min(1, forced);
     const quality = qualityTierOf(this.config);
     return { low: 0.45, medium: 0.5, high: 0.6, ultra: 0.7071 }[quality] ?? 0.7071;
+  }
+
+  /**
+   * FAIL-OPEN for the emitter shadow channel: stamp both targets WHITE once
+   * per (re)creation. StorageTextures are zero-initialized and 0 here means
+   * fully occluded — during the marcher's async compile every emitter's
+   * direct light multiplied by zero, which read as "the emissive's light
+   * kicks in seconds late" (see createGiShadowClearPass). Dispatched through
+   * the same wrapper as every GI pass, so a not-yet-ready pipeline is
+   * recorded and replayed rather than lost.
+   */
+  #clearEmitterShadowTargets(targets, emitterW, emitterH) {
+    const renderer = this.engine.renderer;
+    if (!renderer?.backend?.device || !targets?.emitterShadow) return;
+    try {
+      const a = createGiShadowClearPass(targets.emitterShadow, emitterW, emitterH);
+      const b = createGiShadowClearPass(targets.emitterShadowRaw, emitterW, emitterH);
+      giCompute(renderer, [a.compute, b.compute]);
+    } catch (error) {
+      // A failed clear must never take the build down — the worst case is
+      // the old fail-closed behaviour for one compile window.
+      console.warn("[gi] emitter shadow clear failed:", error?.message ?? error);
+    }
   }
 
   /**

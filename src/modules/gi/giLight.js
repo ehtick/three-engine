@@ -1203,7 +1203,7 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
     // light a dark error is a dim pixel, a bright error is the dot.
     const bilateral =
       light.giPositionNode && light.giScreenTexel
-        ? (texNode) => {
+        ? (texNode, texel = light.giScreenTexel) => {
             // FIXED-METRE HATCHES (2026-08-07, the ~0.196m block-size hunt).
             // Measured: block size on the floor is 0.196 + 0.14·probeSpacing
             // metres in x, and the voxelSize dial is inert (5× the dial moves
@@ -1278,7 +1278,14 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
                 ? [[0, 0]]
                 : [[-0.5, -0.5], [0.5, -0.5], [-0.5, 0.5], [0.5, 0.5]].map(([dx, dy]) => [dx * tapScale, dy * tapScale]);
             const taps = offsets.map(([dx, dy]) => {
-              const uv = screenUV.add(vec2(light.giScreenTexel).mul(vec2(dx, dy)));
+              // Texel size of the texture being sampled — NOT always the
+              // shadow channel's: the emitter pack is a smaller buffer
+              // (emitterShadowScale × shadow size), and ±0.5 shadow-texels
+              // there is ±0.35 emitter-texels — the four taps collapse onto
+              // one texel and the bilateral stops discriminating (found
+              // 2026-08-13). Callers pass the right texel; the default keeps
+              // every resolve-sized texture exactly as before.
+              const uv = screenUV.add(vec2(texel).mul(vec2(dx, dy)));
               const v = vec4(texNode.sample(uv)).toVar();
               const g = light.giPositionNode.sample(uv);
               const d = g.xyz.sub(positionWorld).length();
@@ -1315,7 +1322,9 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
         // Same bilateral as the irradiance above — packed per-emitter shadow
         // factors smear across silhouettes identically, and min-per-channel
         // as the no-tap fallback is exactly "darkest shadow wins".
-        const packed = (bilateral ? bilateral(light.giEmitterShadowNode) : light.giEmitterShadowNode.sample(screenUV)).toVar();
+        const packed = (bilateral
+          ? bilateral(light.giEmitterShadowNode, light.giEmitterShadowTexel ?? light.giScreenTexel)
+          : light.giEmitterShadowNode.sample(screenUV)).toVar();
         const channels = [packed.x, packed.y, packed.z, packed.w];
         light.emitterSlots.forEach((slot, index) => {
           const toEmitter = vec3(slot.center).sub(positionWorld).toVar();
