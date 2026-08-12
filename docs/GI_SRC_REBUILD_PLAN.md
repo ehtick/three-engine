@@ -7565,6 +7565,45 @@ points past a single tuned α to "a multi-scale mean estimator or other
 methods of adaptive averaging", which is the design to reach for if the
 proper arm confirms the trade.
 
+#### 12.46.4 THE EASED CURVE — AND THE TRIANGLE UNDERSOLD THE FIX 2.4×
+
+`ROT_EASE=1 FRAMES=600` (their composition, ROT_HALF=300 ⇒ two turns per
+arm), same four configs, ×2:
+
+| config | rev/px | capLift% | trMax | αmean | still-after |
+|---|---|---|---|---|---|
+| **shipped** | **13.70** | 30 | 0.50 | 0.083 | 3.66 |
+| level-arm (pre-fix) | 33.28 | 93 | 1.00 | 0.097 | 8.39 |
+| no-lift | 58.78 | 0 | 1.00 | 0.100 | 20.6 |
+| window-off | 19.20 | 0 | 0.00 | 0.083 | 3.66 |
+
+Shipped round spread 0.574. **Two corrections to §12.46.1, both from using
+the right curve.**
+
+**(a) The fix is worth 2.4× in FLICKER, not just in fps.** On the triangle,
+shipped and level-arm read identically (4.68 vs 4.67) and the entire claim
+was "same churn, capped cost". On their actual curve it is **33.28 → 13.70**,
+with the post-park settle 8.39 → 3.66 (2.3×). The triangle is a
+*degenerate* input for this mechanism: its rate never dips, so it never
+turns, so it never exercises the arm/close cycle that the user's swing
+performs twice a period. It could measure the pin and the fps, and it
+systematically understated the flicker win.
+
+**(b) The turn windows EARN their cost — shipped now beats window-off**
+(13.70 vs 19.20, −29%), where on the triangle window-off was marginally
+better. This inverts the §12.46 framing: the window is not merely harmless
+once it stops being pinned, it is *useful* precisely at the turns, which is
+where the field is most stale relative to a sun that is accelerating again.
+A light event really is a crossing, and a turn really is one.
+
+**capLift 30% is the CORRECT reading here, not a leak** — two turns per
+600-frame arm, each arming one 1200 ms window. The predicted duty was ~12%
+(one window per 10 s half-swing); 30% is higher because the harness runs
+faster than 30 fps, so a fixed-millisecond hold covers more frames. The
+verdict bar is now curve-dependent (`ROT_EASE` ⇒ 0.6) and additionally
+requires shipped to sit under 0.6× level arming, because the invariant that
+must hold in both regimes is the SEPARATION, not an absolute percentage.
+
 And the reason `ROT_EASE` exists at all is a fifth, subtler one: **the
 constant-rate triangle cannot test the re-arm dwell.** Its per-frame delta
 never dips below the arming threshold, so it can only ever report 0% or
