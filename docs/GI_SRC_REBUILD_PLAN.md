@@ -7351,3 +7351,116 @@ lift) survives as a small real margin on top: lift-on 2.89 vs lift-off
 §12.45 CAMERA_AB numbers (pan excess 6.66 capped / 1.66 off) were
 measured UNDER the coupling — fast decay ran in all those arms; the
 turnover diagnosis stands but its magnitude was mostly the window's.
+
+### 12.46 A LIGHT EVENT IS A CROSSING, NOT A STATE — THE DAY CYCLE PINNED
+### THE TRACKING WINDOW OPEN FOR THE ENTIRE SESSION
+
+The user's 2026-08-12 verdict on the shipped §12.42→§12.45 stack was flat:
+"FPS seems even lower than before, 45-50 for High, 30 when moving the
+camera… when Light moves flicker is still strong. So no much win since
+last session." Both halves have ONE cause, and it is in the arming
+condition §12.43 shipped.
+
+**THE ARITHMETIC CAME FIRST.** Their scene runs `scripts/LightScript.ts`,
+a day cycle that ping-pongs the sun's elevation across 140° with a
+cosine/quadInOut ease over a 10 s half-period. Mid-swing that is
+~0.005 rad per frame at their 30 fps. `ALPHA_MOTION_SAT` is
+`(0.94−0.86)/30 = 0.00267`, so `mLight = min(1, dirDelta/SAT)` **saturates
+at 1.0 on every single frame of the swing** — 1.9× the constant at their
+worst-case frame rate, more at higher rates. §12.43's arm was
+LEVEL-triggered (`if (mLight >= ALPHA_TRACK_THRESHOLD) holdUntil = now +
+1200`), so every frame re-pushed the hold and **the window never closed
+while the sun moved**. Consequences, both of them user-visible:
+
+- §12.45's cap lift keyed off `tr > 0` ⇒ the tier cap sat at
+  `PROBE_RAY_CAP_OFF` permanently. **§12.42's entire fps win — ~14 ms of
+  their 21.2 ms deposit — was cancelled for the whole day cycle.** That is
+  the "fps even lower" report, and it is why the shipped build measured
+  worse for them than the capped build it replaced.
+- The window's fast decay (`rootS = 1`, α pinned at 0.1) became the STEADY
+  STATE. §12.45 accepted that churn explicitly as "transient 1.2 s" — the
+  transient never ended. That is "when light moves, flicker is still
+  strong."
+
+**LIGHT_ROT (new rig arm) PRICED IT BEFORE THE FIX** — a continuous sun
+ping-pong driven on the light's matrix in-page (matrix motion needs no
+prop path; GISystem's loop polls `matrixWorld` deltas, exactly as the
+user's script drives it), per-frame cap/`tr`/α sampling, a discarded
+rotating settle arm before each measured arm so the measurement is the
+STEADY state and the legitimate onset window lands in the discard:
+
+| config | rev/px | capLift% | trMax | αmean |
+|---|---|---|---|---|
+| shipped (level arm) | 4.62 | **100** | 1.00 | 0.100 |
+| no-lift | 30.88 | 0 | 1.00 | 0.100 |
+| window-off | 5.07 | 0 | 0.00 | 0.100 |
+
+Round spread on shipped 0.378. Read the first and third rows together:
+**shipped and window-off are the same churn (4.62 vs 5.07, inside 1.3×
+the spread) — but shipped pays uncapped deposit for it and window-off pays
+tier-capped.** The window buys nothing in this regime and costs the cap.
+The middle row is the guardrail: pinning the window open WITHOUT the lift
+is 6.7× worse than either, so the lift is not the thing to remove —
+**the arming is.**
+
+**THE FIX: arm on RISING EDGES.** `mLight` crossing the threshold arms the
+window once; sustained saturation re-arms nothing. A crossing only counts
+after the peak has spent `ALPHA_TRACK_REARM_MS = 800` BELOW threshold —
+the eased ping-pong dwells sub-threshold ~0.6 s at each extreme, and
+without the dwell every swing reversal would arm a fresh 1.2 s uncapped
+window, i.e. a periodic churn burst twice per cycle. A genuine isolated
+event (a toggle, a teleport, a cut) follows seconds of quiet and always
+arms, so §12.43's and §12.45's step behaviour is untouched. Accepted
+limitation, stated rather than hidden: a step DURING sustained motion
+cannot edge-trigger and rides the already-saturated α ramp — fast α is
+already the ceiling of what the ramp buys there.
+`__giSrcTrackLevelArm = true` restores level arming as the rig's
+regression arm; it is never a shipping config.
+
+#### 12.46.1 VERIFY
+
+Post-fix LIGHT_ROT, four arms interleaved ×2 in one page (fresh process —
+absolute numbers do not cross a process boundary, the within-page
+comparison does):
+
+| config | rev/px | capLift% | trMax | still-after |
+|---|---|---|---|---|
+| **shipped (rising edge)** | **4.676** | **0** | 0.00 | **0.95** |
+| level-arm (pre-fix) | 4.665 | 100 | 1.00 | 3.28 |
+| no-lift | 27.01 | 0 | 1.00 | 10.9 |
+| window-off | 5.00 | 0 | 0.00 | 0.95 |
+
+Shipped round spread 0.590; page still floor 0.718.
+
+**The headline is the first two rows being the SAME number.** 4.676 vs
+4.665 is inside 1/50th of the spread: the rising-edge fix costs **zero**
+flicker during the day cycle and buys back the tier cap on 100% of frames
+— §12.42's ~14 ms of deposit, restored for the regime the user actually
+plays in. `capLift 0%` with `trMax 0.00` is the mechanism confirmed
+directly rather than inferred: the window is genuinely closed during
+sustained rotation, not merely cheaper.
+
+**The unadvertised win is the `still-after` column** — a full still arm
+measured immediately after the sun parks, which is also what every
+ping-pong ENDPOINT looks like. Pre-fix the field stayed churning at
+3.21-3.34 rev/px; post-fix it settles to 0.92-0.99, i.e. **3.4× calmer,
+and within 1.35× of the page's own still floor.** The pre-fix elevation
+outlasts the window's own 1.2 s by most of a 240-frame arm, so it is not
+the open window being counted — it is the field re-equilibrating from an
+uncapped fast-decay state back to the capped slow-decay one. Under a
+ping-pong cycle that transient never got to finish before the next swing.
+
+**HONEST RESIDUAL, AND IT IS THE NEXT UNIT.** Churn *during* rotation is
+~4.7 rev/px in every arm that has a window at all — 6.5× the page's 0.718
+still floor — and window-off's 5.00 shows removing the window does not
+touch it either. So the user's "when light moves, flicker is still
+strong" is only PARTLY closed by §12.46 (the endpoints and the fps are;
+the swing itself is not). What all four arms share is `αmean = 0.100`:
+`m` saturates under sustained rotation, so the §12.38 ramp pins α at its
+fast end for the entire cycle, and §12.38 measured α=0.1 at ~3× the churn
+of α=0.05. The open question is whether sustained SMOOTH motion needs the
+fast α at all — per-frame innovation is small and monotone, so a slower α
+should cost a bounded angular LAG rather than accuracy, which is a very
+different trade from a step. That is an α sweep under LIGHT_ROT, and it
+wants a lag statistic as well as a churn one (§12.38's lesson: a
+smoothing change that eats real signal passes every calm metric).

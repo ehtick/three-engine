@@ -182,6 +182,33 @@ export const ALPHA_MOTION_SAT = (0.94 - 0.86) / 30;
  */
 export const ALPHA_TRACK_HOLD_MS = 1200;
 export const ALPHA_TRACK_THRESHOLD = 0.5;
+/**
+ * §12.46: the window arms on RISING EDGES of the light peak, and a crossing
+ * only counts as an edge after the peak spent at least this long BELOW the
+ * threshold. Two regimes forced this:
+ *
+ *  - A CONTINUOUS sun (the user's day-cycle script: 2–6× ALPHA_MOTION_SAT
+ *    per frame, every frame) saturates the peak permanently. Level-triggered
+ *    arming re-pushed the hold each frame, so the window NEVER closed during
+ *    play — §12.45's cap lift became permanent (the §12.42 fps win cancelled
+ *    for the whole session) and the window's fast decay became the steady
+ *    state. LIGHT_ROT priced the regimes: level-armed 4.62 rev/px at
+ *    capLift 100% vs window-off 5.07 at capLift 0 — SAME churn, tier-capped
+ *    cost — while no-lift's 30.9 confirms the lift must exist wherever level
+ *    arming does. Sustained motion needs no window: the m-driven α ramp with
+ *    the tier cap IS its steady state.
+ *  - The dwell exists for the ping-pong's ENDPOINTS: the eased swing sits
+ *    sub-threshold ~0.6 s at each extreme, and without the dwell every swing
+ *    restart would arm a fresh 1.2 s window — a periodic uncapped churn
+ *    burst every half-cycle. 800 ms clears that dwell; a genuine isolated
+ *    event (toggle, teleport) follows seconds of quiet and always arms.
+ *
+ * A step DURING sustained motion cannot edge (the peak is already high) and
+ * rides the saturated α ramp instead — accepted: fast α is already the
+ * ceiling of what the ramp buys. `__giSrcTrackLevelArm = true` restores
+ * level arming — the rig's regression arm, never a shipping config.
+ */
+export const ALPHA_TRACK_REARM_MS = 800;
 
 /** Frames a probe survives unseen before the per-frame rebuild stops re-inserting it. */
 export const PROBE_MAX_AGE = 60;

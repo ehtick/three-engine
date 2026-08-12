@@ -86,6 +86,34 @@ const CAMERA_VERIFY = process.env.CAMERA_VERIFY === "1";
 // window's own noise cost, as a reference).
 const LIGHT_STEP = process.env.LIGHT_STEP === "1";
 const STEP_AT = Number(process.env.STEP_AT ?? 60);
+// LIGHT_ROT=1 — the CONTINUOUS-SUN arm (the user's day cycle: LightScript.ts
+// ping-pongs sun elevation over 140° at up to ~1°/frame, so dirDelta sits at
+// 1.8–6× ALPHA_MOTION_SAT EVERY frame, mLight saturates ≥ the 0.5 threshold,
+// and under LEVEL-triggered arming the §12.43 window's 1200 ms hold RE-ARMED
+// each frame — it never closed while the sun moved (§12.46 fixed the arming
+// to rising edges; the pre-fix pin is reproducible via the level-arm config).
+// Four configs: shipped (rising edge — steady rotation at tier cost),
+// level-arm (the §12.43–45 behavior: pinned window, permanent cap lift),
+// no-lift (pinned window + tier cap — decomposes the cap-lift's share from
+// the fast-decay share), window-off (`__giSrcMotionTrack=false` — no window
+// at all, the sustained-regime reference). Rotation is driven
+// in-page on the light object — GISystem's light loop polls matrixWorld
+// deltas, so matrix motion needs no editor prop path (unlike LIGHT_STEP's
+// intensity, which rides the prop path to fire light events).
+const LIGHT_ROT = process.env.LIGHT_ROT === "1";
+// rad/frame. Default = the user's editor mid-swing at 30 fps (~0.28°/frame).
+const ROT_RATE = Number(process.env.ROT_RATE ?? 0.005);
+// ROT_ALPHA="0.1,0.05,0.02" (with LIGHT_ROT) — §12.46.1's residual: churn
+// during the swing is ~4.7 rev/px in EVERY window config, and all of them run
+// at αmean 0.100 because `m` saturates for the whole cycle. This sweep asks
+// whether sustained SMOOTH motion needs the fast α at all. It pairs churn
+// with a LAG statistic (body()'s `settleFrames`), because §12.38's lesson is
+// that a slower α passes every calm metric while eating real signal — under
+// sustained motion the signal at risk is the field trailing the sun, and that
+// is exactly what the post-stop net displacement measures.
+const ROT_ALPHA = (process.env.ROT_ALPHA ?? "")
+  .split(",").map(Number).filter((x) => x > 0 && x <= 1);
+const SETTLE_FRAMES = Number(process.env.SETTLE_FRAMES ?? 90);
 // ALPHA_SWEEP="0.1,0.05,0.02" — interleaved arms at several α values, both
 // still and moving, in ONE page. Exists to answer the mechanism question the
 // CEILING_AB left open (§12.32): the still-scene instability is nearly
@@ -275,7 +303,7 @@ if (SRC) {
 // illumination lands on floor the metric reads.
 let stepLightId = null;
 let lightNow = 2;
-if (LIGHT_STEP) {
+if (LIGHT_STEP || LIGHT_ROT) {
   const le = await call("entity.create", {
     name: "__flicker_step_light", transform: { position: [7.5, 3.5, 0] },
   });
@@ -283,11 +311,11 @@ if (LIGHT_STEP) {
   if (!stepLightId) { console.log(`FATAL: step light create failed (${le.error})`); await browser.close(); process.exit(1); }
   await must("component.add", { id: stepLightId, type: "light" });
   await must("component.setProp", { id: stepLightId, type: "light", key: "intensity", value: 2 });
-  console.log(`  step light created (${stepLightId}), intensity 2`);
+  console.log(`  step light created (${stepLightId}), intensity 2 (kind defaults to directional)`);
   await wait(8000);
 }
 
-const body = async ({ anchorId, moverId, frames, amp, rotate, pan = null, light = null }) => {
+const body = async ({ anchorId, moverId, frames, amp, rotate, pan = null, light = null, rotLight = null, settleFrames = 0 }) => {
   const eng = globalThis.__editorApi.entities.live(anchorId)?.engine;
   if (!eng?.renderer) throw new Error("no live engine");
   const obj = globalThis.__editorApi.entities.live(moverId)?.object3D;
@@ -426,6 +454,27 @@ const body = async ({ anchorId, moverId, frames, amp, rotate, pan = null, light 
     await setCam(0);
     globalThis.__flickerCapLift = { panLift, panN, holdLift, holdN, ...mot };
   } else {
+    // LIGHT_ROT: per-frame cap/window/α sampling, the pan path's discipline —
+    // a verify arm that never observed the state it claims to measure is the
+    // §12.42 lift-snapshot lesson, and the whole point of this arm is to
+    // catch the window being PINNED OPEN (trMax 1.0, cap lifted ~100%).
+    const rotStats = rotLight
+      ? { n: 0, lifted: 0, trMax: 0, shMax: 0, lumMax: 0, alphaSum: 0 }
+      : null;
+    const lobj = rotLight ? globalThis.__editorApi.entities.live(rotLight.id)?.object3D : null;
+    if (rotLight && !lobj) throw new Error("rot light not live");
+    // Triangle ping-pong whose phase starts AT the base elevation, so the
+    // first measured frame moves by exactly radPerFrame — an absolute ramp
+    // that began at base−A would land a hidden STEP inside the measured arm.
+    // |Δ| per frame is radPerFrame everywhere except the two turn frames,
+    // which is the user's LightScript regime (eased ping-pong, saturated
+    // mid-swing, brief sub-threshold dwell at the extremes).
+    const half = Math.max(2, Math.floor(frames / 2));
+    const rotAngle = (i) => {
+      const p = (i + Math.floor(half / 2)) % (2 * half);
+      const steps = p < half ? p : 2 * half - p;
+      return rotLight.base + (steps - Math.floor(half / 2)) * rotLight.radPerFrame;
+    };
     for (let i = 0; i < frames; i++) {
       await new Promise((r) => requestAnimationFrame(r));
       // LIGHT_STEP: the step lands mid-window through the editor's own prop
@@ -434,6 +483,13 @@ const body = async ({ anchorId, moverId, frames, amp, rotate, pan = null, light 
         await globalThis.__editorApi.call("component.setProp", {
           id: light.id, type: "light", key: "intensity", value: light.to,
         });
+      }
+      if (rotLight) {
+        // Matrix motion needs no prop path — GISystem's light loop polls
+        // matrixWorld deltas (dirDelta), exactly how the user's day-cycle
+        // script drives the sun.
+        lobj.rotation.x = rotAngle(i);
+        lobj.updateMatrixWorld(true);
       }
       if (rotate) {
         const now = performance.now();
@@ -446,10 +502,64 @@ const body = async ({ anchorId, moverId, frames, amp, rotate, pan = null, light 
       }
       obj.updateMatrixWorld(true);
       renderer.compute(accumulator);
+      if (rotStats) {
+        rotStats.n++;
+        if ((globalThis.__giSrcTransport?.probeRayCap ?? 0) > 100000) rotStats.lifted++;
+        rotStats.trMax = Math.max(rotStats.trMax, system._giTrackMotion ?? 0);
+        rotStats.shMax = Math.max(rotStats.shMax, system._giShadowLastMotion ?? 0);
+        rotStats.lumMax = Math.max(rotStats.lumMax, system._giLightLumMotion ?? 0);
+        rotStats.alphaSum += globalThis.__giSrcAlphaLive ?? 0;
+      }
+    }
+    if (rotLight) {
+      lobj.rotation.x = rotLight.base;
+      lobj.updateMatrixWorld(true);
+      globalThis.__flickerCapLift = {
+        rotN: rotStats.n, rotLift: rotStats.lifted, trMax: rotStats.trMax,
+        shMax: rotStats.shMax, lumMax: rotStats.lumMax,
+        alphaMean: rotStats.alphaSum / Math.max(1, rotStats.n),
+      };
     }
   }
   obj.position.copy(base);
   obj.updateMatrixWorld(true);
+
+  // ── THE LAG STATISTIC (α-under-rotation sweep) ────────────────────────────
+  // Churn alone cannot judge a smoothing change: §12.38's lesson is that a
+  // slower α passes every calm metric while quietly eating real signal. Under
+  // SUSTAINED motion the signal α trades away is LAG — the field trailing the
+  // true lighting by some angle — and lag is directly observable the moment
+  // the light stops: a lagging field SLIDES monotonically into place, while
+  // per-frame variance is zero-mean and cancels over the same window. So the
+  // statistic is NET displacement |lum_after − lum_at_stop|, not the walked
+  // distance (walk sums both and would let the two effects hide each other).
+  // Counting stays disarmed here, so the arm's own churn numbers are the
+  // rotation's alone; `stateBuf.x` tracks luminance regardless of `armed`.
+  let netSettle = null;
+  if (settleFrames > 0) {
+    const before = new Float32Array(await renderer.getArrayBufferAsync(stateBuf.value));
+    armed.value = 0;
+    for (let i = 0; i < settleFrames; i++) {
+      await new Promise((r) => requestAnimationFrame(r));
+      renderer.compute(accumulator);
+    }
+    const after = new Float32Array(await renderer.getArrayBufferAsync(stateBuf.value));
+    const disp = [];
+    let sum = 0;
+    for (let i = 0; i < width * height; i++) {
+      if (after[i * 4 + 3] > frames * 0.5) continue;
+      const d = Math.abs(after[i * 4] - before[i * 4]);
+      disp.push(d);
+      sum += d;
+    }
+    disp.sort((a, b) => a - b);
+    netSettle = {
+      frames: settleFrames,
+      mean: disp.length ? sum / disp.length : 0,
+      p95: disp.length ? disp[Math.floor(disp.length * 0.95)] : 0,
+      px: disp.length,
+    };
+  }
 
   const data = new Float32Array(await renderer.getArrayBufferAsync(stateBuf.value));
   const ampData = new Float32Array(await renderer.getArrayBufferAsync(ampBuf.value));
@@ -733,6 +843,73 @@ if (LIGHT_STEP) {
   await setCap(undefined);
   await setLift(undefined);
   await must("component.setProp", { id: stepLightId, type: "light", key: "intensity", value: 2 });
+}
+// ── THE CONTINUOUS-ROTATION A/B (the day-cycle regime) ──────────────────────
+// A discarded settle arm (also rotating) precedes each measured arm, so the
+// measured arm samples the ROTATION's steady state, not its onset — the onset
+// (one legitimate rising-edge window) lands entirely inside the discard. The
+// still that follows each measured arm reads the settle tail after the sun
+// parks: their ping-pong's endpoint dwell, and where §12.43's 1.2 s close is
+// visible as churn decaying instead of latching.
+const rotRounds = [];
+// Post-§12.46 arms: `shipped` is RISING-EDGE arming (the rotation onset lands
+// in the discarded settle arm, so the measured arm should read capLift ~0 and
+// the window-off arm's churn); `level-arm` is `__giSrcTrackLevelArm = true` —
+// the pre-fix behavior, which the 2026-08-12 pre-fix run measured at 4.62
+// rev/px with capLift 100% (window pinned open, §12.42's fps win cancelled).
+// no-lift (30.9 pre-fix) and window-off (5.07) keep their §12.45 meanings.
+const ROT_NAMES = ["shipped", "level-arm", "no-lift", "window-off"];
+const setLevelArm = (v) => page.evaluate((x) => { globalThis.__giSrcTrackLevelArm = x; }, v);
+if (LIGHT_ROT) {
+  const rotConfigs = [
+    { name: "shipped", track: undefined, lift: undefined, level: undefined },
+    { name: "level-arm", track: undefined, lift: undefined, level: true },
+    { name: "no-lift", track: undefined, lift: false, level: true },
+    { name: "window-off", track: false, lift: undefined, level: undefined },
+  ];
+  // Base elevation ~57° (−1 rad): sun-like over the verified camera's floor.
+  const rotOpts = { rotLight: { id: stepLightId, radPerFrame: ROT_RATE, base: -1.0 } };
+  for (let r = 0; r < 2; r++) {
+    const round = {};
+    for (const cfg of rotConfigs) {
+      await setTrack(cfg.track);
+      await setLift(cfg.lift);
+      await setLevelArm(cfg.level);
+      await wait(300);
+      await measure(0, false, rotOpts);
+      const arm = await measure(0, false, rotOpts);
+      const caps = await page.evaluate(() => globalThis.__flickerCapLift ?? null);
+      const still = await measure(0, false);
+      round[cfg.name] = { arm, caps, still };
+    }
+    rotRounds.push(round);
+  }
+  await setTrack(undefined);
+  await setLift(undefined);
+  await setLevelArm(undefined);
+}
+// ── α UNDER SUSTAINED ROTATION, WITH A LAG COLUMN ───────────────────────────
+// Everything else is the SHIPPING config (rising-edge arming ⇒ window closed,
+// tier cap engaged), so this isolates α alone: `__giSrcAlpha` outranks the
+// ramp, and with the window shut the root and the cap are identical in every
+// arm. A full discarded rotating arm precedes each measured one — the
+// accumulators re-equilibrate over ~1/α refreshes and §12.38 already measured
+// that transient once as if it were flicker.
+const rotAlphaRounds = [];
+if (LIGHT_ROT && ROT_ALPHA.length) {
+  const rotOpts = { rotLight: { id: stepLightId, radPerFrame: ROT_RATE, base: -1.0 } };
+  for (let r = 0; r < 2; r++) {
+    const order = r % 2 === 0 ? ROT_ALPHA : [...ROT_ALPHA].reverse();
+    const round = {};
+    for (const a of order) {
+      await setAlpha(a);
+      await wait(300);
+      await measure(0, false, rotOpts);
+      round[a] = await measure(0, false, { ...rotOpts, settleFrames: SETTLE_FRAMES });
+    }
+    rotAlphaRounds.push(round);
+  }
+  await setAlpha(undefined);
 }
 // ── THE α SWEEP, SAME DISCIPLINE ────────────────────────────────────────────
 // Round 2 walks the α list in REVERSE so a slow page drift loads each α at
@@ -1056,6 +1233,78 @@ if (stepRounds.length) {
   } else {
     console.log("  ⇒ NO MEASURABLE LIFT EFFECT — check `__giSrcTransport.probeRayCap` flips during");
     console.log("     the window (a pinned cap never lifts; is the arm accidentally pinning?).");
+  }
+}
+
+// ── THE CONTINUOUS-ROTATION VERDICT ─────────────────────────────────────────
+if (rotRounds.length) {
+  console.log(`
+=== LIGHT ROT A/B (continuous sun ping-pong, ${ROT_RATE} rad/frame; shipped vs no-lift vs window-off, x${rotRounds.length}) ===`);
+  console.log("  round  config      rev/px    p95      capLift%  trMax  αmean   still-after rev/px");
+  for (const [i, r] of rotRounds.entries()) {
+    for (const name of ROT_NAMES) {
+      const a = r[name];
+      const liftPct = a.caps ? ((a.caps.rotLift / Math.max(1, a.caps.rotN)) * 100).toFixed(0) : "?";
+      console.log(`  ${i + 1}      ${name.padEnd(11)} ${a.arm.meanReversals.toFixed(3).padEnd(9)} ` +
+        `${a.arm.stepP95.toFixed(4).padEnd(8)} ${String(liftPct).padEnd(9)} ` +
+        `${(a.caps?.trMax ?? NaN).toFixed(2).padEnd(6)} ${(a.caps?.alphaMean ?? NaN).toFixed(3).padEnd(7)} ` +
+        `${a.still.meanReversals.toFixed(3)}`);
+    }
+  }
+  const mean = (name, f) => rotRounds.reduce((s, r) => s + r[name].arm[f], 0) / rotRounds.length;
+  const liftOf = (name) => rotRounds.reduce((s, r) => s + (r[name].caps ? r[name].caps.rotLift / Math.max(1, r[name].caps.rotN) : 0), 0) / rotRounds.length;
+  const spread = rotRounds.length > 1
+    ? Math.abs(rotRounds[0].shipped.arm.meanReversals - rotRounds[1].shipped.arm.meanReversals)
+    : NaN;
+  console.log(`  means — shipped ${mean("shipped", "meanReversals").toFixed(3)}, level-arm ${mean("level-arm", "meanReversals").toFixed(3)}, ` +
+    `no-lift ${mean("no-lift", "meanReversals").toFixed(3)}, window-off ${mean("window-off", "meanReversals").toFixed(3)} rev/px ` +
+    `(shipped round spread ${spread.toFixed(3)})`);
+  // §12.46 FIX VERIFY: rising-edge shipped must run steady rotation with the
+  // window CLOSED (cap at tier) at churn comparable to window-off, while
+  // level-arm reproduces the pre-fix pin (capLift ~100%). Pre-fix reference
+  // run (2026-08-12): level 4.62 @ 100% lift / no-lift 30.88 / window-off 5.07.
+  const sLift = liftOf("shipped"), lLift = liftOf("level-arm");
+  const churnOk = mean("shipped", "meanReversals") <=
+    mean("window-off", "meanReversals") + Math.max(spread * 1.5, mean("window-off", "meanReversals") * 0.25);
+  if (sLift < 0.1 && lLift > 0.9 && churnOk) {
+    console.log("  ⇒ §12.46 HOLDS: rising-edge arming runs the day cycle at tier cost (capLift " +
+      `${(sLift * 100).toFixed(0)}%) with window-off churn; level-arm still pins (${(lLift * 100).toFixed(0)}%).`);
+  } else {
+    console.log(`  ⇒ CHECK: shipped capLift ${(sLift * 100).toFixed(0)}% (want <10), level-arm ` +
+      `${(lLift * 100).toFixed(0)}% (want >90), shipped churn ${churnOk ? "ok" : "ABOVE window-off band"}.`);
+    console.log("     A shipped arm that still lifts means an edge is firing repeatedly — check the");
+    console.log("     REARM dwell against this rotation's sub-threshold dwell pattern.");
+  }
+}
+
+// ── α UNDER ROTATION: THE CHURN/LAG TRADE ───────────────────────────────────
+if (rotAlphaRounds.length) {
+  console.log(`
+=== ROT ALPHA SWEEP (continuous sun, shipping window/cap config, x${rotAlphaRounds.length}, round 2 reversed) ===`);
+  console.log(`  settle = NET |Δlum| over ${SETTLE_FRAMES} frames after the sun stops = the LAG`);
+  console.log("  α        churn rev/px (r1/r2)   step p95 (r1/r2)      LAG mean (r1/r2)      LAG p95");
+  for (const a of ROT_ALPHA) {
+    const r = rotAlphaRounds.map((round) => round[a]);
+    console.log(
+      `  ${String(a).padEnd(7)} ${r.map((x) => x.meanReversals.toFixed(3)).join(" / ").padEnd(21)} ` +
+      `${r.map((x) => x.stepP95.toFixed(4)).join(" / ").padEnd(21)} ` +
+      `${r.map((x) => (x.netSettle?.mean ?? NaN).toFixed(5)).join(" / ").padEnd(21)} ` +
+      `${r.map((x) => (x.netSettle?.p95 ?? NaN).toFixed(4)).join(" / ")}`);
+  }
+  const meanOf = (a, f) => rotAlphaRounds.reduce((s, round) => s + f(round[a]), 0) / rotAlphaRounds.length;
+  const hi = ROT_ALPHA[0], lo = ROT_ALPHA[ROT_ALPHA.length - 1];
+  const churnGain = meanOf(hi, (x) => x.meanReversals) / Math.max(1e-9, meanOf(lo, (x) => x.meanReversals));
+  const lagCost = meanOf(lo, (x) => x.netSettle?.mean ?? 0) / Math.max(1e-9, meanOf(hi, (x) => x.netSettle?.mean ?? 0));
+  console.log(`  α ${hi} → ${lo}: churn ×${(1 / churnGain).toFixed(2)} (lower is calmer), lag ×${lagCost.toFixed(2)} (lower is truer)`);
+  if (churnGain > 1.5 && lagCost < 1.5) {
+    console.log("  ⇒ SUSTAINED MOTION DOES NOT NEED THE FAST α: churn falls faster than lag rises,");
+    console.log("     so the §12.38 ramp is mispriced for smooth motion (it was tuned on STEPS).");
+  } else if (lagCost >= 1.5) {
+    console.log(`  ⇒ A REAL TRADE: the slower α trails the sun ${lagCost.toFixed(2)}× further. Any change here`);
+    console.log("     needs a rate-aware α (innovation per frame), not a flat reduction.");
+  } else {
+    console.log("  ⇒ α IS NOT THE LEVER HERE — churn barely moves with it, so the rotating churn is");
+    console.log("     structural (bin membership, §12.24) rather than variance.");
   }
 }
 

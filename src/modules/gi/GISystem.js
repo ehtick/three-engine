@@ -35,7 +35,7 @@ import { resolveMaterialSurface, serializeMeshForBake } from "./voxelizeOnce.js"
 import { createSrcVolume } from "./srcVolume.js";
 import { createSrcDistanceView, createSrcOccupancyView } from "./srcDebugViews.js";
 import { createSrcProbeSystem, describeSrcProbeSystem, formatSrcProbeFrame, srcProbesEnabled, srcShadeEnabled } from "./srcSystem.js";
-import { ALPHA_MOTION_SAT, ALPHA_TRACK_HOLD_MS, ALPHA_TRACK_THRESHOLD } from "./srcConfig.js";
+import { ALPHA_MOTION_SAT, ALPHA_TRACK_HOLD_MS, ALPHA_TRACK_REARM_MS, ALPHA_TRACK_THRESHOLD } from "./srcConfig.js";
 import { createSrcSurfaceAttribution } from "./srcSurface.js";
 import { createOccupancyField, describeOccupancyField, quantizeOccupancyRes } from "./occupancyField.js";
 import { BVH_STRATEGY, buildStaticSceneBvhWords, classifyDynamicShape, composeFieldDynamics, createDynamicObjectSet, dynHeaderWords, giMobilityOf, giTraceOf } from "./dynamicObjects.js";
@@ -3256,13 +3256,33 @@ export class GISystem {
                 return m;
               }
               const now = performance.now();
-              if (mLight >= ALPHA_TRACK_THRESHOLD) {
+              // ── AND IT ARMS ON RISING EDGES ONLY (§12.46) ────────────────
+              // The §12.43 arm was LEVEL-triggered: every frame at mLight ≥
+              // threshold re-pushed the 1200 ms hold. A CONTINUOUS sun — the
+              // user's day cycle rotates 2–6× ALPHA_MOTION_SAT per frame,
+              // every frame — therefore held the window open for the entire
+              // play session: §12.45's cap lift became permanent (fps) and
+              // the window's fast decay became the steady state (their
+              // "when light moves, flicker is still strong"). A light EVENT
+              // is a CROSSING, not a state. The edge needs ALPHA_TRACK_
+              // REARM_MS below the threshold first, or the ping-pong's eased
+              // endpoints (~0.6 s sub-threshold) would re-arm a window every
+              // half-swing — see the constant's comment for the LIGHT_ROT
+              // numbers that priced all of this. Sustained motion runs on
+              // the m-driven α ramp at the tier cap; steps out of stillness
+              // arm exactly as before.
+              const above = mLight >= ALPHA_TRACK_THRESHOLD;
+              const belowFor = now - (this._giMotionBelowSince ?? -1e9);
+              if (above && (globalThis.__giSrcTrackLevelArm === true ||
+                  (!this._giMotionAbovePrev && belowFor >= ALPHA_TRACK_REARM_MS))) {
                 this._giMotionHeld = Math.max(
                   mLight,
                   now < (this._giMotionHoldUntil ?? 0) ? (this._giMotionHeld ?? 0) : 0,
                 );
                 this._giMotionHoldUntil = now + ALPHA_TRACK_HOLD_MS;
               }
+              if (!above && this._giMotionAbovePrev) this._giMotionBelowSince = now;
+              this._giMotionAbovePrev = above;
               const windowOpen = now < (this._giMotionHoldUntil ?? 0);
               // What srcSystem's root relaxation reads (`trackMotion`): the
               // held LIGHT peak while the window is open, zero otherwise —
