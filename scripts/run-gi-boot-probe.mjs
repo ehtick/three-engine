@@ -252,12 +252,14 @@ async function runArm(arm) {
     if (/SLOWEST PIPELINE|next slowest|skipping \d+ /.test(t)) console.log(`  ${t.slice(0, 300)}`);
     if (/compile wave started/.test(t)) marks.waveStart = at;
     if (/compile wave: materials \d+ms, computes \d+ms/.test(t)) { marks.waveDone = at; waveDone = true; }
-    if (/first frame after compile wave/.test(t)) { marks.firstFrame = at; firstFrame = true; }
-    // The end marker. Also releases the post-wave wait: `first frame after
-    // compile wave` is gated on >400ms, so on a healthy boot it never fires and
-    // the probe sat out its full 20s deadline waiting for a line that was never
-    // coming — 20s added to every good run, and only to good runs.
-    if (/field ready:/.test(t)) firstFrame = true;
+    if (/first frame after compile wave/.test(t)) marks.firstFrame = at;
+    // ⚠ THE END MARKER IS `field ready`, AND ONLY IT. Releasing on `first frame
+    // after compile wave` too meant the probe could stop BEFORE the field
+    // finished — the report then silently dropped its own last row and the
+    // total measured to whatever happened to have printed. Waiting on the
+    // marker the report ends at is the only self-consistent rule; the deadline
+    // below is what keeps a genuinely broken boot from hanging.
+    if (/field ready:/.test(t)) { marks.fieldReady = at; firstFrame = true; }
   });
   page.on("pageerror", (e) => {
     const msg = e.message ?? String(e);

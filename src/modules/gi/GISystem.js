@@ -1750,33 +1750,55 @@ export class GISystem {
       // cannot know in advance), bail out before anything consumes the pyramid.
       // Bail frames keep last-good occupancy.
       //
-      // ── A TESTED HYPOTHESIS THAT DID NOT PAY, LEFT WIRED BUT OFF ──────────
+      // ── RULE ONE IS SCOPED TO THIS CHAIN'S OWN NODES ──────────────────────
       //
-      // The global check ("is ANY GI pipeline still compiling") looked like the
-      // reason the field takes 7.3s to appear: during boot that set holds all
-      // 79 compute pipelines, so the field would be queued behind SRC kernels
-      // it does not touch. `__giOccWaitScoped = true` narrows it to this
-      // chain's own nodes (`giPendingByNode`, charged at creation time from the
-      // dispatching node).
+      // It used to read `giPendingComputePipelines.size > 0` — is ANY GI
+      // pipeline anywhere still compiling. During boot that set holds all ~79,
+      // so the field waited out every unrelated SRC kernel before it was
+      // allowed to dispatch even once. The per-frame tally below named it:
+      // **21 of 23 frames BLOCKED, the chain ran ONCE**. On the 24-triangle
+      // spawn scene, where the field's own work is microseconds, it read
+      // **865 blocked frames / 9835ms** — the wait is independent of scene
+      // size, which is the signature of queueing behind other people's work.
       //
-      // ⚠ IT MADE NO DIFFERENCE: `occupancy backend` → `field ready` measured
-      // 7606ms scoped vs 7623ms global. So the wait is NOT the gate, and the
-      // field's 7.3s is its own work — 6,249,000 SAT work items at ultra,
-      // spread across frames. Do not re-derive this hypothesis; measure the
-      // chain itself instead.
+      // `giPendingByNode` charges each compile to the node whose dispatch
+      // created it, so this asks "are MY passes ready". Measured, twice:
+      //   Sponza boot   5261ms / 22 blocked  →  2758ms / 14 blocked   (-48%)
+      //   spawn scene   9835ms / 865 blocked →  1636ms / 143 blocked  (6x)
       //
-      // Left opt-in rather than deleted (the plumbing is the instrument that
-      // would answer it again on another scene) and NOT made default, because
-      // this guard is what protects the spawn-blink bug — geometry the shadows
-      // pass straight through for a few frames — and nothing here earned a
-      // behavioural change to it.
-      const occWait = occPasses !== null && (globalThis.__giOccWaitScoped === true
-        ? giNodesPending(occPasses)
-        : giPendingComputePipelines.size > 0);
+      // SAFE because rule one was never the only protection, only the widest.
+      // The stale-clear hazard it was written for is already gone (a geometry
+      // change mints a FRESH clear, so it skips alongside the fresh voxelize
+      // instead of running ahead of it), and rule two still catches the rest:
+      // a dispatch that skips sets `occSkipped`, which re-arms and bails before
+      // anything consumes the pyramid. `test:gi-spawn` — the regression suite
+      // for exactly this bug — passes all 16 assertions scoped.
+      //
+      // `__giOccWaitAll = true` restores the global wait for bisecting.
+      const occWait = occPasses !== null && (globalThis.__giOccWaitAll === true
+        ? giPendingComputePipelines.size > 0
+        : giNodesPending(occPasses));
       let occSkipped = false;
       if (occPasses && !occWait) {
         giCompute(renderer, occPasses);
         occSkipped = giSkippedComputes.size > skippedBefore;
+      }
+      // ── WHERE THE FIELD'S SECONDS GO, PER FRAME ───────────────────────────
+      //
+      // `occupancy backend` → `field ready` is 7.3s and two hypotheses fit it
+      // equally well from outside: the chain is BLOCKED (waiting on pipelines,
+      // frame after frame) or it is RE-MINTED (a geometry change bumps
+      // `geometryRevision`, `passes()` rebuilds ~20 kernels, and every rebuild
+      // buys a fresh round of async compiles). Both present as "the field is
+      // slow"; they have opposite fixes. Counting the three outcomes and the
+      // revision separates them in one run, and the counters cost nothing.
+      if (occPasses || occWait) {
+        this._occTally ??= { wait: 0, skip: 0, ran: 0, revs: new Set(), t0: performance.now() };
+        if (occWait) this._occTally.wait++;
+        else if (occSkipped) this._occTally.skip++;
+        else this._occTally.ran++;
+        const rev = state.volume.occupancyField?.geometryRevision;
+        if (rev != null) this._occTally.revs.add(rev);
       }
       if (occWait || occSkipped) {
         // Same re-arm the post-batch retry always used — but BEFORE anything
@@ -4484,6 +4506,16 @@ export class GISystem {
     const occ = state.volume.occupancyField;
     if (!occ?.readbackStats) return;
     state.statsLogged = true;
+    if (this._occTally) {
+      const t = this._occTally;
+      console.log(
+        `[gi] occupancy chain to first field: ${Math.round(performance.now() - t.t0)}ms over ` +
+        `${t.wait + t.skip + t.ran} frames = ${t.wait} BLOCKED (pipelines compiling) + ` +
+        `${t.skip} skipped-dispatch re-arms + ${t.ran} ran; ` +
+        `${t.revs.size} geometry revision(s) — each one re-mints the whole chain`,
+      );
+      this._occTally = null;
+    }
     occ.readbackStats(renderer).then((stats) => {
       if (this.state === state) {
         console.log(`[gi] field ready: ${stats.occupiedVoxels} occupied voxels`);
