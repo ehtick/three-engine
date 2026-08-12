@@ -212,6 +212,34 @@ export function giProxySpheres(mesh, bounds, budget, shapeKind = null) {
 let giDispatchDepth = 0;
 const giSkippedComputes = new Set();
 const giPendingComputePipelines = new Set();
+/**
+ * Pending pipeline count PER DISPATCHING NODE — how many compiles a specific
+ * compute node is still waiting on. Keyed on `giCurrentComputeNode`, which is
+ * the node whose dispatch is synchronously on the stack when the pipeline gets
+ * created, so a node learns about its own compiles and nobody else's.
+ *
+ * ══ WHY THIS EXISTS ════════════════════════════════════════════════════════
+ *
+ * The occupancy chain's guard used to read `giPendingComputePipelines.size > 0`
+ * — ANY GI pipeline anywhere still compiling. During the boot's compile wave
+ * that set is never empty (79 compute pipelines, summed latency 293-352s,
+ * overlapping into ~7s of wall clock), so the field could not dispatch until
+ * the LAST unrelated SRC kernel had compiled. Measured: `occupancy backend` at
+ * t+3364ms, `field ready` at t+10700ms — 7.3s, of which the field's own work is
+ * a fraction. The field was not slow; it was queued behind other people's
+ * shaders.
+ *
+ * A WeakMap, so a node that gets replaced on a geometry rebuild takes its entry
+ * with it rather than pinning a dead graph for the life of the process.
+ */
+const giPendingByNode = new WeakMap();
+/** True when any of `nodes` still has a pipeline compiling. */
+function giNodesPending(nodes) {
+  for (const n of nodes) {
+    if (n && typeof n === "object" && (giPendingByNode.get(n) ?? 0) > 0) return true;
+  }
+  return false;
+}
 // Every GPUShaderModule this process has built a pipeline from. three keys its
 // ProgrammableStage cache on WGSL SOURCE, so a repeat module means byte-identical
 // source — and therefore a pipeline compile that a content-keyed cache could
@@ -403,7 +431,18 @@ function installAsyncComputePipelines(renderer) {
           );
         },
       );
-      const tracked = promise.finally(() => giPendingComputePipelines.delete(tracked));
+      // Charge this compile to the node that triggered it, so a consumer can
+      // ask "are MY passes ready" instead of "is the whole module quiet".
+      const owner = giCurrentComputeNode;
+      if (owner && typeof owner === "object") {
+        giPendingByNode.set(owner, (giPendingByNode.get(owner) ?? 0) + 1);
+      }
+      const tracked = promise.finally(() => {
+        giPendingComputePipelines.delete(tracked);
+        if (owner && typeof owner === "object") {
+          giPendingByNode.set(owner, Math.max(0, (giPendingByNode.get(owner) ?? 1) - 1));
+        }
+      });
       giPendingComputePipelines.add(tracked);
       return null; // not ready — the dispatch guard below skips it meanwhile
     };
@@ -1710,7 +1749,30 @@ export class GISystem {
       // if a dispatch DID skip (the first tick is what triggers compilation, so it
       // cannot know in advance), bail out before anything consumes the pyramid.
       // Bail frames keep last-good occupancy.
-      const occWait = occPasses !== null && giPendingComputePipelines.size > 0;
+      //
+      // ── A TESTED HYPOTHESIS THAT DID NOT PAY, LEFT WIRED BUT OFF ──────────
+      //
+      // The global check ("is ANY GI pipeline still compiling") looked like the
+      // reason the field takes 7.3s to appear: during boot that set holds all
+      // 79 compute pipelines, so the field would be queued behind SRC kernels
+      // it does not touch. `__giOccWaitScoped = true` narrows it to this
+      // chain's own nodes (`giPendingByNode`, charged at creation time from the
+      // dispatching node).
+      //
+      // ⚠ IT MADE NO DIFFERENCE: `occupancy backend` → `field ready` measured
+      // 7606ms scoped vs 7623ms global. So the wait is NOT the gate, and the
+      // field's 7.3s is its own work — 6,249,000 SAT work items at ultra,
+      // spread across frames. Do not re-derive this hypothesis; measure the
+      // chain itself instead.
+      //
+      // Left opt-in rather than deleted (the plumbing is the instrument that
+      // would answer it again on another scene) and NOT made default, because
+      // this guard is what protects the spawn-blink bug — geometry the shadows
+      // pass straight through for a few frames — and nothing here earned a
+      // behavioural change to it.
+      const occWait = occPasses !== null && (globalThis.__giOccWaitScoped === true
+        ? giNodesPending(occPasses)
+        : giPendingComputePipelines.size > 0);
       let occSkipped = false;
       if (occPasses && !occWait) {
         giCompute(renderer, occPasses);
