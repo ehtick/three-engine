@@ -7905,3 +7905,418 @@ stabilize them AND collapse ~15 distinct pipelines into one — which is §13.5'
 lever 1 (PIPELINE COUNT), still never measured, worth ~20 s of cold latency by
 their summed in-boot times. That is the cold-boot unit, and it composes with
 the §13.14.6 ramp rather than replacing it.
+
+---
+
+### 12.48 ONE STATIC EMISSIVE WAS CYCLING THE CAP THROUGH EVERY REBUILD — AND THE RESIZE PATH HAD TWO REAL BUGS (2026-08-12, commit `882484a`)
+
+User re-report: "gpu time constantly ballooning" with one emissive; "25 fps
+with any emissive object in the scene at low quality preset". The §12.47-era
+arm counter (`8a32503`, log-only) answered the first half FROM THE LIVE
+EDITOR before anything changed — which is the only instrument this class of
+bug accepts (three harness-green regressions shipped in one day, §12.44.1):
+
+    [gi] light-track window: 1 arms in 2.2s (0.5/s), open 17% … armed by emitter 1, peak 1.00
+    [gi] light-track window: 2 arms in 2.0s (1.0/s), open 58% … armed by emitter 2, peak 1.00
+    [gi] light-track window: 1 arms in 2.0s (0.5/s), open 81% … armed by emitter 1, peak 1.00
+
+**Peak EXACTLY 1.00 named the branch**: `#refreshEmitterSlots`' fresh-seat
+arm (`hadRadius ? motionOf(...) : 1`), not `motionOf` (a parked mesh reads
+dCenter 0). A slot re-seats from radius 0 only when the SLOT was reset — and
+`emitterSlots` are uniforms created inside the state build, so **every GI
+rebuild re-seats every parked emitter with `moved = 1`**. The §12.46
+rising-edge arm then fires legitimately (a decayed-below + re-crossed
+signal), the window lifts the tier cap (§12.45), and the deposit swings 3.8×
+(133.3 ms cap-off / 34.8 ms cap-16, measured seconds apart on their ultra).
+Under dynamic resolution the loop closes on itself: window → slow frame →
+DRS step → resize → srcProbes recreate → (rebuild-adjacent seat churn) →
+window. "Constantly ballooning" was this loop breathing.
+
+**FIX: pose memory lives on the EMITTER OBJECT, not the slot.**
+`_emitterPoseCache` = WeakMap keyed by mesh/provider, carrying
+{center, axis, moved} across rebuilds; `publishMoved` seeds 1 only for a
+key never seen (a genuinely new emitter IS a light event), else runs
+`motionOf` against the CACHED pose. Parked slots zero their cached moved so
+a return-at-same-pose cannot ride a stale retain over the threshold. A
+throttled spike log (`[gi] emitter slot N motion X — new emitter | pose
+delta dC=… dA=…`) names cause per seat, so the next report of this family
+is diagnosable from the console alone. **Live: one boot arm ("new
+emitter"), next frame "pose delta dC=0.0000", zero arms in the following
+minute** — where pre-fix it armed every ~2 s. `test:gi-spawn` 16/16,
+`test:gi-emitter-shapes` 795 checks.
+
+**THE LOW-TIER HALF WAS A DIFFERENT BUG ENTIRELY.** At low/medium the
+window lift is a NO-OP — those tiers never had `probeRayCap`, so
+`readCap()` was already OFF ("their fps was never the complaint",
+srcConfig). The live editor at LOW read: deposit **10.1 ms** of an 18.99 ms
+SRC chain, 62,484 rays for **1,046 live c0 probes** — the coarse low
+lattice concentrates ~60 rays on a mean probe, so a cap cuts MORE here
+than at the tiers it was priced on. And the emitter-shadow marcher (which
+profiled 0.0002 ms only because its pipeline was still compiling —
+async-compile skip, not cheapness) prices at ~65 ns/px × 219k px ≈ 14 ms
+once landed. 25.6 ms (SRC + scene) + ~14 ms (marcher) ≈ 40 ms ≈ the
+user's 25 fps.
+
+**SHIPPED (both halves through their mandated gates):**
+1. `probeRayCap: 16` on low AND medium. Flicker rig `CAP_AB=1 CAP_VALUE=16
+   QUALITY=low SRC=1`: capped BELOW off on both metrics (reversals 0.623
+   vs 0.686, step p95 0.0482 vs 0.0554; off-arm spread 0.077 = noise
+   floor), **compensation lift 0.000** — §12.42's sign-flip reproduces at
+   low. Harness cap sweep at low (`SWEEP=cap QUALITY=low`): 31,595 →
+   7,093 rays (4.5×), Δ mean +2.3%, deposit 1.015 → 0.877 ms — ratios
+   only, the §12.33.2 editor gap stands.
+2. `#emitterShadowScale()`: the emitter buffer's 0.7071 was a bare literal
+   at BOTH allocation sites, tier-blind. Now low 0.45 / medium 0.5 /
+   high 0.6 / ultra 0.7071 (unchanged), `__giEmitterShadowScale` in-page
+   override. ⚠ The tier `macroSteps` ladder is DEAD on the shipping
+   static-BVH arm (only `traceHybridPlane` receives it) — resolution is
+   the honest lever until the marcher itself goes on a diet. The same
+   sweep's boot log crowned it: `SLOWEST PIPELINE: #76 [emitterShadowPass]
+   38.0s (110kB, 4 loops / 236 ifs)` of 263.8 s summed at LOW — the first
+   emissive costs a marcher compile too.
+
+**THE RESIZE PATH HAD TWO REAL BUGS, BOTH SHIPPED SINCE [I], BOTH FOUND BY
+READING WHAT setSize ACTUALLY FORWARDS** (the dynamic-resolution churn
+investigation — 427 pipelines in one session vs 79 clean):
+1. `srcSystem.setSize` forwarded 6 of 10 create args —
+   `lighting`/`surfaces`/`sceneMotion`/`trackMotion` defaulted null, so
+   the FIRST viewport resize rebuilt the deposit WITHOUT hit shading
+   (radiance silently degraded to sky-only) and recompiled a
+   differently-shaped kernel on top of the churn.
+2. The resize rebuild of the resolve passed the BUILD-TIME `gather`
+   closure — closing over the srcProbes that `setSize` had JUST disposed —
+   and omitted `screenGather` entirely. `createGiResolve`'s
+   `gather && !screenGather` fallback then INLINED gatherAt into the
+   resolve (the 58→323 kB pathology this plan documents everywhere),
+   bound to dead buffers. **Every post-resize resolve since [I] was a
+   monster compile whose diffuse term read zeros.** Both inputs now
+   re-derive from the just-rebuilt srcProbes, exactly as the first build
+   derives them.
+
+**AND GI NO LONGER FOLLOWS DYNAMIC RESOLUTION AT ALL.** The DRS controller
+steps `_drsScale` up to 2×/sec hunting a GPU budget that GI itself
+dominates; every step landed in `#screenResolveSize` as a new integer size;
+a GI resize costs ~56 pipelines plus ALL temporal accumulation. GI now
+divides `_drsScale` back out (`__giFollowDrs = true` restores the
+coupling) — GI owns `resolveScale`/`resolveMaxPixels` already, DRS keeps
+scaling the scene render it was built for, and a manual renderScale drag
+still resizes GI. The resize gate takes a 2 px tolerance so the rounded
+reconstruction cannot wobble a teardown into existence. ⚠ Intervention C
+(setSize re-points instead of rebuilding — only 6 of ~44 passes and 4
+buffers are genuinely resolution-dependent, because `expectedC0Probes`
+saturates at 131,072 on any real viewport) is mapped but NOT built; it is
+the remaining churn unit if manual resizes ever matter.
+
+⚠ OPEN: editor-side confirmation of units 2-6 lands on the user's next
+focus — WebView2 defers the Vite reload while the window is unfocused, so
+the live editor is still running pre-fix code as of this entry. The
+pose-cache fix (unit 1) WAS confirmed live before the deferral began.
+
+---
+
+### 12.49 [J] MULTIBOUNCE IS A PASS, AND IT IS ON (2026-08-13, commit `0630196`)
+
+The §4.1 line finally built as written — and §4.1's own phrase "last frame's
+hit points" was WRONG in a way that mattered: a literal last-frame hit list
+carries bin-block indices [C] has since re-claimed (silent cross-probe
+contamination, §12.31's shape). The correct temporal reading is **last
+frame's ATLAS, this frame's hits** — [H] bakes after the deposit, so a pass
+between [E] and [F] reads the previous frame's tiles with bin slots that are
+still valid. Same fixed point R4 models, no stale addressing.
+
+**Shape:** [E] appends one 12-word entry per shaded hit (P, face-forwarded
+n, POST-clamp ρ, destination bin word base) to a hit list riding `scratch`'s
+tail — zero new bindings on [E] (R7). Capacity = transportThreads ×
+raysPerPixel is an EXACT bound; `STAT_SEC_OVERFLOW` counts it being wrong
+anyway. [J] (`srcSecondary.js`, 64 kB, exactly 3 storage bindings: scratch,
+hashKeys, stats — the atlas is a texture) re-shades each hit via `gatherAt`
+and atomicAdds ρ·E/π into BIN_R/G/B only — [E] already counted the ray, so
+[F]'s Σ/count weighs it with no second normalizer.
+
+**Numbers:** deposit WGSL 177.3 kB default vs 175.5 kB opted out (**+1.07%**
+— the inline flag was 58→323 kB / 48 s compiles); closed box **+30.3%**
+energy (0.1768 vs 0.1357), inside R4's 1/(1−0.9)=10× ceiling; convergence
+tail at the rig's noise floor; 8,294 secondary deposits of 131,072 capacity,
+overflow 0. `test:gi-src-deposit` stays bit-exact (no `secondary` option ⇒
+byte-identical kernel — the sink is not built).
+
+**Config truths:** `secondaryOn` = tier default (`low` stays single-bounce)
+with `__giSrcSecondary = false` the opt-out; the inline path is DELETED.
+`SECONDARY_LOD_OFFSET` ships **0**, not the paper's 2 — [B] inserts keys
+only at the camera-derived LOD, so a +2 bias reads SLOT_EMPTY on every
+corner and the renormalizing gather erases the shell; it stays a live
+uniform (`__giSrcSecondaryLodBias`) because that is a property of the
+POPULATION, not the estimator.
+
+⚠ Gate polarity: the secondary probe's single-bounce arm HAD to flip
+`__giSrcSecondary = undefined` → `= false`; under default-on the old arm
+compared the loop to itself. ⚠ `smoke:gi-gpu`'s default arms pin quality
+low and therefore never build [J] — the [J] arm is
+`?src=1&mode=hybrid-exact-complex&sky=0.5&quality=high`, asserted for
+exactly 3 bindings + the deposit-size A/B.
+
+**THE NAMED FOLLOW-ON (the real deposit diet):** widen the entry (~4 words:
+emissive, emitter id, rayIndex — words 10-11 are reserved for this) and move
+the WHOLE `shadeHit` — visibility marcher, 4 rolled light slots, NEE emitter
+set, analytic shapes — out of [E] into [J]. [E] becomes trace + attribute +
+append; [J] becomes shade + gather + deposit. §13.17's evidence says two
+~75 kB kernels compiling in parallel beat one 177 kB monster by MORE than
+the byte ratio. That unit also owns the user's startup ask.
+
+---
+
+### 12.50 THE §12.33.2 "EDITOR IS 10× THE HARNESS" MYSTERY WAS THE INTEGRATED GPU (2026-08-13, commit `afda086`)
+
+User: "in the browser, performance is a lot better (stable 60+ fps on ultra)
+while in the editor the same thing is 25fps". Root cause, verified in
+Chromium source and this machine's registry: **Dawn requests the LOW-POWER
+adapter by default** (`dawn_context_provider.cc` — one adapter per GPU
+process, chosen before any page runs; `requestAdapter({powerPreference})`
+cannot override it), and this box's `HKCU UserGpuPreferences` pins
+**chrome.exe** to `GpuPreference=2` while **msedgewebview2.exe has no
+entry**. So the editor's WebView2 ran every GPU frame on the Radeon 780M
+while every Chrome harness and every exported build ran the RTX 4070.
+
+**⚠ EVERY editor-side performance number in this document before this entry
+is an iGPU number.** The kernel-dependence of the gap (deposit 700 vs
+70 ns/ray = 10×; emitter marcher 87 vs 65 ns/px = 1.3×) is atomics/
+bandwidth-heavy kernels scaling worst on shared LPDDR5 — not a kernel
+pathology, not WebView2's Dawn (same Chromium 151 as Chrome).
+
+**FIX:** `--force-high-performance-gpu` (+ underscore twin) in
+`additionalBrowserArgs` for the editor AND `desktopScaffold.js` (every
+shipped desktop game had the same trap on dual-GPU laptops;
+`run-build-test.mjs` asserts it). The string REPLACES wry's defaults — the
+msWebOOUI/msPdfOOUI/msSmartScreenProtection disables are restored after
+being silently dropped since the flag was first set. A `[gpu] adapter:`
+boot line (sceneSettings.js `resolveRendererLimits`) keeps it honest.
+
+**MEASURED, user's editor, ultra, full-res resolve, 73,578 rays flowing:**
+SRC chain **37.63 → 3.49 ms**, deposit 24.08 → 0.93 (12.6 ns/ray), gather
+5.18 → 0.56, [J] 0.64 → 0.20. ⚠ The FIRST post-restart profile read
+near-zero with `raysPerFrame: 0` — skipped dispatches during the fresh
+adapter's cold compile wave (§12.40.3's empty-dispatch trap); never quote a
+post-adapter-switch profile until hits flow. ⚠ A new adapter = cold shader
+cache: one full cold compile wave, then §13.19's 200× cache resumes.
+
+---
+
+### 12.51 THE EMITTER-SHADOW MUD WAS THE WIDTH PROBE — AND THE CHANNEL FAILED CLOSED (2026-08-13, commit `90221cc`)
+
+Cornell-box report: shadows "kick in much later than the indirect light",
+"severe mud and blocky artifacts". Structural key: on the shipping
+static-BVH arm, admission is binary exact triangles — an open ceiling's
+pixel IS the width probe's output, nothing else. Five fixes, one commit:
+(1) the static-BVH arm passed `tEnd` where the records arm passes the
+lamp-exclusion `tProbe` — a copy-from-the-direct-arm bug the records arm's
+own comment describes verbatim; (2) the probe's `capCut` (0.85·capWorld)
+admitted `freeRadiusAtWorld`'s lattice-inset bounds (levels 1-3 emit
+4-16-voxel pseudo-occluders on a 0.75 m world lattice) — tightened to 0.5
+(`__giShadowWidthCapCut`); SLAB leak A/B read **0.3062 at BOTH cuts** —
+the leak is a pre-existing fallback residual, NOT this change; (3) the
+zero-initialized shadow targets read "fully occluded" during the marcher's
+async compile, so the emissive contributed NO direct light until the
+110 kB pipeline landed — `createGiShadowClearPass` stamps white at target
+(re)creation, fail-open; (4) the emitter filter gets a mid-σ via the
+existing `softness` plumbing (was the hardcoded stochastic-arm σ1.6);
+(5) the specular-glow bilateral sampled the emitter pack with the SHADOW
+channel's texel — per-texture texel now. Blocky CONTACT quantization is
+SRC probe spacing, a different system. ⚠ The default-arm probe FAILED once
+on "field never logged ready" under 4-way process contention — re-run,
+don't diagnose, when other WebGPU processes are compiling.
+
+---
+
+### 12.52 PER-BLOCK COLD FILL + SURPRISE-ADAPTIVE α (2026-08-13, commit `8533a55`)
+
+The ghost/pop-in unit — global signals replaced by per-block state on the
+§12.42 influx-word template. COLD FILL: blocks claimed within 4 frames run
+the cap at ×4 ([D1'] only — the clamp propagates through PROBE_RAYS, [D5]
+never learns; shift-not-multiply keeps the rpp flooring; +36% worst-case
+rays on a fast pan vs the withdrawn global lift's +485%); boostEnable is
+zeroed while the cap is pinned and for COLD_GUARD_FRAMES after
+build/setSize/re-anchor. SURPRISE: the [D1''] publish keeps slow per-block
+accumulators (decayed by the SAME keepCompensated as the bins) + a fast
+signed drift EMA of (frame mean − accumulated mean) normalized by shot
+noise; u ramps 2σ→4σ, decay composes `keep′ = 1−(1−keep)·mix(liftedRatio,
+surpriseF, u)` — at u=1 a block decays at PER-FRAME α 0.1 regardless of
+stride, and u self-terminates as the mean converges (no timer). u ≥ 0.5
+also buys cap ×2. ONE-SWITCH RULE: the governor scales the PUBLISHED word,
+so fast decay and fast evidence can never separate (§12.45's 27-58 rev/px
+is what separation ships). Sustained GLOBAL light motion degrades the
+mechanism off continuously.
+
+State: 5 atomic words/block on `scratch`'s tail + 1 surprise word as
+`freeStack`'s FIFTH region (0 = today's decay bit-for-bit). [E] stays 8/8.
+SUM_SHIFT=10 against u32 wrap. Everything behind optional bundles —
+absent ⇒ byte-identical kernels; the whole bit-exact set re-verified.
+
+**MEASURED INSTRUMENT TRUTHS (temporal ARM 10):** detection at 4σ,
+saturation at **9σ** (the plan's 3σ/6-frame estimate was optimistic — the
+drift EMA peaks at 0.62·Δ while M chases the step; the arm records the
+real thresholds); self-termination 8 frames; 0 false positives at the
+model σ, 0.11% at the measured σ — which is **1.78× the shot model
+because SUM_SHIFT quantization at GI-realistic luma (~3% of Lmax = 1-2
+quanta/deposit) adds comparable noise**; the T0 dead zone absorbs it.
+Recorded, not tuned away.
+
+OPEN (next unit): flicker-rig arms (SURPRISE_AB / LIGHT_STEP per-block /
+ROT_EASE / CAMERA_VERIFY cold-fill) + the converge t90 target (≤ ~2 s
+strided); step 11 (C) — mover-term scoping + window-lift conditional —
+deliberately unshipped until those arms exist.
+
+#### 12.52.1 CONVERGE VERDICT + THE LIVE CORNELL DECOMPOSITION (2026-08-13, `3d8cede`)
+
+`probe:gi-src-converge` with the per-block unit live: **strided-12 t90 =
+0.93 s** (the user's 10-20 s ghost regime; was 2.52 s with the §12.43
+window, 7.42 s bare), default 0.64 s, comp-off 0.68, cap-off 0.69 — the
+surprise mechanism converges a seen step in under a second at every config.
+
+Live Cornell profile (ultra, dGPU, at REST): GPU 17.6 ms of which
+**emitterShadowPass 9.95 ms = 56%** (full-res resolve ⇒ 786k marcher px);
+SRC total 5.4 (deposit 1.9, [J] 0.575, gather 1.0). Ultra's emitter scale
+dropped 0.7071 → 0.55 as the stopgap (`3d8cede`). `unattributedRate` read
+**63.23% after a LIVE quality switch** (fresh boots ~3%) — the §12.44
+tier-switch staleness, now visibly damaging shading ("weird lighting").
+A scripted MCP-cadence drag of the emissive did NOT reproduce "lagging
+hard" (42→43 fps) — the gizmo-drag path (per-frame transforms + editor
+overlay) remains the suspect; reproduce with a play-mode script next.
+
+**QUEUE, in order:** (1) attribution re-stamp on tier change (repro
+headlessly first: boot GAME page, flip quality, read unattributedRate both
+ways); (2) analytic-penumbra rewrite (blocker distance from the BVH the
+arm already traces — kills the waffle grain AND most of the marcher's
+per-pixel cost; step 5 of the §12.51 plan); (3) the [E] shadeHit split
+into [J]'s seam (the cold-startup monster, §12.49 §9); (4) flicker-rig
+arms for the per-block unit (SURPRISE_AB / LIGHT_STEP per-block /
+ROT_EASE / CAMERA_VERIFY cold-fill) + step (C) mover-term scoping.
+
+#### 12.52.2 QUEUE UNIT (1) REFUTED AND REPLACED: THE ATTRIBUTION STALENESS WAS POOL STARVATION (2026-08-13, commit `22740e5`)
+
+The re-stamp unit died on its repro: `probe:gi-attribution` (new) switched
+GAME/Sponza high↔ultra live and read **0.00% unattributed in both
+directions at every delay** — `#rebuild()` re-creates registry, field and
+attribution, whose palette sync runs on construction and every frame, so
+nothing CAN survive a tier switch to go stale. §12.44's "96.53% after a
+switch" and §12.52.1's "63.23%" were **cross-scene comparisons** (Cornell's
+number against Sponza's healthy 3%); a switch moves the rate only because
+the tier moves the voxel size.
+
+The real owner, visible on FRESH boots of any enclosed scene:
+`surfaceCapacity = level0VoxelCount/12` assumes Sponza's 5.5% occupancy; a
+closed 5 m room at 0.1 m voxels is **12.9% occupied**, `surfAllocCompute`
+denies the overflowing bricks, denied bricks carry no records ⇒ no stamps ⇒
+the palette-mean wash ("weird lighting"). Cornell-ultra: stamps saturated
+at 21,833/21,846 pool, 75.3% unattributed, with the engine's own `POOL
+STARVED` warning firing unread. FIX: the pool takes what an 8 MB budget
+allows (floor /12, ceiling /3; crossover ~1.8M voxels), so Cornell gets
+87,382 records (+3.7 MB, 0 denied, stamps == occupied EXACTLY) while
+Sponza-ultra is **byte-identical** (preserves §13.18's stable WGSL).
+Ultra 75.3→43.9%, high 56.4→42.4%, medium 25.9→8.6%.
+
+Also fixed, measured a NO-OP, documented so nobody re-derives it: the face
+retry stepped `world.minCell·0.25` — the COARSE SRC cell, 0.13 voxels on
+Cornell (could never cross a face); now a quarter-cell in the attribution
+grid's own units. The gate never saw it because `gi-src-surface.html`
+passes `world = { minCell: VOXEL }`.
+
+**OPEN (new unit): Cornell's residual ~44% at ultra.** Not the palette
+(stamp&live == stamps), not the pool (0 denied), not the retry (no-op).
+~7 points are the exact-complex trace path (hybrid-plane reads 36.4 vs
+43.6); the rest is hits whose voxel maps to no static record, unowned.
+Enclosed-scene shading visibly wears this. ⚠ Instrument truths from the
+probe build: a freshly-minted compute node's FIRST dispatch is silently
+skipped by the async-pipeline patch (a `stamps 0` read on a healthy frame);
+breaking a retry loop on the first counter that moves reports whichever
+pipeline compiled first; editing `src/modules/gi/*` hot-reloads the page
+under a running probe (one Sponza run hung >1 h).
+
+---
+
+### 12.53 THE SHADEHIT SPLIT: [E] = TRACE+ATTRIBUTE+APPEND, [J] = SHADE+GATHER+DEPOSIT (2026-08-13, commit `daea2ae`)
+
+§12.49's named follow-on, built to spec with five recorded deviations. The
+whole shadeHit (visibility marcher, 4 rolled light slots, NEE emitter set +
+analytic shapes, R5 zeroing) moved into [J]; the hit entry grew 12→16 words
+(`SEC_LE` 10-12, `SEC_EMITTER` 13, `SEC_RAY` 14 — a u32 hashKey pick, not
+float bits — `SEC_SUML` 15). The deposit SPLIT partitions, estimator
+unchanged: T/count/miss deposits + the every-ray stat denominators
+(`SHADED`/`UNATTRIBUTED`/`ALBEDO_CLAMPED` keep §12.52.2's comparability)
+stay in [E]; radiance atomics + their stats move to [J]. §12.52's per-block
+words split the same way the bins do: `BSTAT_SUM_W` from [E], `BSTAT_SUM_L`
+from [J] at a word ADDRESS [E] writes into the record.
+
+**Kernels (high arm): [E] 178.9→87.6 kB (470→264 ifs), [J] 64→154.6 kB
+with bounce / 93.8 shade-only; critical path 0.864× by bytes, 0.781× by
+isolated compile** (contended — flagged) — §13.17's superlinearity again:
+each kernel now carries ONE marcher instance where the un-split deposit
+inlined two. Bindings: [E] stays 8/8; [J] 3→4 with bounce (scratch, stats,
+hashKeys, `bits` — the medium is one buffer), 3 without; the smoke's
+exactly-3 assertion updated deliberately.
+
+Deviations from §12.49: (1) the split clamp is RETIRED — both terms sum and
+clamp once in [J]; `STAT_SEC_CLAMPED` re-aimed at the bounce term alone;
+(2) a 5th entry word beyond the spec's 4 (the §12.52 luma address);
+(3) the gather stayed in [J] — measured FIRST at ~274 ms of a 3,339 ms
+compile (~10%), a third kernel would re-introduce the split clamp for 8% of
+the critical path; (4) `__giSrcSplitShade = false` rebuilds the one-kernel
+form so the split's compile A/B is in-process (§13.14's 47-vs-238 s rule);
+(5) mover-stat denominators shrank to hits only ([J] does no work for the
+~76% of rays that miss — the un-split kernel shaded garbage and discarded
+it).
+
+**⚠ THE GATE POLARITY TRAP, AGAIN, INVERTED:** `__giSrcSecondary = false`
+(and low tier) now gates ONLY the `gatherAt` term — [J] still builds,
+dispatches and SHADES. The secondary gate's old `pass === false` assertion
+would now bless a black frame; replaced by `pass:true, bounce:false,
+hits>0`, asserted live. Gates: `test:gi-src-deposit` bit-exact PASS,
+`test:gi-src-secondary` 13/13 (closed box +11.6% vs §12.49's +30.3% —
+BOTH arms brightened across `90221cc`'s fail-open shadow; the ratio
+compressed, the mechanism is intact), rays/temporal/shade PASS,
+`smoke:gi-gpu` default ×2 + [J] arm PASS.
+
+Named follow-on: [J]'s compile is the critical path and it is marcher CALL
+SITES (rolled lights / NEE / sun), not bytes — fold through ONE predicated
+visibility call; an emission change owing an energy A/B (NEE pick stats
+must hold).
+
+---
+
+### 12.54 ANALYTIC PCSS PENUMBRA — THE WIDTH PROBE LEAVES THE STATIC-BVH EMITTER ARM (2026-08-13, commit `3861491`)
+
+Queue unit (2). The marcher's per-miss-pixel cost WAS the probe: 12
+log-spaced `freeRadiusAtWorld` pyramid descents, whose lattice-inset bounds
+were also the waffle (§12.51's capCut trim was a partial). The exact BVH8
+hit already returns blocker distance, so penumbra is closed-form now:
+`emitterShadowDist` (rgba16f, METRES — an rgba8 span normalization
+quantizes to ~25 cm ≈ 30 texels/step) holds `reff·t_b/(dist − t_b)`; two
+chained wide passes (the light channel's wide pass grown a world-width
+mode — slot table/span/tanHalf drop out of its bindings) reconstruct the
+penumbra in screen space. Chain: raw → filter → MID → wide₁ → WIDE →
+wide₂ → emitterShadow; materials' contract untouched.
+
+Load-bearing details: blocker search is OWN-WIDTH-FIRST then
+average-over-shadowed (the light arm's `max` propagated a wedge's far end
+into the contact band and dissolved the umbra — caught on the rig, with
+the image); a 1 mm floor on hit widths is the occupancy sentinel (contact
+≠ lit); tap acceptance RAMPS over one texel in world-width mode (a hard
+cut renders 16 contour bands of a smoothly-growing radius; grain
+0.0622→0.0453); width-probe creation is lazy so the records arm keeps it.
+
+Rig: kernel **116 kB/247 ifs/23.2 s → 92 kB/188 ifs/3.3 s** (the §13.14.8
+startup term); waffle lattice GONE at 4× zoom; `soft` 0.688→0.380 (the mud
+— ~8k partial-shadow px on open floor with no occluder — deleted; ⚠
+`grain` is not cross-arm comparable, its support changed; `grainAll` is,
+0.0376→0.0366); width map monotone near 0.518 m → far 1.217 m, smooth (the
+feared any-hit jitter does not show); resolution-invariant across
+low/high/ultra; resize probe 0 errors ×4; smoke 2/2 at 8/8 storage.
+
+⚠ WATCH: SLAB leak 0.3062→0.3862, decomposed clean — `nowide` reads
+0.3062 BIT-IDENTICAL, so admission is unchanged and the +0.08 is the wide
+passes pulling lit neighbours into a narrow fully-occluded strip (penumbra
+the leak metric was never built to distinguish). Thin occluders in Sponza
+are the live check. Open surfaces read exactly 1.0 where the mud had them
+at 30-70% grey — emissives read brighter. Hatches:
+`__giEmitterAnalyticPenumbra=false`, `__giEmitterWidePass=false`,
+`__giEmitterWidthDebug=<m>`. New arms on `probe:gi-emitter-shadow`:
+nopenumbra/nowide/widthmap/temporal.
