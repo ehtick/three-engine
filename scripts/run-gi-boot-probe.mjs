@@ -253,6 +253,11 @@ async function runArm(arm) {
     if (/compile wave started/.test(t)) marks.waveStart = at;
     if (/compile wave: materials \d+ms, computes \d+ms/.test(t)) { marks.waveDone = at; waveDone = true; }
     if (/first frame after compile wave/.test(t)) { marks.firstFrame = at; firstFrame = true; }
+    // The end marker. Also releases the post-wave wait: `first frame after
+    // compile wave` is gated on >400ms, so on a healthy boot it never fires and
+    // the probe sat out its full 20s deadline waiting for a line that was never
+    // coming — 20s added to every good run, and only to good runs.
+    if (/field ready:/.test(t)) firstFrame = true;
   });
   page.on("pageerror", (e) => {
     const msg = e.message ?? String(e);
@@ -578,7 +583,13 @@ async function runArm(arm) {
       if (hit) marks[k] = hit.at;
     }
   }
-  const end = marks.firstFrame ?? marks.waveDone ?? Date.now();
+  // ⚠ `first frame after compile wave` ONLY PRINTS WHEN IT EXCEEDS 400ms — it
+  // is a warning, not a stage marker — so anchoring the end on it silently
+  // moved the finish line whenever a run got faster, shortening TTFF twice for
+  // one improvement. `field ready` is unconditional and is the moment GI's
+  // field actually holds the scene, which is what "GI is up" means to a person.
+  const fieldReady = lines.find((l) => /field ready:/.test(l.t))?.at;
+  const end = fieldReady ?? marks.firstFrame ?? marks.waveDone ?? Date.now();
 
   // ══ THE START OF GI INIT IS THE START OF ITS BURST, NOT THE FIRST `[gi]`
   //    LINE ANYWHERE ═══════════════════════════════════════════════════════
@@ -593,10 +604,22 @@ async function runArm(arm) {
   // `[gi]` lines — the voxelize, the BVH and the setup that genuinely belong to
   // this initialization — stopping at the first gap longer than GAP_MS. A burst
   // is what a person perceives as "GI is starting up".
+  // ⚠ THE GAP HEURISTIC IS A FALLBACK NOW, NOT THE RULE. It reads whichever
+  // side of GAP_MS this run's asset load happened to land on, and on this scene
+  // that load measures 4.9-6.0s — astride the threshold. Consecutive runs of
+  // the SAME build reported TTFF 7.1s and 2.3s for exactly that reason. The
+  // engine now prints `scene assets ready after Nms — building` at the real
+  // boundary; anchor there whenever it is present.
   const GAP_MS = 5000;
-  const anchor = lines.findIndex((l) => /compile wave started/.test(l.t));
-  let startIdx = anchor < 0 ? 0 : anchor;
-  while (startIdx > 0 && lines[startIdx].at - lines[startIdx - 1].at < GAP_MS) startIdx--;
+  const readyIdx = lines.findIndex((l) => /scene assets ready after/.test(l.t));
+  let startIdx;
+  if (readyIdx >= 0) {
+    startIdx = readyIdx;
+  } else {
+    const anchor = lines.findIndex((l) => /compile wave started/.test(l.t));
+    startIdx = anchor < 0 ? 0 : anchor;
+    while (startIdx > 0 && lines[startIdx].at - lines[startIdx - 1].at < GAP_MS) startIdx--;
+  }
   const burstStart = lines[startIdx]?.at ?? null;
 
   return {

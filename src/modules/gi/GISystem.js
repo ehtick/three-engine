@@ -1870,11 +1870,26 @@ export class GISystem {
       }
       if (now - this._assetsReadySince < ASSET_LOAD_STABLE_MS) return false;
       this._assetsReadySince = null;
+      // ── THE START LINE FOR EVERY STARTUP MEASUREMENT ───────────────────────
+      //
+      // Everything before this point is the scene loading, which GI waits for
+      // and does not cause; everything after is GI's own bill. Without a mark
+      // here `probe:gi-boot` had to guess the boundary from a 5s gap threshold
+      // — and the asset wait on this scene lands at 4.9-6.0s, i.e. astride it,
+      // so the same build measured 2.3s or 7.1s depending on which side of the
+      // threshold that run's asset load fell. Two runs of one arm differing by
+      // 3× for a reason that has nothing to do with the code under test is not
+      // a slow measurement, it is a wrong one.
+      if (this._deferredSince != null) {
+        console.log(`[gi] scene assets ready after ${(now - this._deferredSince).toFixed(0)}ms — building`);
+        this._deferredSince = null;
+      }
       return true;
     }
     this._assetsReadySince = null;
     if (!this._assetWaitStart) {
       this._assetWaitStart = now;
+      this._deferredSince = now;
       console.log(
         `[gi] build deferred — waiting for scene assets ` +
         `(${pendingMeshes} mesh, ${pendingModels} model; avoids a double compile wave)`,
@@ -2005,11 +2020,21 @@ export class GISystem {
     // ~40ms uninterrupted slices and only take a real macrotask yield
     // between slices — frames/input still interleave, but the wave stops
     // queueing behind itself a couple hundred times.
+    //
+    // ── WHY THE BUDGET IS A KNOB (2026-08-12) ─────────────────────────────
+    // With renderer-side log timestamps the wave finally reads honestly: 1801ms
+    // of which `3 real yields waited 602ms`. So a third of the material wave is
+    // still WAITING, and at ~200ms per yielded frame the cost per yield has not
+    // changed since the 40ms budget was introduced — only the count has. The
+    // budget trades viewport liveness for startup directly and there is no way
+    // to pick it from first principles, so it is a global and the boot probe
+    // can sweep it: `FLAGS={"__giWaveYieldBudgetMs":160}`.
     const yieldStats = { count: 0, waited: 0, skipped: 0 };
+    const yieldBudgetMs = Number(globalThis.__giWaveYieldBudgetMs) || 40;
     let lastRealYield = performance.now();
     if (originalYield)
       scheduler.yield = () => {
-        if (performance.now() - lastRealYield < 40) {
+        if (performance.now() - lastRealYield < yieldBudgetMs) {
           yieldStats.skipped++;
           return Promise.resolve();
         }
@@ -2429,7 +2454,13 @@ export class GISystem {
       );
       // A slow wave earns a breakdown in the log: how much was real JS work
       // vs waiting on the macrotask yields, and which objects paid the most.
-      if (t1 - t0 > 3000) {
+      //
+      // UNCONDITIONAL, for the same reason the prewarm loop's line is: the
+      // 3000ms gate meant a 2139ms wave — half of everything GI spends between
+      // "assets ready" and "first frame" — printed nothing at all, and a silent
+      // stage is indistinguishable from an absent one. The threshold was
+      // guarding against noise in a line that prints once per boot.
+      {
         console.log(
           `[gi] wave breakdown: ${yieldStats.count} real yields waited ${yieldStats.waited.toFixed(0)}ms ` +
             `(${yieldStats.skipped} skipped by the 40ms budget); ` +
