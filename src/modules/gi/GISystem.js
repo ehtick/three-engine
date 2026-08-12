@@ -1548,36 +1548,26 @@ export class GISystem {
     // geometry uploads, deferred voxel-slot parking. Before the gbuffer/
     // compute work so this frame's rays see this frame's pose.
     this.#refreshDynamicObjects(renderer, state);
-    // ══ WHILE THE FIELD'S OWN KERNELS COMPILE, THIS TICK IS ALL COST ═════════
+    // ⛔ A BOOT-IDLE SKIP LIVED HERE AND TOOK GI OFF THE USER'S SCREEN
+    // ENTIRELY. It returned from the whole tick while the field's own kernels
+    // were still compiling, on the reasoning that everything below feeds a field
+    // that does not exist yet — and that the rAF loop's own cost was starving
+    // the delivery of the pipelines the field was blocked on (`probe:gi-boot`'s
+    // turn tracker measured a 7,966 ms window with ZERO macrotask turns, every
+    // pipeline resolving within 2 ms of its end).
     //
-    // Everything below — the gbuffer prepass (a full scene render), SRC, the
-    // reflection prepass, the occupancy chain, the rate queue — feeds a field
-    // that does not exist yet. The chain itself is already guarded (`occWait`,
-    // ~200 lines down), so on these frames it dispatches nothing; the rest of
-    // the tick runs at full price for a result nobody can read.
+    // The measurement was real. The gate was not survivable. It hung off
+    // `_fieldEverReady`, which resets on every rebuild — and the user's editor
+    // rebuilds constantly (a static-BVH rebuild, srcProbes re-created five times
+    // in 2.4 s) while pipelines take 16 s to compile. The latch never got to
+    // set, so the tick returned FOREVER: no gbuffer, no chain, no field, no GI,
+    // and NO ERROR. Their console showed a clean boot and a black scene.
     //
-    // And the price is not just wasted work, it is THE thing keeping the field
-    // waiting. `probe:gi-boot`'s turn tracker: over the 6.0s between the
-    // occupancy pipelines being created and landing, a `setTimeout(0)` chain
-    // ran ZERO times — one 7,966 ms gap swallowed the whole window, and all 25
-    // pipelines resolved within 2 ms of its end. A WebGPU async create resolves
-    // only when the renderer process runs a task to receive the reply, and an
-    // rAF loop this expensive leaves no room for one. So the field's frame loop
-    // was starving the delivery of the very pipelines the field was blocked on.
+    // Any retry needs a bound that cannot starve — a wall-clock cap on the idle,
+    // and a latch that does not re-arm on every rebuild — and it needs to be
+    // proven on the EDITOR, not the harness. The harness never reproduced this:
+    // it boots once, rebuilds nothing, and latched every time.
     //
-    // Standing still costs nothing here: `bootAmbient` (or the previous field,
-    // on a rebuild) is what is on screen either way, and the first tick after
-    // the pipelines land runs the full chain in order.
-    //
-    // `__giNoBootIdle = true` restores the old always-tick behaviour for A/B.
-    if (!this._fieldEverReady && globalThis.__giNoBootIdle !== true) {
-      const occNodes = state.volume.occupancyField?.prewarmComputes?.();
-      if (occNodes?.length && giNodesPending(occNodes)) {
-        this._occTally ??= { wait: 0, skip: 0, ran: 0, idle: 0, revs: new Set(), t0: performance.now() };
-        this._occTally.idle = (this._occTally.idle ?? 0) + 1;
-        return;
-      }
-    }
     // The deferred resolve reads THIS frame's gbuffer, so the prepass renders
     // before any compute is dispatched. It is a nested render (one override
     // material, editor layers excluded) that restores renderer state.
@@ -1613,36 +1603,24 @@ export class GISystem {
             "every probe re-keys, which retires it; positions are unchanged",
           );
         }
-        // ══ NOT UNTIL THE FIELD EXISTS ══════════════════════════════════════
+        // ⛔ THIS DISPATCH WAS ONCE GATED ON THE FIELD EXISTING, and it is the
+        // other half of the outage above. The reasoning still looks right: SRC
+        // traces the occupancy pyramid, so before the pyramid exists these
+        // dispatches do nothing — and worse, they create 52 compute pipelines
+        // into the same batch the field's 25 are stuck behind (every GI compute
+        // pipeline of a boot resolves within 3 ms of the others, so the field
+        // cannot land until SRC has compiled too).
         //
-        // SRC traces the occupancy pyramid. Until the pyramid has been built
-        // once there is nothing to trace, and every dispatch below was ALREADY
-        // a no-op during that window for a second reason: its pipelines were
-        // still compiling, and a dispatch whose pipeline has not landed is
-        // skipped. So these frames did no SRC work either way.
+        // But it gated on `_fieldEverReady`, the same latch as the tick skip,
+        // and in the user's editor that latch never set. SRC then never
+        // dispatched AT ALL — the diffuse term is SRC's screen gather, so the
+        // scene stayed black through a clean, error-free boot.
         //
-        // What they DID do is create 52 compute pipelines, and that is the cost.
-        // `probe:gi-boot` measured every GI compute pipeline of a boot — 78 of
-        // them, 2 kB to 37 kB, created across a 1.1 s spread — resolving within
-        // 3 ms of each other, several seconds after the first was created. They
-        // drain as one batch, so the field's 25 kernels cannot land before
-        // SRC's 52 have compiled too, and the field is what lights the scene.
-        //
-        // Deferring SRC's FIRST dispatch to the frame after the pyramid exists
-        // takes those 52 out of the batch the field is stuck behind. Nothing is
-        // lost: they compile immediately afterwards, while the lit scene is
-        // already on screen, on the same skip-until-ready path they always took.
-        //
-        // `syncCamera` still runs every frame — it is uniform writes and the
-        // re-anchor bookkeeping, and letting the anchor drift while the field
-        // builds would retire every probe on the first real dispatch.
-        //
-        // `__giSrcBeforeField = true` restores the old order for A/B.
-        if (this._fieldEverReady || globalThis.__giSrcBeforeField === true
-          || !state.volume.occupancyField) {
-          giCompute(renderer, state.screen.srcProbes.passes);
-          this.#maybeLogSrcProbeStats(renderer, state);
-        }
+        // The lesson is about the LATCH, not the ordering: a boot optimisation
+        // may not be gated on a one-shot that a rebuild can re-arm, because a
+        // busy editor rebuilds faster than a 16 s pipeline compile completes.
+        giCompute(renderer, state.screen.srcProbes.passes);
+        this.#maybeLogSrcProbeStats(renderer, state);
       }
       // BVH exact-reflection prepass: dispatched right after the gbuffer,
       // EVERY frame it's enabled — independent of the atlas-revision
@@ -1890,15 +1868,7 @@ export class GISystem {
       // ticks (`_fieldReadyOnce` false) the buffers may never have been
       // dispatched, and reading them back throws from deep inside the frame loop
       // (the user-reported "reading 'size'" uncaught promise).
-      if (this._fieldReadyOnce) {
-        // LATCHED, unlike `_fieldReadyOnce` — which is cleared by every re-arm
-        // and is therefore a statement about THIS tick, not about whether a
-        // pyramid has ever existed. The SRC gate above needs the latter: once
-        // there is something to trace, SRC runs for good, including through the
-        // re-arms a later geometry change causes.
-        this._fieldEverReady = true;
-        this.#maybeLogStats(renderer);
-      }
+      if (this._fieldReadyOnce) this.#maybeLogStats(renderer);
     } else {
       // IDLE SLEEP: with the field input quiet past the threshold, only the
       // camera-dependent passes run. The heartbeat frame runs the full queue.
@@ -4602,8 +4572,7 @@ export class GISystem {
       const t = this._occTally;
       console.log(
         `[gi] occupancy chain to first field: ${Math.round(performance.now() - t.t0)}ms over ` +
-        `${t.wait + t.skip + t.ran + (t.idle ?? 0)} frames = ${t.idle ?? 0} IDLED (whole tick skipped ` +
-        `while the field's kernels compiled) + ${t.wait} BLOCKED (chain guard) + ` +
+        `${t.wait + t.skip + t.ran} frames = ${t.wait} BLOCKED (chain guard) + ` +
         `${t.skip} skipped-dispatch re-arms + ${t.ran} ran; ` +
         `${t.revs.size} geometry revision(s) — each one re-mints the whole chain`,
       );
@@ -5233,10 +5202,6 @@ export class GISystem {
     // the one number that says how long the field itself took, independent of
     // how long the editor took to get here.
     this._stateBuiltAt = performance.now();
-    // A rebuild mints fresh compute nodes, and three keys its pipeline cache on
-    // the node's id — so a rebuild recompiles everything and has exactly the
-    // boot's problem. Re-arm the SRC gate with it (see the dispatch site).
-    this._fieldEverReady = false;
     this._pendingFit = null; // refit debounce restarts against fresh bounds
     this.#syncSlots(entries);
     this.#syncBvhScene(entries);
