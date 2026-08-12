@@ -58,10 +58,22 @@ export function desktopTauriConfig({ title, identifier, version = "0.1.0", width
             height,
             resizable: true,
             fullscreen: false,
-            // Without this the bundled WebView2 refuses WebGPU on Windows and
-            // the game shows a black window — the single most likely way a
-            // desktop build of a WebGPU engine fails.
-            additionalBrowserArgs: "--enable-unsafe-webgpu",
+            // Without --enable-unsafe-webgpu the bundled WebView2 refuses
+            // WebGPU on Windows and the game shows a black window — the single
+            // most likely way a desktop build of a WebGPU engine fails.
+            //
+            // --force-high-performance-gpu (both spellings — the hyphen form
+            // is the Chromium switch, the underscore form rides the driver-
+            // workaround forwarding path) pins Dawn to the DISCRETE adapter.
+            // Chromium asks for the LOW-POWER adapter by default and a page
+            // cannot override it, so on any dual-GPU laptop the game would
+            // otherwise run its whole GPU frame on the integrated chip —
+            // measured 10x slower on the engine's own GI deposit (editor vs
+            // Chrome, 2026-08-13). This string REPLACES wry's defaults, so
+            // the msWebOOUI/msPdfOOUI/msSmartScreenProtection disables ride
+            // along rather than being silently dropped.
+            additionalBrowserArgs:
+              "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required --enable-unsafe-webgpu --force-high-performance-gpu --force_high_performance_gpu",
           },
         ],
         security: { csp: null },

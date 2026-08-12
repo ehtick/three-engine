@@ -330,6 +330,10 @@ console.log("\nDesktop scaffold");
     "WebGPU is enabled in the webview (a black window otherwise)",
     conf.app.windows[0].additionalBrowserArgs.includes("--enable-unsafe-webgpu"),
   );
+  check(
+    "the webview is pinned to the discrete GPU (Dawn picks LOW-POWER by default — 10x on dual-GPU laptops)",
+    conf.app.windows[0].additionalBrowserArgs.includes("--force-high-performance-gpu"),
+  );
   eq("the product name is the game's", conf.productName, "Night & Day");
   check("the identifier is not Tauri's rejected placeholder", conf.identifier !== "com.tauri.dev", conf.identifier);
   check("Cargo.toml parses as a package with tauri", files["src-tauri/Cargo.toml"].includes('name = "night-day"') && files["src-tauri/Cargo.toml"].includes("tauri = "));
