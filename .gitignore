@@ -51,3 +51,5 @@ scripts/*.gif
 /artifacts
 # HMR quiet-mode sentinel (see vite.config.js) — a local toggle, never shared.
 .no-hmr
+docs/SplitRadianceCascadesPaper.pdf
+PARALLEL_SESSION_PROMPT.md

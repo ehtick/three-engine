@@ -1,0 +1,1429 @@
+Split Radiance Cascades: Real-Time Global Illumination via Sparse
+Radiance Probes
+ROULI FREEMAN, University of Oxford, United Kingdom
+ALEXANDER SANNIKOV, Grinding Gear Games, New Zealand
+Single frame
+
+Accumulated
+
+Multibounce
+
+Reference
+
+Fig. 1. Showcase of Split Radiance Cascades (Split RC) calculating a single bounce of indirect illumination for the San Miguel scene. “Single frame” shows
+the result of Split RC after a single frame of calculation; “Accumulated” is a result after 10 frames of temporal accumulation; “Multibounce” adds a secondary
+offscreen cache for multiple bounces of indirect lighting; “Reference” shows a path-traced reference. Runtime for Split RC in “Single frame” is 13.2ms, of
+which 6.1ms consists of 1spp raytracing.
+Radiance probe methods are a popular and well-tested approach for approxi­
+mating diffuse global illumination for real-time graphics, but they commonly
+suffer from a lack of detail due to the large spacing between probes. Radi­
+ance Cascades (RC) fixes this by increasing spatial resolution and reducing
+angular resolution for light and occlusion from closer objects, which allows
+it to provide details at all scales without noise or aliasing. However, leading
+implementations of RC either run in 2D or screenspace, due to the prohibitive
+costs of storing high-detail volumetric radiance information.
+In this work, we adapt Radiance Cascades for accurate real-time 3D diffuse
+global illumination using a sparse hashmap to store world-space probes. We
+introduce ray splitting, a method for calculating radiance intervals used in
+RC by tracing rays from visible surfaces and calculating their contribution
+to cascades based on their hit distance. We evaluate our algorithm, Split
+Radiance Cascades, on a variety of scenes, and demonstrate that it can provide
+high-quality indirect illumination in both single-frame and temporally accu­
+mulated contexts.
+
+1 Introduction
+Computing accurate global illumination (GI) in real-time is one
+of the greatest problems of computer graphics. For a long time,
+games have had to rely on precomputed lighting approximations
+to achieve high visual quality, which makes dynamic changes to
+the scene difficult to depict realistically. The primary problem with
+GI is that all surfaces effectively are emissive due to the multiple
+bounces of light, which results in quadratic complexity from inter­
+actions between all pairs of surfaces visible to each other.
+This problem is commonly split into separate steps which solve
+specular/glossy and diffuse illumination and are combined to pro­
+duce the full result. Specular effects are (usually) highly directional
+and so can be handled efficiently by sampling the BRDF; in con­
+trast, diffuse effects require gathering light from all directions in
+the visible hemisphere, however they can be temporally accumu­
+lated easily due to being view-independent. We will only consider
+diffuse effects in this work.
+
+2 • Rouli Freeman, and Alexander Sannikov
+
+Irradiance probes [Greger et al. 1998] have frequently been used
+as a solution to this problem. While their use in game engines has
+historically involved precomputation, methods such as Dynamic
+Diffuse Global Illumination (DDGI) [Majercik et al. 2019] have been
+introduced which calculate irradiance at probes dynamically using
+raytracing. Additionally, by storing information for all surfaces
+near the camera, DDGI can efficiently approximate multibounce
+diffuse effects by feeding bounce information from previous frames
+into later invocations of the algorithm temporally. However, to
+avoid noise, (ir)radiance probe methods commonly have a low
+spatial resolution and so cannot resolve small-scale effects such as
+ambient occlusion.
+Radiance Cascades (RC) [Sannikov 2023] are a variant of radiance
+probes which introduces multiple co-located cascades of probes,
+which each provides radiance and transmittance information from
+a different distance interval. By storing cascades which track
+faraway objects with a lower spatial resolution but higher angular
+resolution, and vice versa for nearby objects, RC can minimize
+error for effects caused by occluders at all distances. RC delivers
+state of the art results in 2D, as can be seen in games such as Core
+Keeper and Kyora, and has been demonstrated as a screenspace GI
+algorithm to great effect in Path of Exile 2. However, it has not been
+explored much for full 3D diffuse illumination including offscreen
+lights and multiple bounces.
+In this work, we first adapt Radiance Cascades for 3D using a
+sparse hashmap to store probes near surfaces, and sparse trilinear
+interpolation to calculate irradiance per-pixel. We use multiple
+levels of detail similarly to cascaded shadow maps [Dimitrov 2007]
+to ensure constant visual size of probes onscreen. We then develop
+ray splitting, a method of converting full rays into ray intervals for
+use in RC, and adjust the algorithm to randomly trace rays from
+visible surfaces and use the intervals to populate the RC data struc­
+ture in a similar manner to SHaRC [NVIDIA 2024] or hashed path
+space filtering [Binder et al. 2021]. This avoids having to calculate
+intervals for each cascade separately, which reduces raytracing
+cost by the total number of cascades. As this approach requires an
+even distribution of rays, we demonstrate a method to choose ray
+directions which ensures uniform coverage across all cascades. We
+evaluate our full algorithm, Split Radiance Cascades (Split RC), and
+demonstrate that it is capable of providing accurate one-bounce
+results in real-time with only a single frame of calculation while
+also being capable of temporal accumulation for increased quality
+and further bounces.
+
+2 Related Work
+Work on global illumination spans several decades. Ritschel et al.
+[2012] provides a summary of approaches up to 2012. Recently,
+methods utilizing monte-carlo raytracing and spatiotemporal reuse
+[Ouyang et al. 2021; Lin et al. 2022] have gained popularity as they
+reliably converge to the reference solution; however for real-time
+applications, they rely heavily on temporal accumulation, per-pixel
+reprojection, and denoisers. As managing the resulting tradeoffs is
+beyond the scope of our paper, we will primarily focus on other
+algorithms that bear more similarity to our approach.
+
+(Ir)radiance Probes. Irradiance probe volumes have been used
+in game engines frequently as a precomputed approximation of
+diffuse global illumination since their introduction in Greger et
+al. [1998]. Storing directional radiance (such as via spherical
+harmonics) instead of irradiance to render specular effects has
+also been explored [Krivanek et al. 2005]. More recently, these
+techniques have been adapted for dynamic environments and realtime calculation. DDGI [Majercik et al. 2019; Majercik et al. 2021]
+utilizes raytracing in order to update probes in real-time, and stores
+additional depth moments to prevent light leaking by modifying
+the interpolation function. Due to probe volumes scaling cubically
+with resolution, recent techniques have focused on storing radi­
+ance only near surfaces, either via surfels [Halen et al. 2021],
+sparse hashmaps [NVIDIA 2024], or texture mapping [Tatzgern et
+al. 2024]. Techniques such as Lumen [Wright et al. 2022] and GI-1.0
+[Boissé et al. 2023] use an additional screenspace radiance cache for
+first-bounce lighting to prevent the detail loss from the low spatial
+resolution of most world-space probes.
+Radiance Cascades. The original Radiance Cascades paper [San­
+nikov 2023] provides formulations of RC for 2D, pure screenspace,
+and screenspace with world-space raytracing. Osborne and San­
+nikov [2024] introduces the bilinear fix method which removes
+ringing artifacts in 2D implementations. Holographic Radiance
+Cascades [Freeman et al. 2025] is a variant of RC which utilizes
+anisotropic probe layouts to eliminate ray gaps larger than the
+base cascade probe spacing, which results in every cascade having
+the same accuracy; however, achieving the same effect in 3D is
+problematic as it would require 𝑂(𝑥4 ) memory for a scene 𝑥 times
+the base cascade probe spacing in size.
+There have been three fully-3D variants of RC for global illumi­
+nation. Mathis [2024] stores probes in 2D using texture mapping,
+which allows the problem to be considered identically to 2D
+RC. Surfel RC [Coppen 2025] uses surfels to initialize probes on
+surfaces, however interpolation artifacts are noticeable (although
+the painterly look may be a feature for some aesthetics). Love and
+Deepspace utilizes Radiance Cascades in 3D [Ruan 2026] to increase
+the efficiency of standard irradiance probes for use on mobile
+devices.
+Path Space Filtering. Binder et al. [2021] traces rays from the cam­
+era, and then averages similar rays together using a world-space
+voxel hashmap and atomic operations. To avoid discretization arti­
+facts, it jitters query and inserted ray positions. SHaRC [NVIDIA
+2024] utilizes a similar hashmap structure with multiple levels of
+detail and no jittering; it is targeted towards second-bounce effects,
+so artifacts are much less noticeable as the cache is not directly
+displayed on-screen.
+
+Split Radiance Cascades: Real-Time Global Illumination via Sparse Radiance Probes • 3
+
+Table 1. Terminology used throughout this paper.
+
+Symbol
+
+Definition
+
+𝐿(𝐱, 𝜔𝑜 )
+
+Radiance leaving a point 𝐱 in direction 𝜔𝑜
+
+𝐿𝑒 (𝐱, 𝜔𝑜 )
+
+Emission from a point 𝐱 in direction 𝜔𝑜
+
+𝐿𝑖 (𝐱, 𝜔𝑖 )
+
+Incident radiance at a point 𝐱 from direction 𝜔𝑖
+
+⃗
+𝒏(𝐱)
+
+Normal vector at a point 𝐱
+
+𝜌(𝐱, 𝜔𝑜 , 𝜔𝑖 )
+
+Bidirectional Reflectance Distribution Function
+(BRDF)
+
+Ω(𝐱)
+
+Hemisphere of directions facing away from the
+surface at point 𝐱
+
+𝑋𝐼
+
+Set of radiance probe positions
+
+Ω𝐼
+
+Set of ray directions per probe
+
+𝐼(𝐩, 𝜔𝑝 )
+
+Computed incident radiance for probe 𝐩 ∈ 𝑋 𝐼
+and direction 𝜔𝑝 ∈ Ω𝐼
+
+Δ𝑠
+
+Spacing between radiance probes
+
+Δ𝜔
+
+Average spacing between ray directions at some
+distance
+
+𝑁
+
+Total number of cascades
+
+𝑋𝑛𝐼 , Ω𝐼𝑛 ,
+Δ𝑠𝑛 , Δ𝜔
+𝑛
+
+Values of 𝑋 𝐼 , Ω𝐼 , Δ𝑠 , Δ𝜔 for cascade 𝑛
+
+𝑡𝑛
+
+Ray cutoff length for cascade 𝑛
+
+𝐾
+
+Ray direction count (|Ω𝐼𝑛 |) increase per cascade
+(aka. branching factor)
+
+𝑙
+
+Ray length (𝑡𝑛 ) increase
+(aka. length scaling coefficient)
+
+per
+
+cascade
+
+𝐽𝑛 (𝐩, 𝜔𝑝 )
+
+Computed radiance
+𝑡𝑛−1 < 𝑡 ≤ 𝑡𝑛
+
+the
+
+interval
+
+𝛽𝑛 (𝐩, 𝜔𝑝 )
+
+Computed transmittance across the interval
+𝑡𝑛−1 < 𝑡 ≤ 𝑡𝑛
+
+𝐼𝑛 (𝐩, 𝜔𝑝 )
+
+Average radiance in the cone around direction
+𝜔𝑝 , for distances 𝑡 > 𝑡𝑛−1
+
+𝑚𝑛 (𝜔)
+
+The nearest direction in Ω𝐼𝑛 to some direction 𝜔
+
+along
+
+3 Background
+One of the main goals of graphics is approximating the rendering
+equation [Kajiya 1986] for radiance reflecting off surfaces:
+𝐿(𝐱, 𝜔𝑜 ) = 𝐿𝑒 (𝐱, 𝜔𝑜 )
++∫
+
+⃗
+𝜌(𝐱, 𝜔𝑜 , 𝜔𝑖 )𝐿𝑖 (𝐱, 𝜔𝑖 ) (𝜔𝑖 ⋅ 𝒏(𝐱))𝑑𝜔
+𝑖
+
+(1)
+
+Ω(𝐱)
+
+This defines the radiance 𝐿 at position 𝐱 in the direction 𝜔𝑜 as a
+⃗
+function of the emission 𝐿𝑒 , incident radiance 𝐿𝑖 , the normal 𝒏(𝐱)
+at the position, and the BRDF 𝜌, integrated over the hemisphere
+Ω(𝐱) of directions facing away from the surface at that point. The
+incident radiance 𝐿𝑖 is then a function of 𝐿 at another location;
+
+specifically, we can write it as 𝐿𝑖 (𝐱, 𝜔) = 𝐿(𝐱 + 𝑡 ⋅ 𝜔, −𝜔), where
+𝑡 is the distance to the first collision for a ray starting at 𝐱 in the
+direction 𝜔.
+As a consequence of this formulation, radiance is defined in
+terms of itself. In order to avoid the recursive dependence, we
+split radiance into multiple bounces, where each bounce uses the
+previous bounce as the incident radiance. The solution to the ren­
+dering equation can be calculated by repeating this process until
+convergence.
+For the purposes of our algorithm, we will focus on calculating
+a single bounce of radiance. Our algorithm supports gathering dif­
+fuse illumination at arbitrary surface locations rather than purely
+on-screen like some final gathering methods, so we can easily rerun
+it multiple times or feed the output into itself temporally to get
+multiple bounces.
+
+3.1 Radiance Probes
+Radiance probe methods approximate 𝐿 by discretizing the sample
+space over which the incident radiance 𝐿𝑖 is calculated. This is
+important as computing 𝐿𝑖 requires a ray trace (or an equivalent
+operation), which is expensive and can make up a large portion of
+the runtime.
+Formally, we calculate 𝐼(𝐩, 𝜔𝑝 ) = 𝐿𝑖 (𝐩, 𝜔𝑝 ) for all probe posi­
+tions 𝐩 in some finite set 𝑋 𝐼 and ray directions 𝜔𝑝 in a set of evenly
+spaced unit vectors Ω𝐼 . Then, we can replace the hemisphere
+integral in Eq. 1 with a sum over the discretized angles:
+2𝜋
+∑
+𝜌(𝐱, 𝜔𝑜 , 𝜔𝑝 )
+|Ω𝐼 ∩ Ω(𝐱)| 𝜔 ∈Ω𝐼 ∩Ω(𝐱)
+(2)
+𝑝
+⃗
+⋅ 𝐈𝐧𝐭𝐞𝐫𝐩(𝐼)(𝐱, 𝜔𝑝 ) (𝜔𝑝 ⋅ 𝒏(𝐱))
+The position at which we calculate radiance is unlikely to coincide
+with one of the probes, so we extend the function 𝐼 to all surface
+points using some interpolation method 𝐈𝐧𝐭𝐞𝐫𝐩. For example, a
+simple method would be trilinear interpolation, if we have probes
+spaced in a uniform 3D grid: 𝑋 𝐼 ⊂ {Δ𝑠 𝑣 | 𝑣 ∈ ℤ3 }, where Δ𝑠
+is the average probe spacing. However, trilinear results in light
+leaking artifacts when there are surfaces thinner than the probe
+spacing. One way of fixing this would be to only interpolate probes
+which are visible from the sample position [Majercik et al. 2019].
+Then, if we need to calculate radiance within a volume of
+size 𝑉 , the total amount of work necessary is approximately
+𝑂(|Ω𝐼 | 𝑉 /(Δ𝑠 )3 ), assuming that the greatest cost is in the ray­
+tracing to compute 𝐼.
+There are two main unavoidable forms of artifacts for radiance
+probe techniques: angular and spatial errors. Consider a probe
+spaced a distance 𝑡 away from an emitter. Then, near the emitter,
+we have average spacing between rays,
+Δ𝜔 = 𝑡√
+
+4𝜋
+|Ω𝐼 |
+
+(3)
+
+so if the size of the emitter is less than this, we are likely to miss it.
+This type of error results in streaks of light, as shown in Fig. 2, or
+noise if the ray directions vary between probes.
+
+4 • Rouli Freeman, and Alexander Sannikov
+
+Δ𝜔
+
+But there is no reason we need to stick with only two levels
+of detail: if we can accurately combine information from probe
+grids with exponentially increasing cutoff lengths, we could get
+something that provides close-to-optimal detail for light sources
+and occluders at any distance. This is the core idea behind Radiance
+Cascades.
+
+𝑡
+
+Fig. 2. A scene with an occluder and an emitter, with lighting calculated
+using a small number of directions. The angular error is larger than the
+emitter, so the blue probe receives no radiance.
+
+Similarly, consider an occluder near the probe. If the occluder is
+smaller than the probe spacing Δ𝑠 , we have no guarantee that any
+of the rays towards the emitter will first hit the occluder, which
+results in light leaking and missed shadows for positions interpo­
+lated from the probes, as shown in Fig. 3.
+
+3.2 Radiance Cascades
+Radiance Cascades [Sannikov 2023; Osborne and Sannikov 2024]
+tracks multiple overlapping cascades of radiance probes: Starting
+from a base grid with spacing Δ𝑠0 , set of directions Ω𝐼0 , and ray
+cutoff length 𝑡0 , each higher cascade exponentially increases these
+values. Specifically, we have for the 𝑛th cascade,
+Δ𝑠𝑛 = Δ𝑠0 ⋅ 2𝑛
+|Ω𝐼𝑛 | = |Ω𝐼0 | ⋅ 𝐾 𝑛
+
+(4)
+
+𝑛
+
+Δ𝑠
+
+Fig. 3. The same scene as the previous diagram, but with a large probe
+spacing and high angular resolution instead. The occluder is not picked up
+as it is between probes, resulting in light leaking.
+
+Therefore, to reduce the resolvable object size, we seek to minimize
+max(Δ𝑠 , Δ𝜔 ). Note that depending on the specific circumstances
+(such as what denoiser is being used), the noise from large angular
+error could appear worse than the blurring and leaking from spatial
+error or vice versa, so the specific scaling of each may vary; but for
+our algorithm this heuristic has worked well. As we have a finite
+computational budget, we can achieve this best by setting Δ𝑠 =
+Δ𝜔 . Unfortunately, Δ𝜔 is not constant; it scales linearly with the
+distance from the probe (see Eq. 3), so as the distance to emitters
+increases, |Ω𝐼 | also has to increase, and due to the finite computa­
+tional budget, Δ𝑠 as well.
+Normal radiance probe techniques have to consider longdistance light sources in order to do global illumination; as a
+consequence, they usually have a low spatial resolution to avoid
+noise, and cannot provide high-frequency details such as shadow­
+ing within areas smaller than the spacing.
+This is not the case for all algorithms. Consider ambient occlu­
+sion (AO) techniques: Instead of concerning itself with distant
+sources, AO assumes that radiance from beyond a certain radius is
+uniform, and so only calculates visibility within a local area. This
+can be done by tracing a few short rays (as due to the length, they
+have a low angular error), and so it can be calculated per-pixel in
+a reasonable amount of time.
+In real-time graphics, these two techniques are commonly com­
+bined to approximate global illumination, as AO can add back some
+of the high-frequency detail that irradiance probes miss. However,
+there is a gap between the detail levels handled by both techniques,
+which makes the combined algorithm unable to handle effects such
+as soft penumbras.
+
+𝑡𝑛 = 𝑡0 ⋅ 𝑙
+for some branching factor 𝐾 and length scaling coefficient 𝑙. We
+need to be slightly careful about the probe positions: as we will
+be using trilinear interpolation, we offset each cascade to evenly
+distribute error: 𝑋𝑛𝐼 ⊂ {Δ𝑠𝑛 (𝑣 + 12 ) | 𝑣 ∈ ℤ3 }. We will also want
+the same property for the directions. An example configuration for
+2D is shown in Fig. 4.
+The angular error at the end of rays is thus:
+𝑛
+
+Δ𝜔
+𝑛 = 𝑡𝑛 √
+
+4𝜋
+𝑙
+= ( √ ) Δ𝜔
+0
+|Ω𝐼𝑛 |
+𝐾
+
+(5)
+
+So, setting 𝐾 = 4 and 𝑙 = 4 results in Δ𝜔 scaling as 2𝑛 , and
+𝑠
+then adjusting 𝑡0 allows us to achieve Δ𝜔
+𝑛 = Δ𝑛 for all cascades.
+Prior to this work, most RC implementations have actually aimed
+for constant Δ𝜔 across cascades by setting 𝑙 = 2, however in our
+experiments aiming for equal angular and spatial error using 𝑙 = 4
+reduces artifacts significantly, as we demonstrate in Appendix A.
+
+Fig. 4. The first three cascades of probes and the rays computed in them
+for 2D Radiance Cascades, using settings 𝐾 = 𝑙 = 2, |Ω𝐼0 | = 4. Probe posi­
+tions are offset to reduce aliasing.
+
+Split Radiance Cascades: Real-Time Global Illumination via Sparse Radiance Probes • 5
+
+Now, consider a ray traced from some position 𝐱 in direction 𝜔
+to calculate the incident radiance 𝐿𝑖 (𝐱, 𝜔). We can split this ray
+into multiple segments: if the first occluder is between distance 0
+and 𝑡0 from 𝐱, then the ray takes on the radiance at it. Otherwise,
+if there is an occluder from 𝑡0 to 𝑡1 , the ray takes on the radiance at
+that occluder, and so on. More generally, if the segment from 0 to
+𝑡0 provides additional radiance 𝐽 and transmits 𝛽 amount of light
+from beyond 𝑡0 , we can merge the segment with the rest of the ray
+using the following equation:
+𝐿𝑖 (𝐱, 𝜔) = 𝐽 + 𝛽 ⋅ 𝐿𝑖 (𝐱 + 𝑡0 ⋅ 𝜔, 𝜔)
+(6)
+Note that this is identical to the equation for premultiplied alpha
+compositing [Porter and Duff 1984] using 𝛼 = 1 − 𝛽.
+This drives our idea of what data should be stored at each
+cascade: For position 𝐩 ∈ 𝑋𝑛𝐼 and direction 𝜔𝑝 ∈ Ω𝐼𝑛 , we calculate
+the transmittance 𝛽𝑛 (𝐩, 𝜔𝑝 ) as 0 if there is an occluder within
+the interval 𝐩 + 𝑡 ⋅ 𝜔𝑝 , 𝑡𝑛−1 < 𝑡 ≤ 𝑡𝑛 (where for convenience we
+set 𝑡−1 = 0), and 1 otherwise. Similarly, if the first hit along the
+interval is at distance 𝑡𝑖 , the radiance interval is computed as
+𝐽𝑛 (𝐩, 𝜔𝑝 ) = 𝐿(𝐩 + 𝑡𝑖 ⋅ 𝜔𝑝 , −𝜔𝑝 ); and otherwise 𝟎 if there is no
+hit. None of this cares about distances closer than 𝑡𝑛−1 , which
+prevents issues such as a small occluder overlapping with a probe
+and shadowing all of its rays. For a more in-depth treatment of
+radiance intervals, see Sannikov [2023] and Osborne and Sannikov
+[2024].
+We then have a very simple algorithm for calculating the radi­
+ance: For every position 𝐱, and direction 𝜔, we can interpolate the
+nearest probes and directions for each cascade level 𝑛 to approx­
+imate radiance and transmittance intervals 𝐽𝑛 , 𝛽𝑛 for the ray
+segment from 𝑡𝑛−1 < 𝑡 ≤ 𝑡𝑛 and merge these from back to front to
+compute the incident radiance 𝐿𝑖 (𝐱, 𝜔) using Eq. 6. We can then
+use many of these samples to integrate the rendering equation
+(Eq. 1). But while this does not require any additional ray tracing, in
+order to get the benefits of the angular resolution of the 𝑛th cascade
+we would need to use |Ω𝐼𝑛 | directions, which is computationally
+infeasible. So, we can only use this procedure when the BRDF is
+highly anisotropic and the number of directions which contribute
+to the radiance is small.
+For a diffuse BRDF, we need a different approach. Since the
+⃗
+multiplier term in the rendering equation 𝜌(𝐱, 𝜔𝑜 , 𝜔𝑖 )(𝜔𝑖 ⋅ 𝒏(𝐱))
+is smooth, we can get high quality estimations by discretizing
+over a small number of sample directions, so long as the radiance
+stored for each direction averages the incident radiance across a
+wide angle rather than containing a single sample. So, we define
+𝐼𝑛 (𝐩, 𝜔𝑝 ) for each cascade as an approximation to the average
+radiance across all angles closer to 𝜔𝑝 than any other element of
+Ω𝐼𝑛 , from distances further than 𝑡𝑛−1 (so that 𝐼0 averages the full
+radiance starting from 0). We can then compute this by combining
+the cones for the higher cascade within the area and merging
+with the traced radiance interval using Eq. 6. Define 𝑚𝑛 (𝜔) as the
+function mapping a direction 𝜔 to the nearest direction in Ω𝐼𝑛 , and
+𝐼
+define 𝑚−1
+𝑛 (𝜔𝑝 ) = {𝜔𝑞 ∈ Ω𝑛+1 | 𝑚𝑛 (𝜔𝑞 ) = 𝜔𝑝 }. Then, we have:
+𝐼𝑛 (𝐩, 𝜔𝑝 ) = 𝐽𝑛 (𝐩, 𝜔𝑝 )
+𝐈𝐧𝐭𝐞𝐫𝐩(𝐼𝑛+1 )(𝐩, 𝜔𝑞 )
+(7)
++𝛽𝑛 (𝐩, 𝜔𝑝 )
+∑
+|𝑚−1
+𝑛 (𝜔𝑝 )|
+𝜔 ∈𝑚−1 (𝜔 )
+𝑞
+
+𝑛
+
+𝑝
+
+Fig. 5. The 𝐽𝑛 and 𝛽𝑛 intervals merged to compute radiance at a point for
+the probe structure in Fig. 4. One of the calculated cones 𝐼𝑛 is also shown
+per cascade.
+
+We visualize this for 2D RC in Fig. 5. Finally, we calculate the radi­
+ance 𝐿(𝐱, 𝜔) via the same approach as in normal radiance probes
+(Eq. 2), using the same interpolation function to estimate 𝐼0 (𝐱, 𝜔𝑝 )
+around arbitrary positions.
+
+3.2.1 Analysis.
+The total amount of computation and raytracing performed by
+RC to calculate a single bounce of light across a scene is,
+𝑛
+𝑁−1
+𝑉 |Ω𝐼𝑛 |
+𝑉 |Ω𝐼0 | 𝑁−1 𝐾
+∑
+=
+∑
+(
+)
+(8)
+𝑠 𝑑
+(Δ𝑠0 )𝑑 𝑛=0 2𝑑
+𝑛=0 (Δ𝑛 )
+where 𝑑 is the dimensionality of the probe structure, 𝑉 is the size
+of the volume or area we are initializing probes over, and 𝑁 is
+the number of cascades; with 𝑙 = 4, typically only 4 or 5 cascades
+are necessary to have rays spanning the entire scene (with the last
+cascade’s rays sampling the environment map upon miss).
+This makes 2D implementations of RC fairly easy: We can set
+𝐾 = 2 and 𝑙 = 4 (which due to the reduced dimensionality means
+𝑠
+Δ𝜔
+𝑛 still scales the same as Δ𝑛 ), and get high quality results
+with one cascade 0 (c0) probe per pixel, and 4 directions per c0
+probe. We then have that 2𝐾𝑑 = 12 , so the total amount of work is
+bounded for an arbitrary number of cascades (so long as there is
+more than 1 probe per cascade). We can get higher quality results
+setting 𝐾 = 4, however it is not necessary for most applications
+and Holographic Radiance Cascades provides better results for the
+same amount of computation.
+In screenspace RC variants, probes are initialized at specific
+points on the depth buffer, using a depth-aware interpolation
+method instead of bilinear to avoid light leaking near depth discon­
+tinuities. This results in the probe structure still being two-dimen­
+sional. To achieve the same error scaling as 2D RC, we increase
+angular resolution in both axes simultaneously, which results in
+
+6 • Rouli Freeman, and Alexander Sannikov
+
+𝐾 = 4, and then 2𝐾𝑑 = 1, so all cascades have the same cost.1
+However, this scaling poses a problem for full 3D RC. Suppose
+we have some cascade 𝑛 having the same spatial and angular reso­
+lution as a normal irradiance probe scheme (so the probes would be
+spaced around 1 meter apart), and want to use RC to add increased
+details for smaller scale effects. Then, we would have to add a
+few cascades below 𝑛; but as 2𝐾𝑑 = 12 , each lower cascade becomes
+progressively more expensive, and so the total cost becomes domi­
+nated by the lower cascades. This is despite the fact that most of
+the probes in the lower cascades will be wasted, as the spacing will
+be fine enough that in most scenes there will be large empty areas
+where probes do not contribute to any surfaces (which is not the
+case for normal irradiance probe spacings). This brings us to our
+first contribution.
+
+4 Sparse Radiance Cascades
+Instead of allocating a large number of probes which are not used
+for future computation, we utilize a hashmap in order to sparsely
+populate the RC structure near visible surfaces only. To initialize
+probes near surfaces, we iterate over all pixels on screen and insert
+the nearest cascade 0 (c0) probe to that point in world-space. We
+then iterate over every c0 probe and initialize the nearest probe in
+c1, and so on for all cascades; we show a 2d version of this in Fig. 6.
+Due to how probes are spaced, this is equivalent to initializing
+the nearest c𝑛 probe to each position visible. We do not initialize
+all trilinear neighbors of each probe for performance reasons, as
+avoiding it halves the amount of probes for little quality loss. As a
+result, we need to only interpolate between existing probes, which
+we do using a sparse trilinear approach: we add the values at the
+existing probes used for trilinear interpolation multiplied by their
+trilinear weight, and then divide by the total weight for all probes
+to renormalize.
+We also need to calculate ray directions for the cascades. While
+in 2D just using evenly spaced angles for Ω𝐼𝑛 is the obvious and
+optimal solution, in 3D there are many ways of semi-evenly distrib­
+uting points on a sphere. We use the equal-area spherical mapping
+in Algorithm 2 to map the unit sphere of directions to [0, 1]2 , and
+then generate points 𝜔𝑛,𝑢,𝑣 = DecodeDir((𝑢 + 12 )/2Θ𝑛 , (𝑣 +
+1
+𝐼
+2
+2 )/Θ𝑛 ) for some angular resolution Θ𝑛 . Then, we get Ω𝑛 =
+{𝜔𝑛,𝑢,𝑣 | 𝑢 ∈ 0..2Θ𝑛 − 1, 𝑣 ∈ 0..Θ𝑛 − 1}. Having twice the reso­
+lution on the 𝑥-axis is necessary to have approximately even
+spacing between directions. We can easily find the nearest
+c𝑛 direction to a cascade 𝑛 + 1 direction as 𝑚𝑛 (𝜔𝑛+1,𝑢,𝑣 ) =
+𝜔(𝑛, ⌊𝑢/2⌋, ⌊𝑣/2⌋), which consistently maps four directions to
+one.
+Merging and shading pixels then follows identically to normal
+RC with the adjusted interpolation method. We summarize the full
+algorithm in Algorithm 1.
+
+1 Path of Exile 2′s implementation actually uses 𝐾 = 2, however this only functions
+
+due to tracing the depth buffer, the top-down camera view, and the vertical size/
+complexity of the scene not scaling with distance.
+2 Surprisingly, the octahedral [Engelhardt and Dachsbacher 2008] and Clarberg octa­
+hedral [Clarberg 2008] schemes result in worse quality despite having a more uniform
+distribution.
+
+Fig. 6. Sparse probes in Radiance Cascades, with levels following the same
+coloring as in Fig. 4. Obscured probes are not initialized.
+Algorithm 1: Sparse Radiance Cascades
+1 function SparseRC():
+
+// Initialize probes.
+for pixel 𝑝 on screen:
+4
+𝐱 ← world position at pixel 𝑝
+5
+Insert0 (Nearest0 (𝐱))
+6
+for cascade level 𝑛 from 1 to 𝑁 − 1:
+7
+for probe 𝐩 in cascade 𝑛 − 1:
+8
+Insert𝑛 (Nearest𝑘 (𝐩))
+9
+// Trace intervals.
+10
+for cascade level 𝑛 from 0 to 𝑁 − 1:
+11
+for probe 𝐩 in cascade 𝑛 and 𝜔𝑛,𝑢,𝑣 in Ω𝐼𝑛 :
+compute radiance interval 𝐽𝑛 (𝐩, 𝜔𝑛,𝑢,𝑣 )
+12
+and transmittance 𝛽𝑛 (𝐩, 𝜔𝑛,𝑢,𝑣 ) using ray tracing
+13
+// Merge cascades.
+14
+for cascade level 𝑛 from 𝑁 − 1 to 0:
+15
+for probe 𝐩 in cascade 𝑛 and 𝜔𝑛,𝑢,𝑣 in Ω𝐼𝑛 :
+compute radiance cone 𝐼𝑛 (𝐩, 𝜔𝑛,𝑢,𝑣 )
+16
+from 𝐽𝑛 , 𝛽𝑛 , and 𝐼𝑛+1 using Eq. 6
+17
+// Shade pixels.
+18
+for pixel 𝑝 on screen:
+19
+𝐱 ← world position at pixel 𝑝
+20
+compute 𝐿(𝐱, 𝜔𝑜 ) using Eq. 2
+// Gets the nearest probe in cascade 𝑛 to a position 𝐱.
+21 function Nearest𝑛 (𝐱):
+22
+return Δ𝑠𝑛 (⌊𝐱/Δ𝑠𝑛 ⌋ + 12 )
+// Inserts the probe at position 𝐩 (assumed to be a half-integer
+multiple
+// of Δ𝑠𝑛 ) into the cascade 𝑛 hashmap.
+23 function Insert𝑛 (𝐩):
+24
+// Code omitted; see Section 6 for details.
+2
+3
+
+4.1 Levels of Detail
+Due to the perspective transform in (most) 3D renders, further
+away objects take up less screen space, and so do not need the same
+probe density as nearby objects to achieve an identical quality; ad­
+ditionally, using the same probe density would result in unbounded
+memory usage for very distant objects. So, we introduce a level of
+detail (LOD) system for our probes in the same fashion as many
+
+Split Radiance Cascades: Real-Time Global Illumination via Sparse Radiance Probes • 7
+
+Algorithm 2: Equal-Area Spherical Mapping
+1 function EncodeDir(𝜔):
+
+𝜙 ← atan2(𝜔𝑦 , 𝜔𝑥 )
+𝜙
+return (frac( 2𝜋
+), (𝜔𝑧 + 1)/2)
+4 function DecodeDir(𝑢, 𝑣):
+5
+𝜙 ← 𝑢 ⋅ 2𝜋
+6
+𝑧←√
+2𝑣 − 1
+7
+𝑟 ← 1 − 𝑧2
+8
+return (𝑟 ⋅ cos(𝜙), 𝑟 ⋅ sin(𝜙), 𝑧)
+2
+3
+
+Fig. 7. An illustration of over-occlusion by Fig. 8. Error from probes being recessed into surfaces in
+Bistro [Lumberyard 2017]; c0 rays start from 𝑡−1 = Δ𝑠0 .
+25% due to probe positioning.
+
+other radiance probe algorithms.3 Each probe stores an additional
+coordinate indicating its LOD, with each higher level increasing the
+probe spacing Δ𝑠0 and base ray length 𝑡0 by a factor of 2. Different
+LODs do not interact with each other; probes of one LOD initialize
+the nearest higher-cascade probe of the same LOD, and when
+interpolating for merging and shading, we only consider probes
+from the same LOD. We choose the LOD for probes upon initial­
+ization based on the binary logarithm of the Chebyshev distance
+from the camera (it produces fewer artifacts than Euclidian due to
+the grid alignment of the probes), so that probes stay the same size
+on-screen.
+To prevent the seam between LODs from being visible, we
+shorten the starting distance of each LOD by 0.9 to overlap with the
+previous LOD, and linearly blend between them across the over­
+lapping interval when computing the final on-screen irradiance.
+
+5 Ray Splitting
+However, this version of Sparse Radiance Cascades still has a stan­
+dard flaw of radiance probe techniques: probe positions can end
+up blocked within objects, which causes unnecessary darkening
+when interpolating. This is amplified as we intentionally spawn
+probes near surfaces rather than in open space. Even if we adjust
+c0 rays to start away from the probe position to avoid the worst
+of the problem, probe positions being recessed into surfaces can
+still cause bias due to rays facing outwards from the surface being
+occluded immediately, as shown in Fig. 7. The result of these errors
+are demonstrated in Fig. 8.
+To solve this problem, we take inspiration from SHaRC [NVIDIA
+2024]: we do not need to spawn rays exactly from the probe posi­
+tions; instead, we can spawn rays from surfaces on-screen (so that
+they are not immediately occluded), and insert them into our probe
+structure.
+Radiance Cascades uses merging to assemble multiple intervals
+into an infinite ray to reconstruct radiance. In ray splitting, we
+invert this by splitting rays into multiple intervals to deposit into
+our RC data structure. Suppose we have a ray starting at position
+𝐱 in direction 𝜔 hitting at a distance 𝑡, where 𝑡𝑛−1 < 𝑡 ≤ 𝑡𝑛 . Then,
+we know that the 𝑛th cascade is occluded in that direction, and
+all lower ones are transparent. So, for all cascades 𝑘 < 𝑛, we can
+estimate 𝐽𝑖 (𝐩, 𝜔𝑝 ) = 𝟎, 𝛽𝑖 (𝐩, 𝜔𝑝 ) = 1, where 𝐩 = Nearest𝑘 (𝐱)
+3 In a rather unfortunate coincidence, most literature refers to this as ‘cascades’ (e.g.
+
+cascaded shadow maps), however to avoid confusion we will refer to them as LODs
+exclusively.
+
+and 𝜔𝑝 = 𝑚𝑘 (𝜔) are the nearest probe position and direction to the
+ray in that cascade. Similarly, for the 𝑛th cascade we can conclude
+that 𝐽𝑛 (𝐩, 𝜔𝑝 ) = 𝐿𝑖 (𝐱, 𝜔) and 𝛽𝑛 (𝐩, 𝜔𝑝 ) = 0.
+We then deposit these values into the associated probe and direc­
+tion in the hashmap. Since there may be multiple contributions, we
+modify the hashmap to store a cumulative sum of all radiance and
+transmittance values deposited into that direction, and compute
+the actual 𝐽𝑛 and 𝛽𝑛 values for merging by dividing by the number
+of rays deposited.
+There are two ways of handling higher cascades: We can either
+choose to not deposit anything to them, as the ray did not hit
+anything within the intervals they cover, or we can extend the ray
+to all remaining cascades and deposit the same radiance and zero
+transmittance to them as well. However, the latter option results in
+noticeable bias due to shorter rays providing a larger contribution
+to the final radiance when averaged together, so we choose the
+former option (although it is a little noisier).
+Our algorithm then proceeds as follows: After initializing
+probes, we spawn rays from surfaces displayed on screen, and
+for each ray we atomically add the radiance and transmittance
+contributions (and increment the count) to the nearest probe and
+direction in each cascade level that the ray provides information
+for. After all rays are deposited, we merge as normal, but ignore
+directions with zero count to prevent division by zero.
+
+5.1 Sampling
+One concern with the ray splitting algorithm is that there is no
+guarantee that every direction of every probe will have at least one
+value before merging. In fact, this is somewhat a feature: probe
+directions that point into surfaces will not be used in the final
+calculation so we avoid computing them unnecessarily by only
+spawning rays facing away from surfaces. Similarly, in an enclosed
+room all rays may terminate before reaching the 𝑛th cascade and
+we would not end up depositing anything to it; but if that is the
+case, the lower cascades must be fully opaque, and so we would not
+read anything from the 𝑛th cascade either.
+However, we need all used directions to be filled in order to
+avoid noise. Conveniently, each cascade requires approximately
+the same number of rays to achieve this: if we consider a scene only
+containing a flat axis-aligned plane, then each cascade has 4x less
+probes than the previous, but each probe has 4x more directions
+(assuming 𝐾 = 4), so the total number of directions is constant
+per cascade. Most scenes have the same scaling due to being effec­
+
+8 • Rouli Freeman, and Alexander Sannikov
+
+tively two-dimensional, with the exception of foliage and thin rods.
+Additionally, due to our level of detail system, probes in the same
+cascade are likely to have similar projected size on-screen (so long
+as the camera is not seeing them obliquely) so we can ensure that
+they all get enough rays by spawning a constant number per pixel.
+Simply using uniformly random directions results in significant
+inefficiencies. Higher cascades become significantly less likely to
+be filled in than the base cascade, as by the coupon collector’s
+problem [Tan et al. 2025] the amount of samples required to fill 𝑘
+buckets scales with 𝑂(𝑘 log 𝑘), and each higher cascade has expo­
+nentially more buckets per probe.
+So, we use the 𝑅2 low-discrepancy sequence [Roberts 2018] to
+generate points on the unit square, which we then map to direc­
+tions using the equal-area mapping in Algorithm 2. We need that
+at each cascade level, all directions are semi-uniformly covered by
+rays, so we assign probes that share the same nearest next-cascade
+probe to contiguous segments of the 𝑅2 sequence so that the rays
+for the next-cascade probe are also a contiguous segment of the
+sequence and so are evenly distributed. The entire sequence is then
+jittered to distribute errors temporally. This is done similarly to a
+hierarchical prefix-sum; we first count the number of rays within
+each probe from lowest to highest cascade, and then compute
+offsets for probes in reverse order. We show pseudocode for this
+in Algorithm 3, and demonstrate the improvement over random
+sampling in Fig. 9.
+Random
+
+R2
+
+Algorithm 3: Ray Generation
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+
+Fig. 9. Comparison of uniform random sampling and 𝑅2 -based sampling
+for a single frame of Bistro.
+
+5.2 Temporal Accumulation
+An additional benefit of this approach is that we can easily tempo­
+rally accumulate rays: In a semi-static scene, there is no need to
+fully recompute probes that existed in previous frames; instead,
+we can blend the previous frame’s cascades with the new intervals
+from the current frame. As our algorithm functions entirely in
+world-space, we do not need to worry about reprojection due to
+camera movement (we leave handling movable objects to future
+work). We can additionally use this to reduce the number of rays
+traced per frame by only tracing rays until we reach a certain target
+number; however as this is dependent on the amount of disocclu­
+sion in the last frame, for the purposes of benchmarking we will
+assume that every frame casts the full number of rays.
+
+6 Implementation
+We implement our algorithm in Rust using the LuisaCompute
+[Zheng et al. 2022] framework as an abstraction over CUDA. Ray­
+tracing is handled by OptiX.
+
+// Input: A global 2d temporal noise value.
+function GenerateRays(jitter):
+num_rays ← {𝐩 ↦ 0 | 𝐩 a probe}
+for pixel 𝑝 on screen:
+𝐱 ← world position at pixel 𝑝
+num_rays[Nearest0 (𝐱)] += 1
+for cascade level 𝑛 from 1 to 𝑁 − 1:
+for probe 𝐩 in cascade 𝑛 − 1:
+num_rays[Nearest𝑛 (𝐩)] += num_rays[𝐱]
+offset ← {}
+global_offset ← 0
+for probe 𝐩 in cascade 𝑁 − 1:
+offset[𝐩] ← global_offset
+global_offset += num_rays[𝐩]
+for cascade level 𝑛 from 𝑁 − 2 to 0:
+for probe 𝐩 in cascade 𝑛 + 1:
+local_offset ← offset[𝐩]
+for probe 𝐪 in cascade 𝑛 where Nearest𝑛+1 (𝐪) = 𝐩:
+offset[𝐪] ← local_offset
+local_offset += num_rays[𝐪]
+for pixel 𝑝 on screen:
+𝐱 ← world position at pixel 𝑝
+𝐩 ← Nearest0 (𝐱)
+𝑢𝑣 ← 𝑅2 (offset[𝐩])
+offset[𝐩] += 1
+𝜔 ← DecodeDir(𝑢𝑣 + jitter mod 1)
+// flip inwards-pointing directions
+⃗
+𝜔 ← 𝜔 ⋅ sign(𝜔 ⋅ 𝒏(𝐱))
+spawn ray from 𝐱 in direction 𝜔
+
+Hashmap. We create a separate hashmap for each cascade to
+store radiance and transmittance. For the key, we encode the probe
+position as a 64-bit integer, using 18 bits for each coordinate axis
+and 10 for the LOD, in order to do insertion locklessly with linear
+probing and atomic operations. The hashmap values are very large
+as each contains all directions for a single probe, so we instead
+store an index into an indirection buffer containing the actual data.
+This allows us to run our hashmap at very low occupancy without
+consuming a large amount of memory. Additionally, we recreate
+our hashmaps every frame from the indirection buffer, so we can
+easily remove old probes without having to handle deletion in the
+hashmap itself.
+Merging. We store directional data such as 𝐽𝑛 , 𝛽𝑛 , and 𝐼𝑛 in
+Morton order, which ensures that at each cascade, the data for all
+directions which are merged into the same direction in the lower
+cascade are stored contiguously. As a result, our merging function
+can do coherent reads during merging, and use warp-wide shuffles
+to share the data between threads to average the cones together.
+We additionally perform pre-averaging: since the only use of 𝐼𝑛
+for cascades higher than 0 is to merge into the lower cascade,
+we directly compute the averaged value used for the next step of
+merging rather than storing them separately. Another optimization
+we use is to make each block of our merging shader responsible for
+only a single probe; this means that the higher-cascade probes used
+
+Split Radiance Cascades: Real-Time Global Illumination via Sparse Radiance Probes • 9
+
+for interpolation are shared across the block, so we can perform
+lookups for them in parallel using shared memory.
+Shading. For the final shading step, we need to compute the
+outgoing radiance via the rendering equation. If we do this naively
+by gathering all directions for the nearest probes and interpolating
+them for each pixel, the cost quickly becomes prohibitive: for 32
+c0 directions, this results in up to 256 unfiltered texture samples
+per pixel. To avoid this, we can precompute directional irradiance
+for each probe by evaluating the rendering equation for each
+direction (assuming that the BRDF is Lambertian), and store this
+in a texture. Then, we sample this texture in the direction of the
+normal for the nearest probes and interpolate those values to get
+the final radiance, which is a maximum of 8 filtered texture sam­
+ples per pixel. Specifically, we calculate a 6x6 octahedral-mapped
+[Engelhardt and Dachsbacher 2008] irradiance field, and then do
+an additional copying pass to add a single-texel border around the
+texture to handle interpolation at the edges.
+Multibounce. We extend our algorithm to support multiple
+bounces by using the hit point of rays traced in the previous
+frame to spawn rays and probes for a secondary cache. We then
+sample from the secondary cache for all ray hits (which allows the
+secondary cache to sample itself for ‘infinite’ bounces via temporal
+accumulation). As most of the algorithm is screen-independent,
+we can reuse our probe initialization, ray generation, and merging
+code, with the only change being the input normal and positions.
+We do not initialize probes that require three bounces currently.
+We use secondary cache probes that are two levels of detail
+higher than the equivalent primary cache to reduce cost, as the
+second bounce information is not directly displayed and so does
+not need to be as precise.
+
+7 Results
+We use length scaling 𝑙 = 4, branching factor 𝐾 = 4, base number
+of directions |Ω𝐼0 | = 32 (using Θ0 = 4), base ray length 𝑡0 ≈
+1.6Δ𝑠0 , and 𝑁 = 4 cascades. We also compare to an implementa­
+tion of DDGI, which we implemented following Majercik et al.
+[2021] with the final shading directly translated from the RTXGIDDGI implementation [NVIDIAGameWorks 2024].
+Performance. Our method takes approximately the same amount
+of time in most of our tests as probes quantity is nearly constant
+due to LODs. We break down the performance of each stage of
+our algorithm in Table 2; stage names follow Algorithm 1, with
+Generate rays referring to Algorithm 3, and Trace rays being the
+calculation of the spawned rays. We have not included the cost for
+creating the G-buffer or tracing shadow rays, as those steps are not
+specific to our algorithm. Note that these metrics are not indicative
+of the maximum possible performance for Split RC as our imple­
+mentation is missing many micro-optimizations; for example, it is
+currently using 32-bit floats to store radiance.
+
+Table 2. Performance breakdown of single-frame Split RC for Fig. 10 and
+Fig. 13, running on a RTX 3080 Laptop GPU. All numbers are in millisec­
+onds.
+Stage
+
+Sponza
+
+San Miguel
+
+Initialize probes
+
+1.2
+
+1.3
+
+Generate rays
+
+0.4
+
+0.6
+
+Trace rays
+
+1.3
+
+4.5
+
+Deposit
+
+2.2
+
+1.9
+
+Merge
+
+1.0
+
+0.8
+
+Shade pixels
+
+2.5
+
+2.4
+
+Total
+
+8.6
+
+11.5
+
+The Trace Rays stage is entirely dependent on raytracing perfor­
+mance, and so is highly variable: the San Miguel scene has
+complex geometry such as foliage, and so takes 3x more time to
+trace than Sponza.
+Quality. We showcase Split RC in the Sponza (©︎ Frank Meinl),
+San Miguel (©︎ Guillermo M. Leal Llaguno), and Conference
+Room (©︎ Anat Grynberg and Greg Ward) scenes [McGuire 2017].
+We show single-frame evaluations of our algorithm, as temporal
+accumulation can hide performance problems and has behavior
+dependent on camera movement, which is hard to measure. As
+most other real-time global illumination algorithms utilize tempo­
+ral accumulation, we also show a converged version using a smaller
+probe spacing and ten frames of accumulation; due to the structure
+of RC, there is little benefit of increasing sampling past that point
+as most remaining error is from interpolation. Apart from in Fig. 1
+and Fig. 12, we only show a single bounce of light in our images,
+as secondary bounces reduce contrast and make errors harder to
+distinguish. DDGI results are computed using a 32x16x32 probe
+grid and accumulated until there is no noise (apart from the 1 frame
+version in Fig. 10). We note a few features of our algorithm:
+• Shadows: Our method can capture soft penumbrae particularly
+well, as seen in Fig. 11; the cascade level that captures the penum­
+bra increases with the distance to the occluder, which results in
+the spatial discretization of radiance matching the penumbra’s
+width across the entire scene.
+• Ambient Occlusion: Our method can provide medium-scale am­
+bient occlusion effects as probes are spaced finely on-screen; this
+is shown clearly in the second row of cutouts for Fig. 10. DDGI
+does not show any ambient occlusion, which is a natural result
+of its probe spacing being larger than the distance from the wall
+to the banner.
+• Artifacts: Split RC misses details smaller than the base probe
+spacing, as seen in Fig. 15, and can also exhibit light leaking
+artifacts from interpolation during merging, which results in
+brightening of shadows in Fig. 10. The small number of c0
+directions can also contribute to bias, although the loss in visual
+quality is minimal. Additionally, Split RC has overblurring when
+trying to resolve hard shadows: in Fig. 13, the shadow of the plant
+in the cutout loses some of the details apparent in the reference.
+
+10 • Rouli Freeman, and Alexander Sannikov
+
+Split RC
+
+DDGI
+
+Sparse RC
+
+Split RC (1 frame)
+
+DDGI (1 frame)
+
+Reference
+
+Split RC
+
+DDGI
+
+Split RC (1 frame)
+
+DDGI (1 frame)
+
+Sparse RC
+
+Reference
+
+Fig. 10. Comparison of Split RC, DDGI, normal Sparse RC (single frame), and a path-traced reference for the Sponza scene. DDGI (1 frame) was computed
+in a single frame with an equal ray count to Split RC (1 frame); it has 1666 probes contributing to surfaces on-screen with 1245 rays each.
+Split RC (1 frame)
+
+DDGI
+
+Split RC, single bounce
+
+Reference
+
+Split RC, multibounce
+
+Split RC
+(1 frame)
+
+DDGI
+
+Reference
+
+Fig. 11. Comparison of single-frame Split RC, DDGI, and a path-traced reference for Sponza near the Fig. 12. Comparison between normal and multi­
+first cutout in Fig. 10. DDGI fails to resolve the penumbra due to it being smaller than the probe spacing. bounce Split RC in the Conference Room scene.
+
+Split Radiance Cascades: Real-Time Global Illumination via Sparse Radiance Probes • 11
+
+DDGI
+
+Split RC (1 frame)
+
+Reference
+
+Split RC
+
+Split RC
+
+Split RC (1 frame)
+DDGI
+Reference
+Fig. 13. Comparison of Split RC, DDGI, and a path-traced reference for the San Miguel scene. The shadows cast by the foilage are missed by DDGI due to
+probes being relocated away from the occluding geometry, while Split RC overblurs them.
+
+7.1 Extensions
+In this section, we demonstrate a few additional capabilities of our
+algorithm which we have not fully developed.
+Specular Effects. As mentioned in Section 3.2, the RC data struc­
+ture can be used to efficiently approximate single rays without
+additional tracing by combining intervals in the same direction.
+We can use this to handle rough specular effects by approximating
+it with a cone: we lookup the cascade with 𝐼𝑛 size similar to our
+target (for example in Fig. 14, this would be cascade 2) and merge it
+with 𝐽𝑛 from previous cascades to get the result. Unfortunately we
+cannot use RC for precise effects such as reflections as the spatial
+resolution loss of higher cascades becomes very apparent, so for
+a full rendering system this would need to be combined with a
+different algorithm.
+Diffuse + Specular
+
+removes problems detecting features smaller than the base probe
+spacing; we show a comparison of this in Fig. 15. Our current un­
+optimized implementation uses directional radiance information
+for each pixel, which requires an expensive gather step rather than
+just sampling irradiance; this takes an additional 23ms per frame,
+despite the actual C(-1) calculation only being 1.4ms extra. This is
+avoidable by treating C(-1) as an ambient term instead and multi­
+plying with the radiance, however that would result in the loss of
+directional lighting information.
+Normal
+
+With C(-1)
+
+Reference
+
+Diffuse Only
+
+Specular Only
+
+Fig. 14. Specular effects with Split RC. Notice that in the bottom right
+corner some spatial grid artifacts are noticeable in addition to the blurring.
+
+C(-1) merging. Instead of starting c0 rays from the probe position,
+we can start them from a small distance 𝑡−1 (commonly set to be
+Δ𝑠0 for normal RC as that can prevent aliasing) and merge the
+values with a “cascade −1”, which we calculate at every pixel with
+screen-space raymarching similarly to Therrien et al. [2022]. This
+
+Fig. 15. Comparison of a close-up view of normal Split RC and Split RC
+with C(-1) merging. The leaves on the pillar have details smaller than the
+c0 probe spacing, resulting in normal RC being unable to capture their
+shadows, while C(-1) merging can capture them well.
+
+Denoising. Our formulation of Split RC traces a ray from each pixel,
+and then uses those rays, in combination with normal, depth, and
+(assumed to be Lambertian) BRDF to compute a filtered image. As
+such, we can treat it as a denoiser that utilizes occlusion and hit
+depth to decide whether rays can be shared between nearby pixels.
+Considering it in this fashion, we can compare to other denoisers
+with the same input ray information. We choose OIDN [Áfra 2026]
+
+12 • Rouli Freeman, and Alexander Sannikov
+
+as a comparison as it is primarily designed for offline use with
+no temporal information, and has a simple CPU-based API, which
+makes integration easy. We show these results in Fig. 16.
+Raw
+
+Reference
+
+OIDN
+
+Split RC
+
+Raw
+Reference
+OIDN
+Split RC
+Fig. 16. Comparison of Split RC as a denoiser against OIDN. Ray directions
+for the raw image are computed using the sampling strategy in Section 5.1.
+The lion head is undersampled in the raw image, which results in signif­
+icant loss of detail in OIDN, whereas Split RC is able to reconstruct it well.
+
+Admittedly, this is a somewhat unfair comparison; OIDN is
+designed to take in radiance which has already been accumulated
+from multiple samples per pixel so it cannot use per-ray informa­
+tion like Split RC.
+
+8 Conclusion
+We have introduced a new method for 3D global illumination based
+on sparse world-space Radiance Cascades. Our method is capable
+of calculating a diffuse bounce efficiently without the need for
+temporal accumulation, and providing effects ranging from ambi­
+ent occlusion to environment mapping within the same algorithm,
+while degrading gracefully for patterns too thin to accurately re­
+solve. In addition, ray splitting avoids the standard issue of probebased methods requiring careful positioning of probes, which is not
+completely ameliorated with standard sparse RC, and reduces the
+amount of rays required by the total number of cascades.
+Ray splitting can be interpreted as an extension of path filtering
+techniques to filter radiance intervals rather than full rays, with
+longer intervals using a larger filter size and being occluded by
+shorter intervals.
+We also demonstrate a new argument for the effectiveness of
+Radiance Cascades: that the errors induced by spatial and angular
+discretization should be simultaneously minimized, which requires
+multiple probe levels due to the angular error scaling with ray
+length. This argument drives our choice of scaling factor.
+
+8.1 Limitations and Future Work
+As RC captures the radiance field up to a certain frequency, it is
+incapable of resolving certain phenomena such as sharp mirror re­
+flections. Additionally, Split RC can exhibit light leaking and other
+artifacts, particularly for geometry smaller than the base probe
+spacing, and is inherently biased due to use of interpolated probes.
+The primary difficulty with our ray splitting scheme is that it
+requires finding rays that are evenly distributed across all cascades.
+While our current approach achieves this goal better than using
+white or blue noise distributed directions, there is still plenty of
+room for improvement; spawning rays from pixels results in up to a
+4x ray quantity difference between the nearest and furthest probes
+within the same LOD, so approaches using a fixed ray budget per
+probe are worth investigating.
+Our temporal accumulation method is very naive; a better
+approach would be to allocate more rays towards newly spawned
+probes (although this re-raises the question of how to evenly dis­
+tribute rays), and reduce the amount of rays for older probes unless
+there is a change in lighting, with the aid of a multi-scale mean
+estimator or other methods of adaptive averaging.
+Finally, it may be possible to represent Split RC entirely as a
+denoiser without hashing or additional storage, which could allow
+it to be used as a drop-in replacement for existing denoisers over
+low sample count path tracers while retaining the benefits of RC.
+
+References
+Nikolaus Binder, Sascha Fricke, and Alexander Keller. 2021. Massively Parallel Path
+Space Filtering. https://arxiv.org/abs/1902.05942.
+Guillaume Boissé, Sylvain Meunier, Heloise de Dinechin, et al. 2023. GI-1.0: A Fast and
+Scalable Two-level Radiance Caching Scheme for Real-time Global Illumination.
+https://arxiv.org/abs/2310.19855.
+Petrik Clarberg. 2008. Fast equal-area mapping of the (hemi)sphere using SIMD.
+Journal of Graphics Tools 13, 3 (2008), 53–68.
+Max Coppen. 2025. Surfel Radiance Cascades. https://github.com/mxcop/src-dgi.
+Rouslan Dimitrov. 2007. Cascaded Shadow Maps. https://developer.download.nvidia.
+com/SDK/10.5/opengl/src/cascaded_shadow_maps/doc/cascaded_shadow_maps.
+pdf.
+Thomas Engelhardt and Carsten Dachsbacher. 2008. Octahedron Environment Maps.
+International Symposium on Vision, Modeling, and Visualization (Jan. 2008), 383–
+388.
+Rouli Freeman, Alexander Sannikov, and Adrian Margel. 2025. Holographic Radiance
+Cascades for 2D Global Illumination. https://arxiv.org/abs/2505.02041.
+Gene Greger, Peter Shirley, Philip M. Hubbard, and Donald P. Greenberg. 1998. The
+irradiance volume. IEEE Computer Graphics and Applications 18, 2 (1998), 32–43.
+https://doi.org/10.1109/38.656788.
+Henrik Halen, Andreas Brinck, Kyle Hayward, and Xiangshun Bei. 2021. SIGGRAPH
+21: Global Illumination Based on Surfels.
+https://www.ea.com/seed/news/
+siggraph21-global-illumination-surfels.
+James T. Kajiya. 1986. The Rendering Equation. ACM Transactions on Graphics (Pro­
+ceedings of SIGGRAPH) 20, 4 (Aug. 1986), 143–150. https://doi.org/10.1145/15922.
+15902.
+Jaroslav Krivanek, Pascal Gautron, Sumanta N. Pattanaik, and Kadi Bouatouch. 2005.
+Radiance caching for efficient global illumination computation. IEEE Transactions
+on Visualization and Computer Graphics 11, 5 (2005), 550–561. https://doi.org/10.
+1109/TVCG.2005.83.
+Daqi Lin, Markus Kettunen, Benedikt Bitterli, Jacopo Pantaleoni, Cem Yuksel, and
+Chris Wyman. 2022. Generalized Resampled Importance Sampling: Foundations
+of ReSTIR. ACM Transactions on Graphics (Proceedings of SIGGRAPH 2022) 41, 4
+(2022), 1–23. https://doi.org/10.1145/3528223.3530158.
+
+Split Radiance Cascades: Real-Time Global Illumination via Sparse Radiance Probes • 13
+
+Amazon Lumberyard. 2017. Amazon Lumberyard Bistro, Open Research Content
+Archive (ORCA). http://developer.nvidia.com/orca/amazon-lumberyard-bistro.
+Zander Majercik, Jean-Philippe Guertin, Derek Nowrouzezahrai, and Morgan
+McGuire. 2019. Dynamic Diffuse Global Illumination with Ray-Traced Irradiance
+Fields. Journal of Computer Graphics Techniques (JCGT) 8, 2 (June 2019), 1–30.
+http://jcgt.org/published/0008/02/01/.
+Zander Majercik, Adam Marrs, Josef Spjut, and Morgan McGuire. 2021. Scaling ProbeBased Real-Time Dynamic Global Illumination for Production. Journal of Computer
+Graphics Techniques (JCGT) 10, 2 (May 2021), 1–29. http://jcgt.org/published/
+0010/02/01/.
+Mathis. 2024. Radiance Cascades 3D. https://www.shadertoy.com/view/X3XfRM.
+Morgan McGuire. 2017. Computer Graphics Archive. https://casual-effects.com/data.
+NVIDIA. 2024. Spatially Hashed Radiance Cache. https://github.com/NVIDIA-RTX/
+SHARC.
+NVIDIAGameWorks. 2024. RTX Global Illumination. https://github.com/NVIDIAGa
+meWorks/RTXGI-DDGI.
+Christopher M. J. Osborne and Alexander Sannikov. 2024. Radiance Cascades: A
+Novel High-Resolution Formal Solution for Multidimensional Non-LTE Radiative
+Transfer. https://arxiv.org/abs/2408.14425.
+Yaobin Ouyang, Shiqiu Liu, Markus Kettunen, Matt Pharr, and Jacopo Pantaleoni.
+2021. ReSTIR GI: Path Resampling for Real-Time Path Tracing. Computer Graphics
+Forum (Proceedings of High Performance Graphics) 40, 8 (June 2021), 17–29. https://
+doi.org/10.1111/cgf.14378.
+Thomas Porter and Tom Duff. 1984. Compositing digital images. Computer Graphics
+18, 3 (Jan. 1984), 253–259. https://doi.org/10.1145/964965.808606.
+Tobias Ritschel, Carsten Dachsbacher, Thorsten Grosch, and Jan Kautz. 2012. The State
+of the Art in Interactive Global Illumination. Computer Graphics Forum 31, 1 (2012),
+160–188. https://doi.org/https://doi.org/10.1111/j.1467-8659.2012.02093.x https://
+onlinelibrary.wiley.com/doi/abs/10.1111/j.1467-8659.2012.02093.x.
+Martin Roberts. 2018. The Unreasonable Effectiveness of Quasirandom Se­
+quences. https://extremelearning.com.au/unreasonable-effectiveness-ofquasirandom-sequences/.
+Tianlong Ruan. 2026. The Evolution of Real-Time Global Illumination in 'Love and
+Deepspace'. Game Developers Conference.
+Alexander Sannikov. 2023. Radiance Cascades: A Novel Approach to Calculating
+Global Illumination. https://github.com/Raikiri/RadianceCascadesPaper.
+Andrew Tan, Oriel Limor, Daniella Bar-Lev, Ryan Gabrys, Zohar Yakhini, and Paul
+H. Siegel. 2025. The Labeled Coupon Collector Problem. https://arxiv.org/abs/
+2507.15231.
+Wolfgang Tatzgern, Alexander Weinrauch, Pascal Stadlbauer, Joerg H. Mueller, Martin
+Winter, and Markus Steinberger. 2024. Radiance Caching with On-Surface Caches
+for Real-Time Global Illumination. Proceedings of the ACM on Computer Graphics
+and Interactive Techniques 7, 3 (Aug. 2024). https://doi.org/10.1145/3675382.
+Olivier Therrien, Yannick Levesque, and Guillaume Gilet. 2022. Screen space indirect
+lighting with visibility bitmask. The Visual Computer 39, 11 (Nov. 2022), 5925–5936.
+https://doi.org/10.1007/s00371-022-02703-y.
+Daniel Wright, Krzysztof Narkowicz, and Patrick Kelly. 2022. Lumen: Real-time Global
+Illumination in Unreal Engine 5. Advances in Real-Time Rendering in Games (2022).
+Shaokun Zheng, Zhiqian Zhou, Xin Chen, et al. 2022. LuisaRender: A High-Perfor­
+mance Rendering Framework with Layered and Unified Interfaces on Stream
+Architectures. ACM Transactions on Graphics (Proceedings of SIGGRAPH) 41, 6
+(Nov. 2022), 232:1–232:19. https://doi.org/10.1145/3550454.3555463.
+Attila T. Áfra. 2026. Intel® Open Image Denoise. https://www.openimagedenoise
+.org/.
+
+A 2x vs 4x Length Scaling
+In this appendix, we compare the quality of Radiance Cascades
+with different length scaling factors. For clarity, we show results in
+2D, and use branching factor 𝐾 = 2 to replicate the same angular
+resolution changes across cascades as 𝐾 = 4 has in 3D. We show
+these results in Fig. 17. As RC functions independently of scene
+complexity, this simple test case is sufficient to demonstrate the
+performance of both scaling factors in the general case.
+
+𝑙 = 4, 𝑡0 = 1
+
+𝑙 = 4, 𝑡0 = 0.5
+
+𝑙 = 4, 𝑡0 = 1.5
+
+𝑙 = 2, 𝑡0 = 24
+
+𝑙 = 2, 𝑡0 = 12
+
+𝑙 = 2, 𝑡0 = 36
+
+Fig. 17. Comparison of different length scaling factors for RC for a single
+light source and occluder. All images use 32 directions per c0 probe with
+one c0 probe per pixel (using units Δ𝑠0 = 1), and are taken at a resolution
+of 2048x768. We chose c0 ray length 𝑡0 for the large images so that aliasing
+is barely apparent.
+
+In the 𝑙 = 4 examples, aliasing (insufficient angular resolution) and
+blurring (insufficient spatial resolution) appear consistently across
+the image; in 𝑡0 = 1.5, aliasing is the only error apparent while
+in 𝑡0 = 0.5 the same is true for blurring, and in 𝑡0 = 1 they are
+balanced. In contrast, for 𝑙 = 2, the error gradually changes from
+aliasing to blurring as the distance from the light increases; all three
+examples have blurring at the rightmost part of the image and even
+the 𝑡0 = 12 example has an overly-sharp penumbra right next to
+the occluder.
+Curiously, the optimal result for 𝑙 = 4 being 𝑡0 = 1.0 dis­
+agrees with our prediction that the correct term to optimize is
+min(Δ𝑠 , Δ𝜔 ); with 32 directions, the c0 ray length should be
+32 𝑠
+around 2𝜋
+Δ0 ≈ 5.09Δ𝑠0 to have Δ𝑠 = Δ𝜔 instead. We believe this
+is due to the aliasing from angular error being more noticeable than
+blurring; in our actual Split RC implementation, we usually have
+multiple rays per direction, which reduces the aliasing and makes
+a longer ray length be optimal.
+
+
