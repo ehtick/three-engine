@@ -22,10 +22,13 @@ import { loadGeometryAsset } from "../geometryAsset.js";
  */
 export class SkinnedMeshComponent extends Component {
   static type = "skinnedmesh";
-  // User-facing name intentionally matches ordinary geometry: both components
-  // represent the renderable mesh surface, while this implementation keeps
-  // skinning data inside the owning GLB.
-  static label = "Mesh";
+  // The label used to be plain "Mesh", to match ordinary geometry: both
+  // components represent the renderable mesh surface, and the Inspector only
+  // ever shows one of them at a time so the two never sat side by side.
+  // Anywhere the label is shown INSTEAD of the type — `component.types`, an
+  // agent reading the manifest — two different types answering to "Mesh" is
+  // simply ambiguous, and there is no context there to disambiguate them.
+  static label = "Skinned Mesh";
   // Import-only: visible as an inspector section, hidden from Add Component.
   static importOnly = true;
   static defaults = {

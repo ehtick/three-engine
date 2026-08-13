@@ -317,7 +317,10 @@ export function buildBvhWords(geometry, arity = 8, triSlotOf = null, strategy = 
   geom.setAttribute("position", new THREE.BufferAttribute(positions, 3));
   geom.setIndex(new THREE.BufferAttribute(index, 1));
   const bvh = new MeshBVH(geom, {
-    maxLeafTris: 8,
+    // `maxLeafTris` until three-mesh-bvh renamed it; the old spelling still
+    // works but logs a deprecation warning on EVERY scene load, which is the
+    // kind of console noise that trains people to ignore the console.
+    targetLeafSize: 8,
     indirect: false,
     ...(strategy != null ? { strategy } : null),
   });
