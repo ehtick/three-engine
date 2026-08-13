@@ -1,5 +1,6 @@
 // @ts-check
 import { Component } from "../Component.js";
+import { runActions } from "../../events/actions.js";
 
 /**
  * Makes an entity clickable — and, since a game has to be playable on a pad,
@@ -34,6 +35,19 @@ export class UiButtonComponent extends Component {
     navDown: "",
     navLeft: "",
     navRight: "",
+    // Inspector-authored responses, the way Unity's `Button.onClick` works —
+    // and in the same place, on the button itself, because "what does this
+    // button do" is a question you ask while looking at the button.
+    //
+    // Additive to the two mechanisms that were already here: scripts on this
+    // entity still get `onClick()` dispatched, and `ui-click` still fires on
+    // the engine. A button whose behaviour lives in a script does not have to
+    // move it here, and a menu with no scripts at all no longer needs one.
+    onClick: [],
+    onPointerEnter: [],
+    onPointerExit: [],
+    onFocus: [],
+    onBlur: [],
   };
   static schema = [
     { key: "interactable", label: "Interactable", type: "boolean" },
@@ -46,6 +60,14 @@ export class UiButtonComponent extends Component {
     { key: "navDown", label: "Nav Down", type: "entity" },
     { key: "navLeft", label: "Nav Left", type: "entity" },
     { key: "navRight", label: "Nav Right", type: "entity" },
+    // Rendered by the inspector's Actions sections rather than the generic
+    // field list, but declared here so the scene loader's entity-id remap finds
+    // the ids inside them — a duplicated menu must point at its own screens.
+    { key: "onClick", label: "On Click", type: "actions", hidden: true },
+    { key: "onPointerEnter", label: "On Pointer Enter", type: "actions", hidden: true },
+    { key: "onPointerExit", label: "On Pointer Exit", type: "actions", hidden: true },
+    { key: "onFocus", label: "On Focus", type: "actions", hidden: true },
+    { key: "onBlur", label: "On Blur", type: "actions", hidden: true },
   ];
 
   onAttach() {
@@ -80,6 +102,7 @@ export class UiButtonComponent extends Component {
     this.hovered = !!on;
     this.#applyTint();
     this.entity.getComponent("script")?.dispatch(on ? "onPointerEnter" : "onPointerExit");
+    this.#run(on ? "onPointerEnter" : "onPointerExit");
   }
 
   setPressed(on) {
@@ -93,6 +116,7 @@ export class UiButtonComponent extends Component {
     this.focused = !!on;
     this.#applyTint();
     this.entity.getComponent("script")?.dispatch(on ? "onFocus" : "onBlur");
+    this.#run(on ? "onFocus" : "onBlur");
   }
 
   /** Legacy setter, kept so existing scripts keep working. */
@@ -124,5 +148,23 @@ export class UiButtonComponent extends Component {
     if (this.props.interactable === false) return;
     this.entity.getComponent("script")?.dispatch("onClick");
     this.entity.engine.emit("ui-click", this.entity);
+    this.#run("onClick");
+  }
+
+  /**
+   * Runs one of the inspector-authored response lists.
+   *
+   * Gated on `engine.playing` for the same reason the binding component is:
+   * the editor drives hover and focus while a menu is merely being *looked* at
+   * in the viewport, and a response that loads a scene would take the author's
+   * work with it. Deliberately last in each handler, after the script dispatch
+   * and the global event, so the three mechanisms have a defined order.
+   */
+  #run(key) {
+    const actions = this.props[key];
+    if (!actions?.length) return;
+    const engine = this.entity?.engine;
+    if (!engine?.playing) return;
+    runActions(actions, { engine, self: this.entity, args: [], params: [] });
   }
 }

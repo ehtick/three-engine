@@ -9,6 +9,8 @@ import { getComponentClass } from "./components/registry.js";
 import { enableEngineModule } from "./modules.js";
 import { collectTimelineAssets } from "./timeline/timelineAsset.js";
 import { createId } from "../shared/ids.js";
+import { remapActions, remapBindings } from "./events/actions.js";
+import { remapGraph } from "./events/graph.js";
 
 /**
  * Runtime scene loading — the thing that turns a scene into a game.
@@ -419,6 +421,30 @@ function remapCollidingIds(engine, entities) {
             next[key] = mapped;
           }
           if (!next) continue;
+          if (props === comp.props) props = { ...props };
+          props[field.key] = next;
+          continue;
+        }
+        if (field?.type === "eventGraph") {
+          const value = props?.[field.key];
+          if (!value) continue;
+          const next = remapGraph(value, idMap);
+          if (next === value) continue;
+          if (props === comp.props) props = { ...props };
+          props[field.key] = next;
+          continue;
+        }
+        if (field?.type === "actions" || field?.type === "bindings") {
+          // Entity ids buried inside inspector-authored event wiring (a
+          // button's onClick list, an Events component's rows). Two levels
+          // down rather than one, and the failure is the loudest version of
+          // this bug: a duplicated menu whose buttons drive the FIRST copy's
+          // screens looks like the UI has simply stopped responding.
+          const value = props?.[field.key];
+          if (!Array.isArray(value)) continue;
+          const next =
+            field.type === "actions" ? remapActions(value, idMap) : remapBindings(value, idMap);
+          if (next === value) continue;
           if (props === comp.props) props = { ...props };
           props[field.key] = next;
           continue;

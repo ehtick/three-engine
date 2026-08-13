@@ -19,12 +19,14 @@
 import {
   Script,
   attribute,
+  listen,
   MeshComponent,
   CameraComponent,
   CharacterControllerComponent,
   TimelineComponent,
   AnimationComponent,
 } from "engine";
+import type { EventBinding, EventAction } from "engine";
 import * as THREE from "three/webgpu";
 
 // `EntityEventMap` is empty out of the box (ad-hoc, game-authored events) —
@@ -726,3 +728,71 @@ async function editorSurface() {
   Editor.log("done");
 }
 void editorSurface;
+
+// ---------------------------------------------------------------------------
+// 10. Events: `@listen` and `waitFor`.
+//
+// The catalog's whole payoff is that a project's own event names are checked at
+// both ends. Here the fixture registers two the way the generated
+// `project-events.d.ts` does, then uses them — so a regression in the decorator
+// overloads or the emitter generics fails `npm run check:types` rather than
+// showing up as autocomplete that quietly knows less.
+// ---------------------------------------------------------------------------
+declare module "engine" {
+  interface EngineEventMap {
+    "score-changed": [total: number];
+  }
+  interface EntityEventMap {
+    healed: [amount: number];
+  }
+}
+
+class EventScript extends Script {
+  // Payload types flow from the map into the handler's parameters.
+  @listen("score-changed")
+  onScore(total: number) {
+    void total.toFixed(0);
+  }
+
+  // A per-entity event, on the entity's own bus.
+  @listen("healed", { on: "entity" })
+  onHealed(amount: number) {
+    void amount;
+  }
+
+  // Input action names are open strings — the same accepted gap
+  // `input.onAction` already carries.
+  @listen("Jump", { on: "input" })
+  onJump() {}
+
+  async onStart() {
+    // Always an array, even for a one-argument event; null only when a timeout
+    // was asked for and elapsed.
+    const scored = await this.engine.waitFor("score-changed");
+    if (scored) {
+      const [total] = scored;
+      void total.toFixed(0);
+    }
+    const timed = await this.engine.waitFor("play-changed", { timeout: 2 });
+    void timed;
+    void (await this.entity.waitFor("healed"));
+
+    // The catalog handle.
+    void this.engine.events.has("score-changed");
+    void this.engine.events.list().map((d) => d.name);
+    void this.engine.listenerCount("score-changed");
+
+    // Wiring read from a script, typed.
+    const wired = this.entity.getComponent("events");
+    if (wired) {
+      const rows: EventBinding[] = wired.bindings;
+      void rows.map((row) => row.when.source);
+    }
+    const button = this.entity.getComponent("uibutton");
+    if (button) {
+      const responses: EventAction[] = button.onClick;
+      void responses.map((r) => r.type);
+    }
+  }
+}
+void EventScript;
