@@ -59,17 +59,20 @@ await new Promise((r) => setTimeout(r, 6000));
 // through a global rather than returning, because it is imported as a module.
 // ---------------------------------------------------------------------------
 const USER_SCRIPT = `
-import { Script, attribute, Vector3, Quaternion, MathUtils, Spherical, MeshComponent, LightComponent } from "engine";
+import { Script, attribute, autobind, math, Vector3, Quaternion, MathUtils, Spherical, MeshComponent, LightComponent } from "engine";
 import * as THREE from "three";
 import { InstancedMesh, MeshStandardNodeMaterial, BoxGeometry, AnimationMixer } from "three/webgpu";
 import { Fn, uniform, vec3 } from "three/tsl";
 
+@autobind
 export default class Turret extends Script {
   @attribute({ type: "number", default: 7, min: 0, max: 20 })
   rpm = 7;
 
   @attribute({ type: "vec3", default: [0, 1, 0] })
   muzzle: [number, number, number] = [0, 1, 0];
+
+  readRpm() { return this.rpm; }
 
   onStart() {
     globalThis.__SMOKE__ = {
@@ -80,6 +83,26 @@ export default class Turret extends Script {
         mathUtilsLerp: MathUtils.lerp(0, 10, 0.5),
         spherical: typeof new Spherical().setFromVector3 === "function",
       },
+      // engine.math — the gameplay math package. Reachable three ways, and
+      // all three must be the SAME object, or a value computed in a script
+      // and one computed in a component are computed by different code.
+      math: {
+        imported: typeof math,
+        clamp: math.clamp(5, 0, 1),
+        // A three Vector3 satisfies the {x, y, z} shape math is written
+        // against — this is the whole no-conversion claim, checked live.
+        movedTowards: (() => {
+          const v = new Vector3(0, 0, 0);
+          math.vec3.moveTowards(v, new Vector3(3, 4, 0), 2.5);
+          return v.length();
+        })(),
+        sameAsInjected: math === this.math,
+        injectedIsObject: typeof this.math === "object",
+        // The easing table behind engine.tween's "ease" option is this one.
+        easeCount: Object.keys(math.ease).length,
+      },
+      // Compared against the engine's own import out in the harness.
+      mathRef: math,
       // Component class tokens — same constructors the engine registers.
       components: {
         meshType: MeshComponent.type,
@@ -116,6 +139,13 @@ export default class Turret extends Script {
       probeCtorIsThreeNs: new Vector3() instanceof THREE.Vector3,
       attributes: Turret.attributes,
       rpm: this.rpm,
+      // @autobind — a method handed off as a bare callback, with no
+      // \`.bind(this)\` anywhere, and the identity stability that lets an
+      // off() undo its on().
+      autobind: (() => {
+        const detached = this.readRpm;
+        return { detachedValue: detached(), stableIdentity: this.readRpm === this.readRpm };
+      })(),
     };
   }
 }
@@ -124,7 +154,7 @@ export default class Turret extends Script {
 const out = await page.evaluate(async (source) => {
   const { transpileScript } = await import("/src/editor/assetLoader.js");
   const { linkEngineImports, resolveRuntimeUrls } = await import("/src/engine/scriptRuntime.js");
-  const { THREE } = await import("/src/engine/index.js");
+  const { THREE, math } = await import("/src/engine/index.js");
 
   const urls = await resolveRuntimeUrls();
   const linked = await linkEngineImports(await transpileScript(source));
@@ -147,8 +177,13 @@ const out = await page.evaluate(async (source) => {
 
   if (importError) return { importError, leftovers, urls };
 
-  // Run the lifecycle hook the way ScriptComponent would.
+  // Run the lifecycle hook the way ScriptComponent would, including the
+  // context injection — the two properties that can be supplied here without
+  // booting a renderer are THREE and math, and both come from the engine's own
+  // module, which is what makes the identity checks below mean something.
   const instance = new mod.default();
+  instance.THREE = THREE;
+  instance.math = math;
   instance.onStart();
   const smoke = globalThis.__SMOKE__;
 
@@ -159,6 +194,9 @@ const out = await page.evaluate(async (source) => {
     // Identity has to be judged out here, against the engine's own import.
     identity: {
       vectorIsEngineVector: smoke.probeVector instanceof THREE.Vector3,
+      // One math package: the script's import and the engine's own must be
+      // the same object, or a component and a script compute differently.
+      mathIsEngineMath: smoke.mathRef === math,
       lengthAcrossBoundary: smoke.probeVector.length(),
       probeCtorIsThreeNs: smoke.probeCtorIsThreeNs,
       engineNsExportNames: Object.keys(THREE),
@@ -195,10 +233,27 @@ check("Quaternion has invert() (not the phantom inverse())", out.engineMath.quat
 check("MathUtils.lerp works", out.engineMath.mathUtilsLerp === 5);
 check("Spherical is exported (new to the engine surface)", out.engineMath.spherical === true);
 
+// --- engine.math ------------------------------------------------------------
+check('math is importable from "engine"', out.math.imported === "object", `typeof = ${out.math.imported}`);
+check("math.clamp works", out.math.clamp === 1);
+check("math.vec3 operates on a real three Vector3 with no conversion", out.math.movedTowards === 2.5, `length = ${out.math.movedTowards}`);
+check("the imported math IS the engine's own math", out.identity.mathIsEngineMath === true);
+check("the imported math IS this.math", out.math.sameAsInjected === true);
+check("this.math is injected on the script instance", out.math.injectedIsObject === true);
+check("math.ease carries the whole easing table", out.math.easeCount === 31, `${out.math.easeCount} curves`);
+
 // --- component class tokens on "engine" -------------------------------------
 check('MeshComponent.type is "mesh"', out.components.meshType === "mesh", `type=${out.components.meshType}`);
 check('LightComponent.type is "light"', out.components.lightType === "light", `type=${out.components.lightType}`);
 check("MeshComponent is the real class", out.components.meshIsFunction === true);
+
+// --- @autobind --------------------------------------------------------------
+check(
+  "@autobind keeps `this` on a method passed as a bare callback",
+  out.autobind?.detachedValue === 7,
+  `readRpm() returned ${JSON.stringify(out.autobind?.detachedValue)}`,
+);
+check("@autobind gives a bound method stable identity", out.autobind?.stableIdentity === true);
 
 // --- the three surface ------------------------------------------------------
 for (const [name, key] of [

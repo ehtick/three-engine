@@ -198,7 +198,7 @@ declare module "engine" {
      *     const health = this.entity.getScript<Health>("Health");
      *     health?.damage(10);
      */
-    getScript<T = Script>(name: string): T | null;
+    getScript<K extends keyof ScriptMap>(name: K): ScriptMap[K] | null;
 
     /**
      * Calls `hook` on every script attached to this entity, returning true if
@@ -206,8 +206,12 @@ declare module "engine" {
      * is attached:
      *
      *     this.entity.dispatch("onDamaged", amount);
+     *
+     * Closed over {@link ScriptHookMap}, so the hook name is checked and its
+     * arguments are arity-checked against whichever of your scripts declares
+     * the method.
      */
-    dispatch(hook: string, ...args: unknown[]): boolean;
+    dispatch<K extends keyof ScriptHookMap>(hook: K, ...args: ScriptHookMap[K]): boolean;
 
     /**
      * True when this entity survives `engine.loadScene` — game managers, the
@@ -650,15 +654,24 @@ declare module "engine" {
    * one frame of a red line at 120fps is not something a human can see.
    */
   /** Easing curve names accepted by `engine.tween`. */
+  /**
+   * Every curve in the engine's easing table. The same names index
+   * {@link MathAPI.ease}, which is the same table — see `math/easing.js`.
+   *
+   * `back*` and `elastic*` deliberately overshoot past 0 and 1 on the way.
+   */
   export type EasingName =
     | "linear"
     | "quadIn" | "quadOut" | "quadInOut"
     | "cubicIn" | "cubicOut" | "cubicInOut"
     | "quartIn" | "quartOut" | "quartInOut"
+    | "quintIn" | "quintOut" | "quintInOut"
     | "sineIn" | "sineOut" | "sineInOut"
     | "expoIn" | "expoOut" | "expoInOut"
+    | "circIn" | "circOut" | "circInOut"
     | "backIn" | "backOut" | "backInOut"
-    | "elasticOut" | "bounceOut";
+    | "elasticIn" | "elasticOut" | "elasticInOut"
+    | "bounceIn" | "bounceOut" | "bounceInOut";
 
   export interface TweenOptions {
     /** Seconds. Default 0.25. */
@@ -1198,6 +1211,235 @@ declare module "engine" {
     readonly stats: { groups: number; culled: number; switches: number };
   }
 
+  /**
+   * One sample of `engine.stats`. Every field is the value for the moment it
+   * was read; nothing here is cumulative-since-startup.
+   */
+  export interface PerfReadout {
+    /**
+     * Frames the renderer actually PRESENTED in the last second, counted.
+     *
+     * Not an average of instantaneous `1000 / dt` rates (that overstates any
+     * uneven frame rate, badly), and not a count of engine ticks: a tick that
+     * ran the update phase and then skipped the draw — a GI compile wave, a
+     * renderer resize — is counted in `skippedFps` instead. Zero with a
+     * non-zero `skippedFps` means the loop is alive and the canvas is frozen;
+     * zero with a zero `skippedFps` means the loop is stopped.
+     */
+    readonly fps: number;
+    /** Ticks per second that ran but drew nothing. See `fps`. */
+    readonly skippedFps: number;
+    /** Wall time between successive update ticks, in ms. Not a frame rate. */
+    readonly frameMs: number;
+    /**
+     * Main-thread ms spent executing one engine frame, smoothed. Excludes time
+     * yielded to a frame-rate cap, so it stays an honest load signal even
+     * while the editor is deliberately pacing the viewport down.
+     */
+    readonly workMs: number;
+    /** `frameMs` as a percentage of a 16.67 ms budget, clamped to 0–100. */
+    readonly cpuLoadPct: number;
+    /** CPU ms spent submitting the frame's draws. Not hardware GPU time. */
+    readonly renderMs: number;
+    /**
+     * Real on-GPU frame time in ms from WebGPU timestamp queries, a frame or
+     * two stale. `0` when the adapter lacks the feature — fall back to
+     * `renderMs` then, as the overlay does.
+     */
+    readonly gpuMs: number;
+    /** `gpuMs` (or `renderMs`) over the same 16.67 ms budget, clamped 0–100. */
+    readonly gpuLoadPct: number;
+    /** Canvas resolution multiplier: manual render scale × dynamic resolution. */
+    readonly renderScale: number;
+    /** JS heap bytes. Chromium-only; `null` on hosts that don't expose it. */
+    readonly jsHeapBytes: number | null;
+    /** Draw calls in the last frame. */
+    readonly drawCalls: number;
+    /** Triangles in the last frame. */
+    readonly triangles: number;
+    /** Bytes across every texture three is tracking. Undercounts render targets. */
+    readonly textureMem: number;
+  }
+
+  /**
+   * `engine.stats` — live performance counters, always on, in Play and in Edit
+   * Mode. Nothing to enable, and a built game that never reads it pays only
+   * for the counting.
+   *
+   *     // one number, freshly counted
+   *     if (this.engine.stats.fps < 30) this.reduceDetail();
+   *
+   *     // everything at once, consistent with each other
+   *     const s = this.engine.stats.sample();
+   *     this.hud.set(`${s.fps} fps · ${s.drawCalls} draws · ${s.triangles} tris`);
+   */
+  export interface PerfStats {
+    /** Frames presented in the last second, recounted on every read. */
+    readonly fps: number;
+    /** Ticks per second that ran but drew nothing. */
+    readonly skippedFps: number;
+    /**
+     * Recount the frame window against the clock and return the whole
+     * readout. Prefer this to `readout` when you want more than one number:
+     * `readout` is only as fresh as the last engine tick, which is stale
+     * precisely when the loop has stopped or stalled.
+     */
+    sample(): PerfReadout;
+    /**
+     * The counters as of the last engine tick, mutated in place every frame.
+     * Clone before storing — the object identity never changes.
+     */
+    readonly readout: PerfReadout;
+  }
+
+  /**
+   * The scheduling half of {@link TimeSystem}, shared by `engine.time` and the
+   * per-script `this.time`.
+   *
+   * Every method comes in two forms. The **callback** form returns an integer
+   * handle and allocates nothing — that is the one to use for the thousands of
+   * cooldowns and fuses a real game runs. The **awaitable** form returns a
+   * promise and is for coroutine-shaped code.
+   *
+   *     // callback: no allocation
+   *     const id = this.time.after(1.5, () => this.entity.destroy());
+   *     this.time.cancel(id);
+   *
+   *     // awaitable: reads like a script
+   *     await this.time.delay(0.4);
+   *     await this.time.frames(2);
+   */
+  export interface TimerAPI {
+    /**
+     * Runs `fn` once after `seconds` of game time. Returns a handle for
+     * `cancel`. Pauses with the game and slows with `timeScale`.
+     *
+     * `fn` receives the **overshoot** — how far past its due moment the frame
+     * actually landed, in seconds. Use it to advance whatever you spawn by
+     * that much so fast-moving things do not appear a frame behind:
+     *
+     *     this.time.after(0.2, (late) => {
+     *       const shot = this.spawnBullet();
+     *       shot.position.addScaledVector(shot.velocity, late);
+     *     });
+     */
+    after(seconds: number, fn: (overshoot: number) => void): number;
+    /** Runs `fn` every `seconds` of game time until cancelled. */
+    every(seconds: number, fn: (overshoot: number) => void): number;
+    /** `after` on the unscaled clock — ignores pause and `timeScale`. */
+    afterReal(seconds: number, fn: (overshoot: number) => void): number;
+    /** `every` on the unscaled clock. */
+    everyReal(seconds: number, fn: (overshoot: number) => void): number;
+    /**
+     * Runs `fn` after `frames` rendered frames — not after a duration. The
+     * right tool for "let this settle", since one frame is one pass of the
+     * update order whatever the display's refresh rate. Clamped to a minimum
+     * of 1: zero would fire inside the update that scheduled it.
+     */
+    afterFrames(frames: number, fn: () => void): number;
+    /** Runs `fn` every `frames` frames until cancelled. */
+    everyFrames(frames: number, fn: () => void): number;
+
+    /**
+     * Waits `seconds` of game time. Resolves `true` when the time elapsed and
+     * `false` if the timer was cancelled — including by the owning script being
+     * torn down mid-wait, which is the case worth handling:
+     *
+     *     if (!(await this.time.delay(2))) return;   // we no longer exist
+     */
+    delay(seconds: number): Promise<boolean>;
+    /** `delay` on the unscaled clock: keeps counting while the game is paused. */
+    realDelay(seconds: number): Promise<boolean>;
+    /** Waits a whole number of frames. */
+    frames(count?: number): Promise<boolean>;
+    /** Waits until the next frame's update. */
+    nextFrame(): Promise<boolean>;
+
+    /** True while `id` names a timer that has not fired or been cancelled. */
+    isActive(id: number): boolean;
+    /**
+     * Cancels a timer. Returns false for an id that already fired or was
+     * already cancelled — both ordinary, so neither throws. A handle kept past
+     * its timer's death can never cancel a later timer that reused its slot.
+     */
+    cancel(id: number): boolean;
+    /** Timers scheduled and not yet fired or cancelled. */
+    readonly pending: number;
+  }
+
+  /**
+   * `this.time` inside a script — a {@link TimerAPI} whose timers are all owned
+   * by that script instance and cancelled when it is destroyed, disabled or
+   * hot-reloaded.
+   *
+   * This is the default a script gets, and the reason is worth stating: timer
+   * callbacks capture `this`, and entities die while their timers are in
+   * flight. A script scheduling on `this.engine.time` instead would keep
+   * running callbacks against a destroyed entity. Use `this.engine.time`
+   * deliberately, for a timer that is *meant* to outlive the entity.
+   */
+  export interface TimerScope extends TimerAPI {
+    /** Seconds the last frame took, scaled and zero while paused. */
+    readonly delta: number;
+    /** Seconds the last frame really took — ignores pause and `timeScale`. */
+    readonly unscaledDelta: number;
+    /** Game seconds since startup. What `after`/`delay` measure against. */
+    readonly elapsed: number;
+    /** Real seconds since startup — advances while the game is paused. */
+    readonly unscaledElapsed: number;
+    /** Frames since startup. What `afterFrames` measures against. */
+    readonly frame: number;
+    /** Time multiplier: 0.25 for bullet time, 2 to fast-forward. */
+    scale: number;
+    /** Whether game time is frozen. Real time and frames keep running. */
+    paused: boolean;
+    /** Cancels every timer this scope created; pending awaits resolve `false`. */
+    cancelAll(): number;
+  }
+
+  /**
+   * `engine.time` — the frame's clocks and the scheduler that runs on them, in
+   * one place, because "how long was this frame" and "run this in three
+   * seconds" are the same subject.
+   *
+   *     if (this.engine.time.paused) return;
+   *     this.cooldown -= this.engine.time.delta;
+   *     this.engine.time.after(3, () => this.respawn());
+   *
+   * Scheduling is O(log n) and an idle frame costs the same with ten thousand
+   * pending timers as with none — the two time clocks are 4-ary heaps in typed
+   * arrays and frame waits use a 256-bucket timing wheel. Nothing is allocated
+   * per timer.
+   */
+  export interface TimeSystem extends TimerAPI {
+    /** Seconds the last frame took, scaled by `scale` and zero while paused. */
+    readonly delta: number;
+    /**
+     * Seconds the last frame really took. Unaffected by pause or `scale` —
+     * what a pause menu's own animation must use, or it freezes itself.
+     */
+    readonly unscaledDelta: number;
+    /** Game seconds since startup. Same value as `engine.elapsedTime`. */
+    readonly elapsed: number;
+    /** Real seconds since startup — keeps advancing while paused. */
+    readonly unscaledElapsed: number;
+    /** Frames since startup. */
+    readonly frame: number;
+    /** Time multiplier. Reads and writes `engine.timeScale`. */
+    scale: number;
+    /** Whether game time is frozen. Reads and writes `engine.paused`. */
+    paused: boolean;
+    /**
+     * A view whose timers all belong to `owner`, cancellable as a group.
+     * Scripts already get one as `this.time`.
+     */
+    scope(owner: object): TimerScope;
+    /** Cancels every timer created through `scope(owner)`. */
+    cancelOwner(owner: object): number;
+    /** Cancels everything. Runs automatically on Stop and on teardown. */
+    clear(): void;
+  }
+
   /** `engine.cameraImpulse` — camera shake, decoupled from which camera is live. */
   export interface ImpulseSystem {
     /**
@@ -1536,7 +1778,60 @@ declare module "engine" {
     navDown: string;
     navLeft: string;
     navRight: string;
+    /**
+     * Inspector-authored responses, Unity's `Button.onClick`. Additive to the
+     * `onClick()` hook dispatched to this entity's scripts and to the global
+     * `"ui-click"` event — all three fire, in that order.
+     */
+    onClick: EventAction[];
+    onPointerEnter: EventAction[];
+    onPointerExit: EventAction[];
+    onFocus: EventAction[];
+    onBlur: EventAction[];
   }> {}
+
+  /**
+   * Wires events to behaviour with no script: rows of "when this happens, do
+   * these things". Godot's Signals dock and Unity's UnityEvent list in one
+   * component. See {@link EventBinding}.
+   */
+  export interface EventBindingComponent extends ComponentBase<{
+    bindings: EventBinding[];
+    /**
+     * The node graph, for wiring a row list cannot express — a condition, a
+     * value passed from one action to the next, several triggers sharing one
+     * chain. Edited in the Event Graph panel.
+     *
+     * A SECOND, independent piece of wiring, not another view of `bindings`:
+     * both run, and converting a graph with a branch into rows would be lossy.
+     */
+    graph: EventGraph | null;
+  }> {}
+
+  /** One node in an event graph. `props` holds that node type's own fields. */
+  export interface EventGraphNode {
+    id: string;
+    /** `on-*` trigger, `do-*` action, or a flow/value node. */
+    type: string;
+    props?: Record<string, any>;
+    position?: { x: number; y: number };
+  }
+
+  /**
+   * One wire. Handles are socket keys; a wire between `"event"`-typed sockets
+   * carries CONTROL (what runs next) and any other type carries a VALUE.
+   */
+  export interface EventGraphEdge {
+    source: string;
+    sourceHandle: string;
+    target: string;
+    targetHandle: string;
+  }
+
+  export interface EventGraph {
+    nodes: EventGraphNode[];
+    edges: EventGraphEdge[];
+  }
 
   /** Flex-style layout container for direct UI children. */
   export interface UiLayoutComponent extends ComponentBase<{
@@ -1642,6 +1937,7 @@ declare module "engine" {
     uiimage: UiImageComponent;
     uitext: UiTextComponent;
     uibutton: UiButtonComponent;
+    events: EventBindingComponent;
     uilayout: UiLayoutComponent;
     uiscroll: UiScrollComponent;
     uimask: UiMaskComponent;
@@ -1709,6 +2005,7 @@ declare module "engine" {
   export const UiImageComponent: ComponentClass<"uiimage">;
   export const UiTextComponent: ComponentClass<"uitext">;
   export const UiButtonComponent: ComponentClass<"uibutton">;
+  export const EventBindingComponent: ComponentClass<"events">;
   export const UiLayoutComponent: ComponentClass<"uilayout">;
   export const UiScrollComponent: ComponentClass<"uiscroll">;
   export const UiMaskComponent: ComponentClass<"uimask">;
@@ -1755,9 +2052,9 @@ declare module "engine" {
     /** First instance. Prefer `getScript` when several are attached. */
     readonly instance: Script | null;
     /** By class name, file stem, or full asset path; null when absent. */
-    getScript<T = Script>(name: string): T | null;
+    getScript<K extends keyof ScriptMap>(name: K): ScriptMap[K] | null;
     /** Calls `hook` on every running script that defines it. */
-    dispatch(hook: string, ...args: unknown[]): boolean;
+    dispatch<K extends keyof ScriptHookMap>(hook: K, ...args: ScriptHookMap[K]): boolean;
     /** `@attribute` descriptors declared by the script at `index`. */
     getAttributeDefs(index?: number): Record<string, AttributeOptions>;
   }
@@ -1962,6 +2259,25 @@ declare module "engine" {
     callFirst<K extends keyof EventMap, R = unknown>(event: K, ...args: EventMap[K]): R | undefined;
     callFirstAsync<K extends keyof EventMap, R = unknown>(event: K, ...args: EventMap[K]): Promise<R | undefined>;
     clear(event?: keyof EventMap): void;
+    /** How many listeners `event` currently has. `0` means an emit goes nowhere. */
+    listenerCount(event: keyof EventMap): number;
+    /**
+     * Waits for the next `event`, resolving with its arguments as an array —
+     * Godot's `await some_signal`, which `once` could not express because it
+     * hands back an unsubscribe rather than a promise.
+     *
+     *     const [cause] = await this.engine.waitFor("player-died");
+     *     await this.engine.waitFor("scene-loaded");
+     *
+     * Always an array, even for a single-argument event. `timeout` is in
+     * SECONDS and resolves `null` instead of rejecting, so a timed wait needs
+     * no try/catch — and it is wall-clock, not game time, so pausing does not
+     * extend it.
+     */
+    waitFor<K extends keyof EventMap>(
+      event: K,
+      opts?: { timeout?: number },
+    ): Promise<EventMap[K] | null>;
   }
 
   /**
@@ -2000,6 +2316,80 @@ declare module "engine" {
    * multi-listener pub-sub — see the note on `Entity` in Entity.js.
    */
   export interface EntityEventMap {}
+
+  /**
+   * Your project's script classes, by class name — what `getScript` resolves.
+   *
+   * Generated into `<project>/project-scripts.d.ts` from the project's own
+   * script files, so `this.entity.getScript("Health")` returns your real
+   * `Health` class with all of its methods, and a misspelled name is a compile
+   * error rather than a `null` at runtime.
+   *
+   * Ships EMPTY here: the engine repo cannot know a game's class names. If a
+   * script is missing from the generated file (its class shape wasn't
+   * recognised), merge it in by hand the same way a module registers a
+   * component:
+   *
+   *     declare module "engine" {
+   *       interface ScriptMap { Health: import("./scripts/Health").default; }
+   *     }
+   */
+  export interface ScriptMap {}
+
+  /**
+   * The argument tuple of one method on one script class, or `any[]` when the
+   * class has no such method.
+   *
+   * This is how `dispatch` gets REAL parameter types rather than `any`. Writing
+   * them out textually in the generated file cannot work — a script's
+   * annotations name types from its own module scope (`amount: DamageInfo`,
+   * imported from a sibling file), and those do not resolve from a declaration
+   * file at the project root. Asking TypeScript to read them off the class
+   * instead sidesteps the whole problem: the class is referenced by
+   * `import("./scripts/Health").default`, so every type in its signature is
+   * resolved in the module that declared it.
+   *
+   * The conditional degrades to `any[]` rather than erroring, because the
+   * generated file is written from a regex parse of the source: if the parser
+   * saw a method TypeScript does not agree exists, the wrong outcome is a
+   * broken declaration file, not a loose signature.
+   */
+  export type ScriptHookArgs<T, K extends PropertyKey> = K extends keyof T
+    ? T[K] extends (...args: infer A) => any
+      ? A
+      : any[]
+    : any[];
+
+  /**
+   * Hook names `dispatch` can send, and the arguments each takes.
+   *
+   * The engine's own hooks are declared below; your scripts' methods are added
+   * by the generated `<project>/project-scripts.d.ts`. Argument types are
+   * deliberately `any` — a script's TypeScript annotations name types from its
+   * own module scope, which would not resolve from the generated file — but the
+   * NAMES and the ARITY are real, so `dispatch("onDamaged")` with a missing
+   * argument is an error and autocomplete shows the parameter's label.
+   *
+   * A hook two scripts declare with different shapes falls back to `any[]`:
+   * there is no honest single signature, and asserting one script's over the
+   * other's would type-check a call that breaks the second one.
+   */
+  export interface ScriptHookMap {
+    /** Physics: another collider started touching this entity's. */
+    onCollisionEnter: [other: Entity];
+    onCollisionExit: [other: Entity];
+    /** Physics: a trigger volume was entered or left. */
+    onTriggerEnter: [other: Entity];
+    onTriggerExit: [other: Entity];
+    /** UI: this entity's button was clicked / hovered / focused. */
+    onClick: [];
+    onPointerEnter: [];
+    onPointerExit: [];
+    onFocus: [];
+    onBlur: [];
+    /** A prefab instance finished expanding into the scene. */
+    onLoad: [];
+  }
 
   export interface InputManager extends TypedEmitter<InputEventMap> {
     /** Currently active device group ("KeyboardMouse" | "Gamepad" | "Touch"). */
@@ -2246,6 +2636,8 @@ declare module "engine" {
     "path-completed": [event: { entityId: string }];
     /** `entity.addTag`/`removeTag`/`setTags` changed the entity's tag list. */
     "entity-tags-changed": [event: { entityId: string }];
+    /** The project's event catalog was replaced (Events panel saved, or boot). */
+    "events-changed": [events: EventDefinition[]];
   }
 
   /**
@@ -2319,6 +2711,22 @@ declare module "engine" {
     config: EngineConfig;
     settings: SceneSettings;
     input: InputManager;
+    /**
+     * Gameplay math — clamping, angle blending, frame-rate-independent
+     * smoothing, seeded randomness, noise, ray tests, aiming. Stateless and
+     * shared; the same object as `import { math } from "engine"`.
+     * See {@link MathAPI}.
+     */
+    math: MathAPI;
+    /**
+     * Clocks and timers in one namespace. `engine.time.delta` is the same
+     * number as `engine.deltaTime`; `engine.time.after(3, fn)` is the
+     * scheduler that runs on it. See {@link TimeSystem}.
+     *
+     * Inside a script prefer `this.time`, which is the same API scoped to that
+     * script so its timers die with it.
+     */
+    readonly time: TimeSystem;
     physics?: PhysicsHandle;
     /** Camera shake. Lives on the engine so a rumble survives a shot change. */
     cameraImpulse: ImpulseSystem;
@@ -2357,10 +2765,14 @@ declare module "engine" {
     /** Caps editor/game frame rate; `0` (default) removes the cap. Never applies during Play. */
     setFrameRateLimit(fps?: number): void;
     /**
-     * Rolling perf counters an overlay reads at ~10 Hz. Debug/tuning data —
-     * built games can ignore it entirely.
+     * Live performance counters — the same numbers the viewport's Stats
+     * overlay shows, readable from any script, in Play and in Edit Mode alike.
+     *
+     *     // in an @executeInEditMode script's onEditorUpdate:
+     *     const s = this.engine.stats.sample();
+     *     console.log(`${s.fps} fps, ${s.drawCalls} draws, ${s.gpuMs.toFixed(1)} ms GPU`);
      */
-    readonly stats: { readonly readout: Record<string, number> };
+    readonly stats: PerfStats;
     /** Spatial-audio system. `listenerEntity` is the entity currently supplying the listener pose (`null` falls back to the active camera). */
     readonly audio: { readonly listenerEntity: Entity | null };
     getEntity(id: string): Entity | null;
@@ -2485,6 +2897,156 @@ declare module "engine" {
      *     const volume = this.engine.prefs.get("volume", 1);
      */
     prefs: KeyValueHandle;
+
+    /**
+     * This project's own declared events — the catalog the Events panel
+     * authors. See {@link EventCatalogHandle}.
+     *
+     * Not a bus. Events are still fired and listened to on `engine`, on an
+     * `Entity`, or on a `Component`; this is where you ask what a project
+     * declares and what has been firing lately.
+     */
+    readonly events: EventCatalogHandle;
+
+    /**
+     * Replaces the project's event catalog with the `events` block from
+     * project.json (or a build's config), and emits `"events-changed"`.
+     *
+     * Editor/boot plumbing rather than gameplay API — the shape mirrors
+     * `applyInput`. Returns the validation errors so a caller with somewhere to
+     * show them can; boot just logs.
+     */
+    applyEvents(events: unknown): string[];
+  }
+
+  /** One parameter of a project-declared event. */
+  export interface EventParamDefinition {
+    name: string;
+    type: "number" | "string" | "boolean" | "vec3" | "color" | "entity" | "asset" | "any";
+    optional?: boolean;
+    description?: string;
+  }
+
+  /**
+   * One entry in the project's event catalog. The editor writes these into
+   * `project.json`, and generates `project-events.d.ts` from them so the name
+   * and payload are type-checked wherever the event is used.
+   */
+  export interface EventDefinition {
+    name: string;
+    /** `"global"` fires on `engine`, `"entity"` on a single entity. */
+    scope: "global" | "entity";
+    params: EventParamDefinition[];
+    description?: string;
+    /** Free-text grouping, used only to organise the Events panel. */
+    category?: string;
+  }
+
+  /** One recorded emission, as the Events panel's monitor shows it. */
+  export interface EventEmission {
+    /** Monotonic counter — two emissions in the same millisecond still order. */
+    seq: number;
+    /** `performance.now()` at the moment of the emit. */
+    t: number;
+    name: string;
+    /** Which bus it came from: `"engine"`, an entity name, `"Player.script"`, … */
+    source: string;
+    /** How many listeners it reached. `0` is the interesting case. */
+    listeners: number;
+    /** Arguments, flattened to primitives/short labels — NOT the live objects. */
+    args: unknown[];
+    /** False for an event the project's catalog doesn't declare. */
+    declared: boolean;
+  }
+
+  /**
+   * One inspector-authored response — the thing a wired-up event DOES.
+   *
+   * Scripts rarely build these by hand (the inspector does), but a script that
+   * wants to add a response at runtime, or read what a button is wired to, gets
+   * the shape from here. `type` names an entry in the engine's action table;
+   * the rest of the keys depend on which one.
+   *
+   * Any string field may hold a token instead of a literal: `"$0"` is the
+   * triggering event's first argument, `"$cause"` the argument named `cause` in
+   * the event's catalog entry, `"$self"` the entity the binding is on.
+   */
+  export interface EventAction {
+    id?: string;
+    type:
+      | "emit"
+      | "call"
+      | "setProp"
+      | "setActive"
+      | "playSound"
+      | "playAnimation"
+      | "playTimeline"
+      | "spawn"
+      | "destroy"
+      | "loadScene"
+      | "setSave"
+      | "log";
+    enabled?: boolean;
+    /** Seconds to wait first. On game time, so a pause pauses it. */
+    delay?: number;
+    [key: string]: any;
+  }
+
+  /** What makes a binding fire. */
+  export interface EventBindingTrigger {
+    source: "engine" | "entity" | "component" | "input" | "lifecycle";
+    /** Event name, for the `engine`, `entity` and `component` sources. */
+    event?: string;
+    /** Entity id, for the `entity` source. Empty means this entity. */
+    target?: string;
+    /** Component type, for the `component` source. */
+    component?: string;
+    /** Input action name, for the `input` source. */
+    action?: string;
+    edge?: "pressed" | "released";
+    phase?: "start" | "stop" | "destroy";
+  }
+
+  /** One row of an `EventBindingComponent`: when this happens, do these. */
+  export interface EventBinding {
+    id?: string;
+    enabled?: boolean;
+    /** Fire only the first time, per Play session. */
+    once?: boolean;
+    /** Run on the next frame rather than inside the emit. */
+    deferred?: boolean;
+    when: EventBindingTrigger;
+    do: EventAction[];
+  }
+
+  /**
+   * `engine.events` — query the project's event catalog, and tap what's firing.
+   *
+   *     if (this.engine.events.has("player-died")) { ... }
+   *     for (const def of this.engine.events.list()) console.log(def.name);
+   */
+  export interface EventCatalogHandle {
+    /** Every declared event, in catalog order. */
+    list(): EventDefinition[];
+    /** One event's definition, or null when the project doesn't declare it. */
+    get(name: string): EventDefinition | null;
+    /** Whether the project declares `name`. */
+    has(name: string): boolean;
+    /**
+     * Starts (or stops) recording every emission on every bus — engine,
+     * entities, components and input alike.
+     *
+     * A debugging aid, not something to ship enabled: the tap sits inside
+     * `emit`, the hottest path an event system has. The Events panel arms it
+     * while it is open and disarms it on close.
+     */
+    record(on?: boolean, opts?: { limit?: number }): void;
+    /** Whether recording is currently armed. */
+    readonly recording: boolean;
+    /** Recorded emissions, oldest first. */
+    history(): EventEmission[];
+    /** Drops everything recorded so far. */
+    clearHistory(): void;
   }
 
   /** A small persisted key/value bag (`engine.prefs`, `engine.saves.state`). */
@@ -2866,11 +3428,798 @@ declare module "engine" {
   export function attribute(options?: AttributeOptions): PropertyDecorator;
 
   /**
+   * What the called form `@autobind()` hands back: the same decorator, usable
+   * on a class or on a single method.
+   */
+  export interface AutobindDecorator {
+    <T extends Function>(target: T): T;
+    <T>(
+      target: object,
+      key: string | symbol,
+      descriptor: TypedPropertyDescriptor<T>,
+    ): TypedPropertyDescriptor<T>;
+  }
+
+  /**
+   * Binds a script's methods to their instance, so passing one as a callback
+   * keeps `this` without `.bind(this)` at the call site:
+   *
+   *     @autobind
+   *     export default class FpsCounter extends Script {
+   *       text: UiTextComponent | null = null;
+   *
+   *       onStart() {
+   *         this.text = this.entity.getComponent(UiTextComponent);
+   *         this.engine.time.every(0.25, this.updateFps);   // no .bind(this)
+   *       }
+   *
+   *       updateFps() { this.text!.text = `FPS: ${this.engine.stats.fps}`; }
+   *     }
+   *
+   * On the class it covers every method the class itself declares; on a single
+   * method it covers just that one:
+   *
+   *     class Turret extends Script {
+   *       @autobind onHit(other: Entity) {}
+   *     }
+   *
+   * Binding happens once per instance, on first read, and the bound function
+   * is then cached as an own property — so `this.onHit === this.onHit` holds
+   * and an `off(this.onHit)` actually removes the handler `on(this.onHit)`
+   * added. (`.bind()` returns a fresh function every call, which is why the
+   * manual version silently fails to unsubscribe.)
+   *
+   * Covers the decorated class's own prototype methods. Getters/setters are
+   * left alone, and a class FIELD needs no decorator — `onHit = () => {}` is
+   * already bound to the instance by the language.
+   */
+  export function autobind(): AutobindDecorator;
+  export function autobind<T extends Function>(target: T): T;
+  export function autobind<T>(
+    target: object,
+    key: string | symbol,
+    descriptor: TypedPropertyDescriptor<T>,
+  ): TypedPropertyDescriptor<T>;
+
+  /**
+   * `@listen` — subscribes a script method for exactly as long as the script
+   * runs, and unsubscribes it when the script stops.
+   *
+   *     export default class Hud extends Script {
+   *       @listen("score-changed")
+   *       onScore(total: number) { this.label.text = `${total}`; }
+   *
+   *       @listen("damaged", { on: "entity" })
+   *       onDamaged(amount: number) { ... }
+   *
+   *       @listen("Jump", { on: "input" })
+   *       onJump() { ... }
+   *     }
+   *
+   * The name is checked against the map for whichever bus `on` selects, and
+   * the method's parameters are checked against that event's payload — so a
+   * typo is a compile error rather than a handler that quietly never fires.
+   * Project events reach these maps through the generated
+   * `project-events.d.ts`; see the Events panel.
+   *
+   * There is deliberately nothing to unsubscribe. Unity pairs a `+=` in
+   * `OnEnable` with a `-=` in `OnDisable` and Godot pairs `connect` with
+   * `disconnect`; in both, a missed second half keeps a dead object alive and
+   * still reacting, which is the most common leak either engine ships. Applies
+   * across hot reload too: the previous instance's handlers are dropped and the
+   * new one's attached.
+   *
+   * Goes on a METHOD. A field holding an arrow function is already
+   * instance-bound and has nowhere to hang the declaration.
+   */
+  export function listen<K extends keyof EngineEventMap>(
+    event: K,
+    options?: { on?: "engine"; once?: boolean },
+  ): <T extends (...args: EngineEventMap[K]) => any>(
+    target: object,
+    key: string | symbol,
+    descriptor: TypedPropertyDescriptor<T>,
+  ) => TypedPropertyDescriptor<T>;
+  export function listen<K extends keyof EntityEventMap>(
+    event: K,
+    options: { on: "entity"; once?: boolean },
+  ): <T extends (...args: EntityEventMap[K]) => any>(
+    target: object,
+    key: string | symbol,
+    descriptor: TypedPropertyDescriptor<T>,
+  ) => TypedPropertyDescriptor<T>;
+  /** Input actions are named per project in the Input panel, so the name is an
+   *  open string here — the same accepted gap `input.onAction` already has. */
+  export function listen(
+    event: string,
+    options: { on: "input"; edge?: "pressed" | "released" },
+  ): <T extends (value?: ActionValue) => any>(
+    target: object,
+    key: string | symbol,
+    descriptor: TypedPropertyDescriptor<T>,
+  ) => TypedPropertyDescriptor<T>;
+
+  // ==========================================================================
+  // engine.math
+  // ==========================================================================
+
+  /**
+   * The shape every `math` function accepts and returns. Declared structurally
+   * rather than as `Vector3` on purpose: a three `Vector3` satisfies it, and so
+   * does an object literal, a component prop, or a row read out of a buffer —
+   * so nothing has to be converted at either end of a call.
+   */
+  export interface Vec2Like { x: number; y: number }
+  /** @see Vec2Like */
+  export interface Vec3Like { x: number; y: number; z: number }
+  /** @see Vec2Like */
+  export interface QuatLike { x: number; y: number; z: number; w: number }
+  /** Barycentric weights of the three vertices of a triangle. */
+  export interface Barycentric { u: number; v: number; w: number }
+
+  /**
+   * One reproducible stream of random numbers.
+   *
+   * Give each system its own — the terrain generator, the loot table, the VFX
+   * — and adding a particle effect can no longer change the dungeon layout.
+   */
+  export interface RandomStream {
+    /** The current seed. Pass it to `create` to replay this exact sequence. */
+    readonly seed: number;
+    /** Restarts the stream. A string seed is hashed. */
+    setSeed(seed: number | string): this;
+    /**
+     * A new independent stream from this seed plus a label. Same parent and
+     * same label always give the same child, so chunk `"3,7"` generates
+     * identically whichever order chunks load in.
+     */
+    derive(label: number | string): RandomStream;
+    /** `[0, 1)`, or `[min, max)` when a range is given. */
+    value(min?: number, max?: number): number;
+    /** A whole number in `[min, max]` — **both ends inclusive**. */
+    int(min: number, max: number): number;
+    /** True with probability `chance` (default 0.5). */
+    bool(chance?: number): boolean;
+    /** -1 or 1, never 0. */
+    sign(): number;
+    /** A uniformly chosen element, or undefined for an empty list. */
+    pick<T>(items: readonly T[]): T | undefined;
+    /** A weighted choice; weights need not sum to 1, and 0 disables an entry. */
+    pickWeighted<T>(items: readonly T[], weights: readonly number[]): T | undefined;
+    /** Fisher–Yates, in place. */
+    shuffle<T>(items: T[]): T[];
+    /** Fisher–Yates on a copy. */
+    shuffled<T>(items: readonly T[]): T[];
+    /** `count` distinct elements. */
+    sample<T>(items: readonly T[], count: number): T[];
+    /**
+     * A normally distributed value — what most "random" gameplay numbers
+     * actually want, since damage, walk speeds and spawn timings cluster
+     * around a typical value rather than spreading evenly.
+     */
+    gaussian(mean?: number, stdDev?: number): number;
+    /** A point on the unit circle. */
+    onCircle<T extends Vec2Like>(out?: T): T;
+    /** A point inside the unit disc, uniform by area. */
+    inCircle<T extends Vec2Like>(out?: T): T;
+    /** A uniformly distributed direction — a point on the unit sphere. */
+    onSphere<T extends Vec3Like>(out?: T): T;
+    /** A point inside the unit sphere, uniform by volume. */
+    inSphere<T extends Vec3Like>(out?: T): T;
+    /** A direction within `halfAngle` of `axis` — spread, scatter, sparks. */
+    inCone<T extends Vec3Like>(axis: Vec3Like, halfAngle: number, out?: T): T;
+    /** A point inside an axis-aligned box. */
+    inBox<T extends Vec3Like>(min: Vec3Like, max: Vec3Like, out?: T): T;
+    /** A uniformly distributed point inside a triangle. */
+    inTriangle<T extends Vec3Like>(a: Vec3Like, b: Vec3Like, c: Vec3Like, out?: T): T;
+    /** A random hue at the given saturation/lightness, as 0..1 RGB. */
+    color<T extends { r: number; g: number; b: number }>(
+      saturation?: number,
+      lightness?: number,
+      out?: T,
+    ): T;
+  }
+
+  /**
+   * Seeded randomness — callable like `Math.random`, with a whole
+   * {@link RandomStream} attached.
+   *
+   *     math.random()           // 0 <= x < 1
+   *     math.random(2, 5)       // 2 <= x < 5
+   *     math.random.int(1, 6)   // a d6
+   *     math.random.pick(sounds)
+   *
+   * Seeded from the clock at startup, so it behaves like `Math.random` until
+   * you call `setSeed`. For anything that must be reproducible on its own,
+   * make a private stream with `create(seed)` rather than reseeding this one —
+   * an unrelated system drawing a number would otherwise shift your sequence.
+   */
+  export interface MathRandom extends RandomStream {
+    (min?: number, max?: number): number;
+    /** The underlying shared stream. */
+    readonly shared: RandomStream;
+    /** An independent stream with its own seed. */
+    create(seed?: number | string): RandomStream;
+    /** The `Random` class itself, for `new math.random.Random("terrain")`. */
+    readonly Random: new (seed?: number | string) => RandomStream;
+    /** Hashes a string to a 32-bit seed. */
+    seedFromString(text: string): number;
+  }
+
+  /**
+   * A field of coherent noise — random that varies *smoothly*, and the same
+   * value at the same coordinate forever. That reproducibility is why terrain
+   * generated from noise needs no storage.
+   */
+  export interface NoiseField {
+    readonly seed: number;
+    /** A deterministic `[0, 1)` value for an integer lattice point. */
+    hash(x: number, y?: number, z?: number): number;
+    /** 2D Perlin noise, roughly `[-1, 1]`, zero at every lattice point. */
+    perlin2(x: number, y: number): number;
+    /** 3D Perlin noise. The third axis is usually time. */
+    perlin3(x: number, y: number, z: number): number;
+    /**
+     * Octaves of {@link NoiseField.perlin2} summed — one octave is smooth
+     * hills, five is a landscape. Normalized, so more detail does not also
+     * mean taller mountains.
+     */
+    fbm2(x: number, y: number, options?: FbmOptions): number;
+    /** {@link NoiseField.fbm2} in three dimensions. */
+    fbm3(x: number, y: number, z: number, options?: FbmOptions): number;
+    /** Ridged multifractal — mountain crests and canyon walls. `[0, 1]`. */
+    ridged2(x: number, y: number, options?: FbmOptions): number;
+    /** Worley/cellular noise: distance to the nearest feature point. */
+    worley2(x: number, y: number): number;
+    /** Noise that tiles seamlessly over `period` — for a looping texture. */
+    tileable2(x: number, y: number, period?: number): number;
+  }
+
+  /** Octave controls for fractal noise. */
+  export interface FbmOptions {
+    /** How many octaves to sum (default 4). More detail, more cost. */
+    octaves?: number;
+    /** Frequency multiplier per octave (default 2). */
+    lacunarity?: number;
+    /** Amplitude multiplier per octave (default 0.5). */
+    gain?: number;
+  }
+
+  /**
+   * Coherent noise — callable as 2D/3D Perlin, with the named methods
+   * attached.
+   *
+   *     const sway = math.noise(this.engine.elapsedTime * 0.4) * 0.05;
+   *     const height = math.noise.fbm2(x * 0.01, z * 0.01, { octaves: 5 });
+   */
+  export interface MathNoise extends NoiseField {
+    (x: number, y?: number, z?: number): number;
+    readonly shared: NoiseField;
+    /** An independent field with its own seed. */
+    create(seed?: number | string): NoiseField;
+    readonly Noise: new (seed?: number | string) => NoiseField;
+  }
+
+  /**
+   * 3D vector operations three does not have. Anything three's `Vector3`
+   * already does well — `add`, `normalize`, `projectOnPlane`, `reflect`,
+   * `clampLength`, `applyQuaternion` — is deliberately absent.
+   */
+  export interface MathVec3 {
+    /** Steps toward `target` at a constant rate, landing exactly on it. */
+    moveTowards<T extends Vec3Like>(current: T, target: Vec3Like, maxDistance: number): T;
+    /**
+     * Frame-rate-independent smoothing. The correct replacement for
+     * `pos.lerp(target, 0.1)` in an update, which eases at a speed that
+     * changes with frame rate.
+     */
+    damp<T extends Vec3Like>(current: T, target: Vec3Like, lambda: number, dt: number): T;
+    /**
+     * A critically damped spring per axis — the standard follow-camera
+     * solution. `velocity` is state you own and pass back each frame.
+     *
+     *     this._vel ??= new Vector3();
+     *     math.vec3.smoothDamp(this.entity.position, target, this._vel, 0.15, dt);
+     */
+    smoothDamp<T extends Vec3Like>(
+      current: T,
+      target: Vec3Like,
+      velocity: Vec3Like,
+      smoothTime: number,
+      dt: number,
+      maxSpeed?: number,
+    ): T;
+    /** Rotates a direction toward another at a capped angular rate. */
+    rotateTowards<T extends Vec3Like>(current: T, target: Vec3Like, maxRadians: number): T;
+    /** Spherical interpolation of two directions — constant angular speed. */
+    slerp<T extends Vec3Like>(a: Vec3Like, b: Vec3Like, t: number, out: T): T;
+    /**
+     * The angle from `a` to `b` **with a sign**, about `axis`. Three's
+     * `angleTo` is unsigned and so cannot tell left from right.
+     */
+    signedAngle(a: Vec3Like, b: Vec3Like, axis: Vec3Like): number;
+    /** Normalizes in place, leaving a zero-length vector at zero (not NaN). */
+    safeNormalize<T extends Vec3Like>(v: T): T;
+    /** Distance ignoring Y — what "in range" almost always means. */
+    horizontalDistance(a: Vec3Like, b: Vec3Like): number;
+    /** Proximity test with no square root. */
+    within(a: Vec3Like, b: Vec3Like, radius: number): boolean;
+    /** Yaw and pitch of a direction, in radians. */
+    toYawPitch<T extends { yaw: number; pitch: number }>(direction: Vec3Like, out?: T): T;
+    /** The unit direction for a yaw/pitch pair. */
+    fromYawPitch<T extends Vec3Like>(yaw: number, pitch: number, out: T): T;
+    /** A point on a quadratic Bézier — arcing projectiles, UI fly-outs. */
+    quadraticBezier<T extends Vec3Like>(
+      p0: Vec3Like, p1: Vec3Like, p2: Vec3Like, t: number, out: T,
+    ): T;
+    /** Catmull–Rom through four points — smooths a path of waypoints. */
+    catmullRom<T extends Vec3Like>(
+      p0: Vec3Like, p1: Vec3Like, p2: Vec3Like, p3: Vec3Like, t: number, out: T,
+    ): T;
+  }
+
+  /** 2D vector operations. */
+  export interface MathVec2 {
+    moveTowards<T extends Vec2Like>(current: T, target: Vec2Like, maxDistance: number): T;
+    /** Frame-rate-independent smoothing. See {@link MathVec3.damp}. */
+    damp<T extends Vec2Like>(current: T, target: Vec2Like, lambda: number, dt: number): T;
+    /** Rotates about the origin, counter-clockwise. */
+    rotate<T extends Vec2Like>(v: T, radians: number): T;
+    /** The 2D cross product — its sign is "left or right of `a`". */
+    cross(a: Vec2Like, b: Vec2Like): number;
+    /** The signed angle from `a` to `b`, in `[-π, π]`. */
+    signedAngle(a: Vec2Like, b: Vec2Like): number;
+    /** The unit vector at `radians`. */
+    fromAngle<T extends Vec2Like>(radians: number, out: T): T;
+    safeNormalize<T extends Vec2Like>(v: T): T;
+    /**
+     * Rescales a stick or WASD vector so diagonals are not faster than the
+     * cardinals, applying a deadzone without the jump a naive clamp gives.
+     */
+    clampStick<T extends Vec2Like>(v: T, deadzone?: number): T;
+  }
+
+  /** Quaternion smoothing and look-rotation. */
+  export interface MathQuat {
+    /** Frame-rate-independent rotational smoothing. */
+    damp<T extends QuatLike>(current: T, target: QuatLike, lambda: number, dt: number): T;
+    /** In-place slerp, taking the short way round. */
+    slerp<T extends QuatLike>(current: T, target: QuatLike, t: number): T;
+    /** The angle between two rotations, in radians. */
+    angleBetween(a: QuatLike, b: QuatLike): number;
+    /**
+     * The rotation looking along `forward` — three's `lookAt` without needing
+     * an object, a matrix, or a scene-graph round trip. Handles the
+     * straight-up case that makes the naive construction NaN.
+     */
+    lookRotation<T extends QuatLike>(forward: Vec3Like, up: Vec3Like, out: T): T;
+  }
+
+  /**
+   * Distances, closest points, ray casts and overlap tests on plain shapes.
+   *
+   * **Convention**: a ray is an origin plus a **normalized** direction, and
+   * every `ray*` returns the distance `t` along it (so the hit point is
+   * `origin + direction * t`) or `null` for a miss. Hits behind the origin are
+   * never reported; a ray starting inside a volume reports the exit.
+   */
+  export interface MathIntersect {
+    /** How far along `a`→`b` the closest point to `p` lies, as 0..1. */
+    closestPointOnSegmentT(p: Vec3Like, a: Vec3Like, b: Vec3Like): number;
+    closestPointOnSegment<T extends Vec3Like>(p: Vec3Like, a: Vec3Like, b: Vec3Like, out: T): T;
+    distanceToSegment(p: Vec3Like, a: Vec3Like, b: Vec3Like): number;
+    /**
+     * The closest pair of points between two segments, and their distance.
+     * Capsule-vs-capsule in disguise: a sword swing against a limb.
+     */
+    closestPointsBetweenSegments(
+      a0: Vec3Like, a1: Vec3Like, b0: Vec3Like, b1: Vec3Like,
+      outA?: Vec3Like, outB?: Vec3Like,
+    ): number;
+    /** Signed distance to a plane; positive is the normal's side. */
+    distanceToPlane(p: Vec3Like, planeNormal: Vec3Like, planeConstant: number): number;
+    /** Weights of `a`, `b`, `c` at `p` — how you read a UV at a hit point. */
+    barycentric<T extends Barycentric>(
+      p: Vec3Like, a: Vec3Like, b: Vec3Like, c: Vec3Like, out?: T,
+    ): T;
+    triangleArea(a: Vec3Like, b: Vec3Like, c: Vec3Like): number;
+
+    rayPlane(
+      origin: Vec3Like, direction: Vec3Like, planeNormal: Vec3Like, planeConstant: number,
+    ): number | null;
+    raySphere(
+      origin: Vec3Like, direction: Vec3Like, center: Vec3Like, radius: number,
+    ): number | null;
+    rayBox(
+      origin: Vec3Like, direction: Vec3Like, min: Vec3Like, max: Vec3Like,
+    ): number | null;
+    /** Möller–Trumbore. `out` receives the hit's barycentric weights. */
+    rayTriangle(
+      origin: Vec3Like, direction: Vec3Like, a: Vec3Like, b: Vec3Like, c: Vec3Like,
+      cullBackface?: boolean, out?: Barycentric,
+    ): number | null;
+    /** A segment swept by a radius — the shape most characters really are. */
+    rayCapsule(
+      origin: Vec3Like, direction: Vec3Like, a: Vec3Like, b: Vec3Like, radius: number,
+    ): number | null;
+
+    sphereSphere(a: Vec3Like, radiusA: number, b: Vec3Like, radiusB: number): boolean;
+    boxBox(minA: Vec3Like, maxA: Vec3Like, minB: Vec3Like, maxB: Vec3Like): boolean;
+    boxSphere(min: Vec3Like, max: Vec3Like, center: Vec3Like, radius: number): boolean;
+    pointInBox(p: Vec3Like, min: Vec3Like, max: Vec3Like): boolean;
+    /** Angle and range in one test — a field of view, a cone attack. */
+    pointInCone(
+      target: Vec3Like, apex: Vec3Like, axis: Vec3Like, halfAngle: number, range?: number,
+    ): boolean;
+    /**
+     * A moving sphere against a static one — the fix for a fast projectile
+     * tunnelling between frames. `velocity` is the whole step's displacement;
+     * the result is the fraction of that step at which contact happens.
+     */
+    sweepSphereSphere(
+      from: Vec3Like, velocity: Vec3Like, radius: number,
+      center: Vec3Like, staticRadius: number,
+    ): number | null;
+
+    /** Where two 2D segments cross, if they do. */
+    segmentSegment2D(a0: Vec2Like, a1: Vec2Like, b0: Vec2Like, b1: Vec2Like, out?: Vec2Like): boolean;
+    /** Ray-cast point-in-polygon; concave is fine, winding does not matter. */
+    pointInPolygon2D(p: Vec2Like, points: readonly Vec2Like[]): boolean;
+    /** Signed area: positive counter-clockwise. The cheapest winding test. */
+    polygonArea2D(points: readonly Vec2Like[]): number;
+  }
+
+  /**
+   * Ballistics and interception — "where do I aim?".
+   *
+   * `gravity` is a positive magnitude acting along **-Y** (9.81 for the real
+   * world). Every function returns `null` / `false` for a genuinely impossible
+   * shot rather than a wild guess, so an AI can decide to reposition instead.
+   */
+  export interface MathTrajectory {
+    /**
+     * The two launch angles that hit a target at a fixed speed: `low` is the
+     * flat fast shot, `high` lobs over cover. Null when out of range.
+     */
+    launchAngles(
+      horizontalDistance: number, heightDelta: number, speed: number, gravity?: number,
+    ): { low: number; high: number } | null;
+    /**
+     * The launch velocity carrying a projectile from `from` to `to` — an
+     * angle turned back into a vector you can hand to a rigidbody.
+     */
+    solveBallistic(
+      from: Vec3Like, to: Vec3Like, speed: number,
+      gravity?: number, preferHigh?: boolean, out?: Vec3Like,
+    ): boolean;
+    /** Where a projectile is `time` seconds after launch. */
+    projectileAt<T extends Vec3Like>(
+      from: Vec3Like, velocity: Vec3Like, time: number, out: T, gravity?: number,
+    ): T;
+    /**
+     * How long a shot takes to travel from `from` to `to`, read off the
+     * horizontal distance — the flight time you want after `solveBallistic`.
+     *
+     * The vertical solution is ambiguous: a projectile passes any height below
+     * its apex twice, so a flat shot at a raised target reaches it CLIMBING
+     * while `timeToHeight` reports the descent.
+     */
+    flightTime(from: Vec3Like, to: Vec3Like, velocity: Vec3Like): number | null;
+    /**
+     * Seconds until a projectile **lands** at `heightDelta` above its launch
+     * height — the descending crossing. For the time to reach a target rather
+     * than the ground, use {@link MathTrajectory.flightTime}.
+     */
+    timeToHeight(verticalSpeed: number, heightDelta?: number, gravity?: number): number | null;
+    /** The peak height above launch, and when it happens. */
+    apex(verticalSpeed: number, gravity?: number): { height: number; time: number };
+    /** The launch speed that reaches `height` — jump tuning, exactly. */
+    jumpSpeedForHeight(height: number, gravity?: number): number;
+    /**
+     * Seconds until a projectile catches a target moving at constant
+     * velocity. Null when the target simply outruns it.
+     */
+    interceptTime(
+      relativePosition: Vec3Like, relativeVelocity: Vec3Like, projectileSpeed: number,
+    ): number | null;
+    /** Where to aim to hit a moving target with a straight-flying shot. */
+    interceptPoint(
+      shooterPosition: Vec3Like, targetPosition: Vec3Like, targetVelocity: Vec3Like,
+      projectileSpeed: number, out?: Vec3Like,
+    ): boolean;
+    /** Lead and arc together — an arcing shot at a moving target. */
+    solveBallisticLead(
+      from: Vec3Like, targetPosition: Vec3Like, targetVelocity: Vec3Like, speed: number,
+      gravity?: number, preferHigh?: boolean, out?: Vec3Like,
+    ): boolean;
+    /** Samples an arc into points — the guide a grenade throw draws. */
+    sampleArc(
+      from: Vec3Like, velocity: Vec3Like, steps: number, maxTime: number, gravity?: number,
+    ): Vec3Like[];
+  }
+
+  /**
+   * Bit flags, packing and stable hashing. All the bitwise operations work on
+   * 32-bit integers, because that is what JavaScript's `&`/`|`/`<<` coerce to.
+   */
+  export interface MathBits {
+    /** True when `flags` has EVERY bit in `mask`. */
+    hasFlag(flags: number, mask: number): boolean;
+    /** True when `flags` has ANY bit in `mask` — the layer-mask test. */
+    hasAnyFlag(flags: number, mask: number): boolean;
+    setFlag(flags: number, mask: number): number;
+    clearFlag(flags: number, mask: number): number;
+    toggleFlag(flags: number, mask: number): number;
+    /** Sets or clears in one call, for the `setVisible(bool)` shape. */
+    writeFlag(flags: number, mask: number, enabled: boolean): number;
+    /** The mask for a single bit index — `bit(3)` is 8. */
+    bit(index: number): number;
+    /** Population count — how many layers a mask covers. */
+    bitCount(value: number): number;
+    lowestBitIndex(value: number): number;
+    /** Every set bit's index — a mask back into the list of layers it names. */
+    bitIndices(value: number): number[];
+
+    intToBytes32(value: number, out?: number[]): number[];
+    bytesToInt32(b3: number, b2: number, b1: number, b0: number): number;
+    intToBytes24(value: number, out?: number[]): number[];
+    bytesToInt24(b2: number, b1: number, b0: number): number;
+    /** Two 16-bit halves in one integer — grid coords as a cheap `Map` key. */
+    packUint16Pair(high: number, low: number): number;
+    unpackUint16Pair<T extends { high: number; low: number }>(packed: number, out?: T): T;
+    /** 0..1 RGB into `0xRRGGBB`, the form three's `Color.getHex()` uses. */
+    packColor(r: number, g: number, b: number): number;
+    unpackColor<T extends { r: number; g: number; b: number }>(hex: number, out?: T): T;
+
+    /**
+     * FNV-1a over a string, avalanche-mixed, as a uint32 — stable across runs
+     * and machines, which is what makes it usable as a seed or a save key.
+     * The same function as {@link MathAPI.seedFromString}. Not cryptographic;
+     * do not use it where an attacker picks the input.
+     */
+    hashString(text: string): number;
+    /**
+     * Avalanche mix for a 32-bit integer: one input bit flipped changes about
+     * half the output bits. Doubles as an integer hash for lattice
+     * coordinates, which is what the noise field uses it for.
+     */
+    hashInt(value: number): number;
+    /** Mixes two hashes into one, order-dependently. */
+    hashCombine(a: number, b: number): number;
+    /** A uint32 as a `[0, 1)` float. */
+    hashToFloat(hash: number): number;
+    /** A stable, visually distinct colour for a string, as `0xRRGGBB`. */
+    colorFromString(text: string, saturation?: number, lightness?: number): number;
+  }
+
+  /** Helpers around the easing table. */
+  export interface MathEasing {
+    /** The table itself — the same object as {@link MathAPI.ease}. */
+    readonly EASINGS: Record<EasingName, (t: number) => number>;
+    /** Every easing name, for a dropdown. */
+    readonly EASE_NAMES: string[];
+    /** Looks a curve up by name, or null. */
+    easingByName(name: string): ((t: number) => number) | null;
+    /** Applies a curve by name, clamping `t`; an unknown name is linear. */
+    apply(name: string, t: number): number;
+    /** Runs a curve out and back over one pass — a flash, a pulse, a squash. */
+    yoyo(easing: (t: number) => number): (t: number) => number;
+    /** Mirrors a curve: `in` becomes `out`. */
+    reverse(easing: (t: number) => number): (t: number) => number;
+    /**
+     * A CSS `cubic-bezier(x1, y1, x2, y2)` curve, for matching one authored in
+     * a design tool. Iterative — build it once, do not call it per frame.
+     */
+    cubicBezier(x1: number, y1: number, x2: number, y2: number): (t: number) => number;
+  }
+
+  /**
+   * Gameplay math shared by the engine and user scripts. Three ways in, all
+   * the same object:
+   *
+   *     import { math } from "engine";   // in a user script
+   *     this.engine.math                 // on the engine
+   *     this.math                        // injected on every script instance
+   *
+   * ## Why it exists next to three
+   *
+   * three ships `Vector3`, `Quaternion` and `MathUtils`, and scripts get all
+   * of them. Those are *types and primitives*. This is the layer above: the
+   * operations gameplay code writes over and over and gets subtly wrong.
+   * Blending two angles the short way round. Smoothing that does not change
+   * speed with frame rate. A random number you can reproduce from a bug
+   * report. Where to aim at a moving target.
+   *
+   * ## Two rules everything here follows
+   *
+   * **It allocates nothing.** Anything returning a vector takes an optional
+   * `out` — pass the vector you already own and a per-frame call stays free.
+   *
+   * **It takes shapes, not classes.** Every parameter is `{x, y, z}`, which a
+   * three `Vector3` satisfies, so vectors cross the boundary unconverted.
+   */
+  export interface MathAPI {
+    // ---- Constants ---------------------------------------------------------
+    /** Multiply degrees by this for radians. */
+    readonly DEG_TO_RAD: number;
+    /** Multiply radians by this for degrees. */
+    readonly RAD_TO_DEG: number;
+    /** A full turn in radians — reach for this instead of `2 * Math.PI`. */
+    readonly TAU: number;
+    /** A quarter turn in radians. */
+    readonly HALF_PI: number;
+    /** The default float-comparison tolerance, 1e-6. */
+    readonly EPSILON: number;
+    readonly GOLDEN_RATIO: number;
+    /** ~137.5° — the spacing that packs points most evenly on a disc. */
+    readonly GOLDEN_ANGLE: number;
+
+    // ---- Range -------------------------------------------------------------
+    /** Constrains to `[min, max]`; a reversed range is corrected, not NaN. */
+    clamp(value: number, min: number, max: number): number;
+    clamp01(value: number): number;
+    /** Alias of `clamp01`, for anyone arriving from shader code. */
+    saturate(value: number): number;
+    between(value: number, min: number, max: number, inclusive?: boolean): boolean;
+
+    // ---- Interpolation -----------------------------------------------------
+    /** **Unclamped** — `t` outside `[0, 1]` extrapolates. */
+    lerp(a: number, b: number, t: number): number;
+    lerpClamped(a: number, b: number, t: number): number;
+    /** The inverse of `lerp`; a zero-length range yields 0, not NaN. */
+    inverseLerp(a: number, b: number, value: number): number;
+    /** Maps one range onto another — health to bar width, distance to volume. */
+    remap(value: number, inMin: number, inMax: number, outMin: number, outMax: number): number;
+    remapClamped(value: number, inMin: number, inMax: number, outMin: number, outMax: number): number;
+    /** GLSL's `step`: 0 below `edge`, 1 at or above. */
+    step(edge: number, value: number): number;
+    /** GLSL's `smoothstep` — a fade with no corner at either end. */
+    smoothstep(edge0: number, edge1: number, value: number): number;
+    /** Zero second derivative too; worth it when acceleration is visible. */
+    smootherstep(edge0: number, edge1: number, value: number): number;
+    /** Schlick's bias: reshapes 0..1 while pinning 0 and 1. 0.5 = identity. */
+    bias(t: number, amount: number): number;
+    /** Schlick's gain: an S-curve through 0.5 — contrast for a mask. */
+    gain(t: number, amount: number): number;
+
+    // ---- Wrapping ----------------------------------------------------------
+    /** The fractional part, always `[0, 1)` — including for negatives. */
+    fract(value: number): number;
+    /** Euclidean modulo: `mod(-1, 4)` is 3, where `-1 % 4` is -1. */
+    mod(value: number, divisor: number): number;
+    /** Wraps into `[0, length)`. */
+    repeat(value: number, length: number): number;
+    /** Wraps into `[min, max)`. */
+    wrap(value: number, min: number, max: number): number;
+    /** Bounces between 0 and `length` — a patrol, a breathing glow. */
+    pingPong(value: number, length: number): number;
+    sawtooth(time: number, period?: number): number;
+    triangleWave(time: number, period?: number): number;
+    /** `duty` is the fraction of each period spent at 1. */
+    squareWave(time: number, period?: number, duty?: number): number;
+
+    // ---- Motion ------------------------------------------------------------
+    /** Constant-rate step toward a target, landing exactly on it. */
+    moveTowards(current: number, target: number, maxDelta: number): number;
+    /**
+     * Frame-rate-independent exponential smoothing — the correct replacement
+     * for `value = lerp(value, target, 0.1)` in an update, which eases at
+     * different speeds at 60 and 144 fps.
+     *
+     * `lambda` is a rate: 1 is a lazy drift, 10 snappy, 30 near-instant.
+     */
+    damp(current: number, target: number, lambda: number, dt: number): number;
+    /** Converts "reach 99% in N seconds" into the `lambda` `damp` wants. */
+    dampLambdaFor(seconds: number): number;
+    /**
+     * A critically damped spring — reaches the target without oscillating and
+     * carries velocity through target changes. Returns the new value AND
+     * velocity; store the velocity and pass it back next frame.
+     */
+    smoothDamp(
+      current: number, target: number, velocity: number,
+      smoothTime: number, dt: number, maxSpeed?: number,
+    ): { value: number; velocity: number };
+    /** Float equality with a tolerance. `===` on floats is a latent bug. */
+    approximately(a: number, b: number, epsilon?: number): boolean;
+
+    // ---- Quantization ------------------------------------------------------
+    /** Rounds to the nearest multiple — grid snapping, slider detents. */
+    snap(value: number, increment: number): number;
+    roundUp(value: number, increment: number): number;
+    roundDown(value: number, increment: number): number;
+    roundTo(value: number, decimals?: number): number;
+    isPowerOfTwo(value: number): boolean;
+    nextPowerOfTwo(value: number): number;
+    previousPowerOfTwo(value: number): number;
+    /** Rounds in log space, so 700 → 512 exactly as a mip chain would. */
+    nearestPowerOfTwo(value: number): number;
+
+    // ---- Aggregates --------------------------------------------------------
+    sum(values: readonly number[]): number;
+    average(values: readonly number[]): number;
+    /** The middle value — what a frame-time readout wants, not the mean. */
+    median(values: readonly number[]): number;
+    /**
+     * The `index`-th point of the golden-angle spiral on a unit disc.
+     * Successive points never clump, unlike random ones, and never read as a
+     * grid, unlike a grid.
+     */
+    goldenAngleSpiral<T extends Vec2Like>(index: number, count: number, out?: T): T;
+
+    // ---- Angles ------------------------------------------------------------
+    degToRad(degrees: number): number;
+    radToDeg(radians: number): number;
+    /** Wraps into `(-π, π]` — the signed form, where the sign is a direction. */
+    wrapAngle(radians: number): number;
+    /** Wraps into `[0, 2π)` — the unsigned form, for a heading. */
+    wrapAngle01(radians: number): number;
+    wrapAngleDeg(degrees: number): number;
+    /** The shortest signed rotation from `from` to `to`. */
+    deltaAngle(from: number, to: number): number;
+    deltaAngleDeg(from: number, to: number): number;
+    /**
+     * Blends two angles the SHORT way round — `lerp(350°, 10°, 0.5)` would
+     * give 180° and spin a character right around for a 20° turn.
+     *
+     * The result is continuous with `a` rather than wrapped, so 350°→10° lands
+     * on 360°. Wrap it yourself if you are storing it.
+     */
+    lerpAngle(a: number, b: number, t: number): number;
+    lerpAngleDeg(a: number, b: number, t: number): number;
+    /** As `lerpAngle`, but `t` is not clamped. */
+    lerpAngleUnclamped(a: number, b: number, t: number): number;
+    /** Turret traverse: turn toward `target` at a capped rate. */
+    moveTowardsAngle(current: number, target: number, maxDelta: number): number;
+    moveTowardsAngleDeg(current: number, target: number, maxDelta: number): number;
+    /** Frame-rate-independent angular smoothing. */
+    dampAngle(current: number, target: number, lambda: number, dt: number): number;
+    /** The mean of a set of angles, computed on the unit circle. */
+    averageAngle(angles: readonly number[]): number;
+    /** The yaw facing `(x, z)` — three's convention, feeds `rotation.y`. */
+    yawFromDirection(x: number, z: number): number;
+    directionFromYaw<T extends Vec3Like>(yaw: number, out?: T): T;
+    /** Positive looks up; the straight-up case does not produce NaN. */
+    pitchFromDirection(x: number, y: number, z: number): number;
+    /** A field-of-view test, once you have both as angles. */
+    withinAngle(facing: number, target: number, halfAngle: number): boolean;
+
+    // ---- Sub-namespaces ----------------------------------------------------
+    /** The easing table — the same functions `engine.tween`'s `ease` names. */
+    readonly ease: Record<EasingName, (t: number) => number>;
+    /** Easing helpers: lookup, names, yoyo, reverse, cubic-bezier. */
+    readonly easing: MathEasing;
+    /** Seeded randomness. Callable: `math.random()`, `math.random(2, 5)`. */
+    readonly random: MathRandom;
+    /** Coherent noise. Callable: `math.noise(x, y)`. */
+    readonly noise: MathNoise;
+    readonly vec3: MathVec3;
+    readonly vec2: MathVec2;
+    readonly quat: MathQuat;
+    readonly intersect: MathIntersect;
+    readonly trajectory: MathTrajectory;
+    readonly bits: MathBits;
+
+    /** A tangent frame for a normal — scattering, decals, cone sampling. */
+    orthonormalBasis<T extends Vec3Like>(normal: Vec3Like, outTangent: T, outBitangent: T): T;
+    /** The `Random` class, for an independent seeded stream. */
+    readonly Random: new (seed?: number | string) => RandomStream;
+    /** The `Noise` class, for an independent noise field. */
+    readonly Noise: new (seed?: number | string) => NoiseField;
+    /** Hashes a string to a 32-bit seed. */
+    seedFromString(text: string): number;
+  }
+
+  /** @see MathAPI */
+  export const math: MathAPI;
+
+  /**
    * Base class scripts extend for full IntelliSense on `this.entity`,
-   * `this.engine`, `this.THREE`, `this.input`, plus the lifecycle methods.
+   * `this.engine`, `this.THREE`, `this.input`, `this.math`, `this.time`, plus
+   * the lifecycle methods.
    *
    * The runtime DOES NOT require extending this class — `ScriptComponent`
-   * injects the four context properties on every script instance regardless
+   * injects the six context properties on every script instance regardless
    * of its base class. This class exists purely as a type-system helper.
    */
   export class Script {
@@ -2878,6 +4227,25 @@ declare module "engine" {
     engine: Engine;
     THREE: typeof THREE;
     input: InputManager | null;
+    /**
+     * Gameplay math, without an import. Same object as
+     * `import { math } from "engine"` and as `this.engine.math`.
+     * See {@link MathAPI}.
+     */
+    math: MathAPI;
+    /**
+     * Clocks and timers, SCOPED to this script: every timer scheduled through
+     * it is cancelled when the script is destroyed, disabled or hot-reloaded,
+     * and any pending `await` resolves `false`. See {@link TimerScope}.
+     *
+     *     this.cooldown -= this.time.delta;
+     *     this.time.after(0.2, () => this.fire());
+     *     await this.time.delay(1);
+     *
+     * Reach for `this.engine.time` only when a timer is meant to outlive the
+     * entity that scheduled it.
+     */
+    time: TimerScope;
 
     /** Called when play starts (or when this script is enabled during play). */
     onStart?(): void;

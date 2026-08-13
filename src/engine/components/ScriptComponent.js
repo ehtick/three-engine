@@ -8,6 +8,8 @@ import {
   registerMenuItem,
   unregisterMenuItemsWithPrefix,
 } from "../editorBridge.js";
+import { math } from "../math/index.js";
+import { attachListeners, detachListeners } from "../scriptRuntime/listen.js";
 
 const RELOAD_CHECK_INTERVAL = 0.75; // seconds
 
@@ -358,13 +360,28 @@ export class ScriptComponent extends Component {
     }
   }
 
-  /** Scripts are their own context: this.entity / this.engine / this.THREE / this.input. */
+  /**
+   * Scripts are their own context: this.entity / this.engine / this.THREE /
+   * this.input / this.math.
+   */
   #bind(instance) {
     if (!instance) return instance;
     instance.entity = this.entity;
     instance.engine = this.entity.engine;
     instance.THREE = THREE;
     instance.input = this.entity.engine.input;
+    // Gameplay math without an import. Stateless, so every script shares the
+    // one namespace — see engine/math/index.js.
+    instance.math = math;
+    // A SCOPED view of engine.time, unlike the three above: the clocks read
+    // through unchanged, but every timer this script schedules is tagged to
+    // this instance and cancelled when it goes away. That is not a convenience.
+    // Timer callbacks capture `this`, entities die while their timers are in
+    // flight, and a script that used `engine.time` directly would keep running
+    // callbacks against a destroyed entity — the single most common way a
+    // hand-rolled timer takes a game down. Scripts get the safe one by default;
+    // `this.engine.time` is still there for a timer meant to outlive the entity.
+    instance.time = this.entity.engine.time.scope(instance);
     return instance;
   }
 
@@ -388,8 +405,18 @@ export class ScriptComponent extends Component {
     // inside #safeCall, which counts toward MAX_ERRORS — so a script defining
     // only `onUpdate` used to log an error every Play and latch itself off on
     // the third one. Guard here the way `dispatch()` and `#stopSlot` already do.
+    // `@listen` subscriptions live exactly as long as the script runs — before
+    // onStart so a handler is already attached if onStart emits something, and
+    // after onDestroy so that hook can still emit its last event.
+    if (should) attachListeners(slot.instance);
     const hook = should ? "onStart" : "onDestroy";
     if (typeof slot.instance[hook] === "function") this.#safeCall(slot, hook);
+    if (!should) detachListeners(slot.instance);
+    // After onDestroy, not before: that hook is allowed to schedule a last
+    // timer (a death fade, a delayed respawn) and would be surprised to find it
+    // cancelled — but anything still pending once the script has stopped is
+    // a callback into a script that is no longer running.
+    if (!should) slot.instance.time?.cancelAll?.();
   }
 
   /** Runs onDestroy if needed and clears the instance. */
@@ -397,6 +424,13 @@ export class ScriptComponent extends Component {
     if (slot.running && typeof slot.instance?.onDestroy === "function") {
       this.#safeCall(slot, "onDestroy");
     }
+    // Unconditional, unlike onDestroy: a slot that never started can still have
+    // scheduled timers from its constructor, and dropping the instance without
+    // cancelling them leaves callbacks holding the only reference to it. Same
+    // reasoning for the subscriptions — a bus holding a handler that closes
+    // over a discarded instance is the leak `@listen` exists to prevent.
+    slot.instance?.time?.cancelAll?.();
+    if (slot.instance) detachListeners(slot.instance);
     slot.running = false;
     slot.instance = null;
     slot.moduleVersion = null;
@@ -457,8 +491,22 @@ export class ScriptComponent extends Component {
 
       // Hot swap while running: if the script defines onHotReload, hand it the
       // old instance to carry state over instead of a destroy/start cycle.
+      // Either way the OLD instance is finished, and its `@listen` handlers
+      // close over it. Left attached they would keep running the previous
+      // version of the code against a discarded instance — a hot reload that
+      // makes a script fire twice, once as it was and once as it is, which
+      // reads as the reload having half-worked.
+      if (oldInstance) detachListeners(oldInstance);
+
+      // Hot swap while running: if the script defines onHotReload, hand it the
+      // old instance to carry state over instead of a destroy/start cycle.
       if (wasRunning && typeof slot.instance?.onHotReload === "function") {
         slot.running = true;
+        // This branch skips `#reconcileSlotRunning`, which is where the new
+        // instance would normally be subscribed — so it has to happen here, or
+        // a script with `onHotReload` silently stops hearing its events after
+        // the first edit.
+        attachListeners(slot.instance);
         this.#safeCall(slot, "onHotReload", [oldInstance]);
         this.#refreshMenuItems();
         this.entity.engine.emit("script-loaded", this);

@@ -19,9 +19,11 @@ import { instantiatePrefabNode } from "./prefab/expand.js";
 import { StatsSystem } from "./StatsSystem.js";
 import { SaveSystem, PreferenceStore } from "./saveSystem.js";
 import { Tween, TweenSystem } from "./tween.js";
+import { TimeSystem } from "./time.js";
 import { configureTextureAssetLoader } from "./textureAsset.js";
 import { installOutputDither } from "./outputDither.js";
 import { BatchSystem } from "./batching.js";
+import { MergeSystem } from "./merging.js";
 import { LodSystem } from "./lod/LodSystem.js";
 import { ImpostorSystem } from "./lod/ImpostorSystem.js";
 import { OcclusionSystem } from "./culling/OcclusionSystem.js";
@@ -32,6 +34,8 @@ import { ImpulseSystem } from "./camera/impulse.js";
 import { DebugDraw } from "./debugDraw.js";
 import { DecalSystem } from "./vfx/DecalSystem.js";
 import { AssetRegistry } from "./assets/AssetRegistry.js";
+import { EventRegistry } from "./events/EventRegistry.js";
+import { math } from "./math/index.js";
 
 /**
  * Runtime core: owns the renderer, the three.js scene (source of truth)
@@ -84,6 +88,11 @@ export class Engine extends EventEmitter {
     // Camera shake. Owned here so it survives whichever camera happens to be
     // active: an explosion's rumble must not stop because the shot cut.
     this.cameraImpulse = new ImpulseSystem();
+    // `engine.math.clamp(...)`, `engine.math.vec3.smoothDamp(...)`. Stateless
+    // and shared — the same object user scripts get from `import { math } from
+    // "engine"`, hung here so a component or a script with an engine reference
+    // never needs the import at all.
+    this.math = math;
     // `engine.debug.line(...)` etc. Owned by the engine rather than the editor
     // because its whole purpose is debugging GAMEPLAY — it has to work in Play
     // mode and in a build, not only while the editor is stopped.
@@ -182,6 +191,10 @@ export class Engine extends EventEmitter {
     // Merges repeated (geometry, material) pairs into instanced draw calls.
     // Driven from #tick's pre-render phase, gated by settings.performance.
     this.batching = new BatchSystem(this);
+    // Collapses DISTINCT (geometry, material) pairs into one merged draw with a
+    // table-driven material — the imported-environment case instancing cannot
+    // reach. Off unless the scene asks for it; see merging.js on why.
+    this.merging = new MergeSystem(this);
     // Picks a detail level per LOD group each frame. Ordered after batching so
     // it can invalidate it (a hidden member still draws through its proxy).
     this.lod = new LodSystem(this);
@@ -216,6 +229,12 @@ export class Engine extends EventEmitter {
     // the shorthand scripts use.
     this.tweens = new TweenSystem();
 
+    // Clocks + scheduler in one namespace (see time.js). `engine.deltaTime`
+    // and the other fields above stay as they are — half the engine reads them
+    // — and this is the surface gameplay code is pointed at, because "how long
+    // was the frame" and "run this in three seconds" are the same subject.
+    this.time = new TimeSystem(this);
+
     this.saves = new SaveSystem(this);
     this.prefs = new PreferenceStore(this);
     this.prefs.hydrate();
@@ -228,6 +247,12 @@ export class Engine extends EventEmitter {
     // `engine.assets` — script-facing texture/material/geometry/audio/cubemap
     // access, wrapping the same path-keyed caches components load through.
     this.assets = new AssetRegistry(this);
+
+    // `engine.events` — the project's own declared events (the catalog the
+    // Events panel authors), plus the diagnostic tap behind its monitor. Not a
+    // bus: events are still listened to and fired on `engine`/`entity`/the
+    // component itself. Empty until `applyEvents` runs at boot.
+    this.events = new EventRegistry();
 
     // Input: built by default with the Player/UI maps enabled; an editor-
     // provided snapshot (applyInput) replaces it. Attached once the canvas
@@ -260,6 +285,7 @@ export class Engine extends EventEmitter {
     // Batching reads `settings`, so it can only be armed once those exist.
     // applySettings() re-applies this whenever the scene changes it.
     this.batching.setEnabled(this.settings.performance?.autoBatching !== false);
+    this.merging.setEnabled(this.settings.performance?.staticMerging === true);
     this.occlusion.setEnabled(this.settings.performance?.occlusionCulling === true);
 
     // Set to true by `emit("hierarchy-changed")` while a coalescing microtask
@@ -403,6 +429,7 @@ export class Engine extends EventEmitter {
       this.#scheduleRendererResize();
     }
     this.batching.setEnabled(this.settings.performance?.autoBatching !== false);
+    this.merging.setEnabled(this.settings.performance?.staticMerging === true);
     this.occlusion.setEnabled(this.settings.performance?.occlusionCulling === true);
     this.emit("settings-changed", this.settings);
     return recreatedRenderer;
@@ -488,6 +515,11 @@ export class Engine extends EventEmitter {
       // last frame of Play must not outlive the run that drew it.
       this.cameraImpulse.clear();
       this.debug.clear();
+      // Same reasoning again, and the sharpest case of it: a wave spawner
+      // scheduled on the last frame of Play would otherwise fire into the
+      // editor's authoring scene seconds after Stop, spawning enemies into the
+      // level the user is editing. Every pending timer dies with the run.
+      this.time.clear();
       // Every decal, including the authored ones — those come back by way of
       // DecalComponent's `resetOnStop`, which re-projects them against the
       // restored scene rather than leaving a bake of the played-through one.
@@ -585,6 +617,27 @@ export class Engine extends EventEmitter {
     this._inputTickUnsub = this.onUpdate(() => next.tick(this.unscaledDeltaTime));
     this.input = next;
     this.emit("input-changed", next);
+  }
+
+  /**
+   * Replaces the project's event catalog with the `events` block from
+   * project.json (or a build's config). Deliberately shaped like `applyInput`
+   * above: same lifecycle, same "the editor pushes a snapshot" contract, same
+   * `*-changed` notification so panels can re-read.
+   *
+   * The catalog is descriptive, not load-bearing — an event fires whether or not
+   * it is declared, because `emit` has never consulted a registry and making it
+   * do so would turn a typo into a silent drop at runtime instead of the compile
+   * error the generated declarations already give. What declaring an event buys
+   * is the typing and the tooling around it.
+   *
+   * @returns the validation errors, so a caller that has somewhere to show them
+   *          can (the Events panel does; boot just logs).
+   */
+  applyEvents(json) {
+    const { errors } = this.events.load(json);
+    this.emit("events-changed", this.events.list());
+    return errors;
   }
 
   async init(canvas) {
@@ -739,6 +792,11 @@ export class Engine extends EventEmitter {
       entity.object3D.userData.cameraHidden = authored && !next;
       if (entity.object3D.visible !== next) entity.object3D.visible = next;
     }
+    // First of the per-frame systems, and ahead of every update callback: a
+    // timer that comes due this frame should have had its effect before any
+    // script looks at the world, or every timed event in the game is read one
+    // frame after it happened. Also the only writer of `engine.time`'s clocks.
+    this.time.update(dt, unscaled);
     // Ahead of the update callbacks so a shake fired by a script this frame is
     // sampled by the camera brain in the SAME frame — a one-frame delay is
     // exactly long enough for a hit to feel disconnected from its impact.
@@ -778,16 +836,27 @@ export class Engine extends EventEmitter {
     this.audio.update?.(unscaled);
     // rendererReady guards the re-init window (init() swaps the renderer
     // asynchronously; rendering before its backend resolves throws).
+    //
+    // EVERY path out of here that does not reach the render call tells the
+    // stats system so, because a tick without a draw is not a frame. Counting
+    // them as frames is what let a frozen viewport report a healthy frame
+    // rate; see StatsSystem.recordPresentedFrame.
     if (this.camera && this.rendererReady) {
       // A renderer resize temporarily stops the animation loop and drains
       // submitted GPU work. If it was requested from inside an update
       // callback, do not encode another frame after the drain was scheduled.
-      if (this._resizeInFlight) return;
+      if (this._resizeInFlight) {
+        this.stats.recordSkippedFrame();
+        return;
+      }
       // Systems may briefly suspend scene rendering while an async pipeline
       // compile wave fills the cache (GI rebuilds): the viewport holds its
       // last frame but the app stays interactive, instead of the render
       // call blocking the main thread for the whole wave.
-      if (this.renderSuspended) return;
+      if (this.renderSuspended) {
+        this.stats.recordSkippedFrame();
+        return;
+      }
       // Final-transform passes (e.g. GI deferred prepass) run here: after
       // physics/scripts have written this frame's transforms, before the
       // main draw that samples their output.
@@ -795,6 +864,12 @@ export class Engine extends EventEmitter {
       // scene, so a GI/postprocess prepass and the main draw agree on what
       // is on screen.
       this.batching.sync();
+      // After batching, and for the same reason batching runs before the
+      // pre-render passes: a GI/postprocess prepass and the main draw must
+      // agree on what is on screen. Merging skips anything batching already
+      // claimed, so the order also settles which system owns a mesh both
+      // could take.
+      this.merging.sync();
       // Impostor bakes are nested renders, so they belong here — after the
       // scene's transforms are final and before the main draw. At most one
       // atlas is baked per frame; the rest of this call just refreshes the
@@ -813,7 +888,10 @@ export class Engine extends EventEmitter {
       // Re-check: a preRender callback (GI rebuild) may have suspended
       // rendering THIS frame — rendering now would sync-compile the whole
       // material wave in this frame, the exact freeze suspension prevents.
-      if (this.renderSuspended) return;
+      if (this.renderSuspended) {
+        this.stats.recordSkippedFrame();
+        return;
+      }
       // Wall-clock the GPU-submit portion of the frame so the stats
       // overlay's "GPU" reading reflects only the render call, not the
       // script tick. WebGPU dispatches the actual GPU work asynchronously,
@@ -833,7 +911,12 @@ export class Engine extends EventEmitter {
       } else {
         this.renderer.render(this.scene, this.camera);
       }
-      this.stats.recordRenderMs(performance.now() - t0);
+      const t1 = performance.now();
+      this.stats.recordRenderMs(t1 - t0);
+      // The one place a frame is counted. Stamped with the time the draw was
+      // submitted rather than the time the tick began, so the FPS window
+      // measures presents and not update-phase starts.
+      this.stats.recordPresentedFrame(t1);
       // Snapshot three's per-frame renderer metrics (draw calls, triangles,
       // texture memory). Has to happen AFTER render() returns because
       // three's animation loop resets these counters at the start of each
@@ -842,6 +925,10 @@ export class Engine extends EventEmitter {
       this.stats.recordRenderInfo();
       this.#resolveGpuTimestamps();
       this.#updateDynamicResolution();
+    } else {
+      // No camera, or the renderer is mid-swap. The loop is running and the
+      // canvas is not changing — the same thing a suspended wave looks like.
+      this.stats.recordSkippedFrame();
     }
     // Post-render passes draw on top of the main render's pixels. The
     // WebGPU backend's render pass starts with `loadOp: Clear`, so any
@@ -1308,7 +1395,9 @@ export class Engine extends EventEmitter {
     this.input.detach();
     this.audio.dispose?.();
     this.stats.dispose();
+    this.time.clear();
     this.batching.dispose();
+    this.merging.dispose();
     this.lod.dispose();
     this.impostors.dispose();
     this.occlusion.dispose();

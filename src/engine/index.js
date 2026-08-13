@@ -11,6 +11,7 @@ import { ScriptComponent } from "./components/ScriptComponent.js";
 import { ParticleComponent } from "./components/ParticleComponent.js";
 import { AnimationComponent } from "./components/AnimationComponent.js";
 import { TimelineComponent } from "./components/TimelineComponent.js";
+import { EventBindingComponent } from "./components/EventBindingComponent.js";
 import { IKComponent } from "./components/IKComponent.js";
 import { InstancerComponent } from "./components/InstancerComponent.js";
 import { LineRendererComponent } from "./components/LineRendererComponent.js";
@@ -56,6 +57,7 @@ const BUILT_IN_COMPONENTS = [
   ParticleComponent,
   AnimationComponent,
   TimelineComponent,
+  EventBindingComponent,
   IKComponent,
   InstancerComponent,
   LineRendererComponent,
@@ -194,6 +196,20 @@ export {
   applyQualityCeiling,
 } from "./sceneSettings.js";
 export { Tween, TweenSystem, EASINGS } from "./tween.js";
+
+/**
+ * `engine.time` — the frame clocks plus the scheduler that runs on them.
+ * Exported as a class rather than an instance: unlike `math` it is stateful,
+ * so each engine owns its own (and a headless test can own one too).
+ */
+export { TimeSystem, TimerScope } from "./time.js";
+/**
+ * `engine.math` — gameplay math shared by the engine and user scripts. Only
+ * the namespace is re-exported here: its members (`clamp`, `lerp`, `step`, …)
+ * are common enough words that spilling them into the engine's top-level
+ * surface would collide with something eventually.
+ */
+export { math } from "./math/index.js";
 export {
   CUBEMAP_EXT,
   CUBEMAP_FACES,

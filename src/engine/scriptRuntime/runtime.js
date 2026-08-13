@@ -73,6 +73,21 @@ export {
 } from "three/webgpu";
 
 /**
+ * `engine.math` — gameplay math, the layer above three's types: angle blending
+ * that takes the short way round, frame-rate-independent smoothing, seeded
+ * randomness, noise, ray tests on plain `{x, y, z}` shapes, and aiming
+ * solvers.
+ *
+ * The same object the engine itself uses, so a value computed in a script and
+ * one computed in a component are computed by the same code. Also reachable as
+ * `this.math` and `this.engine.math` without importing anything.
+ *
+ * Only the namespace is exported, not its members: `clamp`, `lerp` and `step`
+ * are words a game's own module is entitled to use.
+ */
+export { math } from "../math/index.js";
+
+/**
  * Component classes for typed lookup. Same constructors the engine registers.
  * Physics / navigation are included even when those modules are disabled —
  * the class is only a type token; attaching still needs the module enabled.
@@ -158,6 +173,35 @@ export function attribute(options = {}) {
     ctor.attributes[key] = options;
   };
 }
+
+/**
+ * `@autobind` — bind a script's methods to their instance once, at the class,
+ * instead of writing `.bind(this)` at every call site. Usable on the whole
+ * class or on a single method; see `autobind.js` for the mechanism.
+ *
+ *     @autobind
+ *     export default class FpsCounter extends Script {
+ *       onStart() { this.engine.time.every(0.25, this.updateFps); }
+ *       updateFps() { this.text.text = `FPS: ${this.engine.stats.fps}`; }
+ *     }
+ */
+export { autobind } from "./autobind.js";
+
+/**
+ * `@listen` — a method that subscribes itself for as long as the script runs.
+ *
+ *     export default class Hud extends Script {
+ *       @listen("score-changed")
+ *       onScore(total) { this.text.text = `${total}`; }
+ *     }
+ *
+ * No `onStart` subscribe, no `onDestroy` unsubscribe, and therefore no way to
+ * forget the second one — which is the leak Unity's `OnEnable`/`OnDisable`
+ * pairing and Godot's `connect`/`disconnect` both leave to the author. Names
+ * are checked against the project's event catalog, so a typo is a compile
+ * error rather than a handler that never fires. See `listen.js`.
+ */
+export { listen } from "./listen.js";
 
 /** This module's own absolute URL — see `threeRuntime.js` for why. */
 export const __SELF_URL__ = import.meta.url;
