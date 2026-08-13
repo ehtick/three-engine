@@ -1,7 +1,7 @@
 import { useProjectStore } from "./store/projectStore.js";
 import { useSelectionStore } from "./store/selectionStore.js";
-import { syncScriptClassNameAfterRename } from "./scriptClassSync.js";
-import { confirm } from "@tauri-apps/plugin-dialog";
+import { syncScriptClassNameAfterRename, retargetScriptPath } from "./scriptClassSync.js";
+import { confirmDestructive } from "./components/ConfirmDialog.jsx";
 
 /**
  * Filesystem operations behind the Assets panel (create / rename / move /
@@ -153,19 +153,18 @@ export async function deleteEntries(entries) {
     list.length === 1
       ? `Delete "${list[0].name}"${list[0].is_dir ? " and everything inside it" : ""}? This can't be undone.`
       : `Delete ${list.length} items? Folders are deleted with everything inside them. This can't be undone.`;
-  let ok = false;
-  try {
-    ok = await confirm(message, {
-      title: list.length === 1 ? "Delete asset" : "Delete assets",
-      kind: "warning",
-    });
-  } catch (err) {
-    // Browser-based development has no native dialog host. Keep asset
-    // deletion usable there and avoid turning a dialog bootstrap failure
-    // into an unhandled rejection.
-    console.warn(`Native delete confirmation unavailable: ${err}`);
-    ok = window.confirm(message);
-  }
+  // In-app, not the OS message box. The native dialog was dismissing itself
+  // — it flashed up, answered `false`, and the delete silently did nothing —
+  // and `window.confirm()`, the old fallback, blocks the main thread and stops
+  // the render loop while it is up. See components/ConfirmDialog.jsx.
+  const ok = await confirmDestructive({
+    title: list.length === 1 ? "Delete asset" : "Delete assets",
+    message,
+    // Multi-select deletes name what they are about to destroy; a single one
+    // is already named in the message.
+    items: list.length > 1 ? list.map((entry) => entry.name) : [],
+    confirmLabel: list.length === 1 ? "Delete" : `Delete ${list.length} items`,
+  });
   if (!ok) return;
 
   const deleted = [];
@@ -257,6 +256,9 @@ export async function renameEntry(entry, newName) {
     // engine base class.
     const newStem = name.replace(/\.(ts|js)$/i, "");
     await syncScriptClassNameAfterRename(newPath, newStem);
+    // …and move what pointed at the old name: open tabs, the shared Monaco
+    // model, and every entity whose Scripts component named this file.
+    await retargetScriptPath(entry.path, newPath);
 
     await useProjectStore.getState().refresh();
   } catch (err) {

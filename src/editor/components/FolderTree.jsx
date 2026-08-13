@@ -368,7 +368,10 @@ export function FolderTree() {
   // Backspace inside the input still edits text.
   useEffect(() => {
     const onKey = (e) => {
-      if (e.target.closest("input")) return;
+      // Optional call: a keydown does not always carry an Element target — a
+      // synthetic event dispatched on `window` hands us the window itself, and
+      // an unguarded `.closest` there takes down the whole handler chain.
+      if (e.target.closest?.("input")) return;
       if (e.key !== "Delete" || !selected.size) return;
       const tree = treeRef.current;
       if (!tree) return;
