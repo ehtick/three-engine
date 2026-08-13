@@ -117,7 +117,13 @@ defineOp({
     projectRoot();
     const wanted = (variants?.length ? variants : ["400"]).map((key) => parseVariant(String(key)));
     const written = await importGoogleFont(family, wanted);
-    return { family, files: written.map(norm) };
+    // The family NAME is what a text surface asks for, not a file path — see
+    // fonts.js on generated family names.
+    return {
+      family,
+      files: written.map(norm),
+      next: "Use the family name (not a file path) wherever a font is selected.",
+    };
   },
 });
 

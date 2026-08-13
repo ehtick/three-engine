@@ -18,22 +18,57 @@ import { openInIDE } from "../../openInIde.js";
 import { revealAssetInPanel } from "../../assetReveal.js";
 import { refreshAssetFromDisk, watchedProjectRoot } from "../../projectWatcher.js";
 
-const norm = (p) => String(p ?? "").replaceAll("\\", "/").replace(/\/+$/, "");
+export const norm = (p) => String(p ?? "").replaceAll("\\", "/").replace(/\/+$/, "");
 
-/** Absolute path inside the open project, or a thrown explanation. */
+/**
+ * Collapses `.` and `..` segments, so the containment check below compares
+ * where a path actually POINTS rather than how it is spelled.
+ *
+ * Without this the check was a string-prefix test against the raw path, and a
+ * prefix is trivially satisfiable while pointing anywhere on the disk:
+ * `<project>/../../.claude/settings.json` starts with the project root and
+ * resolves outside it. That read succeeded. The absolute form of the same file
+ * was correctly refused, which is what made it look like the check worked.
+ *
+ * A leading `..` that would climb above the root is kept as a literal segment
+ * rather than dropped, so the result cannot silently normalise its way back
+ * INSIDE the project and pass.
+ */
+export function resolvePath(path) {
+  const raw = norm(path);
+  if (!raw) return "";
+  // Keep the leading "/" of a POSIX absolute path and the "C:" of a Windows one.
+  const match = /^(\/|[A-Za-z]:\/)/.exec(raw);
+  const prefix = match?.[1] ?? "";
+  const out = [];
+  for (const segment of raw.slice(prefix.length).split("/")) {
+    if (!segment || segment === ".") continue;
+    if (segment === ".." && out.length && out[out.length - 1] !== "..") out.pop();
+    else out.push(segment);
+  }
+  return prefix + out.join("/");
+}
+
+/**
+ * Absolute path inside the open project, or a thrown explanation.
+ *
+ * Returns the RESOLVED path, not the caller's spelling — every op here passes
+ * the result on to a Tauri command, and handing the traversing form to the
+ * filesystem after approving the resolved one would defeat the whole check.
+ */
 function insideProject(path, { forWriting = false } = {}) {
   const root = useProjectStore.getState().rootPath;
   if (!root) throw new Error("No project is open.");
-  const target = norm(path);
-  if (!target) throw new Error("A path is required.");
-  const prefix = `${norm(root)}/`;
-  const isInside = target.toLowerCase().startsWith(prefix.toLowerCase()) || target === norm(root);
+  if (!norm(path)) throw new Error("A path is required.");
+  const target = resolvePath(path);
+  const base = resolvePath(root);
+  const isInside = target.toLowerCase().startsWith(`${base.toLowerCase()}/`) || target === base;
   if (!isInside) {
     throw new Error(
       `"${path}" is outside the open project (${root}). ${forWriting ? "Writes are" : "Reads are"} limited to the project folder.`,
     );
   }
-  return path;
+  return target;
 }
 
 defineOp({
@@ -131,11 +166,13 @@ defineOp({
   name: "asset.watchStatus",
   readOnly: true,
   description:
-    "Whether the editor is watching the project folder for changes made outside it. When `watching` is false (a browser session, or the watcher failed to start) you must call asset.refresh yourself after writing project files with tools other than this API.",
+    "Whether the editor is watching the project folder for changes made outside it. When `watching` is false (a browser session, the watcher failed to start, or the user turned it off in Project Settings — `enabled` says which) you must call asset.refresh yourself after writing project files with tools other than this API.",
   params: {},
   run() {
     const root = watchedProjectRoot();
-    return { watching: !!root, root };
+    const enabled =
+      useProjectStore.getState().projectMeta?.settings?.editor?.watchProject !== false;
+    return { watching: !!root, root, enabled };
   },
 });
 

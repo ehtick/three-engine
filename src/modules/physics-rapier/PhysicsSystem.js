@@ -359,6 +359,16 @@ export class PhysicsSystem {
 
     entity.object3D.getWorldPosition(_pos);
     entity.object3D.getWorldQuaternion(_quat);
+    // A body placed at NaN panics Rapier on the first step and poisons the wasm
+    // module for the session — see #finiteDims. A broken transform is a much
+    // smaller problem than a physics world that can never be stepped again.
+    if (![_pos.x, _pos.y, _pos.z, _quat.x, _quat.y, _quat.z, _quat.w].every(Number.isFinite)) {
+      console.error(
+        `"${entity.name}" has a non-finite world transform, so no physics body was created for it. ` +
+          "Check its position/rotation/scale and those of its ancestors.",
+      );
+      return;
+    }
     const type = rb?.props.bodyType ?? "fixed";
     const desc = (
       type === "dynamic" ? RAPIER.RigidBodyDesc.dynamic()
@@ -665,6 +675,45 @@ export class PhysicsSystem {
     return null;
   }
 
+  /**
+   * Every dimension handed to Rapier, checked for being a finite number first.
+   *
+   * ⚠ A NaN OR INFINITE EXTENT IS NOT A BAD COLLIDER, IT IS A DEAD SESSION.
+   * Rapier's rust panics on a non-finite shape inside `world.step`, and a panic
+   * in wasm leaves the module's RefCell mutably borrowed forever — so every
+   * subsequent call, in any frame, fails with "recursive use of an object
+   * detected which would lead to unsafe aliasing in rust" or "null pointer
+   * passed to rust". Play mode then throws once per frame and never recovers,
+   * `play_set` reports failure for actions that succeeded, and only restarting
+   * the editor clears it. Removing the offending entity does not help: the
+   * module is already poisoned.
+   *
+   * It is reached more easily than a NaN usually is. A collider whose `size`
+   * was stored as the STRING "[5, 6, 7]" (see api/props.js for how values used
+   * to arrive as text) makes `size[0] / 2` NaN; so does a zero-scaled ancestor
+   * fed through a degenerate matrix. The editor API refuses the string now, but
+   * a scene saved while it did not, an imported model, or a script writing
+   * props directly can all still produce one — and the cost of not checking is
+   * out of all proportion to the cost of checking.
+   *
+   * Skipping the collider (returning null) is the survivable failure: the
+   * entity has no collision, the console says exactly which entity and which
+   * number, and the world keeps stepping.
+   */
+  #finiteDims(entity, shape, dims) {
+    for (const [name, value] of Object.entries(dims)) {
+      if (typeof value === "number" && Number.isFinite(value) && value > 0) continue;
+      console.error(
+        `Collider on "${entity.name}": ${shape} ${name} is ${JSON.stringify(value)}, which is not a ` +
+          "positive finite number. Skipping this collider — a non-finite shape crashes the physics " +
+          "world and poisons it for the rest of the session. Check the component's size/radius/height " +
+          "props and the entity's scale.",
+      );
+      return false;
+    }
+    return true;
+  }
+
   #colliderDesc(col, entity, bodyEntity) {
     const { RAPIER } = this;
     const { shape, size, radius, height, offset, friction, restitution, isSensor } = col.props;
@@ -674,11 +723,19 @@ export class PhysicsSystem {
 
     let desc = null;
     if (shape === "box") {
-      desc = RAPIER.ColliderDesc.cuboid((size[0] / 2) * sx, (size[1] / 2) * sy, (size[2] / 2) * sz);
+      const hx = (size?.[0] / 2) * sx, hy = (size?.[1] / 2) * sy, hz = (size?.[2] / 2) * sz;
+      if (!this.#finiteDims(entity, "box", { "half-extent x": hx, "half-extent y": hy, "half-extent z": hz })) {
+        return null;
+      }
+      desc = RAPIER.ColliderDesc.cuboid(hx, hy, hz);
     } else if (shape === "sphere") {
-      desc = RAPIER.ColliderDesc.ball(radius * maxS);
+      const r = radius * maxS;
+      if (!this.#finiteDims(entity, "sphere", { radius: r })) return null;
+      desc = RAPIER.ColliderDesc.ball(r);
     } else if (shape === "capsule") {
-      desc = RAPIER.ColliderDesc.capsule((height / 2) * sy, radius * Math.max(sx, sz));
+      const halfHeight = (height / 2) * sy, r = radius * Math.max(sx, sz);
+      if (!this.#finiteDims(entity, "capsule", { "half-height": halfHeight, radius: r })) return null;
+      desc = RAPIER.ColliderDesc.capsule(halfHeight, r);
     } else if (shape === "mesh") {
       const tri = collectTrimesh(entity.object3D);
       if (!tri) {
@@ -727,6 +784,16 @@ export class PhysicsSystem {
       _pos.applyQuaternion(relQ).add(rel);
       _quat.copy(relQ);
     }
+    // Same reasoning as #finiteDims: a NaN pose panics the world just as surely
+    // as a NaN extent, and `offset` is a vec3 prop like any other. Zero is a
+    // legal translation, so this cannot go through #finiteDims' positive test.
+    if (![_pos.x, _pos.y, _pos.z, _quat.x, _quat.y, _quat.z, _quat.w].every(Number.isFinite)) {
+      console.error(
+        `Collider on "${entity.name}": its pose is not finite (offset ${JSON.stringify(offset)}, ` +
+          `world scale ${_scale.toArray().join(", ")}). Skipping this collider.`,
+      );
+      return null;
+    }
     desc.setTranslation(_pos.x, _pos.y, _pos.z).setRotation({ x: _quat.x, y: _quat.y, z: _quat.z, w: _quat.w });
     return desc;
   }
@@ -742,13 +809,23 @@ export class PhysicsSystem {
     const sy = Math.abs(_scale.y);
     const sxz = Math.max(Math.abs(_scale.x), Math.abs(_scale.z));
 
+    // Same non-finite guard as #colliderDesc, and for the same reason: a NaN
+    // capsule panics Rapier inside `step`, and a wasm panic poisons the module
+    // for the whole session rather than failing this one entity.
+    const halfHeight = (p.height / 2) * sy, radius = p.radius * sxz;
+    if (!this.#finiteDims(entity, "character capsule", { "half-height": halfHeight, radius })
+      || ![_pos.x, _pos.y, _pos.z, ...(p.offset ?? [])].every(Number.isFinite)) {
+      console.error(`Character controller on "${entity.name}" was not built — see above.`);
+      return;
+    }
+
     const body = this.world.createRigidBody(
       RAPIER.RigidBodyDesc.kinematicPositionBased()
         .setTranslation(_pos.x, _pos.y, _pos.z)
         .setRotation({ x: _quat.x, y: _quat.y, z: _quat.z, w: _quat.w }),
     );
 
-    const colDesc = RAPIER.ColliderDesc.capsule((p.height / 2) * sy, p.radius * sxz)
+    const colDesc = RAPIER.ColliderDesc.capsule(halfHeight, radius)
       .setTranslation(p.offset[0] * _scale.x, p.offset[1] * _scale.y, p.offset[2] * _scale.z)
       .setCollisionGroups(this.layers.groupsFor(p.layer));
     const collider = this.world.createCollider(colDesc, body);

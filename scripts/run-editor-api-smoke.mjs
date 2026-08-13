@@ -466,6 +466,149 @@ const out = await page.evaluate(async () => {
   Editor.history.undo();
   report.batchPartialUndone = Editor.entities.all({ nameContains: "BatchOk" }).length === 0;
 
+  // With stopOnError off, EVERY failing step has to be reported. This used to
+  // be one `failure` object that each new failure overwrote, so two of the
+  // three below came back as bare `null`s in `results` with no reason given.
+  const allFailing = await Editor.batch("All broken", [
+    { op: "entity.create", args: { name: "BatchBadA", parentId: "nope-a" } },
+    { op: "entity.create", args: { name: "BatchBadB", parentId: "nope-b" } },
+    { op: "entity.create", args: { name: "BatchBadC", parentId: "nope-c" } },
+  ], { stopOnError: false });
+  report.batchAllFailures = {
+    count: allFailing.failures?.length ?? 0,
+    steps: (allFailing.failures ?? []).map((f) => f.step).join(","),
+    firstIsFailure: allFailing.failure?.step === allFailing.failures?.[0]?.step,
+  };
+
+  // === 9b. QA regressions ==================================================
+  //
+  // One check per defect found by driving the live editor (the QA ledger for
+  // session 2). Each of these SUCCEEDED silently before the fix, which is the
+  // property that makes them worth a permanent test: nothing in the result
+  // said anything was wrong.
+  const qa = Editor.entities.create({
+    name: "QaProbe",
+    transform: { position: [0, 0, 0], scale: [4, 1, 1] },
+    components: [{ type: "mesh", props: { geometry: "box" } }],
+  });
+
+  // BUG-01: values must land as the type they are, and a value that arrives as
+  // its JSON TEXT must be converted or refused — never stored as a string.
+  // `false` stored as "false" is truthy, so it silently did nothing.
+  Editor.components.setProp(qa.id, "mesh", "receiveShadow", false);
+  const meshProps = () => Editor.entities.get(qa.id).components.find((c) => c.type === "mesh")?.props ?? {};
+  const boolStored = meshProps().receiveShadow;
+  await Editor.call("component.setProp", { id: qa.id, type: "mesh", key: "castShadow", value: "true" });
+  const coercedBool = meshProps().castShadow;
+  report.propTypes = {
+    booleanStaysBoolean: boolStored === false,
+    stringifiedBooleanCoerced: coercedBool === true,
+    // The op's own schema must advertise a real type for `value`, which is what
+    // stopped clients stringifying it in the first place.
+    valueSchemaTyped: Array.isArray(
+      tools.find((t) => t.name === "component_setProp")?.inputSchema?.properties?.value?.type,
+    ),
+    // A string that cannot be the declared type is refused, not stored.
+    garbageRefused: await failure(() =>
+      Editor.call("component.setProp", { id: qa.id, type: "mesh", key: "castShadow", value: "yes please" }),
+    ),
+  };
+
+  // BUG-04: unknown keys and out-of-enum values were both accepted and
+  // persisted into the .scene file.
+  report.propValidation = {
+    unknownKeyRejected: await failure(() =>
+      Editor.call("component.setProp", { id: qa.id, type: "mesh", key: "totallyBogusKey", value: 1 }),
+    ),
+    badEnumRejected: await failure(() =>
+      Editor.call("component.setProp", { id: qa.id, type: "mesh", key: "geometry", value: "dodecahedron_nope" }),
+    ),
+    goodEnumAccepted: (() => {
+      Editor.components.setProp(qa.id, "mesh", "geometry", "sphere");
+      return meshProps().geometry === "sphere";
+    })(),
+    stillClean: !("totallyBogusKey" in meshProps()),
+  };
+
+  // BUG-03: entity.create validated nothing about inline components, while
+  // component.add — the other route to the same result — refused them.
+  report.inlineComponentValidated = await failure(() =>
+    Editor.call("entity.create", { name: "QaBad", components: [{ type: "no_such_component_xyz" }] }),
+  );
+
+  // BUG-13: the box came from the bounding SPHERE, so it was always a cube. A
+  // unit box scaled [4,1,1] reported [6.93, 6.93, 6.93].
+  const qaBounds = await Editor.call("entity.getBounds", { id: qa.id });
+  const [bx, by, bz] = qaBounds?.size ?? [];
+  report.aabb = {
+    size: (qaBounds?.size ?? []).map((v) => Math.round(v * 100) / 100).join(","),
+    // Not a cube: X must be about four times Y and Z.
+    notACube: bx > by * 3 && bx > bz * 3,
+    yIsThin: by > 0.5 && by < 1.5,
+  };
+
+  // BUG-08/09: a cycle threw a raw stack overflow AFTER overwriting the local
+  // transform, and left the live Object3D graph cyclic — the next traversal op
+  // (duplicate, save, bounds) then hung the editor outright.
+  const qaChild = Editor.entities.create({ name: "QaChild", parentId: qa.id });
+  const beforeCycle = JSON.stringify(Editor.entities.get(qa.id).transform);
+  report.cycles = {
+    selfRejected: await failure(() => Editor.call("entity.reparent", { id: qa.id, parentId: qa.id })),
+    descendantRejected: await failure(() =>
+      Editor.call("entity.reparent", { id: qa.id, parentId: qaChild.id }),
+    ),
+    transformIntact: JSON.stringify(Editor.entities.get(qa.id).transform) === beforeCycle,
+    // The graph is still traversable: this is the call that used to wedge the
+    // whole application after a failed reparent.
+    stillTraversable: (await Editor.call("entity.duplicate", { ids: [qa.id] })).length === 1,
+  };
+  for (const dup of Editor.entities.all({ nameContains: "QaProbe" })) {
+    if (dup.id !== qa.id) Editor.entities.delete(dup.id);
+  }
+  Editor.entities.delete(qa.id);
+
+  // BUG-05/07: `component.types` is the only description an agent gets, and it
+  // was dropping both function-provided select options and every prop belonging
+  // to a type whose inspector section is hand-written.
+  const types = Editor.components.types();
+  const selects = types.flatMap((t) =>
+    (t.schema ?? []).filter((d) => d.type === "select").map((d) => ({ owner: t.type, ...d })),
+  );
+  const uiElement = types.find((t) => t.type === "uielement");
+  report.typeManifest = {
+    // `options` may be a lazy FUNCTION on the class (physics layer names load
+    // from project settings) — serialising the raw value silently produced a
+    // select with no options at all.
+    everySelectHasOptions: selects.every((d) => Array.isArray(d.options) && d.options.length > 0),
+    selectsWithEmptyOptions: selects
+      .filter((d) => !d.options?.length)
+      .map((d) => `${d.owner}.${d.key}`)
+      .join(","),
+    // Every declared default is reachable from the schema, inferred or not.
+    uiElementDescribesItsDefaults:
+      !uiElement ||
+      Object.keys(uiElement.defaults ?? {})
+        .filter((k) => k !== "enabled")
+        .every((k) => (uiElement.schema ?? []).some((d) => d.key === k)),
+    noDuplicateLabels: (() => {
+      const seen = new Map();
+      for (const t of types) seen.set(t.label, (seen.get(t.label) ?? 0) + 1);
+      return [...seen].filter(([, n]) => n > 1).map(([label]) => label).join(",");
+    })(),
+  };
+
+  // BUG-10: containment compared the raw path string, so prefixing the project
+  // root with enough `..` segments read any file on the machine.
+  const projectRoot = Editor.project.get().rootPath;
+  report.traversal = projectRoot
+    ? {
+        absoluteRefused: await failure(() => Editor.call("asset.read", { path: "C:/Windows/win.ini" })),
+        dotDotRefused: await failure(() =>
+          Editor.call("asset.read", { path: `${projectRoot}/../../.claude/settings.json` }),
+        ),
+      }
+    : { skipped: "no project open" };
+
 
   // === 7. scene / project / play read-only ops =============================
   report.readers = {
@@ -621,6 +764,80 @@ check("a failing step is reported with its index", out.batchFailure.reported ===
 check("…stops the rest by default", out.batchFailure.stopped === true);
 check("…and names the op that failed", out.batchFailure.namesTheOp === true);
 check("a partial batch is still undone in one step", out.batchPartialUndone === true);
+check(
+  "stopOnError:false reports EVERY failure, not just the last",
+  out.batchAllFailures.count === 3 && out.batchAllFailures.steps === "0,1,2",
+  JSON.stringify(out.batchAllFailures),
+);
+check("…with `failure` still holding the first of them", out.batchAllFailures.firstIsFailure === true);
+
+// ---- QA regressions (see the QA ledger, session 2) -------------------------
+check("BUG-01 a boolean prop is stored as a boolean, not \"false\"", out.propTypes.booleanStaysBoolean === true);
+check("…a value that arrives as JSON text is converted back", out.propTypes.stringifiedBooleanCoerced === true);
+check(
+  "…and `value` advertises a real JSON type so clients stop stringifying it",
+  out.propTypes.valueSchemaTyped === true,
+);
+check(
+  "…while text that cannot be the declared type is refused, not stored",
+  /expects a boolean/i.test(out.propTypes.garbageRefused ?? ""),
+  out.propTypes.garbageRefused,
+);
+check(
+  "BUG-04 an unknown prop key is refused",
+  /has no property/i.test(out.propValidation.unknownKeyRejected ?? ""),
+  out.propValidation.unknownKeyRejected,
+);
+check(
+  "…an out-of-enum select value is refused",
+  /not a legal value/i.test(out.propValidation.badEnumRejected ?? ""),
+  out.propValidation.badEnumRejected,
+);
+check("…a legal one still goes through", out.propValidation.goodEnumAccepted === true);
+check("…and nothing bogus was persisted", out.propValidation.stillClean === true);
+check(
+  "BUG-03 entity.create validates its inline component types",
+  /Unknown component type/i.test(out.inlineComponentValidated ?? ""),
+  out.inlineComponentValidated,
+);
+check(
+  "BUG-13 entity.getBounds returns a real AABB, not a sphere-derived cube",
+  out.aabb.notACube === true && out.aabb.yIsThin === true,
+  out.aabb.size,
+);
+check(
+  "BUG-08 parenting an entity to itself is refused",
+  /itself/i.test(out.cycles.selfRejected ?? ""),
+  out.cycles.selfRejected,
+);
+check(
+  "…as is parenting it under its own descendant",
+  /cyclic/i.test(out.cycles.descendantRejected ?? ""),
+  out.cycles.descendantRejected,
+);
+check("…without losing the entity's transform", out.cycles.transformIntact === true);
+check("BUG-09 …and the scene graph is still traversable afterwards", out.cycles.stillTraversable === true);
+check(
+  "BUG-05 every `select` prop carries its options",
+  out.typeManifest.everySelectHasOptions === true,
+  out.typeManifest.selectsWithEmptyOptions,
+);
+check("BUG-07 uielement's props are discoverable through component.types", out.typeManifest.uiElementDescribesItsDefaults === true);
+check(
+  "BUG-06 no two component types share a label",
+  out.typeManifest.noDuplicateLabels === "",
+  out.typeManifest.noDuplicateLabels,
+);
+check(
+  "BUG-10 asset.read refuses an absolute path outside the project",
+  !!out.traversal.skipped || /outside the open project/i.test(out.traversal.absoluteRefused ?? ""),
+  out.traversal.skipped ?? out.traversal.absoluteRefused,
+);
+check(
+  "…and refuses one that escapes with `..`",
+  !!out.traversal.skipped || /outside the open project/i.test(out.traversal.dotDotRefused ?? ""),
+  out.traversal.skipped ?? out.traversal.dotDotRefused,
+);
 
 // --- read-only ops -----------------------------------------------------------
 check("scene.get reads the open scene", out.readers.scene === true);

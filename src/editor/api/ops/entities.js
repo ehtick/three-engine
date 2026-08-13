@@ -29,6 +29,7 @@ import {
 } from "../../commands/componentCommands.js";
 import { SetTransformCommand } from "../../commands/transformCommands.js";
 import { getComponentClass, getComponentTypes } from "../../../engine/index.js";
+import { optionsOf, preparePropValue, preparePropsObject } from "../props.js";
 
 /** Looks an entity up, throwing a useful message rather than returning null —
  *  an automated caller passing a stale id should hear about it. */
@@ -116,7 +117,21 @@ defineOp({
     if (parentId && !engine.getEntity(parentId)) {
       throw new Error(`No entity with id "${parentId}" to parent to.`);
     }
-    const command = new CreateEntityCommand({ name, parentId, transform, components });
+    // Inline components used to go straight through unchecked, so
+    // `[{ type: "no_such_component_xyz" }]` SUCCEEDED and attached a garbage
+    // component — while `component.add`, the other route to the same result,
+    // correctly refused it. The garbage then serialised into the `.scene` file
+    // and the editor warned about it on every subsequent load. Same checks on
+    // both paths, before anything is created.
+    const checked = components.map((entry, index) => {
+      const type = entry?.type;
+      if (!type) throw new Error(`components[${index}] has no "type".`);
+      if (!getComponentClass(type)) {
+        throw new Error(`Unknown component type "${type}" in components[${index}]. See component.types.`);
+      }
+      return { ...entry, type, props: preparePropsObject(type, entry.props ?? {}) };
+    });
+    const command = new CreateEntityCommand({ name, parentId, transform, components: checked });
     commandBus.execute(command);
     return describeEntity(mustGet(command.entityId));
   },
@@ -241,24 +256,51 @@ defineOp({
   name: "component.types",
   readOnly: true,
   description:
-    "List every registered component type with its label and inspector schema. This is how you discover what `component.add` accepts and which props a type has. A prop of type 'select' carries its `options` — those are the only legal values, so read them rather than guessing. A prop whose label says DEPRECATED exists only so older scenes still load; set the prop its label names instead, because writing the deprecated one is ignored once the replacement has been set.",
+    "List every registered component type with its label and inspector schema. This is how you discover what `component.add` accepts and which props a type has. A prop of type 'select' carries its `options` — those are the only legal values, so read them rather than guessing. A prop whose label says DEPRECATED exists only so older scenes still load; set the prop its label names instead, because writing the deprecated one is ignored once the replacement has been set. Entries marked `inferred: true` are props the type has a default for but does not describe in its schema, because its inspector section is hand-written — the key and the default are real, the type is a guess from the default's shape.",
   params: {},
   run() {
     return getComponentTypes().map((type) => {
       const cls = getComponentClass(type);
+      const declared = (cls?.schema ?? []).map((descriptor) => ({
+        key: descriptor.key,
+        label: descriptor.label,
+        type: descriptor.type,
+        // `options` can be a FUNCTION — see optionsOf. Spreading the raw value
+        // put a function into a JSON result, where it vanishes: `collider.layer`
+        // and `charactercontroller.layer` both advertised `type: "select"` with
+        // no options at all, against a description promising the options are the
+        // only legal values.
+        ...(descriptor.options ? { options: optionsOf(descriptor) ?? [] } : {}),
+        ...(descriptor.min !== undefined ? { min: descriptor.min } : {}),
+        ...(descriptor.max !== undefined ? { max: descriptor.max } : {}),
+      }));
+      // A component whose inspector section is hand-written declares
+      // `schema = []` and a full set of defaults — `uielement` exposes
+      // anchorMin, anchorMax, pivot, pos, size, opacity, visible and
+      // raycastTarget that way, none of which were discoverable here. That is
+      // fine for the Inspector and useless for anything reading the API, so the
+      // defaults it does not describe are listed too, marked as inferred.
+      const described = new Set(declared.map((entry) => entry.key));
+      const inferred = Object.entries(cls?.defaults ?? {})
+        .filter(([key]) => !described.has(key) && key !== "enabled")
+        .map(([key, value]) => ({
+          key,
+          label: key,
+          type:
+            typeof value === "number" ? "number"
+            : typeof value === "boolean" ? "boolean"
+            : typeof value === "string" ? "string"
+            : Array.isArray(value) ? "array"
+            : value && typeof value === "object" ? "object"
+            : "any",
+          inferred: true,
+        }));
       return {
         type,
         label: cls?.label ?? type,
         tags: cls?.tags ?? [],
         defaults: { ...(cls?.defaults ?? {}) },
-        schema: (cls?.schema ?? []).map((descriptor) => ({
-          key: descriptor.key,
-          label: descriptor.label,
-          type: descriptor.type,
-          ...(descriptor.options ? { options: descriptor.options } : {}),
-          ...(descriptor.min !== undefined ? { min: descriptor.min } : {}),
-          ...(descriptor.max !== undefined ? { max: descriptor.max } : {}),
-        })),
+        schema: [...declared, ...inferred],
       };
     });
   },
@@ -279,7 +321,7 @@ defineOp({
       throw new Error(`Unknown component type "${type}". See component.types.`);
     }
     if (entity.components.has(type)) throw new Error(`Entity "${entity.name}" already has a "${type}" component`);
-    commandBus.execute(new AddComponentCommand(id, type, props));
+    commandBus.execute(new AddComponentCommand(id, type, preparePropsObject(type, props)));
     return describeEntity(entity);
   },
 });
@@ -304,17 +346,23 @@ defineOp({
 defineOp({
   name: "component.setProp",
   undoable: true,
-  description: "Set one property on an entity's component.",
+  description:
+    "Set one property on an entity's component. The key must be a property the type actually declares (component.types lists them) and, for a 'select' property, the value must be one of its options — both are refused rather than stored, because a props object accepts anything and a bad write would otherwise look like it succeeded.",
   params: {
     id: { type: "string", required: true },
     type: { type: "string", required: true },
     key: { type: "string", required: true },
-    value: { description: "Any JSON value appropriate to the property." },
+    value: {
+      description:
+        "The value itself — a number, boolean, array or object as the property requires. NOT its JSON text: \"7.5\" and \"[1, 2, 3]\" are strings and are refused.",
+    },
   },
   run({ id, type, key, value }) {
     const entity = mustGet(id);
-    if (!entity.components.has(type)) throw new Error(`Entity "${entity.name}" has no "${type}" component`);
-    commandBus.execute(new SetComponentPropCommand(id, type, key, value));
+    const component = entity.components.get(type);
+    if (!component) throw new Error(`Entity "${entity.name}" has no "${type}" component`);
+    const next = preparePropValue(type, key, value, component);
+    commandBus.execute(new SetComponentPropCommand(id, type, key, next));
     return describeEntity(entity);
   },
 });

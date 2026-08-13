@@ -22,19 +22,24 @@ import { invoke } from "../../assetOps.js";
 import { refreshAssetFromDisk } from "../../projectWatcher.js";
 import { MATERIAL_DEFAULTS } from "../../../engine/materialAsset.js";
 import { SCENE_SETTINGS_DEFAULTS, TONE_MAPPINGS } from "../../../engine/sceneSettings.js";
+import { norm, resolvePath } from "./assets.js";
 
-const norm = (p) => String(p ?? "").replaceAll("\\", "/").replace(/\/+$/, "");
-
-/** Same containment rule as the asset ops — see `ops/assets.js` for why. */
+/**
+ * Same containment rule as the asset ops — see `ops/assets.js` for why, and
+ * for why the path is RESOLVED before it is compared. This used to be a second
+ * copy of the check, which meant the `..` escape that was fixed there was still
+ * open here; there is one implementation now.
+ */
 function insideProject(path) {
   const root = useProjectStore.getState().rootPath;
   if (!root) throw new Error("No project is open.");
-  const target = norm(path);
-  const prefix = `${norm(root)}/`;
-  if (!target.toLowerCase().startsWith(prefix.toLowerCase()) && target !== norm(root)) {
+  if (!norm(path)) throw new Error("A path is required.");
+  const target = resolvePath(path);
+  const base = resolvePath(root);
+  if (!target.toLowerCase().startsWith(`${base.toLowerCase()}/`) && target !== base) {
     throw new Error(`"${path}" is outside the open project (${root}).`);
   }
-  return path;
+  return target;
 }
 
 /** `<root>/materials/<Name>.mat`, which is where the Assets panel puts them. */
@@ -46,6 +51,60 @@ function materialPathFor(name) {
 }
 
 // ---- materials --------------------------------------------------------------
+
+/**
+ * What a `.mat` field is allowed to hold.
+ *
+ * Nothing checked these before, so `{ roughness: 5, metalness: -2, color:
+ * "banana", opacity: 42 }` was written verbatim to the user's asset and only
+ * failed later, in three.js, as "THREE.Color: Unknown color banana" — at which
+ * point the bad data is on disk rather than in the call that produced it.
+ *
+ * Ranges are REFUSED rather than clamped. Silently turning `roughness: 5` into
+ * `1` is a different value than the caller asked for, and a caller that meant
+ * `0.5` would never find out; the error names the range and costs one retry.
+ * Only the fields with a real domain are listed — a texture path is checked for
+ * project containment, not for content, and unknown keys are left alone so a
+ * shader-graph material can carry whatever its graph needs.
+ */
+const MATERIAL_UNIT_FIELDS = [
+  "roughness", "metalness", "opacity", "clearcoat", "clearcoatRoughness",
+  "transmission", "sheen", "sheenRoughness", "iridescence", "reflectivity",
+  "alphaTest",
+];
+const MATERIAL_COLOR_FIELDS = ["color", "emissive", "attenuationColor", "sheenColor", "specularColor"];
+const MATERIAL_NON_NEGATIVE_FIELDS = ["emissiveIntensity", "envMapIntensity", "ior", "thickness", "iridescenceIOR"];
+const HEX_COLOR = /^#([0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/i;
+
+function validateMaterialFields(fields) {
+  for (const key of MATERIAL_UNIT_FIELDS) {
+    const value = fields[key];
+    if (value === undefined || value === null) continue;
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1) {
+      throw new Error(`Material "${key}" must be a number between 0 and 1, got ${JSON.stringify(value)}.`);
+    }
+  }
+  for (const key of MATERIAL_NON_NEGATIVE_FIELDS) {
+    const value = fields[key];
+    if (value === undefined || value === null) continue;
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+      throw new Error(`Material "${key}" must be a number of 0 or more, got ${JSON.stringify(value)}.`);
+    }
+  }
+  for (const key of MATERIAL_COLOR_FIELDS) {
+    const value = fields[key];
+    if (value === undefined || value === null) continue;
+    // Numbers are three's other legal colour form (0xff0000) and round-trip
+    // through the .mat fine; anything else has to be a hex string.
+    if (typeof value === "number" && Number.isFinite(value)) continue;
+    if (typeof value !== "string" || !HEX_COLOR.test(value.trim())) {
+      throw new Error(
+        `Material "${key}" must be a hex colour like "#c0392b", got ${JSON.stringify(value)}.`,
+      );
+    }
+  }
+  return fields;
+}
 
 defineOp({
   name: "material.create",
@@ -62,6 +121,7 @@ defineOp({
     opacity: { type: "number", description: "Below 1 also turns on transparency." },
   },
   async run({ name, ...fields }) {
+    validateMaterialFields(fields);
     const path = materialPathFor(name);
     const dir = path.slice(0, path.lastIndexOf("/"));
     await invoke("create_dir", { path: dir }).catch(() => {});
@@ -103,6 +163,7 @@ defineOp({
     patch: { type: "object", required: true, description: "Fields to merge, e.g. { roughness: 0.2 }." },
   },
   async run({ path, patch }) {
+    validateMaterialFields(patch ?? {});
     const target = insideProject(path);
     const current = JSON.parse(await invoke("read_text_file", { path: target }));
     const next = { ...current, ...patch };
@@ -146,7 +207,7 @@ defineOp({
       type: "object",
       required: true,
       description:
-        "Any of: background, ambientColor, ambientIntensity, environment{cubemap,background,lighting,intensity,rotation,blur}, fog{type,color,near,far,density}, toneMapping, exposure, shadow{...}, renderer{...}. Call scene.getSettings first to see the current shape.",
+        "Any of: background, ambientColor, ambientIntensity, environment{cubemap,background,lighting,intensity,rotation,blur}, fog{type,color,near,far,density}, toneMapping, exposure, shadow{...}, renderer{...}, performance{maxDevicePixelRatio,renderScale,dynamicResolution,targetFps,volumeStepScale,autoBatching,staticMerging,occlusionCulling}. Nested blocks are merged key-by-key, so passing one performance knob keeps the rest. Call scene.getSettings first to see the current shape.",
     },
     label: { type: "string", default: "Change scene settings", description: "Undo-menu label." },
   },
@@ -208,8 +269,16 @@ defineOp({
   async run({ id, folder = null }) {
     if (!engine.getEntity(id)) throw new Error(`No entity with id "${id}"`);
     const { createPrefabFromEntity } = await import("../../prefab.js");
-    const path = await createPrefabFromEntity(id, folder ? insideProject(folder) : null);
-    return { path };
+    // Left to itself `defaultPrefabFolder` uses the folder the Assets panel is
+    // BROWSING, which is the right answer for the menu item and the wrong one
+    // here — an API caller has no cursor in the panel, so the prefab landed
+    // wherever the user last clicked (usually the project root) while this op's
+    // description promised the project's prefab folder. Name it explicitly.
+    const root = useProjectStore.getState().rootPath;
+    const target = folder ? insideProject(folder) : root ? `${norm(root)}/prefabs` : null;
+    const path = await createPrefabFromEntity(id, target);
+    if (!path) throw new Error(`Could not create a prefab from entity "${id}" — see the editor console.`);
+    return { path: norm(path) };
   },
 });
 
@@ -239,7 +308,12 @@ defineOp({
       name: name ?? stem,
       parentId,
       transform: position ? { position } : undefined,
-      components: [{ type: "model", props: { src: target } }],
+      // `path`, not `src`. This said `src` for as long as it existed, and
+      // nothing noticed: a props object accepts any key, so the model component
+      // was attached with an undeclared `src` and an empty `path` — an entity
+      // with a Model component that never loaded a model. `component.setProp`'s
+      // new key check is what surfaced it.
+      components: [{ type: "model", props: { path: target } }],
     });
   },
 });

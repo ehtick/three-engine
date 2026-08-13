@@ -192,6 +192,22 @@ export async function callOp(name, args = {}) {
   return op.run(validateArgs(op, args));
 }
 
+/**
+ * What `type: "any"` becomes in JSON Schema.
+ *
+ * NOT an omitted `type`, which is what this used to emit. A property with no
+ * type is under-specified, and an MCP client faced with one is free to send the
+ * value's JSON *text* instead of the value: `component.setProp`'s `value`
+ * arrived as `"7.5"`, `"true"` and `"[5, 6, 7]"` — every boolean set to `false`
+ * became the truthy string `"false"`, and a vec3 became a string that reached
+ * the physics engine as NaN. The same op nested inside `batch`'s `array`
+ * parameter was unaffected, which is what localised it here.
+ *
+ * An explicit union says "genuinely any JSON value" in a form a client can act
+ * on. `ops/props.js` converts anything that still arrives as text.
+ */
+const ANY_JSON_TYPES = ["string", "number", "boolean", "object", "array", "null"];
+
 /** Expands a parameter descriptor map into a JSON Schema object. */
 export function toJsonSchema(params = {}) {
   const properties = {};
@@ -199,7 +215,7 @@ export function toJsonSchema(params = {}) {
   for (const [key, spec] of Object.entries(params)) {
     const type = spec.type ?? "any";
     properties[key] = {
-      ...(type === "any" ? {} : { type }),
+      ...(type === "any" ? { type: [...ANY_JSON_TYPES] } : { type }),
       ...(spec.description ? { description: spec.description } : {}),
       ...(spec.enum ? { enum: spec.enum } : {}),
       ...(spec.default !== undefined ? { default: spec.default } : {}),

@@ -24,15 +24,18 @@ import { defineOp } from "../registry.js";
 import { engine } from "../../engineInstance.js";
 import { getViewportHandle } from "../../viewportHandle.js";
 import { EDITOR_LAYER } from "../../../engine/editorLayers.js";
-import { getEntityBoundingSphere } from "../../../engine/viewFrustum.js";
 import { useConsoleStore } from "../../store/consoleStore.js";
 import { isViewportFreezeEnabled, setViewportFreezeEnabled } from "../../viewportFreeze.js";
+import { renderSelectionOutline } from "../../selectionOutline.js";
 
 /** Caps the readback so a caller can't ask for a gigabyte of pixels. */
 const MAX_DIM = 2048;
 
 const _sphere = new THREE.Sphere();
 const _box = new THREE.Box3();
+const _scratchBox = new THREE.Box3();
+const _vecA = new THREE.Vector3();
+const _vecB = new THREE.Vector3();
 
 /** The camera a screenshot should use: the editor's view, or the game camera. */
 function pickCamera(which) {
@@ -75,6 +78,25 @@ async function capture({ width, height, camera, includeGizmos }) {
     }
     renderer.setRenderTarget(target);
     renderer.render(engine.scene, camera);
+    // The selection outline is a post-render composite over the frame, not an
+    // object in the scene, so unlike the gizmo and grid it is NOT carried by
+    // the layer mask above — replay it explicitly or a screenshot taken with
+    // `includeGizmos` would show every editor aid EXCEPT the one that says
+    // what is selected.
+    if (includeGizmos) {
+      renderSelectionOutline({
+        renderer,
+        scene: engine.scene,
+        camera,
+        target,
+        width,
+        height,
+        // The capture target is sized in absolute pixels, so the outline's
+        // thickness must be measured the same way — the display's pixel ratio
+        // has nothing to do with a 512x512 readback.
+        pixelRatio: 1,
+      });
+    }
     renderer.setRenderTarget(prevTarget);
 
     // NOTE the signature: on WebGPU `readRenderTargetPixelsAsync` RETURNS the
@@ -136,7 +158,7 @@ defineOp({
     includeGizmos: {
       type: "boolean",
       default: false,
-      description: "Include editor-only overlays (grid, light helpers, selection box).",
+      description: "Include editor-only overlays (grid, light helpers, selection outline).",
     },
   },
   async run({ width = 720, height = 480, camera = "editor", includeGizmos = false }) {
@@ -196,17 +218,63 @@ defineOp({
   },
 });
 
-/** World-space bounds of an entity's renderable content, including descendants. */
+/**
+ * World-space bounds of an entity's renderable content, including descendants.
+ *
+ * ## Why this does not use `getEntityBoundingSphere`
+ *
+ * It used to, and it was wrong in two independent ways that both made the
+ * answer fiction rather than an approximation.
+ *
+ * The box came from `Sphere.getBoundingBox`, so it was always a CUBE. A box
+ * mesh scaled [4, 1, 1] reported a size of [6.93, 6.93, 6.93] — the Y extent
+ * seven times too large — which is worse than useless for the one question the
+ * op exists to answer ("how much room does this take up?"). The radius was
+ * `geometryRadius × max(scale)` rather than the real circumscribed sphere, so
+ * it was only correct under uniform scale.
+ *
+ * And the sphere came out of the CULLING cache, which is keyed on the entity's
+ * world translation. Geometry that loads asynchronously — every mesh backed by
+ * a `geometryAsset`, every imported model — swaps in without the entity moving,
+ * so the cache kept answering with the placeholder unit box it was primed with.
+ * The Sponza atrium floor, a 40 m slab, reported a 1.73 m cube. The engine's own
+ * GI auto-fit disagreed with it by a factor of 24 on the same entity.
+ *
+ * So: a real AABB, expanded from each mesh's geometry bounding box through that
+ * mesh's world matrix, computed fresh every call. `Box3.expandByObject` does
+ * exactly this and re-reads geometry bounds rather than trusting a cache.
+ * `entity.getBounds` is called by hand, a handful of times a session — the
+ * culling cache exists for the per-frame path and has no business here.
+ */
 function boundsOf(entity) {
-  const ok = getEntityBoundingSphere(entity, _sphere);
-  if (!ok || !Number.isFinite(_sphere.radius)) return null;
-  _sphere.getBoundingBox(_box);
+  // Matrices first: a mesh added or moved since the last render has a stale
+  // matrixWorld, and expandByObject reads it directly.
+  entity.object3D.updateWorldMatrix(true, true);
+  _box.makeEmpty();
+  let any = false;
+  entity.object3D.traverse((object) => {
+    // Gizmos, outlines and the rest of the editor's furniture are not part of
+    // what the user placed, and would inflate every answer.
+    if (object.layers?.isEnabled?.(EDITOR_LAYER)) return;
+    if (!object.isMesh && !object.isInstancedMesh && !object.isPoints && !object.isLine) return;
+    if (object.visible === false) return;
+    _box.expandByObject(object, true);
+    any = true;
+  });
+  if (!any || _box.isEmpty()) return null;
+  const size = _box.getSize(new THREE.Vector3());
+  const center = _box.getCenter(new THREE.Vector3());
+  if (![...size.toArray(), ...center.toArray()].every(Number.isFinite)) return null;
+  _box.getBoundingSphere(_sphere);
   return {
-    center: _sphere.center.toArray(),
+    center: center.toArray(),
+    // The sphere that actually contains the box, not a scaled geometry radius.
+    // `viewport.focus` frames on this, and the old value put the camera 11.7
+    // units from a 40 m building — inside it, producing a near-black frame.
     radius: _sphere.radius,
     min: _box.min.toArray(),
     max: _box.max.toArray(),
-    size: _box.getSize(new THREE.Vector3()).toArray(),
+    size: size.toArray(),
   };
 }
 
@@ -234,10 +302,12 @@ defineOp({
     } else {
       const box = new THREE.Box3();
       let any = false;
-      for (const entity of engine.entities.values()) {
-        if (!getEntityBoundingSphere(entity, _sphere) || !Number.isFinite(_sphere.radius)) continue;
-        _sphere.getBoundingBox(_box);
-        box.union(_box);
+      // Root entities only: `boundsOf` already includes descendants, so walking
+      // every entity would union each subtree once per level of nesting.
+      for (const entity of engine.rootEntities ?? engine.entities.values()) {
+        const bounds = boundsOf(entity);
+        if (!bounds) continue;
+        box.union(_scratchBox.set(_vecA.fromArray(bounds.min), _vecB.fromArray(bounds.max)));
         any = true;
       }
       if (!any) throw new Error("The scene has nothing renderable to frame.");
@@ -280,7 +350,7 @@ defineOp({
   name: "entity.getBounds",
   readOnly: true,
   description:
-    "World-space bounding box and sphere of an entity's renderable content, including its children. Use it before placing things next to each other — sizes are otherwise unknowable from transforms alone, since a 'box' mesh's real extent depends on its geometry and scale.",
+    "World-space axis-aligned bounding box and sphere of an entity's renderable content, including its children. Use it before placing things next to each other — sizes are otherwise unknowable from transforms alone, since a 'box' mesh's real extent depends on its geometry and scale. `min`/`max`/`size` are a real AABB (a flat slab reports a flat box); `radius` is the sphere that contains it.",
   params: { id: { type: "string", required: true } },
   run({ id }) {
     const entity = engine.getEntity(id);

@@ -56,14 +56,22 @@ defineOp({
     stopOnError: {
       type: "boolean",
       default: true,
-      description: "Stop at the first failing step (default) rather than running the rest.",
+      description:
+        "Stop at the first failing step (default) rather than running the rest. With this off, `failures` lists every step that failed and why; `failure` is the first of them.",
     },
   },
   async run({ label = "Batch", steps, stopOnError = true }) {
     const mark = commandBus.markGroup();
     const results = [];
     const ids = [];
-    let failure = null;
+    // EVERY failure, not just the last one. With `stopOnError: false` this used
+    // to be a single object that each new failure overwrote, so a batch with
+    // three bad steps reported one error and two bare `null`s in `results` with
+    // nothing to say why — the caller had to re-run the steps one at a time to
+    // find out. `failure` stays as the FIRST failure for callers that read it
+    // as a scalar (which is also the useful one: later steps often fail only
+    // because an earlier one did).
+    const failures = [];
 
     /** Substitutes "$N" references with ids produced by earlier steps. */
     const resolve = (value) => {
@@ -87,7 +95,7 @@ defineOp({
       const step = steps[i] ?? {};
       const name = step.op ?? step.name ?? step.tool;
       if (!name) {
-        failure = { step: i, error: 'Each step needs an "op" (e.g. "entity.create")' };
+        failures.push({ step: i, error: 'Each step needs an "op" (e.g. "entity.create")' });
         if (stopOnError) break;
         results.push(null);
         ids.push(null);
@@ -101,7 +109,7 @@ defineOp({
         results.push(result);
         ids.push(result?.id ?? null);
       } catch (err) {
-        failure = { step: i, op: name, error: String(err?.message ?? err) };
+        failures.push({ step: i, op: name, error: String(err?.message ?? err) });
         results.push(null);
         ids.push(null);
         if (stopOnError) break;
@@ -113,7 +121,8 @@ defineOp({
       ran: results.length,
       requested: steps.length,
       undoSteps: collapsed,
-      failure,
+      failure: failures[0] ?? null,
+      failures,
       results,
     };
   },

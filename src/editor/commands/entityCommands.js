@@ -217,6 +217,32 @@ export class ReparentEntityCommand {
    */
   constructor(entityId, newParentId, newIndex = null) {
     const entity = engine.getEntity(entityId);
+    if (!entity) throw new Error(`No entity with id "${entityId}" to reparent.`);
+    // ── REJECT THE CYCLE BEFORE TOUCHING ANYTHING ─────────────────────────
+    //
+    // Parenting an entity under itself, or under one of its own descendants,
+    // used to be caught only by the crash it caused: `Object3D.attach` walks
+    // the new ancestry to rebase the local transform, and a cycle makes that
+    // walk recurse until the stack runs out ("Maximum call stack size
+    // exceeded"). By then attach has ALREADY decomposed the world matrix onto
+    // the entity, so the parent change was correctly not committed while the
+    // local transform was silently reset — with no undo entry, because the
+    // command never reached the bus.
+    //
+    // Worse, the failure was not survivable. The id-graph still read acyclic
+    // (setParent never ran) while the live Object3D graph was left cyclic, so
+    // the NEXT traversal-based operation recursed forever: a subsequent
+    // `entity.duplicate` wedged the whole editor with the render loop pegged
+    // and nothing written to disk. Validating in the constructor means the
+    // throw happens before `commandBus.execute` calls `do()`, so nothing has
+    // been mutated and there is nothing to roll back.
+    if (newParentId && isDescendantOf(newParentId, entityId)) {
+      throw new Error(
+        newParentId === entityId
+          ? `Cannot parent "${entity.name}" to itself.`
+          : `Cannot parent "${entity.name}" to its own descendant — that would make the hierarchy cyclic.`,
+      );
+    }
     this.entityId = entityId;
     this.newParentId = newParentId;
     this.newIndex = newIndex;

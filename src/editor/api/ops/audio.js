@@ -122,6 +122,12 @@ defineOp({
       license: item.license.name,
       attributionRequired: item.license.attribution,
       commercialUseAllowed: item.license.commercial,
+      // Naming the next step, because the shape is not guessable: a Sound
+      // component holds a LIST of entries and the file lives on
+      // `entries[].audioAsset` — not on a `path`, `clip` or `src` prop.
+      next:
+        "component.add — type 'sound' on an entity, props "
+        + "{ entries: [{ audioAsset: <path>, playback: '2D'|'3D', loop: 'no'|'yes' }] }.",
     };
   },
 });

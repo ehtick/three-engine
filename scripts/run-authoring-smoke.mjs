@@ -114,6 +114,57 @@ const out = await page.evaluate(async (projectRoot) => {
   const escaped = await Editor.callTool("material_get", { path: "C:/Windows/win.ini" });
   report.materialContained = escaped.ok === false && /outside the open project/.test(escaped.error ?? "");
 
+  // BUG-11: `roughness: 5`, `metalness: -2`, `color: "banana"` and `opacity: 42`
+  // were all accepted verbatim and written to the user's .mat, only failing
+  // later inside three.js ("THREE.Color: Unknown color banana") — by which time
+  // the invalid data is on disk rather than in the call that produced it.
+  const badPatch = await Editor.callTool("material_set", {
+    path: created.path,
+    patch: { roughness: 5, color: "banana" },
+  });
+  const badCreate = await Editor.callTool("material_create", { name: "QaBad", opacity: 42 });
+  const afterBad = await Editor.materials.get(created.path);
+  report.materialValidation = {
+    rangeRefused: badPatch.ok === false && /between 0 and 1/.test(badPatch.error ?? ""),
+    createRefused: badCreate.ok === false && /between 0 and 1/.test(badCreate.error ?? ""),
+    // Refused means UNCHANGED — a validation that rejects after writing is no
+    // validation at all.
+    assetUntouched: afterBad.definition.roughness === 0.1 && afterBad.definition.color === "#b5482f",
+  };
+  const badColour = await Editor.callTool("material_set", { path: created.path, patch: { color: "banana" } });
+  report.materialColourRefused =
+    badColour.ok === false && /hex colour/.test(badColour.error ?? "");
+
+  // BUG-10: containment compared the RAW path string against the project root,
+  // so prefixing the root with enough `..` segments satisfied the prefix test
+  // while pointing anywhere on the disk. The absolute form was refused
+  // correctly, which is exactly what made the hole look closed.
+  const readAbsolute = await Editor.callTool("asset_read", { path: "C:/Windows/win.ini" });
+  const readTraversal = await Editor.callTool("asset_read", {
+    path: `${projectRoot}/../../../Windows/win.ini`,
+  });
+  const writeTraversal = await Editor.callTool("asset_write", {
+    path: `${projectRoot}/../qa-escape.txt`,
+    contents: "should never be written",
+  });
+  const deleteTraversal = await Editor.callTool("asset_delete", {
+    paths: [`${projectRoot}/../qa-escape.txt`],
+  });
+  report.traversal = {
+    absoluteReadRefused: readAbsolute.ok === false && /outside the open project/.test(readAbsolute.error ?? ""),
+    dotDotReadRefused: readTraversal.ok === false && /outside the open project/.test(readTraversal.error ?? ""),
+    // The write ops share the check, and a traversing write is arbitrary file
+    // write while a traversing delete is not undoable — they were never probed
+    // in the QA pass and are audited here with the read.
+    dotDotWriteRefused: writeTraversal.ok === false && /outside the open project/.test(writeTraversal.error ?? ""),
+    dotDotDeleteRefused: deleteTraversal.ok === false && /outside the open project/.test(deleteTraversal.error ?? ""),
+    // A `..` that stays INSIDE the project is a legal way to spell a path and
+    // must still work, or the fix is a different bug.
+    innocentDotDotAllowed: (await Editor.callTool("asset_read", {
+      path: `${projectRoot}/materials/../materials/Brick.mat`,
+    })).ok === true,
+  };
+
   // A material is only useful if a mesh can actually take it.
   const mesh = Editor.entities.create({
     name: "BrickWall",
@@ -206,6 +257,15 @@ check("material.get reads it back", out.materialRoundTrip === true);
 check("material.set patches only the named fields", out.materialPatch.changed && out.materialPatch.preserved, JSON.stringify(out.materialPatch));
 check("…and derives `transparent` from opacity", out.materialPatch.derivedTransparent === true);
 check("material paths are confined to the project", out.materialContained === true);
+check("material.set refuses an out-of-range scalar", out.materialValidation.rangeRefused === true);
+check("material.create refuses one too", out.materialValidation.createRefused === true);
+check("…and refuses a colour that is not a colour", out.materialColourRefused === true);
+check("…leaving the .mat on disk untouched", out.materialValidation.assetUntouched === true);
+check("asset.read refuses an absolute path outside the project", out.traversal.absoluteReadRefused === true);
+check("…and one that escapes the project with `..`", out.traversal.dotDotReadRefused === true);
+check("asset.write cannot escape with `..` either", out.traversal.dotDotWriteRefused === true);
+check("…nor can asset.delete", out.traversal.dotDotDeleteRefused === true);
+check("…while a `..` that stays inside the project still resolves", out.traversal.innocentDotDotAllowed === true);
 check("the material assigns to a mesh component", out.materialAssignable === true);
 const matOnDisk = fs.existsSync(path.join(root, "materials", "Brick.mat"));
 check("the .mat really exists on disk", matOnDisk, path.join(root, "materials", "Brick.mat"));
