@@ -13,50 +13,16 @@
  * would freeze itself halfway through.
  */
 
-const clamp01 = (t) => (t < 0 ? 0 : t > 1 ? 1 : t);
+import { EASINGS } from "./math/easing.js";
+import { clamp01 } from "./math/scalar.js";
 
 /**
- * The standard easing set. `inOut` variants are the ones worth reaching for by
- * default: a UI element that starts and stops abruptly reads as a jump cut
- * however long the tween is.
+ * The easing set, re-exported from the math package so there is exactly one
+ * table: `math.ease.backOut` and `{ ease: "backOut" }` are the same function.
+ * It lives in `math/easing.js` because a curve is useful well beyond tweening
+ * — a shader uniform, a camera blend, a hand-rolled timer.
  */
-export const EASINGS = {
-  linear: (t) => t,
-  quadIn: (t) => t * t,
-  quadOut: (t) => t * (2 - t),
-  quadInOut: (t) => (t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t),
-  cubicIn: (t) => t * t * t,
-  cubicOut: (t) => 1 + (t - 1) ** 3,
-  cubicInOut: (t) => (t < 0.5 ? 4 * t ** 3 : 1 + 4 * (t - 1) ** 3),
-  quartIn: (t) => t ** 4,
-  quartOut: (t) => 1 - (t - 1) ** 4,
-  quartInOut: (t) => (t < 0.5 ? 8 * t ** 4 : 1 - 8 * (t - 1) ** 4),
-  sineIn: (t) => 1 - Math.cos((t * Math.PI) / 2),
-  sineOut: (t) => Math.sin((t * Math.PI) / 2),
-  sineInOut: (t) => -(Math.cos(Math.PI * t) - 1) / 2,
-  expoIn: (t) => (t === 0 ? 0 : 2 ** (10 * t - 10)),
-  expoOut: (t) => (t === 1 ? 1 : 1 - 2 ** (-10 * t)),
-  expoInOut: (t) =>
-    t === 0 ? 0 : t === 1 ? 1 : t < 0.5 ? 2 ** (20 * t - 10) / 2 : (2 - 2 ** (-20 * t + 10)) / 2,
-  backIn: (t) => 2.70158 * t ** 3 - 1.70158 * t * t,
-  backOut: (t) => 1 + 2.70158 * (t - 1) ** 3 + 1.70158 * (t - 1) ** 2,
-  backInOut: (t) => {
-    const c = 1.70158 * 1.525;
-    return t < 0.5
-      ? ((2 * t) ** 2 * ((c + 1) * 2 * t - c)) / 2
-      : ((2 * t - 2) ** 2 * ((c + 1) * (2 * t - 2) + c) + 2) / 2;
-  },
-  elasticOut: (t) =>
-    t === 0 ? 0 : t === 1 ? 1 : 2 ** (-10 * t) * Math.sin(((t * 10 - 0.75) * 2 * Math.PI) / 3) + 1,
-  bounceOut: (t) => {
-    const n = 7.5625;
-    const d = 2.75;
-    if (t < 1 / d) return n * t * t;
-    if (t < 2 / d) return n * (t -= 1.5 / d) * t + 0.75;
-    if (t < 2.5 / d) return n * (t -= 2.25 / d) * t + 0.9375;
-    return n * (t -= 2.625 / d) * t + 0.984375;
-  },
-};
+export { EASINGS } from "./math/easing.js";
 
 /** Reads a dotted path (`"position.x"`) off an object. */
 function readPath(target, path) {
