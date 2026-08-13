@@ -24,7 +24,7 @@ import { ObjModelComponent } from "./ObjModelComponent.js";
 export const ambientcgModule = {
   id: "ambientcg",
   name: "AmbientCG",
-  category: "Editor",
+  category: "Assets",
   tags: ["editor-import", "assets", "textures", "models", "hdri", "pbr", "cc0"],
   description:
     "Browse and download free CC0 PBR materials, HDRIs and 3D models from ambientcg.com straight into the project. Adds an OBJ Model component for the runtime loader.",

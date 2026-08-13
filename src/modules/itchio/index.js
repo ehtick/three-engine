@@ -8,7 +8,7 @@
 export const itchioModule = {
   id: "itchio",
   name: "itch.io",
-  category: "Editor",
+  category: "Assets",
   tags: ["editor-import", "assets", "itch.io", "publish"],
   description:
     "Search the whole itch.io store and import free asset packs straight into the project, plus your own owned/purchased library. Store browsing is unofficial (it reads itch.io's public pages); downloads go through itch.io's API with your key. Also builds a publish-ready zip for uploading to your own itch.io page.",

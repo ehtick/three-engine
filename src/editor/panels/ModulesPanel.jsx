@@ -29,7 +29,15 @@ const COLLAPSED_KEY = "engine.modules.collapsedCategories";
 
 // Category order shown in the rail — anything not in this list lands at the
 // bottom under "Other", so adding a new category never silently buries it.
-const CATEGORY_ORDER = ["Physics", "Rendering", "Optimization", "World", "Editor", "Other"];
+//
+// "Assets" is the external-library group: Poly Haven, ambientCG, Sketchfab,
+// Poly Pizza, itch.io and the audio library. They used to sit under "Editor"
+// alongside the Texture and Audio editors, which put six things you turn on to
+// GET content in the same list as two things you turn on to MAKE it — and the
+// list was long enough that finding a browser meant reading past the tools.
+// They are also the only modules that carry per-account API keys, so grouping
+// them puts every credential in the project in one place.
+const CATEGORY_ORDER = ["Physics", "Rendering", "Optimization", "World", "Assets", "Editor", "Other"];
 
 /** Lowercase + collapse whitespace so the search predicate stays simple. */
 function norm(s) {
@@ -295,6 +303,19 @@ const CREDENTIAL_PROVIDERS = {
       helpLabel: "Find token",
       load: () => import("../sketchfab.js"),
       openHelp: (mod) => mod.openTokenPage(),
+    },
+  ],
+  // Unlike Sketchfab's, this key gates BROWSING as well as downloading — Poly
+  // Pizza's API has no anonymous read tier — so the panel is inert until it is
+  // filled in, and it points here rather than showing an empty grid.
+  polypizza: [
+    {
+      id: "polypizza",
+      label: "Poly Pizza API key",
+      placeholder: "Poly Pizza API key",
+      helpLabel: "Get key",
+      load: () => import("../polypizza.js"),
+      openHelp: (mod) => mod.openApiKeyPage(),
     },
   ],
   itchio: [

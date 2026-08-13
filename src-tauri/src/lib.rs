@@ -1153,6 +1153,56 @@ async fn fetch_freesound_text(url: String, token: Option<String>) -> Result<Stri
     .map_err(|e| e.to_string())?
 }
 
+/// Poly Pizza's JSON API (`api.poly.pizza/v1.1`) rejects every request without
+/// a key — there is no anonymous read tier at all, so unlike Sketchfab the
+/// *browse* path needs the credential too, not just the download. Same shape as
+/// the proxies above: hardcoded host allowlist so the key cannot be attached to
+/// an arbitrary URL, and the key rides server-side rather than through JS
+/// `fetch`.
+///
+/// The credential is a plain `x-auth-token` header, NOT an `Authorization`
+/// scheme — sending it as `Bearer`/`Token` returns the same 401 as sending
+/// nothing, which reads exactly like a bad key and is worth an hour if you
+/// assume the usual shape.
+///
+/// Only the JSON API needs this. Model binaries live on `static.poly.pizza`
+/// and are served publicly (verified against the live CDN: a ranged GET with
+/// no credential returns 206), so the download reuses the generic
+/// `fetch_bytes` and thumbnails load through a plain `<img>` src.
+///
+/// Errors arrive as an HTTP status with a JSON body that actually explains the
+/// problem ("You need an API key to do that dingus"), which `ureq` turns into a
+/// `Status` error whose body we would otherwise drop — so it is read back out,
+/// the same way `fetch_freesound_text` does it.
+#[tauri::command]
+async fn fetch_polypizza_text(url: String, token: Option<String>) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let parsed = url::Url::parse(&url).map_err(|e| format!("bad Poly Pizza URL: {e}"))?;
+        if parsed.scheme() != "https" || parsed.host_str() != Some("api.poly.pizza") {
+            return Err("Poly Pizza API requests must use https://api.poly.pizza".to_string());
+        }
+
+        let mut req = ureq::get(&url)
+            .set("User-Agent", "three-engine/0.1")
+            .set("Accept", "application/json");
+        if let Some(value) = token.as_deref().filter(|value| !value.is_empty()) {
+            req = req.set("x-auth-token", value);
+        }
+        match req.call() {
+            Ok(response) => response
+                .into_string()
+                .map_err(|e| format!("read Poly Pizza response: {e}")),
+            Err(ureq::Error::Status(code, response)) => {
+                let body = response.into_string().unwrap_or_default();
+                Err(format!("Poly Pizza API {code}: {body}"))
+            }
+            Err(e) => Err(format!("Poly Pizza API: {e}")),
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// itch.io has no public catalog/search API — only the per-account endpoints
 /// above. Browsing the *whole* store means fetching itch.io's own public
 /// browse/search HTML pages and parsing them client-side with the browser's
@@ -1439,6 +1489,7 @@ pub fn run() {
             fetch_itchio_text,
             fetch_itchio_html,
             fetch_freesound_text,
+            fetch_polypizza_text,
             ai_chat,
             pty::pty_spawn,
             pty::pty_write,

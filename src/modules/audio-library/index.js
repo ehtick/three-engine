@@ -16,7 +16,7 @@
 export const audioLibraryModule = {
   id: "audio-library",
   name: "Audio Library",
-  category: "Editor",
+  category: "Assets",
   tags: ["editor-import", "assets", "audio", "sfx", "ambience", "freesound", "cc0"],
   description:
     "Search free game SFX and ambience from Freesound and Wikimedia Commons, audition results in the editor, and import them into the project with licences recorded automatically.",
