@@ -51,6 +51,7 @@ import "./ops/git.js";
 import "./ops/fonts.js";
 import "./ops/batch.js";
 import "./ops/profile.js";
+import "./ops/events.js";
 
 /** Runs an op synchronously, asserting it isn't one of the async ones. Used by
  *  the sync accessors below, where returning a promise would be a footgun. */
@@ -178,6 +179,9 @@ export const EditorApi = {
     get rootPath() {
       return sync("project.get").rootPath;
     },
+    /** Editor behaviour, hot reload, physics layers — project.json's `settings`. */
+    getSettings: () => callOp("project.getSettings"),
+    setSettings: (patch) => callOp("project.setSettings", { patch }),
   },
 
   // ---- assets ---------------------------------------------------------------

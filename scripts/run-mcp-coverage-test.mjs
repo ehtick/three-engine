@@ -60,6 +60,24 @@ for (const file of opFiles) {
 const thin = descriptions.filter((d) => d.length < 40);
 check("every op explains itself to the model calling it", thin.length === 0, thin.map((d) => d.name).join(", "));
 
+// `defineOp` throws at import time when the implementation is missing — which
+// means the editor fails to boot, but only once someone opens it: the build
+// succeeds, every source-scanning test passes, and nothing here noticed. It has
+// happened (an ops file written with `handler:` instead of `run:`), so the scan
+// checks the shape it can actually see.
+const unimplemented = [];
+for (const file of opFiles) {
+  const src = fs.readFileSync(path.join(opDir, file), "utf8");
+  for (const block of src.split("defineOp({").slice(1)) {
+    const name = /name:\s*"([\w.]+)"/.exec(block)?.[1];
+    if (!name) continue;
+    // Only the portion belonging to this op — the next defineOp's body must not
+    // satisfy this one's check.
+    if (!/\brun\s*[:(]/.test(block)) unimplemented.push(name);
+  }
+}
+check("every op has a run() implementation", unimplemented.length === 0, unimplemented.join(", "));
+
 // --- component properties: the half of the surface that is not an op ---------
 //
 // COMPONENT_ONLY below is only honest if `component.setProp` really can reach
@@ -149,6 +167,7 @@ const MODULE_OPS = {
   ambientcg: "library",
   polyhaven: "library",
   sketchfab: "library",
+  polypizza: "library",
   itchio: "library",
   "audio-library": "audio.library",
   "audio-editor": "audio",
@@ -187,6 +206,7 @@ const PANEL_SURFACES = [
   ["undo/redo", "history"],
   ["the Console", "console"],
   ["scene settings", "scene"],
+  ["Project Settings", "project"],
   ["materials", "material"],
   ["prefabs", "prefab"],
   ["the Modules panel", "module"],
@@ -196,6 +216,7 @@ const PANEL_SURFACES = [
   ["the Audio Editor", "audio"],
   ["the asset library browsers", "library"],
   ["Source Control", "git"],
+  ["the Events panel", "events"],
 ];
 for (const [label, group] of PANEL_SURFACES) {
   check(`${label} has tools`, has(group), `${group}.*`);

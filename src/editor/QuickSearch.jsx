@@ -16,6 +16,7 @@ import { useSelectionStore } from "./store/selectionStore.js";
 import { listProjectEntries, withoutSidecars } from "./assetLoader.js";
 import { openPanel } from "./EditorShell.jsx";
 import { useAssetRevealStore } from "./assetReveal.js";
+import { keyScopeOwns } from "./keyScope.js";
 
 const PANELS = [
   ["viewport", "Viewport"], ["game", "Game"], ["hierarchy", "Hierarchy"],
@@ -23,8 +24,9 @@ const PANELS = [
   ["shaderGraph", "Shader Graph"], ["particles", "Particles"], ["animator", "Animator"],
   ["timeline", "Timeline"], ["sceneSettings", "Scene Settings"],
   ["projectSettings", "Project Settings"], ["build", "Build"], ["modules", "Modules"],
-  ["input", "Input"], ["geometryEditor", "Geometry Editor"], ["postprocess", "Post Process"],
+  ["input", "Input"], ["events", "Events"], ["eventGraph", "Event Graph"], ["geometryEditor", "Geometry Editor"], ["postprocess", "Post Process"],
   ["polyhaven", "Poly Haven"], ["ambientcg", "AmbientCG"], ["sketchfab", "Sketchfab"],
+  ["polypizza", "Poly Pizza"],
   ["itchio", "itch.io"], ["audioLibrary", "Audio Library"], ["audioEditor", "Audio Editor"],
   ["terminal", "Terminal"], ["mcp", "Assistant (MCP)"],
   // The panel id doubles as a search keyword (see `panelItems`), so "git"
@@ -96,7 +98,14 @@ export function QuickSearch() {
 
   useEffect(() => {
     const onKey = (event) => {
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "f") {
+      // Capture phase, so this has to check ownership itself: a code editor
+      // claims Ctrl+F for its own find widget, and stealing it here meant the
+      // widget could never be opened. Every other context lets it through.
+      if (
+        (event.ctrlKey || event.metaKey) &&
+        event.key.toLowerCase() === "f" &&
+        !keyScopeOwns(event)
+      ) {
         event.preventDefault();
         event.stopPropagation();
         setOpen(true);

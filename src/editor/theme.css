@@ -2379,13 +2379,189 @@ body.macro-active .viewport-canvas {
   color: var(--text);
 }
 
-/* ---------- Project Settings keybindings table ---------- */
+/* ---------- Settings panels (Project + Scene) -------------------------------
+   A settings sheet, not an inspector. The inspector's .field-row gives every
+   label a fixed 76px column because its rows are "Position X/Y/Z" — three-
+   character labels beside three number fields. Here the labels are phrases
+   ("Watch project files", "Max device pixel ratio") and most controls are one
+   switch or one field.
+
+   The rule that makes it read as a sheet rather than as a pile of widgets:
+   ONE grid, every row the same. Two columns — label, then a control column of
+   fixed width — so every control shares a left edge AND a right edge, switches
+   included. Mixed control widths (a 64px number beside a 132px select beside a
+   148px text field) is what makes a settings panel look ragged and unfinished,
+   and it is the first thing the eye picks up.
+
+   The panels are short and every section collapses, so the inspector's
+   defer-offscreen-sections optimisation costs more than it saves: a collapsed
+   section would reserve 180px it does not use and the scrollbar would lie. */
+.settings-panel > .inspector-section {
+  content-visibility: visible;
+  padding: 0 12px 8px;
+}
+.settings-panel .section-header.toggle {
+  margin: 0;
+  padding: 11px 0 6px;
+  /* .section-header is space-between for the component headers it was written
+     for (title left, action cluster right). This header is a chevron and a
+     title, and space-between throws the title at the far edge. */
+  justify-content: flex-start;
+  /* .section-header.toggle sets `font: inherit` so it stops looking like a
+     button — which also throws away .section-header's own size/weight/tracking
+     and leaves a header noticeably louder than the inspector's. Put them back. */
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+}
+.settings-panel .section-header.toggle:hover {
+  color: var(--text);
+}
+/* The chevron is an affordance, not part of the title — it should not take a
+   slot in the header's rhythm the way a full-size icon would. */
+.settings-panel .section-chevron {
+  opacity: 0.55;
+  margin-left: -2px;
+}
+.settings-panel .settings-section:not(.open) {
+  padding-bottom: 0;
+}
+
+/* Label column FIXED, control column stretches — the way the inspector reads.
+   The other way round (label 1fr, control capped) leaves a dead gutter across
+   the middle of every row and crams the controls into a narrow strip on the
+   right, which is what made this panel read as a mess next to the inspector. */
+.settings-row {
+  display: grid;
+  grid-template-columns: var(--settings-label-w, 140px) minmax(0, 1fr);
+  align-items: center;
+  column-gap: 10px;
+  min-height: 28px;
+}
+/* Dimmed, like the inspector's .field-label: the label is what you scan past,
+   the value is what you read. Full-strength labels make every row shout. */
+.settings-label {
+  min-width: 0;
+  font-size: 12px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.settings-control {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+/* Every field fills the control column; a unit suffix or an icon button takes
+   only what it needs beside it. */
+.settings-control > .number-field,
+.settings-control > .text-field,
+.settings-control > .select-field,
+.settings-control > .asset-field-wrap {
+  flex: 1;
+  width: auto;
+  min-width: 0;
+}
+/* Fixed-size controls (a switch, a colour swatch) sit at the column's LEFT
+   edge, lined up with the left edge of every field — not pinned to the far
+   right where they read as a separate, second column. */
+.settings-control > input[type="checkbox"],
+.settings-control > .color-field,
+.settings-control > .toolbar-btn {
+  flex: none;
+}
+
+/* The one row shape that breaks the grid: a path plus inline actions, where
+   146px minus two icon buttons leaves nothing to read the path in. Used
+   sparingly and on purpose — every `wide` row is a row that no longer lines up
+   with the ones above it, so a second one would look like a mistake. */
+.settings-row.wide {
+  grid-template-columns: 84px minmax(0, 1fr);
+}
+/* A setting that only means something while the one above it is on. Indented
+   and dimmed so the nesting is visible before you find the greyed-out state. */
+.settings-row.sub .settings-label {
+  padding-left: 12px;
+  opacity: 0.82;
+}
+.settings-row.disabled {
+  opacity: 0.38;
+  pointer-events: none;
+}
+/* "ms", "s", "°" — a suffix INSIDE the field, not a flex sibling beside it.
+   Beside it, the unit ate 17px off three rows and those were the only three
+   rows whose field did not reach the panel's right edge, which is exactly the
+   kind of near-miss misalignment the eye reads as sloppy. */
+.settings-unit {
+  position: absolute;
+  right: 9px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 10.5px;
+  color: var(--text-dim);
+  pointer-events: none;
+}
+.settings-control:has(.settings-unit) > .number-field {
+  padding-right: 26px;
+}
+
+/* Prose is the last resort in these panels — anything a tooltip can carry is a
+   tooltip, and what is left is one line. */
+.settings-note {
+  font-size: 10.5px;
+  line-height: 1.4;
+  color: var(--text-dim);
+  margin: 3px 0 5px;
+}
+.settings-note.danger {
+  color: var(--danger);
+}
+.settings-note.footer {
+  padding: 8px 12px 14px;
+  margin: 0;
+}
+
+/* Layer names: eight one-line fields, two per row — one per row spent half the
+   panel's height on strings nobody edits twice. */
+.settings-layer-names {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px 8px;
+  margin: 2px 0 6px;
+}
+.settings-layer-names label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.settings-layer-names label > span {
+  flex: 0 0 12px;
+  font-size: 10px;
+  color: var(--text-dim);
+  text-align: right;
+}
+.settings-layer-names .text-field {
+  flex: 1;
+  width: auto;
+  min-width: 0;
+}
 
 .keybindings-table {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  margin-top: 4px;
+  gap: 4px;
+  margin-top: 2px;
+}
+/* Action names are sentences ("Toggle all unselected (editor)") and the control
+   is one fixed-width chord field, so this is the one place the columns invert:
+   the label takes the room and the field is pinned. */
+.keybindings-table .settings-row {
+  grid-template-columns: minmax(0, 1fr) 152px;
 }
 
 /* Build panel's scene checklist. Capped and scrollable: a project with fifty
@@ -2411,19 +2587,25 @@ body.macro-active .viewport-canvas {
   opacity: 0.7;
 }
 
-.keybinding-row .field-label {
-  flex: 1;
-  min-width: 0;
-}
-
 .keybinding-cell {
   display: inline-flex;
   align-items: center;
   gap: 4px;
 }
 
+/* Inside a settings row the cell IS the control column: the chord field takes
+   what the reset button leaves, so bindings line up with every other control. */
+.settings-control > .keybinding-cell {
+  flex: 1;
+  min-width: 0;
+}
+.settings-control .keybinding-input {
+  flex: 1;
+  width: auto;
+  min-width: 0;
+}
 .keybinding-input {
-  width: 130px;
+  width: 118px;
   cursor: pointer;
 }
 
@@ -3021,11 +3203,45 @@ body.macro-active .viewport-canvas {
   cursor: default;
 }
 
+/* The file field and its six actions.
+   The field wins the space. Seven controls sharing one row let the name
+   ellipsize down to "B..", and a script you can't read the name of is a script
+   you can't tell from the next one — which is the whole point of a list that
+   holds several. So the actions travel as one cluster and wrap to their own
+   line before the name gives up any more width. */
+.script-slot .script-file-row {
+  flex-wrap: wrap;
+  row-gap: 4px;
+}
+
+.script-slot .script-file-row .asset-field-wrap {
+  /* Enough for a real filename ("PlayerController.ts" ellipsizes at roughly
+     this width, and anything shorter reads in full). `min-width` overrides the
+     0 that lets every other asset field collapse. */
+  flex: 1 1 170px;
+  min-width: 170px;
+}
+
+.script-slot-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
+}
+
 /* Inline "name your new script" field: replaces the New button in place, so
    creating a behaviour never leaves the component panel. */
 .script-name-input {
   flex: 1;
   min-width: 0;
+}
+
+/* Naming a new script replaces the New button in place, inside a cluster that
+   is otherwise sized to its icons — without a basis of its own the field would
+   open two characters wide. */
+.script-slot-actions .script-name-input {
+  flex: 1 1 140px;
+  min-width: 90px;
 }
 
 .script-add-row {
@@ -7086,6 +7302,78 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
   font-size: 9px;
 }
 
+/* Interactive GLB preview (components/ModelPreview.jsx). Used in the asset
+   browsers' detail pane, where the question is "what am I about to import". */
+.model-preview-3d {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.model-preview-stage {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  border-radius: var(--r-sm, 5px);
+  overflow: hidden;
+  background:
+    radial-gradient(120% 100% at 50% 0%, rgba(255, 255, 255, 0.06), transparent 70%),
+    var(--bg-2);
+  border: 1px solid var(--bg-3);
+}
+
+.model-preview-stage canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  /* `grab` reads as "you can turn this" before the user tries. `touch-action`
+     keeps a drag from scrolling the detail pane underneath it on a trackpad. */
+  cursor: grab;
+  touch-action: none;
+}
+
+.model-preview-stage canvas:active { cursor: grabbing; }
+
+.model-preview-loading {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font-size: 11px;
+  color: var(--text-dim);
+  pointer-events: none;
+}
+
+.model-preview-clips { max-width: 100%; width: 100%; }
+
+.model-preview-clipname {
+  font-size: 10.5px;
+  color: var(--text-dim);
+  text-align: center;
+}
+
+/* Poly Pizza's "Animated" toggle sits in the same toolbar row as the two
+   dropdowns, so it borrows their height and border rather than reading as a
+   bare checkbox floating next to two framed controls. */
+.pp-animated {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  background: var(--bg-2);
+  border: 1px solid var(--bg-3);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 12px;
+  padding: 4px 8px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.pp-animated input {
+  margin: 0;
+  cursor: pointer;
+}
+
 .sf-description {
   max-height: 100px;
   margin: 0;
@@ -10175,6 +10463,56 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
 
 .texture-dialog.wide { width: 400px; }
 
+/* Destructive confirmation (components/ConfirmDialog.jsx). Sits above every
+   other overlay — including the portalled context menu that usually opens it —
+   because a question about deleting files must not be rendered underneath the
+   thing that asked it. */
+.confirm-backdrop { z-index: 900; }
+
+.confirm-dialog { width: 340px; }
+
+.confirm-items {
+  margin: 2px 0 0;
+  padding: 6px 8px;
+  max-height: 160px;
+  overflow-y: auto;
+  list-style: none;
+  border-radius: var(--r-sm, 5px);
+  background: var(--bg-2);
+  border: 1px solid var(--bg-3);
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.confirm-items li {
+  padding: 1px 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.confirm-items-more { font-style: italic; opacity: 0.75; }
+
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 7px;
+  margin-top: 4px;
+}
+
+/* The destructive button is coloured but NOT focused first — see the header of
+   ConfirmDialog.jsx on why Cancel takes focus. */
+.confirm-actions .toolbar-btn.danger {
+  background: var(--danger, #c0392b);
+  border-color: var(--danger, #c0392b);
+  color: #fff;
+}
+
+.confirm-actions .toolbar-btn:focus-visible {
+  outline: 2px solid var(--accent, #0a84ff);
+  outline-offset: 1px;
+}
+
 @keyframes tx-pop {
   from { opacity: 0; transform: translateY(6px) scale(0.985); }
   to { opacity: 1; transform: none; }
@@ -12677,4 +13015,756 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
   background: var(--accent-soft);
   border-color: var(--accent-ring);
   color: var(--text);
+}
+
+/* --------------------------------------------------------------------------
+   Events panel â€” the project's event catalog + the live emission monitor.
+   Deliberately shares the Input panel's rail-and-detail proportions: the two
+   are the same kind of screen (project-wide, panel-authored data that scripts
+   then consume) and should not look like they came from different editors.
+   -------------------------------------------------------------------------- */
+.events-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background: var(--bg-1);
+}
+.events-tabs {
+  margin-left: auto;
+  display: flex;
+  gap: 2px;
+}
+.events-tab {
+  background: none;
+  border: 1px solid transparent;
+  border-radius: var(--r-input);
+  color: var(--text-dim);
+  font-size: 11px;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+.events-tab.active {
+  background: var(--accent-soft);
+  border-color: var(--accent-ring);
+  color: var(--text);
+}
+.events-errors {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  padding: 6px 12px;
+  font-size: 11px;
+  color: var(--warn, #e0a33e);
+  background: color-mix(in srgb, var(--warn, #e0a33e) 12%, transparent);
+  border-bottom: 1px solid var(--border);
+}
+.events-layout {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+.events-list {
+  width: 230px;
+  flex: none;
+  border-right: 1px solid var(--border);
+  overflow-y: auto;
+  padding: 8px 0;
+}
+.events-filter {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 10px 8px;
+  padding: 3px 8px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-input);
+  color: var(--text-dim);
+}
+.events-filter input {
+  flex: 1;
+  min-width: 0;
+  background: none;
+  border: none;
+  outline: none;
+  color: var(--text);
+  font-size: 11px;
+}
+.events-group-title {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 8px 12px 4px;
+}
+.events-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px 4px 12px;
+  border-left: 2px solid transparent;
+  transition: background 120ms var(--ease);
+}
+.events-row:hover {
+  background: var(--bg-2);
+}
+.events-row.active {
+  background: var(--accent-soft);
+  border-left-color: var(--accent);
+}
+.events-row-name {
+  flex: 1;
+  min-width: 0;
+  background: none;
+  border: none;
+  color: var(--text);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 6px;
+  padding: 0;
+}
+.events-row-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono, ui-monospace, monospace);
+}
+.events-row-arity {
+  font-size: 10px;
+  color: var(--text-dim);
+  background: var(--fill-1);
+  padding: 1px 6px;
+  border-radius: 999px;
+  flex: none;
+}
+.events-hint {
+  display: block;
+  margin-top: 8px;
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--text-dim);
+}
+.events-hint code {
+  font-size: 10px;
+  background: var(--fill-1);
+  padding: 0 3px;
+  border-radius: 3px;
+}
+.events-main {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px 14px;
+}
+.events-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.events-field {
+  display: grid;
+  grid-template-columns: 90px 1fr;
+  align-items: center;
+  gap: 8px;
+}
+.events-field-tall {
+  align-items: start;
+}
+.events-field > label {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.events-field input[type="text"],
+.events-field select,
+.events-field textarea {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-input);
+  color: var(--text);
+  font-size: 12px;
+  padding: 4px 8px;
+  outline: none;
+  width: 100%;
+  font-family: inherit;
+  resize: vertical;
+}
+.events-field input.invalid {
+  border-color: var(--danger, #d05a5a);
+}
+.events-inline-error {
+  font-size: 11px;
+  color: var(--danger, #d05a5a);
+  padding-left: 98px;
+}
+.events-scope-hint {
+  font-size: 10px;
+  color: var(--text-dim);
+  padding-left: 98px;
+  margin-top: -4px;
+}
+.events-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 10px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.events-empty-params {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-style: italic;
+}
+.events-param {
+  display: grid;
+  grid-template-columns: 1.1fr 0.9fr auto 1.4fr auto auto auto;
+  gap: 5px;
+  align-items: center;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-input);
+  padding: 4px 6px;
+}
+.events-param input[type="text"],
+.events-param select {
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: var(--r-input);
+  color: var(--text);
+  font-size: 11px;
+  padding: 3px 6px;
+  outline: none;
+  min-width: 0;
+  width: 100%;
+}
+.events-param-name {
+  font-family: var(--mono, ui-monospace, monospace);
+}
+.events-param-optional {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 10px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.events-signature {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.events-signature-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-input);
+  padding: 5px 8px;
+}
+.events-signature-row code {
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  white-space: pre;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 11px;
+  color: var(--text);
+}
+.events-listeners {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.events-listeners.none {
+  color: var(--warn, #e0a33e);
+}
+.events-usages {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+.events-usage {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  align-items: flex-start;
+  text-align: left;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-input);
+  padding: 4px 8px;
+  cursor: pointer;
+  width: 100%;
+}
+.events-usage:hover {
+  border-color: var(--accent-ring);
+}
+.events-usage-file {
+  font-size: 10px;
+  color: var(--accent);
+}
+.events-usage code {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+/* ---- Monitor ---- */
+.events-monitor {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+.events-monitor-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+}
+.events-monitor-bar .events-filter {
+  margin: 0;
+  flex: 1;
+}
+.events-rec {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.events-rec.on {
+  color: var(--danger, #d05a5a);
+}
+.events-follow {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.events-monitor-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 0;
+}
+.events-emission {
+  display: grid;
+  grid-template-columns: 110px 180px 1fr 28px auto;
+  gap: 8px;
+  align-items: center;
+  padding: 2px 10px;
+  font-size: 11px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 40%, transparent);
+}
+.events-emission:hover {
+  background: var(--bg-2);
+}
+.events-emission-source {
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.events-emission-name {
+  font-family: var(--mono, ui-monospace, monospace);
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.events-emission-args {
+  font-family: var(--mono, ui-monospace, monospace);
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.events-emission-listeners {
+  text-align: right;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+/* An emit nobody heard â€” the thing people are usually here to find. */
+.events-emission.unheard .events-emission-name {
+  color: var(--warn, #e0a33e);
+}
+.events-emission.unheard .events-emission-listeners {
+  color: var(--warn, #e0a33e);
+}
+.events-declare {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-ring);
+  border-radius: var(--r-input);
+  color: var(--accent);
+  font-size: 10px;
+  padding: 1px 6px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+/* --------------------------------------------------------------------------
+   Event wiring in the inspector â€” the reusable action list (a UI button's
+   onClick) and the Events component's WHEN â†’ THEN table.
+   -------------------------------------------------------------------------- */
+.event-block {
+  margin-top: 8px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+}
+.event-block-title {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 6px;
+}
+.event-empty {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-style: italic;
+  padding: 4px 0 6px;
+  line-height: 1.5;
+}
+.event-actions,
+.event-bindings {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.event-action,
+.event-binding {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  overflow: hidden;
+}
+.event-action.off,
+.event-binding.off {
+  opacity: 0.5;
+}
+.event-action-head,
+.event-binding-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 6px;
+}
+.event-action-kind {
+  flex: none;
+  width: 132px;
+  font-size: 11px;
+}
+.event-action-summary,
+.event-binding-when {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.event-binding-when {
+  color: var(--text);
+  font-size: 11px;
+}
+.event-binding-count {
+  font-size: 10px;
+  color: var(--text-dim);
+  background: var(--fill-1);
+  padding: 1px 6px;
+  border-radius: 999px;
+  flex: none;
+  white-space: nowrap;
+}
+.event-binding-flag {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 10px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  flex: none;
+}
+.event-action-body,
+.event-binding-body {
+  padding: 6px 8px 8px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.event-action-field {
+  display: grid;
+  grid-template-columns: 82px 1fr;
+  align-items: center;
+  gap: 6px;
+}
+.event-action-field > label {
+  font-size: 11px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.event-when {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding-bottom: 4px;
+}
+.event-then {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding-top: 4px;
+  border-top: 1px solid var(--border);
+}
+.event-args {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.event-arg {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.event-arg .text-field {
+  flex: 1;
+  min-width: 0;
+}
+.event-arg-hint {
+  font-size: 10px;
+  color: var(--text-dim);
+  line-height: 1.5;
+}
+.event-arg-hint code {
+  background: var(--fill-1);
+  padding: 0 3px;
+  border-radius: 3px;
+  font-size: 10px;
+}
+
+/* The link from the Events component's row list to its graph panel. */
+.event-graph-link {
+  align-self: flex-start;
+  margin-bottom: 4px;
+}
+/* One-line string field on a graph node. Matches .gf-select's metrics so a
+   node mixing the two doesn't step. */
+.gf-text {
+  width: 100%;
+  min-width: 0;
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: var(--r-input);
+  color: var(--text);
+  font-size: 10px;
+  padding: 2px 5px;
+  outline: none;
+}
+.gf-text:focus {
+  border-color: var(--accent-ring);
+}
+
+/* --------------------------------------------------------------------------
+   Events panel, second pass. The first one leaned on `.inspector-panel.empty`
+   for its empty states â€” that class is `display:flex` with no direction, so a
+   text node beside a sibling element became two columns of one word each.
+   These states are purpose-built instead.
+   -------------------------------------------------------------------------- */
+.events-count {
+  margin-left: 6px;
+  font-size: 10px;
+  color: var(--text-dim);
+  background: var(--fill-1);
+  padding: 1px 6px;
+  border-radius: 999px;
+}
+.events-rail-empty {
+  padding: 10px 12px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-dim);
+  font-style: italic;
+}
+
+/* The right pane before anything is selected â€” the panel's largest surface. */
+.events-splash {
+  max-width: 560px;
+  margin: 0 auto;
+  padding: 18px 4px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.events-splash h2 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: 0.2px;
+}
+.events-splash p {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-dim);
+}
+.events-splash code {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 11px;
+  background: var(--fill-1);
+  padding: 0 4px;
+  border-radius: 3px;
+  color: var(--text);
+}
+.events-splash-code {
+  margin: 2px 0;
+  padding: 10px 12px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 11px;
+  line-height: 1.7;
+  color: var(--text-dim);
+  overflow-x: auto;
+  white-space: pre;
+}
+.events-splash-code .k {
+  color: var(--accent);
+}
+.events-splash-code .s {
+  color: var(--ok, #7fc98a);
+}
+.events-splash-sub {
+  margin-top: 4px !important;
+  font-size: 11px !important;
+}
+.events-starters {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.events-starter {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  width: 100%;
+  text-align: left;
+  padding: 8px 10px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  cursor: pointer;
+  transition: border-color 120ms var(--ease), background 120ms var(--ease);
+}
+.events-starter:hover {
+  border-color: var(--accent-ring);
+  background: var(--bg-3);
+}
+.events-starter-name {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 12px;
+  color: var(--text);
+}
+.events-starter-desc {
+  font-size: 11px;
+  color: var(--text-dim);
+  line-height: 1.4;
+}
+.events-splash-foot {
+  margin-top: 6px !important;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  font-size: 11px !important;
+}
+.events-splash-foot strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* A catalog row reads as a signature, so the list answers "what does this
+   event take" without a click. */
+.events-row-params {
+  color: var(--text-dim);
+  font-size: 11px;
+}
+.events-row-scope {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--text-dim);
+  background: var(--fill-1);
+  padding: 1px 5px;
+  border-radius: 3px;
+  flex: none;
+}
+
+/* Live run trace on the event graph. `graph-node-running` is the node the flow
+   is passing through right now; `graph-node-ran` fades out behind it, so a
+   branch you took a second ago is still readable. */
+.react-flow__node.graph-node-running .graph-node,
+.react-flow__node.graph-node-running.shader-node {
+  border-color: var(--ok, #7fc98a);
+  box-shadow: 0 0 0 1px var(--ok, #7fc98a), 0 0 14px -2px var(--ok, #7fc98a);
+}
+.react-flow__node.graph-node-ran .graph-node,
+.react-flow__node.graph-node-ran.shader-node {
+  border-color: color-mix(in srgb, var(--ok, #7fc98a) 55%, var(--border));
+}
+
+.events-graph-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  height: 100%;
+  padding: 16px;
+  text-align: center;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+.events-graph-empty p {
+  margin: 0;
+  max-width: 320px;
+  line-height: 1.6;
+}
+.events-graph-empty strong {
+  color: var(--text);
+  font-weight: 600;
 }

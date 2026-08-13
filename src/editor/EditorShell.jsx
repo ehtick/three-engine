@@ -3,6 +3,7 @@ import { DockviewReact, themeAbyss } from "dockview-react";
 import { vmSingleton } from "./singleton.js";
 import { QuickSearch } from "./QuickSearch.jsx";
 import { Toasts } from "./Toasts.jsx";
+import { ConfirmDialogHost } from "./components/ConfirmDialog.jsx";
 
 // Bumped to v2 when the "material" panel was removed (materials are edited only
 // through the Shader Graph now). A v1 layout can still contain a Material tab,
@@ -27,11 +28,14 @@ const SceneSettingsPanel = lazy(() => import("./panels/SceneSettingsPanel.jsx").
 const ProjectSettingsPanel = lazy(() => import("./panels/ProjectSettingsPanel.jsx").then((m) => ({ default: m.ProjectSettingsPanel })));
 const ModulesPanel = lazy(() => import("./panels/ModulesPanel.jsx").then((m) => ({ default: m.ModulesPanel })));
 const InputPanel = lazy(() => import("./panels/InputPanel.jsx").then((m) => ({ default: m.InputPanel })));
+const EventsPanel = lazy(() => import("./panels/EventsPanel.jsx").then((m) => ({ default: m.EventsPanel })));
+const EventGraphPanel = lazy(() => import("./panels/EventGraphPanel.jsx").then((m) => ({ default: m.EventGraphPanel })));
 const GeometryEditorPanel = lazy(() => import("./panels/GeometryEditorPanel.jsx").then((m) => ({ default: m.GeometryEditorPanel })));
 const PostprocessPanel = lazy(() => import("./panels/PostprocessPanel.jsx").then((m) => ({ default: m.PostprocessPanel })));
 const PolyHavenPanel = lazy(() => import("./panels/PolyHavenPanel.jsx").then((m) => ({ default: m.PolyHavenPanel })));
 const AmbientCGPanel = lazy(() => import("./panels/AmbientCGPanel.jsx").then((m) => ({ default: m.AmbientCGPanel })));
 const SketchfabPanel = lazy(() => import("./panels/SketchfabPanel.jsx").then((m) => ({ default: m.SketchfabPanel })));
+const PolyPizzaPanel = lazy(() => import("./panels/PolyPizzaPanel.jsx").then((m) => ({ default: m.PolyPizzaPanel })));
 const ItchioPanel = lazy(() => import("./panels/ItchioPanel.jsx").then((m) => ({ default: m.ItchioPanel })));
 const AudioLibraryPanel = lazy(() => import("./panels/AudioLibraryPanel.jsx").then((m) => ({ default: m.AudioLibraryPanel })));
 const AudioEditorPanel = lazy(() => import("./panels/AudioEditorPanel.jsx").then((m) => ({ default: m.AudioEditorPanel })));
@@ -75,11 +79,14 @@ const panelComponents = {
   build: withPanelSuspense(BuildPanel),
   modules: withPanelSuspense(ModulesPanel),
   input: withPanelSuspense(InputPanel),
+  events: withPanelSuspense(EventsPanel),
+  eventGraph: withPanelSuspense(EventGraphPanel),
   geometryEditor: withPanelSuspense(GeometryEditorPanel),
   postprocess: withPanelSuspense(PostprocessPanel),
   polyhaven: withPanelSuspense(PolyHavenPanel),
   ambientcg: withPanelSuspense(AmbientCGPanel),
   sketchfab: withPanelSuspense(SketchfabPanel),
+  polypizza: withPanelSuspense(PolyPizzaPanel),
   itchio: withPanelSuspense(ItchioPanel),
   audioLibrary: withPanelSuspense(AudioLibraryPanel),
   audioEditor: withPanelSuspense(AudioEditorPanel),
@@ -130,11 +137,14 @@ export const PANEL_SPECS = {
   build: { title: "Build", position: { referencePanel: "inspector", direction: "within" } },
   modules: { title: "Modules", position: { referencePanel: "inspector", direction: "within" } },
   input: { title: "Input", position: { referencePanel: "viewport", direction: "below" }, initialHeight: 280 },
+  events: { title: "Events", position: { referencePanel: "viewport", direction: "below" }, initialHeight: 300 },
+  eventGraph: { title: "Event Graph", position: { referencePanel: "viewport", direction: "within" } },
   geometryEditor: { title: "Geometry Editor", position: { referencePanel: "viewport", direction: "within" } },
   postprocess: { title: "Post Process", position: { referencePanel: "inspector", direction: "within" } },
   polyhaven: { title: "Poly Haven", position: { referencePanel: "assets", direction: "within" } },
   ambientcg: { title: "AmbientCG", position: { referencePanel: "assets", direction: "within" } },
   sketchfab: { title: "Sketchfab", position: { referencePanel: "assets", direction: "within" } },
+  polypizza: { title: "Poly Pizza", position: { referencePanel: "assets", direction: "within" } },
   itchio: { title: "itch.io", position: { referencePanel: "assets", direction: "within" } },
   audioLibrary: { title: "Audio Library", position: { referencePanel: "assets", direction: "within" } },
   // Docks with the Assets strip for the same reason the Texture Editor does:
@@ -473,7 +483,14 @@ function buildDefaultLayout(api) {
 
 /**
  * Double-click a tab (or the empty part of a tab bar) to fill the window with
- * that panel; Escape puts it back.
+ * that panel; double-click again to put it back.
+ *
+ * The same gesture both ways, and no keyboard exit. Escape used to un-maximize,
+ * and that was wrong far more often than it was right: inside a maximized panel
+ * Escape is the key that cancels a transform, closes a popover, drops a picker
+ * or leaves a modal tool, and every one of those presses also threw away the
+ * layout the user had deliberately asked for. A gesture that only the tab bar
+ * can trigger can't be hit while working inside the panel.
  *
  * Dockview has the maximize API but binds no gesture to it, so a panel can only
  * be enlarged by dragging splitters — and there is no way at all to get a
@@ -506,20 +523,7 @@ function installMaximizeGestures(api, container) {
     else group.api.maximize?.();
   };
 
-  const onKeyDown = (event) => {
-    // Bubble phase and `defaultPrevented`-aware on purpose: a dialog, a rename
-    // field or a modal tool gets Escape first and stops it. Un-maximizing is
-    // the LAST thing Escape should mean, not the first.
-    if (event.key !== "Escape" || event.defaultPrevented) return;
-    if (!api.hasMaximizedGroup?.()) return;
-    const active = document.activeElement;
-    if (active instanceof HTMLElement && /input|textarea|select/i.test(active.tagName)) return;
-    if (document.querySelector(".dropdown-menu, .texture-dialog, .modal, [role='dialog']")) return;
-    api.exitMaximizedGroup();
-  };
-
   container.addEventListener("dblclick", onDoubleClick);
-  window.addEventListener("keydown", onKeyDown);
 
   // The layout change itself is instant (dockview hides the other groups), so
   // the animation is on the group that survives: without it a panel filling the
@@ -592,6 +596,12 @@ export function EditorShell() {
       </Suspense>
       <QuickSearch />
       <Toasts />
+      {/* Statically imported and mounted unconditionally, not lazy: a
+          destructive action asks its question through this, and
+          `confirmDestructive` answers "no" when no host is mounted — so a
+          host that arrives one Suspense tick late would silently refuse a
+          delete the user did ask for. */}
+      <ConfirmDialogHost />
       <div className="dock-container">
         <DockviewReact
           components={panelComponents}

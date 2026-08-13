@@ -4,6 +4,7 @@ import { rewriteComponentAssets, DOCUMENT_KINDS, extOf, ASSET_EXTENSIONS } from 
 import { BUILD_DEFAULTS, resolveBuildScenes, normalizeRelPath, toProjectRelative } from "./build/buildSettings.js";
 import { themePlayerHtml, injectLivePreviewClient, PREVIEW_REVISION_PATH } from "./build/playerHtml.js";
 import { desktopScaffoldFiles } from "./build/desktopScaffold.js";
+import { serializeEventCatalog } from "../engine/events/catalog.js";
 
 /**
  * Builds the project into a standalone, playable game: the prebuilt player
@@ -326,6 +327,10 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
     const enabledModules = [...useModulesStore.getState().enabled];
     scene.modules = enabledModules;
     scene.input = engine.input.toJSON();
+    // The project's declared events. Carried as the normalized catalog rather
+    // than the raw project.json block so a build can't ship an entry the editor
+    // was already ignoring.
+    scene.events = serializeEventCatalog(engine.events.list());
     // The collision-layer matrix is project-wide, and a build with the wrong
     // matrix has every bullet hitting the player who fired it.
     scene.physics = {

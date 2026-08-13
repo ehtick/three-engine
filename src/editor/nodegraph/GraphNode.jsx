@@ -46,6 +46,23 @@ function Widget({ spec, value, onChange }) {
       return <BoolField value={!!v} onChange={onChange} />;
     case "select":
       return <SelectField value={v} options={spec.options ?? []} onChange={onChange} />;
+    // A one-line string. `code` already existed for multi-line expressions, but
+    // a textarea for a method name or an input action reads as "write some code
+    // here" and takes three rows to do it. Added for the event graph, where
+    // most fields are short strings.
+    case "string":
+    case "text":
+      return (
+        <input
+          type="text"
+          className="gf-text nodrag nopan"
+          spellCheck={false}
+          placeholder={spec.placeholder ?? ""}
+          value={v ?? ""}
+          onChange={(e) => onChange(e.target.value, true)}
+          onBlur={(e) => onChange(e.target.value, false)}
+        />
+      );
     case "curve":
       return <CurveField value={v} yMin={spec.min ?? 0} yMax={spec.max ?? 1} onChange={onChange} />;
     case "gradient":

@@ -16,6 +16,10 @@ import { REVISION } from "three/webgpu";
  * - `<project>/engine-types/three/`       — vendored `@types/three`
  * - `<project>/engine-types/.three-version` — version gate for the above
  * - `<project>/tsconfig.json`             — exposes `engine` + `three` via paths
+ * - `<project>/project-events.d.ts`       — the project's own declared events.
+ *   At the ROOT rather than in `engine-types/`, because that folder is in
+ *   `exclude` and a module augmentation only applies when the file is part of
+ *   the program. See `projectEventTypes.js`.
  *
  * The user's IDE reads `tsconfig.json` from the open file's nearest parent,
  * so as long as they have a script somewhere under the project root, the IDE
@@ -190,6 +194,33 @@ export async function scaffoldProjectTypes(projectRoot) {
     contents: THREE_DTS,
   });
   await scaffoldThreeTypes(invoke, engineTypesDir);
+  // The project's own declared events, generated from project.json's `events`
+  // block. Read here rather than passed in so both callers (project open, and
+  // the Assets panel's manual refresh) get it without either having to know the
+  // catalog exists. Note the destination is the project ROOT, not
+  // `engine-types/` — see projectEventTypes.js for why that is load-bearing.
+  try {
+    const meta = JSON.parse(await invoke("read_text_file", { path: `${projectRoot}/project.json` }));
+    const { writeProjectEventTypes, syncProjectEventTypesToMonaco } = await import(
+      "./projectEventTypes.js"
+    );
+    const generated = await writeProjectEventTypes(projectRoot, meta?.events);
+    await syncProjectEventTypesToMonaco(generated);
+  } catch {
+    // No project.json, or unreadable — nothing to generate from.
+  }
+  // The project's own script classes and hook names, which is what makes
+  // `getScript`/`dispatch` type-checked. Same root placement, same reason.
+  // Not fatal and not awaited-for-correctness: a project whose script types
+  // are missing still runs, it just autocompletes less.
+  try {
+    const { writeProjectScriptTypes, syncProjectScriptTypesToMonaco } = await import(
+      "./projectScriptTypes.js"
+    );
+    await syncProjectScriptTypesToMonaco(await writeProjectScriptTypes(projectRoot));
+  } catch (err) {
+    console.warn(`Couldn't generate script declarations: ${err}`);
+  }
   // tsconfig.json: only write if missing. Users sometimes have their own
   // (e.g. with extra strict flags); we shouldn't silently overwrite those.
   // A `jsconfig.json` counts as "configured" too — it's the same shape, just

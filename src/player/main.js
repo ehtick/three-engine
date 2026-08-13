@@ -171,6 +171,10 @@ async function boot() {
   // Input config next — the manager is attached during init(), so swapping
   // the snapshot detaches/re-attaches to keep listeners consistent.
   if (config.input) engine.applyInput(config.input);
+  // The project's event catalog. Descriptive only — an undeclared event still
+  // fires — but `engine.events.has`/`list` are script-facing, so a build that
+  // shipped without it would answer differently than the editor did.
+  if (config.events) engine.applyEvents(config.events);
 
   // Project settings embedded at export time.
   if (config.player?.title) document.title = config.player.title;

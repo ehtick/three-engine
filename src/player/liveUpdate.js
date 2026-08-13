@@ -206,6 +206,7 @@ export function installLiveUpdate(engine, { refreshScript }) {
       // the author just enabled starts and a disabled one is torn down.
       if (Array.isArray(json.modules)) await applyEngineModules(engine, json.modules);
       if (json.input) engine.applyInput(json.input);
+      if (json.events) engine.applyEvents(json.events);
       // Parked pool instances are not in the snapshot, so the reconcile would
       // destroy them out from under their buckets. Clearing first is what both
       // other restore paths do (`#unloadAll`, leaving Play).

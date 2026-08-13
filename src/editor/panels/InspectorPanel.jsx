@@ -55,6 +55,7 @@ import { ListenerSection } from "../components/ListenerSection.jsx";
 import { TerrainSection } from "../components/TerrainSection.jsx";
 import { TimelineSection } from "../components/TimelineSection.jsx";
 import { LinePointsSection, DecalSection, TrailSection } from "../components/VfxSections.jsx";
+import { EventBindingsSection, ActionListSections } from "../components/EventSections.jsx";
 import { LodSection } from "../components/LodSection.jsx";
 import { ImpostorSection } from "../components/ImpostorSection.jsx";
 import { SplineSection, SplineMeshSection, SplineFollowerSection } from "../components/SplineSection.jsx";
@@ -485,7 +486,15 @@ function EntityRefField({ descriptor, value, onCommit }) {
   );
 }
 
-function PropField({ descriptor, value, onCommit, mixed = false, mixedAxes = [] }) {
+/**
+ * One typed property editor, chosen by `descriptor.type`.
+ *
+ * Exported so sections living in their own files (the event wiring in
+ * `components/EventSections.jsx`) render entity pickers, asset pickers and
+ * selects identically to the generic field list rather than growing a second,
+ * slightly-different set.
+ */
+export function PropField({ descriptor, value, onCommit, mixed = false, mixedAxes = [] }) {
   switch (descriptor.type) {
     case "asset":
       return <AssetField descriptor={descriptor} value={mixed ? "" : value} onCommit={onCommit} />;
@@ -676,82 +685,88 @@ function ScriptsSection({ entityId, props }) {
         const enabled = slot.enabled !== false;
         return (
           <div className="script-slot" key={index}>
-            <div className="field-row">
+            <div className="field-row script-file-row">
               <AssetField
                 descriptor={{ key: `script-${index}`, label: "File", exts: SCRIPT_FILE_EXTS }}
                 value={slot.path ?? ""}
                 onCommit={(path) => updateSlot(index, { path }, "Set script")}
               />
-              {/* Two ways out to the same file. The Code panel is first and
-                  keeps the pencil because editing a script without leaving the
-                  app is the default we want; "Open in IDE" stays one click away
-                  for when the user genuinely wants their own setup. */}
-              <button
-                className="icon-btn"
-                title={
-                  slot.path
-                    ? `Edit ${slot.path.split(/[\\/]/).pop()} in the Code panel`
-                    : "Assign a script first"
-                }
-                disabled={!slot.path}
-                // Lazy, like openAsset.js's own use of it: codeStore pulls in
-                // the Monaco setup module, and the Inspector opens far more
-                // often than this button is pressed.
-                onClick={() => import("../codeStore.js").then((m) => m.openCodeFile(slot.path))}
-              >
-                <Pencil size={12} />
-              </button>
-              <button
-                className="icon-btn"
-                title={
-                  slot.path
-                    ? `Open ${slot.path.split(/[\\/]/).pop()} in your IDE`
-                    : "Assign a script first"
-                }
-                disabled={!slot.path}
-                onClick={() => openInIDE(slot.path)}
-              >
-                <ExternalLink size={12} />
-              </button>
-              <NewScriptButton
-                defaultName={defaultScriptName}
-                onCreated={(path) => updateSlot(index, { path }, "Create script")}
-              />
-              <button
-                className="icon-btn"
-                title={enabled ? "Disable this script" : "Enable this script"}
-                onClick={() => updateSlot(index, { enabled: !enabled }, "Toggle script")}
-              >
-                {enabled ? <Eye size={12} /> : <EyeOff size={12} />}
-              </button>
-              <button
-                className="icon-btn"
-                title="Move up (runs earlier)"
-                disabled={index === 0}
-                onClick={() => move(index, -1)}
-              >
-                <ChevronUp size={12} />
-              </button>
-              <button
-                className="icon-btn"
-                title="Move down (runs later)"
-                disabled={index === slots.length - 1}
-                onClick={() => move(index, 1)}
-              >
-                <ChevronDown size={12} />
-              </button>
-              <button
-                className="icon-btn"
-                title="Remove this script"
-                onClick={() =>
-                  commit(
-                    slots.filter((_, i) => i !== index),
-                    "Remove script",
-                  )
-                }
-              >
-                <X size={12} />
-              </button>
+              {/* The six actions travel as one cluster so they can wrap to
+                  their own line together when the inspector is narrow. Seven
+                  controls sharing one row shrank the file field to "B..", which
+                  is the one thing in the row that has to stay readable. */}
+              <div className="script-slot-actions">
+                {/* Two ways out to the same file. The Code panel is first and
+                    keeps the pencil because editing a script without leaving the
+                    app is the default we want; "Open in IDE" stays one click away
+                    for when the user genuinely wants their own setup. */}
+                <button
+                  className="icon-btn"
+                  title={
+                    slot.path
+                      ? `Edit ${slot.path.split(/[\\/]/).pop()} in the Code panel`
+                      : "Assign a script first"
+                  }
+                  disabled={!slot.path}
+                  // Lazy, like openAsset.js's own use of it: codeStore pulls in
+                  // the Monaco setup module, and the Inspector opens far more
+                  // often than this button is pressed.
+                  onClick={() => import("../codeStore.js").then((m) => m.openCodeFile(slot.path))}
+                >
+                  <Pencil size={12} />
+                </button>
+                <button
+                  className="icon-btn"
+                  title={
+                    slot.path
+                      ? `Open ${slot.path.split(/[\\/]/).pop()} in your IDE`
+                      : "Assign a script first"
+                  }
+                  disabled={!slot.path}
+                  onClick={() => openInIDE(slot.path)}
+                >
+                  <ExternalLink size={12} />
+                </button>
+                <NewScriptButton
+                  defaultName={defaultScriptName}
+                  onCreated={(path) => updateSlot(index, { path }, "Create script")}
+                />
+                <button
+                  className="icon-btn"
+                  title={enabled ? "Disable this script" : "Enable this script"}
+                  onClick={() => updateSlot(index, { enabled: !enabled }, "Toggle script")}
+                >
+                  {enabled ? <Eye size={12} /> : <EyeOff size={12} />}
+                </button>
+                <button
+                  className="icon-btn"
+                  title="Move up (runs earlier)"
+                  disabled={index === 0}
+                  onClick={() => move(index, -1)}
+                >
+                  <ChevronUp size={12} />
+                </button>
+                <button
+                  className="icon-btn"
+                  title="Move down (runs later)"
+                  disabled={index === slots.length - 1}
+                  onClick={() => move(index, 1)}
+                >
+                  <ChevronDown size={12} />
+                </button>
+                <button
+                  className="icon-btn"
+                  title="Remove this script"
+                  onClick={() =>
+                    commit(
+                      slots.filter((_, i) => i !== index),
+                      "Remove script",
+                    )
+                  }
+                >
+                  <X size={12} />
+                </button>
+              </div>
             </div>
             {Object.entries(defs).map(([key, def]) => (
               <div className="field-row" key={key}>
@@ -1871,6 +1886,11 @@ function ComponentSection({ entityId, type, props }) {
       })()}
       {type === "uielement" && <UiElementSection entityId={entityId} props={props} />}
       {type === "script" && <ScriptsSection entityId={entityId} props={props} />}
+      {type === "events" && <EventBindingsSection entityId={entityId} props={props} />}
+      {/* Any component declaring an `actions` prop gets an editor for it — the
+          UI button's onClick/onFocus/... lists today, whatever grows one next
+          without a change here. */}
+      <ActionListSections entityId={entityId} componentType={type} props={props} />
       {type === "geometryModifiers" && <GeometryModifiersSection entityId={entityId} props={props} />}
       {type === "mesh" && (
         <>
