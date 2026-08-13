@@ -117,6 +117,13 @@ import {
   subscribeSplineEdit,
   updateSplineHandles,
 } from "../splineEditing.js";
+import {
+  disposeSelectionOutline,
+  invalidateSelectionOutline,
+  renderSelectionOutline,
+  setSelectionOutline,
+  setSelectionOutlineEnabled,
+} from "../selectionOutline.js";
 
 /** Sets `layers.set(EDITOR_LAYER)` on every Object3D in the subtree —
  *  layers in three.js are not inherited, so this has to walk explicitly. */
@@ -158,7 +165,6 @@ const viewport = {
   orbitStartQuaternion: null,
   orbit: null,
   gizmo: null,
-  selectionBox: null,
   cameraHelper: null,
   lightHelper: null,
   cameraPreview: null,
@@ -321,6 +327,10 @@ async function ensureViewport() {
         viewport.gizmo.getHelper().visible = !armed;
       });
       setupPlayCamera();
+      // Before the camera preview: post-render callbacks run in registration
+      // order, and the PIP is an inset window onto the scene — an outline
+      // composited over the whole canvas afterwards would paint across it.
+      setupSelectionOutline();
       setupCameraPreview();
 
       // Layer-toggle sub-systems. Gizmo + grid live in `viewport.*` and
@@ -329,6 +339,11 @@ async function ensureViewport() {
       // whenever the scene tree changes.
       applyLayerVisibility();
       const unsubHierarchy = engine.on("hierarchy-changed", () => {
+        // The outline caches the flattened mesh list under each selected root,
+        // so anything that rebuilds a subtree (a prefab respawn, a model
+        // finishing its load) has to invalidate it — otherwise it keeps
+        // tracing meshes that were destroyed, or misses ones just added.
+        invalidateSelectionOutline();
         // Cheap-ish — walks every entity looking for a collider.
         // Sets visibility to the user's current preference; new colliders
         // added since the last tick get their `visible` corrected here.
@@ -380,16 +395,10 @@ async function ensureViewport() {
         // rebuilt) and at its current world position. Cheap — just
         // touches the cursor Group's matrix.
         refreshCursor3D();
-        // `viewport.selectionBox` is a BoxHelper in single-select mode
-        // (which has an `update()` that recomputes its geometry from the
-        // attached object3D) or a Box3Helper in multi-select mode (which
-        // has no `update()` and instead reads from its `box` property on
-        // every `updateMatrixWorld`). The type-discriminated call keeps
-        // the per-frame refresh working for both.
-        if (viewport.selectionBox) {
-          if (viewport.selectionBox.type === "BoxHelper") viewport.selectionBox.update();
-          else if (viewport.selectionBox.type === "Box3Helper") viewport.selectionBox.updateMatrixWorld(true);
-        }
+        // NOTE: the selection outline needs nothing here. It re-renders the
+        // selected meshes themselves every frame, so it tracks a gizmo drag,
+        // an inspector edit and script-driven motion for free — where the old
+        // bounding box had to be told to recompute from three separate places.
         viewport.cameraHelper?.update();
         // The light helper samples the live THREE.Light on every update(), so
         // calling it each frame keeps the cone / arrow aligned with the
@@ -596,7 +605,7 @@ function setupPlayCamera() {
   engine.on("play-changed", (playing) => {
     if (viewport.helpers) viewport.helpers.visible = !playing;
     if (viewport.cameraPreview) viewport.cameraPreview.setVisible(!playing);
-    // Gizmo + selectionBox visibility is owned by `applyLayerVisibility`
+    // Gizmo + selection-outline visibility is owned by `applyLayerVisibility`
     // — it AND-combines the user's Gizmo toggle with the editor-vs-play
     // rule so flipping the dropdown takes effect both in and out of play.
     applyLayerVisibility();
@@ -1083,6 +1092,35 @@ function restoreHidden(hidden) {
   for (const { obj, prev } of hidden) obj.visible = prev;
 }
 
+/**
+ * Registers the selection outline as a post-render pass.
+ *
+ * Post-render rather than pre-render for two reasons: the outline is composited
+ * OVER the finished frame, and the extra `renderer.render()` calls it makes
+ * would otherwise reset three's per-frame `renderer.info` counters before
+ * `StatsSystem` has read them, quietly zeroing the stats overlay's draw-call
+ * and triangle readings.
+ */
+function setupSelectionOutline() {
+  if (!engine.renderer) return;
+  // The render targets and compiled materials belong to the WebGPU device that
+  // created them. A renderer rebuild (a settings change that needs new
+  // constructor options) leaves them pointing at a dead device, so drop them
+  // and let the next frame rebuild against the new one.
+  engine.on("renderer-rebuilt", () => {
+    disposeSelectionOutline();
+    attachSelection(useSelectionStore.getState().ids);
+  });
+  engine.onPostRender(() => {
+    if (engine.playing) return;
+    renderSelectionOutline({
+      renderer: engine.renderer,
+      scene: engine.scene,
+      camera: viewport.camera,
+    });
+  });
+}
+
 function setupCameraPreview() {
   if (!engine.renderer || !viewport.canvas) return;
   if (viewport.cameraPreview) return;
@@ -1141,8 +1179,9 @@ function setCollidersVisible(visible) {
 /**
  * Apply all three Layers-toggle states at once. Used both at init
  * (to honor any default toggles) and after the dropdown flips one.
- * Gizmo + selectionBox live as singletons on `viewport.*`, so they're
- * controlled directly; colliders are per-component so we walk.
+ * The gizmo lives as a singleton on `viewport.*` and the selection outline
+ * owns its own module state, so both are controlled directly; colliders are
+ * per-component so we walk.
  */
 function applyLayerVisibility() {
   const { gizmos, cursor3D, colliders, grid, virtualGeometry, debugDraw, uiOverlay } = viewport.layers;
@@ -1158,7 +1197,7 @@ function applyLayerVisibility() {
   // detached gizmo doesn't keep showing stale arrows on screen.
   const gizmoAttached = !!viewport.gizmo?.object;
   if (gizmoHelper) gizmoHelper.visible = gizmos && !engine.playing && gizmoAttached;
-  if (viewport.selectionBox) viewport.selectionBox.visible = gizmos && !engine.playing;
+  setSelectionOutlineEnabled(gizmos && !engine.playing);
   if (viewport.grid) viewport.grid.visible = grid;
   setCollidersVisible(colliders);
   setVirtualGeometryDebugVisible(virtualGeometry && !engine.playing);
@@ -1295,13 +1334,27 @@ function attachSelection(ids) {
   const entities = resolveEntities(entityIds);
   const entity = entities[0] ?? null;
 
-  if (viewport.selectionBox) {
-    engine.scene.remove(viewport.selectionBox);
-    viewport.selectionBox.dispose();
-    viewport.selectionBox = null;
-  }
   detachCameraHelper();
   detachLightHelper();
+
+  // Silhouette outline over every selected entity. Set here rather than in the
+  // per-shape attach functions below because those return early for UI
+  // entities, the 3D cursor and spline knots — and "what is outlined" is the
+  // one thing that must be answered for every one of those cases, if only to
+  // clear it. Cameras and lights are excluded for the same reason they never
+  // got a bounding box: their subtree is an editor-only body model plus a
+  // frustum helper, so the silhouette would trace the helper, not the entity.
+  const outlined = entities.filter((e) => isBoxableEntity(e) && !isUiEntity(e));
+  // Blender's "active object" — the one an operation acts on, drawn in the
+  // lighter orange. `anchorId` is the last plainly-clicked id, which is exactly
+  // that; it can point outside the current selection after a range-select, so
+  // fall back to the first entity.
+  const anchorId = useSelectionStore.getState().anchorId;
+  const active = outlined.find((e) => e.id === anchorId) ?? outlined[0] ?? null;
+  setSelectionOutline(
+    outlined.map((e) => e.object3D),
+    active?.object3D ?? null,
+  );
 
   // UI entities get a 2D rect outline (drawn by the UiSystem overlay pass)
   // instead of the 3D gizmo + bounding box. setHighlight accepts a single
@@ -1386,25 +1439,6 @@ function attachSingleSelection(entity) {
     viewport.gizmo.attach(entity.object3D);
     viewport.gizmo.getHelper().updateMatrixWorld(true);
   }
-  // Cameras skip the bounding-box outline: the entity itself is a single
-  // Object3D whose only children are the PerspectiveCamera and the
-  // editor-only model mesh, so a Box3 over the subtree just brackets the
-  // lens/body silhouette and clutters the view. The frustum helper
-  // (attached below) already shows the camera's position + facing, which
-  // is the visual cue users actually want for a camera entity.
-  if (!cameraComponent?.camera && !lightComponent?.light) {
-    const bounds = new THREE.Box3().setFromObject(entity.object3D);
-    if (!bounds.isEmpty()) {
-      viewport.selectionBox = new THREE.BoxHelper(entity.object3D, 0x4da3ff);
-      viewport.selectionBox.userData.editorOnly = true;
-      // Tag with the entity id so clicking the selection box (which is
-      // editor-only and short-circuits findEntityId by default) still
-      // resolves to the selected entity.
-      viewport.selectionBox.userData.entityId = entity.id;
-      putOnEditorLayer(viewport.selectionBox);
-      engine.scene.add(viewport.selectionBox);
-    }
-  }
   if (cameraComponent?.camera) {
     attachCameraHelper(cameraComponent.camera);
     // Honor the camera component's own preview toggle: even with the
@@ -1441,11 +1475,6 @@ function attachCursorSelection() {
 // positioned at the selection centroid. The actual transform application
 // happens lazily during the drag (see applyPivotDelta / commitPivotDrag).
 function attachMultiSelection(entities) {
-  // Filter out non-boxable entities (cameras/lights) for the union bounds
-  // visualization — they would only bracket the editor preview mesh. They
-  // still receive the gizmo transform; only the outline is suppressed.
-  const boxable = entities.filter(isBoxableEntity);
-
   // Camera helpers / PIP are single-entity affordances — hide them when
   // the selection spans more than one entity so the screen doesn't pile up
   // overlapping frustums.
@@ -1463,20 +1492,6 @@ function attachMultiSelection(entities) {
 
   viewport.gizmo.attach(pivot);
   viewport.gizmo.getHelper().updateMatrixWorld(true);
-
-  if (boxable.length) {
-    const bounds = computeSelectionBounds(boxable);
-    if (!bounds.isEmpty()) {
-      viewport.selectionBox = new THREE.Box3Helper(bounds, 0x4da3ff);
-      viewport.selectionBox.userData.editorOnly = true;
-      // Tag with the first entity id so a click on the outline (which is
-      // editor-only and short-circuits findEntityId by default) still
-      // resolves to a real selection.
-      viewport.selectionBox.userData.entityId = boxable[0].id;
-      putOnEditorLayer(viewport.selectionBox);
-      engine.scene.add(viewport.selectionBox);
-    }
-  }
 }
 
 // ---- Multi-select pivot drag ----------------------------------------------
@@ -1621,19 +1636,9 @@ function applyPivotDrag() {
     }
     useSceneStore.getState().updateTransform(origin.id);
   }
-  // Refresh the Box3 helper so it tracks the moving selection.
-  if (viewport.selectionBox && viewport.selectionBox.type === "Box3Helper") {
-    const entities = drag.origins
-      .map((o) => engine.getEntity(o.id))
-      .filter((e) => e && isBoxableEntity(e));
-    if (entities.length) {
-      const bounds = computeSelectionBounds(entities);
-      if (!bounds.isEmpty()) {
-        viewport.selectionBox.box.copy(bounds);
-        viewport.selectionBox.updateMatrixWorld(true);
-      }
-    }
-  }
+  // NOTE: the selection outline needs no refresh here — it re-renders the
+  // entities themselves, which this loop has just moved.
+  //
   // NOTE: drag.start is *not* advanced each frame. It holds the pivot's
   // pose at drag start so the delta we apply is cumulative across frames.
   // Mutating it would shrink each frame's delta to the per-frame motion,

@@ -79,3 +79,20 @@ export const GI_MIRROR_LAYER = 28;
  * maps, GI, occlusion and reflections.
  */
 export const UI_LAYER = 27;
+
+/**
+ * Layers the editor's selection outline stamps on the selected meshes for the
+ * duration of its mask pass (`editor/selectionOutline.js`) — one bit for the
+ * selection, one for the active object, which is drawn in a lighter colour.
+ *
+ * Unlike every other layer here these are TRANSIENT: the pass overwrites
+ * `mesh.layers.mask` outright (so the camera sees the selection and nothing
+ * else) and restores it before returning, inside one synchronous block. That
+ * is not tidiness — `mesh.layers.mask` is part of the static batching key, so a
+ * bit left set until the next rebuild would silently pull a selected mesh out
+ * of its batch, and a bit copied onto a batch proxy (`instanced.layers.mask =
+ * template.layers.mask`) would drag a thousand unselected crates into the
+ * outline. Nothing outside that block should ever see these bits set.
+ */
+export const SELECTION_MASK_LAYER = 26;
+export const SELECTION_ACTIVE_LAYER = 25;
