@@ -42,6 +42,7 @@ import {
 } from "../../engine/timeline/timelineAsset.js";
 import { defaultValueFor, evaluateKeys, isSteppedType } from "../../engine/timeline/curve.js";
 import { TimelineRuntime } from "../../engine/timeline/TimelineRuntime.js";
+import { ownsKeyboard } from "../keyScope.js";
 import {
   animatableProperties,
   readProperty,
@@ -1137,12 +1138,10 @@ export function TimelinePanel() {
 
   useEffect(() => {
     const onKey = (e) => {
-      const root = rootRef.current;
-      if (!root) return;
-      const inPanel = root.contains(e.target) || root.matches(":hover");
-      if (!inPanel) return;
-      const tag = e.target?.tagName;
-      if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;
+      // `keyScope` owns this decision for the whole editor — focus first, then
+      // the pointer (clicking a keyframe diamond never moves `activeElement`),
+      // with text fields and code editors winning over both.
+      if (!ownsKeyboard("timeline", e)) return;
       const ctrl = e.ctrlKey || e.metaKey;
       if (ctrl && e.key.toLowerCase() === "z") {
         e.preventDefault();

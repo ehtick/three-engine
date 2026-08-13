@@ -24,6 +24,7 @@ import { applyEffect, EFFECTS, effectGroups } from "../audio/effects.js";
 import { captureNoiseProfile } from "../audio/denoise.js";
 import { AudioEffectDialog } from "./AudioEffectDialog.jsx";
 import { usePanelVisible } from "../usePanelVisible.js";
+import { ownsKeyboard } from "../keyScope.js";
 
 const HEAD_WIDTH = 168;
 const LANE_HEIGHT = 76;
@@ -504,12 +505,11 @@ export function AudioEditorPanel({ api } = {}) {
   useEffect(() => {
     if (!moduleOn) return;
     const onKey = (e) => {
-      const el = document.querySelector(".audio-editor");
-      if (!el) return;
-      // Hover, not focus: clicking a waveform lane never moves activeElement.
-      // EditorChrome defers to us by the same test.
-      if (!e.target.closest?.(".audio-editor") && !el.matches(":hover")) return;
-      if (e.target.matches?.("input, textarea, select")) return;
+      // Ownership comes from `keyScope`, the same resolver EditorChrome uses to
+      // defer to us — focus first, then the pointer (clicking a waveform lane
+      // never moves `activeElement`), and any text field or code editor wins
+      // over both.
+      if (!ownsKeyboard("audio", e)) return;
 
       const ctrl = e.ctrlKey || e.metaKey;
       const key = e.key.toLowerCase();

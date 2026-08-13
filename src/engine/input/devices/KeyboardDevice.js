@@ -8,6 +8,18 @@
  * rather than `event.key` so QWERTY/AZERTY layouts feel the same; rebinding
  * in the editor stays layout-independent.
  */
+/**
+ * True when the keystroke was aimed at somewhere text goes. Kept here as a
+ * plain DOM test rather than an import so the engine keeps no dependency on
+ * the editor — a shipped game needs exactly the same rule.
+ */
+function isEditableTarget(target) {
+  if (!(target instanceof Element)) return false;
+  return !!target.closest(
+    "input, textarea, select, [contenteditable]:not([contenteditable='false']), .monaco-editor",
+  );
+}
+
 export class KeyboardDevice {
   constructor() {
     this.id = "keyboard";
@@ -44,6 +56,14 @@ export class KeyboardDevice {
   #handleKey(e, pressed) {
     const code = e.code?.toLowerCase();
     if (!code) return;
+    // Typing is not gameplay. Listening on `window` (see attach) means every
+    // keystroke aimed at a text field, a code editor or any other editable
+    // element also lands here — so in the editor, writing a script while the
+    // game ran walked the player around, and in a shipped game a chat box or a
+    // name entry did the same. Releases are never filtered: if a key went down
+    // as gameplay and came up while a field had focus, dropping the keyup would
+    // leave the control stuck on forever.
+    if (pressed && isEditableTarget(e.target)) return;
     // Repeats (auto-repeat keydown) don't count as a new press — the manager
     // tracks the leading-edge frame for `wasPressedThisFrame`.
     if (pressed && this.state.get(code)) return;

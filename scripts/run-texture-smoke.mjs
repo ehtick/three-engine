@@ -1191,7 +1191,7 @@ console.log("\nlayer transforms");
 }
 
 /* -------------------------------------------------------------------------- */
-/* 12 — double-click a tab bar to maximize, Escape to restore                  */
+/* 12 — double-click a tab bar to maximize, double-click again to restore      */
 /* -------------------------------------------------------------------------- */
 
 console.log("\npanel maximize");
@@ -1210,42 +1210,42 @@ console.log("\npanel maximize");
   check("the panel's tab bar was found", !!tabBar);
 
   if (tabBar) {
+    // Re-measured every time: maximizing moves the group to fill the window, so
+    // coordinates taken before the first double-click point at nothing after it.
+    const doubleClickTabBar = async () => {
+      const at = await page.evaluate(() => {
+        const panel = document.querySelector(".texture-modes, .texture-editor");
+        const bar = panel?.closest(".dv-groupview")?.querySelector(".dv-tabs-and-actions-container");
+        if (!bar) return null;
+        const r = bar.getBoundingClientRect();
+        return { x: r.right - 24, y: r.y + r.height / 2 };
+      });
+      if (!at) return false;
+      await page.mouse.move(at.x, at.y);
+      await page.mouse.down();
+      await page.mouse.up();
+      await page.mouse.down({ clickCount: 2 });
+      await page.mouse.up({ clickCount: 2 });
+      await settle(400);
+      return true;
+    };
+
     check("nothing is maximized to begin with", (await isMaximized()) === false);
-    await page.mouse.move(tabBar.x, tabBar.y);
-    await page.mouse.down();
-    await page.mouse.up();
-    await page.mouse.down({ clickCount: 2 });
-    await page.mouse.up({ clickCount: 2 });
-    await settle(400);
+    await doubleClickTabBar();
     check("double-clicking the tab bar maximizes the panel", await isMaximized());
 
+    // Escape is not an exit, on purpose. Inside a maximized panel Escape is the
+    // key that cancels a transform, closes a popover, drops a picker or leaves
+    // a modal tool — and un-maximizing as well threw away a layout the user had
+    // deliberately asked for, on a press aimed at something else entirely.
     await page.keyboard.press("Escape");
     await settle(400);
-    check("Escape restores the layout", (await isMaximized()) === false);
+    check("Escape does NOT un-maximize", await isMaximized());
 
-    // Escape must not be greedy: a focused text field owns it first, and a
-    // gesture that also fires while someone is typing is worse than none.
-    await page.mouse.move(tabBar.x, tabBar.y);
-    await page.mouse.down();
-    await page.mouse.up();
-    await page.mouse.down({ clickCount: 2 });
-    await page.mouse.up({ clickCount: 2 });
-    await settle(400);
-    const focused = await page.evaluate(() => {
-      const input = document.querySelector(".texture-editor input[type=range], .atlas-editor input");
-      if (!input) return false;
-      input.focus();
-      return document.activeElement === input;
-    });
-    if (focused) {
-      await page.keyboard.press("Escape");
-      await settle(300);
-      check("Escape in a focused field does not un-maximize", await isMaximized());
-      await page.evaluate(() => document.activeElement?.blur?.());
-    }
-    await page.keyboard.press("Escape");
-    await settle(400);
-    check("and it restores once the field is left", (await isMaximized()) === false);
+    // The same gesture both ways, and only on the tab bar — which is the part
+    // of the panel you are never working inside.
+    await doubleClickTabBar();
+    check("double-clicking again restores the layout", (await isMaximized()) === false);
 
     // Maximizing should show MORE of the image, not the same postage stamp in
     // a bigger panel. The zoom readout is the honest measure.
@@ -1261,12 +1261,8 @@ console.log("\npanel maximize");
     const small = await zoomNow();
     check("the docked panel reports a zoom", small > 0, `${small}%`);
 
-    await page.mouse.move(tabBar.x, tabBar.y);
-    await page.mouse.down();
-    await page.mouse.up();
-    await page.mouse.down({ clickCount: 2 });
-    await page.mouse.up({ clickCount: 2 });
-    await settle(700);
+    await doubleClickTabBar();
+    await settle(300);
     const big = await zoomNow();
     check("maximizing re-fits the image to the bigger panel", big > small, `${small}% -> ${big}%`);
 
@@ -1281,8 +1277,8 @@ console.log("\npanel maximize");
     });
     await settle(300);
     const zoomed = await zoomNow();
-    await page.keyboard.press("Escape");
-    await settle(700);
+    await doubleClickTabBar();
+    await settle(300);
     const afterRestore = await zoomNow();
     check(
       "but a zoom the user chose survives a resize",

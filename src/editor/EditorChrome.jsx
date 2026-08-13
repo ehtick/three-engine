@@ -23,7 +23,7 @@ import { engine, ensureEngine } from "./engineInstance.js";
 import { toggle as togglePlay, togglePaused, stepFrame } from "./playMode.js";
 import { commandBus } from "./commands/CommandBus.js";
 import { getProjectSettings, applyProjectSettings } from "./projectSettings.js";
-import { isGraphHovered, isPointerInside } from "./nodegraph/graphContext.js";
+import { keyScopeOwns } from "./keyScope.js";
 import { dispatchVisibilityKeyAction } from "./keybindings.js";
 import { dispatchTerrainKeyAction } from "./terrainBrush.js";
 import { useGeometryEditStore } from "./store/geometryEditStore.js";
@@ -67,6 +67,13 @@ export function EditorChrome() {
         const { useProjectStore: store } = await import("./store/projectStore.js");
         const input = store.getState().projectMeta?.input;
         if (input) engine.applyInput(input);
+        // The project's event catalog, for the same reason and at the same
+        // point: a script's first onUpdate can legitimately ask
+        // `engine.events.has(...)`, and the Events panel reads the live
+        // registry rather than project.json.
+        const events = store.getState().projectMeta?.events;
+        const eventErrors = engine.applyEvents(events);
+        for (const err of eventErrors) console.warn(`Events: ${err}`);
         // Prefabs must be in the registry before the scene loads: a scene
         // stores instances as links, and a link with no def can't expand.
         const { loadProjectPrefabs } = await import("./prefab.js");
@@ -121,14 +128,13 @@ export function EditorChrome() {
 
   useEffect(() => {
     const onKeyDown = (e) => {
-      const inField = e.target.closest?.("input, textarea, select, [contenteditable]");
       const ctrl = e.ctrlKey || e.metaKey;
 
-      if (ctrl && e.key.toLowerCase() === "s") {
-        e.preventDefault();
-        saveScene({ saveAs: e.shiftKey });
-        return;
-      }
+      // Application verbs first. These are the only keys allowed to fire from
+      // inside a context that owns the keyboard — running the game or building
+      // it means the same thing whether you are in the viewport or mid-word in
+      // the code editor, and no panel or text field claims them. Everything
+      // below this block is scene editing and defers to the owning scope.
       if (ctrl && e.key.toLowerCase() === "o") {
         e.preventDefault();
         openScene();
@@ -157,35 +163,16 @@ export function EditorChrome() {
         useProjectStore.getState().closeProject();
         return;
       }
-      // Geometry edit mode owns Delete, Ctrl+Z, G/R/S/E and selection keys.
-      // Its canvas is created imperatively, but remains inside this wrapper.
-      if (e.target.closest?.(".geometry-editor")) return;
-      if (inField) return;
-      // Node-graph editors (shader graph, particle graph) have their own
-      // delete/selection handling — the DOM-ancestry check is a fallback,
-      // but SVG edges/nodes don't always move `document.activeElement`, so
-      // hover state is the reliable signal that a graph "owns" the keypress.
-      if (e.target.closest?.(".react-flow") || isGraphHovered()) return;
-      // The timeline's dope sheet owns Delete / Ctrl+Z / Space / arrows over its
-      // own surface. Hover, not focus: clicking a keyframe diamond does not move
-      // `document.activeElement`, exactly like the graph editors' SVG edges.
-      if (e.target.closest?.(".timeline-panel")) return;
-      for (const el of document.querySelectorAll(".timeline-panel")) {
-        if (isPointerInside(el)) return;
-      }
-      // The texture editor owns Ctrl+Z / Ctrl+S / Delete / single-letter tool
-      // keys over its own surface, for the same reason and by the same test:
-      // clicking on a paint canvas never moves `document.activeElement`.
-      if (e.target.closest?.(".texture-editor")) return;
-      for (const el of document.querySelectorAll(".texture-editor")) {
-        if (isPointerInside(el)) return;
-      }
-      // The audio editor owns Space (play/pause), Ctrl+Z/S/X/C/V and Delete
-      // over its own surface. Same hover test: clicking a waveform lane never
-      // moves `document.activeElement` either.
-      if (e.target.closest?.(".audio-editor")) return;
-      for (const el of document.querySelectorAll(".audio-editor")) {
-        if (isPointerInside(el)) return;
+      // Scene editing from here down. Whichever context owns the keyboard —
+      // the code editor, a text field, the geometry/texture/audio/timeline
+      // panels, a node graph — gets these keys instead; `keyScope` resolves
+      // that in one place so the contexts can't contradict each other.
+      if (keyScopeOwns(e)) return;
+
+      if (ctrl && e.key.toLowerCase() === "s") {
+        e.preventDefault();
+        saveScene({ saveAs: e.shiftKey });
+        return;
       }
 
       const selection = useSelectionStore.getState().ids;

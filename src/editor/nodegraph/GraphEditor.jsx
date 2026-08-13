@@ -14,7 +14,8 @@ import {
 import "@xyflow/react/dist/style.css";
 import "./nodegraph.css";
 import { Plus, Undo2, Redo2, Map as MapIcon, Grid3x3, StickyNote, Maximize2 } from "lucide-react";
-import { setGraphHovered, isPointerInside } from "./graphContext.js";
+import { setGraphHovered } from "./graphContext.js";
+import { ownsKeyboard, activeKeyScopeElement } from "../keyScope.js";
 import { sharedNodeTypes } from "./GraphNode.jsx";
 import { NodePalette, noteRecent } from "./palette.jsx";
 import { createGraphHistory } from "./history.js";
@@ -74,6 +75,10 @@ export const GraphEditor = forwardRef(function GraphEditor(
     canPreview = false,
     registerThumb = null,
     nodeErrors = null,
+    // `{ [nodeId]: "class-name" }` — extra classes on a node's wrapper, for
+    // state a panel knows and the toolkit does not. The event graph uses it to
+    // light up the nodes that just ran. Symmetric with `nodeErrors`.
+    nodeClasses = null,
   },
   ref,
 ) {
@@ -664,18 +669,14 @@ export const GraphEditor = forwardRef(function GraphEditor(
   useEffect(() => {
     const onKeyDown = (e) => {
       // Only act when this graph is the thing the user is pointing at, and
-      // never while they're typing into one of its fields. `:hover` alone is
-      // not enough — a dropdown's full-screen overlay steals it (see
-      // graphContext.js), so fall back to a geometric pointer test.
-      if (
-        !wrapRef.current?.contains(document.activeElement) &&
-        !wrapRef.current?.matches(":hover") &&
-        !isPointerInside(wrapRef.current)
-      ) {
-        return;
-      }
-      const tag = document.activeElement?.tagName;
-      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+      // never while they're typing into one of its fields. `keyScope` resolves
+      // both — including the geometric pointer test that a `:hover` check gets
+      // wrong once a dropdown's full-screen overlay covers the canvas (see
+      // graphContext.js). The element check keeps a second graph editor (shader
+      // graph and particle graph can both be open) from acting on our keys.
+      if (!ownsKeyboard("graph", e)) return;
+      const owner = activeKeyScopeElement(e);
+      if (!owner || !wrapRef.current?.contains(owner)) return;
       const key = e.key.toLowerCase();
       const mod = e.ctrlKey || e.metaKey;
       if (!mod) {
@@ -729,6 +730,7 @@ export const GraphEditor = forwardRef(function GraphEditor(
         const connectedHandles = new Set(edges.filter((e) => e.target === n.id).map((e) => e.targetHandle));
         return {
           ...n,
+          ...(nodeClasses?.[n.id] ? { className: nodeClasses[n.id] } : {}),
           data: {
             ...n.data,
             describe: registry.describe,
@@ -740,7 +742,7 @@ export const GraphEditor = forwardRef(function GraphEditor(
           },
         };
       }),
-    [nodes, edges, registry, handlePropsChange, registerThumb, canPreview, nodeErrors],
+    [nodes, edges, registry, handlePropsChange, registerThumb, canPreview, nodeErrors, nodeClasses],
   );
 
   const toggleMinimap = () => {

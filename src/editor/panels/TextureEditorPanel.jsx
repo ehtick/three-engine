@@ -57,6 +57,7 @@ import { useSelectionStore } from "../store/selectionStore.js";
 import { extOf, ATLAS_EXTENSIONS, TEXTURE_EXTENSIONS } from "../assetLoader.js";
 import { uniqueName } from "../assetOps.js";
 import { pushToast } from "../toasts.js";
+import { ownsKeyboard } from "../keyScope.js";
 import { ContextMenu } from "../ContextMenu.jsx";
 import { SelectField } from "../fields/SelectField.jsx";
 import { TexturePicker } from "./TexturePicker.jsx";
@@ -1079,15 +1080,12 @@ function TextureWorkspace({ path, onPathChange, onAtlasChange, onSliceIntoSprite
   const rootRef = useRef(null);
   useEffect(() => {
     const onKey = (event) => {
-      const root = rootRef.current;
-      if (!root || !root.contains(document.activeElement) ) {
-        // Hover, not focus: clicking on the canvas does not move
-        // `document.activeElement`, so a focus-only test would drop every
-        // shortcut the moment the user actually painted something.
-        if (!root?.matches(":hover")) return;
-      }
-      const target = event.target;
-      if (target instanceof HTMLElement && /input|textarea|select/i.test(target.tagName)) return;
+      // `keyScope` decides ownership for the whole editor: focus first, then
+      // the pointer (clicking a paint canvas never moves `activeElement`, so a
+      // focus-only test would drop every shortcut the moment the user actually
+      // painted something), and a text field or code editor inside or beside
+      // this panel wins over both.
+      if (!ownsKeyboard("texture", event)) return;
       const ctrl = event.ctrlKey || event.metaKey;
       const key = event.key.toLowerCase();
 
@@ -2025,8 +2023,10 @@ function TextureCanvas({
   useEffect(() => {
     const set = (down) => (event) => {
       if (event.code !== "Space" && event.key !== " ") return;
-      const target = event.target;
-      if (target instanceof HTMLElement && /input|textarea|select/i.test(target.tagName)) return;
+      // Releasing always registers: if ownership moved between press and
+      // release — the pointer left the canvas, a field took focus — the panel
+      // would otherwise stay stuck in pan mode with no way out.
+      if (down && !ownsKeyboard("texture", event)) return;
       if (spaceRef.current === down) return;
       spaceRef.current = down;
       wrapRef.current?.classList.toggle("panning", down);

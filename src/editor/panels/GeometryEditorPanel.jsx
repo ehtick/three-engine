@@ -11,6 +11,7 @@ import { invalidateVirtualGeometryAsset } from "../../modules/virtual-geometry/i
 import { CreateEntityCommand } from "../commands/entityCommands.js";
 import { AddComponentCommand, RemoveComponentCommand, SetComponentPropCommand } from "../commands/componentCommands.js";
 import { AxisViewGizmo } from "../helpers/AxisViewGizmo.jsx";
+import { isTypingTarget } from "../keyScope.js";
 import { GEOMETRY_MODIFIER_DEFINITIONS, createGeometryModifier } from "../../engine/geometryModifiers.js";
 import { applyGeometryModifier } from "../geometryModifierEditing.js";
 
@@ -2331,6 +2332,10 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
     const capture = (event) => {
       if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== "r") return;
       if (!sessionRef.current) return;
+      // A live edit session claims Ctrl+R globally, which would otherwise reach
+      // across the editor and start a loop cut while the user is typing in a
+      // code editor or a field.
+      if (isTypingTarget(event)) return;
       event.preventDefault();
       event.stopImmediatePropagation();
       if (event.shiftKey) startOffsetLoop();
