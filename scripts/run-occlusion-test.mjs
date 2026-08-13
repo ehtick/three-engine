@@ -377,5 +377,76 @@ await check("the test uses the camera the depth was CAPTURED with, not the one t
 
 // ---------------------------------------------------------------------------
 
+section("the occluder tag depends on a bounding sphere that must not go stale");
+
+// ⚠ THIS IS THE BUG THAT MADE THE WHOLE FEATURE READ "occluded 0" IN A REAL
+// SCENE while every test above passed. The tests build their occluders from
+// primitive geometry, which exists on frame 1; a real scene's walls are
+// `geometryAsset` meshes that render the declared primitive ("box") until the
+// .geom lands a few hundred milliseconds later. `getEntityBoundingSphere`
+// cached the placeholder's radius against a hash of the entity's TRANSLATION,
+// and a geometry swap does not move anything — so a 25 m wall answered 0.866
+// for the rest of the session, failed `minOccluderSize`, and the occluder list
+// came out EMPTY. With no occluders the depth pass never runs, the pyramid is
+// never built, and `apply()` returns before testing a single object.
+const { getEntityBoundingSphere } = await import("../src/engine/viewFrustum.js");
+
+await check("a geometry swap invalidates the cached bounding sphere", () => {
+  const engine = new Engine();
+  const wall = engine.createEntity({ name: "Wall" });
+  const mesh = wall.addComponent("mesh", { geometry: "box" });
+  engine.scene.updateMatrixWorld(true);
+
+  const sphere = new THREE.Sphere();
+  // Frame 1: frustum culling asks, and caches the placeholder unit box.
+  getEntityBoundingSphere(wall, sphere);
+  assert.ok(Math.abs(sphere.radius - Math.sqrt(3) / 2) < 1e-3, `placeholder ${sphere.radius}`);
+
+  // The .geom asset lands. Same entity, same position, much bigger geometry.
+  mesh.mesh.geometry.dispose();
+  mesh.mesh.geometry = new THREE.BoxGeometry(42.9, 0.5, 27.5);
+  engine.scene.updateMatrixWorld(true);
+
+  getEntityBoundingSphere(wall, sphere);
+  assert.ok(sphere.radius > 20, `after the swap the sphere is still ${sphere.radius}`);
+});
+
+await check("…so a wall whose geometry loaded late is still tagged as an occluder", () => {
+  const engine = new Engine();
+  const wall = engine.createEntity({ name: "Wall" });
+  const mesh = wall.addComponent("mesh", { geometry: "box" });
+  engine.scene.updateMatrixWorld(true);
+  const sphere = new THREE.Sphere();
+  getEntityBoundingSphere(wall, sphere); // poison the cache the way frame 1 does
+
+  mesh.mesh.geometry.dispose();
+  mesh.mesh.geometry = new THREE.BoxGeometry(42.9, 0.5, 27.5);
+  engine.scene.updateMatrixWorld(true);
+
+  engine.occlusion.setEnabled(true);
+  engine.occlusion.refreshOccluders();
+  assert.equal(engine.occlusion.stats.occluders, 1, "the wall was not counted as an occluder");
+  assert.equal(mesh.mesh.layers.isEnabled(OCCLUDER_LAYER), true, "no OCCLUDER_LAYER bit");
+});
+
+await check("rescaling an entity invalidates it too", () => {
+  // Scale changes the world-space radius while leaving the translation alone —
+  // the same blind spot, reachable by dragging the scale gizmo.
+  const engine = new Engine();
+  const box = engine.createEntity({ name: "Box" });
+  box.addComponent("mesh", { geometry: "box" });
+  engine.scene.updateMatrixWorld(true);
+  const sphere = new THREE.Sphere();
+  getEntityBoundingSphere(box, sphere);
+  const before = sphere.radius;
+
+  box.object3D.scale.set(30, 30, 30);
+  engine.scene.updateMatrixWorld(true);
+  getEntityBoundingSphere(box, sphere);
+  assert.ok(sphere.radius > before * 20, `${before} -> ${sphere.radius}`);
+});
+
+// ---------------------------------------------------------------------------
+
 console.log(`\n${failures === 0 ? "all occlusion checks passed" : `${failures} FAILED`}`);
 process.exit(failures === 0 ? 0 : 1);

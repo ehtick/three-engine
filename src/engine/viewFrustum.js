@@ -235,6 +235,24 @@ function collectMeshes(entity, meshes, depth) {
  * Returns false when the entity has no meshes — same convention as
  * `computeEntityBoundingSphere`.
  */
+/**
+ * Bumped whenever geometry appears somewhere the per-entity hash below cannot
+ * see it — a Model component finishing its load and building a whole subtree,
+ * an impostor or LOD level swapping a descendant's mesh.
+ *
+ * A GLOBAL counter rather than per-entity invalidation on purpose. The events
+ * that move it are rare (an asset load, an editor commit) and the cost of a
+ * bump is one recompute per entity on the next frame; the cost of MISSING one
+ * is a permanently wrong bounding sphere, which is silent and was in the
+ * product for months. A conservative global is the right side to err on.
+ */
+let boundsEpoch = 0;
+
+/** Forces every cached entity bounding sphere to be recomputed. */
+export function invalidateEntityBounds() {
+  boundsEpoch = (boundsEpoch + 1) >>> 0;
+}
+
 export function getEntityBoundingSphere(entity, out) {
   if (!entity._viewSphereCache) {
     entity._viewSphereCache = {
@@ -244,16 +262,48 @@ export function getEntityBoundingSphere(entity, out) {
     };
   }
   const cache = entity._viewSphereCache;
-  // Hash includes the entity's own matrix and its ancestors' — moving a
-  // parent moves the child in world space. Cheap: read the 3 translation
-  // components from each.
-  let h = 0;
+  // ── THE HASH MUST COVER GEOMETRY, NOT JUST POSITION ──────────────────────
+  //
+  // It used to be translations alone, and that is wrong for every mesh whose
+  // geometry arrives AFTER the first frame: a `geometryAsset` mesh renders the
+  // declared primitive ("box") immediately, frustum culling asks for its sphere
+  // on frame 1 and caches the unit box's 0.866, then the .geom lands and
+  // replaces `mesh.geometry` WITHOUT MOVING THE ENTITY. Nothing in the hash
+  // changed, so the cache answered 0.866 for the rest of the session — for a
+  // Sponza wall whose real radius is 25.5.
+  //
+  // That silently broke three systems at once, and the visible one was the
+  // hardest to trace back: occlusion culling tags an object as an occluder only
+  // above `minOccluderSize` (1.5 m), so EVERY imported wall failed the test,
+  // the occluder list came out empty, the depth pass never ran, and the Stats
+  // overlay read "occluded 0" forever in a scene full of occluders. Frustum
+  // culling was testing a 0.866 sphere for a 40 m building, and LOD screen
+  // heights were computed from the same number.
+  //
+  // Mixing the geometry's `id` in costs one property read and catches the
+  // common case with NO call site to remember — which matters, because the
+  // alternative (invalidate explicitly at every swap) is exactly the design
+  // that produced this bug by missing one. `children.length` catches a mesh
+  // appearing as a child; `boundsEpoch` covers the rest.
+  let h = boundsEpoch >>> 0;
+  const ownGeometry =
+    entity.getComponent?.("mesh")?.mesh?.geometry ??
+    entity.getComponent?.("skinnedmesh")?.mesh?.geometry ??
+    entity.getComponent?.("instancer")?.instancedMesh?.geometry;
+  h = ((h ^ (ownGeometry?.id ?? 0)) * 16777619) >>> 0;
+  h = ((h ^ (entity.children?.length ?? 0)) * 16777619) >>> 0;
   let node = entity;
   while (node) {
     const m = node.object3D.matrixWorld.elements;
     h = ((h ^ Math.fround(m[12])) * 16777619) >>> 0;
     h = ((h ^ Math.fround(m[13])) * 16777619) >>> 0;
     h = ((h ^ Math.fround(m[14])) * 16777619) >>> 0;
+    // The basis diagonal, because SCALE changes the world-space radius while
+    // leaving the translation untouched — resizing a wall in the inspector kept
+    // its old sphere for exactly the same reason a geometry swap did.
+    h = ((h ^ Math.fround(m[0])) * 16777619) >>> 0;
+    h = ((h ^ Math.fround(m[5])) * 16777619) >>> 0;
+    h = ((h ^ Math.fround(m[10])) * 16777619) >>> 0;
     node = node.parent;
   }
   if (h === cache.hash && cache.hasGeometry) {

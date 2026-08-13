@@ -4,6 +4,7 @@ import { Component } from "./Component.js";
 import { resolveAssetUrl } from "../assetResolver.js";
 import { loadMaterialAsset } from "../materialAsset.js";
 import { getGltfLoader, rebaseClipToZero } from "../gltfLoader.js";
+import { invalidateEntityBounds } from "../viewFrustum.js";
 
 // Draco-enabled shared loader: Draco-compressed .glb (from the draco module)
 // decode transparently; plain .glb are unaffected.
@@ -74,6 +75,13 @@ export class ModelComponent extends Component {
       // the user saved the scene with the component disabled.
       this.root.visible = this._enabled;
       this.bindSkeletonEntities();
+      // A model's meshes hang off `entity.object3D`, not off child ENTITIES, so
+      // nothing in the bounding-sphere cache's per-entity hash can see them
+      // appear — and the entity did not move while loading. Without this the
+      // cache keeps answering "no geometry" or the placeholder's radius for the
+      // rest of the session, which is what stopped imported buildings from ever
+      // being tagged as occluders. See viewFrustum.js.
+      invalidateEntityBounds();
       this.entity.engine.emit("model-loaded", this.entity);
     } catch (err) {
       console.error(`Failed to load model "${path}": ${err.message}`);

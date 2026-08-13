@@ -208,8 +208,13 @@ export class OcclusionSystem {
    * Re-tags which meshes are occluders. Runs on a dirty flag rather than every
    * frame: the tag is a layer bit, and a layer bit is part of the batching key,
    * so writing it every frame would rebuild every batch in the scene forever.
+   *
+   * Public because "which objects does this system think are occluders" is the
+   * one question that diagnoses a scene culling nothing, and it is unanswerable
+   * from outside if the tagging pass cannot be run on demand. `stats.occluders`
+   * reports the count.
    */
-  #refreshOccluders() {
+  refreshOccluders() {
     this._occluderDirty = false;
     this._occluders.length = 0;
     const minRadius = this.minOccluderSize;
@@ -236,6 +241,15 @@ export class OcclusionSystem {
       if (template?.layers.isEnabled(OCCLUDER_LAYER)) batch.mesh.layers.enable(OCCLUDER_LAYER);
       else batch.mesh.layers.disable(OCCLUDER_LAYER);
     }
+    // Same for merge proxies. A merged group is one large object by
+    // construction, so it should occlude whenever ANY of the geometry it stands
+    // in for did — read from the bits the loop above just computed, not from
+    // anything cached at merge time.
+    for (const group of this.engine.merging?.groups ?? []) {
+      const occludes = group.members.some((member) => member.mesh.layers.isEnabled(OCCLUDER_LAYER));
+      if (occludes) group.mesh.layers.enable(OCCLUDER_LAYER);
+      else group.mesh.layers.disable(OCCLUDER_LAYER);
+    }
   }
 
   #clearOccluderTags() {
@@ -257,7 +271,7 @@ export class OcclusionSystem {
     const camera = this.engine.camera;
     if (!renderer || !camera || !this.engine.rendererReady) return;
     if (this.pending) return; // one readback in flight; the next frame will do
-    if (this._occluderDirty) this.#refreshOccluders();
+    if (this._occluderDirty) this.refreshOccluders();
     if (this._occluders.length === 0) return;
 
     const target = this.#ensureTarget();
