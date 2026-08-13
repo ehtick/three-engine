@@ -6,9 +6,11 @@
  *
  * What it measures, every frame:
  *
- *   fps         — frames/second from `1000 / dt`, smoothed by a 30-frame EMA
- *                 so the readout is steady but reacts within ~half a second
- *                 to a 60→30 drop
+ *   fps         — frames the renderer actually PRESENTED in the last second,
+ *                 counted. Not an average of `1000 / dt`. See the FPS block
+ *                 below: that average, and the update-phase sampling that fed
+ *                 it, both reported a healthy frame rate for a viewport that
+ *                 was visibly crawling or frozen outright.
  *   frameMs     — wall time between successive onUpdate() calls (the engine
  *                 #tick minus the render() call that sits between updates)
  *   cpuLoadPct  — frameMs as a percentage of a 16.67 ms budget (60 Hz reference).
@@ -58,10 +60,35 @@
 // at any 60 Hz scene and confuse the user — "why is my idle scene at 200%?".)
 const FRAME_BUDGET_MS = 1000 / 60;
 
-// EMA smoothing factor. alpha=1/30 gives a time constant of ~30 frames ≈
-// 0.5 s at 60 Hz — long enough to be readable, short enough to feel
-// responsive when the load actually changes.
+// EMA smoothing factor for the millisecond readings. alpha=1/30 gives a time
+// constant of ~30 frames ≈ 0.5 s at 60 Hz — long enough to be readable, short
+// enough to feel responsive when the load actually changes.
 const FPS_EMA_ALPHA = 1 / 30;
+
+/**
+ * FPS IS A COUNT, NOT AN AVERAGE OF RATES. This distinction is the whole
+ * reason the readout used to lie, so it is worth the paragraph.
+ *
+ * The previous implementation EMA'd `1000 / dt` — the mean of instantaneous
+ * rates. That is not the frame rate. By Jensen's inequality the mean of
+ * reciprocals is always >= the reciprocal of the mean, and the gap grows with
+ * variance: frames of 5, 5, 5 and 60 ms are 4 frames in 75 ms = 53 fps, but
+ * averaging their instantaneous rates (200, 200, 200, 16.7) says 154. A
+ * stutter is exactly high variance, so the old number was most wrong in the
+ * one situation the overlay exists to diagnose — steady, plausible, and
+ * roughly triple the truth.
+ *
+ * So: stamp every frame the renderer actually presented, and divide the count
+ * in the last second by that second. The window ends at READ time, not at the
+ * last frame, which is what makes a stalled or stopped loop decay to 0 instead
+ * of holding its final reading forever.
+ */
+const FPS_WINDOW_MS = 1000;
+
+// One second of presents at 512 Hz. Above that the count saturates and the
+// readout under-reports — a limit no display reaches, and the failure
+// direction is the safe one (a saturated 512 still reads as "very fast").
+const PRESENT_RING = 512;
 
 export class StatsSystem {
   constructor(engine) {
@@ -71,7 +98,18 @@ export class StatsSystem {
     // updates. The StatsOverlay component does a shallow spread at the
     // read boundary so React doesn't bail out on Object.is equality.
     this.readout = {
+      // Frames presented in the last second. Refreshed on every tick AND on
+      // every `sample()` call, so a host polling at 10 Hz sees it fall while
+      // the engine loop is stopped rather than reading a frozen number.
       fps: 0,
+      // Frames the engine ticked but did NOT present in the last second:
+      // resize drains and `renderSuspended` waves (GI's compile wave is the
+      // big one) run the whole update phase and then return before the draw.
+      // Those frames used to be counted as frames — a suspended viewport
+      // holding one still image reported the full refresh rate. Surfaced
+      // rather than merely excluded, because "0 fps, 70 skipped" says the
+      // engine is alive and stalled, which "0 fps" alone does not.
+      skippedFps: 0,
       frameMs: 0,
       // Main-thread time actually spent executing one engine frame. Unlike
       // frameMs this excludes time deliberately yielded by a host-side frame
@@ -102,9 +140,38 @@ export class StatsSystem {
     // 0 ms GPU time rather than NaN.
     this._lastRenderMs = 0;
 
+    // Ring of wall-clock stamps, one per presented frame. A ring rather than a
+    // trimmed array because this is written on the hot path every frame and
+    // read ten times a second: writing is one store and two increments, and
+    // nothing allocates.
+    this._presentTimes = new Float64Array(PRESENT_RING);
+    this._presentHead = 0;
+    this._presentFilled = 0;
+    this._skippedTimes = new Float64Array(PRESENT_RING);
+    this._skippedHead = 0;
+    this._skippedFilled = 0;
+
     this._unsubUpdate = null;
     this._lastTickStart = 0;
     this._tick = this._tick.bind(this);
+  }
+
+  /**
+   * Frames presented in the last second, recounted against the clock on every
+   * read. A live getter rather than a plain field because the number a script
+   * wants is "what is the frame rate right now", and `readout.fps` is only as
+   * fresh as the last tick — which is stale by definition in the case that
+   * matters most, a loop that has stopped ticking.
+   *
+   *     if (this.engine.stats.fps < 30) this.dropParticleBudget();
+   */
+  get fps() {
+    return this.sample().fps;
+  }
+
+  /** Ticks per second that ran but drew nothing. See `readout.skippedFps`. */
+  get skippedFps() {
+    return this.sample().skippedFps;
   }
 
   start() {
@@ -126,6 +193,51 @@ export class StatsSystem {
    */
   recordRenderMs(ms) {
     this._lastRenderMs = ms;
+  }
+
+  /**
+   * One frame reached the canvas. Called by Engine.#tick() immediately after
+   * the render call — either `renderer.render()` or a render override's own
+   * draw — and by nothing else.
+   *
+   * The placement is the point. The FPS counter used to live in `_tick()`,
+   * which runs as an `onUpdate` callback, i.e. in the update phase BEFORE the
+   * render block. Every path that returns between the two — a resize drain,
+   * `renderSuspended` (raised for the whole of GI's compile wave, during which
+   * the editor deliberately pins the loop uncapped) — produced a full tick
+   * with no draw, and the old counter scored it as a frame. That is a viewport
+   * frozen on one image reporting the display's refresh rate, which is the
+   * exact complaint this rewrite answers.
+   */
+  recordPresentedFrame(now = performance.now()) {
+    this._presentTimes[this._presentHead] = now;
+    this._presentHead = (this._presentHead + 1) % PRESENT_RING;
+    if (this._presentFilled < PRESENT_RING) this._presentFilled++;
+  }
+
+  /** A tick that ran the update phase and then returned without drawing. */
+  recordSkippedFrame(now = performance.now()) {
+    this._skippedTimes[this._skippedHead] = now;
+    this._skippedHead = (this._skippedHead + 1) % PRESENT_RING;
+    if (this._skippedFilled < PRESENT_RING) this._skippedFilled++;
+  }
+
+  /**
+   * Refresh the time-derived counters against `now` and return the readout.
+   *
+   * Hosts must call this before reading `fps`/`skippedFps` rather than trusting
+   * the last tick's values: when the loop is stopped (the editor suspends an
+   * unfocused viewport) or wedged, no tick runs, and a counter that only
+   * updates from inside the loop can never report that the loop isn't running.
+   * Recounting at read time makes "nothing is being drawn" decay honestly to
+   * zero within one window.
+   */
+  sample(now = performance.now()) {
+    this.readout.fps = countWithin(this._presentTimes, this._presentHead, this._presentFilled, now);
+    this.readout.skippedFps = countWithin(
+      this._skippedTimes, this._skippedHead, this._skippedFilled, now,
+    );
+    return this.readout;
   }
 
   recordFrameWorkMs(ms) {
@@ -171,25 +283,18 @@ export class StatsSystem {
     const now = performance.now();
 
     if (this._lastTickStart > 0) {
-      const dt = now - this._lastTickStart;
       // Frame CPU work: time between successive onUpdate() calls. Covers
       // the script + component updates + the synchronous parts of last
       // frame's GPU submission; the renderer.render() itself is excluded
       // because it sits between the update phase and the next onUpdate.
-      this.readout.frameMs = dt;
-
-      // FPS = 1000 / dt, smoothed with an EMA. The instant value is
-      // unbounded (a 0.1 ms interval would say 10 000 fps), so we also
-      // soft-cap the displayed FPS in the UI.
-      const instantFps = 1000 / Math.max(dt, 1);
-      if (this.readout.fps === 0) {
-        this.readout.fps = instantFps;
-      } else {
-        this.readout.fps =
-          FPS_EMA_ALPHA * instantFps + (1 - FPS_EMA_ALPHA) * this.readout.fps;
-      }
+      //
+      // NOT a frame-rate signal, whatever it looks like: this interval keeps
+      // running at the display's cadence through every non-drawing tick. FPS
+      // comes from recordPresentedFrame() alone.
+      this.readout.frameMs = now - this._lastTickStart;
     }
     this._lastTickStart = now;
+    this.sample(now);
 
     this.readout.renderMs = this._lastRenderMs;
     this._lastRenderMs = 0;
@@ -217,6 +322,27 @@ export class StatsSystem {
     // returns, when the per-frame metrics are populated with this
     // frame's data.
   }
+}
+
+/**
+ * How many stamps in the ring fall inside the window ending at `now`.
+ *
+ * Walks backwards from the newest entry and stops at the first one that has
+ * aged out — the ring is written in time order, so the first miss ends the
+ * count and a 60 fps engine touches 60 slots, not 512.
+ */
+function countWithin(times, head, filled, now) {
+  const cutoff = now - FPS_WINDOW_MS;
+  let n = 0;
+  for (let i = 1; i <= filled; i++) {
+    const index = (head - i + PRESENT_RING) % PRESENT_RING;
+    if (times[index] <= cutoff) break;
+    n++;
+  }
+  // The window is exactly one second, so the count IS the rate. Kept as an
+  // explicit division so the window length can change without the units
+  // silently changing with it.
+  return (n * 1000) / FPS_WINDOW_MS;
 }
 
 function clampPct(p) {

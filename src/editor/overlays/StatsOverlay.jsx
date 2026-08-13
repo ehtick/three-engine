@@ -5,7 +5,12 @@ import { ensureEngine } from "../engineInstance.js";
 /**
  * Editor-only viewport overlay showing live engine telemetry:
  *
- *   FPS              frames/second (smoothed)
+ *   FPS              frames the renderer actually presented in the last second,
+ *                    counted (see StatsSystem — this is not an average of
+ *                    instantaneous rates, and it excludes ticks that ran the
+ *                    update phase without drawing). Reads "—" when the loop is
+ *                    stopped, and "0" with a Stalled row when the loop is
+ *                    running but every frame is being skipped.
  *   CPU              engine frame time in ms (update tick, excluding render)
  *   GPU              real on-GPU frame time in ms (WebGPU timestamp queries);
  *                    falls back to CPU-side submit time, labelled
@@ -39,6 +44,7 @@ const COLLAPSED_STORAGE_KEY = "engine.viewport.stats.collapsed";
 
 const EMPTY_READOUT = {
   fps: 0,
+  skippedFps: 0,
   frameMs: 0,
   workMs: 0,
   cpuLoadPct: 0,
@@ -62,6 +68,12 @@ function readStats(liveEngine) {
   // overlay can mount before the editor's asynchronous engine bootstrap ends.
   const stats = liveEngine.stats;
   if (!stats) return { ...EMPTY_READOUT };
+  // `sample()` recounts the frame window against NOW. Without it the FPS
+  // reading would only ever be refreshed from inside the engine loop — so a
+  // loop that has stopped (the editor suspends an unfocused viewport) or one
+  // that is stalled mid-wave would keep displaying whatever it last managed,
+  // which is the failure mode this overlay is supposed to reveal.
+  stats.sample();
   // The StatsSystem mutates its readout in place every frame; React's
   // useState bails out on identical references, so we shallow-clone to
   // guarantee every 10 Hz poll triggers a render.
@@ -177,8 +189,12 @@ export function StatsOverlay({ forceVisible = false }) {
           {collapsed ? "▸" : "▾"}
         </span>
         <span className="stats-overlay-label">FPS</span>
-        <span className={`stats-overlay-value tone-${fpsTone(r.fps)}`}>
-          {r.fps > 0 ? r.fps.toFixed(0) : "—"}
+        {/* Three states, not two. A stopped loop (nothing to draw, viewport
+            unfocused and frozen) is "—": zero would read as a performance
+            collapse. A loop that IS running and drawing nothing is "0" — that
+            one really is a collapse, and the Stalled row below names it. */}
+        <span className={`stats-overlay-value tone-${fpsTone(r.fps, r.skippedFps)}`}>
+          {r.fps > 0 ? r.fps.toFixed(0) : r.skippedFps > 0 ? "0" : "—"}
         </span>
       </button>
       {!collapsed && (
@@ -204,6 +220,14 @@ export function StatsOverlay({ forceVisible = false }) {
             value={formatBytes(r.jsHeapBytes)}
             tone={memTone(r.jsHeapBytes)}
           />
+          {/* Ticks per second that ran the whole update phase and then
+              returned before the draw — a GI compile wave holding the
+              viewport on its last image, or a renderer resize draining. The
+              row is absent when there are none, so seeing it at all means
+              the picture on screen is older than the scene. */}
+          {r.skippedFps > 0 && (
+            <Row label="Stalled" value={`${r.skippedFps.toFixed(0)} /s`} tone="warm" />
+          )}
           <Section title="Renderer" />
           {r.renderScale < 0.995 && (
             <Row label="Res scale" value={`${Math.round(r.renderScale * 100)}%`} tone="warm" />
@@ -276,8 +300,10 @@ function loadClass(ms) {
   return "ok";
 }
 
-function fpsTone(fps) {
-  if (fps <= 0) return "ok";
+function fpsTone(fps, skippedFps = 0) {
+  // A stopped loop is neutral; a running loop presenting nothing is the worst
+  // reading there is, and must not share the idle colour.
+  if (fps <= 0) return skippedFps > 0 ? "heavy" : "ok";
   if (fps < 30) return "heavy";
   if (fps < 50) return "warm";
   return "ok";
