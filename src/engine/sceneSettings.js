@@ -70,6 +70,20 @@ export const SCENE_SETTINGS_DEFAULTS = {
     // goes from a thousand draw calls to one. Off only makes sense when
     // debugging a suspected batching artifact.
     autoBatching: true,
+    // Merges meshes with DIFFERENT geometry and DIFFERENT materials into one
+    // draw, by concatenating their vertex buffers and shading them through a
+    // table-driven "uber" material (see engine/merging.js). This is the case
+    // autoBatching cannot reach: an imported environment repeats nothing, so
+    // instancing finds no groups, and every material is still its own draw in
+    // every pass — colour, depth prepass and shadow map alike.
+    //
+    // OFF by default, for one specific reason worth knowing before turning it
+    // on: the GI module reads `material.map` on the CPU to build its albedo
+    // atlas, and an uber material's colour lives in a texture array the CPU
+    // cannot index. A merged surface therefore contributes its group's average
+    // tint to GI's BVH reflection albedo rather than its own texture. Direct
+    // lighting, shadows and the voxel field are unaffected.
+    staticMerging: false,
     // Hides objects the depth buffer says are behind something else (see
     // culling/OcclusionSystem.js). OFF by default and deliberately so: it costs
     // a low-resolution depth pass over the scene's big geometry every frame,
@@ -292,6 +306,24 @@ export function rendererConstructorOptions(settings) {
 export async function resolveRendererLimits() {
   try {
     const adapter = await navigator.gpu?.requestAdapter?.();
+    // WHICH GPU — printed once per boot, because on a dual-GPU laptop the
+    // answer decides every performance number that follows. Chromium's Dawn
+    // asks for the LOW-POWER adapter by default and a page cannot override
+    // it (the choice is per GPU process), so the editor spent months running
+    // its whole GPU frame on the integrated chip — measured 10× slower on
+    // the GI deposit — while every Chrome harness ran the discrete card.
+    // `--force-high-performance-gpu` in additionalBrowserArgs is the fix;
+    // this line is what keeps the fix HONEST across machines and updates.
+    {
+      const i = adapter?.info ?? {};
+      const fallback = i.isFallbackAdapter ?? adapter?.isFallbackAdapter;
+      console.log(
+        `[gpu] adapter: ${i.vendor || "?"} / ${i.architecture || "?"}` +
+          `${i.device ? ` (${i.device})` : ""}${i.description ? ` "${i.description}"` : ""}` +
+          `${fallback ? " ⚠ FALLBACK (software)" : ""}` +
+          ` — maxStorageBuffer ${((adapter?.limits?.maxStorageBufferBindingSize ?? 0) / 1048576) | 0}MB`,
+      );
+    }
     const requiredLimits = {};
     const uniforms = adapter?.limits?.maxUniformBuffersPerShaderStage ?? 0;
     if (uniforms > 12) requiredLimits.maxUniformBuffersPerShaderStage = Math.min(24, uniforms);

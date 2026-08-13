@@ -16,6 +16,7 @@
  */
 import { defineOp } from "../registry.js";
 import { engine } from "../../engineInstance.js";
+import { auditDrawCalls } from "../../../engine/drawCallAudit.js";
 
 /** Named screen-chain passes, in the order they run. */
 const SCREEN_PASSES = [
@@ -289,5 +290,78 @@ defineOp({
     } finally {
       engine.renderSuspended = wasSuspended;
     }
+  },
+});
+
+defineOp({
+  name: "profile.frameStats",
+  readOnly: true,
+  description:
+    "Live frame-rate and renderer counters — the same numbers the viewport's Stats overlay shows. `fps` counts frames the renderer actually PRESENTED over a one-second window; ticks that ran but skipped the draw (a GI compile wave, a renderer resize) are reported separately as `skippedFps`, and an idle viewport the editor has suspended reports 0 for both. Use this to check whether a change actually made the editor faster. `culling` reports what the occlusion and LOD systems are doing: `occlusion.occluders` is 0 when no object in the scene is large enough to be worth rendering into the occluder depth pass, in which case nothing can ever be culled.",
+  params: {
+    settleMs: {
+      type: "number",
+      default: 1100,
+      description:
+        "How long to let the frame window fill before reading, in ms. The window is one second, so anything below ~1000 reports a partial count. 0 reads immediately. Max 10000.",
+    },
+  },
+  async run({ settleMs = 1100 }) {
+    const stats = engine?.stats;
+    if (!stats) throw new Error("No engine.");
+    const wait = Math.max(0, Math.min(10_000, Math.round(settleMs)));
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    // sample() recounts against the clock. Reading `readout` directly would
+    // report whatever the last tick left behind — which for a suspended
+    // viewport is a stale frame rate for a canvas that is not drawing.
+    const r = stats.sample();
+    const drawing = r.fps > 0;
+    return {
+      fps: Math.round(r.fps),
+      skippedFps: Math.round(r.skippedFps),
+      cpuMs: +(r.workMs || r.frameMs).toFixed(2),
+      gpuMs: +(r.gpuMs > 0 ? r.gpuMs : r.renderMs).toFixed(2),
+      gpuMsIsReal: r.gpuMs > 0,
+      renderScale: +r.renderScale.toFixed(3),
+      drawCalls: r.drawCalls,
+      triangles: r.triangles,
+      textureMemMB: +(r.textureMem / 1048576).toFixed(1),
+      jsHeapMB: r.jsHeapBytes == null ? null : +(r.jsHeapBytes / 1048576).toFixed(1),
+      playing: !!engine.playing,
+      // The three view-culling systems, because "occluded 0" and "occluded 0 of
+      // 0" are completely different reports and the Stats overlay shows neither
+      // when the count is zero. `occluders` is the one that actually diagnoses
+      // it: a scene with occlusion on and ZERO occluders never even runs the
+      // depth pass, so nothing downstream can cull anything.
+      culling: {
+        occlusion: engine.occlusion?.stats ?? null,
+        lodHidden: [...engine.entities.values()].filter((e) => e._lodHidden === true).length,
+      },
+      note: drawing
+        ? r.skippedFps > 0
+          ? `Drawing ${Math.round(r.fps)} frames/s and skipping ${Math.round(r.skippedFps)} — something is suspending the render mid-wave.`
+          : "Rendering normally."
+        : r.skippedFps > 0
+          ? "The loop is running and presenting NOTHING — rendering is suspended (a GI compile wave or a renderer resize). The viewport is frozen on its last image."
+          : "The render loop is stopped: the editor suspends an unfocused viewport, so this is expected unless the viewport is the focused panel.",
+    };
+  },
+});
+
+defineOp({
+  name: "profile.drawCalls",
+  readOnly: true,
+  description:
+    "Draw-call breakdown: every submission of one real frame, attributed to its render pass, its object and its material. Use this instead of guessing why a scene submits too much — it separates the main opaque pass from shadow cascades, depth prepasses and post-render overlays, names the material behind each draw, and reports the floor each pass would reach if every draw sharing a pipeline state were merged. Its total is legitimately higher than the stats overlay's, which stops counting before the post-render passes.",
+  params: {
+    frames: {
+      type: "number",
+      default: 1,
+      description: "Frames to capture. More than one distinguishes a steady frame from a one-off bake. Max 10.",
+    },
+  },
+  async run({ frames = 1 }) {
+    if (!engine) throw new Error("No engine.");
+    return auditDrawCalls(engine, { frames });
   },
 });
