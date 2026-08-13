@@ -1,11 +1,8 @@
 import { useEffect, useState } from "react";
-import { Save, X, RotateCcw } from "lucide-react";
+import { Save, X, RotateCcw, Crosshair } from "lucide-react";
+import { Row, Toggle, Note, Section } from "./settingsUi.jsx";
 import { useProjectStore, basename } from "../store/projectStore.js";
-import {
-  getProjectSettings,
-  saveProjectSettings,
-  PROJECT_SETTINGS_DEFAULTS,
-} from "../projectSettings.js";
+import { getProjectSettings, saveProjectSettings } from "../projectSettings.js";
 import { currentScenePath } from "../sceneIO.js";
 import { KEY_BINDING_ACTIONS, describeBinding } from "../keybindings.js";
 import {
@@ -50,15 +47,6 @@ async function pathExists(absPath) {
   }
 }
 
-function Row({ label, children }) {
-  return (
-    <div className="field-row">
-      <span className="field-label">{label}</span>
-      {children}
-    </div>
-  );
-}
-
 function Num({ value, onChange, min, max, step = 0.1 }) {
   return (
     <input
@@ -83,7 +71,7 @@ function Num({ value, onChange, min, max, step = 0.1 }) {
  * whether the editor accepted their input. Empty input is allowed and
  * means "unbound" — clicking the reset icon restores the default.
  */
-function KeybindingInput({ actionId, value, defaultChord, onChange }) {
+function KeybindingInput({ value, defaultChord, onChange }) {
   const [draft, setDraft] = useState(value ?? defaultChord);
   const [capturing, setCapturing] = useState(false);
 
@@ -155,25 +143,21 @@ function KeybindingsTable({ keybindings, onChange }) {
   return (
     <div className="keybindings-table">
       {Object.entries(KEY_BINDING_ACTIONS).map(([actionId, def]) => (
-        <div key={actionId} className="field-row keybinding-row">
-          <span className="field-label" title={actionId}>{def.label}</span>
-          <KeybindingInput
-            actionId={actionId}
-            value={keybindings[actionId] ?? ""}
-            defaultChord={def.default}
-            onChange={(chord) => onChange({ ...keybindings, [actionId]: chord })}
-          />
+        <div key={actionId} className="settings-row keybinding-row" title={actionId}>
+          <span className="settings-label">{def.label}</span>
+          <div className="settings-control">
+            <KeybindingInput
+              value={keybindings[actionId] ?? ""}
+              defaultChord={def.default}
+              onChange={(chord) => onChange({ ...keybindings, [actionId]: chord })}
+            />
+          </div>
         </div>
       ))}
     </div>
   );
 }
 
-/**
- * Project-wide settings (project.json `settings`): editor behavior, script
- * hot reload, performance, export metadata. Not undoable — these are
- * preferences, not scene edits. Save writes the file and applies live.
- */
 /**
  * Layer names + the collision matrix, Unity-style. The matrix is symmetric, so
  * only the lower triangle is editable — showing both halves invites the user to
@@ -183,7 +167,7 @@ function KeybindingsTable({ keybindings, onChange }) {
  * default) means everything collides, which is what projects had before layers
  * existed. The first edit materialises a real matrix.
  */
-function CollisionMatrixSection({ layers, matrix, onChange }) {
+function CollisionMatrix({ layers, matrix, onChange }) {
   const names = layers ?? [];
   const rows = matrix ?? names.map(() => 0xffff);
   const collides = (i, j) => !!(rows[i] & (1 << j));
@@ -208,24 +192,26 @@ function CollisionMatrixSection({ layers, matrix, onChange }) {
   };
 
   return (
-    <div className="inspector-section">
-      <div className="section-header">Physics Layers</div>
-      <div className="asset-hint" style={{ padding: "0 2px 6px" }}>
-        A collider is on one layer; this matrix decides which layers touch. Queries
-        (raycast, overlap) are not filtered by it — they take their own layer list.
+    <>
+      <Note>
+        A collider sits on one layer; the matrix decides which layers touch. Raycasts and
+        overlaps take their own layer list and ignore it.
+      </Note>
+      <div className="settings-layer-names">
+        {names.map((name, index) => (
+          <label key={index}>
+            <span>{index}</span>
+            <input
+              className="text-field"
+              value={name}
+              onChange={(e) => rename(index, e.target.value)}
+              // Layer 0 is the fallback for any collider whose layer went
+              // missing, so it always has to exist under some name.
+              placeholder={index === 0 ? "Default" : `Layer ${index}`}
+            />
+          </label>
+        ))}
       </div>
-      {names.map((name, index) => (
-        <Row key={index} label={`Layer ${index}`}>
-          <input
-            className="text-field"
-            value={name}
-            onChange={(e) => rename(index, e.target.value)}
-            // Layer 0 is the fallback for any collider whose layer went
-            // missing, so it always has to exist under some name.
-            placeholder={index === 0 ? "Default" : `Layer ${index}`}
-          />
-        </Row>
-      ))}
       <div className="collision-matrix">
         {names.map((rowName, i) => (
           <div className="collision-matrix-row" key={i}>
@@ -255,10 +241,15 @@ function CollisionMatrixSection({ layers, matrix, onChange }) {
           ))}
         </div>
       </div>
-    </div>
+    </>
   );
 }
 
+/**
+ * Project-wide settings (project.json `settings`): editor behavior, hot reload,
+ * performance, export metadata, physics layers. Not undoable — these are
+ * preferences, not scene edits. Save writes the file and applies live.
+ */
 export function ProjectSettingsPanel() {
   const rootPath = useProjectStore((s) => s.rootPath);
   const projectName = useProjectStore((s) => s.projectMeta?.name);
@@ -324,129 +315,44 @@ export function ProjectSettingsPanel() {
     }
   };
 
-  const saveMainScene = async () => {
-    const value = normalizeMainPath(mainDraft);
+  const setMain = async (value) => {
     try {
       await useProjectStore.getState().updateMeta({ [MAIN_SCENE_KEY]: value });
       setMainDraft(value);
       setMainDirty(false);
-      console.log(value ? `Main scene set: ${value}` : "Main scene cleared");
     } catch (err) {
       console.error(`Failed to set main scene: ${err}`);
     }
   };
 
-  const useCurrentAsMain = async () => {
+  const useCurrentAsMain = () => {
     const abs = currentScenePath();
-    if (!abs) return;
-    const rel = projectRelative(rootPath, abs);
-    setMainDraft(rel);
-    try {
-      await useProjectStore.getState().updateMeta({ [MAIN_SCENE_KEY]: rel });
-      setMainDirty(false);
-      console.log(`Main scene set to current: ${rel}`);
-    } catch (err) {
-      console.error(`Failed to set main scene: ${err}`);
-    }
-  };
-
-  const clearMainScene = async () => {
-    setMainDraft("");
-    try {
-      await useProjectStore.getState().updateMeta({ [MAIN_SCENE_KEY]: "" });
-      setMainDirty(false);
-    } catch (err) {
-      console.error(`Failed to clear main scene: ${err}`);
-    }
+    if (abs) setMain(projectRelative(rootPath, abs));
   };
 
   const { editor, scripts, rendering, game, physics } = settings;
   const mainValue = normalizeMainPath(mainDirty ? mainDraft : mainScene);
-  const mainHint = !mainValue
-    ? "No main scene set — boot will fall back to the last-edited scene."
-    : mainValid === false
-      ? `File not found: ${rootPath}/${mainValue}`
-      : mainValid === true
-        ? `Opens on editor boot: ${mainValue}`
-        : "Checking…";
+  const mainMissing = !!mainValue && mainValid === false;
 
   return (
-    <div className="inspector-panel scene-settings-panel">
+    <div className="inspector-panel settings-panel project-settings-panel">
       <div className="panel-toolbar">
         <span className="asset-path" title={rootPath}>
           {projectName ?? basename(rootPath)}
         </span>
-        <button className="toolbar-btn" disabled={!dirty} onClick={save}>
+        <button
+          className={`toolbar-btn${dirty ? " primary" : ""}`}
+          disabled={!dirty}
+          title={dirty ? "Write project.json and apply" : "No unsaved changes"}
+          onClick={save}
+        >
           <Save size={13} />
-          Save{dirty ? " •" : ""}
+          Save
         </button>
       </div>
 
-      <div className="inspector-section">
-        <div className="section-header">Editor</div>
-        <Row label="Autosave (s)">
-          <Num value={editor.autosaveSeconds} min={0} step={5} onChange={(v) => patch("editor", { autosaveSeconds: v })} />
-        </Row>
-        <Row label="Snap move">
-          <Num value={editor.snapTranslate} min={0.01} step={0.1} onChange={(v) => patch("editor", { snapTranslate: v })} />
-        </Row>
-        <Row label="Snap rotate°">
-          <Num value={editor.snapRotateDeg} min={1} max={90} step={1} onChange={(v) => patch("editor", { snapRotateDeg: v })} />
-        </Row>
-        <Row label="Snap scale">
-          <Num value={editor.snapScale} min={0.01} step={0.05} onChange={(v) => patch("editor", { snapScale: v })} />
-        </Row>
-        <Row label="Show grid">
-          <input type="checkbox" checked={editor.showGrid !== false} onChange={(e) => patch("editor", { showGrid: e.target.checked })} />
-        </Row>
-        <Row label="Grid size">
-          <Num value={editor.gridSize} min={2} step={2} onChange={(v) => patch("editor", { gridSize: v })} />
-        </Row>
-        <Row label="Divisions">
-          <Num value={editor.gridDivisions} min={1} step={1} onChange={(v) => patch("editor", { gridDivisions: v })} />
-        </Row>
-        <Row label="Freeze unfocused viewport">
-          <input
-            type="checkbox"
-            checked={freezeUnfocused}
-            title="Stop rendering the viewport while another panel has focus. It wakes up whenever something it draws changes; turn this off if you need an unattended simulation to keep ticking."
-            onChange={(e) => setViewportFreezeEnabled(e.target.checked)}
-          />
-        </Row>
-        <div className="asset-hint" style={{ padding: "0 2px 6px" }}>
-          Freezing applies immediately and is remembered per machine, not saved
-          into the project.
-        </div>
-      </div>
-
-      <div className="inspector-section">
-        <div className="section-header">Keybindings</div>
-        <KeybindingsTable
-          keybindings={editor.keybindings ?? {}}
-          onChange={(keybindings) => patch("editor", { keybindings })}
-        />
-      </div>
-
-      <div className="inspector-section">
-        <div className="section-header">Scripts</div>
-        <Row label="Hot reload">
-          <input type="checkbox" checked={scripts.hotReload !== false} onChange={(e) => patch("scripts", { hotReload: e.target.checked })} />
-        </Row>
-        <Row label="Poll (ms)">
-          <Num value={scripts.reloadIntervalMs} min={100} step={50} onChange={(v) => patch("scripts", { reloadIntervalMs: v })} />
-        </Row>
-      </div>
-
-      <div className="inspector-section">
-        <div className="section-header">Performance</div>
-        <Row label="Pixel ratio cap">
-          <Num value={rendering.pixelRatioCap} min={0.5} max={4} step={0.25} onChange={(v) => patch("rendering", { pixelRatioCap: v })} />
-        </Row>
-      </div>
-
-      <div className="inspector-section">
-        <div className="section-header">Game</div>
-        <Row label="Title">
+      <Section id="project.game" title="Game">
+        <Row label="Title" hint="Page title of the exported build. Empty = project name.">
           <input
             className="text-field"
             type="text"
@@ -455,69 +361,48 @@ export function ProjectSettingsPanel() {
             onChange={(e) => patch("game", { title: e.target.value })}
           />
         </Row>
-        <Row label="Main scene">
-          <div style={{ display: "flex", flexDirection: "column", gap: 4, width: "100%" }}>
-            <div style={{ display: "flex", gap: 4, width: "100%" }}>
-              <input
-                className="text-field"
-                type="text"
-                value={mainDraft}
-                placeholder="scenes/main.scene"
-                onChange={(e) => {
-                  setMainDraft(e.target.value);
-                  setMainDirty(normalizeMainPath(e.target.value) !== normalizeMainPath(mainScene));
-                }}
-                style={{ flex: 1 }}
-              />
-              {mainDirty ? (
-                <button
-                  className="toolbar-btn"
-                  title="Save the typed path as the main scene"
-                  disabled={mainValid === false}
-                  onClick={saveMainScene}
-                >
-                  <Save size={13} />
-                </button>
-              ) : null}
-              <button
-                className="toolbar-btn"
-                title="Use the currently open scene as the main scene"
-                disabled={!currentScenePath()}
-                onClick={useCurrentAsMain}
-              >
-                Use current
-              </button>
-              {mainScene ? (
-                <button
-                  className="toolbar-btn"
-                  title="Clear main scene (boot will fall back to last-edited scene)"
-                  onClick={clearMainScene}
-                >
-                  <X size={13} />
-                </button>
-              ) : null}
-            </div>
-            <span
-              className="asset-hint"
-              style={{
-                color: mainValid === false ? "var(--danger, #e26d6d)" : undefined,
-                padding: "0 2px",
-              }}
-            >
-              {mainHint}
-            </span>
-          </div>
+        <Row
+          label="Main scene"
+          wide
+          hint="Opens on editor boot and boots the build. Empty = last-edited scene."
+        >
+          <input
+            className={`text-field${mainMissing ? " missing-ref" : ""}`}
+            type="text"
+            value={mainDraft}
+            placeholder="scenes/main.scene"
+            onChange={(e) => {
+              setMainDraft(e.target.value);
+              setMainDirty(normalizeMainPath(e.target.value) !== normalizeMainPath(mainScene));
+            }}
+            onBlur={() => {
+              if (mainDirty && !mainMissing) setMain(normalizeMainPath(mainDraft));
+            }}
+          />
+          <button
+            className="toolbar-btn icon-only"
+            title="Use the scene that's open now"
+            disabled={!currentScenePath()}
+            onClick={useCurrentAsMain}
+          >
+            <Crosshair size={13} />
+          </button>
+          <button
+            className="toolbar-btn icon-only"
+            title="Clear"
+            disabled={!mainScene && !mainDraft}
+            onClick={() => setMain("")}
+          >
+            <X size={13} />
+          </button>
         </Row>
-      </div>
-
-      <div className="inspector-section">
-        <div className="section-header">Saves</div>
-        <div className="asset-hint" style={{ padding: "0 2px 6px" }}>
-          Save slots and preferences are stored under this id, so two games served from
-          the same origin can't read each other's saves. Empty = the title above — which
-          means renaming the game orphans existing saves; pin an id to keep them.
-        </div>
-        <Row label="Save id">
+        {mainMissing ? (
+          <Note danger>Not found: {mainValue}</Note>
+        ) : null}
+        <Row
+          label="Save id"
+          hint="Namespaces save slots so two games on one origin can't read each other's. Empty = the title, which means renaming the game orphans existing saves."
+        >
           <input
             className="text-field"
             type="text"
@@ -526,7 +411,10 @@ export function ProjectSettingsPanel() {
             onChange={(e) => patch("game", { saveId: e.target.value })}
           />
         </Row>
-        <Row label="Save version">
+        <Row
+          label="Save version"
+          hint="Bump when what your scripts write in onSave changes, and register engine.saves.registerMigration(n, fn). A save with no path to this version is refused, not loaded wrong."
+        >
           <Num
             value={game.saveVersion ?? 1}
             min={1}
@@ -534,22 +422,143 @@ export function ProjectSettingsPanel() {
             onChange={(v) => patch("game", { saveVersion: Math.max(1, Math.round(v)) })}
           />
         </Row>
-        <div className="asset-hint" style={{ padding: "6px 2px 0" }}>
-          Bump the version when what your scripts write in <code>onSave</code> changes, and
-          register a migration with <code>engine.saves.registerMigration(n, fn)</code>. A
-          save with no path to the current version is refused rather than loaded wrong.
-        </div>
-      </div>
+      </Section>
 
-      <CollisionMatrixSection
-        layers={physics.layers}
-        matrix={physics.matrix}
-        onChange={(next) => patch("physics", next)}
-      />
+      <Section id="project.hotreload" title="Hot Reload">
+        <Row
+          label="Watch project files"
+          hint="Re-read files changed outside the editor — an agent's file tools, your IDE, a paint program, a git checkout. Off means those changes appear only after a manual refresh or a restart."
+        >
+          <Toggle
+            checked={editor.watchProject !== false}
+            onChange={(v) => patch("editor", { watchProject: v })}
+          />
+        </Row>
+        <Row
+          label="Reload scripts"
+          hint="Re-run changed .ts/.js scripts in place, keeping the scene as it is."
+        >
+          <Toggle
+            checked={scripts.hotReload !== false}
+            onChange={(v) => patch("scripts", { hotReload: v })}
+          />
+        </Row>
+        <Row
+          label="Poll interval"
+          sub
+          disabled={scripts.hotReload === false}
+          hint="How often script files are checked for changes."
+        >
+          <Num
+            value={scripts.reloadIntervalMs}
+            min={100}
+            step={50}
+            onChange={(v) => patch("scripts", { reloadIntervalMs: v })}
+          />
+          <span className="settings-unit">ms</span>
+        </Row>
+      </Section>
 
-      <div className="asset-hint" style={{ padding: "4px 10px" }}>
-        Stored in project.json. Scene look (background, fog, tone mapping…) lives in Scene Settings.
-      </div>
+      <Section id="project.editor" title="Editor">
+        <Row label="Autosave" hint="Seconds between automatic scene saves. 0 = off.">
+          <Num
+            value={editor.autosaveSeconds}
+            min={0}
+            step={5}
+            onChange={(v) => patch("editor", { autosaveSeconds: v })}
+          />
+          <span className="settings-unit">s</span>
+        </Row>
+        <Row label="Show grid">
+          <Toggle
+            checked={editor.showGrid !== false}
+            onChange={(v) => patch("editor", { showGrid: v })}
+          />
+        </Row>
+        <Row label="Grid size" sub disabled={editor.showGrid === false}>
+          <Num
+            value={editor.gridSize}
+            min={2}
+            step={2}
+            onChange={(v) => patch("editor", { gridSize: v })}
+          />
+        </Row>
+        <Row label="Grid divisions" sub disabled={editor.showGrid === false}>
+          <Num
+            value={editor.gridDivisions}
+            min={1}
+            step={1}
+            onChange={(v) => patch("editor", { gridDivisions: v })}
+          />
+        </Row>
+        <Row label="Snap move" hint="Grid step held down while dragging the move gizmo.">
+          <Num
+            value={editor.snapTranslate}
+            min={0.01}
+            step={0.1}
+            onChange={(v) => patch("editor", { snapTranslate: v })}
+          />
+        </Row>
+        <Row label="Snap rotate">
+          <Num
+            value={editor.snapRotateDeg}
+            min={1}
+            max={90}
+            step={1}
+            onChange={(v) => patch("editor", { snapRotateDeg: v })}
+          />
+          <span className="settings-unit">°</span>
+        </Row>
+        <Row label="Snap scale">
+          <Num
+            value={editor.snapScale}
+            min={0.01}
+            step={0.05}
+            onChange={(v) => patch("editor", { snapScale: v })}
+          />
+        </Row>
+      </Section>
+
+      <Section id="project.viewport" title="Viewport">
+        <Row
+          label="Pixel ratio cap"
+          hint="Upper bound on devicePixelRatio. Lower it to render fewer pixels on a HiDPI display."
+        >
+          <Num
+            value={rendering.pixelRatioCap}
+            min={0.5}
+            max={4}
+            step={0.25}
+            onChange={(v) => patch("rendering", { pixelRatioCap: v })}
+          />
+        </Row>
+        <Row
+          label="Freeze unfocused"
+          hint="Stop drawing the viewport while another panel has focus; it wakes whenever something it draws changes. Applies immediately and is stored per machine, not in the project."
+        >
+          <Toggle checked={freezeUnfocused} onChange={setViewportFreezeEnabled} />
+        </Row>
+      </Section>
+
+      <Section id="project.keybindings" title="Keybindings" defaultOpen={false}>
+        <KeybindingsTable
+          keybindings={editor.keybindings ?? {}}
+          onChange={(keybindings) => patch("editor", { keybindings })}
+        />
+      </Section>
+
+      <Section id="project.physics" title="Physics Layers" defaultOpen={false}>
+        <CollisionMatrix
+          layers={physics.layers}
+          matrix={physics.matrix}
+          onChange={(next) => patch("physics", next)}
+        />
+      </Section>
+
+      <Note footer>
+        Stored in project.json. Scene look — background, fog, tone mapping — lives in Scene
+        Settings.
+      </Note>
     </div>
   );
 }

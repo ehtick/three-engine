@@ -177,7 +177,7 @@ const before = await page.evaluate(() => {
 
 await page.evaluate(() => {
   const row = [...document.querySelectorAll(".inspector-panel .field-row")].find(
-    (r) => r.querySelector(".field-label")?.textContent?.trim() === "Material",
+    (r) => r.querySelector(".settings-label")?.textContent?.trim() === "Material",
   );
   row?.querySelector(".asset-field")?.click();
 });
@@ -235,7 +235,7 @@ await wait(900);
 
 await page.evaluate(() => {
   const row = [...document.querySelectorAll(".inspector-panel .field-row")].find(
-    (r) => r.querySelector(".field-label")?.textContent?.trim() === "Material",
+    (r) => r.querySelector(".settings-label")?.textContent?.trim() === "Material",
   );
   row?.querySelector(".asset-field")?.click();
 });
@@ -325,6 +325,93 @@ if (onDisk) {
   check("its class name follows the filename", /class Spinner extends Script/.test(source));
 }
 
+// A script slot is a file field plus six actions. Narrow the panel to the width
+// a docked inspector actually gets and the name must still be readable — it used
+// to ellipsize down to "B..", which makes two slots indistinguishable.
+const narrow = await page.evaluate(async () => {
+  const panel = document.querySelector(".inspector-panel");
+  const previous = panel.style.width;
+  panel.style.width = "300px";
+  await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+  const name = panel.querySelector(".script-slot .asset-field-name");
+  const field = panel.querySelector(".script-slot .asset-field-wrap");
+  const actions = panel.querySelector(".script-slot .script-slot-actions");
+  const out = {
+    text: name?.textContent ?? "",
+    fieldWidth: Math.round(field?.getBoundingClientRect().width ?? 0),
+    clipped: (name?.scrollWidth ?? 0) > (name?.clientWidth ?? 0) + 1,
+    // When they no longer fit beside the field the actions drop to their own
+    // line rather than squeezing it.
+    actionsWrapped:
+      !!actions && !!field &&
+      actions.getBoundingClientRect().top > field.getBoundingClientRect().bottom - 2,
+  };
+  panel.style.width = previous;
+  await new Promise((r) => requestAnimationFrame(r));
+  return out;
+});
+check(
+  "a script slot keeps its filename readable in a narrow inspector",
+  narrow.fieldWidth >= 160 && !narrow.clipped,
+  `"${narrow.text}" in ${narrow.fieldWidth}px${narrow.clipped ? " (clipped)" : ""}`,
+);
+check("…by wrapping the action buttons instead of squeezing the name", narrow.actionsWrapped);
+
+// --- 4b. the Asset Inspector scrolls past its embedded code editor ----------
+//
+// Monaco consumes the wheel by default. Embedded in a scrolling column that
+// meant the pointer was always over the editor, every tick went into the code,
+// and whatever sat below the tile could not be reached at all.
+await page.evaluate(async (file) => {
+  const { useSelectionStore } = await globalThis.__importLive("/src/editor/store/selectionStore.js");
+  useSelectionStore.getState().selectAssets([file]);
+}, path.join(root, "scripts", "Spinner.ts").replaceAll("\\", "/"));
+await wait(3000);
+
+const codeScroll = await page.evaluate(async () => {
+  const panel = document.querySelector(".inspector-panel");
+  const host = panel?.querySelector(".asset-code .code-editor-host");
+  if (!panel || !host) return { mounted: false };
+  panel.scrollTop = 0;
+  await new Promise((r) => setTimeout(r, 200));
+  const r = host.getBoundingClientRect();
+  return {
+    mounted: true,
+    maxScroll: panel.scrollHeight - panel.clientHeight,
+    point: { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) },
+  };
+});
+if (!codeScroll.mounted) {
+  check("the Asset Inspector embeds a code editor for a script", false);
+} else if (codeScroll.maxScroll < 40) {
+  check("the Asset Inspector embeds a code editor for a script", true, "panel too short to scroll — skipped");
+} else {
+  await page.mouse.move(codeScroll.point.x, codeScroll.point.y);
+  for (let i = 0; i < 40; i++) await page.mouse.wheel({ deltaY: 220 });
+  await wait(600);
+  const scrolled = await page.evaluate(() => {
+    const panel = document.querySelector(".inspector-panel");
+    return {
+      top: Math.round(panel.scrollTop),
+      max: panel.scrollHeight - panel.clientHeight,
+    };
+  });
+  check(
+    "the wheel over the embedded code editor still scrolls the inspector",
+    scrolled.top >= scrolled.max - 4,
+    `${scrolled.top}/${scrolled.max}px`,
+  );
+}
+
+// Selecting an asset swaps the Inspector over to the Asset Inspector. Every
+// check below this point reads the ENTITY inspector, so put the selection back
+// before moving on.
+await page.evaluate(async (id) => {
+  const { useSelectionStore } = await globalThis.__importLive("/src/editor/store/selectionStore.js");
+  useSelectionStore.getState().select([id]);
+}, await page.evaluate(() => globalThis.__polishId));
+await wait(1200);
+
 // --- 5. the 3D cursor HUD is a compact chip ---------------------------------
 
 const hud = await page.evaluate(() => {
@@ -356,7 +443,7 @@ const rightClick = (selector, offset = { x: 8, y: 8 }) =>
       if (sel.startsWith("row:")) {
         const [, label, rest] = sel.match(/^row:([^|]+)\|(.*)$/);
         scope = [...document.querySelectorAll(".inspector-panel .field-row")].find(
-          (r) => r.querySelector(".field-label")?.textContent?.trim() === label,
+          (r) => r.querySelector(".settings-label")?.textContent?.trim() === label,
         );
         sel = rest;
         if (!scope) return { found: false };
@@ -648,13 +735,13 @@ await wait(1500);
 
 const freezeRow = await page.evaluate(async () => {
   const { isViewportFreezeEnabled } = await globalThis.__importLive("/src/editor/viewportFreeze.js");
-  const row = [...document.querySelectorAll(".scene-settings-panel .field-row")].find(
-    (r) => /freeze/i.test(r.querySelector(".field-label")?.textContent ?? ""),
+  const row = [...document.querySelectorAll(".project-settings-panel .settings-row")].find(
+    (r) => /freeze/i.test(r.querySelector(".settings-label")?.textContent ?? ""),
   );
   const box = row?.querySelector('input[type="checkbox"]');
   return {
     found: !!box,
-    label: row?.querySelector(".field-label")?.textContent?.trim() ?? "",
+    label: row?.querySelector(".settings-label")?.textContent?.trim() ?? "",
     checkedOnOpen: box?.checked ?? null,
     prefOnOpen: isViewportFreezeEnabled(),
     // The old home: a snowflake button in the viewport toolbar.
@@ -673,8 +760,8 @@ const freezeToggled = await page.evaluate(async () => {
   const { isViewportFreezeEnabled, setViewportFreezeEnabled } = await globalThis.__importLive(
     "/src/editor/viewportFreeze.js",
   );
-  const box = [...document.querySelectorAll(".scene-settings-panel .field-row")]
-    .find((r) => /freeze/i.test(r.querySelector(".field-label")?.textContent ?? ""))
+  const box = [...document.querySelectorAll(".project-settings-panel .settings-row")]
+    .find((r) => /freeze/i.test(r.querySelector(".settings-label")?.textContent ?? ""))
     ?.querySelector('input[type="checkbox"]');
   box?.click();
   const afterClick = { pref: isViewportFreezeEnabled(), stored: localStorage.getItem("engine.viewport.freezeWhenUnfocused") };
@@ -693,10 +780,154 @@ check(
   "the checkbox follows the preference when something else changes it",
   (await page.evaluate(
     () =>
-      [...document.querySelectorAll(".scene-settings-panel .field-row")]
-        .find((r) => /freeze/i.test(r.querySelector(".field-label")?.textContent ?? ""))
+      [...document.querySelectorAll(".project-settings-panel .settings-row")]
+        .find((r) => /freeze/i.test(r.querySelector(".settings-label")?.textContent ?? ""))
         ?.querySelector('input[type="checkbox"]')?.checked === true,
   )),
+);
+
+// --- 10. hot reload is a Project Settings switch -----------------------------
+//
+// Watching the project folder used to be unconditional, which is wrong on a
+// network share and wrong when a build step churns thousands of files under the
+// root. The switch is only worth anything if flipping it actually stops the
+// watcher, so the check follows it all the way down to `watchedProjectRoot()`
+// rather than stopping at "the checkbox went grey".
+
+const hotReload = await page.evaluate(async () => {
+  const rowFor = (re) =>
+    [...document.querySelectorAll(".project-settings-panel .settings-row")].find((r) =>
+      re.test(r.querySelector(".settings-label")?.textContent ?? ""),
+    );
+  const watchRow = rowFor(/watch project files/i);
+  const scriptRow = rowFor(/reload scripts/i);
+  const pollRow = rowFor(/poll interval/i);
+  const { getProjectSettings } = await globalThis.__importLive("/src/editor/projectSettings.js");
+  return {
+    hasWatch: !!watchRow?.querySelector('input[type="checkbox"]'),
+    hasScripts: !!scriptRow?.querySelector('input[type="checkbox"]'),
+    hasPoll: !!pollRow?.querySelector('input[type="number"]'),
+    watchDefault: getProjectSettings().editor.watchProject !== false,
+  };
+});
+check(
+  "Project Settings has a Hot Reload group with all three controls",
+  hotReload.hasWatch && hotReload.hasScripts && hotReload.hasPoll,
+  JSON.stringify(hotReload),
+);
+check("…and watching the project folder is on by default", hotReload.watchDefault === true);
+
+// The watcher itself is a Tauri process — a browser harness can never start it,
+// so "watchedProjectRoot() is null" would pass here no matter what the switch
+// did. What IS testable in a browser is the gate the switch feeds: the store
+// flag, and the status an agent reads before deciding whether it must call
+// asset.refresh by hand.
+const watchOff = await page.evaluate(async () => {
+  const { useProjectStore } = await globalThis.__importLive("/src/editor/store/projectStore.js");
+  const { callOp } = await globalThis.__importLive("/src/editor/api/registry.js");
+  const meta = useProjectStore.getState().projectMeta ?? {};
+  const settings = meta.settings ?? {};
+  const withFlag = async (watchProject) => {
+    useProjectStore.setState({
+      projectMeta: {
+        ...meta,
+        settings: { ...settings, editor: { ...(settings.editor ?? {}), watchProject } },
+      },
+    });
+    return (await callOp("asset.watchStatus", {})).enabled;
+  };
+  const off = await withFlag(false);
+  const on = await withFlag(true);
+  useProjectStore.setState({ projectMeta: meta });
+  return { off, on };
+});
+check(
+  "asset.watchStatus reports the switch, so an agent knows to refresh by hand",
+  watchOff.off === false && watchOff.on === true,
+  JSON.stringify(watchOff),
+);
+
+// Flipping the checkbox has to arm Save — an unsaved preference that looks
+// applied is worse than no switch at all.
+const watchDirty = await page.evaluate(() => {
+  const row = [...document.querySelectorAll(".project-settings-panel .settings-row")].find((r) =>
+    /watch project files/i.test(r.querySelector(".settings-label")?.textContent ?? ""),
+  );
+  const box = row?.querySelector('input[type="checkbox"]');
+  const before = box?.checked;
+  box?.click();
+  return { before, after: box?.checked };
+});
+await wait(150);
+check(
+  "flipping it ticks through and arms Save",
+  watchDirty.before === true &&
+    watchDirty.after === false &&
+    (await page.evaluate(
+      () =>
+        ![...document.querySelectorAll(".project-settings-panel .panel-toolbar .toolbar-btn")].some(
+          (b) => /save/i.test(b.textContent ?? "") && b.disabled,
+        ),
+    )),
+  JSON.stringify(watchDirty),
+);
+
+// --- 11. Scene Settings speaks the same layout language ----------------------
+//
+// Both settings panels share settingsUi.jsx. The risk of that sharing is silent
+// drift: a section renamed or a row that stops rendering shows up as an empty
+// panel, and nothing else in the suite opens this one.
+
+await page.evaluate(async () => {
+  const { openPanel } = await globalThis.__importLive("/src/editor/EditorShell.jsx");
+  openPanel("sceneSettings");
+});
+await wait(1200);
+
+const scene = await page.evaluate(() => {
+  const panel = document.querySelector(".scene-settings-panel.settings-panel");
+  if (!panel) return { found: false };
+  const labelsIn = (title) => {
+    const section = [...panel.querySelectorAll(".settings-section")].find(
+      (s) => s.querySelector(".section-header")?.textContent.trim() === title,
+    );
+    return [...(section?.querySelectorAll(".settings-label") ?? [])].map(
+      (n) => n.textContent.trim(),
+    );
+  };
+  return {
+    found: true,
+    sections: [...panel.querySelectorAll(".settings-section .section-header")].map((h) =>
+      h.textContent.trim(),
+    ),
+    rendering: labelsIn("Rendering"),
+    // Collapsed by default: it rebuilds the renderer, so it is not a knob you
+    // want under the cursor while tuning fog.
+    rendererClosed: ![...panel.querySelectorAll(".settings-section")].some(
+      (s) =>
+        s.querySelector(".section-header")?.textContent.trim() === "Renderer" &&
+        s.classList.contains("open"),
+    ),
+    prose: [...panel.querySelectorAll(".settings-note")].map((n) => n.textContent.trim().length),
+  };
+});
+check(
+  "Scene Settings renders in the shared settings layout",
+  scene.found && ["Environment", "Fog", "Rendering", "Performance", "Renderer"].every((s) => scene.sections?.includes(s)),
+  JSON.stringify(scene.sections),
+);
+check(
+  "…with the shadow knobs folded under the switch that gates them",
+  ["Shadows", "Map type", "Auto update", "Force update"].every((l) => scene.rendering?.includes(l)),
+  JSON.stringify(scene.rendering),
+);
+check("…and the renderer rebuild section collapsed by default", scene.rendererClosed === true);
+// The panel used to carry four explanatory paragraphs. They are tooltips now,
+// and a regression here is someone quietly putting the walls of text back.
+check(
+  "…and no wall of text left in it",
+  (scene.prose ?? []).every((n) => n <= 120),
+  JSON.stringify(scene.prose),
 );
 
 // ---------------------------------------------------------------------------

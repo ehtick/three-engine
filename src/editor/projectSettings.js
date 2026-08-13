@@ -29,6 +29,13 @@ export const PROJECT_SETTINGS_DEFAULTS = {
     // dispatcher in keybindings.js reads this on every keydown so
     // changes apply immediately after Save.
     keybindings: {},
+    // Watch the project folder and re-read files written by anything other
+    // than the editor (an agent's file tools, an IDE, a paint program, a
+    // `git checkout`). Off = the editor as it behaved before the watcher
+    // existed: external edits appear only after `asset.refresh` or a
+    // restart. Worth turning off when the project lives on a network share
+    // or a build step churns thousands of files under the project root.
+    watchProject: true,
   },
   scripts: {
     hotReload: true,
@@ -113,6 +120,22 @@ export async function applyProjectSettings(settings = getProjectSettings()) {
   const engine = await ensureEngine();
   engine.config.scriptHotReload = settings.scripts.hotReload !== false;
   engine.config.scriptReloadIntervalMs = settings.scripts.reloadIntervalMs ?? 750;
+
+  // Filesystem watching. `startProjectWatcher` re-reads the flag itself (it is
+  // also called on project open, before this ever runs), so all this has to do
+  // is act on a change made while a project is already open. Dynamic import:
+  // the watcher reads the project store, and pulling it in at module scope
+  // would make that cycle exist for every consumer of this file.
+  // Never fatal: applying settings is on the project-open path, and a project
+  // whose watcher could not start (a browser harness, a folder the OS refuses
+  // to watch) must still get its pixel ratio, saves and physics layers.
+  try {
+    const watcher = await import("./projectWatcher.js");
+    if (settings.editor.watchProject === false) await watcher.stopProjectWatcher();
+    else await watcher.startProjectWatcher();
+  } catch (err) {
+    console.warn(`Project watcher unavailable: ${err?.message ?? err}`);
+  }
 
   // Saves. The namespace must match the one an exported build uses, or testing
   // a save in the editor would tell you nothing about the shipped game — so

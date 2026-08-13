@@ -175,3 +175,45 @@ defineOp({
     };
   },
 });
+
+defineOp({
+  name: "project.getSettings",
+  readOnly: true,
+  description:
+    "The project's own settings (project.json `settings`), as the Project Settings panel shows them: editor behaviour and snapping, hot reload, pixel ratio cap, game title / save namespace, physics layers and the collision matrix. Scene look lives in scene.getSettings instead.",
+  params: {},
+  async run() {
+    const { getProjectSettings } = await import("../../projectSettings.js");
+    return { settings: structuredClone(getProjectSettings()) };
+  },
+});
+
+defineOp({
+  name: "project.setSettings",
+  description:
+    "Patch the project's settings and apply them live. Top-level sections are merged key-by-key, so pass only what you want to change — e.g. { editor: { watchProject: false }, scripts: { hotReload: false } }. Writes project.json; NOT undoable, these are preferences rather than scene edits. Call project.getSettings first to see the current shape.",
+  params: {
+    patch: {
+      type: "object",
+      required: true,
+      description:
+        "Any of: editor{autosaveSeconds,snapTranslate,snapRotateDeg,snapScale,gridSize,gridDivisions,showGrid,watchProject,keybindings}, scripts{hotReload,reloadIntervalMs}, rendering{pixelRatioCap}, game{title,saveId,saveVersion}, physics{layers,matrix}. Sections are merged, so one key does not wipe its siblings.",
+    },
+  },
+  async run({ patch }) {
+    const { getProjectSettings, saveProjectSettings } = await import("../../projectSettings.js");
+    const current = getProjectSettings();
+    const next = { ...current };
+    for (const [section, values] of Object.entries(patch ?? {})) {
+      if (!(section in current)) throw new Error(`Unknown settings section "${section}"`);
+      // Merged rather than replaced: an agent setting one knob must not silently
+      // reset the ten it did not mention.
+      next[section] =
+        values && typeof values === "object" && !Array.isArray(values)
+          ? { ...current[section], ...values }
+          : values;
+    }
+    await saveProjectSettings(next);
+    return { settings: structuredClone(next) };
+  },
+});

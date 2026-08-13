@@ -152,7 +152,7 @@ check(
     const { openPanel } = await globalThis.__importLive("/src/editor/EditorShell.jsx");
     openPanel("projectSettings");
     await new Promise((r) => setTimeout(r, 900));
-    const buried = [...document.querySelectorAll(".scene-settings-panel .section-header")].some((h) =>
+    const buried = [...document.querySelectorAll(".project-settings-panel .section-header")].some((h) =>
       /MCP/i.test(h.textContent ?? ""),
     );
     openPanel("mcp");
