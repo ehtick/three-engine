@@ -4,6 +4,7 @@ import { Save, ExternalLink, RotateCcw, WrapText, Braces, Command } from "lucide
 import { loadMonaco, getModel, ensureThreeTypes, languageForPath } from "../code/monaco.js";
 import { useProjectStore } from "../store/projectStore.js";
 import { openInIDE } from "../openInIde.js";
+import { renameScriptToMatchClass } from "../scriptClassSync.js";
 
 async function invoke(cmd, args) {
   const { invoke } = await import("@tauri-apps/api/core");
@@ -138,9 +139,27 @@ export function CodeEditor({
     try {
       await invoke("save_scene", { path, contents: text });
       savedRef.current = text;
+      // The model's own flag is only recomputed when the text next changes, so
+      // a successful save left it reading "dirty" until the next keystroke —
+      // and the unmount cleanup below force-saves on that flag. Closing a tab
+      // after saving therefore wrote the file again, which was invisible until
+      // a rename came between the two and the old filename reappeared.
+      if (modelRef.current) modelRef.current.__engineDirty = false;
       markDirty(false);
       setStatus("Saved");
       setError(null);
+      // Renaming the script's class renames its file. The pairing has always
+      // worked the other way (renaming the asset rewrites the class), and only
+      // holding in one direction is worse than not holding at all: rename the
+      // class and the two names disagree until someone notices. Only the
+      // DEFAULT-EXPORTED class counts — a file may declare as many others as it
+      // likes and none of them move anything.
+      //
+      // On save rather than on keystroke, for the same reason saving is
+      // explicit here: renaming a file the user is halfway through typing a
+      // class name into would be worse than useless.
+      const renamedTo = await renameScriptToMatchClass(path, text);
+      if (renamedTo) setStatus(`Saved · renamed to ${renamedTo.split(/[\\/]/).pop()}`);
       // The Assets grid shows size and modified date; a save that doesn't
       // move them looks like a save that didn't happen.
       useProjectStore.getState().refresh?.();
@@ -164,6 +183,20 @@ export function CodeEditor({
     setReady(false);
     setError(null);
 
+    // Opening a file is four awaits deep, and when it is slow the only thing
+    // the user can see is that the editor froze. Timing each phase costs one
+    // `performance.now()` apiece and turns "it hangs for five seconds" into a
+    // line that names which of them it was — the difference between a bug
+    // report that can be acted on and one that can't.
+    const phases = {};
+    let mark = performance.now();
+    const phase = (name) => {
+      const now = performance.now();
+      phases[name] = Math.round(now - mark);
+      mark = now;
+    };
+    const openedAt = mark;
+
     (async () => {
       let text = "";
       try {
@@ -172,9 +205,12 @@ export function CodeEditor({
         if (!disposed) setError(`Couldn't read this file: ${err?.message ?? err}`);
         return;
       }
+      phase("read");
       const monaco = await loadMonaco();
+      phase("monaco");
       if (disposed) return;
       const model = await getModel(path, text);
+      phase("model");
       if (disposed) return;
       // A model that already existed may hold unsaved edits from another pane;
       // only adopt the disk text when they agree, so switching panels never
@@ -217,7 +253,18 @@ export function CodeEditor({
         smoothScrolling: true,
         cursorBlinking: "smooth",
         padding: { top: compact ? 6 : 10, bottom: compact ? 6 : 40 },
-        scrollbar: { verticalScrollbarSize: 10, horizontalScrollbarSize: 10, useShadows: false },
+        scrollbar: {
+          verticalScrollbarSize: 10,
+          horizontalScrollbarSize: 10,
+          useShadows: false,
+          // Monaco swallows the wheel by default, even at the end of its own
+          // scroll. In the Code panel that is right — the editor IS the pane.
+          // Embedded in the Asset Inspector it is not: the tile is taller than
+          // what is left of a scrolling column, so the pointer is always over
+          // the editor, and every wheel tick went into the code instead of the
+          // panel. The section below it could not be reached at all.
+          alwaysConsumeMouseWheel: !resizable,
+        },
         quickSuggestions: { other: true, comments: false, strings: false },
         suggestSelection: "first",
         tabCompletion: "on",
@@ -235,9 +282,18 @@ export function CodeEditor({
         setStatus("");
       });
 
+      phase("create");
       resizeObserver = new ResizeObserver(() => editor?.layout());
       resizeObserver.observe(host);
       setReady(true);
+      const total = Math.round(performance.now() - openedAt);
+      // Only when it was actually slow. A quiet console is the point: this
+      // exists to catch the case where opening a file stalls the whole editor,
+      // and a line on every open would be noise nobody reads.
+      if (total > 800) {
+        const parts = Object.entries(phases).map(([k, v]) => `${k} ${v}ms`).join(" · ");
+        console.warn(`[code] ${path.split(/[\\/]/).pop()} took ${total}ms to open — ${parts}`);
+      }
     })().catch((err) => {
       if (!disposed) setError(String(err?.message ?? err));
     });
@@ -254,9 +310,10 @@ export function CodeEditor({
       editor?.dispose();
       editorRef.current = null;
     };
-    // `compact`/`minimap`/`readOnly` are construction options; changing them
-    // rebuilds the editor, which is correct and vanishingly rare.
-  }, [path, readOnly, compact, minimap, markDirty]);
+    // `compact`/`minimap`/`readOnly`/`resizable` are construction options;
+    // changing them rebuilds the editor, which is correct and vanishingly rare
+    // (each is fixed per call site).
+  }, [path, readOnly, compact, minimap, resizable, markDirty]);
 
   /**
    * Attaches or detaches vim mode on the live editor.

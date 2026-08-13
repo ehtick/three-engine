@@ -103,6 +103,25 @@ export async function refreshAssetFromDisk(path) {
   }
 }
 
+/**
+ * Re-reads the project's scripts and rewrites `project-scripts.d.ts`.
+ *
+ * Exported so the paths that write a script WITHOUT going through the watcher —
+ * the Code panel's own save, `asset.createScript`, a class rename — can refresh
+ * immediately rather than waiting for the watcher's debounce, which is long
+ * enough to be noticeable when you alt-tab straight to your IDE.
+ */
+export async function regenerateScriptTypes() {
+  const rootPath = useProjectStore.getState().rootPath;
+  if (!rootPath) return;
+  const { invalidateScriptCache } = await import("./scriptIntrospect.js");
+  const { writeProjectScriptTypes, syncProjectScriptTypesToMonaco } = await import(
+    "./projectScriptTypes.js"
+  );
+  invalidateScriptCache();
+  await syncProjectScriptTypesToMonaco(await writeProjectScriptTypes(rootPath));
+}
+
 /** Handles one coalesced batch of externally-changed paths. */
 async function flush() {
   state.timer = null;
@@ -123,6 +142,16 @@ async function flush() {
 
   // One listing for the whole batch, not one per file.
   await useProjectStore.getState().refresh().catch(() => {});
+
+  // A script's classes and methods are the source for `getScript`/`dispatch`'s
+  // types and for the inspector's method picker, so any script write has to
+  // regenerate them. Batched here rather than hooked to the editor's save
+  // button because the file can also change from an external IDE, an agent's
+  // file tools, or a rename — and autocomplete that is only correct when the
+  // edit came from inside the editor is autocomplete nobody can trust.
+  if (paths.some((p) => /\.(ts|js)$/i.test(p) && !/\.d\.ts$/i.test(p))) {
+    await regenerateScriptTypes().catch(() => {});
+  }
 
   if (sceneChanged) await handleSceneFileChanged(scenePath);
 }
@@ -162,9 +191,21 @@ export function noteExternalChanges(paths) {
  * Outside Tauri (a browser harness, the exported player) there is nothing to
  * watch, so this resolves to false rather than throwing: the editor still works,
  * it just cannot see changes it did not make.
+ *
+ * Reads the project's own `editor.watchProject` flag rather than taking it as an
+ * argument: this is called from project open, from settings apply, and from the
+ * API, and a flag threaded through three call sites is a flag that will be
+ * forgotten at one of them. Read straight off the store — importing
+ * projectSettings.js here would drag the engine instance into the watcher.
  */
 export async function startProjectWatcher(root = useProjectStore.getState().rootPath) {
   if (!root) return false;
+  const settings = useProjectStore.getState().projectMeta?.settings;
+  if (settings?.editor?.watchProject === false) {
+    // Turned off mid-session: whatever was running has to actually stop.
+    if (state.root) await stopProjectWatcher();
+    return false;
+  }
   let invoke;
   let listen;
   try {

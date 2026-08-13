@@ -1,7 +1,19 @@
 /**
  * Helpers for keeping a script's default-exported class name in sync with its
- * filename. Used by both the Assets panel's inline rename and the Asset
- * Inspector's name field, so the two rename flows behave identically.
+ * filename — in both directions.
+ *
+ * The pairing is deliberately narrow: a script file may declare as many classes
+ * as it likes, and only the DEFAULT-EXPORTED one is the script. Helper classes,
+ * data holders and everything else in the file are none of this module's
+ * business and are never touched.
+ *
+ * Renaming the file rewrites that one class (`syncScriptClassNameAfterRename`,
+ * used by both the Assets panel's inline rename and the Asset Inspector's name
+ * field). Renaming that one class in the editor renames the file back
+ * (`filenameForScriptSource`, applied on save by `CodeEditor`). Either way the
+ * two names never drift apart, and `retargetScriptPath` moves the references —
+ * open tabs, the shared Monaco model, every entity's script slots — so a rename
+ * from one side doesn't leave the other pointing at a file that is gone.
  */
 
 /** File stem → PascalCase identifier (e.g. "player_controller" → "PlayerController").
@@ -36,7 +48,6 @@ export function stemToClassName(stem) {
  * but the class name is left as-is).
  */
 export async function syncScriptClassName(filePath, newStem) {
-  const ext = filePath.toLowerCase();
   const lower = filePath.toLowerCase();
   if (!lower.endsWith(".ts") && !lower.endsWith(".js")) return null;
   const { invoke } = await import("@tauri-apps/api/core");
@@ -102,4 +113,173 @@ export async function syncScriptClassNameAfterRename(newPath, newStem) {
       console.warn(`Renamed file but couldn't sync class name: ${err}`);
     }
   }
+}
+
+/* -------------------------------------------------------------------------- */
+/* The other direction: the class in the file names the file                   */
+/* -------------------------------------------------------------------------- */
+
+/** Line and block comments, blanked so a commented-out declaration can't win. */
+function withoutComments(source) {
+  return String(source ?? "")
+    .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, " "))
+    .replace(/\/\/[^\n]*/g, (m) => m.replace(/[^\n]/g, " "));
+}
+
+/**
+ * The name of the class this file exports as its script, or null.
+ *
+ * Both spellings people actually write are recognised:
+ *
+ *   export default class Player extends Script { }
+ *   class Player extends Script { }  …  export default Player
+ *
+ * A file with several classes is the normal case, not an edge case — only the
+ * default-exported one is returned, and `export default` of anything that is
+ * not a class declared in the file (an object, a function, an instance) gives
+ * null so nothing gets renamed on its account.
+ */
+export function defaultExportedClassName(source) {
+  const text = withoutComments(source);
+  const inline = /\bexport\s+default\s+(?:abstract\s+)?class\s+([A-Za-z_$][\w$]*)/.exec(text);
+  if (inline) return inline[1];
+  const byName = /\bexport\s+default\s+([A-Za-z_$][\w$]*)\s*(?:;|$)/m.exec(text);
+  if (!byName) return null;
+  const name = byName[1];
+  // Only when that identifier is a class declared here. `export default foo`
+  // where foo is a function or a value is not a script class.
+  const declared = new RegExp(`\\b(?:abstract\\s+)?class\\s+${name}\\b`).test(text);
+  return declared ? name : null;
+}
+
+/**
+ * The filename this script should have, given its source — or null when it
+ * already matches (or there is nothing to match against).
+ *
+ * The comparison runs through `stemToClassName` in the same direction the other
+ * flow does, so "player_controller.ts" holding `class PlayerController` is
+ * already in sync and does NOT get renamed to "PlayerController.ts". Only a
+ * class name that no longer corresponds to the stem at all moves the file.
+ */
+export function filenameForScriptSource(filePath, source) {
+  const lower = String(filePath ?? "").toLowerCase();
+  if (!lower.endsWith(".ts") && !lower.endsWith(".js")) return null;
+  const className = defaultExportedClassName(source);
+  if (!className) return null;
+  const name = String(filePath).replaceAll("\\", "/").split("/").pop() ?? "";
+  const ext = name.slice(name.lastIndexOf("."));
+  const stem = name.slice(0, name.length - ext.length);
+  if (stemToClassName(stem) === className) return null;
+  const dir = String(filePath).slice(0, String(filePath).length - name.length);
+  return `${dir}${className}${ext}`;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Moving the references with the file                                         */
+/* -------------------------------------------------------------------------- */
+
+const samePath = (a, b) =>
+  String(a ?? "").replaceAll("\\", "/").toLowerCase() ===
+  String(b ?? "").replaceAll("\\", "/").toLowerCase();
+
+/**
+ * Points everything that referred to `oldPath` at `newPath`.
+ *
+ * A rename that only moves the file leaves the editor lying to the user: the
+ * Code panel still shows a tab for a path that no longer exists, the shared
+ * Monaco model still answers to the old URI (so a save writes the deleted name
+ * back), and every entity whose Scripts component named the old file silently
+ * stops running its behaviour. This moves all three.
+ *
+ * The component edits go through the command bus like every other component
+ * change, so the scene is marked dirty and the inspector re-renders. Undo of
+ * one of them would point a slot back at a filename that is gone — renaming
+ * again is the way back, and that is still better than a scene that quietly
+ * lost its scripts.
+ */
+export async function retargetScriptPath(oldPath, newPath) {
+  // Exact comparison, not `samePath`: a case-only rename is a real rename here
+  // (the tab label and the model URI both carry the old spelling) even though
+  // every path comparison below treats the two as the same file.
+  if (!oldPath || !newPath || oldPath === newPath) return;
+
+  const [{ useCodeStore }, { disposeModel }] = await Promise.all([
+    import("./codeStore.js"),
+    import("./code/monaco.js"),
+  ]);
+
+  const { engine } = await import("./engineInstance.js");
+  const { commandBus } = await import("./commands/CommandBus.js");
+  const { SetComponentPropCommand } = await import("./commands/componentCommands.js");
+
+  for (const rootEntity of engine.rootEntities ?? []) {
+    rootEntity.traverse((entity) => {
+      const slots = entity.getComponent?.("script")?.props?.scripts;
+      if (!Array.isArray(slots) || !slots.some((slot) => samePath(slot?.path, oldPath))) return;
+      const next = slots.map((slot) =>
+        samePath(slot?.path, oldPath) ? { ...slot, path: newPath } : slot,
+      );
+      commandBus.execute(
+        new SetComponentPropCommand(entity.id, "script", "scripts", next, "Rename script"),
+      );
+    });
+  }
+
+  const before = useCodeStore.getState();
+  if (before.files.includes(oldPath)) {
+    const wasActive = before.activePath === oldPath;
+    const previouslyActive = before.activePath;
+    // `close` drops the shared model itself once no tab shows the file, which
+    // is also what keeps the still-mounted editor from being pulled out from
+    // under React mid-render.
+    before.close(oldPath);
+    useCodeStore.getState().open(newPath);
+    // `open` activates what it opens — right when the renamed file was the one
+    // being edited, wrong when it was a background tab.
+    if (!wasActive) useCodeStore.getState().activate(previouslyActive);
+  } else {
+    // No tab held it, but the Inspector's inline editor may have created the
+    // model anyway. It is keyed by the old URI and its contents now belong to
+    // a file under a different name, so leaving it means two documents for one
+    // file — and a save from the stale one recreates the old filename.
+    await disposeModel(oldPath).catch(() => {});
+  }
+}
+
+/**
+ * Renames a script file so its name matches the class it exports, if they have
+ * drifted apart. Returns the new path, or null when nothing needed to move.
+ *
+ * Refuses rather than clobbers: if a file already sits at the target name, the
+ * rename is skipped and the mismatch stays. Silently overwriting somebody
+ * else's script because two classes were given the same name is not a trade
+ * worth making for a convenience feature.
+ */
+export async function renameScriptToMatchClass(filePath, source) {
+  const target = filenameForScriptSource(filePath, source);
+  if (!target) return null;
+  const { invoke } = await import("@tauri-apps/api/core");
+  try {
+    // A case-only change is this same file on Windows, so `stat_file` finding
+    // something there proves nothing — renaming "playerx.ts" to "PlayerX.ts"
+    // must still be allowed.
+    if (!samePath(filePath, target)) {
+      let taken = true;
+      try {
+        await invoke("stat_file", { path: target });
+      } catch {
+        taken = false;
+      }
+      if (taken) {
+        console.warn(`Not renaming to ${target.split(/[\\/]/).pop()} — a file with that name exists.`);
+        return null;
+      }
+    }
+    await invoke("rename_path", { from: filePath, to: target });
+  } catch (err) {
+    console.warn(`Couldn't rename script to match its class: ${err?.message ?? err}`);
+    return null;
+  }
+  await retargetScriptPath(filePath, target);
+  return target;
 }

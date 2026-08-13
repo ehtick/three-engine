@@ -193,6 +193,24 @@ function addLib(monaco, contents, uri) {
 }
 
 /**
+ * Registers a declaration file that CHANGES during a session — currently the
+ * project's generated event declarations, which are rewritten every time the
+ * Events panel saves.
+ *
+ * Deliberately not `addLib`: that one dedupes by URI and never replaces, which
+ * is right for the engine's own bundled declarations (they can't change while
+ * the app runs) and exactly wrong here — the second save of the session would
+ * be dropped and the user would watch autocomplete go stale with no way to
+ * refresh short of restarting. Monaco replaces a same-URI lib and bumps its
+ * internal version, so re-registering is both correct and cheap.
+ */
+export async function registerExtraLib(contents, uri) {
+  const monaco = await loadMonaco();
+  monaco.languages.typescript.typescriptDefaults.addExtraLib(contents, uri);
+  monaco.languages.typescript.javascriptDefaults.addExtraLib(contents, uri);
+}
+
+/**
  * Loads Monaco (once) with the editor's theme, compiler options and the
  * bundled engine declarations already registered.
  */
@@ -245,8 +263,15 @@ export async function ensureThreeTypes(projectRoot) {
       const monaco = await loadMonaco();
       const { invoke } = await import("@tauri-apps/api/core");
       const root = `${String(projectRoot).replace(/[\\/]$/, "")}/engine-types`;
+      // ~970 files come back in one IPC response. That is one round trip by
+      // design (see the header), but it is also the single biggest payload the
+      // editor ever moves across it, so when opening a script feels slow this
+      // is the first number worth having.
+      const readStart = performance.now();
       const files = await invoke("read_text_files", { root, suffix: ".d.ts" });
+      const readMs = Math.round(performance.now() - readStart);
       if (!files?.length) return false;
+      const registerStart = performance.now();
       for (const file of files) {
         // Monaco resolves `paths` against the URIs libs are registered under,
         // so the on-disk layout has to be reproduced exactly under file:///.
@@ -257,6 +282,12 @@ export async function ensureThreeTypes(projectRoot) {
         addLib(monaco, file.contents, `file:///${relative}`);
       }
       state.threeLoadedFor = projectRoot;
+      const registerMs = Math.round(performance.now() - registerStart);
+      if (readMs + registerMs > 800) {
+        console.warn(
+          `[code] three declarations: ${files.length} files, read ${readMs}ms, registered ${registerMs}ms`,
+        );
+      }
       return true;
     } catch (error) {
       console.warn(`[code] three declarations unavailable: ${error?.message ?? error}`);

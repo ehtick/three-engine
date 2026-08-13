@@ -60,7 +60,7 @@ import {
   updateMaterialPipeline,
 } from "../../engine/materialAsset.js";
 import { openPanel } from "../EditorShell.jsx";
-import { syncScriptClassNameAfterRename } from "../scriptClassSync.js";
+import { syncScriptClassNameAfterRename, retargetScriptPath } from "../scriptClassSync.js";
 import { TagField } from "../fields/TagField.jsx";
 import {
   ASSET_FLAG_DEFAULTS,
@@ -207,6 +207,9 @@ async function renameAsset(path, newStem) {
     // Scripts: keep the default-exported class name in sync with the new
     // filename stem, and inject `extends Script` if missing.
     await syncScriptClassNameAfterRename(newPath, name);
+    // …and move what pointed at the old name: open tabs, the shared Monaco
+    // model, and every entity whose Scripts component named this file.
+    await retargetScriptPath(path, newPath);
     await useProjectStore.getState().refresh();
     useSelectionStore.getState().selectAsset(newPath);
     console.log(`Renamed to ${fileName(newPath)}`);
