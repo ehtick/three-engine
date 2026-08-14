@@ -1,0 +1,434 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Light-tree descent gate — lightTreeGpu vs sampleLightTree</title>
+    <style>html,body{margin:0;background:#111;color:#ddd;font:13px monospace}canvas{display:none}</style>
+  </head>
+  <body>
+    <canvas id="view" width="16" height="16"></canvas>
+    <pre id="log"></pre>
+    <script type="module">
+      // ══ THE §12.62 UNIT-W2 GATE: THE DESCENT TWIN, WITHOUT THE ENGINE ════
+      //
+      // `lightTreeGpu.js`'s `createLightTreeSampler` diffed against
+      // `lightTree.js`'s `sampleLightTree` — same packed words, same shading
+      // points, same counter-based RNG seeds, so the two descents must pick
+      // THE SAME EMITTERS case by case and report pdfs equal to f32 drift.
+      //
+      // ══ WHERE THE TWO SIDES CAN LEGALLY DISAGREE ════════════════════════
+      //
+      //   · f32 vs f64 in the IMPORTANCE math only. The u01 draws themselves
+      //     are bit-identical by construction ((h >> 8) · 2^-24 is exact in
+      //     both widths — see lightTreeGpu.js's RNG note), so a pick can flip
+      //     only when a probability boundary lands within ~1e-7 of a draw.
+      //     Randomized fixtures keep measure-zero boundaries measure-zero;
+      //     indices are therefore compared EXACTLY, pdfs at 1e-4 relative.
+      //
+      // ══ THE ARMS ════════════════════════════════════════════════════════
+      //
+      //   coverage   the fixture set actually exercises both root paths
+      //              (split and choose-one), point receivers, and >1-emitter
+      //              leaves — a gate over a degenerate fixture proves nothing.
+      //   indices    GPU-selected emitter indices == CPU's, case by case.
+      //   pdf        GPU pdf vs CPU pdf, relative 1e-4; max reported.
+      //   selfpdf    lightTreeSelectPdf(view,P,N,index) recomputes each CPU
+      //              sample's marginal inclusion probability independently —
+      //              the estimator's other half must agree with the sampler.
+      //   canary     one importance term (node 0 / slot 0 attr power) is
+      //              perturbed ×1.05 in a CPU-side COPY of the words; the diff
+      //              against the untouched GPU results must FAIL. A gate that
+      //              cannot fail proves nothing.
+      //
+      // Run: node scripts/run-gi-lighttree-descent.mjs
+      const out = document.querySelector("#log");
+      const say = (line) => { out.textContent += line + "\n"; };
+      let failures = 0;
+      let checks = 0;
+      const check = (label, ok, detail = "") => {
+        checks++;
+        say(`  ${ok ? "PASS" : "FAIL"} ${label}${detail ? ` — ${detail}` : ""}`);
+        if (!ok) failures++;
+      };
+      const fail = (error) => {
+        console.error("LT-DESCENT FAIL", error?.stack ?? error?.message ?? String(error));
+        globalThis.__LT_DESCENT_RESULT__ = {
+          pass: false, error: error?.message ?? String(error), text: out.textContent,
+        };
+      };
+      globalThis.addEventListener("error", (event) => fail(event.error ?? event.message));
+      globalThis.addEventListener("unhandledrejection", (event) => fail(event.reason));
+
+      try {
+        const THREE = await import("three/webgpu");
+        const TSL = await import("three/tsl");
+        const LT = await import("/src/modules/gi/lightTree.js");
+        const GPU = await import("/src/modules/gi/lightTreeGpu.js");
+        const { Fn, instanceIndex, instancedArray, vec4 } = TSL;
+
+        const renderer = new THREE.WebGPURenderer({ canvas: document.querySelector("#view") });
+        await renderer.init();
+        const device = renderer.backend.device;
+        const validationErrors = [];
+        device.addEventListener?.("uncapturederror", (event) => {
+          validationErrors.push(event.error?.message ?? String(event.error));
+          console.error("WebGPU validation error:", validationErrors.at(-1));
+        });
+
+        // mulberry32 — the harness PRNG standard, for FIXTURE GEOMETRY only.
+        // The descent draws come from makeGpuRng, the kernel's exact mirror.
+        const makeRng = (seed) => {
+          let s = seed >>> 0;
+          return () => {
+            s = (s + 0x6d2b79f5) >>> 0;
+            let t = s;
+            t = Math.imul(t ^ (t >>> 15), t | 1);
+            t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+            return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+          };
+        };
+        const f32 = Math.fround;
+        const f32v = (v) => v.map(Math.fround);
+        const relErr = (a, b) => Math.abs(a - b) / Math.max(Math.abs(a), Math.abs(b), 1e-12);
+
+        // ── SYNTHETIC EMITTERS ─────────────────────────────────────────────
+        // Direct emitter records (the shape emitterFromMesh emits) rather than
+        // meshes: the descent reads ONLY bounds/power/axis/cones, and direct
+        // synthesis gives the cone variety the arms need — isotropic closed
+        // bodies (cosThetaO = −1), wide cones, and tight spot-like cones —
+        // without a geometry pass. buildLightTree packs everything to f32, so
+        // both sides read identical words regardless of input precision.
+        const makeEmitter = (rng, centre, id) => {
+          const half = [0.1 + rng() * 0.7, 0.1 + rng() * 0.7, 0.1 + rng() * 0.7];
+          const axis = (() => {
+            const a = [rng() * 2 - 1, rng() * 2 - 1, rng() * 2 - 1];
+            const l = Math.hypot(...a) || 1;
+            return a.map((c) => c / l);
+          })();
+          const coneRoll = rng();
+          // A third of everything: closed bodies, wide cones, spot-like cones.
+          const cosThetaO = coneRoll < 0.34 ? -1 : coneRoll < 0.67 ? rng() - 0.5 : 0.9 + rng() * 0.085;
+          // Mostly Lambertian (theta_e = pi/2), a few narrowed emitters.
+          const cosThetaE = rng() < 0.8 ? 0 : 0.17;
+          const area = 0.05 + rng() * 2;
+          return {
+            min: [centre[0] - half[0], centre[1] - half[1], centre[2] - half[2]],
+            max: [centre[0] + half[0], centre[1] + half[1], centre[2] + half[2]],
+            rgb: [0.2 + rng() * 4, 0.2 + rng() * 4, 0.2 + rng() * 4],
+            power: 0.2 + rng() * 8,
+            area,
+            axis,
+            cosThetaO,
+            cosThetaE,
+            centre: centre.slice(),
+            angularRadius: Math.sqrt(((half[0] * half[1] + half[1] * half[2] + half[2] * half[0]) * 2) / Math.PI),
+            kind: rng() < 0.5 ? 0 : 1,
+            half,
+            bx: [1, 0, 0],
+            by: [0, 1, 0],
+            meshId: 1000 + id,
+            instanceId: -1,
+          };
+        };
+        const makeFixture = (n, layout, seed) => {
+          const rng = makeRng(seed);
+          const emitters = [];
+          if (layout === "clustered") {
+            const hubs = [];
+            const hubCount = Math.max(1, Math.min(3, Math.ceil(n / 6)));
+            for (let h = 0; h < hubCount; h++) {
+              hubs.push([(rng() * 2 - 1) * 6, (rng() * 2 - 1) * 6, (rng() * 2 - 1) * 6]);
+            }
+            for (let i = 0; i < n; i++) {
+              const hub = hubs[i % hubs.length];
+              emitters.push(makeEmitter(rng, [
+                hub[0] + (rng() * 2 - 1) * 0.8,
+                hub[1] + (rng() * 2 - 1) * 0.8,
+                hub[2] + (rng() * 2 - 1) * 0.8,
+              ], i));
+            }
+          } else {
+            for (let i = 0; i < n; i++) {
+              emitters.push(makeEmitter(rng, [
+                (rng() * 2 - 1) * 8, (rng() * 2 - 1) * 8, (rng() * 2 - 1) * 8,
+              ], i));
+            }
+          }
+          return emitters;
+        };
+
+        // ── BUILD + PACK ALL FIXTURES INTO ONE BUFFER ──────────────────────
+        // One storage buffer, several blocks at NON-ZERO bases behind a junk
+        // prefix: every internal offset must be base-relative (the production
+        // block rides the occupancy `bits` tail), so an absolute read fails
+        // loudly here rather than silently in the real buffer.
+        // 40 and 80 on top of the plan's five: with targetLeafSize 8 and
+        // arity 4 the root alone holds up to 32 emitters, so every plan-sized
+        // tree is depth 0 and the interior choose-one loop would never run —
+        // a twin whose descent loop is untested is not a twin.
+        const COUNTS = [1, 2, 4, 9, 17, 40, 80];
+        const LAYOUTS = ["clustered", "spread"];
+        const fixtures = [];
+        {
+          let fseed = 0x11f7;
+          for (const layout of LAYOUTS) {
+            for (const n of COUNTS) {
+              const emitters = makeFixture(n, layout, (fseed = (fseed * 2654435761) >>> 0));
+              const built = LT.buildLightTree(emitters);
+              if (!built) throw new Error(`buildLightTree returned null for n=${n} ${layout}`);
+              fixtures.push({ n, layout, built });
+            }
+          }
+        }
+        const PREFIX = 13; // junk words before the first block
+        let totalWords = PREFIX;
+        for (const f of fixtures) { f.base = totalWords; totalWords += f.built.words.length; }
+        const hosted = new Uint32Array(totalWords);
+        hosted.fill(0xdeadbeef, 0, PREFIX);
+        for (const f of fixtures) hosted.set(f.built.words, f.base);
+        for (const f of fixtures) f.view = LT.readLightTree(hosted, f.base);
+
+        say("── THE FIXTURES ──");
+        for (const f of fixtures) {
+          say(`  n=${String(f.n).padStart(2)} ${f.layout.padEnd(9)} base=${f.base} nodes=${f.built.nodeCount} depth=${f.built.maxDepth} words=${f.built.words.length}`);
+        }
+        {
+          // A gate over single-emitter leaves only would never walk the leaf
+          // CDF loop; require a fixture with a >1-emitter leaf.
+          let multiLeaf = 0;
+          for (const f of fixtures) {
+            const walk = (node) => {
+              for (let s = 0; s < f.view.arity; s++) {
+                const ref = f.view.childRef(node, s);
+                if (ref === 0) continue;
+                if (ref & 0x80000000) { if (((ref >>> 24) & 0x7f) > 1) multiLeaf++; }
+                else walk(ref - 1);
+              }
+            };
+            walk(0);
+          }
+          check("the fixture set contains multi-emitter leaves (the leaf CDF walk has a subject)",
+            multiLeaf > 0, `${multiLeaf} leaves with >1 emitter`);
+          check("the fixture set contains depth >= 1 trees (the interior descent loop has a subject)",
+            fixtures.some((f) => f.built.maxDepth >= 1),
+            `depths ${fixtures.map((f) => f.built.maxDepth).join(",")}`);
+        }
+
+        // ── THE CASES ──────────────────────────────────────────────────────
+        // Per fixture: points at emitter centres (near-field, d <= radius),
+        // inside the cloud, on random "surfaces", and far away; every 4th
+        // point is a POINT RECEIVER (N = null — the CPU skips the receiver
+        // term, the GPU multiplies by an exact 1). P and N are f32-quantized
+        // on the way in so both sides start from identical inputs.
+        const CASES = [];
+        const SEEDS_PER_POINT = 10;
+        {
+          const rng = makeRng(0xca5e5);
+          const unit = () => {
+            const v = [rng() * 2 - 1, rng() * 2 - 1, rng() * 2 - 1];
+            const l = Math.hypot(...v) || 1;
+            return f32v(v.map((c) => c / l));
+          };
+          for (const [fi, f] of fixtures.entries()) {
+            const view = f.view;
+            const emitterCentre = (i) => {
+              const e = view.emitter(i % view.emitterCount);
+              return [(e.min[0] + e.max[0]) / 2, (e.min[1] + e.max[1]) / 2, (e.min[2] + e.max[2]) / 2];
+            };
+            const points = [];
+            for (let k = 0; k < 4; k++) {
+              const c = emitterCentre(k);
+              points.push(f32v([c[0] + (rng() - 0.5) * 0.1, c[1] + (rng() - 0.5) * 0.1, c[2] + (rng() - 0.5) * 0.1]));
+            }
+            for (let k = 0; k < 8; k++) {
+              points.push(f32v([(rng() * 2 - 1) * 9, (rng() * 2 - 1) * 9, (rng() * 2 - 1) * 9]));
+            }
+            for (let k = 0; k < 9; k++) {
+              const c = emitterCentre(k + 2);
+              points.push(f32v([c[0] + (rng() * 2 - 1) * 3, c[1] + (rng() * 2 - 1) * 3, c[2] + (rng() * 2 - 1) * 3]));
+            }
+            for (let k = 0; k < 4; k++) {
+              const d = unit();
+              points.push(f32v([d[0] * 28, d[1] * 28, d[2] * 28]));
+            }
+            for (const [pi, P] of points.entries()) {
+              const N = pi % 4 === 3 ? null : unit();
+              for (let k = 0; k < SEEDS_PER_POINT; k++) {
+                const seed = GPU.lowbias32((fi * 0x01000193) ^ (pi * 0x9e3779b9) ^ (k * 0x85ebca6b) ^ 0x5eed);
+                CASES.push({ fixture: fi, P, N, seed });
+              }
+            }
+          }
+        }
+        say(`\n  ${CASES.length} (P, N, seed) cases over ${fixtures.length} fixtures`);
+        check("case count reaches the bar", CASES.length >= 2000, `${CASES.length} >= 2000`);
+
+        // ── THE CPU SIDE ───────────────────────────────────────────────────
+        const cpuRun = (view) => (c) =>
+          LT.sampleLightTree(view, c.P, c.N, GPU.makeGpuRng(c.seed));
+        const cpuResults = CASES.map((c) => cpuRun(fixtures[c.fixture].view)(c));
+        {
+          const twos = cpuResults.filter((r) => r.length === 2).length;
+          const ones = cpuResults.filter((r) => r.length === 1).length;
+          const nulls = CASES.filter((c) => c.N === null).length;
+          check("both root paths are exercised (split AND choose-one)",
+            twos > CASES.length * 0.05 && ones > CASES.length * 0.05,
+            `${twos} split cases, ${ones} choose-one cases`);
+          check("point receivers (N = null) are in the mix", nulls > CASES.length * 0.1, `${nulls} cases`);
+        }
+
+        // ── THE GPU SIDE ───────────────────────────────────────────────────
+        const wordsBuf = instancedArray(hosted, "uint");
+        const meta = new Uint32Array(CASES.length * 2);
+        const pos = new Float32Array(CASES.length * 4);
+        const nrm = new Float32Array(CASES.length * 4);
+        CASES.forEach((c, i) => {
+          meta[i * 2] = fixtures[c.fixture].base;
+          meta[i * 2 + 1] = c.seed;
+          pos.set([...c.P, c.N ? 1 : 0], i * 4);
+          nrm.set(c.N ? [...c.N, 0] : [0, 1, 0, 0], i * 4);
+        });
+        const metaBuf = instancedArray(meta, "uint");
+        const posBuf = instancedArray(pos, "vec4");
+        const nrmBuf = instancedArray(nrm, "vec4");
+        const outBuf = instancedArray(new Float32Array(CASES.length * 4), "vec4");
+
+        const sampler = GPU.createLightTreeSampler(wordsBuf);
+        const kernel = Fn(() => {
+          const i = instanceIndex.toVar();
+          const pv = posBuf.element(i).toVar();
+          const nv = nrmBuf.element(i).toVar();
+          const baseW = metaBuf.element(i.mul(2)).toVar();
+          const seed = metaBuf.element(i.mul(2).add(1)).toVar();
+          const r = sampler(pv.xyz, nv.xyz, pv.w, baseW, seed);
+          outBuf.element(i).assign(vec4(r.index0, r.pdf0, r.index1, r.pdf1));
+        })().compute(CASES.length);
+        await renderer.computeAsync(kernel);
+        const raw = new Float32Array(
+          (await renderer.getArrayBufferAsync(outBuf.value)).slice(0, CASES.length * 16),
+        );
+        const gpuResults = CASES.map((_, i) => {
+          const list = [];
+          if (raw[i * 4] >= 0) list.push({ index: Math.round(raw[i * 4]), pdf: raw[i * 4 + 1] });
+          if (raw[i * 4 + 2] >= 0) list.push({ index: Math.round(raw[i * 4 + 2]), pdf: raw[i * 4 + 3] });
+          return list;
+        });
+
+        // ── THE DIFF ───────────────────────────────────────────────────────
+        const diff = (cpu, tolPdf) => {
+          let indexMismatches = 0;
+          let maxPdfRel = 0;
+          let worstAt = "";
+          let samples = 0;
+          const bad = [];
+          for (let i = 0; i < CASES.length; i++) {
+            const a = cpu[i];
+            const b = gpuResults[i];
+            if (a.length !== b.length || a.some((s, k) => s.index !== b[k].index)) {
+              indexMismatches++;
+              if (bad.length < 6) {
+                bad.push(`case ${i} (fix ${CASES[i].fixture}, seed ${CASES[i].seed >>> 0}): ` +
+                  `cpu [${a.map((s) => s.index).join(",")}] gpu [${b.map((s) => s.index).join(",")}]`);
+              }
+              continue;
+            }
+            for (let k = 0; k < a.length; k++) {
+              samples++;
+              const e = relErr(a[k].pdf, b[k].pdf);
+              if (e > maxPdfRel) {
+                maxPdfRel = e;
+                worstAt = `case ${i} (fix ${CASES[i].fixture}) sample ${k}: cpu pdf ${a[k].pdf} gpu ${b[k].pdf}`;
+              }
+              if (e > tolPdf && bad.length < 6) {
+                bad.push(`case ${i} sample ${k}: cpu pdf ${a[k].pdf} gpu ${b[k].pdf} rel ${e.toExponential(2)}`);
+              }
+            }
+          }
+          return { indexMismatches, maxPdfRel, worstAt, samples, bad, pass: indexMismatches === 0 && maxPdfRel <= tolPdf };
+        };
+
+        say("\n── THE MIRROR: same seeds, same descent, both sides ──");
+        const TOL = 1e-4;
+        const main = diff(cpuResults, TOL);
+        check("selected emitter indices match EXACTLY, case by case",
+          main.indexMismatches === 0,
+          `${main.indexMismatches} of ${CASES.length} cases differ` +
+          (main.bad.length && main.indexMismatches ? `\n     ${main.bad.join("\n     ")}` : ""));
+        check("pdfs agree within f32 drift",
+          main.maxPdfRel <= TOL,
+          `max rel ${main.maxPdfRel.toExponential(2)} over ${main.samples} samples (bar ${TOL})` +
+          (main.maxPdfRel > TOL ? `\n     worst: ${main.worstAt}` : ""));
+        {
+          // The interior choose-one loop must have actually run: some sampled
+          // emitter must sit two levels down (root slot -> interior node ->
+          // leaf), or the depth arm above was decoration.
+          let deep = 0;
+          for (let i = 0; i < CASES.length; i++) {
+            const view = fixtures[CASES[i].fixture].view;
+            for (const s of cpuResults[i]) if (view.locate[s.index].path.length >= 2) deep++;
+          }
+          check("sampled paths traverse interior nodes (the descent loop ran)",
+            deep > 100, `${deep} samples descended through depth >= 1`);
+        }
+
+        // ── SELF-CONSISTENCY: the pdf query agrees with the sampler ────────
+        say("\n── lightTreeSelectPdf RECOMPUTES what the sampler REPORTED ──");
+        {
+          let worst = 0;
+          let n = 0;
+          for (let i = 0; i < CASES.length; i++) {
+            const c = CASES[i];
+            const view = fixtures[c.fixture].view;
+            for (const s of cpuResults[i]) {
+              n++;
+              const p = LT.lightTreeSelectPdf(view, c.P, c.N, s.index);
+              worst = Math.max(worst, relErr(p, s.pdf));
+            }
+          }
+          check("the marginal inclusion probability matches the returned pdf",
+            worst <= TOL, `max rel ${worst.toExponential(2)} over ${n} samples (both f64 — expect ~1e-12)`);
+        }
+
+        // ── THE CANARY ─────────────────────────────────────────────────────
+        // One importance term — the packed attr POWER of node 0 / slot 0 —
+        // perturbed ×1.05 in a CPU-side copy. Root probabilities move in
+        // every multi-emitter fixture, so the diff against the untouched GPU
+        // results must fail, or this gate could not catch a real drift.
+        say("\n── THE CANARY: a gate that cannot fail proves nothing ──");
+        {
+          const perturbed = hosted.slice();
+          const pf32 = new Float32Array(perturbed.buffer);
+          const perturbedViews = fixtures.map((f) => {
+            if (f.view.emitterCount < 2) return f.view; // single-emitter pdfs are 1 regardless
+            const aw = f.view.attrBase; // node 0, slot 0 attr record, +0 = power
+            pf32[aw] = f32(pf32[aw] * 1.05);
+            return LT.readLightTree(perturbed, f.base);
+          });
+          const canaryCpu = CASES.map((c, i) => {
+            const f = fixtures[c.fixture];
+            if (f.view.emitterCount < 2) return cpuResults[i];
+            return LT.sampleLightTree(perturbedViews[c.fixture], c.P, c.N, GPU.makeGpuRng(c.seed));
+          });
+          const canary = diff(canaryCpu, TOL);
+          check("perturbing one importance term CPU-side makes the diff FAIL",
+            !canary.pass,
+            `${canary.indexMismatches} index mismatches, max pdf rel ${canary.maxPdfRel.toExponential(2)}`);
+        }
+
+        check("no WebGPU validation errors", validationErrors.length === 0, validationErrors.join(" | "));
+        say(`\n${failures ? `gi-lighttree-descent: ${failures} of ${checks} FAILED` : "gi-lighttree-descent: all cases PASS"}`);
+        globalThis.__LT_DESCENT_RESULT__ = {
+          pass: failures === 0,
+          failures,
+          checks,
+          cases: CASES.length,
+          fixtures: fixtures.length,
+          maxPdfRel: main.maxPdfRel,
+          text: out.textContent,
+        };
+      } catch (error) {
+        fail(error);
+      }
+    </script>
+  </body>
+</html>

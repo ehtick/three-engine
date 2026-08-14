@@ -162,6 +162,18 @@ export function renderGiGBuffer(renderer, scene, camera, gbuffer, { mirrorMask =
   const previousMask = camera.layers.mask;
   const previousTransparent = renderer.transparent;
   const previousAutoClear = renderer.autoClear;
+  // ⚠ SHADOWS OFF OR THE OVERRIDE POISONS THE SHADOW PASS: a shadow update
+  // landing inside a nested override render compiles the override material
+  // into the depth-only shadow context — an empty-fragment-struct INVALID
+  // pipeline that, once cached, poisons whole command buffers (found via the
+  // occluder pass and the selection outline, 2026-08-13; same guard there).
+  // Shadows still update in the main render.
+  // §12.66 BISECT HATCH: `__giGbufShadowGuard = false` skips the disable —
+  // this guard shipped in the 14:02 save at the exact lit→black boot
+  // boundary, and three's shadow-node setup observes `shadowMap.enabled`.
+  const guardOn = globalThis.__giGbufShadowGuard !== false;
+  const previousShadows = renderer.shadowMap.enabled;
+  if (guardOn) renderer.shadowMap.enabled = false;
   // OPAQUE ONLY. `scene.overrideMaterial` replaces the material of everything
   // that renders, so a transparent object — a glass pane, or a VolumeNodeMaterial
   // fog box — would be drawn as a solid surface into the gbuffer and every
@@ -206,6 +218,7 @@ export function renderGiGBuffer(renderer, scene, camera, gbuffer, { mirrorMask =
     renderer.transparent = previousTransparent;
     scene.overrideMaterial = previousOverride;
     camera.layers.mask = previousMask;
+    if (guardOn) renderer.shadowMap.enabled = previousShadows;
   }
 }
 
@@ -275,13 +288,22 @@ export function renderGiGBuffer(renderer, scene, camera, gbuffer, { mirrorMask =
  * here — emitter direct, analytic direct, reflections, sun shadows — is
  * independent of it and keeps working.
  */
-export function createGiResolve({ gbuffer, targets, width, height, gather = null, screenGather = null, cameraPosition = null, normalOffset, intensity, emitter, radiance = null, bvhShade = null, ao = null }) {
+export function createGiResolve({ gbuffer, targets, width, height, gather = null, screenGather = null, cameraPosition = null, normalOffset, intensity, emitter, radiance = null, bvhShade = null, ao = null, rawCopy = null }) {
   // The TARGETS are owned by the caller and outlive every rebuild: materials
   // sample them through persistent texture nodes, so recreating them here
   // would silently leave already-compiled materials bound to dead textures.
   // `emitterShadow` is no longer written here — the dedicated emitter shadow
   // pass + filter own it (see createGiEmitterShadowPass); this kernel only
   // SAMPLES it for the diffuse emitter-direct term.
+  //
+  // `rawCopy` (§12.65): with the irradiance temporal filter built, this kernel
+  // ALSO stores its result into `irradianceRaw` — the filter's input. The
+  // resolve keeps writing `irradiance` itself so a filter whose pipeline
+  // never lands (the §12.56-class silent wedge — see the plan's §12.65
+  // postmortem: four priming shapes fired and failed while the identical
+  // page-context dispatch worked) degrades to the PRE-FILTER image instead of
+  // a black GI texture. The filter, when alive, overwrites `irradiance` later
+  // in the same frame (queue order: resolve → filter → history snapshot).
   const { irradiance, radiance: radianceTarget } = targets;
 
   // Size lives in a uniform so a viewport resize is a uniform write, not a
@@ -495,7 +517,38 @@ export function createGiResolve({ gbuffer, targets, width, height, gather = null
           // correct, where a missing base would have been black.
           const hitE = (gather ? vec3(gather(shadePoint, nFace, vec3(0))) : vec3(0)).toVar();
           if (emitter) {
-            hitE.addAssign(emitterDirectAt(emitter, hitP, nFace, shadePoint).irradiance);
+            // EMITTER DIRECT AT A REFLECTION HIT IS UNSHADOWED BY DEFAULT
+            // (2026-08-13, §12.56) — the same trade analyticDirectAt already
+            // makes for lights, now measured for emitters. The old inline
+            // path (no `shadowSample` ⇒ a full emitterSlotShadow record-march
+            // + BVH descent per slot, per hit pixel — a hit is a different
+            // world point than the pixel, so the screen texture can't stand
+            // in) was ~ALL of the resolve's emitter cost on real content:
+            // Sponza + 3 strength-100 emitters read resolve 10.96 ms traced
+            // vs 0.27 ms unshadowed (harness, 806×392; the user's editor:
+            // 49.6 ms at 1640×912), with A/B screenshots INDISTINGUISHABLE —
+            // this scene's mirror blur hides shadow error inside reflections
+            // entirely. Cost scales per-INVOCATION (BVH descent setup), so
+            // neither the luma gate (absolute — a strength-100 lamp keeps
+            // its whole 1/d² reach) nor a march-length cap (measured −7%)
+            // could rescue the traced path; both survive on the hatch arm.
+            // `__giHitEmitterShadows = true` restores tracing (with
+            // `__giHitEmitterTraceScale` / `__giHitEmitterMarchCap` dials).
+            // The shadowSample shape also keeps the marcher OUT of this
+            // kernel's WGSL — the traced resolve compiled 22.9 s at boot.
+            const hitShadows = globalThis.__giHitEmitterShadows === true;
+            const hitParams = hitShadows
+              ? {
+                  ...emitter,
+                  traceCutoffScale: Number.isFinite(Number(globalThis.__giHitEmitterTraceScale))
+                    ? Number(globalThis.__giHitEmitterTraceScale)
+                    : 24,
+                  maxTraceDistance: Number.isFinite(Number(globalThis.__giHitEmitterMarchCap))
+                    ? Number(globalThis.__giHitEmitterMarchCap)
+                    : 4,
+                }
+              : { ...emitter, shadowSample: () => float(1) };
+            hitE.addAssign(emitterDirectAt(hitParams, hitP, nFace, shadePoint).irradiance);
           }
           if (bvhShade.lightSlots?.length) {
             hitE.addAssign(analyticDirectAt(bvhShade.lightSlots, hitP, nFace));
@@ -511,6 +564,7 @@ export function createGiResolve({ gbuffer, targets, width, height, gather = null
       }
     });
     textureStore(irradiance, coord, vec4(out, 1));
+    if (rawCopy) textureStore(rawCopy, coord, vec4(out, 1));
     textureStore(radianceTarget, coord, vec4(reflectedOut, 1));
     if (bvhShade) textureStore(bvhShade.target, coord, vec4(bvhOut, bvhValid));
   })().compute(width * height);
@@ -1326,6 +1380,105 @@ export function createGiLightShadowHistoryPass({
 }
 
 /**
+ * ══ THE IRRADIANCE TEMPORAL FILTER (§12.65) ═════════════════════════════════
+ *
+ * A reprojected screen-space EMA over the GI resolve — the "resolve-space
+ * filter" §12.63 specced after the Sponza probes measured what no CPU dial
+ * could reach: post-pan holds churn at 16× the parked floor because the
+ * screen-driven transport re-samples every probe when the view changes, and
+ * the whole field crawls to its new equilibrium IN VIEW. The probes' own
+ * temporal layer cannot help (it is the thing converging); a second, SCREEN
+ * layer can, because the resolve's per-pixel answer for a parked-or-panning
+ * camera over static geometry is the same world radiance landing on
+ * reprojectable pixels.
+ *
+ * Shape: `raw` is the resolve's output (the filter's OWN input texture,
+ * never sampled by materials); history is validated EXACTLY like the
+ * light-shadow filter's — previous camera's clip, row-flipped, world-position
+ * epsilon, 3×3 silhouette rescue (that pass's comments carry the measured
+ * reasons; this one inherits them wholesale). The blend writes `target` =
+ * `targets.irradiance`, the texture materials have always sampled.
+ *
+ * Ghosting control is the SHADOW CHAIN'S, not a neighborhood clamp: the
+ * `history.weight` uniform is driven to zero by the system while any LIGHT
+ * is moving (matrix, luminance or emitter motion — the same family the α
+ * ramp rides), because a light change invalidates history SEMANTICALLY
+ * (same surface, stale radiance) in a way position validation cannot see.
+ * Camera motion deliberately does NOT drop the weight — reprojection handles
+ * it, and that is the entire point: the pan's re-equilibration churn averages
+ * away instead of playing on screen. Validation failure falls back to the
+ * raw resolve — the failure mode is the pre-§12.65 noise, never a ghost.
+ */
+export function createGiIrradianceTemporalPass({
+  gbuffer, source, target, histIrr, histPos, width, height, history,
+}) {
+  const widthU = uniform(width, "uint");
+  const positionNode = texture(gbuffer.position);
+  const rawNode = texture(source);
+  const histIrrNode = texture(histIrr);
+  const histPosNode = texture(histPos);
+  const compute = Fn(() => {
+    const px = instanceIndex.mod(widthU);
+    const py = instanceIndex.div(widthU);
+    const coord = ivec2(px.toInt(), py.toInt());
+    const raw = vec4(rawNode.load(coord)).toVar();
+    const out = raw.toVar();
+    const g0 = positionNode.load(coord).toVar();
+    If(g0.w.greaterThan(0.5), () => {
+      const P = g0.xyz.toVar();
+      const clip = history.prevViewProj.mul(vec4(P, 1)).toVar();
+      const histSample = vec4(0).toVar();
+      const valid = float(0).toVar();
+      If(clip.w.greaterThan(1e-3), () => {
+        const ndc = clip.xyz.div(clip.w).toVar();
+        const hx = ndc.x.mul(0.5).add(0.5).mul(width).toVar();
+        // Row 0 is the TOP of the frame — the shadow filter's proven flip.
+        const hy = float(0.5).sub(ndc.y.mul(0.5)).mul(height).toVar();
+        If(
+          hx.greaterThanEqual(0).and(hx.lessThan(width)).and(hy.greaterThanEqual(0)).and(hy.lessThan(height)),
+          () => {
+            const hc = ivec2(hx.toInt(), hy.toInt()).toVar();
+            const hp = histPosNode.load(hc).toVar();
+            If(hp.w.greaterThan(0.5), () => {
+              If(hp.xyz.sub(P).length().lessThan(float(history.validEps).max(1e-3)), () => {
+                histSample.assign(vec4(histIrrNode.load(hc)));
+                valid.assign(1);
+              });
+            });
+            // Silhouette rescue — same 3×3 ring, same measured reason
+            // ("extremely jumpy on camera movement" without it).
+            If(valid.lessThan(0.5), () => {
+              for (let dy = -1; dy <= 1; dy++) {
+                for (let dx = -1; dx <= 1; dx++) {
+                  if (dx === 0 && dy === 0) continue;
+                  const nc = ivec2(
+                    hc.x.add(dx).clamp(0, width - 1),
+                    hc.y.add(dy).clamp(0, height - 1),
+                  ).toVar();
+                  const np = histPosNode.load(nc).toVar();
+                  If(
+                    valid.lessThan(0.5)
+                      .and(np.w.greaterThan(0.5))
+                      .and(np.xyz.sub(P).length().lessThan(float(history.validEps).max(1e-3))),
+                    () => {
+                      histSample.assign(vec4(histIrrNode.load(nc)));
+                      valid.assign(1);
+                    },
+                  );
+                }
+              }
+            });
+          },
+        );
+      });
+      out.assign(mix(raw, histSample, valid.mul(float(history.weight))));
+    });
+    textureStore(target, coord, out);
+  })().compute(width * height);
+  return { compute, widthU };
+}
+
+/**
  * Octahedral-encodes a unit vector into 2 floats in [-1,1] (Cigolle et al.,
  * "A Survey of Efficient Representations for Independent Unit Vectors") —
  * how createGiBvhReflect packs the BVH hit's exact face normal into the
@@ -1684,8 +1837,45 @@ export function createGiTargets(width, height, shadowWidth = width, shadowHeight
       this.emitterShadowHist = hist;
       this.emitterShadowHistPos = histPos;
     },
+    // ══ THE IRRADIANCE TEMPORAL TRIO (§12.65) — same laziness as the shadow
+    // trios and for the same reason (three resolve-res textures ≈ 30MB at
+    // editor scale, only paid when the filter is actually built). With the
+    // filter on, the RESOLVE writes `irradianceRaw`; the reprojection filter
+    // (createGiIrradianceTemporalPass) blends it against `irradianceHist`
+    // and writes `irradiance` — the texture materials have ALWAYS sampled,
+    // so the persistent material bindings never learn the filter exists.
+    irradianceRaw: null,
+    irradianceHist: null,
+    irradianceHistPos: null,
+    ensureIrradianceTemporal() {
+      if (this.irradianceRaw) return;
+      const v = globalThis.__giNoTargetVersion ? 0 : ++targetGeneration;
+      // HalfFloat like `irradiance` itself — raw and hist carry the same
+      // signal. The EMA-in-half-float hazard note on the emitter trio
+      // applies unchanged (insurance; nothing measured has needed more).
+      const raw = new THREE.StorageTexture(width, height);
+      raw.type = THREE.HalfFloatType;
+      raw.name = "giIrradianceRaw";
+      raw.version = v;
+      const hist = new THREE.StorageTexture(width, height);
+      hist.type = THREE.HalfFloatType;
+      hist.name = "giIrradianceHist";
+      hist.version = v;
+      // Full float world position, exactly like the shadow trios: half
+      // precision at 50m is ~3cm — the same order as the validity epsilon.
+      const histPos = new THREE.StorageTexture(width, height);
+      histPos.type = THREE.FloatType;
+      histPos.name = "giIrradianceHistPos";
+      histPos.version = v;
+      this.irradianceRaw = raw;
+      this.irradianceHist = hist;
+      this.irradianceHistPos = histPos;
+    },
     dispose() {
       irradiance.dispose();
+      this.irradianceRaw?.dispose();
+      this.irradianceHist?.dispose();
+      this.irradianceHistPos?.dispose();
       emitterShadow.dispose();
       emitterShadowRaw.dispose();
       emitterShadowDist.dispose();

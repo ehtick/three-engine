@@ -50,8 +50,11 @@
 import * as THREE from "three/webgpu";
 import { float, ivec2, step, texture, uint, uniform, vec3 } from "three/tsl";
 import {
-  ALPHA_TRACK_HOLD_MS, CASCADE_COUNT, COLD_GUARD_FRAMES, GOV_HI, GOV_LO, MAX_LODS,
-  PROBE_RAY_CAP_OFF, SRC_QUALITY, SUM_SHIFT, SURPRISE_ONE, TEMPORAL_ALPHA,
+  ALPHA_TRACK_HOLD_MS, CAM_SETTLE_ALPHA, CASCADE_COUNT, COLD_GUARD_FRAMES, GOV_HI, GOV_LO, MAX_LODS,
+  LIGHT_SETTLE_FADE_MS, LIGHT_SETTLE_HOLD_MS,
+  PROBE_RAY_CAP_OFF, REST_BOOT_HOLD_MS, REST_CAM_FADE_MS, REST_CAM_HOLD_MS,
+  REST_TRANSPORT_FRACTION,
+  SEED_RAYS, SRC_QUALITY, SUM_SHIFT, SURPRISE_ONE, TEMPORAL_ALPHA,
   TEMPORAL_ALPHA_STILL, W0, srcProbeRayCap, srcQualityTier, srcTransportRays,
 } from "./srcConfig.js";
 import { createSrcProbeGizmos } from "./srcGizmos.js";
@@ -68,6 +71,7 @@ import {
 } from "./srcDeposit.js";
 import { createSrcHitAttribution, createSrcHitLighting, createSrcHitShader } from "./srcShade.js";
 import { createSrcMergeFrame, formatSrcMerge } from "./srcMerge.js";
+import { createSrcSeedFrame, formatSrcSeed } from "./srcSeed.js";
 import { createSrcSecondaryFrame, formatSrcSecondary } from "./srcSecondary.js";
 import { createSrcScreenGather, formatSrcGather } from "./srcScreenGather.js";
 import { createSrcTileAtlas, formatSrcTiles } from "./srcTiles.js";
@@ -469,6 +473,15 @@ export function createSrcProbeSystem({
   let rayCeiling = readCeiling();
   let rayStride = strideFor(rayCeiling);
   strideU.value = rayStride;
+  // The §12.61 rest cadence's current scale on the tier ceiling, captured for
+  // publishTransport — a derived number nothing prints is a number probes will
+  // guess (§12.42). Declared HERE, above publishTransport's construction-time
+  // call: the first draft declared it beside the camera state 500 lines down
+  // and the TDZ ReferenceError silently cost the whole SRC build (the cost
+  // probe read "1 kernels", 4.7% lit — a black scene wearing a probe failure).
+  let restFactor = 1;
+  /** When this system was built — the rest cadence's boot hold reads it. */
+  const buildAt = performance.now();
   // ── THE PER-PROBE RAY CAP (srcConfig's `probeRayCap`, §12.32.1 option 1) ──
   //
   // The ceiling bounds the FRAME and prices rays by screen coverage; the cap
@@ -500,6 +513,9 @@ export function createSrcProbeSystem({
       // ceiling; the cap field beside it says when it is a bound.
       tracedRays: Math.ceil(naturalRays / rayStride),
       probeRayCap,
+      // §12.61: the rest cadence's current scale on the tier ceiling. 1 =
+      // full budget (motion/window/camera); REST_TRANSPORT_FRACTION = parked.
+      restFactor,
     };
   };
   publishTransport();
@@ -941,6 +957,24 @@ export function createSrcProbeSystem({
       })
     : null;
 
+  // ── THE FRESH-PROBE SEED (§12.59.2) ──────────────────────────────────────
+  //
+  // A newborn probe's bins start at its PARENT's last-frame merged answer
+  // instead of at zero — §12.59.1's pan bisect pinned camera-motion flicker on
+  // exactly that from-zero convergence. `srcSeed.js`'s header carries the
+  // design; the two wiring facts that live HERE are (1) its passes MUST sit
+  // between `deposit.decay` (which zeroes freshly claimed blocks — a seed
+  // before it is silently wiped) and `deposit.resolve`, which the `passes`
+  // list below enforces, and (2) `__giSrcSeed = false` is a BUILD-time hatch
+  // like `__giSrcSurprise` — off builds no passes at all, the only "off" that
+  // backs a bit-exactness claim. The live dial is `__giSrcSeedRays` (0 = the
+  // in-page A/B arm), polled in `syncCamera` under the same §12.23 rule as α.
+  const seedOn = globalThis.__giSrcSeed !== false;
+  const seedRaysU = uniform(SEED_RAYS);
+  const seed = seedOn && deposit
+    ? createSrcSeedFrame(store, binStore, { lmax: lmaxU, seedRays: seedRaysU })
+    : null;
+
   // ── [G]: THE MERGE (plan §12.18.7 unit 3) ────────────────────────────────
   //
   // Cascade 3 → 0, in place over the resolved payload. This is what turns a
@@ -979,6 +1013,15 @@ export function createSrcProbeSystem({
   const camScratchQ = new THREE.Quaternion();
   let camSeen = false;
   let camHoldUntil = 0;
+  // When the camera last moved past the pan thresholds — the §12.61 rest
+  // cadence's third drive term. 0 = "long ago"; a cold boot overwrites it on
+  // frame one (no-history counts as movement).
+  let camMovedAt = 0;
+  // §12.67: the last frame the §12.43 light-event window was OPEN (tr > 0).
+  // The light-settle envelope holds+fades from here, so a departed light's
+  // ghost keeps full evidence + a floored α until it has re-converged instead
+  // of decaying at the still rate on rest-cadence rays. -Infinity = never.
+  let trOpenAt = -Infinity;
 
   const system = {
     store,
@@ -988,6 +1031,8 @@ export function createSrcProbeSystem({
     rayFrame,
     binStore,
     deposit,
+    /** The fresh-probe seed (§12.59.2), or null when `__giSrcSeed = false`. */
+    seed,
     /** [J], or null when the tier or the hatch turned the second bounce off. */
     secondary,
     merge,
@@ -1041,9 +1086,17 @@ export function createSrcProbeSystem({
           // `hashBlockFrame.pass` does NOT move for this: it already runs
           // before the first ray, for the reason above it, and that is exactly
           // where [J]'s corner lookups need it.
+          // The SEED rides inside the deposit's window — after the decay (a
+          // seed before it is zeroed with the fresh block it targets), before
+          // the resolve (which reads the accumulators once). It commutes with
+          // [E] and [J] (pure atomicAdds), so decay-adjacent is a choice for
+          // readability, not a constraint tighter than the window.
           ...(secondary
-            ? [deposit.decay, deposit.scatter, secondary.pass, deposit.resolve]
-            : deposit.passes),
+            ? [deposit.decay, ...(seed?.passes ?? []),
+               deposit.scatter, secondary.pass, deposit.resolve]
+            : seed
+              ? [deposit.decay, ...seed.passes, deposit.scatter, deposit.resolve]
+              : deposit.passes),
           ...merge.passes, ...tiles.passes,
           gather.reset, gather.compute,
         ]
@@ -1070,13 +1123,29 @@ export function createSrcProbeSystem({
           // three contiguous dispatches — and `profile.giPasses` asserts these
           // counts sum to `passes.length`, so a group list that did not split
           // would withhold every per-group number rather than mislabel one.
+          // The SEED splits the decay off again when it runs, for the same
+          // assert: its passes sit between decay and trace in `passes` above.
           ...(secondary
-            ? [
-                { label: "deposit (decay + trace + attribute)", count: 2 },
-                { label: "shade + bounce [J]", count: 1 },
-                { label: "deposit (resolve)", count: 1 },
-              ]
-            : [{ label: "deposit (trace + shade)", count: deposit.passes.length }]),
+            ? seed
+              ? [
+                  { label: "deposit (decay)", count: 1 },
+                  { label: "seed (fresh-probe prior)", count: seed.passes.length },
+                  { label: "deposit (trace + attribute)", count: 1 },
+                  { label: "shade + bounce [J]", count: 1 },
+                  { label: "deposit (resolve)", count: 1 },
+                ]
+              : [
+                  { label: "deposit (decay + trace + attribute)", count: 2 },
+                  { label: "shade + bounce [J]", count: 1 },
+                  { label: "deposit (resolve)", count: 1 },
+                ]
+            : seed
+              ? [
+                  { label: "deposit (decay)", count: 1 },
+                  { label: "seed (fresh-probe prior)", count: seed.passes.length },
+                  { label: "deposit (trace + shade)", count: 2 },
+                ]
+              : [{ label: "deposit (trace + shade)", count: deposit.passes.length }]),
           { label: "merge", count: merge.passes.length },
           { label: "tiles", count: tiles.passes.length },
           { label: "gather", count: 2 },
@@ -1160,10 +1229,17 @@ export function createSrcProbeSystem({
       // targeting §12.42's per-block α compensation already does — and it
       // needs the cap to stop being one global uniform first.
       camera.getWorldQuaternion(camScratchQ);
-      if (camSeen && globalThis.__giSrcCamCapLift === true) {
-        const posDelta = camPrevPos.distanceTo(cameraU.value);
-        const rotDelta = 2 * Math.acos(Math.min(1, Math.abs(camScratchQ.dot(camPrevQ))));
-        if (posDelta > CAM_LIFT_POS || rotDelta > CAM_LIFT_ROT) {
+      // Deltas are computed UNCONDITIONALLY now — the §12.61 rest cadence
+      // needs camera recency whatever the opt-in cap lift is set to. A frame
+      // with no history counts as movement, so a cold boot starts at the full
+      // ray budget rather than discovering the scene at half rate.
+      const camPosDelta = camSeen ? camPrevPos.distanceTo(cameraU.value) : Infinity;
+      const camRotDelta = camSeen
+        ? 2 * Math.acos(Math.min(1, Math.abs(camScratchQ.dot(camPrevQ))))
+        : Infinity;
+      if (camPosDelta > CAM_LIFT_POS || camRotDelta > CAM_LIFT_ROT) {
+        camMovedAt = performance.now();
+        if (camSeen && globalThis.__giSrcCamCapLift === true) {
           camHoldUntil = performance.now() + ALPHA_TRACK_HOLD_MS;
         }
       }
@@ -1208,7 +1284,60 @@ export function createSrcProbeSystem({
       // ⚠ It is a root, not a division. `keep/S` or `1 − α/S` both look
       // plausible and neither composes: decay is MULTIPLICATIVE across frames,
       // so the only function whose S-fold product is `1 − α` is its S-th root.
-      const alpha = readAlpha();
+      // ── THE CAMERA-SETTLE α FLOOR (§12.63) ───────────────────────────────
+      // Hoisted camera-recency envelope — the SAME hold+fade the rest cadence
+      // reads below. The transport is screen-driven, so a pan shifts every
+      // probe's estimator equilibrium; at the bare still floor the field then
+      // crawls to the new equilibrium over ~50 frames in full view (Sponza
+      // post-pan holds: 2.4 rev/px/s vs 0.155 parked, churn heatmap UNIFORM
+      // over lit content — CAM_SETTLE_ALPHA's doc carries the numbers). α is
+      // floored on the envelope so the re-equilibration compresses into the
+      // window the cadence keeps at full rays. Parked: camTerm 0, floor is
+      // ALPHA_STILL exactly. A pinned `__giSrcAlpha` outranks the floor (it
+      // returns from readAlpha before the max — instrument rule); the settle
+      // hatch `__giSrcCamSettleAlpha` is the A/B arm (false = off, number =
+      // custom floor).
+      const nowMs = performance.now();
+      const sinceCam = nowMs - camMovedAt;
+      const camTerm = sinceCam <= REST_CAM_HOLD_MS
+        ? 1
+        : Math.max(0, 1 - (sinceCam - REST_CAM_HOLD_MS) / REST_CAM_FADE_MS);
+      // ── THE LIGHT-SETTLE ENVELOPE (§12.67) ──────────────────────────────
+      // `tr` is read HERE (the §12.43 root block below re-uses it) because
+      // the envelope must be in hand before α is computed: it feeds the same
+      // floor camTerm does. Stamped from the last OPEN frame, so the window
+      // closing starts the hold — the exact moment the old behaviour dropped
+      // every responsiveness signal at once while the departed light's ghost
+      // still held the field (the user's "continues color bleeding and
+      // flickering for quite some time"). While the window is open the term
+      // is 1, which only widens what tr already grants.
+      const tr = trackMotion ? Math.min(1, Math.max(0, Number(trackMotion()) || 0)) : 0;
+      if (tr > 0) trOpenAt = nowMs;
+      const lightSettleOn = globalThis.__giSrcLightSettle !== false;
+      const holdPin = Number(globalThis.__giSrcLightSettleHoldMs);
+      const fadePin = Number(globalThis.__giSrcLightSettleFadeMs);
+      const lightHoldMs = Number.isFinite(holdPin) ? Math.max(0, holdPin) : LIGHT_SETTLE_HOLD_MS;
+      const lightFadeMs = Number.isFinite(fadePin) ? Math.max(1, fadePin) : LIGHT_SETTLE_FADE_MS;
+      const sinceTr = nowMs - trOpenAt;
+      const lightTerm = lightSettleOn
+        ? (sinceTr <= lightHoldMs
+            ? 1
+            : Math.max(0, 1 - (sinceTr - lightHoldMs) / lightFadeMs))
+        : 0;
+      const settleHatch = globalThis.__giSrcCamSettleAlpha;
+      const alphaPinned = Number.isFinite(Number(globalThis.__giSrcAlpha));
+      const settleFloor = Number.isFinite(Number(settleHatch)) && Number(settleHatch) > 0
+        ? Number(settleHatch)
+        : CAM_SETTLE_ALPHA;
+      // One floor, two envelopes: re-equilibration is re-equilibration
+      // whether the camera moved it or a light left it behind.
+      const settleTerm = Math.max(camTerm, lightTerm);
+      const alpha = settleHatch !== false && !alphaPinned
+        ? Math.max(
+            readAlpha(),
+            TEMPORAL_ALPHA_STILL + settleTerm * (settleFloor - TEMPORAL_ALPHA_STILL),
+          )
+        : readAlpha();
       // Published every frame for probes — a plain number write. The α ramp
       // was UNGATEABLE end-to-end before this: `keepU` folds the stride root
       // in, so no page could read back what α the motion signal actually
@@ -1229,7 +1358,56 @@ export function createSrcProbeSystem({
       // refuted it: any spurious motion spike became a 1.2 s burst of
       // relaxed-root fast decay, and the rig's still controls read 21.2 vs
       // 0.92 rev/px — the user saw it as water caustics on a parked floor.
-      const tr = trackMotion ? Math.min(1, Math.max(0, Number(trackMotion()) || 0)) : 0;
+      // (`tr` is hoisted above with the §12.67 light-settle envelope — the α
+      // floor needs it before α is computed.)
+      const mLight = motionOf(alpha);
+      // ── THE REST CADENCE (§12.61) ────────────────────────────────────────
+      // The cost-probe fit: deposit ≈ 3.7 ms floor + 42.2 ns/ray — rays are
+      // 71% of the chain at ultra, and §12.60's α 0.02 means a parked scene
+      // reaches the same steady state on half the evidence rate. So at rest
+      // the ceiling scales by REST_TRANSPORT_FRACTION, and ANY of the three
+      // responsiveness signals restores it continuously: the α motion ramp
+      // (mLight), an open tracking window (tr — a light just changed), or a
+      // recent camera move (held REST_CAM_HOLD_MS, then FADED over
+      // REST_CAM_FADE_MS — a budget step on the frame a pan ends is R1's
+      // cliff in miniature). The decay's stride root below reads the stride
+      // this produces, so evidence preservation follows the real refresh rate
+      // with no extra wiring. A pinned `__giSrcTransportRays` is an
+      // instrument and is never scaled (readCeiling returns the pin; the
+      // factor is forced to 1 so the pin means what the arm that set it
+      // meant).
+      // (`camTerm` is computed with the settle-α floor above — one envelope,
+      // two consumers: the α floor and this budget restore.)
+      // The boot hold: the fill-from-black is the one convergence the seed
+      // cannot prior (no parents exist yet), so the first seconds run at the
+      // full budget whatever the camera does. Same hold+fade shape as camTerm.
+      const sinceBuild = nowMs - buildAt;
+      const bootTerm = sinceBuild <= REST_BOOT_HOLD_MS
+        ? 1
+        : Math.max(0, 1 - (sinceBuild - REST_BOOT_HOLD_MS) / REST_CAM_FADE_MS);
+      const ceilingPinned = Number.isFinite(Number(globalThis.__giSrcTransportRays));
+      const restOn = globalThis.__giSrcRestCadence !== false && !ceilingPinned;
+      const forcedFraction = Number(globalThis.__giSrcRestFraction);
+      const restFraction = Number.isFinite(forcedFraction)
+        ? Math.min(1, Math.max(0.1, forcedFraction))
+        : REST_TRANSPORT_FRACTION;
+      // §12.67: `lightTerm` keeps the budget up after the window CLOSES —
+      // the departed light's ghost needs evidence to drain without blotches.
+      const restDrive = Math.max(mLight, tr, camTerm, bootTerm, lightTerm);
+      restFactor = restOn ? restFraction + (1 - restFraction) * restDrive : 1;
+      globalThis.__giSrcRestFactorLive = restFactor;
+      // The ceiling is live (see `readCeiling`) and the rest factor rides it.
+      // Re-derived HERE, before the stride root, so `rootS` reads the stride
+      // this frame actually refreshes at — the old order computed the root
+      // from last frame's stride, harmless when the ceiling moved once per
+      // probe run and wrong every frame near a rest transition.
+      const nextCeiling = Math.max(1, Math.round(readCeiling() * restFactor));
+      if (nextCeiling !== rayCeiling) {
+        rayCeiling = nextCeiling;
+        rayStride = strideFor(rayCeiling);
+        strideU.value = rayStride;
+        publishTransport();
+      }
       const rootS = 1 + (Math.max(1, rayStride) - 1) * (1 - tr);
       const keep = (1 - alpha) ** (1 / rootS);
       if (keepU.value !== keep) keepU.value = keep;
@@ -1258,7 +1436,7 @@ export function createSrcProbeSystem({
       // fades out across [GOV_LO, GOV_HI] of the same motion signal the α ramp
       // rides. Smoothstep rather than a threshold for R1's reason: a binary
       // handover would step the ray budget on the frame it crossed.
-      const mLight = motionOf(alpha);
+      // `mLight` is hoisted above (the rest cadence reads it too).
       const govT = Math.min(1, Math.max(0, (mLight - GOV_LO) / Math.max(1e-6, GOV_HI - GOV_LO)));
       const forcedGain = Number(globalThis.__giSrcSurpriseGain);
       const gain = Number.isFinite(forcedGain)
@@ -1279,23 +1457,8 @@ export function createSrcProbeSystem({
       // definition of "which frame is this" (the decay pass compares against it
       // exactly, and two counters that drift would silently decorrelate the
       // stride from the decay).
-      // The ceiling is live (see `readCeiling`), so re-derive the stride before
-      // using it. Compare-then-assign for the same reason `keepU` does: a
-      // uniform written every frame is uploaded every frame, and a still scene
-      // should upload nothing.
-      const nextCeiling = readCeiling();
-      if (nextCeiling !== rayCeiling) {
-        rayCeiling = nextCeiling;
-        rayStride = strideFor(rayCeiling);
-        strideU.value = rayStride;
-        // Publish the derived stride. The boot line reports the stride the
-        // system was BUILT with, and `__giSrcTransportRays` moves it afterwards
-        // without logging — so a probe that changes the ceiling at runtime had
-        // no way to read what it actually bought and was reduced to re-deriving
-        // it from an assumed `pixelCount`. Written only on change, so a still
-        // scene still writes nothing.
-        publishTransport();
-      }
+      // (The ceiling poll moved ABOVE the stride root — see the rest-cadence
+      // block. `publishTransport` still fires only on change.)
       // The cap polls on the same schedule and for the same reason as the
       // ceiling. Compare-then-assign: a still scene uploads nothing.
       // ── AND IT LIFTS INSIDE THE TRACKING WINDOW (§12.45) ─────────────────
@@ -1347,6 +1510,13 @@ export function createSrcProbeSystem({
       // [J]'s LOD-bias hatch, polled beside the others for the same §12.23
       // reason: a build-time read can only be A/B'd by reloading.
       secondary?.poll();
+      // The seed's live dial, same rule. 0 zeroes every seeded word and is the
+      // flicker instrument's in-page off arm; the build hatch is `__giSrcSeed`.
+      if (seed) {
+        const forcedSeed = Number(globalThis.__giSrcSeedRays);
+        const nextSeed = Number.isFinite(forcedSeed) ? Math.max(0, forcedSeed) : SEED_RAYS;
+        if (seedRaysU.value !== nextSeed) seedRaysU.value = nextSeed;
+      }
       phaseU.value = rayStride > 1 ? frameStampU.value % rayStride : 0;
       const a = anchorU.value;
       const drift = Math.max(
@@ -1404,6 +1574,7 @@ export function createSrcProbeSystem({
         raysPerPixel: tier.raysPerPixel,
         totalRays: await rayFrame.readTotal(renderer),
         rays: deposit ? await deposit.readStats(renderer) : null,
+        seed: seed ? await seed.readStats(renderer) : null,
         secondary: secondary ? await secondary.readStats(renderer) : null,
         merge: merge ? await merge.readStats(renderer) : null,
         tiles: tiles ? await tiles.readStats(renderer) : null,
@@ -1442,6 +1613,7 @@ export function createSrcProbeSystem({
 
     dispose() {
       gizmos.dispose();
+      seed?.dispose();
       secondary?.dispose();
       gather?.dispose();
       hashBlockFrame?.dispose();
@@ -1571,6 +1743,10 @@ export function formatSrcProbeFrame(stats) {
     // [J]'s own line. `bounce 0/N` with the boot line claiming MULTIBOUNCE is
     // the reading that separates "the second bounce is dim here" from "the
     // pass did not dispatch", which are the same picture.
+    // The seed's instrument: `probes` says newborns are inheriting a prior at
+    // all, `cold` says how many the ladder could not reach (the deferred
+    // spatial-neighbour fallback's demand signal).
+    (stats.seed?.dispatched && stats.seed.probes ? `  |  ${formatSrcSeed(stats.seed)}` : "") +
     (stats.secondary?.dispatched ? `  |  ${formatSrcSecondary(stats.secondary)}` : "") +
     // The merge's range instrument. `to sky` is the fraction of merged bins
     // whose parent chain reached the top — i.e. how much of the frame is

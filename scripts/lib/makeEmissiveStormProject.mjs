@@ -148,11 +148,26 @@ export async function makeEmissiveStormProject(root, opts = {}) {
     // way a large one is not — the difference between "apply a calibration
     // factor" and "the cheap path cannot represent small emitters at all".
     lampRadius = STORM_RIG.lampRadius,
+    // Mirror floor (2026-08-13): roughness 0.3 puts the floor in bucket 0
+    // (GI_MIRROR_ROUGHNESS_MAX 0.45) — the scene gains a reflection CONSUMER,
+    // which at ultra turns on the exact-reflection prepass + the resolve's
+    // hit-shading. That is the arm that prices the emitters × reflections
+    // interaction (each hit pixel runs emitterSlotShadow inline per slot);
+    // without it the resolve never compiles the bvhShade branch and the
+    // emitter sweep measures only the dedicated shadow pass.
+    mirrorFloor = false,
+    // Walls + ceiling. An OPEN rig cannot price hit shading at all: the
+    // mirror floor reflects the sky, every reflection ray MISSES (t = -1),
+    // and the resolve's bvhShade branch — the thing the mirror arm exists to
+    // measure — is skipped on ~every pixel. Enclosed, a floor pixel's
+    // reflected ray hits the ceiling and pays the full hit-shade (gather +
+    // per-slot emitter march), which is the Sponza shape.
+    enclosed = false,
   } = opts;
   await mkdir(path.join(root, "scenes"), { recursive: true });
   await mkdir(path.join(root, "materials"), { recursive: true });
 
-  const mats = { Floor: bsdf("#d8d8d8"), Crate: bsdf("#b0b4bc") };
+  const mats = { Floor: bsdf("#d8d8d8", mirrorFloor ? 0.3 : 1), Crate: bsdf("#b0b4bc") };
   // All lamps share ONE colour when there are more than four: the measurement
   // compares lamp-to-lamp delivery, and per-lamp hue would confound it with
   // the promotion gate's own colour sensitivity.
@@ -166,7 +181,23 @@ export async function makeEmissiveStormProject(root, opts = {}) {
   const M = (name) => `${root.replaceAll("\\", "/")}/materials/${name}.mat`;
   const { floorSize, crateSize } = STORM_RIG;
 
+  // Enclosure walls sit just inside the GI volume (sizeX/Z 16 spans ±8, the
+  // 14m floor leaves a margin); height 3.6 keeps the ceiling inside sizeY 8's
+  // upper half. Crate material — diffuse, so the enclosure adds hit targets
+  // without adding more reflection consumers.
+  const wallH = 3.6;
+  const half = floorSize / 2;
+  const enclosure = enclosed
+    ? [
+        mesh("Ceiling", "box", M("Crate"), [0, wallH, 0], [floorSize, 0.1, floorSize]),
+        mesh("WallN", "box", M("Crate"), [0, wallH / 2, -half], [floorSize, wallH, 0.1]),
+        mesh("WallS", "box", M("Crate"), [0, wallH / 2, half], [floorSize, wallH, 0.1]),
+        mesh("WallW", "box", M("Crate"), [-half, wallH / 2, 0], [0.1, wallH, floorSize]),
+        mesh("WallE", "box", M("Crate"), [half, wallH / 2, 0], [0.1, wallH, floorSize]),
+      ]
+    : [];
   const rig = [
+    ...enclosure,
     mesh("Floor", "box", M("Floor"), [0, -0.05, 0], [floorSize, 0.1, floorSize]),
     ...CRATES.map((p, i) =>
       mesh(`Crate${i}`, "box", M("Crate"), p, [crateSize, crateSize, crateSize], {

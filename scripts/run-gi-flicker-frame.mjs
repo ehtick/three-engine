@@ -57,6 +57,41 @@ const CEILING_AB = process.env.CEILING_AB === "1";
 // directly (same stride both arms), the α-sweep's discipline.
 const CAP_AB = process.env.CAP_AB === "1";
 const CAP_VALUE = Number(process.env.CAP_VALUE ?? 16);
+// SURPRISE_AB=1 — §12.52's per-block surprise-α, STILL arms: does the
+// detector re-trip on converged-but-noisy blocks at rest? Its measured noise
+// floor is 1.78× the shot model (SUM_SHIFT quantization at GI-realistic
+// luma), so the 2σ→4σ detection ramp is ~1.1σ→2.2σ of TRUE σ — false trips
+// would decay a block fast, re-noise it, and re-trip: self-sustaining still
+// churn wearing §12.52's own machinery. Gain 0 is the in-page off
+// (srcSystem polls `__giSrcSurpriseGain` per frame; the governor publishes
+// gain 1 on a parked scene, so "natural" at rest IS the fully-armed state).
+const SURPRISE_AB = process.env.SURPRISE_AB === "1";
+// CROSS_LAG=1 — §12.46.3's "correct instrument", built. The α sweep's churn
+// column was unambiguous (34× between α 0.1 and 0.02 under rotation) but its
+// lag column refuted itself, so no α change may ship without this. Method:
+// park the sun at the eased curve's MIDPOINT (its fastest angle — the
+// hardest case), converge and time-average a noise-free TRUTH at the
+// DEFAULT α; then force the arm's α and ping-pong the sun through that same
+// angle, accumulating the live field PER PIXEL at each crossing, ascending
+// and descending crossings kept separate (lag trails the sun, so its sign
+// flips with direction — the direction-antisymmetric part of the per-pixel
+// pass-mean IS the lag, and everything direction-symmetric cancels out of
+// it). Noise falls as 1/√passes in the per-pixel mean; the per-crossing
+// |diff| keeps lag+noise for scale. SELF-CHECK: EMA lag for a ramp grows as
+// α falls — a lag column that shrinks with α is broken, and the run must
+// say so rather than print a verdict (the netSettle lesson, §12.46.3).
+const CROSS_LAG = process.env.CROSS_LAG === "1";
+const CROSS_ALPHA = (process.env.CROSS_ALPHA ?? "0.1,0.02")
+  .split(",").map(Number).filter((v) => Number.isFinite(v) && v > 0);
+const CROSS_CYCLES = Number(process.env.CROSS_CYCLES ?? 3);
+const CROSS_ROUNDS = Number(process.env.CROSS_ROUNDS ?? 1);
+// CROSS_GAIN=<0..1> — pins `__giSrcSurpriseGain` during the swing (truth is
+// always accumulated at rest, where the pin is irrelevant). The validation
+// arm: at α=0.02 with gain 0 the raw EMA lag (~τ·dθ/dt, tens of degrees of
+// sun angle) MUST dwarf the noise floor — if it does, the instrument is
+// proven able to see lag AND the per-block surprise decay is proven to be
+// what bounds it with the gain live.
+const CROSS_GAIN = process.env.CROSS_GAIN !== undefined ? Number(process.env.CROSS_GAIN) : undefined;
 // TRACK_AB=1 — §12.43's tracking window: MOVING arms, tracking on vs
 // `__giSrcMotionTrack = false`, interleaved in one page. The risk it prices
 // is the root relaxing during continuous motion (keep = 1−α instead of the
@@ -77,6 +112,16 @@ const CAM_ANGLE = (Number(process.env.CAM_ANGLE ?? 25) * Math.PI) / 180;
 // fix) and only `__giSrcCamCapLift` differs. Expected: lift-on pan-excess
 // lands near the off arm's 1.66, lift-off near the capped arm's 6.66.
 const CAMERA_VERIFY = process.env.CAMERA_VERIFY === "1";
+// SEED_AB=1 — §12.59.2's fix A/B: the fresh-probe SEED (newborn probes start
+// at their parent's last-frame merged answer) on at its shipping weight vs
+// `__giSrcSeedRays = 0`, which zeroes every seeded word IN-PAGE — the passes
+// still dispatch, so the arms differ by the prior alone. Shipping config
+// otherwise (tier cap unpinned). The two numbers §12.59.1 left on the table:
+// PAN EXCESS over own still (0.543 capped / 0.462 off pre-fix) and the
+// post-pan stills that read 0.22–0.35 against a 0.204 clean floor. The parked
+// still itself is the no-regression control — all-rest suspects measured
+// inside the noise floor, so the seed must not move it.
+const SEED_AB = process.env.SEED_AB === "1";
 // LIGHT_STEP=1 — the same report's other half: "anytime light updates, it
 // starts flickering". A REAL intensity step lands mid-arm through the
 // editor's own prop path (GISystem's light events fire exactly as live, the
@@ -318,7 +363,7 @@ if (SRC) {
 // illumination lands on floor the metric reads.
 let stepLightId = null;
 let lightNow = 2;
-if (LIGHT_STEP || LIGHT_ROT) {
+if (LIGHT_STEP || LIGHT_ROT || CROSS_LAG) {
   const le = await call("entity.create", {
     name: "__flicker_step_light", transform: { position: [7.5, 3.5, 0] },
   });
@@ -337,6 +382,27 @@ const body = async ({ anchorId, moverId, frames, amp, rotate, pan = null, light 
   if (!obj) throw new Error("mover not live");
   const renderer = eng.renderer;
   const system = eng.modules.get("gi")?.system;
+  // A quality override or the mover spawn queues a REBUILD that REPLACES the
+  // resolve targets. Grabbing `_giTargets` before the last rebuild lands means
+  // accumulating over a texture nothing writes any more — the run that
+  // motivated this reported 0.000 reversals under a MOVING mover: a flawless
+  // number that was actually a dead reference. Wait until no rebuild is queued
+  // and the targets object holds still for 60 consecutive frames.
+  await new Promise((resolveP, rejectP) => {
+    let stable = 0;
+    let last = system?._giTargets;
+    let guard = 0;
+    const tick = () => {
+      if (++guard > 3600) return rejectP(new Error("GI targets never settled (rebuild loop?)"));
+      const now = system?._giTargets;
+      if (!system?._rebuildQueued && now && now === last) stable++;
+      else stable = 0;
+      last = now;
+      if (stable >= 60) return resolveP();
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  });
   const targets = system?._giTargets;
   const size = system?._giTargetSize;
   if (!targets?.irradiance || !size) throw new Error("no GI resolve targets");
@@ -457,6 +523,17 @@ const body = async ({ anchorId, moverId, frames, amp, rotate, pan = null, light 
         renderer.compute(accumulator);
         panN++; if (capNow()) panLift++;
         sampleMotion(false);
+      }
+      // Seed liveness (§12.59.2): one readback at the end of the first pan
+      // segment — the frames that HAVE fresh probes — so a SEED_AB arm can
+      // prove the pass ran (seed on: probes>0 AND bins>0; dial 0: probes>0,
+      // bins=0) instead of measuring a fix that never fired (the §12.42
+      // lift-snapshot lesson). Both arms pay the same one-readback stall.
+      if (cyc === 0) {
+        const seedFrame = system.state?.screen?.srcProbes?.seed;
+        if (seedFrame?.readStats) {
+          globalThis.__flickerSeedMid = await seedFrame.readStats(renderer);
+        }
       }
       armed.value = 1;
       for (let i = 0; i < seg; i++) {
@@ -786,6 +863,222 @@ if (CAP_AB) {
   }
   await setCap(undefined);
 }
+// ── THE PER-BLOCK SURPRISE A/B (§12.52) ─────────────────────────────────────
+// Still arms only: the question is the detector's false-trip rate at rest,
+// and a mover would hand it real surprises to be right about. A full
+// discarded arm after every switch — u self-terminates over ~8 frames and
+// the accumulators re-equilibrate at the restored decay before the counted
+// arm starts. `undefined` restores the governor (Number(undefined) is NaN,
+// which the poll treats as "no forced gain").
+const setSurpriseGain = (v) => page.evaluate((x) => { globalThis.__giSrcSurpriseGain = x; }, v);
+const surpriseRounds = [];
+if (SURPRISE_AB) {
+  for (let r = 0; r < 2; r++) {
+    await setSurpriseGain(0);
+    await wait(300);
+    await measure(0, false);
+    const off = await measure(0, false);
+    await setSurpriseGain(undefined);
+    await wait(300);
+    await measure(0, false);
+    const on = await measure(0, false);
+    surpriseRounds.push({ off, on });
+  }
+  await setSurpriseGain(undefined);
+}
+// ── THE CROSSING-LAG INSTRUMENT (§12.46.3's spec, verbatim) ─────────────────
+// Runs entirely in one page.evaluate per arm; each arm carries its OWN truth,
+// so arms are self-contained and only their (lag, churn-context) pairs are
+// compared. Truth accumulates at the DEFAULT α — the converged fixed point is
+// α-independent, and converging the truth at α=0.02 would take 5× the frames
+// for the identical answer. The first swing cycle after forcing the arm's α
+// is DISCARDED (the accumulators re-equilibrate over ~1/α refreshes — §12.38
+// measured that transient once as if it were signal).
+const crossBody = async ({ anchorId, rotLightId, halfFrames, span, base, convergeFrames, truthFrames, cycles, forceAlpha, forceGain }) => {
+  const eng = globalThis.__editorApi.entities.live(anchorId)?.engine;
+  const lobj = globalThis.__editorApi.entities.live(rotLightId)?.object3D;
+  if (!eng?.renderer || !lobj) throw new Error("cross: no engine or light");
+  const renderer = eng.renderer;
+  const system = eng.modules.get("gi")?.system;
+  const targets = system?._giTargets;
+  const size = system?._giTargetSize;
+  if (!targets?.irradiance || !size) throw new Error("cross: no GI resolve targets");
+  const { width, height } = size;
+  const TSL = await import("/node_modules/three/build/three.tsl.js");
+  const { Fn, If, float, instanceIndex, instancedArray, ivec2, texture, uniform, vec3 } = TSL;
+
+  const truthBuf = instancedArray(new Float32Array(width * height), "float");
+  const upBuf = instancedArray(new Float32Array(width * height), "float");
+  const downBuf = instancedArray(new Float32Array(width * height), "float");
+  const absBuf = instancedArray(new Float32Array(width * height), "float");
+  const widthU = uniform(width, "uint");
+  const invTruth = uniform(0);
+  // −1 = no-op (pipeline warmup: a freshly-minted compute node's FIRST
+  // dispatches are silently skipped while the pipeline compiles async — the
+  // §12.52.2 probe trap — and a skipped truth frame would quietly bias the
+  // truth divisor), 0 = truth accumulation, 1 = ascending crossing,
+  // 2 = descending crossing.
+  const modeU = uniform(-1);
+  const kernel = Fn(() => {
+    const px = instanceIndex.mod(widthU);
+    const py = instanceIndex.div(widthU);
+    const lum = texture(targets.irradiance)
+      .load(ivec2(px.toInt(), py.toInt())).xyz.dot(vec3(0.2126, 0.7152, 0.0722)).toVar();
+    If(modeU.greaterThan(-0.5).and(modeU.lessThan(0.5)), () => {
+      truthBuf.element(instanceIndex).assign(truthBuf.element(instanceIndex).add(lum));
+    });
+    If(modeU.greaterThan(0.5), () => {
+      const diff = lum.sub(truthBuf.element(instanceIndex).mul(invTruth)).toVar();
+      absBuf.element(instanceIndex).assign(absBuf.element(instanceIndex).add(diff.abs()));
+      If(modeU.lessThan(1.5), () => {
+        upBuf.element(instanceIndex).assign(upBuf.element(instanceIndex).add(diff));
+      });
+      If(modeU.greaterThan(1.5), () => {
+        downBuf.element(instanceIndex).assign(downBuf.element(instanceIndex).add(diff));
+      });
+    });
+  })().compute(width * height);
+
+  const frame = () => new Promise((r) => requestAnimationFrame(r));
+  const quadInOut = (s) => (s < 0.5 ? 2 * s * s : 1 - 2 * (1 - s) * (1 - s));
+  // The user's curve, verbatim from the ease arm above.
+  const angleAt = (i) => {
+    const p = i % (2 * halfFrames);
+    const frac = (p < halfFrames ? p : 2 * halfFrames - p) / halfFrames;
+    return base + span * quadInOut(0.5 - 0.5 * Math.cos(frac * Math.PI));
+  };
+  const mid = base + span * 0.5;
+
+  // 1) Park at the midpoint and converge at the DEFAULT α. The tail of the
+  //    converge doubles as pipeline warmup (mode −1 touches no buffer).
+  globalThis.__giSrcAlpha = undefined;
+  lobj.rotation.x = mid;
+  lobj.updateMatrixWorld(true);
+  modeU.value = -1;
+  for (let i = 0; i < convergeFrames; i++) {
+    await frame();
+    if (i > convergeFrames - 30) renderer.compute(kernel);
+  }
+  // 2) Truth: a plain time average — noise integrates out, lag is zero
+  //    because nothing moves.
+  modeU.value = 0;
+  for (let i = 0; i < truthFrames; i++) {
+    await frame();
+    renderer.compute(kernel);
+  }
+  invTruth.value = 1 / truthFrames;
+  // 3) The arm's α (and surprise gain, when pinned), then the swing. Phase
+  //    starts AT the midpoint (frac 0.5) so the first frame moves by one
+  //    frame's worth of angle — starting at the curve's base would land a
+  //    hidden step (the triangle arm's lesson).
+  globalThis.__giSrcAlpha = forceAlpha;
+  if (forceGain !== undefined && forceGain !== null) globalThis.__giSrcSurpriseGain = forceGain;
+  const phase = Math.floor(halfFrames / 2);
+  const total = (cycles + 1) * 2 * halfFrames; // first cycle discarded
+  let countUp = 0;
+  let countDown = 0;
+  let prev = angleAt(phase);
+  for (let k = 1; k < total; k++) {
+    await frame();
+    const now = angleAt(k + phase);
+    lobj.rotation.x = now;
+    lobj.updateMatrixWorld(true);
+    // Strict sign flip only: the start frame sits exactly ON mid and must
+    // not count itself as a pass.
+    if (k > 2 * halfFrames && (prev - mid) * (now - mid) < 0) {
+      const ascending = now > prev;
+      modeU.value = ascending ? 1 : 2;
+      renderer.compute(kernel);
+      if (ascending) countUp++;
+      else countDown++;
+    }
+    prev = now;
+  }
+  globalThis.__giSrcAlpha = undefined;
+  globalThis.__giSrcSurpriseGain = undefined;
+  lobj.rotation.x = base;
+  lobj.updateMatrixWorld(true);
+
+  const truth = new Float32Array(await renderer.getArrayBufferAsync(truthBuf.value));
+  const up = new Float32Array(await renderer.getArrayBufferAsync(upBuf.value));
+  const down = new Float32Array(await renderer.getArrayBufferAsync(downBuf.value));
+  const abs = new Float32Array(await renderer.getArrayBufferAsync(absBuf.value));
+  // ── THE ANTISYMMETRY ESTIMATOR ──────────────────────────────────────────
+  // The field trails the sun, so at an ascending crossing it resembles the
+  // sun at θ*−δ and at a descending one θ*+δ: to first order the lag
+  // structure in the down passes is the NEGATIVE of the up passes'. Noise is
+  // direction-blind, and so is any truth-side bias (an under-converged truth
+  // appears identically in both). So with mU/mD the per-pixel pass-means,
+  //   antisym = (mU − mD)/2   carries lag + noise,
+  //   sym     = (mU + mD)/2   carries the SAME noise power + zero lag,
+  // and Var(antisym) − Var(sym) over pixels is the lag's own variance with
+  // the noise bias cancelled — the plain mean-|·| column keeps the E|X|
+  // failure (a first run of this instrument self-refuted on exactly that;
+  // its refusal is why this estimator exists).
+  let inst = 0;
+  let truthSum = 0;
+  let lit = 0;
+  let sumA = 0;
+  let sumA2 = 0;
+  let sumS = 0;
+  let sumS2 = 0;
+  let lagUp = 0;
+  let lagDown = 0;
+  for (let i = 0; i < width * height; i++) {
+    const t = truth[i] * invTruth.value;
+    // Unlit / background pixels carry no signal and would dilute every mean.
+    if (t < 0.02) continue;
+    lit++;
+    truthSum += t;
+    const mU = countUp ? up[i] / countUp : 0;
+    const mD = countDown ? down[i] / countDown : 0;
+    const a = (mU - mD) / 2;
+    const s = (mU + mD) / 2;
+    sumA += a;
+    sumA2 += a * a;
+    sumS += s;
+    sumS2 += s * s;
+    lagUp += Math.abs(mU);
+    lagDown += Math.abs(mD);
+    inst += abs[i] / Math.max(1, countUp + countDown);
+  }
+  const n = Math.max(1, lit);
+  const varA = sumA2 / n - (sumA / n) ** 2;
+  const varS = sumS2 / n - (sumS / n) ** 2;
+  return {
+    countUp, countDown, lit,
+    truthMean: truthSum / n,
+    // Kept for scale/reference; biased by E|X| — never the verdict column.
+    lagUp: lagUp / n,
+    lagDown: lagDown / n,
+    inst: inst / n,
+    // RMS amplitude of the direction-antisymmetric (= lag) structure, noise
+    // power subtracted. Negative differences clamp to 0: "no lag resolvable
+    // above this run's noise".
+    lagRMS: Math.sqrt(Math.max(0, varA - varS)),
+    noiseRMS: Math.sqrt(Math.max(0, varS)),
+  };
+};
+
+const crossRounds = [];
+if (CROSS_LAG) {
+  for (let r = 0; r < CROSS_ROUNDS; r++) {
+    const order = r % 2 === 0 ? CROSS_ALPHA : [...CROSS_ALPHA].reverse();
+    const round = {};
+    for (const a of order) {
+      round[a] = await page.evaluate(crossBody, {
+        anchorId: giEntity.id, rotLightId: stepLightId,
+        halfFrames: ROT_HALF, span: 1.222, base: -1.0,
+        convergeFrames: 300, truthFrames: 180, cycles: CROSS_CYCLES,
+        forceAlpha: a, forceGain: CROSS_GAIN,
+      });
+      console.log(`  cross α=${a}: ${round[a].countUp}+${round[a].countDown} passes, ` +
+        `lagRMS ${round[a].lagRMS.toFixed(5)} (noiseRMS ${round[a].noiseRMS.toFixed(5)}), inst ${round[a].inst.toFixed(5)}`);
+    }
+    crossRounds.push(round);
+  }
+  await setAlpha(undefined);
+}
 // ── THE TRACKING-WINDOW A/B (§12.43) ────────────────────────────────────────
 // Moving arms, because that is where the root now relaxes; a full discarded
 // arm after every switch (the accumulators re-equilibrate at the new keep),
@@ -868,6 +1161,34 @@ if (CAMERA_VERIFY) {
   }
   await setCamLift(undefined);
 }
+// ── THE FRESH-PROBE SEED A/B (§12.59.2) ─────────────────────────────────────
+// Interleaved ×2, discarded arm after every switch, both configs otherwise
+// shipping (tier cap unpinned, α live). still2 per config for the same reason
+// CAMERA_AB grew one: pre-fix, the pan's churn OUTLIVED a whole arm — the
+// seed's claim is precisely that it shortens that tail.
+const setSeedRays = (v) => page.evaluate((x) => { globalThis.__giSrcSeedRays = x; }, v);
+const seedMid = () => page.evaluate(() => globalThis.__flickerSeedMid ?? null);
+const seedRounds = [];
+if (SEED_AB) {
+  for (let r = 0; r < 2; r++) {
+    await setSeedRays(undefined);
+    await wait(300);
+    await measure(0, false);
+    const onPan = await measure(0, false, { pan: { angle: CAM_ANGLE, cycles: 2 } });
+    const onSeed = await seedMid();
+    const onStill = await measure(0, false);
+    const onStill2 = await measure(0, false);
+    await setSeedRays(0);
+    await wait(300);
+    await measure(0, false);
+    const offPan = await measure(0, false, { pan: { angle: CAM_ANGLE, cycles: 2 } });
+    const offSeed = await seedMid();
+    const offStill = await measure(0, false);
+    const offStill2 = await measure(0, false);
+    seedRounds.push({ onPan, onStill, onStill2, offPan, offStill, offStill2, onSeed, offSeed });
+  }
+  await setSeedRays(undefined);
+}
 // ── THE LIGHT-STEP A/B ──────────────────────────────────────────────────────
 // Direction alternates 2↔6 arm to arm, so over 2 rounds every config sees one
 // rising and one falling step and the per-config means are balanced. A
@@ -881,12 +1202,20 @@ const stepRounds = [];
 // pre-§12.45 behavior (it measured 24.1 rev/px; cap-off measured 15.3 — the
 // lift's ceiling — and window-off 3.7, in the 2026-08-12 pre-fix run).
 const setLift = (v) => page.evaluate((x) => { globalThis.__giSrcCapWindowLift = x; }, v);
-const STEP_NAMES = ["shipped", "no-lift", "window-off"];
+const STEP_NAMES = ["shipped", "settle-off", "no-lift", "window-off"];
 if (LIGHT_STEP) {
+  // §12.67: `settle-off` disables the light-settle envelope (the hold+fade
+  // that keeps α floored + rays up after the §12.43 window closes), and every
+  // config now takes a TAIL measure right after the step arm — the departed
+  // light's ghost draining is the user-reported regime ("surface continues
+  // color bleeding and flickering after the light went away"), and it lives
+  // in the tail, which the step arm alone never sampled.
+  const setSettle = (v) => page.evaluate((x) => { globalThis.__giSrcLightSettle = x; }, v);
   const stepConfigs = [
-    { name: "shipped", track: undefined, cap: undefined, lift: undefined },
-    { name: "no-lift", track: undefined, cap: undefined, lift: false },
-    { name: "window-off", track: false, cap: undefined, lift: undefined },
+    { name: "shipped", track: undefined, cap: undefined, lift: undefined, settle: undefined },
+    { name: "settle-off", track: undefined, cap: undefined, lift: undefined, settle: false },
+    { name: "no-lift", track: undefined, cap: undefined, lift: false, settle: undefined },
+    { name: "window-off", track: false, cap: undefined, lift: undefined, settle: undefined },
   ];
   for (let r = 0; r < 2; r++) {
     const round = {};
@@ -894,18 +1223,30 @@ if (LIGHT_STEP) {
       await setTrack(cfg.track);
       await setCap(cfg.cap);
       await setLift(cfg.lift);
+      await setSettle(cfg.settle);
+      // §12.67.1 PROTOCOL: every config measures the SAME 6→0 DEPARTURE.
+      // The first draft alternated 2↔6 across configs, which handed one
+      // config the arrival arms and the next the departure arms — a
+      // confounded A/B by construction. Re-lighting to 6 and settling
+      // before each arm makes the ghost each config must drain identical,
+      // and 6→0 (not 6→2) is the user's actual regime: the light GONE,
+      // the multibounce residue draining. TWO tail windows because "quite
+      // some time" lives past the first one (the §12.63 lesson — short
+      // observation biases against settle fixes).
+      await must("component.setProp", { id: stepLightId, type: "light", key: "intensity", value: 6 });
       await wait(300);
       await measure(0, false);
-      const to = lightNow === 2 ? 6 : 2;
-      const arm = await measure(0, false, { light: { id: stepLightId, at: STEP_AT, to } });
-      round[cfg.name] = { arm, dir: `${lightNow}->${to}` };
-      lightNow = to;
+      const arm = await measure(0, false, { light: { id: stepLightId, at: STEP_AT, to: 0 } });
+      const tail = await measure(0, false);
+      const tail2 = await measure(0, false);
+      round[cfg.name] = { arm, tail, tail2, dir: "6->0" };
     }
     stepRounds.push(round);
   }
   await setTrack(undefined);
   await setCap(undefined);
   await setLift(undefined);
+  await setSettle(undefined);
   await must("component.setProp", { id: stepLightId, type: "light", key: "intensity", value: 2 });
 }
 // ── THE CONTINUOUS-ROTATION A/B (the day-cycle regime) ──────────────────────
@@ -1007,6 +1348,14 @@ if (ALPHA_SWEEP.length) {
   await setAlpha(undefined);
 }
 
+
+// A MOVING object with ZERO changed pixels is not "no flicker" — it is the
+// accumulator watching a texture the GI stopped writing (a rebuild replaced
+// the targets after the grab). Fail loud instead of printing flawless zeros.
+if (result.changedPx === 0 && result.meanChangedFrames === 0) {
+  console.log("\nINSTRUMENT FAILURE: resolve texture never changed under a moving object — dead target reference (rebuild replaced _giTargets after the accumulator grabbed them). Nothing below is a measurement.");
+  process.exit(1);
+}
 
 console.log(`\n=== PER-FRAME FLICKER (${result.width}x${result.height}, ${result.frames} frames, ${ROTATE ? "ROTATING box 2-axis 0.6rad/s" : "sub-voxel mover"}) ===`);
 console.log(`  kept ${result.kept} px, excluded ${result.excluded} (mover footprint)`);
@@ -1187,6 +1536,81 @@ if (capRounds.length) {
   }
 }
 
+// ── THE SURPRISE A/B VERDICT ────────────────────────────────────────────────
+// The claim under test: a PARKED scene's churn is the same with the surprise
+// detector fully armed (governor gain 1 at rest) and disabled (gain 0). An
+// armed arm clearly above the off arm means the detector is re-tripping on
+// noise and §12.52's fast decay is manufacturing the still flicker it was
+// built to localize.
+if (surpriseRounds.length) {
+  console.log(`
+=== PER-BLOCK SURPRISE A/B (still arms, gain 0 vs governor, interleaved x${surpriseRounds.length}) ===`);
+  const onMean = surpriseRounds.reduce((s, r) => s + r.on.meanReversals, 0) / surpriseRounds.length;
+  const offMean = surpriseRounds.reduce((s, r) => s + r.off.meanReversals, 0) / surpriseRounds.length;
+  const onP95 = surpriseRounds.reduce((s, r) => s + r.on.stepP95, 0) / surpriseRounds.length;
+  const offP95 = surpriseRounds.reduce((s, r) => s + r.off.stepP95, 0) / surpriseRounds.length;
+  const spread = surpriseRounds.length > 1
+    ? Math.abs(surpriseRounds[0].off.meanReversals - surpriseRounds[1].off.meanReversals)
+    : NaN;
+  console.log(`  still reversals/px: armed ${onMean.toFixed(3)}  vs  gain-0 ${offMean.toFixed(3)}   ` +
+    `(${((onMean / offMean - 1) * 100).toFixed(0)}%)`);
+  console.log(`  still step p95:     armed ${onP95.toFixed(4)}  vs  gain-0 ${offP95.toFixed(4)}   ` +
+    `(${((onP95 / offP95 - 1) * 100).toFixed(0)}%)`);
+  console.log(`  round-to-round spread on the gain-0 arm: ${spread.toFixed(3)} — the noise floor`);
+  const excess = onMean - offMean;
+  if (excess > Math.max(spread * 1.5, offMean * 0.15)) {
+    console.log("  ⇒ THE DETECTOR RE-TRIPS AT REST. Scale its σ by the measured 1.78× quantization");
+    console.log("     floor (or raise the 2σ→4σ ramp) before any further per-block tuning.");
+  } else {
+    console.log("  ⇒ The still scene does NOT pay for the armed detector — its churn is elsewhere.");
+  }
+}
+
+// ── THE CROSSING-LAG VERDICT ────────────────────────────────────────────────
+// Prints the lag column §12.46.3 refused to fake, with its self-check: EMA
+// lag for a ramp input scales as (1−α)/α, so lag must RISE as α falls. A
+// column that falls with α is measuring noise (the netSettle failure) and
+// the run says so instead of printing a verdict.
+if (crossRounds.length) {
+  console.log(`
+=== CROSSING LAG (eased ping-pong through the midpoint; per-pixel pass-mean vs a ${300}+${180}-frame parked truth) ===`);
+  const byAlpha = new Map();
+  for (const round of crossRounds) {
+    for (const [a, v] of Object.entries(round)) {
+      if (!byAlpha.has(a)) byAlpha.set(a, []);
+      byAlpha.get(a).push(v);
+    }
+  }
+  const rows = [...byAlpha.entries()].map(([a, vs]) => {
+    const mean = (f) => vs.reduce((s, v) => s + f(v), 0) / vs.length;
+    return {
+      alpha: Number(a),
+      lag: mean((v) => v.lagRMS),
+      noise: mean((v) => v.noiseRMS),
+      inst: mean((v) => v.inst),
+      truth: mean((v) => v.truthMean),
+      passes: vs.reduce((s, v) => s + v.countUp + v.countDown, 0),
+    };
+  }).sort((x, y) => y.alpha - x.alpha);
+  for (const row of rows) {
+    console.log(`  α=${row.alpha}: lagRMS ${row.lag.toFixed(5)} (${((row.lag / row.truth) * 100).toFixed(1)}% of mean luma), ` +
+      `noiseRMS ${row.noise.toFixed(5)}, per-pass |diff| ${row.inst.toFixed(5)}, ${row.passes} passes`);
+  }
+  if (rows.length >= 2) {
+    const hi = rows[0];
+    const lo = rows[rows.length - 1];
+    if (lo.lag <= hi.lag * 1.05) {
+      console.log(`  ⚠ SELF-REFUTED: lagRMS at α=${lo.alpha} should exceed α=${hi.alpha}'s and does not ` +
+        `(${lo.lag.toFixed(5)} vs ${hi.lag.toFixed(5)}). Either the lag is below this run's noise floor ` +
+        `(raise CROSS_CYCLES) or the instrument is broken — do not quote this run either way.`);
+    } else {
+      console.log(`  lagRMS ratio α=${lo.alpha}/α=${hi.alpha}: ${(lo.lag / hi.lag).toFixed(2)}× ` +
+        `(an ideal EMA ramp would read ~${(((1 - lo.alpha) / lo.alpha) / ((1 - hi.alpha) / hi.alpha)).toFixed(1)}×)`);
+      console.log(`  ⇒ quote this against the ROT_ALPHA churn column (34× churn win at α=0.02) to price the α trade.`);
+    }
+  }
+}
+
 // ── THE TRACKING-WINDOW VERDICT ─────────────────────────────────────────────
 if (trackRounds.length) {
   console.log(`
@@ -1271,19 +1695,75 @@ if (camVerifyRounds.length) {
   }
 }
 
+// ── THE FRESH-PROBE SEED VERDICT ────────────────────────────────────────────
+if (seedRounds.length) {
+  console.log(`
+=== FRESH-PROBE SEED A/B (§12.59.2; seedRays default vs 0, ±${((CAM_ANGLE * 180) / Math.PI).toFixed(0)}° pan–hold ×2, x${seedRounds.length}) ===`);
+  console.log("  round  arm       pan rev/px   still rev/px   still2 rev/px   pan p95   seeded (mid-pan frame)");
+  const seedStr = (s) => (s
+    ? `${s.probes} probes / ${s.bins} bins` + (s.cold ? ` (${s.cold} cold)` : "")
+    : "NO READBACK");
+  for (const [i, r] of seedRounds.entries()) {
+    console.log(`  ${i + 1}      seed-on   ${r.onPan.meanReversals.toFixed(3).padEnd(12)} ${r.onStill.meanReversals.toFixed(3).padEnd(14)} ` +
+      `${r.onStill2.meanReversals.toFixed(3).padEnd(15)} ${r.onPan.stepP95.toFixed(4).padEnd(9)} ${seedStr(r.onSeed)}`);
+    console.log(`  ${i + 1}      seed-off  ${r.offPan.meanReversals.toFixed(3).padEnd(12)} ${r.offStill.meanReversals.toFixed(3).padEnd(14)} ` +
+      `${r.offStill2.meanReversals.toFixed(3).padEnd(15)} ${r.offPan.stepP95.toFixed(4).padEnd(9)} ${seedStr(r.offSeed)}`);
+  }
+  // Liveness gate BEFORE any verdict: an on arm that seeded no bins measured
+  // nothing, and saying so beats interpreting it.
+  const live = seedRounds.every((r) => (r.onSeed?.bins ?? 0) > 0 && (r.offSeed?.bins ?? 0) === 0);
+  const mean = (k, f) => seedRounds.reduce((s, r) => s + r[k][f], 0) / seedRounds.length;
+  const exOn = mean("onPan", "meanReversals") - mean("onStill", "meanReversals");
+  const exOff = mean("offPan", "meanReversals") - mean("offStill", "meanReversals");
+  const p95On = mean("onPan", "stepP95");
+  const p95Off = mean("offPan", "stepP95");
+  const spread = seedRounds.length > 1
+    ? Math.abs(seedRounds[0].offPan.meanReversals - seedRounds[1].offPan.meanReversals)
+    : NaN;
+  console.log(`  the page's CLEAN pre-pan still: ${still.meanReversals.toFixed(3)} rev/px — post-pan stills read against THIS floor`);
+  console.log(`  PAN EXCESS over own still: seed-on ${exOn.toFixed(3)}  vs  seed-off ${exOff.toFixed(3)}` +
+    `   (spread on seed-off pan: ${spread.toFixed(3)})`);
+  console.log(`  pan step p95: seed-on ${p95On.toFixed(4)}  vs  seed-off ${p95Off.toFixed(4)}`);
+  console.log(`  post-pan stills (still→still2): on ${mean("onStill", "meanReversals").toFixed(3)}→${mean("onStill2", "meanReversals").toFixed(3)}` +
+    `  vs  off ${mean("offStill", "meanReversals").toFixed(3)}→${mean("offStill2", "meanReversals").toFixed(3)}`);
+  if (!live) {
+    console.log("  ⚠ LIVENESS FAILED — the on arm seeded no bins (or the off arm seeded some).");
+    console.log("     No verdict; check __giSrcSeed, the pass order, and the readback path.");
+  } else if (exOff - exOn > Math.max(spread * 1.5, Math.abs(exOn) * 0.25)) {
+    console.log("  ⇒ THE SEED HOLDS: newborn probes inherit a prior and converge quietly.");
+  } else {
+    console.log("  ⇒ NO MEASURABLE EFFECT on pan excess — check `cold` (a fast pan the ladder");
+    console.log("     cannot seed) and whether the churn lives at the TOP cascade (unseeded).");
+  }
+}
+
 // ── THE LIGHT-STEP VERDICT ──────────────────────────────────────────────────
 if (stepRounds.length) {
   console.log(`
 === LIGHT STEP A/B (intensity toggles at frame ${STEP_AT}; shipped(lift) vs no-lift vs window-off, x${stepRounds.length}) ===`);
-  console.log("  round  config      dir     rev/px    p95      meanWalk");
+  console.log("  round  config      dir     rev/px    p95      meanWalk  tail      tail2");
   for (const [i, r] of stepRounds.entries()) {
     for (const name of STEP_NAMES) {
       const a = r[name];
+      if (!a) continue;
       console.log(`  ${i + 1}      ${name.padEnd(11)} ${a.dir.padEnd(7)} ${a.arm.meanReversals.toFixed(3).padEnd(9)} ` +
-        `${a.arm.stepP95.toFixed(4).padEnd(8)} ${a.arm.meanWalk.toFixed(3)}`);
+        `${a.arm.stepP95.toFixed(4).padEnd(8)} ${a.arm.meanWalk.toFixed(3).padEnd(9)} ` +
+        `${(a.tail ? a.tail.meanReversals.toFixed(3) : "-").padEnd(9)} ${a.tail2 ? a.tail2.meanReversals.toFixed(3) : "-"}`);
     }
   }
   const mean = (name, f) => stepRounds.reduce((s, r) => s + r[name].arm[f], 0) / stepRounds.length;
+  // §12.67 verdict — the TAILS are the user-reported regime (stale bleed +
+  // flicker after the light LEFT). shipped = light-settle envelope ON.
+  if (stepRounds.every((r) => r["settle-off"]?.tail2 && r.shipped?.tail2)) {
+    const tm = (name, f) => stepRounds.reduce((s, r) => s + r[name][f].meanReversals, 0) / stepRounds.length;
+    const t1On = tm("shipped", "tail");
+    const t1Off = tm("settle-off", "tail");
+    const t2On = tm("shipped", "tail2");
+    const t2Off = tm("settle-off", "tail2");
+    console.log(`  §12.67 TAILS (6->0 departure, direction-matched) —`);
+    console.log(`    tail1: shipped ${t1On.toFixed(3)} vs settle-off ${t1Off.toFixed(3)} (÷${(t1Off / Math.max(1e-6, t1On)).toFixed(2)})`);
+    console.log(`    tail2: shipped ${t2On.toFixed(3)} vs settle-off ${t2Off.toFixed(3)} (÷${(t2Off / Math.max(1e-6, t2On)).toFixed(2)})`);
+  }
   const spread = stepRounds.length > 1
     ? Math.abs(stepRounds[0].shipped.arm.meanReversals - stepRounds[1].shipped.arm.meanReversals)
     : NaN;

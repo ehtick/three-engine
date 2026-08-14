@@ -61,11 +61,24 @@ const EMIT = Number(process.env.EMIT ?? 8);
 const CLUTTER = Number(process.env.CLUTTER ?? 0);
 const MOVERS = Number(process.env.MOVERS ?? 0);
 const SEGS = Number(process.env.SEGS ?? 24);
+// MIRROR=1 (2026-08-13): floor drops to roughness 0.3 = bucket 0, the scene
+// gains a reflection consumer, and QUALITY defaults to ultra because
+// exactReflections exists only there (giConfig BY_TIER) — this is the arm
+// that prices emitters × exact reflections (the resolve's hit-path
+// emitterSlotShadow march; measured 1.7 → 60 ms live on Sponza at 3 slots).
+const MIRROR = process.env.MIRROR === "1";
+const QUALITY = process.env.QUALITY ?? (MIRROR ? "ultra" : "high");
+// ENCLOSED=1 adds walls + a ceiling. Mandatory for the mirror arm to measure
+// anything: an open rig's mirror floor reflects the sky, every reflection ray
+// misses, and the hit-shade branch under test never executes (see the rig's
+// `enclosed` note).
+const ENCLOSED = process.env.ENCLOSED === "1" || MIRROR;
 await makeEmissiveStormProject(GEN_ROOT, {
   lampMobility: MOBILITY, emitStrength: EMIT,
   clutterCount: CLUTTER, moverCount: MOVERS, clutterSegments: SEGS,
+  mirrorFloor: MIRROR, enclosed: ENCLOSED, gi: { quality: QUALITY },
 });
-console.log(`  generated emissive-storm rig at ${GEN_ROOT}   lamps: giMobility=${MOBILITY} emitStrength=${EMIT} clutter=${CLUTTER}x${SEGS}seg movers=${MOVERS}`);
+console.log(`  generated emissive-storm rig at ${GEN_ROOT}   lamps: giMobility=${MOBILITY} emitStrength=${EMIT} clutter=${CLUTTER}x${SEGS}seg movers=${MOVERS} mirror=${MIRROR ? 1 : 0} quality=${QUALITY}`);
 console.log(`  sweep: live=[${LIVE.join(",")}]  motion=[${MOTION.map((m) => (m ? "on" : "off")).join(",")}]`);
 await mkdir(SHOT, { recursive: true });
 
@@ -85,7 +98,7 @@ let built = false;
 const churn = [];
 page.on("console", (m) => {
   const t = m.text();
-  if (/\[gi\] built|dynamic-objects|occupancy backend|emitter shadows|bright emitters/i.test(t)) {
+  if (/\[gi\] built|dynamic-objects|occupancy backend|emitter shadows|bright emitters|exact reflections|material GI buckets/i.test(t)) {
     console.log(`  ${t.slice(0, 185)}`);
   }
   if (/\[gi\] built/.test(t)) built = true;
@@ -146,7 +159,14 @@ await wait(SETTLE);
 // Park the viewport camera where the lamps, the crates and the floor pools are
 // all on screen — every GI screen pass is per-pixel work over what is visible,
 // so an off-target camera measures a different frame than the user sees.
-await must("viewport.setCamera", { position: [0, 8.5, 10.5], target: [0, 0.6, 0] });
+// The enclosed arm parks INSIDE the room (walls 14m, height 3.6): the default
+// pose sits above the ceiling, which hides the mirror floor entirely and
+// points every reflection ray at the sky — the hit-shade branch under test
+// then never runs on a single pixel.
+const CAM = ENCLOSED
+  ? { position: [0, 1.9, 6.2], target: [0, 0.8, -2] }
+  : { position: [0, 8.5, 10.5], target: [0, 0.6, 0] };
+await must("viewport.setCamera", CAM);
 await wait(1500);
 
 // The lamp control surface, installed once. Motion is driven from rAF rather

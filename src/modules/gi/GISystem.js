@@ -30,7 +30,7 @@ import * as THREE from "three/webgpu";
 import { Fn, If, cameraPosition, cos, float, fract, mix, normalWorld, positionWorld, renderGroup, screenCoordinate, screenUV, select, sin, smoothstep, texture, uniform, uniformArray, vec2, vec3, vec4 } from "three/tsl";
 import { GI_BOOT_AMBIENT_MAX_TICKS, bootAmbientStep } from "./bootAmbient.js";
 import { giDebugView, resolveGiConfig, sceneSkyRadiance } from "./giConfig.js";
-import { blitBvhAtlasTiles, createGiBvhReflect, createGiBvhTarget, createGiEmitterShadowPass, createGiGBuffer, createGiLightShadowFilterPass, createGiLightShadowHistoryPass, createGiLightShadowPass, createGiLightShadowWidePass, createGiResolve, createGiShadowClearPass, createGiTargets, renderGiGBuffer } from "./giScreen.js";
+import { blitBvhAtlasTiles, createGiBvhReflect, createGiBvhTarget, createGiEmitterShadowPass, createGiGBuffer, createGiIrradianceTemporalPass, createGiLightShadowFilterPass, createGiLightShadowHistoryPass, createGiLightShadowPass, createGiLightShadowWidePass, createGiResolve, createGiShadowClearPass, createGiTargets, renderGiGBuffer } from "./giScreen.js";
 import { resolveMaterialSurface, serializeMeshForBake } from "./voxelizeOnce.js";
 import { createSrcVolume } from "./srcVolume.js";
 import { createSrcDistanceView, createSrcOccupancyView } from "./srcDebugViews.js";
@@ -39,10 +39,11 @@ import { ALPHA_MOTION_SAT, ALPHA_TRACK_HOLD_MS, ALPHA_TRACK_REARM_MS, ALPHA_TRAC
 import { createSrcSurfaceAttribution } from "./srcSurface.js";
 import { createOccupancyField, describeOccupancyField, quantizeOccupancyRes } from "./occupancyField.js";
 import { BVH_STRATEGY, buildStaticSceneBvhWords, classifyDynamicShape, composeFieldDynamics, createDynamicObjectSet, dynHeaderWords, giMobilityOf, giTraceOf } from "./dynamicObjects.js";
+import { buildLightTree, collectEmitters } from "./lightTree.js";
 import { fitPrimitive } from "./primitiveFit.js";
 import { fitEmitterShape } from "./emitterShapes.js";
 import { MeshBVH } from "three-mesh-bvh";
-import { UI_LAYER } from "../../engine/editorLayers.js";
+import { GI_MIRROR_LAYER, UI_LAYER } from "../../engine/editorLayers.js";
 import { GICascadeLight, MAX_EMITTERS, giRoughnessBucketOf, registerGILight } from "./giLight.js";
 import { buildBvhScene } from "./bvh/bvhScene.js";
 import { RayHitMode, rayHitModeName, resolveRayHitConfig } from "./rayHit/RayHitConfig.js";
@@ -252,11 +253,28 @@ let giPipelineReuseHits = 0;
 // concurrently in Xms` is a DRAIN total and cannot say which one owned it, and
 // on the user's editor that total is 62,046 ms for a single pipeline.
 const giPipelineTimings = [];
+// ── §12.56 WATCHDOG STATE ───────────────────────────────────────────────────
+// When the LAST compute pipeline settled (resolved or rejected). The watchdog
+// below uses it as a wave-quiet gate: during a healthy boot compile wave
+// settles land constantly, so a pipeline that is merely QUEUED behind other
+// people's shaders never trips the retry — only one that stays pending after
+// the driver has gone quiet does. That is exactly the §12.65.1 wedge signature
+// (pipeline pending MINUTES after boot, everything else long since compiled).
+let giLastPipelineSettleT = 0;
+// Retries are BOUNDED because an unbounded re-roll of a genuinely broken
+// descriptor would hammer the driver forever; 4 attempts × the retry window is
+// enough to survive any transient, and the warn lines make attempt N visible.
+const GI_PIPELINE_MAX_RETRIES = 4;
 if (import.meta.env?.DEV) {
   // Harness diagnostics (run-gi-spawn-test and friends): lets a probe see
   // whether the dispatch loop is stuck waiting on pipelines / skipping.
   globalThis.__giPendingComputePipelines = giPendingComputePipelines;
   globalThis.__giSkippedComputesSet = giSkippedComputes;
+  // §12.56: the creation ledger, readable by probes. Each entry carries
+  // pass/label/kb at creation and `ms: null` UNTIL the create promise settles
+  // — so `ms === null` long after boot is the pending-forever signature, per
+  // named pipeline, without wrapping anything from page context.
+  globalThis.__giPipelineTimings = giPipelineTimings;
   // WHICH PASS IS CREATING THIS PIPELINE — readable from OUTSIDE the module.
   // `probe:gi-boot` wraps `GPUDevice.prototype.createComputePipelineAsync` at
   // document start, long before this file loads, and every GI pipeline carries
@@ -420,12 +438,33 @@ function installAsyncComputePipelines(renderer) {
           ? (wgsl.match(/var<storage[^>]*>\s*(\w+)/g) ?? []).slice(0, 4).map((s) => s.split(/\s+/).pop()).join(",")
           : "",
       });
-      const record = () => { giPipelineTimings[order].ms = performance.now() - tCreate; };
+      const record = () => {
+        giPipelineTimings[order].ms = performance.now() - tCreate;
+        giLastPipelineSettleT = performance.now();
+      };
+      // ── §12.56: KEEP WHAT A RETRY NEEDS ──────────────────────────────────
+      // The descriptor (module + layout objects, both alive as long as the
+      // pipeline cache holds this entry) and the ledger row, stashed on the
+      // SAME backend data the dispatch guard reads — so the guard can both
+      // detect "pending forever" and re-roll it without any second map.
+      // Dropped again on success; a landed pipeline never retries.
+      {
+        const data = backend.get(computePipeline);
+        data.giDescriptor = descriptor;
+        data.giCreateT = tCreate;
+        data.giTiming = giPipelineTimings[order];
+        // The owner too (giCurrentComputeNode at creation): a wedged original
+        // never runs its `finally`, so a successful re-roll must decrement
+        // giPendingByNode itself or giNodesPending gates (the occupancy
+        // chain's occWait) stay blocked on a pipeline that is actually live.
+        data.giOwner = giCurrentComputeNode;
+      }
       const promise = device.createComputePipelineAsync(descriptor).then(
         (pipelineGPU) => {
           record();
           const data = backend.get(computePipeline);
           data.pipeline = pipelineGPU;
+          data.giDescriptor = null;
           const replay = data.giReplayNodes;
           if (replay?.size) {
             data.giReplayNodes = null;
@@ -448,7 +487,11 @@ function installAsyncComputePipelines(renderer) {
       }
       const tracked = promise.finally(() => {
         giPendingComputePipelines.delete(tracked);
-        if (owner && typeof owner === "object") {
+        // Skip the decrement if a §12.56 re-roll already credited this owner
+        // (the wedge case where the original settles LATE, after the watchdog
+        // healed the pipeline) — decrementing twice would mask a real second
+        // pending compile on the same node.
+        if (owner && typeof owner === "object" && !backend.get(computePipeline).giOwnerCredited) {
           giPendingByNode.set(owner, Math.max(0, (giPendingByNode.get(owner) ?? 1) - 1));
         }
       });
@@ -461,9 +504,92 @@ function installAsyncComputePipelines(renderer) {
       device.createComputePipeline = rawDeviceCreate;
     }
   };
+  // ── §12.56 THE WATCHDOG: PENDING-FOREVER PIPELINES GET RE-ROLLED ──────────
+  //
+  // The skip-until-ready contract above assumes every createComputePipelineAsync
+  // eventually settles. §12.65.1 proved it doesn't: on some boots a pipeline's
+  // create promise stays pending for the LIFE OF THE PAGE (zero console errors,
+  // the pass skipped every frame — the irradiance filter read black for minutes
+  // while its pipeline sat "compiling"). Same family as the dead-[J] boots and
+  // the occluder-pipeline race. Root cause is a driver/Dawn nondeterminism this
+  // wrapper cannot see into — what it CAN do is notice the signature and re-ask.
+  //
+  // Detection is two-gated, both cheap, both from the skip path (a wedged
+  // pipeline is by definition being dispatched and skipped every frame):
+  //   · the pipeline's OWN create started > retryMs ago, AND
+  //   · no pipeline anywhere has settled for > retryMs (wave-quiet — during a
+  //     healthy boot wave settles land constantly, so queued-behind-others
+  //     never trips this; §13.4's 62s pathological compile keeps advancing the
+  //     clock for everyone else and its own retry costs one duplicate compile).
+  // The re-roll calls createComputePipelineAsync again with the ORIGINAL
+  // descriptor (module + layouts are alive — the pipeline cache retains them).
+  // If the original promise later lands anyway, last write wins and both
+  // pipelines are valid for the descriptor — correctness is unaffected.
+  //
+  // Every firing warns with the pass name (§13.14.8's stamps), which makes this
+  // the Dawn-error-scope instrument §12.56 asked for: a re-roll that REJECTS
+  // names the failing pipeline and surfaces the validation error the original
+  // create swallowed by never settling.
+  //
+  // `__giPipelineRetryMs` (default 6000) tunes the window; 0 disables.
+  const giMaybeRerollPipeline = (data) => {
+    if (!data.giDescriptor || data.giRetryInFlight) return;
+    if ((data.giRetries ?? 0) >= GI_PIPELINE_MAX_RETRIES) return;
+    const retryMs = Number(globalThis.__giPipelineRetryMs ?? 6000);
+    if (!(retryMs > 0)) return;
+    const now = performance.now();
+    const quietSince = now - Math.max(
+      data.giCreateT ?? 0,
+      giLastPipelineSettleT,
+      data.giLastRetryT ?? 0,
+    );
+    if (quietSince < retryMs) return;
+    data.giRetryInFlight = true;
+    data.giRetries = (data.giRetries ?? 0) + 1;
+    data.giLastRetryT = now;
+    const name = data.giTiming?.pass ?? data.giTiming?.label ?? "?";
+    console.warn(
+      `[gi] §12.56 WATCHDOG: compute pipeline "${name}" pending ` +
+        `${((now - (data.giCreateT ?? now)) / 1000).toFixed(1)}s ` +
+        `(${data.giSkips ?? 0} skipped dispatches, driver quiet ${(quietSince / 1000).toFixed(1)}s) ` +
+        `— re-rolling, attempt ${data.giRetries}/${GI_PIPELINE_MAX_RETRIES}`,
+    );
+    device.createComputePipelineAsync(data.giDescriptor).then(
+      (pipelineGPU) => {
+        giLastPipelineSettleT = performance.now();
+        if (data.pipeline) return; // original landed meanwhile — keep it
+        data.pipeline = pipelineGPU;
+        data.giDescriptor = null;
+        if (data.giTiming && data.giTiming.ms === null) {
+          data.giTiming.ms = performance.now() - (data.giCreateT ?? performance.now());
+          data.giTiming.rerolled = data.giRetries;
+        }
+        if (data.giOwner && typeof data.giOwner === "object" && !data.giOwnerCredited) {
+          data.giOwnerCredited = true;
+          giPendingByNode.set(data.giOwner, Math.max(0, (giPendingByNode.get(data.giOwner) ?? 1) - 1));
+        }
+        console.warn(`[gi] §12.56 WATCHDOG: re-roll landed — "${name}" live after ${data.giRetries} attempt(s)`);
+        const replay = data.giReplayNodes;
+        if (replay?.size) {
+          data.giReplayNodes = null;
+          for (const node of replay) renderer.compute(node);
+        }
+      },
+      (error) => {
+        giLastPipelineSettleT = performance.now();
+        // THE PRIZE LINE: the original create never surfaced this error — it
+        // just never settled. This names the pipeline AND the reason.
+        console.error(
+          `[gi] §12.56 WATCHDOG: re-roll for "${name}" REJECTED: ${error?.message ?? error}`,
+        );
+      },
+    ).finally(() => { data.giRetryInFlight = false; });
+  };
   backend.compute = function (computeGroup, computeNode, bindings, pipeline, dispatchSize) {
     const data = this.get(pipeline);
     if (!data.pipeline) {
+      data.giSkips = (data.giSkips ?? 0) + 1;
+      giMaybeRerollPipeline(data);
       if (giDispatchDepth > 0) giSkippedComputes.add(computeNode);
       else (data.giReplayNodes ??= new Set()).add(computeNode);
       return;
@@ -1248,6 +1374,12 @@ export class GISystem {
   dispose() {
     for (const unsub of this._unsubs) unsub?.();
     this._unsubs = [];
+    // Give the environment's material IBL back (§12.64) — only if the black
+    // node is still OURS; a user/script that replaced it keeps their node.
+    const scene = this.engine?.scene;
+    if (scene && this._envIblBlack && scene.environmentNode === this._envIblBlack) {
+      scene.environmentNode = null;
+    }
     this.#dispose();
     this.component = null;
   }
@@ -1320,6 +1452,46 @@ export class GISystem {
     // reads on screen as "the environment slider does nothing".
     if (this.state?.skyRadiance) {
       sceneSkyRadiance(this.engine?.scene, this.state.skyRadiance.value);
+    }
+    // ── THE ENVIRONMENT MUST NOT ALSO LIGHT MATERIALS DIRECTLY (§12.64) ──
+    // three applies `scene.environment` as per-material image-based light —
+    // diffuse `iblIrradiance` AND specular radiance, both UNOCCLUDED. With GI
+    // active that is a second, flat copy of the sky on every surface: the
+    // user's Sponza report, "adding environment fills the whole sponza with
+    // ambient", where enclosed corridors must stay dark. GI already carries
+    // the environment CORRECTLY — escaping rays return `sceneSkyRadiance`
+    // through the cascade transmittance, so sky reaches exactly what can see
+    // it. The seam is `scene.environmentNode`: when set to a node, three's
+    // `getEnvironmentNode` returns it INSTEAD of building one from
+    // `scene.environment` — which itself stays untouched for GI's sky read,
+    // Scene Settings and the background. A constant black node therefore
+    // removes the material-level IBL (both halves — at roughness 1 the
+    // specular half degenerates to a second ambient, so it must go too)
+    // without fighting any of the environment's writers. Polled per frame for
+    // the same reason the sky is: nothing notifies. Installed only while an
+    // environment EXISTS (a dummy node on an env-less scene would flip
+    // three's hasSceneEnvironment and dirty material cache keys for nothing);
+    // removed on dispose and only if still ours. `__giKeepIBL = true` is the
+    // escape hatch and the A/B arm.
+    {
+      const scene = this.engine?.scene;
+      if (scene) {
+        const keep = globalThis.__giKeepIBL === true;
+        const install = !keep && !!scene.environment;
+        if (install && !scene.environmentNode) {
+          this._envIblBlack ??= THREE.TSL.vec3(0, 0, 0);
+          scene.environmentNode = this._envIblBlack;
+          if (!this._envIblLogged) {
+            this._envIblLogged = true;
+            console.log(
+              "[gi] environment IBL suppressed — the environment lights the scene through GI only "
+              + "(occluded sky), not as flat per-material ambient. `__giKeepIBL = true` restores it.",
+            );
+          }
+        } else if (!install && this._envIblBlack && scene.environmentNode === this._envIblBlack) {
+          scene.environmentNode = null;
+        }
+      }
     }
     const bootStep = bootAmbientStep({
       enabled: this.config.bootAmbient === true
@@ -1476,6 +1648,43 @@ export class GISystem {
       // SRC's radiance memory (the sceneMotion closure below is its one
       // consumer).
       this._giLightLumMotion = lumMotion;
+    }
+    // ── §12.65: THE IRRADIANCE FILTER'S PER-FRAME INPUTS ─────────────────
+    // MUST run ABOVE the shadow block: both consumers copy LAST frame's VP
+    // out of `_giPrevVPStore` before it is overwritten with this frame's,
+    // and the shadow block is a store-writer. The weight is the ghosting
+    // control (see the pass's header): held high at rest and under CAMERA
+    // motion (reprojection handles that — the point of the filter), driven
+    // to zero by LIGHT motion — matrix, luminance or emitter, the α ramp's
+    // own family — because a light change stales history semantically in a
+    // way position validation cannot see. An open §12.43 window zeroes it
+    // too (a light EVENT just fired). `__giIrrHistWeight` pins it;
+    // `__giIrrTemporal = false` at build removes the chain entirely.
+    if (state.screen?.irrTemporalPass && this._giIrrHistWeightU) {
+      const camera = this.engine.camera;
+      if (camera) {
+        if (this._giPrevVPStore) this._giIrrPrevVPU.value.copy(this._giPrevVPStore);
+        // If the shadow block below is absent (analytic arm), this block
+        // owns the store update instead — exactly one writer per frame.
+        if (!(state.screen?.lightShadowPass && this._giShadowFrameU)) {
+          (this._giPrevVPStore ??= new THREE.Matrix4()).multiplyMatrices(
+            camera.projectionMatrix,
+            camera.matrixWorldInverse,
+          );
+        }
+      }
+      const pin = Number(globalThis.__giIrrHistWeight);
+      if (Number.isFinite(pin)) {
+        this._giIrrHistWeightU.value = Math.min(0.98, Math.max(0, pin));
+      } else {
+        const mLight = Math.min(1, Math.max(
+          (this._giShadowLastMotion ?? 0) / ALPHA_MOTION_SAT,
+          this._giEmitterLastMotion ?? 0,
+          (this._giLightLumMotion ?? 0) / ALPHA_MOTION_SAT,
+        ));
+        const windowOpen = (this._giTrackMotion ?? 0) > 0;
+        this._giIrrHistWeightU.value = windowOpen ? 0 : 0.9 * (1 - mLight);
+      }
     }
     // (Analytic-width arm: `_giShadowFrameU` is never created, the whole
     // block compiles out of the frame — no phase, no history weights.)
@@ -1914,6 +2123,13 @@ export class GISystem {
                   ]
                 : []),
               state.screen.resolve.compute,
+              // §12.65: the filter pair rides wherever the resolve rides —
+              // with the filter built, the resolve writes RAW and only the
+              // filter writes the texture materials sample; dropping it here
+              // would freeze `irradiance` for the whole idle/compile stride.
+              ...(state.screen.irrTemporalPass
+                ? [state.screen.irrTemporalPass.compute, state.screen.irrHistoryPass.compute]
+                : []),
               // The shadow pass is camera-dependent like the resolve — an
               // idle-frozen shadow texture would lag every camera move.
               ...(state.screen.lightShadowPass ? [state.screen.lightShadowPass.compute] : []),
@@ -1951,6 +2167,12 @@ export class GISystem {
       // source above (idle lists), and re-applying a Set is cheaper than
       // proving it never is.
       if (frameSkip.size) frameQueue = frameQueue.filter((node) => !frameSkip.has(node));
+      // (§12.65 pipeline priming lived here and is GONE: four shapes —
+      // in-tick batched, gated single-shot, task-context single-node,
+      // computeAsync — all fired and all failed to create the wedged
+      // pipeline from engine context, while the identical page-context
+      // dispatch worked 7/7 boots. The fail-safe resolve topology made the
+      // wedge cosmetic instead; the general §12.56 auto-retry stays filed.)
       // Guard the empty case: `__giFreeze = "all"` produces no computes, and
       // three's renderer.compute([]) throws "expects a ComputeNode".
       if (frameQueue.length) giCompute(renderer, frameQueue);
@@ -2097,6 +2319,11 @@ export class GISystem {
   }
 
   async #compileWave() {
+    // §12.66 BISECT HATCH: `__giNoCompileWave = true` skips the wave entirely
+    // (accepting the sync first-frame compile freeze it exists to prevent).
+    // Exists to answer "is the wave's compile-target/light-clone machinery
+    // what poisons the sun's shadow evaluation on fresh boots" with one boot.
+    if (globalThis.__giNoCompileWave === true) return;
     const engine = this.engine;
     const renderer = engine.renderer;
     if (!renderer?.compileAsync || !engine.camera || !engine.scene) return;
@@ -2116,6 +2343,9 @@ export class GISystem {
     if (compileTarget) {
       compileTarget.background = engine.scene.background;
       compileTarget.environment = engine.scene.environment;
+      // §12.64: the IBL-suppression node must be mirrored, or this warms
+      // env-textured shader variants the live scene will never render.
+      compileTarget.environmentNode = engine.scene.environmentNode;
       compileTarget.environmentIntensity = engine.scene.environmentIntensity;
       compileTarget.environmentRotation.copy(engine.scene.environmentRotation);
       compileTarget.fog = engine.scene.fog;
@@ -2655,6 +2885,34 @@ export class GISystem {
             }
           }),
         );
+        // ── THE DEAD-[J] WATCHDOG (§12.56 REFRAMED, 2026-08-14) ────────────
+        // An async COMPUTE pipeline that fails validation dispatches nothing
+        // and logs nothing (§12.44.1's shape), and when the casualty is [J]
+        // the whole frame's GI renders BLACK while every upstream counter
+        // stays healthy — measured on the mask-bisect rig at 3/4 masked and
+        // 1/4 DENSE boots, zero console errors on any of them. One async
+        // readback, once, after the wave settles; the signature is "rays
+        // attributed but [J] shaded nothing". A named error beats the worst
+        // silent failure this engine has; the auto-retry is filed, not built.
+        if (compileSucceeded) {
+          setTimeout(async () => {
+            try {
+              if (this._compileToken !== token) return;
+              const src = this.state?.screen?.srcProbes;
+              if (!src?.secondary || !this.engine?.renderer) return;
+              const s = await src.readStats(this.engine.renderer);
+              if ((s?.rays?.shaded ?? 0) > 1000 && (s?.rays?.secondaryHits ?? 0) === 0) {
+                console.error(
+                  "[gi] DEAD SHADING PASS — rays are tracing and attributing but [J] shaded " +
+                  "NOTHING this frame: an async compute pipeline failed validation silently and " +
+                  "GI is rendering black. Known nondeterministic compile race " +
+                  "(GI_SRC_REBUILD_PLAN §12.56); reload to re-roll the compile. " +
+                  `(shaded ${s.rays.shaded}, secondaryHits 0)`,
+                );
+              }
+            } catch { /* diagnostic only — the watchdog must never throw */ }
+          }, 5000);
+        }
       }
     }
   }
@@ -3650,7 +3908,67 @@ export class GISystem {
       inputs.gather = srcProbes?.gather
         ? (point, normal) => srcProbes.gather.gatherAt(point, normal).irradiance
         : null;
-      const resolve = createGiResolve({ gbuffer, targets, width, height, ...inputs });
+      // ── THE IRRADIANCE TEMPORAL FILTER (§12.65) ──────────────────────────
+      // DEFAULT ON since 2026-08-14 evening (`__giIrrTemporal = false` opts
+      // out). ÷12 on post-pan churn, ~0 still floor, LIGHT_STEP
+      // responsiveness holds (§12.65's receipts). The day it spent opt-in is
+      // a cautionary tale worth its comment: the "wedged pipeline / poisoned
+      // batch" postmortem that turned it off (§12.65.1) was REFUTED — every
+      // "output texture reads zero" datum came from the probes' own fresh
+      // copy kernels, whose FIRST dispatch installAsyncComputePipelines
+      // silently skips (the readback returns buffer zeros), and the
+      // "page-context dispatch unwedges it" legend was those probes healing
+      // their own instrument. The §12.56 watchdog's ledger settled it: on
+      // every boot examined the pair's pipelines compiled in 0.4-1.7 s,
+      // zero re-rolls, zero pending. Verified default-on: 2 fresh pose-set
+      // boots lit (meanLum 0.437, ledger clean) + smoke:gi-gpu. The general
+      // §12.56 watchdog stays as insurance for the classes that ARE real
+      // (dead-[J], occluder, emitter-seat streaming).
+      const irrTemporalOn = globalThis.__giIrrTemporal !== false;
+      if (irrTemporalOn) {
+        targets.ensureIrradianceTemporal?.();
+        this._giIrrPrevVPU ??= uniform(new THREE.Matrix4()).setGroup(renderGroup);
+        this._giIrrHistWeightU ??= uniform(0).setGroup(renderGroup);
+      }
+      const resolve = createGiResolve({
+        gbuffer,
+        targets,
+        rawCopy: irrTemporalOn ? targets.irradianceRaw : null,
+        width,
+        height,
+        ...inputs,
+      });
+      const irrTemporalPass = irrTemporalOn
+        ? createGiIrradianceTemporalPass({
+            gbuffer,
+            source: targets.irradianceRaw,
+            target: targets.irradiance,
+            histIrr: targets.irradianceHist,
+            histPos: targets.irradianceHistPos,
+            width,
+            height,
+            history: {
+              prevViewProj: this._giIrrPrevVPU,
+              weight: this._giIrrHistWeightU,
+              validEps: inputs.lightShadow?.voxMax ?? 0.15,
+            },
+          })
+        : null;
+      // History snapshot — the shadow chain's own pass, reused verbatim: it
+      // copies (source → histShadow, gbuffer position → histPos) and the
+      // irradiance chain needs exactly that at 1:1 scale.
+      const irrHistoryPass = irrTemporalOn
+        ? createGiLightShadowHistoryPass({
+            gbuffer,
+            source: targets.irradiance,
+            histShadow: targets.irradianceHist,
+            histPos: targets.irradianceHistPos,
+            width,
+            height,
+            resolveWidth: width,
+            resolveHeight: height,
+          })
+        : null;
       // The shadow trace as its own pass at its own budget — see
       // createGiLightShadowPass for why it left the resolve kernel.
       // Temporal-accumulation uniforms, persistent across rebuilds/resizes
@@ -4010,7 +4328,7 @@ export class GISystem {
         this.engine.scene.add(srcProbes.gizmos.group);
         srcProbes.gizmos.setVisible(giDebugView() === "src-probes");
       }
-      return { gbuffer, srcProbes, resolve, lightShadowPass, lightShadowFilterPass, lightShadowWidePass, lightShadowWidePass2, lightShadowHistoryPass, lightShadowPostPass, emitterShadowPass, emitterShadowFilterPass, emitterShadowHistoryPass, emitterShadowPostPass, emitterShadowWidePass, emitterShadowWidePass2, targets, width, height, shadowWidth: shadowW, shadowHeight: shadowH, emitterShadowWidth: emitterW, emitterShadowHeight: emitterH, ...inputs };
+      return { gbuffer, srcProbes, resolve, irrTemporalPass, irrHistoryPass, lightShadowPass, lightShadowFilterPass, lightShadowWidePass, lightShadowWidePass2, lightShadowHistoryPass, lightShadowPostPass, emitterShadowPass, emitterShadowFilterPass, emitterShadowHistoryPass, emitterShadowPostPass, emitterShadowWidePass, emitterShadowWidePass2, targets, width, height, shadowWidth: shadowW, shadowHeight: shadowH, emitterShadowWidth: emitterW, emitterShadowHeight: emitterH, ...inputs };
     } catch (error) {
       // Falling back to the in-material path keeps GI working (slowly) rather
       // than rendering an unlit scene.
@@ -4092,6 +4410,8 @@ export class GISystem {
     // resize on that arm must re-materialize them before the pass rebuilds
     // below bind them (the history pass's existence records the arm).
     if (screen.lightShadowHistoryPass) screen.targets.ensureShadowTemporal?.();
+    // §12.65: same re-materialization contract for the irradiance trio.
+    if (screen.irrTemporalPass) screen.targets.ensureIrradianceTemporal?.();
     this._giTargets = screen.targets;
     this._giTargetSize = { width, height };
     this._giIrradianceNode.value = screen.targets.irradiance;
@@ -4157,6 +4477,9 @@ export class GISystem {
     screen.resolve = createGiResolve({
       gbuffer: screen.gbuffer,
       targets: screen.targets,
+      // §12.65 fail-safe contract, same as the build: the resolve writes
+      // irradiance itself and the filter overwrites when alive.
+      rawCopy: screen.irrTemporalPass ? screen.targets.irradianceRaw : null,
       width,
       height,
       gather: screen.gather,
@@ -4174,6 +4497,53 @@ export class GISystem {
     if (index >= 0) state.queue[index] = screen.resolve.compute;
     if (indexNoFeedback >= 0) state.queueNoFeedback[indexNoFeedback] = screen.resolve.compute;
     if (indexFeedbackOnly >= 0) state.queueFeedbackOnly[indexFeedbackOnly] = screen.resolve.compute;
+    // §12.65: the irradiance temporal pair follows the resolve's own
+    // rebuild+splice contract — fresh targets at the new size, queue
+    // positions preserved so they stay BEHIND the resolve they consume.
+    if (screen.irrTemporalPass) {
+      const oldIrr = screen.irrTemporalPass.compute;
+      const oldIrrHist = screen.irrHistoryPass.compute;
+      const irrIndexes = [
+        state.queue.indexOf(oldIrr),
+        state.queueNoFeedback.indexOf(oldIrr),
+        state.queueFeedbackOnly?.indexOf(oldIrr) ?? -1,
+      ];
+      const irrHistIndexes = [
+        state.queue.indexOf(oldIrrHist),
+        state.queueNoFeedback.indexOf(oldIrrHist),
+        state.queueFeedbackOnly?.indexOf(oldIrrHist) ?? -1,
+      ];
+      screen.irrTemporalPass = createGiIrradianceTemporalPass({
+        gbuffer: screen.gbuffer,
+        source: screen.targets.irradianceRaw,
+        target: screen.targets.irradiance,
+        histIrr: screen.targets.irradianceHist,
+        histPos: screen.targets.irradianceHistPos,
+        width,
+        height,
+        history: {
+          prevViewProj: this._giIrrPrevVPU,
+          weight: this._giIrrHistWeightU,
+          validEps: screen.lightShadow?.voxMax ?? 0.15,
+        },
+      });
+      screen.irrHistoryPass = createGiLightShadowHistoryPass({
+        gbuffer: screen.gbuffer,
+        source: screen.targets.irradiance,
+        histShadow: screen.targets.irradianceHist,
+        histPos: screen.targets.irradianceHistPos,
+        width,
+        height,
+        resolveWidth: width,
+        resolveHeight: height,
+      });
+      if (irrIndexes[0] >= 0) state.queue[irrIndexes[0]] = screen.irrTemporalPass.compute;
+      if (irrIndexes[1] >= 0) state.queueNoFeedback[irrIndexes[1]] = screen.irrTemporalPass.compute;
+      if (irrIndexes[2] >= 0) state.queueFeedbackOnly[irrIndexes[2]] = screen.irrTemporalPass.compute;
+      if (irrHistIndexes[0] >= 0) state.queue[irrHistIndexes[0]] = screen.irrHistoryPass.compute;
+      if (irrHistIndexes[1] >= 0) state.queueNoFeedback[irrHistIndexes[1]] = screen.irrHistoryPass.compute;
+      if (irrHistIndexes[2] >= 0) state.queueFeedbackOnly[irrHistIndexes[2]] = screen.irrHistoryPass.compute;
+    }
     // Emitter shadow pass + filter follow the same rebuild+splice contract
     // (fresh targets at the new sizes; queue positions preserved so they
     // stay AHEAD of the resolve that samples them).
@@ -4672,11 +5042,24 @@ export class GISystem {
 
   /**
    * Whether the exact-reflection prepass restricts itself to mirror pixels.
-   * On by default — the dense arm exists only as the A/B for the harness and
-   * as an escape hatch if a scene's mirror tagging ever proves wrong (the
-   * failure mode would be a reflective surface whose material bucket the
-   * collect walk didn't classify: it loses its exact reflection and falls
-   * back to the cascade lookup, rather than rendering wrong).
+   * ⚠ STILL OPT-IN (`__giBvhMask = true`), and deliberately so — but not for
+   * the reason the original comment claimed ("on by default"; the code has
+   * read `=== true` since 2026-08-04, the `__giSrcSecondary` polarity trap).
+   * 2026-08-13 findings, in order:
+   *   1. Masked mode was UNSHIPPABLE regardless of the gate: nothing ever
+   *      tagged meshes into GI_MIRROR_LAYER, so the mask pass drew nothing
+   *      and masked mode silently killed exact reflections. #collectMeshes
+   *      tags bucket-0/3 meshes now — that half is fixed and harmless under
+   *      dense (nothing reads normal.w there).
+   *   2. With tagging in place the flip was tried and REVERTED same-day:
+   *      masked boots render a broken frame on the enclosed mirror rig
+   *      (`MIRROR=1 run-gi-emissive-cost.mjs` — white/black split where the
+   *      dense arm lights correctly), and stopping the mask pass live does
+   *      NOT recover the frame (scripts/run-gi-mask-bisect.mjs), so the
+   *      fault is on the masked-prepass/consumption side, not the second
+   *      gbuffer render. Diagnose with that rig before re-attempting the
+   *      flip; the prize is real (mask alone halved the emitters×reflections
+   *      resolve term: Δ +9.35 → +4.37 ms on the rig).
    */
   #bvhMaskEnabled() {
     return globalThis.__giBvhMask === true;
@@ -5012,6 +5395,11 @@ export class GISystem {
   }
 
   #rebuild() {
+    // §12.66 BISECT HATCH: `__giOff = true` keeps GI from ever building —
+    // no gbuffer nested renders, no light-shadow node swaps, no compile
+    // wave, no GI light. One boot answers "is ANY GI boot path what breaks
+    // the sun's shadow evaluation".
+    if (globalThis.__giOff === true) return;
     this.#dispose();
     const component = this.component;
     const engine = this.engine;
@@ -5182,6 +5570,56 @@ export class GISystem {
     });
     // Entries + slot assignment + emitter promotion + SDF load-or-bake.
     const entries = this.#buildEntries(meshes);
+
+    // ── LIGHT TREE W1 (§12.62): BUILD + UPLOAD, NO CONSUMER YET ───────────
+    // AFTER #buildEntries (it stashes the candidate meshes) and after the
+    // occupancy build (it created `_dynSet`, whose bump allocator and staging
+    // queue this rides — the same ones the static shadow BVH just used, so
+    // the region can never overlap the BVH blocks or the card tables). The
+    // first draft lived inside #buildOccupancyField and never ran: the field
+    // builds BEFORE the entries walk, so `_emitterCands` was always null
+    // there — the W1 gate's "no __giLightTreeLive" FAIL is what caught it.
+    // Consumers arrive with W2/W3; until then the only readers are the gate
+    // (`run-gi-lighttree-upload.mjs`) and the publish below. Instanced
+    // emitters are still absent (the seat candidate walk excludes them — its
+    // slots cannot represent instances); W3's collection revisits that.
+    this._lightTreeRegion = null;
+    globalThis.__giLightTreeLive = null;
+    if (globalThis.__giLightTree !== false && this._dynSet && this._emitterCands?.length) {
+      try {
+        const treeEmitters = collectEmitters(
+          this._emitterCands.map((c) => c?.mesh).filter(Boolean),
+        );
+        const tree = treeEmitters.length ? buildLightTree(treeEmitters) : null;
+        if (tree) {
+          const region = this._dynSet.allocPoolWords(tree.words.length);
+          if (region) {
+            this._dynSet.queueRegionUpload(region.abs, tree.words);
+            this._lightTreeRegion = {
+              abs: region.abs,
+              rel: region.rel,
+              words: tree.words.length,
+              emitterCount: tree.emitterCount,
+              nodeCount: tree.nodeCount,
+              totalPower: tree.totalPower,
+              maxDepth: tree.maxDepth,
+            };
+            // The §12.42 rule: a derived number nothing prints is a number
+            // probes will guess. The W1 gate reads this to find the region.
+            globalThis.__giLightTreeLive = { ...this._lightTreeRegion };
+            console.log(
+              `[gi] light tree: ${tree.emitterCount} emitters / ${tree.nodeCount} nodes, ` +
+                `${((tree.words.length * 4) / 1024).toFixed(1)}KB at pool word ${region.rel} ` +
+                "(UNWIRED — §12.62 W1; `__giLightTree = false` skips the build)",
+            );
+          }
+        }
+      } catch (err) {
+        // Non-fatal by design: nothing consumes the tree yet, so a build
+        // failure must never cost the rebuild it rides along with.
+        console.warn(`[gi] light tree build failed (non-fatal, unwired): ${err?.message ?? err}`);
+      }
+    }
 
     // Per-frame analytic direct light: fixed uniform slots. Light moves/edits
     // update uniforms only, so no kernel gains a binding and nothing rebuilds.
@@ -5469,6 +5907,17 @@ export class GISystem {
       // split — it is 0.1ms and skipping it would stall GI against camera
       // motion, which is the one thing measurement says is currently free.
       queueFeedbackOnly.push(screen.resolve.compute);
+      // §12.65: filter then history snapshot, IMMEDIATELY after the resolve
+      // whose raw output they consume — every queue the resolve rides, for
+      // the same camera-dependence reason. Order is the contract: the
+      // snapshot reads the FILTERED irradiance and must not race the filter
+      // (the shadow chain's history pass carries the same rule).
+      if (screen.irrTemporalPass) {
+        const irrChain = [screen.irrTemporalPass.compute, screen.irrHistoryPass.compute];
+        queue.push(...irrChain);
+        queueNoFeedback.push(...irrChain);
+        queueFeedbackOnly.push(...irrChain);
+      }
       // The shadow pass is camera-dependent the same way (it reads the
       // per-frame gbuffer), so it rides every half too.
       if (screen.lightShadowPass) {
@@ -6038,6 +6487,21 @@ export class GISystem {
       const light = lights[i];
       if (!light?.shadow || light.userData?.giShadowMode !== "gi") continue;
       claimed.add(light);
+      // ONE line, once, at the moment the feature turns on — because what it
+      // costs is invisible and large. Measured live (Sponza, ultra, 1783×897
+      // shadow channel, RTX 4070): the trace alone is ~29 ms GPU/frame, which
+      // reads as "gi shadow mode broke my editor" unless something says the
+      // price out loud. Half-res tiers (low/medium/high) pay a quarter of it.
+      if (!this._loggedLightShadowClaim) {
+        this._loggedLightShadowClaim = true;
+        const w = state.screen?.shadowWidth ?? 0;
+        const h = state.screen?.shadowHeight ?? 0;
+        console.info(
+          `[gi] "${light.name || "light"}" now uses gi-traced shadows: ${w}×${h} px marched per frame — ` +
+            "the most expensive GI screen pass. If fps drops, lower GI quality (halves the traced pixels) " +
+            'or set the light back to Shadow Source "map".',
+        );
+      }
       maxClaimedAngle = Math.max(maxClaimedAngle, light.userData?.giSourceAngle ?? 0);
       const entry = this.#acquireLightShadowNode(light);
       entry.mask.value.set(i === 0 ? 1 : 0, i === 1 ? 1 : 0, i === 2 ? 1 : 0, i === 3 ? 1 : 0);
@@ -6502,22 +6966,16 @@ export class GISystem {
 
     // Emitter promotion: qualify by PEAK radiance ≥ 0.5 (see the `peak` note
     // in #buildEntries — luminance rejected saturated red/blue lamps that are
-    // every bit as bright as the white ones it accepted), rank by emitted
-    // POWER (luminance · world radius²) — a large dim panel outshines a tiny
-    // bright trinket, and the slots should go to the lamps that actually
-    // light the scene.
+    // every bit as bright as the white ones it accepted), rank by APPARENT
+    // brightness — emitted power over 1+d² to the active camera
+    // (#chooseEmitterSeats). Raw power alone let the four highest-power lamps
+    // ANYWHERE in the scene hold every seat forever, which the user read as
+    // "after 3-4 emissives the rest do not emit any light" (2026-08-13): an
+    // un-promoted lamp only glows through the field (~17% of the energy,
+    // lightTree.js header), so next to a promoted neighbour it looks OFF.
     this._emitterInfos = [];
+    this._emitterCands = null;
     if (this.config.emissiveShadows !== false) {
-      const scratch = new THREE.Vector3();
-      const powerOf = (entry) => {
-        const geometry = entry.mesh.geometry;
-        if (!geometry.boundingSphere) geometry.computeBoundingSphere();
-        entry.mesh.getWorldScale(scratch);
-        const radius =
-          (geometry.boundingSphere?.radius ?? 0.1) *
-          Math.max(Math.abs(scratch.x), Math.abs(scratch.y), Math.abs(scratch.z));
-        return entry.luminance * Math.max(radius * radius, 1e-4);
-      };
       // ONE emitter per MESH. An emitter slot is described by its mesh's own
       // world transform (`#refreshEmitterSlots` reads `mesh.matrixWorld`), so
       // an InstancedMesh's instances would all promote to the same box at the
@@ -6537,57 +6995,11 @@ export class GISystem {
         seenEmitterMesh.add(cand.mesh);
         bright.push(cand);
       }
-      bright.sort((a, b) => powerOf(b) - powerOf(a));
-      if (bright.length > MAX_EMITTERS && !this._warnedEmitterBudget) {
-        this._warnedEmitterBudget = true;
-        console.warn(`[gi] ${bright.length} bright emitters; analytic slots cover the brightest ${MAX_EMITTERS}`);
-      }
-      // ── STICKY SEATS (2026-08-08, the cannonball scene). Slots are
-      // POSITIONAL (#refreshEmitterSlots maps infos[i] → slot i), and the
-      // seat list used to be rebuilt from the power ranking on every
-      // fingerprint scan. With 24 identical strength-100 projectiles the
-      // ranking is a 24-way tie, so which four won — and in which order —
-      // changed per scan: every flip re-surfaced an atlas slot (a composite),
-      // re-posed a slot (moved = 1 → an EMA history cut where its light
-      // lands), and re-aimed the emitter-shadow channel. An incumbent now
-      // keeps its seat AND its index until it dims, despawns, or a
-      // challenger out-powers it by 1.5× — so identical lamps turn over at
-      // despawn cadence, never at scan cadence.
-      const byMesh = new Map();
-      for (const cand of bright) byMesh.set(cand.mesh, cand);
-      const prevSeats = this._promotedEmitterMeshes ?? [];
-      const chosen = new Array(MAX_EMITTERS).fill(null);
-      const taken = new Set();
-      for (let i = 0; i < MAX_EMITTERS; i++) {
-        const cand = prevSeats[i] ? byMesh.get(prevSeats[i]) : null;
-        if (cand && !taken.has(cand.mesh)) {
-          chosen[i] = cand;
-          taken.add(cand.mesh);
-        }
-      }
-      for (const cand of bright) {
-        if (taken.has(cand.mesh)) continue;
-        const hole = chosen.indexOf(null);
-        if (hole !== -1) {
-          chosen[hole] = cand;
-          taken.add(cand.mesh);
-          continue;
-        }
-        let weakestAt = -1;
-        let weakestPower = Infinity;
-        for (let i = 0; i < MAX_EMITTERS; i++) {
-          const p = powerOf(chosen[i]);
-          if (p < weakestPower) {
-            weakestPower = p;
-            weakestAt = i;
-          }
-        }
-        if (weakestAt !== -1 && powerOf(cand) > weakestPower * 1.5) {
-          taken.delete(chosen[weakestAt].mesh);
-          chosen[weakestAt] = cand;
-          taken.add(cand.mesh);
-        }
-      }
+      // Stashed for the camera-cadence re-rank in #checkFingerprint: the
+      // score depends on the camera and the camera never touches the mesh
+      // fingerprint, so seat-following has to be driven from the scan loop.
+      this._emitterCands = bright;
+      const chosen = this.#chooseEmitterSeats(bright);
       this._promotedEmitterMeshes = chosen.map((cand) => cand?.mesh ?? null);
       for (const cand of chosen) {
         if (cand) cand.promoted = true;
@@ -6614,6 +7026,105 @@ export class GISystem {
       }
     }
     return entries;
+  }
+
+  /**
+   * Seat selection for the MAX_EMITTERS analytic slots — shared by
+   * #buildEntries and the camera-cadence re-rank in #checkFingerprint.
+   *
+   * Score is APPARENT brightness: emitted power (luminance · world radius² —
+   * a large dim panel still outshines a tiny bright trinket) over 1+d² to
+   * the active camera. That is the ordering a viewer perceives, so seats
+   * follow the player instead of being owned forever by the four
+   * highest-power lamps anywhere in the scene. No camera (headless
+   * harnesses) = raw power, the old deterministic ordering.
+   *
+   * ── STICKY SEATS (2026-08-08, the cannonball scene). Slots are POSITIONAL
+   * (#refreshEmitterSlots maps infos[i] → slot i), and the seat list used to
+   * be rebuilt from the ranking on every fingerprint scan. With 24 identical
+   * strength-100 projectiles the ranking is a 24-way tie, so which four won —
+   * and in which order — changed per scan: every flip re-surfaced an atlas
+   * slot (a composite), re-posed a slot (moved = 1 → an EMA history cut where
+   * its light lands), and re-aimed the emitter-shadow channel. An incumbent
+   * keeps its seat AND its index until it dims, despawns, or a challenger
+   * out-SCORES it by 1.5× — on the camera-relative score that ratio is
+   * hysteresis in distance too, so walking past identical lamps turns seats
+   * over at door-to-door cadence, never per scan.
+   *
+   * READ-ONLY on sticky state: reads _promotedEmitterMeshes, never writes it
+   * (the caller does) — so the re-rank can ask "would the seats change?"
+   * without committing.
+   */
+  #chooseEmitterSeats(bright) {
+    const camera = this.engine.camera;
+    const camPos = camera ? new THREE.Vector3().setFromMatrixPosition(camera.matrixWorld) : null;
+    const scratch = new THREE.Vector3();
+    const pos = new THREE.Vector3();
+    const score = new Map();
+    for (const cand of bright) {
+      const geometry = cand.mesh?.geometry;
+      // A mesh disposed between scans scores 0 rather than throwing — the
+      // scan that notices the disposal rebuilds the candidate list anyway.
+      if (!geometry) {
+        score.set(cand, 0);
+        continue;
+      }
+      if (!geometry.boundingSphere) geometry.computeBoundingSphere();
+      cand.mesh.getWorldScale(scratch);
+      const radius =
+        (geometry.boundingSphere?.radius ?? 0.1) *
+        Math.max(Math.abs(scratch.x), Math.abs(scratch.y), Math.abs(scratch.z));
+      const power = cand.luminance * Math.max(radius * radius, 1e-4);
+      if (!camPos) {
+        score.set(cand, power);
+        continue;
+      }
+      pos.setFromMatrixPosition(cand.mesh.matrixWorld);
+      score.set(cand, power / (1 + camPos.distanceToSquared(pos)));
+    }
+    bright.sort((a, b) => score.get(b) - score.get(a));
+    if (bright.length > MAX_EMITTERS && !this._warnedEmitterBudget) {
+      this._warnedEmitterBudget = true;
+      console.warn(
+        `[gi] ${bright.length} bright emitters; analytic slots cover the ${MAX_EMITTERS} most apparent (power/d² to the camera, re-ranked as it moves) — the rest emit through the field only`,
+      );
+    }
+    const byMesh = new Map();
+    for (const cand of bright) byMesh.set(cand.mesh, cand);
+    const prevSeats = this._promotedEmitterMeshes ?? [];
+    const chosen = new Array(MAX_EMITTERS).fill(null);
+    const taken = new Set();
+    for (let i = 0; i < MAX_EMITTERS; i++) {
+      const cand = prevSeats[i] ? byMesh.get(prevSeats[i]) : null;
+      if (cand && !taken.has(cand.mesh)) {
+        chosen[i] = cand;
+        taken.add(cand.mesh);
+      }
+    }
+    for (const cand of bright) {
+      if (taken.has(cand.mesh)) continue;
+      const hole = chosen.indexOf(null);
+      if (hole !== -1) {
+        chosen[hole] = cand;
+        taken.add(cand.mesh);
+        continue;
+      }
+      let weakestAt = -1;
+      let weakestScore = Infinity;
+      for (let i = 0; i < MAX_EMITTERS; i++) {
+        const s = score.get(chosen[i]) ?? 0;
+        if (s < weakestScore) {
+          weakestScore = s;
+          weakestAt = i;
+        }
+      }
+      if (weakestAt !== -1 && (score.get(cand) ?? 0) > weakestScore * 1.5) {
+        taken.delete(chosen[weakestAt].mesh);
+        chosen[weakestAt] = cand;
+        taken.add(cand.mesh);
+      }
+    }
+    return chosen;
   }
 
   /** Slot surface for an entry: promoted emitters composite ZERO emissive. */
@@ -6939,6 +7450,7 @@ export class GISystem {
         // as "node-driven" — see #markObservedMaterial. GI light receivers
         // include meshes the FIELD skips (transparent etc.), so mark all.
         const mats = Array.isArray(object.material) ? object.material : [object.material];
+        let readsReflection = false;
         for (const m of mats) {
           // Volume materials shade through a scattering model with no
           // irradiance slot (see GICascadeLightNode.setup) — marking them
@@ -6948,10 +7460,25 @@ export class GISystem {
           this.#markObservedMaterial(m);
           this.#refreshMirrorBucket(m);
           const bucket = m ? giRoughnessBucketOf(m) : 2;
+          if (bucket === 0 || bucket === 3) readsReflection = true;
           if (m && !seenMaterials.has(m)) {
             seenMaterials.add(m);
             tally[bucket]++;
           }
+        }
+        // The missing half of the mirror mask: buckets 0/3 are the shaders
+        // that read `bvhShade`, and the gbuffer's mask pass draws exactly the
+        // GI_MIRROR_LAYER set (renderGiGBuffer) — so tag it here, where the
+        // bucket is already in hand. Without this the mask pass drew NOTHING,
+        // so `__giBvhMask = true` silently disabled exact reflections instead
+        // of restricting them. Harmless under the dense default (nothing
+        // reads normal.w there), and a tag that goes stale (material leaves
+        // the bucket, no rebuild runs) costs extra traced pixels, never a
+        // wrong image. ⚠ Masked mode itself is still NOT default — see
+        // #bvhMaskEnabled for the open visual bug and the rig that shows it.
+        if (!editorOnly) {
+          if (readsReflection) object.layers.enable(GI_MIRROR_LAYER);
+          else object.layers.disable(GI_MIRROR_LAYER);
         }
         // A volume's bounding box is a participating medium, not a surface —
         // baking it into the SDF field would make a fog box shadow the room
@@ -7138,6 +7665,21 @@ export class GISystem {
     const meshes = this.#collectMeshes();
     // Refresh the light LIST here (cadence); uniforms read live per frame.
     this._lightObjects = this.#collectLightObjects();
+    // Camera-cadence emitter seat re-rank. The seat score is apparent
+    // brightness (power/d² to the active camera — #chooseEmitterSeats) and a
+    // camera move never touches the mesh fingerprint, so an over-budget
+    // scene must re-ask the seating question here, every scan. When the
+    // answer changes, drop the fingerprint so THIS scan falls through to the
+    // full reconcile and the flip rides the sanctioned path (slot
+    // re-surface → atlas revision → composite, EMA cut). The chooser's 1.5×
+    // hysteresis keeps walk-through turnover at door-to-door cadence.
+    if ((this._emitterCands?.length ?? 0) > MAX_EMITTERS) {
+      const seats = this.#chooseEmitterSeats(this._emitterCands);
+      const current = this._promotedEmitterMeshes ?? [];
+      if (seats.some((cand, i) => (cand?.mesh ?? null) !== (current[i] ?? null))) {
+        this._fingerprint = null;
+      }
+    }
     const fingerprint = this.#computeFingerprint(meshes);
     if (fingerprint === this._fingerprint) return;
     this._fingerprint = fingerprint;

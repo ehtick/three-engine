@@ -294,7 +294,22 @@ for (const arm of arms) {
     const p = await call("profile.giPasses", { samples: 6 });
     const src = p.value?.srcProbes;
     const groups = src?.groupMs ?? {};
-    const deposit = groups["deposit (trace + shade)"]?.ms ?? null;
+    // "The deposit" is not one group name across builds: the un-split kernel
+    // reports "deposit (trace + shade)", §12.53's [J] split reports
+    // decay+trace / shade+bounce / resolve as separate groups, and §12.59.2's
+    // seed splits the decay off again. Sum every group that is part of the
+    // trace-and-deposit story so the column survives regrouping — and print
+    // the group table once per arm so a future rename is visible instead of
+    // silently reading null.
+    const depositKeys = Object.keys(groups).filter((k) =>
+      /^deposit|^shade \+ bounce|^seed/.test(k));
+    const deposit = depositKeys.length
+      ? Number(depositKeys.reduce((s, k) => s + (groups[k]?.ms ?? 0), 0).toFixed(3))
+      : null;
+    if (Object.keys(groups).length) {
+      console.log(`      · groups: ${Object.entries(groups)
+        .map(([k, v]) => `${k} ${v?.ms?.toFixed?.(2) ?? "?"}ms`).join(" | ")}`);
+    }
     const live = (src?.cascades ?? []).reduce((n, c) => n + c.live, 0) || null;
     const resolvePx = (p.value?.pixels?.resolve ?? []).join("x");
     if (!src) console.log(`      · profile.giPasses returned no srcProbes — ${p.error ?? "(no error)"}`);

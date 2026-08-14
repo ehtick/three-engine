@@ -173,12 +173,23 @@ export const TEMPORAL_ALPHA = 0.1;
  * The still-scene shimmer is VARIANCE (it falls monotonically with α); the
  * rising per-change p95 is the counted set shrinking to the sparse structural
  * events α cannot touch (§12.24's bin-membership floor — a separate, named
- * debt). 0.05 rather than 0.02 because the still floor still governs how fast
- * a light TOGGLE converges (intensity changes are invisible to the motion
- * signal): ~1 s at 0.05 and stride 3 against ~2.5 s at 0.02. The extra 2.9× is
- * headroom for when an intensity-delta joins the motion signal.
+ * debt).
+ *
+ * 0.05 → 0.02 (2026-08-14, §12.60): the sweep shipped 0.05 rather than 0.02
+ * because the still floor then governed how fast a light TOGGLE converged —
+ * "intensity changes are invisible to the motion signal", ~1 s at 0.05 vs
+ * ~2.5 s at 0.02, and the extra 2.9× was explicitly banked as "headroom for
+ * when an intensity-delta joins the motion signal". §12.43 then built exactly
+ * that: the tracking window ARMS on light events (its `lightLum` term — the
+ * LIGHT_STEP harness drives a real intensity step through the prop path and
+ * watches the window arm), so a toggle now converges at the WINDOW's rate
+ * whatever the still floor is, and the banked headroom is spendable. The user
+ * report it buys: "in darker areas it is very flickering" AT REST — the dark
+ * pixels are where relative variance is largest, and the still floor is the
+ * variance dial (÷2.9 more at 0.02, the table above). The LIGHT_STEP arm is
+ * the regression gate for the trade this reverses.
  */
-export const TEMPORAL_ALPHA_STILL = 0.05;
+export const TEMPORAL_ALPHA_STILL = 0.02;
 
 /**
  * The motion at which the α ramp saturates at TEMPORAL_ALPHA — derived from
@@ -188,6 +199,125 @@ export const TEMPORAL_ALPHA_STILL = 0.05;
  * ~5.3 cm/frame mover translation.
  */
 export const ALPHA_MOTION_SAT = (0.94 - 0.86) / 30;
+
+/**
+ * ══ THE REST CADENCE — FEWER RAYS WHEN NOTHING NEEDS THEM (§12.61) ══════════
+ *
+ * The §12.57 attribution named the SRC chain's cost pole and the cost-probe
+ * fit put a number on it: `deposit ms ≈ 3.7 floor + 42.2 ns × rays` — RAYS are
+ * 71% of the deposit at ultra, and the ray budget is preset-independent in
+ * exactly the way the user's "lower presets don't help" reads. The still floor
+ * moving to α 0.02 (§12.60) is what makes a cut affordable: a parked scene now
+ * accumulates ~50 frames of evidence, so HALF the rays per frame reach the
+ * same steady state with a √2 variance cost that §12.60's ÷2.9 dwarfs.
+ *
+ * So at REST the transport ceiling scales by this fraction (stride widens, the
+ * R2 phase still covers every pixel, the decay's stride ROOT follows the real
+ * refresh rate automatically). "Rest" is the same signal family every other
+ * responsiveness mechanism already rides — the α motion ramp, the §12.43
+ * tracking window, and camera recency — so ANY of scene motion, an open light
+ * window, or a recent camera move restores the full budget continuously, and
+ * the machinery that made those signals honest (rising-edge arming, peak
+ * holds) is inherited rather than re-derived.
+ *
+ * `__giSrcRestCadence = false` opts out; `__giSrcRestFraction` is the live
+ * dial; a pinned `__giSrcTransportRays` is an instrument and is never scaled.
+ */
+export const REST_TRANSPORT_FRACTION = 0.5;
+/** How long after the last camera move the full budget holds (ms). */
+export const REST_CAM_HOLD_MS = 600;
+/** Full budget for this long after a BUILD — the initial fill from black is
+ *  the one convergence the seed cannot prior (no parents exist yet) and the
+ *  camera term only buys ~1 s. Fades on the same REST_CAM_FADE_MS ramp. */
+export const REST_BOOT_HOLD_MS = 3000;
+/** And how long it then FADES back to the rest fraction (ms) — a step in ray
+ *  budget on the frame a pan ends would be R1's cliff in miniature. */
+export const REST_CAM_FADE_MS = 400;
+
+/**
+ * ══ THE CAMERA-SETTLE α FLOOR — RE-EQUILIBRATION, NOT STALENESS (§12.63) ═════
+ *
+ * ALPHA_STILL's doc says "a camera move stales nothing", and that stays true —
+ * no accumulated evidence becomes WRONG when the view turns. But the Sponza
+ * pan probes (2026-08-14, `run-gi-sponza-*`) measured the half the rig never
+ * showed: the transport is SCREEN-DRIVEN (rays walk out of gbuffer pixels), so
+ * the set of surface points feeding each probe is view-dependent, and a pan
+ * shifts every probe's estimator equilibrium a little. At α 0.02 the whole
+ * field then crawls to its new equilibrium over ~50 frames IN FULL VIEW:
+ * post-pan holds measured 2.4 rev/px/s against a 0.155 parked floor (16×),
+ * with the churn heatmap UNIFORM over lit content — not the pan's leading
+ * edge — and every capacity/cold-start suspect acquitted by the stats dump
+ * (hash load 1–2%, noBlock 0, ~30 fresh probes/frame, seed live). The §12.59.3
+ * seed still earns its keep at the edges: seed-off measured 3.5 rev/px/s and
+ * 4.5× the hot-pixel population on the same holds.
+ *
+ * So α rides the SAME camera-recency envelope the rest cadence already runs
+ * (REST_CAM_HOLD_MS + REST_CAM_FADE_MS): floored at this value while the
+ * camera moves and through the hold, fading back to ALPHA_STILL after. 0.05
+ * is yesterday's shipped still value — during-pan behaviour returns to what
+ * every earlier build showed, it simply stops OUTLIVING the pan by three
+ * seconds. Parked scenes never see it (camTerm 0 ⇒ floor = ALPHA_STILL
+ * exactly), and the settle window is also the window the rest cadence keeps
+ * at full rays, so the faster forgetting is fed rather than starved.
+ *
+ * `__giSrcCamSettleAlpha = false` opts out (the A/B arm); a number pins the
+ * settle floor itself. A pinned `__giSrcAlpha` outranks this like everything
+ * else — a pin must mean what the arm that set it meant.
+ */
+export const CAM_SETTLE_ALPHA = 0.05;
+
+/**
+ * ══ THE LIGHT-SETTLE ENVELOPE — THE DEPARTED LIGHT'S GHOST (§12.67) ═════════
+ *
+ * User report (2026-08-14): "when lights was lighting some surface, and then
+ * went away, this surface continue color bleeding and flickering for quite
+ * some time after that." Mechanism: the §12.43 light-event window closes on
+ * the EVENT cadence, not on re-convergence — the moment it does, tr drops to
+ * 0, α returns to ALPHA_STILL and the rest cadence cuts rays, so the stale
+ * bounce energy on the previously-lit surfaces decays at the still rate on a
+ * REDUCED evidence rate. §12.52 surprise cannot rescue it: an evidence-starved
+ * block gets no fresh deposits to disagree with, keeps its ghost until rays
+ * revisit, then corrects in sparse blotches — the reported flicker. This is
+ * the light-side twin of the §12.63 camera hole, and it takes the same shape:
+ * a hold+fade envelope stamped from the LAST FRAME THE WINDOW WAS OPEN,
+ * feeding both the α floor (with CAM_SETTLE_ALPHA — one floor, two reasons to
+ * be there) and the rest cadence's drive term.
+ *
+ * LONGER than the camera envelope on purpose: a pan REDISTRIBUTES the
+ * estimator (§12.63's doctrine note) while a departed light DELETES energy —
+ * the whole multibounce residue has to drain, and it re-deposits through the
+ * feedback loop while it does. Hatches: `__giSrcLightSettle = false` (off —
+ * the A/B arm), `__giSrcLightSettleHoldMs` / `__giSrcLightSettleFadeMs`
+ * (numeric pins).
+ */
+export const LIGHT_SETTLE_HOLD_MS = 1500;
+export const LIGHT_SETTLE_FADE_MS = 800;
+
+/**
+ * ══ THE FRESH-PROBE SEED — HOW MUCH A BORROWED PRIOR WEIGHS (§12.59.2) ══════
+ *
+ * §12.59.1's pan bisect pinned camera-motion flicker on newborn probes
+ * converging FROM ZERO in view: every at-rest suspect (cap, surprise, tracking
+ * window) measured inside the noise floor, while a 25° pan drove per-pixel step
+ * amplitude ~200×, cap-INVARIANT — faster intake cannot hide convergence,
+ * only a prior can. `srcSeed.js` writes that prior: a fresh probe's bins start
+ * at its parent cascade probe's last-frame MERGED answer, carried at this many
+ * rays' worth of fixed-point weight.
+ *
+ * The number is an EFFECTIVE SAMPLE COUNT, so it has two anchors rather than
+ * being taste: §12.13.4's measured 0.78 rays/bin/frame makes 6 rays ≈ 8 frames
+ * of evidence, and the steady-state weight under decay is
+ * `influx/(1−keep) ≈ 0.78/0.1 ≈ 7.8` rays — seeding just UNDER steady state
+ * means a newborn bin is exactly as hard to move as a settled one, never
+ * harder. Real local evidence therefore dominates within ~1/α frames, and the
+ * decay retires the borrowed weight on the same clock as any other evidence.
+ *
+ * `__giSrcSeedRays` is the live dial (polled per frame, srcSystem's §12.23
+ * rule); `0` zeroes every write and is the in-page A/B arm the flicker
+ * instrument quotes. `__giSrcSeed = false` (read once, at build) removes the
+ * passes entirely — the only form of "off" that can back a bit-exactness claim.
+ */
+export const SEED_RAYS = 6;
 
 /**
  * ══ THE TRACKING WINDOW — WHY A SEEN CHANGE HOLDS α UP (§12.43) ═════════════
@@ -409,8 +539,15 @@ export const INFLUX_ONE = 0x10000;
  * mechanism §12.45 measured as 36% of the light-update flicker.
  */
 export const SURPRISE_ONE = 0x10000;
-/** Signed-EMA rate for the drift term. Fast enough to see a step inside the T0→T1 ramp. */
-export const SURPRISE_RATE = 0.25;
+/**
+ * Signed-EMA rate for the drift term. Fast enough to see a step inside the
+ * T0→T1 ramp. Raised 0.25 → 0.45 with the ramp raise below: the higher trip
+ * point needed the EMA to carry MORE of a step's Δ inside the 6-frame
+ * detection window (drift peak scales ~linearly with rate there) while its
+ * noise passband only grows as √(r/(2−r)) — detection moved 8σ → inside the
+ * gate, noise fires stayed at zero on the fixture.
+ */
+export const SURPRISE_RATE = 0.45;
 /**
  * Shot-noise coefficient: the per-frame standard error of a block's mean is
  * `M·sqrt(K/n)` for `n` deposits. K is empirical (§12.13.4's 0.78 rays/bin
@@ -418,9 +555,26 @@ export const SURPRISE_RATE = 0.25;
  * as "one σ" and therefore where the T0/T1 ramp begins.
  */
 export const SURPRISE_SHOT_K = 0.143;
-/** Ramp ends, in σ. Below T0 nothing is surprising; at T1 the block is fully surprised. */
-export const SURPRISE_T0 = 2;
-export const SURPRISE_T1 = 4;
+/**
+ * Ramp ends, in σ. Below T0 nothing is surprising; at T1 the block is fully
+ * surprised.
+ *
+ * RAISED 2/4 → 3.5/7 (2026-08-13). The shipped 2σ trip point was ~3σ of the
+ * TRUE drift spread (the arm measured live noise at 1.78× the shot model —
+ * SUM_SHIFT quantization — and the drift EMA's own σ is ~0.38 of the input's),
+ * which the fixture priced at 0.11% false fires per block-frame and called
+ * absorbed. Live it was not: across thousands of resident blocks that is
+ * several noise-fires per frame, each decaying its block at up to the fast α,
+ * and the flicker rig's SURPRISE_AB arm (interleaved, in-page) read a PARKED
+ * Sponza at 2.784 reversals/px armed vs 1.410 at gain 0 — the detector was
+ * manufacturing about half of the still-scene flicker it shipped to localize.
+ * 3.5/7 puts the trip at ~5σ of the true drift spread. The ceiling is the
+ * temporal fixture's own detection gate: drift peaks at 0.62·Δ while M chases
+ * the step, so T0 3.5 opens the ramp at a ~6σ step (gate: ≤ 6 within 6 frames)
+ * and T1 6.5 saturates at the fixture's measured 12σ (gate: ≤ 12) — raise either further and (c) fails.
+ */
+export const SURPRISE_T0 = 3.5;
+export const SURPRISE_T1 = 6.5;
 /**
  * Noise floor, in units of unit luma — 1/1024, one quantum of the SUM_SCALE the
  * deposits arrive in. Without it a block whose mean is zero has zero noise and

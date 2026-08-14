@@ -926,11 +926,21 @@ export function emitterSlotShadow(params, slot, P, N, samplePoint, penumbraOut =
     .dot(vec3(0.2126, 0.7152, 0.0722))
     .toVar();
   const shadow = float(1).toVar();
+  // `traceCutoffScale` (default 1 = trace everything the show-fade shows)
+  // raises ONLY the trace admission, not the contribution fade. The resolve's
+  // reflection-hit path sets it (see createGiResolve's bvhShade block): a hit
+  // pixel runs this whole march inline per slot, and tracing every pixel
+  // within a lamp's full 1/d² reach there measured 1.7 → 60 ms of resolve at
+  // 3 emitters. Slots gated out here keep shadow = 1 — dim light renders
+  // UNSHADOWED rather than not at all, a deliberate, BOUNDED exception to the
+  // "too dim to trace ⇒ too dim to show" rule above: the leak is capped at
+  // scale × cutoff luma, and only inside reflections.
+  const traceCut = emitterCutoff(params) * (params.traceCutoffScale ?? 1);
   If(
     slot.radius.greaterThan(0.001)
       .and(cosTheta.greaterThan(0.05))
       .and(dist.lessThan(params.shadowRange))
-      .and(emitterLum.greaterThan(emitterCutoff(params))),
+      .and(emitterLum.greaterThan(traceCut)),
     () => {
       // k = distance / emitter angular radius encodes the light's angular
       // size: bigger/closer emitter → softer. Floor 1.2 so a large area
@@ -939,7 +949,18 @@ export function emitterSlotShadow(params, slot, P, N, samplePoint, penumbraOut =
       // Ray cap at the emitter's actual SURFACE (slab entry for boxes —
       // the bounding sphere of an elongated lamp stopped the ray well
       // short of its face, exempting anything hugging it from occluding).
-      const maxT = emitterSurfaceT(slot, samplePoint, dirToEmitter, dist).sub(params.shadowMargin).max(0);
+      // `maxTraceDistance` (optional, metres) additionally caps the MARCH
+      // LENGTH from the receiver. The resolve's reflection-hit path sets it:
+      // `traceCutoffScale` alone is an absolute-luma gate, so a STRENGTH-100
+      // lamp keeps its whole 1/d² reach earning full-length marches (their
+      // Sponza: resolve 60→50ms only — the gate never fired indoors). A
+      // length cap bounds the per-march cost independent of emitter strength
+      // and keeps near-receiver occlusion — the part that reads as shadow in
+      // a reflection — exact; occluders beyond the cap stop occluding (soft,
+      // spatially plausible leak, reflections only).
+      const rawMaxT = emitterSurfaceT(slot, samplePoint, dirToEmitter, dist).sub(params.shadowMargin).max(0);
+      const marchCap = Number(params.maxTraceDistance);
+      const maxT = Number.isFinite(marchCap) && marchCap > 0 ? rawMaxT.min(marchCap).toVar() : rawMaxT;
       If(maxT.greaterThan(params.shadowMargin), () => {
         // Self-exclusion covers ONLY the lamp's own body + a couple of
         // field cells. Sphere slots: the bounding sphere ×1.5 (their body

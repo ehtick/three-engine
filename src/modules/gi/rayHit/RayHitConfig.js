@@ -54,18 +54,41 @@ export function rayHitModeName(mode) {
  * That quantized every rotated cube's and every trim/arch edge's shadow to
  * full voxels while the flat-face interiors stayed sub-voxel exact. The
  * triangle pool's memory cost (~2 tris x 36 B per failed-fit cell) is the
- * price of correct silhouettes and the presets that can afford it pay it;
- * low/medium keep the lean modes.
+ * price of correct silhouettes — and, §12.68 measured, of correct TRANSPORT
+ * ENERGY: every preset pays it now (see AUTO_MODE_BY_QUALITY below).
  */
 const AUTO_MODE_BY_QUALITY = Object.freeze({
-  // low was HybridBrickBox until 2026-08-05. With the sun-disc stochastic
-  // shadow arm the records ARE the shadow quality: box hits quantize every
-  // silhouette to whole voxels (low's voxels are the biggest), and the box
-  // arm's origin lift leaves a dead zone ~1 voxel deep that the per-pixel
-  // jittered rays escape through — the "holes in the voxel mesh, light leaks"
-  // report. Plane records at low's small grid cost little and fix both.
-  low: RayHitMode.HybridPlane,
-  medium: RayHitMode.HybridPlane,
+  // low was HybridBrickBox until 2026-08-05 ("holes in the voxel mesh, light
+  // leaks" — box origin-lift dead zone), then HybridPlane until 2026-08-14.
+  //
+  // ══ WHY LOW/MEDIUM ARE EXACT-COMPLEX TOO (§12.68 PRESET ENERGY) ══════════
+  //
+  // HybridPlane is not merely "quantized silhouettes": any occupied cell
+  // WITHOUT a usable simple-plane record — complex fit (edges, trim, curved
+  // mouldings, foliage), pool overflow, unfitted — keeps occupied-BOX hit
+  // semantics, so a ray crossing the EMPTY part of such a voxel stops on a
+  // phantom hull. On real content at low/medium voxel sizes that is a
+  // TRANSPORT ENERGY SINK, not an edge artifact. Measured on the user's
+  // Sponza (medium, same pose, single-knob A/B — everything else identical:
+  // same 0.164 m occupancy grid, same s₀ 0.6, same 26 330 rays/frame):
+  //
+  //             hitRate   mean free path   GI screen mean   deep-arch cells
+  //   plane      0.984        2.00 m           0.358          0.08–0.10
+  //   exact      0.966        3.92 m           1.486          0.27–0.30
+  //
+  // Half the free path ⇒ rays die on phantom boxes near their birth surface
+  // instead of reaching the sun-lit courtyard or the sky, and the deposit
+  // carries the phantom's (dark) radiance with T = 0 — a multiplicative ~4.2×
+  // GI collapse concentrated in exactly the GI-only interiors ("medium is too
+  // dark in most places, low doubled"). Attribution was innocent (1–3% both
+  // arms); ray budget was innocent (ultra fires 8× low's rays at the same
+  // screen mean). A preset may buy noise and coarseness; it must not lose
+  // energy — so hit precision is now preset-independent and the presets keep
+  // trading rays, probe density and resolution only. Measured cost at medium
+  // on Sponza: +35 MB triangle pool, GPU 5.6 → 6.4 ms on the capped 4070.
+  // `__giRayHitMode = "hybrid-plane"` remains the A/B hatch.
+  low: RayHitMode.HybridExactComplex,
+  medium: RayHitMode.HybridExactComplex,
   high: RayHitMode.HybridExactComplex,
   ultra: RayHitMode.HybridExactComplex,
 });

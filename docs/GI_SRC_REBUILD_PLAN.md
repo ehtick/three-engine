@@ -183,6 +183,25 @@ memory (`gi-module.md`); the ones that bind hardest here:
   kernel size — a 154kB kernel compiles 85× faster than a 16kB one. So this rule constrains HOW MANY
   KERNELS A DESIGN SHIPS, and "one more compute pass" is the decision it exists to make expensive.
   Full budget, measurement, re-ranked levers and **the four things its first version got wrong**: **§13**.
+- R19. **Thousands of moving objects must run at full speed with GI on** (user requirement,
+  2026-08-13: "we're making a game engine — thousands of objects might be moving"). What today
+  violates it: the exact-mover set is a PER-RAY LINEAR LOOP (dynamicObjects.js `Loop(0..count)`,
+  ~15 buffer reads + inverse transform + slab test per object per ray) — that is WHY the cap is
+  16 (hard clamp 64 via `__giMaxDynamicObjects`), and overflow degrades to PER-FRAME
+  RE-VOXELIZATION, which is both slow and reads as blocky flickering light. The rule splits into
+  three obligations, cheapest first:
+    (a) **Overflow must degrade to "no GI occlusion", never to per-frame re-voxelization** — a
+        prop with no exact shadow is fine; a prop that flickers and costs CPU every frame is not.
+    (b) **The exact-set budget must be spent by RELEVANCE, not arrival order** — the user's live
+        scene holds 15 of 16 slots on objects that have NEVER moved (first-come adoption). Evict
+        by recent-motion × screen coverage × emissive so the 16 that trace are the 16 that show.
+    (c) **The scaling architecture is a TLAS over mover instances** — a per-frame refit BVH over
+        adopted AABBs (leaves = analytic shapes or per-GEOMETRY BLAS, so 1,000 pooled projectiles
+        share ONE mesh BVH + 1,000 instance transforms), replacing the linear loop with a
+        descent. CPU refit of thousands of AABBs is ~ms and uploads one buffer; the per-ray cost
+        becomes log-ish in N and zero when the ray's AABB path misses the mover set. Scale
+        honesty: no engine gives thousands of movers individual exact GI occlusion — (c) raises
+        the ceiling to hundreds-of-relevant, (a)+(b) make the tail free and invisible.
 
 ---
 
@@ -8320,3 +8339,1124 @@ at 30-70% grey — emissives read brighter. Hatches:
 `__giEmitterAnalyticPenumbra=false`, `__giEmitterWidePass=false`,
 `__giEmitterWidthDebug=<m>`. New arms on `probe:gi-emitter-shadow`:
 nopenumbra/nowide/widthmap/temporal.
+
+### 12.55 THE SURPRISE DETECTOR WAS MANUFACTURING STILL-SCENE FLICKER (2026-08-13)
+
+The user's re-report after the §12.52-54 wave: "flicker is still there,
+smaller, but still there." The rig grew the SURPRISE_AB arm §12.52 queued
+(still arms only, in-page interleaved ×2, `__giSrcSurpriseGain` 0 vs the
+governor — gain is live-polled and the governor publishes 1 on a parked
+scene, so "natural at rest" IS the fully-armed state):
+
+    still reversals/px, ultra, user's Sponza (shipped 2/4 ramp, rate 0.25):
+      armed 2.784  vs  gain-0 1.410   (+97%, round spread 0.164)
+
+**The §12.52 detector was re-tripping on noise at rest and roughly DOUBLING
+still-scene churn — about half of the user's remaining flicker.** Mechanism:
+the ramp's 2σ trip is priced against the SHOT model, live noise is 1.78×
+that (§12.52's own measured truth), and the drift EMA's σ is ~0.38 of its
+input's — so 2σ-model ≈ 3σ of the drift's true spread: ~0.1-0.3% of
+block-frames × thousands of resident blocks = several fires per frame, each
+running fast decay on its block. The fixture's FP leg saw 0.11% and called
+it absorbed; across a real scene it is not.
+
+**Shipped: `SURPRISE_T0/T1` 2/4 → 3.5/6.5 and `SURPRISE_RATE` 0.25 → 0.45**
+(srcConfig.js — CPU mirror and WGSL both read from there). The rate raise is
+what keeps detection inside the temporal fixture's own gate at the higher
+trip point: the drift EMA carries more of a step's Δ inside the 6-frame
+detection window while its noise passband grows only as √(r/(2−r)).
+Gates after: `test:gi-src-temporal` ALL PASS — detection 6σ (gate ≤6),
+saturation 11σ (gate ≤12), self-termination 3 frames (was 8), noise fires
+0/6400 at model σ and 2/6400 grazing u≈0.1 at measured σ (was firing at
+u≈0.95 there). `test:gi-src-math`, `test:gi-src-rays` PASS.
+`probe:gi-src-converge` t90 strided-12 = **0.92s** (§12.52.1 read 0.93) —
+the ghost-regime win is intact.
+
+Re-measured live (same arm, same discipline): armed 2.242 vs gain-0 1.448 —
+**the armed excess halved (+97% → +55%) but is still 4.5× the round
+spread.** The residual is expected: live per-frame block means are NOT
+gaussian around M — R2 ray-set rotation cycles different ray directions
+through a block per frame, a deterministic oscillation the shot-σ model
+cannot represent and the faster EMA passes MORE of. **THE NAMED NEXT UNIT:
+a per-block SELF-CALIBRATING noise scale** — normalize drift by an EMA of
+|I−M| (the block's own measured innovation floor) instead of the analytic
+shot σ; a block whose rays oscillate learns its own floor. Costs one more
+per-block word (a sixth BSTAT region) + [D1''] publish + both mirrors +
+the full gate battery — a dedicated unit, not a constants tweak. The paper
+§8.1's "multi-scale mean estimator" is this.
+
+⚠ INSTRUMENT NOTES for whoever re-runs: the SURPRISE_AB verdict text
+prints the same fix hint regardless of magnitude — read the numbers, not
+the hint line, when judging a partial fix. And the arm inherits every rig
+discipline: in-page only, ×2 interleaved, gain-0 spread is the noise floor.
+
+**CROSS_LAG (§12.46.3's "correct instrument") IS ALSO BUILT** — same rig,
+`CROSS_LAG=1 CROSS_ALPHA=0.1,0.02`: parked-truth at the eased curve's
+midpoint (default-α truth, mode-−1 pipeline warmup against the §12.52.2
+first-dispatch skip), then per-pixel pass-mean accumulation at each
+midpoint crossing, ascending/descending kept separate, first post-α-switch
+cycle discarded. Self-check refuses the verdict if lag falls as α falls
+(the netSettle failure mode). Results land in the session log / memory.
+
+#### 12.55.1 CROSS_LAG RAN — THE α TRADE IS PRICED, AND THE LAG SIDE IS A BOUND
+
+Three runs, each self-contained (per-arm parked truth):
+
+1. First estimator (mean-|per-pixel pass-mean|) SELF-REFUTED exactly as the
+   §12.46.3 note predicted — E|X| noise residue at 6 passes swamped the lag
+   and the α ordering came out inverted. The instrument refused the verdict;
+   the refusal worked.
+2. Rebuilt on the ANTISYMMETRY estimator: the field trails the sun, so lag
+   structure at ascending crossings is the NEGATIVE of descending ones,
+   while noise and truth-side bias are direction-blind. With mU/mD the
+   per-pixel pass-means, `lagRMS = sqrt(max(0, Var((mU−mD)/2) −
+   Var((mU+mD)/2)))` cancels the noise bias to first order AND cancels any
+   systematic swing-vs-rest level shift (it lands in the symmetric field).
+   Result (ultra, user's Sponza, eased curve H=300, 5 cycles, in-page):
+   **lagRMS 0.00000 at BOTH α=0.1 and α=0.02** — noise floors 0.030/0.024
+   luma RMS. No resolvable lag at either α.
+3. VALIDATION ARM — α=0.02 with `CROSS_GAIN=0` (surprise OFF, so nothing
+   per-block can bound a raw EMA lag): still lagRMS 0, and the TOTAL
+   per-pass |diff| read **0.0062 luma ≈ 2% of mean** — where a naive
+   τ≈50-refresh EMA lag (~12° of sun angle) should have dwarfed it. The
+   "surprise bounds the lag" hypothesis is REFUTED; the honest reading is
+   that on this scene the BOUNCE field's angular gradient at the crossing
+   is small enough that even naive-EMA staleness costs ~2% instantaneous
+   luma error. (The α=0.1 arms read HIGHER per-pass |diff| — 0.023-0.025 —
+   because at α=0.1 the diff is variance-dominated: the noisier α reads as
+   MORE total error at the crossing than the laggier one.)
+
+**THE TRADE, QUOTABLE: on the user's scene and their own sun curve,
+α=0.02 under sustained smooth rotation costs ≤2% instantaneous luma error
+(unresolvable lag + less noise than α=0.1) and buys the §12.46.3 34× churn
+cut.** The α-under-rotation ship is therefore de-risked ON THIS EVIDENCE:
+make the α ramp edge-aware the way §12.46 made the WINDOW edge-aware —
+sustained saturation of `sceneMotion` (no rising edge for ~2s) slides the
+tracked α from TEMPORAL_ALPHA down toward ~0.04; any edge restores it.
+⚠ THE MISSING GATE, named before anyone ships this: a MID-ROTATION STEP
+arm. §12.46's rising-edge arming needs an 800ms sub-threshold dwell, so a
+step landing DURING continuous rotation re-arms nothing TODAY — currently
+covered by the always-fast swing α; after this change it would lean
+entirely on per-block surprise (§12.52), whose live still-scene behavior
+§12.55 just showed is not yet trustworthy. Build the arm (LIGHT_STEP
+landing mid-ROT_EASE), then ship. Do not ship on the existing arms alone.
+
+Rig knobs added this session: `SURPRISE_AB=1`, `CROSS_LAG=1`,
+`CROSS_ALPHA`, `CROSS_CYCLES`, `CROSS_ROUNDS`, `CROSS_GAIN`. All arms
+in-page, ×2 interleave where cheap, per-arm truth where not.
+
+### 12.56 EMITTERS × EXACT REFLECTIONS — THE RESOLVE'S HIT-PATH EMITTER MARCH (2026-08-13, uncommitted)
+
+**The user's "a few emissive lights → 5 fps at ultra" is an INTERACTION term, not an
+emitter cost.** Live MCP repro on their Sponza (dGPU, viewport unfreeze, ultra, SSR on):
+baseline 42 fps / 21.5 ms GPU with 0 emitters; THREE 0.4-scale emissive spheres
+(CannonBall.mat) → 9 fps / 101.5 ms. `profile.giPasses` attribution: **`resolve`
+1.67 → 60.35 ms** (1640×912), `emitterShadowPass` 14.0, SRC chain FLAT at 4.4 ms,
+rays capped at ~25.6k throughout (§12.48's pose cache held — each sphere armed the
+light-track window exactly once). SSR itself is 2.4 ms (toggle A/B) — not the story.
+
+**Mechanism, read at source:** their scene has a bucket-0/3 material, so the
+exact-reflection prepass runs — and `#bvhMaskEnabled()` has been a dead opt-in since
+2026-08-04 (`=== true`, the `__giSrcSecondary` polarity trap; its own doc comment said
+"on by default"), so it runs **DENSE full-screen, hit-shaded**. The resolve's
+`bvhShade` branch shades every hit pixel with `emitterDirectAt` **without**
+`shadowSample` (a hit is a different world point than the pixel), which runs the full
+`emitterSlotShadow` record-march + BVH descent inline, per slot, per pixel. Enclosed
+scene ⇒ ~every reflected ray hits ⇒ ~1.5M px × 3 slots × ~13 ns.
+
+**Rig:** `run-gi-emissive-cost.mjs` gained `MIRROR=1` (floor roughness 0.3 = bucket 0,
+quality defaults ultra — exactReflections exists only there) and `ENCLOSED=1`
+(walls+ceiling; an OPEN mirror rig reflects the sky, every ray MISSES, and the branch
+under test never executes — the first two runs measured nothing and looked green).
+Camera parks INSIDE when enclosed. In-page 0→4-emitter sweep, Δresolve:
+
+| arm | Δresolve (0→4 emitters) |
+|---|---|
+| dense + trace-all (= what shipped yesterday) | **+9.35 ms** |
+| masked + trace-all | +4.37 ms (image BROKEN, see below) |
+| dense + hit-trace diet 24 (**NEW SHIPPING**) | **+1.29 ms (7.3×)** |
+| masked + diet | +0.82 ms (image broken) |
+
+**SHIPPED — the hit-path trace diet:** `emitterSlotShadow` gained
+`params.traceCutoffScale` (default 1 = unchanged); the resolve's hit call site passes
+`__giHitEmitterTraceScale` (default **24**, baked at build). Above-gate slots trace as
+before; dimmer slots contribute **unshadowed** — a deliberate, BOUNDED exception to
+the show==trace coupling: leak ≤ 24 × emitterCutoff ≈ 0.036 luma, only inside
+reflections, traded against a per-pixel BVH march whose reach otherwise grows as
+cutoff⁻¹. Dedicated emitterShadowPass and the legacy in-material arm take `?? 1` —
+byte-identical. Rig shot dense+diet vs dense+trace-all: visually equivalent (lamp
+pools, crate contact shadows intact). Gates: test:gi-emitter-shapes 795 ✓,
+test:gi-src-shade ✓, test:gi-rayhit-shadow ✓. ⚠ test:gi-lightvis "component disabled
+stops GI" FAILS — **verified pre-existing on a clean HEAD worktree**, not from this.
+
+**SHIPPED — GI_MIRROR_LAYER tagging (the mask's missing half):** #collectMeshes now
+tags bucket-0/3 meshes into GI_MIRROR_LAYER (harmless under dense; stale tag = cost,
+never a wrong image). **REVERTED same-day — the mask default flip:** with tagging in
+place, masked boots render a BROKEN frame on the enclosed rig (white/black split where
+dense lights correctly, at live=0 too), and `scripts/run-gi-mask-bisect.mjs` shows
+stopping the mask pass LIVE does not recover ⇒ the fault is masked-prepass/consumption
+side, not the second gbuffer render. `__giBvhMask` stays opt-in; the mask unit is
+queued with rig + bisect script and a real prize (halves the interaction term again).
+
+**OPEN, filed here:**
+1. **Masked-mode broken frame** (above) — diagnose with `MIRROR=1` rig + bisect.
+   **REFRAMED 2026-08-14 (extended bisect, per-stage stats both arms):** NOT a
+   mask-data bug. Two masked boots of the same rig, same code, minutes apart:
+   one healthy (gather lit 141,602/141,602, secondaryHits 16,972), one fully
+   dark with `secondaryHits: 0, maxL: 0, gather lit: 0` while rays/hits/
+   deposits/merge ALL count normally — §12.53's documented signature of [J]'s
+   PIPELINE silently failing to create (nothing shades ⇒ black GI), with ZERO
+   console errors either boot. The mask flag changes compile batching enough
+   to move the odds, which is why brokenness correlated with masked boots; the
+   §12.56 "white/black split" is plausibly the same race landing on a
+   different pipeline. Same family as the OPEN occluder-pipeline race
+   (occlusion-culling ledger) and the "first frame after compile wave took
+   NNNms — pipelines recompiled at resume" warnings. The extended
+   `run-gi-mask-bisect.mjs` (per-stage stats + dense control page) is the
+   instrument; the detection signature is `secondaryHits == 0 && shaded > 0`
+   on a settled frame. **WATCHDOG SHIPPED AND VERIFIED (2026-08-14):** one
+   async readback 5 s after the compile wave resumes; on the signature it
+   console.errors "[gi] DEAD SHADING PASS …" naming this section — fired on
+   the very next dead masked boot, silent on the healthy dense arm. The
+   AUTO-RETRY (rebuild [J]'s pipeline on detection) stays FILED — the race's
+   root cause (why an async compute pipeline validation-fails
+   nondeterministically, also the occluder pass's open bug) is the real
+   target, and it needs a Dawn-level error-scope capture to even name the
+   failing pipeline.
+2. **Plain-prop emissive .mat never promotes**: a material_create'd .mat with
+   `emissive/emissiveIntensity` as flat fields (no shader graph) reads `emitters: 0`
+   while the graph-emissive CannonBall promotes instantly on the same mesh in the same
+   scene. resolveMaterialSurface handles flat `.emissive` — suspect the .mat→material
+   application path. User-facing: "my emissive material doesn't light".
+3. **`emitterShadowPass` is now the emitter pole again** (14 ms / 3 emitters on Sponza
+   ultra at 902×502): reach is priced by `emitterCutoff` (area ∝ cutoff⁻¹) — the
+   next lever after the two above.
+4. test:gi-lightvis pre-existing failure (above).
+
+#### 12.56.1 THE DIET WAS NOT ENOUGH LIVE — HIT-PATH EMITTER SHADOWS GO UNSHADOWED BY DEFAULT (2026-08-13, same session)
+
+**User: "a little better, still 10 fps." Their editor HAD reloaded (171kB resolve kernel
+in the boot log) — the diet was live and weak: resolve 60.35 → 49.6 ms.** Two wrong
+assumptions found and priced on their REAL content:
+
+1. **The luma gate is ABSOLUTE and their lamps are strength 100** (CannonBall.mat;
+   the rig validated at strength 8). A strength-100 lamp keeps earning marches to
+   ~14 m ⇒ the gate never fires indoors on Sponza.
+2. **Cost is per-INVOCATION, not per-metre.** A 4 m march-length cap
+   (`maxTraceDistance` through emitterSlotShadow, `__giHitEmitterMarchCap`) moved the
+   real-Sponza arm 10.96 → 10.21 ms (−7%). The BVH descent setup dominates; ray length
+   does not.
+
+**The ceiling arm settled it:** `run-gi-hitcap-sponza.mjs` (new; tauri-shim boots the
+REAL GAME project read-only, spawns 3 CannonBall spheres in-page at the same pose as
+the live MCP repro, reads profile.giPasses) — trace-nothing reads **resolve 0.27 ms vs
+10.96 traced** (806×392; editor scale ≈ 2 vs 50 ms), and the A/B screenshots are
+**INDISTINGUISHABLE** on their scene. So emitter shadows inside reflections buy nothing
+visible here while costing ~the whole resolve. **Shipped: the hit path defaults to
+`shadowSample: () => 1`** — same trade analyticDirectAt documents for lights, and the
+shadowSample shape keeps the marcher OUT of the resolve WGSL (the traced resolve was
+the boot's slowest pipeline at 22.9 s — this is also a §13 startup win).
+`__giHitEmitterShadows = true` restores tracing with the §12.56 gate+cap dials.
+Gates re-run green (emitter-shapes 795 / src-shade / rayhit-shadow). Editor-scale
+expectation, 3 emitters at ultra+SSR: GI ≈ resolve ~2 + emitterShadowPass ~13 + src ~5
+⇒ the emitter pole is now **emitterShadowPass** (§12.56 open item 3, reach ∝ cutoff⁻¹).
+
+⚠ Live-editor session noise, recorded: baseline GPU read 21.5 ms and 41.6 ms for the
+SAME scene/pose two hours apart (0 emitters both times, GI flat at ~8 ms — NOT GI;
+three assistant sessions were live-editing framePacing/occlusion at the time), and the
+unfocused-viewport path presents 9 fps where unfreezing reads 21 fps on the same frame.
+Their scene also sits at the 16-mover cap with 15 never-moved movers (engine warns;
+`giMobility: static` on the props is the user-side fix).
+
+### 12.57 "STILL LOW FPS ON EVERY PRESET" — THE FRAME WAS POWER-CAPPED, NOT PASS-BOUND (2026-08-13, evening)
+
+User: "still very low fps even on lower quality presets; we need 60 fps on ultra."
+Live Sponza, viewport 1642×974, ultra, SSR on, 0 emitters: **30 fps / 30.8 ms GPU
+(real timestamps), CPU 5.9 ms.**
+
+Attribution first — the per-pass ledger at that state:
+- GI real steady state ≈ **11.5 ms**: srcProbes 9.6 (deposit 2.9, gather 2.8,
+  tiles 0.95, shade[J] 0.92, populate 0.87, rest ~1.1) + resolve 1.9. The 1.9 ms of
+  `lightShadowFilterPass`/wide entries in `queueMs` was a PROFILER ARTIFACT — the op
+  times raw `state.queue` nodes; the frame loop's `frameSkip` never dispatches them
+  (no light uses Shadow Source "gi"). `profile.js` now annotates those entries
+  "NOT dispatched" and excludes them from `queueTotalMs`.
+- Then the eliminations that refused to eliminate: PP/SSR off → 31.3. Shadow map
+  frozen → 31.5. `castShadow` off entirely → 31.7. MSAA 4→1 → 32.3. **Four
+  removals, zero movement** — the classic fingerprint of a clock ceiling, where
+  removed work just redistributes inside a fixed power budget.
+- renderScale 0.5 → **11.9 ms / 67 fps** — the frame IS per-pixel bound, it's the
+  per-pixel RATE that's absurd (≈16 ns/px of beauty+GI on a Lovelace chip).
+
+The rate had a reason: **`nvidia-smi -q -d PERFORMANCE,POWER` — RTX 4070 Laptop at
+P4, 1410 of 3105 MHz, 100% utilization, Current Power Limit 33.00 W (default 55,
+max 90), `SW Power Cap: Active`, `SW Thermal Slowdown: Active` at 69 °C, throttle
+counters at 12+ hours.** 33 W is the ASUS ROG Zephyrus G14's SILENT-mode dGPU cap.
+The user-side fix is one keypress (Fn+F5 / Armoury Crate → Performance or Turbo);
+expected ≈2.2× on every GPU number, i.e. this exact frame lands ~14 ms ≈ 60 fps on
+ultra with SSR at viewport res. §12.56.1's "baseline doubled 21.5→41.6 ms same
+scene" almost certainly = this cap engaging/releasing, and every ladder in §12
+measured on the editor today carries an unknown clock state. Rule going forward:
+**record the power state next to any editor measurement** (the harness Chromes run
+the same silicon under the same cap).
+
+Engine-side facts this session still banked:
+- **Scene Settings' shadow `autoUpdate` was dead wiring on WebGPU** — three r185's
+  `ShadowNode.updateBefore` gates on the PER-LIGHT `shadow.needsUpdate ||
+  shadow.autoUpdate` and never reads `renderer.shadowMap.autoUpdate`. Fixed:
+  `applySettingsToScene` mirrors the setting onto every light (gi-mode lights stay
+  frozen; a freeze with no rendered map forces one render first — the null
+  `depthTexture` crash), and `LightComponent#configureShadow` initializes new
+  lights from `engine.settings`. The 4096² sun map on static Sponza re-rendered
+  every frame all along (56 draws / 264 k tris); with the checkbox now real, a
+  static scene can actually freeze it.
+- Full frame = scene rasterized 4×: beauty 75 draws + shadow 56 + a full-res
+  depth-only prepass 41 (PP input) + occluder 24 (which still culls 0/33 — the
+  camera has `occlusionCulling: "on"` overriding the scene's off; recommend off in
+  Sponza).
+- Next engine cuts, in order, ONCE REMEASURED UNTHROTTLED: srcProbes cadence
+  (9.6 ms is preset-independent — the "lower presets don't help" half of the user's
+  report is real and lives here), GI resolve scale on ultra (resolve+gather+
+  emitter chain are per-resolve-pixel), dedupe the PP depth prepass against the
+  gbuffer, R19 mover units a/b.
+
+### 12.58 EMITTER SEATS FOLLOW THE CAMERA (2026-08-13, evening — uncommitted)
+
+User: "after 3-4 emissives, all other emissives do not emit any light." Mechanism:
+`MAX_EMITTERS = 4` analytic slots ranked by raw emitted power (luminance·r²) with
+sticky 1.5× hysteresis — camera position played no role, so the four highest-power
+lamps ANYWHERE held every seat forever, and an un-promoted lamp shows only its field
+transport (~17% of the energy, lightTree.js header) → next to a promoted neighbour it
+reads as OFF.
+
+Shipped: `#chooseEmitterSeats` (extracted from `#buildEntries`) scores by APPARENT
+brightness — power/(1+d²) to `engine.camera` — and `#checkFingerprint` re-asks the
+seating question every 250ms scan (a camera move never touches the mesh fingerprint,
+so the re-rank must ride the scan loop; a changed answer nulls the fingerprint and the
+flip goes through the sanctioned reconcile: slot re-surface → atlas revision →
+composite, EMA cut). Sticky seats + the 1.5× ratio survive unchanged — on a
+camera-relative score the ratio is hysteresis in DISTANCE, so turnover happens at
+door-to-door walking cadence, never per scan. No camera (headless) = raw power, the
+old ordering.
+
+Verified `scripts/run-gi-seat-follow.mjs` (NEW; vite 5201): 8 identical lamps on a
+ring — (A) camera by lamp 0 seats exactly the 4 nearest; (B) jump to the opposite
+side, seats follow within a few scans; (C) 6s still camera, zero seat changes.
+ALL PASS. ⚠ Harness trap worth keeping: park the probe camera at an ANGULAR OFFSET
+from a lamp — dead-on is mirror-symmetric, the 4th/5th nearest tie EXACTLY, and the
+tie-break is arbitrary (first run "failed" on an equally-correct seat set).
+
+NOT the endgame: the cap itself stands. `lightTree.js` (CPU half built, UNWIRED —
+srcShade.js:81) is the real many-lights design: O(log n) tree descent per shading
+point, no promotion boundary at all. Seat-following makes the 4-slot budget spend
+itself on the lamps the player can see, which is the honest interim.
+
+### 12.59 DARK-AREA FLICKER: A REAL STILL-SCENE BASELINE AT LAST (2026-08-13, night)
+
+User: "in darker areas it is very flickering." The per-frame instrument
+(`run-gi-flicker-frame.mjs`) needed THREE fixes before it measured anything real —
+each one a way to report a FLAWLESS ZERO on a broken run:
+1. It grabbed `_giTargets` before the quality-override rebuild replaced them →
+   accumulated over a dead texture. Now waits for `_rebuildQueued` clear + 60
+   stable frames, AND fails loud ("INSTRUMENT FAILURE") when a MOVING mover
+   produces zero changed pixels — flawless zeros are never printed silently again.
+2. It PINS `__giSrcProbes` OFF by default (written pre-Phase-5, when SRC was the
+   experiment); on today's engine that leaves the sampled resolve unwritten.
+   `SRC=1` is MANDATORY for any current measurement (it also sets the sky).
+3. (Same class, fixed in the outline repro: puppeteer reports console.warn as
+   type "warn", not "warning" — exact-match filters silently eat every warning.)
+
+The baseline, real Sponza, ultra, SRC live, 806×392 @ 240 frames:
+- STILL scene: **0.468 reversals/px, step p95 0.026** — a still scene should sit
+  near zero; this residual oscillation IS the user's dark-area shimmer, and the
+  histogram shape (280 881 px at 0 reversals vs 8 741 px above 10) says it is
+  CONCENTRATED in a minority of pixels, which matches "darker areas" (low
+  evidence rate → high relative variance).
+- MOVING (sub-voxel sinusoid): 0.823 rev/px (+76%), step p95 0.2422 (+826%).
+
+Next: bisect the still-scene residual with the existing arms — CAP_AB (per-probe
+ray cap variance on low-evidence probes), SURPRISE_AB (§12.52's per-block α),
+and the light-track window (this evening's console shows it re-arming off the
+SHADOW signal at peak 453 on a still scene — every arm lifts the ray cap and
+re-rolls the noise, which presents exactly as shimmer). §12.55 closed the
+surprise-detector half; this 0.468 is what remains.
+
+### 12.59.1 THE STILL-SCENE BISECT: EVERY RESIDENT SUSPECT ACQUITTED — THE FLICKER IS CAMERA-MOTION CHURN (2026-08-14)
+
+Three A/B arms, one page, real Sponza ultra + SRC (`run-gi-flicker-frame.mjs`,
+SURPRISE_AB + TRACK_AB + CAMERA_AB; CAP_AB ran in its own page first):
+
+- **Ray cap: acquitted.** capped 0.221 vs off 0.246 rev/px — the CAPPED arm is
+  no worse (−10%, inside spread). §12.38's calm survives the cap.
+- **Surprise detector: acquitted at rest.** armed 0.215 vs gain-0 0.208 (+3%).
+- **Tracking window: acquitted at rest.** still on/off IDENTICAL (0.235/0.235).
+  Moving arms: reversals +3% (noise) but step p95 +73% (0.0417 vs 0.0240) — the
+  window's fast decay does amplify pop amplitude during real motion; that is
+  its designed trade (responsiveness), noted, not the still-scene bug.
+- **Camera pan: THE FINDING.** ±25° pan–hold: pan-window reversals 0.69–0.77/px
+  with **step p95 ≈ 3.14** (the clean still reads 0.015 — a ~200× amplitude
+  jump), CAP-INVARIANT (capped and off arms within spread on every column), and
+  the churn OUTLIVES the pan: post-pan stills read 0.18–0.35 against the page's
+  clean 0.204 floor, still elevated a full 270-frame arm later. The rig's own
+  verdict line: **look at fresh-probe seeding/α, not the ray budget.**
+
+Mechanism this points at: camera motion anchors FRESH PROBES for newly-visible
+gbuffer pixels; they start with no history, seed at full variance, and converge
+in view — which the eye reads as dark-area shimmer while navigating (dark = low
+absolute signal = highest relative amplitude; the user's exact report). Next
+unit, in order of expected value:
+  (a) seed a fresh probe from its CASCADE PARENT / spatial neighbours instead
+      of zero history (the field already holds a converged coarser answer);
+  (b) a per-probe age-scaled α so newborn probes drink evidence fast but
+      RENDER at reduced weight until variance settles (confidence-weighted
+      resolve blend);
+  (c) re-anchor hysteresis: §12.43's reanchor already slides whole cells —
+      check whether pans re-anchor MORE probes than the view change requires
+      (reanchors: 1 per profile snapshot looked sane, but that was one pose).
+Baseline bookkeeping: page-to-page still floors ranged 0.20–0.47 across the
+night's runs — only in-page interleaved arms are quotable (the instrument's
+own warning, now measured twice over).
+
+#### 12.59.2 THE SEED UNIT, SPECCED (implementation spec — next work unit)
+
+§12.52's COLD FILL is a RAY-BUDGET lift (×4 for 4 frames) — newborn bins still
+converge FROM ZERO in view, and the §12.59.1 pan A/B is the CAMERA_VERIFY arm
+§12.52 left open: cap-invariant churn proves faster intake does not hide the
+convergence. The fix is a RADIANCE PRIOR, not more rays:
+
+**Seed pass** (new, in the populate group, after compaction — PROBE_PARENT
+holds the parent probe INDEX only after compaction resolves it, §srcProbes
+PROBE_PARENT comment):
+- select: probes with `FLAG_FRESH` set AND `PROBE_PARENT != SLOT_EMPTY` AND a
+  claimed `PROBE_BLOCK`;
+- for each bin direction of the child, sample the PARENT's bins at the same
+  world direction — srcMerge already owns the parent↔child angular resampling
+  (reuse its mapping, do not re-derive);
+- write the parent's mean as the child's starting accumulator value with a
+  modest effective sample count (start conservative: the equivalent of ~8
+  frames of evidence — enough to kill the from-zero swing, small enough that
+  real local evidence dominates within ~1/α);
+- root cascade (no parent): fall back to the probe's spatial neighbours at the
+  same cascade, and if none, today's from-zero behaviour.
+Known traps that WILL bite (from §12's ledger): compute binding budget is 8
+per pass; `atomicStore` not `.assign`; TSL `Return()` inside `Fn`.
+
+**Verification** = the §12.59.1 pan arm, unchanged: PAN EXCESS over own still
+(0.543 capped / 0.462 off) and the post-pan elevated stills (0.22-0.35 vs
+0.204 floor) are the two numbers the seed must move; the still floor itself
+(~0.20, all suspects acquitted) is NOT expected to move and serves as the
+no-regression control. Run `SRC=1 CAMERA_AB=1` before AND after on the same
+build; only in-page arms are quotable.
+
+#### 12.59.3 THE SEED SHIPPED AND HOLDS — PAN EXCESS ÷9.6 (2026-08-14, uncommitted)
+
+Implemented as specced, with one design upgrade and one ordering trap the spec
+had not priced:
+
+- **The prior reads the parent's MERGED payload, not its accumulator.** The
+  merged answer is full-range (own interval + ladder + sky) — the same domain
+  the child's bins reach after ITS merge — and the handover is STATIONARY: a
+  clear-truth bin resolves `L = W·Lp/(W+w), T = w/(W+w)`, its merge adds
+  `T·Lp`, total `Lp` at every w. A raw-accumulator seed would describe the
+  parent's own 2× interval AND be double-counted by the child's merge.
+  `srcSeed.js`'s header carries the argument.
+- **The deposit's decay ZEROES blocks claimed this frame** (the stamp check),
+  so a seed pass in the populate group is silently wiped every frame and
+  renders exactly like not existing. The seed dispatches between
+  `deposit.decay` and the scatter; writes are `atomicAdd` (commutes with [E],
+  correct anywhere in the decay→resolve window). Third trap, dodged by flag:
+  a parent that is ITSELF fresh has a previous owner's stale payload —
+  skipped and counted (`SEED_COLD`).
+- Cascades 0..N−2 only; the top-cascade spatial-neighbour fallback stays
+  DEFERRED (below: the demand signal did not materialize).
+
+`SRC=1 SEED_AB=1` (storm-free Sponza page, ±25° pan–hold ×2, interleaved ×2,
+liveness gate on the mid-pan readback — on: 192/347 bins seeded, off: 0):
+
+    PAN EXCESS over own still:  seed-on 0.086   seed-off 0.827   (spread 0.022)
+    post-pan stills:            on 1.253→1.298  off 1.160→1.139  (floor 1.260)
+    pan step p95:               on 3.12         off 3.11         (unchanged)
+
+⇒ **÷9.6 on the §12.59.1 mechanism**; a seed-on pan is statistically near its
+own still. The still floor did not move (the all-suspects-acquitted control).
+Residuals, both filed rather than open: (1) step p95 unchanged — the seed
+kills the OSCILLATION, not the single first convergence step of a
+newly-revealed surface; (2) mid-pan `cold` 106–312 vs 10–18 seeded — the pan's
+leading edge births whole ladders in one frame, so most edge probes still
+start cold, and the excess STILL fell 9.6× — the seeded interior/trailing
+fills evidently carried the visible churn. If a future report names the
+leading edge, the spatial-neighbour fallback (same-cascade, root included) is
+the specced next step and `SEED_COLD` is its demand instrument.
+
+Files: `srcSeed.js` (new — passes, stats, `formatSrcSeed`), `srcConfig.js`
+(`SEED_RAYS = 6` ≈ 8 frames of 0.78 rays/bin, just under the decay's steady
+state so a newborn is never harder to move than a settled bin), `srcSystem.js`
+(build hatch `__giSrcSeed`, live dial `__giSrcSeedRays` polled per frame,
+passGroups split, seed telemetry in readStats + debug line),
+`run-gi-flicker-frame.mjs` (`SEED_AB=1` arm + mid-pan liveness readback).
+
+### 12.60 THE STILL FLOOR SPENDS ITS BANKED HEADROOM — ALPHA_STILL 0.05 → 0.02 (2026-08-14, uncommitted)
+
+User (post-seed build live in their editor): "flicker is still present" — with the
+pan churn fixed (§12.59.3), what remains AT REST is the §12.59 still floor:
+per-pixel ray-noise VARIANCE, worst in dark pixels (largest relative amplitude —
+and their Sponza currently has NO environment, so dark areas are single-bounce
+lamp light with no fill at all; recommended user-side regardless).
+
+The lever was measured and priced in §12.38's ALPHA_SWEEP table: still floor
+1.15 rev/px at α_still 0.05 → 0.40 at 0.02 (÷2.9). It shipped at 0.05 ONLY for
+the light-toggle convergence trade — "intensity changes are invisible to the
+motion signal" — with the extra 2.9× explicitly banked as "headroom for when an
+intensity-delta joins the motion signal". §12.43 then built exactly that (the
+tracking window's `lightLum` arming term, driven by real prop-path intensity
+steps in the LIGHT_STEP harness), so the toggle now converges at the WINDOW's
+rate whatever the still floor is. The headroom is spendable; spent.
+
+Gate (`SRC=1 LIGHT_STEP=1` on the 0.02 build, one page, interleaved ×2):
+shipped 4.03 rev/px per step arm vs no-lift 11.40 vs window-off 0.46 (spread
+0.318) — "THE WINDOW CAP LIFT HOLDS", i.e. step convergence still rides the
+lifted evidence rate and re-caps after. In-page still control 0.517 rev/px.
+One constant changed (`TEMPORAL_ALPHA_STILL`); `motionOf`/lift/surpriseF all
+derive from it and recompute. Note `surpriseF` at rest is now 5 (was 2) — a
+surprised block forgets 5× faster relative to the slower floor, which is the
+mechanism's intent (surprise means the truth moved).
+
+### 12.62 LIGHT-TREE WIRING — THE STAGED PLAN (recorded 2026-08-14; execution next)
+
+`lightTree.js` is COMPLETE CPU-side (1,129 lines, `test:gi-lighttree` PASS —
+`estimateLightTree` converges to 0.013% of reference; block layout, importance,
+sampling and pdf all mirrored and gated) and has ZERO consumers. §12.58's
+camera-apparent seats mitigated the user's "4 emitters then nothing" report;
+this is the endgame that removes the cap entirely. The wiring is a MULTI-UNIT
+migration — one unit per consumer, each with its own gate, never a big-bang
+swap (a tree-sampled emitter and a promoted one must deliver the SAME number
+or the migration itself is a visible change — the file's own header):
+
+- **Unit W1 — build + upload. ✅ SHIPPED + GATE PASS (2026-08-14).** GISystem
+  builds the block right after `#buildEntries` (⚠ NOT inside
+  `#buildOccupancyField` — the field builds BEFORE the entries walk, so
+  `_emitterCands` is always null there; the gate's first FAIL caught exactly
+  that) over the seat-candidate meshes, `allocPoolWords` +
+  `queueRegionUpload` — the static shadow BVH's own allocator and staging
+  queue, zero new bindings. Publishes `__giLightTreeLive`
+  {abs,rel,words,counts,power} and a boot line. Hatch: `__giLightTree=false`.
+  Gate `run-gi-lighttree-upload.mjs`: PASS — 4 emitters / 1 node / 244 words
+  round-trip off the GPU with exact counts and f32-exact totalPower, static
+  BVH header as the known-good control. ⚠ GATE TRAP, PAID TWICE: an in-page
+  copy kernel built from a SECOND `three.tsl` import over the app's `bits`
+  node renders ZEROS with no error (the duplicate-three trap in harness
+  costume — both the tree region and the known-good control read 0, which is
+  what indicted the read path). Whole-buffer `getArrayBufferAsync` + slice is
+  the honest read. Incidentally: the dead-[J] watchdog fired on 2 of 4 gate
+  boots — the §12.56 race frequency holding on an UNMASKED rig.
+- **Unit W2 — WGSL descent, twin-gated.** `sampleLightTree`/`clusterImportance`
+  as TSL/WGSL against the block, diffed bit-level against the CPU mirror on a
+  seeded RNG (the srcRef discipline; the CPU side already exists as the
+  mirror). No consumer yet — a standalone gate kernel only. Traps by
+  construction: the 8-storage-buffer ceiling (the block rides `bits`, costing
+  ZERO new bindings — that is the whole reason W1 stages it there), and
+  `hashKey`-based rng (u32-pure, §srcShade's divide caveat).
+- **Unit W3 — [J] first.** `createSrcHitLighting`'s NEE swaps the 4-slot
+  emitter loop for ONE tree sample + pdf (the `importance` parameter at
+  srcShade.js:81 was left for exactly this). [J] is the right first consumer:
+  its output is temporally accumulated (variance-tolerant), and §12.26.5
+  priced bounds-based ranking at 3.00× standard error — the tree's
+  cone-bounded importance must be A/B'd against that number, not asserted.
+  Gate: §12.26.7's energy arm (analytic-on vs tree, mean over a region) plus
+  the flicker harness still floor.
+- **Unit W4 — the resolve's emitterDirectAt + emitterShadowPass.** The
+  screen-side swap, priced by §12.56.1's ledger (emitterShadowPass ~13-14 ms
+  with 3 emitters is the emitter pole — the tree turns O(slots×pixels) into
+  O(log n×pixels) and unifies the reach question with the importance cut).
+- **Unit W5 — retire the promotion path** (slots, seats, `MAX_EMITTERS`, the
+  R5 zeroing handoff moves to the tree's NEE set). Only after W3+W4 hold
+  their energy gates on the real Sponza.
+
+### 12.61 THE REST CADENCE — THE PRESET-INDEPENDENT 9.6ms GETS ITS FIRST CUT (2026-08-14, uncommitted)
+
+§12.57 queued "srcProbes cadence" as the next engine cut and the re-run cost
+probe (group parsing fixed for the §12.53/§12.59.2 group splits) finally put
+per-group numbers on the ultra chain. At scale 1.00, 210,635 rays: deposit
+(trace+attribute) 7.58 · [J] 2.72 · decay 1.12 · resolve[F] 1.06 · everything
+else ~1.8 = chain 14.30 ms (33 W-capped silicon; ratios are the claim). The
+three-arm least-squares: **deposit ≈ 3.7 ms floor + 42.2 ns/ray — rays are 71%
+of the deposit.** Two prior hypotheses died here: resolve-scale work cannot
+move the SRC chain (gather is 0.33 ms — the per-resolve-pixel cost lives in
+the SCREEN chain, §12.57's resolve 1.9 + emitter passes), and the bin-pool
+passes are a 2.2 ms floor, not the pole.
+
+**Shipped: the transport ceiling scales down AT REST.** §12.60's α 0.02 is
+what makes it affordable — a parked scene accumulates ~50 frames, so half the
+rays reach the same steady state at a √2 variance cost the ÷2.9 dwarfs. The
+drive term is `max(mLight, tr, camTerm)`: the α motion ramp, the §12.43
+tracking window, and camera recency (600 ms hold + 400 ms FADE — a budget
+step on the frame a pan ends is R1's cliff in miniature; deltas now computed
+unconditionally, the §12.47 cap lift stays opt-in and unchanged). Every term
+inherits the arming discipline its own mechanism already paid for. The decay's
+stride ROOT reads the post-cadence stride — the ceiling poll MOVED above the
+keep computation, closing a pre-existing one-frame root/stride skew that only
+mattered when the ceiling moved per-frame. `restFactor` is published on
+`__giSrcTransport` and `__giSrcRestFactorLive` (the §12.42 "a number nothing
+prints" rule). Hatches: `__giSrcRestCadence=false` (off), `__giSrcRestFraction`
+(live dial); a pinned `__giSrcTransportRays` is never scaled.
+
+All 10 `test:gi-src-*` node suites pass on the combined tree (seed + α + rest).
+
+**The receipt (same machine, minutes apart, same-px arms):** parked scale-0.50
+arm pre-cadence chain 15.43 ms / deposit 14.29 → post-cadence 9.78 / 8.64
+(−37% / −40%), the trace group EXACTLY halved (9.35 → 4.62 ms) and the image
+byte-similar (mean 0.1603 vs 0.1599, lit 70.8/70.7%). Editor-scale
+expectation: srcProbes ~9.6 → ~6 ms parked, full budget the instant anything
+moves. TWO TRAPS PAID FOR SHIPPING IT: (1) `publishTransport` runs at
+CONSTRUCTION and the first draft declared `restFactor` 500 lines later — the
+TDZ ReferenceError silently cost the ENTIRE SRC build and rendered a 4.7%-lit
+black scene with no error anywhere near the cause (the cost probe's "prewarm
+1 kernels" line was the tell); (2) the boot hold (`REST_BOOT_HOLD_MS` 3 s,
+same hold+fade shape as the camera term) — the fill-from-black is the one
+convergence the seed cannot prior, and the camera term alone gave it ~1 s.
+⚠ The cost probe's "traced rays"/stride columns parse the BOOT line, which
+reports build-time values — under the cadence the SETTLED rate is the factor
+times that; read the group table, not the rays column, on a parked page.
+
+### 12.63 THE RESIDUAL FLICKER IS THE PAN'S AFTERMATH — MEASURED ON THE REAL SPONZA, AND THE CAMERA-SETTLE α FLOOR (2026-08-14, uncommitted)
+
+User (with §12.59.3 + §12.60 + §12.61 live in their editor): "AO is great, but
+the flicker still persists." The rig arms were all green, so this round was
+measured ON THEIR SCENE — `run-gi-sponza-flicker/panab/stats/heatmap.mjs` boot
+the real GAME project read-only (tauri shim) and run the flicker harness's
+accumulator over the live resolve. What the tour established, in order:
+
+- **The console's constant `emitter slot 0 motion` lines are PLAY-MODE
+  physics** (launched emissive balls rolling; `peak 344` = a pooled ball
+  parking), not a tracker fault: a 20 s parked edit-mode watch read dC exactly
+  0.00000 on all four slots. The `armed by shadow` clusters are the day-cycle
+  sun (LightScript.ts, ±70° ping-pong) arming at its eased endpoints —
+  §12.46's designed behaviour. The play-transition `static shadow bvh`
+  rebuilds are reconciliation, debounced and counted by design.
+- **Three states, one in-page instrument** (rev/px/s over lit pixels): edit
+  parked **0.155** (rest cadence engaged, nothing armed — the at-rest fixes
+  HOLD on Sponza); play with the sun sweeping **0.475** (α ramp doing its
+  job; small 0.005 steps — but the interior is near-black at parts of the
+  cycle, so relative visibility is high and the missing scene ENVIRONMENT
+  makes it worse); edit pan→hold **2.45 — 16× the parked floor, the dominant
+  state the user actually works in.**
+- **Hold-churn suspects, priced live** (hatches, interleaved): rest cadence
+  off and α pinned at 0.05 both INSIDE the ±40% replicate spread — acquitted.
+  Seed rays 0: **3.1–3.5 rev/px/s and 4.5× the hot-pixel population** — the
+  §12.59.3 seed re-earns its keep on this scene. Stats dump: hash load 1–2%,
+  `noBlock` 0, `failed` 0, ~30 fresh probes/frame, seed live — every
+  capacity/cold-start suspect acquitted. Heatmap: churn **UNIFORM over lit
+  content** (curtains, bounce-lit vaults), not the pan's leading edge.
+- **Mechanism**: the transport is SCREEN-DRIVEN, so the set of surface points
+  feeding each probe is view-dependent — a pan shifts every probe's estimator
+  equilibrium slightly, and at α 0.02 the whole field crawls to the new
+  equilibrium over ~50 frames in full view. Evidence never becomes WRONG
+  (ALPHA_STILL's doc stays true); it becomes DIFFERENTLY SAMPLED.
+
+**Shipped: `CAM_SETTLE_ALPHA` 0.05 (§srcConfig doc carries the full argument).**
+α is floored on the SAME camera-recency hold+fade envelope the rest cadence
+reads (one envelope, two consumers — hoisted above `readAlpha`), so
+re-equilibration compresses into the window that already runs at full rays.
+Parked scenes never see it (camTerm 0); a pinned `__giSrcAlpha` outranks it;
+`__giSrcCamSettleAlpha` = false is the A/B arm, a number pins the floor.
+
+**Receipt (same-page interleaved, real Sponza):** short holds (1.25 s, biased
+AGAINST the fix) — hot pixels ÷1.6 (3/3 replicates), step amp lower 3/3, rev
+−12%; long holds (2.5 s) — **rev −23% (1.20 vs 1.56, 2/2 replicates,
+off-arm spread 1.557..1.569), churn −16%, step amp −12%**. Liveness:
+`alphaHold 0.020..0.050` on vs `0.020..0.020` off. `test:gi-src-temporal`
+green (standalone gates pass no motion getter and never see the floor).
+
+**Residual + next lever, filed:** post-pan holds still sit ~8× the parked
+floor after the settle — that residual is per-frame estimator variance on
+bright indirect content plus the α-invariant part of the redistribution
+transient, and no CPU dial reaches it. The specced next step is a
+RESOLVE-SPACE FILTER: either the gather→resolve spatial filter §12.53 already
+names as "lacking", or a temporal reprojection EMA on the resolve target
+(prev-VP infrastructure exists — `_giPrevVPStore`; depth is in hand;
+neighborhood clamp against ghosting). It would also buy down the play-mode
+sun number and the §12.59 still floor. Sponza probes stay in
+`scripts/run-gi-sponza-*.mjs` until it ships.
+
+### 12.64 THE ENVIRONMENT MUST NOT ALSO LIGHT MATERIALS DIRECTLY — IBL SUPPRESSION UNDER GI (2026-08-14, uncommitted)
+
+User (after following §12.63's "set an environment" advice): "when adding
+environment, it fills the whole sponza with ambient, which is not correct, as
+it must have very dark areas where light almost does not reach." Exactly
+right, and it is a WIRING GAP, not tuning: three applies `scene.environment`
+as per-material image-based light — diffuse `iblIrradiance` AND specular
+radiance, both UNOCCLUDED (EnvironmentNode.setup) — while GI ALSO carries the
+same environment correctly (escaping rays return `sceneSkyRadiance` through
+cascade transmittance). Every surface got the flat copy on top of the
+occluded one. At roughness 1 the "specular" half degenerates into a second
+ambient, so keeping it would leak the same wash — both halves go.
+
+**Shipped:** while GI is active and an environment exists, GISystem sets
+`scene.environmentNode = vec3(0)` — the supported three seam: a node there
+REPLACES the one three builds from `scene.environment`, which itself stays
+untouched (GI's sky read, Scene Settings, background all keep working).
+Installed in the per-frame poll beside the sky read (nothing notifies);
+removed on dispose only if still ours; mirrored onto the §12.55 background
+compileTarget so the warm pipelines match the live ones. `__giKeepIBL = true`
+restores the old behaviour (the A/B arm).
+
+**Gate** `run-gi-env-ibl-gate.mjs` (real Sponza via shim, in-page 64×32 white
+env, SUN ZEROED, beauty-frame region means via onPostRender readback):
+
+    deep-arch region:  no-env 0.0244   ibl-on 0.4825 (the 20× wash)   suppressed 0.0605
+    full frame:        no-env 0.2017   ibl-on 0.4884                  suppressed 0.2181
+
+⇒ the wash is gone; the arch keeps only GI's occluded sky (+0.036 through
+real openings); open areas stay lit. Eyecheck frame: atrium lit from the sky,
+vaults self-shading, corridor end genuinely dark.
+
+**THREE INSTRUMENT TRAPS this gate paid for, in order:** (1) a "dark region"
+rect chosen off a sun-lit screenshot measured LIT content — the sun at
+intensity 50 tonemap-drowns a ±1 environment to ~1% of the frame; zero the
+sun for any environment-scale measurement (this is also WHEN the user sees
+the wash: the day-cycle sun spends much of play below the horizon).
+(2) The PMREM of a 1×1 DataTexture comes out ~black — the first sun-off run
+measured GI sky in BOTH arms and called the suppression dead; 64×32 works.
+(3) Toggling `scene.environmentNode` mid-session must be followed by a
+`material.needsUpdate` sweep in a harness — at BOOT the GI compile wave
+covers it, which is the shipping path.
+
+### 12.65 THE IRRADIANCE TEMPORAL FILTER — POST-PAN CHURN ÷12, STILL FLOOR ~0 (2026-08-14, uncommitted)
+
+The §12.63 residual, built: a reprojected screen-space EMA over the GI
+resolve. The probes' own temporal layer cannot absorb the pan aftermath — it
+IS the thing converging — but a SCREEN layer can, because for a parked or
+panning camera over static geometry the same world radiance lands on
+reprojectable pixels.
+
+**Shape** (`createGiIrradianceTemporalPass`, giScreen.js): the resolve now
+writes `irradianceRaw` (a SHIM targets view — createGiResolve destructures
+only irradiance/radiance, so `{...targets, irradiance: raw}` re-targets it
+without touching its code); the filter validates history exactly like the
+light-shadow filter (prev-VP clip, row-flip, world-position epsilon, 3×3
+silhouette rescue — that pass's comments carry the measured reasons) and
+writes `targets.irradiance`, the texture every persistent material binding
+has always pointed at — materials never learn the filter exists. History
+snapshot = `createGiLightShadowHistoryPass` REUSED VERBATIM at 1:1 scale.
+The trio (`irradianceRaw/Hist/HistPos`) is lazy like the shadow trios
+(~30MB at editor res, paid only when built).
+
+**Ghosting control is the shadow chain's, not a neighborhood clamp:** the
+weight uniform runs `0.9 × (1 − mLight)` and zeroes while a §12.43 window is
+open — light motion (matrix, luminance, emitter — the α ramp's family)
+stales history semantically in a way position validation cannot see. Camera
+motion deliberately does NOT drop it; that is the point. Hatches:
+`__giIrrTemporal = false` (build-time, removes the chain),
+`__giIrrHistWeight` (live pin; 0 = same-page passthrough off-arm).
+
+**Wired into all four dispatch paths** — build queues (×3), the idle
+frameQueue (with the filter built, the resolve writes RAW; dropping the pair
+there would freeze `irradiance` for the whole idle stride), and the resize
+rebuild+splice contract (fresh targets, queue positions preserved). The
+prev-VP store gets exactly one writer per frame: the irr block copies BEFORE
+the shadow block overwrites, and owns the update when the shadow block is
+compiled out (analytic arm).
+
+**Receipts (all with the filter live):**
+- Sponza pan-holds (SEG=240, interleaved ×2, off-arm = weight pinned 0,
+  same cost both arms): **0.048/0.059 vs 0.626/0.683 rev/px/s — ÷12**,
+  churn −32%, and the filtered hold floor sits BELOW the old parked floor.
+- Rig `SRC=1 LIGHT_STEP=1`: **still control 0.004 rev/px** (the §12.59
+  floor, ~0.2–0.5 pre-filter, is effectively gone); **the window cap lift
+  HOLDS** — shipped 1.03 vs no-lift 3.91 rev/px, tight round spread 0.080,
+  no lag/ghost signature in step amplitudes: light events pass straight
+  through the motion-zeroed weight.
+- `smoke:gi-gpu` both arms PASS with the filter in-chain.
+
+Play-mode sun sweep is deliberately UNCHANGED (weight ≈ 0 under sustained
+light motion — that state runs on the α ramp as before). If a future report
+names it, the §12.53 gather→resolve spatial filter is the remaining specced
+lever.
+
+#### 12.65.1 POSTMORTEM: THE FILTER IS OPT-IN UNTIL §12.56 IS FIXED (2026-08-14, same day)
+
+User (after the reload that delivered §12.63–65): "there are some weird
+places where light never appears, though visually it should reach it" — and
+the dark-pocket probe walked a black pixel to a probe ladder CARRYING LIGHT
+(c0 payload 32/32 known, meanL 0.36), a lit gather (min 0.02, empty 0), a
+lit RAW resolve (2.36, 2.17, 1.77) — and `targets.irradiance` at EXACT ZERO
+across the whole band. The filter pass sat in every queue with weight 0.9
+and was never dispatched.
+
+**The wedge, established by bisect** (`run-gi-irrfilter-forcedispatch.mjs`):
+the pair's pipelines are silently never created from the BATCHED frame path
+on some boots (others are fine — same §12.56 nondeterminism), and a batch
+containing a pending member drops the WHOLE submit — the resolve's own
+writes included, which is why even the fail-safe rawCopy topology (shipped,
+kept) still read black. Dispatching the HISTORY pass ALONE from page context
+created its pipeline and the entire frame path unwedged on the spot, every
+boot tried (7/7).
+
+**Four priming shapes, all fired, all failed** — from ENGINE context the
+identical dispatch never creates the pipeline: (1) in-tick batched pair;
+(2) `_fieldReadyOnce`-gated single-shot (plus the `_frame % 60` trap — that
+counter pins near zero, use a dedicated one); (3) task-context single-node
+`renderer.compute`; (4) `renderer.computeAsync`. Page-context
+`renderer.compute([node])` — same renderer object, same node object — works
+instantly. The engine-vs-page difference is unidentified and lives somewhere
+in `installAsyncComputePipelines`' interaction with the frame loop; the
+replay guard only covers depth-0 skips by design, and batch skips assume
+"next frame the pipeline is ready", which is exactly what the wedge breaks.
+
+**Shipped state:** `__giIrrTemporal === true` opts IN (default off); all
+§12.65 code, the fail-safe resolve topology and the A/B instruments stay.
+The §12.56 GENERAL FIX — an auto-retry/watchdog that detects a
+pending-forever pipeline and re-rolls it — is now the top GI reliability
+item: it gates this filter's ÷12, the known dead-[J] race AND the open
+occluder-pipeline race. The dark-pocket + force-dispatch probes are its
+ready-made gates.
+
+### 12.66 THE BLACK FRESH BOOT — OPEN, with the full exoneration ledger (2026-08-14 afternoon)
+
+**Symptom.** Every fresh harness boot of the user's GAME/Sponza since ~14:40
+renders a BLACK viewport (blackFrac 0.9957-0.9998, meanLum 0.0003-0.0004,
+IDENTICAL across ~12 boots — a constant image, not a dark render). The editor
+UI is fine, the loop ticks at ~100fps, GI textures are lit and healthy, three
+assistant-session live editors render LIT, and a boot at 14:07 (flicker
+verification run, page loaded ~13:52-14:00) rendered LIT with the same
+procedure. **`castShadow=false` on the sun lights the frame to meanLum 0.89.**
+The sun's shadow SAMPLE reads ~0 at every pixel.
+
+**The two decisive receipts:**
+- `shadow.bias` ±0.05 moves NOTHING; `shadow.intensity=0.5` reads exactly
+  `mix(1, ~0, 0.5)` — the sample is a hard 0 independent of the comparison
+  reference. A real-map comparison CANNOT be bias-independent ⇒ the shader is
+  not comparing against the real map content.
+- The real map is VERIFIED GOOD: 64×64 compute census reads min 0.204 / mean
+  0.902 / 15% geometry coverage — exactly Sponza's footprint in an 80m ortho
+  (early "85% far-plane = casters culled" reading was wrong — that IS the
+  correct coverage). One 4096² ShadowDepthTexture created per boot (t=2.3s,
+  ShadowNode.renderShadow — device.createTexture census with stacks).
+
+**Exonerated, each by a dedicated boot or live toggle** (scripts:
+`run-blackframe-bisect.mjs` PPOFF/NOWAVE/GIOFF/NOGUARD env-matrix,
+`run-blackframe-shadowstate.mjs`, `run-blackframe-texcensus.mjs`,
+`run-blackframe-wgsl-capture.mjs`):
+- §12.65 filter (default-off + IRR=0 control black), the §12.56 watchdog
+  (never fired — its warn lines are absent), PP (component removed live AND
+  `__ppForceDisabled` from frame zero — the ONLY valid PP bisect for
+  compile poisoning), GI wholesale (`__giOff`), the compile wave
+  (`__giNoCompileWave`), the 14:02 gbuffer shadows-off guard
+  (`__giGbufShadowGuard=false`), ALL COMBINATIONS of wave+guard+PP off,
+  occlusion culling + `cullShadowCasters` (camera-governed culling, Engine.js
+  rework), tonemap/exposure (state dump + NoToneMapping live), shadowMapType
+  Basic→PCFSoft, bias/normalBias sweeps, camera component enabled on/off,
+  scene light props (byte-identical to GAME-HEAD), Chrome version (update
+  staged 4:51 but chrome.exe unswapped), vite dep re-optimization (deps
+  cache untouched since 9:57 — before the lit boots), duplicate-three.
+- The empty-fragment-struct pipeline errors (`struct OutputType {}`) are
+  PP-warm collateral — GISystem #warmOverridePass compiling the PP scenePass
+  builds one scene-material fragment with zero outputs (33KB full-beauty
+  WGSL, captured with stacks) — but PPOFF boots have ZERO of them and are
+  still black. Real bug, separate ticket, NOT this.
+- Unlit white MeshBasicNodeMaterial probe cube: never rendered (its fresh
+  pipeline compiles into the broken state too) — blackness is not
+  content-specific.
+- `castShadow` off→on re-arms the black (a LIVE shadow-node rebuild
+  re-enters the broken state — it is not boot-order-once).
+
+**Standing hypothesis (untested):** the frame's bind groups hold a view of a
+PLACEHOLDER/dummy depth texture instead of the real ShadowDepthTexture, and
+whatever refreshes bindings placeholder→real is defeated in this tree state.
+Next instrument, prescribed: document-start wrap of `device.createBindGroup`
+(+ `texture.createView` correlation) — census which texture view the settled
+frame's fragment bind groups reference for the comparison sampler, compared
+against the t=2.3s real texture. That turns "which texture does the shader
+read" from theory into a boot log line.
+
+**Timeline paradox, unresolved:** the lit 14:07 run vs black 14:40+ runs
+differ by (a) the user's 14:17 scene+project save — every individual delta
+tested and exonerated, whole-file A/B impossible (no pre-save copy exists);
+(b) giScreen@14:02 + GISystem@14:34(mine) — both behaviorally exonerated via
+hatches/absent log lines. Either an untested interaction of the 14:17 save,
+or the 14:07 run's lit-ness itself deserves suspicion (its page loaded
+during an edit window; its arms dispatched page-context computes
+continuously — though the same dispatches demonstrably do NOT heal black
+boots now).
+
+**User impact: an editor RESTART on the current tree will boot black.** The
+live sessions stay lit only because their material bindings predate the
+breaking state. Mitigation available to the user if hit before the fix:
+turn the sun's Cast Shadow off/on is NOT enough — set Shadow → castShadow
+OFF renders lit (no sun shadows) until the fix lands.
+
+**Hatches added this session (all §12.66-labeled, keep until closed):**
+`__ppForceDisabled`, `__giOff`, `__giNoCompileWave`, `__giGbufShadowGuard`,
+`__ppScalarParams` (PostprocessComponent matParams bisect). Plus the SSR
+composite rewrite to pure premultiplied ADD (postGraph.js — correct
+regardless of this bug; the displacement term `k` modeled factors the addon
+premultiplies and its comment's "runs LOW" claim was wrong on fresnel).
+
+**RESOLVED (2026-08-14 evening). THE BLACK FRESH BOOT IS A CORRECT RENDER —
+of the saved scene, from the harness's default camera pose. No engine bug;
+no fix; no code changed.** The decisive receipt is one screenshot: the
+user's own LIVE, healthy, brightly-lit editor was pointed (via MCP
+`viewport_setCamera`, pose saved and restored) at the exact pose every
+harness boot measures — position (7,5,9) → target (5.25,3.75,6.75) — and it
+rendered the SAME near-black frame. The dark view is real scene content.
+
+The full causal chain, every link measured on fresh boots
+(`run-blackframe-{bindcensus,comparecensus,frameid,ghostcaster,ghostid,
+giresolve,gistages,gbufread,srctiles,hatchmatrix,slotdesync,alphapin,
+emitterchain,dispatchcensus,verify}.mjs`):
+
+1. **The shadow pipeline is CORRECT end-to-end** — the standing
+   placeholder-binding hypothesis is REFUTED. Document-start
+   createBindGroup/createView census: every settled-frame fragment bind
+   group references the REAL 4096² ShadowDepthTexture (serial-verified
+   against `backend.get(depthTexture).texture`); one comparison sampler,
+   `less-equal`, correctly paired; `reversedDepthBuffer` false both sides;
+   the map re-renders EVERY frame (94.9 passes/s counted at
+   `beginRenderPass`, `updateMatrices` 94.9/s, far=50 at every call); the
+   shadow matrix's implied sun direction matches the scene file to 3
+   decimals. Live compare-flips behave exactly as a healthy pipeline must:
+   GreaterEqual/Always → lit (0.83), LessEqual/Never → black.
+2. **The hard-0 sample is TRUE occlusion.** `sponza_25` is a REAL 37×23 m
+   roof slab (geometry bbox y 12.8–14.3) spanning the entire building —
+   castShadow bisect: killing only sponza_25 lifts the frame 0.0003 →
+   0.117 (correctly-shadowed Sponza, not the all-lit 0.83). CPU truth:
+   view surfaces project ~0.21 deeper than the stored roof depth at their
+   texels — bias ±0.05 (±2.5 m) rightly cannot bridge a 10.5 m roof-to-
+   floor gap, which is the whole "bias-independent" receipt. (The earlier
+   "map content = 85% far-plane + Sponza footprint = GOOD" reading was
+   right; the missing insight was that the footprint's interior IS the
+   roof, over everything.)
+3. **The scene is mostly dark BY CONTENT.** Sky/ambient are authored 0
+   (GI override skyIntensity 0, scene ambient off), the sun (intensity 50)
+   is roof-blocked over the whole interior, and the single interior light
+   is a 1 m emissive-×10 cube (`Mesh 7.mat`). Under that lighting the
+   default-framing view is genuinely near-black even with GI converged —
+   the live-editor A/B proves it.
+4. **Why 14:07 was lit and 14:40+ black:** the harness's fresh browser
+   profile has NO saved viewport pose, so every boot frames the scene at
+   the DEFAULT pose; the 14:17 scene+project save changed what that
+   framing shows (and the assistants'/user's live editors keep their own
+   localStorage poses in the lit gallery). The prior session's delta hunt
+   compared light/camera-component props — the one delta that mattered was
+   the VIEWPORT POSE, which lives outside the scene diff. Its
+   "castShadow off→on re-arms the black" was the sun flooding vs not; its
+   "unlit white probe cube never rendered" was the §12.65.1 instrument
+   artifact (fresh material pipeline's first frames), not output-chain
+   poisoning.
+
+**Verification (fresh boots at the user's WORKING pose,
+`run-blackframe-verify.mjs`):** PPOFF boot 1 PASS (blackFrac 0.0259,
+meanLum 0.3301, seats 0); PPOFF boot 2 PASS (0.0254 / 0.3075, seats 1);
+PP-on boots 3+3' both LIT at meanLum 0.3097 / 0.3064 with blackFrac
+0.0383 / 0.0386 — nominally over the 0.03 gate, reproducibly, because the
+PP tonemap crushes the arcade vaults' deep-shadow pixels below the 2/255
+threshold (~3.9% vs ~2.5% PP-off); a 0.31-mean frame is 1000× the black
+boots' 0.0003 and unambiguously lit, so the gate for PP-on runs should be
+meanLum-based (> 0.1), not blackFrac. castShadow ON in every boot.
+`npm run smoke:gi-gpu` PASS both arms; `npm run test:gi-spawn` ALL PASS.
+The original bisect gate (lit at the DEFAULT pose) is unsatisfiable by
+construction and retired with this entry. Note boots 1/3/3' passed WITH
+ZERO EMITTER SEATS (sun through openings + bounce carries this pose)
+while boot 2 seated the cube — the seat race is per-boot real; its
+receipt is in the finding below.
+
+**Real (secondary) findings kept open from this hunt:**
+- **Emitter-seat streaming race (OPEN, §12.56-family):** one census boot
+  settled 20 s past "[gi] built" with `_emitterInfos` EMPTY
+  (`run-blackframe-dispatchcensus.mjs`: emitterInfosLen 0, emitter chain
+  frameSkip'd every frame, shadow targets at birth-zero) while sibling
+  boots seated the cube (rgb=10) — the promotion depends on
+  `resolveMaterialSurface` seeing the streamed material, and the
+  fingerprint rescan (which DOES hash resolved emissive) had not caught it
+  by +21 s. With a seat absent the lamp contributes nothing anywhere
+  (R5 zeroes the palette emissive for promoted/would-be-promoted paths).
+  Needs a dedicated boot-matrix before shipping a fix.
+- The emitter/light shadow chains' **fail-open clear is one silently
+  skippable dispatch** (§12.56 first-dispatch skip): until the chain's
+  first real dispatch lands, fresh targets read 0 = fully occluded —
+  fail-CLOSED in practice. Harmless when the chain runs; a black-lamp
+  amplifier whenever the seat race (above) or a §12.56 wedge stalls the
+  chain.
+- `giSkippedComputes` is cleared at the END of the GI tick
+  (GISystem.js ~line 2180), so any postRender skip census reads an empty
+  set by construction — an instrument trap that cost this hunt one wrong
+  "zero skips" conclusion. Sample it inside the tick or before the clear.
+- "[gi] first frame after compile wave took 1446ms — pipelines recompiled
+  at resume (likely the postprocess render path; report this)" — logged on
+  every fresh boot; already self-reporting, still unfixed.
+
+**Cleanup:** the `run-blackframe-*.mjs` one-offs (19 scripts: this
+session's 15 + the prior session's bisect/shadowstate/texcensus/
+wgsl-capture) are superseded by this entry and can be deleted with it —
+keep `run-blackframe-verify.mjs` until the emitter-seat race closes; the
+§12.66 hatches above stay until then too. The `__giSrcSecondary`
+memory-note stands. The `sponza_25` roof is the user's content decision —
+if they want the classic open-atrium Sponza look, castShadow off on
+sponza_25 (or deleting the roof) is a SCENE edit, not an engine matter.
+
+### 12.67 LIGHT-DEPARTURE TAIL — stale bleed + flicker after a light leaves (user report 2026-08-14, spec)
+
+User: "when lights was lighting some surface, and then went away, this surface
+continue color bleeding and flickering for quite some time after that."
+
+Mechanism, read at srcSystem.js §12.61 drive block: `restDrive =
+max(mLight, tr, camTerm, bootTerm)`. A departing light arms the §12.43 window
+(tr=1, relaxed root, cap lift) — but the window closes on the EVENT cadence,
+not on re-convergence. After close: tr=0, mLight subsides, restDrive→0 ⇒ α
+returns to TEMPORAL_ALPHA_STILL (0.02) AND the rest cadence cuts rays to
+REST_TRANSPORT_FRACTION. The previously-lit surfaces still hold the OLD
+equilibrium: stale bounce energy now decays at still-α on a REDUCED evidence
+rate — and §12.52 surprise cannot rescue it (it needs fresh deposits to detect
+the disagreement; starved blocks keep their ghost until rays revisit, then
+correct in sparse blotches = the reported flicker). The camera version of this
+exact hole is what §12.63 fixed with the settle envelope.
+
+Fix shape (NOT YET BUILT — src is locked on §12.66 until the forensics agent
+lands): a LIGHT-settle hold+fade twin of camTerm — the §12.43 window CLOSING
+starts `lightTerm` (hold ~REST_CAM_HOLD_MS-class, fade REST_CAM_FADE_MS-class)
+feeding BOTH the α floor (§12.63 shape) and restDrive, so the field keeps
+full evidence + elevated α until the departed light's ghost has re-converged.
+Hatches: `__giSrcLightSettleHold(Ms)`, pin rules as §12.63.
+
+Gate: extend the flicker rig with a LIGHT_DEPART arm — light parked over a
+surface until settled → step OFF → measure (a) tail half-life of the region's
+luminance error vs final, (b) rev/px during the tail. A/B hatch-off vs on;
+the §12.63 SEG=240 protocol (short holds bias against settle fixes).
+
+#### 12.67.1 ENVELOPE SHIPPED; RIG VERDICT OPEN (2026-08-14)
+
+Shipped: `LIGHT_SETTLE_HOLD_MS 1500 / FADE 800` (srcConfig), `tr` hoisted, α
+floor takes `max(camTerm, lightTerm)` (one CAM_SETTLE_ALPHA floor, two
+envelopes), restDrive gains `lightTerm`. Hatches `__giSrcLightSettle`,
+`__giSrcLightSettleHoldMs/FadeMs`. All 10 gi-src node suites PASS.
+
+Rig: LIGHT_STEP gained a `settle-off` config + a TAIL measure per arm. First
+run read shipped-tail 0.569 vs settle-off 0.622 (÷1.09 — a wash) — but the
+PROTOCOL IS CONFOUNDED: configs alternate step direction, so `shipped` got
+the 2→6 (arrival) arms and `settle-off` the 6→2 (departure) arms, and the
+rig never steps to ZERO — the user's regime is a true departure with
+multibounce residue, which a 6→2 dim on the small rig barely exercises.
+Verdict OPEN until the arm is direction-matched (reset light between
+configs), steps to ~0, and takes a LONGER tail (the §12.63 lesson: short
+holds bias against settle fixes). The envelope stays in (mechanism sound,
+cost bounded: ~2.3 s of full budget after a light event), and the REAL gate
+is the user's Sponza with a toggled lamp.
+
+### 12.68 PRESET ENERGY — "MEDIUM IS TOO DARK" WAS THE HYBRID-PLANE BOX
+### FALLBACK HALVING THE TRANSPORT'S FREE PATH (2026-08-14, uncommitted)
+
+User report, with screenshot: on the MEDIUM preset their Sponza is "too dark
+in most places" — deep arches/interiors near-black, sun-lit areas fine — and
+"low has the same problem doubled"; ultra/high look correct. Since §12.64 the
+environment lights ONLY through GI, so a preset that loses GI energy shows
+exactly as this. A preset may buy noise and coarseness; it must not lose
+energy — this section is the measurement of where medium/low lost it, and the
+fix.
+
+**The instrument** (`scripts/run-gi-preset-energy.mjs`, kept until this
+section is verified in the user's editor): one FRESH boot per arm against the
+real read-only Sponza, all at the §12.66 working pose, preset forced via
+`__giConfigOverride = { quality, resolveScale, exactReflections }` before
+boot. Per arm: beauty-frame luminance percentiles + an 8×6 cell grid (canvas
+readback, 5-frame mean), `_giTargets.irradiance` percentiles (PRIMED compute
+readback — §12.65.1 discipline), the live deposit/merge/gather stats, and the
+boot config lines. Repeat boots reproduce to 3 decimals (medium ran twice:
+GI mean 0.35804 / 0.35547).
+
+#### 12.68.1 The ladder, and the cliff
+
+    arm            ray-hit mode            GI screen mean   GI p25    frame p05   dark cells (7/14/47)
+    ultra          hybrid-exact-complex        1.808        1.084       0.204     0.32 / 0.31 / 0.14
+    high           hybrid-exact-complex        1.659        0.917       0.206     0.32 / 0.30 / 0.15
+    medium         hybrid-plane (auto)         0.358        0.108       0.093     0.08 / 0.10 / 0.09
+    low            hybrid-plane (auto)         0.253        0.052       0.076     0.06 / 0.08 / 0.08
+
+The loss is IN THE FIELD (the gather's own meanLum shows the full collapse:
+1.49 vs 0.35), not the resolve or composite; the cliff sits exactly at the
+high→medium boundary; and it is ENERGY, not variance — every percentile of
+the GI distribution drops ~3-5×.
+
+#### 12.68.2 Single-knob isolation — the mode owns it, everything else acquitted
+
+    arm                                     GI screen mean      Δ vs its tier
+    medium + __giRayHitMode=exact-complex       1.460           ×4.1  (≈ high)
+    high   + __giRayHitMode=hybrid-plane        0.614           ÷2.7  (≈ medium)
+
+The medium+exact arm changes NOTHING else: same 256×128×176 @ 0.164 m
+occupancy grid, same s₀ 0.6, same 1 ray/px, same 26,330 rays/frame, same
+probe budgets — and recovers to within 11% of high. Acquitted by the same
+table: ray budget (ultra fires 8× low's rays for +9% mean), spacing0,
+raysPerPixel, probe budgets, resolveScale, record-pool starvation (§12.52.2's
+suspect — pool 355k/481k claimed at medium, NOT saturated), and attribution
+(unattributedRate 1.4% plane / 2.6% exact — both noise).
+
+#### 12.68.3 The mechanism, from the deposit stats
+
+    medium, same pose        hitRate    mean free path    deposits/ray
+    hybrid-plane              0.984         2.00 m            1.57
+    hybrid-exact-complex      0.966         3.92 m            2.09
+
+HybridPlane resolves an occupied voxel through its fitted SIMPLE plane — but
+any cell WITHOUT a usable record (complex fit: edges, trim, curved mouldings,
+foliage; pool overflow; unfitted) keeps occupied-BOX semantics
+(`occupancyField.js`, traceHybridPlane header): the ray stops on the voxel
+HULL even where the actual surface never crosses its path. Sponza's surfaces
+at 0.164-0.234 m voxels are dense with complex-flagged cells, so the
+transport's mean free path HALVES: rays die on phantom hulls near their birth
+surface instead of reaching the sun-lit courtyard or the sky, and each false
+hit deposits the phantom's (dark, often back-facing) radiance with T = 0 —
+occluding the cascade chain's real answer behind it. A multiplicative energy
+sink, worst exactly where all light is indirect. Exact-complex runs the
+cell's ≤16-triangle list and lets a genuinely empty crossing CONTINUE — §4.3
+calls that "the ONE case where a cell is left without a hit on exact
+evidence" — which is precisely the difference the ladder measured.
+
+#### 12.68.4 The fix, and the post-fix ladder
+
+`AUTO_MODE_BY_QUALITY` (src/modules/gi/rayHit/RayHitConfig.js): low/medium
+move from HybridPlane to HybridExactComplex — hit precision is now
+preset-INDEPENDENT, and the presets keep trading rays, probe density and
+resolution (variance and reach, never energy). `__giRayHitMode =
+"hybrid-plane"` remains the A/B hatch. Measured cost on the real Sponza,
+medium: occupancy 37→72 MB (the tri pool), GPU 5.6→6.4 ms, 74→70 fps on the
+power-capped 4070 (§12.57 caveat applies); low: 15.5→29.9 MB.
+
+    arm (auto mode)      GI screen mean         frame p05   dark cells (7/14/47)
+    medium POST-FIX       1.480  (was 0.358)      0.196     0.31 / 0.28 / 0.12
+    low    POST-FIX       0.819  (was 0.253)      0.115     0.12 / 0.12 / 0.11
+
+Medium sits within 11% of high — the user's report is resolved at the tier
+they named. Low recovers 3.2× but stays ~½ of high BY DESIGN, and the
+residual is now the documented trades, not the bug: `secondary: false` (low
+ships single-bounce — SRC_QUALITY), and 0.234 m voxels whose over-limit dense
+cells (4,351 exceed MAX_COMPLEX_TRIANGLES) keep box hits. If "low is still
+too dark" survives this fix, those two are the remaining owners, in that
+order — note there is NO hatch to force the second bounce at low
+(`__giSrcSecondary` is opt-OUT only; the tier gate wins).
+
+Gates after the flip: `test:gi-src-gather`, `test:gi-src-merge`,
+`test:gi-src-temporal`, `smoke:gi-gpu` — all green (the smoke takes explicit
+`?mode=`, so the auto flip changes no smoke arm).
+
+**Instrument note for future preset work:** `__giConfigOverride = { quality }`
+steers every tier-keyed table (both `qualityTierOf`s read the settled
+`config.quality`) but NOT `BY_TIER`'s resolveScale/exactReflections, which
+were already spread into the settled object — force those two alongside or a
+"forced ultra" runs at the saved scene's resolve scale.
+
+#### 12.67.2 DIRECTION-MATCHED VERDICT (2026-08-14)
+
+Protocol fixed (every config re-lit to 6, settled, stepped 6→0; two tail
+windows). Result ×2 rounds: tail1 shipped 1.007 vs settle-off 1.135 rev/px
+(÷1.13, shipped also tighter: 1.004/1.010 vs 1.053/1.218); tail2 a wash
+(0.836 vs 0.822). Still control UNCHANGED with the envelope in (0.901) — no
+noise leak into parked scenes. Interpretation: at rig scale the departure
+ghost drains within ~one window regardless, so the envelope's full value
+(multibounce residue on real content) is not measurable here; the rig CAN
+however say the envelope costs nothing. Note for a future half-life metric:
+rev/px per window under-credits settle fixes structurally — window-off reads
+the LOWEST tail1 (0.705) precisely because it converges slowest (its ghost
+outlives the window, churning less per window but lasting longer — the exact
+"quite some time" the user reported). Tail LUMINANCE ERROR vs final is the
+right metric when this next needs numbers. Envelope stays shipped; the
+user's Sponza lamp scenario is the standing referee.
