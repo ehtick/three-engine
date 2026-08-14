@@ -1375,7 +1375,13 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
           const dist = toEmitter.length().max(1e-3).toVar();
           emitterData.push({
             slot,
-            shadow: channels[index] ?? float(1),
+            // §12.70 W4b: under the tile cut the packed channels are keyed to
+            // each pixel's TILE list, not to these global seats — sampling
+            // them here would occlude one lamp's glow with another lamp's
+            // shadow. The glow goes UNSHADOWED on that arm (a near-emitter
+            // effect the seats still cover); re-keying the material path is
+            // W5's business if it ever shows.
+            shadow: light.emitterTileKeyed ? float(1) : (channels[index] ?? float(1)),
             dist,
             dirToEmitter: toEmitter.div(dist).toVar(),
             active: step(0.001, slot.radius),

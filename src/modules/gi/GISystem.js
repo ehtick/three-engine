@@ -30,8 +30,9 @@ import * as THREE from "three/webgpu";
 import { Fn, If, cameraPosition, cos, float, fract, mix, normalWorld, positionWorld, renderGroup, screenCoordinate, screenUV, select, sin, smoothstep, texture, uniform, uniformArray, vec2, vec3, vec4 } from "three/tsl";
 import { GI_BOOT_AMBIENT_MAX_TICKS, bootAmbientStep } from "./bootAmbient.js";
 import { giDebugView, resolveGiConfig, sceneSkyRadiance } from "./giConfig.js";
-import { blitBvhAtlasTiles, createGiBvhReflect, createGiBvhTarget, createGiEmitterShadowPass, createGiGBuffer, createGiIrradianceTemporalPass, createGiLightShadowFilterPass, createGiLightShadowHistoryPass, createGiLightShadowPass, createGiLightShadowWidePass, createGiResolve, createGiShadowClearPass, createGiTargets, renderGiGBuffer } from "./giScreen.js";
-import { resolveMaterialSurface, serializeMeshForBake } from "./voxelizeOnce.js";
+import { blitBvhAtlasTiles, computeCompressedTextureAverage, createGiBvhReflect, createGiBvhTarget, createGiEmitterShadowPass, createGiEmitterTileCutPass, createGiGBuffer, createGiIrradianceTemporalPass, createGiLightShadowFilterPass, createGiLightShadowHistoryPass, createGiLightShadowPass, createGiLightShadowWidePass, createGiResolve, createGiShadowClearPass, createGiTargets, renderGiGBuffer } from "./giScreen.js";
+import { createLightTreeEmitterImportance, createLightTreeRecordSlot } from "./lightTreeGpu.js";
+import { noteTextureAverage, pendingTextureAverages, resolveMaterialSurface, serializeMeshForBake } from "./voxelizeOnce.js";
 import { createSrcVolume } from "./srcVolume.js";
 import { createSrcDistanceView, createSrcOccupancyView } from "./srcDebugViews.js";
 import { createSrcProbeSystem, describeSrcProbeSystem, formatSrcProbeFrame, srcProbesEnabled, srcShadeEnabled } from "./srcSystem.js";
@@ -1853,10 +1854,54 @@ export class GISystem {
       // render just above. Self-guarding (see blitBvhAtlasTiles's own
       // comment) — cheap to call every tick, only does real work once per
       // bvhScene build.
-      if (state.bvhScene?.pendingGpuTiles?.length) {
+      // ⚠ NOT while the compile wave is in flight: #warmOverridePass pins the
+      // postprocess pass's MRT on the renderer across a multi-second await
+      // (PassNode.compileAsync restores it only at the END), and any nested
+      // render that creates pipelines inside that window builds them against
+      // the wrong MRT — the empty-fragment-struct invalid-pipeline class.
+      // The blit self-defers (pendingGpuTiles persists), so waiting costs
+      // one wave.
+      if (state.bvhScene?.pendingGpuTiles?.length && !this._compileWaveActive) {
         const blitted = blitBvhAtlasTiles(renderer, state.bvhScene);
         if (blitted > 0) {
           console.log(`[gi] bvh: atlas gpu-blit: ${blitted} compressed tiles`);
+        }
+      }
+      // GPU average colors for compressed textures (bounce-albedo palette —
+      // see voxelizeOnce's pendingTextureAverages for the washout this
+      // fixes). Same placement discipline as the blit above: live renderer
+      // mid-frame, never during the compile wave.
+      //
+      // ⚠ DRAIN THE WHOLE QUEUE IN ONE TICK. The first version kicked 2 per
+      // tick "to spread the cost" and the cost was never the problem — the
+      // 32×32 renders are trivial. What the trickle actually did: every
+      // small batch of landed averages changed a material or two, the next
+      // 250ms fingerprint scan saw it, and #syncBvhScene rebuilt the
+      // reflection state — "exact reflections ON" + a 25-tile atlas re-blit
+      // ~8 times in the first boot second, strobing the emitter seats and
+      // every reflective pixel (user-visible as boot-time blocky flicker on
+      // metals, 2026-08-14). All-at-once means the averages land inside one
+      // or two frames and the scan sees ONE change.
+      if (pendingTextureAverages.size && !this._compileWaveActive) {
+        this._texAvgInflight ??= new WeakSet();
+        for (const tex of pendingTextureAverages) {
+          if (this._texAvgInflight.has(tex)) continue;
+          this._texAvgInflight.add(tex);
+          this._texAvgCount = (this._texAvgCount ?? 0) + 1;
+          computeCompressedTextureAverage(renderer, tex)
+            .then((rgb) => noteTextureAverage(tex, rgb))
+            .catch(() => noteTextureAverage(tex, null))
+            .finally(() => {
+              this._texAvgInflight.delete(tex);
+              // One line when the LAST in-flight average lands and nothing
+              // re-queued meanwhile — not once per zero-crossing (the 2/tick
+              // version logged it eight times a boot).
+              if (--this._texAvgCount === 0 && pendingTextureAverages.size === 0) {
+                console.log(
+                  "[gi] bounce albedo: compressed-texture averages resolved on the GPU — the palette re-tints on the next scan (the CPU canvas cannot decode KTX2; without this, bounce albedo fell back to near-white base colors and washed the interior out)",
+                );
+              }
+            });
         }
       }
     }
@@ -2328,6 +2373,10 @@ export class GISystem {
     const renderer = engine.renderer;
     if (!renderer?.compileAsync || !engine.camera || !engine.scene) return;
     const token = (this._compileToken = {});
+    // Live for the whole wave (cleared in the finally): nested renders that
+    // create pipelines — the KTX2 atlas blit above all — must not run while
+    // #warmOverridePass has the postprocess MRT pinned across its await.
+    this._compileWaveActive = true;
     const state = this.state;
     const pendingLight = state?.light?.parent !== engine.scene ? state?.light : null;
     const overrideOwnsCamera = [...(engine.renderOverrides ?? [])].some((override) => override.ownsCamera?.(engine));
@@ -2862,6 +2911,7 @@ export class GISystem {
     } catch (error) {
       console.warn("[gi] async compile wave failed; GI was not committed:", error?.stack ?? error?.message ?? error);
     } finally {
+      this._compileWaveActive = false;
       if (originalYield) scheduler.yield = originalYield;
       if (originalGetForRender) pipelines.getForRender = originalGetForRender;
       if (this._compileToken === token) {
@@ -3880,6 +3930,18 @@ export class GISystem {
                   // `kind` is a uniform, so the bound cannot be a build-time
                   // choice. The volume diagonal is the finite stand-in.
                   maxRay: volume.world.size.value.length(),
+                  // §12.62 W3: the W1 tree region, already built and queued
+                  // by #rebuild before this constructor runs. `abs` is the
+                  // absolute u32 word index into the occupancy `bits` buffer
+                  // — srcSystem bakes it as the descent's base word behind
+                  // the `__giSrcLightTree` hatch.
+                  lightTree: this._lightTreeRegion
+                    ? {
+                        baseWord: this._lightTreeRegion.abs,
+                        emitterCount: this._lightTreeRegion.emitterCount,
+                        maxDepth: this._lightTreeRegion.maxDepth,
+                      }
+                    : null,
                 }
               : null,
           });
@@ -3908,6 +3970,59 @@ export class GISystem {
       inputs.gather = srcProbes?.gather
         ? (point, normal) => srcProbes.gather.gatherAt(point, normal).irradiance
         : null;
+      // ── THE DIRECTIONAL RADIANCE LOOKUP, REBUILT (§12.71b) ───────────────
+      // `deferredRadianceLookup` has been null since the cascades (and their
+      // createRadianceLookup reader) died — "rough/glossy surfaces lose their
+      // blurred environment term until Phase 1-3". The consequence stayed
+      // invisible until the first metal-heavy scene: with the lookup null,
+      // giLight's ENTIRE specular block (its gate is `radianceFn ||
+      // giRadianceNode`) compiles out — including the exact-BVH mirror blend
+      // inside it — and §12.64's IBL suppression removed the last remaining
+      // leg, so `indirectSpecular = radiance·F + multi·iblIrradiance/π`
+      // evaluated 0 + 0: a bright-gray metal sphere rendered PITCH BLACK in
+      // a sunlit corridor (probe-sphere protocol, 2026-08-14; flipping the
+      // same sphere to metalness 0 lit it perfectly, which is what convicts
+      // the specular slot specifically).
+      //
+      // Phase 1-3's replacement is the SRC probe atlas itself: the tiles are
+      // direction-binned, `sampleTileRGBA(block, dir)` accepts an arbitrary
+      // direction, and gatherAt() only ever passed the surface normal by
+      // CONVENTION. Fed the reflected direction instead, the same sparse-
+      // trilinear coverage-weighted integral IS the cosine-lobe-blurred
+      // environment term — spatially local, occlusion-aware (probes only
+      // know what reached them), and exactly the "blurred" end of the lobe
+      // giLight's roughness gates expect: mirrors still take the exact-BVH
+      // hit blend over it. ÷π converts the cosine-hemisphere irradiance to
+      // the outgoing-radiance scale the specular slot multiplies by F (the
+      // same convention as the fully-rough `irradiance/π` limit).
+      //
+      // Cost note: the resolve already inlines THIS closure for the exact-
+      // reflection hit, so the per-pixel call reuses the same two storage-
+      // buffer bindings (hashKeys + hashBlock) and the atlas texture — ALU
+      // and WGSL size, not new bindings.
+      //
+      // ⚠ OPT-IN (`__giGlossyRadiance = true`) SINCE THE SAME NIGHT IT
+      // SHIPPED: on the user's lamp-lit Sponza the term painted FLICKERING
+      // WHITE BLOBS on the metallic embroidery (confirmed live with SSR
+      // zeroed — the blobs stayed and flickered). Mechanism, in this
+      // module's own vocabulary: the DIFFUSE gather averages many bins and
+      // then rides the §12.65 temporal filter; this lookup samples ~one bin
+      // along one direction and writes a radiance target NO temporal pass
+      // touches — raw per-frame probe noise on every glossy pixel — and it
+      // re-delivers emitters the resolve's emitter-direct term already
+      // lights. Default-ON needs its own unit first: a temporal filter on
+      // the radiance target (reuse createGiIrradianceTemporalPass), an
+      // emitter de-duplication story, and a luminance cap. Until then,
+      // metals fall back to dark-but-stable (§12.71b has the whole ledger).
+      if (!inputs.radiance && srcProbes?.gather && globalThis.__giGlossyRadiance === true) {
+        const dirLookup = (point, dir) =>
+          vec3(srcProbes.gather.gatherAt(point, dir).irradiance).mul(1 / Math.PI);
+        inputs.radiance = { lookup: dirLookup };
+        radianceLookup = dirLookup;
+        console.log(
+          "[gi] glossy radiance: directional probe-atlas lookup LIVE — metals/glossy sample the field along the reflected ray (resolve-side, materials read the radiance target)",
+        );
+      }
       // ── THE IRRADIANCE TEMPORAL FILTER (§12.65) ──────────────────────────
       // DEFAULT ON since 2026-08-14 evening (`__giIrrTemporal = false` opts
       // out). ÷12 on post-pan churn, ~0 still floor, LIGHT_STEP
@@ -3930,12 +4045,75 @@ export class GISystem {
         this._giIrrPrevVPU ??= uniform(new THREE.Matrix4()).setGroup(renderGroup);
         this._giIrrHistWeightU ??= uniform(0).setGroup(renderGroup);
       }
+      // §12.70 W4b: the per-tile emitter cut — built BEFORE the resolve and
+      // the shadow pass because both CONSUME it since slice (ii): the shadow
+      // pass marches each pixel's tile-list emitters (record pseudo-slots),
+      // the resolve evaluates the same list against the same id-keyed
+      // channels. Behind `__giEmitterTileCut` (build-time, default OFF);
+      // requires the W1 tree region.
+      const emitterTileCut = inputs.emitter
+          && globalThis.__giEmitterTileCut === true
+          && this._lightTreeRegion
+          && volume?.occupancyField?.bits
+        ? createGiEmitterTileCutPass({
+            gbuffer,
+            importance: createLightTreeEmitterImportance(volume.occupancyField.bits),
+            baseWord: this._lightTreeRegion.abs,
+            emitterCount: this._lightTreeRegion.emitterCount,
+            tileSize: 8,
+            width: emitterW,
+            height: emitterH,
+            resolveWidth: width,
+            resolveHeight: height,
+            cameraPosition: this._giResolveCamU,
+          })
+        : null;
+      let tileCutBundle = null;
+      if (emitterTileCut) {
+        const recordSlotAt = createLightTreeRecordSlot(volume.occupancyField.bits);
+        const treeBase = this._lightTreeRegion.abs;
+        tileCutBundle = {
+          idBuf: emitterTileCut.idBuf,
+          tilesX: emitterTileCut.tilesX,
+          tilesY: emitterTileCut.tilesY,
+          tileSize: emitterTileCut.tileSize,
+          recordSlot: (id) => recordSlotAt(treeBase, id),
+        };
+        // Dev-visible handle (the §12.42 rule) — the W4b rig reads the
+        // buffers through it.
+        globalThis.__giTileCutLive = {
+          tilesX: emitterTileCut.tilesX,
+          tilesY: emitterTileCut.tilesY,
+          tileSize: emitterTileCut.tileSize,
+          emitterW, emitterH, resolveW: width, resolveH: height,
+          posBuf: emitterTileCut.posBuf,
+          idBuf: emitterTileCut.idBuf,
+        };
+        console.log(
+          `[gi] emitter tile cut: ${emitterTileCut.tilesX}×${emitterTileCut.tilesY} tiles over ` +
+          `${this._lightTreeRegion.emitterCount} emitters (§12.70 W4b — slots follow each pixel's tile)`,
+        );
+      } else if (globalThis.__giEmitterTileCut === true) {
+        // The hatch asked and did not get — say WHY (the §12.42 rule; the
+        // slice-(ii) gate's first run read byte-identical arms and the only
+        // silent explanation is a precondition failing here).
+        console.log(
+          `[gi] emitter tile cut UNARMED: emitter=${!!inputs.emitter} ` +
+          `region=${!!this._lightTreeRegion} bits=${!!volume?.occupancyField?.bits}`,
+        );
+        globalThis.__giTileCutLive = null;
+      } else if (globalThis.__giTileCutLive) {
+        globalThis.__giTileCutLive = null;
+      }
       const resolve = createGiResolve({
         gbuffer,
         targets,
         rawCopy: irrTemporalOn ? targets.irradianceRaw : null,
         width,
         height,
+        emitterTileCut: tileCutBundle
+          ? { ...tileCutBundle, scaleX: emitterW / width, scaleY: emitterH / height }
+          : null,
         ...inputs,
       });
       const irrTemporalPass = irrTemporalOn
@@ -4136,6 +4314,8 @@ export class GISystem {
             resolveWidth: width,
             resolveHeight: height,
             cameraPosition: this._giResolveCamU,
+            // §12.70 W4b slice (ii): march each pixel's TILE-list emitters.
+            tileCut: tileCutBundle,
           })
         : null;
       // EMITTER TEMPORAL ACCUMULATION (2026-08-07). This channel had the
@@ -4304,6 +4484,11 @@ export class GISystem {
         : null;
       light.giIrradianceNode = this._giIrradianceNode;
       light.giEmitterShadowNode = emitterSlots ? this._giEmitterShadowNode : null;
+      // §12.70 W4b: under the tile cut the packed shadow channels are keyed
+      // to each pixel's TILE list, not to the global seats these material
+      // slots are — giLight's glow path reads this flag and goes unshadowed
+      // rather than occluding one lamp's glow with another lamp's shadow.
+      light.emitterTileKeyed = globalThis.__giEmitterTileCut === true && !!this._lightTreeRegion;
       light.giRadianceNode = radianceLookup ? this._giRadianceNode : null;
       // Silhouette-validity inputs for giLight's bilateral screen sampling
       // (same machinery as the shadowNode's — see #acquireLightShadowNode):
@@ -4328,7 +4513,7 @@ export class GISystem {
         this.engine.scene.add(srcProbes.gizmos.group);
         srcProbes.gizmos.setVisible(giDebugView() === "src-probes");
       }
-      return { gbuffer, srcProbes, resolve, irrTemporalPass, irrHistoryPass, lightShadowPass, lightShadowFilterPass, lightShadowWidePass, lightShadowWidePass2, lightShadowHistoryPass, lightShadowPostPass, emitterShadowPass, emitterShadowFilterPass, emitterShadowHistoryPass, emitterShadowPostPass, emitterShadowWidePass, emitterShadowWidePass2, targets, width, height, shadowWidth: shadowW, shadowHeight: shadowH, emitterShadowWidth: emitterW, emitterShadowHeight: emitterH, ...inputs };
+      return { gbuffer, srcProbes, resolve, irrTemporalPass, irrHistoryPass, lightShadowPass, lightShadowFilterPass, lightShadowWidePass, lightShadowWidePass2, lightShadowHistoryPass, lightShadowPostPass, emitterShadowPass, emitterTileCut, emitterTileCutBundle: tileCutBundle, emitterShadowFilterPass, emitterShadowHistoryPass, emitterShadowPostPass, emitterShadowWidePass, emitterShadowWidePass2, targets, width, height, shadowWidth: shadowW, shadowHeight: shadowH, emitterShadowWidth: emitterW, emitterShadowHeight: emitterH, ...inputs };
     } catch (error) {
       // Falling back to the in-material path keeps GI working (slowly) rather
       // than rendering an unlit scene.
@@ -4474,6 +4659,63 @@ export class GISystem {
     screen.gather = screen.srcProbes?.gather
       ? (point, normal) => screen.srcProbes.gather.gatherAt(point, normal).irradiance
       : null;
+    // §12.71b: the directional radiance lookup is the SAME closure fed the
+    // reflected direction — it re-derives here for exactly the reason the two
+    // lines above do (the build-time lookup closed over the srcProbes setSize
+    // just disposed; a stale one is the identical dead-buffer monster).
+    // Opt-in — see the boot-path comment for the flicker postmortem.
+    screen.radiance = screen.srcProbes?.gather && globalThis.__giGlossyRadiance === true
+      ? {
+          lookup: (point, dir) =>
+            vec3(screen.srcProbes.gather.gatherAt(point, dir).irradiance).mul(1 / Math.PI),
+        }
+      : null;
+    // §12.70 W4b: the tile cut is sized to the emitter grid AND bakes the
+    // gbuffer scale, so it rebuilds BEFORE the resolve and the shadow pass
+    // that consume its buffers — a stale sx/sy would rank tiles at the wrong
+    // world positions, and a stale idBuf would leave both consumers bound to
+    // a buffer the old dispatch no longer fills. recordSlot survives as-is
+    // (it closes over the bits node + base word, both resize-invariant).
+    if (screen.emitterTileCut) {
+      const oldCut = screen.emitterTileCut.compute;
+      const cutIndexes = [
+        state.queue.indexOf(oldCut),
+        state.queueNoFeedback.indexOf(oldCut),
+        state.queueFeedbackOnly?.indexOf(oldCut) ?? -1,
+      ];
+      screen.emitterTileCut = createGiEmitterTileCutPass({
+        gbuffer: screen.gbuffer,
+        importance: screen.emitterTileCut.importance,
+        baseWord: screen.emitterTileCut.baseWord,
+        emitterCount: screen.emitterTileCut.emitterCount,
+        tileSize: screen.emitterTileCut.tileSize,
+        width: emitterW,
+        height: emitterH,
+        resolveWidth: width,
+        resolveHeight: height,
+        cameraPosition: this._giResolveCamU,
+      });
+      screen.emitterTileCutBundle = {
+        ...screen.emitterTileCutBundle,
+        idBuf: screen.emitterTileCut.idBuf,
+        tilesX: screen.emitterTileCut.tilesX,
+        tilesY: screen.emitterTileCut.tilesY,
+        tileSize: screen.emitterTileCut.tileSize,
+      };
+      if (globalThis.__giTileCutLive) {
+        globalThis.__giTileCutLive = {
+          tilesX: screen.emitterTileCut.tilesX,
+          tilesY: screen.emitterTileCut.tilesY,
+          tileSize: screen.emitterTileCut.tileSize,
+          emitterW, emitterH, resolveW: width, resolveH: height,
+          posBuf: screen.emitterTileCut.posBuf,
+          idBuf: screen.emitterTileCut.idBuf,
+        };
+      }
+      if (cutIndexes[0] >= 0) state.queue[cutIndexes[0]] = screen.emitterTileCut.compute;
+      if (cutIndexes[1] >= 0) state.queueNoFeedback[cutIndexes[1]] = screen.emitterTileCut.compute;
+      if (cutIndexes[2] >= 0) state.queueFeedbackOnly[cutIndexes[2]] = screen.emitterTileCut.compute;
+    }
     screen.resolve = createGiResolve({
       gbuffer: screen.gbuffer,
       targets: screen.targets,
@@ -4493,6 +4735,9 @@ export class GISystem {
       radiance: screen.radiance,
       bvhShade: screen.bvhShade,
       ao: screen.ao,
+      emitterTileCut: screen.emitterTileCutBundle
+        ? { ...screen.emitterTileCutBundle, scaleX: emitterW / width, scaleY: emitterH / height }
+        : null,
     });
     if (index >= 0) state.queue[index] = screen.resolve.compute;
     if (indexNoFeedback >= 0) state.queueNoFeedback[indexNoFeedback] = screen.resolve.compute;
@@ -4570,6 +4815,7 @@ export class GISystem {
         resolveWidth: width,
         resolveHeight: height,
         cameraPosition: this._giResolveCamU,
+        tileCut: screen.emitterTileCutBundle ?? null,
       });
       if (emitterIndexes[0] >= 0) state.queue[emitterIndexes[0]] = screen.emitterShadowPass.compute;
       if (emitterIndexes[1] >= 0) state.queueNoFeedback[emitterIndexes[1]] = screen.emitterShadowPass.compute;
@@ -5889,6 +6135,9 @@ export class GISystem {
         // is order-independent, but keeping the two arms identical is worth more
         // than the freedom.
         const emitterChain = [screen.emitterShadowPass.compute, screen.emitterShadowFilterPass.compute];
+        // §12.70 W4b: the tile cut runs FIRST in the chain — consumerless
+        // today, but the order is already the contract its consumers need.
+        if (screen.emitterTileCut) emitterChain.unshift(screen.emitterTileCut.compute);
         if (screen.emitterShadowHistoryPass) emitterChain.push(screen.emitterShadowHistoryPass.compute);
         if (screen.emitterShadowPostPass) emitterChain.push(screen.emitterShadowPostPass.compute);
         // LAST, and the order is the contract: whichever of filter/post ran

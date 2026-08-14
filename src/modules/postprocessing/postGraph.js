@@ -1223,7 +1223,34 @@ function buildNode(type, props, ins, ctx) {
       // (slightly hot), which is the failure direction that degrades, not the
       // one that destroys. `intensity` rides inside the addon's premultiplied
       // rgb, so 0 still means "SSR off, beauty intact".
-      return TSL.vec4(beauty.rgb.add(ssrNode.rgb), beauty.a);
+      //
+      // ── RE-MASK AFTER THE BLUR: the halo around every metal (2026-08-14) ─
+      //
+      // The addon premultiplies by metalness at MARCH time, then runs its
+      // roughness blur mips over the reflection buffer — and that blur is
+      // NOT edge-aware, so reflection energy smears past the silhouette onto
+      // pixels whose own metalness is 0. User-reported as "blurry edges
+      // around all metals, even at full res, from the very beginning". Those
+      // halo pixels are non-metal receivers by definition, so multiply the
+      // BLURRED output by the receiving pixel's own metalness mask at
+      // composite time: the halo dies, any real metal keeps its reflection
+      // at full weight (smoothstep, not a bare ×m — the addon already
+      // applied metalness once and a second linear factor would dim
+      // mid-metal embroidery by m²). Skipped when reflectNonMetals is on —
+      // there the dielectric neighbours legitimately receive SSR.
+      //
+      // Ramp is DELIBERATELY low (0.01→0.06): the first cut used 0.02→0.2
+      // and the user's embroidery lost its reflections outright — woven
+      // gold-thread metalness maps sit well below 0.2 (thread-vs-cloth
+      // antialiasing pulls texels toward zero). The mask only needs to
+      // separate "authored metal, however faint" from "true zero-metal
+      // receiver catching the blur's spill" — so full weight from 0.06 up,
+      // and only the near-zero halo band dies.
+      let ssrRgb = ssrNode.rgb;
+      if (ctx.metalnessNode && !P.reflectNonMetals) {
+        ssrRgb = ssrRgb.mul(TSL.smoothstep(TSL.float(0.01), TSL.float(0.06), ctx.metalnessNode));
+      }
+      return TSL.vec4(beauty.rgb.add(ssrRgb), beauty.a);
     }
     case "denoise": {
       const beauty = ins.get("color") ?? TSL.vec4(0);

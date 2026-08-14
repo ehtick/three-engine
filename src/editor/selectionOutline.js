@@ -650,13 +650,24 @@ export async function precompileSelectionOutlineMasks({ renderer, scene, camera 
   for (const material of [state.maskSelectedMaterial, state.maskActiveMaterial]) {
     const prevOverride = scene.overrideMaterial;
     const prevTarget = renderer.getRenderTarget();
+    // (3) MRT must be NULLED, not merely inherited: GI's compile wave pins the
+    // postprocess pass's MRT on the renderer across a multi-second await
+    // (PassNode.compileAsync restores only at the end), and this warm can run
+    // inside that window. Compiling the mask — or the scene BACKGROUND, which
+    // ignores overrideMaterial — under that leaked MRT builds fragments whose
+    // output struct is EMPTY: the same invalid-pipeline class as (1). Seen
+    // live 2026-08-14 as "fragment_Background.material: structures must have
+    // at least one member" during boot on the user's Sponza.
+    const prevMrt = renderer.getMRT();
     let pending = null;
     try {
       for (const light of lights) light.visible = false;
       scene.overrideMaterial = material;
       renderer.setRenderTarget(state.maskTarget);
+      renderer.setMRT(null);
       pending = renderer.compileAsync(scene, camera);
     } finally {
+      renderer.setMRT(prevMrt);
       renderer.setRenderTarget(prevTarget);
       scene.overrideMaterial = prevOverride;
       for (const light of lights) light.visible = true;

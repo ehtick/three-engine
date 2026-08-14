@@ -30,6 +30,7 @@ import * as THREE from "three/webgpu";
 import {
   Fn,
   If,
+  Loop,
   abs,
   atomicAdd,
   cos,
@@ -58,6 +59,7 @@ import {
 } from "three/tsl";
 import { MAX_EMITTERS, analyticDirectAt, decodeOctNormal, emitterDirectAt, emitterSlotShadow } from "./giLight.js";
 import { DEBUG_LAYER, EDITOR_LAYER, GI_MIRROR_LAYER, UI_LAYER } from "../../engine/editorLayers.js";
+import { readRenderTargetImage } from "../../engine/renderTargetImage.js";
 import { ALBEDO_ATLAS_GRID, ALBEDO_ATLAS_SIZE, ALBEDO_ATLAS_TILE } from "./bvh/bvhScene.js";
 
 /**
@@ -288,7 +290,7 @@ export function renderGiGBuffer(renderer, scene, camera, gbuffer, { mirrorMask =
  * here — emitter direct, analytic direct, reflections, sun shadows — is
  * independent of it and keeps working.
  */
-export function createGiResolve({ gbuffer, targets, width, height, gather = null, screenGather = null, cameraPosition = null, normalOffset, intensity, emitter, radiance = null, bvhShade = null, ao = null, rawCopy = null }) {
+export function createGiResolve({ gbuffer, targets, width, height, gather = null, screenGather = null, cameraPosition = null, normalOffset, intensity, emitter, radiance = null, bvhShade = null, ao = null, rawCopy = null, emitterTileCut = null }) {
   // The TARGETS are owned by the caller and outlive every rebuild: materials
   // sample them through persistent texture nodes, so recreating them here
   // would silently leave already-compiled materials bound to dead textures.
@@ -472,8 +474,28 @@ export function createGiResolve({ gbuffer, targets, width, height, gather = null
           vec2(px.toFloat().add(0.5).div(width), py.toFloat().add(0.5).div(height)),
         ).level(0).toVar();
         const shadowChannels = [packedShadow.x, packedShadow.y, packedShadow.z, packedShadow.w];
+        // §12.70 W4b slice (ii): under the tile cut, the evaluated slots are
+        // the pixel's TILE's id-keyed emitters loaded from tree records — the
+        // shadow texture's channels were marched for exactly this list by
+        // exactly this keying, so `shadowSample(i)` still means "my i-th
+        // emitter's visibility" at every pixel. The reflection-hit path below
+        // keeps the GLOBAL seats on purpose: a hit is a different world point
+        // — its tile is not this pixel's — and its emitter direct ships
+        // unshadowed anyway (§12.56.1).
+        let slotSource = emitter;
+        if (emitterTileCut) {
+          const spx = px.toFloat().add(0.5).mul(emitterTileCut.scaleX);
+          const spy = py.toFloat().add(0.5).mul(emitterTileCut.scaleY);
+          const tile = spy.div(emitterTileCut.tileSize).toUint().min(uint(emitterTileCut.tilesY - 1))
+            .mul(uint(emitterTileCut.tilesX))
+            .add(spx.div(emitterTileCut.tileSize).toUint().min(uint(emitterTileCut.tilesX - 1)))
+            .toVar();
+          const tileSlots = [0, 1, 2, 3].map((k) =>
+            emitterTileCut.recordSlot(emitterTileCut.idBuf.element(tile.mul(4).add(uint(k)))));
+          slotSource = { ...emitter, emitterSlots: tileSlots };
+        }
         const direct = emitterDirectAt(
-          { ...emitter, shadowSample: (i) => shadowChannels[i] ?? float(1) },
+          { ...slotSource, shadowSample: (i) => shadowChannels[i] ?? float(1) },
           P, N, samplePoint,
         );
         out.addAssign(direct.irradiance.mul(intensity));
@@ -863,7 +885,7 @@ export function createGiLightShadowPass({ gbuffer, lightShadow, width, height, r
  */
 export function createGiEmitterShadowPass({
   gbuffer, emitter, normalOffset, target, width, height, resolveWidth, resolveHeight,
-  cameraPosition = null, distTarget = null,
+  cameraPosition = null, distTarget = null, tileCut = null,
 }) {
   const widthU = uniform(width, "uint");
   const positionNode = texture(gbuffer.position);
@@ -909,7 +931,23 @@ export function createGiEmitterShadowPass({
         : float(1);
       const N = rawN.mul(facing).toVar();
       const samplePoint = P.add(N.mul(normalOffset)).toVar();
-      emitter.emitterSlots.slice(0, MAX_EMITTERS).forEach((slot, index) => {
+      // §12.70 W4b slice (ii): under the tile cut, the marched slots are the
+      // PIXEL'S TILE's id-keyed emitters loaded from tree records — the same
+      // `emitterSlotShadow` estimator, fed a pseudo-slot instead of a seat
+      // uniform. Channel i ≡ the tile's i-th emitter BY ID (giScreen's
+      // createGiEmitterTileCutPass sorted them), consistent with what the
+      // resolve reconstructs at every pixel of the same tile.
+      const slots = tileCut
+        ? (() => {
+            const tile = py.div(uint(tileCut.tileSize)).min(uint(tileCut.tilesY - 1))
+              .mul(uint(tileCut.tilesX))
+              .add(px.div(uint(tileCut.tileSize)).min(uint(tileCut.tilesX - 1)))
+              .toVar();
+            return [0, 1, 2, 3].map((k) =>
+              tileCut.recordSlot(tileCut.idBuf.element(tile.mul(4).add(uint(k)))));
+          })()
+        : emitter.emitterSlots.slice(0, MAX_EMITTERS);
+      slots.forEach((slot, index) => {
         shadowVars[index].assign(
           emitterSlotShadow(emitter, slot, P, N, samplePoint, distVars ? distVars[index] : null),
         );
@@ -925,6 +963,124 @@ export function createGiEmitterShadowPass({
   })().compute(width * height);
 
   return { compute, widthU };
+}
+
+/**
+ * §12.70 W4b — THE PER-TILE EMITTER CUT. One thread per TILE of the
+ * emitter-shadow grid: reconstruct the tile-centre receiver from the gbuffer
+ * (the same load + facing flip the shadow pass applies per pixel), rank EVERY
+ * light-tree emitter record by `clusterImportance` at that receiver, keep the
+ * top MAX_EMITTERS. Deterministic — no draws, no history; the selection can
+ * only change when the scene or the camera does.
+ *
+ * ⚠ CHANNEL KEYING IS BY EMITTER ID, NOT BY RANK. The kept 4 are sorted
+ * ascending by id before writing, so wherever two adjacent tiles agree on the
+ * SET, they agree on every channel's meaning — at ≤4 emitters that is
+ * everywhere, which is what makes the future consumer swap byte-comparable
+ * to the global slots. Rank order is deliberately discarded: it is the one
+ * thing neighbouring tiles are ALLOWED to disagree on without artifacts.
+ *
+ * An emitter whose importance is ZERO at the tile centre is excluded even if
+ * seats are free (strict `>` against an empty slot's 0): the emission-cone /
+ * behind-horizon cases the importance already prices. Empty seats read
+ * 0xffffffff. A sky tile (no geometry) writes an all-empty list, valid 0.
+ *
+ * O(N) scan, not a tree walk, ON PURPOSE: tiles number thousands (not
+ * millions of pixels), records max out at 127/leaf, and one inlined
+ * importance inside a GPU loop beats a best-first traversal's stack at every
+ * N the block can hold. The TREE remains [J]'s sampling structure (§12.69);
+ * the screen needs only the ranking key — `createLightTreeEmitterImportance`,
+ * the same `buildImportanceMath` the descent compiles.
+ *
+ * Consumerless in this slice: the rig reads `posBuf`/`idBuf` back and
+ * verifies the sets against the CPU's `emitterImportance` at the SAME
+ * reconstructed P (§12.70 W4b gate). emitterShadowPass/emitterDirectAt swap
+ * onto `idBuf` in the next slice.
+ *
+ * @param {(P,N,hasN,base,id)=>Node} options.importance
+ *   from createLightTreeEmitterImportance(words) — caller-built so this file
+ *   stays free of the lightTree modules.
+ */
+export function createGiEmitterTileCutPass({
+  gbuffer, importance, baseWord, emitterCount, tileSize, width, height,
+  resolveWidth, resolveHeight, cameraPosition = null,
+}) {
+  const tilesX = Math.ceil(width / tileSize);
+  const tilesY = Math.ceil(height / tileSize);
+  const tileCount = tilesX * tilesY;
+  // Two buffers, no bit-casting: TWO vec4 floats per tile — [P.xyz, valid]
+  // then [N.xyz, 0] (the rig's CPU mirror re-ranks at this exact receiver,
+  // and the importance needs BOTH) — plus 4 u32 ids per tile.
+  const posBuf = instancedArray(new Float32Array(tileCount * 8), "vec4");
+  const idBuf = instancedArray(new Uint32Array(tileCount * 4), "uint");
+  const tilesXU = uniform(tilesX, "uint");
+  const positionNode = texture(gbuffer.position);
+  const normalNode = texture(gbuffer.normal);
+  const sx = resolveWidth / width;
+  const sy = resolveHeight / height;
+
+  const compute = Fn(() => {
+    const tx = instanceIndex.mod(tilesXU);
+    const ty = instanceIndex.div(tilesXU);
+    // Tile-centre pixel in emitter-shadow res, scaled into gbuffer coords —
+    // the per-pixel shadow pass's own mapping, applied at the tile centre.
+    const gCoord = ivec2(
+      tx.toFloat().add(0.5).mul(tileSize).mul(sx).toInt(),
+      ty.toFloat().add(0.5).mul(tileSize).mul(sy).toInt(),
+    );
+    const g0 = positionNode.load(gCoord).toVar();
+    const g1 = normalNode.load(gCoord).toVar();
+    const ids = [0, 1, 2, 3].map(() => uint(0xffffffff).toVar());
+    const imps = [0, 1, 2, 3].map(() => float(0).toVar());
+    const outN = vec3(0, 1, 0).toVar();
+    If(g0.w.greaterThan(0.5), () => {
+      const P = g0.xyz.toVar();
+      const rawN = g1.xyz.normalize().toVar();
+      const facing = cameraPosition
+        ? step(0, rawN.dot(vec3(cameraPosition).sub(P))).mul(2).sub(1)
+        : float(1);
+      const N = rawN.mul(facing).toVar();
+      outN.assign(N);
+      Loop({ start: uint(0), end: uint(emitterCount), type: "uint", condition: "<" }, ({ i }) => {
+        const imp = float(importance(P, N, float(1), uint(baseWord), i)).toVar();
+        // Predicated 4-slot insertion, strict `>`: ties keep the EARLIER id
+        // in the higher rank — the rig's CPU mirror replicates exactly this.
+        If(imp.greaterThan(imps[0]), () => {
+          imps[3].assign(imps[2]); ids[3].assign(ids[2]);
+          imps[2].assign(imps[1]); ids[2].assign(ids[1]);
+          imps[1].assign(imps[0]); ids[1].assign(ids[0]);
+          imps[0].assign(imp); ids[0].assign(i);
+        }).ElseIf(imp.greaterThan(imps[1]), () => {
+          imps[3].assign(imps[2]); ids[3].assign(ids[2]);
+          imps[2].assign(imps[1]); ids[2].assign(ids[1]);
+          imps[1].assign(imp); ids[1].assign(i);
+        }).ElseIf(imp.greaterThan(imps[2]), () => {
+          imps[3].assign(imps[2]); ids[3].assign(ids[2]);
+          imps[2].assign(imp); ids[2].assign(i);
+        }).ElseIf(imp.greaterThan(imps[3]), () => {
+          imps[3].assign(imp); ids[3].assign(i);
+        });
+      });
+    });
+    // The by-id sort (empties = 0xffffffff sink to the end): a 5-swap network
+    // on 4 elements, each swap predicated.
+    const cswap = (a, b) => {
+      const doSwap = ids[a].greaterThan(ids[b]);
+      const t = ids[a].toVar();
+      ids[a].assign(select(doSwap, ids[b], ids[a]));
+      ids[b].assign(select(doSwap, t, ids[b]));
+    };
+    cswap(0, 1); cswap(2, 3); cswap(0, 2); cswap(1, 3); cswap(1, 2);
+    posBuf.element(instanceIndex.mul(2)).assign(vec4(g0.xyz, select(g0.w.greaterThan(0.5), float(1), float(0))));
+    posBuf.element(instanceIndex.mul(2).add(uint(1))).assign(vec4(outN, 0));
+    for (let k = 0; k < 4; k++) {
+      idBuf.element(instanceIndex.mul(4).add(uint(k))).assign(ids[k]);
+    }
+  })().compute(tileCount);
+
+  // importance/baseWord/emitterCount ride along so a viewport resize can
+  // rebuild at new tile dims without re-deriving the tree plumbing.
+  return { compute, tilesX, tilesY, tileSize, tileCount, posBuf, idBuf, importance, baseWord, emitterCount };
 }
 
 /**
@@ -2050,6 +2206,70 @@ export function createGiBvhTarget(width, height) {
  * @param {ReturnType<typeof import("./bvh/bvhScene.js").buildBvhScene>} bvhScene
  * @return {number} Tiles actually blitted this call (0 = no-op).
  */
+/**
+ * Mean LINEAR color of a texture the CPU cannot draw (KTX2/basis), on the GPU.
+ *
+ * The shader decodes what the canvas cannot: sampling an sRGB-format
+ * compressed texture yields LINEAR values in-shader, so a 32×32 quad render
+ * into a linear rgba8 target followed by one readback is an unbiased linear
+ * mean (no Jensen correction needed — the sRGB-space-downsample bias that
+ * forced voxelizeOnce's canvas path up to 128×128 does not exist here,
+ * because the bilinear filtering happens in linear space).
+ *
+ * Same nested-render discipline as blitBvhAtlasTiles above: resetRendererState
+ * (MRT/renderObjectFunction NULLED — the compile-wave leak class), restore in
+ * finally. Alpha-weighted like the canvas path, for the same alphaTest-foliage
+ * reason.
+ *
+ * @param {import("three/webgpu").Renderer} renderer
+ * @param {THREE.Texture} tex  a compressed texture
+ * @return {Promise<{r:number,g:number,b:number}|null>}
+ */
+export async function computeCompressedTextureAverage(renderer, tex) {
+  const size = 32;
+  const rt = new THREE.RenderTarget(size, size, {
+    depthBuffer: false,
+    stencilBuffer: false,
+    generateMipmaps: false,
+  });
+  rt.texture.name = "giTexAverage";
+  rt.texture.colorSpace = THREE.LinearSRGBColorSpace;
+  rt.texture.version = ++targetGeneration;
+  const rendererState = THREE.RendererUtils.resetRendererState(renderer);
+  const quad = new THREE.QuadMesh();
+  try {
+    renderer.setRenderTarget(rt);
+    renderer.setScissorTest(false);
+    rt.viewport.set(0, 0, size, size);
+    rt.scissor.set(0, 0, size, size);
+    const mat = new THREE.NodeMaterial();
+    mat.colorNode = texture(tex);
+    mat.transparent = false;
+    mat.depthTest = false;
+    mat.depthWrite = false;
+    mat.fog = false;
+    quad.material = mat;
+    quad.render(renderer);
+    mat.dispose();
+  } finally {
+    THREE.RendererUtils.restoreRendererState(renderer, rendererState);
+  }
+  try {
+    const px = await readRenderTargetImage(renderer, rt, size, size);
+    let r = 0, g = 0, b = 0, w = 0;
+    for (let i = 0; i < px.length; i += 4) {
+      const a = px[i + 3] / 255;
+      r += (px[i] / 255) * a;
+      g += (px[i + 1] / 255) * a;
+      b += (px[i + 2] / 255) * a;
+      w += a;
+    }
+    return w > 1e-3 ? { r: r / w, g: g / w, b: b / w } : null;
+  } finally {
+    rt.dispose();
+  }
+}
+
 export function blitBvhAtlasTiles(renderer, bvhScene) {
   const pending = bvhScene?.pendingGpuTiles;
   if (!pending || pending.length === 0) return 0;
@@ -2075,7 +2295,18 @@ export function blitBvhAtlasTiles(renderer, bvhScene) {
   // guaranteed different from whatever was bound (the canvas atlas) before.
   rt.texture.version = ++targetGeneration;
 
-  const rendererState = THREE.RendererUtils.saveRendererState(renderer);
+  // resetRendererState, NOT saveRendererState: reset additionally NULLS the
+  // renderer's MRT and renderObjectFunction (three's own pattern for every
+  // internal quad pass). This blit can run while the compile wave has the
+  // postprocess scene-pass MRT pinned on the renderer — PassNode.compileAsync
+  // sets its MRT, then AWAITS a multi-second compile with frames still
+  // flowing — and a bare colorNode quad material built under that MRT
+  // generates a fragment whose output struct is EMPTY ("structures must have
+  // at least one member"): an invalid pipeline that, once cached, poisons
+  // every command buffer that touches it (the renderGiGBuffer/occluder/
+  // selection-outline class). Found live on the user's Sponza the first time
+  // this path ran with KTX2 tiles during a boot wave, 2026-08-14.
+  const rendererState = THREE.RendererUtils.resetRendererState(renderer);
   const quad = new THREE.QuadMesh();
   let blitted = 0;
   try {

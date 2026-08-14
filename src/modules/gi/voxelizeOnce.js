@@ -59,6 +59,34 @@ function textureValueOf(node, depth = 0) {
  * image → cached null → the scalar color fallback stands.
  */
 const textureAverageCache = new WeakMap(); // texture -> {r,g,b} | null (tried, undrawable)
+
+/**
+ * COMPRESSED (KTX2/basis) textures cannot go through the canvas path below —
+ * their `image` is not drawable, so for a compressed-textures project every
+ * mesh's bounce albedo silently fell back to the material's base-color factor.
+ * On glTF imports that factor is typically near-WHITE while the texture holds
+ * the real color, and in an enclosed scene the error COMPOUNDS per bounce
+ * (indirect ≈ direct·Ā/(1−Ā)): true Ā≈0.4 → ×0.67 fill, false Ā≈0.6+ →
+ * ×1.6 — the whole interior brightens and desaturates. Live report
+ * 2026-08-14, the user's banner Sponza: "washed out compared to before,
+ * after I compressed the textures" — and it survived every post/shadow/sun
+ * bisect because it lives inside the GI bounce.
+ *
+ * The GPU can sample what the canvas cannot draw (same fact the BVH atlas
+ * blit is built on), so compressed textures queue here and GISystem's tick
+ * renders each into a small target and calls `noteTextureAverage`. Returning
+ * null UNCACHED is the same retry-next-scan contract as a not-yet-loaded
+ * image: the fingerprint scan revisits, finds the cache filled, the palette
+ * updates, and the normal reconcile re-uploads it.
+ */
+export const pendingTextureAverages = new Set();
+
+/** GPU averager's completion callback — also the failure path (rgb = null
+ *  caches the miss so the scalar fallback stands without re-queueing). */
+export function noteTextureAverage(texture, rgb) {
+  textureAverageCache.set(texture, rgb);
+  pendingTextureAverages.delete(texture);
+}
 // Fingerprint scans revisit the same materials for the lifetime of a scene.
 // A diagnostic that cannot change until the material graph changes should not
 // flood the editor console/store on every scan.
@@ -66,6 +94,11 @@ const warnedUnresolvedEmissive = new WeakSet();
 function textureAverageColor(texture) {
   if (!texture) return null;
   if (textureAverageCache.has(texture)) return textureAverageCache.get(texture);
+  if (texture.isCompressedTexture) {
+    // See pendingTextureAverages above — the GPU answers this one.
+    pendingTextureAverages.add(texture);
+    return null;
+  }
   const image = texture.image;
   if (!image || !(image.width > 0) || !(image.height > 0)) return null; // not loaded yet — retry next scan
   if (image.complete === false) return null;
