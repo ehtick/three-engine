@@ -8849,14 +8849,17 @@ or the migration itself is a visible change — the file's own header):
   what indicted the read path). Whole-buffer `getArrayBufferAsync` + slice is
   the honest read. Incidentally: the dead-[J] watchdog fired on 2 of 4 gate
   boots — the §12.56 race frequency holding on an UNMASKED rig.
-- **Unit W2 — WGSL descent, twin-gated.** `sampleLightTree`/`clusterImportance`
+- **Unit W2 — WGSL descent, twin-gated. ✅ SHIPPED + GATE PASS (2026-08-14).**
+  `sampleLightTree`/`clusterImportance`
   as TSL/WGSL against the block, diffed bit-level against the CPU mirror on a
   seeded RNG (the srcRef discipline; the CPU side already exists as the
   mirror). No consumer yet — a standalone gate kernel only. Traps by
   construction: the 8-storage-buffer ceiling (the block rides `bits`, costing
   ZERO new bindings — that is the whole reason W1 stages it there), and
   `hashKey`-based rng (u32-pure, §srcShade's divide caveat).
-- **Unit W3 — [J] first.** `createSrcHitLighting`'s NEE swaps the 4-slot
+- **Unit W3 — [J] first. ✅ WIRED + FIXTURE GATE PASS (2026-08-14 — §12.69;
+  hatch `__giSrcLightTree`, default OFF pending the live energy arm).**
+  `createSrcHitLighting`'s NEE swaps the 4-slot
   emitter loop for ONE tree sample + pdf (the `importance` parameter at
   srcShade.js:81 was left for exactly this). [J] is the right first consumer:
   its output is temporally accumulated (variance-tolerant), and §12.26.5
@@ -9460,3 +9463,287 @@ outlives the window, churning less per window but lasting longer — the exact
 "quite some time" the user reported). Tail LUMINANCE ERROR vs final is the
 right metric when this next needs numbers. Envelope stays shipped; the
 user's Sponza lamp scenario is the standing referee.
+
+### 12.69 UNIT W3 — [J]'S NEE THROUGH THE LIGHT TREE, TWIN-GATED (2026-08-14 evening, uncommitted; hatch-off)
+
+§12.62's W3, executed. `createSrcHitLighting` gains a `lightTree` option that
+REPLACES the slot NEE (never both — two estimators over overlapping light sets
+double-deliver every emitter both can reach): one W2 descent per hit, up to two
+samples, each contributing `E·v/pdf` — `estimateLightTree`'s estimator verbatim.
+Wiring: GISystem hangs `{baseWord: _lightTreeRegion.abs, emitterCount, maxDepth}`
+on the `lighting` object (the region is built+queued BEFORE `createSrcProbeSystem`
+runs, so the base word bakes as a compile-time constant); srcSystem builds the
+sampler + eval over `volume.occupancyField.bits` — the block rides the bits tail
+the visibility marcher already binds, so [J] stays at 4/8 storage bindings.
+Hatch: `__giSrcLightTree = true` (build-time, DEFAULT OFF). Boot line
+`[gi] src [J] NEE: light tree (base …)` per the §12.42 rule.
+
+**The new GPU math — `createLightTreeEmitterEval` (lightTreeGpu.js)** — is the
+CPU `emitterIrradiance` term for term: cone gate via the cosSub identity +
+Sterbenz complements (no acos round-trip), then giLight's OWN `sphereLightFactor`
+/ `boxLightFactor` / `boxRayEnter` fed record words instead of slot uniforms —
+parity with the promoted path BY SHARED CODE for the two kinds records can hold
+(`LT_KIND` 0/1 matches giLight's enum; `emitterSurfaceT` deliberately NOT reused
+— its kind dispatch would compile five dead shape intersectors into [J]).
+⚠ The cone gate exists ONLY on the tree arm (unbiasedness: contribution > 0 must
+imply importance > 0 at every ancestor); a promoted slot emits full-sphere. The
+two arms differ by exactly that gate, by design, tree matching the reference.
+
+**Estimator discipline kept:** ONE visibility call site for both samples (the
+rolled predicated funnel — ~1.2 s compile per site, §13.14.5); seed a pure
+function of rayIndex (same 0x9e37 family as the slot draw it replaces — no frame
+term, the still floor's accumulation relies on the repeat). R5: the zeroing
+branch now arms under `useNee || useTree`; the flag still speaks promoted-slot
+indices, which is exactly the subset it can name — a NON-promoted tree emitter
+that also emits on contact would double-deliver, which production cannot hit
+today (promoted statics zero at palette bake, movers at writeSurface, and the
+palette's own emitter flag ships −1 — srcSurface `emitterMeshes` unwired).
+Moving the WHOLE handoff to the tree set is W5's charter. Also W5's: mover
+emitters sit in the tree at BUILD POSE (records are static words; slots refresh
+per frame) — tree arm treats a moved emitter from its bake position until a
+rebuild.
+
+**Fixture gate (test:gi-lighttree-descent): ALL 19 PASS** — the W2 arms
+unchanged (index parity exact, pdf 1.98e-6, canary fails on purpose) plus the
+two W3 arms over 76,500 (case,emitter) evals and 3,500 full-estimator cases:
+E per channel vs `emitterIrradiance`, dirTo 1.6e-7, maxT 2.6e-3× its bar;
+estimator Σ E/pdf vs `estimateLightTree` same-seed, 0 bad. THE CALIBRATION IS
+THE FINDING — three rounds of honest bars, each measured not asserted:
+  · box factor f32 noise is ABSOLUTE and DISTANCE-SCALED (24 acos calls, ε/sinθ
+    per edge, sinθ ≈ diag/dist): flat 5e-5 left 60 bad, flat 2e-4 left 10, all
+    farther out; the bar that closed it is 1.5e-5·dist (floor 1e-4), ~2× the
+    measured envelope (2.1e-4 at dist 32), ~100× under any real defect up close.
+  · the estimator inherits that noise ×(1/pdf) — the abs floor must RIDE THE
+    DIVISION (per-case Σ rawFloor(dist,kind)/pdf); a fixed floor misread pure
+    scale-amplified drift as 8.5% "failures".
+  · ONE-SIDED ZERO FLIPS (hard gates: cone, slab miss — f64 exactly OFF, f32 a
+    hair inside) get population accounting, not rel comparisons: PASS is
+    ≤2% of cases AND ≤0.1% of total energy (measured 14/3500, 0.000% — a
+    missing/inverted gate flips a population, not a boundary sliver).
+
+**Live gate (test:gi-lighttree-nee, NEW):** ABBA arms on an enclosed 4-STATIC-
+lamp storm rig — exactly MAX_EMITTERS so tree set ≡ promoted set (the parity
+scene; §12.26.7: an energy claim wants an energy statistic — the centre-crop
+mean over frames). Verdict = energy within 5% + tree arms actually armed (the
+boot line) + noise ratio reported against §12.26.5's 3.00×-SE ceiling.
+
+**LIVE GATE: PASS (2026-08-14 evening).** ABBA, one invocation:
+slot 0.2323/0.2175 · tree 0.2354/0.2153 mean centre-crop luminance —
+**energy ratio 1.002** (slot round spread 0.0148, i.e. 6.6% boot-order drift
+that the ABBA pairing absorbs: adjacent arms track to <1.5%); **frame-noise
+ratio 0.71×** — the tree arm is QUIETER than the slots, far under the 3.00×
+ceiling (at 4 emitters the tree is one leaf ranking on the full importance ≈
+the exact contribution, and the root split hands every hit TWO stratified
+samples where the slot path draws one). Both arms ticking, both tree boots
+printed the arm line (base 3670704, 4 emitters, depth 0). Coverage note: the
+rig's tree is depth 0, so the LIVE run exercises leaf sampling + production
+wiring; deep descents are the fixture's 14-fixture job — together they cover.
+
+**Hatch stays OFF.** Not for doubt about [J] — for the two documented W5 gaps
+that only bite where the tree WINS (>4 emitters): a non-promoted emitter that
+is emissive on contact double-delivers (R5's handoff still speaks slot
+indices), and mover emitters sit at build pose in the packed records. Flip
+order per §12.62: W4 (screen-side swap, priced by §12.56.1's emitterShadowPass
+pole) then W5 (the handoff + seat retirement) — THEN the default, gated on the
+real Sponza.
+
+### 12.70 UNIT W4 SPEC — THE SCREEN-SIDE TREE, AND THE TWO WALLS IT MUST RESPECT (2026-08-14 night; spec first, execution staged)
+
+§12.62's W4 said "swap emitterDirectAt + emitterShadowPass onto the tree, O(slots×
+pixels) → O(log n×pixels)". The read-through that priced it (this section) says the
+literal swap is the WRONG first move, and why.
+
+**What the screen path actually is (mapped at source):** `emitterDirectAt` is a
+BUILD-TIME unroll over 4 per-field uniform bundles (giLight.js:861-900 — not a
+uniformArray, not a buffer; every slot costs its instructions whether live or not),
+its result added RAW per frame into the resolve accumulator (giScreen.js:479).
+`emitterShadowPass` (giScreen.js:864-928) is one record-march per slot per pixel at
+~0.5× light-shadow res, output packed as ONE RGBA — **channel i ≡ slot i** — then
+bilateral + wide passes; the resolve AND the material specular-glow path both sample
+it under that channel contract. The §12.65 irradiance temporal filter sits on the
+COMPOSITED resolve, and its history weight is deliberately driven to ZERO by light
+motion (GISystem.js:1652-1662).
+
+**The two walls:**
+1. **The channel↔slot contract.** Any per-pixel emitter SELECTION (stochastic or
+   deterministic) breaks the packed texture's meaning under SPATIAL filtering —
+   neighbors with different emitter sets bilateral-blend visibilities of different
+   lights. Selection granularity must be ≥ the filter kernel's, or the texture must
+   be re-keyed and re-filtered per whatever replaces slots.
+2. **The history is killed exactly when stochastic noise would spike.** A per-pixel
+   tree SAMPLE leans on temporal accumulation; ours zeroes on light motion by design
+   (ghost-vs-lag §12.43 lineage). Stochastic direct = a reservoir + its own
+   denoising story = the deleted-ReSTIR shape. Not a unit — a project.
+
+**The honest pricing at Sponza scale:** with 3-4 emitters, selection is NOT the
+cost — the ~13-14 ms IS the marches (K contributing emitters need K marches under
+any selector; §12.56.1 already took the reflection-hit marches to unshadowed). The
+tree's screen-side value is the MANY-emitter regime: today a 12-lamp room lights
+exactly 4 globally-chosen seats (§12.58 camera-apparent ranking), the rest fall to
+[J]'s indirect only (which W3's tree now covers behind its hatch — the direct hole
+is the remaining half).
+
+**Staged W4, each stage gated:**
+- **W4a — the many-emitter baseline rig. ⚠ FIRST RECORDING RETRACTED, THEN
+  RE-MEASURED (run-gi-emitter-scale.mjs).** The original N=12 numbers
+  (emitterShadow 0.03 ms, meanLum 0.1786, "the 12-lamp room reads DARKER")
+  were the §12.66 pose artifact in a new costume: the pulled-back pose
+  z=7.4 sat OUTSIDE the enclosed room (near wall at half = 7.05) — every
+  reading was the box's EXTERIOR (no emitter light, back-facing receivers
+  gating all marches, importance ties collapsing every tile list to
+  {0,1,2,3}). Caught by the rig's own P-SPREAD instrument (tile receivers
+  read x±0.47, z≡7.05 — a wall patch, not a room), which is now printed on
+  every cut readback: **a generated-rig pose must be verified INSIDE the
+  scene bounds, and the P spread is the cheap proof.** Re-measured interior
+  (same pose as N=4): N=12 seats-only reads meanLum ~0.666, emitterShadow
+  ~0.7-0.9 ms, all 12 ids in play across tile lists with visibility-shaped
+  frequency. The REAL baseline facts: the camera-apparent seats own the NEAR
+  half of the frame (the crop mean barely misses them); what the cap costs
+  is the FAR half's direct — a REGIONAL quantity, which is why the W4b
+  recovery gate is (topΔ − bottomΔ), not a mean ratio.
+- **W4b — per-TILE deterministic top-K cut (the recommended architecture).
+  SLICE (i) ✅ SHIPPED + GATE PASS (2026-08-14 night):** `createGiEmitterTileCutPass`
+  (giScreen) — one thread per 8×8 tile of the emitter-shadow grid, gbuffer
+  reconstruction at the tile centre (the shadow pass's own load + facing flip),
+  then an O(N) scan over ALL tree emitter records ranked by
+  `createLightTreeEmitterImportance` (lightTreeGpu — `buildImportanceMath`
+  extracted and SHARED with the descent, fixture re-gated 19/19 bit-identical
+  after the refactor, pdf 1.98e-6). NOT a tree walk, on purpose: thousands of
+  tiles × ≤127 records makes the flat scan cheaper than a best-first stack —
+  the TREE stays [J]'s sampling structure, the screen borrows only the ranking
+  key. Kept 4 are **sorted by EMITTER ID** before writing (rank order is the
+  one thing neighbouring tiles may disagree on without artifacts; wherever two
+  tiles agree on the SET they agree on every channel's meaning). Zero-importance
+  emitters excluded even with free seats (strict `>` — the cone/horizon the
+  importance already prices). Buffers: 2×vec4/tile (P+valid, N) + 4×u32 ids;
+  dev handle `__giTileCutLive`; hatch `__giEmitterTileCut` (build-time, default
+  OFF); queued FIRST in the emitter chain; resize follows the rebuild+splice
+  contract (a stale sx/sy would rank at wrong world points). CONSUMERLESS this
+  slice. Gate (`TILECUT=1 run-gi-emitter-scale.mjs`, both N): **N=12 and N=4 —
+  465 tiles, 450 valid, 450/450 EXACT set matches vs the CPU's
+  `emitterImportance` ranking (now exported), 0 near-ties, 0 structural**;
+  boot line asserted; smoke:gi-gpu both arms PASS on the untouched default.
+  **SLICE (ii) ✅ SHIPPED + GATE PASS (2026-08-14):** emitterShadowPass +
+  the resolve's emitterDirectAt read the tile's id list, loading per-emitter
+  data from tree RECORDS (`createLightTreeRecordSlot` pseudo-slot fed
+  `emitterSlotShadow`/`emitterSlotFactor` — the W3 shared-code pattern);
+  material glow keeps GLOBAL slots and goes unshadowed under the hatch (its
+  channel assumption cannot survive tile keying — documented trade, W5's to
+  re-key). Recorded gate (`AB=1 LAMPS=4,12 SETTLE=18000
+  run-gi-emitter-scale.mjs`, 4 boots, hatch-off vs hatch-on interleaved):
+  **N=4 PARITY ratio 1.032 (bar ≤1.05), sets 450/450 exact, marches
+  0.37→0.7 ms; N=12 REGIONAL RECOVERY (topΔ − bottomΔ) = 0.0663 (bar
+  ≥0.008; topΔ +0.0651, bottomΔ −0.0012 — the far half gains, the seated
+  near floor stays flat), mean 0.5965→0.6249, all 12 ids live in tile lists
+  with visibility-shaped frequency [372..158], emitterShadow 1.53→0.96 ms,
+  sets ok, boot lines asserted, P spread interior on every arm.** The cut
+  costs nothing measurable and the 12-lamp march bill went DOWN — per-tile
+  lists march nearer, cheaper records than 4 global camera-apparent seats.
+  Hatch `__giEmitterTileCut` stays default OFF. **SEAM IMAGING (SEAM=1, 2026-08-14):
+  NO SEAM BY EYE — statistic v1 inconclusive.** Census: 110/435 H and 160/420 V
+  boundaries carry DIFFERENT sets (mean Δset ~2.7-3, worst 8 = fully disjoint);
+  the ×6 crop at the Δset-8 boundary shows a smooth transition, no grid-aligned
+  edge (`.gi-shots/emitter-scale/seam-*.png`). The soft gate FAILED on Y-grad
+  excess +0.110, but the true-pitch ratios were nearly EQUAL across arms
+  (off 1.130 / on 1.159) — the excess came from the single incommensurate-pitch
+  CONTROL fold moving between arms (0.731 → 0.650): one control pitch is a
+  sample of size 1 from the null. v2 needs a PHASE-SHIFTED null (same pitch,
+  M shifted phases → z-score) for the gradient stat, and a multi-pitch control
+  family for the fold. REMAINING before default: seam statistic v2, and the
+  Sponza-scale ms re-ledger (ultra res, strength-100 lamps).
+- **W4c — only if ever needed: stochastic + reservoir.** Filed, not planned.
+
+W5 (R5 handoff to the tree set, seat retirement) depends on W4b's consumer shape —
+order stands W4a → W4b → W5 → default flips gated on real Sponza.
+
+### 12.71 THE NEW-SPONZA QUALITY LEDGER — what the banner Sponza exposed (2026-08-14 night)
+
+The user's Intel/banner Sponza (26 meshes, 262k tris, curtains + gold-metal
+embroidery, Belfast HDR env, day-cycle sun script) against their Blender
+reference. Perf ledger + acquittals live in the `new-sponza-perf` memory; this
+section is the QUALITY spec. Verified that night: the boot is clean (the
+empty-struct MRT-leak class is fixed — see the 2026-08-14 NIGHT memory block),
+post/compression/shadow-map/sun-death all acquitted by live bisect. Three
+structural gaps remain, ranked:
+
+**(a) SUB-CELL SURFACES SHARE ONE RADIANCE CELL — the flat-curtain mechanism.**
+Not ray tunneling: the composited field gives thin geometry one occupancy
+shell per side, needing ~2 cells across a wall; a 2-5cm curtain at 0.26m
+ultra cells collapses BOTH faces into one cell, so the lit side and the dark
+side become one value — double-lit flat fabric, "unresponsive to probe
+density, a CELL SIZE problem" (GISystem's watertightness note, ~6331). The
+volume-shrink advice in that warning does NOT rescue cloth: corridor-only
+bounds move cells 0.26→~0.17m, still 4-8× thicker than a curtain. ⚠ The
+per-mesh thin-detector under-counts here — it tests each mesh's UNION box
+thinnest axis, and a mesh holding 20 curtains spread across the building has
+a thick union; only 3 real meshes flagged while every curtain is locally
+sub-cell. FIX DIRECTION (its own unit, not an evening): normal-side-aware
+cell radiance at the GATHER — surface records already carry per-surface
+normals + §12.52 attribution; a receiver should reject/weight cell radiance
+whose attributed source normal opposes its own. Prereq reading:
+cascadeGather's ONE-SIDED notes, gi-src-surface-attribution memory. Interim
+content-side truth: none of the shipping knobs fix cloth; say so rather than
+sell a preset.
+
+**(b) METALS GO BLACK INDOORS.** §12.64 suppresses per-material env IBL under
+GI (correct — unoccluded IBL washed the scene); metals then live on SSR
+(user runs it half-res, `screenEdgeFade 0` shows the white background
+fallback at full strength on screen-exit rays — the embroidery blowout that
+bloom smears into blotches) + whatever GI specular the bucket gives them
+(this scene: 0 mirror / 24 dynamic-roughness). Braziers read pure black,
+embroidery blows white — Blender's metals reflect the interior.
+
+**ROOT CAUSE PROVEN 2026-08-14 night (live probe sphere, metalness flip):**
+a gray metal sphere (albedo #b0b0b0, m=1) renders PITCH BLACK in the sunlit
+corridor at r=0.25 AND r=0.05, while the identical sphere at metalness 0 is
+beautifully lit ⇒ GI diffuse fine, `context.radiance` ≡ 0. Two nulls stack:
+(1) `deferredRadianceLookup` is PERMANENTLY null — GISystem ~5908's own
+comment: the cascade reader (createRadianceLookup) was deleted with the
+cascades and "rough/glossy surfaces lose their blurred environment term
+until Phase 1-3"; with `radianceFn`/`giRadianceNode` both null, giLight's
+ENTIRE specular block (gate at giLight ~1409) compiles out — including,
+note, the exact-BVH mirror blend at ~1474, which sits INSIDE the gated
+block: `bvh: exact reflections ON` traces and shades hits every frame that
+no material can read. (2) three's `indirectSpecular = radiance·single +
+multi·(iblIrradiance/π)` — the iblIrradiance leg was the env IBL, which
+§12.64 now suppresses. 0 + 0 = black metal; old Sponza had no metals so it
+shipped unseen. FIX (the deferred Phase 1-3, now due): rebuild the
+directional radiance lookup over TODAY's field — resample the SRC probe
+tile atlas (or the resolve's radiance target, once the resolve writes it
+for non-mirror pixels) along `reflect(V,N)` with roughness-driven
+blur/cascade choice, assign it to `deferredRadianceLookup`, and the whole
+dormant giLight machinery (sharp/soft mixes, exact-hit blend, mirror gate)
+comes back for free. Verify with the SAME probe-sphere protocol. Plus: SSR
+screenEdgeFade default > 0 in the post node (user's stored 0 → 0.4 fixed
+live 2026-08-14).
+
+**v1 SHIPPED AND DEMOTED TO OPT-IN THE SAME NIGHT (`__giGlossyRadiance =
+true` to arm).** Gates passed (smoke 8/8 storage, SRC-on NEE energy 0.966)
+but the user's lamp-lit night scene showed FLICKERING WHITE BLOBS on the
+metallic embroidery, confirmed ours by zeroing SSR live (blobs persisted,
+flickering). Mechanism: the diffuse gather averages many bins THEN rides
+the §12.65 temporal filter; the directional lookup samples ~one bin along
+one direction into a radiance target NO temporal pass touches — per-frame
+probe noise on every glossy pixel — and it re-delivers emitters the
+resolve's emitter-direct term already lights (double delivery, so lamps
+blob twice as bright). v2 checklist before default-ON: (1) temporal filter
+on the radiance target (reuse createGiIrradianceTemporalPass verbatim —
+same shim pattern as §12.65); (2) emitter de-duplication (either subtract
+the emitter-direct estimate from the lookup or exclude promoted-emitter
+energy from the bins the lookup reads); (3) luminance cap tied to the
+emitter-direct scale; (4) the probe-sphere protocol AND a lamp-lit flicker
+rig (rev/px on a metal patch, same instrument family as §12.59) as gates.
+Dark-but-stable metals until then.
+
+**(c) LOWER PRESETS DARKEN INDIRECT-ONLY REGIONS on this scene** (medium vs
+ultra: sunlit areas match, vaults/arcades visibly darker; live screenshot
+pair 2026-08-14). §12.68-class preset-energy violation, NEW scene shape
+(no emitters, env-only + sun through apertures). Needs the rig with
+readbacks — same-pose meanLum by region across quality arms on the real
+project via the tauri shim (run-gi-sponza-* pattern), then find which
+derived term loses energy. Presets trade rays/probes/resolution, NEVER
+energy.
+
+Also recorded: the day-cycle LightScript moves the sun every play session —
+no cross-session look comparison is valid without matching sun angle first
+(two of this night's false suspicions came from exactly that).
