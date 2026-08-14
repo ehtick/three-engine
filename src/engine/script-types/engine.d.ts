@@ -3303,6 +3303,16 @@ declare module "engine" {
     getCubemap(path: string): CubeTexture | null;
 
     /**
+     * The shared sky texture for an environment path — either a `.cubemap` or
+     * an equirectangular `.hdr`/`.exr`, the two shapes the scene's own sky slot
+     * accepts. Assign it to `engine.three.scene.environment` to swap the sky at
+     * runtime; you get the same instance the editor uses, not a second decode.
+     */
+    environment(path: string): Promise<Texture | CubeTexture | null>;
+    /** The already-loaded sky texture for `path`, or null if not loaded yet. */
+    getEnvironment(path: string): Texture | CubeTexture | null;
+
+    /**
      * Registers a project font file so text can be drawn with it.
      *
      * `family` is the CSS family name to use — a GENERATED id, not the name

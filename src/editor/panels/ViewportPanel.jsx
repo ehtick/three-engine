@@ -118,11 +118,14 @@ import {
   updateSplineHandles,
 } from "../splineEditing.js";
 import {
+  applySelectionOutlineOverlay,
+  compositeSelectionOutline,
   disposeSelectionOutline,
   invalidateSelectionOutline,
-  renderSelectionOutline,
+  precompileSelectionOutlineMasks,
   setSelectionOutline,
   setSelectionOutlineEnabled,
+  updateSelectionOutlineMask,
 } from "../selectionOutline.js";
 
 /** Sets `layers.set(EDITOR_LAYER)` on every Object3D in the subtree —
@@ -1093,32 +1096,75 @@ function restoreHidden(hidden) {
 }
 
 /**
- * Registers the selection outline as a post-render pass.
+ * Registers the selection outline across the frame's two phases.
  *
- * Post-render rather than pre-render for two reasons: the outline is composited
- * OVER the finished frame, and the extra `renderer.render()` calls it makes
- * would otherwise reset three's per-frame `renderer.info` counters before
- * `StatsSystem` has read them, quietly zeroing the stats overlay's draw-call
- * and triangle readings.
+ * The MASK/DILATE half makes nested `renderer.render()` calls and manual
+ * target swaps, so it runs PRE-render — the sanctioned slot for nested renders
+ * (the GI gbuffer and the occluder pass live there for the same reason). The
+ * COMPOSITE half depends on who owns the frame:
+ *
+ *   - direct frames (`renderer.render`): one post-render quad over the canvas;
+ *   - postprocess frames (a render override owns the camera): NOTHING here —
+ *     the ring composites inside the pipeline's own output node, which the
+ *     editor registers as `engine.viewportOverlayNode`. Drawing anything
+ *     manually after `RenderPipeline.render()` silently corrupts the WebGPU
+ *     backend's cached render state (the "select an object and the viewport
+ *     breaks" bug, reproduced by scripts/run-outline-postfx-repro.mjs).
  */
 function setupSelectionOutline() {
   if (!engine.renderer) return;
+  // The postprocess module composites this into its pipeline output at
+  // compile time. Registered once, before any scene pipeline compiles; the
+  // returned node graph is stable across selection changes so selecting
+  // never rebuilds a pipeline.
+  engine.viewportOverlayNode = applySelectionOutlineOverlay;
   // The render targets and compiled materials belong to the WebGPU device that
   // created them. A renderer rebuild (a settings change that needs new
   // constructor options) leaves them pointing at a dead device, so drop them
-  // and let the next frame rebuild against the new one.
+  // and let the next frame rebuild against the new one. This handler is
+  // registered BEFORE any PostprocessComponent's (the editor boots first), so
+  // the disposal lands before the pipelines that bind the overlay's textures
+  // recompile against the fresh ones.
   engine.on("renderer-rebuilt", () => {
     disposeSelectionOutline();
     attachSelection(useSelectionStore.getState().ids);
   });
-  engine.onPostRender(() => {
-    if (engine.playing) return;
-    renderSelectionOutline({
+  engine.onPreRender(() => {
+    updateSelectionOutlineMask({
       renderer: engine.renderer,
       scene: engine.scene,
       camera: viewport.camera,
+      playing: engine.playing,
     });
   });
+  engine.onPostRender(() => {
+    if (engine.playing) return;
+    // A render override (PostprocessComponent) already composited the ring
+    // inside its pipeline via engine.viewportOverlayNode.
+    const overrideOwnsFrame = [...(engine.renderOverrides ?? [])].some((o) => o.ownsCamera?.(engine));
+    if (overrideOwnsFrame) return;
+    compositeSelectionOutline({ renderer: engine.renderer });
+  });
+  // Warm the mask pipelines so the FIRST selection of any mesh never compiles
+  // mid-frame ("it lags each time I select another object"). Once at startup
+  // and again — debounced, off the frame — whenever the entity tree changes;
+  // compileAsync only creates what is missing, so re-runs are cheap.
+  let warmTimer = 0;
+  const warmMasks = () => {
+    warmTimer = 0;
+    if (engine.playing || !engine.renderer || !viewport.camera) return;
+    precompileSelectionOutlineMasks({
+      renderer: engine.renderer,
+      scene: engine.scene,
+      camera: viewport.camera,
+    }).catch(() => {});
+  };
+  const scheduleWarm = () => {
+    if (warmTimer) clearTimeout(warmTimer);
+    warmTimer = setTimeout(warmMasks, 1000);
+  };
+  scheduleWarm();
+  engine.on("hierarchy-changed", scheduleWarm);
 }
 
 function setupCameraPreview() {

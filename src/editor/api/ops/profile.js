@@ -121,8 +121,15 @@ defineOp({
       }
       const queueMs = {};
       for (const e of [...queueEntries].sort((a, b) => (b.ms ?? 0) - (a.ms ?? 0))) {
+        // The frame loop dispatch-skips the shadow chains (GISystem's
+        // `frameSkip`), but this op times raw queue nodes — so a skipped
+        // pass shows its WOULD-BE cost. Annotate it the way screenPassesMs
+        // does, or the number reads as live frame cost (it misread as a
+        // 1.9ms/frame leak once already).
+        const why = skipReason(e.pass);
+        const value = why && typeof e.ms === "number" ? `${e.ms} (NOT dispatched — ${why})` : e.ms;
         // Duplicate labels (one merge per cascade level) keep their index.
-        queueMs[queueMs[e.pass] === undefined ? e.pass : `${e.pass} #${queueEntries.indexOf(e)}`] = e.ms;
+        queueMs[queueMs[e.pass] === undefined ? e.pass : `${e.pass} #${queueEntries.indexOf(e)}`] = value;
       }
       // SRC probe population (opt-in via `__giSrcProbes`), timed PER GROUP.
       //
@@ -279,6 +286,7 @@ defineOp({
         srcProbes,
         queueMs,
         queueTotalMs: +queueEntries
+          .filter((e) => !skipReason(e.pass))
           .map((e) => e.ms)
           .filter((v) => typeof v === "number")
           .reduce((a, b) => a + b, 0)

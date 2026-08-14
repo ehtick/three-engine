@@ -282,12 +282,18 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
   };
 
   const rewriteScene = (sceneJson) => {
-    // Scene settings can reference a .cubemap (skybox / image-based lighting).
-    // It ships like a .mat: the descriptor is rewritten, its faces are copied.
-    if (sceneJson.settings?.environment?.cubemap) {
-      const src = sceneJson.settings.environment.cubemap;
-      cubemapPaths.add(sourcePath(src));
-      sceneJson.settings.environment.cubemap = claimDoc(src);
+    // The scene's sky slot, which holds either shape (engine/environmentAsset.js).
+    // A .cubemap ships like a .mat — the descriptor is re-emitted and its six
+    // faces are copied. An .hdr/.exr is one file and just gets copied; routing
+    // it through the cubemap bucket would try to parse a binary as JSON.
+    const sky = sceneJson.settings?.environment?.cubemap;
+    if (sky) {
+      if (extOf(sky) === "cubemap") {
+        cubemapPaths.add(sourcePath(sky));
+        sceneJson.settings.environment.cubemap = claimDoc(sky);
+      } else {
+        sceneJson.settings.environment.cubemap = claim(sky);
+      }
     }
     (sceneJson.entities ?? []).forEach(visit);
     for (const def of sceneJson.prefabs ?? []) {

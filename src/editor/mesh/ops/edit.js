@@ -213,6 +213,12 @@ export function makeEdgeFace(mesh, mode) {
   const shared = face.loops.find((loop) => loop.e.loops.length === 2);
   if (shared) {
     const neighbour = shared.e.loops.find((loop) => loop.f !== face);
+    if (neighbour) {
+      // The fill joins that surface, so it takes its shading and material too —
+      // the smooth default reads as a dark dent on a flat-shaded mesh.
+      face.material = neighbour.f.material;
+      face.smooth = neighbour.f.smooth;
+    }
     if (neighbour && neighbour.v === shared.v) face = flipFace(mesh, face) ?? face;
   }
   clearSelection(mesh);
@@ -570,8 +576,10 @@ export function ripVerts(mesh, verts, direction = [1, 0, 0], { fill = false } = 
     for (let index = 0; index + 1 < seams.length; index++) {
       const [a, aCopy] = seams[index];
       const [b, bCopy] = seams[index + 1];
-      if (!findEdge(a, b)) continue;
-      addFace(mesh, [a, b, bCopy, aCopy]);
+      const seamEdge = findEdge(a, b);
+      if (!seamEdge) continue;
+      const beside = seamEdge.loops[0]?.f;
+      addFace(mesh, [a, b, bCopy, aCopy], beside ? { material: beside.material, smooth: beside.smooth } : {});
     }
   }
   flushSelection(mesh, "vert");

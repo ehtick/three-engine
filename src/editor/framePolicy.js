@@ -47,12 +47,18 @@ export function shouldSuspendViewport({
  * an idle scene runs uncapped because capping it buys nothing and costs
  * smoothness while orbiting.
  *
+ * `gesture` means the pointer is actively dragging ON the viewport canvas —
+ * an orbit, a gizmo drag, a transform. That is the one moment the viewport
+ * must never be capped: the heavy work IS what the user is steering, and the
+ * work-based caps below turned a heavy-scene orbit into a visible stutter that
+ * came and went as workMs crossed their thresholds.
+ *
  * @param {number} workMs how long the last frame's GPU/CPU work took
- * @param {{ interacting?: boolean, playing?: boolean }} [state]
+ * @param {{ interacting?: boolean, playing?: boolean, gesture?: boolean }} [state]
  * @returns {number} an fps cap, or 0 for uncapped
  */
-export function editorFrameRateFor(workMs, { interacting = false, playing = false } = {}) {
-  if (playing || !(workMs > 0)) return 0;
+export function editorFrameRateFor(workMs, { interacting = false, playing = false, gesture = false } = {}) {
+  if (playing || gesture || !(workMs > 0)) return 0;
   if (interacting && workMs >= 14) return 15;
   if (workMs >= 42) return 20;
   if (workMs >= 24) return 30;

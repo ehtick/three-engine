@@ -39,6 +39,23 @@ function isViewportGesture(target) {
   return !!target?.closest?.("canvas.viewport-canvas, .geometry-editor-canvas");
 }
 
+/**
+ * Which canvas a direct gesture is happening on, or null.
+ *
+ * "main" is the engine's own viewport; "geometry" is the geometry editor's
+ * separate canvas and renderer. The distinction matters because the two are
+ * paced differently: a gesture on the main canvas must never be capped, while a
+ * gesture on the geometry canvas means the ENGINE loop is the competition — it
+ * may be catching up on an autosave or a GI rebuild behind a detached tab, and
+ * every frame it renders there is stolen from the orbit the user is actually
+ * performing.
+ */
+function gestureSurface(target) {
+  if (target?.closest?.("canvas.viewport-canvas")) return "main";
+  if (target?.closest?.(".geometry-editor-canvas")) return "geometry";
+  return null;
+}
+
 /** The live viewport canvas, or null before one exists. */
 function viewportCanvas() {
   return document.querySelector("canvas.viewport-canvas");
@@ -95,6 +112,13 @@ export function installEditorFramePacing() {
 
   let interactiveUntil = 0;
   let dirtyUntil = 0;
+  // A pressed pointer dragging on a viewport canvas, plus a short tail after
+  // wheel zooms (which have no up event to end on).
+  /** @type {"main" | "geometry" | null} */
+  let gestureHeld = null;
+  /** @type {"main" | "geometry" | null} */
+  let gestureWheeled = null;
+  let gestureWheelUntil = 0;
   // See the pin block in apply(): bridges sub-sample gaps between the boot
   // chain's pin signals, and covers the pre-entity scene-file phase at
   // install time.
@@ -164,6 +188,12 @@ export function installEditorFramePacing() {
     return false;
   };
 
+  /** The canvas a direct gesture is live on right now, or null. */
+  const activeGesture = () => {
+    if (gestureHeld) return gestureHeld;
+    return performance.now() < gestureWheelUntil ? gestureWheeled : null;
+  };
+
   const apply = () => {
     if (cameraMoved()) wake();
 
@@ -217,6 +247,38 @@ export function installEditorFramePacing() {
     // happens to be watching it at the time.
     const catchingUp = performance.now() < dirtyUntil;
 
+    // A live drag on the geometry editor's canvas owns the main thread. The
+    // geometry editor renders through its own canvas and requestAnimationFrame
+    // loop, so the engine loop at that moment is painting a viewport that is
+    // hidden behind the geometry tab — catching up on an autosave, or pinned
+    // UNCAPPED for seconds by the GI rebuild each geometry save queues — and
+    // every one of those frames is stolen from the orbit the user is actually
+    // performing. That is the "viewport randomly starts throttling while I
+    // orbit" report: the bursts follow the edits. Play mode is exempt as
+    // always. The deferred work resumes the moment the gesture ends; a GI
+    // rebuild finishing an orbit later is invisible, a stuttering orbit is not.
+    const gesture = engine.playing ? null : activeGesture();
+    if (gesture === "geometry") {
+      if (!viewportVisible()) {
+        if (!suspended && host.loopActive) {
+          suspended = true;
+          host.stop();
+        }
+        return;
+      }
+      // Both canvases are on screen (a split layout): keep the main viewport
+      // moving, but at the catch-up rate rather than full speed.
+      if (suspended) {
+        suspended = false;
+        host.start();
+      }
+      if (applied !== DIRTY_FPS) {
+        applied = DIRTY_FPS;
+        engine.setFrameRateLimit(DIRTY_FPS);
+      }
+      return;
+    }
+
     if (idle && !catchingUp) {
       if (!suspended && host.loopActive) {
         suspended = true;
@@ -238,6 +300,7 @@ export function installEditorFramePacing() {
         : editorFrameRateFor(workMs, {
             interacting: performance.now() < interactiveUntil,
             playing: engine.playing,
+            gesture: gesture === "main",
           });
     if (next === applied) return;
     applied = next;
@@ -254,6 +317,42 @@ export function installEditorFramePacing() {
   window.addEventListener("pointermove", prioritizeUi, true);
   window.addEventListener("wheel", prioritizeUi, { capture: true, passive: true });
   window.addEventListener("keydown", prioritizeUi, true);
+
+  // Direct canvas gestures. Held pointers are counted rather than flagged so a
+  // second touch releasing early cannot end a drag that is still going; wheel
+  // zooms have no up event, so they run on a short tail instead.
+  let gesturePointers = 0;
+  const onGesturePointerDown = (event) => {
+    const surface = gestureSurface(event.target);
+    if (!surface) return;
+    gesturePointers += 1;
+    gestureHeld = surface;
+    apply();
+  };
+  const onGesturePointerEnd = () => {
+    if (!gestureHeld) return;
+    gesturePointers = Math.max(0, gesturePointers - 1);
+    if (gesturePointers) return;
+    gestureHeld = null;
+    apply();
+  };
+  const onGestureLost = () => {
+    gesturePointers = 0;
+    gestureHeld = null;
+    apply();
+  };
+  const onGestureWheel = (event) => {
+    const surface = gestureSurface(event.target);
+    if (!surface) return;
+    gestureWheeled = surface;
+    gestureWheelUntil = performance.now() + 300;
+    apply();
+  };
+  window.addEventListener("pointerdown", onGesturePointerDown, true);
+  window.addEventListener("pointerup", onGesturePointerEnd, true);
+  window.addEventListener("pointercancel", onGesturePointerEnd, true);
+  window.addEventListener("blur", onGestureLost);
+  window.addEventListener("wheel", onGestureWheel, { capture: true, passive: true });
   // Clicking into or out of the viewport changes the answer immediately;
   // waiting up to a sample interval to resume makes it feel sticky.
   window.addEventListener("focusin", apply, true);

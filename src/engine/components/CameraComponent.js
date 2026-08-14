@@ -3,6 +3,9 @@ import { Component } from "./Component.js";
 import { DEBUG_LAYER, EDITOR_LAYER, UI_LAYER } from "../editorLayers.js";
 import { BLEND_STYLES, CameraPose, blendCurve } from "../camera/rigMath.js";
 
+/** Occlusion is tri-state so a pre-existing scene setting still means something. */
+export const OCCLUSION_MODES = ["inherit", "on", "off"];
+
 /**
  * The real camera — and, when the scene has any Virtual Cameras, the "brain"
  * that decides which of them is live and blends between them.
@@ -35,6 +38,21 @@ export class CameraComponent extends Component {
     followTarget: null, // entity id (string) or null
     followInViewport: false,
     followInGame: false,
+    // --- culling ---
+    // What this camera does and does not bother drawing. It lives here rather
+    // than in scene settings because culling is a property of a VIEW: a minimap
+    // and a first-person camera looking at the same room disagree about what is
+    // worth testing, and the answer to "why did that mesh vanish?" should be on
+    // the thing that made it vanish.
+    frustumCulling: true,
+    // Tri-state, not a boolean, because it used to be
+    // `settings.performance.occlusionCulling` and every scene authored before
+    // the move still carries that. "inherit" reads the scene setting, so those
+    // scenes behave exactly as they did; "on"/"off" are this camera saying so.
+    occlusionCulling: "inherit",
+    occluderMinSize: 1.5,
+    occlusionBias: 0.02,
+    cullShadowCasters: true,
   };
   static schema = [
     { key: "fov", label: "FOV", type: "number", min: 1, max: 179, step: 1 },
@@ -44,6 +62,16 @@ export class CameraComponent extends Component {
     { key: "blendStyle", label: "Blend Curve", type: "select", options: BLEND_STYLES },
     { key: "shake", label: "Shake Scale", type: "number", min: 0, max: 4, step: 0.1 },
     { key: "previewRigInEditor", label: "Preview Rig", type: "boolean" },
+    { key: "frustumCulling", label: "Frustum Culling", type: "boolean" },
+    {
+      key: "occlusionCulling",
+      label: "Occlusion Culling",
+      type: "select",
+      options: OCCLUSION_MODES,
+    },
+    { key: "occluderMinSize", label: "Min Occluder Size", type: "number", min: 0, step: 0.1 },
+    { key: "occlusionBias", label: "Occlusion Bias", type: "number", min: 0, max: 1, step: 0.005 },
+    { key: "cullShadowCasters", label: "Cull Shadow Casters", type: "boolean" },
   ];
 
   onAttach() {
@@ -57,6 +85,7 @@ export class CameraComponent extends Component {
     // one of its own (see engine/ui/UiSystem.js).
     this.camera.layers.enable(UI_LAYER);
     this.camera.userData.entityId = this.entity.id;
+    this.entity.engine.cameraComponents.add(this);
     this.entity.object3D.add(this.camera);
     this.model = buildCameraModel();
     this.model.traverse((child) => child.layers.set(EDITOR_LAYER));
@@ -82,6 +111,7 @@ export class CameraComponent extends Component {
 
   onDetach() {
     this.#restorePreviewPose();
+    this.entity.engine.cameraComponents.delete(this);
     if (!this.camera) return;
     this.entity.object3D.remove(this.camera);
     this.camera = null;

@@ -8,7 +8,7 @@
  *   models   → gltf + buffers + textures fetched and packed into a single
  *              .glb, then run through the standard unpackGlb pipeline
  *              (prefab + materials + extracted textures, draco/basis aware)
- *   hdris    → PolyHaven/<Name>_<res>.hdr for the Environment component
+ *   hdris    → PolyHaven/<Name>_<res>.hdr, set as the scene's sky
  *
  * API: https://github.com/Poly-Haven/Public-API — CC0 content, CORS open on
  * both api.polyhaven.com and the dl.polyhaven.org CDN, so plain fetch works
@@ -406,8 +406,21 @@ export async function downloadHdri({ name, files, res = "2k", onProgress }) {
 }
 
 /**
- * Points the scene at an HDRI: reuses the first Environment component in the
- * scene, else creates an "Environment" entity (undoable) with one.
+ * Points the scene at an HDRI — as a SCENE SETTING (`environment.cubemap`,
+ * which accepts .hdr/.exr as well as .cubemap; see engine/environmentAsset.js).
+ *
+ * This used to spawn an entity carrying an `environment` component instead, and
+ * that is precisely what made an imported sky uncontrollable: the viewport
+ * showed an HDRI while Scene Settings — the panel with the intensity, rotation
+ * and blur knobs — said "None", because the two never shared a slot. A scene
+ * setting is also the right home on the merits: one sky per scene, saved with
+ * the scene, no entity to accidentally delete or reparent.
+ *
+ * A scene that ALREADY holds an environment component keeps using it (writing
+ * the setting too would leave two skies fighting, and the component wins).
+ * Scene Settings offers a one-click move for those.
+ *
+ * @returns {Promise<{ entity: import("../engine/Entity.js").Entity | null }>}
  */
 export async function setSceneEnvironment(hdriPath) {
   const { ensureEngine } = await import("./engineInstance.js");
@@ -416,15 +429,16 @@ export async function setSceneEnvironment(hdriPath) {
     const comp = entity.getComponent("environment");
     if (comp) {
       comp.setProp("hdri", hdriPath);
-      return entity;
+      return { entity };
     }
   }
-  const { CreateEntityCommand } = await import("./commands/entityCommands.js");
   const { commandBus } = await import("./commands/CommandBus.js");
-  const cmd = new CreateEntityCommand({
-    name: "Environment",
-    components: [{ type: "environment", props: { hdri: hdriPath } }],
-  });
-  commandBus.execute(cmd);
-  return engine.getEntity(cmd.entityId);
+  const { SetSceneSettingsCommand } = await import("./commands/settingsCommands.js");
+  commandBus.execute(
+    new SetSceneSettingsCommand(
+      { environment: { cubemap: hdriPath, background: true, lighting: true } },
+      "Set scene sky",
+    ),
+  );
+  return { entity: null };
 }

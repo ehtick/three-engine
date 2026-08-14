@@ -8,6 +8,7 @@ import {
   ChevronRight,
   Copy,
   CopyPlus,
+  Download,
   ExternalLink,
   FileCode2,
   FolderOpen,
@@ -39,6 +40,7 @@ import {
   AUDIO_EXTENSIONS,
   FONT_EXTENSIONS,
   SCRIPT_EXTENSIONS,
+  HDRI_EXTENSIONS,
 } from "../assetLoader.js";
 import { assetActions } from "../assetActions.js";
 import { CodeEditor } from "../components/CodeEditor.jsx";
@@ -105,6 +107,8 @@ const TYPE_LABELS = {
   geom: "Geometry",
   mat: "Material",
   cubemap: "Cube Map",
+  hdr: "HDRI",
+  exr: "HDRI",
   anim: "Animator",
   timeline: "Timeline",
   atlas: "Sprite Atlas",
@@ -142,6 +146,7 @@ const ACTION_ICONS = {
   Brush,
   Copy,
   CopyPlus,
+  Download,
   ExternalLink,
   FileCode2,
   FolderOpen,
@@ -174,6 +179,7 @@ const KNOWN_EXTS = new Set([
   ...SCRIPT_EXTENSIONS,
   ...AUDIO_EXTENSIONS,
   ...JSON_SOURCE_EXTS,
+  ...HDRI_EXTENSIONS,
   "glb",
   "geom",
   "json",
@@ -972,10 +978,65 @@ function CubemapEditor({ path }) {
         <div className="asset-hint">
           {isActive
             ? "This cube map is the scene's skybox and image-based lighting source. Tune intensity, rotation and blur in Scene Settings → Environment."
-            : "Sets Scene Settings → Environment → Cube Map, which drives both the skybox and image-based lighting."}
+            : "Sets Scene Settings → Environment → Sky, which drives both the skybox and image-based lighting."}
         </div>
       </div>
     </>
+  );
+}
+
+/**
+ * An equirectangular HDRI (`.hdr` / `.exr`) — the other shape the scene's sky
+ * slot takes. There is nothing to edit inside the file, so the whole panel is
+ * the one action that matters: make it the scene's sky, in the same place a
+ * cube map goes, with the same knobs (Scene Settings → Environment).
+ */
+function HdriInspector({ path }) {
+  const [activeSky, setActiveSky] = useState("");
+  useEffect(() => {
+    let live = true;
+    let unsub = null;
+    import("../engineInstance.js").then(({ ensureEngine }) =>
+      ensureEngine().then((engine) => {
+        if (!live) return;
+        const read = (settings) => setActiveSky(settings?.environment?.cubemap ?? "");
+        read(engine.settings);
+        unsub = engine.on("settings-changed", read);
+      }),
+    );
+    return () => {
+      live = false;
+      unsub?.();
+    };
+  }, []);
+
+  const norm = (p) => String(p ?? "").replaceAll("\\", "/");
+  const isActive = !!activeSky && norm(activeSky) === norm(path);
+
+  const useAsSky = async (enable) => {
+    const { commandBus } = await import("../commands/CommandBus.js");
+    const { SetSceneSettingsCommand } = await import("../commands/settingsCommands.js");
+    commandBus.execute(
+      new SetSceneSettingsCommand(
+        { environment: { cubemap: enable ? path : "", background: true, lighting: true } },
+        enable ? "Set scene sky" : "Clear scene sky",
+      ),
+    );
+  };
+
+  return (
+    <div className="inspector-section">
+      <div className="section-header">Scene</div>
+      <button className="toolbar-btn wide" onClick={() => useAsSky(!isActive)}>
+        <Globe size={13} />
+        {isActive ? "Remove from Scene Environment" : "Set as Scene Environment"}
+      </button>
+      <div className="asset-hint">
+        {isActive
+          ? "This HDRI is the scene's sky and image-based lighting source. Tune intensity, rotation and blur in Scene Settings → Environment."
+          : "Sets Scene Settings → Environment → Sky, which drives both the skybox and image-based lighting."}
+      </div>
+    </div>
   );
 }
 
@@ -1857,7 +1918,7 @@ function SceneSummary({ path }) {
               </>
             )}
             {scene.settings?.environment?.cubemap && (
-              <div className="asset-info-row">Skybox: {fileName(scene.settings.environment.cubemap)}</div>
+              <div className="asset-info-row">Sky: {fileName(scene.settings.environment.cubemap)}</div>
             )}
           </div>
         );
@@ -2091,6 +2152,7 @@ export function AssetInspector({ path }) {
       {isFont && <FontPreview path={path} />}
       {ext === "atlas" && <AtlasPreview path={path} />}
       {ext === "cubemap" && <CubemapEditor path={path} />}
+      {HDRI_EXTENSIONS.includes(ext) && <HdriInspector path={path} />}
       {isAudio && <AudioPreview path={path} />}
       {ext === "scene" && <SceneSummary path={path} />}
       {ext === "timeline" && <TimelineSummary path={path} />}

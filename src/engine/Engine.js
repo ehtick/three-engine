@@ -85,6 +85,14 @@ export class Engine extends EventEmitter {
     // under Vite's `?t=` reload twins — see the long history in the notes on
     // `vmSingleton`. One engine, one list.
     this.virtualCameras = new Set();
+    // Real cameras (CameraComponent), same registry pattern and the same
+    // reason. Culling reads this: the editor's viewport camera is not an
+    // entity and has no component, so "what would the shipped game cull?" has
+    // to be answered from the scene's own camera. See `applyCullingSettings()`.
+    this.cameraComponents = new Set();
+    // Resolved from the governing camera every tick; seeded here so a headless
+    // caller that never ticks still gets the default (culling on).
+    this._frustumCulling = true;
     // Camera shake. Owned here so it survives whichever camera happens to be
     // active: an explosion's rumble must not stop because the shot cut.
     this.cameraImpulse = new ImpulseSystem();
@@ -286,7 +294,10 @@ export class Engine extends EventEmitter {
     // applySettings() re-applies this whenever the scene changes it.
     this.batching.setEnabled(this.settings.performance?.autoBatching !== false);
     this.merging.setEnabled(this.settings.performance?.staticMerging === true);
-    this.occlusion.setEnabled(this.settings.performance?.occlusionCulling === true);
+    // Resolved through the camera, not read from settings directly — the scene
+    // setting is only what a camera set to "inherit" falls back to. Re-applied
+    // every tick anyway; this is just so the state is right before the first one.
+    this.applyCullingSettings();
 
     // Set to true by `emit("hierarchy-changed")` while a coalescing microtask
     // is pending. See the `emit` override below.
@@ -430,7 +441,10 @@ export class Engine extends EventEmitter {
     }
     this.batching.setEnabled(this.settings.performance?.autoBatching !== false);
     this.merging.setEnabled(this.settings.performance?.staticMerging === true);
-    this.occlusion.setEnabled(this.settings.performance?.occlusionCulling === true);
+    // Resolved through the camera, not read from settings directly — the scene
+    // setting is only what a camera set to "inherit" falls back to. Re-applied
+    // every tick anyway; this is just so the state is right before the first one.
+    this.applyCullingSettings();
     this.emit("settings-changed", this.settings);
     return recreatedRenderer;
   }
@@ -712,6 +726,53 @@ export class Engine extends EventEmitter {
     this.renderer.setAnimationLoop(null);
   }
 
+  /**
+   * The camera component whose culling settings apply this frame.
+   *
+   * Usually the active camera's own. The case that makes this a method is the
+   * EDITOR VIEWPORT: its camera is a plain PerspectiveCamera owned by the
+   * panel, not an entity, so it has no component to read. Falling back to the
+   * scene's first enabled camera is what makes the viewport cull the way the
+   * shipped game will — otherwise occlusion problems are invisible until you
+   * press Play, which is the slowest possible way to find them.
+   *
+   * Null when the scene has no camera at all; callers fall back to defaults.
+   */
+  governingCullingCamera() {
+    const entityId = this.camera?.userData?.entityId;
+    if (entityId) {
+      const own = this.getEntity(entityId)?.getComponent("camera");
+      if (own) return own;
+    }
+    for (const component of this.cameraComponents) {
+      if (component.enabled !== false) return component;
+    }
+    return null;
+  }
+
+  /**
+   * Pushes the governing camera's culling props into the systems that read
+   * them. Called at the top of every tick; public because "what is actually
+   * culling right now" is a question worth being able to ask without rendering
+   * a frame — the tests do exactly that.
+   */
+  applyCullingSettings() {
+    const props = this.governingCullingCamera()?.props;
+    this._frustumCulling = props ? props.frustumCulling !== false : true;
+    // "inherit" is what every scene authored before these props existed says,
+    // and it has to keep meaning the old scene-level setting.
+    const mode = props?.occlusionCulling ?? "inherit";
+    const inherited = this.settings.performance?.occlusionCulling === true;
+    this.occlusion.setEnabled(mode === "inherit" ? inherited : mode === "on");
+    if (props) {
+      this.occlusion.configure({
+        minOccluderSize: props.occluderMinSize,
+        bias: props.occlusionBias,
+        cullShadowCasters: props.cullShadowCasters,
+      });
+    }
+  }
+
   #tick() {
     const frameStarted = performance.now();
     if (this.frameRateLimit > 0) {
@@ -744,14 +805,23 @@ export class Engine extends EventEmitter {
     // culling decisions see the current frame. The frustum internally
     // no-ops when the camera hasn't moved, so this is one cheap
     // matrix-multiply hash check on a static-camera frame.
+    // Culling is configured on the camera (see CameraComponent), so resolve
+    // whose settings apply before anything reads them.
+    this.applyCullingSettings();
     this.viewFrustum.refresh(this.camera);
     // Update `_inView` on every view-only component: one sphere/plane test
     // each. The registry is maintained incrementally as components opt in and
     // out (see Component._viewOnlyActive), so this costs nothing on a scene
     // that uses no frustum gating — where the previous nested walk over every
     // entity and every component still ran in full, every frame.
-    if (this.viewFrustum.isReady()) {
+    if (this.viewFrustum.isReady() && this._frustumCulling) {
       for (const c of this.viewOnlyComponents) c.updateViewVisibility(this.viewFrustum);
+    } else if (!this._frustumCulling) {
+      // Turning it off has to UNDO it, not just stop updating it: a component
+      // left with `_inView === false` from the last frame it was tested would
+      // stay hidden forever, which is the exact complaint the switch exists to
+      // diagnose. `null` is the frustum's own "no camera, show everything".
+      for (const c of this.viewOnlyComponents) c.updateViewVisibility(null);
     }
     // Resolve per-mode visibility onto every entity's Object3D. We write
     // only when the desired value differs from the current one so a stable

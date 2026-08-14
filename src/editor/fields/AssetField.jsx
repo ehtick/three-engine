@@ -197,6 +197,7 @@ export function AssetField({ descriptor, value, onCommit }) {
           anchorRef={triggerRef}
           className="asset-options component-menu"
           minWidth={250}
+          layer={descriptor.layer}
           onClose={() => setOpen(false)}
         >
           <div className="component-menu-search">

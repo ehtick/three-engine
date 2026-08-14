@@ -19,7 +19,7 @@ import {
   TEXTURE_EXTENSIONS,
   SCRIPT_EXTENSIONS,
   MATERIAL_EXTENSIONS,
-  CUBEMAP_EXTENSIONS,
+  ENVIRONMENT_EXTENSIONS,
   PREFAB_EXTENSIONS,
   ANIMATOR_EXTENSIONS,
   GEOMETRY_EXTENSIONS,
@@ -40,7 +40,9 @@ export const ASSET_TYPES = [
   { id: "model", label: "Models", Icon: Boxes, exts: MODEL_IMPORT_EXTENSIONS },
   { id: "texture", label: "Textures", Icon: Image, exts: TEXTURE_EXTENSIONS },
   { id: "material", label: "Materials", Icon: Palette, exts: MATERIAL_EXTENSIONS },
-  { id: "cubemap", label: "Cube Maps", Icon: Globe, exts: CUBEMAP_EXTENSIONS },
+  // Both shapes of a sky under one filter — a cube map and an HDRI are the same
+  // thing to anyone looking for one. See src/engine/environmentAsset.js.
+  { id: "cubemap", label: "Skies", Icon: Globe, exts: ENVIRONMENT_EXTENSIONS },
   { id: "geometry", label: "Geometry", Icon: Shapes, exts: GEOMETRY_EXTENSIONS },
   { id: "atlas", label: "Sprite Atlases", Icon: Grid3x3, exts: ATLAS_EXTENSIONS },
   { id: "prefab", label: "Prefabs", Icon: Package, exts: PREFAB_EXTENSIONS },

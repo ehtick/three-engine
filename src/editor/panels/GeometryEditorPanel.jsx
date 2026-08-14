@@ -8,8 +8,9 @@ import { invalidateBlobUrl, writeBinaryFile } from "../assetLoader.js";
 import { disposeOrReleaseGeometry } from "../../engine/geometryAsset.js";
 import { authoredGeometry, ensureGeometryAsset, saveNewGeometryAsset } from "../geometryEditing.js";
 import { invalidateVirtualGeometryAsset } from "../../modules/virtual-geometry/index.js";
-import { CreateEntityCommand } from "../commands/entityCommands.js";
+import { BatchCommand, CreateEntityCommand } from "../commands/entityCommands.js";
 import { AddComponentCommand, RemoveComponentCommand, SetComponentPropCommand } from "../commands/componentCommands.js";
+import { AssetField } from "../fields/AssetField.jsx";
 import { AxisViewGizmo } from "../helpers/AxisViewGizmo.jsx";
 import { isTypingTarget } from "../keyScope.js";
 import { GEOMETRY_MODIFIER_DEFINITIONS, createGeometryModifier } from "../../engine/geometryModifiers.js";
@@ -71,6 +72,7 @@ import {
 import { bevelEdges, knifeCut, loopCut, offsetEdgeLoop, subdivideFaces } from "../mesh/ops/topology.js";
 import {
   bridgeEdgeLoops,
+  bridgeFaces,
   fillHoles,
   flipNormals,
   gridFill,
@@ -160,10 +162,12 @@ const SHADING_MODES = [
 const MODE_LABELS = { vert: "Vertex", edge: "Edge", face: "Face" };
 const UNDO_DEPTH = 64;
 
-const materialSlotLabel = (path, index) => {
-  const filename = String(path ?? "").split(/[\\/]/).pop()?.replace(/\.mat$/i, "");
-  return `Slot ${index + 1} · ${filename || "Unassigned"}`;
-};
+// Slot index is the geometry group index — the same eight keys the Mesh
+// component and the Inspector's material section use.
+const MATERIAL_SLOT_KEYS = [
+  "material",
+  ...Array.from({ length: 7 }, (_, index) => `material${index + 2}`),
+];
 
 function reloadGeometryUsers(path) {
   for (const candidate of engine.entities.values()) {
@@ -551,6 +555,9 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
   const [selectionTool, setSelectionTool] = useState(null);
   const [selectionGesture, setSelectionGesture] = useState(null);
   const [faceMaterial, setFaceMaterial] = useState(0);
+  // How many material slot rows the list shows beyond the assigned ones — the
+  // "+" button's state. The assigned slots always show regardless.
+  const [slotRows, setSlotRows] = useState(1);
   const [cuts, setCuts] = useState(1);
   const [snapView, setSnapView] = useState(null);
   const [pendingChord, setPendingChord] = useState(null);
@@ -1320,6 +1327,119 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
     return count ? { message: `Assigned slot ${faceMaterial + 1} to ${count} faces` } : { error: "Select faces first" };
   });
 
+  /* ------------------------- Material slot list -------------------------- */
+
+  // A different entity means a different slot list; carrying the previous
+  // mesh's active slot over would assign faces to a slot that may not exist.
+  useEffect(() => {
+    setFaceMaterial(0);
+    setSlotRows(1);
+  }, [entityId]);
+
+  /**
+   * The entity's real materials are borrowed once when the editor scene is
+   * built, so a slot change would leave Material Preview showing the old
+   * surface until the panel reopened. The mesh component reloads its material
+   * asynchronously after the prop commit; polling briefly and re-borrowing
+   * when the array's identity changes is the simplest hook that cannot miss
+   * the load, whatever path it takes.
+   */
+  const watchRealMaterials = () => {
+    const until = performance.now() + 3000;
+    const tick = () => {
+      const session = sessionRef.current;
+      if (!session) return;
+      const source = component?.mesh?.material;
+      if (source) {
+        const next = Array.isArray(source) ? [...source] : source;
+        const changed = Array.isArray(next)
+          ? !Array.isArray(session.realMaterials) || next.some((entry, index) => entry !== session.realMaterials[index])
+          : next !== session.realMaterials;
+        if (changed) {
+          session.realMaterials = next;
+          // The dispose path must know these are the entity's own materials —
+          // disposing a borrowed material blanks the mesh in Object Mode.
+          for (const material of Array.isArray(next) ? next : [next]) session.borrowedMaterials?.add(material);
+          if (session.shading === "material" || session.shading === "rendered") applyShading(session, session.shading);
+        }
+      }
+      if (performance.now() < until) requestAnimationFrame(tick);
+    };
+    tick();
+  };
+
+  const slotValues = MATERIAL_SLOT_KEYS.map((key) => component?.props?.[key] ?? "");
+  const filledSlots = MATERIAL_SLOT_KEYS.reduce((last, key, index) => (component?.props?.[key] ? index + 1 : last), 0);
+  const slotCount = Math.min(MATERIAL_SLOT_KEYS.length, Math.max(1, filledSlots, slotRows));
+
+  const commitSlots = async (next, label) => {
+    const { commandBus } = await import("../commands/CommandBus.js");
+    // Only the slots that actually changed become commands, so a removal's
+    // renumbered tail does not bury the undo entry in no-op writes.
+    const commands = [];
+    MATERIAL_SLOT_KEYS.forEach((key, index) => {
+      const value = next[index] ?? "";
+      if (value !== slotValues[index]) commands.push(new SetComponentPropCommand(entityId, "mesh", key, value));
+    });
+    if (commands.length) commandBus.execute(commands.length === 1 ? commands[0] : new BatchCommand(commands, label));
+    // Committing from a portalled picker leaves focus on <body>, where every
+    // editor shortcut is dead until the canvas is clicked — refocus instead.
+    sessionRef.current?.canvas?.focus();
+    watchRealMaterials();
+  };
+
+  const setSlot = (index, value) => {
+    const next = [...slotValues];
+    next[index] = value;
+    commitSlots(next, index === 0 ? "Set material" : `Set material slot ${index + 1}`);
+  };
+
+  const addSlot = () => {
+    if (slotCount >= MATERIAL_SLOT_KEYS.length) return;
+    setSlotRows(slotCount + 1);
+    // Blender activates the slot it just added.
+    setFaceMaterial(slotCount);
+  };
+
+  /**
+   * Removes the ACTIVE slot, Blender style: later slots shift up, faces using
+   * them follow, and faces that used the removed slot fall back to the first.
+   * The face renumber goes through the geometry undo stack and the prop shift
+   * through the app history — two stacks, so a Ctrl+Z in the editor restores
+   * the faces first and the slot paths on the next undo in the Inspector.
+   */
+  const removeActiveSlot = () => {
+    if (slotCount <= 1) return;
+    const index = Math.min(faceMaterial, slotCount - 1);
+    runOperator(`Remove material slot ${index + 1}`, (session) => {
+      let moved = 0;
+      for (const face of session.mesh.faces) {
+        if (face.material === index) {
+          face.material = 0;
+          moved++;
+        } else if (face.material > index) {
+          face.material -= 1;
+          moved++;
+        }
+      }
+      return { message: `Removed slot ${index + 1}${moved ? `, ${moved} faces renumbered` : ""}` };
+    });
+    const next = [...slotValues];
+    next.splice(index, 1);
+    next.push("");
+    commitSlots(next, `Remove material slot ${index + 1}`);
+    setSlotRows(Math.max(1, slotCount - 1));
+    setFaceMaterial(Math.max(0, Math.min(index, slotCount - 2)));
+  };
+
+  /** Blender's Select / Deselect under the slot list. */
+  const doSelectBySlot = (select) => runSelection(select ? "Select by Slot" : "Deselect by Slot", (session) => {
+    for (const face of session.mesh.faces) {
+      if (face.material === faceMaterial) face.select = select;
+    }
+    flushSelection(session.mesh, "face");
+  });
+
   const doMark = (property, value, label) => runOperator(label, (session) => ({
     message: `${label}: ${markEdges(session.mesh, property, value, selected(session.mesh, "edge"))} edges`,
   }));
@@ -1462,7 +1582,7 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
     if (key === "escape" && (session.selectionTool || session.selectionGesture)) { consume(); cancelSelectionTool(); return; }
 
     // --- Chord starters ---------------------------------------------------
-    if (ctrl && key === "e") { consume(); setPendingChord("edge"); setStatus("Edge menu: B bevel · R loop cut · S mark seam · Shift+S clear seam · H mark sharp · Shift+H clear sharp · G slide · B bridge · F grid fill"); return; }
+    if (ctrl && key === "e") { consume(); setPendingChord("edge"); setStatus("Edge menu: B bevel · R loop cut · S mark seam · Shift+S clear seam · H mark sharp · Shift+H clear sharp · G slide · J bridge · F grid fill"); return; }
     if (ctrl && key === "v") { consume(); setPendingChord("vertex"); setStatus("Vertex menu: M merge · S smooth · R rip · F rip fill · Y split · C connect"); return; }
     if (ctrl && key === "f") { consume(); setPendingChord("face"); setStatus("Face menu: I inset · E extrude · P poke · T triangulate · J tris to quads · S shade smooth · Shift+S shade flat"); return; }
     if (!ctrl && event.altKey && key === "e") { consume(); setPendingChord("extrude"); setStatus("Extrude: E region · I individual · N along normals · V vertices"); return; }
@@ -1579,7 +1699,14 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
       if (key === "h") return doMark("sharp", !shift, shift ? "Clear Sharp" : "Mark Sharp");
       if (key === "g") return startEdgeSlide();
       if (key === "f") return withSelection("Grid Fill", (value) => gridFill(value.mesh, selected(value.mesh, "edge")));
-      if (key === "j") return withSelection("Bridge Edge Loops", (value) => bridgeEdgeLoops(value.mesh, selected(value.mesh, "edge")));
+      // With faces selected Blender bridges the two face regions, deleting
+      // them; with edges it bridges the loops directly. Same menu entry, same
+      // shortcut.
+      if (key === "j") return withSelection("Bridge Edge Loops", (value) => (
+        value.mode === "face" && selected(value.mesh, "face").length
+          ? bridgeFaces(value.mesh)
+          : bridgeEdgeLoops(value.mesh, selected(value.mesh, "edge"))
+      ));
       return setStatus("");
     }
     if (chord === "vertex") {
@@ -1870,6 +1997,36 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
       setStatus(`Remeshed to ${result.faces} faces at a voxel size of ${result.voxelSize.toPrecision(3)} — UVs and material slots were reset, re-unwrap if you need them`);
     } finally {
       setBusy(false);
+    }
+  };
+
+  /**
+   * Export the mesh AS EDITED, not the file on disk.
+   *
+   * Edit Mode autosaves, but not on every keystroke, and a modifier stack is
+   * never in the `.geom` at all — exporting the asset from a panel showing
+   * something else is the kind of surprise that is only noticed in Blender.
+   * `bufferGeometryFromMesh` is what Object Mode is already shown, so this
+   * exports exactly the triangles on screen.
+   */
+  const doExportGlb = async () => {
+    const session = sessionRef.current;
+    if (!session) return;
+    setStatus("Exporting GLB…");
+    const geometry = bufferGeometryFromMesh(session.mesh);
+    try {
+      const { exportGeometryWithDialog } = await import("../geomExport.js");
+      const name = engine.getEntity(entityId)?.name || "Mesh";
+      const result = await exportGeometryWithDialog(geometry, { name });
+      setStatus(
+        result
+          ? `Exported ${result.targetPath.split(/[\\/]/).pop()} — ${result.triangles.toLocaleString()} triangles`
+          : "Export cancelled",
+      );
+    } catch (error) {
+      setStatus(`Export failed: ${error.message ?? error}`);
+    } finally {
+      geometry.dispose();
     }
   };
 
@@ -2490,6 +2647,9 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
       mesh, meshObject, wire, basePoints, faceOverlay, edgeOverlay, vertexOverlay, activeOverlay, context,
       modifierPreviewObject, modifierCageMaterial, modifierWireframeMaterial,
       scene, editMaterials, realMaterials, wireframeMaterial, editorLights, sceneLights, shading,
+      // Every material ever borrowed from the entity — the dispose sweep must
+      // skip them all, including ones re-borrowed after a slot change.
+      borrowedMaterials: new Set(Array.isArray(realMaterials) ? realMaterials : [realMaterials]),
       camera, perspectiveCamera, orthographicCamera: null, orthographicHeight: 10,
       controls, canvas,
       mode: "face",
@@ -2955,7 +3115,7 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
       controls.removeEventListener("change", onControlsChange);
       modifierPreviewUnsub?.();
       controls.dispose();
-      const borrowed = new Set(Array.isArray(realMaterials) ? realMaterials : [realMaterials]);
+      const borrowed = session.borrowedMaterials ?? new Set(Array.isArray(realMaterials) ? realMaterials : [realMaterials]);
       scene.traverse((object) => {
         if (!object.userData?.sharedGeometry) object.geometry?.dispose?.();
         if (object.userData?.sharedMaterial) return;
@@ -2980,7 +3140,6 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
   if (!component) return <div className="geometry-editor-empty">Select an entity with a Mesh component.</div>;
   const session = sessionRef.current;
   const count = session ? selectionCount(session.mesh, mode) : 0;
-  const materialSlots = Array.from({ length: 8 }, (_, index) => component.props[index ? `material${index + 1}` : "material"] ?? "");
   const run = (event, action) => {
     setOpenMenu(null);
     // Back to the viewport, so the keymap keeps working after a menu action —
@@ -3176,6 +3335,9 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
             <button disabled={!count} onClick={(e) => run(e, () => doDissolve("verts"))}>Vertices <kbd>X D</kbd></button>
             <button disabled={!count} onClick={(e) => run(e, () => doDissolve("edges"))}>Edges <kbd>X G</kbd></button>
             <button disabled={!count} onClick={(e) => run(e, () => doDissolve("faces"))}>Faces <kbd>X S</kbd></button>
+            <hr />
+            <button onClick={(e) => run(e, doExportGlb)}>Export as GLB…</button>
+            <span className="geometry-menu-note">Writes the mesh as it is right now, for Blender or anything else that reads glTF.</span>
           </ToolbarMenu>
 
         <ToolbarMenu label="Vertex">
@@ -3196,7 +3358,9 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
         <ToolbarMenu label="Edge">
             <button disabled={mode !== "edge" || !count} onClick={(e) => run(e, () => startExtrude("region"))}>Extrude Edges <kbd>E</kbd></button>
             <button disabled={mode !== "edge" || !count} onClick={(e) => run(e, startBevel)}>Bevel Edges <kbd>Ctrl+B</kbd></button>
-            <button disabled={mode !== "edge" || !count} onClick={(e) => run(e, () => withSelection("Bridge Edge Loops", (s) => bridgeEdgeLoops(s.mesh, selected(s.mesh, "edge"))))}>Bridge Edge Loops</button>
+            <button disabled={(mode !== "edge" && mode !== "face") || !count} onClick={(e) => run(e, () => withSelection("Bridge Edge Loops", (s) => (
+              s.mode === "face" && selected(s.mesh, "face").length ? bridgeFaces(s.mesh) : bridgeEdgeLoops(s.mesh, selected(s.mesh, "edge"))
+            )))}>Bridge Edge Loops</button>
             <button disabled={mode !== "edge" || !count} onClick={(e) => run(e, () => withSelection("Grid Fill", (s) => gridFill(s.mesh, selected(s.mesh, "edge"))))}>Grid Fill</button>
             <button disabled={mode !== "edge" || !count} onClick={(e) => run(e, startEdgeSlide)}>Edge Slide</button>
             <hr />
@@ -3234,12 +3398,44 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
 
         {mode === "face" && (
           <ToolbarMenu label="Material" popoverClassName="geometry-material-popover">
-              <label>Face slot
-                <select value={faceMaterial} onChange={(event) => setFaceMaterial(Number(event.target.value))}>
-                  {materialSlots.map((path, index) => <option key={index} value={index}>{materialSlotLabel(path, index)}</option>)}
-                </select>
-              </label>
+              {/* Blender's material slot list: one row per slot, the active one
+                  highlighted; each row is a full asset picker with previews.
+                  Clicking a row activates the slot, clicking its field browses. */}
+              <span className="geometry-menu-heading">Material Slots</span>
+              <div className="geometry-material-slots">
+                {Array.from({ length: slotCount }, (_, index) => (
+                  <div
+                    key={MATERIAL_SLOT_KEYS[index]}
+                    className={`geometry-material-slot ${index === faceMaterial ? "active" : ""}`}
+                    onClick={() => setFaceMaterial(index)}
+                  >
+                    <span className="geometry-material-slot-index">{index + 1}</span>
+                    <AssetField
+                      descriptor={{
+                        key: MATERIAL_SLOT_KEYS[index],
+                        label: "Material",
+                        exts: ["mat"],
+                        emptyLabel: index === 0 ? "Default" : "None",
+                        // The toolbar popover sits at z-index 950; the picker
+                        // must clear it or it paints behind its own menu.
+                        layer: "toolbar",
+                      }}
+                      value={slotValues[index]}
+                      onCommit={(value) => setSlot(index, value)}
+                    />
+                  </div>
+                ))}
+              </div>
+              <div className="geometry-material-slot-actions">
+                <button disabled={slotCount >= MATERIAL_SLOT_KEYS.length} title="Add a material slot" onClick={() => addSlot()}>+ Add</button>
+                <button disabled={slotCount <= 1} title="Remove the active slot — later slots shift up, faces follow" onClick={() => removeActiveSlot()}>− Remove</button>
+              </div>
+              <hr />
               <button disabled={!count} onClick={(e) => run(e, doAssignMaterial)}>Assign to Selection</button>
+              <div className="geometry-material-slot-actions">
+                <button title="Select every face using the active slot" onClick={() => doSelectBySlot(true)}>Select</button>
+                <button title="Deselect every face using the active slot" onClick={() => doSelectBySlot(false)}>Deselect</button>
+              </div>
             </ToolbarMenu>
         )}
 

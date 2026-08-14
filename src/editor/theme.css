@@ -1288,6 +1288,76 @@ select:focus-visible {
   height: 27px;
 }
 
+/* Blender-style material slot list: one row per slot, active row highlighted,
+   each row carrying a full asset picker with its preview swatch. */
+.geometry-material-popover {
+  min-width: 236px;
+}
+
+.geometry-material-slots {
+  display: grid;
+  gap: 2px;
+  padding: 2px 6px;
+}
+
+.geometry-material-slot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 4px;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  cursor: pointer;
+}
+
+.geometry-material-slot:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.geometry-material-slot.active {
+  border-color: rgba(242, 139, 48, 0.55);
+  background: rgba(242, 139, 48, 0.12);
+}
+
+.geometry-material-slot-index {
+  flex: 0 0 auto;
+  min-width: 14px;
+  color: var(--text-dim);
+  font-size: 10px;
+  text-align: center;
+}
+
+.geometry-material-slot .asset-field-wrap {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.geometry-material-slot-actions {
+  display: flex;
+  gap: 4px;
+  padding: 2px 6px;
+}
+
+/* The popover's own button rule stretches everything to 100%; the paired
+   actions share the row instead. */
+.geometry-material-slot-actions button {
+  width: auto;
+  flex: 1 1 0;
+  justify-content: center;
+  min-height: 24px;
+}
+
+/* A dropdown opened from inside a geometry toolbar popover (z-index 950) must
+   clear it — overlay included — or the picker paints behind the menu that
+   opened it and every click lands on the wrong layer. */
+.dropdown-overlay.layer-toolbar {
+  z-index: 955;
+}
+
+.dropdown-menu.portal-menu.layer-toolbar {
+  z-index: 960;
+}
+
 .geometry-menu-field {
   display: flex;
   align-items: center;

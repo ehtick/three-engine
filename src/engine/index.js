@@ -223,6 +223,15 @@ export {
   invalidateCubemapAsset,
 } from "./cubemapAsset.js";
 export {
+  EQUIRECT_EXTS,
+  ENVIRONMENT_EXTS,
+  isCubemapPath,
+  isEquirectPath,
+  loadEnvironmentAsset,
+  getLoadedEnvironment,
+  invalidateEnvironmentAsset,
+} from "./environmentAsset.js";
+export {
   TIMELINE_VERSION,
   TIMELINE_EXT,
   TRACK_KINDS,

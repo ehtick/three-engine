@@ -119,6 +119,29 @@ function modelActions(path) {
   ];
 }
 
+function geometryActions(path) {
+  return [
+    {
+      id: "asset.open",
+      label: `Open in ${EDITOR_LABEL.geom}`,
+      hint: "The editor that owns this asset type.",
+      icon: "ExternalLink",
+      primary: true,
+      run: () => openAssetPath(path),
+    },
+    {
+      id: "geom.exportGlb",
+      label: "Export as GLB…",
+      hint: "Write the mesh out as a .glb anything else can open — Blender, a marketplace, another project.",
+      icon: "Download",
+      run: async () => {
+        const { exportGeometryAssetWithDialog } = await import("./geomExport.js");
+        await exportGeometryAssetWithDialog(path);
+      },
+    },
+  ];
+}
+
 function materialActions(path) {
   return [
     {
@@ -282,6 +305,7 @@ function typeActions(path) {
   if (FONT_EXTENSIONS.includes(ext)) return fontActions(path);
   if (SCRIPT_EXTENSIONS.includes(ext)) return scriptActions(path);
   if (ext === "glb") return modelActions(path);
+  if (ext === "geom") return geometryActions(path);
   if (ext === "mat") return materialActions(path);
   if (ext === "prefab" || ext === "entity") return prefabActions(path);
   if (ext === "scene") return sceneActions(path);

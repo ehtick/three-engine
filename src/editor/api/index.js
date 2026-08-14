@@ -327,6 +327,7 @@ export const EditorApi = {
     transform: (options = {}) => callOp("geometry.transform", options),
     addPrimitive: (kind, options = {}) => callOp("geometry.addPrimitive", { kind, ...options }),
     remesh: (options = {}) => callOp("geometry.remesh", options),
+    exportGlb: (path, targetPath) => callOp("geometry.exportGlb", { path, targetPath }),
     commit: (keepOpen = false) => callOp("geometry.commit", { keepOpen }),
     cancel: () => callOp("geometry.cancel"),
   },

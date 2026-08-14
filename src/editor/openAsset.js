@@ -4,7 +4,7 @@ import {
   TEXTURE_EXTENSIONS,
   SCRIPT_EXTENSIONS,
   MATERIAL_EXTENSIONS,
-  CUBEMAP_EXTENSIONS,
+  ENVIRONMENT_EXTENSIONS,
   PREFAB_EXTENSIONS,
   ANIMATOR_EXTENSIONS,
   TIMELINE_EXTENSIONS,
@@ -66,7 +66,7 @@ export function hasAssetEditor(path) {
     PREFAB_EXTENSIONS.includes(ext) ||
     ANIMATOR_EXTENSIONS.includes(ext) ||
     TIMELINE_EXTENSIONS.includes(ext) ||
-    CUBEMAP_EXTENSIONS.includes(ext) ||
+    ENVIRONMENT_EXTENSIONS.includes(ext) ||
     MATERIAL_EXTENSIONS.includes(ext) ||
     GEOMETRY_EXTENSIONS.includes(ext) ||
     isEditableAudio(ext)
@@ -100,8 +100,9 @@ export function openAssetPath(path, { isDir = false } = {}) {
   } else if (isEditableAudio(ext)) {
     useSelectionStore.getState().selectAsset(path);
     import("./EditorShell.jsx").then((m) => m.openPanel("audioEditor"));
-  } else if (CUBEMAP_EXTENSIONS.includes(ext)) {
-    // Face slots live in the Inspector — there's no separate cube map editor.
+  } else if (ENVIRONMENT_EXTENSIONS.includes(ext)) {
+    // Skies live in the Inspector — cube-map face slots and the "use as scene
+    // sky" action for an HDRI. There's no separate editor for either.
     useSelectionStore.getState().selectAsset(path);
     import("./EditorShell.jsx").then((m) => m.openPanel("inspector"));
   } else if (MATERIAL_EXTENSIONS.includes(ext)) {

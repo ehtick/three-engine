@@ -1,11 +1,11 @@
 // @ts-check
 import { useEffect, useState } from "react";
-import { ensureEngine } from "../engineInstance.js";
+import { engine, ensureEngine } from "../engineInstance.js";
 import { commandBus } from "../commands/CommandBus.js";
 import { SetSceneSettingsCommand } from "../commands/settingsCommands.js";
 import { useSceneStore } from "../store/sceneStore.js";
 import { MSAA_SAMPLES, SHADOW_TYPES, SCENE_SETTINGS_DEFAULTS } from "../../engine/sceneSettings.js";
-import { CUBEMAP_EXTENSIONS } from "../assetLoader.js";
+import { ENVIRONMENT_EXTENSIONS, CUBEMAP_EXTENSIONS } from "../assetLoader.js";
 import { AssetField } from "../fields/AssetField.jsx";
 import { useSelectionStore } from "../store/selectionStore.js";
 import { openPanel } from "../EditorShell.jsx";
@@ -56,6 +56,111 @@ function Color({ value, onChange }) {
   );
 }
 
+const extOf = (path) => String(path ?? "").split(".").pop()?.toLowerCase() ?? "";
+const isCubemap = (path) => CUBEMAP_EXTENSIONS.includes(extOf(path));
+
+/**
+ * Finds an `environment` (HDRI) COMPONENT in the open scene.
+ *
+ * Scenes authored before the sky moved into scene settings hold their HDRI on
+ * an entity — Poly Haven's "use as sky" used to spawn one. That component still
+ * works and still wins (it applies after settings do), which is exactly why the
+ * panel has to say so: otherwise Scene Settings reads "Sky: None" while the
+ * viewport is plainly showing an HDRI, and nothing in this panel moves it.
+ */
+function useLegacyEnvironmentEntity() {
+  const [found, setFound] = useState(null);
+  useEffect(() => {
+    let live = true;
+    const unsubs = [];
+    ensureEngine().then((engine) => {
+      if (!live) return;
+      const scan = () => {
+        for (const entity of engine.entities.values()) {
+          const comp = entity.getComponent?.("environment");
+          if (comp) return setFound({ id: entity.id, name: entity.name, props: { ...comp.props } });
+        }
+        setFound(null);
+      };
+      scan();
+      // Component add/remove has no event of its own; the entity carrying one
+      // is created and deleted whole, and every settings commit re-renders the
+      // panel anyway, so these three cover it.
+      for (const event of ["hierarchy-changed", "entity-spawned", "entity-despawned"]) {
+        unsubs.push(engine.on(event, scan));
+      }
+    });
+    return () => {
+      live = false;
+      for (const off of unsubs) off?.();
+    };
+  }, []);
+  return found;
+}
+
+/**
+ * The one-click migration: copy the component's HDRI + knobs into scene
+ * settings and delete the entity that carried them, as ONE undoable step.
+ */
+function LegacyEnvironmentNote({ entity }) {
+  const move = async () => {
+    const { DeleteEntityCommand } = await import("../commands/entityCommands.js");
+    const p = entity.props ?? {};
+    // Two commands, one Ctrl+Z. Settings first: if the delete were to fail, a
+    // scene with the sky in both places still renders, whereas one with the
+    // entity gone and the setting unwritten has no sky at all.
+    const mark = commandBus.markGroup();
+    commandBus.execute(
+      new SetSceneSettingsCommand(
+        {
+          environment: {
+            cubemap: p.hdri ?? "",
+            background: p.background !== false,
+            // The component had no "use for lighting" switch — an HDRI on an
+            // entity always lit the scene, so preserve that.
+            lighting: true,
+            intensity: p.intensity ?? 1,
+            rotation: p.rotation ?? 0,
+            blur: p.blur ?? 0,
+          },
+        },
+        "Move HDRI into scene settings",
+      ),
+    );
+    if (engine.getEntity(entity.id)) commandBus.execute(new DeleteEntityCommand(entity.id));
+    commandBus.collapseFrom(mark, "Move HDRI into scene settings");
+  };
+  return (
+    <>
+      {/* Short on purpose — this panel's prose budget is one line per note,
+          and the polish smoke enforces it. The explanation is the tooltip. */}
+      <Note>
+        The sky comes from the <strong>{entity.name}</strong> entity, not this slot.
+      </Note>
+      <button
+        className="toolbar-btn wide"
+        title={
+          "An HDRI on an entity overrides this panel — it applies after scene settings do, so the " +
+          "Sky slot above and its knobs do not reach it. Moving it in copies the HDRI, intensity, " +
+          "rotation and blur into the scene and deletes the entity. One undo puts it back."
+        }
+        onClick={move}
+      >
+        Move HDRI into Scene Settings
+      </button>
+      <button
+        className="toolbar-btn wide"
+        onClick={() => {
+          useSelectionStore.getState().select([entity.id]);
+          openPanel("inspector");
+        }}
+      >
+        Select {entity.name}
+      </button>
+    </>
+  );
+}
+
 /**
  * Per-scene environment settings (saved inside the .scene file, undoable).
  * Every change is one command on the bus, applied live to the engine.
@@ -66,6 +171,7 @@ function Color({ value, onChange }) {
 export function SceneSettingsPanel() {
   const sceneName = useSceneStore((s) => s.sceneName);
   const [settings, setSettings] = useState(null);
+  const legacyEnv = useLegacyEnvironmentEntity();
 
   useEffect(() => {
     let unsub = null;
@@ -147,13 +253,17 @@ export function SceneSettingsPanel() {
             onCommit={(v) => commit({ ambientIntensity: v }, "Change ambient intensity")}
           />
         </Row>
-        <Row label="Cube map" hint="Drives both the skybox and image-based lighting.">
+        <Row
+          label="Sky"
+          hint="A .cubemap or an HDRI (.hdr/.exr). Drives both the skybox and image-based lighting."
+        >
           <AssetField
-            descriptor={{ exts: CUBEMAP_EXTENSIONS, emptyLabel: "None" }}
+            descriptor={{ exts: ENVIRONMENT_EXTENSIONS, emptyLabel: "None" }}
             value={env.cubemap}
-            onCommit={(value) => commitEnv({ cubemap: value }, "Change scene cube map")}
+            onCommit={(value) => commitEnv({ cubemap: value }, "Change scene sky")}
           />
         </Row>
+        {legacyEnv && <LegacyEnvironmentNote entity={legacyEnv} />}
         {env.cubemap && (
           <>
             <Row label="Show as sky" sub>
@@ -195,15 +305,17 @@ export function SceneSettingsPanel() {
                 onCommit={(v) => commitEnv({ blur: v }, "Change sky blur")}
               />
             </Row>
-            <button
-              className="toolbar-btn wide"
-              onClick={() => {
-                useSelectionStore.getState().selectAsset(env.cubemap);
-                openPanel("inspector");
-              }}
-            >
-              Edit Cube Map Faces
-            </button>
+            {isCubemap(env.cubemap) && (
+              <button
+                className="toolbar-btn wide"
+                onClick={() => {
+                  useSelectionStore.getState().selectAsset(env.cubemap);
+                  openPanel("inspector");
+                }}
+              >
+                Edit Cube Map Faces
+              </button>
+            )}
           </>
         )}
       </Section>

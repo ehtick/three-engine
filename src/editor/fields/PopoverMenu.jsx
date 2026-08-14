@@ -20,7 +20,7 @@ import { createPortal } from "react-dom";
 const MARGIN = 8; // keep-off distance from the window edges
 const GAP = 4; // trigger ↔ menu gap, matches the old `top: calc(100% + 4px)`
 
-export function PopoverMenu({ anchorRef, className = "", align = "left", minWidth = 0, onClose, children }) {
+export function PopoverMenu({ anchorRef, className = "", align = "left", minWidth = 0, layer = null, onClose, children }) {
   const menuRef = useRef(null);
   const [pos, setPos] = useState(null);
 
@@ -63,12 +63,15 @@ export function PopoverMenu({ anchorRef, className = "", align = "left", minWidt
     };
   }, [anchorRef, align, minWidth]);
 
+  // `layer` lifts both the menu and its dismiss overlay above whatever opened
+  // it, for the cases where the trigger itself lives in a high-z popover (the
+  // geometry toolbar menus sit at z-index 950, far above the default 200).
   return createPortal(
     <>
-      <div className="dropdown-overlay" onPointerDown={onClose} />
+      <div className={`dropdown-overlay${layer ? ` layer-${layer}` : ""}`} onPointerDown={onClose} />
       <div
         ref={menuRef}
-        className={`dropdown-menu portal-menu ${className}`.trim()}
+        className={`dropdown-menu portal-menu${layer ? ` layer-${layer}` : ""} ${className}`.trim()}
         style={{
           left: pos?.left ?? 0,
           top: pos?.top ?? 0,

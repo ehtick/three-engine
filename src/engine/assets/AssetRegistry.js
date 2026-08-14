@@ -3,6 +3,7 @@ import { loadMaterialAsset, getMaterialInstance } from "../materialAsset.js";
 import { acquireGeometryAsset, releaseGeometryAsset } from "../geometryAsset.js";
 import { loadAudioAsset, getAudioBuffer } from "../audio/AudioAsset.js";
 import { loadCubemapAsset, getLoadedCubemap } from "../cubemapAsset.js";
+import { loadEnvironmentAsset, getLoadedEnvironment } from "../environmentAsset.js";
 import { ensureFontLoaded, getLoadedFont, fontFamilyFor } from "../ui/fontAsset.js";
 import { assetCatalog } from "./catalog.js";
 
@@ -97,6 +98,21 @@ export class AssetRegistry {
   /** The already-loaded cube texture for `path`, or null if not loaded yet. */
   getCubemap(path) {
     return getLoadedCubemap(path);
+  }
+
+  /**
+   * The shared sky texture for an environment path — either a `.cubemap` or an
+   * equirectangular `.hdr`/`.exr`. This is what the scene's own sky slot loads,
+   * so a script swapping `scene.environment` gets the same instance the editor
+   * would rather than a second decode of the same file.
+   */
+  environment(path) {
+    return loadEnvironmentAsset(path);
+  }
+
+  /** The already-loaded sky texture for `path`, or null if not loaded yet. */
+  getEnvironment(path) {
+    return getLoadedEnvironment(path);
   }
 
   /**

@@ -97,7 +97,7 @@ const OPERATIONS = [
   { id: "poke", needs: "face", params: ["offset"], summary: "Fan each selected face out from a new centre vertex." },
   { id: "triangulate", needs: "face", params: [], summary: "Triangulate the selected faces." },
   { id: "trisToQuads", needs: "face", params: ["angleLimit"], summary: "Merge adjacent triangles back into quads where the result stays flat enough." },
-  { id: "bridge", needs: "edge", params: [], summary: "Bridge two selected edge loops with a new face band." },
+  { id: "bridge", needs: "any", params: [], summary: "Bridge two selected edge loops with a new face band. With two face regions selected instead, deletes them and bridges their boundary loops — Blender's tunnel-cutting workflow." },
   { id: "gridFill", needs: "edge", params: ["span"], summary: "Fill a closed edge loop with a quad grid." },
   { id: "fillHoles", needs: "any", params: ["maxSides"], summary: "Cap every boundary hole in the mesh." },
   { id: "makeFace", needs: "vert", params: [], summary: "Blender's F: make an edge or face from the selected vertices." },
@@ -515,9 +515,15 @@ async function applyOperation(m, mesh, operation, p, state) {
     case "trisToQuads":
       m.cleanup.trisToQuads(mesh, { faces: faces(), ...(p.angleLimit ? { angleLimit: p.angleLimit } : {}) });
       return;
-    case "bridge":
-      fail(m.cleanup.bridgeEdgeLoops(mesh, edges()));
+    case "bridge": {
+      // Mirrors the panel: with faces selected the two regions are deleted and
+      // their boundary loops bridged, as Blender's Bridge Edge Loops does.
+      const selectedFaces = faces();
+      fail(selectedFaces.length >= 2
+        ? m.cleanup.bridgeFaces(mesh, selectedFaces)
+        : m.cleanup.bridgeEdgeLoops(mesh, edges()));
       return;
+    }
     case "gridFill":
       fail(m.cleanup.gridFill(mesh, edges(), { span: p.span ?? null }));
       return;
@@ -658,6 +664,31 @@ defineOp({
     const result = primitives.addPrimitive(state.mesh, kind, { at, ...options });
     if (result?.error) throw new Error(result.error);
     return { kind, at, statistics: cleanup.meshStatistics(state.mesh) };
+  },
+});
+
+/**
+ * The one op here that is not about an edit session — it reads a `.geom` off
+ * disk and needs no `beginEdit`. It lives in this file anyway because that is
+ * where someone looking for "do something with a mesh" will look, and the
+ * alternative (a lone `asset.exportGlb` among the file operations) is
+ * discoverable only by accident.
+ */
+defineOp({
+  name: "geometry.exportGlb",
+  description:
+    "Write a .geom out as a .glb, the format everything else reads — Blender, a marketplace, another project. Geometry only: material slots survive as separate primitives but carry placeholder materials, because a .geom holds no material reference (that lives on the Mesh component). Needs no edit session.",
+  params: {
+    path: { type: "string", required: true, description: "The .geom asset to export." },
+    targetPath: {
+      type: "string",
+      description:
+        "Where to write it. Defaults to a free `.glb` beside the source — never the existing sibling `.glb` a .geom was unpacked from, which would overwrite the original model.",
+    },
+  },
+  async run({ path, targetPath }) {
+    const { exportGeometryAssetAsGlb } = await import("../../geomExport.js");
+    return exportGeometryAssetAsGlb(path, { targetPath });
   },
 });
 

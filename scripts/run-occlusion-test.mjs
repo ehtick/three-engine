@@ -45,6 +45,7 @@ const THREE = await import("three/webgpu");
 const { DepthPyramid, projectSphere, isOccluded, createBounds } = await import(
   "../src/engine/culling/occlusionMath.js"
 );
+const { toPyramidRows } = await import("../src/engine/culling/OcclusionSystem.js");
 const { Engine, registerBuiltInComponents, OCCLUDER_LAYER } = await import("../src/engine/index.js");
 
 registerBuiltInComponents();
@@ -194,6 +195,66 @@ await check("a small box reads level 0 and sees only its own texels", () => {
 
 await check("an unbuilt pyramid answers 'infinitely far' — nothing is culled before there is data", () => {
   assert.equal(new DepthPyramid().sampleMax(0, 0, 1, 1), Infinity);
+});
+
+// ---------------------------------------------------------------------------
+
+section("the readback arrives in the pyramid's row order");
+
+// The bug this section exists for shipped and was reported as "meshes vanish in
+// front of the camera". `projectSphere` maps NDC y to `v = y*0.5+0.5`, so v runs
+// UP the screen and the pyramid's row 0 must be the BOTTOM of the frame. Only
+// WebGL's `gl.readPixels` delivers that; WebGPU's `copyTextureToBuffer` keeps
+// texture order, so row 0 is the TOP. Feeding it through unflipped mirrors every
+// depth test about the screen centre — no error, no blank frame, just objects
+// culled against whatever happens to be on the opposite side of the view.
+
+/** width 4, height 3: row `r` (from the bottom) is filled with `r + 1`. */
+const bottomUpRows = [1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3];
+
+await check("a WebGPU readback (top-down, 256-byte padded rows) is flipped and unpadded", () => {
+  const paddedFloats = 64; // 256 bytes / 4
+  const raw = new Float32Array(paddedFloats * 3);
+  // Row 0 of the buffer is the TOP of the frame, which is the LAST pyramid row.
+  for (let y = 0; y < 3; y++) raw.fill(3 - y, y * paddedFloats, y * paddedFloats + 4);
+  assert.deepEqual([...toPyramidRows(raw, 4, 3, false)], bottomUpRows);
+});
+
+await check("a WebGL readback is already bottom-up and tight, so it passes straight through", () => {
+  const raw = new Float32Array(bottomUpRows);
+  assert.equal(toPyramidRows(raw, 4, 3, true), raw, "no copy needed");
+});
+
+await check("the mirrored buffer really would cull a visible object", () => {
+  // A wall filling the BOTTOM half of the frame at 5 m, open sky above it.
+  const width = 16;
+  const height = 16;
+  const paddedFloats = Math.ceil((width * 4) / 256) * 64;
+  const raw = new Float32Array(paddedFloats * height);
+  for (let y = 0; y < height; y++) {
+    // Buffer row 0 is the TOP of the frame on WebGPU, so the wall — the bottom
+    // half of what you see — occupies the SECOND half of the buffer.
+    const value = y >= height / 2 ? 5 : 0;
+    for (let x = 0; x < width; x++) raw[y * paddedFloats + x] = value;
+  }
+  const rows = toPyramidRows(raw, width, height, false);
+
+  // Exactly what the previous code handed the pyramid: unpadded, never flipped.
+  const unflipped = new Float32Array(rows.length);
+  for (let y = 0; y < height; y++) {
+    unflipped.set(rows.subarray((height - 1 - y) * width, (height - y) * width), y * width);
+  }
+
+  // An object 50 m away, high on screen (v ≈ 0.75) with nothing but sky in front.
+  const high = { minU: 0.4, maxU: 0.6, minV: 0.7, maxV: 0.8, nearDist: 50 };
+
+  const correct = new DepthPyramid();
+  correct.build(rows, width, height);
+  assert.equal(isOccluded(correct, high), false, "nothing is in front of it");
+
+  const mirrored = new DepthPyramid();
+  mirrored.build(unflipped, width, height);
+  assert.equal(isOccluded(mirrored, high), true, "…but the un-flipped buffer hides it");
 });
 
 // ---------------------------------------------------------------------------
@@ -373,6 +434,96 @@ await check("the test uses the camera the depth was CAPTURED with, not the one t
   engine.camera.updateMatrixWorld(true);
   resolve(engine);
   assert.equal(prop._occluded, true, "the answer must not change until a new capture lands");
+});
+
+// ---------------------------------------------------------------------------
+
+section("culling is configured on the camera, not the scene");
+
+// The knobs moved onto CameraComponent because culling is a property of a VIEW.
+// Two things have to keep working through that move: every scene authored
+// before it (which says nothing on its camera and everything in
+// settings.performance), and the EDITOR VIEWPORT, whose camera is a plain
+// PerspectiveCamera owned by the panel and has no component to read at all.
+
+const cameraScene = (cameraProps = {}, performance = {}) => {
+  const engine = new Engine();
+  Object.assign(engine.settings.performance, performance);
+  const entity = engine.createEntity({ name: "Camera" });
+  entity.addComponent("camera", cameraProps);
+  return { engine, entity, component: entity.getComponent("camera") };
+};
+
+await check("'inherit' means what settings.performance used to mean — both ways", () => {
+  const on = cameraScene({}, { occlusionCulling: true });
+  on.engine.applyCullingSettings();
+  assert.equal(on.engine.occlusion.enabled, true, "scene says on");
+
+  const off = cameraScene({}, { occlusionCulling: false });
+  off.engine.applyCullingSettings();
+  assert.equal(off.engine.occlusion.enabled, false, "scene says off");
+});
+
+await check("the camera overrides the scene in both directions", () => {
+  const forcedOn = cameraScene({ occlusionCulling: "on" }, { occlusionCulling: false });
+  forcedOn.engine.applyCullingSettings();
+  assert.equal(forcedOn.engine.occlusion.enabled, true);
+
+  // The direction a two-value setting cannot express, and the reason the prop
+  // is tri-state: one camera opting OUT of a scene that has it on.
+  const forcedOff = cameraScene({ occlusionCulling: "off" }, { occlusionCulling: true });
+  forcedOff.engine.applyCullingSettings();
+  assert.equal(forcedOff.engine.occlusion.enabled, false);
+});
+
+await check("the editor viewport camera has no component, so the scene's camera governs", () => {
+  const { engine, component } = cameraScene({ occlusionCulling: "on" }, { occlusionCulling: false });
+  // Exactly what ViewportPanel does when nothing is being looked through: a
+  // bare three camera with no entityId on it.
+  engine.camera = new THREE.PerspectiveCamera(60, 1, 0.1, 100);
+  assert.equal(engine.governingCullingCamera(), component, "falls back to the scene's camera");
+  engine.applyCullingSettings();
+  assert.equal(engine.occlusion.enabled, true, "so the viewport culls like the build will");
+});
+
+await check("a camera drives its own settings when it is the one being looked through", () => {
+  const { engine, component } = cameraScene({ occlusionCulling: "on", occluderMinSize: 9 });
+  engine.camera = component.camera;
+  assert.equal(engine.governingCullingCamera(), component);
+  engine.applyCullingSettings();
+  assert.equal(engine.occlusion.minOccluderSize, 9);
+});
+
+await check("changing the occluder size re-tags, or the new value does nothing", () => {
+  const { engine, component } = cameraScene({ occlusionCulling: "on" });
+  engine.applyCullingSettings();
+  engine.occlusion._occluderDirty = false;
+  component.props.occluderMinSize = 12;
+  engine.applyCullingSettings();
+  assert.equal(engine.occlusion.minOccluderSize, 12);
+  assert.equal(engine.occlusion._occluderDirty, true, "the cached occluder set must be rebuilt");
+});
+
+await check("a scene with no camera at all still resolves to the scene setting", () => {
+  const engine = new Engine();
+  engine.settings.performance.occlusionCulling = true;
+  assert.equal(engine.governingCullingCamera(), null);
+  engine.applyCullingSettings();
+  assert.equal(engine.occlusion.enabled, true);
+  assert.equal(engine._frustumCulling, true, "frustum culling defaults ON with no camera");
+});
+
+await check("turning frustum culling off is the escape hatch for 'why did that vanish'", () => {
+  const { engine } = cameraScene({ frustumCulling: false });
+  engine.applyCullingSettings();
+  assert.equal(engine._frustumCulling, false);
+});
+
+await check("a detached camera stops governing", () => {
+  const { engine, entity, component } = cameraScene({ occlusionCulling: "on" });
+  assert.equal(engine.governingCullingCamera(), component);
+  entity.removeComponent("camera");
+  assert.equal(engine.governingCullingCamera(), null, "the registry must not leak it");
 });
 
 // ---------------------------------------------------------------------------

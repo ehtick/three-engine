@@ -32,7 +32,7 @@ import { applyEngineModules } from "../engine/modules.js";
 import { reloadMaterialAsset, refreshMaterialsUsingTexture } from "../engine/materialAsset.js";
 import { invalidateShaderTextureCache } from "../engine/tslGraph.js";
 import { invalidateGeometryAsset } from "../engine/geometryAsset.js";
-import { invalidateCubemapAsset } from "../engine/cubemapAsset.js";
+import { invalidateEnvironmentAsset } from "../engine/environmentAsset.js";
 import { invalidateAtlasAsset } from "../engine/sprite/atlasAsset.js";
 import { disposeAudioAsset } from "../engine/audio/AudioAsset.js";
 
@@ -157,8 +157,10 @@ export function installLiveUpdate(engine, { refreshScript }) {
       } else if (/\.geom$/i.test(rel)) {
         invalidateGeometryAsset(rel);
         owned.push(rel);
-      } else if (/\.cubemap$/i.test(rel)) {
-        invalidateCubemapAsset(rel);
+      } else if (/\.(cubemap|hdr|exr)$/i.test(rel)) {
+        // Both shapes of the scene's sky slot — a re-exported .hdr has to drop
+        // its decoded texture for the same reason an edited cube face does.
+        invalidateEnvironmentAsset(rel);
         owned.push(rel);
       } else if (/\.atlas$/i.test(rel)) {
         invalidateAtlasAsset(rel);

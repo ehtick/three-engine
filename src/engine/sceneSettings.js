@@ -1,5 +1,5 @@
 import * as THREE from "three/webgpu";
-import { getLoadedCubemap, loadCubemapAsset } from "./cubemapAsset.js";
+import { getLoadedEnvironment, loadEnvironmentAsset } from "./environmentAsset.js";
 
 /**
  * Per-scene environment/rendering settings, serialized inside the scene JSON
@@ -10,9 +10,14 @@ export const SCENE_SETTINGS_DEFAULTS = {
   background: "#202329",
   ambientColor: "#ffffff",
   ambientIntensity: 0.3,
-  // Scene-wide image-based environment. `cubemap` points at a `.cubemap`
-  // asset (six face images); it drives the skybox and/or the IBL that lights
-  // every material. Empty = flat `background` color, as before.
+  // Scene-wide image-based environment — THE scene's sky. It drives the skybox
+  // and/or the IBL that lights every material. Empty = flat `background` color.
+  //
+  // `cubemap` accepts either a `.cubemap` asset (six face images) or an
+  // equirectangular `.hdr`/`.exr` panorama — the shape Poly Haven and every
+  // other HDRI library ships. The key kept its original name because every
+  // scene on disk writes it; read it as "the environment asset", and see
+  // engine/environmentAsset.js for why the two shapes share one slot.
   environment: {
     cubemap: "",
     background: true, // draw it as the skybox
@@ -88,8 +93,14 @@ export const SCENE_SETTINGS_DEFAULTS = {
     // culling/OcclusionSystem.js). OFF by default and deliberately so: it costs
     // a low-resolution depth pass over the scene's big geometry every frame,
     // which is a straight loss in an open landscape with nothing to hide behind
-    // and a large win indoors. It is a property of the LEVEL, not of the
-    // project, which is why it lives here.
+    // and a large win indoors.
+    //
+    // The setting now lives on the CAMERA (`CameraComponent`), because culling
+    // is a property of a view — a minimap and a first-person camera looking at
+    // the same room disagree about it. This remains as the scene-wide default a
+    // camera set to `occlusionCulling: "inherit"` falls back to, which is what
+    // every scene authored before the move says, so none of them changed
+    // behaviour. A scene with no camera at all also lands here.
     occlusionCulling: false,
   },
 };
@@ -404,23 +415,23 @@ function pushSceneEnvironment(settings, scene, texture, env) {
 }
 
 /**
- * Background + image-based lighting. Decoding a cube map is async, but this
- * runs on *every* settings change (dragging a quality slider re-applies
- * everything), so a cached texture is installed synchronously — otherwise the
- * sky would flash back to the clear color on each unrelated edit.
+ * Background + image-based lighting. Decoding a cube map or an HDRI is async,
+ * but this runs on *every* settings change (dragging a quality slider
+ * re-applies everything), so a cached texture is installed synchronously —
+ * otherwise the sky would flash back to the clear color on each unrelated edit.
  */
 function applySceneEnvironment(settings, scene) {
   const env = { ...SCENE_SETTINGS_DEFAULTS.environment, ...(settings.environment ?? {}) };
   const seq = ++environmentSeq;
   const path = env.cubemap;
-  const cached = path ? getLoadedCubemap(path) : null;
+  const cached = path ? getLoadedEnvironment(path) : null;
   if (cached) {
     pushSceneEnvironment(settings, scene, cached, env);
     return;
   }
   clearSceneEnvironment(settings, scene);
   if (!path) return;
-  loadCubemapAsset(path).then((texture) => {
+  loadEnvironmentAsset(path).then((texture) => {
     // A newer apply already decided what the environment should be.
     if (seq !== environmentSeq || !texture) return;
     pushSceneEnvironment(settings, scene, texture, env);
@@ -460,6 +471,24 @@ export function applySettingsToScene(settings, scene, ambientLight, renderer) {
     renderer.shadowMap.type = SHADOW_TYPES[shadow.type] ?? THREE.PCFSoftShadowMap;
     renderer.shadowMap.autoUpdate = shadow.autoUpdate !== false;
     renderer.shadowMap.needsUpdate = shadow.needsUpdate === true;
+    // The WebGPU path never reads `renderer.shadowMap.autoUpdate`:
+    // ShadowNode.updateBefore gates on the PER-LIGHT `shadow.needsUpdate ||
+    // shadow.autoUpdate` (three r185, ShadowNode.js ~855). Mirror the setting
+    // onto every light so the checkbox governs what actually renders. GI-mode
+    // lights stay out: their 16x16 map is deliberately frozen forever
+    // (LightComponent#configureShadow) and flipping autoUpdate back on would
+    // re-render a placeholder nothing samples.
+    scene.traverse((obj) => {
+      if (!obj.isLight || !obj.shadow || obj.userData.giShadowMode === "gi") return;
+      obj.shadow.autoUpdate = shadow.autoUpdate !== false;
+      // A frozen castShadow light whose map never rendered crashes three's
+      // sampling setup (`shadow.map.depthTexture` on null — see the gi-mode
+      // comment in LightComponent). One forced render creates the map, then
+      // the freeze holds.
+      if (shadow.needsUpdate === true || (!obj.shadow.autoUpdate && !obj.shadow.map)) {
+        obj.shadow.needsUpdate = true;
+      }
+    });
   }
 }
 

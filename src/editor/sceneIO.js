@@ -87,16 +87,30 @@ function rememberScene(path) {
   }
 }
 
-/** Resolves the boot-time scene path from projectMeta: mainScene wins over
- *  lastScene (the user's chosen entry point always takes precedence over the
- *  last-edited scene). Returns absolute path or null. */
-function resolveBootPath() {
+/**
+ * Resolves the boot-time scene path from projectMeta: **lastScene wins**, with
+ * mainScene as the fallback. Returns an absolute path, or null.
+ *
+ * This was the other way round, on the reasoning that the user's chosen entry
+ * point should beat the last-edited scene. That is right for a BUILD and wrong
+ * for an editor: `mainScene` is the scene a shipped game boots into, set once
+ * and then left alone, so preferring it meant closing the editor on the level
+ * you were building and reopening on the menu — every single time, with the
+ * work you were mid-way through one Open Scene away and no indication that the
+ * editor had decided to go somewhere else. `lastScene` is written on every
+ * open/save (see `rememberScene`), so this is simply "reopen what I had open".
+ *
+ * `mainScene` still wins the only argument it should: it is what the build
+ * exports and what `resolveBuildScenes` starts from. Nothing there reads this.
+ */
+function bootCandidates() {
   const root = projectRoot();
-  if (!root) return null;
+  if (!root) return [];
   const meta = useProjectStore.getState().projectMeta ?? {};
-  const candidate = meta.mainScene || meta.lastScene;
-  if (!candidate) return null;
-  return isAbsolute(candidate) ? candidate : `${root}/${candidate}`;
+  const absolute = (p) => (isAbsolute(p) ? p : `${root}/${p}`);
+  // Deduped because the two very often name the same scene, and trying it
+  // twice would log the same "not found" warning twice.
+  return [...new Set([meta.lastScene, meta.mainScene].filter(Boolean).map(absolute))];
 }
 
 /** Reloads the scene the editor should boot into. Validates the path exists
@@ -119,32 +133,42 @@ function resolveBootPath() {
 export async function restoreLastScene() {
   const engine = await ensureEngine();
   const root = projectRoot();
-  let path = resolveBootPath();
-  if (!path && !root) path = localStorage.getItem(LAST_SCENE_KEY);
-  if (!path) return false;
+  const candidates = bootCandidates();
+  if (!candidates.length && !root) {
+    const legacy = localStorage.getItem(LAST_SCENE_KEY);
+    if (legacy) candidates.push(legacy);
+  }
+  if (!candidates.length) return false;
 
   const { invoke } = await import("@tauri-apps/api/core");
-  try {
-    await invoke("stat_file", { path });
-  } catch {
-    const scope = root ? `project ${root}` : "saved scene";
-    console.warn(`Saved scene not found on disk: ${path} — leaving editor empty (${scope}). Use File → New Scene or Open Scene…`);
-    return false;
+  for (const path of candidates) {
+    try {
+      await invoke("stat_file", { path });
+    } catch {
+      // Renaming or deleting the scene you last had open must not strand the
+      // editor on an empty stage — fall through to `mainScene`.
+      console.warn(`Saved scene not found on disk: ${path}`);
+      continue;
+    }
+    try {
+      const { deserializeScene } = await import("../engine/index.js");
+      const contents = await invoke("load_scene", { path });
+      await deserializeScene(engine, JSON.parse(contents));
+      engine.sceneName = sceneNameFromPath(path);
+      if (path === candidates[0]) open.path = path;
+      // Fell back past a `lastScene` that no longer exists — repair it, or
+      // every future launch re-reports the same missing file.
+      else rememberScene(path);
+      afterSceneSwap(engine);
+      console.log(`Restored scene: ${path}`);
+      return true;
+    } catch (err) {
+      console.warn(`Couldn't restore scene (${path}): ${err}`);
+    }
   }
-
-  try {
-    const { deserializeScene } = await import("../engine/index.js");
-    const contents = await invoke("load_scene", { path });
-    await deserializeScene(engine, JSON.parse(contents));
-    engine.sceneName = sceneNameFromPath(path);
-    open.path = path;
-    afterSceneSwap(engine);
-    console.log(`Restored scene: ${path}`);
-    return true;
-  } catch (err) {
-    console.warn(`Couldn't restore scene (${path}): ${err}`);
-    return false;
-  }
+  const scope = root ? `project ${root}` : "saved scene";
+  console.warn(`No scene could be restored (${scope}). Use File → New Scene or Open Scene…`);
+  return false;
 }
 
 function afterSceneSwap(engine = null) {

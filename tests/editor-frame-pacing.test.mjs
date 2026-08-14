@@ -12,3 +12,8 @@ test("editor frame pacing yields progressively more time for expensive frames", 
   assert.equal(editorFrameRateFor(50), 20);
   assert.equal(editorFrameRateFor(25, { interacting: true }), 15);
 });
+
+test("a direct viewport gesture is never capped, whatever the frame costs", () => {
+  assert.equal(editorFrameRateFor(50, { gesture: true }), 0);
+  assert.equal(editorFrameRateFor(25, { interacting: true, gesture: true }), 0);
+});

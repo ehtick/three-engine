@@ -1,6 +1,7 @@
 import * as THREE from "three/webgpu";
 import { faceDirection, normalWorld, vec4 } from "three/tsl";
 import { frameBasis, frameDirection } from "./octahedral.js";
+import { readRenderTargetImage } from "../renderTargetImage.js";
 
 /**
  * Baking an octahedral impostor atlas (roadmap item 14).
@@ -219,34 +220,25 @@ function renderTiles(renderer, scene, target, { frames, tile, hemisphere, center
 /**
  * Reads a render target back as a tightly-packed, BOTTOM-UP atlas.
  *
- * Two corrections, both of the silent kind:
- *
- * **Padding.** WebGPU pads every row of a texture-to-buffer copy up to a
- * multiple of 256 bytes and three hands the mapped buffer over with the padding
- * still in it. Indexing it tightly yields an image that is progressively
- * sheared down the frame — plausible enough to ship, and nothing about the data
- * says so.
- *
- * **Row order, per TILE.** The readback arrives with row 0 at the top of the
- * image, and the viewport that placed each tile also counts from the top — so
- * tile row `r` really is at rows `[r*tile, …)`, but the pixels inside it are
- * upside down relative to `v`. Flipping the WHOLE image would fix the pixels
- * and break the placement (the shader would read frame `frames-1-r`, which is a
- * different view of the same object and therefore still looks like an object —
- * the worst kind of wrong). Flipping within each tile band fixes exactly the
- * one that is wrong, and leaves an atlas whose `v` runs upward, which is what
- * every other line of code here assumes.
+ * The padding and the backend's row order are `renderTargetImage.js`'s problem;
+ * what is specific to an atlas is that the flip has to happen **per TILE**.
+ * The image arrives top-down and the viewport that placed each tile also counts
+ * from the top, so tile row `r` really is at rows `[r*tile, …)` — but the pixels
+ * inside it are upside down relative to `v`. Flipping the WHOLE image would fix
+ * the pixels and break the placement (the shader would read frame
+ * `frames-1-r`, which is a different view of the same object and therefore
+ * still looks like an object — the worst kind of wrong). Flipping within each
+ * tile band fixes exactly the one that is wrong, and leaves an atlas whose `v`
+ * runs upward, which is what every other line of code here assumes.
  */
 async function readAtlas(renderer, target, size, tile) {
-  const raw = await renderer.readRenderTargetPixelsAsync(target, 0, 0, size, size);
+  const image = await readRenderTargetImage(renderer, target, size, size);
   const rowBytes = size * 4;
-  const paddedRow = Math.ceil(rowBytes / 256) * 256;
   const out = new Uint8Array(rowBytes * size);
   for (let y = 0; y < size; y++) {
     const band = Math.floor(y / tile) * tile;
-    const from = (band + tile - 1 - (y - band)) * paddedRow;
-    const available = Math.max(0, Math.min(rowBytes, raw.length - from));
-    if (available > 0) out.set(raw.subarray(from, from + available), y * rowBytes);
+    const from = (band + tile - 1 - (y - band)) * rowBytes;
+    out.set(image.subarray(from, from + rowBytes), y * rowBytes);
   }
   return out;
 }

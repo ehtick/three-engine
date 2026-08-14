@@ -158,7 +158,7 @@ export function extrudeFaceRegion(mesh, faces = selected(mesh, "face")) {
       const inside = loop.e.loops.filter((other) => region.has(other.f)).length;
       if (inside === 1) {
         const next = face.loops[(loop.index + 1) % face.loops.length];
-        boundary.push({ from: loop.v, to: next.v, material: face.material, uv: [...loop.uv], nextUV: [...next.uv] });
+        boundary.push({ from: loop.v, to: next.v, material: face.material, smooth: face.smooth, uv: [...loop.uv], nextUV: [...next.uv] });
       }
     }
   }
@@ -184,7 +184,11 @@ export function extrudeFaceRegion(mesh, faces = selected(mesh, "face")) {
   // them facing outward for any consistently wound source region.
   const walls = [];
   for (const entry of boundary) {
-    const wall = addFace(mesh, [entry.from, entry.to, copyOf(entry.to), copyOf(entry.from)], { material: entry.material });
+    // Walls continue the surface they grew from, so they take its shading too.
+    // `addFace` defaults to smooth, and a smooth wall on a flat-shaded box
+    // renders as a dark gradient bending around the corner — which reads as
+    // "the UVs broke" even though the UVs are untouched.
+    const wall = addFace(mesh, [entry.from, entry.to, copyOf(entry.to), copyOf(entry.from)], { material: entry.material, smooth: entry.smooth });
     if (wall) walls.push(setSideBaseUV(wall, entry.uv, entry.nextUV));
   }
   updateSideUVs(walls);
@@ -224,7 +228,7 @@ export function extrudeFacesIndividual(mesh, faces = selected(mesh, "face")) {
     }
     for (let index = 0; index < ring.length; index++) {
       const next = (index + 1) % ring.length;
-      const side = addFace(mesh, [ring[index], ring[next], copies[next], copies[index]], { material });
+      const side = addFace(mesh, [ring[index], ring[next], copies[next], copies[index]], { material, smooth });
       if (side) sides.push(setSideBaseUV(side, uvs[index], uvs[next]));
     }
   }
@@ -278,7 +282,7 @@ export function extrudeEdges(mesh, edges = selected(mesh, "edge")) {
     const loop = edge.loops[0];
     const forward = loop ? loop.v === edge.v2 : true;
     const [a, b] = forward ? [edge.v1, edge.v2] : [edge.v2, edge.v1];
-    const face = addFace(mesh, [a, b, copyOf(b), copyOf(a)], { material });
+    const face = addFace(mesh, [a, b, copyOf(b), copyOf(a)], { material, smooth: loop?.f.smooth ?? true });
     if (face) {
       created.push(face);
       if (loop) {
@@ -417,10 +421,12 @@ export function insetFaces(mesh, faces = selected(mesh, "face"), { individual = 
     for (const loop of boundaryLoops) bySource.set(loop.v, loop);
     const ring = [];
     const ringUVs = [];
+    const ringFaces = [];
     let current = boundaryLoops[0];
     for (let step = 0; step < boundaryLoops.length; step++) {
       ring.push(current.v);
       ringUVs.push([...current.uv]);
+      ringFaces.push(current.f);
       const next = bySource.get(current.f.loops[(current.index + 1) % current.f.loops.length].v);
       if (!next || next === boundaryLoops[0]) break;
       current = next;
@@ -463,7 +469,10 @@ export function insetFaces(mesh, faces = selected(mesh, "face"), { individual = 
     }
     for (let index = 0; index < ring.length; index++) {
       const next = (index + 1) % ring.length;
-      const side = addFace(mesh, [ring[index], ring[next], copies[next], copies[index]], { material: rebuilds[0].material });
+      const side = addFace(mesh, [ring[index], ring[next], copies[next], copies[index]], {
+        material: ringFaces[index].material,
+        smooth: ringFaces[index].smooth,
+      });
       if (side) sides.push(setSideBaseUV(side, ringUVs[index], ringUVs[next]));
     }
   }

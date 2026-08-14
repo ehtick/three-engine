@@ -96,3 +96,16 @@ export const UI_LAYER = 27;
  */
 export const SELECTION_MASK_LAYER = 26;
 export const SELECTION_ACTIVE_LAYER = 25;
+
+/**
+ * Layer for the postprocess editor-overlay pass's DEPTH SEED quad
+ * (`PostprocessComponent`): a fullscreen quad that copies the scene pass's
+ * depth into the overlay pass's depth attachment so editor helpers occlude
+ * against real scene geometry inside a PP-owned frame.
+ *
+ * A private bit rather than EDITOR_LAYER because the quad must render ONLY in
+ * that one pass — on a direct frame the editor camera sees EDITOR_LAYER, and
+ * a depth-stomping fullscreen quad there would overwrite the live depth
+ * buffer for everything drawn after it.
+ */
+export const PP_OVERLAY_SEED_LAYER = 24;

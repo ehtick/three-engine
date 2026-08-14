@@ -20,6 +20,11 @@ export const MATERIAL_EXTENSIONS = ["mat"];
 // Six-face cube map descriptor (JSON naming the face textures) — used as a
 // scene skybox / IBL source. See src/engine/cubemapAsset.js.
 export const CUBEMAP_EXTENSIONS = ["cubemap"];
+// Equirectangular HDR panoramas — the other shape a sky comes in, and the one
+// Poly Haven ships. See src/engine/environmentAsset.js.
+export const HDRI_EXTENSIONS = ["hdr", "exr"];
+// Everything the scene's sky slot (`settings.environment.cubemap`) accepts.
+export const ENVIRONMENT_EXTENSIONS = [...CUBEMAP_EXTENSIONS, ...HDRI_EXTENSIONS];
 // `.prefab` is the real thing (a linked, override-aware prefab asset).
 // `.entity` is the legacy bare snapshot — still readable (it's upgraded to a
 // prefab def on load), so old assets keep working.

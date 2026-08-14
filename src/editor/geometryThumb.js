@@ -8,6 +8,7 @@
  */
 import * as THREE from "three/webgpu";
 import { loadGeometryAsset } from "../engine/geometryAsset.js";
+import { renderTargetToDataUrl } from "../engine/renderTargetImage.js";
 import { onAssetInvalidated, extOf } from "./assetLoader.js";
 import { samePath } from "./assetReveal.js";
 
@@ -118,7 +119,9 @@ function frameCamera(camera, geometry, scratch) {
 
 /**
  * Renders the current scene into `target` and returns a PNG data URL.
- * Handles WebGPU's 256-byte row padding and bottom-up orientation.
+ * Row padding and row ORDER are the readback helper's business — this used to
+ * carry its own copy of the WebGL bottom-up flip, which produced thumbnails
+ * that were upside down on WebGPU.
  */
 async function capture({ renderer, scene, camera, target }) {
   const prev = renderer.getRenderTarget();
@@ -126,21 +129,7 @@ async function capture({ renderer, scene, camera, target }) {
     renderer.setRenderTarget(target);
     renderer.render(scene, camera);
     renderer.setRenderTarget(prev);
-
-    const raw = await renderer.readRenderTargetPixelsAsync(target, 0, 0, SIZE, SIZE);
-    const rowBytes = SIZE * 4;
-    const paddedRow = Math.ceil(rowBytes / 256) * 256;
-    const canvas = document.createElement("canvas");
-    canvas.width = canvas.height = SIZE;
-    const ctx = canvas.getContext("2d");
-    const image = ctx.createImageData(SIZE, SIZE);
-    for (let y = 0; y < SIZE; y++) {
-      const from = (SIZE - 1 - y) * paddedRow;
-      const available = Math.max(0, Math.min(rowBytes, raw.length - from));
-      if (available > 0) image.data.set(raw.subarray(from, from + available), y * rowBytes);
-    }
-    ctx.putImageData(image, 0, 0);
-    return canvas.toDataURL("image/png");
+    return await renderTargetToDataUrl(renderer, target, SIZE, SIZE);
   } finally {
     renderer.setRenderTarget(prev);
   }

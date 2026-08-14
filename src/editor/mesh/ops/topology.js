@@ -611,7 +611,14 @@ export function bevelEdges(mesh, edges = selected(mesh, "edge"), { width = 0.1, 
     // directions, so the strip runs against face A to stay wound with it:
     // [aEnd, aStart, bEnd, bStart]. `sides.a.start` and `sides.b.end` are the
     // same original vertex, which is what pairs the corners up.
-    const strip = buildBevelStrip(mesh, [aStart, bEnd], [aEnd, bStart], sides.a.start, sides.a.end, segments);
+    // The chamfer replaces the corner between faces A and B, so it wears their
+    // shading: face A's material (whose UVs it also continues), smooth if
+    // either side was — left to the default, a bevel on a flat-shaded box came
+    // back as a smooth strip on material 0.
+    const strip = buildBevelStrip(mesh, [aStart, bEnd], [aEnd, bStart], sides.a.start, sides.a.end, segments, {
+      material: sides.a.face.material,
+      smooth: sides.a.face.smooth || sides.b.face.smooth,
+    });
     // Continue face A's UVs across the chamfer so the texel density matches the
     // surface it was cut from.
     //
@@ -752,9 +759,25 @@ export function bevelEdges(mesh, edges = selected(mesh, "edge"), { width = 0.1, 
       // few millimetres across — tens of times the density of the surface it
       // sits in, and the most visible part of "bevel ruins the UVs".
       const cornerUVs = ringUVsFromNeighbour(oriented);
+      // The cap fills the hole between the strips, so it dresses like them:
+      // majority shading and material of the faces already around the ring
+      // (which by now includes the strips, themselves inherited from the
+      // beveled faces).
+      const around = new Set();
+      for (const corner of oriented) for (const face of vertFaces(corner)) around.add(face);
+      let smoothVotes = 0;
+      const materialVotes = new Map();
+      for (const face of around) {
+        smoothVotes += face.smooth ? 1 : -1;
+        materialVotes.set(face.material, (materialVotes.get(face.material) ?? 0) + 1);
+      }
+      const shading = {
+        material: [...materialVotes.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? 0,
+        smooth: smoothVotes > 0,
+      };
       const caps = segments > 1
-        ? gridDomedCorner(mesh, oriented, vert, cornerUVs, segments)
-        : [addFace(mesh, oriented, { uvs: cornerUVs ?? planarRingUVs(oriented) })];
+        ? gridDomedCorner(mesh, oriented, vert, cornerUVs, segments, shading)
+        : [addFace(mesh, oriented, { ...shading, uvs: cornerUVs ?? planarRingUVs(oriented) })];
       for (const cap of caps) if (cap) created.push(cap);
     }
     mesh.verts.delete(vert);
@@ -773,15 +796,15 @@ export function bevelEdges(mesh, edges = selected(mesh, "edge"), { width = 0.1, 
  * continue into the cap, while the barycentric interior avoids the single
  * many-spoked hub produced by the old fan.
  */
-function gridDomedCorner(mesh, ring, vert, inheritedUVs, segments) {
+function gridDomedCorner(mesh, ring, vert, inheritedUVs, segments, shading = {}) {
   const steps = Math.max(1, Math.min(Math.round(segments) || 1, 16));
-  if (ring.length !== steps * 3) return fanDomedCorner(mesh, ring, vert, inheritedUVs);
+  if (ring.length !== steps * 3) return fanDomedCorner(mesh, ring, vert, inheritedUVs, shading);
 
   // Blender's special three-edge M_ADJ pattern uses three m×m quad patches
   // when the profile has 2m segments. This is the topology visible on a
   // normally beveled cube: profile loops enter the corner, turn onto one of
   // three radial seams, and meet at a low-valence shared center.
-  if (steps % 2 === 0) return quadDomedTriCorner(mesh, ring, vert, inheritedUVs, steps);
+  if (steps % 2 === 0) return quadDomedTriCorner(mesh, ring, vert, inheritedUVs, steps, shading);
 
   const points = ring.map((corner) => corner.co);
   const sphere = fitSphere(points) ?? {
@@ -829,7 +852,7 @@ function gridDomedCorner(mesh, ring, vert, inheritedUVs, segments) {
   const addTriangle = (coordinates) => {
     const triangle = coordinates.map(([a, b]) => vertices.get(key(a, b)));
     const triangleUVs = coordinates.map(([a, b]) => uvs.get(key(a, b)));
-    const face = addFace(mesh, triangle, { uvs: triangleUVs });
+    const face = addFace(mesh, triangle, { ...shading, uvs: triangleUVs });
     if (face) faces.push(face);
   };
   for (let a = 0; a < steps; a++) for (let b = 0; b < steps - a; b++) {
@@ -839,7 +862,7 @@ function gridDomedCorner(mesh, ring, vert, inheritedUVs, segments) {
   return faces;
 }
 
-function quadDomedTriCorner(mesh, ring, vert, inheritedUVs, steps) {
+function quadDomedTriCorner(mesh, ring, vert, inheritedUVs, steps, shading = {}) {
   const half = steps / 2;
   const points = ring.map((corner) => corner.co);
   const sphere = fitSphere(points) ?? {
@@ -925,7 +948,7 @@ function quadDomedTriCorner(mesh, ring, vert, inheritedUVs, steps) {
     for (let u = 0; u < half; u++) for (let v = 0; v < half; v++) {
       const corners = [patch[u][v], patch[u + 1][v], patch[u + 1][v + 1], patch[u][v + 1]];
       const uvs = [patchUV[u][v], patchUV[u + 1][v], patchUV[u + 1][v + 1], patchUV[u][v + 1]];
-      const face = addFace(mesh, corners, { uvs });
+      const face = addFace(mesh, corners, { ...shading, uvs });
       if (face) faces.push(face);
     }
   }
@@ -941,7 +964,7 @@ function quadDomedTriCorner(mesh, ring, vert, inheritedUVs, steps) {
  * between the two offset directions, which is what gives a rounded profile
  * rather than a flat chamfer cut into steps.
  */
-function buildBevelStrip(mesh, atStart, atEnd, pivotStart, pivotEnd, segments) {
+function buildBevelStrip(mesh, atStart, atEnd, pivotStart, pivotEnd, segments, shading = {}) {
   const steps = Math.max(1, Math.min(Math.round(segments) || 1, 16));
   const faces = [];
   const edgeDirection = normalize3(sub3(pivotEnd.co, pivotStart.co));
@@ -985,7 +1008,7 @@ function buildBevelStrip(mesh, atStart, atEnd, pivotStart, pivotEnd, segments) {
     const t = step / steps;
     const nextStart = step === steps ? atStart[1] : arcPoint(atStart[0], atStart[1], pivotStart, t);
     const nextEnd = step === steps ? atEnd[1] : arcPoint(atEnd[0], atEnd[1], pivotEnd, t);
-    const face = addFace(mesh, [previous[1], previous[0], nextStart, nextEnd]);
+    const face = addFace(mesh, [previous[1], previous[0], nextStart, nextEnd], shading);
     if (face) faces.push(face);
     startChain.push(nextStart);
     endChain.push(nextEnd);
@@ -1047,7 +1070,7 @@ function cornerRing(chains) {
  * the strips' arcs put it on — so a hub placed at the same radius along the
  * ring's mean direction continues the curvature instead of slicing across it.
  */
-function fanDomedCorner(mesh, ring, vert, inheritedUVs = null) {
+function fanDomedCorner(mesh, ring, vert, inheritedUVs = null, shading = {}) {
   const points = ring.map((corner) => corner.co);
   // The arcs meeting here are all centred on the same corner sphere, so fitting
   // one to the ring recovers that sphere exactly rather than approximating it.
@@ -1059,7 +1082,7 @@ function fanDomedCorner(mesh, ring, vert, inheritedUVs = null) {
     points.reduce((sum, point) => add3(sum, point), [0, 0, 0]).map((value) => value / points.length),
     sphere.center,
   ));
-  if (length3(outward) < 1e-9) return [addFace(mesh, ring, { uvs: inheritedUVs ?? planarRingUVs(ring) })];
+  if (length3(outward) < 1e-9) return [addFace(mesh, ring, { ...shading, uvs: inheritedUVs ?? planarRingUVs(ring) })];
   const hub = addVert(mesh, add3(sphere.center, scale3(outward, sphere.radius)));
 
   // A planar unwrap of the whole ring, reused per triangle so the corner keeps
@@ -1076,6 +1099,7 @@ function fanDomedCorner(mesh, ring, vert, inheritedUVs = null) {
   for (let index = 0; index < ring.length; index++) {
     const next = (index + 1) % ring.length;
     faces.push(addFace(mesh, [ring[index], ring[next], hub], {
+      ...shading,
       uvs: [ringUVs[index], ringUVs[next], hubUV],
     }));
   }

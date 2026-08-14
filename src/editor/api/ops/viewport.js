@@ -24,6 +24,7 @@ import { defineOp } from "../registry.js";
 import { engine } from "../../engineInstance.js";
 import { getViewportHandle } from "../../viewportHandle.js";
 import { EDITOR_LAYER } from "../../../engine/editorLayers.js";
+import { renderTargetToDataUrl } from "../../../engine/renderTargetImage.js";
 import { useConsoleStore } from "../../store/consoleStore.js";
 import { isViewportFreezeEnabled, setViewportFreezeEnabled } from "../../viewportFreeze.js";
 import { renderSelectionOutline } from "../../selectionOutline.js";
@@ -99,37 +100,10 @@ async function capture({ width, height, camera, includeGizmos }) {
     }
     renderer.setRenderTarget(prevTarget);
 
-    // NOTE the signature: on WebGPU `readRenderTargetPixelsAsync` RETURNS the
-    // pixels and its 6th argument is a texture index, not a destination buffer
-    // (that is the WebGL shape). Passing an array there indexes
-    // `renderTarget.textures[<array>]`, yields undefined, and fails inside the
-    // backend with "Invalid value used as weak map key".
-    const raw = await renderer.readRenderTargetPixelsAsync(target, 0, 0, width, height);
-
-    // WebGPU requires `bytesPerRow` to be a multiple of 256, and three returns
-    // the mapped buffer with that padding still in it. Indexing it tightly
-    // "works" — you get a plausible PNG of the right size — but every row after
-    // the first is offset a little further, so the image comes out sheared and
-    // nothing about the result says so. Unpad explicitly.
-    const rowBytes = width * 4;
-    const paddedRow = Math.ceil(rowBytes / 256) * 256;
-
-    // Render targets are bottom-up; canvases are top-down. Doing the flip in
-    // the same pass as the unpad keeps this to one row copy each.
-    const canvas = document.createElement("canvas");
-    canvas.width = width;
-    canvas.height = height;
-    const ctx = canvas.getContext("2d");
-    const image = ctx.createImageData(width, height);
-    for (let y = 0; y < height; y++) {
-      const from = (height - 1 - y) * paddedRow;
-      // The final row is short by design — three sizes the buffer as
-      // (height-1)*paddedRow + rowBytes — so clamp rather than over-read.
-      const available = Math.max(0, Math.min(rowBytes, raw.length - from));
-      if (available > 0) image.data.set(raw.subarray(from, from + available), y * rowBytes);
-    }
-    ctx.putImageData(image, 0, 0);
-    return canvas.toDataURL("image/png");
+    // Row padding and row order both differ by backend and both used to be
+    // hand-rolled here — with WebGL's bottom-up flip applied to WebGPU, which
+    // returned every screenshot upside down. `renderTargetImage.js` owns it.
+    return await renderTargetToDataUrl(renderer, target, width, height);
   } finally {
     if (camera.isPerspectiveCamera && prevAspect) {
       camera.aspect = prevAspect;

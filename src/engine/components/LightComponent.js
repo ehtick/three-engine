@@ -592,6 +592,18 @@ export class LightComponent extends Component {
     s.bias = this.props.shadowBias;
     s.normalBias = this.props.shadowNormalBias;
     s.radius = this.props.shadowRadius;
+    // Scene Settings' "shadow auto update" lives on the PER-LIGHT shadow in the
+    // WebGPU path (ShadowNode gates on `shadow.needsUpdate || shadow.autoUpdate`;
+    // renderer.shadowMap.autoUpdate is never read). applySettingsToScene mirrors
+    // it onto existing lights — a light created afterwards must read it here or
+    // it silently re-renders its map every frame regardless of the setting.
+    // gi-mode lights are re-frozen right after this call (their 16x16 map never
+    // renders), so initializing from settings here is safe for them too.
+    const shadowSettings = this.entity?.engine?.settings?.shadow;
+    if (shadowSettings) {
+      s.autoUpdate = shadowSettings.autoUpdate !== false;
+      s.needsUpdate = true;
+    }
     const typeMap = LightComponent.#getShadowTypeMap();
     if (this.props.shadowMapType in typeMap) {
       s.type = typeMap[this.props.shadowMapType];

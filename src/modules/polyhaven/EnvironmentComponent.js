@@ -1,12 +1,19 @@
 import * as THREE from "three/webgpu";
 import { Component } from "../../engine/components/Component.js";
-import { resolveAssetUrl } from "../../engine/assetResolver.js";
+import { loadEnvironmentAsset } from "../../engine/environmentAsset.js";
 
 /**
  * HDRI environment: image-based lighting + optional skybox background from an
  * equirectangular .hdr/.exr asset (the format PolyHaven ships). Attaching it
  * takes over `scene.environment` (and `scene.background` when enabled);
  * detaching restores whatever the scene settings had before.
+ *
+ * PREFER SCENE SETTINGS → ENVIRONMENT → SKY, which takes the same .hdr/.exr
+ * (see engine/environmentAsset.js). This component predates that and remains
+ * for what a scene setting cannot express — a script swapping skies at runtime,
+ * an HDRI that travels with a prefab — and for scenes already using it. It
+ * still WINS over the scene setting, because it applies after; Scene Settings
+ * says so, and offers a one-click move.
  *
  * One environment is active at a time — the last attached component wins.
  * Registered by the `polyhaven` module, but works with any HDR asset.
@@ -65,31 +72,15 @@ export class EnvironmentComponent extends Component {
     this.#release();
     const path = this.props.hdri;
     if (!path) return;
-    let texture;
-    try {
-      texture = await this.#loadEquirect(path);
-    } catch (err) {
-      console.error(`Environment: couldn't load "${path}": ${err.message ?? err}`);
-      return;
-    }
-    // A newer reload/detach happened while we were fetching — drop the result.
-    if (generation !== this.#generation) {
-      texture.dispose();
-      return;
-    }
-    texture.mapping = THREE.EquirectangularReflectionMapping;
+    // The SHARED decode — the same cached texture the scene's own sky slot
+    // uses, so an HDRI referenced from both places is decoded once. It also
+    // means the texture is not ours to dispose; see #release.
+    const texture = await loadEnvironmentAsset(path);
+    // A newer reload/detach happened while we were fetching, or the file could
+    // not be read (loadEnvironmentAsset logs and resolves null).
+    if (!texture || generation !== this.#generation) return;
     this.#texture = texture;
     this.#apply();
-  }
-
-  async #loadEquirect(path) {
-    const url = await resolveAssetUrl(path);
-    if (/\.exr$/i.test(path)) {
-      const { EXRLoader } = await import("three/addons/loaders/EXRLoader.js");
-      return new EXRLoader().loadAsync(url);
-    }
-    const { RGBELoader } = await import("three/addons/loaders/RGBELoader.js");
-    return new RGBELoader().loadAsync(url);
   }
 
   /** Pushes texture + params onto the scene, capturing prior state once. */
@@ -125,10 +116,17 @@ export class EnvironmentComponent extends Component {
     this.#prev = null;
   }
 
-  /** Full teardown: scene restore + texture disposal. */
+  /**
+   * Full teardown: restore the scene, drop our reference.
+   *
+   * The texture is NOT disposed — it belongs to the shared environment cache,
+   * and the scene's own sky slot (or another component) may be pointing at the
+   * same file. Disposing it here would destroy a GPU texture still assigned to
+   * `scene.environment`. `invalidateEnvironmentAsset` is what frees it, and the
+   * live-update path is the one caller that means it.
+   */
   #release() {
     this.#unapply();
-    this.#texture?.dispose();
     this.#texture = null;
   }
 }

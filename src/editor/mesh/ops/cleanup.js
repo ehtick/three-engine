@@ -15,6 +15,7 @@ import {
   findEdge,
   flipFace,
   isBoundaryEdge,
+  killEdge,
   killFace,
   splitFace,
   vertFaces,
@@ -23,7 +24,7 @@ import {
 import { clearSelection, flushSelection, selected, selectedVerts } from "../select.js";
 import { faceRegions } from "./edit.js";
 import { faceTriangles } from "../tessellate.js";
-import { updateSideUVs } from "./extrude.js";
+import { setSideBaseUV, updateSideUVs } from "./extrude.js";
 import { planarRingUVs } from "./uv.js";
 
 const add3 = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
@@ -404,6 +405,44 @@ function edgeChains(edges) {
   return { chains };
 }
 
+/**
+ * The face across an edge, read as "what should a new face grown from this
+ * edge look like": its shading, its material slot, and the UVs it holds at the
+ * edge's two endpoints, ordered to match [from, to].
+ */
+function edgeContinuation(edge, from) {
+  const loop = edge?.loops?.[0];
+  if (!loop) return null;
+  const next = loop.f.loops[(loop.index + 1) % loop.f.loops.length];
+  const forward = loop.v === from;
+  return {
+    material: loop.f.material,
+    smooth: loop.f.smooth,
+    uv: forward ? [...loop.uv] : [...next.uv],
+    nextUV: forward ? [...next.uv] : [...loop.uv],
+  };
+}
+
+/**
+ * Majority shading among the faces surrounding a boundary ring — what a fill
+ * dropped into that hole should look like. One vote per boundary edge, so a
+ * large flat neighbour and a sliver count the same.
+ */
+function ringShading(ring) {
+  let smoothVotes = 0;
+  let flatVotes = 0;
+  const materials = new Map();
+  for (let index = 0; index < ring.length; index++) {
+    const face = findEdge(ring[index], ring[(index + 1) % ring.length])?.loops?.[0]?.f;
+    if (!face) continue;
+    if (face.smooth) smoothVotes++;
+    else flatVotes++;
+    materials.set(face.material, (materials.get(face.material) ?? 0) + 1);
+  }
+  const material = [...materials.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? 0;
+  return { material, smooth: smoothVotes > flatVotes };
+}
+
 /** Bridge Edge Loops: joins two equally sized boundaries with quads. */
 export function bridgeEdgeLoops(mesh, edges = selected(mesh, "edge")) {
   const result = edgeChains(edges);
@@ -432,12 +471,25 @@ export function bridgeEdgeLoops(mesh, edges = selected(mesh, "edge")) {
   const segments = first.closed ? count : count - 1;
   for (let index = 0; index < segments; index++) {
     const next = (index + 1) % count;
-    const quad = addFace(mesh, [first.verts[index], first.verts[next], best.verts[next], best.verts[index]]);
-    if (quad) created.push(quad);
+    // The tube continues the surface it grows out of: shading, material slot
+    // and UV density all come from the face across the first boundary's edge,
+    // exactly as an extrude wall inherits from its source face. Left to the
+    // defaults, every bridge quad came out smooth-shaded on material 0.
+    const continuation = edgeContinuation(findEdge(first.verts[index], first.verts[next]), first.verts[index]);
+    const quad = addFace(
+      mesh,
+      [first.verts[index], first.verts[next], best.verts[next], best.verts[index]],
+      continuation ? { material: continuation.material, smooth: continuation.smooth } : {},
+    );
+    if (quad) {
+      if (continuation) setSideBaseUV(quad, continuation.uv, continuation.nextUV);
+      created.push(quad);
+    }
   }
   if (!created.length) return { error: "Could not bridge those boundaries" };
-  // Bridge quads span between two islands, so there is no neighbouring UV to
-  // inherit; they get the same measured strip layout as an extrude wall.
+  // With a recorded base the strip continues the neighbouring surface's UVs at
+  // matching density; without one (a bridge between bare wire loops) it falls
+  // back to the measured world-unit layout.
   updateSideUVs(created);
   // Match the surrounding surface so the tube is not inside out.
   for (const face of created) {
@@ -450,6 +502,56 @@ export function bridgeEdgeLoops(mesh, edges = selected(mesh, "edge")) {
   for (const face of created) if (mesh.faces.has(face)) face.select = true;
   flushSelection(mesh, "face");
   return { faces: created.length };
+}
+
+/**
+ * Bridge with faces selected, as Blender's Bridge Edge Loops behaves when the
+ * selection is two face regions: the regions' faces are deleted and the two
+ * boundary rings they leave behind are bridged. Selecting two opposite faces
+ * of a box and bridging is what cuts a tunnel straight through it.
+ */
+export function bridgeFaces(mesh, faces = selected(mesh, "face")) {
+  if (faces.length < 2) return { error: "Select two faces or face regions to bridge" };
+  const regions = faceRegions(faces);
+  if (regions.length !== 2) return { error: "Bridge needs exactly two separate face regions" };
+
+  const boundary = new Set();
+  const interior = new Set();
+  for (const group of regions) {
+    const region = new Set(group);
+    for (const face of region) {
+      for (const loop of face.loops) {
+        const inside = loop.e.loops.filter((other) => region.has(other.f)).length;
+        (inside === 1 ? boundary : interior).add(loop.e);
+      }
+    }
+  }
+  // Validate before deleting anything: the faces are killed below, so a
+  // mismatch discovered inside `bridgeEdgeLoops` afterwards would leave two
+  // holes and no bridge.
+  const probe = edgeChains([...boundary]);
+  if (probe.error) return probe;
+  if (probe.chains.length !== 2) return { error: "Bridge needs exactly two boundary loops" };
+  if (probe.chains[0].closed !== probe.chains[1].closed) return { error: "Both boundaries must be open or both closed" };
+  if (probe.chains[0].verts.length !== probe.chains[1].verts.length) return { error: "Both boundaries must have the same vertex count" };
+
+  // The regions' faces become the inside of the tube. Their boundary edges
+  // survive — still holding the outside neighbours the bridge quads inherit
+  // shading and UVs from — while interior edges and verts are swept, because
+  // `killFace` deliberately leaves edges behind as wire.
+  for (const group of regions) for (const face of group) killFace(mesh, face);
+  for (const edge of interior) {
+    if (mesh.edges.has(edge) && !edge.loops.length) killEdge(mesh, edge);
+  }
+  for (const edge of interior) {
+    for (const vert of [edge.v1, edge.v2]) {
+      if (mesh.verts.has(vert) && !vert.edges.size) mesh.verts.delete(vert);
+    }
+  }
+
+  const result = bridgeEdgeLoops(mesh, [...boundary]);
+  if (result.error) return result;
+  return { ...result, removed: faces.length };
 }
 
 /** Grid Fill: fills a closed boundary of even length with a quad grid. */
@@ -530,9 +632,11 @@ export function gridFill(mesh, edges = selected(mesh, "edge"), { span = null } =
     }
   }
   const created = [];
+  const shading = ringShading(ring);
   for (let row = 0; row < rows; row++) {
     for (let column = 0; column < columns; column++) {
       const cell = addFace(mesh, [grid[row][column], grid[row][column + 1], grid[row + 1][column + 1], grid[row + 1][column]], {
+        ...shading,
         uvs: [gridUV[row][column], gridUV[row][column + 1], gridUV[row + 1][column + 1], gridUV[row + 1][column]],
       });
       if (cell) created.push(cell);
@@ -561,7 +665,7 @@ export function fillHoles(mesh, { maxSides = 64 } = {}) {
   let filled = 0;
   for (const chain of result.chains) {
     if (!chain.closed || chain.verts.length < 3 || chain.verts.length > maxSides) continue;
-    const face = addFace(mesh, chain.verts, { uvs: planarRingUVs(chain.verts) });
+    const face = addFace(mesh, chain.verts, { ...ringShading(chain.verts), uvs: planarRingUVs(chain.verts) });
     if (!face) continue;
     const reference = face.loops.find((loop) => loop.e.loops.length === 2);
     const neighbour = reference?.e.loops.find((loop) => loop.f !== face);
@@ -607,6 +711,14 @@ export function spinEdges(mesh, edges = selected(mesh, "edge"), { steps = 12, an
     for (let index = 0; index + 1 < chain.verts.length; index++) pairs.push([chain.verts[index], chain.verts[index + 1]]);
     if (chain.closed) pairs.push([chain.verts[chain.verts.length - 1], chain.verts[0]]);
   }
+  // A profile edge spun off an existing surface carries that surface's shading
+  // around the whole sweep; a bare wire profile falls back to the defaults.
+  // Read once per pair before the sweep — later steps neighbour only the quads
+  // this loop itself created.
+  const shadingOf = new Map(pairs.map((pair) => {
+    const face = findEdge(pair[0], pair[1])?.loops?.[0]?.f;
+    return [pair, face ? { material: face.material, smooth: face.smooth } : {}];
+  }));
   let previous = new Map(profile.map((vert) => [vert, vert]));
   const created = [];
   for (let step = 1; step <= segments; step++) {
@@ -615,8 +727,9 @@ export function spinEdges(mesh, edges = selected(mesh, "edge"), { steps = 12, an
     for (const vert of profile) {
       current.set(vert, full && isLast ? vert : addVert(mesh, rotateAbout(vert.co, center, axis, (angle * step) / segments)));
     }
-    for (const [a, b] of pairs) {
-      const quad = addFace(mesh, [previous.get(a), previous.get(b), current.get(b), current.get(a)]);
+    for (const pair of pairs) {
+      const [a, b] = pair;
+      const quad = addFace(mesh, [previous.get(a), previous.get(b), current.get(b), current.get(a)], shadingOf.get(pair));
       if (quad) created.push(quad);
     }
     previous = current;

@@ -432,11 +432,11 @@ defineOp({
   name: "scene.setEnvironment",
   undoable: true,
   description:
-    "Point the scene's lighting environment at an HDRI in the project. Reuses the scene's existing Environment component if there is one, otherwise creates an Environment entity carrying it. This is the step after importing an HDRI — the file on its own lights nothing.",
+    "Point the scene's sky at an HDRI in the project. Writes the scene setting `environment.cubemap` (which accepts .hdr/.exr as well as .cubemap), so it is controllable in Scene Settings — intensity, rotation, sky blur, and whether it draws as a backdrop or only lights the scene. This is the step after importing an HDRI: the file on its own lights nothing. A scene that already carries an Environment component keeps using that instead; Scene Settings offers a one-click move.",
   params: { path: { type: "string", required: true, description: "Absolute path to an .hdr/.exr in the project." } },
   async run({ path }) {
     const { setSceneEnvironment } = await import("../../polyhaven.js");
-    const entity = await setSceneEnvironment(path);
-    return { entityId: entity?.id ?? null, hdri: path };
+    const { entity } = await setSceneEnvironment(path);
+    return { hdri: path, entityId: entity?.id ?? null, via: entity ? "component" : "sceneSettings" };
   },
 });

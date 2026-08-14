@@ -1,6 +1,6 @@
 // @ts-check
 import * as THREE from "three/webgpu";
-import { Fn, max, mix, step, texture, uniform, uv, vec2, vec4 } from "three/tsl";
+import { Fn, float, max, mix, step, texture, uniform, uv, vec2, vec4 } from "three/tsl";
 import { EDITOR_LAYER, SELECTION_ACTIVE_LAYER, SELECTION_MASK_LAYER } from "../engine/editorLayers.js";
 import { vmSingleton } from "./singleton.js";
 
@@ -15,7 +15,10 @@ import { vmSingleton } from "./singleton.js";
  * rotated or non-convex mesh the box is mostly empty space. Every DCC app
  * solves this the same way — trace the object's own silhouette.
  *
- * HOW. Screen space, in three passes, entirely after the main draw:
+ * HOW. Screen space, in three passes — mask + horizontal dilate PRE-render
+ * (updateSelectionOutlineMask), the final composite either as one post-render
+ * quad (direct frames) or inside the postprocess pipeline's output node
+ * (applySelectionOutlineOverlay) when one owns the camera:
  *
  *   1. MASK. Render only the selected meshes into an RGBA8 target with a flat
  *      override material: red channel = "selected", green channel = "active"
@@ -113,6 +116,19 @@ const state = vmSingleton("selectionOutline", () => ({
   compositeMaterial: null,
   /** @type {any} vec2 uniform: one texel of the current target. */
   texel: null,
+  /**
+   * True while the mask/dilate targets hold a live ring. Cleared (with a real
+   * GPU clear of both targets) the frame the selection empties, so neither the
+   * post-render composite nor the postprocess overlay can show a stale ring.
+   */
+  ringLive: false,
+  /**
+   * Float uniform: the current dilation radius, read per-tap by the overlay
+   * node (see applySelectionOutlineOverlay) so a DPI change never forces the
+   * postprocess pipeline to rebuild — its tap loop is unrolled to MAX_RADIUS
+   * and gated at runtime.
+   */
+  overlayRadiusU: null,
 }));
 
 /**
@@ -297,32 +313,50 @@ function buildFullscreenMaterials(radius) {
 }
 
 /**
- * Draws the outline over whatever is currently in `target`.
+ * Renders the outline's MASK and horizontal-DILATE passes into the module's
+ * offscreen targets. This is the half of the effect that makes nested
+ * `renderer.render()` calls and manual `setRenderTarget` swaps, so it MUST run
+ * in the engine's PRE-render phase, next to the GI gbuffer and the occluder
+ * pass — the sanctioned slot for nested renders.
  *
- * Runs as a post-render pass: the frame is already composited, and this only
- * adds pixels where the ring is. Every piece of renderer/scene state it touches
- * is restored before it returns, including the layer masks it stamps on the
- * selected meshes.
+ * ⚠ WHY THE SPLIT EXISTS (2026-08-13): this whole effect used to run
+ * post-render, after the frame was presented. With a PostprocessComponent
+ * active, the frame is owned by three's RenderPipeline, and
+ * PostprocessComponent's own header documents the rule the old shape broke:
+ * manual target swapping outside the renderer's managed frame desynchronizes
+ * the WebGPU backend's cached render state. The result was SILENT canvas
+ * corruption (no validation errors) from the first selection onward —
+ * reproduced deterministically on the user's project by
+ * scripts/run-outline-postfx-repro.mjs. Post-render now draws at most ONE
+ * fullscreen quad (compositeSelectionOutline), and with a postprocess pipeline
+ * active it draws nothing at all — the ring composites INSIDE the pipeline via
+ * applySelectionOutlineOverlay.
+ *
+ * Every piece of renderer/scene state this touches is restored before it
+ * returns, including the layer masks it stamps on the selected meshes and the
+ * previous render target.
  *
  * @param {object} options
  * @param {THREE.WebGPURenderer} options.renderer
  * @param {THREE.Scene} options.scene
  * @param {THREE.Camera} options.camera
- * @param {THREE.RenderTarget|null} [options.target] Destination — the canvas
- *   when null. The offscreen screenshot path passes its own target so a capture
- *   shows the same outline the viewport does.
- * @param {number} [options.width] Destination width in pixels (defaults to the
- *   renderer's drawing buffer).
+ * @param {number} [options.width] Mask resolution (defaults to the renderer's
+ *   drawing buffer).
  * @param {number} [options.height]
  * @param {number} [options.pixelRatio] Device pixels per CSS pixel, for keeping
  *   the outline the same apparent thickness on a HiDPI display.
- * @return {boolean} True when something was drawn.
+ * @param {boolean} [options.playing] Play mode never shows the editor outline;
+ *   passing true clears any live ring instead of rendering one.
+ * @return {boolean} True when the targets now hold a live ring.
  */
-export function renderSelectionOutline({ renderer, scene, camera, target = null, width, height, pixelRatio }) {
+export function updateSelectionOutlineMask({ renderer, scene, camera, width, height, pixelRatio, playing = false }) {
   if (!renderer || !scene || !camera) return false;
-  if (!state.enabled || state.roots.length === 0) return false;
-  refreshEntries();
-  if (state.entries.length === 0) return false;
+  const wants = !playing && state.enabled && state.roots.length > 0;
+  if (wants) refreshEntries();
+  if (!wants || state.entries.length === 0) {
+    clearRing(renderer);
+    return false;
+  }
 
   let w = width;
   let h = height;
@@ -345,6 +379,7 @@ export function renderSelectionOutline({ renderer, scene, camera, target = null,
   const ratio = pixelRatio ?? renderer.getPixelRatio();
   const radius = Math.max(1, Math.min(MAX_RADIUS, Math.round(WIDTH_CSS_PX * ratio)));
   if (!state.compositeMaterial || state.radius !== radius) buildFullscreenMaterials(radius);
+  if (state.overlayRadiusU) state.overlayRadiusU.value = radius;
 
   // Stamp the isolation layer. `visible` is forced only for meshes a SYSTEM
   // hid while still drawing them — a static-batching member renders through
@@ -365,16 +400,27 @@ export function renderSelectionOutline({ renderer, scene, camera, target = null,
     if (active) hasActive = true;
     else hasSelected = true;
   }
-  if (stamped.length === 0) return false;
+  if (stamped.length === 0) {
+    clearRing(renderer);
+    return false;
+  }
 
   // Cast: three's own runtime takes `(renderer, scene, state)` for both of
   // these — its shipped `@types` declaration drops the `scene` parameter.
   const utils = /** @type {any} */ (THREE.RendererUtils);
   const rendererState = utils.resetRendererAndSceneState(renderer, scene);
+  const prevTarget = renderer.getRenderTarget();
+  const prevAutoClear = renderer.autoClear;
   const prevAutoClearColor = renderer.autoClearColor;
   const prevAutoClearDepth = renderer.autoClearDepth;
   const prevCameraMask = camera.layers.mask;
+  // Belt to precompileSelectionOutlineMasks' guard: the narrowed camera layers
+  // already keep lights out of these renders, but a shadow update inside a
+  // nested override render is the empty-fragment-struct pipeline trap, and
+  // this is cheap insurance against a light ever landing on a mask layer.
+  const prevShadows = renderer.shadowMap.enabled;
   try {
+    renderer.shadowMap.enabled = false;
     renderer.setRenderTarget(state.maskTarget);
     renderer.setClearColor(0x000000, 0);
     renderer.autoClear = true;
@@ -403,9 +449,74 @@ export function renderSelectionOutline({ renderer, scene, camera, target = null,
     renderer.autoClearColor = true;
     state.quad.material = state.dilateMaterial;
     state.quad.render(renderer);
+  } finally {
+    camera.layers.mask = prevCameraMask;
+    for (const { mesh, mask, visible } of stamped) {
+      mesh.layers.mask = mask;
+      mesh.visible = visible;
+    }
+    renderer.setRenderTarget(prevTarget);
+    renderer.autoClear = prevAutoClear;
+    renderer.autoClearColor = prevAutoClearColor;
+    renderer.autoClearDepth = prevAutoClearDepth;
+    renderer.shadowMap.enabled = prevShadows;
+    utils.restoreRendererAndSceneState(renderer, scene, rendererState);
+  }
+  state.ringLive = true;
+  return true;
+}
 
-    // Back to the frame. autoClear off or the WebGPU pass starts with
-    // `loadOp: Clear` and wipes everything drawn before us.
+/**
+ * Clears the mask/dilate targets the frame the ring should disappear
+ * (deselection, play mode, disabled). One real GPU clear, then nothing until
+ * the next selection — the overlay/composite read transparent black and draw
+ * no ring. Freshly created WebGPU textures are zero-initialized by spec, so a
+ * never-rendered target needs no clear.
+ */
+function clearRing(renderer) {
+  if (!state.ringLive) return;
+  state.ringLive = false;
+  if (!state.maskTarget || !renderer) return;
+  const prevTarget = renderer.getRenderTarget();
+  const prevColor = new THREE.Color();
+  renderer.getClearColor(prevColor);
+  const prevAlpha = renderer.getClearAlpha();
+  try {
+    renderer.setClearColor(0x000000, 0);
+    renderer.setRenderTarget(state.maskTarget);
+    renderer.clear(true, false, false);
+    renderer.setRenderTarget(state.dilateTarget);
+    renderer.clear(true, false, false);
+  } finally {
+    renderer.setRenderTarget(prevTarget);
+    renderer.setClearColor(prevColor, prevAlpha);
+  }
+}
+
+/**
+ * Draws the finished ring over `target` (the canvas when null) as ONE
+ * fullscreen quad — no nested scene renders, no camera or layer state.
+ *
+ * Only for frames the engine renders DIRECTLY (`renderer.render`). When a
+ * postprocess pipeline owns the frame, do not call this — the ring composites
+ * inside the pipeline via applySelectionOutlineOverlay instead, because even
+ * a single manual target swap after `RenderPipeline.render()` lands in the
+ * corruption class documented at the top of updateSelectionOutlineMask.
+ *
+ * @param {object} options
+ * @param {THREE.WebGPURenderer} options.renderer
+ * @param {THREE.RenderTarget|null} [options.target]
+ * @return {boolean} True when the quad was drawn.
+ */
+export function compositeSelectionOutline({ renderer, target = null }) {
+  if (!renderer || !state.ringLive || !state.compositeMaterial || !state.quad) return false;
+  const prevTarget = renderer.getRenderTarget();
+  const prevAutoClear = renderer.autoClear;
+  const prevAutoClearColor = renderer.autoClearColor;
+  const prevAutoClearDepth = renderer.autoClearDepth;
+  try {
+    // autoClear off or the WebGPU pass starts with `loadOp: Clear` and wipes
+    // everything drawn before us.
     renderer.setRenderTarget(target);
     renderer.autoClear = false;
     renderer.autoClearColor = false;
@@ -413,16 +524,145 @@ export function renderSelectionOutline({ renderer, scene, camera, target = null,
     state.quad.material = state.compositeMaterial;
     state.quad.render(renderer);
   } finally {
-    camera.layers.mask = prevCameraMask;
-    for (const { mesh, mask, visible } of stamped) {
-      mesh.layers.mask = mask;
-      mesh.visible = visible;
-    }
+    renderer.autoClear = prevAutoClear;
     renderer.autoClearColor = prevAutoClearColor;
     renderer.autoClearDepth = prevAutoClearDepth;
-    utils.restoreRendererAndSceneState(renderer, scene, rendererState);
+    renderer.setRenderTarget(prevTarget);
   }
   return true;
+}
+
+/**
+ * Mask + composite in one call — the OFFSCREEN path (viewport.screenshot ops),
+ * which owns its whole render sequence and passes an explicit target. The live
+ * viewport must NOT use this: its two halves belong to different frame phases
+ * (see updateSelectionOutlineMask).
+ */
+export function renderSelectionOutline({ renderer, scene, camera, target = null, width, height, pixelRatio }) {
+  if (!updateSelectionOutlineMask({ renderer, scene, camera, width, height, pixelRatio })) return false;
+  return compositeSelectionOutline({ renderer, target });
+}
+
+/**
+ * Wraps a postprocess chain's output colour with the selection ring — the
+ * "separate pass" that lets the outline coexist with the postprocessing
+ * module. PostprocessComponent calls this (via `engine.viewportOverlayNode`)
+ * once per pipeline compile; selection changes only change the CONTENT of the
+ * mask/dilate textures, never the node graph, so selecting never rebuilds the
+ * postprocess pipeline.
+ *
+ * Stability contract: the targets are created here if they don't exist yet
+ * (2×2, zero-filled ⇒ no ring) and are only ever `setSize`d afterwards, which
+ * keeps the texture OBJECTS the pipeline binds valid. disposeSelectionOutline
+ * breaks that contract, which is why it must only run on `renderer-rebuilt` —
+ * the same event that rebuilds every postprocess pipeline anyway.
+ *
+ * The vertical-dilate tap loop is unrolled to MAX_RADIUS and each tap is
+ * gated by a radius uniform, so a DPI change (radius change) is a uniform
+ * write, not a recompile. The ring colour passes through the pipeline's tone
+ * mapping, so it reads a touch dimmer than the direct-render path's — a known,
+ * accepted difference.
+ *
+ * @param {any} colorNode The chain's output colour node.
+ * @return {any} The colour node with the ring mixed in.
+ */
+export function applySelectionOutlineOverlay(colorNode) {
+  if (!state.texel) state.texel = uniform(new THREE.Vector2(0.5, 0.5));
+  if (!state.maskTarget) {
+    state.maskTarget = makeTarget(2, 2, "selectionOutlineMask");
+    state.dilateTarget = makeTarget(2, 2, "selectionOutlineDilate");
+  }
+  state.overlayRadiusU ??= uniform(0);
+  const maskTexture = state.maskTarget.texture;
+  const dilateTexture = state.dilateTarget.texture;
+  const texel = state.texel;
+  const radiusU = state.overlayRadiusU;
+  const activeColor = uniform(new THREE.Color(ACTIVE_COLOR));
+  const selectedColor = uniform(new THREE.Color(SELECTED_COLOR));
+  return Fn(() => {
+    const base = uv();
+    let grown = /** @type {any} */ (texture(dilateTexture, base));
+    for (let i = 1; i <= MAX_RADIUS; i++) {
+      const gate = step(float(i), radiusU);
+      const offset = vec2(0, texel.y.mul(i));
+      grown = max(grown, texture(dilateTexture, base.add(offset)).mul(gate));
+      grown = max(grown, texture(dilateTexture, base.sub(offset)).mul(gate));
+    }
+    const mask = texture(maskTexture, base);
+    // Same ring maths as the composite material — see buildFullscreenMaterials
+    // for why BOTH channels subtract.
+    const inside = max(mask.r, mask.g);
+    const edge = max(grown.r, grown.g).mul(inside.oneMinus());
+    const ring = mix(selectedColor, activeColor, step(0.5, grown.g));
+    const beauty = vec4(colorNode);
+    return vec4(mix(beauty.rgb, ring, edge), beauty.a);
+  })();
+}
+
+/**
+ * Pre-compiles the mask materials' render pipelines against every mesh
+ * currently in view, so selecting an object never compiles mid-frame.
+ *
+ * WHY: a WebGPU render pipeline is per material × geometry layout × render
+ * context. The mask pass draws the selected meshes with an override material
+ * into its own RGBA8/no-depth target, so the FIRST time any given mesh is
+ * selected, that pipeline does not exist yet and compiles synchronously inside
+ * the frame — the reported "it lags each time I select another object".
+ * `renderer.compileAsync` walks the same projection path `render` does, so
+ * running it with the override + the mask target bound builds exactly the
+ * pipelines the mask pass will ask for, off the critical path.
+ *
+ * compileAsync's setup (projection, render-object creation, pipeline REQUESTS)
+ * is synchronous — its only awaits are `init()` (already done) and the final
+ * pipeline promises — so the override/target are restored immediately after
+ * the call returns and the compiles finish in the background.
+ *
+ * LIMIT: `compileAsync` frustum-culls, so this warms the meshes the camera can
+ * currently see — which covers click-selection by construction. Selecting an
+ * OFF-SCREEN entity from the hierarchy can still compile on first draw; call
+ * this again after big camera jumps if that ever reads as a hitch.
+ */
+export async function precompileSelectionOutlineMasks({ renderer, scene, camera }) {
+  if (!renderer || !scene || !camera) return;
+  if (!state.maskSelectedMaterial) {
+    state.maskSelectedMaterial = makeMaskMaterial("selected");
+    state.maskActiveMaterial = makeMaskMaterial("active");
+  }
+  if (!state.maskTarget) {
+    state.maskTarget = makeTarget(2, 2, "selectionOutlineMask");
+    state.dilateTarget = makeTarget(2, 2, "selectionOutlineDilate");
+  }
+  // ⚠ LIGHTS MUST BE HIDDEN DURING THE PROJECTION, for two reasons that both
+  // matter. (1) With a light in the render list, compileAsync ALSO compiles
+  // the shadow-map pass, and the shadow pass applies scene.overrideMaterial —
+  // compiling this colorNode material into a depth-only context whose
+  // fragment output struct is EMPTY: an invalid WGSL pipeline ("structures
+  // must have at least one member"), the exact class that poisoned command
+  // buffers via the occluder pass. (2) Pipelines key on the lights node, and
+  // the REAL mask pass renders with camera layers that exclude every light —
+  // warming with lights hidden builds exactly the no-lights variant the mask
+  // pass will bind. Hide → synchronous projection → restore happens inside
+  // one JS task per material, so no rendered frame ever sees the scene dark.
+  const lights = [];
+  scene.traverse((obj) => {
+    if (obj.isLight && obj.visible) lights.push(obj);
+  });
+  for (const material of [state.maskSelectedMaterial, state.maskActiveMaterial]) {
+    const prevOverride = scene.overrideMaterial;
+    const prevTarget = renderer.getRenderTarget();
+    let pending = null;
+    try {
+      for (const light of lights) light.visible = false;
+      scene.overrideMaterial = material;
+      renderer.setRenderTarget(state.maskTarget);
+      pending = renderer.compileAsync(scene, camera);
+    } finally {
+      renderer.setRenderTarget(prevTarget);
+      scene.overrideMaterial = prevOverride;
+      for (const light of lights) light.visible = true;
+    }
+    await pending;
+  }
 }
 
 /** Frees the targets and materials. The selection itself is forgotten too. */
@@ -441,6 +681,7 @@ export function disposeSelectionOutline() {
   state.compositeMaterial = null;
   state.quad = null;
   state.radius = 0;
+  state.ringLive = false;
   state.roots = [];
   state.activeRoot = null;
   state.entries = [];

@@ -114,8 +114,15 @@ export class DepthPyramid {
 
   /**
    * Rebuilds from a base level of view-space distances. `data` is one float per
-   * texel, row 0 at the BOTTOM of the frame — the order a render-target
-   * readback arrives in, and the same order `v` runs in.
+   * texel, row 0 at the BOTTOM of the frame — the order `v` runs in, since
+   * `projectSphere` maps NDC y to `v = y * 0.5 + 0.5` and NDC +y is the top of
+   * the screen.
+   *
+   * That is a REQUIREMENT ON THE CALLER, not a description of what a readback
+   * gives you: only WebGL hands rows over bottom-up, and a WebGPU readback
+   * arrives top-down and has to be flipped first (`OcclusionSystem`'s
+   * `toPyramidRows`). Feeding this the wrong way up mirrors every depth test
+   * about the screen centre and culls objects that nothing is in front of.
    */
   build(data, width, height) {
     this.width = width;

@@ -68,7 +68,9 @@ import { OCCLUDER_LAYER, UI_LAYER } from "../editorLayers.js";
  */
 
 /** Occluder depth is rendered at this width; height follows the aspect. A
- *  multiple of 64 so the readback rows need no unpadding on any backend. */
+ *  multiple of 64 so the readback rows need no unpadding on any backend — they
+ *  still need REORDERING on WebGPU, which is a separate matter; see
+ *  `toPyramidRows`. */
 const DEFAULT_WIDTH = 256;
 
 export class OcclusionSystem {
@@ -104,6 +106,23 @@ export class OcclusionSystem {
     this.testedLastFrame = 0;
     this.culledLastFrame = 0;
     this._sphere = new THREE.Sphere();
+  }
+
+  /**
+   * Applies the knobs from whichever camera governs this frame.
+   *
+   * `minOccluderSize` decides which objects are TAGGED as occluders, and that
+   * tagging is cached until something invalidates it — so changing the size
+   * without marking the tags dirty leaves the previous frame's occluder set in
+   * place and the new value appears to do nothing.
+   */
+  configure({ minOccluderSize, bias, cullShadowCasters }) {
+    if (Number.isFinite(minOccluderSize) && minOccluderSize !== this.minOccluderSize) {
+      this.minOccluderSize = minOccluderSize;
+      this._occluderDirty = true;
+    }
+    if (Number.isFinite(bias)) this.bias = bias;
+    if (cullShadowCasters !== undefined) this.cullShadowCasters = cullShadowCasters !== false;
   }
 
   setEnabled(value) {
@@ -289,7 +308,19 @@ export class OcclusionSystem {
     this.pendingView.copy(camera.matrixWorldInverse);
     this.pendingProjection.copy(camera.projectionMatrix);
 
+    const previousShadows = renderer.shadowMap.enabled;
     try {
+      // ⚠ SHADOWS OFF OR THE OVERRIDE POISONS THE SHADOW PASS (2026-08-13,
+      // the "viewport freezes with weird artifacts" bug). When a shadow map
+      // update lands inside this nested render, the shadow pass APPLIES
+      // scene.overrideMaterial — compiling "Occluder depth" into a depth-only
+      // context whose fragment output struct is EMPTY. That is an invalid
+      // WGSL pipeline ("structures must have at least one member"); once
+      // cached, binding it poisons whole command buffers and the queue drops
+      // entire frames — with no error on the frames that die. Intermittent by
+      // construction: it needed a shadow-dirty frame to coincide with this
+      // pass. Shadows still update normally in the main render.
+      renderer.shadowMap.enabled = false;
       // A transparent surface does not hide what is behind it, and an override
       // material would draw it as though it did — the "glass wall culls the
       // room" bug, which the GI gbuffer had to learn the same way.
@@ -315,6 +346,7 @@ export class OcclusionSystem {
       this.engine.scene.overrideMaterial = previousOverride;
       camera.layers.mask = previousMask;
       renderer.transparent = previousTransparent;
+      renderer.shadowMap.enabled = previousShadows;
     }
 
     this.pending = true;
@@ -322,7 +354,12 @@ export class OcclusionSystem {
       .readRenderTargetPixelsAsync(target, 0, 0, this.width, this.height)
       .then((raw) => {
         if (!this.enabled) return;
-        this.pyramid.build(unpad(raw, this.width, this.height), this.width, this.height);
+        const webgl = !!renderer.backend?.isWebGLBackend;
+        this.pyramid.build(
+          toPyramidRows(raw, this.width, this.height, webgl),
+          this.width,
+          this.height,
+        );
         this.captureView.copy(this.pendingView);
         this.captureProjection.copy(this.pendingProjection);
       })
@@ -448,13 +485,36 @@ export class OcclusionSystem {
  * every row after the first drifts a little further, the pyramid is built from
  * a smeared image, and objects are culled in the wrong places.
  */
-function unpad(raw, width, height) {
+/**
+ * Turns the raw readback into the base level `DepthPyramid.build` documents:
+ * tightly packed, **row 0 at the BOTTOM of the frame**, because that is the
+ * direction `v` runs in `projectSphere` (`v = y * 0.5 + 0.5`, so `v = 1` is the
+ * top of the screen).
+ *
+ * Which requires knowing the backend, and getting it wrong is invisible rather
+ * than loud. `gl.readPixels` counts rows from the bottom and needs nothing done
+ * to it; WebGPU's `copyTextureToBuffer` preserves texture order, so row 0 is
+ * the TOP and the buffer has to be flipped. Skipping that flip does not blank
+ * the screen or throw — it silently tests every object against the depth of the
+ * region MIRRORED vertically about the screen centre. An object high on screen
+ * is then compared with whatever is low on screen, and if that happens to be
+ * nearby (a floor, a desk, a wall coming towards the camera) the object is
+ * culled with nothing whatsoever in front of it. "Meshes vanish in front of the
+ * camera, and it depends where I look" is exactly what that produces.
+ *
+ * See `engine/renderTargetImage.js`, which draws the same distinction for
+ * colour readbacks; this one cannot share it because the pyramid wants floats
+ * and the opposite row order from an image.
+ */
+export function toPyramidRows(raw, width, height, webgl) {
   const rowFloats = width;
-  const paddedFloats = Math.ceil((width * 4) / 256) * 64;
-  if (paddedFloats === rowFloats && raw.length >= rowFloats * height) return raw;
+  // WebGL packs tightly; WebGPU pads each row to 256 BYTES = 64 floats.
+  const sourceRow = webgl ? rowFloats : Math.ceil((width * 4) / 256) * 64;
+  // Already bottom-up and unpadded: WebGL at any width, and nothing else.
+  if (webgl && raw.length >= rowFloats * height) return raw;
   const out = new Float32Array(rowFloats * height);
   for (let y = 0; y < height; y++) {
-    const from = y * paddedFloats;
+    const from = (webgl ? y : height - 1 - y) * sourceRow;
     const available = Math.max(0, Math.min(rowFloats, raw.length - from));
     if (available > 0) out.set(raw.subarray(from, from + available), y * rowFloats);
   }

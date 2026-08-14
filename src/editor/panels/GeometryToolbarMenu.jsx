@@ -104,6 +104,12 @@ export function ToolbarMenu({ label, title, popoverClassName = "", disabled = fa
     const onPointerDown = (event) => {
       if (popoverRef.current?.contains(event.target)) return;
       if (summaryRef.current?.contains(event.target)) return;
+      // A field inside the menu can open its own portalled dropdown — the
+      // material slot picker does. That portal lives on <body>, outside the
+      // popover's subtree, so without this a click anywhere in the picker (or
+      // on its dismiss overlay) closed the menu it was opened from and
+      // unmounted the picker mid-choice.
+      if (event.target.closest?.(".portal-menu, .dropdown-overlay, .context-menu")) return;
       menus.close();
     };
     const onKeyDown = (event) => {
