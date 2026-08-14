@@ -128,6 +128,7 @@
     "test:gi-dynobj": "node scripts/run-gi-dynobj-bvh4-test.mjs",
     "test:gi-lighttree": "node scripts/run-gi-light-tree-test.mjs",
     "test:gi-lighttree-descent": "node scripts/run-gi-lighttree-descent.mjs",
+    "test:gi-lighttree-nee": "node scripts/run-gi-lighttree-nee.mjs",
     "test:gi-boot-ambient": "node scripts/run-gi-boot-ambient-test.mjs",
     "test:gi-proxy-fit": "node scripts/run-gi-proxy-fit-test.mjs",
     "gi:shot-diff": "node scripts/run-gi-shot-diff.mjs",

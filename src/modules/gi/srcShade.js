@@ -513,6 +513,7 @@ export function createSrcHitLighting({
   neeSamples = 1,
   importance = null,
   floorFraction = IMPORTANCE_FLOOR_FRACTION,
+  lightTree = null,
   count = null,
 } = {}) {
   if (voxelSize == null) {
@@ -532,7 +533,12 @@ export function createSrcHitLighting({
     );
   }
   const margin = float(voxelSize).mul(0.5);
-  const useNee = neeEmitters && emitters.length > 0;
+  // §12.62 W3: the light tree REPLACES the slot NEE when supplied — two NEE
+  // estimators over overlapping light sets would double-deliver every emitter
+  // both can reach. The slot set stays wired (the screen chain's direct and
+  // R5's flag both still speak in slot indices); only the [J] pick changes.
+  const useTree = lightTree != null;
+  const useNee = neeEmitters && emitters.length > 0 && !useTree;
 
   return (Pin, nIn, rhoIn, emissiveIn, emitterIn, rayIndex) => {
     const P = vec3(Pin).toVar();
@@ -637,6 +643,71 @@ export function createSrcHitLighting({
       }));
     }
 
+    // ── §12.62 W3: NEE THROUGH THE LIGHT TREE ───────────────────────────────
+    //
+    // The estimator is `estimateLightTree`'s, verbatim: up to two samples from
+    // the descent (the root may split), each contributing `E · v / pdf` where
+    // `pdf` is the MARGINAL INCLUSION probability the descent returns and `E`
+    // is the record's closed-form unoccluded irradiance. No importance floor
+    // and no ranking pass here — the tree's pdf IS the ranking, and §12.26.5's
+    // 3.00×-standard-error ceiling on a bounds-based pdf is what the flicker
+    // arm of the W3 gate prices rather than asserts.
+    //
+    // The seed is a PURE FUNCTION of the ray index, exactly like the slot
+    // draw above it replaces: no state, no frame term — the pick repeats
+    // frame-to-frame at rest, which is the property the still floor's
+    // temporal accumulation already relies on. (0x9e37 is the same odd
+    // multiplier the stratified slot draw uses; the sampler's own counter RNG
+    // decorrelates the per-descent draws from it.)
+    //
+    // ⚠ ONE visibility call site for BOTH samples — the predicated funnel the
+    // rolled light loop above documents. `visibility` costs ~1.2 s of shader
+    // compile PER CALL SITE (§13.14.5) and [J] carries the pole; two inline
+    // sites here would put the §12.53 split's savings straight back.
+    if (useTree) {
+      const seed = hashKey(uint(rayIndex).mul(uint(0x9e37)));
+      const s = lightTree.sample(P, n, seed);
+      const picks = [
+        { idx: s.index0, pdf: s.pdf0 },
+        { idx: s.index1, pdf: s.pdf1 },
+      ].map(({ idx, pdf }) => {
+        const t = {
+          E: vec3(0).toVar(),
+          dirTo: vec3(0, 1, 0).toVar(),
+          maxT: float(0).toVar(),
+          pdf: float(0).toVar(),
+        };
+        If(float(idx).greaterThanEqual(0).and(float(pdf).greaterThan(0)), () => {
+          const e = lightTree.evalAt(P, n, float(idx).toUint());
+          t.E.assign(e.E);
+          t.dirTo.assign(e.dirTo);
+          // The cap stops at the emitter's own surface; the margin is R2's,
+          // subtracted here exactly as `emitterTermsAt` does for a slot.
+          t.maxT.assign(e.maxT.sub(margin).max(0));
+          t.pdf.assign(pdf);
+        });
+        return t;
+      });
+      Loop({ start: int(0), end: int(picks.length), type: "int", condition: "<" }, ({ i }) => {
+        const Ei = vec3(0).toVar();
+        const dirTo = vec3(0, 1, 0).toVar();
+        const maxT = float(0).toVar();
+        const w = float(0).toVar();
+        for (let k = 0; k < picks.length; k++) {
+          const take = i.equal(int(k));
+          Ei.assign(select(take, picks[k].E, Ei));
+          dirTo.assign(select(take, picks[k].dirTo, dirTo));
+          maxT.assign(select(take, picks[k].maxT, maxT));
+          w.assign(select(take, picks[k].pdf, w));
+        }
+        If(Ei.x.max(Ei.y).max(Ei.z).greaterThan(0).and(w.greaterThan(0)), () => {
+          const v = visibility ? float(visibility(P, n, dirTo, maxT)).toVar() : float(1).toVar();
+          if (count && visibility) count.shadowRays(1);
+          E.addAssign(Ei.mul(v).div(w));
+        });
+      });
+    }
+
     // ── ρ/π · E, with R4's ceiling — applied AT THE HIT (in [E], by
     //    `createSrcHitAttribution`) and never at an `intensity` prop where an
     //    artistic gain belongs. The ρ arriving here is ALREADY bounded. ──────
@@ -646,7 +717,16 @@ export function createSrcHitLighting({
     // ── emission, and R5's zeroing ──────────────────────────────────────────
     const Le = vec3(emissiveIn).toVar();
     const emits = Le.x.max(Le.y).max(Le.z).greaterThan(0).toVar();
-    if (useNee && emitterIn != null) {
+    // R5 under the tree (§12.62 W3): the flag still speaks in PROMOTED slot
+    // indices, and the tree's emitter set is a superset of the promoted set —
+    // so this zeroes exactly the emitters whose double-delivery the flag can
+    // name. A NON-promoted tree emitter that is also emissive on contact
+    // would deliver twice; today that cannot happen in production (statics'
+    // promoted emissive is zeroed at palette bake, movers' at writeSurface,
+    // and the production palette flag is always −1 — srcSurface's
+    // `emitterMeshes` is unwired), and moving the WHOLE handoff onto the
+    // tree's set is Unit W5's charter, not a branch here.
+    if ((useNee || useTree) && emitterIn != null) {
       const isNeeLight = float(emitterIn).greaterThanEqual(0)
         .and(float(emitterIn).lessThan(emitters.length))
         .toVar();

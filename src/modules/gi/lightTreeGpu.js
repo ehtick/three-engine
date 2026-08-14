@@ -93,6 +93,7 @@ import {
   uintBitsToFloat,
   vec3,
 } from "three/tsl";
+import { boxLightFactor, boxRayEnter, sphereLightFactor } from "./giLight.js";
 
 const ARITY = 4;
 const NODE_WORDS = 28;
@@ -127,6 +128,97 @@ export function makeGpuRng(seed) {
     state = (state + 0x9e3779b9) >>> 0;
     return (lowbias32(state) >>> 8) / 16777216;
   };
+}
+
+// ═══════════════════════════════════════════════ the importance math, shared
+
+/**
+ * The cluster/emitter importance kernel math, built once per (P, N, hasN)
+ * triple and shared by the DESCENT (createLightTreeSampler) and the W4 TOP-K
+ * ranking (createLightTreeEmitterImportance) — one transcription of
+ * `clusterImportance`, not three (the drift the fixture gate exists to catch
+ * lives in copies). Code below is the sampler's original, moved verbatim.
+ */
+function buildImportanceMath(words, P, N, hasN) {
+  const fword = (idx) => uintBitsToFloat(words.element(idx));
+  const safeSqrt = (x) => sqrt(float(x).max(0));
+  // PBRT's clamped angle-difference identities — `cosA > cosB` means A < B,
+  // where the difference reads as 0 rather than wrapping negative.
+  const cosSub = (sinA, cosA, sinB, cosB) =>
+    select(cosA.greaterThan(cosB), float(1), cosA.mul(cosB).add(sinA.mul(sinB)));
+  const sinSub = (sinA, cosA, sinB, cosB) =>
+    select(cosA.greaterThan(cosB), float(0), sinA.mul(cosB).sub(cosA.mul(sinB)));
+
+  /** `clusterImportance`, term for term, in the CPU's evaluation order. */
+  const clusterImp = (bmin, bmax, power, axis, cosThetaO, cosThetaE) => {
+    const result = float(0).toVar();
+    If(power.greaterThan(0), () => {
+      const c = bmin.add(bmax).mul(0.5).toVar();
+      const dv = P.sub(c).toVar();
+      const d2raw = dv.dot(dv).toVar();
+      const ext = bmax.sub(bmin).toVar();
+      const diag = sqrt(ext.dot(ext)).toVar();
+      // The near-field clamp, unit quirk and all (a LENGTH raising an
+      // AREA-dimensioned d2) — kept verbatim because the CPU keeps it
+      // verbatim from PBRT, and the twin's job is agreement, not taste.
+      const d2 = d2raw.max(diag.div(2)).max(1e-12).toVar();
+      const d = sqrt(d2raw).toVar();
+      const wi = select(d.greaterThan(1e-12), dv.div(d), vec3(0, 1, 0)).toVar();
+      const radius = diag.mul(0.5).toVar();
+      const rr = radius.div(d).toVar();
+      // P inside the cluster's bounding sphere: the cluster subtends every
+      // direction, cosThetaU = −1 (the CPU's `d <= radius` branch).
+      //
+      // ⚠ THE COMPLEMENT-SQRT REWRITES (deviation #2, measured 2.15e-4 on
+      // the pdf before them): every `sqrt(1 − c²)` below is the CPU's f64
+      // formula, where it is benign — in f32, `1 − c²` at |c| → 1 cancels
+      // catastrophically, and sinThetaU's DOUBLE complement
+      // `sqrt(1 − (1 − rr²))` cancels at plain far-field rr. Each rewrite
+      // is an algebraic identity (the same real number): sinThetaU IS rr
+      // outside / 0 inside, and the others take the factored Sterbenz form
+      // `(1 − c)(1 + c)` whose small factor is exact (srcMathTsl.decodeDir
+      // documents the same trick). Identical order everywhere else.
+      const cosThetaU = select(
+        d.lessThanEqual(radius), float(-1),
+        safeSqrt(float(1).sub(rr).mul(float(1).add(rr))),
+      ).toVar();
+      const sinThetaU = select(d.lessThanEqual(radius), float(0), rr).toVar();
+      const cosTheta = axis.dot(wi).clamp(-1, 1).toVar();
+      const sinTheta = safeSqrt(float(1).sub(cosTheta).mul(float(1).add(cosTheta))).toVar();
+      const sinThetaO = safeSqrt(float(1).sub(cosThetaO).mul(float(1).add(cosThetaO))).toVar();
+      const cosThetaX = cosSub(sinTheta, cosTheta, sinThetaO, cosThetaO).toVar();
+      const sinThetaX = sinSub(sinTheta, cosTheta, sinThetaO, cosThetaO).toVar();
+      const cosThetaP = cosSub(sinThetaX, cosThetaX, sinThetaU, cosThetaU).toVar();
+      If(cosThetaP.greaterThan(cosThetaE), () => {
+        const imp = power.mul(cosThetaP).div(d2).toVar();
+        // Receiver cosine widened by the subtended angle; select()ed to an
+        // exact ×1 for point receivers (the CPU's `if (N)` skip).
+        const cosThetaI = wi.dot(N).max(0).toVar();
+        const sinThetaI = safeSqrt(float(1).sub(cosThetaI).mul(float(1).add(cosThetaI))).toVar();
+        imp.mulAssign(select(
+          hasN.greaterThan(0.5),
+          cosSub(sinThetaI, cosThetaI, sinThetaU, cosThetaU),
+          float(1),
+        ));
+        result.assign(select(imp.greaterThan(0), imp, float(0)));
+      });
+    });
+    return result;
+  };
+
+  /** Importance of one emitter record at `emitterBase + id·EMITTER_WORDS`. */
+  const emitterImpAt = (emitterBase, id) => {
+    const p = emitterBase.add(uint(id).mul(uint(EMITTER_WORDS))).toVar();
+    const bmin = vec3(fword(p), fword(p.add(uint(1))), fword(p.add(uint(2)))).toVar();
+    const bmax = vec3(fword(p.add(uint(3))), fword(p.add(uint(4))), fword(p.add(uint(5)))).toVar();
+    const power = fword(p.add(uint(9))).toVar();
+    const axis = vec3(fword(p.add(uint(10))), fword(p.add(uint(11))), fword(p.add(uint(12)))).toVar();
+    const cosO = fword(p.add(uint(13))).toVar();
+    const cosE = fword(p.add(uint(14))).toVar();
+    return clusterImp(bmin, bmax, power, axis, cosO, cosE);
+  };
+
+  return { fword, safeSqrt, cosSub, sinSub, clusterImp, emitterImpAt };
 }
 
 // ═══════════════════════════════════════════════════════════ the TSL descent
@@ -176,83 +268,9 @@ export function createLightTreeSampler(words, options = {}) {
       return shiftRight(x, uint(8)).toFloat().mul(1 / 16777216);
     };
 
-    const fword = (idx) => uintBitsToFloat(words.element(idx));
-    const safeSqrt = (x) => sqrt(float(x).max(0));
-    // PBRT's clamped angle-difference identities — `cosA > cosB` means A < B,
-    // where the difference reads as 0 rather than wrapping negative.
-    const cosSub = (sinA, cosA, sinB, cosB) =>
-      select(cosA.greaterThan(cosB), float(1), cosA.mul(cosB).add(sinA.mul(sinB)));
-    const sinSub = (sinA, cosA, sinB, cosB) =>
-      select(cosA.greaterThan(cosB), float(0), sinA.mul(cosB).sub(cosA.mul(sinB)));
-
-    /** `clusterImportance`, term for term, in the CPU's evaluation order. */
-    const clusterImp = (bmin, bmax, power, axis, cosThetaO, cosThetaE) => {
-      const result = float(0).toVar();
-      If(power.greaterThan(0), () => {
-        const c = bmin.add(bmax).mul(0.5).toVar();
-        const dv = P.sub(c).toVar();
-        const d2raw = dv.dot(dv).toVar();
-        const ext = bmax.sub(bmin).toVar();
-        const diag = sqrt(ext.dot(ext)).toVar();
-        // The near-field clamp, unit quirk and all (a LENGTH raising an
-        // AREA-dimensioned d2) — kept verbatim because the CPU keeps it
-        // verbatim from PBRT, and the twin's job is agreement, not taste.
-        const d2 = d2raw.max(diag.div(2)).max(1e-12).toVar();
-        const d = sqrt(d2raw).toVar();
-        const wi = select(d.greaterThan(1e-12), dv.div(d), vec3(0, 1, 0)).toVar();
-        const radius = diag.mul(0.5).toVar();
-        const rr = radius.div(d).toVar();
-        // P inside the cluster's bounding sphere: the cluster subtends every
-        // direction, cosThetaU = −1 (the CPU's `d <= radius` branch).
-        //
-        // ⚠ THE COMPLEMENT-SQRT REWRITES (deviation #2, measured 2.15e-4 on
-        // the pdf before them): every `sqrt(1 − c²)` below is the CPU's f64
-        // formula, where it is benign — in f32, `1 − c²` at |c| → 1 cancels
-        // catastrophically, and sinThetaU's DOUBLE complement
-        // `sqrt(1 − (1 − rr²))` cancels at plain far-field rr. Each rewrite
-        // is an algebraic identity (the same real number): sinThetaU IS rr
-        // outside / 0 inside, and the others take the factored Sterbenz form
-        // `(1 − c)(1 + c)` whose small factor is exact (srcMathTsl.decodeDir
-        // documents the same trick). Identical order everywhere else.
-        const cosThetaU = select(
-          d.lessThanEqual(radius), float(-1),
-          safeSqrt(float(1).sub(rr).mul(float(1).add(rr))),
-        ).toVar();
-        const sinThetaU = select(d.lessThanEqual(radius), float(0), rr).toVar();
-        const cosTheta = axis.dot(wi).clamp(-1, 1).toVar();
-        const sinTheta = safeSqrt(float(1).sub(cosTheta).mul(float(1).add(cosTheta))).toVar();
-        const sinThetaO = safeSqrt(float(1).sub(cosThetaO).mul(float(1).add(cosThetaO))).toVar();
-        const cosThetaX = cosSub(sinTheta, cosTheta, sinThetaO, cosThetaO).toVar();
-        const sinThetaX = sinSub(sinTheta, cosTheta, sinThetaO, cosThetaO).toVar();
-        const cosThetaP = cosSub(sinThetaX, cosThetaX, sinThetaU, cosThetaU).toVar();
-        If(cosThetaP.greaterThan(cosThetaE), () => {
-          const imp = power.mul(cosThetaP).div(d2).toVar();
-          // Receiver cosine widened by the subtended angle; select()ed to an
-          // exact ×1 for point receivers (the CPU's `if (N)` skip).
-          const cosThetaI = wi.dot(N).max(0).toVar();
-          const sinThetaI = safeSqrt(float(1).sub(cosThetaI).mul(float(1).add(cosThetaI))).toVar();
-          imp.mulAssign(select(
-            hasN.greaterThan(0.5),
-            cosSub(sinThetaI, cosThetaI, sinThetaU, cosThetaU),
-            float(1),
-          ));
-          result.assign(select(imp.greaterThan(0), imp, float(0)));
-        });
-      });
-      return result;
-    };
-
+    const { fword, clusterImp, emitterImpAt } = buildImportanceMath(words, P, N, hasN);
     /** Importance of one emitter leaf, from its record — `emitterImportance`. */
-    const emitterImp = (id) => {
-      const p = emitterBase.add(uint(id).mul(uint(EMITTER_WORDS))).toVar();
-      const bmin = vec3(fword(p), fword(p.add(uint(1))), fword(p.add(uint(2)))).toVar();
-      const bmax = vec3(fword(p.add(uint(3))), fword(p.add(uint(4))), fword(p.add(uint(5)))).toVar();
-      const power = fword(p.add(uint(9))).toVar();
-      const axis = vec3(fword(p.add(uint(10))), fword(p.add(uint(11))), fword(p.add(uint(12)))).toVar();
-      const cosO = fword(p.add(uint(13))).toVar();
-      const cosE = fword(p.add(uint(14))).toVar();
-      return clusterImp(bmin, bmax, power, axis, cosO, cosE);
-    };
+    const emitterImp = (id) => emitterImpAt(emitterBase, id);
 
     const leafId = (start, j) =>
       words.element(triBase.add(start.add(j).mul(uint(TRI_WORDS))).add(uint(9)));
@@ -475,5 +493,181 @@ export function createLightTreeSampler(words, options = {}) {
     });
 
     return { index0, pdf0, index1, pdf1 };
+  };
+}
+
+// ═══════════════════════════════════════════════════ the TSL emitter evaluation
+
+/**
+ * The GPU twin of `lightTree.js`'s `emitterIrradiance` (§12.62 Unit W3), plus
+ * the shadow-ray cap `srcShade.js`'s NEE needs — everything an estimator
+ * multiplies a tree sample's `1/pdf` by:
+ *
+ *     { E, dirTo, maxT }  =  unoccluded RGB irradiance at (P, N),
+ *                            the direction P → emitter,
+ *                            where the shadow ray must STOP (the emitter's own
+ *                            surface — slab entry for boxes; margin is the
+ *                            CALLER's to subtract, exactly `emitterSurfaceT`'s
+ *                            contract for promoted slots).
+ *
+ * Parity is BY SHARED CODE where the shapes live: `sphereLightFactor`,
+ * `boxLightFactor` and `boxRayEnter` are giLight.js's own exports — the same
+ * closed forms the promoted-slot path evaluates — fed with record words
+ * instead of slot uniforms (they take arbitrary nodes; the CPU mirrors in
+ * lightTree.js are term-for-term copies of exactly these). What is NOT reused
+ * is `emitterSurfaceT`: its kind dispatch would compile the capsule /
+ * cylinder / frustum / disc / torus intersectors dead into [J] (records only
+ * ever hold kind 0 sphere / 1 box — `LT_KIND`), and [J]'s compile time is the
+ * §12.53 pole this module already paid twice to protect.
+ *
+ * ⚠ THE EMISSION-CONE GATE IS HERE AND NOT ON THE PROMOTED PATH. The CPU
+ * reference gates on `cos(max(θ − θO, 0)) > cosThetaE` because unbiasedness
+ * requires `contribution > 0 ⇒ importance > 0` at every ancestor
+ * (lightTree.js:1072-1075 — the gate is a SUBSET of `clusterImportance`'s
+ * acceptance region). A promoted slot emits into the full sphere. So the tree
+ * arm and the slot arm differ by exactly this gate, and the §12.26.7-style
+ * energy A/B must be read with that in mind: for a lamp whose cone covers its
+ * receivers the two agree; for a shaded spot they differ BY DESIGN, and the
+ * tree is the one matching the reference.
+ *
+ * The cone test itself avoids `acos`/`cos` round-trips: `cos(max(θ − θO, 0))`
+ * is the clamped angle-difference identity (`cosSub` in the descent above),
+ * with Sterbenz `(1 − c)(1 + c)` complements — the same two f32 disciplines
+ * the descent already documents.
+ *
+ * @param {Node} words  the SAME u32 storage node the sampler reads
+ */
+export function createLightTreeEmitterEval(words) {
+  return (Pin, Nin, baseIn, indexIn) => {
+    const P = vec3(Pin).toVar();
+    const N = vec3(Nin).toVar();
+    const base = uint(baseIn).toVar();
+    const emitterBase = base.add(words.element(base.add(uint(4)))).toVar();
+    const p = emitterBase.add(uint(indexIn).mul(uint(EMITTER_WORDS))).toVar();
+    const fword = (idx) => uintBitsToFloat(words.element(idx));
+
+    const rgb = vec3(fword(p.add(uint(6))), fword(p.add(uint(7))), fword(p.add(uint(8)))).toVar();
+    const axis = vec3(fword(p.add(uint(10))), fword(p.add(uint(11))), fword(p.add(uint(12)))).toVar();
+    const cosO = fword(p.add(uint(13))).clamp(-1, 1).toVar();
+    const cosE = fword(p.add(uint(14))).toVar();
+    const centre = vec3(fword(p.add(uint(16))), fword(p.add(uint(17))), fword(p.add(uint(18)))).toVar();
+    const aR = fword(p.add(uint(19))).toVar();
+    const kind = words.element(p.add(uint(20))).toVar();
+    const half = vec3(fword(p.add(uint(21))), fword(p.add(uint(22))), fword(p.add(uint(23)))).toVar();
+    const bx = vec3(fword(p.add(uint(24))), fword(p.add(uint(25))), fword(p.add(uint(26)))).toVar();
+    const by = vec3(fword(p.add(uint(27))), fword(p.add(uint(28))), fword(p.add(uint(29)))).toVar();
+    // The record stores bx/by only; bz is derived, exactly as the CPU does.
+    const bz = bx.cross(by).toVar();
+
+    const d = P.sub(centre).toVar();
+    const distR = d.length().toVar();
+    const dist = distR.max(1e-9).toVar();
+    const wi = d.div(dist).toVar(); // emitter → P, the importance convention
+
+    // cos(max(θ − θO, 0)) via the identity — 1 when θ < θO, cos(θ − θO) after.
+    const cosTh = axis.dot(wi).clamp(-1, 1).toVar();
+    const sinTh = sqrt(float(1).sub(cosTh).mul(float(1).add(cosTh)).max(0)).toVar();
+    const sinO = sqrt(float(1).sub(cosO).mul(float(1).add(cosO)).max(0)).toVar();
+    const coneCos = select(
+      cosTh.greaterThan(cosO), float(1),
+      cosTh.mul(cosO).add(sinTh.mul(sinO)),
+    ).toVar();
+
+    const E = vec3(0).toVar();
+    // The CPU's two early returns, as one predicate: a degenerate distance or
+    // a point outside the emission cone contributes zero.
+    If(distR.greaterThan(1e-9).and(coneCos.greaterThan(cosE)), () => {
+      const F = float(0).toVar();
+      If(kind.equal(uint(1)), () => {
+        F.assign(boxLightFactor(P, N, centre, half, bx, by, bz));
+      }).Else(() => {
+        const sinR = aR.div(dist.max(1e-6)).clamp(0, 1).toVar();
+        // `wi` points emitter → P; the receiver's cosine is against P → emitter.
+        const cosT = wi.dot(N).negate().clamp(-1, 1).toVar();
+        F.assign(float(Math.PI).mul(sinR).mul(sinR).mul(sphereLightFactor(cosT, sinR)));
+      });
+      E.assign(rgb.mul(F.max(0)));
+    });
+
+    const dirTo = wi.negate().toVar();
+    // Where the shadow ray stops: sphere records carry their bounding radius in
+    // `angularRadius` (a LENGTH — lightTree.js:353); for a box that word is the
+    // equivalent-disc radius and the slab entry is the honest surface.
+    const maxT = dist.sub(aR).toVar();
+    If(kind.equal(uint(1)), () => {
+      maxT.assign(boxRayEnter(P, dirTo, centre, half, bx, by, bz));
+    });
+    return { E, dirTo, maxT };
+  };
+}
+
+// ═══════════════════════════════════════ the standalone importance (§12.70 W4)
+
+/**
+ * One emitter record's importance at (P, N) — `emitterImportance`'s GPU twin,
+ * standalone. This is the W4b tile cut's ranking key: a per-TILE pass loops
+ * every record, ranks by this, and keeps the top MAX_EMITTERS. At tile counts
+ * (thousands, not millions) an O(N) scan beats a best-first tree walk for any
+ * N the leaf encoding can even hold (≤127/leaf) — the TREE stays [J]'s
+ * sampling structure; the SCREEN needs only the importance function, which is
+ * why this export shares `buildImportanceMath` with the descent instead of
+ * transcribing `clusterImportance` a third time.
+ *
+ * Returns `(P, N, hasN, baseWord, id) => float` — same conventions as the
+ * sampler (hasN 0/1 selects the receiver-cosine widening to an exact ×1).
+ */
+/**
+ * §12.70 W4b slice (ii) — one tree emitter record as a PSEUDO-SLOT: the same
+ * field names the promoted-slot uniforms carry (center/radius/color/kind/
+ * half/bx/by/bz + reff), each a node loaded from the record words, so
+ * `emitterDirectAt`, `emitterSlotShadow`, `emitterSlotFactor` and
+ * `emitterSurfaceT` evaluate a tile-cut emitter through the EXACT closed
+ * forms the global seats use — parity by shared code, the W3 pattern.
+ *
+ * `reff` (the angular-size radius `emitterAngularRadius` reads) is the record's
+ * `angularRadius` word — for spheres the bounding radius, for boxes the
+ * mean-projected-area-equivalent radius, which is precisely the convention the
+ * CPU-side slot refresh feeds `reff` (lightTree.js:374 vs GISystem's refresh).
+ *
+ * The EMPTY sentinel (0xffffffff) loads record 0's words harmlessly but
+ * forces `radius` to 0 — every consumer already treats radius ≤ 0.001 as an
+ * empty seat (`active = step(0.001, radius)`, the shadow's admission If), so
+ * an empty tile seat is inert through the whole chain by the same mechanism
+ * a parked global seat is.
+ */
+export function createLightTreeRecordSlot(words) {
+  return (baseIn, idIn) => {
+    const base = uint(baseIn).toVar();
+    const emitterBase = base.add(words.element(base.add(uint(4)))).toVar();
+    const isEmpty = uint(idIn).equal(uint(0xffffffff)).toVar();
+    const id = select(isEmpty, uint(0), uint(idIn)).toVar();
+    const p = emitterBase.add(id.mul(uint(EMITTER_WORDS))).toVar();
+    const fword = (i) => uintBitsToFloat(words.element(i));
+    const radius = select(isEmpty, float(0), fword(p.add(uint(19)))).toVar();
+    const bx = vec3(fword(p.add(uint(24))), fword(p.add(uint(25))), fword(p.add(uint(26)))).toVar();
+    const by = vec3(fword(p.add(uint(27))), fword(p.add(uint(28))), fword(p.add(uint(29)))).toVar();
+    return {
+      center: vec3(fword(p.add(uint(16))), fword(p.add(uint(17))), fword(p.add(uint(18)))).toVar(),
+      radius,
+      reff: radius,
+      color: vec3(fword(p.add(uint(6))), fword(p.add(uint(7))), fword(p.add(uint(8)))).toVar(),
+      kind: words.element(p.add(uint(20))).toFloat().toVar(),
+      half: vec3(fword(p.add(uint(21))), fword(p.add(uint(22))), fword(p.add(uint(23)))).toVar(),
+      bx,
+      by,
+      bz: bx.cross(by).toVar(),
+    };
+  };
+}
+
+export function createLightTreeEmitterImportance(words) {
+  return (Pin, Nin, hasNin, baseIn, idIn) => {
+    const P = vec3(Pin).toVar();
+    const N = vec3(Nin).toVar();
+    const hasN = float(hasNin).toVar();
+    const base = uint(baseIn).toVar();
+    const emitterBase = base.add(words.element(base.add(uint(4)))).toVar();
+    const m = buildImportanceMath(words, P, N, hasN);
+    return m.emitterImpAt(emitterBase, idIn);
   };
 }

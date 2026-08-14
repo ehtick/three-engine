@@ -39,6 +39,15 @@
       //              perturbed ×1.05 in a CPU-side COPY of the words; the diff
       //              against the untouched GPU results must FAIL. A gate that
       //              cannot fail proves nothing.
+      //   eval       (§12.62 Unit W3) createLightTreeEmitterEval vs the CPU's
+      //              emitterIrradiance for EVERY (case, emitter) pair: E per
+      //              channel (rel 2e-3, abs floor 1e-5 — f32 through the
+      //              acos-heavy box math), dirTo vs normalized(centre − P),
+      //              and the shadow-ray cap maxT (sphere: dist − angularRadius;
+      //              box: a CPU mirror of giLight.boxRayEnter's slab entry).
+      //   estimator  the full W3 NEE term, term for term on the GPU:
+      //              Σ over the sampler's slots of E(index)/pdf, vs the CPU's
+      //              estimateLightTree under the SAME seed — same picks.
       //
       // Run: node scripts/run-gi-lighttree-descent.mjs
       const out = document.querySelector("#log");
@@ -64,7 +73,7 @@
         const TSL = await import("three/tsl");
         const LT = await import("/src/modules/gi/lightTree.js");
         const GPU = await import("/src/modules/gi/lightTreeGpu.js");
-        const { Fn, instanceIndex, instancedArray, vec4 } = TSL;
+        const { Fn, If, float, instanceIndex, instancedArray, vec3, vec4 } = TSL;
 
         const renderer = new THREE.WebGPURenderer({ canvas: document.querySelector("#view") });
         await renderer.init();
@@ -415,6 +424,320 @@
             `${canary.indexMismatches} index mismatches, max pdf rel ${canary.maxPdfRel.toExponential(2)}`);
         }
 
+        // ── THE EVAL ARM (§12.62 Unit W3) ──────────────────────────────────
+        // createLightTreeEmitterEval vs emitterIrradiance for EVERY
+        // (case, emitter) pair. Point receivers (N = null) are compared with
+        // the SAME placeholder normal the nrm buffer already carries
+        // ([0,1,0]): irradiance is a surface quantity, the eval twin always
+        // takes a normal — parity only needs both sides fed the same one.
+        say("\n── THE EVAL ARM: createLightTreeEmitterEval vs emitterIrradiance ──");
+        const NSUB = [0, 1, 0]; // the nrm buffer's stand-in for N = null
+        const dot3 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        const cross3 = (a, b) => [
+          a[1] * b[2] - a[2] * b[1],
+          a[2] * b[0] - a[0] * b[2],
+          a[0] * b[1] - a[1] * b[0],
+        ];
+        // giLight.boxRayEnter's slab entry, mirrored exactly: transform P and
+        // dir into the box frame, safe inverse with ±1e-6 clamps, entry =
+        // max over slabs of the per-slab tmin.
+        const boxEnterCpu = (P, dir, centre, half, bx, by, bz) => {
+          const rel = [P[0] - centre[0], P[1] - centre[1], P[2] - centre[2]];
+          const ro = [dot3(rel, bx), dot3(rel, by), dot3(rel, bz)];
+          const rd = [dot3(dir, bx), dot3(dir, by), dot3(dir, bz)];
+          const safe = (c) => (c >= 0 ? Math.max(c, 1e-6) : Math.min(c, -1e-6));
+          let enter = -Infinity;
+          for (let k = 0; k < 3; k++) {
+            const inv = 1 / safe(rd[k]);
+            const t1 = (-half[k] - ro[k]) * inv;
+            const t2 = (half[k] - ro[k]) * inv;
+            enter = Math.max(enter, Math.min(t1, t2));
+          }
+          return enter;
+        };
+
+        const evalMetaList = [];
+        for (let ci = 0; ci < CASES.length; ci++) {
+          const count = fixtures[CASES[ci].fixture].view.emitterCount;
+          for (let ei = 0; ei < count; ei++) evalMetaList.push(ci, ei);
+        }
+        const evalCount = evalMetaList.length / 2;
+        const evalMeta = new Uint32Array(evalMetaList);
+        say(`  ${evalCount} (case, emitter) evaluations`);
+
+        const evalFn = GPU.createLightTreeEmitterEval(wordsBuf);
+        const evalMetaBuf = instancedArray(evalMeta, "uint");
+        const evalOutE = instancedArray(new Float32Array(evalCount * 4), "vec4");
+        const evalOutD = instancedArray(new Float32Array(evalCount * 4), "vec4");
+        const evalKernel = Fn(() => {
+          const i = instanceIndex.toVar();
+          const caseI = evalMetaBuf.element(i.mul(2)).toVar();
+          const emitterI = evalMetaBuf.element(i.mul(2).add(1)).toVar();
+          const pv = posBuf.element(caseI).toVar();
+          const nv = nrmBuf.element(caseI).toVar();
+          const baseW = metaBuf.element(caseI.mul(2)).toVar();
+          const r = evalFn(pv.xyz, nv.xyz, baseW, emitterI);
+          evalOutE.element(i).assign(vec4(r.E, r.maxT));
+          evalOutD.element(i).assign(vec4(r.dirTo, 0));
+        })().compute(evalCount);
+        await renderer.computeAsync(evalKernel);
+        const rawEval = new Float32Array(
+          (await renderer.getArrayBufferAsync(evalOutE.value)).slice(0, evalCount * 16),
+        );
+        const rawDir = new Float32Array(
+          (await renderer.getArrayBufferAsync(evalOutD.value)).slice(0, evalCount * 16),
+        );
+
+        {
+          // Kind-aware relative tolerance. The sphere factor is two multiplies
+          // and a Hermite fade — 2e-3 holds easily. The box factor is 24 f32
+          // `acos` calls whose conditioning degrades as the subtended angles
+          // shrink (acos near ±1 loses ~half the significand): measured worst
+          // drift 1.51e-2 at dist 27.8 with the cone WIDE open (margin 0.35),
+          // i.e. pure float width, not a gate flip — the bound is set just
+          // above what f64-vs-f32 arithmetic actually costs, and a wrong word
+          // offset or missing term still overshoots it by orders.
+          const REL_E_SPH = 2e-3;
+          const REL_E_BOX = 2.5e-2;
+          const ABS_E = 1e-5; // near-zero channel floor
+          // The box factor's f32 noise is ABSOLUTE and DISTANCE-SCALED: each
+          // of the 24 acos calls runs on a dot → 1 as the subtended angle
+          // shrinks, and acos's conditioning there costs ~ε/sinθ per edge —
+          // sinθ ≈ diag/dist, so the noise grows LINEARLY with distance while
+          // the result shrinks as 1/dist², and a flat bar just chases the far
+          // tail (5e-5 left 60 bad, 2e-4 left 10, all farther out). Measured
+          // envelope over 76,500 evals: worst |Δ| 2.1e-4 at dist 32, 5.4e-5
+          // at dist 10, nothing anomalous under dist 9 — pure conditioning,
+          // and the same noise already ships in giLight's slot path, which IS
+          // this code. The bar: 1.5e-5·dist with a 1e-4 floor (~2× the
+          // envelope), still ~100× under any real defect at the near
+          // distances production emitters actually live at.
+          const boxAbsAt = (dist) => Math.max(1e-4, 1.5e-5 * dist);
+          let eBad = 0;
+          let dirBad = 0;
+          let tBad = 0;
+          let nonzero = 0;
+          let boxN = 0;
+          let sphN = 0;
+          let eWorst = 0;
+          let eWorstAt = "";
+          let dirWorst = 0;
+          let tWorst = 0;
+          let tWorstAt = "";
+          const eBadLines = [];
+          const eBadSeen = new Set();
+          const eFlips = new Set();
+          const eDrifts = new Set();
+          for (let i = 0; i < evalCount; i++) {
+            const ci = evalMeta[i * 2];
+            const ei = evalMeta[i * 2 + 1];
+            const c = CASES[ci];
+            const view = fixtures[c.fixture].view;
+            const Nsub = c.N ?? NSUB;
+            const em = view.emitter(ei);
+            const Ecpu = LT.emitterIrradiance(view, ei, c.P, Nsub);
+            const Egpu = [rawEval[i * 4], rawEval[i * 4 + 1], rawEval[i * 4 + 2]];
+            if (Ecpu[0] > 0 || Ecpu[1] > 0 || Ecpu[2] > 0) nonzero++;
+            if (em.kind === 1) boxN++; else sphN++;
+            const relTol = em.kind === 1 ? REL_E_BOX : REL_E_SPH;
+            const distPE = Math.hypot(c.P[0] - em.centre[0], c.P[1] - em.centre[1], c.P[2] - em.centre[2]);
+            const absTol = em.kind === 1 ? boxAbsAt(distPE) : ABS_E;
+            let chBad = false;
+            let myWorst = 0;
+            let myLine = "";
+            for (let k = 0; k < 3; k++) {
+              if (Math.abs(Ecpu[k] - Egpu[k]) <= absTol) continue;
+              const rel = relErr(Ecpu[k], Egpu[k]);
+              if (rel > myWorst) {
+                myWorst = rel;
+                myLine = `eval ${i} (case ${ci}, emitter ${ei}, kind ${em.kind}) ch ${k}: cpu ${Ecpu[k]} gpu ${Egpu[k]}`;
+              }
+              if (rel > relTol) chBad = true;
+            }
+            if (myWorst > eWorst) { eWorst = myWorst; eWorstAt = myLine; }
+            if (chBad) {
+              eBad++;
+              const pointKey = `${Math.floor(ci / 10)}:${ei}`;
+              if (myWorst > 0.5) eFlips.add(pointKey);
+              else eDrifts.add(pointKey);
+              if (!eBadSeen.has(pointKey) && eBadLines.length < 10) {
+                eBadSeen.add(pointKey);
+                // CPU-side margins for the diagnosis: how close was this eval
+                // to a discontinuous gate?
+                const dv2 = [c.P[0] - em.centre[0], c.P[1] - em.centre[1], c.P[2] - em.centre[2]];
+                const dd = Math.hypot(dv2[0], dv2[1], dv2[2]);
+                const wi2 = [dv2[0] / dd, dv2[1] / dd, dv2[2] / dd];
+                const cosTh2 = Math.max(-1, Math.min(1, dot3(em.axis, wi2)));
+                const coneCos2 = cosTh2 > em.cosThetaO ? 1
+                  : cosTh2 * em.cosThetaO + Math.sqrt(Math.max(0, 1 - cosTh2 * cosTh2)) * Math.sqrt(Math.max(0, 1 - em.cosThetaO * em.cosThetaO));
+                eBadLines.push(`${myLine} | rel ${myWorst.toExponential(2)} dist ${dd.toFixed(2)} coneMargin ${(coneCos2 - em.cosThetaE).toExponential(2)}`);
+              }
+            }
+            // dirTo + maxT — skip only the degenerate P-at-centre direction.
+            const dvec = [em.centre[0] - c.P[0], em.centre[1] - c.P[1], em.centre[2] - c.P[2]];
+            const dl = Math.hypot(dvec[0], dvec[1], dvec[2]);
+            if (dl > 1e-6) {
+              const dcpu = [dvec[0] / dl, dvec[1] / dl, dvec[2] / dl];
+              const derr = Math.max(
+                Math.abs(dcpu[0] - rawDir[i * 4]),
+                Math.abs(dcpu[1] - rawDir[i * 4 + 1]),
+                Math.abs(dcpu[2] - rawDir[i * 4 + 2]),
+              );
+              if (derr > dirWorst) dirWorst = derr;
+              if (derr > 1e-4) dirBad++;
+              const maxTgpu = rawEval[i * 4 + 3];
+              const tref = em.kind === 1
+                ? boxEnterCpu(c.P, dcpu, em.centre, em.half, em.bx, em.by, cross3(em.bx, em.by))
+                : dl - em.angularRadius;
+              const ttol = 1e-4 * Math.max(1, dl);
+              const terr = Math.abs(maxTgpu - tref);
+              if (terr / ttol > tWorst) {
+                tWorst = terr / ttol;
+                tWorstAt = `eval ${i} (case ${ci}, emitter ${ei}, kind ${em.kind}): cpu ${tref} gpu ${maxTgpu}`;
+              }
+              if (terr > ttol) tBad++;
+            }
+          }
+          check("eval coverage: both kinds and real energy in the mix",
+            nonzero > evalCount * 0.05 && boxN > 0 && sphN > 0,
+            `${nonzero} nonzero-E evals, ${boxN} box, ${sphN} sphere`);
+          check("E matches emitterIrradiance per channel (rel 2e-3 sphere / 2.5e-2 box, abs floor 1e-5)",
+            eBad === 0,
+            `${eBad} of ${evalCount} evals differ; worst rel ${eWorst.toExponential(2)}` +
+            (eBad ? ` — ${eFlips.size} unique flip pairs (rel > 0.5), ${eDrifts.size} unique drift pairs\n     ${eBadLines.join("\n     ")}` : ""));
+          check("dirTo is the unit direction P → emitter centre (1e-4)",
+            dirBad === 0, `${dirBad} bad, max |Δ| ${dirWorst.toExponential(2)}`);
+          check("maxT stops the shadow ray at the emitter surface (sphere d − R, box slab entry)",
+            tBad === 0,
+            `${tBad} bad, worst ${tWorst.toExponential(2)}× its bar` +
+            (tBad ? `\n     worst: ${tWorstAt}` : ""));
+        }
+
+        // ── THE ESTIMATOR ARM (§12.62 Unit W3) ─────────────────────────────
+        // The full NEE term the production kernel will compute, term for
+        // term on the GPU: sample, then Σ E(index)/pdf over the 1-2 slots.
+        // hasN = 1 for EVERY case because the CPU side is estimateLightTree
+        // fed the same substituted normal — identical importances, identical
+        // draw order, so the two sides pick the same emitters.
+        say("\n── THE ESTIMATOR ARM: Σ E/pdf, term for term, both sides ──");
+        const estOut = instancedArray(new Float32Array(CASES.length * 4), "vec4");
+        const estKernel = Fn(() => {
+          const i = instanceIndex.toVar();
+          const pv = posBuf.element(i).toVar();
+          const nv = nrmBuf.element(i).toVar();
+          const baseW = metaBuf.element(i.mul(2)).toVar();
+          const seed = metaBuf.element(i.mul(2).add(1)).toVar();
+          const s = sampler(pv.xyz, nv.xyz, float(1), baseW, seed);
+          const acc = vec3(0).toVar();
+          If(s.index0.greaterThanEqual(0).and(s.pdf0.greaterThan(0)), () => {
+            acc.addAssign(evalFn(pv.xyz, nv.xyz, baseW, s.index0.toUint()).E.div(s.pdf0));
+          });
+          If(s.index1.greaterThanEqual(0).and(s.pdf1.greaterThan(0)), () => {
+            acc.addAssign(evalFn(pv.xyz, nv.xyz, baseW, s.index1.toUint()).E.div(s.pdf1));
+          });
+          estOut.element(i).assign(vec4(acc, 0));
+        })().compute(CASES.length);
+        await renderer.computeAsync(estKernel);
+        const rawEst = new Float32Array(
+          (await renderer.getArrayBufferAsync(estOut.value)).slice(0, CASES.length * 16),
+        );
+        {
+          const lum = (v) => 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2];
+          // ⚠ THE FLOOR IS PDF-AWARE, AND THAT IS THE WHOLE CALIBRATION. At a
+          // CONTINUOUS zero crossing (a receiver on an emitter's horizon, a
+          // box face seen edge-on) the CPU's f64 reads exactly 0 while the
+          // GPU's f32 lands ~1e-5 above it — the eval arm's 1e-5 floor
+          // absorbs that raw drift. The estimator then divides by a pdf as
+          // small as ~0.05, amplifying the same drift to ~2e-4 (measured:
+          // the pre-calibration run's 58 "failures" were ALL cpu-exactly-zero
+          // vs gpu ≤ 1.1e-4 — float width through the division, not energy).
+          // A real defect (wrong word offset, missing term, dropped sample)
+          // moves values of order 0.1 and clears this floor by 500×.
+          const ABS_EST = 2e-4;
+          // Relative bounds inherit the eval arm's box conditioning (2.5e-2)
+          // and compound two evals per case, so channels get a hair more.
+          const REL_LUM = 2.5e-2;
+          const REL_CH = 3e-2;
+          // ONE-SIDED ZERO FLIPS get their own accounting instead of a rel
+          // comparison (rel against an exact zero is always 1.0 and prices
+          // nothing): one side sits exactly at a hard gate's OFF value (the
+          // emission cone, a slab miss) while the other side's f32 landed a
+          // hair inside — boundary-measure float width, amplified by ÷pdf.
+          // The defect this arm exists to catch — a MISSING or inverted gate
+          // — flips every affected pick, not a boundary sliver, and carries
+          // real energy. So flips PASS only as a population: ≤ 2% of cases
+          // AND ≤ 0.1% of the total CPU-side energy (§12.26.7's discipline —
+          // an energy claim wants an energy statistic).
+          const FLIP_LUM = 1e-3;
+          let lumBad = 0;
+          let chBad = 0;
+          let lumWorst = 0;
+          let chWorst = 0;
+          let worstAt = "";
+          let estNonzero = 0;
+          let floored = 0;
+          let zeroFlips = 0;
+          let flipLum = 0;
+          let totalLum = 0;
+          for (let i = 0; i < CASES.length; i++) {
+            const c = CASES[i];
+            const view = fixtures[c.fixture].view;
+            const cpuE = LT.estimateLightTree(view, c.P, c.N ?? NSUB, GPU.makeGpuRng(c.seed));
+            const gpuE = [rawEst[i * 4], rawEst[i * 4 + 1], rawEst[i * 4 + 2]];
+            // The case's own noise floor: each sample contributes its raw
+            // eval-arm floor AMPLIFIED by its 1/pdf (a fresh rng with the same
+            // seed replays the identical picks — the descent arm proved that).
+            // The 6 pre-calibration "failures" this closes were uniform ~8.5%
+            // scale-downs whose RAW drift (4e-5 on a dim box) sat under the
+            // eval arm's own bar; ÷pdf is a multiplier, so the bar must ride
+            // along. A real defect still overshoots: order-1 relative error
+            // on an order-0.1 value clears any plausible floor by 100×.
+            const picks = LT.sampleLightTree(view, c.P, c.N ?? NSUB, GPU.makeGpuRng(c.seed));
+            let caseAbs = ABS_EST;
+            for (const s of picks) {
+              if (!(s.pdf > 0)) continue;
+              const se = view.emitter(s.index);
+              const sd = Math.hypot(c.P[0] - se.centre[0], c.P[1] - se.centre[1], c.P[2] - se.centre[2]);
+              const rawFloor = se.kind === 1 ? Math.max(1e-4, 1.5e-5 * sd) : 1e-5;
+              caseAbs += rawFloor / s.pdf;
+            }
+            if (lum(cpuE) > 1e-5) estNonzero++;
+            const la = lum(cpuE);
+            const lb = lum(gpuE);
+            totalLum += la;
+            if ((la === 0 && lb > 0 && lb < FLIP_LUM) || (lb === 0 && la > 0 && la < FLIP_LUM)) {
+              zeroFlips++;
+              flipLum += Math.max(la, lb);
+              continue; // counted above; the rel machinery has nothing to price
+            }
+            if (Math.abs(la - lb) > caseAbs) {
+              const lrel = relErr(la, lb);
+              if (lrel > lumWorst) {
+                lumWorst = lrel;
+                worstAt = `case ${i} (fix ${c.fixture}, seed ${c.seed >>> 0}): cpu [${cpuE.map((v) => v.toPrecision(6)).join(",")}] gpu [${gpuE.map((v) => v.toPrecision(6)).join(",")}]`;
+              }
+              if (lrel > REL_LUM) lumBad++;
+            } else if (Math.abs(la - lb) > 1e-5) floored++;
+            for (let k = 0; k < 3; k++) {
+              if (Math.abs(cpuE[k] - gpuE[k]) <= caseAbs) continue;
+              const rel = relErr(cpuE[k], gpuE[k]);
+              if (rel > chWorst) chWorst = rel;
+              if (rel > REL_CH) chBad++;
+            }
+          }
+          check("the estimator delivers energy somewhere", estNonzero > CASES.length * 0.1,
+            `${estNonzero} of ${CASES.length} cases nonzero`);
+          check("estimator luminance agrees with estimateLightTree (rel 2.5e-2, abs floor 2e-4)",
+            lumBad === 0,
+            `${lumBad} bad, ${floored} under the pdf-aware floor, worst rel ${lumWorst.toExponential(2)}` +
+            (lumBad ? `\n     ${worstAt}` : ""));
+          check("estimator channels agree (rel 3e-2, abs floor 2e-4)",
+            chBad === 0, `${chBad} bad channels, worst rel ${chWorst.toExponential(2)}`);
+          check("zero flips are boundary-measure (≤2% of cases, ≤0.1% of energy)",
+            zeroFlips <= CASES.length * 0.02 && flipLum <= totalLum * 1e-3,
+            `${zeroFlips} flips of ${CASES.length} cases, flip energy ${flipLum.toExponential(2)} of ${totalLum.toExponential(2)} total (${(flipLum / Math.max(totalLum, 1e-12) * 100).toFixed(3)}%)`);
+        }
+
         check("no WebGPU validation errors", validationErrors.length === 0, validationErrors.join(" | "));
         say(`\n${failures ? `gi-lighttree-descent: ${failures} of ${checks} FAILED` : "gi-lighttree-descent: all cases PASS"}`);
         globalThis.__LT_DESCENT_RESULT__ = {
@@ -422,6 +745,7 @@
           failures,
           checks,
           cases: CASES.length,
+          evals: evalCount,
           fixtures: fixtures.length,
           maxPdfRel: main.maxPdfRel,
           text: out.textContent,

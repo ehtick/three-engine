@@ -783,8 +783,9 @@ export function clusterImportance(bounds, power, axis, cosThetaO, cosThetaE, P, 
   return importance > 0 ? importance : 0;
 }
 
-/** Importance of a single emitter leaf, read from its record. */
-function emitterImportance(view, id, P, N) {
+/** Importance of a single emitter leaf, read from its record. Exported since
+ * §12.70 W4b: the tile-cut rig's CPU mirror ranks with exactly this. */
+export function emitterImportance(view, id, P, N) {
   const p = view.emitterBase + id * LT_EMITTER_WORDS;
   const f = view.f32;
   const bounds = [f[p], f[p + 1], f[p + 2], f[p + 3], f[p + 4], f[p + 5]];

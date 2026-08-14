@@ -70,6 +70,7 @@ import {
   DEPOSIT_SCALE, createSrcBinStore, createSrcDepositFrame, createSrcShadeCounters,
 } from "./srcDeposit.js";
 import { createSrcHitAttribution, createSrcHitLighting, createSrcHitShader } from "./srcShade.js";
+import { createLightTreeEmitterEval, createLightTreeSampler } from "./lightTreeGpu.js";
 import { createSrcMergeFrame, formatSrcMerge } from "./srcMerge.js";
 import { createSrcSeedFrame, formatSrcSeed } from "./srcSeed.js";
 import { createSrcSecondaryFrame, formatSrcSecondary } from "./srcSecondary.js";
@@ -824,6 +825,42 @@ export function createSrcProbeSystem({
         // one exists; stratification means 1 → 4 cuts the standard error 2.61×
         // where independent draws would give 2.00×.
         neeSamples: Math.max(1, Number(globalThis.__giSrcNeeSamples) || 1),
+        // ── §12.62 W3: THE TREE NEE, BEHIND ITS BUILD-TIME HATCH ─────────
+        //
+        // `__giSrcLightTree = true` swaps [J]'s slot NEE for one descent of
+        // the W1 block (`lighting.lightTree` carries the region GISystem
+        // uploaded — the region exists BEFORE this build, §12.62 W1, so the
+        // base word is a compile-time constant; a rebuild recompiles the
+        // whole chain and re-bakes it). The block rides the occupancy `bits`
+        // tail, which the visibility marcher already binds — zero new
+        // storage bindings in [J], the entire reason W1 staged it there.
+        //
+        // Default OFF: the W3 gate (energy parity on a ≤4-emitter scene,
+        // where the tree set and the promoted set coincide, plus the flicker
+        // still floor) decides the flip, not the wiring.
+        lightTree: (() => {
+          if (globalThis.__giSrcLightTree !== true) return null;
+          const info = lighting.lightTree ?? null;
+          const words = volume.occupancyField?.bits ?? null;
+          if (!info || !words || !(info.baseWord >= 0)) return null;
+          const base = uint(info.baseWord);
+          const sampler = createLightTreeSampler(words, {
+            // The per-branch loop bound; the tree's real depth bounds the
+            // iterations actually run, so tight is free and loose is safe.
+            maxDescent: Math.max(4, (info.maxDepth ?? 8) + 2),
+          });
+          const evalAt = createLightTreeEmitterEval(words);
+          // The §12.42 rule — a number nothing prints does not exist. The W3
+          // gate asserts this line to prove the arm actually compiled.
+          console.log(
+            `[gi] src [J] NEE: light tree (base ${info.baseWord}, ` +
+            `${info.emitterCount ?? "?"} emitters, depth ${info.maxDepth ?? "?"}) — slot NEE replaced`,
+          );
+          return {
+            sample: (P, n, seed) => sampler(P, n, float(1), base, seed),
+            evalAt: (P, n, idx) => evalAt(P, n, base, idx),
+          };
+        })(),
         count: shadeCounters,
       }
     : null;
