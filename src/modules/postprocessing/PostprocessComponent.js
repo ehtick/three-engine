@@ -1,7 +1,7 @@
 import * as THREE from "three/webgpu";
 import * as TSL from "three/tsl";
 import { Component } from "../../engine/components/Component.js";
-import { EDITOR_LAYER } from "../../engine/editorLayers.js";
+import { EDITOR_LAYER, PP_OVERLAY_SEED_LAYER } from "../../engine/editorLayers.js";
 import {
   compilePostGraph,
   DEFAULT_POST_GRAPH,
@@ -9,6 +9,7 @@ import {
   postGraphSignature,
   loadSSGI,
   loadSSR,
+  loadGTAO,
   loadDenoise,
   loadTRAA,
   loadBloom,
@@ -32,6 +33,56 @@ import {
   loadMotionBlur,
   loadFSR1,
 } from "./postGraph.js";
+
+/**
+ * The value a material ACTUALLY SHADES WITH for `metalness` / `roughness`,
+ * resolved per material at shader-build time.
+ *
+ * `TSL.metalness` / `TSL.roughness` are `materialReference(...)` accessors:
+ * they read the JS SCALARS `material.metalness` / `material.roughness`. But
+ * `MeshStandardNodeMaterial.setupVariants` prefers the NODES whenever they are
+ * set — `this.metalnessNode ? float(this.metalnessNode) : materialMetalness` —
+ * and the editor's shader-graph compiler sets them on every material it
+ * builds, leaving the asset's scalars at whatever they happened to be. So the
+ * scalars describe a DIFFERENT material than the one on screen, and writing
+ * them into the matParams MRT hands SSR that different material.
+ *
+ * Not hypothetical, and not subtle in its effect: the mirror cube in the
+ * user's Sponza is graph metalness 1 / roughness 0 over asset scalars 0 / 0.7,
+ * so it arrived at SSR as a rough dielectric and the addon's `metalness <= 0`
+ * discard threw away every one of its pixels (SSRNode.js:911). A perfect
+ * mirror rendered PURE BLACK — at every distance, and at every `maxDistance`,
+ * which is what makes it read as "SSR has a range limit" rather than "SSR was
+ * told this mirror is plaster". GI hit the same disagreement on the same
+ * material and resolved it the same way (`giLight.js:1429`).
+ *
+ * An `Fn` body receives the NodeBuilder, and a shader node's properties are
+ * cached per builder, so this re-runs for each material's fragment shader.
+ * Materials with no node (anything glTF-loaded) fall through to the scalar,
+ * which for them is the value they shade with.
+ */
+function shadedMaterialParam(nodeKey, scalarAccessor) {
+  // ── BISECT HATCH (§12.66): `__ppScalarParams = true` forces the plain
+  // scalar accessor, skipping the per-material Fn resolution entirely. Exists
+  // because the black-boot forensics ranked "one shared Fn call node collapses
+  // to a single material's value under node caching" as the mechanism that
+  // turned the SSR composite bug from black-metals into a black FRAME — a
+  // boot with this hatch on arbitrates that without an engine rebuild.
+  if (globalThis.__ppScalarParams === true) return scalarAccessor.clamp(0, 1);
+  return TSL.Fn((builder) => resolveShadedParam(builder.material, nodeKey, scalarAccessor))();
+}
+
+/**
+ * The precedence rule itself, split out so it is testable without a GPU: node
+ * if the material has one, scalar accessor otherwise. Exported for
+ * `tests/post-ssr.test.mjs`.
+ */
+export function resolveShadedParam(material, nodeKey, scalarAccessor) {
+  const node = material?.[nodeKey];
+  // The MRT attachment is 8-bit UNORM, so out-of-range authored values would
+  // wrap rather than saturate.
+  return (node != null ? TSL.float(node) : scalarAccessor).clamp(0, 1);
+}
 
 function findGodraysLight(engine) {
   for (const entity of engine?.entities?.values?.() ?? []) {
@@ -141,6 +192,9 @@ export class PostprocessComponent extends Component {
     // Last compiled signature so we can skip recompiles when the graph
     // hasn't structurally changed (only hot params moved).
     this.signature = null;
+    // Last `compilePostGraph` result; kept for its `updateParams`, which
+    // pushes hot-param edits into the compiled addons without a rebuild.
+    this.compiled = null;
     this.generation = 0;
     // Unsubscribe handle for the late-camera-arrival watcher. Cleared
     // once the camera is resolved.
@@ -254,6 +308,14 @@ export class PostprocessComponent extends Component {
    * intercept the engine's render.
    */
   ownsCamera(engine) {
+    // §12.66 BISECT HATCH: `__ppForceDisabled = true` (set before boot) makes
+    // every postprocess component inert — no pipeline ownership, and
+    // #ensurePipeline below refuses to build. Exists because "remove the
+    // component after boot" is NOT a valid PP bisect: the boot-time compile
+    // wave is where a PP-armed context can poison cached pipelines (the
+    // empty-fragment-struct class), and only a boot with PP never armed
+    // separates "PP present at compile time" from "PP running now".
+    if (globalThis.__ppForceDisabled === true) return false;
     if (this.props.enabled === false) return false;
     const desired = this.#desiredRenderCamera(engine);
     if (desired !== this.renderCamera) {
@@ -305,6 +367,7 @@ export class PostprocessComponent extends Component {
   // -------------------------------------------------------------------------
 
   async #ensurePipeline() {
+    if (globalThis.__ppForceDisabled === true) return; // §12.66 bisect hatch — see ownsCamera
     if (!this.renderCamera) return;
     const engine = this.entity.engine;
     const renderer = engine?.renderer;
@@ -313,8 +376,24 @@ export class PostprocessComponent extends Component {
     const graph = this.props.graph ?? DEFAULT_POST_GRAPH;
     const signature = postGraphSignature(graph);
     // Hot-param-only edits (slider drags) leave the signature identical and
-    // don't need a rebuild; structural edits (wires, selects, etc.) do.
-    if (signature === this.signature && this.pipeline) return;
+    // don't need a rebuild; structural edits (wires, selects, etc.) do. The
+    // new values still have to reach the GPU though — `updateParams` writes
+    // them into the addons' live uniforms, which is the whole reason those
+    // params are declared `kind: "hot"`. Returning without it (what this did
+    // before) meant a slider moved nothing until some structural edit
+    // happened to force a recompile.
+    if (signature === this.signature && this.pipeline) {
+      try {
+        this.compiled?.updateParams?.(graph);
+      } catch (err) {
+        // An applier writes into addon uniforms; a three upgrade that renames
+        // one would otherwise throw out of this async method as an unhandled
+        // rejection. The pipeline itself is still valid — just stale by one
+        // edit — so warn and keep rendering.
+        console.warn(`Post-process hot params failed to apply: ${err?.message ?? err}`);
+      }
+      return;
+    }
 
     this.generation++;
     const myGen = this.generation;
@@ -334,6 +413,7 @@ export class PostprocessComponent extends Component {
     const [
       ssgi,
       ssr,
+      gtao,
       denoise,
       traa,
       bloom,
@@ -359,6 +439,7 @@ export class PostprocessComponent extends Component {
     ] = await Promise.all([
       loadSSGI(),
       loadSSR(),
+      loadGTAO(),
       loadDenoise(),
       loadTRAA(),
       loadBloom(),
@@ -450,14 +531,16 @@ export class PostprocessComponent extends Component {
       // same scene pass as color/depth so temporal reprojection aligns.
       if (needs.velocity) mrtSlots.velocity = TSL.velocity;
       // Material params for screen-space reflections: metalness in R,
-      // roughness in G. `metalness`/`roughness` are MaterialNode accessors
-      // that resolve to each material's own value during its fragment
-      // shader (defaulting to 0 / 1 for materials without the property),
-      // so the pass writes a per-pixel material buffer alongside colour.
-      // The hybrid SSR path reads it to tell metal from dielectric and to
-      // pick the reflection blur mip; without it SSR reflects everything
-      // or nothing.
-      if (needs.matParams) mrtSlots.matParams = TSL.vec4(TSL.metalness, TSL.roughness, 0, 1);
+      // roughness in G. The hybrid SSR path reads it to tell metal from
+      // dielectric and to pick the reflection blur mip.
+      if (needs.matParams) {
+        mrtSlots.matParams = TSL.vec4(
+          shadedMaterialParam("metalnessNode", TSL.metalness),
+          shadedMaterialParam("roughnessNode", TSL.roughness),
+          0,
+          1,
+        );
+      }
       // A graph that consumes only color/depth gets NO MRT at all — the
       // pass renders exactly like the plain canvas path, single attachment.
       this.scenePass.setMRT(Object.keys(mrtSlots).length > 1 ? TSL.mrt(mrtSlots) : null);
@@ -471,6 +554,89 @@ export class PostprocessComponent extends Component {
       // metalness/roughness are 0..1 scalars — 8-bit is plenty.
       const matTexture = needs.matParams ? this.scenePass.getTexture("matParams") : null;
       if (matTexture) matTexture.type = THREE.UnsignedByteType;
+      // ── EDITOR HELPER OVERLAY PASS (editor viewport only) ───────────────
+      // The scene pass strips EDITOR_LAYER so effects never see the grid or
+      // gizmos — which, before this pass existed, meant a PP-owned editor
+      // frame had NO editor aids at all ("no gizmos appear except the
+      // outline", 2026-08-13). They cannot be drawn after pipeline.render()
+      // (this file's header rule), so they render INSIDE the pipeline: a
+      // second scene pass over EDITOR_LAYER only, composited by
+      // #applyEditorHelpers with a per-pixel depth test against the scene
+      // pass. Gated on the editor's overlay registration — game builds never
+      // register one, so shipped pipelines stay byte-identical.
+      this.#disposeEditorOverlayPass();
+      if (typeof engine.viewportOverlayNode === "function") {
+        const overlayPass = TSL.pass(engine.scene, this.renderCamera, { samples: 1 });
+        const overlayLayers = new THREE.Layers();
+        overlayLayers.set(EDITOR_LAYER);
+        overlayLayers.enable(PP_OVERLAY_SEED_LAYER);
+        overlayPass.setLayers(overlayLayers);
+        // DEPTH SEED. On direct frames, helpers occlude by depth-TESTING the
+        // shared buffer — and many (collider wireframes) never WRITE depth,
+        // so no composite-side comparison can reconstruct their occlusion
+        // ("gizmos have no depth", the first live report). Instead, a
+        // fullscreen quad on a private layer renders FIRST in this pass
+        // (renderOrder −1e9) and writes the scene pass's depth into the
+        // overlay's depth attachment via depthNode; every helper material
+        // then depth-tests inside the pass exactly as it does on direct
+        // frames — depthTest:false gizmos stay always-on-top, everything
+        // else occludes per fragment. No composite heuristics.
+        const seedMat = new THREE.MeshBasicNodeMaterial();
+        seedMat.colorWrite = false;
+        seedMat.depthTest = false;
+        seedMat.depthWrite = true;
+        seedMat.vertexNode = TSL.vec4(TSL.positionGeometry.xy, 0, 1);
+        seedMat.depthNode = TSL.float(TSL.texture(this.scenePass.renderTarget.depthTexture));
+        const seedQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), seedMat);
+        seedQuad.name = "__ppOverlayDepthSeed";
+        seedQuad.frustumCulled = false;
+        seedQuad.renderOrder = -1e9;
+        seedQuad.layers.set(PP_OVERLAY_SEED_LAYER);
+        engine.scene.add(seedQuad);
+        this._overlaySeedQuad = seedQuad;
+        // Editor helpers must NEVER reach play mode ("gizmos appear in play
+        // mode", the second live report): PassNode overrides camera.layers
+        // with the pass's own set, so the game camera would see EDITOR_LAYER
+        // regardless of its mask. Gate with a live uniform (composite → 0)
+        // AND skip the render entirely while playing.
+        this._overlayLiveU = TSL.uniform(1);
+        // PassNode draws scene.background as a fullscreen pass that IGNORES
+        // camera layers (the occlusion-culling depth trap, same class) and
+        // hard-codes autoClear — patch the instance to hide the background
+        // and clear to alpha 0 so the composite can read helper coverage.
+        // Instance patch, not subclass: TSL.pass is the sanctioned
+        // constructor and this is the only pass with these needs.
+        const originalUpdateBefore = overlayPass.updateBefore.bind(overlayPass);
+        const clearColor = new THREE.Color();
+        overlayPass.updateBefore = (frame) => {
+          const playing = !!engine.playing;
+          if (this._overlayLiveU) this._overlayLiveU.value = playing ? 0 : 1;
+          if (playing) return;
+          const scene = engine.scene;
+          const renderer = engine.renderer;
+          const bg = scene.background;
+          const alpha = renderer.getClearAlpha();
+          renderer.getClearColor(clearColor);
+          const r = clearColor.r, g = clearColor.g, b = clearColor.b;
+          scene.background = null;
+          // Clear to (0,0,0,0), not just alpha 0: helpers alpha-blend onto
+          // the clear COLOR, so a white scene background would whiten every
+          // partial-alpha helper pixel in the premultiplied composite.
+          renderer.setClearColor(0x000000, 0);
+          // Liveness counter for harness probes: "is this pass actually
+          // rendering every frame" is otherwise unanswerable from outside.
+          globalThis.__ppOverlayTicks = (globalThis.__ppOverlayTicks ?? 0) + 1;
+          try {
+            originalUpdateBefore(frame);
+          } finally {
+            scene.background = bg;
+            clearColor.setRGB(r, g, b);
+            renderer.setClearColor(clearColor, alpha);
+          }
+        };
+        this.editorOverlayPass = overlayPass;
+        if (globalThis.__ppOverlayDebug) console.warn(`[pp] editorOverlayPass created (camera=${this.renderCamera?.type})`);
+      }
     }
 
     // Pull the auto-fed input sockets from the pass.
@@ -554,6 +720,7 @@ export class PostprocessComponent extends Component {
         // GI / Reflections
         ssgi,
         ssr,
+        gtao,
         denoise,
         traa,
         // Effects / Filters
@@ -585,13 +752,17 @@ export class PostprocessComponent extends Component {
         temps: this.keepaliveTemps,
       });
       if (myGen !== this.generation) return;
-      this.outputNode = compiled.output;
+      this.outputNode = this.#applyViewportOverlay(this.#applyEditorHelpers(compiled.output));
       this.signature = compiled.signature;
+      // Retained for the hot-param path in #ensurePipeline: it owns the
+      // closures that write straight into the addons' live uniforms.
+      this.compiled = compiled;
     } catch (err) {
       console.error(`Post-process graph failed to compile: ${err.message ?? err}`);
       // Drop to the raw beauty so the camera still renders something.
-      this.outputNode = beautyNode;
+      this.outputNode = this.#applyViewportOverlay(this.#applyEditorHelpers(beautyNode));
       this.signature = "__passthrough__";
+      this.compiled = null;
     }
 
     if (!this.pipeline) {
@@ -599,6 +770,95 @@ export class PostprocessComponent extends Component {
     } else {
       this.pipeline.outputNode = this.outputNode;
       this.pipeline.needsUpdate = true;
+    }
+  }
+
+  /**
+   * Composites the editor's viewport overlay (the selection outline ring)
+   * INSIDE the pipeline's output, when the host app registered one.
+   *
+   * This exists because the overlay must not draw AFTER `pipeline.render()`
+   * — a manual target swap outside the pipeline's managed frame silently
+   * corrupts the WebGPU backend's cached render state (this file's header
+   * rule; the selection outline reproduced it as a broken viewport on the
+   * first selection). The editor sets `engine.viewportOverlayNode` once at
+   * boot to `applySelectionOutlineOverlay` (src/editor/selectionOutline.js);
+   * the wrapper's node graph is STABLE across selection changes — only its
+   * mask textures' contents change — so this costs one compile per pipeline
+   * build and zero rebuilds afterwards. Game builds never register one, so
+   * shipped pipelines are byte-identical to before.
+   */
+  #applyViewportOverlay(node) {
+    const overlay = this.entity?.engine?.viewportOverlayNode;
+    if (typeof overlay !== "function") return node;
+    try {
+      return overlay(node) ?? node;
+    } catch (err) {
+      console.warn(`Viewport overlay failed to attach to the post pipeline: ${err?.message ?? err}`);
+      return node;
+    }
+  }
+
+  /**
+   * Composites the editor helper pass (grid, gizmos, light helpers — the
+   * EDITOR_LAYER content the scene pass strips) over the post output, inside
+   * the pipeline. Occlusion rules, per pixel:
+   *   - a helper that WROTE depth (grid, collider wireframes) is hidden
+   *     where the scene is nearer — the same look the direct-frame shared
+   *     depth buffer gives;
+   *   - a helper that wrote NO depth (the transform gizmo's depthTest:false
+   *     materials) always shows, exactly as on direct frames.
+   * The overlay target clears to (0,0,0,0) and helpers blend onto it, so its
+   * RGB is PREMULTIPLIED — composite with base·(1−a) + rgb, never mix()
+   * (the postprocessing black-band trap). Helper colors ride through the
+   * chain's tonemap, so they read slightly dimmer than direct frames — the
+   * same accepted trade as the selection ring.
+   */
+  #applyEditorHelpers(node) {
+    const pass = this.editorOverlayPass;
+    if (globalThis.__ppOverlayDebug) {
+      console.warn(`[pp] applyEditorHelpers: pass=${!!pass} scenePass=${!!this.scenePass} mode=${globalThis.__ppOverlayDebug}`);
+    }
+    if (!pass || !this.scenePass) return node;
+    try {
+      const helper = pass.getTextureNode();
+      const base = TSL.vec4(node);
+      // Compile-time debug taps (set the global BEFORE the pipeline builds):
+      // "raw" shows the overlay target itself, "alpha" its coverage — the
+      // one-run discriminator between "pass renders nothing" and "composite
+      // math hides it".
+      if (globalThis.__ppOverlayDebug === "raw") return TSL.vec4(helper.rgb, TSL.float(1));
+      if (globalThis.__ppOverlayDebug === "alpha") return TSL.vec4(helper.a, helper.a, helper.a, TSL.float(1));
+      // Occlusion happened INSIDE the pass (the depth-seed quad presents real
+      // scene depth for every helper material to test against — see the pass
+      // creation block), so the composite is a plain premultiplied-over, gated
+      // by the play-mode uniform. TSL naming trap for whoever edits this:
+      // comparisons are GLSL-style (`lessThanEqual`), NOT `lessThanOrEqual` —
+      // the wrong name THROWS here and the catch downgrades it to a warn.
+      const live = this._overlayLiveU ?? TSL.float(1);
+      const a = helper.a.mul(live);
+      const rgb = base.rgb.mul(TSL.float(1).sub(a)).add(helper.rgb.mul(live));
+      return TSL.vec4(rgb, base.a);
+    } catch (err) {
+      console.warn(`Editor helper overlay failed to attach: ${err?.message ?? err}`);
+      return node;
+    }
+  }
+
+  #disposeEditorOverlayPass() {
+    if (this.editorOverlayPass && typeof this.editorOverlayPass.dispose === "function") {
+      try {
+        this.editorOverlayPass.dispose();
+      } catch (err) {
+        console.warn(`PostprocessComponent: overlay pass dispose failed: ${err?.message ?? err}`);
+      }
+    }
+    this.editorOverlayPass = null;
+    if (this._overlaySeedQuad) {
+      this._overlaySeedQuad.removeFromParent();
+      this._overlaySeedQuad.geometry?.dispose?.();
+      this._overlaySeedQuad.material?.dispose?.();
+      this._overlaySeedQuad = null;
     }
   }
 
@@ -621,10 +881,13 @@ export class PostprocessComponent extends Component {
       }
     }
     this.scenePass = null;
+    this.#disposeEditorOverlayPass();
     this._passNeedsKey = null;
     this.postprocessLayers = null;
     this.scene = null;
     this.signature = null;
+    // Its appliers close over addon instances whose render targets are gone.
+    this.compiled = null;
     this.outputNode = null;
     if (this.keepaliveTemps) this.keepaliveTemps.clear();
   }

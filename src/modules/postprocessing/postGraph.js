@@ -2,11 +2,14 @@ import * as TSL from "three/tsl";
 
 // `ssgi` and `ssr` are imported lazily so a project that never wires those
 // nodes pays nothing for them AND the whole module catalog still loads when
-// the user is on a build that doesn't ship the addons (e.g. the SSRNode
-// addon in three r185 depends on `utils/RNoise.js` + `utils/SpecularHelpers.js`,
-// which are not bundled in the npm package). The first time the compiler
-// encounters one of those nodes it dynamically imports the addon and
-// memoises the resolved function for the rest of the session.
+// the user is on a build that doesn't ship the addons. The first time the
+// compiler encounters one of those nodes it dynamically imports the addon and
+// memoises the resolved function for the rest of the session; a failed import
+// resolves to null and that node compiles to a passthrough.
+//
+// (An older note here claimed SSRNode's `RNoise` / `SpecularHelpers` deps were
+// missing from the npm package. They ship — as `tsl/utils/*`, which is what
+// SSRNode's own `../utils/` resolves to from `tsl/display/`.)
 
 /**
  * Node-based post-processing graph for cameras.
@@ -137,7 +140,79 @@ export const PP_NODE_TYPES = {
       resScale("0.5"),
       bool("stochastic", "Stochastic", false),
       num("intensity", "Intensity", 1.0, { min: 0, max: 4, step: 0.05 }),
+      // How far a ray may travel, in WORLD UNITS, before the reflection is
+      // abandoned. SSRNode constructs this as `uniform(1)` (SSRNode.js:168)
+      // and we never assigned it, so every SSR node in the editor reflected
+      // exactly one metre of scene and gave up — the reach has to be set to
+      // something scene-sized to be useful. It bounds both the march and the
+      // addon's own (1 - d/maxDistance)² falloff, so it is the single knob
+      // that decides how far reflections carry.
+      num("maxDistance", "Max Distance", 20, { min: 0.1, max: 500, step: 0.1 }),
+      // Depth-crossing tolerance in view-space units: how far behind the
+      // depth buffer a ray may pass and still count as hitting that surface.
+      // Too small and rays tunnel through thin geometry (holes in the
+      // reflection); too large and far surfaces smear onto near ones. The
+      // addon floors it per-pixel at three texels of view-space width, so
+      // this acts as the upper bound.
+      num("thickness", "Thickness", 0.1, { min: 0.001, max: 5, step: 0.001 }),
+      // March density. In mirror mode this is steps per screen-space texel of
+      // ray length, so cost scales with `maxDistance` — a longer reach at the
+      // same quality is a longer loop. In stochastic mode it's a fraction of
+      // the addon's fixed 64-step budget instead.
+      num("quality", "Quality", 0.5, { min: 0.05, max: 1, step: 0.05 }),
+      // UV-space width of the fade applied as a hit approaches the screen
+      // border. Longer rays reach further off-screen, so without this the
+      // reflections of objects leaving the frame pop out at the edge.
+      num("screenEdgeFade", "Edge Fade", 0.2, { min: 0, max: 0.5, step: 0.01 }),
       bool("reflectNonMetals", "Reflect Non-metals", false),
+      // Bisects the coarse depth crossing toward the exact intersection.
+      // Compile-time constant in the addon, hence structural here. Worth its
+      // eight extra depth fetches once rays are long enough that one march
+      // step spans several texels — which, at any useful `maxDistance`, is
+      // every step.
+      bool("binaryRefine", "Refine Hits", true),
+    ],
+  },
+  gtao: {
+    label: "AO (GTAO)",
+    category: "gi",
+    inputs: [
+      { key: "color", kind: "vec4" },
+      { key: "depth", kind: "float" },
+      { key: "normal", kind: "vec3" },
+    ],
+    // `color` is the finished composite (beauty × AO) so the common case is
+    // one wire; `ao` is the bare float term for users who want it inside
+    // their own arithmetic (before a GI add, after a fog mix, etc.).
+    outputs: [
+      { key: "color", kind: "vec4" },
+      { key: "ao", kind: "float" },
+    ],
+    params: [
+      // Half res by default: AO is low-frequency, the built-in denoise blurs
+      // anyway, and full-res horizon marching is exactly the "post doubles my
+      // frame time" cost class. Same rationale as SSGI/SSR.
+      resScale("0.5"),
+      // ⚠ The addon constructs radius as `uniform(0.25)` — a quarter of a
+      // WORLD UNIT, tuned for three's demo scenes (trap #1 in this file's
+      // ledger: addon defaults are not scene-scale). 0.5 m reads as contact
+      // shading at door/crate scale in a metre-scaled scene.
+      num("radius", "Radius", 0.5, { min: 0.05, max: 4, step: 0.05 }),
+      // The addon's `scale` uniform — the exponent-ish strength of the
+      // occlusion term. Its own default.
+      num("scale", "Intensity", 1, { min: 0, max: 4, step: 0.05 }),
+      // View-space depth band a sample may sit behind the depth buffer and
+      // still occlude — the same knob SSR calls thickness.
+      num("thickness", "Thickness", 1, { min: 0.01, max: 10, step: 0.01 }),
+      num("distanceExponent", "Distance Exp", 1, { min: 0.5, max: 4, step: 0.1 }),
+      num("distanceFallOff", "Distance Falloff", 1, { min: 0, max: 1, step: 0.01 }),
+      // ≥30 switches the addon from 3 to 5 horizon directions (GTAONode's
+      // DIRECTIONS select) — 16 is its own default.
+      num("samples", "Samples", 16, { min: 4, max: 64, step: 1 }),
+      // The raw pass shimmers BY CONSTRUCTION — GTAO rotates its sample
+      // pattern through 6 temporal frames — so the denoise is on by default
+      // and structural (it changes which passes exist).
+      bool("denoise", "Denoise", true),
     ],
   },
   denoise: {
@@ -691,6 +766,7 @@ const _lazyResolvers = new Map(); // key -> { promise, reject }
 const _addonLoaders = {
   ssgi: () => import("three/addons/tsl/display/SSGINode.js"),
   ssr: () => import("three/addons/tsl/display/SSRNode.js"),
+  gtao: () => import("three/addons/tsl/display/GTAONode.js"),
   denoise: () => import("three/addons/tsl/display/DenoiseNode.js"),
   traa: () => import("three/addons/tsl/display/TRAANode.js"),
   bloom: () => import("three/addons/tsl/display/BloomNode.js"),
@@ -756,6 +832,9 @@ export function loadSSGI() {
 }
 export function loadSSR() {
   return lazyLoad("ssr", "ssr");
+}
+export function loadGTAO() {
+  return lazyLoad("gtao", "ao");
 }
 // Poisson-Gaussian denoise (Khademi et al. WACV 2021). Bundled in r185
 // alongside the optional SSGI/SSR addons; only depends on the SimplexNoise
@@ -880,17 +959,21 @@ function buildNode(type, props, ins, ctx) {
       // plain JS boolean (SSGINode.js:193) and is assigned directly —
       // setting its `.value` would create a new property and the addon
       // would never see the change.
-      ssgiNode.sliceCount.value = P.sliceCount;
-      ssgiNode.stepCount.value = P.stepCount;
-      ssgiNode.radius.value = P.radius;
-      ssgiNode.expFactor.value = P.expFactor;
-      ssgiNode.thickness.value = P.thickness;
-      ssgiNode.aoIntensity.value = P.aoIntensity;
-      ssgiNode.giIntensity.value = P.giIntensity;
-      ssgiNode.backfaceLighting.value = P.backfaceLighting;
-      ssgiNode.useLinearThickness.value = P.useLinearThickness;
-      ssgiNode.useScreenSpaceSampling.value = P.useScreenSpaceSampling;
-      ssgiNode.useTemporalFiltering = P.useTemporalFiltering;
+      const applyHot = (Q) => {
+        ssgiNode.sliceCount.value = Q.sliceCount;
+        ssgiNode.stepCount.value = Q.stepCount;
+        ssgiNode.radius.value = Q.radius;
+        ssgiNode.expFactor.value = Q.expFactor;
+        ssgiNode.thickness.value = Q.thickness;
+        ssgiNode.aoIntensity.value = Q.aoIntensity;
+        ssgiNode.giIntensity.value = Q.giIntensity;
+        ssgiNode.backfaceLighting.value = Q.backfaceLighting;
+        ssgiNode.useLinearThickness.value = Q.useLinearThickness;
+        ssgiNode.useScreenSpaceSampling.value = Q.useScreenSpaceSampling;
+        ssgiNode.useTemporalFiltering = Q.useTemporalFiltering;
+      };
+      applyHot(P);
+      ctx.registerHot?.(applyHot);
       // SSGINode has no resolutionScale property (unlike SSRNode), but its
       // updateBefore path sizes the GI render target by calling
       // `this.setSize(drawingBufferWidth, drawingBufferHeight)` every
@@ -979,18 +1062,99 @@ function buildNode(type, props, ins, ctx) {
         gi: giNode.rgb ?? TSL.vec3(0),
       };
     }
-    case "ssr": {
+    case "gtao": {
       const beauty = ins.get("color") ?? TSL.vec4(0);
+      const depth = ins.get("depth") ?? TSL.float(0);
+      // Null lets the addon reconstruct normals from depth in-shader — a
+      // placeholder vec3 would throw in sampleNormal (the SSGI note above).
+      const normal = ins.get("normal") ?? null;
+      const fn = ctx.gtao;
+      if (typeof fn !== "function") {
+        console.warn("AO node: GTAO addon not loaded — emitting beauty passthrough");
+        return { color: beauty, ao: TSL.float(1) };
+      }
+      const aoPass = fn(depth, normal, ctx.camera);
+      // Plain JS property read in the addon's setSize (like SSRNode): the AO
+      // target shrinks while the composite samples it back at full res.
+      aoPass.resolutionScale = resolutionScale;
+      const applyHot = (Q) => {
+        aoPass.radius.value = Q.radius;
+        aoPass.scale.value = Q.scale;
+        aoPass.thickness.value = Q.thickness;
+        aoPass.distanceExponent.value = Q.distanceExponent;
+        aoPass.distanceFallOff.value = Q.distanceFallOff;
+        aoPass.samples.value = Q.samples;
+      };
+      applyHot(P);
+      ctx.registerHot?.(applyHot);
+      // Same defensive anchor as SSGI: a swizzle-folded `.r` access can drop
+      // the offscreen pass from three's reference walk.
+      if (ctx.temps && typeof ctx.temps.add === "function") ctx.temps.add(aoPass);
+      let aoTex = aoPass.getTextureNode?.();
+      if (!aoTex) {
+        console.warn("AO node: getTextureNode() missing — emitting beauty passthrough");
+        return { color: beauty, ao: TSL.float(1) };
+      }
+      // ⚠ THE DENOISE STAGE IS DISABLED — the param is accepted and ignored.
+      // GTAO's sample pattern rotates through 6 temporal frames, so the raw
+      // texture shimmers mildly; the addon library's example denoises before
+      // compositing and this builder tried twice to do the same:
+      //   1. INLINE (`ctx.denoise(aoTex, depth, normal, camera)`): the chain
+      //      lands inside the editor-overlay conditional and three hoists the
+      //      addon's in-Loop textureSample out of the loop — WGSL that
+      //      references the loop var outside it ("unresolved value 'i'").
+      //   2. RTT-WRAPPED (`convertToTexture(...)`): the chain shares depth/
+      //      normal nodes with the main composite, and compiling the same
+      //      subgraph under a second NodeBuilder mis-resolves a shared node —
+      //      the user's editor threw "cannot index into expression of type
+      //      'mat4x4<f32>'" with `cameraProjectionMatrix` sitting where a
+      //      TEXEL belongs (fragment_RTT, 2026-08-14).
+      // The correct isolation is a REAL internal render-target pass with
+      // fresh texture nodes (what GTAONode does for its own AO pass) — filed,
+      // not improvised a third time. Raw half-res AO multiplied onto beauty
+      // is correct and mildly noisy, which beats broken.
+      if (P.denoise && typeof ctx.denoise === "function") {
+        console.warn("AO node: denoise stage is temporarily disabled (see builder comment) — raw GTAO output in use");
+      }
+      const ao = aoTex.r;
+      // Multiplying the FINISHED frame darkens direct light and specular too —
+      // the standard post-AO approximation. The correct split needs a diffuse
+      // MRT this pass doesn't plumb; the ssgi builder documents the same
+      // substitution and the same reason.
+      return {
+        color: TSL.vec4(beauty.rgb.mul(ao), beauty.a),
+        ao,
+      };
+    }
+    case "ssr": {
+      const beautyIn = ins.get("color") ?? TSL.vec4(0);
       const depth = ins.get("depth") ?? TSL.float(0);
       const normal = ins.get("normal") ?? null;
       const fn = ctx.ssr;
       if (typeof fn !== "function") {
         console.warn("SSR node: addon not loaded — emitting beauty passthrough");
-        return beauty;
+        return beautyIn;
       }
+      // SSR SAMPLES its color input at arbitrary hit UVs (`colorNode.sample`),
+      // so it needs a texture-backed node. Straight from Input that is the
+      // scene pass texture; downstream of an arithmetic node (gtao's
+      // composite, a grade chain) it is a computed vec4 and `.sample` throws
+      // at build. Wrap only when needed — the RTT pass this buys is exactly
+      // the price of sampling a computed image, not a tax on the common case.
+      const beauty = typeof beautyIn.sample === "function"
+        ? beautyIn
+        : TSL.convertToTexture(beautyIn);
       const ssrNode = fn(beauty, depth, normal, {
+        // Without this the addon infers the camera from `colorNode.passNode`
+        // and throws "No camera found" outright — which it does the moment
+        // anything sits between the Input node and SSR, since only the raw
+        // scene-pass texture carries a `passNode`.
+        camera: ctx.camera,
         stochastic: P.stochastic,
         reflectNonMetals: P.reflectNonMetals,
+        // Compile-time constant in the addon (it re-bakes the fragment Fn),
+        // so it travels as a construction option, not a uniform.
+        binaryRefine: P.binaryRefine,
         // Per-pixel material params from the scene-pass MRT (null on builds
         // without the slot — the addon then treats surfaces as smooth
         // non-metal). With these wired, SSR reflects metals correctly and
@@ -1002,28 +1166,64 @@ function buildNode(type, props, ins, ctx) {
       // setSize (SSRNode.js:652) — the ray-march target shrinks while the
       // composite stays full res.
       ssrNode.resolutionScale = resolutionScale;
+      // Ray reach and march tuning. These are all UniformNodes on the addon,
+      // so they update in place without a pipeline rebuild — see registerHot.
+      // `maxDistance` is the important one: the addon defaults it to ONE
+      // WORLD UNIT and we never assigned it, so reflections died a metre out.
+      const applyHot = (Q) => {
+        ssrNode.maxDistance.value = Q.maxDistance;
+        ssrNode.thickness.value = Q.thickness;
+        ssrNode.quality.value = Q.quality;
+        ssrNode.screenEdgeFade.value = Q.screenEdgeFade;
+        ssrNode.intensity.value = Q.intensity;
+      };
+      applyHot(P);
+      ctx.registerHot?.(applyHot);
       // Hybrid composite (SSR on-screen + GI voxel-cone fallback):
       //  - The GI specular cone is already folded into `beauty` (in-material),
       //    so a metallic surface's beauty ≈ its reflection. That is the
-      //    off-screen fallback.
-      //  - SSR (blur mode) writes vec4(0) on a screen-space miss, so its alpha
-      //    (hit distance) is a clean miss mask: `.a > 0` = on-screen hit.
-      //  - On a hit we mix the beauty toward the sharp SSR by the surface's
-      //    reflectivity (metalness). Metal (weight→1) swaps its blurry voxel
-      //    reflection for the sharp SSR; on a miss the weight is 0 so the voxel
-      //    cone in beauty shows through. Non-metals keep beauty (SSR blur mode
-      //    already weights its output by metalness, so this only ever *reveals*
-      //    a reflection where one belongs — it never darkens a dielectric the
-      //    way the old flat `mix(beauty, ssr, intensity)` did).
-      const hitMask = ssrNode.a.greaterThan(0);
-      const reflectivity = ctx.metalnessNode != null
-        ? TSL.float(ctx.metalnessNode)
-        : TSL.float(1);
-      const weight = hitMask.select(
-        reflectivity.mul(TSL.float(P.intensity)).clamp(0, 1),
-        TSL.float(0),
-      );
-      return TSL.mix(beauty, TSL.vec4(ssrNode.rgb, beauty.a), weight);
+      //    off-screen fallback, and everything SSR fails to find must land
+      //    back on it.
+      //  - The addon hands us a PREMULTIPLIED contribution: in mirror mode
+      //    `reflection × metalness × (1 - d/maxDistance)² × fresnel × intensity`
+      //    (SSRNode.js:1237-1245). So a hit near the range limit is a *black*
+      //    sample, not an absent one.
+      //  - That is what made reflections turn black instead of fading: the old
+      //    composite mixed `beauty → ssr` on a binary `alpha > 0` hit mask, so
+      //    those attenuated-to-zero samples pulled the surface to black over
+      //    exactly the band where the fallback should have been taking over.
+      //
+      // Fix: ADD rather than mix — `ssr.rgb` already carries every factor in
+      // `k`, so mixing applies them twice — and ramp `k` down over range so
+      // that as the sample fades to zero the weight does too and `beauty`
+      // comes back.
+      //
+      // ── PURE PREMULTIPLIED ADD — NO DISPLACEMENT TERM. (2026-08-14) ──────
+      //
+      // A previous revision displaced beauty by
+      // `k = metalness × intensity × (1 − a/maxDistance)²` before adding the
+      // sample, reasoning that the ramp keeps `k` low. That reasoning was
+      // wrong ON THE OTHER FACTOR: the addon's returned rgb is ALSO
+      // premultiplied by `fresnelCoe = (dot(I,R)+1)/2` (≈0 at normal
+      // incidence), its perpendicular-distance attenuation and its luminance
+      // clamp — none of which `k` modelled. Wherever those zeroed the sample
+      // while the ramp kept `k` high (a near-field self-hit under
+      // maxDistance 100 gives a≈0 ⇒ ramp≈1 ⇒ k→metalness), the composite
+      // returned `beauty×(1−k) + ~0` — the black hole the old comment said
+      // could not happen. On the user's saved Sponza graph this blacked the
+      // ENTIRE fresh-boot frame to a ×0.001 ghost (see plan §12.66; the
+      // frame-wide reach came from the matParams MRT resolving metalness ≈1
+      // everywhere, but any honest metalness still blacks every metal).
+      //
+      // So: ADD, full stop — the module's own hard-won rule (a premultiplied
+      // output must be ADDED, not mixed; the addon's factors already weight
+      // the sample, and any second weight applied to BEAUTY displaces energy
+      // the sample does not return). Cost, accepted and bounded: a strong
+      // metal keeps its raster env/GI reflection UNDER the screen-space one
+      // (slightly hot), which is the failure direction that degrades, not the
+      // one that destroys. `intensity` rides inside the addon's premultiplied
+      // rgb, so 0 still means "SSR off, beauty intact".
+      return TSL.vec4(beauty.rgb.add(ssrNode.rgb), beauty.a);
     }
     case "denoise": {
       const beauty = ins.get("color") ?? TSL.vec4(0);
@@ -1049,10 +1249,21 @@ function buildNode(type, props, ins, ctx) {
       // on the addon. Mutating `.value` (rather than replacing the
       // UniformNode) matches three's documented public API and keeps
       // the addon's internal references intact.
-      denoiseNode.radius.value = P.radius;
-      denoiseNode.lumaPhi.value = P.lumaPhi;
-      denoiseNode.depthPhi.value = P.depthPhi;
-      denoiseNode.normalPhi.value = P.normalPhi;
+      const applyHot = (Q) => {
+        denoiseNode.radius.value = Q.radius;
+        denoiseNode.lumaPhi.value = Q.lumaPhi;
+        denoiseNode.depthPhi.value = Q.depthPhi;
+        denoiseNode.normalPhi.value = Q.normalPhi;
+      };
+      applyHot(P);
+      ctx.registerHot?.(applyHot);
+      // Returned INLINE, as it always was. An RTT wrap (`convertToTexture`)
+      // was tried here on 2026-08-14 and REVERTED the same day: compiling the
+      // chain's shared depth/normal subgraph under a second NodeBuilder
+      // mis-resolves shared nodes (the gtao builder's comment carries the
+      // exact WGSL failure). Inline it still risks the loop-hoist trap under
+      // the editor-overlay conditional — the real fix for both is an internal
+      // render-target pass with fresh texture nodes; filed.
       return denoiseNode;
     }
     case "traa": {
@@ -1277,9 +1488,13 @@ function buildNode(type, props, ins, ctx) {
       // Pass numbers so BloomNode creates UniformNodes; passing TSL.float()
       // would bake the values into ConstNodes and make the controls inert.
       const node = fn(color, P.strength, P.radius, P.threshold);
-      if (node.strength?.value !== undefined) node.strength.value = P.strength;
-      if (node.radius?.value !== undefined) node.radius.value = P.radius;
-      if (node.threshold?.value !== undefined) node.threshold.value = P.threshold;
+      const applyHot = (Q) => {
+        if (node.strength?.value !== undefined) node.strength.value = Q.strength;
+        if (node.radius?.value !== undefined) node.radius.value = Q.radius;
+        if (node.threshold?.value !== undefined) node.threshold.value = Q.threshold;
+      };
+      applyHot(P);
+      ctx.registerHot?.(applyHot);
       node.setResolutionScale?.(resolutionScale);
       // BloomNode returns only the blurred contribution. Composite it over
       // the original color so the scene remains sharp outside the glow.
@@ -1295,7 +1510,11 @@ function buildNode(type, props, ins, ctx) {
       // GodraysNode exposes `density` as a `.value` uniform. Its light
       // source is resolved from the scene's enabled shadow-casting lights.
       const node = fn(depth, ctx.camera, light);
-      if (node.density?.value !== undefined) node.density.value = P.density;
+      const applyHot = (Q) => {
+        if (node.density?.value !== undefined) node.density.value = Q.density;
+      };
+      applyHot(P);
+      ctx.registerHot?.(applyHot);
       // Plain JS property, read by GodraysNode.setSize (GodraysNode.js:258).
       node.resolutionScale = resolutionScale;
       if (ctx.temps?.add) ctx.temps.add(node);
@@ -1361,8 +1580,12 @@ function buildNode(type, props, ins, ctx) {
       // in place, then return the node (no offscreen pass; can fold
       // into the output shader).
       const node = fn(color, P.amount, P.angle);
-      if (node.amount?.value !== undefined) node.amount.value = P.amount;
-      if (node.angle?.value !== undefined) node.angle.value = P.angle;
+      const applyHot = (Q) => {
+        if (node.amount?.value !== undefined) node.amount.value = Q.amount;
+        if (node.angle?.value !== undefined) node.angle.value = Q.angle;
+      };
+      applyHot(P);
+      ctx.registerHot?.(applyHot);
       return node;
     }
     case "sharpen": {
@@ -1407,8 +1630,12 @@ function buildNode(type, props, ins, ctx) {
       if (typeof fn !== "function") return color;
       // DotScreenNode stores angle/scale as `.value` uniforms.
       const node = fn(color, P.angle, P.scale);
-      if (node.angle?.value !== undefined) node.angle.value = P.angle;
-      if (node.scale?.value !== undefined) node.scale.value = P.scale;
+      const applyHot = (Q) => {
+        if (node.angle?.value !== undefined) node.angle.value = Q.angle;
+        if (node.scale?.value !== undefined) node.scale.value = Q.scale;
+      };
+      applyHot(P);
+      ctx.registerHot?.(applyHot);
       return node;
     }
     case "lut3D": {
@@ -1502,6 +1729,29 @@ export function compilePostGraph(graph, ctx) {
   const built = new Map(); // nodeId -> Map<outputKey, tslNode>
   const visiting = new Set();
 
+  // Hot params (`kind: "hot"`) are meant to be UniformNodes on the addon
+  // instance a builder creates, so that a slider drag can push a new value
+  // into the live shader instead of rebuilding the pipeline and every
+  // offscreen render target behind it. A builder opts in by handing us an
+  // applier; `updateParams` replays the edited graph's props through them.
+  // Builders that bake their numbers into constant TSL (the arithmetic and
+  // tonemap families, DoF, sharpen…) don't register, and keep needing the
+  // signature rebuild they already get.
+  const hotAppliers = new Map(); // nodeId -> (props) => void
+  let buildingNodeId = null;
+  const buildCtx = {
+    ...ctx,
+    registerHot(apply) {
+      if (buildingNodeId != null) hotAppliers.set(buildingNodeId, apply);
+    },
+  };
+  const updateParams = (nextGraph) => {
+    for (const n of nextGraph?.nodes ?? []) {
+      const apply = hotAppliers.get(n.id);
+      if (apply) apply({ ...nodeDefaults(n.type), ...n.props });
+    }
+  };
+
   function inputValue(nodeId, handleKey) {
     const edge = incoming.get(nodeId)?.get(handleKey);
     if (!edge) return null;
@@ -1521,7 +1771,11 @@ export function compilePostGraph(graph, ctx) {
       const v = inputValue(nodeId, spec.key);
       if (v != null) ins.set(spec.key, v);
     }
-    const result = buildNode(node.type, node.props, ins, ctx);
+    // `ins` are fully resolved above, so no builder runs re-entrantly here —
+    // the id is unambiguous for the duration of this one buildNode call.
+    buildingNodeId = nodeId;
+    const result = buildNode(node.type, node.props, ins, buildCtx);
+    buildingNodeId = null;
     visiting.delete(nodeId);
 
     let outMap;
@@ -1595,13 +1849,13 @@ export function compilePostGraph(graph, ctx) {
     return {
       output: ctx.beautyNode ?? TSL.vec4(0, 0, 0, 1),
       signature: "__passthrough__",
-      updateParams: () => {},
+      updateParams,
     };
   }
   return {
     output: result,
     signature: postGraphSignature(graph),
-    updateParams: () => {},
+    updateParams,
   };
 }
 
