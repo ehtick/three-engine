@@ -481,6 +481,9 @@ export function createSrcProbeSystem({
   // and the TDZ ReferenceError silently cost the whole SRC build (the cost
   // probe read "1 kernels", 4.7% lit — a black scene wearing a probe failure).
   let restFactor = 1;
+  /** §12.74: when the α-ramp motion signal last STARTED being continuously
+   *  significant. 0 = not currently sustained. See the root-relax block. */
+  let motionSustainSince = 0;
   /** When this system was built — the rest cadence's boot hold reads it. */
   const buildAt = performance.now();
   // ── THE PER-PROBE RAY CAP (srcConfig's `probeRayCap`, §12.32.1 option 1) ──
@@ -1445,7 +1448,58 @@ export function createSrcProbeSystem({
         strideU.value = rayStride;
         publishTransport();
       }
-      const rootS = 1 + (Math.max(1, rayStride) - 1) * (1 - tr);
+      // ── §12.74: A LIGHT THAT KEEPS MOVING RELAXES THE ROOT TOO ───────────
+      //
+      // The root above relaxes only while `tr > 0` — GISystem's light-event
+      // window, which §12.46 made RISING-EDGE precisely so a continuously
+      // moving light could not hold it open. That was the right call for what
+      // the window ALSO does (an open window lifts the per-probe ray cap to
+      // OFF: a 3.8× deposit swing, the "gpu time constantly ballooning"
+      // report), but the two effects were bundled onto one signal, so the
+      // CHEAP half went with the expensive one. The consequence is the user's
+      // 2026-08-15 report — "any light that moves, temporal is just too slow
+      // to keep up, it feels very unresponsive": with the window shut, α is
+      // spread over a whole refresh interval by the stride root, so at stride
+      // ~9 and 30 fps a moving light's field settles with t90 ≈ 7 s.
+      //
+      // So the ROOT (free — one uniform, no extra rays) now also relaxes with
+      // SUSTAINED motion, while the CAP (expensive) keeps reading `tr` alone
+      // and stays capped. History that is being continuously invalidated is
+      // not evidence worth preserving.
+      //
+      // ⚠ SUSTAINED, not instantaneous, and this is the whole safety argument:
+      // §12.43's first draft derived the root from α directly and TRACK_AB
+      // refuted it — a spurious one-frame spike became a burst of relaxed-root
+      // fast decay and the still controls read 21.2 vs 0.92 rev/px ("water
+      // caustics on a parked floor"). A spike cannot survive MOTION_SUSTAIN_MS
+      // of continuous above-threshold motion, and a light that genuinely keeps
+      // moving trivially can. `__giSrcMotionRoot = false` is the A/B arm.
+      // ⚠ AND IT IS CAPPED BELOW 1 (2026-08-15, the same evening's second
+      // report: "now it seems we have our flicker back"). Relaxing the root
+      // ALL the way spends the stride's evidence preservation entirely, and at
+      // a capped ray budget that is variance — the noise the root existed to
+      // shield. 0.7 keeps a third of the preservation: at stride 9 the field's
+      // t90 goes ~7 s → ~2.5 s rather than 0.8 s, and §12.65's screen filter
+      // (whose weight now has a floor under exactly this state, GISystem) eats
+      // what is left. `__giSrcMotionRoot` takes a NUMBER to pin the relax
+      // itself — the live dial for this trade — or `false` to opt out.
+      const MOTION_SUSTAIN_MS = 250;
+      const MOTION_ROOT_ON = 0.15;
+      const MOTION_ROOT_MAX = 0.7;
+      if (mLight >= MOTION_ROOT_ON) {
+        if (!motionSustainSince) motionSustainSince = nowMs;
+      } else {
+        motionSustainSince = 0;
+      }
+      const rootPin = Number(globalThis.__giSrcMotionRoot);
+      const sustained = globalThis.__giSrcMotionRoot === false || !motionSustainSince
+        || nowMs - motionSustainSince < MOTION_SUSTAIN_MS
+        ? 0
+        : (Number.isFinite(rootPin)
+          ? Math.min(1, Math.max(0, rootPin))
+          : Math.min(MOTION_ROOT_MAX, mLight));
+      globalThis.__giSrcMotionRootLive = sustained;
+      const rootS = 1 + (Math.max(1, rayStride) - 1) * (1 - Math.max(tr, sustained));
       const keep = (1 - alpha) ** (1 / rootS);
       if (keepU.value !== keep) keepU.value = keep;
       // The compensation lift rides the same α, published for the same

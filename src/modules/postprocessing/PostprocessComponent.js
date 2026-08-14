@@ -84,6 +84,40 @@ export function resolveShadedParam(material, nodeKey, scalarAccessor) {
   return (node != null ? TSL.float(node) : scalarAccessor).clamp(0, 1);
 }
 
+/**
+ * The scene's environment, IF it is the shape SSRNode's stochastic path can
+ * sample: an equirectangular panorama with CPU-side pixels.
+ *
+ * `SSRNode.setEnvMap` builds importance-sampling CDF tables on the CPU from
+ * `image.data`, and says so in its own warning — "PMREM cubemaps and
+ * `scene.environment` are not supported". Ours usually IS supported, because
+ * `environmentAsset.js` assigns the raw HDRLoader/EXRLoader DataTexture to
+ * `scene.environment` and lets three PMREM it internally at render time. A
+ * `.cubemap` (six face images) is genuinely the unsupported shape, and returns
+ * null here so the SSR node degrades to mirror mode with its warning instead
+ * of throwing during the shader build.
+ */
+function ssrEnvironmentOf(scene) {
+  const env = scene?.environment;
+  if (!env?.isTexture || env.isCubeTexture) return null;
+  if (env.mapping !== THREE.EquirectangularReflectionMapping) return null;
+  return ArrayBuffer.isView(env.image?.data) ? env : null;
+}
+
+/**
+ * The BASE colour a material shades with — same precedence rule as
+ * `shadedMaterialParam`, in three channels, for the metal F0 tint written into
+ * the matParams MRT. `colorNode` may be a vec3 or a vec4 (a texture straight
+ * off a graph output), so it is narrowed to rgb.
+ */
+function shadedMaterialColor() {
+  if (globalThis.__ppScalarParams === true) return TSL.vec3(TSL.materialColor);
+  return TSL.Fn((builder) => {
+    const node = builder.material?.colorNode;
+    return TSL.vec3(node != null ? TSL.vec4(node).rgb : TSL.materialColor).clamp(0, 1);
+  })();
+}
+
 function findGodraysLight(engine) {
   for (const entity of engine?.entities?.values?.() ?? []) {
     const light = entity.getComponent?.("light")?.light;
@@ -375,6 +409,16 @@ export class PostprocessComponent extends Component {
 
     const graph = this.props.graph ?? DEFAULT_POST_GRAPH;
     const signature = postGraphSignature(graph);
+    // ── THE SSR ENVIRONMENT IS STRUCTURAL ───────────────────────────────────
+    // SSRNode's stochastic path bakes `sampleEnvReflection` into its fragment
+    // Fn and dereferences the importance-sampled environment with no null
+    // guard, so whether an env map exists decides which shader gets built —
+    // not a uniform. Swapping the scene's HDRI therefore has to rebuild, and a
+    // scene that gains its first HDRI is what turns Stochastic from "warns and
+    // degrades" into the real path. Identity, not equality: the same texture
+    // re-applied by a settings re-apply must not churn pipelines.
+    const ssrEnvironment = ssrEnvironmentOf(engine.scene);
+    const envKey = ssrEnvironment?.uuid ?? "";
     // Hot-param-only edits (slider drags) leave the signature identical and
     // don't need a rebuild; structural edits (wires, selects, etc.) do. The
     // new values still have to reach the GPU though — `updateParams` writes
@@ -382,7 +426,7 @@ export class PostprocessComponent extends Component {
     // params are declared `kind: "hot"`. Returning without it (what this did
     // before) meant a slider moved nothing until some structural edit
     // happened to force a recompile.
-    if (signature === this.signature && this.pipeline) {
+    if (signature === this.signature && envKey === this._ssrEnvKey && this.pipeline) {
       try {
         this.compiled?.updateParams?.(graph);
       } catch (err) {
@@ -534,11 +578,34 @@ export class PostprocessComponent extends Component {
       // roughness in G. The hybrid SSR path reads it to tell metal from
       // dielectric and to pick the reflection blur mip.
       if (needs.matParams) {
+        // ── B/A CARRY THE METAL'S F0 TINT, AS CHROMA (2026-08-15) ──────────
+        //
+        // A metal reflects through its own base colour — that is the whole
+        // difference between gold and chrome — but SSRNode's mirror path
+        // weights its sample by `vec3(metalness)` and nothing else
+        // (SSRNode.js:930-932; only the STOCHASTIC branch builds an f0 from
+        // albedo). So gold thread came back WHITE: the user's banner
+        // embroidery read as polished chrome next to Blender's gold.
+        //
+        // The tint rides the two spare channels of the attachment that is
+        // already here, rather than a `diffuse` MRT: an extra full-screen
+        // attachment is written by every material in the scene pass, and this
+        // frame is already per-pixel bound. Chroma is scale-invariant
+        // (`r/(r+g+b)`), so reconstructing with `rgb / max(rgb)` returns the
+        // ORIGINAL ratios exactly for any colour whose brightest channel is 1
+        // — true of gold, copper and brass F0. Darker metals brighten a
+        // little; the alternative was a wrong hue on all of them.
+        //
+        // ⚠ NOT `diffuseColor`: after `setupVariants` that is already
+        // multiplied by (1 − metalness), i.e. BLACK for exactly the pixels
+        // this is for. The base colour before the split is what F0 is.
+        const base = shadedMaterialColor();
+        const sum = base.r.add(base.g).add(base.b).max(1e-4);
         mrtSlots.matParams = TSL.vec4(
           shadedMaterialParam("metalnessNode", TSL.metalness),
           shadedMaterialParam("roughnessNode", TSL.roughness),
-          0,
-          1,
+          base.r.div(sum),
+          base.g.div(sum),
         );
       }
       // A graph that consumes only color/depth gets NO MRT at all — the
@@ -685,11 +752,21 @@ export class PostprocessComponent extends Component {
     // then treats surfaces with its own null-node defaults.
     let metalnessNode = null;
     let roughnessNode = null;
+    let metalTintNode = null;
     try {
       if (needs.matParams) {
         const matTex = this.scenePass.getTextureNode("matParams");
         metalnessNode = TSL.sample((uv) => matTex.sample(uv).r);
         roughnessNode = TSL.sample((uv) => matTex.sample(uv).g);
+        // B/A hold the base colour's chroma (see the MRT slot above). Rebuild
+        // the third component and renormalize by the brightest channel — that
+        // inverts the projection exactly for an F0 whose max channel is 1.
+        metalTintNode = TSL.sample((uv) => {
+          const s = matTex.sample(uv);
+          const b = s.b.add(s.a).oneMinus().max(0);
+          const rgb = TSL.vec3(s.b, s.a, b);
+          return rgb.div(rgb.r.max(rgb.g).max(rgb.b).max(1e-3));
+        });
       }
     } catch (err) {
       console.warn(
@@ -717,6 +794,8 @@ export class PostprocessComponent extends Component {
           (engine.settings?.renderer?.samples ?? 4) > 1,
         metalnessNode,
         roughnessNode,
+        metalTintNode,
+        ssrEnvironment,
         // GI / Reflections
         ssgi,
         ssr,
@@ -754,6 +833,8 @@ export class PostprocessComponent extends Component {
       if (myGen !== this.generation) return;
       this.outputNode = this.#applyViewportOverlay(this.#applyEditorHelpers(compiled.output));
       this.signature = compiled.signature;
+      // Paired with the signature: the env decides which SSR shader was built.
+      this._ssrEnvKey = envKey;
       // Retained for the hot-param path in #ensurePipeline: it owns the
       // closures that write straight into the addons' live uniforms.
       this.compiled = compiled;
@@ -886,6 +967,7 @@ export class PostprocessComponent extends Component {
     this.postprocessLayers = null;
     this.scene = null;
     this.signature = null;
+    this._ssrEnvKey = null;
     // Its appliers close over addon instances whose render targets are gone.
     this.compiled = null;
     this.outputNode = null;

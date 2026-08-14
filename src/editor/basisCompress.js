@@ -18,11 +18,45 @@ export function isBasisEnabled() {
   return useModulesStore.getState().enabled.includes("basis");
 }
 
+/**
+ * Merges the `basis` block into the texture's existing `.meta` — and REFUSES
+ * to write if that meta exists but could not be read.
+ *
+ * `readAssetMeta` returns null for both "no meta file" and "the read or the
+ * JSON parse failed", and spreading null into `{}` turns the second case into
+ * a silent overwrite of every other key. That is not hypothetical: the user's
+ * banner Sponza came out of a compress-all pass with all 69 metas reduced to
+ * `{"basis": {...}}`, losing the glTF importer's `flipY: false` and
+ * `colorSpace: "linear"`. Both losses are invisible while every map is
+ * compressed (a compressed texture cannot be flipped at upload, so they all
+ * agreed) and both bite the moment one map is not: the PNG came back flipped
+ * against its own KTX2 albedo — "the metallic roughness map is slipped, not
+ * matching the albedo" — while normal/ORM maps quietly started being
+ * sRGB-decoded as colour. An asset pipeline may not lose import settings.
+ */
 async function writeMeta(path, basis) {
-  const current = (await readAssetMeta(`${path}.meta`)) ?? {};
+  const metaPath = `${path}.meta`;
+  let current = {};
+  let raw = null;
+  try {
+    raw = await invoke("read_text_file", { path: metaPath });
+  } catch {
+    raw = null; // no sidecar yet — this compress creates the first one
+  }
+  if (raw != null) {
+    try {
+      current = JSON.parse(raw) ?? {};
+    } catch (err) {
+      throw new Error(
+        `${basename(path)}: its .meta is present but unreadable (${err?.message ?? err}) — ` +
+          "refusing to compress, because writing would drop flipY / colorSpace / wrap settings. " +
+          "Fix or delete the .meta and retry.",
+      );
+    }
+  }
   const next = { ...current, basis };
   await invoke("save_scene", {
-    path: `${path}.meta`,
+    path: metaPath,
     contents: JSON.stringify(next, null, 2),
   });
   return next;

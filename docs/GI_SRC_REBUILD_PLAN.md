@@ -9747,3 +9747,129 @@ energy.
 Also recorded: the day-cycle LightScript moves the sun every play session —
 no cross-session look comparison is valid without matching sun angle first
 (two of this night's false suspicions came from exactly that).
+
+---
+
+## 12.72 PRESET ENERGY, PART 2 — THE OCCUPANCY VOXEL (2026-08-15, SHIPPED)
+
+§12.71(c)'s open item, closed with the readback rig it asked for. The user's
+report was the same sentence §12.68 answered ("GI produces less indirect light
+than it used to, and it gets worse on lower presets") and the answer is the same
+SHAPE with a different knob: a second HIT-PRECISION control was still tier-keyed,
+and hit precision costs ENERGY, not detail.
+
+`GISystem.#buildOccupancyField` sized the occupancy voxel from a tier table —
+low 0.25 / medium 0.175 / high 0.125 / ultra 0.1 m, "relaxed for cost". A coarser
+voxel fattens every surface by ~half a cell: arcade openings narrow, grazing rays
+stop on phantom hulls near their birth surface, and the deposit carries that dark
+hit with T=0. It is multiplicative and it lands exactly where GI is the only
+light — the vaults and arcades the user pointed at.
+
+**Measured on the user's banner Sponza** (`run-gi-preset-energy.mjs`, one fresh
+boot per arm, §12.66 pose, single knob — `__giOccVoxelTarget`/`__giOccBudget`
+are the new dials):
+
+| occ voxel | mean free path | GI gather mean | frame blackFrac | field |
+|---|---|---|---|---|
+| 0.225 m (low, was) | 2.45 m | 0.283 | 4.0 % | 23 MB |
+| 0.163 m (medium, was) | 2.87 m | 0.389 | 14.6 % | 43 MB |
+| 0.114 m | 3.28 m | 0.662 | 0.9 % | 110 MB |
+| 0.095 m | 3.51 m | 0.756 | 0.9 % | 177 MB |
+| 0.092 m (ultra) | 3.59 m | **0.730** | — | 153 MB |
+
+**Medium at ultra's PRECISION matches ultra's ENERGY while still firing 8× fewer
+rays** (26 330 vs 210 635 rays/frame; gather mean 0.771 vs 0.730 after the fix).
+That is the whole thesis in one row: rays buy noise, the voxel buys energy.
+hitRate is flat (0.957–0.965) and unattributedRate is flat (2–3 %) across every
+arm — attribution and the record pool are innocent, as in §12.68.
+
+SHIPPED: the target is preset-independent at 0.1 m (spec §1.1's own range) and
+the tier ladder moved to the BUDGET, which is a real memory ceiling in cells —
+low 8e6 / medium 16e6 / high 32e6 / ultra 64e6. The budget binds only on volumes
+too large to hold at 0.1 m and then degrades knowingly; on this scene ultra is
+byte-identical, medium goes 43 → 177 MB, low 23 → 107 MB (0.121 m, still
+budget-clamped: gather 0.617, and low's remaining gap to ultra is its documented
+single-bounce tier).
+
+⚠ GATE TRAP PAID: `test:gi-occupancy`'s INSTANCED assertion probed a fixed
+**±2-voxel** window around each instance centre. Occupancy is a SURFACE
+voxelization, so an instance's centre is empty and the only bits are its 0.6 m
+cube's shell at ±0.3 m — the window reached it at 0.116 m voxels and read ZERO
+the moment the field got finer, reporting "instances are not voxelized" while
+they were. The radius is in METRES now. (`composite clamps from a level at least
+as coarse as its cell` still FAILS on both arms — pre-existing, verified against
+a stashed baseline.)
+
+ALSO FOUND, SCENE-SIDE, NOT AN ENGINE BUG: the scene's Environment is EMPTY
+(`environment.cubemap: ""`), so `sceneSkyRadiance` returns 0 and the GI boot log
+says so in full — "every photon here comes from a lamp and ONE bounce". With one
+directional light, no emitters and ambient 0, shadowed regions have literally no
+fill, which is most of the gap against the user's Blender reference (whose world
+lights the shade). Set Scene → Environment to get the occluded sky fill back.
+
+## 12.73 A LIGHT GOING OUT IS A LIGHT EVENT (2026-08-15, SHIPPED)
+
+User: "after an emissive object disappears, light from it remains for like a
+minute until completely vanish." It did, and the code said so: all three of
+`#refreshEmitterSlots`'s "this slot has no emitter now" paths — seat unfilled,
+provider returning no shape, mesh hidden or despawned — published
+`slot.moved = 0`. The one frame on which the field is most wrong was reported
+as a quiet frame, so `mLight` never crossed `ALPHA_TRACK_THRESHOLD`, §12.43's
+window never armed, and the stale deposit drained at the still α (0.02 per
+refresh interval ⇒ t90 ≈ 30–60 s at stride ~9 / 30 fps).
+
+SHIPPED: `publishGone(i, slot, key)` publishes a full event on the FALLING
+edge, exactly as a fresh promotion publishes one on the rising edge, with
+liveness tracked per SLOT on the system (`_emitterSlotLive`) so a GI rebuild
+cannot fake either edge — the §12.48 trap that made a parked lamp re-arm the
+window every rebuild and pinned the ray cap OFF. `publishMoved` also grew a
+LUMINANCE term (`dLum`, the light arm's §12.38.3 `lumMotion` on the emitter's
+own radiance): a dimming lamp or an animated emissive changed the field while
+`motionOf` — pose only — reported nothing.
+
+## 12.74 THE ROOT AND THE CAP WERE ONE SIGNAL (2026-08-15, SHIPPED)
+
+User, same session: "any light that moves, temporal is just too slow to keep
+up, it feels very unresponsive." The decay root
+`rootS = 1 + (stride − 1)·(1 − tr)` relaxes only while the light-event window
+is open, and §12.46 made that window RISING-EDGE precisely so a continuously
+moving light could not hold it open — because an open window ALSO lifts the
+per-probe ray cap to OFF, a 3.8× deposit swing. Two effects, one signal: the
+cheap half (forget faster) was withheld because the expensive half (fire more
+rays) had to be. With the window shut, α is spread across a whole refresh
+interval by the stride root, so a moving light settles with t90 ≈ 7 s.
+
+SHIPPED: the root now also relaxes with SUSTAINED motion —
+`max(tr, sustained)`, where `sustained` requires `mLight ≥ 0.15` continuously
+for `MOTION_SUSTAIN_MS` (250 ms) — while the cap keeps reading `tr` alone and
+stays capped. History that is being continuously invalidated is not evidence
+worth preserving, and preserving it costs nothing to stop. Expected: t90 ≈ 0.8 s
+at 30 fps for a moving light, with no extra rays. ⚠ The sustain requirement IS
+the safety argument: §12.43's first draft derived the root from α directly and
+TRACK_AB refuted it — a one-frame spurious spike became a burst of relaxed-root
+fast decay, still controls 21.2 vs 0.92 rev/px ("water caustics on a parked
+floor"). A spike cannot survive 250 ms of continuous above-threshold motion.
+Hatch: `__giSrcMotionRoot = false`; `__giSrcMotionRootLive` publishes the term.
+
+## 12.75 THE COMPRESSOR ATE THE IMPORT SETTINGS (2026-08-15, SHIPPED)
+
+Found while chasing "the metallic roughness map is slipped, not matching the
+albedo". `basisCompress.writeMeta` merged the new `basis` block into
+`(await readAssetMeta(...)) ?? {}` — and `readAssetMeta` returns null for BOTH
+"no meta file" and "the read or the parse failed", so one unreadable read
+rewrote the sidecar as `{"basis": {...}}` and dropped everything else. All 69
+of the user's sponza2 metas were in exactly that state, missing the glTF
+importer's `flipY: false` and `colorSpace: "linear"`.
+
+Both losses are INVISIBLE while every map is compressed — a compressed texture
+cannot be flipped at upload, so all of them agreed on the wrong orientation —
+and both bite the moment one map is not: a PNG ORM against a KTX2 albedo comes
+back flipped against it (the "slipped" report), and normal/ORM maps start being
+sRGB-decoded as colour, which is a silent PBR error on every surface.
+
+SHIPPED: `writeMeta` distinguishes "no sidecar" (write the first one) from "a
+sidecar that would not parse" (throw, naming the file — refusing to compress
+beats losing import settings). The user's 69 metas were restored by hand
+(flipY false, colorSpace srgb for diffuse / linear for orm+normal) and the
+whole sponza2 set left uncompressed, which also retires the ETC1S-on-a-non-
+colour-map damage until the encoder grows UASTC (§12.71's queued unit).

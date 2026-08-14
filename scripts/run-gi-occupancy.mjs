@@ -235,12 +235,19 @@ const result = await page.evaluate(async () => {
   }
 
   // ── 4. INSTANCED: each instance must have occupied voxels around ITS centre.
+  // ⚠ THE RADIUS IS IN METRES, NOT VOXELS. Occupancy is a SURFACE
+  // voxelization, so an instance's centre is empty and the only bits are its
+  // 0.6 m cube's shell at ±0.3 m. A fixed ±2-voxel window happened to reach it
+  // at 0.116 m voxels and read ZERO the moment the field got finer (§12.72
+  // made the occupancy target preset-independent at 0.1 m) — a resolution-
+  // dependent probe reporting "instances are not voxelized" while they were.
+  const probeR = Math.max(2, Math.ceil(0.36 / Math.max(1e-6, field.stats.voxelSize)));
   const instanceHits = instancePositions.map((p) => {
     const v = reader.voxelOf(p, 0);
     let n = 0;
-    for (let dx = -2; dx <= 2; dx++) {
-      for (let dy = -2; dy <= 2; dy++) {
-        for (let dz = -2; dz <= 2; dz++) {
+    for (let dx = -probeR; dx <= probeR; dx++) {
+      for (let dy = -probeR; dy <= probeR; dy++) {
+        for (let dz = -probeR; dz <= probeR; dz++) {
           n += reader.get(v.x + dx, v.y + dy, v.z + dz, 0);
         }
       }

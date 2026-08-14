@@ -164,6 +164,25 @@ export const PP_NODE_TYPES = {
       // border. Longer rays reach further off-screen, so without this the
       // reflections of objects leaving the frame pop out at the edge.
       num("screenEdgeFade", "Edge Fade", 0.2, { min: 0, max: 0.5, step: 0.01 }),
+      // THE ROUGHNESS GATE (2026-08-15). Mirror mode traces ONE reflection ray
+      // and fakes roughness by sampling a mip chain of the reflection buffer at
+      // `lod = roughness² × 4` (SSRNode.js:462-466), where each mip is a
+      // 5-tap box blur with `separation = mip index`. Past ~0.5 roughness that
+      // is a sparse tap pattern over a 1/8–1/16-res buffer, so a small very
+      // bright region in the reflection (a sunlit floor, a window slit) comes
+      // back as HARD-EDGED BRIGHT RECTANGLES rather than a soft sheen — the
+      // user's banner curtains, whose gold thread is metal at roughness
+      // 0.76–0.94 in the source ORM. Three's own code treats ≥0.25 as fully
+      // non-glossy (`glossiness = 1 - min(r/0.25, 1)`), so there is nothing to
+      // recover up there: rough metal wants many samples (`stochastic: true`
+      // plus a denoiser) or an env/GI term, not a blurred mirror.
+      // Fades out over `[maxRoughness, maxRoughness + 0.15]`, so 1 = never
+      // fades = the pre-2026-08-15 behaviour.
+      num("maxRoughness", "Max Roughness", 0.6, { min: 0.05, max: 1, step: 0.01 }),
+      // The addon's own bright-sample clamp (SSRNode.js:1273-1274) — it
+      // normalizes any sample whose luminance exceeds this. Unassigned it sits
+      // at 10, which lets a blown sunlit pixel dominate a whole blur footprint.
+      num("maxLuminance", "Max Luminance", 10, { min: 0.1, max: 100, step: 0.1 }),
       bool("reflectNonMetals", "Reflect Non-metals", false),
       // Bisects the coarse depth crossing toward the exact intersection.
       // Compile-time constant in the addon, hence structural here. Worth its
@@ -1144,13 +1163,42 @@ function buildNode(type, props, ins, ctx) {
       const beauty = typeof beautyIn.sample === "function"
         ? beautyIn
         : TSL.convertToTexture(beautyIn);
+      // ── STOCHASTIC IS REAL WHEN THE SCENE HAS AN HDRI ────────────────────
+      // Mirror mode traces ONE ray and fakes roughness with a mip chain, so a
+      // satin metal is not something it can represent — the user's gold
+      // embroidery read as polished chrome against Blender's thread. The GGX
+      // path is what represents it, and it needs an environment for two
+      // different reasons: its miss branch samples one (no null guard — see
+      // the option below), and a corridor's reflection rays mostly DO miss, so
+      // without one the metal reflects black where the sky should be.
+      // `ssrEnvironment` is the scene's own HDRI when it is the shape
+      // `setEnvMap` accepts (PostprocessComponent.ssrEnvironmentOf).
+      const stochastic = P.stochastic && !!ctx.ssrEnvironment;
+      if (P.stochastic && !stochastic) {
+        console.warn(
+          "SSR node: Stochastic needs the scene environment to be an equirectangular .hdr/.exr " +
+            "(Scene → Environment); a .cubemap has no CPU-side pixels for SSRNode.setEnvMap. " +
+            "Falling back to mirror mode — stochastic without an env map throws during the " +
+            "shader build. Lower Max Roughness instead to keep mirror mode off rough metals.",
+        );
+      }
       const ssrNode = fn(beauty, depth, normal, {
         // Without this the addon infers the camera from `colorNode.passNode`
         // and throws "No camera found" outright — which it does the moment
         // anything sits between the Input node and SSR, since only the raw
         // scene-pass texture carries a `passNode`.
         camera: ctx.camera,
-        stochastic: P.stochastic,
+        // ⚠ STOCHASTIC NEEDS AN ENVIRONMENT OR IT DOES NOT BUILD. The GGX path
+        // defines its miss branch as `this._importanceEnvironment.sample…`
+        // (SSRNode.js:954-987) with no null guard, and that field stays null
+        // until `setEnvMap()` is handed an EQUIRECTANGULAR HDR WITH CPU-SIDE
+        // `image.data` — a PMREM'd `scene.environment` is explicitly rejected
+        // (SSRNode.js:708). So flipping this toggle on a normal scene throws
+        // `Cannot read properties of null (reading 'sampleEnvironmentBRDF')`
+        // during the TSL build and takes the whole post chain with it (seen
+        // live 2026-08-15). Until the panel can hand SSR a raw .hdr, the
+        // toggle degrades to mirror mode with the reason said out loud.
+        stochastic: stochastic,
         reflectNonMetals: P.reflectNonMetals,
         // Compile-time constant in the addon (it re-bakes the fragment Fn),
         // so it travels as a construction option, not a uniform.
@@ -1161,6 +1209,17 @@ function buildNode(type, props, ins, ctx) {
         // picks its blur mip from roughness.
         metalnessNode: ctx.metalnessNode ?? null,
         roughnessNode: ctx.roughnessNode ?? null,
+        // Only read on the stochastic path, where the addon calls setEnvMap
+        // for it (SSRNode.js:478) and samples it on every miss. Passing it in
+        // mirror mode would build the CDF tables for a branch that is baked
+        // out, so it travels with `stochastic`.
+        environmentNode: stochastic ? ctx.ssrEnvironment : null,
+        // The GGX sampler's albedo → its f0, i.e. the metal's own colour: the
+        // stochastic path tints the reflection itself rather than needing the
+        // composite-side tint below. The matParams chroma is what we have (a
+        // full diffuse MRT would be another attachment on a frame that is
+        // already per-pixel bound), and for a metal, f0 IS that colour.
+        diffuseNode: stochastic ? (ctx.metalTintNode ?? null) : null,
       });
       // SSRNode exposes resolutionScale as a plain JS property read in its
       // setSize (SSRNode.js:652) — the ray-march target shrinks while the
@@ -1170,12 +1229,16 @@ function buildNode(type, props, ins, ctx) {
       // so they update in place without a pipeline rebuild — see registerHot.
       // `maxDistance` is the important one: the addon defaults it to ONE
       // WORLD UNIT and we never assigned it, so reflections died a metre out.
+      // Our own uniform (not the addon's) — it weights the composite below.
+      const maxRoughness = TSL.uniform(P.maxRoughness ?? 1);
       const applyHot = (Q) => {
         ssrNode.maxDistance.value = Q.maxDistance;
         ssrNode.thickness.value = Q.thickness;
         ssrNode.quality.value = Q.quality;
         ssrNode.screenEdgeFade.value = Q.screenEdgeFade;
         ssrNode.intensity.value = Q.intensity;
+        ssrNode.maxLuminance.value = Q.maxLuminance;
+        maxRoughness.value = Q.maxRoughness;
       };
       applyHot(P);
       ctx.registerHot?.(applyHot);
@@ -1249,6 +1312,39 @@ function buildNode(type, props, ins, ctx) {
       let ssrRgb = ssrNode.rgb;
       if (ctx.metalnessNode && !P.reflectNonMetals) {
         ssrRgb = ssrRgb.mul(TSL.smoothstep(TSL.float(0.01), TSL.float(0.06), ctx.metalnessNode));
+      }
+      // …and fade the whole term out on rough receivers (see `maxRoughness` in
+      // the catalog): past that roughness the addon's mip-blur mirror is a
+      // block pattern, not a reflection. The fade rides the RECEIVING pixel's
+      // roughness, the same channel the addon picks its blur mip from, so the
+      // two agree about which surfaces are rough.
+      // …and fade the whole term out on rough receivers (see `maxRoughness` in
+      // the catalog): past that roughness the addon's mip-blur mirror is a
+      // block pattern, not a reflection. The fade rides the RECEIVING pixel's
+      // roughness, the same channel the addon picks its blur mip from, so the
+      // two agree about which surfaces are rough.
+      //
+      // MIRROR MODE ONLY. The gate exists to hide an artifact of the mip-blur
+      // approximation; the stochastic path represents rough metal properly
+      // (that is what its GGX lobe IS), so gating it there would throw away
+      // the exact surfaces the mode was turned on for.
+      if (ctx.roughnessNode && !stochastic) {
+        ssrRgb = ssrRgb.mul(
+          TSL.smoothstep(maxRoughness, maxRoughness.add(0.15), ctx.roughnessNode).oneMinus(),
+        );
+      }
+      // ── AND A METAL REFLECTS THROUGH ITS OWN COLOUR ─────────────────────
+      // The addon's mirror path weights the sample by `vec3(metalness)` and
+      // nothing else, so every metal reflects like chrome — the user's gold
+      // embroidery came back white against Blender's gold. F0 for a metal IS
+      // its base colour; the matParams MRT carries it as chroma in B/A
+      // (PostprocessComponent). Dielectrics keep an uncoloured reflection,
+      // which is also physically right, so the tint rides `metalness`.
+      // ⚠ MIRROR MODE ONLY, for the same reason `diffuseNode` is passed only
+      // in stochastic mode: there the GGX sampler already built f0 from that
+      // colour, and tinting again would square it (gold going orange-brown).
+      if (!stochastic && ctx.metalTintNode && ctx.metalnessNode) {
+        ssrRgb = ssrRgb.mul(TSL.mix(TSL.vec3(1), ctx.metalTintNode, ctx.metalnessNode));
       }
       return TSL.vec4(beauty.rgb.add(ssrRgb), beauty.a);
     }

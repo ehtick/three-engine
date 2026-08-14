@@ -1684,7 +1684,27 @@ export class GISystem {
           (this._giLightLumMotion ?? 0) / ALPHA_MOTION_SAT,
         ));
         const windowOpen = (this._giTrackMotion ?? 0) > 0;
-        this._giIrrHistWeightU.value = windowOpen ? 0 : 0.9 * (1 - mLight);
+        // ── §12.74b: A FLOOR WHILE THE FIELD IS FORGETTING FAST ─────────────
+        //
+        // `0.9·(1−mLight)` drives this filter to ZERO under sustained light
+        // motion, on the argument that a light change stales history
+        // semantically. That was right when the field itself kept its history
+        // through the motion (the stride root preserved it, which is why a
+        // moving light took ~7 s to settle). §12.74 traded that away — under
+        // sustained motion the field now forgets at up to `MOTION_ROOT_MAX` of
+        // the per-frame rate — and the two changes together removed BOTH
+        // smoothers at once: the user's "now it seems we have our flicker
+        // back", minutes after "any light that moves feels very unresponsive".
+        //
+        // So while §12.74's term is live, the SCREEN filter holds a floor: it
+        // is reprojected and world-validated, so with the camera stable it
+        // costs ~2-3 frames of lag (~0.1 s) against seconds of field settle
+        // time — the cheap half of the trade, again. A §12.43 WINDOW (a light
+        // STEP, not a sweep) still zeroes it outright: a step is exactly the
+        // case where history is wrong rather than noisy.
+        const fastField = Math.min(1, Math.max(0, Number(globalThis.__giSrcMotionRootLive) || 0));
+        const base = 0.9 * (1 - mLight);
+        this._giIrrHistWeightU.value = windowOpen ? 0 : Math.max(base, 0.7 * fastField);
       }
     }
     // (Analytic-width arm: `_giShadowFrameU` is never created, the whole
@@ -7533,28 +7553,71 @@ export class GISystem {
     const publishMoved = (i, slot, key, useAxis) => {
       let prev = poseCache.get(key);
       let moved;
+      const c = slot.color.value;
+      const lum = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
       if (!prev) {
-        prev = { center: new THREE.Vector3(), axis: new THREE.Vector3(), moved: 0 };
+        prev = { center: new THREE.Vector3(), axis: new THREE.Vector3(), moved: 0, lum };
         poseCache.set(key, prev);
         moved = 1;
         logSpike(i, moved, "new emitter");
       } else {
         const dCenter = prev.center.distanceTo(slot.center.value);
         const dAxis = useAxis ? 1 - Math.abs(prev.axis.dot(slot.by.value)) : 0;
-        moved = motionOf(prev, dCenter, dAxis, slot.reff.value);
-        logSpike(i, moved, `pose delta dC=${dCenter.toFixed(4)} dA=${dAxis.toFixed(4)}`);
+        // ── §12.73: BRIGHTNESS IS MOTION TOO. `motionOf` reads pose only, so a
+        // lamp dimming, an animated emissive or a colour ramp changed the field
+        // while telling the temporal system nothing happened — and at the still
+        // α (0.02 per REFRESH, diluted again by the probe stride) a stale
+        // deposit takes t90 ≈ 30-60 s to leave. The light arm has had this term
+        // since §12.38.3 (`lumMotion`, the hoisted light loop); this is the same
+        // relative delta on the emitter's own radiance, normalized the same way
+        // `moved` already is (the emitter term enters `mLight` RAW, unlike the
+        // light terms, which are divided by ALPHA_MOTION_SAT).
+        const dLum = Math.abs(lum - (prev.lum ?? lum)) / Math.max(prev.lum ?? 0, lum, 1e-3);
+        moved = Math.max(motionOf(prev, dCenter, dAxis, slot.reff.value), Math.min(1, dLum));
+        logSpike(i, moved, `pose delta dC=${dCenter.toFixed(4)} dA=${dAxis.toFixed(4)} dL=${dLum.toFixed(3)}`);
       }
       prev.center.copy(slot.center.value);
       prev.axis.copy(slot.by.value);
       prev.moved = moved;
+      prev.lum = lum;
       slot.moved.value = moved;
+      live[i] = true;
+    };
+    // ── §12.73: AND SO IS GOING OUT. ────────────────────────────────────────
+    // All three "this slot has no emitter now" paths below used to publish
+    // `moved = 0` — the one moment the field is MOST wrong is reported as a
+    // quiet frame. User, 2026-08-15: "after an emissive object disappears,
+    // light from it remains for like a minute until completely vanish." That
+    // minute is the still-α decay with nothing to shorten it: the §12.43
+    // light-event window arms on `mLight`, `mLight` reads this uniform, and a
+    // despawn (destroyEntity, a pooled projectile parking, a particle system
+    // emptying, a seat freed) never crossed the threshold.
+    //
+    // So the FALLING edge publishes a full event for one frame, exactly as a
+    // fresh promotion publishes one on the rising edge. `live` is per SLOT and
+    // lives on the system (not on the rebuilt uniforms), so a GI rebuild alone
+    // cannot fake either edge — the §12.48 trap that made a parked lamp re-arm
+    // the window every rebuild and pinned the ray cap OFF.
+    const live = (this._emitterSlotLive ??= []);
+    const publishGone = (i, slot, key) => {
+      slot.radius.value = 0;
+      const wasLive = live[i] === true;
+      slot.moved.value = wasLive ? 1 : 0;
+      if (wasLive) logSpike(i, 1, "emitter gone");
+      live[i] = false;
+      // The pose memory keeps the LAST pose (so a return to the same spot is a
+      // real zero-delta), but its retained motion must not decay across the
+      // gap — the emitter is not moving while it does not exist.
+      if (key) {
+        const prev = poseCache.get(key);
+        if (prev) prev.moved = 0;
+      }
     };
     for (let i = 0; i < state.emitterSlots.length; i++) {
       const slot = state.emitterSlots[i];
       const info = infos[i];
       if (!info) {
-        slot.radius.value = 0;
-        slot.moved.value = 0;
+        publishGone(i, slot, null);
         continue;
       }
       // Dynamic emitter (particle system): no mesh, no bounding sphere — the
@@ -7564,10 +7627,7 @@ export class GISystem {
       if (info.provider) {
         const shape = info.provider();
         if (!shape || !(shape.radius > 0)) {
-          slot.radius.value = 0;
-          slot.moved.value = 0;
-          const prev = poseCache.get(info.provider);
-          if (prev) prev.moved = 0;
+          publishGone(i, slot, info.provider);
           continue;
         }
         slot.center.value.copy(shape.center);
@@ -7583,10 +7643,7 @@ export class GISystem {
       // the object; the seat list refreshes at scan cadence) — park the slot
       // now, not up to 250ms later at the ghost's last pose.
       if (!info.mesh.visible || !info.mesh.parent) {
-        slot.radius.value = 0;
-        slot.moved.value = 0;
-        const prev = poseCache.get(info.mesh);
-        if (prev) prev.moved = 0;
+        publishGone(i, slot, info.mesh);
         continue;
       }
       const geometry = info.mesh.geometry;
@@ -8141,9 +8198,38 @@ export class GISystem {
     // path or request a larger device limit to hide a binding regression.
 
     // Spec §1.1: 0.10–0.15m, "not 0.35 — sub-voxel sheets were the root cause
-    // of the blob/leak artifacts". Low/medium relax it for cost.
-    const target = { low: 0.25, medium: 0.175, high: 0.125, ultra: 0.1 }[quality] ?? 0.125;
-    const budget = { low: 16e6, medium: 32e6, high: 64e6, ultra: 128e6 }[quality] ?? 64e6;
+    // of the blob/leak artifacts".
+    //
+    // ══ §12.72 PRESET ENERGY, PART 2: THE OCCUPANCY VOXEL ════════════════════
+    //
+    // This target used to be tier-keyed (low 0.25 / medium 0.175 / high 0.125 /
+    // ultra 0.1) "for cost", and it is the SECOND hit-precision knob to be
+    // convicted of eating transport energy — §12.68 was the first, in the
+    // ray-hit mode table. The mechanism is geometric, not an artifact budget: a
+    // coarser voxel FATTENS every surface by ~half a cell, so arcade openings
+    // narrow, grazing rays stop on phantom hulls near their birth surface, and
+    // the deposit carries that dark hit. Measured on the user's banner Sponza
+    // (new-Sponza pose, one boot per arm, ONLY this knob moved — same scene,
+    // same rays, same tier tables otherwise):
+    //
+    //   occ voxel   mean free path   GI gather mean   frame blackFrac   field
+    //     0.225 m       2.45 m           0.283            4.0 %         23 MB
+    //     0.163 m       2.87 m           0.389           14.6 %         43 MB
+    //     0.114 m       3.28 m           0.662            0.9 %        110 MB
+    //     0.095 m       3.51 m           0.756            0.9 %        177 MB
+    //   ultra 0.092     3.59 m           0.730              —          153 MB
+    //
+    // Medium at ultra's PRECISION matches ultra's energy (0.756 vs 0.730) while
+    // still firing 8× fewer rays (26k vs 211k/frame) — rays buy noise, the
+    // voxel buys energy. So precision is preset-independent here too, and the
+    // tier ladder moves to the BUDGET, which is a real memory ceiling: it binds
+    // only on volumes too large to hold at 0.1 m, and then it degrades
+    // knowingly (a 40 m room at low is a different scene from this one).
+    // Hatches: `__giOccVoxelTarget` (metres), `__giOccBudget` (cells).
+    const target = globalThis.__giOccVoxelTarget ?? 0.1;
+    const budget =
+      globalThis.__giOccBudget ??
+      ({ low: 8e6, medium: 16e6, high: 32e6, ultra: 64e6 }[quality] ?? 32e6);
     const volume = size.sizeX * size.sizeY * size.sizeZ;
     const voxelSize = Math.max(target, Math.cbrt(volume / budget));
     const res = quantizeOccupancyRes({

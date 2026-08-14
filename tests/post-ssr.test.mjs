@@ -118,6 +118,36 @@ test("updateParams restores omitted props to their defaults", () => {
   assert.equal(instance.maxDistance.value, 20);
 });
 
+test("the roughness gate and the luminance clamp are hot, and default to a real cut", () => {
+  // Mirror-mode SSR fakes roughness with a mip chain of 5-tap box blurs
+  // (SSRNode.js:462-466, 779-788). Past ~0.5 roughness that is a sparse tap
+  // pattern over a 1/8-res buffer, so a bright reflection returns as hard
+  // rectangles — the banner curtains' gold thread (metal at roughness
+  // 0.76-0.94) wore exactly that. The gate has to be a SLIDER, not a rebuild:
+  // finding the right cut for a scene is a drag, not a graph edit.
+  const graph = ssrGraph();
+  const { compiled, instance } = compile(graph);
+  assert.equal(nodeDefaults("ssr").maxRoughness, 0.6);
+  assert.equal(instance.maxLuminance.value, 10, "the addon's clamp is assigned, not left to chance");
+
+  const dragged = ssrGraph({ maxRoughness: 1, maxLuminance: 2.5 });
+  assert.equal(postGraphSignature(dragged), postGraphSignature(graph));
+  compiled.updateParams(dragged);
+  assert.equal(instance.maxLuminance.value, 2.5);
+});
+
+test("Stochastic degrades to mirror mode when the scene has no equirect HDRI", () => {
+  // SSRNode's GGX branch defines its miss path as
+  // `this._importanceEnvironment.sampleEnvironment…` with no null guard, and
+  // that field is null until setEnvMap() gets an equirect HDR with CPU-side
+  // pixels. Flipping the toggle on a scene without one threw
+  // "Cannot read properties of null (reading 'sampleEnvironmentBRDF')" during
+  // the TSL build and took the whole post chain down with it (live, 2026-08-15).
+  const { instance } = compile(ssrGraph({ stochastic: true }));
+  assert.ok(instance, "the node still builds");
+  assert.equal(instance.stochastic, false, "degraded to mirror mode rather than throwing");
+});
+
 test("structural params stay structural", () => {
   // `binaryRefine` and `stochastic` are baked into the addon's fragment Fn,
   // so they must force a rebuild rather than ride the hot path.
