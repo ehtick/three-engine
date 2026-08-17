@@ -1486,6 +1486,8 @@ declare module "engine" {
     shadowCamNear: number;
     shadowCamFar: number;
     shadowCamSize: number;
+    /** World-space recentre snap for directional maps (0 = one texel). */
+    shadowCamSnap: number;
     shadowCamFov: number;
     csm: boolean;
     csmCascades: number;

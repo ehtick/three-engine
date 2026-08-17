@@ -379,7 +379,19 @@ const seeded = await page.evaluate(async () => {
     file("Level.scene", "scene"),
     { name: "Props", path: `${root}/Props`, ext: "", is_dir: true, size: 0, modified: 0 },
   ];
-  useProjectStore.setState({ rootPath: root, currentPath: root, entries, loading: false, error: null });
+  // Autosave off for the fixture. A root path plus a dirty scene is all the
+  // editor's 10s autosave needs, and here it would write "C:/FakeProject" over
+  // a Tauri bridge that does not exist in a browser — a pageerror this smoke
+  // treats as a failure, arriving purely as a function of how long the run
+  // takes rather than of anything it tested.
+  useProjectStore.setState({
+    rootPath: root,
+    currentPath: root,
+    entries,
+    loading: false,
+    error: null,
+    projectMeta: { settings: { editor: { autosaveSeconds: 0 } } },
+  });
   globalThis.__fakeRoot = root;
   return true;
 });
@@ -463,6 +475,47 @@ if (seeded) {
   );
   check("a tag: query matches asset tags", byTag.length === 1 && byTag[0] === "Rock.png", JSON.stringify(byTag));
 }
+
+// --- the Inspector follows the selection ------------------------------------
+
+// Closing the panel outright is the strongest form of "not active": if the
+// follower brings it back from closed, it certainly brings it forward from
+// behind another tab, and `isPanelVisible` is the same predicate the follower
+// itself uses (existing + on screen + the group's active tab + big enough).
+const follow = await page.evaluate(async () => {
+  const shell = await globalThis.__importLive("/src/editor/EditorShell.jsx");
+  const { useSelectionStore } = await globalThis.__importLive("/src/editor/store/selectionStore.js");
+  const settle = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  useSelectionStore.getState().clear();
+  shell.closePanel("inspector");
+  await settle(300);
+  const closed = !shell.isPanelVisible("inspector");
+
+  useSelectionStore.getState().select(globalThis.__smokeId);
+  await settle(600);
+  const afterEntity = shell.isPanelVisible("inspector");
+
+  // …and a cleared selection must not reopen it: there is nothing to inspect,
+  // and a panel that reappears when you click empty space is a panel that
+  // cannot be closed.
+  shell.closePanel("inspector");
+  await settle(300);
+  useSelectionStore.getState().clear();
+  await settle(400);
+  const stayedClosed = !shell.isPanelVisible("inspector");
+
+  let afterAsset = null;
+  if (globalThis.__fakeRoot) {
+    useSelectionStore.getState().selectAsset(`${globalThis.__fakeRoot}/Rock.png`);
+    await settle(600);
+    afterAsset = shell.isPanelVisible("inspector");
+  }
+  return { closed, afterEntity, stayedClosed, afterAsset };
+});
+check("selecting an entity opens the Inspector when it isn't showing", follow.closed && follow.afterEntity, JSON.stringify(follow));
+check("clearing the selection does not reopen it", follow.stayedClosed, JSON.stringify(follow));
+check("selecting an asset opens it too", follow.afterAsset !== false, JSON.stringify(follow));
 
 // ---------------------------------------------------------------------------
 
@@ -554,6 +607,39 @@ if (buildPanel.found) {
     return !!panel.querySelector("select");
   });
   check("switching between targets keeps the panel alive", switched === true);
+}
+
+// --- Post Process panel: the .post document toolbar --------------------------
+//
+// The graph moved out of the component and into a `.post` file, which means
+// the panel grew a document toolbar — which graph, Save, Save As. The op smoke
+// covers the file half; what it cannot cover is that the toolbar RENDERS, and
+// a React throw in this panel blanks the whole subtree silently.
+await page.evaluate(async () => {
+  const { openPanel } = await globalThis.__importLive("/src/editor/EditorShell.jsx");
+  openPanel("postprocess");
+});
+await wait(1500);
+const post = await page.evaluate(() => {
+  const panel = document.querySelector(".postprocess-panel");
+  if (!panel) return null;
+  return {
+    // The Graph slot is an AssetField; with nothing assigned it reads "Embedded".
+    slot: panel.querySelector(".asset-field .asset-field-name")?.textContent?.trim() ?? null,
+    buttons: [...panel.querySelectorAll(".toolbar-btn")].map((b) => b.textContent.trim()).filter(Boolean),
+    // No camera in this fixture, so the editor half is the empty state — which
+    // must still explain both ways in, not just the camera one.
+    empty: panel.querySelector(".postprocess-empty h3")?.textContent?.trim() ?? null,
+  };
+});
+check("the Post Process panel renders", !!post, post ? "" : "no .postprocess-panel");
+if (post) {
+  check("…with a Graph slot for picking a .post", post.slot === "Embedded", String(post.slot));
+  check(
+    "…and the empty state names the graph route, not only the camera one",
+    /graph/i.test(post.empty ?? ""),
+    String(post.empty),
+  );
 }
 
 // --- opening panels must work from ANY copy of EditorShell -------------------

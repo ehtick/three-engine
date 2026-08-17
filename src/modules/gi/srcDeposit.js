@@ -769,6 +769,27 @@ export function createSrcDepositFrame(store, bins, {
               k.assign(float(1.0).sub(float(1.0).sub(float(keep)).mul(f)));
             });
           }
+          // ── S1: FREEZE A HELD BLOCK (locality retention) ────────────────
+          //
+          // `blockHeldBase` carries the frame on which the age pass decided to
+          // KEEP this block's probe while no pixel was looking at it. Stamped
+          // this frame ⇒ the probe is off-screen, receiving no rays, and its
+          // accumulated answer is the thing retention exists to preserve — so
+          // `keep = 1` and the payload is held exactly rather than faded.
+          //
+          // Without this, retention is worse than useless: the block would come
+          // back holding `keep^N` of what it knew, and the gather would read a
+          // DARK VOTE where it previously read an absence — the one thing R1
+          // forbids. `srcProbes.blockHeldBase` carries the whole argument,
+          // including why the test is visibility and not "did it get rays".
+          //
+          // BEFORE the claim-stamp check below, which must still win: a block
+          // handed to a NEW probe this frame is zeroed whatever any older
+          // stamp says.
+          const heldB = store.blockHeldBase + info.blockBase;
+          If(freeStack.element(uint(heldB).add(block)).equal(frameStamp), () => {
+            k.assign(float(1));
+          });
           const stamp = freeStack.element(uint(base).add(block)).toVar();
           If(stamp.equal(frameStamp), () => { k.assign(float(0)); });
         });

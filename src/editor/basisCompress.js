@@ -14,6 +14,40 @@ async function invoke(cmd, args) {
   return invoke(cmd, args);
 }
 
+/**
+ * Which codec this texture wants — see `compress_texture_basis` for what each
+ * mode does and what picking wrong costs.
+ *
+ * THE SIGNAL ALREADY EXISTS AND ALWAYS DID: `colorSpace` has been written into
+ * every `.meta` since import (`glbImport.js` — `srgb` for diffuse/emissive,
+ * `linear` for every data map), and so have PolyHaven, ambientCG and itch.io.
+ * That single field separates colour from data, which is the distinction ETC1S
+ * cares about. So this needs no new metadata and no re-import.
+ *
+ * Normals need a third answer and `colorSpace` cannot give it — a normal map
+ * and an ORM map are both linear. The importer names files by ROLE for an
+ * unrelated reason ("<material> normal", "<material> orm" — so one source image
+ * used by two slots cannot race onto one path), and that naming is what makes
+ * the existing asset sets classifiable without re-importing them. It is a
+ * heuristic on the name and it is allowed to be: guessing "linear" for a normal
+ * map still gets UASTC, which is the part that matters. `usage` in the meta
+ * wins when present, for callers who know better than the filename.
+ */
+export function basisModeFor(path, meta) {
+  const usage = String(meta?.usage ?? "").toLowerCase();
+  if (usage === "normal" || usage === "linear" || usage === "srgb") return usage;
+  const name = basename(path).toLowerCase();
+  const isNormal = /(^|[ \-_.])(normal|normals|nrm|norm|nor)([ \-_.]|$)/.test(name);
+  if (meta?.colorSpace === "linear") return isNormal ? "normal" : "linear";
+  if (meta?.colorSpace === "srgb") return "srgb";
+  // No colorSpace recorded (hand-dropped PNGs, older imports): the name is all
+  // there is. Colour is the safe default — see the Rust side's fallback note.
+  if (isNormal) return "normal";
+  return /(^|[ \-_.])(orm|arm|rough|roughness|metal|metalness|metallic|ao|occlusion|spec|specular|gloss|glossiness|displace|height|bump|mask|opacity|alpha)([ \-_.]|$)/.test(name)
+    ? "linear"
+    : "srgb";
+}
+
 export function isBasisEnabled() {
   return useModulesStore.getState().enabled.includes("basis");
 }
@@ -71,10 +105,18 @@ export async function compressTextureBasis(path) {
   );
 }
 
-async function compressTextureBasisImpl(path) {
-  const info = await invoke("compress_texture_basis", { path });
+async function compressTextureBasisImpl(path, knownMeta) {
+  // The meta is read BEFORE encoding, not after: it is what decides the codec.
+  // `writeMeta` re-reads and merges, so a null here only costs the mode guess
+  // its best signal — it cannot lose the file's other settings.
+  const meta = knownMeta ?? (await readAssetMeta(`${path}.meta`));
+  const mode = basisModeFor(path, meta);
+  const info = await invoke("compress_texture_basis", { path, mode });
   invalidateBlobUrl(`${path}.basis`);
-  await writeMeta(path, { enabled: true, ...info });
+  // `mode` is recorded so a later reader can tell which codec produced this
+  // derivative without re-deriving the guess — and so a re-encode after the
+  // rules change is a diff rather than an archaeology exercise.
+  await writeMeta(path, { enabled: true, mode, ...info });
   return info;
 }
 
@@ -90,32 +132,62 @@ export async function setTextureBasisEnabled(path, enabled) {
   return null;
 }
 
-/** Compresses every texture that has not explicitly opted out. */
-export async function compressAllProjectTextures() {
+/**
+ * Compresses every texture that has not explicitly opted out.
+ *
+ * ⚠ `force` EXISTS BECAUSE THE OPT-OUT AND THE DAMAGE CONTROL ARE THE SAME BIT.
+ *
+ * When the ETC1S-for-everything bug was found (plan §12.78), the mitigation was
+ * to set `basis.enabled = false` on all 69 affected maps so the originals would
+ * load. That is indistinguishable, in the meta, from a user deciding "never
+ * compress this one" — so once the encoder was fixed, this function skipped
+ * every single texture that needed re-encoding and returned `{compressed: 0}`.
+ * The user saw texture memory move 1.02 GB → 969 MB and reasonably asked
+ * whether the fix had worked. It had; nothing had run it.
+ *
+ * So: `force` re-encodes opted-out textures too, and `skipped` is REPORTED
+ * rather than silent — a bulk operation that does nothing must say so.
+ */
+export async function compressAllProjectTextures({ force = false } = {}) {
   return useAssetProcessingStore.getState().track(
-    "Compressing project textures…",
-    () => compressAllProjectTexturesImpl(),
+    force ? "Re-compressing project textures…" : "Compressing project textures…",
+    () => compressAllProjectTexturesImpl({ force }),
   );
 }
 
-async function compressAllProjectTexturesImpl() {
+async function compressAllProjectTexturesImpl({ force = false } = {}) {
   const root = useProjectStore.getState().rootPath;
-  if (!root) return { compressed: 0, failed: 0 };
+  if (!root) return { compressed: 0, failed: 0, skipped: 0 };
   const paths = await listProjectAssets(root, TEXTURE_EXTENSIONS, 20);
   let compressed = 0;
   let failed = 0;
+  let skipped = 0;
+  let restaled = 0;
   for (const path of paths) {
     const meta = await readAssetMeta(`${path}.meta`);
-    if (meta?.basis?.enabled === false) continue;
+    if (meta?.basis?.enabled === false && !force) {
+      skipped++;
+      continue;
+    }
+    // A derivative written before the codec rules existed carries no `mode`;
+    // one written under different rules carries the wrong one. Both mean the
+    // file on disk is not what this pipeline would produce today.
+    if (meta?.basis && meta.basis.mode !== basisModeFor(path, meta)) restaled++;
     try {
-      await compressTextureBasisImpl(path);
+      await compressTextureBasisImpl(path, meta);
       compressed++;
     } catch (err) {
       failed++;
       console.warn(`Basis compression skipped for ${path}: ${err.message ?? err}`);
     }
   }
-  return { compressed, failed };
+  if (skipped) {
+    console.info(
+      `[basis] ${skipped} texture(s) skipped — they carry basis.enabled:false. ` +
+        "Pass force to re-encode them (see compressAllProjectTextures).",
+    );
+  }
+  return { compressed, failed, skipped, staleRecoded: restaled };
 }
 
 /** Import hook: the module is a global default, explicit asset opt-out wins. */

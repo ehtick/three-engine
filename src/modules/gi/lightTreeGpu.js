@@ -537,7 +537,7 @@ export function createLightTreeSampler(words, options = {}) {
  *
  * @param {Node} words  the SAME u32 storage node the sampler reads
  */
-export function createLightTreeEmitterEval(words) {
+export function createLightTreeEmitterEval(words, { subCellRef = 0 } = {}) {
   return (Pin, Nin, baseIn, indexIn) => {
     const P = vec3(Pin).toVar();
     const N = vec3(Nin).toVar();
@@ -587,6 +587,22 @@ export function createLightTreeEmitterEval(words) {
         F.assign(float(Math.PI).mul(sinR).mul(sinR).mul(sphereLightFactor(cosT, sinR)));
       });
       E.assign(rgb.mul(F.max(0)));
+      // §13.7 — SUB-CELL EMITTER DAMP (field transport only). A pea-sized
+      // bulb's DIRECT light is delivered per-pixel by the screen chain (tile
+      // cut + shadow pass, full strength, crisp falloff); what THIS estimator
+      // feeds is the PROBE FIELD, where a sub-cell emitter's energy lands on
+      // a ~spacing-sized lattice and comes back as meters-wide saturated
+      // patches with per-probe NEE variance — the user's Bistro string-bulb
+      // "weird color bleeds" (95 bulbs, 2026-08-16). Ramp by physical size
+      // against the lattice pitch: emitters at or above half a cell are
+      // untouched (Cornell panels, Sponza banners — bit-identical), true
+      // point-bulbs keep a 15% floor so their bounce reads as a glow, not a
+      // wash. `aR` is the record's physical radius (disc-equivalent for
+      // boxes), NOT the angular term — this is a size test, not a solid
+      // angle.
+      if (subCellRef > 0) {
+        E.mulAssign(aR.div(float(subCellRef)).clamp(0.15, 1));
+      }
     });
 
     const dirTo = wi.negate().toVar();

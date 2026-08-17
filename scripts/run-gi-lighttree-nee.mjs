@@ -81,7 +81,10 @@ async function runArm(arm, round) {
     localStorage.setItem("engine.projectRoot.v1", project);
     localStorage.setItem("engine.recentProjects.v1", JSON.stringify([project]));
     globalThis.__editorKeepRendering = true;
-    if (treeOn) globalThis.__giSrcLightTree = true;
+    // EXPLICIT ON BOTH ARMS — the hatch defaults ON since §12.70's flip, so
+    // `if (treeOn) set true` would make the SLOT arm a second tree arm and
+    // this parity gate would compare the tree against itself.
+    globalThis.__giSrcLightTree = treeOn === true;
   }, GEN_ROOT, tree);
   await page.goto(url, { waitUntil: "load", timeout: 60000 });
   await page.waitForSelector(".hub-recent-open-btn", { timeout: 30000 });

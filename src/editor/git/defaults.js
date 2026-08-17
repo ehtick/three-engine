@@ -122,6 +122,7 @@ export function defaultGitattributes({ lfs = true } = {}) {
 *.prefab text
 *.anim text
 *.timeline text
+*.post text
 *.atlas text
 *.meta text
 *.gltf text

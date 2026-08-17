@@ -239,6 +239,7 @@ export function MenuBar() {
       { label: "Particles", action: () => openPanel("particles") },
       { label: "Animator", action: () => openPanel("animator") },
       { label: "Timeline", action: () => openPanel("timeline") },
+      { label: "Post Process", action: () => openPanel("postprocess") },
       { separator: true },
       { label: "Scene Settings", action: () => openPanel("sceneSettings") },
       { label: "Project Settings", action: () => openPanel("projectSettings") },

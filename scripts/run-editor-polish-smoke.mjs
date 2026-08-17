@@ -177,7 +177,7 @@ const before = await page.evaluate(() => {
 
 await page.evaluate(() => {
   const row = [...document.querySelectorAll(".inspector-panel .field-row")].find(
-    (r) => r.querySelector(".settings-label")?.textContent?.trim() === "Material",
+    (r) => r.querySelector(".field-label")?.textContent?.trim() === "Material",
   );
   row?.querySelector(".asset-field")?.click();
 });
@@ -235,7 +235,7 @@ await wait(900);
 
 await page.evaluate(() => {
   const row = [...document.querySelectorAll(".inspector-panel .field-row")].find(
-    (r) => r.querySelector(".settings-label")?.textContent?.trim() === "Material",
+    (r) => r.querySelector(".field-label")?.textContent?.trim() === "Material",
   );
   row?.querySelector(".asset-field")?.click();
 });
@@ -443,7 +443,7 @@ const rightClick = (selector, offset = { x: 8, y: 8 }) =>
       if (sel.startsWith("row:")) {
         const [, label, rest] = sel.match(/^row:([^|]+)\|(.*)$/);
         scope = [...document.querySelectorAll(".inspector-panel .field-row")].find(
-          (r) => r.querySelector(".settings-label")?.textContent?.trim() === label,
+          (r) => r.querySelector(".field-label")?.textContent?.trim() === label,
         );
         sel = rest;
         if (!scope) return { found: false };

@@ -116,7 +116,7 @@ import { MeshBVH, SAH, AVERAGE, CENTER } from "three-mesh-bvh";
 export const BVH_STRATEGY = { sah: SAH, average: AVERAGE, center: CENTER };
 import {
   Fn, If, Loop, float, floatBitsToUint, instanceIndex, instancedArray, int,
-  select, uint, uintBitsToFloat, uniformArray, vec2, vec3, vec4, wgslFn,
+  select, uint, uintBitsToFloat, uniform, uniformArray, vec2, vec3, vec4, wgslFn,
 } from "three/tsl";
 import { sharedFn } from "./giFn.js";
 import { resolveMaterialSurface } from "./voxelizeOnce.js";
@@ -1076,6 +1076,32 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
   // plumbing may canonicalize into corrupted masks).
   const staticMaskUniform = uniformArray(new Array(STATIC_MASK_WORDS).fill(0), "uint");
 
+  // ── THE STATIC BVH'S BASES ARE RUNTIME UNIFORMS, NOT COMPILE-TIME LITERALS.
+  //
+  // These used to be passed to the traversal as `uint(info.nodeBase)` /
+  // `uint(info.triBase)`, which are CONSTANT nodes: three bakes them into the
+  // WGSL as literals when the shadow kernel is compiled, once, at GI build
+  // time. `attachStaticBvh` then repointed them at runtime — and nothing
+  // recompiled, so the change was invisible to every kernel already built.
+  //
+  // `nodeBase` is always the region offset and never moves, so this looked
+  // harmless for a long time. `triBase` is `nodeBase + packed.nodeWords`, and
+  // nodeWords is the BVH's node count: it moves whenever the tree SHAPE
+  // changes. So after a debounced rebuild (#maybeRebuildStaticBvh — spawned
+  // projectiles, a demoted mover, exiting play mode, any placement add/remove)
+  // the kernel traversed the NEW node array at the correct base while fetching
+  // triangle vertices from the OLD triangle base. Every leaf test then read
+  // whatever words happened to live there, missed, and the sun's GI shadows
+  // vanished from the whole scene — permanently, until something forced a full
+  // GI rebuild. It was intermittent for exactly one reason: a rebuild whose
+  // node count happened to land unchanged left triBase valid and looked fine.
+  // (User report 2026-08-16: "gi shadows disappear when scene changes"; the
+  // same mechanism is behind the older "shadows break after exiting playmode".)
+  //
+  // Two uniform reads per traversal — against a 44-deep stack walk, free.
+  const staticNodeBaseUniform = uniform(0, "uint");
+  const staticTriBaseUniform = uniform(0, "uint");
+
   // Persistent header-sync compute: uniform vec4s → bitcast f32 words in the
   // bits region (mask words pass through raw). Its own pipeline, 3 bindings —
   // nowhere near any wall.
@@ -1104,6 +1130,9 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
   const geoBlocks = new Map();
   let nextWord = HEADER_WORDS;
   const pendingComputes = [];
+  // Persistent re-uploadable regions (createRegionUploader) — one pipeline
+  // each, offered to the dispatcher only on the frames their bytes changed.
+  const regionUploaders = [];
 
   const entries = new Map();
   const slots = new Array(MAX).fill(null);
@@ -1407,9 +1436,19 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
     /** Info for the world-space static BVH riding this bits buffer. */
     staticBvh: null,
 
-    /** Registers the static-scene BVH region (absolute word offsets). */
+    /**
+     * Registers the static-scene BVH region (absolute word offsets).
+     *
+     * Live for every already-compiled kernel: the bases ride uniforms (see the
+     * block above them). Call this only once the words those bases describe
+     * are actually on the GPU — the pair is atomic, and a base pointing at a
+     * region that still holds the previous build is the same garbage-read as
+     * the stale-literal bug this replaced.
+     */
     attachStaticBvh({ nodeBase, triBase }) {
       set.staticBvh = { nodeBase, triBase };
+      staticNodeBaseUniform.value = nodeBase >>> 0;
+      staticTriBaseUniform.value = triBase >>> 0;
     },
 
     /**
@@ -1449,6 +1488,55 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
       if (!entry) return false;
       setCardTableAt(entry.index, cardTableRel);
       return true;
+    },
+
+    /**
+     * A RE-UPLOADABLE region: reserves `maxWords` and returns a handle whose
+     * `write(words)` refreshes it, as often as every frame.
+     *
+     * `queueRegionUpload` below cannot do this. It builds a fresh staging
+     * buffer AND a fresh compute per call, which is a new pipeline per call —
+     * fine for a build-time upload, ruinous for anything that tracks a moving
+     * object (§12.70 W5: the light tree's records are static words, so a lamp
+     * that moves lights from its bake pose until the next full GI rebuild).
+     * Here the pipeline and the staging buffer are made ONCE and only the
+     * attribute's bytes are re-sent, which is the same contract the header
+     * sync above runs on.
+     *
+     * The handle rides `pendingDispatch`/`confirmDispatch` exactly like the
+     * header does: it is offered only while dirty, and the dirty flag clears
+     * only once the frame actually dispatched it (a skipped-pipeline frame
+     * retries rather than losing the write).
+     */
+    createRegionUploader(maxWords) {
+      const n = Number.isFinite(maxWords) ? Math.max(0, Math.trunc(maxWords)) : 0;
+      if (!enabled || n === 0) return null;
+      const alloc = set.allocPoolWords(n);
+      if (!alloc) return null;
+      const staging = instancedArray(new Uint32Array(alloc.words), "uint");
+      const compute = Fn(() => {
+        bits.element(uint(alloc.abs).add(instanceIndex)).assign(staging.element(instanceIndex));
+      })().compute(alloc.words);
+      const handle = {
+        abs: alloc.abs,
+        rel: alloc.rel,
+        capacity: alloc.words,
+        dirty: false,
+        /** false = `words` does not fit; the region keeps its last contents. */
+        write(words) {
+          if (words.length > alloc.words) return false;
+          const array = staging.value.array;
+          array.set(words);
+          // Zero the tail: a shrinking tree would otherwise leave the previous
+          // build's words readable past the new header's extents.
+          if (words.length < array.length) array.fill(0, words.length);
+          staging.value.needsUpdate = true;
+          handle.dirty = true;
+          return true;
+        },
+      };
+      regionUploaders.push({ handle, compute });
+      return handle;
     },
 
     /**
@@ -1499,9 +1587,12 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
     traceStaticBvh(origin, dir, tMin, tMax, { anyHit = globalThis.__giShadowAnyHit !== false } = {}) {
       const info = set.staticBvh;
       if (!info) return null;
+      // `info` gates COMPILATION (no BVH ⇒ the arm is not emitted at all); the
+      // bases themselves come from the uniforms, so a later rebuild moves them
+      // without a recompile.
       return bvh8MaskedTraceWgsl(
         vec3(origin), vec3(dir), float(tMin), float(tMax),
-        uint(info.nodeBase), uint(info.triBase),
+        staticNodeBaseUniform, staticTriBaseUniform,
         uint(baseWord + STATIC_MASK_WORD_BASE), uint(anyHit ? 1 : 0), bits,
       ).toVar();
     },
@@ -1740,6 +1831,7 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
       if (!enabled) return [];
       const out = [];
       if (headerDirty && headerCompute) out.push(headerCompute);
+      for (const r of regionUploaders) if (r.handle.dirty) out.push(r.compute);
       for (const p of pendingComputes) out.push(p.compute);
       return out;
     },
@@ -1747,6 +1839,9 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
     /** `skipped` = the giSkippedComputes set after this frame's dispatch. */
     confirmDispatch(skipped) {
       if (headerCompute && headerDirty && !skipped.has(headerCompute)) headerDirty = false;
+      for (const r of regionUploaders) {
+        if (r.handle.dirty && !skipped.has(r.compute)) r.handle.dirty = false;
+      }
       for (let i = pendingComputes.length - 1; i >= 0; i--) {
         const p = pendingComputes[i];
         if (!skipped.has(p.compute)) {

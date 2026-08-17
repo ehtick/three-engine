@@ -50,6 +50,10 @@ await page.evaluateOnNewDocument((PROJECT, STRATEGY) => {
   localStorage.setItem("engine.projectRoot.v1", PROJECT);
   localStorage.setItem("engine.recentProjects.v1", JSON.stringify([PROJECT]));
   globalThis.__giStaticBvhStrategy = STRATEGY;
+  // GISystem drops its CPU-side copy of the packed BVH after upload unless this
+  // is set — it is 125-188 MB of dead heap in a normal session. This probe is
+  // the one reader, so it asks for the handle explicitly.
+  globalThis.__giKeepStaticBvhPacked = true;
 }, PROJECT, STRATEGY);
 await page.goto(url, { waitUntil: "load", timeout: 60000 });
 await page.waitForSelector(".hub-recent-open-btn", { timeout: 30000 });

@@ -1,6 +1,7 @@
 import { Suspense, lazy } from "react";
 import { DockviewReact, themeAbyss } from "dockview-react";
 import { vmSingleton } from "./singleton.js";
+import { useSelectionStore } from "./store/selectionStore.js";
 import { QuickSearch } from "./QuickSearch.jsx";
 import { Toasts } from "./Toasts.jsx";
 import { ConfirmDialogHost } from "./components/ConfirmDialog.jsx";
@@ -140,7 +141,10 @@ export const PANEL_SPECS = {
   events: { title: "Events", position: { referencePanel: "viewport", direction: "below" }, initialHeight: 300 },
   eventGraph: { title: "Event Graph", position: { referencePanel: "viewport", direction: "within" } },
   geometryEditor: { title: "Geometry Editor", position: { referencePanel: "viewport", direction: "within" } },
-  postprocess: { title: "Post Process", position: { referencePanel: "inspector", direction: "within" } },
+  // Docks with the Assets strip, like the Shader Graph and Particles panels:
+  // a node graph in the 320px Inspector column is a postage stamp, and this
+  // one now also carries a document toolbar (which `.post`, save, save as).
+  postprocess: { title: "Post Process", position: { referencePanel: "assets", direction: "within" } },
   polyhaven: { title: "Poly Haven", position: { referencePanel: "assets", direction: "within" } },
   ambientcg: { title: "AmbientCG", position: { referencePanel: "assets", direction: "within" } },
   sketchfab: { title: "Sketchfab", position: { referencePanel: "assets", direction: "within" } },
@@ -198,6 +202,9 @@ const dock = vmSingleton("dockState", () => ({
   // clicking "Edit Material" / "Edit Shader Graph" during the first paint still
   // opens the panel once Dockview is ready. A Set dedupes a flurry of clicks.
   pending: new Set(),
+  // Unsubscriber for the selection→Inspector follower, so an HMR remount
+  // (onReady fires again) replaces it instead of stacking a second listener.
+  unfollow: null,
 }));
 
 /**
@@ -307,6 +314,79 @@ export function isPanelVisible(id) {
     return false;
   }
   return true;
+}
+
+/**
+ * What is selected, as one comparable string.
+ *
+ * Compared by CONTENT, not by array identity: `prune()` rewrites `ids` on every
+ * scene change, and an identity check would read those rewrites as "the user
+ * selected something" and pop the Inspector open while nothing was clicked.
+ */
+function selectionKey(state) {
+  if (state.assetPath) return `@${state.assetPath}`;
+  return state.ids.length ? `#${state.ids.join(",")}` : "";
+}
+
+/**
+ * True when activating the Inspector would cover the panel the user is working
+ * in — i.e. they have stacked the two into one group.
+ *
+ * Someone who has docked the Inspector as a tab beside the Assets panel is
+ * clicking assets *in that group*; flipping to the Inspector would take the
+ * grid they are clicking out from under the pointer, and the next click lands
+ * on the Inspector instead. Following the selection is worth doing right up
+ * until it makes the thing that produces selections unreachable.
+ */
+function wouldHideTheActivePanel() {
+  const inspector = dock.api?.getPanel("inspector");
+  const active = dock.api?.activePanel;
+  if (!inspector || !active || active.id === "inspector") return false;
+  return active.group === inspector.group;
+}
+
+/**
+ * Selecting something is a request to look at it — so bring the Inspector
+ * forward when it is open behind another tab, or reopen it when it was closed.
+ *
+ * Two things it deliberately does NOT do:
+ *
+ * - **It never touches a maximized layout.** Double-clicking a tab to maximize
+ *   (and the Game panel's maximize-on-play) is an explicit "show me only this";
+ *   `revealPanel` would exit that maximized group, which reads as the editor
+ *   scrambling the layout because the user clicked an object.
+ * - **It does not re-activate on a repeated selection.** Clicking the same
+ *   entity again, or a `prune()` that changes nothing, must not yank a tab the
+ *   user has since switched away from.
+ *
+ * Subscribed outside React because it lives exactly as long as the dock does,
+ * and `dock` is the thing it needs — see the vmSingleton note above for why
+ * this file's module scope cannot be trusted to hold state.
+ */
+function followSelectionIntoInspector() {
+  dock.unfollow?.();
+  let last = selectionKey(useSelectionStore.getState());
+  dock.unfollow = useSelectionStore.subscribe((state) => {
+    const key = selectionKey(state);
+    if (key === last) return;
+    last = key;
+    // A cleared selection has nothing to inspect; leave whatever is in front.
+    if (!key) return;
+    if (dock.api?.hasMaximizedGroup?.()) return;
+    if (isPanelVisible("inspector")) return;
+    // Deferred by a microtask: selection is usually set from inside a React
+    // event handler or an op's batch, and adding a dock panel from there is how
+    // "cannot update a component while rendering a different component" starts.
+    queueMicrotask(() => {
+      // Re-checked, because a fast click-through (or an op that selects and
+      // then re-selects) can have moved on before this runs.
+      if (selectionKey(useSelectionStore.getState()) !== key) return;
+      if (dock.api?.hasMaximizedGroup?.()) return;
+      if (isPanelVisible("inspector")) return;
+      if (wouldHideTheActivePanel()) return;
+      openPanel("inspector");
+    });
+  });
 }
 
 /** Closes `id` if it is open. No-op otherwise. */
@@ -586,6 +666,8 @@ function onDockReady(event) {
 
   const container = event.containerApi?.element ?? document.querySelector(".dock-container");
   if (container) installMaximizeGestures(api, container);
+
+  followSelectionIntoInspector();
 }
 
 export function EditorShell() {

@@ -1,4 +1,5 @@
 import {
+  Aperture,
   Boxes,
   Grid3x3,
   FileCode2,
@@ -22,6 +23,7 @@ import {
   ENVIRONMENT_EXTENSIONS,
   PREFAB_EXTENSIONS,
   ANIMATOR_EXTENSIONS,
+  POST_EXTENSIONS,
   GEOMETRY_EXTENSIONS,
   ATLAS_EXTENSIONS,
   AUDIO_EXTENSIONS,
@@ -49,6 +51,7 @@ export const ASSET_TYPES = [
   { id: "scene", label: "Scenes", Icon: Layers, exts: ["scene"] },
   { id: "script", label: "Scripts", Icon: FileCode2, exts: SCRIPT_EXTENSIONS },
   { id: "animator", label: "Animators", Icon: Workflow, exts: ANIMATOR_EXTENSIONS },
+  { id: "post", label: "Post Process", Icon: Aperture, exts: POST_EXTENSIONS },
   { id: "audio", label: "Audio", Icon: Volume2, exts: AUDIO_EXTENSIONS },
   { id: "font", label: "Fonts", Icon: Type, exts: FONT_EXTENSIONS },
 ];

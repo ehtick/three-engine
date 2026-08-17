@@ -239,6 +239,146 @@ export function quantizeOccupancyRes(want) {
  *   enableComplexTriangles?: boolean, complexTriangleCapacity?: number,
  *   rayHitCoarseSkip?: boolean}} [options]
  */
+/**
+ * Sizes the four surface pools. **Pure** — no device, no buffers, no options
+ * object beyond the numbers it is handed.
+ *
+ * ## Why this is a separate function
+ *
+ * It used to be forty lines in the middle of `createOccupancyField`, which
+ * allocates GPU storage and cannot run in a test. That is exactly how the bug
+ * below survived: the arithmetic had no way to be asserted on, so a constant
+ * collision that silently disabled a tuned ratio went unnoticed through the
+ * sessions that tuned it.
+ *
+ * ## ⛔ THE BUG: the ratio was decorative on every large volume
+ *
+ * `complexTriangleCapacity` and `surfaceCapacity` were clamped by the SAME
+ * `1 << 21`. `surfaceCapacity` is itself capped there, so the moment a scene
+ * reached the record ceiling, `2097152 * 1.5 = 3145728` was clamped straight
+ * back down to `2097152` — **the triangle pool could never be larger than the
+ * record pool**, and `COMPLEX_TRIANGLES_PER_RECORD` stopped meaning anything at
+ * precisely the scenes it was tuned for.
+ *
+ * Measured on Bistro (2026-08-17), GI ultra, a 47 m volume over a 109 × 115 m
+ * city: `surface records: 1985690/2097152 claimed, triangles 4173329/2097152` —
+ * the record pool at 95 % and the triangle pool asking for **199 % of a capacity
+ * it was structurally forbidden from having**. 289 858 cells fell back to
+ * voxel-box hits, and because GI's detail box follows the camera, WHICH cells
+ * lose their triangles changes as you fly. The user's report was *"black patches
+ * ... that start filling with light, or turning black again as I move the camera
+ * around"* — a pool-sizing arithmetic error, presenting as a lighting bug.
+ *
+ * The triangle ceiling is now DERIVED from the ratio rather than colliding with
+ * it, so the constant is the only thing deciding the relationship.
+ */
+
+/**
+ * THE HARD CEILINGS ON THE SURFACE POOLS — exported, because the caller that
+ * SIZES them has to know where they stop.
+ *
+ * §GI_SPATIAL_REBUILD Part 2 B3: `#maybeLogStats` remembers measured demand in
+ * `_surfacePoolHint` and forces one rebuild to make it land. A scene whose
+ * demand exceeds these numbers can never satisfy that hint, so the rebuild is a
+ * ~20 s stall that changes nothing and then fires again on the next boot — the
+ * `forced rebuild 1/2` line the user sees every startup at ultra. Growth has to
+ * be able to ask "is what I am about to request even reachable?", and that
+ * question needs the ceilings out here rather than as locals inside the planner.
+ */
+export const SURFACE_POOL_CEILINGS = {
+  records: 1 << 21,
+  ratio: 2.5,
+  get triangles() { return Math.ceil(this.records * this.ratio); },
+};
+
+export function planSurfacePools({
+  level0VoxelCount,
+  surfaceEnabled,
+  complexEnabled,
+  surfaceRecordCapacity,
+  complexTriangleCapacity: complexOverride,
+  dynamicSurfaceRecordCapacity,
+  dynamicComplexTriangleCapacity: dynamicComplexOverride,
+}) {
+  const RECORD_BYTES = (SURFACE_RECORD_WORDS + SURFACE_SCRATCH_WORDS) * 4;
+  const RECORD_POOL_BUDGET_BYTES = 8 << 20;
+  const MAX_SURFACE_RECORDS = SURFACE_POOL_CEILINGS.records;
+  // ── 1.5, NOT 2 (§12.76, measured on the banner Sponza) ──────────────────
+  // "2 triangles per record" was an estimate for cells that fail the simple
+  // fit. The real ratio, read off a live build (`surface records:` line, 26
+  // meshes / 262k tris at 0.095 m): 970,164 triangles against 803,173 claimed
+  // records = **1.21**, and the pool sat at 48% used while costing 72 MB — the
+  // single largest term in a 150 MB field. 1.5 keeps a 24% margin over the
+  // measured ratio. It is a CEILING on a pool that allocates on demand, so the
+  // trade for a scene with denser trim than Sponza's is bounded and
+  // instrumented: overflow prints `N dense cells exceed the per-cell
+  // exact-triangle limit`, and `complexTriangleCapacity` overrides it outright.
+  const COMPLEX_TRIANGLES_PER_RECORD = 1.5;
+  // ── THE CEILING IS NOT THE DEFAULT, and conflating them was the second half
+  // of the same bug ────────────────────────────────────────────────────────
+  //
+  // The ratio above sizes a scene NOBODY HAS MEASURED. The ceiling bounds what a
+  // scene that HAS been measured is allowed to ask for — and it only ever binds
+  // for scenes whose real ratio came out HIGHER than the default. Deriving it
+  // from the default therefore guarantees it clamps exactly the scenes it exists
+  // to serve, which is the same shape as the `1 << 21` collision one edit up:
+  // Bistro's grow-on-pressure hint asked for 3 955 759 and was handed 3 145 728,
+  // still oversubscribed at 1.14x with the pool "converging" on a limit it could
+  // never reach.
+  //
+  // Sponza's measured 1.21 says nothing about this number. Bistro measures
+  // **2.09** (3 581 595 triangles / 1 712 108 records) — genuinely denser trim,
+  // not a misconfiguration. 2.5 covers it with margin.
+  //
+  // ⚠ This is a CEILING on a pool that allocates on demand from the measured
+  // hint, so a scene that does not need the headroom does not pay for it:
+  // Bistro moves 113 MB → ~129 MB, and Sponza-class scenes allocate exactly what
+  // they did before. The worst case is bounded and instrumented — the audit line
+  // prints the oversubscription ratio and what the next build will request.
+  const MAX_COMPLEX_TRIANGLE_RATIO = SURFACE_POOL_CEILINGS.ratio;
+  const MAX_COMPLEX_TRIANGLE_POOL = SURFACE_POOL_CEILINGS.triangles;
+
+  const surfaceRecordDemand = Math.max(
+    Math.ceil(level0VoxelCount / 12),
+    Math.min(
+      Math.ceil(level0VoxelCount / 3),
+      Math.floor(RECORD_POOL_BUDGET_BYTES / RECORD_BYTES),
+    ),
+  );
+  const surfaceCapacity = surfaceEnabled
+    ? Math.min(MAX_SURFACE_RECORDS, Math.max(1 << 14, surfaceRecordCapacity ?? surfaceRecordDemand))
+    : 0;
+  const complexTriangleCapacity = complexEnabled
+    ? Math.min(MAX_COMPLEX_TRIANGLE_POOL, Math.max(1 << 12,
+        complexOverride ?? Math.ceil(surfaceCapacity * COMPLEX_TRIANGLES_PER_RECORD)))
+    : 0;
+  // DYNAMIC RECORD REFIT: a reserved TAIL of the record pool, re-fitted for the
+  // DynamicBrick set on EVERY chain so movers keep exact fitted-plane
+  // silhouettes instead of degrading to occupied-box hits for as long as they
+  // move. Dynamic records live ONE dispatch — the tail cursor resets each chain
+  // and every DynamicBrick re-allocates — so there is no invalidation problem.
+  // Sized for mover SURFACE voxels, a tiny fraction of the static scene's;
+  // overflow degrades that brick to box fallback and counts a diagnostic.
+  const dynamicSurfaceCapacity = surfaceEnabled
+    ? Math.min(1 << 16, Math.max(1 << 12,
+        dynamicSurfaceRecordCapacity ?? Math.ceil(surfaceCapacity / 16)))
+    : 0;
+  // A mover's SILHOUETTE cells (as seen from a light) contain its EDGES — two
+  // faces per cell, which fail the simple-plane fit — so without exact triangles
+  // every rotated mover's shadow quantizes to full voxels along precisely the
+  // cells that define its outline.
+  const dynamicComplexTriangleCapacity = complexEnabled
+    ? Math.min(1 << 17, Math.max(1 << 10,
+        dynamicComplexOverride ?? dynamicSurfaceCapacity * 2))
+    : 0;
+  return {
+    surfaceCapacity,
+    complexTriangleCapacity,
+    dynamicSurfaceCapacity,
+    dynamicComplexTriangleCapacity,
+  };
+}
+
 export function createOccupancyField(bounds, res0, options = {}) {
   const { levels, totalWords } = planLevels(res0);
   const level0 = levels[0];
@@ -315,53 +455,25 @@ export function createOccupancyField(bounds, res0, options = {}) {
   // (fixed separately in `srcSurface.js`, measured: no change). Sponza reads
   // 0.00% throughout and is untouched by any of this.
   const level0VoxelCount = res0.x * res0.y * res0.z;
-  const RECORD_BYTES = (SURFACE_RECORD_WORDS + SURFACE_SCRATCH_WORDS) * 4;
-  const RECORD_POOL_BUDGET_BYTES = 8 << 20;
-  const surfaceRecordDemand = Math.max(
-    Math.ceil(level0VoxelCount / 12),
-    Math.min(
-      Math.ceil(level0VoxelCount / 3),
-      Math.floor(RECORD_POOL_BUDGET_BYTES / RECORD_BYTES),
-    ),
-  );
-  const surfaceCapacity = surfaceEnabled
-    ? Math.min(1 << 21, Math.max(1 << 14, options.surfaceRecordCapacity ?? surfaceRecordDemand))
-    : 0;
-  // Phase 4: complex cells keep their SHORT exact triangle list instead of
-  // degrading to an occupied box. The pool is capped for the same reason the
-  // record pool is — overflow leaves the record zero (box fallback) and counts
-  // a diagnostic, never a miss. 2 triangles per record is the measured
-  // Sponza-class ratio for cells that fail the simple fit; each costs 36 B.
+  // Declared here, not inlined into the call below: the rest of this function
+  // reads it in eight places (the finalize computes, the complex-write pass, the
+  // trace variants). Folding it into the argument list is how it went missing.
   const complexEnabled = surfaceEnabled && options.enableComplexTriangles === true;
-  const complexTriangleCapacity = complexEnabled
-    ? Math.min(1 << 21, Math.max(1 << 12, options.complexTriangleCapacity ?? surfaceCapacity * 2))
-    : 0;
-  // DYNAMIC RECORD REFIT: a reserved TAIL of the record pool, re-fitted for
-  // the DynamicBrick set on EVERY chain (fast ones included) so movers keep
-  // exact fitted-plane silhouettes instead of degrading to occupied-box hits
-  // for as long as they move ("shadows must be smooth and follow silhouettes
-  // exactly" is the standing product requirement — a moving character is
-  // permanently dynamic, so the records-off window was not an edge case).
-  // Dynamic records live ONE dispatch: the tail cursor resets each chain and
-  // every DynamicBrick re-allocates, so there is no invalidation problem to
-  // solve. Sized for mover SURFACE voxels, which are a tiny fraction of the
-  // static scene's; overflow degrades that brick to box fallback and counts
-  // a diagnostic — never a miss (same contract as the static pool).
-  const dynamicSurfaceCapacity = surfaceEnabled
-    ? Math.min(1 << 16, Math.max(1 << 12,
-        options.dynamicSurfaceRecordCapacity ?? Math.ceil(surfaceCapacity / 16)))
-    : 0;
+  const {
+    surfaceCapacity,
+    complexTriangleCapacity,
+    dynamicSurfaceCapacity,
+    dynamicComplexTriangleCapacity,
+  } = planSurfacePools({
+    level0VoxelCount,
+    surfaceEnabled,
+    complexEnabled,
+    surfaceRecordCapacity: options.surfaceRecordCapacity,
+    complexTriangleCapacity: options.complexTriangleCapacity,
+    dynamicSurfaceRecordCapacity: options.dynamicSurfaceRecordCapacity,
+    dynamicComplexTriangleCapacity: options.dynamicComplexTriangleCapacity,
+  });
   const totalSurfaceCapacity = surfaceCapacity + dynamicSurfaceCapacity;
-  // The dynamic tail's own slice of the triangle pool, refit per chain like
-  // the records. A mover's SILHOUETTE cells (as seen from a light) contain
-  // its EDGES — two faces per cell, which fail the simple-plane fit — so
-  // without exact triangles every rotated mover's shadow quantizes to full
-  // voxels along precisely the cells that define its outline. Same one-
-  // dispatch lifetime and overflow-degrades-to-box contract as the records.
-  const dynamicComplexTriangleCapacity = complexEnabled
-    ? Math.min(1 << 17, Math.max(1 << 10,
-        options.dynamicComplexTriangleCapacity ?? dynamicSurfaceCapacity * 2))
-    : 0;
   const totalComplexTriangleCapacity = complexTriangleCapacity + dynamicComplexTriangleCapacity;
   // ── STATIC SURFACE ATTRIBUTION (SRC Phase 5) ──────────────────────────────
   //
@@ -702,7 +814,30 @@ export function createOccupancyField(bounds, res0, options = {}) {
   // Local→world per instance slot. The atlas carries the INVERSE (it samples
   // slot SDFs by pushing world points into local space); voxelization pushes
   // local triangles out into world space, so it needs the forward matrix.
-  const localToWorld = uniformArray(Array.from({ length: slotCapacity }, () => new THREE.Matrix4()));
+  //
+  // ⚠ A STORAGE BUFFER, NOT A uniformArray — and this is a measured breakage,
+  // not a style choice. three packs ALL of a compute object's uniformArrays
+  // into ONE object-group UBO (`bindGroup_object`), whose binding must fit
+  // maxUniformBufferBindingSize (64KB guaranteed). As a uniformArray this was
+  // 64 bytes per slot IN THAT SHARED BUDGET, alongside `slotDynamic` and
+  // whatever else the kernel binds: 512 slots (32KB) fit with room to spare,
+  // 768 (48KB) did NOT — every GI compute submit failed with
+  //   Invalid BindGroup "bindGroup_object" … Queue.Submit(<invalid>)
+  // and a dropped submit renders as a black GI field, not as an error dialog.
+  // Storage buffers are bound individually against a ~128MB+ limit, which
+  // takes matrices out of the uniform budget entirely. The read sites are
+  // unchanged (`.element(i)` works on both node kinds); only the write path
+  // differs — flat floats + `needsUpdate` instead of Matrix4 `.copy`, see
+  // `setSlotMatrix`. Initialised to IDENTITY per slot, matching what
+  // `new THREE.Matrix4()` per entry used to give an unseated slot.
+  const localToWorldInit = new Float32Array(slotCapacity * 16);
+  for (let slot = 0; slot < slotCapacity; slot++) {
+    localToWorldInit[slot * 16 + 0] = 1;
+    localToWorldInit[slot * 16 + 5] = 1;
+    localToWorldInit[slot * 16 + 10] = 1;
+    localToWorldInit[slot * 16 + 15] = 1;
+  }
+  const localToWorld = instancedArray(localToWorldInit, "mat4");
 
   const stats = {
     res: res0,
@@ -4455,9 +4590,19 @@ export function createOccupancyField(bounds, res0, options = {}) {
   const setSlotMatrix = (slot, matrix) => {
     if (slot < 0 || slot >= slotCapacity) return;
     // No-op writes are common (every fingerprint scan re-sends every matrix)
-    // and must not invalidate the static snapshot below.
-    if (localToWorld.array[slot].equals(matrix)) return;
-    localToWorld.array[slot].copy(matrix);
+    // and must not invalidate the static snapshot below. Element-wise against
+    // the flat storage backing — `localToWorld` is a storage buffer now (see
+    // its declaration), so there is no per-slot Matrix4 to `.equals`.
+    const flat = localToWorld.value.array;
+    const base = slot * 16;
+    const elements = matrix.elements;
+    let same = true;
+    for (let i = 0; i < 16; i++) {
+      if (flat[base + i] !== elements[i]) { same = false; break; }
+    }
+    if (same) return;
+    flat.set(elements, base);
+    localToWorld.value.needsUpdate = true;
     // Self-defence for the split: a matrix write on a slot still flagged
     // STATIC invalidates the snapshot (its baked footprint moved). GISystem
     // flags movers dynamic before writing, so this fires only on the first
@@ -4935,6 +5080,18 @@ export function createOccupancyField(bounds, res0, options = {}) {
      * Both are exact questions about this array, so neither needs a screenshot.
      */
     async readbackBits(renderer) {
+      // Chrome caps `mappedAtCreation` staging buffers near 256 MB REGARDLESS
+      // of the device's raised maxBufferSize — the world-scale Bistro bits run
+      // 321 MB and the map rejects with a RangeError. A diagnostic must never
+      // throw out of the tick; callers receive null and say the count was
+      // skipped.
+      const bitsBytes = bits.value?.array?.byteLength ?? 0;
+      if (bitsBytes > 200 * 1024 * 1024) {
+        console.log(
+          `[gi] bits readback skipped — ${(bitsBytes / 1048576).toFixed(0)} MB exceeds the mappable staging cap`,
+        );
+        return null;
+      }
       const data = new Uint32Array(await renderer.getArrayBufferAsync(bits.value));
       let count = 0;
       for (let i = 0; i < level0.words; i++) {
@@ -4986,10 +5143,10 @@ export function createOccupancyField(bounds, res0, options = {}) {
       };
     },
 
-    /** Occupied-voxel count only. */
+    /** Occupied-voxel count only; null when the bits are too large to map. */
     async readbackStats(renderer) {
-      await this.readbackBits(renderer);
-      return stats;
+      const reader = await this.readbackBits(renderer);
+      return reader ? stats : null;
     },
 
     dispose() {},

@@ -34,6 +34,9 @@ export const ANIMATOR_EXTENSIONS = ["anim"];
 // event, activation and camera-shot tracks. See src/engine/timeline/.
 export const TIMELINE_EXTENSIONS = ["timeline"];
 export const GEOMETRY_EXTENSIONS = ["geom"];
+// Post-process graphs (`.post`) — the node graph a camera's Postprocess
+// component renders through. See src/modules/postprocessing/postAsset.js.
+export const POST_EXTENSIONS = ["post"];
 // Sprite atlases (`.atlas`) — regions, pivots, nine-slice borders and sprite
 // animations over an ordinary image. See src/engine/sprite/atlasAsset.js.
 export const ATLAS_EXTENSIONS = ["atlas"];

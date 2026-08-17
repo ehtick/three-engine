@@ -320,6 +320,7 @@ export function languageForPath(path) {
     case "mat":
     case "anim":
     case "timeline":
+    case "post":
     case "atlas":
     case "cubemap":
     case "meta":

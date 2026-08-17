@@ -166,9 +166,21 @@ function handle(cmd, args = {}, writableRoot = null) {
  */
 export async function installTauriShim(
   page,
-  { verbose = false, writableRoot = null, extraCommands = {} } = {},
+  { verbose = false, writableRoot = null, extraCommands = {}, autoOpenProject = false } = {},
 ) {
   const extraNames = Object.keys(extraCommands);
+  // The editor reopens the last project at launch and walks past the hub
+  // (src/editor/startupReopen.js). Harnesses are written against the hub —
+  // most click "Skip the project", and the GI/blackframe family seeds a recent
+  // list and waits on `.hub-recent-open-btn` — so a launch that skips it hangs
+  // them on a selector that never appears. A shimmed Tauri IS a test harness,
+  // so the picker is the default here; pass autoOpenProject to test the
+  // launch path itself.
+  if (!autoOpenProject) {
+    await page.evaluateOnNewDocument(() => {
+      globalThis.__editorNoAutoOpen = true;
+    });
+  }
   await page.exposeFunction("__tauriShimInvoke", async (cmd, args) => {
     try {
       // Harness-supplied handlers win, so a test can stand in for a Rust

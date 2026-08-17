@@ -1,7 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
-import { Plus, Trash2, Box, Video, Lightbulb, Sparkles, FileCode2, Package, Circle, ChevronRight, Monitor, Type, Image as ImageIcon, MousePointerClick, Rows3, ScrollText, Square, Eye, EyeOff, Play, Pause, Mountain, Spline, Search, X } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Plus, Trash2, Box, Video, Lightbulb, Sparkles, FileCode2, Package, Circle, ChevronRight, Monitor, Type, Image as ImageIcon, MousePointerClick, Rows3, ScrollText, Square, Eye, EyeOff, Play, Pause, Mountain, Spline, Search, X, ListChecks, Crosshair } from "lucide-react";
 import { useSceneStore } from "../store/sceneStore.js";
-import { useSelectionStore } from "../store/selectionStore.js";
+import { useSelectionStore, selectedIdSet } from "../store/selectionStore.js";
+import { buildSearchIndex, sortMatchIds } from "../hierarchySearch.js";
+import { chordOf, ownsKeyboard } from "../keyScope.js";
 import { useModulesStore } from "../modules.js";
 import { commandBus } from "../commands/CommandBus.js";
 import {
@@ -244,6 +246,63 @@ function isParentUiScreen(parentId) {
 /** Shared empty set so a scene with nothing collapsed doesn't allocate. */
 const NO_COLLAPSE = new Set();
 
+/**
+ * Row pitch in px — `.hierarchy-row` is a fixed 26px tall with a 1px margin top
+ * and bottom. Fixed on purpose: it is what lets the search results be windowed
+ * with arithmetic instead of measurement.
+ */
+const ROW_PITCH = 28;
+
+/** Rows rendered beyond the viewport on each side, so a scroll shows content
+ *  rather than blank space while React catches up. */
+const OVERSCAN = 12;
+
+/**
+ * Windows a flat list of rows to what the scroll container can actually show.
+ *
+ * Search mode renders every match at depth 0, and a query like "mesh" in a real
+ * scene matches thousands. Rendered whole, each keystroke re-mounted 1500 rows
+ * — 1.2 SECONDS per character typed, measured, which makes the filter box
+ * unusable at exactly the size that makes filtering worth doing. Windowing turns
+ * that into ~40 rows regardless of how many matched.
+ *
+ * Only search mode needs it: the tree is recursive and folded by default, so it
+ * renders its roots and whatever the user chose to open.
+ *
+ * @returns {{ start: number, end: number }} half-open row range to render
+ */
+function useRowWindow(enabled, count, scrollRef) {
+  const [range, setRange] = useState({ start: 0, end: OVERSCAN * 4 });
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!enabled || !el) {
+      setRange((prev) => (prev.start === 0 ? prev : { start: 0, end: OVERSCAN * 4 }));
+      return;
+    }
+    const update = () => {
+      const fits = Math.ceil(el.clientHeight / ROW_PITCH);
+      // Clamped against `count`, because a narrowing query shrinks the list
+      // while the container still holds the old scrollTop for one frame. The
+      // browser corrects that (and fires another scroll), but an unclamped
+      // start would render an empty window under a full-height spacer in the
+      // meantime — a blank panel, which reads as broken rather than as pending.
+      const first = Math.max(0, Math.min(Math.floor(el.scrollTop / ROW_PITCH), Math.max(0, count - fits)));
+      const start = Math.max(0, first - OVERSCAN);
+      const end = Math.min(count, first + fits + OVERSCAN);
+      setRange((prev) => (prev.start === start && prev.end === end ? prev : { start, end }));
+    };
+    update();
+    el.addEventListener("scroll", update, { passive: true });
+    const observer = new ResizeObserver(update);
+    observer.observe(el);
+    return () => {
+      el.removeEventListener("scroll", update);
+      observer.disconnect();
+    };
+  }, [enabled, count, scrollRef]);
+  return range;
+}
+
 /** True when the mirrored entity table holds nothing — cheaper than
  *  `Object.keys(...).length` on a scene-sized map, and this is asked on every
  *  render of the panel. */
@@ -352,17 +411,47 @@ function EntityIcon({ components }) {
   return <Icon className={`entity-icon ${color}`} size={13} strokeWidth={1.75} />;
 }
 
-/** Depth-first visible order of entity ids (for shift-range selection). */
-function flattenTree(rootIds, entities) {
+/**
+ * Depth-first order of the rows actually ON SCREEN — the list every range
+ * gesture and every keyboard move runs over.
+ *
+ * `collapsedIds` is the whole point. Walking the full tree instead (which this
+ * used to do) meant a shift-click spanning a folded parent silently swept in
+ * every hidden descendant: the user selected two visible rows and got two
+ * hundred, with no way to see what they'd hit. What you can see is what you can
+ * range-select.
+ */
+function visibleOrder(rootIds, entities, collapsedIds) {
   const out = [];
   const walk = (id) => {
     const e = entities[id];
     if (!e) return;
     out.push(id);
-    e.childIds.forEach(walk);
+    if (!collapsedIds?.has(id)) e.childIds.forEach(walk);
   };
   rootIds.forEach(walk);
   return out;
+}
+
+/**
+ * Scrolls a row into view once React has actually rendered it.
+ *
+ * Reveal is three state changes at once (clear the query, unfold the ancestors,
+ * select) and the row does not exist in the DOM until they commit — a scroll
+ * issued in the same tick finds nothing and silently does nothing, which is
+ * exactly how "clicking a search result doesn't scroll to it" looks. Two
+ * animation frames put us after the commit and after layout; the retry covers
+ * the case where an ancestor's own re-render lands a frame later.
+ */
+function scrollRowIntoView(id, attempts = 6) {
+  requestAnimationFrame(() => {
+    const row = document.querySelector(`.hierarchy-panel .hierarchy-row[data-entity-id="${CSS.escape(id)}"]`);
+    if (row) {
+      row.scrollIntoView({ block: "center", behavior: "auto" });
+      return;
+    }
+    if (attempts > 0) scrollRowIntoView(id, attempts - 1);
+  });
 }
 
 /** Walks the subtree under `id` and returns every descendant id (depth-first,
@@ -378,47 +467,6 @@ function collectDescendants(id, entities) {
     if (e.childIds.length) stack.push(...e.childIds);
   }
   return out;
-}
-
-/**
- * Rank an entity against the search query in the priority order the user
- * asked for. Returns a numeric tier where lower = better; `Infinity` means
- * "no match". Tiers:
- *   0 — name starts with query (case-insensitive)
- *   1 — name contains query
- *   2 — entity has a component whose type starts with query
- *   3 — entity has a component whose type contains query
- *   4 — entity carries a tag containing the query
- *
- * Both the name and every component type are checked in this priority, so
- * "can" jumps to the top for entities literally named "can" AND for any
- * entity carrying a `camera` component.
- *
- * A `tag:` prefix searches tags exclusively — "tag:enemy" finds every tagged
- * enemy without also dragging in the entity someone named "Enemy spawn note".
- */
-function matchTier(entity, q) {
-  const tags = (entity.tags ?? []).map((tag) => tag.toLowerCase());
-  if (q.startsWith("tag:")) {
-    const needle = q.slice(4).trim();
-    if (!needle) return tags.length ? 0 : Infinity;
-    if (tags.some((tag) => tag === needle)) return 0;
-    return tags.some((tag) => tag.includes(needle)) ? 1 : Infinity;
-  }
-  const name = (entity.name ?? "").toLowerCase();
-  if (name.startsWith(q)) return 0;
-  if (name.includes(q)) return 1;
-  const components = entity.components ?? {};
-  for (const type of Object.keys(components)) {
-    const t = type.toLowerCase();
-    if (t.startsWith(q)) return 2;
-  }
-  for (const type of Object.keys(components)) {
-    const t = type.toLowerCase();
-    if (t.includes(q)) return 3;
-  }
-  if (tags.some((tag) => tag.includes(q))) return 4;
-  return Infinity;
 }
 
 /**
@@ -450,26 +498,6 @@ function HighlightedName({ name, query, tier }) {
   );
 }
 
-/** Builds the search index for the current scene: { id -> tier }. Walks the
- *  full scene (not just visible rows) so collapsed branches still surface
- *  when they match the query. Returns `null` when the query is empty so the
- *  caller can fast-path to "show everything". */
-function buildSearchIndex(rootIds, entities, query) {
-  const q = query.trim().toLowerCase();
-  if (!q) return null;
-  const out = {};
-  const stack = [...rootIds];
-  while (stack.length) {
-    const id = stack.pop();
-    const e = entities[id];
-    if (!e) continue;
-    const tier = matchTier(e, q);
-    if (tier !== Infinity) out[id] = { tier };
-    if (e.childIds.length) stack.push(...e.childIds);
-  }
-  return out;
-}
-
 /** Walks from `id` up to the scene root, collecting every ancestor id.
  *  Used to uncollapse the path to a search result so the user lands on
  *  the right row when search exits. */
@@ -488,7 +516,33 @@ function collectAncestors(id, entities) {
   return out;
 }
 
-function handleRowClick(e, id, rootIds, entities) {
+/**
+ * Selection half of a row click, shared by the tree and by search results.
+ *
+ * `getOrder()` yields the ids currently on screen, in display order — the tree's
+ * visible rows, or the ranked match list while searching. Both modes go through
+ * here on purpose: a filtered list is still a list, and "search, then shift-click
+ * from the first hit to the last" is the whole reason someone filters 1500
+ * meshes down in the first place.
+ */
+function applyRowSelection(e, id, getOrder) {
+  const sel = useSelectionStore.getState();
+  // Ctrl+Shift = extend the range without dropping what other ranges added.
+  if (e.shiftKey && sel.anchorId) {
+    const order = getOrder();
+    const a = order.indexOf(sel.anchorId);
+    const b = order.indexOf(id);
+    if (a === -1 || b === -1) return sel.select(id);
+    const range = order.slice(Math.min(a, b), Math.max(a, b) + 1);
+    if (e.ctrlKey || e.metaKey) sel.add(range, sel.anchorId);
+    else sel.select(range, sel.anchorId);
+    return;
+  }
+  if (e.ctrlKey || e.metaKey) sel.toggle(id);
+  else sel.select(id);
+}
+
+function handleRowClick(e, id, getOrder) {
   if (suppressNextClick) {
     suppressNextClick = false;
     return;
@@ -559,18 +613,7 @@ function handleRowClick(e, id, rootIds, entities) {
     }
     return;
   }
-  const sel = useSelectionStore.getState();
-  if (e.ctrlKey || e.metaKey) {
-    sel.toggle(id);
-  } else if (e.shiftKey && sel.anchorId) {
-    const order = flattenTree(rootIds, entities);
-    const a = order.indexOf(sel.anchorId);
-    const b = order.indexOf(id);
-    if (a === -1 || b === -1) return sel.select(id);
-    sel.select(order.slice(Math.min(a, b), Math.max(a, b) + 1), sel.anchorId);
-  } else {
-    sel.select(id);
-  }
+  applyRowSelection(e, id, getOrder);
 }
 
 /**
@@ -692,7 +735,7 @@ function EntityRow({
   dropHint,
   setDropHint,
   onContextMenu,
-  rootIds,
+  getRowOrder,
   collapsedIds,
   onToggleCollapsed,
   draggingIds,
@@ -702,7 +745,10 @@ function EntityRow({
   onPickSearchResult,
 }) {
   const entity = useSceneStore((s) => s.entities[id]);
-  const selected = useSelectionStore((s) => s.ids.includes(id));
+  // Set lookup, not `ids.includes(id)` — see selectedIdSet. Every row runs this
+  // on every selection change, and a 1500-row search result makes the linear
+  // version quadratic.
+  const selected = useSelectionStore((s) => selectedIdSet(s.ids).has(id));
   const prefab = usePrefabRowInfo(id);
   // Assets-panel drags (.prefab/.entity/.glb) land on rows as "add as child".
   const assetDropRef = useAssetDrop({
@@ -728,17 +774,23 @@ function EntityRow({
   const hasChildren = !isSearching && entity.childIds.length > 0;
   const collapsed = hasChildren && collapsedIds.has(id);
 
-  // While searching, clicking a hit exits the search and lands the user on
-  // the full hierarchy with that entity's path uncollapsed and selected.
-  // Outside of search, the regular select / drag / pick handlers in
-  // handleRowClick apply.
+  // A click means the same thing in both modes: select, with Ctrl to toggle and
+  // Shift to range. It used to *exit* the search and jump to the row, which made
+  // the results list unusable for its most valuable job — filter to 1500 meshes,
+  // select them all, change one property. Getting to the row in the tree is now
+  // the deliberate gesture (double-click, or Reveal in the row menu) rather than
+  // the accidental one.
   const onRowClick = (e) => {
-    if (isSearching) {
-      e.stopPropagation();
-      onPickSearchResult?.(id);
-      return;
-    }
-    handleRowClick(e, id, rootIds, useSceneStore.getState().entities);
+    if (isSearching) e.stopPropagation();
+    handleRowClick(e, id, getRowOrder);
+  };
+
+  // Double-click renames in the tree; in search results it reveals, because the
+  // tree is where you rename and the results list is where you're still looking
+  // for things. Rename is still on the row's context menu in both.
+  const onRowDoubleClick = () => {
+    if (isSearching) onPickSearchResult?.(id);
+    else setRenamingId(id);
   };
 
   const commitRename = (value) => {
@@ -778,7 +830,7 @@ function EntityRow({
         data-entity-id={id}
         ref={assetDropRef}
         onClick={onRowClick}
-        onDoubleClick={() => setRenamingId(id)}
+        onDoubleClick={onRowDoubleClick}
         onContextMenu={(e) => onContextMenu(e, id)}
         onPointerDown={(e) => onRowPointerDown(e, id)}
       >
@@ -841,7 +893,7 @@ function EntityRow({
             dropHint={dropHint}
             setDropHint={setDropHint}
             onContextMenu={onContextMenu}
-            rootIds={rootIds}
+            getRowOrder={getRowOrder}
             collapsedIds={collapsedIds}
             forcedCollapsed={null}
             onToggleCollapsed={onToggleCollapsed}
@@ -920,10 +972,25 @@ function prefabMenuItems(single) {
   ];
 }
 
-function ContextMenu({ menu, close, setRenamingId, onCreate, onNewScene, terrainEnabled }) {
+function ContextMenu({
+  menu,
+  close,
+  setRenamingId,
+  onCreate,
+  onNewScene,
+  terrainEnabled,
+  onSelectAll,
+  onInvertSelection,
+  onReveal,
+  getRowOrder,
+}) {
   const selection = useSelectionStore.getState().ids;
   const single = selection.length === 1 ? selection[0] : null;
   const canPaste = clipboardHasEntities();
+  // Rows on screen right now — the filtered list while a search is running.
+  // Computed here rather than passed in, because the menu is the only thing
+  // that needs the number and it only exists while it is open.
+  const rowCount = getRowOrder().length;
 
   // A mutating workflow may only run on a provider that can close its own
   // tool set (see aiStore.runWorkflow — this mirrors that check so the menu
@@ -949,6 +1016,10 @@ function ContextMenu({ menu, close, setRenamingId, onCreate, onNewScene, terrain
         { label: UI_SCREEN_PRESET.label, icon: UI_SCREEN_PRESET.Icon, action: () => onCreate(UI_SCREEN_PRESET.spec) },
         { separator: true },
         { label: "Paste", shortcut: "Ctrl+V", disabled: !canPaste, action: () => pasteEntities(null) },
+        { separator: true },
+        { label: `Select All (${rowCount})`, shortcut: "Ctrl+A", disabled: !rowCount, action: onSelectAll },
+        { label: "Deselect All", shortcut: "Alt+A", disabled: !selection.length, action: () => useSelectionStore.getState().clear() },
+        { separator: true },
         { label: "New Scene", action: onNewScene },
       ]
     : [
@@ -965,6 +1036,17 @@ function ContextMenu({ menu, close, setRenamingId, onCreate, onNewScene, terrain
         { label: "Duplicate", shortcut: "Ctrl+D", action: duplicateSelection },
         { label: "Group Selection", shortcut: "Ctrl+G", disabled: selection.length < 2, action: groupSelection },
         { label: "Rename", disabled: !single, action: () => setRenamingId(single) },
+        { separator: true },
+        // "Select All" here means the rows on screen, which is the filtered list
+        // while a search is running — the point of the whole gesture.
+        { label: `Select All (${rowCount})`, shortcut: "Ctrl+A", disabled: !rowCount, action: onSelectAll },
+        { label: "Invert Selection", shortcut: "Ctrl+I", disabled: !rowCount, action: onInvertSelection },
+        {
+          label: "Reveal in Hierarchy",
+          icon: Crosshair,
+          disabled: !single,
+          action: () => onReveal(single),
+        },
         ...applyTransformMenuItems(single),
         ...prefabMenuItems(single),
         { separator: true },
@@ -989,7 +1071,10 @@ export function HierarchyPanel() {
   const rootIds = useSceneStore((s) => s.rootIds);
   const sceneName = useSceneStore((s) => s.sceneName);
   const dirty = useSceneStore((s) => s.dirty);
-  const selection = useSelectionStore((s) => s.ids);
+  // The count, not the array — the toolbar only needs "is anything selected",
+  // and subscribing to the array re-renders the whole panel every time a 1500-id
+  // selection is rebuilt.
+  const selectionCount = useSelectionStore((s) => s.ids.length);
   const terrainEnabled = useModulesStore((s) => s.enabled.includes("terrain"));
   const stage = usePrefabStore((s) => s.stage);
   const stageDirty = usePrefabStore((s) => s.stageDirty);
@@ -1009,12 +1094,28 @@ export function HierarchyPanel() {
   const [draggingIds, setDraggingIds] = useState([]);
   const [ghostPos, setGhostPos] = useState(null); // {x, y}
   const [searchQuery, setSearchQuery] = useState("");
+  // Keyboard cursor: the row the arrows move from. Distinct from the selection
+  // anchor because Shift+Arrow has to grow a range while the anchor stays put.
+  const cursorRef = useRef(null);
+  const searchInputRef = useRef(null);
+  const treeRef = useRef(null);
 
   // Assets dropped on empty tree space spawn at the scene root.
   const treeAssetDropRef = useAssetDrop({
     accepts: DROPPABLE_ASSET_EXTENSIONS,
     onDrop: (path) => dropAssetOnEntity(path, null),
   });
+
+  // The scroll container is both an asset drop target and the thing the row
+  // window measures against; one node, two consumers. Memoized so the drop
+  // target isn't unregistered and re-registered on every render.
+  const setTreeRef = useCallback(
+    (el) => {
+      treeRef.current = el;
+      treeAssetDropRef(el);
+    },
+    [treeAssetDropRef],
+  );
 
   // Whenever the scene swaps (boot, File → Open, File → New Scene, project
   // switch), adopt that scene's remembered collapse state — DURING RENDER, not
@@ -1179,11 +1280,18 @@ export function HierarchyPanel() {
     });
   };
 
-  /** Search-mode "exit to entity": when the user clicks a hit, clear the
-   *  query, drop every ancestor of the chosen entity from `collapsedIds`
-   *  so the path is fully expanded, and select the entity. The hierarchy
-   *  then snaps back to its normal tree view, focused on the picked row. */
-  const onPickSearchResult = (id) => {
+  /**
+   * "Take me to this entity in the tree": clear any search, unfold every
+   * ancestor so the path is open, select it, and SCROLL IT INTO VIEW.
+   *
+   * The scroll is not a nicety. Revealing a row in a scene of a few thousand
+   * entities lands it hundreds of rows down a scroll container the user is not
+   * looking at — the selection changed, the inspector changed, and the tree
+   * appeared not to react at all. `scrollRowIntoView` waits for the row to
+   * actually exist, because none of the three state changes above have
+   * committed at the time this returns.
+   */
+  const revealEntity = useCallback((id) => {
     const entities = useSceneStore.getState().entities;
     const ancestors = collectAncestors(id, entities);
     setCollapsedIds((prev) => {
@@ -1192,8 +1300,10 @@ export function HierarchyPanel() {
       return next;
     });
     useSelectionStore.getState().select(id);
+    cursorRef.current = id;
     setSearchQuery("");
-  };
+    scrollRowIntoView(id);
+  }, []);
 
   // Search → match index. Recomputed only when the query or scene changes;
   // empty query short-circuits to `null` so the tree falls back to normal
@@ -1214,14 +1324,161 @@ export function HierarchyPanel() {
 
   // Sorted match ids for the "X results" pill. Tier-0/1 (name) first, then
   // tier-2/3 (component), with name as the stable tiebreaker.
-  const sortedMatchIds = useMemo(() => {
-    if (!searchMatches) return [];
-    return Object.keys(searchMatches).sort((a, b) => {
-      const t = searchMatches[a].tier - searchMatches[b].tier;
-      if (t !== 0) return t;
-      return (entities[a]?.name ?? "").localeCompare(entities[b]?.name ?? "");
-    });
-  }, [searchMatches, entities]);
+  const sortedMatchIds = useMemo(() => sortMatchIds(searchMatches, entities), [searchMatches, entities]);
+
+  /**
+   * The ids on screen, in display order — the one list every multi-select
+   * gesture agrees on: shift-ranges, Ctrl+A, arrow keys, invert.
+   *
+   * A function rather than a memoized array on purpose. In tree mode the order
+   * depends on the entity map, and *subscribing* to that map here would undo the
+   * fix directly below: sceneStore replaces the map object on every
+   * pointermove of a gizmo drag, so a subscription re-renders every row of the
+   * panel on every drag frame. Read at click/keypress time, it costs nothing
+   * while nothing is happening.
+   */
+  const getRowOrder = useCallback(() => {
+    if (searchMatches) return sortedMatchIds;
+    return visibleOrder(rootIds, useSceneStore.getState().entities, collapsedIds);
+  }, [searchMatches, sortedMatchIds, rootIds, collapsedIds]);
+
+  const rowWindow = useRowWindow(!!searchMatches, sortedMatchIds.length, treeRef);
+
+  // A new query starts at the top of its results. Without this, refining a
+  // search leaves the list scrolled to where the previous one was read, which
+  // for a narrower query is usually past the end of the new one.
+  useEffect(() => {
+    if (treeRef.current) treeRef.current.scrollTop = 0;
+  }, [searchQuery]);
+
+  /**
+   * Brings a row into view, whether or not it is currently rendered.
+   *
+   * With the results windowed, Home/End (and any jump past the overscan) targets
+   * a row that does not exist in the DOM yet, so `scrollRowIntoView` alone would
+   * find nothing and quietly do nothing. Scrolling to the row's arithmetic
+   * position first makes the window render it; the DOM-based pass then lands it
+   * exactly.
+   */
+  const scrollToRow = useCallback(
+    (id, index) => {
+      const el = treeRef.current;
+      if (el && searchMatches && index >= 0) {
+        const top = index * ROW_PITCH;
+        if (top < el.scrollTop || top + ROW_PITCH > el.scrollTop + el.clientHeight) {
+          el.scrollTop = Math.max(0, top - Math.max(0, (el.clientHeight - ROW_PITCH) / 2));
+        }
+      }
+      scrollRowIntoView(id);
+    },
+    [searchMatches],
+  );
+
+  /** Everything on screen, in one selection. */
+  const selectAllRows = useCallback(() => {
+    const order = getRowOrder();
+    if (!order.length) return;
+    useSelectionStore.getState().select(order, order[0]);
+    cursorRef.current = order[order.length - 1];
+  }, [getRowOrder]);
+
+  /** Selected rows become unselected and vice versa, within what's on screen. */
+  const invertSelection = useCallback(() => {
+    const order = getRowOrder();
+    const current = selectedIdSet(useSelectionStore.getState().ids);
+    const next = order.filter((id) => !current.has(id));
+    if (next.length) useSelectionStore.getState().select(next, next[0]);
+    else useSelectionStore.getState().clear();
+    cursorRef.current = next[next.length - 1] ?? null;
+  }, [getRowOrder]);
+
+  /**
+   * Moves the keyboard cursor by `delta` rows (or to an absolute `to` index),
+   * selecting as it goes. Shift grows the range from the anchor instead of
+   * replacing the selection — the same contract as shift-click, so the two
+   * gestures can be mixed without the selection jumping.
+   */
+  const moveCursor = useCallback(
+    (delta, { extend = false, to = null } = {}) => {
+      const order = getRowOrder();
+      if (!order.length) return;
+      const sel = useSelectionStore.getState();
+      const from = order.indexOf(cursorRef.current ?? sel.anchorId ?? "");
+      const index =
+        to === "first" ? 0
+        : to === "last" ? order.length - 1
+        : from === -1 ? (delta > 0 ? 0 : order.length - 1)
+        : Math.min(order.length - 1, Math.max(0, from + delta));
+      const id = order[index];
+      cursorRef.current = id;
+      if (extend && sel.anchorId && order.includes(sel.anchorId)) {
+        const a = order.indexOf(sel.anchorId);
+        sel.select(order.slice(Math.min(a, index), Math.max(a, index) + 1), sel.anchorId);
+      } else {
+        sel.select(id);
+      }
+      scrollToRow(id, index);
+    },
+    [getRowOrder, scrollToRow],
+  );
+
+  // The hierarchy's own keymap. `keyScope` hands us only the chords listed in
+  // HIERARCHY_CLAIMS, and only when the pointer or focus is actually in this
+  // panel — so Delete, Ctrl+D and Ctrl+Z still reach the global handler from
+  // right here, and none of these fire while the user is typing in the filter
+  // box (that resolves to the "text" scope instead).
+  useEffect(() => {
+    const onKey = (e) => {
+      if (!ownsKeyboard("hierarchy", e)) return;
+      const chord = chordOf(e);
+      const handled = () => {
+        e.preventDefault();
+        e.stopPropagation();
+      };
+      switch (chord) {
+        // Ctrl+A is the universal spelling; Shift+A is Blender's, and both
+        // land on people who use this panel.
+        case "ctrl+a":
+        case "shift+a":
+          handled();
+          return selectAllRows();
+        case "ctrl+shift+a":
+        case "alt+a":
+          handled();
+          return useSelectionStore.getState().clear();
+        case "ctrl+i":
+          handled();
+          return invertSelection();
+        case "arrowdown":
+          handled();
+          return moveCursor(1);
+        case "arrowup":
+          handled();
+          return moveCursor(-1);
+        case "shift+arrowdown":
+          handled();
+          return moveCursor(1, { extend: true });
+        case "shift+arrowup":
+          handled();
+          return moveCursor(-1, { extend: true });
+        case "home":
+          handled();
+          return moveCursor(0, { to: "first" });
+        case "end":
+          handled();
+          return moveCursor(0, { to: "last" });
+        case "shift+home":
+          handled();
+          return moveCursor(0, { to: "first", extend: true });
+        case "shift+end":
+          handled();
+          return moveCursor(0, { to: "last", extend: true });
+        default:
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [selectAllRows, invertSelection, moveCursor]);
 
   const createEntity = async (spec) => {
     setMenuOpen(false);
@@ -1341,7 +1598,7 @@ export function HierarchyPanel() {
         <button
           className="toolbar-btn icon-only"
           title="Delete selection (Del)"
-          disabled={!selection.length}
+          disabled={!selectionCount}
           onClick={deleteSelection}
         >
           <Trash2 size={14} />
@@ -1349,10 +1606,11 @@ export function HierarchyPanel() {
         <div className="hierarchy-search">
           <Search size={12} className="hierarchy-search-icon" />
           <input
+            ref={searchInputRef}
             className="hierarchy-search-input"
             type="text"
             placeholder="Search name, component, tag:…"
-            title="Search by name or component type. Prefix with tag: to search tags only."
+            title="Search by name or component type. Prefix with tag: to search tags only. Ctrl+Shift+A selects every result."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             onKeyDown={(e) => {
@@ -1361,18 +1619,46 @@ export function HierarchyPanel() {
                 setSearchQuery("");
                 return;
               }
+              // The field is a text field, so Ctrl+A rightly selects the query
+              // text — the "select every result" gesture needs its own chord
+              // that no text field claims. Same one the tree answers to.
+              if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "a") {
+                e.preventDefault();
+                e.stopPropagation();
+                selectAllRows();
+                return;
+              }
+              // Down-arrow walks out of the box and into the results, so a
+              // filtered list is navigable without touching the mouse.
+              if (e.key === "ArrowDown" && sortedMatchIds.length > 0) {
+                e.preventDefault();
+                e.stopPropagation();
+                cursorRef.current = null;
+                moveCursor(1);
+                return;
+              }
               // Enter on a non-empty query jumps straight to the top match:
               // clear the search, uncollapse the path to that entity, and
-              // select it. Mirrors what happens on click but keeps the
-              // keyboard flow for "type → Enter → land" without a mouse.
+              // select it. Mirrors double-click but keeps the keyboard flow
+              // for "type → Enter → land" without a mouse.
               if (e.key === "Enter" && sortedMatchIds.length > 0) {
                 e.preventDefault();
                 e.stopPropagation();
-                onPickSearchResult(sortedMatchIds[0]);
+                revealEntity(sortedMatchIds[0]);
               }
             }}
             spellCheck={false}
           />
+          {searchQuery && sortedMatchIds.length > 0 && (
+            <button
+              type="button"
+              className="hierarchy-search-selectall"
+              title={`Select all ${sortedMatchIds.length} results (Ctrl+Shift+A)`}
+              onClick={selectAllRows}
+            >
+              <ListChecks size={12} />
+            </button>
+          )}
           {searchQuery && (
             <button
               type="button"
@@ -1394,12 +1680,23 @@ export function HierarchyPanel() {
         </div>
       </div>
       <div className="scene-label">
-        {sceneName}
-        {dirty ? " •" : ""}
+        <span className="scene-label-name">
+          {sceneName}
+          {dirty ? " •" : ""}
+        </span>
+        {/* A multi-selection is invisible once it runs past the visible rows —
+            you cannot tell 40 selected from 1500 by looking. The count is the
+            only confirmation that Ctrl+A did what you asked before you change
+            a property on all of them. */}
+        {selectionCount > 1 && (
+          <span className="scene-label-selection" title="Entities selected">
+            {selectionCount} selected
+          </span>
+        )}
       </div>
       <div
         className={`hierarchy-tree ${isFollowPickArmed() || getTerrainScatterSourcePick() ? "follow-pick-armed" : ""}`}
-        ref={treeAssetDropRef}
+        ref={setTreeRef}
         onClick={(e) => {
           if (isFollowPickArmed()) {
             // A click on a row already handled the pick via handleRowClick;
@@ -1420,7 +1717,12 @@ export function HierarchyPanel() {
           setContextMenu({ x: e.clientX, y: e.clientY, empty: true });
         }}
       >
-        {(searchMatches ? sortedMatchIds : rootIds).map((id) => (
+        {/* Windowed results stand on a spacer as tall as the rows above them, so
+            the scrollbar still describes the whole match list. */}
+        {searchMatches && rowWindow.start > 0 && (
+          <div style={{ height: rowWindow.start * ROW_PITCH }} aria-hidden />
+        )}
+        {(searchMatches ? sortedMatchIds.slice(rowWindow.start, rowWindow.end) : rootIds).map((id) => (
           <EntityRow
             key={id}
             id={id}
@@ -1430,7 +1732,7 @@ export function HierarchyPanel() {
             dropHint={dropHint}
             setDropHint={setDropHint}
             onContextMenu={onRowContextMenu}
-            rootIds={rootIds}
+            getRowOrder={getRowOrder}
             collapsedIds={collapsedIds}
             forcedCollapsed={null}
             onToggleCollapsed={onToggleCollapsed}
@@ -1438,9 +1740,12 @@ export function HierarchyPanel() {
             onRowPointerDown={onRowPointerDown}
             searchMatches={searchMatches}
             searchQuery={searchQuery}
-            onPickSearchResult={onPickSearchResult}
+            onPickSearchResult={revealEntity}
           />
         ))}
+        {searchMatches && sortedMatchIds.length > rowWindow.end && (
+          <div style={{ height: (sortedMatchIds.length - rowWindow.end) * ROW_PITCH }} aria-hidden />
+        )}
         {searchMatches && sortedMatchIds.length === 0 && (
           <div className="hierarchy-search-empty">No entities match “{searchQuery}”.</div>
         )}
@@ -1453,6 +1758,10 @@ export function HierarchyPanel() {
           onCreate={createEntity}
           onNewScene={createScene}
           terrainEnabled={terrainEnabled}
+          onSelectAll={selectAllRows}
+          onInvertSelection={invertSelection}
+          onReveal={revealEntity}
+          getRowOrder={getRowOrder}
         />
       )}
       {ghostPos && draggingIds.length > 0 && (

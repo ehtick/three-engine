@@ -81,10 +81,11 @@ import {
   instancedArray,
   int,
   uint,
+  vec3,
   wgslFn,
 } from "three/tsl";
 import { BIN_BUDGET, CASCADE_COUNT, INFLUX_ONE, MAX_LODS, PROBE_MAX_AGE, W0, blockCapacities } from "./srcConfig.js";
-import { KEY_EMPTY } from "./srcMath.js";
+import { KEY_EMPTY, worldKeysEnabled } from "./srcMath.js";
 import {
   cellPosition,
   chebyshev,
@@ -92,11 +93,14 @@ import {
   keyCell,
   keyLod,
   keySecondary,
+  keyWorldCell,
   latticeOrigin,
   lodAtDistance,
+  lodOuterRadius,
   nearestCell,
   packProbeKey,
   probeSpacing,
+  worldCellAt,
 } from "./srcMathTsl.js";
 
 /**
@@ -213,6 +217,18 @@ export const COUNTER_NOBLOCK = 5;
  * the failure the cold guard and the governor can produce between them.
  */
 export const COUNTER_BOOSTED = 6;
+/**
+ * Probes RETAINED off-screen this frame by S1's locality rule (the last spare
+ * counter word).
+ *
+ * Its own counter for the reason every counter in this block has one: "retention
+ * is armed", "retention is armed and the scene never leaves reach", and
+ * "retention is armed and the crowding guard is holding it off" all render
+ * IDENTICALLY — as a scene that behaves exactly like the shipped build. This is
+ * the only reading that separates them, and without it the unit could regress to
+ * a no-op and no gate would notice.
+ */
+export const COUNTER_HELD = 7;
 
 // ═════════════════════════════════════════════════════════ THE WGSL ISLAND
 
@@ -491,7 +507,39 @@ export function createSrcProbeStore({
   // before the mechanism existed — the same statement `INFLUX_ONE` makes one
   // region up, by the same mechanism (a skip, not a computed identity).
   const surpriseBase = influxBase + blockTotal;
-  const freeInit = new Uint32Array(surpriseBase + blockTotal);
+  // ── AND A SIXTH: THE PER-BLOCK HOLD STAMP (S1's locality retention) ──────
+  //
+  // The frame number on which this block's owning probe was RETAINED WITHOUT
+  // BEING VISIBLE — indexed `heldBase + blockBase[c] + block`, exactly as the
+  // other three per-block regions are, and riding this buffer for the same R7
+  // reason (fold, don't multiply bindings).
+  //
+  // ══ WHY RETENTION NEEDS A SECOND MECHANISM AT ALL ═══════════════════════
+  //
+  // Keeping an off-screen probe ALIVE is not the same as keeping its ANSWER.
+  // The decay pass runs over every allocated bin every frame and multiplies by
+  // `keep`, so a probe held for a second while the camera looks elsewhere comes
+  // back holding `keep^60` of what it knew — i.e. black. Retention on its own
+  // would hold a slot whose payload has faded, which is strictly WORSE than
+  // retiring it: the gather would read a dark VOTE where it used to read an
+  // absence, and R1 is the rule that a missing probe must never darken.
+  //
+  // So the age pass stamps the blocks it is holding, and the decay freezes
+  // (`keep = 1`) on the ones stamped THIS frame.
+  //
+  // ⚠ THE TEST IS VISIBILITY, NOT "DID IT GET RAYS". Under the ray stride a
+  // VISIBLE probe receives rays only every S-th frame, and the decay is
+  // deliberately the S-th root so the product over S frames is exactly `1−α`
+  // (§12.23). Freezing on "no rays this frame" would decay visible probes S
+  // times too slowly and un-calibrate every temporal measurement in §12. A
+  // probe resolved by a pixel last frame has `PROBE_AGE == 0`, and that — not
+  // the ray count — is what this stamp keys on.
+  //
+  // Zero-filled: a block nobody has held reads a stamp that cannot equal any
+  // real frame number, so a build that never arms retention decays bit-for-bit
+  // as before. Same compatibility argument the influx and surprise regions make.
+  const heldBase = surpriseBase + blockTotal;
+  const freeInit = new Uint32Array(heldBase + blockTotal);
   freeInit.fill(INFLUX_ONE, influxBase, surpriseBase);
   for (const c of cascades) {
     for (let i = 0; i < c.probeCapacity; i++) {
@@ -525,6 +573,8 @@ export function createSrcProbeStore({
     blockInfluxBase: influxBase,
     /** Where the per-block surprise words start inside `freeStack`. */
     blockSurpriseBase: surpriseBase,
+    /** Where the per-block HOLD stamps start inside `freeStack` (S1 retention). */
+    blockHeldBase: heldBase,
     /** Where the c0 hash→block words start inside `hashKeys` (§12.39). */
     hashBlockBase,
     hashKeys,
@@ -534,10 +584,11 @@ export function createSrcProbeStore({
     freeStack,
     freeTop,
     /** Bytes on the GPU, for the memory high-water telemetry (plan §8). */
-    // `blockTotal * 4` — the block free stack plus the three per-block regions
-    // riding this buffer's tail (stamps, influx words, surprise words).
+    // `blockTotal * 5` — the block free stack plus the FOUR per-block regions
+    // riding this buffer's tail (claim stamps, influx words, surprise words,
+    // hold stamps).
     bytes: (hashTotal * 2 + cascades[0].hashCapacity + probeTotal * PROBE_WORDS + probeTotal
-      + blockTotal * 4 + cascadeCount * (COUNTER_WORDS + 2)) * 4,
+      + blockTotal * 5 + cascadeCount * (COUNTER_WORDS + 2)) * 4,
     dispose() {
       for (const b of [hashKeys, hashSlot, probeTable, counters, freeStack, freeTop]) {
         b?.value?.dispose?.();
@@ -582,6 +633,9 @@ export function createHashClearPass(store) {
       // whose threads all add into this word, so a thread clearing it would
       // race the ones already counting. This pass runs frames earlier.
       atomicStore(counters.element(base.add(COUNTER_BOOSTED)), uint(0));
+      // Same rule as BOOSTED: cleared here, frames before the age pass that
+      // counts into it, so no thread clears a word its siblings are adding to.
+      atomicStore(counters.element(base.add(COUNTER_HELD)), uint(0));
     });
   })().compute(hashTotal);
 }
@@ -601,13 +655,17 @@ export function createHashClearPass(store) {
  * bounded number of frames, and a flag that is set at birth and never cleared
  * would make every probe permanently fresh.
  */
-export function createAgePass(store, cascade, { maxAge = PROBE_MAX_AGE } = {}) {
+export function createAgePass(store, cascade, {
+  maxAge = PROBE_MAX_AGE,
+  retain = null,
+} = {}) {
   const c = store.cascades[cascade];
   const { hashKeys, hashSlot, probeTable, counters, freeStack, freeTop, cascadeCount } = store;
   // Where this cascade's block region starts inside the shared stack, and which
   // top word owns it. Both are JS constants folded into the shader.
   const blockStack = store.blockStackBase + c.blockBase;
   const blockTopWord = cascadeCount + cascade;
+  const heldStamp = store.blockHeldBase + c.blockBase;
   return Fn(() => {
     const p = instanceIndex.add(uint(c.probeBase)).toVar();
     const w = p.mul(PROBE_WORDS).toVar();
@@ -624,7 +682,69 @@ export function createAgePass(store, cascade, { maxAge = PROBE_MAX_AGE } = {}) {
     const age = probeTable.element(w.add(PROBE_AGE)).add(1).toVar();
     const key = probeTable.element(w.add(PROBE_KEY)).toVar();
 
-    If(age.greaterThan(uint(maxAge)), () => {
+    // ── S1: LOCALITY RETIREMENT ──────────────────────────────────────────────
+    //
+    // `PROBE_AGE` is FRAMES SINCE A PIXEL LOOKED AT THIS PROBE, so the shipped
+    // rule retires on VISIBILITY: turn the camera, and a second later every
+    // probe behind you is gone along with its accumulated payload. Turn back and
+    // the whole neighbourhood cold-starts at α ≈ 0.02. That is the plan's "black
+    // patches that cannot keep up", and it is not a tuning problem — the state is
+    // keyed to what is on screen right now.
+    //
+    // World-absolute keys make the fix expressible: a probe's identity is now a
+    // permanent property of its world cell, so it can be kept across ANY camera
+    // motion and still be the same probe when it comes back. The rule becomes
+    // LOCALITY — is this probe still in the neighbourhood its LOD serves? —
+    // and visibility only decides who gets RAYS (which is the part of SRC that
+    // was already right: `srcRays` budgets off `pixelProbe`, so a retained probe
+    // costs storage and nothing else).
+    //
+    // ⚠ TWO BOUNDS, BOTH LOAD-BEARING.
+    //
+    //  · `outOfReach` retires immediately regardless of age. A probe the camera
+    //    has walked away from is not coming back cheaply, and its key would
+    //    eventually alias (the ±256-cell window) — retiring it at the shell
+    //    boundary is what keeps the alias proof true rather than merely likely.
+    //  · `crowded` falls back to the VISIBILITY age when the table is filling.
+    //    Retention grows the population from "visible surface cells" to "every
+    //    surface cell in the neighbourhood", which is several times larger, and
+    //    an insert that fails is a probe that DOES NOT EXIST — strictly worse
+    //    than a cold one, because the pixel gathers nothing at all. So retention
+    //    yields to capacity, every time, and the guard is what makes it safe to
+    //    arm rather than a gamble on the scene fitting.
+    const effMaxAge = uint(maxAge).toVar();
+    if (retain) {
+      const lodI = keyLod(key).toVar();
+      const s = probeSpacing(cascade, float(lodI), retain.spacing0).toVar();
+      const pos = vec3(keyWorldCell(key, retain.camera, s)).mul(s).toVar();
+      const cheb = chebyshev(pos, retain.camera).toVar();
+      const outOfReach = cheb.greaterThan(lodOuterRadius(float(lodI), retain.spacing0));
+      // Last frame's live count. One frame stale by construction (compaction
+      // writes it after this pass) and that is fine — it is a pressure signal,
+      // not a correctness input.
+      const live = atomicLoad(counters.element(uint(cascade * COUNTER_WORDS + COUNTER_LIVE))).toVar();
+      const crowded = live.greaterThan(uint(Math.floor(c.probeCapacity * retain.highWater)));
+      If(outOfReach.not().and(crowded.not()), () => {
+        effMaxAge.assign(uint(retain.maxAge));
+        // HOLD THIS BLOCK'S PAYLOAD. Only when the probe is INVISIBLE
+        // (`age > 1` — age was incremented above, so 1 means "resolved last
+        // frame"), because a visible probe must keep decaying at the calibrated
+        // rate whether or not the ray stride gave it rays this frame. See
+        // `blockHeldBase` for the full argument.
+        If(age.greaterThan(uint(1)), () => {
+          const block = probeTable.element(w.add(PROBE_BLOCK)).toVar();
+          If(block.notEqual(uint(SLOT_EMPTY)), () => {
+            freeStack.element(uint(heldStamp).add(block)).assign(retain.frameStamp);
+            atomicAdd(counters.element(uint(cascade * COUNTER_WORDS + COUNTER_HELD)), uint(1));
+          });
+        });
+      }).Else(() => {
+        // Out of reach retires NOW, not in `maxAge` frames — see the bound note.
+        If(outOfReach, () => { effMaxAge.assign(uint(0)); });
+      });
+    }
+
+    If(age.greaterThan(effMaxAge), () => {
       probeTable.element(w.add(PROBE_FLAGS)).assign(uint(0));
       probeTable.element(w.add(PROBE_AGE)).assign(uint(0));
       // ── RELEASE THE BIN BLOCK ──────────────────────────────────────────
@@ -1022,9 +1142,56 @@ export function createSrcProbeFrame(store, {
     return { lod, spacing: s, origin: latticeOrigin(anchor, s).toVar() };
   };
 
+  // ── S1: THE CELL A POINT KEYS TO, AND THE POSITION A KEY NAMES ───────────
+  //
+  // Two functions rather than the four call sites below each spelling out the
+  // choice, because the two must agree: `keyCellOf` decides what goes INTO a key
+  // and `keyPosition` reads it back out, and a build where one is world-absolute
+  // and the other is anchor-relative populates probes at positions half a window
+  // away from where the transport thinks they are — plausible light, wrong place,
+  // and no energy check can see it.
+  //
+  // Anchor-relative (the shipped default) is exactly what it always was.
+  const worldKeys = worldKeysEnabled();
+  const keyCellOf = (position, L) =>
+    worldKeys ? worldCellAt(position, anchor, L.spacing) : nearestCell(position, L.origin, L.spacing);
+  /**
+   * World position of the cell a key names.
+   *
+   * ⚠ Under world-absolute keying this needs the CAMERA, not the anchor: the
+   * 9-bit field holds `worldCell mod 512` and the representative is chosen within
+   * ±256 cells of wherever the viewer is. That is the one cost of the scheme and
+   * the reason `keyCell` alone is never enough (it returns a residue).
+   */
+  const keyPosition = (key, spacing, origin) =>
+    worldKeys
+      ? vec3(keyWorldCell(key, camera, spacing)).mul(float(spacing))
+      : cellPosition(keyCell(key), origin, spacing);
+
   const passes = [];
   passes.push(createHashClearPass(store));
-  for (let c = 0; c < N; c++) passes.push(createAgePass(store, c, { maxAge }));
+  // ── S1: THE RETENTION BUNDLE, OR NULL ────────────────────────────────────
+  //
+  // Built only under world-absolute keys, because locality retention is not
+  // expressible without them: holding a probe across a camera move is only
+  // meaningful if it is still the SAME probe afterwards, and under anchor-relative
+  // keys a re-anchor renames it. Arming one without the other would retain probes
+  // right up to the anchor jump that renumbers every one of them.
+  const retain = worldKeysEnabled() && globalThis.__giSrcProbeRetain !== false && frameStamp
+    ? {
+        camera,
+        spacing0,
+        frameStamp,
+        // Long enough to be "held", finite so a probe whose surface was deleted
+        // is still reclaimed. Geometry edits rebuild the field anyway; this is
+        // the backstop for the case that does not.
+        maxAge: Number(globalThis.__giSrcProbeRetainAge) || 3600,
+        // Retention yields to capacity at this fraction of the slot pool — see
+        // the `crowded` note in `createAgePass`.
+        highWater: Number(globalThis.__giSrcProbeRetainHighWater) || 0.6,
+      }
+    : null;
+  for (let c = 0; c < N; c++) passes.push(createAgePass(store, c, { maxAge, retain }));
 
   // ── [B] cascade 0, from the gbuffer ───────────────────────────────────────
   passes.push(createInsertPass(
@@ -1034,7 +1201,7 @@ export function createSrcProbeFrame(store, {
       const key = uint(KEY_EMPTY).toVar();
       If(px.valid, () => {
         const L = latticeAt(px.position, 0);
-        const cell = nearestCell(px.position, L.origin, L.spacing).toVar();
+        const cell = keyCellOf(px.position, L).toVar();
         // `secondary` is 0: the multibounce cache inserts into the same maps
         // under the key's secondary bit, and it is Phase 5's caller, not this
         // one's parameter — a flag here would be a knob nothing sets.
@@ -1074,7 +1241,7 @@ export function createSrcProbeFrame(store, {
         lodI,
         lod,
         secondary: keySecondary(key),
-        position: cellPosition(keyCell(key), origin, s).toVar(),
+        position: keyPosition(key, s, origin).toVar(),
       };
     };
 
@@ -1091,7 +1258,10 @@ export function createSrcProbeFrame(store, {
           // own. §4.5: no cross-LOD interaction, anywhere.
           const s = probeSpacing(c, ch.lod, spacing0).toVar();
           const origin = latticeOrigin(anchor, s).toVar();
-          key.assign(packProbeKey(ch.lodI, ch.secondary, nearestCell(ch.position, origin, s)));
+          key.assign(packProbeKey(
+            ch.lodI, ch.secondary,
+            keyCellOf(ch.position, { spacing: s, origin }),
+          ));
         });
         return key;
       },
@@ -1117,6 +1287,8 @@ export function createSrcProbeFrame(store, {
     pixelProbe,
     pixelHash,
     passes,
+    /** Non-null when S1 locality retention is armed — for the boot line. */
+    retain,
     /**
      * Dispatch the frame in order. The order IS the algorithm — every gap
      * between two passes is a barrier WebGPU can only express as a dispatch
@@ -1164,6 +1336,8 @@ export async function readSrcProbeStats(renderer, store) {
       // cascade anyway, because a nonzero here on c1+ would mean the counter
       // block's stride and the pass's cascade disagree.
       boosted: raw[base + COUNTER_BOOSTED] >>> 0,
+      /** S1: probes held off-screen this frame instead of retired. */
+      held: raw[base + COUNTER_HELD] >>> 0,
       probeCapacity: c.probeCapacity,
       hashCapacity: c.hashCapacity,
       blockCapacity: c.blockCapacity,
@@ -1188,6 +1362,10 @@ export function formatSrcProbeStats(stats) {
       // Printed only when it fires. A probe born without bins is invisible in
       // every other number here — it is live, keyed and ray-budgeted — so this
       // is the only place "the bin budget is too small for this scene" appears.
-      (s.noBlock ? ` NOBLOCK ${s.noBlock}/${s.blockCapacity}` : ""))
+      (s.noBlock ? ` NOBLOCK ${s.noBlock}/${s.blockCapacity}` : "") +
+      // Printed only when retention actually holds something — a zero here on an
+      // armed build means the scene never leaves reach or the crowding guard is
+      // suppressing it, and those are different problems from "not armed".
+      (s.held ? ` held ${s.held}` : ""))
     .join("  |  ");
 }

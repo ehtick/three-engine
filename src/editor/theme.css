@@ -578,6 +578,29 @@ body,
   color: var(--text);
 }
 
+/* "Select all results" — the mouse spelling of Ctrl+Shift+A. Same quiet
+ * ghost-button treatment as the clear X so the field still reads as one
+ * control, not a toolbar. */
+.hierarchy-search-selectall {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.hierarchy-search-selectall:hover {
+  background: var(--fill-2);
+  color: var(--accent, #4da3ff);
+}
+
 /* Quiet tally — same surface as the toolbar, not a notification pill.
  * Color flips to the accent only when there's a query AND zero matches,
  * so an empty result is the only state that calls attention to itself. */
@@ -2200,12 +2223,30 @@ body.macro-active .viewport-canvas {
 }
 
 .scene-label {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
   padding: 7px 12px 5px;
   font-size: 10.5px;
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.07em;
   color: var(--text-dim);
+}
+
+.scene-label-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The selected-entity tally. Accent-coloured because it is the only on-screen
+ * confirmation that a Ctrl+A over a filtered list caught what the user meant,
+ * and they are about to edit every one of them at once. */
+.scene-label-selection {
+  flex-shrink: 0;
+  color: var(--accent);
 }
 
 .hierarchy-tree {
@@ -4897,6 +4938,44 @@ input[type="checkbox"]:checked::after {
 }
 
 /* ---------- Project hub ---------- */
+
+/**
+ * The one-screen "we're getting there" state: shown while the last project
+ * reopens at launch, and behind the lazy EditorShell chunk. Same ground as the
+ * hub so a launch that walks past the picker does not flash a different
+ * background on its way to the editor.
+ */
+.editor-splash {
+  height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-0);
+  color: var(--text-dim);
+  font-size: 13px;
+  letter-spacing: 0.01em;
+  animation: editor-splash-in 0.6s var(--ease) both;
+}
+
+/* Delayed rather than instant: a reopen that takes 80ms should read as the app
+   opening, not as a message that appeared and left again. */
+@keyframes editor-splash-in {
+  from {
+    opacity: 0;
+  }
+  60% {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .editor-splash {
+    animation: none;
+  }
+}
 
 .hub-shell {
   position: relative;

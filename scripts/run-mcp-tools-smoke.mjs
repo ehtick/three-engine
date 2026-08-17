@@ -141,8 +141,36 @@ check(
   (badEffect.error ?? "").slice(0, 60),
 );
 
+// Probe.png is 64x32 here, so "fit into a 32x32 box" has a wrong answer (32x32)
+// and a right one (32x16) — a square source could not tell them apart.
+const fitted = await page.evaluate(
+  (d) => globalThis.__call("texture_resizeMany", { paths: [`${d}/Probe.png`], width: 32, height: 32, mode: "fit" }),
+  dir,
+);
+check(
+  "texture.resizeMany fits inside the box without distorting",
+  fitted.ok === true && fitted.result?.resized?.[0]?.width === 32 && fitted.result?.resized?.[0]?.height === 16,
+  JSON.stringify(fitted.result ?? fitted.error),
+);
+
+const mixed = await page.evaluate(
+  (d) => globalThis.__call("texture_resizeMany", { paths: [`${d}/Probe.png`, `${d}/Notes.txt`], scale: 100 }),
+  dir,
+);
+check(
+  "…and reports the files it skipped instead of silently dropping them",
+  mixed.ok === true && mixed.result?.skipped?.length === 1 && mixed.result?.unchanged?.length === 1,
+  JSON.stringify(mixed.result ?? mixed.error),
+);
+
 const resized = await page.evaluate((d) => globalThis.__call("texture_resize", { path: `${d}/Probe.png`, width: 32, height: 32 }), dir);
 check("texture.resize resamples", resized.ok === true && resized.result?.width === 32, JSON.stringify(resized.result ?? resized.error));
+const resizedInfo = await page.evaluate((d) => globalThis.__call("texture_info", { path: `${d}/Probe.png` }), dir);
+check(
+  "…and the file on disk is that size, not just the answer",
+  resizedInfo.result?.width === 32 && resizedInfo.result?.height === 32,
+  JSON.stringify(resizedInfo.result ?? resizedInfo.error),
+);
 
 const meta = await page.evaluate((d) => globalThis.__call("texture_setMeta", { path: `${d}/Probe.png`, colorSpace: "linear" }), dir);
 check("texture.setMeta writes the colour-space flag", meta.ok === true, meta.error ?? "");
@@ -297,11 +325,127 @@ check("…carrying the edited mesh, not the original cube", (savedGeom?.position
 const afterCommit = await page.evaluate(() => globalThis.__call("geometry_status"));
 check("…and closes the session", afterCommit.result?.open === false);
 
+// --- post-process graphs (.post) ---------------------------------------------
+//
+// The graph used to be a blob inside the .scene, so "does this op work" and
+// "did anything reach the disk" were the same question and neither was
+// checkable. Now it is a document: every check below is against the FILE, plus
+// the one thing a file can't show — that a live camera picked the change up.
+
+const postGate = await page.evaluate((r) => globalThis.__call("post_create", { path: `${r}/Gated.post` }), root.replaceAll("\\", "/"));
+check(
+  "post.create refuses while the postprocessing module is off",
+  postGate.ok === false && /postprocessing/.test(postGate.error ?? ""),
+  (postGate.error ?? "").slice(0, 60),
+);
+check("…and writes nothing", !fs.existsSync(path.join(root, "Gated.post")));
+
+await page.evaluate(() => globalThis.__call("module_setEnabled", { id: "postprocessing", enabled: true }));
+await wait(600);
+
+const postTypes = await page.evaluate(() => globalThis.__call("post_nodeTypes"));
+const postNodes = postTypes.result?.nodes ?? [];
+check("post.nodeTypes lists the node registry", postNodes.length >= 20, `${postNodes.length} types`);
+check(
+  "…with each param's default and whether it is a live uniform",
+  postNodes.some((n) => n.type === "bloom" && n.params.some((p) => p.kind === "hot" && p.default !== undefined)),
+);
+
+const postCreated = await page.evaluate((r) => globalThis.__call("post_create", { path: `${r}/Look` }), root.replaceAll("\\", "/"));
+check("post.create writes a new .post", postCreated.ok === true, postCreated.error ?? "");
+check("…appending the extension when it is missing", fs.existsSync(path.join(root, "Look.post")));
+check("…as a passthrough, not an empty file", postCreated.result?.label === "Passthrough", JSON.stringify(postCreated.result));
+
+const GRADE = {
+  nodes: [
+    { id: "in", type: "input", props: {}, position: { x: 0, y: 0 } },
+    { id: "bl", type: "bloom", props: { strength: 0.6 }, position: { x: 200, y: 0 } },
+    { id: "out", type: "output", props: {}, position: { x: 400, y: 0 } },
+  ],
+  edges: [
+    { source: "in", sourceHandle: "color", target: "bl", targetHandle: "color" },
+    { source: "bl", sourceHandle: "out", target: "out", targetHandle: "color" },
+  ],
+};
+
+const noOutput = await page.evaluate(
+  (args) => globalThis.__call("post_set", { path: `${args.r}/Look.post`, graph: { nodes: [args.g.nodes[0]], edges: [] } }),
+  { r: root.replaceAll("\\", "/"), g: GRADE },
+);
+check("post.set refuses a graph with no Output node", noOutput.ok === false, (noOutput.error ?? "").slice(0, 60));
+
+const badType = await page.evaluate(
+  (args) => {
+    const graph = structuredClone(args.g);
+    graph.nodes[1].type = "blooom";
+    return globalThis.__call("post_set", { path: `${args.r}/Look.post`, graph });
+  },
+  { r: root.replaceAll("\\", "/"), g: GRADE },
+);
+check("…and a typo'd node type, by name", badType.ok === false && /blooom/.test(badType.error ?? ""), (badType.error ?? "").slice(0, 60));
+check(
+  "…without touching the file either time",
+  JSON.parse(fs.readFileSync(path.join(root, "Look.post"), "utf8")).graph.nodes.length === 2,
+);
+
+const postSet = await page.evaluate(
+  (args) => globalThis.__call("post_set", { path: `${args.r}/Look.post`, graph: args.g }),
+  { r: root.replaceAll("\\", "/"), g: GRADE },
+);
+check("post.set writes the graph", postSet.ok === true, postSet.error ?? "");
+const onDisk = JSON.parse(fs.readFileSync(path.join(root, "Look.post"), "utf8"));
+check("…to the file, versioned", onDisk.version === 1 && onDisk.graph.nodes.length === 3, JSON.stringify(Object.keys(onDisk)));
+check("…keeping the param that was set", onDisk.graph.nodes.find((n) => n.id === "bl")?.props?.strength === 0.6);
+
+// A camera to point it at. `post.assign` is the whole reason a .post is not
+// just a file in a folder.
+const cam = await page.evaluate(() =>
+  globalThis.__call("entity_create", { name: "PostCam", components: [{ type: "camera" }, { type: "postprocess" }] }),
+);
+const camId = cam.result?.id;
+check("a camera with a Post Process component exists to assign to", !!camId, cam.error ?? "");
+
+const assigned = await page.evaluate(
+  (args) => globalThis.__call("post_assign", { entityId: args.id, path: `${args.r}/Look.post` }),
+  { id: camId, r: root.replaceAll("\\", "/") },
+);
+check("post.assign points the camera at it", assigned.ok === true && assigned.result?.changed === true, assigned.error ?? "");
+
+await wait(500);
+const camGraph = await page.evaluate((id) => globalThis.__call("post_get", { entityId: id }), camId);
+check(
+  "…and the camera now RENDERS the file, not an inline graph",
+  camGraph.result?.source === "asset" && camGraph.result?.label === "bloom",
+  JSON.stringify({ source: camGraph.result?.source, label: camGraph.result?.label }),
+);
+
+const postList = await page.evaluate(() => globalThis.__call("post_list"));
+const listed = (postList.result?.graphs ?? []).find((g) => g.path.endsWith("Look.post"));
+check("post.list finds it", !!listed, (postList.result?.graphs ?? []).map((g) => g.path).join(", "));
+check("…and names the camera using it", listed?.usedBy?.some((u) => u.entityId === camId), JSON.stringify(listed?.usedBy));
+
+const cleared = await page.evaluate((id) => globalThis.__call("post_assign", { entityId: id, path: "" }), camId);
+check("post.assign clears the slot", cleared.ok === true && cleared.result?.path === "", cleared.error ?? "");
+
+const escapePost = await page.evaluate(() => globalThis.__call("post_create", { path: "C:/Windows/Temp/Escape.post" }));
+check(
+  "post.create refuses a path outside the project",
+  escapePost.ok === false && /outside the open project/.test(escapePost.error ?? ""),
+  (escapePost.error ?? "").slice(0, 60),
+);
+
 // --- libraries and build ------------------------------------------------------
 
 const libStatus = await page.evaluate(() => globalThis.__call("library_status"));
 const providers = libStatus.result?.providers ?? [];
-check("library.status answers for every library", providers.length === 4, providers.map((p) => p.id).join(", "));
+// Written out rather than counted so adding a library fails here with the
+// name of the one that has no status, instead of an off-by-one on a number.
+const LIBRARIES = ["polyhaven", "ambientcg", "sketchfab", "polypizza", "itchio"];
+check(
+  "library.status answers for every library",
+  LIBRARIES.every((id) => providers.some((p) => p.id === id)) && providers.length === LIBRARIES.length,
+  providers.map((p) => p.id).join(", "),
+);
 check(
   "…and explains what is missing rather than just refusing",
   providers.every((p) => p.ready || (p.note ?? "").length > 10),

@@ -39,12 +39,19 @@
 //    while p is camera-relative and loses a bit per octave once it is not. The
 //    lattice origins are camera-anchored precisely so this stays true (§4.2);
 //    a build that anchors at the world origin instead re-imports the problem.
+//    ⚠ `worldCellAt` (S1's world-absolute keying) produces a WORLD cell index
+//    and therefore looks like exactly that mistake. It is not: it keeps the
+//    division camera-relative and recovers the world index by INTEGER addition
+//    of the origin's own cell. Read its header before writing anything here that
+//    divides an absolute coordinate — the naive `round(p/s)` is the trap this
+//    note describes, and it is one character away.
 //
 // docs/GI_SRC_REBUILD_PLAN.md §4.2, §7 Phase 1.
 
 import {
   Fn,
   bitAnd,
+  bool,
   bitOr,
   bitXor,
   cos,
@@ -71,6 +78,7 @@ import {
   R2_ALPHA2_FX,
   R2_FX_TO_UNIT,
   R2_HALF_FX,
+  worldKeysEnabled,
 } from "./srcMath.js";
 import { KEY_MAX_LODS, LOD0_REACH, LOD_OVERLAP, MAX_LODS, R0_OVER_S0, GAMMA } from "./srcConfig.js";
 
@@ -264,6 +272,36 @@ export function rayDirection(n, normal, jitterX = 0, jitterY = 0) {
 export function packProbeKey(lod, secondary, cell) {
   const l = int(lod).toVar();
   const c = ivec3(cell).toVar();
+  if (worldKeysEnabled()) {
+    // WORLD-ABSOLUTE TWIN of `srcMath.packProbeKey`'s world branch. `cell` is a
+    // WORLD cell; the 9-bit field takes its residue. No bias, no range test —
+    // the window is toroidal, so no cell is unrepresentable.
+    //
+    // ⚠ `bitAnd` ON THE SIGNED INT, THEN `uint`. A world cell is NEGATIVE
+    // wherever the lattice runs the other side of the world origin, and
+    // `uint(negative)` is not a value WGSL will let you reason about — masking
+    // first is what makes the two's-complement residue the SAME nine bits the
+    // JS mirror's `cx & 511` produces. Converting first and masking after
+    // happens to agree on most hardware and is not guaranteed to.
+    const keyW = bitOr(
+      bitOr(
+        shiftLeft(bitAnd(uint(l.add(1)), uint(0xf)), uint(28)),
+        shiftLeft(uint(secondary), uint(27)),
+      ),
+      bitOr(
+        shiftLeft(uint(bitAnd(c.x, int(KEY_AXIS_RANGE - 1))), uint(18)),
+        bitOr(
+          shiftLeft(uint(bitAnd(c.y, int(KEY_AXIS_RANGE - 1))), uint(9)),
+          uint(bitAnd(c.z, int(KEY_AXIS_RANGE - 1))),
+        ),
+      ),
+    );
+    return select(
+      l.greaterThanEqual(0).and(l.lessThan(KEY_MAX_LODS)),
+      keyW,
+      uint(KEY_EMPTY),
+    );
+  }
   const x = c.x.add(KEY_AXIS_OFFSET).toVar();
   const y = c.y.add(KEY_AXIS_OFFSET).toVar();
   const z = c.z.add(KEY_AXIS_OFFSET).toVar();
@@ -296,18 +334,71 @@ export function keySecondary(key) {
   return bitAnd(shiftRight(uint(key), uint(27)), uint(1));
 }
 
-/** Cell coordinates of a packed key, un-biased back to signed. */
+/**
+ * Cell coordinates of a packed key.
+ *
+ * Un-biased back to signed under anchor-relative keying; the RAW `[0,512)`
+ * residue under world-absolute keying, where recovering the world cell needs a
+ * reference and is `keyWorldCell` instead. Every call site that turns a key into
+ * a POSITION must use that one — this alone is off by a multiple of 512 cells.
+ */
 export function keyCell(key) {
   const k = uint(key).toVar();
+  const bias = worldKeysEnabled() ? 0 : KEY_AXIS_OFFSET;
   return ivec3(
-    int(bitAnd(shiftRight(k, uint(18)), uint(KEY_AXIS_RANGE - 1))).sub(KEY_AXIS_OFFSET),
-    int(bitAnd(shiftRight(k, uint(9)), uint(KEY_AXIS_RANGE - 1))).sub(KEY_AXIS_OFFSET),
-    int(bitAnd(k, uint(KEY_AXIS_RANGE - 1))).sub(KEY_AXIS_OFFSET),
+    int(bitAnd(shiftRight(k, uint(18)), uint(KEY_AXIS_RANGE - 1))).sub(bias),
+    int(bitAnd(shiftRight(k, uint(9)), uint(KEY_AXIS_RANGE - 1))).sub(bias),
+    int(bitAnd(k, uint(KEY_AXIS_RANGE - 1))).sub(bias),
   );
+}
+
+/**
+ * The unique cell congruent to `packed` mod 512 within ±256 of `ref` — twin of
+ * `srcMath.wrapCellNear`, and the inverse of the world-absolute pack.
+ *
+ * ⚠ NO `%`. `bitAnd` with 511 on the signed difference is the two's-complement
+ * residue, which matches the mirror's `&` exactly; a WGSL `%` on a negative
+ * operand truncates toward zero and would disagree for every probe on the
+ * negative side of the camera.
+ */
+export function wrapCellNear(packed, ref) {
+  const p = ivec3(packed).toVar();
+  const r = ivec3(ref).toVar();
+  const d = ivec3(
+    bitAnd(p.x.sub(r.x).add(KEY_AXIS_OFFSET), int(KEY_AXIS_RANGE - 1)),
+    bitAnd(p.y.sub(r.y).add(KEY_AXIS_OFFSET), int(KEY_AXIS_RANGE - 1)),
+    bitAnd(p.z.sub(r.z).add(KEY_AXIS_OFFSET), int(KEY_AXIS_RANGE - 1)),
+  ).toVar();
+  return r.add(d).sub(ivec3(KEY_AXIS_OFFSET));
+}
+
+/**
+ * A key's WORLD cell, given the camera position and the lattice spacing.
+ *
+ * Under anchor-relative keying this is `keyCell` unchanged — the caller adds the
+ * lattice origin as it always did. Under world-absolute keying it resolves the
+ * residue against the camera's own cell, which is what makes a probe's position
+ * a function of its key alone (plus where you are standing) rather than of a
+ * camera-following anchor that renumbers everything when it jumps.
+ */
+export function keyWorldCell(key, camera, spacing) {
+  const cell = keyCell(key);
+  if (!worldKeysEnabled()) return cell;
+  const s = float(spacing).toVar();
+  const cam = vec3(camera).toVar();
+  const refCell = ivec3(
+    int(roundHalfUp(cam.x.div(s))),
+    int(roundHalfUp(cam.y.div(s))),
+    int(roundHalfUp(cam.z.div(s))),
+  ).toVar();
+  return wrapCellNear(cell, refCell);
 }
 
 /** True when a cell is representable at all. Twin of `probeKeyInWindow`. */
 export function probeKeyInWindow(cell) {
+  // Vacuously true under a toroidal window — see the mirror's note on why this
+  // stays a call rather than being deleted at the call sites.
+  if (worldKeysEnabled()) return bool(true);
   const c = ivec3(cell).toVar();
   return c.x.add(KEY_AXIS_OFFSET).greaterThanEqual(0)
     .and(c.y.add(KEY_AXIS_OFFSET).greaterThanEqual(0))
@@ -339,6 +430,20 @@ export function hashKey(key) {
  */
 export function probeSpacing(cascade, lod, spacing0) {
   return float(spacing0).mul(1 << cascade).mul(float(lod).exp2());
+}
+
+/**
+ * OUTER Chebyshev radius of LOD `lod` — where the shell stops being the one
+ * selected. Twin of `srcConfig.lodRadius(lod + 1, spacing0)`, i.e.
+ * `s₀·LOD0_REACH·2^(lod+1)`.
+ *
+ * Exists for the LOCALITY RETIREMENT rule (S1): "is this probe still in the
+ * neighbourhood its LOD serves?" is the question that replaces "has a pixel
+ * looked at this probe recently?", and it has to be asked on the GPU, per probe,
+ * from the probe's own key.
+ */
+export function lodOuterRadius(lod, spacing0) {
+  return float(spacing0).mul(LOD0_REACH).mul(float(lod).add(1).exp2());
 }
 
 /**
@@ -383,6 +488,62 @@ export function latticeOrigin(anchor, spacing) {
     roundHalfUp(a.y.div(s)).mul(s),
     roundHalfUp(a.z.div(s)).mul(s),
   );
+}
+
+/**
+ * The lattice origin expressed as an INTEGER CELL INDEX — `round(anchor/s)`,
+ * which is the intermediate `latticeOrigin` already computes before scaling back
+ * up. Twin of `srcMath.latticeOriginCellFor`.
+ */
+export function latticeOriginCell(anchor, spacing) {
+  const s = float(spacing).toVar();
+  const a = vec3(anchor).toVar();
+  return ivec3(
+    int(roundHalfUp(a.x.div(s))),
+    int(roundHalfUp(a.y.div(s))),
+    int(roundHalfUp(a.z.div(s))),
+  );
+}
+
+/**
+ * THE WORLD CELL of a point — the key's coordinate under world-absolute keying,
+ * computed WITHOUT ever dividing an absolute world coordinate.
+ *
+ * ══ WHY IT IS NOT JUST `round(p/s)` ════════════════════════════════════════
+ *
+ * Trap 4 in this file's header is explicit: `(p − origin)/spacing` is exact
+ * enough in f32 only while `p` is CAMERA-RELATIVE, and "a build that anchors at
+ * the world origin instead re-imports the problem". A naive world-absolute key
+ * would do exactly that — divide raw world coordinates — and lose a mantissa bit
+ * per octave of distance from the world origin. At 10 km out that is ~6 cm of a
+ * 0.35 m cell; further out it is a cell, and then probes on the two sides of one
+ * surface disagree about which cell they belong to.
+ *
+ * So the subtraction STAYS camera-relative and the world index is recovered in
+ * integers:
+ *
+ *     worldCell = round(anchor/s) + round((p − round(anchor/s)·s)/s)
+ *
+ * which is identically `round(p/s)` for any integer origin cell, because
+ * `round(x − n) = round(x) − n` when n is an integer. The f32 division only ever
+ * sees a camera-relative offset, and the anchor contributes through exact
+ * integer addition.
+ *
+ * ══ AND THIS IS WHAT DELETES THE RE-ANCHOR ═════════════════════════════════
+ *
+ * The result does not depend on WHERE the anchor is — move it and `originCell`
+ * and `localCell` change by equal and opposite integers. So the anchor stops
+ * being a thing probe identity is measured against and becomes purely a
+ * numerical-precision device: it may follow the camera every single frame at
+ * zero cost, and no probe is ever renumbered. `REANCHOR_CHEBYSHEV`, the 64·s₀
+ * drift threshold, the cold-guard re-arm it triggers, and the "wholesale history
+ * loss on long moves" the plan attributes to it all become unreachable code.
+ */
+export function worldCellAt(p, anchor, spacing) {
+  const originCell = latticeOriginCell(anchor, spacing).toVar();
+  const s = float(spacing).toVar();
+  const local = nearestCell(p, vec3(originCell).mul(s), s);
+  return ivec3(originCell).add(local);
 }
 
 /** The nearest lattice cell to `p` — the ONE cell a pixel inserts. */

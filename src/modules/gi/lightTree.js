@@ -111,6 +111,12 @@
 //     +27..29 box axis Y (unit; axis Z = cross(X, Y))              (f32)
 //     +30     mesh id                                              (u32)
 //     +31     instance id (0xffffffff = whole mesh)                (u32)
+//     ⚠ (mesh id, instance id) IS NOT AN EMITTER IDENTITY. A sparse mesh is
+//     refit as several emitters (`splitSparseEmitter`), and every piece carries
+//     the same pair — they describe WHICH MESH this emitter came from, which is
+//     what a self-hit test wants and what a per-emitter history does not. If
+//     something ever needs to name one emitter across frames, give it the
+//     record index or add a word; do not assume this pair is unique.
 //
 // ══ THE SAMPLER ═════════════════════════════════════════════════════════════
 //
@@ -251,8 +257,17 @@ export function emitterFromMesh(mesh, options = {}) {
   const flip = matrix.determinant() < 0 ? -1 : 1;
 
   const index = geometry.index;
-  const triCount = Math.floor((index ? index.count : position.count) / 3);
+  // A SUBSET of the mesh's triangles, when `collectEmitters` split a sparse
+  // emissive mesh into the separate pieces it actually holds — see
+  // `splitSparseEmitter`. Every loop below walks `triAt(t)` instead of `t`, and
+  // the fitted shape comes from the SUBSET's own local AABB rather than the
+  // geometry's, which is the whole point: a shape fitted to all the triangles
+  // is exactly the too-large shape the split exists to stop making.
+  const subset = options.triangles ?? null;
+  const meshTriCount = Math.floor((index ? index.count : position.count) / 3);
+  const triCount = subset ? subset.length : meshTriCount;
   if (triCount < 1) return null;
+  const triAt = subset ? (t) => subset[t] : (t) => t;
   const posArray = position.array;
   const idxArray = index ? index.array : null;
   const xf = (vi, out) => {
@@ -269,13 +284,29 @@ export function emitterFromMesh(mesh, options = {}) {
   const c = [0, 0, 0];
   const bmin = [Infinity, Infinity, Infinity];
   const bmax = [-Infinity, -Infinity, -Infinity];
+  // LOCAL AABB of the subset, accumulated only when there is one. The shape fit
+  // reads `geometry.boundingBox` otherwise, and re-deriving it here for the
+  // whole-mesh case would double pass 1's inner work on the refresh path for a
+  // number three already cached.
+  const lmin = [Infinity, Infinity, Infinity];
+  const lmax = [-Infinity, -Infinity, -Infinity];
   let area = 0;
   const nsum = [0, 0, 0];
   // Pass 1 — world AABB, total area, area-weighted normal sum (the cone axis).
   for (let t = 0; t < triCount; t++) {
-    const i0 = idxArray ? idxArray[t * 3] : t * 3;
-    const i1 = idxArray ? idxArray[t * 3 + 1] : t * 3 + 1;
-    const i2 = idxArray ? idxArray[t * 3 + 2] : t * 3 + 2;
+    const tri = triAt(t);
+    const i0 = idxArray ? idxArray[tri * 3] : tri * 3;
+    const i1 = idxArray ? idxArray[tri * 3 + 1] : tri * 3 + 1;
+    const i2 = idxArray ? idxArray[tri * 3 + 2] : tri * 3 + 2;
+    if (subset) {
+      for (const vi of [i0, i1, i2]) {
+        for (let k = 0; k < 3; k++) {
+          const v = posArray[vi * 3 + k];
+          if (v < lmin[k]) lmin[k] = v;
+          if (v > lmax[k]) lmax[k] = v;
+        }
+      }
+    }
     xf(i0, a); xf(i1, b); xf(i2, c);
     for (let k = 0; k < 3; k++) {
       if (a[k] < bmin[k]) bmin[k] = a[k];
@@ -304,9 +335,10 @@ export function emitterFromMesh(mesh, options = {}) {
     axis = norm3(nsum);
     let minDot = 1;
     for (let t = 0; t < triCount; t++) {
-      const i0 = idxArray ? idxArray[t * 3] : t * 3;
-      const i1 = idxArray ? idxArray[t * 3 + 1] : t * 3 + 1;
-      const i2 = idxArray ? idxArray[t * 3 + 2] : t * 3 + 2;
+      const tri = triAt(t);
+      const i0 = idxArray ? idxArray[tri * 3] : tri * 3;
+      const i1 = idxArray ? idxArray[tri * 3 + 1] : tri * 3 + 1;
+      const i2 = idxArray ? idxArray[tri * 3 + 2] : tri * 3 + 2;
       xf(i0, a); xf(i1, b); xf(i2, c);
       const n = cross3([b[0] - a[0], b[1] - a[1], b[2] - a[2]], [c[0] - a[0], c[1] - a[1], c[2] - a[2]]);
       const l = len3(n);
@@ -326,13 +358,18 @@ export function emitterFromMesh(mesh, options = {}) {
   // sphere model; EVERYTHING else is an oriented box from the local AABB
   // carried through matrixWorld, which is exact for the box/plane primitives
   // users actually build lamps from.
-  if (!geometry.boundingSphere) geometry.computeBoundingSphere();
-  if (!geometry.boundingBox) geometry.computeBoundingBox();
+  if (!subset && !geometry.boundingSphere) geometry.computeBoundingSphere();
+  if (!subset && !geometry.boundingBox) geometry.computeBoundingBox();
   const scale = new THREE.Vector3();
   matrix.decompose(new THREE.Vector3(), new THREE.Quaternion(), scale);
   const maxScale = Math.max(Math.abs(scale.x), Math.abs(scale.y), Math.abs(scale.z));
   const params = geometry.parameters;
+  // A SUBSET IS NEVER THE SPHERE CASE. The test asks whether this GEOMETRY is a
+  // closed sphere primitive; one cluster out of a split mesh is a piece of
+  // something, and `geometry.boundingSphere` would describe the whole mesh
+  // anyway — which is the 12 m radius the split exists to get rid of.
   const fullSphere =
+    !subset &&
     geometry.type === "SphereGeometry" &&
     (params?.phiLength ?? Math.PI * 2) > Math.PI * 2 - 1e-3 &&
     (params?.thetaLength ?? Math.PI) > Math.PI - 1e-3;
@@ -344,7 +381,9 @@ export function emitterFromMesh(mesh, options = {}) {
   let bx = [1, 0, 0];
   let by = [0, 1, 0];
   const bs = geometry.boundingSphere;
-  const bb = geometry.boundingBox;
+  const bb = subset
+    ? { min: { x: lmin[0], y: lmin[1], z: lmin[2] }, max: { x: lmax[0], y: lmax[1], z: lmax[2] } }
+    : geometry.boundingBox;
   const cv = new THREE.Vector3();
   if (fullSphere) {
     kind = LT_KIND.sphere;
@@ -396,16 +435,89 @@ export function emitterFromMesh(mesh, options = {}) {
     }
   }
 
-  const mean = (rgb[0] + rgb[1] + rgb[2]) / 3;
+  // ── SPARSE FILL: THE MODEL EMITS OVER ITS BOUNDS, THE MESH DOES NOT ───────
+  //
+  // Both irradiance models integrate the fitted SHAPE — `boxLightFactor` over
+  // the bounding OBB, or the sphere's `pi·sin²(R/d)`. Either assumes the mesh
+  // FILLS that shape. Scattered emissive geometry does not, and because both
+  // models scale with the shape's projected area the error is enormous:
+  //
+  //   Live Bistro, `StringLights_01a1_6473_1`: ONE mesh holding a whole 6 m
+  //   string of ~2.5 cm party bulbs, because a GLB splits by MATERIAL and
+  //   every bulb of one colour lands together. Bounding box 2.4x1.3x5.9 m
+  //   (radius 3.26 m) standing in for a few cm² of actual bulb. The user
+  //   isolated it exactly — sun off, bulbs alone lighting the whole street:
+  //   "considering their size, they should reach 0.5 m maximum" (2026-08-17).
+  //
+  // `area` (pass 1) is the TRUE world triangle area, and `power` already uses
+  // it — so the tree's own importance knew the bulbs were tiny while the
+  // irradiance model lit the street. This reconciles the two by DIMMING the
+  // radiance to the fill fraction, which is exact for the far field: energy
+  // delivered is (projected area)x(radiance), so a shape 1000x too large
+  // carrying 1/1000 the radiance delivers the right amount.
+  //
+  // WHY NOT SHRINK THE SHAPE INSTEAD: `angularRadius`/`half` also set where a
+  // shadow ray STOPS (`maxT` = the OBB entry, or `dist - aR`). Shrink them and
+  // rays march INTO the string and self-shadow on the bulbs' own occupancy
+  // cells, deleting the light entirely. Radiance is the term that carries
+  // energy; geometry is the term that carries occlusion. Only the first is
+  // wrong here.
+  //
+  // THE DENOMINATOR IS THE SHAPE'S LARGEST CROSS-SECTION, and the choice is
+  // load-bearing. Cauchy's mean projected area (surface/4) is the natural
+  // instinct and it is WRONG here: it holds for CLOSED bodies, while an
+  // emissive panel is a one-sided plate whose triangles are counted once, so
+  // Cauchy would score it 0.5 and silently halve every flat light in every
+  // existing scene. "Does this mesh's emitting area at least cover its own
+  // widest cross-section?" is the question that separates solid from
+  // scattered, and it is safe on all of them: a flat panel scores exactly 1,
+  // a closed cube 6, a sphere bulb pi — all clamp to 1 and pass through
+  // BIT-IDENTICAL. Only genuinely sparse meshes are touched, and the string
+  // scores 0.0035.
+  const crossSection = kind === LT_KIND.sphere
+    ? Math.PI * angularRadius * angularRadius
+    : 4 * Math.max(half[0] * half[1], half[1] * half[2], half[2] * half[0]);
+  const fill = crossSection > 1e-12 ? Math.min(1, area / crossSection) : 1;
+  // ⚠⚠ POWER IS MEASURED BEFORE THE DAMPING, AND THAT ORDER IS THE WHOLE BUG
+  // THIS LINE FIXES (2026-08-17, user: "1000 emission strength mesh does not
+  // cast any light on surrounding meshes at all").
+  //
+  // `fill` corrects the IRRADIANCE MODEL, whose shape is too big. It does not
+  // change how much light the mesh emits: the model delivers
+  // pi x crossSection x (L x fill) = pi x area x L — the true power, which is
+  // exactly the point of the correction. So the emitter's IMPORTANCE must stay
+  // pi x area x L_authored.
+  //
+  // Taking the mean AFTER damping `rgb` in place made it pi x area x L x fill
+  // — the fill applied TWICE, once to radiance and again to importance. The
+  // light tree's descent and the §12.70 tile cut both rank by this number, so
+  // a sparse emitter (the string scores 0.0035, a merged proxy 7.6e-5) sank
+  // below every other candidate and was never sampled by NEE at all. Turning
+  // the strength up did nothing, because strength scales power and importance
+  // is RELATIVE — it stayed last. The block comment above already stated the
+  // intent ("`power` already uses [the true area]"); only the ordering was wrong.
+  const meanAuthored = (rgb[0] + rgb[1] + rgb[2]) / 3;
+  if (fill < 1) {
+    rgb[0] *= fill; rgb[1] *= fill; rgb[2] *= fill;
+  }
+
   return {
     mesh,
+    /** Fraction of the fitted shape the triangles actually cover (diagnostic). */
+    fill,
+    /** Which piece of a split mesh this is, or -1 for the whole mesh. */
+    clusterId: options.clusterId ?? -1,
+    /** Triangles in this emitter (the whole mesh unless it was split). */
+    triCount,
     instanceId: options.instanceId ?? -1,
     min: bmin,
     max: bmax,
     rgb,
     // Lambertian emitter: Phi = pi * A * L. Scalar (channel mean) because the
     // descent needs ONE importance; the estimator still carries full RGB.
-    power: Math.PI * area * mean,
+    // `meanAuthored`, NOT `mean` — see the sparse-fill block above for why the
+    // damped radiance must not reach the importance term.
+    power: Math.PI * area * meanAuthored,
     area,
     axis,
     cosThetaO,
@@ -420,10 +532,296 @@ export function emitterFromMesh(mesh, options = {}) {
   };
 }
 
+// ══════════════════════════════════════════════════ CPU: splitting sparse meshes
+//
+// ONE MESH IS NOT ONE LIGHT. A glTF splits by MATERIAL, so an entire run of
+// party bulbs, a whole ceiling's worth of downlights, or every window pane on a
+// facade arrives as a single mesh — and `emitterFromMesh` fits ONE shape to it.
+// Measured on the user's Bistro cafe (2026-08-17), live ledger:
+//
+//   P=1.8e+1 area=3.8e-2m² fill=0.000 rgb=0.0/0.0/0.0 r=12.03m
+//
+// A **12 metre** fitted radius standing in for 380 cm² of actual bulb. §13.7g's
+// sparse-fill correction then damps the radiance by `area / crossSection` to
+// keep the far-field power honest, and at fill 8.4e-5 that rounds the emitted
+// radiance to literally zero. 19 of that scene's 95 emitters were in this state:
+// nineteen lights delivering nothing, with no error anywhere.
+//
+// The correction is not the bug — it is load-bearing, and without it those
+// bulbs light the whole street. The bug is upstream of it: the fit. Every
+// receiver in the cafe stands INSIDE a 12 m sphere, where the sphere-irradiance
+// model has no meaning at all, so no choice of radiance could have been right.
+//
+// So split the mesh into the pieces it actually holds, and fit one emitter to
+// each. A bulb becomes a 2 cm emitter at fill ~= 1 — the model's assumption is
+// true again, the damping does not fire, and the light lands where the geometry
+// is instead of averaged over a 12 m ball. **Nothing changes in the project**:
+// this is a fitting decision, not an authoring one.
+//
+// WHY CONNECTED COMPONENTS AND NOT A SPATIAL GRID. The pieces are already named
+// by the geometry — a bulb is a closed shell sharing no vertex with the next
+// bulb. A grid would have to guess a cell size, and any guess splits a single
+// long neon tube (which must stay ONE emitter: it is genuinely one connected
+// light) while merging two bulbs that happen to sit close. Connectivity asks
+// the mesh instead of guessing, and it answers "one piece" for the tube, which
+// is exactly the case where the fill damping should keep doing its job.
+
+/** Don't run the union-find on a mesh this big — see the cache note below. */
+const MAX_SPLIT_TRIANGLES = 200_000;
+/** Pieces one mesh may become. Beyond this, neighbours merge (Morton order). */
+const MAX_CLUSTERS_PER_MESH = 32;
+/**
+ * Extra emitters splitting may add across the whole scene.
+ *
+ * Not free: the §12.70 tile cut scans every record per screen tile, so the
+ * emitter count is a per-frame cost and not just words. 256 roughly quadruples
+ * the user's 95 and is worth measuring against, not exceeding by default.
+ * `__giEmitterSplitBudget` overrides it.
+ */
+const MAX_SPLIT_EMITTERS = 256;
+/** Below this fill, a mesh is worth trying to split. Matches the ledger's cut. */
+const SPLIT_FILL_THRESHOLD = 0.5;
+
+/**
+ * The mesh's triangles grouped into connected pieces, or `null` when there is
+ * only one piece (nothing to split) or the mesh is too big to walk.
+ *
+ * CACHED ON THE GEOMETRY, and that is not an optimisation — it is what makes
+ * this safe to call at all. `collectEmitters` runs again from
+ * `#refreshLightTree` every time a lamp moves or dims, which can be every
+ * frame; a union-find over 200k triangles per frame would be a far worse bug
+ * than the one being fixed. The result is in LOCAL triangle-index space and has
+ * no dependence on the world matrix, so a moving lamp reuses it verbatim.
+ *
+ * @param {THREE.BufferGeometry} geometry
+ * @param {number} maxClusters
+ * @returns {Int32Array[] | null}
+ */
+export function triangleClusters(geometry, maxClusters = MAX_CLUSTERS_PER_MESH) {
+  const position = geometry?.attributes?.position;
+  if (!position) return null;
+  const cap = Math.max(2, Math.floor(maxClusters));
+  const cached = geometry.userData?.__giTriClusters;
+  if (cached && cached.cap === cap && cached.version === (position.version ?? 0)) {
+    return cached.clusters;
+  }
+
+  const index = geometry.index;
+  const idxArray = index ? index.array : null;
+  const triCount = Math.floor((index ? index.count : position.count) / 3);
+  const store = (clusters) => {
+    (geometry.userData ??= {}).__giTriClusters = { cap, version: position.version ?? 0, clusters };
+    return clusters;
+  };
+  if (triCount < 2 || triCount > MAX_SPLIT_TRIANGLES) return store(null);
+
+  const vertCount = position.count;
+  const posArray = position.array;
+  const parent = new Int32Array(vertCount);
+  for (let i = 0; i < vertCount; i++) parent[i] = i;
+  const find = (x) => {
+    let r = x;
+    while (parent[r] !== r) { parent[r] = parent[parent[r]]; r = parent[r]; }
+    return r;
+  };
+  const union = (x, y) => {
+    const a = find(x);
+    const b = find(y);
+    if (a !== b) parent[b] = a;
+  };
+
+  // WELD BY EXACT POSITION FIRST. A merged or de-indexed mesh has one vertex
+  // per triangle corner, so connectivity through indices alone would call every
+  // triangle its own piece. Exact float equality is deliberate: duplicates
+  // produced by de-indexing are bit-identical, and a tolerance here would start
+  // welding genuinely separate bulbs that happen to sit within it.
+  const weld = new Map();
+  for (let v = 0; v < vertCount; v++) {
+    const key = `${posArray[v * 3]}|${posArray[v * 3 + 1]}|${posArray[v * 3 + 2]}`;
+    const first = weld.get(key);
+    if (first === undefined) weld.set(key, v);
+    else union(first, v);
+  }
+  for (let t = 0; t < triCount; t++) {
+    const i0 = idxArray ? idxArray[t * 3] : t * 3;
+    const i1 = idxArray ? idxArray[t * 3 + 1] : t * 3 + 1;
+    const i2 = idxArray ? idxArray[t * 3 + 2] : t * 3 + 2;
+    union(i0, i1);
+    union(i0, i2);
+  }
+
+  // Dense piece ids, in FIRST-TRIANGLE ORDER so the result is a pure function
+  // of the buffers — the build and every later refresh must produce the same
+  // emitters in the same order or the first repack renumbers the whole tree.
+  const roots = new Map();
+  const triPiece = new Int32Array(triCount);
+  for (let t = 0; t < triCount; t++) {
+    const i0 = idxArray ? idxArray[t * 3] : t * 3;
+    const root = find(i0);
+    let id = roots.get(root);
+    if (id === undefined) { id = roots.size; roots.set(root, id); }
+    triPiece[t] = id;
+  }
+  const pieceCount = roots.size;
+  if (pieceCount < 2) return store(null);
+
+  let order = null;
+  let mergedGroups = 0;
+  if (pieceCount > cap) {
+    // TOO MANY PIECES: merge NEIGHBOURS, chosen by Morton order of each piece's
+    // centroid. A string of 40 bulbs capped at 32 becomes 32 emitters of one or
+    // two adjacent bulbs — still ~3000x better fitted than one 12 m sphere.
+    // Morton (not "every k-th piece") because merging pieces that are far apart
+    // would rebuild the very shape being escaped, only smaller.
+    const cx = new Float64Array(pieceCount);
+    const cy = new Float64Array(pieceCount);
+    const cz = new Float64Array(pieceCount);
+    const n = new Float64Array(pieceCount);
+    for (let t = 0; t < triCount; t++) {
+      const p = triPiece[t];
+      for (let k = 0; k < 3; k++) {
+        const vi = idxArray ? idxArray[t * 3 + k] : t * 3 + k;
+        cx[p] += posArray[vi * 3];
+        cy[p] += posArray[vi * 3 + 1];
+        cz[p] += posArray[vi * 3 + 2];
+      }
+      n[p] += 3;
+    }
+    for (let p = 0; p < pieceCount; p++) {
+      const d = Math.max(1, n[p]);
+      cx[p] /= d; cy[p] /= d; cz[p] /= d;
+    }
+    // ⚠ MEDIAN SPLITS, NOT A SPACE-FILLING CURVE. Sorting the pieces by Morton
+    // code and cutting the sequence into equal runs is the obvious way to do
+    // this and it does not work well enough: Morton order jumps across the
+    // whole model at every high-order bit boundary, so the runs that straddle
+    // one contain pieces from opposite ends. Measured on the cap arm of
+    // `test:gi-emitter-split` — 80 bulbs into 16 groups gave a worst group
+    // radius of 1.57 m against the unsplit 2.86 m, i.e. barely half the win,
+    // and 2.34 m before the quantization was even made isotropic.
+    //
+    // Repeatedly halving the WIDEST group at the median of its longest axis
+    // gives compact groups by construction, with no boundary artifact to
+    // reason about. `cap` is at most a few dozen, so the linear rescan per
+    // split is nothing.
+    let groups = [Array.from({ length: pieceCount }, (_, p) => p)];
+    const axisOf = [cx, cy, cz];
+    while (groups.length < cap) {
+      let bestIdx = -1;
+      let bestExtent = 0;
+      let bestAxis = 0;
+      for (let g = 0; g < groups.length; g++) {
+        const members = groups[g];
+        if (members.length < 2) continue;
+        for (let k = 0; k < 3; k++) {
+          const coord = axisOf[k];
+          let lo = Infinity;
+          let hi = -Infinity;
+          for (const p of members) {
+            if (coord[p] < lo) lo = coord[p];
+            if (coord[p] > hi) hi = coord[p];
+          }
+          if (hi - lo > bestExtent) { bestExtent = hi - lo; bestIdx = g; bestAxis = k; }
+        }
+      }
+      if (bestIdx < 0) break; // every group is a single piece
+      const members = groups[bestIdx];
+      const coord = axisOf[bestAxis];
+      // Tie-break on the piece id — two coincident centroids must not reorder
+      // between a build and a refresh, or the whole tree renumbers.
+      members.sort((p1, p2) => (coord[p1] - coord[p2]) || (p1 - p2));
+      const mid = members.length >> 1;
+      groups.splice(bestIdx, 1, members.slice(0, mid), members.slice(mid));
+    }
+    order = new Int32Array(pieceCount);
+    for (let g = 0; g < groups.length; g++) for (const p of groups[g]) order[p] = g;
+    mergedGroups = groups.length;
+  }
+
+  const groupCount = order ? mergedGroups : pieceCount;
+  const counts = new Int32Array(groupCount);
+  for (let t = 0; t < triCount; t++) counts[order ? order[triPiece[t]] : triPiece[t]]++;
+  const clusters = [];
+  for (let g = 0; g < groupCount; g++) clusters.push(new Int32Array(counts[g]));
+  const cursor = new Int32Array(groupCount);
+  for (let t = 0; t < triCount; t++) {
+    const g = order ? order[triPiece[t]] : triPiece[t];
+    clusters[g][cursor[g]++] = t;
+  }
+  return store(clusters.filter((c) => c.length > 0));
+}
+
+/**
+ * `base` re-fitted as one emitter per connected piece, or `null` when splitting
+ * is impossible or does not actually help.
+ *
+ * ⚠ THE ACCEPTANCE TEST IS NOT OPTIONAL. Splitting multiplies the emitter count
+ * — a per-frame cost in the tile cut — so a split that does not raise the fill
+ * has to be thrown away. It also guards the case connectivity cannot see: a
+ * mesh whose separate pieces are each individually sparse (a wireframe, a
+ * particle sheet of quads) splits into many equally-bad emitters, and paying N
+ * times the cost for the same wrong shape would be strictly worse than the
+ * single damped emitter §13.7g already handles correctly.
+ */
+export function splitSparseEmitter(mesh, base, options = {}) {
+  const clusters = triangleClusters(mesh?.geometry, options.maxClusters ?? MAX_CLUSTERS_PER_MESH);
+  if (!clusters || clusters.length < 2) return null;
+
+  const parts = [];
+  let areaSum = 0;
+  let fillArea = 0;
+  for (let i = 0; i < clusters.length; i++) {
+    const e = emitterFromMesh(mesh, { ...options, triangles: clusters[i], clusterId: i });
+    if (!e) continue;
+    parts.push(e);
+    areaSum += e.area;
+    fillArea += e.area * e.fill;
+  }
+  if (parts.length < 2 || !(areaSum > 0)) return null;
+
+  // TWO WAYS A SPLIT CAN BE WORTH KEEPING, and it needs only one of them.
+  // Everything below is area-weighted, so a hairline sliver cannot outvote the
+  // piece carrying the energy — `power` is proportional to area, so this is the
+  // geometry the delivered light actually sees.
+  let radiusArea = 0;
+  for (const p of parts) radiusArea += p.area * p.angularRadius;
+  const meanFill = fillArea / areaSum;
+  const meanRadius = radiusArea / areaSum;
+
+  // 1. FILL. The piece fills its own fitted shape, so §13.7g's damping stops
+  //    firing and the authored radiance survives. This is the win on a full
+  //    split — a bulb refit alone reads fill 1.000.
+  const fillWon = meanFill > Math.min(1, (base.fill ?? 1) * 2);
+
+  // 2. PLACEMENT. ⚠ AND THIS IS NOT REDUNDANT WITH (1) — it is the criterion
+  //    that keeps the per-mesh cap from being a fiction. Fill is very nearly
+  //    SCALE-INVARIANT under merging: cut a 2-D scatter of N bulbs into k
+  //    groups and each holds N/k bulbs across an extent ~E/sqrt(k), so its
+  //    cross-section falls by the same k and the fill does not move at all.
+  //    Measured: 80 bulbs capped at 16 groups gives meanFill 0.017 against the
+  //    whole string's 0.022 — a fill test alone REFUSES every capped split and
+  //    the cap silently does nothing.
+  //
+  //    But the capped split is still a large win, because the other half of the
+  //    bug was never about radiance: every receiver stood INSIDE a 12 m fitted
+  //    sphere, where the sphere-irradiance model has no meaning, and the light
+  //    was delivered from the string's centroid instead of from the bulbs. 16
+  //    shapes of 0.6 m placed along the street fix that whether or not any of
+  //    them is individually dense.
+  const placementWon = meanRadius < (base.angularRadius ?? Infinity) * 0.5;
+
+  if (!fillWon && !placementWon) return null;
+  return parts;
+}
+
 /**
  * Every emissive placement under `source` (an Object3D to traverse, or an
  * array of meshes). InstancedMesh members are expanded per instance — see the
  * `matrixWorld` note on emitterFromMesh.
+ *
+ * Sparse meshes are split into their connected pieces (see `splitSparseEmitter`);
+ * `__giEmitterSplit = false` or `options.split === false` turns that off, and
+ * the returned array carries a `splitStats` summary for the boot ledger.
  */
 export function collectEmitters(source, options = {}) {
   const meshes = [];
@@ -431,7 +829,8 @@ export function collectEmitters(source, options = {}) {
   else if (source?.traverse) source.traverse((o) => { if (o.isMesh) meshes.push(o); });
   else if (source?.isMesh) meshes.push(source);
 
-  const out = [];
+  /** @type {{ e: any, mesh: any, matrixWorld: any, instanceId: number, parts: any[] | null }[]} */
+  const fitted = [];
   const tmp = new THREE.Matrix4();
   for (const mesh of meshes) {
     if (mesh.visible === false && !mesh.userData?.batchedInto && !mesh.userData?.cameraHidden) continue;
@@ -442,13 +841,57 @@ export function collectEmitters(source, options = {}) {
         mesh.getMatrixAt(i, tmp);
         const world = new THREE.Matrix4().multiplyMatrices(mesh.matrixWorld, tmp);
         const e = emitterFromMesh(mesh, { ...options, instanceId: i, matrixWorld: world });
-        if (e) out.push(e);
+        if (e) fitted.push({ e, mesh, matrixWorld: world, instanceId: i, parts: null });
       }
       continue;
     }
     const e = emitterFromMesh(mesh, options);
-    if (e) out.push(e);
+    if (e) fitted.push({ e, mesh, matrixWorld: options.matrixWorld ?? null, instanceId: options.instanceId ?? -1, parts: null });
   }
+
+  // ── THE SPLIT PASS ────────────────────────────────────────────────────────
+  //
+  // Second pass rather than inline, because the budget has to be spent on the
+  // emitters that matter. Splitting is ranked by `power` — the TRUE emitted
+  // power, `pi * area * L_authored`, which §13.7g deliberately keeps free of
+  // the fill damping — so a dark decorative strip cannot consume the budget a
+  // room's actual lighting needs.
+  const stats = { sparse: 0, split: 0, added: 0, worstBefore: 1, bestAfter: 0 };
+  const splitOn = options.split !== false && globalThis.__giEmitterSplit !== false;
+  if (splitOn) {
+    const budgetOverride = Number(globalThis.__giEmitterSplitBudget) || MAX_SPLIT_EMITTERS;
+    let budget = Math.max(0, options.maxSplitEmitters ?? budgetOverride);
+    const perMesh = Math.max(2, options.maxClusters ?? MAX_CLUSTERS_PER_MESH);
+    const sparse = fitted.filter((f) => (f.e.fill ?? 1) < SPLIT_FILL_THRESHOLD);
+    stats.sparse = sparse.length;
+    sparse.sort((a, b) => b.e.power - a.e.power);
+    for (const f of sparse) {
+      if (budget < 1) break;
+      const parts = splitSparseEmitter(f.mesh, f.e, {
+        ...options,
+        matrixWorld: f.matrixWorld ?? undefined,
+        instanceId: f.instanceId,
+        maxClusters: Math.min(perMesh, budget + 1),
+      });
+      if (!parts) continue;
+      f.parts = parts;
+      budget -= parts.length - 1;
+      stats.split++;
+      stats.added += parts.length - 1;
+      if ((f.e.fill ?? 1) < stats.worstBefore) stats.worstBefore = f.e.fill ?? 1;
+      for (const p of parts) if (p.fill > stats.bestAfter) stats.bestAfter = p.fill;
+    }
+  }
+
+  // Flattened in the ORIGINAL fit order with each mesh's pieces inline: the
+  // refresh path re-runs this whole function and must reproduce the same
+  // sequence, or the first repack renumbers every record in the tree.
+  const out = [];
+  for (const f of fitted) {
+    if (f.parts) out.push(...f.parts);
+    else out.push(f.e);
+  }
+  out.splitStats = stats;
   return out;
 }
 

@@ -170,7 +170,7 @@ export class MeshComponent extends Component {
     if (this.props.material) this.#loadSharedMaterial(this.props.material);
     this.#loadExtraMaterials();
     // Honour the enabled flag at attach time.
-    this.mesh.visible = this.enabled;
+    this.#applyVisibility();
   }
 
   onDetach() {
@@ -197,6 +197,38 @@ export class MeshComponent extends Component {
    * anything else (a primitive we built, an evaluated modifier result) is ours
    * alone and is disposed.
    */
+  /**
+   * Write `visible` from this component's own authored state — UNLESS a
+   * batching or merging proxy currently owns this mesh.
+   *
+   * ⚠ THE OWNERSHIP RULE. `batching.js` and `merging.js` both hide their
+   * members (`visible = false`), leave them in the scene graph, and mark the
+   * claim with `userData.batchedInto` / `userData.mergedInto`. Six places in
+   * this file used to write `visible` directly, and any of them firing while a
+   * proxy held the mesh RESURRECTED it — so its geometry drew twice, once as
+   * itself and once inside the proxy.
+   *
+   * On Bistro that was the load/hang loop. `#applySharedMaterial` runs on every
+   * material-asset notification; it un-hid the member and then announced
+   * `component-changed:mesh`, which is precisely what `merging.js` invalidates
+   * on. Merging rebuilt, the mesh set GI collects flipped between proxies and
+   * members (GI built at 580 meshes and then at 1034 on the same scene), GI
+   * bumped its geometry revision and ran a full rebuild — a material compile
+   * wave of 68-77 SECONDS — and the churn produced more notifications. The
+   * console read `[rebuild #27, asked for by component-changed:mesh]`, then
+   * `#28`, then `#29`.
+   *
+   * Deferring to the owner loses nothing: `merging.js#teardown` restores members
+   * with this identical expression, so the authored state is recomputed the
+   * moment the proxy lets go. Hiding is NOT routed through here — a component
+   * being disabled must take effect immediately, and hiding can never resurrect.
+   */
+  #applyVisibility() {
+    if (!this.mesh) return;
+    if (this.mesh.userData.mergedInto || this.mesh.userData.batchedInto) return;
+    this.mesh.visible = this.enabled && this.materialRenderable !== false;
+  }
+
   #releaseGeometry(geometry) {
     disposeOrReleaseGeometry(geometry);
   }
@@ -207,8 +239,8 @@ export class MeshComponent extends Component {
 
   onEnable() {
     // A material with nothing wired to Surface/Volume must stay hidden even
-    // when the component is enabled.
-    if (this.mesh) this.mesh.visible = this.materialRenderable !== false;
+    // when the component is enabled — and so must a member a proxy is holding.
+    this.#applyVisibility();
   }
 
   async #loadSharedMaterial(path) {
@@ -308,7 +340,28 @@ export class MeshComponent extends Component {
       this.props.geometry = "box";
       this.props.geometryAsset = "";
     }
-    this.mesh.visible = this.enabled && this.materialRenderable !== false;
+    // ⚠ BATCHING AND MERGING OWN `visible` WHILE THEY HOLD THIS MESH.
+    //
+    // Both hide their members (`visible = false`) and leave them in the graph,
+    // marking the claim with `userData.batchedInto` / `userData.mergedInto`.
+    // This line ran on every material-asset notification and wrote `visible`
+    // unconditionally, which RESURRECTED a merged member — so its geometry drew
+    // twice, once as itself and once inside its proxy — and then
+    // `#announceSwap` below emitted `component-changed:mesh`, which is exactly
+    // what `merging.js` invalidates on.
+    //
+    // That is the loop: notification → member un-hidden + event → merging
+    // rebuilds → the mesh set GI collects flips between proxies and members
+    // (measured: GI built at 580 meshes and then at 1034 on the same scene) →
+    // GI geometry revision → full rebuild and a material compile wave (68 866 ms
+    // and 77 381 ms on Bistro) → more notifications. `[rebuild #27, asked for by
+    // component-changed:mesh]` then `#28` is this cycle turning.
+    //
+    // The value computed here is not wrong — `merging.js`'s `#teardown` restores
+    // members with the identical expression — so deferring to the owner loses
+    // nothing: whenever the proxy is torn down, the authored state is
+    // recomputed there.
+    this.#applyVisibility();
     // `mesh.material` is a *new object* now — the shared .mat instance replaced
     // the placeholder default we were created with. Anything that captured the
     // old reference (terrain scatter builds InstancedMeshes from this mesh) is
@@ -355,7 +408,7 @@ export class MeshComponent extends Component {
           const hasExtraMaterial = paths.slice(1).some(Boolean);
           this.mesh.material = hasExtraMaterial && this.mesh.geometry?.groups?.length ? paths.map((p) => getMaterialInstance(p) ?? getDefaultMaterial()) : cached;
           this.materialRenderable = isMaterialRenderable(this.props.material);
-          this.mesh.visible = this.enabled && this.materialRenderable !== false;
+          this.#applyVisibility();
         } else {
           // Cold cache: leave the mesh on its current material rather than
           // reverting to the default placeholder — the `#loadSharedMaterial`
@@ -366,7 +419,7 @@ export class MeshComponent extends Component {
         this._materialAssetLoading = false;
         this.#applyMaterialSlots();
         this.materialRenderable = true;
-        this.mesh.visible = this.enabled;
+        this.#applyVisibility();
       }
     } else if (/^material[2-8]$/.test(key)) {
       this.#loadExtraMaterials();

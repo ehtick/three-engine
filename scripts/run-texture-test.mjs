@@ -23,6 +23,13 @@ import {
   setPixel,
   getPixel,
 } from "../src/editor/texture/pixels.js";
+import {
+  anchorFactors,
+  fitBuffer,
+  fitDocument,
+  plannedSize,
+  MAX_SIZE,
+} from "../src/editor/texture/fit.js";
 import { blendInto, compositeLayers, BLEND_MODES } from "../src/editor/texture/blend.js";
 import { encodePng, decodePng, isDecodablePng } from "../src/editor/texture/png.js";
 import { encodeTexDoc, decodeTexDoc, isTexDoc, texDocMatches } from "../src/editor/texture/texdoc.js";
@@ -1830,6 +1837,109 @@ check("transformedBounds reports what a rotation actually needs", () => {
   assert.ok(turned.width >= 14 && turned.width <= 15, `10x10 at 45 deg needs ~14.1 (${turned.width})`);
   assert.equal(transformClips(10, 10, { angle: 45 }), true, "so a 45 degree turn is reported as clipping");
   assert.equal(transformClips(10, 10, { scaleX: 0.5, scaleY: 0.5 }), false);
+});
+
+console.log("\nfit modes (bulk resize)");
+
+check("fit keeps the source aspect inside the box; stretch does not", () => {
+  const wide = { width: 1000, height: 500 };
+  assert.deepEqual(plannedSize(wide, { width: 512, height: 512, mode: "fit" }), { width: 512, height: 256 });
+  assert.deepEqual(plannedSize(wide, { width: 512, height: 512, mode: "stretch" }), { width: 512, height: 512 });
+  // "resize" is what texture.resize shipped with and still means "stretch".
+  assert.deepEqual(plannedSize(wide, { width: 512, height: 512, mode: "resize" }), { width: 512, height: 512 });
+});
+
+check("fit accepts one bound and leaves the other free", () => {
+  // "no wider than 256, however tall that makes it" — the missing dimension is
+  // unbounded, NOT "keep the old height", which would cap the scale at 1.
+  assert.deepEqual(plannedSize({ width: 800, height: 400 }, { width: 200, mode: "fit" }), {
+    width: 200,
+    height: 100,
+  });
+});
+
+check("a percentage scales each image from its own size", () => {
+  // The only sizing a mixed selection can share: two images of different sizes
+  // both get halved, rather than both being forced to one number.
+  assert.deepEqual(plannedSize({ width: 1024, height: 512 }, { scale: 50 }), { width: 512, height: 256 });
+  assert.deepEqual(plannedSize({ width: 300, height: 300 }, { scale: 50 }), { width: 150, height: 150 });
+  // Percentage wins over width/height rather than silently doing both.
+  assert.deepEqual(plannedSize({ width: 100, height: 100 }, { scale: 200, width: 16, height: 16 }), {
+    width: 200,
+    height: 200,
+  });
+});
+
+check("sizes are clamped, never zero and never unbounded", () => {
+  assert.equal(plannedSize({ width: 100, height: 100 }, { scale: 0.1 }).width, 1, "rounds up to one pixel");
+  assert.equal(plannedSize({ width: 8000, height: 8000 }, { scale: 400 }).width, MAX_SIZE);
+});
+
+check("anchors read as compass ids and as words", () => {
+  assert.deepEqual(anchorFactors("nw"), [0, 0]);
+  assert.deepEqual(anchorFactors("top-left"), [0, 0]);
+  assert.deepEqual(anchorFactors("c"), [0.5, 0.5]);
+  assert.deepEqual(anchorFactors("center"), [0.5, 0.5]);
+  assert.deepEqual(anchorFactors("se"), [1, 1]);
+  assert.deepEqual(anchorFactors("bottom-right"), [1, 1]);
+  assert.deepEqual(anchorFactors(undefined), [0.5, 0.5]);
+});
+
+check("a downscale keeps the whole picture, centred and unclipped", () => {
+  // Regression: the first version of texture.resize scaled through
+  // transformBuffer, whose pivot is the OUTPUT centre re-added in SOURCE
+  // coordinates. That is only correct when the size does not change — a 4x4
+  // going to 2x2 sampled the source window [-3, 5] instead of [0, 4], so the
+  // result was off-centre and half transparent. It still returned an image of
+  // the right size, which is why only a pixel check catches it.
+  const b = createBuffer(4, 4);
+  for (let y = 0; y < 4; y++) {
+    for (let x = 0; x < 4; x++) {
+      const quadrant = (y < 2 ? 0 : 2) + (x < 2 ? 0 : 1);
+      setPixel(b, x, y, [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255], [255, 255, 0, 255]][quadrant]);
+    }
+  }
+  const out = fitBuffer(b, { width: 2, height: 2, mode: "stretch", filter: "nearest" });
+  assert.deepEqual([out.width, out.height], [2, 2]);
+  assert.deepEqual(px(out, 0, 0), [255, 0, 0, 255], "top-left quadrant survives");
+  assert.deepEqual(px(out, 1, 0), [0, 255, 0, 255]);
+  assert.deepEqual(px(out, 0, 1), [0, 0, 255, 255]);
+  assert.deepEqual(px(out, 1, 1), [255, 255, 0, 255], "bottom-right quadrant survives");
+});
+
+check("canvas mode pads without resampling, at the anchor", () => {
+  const b = createBuffer(2, 2, [255, 0, 0, 255]);
+  const nw = fitBuffer(b, { width: 4, height: 4, mode: "canvas", anchor: "nw" });
+  assert.deepEqual([nw.width, nw.height], [4, 4]);
+  assert.deepEqual(px(nw, 0, 0), [255, 0, 0, 255], "pixels sit against the top-left");
+  assert.deepEqual(px(nw, 3, 3), [0, 0, 0, 0], "the new area is transparent");
+  const se = fitBuffer(b, { width: 4, height: 4, mode: "canvas", anchor: "se" });
+  assert.deepEqual(px(se, 3, 3), [255, 0, 0, 255]);
+  assert.deepEqual(px(se, 0, 0), [0, 0, 0, 0]);
+});
+
+check("cover fills the box completely — no transparent seam", () => {
+  // The whole promise of "crop to fill": an aspect mismatch costs you edges,
+  // never a strip of empty pixels along one side.
+  const b = createBuffer(4, 2, [0, 128, 255, 255]);
+  const out = fitBuffer(b, { width: 3, height: 3, mode: "cover", anchor: "c", filter: "nearest" });
+  assert.deepEqual([out.width, out.height], [3, 3]);
+  for (let y = 0; y < 3; y++) {
+    for (let x = 0; x < 3; x++) assert.equal(px(out, x, y)[3], 255, `(${x},${y}) is covered`);
+  }
+});
+
+check("resizing a document keeps its layers", () => {
+  // A resize is a size change, not a reason to lose someone's layer stack —
+  // this is what separates it from texture.process, which flattens.
+  const doc = createDocument({ width: 8, height: 8 });
+  addLayer(doc, { name: "Detail" });
+  fitDocument(doc, { width: 4, height: 4, mode: "stretch" });
+  assert.equal(doc.layers.length, 2, "both layers survived");
+  assert.deepEqual([doc.width, doc.height], [4, 4]);
+  for (const layer of doc.layers) {
+    assert.deepEqual([layer.buffer.width, layer.buffer.height], [4, 4], "every layer was resampled");
+  }
 });
 
 console.log("\neditor frame pacing");

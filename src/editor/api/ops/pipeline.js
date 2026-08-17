@@ -71,13 +71,19 @@ defineOp({
 defineOp({
   name: "asset.compressAllTextures",
   description:
-    "Transcode every texture in the project to Basis/KTX2. This is the bulk version of asset.compress and can take minutes on a large project — it is the same button the Modules panel offers, with the same throttling.",
-  params: {},
-  async run() {
+    "Transcode every texture in the project to Basis/KTX2. This is the bulk version of asset.compress and can take minutes on a large project — it is the same button the Modules panel offers, with the same throttling. Textures whose .meta carries basis.enabled:false are SKIPPED and counted in `skipped`; pass force:true to re-encode those too, which is what you want after the codec rules change.",
+  params: {
+    force: {
+      type: "boolean",
+      description:
+        "Re-encode textures that opted out (basis.enabled:false) and re-enable them. Use after an encoder change — an opt-out set as damage control looks identical to a deliberate one, so without this the bulk pass silently does nothing on exactly the textures that need fixing.",
+    },
+  },
+  async run({ force = false }) {
     requireModule("basis");
     requireProject();
     const { compressAllProjectTextures } = await import("../../basisCompress.js");
-    return (await compressAllProjectTextures()) ?? { ok: true };
+    return (await compressAllProjectTextures({ force })) ?? { ok: true };
   },
 });
 

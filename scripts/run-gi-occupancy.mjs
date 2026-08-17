@@ -280,7 +280,7 @@ const result = await page.evaluate(async () => {
     ancestorOk,
     instanceHits,
     levelCounts,
-    coarseLevel: volume.coarseLevel,
+    // (`coarseLevel` was read here for a check §12.8 outlived — see below.)
   };
 });
 
@@ -308,7 +308,15 @@ const checks = [
     `each InstancedMesh instance voxelized (${result.instanceHits.join(",")})`,
     result.instanceHits.every((n) => n > 0),
   ],
-  ["composite clamps from a level at least as coarse as its cell", result.coarseLevel >= 0],
+  // ("composite clamps from a level at least as coarse as its cell",
+  //  `result.coarseLevel >= 0`) — DELETED 2026-08-15. It had been FAILING for
+  //  as long as the SRC volume has existed, and not because anything was
+  //  wrong: `coarseLevel` is on `createSrcVolume`'s explicit "NOT compatible
+  //  with, and never will be" list (with compositeCompute, distanceTexture,
+  //  grid, sparse, the six buffers) — it belonged to the giField transport
+  //  §12.8 deleted. `undefined >= 0` is false, so the check reported a red
+  //  suite for a concept that no longer exists. A gate nobody can satisfy
+  //  teaches people to skip the gate.
 ];
 
 let failed = 0;

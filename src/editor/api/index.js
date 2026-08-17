@@ -52,6 +52,7 @@ import "./ops/fonts.js";
 import "./ops/batch.js";
 import "./ops/profile.js";
 import "./ops/events.js";
+import "./ops/post.js";
 
 /** Runs an op synchronously, asserting it isn't one of the async ones. Used by
  *  the sync accessors below, where returning a promise would be a footgun. */
@@ -142,6 +143,8 @@ export const EditorApi = {
     },
     set: (ids) => sync("selection.set", { ids: Array.isArray(ids) ? ids : [ids] }),
     clear: () => sync("selection.set", { ids: [] }),
+    /** "Search, then Ctrl+A": select everything matching a hierarchy query. */
+    selectMatching: (query, options = {}) => sync("selection.selectMatching", { query, ...options }),
     selectAssets: (paths) => sync("selection.selectAssets", { paths: Array.isArray(paths) ? paths : [paths] }),
   },
 
@@ -303,6 +306,7 @@ export const EditorApi = {
     effects: () => callOp("texture.effects"),
     process: (path, effect, params = {}) => callOp("texture.process", { path, effect, params }),
     resize: (path, width, height, options = {}) => callOp("texture.resize", { path, width, height, ...options }),
+    resizeMany: (paths, options = {}) => callOp("texture.resizeMany", { paths, ...options }),
     setMeta: (path, patch) => callOp("texture.setMeta", { path, ...patch }),
     addLayer: (path, options = {}) => callOp("texture.addLayer", { path, ...options }),
     setLayer: (path, layer, patch = {}) => callOp("texture.setLayer", { path, layer, ...patch }),
@@ -330,6 +334,16 @@ export const EditorApi = {
     exportGlb: (path, targetPath) => callOp("geometry.exportGlb", { path, targetPath }),
     commit: (keepOpen = false) => callOp("geometry.commit", { keepOpen }),
     cancel: () => callOp("geometry.cancel"),
+  },
+
+  /** Post-process graphs (`.post`) — the look of a camera's frame. */
+  post: {
+    nodeTypes: () => callOp("post.nodeTypes"),
+    list: () => callOp("post.list"),
+    get: (options = {}) => callOp("post.get", options),
+    create: (options = {}) => callOp("post.create", options),
+    set: (options = {}) => callOp("post.set", options),
+    assign: (entityId, path = "") => callOp("post.assign", { entityId, path }),
   },
 
   /** Compression, baking, building, publishing. */

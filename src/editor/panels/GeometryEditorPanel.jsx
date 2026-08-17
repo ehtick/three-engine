@@ -13,6 +13,7 @@ import { AddComponentCommand, RemoveComponentCommand, SetComponentPropCommand } 
 import { AssetField } from "../fields/AssetField.jsx";
 import { AxisViewGizmo } from "../helpers/AxisViewGizmo.jsx";
 import { isTypingTarget } from "../keyScope.js";
+import { installWheelZoom } from "../viewportZoom.js";
 import { GEOMETRY_MODIFIER_DEFINITIONS, createGeometryModifier } from "../../engine/geometryModifiers.js";
 import { applyGeometryModifier } from "../geometryModifierEditing.js";
 
@@ -3026,6 +3027,14 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
       event.preventDefault();
       event.stopPropagation();
     };
+    // Which live gesture currently owns the wheel — mirrors the branches of
+    // `onWindowWheel` below. Shared with the viewport dolly so a loopcut's
+    // segment count and one notch of zoom never both happen at once.
+    const macroOwnsWheel = () =>
+      session.selectionGesture?.kind === "circle" ||
+      session.macro?.kind === "loopcut" ||
+      session.macro?.kind === "bevel" ||
+      !!session.macro?.proportional;
     const onWindowWheel = (event) => {
       if (session.selectionGesture?.kind === "circle") {
         session.circleRadius = THREE.MathUtils.clamp((session.circleRadius ?? 32) * 1.08 ** (-event.deltaY / 100), 8, 240);
@@ -3068,6 +3077,15 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
     window.addEventListener("wheel", onWindowWheel, { capture: true, passive: false });
     window.addEventListener("contextmenu", onContextMenu, true);
     window.addEventListener("blur", onBlur);
+    // Edit Mode gets the same distance-aware dolly as the scene viewport:
+    // OrbitControls' pivot-relative zoom stalls out exactly when you are
+    // trying to get in close on a face. See viewportZoom.js.
+    const disposeWheelZoom = installWheelZoom(canvas, {
+      getCamera: () => session.camera,
+      getControls: () => session.controls,
+      getRoot: () => session.scene,
+      isEnabled: () => !macroOwnsWheel(),
+    });
 
     (async () => {
       renderer = new THREE.WebGPURenderer({ canvas, antialias: true });
@@ -3109,6 +3127,7 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
       window.removeEventListener("pointerdown", onWindowPointerDown, true);
       window.removeEventListener("pointerup", onWindowPointerUp, true);
       window.removeEventListener("wheel", onWindowWheel, true);
+      disposeWheelZoom();
       window.removeEventListener("contextmenu", onContextMenu, true);
       window.removeEventListener("blur", onBlur);
       controls.removeEventListener("start", onControlsStart);

@@ -4,6 +4,21 @@ import { scaffoldProjectTypes } from "../projectTypes.js";
 
 const ROOT_KEY = "engine.projectRoot.v1";
 
+/**
+ * The project the editor had open when it was last used, or null.
+ *
+ * Exported because it is read before the store exists in any meaningful sense:
+ * `startupReopen.js` has to decide, synchronously and in the first frame,
+ * whether this launch is going to the hub or straight back into a project.
+ */
+export function lastProjectPath() {
+  try {
+    return localStorage.getItem(ROOT_KEY) || null;
+  } catch {
+    return null;
+  }
+}
+
 function basename(path) {
   return path.split(/[\\/]/).pop() ?? path;
 }
@@ -17,7 +32,15 @@ const RECENT_KEY = "engine.recentProjects.v1";
 
 function loadRecent() {
   try {
-    return JSON.parse(localStorage.getItem(RECENT_KEY)) ?? [];
+    // Filtered, not just parsed. A non-string entry — a `null` from a
+    // `JSON.stringify([undefined])` written by anything that got a path wrong —
+    // reaches `RecentRow`, which calls `.replace` on it and throws during
+    // render. React unmounts the subtree, so the whole hub goes white, and the
+    // hub is the only UI on screen at that point: there is nothing left to
+    // click to recover. That matters more now that the hub is where a failed
+    // project restore lands.
+    const saved = JSON.parse(localStorage.getItem(RECENT_KEY));
+    return Array.isArray(saved) ? saved.filter((p) => typeof p === "string" && p) : [];
   } catch {
     return [];
   }
@@ -31,6 +54,13 @@ export const useProjectStore = vmSingleton("projectStore", () => create((set, ge
   error: null,
   recent: loadRecent(),
   hubSkipped: false,
+  // The project path a launch is reopening, or false. Set from the first frame
+  // (startupReopen.js runs before the first render) until the attempt resolves
+  // either way, and it carries the PATH rather than a bare flag so the splash
+  // can name what it is opening — on a slow drive that splash is the only thing
+  // on screen for a second or two. Showing the hub during that window instead
+  // would flash a picker the user never gets to use.
+  restoring: false,
   // Monotonic counter bumped every time the project tree's contents change
   // anywhere on disk (delete/rename/move/create inside the project, even on
   // paths the user isn't currently browsing in the grid). The folder tree
@@ -56,7 +86,7 @@ export const useProjectStore = vmSingleton("projectStore", () => create((set, ge
     await resetEditorScene().catch((err) =>
       console.warn(`Couldn't reset editor scene on close project: ${err}`),
     );
-    set({ rootPath: null, currentPath: null, projectMeta: {}, hubSkipped: false });
+    set({ rootPath: null, currentPath: null, projectMeta: {}, hubSkipped: false, restoring: false });
   },
 
   projectMeta: {}, // contents of <root>/project.json (lastScene, name, …)
@@ -149,10 +179,34 @@ export const useProjectStore = vmSingleton("projectStore", () => create((set, ge
     return get().openProject(path);
   },
 
+  /**
+   * Reopens the last project, if it is still where it was. Returns whether it
+   * opened, so a caller can fall back to the hub.
+   *
+   * The existence check is the point. `openProject` reports success for a path
+   * that is no longer there — `project.json` failing to read is a tolerated
+   * "not a hub project", and `navigate` catches its own error into store state
+   * — so restoring a deleted or moved folder would drop the user into an
+   * editor pointed at nothing, with the failure showing up as an empty Assets
+   * panel rather than as an explanation. Better to say so and offer the picker.
+   *
+   * A path that no longer resolves is deliberately NOT forgotten: an external
+   * drive that is not plugged in yet, or a network share that is slow to mount,
+   * is the same symptom as a deleted folder, and quietly erasing the user's
+   * last project because of one is not a trade worth making. It stays in the
+   * recent list until they remove it.
+   */
   async restoreLastFolder() {
-    const saved = localStorage.getItem(ROOT_KEY);
-    if (!saved) return;
-    await get().openProject(saved);
+    const saved = lastProjectPath();
+    if (!saved) return false;
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      await invoke("list_dir", { path: saved });
+    } catch (err) {
+      console.warn(`Couldn't reopen "${saved}": ${err?.message ?? err}`);
+      return false;
+    }
+    return get().openProject(saved);
   },
 
   async navigate(path) {

@@ -50,7 +50,7 @@
 import * as THREE from "three/webgpu";
 import { float, ivec2, step, texture, uint, uniform, vec3 } from "three/tsl";
 import {
-  ALPHA_TRACK_HOLD_MS, CAM_SETTLE_ALPHA, CASCADE_COUNT, COLD_GUARD_FRAMES, GOV_HI, GOV_LO, MAX_LODS,
+  ALPHA_TRACK_HOLD_MS, BIN_BUDGET, CAM_SETTLE_ALPHA, CASCADE_COUNT, COLD_GUARD_FRAMES, GOV_HI, GOV_LO, MAX_LODS,
   LIGHT_SETTLE_FADE_MS, LIGHT_SETTLE_HOLD_MS,
   PROBE_RAY_CAP_OFF, REST_BOOT_HOLD_MS, REST_CAM_FADE_MS, REST_CAM_HOLD_MS,
   REST_TRANSPORT_FRACTION,
@@ -58,7 +58,7 @@ import {
   TEMPORAL_ALPHA_STILL, W0, srcProbeRayCap, srcQualityTier, srcTransportRays,
 } from "./srcConfig.js";
 import { createSrcProbeGizmos } from "./srcGizmos.js";
-import { R2_ALPHA1_FX, R2_ALPHA2_FX } from "./srcMath.js";
+import { R2_ALPHA1_FX, R2_ALPHA2_FX, worldKeysEnabled } from "./srcMath.js";
 import {
   createSrcHashBlockFrame,
   createSrcProbeFrame,
@@ -145,6 +145,28 @@ function expectedC0Probes(pixelCount) {
 }
 
 /**
+ * §12.77 Unit A — the pools START at these floors and GROW ON PRESSURE, they
+ * are no longer allocated to the pixel proxy up front. The floors are the
+ * §12.77.1 treatment arms, measured on the banner Sponza: capacity-proportional
+ * passes 3.61 → 1.19 ms, store 88.2 → 47.7 MB, with failedInserts/noBlock/
+ * clamped ZERO and rays/hits/deposits identical to 0.2%. 700k bins ≈ 24 MB also
+ * sits under the 4070's L2, which is where the superlinear decay win lives —
+ * the sizing target is "under L2", not a ratio. A scene the floors starve says
+ * so in the counters (`failed`, `noBlock` — per frame, one tiny readback), and
+ * GISystem's pressure check doubles the starved pool toward `srcPoolCeilings`
+ * and rebuilds through the same path a resize takes. Growth reacts within
+ * ~a second; §12.52.2's record-pool starvation (the enclosed-scene wash) is
+ * what an UNGUARDED shrink looks like, which is why the guard ships first,
+ * in the same change.
+ */
+export const SRC_POOL_FLOORS = { c0Probes: 16384, binBudget: 700_000 };
+
+/** Where growth stops: the old up-front allocations, now the worst case. */
+export function srcPoolCeilings(pixelCount) {
+  return { c0Probes: expectedC0Probes(pixelCount), binBudget: BIN_BUDGET };
+}
+
+/**
  * Build the SRC probe population bound to one gbuffer.
  *
  * @param {object} options
@@ -176,19 +198,48 @@ function expectedC0Probes(pixelCount) {
 export function createSrcProbeSystem({
   gbuffer, width, height, props = null, volume = null, sky = null,
   lighting = null, surfaces = null, sceneMotion = null, trackMotion = null,
+  pools = null,
 } = {}) {
   const tier = SRC_QUALITY[srcQualityTier(props)];
   const spacing0 = Number(globalThis.__giSrcSpacing0) || tier.spacing0;
   const pixelCount = width * height;
 
+  // Resolved pool sizes, floors-first (§12.77 Unit A). Precedence: the FIXED
+  // hatches (`__giSrcC0Probes`/`__giSrcBinBudget` — freeze the pool for a
+  // deterministic A/B arm; GISystem also suspends growth while either is set)
+  // > `pools` (GISystem's grown state, carried across rebuilds) >
+  // `__giSrcPoolInit` (growth-PERMITTED initial sizes, for exercising the
+  // grow path in a harness) > the floors.
+  const initHatch = globalThis.__giSrcPoolInit ?? null;
+  const poolConfig = {
+    c0Probes: Number(globalThis.__giSrcC0Probes)
+      || Number(pools?.c0Probes)
+      || Number(initHatch?.c0Probes)
+      || SRC_POOL_FLOORS.c0Probes,
+    binBudget: Number(globalThis.__giSrcBinBudget)
+      || Number(pools?.binBudget)
+      || Number(initHatch?.binBudget)
+      || SRC_POOL_FLOORS.binBudget,
+  };
+
   const store = createSrcProbeStore({
-    c0Probes: expectedC0Probes(pixelCount),
+    // ── SIZED FROM THE FLOORS, GROWN ON PRESSURE (§12.77 Unit A) ────────────
+    //
+    // `expectedC0Probes` (a quarter of the pixel count) used to be allocated up
+    // front, and it is a PROXY for a quantity this system counts every frame
+    // (`live`, `failedInserts`, `COUNTER_NOBLOCK`). On the user's Sponza the
+    // proxy asked for 131,072 c0 slots with 1,788 live — 1.4% — and because
+    // `.compute()` bakes its thread count, `populate`, `rays`, `seed` and
+    // `hashBlock` sweep the whole allocation every frame regardless. The proxy
+    // is now the growth CEILING (`srcPoolCeilings`) instead of the allocation;
+    // the counters are the demand signal (see SRC_POOL_FLOORS above).
+    c0Probes: poolConfig.c0Probes,
     cascadeCount: CASCADE_COUNT,
     w0: W0,
     // The bin block pool is sized from here, so the A/B dial for GI's largest
     // allocation lives next to the other two (`__giSrcSpacing0`, `__giSrcLmax`).
     // In bins, not bytes — the byte count is srcDeposit's layout to know.
-    binBudget: Number(globalThis.__giSrcBinBudget) || undefined,
+    binBudget: poolConfig.binBudget,
   });
 
   const cameraU = uniform(new THREE.Vector3());
@@ -828,21 +879,26 @@ export function createSrcProbeSystem({
         // one exists; stratification means 1 → 4 cuts the standard error 2.61×
         // where independent draws would give 2.00×.
         neeSamples: Math.max(1, Number(globalThis.__giSrcNeeSamples) || 1),
-        // ── §12.62 W3: THE TREE NEE, BEHIND ITS BUILD-TIME HATCH ─────────
+        // ── §12.62 W3: THE TREE NEE — [J] SAMPLES EVERY EMITTER ──────────
         //
-        // `__giSrcLightTree = true` swaps [J]'s slot NEE for one descent of
-        // the W1 block (`lighting.lightTree` carries the region GISystem
-        // uploaded — the region exists BEFORE this build, §12.62 W1, so the
-        // base word is a compile-time constant; a rebuild recompiles the
-        // whole chain and re-bakes it). The block rides the occupancy `bits`
-        // tail, which the visibility marcher already binds — zero new
-        // storage bindings in [J], the entire reason W1 staged it there.
+        // One descent of the W1 block replaces the slot NEE (`lighting
+        // .lightTree` carries the region GISystem uploaded — the region
+        // exists BEFORE this build, §12.62 W1, so the base word is a
+        // compile-time constant; a rebuild recompiles the whole chain and
+        // re-bakes it). The block rides the occupancy `bits` tail, which the
+        // visibility marcher already binds — zero new storage bindings in
+        // [J], the entire reason W1 staged it there.
         //
-        // Default OFF: the W3 gate (energy parity on a ≤4-emitter scene,
-        // where the tree set and the promoted set coincide, plus the flicker
-        // still floor) decides the flip, not the wiring.
+        // **DEFAULT ON since 2026-08-15 (§12.70), together with
+        // `__giEmitterTileCut` — the two are one feature (W5b): this gives
+        // every emitter a TRANSPORT sampler, the cut gives it a SCREEN one,
+        // and R5's zeroing keys on THIS hatch. Armed apart they double-deliver
+        // or under-deliver; the measurement is in the plan.** Gated on the W3
+        // fixture (19/19), the live ABBA parity rig (energy 1.008, noise
+        // 0.96×) and §12.70's storm + Sponza ledgers.
+        // `__giSrcLightTree = false` restores the four promoted slots.
         lightTree: (() => {
-          if (globalThis.__giSrcLightTree !== true) return null;
+          if (globalThis.__giSrcLightTree === false) return null;
           const info = lighting.lightTree ?? null;
           const words = volume.occupancyField?.bits ?? null;
           if (!info || !words || !(info.baseWord >= 0)) return null;
@@ -852,7 +908,19 @@ export function createSrcProbeSystem({
             // iterations actually run, so tight is free and loose is safe.
             maxDescent: Math.max(4, (info.maxDepth ?? 8) + 2),
           });
-          const evalAt = createLightTreeEmitterEval(words);
+          // §13.7: sub-cell emitters damp their FIELD contribution against
+          // the c0 lattice pitch (screen direct is untouched — see the eval's
+          // comment). `__giSubCellEmitterDamp = false` restores full-strength
+          // transport. NOTE the asymmetry: the `__giSrcLightTree = false`
+          // fallback arm (promoted-slot NEE) is NOT damped — it predates
+          // §13.7 and stays byte-identical for A/B.
+          // §13.7 — DEFAULT OFF until measured. It shipped default-on on a
+          // hypothesis and the artifact it targeted survived it; the flip
+          // discipline says the OFF arm is the default until a rig says
+          // otherwise. Arm with `__giSubCellEmitterDamp = true`.
+          const evalAt = createLightTreeEmitterEval(words, {
+            subCellRef: globalThis.__giSubCellEmitterDamp === true ? spacing0 * 0.5 : 0,
+          });
           // The §12.42 rule — a number nothing prints does not exist. The W3
           // gate asserts this line to prove the arm actually compiled.
           console.log(
@@ -1031,6 +1099,9 @@ export function createSrcProbeSystem({
         // that interpolates over a lattice placed from a second anchor produces
         // plausible light in the wrong place, and no energy check can see it.
         anchor: vec3(anchorU),
+        // S1: the merge resolves a key's world cell against the viewer under
+        // world-absolute keying. Same uniform the population's LOD metric uses.
+        camera: vec3(cameraU),
         sky: sky ? vec3(sky) : vec3(0),
         w0: W0,
       })
@@ -1215,6 +1286,24 @@ export function createSrcProbeSystem({
     width,
     height,
     pixelCount,
+    // What the pools were actually built at (post-precedence), so GISystem's
+    // pressure check can compare its grown target against reality and setSize
+    // can tell a pool grow from a no-op.
+    poolConfig,
+    /**
+     * The pressure probe — TWO small readbacks. The per-cascade counter block
+     * (live, failed, noBlock at PROBE BIRTH) alone is NOT the bin signal:
+     * birth-time claims go quiet once the population stabilizes, while every
+     * standing blockless probe keeps failing its DEPOSIT each frame — the
+     * growth harness measured 38k deposit noBlock/frame with birth noBlock 0
+     * and a visibly darkened image (the §12.52.2 wash). So the deposit's own
+     * counter rides along. Async, off the hot path, ~1 s cadence; unlike
+     * `readStats` (seven readbacks) this stays cheap.
+     */
+    readPressure: async (renderer) => ({
+      cascades: await readSrcProbeStats(renderer, store),
+      depositNoBlock: deposit ? ((await deposit.readStats(renderer))?.noBlock ?? 0) : 0,
+    }),
     // The ray ceiling, published so the boot line and `profile.giPasses` report
     // what the transport ACTUALLY fires rather than what the resolution implies.
     // `natural` is the pre-ceiling number: reading only `rays/px` off the log
@@ -1229,6 +1318,25 @@ export function createSrcProbeSystem({
     get tracedRays() { return Math.ceil(naturalRays / rayStride); },
     get probeRayCap() { return probeRayCap; },
     get reanchorCount() { return reanchors; },
+    /**
+     * The live lattice anchor, as a plain triple.
+     *
+     * ⚠ A PROBE'S WORLD POSITION IS NOT RECOVERABLE WITHOUT THIS. A packed key
+     * carries a CELL, and the cell is relative to `latticeOriginFor(anchor, s)`
+     * under anchor-relative keys — so any tool that wants to ask "where is this
+     * probe, and what is near it" has to either read the anchor or reconstruct
+     * it from the camera and the hysteresis quantum, which is exactly the kind
+     * of re-derivation §12.42 forbids ("a derived number nothing prints is a
+     * number probes will guess"). Added when a colour-bleed rig needed to bucket
+     * probes by distance to the nearest red surface and had no way to place them.
+     *
+     * A copy, not the uniform's vector: handing out the live object lets a
+     * reader move the lattice by accident.
+     */
+    get anchor() {
+      const a = anchorU.value;
+      return [a.x, a.y, a.z];
+    },
 
     /**
      * Per-frame camera sync, and the re-anchor decision. Call BEFORE dispatching
@@ -1615,6 +1723,40 @@ export function createSrcProbeSystem({
         Math.abs(cameraU.value.y - a.y),
         Math.abs(cameraU.value.z - a.z),
       );
+      // ══ S1: UNDER WORLD-ABSOLUTE KEYS THE ANCHOR STOPS BEING IDENTITY ═════
+      //
+      // `worldCellAt` is `round(anchor/s) + round((p − round(anchor/s)·s)/s)`,
+      // which is identically `round(p/s)` for ANY integer origin cell. So a
+      // probe's key does not depend on where the anchor is, and moving the
+      // anchor cannot renumber anything. The anchor's only remaining job is the
+      // one trap 4 in `srcMathTsl` names: keeping the f32 division
+      // camera-relative so it stays exact far from the world origin.
+      //
+      // Which means it should follow the camera CONTINUOUSLY, and the whole
+      // re-anchor apparatus below — the 64·s₀ drift threshold, the 16·s₀
+      // hysteresis quantum, the cold-guard re-arm, the `reanchors` counter the
+      // telemetry prints — exists only to make a re-keying event RARE. There is
+      // no re-keying event any more.
+      //
+      // The plan calls the old behaviour "wholesale history loss on long moves"
+      // and it is exactly that: past the threshold every probe in the scene got
+      // a new key, retired, and came back cold on one frame. This returns FALSE
+      // — no re-anchor happened, because there is nothing to re-anchor — while
+      // still tracking the camera, so `syncCamera`'s callers see a scene that
+      // never re-anchors instead of one that does it silently.
+      if (worldKeysEnabled()) {
+        // Quantized, not raw: `latticeOriginCell` is `round(anchor/s)` per level,
+        // so a jittering anchor would recompute every level's origin cell every
+        // frame for no benefit. The quantum keeps the uniform still while the
+        // camera walks, which keeps the uploads at zero on a static view.
+        const q = ANCHOR_QUANTUM * spacing0;
+        scratch.copy(cameraU.value).divideScalar(q).round().multiplyScalar(q);
+        if (!anchored || !a.equals(scratch)) {
+          a.copy(scratch);
+          anchored = true;
+        }
+        return false;
+      }
       if (anchored && drift <= REANCHOR_CHEBYSHEV * spacing0) return false;
       // Snap to a whole number of quanta rather than to the camera itself, so a
       // player pacing back and forth across the threshold does not re-anchor on
@@ -1680,8 +1822,17 @@ export function createSrcProbeSystem({
      * change, and pretending otherwise would run the population over a stale
      * pixel count and silently drop the new edge of the screen.
      */
-    setSize(nextWidth, nextHeight) {
-      if (nextWidth === system.width && nextHeight === system.height) return system;
+    setSize(nextWidth, nextHeight, nextPools = null) {
+      // A pool grow rides THIS path (§12.77 Unit A): same dims + changed pools
+      // is a real rebuild, not a no-op — the dispatch counts baked from the
+      // capacities are exactly as compile-time as the ones baked from the
+      // resolution. `nextPools` values already resolved through the hatch
+      // precedence land in `poolConfig`, so comparing against it is exact.
+      const poolsChanged = nextPools && (
+        (Number(nextPools.c0Probes) || 0) > system.poolConfig.c0Probes ||
+        (Number(nextPools.binBudget) || 0) > system.poolConfig.binBudget
+      );
+      if (nextWidth === system.width && nextHeight === system.height && !poolsChanged) return system;
       // EVERY create arg forwards. The first version passed only the six it
       // could see, so `lighting`/`surfaces`/`sceneMotion`/`trackMotion`
       // defaulted to null and the FIRST viewport resize silently rebuilt the
@@ -1691,6 +1842,7 @@ export function createSrcProbeSystem({
       const next = createSrcProbeSystem({
         gbuffer, width: nextWidth, height: nextHeight, props, volume, sky,
         lighting, surfaces, sceneMotion, trackMotion,
+        pools: nextPools ?? pools,
       });
       // Carry the debug view's on/off state across the rebuild. Losing it means
       // a viewport resize silently turns the gizmos off mid-inspection, which
@@ -1724,6 +1876,14 @@ export function describeSrcProbeSystem(system) {
   const c = system.store.cascades
     .map((x) => `c${x.cascade} ${x.probeCapacity}/${x.hashCapacity}`)
     .join(" ");
+  // S1: WHICH KEYING AND WHETHER RETENTION BUILT. Both are build-time globals,
+  // and a boot line that does not name them leaves the world-key arm looking
+  // exactly like the shipped one — the §12.30 failure this file keeps re-finding
+  // in a new costume. `retain` is the BUILT bundle, not the flag that asked for
+  // it, so a build where the two disagree says so.
+  const keying = worldKeysEnabled()
+    ? `WORLD-ABSOLUTE keys (no re-anchor)${system.frame?.retain ? `, locality retention (hold >${system.frame.retain.maxAge}f, yields at ${Math.round(system.frame.retain.highWater * 100)}% capacity)` : ", retention OFF"}`
+    : "anchor-relative keys (re-anchors on drift)";
   const bytes = system.store.bytes + system.rayStore.bytes + (system.binStore?.bytes ?? 0);
   // `passes/groups` is not decoration: `profile.giPasses` attributes the chain
   // by walking `passGroups`, and when that came back absent there was no way to
@@ -1732,7 +1892,7 @@ export function describeSrcProbeSystem(system) {
   // that is already being read rather than in another instrumented run.
   const groups = Array.isArray(system.passGroups) ? system.passGroups.length : "ABSENT";
   return `[gi] src probes: ${system.pixelCount} gbuffer pixels, ${system.passes.length} passes / ` +
-    `${groups} groups, s0=${system.spacing0}, ` +
+    `${groups} groups, s0=${system.spacing0}, ${keying}, ` +
     `${c}, ${system.raysPerPixel} rays/px, ` +
     // ⚠ SAY THE RAY COUNT, NOT JUST THE RATE. "2 rays/px" read as a small
     // number for a whole phase while it meant 3,146,400 rays a frame and 94% of

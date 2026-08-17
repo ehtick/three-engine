@@ -149,15 +149,18 @@ check("found the module catalogue", moduleIds.length >= 15, moduleIds.join(", ")
  * Modules whose entire surface really is component properties, plus the reason.
  *
  * This list is allowed to exist because for some modules it is the truth:
- * enabling `postprocessing` and setting bloom threshold is `module.setEnabled`
- * followed by `component.setProp`, and inventing `post.setBloom` would be a
+ * enabling `physics-rapier` and giving a body a mass is `module.setEnabled`
+ * followed by `component.setProp`, and inventing `physics.setMass` would be a
  * second way to do the same thing that drifts from the first. What is NOT
  * allowed is a module with buttons — a bake, an import, a compress — and no op
  * for them, because a button is a capability `component.setProp` cannot reach.
+ *
+ * `postprocessing` used to be on this list and stopped being true the day its
+ * graph became a `.post` document: a file is not a property, and authoring one
+ * is `post.*`.
  */
 const COMPONENT_ONLY = {
   gi: "Global illumination is properties — the gi component for the volume, and giMobility/giTrace on each mesh; the bake is automatic and driven by the scene, not by a button.",
-  postprocessing: "Effects are properties of the post component; enabling the module is module.setEnabled.",
   "physics-rapier": "Bodies, colliders and joints are components; the layer matrix is scene.setSettings.",
   "virtual-geometry": "Cluster building happens on import when the module is on; the flag is a component/.meta property.",
 };
@@ -172,6 +175,7 @@ const MODULE_OPS = {
   "audio-library": "audio.library",
   "audio-editor": "audio",
   "texture-editor": "texture",
+  postprocessing: "post",
   navigation: "nav",
   terrain: "terrain",
   basis: "asset.compress",

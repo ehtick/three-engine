@@ -741,15 +741,11 @@ export function nodeDefaults(type) {
 // ---------------------------------------------------------------------------
 // Default graph: a one-node passthrough (Color → Output) so a freshly added
 // PostProcessComponent renders the scene unchanged until the user adds nodes.
+// Defined in postAsset.js (the format, which imports no three) and re-exported
+// here so the compiler's importers don't need to know that split exists.
 // ---------------------------------------------------------------------------
 
-export const DEFAULT_POST_GRAPH = {
-  nodes: [
-    { id: "input", type: "input", props: {}, position: { x: 80, y: 160 } },
-    { id: "output", type: "output", props: {}, position: { x: 480, y: 180 } },
-  ],
-  edges: [{ source: "input", sourceHandle: "color", target: "output", targetHandle: "color" }],
-};
+export { DEFAULT_POST_GRAPH, createPostGraph, normalizePostGraph, POST_EXT } from "./postAsset.js";
 
 // ---------------------------------------------------------------------------
 // Quality presets — kept in one place so editor + compiler share the values.
@@ -767,21 +763,20 @@ const SSGI_QUALITY_PRESETS = {
   high: { sliceCount: 3, stepCount: 16 },
 };
 
-// Lazy addon resolvers. The first node compile triggers the dynamic import;
-// subsequent compiles use the cached promise. A failed import (addon not
-// bundled in this three build) keeps `null` here forever and the compiler
-// falls back to a no-op for that node, so a missing addon never crashes
-// the whole graph. We cache once per addon key, keyed by the module's
-// installed side effect — every import() here resolves a string keyed off
-// the source module path.
+// Lazy addon resolvers. The first compile that needs a node type triggers
+// its dynamic import; subsequent compiles reuse the cached promise. A
+// permanently missing addon (not in this three build) caches `null` and the
+// compiler falls through to a passthrough for that node. Transient browser
+// fetch failures (`net::ERR_INSUFFICIENT_RESOURCES` from firing ~25 Vite
+// deps at once) are retried and NOT memoised as null, so a later compile
+// can recover.
 //
-// The exported `loadXxx()` helpers select the addon key and named export.
-const _lazyResolvers = new Map(); // key -> { promise, reject }
-
 // Keep these imports as literal specifiers. Vite can rewrite/package a
 // literal dynamic import, but `/* @vite-ignore */ import(modulePath)` leaves
 // the bare `three/addons/...` string for the browser, where it is not a valid
 // URL and produces "Failed to resolve module specifier".
+const _lazyResolvers = new Map(); // key -> { promise }
+
 const _addonLoaders = {
   ssgi: () => import("three/addons/tsl/display/SSGINode.js"),
   ssr: () => import("three/addons/tsl/display/SSRNode.js"),
@@ -810,40 +805,222 @@ const _addonLoaders = {
   fsr1: () => import("three/addons/tsl/display/FSR1Node.js"),
 };
 
-function lazyLoad(key, exportName) {
-  let entry = _lazyResolvers.get(key);
-  if (!entry) {
-    // `/* @vite-ignore */` tells Vite to skip its dynamic-import
-    // analyzer for this call. The analyzer couldn't statically resolve
-    // `modulePath` (it's a parameter, not a string literal) and was
-    // emitting the same warning every compile:
-    //
-    //   The above dynamic import cannot be analyzed by Vite.
-    //   ...
-    //
-    // With the comment, Vite leaves the import expression untouched so
-    // the string survives into the browser bundle. The browser then
-    // resolves the literal `"three/addons/..."` against Vite's runtime
-    // resolver — which we've configured in `vite.config.js` with a
-    // `resolve.alias` that maps `three/addons` → `three/examples/jsm`.
-    // That alias runs at the resolution step and rewrites the
-    // specifier before any module-graph dispatch, so the addons load
-    // even though Rollup's optimizer never saw them.
-    const promise = (_addonLoaders[key] ? _addonLoaders[key]() : Promise.resolve(null))
-      .then((m) => m[exportName] ?? null)
-      .catch((err) => {
-        console.warn(`Post-process addon "${key}" not available: ${err.message ?? err}`);
-        return null;
-      });
-    entry = { promise, resolved: false };
-    _lazyResolvers.set(key, entry);
+/** Named export each addon module exposes. */
+const _addonExportNames = {
+  ssgi: "ssgi",
+  ssr: "ssr",
+  gtao: "ao",
+  denoise: "denoise",
+  traa: "traa",
+  bloom: "bloom",
+  godrays: "godrays",
+  depthAwareBlend: "depthAwareBlend",
+  dof: "dof",
+  chromaticAberration: "chromaticAberration",
+  film: "film",
+  fxaa: "fxaa",
+  smaa: "smaa",
+  sobel: "sobel",
+  rgbShift: "rgbShift",
+  sharpen: "sharpen",
+  afterImage: "afterImage",
+  sepia: "sepia",
+  bleach: "bleach",
+  dotScreen: "dotScreen",
+  lut3D: "lut3D",
+  gaussianBlur: "gaussianBlur",
+  bilateralBlur: "bilateralBlur",
+  motionBlur: "motionBlur",
+  fsr1: "fsr1",
+};
+
+/**
+ * Graph node `type` → addon loader key(s). Godrays also needs
+ * `depthAwareBlend` for the soft composite path.
+ */
+const _nodeTypeAddonKeys = {
+  ssgi: ["ssgi"],
+  ssr: ["ssr"],
+  gtao: ["gtao"],
+  denoise: ["denoise"],
+  traa: ["traa"],
+  bloom: ["bloom"],
+  godrays: ["godrays", "depthAwareBlend"],
+  depthOfField: ["dof"],
+  chromaticAberration: ["chromaticAberration"],
+  film: ["film"],
+  fxaa: ["fxaa"],
+  smaa: ["smaa"],
+  sobel: ["sobel"],
+  rgbShift: ["rgbShift"],
+  sharpen: ["sharpen"],
+  afterImage: ["afterImage"],
+  sepia: ["sepia"],
+  bleach: ["bleach"],
+  dotScreen: ["dotScreen"],
+  lut3D: ["lut3D"],
+  gaussianBlur: ["gaussianBlur"],
+  bilateralBlur: ["bilateralBlur"],
+  motionBlur: ["motionBlur"],
+  fsr1: ["fsr1"],
+};
+
+/** Cap concurrent dynamic imports so Chrome does not abort the fetch storm. */
+const ADDON_IMPORT_CONCURRENCY = 4;
+const ADDON_IMPORT_ATTEMPTS = 3;
+let _addonImportInflight = 0;
+const _addonImportWaiters = [];
+
+function _acquireAddonImportSlot() {
+  return new Promise((resolve) => {
+    const tryAcquire = () => {
+      if (_addonImportInflight < ADDON_IMPORT_CONCURRENCY) {
+        _addonImportInflight++;
+        resolve();
+        return;
+      }
+      _addonImportWaiters.push(tryAcquire);
+    };
+    tryAcquire();
+  });
+}
+
+function _releaseAddonImportSlot() {
+  _addonImportInflight = Math.max(0, _addonImportInflight - 1);
+  const next = _addonImportWaiters.shift();
+  if (next) next();
+}
+
+function _isTransientImportError(err) {
+  const msg = String(err?.message ?? err ?? "");
+  return /Failed to fetch|INSUFFICIENT_RESOURCES|Load failed|NetworkError|network/i.test(msg);
+}
+
+function _sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function _mapLimit(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i], i);
+    }
   }
-  return entry.promise;
+  const n = Math.min(limit, Math.max(1, items.length));
+  await Promise.all(Array.from({ length: n }, () => worker()));
+  return results;
+}
+
+function lazyLoad(key, exportName = _addonExportNames[key]) {
+  let entry = _lazyResolvers.get(key);
+  if (entry) return entry.promise;
+
+  const promise = (async () => {
+    const loader = _addonLoaders[key];
+    if (!loader || !exportName) return null;
+    let lastErr = null;
+    for (let attempt = 0; attempt < ADDON_IMPORT_ATTEMPTS; attempt++) {
+      if (attempt > 0) await _sleep(80 * 2 ** (attempt - 1));
+      await _acquireAddonImportSlot();
+      try {
+        const mod = await loader();
+        return mod[exportName] ?? null;
+      } catch (err) {
+        lastErr = err;
+      } finally {
+        _releaseAddonImportSlot();
+      }
+    }
+    console.warn(`Post-process addon "${key}" not available: ${lastErr?.message ?? lastErr}`);
+    // Do not pin a permanent null for Chrome resource aborts — the next
+    // compile can try again once other fetches have drained.
+    if (_isTransientImportError(lastErr)) {
+      _lazyResolvers.delete(key);
+    }
+    return null;
+  })();
+
+  entry = { promise };
+  _lazyResolvers.set(key, entry);
+  return promise;
 }
 
 /** Drops every memoised factory. Used by the engine when the renderer is rebuilt. */
 export function resetLazyPostAddons() {
   for (const key of _lazyResolvers.keys()) _lazyResolvers.delete(key);
+}
+
+/** Addon keys reachable from the Output node (orphans never compile). */
+export function collectPostAddonKeys(graph) {
+  const nodes = graph?.nodes ?? [];
+  const edges = graph?.edges ?? [];
+  const nodeById = new Map(nodes.map((n) => [n.id, n]));
+  const out = nodes.find((n) => n.type === "output");
+  const keys = new Set();
+  if (!out) return keys;
+  const incoming = new Map();
+  for (const e of edges) {
+    if (!incoming.has(e.target)) incoming.set(e.target, []);
+    incoming.get(e.target).push(e);
+  }
+  const seen = new Set([out.id]);
+  const stack = [out.id];
+  while (stack.length) {
+    const node = nodeById.get(stack.pop());
+    if (!node) continue;
+    for (const key of _nodeTypeAddonKeys[node.type] ?? []) keys.add(key);
+    for (const e of incoming.get(node.id) ?? []) {
+      if (!seen.has(e.source)) {
+        seen.add(e.source);
+        stack.push(e.source);
+      }
+    }
+  }
+  return keys;
+}
+
+/**
+ * Load only the addons the current graph reaches, with a concurrency cap.
+ * Returns the ctx bag `compilePostGraph` expects (`ssgi`, `gtao`, `dof`, …).
+ * Unused keys are `null` (passthrough).
+ */
+export async function loadAddonsForGraph(graph) {
+  const empty = {
+    ssgi: null,
+    ssr: null,
+    gtao: null,
+    denoise: null,
+    traa: null,
+    bloom: null,
+    godrays: null,
+    depthAwareBlend: null,
+    dof: null,
+    chromaticAberration: null,
+    film: null,
+    fxaa: null,
+    smaa: null,
+    sobel: null,
+    rgbShift: null,
+    sharpen: null,
+    afterImage: null,
+    sepia: null,
+    bleach: null,
+    dotScreen: null,
+    lut3D: null,
+    gaussianBlur: null,
+    bilateralBlur: null,
+    motionBlur: null,
+    fsr1: null,
+  };
+  const keys = [...collectPostAddonKeys(graph)];
+  if (!keys.length) return empty;
+  const loaded = await _mapLimit(keys, ADDON_IMPORT_CONCURRENCY, (key) => lazyLoad(key));
+  const out = { ...empty };
+  for (let i = 0; i < keys.length; i++) out[keys[i]] = loaded[i];
+  return out;
 }
 
 export function loadSSGI() {
@@ -1629,7 +1806,14 @@ function buildNode(type, props, ins, ctx) {
       const depth = ins.get("depth");
       const fn = ctx.godrays;
       const light = ctx.godraysLight;
-      if (typeof fn !== "function" || !depth || !light) return color;
+      // The map check is deliberately repeated here, not left to
+      // `findGodraysLight`: the light is resolved when the GRAPH is built, and
+      // a light can lose its map afterwards (switching Shadow Source to "gi"
+      // frees it) while this node is still compiled. `GodraysNode` reads
+      // `light.shadow.map.depthTexture` at construction, so without this the
+      // graph throws `Cannot read properties of null (reading 'depthTexture')`
+      // from inside TSL, where the stack says nothing about which light.
+      if (typeof fn !== "function" || !depth || !light || !light.shadow?.map?.depthTexture) return color;
       // GodraysNode exposes `density` as a `.value` uniform. Its light
       // source is resolved from the scene's enabled shadow-casting lights.
       const node = fn(depth, ctx.camera, light);
@@ -1852,6 +2036,48 @@ export function compilePostGraph(graph, ctx) {
   const built = new Map(); // nodeId -> Map<outputKey, tslNode>
   const visiting = new Set();
 
+  // ── WHICH GRAPH NODE OWNS WHICH RENDER PASSES (2026-08-16) ──────────────────
+  //
+  // An effect's GPU work lives in `updateBefore` — the hook three calls to
+  // render its own passes before the quad that samples them. Collecting those
+  // nodes HERE, while the graph node that produced them is still in hand, is
+  // the only place the association exists: by the time `profile.renderPasses`
+  // sees the compiled output it has an anonymous DAG, and walking it from the
+  // output found NOTHING (three visited nodes, all `updateBeforeType: 'none'`)
+  // because most addons return a PassTextureNode over the effect rather than
+  // the effect itself. Labelled with the user's own node type, so the profile
+  // reads "Bloom 4 ms" rather than "UnrealBloomNode #3".
+  //
+  // Purely observational — nothing in rendering reads this.
+  const effects = [];
+  const seenEffects = new Set();
+  const collectEffects = (label, root) => {
+    const stack = [[root, 0]];
+    const local = new Set();
+    while (stack.length) {
+      const [n, depth] = stack.pop();
+      if (!n || typeof n !== "object" || depth > 5 || local.has(n)) continue;
+      local.add(n);
+      if (typeof n.updateBefore === "function" && n.updateBeforeType && n.updateBeforeType !== "none" && !seenEffects.has(n)) {
+        seenEffects.add(n);
+        effects.push({ label, node: n });
+      }
+      if (typeof n.getChildren === "function") {
+        try {
+          for (const child of n.getChildren()) stack.push([child, depth + 1]);
+        } catch {
+          // A node that throws while enumerating children is not worth
+          // failing a graph compile over — this is a profiling aid.
+        }
+      }
+      // The documented hops an addon puts between its output and its passes.
+      for (const key of ["passNode", "textureNode", "node", "inputNode"]) {
+        const value = n[key];
+        if (value && typeof value === "object") stack.push([value, depth + 1]);
+      }
+    }
+  };
+
   // Hot params (`kind: "hot"`) are meant to be UniformNodes on the addon
   // instance a builder creates, so that a slider drag can push a new value
   // into the live shader instead of rebuilding the pipeline and every
@@ -1964,6 +2190,9 @@ export function compilePostGraph(graph, ctx) {
       }
     }
     built.set(nodeId, outMap);
+    if (node.type !== "input" && node.type !== "output") {
+      for (const value of outMap.values()) collectEffects(node.type, value);
+    }
     return outMap.get(outputKey) ?? null;
   }
 
@@ -1973,12 +2202,15 @@ export function compilePostGraph(graph, ctx) {
       output: ctx.beautyNode ?? TSL.vec4(0, 0, 0, 1),
       signature: "__passthrough__",
       updateParams,
+      effects: [],
     };
   }
   return {
     output: result,
     signature: postGraphSignature(graph),
     updateParams,
+    // Consumed only by `profile.renderPasses` (see collectEffects above).
+    effects,
   };
 }
 

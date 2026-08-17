@@ -56,7 +56,7 @@ export function resolvePath(path) {
  * the result on to a Tauri command, and handing the traversing form to the
  * filesystem after approving the resolved one would defeat the whole check.
  */
-function insideProject(path, { forWriting = false } = {}) {
+export function insideProject(path, { forWriting = false } = {}) {
   const root = useProjectStore.getState().rootPath;
   if (!root) throw new Error("No project is open.");
   if (!norm(path)) throw new Error("A path is required.");

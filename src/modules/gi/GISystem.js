@@ -30,21 +30,23 @@ import * as THREE from "three/webgpu";
 import { Fn, If, cameraPosition, cos, float, fract, mix, normalWorld, positionWorld, renderGroup, screenCoordinate, screenUV, select, sin, smoothstep, texture, uniform, uniformArray, vec2, vec3, vec4 } from "three/tsl";
 import { GI_BOOT_AMBIENT_MAX_TICKS, bootAmbientStep } from "./bootAmbient.js";
 import { giDebugView, resolveGiConfig, sceneSkyRadiance } from "./giConfig.js";
-import { blitBvhAtlasTiles, computeCompressedTextureAverage, createGiBvhReflect, createGiBvhTarget, createGiEmitterShadowPass, createGiEmitterTileCutPass, createGiGBuffer, createGiIrradianceTemporalPass, createGiLightShadowFilterPass, createGiLightShadowHistoryPass, createGiLightShadowPass, createGiLightShadowWidePass, createGiResolve, createGiShadowClearPass, createGiTargets, renderGiGBuffer } from "./giScreen.js";
+import { blitBvhAtlasTiles, computeCompressedTextureAverage, createGiBvhReflect, createGiBvhTarget, createGiEmitterShadowPass, createGiEmitterTileCutPass, createGiFarFieldAvgPass, createGiGBuffer, createGiIrradianceTemporalPass, createGiLightShadowFilterPass, createGiLightShadowHistoryPass, createGiLightShadowPass, createGiLightShadowWidePass, createGiResolve, createGiShadowClearPass, createGiTargets, renderGiGBuffer } from "./giScreen.js";
 import { createLightTreeEmitterImportance, createLightTreeRecordSlot } from "./lightTreeGpu.js";
 import { noteTextureAverage, pendingTextureAverages, resolveMaterialSurface, serializeMeshForBake } from "./voxelizeOnce.js";
 import { createSrcVolume } from "./srcVolume.js";
 import { createSrcDistanceView, createSrcOccupancyView } from "./srcDebugViews.js";
-import { createSrcProbeSystem, describeSrcProbeSystem, formatSrcProbeFrame, srcProbesEnabled, srcShadeEnabled } from "./srcSystem.js";
-import { ALPHA_MOTION_SAT, ALPHA_TRACK_HOLD_MS, ALPHA_TRACK_REARM_MS, ALPHA_TRACK_THRESHOLD } from "./srcConfig.js";
+import { SRC_POOL_FLOORS, createSrcProbeSystem, describeSrcProbeSystem, formatSrcProbeFrame, srcPoolCeilings, srcProbesEnabled, srcShadeEnabled } from "./srcSystem.js";
+import { ALPHA_MOTION_SAT, ALPHA_TRACK_HOLD_MS, ALPHA_TRACK_REARM_MS, ALPHA_TRACK_THRESHOLD, CASCADE_COUNT, binCount } from "./srcConfig.js";
 import { createSrcSurfaceAttribution } from "./srcSurface.js";
-import { createOccupancyField, describeOccupancyField, quantizeOccupancyRes } from "./occupancyField.js";
+import { SURFACE_POOL_CEILINGS, createOccupancyField, describeOccupancyField, quantizeOccupancyRes } from "./occupancyField.js";
 import { BVH_STRATEGY, buildStaticSceneBvhWords, classifyDynamicShape, composeFieldDynamics, createDynamicObjectSet, dynHeaderWords, giMobilityOf, giTraceOf } from "./dynamicObjects.js";
-import { buildLightTree, collectEmitters } from "./lightTree.js";
+import { buildLightTree, collectEmitters, estimateLightTreeWords } from "./lightTree.js";
 import { fitPrimitive } from "./primitiveFit.js";
 import { fitEmitterShape } from "./emitterShapes.js";
 import { MeshBVH } from "three-mesh-bvh";
-import { GI_MIRROR_LAYER, UI_LAYER } from "../../engine/editorLayers.js";
+import { DEBUG_LAYER, EDITOR_LAYER, GI_MIRROR_LAYER, UI_LAYER } from "../../engine/editorLayers.js";
+import { collectStateComputeNodes, purgeNodeBuilderCache, releaseComputeNodes } from "./releaseCompute.js";
+import { textureLoadsInFlight } from "../../engine/textureAsset.js";
 import { GICascadeLight, MAX_EMITTERS, giRoughnessBucketOf, registerGILight } from "./giLight.js";
 import { buildBvhScene } from "./bvh/bvhScene.js";
 import { RayHitMode, rayHitModeName, resolveRayHitConfig } from "./rayHit/RayHitConfig.js";
@@ -262,6 +264,20 @@ const giPipelineTimings = [];
 // the driver has gone quiet does. That is exactly the §12.65.1 wedge signature
 // (pipeline pending MINUTES after boot, everything else long since compiled).
 let giLastPipelineSettleT = 0;
+// When the in-flight watchdog re-roll started, or 0 for "none". A TIMESTAMP
+// rather than a boolean because the failure this whole subsystem exists for is
+// a promise that never settles: a boolean lock would be taken by the first
+// re-roll, never released by its `finally`, and the watchdog would be dead for
+// the life of the page — the exact wedge it is meant to heal, now permanent and
+// silent. As a lease it expires on its own, so one stuck re-roll costs one
+// window and the next pipeline still gets its turn.
+let giRerollLeaseT = 0;
+// The longest any pipeline has taken to compile SUCCESSFULLY this session. The
+// watchdog scales its "pending too long" window off this, so a scene whose
+// shaders genuinely take half a minute is not diagnosed as wedged. Only
+// successes count: a re-roll's own latency would ratchet the window up on the
+// strength of the storm it is supposed to prevent.
+let giSlowestSettledMs = 0;
 // Retries are BOUNDED because an unbounded re-roll of a genuinely broken
 // descriptor would hammer the driver forever; 4 attempts × the retry window is
 // enough to survive any transient, and the warn lines make attempt N visible.
@@ -339,7 +355,12 @@ function giCompute(renderer, nodes) {
   }
 }
 
-function installAsyncComputePipelines(renderer) {
+// Exported for `tests/gi-pipeline-watchdog.test.mjs`, which drives it with a
+// fake backend/device that reproduces three's reset-the-singleton-descriptor
+// behaviour. That test is the only guard on the snapshot above — the failure
+// it catches is invisible in a normal run (the watchdog logs a rejection and
+// the frame just keeps skipping the pass), so it must not be inlined away.
+export function installAsyncComputePipelines(renderer) {
   const backend = renderer?.backend;
   const device = backend?.device;
   if (!backend || typeof device?.createComputePipelineAsync !== "function") return;
@@ -439,9 +460,14 @@ function installAsyncComputePipelines(renderer) {
           ? (wgsl.match(/var<storage[^>]*>\s*(\w+)/g) ?? []).slice(0, 4).map((s) => s.split(/\s+/).pop()).join(",")
           : "",
       });
-      const record = () => {
-        giPipelineTimings[order].ms = performance.now() - tCreate;
+      const record = (ok = false) => {
+        const elapsed = performance.now() - tCreate;
+        giPipelineTimings[order].ms = elapsed;
         giLastPipelineSettleT = performance.now();
+        // Only successes widen the watchdog's window — see giSlowestSettledMs.
+        // A pipeline that took 27 s and WORKED is proof this machine compiles
+        // this scene's shaders slowly; one that took 27 s and failed is not.
+        if (ok && elapsed > giSlowestSettledMs) giSlowestSettledMs = elapsed;
       };
       // ── §12.56: KEEP WHAT A RETRY NEEDS ──────────────────────────────────
       // The descriptor (module + layout objects, both alive as long as the
@@ -451,7 +477,34 @@ function installAsyncComputePipelines(renderer) {
       // Dropped again on success; a landed pipeline never retries.
       {
         const data = backend.get(computePipeline);
-        data.giDescriptor = descriptor;
+        // ⚠ SNAPSHOT THE FIELDS — NEVER KEEP THE DESCRIPTOR OBJECT ITSELF.
+        // three hands this callback a MODULE-LEVEL SINGLETON
+        // (`_computePipelineDescriptor`, class GPUComputePipelineDescriptor in
+        // three.webgpu.nodes.js) and calls `.reset()` on the line AFTER
+        // `device.createComputePipeline(...)` returns — zeroing label, layout
+        // and compute. Storing the reference meant every pending pipeline in
+        // the module aliased ONE object that was already blank, so the §12.56
+        // re-roll below re-asked the driver with `layout: null` and was
+        // rejected 100% of the time:
+        //
+        //   §12.56 WATCHDOG: re-roll for "emitterShadowPass" REJECTED: Failed
+        //   to read the 'layout' property from 'GPUPipelineDescriptorBase':
+        //   The provided value 'null' is not a valid enum value of type
+        //   GPUAutoLayoutMode
+        //
+        // (observed live on the banner Sponza, 2026-08-16). The watchdog has
+        // therefore NEVER healed a wedged pipeline since it shipped — every
+        // firing was a rename of the failure, not a recovery. `compute` (the
+        // backend's per-program `{module, entryPoint}`) and `layout` (a real
+        // GPUPipelineLayout) are stable objects three retains; only the
+        // CONTAINER is recycled, so a shallow copy is the complete fix. It
+        // keeps those two alive until the pipeline lands, which is exactly the
+        // lifetime a retry needs, and is dropped with the rest on success.
+        data.giDescriptor = {
+          label: descriptor.label,
+          layout: descriptor.layout,
+          compute: descriptor.compute,
+        };
         data.giCreateT = tCreate;
         data.giTiming = giPipelineTimings[order];
         // The owner too (giCurrentComputeNode at creation): a wedged original
@@ -462,7 +515,7 @@ function installAsyncComputePipelines(renderer) {
       }
       const promise = device.createComputePipelineAsync(descriptor).then(
         (pipelineGPU) => {
-          record();
+          record(true);
           const data = backend.get(computePipeline);
           data.pipeline = pipelineGPU;
           data.giDescriptor = null;
@@ -539,12 +592,36 @@ function installAsyncComputePipelines(renderer) {
     const retryMs = Number(globalThis.__giPipelineRetryMs ?? 6000);
     if (!(retryMs > 0)) return;
     const now = performance.now();
+    // ── ONE RE-ROLL IN FLIGHT AT A TIME, GLOBALLY ───────────────────────────
+    // The wave-quiet gate below is per-pipeline, so on a boot where the whole
+    // wave is pending it passes for EVERY pipeline in the same millisecond.
+    // Measured on the Bistro scene: 41 pipelines (src#16…src#56) re-rolled on
+    // one tick, all at 14:27:56.272Z. That is a thundering herd aimed at the
+    // exact resource that is already the bottleneck — and because each duplicate
+    // compile keeps the driver busy WITHOUT settling anything, it re-arms the
+    // quiet gate and earns attempts 2, 3 and 4. 70 kernels became 591 pipeline
+    // compiles totalling 3366 s. Serialising costs a wedged pipeline one extra
+    // retry window and removes the feedback loop entirely.
+    // ── THE THRESHOLD IS ADAPTIVE, NOT 6 SECONDS ────────────────────────────
+    // A fixed window encodes an assumption about how fast this machine compiles
+    // this scene's shaders, and Bistro breaks it: its SRC kernels reach 155 kB
+    // of WGSL and single pipelines legitimately take 20-27 s, during which the
+    // driver is working flat out and nothing settles. "Driver quiet" is a proxy
+    // for "wedged" that only holds when a normal compile is fast relative to the
+    // window — so scale the window by the slowest compile that has ACTUALLY
+    // SUCCEEDED this session. A scene of small shaders keeps the 6 s behaviour
+    // (the floor); a scene of huge ones stops calling a working compiler dead.
+    const effectiveRetryMs = Math.max(retryMs, giSlowestSettledMs * 1.5);
     const quietSince = now - Math.max(
       data.giCreateT ?? 0,
       giLastPipelineSettleT,
       data.giLastRetryT ?? 0,
     );
-    if (quietSince < retryMs) return;
+    if (quietSince < effectiveRetryMs) return;
+    // Take the lease (see giRerollLeaseT). Held for one retry window at most,
+    // so a re-roll that itself wedges cannot lock the watchdog out forever.
+    if (giRerollLeaseT && now - giRerollLeaseT < effectiveRetryMs) return;
+    giRerollLeaseT = now;
     data.giRetryInFlight = true;
     data.giRetries = (data.giRetries ?? 0) + 1;
     data.giLastRetryT = now;
@@ -584,7 +661,12 @@ function installAsyncComputePipelines(renderer) {
           `[gi] §12.56 WATCHDOG: re-roll for "${name}" REJECTED: ${error?.message ?? error}`,
         );
       },
-    ).finally(() => { data.giRetryInFlight = false; });
+    ).finally(() => {
+      data.giRetryInFlight = false;
+      // Release early on a settle so the next wedged pipeline need not wait out
+      // the full lease; a re-roll that never settles simply lets it expire.
+      if (giRerollLeaseT === now) giRerollLeaseT = 0;
+    });
   };
   backend.compute = function (computeGroup, computeNode, bindings, pipeline, dispatchSize) {
     const data = this.get(pipeline);
@@ -749,8 +831,57 @@ const MAX_INSTANCES_PER_MESH = 256;
 // SDF bakes sample the surface, not every triangle cell — but a multi-
 // million-tri mesh still costs seconds of worker time on first bake.
 const MAX_TRIS_PER_MESH = 500_000;
+
+/**
+ * Emitters the light-tree region is reserved for even when the scene builds
+ * with fewer — the headroom a scene needs to SPAWN emissives into.
+ *
+ * The tree's base word is baked into the compiled descent, so the region
+ * cannot move without a recompile: whatever is reserved at build time is the
+ * hard ceiling until the next GI rebuild, and past it `#refreshLightTree`
+ * refuses the write and freezes the tree at the build pose. That freeze is
+ * invisible except as "my spawned emissives emit no light".
+ *
+ * 128 costs ~15 KB of the dynamic pool and nothing per frame (an unused
+ * reservation is never walked). `__giLightTreeMinEmitters` overrides it for a
+ * scene that genuinely spawns more.
+ */
+const LIGHT_TREE_MIN_CAPACITY_EMITTERS = Math.max(
+  1,
+  Number(globalThis.__giLightTreeMinEmitters) || 128,
+);
 const MAX_AXIS_RES = 128;
 const MAX_PROBE_AXIS = 48;
+// §13 F1 — the DETAIL BOX tiers. Past city scale the volume stops covering
+// the scene and clamps to a camera-centred box: density near the camera is
+// the resource, not volume (a 48-axis lattice over 130 m is 2.5 m probes; the
+// same lattice over 48 m is 1 m). F1 is HATCH-ONLY — arm via
+// `__giConfigOverride.detailExtent = <metres | true>`; the scene-covering fit
+// stays the default until F3 gives out-of-volume surfaces a fallback (F0
+// measured them CRUSHED BLACK, plan §13.2).
+// Sized by each tier's own `probeAxis` cap, NOT by taste: the probe budgets
+// are exactly probeAxis³, so the finest spacing a box can reach is
+// spacing ≈ extent·1.05/(probeAxis − 2 margin cells) — the F1 rig measured a
+// 48 m box on medium landing at 2.25 m (axis cap 28 binds, and Bistro's 32 m
+// building height ALONE pins y to 33.6/26 ≈ 1.3 m, which is why the detail
+// box clamps Y too). These extents land every tier at ~1.0-1.2 m probes
+// WITHIN its existing budgets — pools are the memory, the detail box only
+// re-spends them (plan §13.8).
+const DETAIL_EXTENT_BY_TIER = { low: 20, medium: 24, high: 36, ultra: 42 };
+// §13 DEFAULT-ON (with F3's far-field fallback shipped): past this horizontal
+// scene span the detail box arms itself — density near the camera beats
+// coverage of a whole city, and the far field gets the deliberate F3 constant
+// instead of an accidental black. Under the trigger, nothing changes:
+// small/room scenes keep the scene-covering fit bit-identical (F1 gate a).
+// `__giConfigOverride.detailExtent = false` force-disables; `true`/metres
+// force-arm as before.
+const DETAIL_TRIGGER = 60;
+// §13 F2 — the camera drives the slide. Hysteresis: slide only when the
+// camera leaves the CENTRAL THIRD of the box (± extent/6 from the anchor),
+// so orbit jitter and small strafes never move the field. Throttle: at most
+// one slide per interval — a request landing inside it simply re-fires on a
+// later tick, because the band condition persists (queued, never stacked).
+const DETAIL_SLIDE_MIN_INTERVAL_MS = 500;
 // Analytic lights the per-frame GPU direct pass supports (uniform slots —
 // a fixed count keeps light add/remove/move recompile- and rebake-free).
 const MAX_GI_LIGHTS = 4;
@@ -1258,7 +1389,26 @@ export class GISystem {
         // `visible` flag must not exclude it here — see engine/batching.js.
         // Same camera-independence rule as #collectMeshes: auto-fit bounds
         // must not breathe as LOD/occlusion hide things off-screen.
-        if (child.visible === false && !child.userData.batchedInto && !child.userData.cameraHidden) return;
+        // ⚠ `mergedInto` BELONGS HERE AND NOT IN #collectMeshes — the asymmetry
+        // is the point, and it is what made a Paris street block fit into
+        // 11.7 x 4.2 x 12.0 m.
+        //
+        // Static merging (engine/merging.js) hides each member with
+        // `visible = false` + `userData.mergedInto`, and parents the merged
+        // PROXY at the SCENE ROOT. #collectMeshes walks the whole scene, so it
+        // picks the proxies up and must keep skipping the members or every
+        // merged triangle would be counted twice. This walk is different: it
+        // covers only the GI component's OWN entity subtree, which the
+        // scene-root proxies are not in. Pruning the members there removes the
+        // geometry with nothing to replace it — on the Bistro scene merging
+        // claimed 1023 of ~1456 meshes, so the volume was fitted to the
+        // unmerged remainder and most of the street fell outside the field.
+        //
+        // The same pair of flags is tested together in selectionOutline.js:395;
+        // only this walk had one of them.
+        const hiddenButPresent =
+          child.userData.batchedInto || child.userData.mergedInto || child.userData.cameraHidden;
+        if (child.visible === false && !hiddenButPresent) return;
         const skip =
           !child.isMesh ||
           child.userData.__giDebug ||
@@ -1309,7 +1459,82 @@ export class GISystem {
    * checkerboard across the outside faces. A real (dark) probe layer out
    * there makes outside surfaces honestly, uniformly dark instead.
    */
+  /**
+   * §13 F1 — clamp the content AABB to the camera-centred detail box.
+   *
+   * Sits INSIDE the `#fitBoundsFor` funnel deliberately: that function is the
+   * single source of truth for build AND the auto-fit watcher, so a clamp
+   * here is seen identically by both and cannot invite refit oscillation.
+   * The anchor is captured ONCE when the clamp first arms and then held —
+   * F2 owns moving it (hysteresis + throttle); a per-call camera read would
+   * make the watcher chase every orbit twitch. Horizontal axes only; Y keeps
+   * the content's height. The anchor is clamped into the content box first,
+   * so a far-away editor camera can never fit an empty volume, and the
+   * intersection below is non-empty by construction.
+   */
+  #detailClampAabb(aabb) {
+    const hatch = globalThis.__giConfigOverride?.detailExtent;
+    if (hatch === false) return aabb;
+    const span = new THREE.Vector3();
+    aabb.getSize(span);
+    const tierExtent = DETAIL_EXTENT_BY_TIER[qualityTierOf(this.config)] ?? 24;
+    // DEFAULT-ON past city scale (see DETAIL_TRIGGER); the hatch force-arms
+    // (`true` = tier extent, a number = explicit metres) or force-disables.
+    const extent = hatch
+      ? (hatch === true ? tierExtent : Math.max(8, Number(hatch) || 0))
+      : (Math.max(span.x, span.z) > DETAIL_TRIGGER ? tierExtent : 0);
+    if (!extent) return aabb;
+    // Arm only when the clamp would actually shrink a horizontal axis — a
+    // scene already smaller than the box builds exactly as before.
+    if (span.x <= extent && span.z <= extent) return aabb;
+    this._detailExtent = extent;
+    if (!this._detailAnchor) {
+      const camera = this.engine?.camera;
+      this._detailAnchor = new THREE.Vector3();
+      if (camera) camera.getWorldPosition(this._detailAnchor);
+      else aabb.getCenter(this._detailAnchor);
+      aabb.clampPoint(this._detailAnchor, this._detailAnchor);
+      console.log(
+        `[gi] detail volume armed: ${extent}m box anchored at ` +
+          `${this._detailAnchor.x.toFixed(1)},${this._detailAnchor.y.toFixed(1)},${this._detailAnchor.z.toFixed(1)} ` +
+          `(content ${span.x.toFixed(0)}x${span.y.toFixed(0)}x${span.z.toFixed(0)}m; ` +
+          `out-of-box indirect = the §13 F3 far-field constant)`,
+      );
+    }
+    const anchor = this._detailAnchor;
+    const half = extent / 2;
+    // CONSTANT SIZE, position-clamped — never truncated against the content
+    // edge. The F2 dolly rig caught the truncating version red-handed: a
+    // truncated box's span and center move by ARBITRARY amounts as the
+    // anchor walks past a content edge, so `#fitBoundsFor`'s floor/ceil
+    // lattice snap flapped between 28 and 29 cells, bumped the spacing rung
+    // (1.0 → 1.1), and handed `#refitInPlace` a fit BIGGER than the live box
+    // — the STRETCH tier, which resamples probes mid-walk (three of ten
+    // dolly refits, plus a compile wave riding the churn). With a constant
+    // extent-sized box that CLAMPS ITS POSITION into the content (and an
+    // anchor F2 only ever moves in whole probe-spacing steps), `laid()`'s
+    // center translates by exact lattice multiples, the cell counts are
+    // translation-invariant, and every follow refit is a pure slide.
+    // An axis whose content is smaller than the extent keeps the content
+    // bounds themselves — constant too, and it builds exactly as before.
+    const posClamp = (lo, hi, v) => Math.max(lo, Math.min(v, hi));
+    const minX = span.x > extent ? posClamp(aabb.min.x, aabb.max.x - extent, anchor.x - half) : aabb.min.x;
+    const maxX = span.x > extent ? minX + extent : aabb.max.x;
+    const minZ = span.z > extent ? posClamp(aabb.min.z, aabb.max.z - extent, anchor.z - half) : aabb.min.z;
+    const maxZ = span.z > extent ? minZ + extent : aabb.max.z;
+    // Y is capped too, GROUND-ANCHORED (not camera-anchored): the F1 rig
+    // proved Bistro's 32 m facades alone pin medium's 28-probe axis to
+    // ≥1.3 m spacing no matter how small the horizontal box gets. Street
+    // GI lives at street height; upper facades join the F3 far field.
+    const maxY = Math.min(aabb.max.y, aabb.min.y + extent);
+    return new THREE.Box3(
+      new THREE.Vector3(minX, aabb.min.y, minZ),
+      new THREE.Vector3(maxX, maxY, maxZ),
+    );
+  }
+
   #fitBoundsFor(aabb) {
+    aabb = this.#detailClampAabb(aabb);
     const center = new THREE.Vector3();
     aabb.getCenter(center);
     const span = new THREE.Vector3();
@@ -1539,6 +1764,37 @@ export class GISystem {
     const state = this.state;
     if (!state) return;
 
+    // §13 F0 rig: slide the volume by [dx, dz] metres (snapped to the probe
+    // lattice) WITHOUT a rebuild — `globalThis.__giVolumeSlide = [20, 0]`,
+    // consumed one-shot here. Measures what F2's camera-driven slide will pay
+    // and, once part of the scene is outside the moved box, shows what the
+    // composite does for out-of-volume surfaces. ⚠ the auto-fit watcher will
+    // notice the content/volume mismatch and slide back on its own cadence —
+    // that return trip is a second, free measurement, not a bug.
+    if (globalThis.__giVolumeSlide) {
+      const [dx = 0, dz = 0] = globalThis.__giVolumeSlide;
+      globalThis.__giVolumeSlide = null;
+      this.#debugSlide(Number(dx) || 0, Number(dz) || 0);
+    }
+    // §13 F2: when the detail box is armed, the camera drives the slide.
+    this.#detailFollowTick(performance.now());
+
+    // §13.7d — LIVE AO DIALS. `aoStrength`/`aoRadius` are uniforms (only the
+    // `ao` prop itself is structural), so a sweep needs no rebuild and no
+    // compile wave: `__giAoOverride = { strength: 0.8, radius: 2.5 }`.
+    // strength 0 is a clean AO-OFF baseline inside the SAME boot, which is
+    // what makes a 4-arm A/B affordable on a scene with a 3-minute boot.
+    // Polled, like every other debug hatch here.
+    const aoOv = globalThis.__giAoOverride;
+    if (aoOv && state.screen?.ao) {
+      if (Number.isFinite(aoOv.strength)) {
+        state.screen.ao.strength.value = Math.min(1, Math.max(0, aoOv.strength));
+      }
+      if (Number.isFinite(aoOv.radius)) {
+        state.screen.ao.radius.value = Math.min(4, Math.max(0.1, aoOv.radius));
+      }
+    }
+
     // Belt-and-braces for the lights-hash memo bug (#purgeLightsHashMemo):
     // purge once more a few frames after every build, when async pipeline
     // compiles have settled. A purge is nearly free (one small map) and,
@@ -1550,9 +1806,27 @@ export class GISystem {
       if (this._lightsRefreshTicks === 0) this.#purgeLightsHashMemo();
     }
 
+    // ── SUB-PHASE MARKS (see StatsSystem.markSub) ────────────────────────────
+    // `preRender` measured 25.5 ms of a 54 ms CPU frame on Bistro and named
+    // nothing inside itself. These boundaries are what make that answerable;
+    // disarmed they cost one boolean test each.
+    const stats = this.engine.stats;
+    const mark = stats?.markSub ? (name) => stats.markSub(name) : () => {};
+
     // Analytic lights AND promoted emissive emitters are per-frame uniforms
     // — moving either re-lights the field this same frame, no bake involved.
+    mark("gi.lightUniforms");
     this.#updateLightUniforms();
+    mark("gi.srcPoolPressure");
+    this.#syncSrcPoolPressure(state);
+    mark("gi.frameUniforms");
+    // §12.80 Unit B: the checkerboard parity flips EVERY frame, on its own
+    // uniform — the jitter phase freezes with `__giShadowTemporal = false` and
+    // never exists on the analytic arm, and a frozen parity would leave half
+    // the shadow buffer permanently stale.
+    if (this._giShadowCheckerU) {
+      this._giShadowCheckerU.value = (this._giShadowCheckerU.value + 1) & 1;
+    }
     // Live lift A/B for the wall-leak question (`__giShadowLift`, voxels;
     // default 1.5 = shipped behaviour). Outside the temporal block below
     // because the analytic-width arm builds no temporal uniforms yet still
@@ -1758,7 +2032,15 @@ export class GISystem {
     // addressed kernels that §12.8 deleted; the presets and their live
     // `__gi*` overrides are recorded in the plan so Phase 1-3 can re-tune
     // rather than re-derive them.)
+    mark("gi.emitterSlots");
     this.#refreshEmitterSlots();
+    // §12.70 W5: and the same live pose into the tree's packed records, for
+    // the consumers that read records instead of slots ([J]'s NEE, the whole
+    // screen emitter chain under the tile cut). Right after the slots so the
+    // two descriptions of one lamp can never be a frame apart.
+    mark("gi.lightTree");
+    this.#refreshLightTree();
+    mark("gi.atlasTransforms");
     // Slot transforms track live matrices — dragging a mesh updates its
     // uniforms here, which bumps the atlas revision and re-runs the
     // composite below. That IS the whole cost of moving scene geometry.
@@ -1769,15 +2051,19 @@ export class GISystem {
     // And for the occupancy pyramid: matrices only. Its triangle buffers and
     // work list are rotation/translation invariant by construction, so a drag
     // never touches them — see #buildOccupancyField.
+    mark("gi.occupancyTransforms");
     this.#refreshOccupancyTransforms(state.volume.occupancyField);
     // AFTER the transform refresh, so the bounds this reads are this frame's.
     // Reading them before would publish the previous pose's occluder spheres and
     // give every mover shadow a one-frame lag against its own geometry.
+    mark("gi.moverOccluders");
     this.#syncMoverOccluders();
     // Exact dynamic objects: live transforms into the header region, queued
     // geometry uploads, deferred voxel-slot parking. Before the gbuffer/
     // compute work so this frame's rays see this frame's pose.
+    mark("gi.dynamicObjects");
     this.#refreshDynamicObjects(renderer, state);
+    mark("gi.tickTail");
     // ⛔ A BOOT-IDLE SKIP LIVED HERE AND TOOK GI OFF THE USER'S SCREEN
     // ENTIRELY. It returned from the whole tick while the field's own kernels
     // were still compiling, on the reasoning that everything below feeds a field
@@ -1813,9 +2099,37 @@ export class GISystem {
       // prepass is about to run. Without exact reflections the gbuffer's
       // normal.w stays 0 everywhere, exactly as before this existed.
       const wantsMirrorMask = !!state.screen.bvhReflect && this.#bvhReflectionsEnabled() && this.#bvhMaskEnabled();
-      renderGiGBuffer(renderer, this.engine.scene, this.engine.camera, state.screen.gbuffer, {
-        mirrorMask: wantsMirrorMask,
-      });
+      // ⚠ THE SECOND FULL SCENE SUBMISSION. This is a nested render of every
+      // eligible mesh through one override material — on Bistro, 480 draws and
+      // 2.25 M triangles at half res, every frame, on top of the main pass's
+      // 484. It is CPU-encoding cost, not shading cost, so it scales with DRAW
+      // COUNT and nothing else.
+      mark("gi.gbufferPrepass");
+      // ── HELD WHEN NOTHING IT DRAWS HAS CHANGED ───────────────────────────
+      // The target is persistent and nothing ping-pongs it, so skipping the
+      // submission leaves a valid g-buffer in place — every consumer below
+      // reads the same pixels it would have. See #gbufferFingerprint for the
+      // conservative rule and why the camera is in the key.
+      // `__giGbufferFreeze = false` restores the unconditional prepass.
+      const gbufKey = globalThis.__giGbufferFreeze === false
+        ? null
+        : this.#gbufferFingerprint(this.engine.camera, state.screen.gbuffer?.rt);
+      // ⚠ The mask pass is a SECOND submission with different contents, so a
+      // frame that turns it on must re-render even if the geometry key matches.
+      const gbufHeld = gbufKey !== null &&
+        gbufKey === this._gbufferKey &&
+        wantsMirrorMask === this._gbufferMask;
+      if (gbufHeld) {
+        this._gbufferHeldFrames = (this._gbufferHeldFrames ?? 0) + 1;
+      } else {
+        this._gbufferKey = gbufKey;
+        this._gbufferMask = wantsMirrorMask;
+        this._gbufferHeldFrames = 0;
+        renderGiGBuffer(renderer, this.engine.scene, this.engine.camera, state.screen.gbuffer, {
+          mirrorMask: wantsMirrorMask,
+        });
+      }
+      mark("gi.screenChain");
       // [A] → [B]: probe population reads the gbuffer that was just rendered,
       // so it goes here and nowhere else. Ahead of every other compute for the
       // same reason the gbuffer is ahead of the resolve — this is the frame's
@@ -2264,6 +2578,12 @@ export class GISystem {
     if (this._frame % FINGERPRINT_INTERVAL_FRAMES === 0) {
       this.#checkFingerprint();
     }
+    // Deliberately OUTSIDE both the modulo above and `#refreshDynamicObjects`
+    // (which early-returns when the dynamic-object set is disabled): this is
+    // the only thing that ever clears `_bvhSceneStale`, so parking it behind
+    // either gate would mean a scene that added a mesh with movers switched
+    // off never got it into the exact-reflection BVH at all.
+    this.#maybeResyncBvhScene(this.state);
   }
 
   /**
@@ -2286,7 +2606,21 @@ export class GISystem {
       const mesh = entity.getComponent?.("mesh");
       if (mesh?.assetLoadsPending) pendingMeshes++;
     }
-    const pending = pendingModels + pendingMeshes;
+    // Textures count too, and nothing but the loader can see them:
+    // `loadMaterialAsset` resolves the material immediately and its maps land
+    // in detached `.then()`s, so `assetLoadsPending` clears minutes before the
+    // KTX2 transcode tail does. Building inside that window seats the UNMERGED
+    // scene (1532 placements into 768 slots — half the scene invisible to GI)
+    // and every merging commit afterwards forces another full rebuild.
+    const pendingTextures = textureLoadsInFlight();
+    // Merging counts too: its settle window (400 ms) is longer than this
+    // gate's stable window (250 ms), so without this the first build always
+    // ran against the UNMERGED scene — 1532 placements into 768 slots, half
+    // invisible — and the merge commit invalidated it seconds later for a
+    // second full compile wave. Merging's own hold is bounded, so this cannot
+    // deadlock; the stall bound below covers a stuck flag regardless.
+    const pendingMerge = this.engine.merging?.settling ? 1 : 0;
+    const pending = pendingModels + pendingMeshes + pendingTextures + pendingMerge;
     const now = performance.now();
     if (!pending) {
       this._assetWaitStart = null;
@@ -2318,13 +2652,23 @@ export class GISystem {
       this._deferredSince = now;
       console.log(
         `[gi] build deferred — waiting for scene assets ` +
-        `(${pendingMeshes} mesh, ${pendingModels} model; avoids a double compile wave)`,
+        `(${pendingMeshes} mesh, ${pendingModels} model, ${pendingTextures} texture` +
+        `${pendingMerge ? ", merge settling" : ""}; avoids a double compile wave)`,
       );
+    }
+    // The timeout measures a STALLED load, not a long one: Bistro's transcode
+    // tail is legitimately 2+ minutes, and firing mid-tail is exactly the
+    // half-blind early build the wait exists to avoid. Progress re-arms it; a
+    // broken file leaves the count frozen and the timeout does its job.
+    if (pending !== this._pendingSeenCount) {
+      this._pendingSeenCount = pending;
+      this._assetWaitStart = now;
     }
     if (now - this._assetWaitStart < ASSET_LOAD_TIMEOUT_MS) return false;
     console.warn(
-      `[gi] building despite unfinished scene assets after ${ASSET_LOAD_TIMEOUT_MS / 1000}s ` +
-      `(${pendingMeshes} mesh, ${pendingModels} model) — a refit may follow`,
+      `[gi] building despite scene assets stalled for ${ASSET_LOAD_TIMEOUT_MS / 1000}s ` +
+      `(${pendingMeshes} mesh, ${pendingModels} model, ${pendingTextures} texture` +
+      `${pendingMerge ? ", merge settling" : ""}) — a refit may follow`,
     );
     this._assetWaitStart = null;
     return true;
@@ -3105,7 +3449,35 @@ export class GISystem {
     // sun-disc + temporal arm for A/B — it remains the reference instrument
     // (256-frame static accumulation is unbiased ground truth).
     const analyticWidth = globalThis.__giShadowAnalyticWidth !== false;
-    const widthProbe = analyticWidth ? volume.createWidthProbe?.() : null;
+    const exactArm = !!(this._dynSet?.staticBvh && globalThis.__giShadowStaticBvh !== false);
+    // ── §12.79 THE WIDTH PROBE IS THE POLE, AND ON THE EXACT ARM IT IS
+    //    REDUNDANT — the same diet §12.54 ran on the emitter arm.
+    //
+    // Measured on the user's Sponza with the sun in gi mode: `lightShadowPass`
+    // 14.22 ms of a 20.29 ms frame — 70% of the GPU — at HALF resolve
+    // (794x449), i.e. ~40 ns/px, and it scales per resolve-pixel so ultra
+    // extrapolates to ~57 ms. The probe is ~12 trilinear distanceTexture taps
+    // plus pyramid descents, run on every pixel whose central ray MISSED,
+    // which on a sunlit scene is most of the screen.
+    //
+    // It is redundant here because this arm's admission is EXACT TRIANGLES:
+    // the verdict is already binary, and the blocker distance `tBest` falls
+    // out of the two BVH traces for free. A directional source of half-angle
+    // t is the degenerate case of the emitter arm's similar triangles (the
+    // source is at infinity, so `reff*t/(dist-t)` collapses to `tan(t)*t_b`)
+    // — one multiply against twelve taps and a descent. The spatial spread
+    // that turns that width into a penumbra is the wide pass's job and the
+    // wide pass already does it; it was simply being handed a normalised
+    // distance and re-deriving the width from the slot table instead.
+    //
+    // The other two arms (record march, legacy DDA) KEEP the probe: their
+    // admission is not binary — they carry an analytic cone accumulator whose
+    // near-field `pen` term the probe extends — so removing it there would
+    // remove softness nothing else supplies. Scoped to the arm that measured.
+    //
+    // `__giLightAnalyticPenumbra = false` restores the probe on this arm.
+    const analyticPen = analyticWidth && exactArm && globalThis.__giLightAnalyticPenumbra !== false;
+    const widthProbe = analyticWidth && !analyticPen ? volume.createWidthProbe?.() : null;
     // 1.5 OCCUPANCY VOXELS of ray lift — a node, not a number, so an in-place
     // refit rescales it with the pyramid. See the resolve's own comment for
     // why the gather's normalOffset is the wrong scale here. The factor is a
@@ -3119,19 +3491,26 @@ export class GISystem {
     // the voxel lift (see its use in traceDda for the measurement that sized
     // it). Live uniform `__giShadowExactBias` for the same in-editor A/B.
     const exactBiasFactor = uniform(0.02);
-    const exactArm = !!(this._dynSet?.staticBvh && globalThis.__giShadowStaticBvh !== false);
     return {
       liftFactor,
       exactBiasFactor,
       exactArm,
       analyticWidth,
+      // Read by #buildScreenResolve: with the diet on, the dist channel holds
+      // METRES of penumbra half-width rather than a normalised blocker
+      // distance, so the wide passes must run in world-width mode.
+      analyticPen,
       marcher: globalThis.__giLightShadowSphere === true
         ? "sphere"
         : (this._dynSet?.staticBvh && globalThis.__giShadowStaticBvh !== false
             ? "static-bvh8 + exact-dynamics"
             : recordMarch ? `records (${rayHitModeName(shadowMode)})` : "voxel-dda") +
           (analyticWidth
-            ? " + analytic-width"
+            // The name says which softness model compiled, because "did my
+            // change take?" was otherwise only answerable by staring at a ms
+            // figure inside its own noise band — which is how the §12.79 diet
+            // first read as a REGRESSION on a page that had not reloaded.
+            ? (analyticPen ? " + analytic-penumbra" : " + analytic-width")
             : globalThis.__giConeShadowDensity === true ? " + density-cone" : " + sun-disc"),
       slots: lightSlots,
       lift,
@@ -3324,6 +3703,24 @@ export class GISystem {
                   exactVis = select(hit, float(0), evalMidW(hit.not()));
                 } else {
                   exactVis = select(hit, float(0), float(1));
+                }
+                if (analyticPen) {
+                  // tan(half-angle) * blocker distance — the sun's penumbra
+                  // half-width at the receiver, in METRES, straight from the
+                  // t the traces already resolved. `tanHalf` is null only on
+                  // a hard-shadow call, where a zero width is the right answer.
+                  //
+                  // THE 1 mm FLOOR IS A SENTINEL, NOT A WIDTH (§12.54's rule,
+                  // and it is load-bearing for the blocker search below): a
+                  // CONTACT pixel and a LIT pixel both write ~0, and the
+                  // search has to keep the first's own zero radius while
+                  // giving the second its neighbours'. Exact 0 only on a miss
+                  // makes the channel its own occupancy mask.
+                  const w = float(tanHalf ?? 0).max(0).mul(tBest.max(0)).clamp(0, 64).toVar();
+                  return vec2(
+                    coneT ? exactVis.mul(coneT) : exactVis,
+                    select(hit, w.max(1e-3), float(0)),
+                  );
                 }
                 return vec2(
                   coneT ? exactVis.mul(coneT) : exactVis,
@@ -3798,7 +4195,24 @@ export class GISystem {
           let surfaces = null;
           if (srcShadeEnabled() && volume?.occupancyField && atlas) {
             try {
-              surfaces = createSrcSurfaceAttribution(volume.occupancyField, volume.world, atlas);
+              // §12.70 W5b: `emitterMeshes` WIRED at last. The palette's
+              // emitter flag was defaulting to "nobody", which made
+              // `emissiveOrphans` — the counter for "this surface's light
+              // exists on neither path" — fire on every correctly-zeroed
+              // emitter, promoted or tree. Naming the NEE set turns the flag
+              // back into the assertion srcSurface's header says it is. The
+              // GPU R5 branch is unaffected: it compares against giLight's
+              // SLOT array, so a tree-only index simply reads "not a slot
+              // light" and finds nothing to zero, the palette having zeroed
+              // it on the CPU already.
+              surfaces = createSrcSurfaceAttribution(volume.occupancyField, volume.world, atlas, {
+                emitterMeshes: () => this.#neeEmitterMeshes(),
+              });
+              // The §12.42 rule. `emissiveOrphans` is the ONE check that a
+              // GPU counter structurally cannot make (nothing carries the
+              // emission to notice it is gone), and until now nothing read it
+              // — so the W5b gate reads it here, and so can a probe.
+              globalThis.__giSurfacePaletteLive = surfaces.stats;
             } catch (error) {
               console.warn("[gi] src surface attribution unavailable:", error?.message ?? error);
             }
@@ -3806,6 +4220,10 @@ export class GISystem {
           srcProbes = createSrcProbeSystem({
             gbuffer, width, height, props: this.config, volume, sky: skyRadiance,
             surfaces,
+            // §12.77 Unit A: the grown pool sizes survive every rebuild —
+            // quality changes, resizes, scene edits — because demand already
+            // proved the floors short. Growth only; see #syncSrcPoolPressure.
+            pools: this.#srcPoolsForBuild(),
             // ── MOTION-ADAPTIVE α's SIGNAL (§12.38) ─────────────────────
             //
             // Normalized [0,1]; 1 = "fully moving", where α sits at the
@@ -3935,8 +4353,37 @@ export class GISystem {
               // What srcSystem's root relaxation reads (`trackMotion`): the
               // held LIGHT peak while the window is open, zero otherwise —
               // sub-threshold jitter and mover churn never reach the root.
+              //
+              // ⚠⚠ A VOLUME SLIDE MUST NOT REACH THIS LINE, AND THAT IS THE
+              // FIX FOR "PERFORMANCE DROPS SEVERELY WHEN THE CAMERA MOVES"
+              // (2026-08-17). §13 F2's `#detailFollowTick` armed the settle
+              // window by writing `_giMotionHeld`/`_giMotionHoldUntil`
+              // directly, so a walking camera re-armed it every throttle
+              // interval — the live log read `open 100% of 134 frames —
+              // armed by none, peak 0.00`, i.e. permanently open with NO
+              // light event anywhere. `trackMotion` then reported 0.5, which
+              // lifts the per-probe ray cap to OFF (srcSystem's `capLifted`)
+              // — the 3.8x deposit swing the diagnostic below prices, paid
+              // continuously for the whole walk. §12.47 had ALREADY removed
+              // exactly this cost by making the camera cap lift opt-in
+              // (`__giSrcCamCapLift`, "why it cost half the frame rate");
+              // F2 reintroduced it through the settle window by accident.
+              //
+              // The slide wants ONE of the window's two effects: the α floor,
+              // so the strip it just uncovered ramps in instead of popping.
+              // It does not want the ray cap lifted — the uncovered strip is
+              // a fraction of the field, and paying uncapped rays on EVERY
+              // probe for it is what makes walking expensive. So the slide
+              // gets its own held pair, folded into α here and deliberately
+              // absent from `_giTrackMotion`.
+              const slideOpen = now < (this._giSlideHoldUntil ?? 0);
+              const slideHeld = slideOpen ? (this._giSlideHeld ?? 0) : 0;
               this._giTrackMotion = windowOpen ? (this._giMotionHeld ?? 0) : 0;
-              return windowOpen ? Math.max(m, this._giMotionHeld ?? 0) : m;
+              return Math.max(
+                m,
+                windowOpen ? (this._giMotionHeld ?? 0) : 0,
+                slideHeld,
+              );
             },
             trackMotion: () => this._giTrackMotion ?? 0,
             lighting: surfaces
@@ -3948,8 +4395,13 @@ export class GISystem {
                   emitters: emitterSlots ?? [],
                   // A directional slot's shadow ray runs the whole medium, and
                   // `kind` is a uniform, so the bound cannot be a build-time
-                  // choice. The volume diagonal is the finite stand-in.
-                  maxRay: volume.world.size.value.length(),
+                  // choice. The volume diagonal is the finite stand-in — AS A
+                  // NODE off the `world.size` uniform (§13 F1, same pattern as
+                  // srcTrace's marcher reach). `world.size.value.length()`
+                  // froze the diagonal into WGSL: a stretch refit updated
+                  // `diagU` but could never reach that literal, so off-screen
+                  // sun-visibility rays kept the OLD medium's length.
+                  maxRay: vec3(volume.world.size).length(),
                   // §12.62 W3: the W1 tree region, already built and queued
                   // by #rebuild before this constructor runs. `abs` is the
                   // absolute u32 word index into the occupancy `bits` buffer
@@ -3990,6 +4442,50 @@ export class GISystem {
       inputs.gather = srcProbes?.gather
         ? (point, normal) => srcProbes.gather.gatherAt(point, normal).irradiance
         : null;
+      // ── §13 F3: THE FAR-FIELD FALLBACK (only when the detail box is armed) ─
+      // Small scenes never set `_detailExtent`, so they compile no term and
+      // build bit-identical (F1 gate a). `__giFarField = false` is the kill
+      // switch — the OFF arm must reproduce the F0 crushed-black baseline
+      // exactly (F3 gate c), so it skips the passes, not just the mix.
+      if (srcProbes?.gather?.target && this._detailExtent && this._detailAnchor &&
+          volume?.world?.min && globalThis.__giFarField !== false) {
+        this._giFarFieldTex ??= (() => {
+          const t = new THREE.StorageTexture(1, 1);
+          t.type = THREE.HalfFloatType;
+          t.name = "giFarFieldAvg";
+          return t;
+        })();
+        this._giFarFieldNode ??= texture(this._giFarFieldTex);
+        const farAvg = createGiFarFieldAvgPass({
+          source: srcProbes.gather.target,
+          width: srcProbes.gather.width,
+          height: srcProbes.gather.height,
+          out: this._giFarFieldTex,
+        });
+        // Appended to the SRC dispatch list, whose last entries are the
+        // screen gather — so the average is of THIS frame's gather, ordered
+        // by list position alone.
+        srcProbes.passes.push(farAvg.computeAccum, farAvg.computeEma);
+        inputs.farField = {
+          node: this._giFarFieldNode,
+          // The LIVE world uniforms — every F2 slide moves the feather with
+          // the box for free, same contract as `maxRay` above.
+          worldMin: volume.world.min,
+          worldSize: volume.world.size,
+          // FOUR probe cells, not two: the box edge cuts THROUGH geometry
+          // now, and probes within ~2 cells of it are starved (their rays
+          // exit the occupancy immediately) — the live look showed their
+          // trilinear tent as black/white blocking on boundary facades. The
+          // feather must swallow the sick zone, not just soften the cliff.
+          // `state` can still be the OUTGOING build's here; spacings land
+          // 1.0-2.5 m, so the feather is 4-10 m either way.
+          feather: 4 * (this.state?.probeSpacing || 1),
+        };
+        console.log(
+          `[gi] far-field fallback armed (§13 F3): screen-gather EMA constant, ` +
+            `feather ${inputs.farField.feather.toFixed(1)}m inside the detail box boundary`,
+        );
+      }
       // ── THE DIRECTIONAL RADIANCE LOOKUP, REBUILT (§12.71b) ───────────────
       // `deferredRadianceLookup` has been null since the cascades (and their
       // createRadianceLookup reader) died — "rough/glossy surfaces lose their
@@ -4069,18 +4565,53 @@ export class GISystem {
       // the shadow pass because both CONSUME it since slice (ii): the shadow
       // pass marches each pixel's tile-list emitters (record pseudo-slots),
       // the resolve evaluates the same list against the same id-keyed
-      // channels. Behind `__giEmitterTileCut` (build-time, default OFF);
-      // requires the W1 tree region.
+      // channels. Requires the W1 tree region.
+      //
+      // **DEFAULT ON since 2026-08-15 (§12.70), together with
+      // `__giSrcLightTree` — the two are one feature (W5b).** Without it a
+      // scene's 5th emissive mesh and beyond deliver no direct light at all,
+      // which is the standing "after 3-4 emissives the rest don't emit"
+      // report. Gated on: N=4 parity 1.020, N=12 regional recovery +0.0833,
+      // seam PASS at tileSize 1, R5 palette flags 4→N with zero orphans, the
+      // mover gate, and a Sponza-scale ledger where the pair is CHEAPER
+      // (6.572 → 6.162 ms while lighting 15 emitters instead of 4).
+      // `__giEmitterTileCut = false` restores the four global seats.
       const emitterTileCut = inputs.emitter
-          && globalThis.__giEmitterTileCut === true
+          && globalThis.__giEmitterTileCut !== false
           && this._lightTreeRegion
           && volume?.occupancyField?.bits
         ? createGiEmitterTileCutPass({
             gbuffer,
             importance: createLightTreeEmitterImportance(volume.occupancyField.bits),
             baseWord: this._lightTreeRegion.abs,
-            emitterCount: this._lightTreeRegion.emitterCount,
-            tileSize: 8,
+            // §12.70 W5: LIVE, not baked — #refreshLightTree can re-pack the
+            // tree with a different emitter count between GI rebuilds.
+            emitterCount: this._lightTreeCountU ?? this._lightTreeRegion.emitterCount,
+            // §12.70 W4c — THE TILE IS THE ARTIFACT, SO THE DEFAULT IS NO TILE.
+            // One receiver standing in for a whole tile is fine on a flat
+            // wall and wrong wherever the tile straddles a silhouette: the
+            // pixels on the far surface get the near surface's four lamps,
+            // which is a tile-shaped brightness patch hugging every edge (the
+            // §12.70 W4b seam FAIL — visible as rectangular frames around the
+            // storm's cubes). Measured N=12 seam excess against a ±0.02 noise
+            // floor: tileSize 8 → +0.19/+0.16, 4 → +0.09/+0.11, 1 → floor,
+            // and the crops agree. tileSize 1 costs LESS overall, not more:
+            // the cut pass goes 0.02 → 0.04 ms while emitterShadowPass drops
+            // 0.82 → 0.60 (each pixel now marches ITS OWN nearest four
+            // instead of a tile representative's), total 0.96 → 0.74 ms.
+            //
+            // The scan is O(N) per tile, and nothing caps the tree's emitter
+            // count, so the default keeps `tiles × N` bounded at ~16
+            // importance evaluations per emitter-shadow pixel — which is
+            // tileSize 1 up to 16 emitters, then coarsens. Past that the
+            // top-4-of-N approximation is the bigger error anyway.
+            // `__giEmitterTileSize` pins it (the seam sweep's knob).
+            tileSize: (() => {
+              const t = Number(globalThis.__giEmitterTileSize);
+              if (Number.isFinite(t) && t >= 1) return Math.round(t);
+              const n = Math.max(1, this._lightTreeRegion.emitterCount);
+              return Math.min(8, Math.max(1, Math.ceil(Math.sqrt(n / 16))));
+            })(),
             width: emitterW,
             height: emitterH,
             resolveWidth: width,
@@ -4094,6 +4625,10 @@ export class GISystem {
         const treeBase = this._lightTreeRegion.abs;
         tileCutBundle = {
           idBuf: emitterTileCut.idBuf,
+          // §12.70 W4c: the resolve reads the tail compensation out of this
+          // buffer's normal-vec4 `.w`. Only the RESOLVE gets it — the shadow
+          // pass marches visibility, which the compensation must not scale.
+          posBuf: emitterTileCut.posBuf,
           tilesX: emitterTileCut.tilesX,
           tilesY: emitterTileCut.tilesY,
           tileSize: emitterTileCut.tileSize,
@@ -4109,14 +4644,30 @@ export class GISystem {
           posBuf: emitterTileCut.posBuf,
           idBuf: emitterTileCut.idBuf,
         };
+        globalThis.__giTileCutLive.compCap = emitterTileCut.compCap;
+        // §12.70 W5b: the two hatches are not independent. The cut gives every
+        // tree emitter a SCREEN direct term; only `__giSrcLightTree` gives the
+        // TRANSPORT one, and only then does R5 zero their emission out of the
+        // field. Armed alone, the un-seated lamps deliver screen direct AND
+        // field emission — the double-delivery R5 exists to stop. Measured, so
+        // nobody has to re-measure it: RECOVERY read +0.083 with both armed and
+        // −0.063 with the zeroing keyed to this hatch instead.
+        if (globalThis.__giSrcLightTree === false) {
+          console.warn(
+            "[gi] emitter tile cut armed WITHOUT `__giSrcLightTree`: un-seated emitters now " +
+            "deliver screen direct AND their field emission (R5 double-delivery). The two flip together.",
+          );
+        }
         console.log(
           `[gi] emitter tile cut: ${emitterTileCut.tilesX}×${emitterTileCut.tilesY} tiles over ` +
-          `${this._lightTreeRegion.emitterCount} emitters (§12.70 W4b — slots follow each pixel's tile)`,
+          `${this._lightTreeRegion.emitterCount} emitters (§12.70 W4b — slots follow each pixel's tile; ` +
+          `tail compensation cap ${emitterTileCut.compCap}${emitterTileCut.compCap > 1 ? "" : " — DISABLED"})`,
         );
-      } else if (globalThis.__giEmitterTileCut === true) {
-        // The hatch asked and did not get — say WHY (the §12.42 rule; the
-        // slice-(ii) gate's first run read byte-identical arms and the only
-        // silent explanation is a precondition failing here).
+      } else if (globalThis.__giEmitterTileCut !== false && inputs.emitter) {
+        // Wanted and did not get — say WHY (the §12.42 rule; the slice-(ii)
+        // gate's first run read byte-identical arms and the only silent
+        // explanation is a precondition failing here). Only when the scene
+        // HAS emitters: a scene with none is not missing anything.
         console.log(
           `[gi] emitter tile cut UNARMED: emitter=${!!inputs.emitter} ` +
           `region=${!!this._lightTreeRegion} bits=${!!volume?.occupancyField?.bits}`,
@@ -4195,6 +4746,14 @@ export class GISystem {
         this._giShadowPrevVPU ??= uniform(new THREE.Matrix4()).setGroup(renderGroup);
         this._giShadowHistWeightU ??= uniform(0.9).setGroup(renderGroup);
       }
+      // §12.80 Unit B: checkerboard trace — half the pixels per dispatch, the
+      // other half keeps last frame's texel (see the pass's own comment for
+      // why the DISPATCH halves rather than the lanes). The parity uniform
+      // advances in the per-frame sync, independent of the temporal-jitter
+      // phase (which the analytic arm doesn't run). `__giShadowCheckerboard =
+      // false` restores the full-dispatch trace for A/B.
+      const checkerOn = globalThis.__giShadowCheckerboard !== false;
+      if (checkerOn) this._giShadowCheckerU ??= uniform(0, "uint");
       const lightShadowPass = inputs.lightShadow
         ? createGiLightShadowPass({
             gbuffer,
@@ -4204,6 +4763,7 @@ export class GISystem {
             resolveWidth: width,
             resolveHeight: height,
             frame: analyticWidth ? null : this._giShadowFrameU,
+            checker: checkerOn ? this._giShadowCheckerU : null,
           })
         : null;
       // Edge-aware average of the stochastic trace — see the pass's comment
@@ -4250,7 +4810,15 @@ export class GISystem {
             source: targets.lightShadowMid,
             dist: targets.lightShadowDist,
             target: targets.lightShadowWide,
-            slots: inputs.lightShadow.slots,
+            // §12.79: with the diet on, the dist channel already holds METRES
+            // of penumbra half-width, so the pass runs its world-width branch
+            // (`slots: null`) instead of re-deriving the width from the slot
+            // table. `searchFrac` switches the neighbourhood from the 3-texel
+            // MAX to the 8-tap average-of-shadowed-taps estimator — required,
+            // not cosmetic: the max only worked because the width probe was
+            // already softening the miss side, and with the probe gone it
+            // would clip every penumbra a few texels off the silhouette.
+            slots: inputs.lightShadow.analyticPen ? null : inputs.lightShadow.slots,
             span: inputs.lightShadow.span,
             width: shadowW,
             height: shadowH,
@@ -4258,6 +4826,7 @@ export class GISystem {
             resolveHeight: height,
             cameraPosition: this._giShadowWideCamU,
             capFrac: 0.08,
+            searchFrac: inputs.lightShadow.analyticPen ? 0.08 : null,
           })
         : null;
       const lightShadowWidePass2 = lightShadowWidePass
@@ -4266,7 +4835,9 @@ export class GISystem {
             source: targets.lightShadowWide,
             dist: targets.lightShadowDist,
             target: targets.lightShadow,
-            slots: inputs.lightShadow.slots,
+            // Same world-width switch as the pass above; the search radius
+            // tracks this pass's own cap, as it does on the emitter chain.
+            slots: inputs.lightShadow.analyticPen ? null : inputs.lightShadow.slots,
             span: inputs.lightShadow.span,
             width: shadowW,
             height: shadowH,
@@ -4274,6 +4845,7 @@ export class GISystem {
             resolveHeight: height,
             cameraPosition: this._giShadowWideCamU,
             capFrac: 0.25,
+            searchFrac: inputs.lightShadow.analyticPen ? 0.25 : null,
           })
         : null;
       const lightShadowHistoryPass = lightShadowFilterPass && !analyticWidth
@@ -4508,7 +5080,7 @@ export class GISystem {
       // to each pixel's TILE list, not to the global seats these material
       // slots are — giLight's glow path reads this flag and goes unshadowed
       // rather than occluding one lamp's glow with another lamp's shadow.
-      light.emitterTileKeyed = globalThis.__giEmitterTileCut === true && !!this._lightTreeRegion;
+      light.emitterTileKeyed = globalThis.__giEmitterTileCut !== false && !!this._lightTreeRegion;
       light.giRadianceNode = radianceLookup ? this._giRadianceNode : null;
       // Silhouette-validity inputs for giLight's bilateral screen sampling
       // (same machinery as the shadowNode's — see #acquireLightShadowNode):
@@ -4596,7 +5168,7 @@ export class GISystem {
     // The probe population is one thread per gbuffer pixel and its dispatch
     // counts are baked into the compute nodes, so a resize rebuilds it. Returns
     // a NEW system and disposes the old one — the assignment is the point.
-    if (screen.srcProbes) screen.srcProbes = screen.srcProbes.setSize(width, height);
+    if (screen.srcProbes) screen.srcProbes = screen.srcProbes.setSize(width, height, this._srcPools ?? null);
     // New targets at the new size; the persistent nodes are re-pointed at
     // them, which is a binding refresh rather than a shader rebuild (every
     // observed material has hasNode = true, so its bindings refresh per frame
@@ -4690,6 +5262,27 @@ export class GISystem {
             vec3(screen.srcProbes.gather.gatherAt(point, dir).irradiance).mul(1 / Math.PI),
         }
       : null;
+    // §13 F3: the far-field average pass closed over the gather target setSize
+    // just disposed — recreate it against the fresh one (its passes list is
+    // fresh too, so the old entries are already gone) and hand the new resolve
+    // the same persistent 1×1 texture node. Same gating as the build.
+    let farFieldInput = null;
+    if (screen.srcProbes?.gather?.target && this._detailExtent && this._detailAnchor &&
+        state.volume?.world?.min && globalThis.__giFarField !== false && this._giFarFieldTex) {
+      const farAvg = createGiFarFieldAvgPass({
+        source: screen.srcProbes.gather.target,
+        width: screen.srcProbes.gather.width,
+        height: screen.srcProbes.gather.height,
+        out: this._giFarFieldTex,
+      });
+      screen.srcProbes.passes.push(farAvg.computeAccum, farAvg.computeEma);
+      farFieldInput = {
+        node: this._giFarFieldNode,
+        worldMin: state.volume.world.min,
+        worldSize: state.volume.world.size,
+        feather: 4 * (state.probeSpacing || 1),
+      };
+    }
     // §12.70 W4b: the tile cut is sized to the emitter grid AND bakes the
     // gbuffer scale, so it rebuilds BEFORE the resolve and the shadow pass
     // that consume its buffers — a stale sx/sy would rank tiles at the wrong
@@ -4718,6 +5311,7 @@ export class GISystem {
       screen.emitterTileCutBundle = {
         ...screen.emitterTileCutBundle,
         idBuf: screen.emitterTileCut.idBuf,
+        posBuf: screen.emitterTileCut.posBuf,
         tilesX: screen.emitterTileCut.tilesX,
         tilesY: screen.emitterTileCut.tilesY,
         tileSize: screen.emitterTileCut.tileSize,
@@ -4758,6 +5352,7 @@ export class GISystem {
       emitterTileCut: screen.emitterTileCutBundle
         ? { ...screen.emitterTileCutBundle, scaleX: emitterW / width, scaleY: emitterH / height }
         : null,
+      farField: farFieldInput,
     });
     if (index >= 0) state.queue[index] = screen.resolve.compute;
     if (indexNoFeedback >= 0) state.queueNoFeedback[indexNoFeedback] = screen.resolve.compute;
@@ -4981,6 +5576,10 @@ export class GISystem {
         // raw texture differing by ~1 pixel while the phase uniform climbs.
         // (The analytic-width arm builds with frame null — same rule.)
         frame: screen.lightShadow?.analyticWidth ? null : this._giShadowFrameU,
+        // Same MUST-match rule for the checkerboard parity (§12.80 Unit B):
+        // omitting it here would silently swap in the full-dispatch kernel on
+        // the first resize — the inverse of the frozen-dither bug above.
+        checker: globalThis.__giShadowCheckerboard !== false ? (this._giShadowCheckerU ??= uniform(0, "uint")) : null,
       });
       if (passIndexes[0] >= 0) state.queue[passIndexes[0]] = screen.lightShadowPass.compute;
       if (passIndexes[1] >= 0) state.queueNoFeedback[passIndexes[1]] = screen.lightShadowPass.compute;
@@ -5412,6 +6011,26 @@ export class GISystem {
       this.config.lightShadowMaxPixels ||
       1_900_000;
     let { width, height } = resolve;
+    // ── §12.79b THE BUDGET IS A CEILING, NOT A SCALE — AND NOTHING EVER HIT IT.
+    //
+    // 1.9 M px only binds above ~1440p, so on every real viewport this method
+    // returned the resolve size unchanged and the channel ran 1:1 with the GI
+    // resolve. That is the ultra CONTRACT (BY_TIER: ultra buys full-res shadow
+    // edges and pays ~4x for them) but it was silently the LOW contract too,
+    // which is the same "presets don't move the expensive thing" defect §12.77
+    // found in the SRC pools.
+    //
+    // The header above already argues this is the right knob: the trace is the
+    // most expensive per-pixel work in the module, and the material-side
+    // bilateral validates every tap against the FULL-RES gbuffer position, so
+    // the channel's own pixel count buys penumbra resolution rather than edge
+    // resolution. The emitter arm has been tier-scaled since 2026-08-12 for
+    // exactly this reason (#emitterShadowScale); the light arm never was.
+    const scale = this.#lightShadowScale();
+    if (scale < 1) {
+      width = Math.max(16, Math.round(width * scale));
+      height = Math.max(16, Math.round(height * scale));
+    }
     const px = width * height;
     if (px > budget) {
       const s = Math.sqrt(budget / px);
@@ -5419,6 +6038,33 @@ export class GISystem {
       height = Math.max(16, Math.round(height * s));
     }
     return { width, height };
+  }
+
+  /**
+   * Light-shadow buffer scale, applied per axis to the resolve size.
+   *
+   * The trade is penumbra DETAIL, not silhouette sharpness: the material-side
+   * bilateral reconstructs edges from the full-res gbuffer position, which is
+   * the same mechanism that lets the resolve itself run at half res on
+   * low/medium/high. Halving this axis quarters the module's single most
+   * expensive pass.
+   *
+   * `__giShadowScale` overrides for an in-page A/B.
+   */
+  #lightShadowScale() {
+    const forced = Number(globalThis.__giShadowScale);
+    if (Number.isFinite(forced) && forced > 0) return Math.min(1, forced);
+    const quality = qualityTierOf(this.config);
+    // Ultra was deliberately 1.0 ("the tier that does not get capped") until
+    // 2026-08-15, when the live Sponza frame priced that contract: 16.4 ms of
+    // a 31.6 ms ultra frame in ONE pass — gi shadows can only replace shadow
+    // maps if they cost like them. §12.79's gate already showed half-res
+    // (behind the full-res-gbuffer bilateral + the frame-jittered temporal
+    // filter) holds frameMean within 1.5% of full-res; ultra's shadow channel
+    // at 0.5 now matches high's ABSOLUTE pixel count (high: 0.7071²-scaled
+    // resolve × 0.7071² again ≈ 0.25× drawing buffer — same as 1 × 0.5²).
+    // `__giShadowScale = 1` is the one-boot A/B back to the old contract.
+    return { low: 0.5, medium: 0.5, high: 0.7071, ultra: 0.5 }[quality] ?? 0.5;
   }
 
   /**
@@ -5613,9 +6259,13 @@ export class GISystem {
         " — the scene lights on the next presented frame (the voxel count below is a readback, not the wait)",
     );
     occ.readbackStats(renderer).then((stats) => {
-      if (this.state === state) {
+      if (this.state === state && stats) {
         console.log(`[gi] field ready: ${stats.occupiedVoxels} occupied voxels`);
       }
+    }).catch((err) => {
+      // A lost device turns every readback into nonsense errors ("size (32) is
+      // too large") — diagnostics degrade to a warning, never uncaught spam.
+      console.warn(`[gi] field stats readback failed: ${err?.message ?? err}`);
     });
     // SURFACE-RECORD POOL AUDIT — starvation here is otherwise invisible: the
     // boot log says `marcher records` while a contiguous macro-order slab of
@@ -5623,7 +6273,10 @@ export class GISystem {
     // silhouettes (the Sponza-ultra bug: demand 1.24M vs the old 1M cap).
     const occField = state.volume.occupancyField;
     if (occField?.hasSurfaceRecords && occField.readbackSurfaceAlloc) {
-      occField.readbackSurfaceAlloc(renderer).then((alloc) => {
+      occField.readbackSurfaceAlloc(renderer).catch((err) => {
+        console.warn(`[gi] surface pool readback failed: ${err?.message ?? err}`);
+        return null;
+      }).then((alloc) => {
         if (this.state !== state || !alloc) return;
         const line = `[gi] surface records: ${alloc.allocated}/${alloc.capacity} claimed` +
           `, triangles ${alloc.triangles}/${alloc.triangleCapacity}` +
@@ -5632,10 +6285,134 @@ export class GISystem {
         // pool starvation (claims denied → whole bricks boxed; the capacity is
         // wrong) vs the per-cell exact-triangle cap (a dense cell exceeds
         // MAX_COMPLEX_TRIANGLES and is boxed by design; capacity is fine).
+        // ── GROW-ON-PRESSURE, DEFERRED TO THE NEXT BUILD (2026-08-17) ────────
+        //
+        // The SRC pools grow reactively (#syncSrcPoolPressure) because their
+        // rebuild is a probe-store swap. This pool cannot copy that: it lives in
+        // the occupancy allocation, so growing it re-mints the whole chain — a
+        // ~20 s freeze on the scene that needs it most, which is precisely the
+        // symptom being fixed. Forcing that automatically would trade a shading
+        // artifact for a stall, and on a chronically oversubscribed scene it
+        // could fire repeatedly.
+        //
+        // So demand is REMEMBERED, not acted on: `_surfacePoolHint` sizes the
+        // next build that happens for any other reason (a merge commit, a refit,
+        // a quality change — this scene has several per session), and the pool
+        // converges without a freeze anyone asked for.
+        //
+        // `alloc.triangles` is a DEMAND counter, not a stored count: it keeps
+        // incrementing past capacity while the writes are rejected, which is
+        // exactly what makes it usable as the next size. Capacity clamps live in
+        // occupancyField.js; this only has to be honest about what was asked.
+        // 1.15x, not the bare measurement: demand is not a constant — it moves
+        // with the camera-following detail box and with what merging last
+        // committed, so sizing to exactly what was asked converges on 1.00x and
+        // re-overflows on the next frame that asks for a little more. The
+        // ceiling clamps this, so the headroom can never run away.
+        const wantTriangles = alloc.triangles > alloc.triangleCapacity
+          ? Math.ceil(alloc.triangles * 1.15)
+          : 0;
+        const wantRecords = alloc.overflowBricks > 0 ? Math.ceil(alloc.allocated * 1.5) : 0;
+        if (wantTriangles || wantRecords) {
+          const hint = (this._surfacePoolHint ??= {});
+          const before = hint.triangles ?? 0;
+          hint.triangles = Math.max(before, wantTriangles);
+          hint.records = Math.max(hint.records ?? 0, wantRecords);
+          // B1: this measurement cost a stall to earn — do not re-earn it
+          // on the next boot of the same scene.
+          this.#persistSurfacePoolHint();
+          // ── ONE FORCED REBUILD, SO THE HINT ACTUALLY LANDS ─────────────────
+          //
+          // The hint sizes the next build, and on a settled scene there may not
+          // BE a next build for a long time: an auto-fit refit slides the volume
+          // in place and never re-creates the occupancy field, so a scene can sit
+          // oversubscribed — and visibly wrong — indefinitely while a correct
+          // hint waits for a trigger that is not coming.
+          //
+          // So take the freeze deliberately, and bound it hard. `_surfacePoolRebuilds`
+          // is capped because the failure mode of an unbounded version is a
+          // rebuild loop on a scene whose demand genuinely exceeds the ceiling —
+          // each one a ~20 s stall, which is far worse than the artifact it is
+          // chasing. Two is enough to converge: the first measurement already
+          // carries 15 % headroom, so a second is only needed if demand moved.
+          // ── B3: NEVER FORCE A REBUILD THAT CANNOT SUCCEED ──────────────────
+          //
+          // The hint is clamped by `planSurfacePools` against
+          // `SURFACE_POOL_CEILINGS`, so a scene demanding more than the ceiling
+          // gets the SAME capacity it already has — and the forced rebuild below
+          // then pays a ~20 s stall to allocate exactly what was there before,
+          // reports the same oversubscription, and does it again on the next
+          // boot. That is the `forced rebuild 1/2` line the user sees at every
+          // ultra startup: not growth, a treadmill.
+          //
+          // So the request is compared against the ceiling BEFORE the rebuild is
+          // taken. At the ceiling the hint is clamped (it is still worth
+          // carrying — it pins the pool at maximum for any build that happens
+          // for another reason) and the stall is refused, once, out loud, with
+          // the lever that actually works: demand, not supply.
+          const capped = hint.triangles >= SURFACE_POOL_CEILINGS.triangles
+            || hint.records >= SURFACE_POOL_CEILINGS.records;
+          if (capped) {
+            hint.triangles = Math.min(hint.triangles, SURFACE_POOL_CEILINGS.triangles);
+            hint.records = Math.min(hint.records ?? 0, SURFACE_POOL_CEILINGS.records);
+            if (!this._warnedSurfacePoolCeiling) {
+              this._warnedSurfacePoolCeiling = true;
+              console.warn(
+                `[gi] surface pool demand (${alloc.triangles} triangles, ${alloc.allocated} records) is at or past ` +
+                  `the architectural ceiling (${SURFACE_POOL_CEILINGS.triangles} / ${SURFACE_POOL_CEILINGS.records}). ` +
+                  `The pool is pinned at maximum and NO rebuild is forced — one could not allocate more, so it would ` +
+                  `cost a stall and change nothing. The lever here is DEMAND: a lower GI quality tier or a larger ` +
+                  `world scale coarsens the field and fits. Some cells keep falling back to voxel boxes until then.`,
+              );
+            }
+          }
+          const grew = !capped && hint.triangles > before * 1.1;
+          if (grew && (this._surfacePoolRebuilds ?? 0) < 2) {
+            this._surfacePoolRebuilds = (this._surfacePoolRebuilds ?? 0) + 1;
+            console.warn(
+              `[gi] rebuilding once to resize the surface pool to ${hint.triangles} triangles ` +
+                `(forced rebuild ${this._surfacePoolRebuilds}/2). Expect one stall; without it the ` +
+                `oversubscription stays until something else triggers a build, and shadowed regions ` +
+                `keep losing their indirect fill.`,
+            );
+            this.requestRebuild();
+          }
+        } else if (this._surfacePoolHint && alloc.triangles < alloc.triangleCapacity * 0.6) {
+          // ⚠ A GROW-ONLY HINT IS A LEAK. Delete half the scene, or drop the
+          // quality tier, and a hint earned by the old content would keep
+          // allocating for it every build for the rest of the session — the
+          // pool is sized at BUILD time, so that is real wasted memory, not a
+          // lazily-filled reservation.
+          //
+          // Released only on COMFORTABLE headroom (60 %), never at the first
+          // reading under capacity: relaxing the moment demand fits would hand
+          // back the very headroom that made it fit and oscillate between the
+          // two sizes, one full GI rebuild per flip.
+          this._surfacePoolHint = null;
+          // Released for real: drop the stored value too, or the next boot
+          // re-allocates for content this scene no longer has.
+          this.#persistSurfacePoolHint();
+        }
+        const willRetry = this._surfacePoolHint
+          ? ` — next GI build will ask for ${this._surfacePoolHint.triangles || alloc.triangleCapacity} triangles`
+          : "";
         if (alloc.overflowBricks > 0) {
           console.warn(
             `${line} — POOL STARVED: ${alloc.overflowBricks} bricks degraded to voxel-box ` +
-              `hits (square silhouettes there). The record pool is undersized for this scene.`,
+              `hits (square silhouettes there). The record pool is undersized for this scene.` +
+              willRetry,
+          );
+        } else if (alloc.triangles > alloc.triangleCapacity) {
+          // ⚠ DISTINCT FROM the per-cell cap below, and the remedies differ.
+          // Oversubscribed POOL = capacity is wrong and the cells that miss out
+          // change as the detail box follows the camera (moving black patches).
+          // The per-cell cap = one dense cell exceeds MAX_COMPLEX_TRIANGLES and
+          // is boxed by design, in the same place every frame.
+          console.warn(
+            `${line} — TRIANGLE POOL OVERSUBSCRIBED ${(alloc.triangles / Math.max(1, alloc.triangleCapacity)).toFixed(2)}x: ` +
+              `cells lose their exact triangles and fall back to voxel boxes, and WHICH cells ` +
+              `lose them moves with the camera-following detail box (patches that darken and ` +
+              `refill as you fly).${willRetry}`,
           );
         } else if (alloc.complexOverflowCells > 0) {
           console.log(
@@ -5834,6 +6611,10 @@ export class GISystem {
       res,
       rayHitMode: rayHitConfig.activeMode,
     });
+    // The cell size #slotSurface needs for the sub-cell emissive test, stashed
+    // BEFORE the entries walk (which is where it is consumed) — `this.state`
+    // is still the outgoing build's at that point.
+    this._surfaceCellSize = volume.minCell ?? 0;
     // Entries + slot assignment + emitter promotion + SDF load-or-bake.
     const entries = this.#buildEntries(meshes);
 
@@ -5850,34 +6631,188 @@ export class GISystem {
     // emitters are still absent (the seat candidate walk excludes them — its
     // slots cannot represent instances); W3's collection revisits that.
     this._lightTreeRegion = null;
+    this._lightTreeUploader = null;
+    this._lightTreePoseCache = null;
+    this._lightTreePoseCount = -1;
     globalThis.__giLightTreeLive = null;
     if (globalThis.__giLightTree !== false && this._dynSet && this._emitterCands?.length) {
       try {
-        const treeEmitters = collectEmitters(
-          this._emitterCands.map((c) => c?.mesh).filter(Boolean),
-        );
+        // Same STABLE order the refresh uses — see #lightTreeMeshes. If the
+        // build collected in candidate order and the refresh in id order, the
+        // very first repack would renumber every record.
+        const treeEmitters = collectEmitters(this.#lightTreeMeshes());
+        // §13.7g — SAY WHEN AN EMITTER DOES NOT FILL ITS OWN SHAPE. A mesh
+        // holding scattered emissive geometry (a GLB puts a whole string of
+        // party bulbs in ONE mesh, per material) is fitted to its BOUNDING
+        // volume, and both irradiance models scale with that shape's
+        // projected area — so it over-delivers by the inverse of its fill.
+        // Bistro's string lights measured 0.0035, i.e. ~285x too much light,
+        // which is the user's "sun off, and the bulbs light the whole street".
+        // Named here because a corrected number is invisible otherwise.
+        // §13.7h — WHAT THE SPLIT DID. A glTF splits by material, so a whole
+        // run of party bulbs arrives as ONE mesh; `collectEmitters` now refits
+        // it as one emitter per connected piece, which is why a bulb reads
+        // fill ~= 1 and r ~= 0.02 m in the ledger below instead of fill 0.000
+        // and r = 12 m. Named because the difference between "split" and
+        // "damped to nothing" is invisible from a screenshot.
+        const split = treeEmitters.splitStats;
+        if (split?.split) {
+          console.log(
+            `[gi] emitter SPLIT: ${split.split} of ${split.sparse} sparse meshes were refit as their ` +
+              `connected pieces (+${split.added} emitters, ${treeEmitters.length} total) — one glTF mesh ` +
+              `is not one light, and a shape fitted to all of them delivers zero. Worst fill before ` +
+              `${split.worstBefore.toExponential(1)}, best after ${split.bestAfter.toFixed(3)}. ` +
+              "`__giEmitterSplit = false` restores the single-fit behaviour.",
+          );
+        }
+        const sparse = treeEmitters.filter((e) => (e?.fill ?? 1) < 0.5);
+        if (sparse.length) {
+          const worst = sparse.reduce((a, e) => (e.fill < a.fill ? e : a), sparse[0]);
+          console.log(
+            `[gi] ${sparse.length} of ${treeEmitters.length} emitters are STILL SPARSE after splitting — ` +
+              `scattered geometry inside a much larger fitted shape (one connected piece that does not ` +
+              `fill its own bounds: a wireframe, a diagonal tube, a facade mask). Their radiance is ` +
+              `scaled to the fill fraction so they deliver their real area's worth (worst: ` +
+              `"${worst.mesh?.name || "mesh"}" fill ${worst.fill.toExponential(1)}, i.e. it was ` +
+              `${(1 / worst.fill).toFixed(0)}x too bright)`,
+          );
+        }
+        // The emitter ledger: WHICH meshes are actually lighting this scene,
+        // by delivered power, with the shape each one was fitted to. Without
+        // it "the bulbs light the whole street" is unattributable — the fill
+        // correction above prints nothing when nothing is sparse, and that
+        // silence is indistinguishable from "no emitters here at all".
+        if (globalThis.__giLogEmitterLedger !== false && treeEmitters.length) {
+          const top = [...treeEmitters].sort((a, b) => b.power - a.power).slice(0, 6);
+          console.log(
+            `[gi] emitter ledger — ${treeEmitters.length} tree emitters, top by power: ` +
+              top
+                .map(
+                  (e) =>
+                    `"${(e.mesh?.name || "mesh").slice(-28)}" P=${e.power.toExponential(1)} ` +
+                    `area=${e.area.toExponential(1)}m² fill=${(e.fill ?? 1).toFixed(3)} ` +
+                    `rgb=${e.rgb.map((v) => v.toFixed(1)).join("/")} r=${e.angularRadius.toFixed(2)}m`,
+                )
+                .join(" | "),
+          );
+        }
+        // ── "MY SMALL EMISSIVE MESH DOES NOT LIGHT ANYTHING" ────────────────
+        //
+        // Measured, not guessed (`test:gi-emitter-size`, 2026-08-17): at MATCHED
+        // TOTAL POWER a 2.5 cm emitter delivers 0.885x what a 20 cm one does, and
+        // its falloff is not steeper than inverse-square out to 1.6 m. The
+        // transport is not the problem and neither is reach.
+        //
+        // The problem is the UNITS. `strength` on an emission node is RADIANCE,
+        // and a Lambertian emitter's power is `pi · area · radiance`, so power
+        // scales with the SQUARE of size. In that sweep, holding delivered light
+        // constant took strength 3 at r = 0.2 m and strength **192** at
+        // r = 0.025 m — a 64x authoring difference for the same result. Nobody
+        // types 192 because nothing ever told them to, so a bulb-sized mesh at a
+        // panel-sized strength reads as "small emissives are broken".
+        //
+        // This is the line that tells them. It is a DIAGNOSTIC and deliberately
+        // not a correction: silently rescaling emission by area would change the
+        // look of every scene already authored against the current meaning, and
+        // that is the user's call to make, not a boot-time surprise.
+        if (globalThis.__giLogEmitterScaleHint !== false && treeEmitters.length > 1) {
+          const withArea = treeEmitters.filter((e) => (e?.area ?? 0) > 1e-9);
+          if (withArea.length > 1) {
+            const strongest = withArea.reduce((a, e) => (e.power > a.power ? e : a), withArea[0]);
+            const smallest = withArea.reduce((a, e) => (e.area < a.area ? e : a), withArea[0]);
+            // Only worth saying when the small one is genuinely being drowned:
+            // an order of magnitude down in power AND a fraction of the area.
+            const ratio = strongest.power / Math.max(smallest.power, 1e-12);
+            if (smallest !== strongest && ratio > 10 && smallest.area < strongest.area * 0.2) {
+              const mean = (c) => (c.rgb[0] + c.rgb[1] + c.rgb[2]) / 3;
+              const needed = mean(smallest) * ratio;
+              console.log(
+                `[gi] emitter SCALE hint: "${(smallest.mesh?.name || "mesh").slice(-24)}" is the smallest emitter ` +
+                `(area ${smallest.area.toExponential(1)}m², P=${smallest.power.toExponential(1)}) and emits ` +
+                `${ratio.toFixed(0)}x less power than "${(strongest.mesh?.name || "mesh").slice(-24)}" ` +
+                `(area ${strongest.area.toExponential(1)}m²). This is NOT a delivery failure — emission strength is ` +
+                `RADIANCE and power = pi·area·radiance, so power falls with the SQUARE of size. For parity with the ` +
+                `brightest emitter this mesh wants a strength near ${needed.toExponential(1)} ` +
+                `(currently ~${mean(smallest).toExponential(1)}). Verified by \`npm run test:gi-emitter-size\`: at equal ` +
+                `power, a 2.5 cm emitter delivers 0.885x a 20 cm one — size costs nothing, AREA costs everything.`,
+              );
+            }
+          }
+        }
         const tree = treeEmitters.length ? buildLightTree(treeEmitters) : null;
         if (tree) {
-          const region = this._dynSet.allocPoolWords(tree.words.length);
-          if (region) {
-            this._dynSet.queueRegionUpload(region.abs, tree.words);
+          // §12.70 W5: reserve for GROWTH, not for this pack. The region is
+          // re-uploadable now (#refreshLightTree rebuilds it when an emitter
+          // moves, dims or disappears), and a re-pack of a slightly different
+          // set can want more words than the first one did — a region sized to
+          // the first pack would refuse every later write and silently freeze
+          // the tree at the build pose, which is the exact bug this closes.
+          // 25% headroom over the worst-case bound for today's count.
+          //
+          // ⚠ 25 % OF THE BUILD-TIME COUNT IS NOT HEADROOM FOR A GAME (2026-08-16).
+          //
+          // It covers a re-pack of the SAME lamps — it does not survive a scene
+          // that SPAWNS emissives, which is the normal case: a projectile, a
+          // muzzle flash, a pickup. Measured on the banner Sponza with the ball
+          // launcher on a 0.4 s timer, the engine's own warning said it exactly:
+          //
+          //   light tree refresh refused: 1270 words > 785 reserved
+          //   (27 emitters vs 6 at build) — tree frozen until the next GI rebuild
+          //
+          // 6 lamps at build reserved 785 words; 21 emissive balls in flight
+          // wanted 1270. The write is refused and **the tree freezes at the
+          // build pose, so every spawned emissive contributes no light at all**
+          // — which is the standing "with many emissive objects most of them
+          // stop emitting" report, arriving through the very feature that was
+          // supposed to end it.
+          //
+          // The region cannot simply grow on demand: its base word is BAKED
+          // into the compiled descent (`lightTree.baseWord`), so moving it
+          // needs a recompile. The reservation is therefore floored at a count
+          // a scene can spawn INTO. It is bought with pool words, not frames:
+          // 128 emitters is ~15 KB against the occupancy backend's 136 MB, and
+          // an unused reservation costs nothing per frame — nothing walks it.
+          const growthFloor = Math.max(tree.emitterCount, LIGHT_TREE_MIN_CAPACITY_EMITTERS);
+          const capacity = Math.ceil(estimateLightTreeWords(Math.max(1, growthFloor)) * 1.25);
+          const uploader = this._dynSet.createRegionUploader(Math.max(capacity, tree.words.length));
+          if (uploader && uploader.write(tree.words)) {
+            this._lightTreeUploader = uploader;
             this._lightTreeRegion = {
-              abs: region.abs,
-              rel: region.rel,
+              abs: uploader.abs,
+              rel: uploader.rel,
               words: tree.words.length,
+              capacityWords: uploader.capacity,
               emitterCount: tree.emitterCount,
               nodeCount: tree.nodeCount,
               totalPower: tree.totalPower,
-              maxDepth: tree.maxDepth,
+              // The DESCENT bakes its loop bound off this, and a live re-pack
+              // can deepen the tree by a level or two, so what we publish is a
+              // capacity, not this build's depth: a loose bound costs nothing
+              // (the real depth ends the walk) and a tight one truncates.
+              // Sized off the same growth floor as the region: the descent's
+              // loop bound is baked, and a tree that grows from 6 emitters to
+              // 27 deepens past a bound derived from 6 — the walk then stops
+              // early and the tail of the tree (the dimmest emitters, which is
+              // most of them once a scene starts spawning) is never reached.
+              // A loose bound costs nothing; the real depth ends the walk.
+              maxDepth: Math.max(tree.maxDepth, Math.ceil(Math.log2(Math.max(2, growthFloor)))),
+              builtDepth: tree.maxDepth,
             };
+            // The tile cut's per-record scan reads this LIVE (a uniform, not a
+            // baked constant) — see #refreshLightTree.
+            this._lightTreeCountU ??= uniform(tree.emitterCount, "uint");
+            this._lightTreeCountU.value = tree.emitterCount;
             // The §12.42 rule: a derived number nothing prints is a number
             // probes will guess. The W1 gate reads this to find the region.
             globalThis.__giLightTreeLive = { ...this._lightTreeRegion };
             console.log(
               `[gi] light tree: ${tree.emitterCount} emitters / ${tree.nodeCount} nodes, ` +
-                `${((tree.words.length * 4) / 1024).toFixed(1)}KB at pool word ${region.rel} ` +
-                "(UNWIRED — §12.62 W1; `__giLightTree = false` skips the build)",
+                `${((tree.words.length * 4) / 1024).toFixed(1)}KB of ${((uploader.capacity * 4) / 1024).toFixed(1)}KB ` +
+                `at pool word ${uploader.rel} (live-refreshed; \`__giLightTree = false\` skips the build, ` +
+                "`__giLightTreeRefresh = false` freezes it at this pose)",
             );
+          } else if (uploader) {
+            console.warn("[gi] light tree: region reserved but the first pack did not fit — tree unavailable");
           }
         }
       } catch (err) {
@@ -6449,19 +7384,32 @@ export class GISystem {
     if (!volume.occupancyField) {
       console.warn("[gi] no occupancy field — nothing supplies distance, so GI has no geometry at all");
     }
-    // WATERTIGHTNESS CHECK. The composited field gives thin geometry ONE
-    // occupancy shell per side so a wall's lit face and its shadowed face
-    // never mix (see cascadeGather's ONE-SIDED notes). That needs at least
-    // ~2 cells across the wall. Thinner than that and the two faces collapse
-    // into the SAME cell: the sunlit outside and the dark inside become one
-    // value, and the interior lights up as if the wall were not there. It
-    // reads exactly like "light leaks through walls" — dim, tinted by each
-    // surface's own albedo, and completely unresponsive to probe density,
-    // because it is a CELL SIZE problem, not a probe problem.
+    // ══ THIN-GEOMETRY CHECK — AND WHAT IT DOES *NOT* MEAN ANY MORE ══════════
     //
-    // Sponza at a 42.9x19.8x27.5m auto-fit gets 0.34m cells, and most of its
-    // enclosure is thinner than 0.68m — the whole building is transparent to
-    // GI and nothing in the logs said so. Say it, with the number to change.
+    // ⚠ THIS WARNING USED TO SAY THIN MESHES DO NOT BLOCK LIGHT. THEY DO.
+    // It was written for the COMPOSITED distance field, which needed ~2 cells
+    // across a wall to keep its lit face and its shadowed face from collapsing
+    // into one value ("the interior lights up as if the wall were not there").
+    // That field is gone: occupancy is CONSERVATIVELY rasterized — any cell a
+    // triangle touches is set, however thin the sheet — and hits resolve
+    // against per-cell planes and exact triangles, not against the cell box.
+    //
+    // Measured 2026-08-15, `THICK=0.05 npm run test:gi-sunleak` at quality
+    // high (0.089 m voxels — a wall HALF a cell thick), sealed box, sun
+    // outside: interior added-by-GI **0.00000**, bit-identical to the 0.4 m
+    // wall, threshold 0.002. `test:gi-occupancy` says the same from the other
+    // side: sub-voxel 0.08 m walls fully present (1350/1350 probes), closed
+    // room SEALED (400/400 rays blocked).
+    //
+    // The wrong version of this line cost real work: it is why the banner
+    // Sponza's flat-looking curtains were filed as "they do not block GI" and
+    // why a finer-voxel plan got scoped around a non-problem. **A diagnostic
+    // that describes a state the code has left is worse than no diagnostic** —
+    // the same lesson §12.66 wrote about the diffuse-indirect line, learned
+    // again here. What thin geometry DOES still cost is sub-cell detail: both
+    // faces share a cell, so they share its surface record and its palette
+    // entry, and the two sides cannot carry different bounce colour. That is a
+    // shading-detail limit, not a leak.
     // The LARGEST cell axis: an axis clamped by MAX_AXIS_RES has coarser
     // cells than `voxelSize` asked for, and the coarsest axis is the one that
     // decides whether a wall survives.
@@ -6485,10 +7433,10 @@ export class GISystem {
       console.warn(
         `[gi] ${thinCount} of ${meshes.length} meshes are thinner than 2 GI cells (${(cellSize * 2).toFixed(2)}m at voxel ${cellSize.toFixed(2)}m)` +
           `${thinNames.length ? ` — e.g. ${thinNames.join(", ")}` : ""}. ` +
-          `The field cannot keep their two faces apart, so they do NOT block light: expect indirect to pass straight through them ` +
-          `(a lit exterior wall will light the room behind it). Fix by shrinking the GI volume (currently ` +
-          `${sizeX.toFixed(1)}x${sizeY.toFixed(1)}x${sizeZ.toFixed(1)}m — smaller volume, same budget, finer cells), raising Quality, ` +
-          `or turning Auto Fit off and setting a tighter size around the room that actually needs GI.`,
+          `They still BLOCK light (conservative voxelization + exact per-cell triangles; measured 0.00000 leak through a half-cell wall), ` +
+          `but their two faces share one cell, so they share one surface record and one bounce colour — no front/back shading difference ` +
+          `and no sub-cell detail on them. Finer cells fix it: shrink the GI volume (currently ` +
+          `${sizeX.toFixed(1)}x${sizeY.toFixed(1)}x${sizeZ.toFixed(1)}m — smaller volume, same budget, finer cells) or raise Quality.`,
       );
     }
     // COVERAGE CHECK. Everything outside the volume is invisible to GI:
@@ -6503,13 +7451,24 @@ export class GISystem {
       const sceneVolume = Math.max(1e-6, sceneSize.x * sceneSize.y * sceneSize.z);
       const covered = sizeX * sizeY * sizeZ;
       if (covered < sceneVolume * 0.35) {
-        console.warn(
-          `[gi] volume covers only ${((covered / sceneVolume) * 100).toFixed(0)}% of the scene content ` +
-            `(GI ${sizeX.toFixed(1)}x${sizeY.toFixed(1)}x${sizeZ.toFixed(1)}m vs content ` +
-            `${sceneSize.x.toFixed(1)}x${sceneSize.y.toFixed(1)}x${sceneSize.z.toFixed(1)}m). ` +
-            `Geometry outside it receives NO GI and reflections there miss (metals read flat white). ` +
-            `Move the Global Illumination component onto the entity that contains the room, or turn Auto Fit off and set the size manually.`,
-        );
+        // §13: under-coverage is BY DESIGN when the detail box armed — the
+        // box follows the camera (F2) and the far field gets the F3
+        // constant, so the old "receives NO GI" advice would send the user
+        // chasing a non-problem.
+        if (this._detailExtent && this._detailAnchor) {
+          console.log(
+            `[gi] detail volume covers ${((covered / sceneVolume) * 100).toFixed(0)}% of the scene ` +
+              `(§13: the box follows the camera; outside it, indirect is the far-field constant)`,
+          );
+        } else {
+          console.warn(
+            `[gi] volume covers only ${((covered / sceneVolume) * 100).toFixed(0)}% of the scene content ` +
+              `(GI ${sizeX.toFixed(1)}x${sizeY.toFixed(1)}x${sizeZ.toFixed(1)}m vs content ` +
+              `${sceneSize.x.toFixed(1)}x${sceneSize.y.toFixed(1)}x${sceneSize.z.toFixed(1)}m). ` +
+              `Geometry outside it receives NO GI and reflections there miss (metals read flat white). ` +
+              `Move the Global Illumination component onto the entity that contains the room, or turn Auto Fit off and set the size manually.`,
+          );
+        }
       }
     }
     // PROBE DENSITY. The quality presets are total probe BUDGETS, so the
@@ -6548,6 +7507,132 @@ export class GISystem {
    * #updateLightUniforms/#refreshEmitterSlots each tick, so it digests what
    * the GPU is actually about to read. Cheap: ~100 muls on plain numbers.
    */
+  /**
+   * Hash of everything the g-buffer prepass draws, or `null` for "never hold".
+   *
+   * ## Why
+   *
+   * `renderGiGBuffer` is the frame's SECOND full scene submission — measured on
+   * Bistro at **366 draws / 2.45 M triangles / 10.4 ms of CPU every frame**, the
+   * single biggest GI cost on the CPU side and 28% of the whole engine tick. It
+   * is pure command-encoding cost that scales with draw count (see the note at
+   * the call site), so no resolution or quality dial touches it.
+   *
+   * But a g-buffer is a pure function of (camera, geometry): same camera, same
+   * meshes, same transforms ⇒ byte-identical target. `createGiGBuffer` allocates
+   * ONE persistent RenderTarget with no ping-pong, so simply not re-rendering
+   * leaves last frame's contents valid and every downstream consumer — probe
+   * population, the deferred resolve, the emitter shadow pass — reads exactly
+   * what it would have read anyway.
+   *
+   * This is the same trade `shadowFreeze.js` and `godraysShadow.js` already
+   * make one system over, and the same one the user proved by hand: freezing the
+   * 2048² shadow map took this scene from 32.4 to 25.2 ms of CPU.
+   *
+   * ## The conservative rule
+   *
+   * Returns `null` — "re-render unconditionally" — the moment it sees geometry
+   * whose silhouette can change without its world matrix moving. Skinned meshes
+   * and morph targets deform in the vertex shader, so nothing this walk can read
+   * moves when the g-buffer should. A miss here is stale GI (wrong indirect
+   * light on moved geometry), which is a visible artifact and not a crash, so
+   * the rule is deliberately biased towards doing the work.
+   *
+   * ⚠ THE CAMERA IS PART OF THE KEY, unlike `fingerprintCasters`' content hash.
+   * A g-buffer is view-dependent in a way a shadow map is not: every pixel holds
+   * a world position and normal for whatever that pixel sees. Panning
+   * invalidates it on the first frame of motion and it re-renders every frame
+   * while the camera moves — which is correct, and means the win is on a parked
+   * camera, i.e. most of what an editor viewport does.
+   *
+   * ⚠ The layer skips MIRROR the ones `renderGiGBuffer` applies to the camera.
+   * Editor gizmos, UI and debug draw are excluded from the prepass, so letting
+   * them into the key would re-render the whole scene every time a gizmo
+   * followed the selection — the freeze would never engage in the editor at all.
+   *
+   * Rounded to 1e-4 so float jitter in a matrix recomputed every frame from
+   * unchanged inputs does not read as motion. A rolling integer hash, not a
+   * joined string: this runs every frame over the whole scene, and allocating
+   * hundreds of short-lived strings to save draw calls would move the cost onto
+   * the GC — the exact mistake `merging.js`' watchers were amortised to undo.
+   */
+  #gbufferFingerprint(camera, rt) {
+    const scene = this.engine?.scene;
+    if (!scene || !camera) return null;
+    let h = 0x811c9dc5;
+    let dynamic = false;
+    const mix = (v) => {
+      h = Math.imul(h ^ (v | 0), 0x01000193) >>> 0;
+    };
+    const mixMatrix = (m) => {
+      if (!m) return;
+      const e = m.elements;
+      for (let i = 0; i < 16; i++) mix(Math.round(e[i] * 1e4));
+    };
+    // View AND projection: a zoom or an aspect change alters every pixel's ray
+    // without moving the camera. The target dims come along because
+    // #syncScreenResolveSize can resize the g-buffer underneath us, and a
+    // resized target starts undefined rather than holding the old image.
+    // BOTH camera matrices: `matrixWorldInverse` is refreshed by
+    // `renderer.render`, so at preRender time it is the PREVIOUS frame's, while
+    // `matrixWorld` is written by whoever poses the camera (the viewport panel,
+    // a CameraComponent) and is already this frame's. Mixing both makes the
+    // hold release on the first frame of motion instead of the second.
+    mixMatrix(camera.matrixWorld);
+    mixMatrix(camera.matrixWorldInverse);
+    mixMatrix(camera.projectionMatrix);
+    mix(rt?.width ?? 0);
+    mix(rt?.height ?? 0);
+    // ── STAGE 1 EARLY-OUT: A MOVING CAMERA MUST NOT PAY THE SCENE WALK ──────
+    //
+    // The walk below is ~1100 meshes and 16 rounded matrix elements each. On a
+    // PARKED camera that is the whole point — it buys a 10.4 ms prepass for
+    // ~1.5 ms. While the camera MOVES it buys nothing: the key cannot match, so
+    // every frame paid for the walk AND the prepass it failed to avoid, which
+    // is pure added cost on exactly the frames that were already the most
+    // expensive (user-reported: "whenever I move camera it jumps to 20 fps").
+    //
+    // The camera is hashed first and alone, so motion is detected in ~35 mixes
+    // and the walk is skipped entirely. Costs one frame of re-engagement after
+    // the camera stops (this returns null, so the next frame is the first that
+    // can record a scene key) — against a freeze that only pays off over many
+    // still frames, that is free.
+    if (h !== this._gbufferCamKey) {
+      this._gbufferCamKey = h;
+      return null;
+    }
+    // ⚠ TARGET IDENTITY, NOT JUST ITS SIZE. A GI rebuild mints a FRESH
+    // g-buffer; if it happens to come back the same size, a size-only key would
+    // match the outgoing one and hold the prepass against a target that has
+    // never been rendered into — a black g-buffer, i.e. no GI at all, for as
+    // long as the camera sits still. Texture ids are per-object and monotonic,
+    // so a new target can never collide with the old one.
+    mix(rt?.textures?.[0]?.id ?? -1);
+    const skipLayers = (1 << EDITOR_LAYER) | (1 << UI_LAYER) | (1 << DEBUG_LAYER);
+    scene.traverse((object) => {
+      if (dynamic || !object.isMesh) return;
+      if (object.isSkinnedMesh || object.morphTargetInfluences?.length) {
+        dynamic = true;
+        return;
+      }
+      // Not drawn into the g-buffer ⇒ not part of its identity.
+      if ((object.layers.mask & skipLayers) !== 0) return;
+      mix(object.visible === false ? 1 : 2);
+      if (object.visible === false) return;
+      mix(object.id);
+      mix(object.geometry?.id ?? -1);
+      mixMatrix(object.matrixWorld);
+      // Per-instance transforms live in a buffer this walk cannot see, but three
+      // bumps `instanceMatrix.version` on every upload — the "did the silhouette
+      // move" signal for two integers instead of a walk over N matrices.
+      if (object.isInstancedMesh) {
+        mix(object.count);
+        mix(object.instanceMatrix?.version ?? -1);
+      }
+    });
+    return dynamic ? null : h;
+  }
+
   #fieldInputHash() {
     const state = this.state;
     if (!state) return 0;
@@ -6610,6 +7695,401 @@ export class GISystem {
     // digest so that editing one still WAKES the pipeline, which is what makes
     // the idle heuristic's shape survive Phase 1-3 unchanged.)
     return h;
+  }
+
+  /**
+   * §12.77 Unit A — GROW-ON-PRESSURE for the SRC pools.
+   *
+   * The pools boot at `SRC_POOL_FLOORS` (measured clean on the banner Sponza,
+   * −2.4 ms of capacity-proportional pass cost and −40 MB against the old
+   * pixel-proxy allocation) and this check is the guard that makes the floors
+   * safe to ship: a scene the floors starve says so in the per-cascade
+   * counters — `failed` (hash/slot pool short), `noBlock` (bin pool short) —
+   * within one frame, and the starved pool doubles toward `srcPoolCeilings`
+   * (the old up-front allocation, now the worst case). The rebuild rides the
+   * SAME path a viewport resize takes (#syncScreenResolveSize → setSize with
+   * changed pools), because that path already carries every §12.48-class
+   * lesson about what must re-derive when srcProbes is replaced.
+   *
+   * Growth only — shrink-on-slack is deliberately absent (§12.52.2's
+   * record-pool starvation is what an unguarded shrink looks like, and it
+   * reads as a lighting bug). Suspended while either FIXED pool hatch is set,
+   * so harness A/B arms stay deterministic; `__giSrcPoolInit` sets
+   * growth-permitted initial sizes for exercising this path.
+   */
+  /**
+   * §GI_SPATIAL_REBUILD Part 2 B1 — THE POOL SIZES SURVIVE THE BOOT.
+   *
+   * Growth is measured, correct, and thrown away at every reload: the pools
+   * restart at `SRC_POOL_FLOORS` and re-climb the same ladder, and every rung
+   * is a probe-store rebuild the user watches as unlit→lit. Bistro, one boot:
+   * `binBudget 700000→1400000`, then `→2800000`, then `c0Probes 16384→32768`.
+   * The demand that produced those numbers is a property of the SCENE, not of
+   * the session, so it belongs in `engine.prefs` — the same place a settings
+   * slider lives, written through on change and hydrated at boot.
+   *
+   * Keyed by scene name under the saves namespace (which is already
+   * project-scoped), so two scenes in one project do not inherit each other's
+   * demand. Read-time clamping is the caller's: `srcPoolCeilings` needs a pixel
+   * count that does not exist until the gbuffer does, and a remembered value
+   * larger than this session's ceiling must be capped rather than trusted —
+   * the window can be smaller this time.
+   *
+   * ⚠ NOT persisted while a FIXED pool hatch is set. A harness that pins
+   * `__giSrcC0Probes` for a deterministic arm must not write that pin into the
+   * user's preferences and change every later boot of the same scene.
+   */
+  #poolPrefsKey(kind) {
+    const scene = this.engine?.sceneName || "Untitled";
+    return `gi.${kind}.${scene}`;
+  }
+
+  /** The remembered pools for this scene, hydrated once per state. */
+  #srcPoolsForBuild() {
+    if (this._srcPools) return this._srcPools;
+    if (this._srcPoolsHydrated) return null;
+    this._srcPoolsHydrated = true;
+    if (Number(globalThis.__giSrcC0Probes) || Number(globalThis.__giSrcBinBudget)) return null;
+    const saved = this.engine?.prefs?.get?.(this.#poolPrefsKey("srcPools"), null);
+    const c0Probes = Number(saved?.c0Probes) || 0;
+    const binBudget = Number(saved?.binBudget) || 0;
+    if (!c0Probes && !binBudget) return null;
+    this._srcPools = {
+      c0Probes: Math.max(SRC_POOL_FLOORS.c0Probes, c0Probes),
+      binBudget: Math.max(SRC_POOL_FLOORS.binBudget, binBudget),
+    };
+    console.log(
+      `[gi] src pools restored from this scene's measured demand: c0Probes ${this._srcPools.c0Probes}, ` +
+      `binBudget ${this._srcPools.binBudget} — the boot skips the grow ladder (and its rebuilds)`,
+    );
+    return this._srcPools;
+  }
+
+  /** Remember what growth learned. Called on every grow, never on a pinned arm. */
+  #persistSrcPools() {
+    if (Number(globalThis.__giSrcC0Probes) || Number(globalThis.__giSrcBinBudget)) return;
+    if (!this._srcPools) return;
+    this.engine?.prefs?.set?.(this.#poolPrefsKey("srcPools"), {
+      c0Probes: this._srcPools.c0Probes,
+      binBudget: this._srcPools.binBudget,
+    });
+  }
+
+  /**
+   * The surface-pool hint's persistent half — same argument as the SRC pools,
+   * and a sharper payoff: this hint costs a FORCED REBUILD to land (a ~20 s
+   * stall), and re-learning it every boot means paying that stall every boot.
+   * Restored before the first build, the very first field is the right size.
+   */
+  #surfacePoolHintForBuild() {
+    if (this._surfacePoolHint) return this._surfacePoolHint;
+    if (this._surfacePoolHintHydrated) return null;
+    this._surfacePoolHintHydrated = true;
+    const saved = this.engine?.prefs?.get?.(this.#poolPrefsKey("surfacePool"), null);
+    const triangles = Math.min(Number(saved?.triangles) || 0, SURFACE_POOL_CEILINGS.triangles);
+    const records = Math.min(Number(saved?.records) || 0, SURFACE_POOL_CEILINGS.records);
+    if (!triangles && !records) return null;
+    this._surfacePoolHint = { triangles, records };
+    // The forced-rebuild budget is spent too: a restored hint is already the
+    // answer the previous session's two rebuilds converged on, so a fresh pair
+    // of stalls would only re-derive it.
+    this._surfacePoolRebuilds = 2;
+    console.log(
+      `[gi] surface pool sized from this scene's measured demand: ${triangles} triangles, ${records} records ` +
+      `— the boot skips the forced resize rebuild`,
+    );
+    return this._surfacePoolHint;
+  }
+
+  #persistSurfacePoolHint() {
+    const hint = this._surfacePoolHint;
+    this.engine?.prefs?.set?.(
+      this.#poolPrefsKey("surfacePool"),
+      hint ? { triangles: hint.triangles ?? 0, records: hint.records ?? 0 } : undefined,
+    );
+  }
+
+  /**
+   * §GI_SPATIAL_REBUILD Part 2 B2 — A POOL GROW STOPS BEING A TEARDOWN.
+   *
+   * ══ WHAT THE OLD PATH DID, AND WHY IT FLASHED ══════════════════════════════
+   *
+   * A pool grow needs exactly ONE thing rebuilt: the probe store (its dispatch
+   * counts are baked from the capacities). It got that by setting
+   * `state.screen.width = 0` so `#syncScreenResolveSize` would stop early-
+   * returning — which bought the store swap and, with it, THE ENTIRE RESIZE
+   * PATH: `gbuffer.setSize`, a fresh `createGiTargets` for every GI target, the
+   * emitter-shadow clear, and a rebuild of the tile cut, the emitter shadow
+   * pass, its filter and wide passes, and the irradiance temporal pair.
+   *
+   * The dimensions had not changed. Every one of those targets was recreated at
+   * the size it already was — and recreated means ZEROED, which threw away the
+   * §12.65 irradiance history, the emitter-shadow history and the light-shadow
+   * history. So a grow whose only real cost is a cold probe store also blanked
+   * every temporal accumulator that could have carried the picture across it.
+   * That is the user's "GI initializes twice" / "unlit → lit" flash: not one
+   * cold store, a whole cold screen chain.
+   *
+   * ══ WHAT THIS DOES INSTEAD ═════════════════════════════════════════════════
+   *
+   * Rebuilds the probe store, re-derives the three things that close over it
+   * (the screen-gather node, the reflection gather closure, the far-field
+   * average pass), rebuilds the resolve — which genuinely must be rebuilt, it
+   * BINDS the store's buffers for reflection hits — and splices it back into
+   * the queues at its own index. Every render target, every temporal history
+   * and every other pass is left alone.
+   *
+   * The cold store still has to re-converge; that is what S1 exists to delete.
+   * What this removes is the part that was never necessary: the irradiance
+   * temporal filter now holds the previous frame's answer and fades into the new
+   * one over its own window instead of starting from black.
+   *
+   * ⚠ SIZE-INVARIANT BY CONSTRUCTION, AND IT HAS TO STAY THAT WAY. The caller
+   * only reaches this when the resolve size is unchanged; a real resize still
+   * goes through `#syncScreenResolveSize`, which is the one path allowed to
+   * recreate targets. If a future pool dial ever changes a target's size, it
+   * belongs there, not here.
+   */
+  #rebuildSrcProbesForPools(state) {
+    const screen = state.screen;
+    if (!screen?.srcProbes || !screen.resolve) return false;
+    const { width, height } = { width: screen.width, height: screen.height };
+    const before = screen.srcProbes;
+    const next = before.setSize(width, height, this._srcPools ?? null);
+    if (next === before) return false;          // setSize refused — nothing grew
+    screen.srcProbes = next;
+
+    // The queue slots the resolve occupies, captured BEFORE it is replaced.
+    const index = state.queue.indexOf(screen.resolve.compute);
+    const indexNoFeedback = state.queueNoFeedback.indexOf(screen.resolve.compute);
+    const indexFeedbackOnly = state.queueFeedbackOnly?.indexOf(screen.resolve.compute) ?? -1;
+
+    // Both gather inputs re-derive from the NEW store, for the reason
+    // #syncScreenResolveSize spells out at length: a build-time closure over a
+    // disposed store makes `createGiResolve` inline the whole gather against
+    // dead buffers (the 58→323 kB kernel reading zeros).
+    screen.screenGather = screen.srcProbes?.gather?.node ?? null;
+    screen.gather = screen.srcProbes?.gather
+      ? (point, normal) => screen.srcProbes.gather.gatherAt(point, normal).irradiance
+      : null;
+    screen.radiance = screen.srcProbes?.gather && globalThis.__giGlossyRadiance === true
+      ? {
+          lookup: (point, dir) =>
+            vec3(screen.srcProbes.gather.gatherAt(point, dir).irradiance).mul(1 / Math.PI),
+        }
+      : null;
+    // §13 F3: the far-field average closed over the gather target that just
+    // went away. Same persistent 1×1 output texture and node, so the resolve
+    // below binds the thing it always bound.
+    let farFieldInput = null;
+    if (screen.srcProbes?.gather?.target && this._detailExtent && this._detailAnchor &&
+        state.volume?.world?.min && globalThis.__giFarField !== false && this._giFarFieldTex) {
+      const farAvg = createGiFarFieldAvgPass({
+        source: screen.srcProbes.gather.target,
+        width: screen.srcProbes.gather.width,
+        height: screen.srcProbes.gather.height,
+        out: this._giFarFieldTex,
+      });
+      screen.srcProbes.passes.push(farAvg.computeAccum, farAvg.computeEma);
+      farFieldInput = {
+        node: this._giFarFieldNode,
+        worldMin: state.volume.world.min,
+        worldSize: state.volume.world.size,
+        feather: 4 * (state.probeSpacing || 1),
+      };
+    }
+    const emitterW = screen.emitterShadowWidth;
+    const emitterH = screen.emitterShadowHeight;
+    screen.resolve = createGiResolve({
+      gbuffer: screen.gbuffer,
+      // THE SAME TARGETS. This is the whole unit — see the header.
+      targets: screen.targets,
+      rawCopy: screen.irrTemporalPass ? screen.targets.irradianceRaw : null,
+      width,
+      height,
+      gather: screen.gather,
+      screenGather: screen.screenGather,
+      cameraPosition: this._giResolveCamU,
+      normalOffset: screen.normalOffset,
+      intensity: screen.intensity,
+      emitter: screen.emitter,
+      radiance: screen.radiance,
+      bvhShade: screen.bvhShade,
+      ao: screen.ao,
+      emitterTileCut: screen.emitterTileCutBundle && emitterW && emitterH
+        ? { ...screen.emitterTileCutBundle, scaleX: emitterW / width, scaleY: emitterH / height }
+        : null,
+      farField: farFieldInput,
+    });
+    if (index >= 0) state.queue[index] = screen.resolve.compute;
+    if (indexNoFeedback >= 0) state.queueNoFeedback[indexNoFeedback] = screen.resolve.compute;
+    if (indexFeedbackOnly >= 0) state.queueFeedbackOnly[indexFeedbackOnly] = screen.resolve.compute;
+    return true;
+  }
+
+  #syncSrcPoolPressure(state) {
+    const src = state?.screen?.srcProbes;
+    if (!src?.readPressure) return;
+    if (Number(globalThis.__giSrcC0Probes) || Number(globalThis.__giSrcBinBudget)) return;
+    const now = performance.now();
+    // Let the boot compile wave drain before reading demand: during the wave
+    // dispatches are skipped, counters read as a scene that is not there yet
+    // (§12.40.3's empty-dispatch trap), and a grow here would queue ANOTHER
+    // wave on top of the first.
+    if (now - (this._stateBuiltAt ?? 0) < 8000) return;
+    if (this._srcPoolCheckBusy || now < (this._srcPoolNextCheckAt ?? 0)) return;
+    this._srcPoolCheckBusy = true;
+    // EXPONENTIAL BACKOFF ON CLEAN READS (2026-08-16). A readback can force a
+    // queue sync, and a fixed 1.5 s cadence forever means a recurring hitch on
+    // a perfectly static scene — reported live as "50 fps drops to 20
+    // constantly with nothing moving". Demand shows up at boot and when the
+    // camera reaches new geometry; a converged scene needs polling ~never.
+    // Clean read → interval doubles (1.5 s → … → 60 s cap); any grow resets
+    // to 1.5 s so a real starvation episode still converges fast.
+    this._srcPoolBackoffMs = Math.min(60000, (this._srcPoolBackoffMs ?? 750) * 2);
+    this._srcPoolNextCheckAt = now + this._srcPoolBackoffMs;
+    src.readPressure(this.engine.renderer).then(({ cascades: stats, depositNoBlock }) => {
+      this._srcPoolCheckBusy = false;
+      // Stale-system guard: a rebuild/resize may have replaced srcProbes while
+      // the readback was in flight — the counters then describe a disposed
+      // store (the §12.48 dead-buffer class).
+      if (this.state !== state || state.screen?.srcProbes !== src) return;
+      const cur = src.poolConfig;
+      const ceilings = srcPoolCeilings(src.pixelCount);
+      // `failed` = hash insert dropped; live near probeCapacity = the next
+      // frames WILL drop (hash load 0.5 is exactly probes-full, so 0.75 of
+      // probeCapacity is early warning, not paranoia). The bin signal is the
+      // DEPOSIT-side noBlock — birth-time claims (`s.noBlock`) go quiet once
+      // the population stabilizes while standing blockless probes keep
+      // failing deposits every frame; both count, either grows the pool.
+      const starvedSlots = stats.some((s) => s.failed > 0 || s.live > 0.75 * s.probeCapacity);
+      const starvedBins = depositNoBlock > 0 || stats.some((s) => s.noBlock > 0);
+      // ── A SLOT GROW AGAINST A CAPPED BIN POOL IS STRICTLY MORE BLACK ─────
+      //
+      // The two pools are not independent: a probe needs a SLOT to exist and a
+      // BLOCK to deposit into, and `blockCapacities` splits a fixed bin budget,
+      // so doubling the slot pool while the bin pool sits at its ceiling buys
+      // more probes to share the same blocks. Every extra probe is born
+      // blockless. Measured on Bistro 2026-08-17: the check logged
+      // `c0Probes 16384→32768, binBudget 1400000→1400000` and the moving black
+      // patches got worse, not better, because `noBlock` is what was actually
+      // binding. So when bins are starved AND cannot grow, hold the slot pool
+      // too — the pressure is real but this is not the pool that relieves it.
+      // ⚠ THE HOLD APPLIES TO THE WARNING SIGNAL ONLY, NEVER TO A DROPPED
+      // INSERT. `failed > 0` means the hash refused the probe outright — as
+      // the console line puts it, "those probes simply do not exist", and a
+      // pixel whose probe does not exist gathers NOTHING. That is a harder
+      // failure than a probe that exists without a block, so it outranks the
+      // dilution argument above and always grows. `live > 0.75 * capacity` is
+      // the early warning, and THAT is what holds while bins are capped.
+      // (Bistro 2026-08-17: holding on both pinned c0 at 32768 while it was
+      // still dropping 500 inserts a frame — the hold became the bug.)
+      const binsCapped = starvedBins && cur.binBudget >= ceilings.binBudget;
+      const droppedInserts = stats.some((s) => s.failed > 0);
+      // ── GROW TO DEMAND, NOT BY DOUBLING ─────────────────────────────────
+      //
+      // Every grow REBUILDS THE PROBE STORE, and a rebuild is a visible
+      // unlit→lit flash plus a compile wave. Doubling therefore charges the
+      // user one flash per rung of the ladder, and the pools always restart
+      // from `SRC_POOL_FLOORS` on a reload — so a scene that needs the ceiling
+      // pays the whole climb on EVERY boot. Bistro 2026-08-17, one boot:
+      // `binBudget 700000→1400000`, then `→2800000`, then `c0Probes
+      // 16384→32768`, each its own rebuild. That is the user's "GI initializes
+      // twice" (unlit, lit, unlit, lit) and their "GI restarts after camera
+      // movement" — the camera reaching new geometry is what raises demand.
+      //
+      // The counters say exactly how much is wanted, so ask for it once. Bins
+      // are split EQUALLY across cascades (`blockCapacities`), so the budget a
+      // cascade implies is `blocksWanted x binCount(c) x CASCADE_COUNT`, and
+      // the binding cascade is the max. `live + noBlock` is the true demand:
+      // the probes that exist plus the ones that wanted a block and missed.
+      const HEADROOM = 1.3;
+      const next = {};
+      if ((droppedInserts || (starvedSlots && !binsCapped)) && cur.c0Probes < ceilings.c0Probes) {
+        // ⚠⚠ A DROPPED INSERT GROWS HARD — BUT NEVER PAST WHAT THE BIN POOL
+        // CAN BACK, AND THAT CEILING IS THE REAL STORY ON THIS SCENE.
+        //
+        // `failed` counts what ONE sampled frame refused, and the population
+        // this pool has to hold is not that frame's, it is every surface the
+        // camera will TURN TOWARD. Sizing from the sample under-reads exactly
+        // in proportion to how much of the scene is still off-screen, which is
+        // why 16384 measured "wants 20176", grew to 32768, and promptly dropped
+        // 500 more. Meanwhile every attempt costs a full probe-store rebuild.
+        //
+        // The user's report is what a starved hash looks like from the outside,
+        // and it is unambiguous (2026-08-17): "patches appear on surfaces that
+        // were not initially in the camera frustum". A probe whose insert is
+        // refused IS NEVER CREATED — the console says "those probes simply do
+        // not exist" — so newly-revealed geometry does not converge slowly, it
+        // stays black forever while probes for the original view hold every
+        // slot. Rotating back and forth walks the artifact around the scene.
+        //
+        // ⛔ BUT A SLOT WITHOUT A BLOCK IS NOT A PROBE. `blockCapacities` splits
+        // `binBudget` equally and caps each cascade at its slot count, so
+        // c0 blocks = binBudget / CASCADE_COUNT / binCount(0) — at the 2.8 M
+        // ceiling that is 21 875, FULL STOP. Growing slots past it manufactures
+        // probes that exist, key, and resolve while never holding a single
+        // accumulator. Whether the gather skips them or reads them as zero
+        // decides between "no worse" and "much darker", and that is not a
+        // question to answer by shipping — so the pools stay matched.
+        //
+        // ⚠ WHICH MEANS THE HONEST READING OF THIS SCENE IS: IT WANTS MORE
+        // PROBES THAN THE ARCHITECTURE CAN BACK. 131 072 c0 blocks would need
+        // 16.8 M bins ≈ 604 MB, the exact allocation that blew the 128 MiB
+        // binding limit and caused the budget to exist. The lever is DEMAND,
+        // not supply: c0 population goes as 1/s0², so s0 0.35 → 0.5 (a lower
+        // quality tier, or a bigger world scale) roughly halves it and fits.
+        // Growing pools can only ever chase this scene, never catch it.
+        const c0 = stats.find((s) => s.cascade === 0);
+        const measured = 1 << Math.ceil(Math.log2(Math.max(1, ((c0?.live ?? 0) + (c0?.failed ?? 0)) * HEADROOM)));
+        const blockBacked = Math.floor(
+          (next.binBudget ?? cur.binBudget) / CASCADE_COUNT / binCount(0),
+        );
+        next.c0Probes = Math.min(
+          ceilings.c0Probes,
+          Math.max(cur.c0Probes, Math.min(blockBacked, Math.max(cur.c0Probes * 2, measured))),
+        );
+        if (next.c0Probes === cur.c0Probes) delete next.c0Probes;
+      }
+      if (starvedBins && cur.binBudget < ceilings.binBudget) {
+        const wanted = stats.reduce(
+          (n, s) => Math.max(n, ((s.live ?? 0) + (s.noBlock ?? 0)) * binCount(s.cascade) * CASCADE_COUNT),
+          0,
+        );
+        const target = Math.max(cur.binBudget * 2, Math.ceil(wanted * HEADROOM));
+        next.binBudget = Math.min(ceilings.binBudget, target);
+      }
+      if (next.c0Probes === undefined && next.binBudget === undefined) return;
+      this._srcPools = { ...cur, ...next };
+      // B1: remember it, so the next boot of this scene starts here.
+      this.#persistSrcPools();
+      // One grow, then let the rebuild's compile wave settle before the next
+      // reading — mid-wave counters would double-grow off skipped dispatches.
+      // A grow also resets the clean-read backoff: demand is live again.
+      this._srcPoolBackoffMs = 750;
+      this._srcPoolNextCheckAt = now + 10000;
+      const why = stats
+        .filter((s) => s.failed > 0 || s.noBlock > 0 || s.live > 0.75 * s.probeCapacity)
+        .map((s) => `c${s.cascade} live ${s.live}/${s.probeCapacity}${s.failed ? ` failed ${s.failed}` : ""}${s.noBlock ? ` noBlock ${s.noBlock}` : ""}`)
+        .join(", ") + (depositNoBlock > 0 ? `${stats.some((s) => s.failed || s.noBlock || s.live > 0.75 * s.probeCapacity) ? ", " : ""}deposit noBlock ${depositNoBlock}` : "");
+      console.log(
+        `[gi] src pool grow: c0Probes ${cur.c0Probes}→${this._srcPools.c0Probes}, ` +
+        `binBudget ${cur.binBudget}→${this._srcPools.binBudget} (${why}) — rebuilding probe store`,
+      );
+      // ── B2: THE STORE SWAP, AND NOTHING ELSE ────────────────────────────
+      //
+      // This used to be `state.screen.width = 0` — a poke that defeated
+      // #syncScreenResolveSize's tolerance check so its rebuild path would
+      // run. It did swap the store, and it also recreated every GI target at
+      // the size it already was, zeroing every temporal history in the chain.
+      // #rebuildSrcProbesForPools does the store swap and the one rebuild it
+      // forces (the resolve), leaving the targets and their history alone.
+      //
+      // Falls back to the old poke if the surgical path declines — a state
+      // with no resolve yet, or a setSize that refused the grow. Better a
+      // flash than a pool that measured starved and never grew.
+      if (!this.#rebuildSrcProbesForPools(state)) state.screen.width = 0;
+    }).catch(() => { this._srcPoolCheckBusy = false; });
   }
 
   #updateLightUniforms() {
@@ -6949,7 +8429,36 @@ export class GISystem {
     };
     this._lightShadowNodes.set(light, entry);
     light.shadow.shadowNode = entry.node;
-    light.shadow.needsUpdate = true;
+    // ⚠⚠ `autoUpdate`, NEVER `needsUpdate`, AND THE DISPOSE BELOW IS WHY.
+    //
+    //   // three/src/nodes/lighting/ShadowNode.js
+    //   dispose() { ... this.shadowMap = null; }
+    //   updateBefore(frame) {
+    //     let needsUpdate = shadow.needsUpdate || shadow.autoUpdate;
+    //     if (needsUpdate) {
+    //       this.updateShadow(frame);
+    //       if (this.shadowMap.depthTexture.version === ...)   // UNGUARDED
+    //
+    // `light.dispose()` on the next line disposes the ShadowNode, which NULLS
+    // `shadowMap`. A sticky `needsUpdate = true` then survives into the next
+    // frame's `updateBefore`, drives `updateShadow` against the dead node, and
+    // dereferences null:
+    //
+    //   Uncaught TypeError: Cannot read properties of null (reading 'depthTexture')
+    //     at ShadowNode.updateShadow ... at WebGPURenderer.render ... at #tick
+    //
+    // reported live twice (2026-08-17). ⚠ THE CRASH NEEDS `autoUpdate === false`
+    // TOO — with autoUpdate true, three rebuilds through `setup()` before
+    // `updateBefore` reaches the dereference, which is why the DEFAULT
+    // configuration never trips it and this looks intermittent. The state that
+    // arms it is a light `ShadowFreezeSystem` has frozen, so the bug only
+    // appears on scenes where the freeze is doing its job.
+    //
+    // `autoUpdate = true` asks for the identical render through the path three
+    // already owns, with its own initialisation guarantees — the same argument
+    // `shadowFreeze.js`'s header makes for never writing `needsUpdate` at all.
+    // ShadowFreezeSystem re-freezes the light two still frames later.
+    light.shadow.autoUpdate = true;
     // AnalyticLightNode CACHES the composed shadow branch (`shadowColorNode`)
     // on the light node and only rebuilds it when the light dispatches
     // 'dispose' — its hash is just the light's uuid, so neither a new
@@ -6974,8 +8483,19 @@ export class GISystem {
     // inert 1 LightComponent boots gi lights with; leaving gi mode rebuilds
     // the light anyway, which restores real maps.
     if (light.shadow && light.shadow.shadowNode === entry.node) {
-      light.shadow.shadowNode = light.userData?.giShadowMode === "gi" ? float(1) : undefined;
-      light.shadow.needsUpdate = true;
+      const stillGi = light.userData?.giShadowMode === "gi";
+      light.shadow.shadowNode = stillGi ? float(1) : undefined;
+      // Same rule as #syncLightShadowNodes — see the long note there. `dispose()`
+      // nulls three's `shadowMap`, so a sticky `needsUpdate` is what turns the
+      // next `updateBefore` into a null dereference. This site is the likelier
+      // of the two to fire it: it runs when GI HANDS A LIGHT BACK, which is
+      // exactly when a `shadowMode: "map"` light passes through GI's traced set.
+      //
+      // Not armed for a light still flagged gi: its map is a 16x16 stub the
+      // component deliberately froze, and re-enabling autoUpdate would render a
+      // placeholder nothing samples. It keeps the inert `float(1)` above, which
+      // is what stops the same crash for that case.
+      if (!stillGi) light.shadow.autoUpdate = true;
       light.dispose?.();
     }
   }
@@ -7053,8 +8573,33 @@ export class GISystem {
       mesh.geometry?.dispose();
       mesh.material?.dispose();
     }
-    // Compute nodes / storage buffers are released with GC once nothing
-    // references them; three's storage attributes hold no scene-graph refs.
+    // ⚠ GC IS NOT ENOUGH, AND THE OLD COMMENT HERE SAID IT WAS.
+    //
+    // It read: "Compute nodes / storage buffers are released with GC once
+    // nothing references them; three's storage attributes hold no scene-graph
+    // refs." True of the SCENE GRAPH, false of the RENDERER — every dispatched
+    // compute node leaves an entry in `renderer._pipelines`/`_bindings`, and a
+    // bind group holds strong references to every buffer it binds. So the
+    // disposes above can all succeed while the renderer keeps this build's
+    // `bits` (449 MB), occupancy field (360 MB) and SRC store (142 MB) alive.
+    //
+    // Boot log for the same reason: 516 pipelines compiled for 68 kernels.
+    // Rebuilds mint fresh nodes, three keys pipelines on node id, nothing
+    // evicts. User-visible as ~2 GB of heap per GI settings change (6 GB after
+    // a few; 13.4 GB killed the device outright). See releaseCompute.js.
+    const stale = collectStateComputeNodes(state);
+    const released = releaseComputeNodes(this.engine?.renderer, stale);
+    // ⚠ AND THE MATERIAL SIDE, WHICH IS THE BIGGER HALF. The compute eviction
+    // alone left the heap climbing ~2.2 GB per rebuild; the bulk is 116
+    // materials' re-injected GI node graphs piling up in `nodeBuilderCache`
+    // under fresh cache keys. See purgeNodeBuilderCache.
+    const purged = purgeNodeBuilderCache(this.engine?.renderer);
+    if (globalThis.__giLogComputeRelease === true) {
+      console.log(
+        `[gi] dispose: released ${released}/${stale.length} compute nodes` +
+        `${purged ? ", purged the node-builder cache" : ""}`,
+      );
+    }
   }
 
   #applyLiveProps() {
@@ -7244,6 +8789,7 @@ export class GISystem {
     // lightTree.js header), so next to a promoted neighbour it looks OFF.
     this._emitterInfos = [];
     this._emitterCands = null;
+    this._emitterCandMeshes = null;
     if (this.config.emissiveShadows !== false) {
       // ONE emitter per MESH. An emitter slot is described by its mesh's own
       // world transform (`#refreshEmitterSlots` reads `mesh.matrixWorld`), so
@@ -7254,10 +8800,31 @@ export class GISystem {
       // composited per instance); it just does not get an analytic slot.
       const seenEmitterMesh = new Set();
       const bright = [];
+      // ⚠ WHAT THE EXCLUSIONS COST, SAID OUT LOUD (§13.7c). An emissive mesh
+      // that fails this filter is not "not an emitter" — it is an emitter
+      // whose ONLY delivery path is the baked field, with no NEE sampling,
+      // no R5 zeroing and no screen-side direct. That is invisible in every
+      // log we had, and it is what made a string of instanced bulbs read as
+      // coloured blotches for a whole session.
+      const excludedInstanced = new Set();
+      let excludedDim = 0;
       for (const entry of entries) {
+        if (entry.peak >= 0.5 && entry.mesh.isInstancedMesh) excludedInstanced.add(entry.mesh);
+        else if (entry.peak > 0.05 && entry.peak < 0.5) excludedDim++;
         if (entry.peak < 0.5 || entry.mesh.isInstancedMesh || seenEmitterMesh.has(entry.mesh)) continue;
         seenEmitterMesh.add(entry.mesh);
         bright.push(entry);
+      }
+      if (excludedInstanced.size || excludedDim) {
+        let instances = 0;
+        for (const mesh of excludedInstanced) instances += mesh.count ?? 1;
+        console.log(
+          `[gi] emitters delivered by the FIELD ONLY: ${excludedInstanced.size} instanced mesh(es) ` +
+            `= ${instances} instances, plus ${excludedDim} placement(s) under the 0.5 peak gate. ` +
+            `They are not in the light tree, get no NEE sampling and are not R5-zeroed — ` +
+            `sub-cell ones deposit their hue into the probe lattice (§13.7c damps that; ` +
+            `\`__giSubCellEmissiveDamp = false\` restores it).`,
+        );
       }
       for (const cand of analyticEmitterCands) {
         if (seenEmitterMesh.has(cand.mesh)) continue;
@@ -7268,6 +8835,9 @@ export class GISystem {
       // score depends on the camera and the camera never touches the mesh
       // fingerprint, so seat-following has to be driven from the scan loop.
       this._emitterCands = bright;
+      // §12.70 W5b: the NEE set as a lookup — #isNeeEmitterMesh asks it once
+      // per entry during the palette bake and once per mover per frame.
+      this._emitterCandMeshes = new Set(bright.map((c) => c?.mesh).filter(Boolean));
       const chosen = this.#chooseEmitterSeats(bright);
       this._promotedEmitterMeshes = chosen.map((cand) => cand?.mesh ?? null);
       for (const cand of chosen) {
@@ -7324,9 +8894,83 @@ export class GISystem {
    * (the caller does) — so the re-rank can ask "would the seats change?"
    * without committing.
    */
+  /**
+   * §GI_SPATIAL_REBUILD Part 2 S2 — IS EVERY EMITTER DELIVERED WITHOUT A SEAT?
+   *
+   * True when both global delivery paths are armed: the transport samples every
+   * tree emitter (`#lightTreeIsNeeSet`, i.e. `__giSrcLightTree`) and the screen's
+   * per-pixel cut shades every visible pixel with its own top-K
+   * (`__giEmitterTileCut`). W5b established that those two are ONE feature and
+   * flip together, so this asks for both rather than either.
+   *
+   * When it holds, the four analytic seats are no longer a delivery path — they
+   * are a quality bonus (an analytic shadow channel) on top of an answer that
+   * already reaches every lamp. Which is what makes it safe to stop pointing
+   * them at the camera; see `#chooseEmitterSeats`.
+   *
+   * ⚠ THIS IS AN EMPIRICAL CLAIM AND IT WAS MEASURED, not assumed. The plan
+   * gated S2 on "after Phase E proves delivery", and `test:gi-shadowed-bulb`
+   * proved it: a hidden r=0.05 m bulb at strength 2000, UN-SEATED among 95 tree
+   * emitters, delivers a 1.18e-1 luminance delta at snr 385 through this path —
+   * 48× what field emission delivers. If that gate ever goes red, this predicate
+   * must go false with it, because then seats ARE the delivery path again.
+   */
+  #emitterDeliveryIsGlobal() {
+    return this.#lightTreeIsNeeSet() && globalThis.__giEmitterTileCut !== false;
+  }
+
+  /**
+   * Do the analytic seats track the camera? Derived from delivery, overridable.
+   *
+   * ⚠ THE HATCH EXISTS SO THE A/B CAN BE HONEST. Without it the only way to
+   * compare seat policies is to turn the tile cut off — which also changes what
+   * the un-seated lamps deliver, so a flicker measurement would be confounded
+   * with an energy change and neither number would mean anything. This lets both
+   * arms run FULL DELIVERY and differ in the seat policy alone, which is the one
+   * variable S2 changes. `test:gi-seat-churn` is that A/B.
+   */
+  #emitterSeatsFollowCamera() {
+    if (globalThis.__giEmitterSeatsFollowCamera === true) return true;
+    if (globalThis.__giEmitterSeatsFollowCamera === false) return false;
+    return !this.#emitterDeliveryIsGlobal();
+  }
+
   #chooseEmitterSeats(bright) {
     const camera = this.engine.camera;
-    const camPos = camera ? new THREE.Vector3().setFromMatrixPosition(camera.matrixWorld) : null;
+    // ── S2: SEATS STOP FOLLOWING THE CAMERA ─────────────────────────────────
+    //
+    // The score below is APPARENT brightness — power over distance to the camera
+    // — so it changes every time the view moves, and `#checkFingerprint`
+    // re-asks the seating question on every scan precisely because a camera move
+    // never touches the mesh fingerprint. Each flip then rides the sanctioned
+    // path: slot re-surface → atlas revision → composite → `moved = 1`, which
+    // CUTS THE EMA HISTORY where that light lands, and re-aims an
+    // emitter-shadow channel. That is the plan's "light pops/flicker during
+    // movement", and it is a cost paid on the single most common interaction in
+    // the editor.
+    //
+    // It was the right design while seats were the ONLY way an emitter reached
+    // the screen: with four slots for N lamps you want the four that matter to
+    // where you are looking. `#emitterDeliveryIsGlobal` is that premise
+    // expiring — every lamp is delivered now, so the seats are a bonus, and a
+    // bonus is not worth re-cutting temporal history for.
+    //
+    // Falling back to RAW POWER makes seat identity a property of the SCENE.
+    // Seats then change only when the scene does (a lamp dims, spawns,
+    // despawns), which is exactly the "at most a cache, never the delivery path"
+    // the plan asks for. It is also the ordering headless harnesses have always
+    // used (the `!camPos` branch below), so it is the better-tested path of the
+    // two rather than a new one.
+    //
+    // The trade, stated plainly: the four analytic shadow channels now go to the
+    // scene's four most powerful lamps rather than the four nearest, so a
+    // distant lamp can hold a seat while a near one does not. What that costs is
+    // shadow QUALITY on the near lamp — which still receives its full direct and
+    // indirect contribution through the tile cut and the tree — against a
+    // flicker the user actually reported. Invisible against visible.
+    const camPos = camera && this.#emitterSeatsFollowCamera()
+      ? new THREE.Vector3().setFromMatrixPosition(camera.matrixWorld)
+      : null;
     const scratch = new THREE.Vector3();
     const pos = new THREE.Vector3();
     const score = new Map();
@@ -7354,8 +8998,28 @@ export class GISystem {
     bright.sort((a, b) => score.get(b) - score.get(a));
     if (bright.length > MAX_EMITTERS && !this._warnedEmitterBudget) {
       this._warnedEmitterBudget = true;
+      // ⚠ THE OLD TEXT WAS FALSE UNDER AN ARMED TREE, and it was the most
+      // misleading line this module printed (plan "Cleanups to carry").
+      //
+      // It said the un-seated lamps "emit through the field only". Under an armed
+      // tree R5 DELETES exactly that — `#slotSurface` zeroes the emissive of
+      // every tree candidate, on the promise that the transport's NEE descent and
+      // the per-pixel tile cut deliver instead. So the line named, as the
+      // fallback, the one path that had been removed. Anyone reading it while
+      // chasing a dark emitter was sent to look at the field.
+      //
+      // It now describes whichever arrangement actually built, and says which
+      // path carries the un-seated lamps.
+      const global = !this.#emitterSeatsFollowCamera();
       console.warn(
-        `[gi] ${bright.length} bright emitters; analytic slots cover the ${MAX_EMITTERS} most apparent (power/d² to the camera, re-ranked as it moves) — the rest emit through the field only`,
+        `[gi] ${bright.length} bright emitters, ${MAX_EMITTERS} analytic slots. ` +
+        (global
+          ? `Seats go to the ${MAX_EMITTERS} most POWERFUL (scene-anchored — they do not follow the camera, ` +
+            `so no seat churn on movement). Every other lamp is delivered in full by the light tree's NEE ` +
+            `descent plus the per-pixel emitter tile cut; a seat only adds an analytic shadow channel.`
+          : `Seats go to the ${MAX_EMITTERS} most apparent (power/d² to the camera, re-ranked as it moves — ` +
+            `each flip cuts temporal history where that light lands). The rest emit through the FIELD only, ` +
+            `which is a coarser path: arm \`__giSrcLightTree\` + \`__giEmitterTileCut\` for full delivery.`),
       );
     }
     const byMesh = new Map();
@@ -7396,17 +9060,151 @@ export class GISystem {
     return chosen;
   }
 
-  /** Slot surface for an entry: promoted emitters composite ZERO emissive. */
+  /**
+   * §12.70 W5b — IS THIS MESH ONE OF THE NEE LIGHTS?
+   *
+   * R5's rule: an emitter that is SAMPLED as a light must not also deliver its
+   * emission on contact, or its energy arrives twice (§12.26.7 measured 2.60×
+   * on mean floor irradiance when the handoff was missing). Three sites act on
+   * that rule — the static palette bake (#slotSurface), the mover surface
+   * words (writeSurface's `isPromotedEmitter`) and the analytic-only occluder
+   * spheres — and all three used to ask "does this mesh hold one of the four
+   * PROMOTED SEATS?", which was the whole NEE set at the time.
+   *
+   * It stopped being the whole set the moment the tree arms. [J]'s descent
+   * (§12.62 W3) samples EVERY tree emitter, and since §12.70 W4b the screen's
+   * per-pixel cut marches every tree emitter too — so under either hatch the
+   * un-seated lamps were being sampled as lights AND emitting on contact. The
+   * plan filed this as a W5 gap "production cannot hit today"; W4b is what
+   * made it reachable, because before it the un-seated lamps had no direct
+   * path at all.
+   *
+   * Reads the hatches rather than a stored flag on purpose: they are
+   * build-time globals, this runs inside the build, and a stored copy is one
+   * more thing to keep in step with them.
+   */
+  #isNeeEmitterMesh(mesh) {
+    if (!mesh) return false;
+    if (this._emitterInfos?.some((e) => e?.mesh === mesh)) return true;
+    if (!this.#lightTreeIsNeeSet()) return false;
+    return this._emitterCandMeshes?.has(mesh) === true;
+  }
+
+  /**
+   * True when the TRANSPORT's NEE set is the whole tree — i.e. `[J]` samples
+   * every candidate rather than the four promoted slots.
+   *
+   * ⚠ THIS IS `__giSrcLightTree` AND NOT `__giEmitterTileCut`, and the
+   * difference cost a measurement to find. R5 is a statement about the
+   * TRANSPORT: an emitter [J] samples must not also be hit by chance. The tile
+   * cut is a statement about the SCREEN: it decides which emitters the deferred
+   * resolve shades a visible pixel with. Arming the zeroing off the screen
+   * hatch deleted the un-seated lamps' emission from the field while nothing in
+   * the transport had taken over sampling them — their whole multi-bounce
+   * contribution vanished and only a single screen-space direct term came back.
+   * The emitter-scale rig read it immediately: RECOVERY went from +0.052 to
+   * **−0.063**, the far half DARKER with the cut on than without it.
+   *
+   * The two hatches are therefore not independent: the tile cut alone leaves
+   * the un-seated lamps delivering screen direct AND field emission (the
+   * double-delivery R5 exists to stop), and they flip together.
+   */
+  #lightTreeIsNeeSet() {
+    if (!this._lightTreeRegion) return false;
+    return globalThis.__giSrcLightTree !== false;
+  }
+
+  /**
+   * The NEE emitter set as MESHES, index-aligned with what the palette's
+   * emitter flag means: the promoted seats first (so an index below
+   * MAX_EMITTERS keeps meaning the same slot it always did — giLight's array
+   * is what the GPU R5 branch compares against), then the rest of the tree's
+   * candidates when a tree hatch is armed.
+   */
+  #neeEmitterMeshes() {
+    const seats = (this._emitterInfos ?? []).map((e) => e?.mesh ?? null);
+    if (!this.#lightTreeIsNeeSet()) return seats;
+    const out = seats.slice();
+    const seen = new Set(seats.filter(Boolean));
+    for (const mesh of this._emitterCandMeshes ?? []) {
+      if (!seen.has(mesh)) { seen.add(mesh); out.push(mesh); }
+    }
+    return out;
+  }
+
+  /** Slot surface for an entry: NEE-sampled emitters composite ZERO emissive. */
   #slotSurface(entry) {
+    const zeroed = entry.promoted || this.#isNeeEmitterMesh(entry.mesh);
+    if (zeroed) return { color: entry.surface.color, emissive: { r: 0, g: 0, b: 0 } };
+    let r = entry.surface.emissive.r * entry.surface.emissiveIntensity;
+    let g = entry.surface.emissive.g * entry.surface.emissiveIntensity;
+    let b = entry.surface.emissive.b * entry.surface.emissiveIntensity;
+    const damp = this.#subCellEmissiveDamp(entry);
+    if (damp) {
+      // Chroma first, then energy — the two ramps are separate on purpose
+      // (see #subCellEmissiveDamp).
+      const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      r = (lum + (r - lum) * damp.chroma) * damp.energy;
+      g = (lum + (g - lum) * damp.chroma) * damp.energy;
+      b = (lum + (b - lum) * damp.chroma) * damp.energy;
+    }
+    return { color: entry.surface.color, emissive: { r, g, b } };
+  }
+
+  /**
+   * §13.7c — THE SUB-CELL EMISSIVE DAMP, on the path INSTANCED bulbs take.
+   *
+   * `#buildEntries` excludes `isInstancedMesh` from the emitter candidate set
+   * (an analytic slot is described by its MESH's transform, so every instance
+   * would promote to the same box), and its comment states the consequence:
+   * instanced emissive geometry "still emits through the FIELD". So a string
+   * of instanced bulbs is never in the light tree, is never R5-zeroed, and
+   * never reaches §13.7's tree-eval damp — its saturated emissive is baked
+   * into the surface records and delivered by the probe lattice alone. The
+   * user confirmed these string lights as the source of the "dirty colors"
+   * (2026-08-16), which is why the damp had to move HERE.
+   *
+   * At 1 m probes a 5 cm bulb is two orders of magnitude below the lattice:
+   * the field can honestly carry "there is light here", but not "it is
+   * magenta HERE and not 2 m to the left" — a single probe whose few rays hit
+   * the bulb's cell paints a trilinear blob in the bulb's hue, which is
+   * exactly the artifact.
+   *
+   * TWO RAMPS, and the split is the whole design: CHROMA is what the lattice
+   * cannot represent, so it damps hard (to 8%); ENERGY is real light the
+   * scene should still receive, so it damps gently (to a 35% floor). The
+   * result is that bulbs keep lighting the street and stop tinting it. The
+   * bulbs' own visible glow is the RASTER material and is untouched — this
+   * only changes what they deposit into the probe field.
+   *
+   * Returns null (untouched, and no per-entry work) for anything at or above
+   * cell size — every ordinary emissive panel, sign and lamp.
+   */
+  #subCellEmissiveDamp(entry) {
+    // DEFAULT OFF (§12.70's flip discipline, re-learned the hard way): the
+    // A/B measured this at 1% on the artifact it was written for, because
+    // the premise was wrong — the diagnostic below prints NOTHING on this
+    // scene, i.e. there are no field-only instanced emitters here at all.
+    // Arm with `__giSubCellEmissiveDamp = true` for scenes that DO report
+    // field-only emitters.
+    if (globalThis.__giSubCellEmissiveDamp !== true) return null;
+    const cell = this._surfaceCellSize ?? this.state?.volume?.minCell ?? 0;
+    const half = entry.analytic?.half;
+    if (!(cell > 0) || !half) return null;
+    if (Math.max(entry.r ?? 0, entry.g ?? 0, entry.b ?? 0) < 0.05) return null;
+    const scale = (this._surfScaleScratch ??= new THREE.Vector3());
+    entry.mesh.getWorldScale(scale);
+    const maxScale = Math.max(Math.abs(scale.x), Math.abs(scale.y), Math.abs(scale.z));
+    // LARGEST dimension against the cell: a long thin neon tube is NOT
+    // sub-cell (it spans many probes along its length and the lattice can
+    // carry that), so the conservative test is the extent that most nearly
+    // reaches a cell.
+    const size = 2 * Math.max(half[0], half[1], half[2]) * maxScale;
+    const ratio = size / cell;
+    if (!(ratio < 1)) return null;
     return {
-      color: entry.surface.color,
-      emissive: entry.promoted
-        ? { r: 0, g: 0, b: 0 }
-        : {
-            r: entry.surface.emissive.r * entry.surface.emissiveIntensity,
-            g: entry.surface.emissive.g * entry.surface.emissiveIntensity,
-            b: entry.surface.emissive.b * entry.surface.emissiveIntensity,
-          },
+      energy: Math.max(0.35, ratio),
+      chroma: Math.max(0.08, ratio),
     };
   }
 
@@ -7500,6 +9298,161 @@ export class GISystem {
     // 0.10-0.25m voxels and marches them hierarchically, so sub-cell geometry
     // is IN the medium rather than refined against on the side. The whole
     // ranking was an artifact of the coarse composited field.
+  }
+
+  /**
+   * The light tree's emitter meshes, in a STABLE order (by object id).
+   *
+   * `#chooseEmitterSeats` sorts `_emitterCands` in place by camera-apparent
+   * power, so the raw candidate order is a function of where the camera is
+   * looking. Collecting in that order makes emitter ids — which the tile cut
+   * writes into `idBuf` and every record reader keys channels by — permute on
+   * any repack: the W5a gate measured 10 of 12 records renumbered by a single
+   * lamp move. Nothing today persists an id across frames, so the permutation
+   * was harmless, but it is harmless by luck rather than by design, and it is
+   * exactly the sort of thing an emitter-shadow history would inherit as
+   * garbage. Sorting by mesh id costs a comparison per lamp and makes the id
+   * a stable name.
+   */
+  #lightTreeMeshes() {
+    const meshes = [];
+    for (const cand of this._emitterCands ?? []) if (cand?.mesh) meshes.push(cand.mesh);
+    meshes.sort((a, b) => a.id - b.id);
+    return meshes;
+  }
+
+  /**
+   * §12.70 W5 — KEEPS THE LIGHT TREE AT THE LIVE POSE.
+   *
+   * The tree's emitter records are PACKED WORDS: bounds, power, cone axis, all
+   * frozen at build time, where the promoted slots opposite them are uniforms
+   * refreshed every frame (#refreshEmitterSlots). So every consumer that reads
+   * records — [J]'s NEE descent (§12.62 W3) and, since §12.70 W4b, the whole
+   * screen-side emitter chain — lit a moving lamp from where it was when the
+   * field was last rebuilt. Documented as a W5 gap when the hatches went in;
+   * this is that gap closed. It covers dimming and colour ramps too: the same
+   * words carry power.
+   *
+   * Cheap because the tree is small. The signature scan is 17 floats per
+   * candidate mesh against a cached copy; only a real change re-runs
+   * `collectEmitters` + `buildLightTree` (microseconds at the counts a screen
+   * can hold) and re-sends a few KB through the persistent uploader — one
+   * pipeline, made once, offered to the dispatcher only on the frames it has
+   * new bytes. A still scene pays the compare and nothing else.
+   *
+   * ⚠ The emitter COUNT can change here (a mesh hidden, an InstancedMesh
+   * resized) without a GI rebuild, which is why the tile cut's scan bound is a
+   * uniform and why the region is reserved with headroom. A pack that does not
+   * fit is refused whole — the region keeps the last good tree rather than
+   * half of a new one.
+   *
+   * `__giLightTreeRefresh = false` freezes it (the A/B arm, and the escape
+   * hatch if a scene ever makes the rebuild itself the cost).
+   */
+  #refreshLightTree() {
+    if (globalThis.__giLightTreeRefresh === false) return;
+    const uploader = this._lightTreeUploader;
+    const region = this._lightTreeRegion;
+    if (!uploader || !region) return;
+    const meshes = this.#lightTreeMeshes();
+    if (!meshes.length) return;
+    // SELF-THROTTLE, measured rather than guessed. An animated emissive (a
+    // flickering lamp, a colour ramp) changes the signature every frame, and
+    // the repack is CPU work that scales with emitter count — so a repack that
+    // measured expensive is spaced to ~10% of the time it costs, and a cheap
+    // one (the common case: a dozen lamps, tens of microseconds) is never
+    // delayed at all. The pose is at most one throttle window stale, never
+    // a rebuild away.
+    const now = performance.now();
+    const cost = this._lightTreeRefreshCost ?? 0;
+    if (cost > 0.5 && now - (this._lightTreeRefreshAt ?? 0) < cost * 10) return;
+    // 20 floats per mesh: the world matrix (16), emissive × intensity (3), and
+    // one slot that carries either the instance-matrix version or the instance
+    // count — an InstancedMesh's per-instance poses are emitters of their own
+    // and `getMatrixAt` per instance per frame is exactly the cost this scan
+    // exists to avoid, so the attribute's own version stands in for them.
+    //
+    // ⚠ KEYED BY MESH, NOT BY INDEX. `#chooseEmitterSeats` SORTS
+    // `_emitterCands` IN PLACE by camera-apparent power every frame, so slot i
+    // is a different lamp after any camera move. An index-keyed cache compares
+    // one lamp's matrix against another's, reads "changed" on a still scene,
+    // and rebuilds + re-uploads the whole tree every frame the camera turns —
+    // found by the W5a gate, which saw two records jump 8.5 units on a 2.5
+    // unit move (a permutation, not a motion).
+    const STRIDE = 20;
+    const cache = (this._lightTreePoseCache ??= new WeakMap());
+    let changed = this._lightTreePoseCount !== meshes.length;
+    this._lightTreePoseCount = meshes.length;
+    for (const mesh of meshes) {
+      let row = cache.get(mesh);
+      if (!row) {
+        row = new Float32Array(STRIDE);
+        row[19] = NaN;
+        cache.set(mesh, row);
+        changed = true;
+      }
+      const e = mesh.matrixWorld.elements;
+      for (let k = 0; k < 16; k++) {
+        if (Math.abs(row[k] - e[k]) > 1e-5) changed = true;
+        row[k] = e[k];
+      }
+      const material = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
+      const emissive = material?.emissive;
+      const gain = material?.emissiveIntensity ?? 1;
+      const rgb = [(emissive?.r ?? 0) * gain, (emissive?.g ?? 0) * gain, (emissive?.b ?? 0) * gain];
+      for (let k = 0; k < 3; k++) {
+        if (Math.abs(row[16 + k] - rgb[k]) > 1e-6) changed = true;
+        row[16 + k] = rgb[k];
+      }
+      const instances = mesh.isInstancedMesh
+        ? mesh.count * 4096 + (mesh.instanceMatrix?.version ?? 0)
+        : (mesh.visible === false ? -1 : 1);
+      if (row[19] !== instances) changed = true;
+      row[19] = instances;
+    }
+    if (!changed) return;
+    try {
+      const started = performance.now();
+      const treeEmitters = collectEmitters(meshes);
+      const tree = treeEmitters.length ? buildLightTree(treeEmitters) : null;
+      this._lightTreeRefreshCost = performance.now() - started;
+      this._lightTreeRefreshAt = performance.now();
+      if (!tree) return;
+      if (!uploader.write(tree.words)) {
+        if (!this._warnedLightTreeCapacity) {
+          this._warnedLightTreeCapacity = true;
+          console.warn(
+            `[gi] light tree refresh refused: ${tree.words.length} words > ${uploader.capacity} reserved ` +
+            `(${tree.emitterCount} emitters vs ${region.emitterCount} at build) — tree frozen until the next GI rebuild`,
+          );
+        }
+        return;
+      }
+      region.words = tree.words.length;
+      region.emitterCount = tree.emitterCount;
+      region.nodeCount = tree.nodeCount;
+      region.totalPower = tree.totalPower;
+      region.builtDepth = tree.maxDepth;
+      // maxDepth is the DESCENT'S BAKED BOUND and must never grow past what
+      // the compiled kernel was given — a deeper pack simply stops early,
+      // which costs a little energy on the tail, where truncating the bound
+      // would be a wrong answer at every depth.
+      if (this._lightTreeCountU) this._lightTreeCountU.value = tree.emitterCount;
+      if (globalThis.__giLightTreeLive) globalThis.__giLightTreeLive = { ...region };
+      if (tree.maxDepth > region.maxDepth && !this._warnedLightTreeDepth) {
+        this._warnedLightTreeDepth = true;
+        console.warn(
+          `[gi] light tree refresh deepened to ${tree.maxDepth} past the descent's baked ` +
+          `${region.maxDepth} — the tail of the walk is truncated until the next GI rebuild`,
+        );
+      }
+    } catch (err) {
+      // Same contract as the build: a tree failure must never cost the frame.
+      if (!this._warnedLightTreeRefresh) {
+        this._warnedLightTreeRefresh = true;
+        console.warn(`[gi] light tree refresh failed (non-fatal): ${err?.message ?? err}`);
+      }
+    }
   }
 
   /**
@@ -7979,15 +9932,26 @@ export class GISystem {
     // full reconcile and the flip rides the sanctioned path (slot
     // re-surface → atlas revision → composite, EMA cut). The chooser's 1.5×
     // hysteresis keeps walk-through turnover at door-to-door cadence.
-    if ((this._emitterCands?.length ?? 0) > MAX_EMITTERS) {
+    //
+    // ── S2: AND IT IS SKIPPED ENTIRELY WHEN SEATS DO NOT FOLLOW THE CAMERA ──
+    //
+    // With `#emitterDeliveryIsGlobal` the seat score has no camera term, so
+    // re-asking on a camera cadence can only ever return the same answer. The
+    // skip is therefore not a behaviour change — it is declining to sort every
+    // candidate mesh on every scan to re-derive a constant. Scene changes still
+    // re-seat, through `#buildEntries` on the content path below, which is where
+    // a scene-driven seat change belongs.
+    let seatsChanged = false;
+    if (!this.#emitterSeatsFollowCamera()) {
+      // nothing to do — seats are scene-anchored
+    } else if ((this._emitterCands?.length ?? 0) > MAX_EMITTERS) {
       const seats = this.#chooseEmitterSeats(this._emitterCands);
       const current = this._promotedEmitterMeshes ?? [];
-      if (seats.some((cand, i) => (cand?.mesh ?? null) !== (current[i] ?? null))) {
-        this._fingerprint = null;
-      }
+      seatsChanged = seats.some((cand, i) => (cand?.mesh ?? null) !== (current[i] ?? null));
     }
     const fingerprint = this.#computeFingerprint(meshes);
-    if (fingerprint === this._fingerprint) return;
+    const contentChanged = fingerprint !== this._fingerprint;
+    if (!contentChanged && !seatsChanged) return;
     this._fingerprint = fingerprint;
     // Mesh set / material / geometry change: rebuild the entry list and
     // reconcile slots. Cheap (no geometry copies unless a bake is needed),
@@ -7995,7 +9959,31 @@ export class GISystem {
     const entries = this.#buildEntries(meshes);
     state.entries = entries;
     this.#syncSlots(entries);
-    this.#syncBvhScene(entries);
+    // ⚠ A SEAT RE-RANK MUST NOT REBUILD THE BVH (2026-08-16).
+    //
+    // The seat flip used to be signalled by `this._fingerprint = null`, which
+    // is a hammer: it made the mesh-content comparison below report a change
+    // it had not seen, so a seat swap dragged the ENTIRE content path along
+    // with it — `buildBvhScene` over 262 k triangles, a fresh
+    // `createGiBvhReflect` compute node (three keys pipelines on node id, so a
+    // new node is always a pipeline cache MISS and a fresh multi-second
+    // `createComputePipelineAsync`), and a 55-tile albedo atlas re-blit.
+    //
+    // Seats are re-ranked by apparent brightness (power/d² to the camera) on
+    // EVERY scan, so with emissive projectiles in flight the ranking churns
+    // continuously: the live console showed `bvh: exact reflections ON — 56
+    // meshes, 262629 tris` plus its atlas blit firing every ~1.4 s during play,
+    // which is the reported "freezes and lags when I shoot emissive lights".
+    //
+    // The BVH scene is a pure function of the MESH SET and its geometry, and a
+    // seat swap changes neither — the rebuild it triggered was guaranteed to
+    // produce an identical BVH. `#syncSlots` and `#refreshOccupancyContent`
+    // below DO still run for a seat change, because promotion strips an
+    // emitter's baked emissive out of the field (see giLight's emitter block)
+    // and that content genuinely moves.
+    // Marked, not run: a burst of spawns/despawns (projectiles) would otherwise
+    // pay a full 262 k-triangle BVH build EACH. See `#maybeResyncBvhScene`.
+    if (contentChanged) this._bvhSceneStale ??= this._frame;
     // And the occupancy pyramid, which is what transport rays actually
     // intersect — see #refreshOccupancyContent for why this was missing.
     this.#refreshOccupancyContent(meshes);
@@ -8119,6 +10107,131 @@ export class GISystem {
       sdfView.position.copy(state.center);
       sdfView.scale.set(size.x / state.buildSize.x, size.y / state.buildSize.y, size.z / state.buildSize.z);
     }
+  }
+
+  /**
+   * §13 F0: one instrumented volume slide, driven by `__giVolumeSlide`.
+   *
+   * Snaps the step to the probe lattice exactly as `#refitInPlace`'s slide
+   * does, times the CPU half, and names what to watch for on the GPU half:
+   * the recomposite rides the next occupancy chain, and the invariant under
+   * test is that NO compile wave and NO rebuild follows. The auto-fit watcher
+   * will slide the box back toward the content on its own cadence — the
+   * return trip is a second free measurement.
+   */
+  #debugSlide(dx, dz) {
+    const state = this.state;
+    if (!state?.volume?.setBounds) return;
+    const spacing = state.probeSpacing || 1;
+    const step = new THREE.Vector3(
+      Math.round(dx / spacing) * spacing,
+      0,
+      Math.round(dz / spacing) * spacing,
+    );
+    if (step.lengthSq() === 0) {
+      console.log(`[gi] slide: step ${dx},${dz} snapped to zero at ${spacing.toFixed(2)}m spacing — nothing to do`);
+      return;
+    }
+    const size = new THREE.Vector3().subVectors(state.bounds.max, state.bounds.min);
+    const next = {
+      min: state.bounds.min.clone().add(step),
+      max: state.bounds.max.clone().add(step),
+    };
+    const t0 = performance.now();
+    this.#applyBounds(next, size);
+    console.log(
+      `[gi] slide: ${(performance.now() - t0).toFixed(1)}ms CPU (#applyBounds), ` +
+        `${state.entries.length} slots re-synced, step ${step.x.toFixed(2)},${step.z.toFixed(2)}m — ` +
+        `recomposite rides the next occupancy chain; a compile wave after this line is a §13 gate FAILURE`,
+    );
+  }
+
+  /**
+   * §13 F2 — the camera drives the slide.
+   *
+   * Runs every tick but is two null-checks deep when the detail box is not
+   * armed. When the camera leaves the CENTRAL THIRD of the box (± extent/6
+   * from the anchor — hysteresis against orbit jitter), the anchor jumps to
+   * the camera (clamped into the content) and the move routes through the
+   * SAME `#fitBoundsFor` funnel the watcher and the build use, so the
+   * watcher agrees with the result by construction and never fights the
+   * follow. The slide itself is `#refitInPlace`'s lattice-snapped translate:
+   * uniform writes + one recomposite, NO rebuild ever (§13.8 — a rebuild
+   * here is a compile wave mid-walk, and the consumer that forces one is
+   * the bug). The throttle needs no queue: a request landing inside the
+   * interval re-fires on a later tick because the band condition persists.
+   *
+   * Every slide arms the §12.67 light-settle window (`_giMotionHeld` at 0.5
+   * — half strength: the strip the box just uncovered has no history and
+   * needs the floored α + lifted ray cap to fill as a ramp, but ~2/3 of the
+   * field slid over VALID history that full panic would needlessly decay).
+   * While the player walks, slides re-arm the window continuously — that is
+   * the correct steady state; standing still closes it within
+   * ALPHA_TRACK_HOLD_MS.
+   */
+  #detailFollowTick(nowMs) {
+    const anchor = this._detailAnchor;
+    const extent = this._detailExtent;
+    if (!anchor || !extent) return;
+    const state = this.state;
+    if (!state?.volume?.setBounds || globalThis.__giConfigOverride?.detailExtent === false) return;
+    const camera = this.engine?.camera;
+    if (!camera) return;
+    const cam = (this._detailCamScratch ??= new THREE.Vector3());
+    camera.getWorldPosition(cam);
+    const band = extent / 6;
+    if (Math.abs(cam.x - anchor.x) <= band && Math.abs(cam.z - anchor.z) <= band) return;
+    if (nowMs - (this._detailLastSlideAt ?? 0) < DETAIL_SLIDE_MIN_INTERVAL_MS) return;
+    this._detailLastSlideAt = nowMs;
+    const aabb = this.#autoFitAabb() ?? this.#sceneAabb(this.#collectMeshes());
+    if (!aabb) return;
+    // The anchor moves in WHOLE probe-spacing steps, horizontal only — the
+    // fractional offset it was BUILT with is preserved forever, which is
+    // half of the funnel's translation-invariance (see #detailClampAabb:
+    // constant-size box is the other half). It deliberately does NOT clamp
+    // to the content: the box clamps its own position, so an off-map camera
+    // just pins the box at the content edge.
+    const spacing = state.probeSpacing || 1;
+    const fromX = anchor.x;
+    const fromZ = anchor.z;
+    anchor.x += Math.round((cam.x - anchor.x) / spacing) * spacing;
+    anchor.z += Math.round((cam.z - anchor.z) / spacing) * spacing;
+    const t0 = performance.now();
+    const boundsMinX = state.bounds.min.x;
+    const boundsMinZ = state.bounds.min.z;
+    const fit = this.#fitBoundsFor(aabb);
+    if (!this.#refitInPlace(fit)) {
+      // Never rebuild from the follow path. Should be structurally
+      // unreachable now (translation-invariant fits) — if it fires, the
+      // invariance broke; restore the anchor and let the watcher arbitrate.
+      anchor.x = fromX;
+      anchor.z = fromZ;
+      console.warn(
+        "[gi] follow: refit refused the slide (fit changed size under translation — invariance bug) — " +
+          "anchor restored, the auto-fit watcher arbitrates",
+      );
+      return;
+    }
+    if (state.bounds.min.x === boundsMinX && state.bounds.min.z === boundsMinZ) {
+      // The box did not actually move — pinned at a content edge with the
+      // camera beyond it. Don't arm the settle window for nothing, and back
+      // the retry off so an off-map camera doesn't re-run the scene walk
+      // every throttle interval.
+      this._detailLastSlideAt = nowMs + DETAIL_SLIDE_MIN_INTERVAL_MS * 9;
+      return;
+    }
+    // ⚠ THE SLIDE'S OWN PAIR, NOT THE LIGHT-TRACK PAIR — see the long note at
+    // the `trackMotion` getter. Writing `_giMotionHeld` here made a walking
+    // camera hold the light-settle window open permanently ("armed by none,
+    // peak 0.00, open 100% of frames") which lifts the probe ray cap to OFF
+    // and costs ~3.8x on the deposit for the entire walk. This pair feeds the
+    // α floor only, which is the half of the settle a slide actually needs.
+    this._giSlideHeld = Math.max(this._giSlideHeld ?? 0, 0.5);
+    this._giSlideHoldUntil = nowMs + ALPHA_TRACK_HOLD_MS;
+    console.log(
+      `[gi] follow: slide ${(performance.now() - t0).toFixed(1)}ms CPU, anchor ` +
+        `${fromX.toFixed(1)},${fromZ.toFixed(1)} → ${anchor.x.toFixed(1)},${anchor.z.toFixed(1)} — settle window armed`,
+    );
   }
 
   #computeFingerprint(meshes) {
@@ -8261,7 +10374,16 @@ export class GISystem {
     const dynObjectsOn = globalThis.__giDynamicObjects !== false;
     const dynPoolWords = Number(globalThis.__giDynMeshWords) ||
       ({ low: 262144, medium: 393216, high: 786432, ultra: 1572864 }[quality] ?? 786432);
-    const dynWords = dynObjectsOn ? dynHeaderWords() + dynPoolWords : 0;
+    // Mover cap by tier. 16 was one crate pile short: the user's spawned
+    // 30-box pyramid adopted 16 and the rest kept their static-BVH triangles
+    // at the play-entry pose — tumbling crates with the old pile's shadow
+    // baked under them (2026-08-16). The marcher loops over the LIVE count
+    // (header word 0), so an uncontended scene pays nothing for the headroom;
+    // a full set costs every shadow ray one OBB test per mover, which is why
+    // low/medium keep 16. Hard ceiling stays 64 (f32-exact card ids).
+    const dynMaxObjects = Number(globalThis.__giMaxDynamicObjects) ||
+      ({ low: 16, medium: 16, high: 24, ultra: 32 }[quality] ?? 16);
+    const dynWords = dynObjectsOn ? dynHeaderWords(dynMaxObjects) + dynPoolWords : 0;
 
     // STATIC-SCENE SHADOW BVH ("light by voxels, shadows by BVH"): one
     // world-space BVH8 over every static placement — the screen shadow
@@ -8281,12 +10403,21 @@ export class GISystem {
       // Diagnostics handle: the CPU traversal mirror in the static-BVH probe
       // reads the SAME words the GPU traverses (the bits upload is a compute
       // copy from staging — the CPU bits array never holds them).
-      this._staticBvhPacked = staticBvhPacked;
+      //
+      // ⚠ OPT-IN, because this handle is the ONLY reference keeping the packed
+      // words alive once they have been uploaded. On Bistro that is 125 MB of
+      // `Uint32Array` (188 MB with the dynamic set's copy) retained for the
+      // whole session so that `run-gi-static-bvh-probe.mjs` — which nothing but
+      // a developer ever runs — can walk it. Everything the renderer needs is
+      // already on the GPU. Held permanently it is pure heap, on a scene whose
+      // heap growth is what kills the WebGPU device (2026-08-17: 13.4 GB, then
+      // "Instance dropped in popErrorScope"). The probe sets the flag.
+      if (globalThis.__giKeepStaticBvhPacked === true) this._staticBvhPacked = staticBvhPacked;
       if (staticBvhPacked) {
         console.log(
           `[gi] static shadow bvh: ${staticBvhPacked.triCount} tris, ` +
             `${(staticBvhPacked.words.length * 4 / (1024 * 1024)).toFixed(1)}MB, built in ${(performance.now() - t0).toFixed(0)}ms` +
-            ` (${globalThis.__giStaticBvhStrategy ?? "sah"} splits)`,
+            ` (${globalThis.__giStaticBvhStrategy ?? "sah"} splits), triBase ${staticBvhPacked.nodeWords}`,
         );
       }
     }
@@ -8320,6 +10451,14 @@ export class GISystem {
       // Phase 4: complex cells store short exact triangle lists in the same
       // allocation instead of degrading to occupied-box hits.
       enableComplexTriangles: rayHitConfig?.activeMode === RayHitMode.HybridExactComplex,
+      // ── MEASURED DEMAND FROM A PREVIOUS BUILD (see #maybeLogStats) ────────
+      // Both default to `undefined`, which is "use the derived size" — so a
+      // scene that has never overflowed is byte-identical to before. Only a
+      // field that actually reported oversubscription carries a hint, and
+      // occupancyField clamps it against its own ceilings, so a runaway demand
+      // counter cannot allocate an arbitrary buffer.
+      complexTriangleCapacity: this.#surfacePoolHintForBuild()?.triangles || undefined,
+      surfaceRecordCapacity: this._surfacePoolHint?.records || undefined,
       // Phase 5: the conservative pyramid ride is the DEFAULT, so `!== false`
       // (not `=== true`) — a caller with no rayHitConfig at all still gets the
       // skip; only an explicit opt-out compiles the no-skip A/B arm.
@@ -8333,8 +10472,17 @@ export class GISystem {
     // only offer the baseline the optional regions must shrink to fit:
     // static shadow BVH first (shadows fall back to the records marcher),
     // then the exact-dynamic pool.
-    const deviceLimit =
-      this.engine?.renderer?.backend?.device?.limits?.maxStorageBufferBindingSize ?? 134217728;
+    // BOTH limits, because they are separate and EITHER one kills the buffer:
+    // binding size at bind-group creation, buffer size at CreateBuffer itself.
+    // Clamping to the binding limit alone left a 261MB buffer failing creation
+    // against the default 256MB maxBufferSize while the binding limit stood at
+    // 1GB (Bistro, 2026-08-16) — the ladder never fired and the console filled
+    // with the same CreateBindGroup cascade it exists to prevent.
+    const deviceLimits = this.engine?.renderer?.backend?.device?.limits;
+    const deviceLimit = Math.min(
+      deviceLimits?.maxStorageBufferBindingSize ?? 134217728,
+      deviceLimits?.maxBufferSize ?? 268435456,
+    );
     let field = makeField(dynWords, staticBvhWords);
     if (field.bitsBuffer.value.array.byteLength > deviceLimit && staticBvhWords > 0) {
       console.warn(
@@ -8365,13 +10513,19 @@ export class GISystem {
         bits: field.bitsBuffer,
         baseWord: field.dynamicObjectWordOffset,
         capacityWords: field.dynamicObjectWords,
+        // The SAME tiered value the header region above was sized with — the
+        // set recomputes HEADER_WORDS from it, and the two must agree or the
+        // pool's base word lands inside the header.
+        maxObjects: dynMaxObjects,
         // Live, not a snapshot: `_emitterInfos` is rebuilt by #buildEntries on
         // every rescan, and an adopted mover's header is re-published whenever
         // this predicate's answer changes (it is part of the surface stamp). See
         // writeSurface — without this the exact path double-counts a promoted
         // emitter's own emissive, which #slotSurface has always zeroed on the
         // voxel path.
-        isPromotedEmitter: (mesh) => this._emitterInfos?.some((e) => e?.mesh === mesh) === true,
+        // §12.70 W5b: the NEE set, not just the four seats — under either tree
+        // hatch every candidate is sampled as a light.
+        isPromotedEmitter: (mesh) => this.#isNeeEmitterMesh(mesh),
       });
       composeFieldDynamics(field, this._dynSet);
       if (staticBvhPacked && field.staticBvhWords > 0) {
@@ -8382,6 +10536,10 @@ export class GISystem {
         });
         this._staticBvhCapacity = field.staticBvhWords;
         this._staticBvhStale = null;
+        // Region offsets are per-field and `_dynSet` is brand new: a rebuild
+        // staged against the PREVIOUS field would publish bases into an
+        // allocation that no longer exists.
+        this._staticBvhPendingAttach = null;
       }
       if (this._dynAdoptedKeys.size > 0) this.#readoptDynamicObjects(meshes);
       // Boot marker (the "is my build live" pattern): one line that settles
@@ -8921,7 +11079,11 @@ export class GISystem {
       if (!st) holder.set(c.mesh, (st = {}));
       const vis = visFor(st, c.r);
       const surf = c.surface;
-      const isSeatedEmitter = promoted ? promoted.indexOf(c.mesh) !== -1 : false;
+      // §12.70 W5b: the NEE set (seats, plus every tree candidate when a tree
+      // hatch is armed) — `promoted` alone left un-seated lamps delivering
+      // both their analytic direct and their bounce.
+      const isSeatedEmitter = this.#isNeeEmitterMesh(c.mesh)
+        || (promoted ? promoted.indexOf(c.mesh) !== -1 : false);
       const ei = surf?.emissiveIntensity ?? 1;
       bundle.spheres.array[n].set(c.cx, c.cy, c.cz, c.r);
       bundle.albedo.array[n].set(surf?.color?.r ?? 1, surf?.color?.g ?? 1, surf?.color?.b ?? 1, 0);
@@ -9026,6 +11188,36 @@ export class GISystem {
         field.setSlotDynamic?.(p.slot, true);
         field.setSlotMatrix(p.slot, p.matrix);
         p._lastMovedFrame = this._frame;
+        // ── THE OCCUPANCY MOVED; THE SHADOW BVH DID NOT (the ghost-shadow bug).
+        //
+        // A "static"-mobility mesh keeps its triangles in the world static
+        // shadow BVH — that is the whole point of the setting, and it is where
+        // exact silhouettes come from for free. But the BVH is built at a pose
+        // and only rebuilt when `_staticBvhStale` is set, which until now
+        // happened on placement ADD/REMOVE and never on a placement that simply
+        // MOVED. So dragging a crate updated its voxel footprint (bounced light
+        // followed) while every shadow ray kept intersecting its triangles at
+        // the OLD pose: a hard shadow on the floor with nothing above it,
+        // exactly the §12.75-era "stale pose" shape one system further down.
+        //
+        // The same 180-frame debounce the other call sites use applies, so a
+        // drag rebuilds once when it settles rather than once per frame — the
+        // shadow corrects a few seconds after the object stops, not during.
+        // Adopted movers do NOT come through here (they `continue` above);
+        // their exact shape is refreshed per frame by #refreshDynamicObjects.
+        if (this._dynSet?.staticBvh) {
+          this._staticBvhStale = this._frame;
+          // And while it moves, its build-pose triangles come OUT of the
+          // shadow set (the same per-slot mask adoption uses): a mover over
+          // the adoption cap — or pinned "static" — otherwise drags a baked
+          // shadow of its old pose around, and the debounced rebuild above
+          // cannot fire during sustained motion because this very branch
+          // keeps re-arming it. No shadow while moving beats a shadow that
+          // stopped following; the rebuild at rest restores the exact
+          // silhouette and clears every motion mask (resetStaticMask in
+          // #maybeRebuildStaticBvh).
+          this._dynSet.setStaticMaskBit(p.slot, true);
+        }
       } else if (
         p._lastMovedFrame != null &&
         this._frame - p._lastMovedFrame > OCC_DYNAMIC_QUIET_FRAMES
@@ -9110,6 +11302,8 @@ export class GISystem {
     const pending = dyn.pendingDispatch();
     if (pending.length > 0) giCompute(renderer, pending);
     const live = dyn.confirmDispatch(giSkippedComputes);
+    // Before this frame's screen passes: words and bases flip together.
+    this.#commitStaticBvhAttach();
     // Park the adoptees' voxel slots only once the exact side is actually
     // live on the GPU — until then the frozen bits stand in.
     if (live && this._dynPendingDisable?.length) {
@@ -9136,13 +11330,56 @@ export class GISystem {
    * content changes. Excludes adopted placements; the mask resets to empty
    * because the fresh soup simply omits them.
    */
+  /**
+   * Debounced exact-reflection BVH resync — the sibling of
+   * `#maybeRebuildStaticBvh` below, and it exists for the same reason.
+   *
+   * MEASURED 2026-08-16, banner Sponza with the ball launcher on a 0.4 s timer:
+   * spawning and retiring emissive projectiles put the frame at **25 fps with
+   * CPU 37.4 ms against a GPU of only 18.6** — CPU-bound by a factor of two,
+   * which no shader change can touch. The console said why: `bvh: exact
+   * reflections ON — 56 meshes, 262629 tris` plus its 55-tile atlas blit,
+   * **two to three times per second**. Every spawn and every despawn changes
+   * the mesh set, the content fingerprint moves, and `#syncBvhScene` rebuilds
+   * the WHOLE static scene — a 262 k-triangle BVH build, an albedo atlas
+   * re-blit, and a fresh `createGiBvhReflect` compute node (three keys
+   * pipelines on node id, so a new node is always a cache miss and a fresh
+   * `createComputePipelineAsync`).
+   *
+   * A projectile is not worth any of that. Reflections of a ball that appeared
+   * 30 frames ago are indistinguishable from reflections of one that appeared
+   * this frame — while a synchronous rebuild per spawn is a visible stall. So
+   * the incremental path now only MARKS the scene stale and this collapses a
+   * burst into one rebuild. `#rebuild()` still calls `#syncBvhScene` directly:
+   * a full rebuild is already a wave, and deferring inside it would leave the
+   * light pointing at a disposed BVH.
+   *
+   * `__giBvhResyncFrames` tunes the window; 0 restores the old rebuild-per-
+   * change behaviour for an A/B.
+   */
+  #maybeResyncBvhScene(state) {
+    if (this._bvhSceneStale == null || !state) return;
+    const raw = Number(globalThis.__giBvhResyncFrames);
+    const frames = Number.isFinite(raw) ? raw : 60;
+    if (frames > 0 && this._frame - this._bvhSceneStale < frames) return;
+    this._bvhSceneStale = null;
+    if (state.entries) this.#syncBvhScene(state.entries);
+  }
+
   #maybeRebuildStaticBvh(state) {
     const dyn = this._dynSet;
     if (this._staticBvhStale == null || !dyn?.staticBvh) return;
     if (this._frame - this._staticBvhStale < 180) return;
-    this._staticBvhStale = null;
+    // One rebuild in flight at a time: the words are staged and the bases flip
+    // only once the upload has actually dispatched (#commitStaticBvhAttach).
+    if (this._staticBvhPendingAttach) return;
     const field = state.volume?.occupancyField;
-    if (!field?.placements) return;
+    // Re-arm rather than drop it: without a field there is nothing to pack
+    // yet, and clearing the flag here would strand the motion mask (slots
+    // masked out of the shadow BVH are un-masked ONLY by a rebuild that
+    // reaches resetStaticMask below).
+    if (!field?.placements) { this._staticBvhStale = this._frame; return; }
+    this._staticBvhStale = null;
     const t0 = performance.now();
     const items = [];
     for (const p of field.placements) {
@@ -9153,30 +11390,71 @@ export class GISystem {
       items.push({ positions: record.positions, index: record.index, matrix: p.matrix, slot: p.slot });
     }
     const packed = items.length ? buildStaticSceneBvhWords(items, staticBvhStrategy()) : null;
-    if (!packed) return;
-    this._staticBvhPacked = packed;
+    if (!packed) {
+      // No static geometry left to pack. Nothing to retry, but the motion mask
+      // must not survive the decision — see the capacity path below.
+      dyn.resetStaticMask([]);
+      return;
+    }
+    // Opt-in for the same reason as the build-time site above: this reference
+    // is what keeps the packed words on the heap after the upload.
+    if (globalThis.__giKeepStaticBvhPacked === true) this._staticBvhPacked = packed;
     if (packed.words.length > (this._staticBvhCapacity ?? 0)) {
       console.warn(
         `[gi] static shadow bvh: rebuild needs ${packed.words.length} words > ${this._staticBvhCapacity} capacity — ` +
           "keeping the stale BVH (new content shadows arrive on the next full GI rebuild)",
       );
+      // The mask is the mover-motion mask, and resetStaticMask is the ONLY
+      // thing that clears it. Bailing with it set left those slots masked out
+      // of the shadow BVH forever — they stopped casting any shadow at all for
+      // the rest of the session. A shadow at the build pose is the lesser
+      // artifact; the pose corrects at the next full GI rebuild.
+      dyn.resetStaticMask([]);
       return;
     }
-    dyn.queueRegionUpload(field.staticBvhWordOffset, packed.words);
-    dyn.attachStaticBvh({
+    // STAGED, NOT LIVE. The words ride a fresh compute (a fresh pipeline, so
+    // async compilation can skip it for a frame or more), while the bases are
+    // uniforms that take effect the instant they are written. Flipping them
+    // here would point the traversal at a region that still holds the previous
+    // build. #commitStaticBvhAttach does both together, in the same frame the
+    // upload actually dispatches and before this frame's screen passes run.
+    this._staticBvhPendingAttach = {
+      block: dyn.queueRegionUpload(field.staticBvhWordOffset, packed.words),
       nodeBase: field.staticBvhWordOffset,
       triBase: field.staticBvhWordOffset + packed.nodeWords,
-    });
+      triCount: packed.triCount,
+      buildMs: performance.now() - t0,
+    };
+  }
+
+  /**
+   * Publishes a staged static-BVH rebuild once its words are on the GPU.
+   *
+   * Called right after confirmDispatch, so on the frame the upload compute
+   * actually goes out this runs BEFORE the shadow passes read it: the words
+   * and the bases change together and no frame ever sees a mismatched pair.
+   * Until then the previous BVH stays attached and keeps casting shadows.
+   */
+  #commitStaticBvhAttach() {
+    const pending = this._staticBvhPendingAttach;
+    if (!pending || pending.block?.uploaded !== true) return;
+    this._staticBvhPendingAttach = null;
+    const dyn = this._dynSet;
+    if (!dyn) return;
+    dyn.attachStaticBvh({ nodeBase: pending.nodeBase, triBase: pending.triBase });
     dyn.resetStaticMask([]);
     // ALWAYS LOGGED, not behind the debug flag: this is a SYNCHRONOUS
     // main-thread stall of hundreds of milliseconds (262k tris ≈ 200ms center
     // / 600ms SAH on the user's Sponza). A rebuild that fires on a timer is
     // indistinguishable from "the editor is lagging", and the only way to tell
-    // a one-off from a loop is to see them in the console.
+    // a one-off from a loop is to see them in the console. triBase is printed
+    // because a MOVED triBase is what used to silently kill every sun shadow
+    // in the scene (see attachStaticBvh's note in dynamicObjects.js).
     this._staticBvhRebuilds = (this._staticBvhRebuilds ?? 0) + 1;
     console.log(
       `[gi] static shadow bvh: rebuild #${this._staticBvhRebuilds} — ` +
-        `${packed.triCount} tris in ${(performance.now() - t0).toFixed(0)}ms`,
+        `${pending.triCount} tris in ${pending.buildMs.toFixed(0)}ms, ` +
+        `triBase ${pending.triBase - pending.nodeBase} (live)`,
     );
   }
 

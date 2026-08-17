@@ -960,6 +960,23 @@ export function gatherPixel(cfg, built, tiles, position, normal, interior = IRRA
       position[0], position[1], position[2],
       origin[0], origin[1], origin[2], s,
     );
+    // §13.7d — the GPU gather's normal-plane wrap weight, mirrored. Reads the
+    // SAME global, so `test:gi-src-gather` never diffs a weighted GPU against
+    // an unweighted CPU. Applied to the corner weights before the sparse
+    // gather rather than inside `combine`, which is not handed a position.
+    const nwHatch = globalThis.__giGatherNormalWeight;
+    if (nwHatch === true || (Number.isFinite(nwHatch) && nwHatch > 0)) {
+      const nwExp = Number.isFinite(nwHatch) && nwHatch > 0 ? nwHatch : 2;
+      for (const c of corners) {
+        const dx = origin[0] + c.cx * s - position[0];
+        const dy = origin[1] + c.cy * s - position[1];
+        const dz = origin[2] + c.cz * s - position[2];
+        const len = Math.hypot(dx, dy, dz) || 1e-5;
+        const dot = (dx * normal[0] + dy * normal[1] + dz * normal[2]) / len;
+        const facing = Math.max(0, dot * 0.5 + 0.5);
+        c.weight *= Math.max(1e-3, nwExp === 2 ? facing * facing : facing ** nwExp);
+      }
+    }
     const gathered = sparseGather(
       corners,
       (cx, cy, cz) => {

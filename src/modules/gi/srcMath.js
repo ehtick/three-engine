@@ -269,6 +269,94 @@ export const KEY_AXIS_RANGE = 1 << KEY_AXIS_BITS; // 512
 export const KEY_AXIS_OFFSET = KEY_AXIS_RANGE >> 1; // 256
 export const KEY_EMPTY = 0;
 
+// ══════════════════════ WORLD-ABSOLUTE KEYS (the toroidal window)
+//
+// docs/GI_SPATIAL_REBUILD_PLAN.md Part 2 S1, realized on the KEY rather than on
+// the storage. Read this block before touching anything above it.
+//
+// ══ WHAT S1 ASKED FOR, AND WHY IT CANNOT BE THE STORAGE ════════════════════
+//
+// The plan proposes a fixed-footprint camera-centred RING: "probe index =
+// worldCell mod ringSize", memory sized once, growth deleted as a concept. The
+// properties it buys are the right ones — no insert failure, no re-anchor, no
+// retirement of survivors, O(strip) on camera motion. The arithmetic of making
+// STORAGE dense is what kills it:
+//
+//   A probe population is a 2-DIMENSIONAL MANIFOLD (visible surfaces) inside a
+//   3-dimensional lattice. A dense ring pays for the third dimension and gets
+//   nothing back. At s₀ = 0.35 the LOD-0 shell reaches 44.8 m, i.e. 256 cells
+//   per axis: 16,777,216 slots to hold the ~16,000 probes this scene actually
+//   has. **1,049x waste at cascade 0, LOD 0 alone.** Summed over the real
+//   ladder (CASCADE_COUNT 4 x MAX_LODS 10, each level's own shell) it is
+//   191,692,800 cells — 5.85 GB of probe records and 338 GB of direction bins.
+//
+// That is the SAME arithmetic that produced §12.16's finding ("0.24% of
+// allocated bins were ever sampled", 604 MB against a 128 MiB binding limit)
+// and made the block pool budget-sized in the first place. The plan's own
+// rejected-alternatives section names the 604 MB bin wall as the reason to
+// abandon growing the hash; a dense ring walks into it from the other side.
+//
+// ══ SO THE TORUS GOES ON THE KEY, WHERE IT IS FREE ═════════════════════════
+//
+// Every property S1 wants comes from probe IDENTITY being a pure function of
+// the world cell. It does not require storage to be indexed that way — the hash
+// can stay sparse, which is what keeps the memory honest.
+//
+// Today a key holds the cell RELATIVE to a camera-following anchor, biased by
+// +256 into the 9-bit field. That relativity is the entire reason `srcSystem`
+// re-anchors, and re-anchoring is the plan's "wholesale history loss on long
+// moves": the anchor jumps, every cell coordinate changes, every key changes,
+// and every probe in the scene is renumbered and retired at once.
+//
+// Under world-absolute keys the 9 bits hold `worldCell mod 512` — no anchor, no
+// bias, no range check, no re-anchor, EVER. A probe's key is a permanent
+// property of where it is in the world.
+//
+// ══ THE ALIAS IS UNREACHABLE BY CONSTRUCTION, AND HERE IS THE PROOF ════════
+//
+// Two world cells 512 apart on an axis share a key. They can never both be live:
+//
+//   · LOD L exists only within Chebyshev distance `lodRadius(L+1)` of the
+//     camera = s₀·64·2^(L+1), so the widest live span on one axis is
+//     2·s₀·64·2^(L+1) = 256·s₀·2^L world units.
+//   · The alias period at cascade c, LOD L is 512 cells of size s₀·2^(c+L),
+//     i.e. 512·s₀·2^(c+L) world units.
+//   · period/extent = 512·2^c / 256 = **2·2^c ≥ 2**.
+//
+// A factor of two at the worst pair (every cascade 0 LOD), growing by 2^c for
+// the coarser cascades. `run-gi-src-worldkeys-test.mjs` sweeps all 40
+// (cascade, LOD) pairs and asserts it rather than trusting this comment.
+//
+// ══ THE ONE COST: RECONSTRUCTION NEEDS THE CAMERA ══════════════════════════
+//
+// `worldCell mod 512` is not invertible on its own. Recovering the world cell —
+// which the cascade ladder, the merge and the gizmos all need, because a probe's
+// position comes from its key and never from a stored copy — takes the unique
+// representative within ±256 cells of the camera's own cell. That is
+// `wrapCellNear` below, and the margin proved above is exactly what makes the
+// representative unique.
+//
+// Hatched (`__giSrcWorldKeys`) and OFF by default: the plan requires the old
+// keying kept for A/B through the whole phase.
+
+/** Is world-absolute probe keying armed? `__giSrcWorldKeys = true` opts in. */
+export function worldKeysEnabled() {
+  return globalThis.__giSrcWorldKeys === true;
+}
+
+/**
+ * The unique integer congruent to `packed` mod 512 that lies within ±256 of
+ * `ref` — the inverse of `worldCell & 511`.
+ *
+ * `ref` is the camera's own cell on the same lattice. Correct for every live
+ * probe because the live span is at most half the period (see the proof above),
+ * so exactly one representative falls in the window.
+ */
+export function wrapCellNear(packed, ref) {
+  const d = (packed - ref + KEY_AXIS_OFFSET) & (KEY_AXIS_RANGE - 1);
+  return ref + d - KEY_AXIS_OFFSET;
+}
+
 /**
  * Pack a probe key. `cx/cy/cz` are cell coords RELATIVE to the LOD's
  * camera-anchored origin (so they straddle zero); the +256 bias maps them into
@@ -277,6 +365,20 @@ export const KEY_EMPTY = 0;
  */
 export function packProbeKey(lod, secondary, cx, cy, cz) {
   if (!(lod >= 0) || lod >= KEY_MAX_LODS) return KEY_EMPTY;
+  if (worldKeysEnabled()) {
+    // WORLD-ABSOLUTE: `cx/cy/cz` are WORLD cells, wrapped into the 9-bit field.
+    // No bias and NO RANGE CHECK — the window is toroidal now, so there is no
+    // such thing as an unrepresentable cell and therefore no silent absence.
+    // (The LOD test above stays: `lod` really can be out of range, and the +1
+    // bias on it is what keeps a packed word from colliding with KEY_EMPTY.)
+    return (
+      (((lod + 1) & 0xf) << 28) |
+      ((secondary ? 1 : 0) << 27) |
+      ((cx & (KEY_AXIS_RANGE - 1)) << 18) |
+      ((cy & (KEY_AXIS_RANGE - 1)) << 9) |
+      (cz & (KEY_AXIS_RANGE - 1))
+    ) >>> 0;
+  }
   const x = cx + KEY_AXIS_OFFSET;
   const y = cy + KEY_AXIS_OFFSET;
   const z = cz + KEY_AXIS_OFFSET;
@@ -291,18 +393,51 @@ export function packProbeKey(lod, secondary, cx, cy, cz) {
   ) >>> 0;
 }
 
-/** Unpack a probe key, or null for EMPTY. */
+/**
+ * Unpack a probe key, or null for EMPTY.
+ *
+ * Under world-absolute keying the cell fields are RAW `[0,512)` residues, not
+ * signed offsets — recovering the world cell needs a reference, so it is
+ * `keyWorldCell` below and never this. Returning the un-biased signed value
+ * here would hand every existing caller a plausible cell that is wrong by a
+ * multiple of 512, which is the failure mode this whole block exists to make
+ * impossible; so it returns the residue and says so in the field names.
+ */
 export function unpackProbeKey(key) {
   const k = key >>> 0;
   if (k === KEY_EMPTY) return null;
   const lodBiased = (k >>> 28) & 0xf;
   if (lodBiased === 0) return null;
+  const bias = worldKeysEnabled() ? 0 : KEY_AXIS_OFFSET;
   return {
     lod: lodBiased - 1,
     secondary: ((k >>> 27) & 1) === 1,
-    cx: ((k >>> 18) & (KEY_AXIS_RANGE - 1)) - KEY_AXIS_OFFSET,
-    cy: ((k >>> 9) & (KEY_AXIS_RANGE - 1)) - KEY_AXIS_OFFSET,
-    cz: (k & (KEY_AXIS_RANGE - 1)) - KEY_AXIS_OFFSET,
+    cx: ((k >>> 18) & (KEY_AXIS_RANGE - 1)) - bias,
+    cy: ((k >>> 9) & (KEY_AXIS_RANGE - 1)) - bias,
+    cz: (k & (KEY_AXIS_RANGE - 1)) - bias,
+    /** True when cx/cy/cz are residues awaiting `keyWorldCell`. */
+    residue: bias === 0,
+  };
+}
+
+/**
+ * The WORLD cell a key names, given the camera's own cell on the same lattice.
+ *
+ * The one inverse under world-absolute keying, and the reason every consumer
+ * derives a probe's position from its key plus the camera rather than from a
+ * stored position: a stored position is a second source of truth, and the
+ * §12.70 W5a gate already caught what happens when two sources disagree.
+ */
+export function keyWorldCell(key, refCx, refCy, refCz) {
+  const u = unpackProbeKey(key);
+  if (!u) return null;
+  if (!u.residue) return { lod: u.lod, secondary: u.secondary, cx: u.cx, cy: u.cy, cz: u.cz };
+  return {
+    lod: u.lod,
+    secondary: u.secondary,
+    cx: wrapCellNear(u.cx, refCx),
+    cy: wrapCellNear(u.cy, refCy),
+    cz: wrapCellNear(u.cz, refCz),
   };
 }
 
@@ -314,6 +449,12 @@ export function unpackProbeKey(key) {
  * camera.
  */
 export function probeKeyInWindow(cx, cy, cz) {
+  // Under world-absolute keying EVERY cell is representable — the window wrapped
+  // instead of clipping — so this is vacuously true. Kept as a call rather than
+  // deleted at the call sites: the checks it guards are the ones that would have
+  // to come BACK if the keying were ever reverted, and a `true` here keeps that
+  // reversion a one-line change instead of a re-derivation.
+  if (worldKeysEnabled()) return true;
   return (
     cx + KEY_AXIS_OFFSET >= 0 &&
     cy + KEY_AXIS_OFFSET >= 0 &&
@@ -689,6 +830,29 @@ export function latticeOriginFor(anchorX, anchorY, anchorZ, spacing) {
     Math.round(anchorY / spacing) * spacing,
     Math.round(anchorZ / spacing) * spacing,
   ];
+}
+
+/**
+ * The lattice origin as an INTEGER CELL INDEX. Mirror of
+ * `srcMathTsl.latticeOriginCell`.
+ */
+export function latticeOriginCellFor(anchorX, anchorY, anchorZ, spacing) {
+  return [
+    Math.round(anchorX / spacing),
+    Math.round(anchorY / spacing),
+    Math.round(anchorZ / spacing),
+  ];
+}
+
+/**
+ * THE WORLD CELL of a point, without ever dividing an absolute world coordinate.
+ * Mirror of `srcMathTsl.worldCellAt` — that function's header carries the whole
+ * argument (f32 precision, and why this is what deletes the re-anchor).
+ */
+export function worldCellAt(px, py, pz, anchorX, anchorY, anchorZ, spacing) {
+  const o = latticeOriginCellFor(anchorX, anchorY, anchorZ, spacing);
+  const local = nearestCell(px, py, pz, o[0] * spacing, o[1] * spacing, o[2] * spacing, spacing);
+  return { cx: o[0] + local.cx, cy: o[1] + local.cy, cz: o[2] + local.cz };
 }
 
 /** World position of lattice cell (cx, cy, cz). */

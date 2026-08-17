@@ -103,12 +103,15 @@ import {
   vec3,
 } from "three/tsl";
 import { CASCADE_COUNT, W0 } from "./srcConfig.js";
+import { worldKeysEnabled } from "./srcMath.js";
 import {
   cellPosition,
   keyCell,
+  keyWorldCell,
   keyLod,
   keySecondary,
   latticeOrigin,
+  latticeOriginCell,
   packProbeKey,
   probeSpacing,
 } from "./srcMathTsl.js";
@@ -167,13 +170,24 @@ export const MERGE_WORDS = 8;
  * @param {Node} options.sky  vec3 uniform: the radiance the top cascade
  *   composites. Deposited nowhere else — a per-cascade sky deposit would
  *   multiply it by the cascade count (`splitDeposits`' header).
+ * @param {Node} [options.camera]  world camera position. REQUIRED under
+ *   world-absolute keying (S1) and unused without it: a key holds
+ *   `worldCell mod 512` and the representative is resolved within ±256 cells of
+ *   the viewer, so the merge cannot turn a key back into a position without it.
  */
 export function createSrcMergeFrame(store, bins, {
   spacing0,
   anchor,
+  camera = null,
   sky,
   w0 = W0,
 } = {}) {
+  if (worldKeysEnabled() && !camera) {
+    // Loud, at build, rather than a merge that silently interpolates over the
+    // wrong lattice — see the `anchor` note above for why that class of bug is
+    // invisible to every energy check this module has.
+    throw new Error("createSrcMergeFrame: world-absolute keying needs `camera`");
+  }
   const { probeTable } = store;
   const { payload } = bins;
   const N = store.cascadeCount ?? CASCADE_COUNT;
@@ -247,7 +261,12 @@ export function createSrcMergeFrame(store, bins, {
       const lod = float(lodI).toVar();
       const secondary = keySecondary(key).toVar();
       const s = probeSpacing(c, lod, spacing0).toVar();
-      const position = cellPosition(keyCell(key), latticeOrigin(anchor, s), s).toVar();
+      // S1: under world-absolute keying the key holds a residue, so the world
+      // cell is resolved against the CAMERA (srcMathTsl.keyWorldCell) rather
+      // than added to a lattice origin. Same rule, one call.
+      const position = (worldKeysEnabled()
+        ? vec3(keyWorldCell(key, camera, s)).mul(s)
+        : cellPosition(keyCell(key), latticeOrigin(anchor, s), s)).toVar();
 
       // THE PARENT LATTICE: same LOD, next cascade — so exactly 2× the spacing.
       // The ladder climbs in cascade index and NEVER in LOD (§4.5, no cross-LOD
@@ -258,7 +277,11 @@ export function createSrcMergeFrame(store, bins, {
       const f = position.sub(originP).div(sp).toVar();
       const cell0 = floor(f).toVar();
       const t = f.sub(cell0).toVar();
+      // Same coordinate-system shift the screen gather documents: the
+      // interpolation stays local to `originP`, the KEY goes world-absolute.
+      const parentShift = worldKeysEnabled() ? latticeOriginCell(anchor, sp).toVar() : null;
       const baseCell = ivec3(int(cell0.x), int(cell0.y), int(cell0.z)).toVar();
+      if (parentShift) baseCell.assign(baseCell.add(parentShift));
       const record = uint(recordBase).add(block.mul(uint(MERGE_CORNERS))).toVar();
 
       for (let k = 0; k < MERGE_CORNERS; k++) {

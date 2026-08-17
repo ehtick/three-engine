@@ -19,13 +19,45 @@ struct BasisCompressionInfo {
     compressed: u64,
 }
 
-/// Encodes a source image to an ETC1S Basis Universal KTX2 derivative.
+/// Encodes a source image to a Basis Universal KTX2 derivative.
 /// The source remains untouched; runtime loading selects `<source>.basis`
 /// through the image's metadata and can always fall back to the original.
+///
+/// ── `mode` IS NOT COSMETIC (plan §12.78) ──────────────────────────────────
+///
+/// This command used to take a path and nothing else, and hardcoded
+/// `-linear -q 180` for every image. Both halves of that were wrong, in
+/// opposite directions, and between them they damaged a whole asset set:
+///
+///   * ETC1S is a PERCEPTUAL COLOUR codec. Pointed at a metal-rough map it
+///     crushed the metalness channel to ~0 at thread scale while the source
+///     PNG histogrammed fine (mean 0.072, 31% of texels > 0.06) — dead
+///     reflections that no SSR threshold could find. Never ETC1S a data map.
+///   * `-linear` on an sRGB map is the mirror mistake. basisu's own help:
+///     textures are converted sRGB→linear before mipmap filtering and back
+///     again *unless* `-linear` is passed, which also swaps the codec's sRGB
+///     error metric for a linear one. So every compressed albedo was
+///     mip-filtered in the wrong space with its bits spent against the wrong
+///     metric.
+///
+/// The caller picks from the asset's own metadata — see `basisModeFor` in
+/// `basisCompress.js`; `colorSpace` has been in every `.meta` since import.
+///
+///   "srgb"   — albedo, emissive, any colour map. ETC1S, sRGB metrics.
+///   "linear" — ORM / roughness / metalness / AO. UASTC, linear metrics.
+///   "normal" — tangent-space normals. UASTC with the encoder's normal tuning
+///              (`-normal_map` sets linear metrics, linear mip filtering, no
+///              selector RDO and no sRGB in one flag).
+///
+/// UASTC RDO is deliberately NOT enabled. RDO trades quality for LZ size, and
+/// UASTC transcodes to BC7 either way — so it would shrink the file on disk
+/// and buy nothing in VRAM, while giving back exactly the precision this
+/// change exists to restore. KTX2 still Zstd-compresses UASTC payloads.
 #[tauri::command]
 async fn compress_texture_basis(
     app: tauri::AppHandle,
     path: String,
+    mode: Option<String>,
 ) -> Result<BasisCompressionInfo, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let exe_name = if cfg!(windows) {
@@ -64,17 +96,21 @@ async fn compress_texture_basis(
             .ok_or("Basis encoder resource not found")?;
 
         let output_path = format!("{path}.basis");
+        // Unknown / absent mode falls back to "srgb": it is the common case and
+        // it is the one the old invocation got wrong. A data map reaching here
+        // unlabelled is a caller bug, and an ETC1S data map is loud (dead
+        // reflections) rather than silent, which is the failure we want.
+        let mode = mode.as_deref().unwrap_or("srgb");
+        let mut args: Vec<&str> = vec![path.as_str(), "-ktx2", "-mipmap"];
+        match mode {
+            "linear" => args.extend_from_slice(&["-linear", "-uastc", "-uastc_level", "2"]),
+            "normal" => args.extend_from_slice(&["-normal_map", "-uastc", "-uastc_level", "2"]),
+            // `-q` is an ETC1S-only knob and is ignored under `-uastc`.
+            _ => args.extend_from_slice(&["-q", "180"]),
+        }
+        args.extend_from_slice(&["-output_file", output_path.as_str()]);
         let result = std::process::Command::new(&encoder)
-            .args([
-                path.as_str(),
-                "-ktx2",
-                "-mipmap",
-                "-linear",
-                "-q",
-                "180",
-                "-output_file",
-                output_path.as_str(),
-            ])
+            .args(&args)
             .output()
             .map_err(|e| format!("start {}: {e}", encoder.display()))?;
         if !result.status.success() {

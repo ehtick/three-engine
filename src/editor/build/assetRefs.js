@@ -51,7 +51,7 @@ export const extOf = (path) => {
  * author's scripts is at fault.
  */
 export const ASSET_EXTENSIONS = new Set([
-  "mat", "atlas", "timeline", "audio", "cubemap", "geom", "anim",
+  "mat", "atlas", "timeline", "audio", "cubemap", "geom", "anim", "post",
   "glb", "gltf",
   "png", "jpg", "jpeg", "webp", "basis", "ktx2", "hdr", "exr",
   "ogg", "oga", "wav", "mp3", "flac", "m4a", "opus",

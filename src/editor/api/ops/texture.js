@@ -56,14 +56,6 @@ async function effectRegistry() {
   ];
 }
 
-/** "top-left" / "center" / "bottom-right" -> the 0..1 factors to place by. */
-function anchorFactors(anchor) {
-  const name = String(anchor ?? "center").toLowerCase();
-  const x = name.includes("left") ? 0 : name.includes("right") ? 1 : 0.5;
-  const y = name.includes("top") ? 0 : name.includes("bottom") ? 1 : 0.5;
-  return [x, y];
-}
-
 const describeEffect = (spec) => ({
   id: spec.id,
   label: spec.label,
@@ -173,53 +165,82 @@ defineOp({
   },
 });
 
+/** The four sizing modes, spelled out once for both resize ops. */
+const RESIZE_MODES = ["fit", "stretch", "resize", "cover", "canvas"];
+const MODE_HELP =
+  "How the size is reached: 'fit' scales inside the box keeping the aspect ratio, " +
+  "'stretch' (alias 'resize') resamples to exactly this size, 'cover' scales to fill and crops " +
+  "the overflow at the anchor, 'canvas' does not resample at all and pads/crops the frame.";
+const ANCHOR_HELP =
+  "For 'cover' and 'canvas': where the existing pixels sit in the new frame — center, " +
+  "top-left, bottom-right, or the compass ids the panel uses (c, nw, se…). Ignored by the other modes.";
+
 defineOp({
   name: "texture.resize",
   description:
-    "Resample an image to a new size, or change the canvas around it without resampling. 'resize' scales the picture; 'canvas' keeps the pixels and grows/crops the area around an anchor.",
+    "Resize one image on disk. Its layer stack (.tex) is resized with it rather than flattened, and a .basis derivative beside it is re-encoded — a KTX2 sidecar describing the old size is the file the engine would keep loading.",
   params: {
     path: { type: "string", required: true },
-    width: { type: "number", required: true, description: "Target width in pixels." },
-    height: { type: "number", required: true, description: "Target height in pixels." },
-    mode: { type: "string", default: "resize", enum: ["resize", "canvas"], description: "Resample, or re-frame." },
-    anchor: {
-      type: "string",
-      default: "center",
-      description: "Canvas mode only: where the existing pixels sit — center, top-left, bottom-right, etc.",
-    },
-    filter: { type: "string", default: "bilinear", enum: ["bilinear", "nearest"], description: "Resize sampling." },
+    width: { type: "number", description: "Target width in pixels. Omit when passing scale." },
+    height: { type: "number", description: "Target height in pixels. Omit when passing scale." },
+    scale: { type: "number", description: "Percentage of the current size — 50 halves it. Wins over width/height." },
+    mode: { type: "string", default: "resize", enum: RESIZE_MODES, description: MODE_HELP },
+    anchor: { type: "string", default: "center", description: ANCHOR_HELP },
+    filter: { type: "string", default: "bilinear", enum: ["bilinear", "nearest"], description: "Resize sampling. 'nearest' for pixel art and masks." },
   },
-  async run({ path, width, height, mode = "resize", anchor = "center", filter = "bilinear" }) {
-    requireModule();
-    const { file, doc } = await openDoc(path);
-    const { flattenDocument, documentFromBuffer } = await import("../../texture/layers.js");
-    const { transformBuffer } = await import("../../texture/transform.js");
-    const flat = flattenDocument(doc);
-
-    let out;
-    if (mode === "canvas") {
-      // Same anchor arithmetic the panel's Canvas Size dialog does, inlined
-      // rather than imported: that helper lives in a .jsx module, and pulling
-      // React into an op module to reuse six lines is a bad trade.
-      const [ax, ay] = anchorFactors(anchor);
-      out = transformBuffer(flat, {
-        width,
-        height,
-        offsetX: Math.round((width - flat.width) * ax),
-        offsetY: Math.round((height - flat.height) * ay),
-        filter: "nearest",
-      });
-    } else {
-      out = transformBuffer(flat, {
-        width,
-        height,
-        scaleX: width / flat.width,
-        scaleY: height / flat.height,
-        filter,
-      });
+  async run({ path, width, height, scale, mode = "resize", anchor = "center", filter = "bilinear" }) {
+    // Deliberately NOT gated on the texture-editor module, unlike the painting
+    // ops around it. Resizing an image file is an asset-pipeline operation —
+    // the same kind of thing as Draco-compressing a .glb — and the Assets panel
+    // offers it on any texture. Gating it would mean an agent could not do what
+    // the right-click menu right beside it does.
+    if (width == null && height == null && scale == null) {
+      throw new Error("Nothing to resize to — pass width and/or height, or scale.");
     }
-    await file.saveTextureDocument(path, documentFromBuffer(out, doc.layers[0]?.name ?? "Background"));
-    return { path, width: out.width, height: out.height, mode };
+    const { resizeTextureFile } = await import("../../textureResize.js");
+    const result = await resizeTextureFile(path, { width, height, scale, mode, anchor, filter });
+    await useProjectStore.getState().refresh();
+    return { ...result, mode };
+  },
+});
+
+defineOp({
+  name: "texture.resizeMany",
+  description:
+    "Resize a set of images in one pass — the bulk form of texture.resize, and what the Assets panel's 'Resize Images…' runs. A file that fails is reported and the rest carry on. With mode 'fit' (the default) a mixed-aspect selection stays undistorted: each image is scaled to fit the box rather than forced to the same shape.",
+  params: {
+    paths: { type: "array", required: true, items: { type: "string" }, description: "Absolute paths of the images." },
+    width: { type: "number", description: "Target width in pixels. Omit when passing scale." },
+    height: { type: "number", description: "Target height in pixels. Omit when passing scale." },
+    scale: { type: "number", description: "Percentage of each image's own size — 50 halves them all. Wins over width/height." },
+    mode: { type: "string", default: "fit", enum: RESIZE_MODES, description: MODE_HELP },
+    anchor: { type: "string", default: "center", description: ANCHOR_HELP },
+    filter: { type: "string", default: "bilinear", enum: ["bilinear", "nearest"], description: "Resize sampling. 'nearest' for pixel art and masks." },
+  },
+  async run({ paths, width, height, scale, mode = "fit", anchor = "center", filter = "bilinear" }) {
+    // Ungated for the same reason as texture.resize above.
+    if (!paths?.length) throw new Error("Nothing to resize — pass at least one path.");
+    if (width == null && height == null && scale == null) {
+      throw new Error("Nothing to resize to — pass width and/or height, or scale.");
+    }
+    const { resizeTextures } = await import("../../textureResize.js");
+    const { resized, unchanged, failed, skipped } = await resizeTextures(paths, {
+      width,
+      height,
+      scale,
+      mode,
+      anchor,
+      filter,
+    });
+    return {
+      mode,
+      resized: resized.map((r) => ({ path: r.path, from: r.from, width: r.width, height: r.height })),
+      unchanged: unchanged.map((r) => r.path),
+      failed,
+      // Non-image files in the selection: reported rather than silently dropped,
+      // because "I passed 12 paths and 9 changed" needs an explanation.
+      skipped,
+    };
   },
 });
 

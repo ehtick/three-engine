@@ -9,6 +9,8 @@ import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
 import { ensureEngine, engine, isEngineReady } from "../engineInstance.js";
 import { installEditorFramePacing } from "../editorFramePacing.js";
+import { installWheelZoom } from "../viewportZoom.js";
+import { isPickVisible } from "../pickVisibility.js";
 import {
   openBrowserPreviewUrl,
   getBrowserPreviewState,
@@ -294,6 +296,16 @@ async function ensureViewport() {
       setViewportHandle(viewport);
       viewport.orbit.enableDamping = true;
       viewport.orbit.dampingFactor = 0.12;
+      // Wheel zoom is ours: OrbitControls' dolly is a fraction of the distance
+      // to the orbit pivot, which grinds to a halt whenever the pivot is
+      // nearer than whatever you are flying at. See viewportZoom.js.
+      viewport.disposeWheelZoom?.();
+      viewport.disposeWheelZoom = installWheelZoom(canvas, {
+        getCamera: () => viewport.camera,
+        getControls: () => viewport.orbit,
+        getRoot: () => engine.scene,
+        isEnabled: () => !engine.playing,
+      });
       viewport.orbit.addEventListener("start", () => {
         viewport.orbitStartQuaternion = viewport.camera?.quaternion.clone() ?? null;
       });
@@ -1808,16 +1820,6 @@ function detachLightHelper() {
 // like it was aiming at bounding boxes instead of geometry.
 const LINE_PICK_PX = 5;
 
-/** True when `object` and every ancestor is visible. three's raycaster
- *  dropped its `visible` check years ago, so hidden entities stay clickable
- *  unless we filter them here. */
-function isPickVisible(object) {
-  for (let node = object; node; node = node.parent) {
-    if (node.visible === false) return false;
-  }
-  return true;
-}
-
 /** Solid geometry beats wireframe helpers regardless of depth. The selection
  *  outline is a LineSegments cage sitting on the *outside* of the object it
  *  brackets, so by distance it always beats the mesh it belongs to — letting
@@ -2738,6 +2740,7 @@ function handleAssetDrop(path, point) {
   if (TEXTURE_EXTENSIONS.includes(ext) || MATERIAL_EXTENSIONS.includes(ext)) {
     const hits = raycaster.intersectObjects(engine.scene.children, true);
     for (const hit of hits) {
+      if (!isPickVisible(hit.object)) continue;
       const entityId = findEntityId(hit.object);
       const entity = entityId && engine.getEntity(entityId);
       const mesh = entity?.getComponent("mesh");
@@ -2757,6 +2760,7 @@ function handleAssetDrop(path, point) {
   if (SCRIPT_EXTENSIONS.includes(ext)) {
     const hits = raycaster.intersectObjects(engine.scene.children, true);
     for (const hit of hits) {
+      if (!isPickVisible(hit.object)) continue;
       const entityId = findEntityId(hit.object);
       const entity = entityId && engine.getEntity(entityId);
       if (!entity) continue;
@@ -2787,7 +2791,7 @@ function handleAssetDrop(path, point) {
     // empty scene with the cursor still at the origin.
     const hits = raycaster.intersectObjects(engine.scene.children, true);
     let at = null;
-    const surfaceHit = hits.find((hit) => !hit.object.userData?.editorOnly);
+    const surfaceHit = hits.find((hit) => !hit.object.userData?.editorOnly && isPickVisible(hit.object));
     if (surfaceHit) {
       at = [surfaceHit.point.x, surfaceHit.point.y, surfaceHit.point.z];
     } else {
@@ -2860,6 +2864,7 @@ function placeCursorFromPointer(clientX, clientY, canvas, snapToExistingDepth) {
   const hits = raycaster.intersectObjects(engine.scene.children, true);
   for (const hit of hits) {
     if (hit.object.userData?.editorOnly) continue;
+    if (!isPickVisible(hit.object)) continue;
     return [hit.point.x, hit.point.y, hit.point.z];
   }
   // Miss: project the cursor onto a plane through the existing 3D

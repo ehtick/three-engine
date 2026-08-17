@@ -45,6 +45,7 @@ const EDITOR_LABEL = {
   mat: "Shader Graph",
   anim: "Animator",
   timeline: "Timeline",
+  post: "Post Process",
   atlas: "Atlas Editor",
   geom: "Geometry Editor",
   prefab: "Prefab Mode",

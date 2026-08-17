@@ -59,6 +59,37 @@ const TEXT_PASSTHROUGH = new Set([...PANEL_PASSTHROUGH, "ctrl+s", "ctrl+shift+s"
  */
 const CODE_PASSTHROUGH = new Set(APP_CHORDS);
 
+/**
+ * The hierarchy claims by ALLOWLIST, not by denylist.
+ *
+ * Every other scope here is a world of its own: inside the code editor or the
+ * paint canvas the scene shortcuts have no business firing at all, so they list
+ * the few keys that get *through*. The hierarchy is the opposite — it IS the
+ * scene, and Delete / Ctrl+D / Ctrl+C / Ctrl+Z must keep working with the
+ * pointer resting on a row. Spelling that as a passthrough set would mean
+ * restating every global shortcut here and re-stating it again each time one is
+ * added, with a silently dead hotkey as the failure.
+ *
+ * So it names only the chords that mean something different in a list than they
+ * do in the editor at large — select all, deselect, invert, row navigation —
+ * and everything else falls through untouched.
+ */
+const HIERARCHY_CLAIMS = new Set([
+  "ctrl+a",
+  "shift+a",
+  "ctrl+shift+a",
+  "alt+a",
+  "ctrl+i",
+  "arrowup",
+  "arrowdown",
+  "shift+arrowup",
+  "shift+arrowdown",
+  "home",
+  "end",
+  "shift+home",
+  "shift+end",
+]);
+
 const CODE_SELECTOR = ".monaco-editor";
 const TEXT_SELECTOR =
   "input, textarea, select, [contenteditable]:not([contenteditable='false'])";
@@ -72,6 +103,10 @@ const TEXT_SCOPE = { id: "text", passthrough: TEXT_PASSTHROUGH };
  * `pointer: true` means the panel also owns keys while the pointer merely rests
  * over it — correct for canvas-like surfaces where interacting doesn't move
  * focus. `pointer: false` restricts it to real DOM focus/target ancestry.
+ *
+ * A scope declares either `passthrough` (a denylist: it owns everything except
+ * these) or `claims` (an allowlist: it owns only these). See HIERARCHY_CLAIMS
+ * for when the inversion is the right shape.
  *
  * Adding a panel keymap is a row here; nothing else in the editor needs to
  * learn about it.
@@ -92,6 +127,16 @@ export const KEY_SCOPES = [
   { id: "timeline", selector: ".timeline-panel", pointer: true, passthrough: PANEL_PASSTHROUGH },
   { id: "texture", selector: ".texture-editor", pointer: true, passthrough: PANEL_PASSTHROUGH },
   { id: "audio", selector: ".audio-editor", pointer: true, passthrough: PANEL_PASSTHROUGH },
+  // Hover-owned like the canvases above: clicking a row never moves
+  // `document.activeElement`, so a focus-only test would drop these keys the
+  // moment the list was actually used.
+  {
+    id: "hierarchy",
+    selector: ".hierarchy-panel",
+    pointer: true,
+    claims: HIERARCHY_CLAIMS,
+    passthrough: PANEL_PASSTHROUGH,
+  },
 ];
 
 /**
@@ -198,6 +243,9 @@ export function activeKeyScopeElement(event) {
 export function keyScopeOwns(event) {
   const scope = activeKeyScope(event);
   if (!scope) return false;
+  // An allowlist scope owns exactly what it claims; everything else it never
+  // saw. (A denylist scope owns everything but its passthrough set.)
+  if (scope.claims) return scope.claims.has(chordOf(event));
   return !scope.passthrough.has(chordOf(event));
 }
 

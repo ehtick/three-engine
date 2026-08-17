@@ -90,6 +90,43 @@ const FPS_WINDOW_MS = 1000;
 // direction is the safe one (a saturated 512 still reads as "very fast").
 const PRESENT_RING = 512;
 
+/**
+ * The phases of one engine tick, in the order Engine.#tick runs them. Engine
+ * imports this and marks boundaries by ORDINAL (`PHASE.merging`), so the hot
+ * path never touches a string.
+ *
+ * Adding a phase means adding it here AND marking it in #tick; an unmarked
+ * phase does not vanish, it silently folds into whichever phase precedes it.
+ * That is the one failure mode of this instrument and it reads as innocence
+ * for the phase that got the blame, so keep the two lists in step.
+ */
+export const PHASES = [
+  "frustumCull",     // applyCullingSettings + frustum refresh + view-only components
+  "lod",             // LODSystem.update
+  "occlusionApply",  // OcclusionSystem.apply (reads last frame's readback)
+  "visibilityWalk",  // the per-entity visible/_lodHidden/_occluded resolve
+  "coreSystems",     // time, cameraImpulse, tweens, debug, decals, pool, paths
+  "scripts",         // update + lateUpdate callbacks
+  "audio",
+  "batching",        // BatchingSystem.sync
+  "merging",         // MergeSystem.sync
+  "impostors",
+  "occlusionRender", // OcclusionSystem.render (occluder depth pass + readback)
+  "preRender",       // preRender callbacks — GI's rebuild and gbuffer prepass live here
+  "debugFlush",
+  // ⚠ MUST STAY AFTER `preRender`. LightComponent recentres a directional
+  // light's shadow camera in an onPreRender callback, so the shadow camera is
+  // not final until that phase has run — see shadowFreeze.js.
+  "shadowFreeze",    // ShadowFreezeSystem.update (caster + shadow-camera fingerprint)
+  "renderEncode",    // renderer.render / postprocess override: WebGPU command encoding
+  "postRender",      // postRender callbacks (editor overlays)
+];
+
+/** Ordinal lookup, so call sites read as `PHASE.merging` rather than `8`. */
+export const PHASE = Object.freeze(
+  PHASES.reduce((map, name, i) => ((map[name] = i), map), {}),
+);
+
 export class StatsSystem {
   constructor(engine) {
     this.engine = engine;
@@ -150,6 +187,15 @@ export class StatsSystem {
     this._skippedTimes = new Float64Array(PRESENT_RING);
     this._skippedHead = 0;
     this._skippedFilled = 0;
+
+    // CPU phase profiler. Disarmed by default: `markPhase` returns on the
+    // first line, so an unprofiled frame pays one boolean test per phase.
+    this._phaseTotals = new Float64Array(PHASES.length);
+    this._phaseArmed = false;
+    this._phaseFramesTarget = 0;
+    this._phaseFramesDone = 0;
+    this._phaseIndex = -1;
+    this._phaseLast = 0;
 
     this._unsubUpdate = null;
     this._lastTickStart = 0;
@@ -243,6 +289,146 @@ export class StatsSystem {
   recordFrameWorkMs(ms) {
     const previous = this.readout.workMs;
     this.readout.workMs = previous === 0 ? ms : 0.1 * ms + 0.9 * previous;
+  }
+
+  // ---------------------------------------------------------------------
+  // CPU PHASE PROFILER
+  //
+  // The GPU side of a frame has had two instruments for a while
+  // (profile.giPasses, profile.renderPasses) and the CPU side has had ONE
+  // AGGREGATE NUMBER: `workMs`. That asymmetry is how a CPU-bound scene gets
+  // diagnosed as a shader problem — every question about where the tick goes
+  // could only be answered by subtraction, and this codebase has already lost
+  // three sessions to an arithmetic residual being mistaken for evidence.
+  //
+  // Cost when disarmed is one integer compare in `markPhase`. Nothing here
+  // allocates on the hot path: the accumulators are a preallocated
+  // Float64Array indexed by the PHASES table, and phase names are resolved
+  // only when the capture is read.
+  // ---------------------------------------------------------------------
+
+  /**
+   * Arm the phase profiler for the next `frames` ticks. Accumulates total ms
+   * per phase plus a frame count, so the reader reports a mean rather than one
+   * sampled frame — a single tick on a scene with GC pauses is not a
+   * measurement.
+   */
+  beginPhaseCapture(frames = 60) {
+    this._phaseTotals.fill(0);
+    this._subTotals?.clear();
+    this._subName = null;
+    this._phaseFramesTarget = Math.max(1, Math.round(frames));
+    this._phaseFramesDone = 0;
+    this._phaseLast = 0;
+    this._phaseIndex = -1;
+    this._phaseArmed = true;
+  }
+
+  /**
+   * Open a named SUB-phase inside the current phase, closing the previous one.
+   *
+   * `PHASES` is a fixed table owned by the engine, which is right for the tick's
+   * own structure and useless for a MODULE: `preRender` is one ordinal covering
+   * every registered callback, and on the scene this was added for it was 25 ms
+   * of a 54 ms CPU frame with no way to ask what inside it was expensive. A
+   * module cannot add to `PHASES` without the engine knowing its name, so it
+   * marks free-form sub-phases here instead and the reader nests them under
+   * whatever phase was open.
+   *
+   * ⚠ Same trap as `markPhase`: an UNMARKED span does not read as zero, it folds
+   * into the sub-phase before it. Mark the boundary after the last thing you
+   * want attributed, and `markSub(null)` to close out into unattributed time.
+   *
+   * Disarmed cost is one boolean test — the Map is only touched during a
+   * capture, so nothing allocates on a normal frame.
+   */
+  markSub(name) {
+    if (!this._phaseArmed) return;
+    const now = performance.now();
+    if (this._subName !== null) {
+      const totals = (this._subTotals ??= new Map());
+      totals.set(this._subName, (totals.get(this._subName) ?? 0) + (now - this._subLast));
+    }
+    this._subName = name;
+    this._subLast = now;
+  }
+
+  /** True once the armed capture has collected every frame it asked for. */
+  phaseCaptureComplete() {
+    return !this._phaseArmed && this._phaseFramesDone > 0;
+  }
+
+  /**
+   * Close the previous phase and open `index`. Called from Engine.#tick at
+   * each phase boundary. `index` is a PHASES ordinal, never a string, so the
+   * hot path does no hashing and no allocation.
+   */
+  markPhase(index) {
+    if (!this._phaseArmed) return;
+    // ⚠ A SUB-PHASE MAY NOT OUTLIVE ITS PHASE, and this is the only place that
+    // can enforce it. A module marks sub-phases inside its callback and has no
+    // hook that reliably runs on the way out — GI's tick alone has a dozen early
+    // returns — so the last sub-phase it opened stayed open and swallowed
+    // everything that came after. Measured on the first capture: `gi.screenChain`
+    // reported **22.8 ms inside a 7.5 ms preRender**, because it had absorbed the
+    // whole of `renderEncode`. That is the same "an unmarked span folds into the
+    // span before it" trap the phase table itself documents, one level down —
+    // and a sub-phase larger than its parent is the one symptom that makes it
+    // obvious, so closing here is what keeps the numbers self-checking.
+    this.markSub(null);
+    const now = performance.now();
+    if (this._phaseIndex >= 0) this._phaseTotals[this._phaseIndex] += now - this._phaseLast;
+    this._phaseIndex = index;
+    this._phaseLast = now;
+  }
+
+  /**
+   * Close the frame's last open phase and count the frame. Called once at the
+   * very end of #tick — INCLUDING on the early-return paths, because a tick
+   * that skipped the draw still spent its update phase and dropping it would
+   * make a suspended-wave frame look free.
+   */
+  endPhaseFrame() {
+    if (!this._phaseArmed) return;
+    // Sub-phases first: a module that returned early may still have one open,
+    // and closing it after the frame count would attribute it to the next frame.
+    this.markSub(null);
+    if (this._phaseIndex >= 0) {
+      this._phaseTotals[this._phaseIndex] += performance.now() - this._phaseLast;
+    }
+    this._phaseIndex = -1;
+    this._phaseFramesDone++;
+    if (this._phaseFramesDone >= this._phaseFramesTarget) this._phaseArmed = false;
+  }
+
+  /**
+   * The capture, as { frames, totalMs, phases: [{ name, ms, pct }] } sorted
+   * costliest first. `ms` is the mean per frame.
+   */
+  readPhaseCapture() {
+    const frames = this._phaseFramesDone || 1;
+    const phases = PHASES.map((name, i) => ({
+      name,
+      ms: +(this._phaseTotals[i] / frames).toFixed(3),
+    }));
+    const totalMs = phases.reduce((sum, p) => sum + p.ms, 0);
+    for (const p of phases) p.pct = totalMs > 0 ? +((100 * p.ms) / totalMs).toFixed(1) : 0;
+    phases.sort((a, b) => b.ms - a.ms);
+    // Sub-phases are reported as their own ranked list rather than nested under
+    // a parent, because a module marks them wherever it likes and inferring the
+    // parent from mark order would be a guess. They sum to LESS than their
+    // phase — whatever the module did not mark stays unattributed, which is the
+    // honest answer and the one that says "keep looking".
+    const subPhases = [...(this._subTotals ?? new Map())]
+      .map(([name, ms]) => ({ name, ms: +(ms / frames).toFixed(3) }))
+      .sort((a, b) => b.ms - a.ms);
+    return {
+      frames: this._phaseFramesDone,
+      totalMs: +totalMs.toFixed(3),
+      complete: !this._phaseArmed,
+      phases,
+      subPhases,
+    };
   }
 
   /**

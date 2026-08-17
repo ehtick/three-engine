@@ -439,7 +439,17 @@ function applyStockPbr(entry, material, stock, generation) {
 
   material.roughness = stock.roughness ?? 0.5;
 
-  material.metalness = stock.metalness ?? 0;
+  // ⚠ METALNESS IS HELD AT 0 UNTIL ITS MAP ARRIVES, and this is not caution —
+  // it is a rendering bug that shipped. `matchStockPbr` pins the factor to 1
+  // when the channel is wired (three composes `metalness * metalnessMap.b`, so
+  // any other factor would not equal the graph). But the map loads
+  // ASYNCHRONOUSLY, so between here and its arrival the material is a perfect
+  // mirror with nothing bound — and a mirror in a scene with no environment
+  // and no ambient renders BLACK with specular sparkle. The graph path never
+  // had this window because it awaited every texture before compiling.
+  //
+  // Roughness needs no such guard: its pinned factor is 1, which is matte.
+  material.metalness = stock.metalnessMap ? 0 : (stock.metalness ?? 0);
 
   material.ior = stock.ior ?? 1.5;
 
@@ -449,33 +459,53 @@ function applyStockPbr(entry, material, stock, generation) {
 
   material.normalScale?.set(stock.normalScale, stock.normalScale);
 
-  const assign = (slot, path) => {
+  // Every slot this material wants, loaded together and announced ONCE.
+  //
+  // ⚠ ONE NOTIFY PER MATERIAL, NOT ONE PER TEXTURE. `notifyMaterial` makes
+  // every subscriber re-adopt the material, and the ORM pair took a two-slot
+  // material to four — on an imported city that turned startup into a visible
+  // minute of materials resolving one at a time. The slots still load in
+  // parallel; only the announcement is coalesced.
+  //
+  // The ORM pair usually resolves to the SAME path, and `loadShaderTexture` is
+  // cached by path, so this binds one texture twice rather than decoding it
+  // twice — and it is the same instance the graph path would have sampled.
+  const slots = [
+    ["map", stock.map],
+    ["normalMap", stock.normalMap],
+    ["roughnessMap", stock.roughnessMap],
+    ["metalnessMap", stock.metalnessMap],
+  ];
 
+  const pending = [];
+  for (const [slot, path] of slots) {
     if (!path) {
-
       material[slot] = null;
-
-      return;
-
+      continue;
     }
+    pending.push(
+      loadShaderTexture(path)
+        .then((texture) => {
+          if (generation !== entry.generation) return;
+          material[slot] = texture;
+        })
+        .catch((err) => console.error(`Material texture "${path}": ${err.message}`)),
+    );
+  }
 
-    loadShaderTexture(path)
-      .then((texture) => {
-        if (generation !== entry.generation) return;
-        material[slot] = texture;
-        material.needsUpdate = true;
-        // Same second notify the def-map path does: subscribers that adopted
-        // the material before the async texture landed re-read it now.
-        entry.renderable = computeRenderable(entry.def?.shaderGraph);
-        notifyMaterial(entry.path);
-      })
-      .catch((err) => console.error(`Material texture "${path}": ${err.message}`));
-
-  };
-
-  assign("map", stock.map);
-
-  assign("normalMap", stock.normalMap);
+  if (pending.length) {
+    Promise.all(pending).then(() => {
+      if (generation !== entry.generation) return;
+      // Now — and only now — is the pinned factor safe to apply. See the
+      // metalness note above.
+      if (stock.metalnessMap && material.metalnessMap) material.metalness = stock.metalness ?? 1;
+      material.needsUpdate = true;
+      // The same notify the def-map path does: subscribers that adopted the
+      // material before its textures landed re-read it here.
+      entry.renderable = computeRenderable(entry.def?.shaderGraph);
+      notifyMaterial(entry.path);
+    });
+  }
 
   material.needsUpdate = true;
 

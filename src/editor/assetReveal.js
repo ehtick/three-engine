@@ -21,8 +21,20 @@ export const useAssetRevealStore = vmSingleton("assetRevealStore", () => create(
   // Bumped on every reveal so asking for the SAME asset twice still re-scrolls
   // and re-flashes the ring.
   token: 0,
-  reveal: (path) => set((state) => ({ path, token: state.token + 1 })),
-  clear: () => set({ path: null }),
+  /**
+   * Whether this reveal should also take keyboard focus.
+   *
+   * Off by default, and that default is the inspector's: clicking a material
+   * slot must not yank focus out of the field you clicked. Quick search asks
+   * for it, because there the reveal IS the user's whole gesture and the next
+   * thing they press (Enter, to open) has to land on the grid. Focus beats
+   * hover in `keyScope`, and after a modal closes the pointer is wherever it
+   * was left — so without this the follow-up keystroke goes nowhere.
+   */
+  focus: false,
+  reveal: (path, { focus = false } = {}) =>
+    set((state) => ({ path, focus, token: state.token + 1 })),
+  clear: () => set({ path: null, focus: false }),
 })));
 
 const norm = (p) => String(p ?? "").replaceAll("\\", "/").replace(/\/$/, "").toLowerCase();

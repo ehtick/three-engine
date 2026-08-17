@@ -9,6 +9,7 @@ import {
   ANIMATOR_EXTENSIONS,
   TIMELINE_EXTENSIONS,
   GEOMETRY_EXTENSIONS,
+  POST_EXTENSIONS,
   AUDIO_EXTENSIONS,
 } from "./assetLoader.js";
 import { useProjectStore, basename } from "./store/projectStore.js";
@@ -66,6 +67,7 @@ export function hasAssetEditor(path) {
     PREFAB_EXTENSIONS.includes(ext) ||
     ANIMATOR_EXTENSIONS.includes(ext) ||
     TIMELINE_EXTENSIONS.includes(ext) ||
+    POST_EXTENSIONS.includes(ext) ||
     ENVIRONMENT_EXTENSIONS.includes(ext) ||
     MATERIAL_EXTENSIONS.includes(ext) ||
     GEOMETRY_EXTENSIONS.includes(ext) ||
@@ -97,6 +99,11 @@ export function openAssetPath(path, { isDir = false } = {}) {
   } else if (TIMELINE_EXTENSIONS.includes(ext)) {
     useSelectionStore.getState().selectAsset(path);
     import("./EditorShell.jsx").then((m) => m.openPanel("timeline"));
+  } else if (POST_EXTENSIONS.includes(ext)) {
+    // The Post Process panel edits whichever `.post` is selected, exactly as
+    // the Timeline panel follows the selected `.timeline`.
+    useSelectionStore.getState().selectAsset(path);
+    import("./EditorShell.jsx").then((m) => m.openPanel("postprocess"));
   } else if (isEditableAudio(ext)) {
     useSelectionStore.getState().selectAsset(path);
     import("./EditorShell.jsx").then((m) => m.openPanel("audioEditor"));

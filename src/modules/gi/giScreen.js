@@ -33,6 +33,8 @@ import {
   Loop,
   abs,
   atomicAdd,
+  atomicLoad,
+  atomicStore,
   cos,
   float,
   fract,
@@ -225,6 +227,89 @@ export function renderGiGBuffer(renderer, scene, camera, gbuffer, { mirrorMask =
 }
 
 /**
+ * §13 F3 — the far-field average: "what indirect light looks like around
+ * here", reduced to ONE value the resolve can afford to read per pixel.
+ *
+ * Two tiny dispatches appended to the SRC pass list right after the screen
+ * gather (whose output texture is the source — the gather stores `vec4(E, 1)`
+ * per valid gbuffer texel):
+ *
+ *   accum — one thread per gather texel; LIT texels (w = 1, luminance above
+ *           a hair) fixed-point-atomic their RGB into a 4-word buffer.
+ *           Lit-only is load-bearing: the crushed out-of-volume pixels this
+ *           term exists to fix must not drag their own fallback toward black.
+ *   ema   — one thread; averages, EMAs at α = 0.05 (~1.3 s at 60 fps — slow
+ *           enough to hide view churn, fast enough to track a lamp toggle),
+ *           stores to a 1×1 texture, and resets the accumulators for the
+ *           next frame. Fewer than 64 lit texels keeps last frame's answer:
+ *           a boot frame or a camera buried in a wall must not zero the far
+ *           field. The dispatch split is the synchronization — no workgroup
+ *           barriers, same idiom as the occupancy surface reducer.
+ *
+ * The 1×1 OUT TEXTURE is caller-owned and persistent (GISystem keeps it
+ * across rebuilds/resizes exactly like the irradiance targets): a TEXTURE
+ * because the resolve sits at the portable eight-storage-buffer limit and
+ * texture bindings are free of it. Fixed point is ×256 with a per-texel
+ * clamp at 32 — headroom for an average E of ~10 over 1.6 M texels before
+ * a u32 could wrap.
+ */
+export function createGiFarFieldAvgPass({ source, width, height, out }) {
+  const srcNode = texture(source);
+  const FX = 256;
+  const accum = instancedArray(new Uint32Array(4), "uint").toAtomic();
+  const ema = instancedArray(new Float32Array(4), "float");
+  const widthU = uint(width);
+  const computeAccum = Fn(() => {
+    const i = instanceIndex;
+    const coord = ivec2(i.mod(widthU).toInt(), i.div(widthU).toInt());
+    const t = srcNode.load(coord).toVar();
+    const lum = t.x.mul(0.2126).add(t.y.mul(0.7152)).add(t.z.mul(0.0722));
+    If(t.w.greaterThan(0.5).and(lum.greaterThan(0.001)), () => {
+      atomicAdd(accum.element(uint(0)), t.x.min(32).mul(FX).toUint());
+      atomicAdd(accum.element(uint(1)), t.y.min(32).mul(FX).toUint());
+      atomicAdd(accum.element(uint(2)), t.z.min(32).mul(FX).toUint());
+      atomicAdd(accum.element(uint(3)), uint(1));
+    });
+  })().compute(width * height);
+  const computeEma = Fn(() => {
+    const count = atomicLoad(accum.element(uint(3))).toVar();
+    If(count.greaterThan(uint(64)), () => {
+      const inv = float(1).div(count.toFloat().mul(FX));
+      const avg = vec3(
+        atomicLoad(accum.element(uint(0))).toFloat().mul(inv),
+        atomicLoad(accum.element(uint(1))).toFloat().mul(inv),
+        atomicLoad(accum.element(uint(2))).toFloat().mul(inv),
+      ).toVar();
+      const primed = ema.element(uint(3)).toVar();
+      const alpha = select(primed.greaterThan(0.5), float(0.05), float(1));
+      const next = mix(
+        vec3(ema.element(uint(0)), ema.element(uint(1)), ema.element(uint(2))),
+        avg,
+        alpha,
+      ).toVar();
+      ema.element(uint(0)).assign(next.x);
+      ema.element(uint(1)).assign(next.y);
+      ema.element(uint(2)).assign(next.z);
+      ema.element(uint(3)).assign(1);
+      // PUBLISH SHAPED, ACCUMULATE RAW. The raw average of a bulb-lit street
+      // is saturated lavender, and at street level the far field is MOST of
+      // the frame — the first live look read as purple fog (2026-08-16).
+      // Materials multiply this irradiance by their own albedo, so far
+      // surfaces keep their color variation; what must go is the TINT and
+      // the full-strength energy: keep 35% of the chroma, damp to 60%.
+      const pubLum = next.x.mul(0.2126).add(next.y.mul(0.7152)).add(next.z.mul(0.0722));
+      const shaped = mix(vec3(pubLum), next, 0.35).mul(0.6);
+      textureStore(out, ivec2(0, 0), vec4(shaped, 1));
+    });
+    atomicStore(accum.element(uint(0)), uint(0));
+    atomicStore(accum.element(uint(1)), uint(0));
+    atomicStore(accum.element(uint(2)), uint(0));
+    atomicStore(accum.element(uint(3)), uint(0));
+  })().compute(1);
+  return { computeAccum, computeEma };
+}
+
+/**
  * The resolve pass: one compute over screen pixels that turns the gbuffer
  * into the two textures materials read.
  *
@@ -289,8 +374,20 @@ export function renderGiGBuffer(renderer, scene, camera, gbuffer, { mirrorMask =
  * an exact-reflection hit is lit by its direct terms alone. Every other term
  * here — emitter direct, analytic direct, reflections, sun shadows — is
  * independent of it and keeps working.
+ *
+ * `farField` (§13 F3, optional — only passed when the detail volume is armed):
+ * `{ node, worldMin, worldSize, feather }`. Surfaces outside the camera-
+ * following detail box have no probes, no occupancy and no surface records —
+ * without this term their indirect is an ACCIDENTAL zero (F0 measured them
+ * crushed black). The term replaces the diffuse indirect with a hemispherical
+ * constant — the far-field average texture × a sky-down cosine — feathered in
+ * across the last `feather` metres inside the boundary. Direct sun, analytic
+ * lights and their traced shadows are volume-independent and untouched; the
+ * mix runs BEFORE those terms are added. `worldMin`/`worldSize` are the
+ * volume's LIVE world uniforms, so every F2 slide moves the feather with the
+ * box for free.
  */
-export function createGiResolve({ gbuffer, targets, width, height, gather = null, screenGather = null, cameraPosition = null, normalOffset, intensity, emitter, radiance = null, bvhShade = null, ao = null, rawCopy = null, emitterTileCut = null }) {
+export function createGiResolve({ gbuffer, targets, width, height, gather = null, screenGather = null, cameraPosition = null, normalOffset, intensity, emitter, radiance = null, bvhShade = null, ao = null, rawCopy = null, emitterTileCut = null, farField = null }) {
   // The TARGETS are owned by the caller and outlive every rebuild: materials
   // sample them through persistent texture nodes, so recreating them here
   // would silently leave already-compiled materials bound to dead textures.
@@ -458,6 +555,32 @@ export function createGiResolve({ gbuffer, targets, width, height, gather = null
         const obscurance = occAcc.div(norm.max(1e-4)).mul(float(ao.strength)).clamp(0, 1);
         out.mulAssign(obscurance.oneMinus());
       }
+      // ── §13 F3: THE FAR FIELD IS DELIBERATE, NOT AN ACCIDENT ────────────
+      // Runs AFTER the AO block on purpose: the AO oracle's occupancy taps
+      // are undefined outside the volume, and a fallback multiplied by a
+      // broken obscurance would re-crush exactly the pixels this term
+      // exists to lift. Runs BEFORE the direct terms below, which must
+      // survive at any distance.
+      if (screenGather && farField) {
+        const rel = vec3(P).sub(vec3(farField.worldMin)).toVar();
+        const size = vec3(farField.worldSize).toVar();
+        // Signed inside-distance to the box: negative outside, so the clamp
+        // sends w to 1 there and the whole diffuse term becomes the constant.
+        const inside = rel.x.min(size.x.sub(rel.x))
+          .min(rel.y.min(size.y.sub(rel.y)))
+          .min(rel.z.min(size.z.sub(rel.z)))
+          .toVar();
+        const w = float(1).sub(inside.div(float(farField.feather).max(1e-3)).clamp(0, 1)).toVar();
+        If(w.greaterThan(0), () => {
+          // Sky-down hemisphere with a ground-bounce floor: up-facing 1.0,
+          // walls 0.6, down-facing 0.2 — the average already contains the
+          // scene's own ground bounce, so a hard cosine would starve awnings
+          // and soffits for no physical reason.
+          const hemi = N.y.mul(0.4).add(0.6);
+          const constant = farField.node.load(ivec2(0, 0)).xyz.mul(hemi).mul(intensity);
+          out.assign(mix(out, constant, w));
+        });
+      }
       if (radiance?.lookup && cameraPosition) {
         const incident = P.sub(cameraPosition).normalize().toVar();
         const reflected = reflect(incident, N).toVar();
@@ -483,6 +606,7 @@ export function createGiResolve({ gbuffer, targets, width, height, gather = null
         // — its tile is not this pixel's — and its emitter direct ships
         // unshadowed anyway (§12.56.1).
         let slotSource = emitter;
+        let tileComp = null;
         if (emitterTileCut) {
           const spx = px.toFloat().add(0.5).mul(emitterTileCut.scaleX);
           const spy = py.toFloat().add(0.5).mul(emitterTileCut.scaleY);
@@ -493,12 +617,29 @@ export function createGiResolve({ gbuffer, targets, width, height, gather = null
           const tileSlots = [0, 1, 2, 3].map((k) =>
             emitterTileCut.recordSlot(emitterTileCut.idBuf.element(tile.mul(4).add(uint(k)))));
           slotSource = { ...emitter, emitterSlots: tileSlots };
+          // §12.70 W4c: the cut's tail compensation. The kept four carry the
+          // dropped tail's power, so the tile delivers the FULL set's energy
+          // — which is what makes two tiles that kept DIFFERENT sets agree at
+          // their shared boundary: A gives kept_A · (Σ/kept_A) = Σ and B
+          // gives Σ, where uncompensated they gave kept_A ≠ kept_B.
+          //
+          // ⚠ THE RATIO IS PAIRED WITH ITS OWN TILE'S SET AND MUST STAY
+          // NEAREST. Interpolating it across tile centres (the obvious
+          // "smooth the seam away" move) hands tile A's kept sum tile B's
+          // divisor and re-opens the step it just closed, WIDER — the
+          // boundary pixel would deliver kept_A · (Σ/kept_A + Σ/kept_B)/2.
+          // Continuity here comes from the pairing, not from blurring.
+          if (emitterTileCut.posBuf) {
+            tileComp = emitterTileCut.posBuf.element(tile.mul(2).add(uint(1))).w.toVar();
+          }
         }
         const direct = emitterDirectAt(
           { ...slotSource, shadowSample: (i) => shadowChannels[i] ?? float(1) },
           P, N, samplePoint,
         );
-        out.addAssign(direct.irradiance.mul(intensity));
+        out.addAssign(
+          tileComp ? direct.irradiance.mul(intensity).mul(tileComp) : direct.irradiance.mul(intensity),
+        );
       }
       // GI-traced direct shadows moved to their OWN pass — see
       // createGiLightShadowPass below (independent pixel budget; the trace
@@ -612,7 +753,7 @@ export function createGiResolve({ gbuffer, targets, width, height, gather = null
  * Its pixel count is therefore its own budget (GISystem #lightShadowSize),
  * and the gbuffer is read at nearest-texel through the resolution ratio.
  */
-export function createGiLightShadowPass({ gbuffer, lightShadow, width, height, resolveWidth, resolveHeight, frame = null }) {
+export function createGiLightShadowPass({ gbuffer, lightShadow, width, height, resolveWidth, resolveHeight, frame = null, checker = null }) {
   const widthU = uniform(width, "uint");
   const positionNode = texture(gbuffer.position);
   const normalNode = texture(gbuffer.normal);
@@ -620,8 +761,28 @@ export function createGiLightShadowPass({ gbuffer, lightShadow, width, height, r
   const sy = resolveHeight / height;
 
   const compute = Fn(() => {
-    const px = instanceIndex.mod(widthU);
-    const py = instanceIndex.div(widthU);
+    // ── CHECKERBOARD TRACE (§12.80 Unit B) ───────────────────────────────────
+    // With a `checker` uniform (0/1, advanced every frame by GISystem), each
+    // dispatch traces HALF the pixels — the half whose (x+y) parity matches —
+    // and the other half keeps last frame's texel (the raw/dist targets are
+    // persistent; skipping the store IS the fill). The filter's temporal
+    // accumulation integrates the two phases exactly as it already integrates
+    // the frame-jittered disc samples. THE DISPATCH HALVES, NOT THE LANES: an
+    // in-kernel `If(parity)` skip leaves every warp half-active through the
+    // whole BVH descent and saves almost nothing — each thread here maps to
+    // one traced cell instead, so warps stay dense. `px` clamps rather than
+    // guards on an odd width: the worst case re-traces one edge texel.
+    let px, py;
+    if (checker) {
+      const halfW = widthU.add(uint(1)).div(uint(2));
+      py = instanceIndex.div(halfW);
+      px = instanceIndex.mod(halfW).mul(uint(2))
+        .add(py.add(checker).bitAnd(uint(1)))
+        .min(widthU.sub(uint(1)));
+    } else {
+      px = instanceIndex.mod(widthU);
+      py = instanceIndex.div(widthU);
+    }
     const coord = ivec2(px.toInt(), py.toInt());
     // Nearest gbuffer texel at the (usually finer) resolve resolution.
     const gCoord = ivec2(
@@ -854,7 +1015,7 @@ export function createGiLightShadowPass({ gbuffer, lightShadow, width, height, r
       coord,
       vec4(lightShadowVars[0], lightShadowVars[1], lightShadowVars[2], lightShadowVars[3]),
     );
-  })().compute(width * height);
+  })().compute((checker ? Math.ceil(width / 2) : width) * height);
 
   return { compute, widthU };
 }
@@ -1008,9 +1169,30 @@ export function createGiEmitterTileCutPass({
   const tilesX = Math.ceil(width / tileSize);
   const tilesY = Math.ceil(height / tileSize);
   const tileCount = tilesX * tilesY;
+  // §12.70 W4c — TAIL COMPENSATION CAP. A top-4 cut without compensation is
+  // the seam: neighbouring tiles that keep DIFFERENT sets drop DIFFERENT
+  // tails, and the missing energy steps at the boundary. `Σimp / Σimp(kept)`
+  // is Walter's lightcuts answer — the kept representatives carry the tail's
+  // power, so the delivered TOTAL is continuous even where the SET is not.
+  // Capped because the ratio is N/4 when every emitter matters equally, and
+  // an uncapped multiply would turn a 40-lamp tile's four survivors into
+  // ten-times-too-bright pinpoints. `__giTileCutCompensate = 1` disables it
+  // (the A/B arm), a number raises/lowers the cap.
+  //
+  // ⚠ THE TAIL RIDES THE KEPT LAMPS' VISIBILITY, NOT ITS OWN. `importance`
+  // has no occlusion term, so a dropped lamp behind a wall still counts
+  // toward Σ and its energy arrives through whichever lamps the pixel did
+  // keep. Measured harmless where the tail is genuinely visible (the emissive
+  // storm: p50 1.17, mean +2.7% canvas energy over the uncompensated arm);
+  // the cap is 2 rather than the natural N/4 precisely to bound what that
+  // assumption can cost in a room-partitioned scene, and clipping
+  // under-delivers, which is the safe direction. An occlusion-aware tail is
+  // the honest fix and is not in this slice.
+  const compCapRaw = Number(globalThis.__giTileCutCompensate);
+  const compCap = Number.isFinite(compCapRaw) ? Math.max(1, compCapRaw) : 2;
   // Two buffers, no bit-casting: TWO vec4 floats per tile — [P.xyz, valid]
-  // then [N.xyz, 0] (the rig's CPU mirror re-ranks at this exact receiver,
-  // and the importance needs BOTH) — plus 4 u32 ids per tile.
+  // then [N.xyz, compensation] (the rig's CPU mirror re-ranks at this exact
+  // receiver, and the importance needs BOTH) — plus 4 u32 ids per tile.
   const posBuf = instancedArray(new Float32Array(tileCount * 8), "vec4");
   const idBuf = instancedArray(new Uint32Array(tileCount * 4), "uint");
   const tilesXU = uniform(tilesX, "uint");
@@ -1033,6 +1215,7 @@ export function createGiEmitterTileCutPass({
     const ids = [0, 1, 2, 3].map(() => uint(0xffffffff).toVar());
     const imps = [0, 1, 2, 3].map(() => float(0).toVar());
     const outN = vec3(0, 1, 0).toVar();
+    const impTotal = float(0).toVar();
     If(g0.w.greaterThan(0.5), () => {
       const P = g0.xyz.toVar();
       const rawN = g1.xyz.normalize().toVar();
@@ -1041,8 +1224,15 @@ export function createGiEmitterTileCutPass({
         : float(1);
       const N = rawN.mul(facing).toVar();
       outN.assign(N);
+      // §12.70 W5: the bound is a NODE when the caller passes one — a live
+      // tree refresh (a lamp moved, a mesh went invisible) can change the
+      // emitter count without a GI rebuild, and a baked constant would then
+      // either walk records the new tree no longer has or stop short of the
+      // ones it does. `uint()` of a number still bakes, so the static callers
+      // and the fixtures are unchanged.
       Loop({ start: uint(0), end: uint(emitterCount), type: "uint", condition: "<" }, ({ i }) => {
         const imp = float(importance(P, N, float(1), uint(baseWord), i)).toVar();
+        impTotal.addAssign(imp);
         // Predicated 4-slot insertion, strict `>`: ties keep the EARLIER id
         // in the higher rank — the rig's CPU mirror replicates exactly this.
         If(imp.greaterThan(imps[0]), () => {
@@ -1071,8 +1261,18 @@ export function createGiEmitterTileCutPass({
       ids[b].assign(select(doSwap, t, ids[b]));
     };
     cswap(0, 1); cswap(2, 3); cswap(0, 2); cswap(1, 3); cswap(1, 2);
+    // The compensation rides in the normal vec4's free `.w` — one scalar per
+    // tile, written whether or not the consumer is armed so the rig can read
+    // the distribution back on either arm. `kept` sums the SELECTION, which
+    // the id-sort above only permutes; an empty seat contributes its 0.
+    const kept = imps[0].add(imps[1]).add(imps[2]).add(imps[3]).toVar();
+    const comp = select(
+      kept.greaterThan(0),
+      impTotal.div(kept.max(1e-30)).clamp(1, compCap),
+      float(1),
+    );
     posBuf.element(instanceIndex.mul(2)).assign(vec4(g0.xyz, select(g0.w.greaterThan(0.5), float(1), float(0))));
-    posBuf.element(instanceIndex.mul(2).add(uint(1))).assign(vec4(outN, 0));
+    posBuf.element(instanceIndex.mul(2).add(uint(1))).assign(vec4(outN, comp));
     for (let k = 0; k < 4; k++) {
       idBuf.element(instanceIndex.mul(4).add(uint(k))).assign(ids[k]);
     }
@@ -1080,7 +1280,7 @@ export function createGiEmitterTileCutPass({
 
   // importance/baseWord/emitterCount ride along so a viewport resize can
   // rebuild at new tile dims without re-deriving the tree plumbing.
-  return { compute, tilesX, tilesY, tileSize, tileCount, posBuf, idBuf, importance, baseWord, emitterCount };
+  return { compute, tilesX, tilesY, tileSize, tileCount, posBuf, idBuf, importance, baseWord, emitterCount, compCap };
 }
 
 /**
@@ -1695,7 +1895,45 @@ export function createGiBvhReflect({
   gbuffer, target, colorTarget, width, height, bvhScene,
   cameraPosition, normalOffset, maxDistance, mask = true,
 }) {
+  // ── ONE RAY PER stride×stride BLOCK (2026-08-16) ────────────────────────────
+  //
+  // MEASURED: this pass is **13.09 ms of a 31.85 ms ultra frame** on the banner
+  // Sponza (`profile.giPasses`, 1588×898) — 41 % of the frame, and by far the
+  // most expensive thing GI does. It was invisible for three sessions because
+  // it was missing from that op's pass list.
+  //
+  // A BVH traversal per pixel is what costs; the STORES are nearly free. So
+  // trace one ray per block and replicate the result across the block, which
+  // keeps every target full-resolution and therefore needs NO change in any
+  // consumer — the resolve reads these with `load(coord)` on its own full-res
+  // grid (createGiResolve's `bvhShade`) and materials sample by `screenUV`. A
+  // genuinely half-res TEXTURE would have required touching both.
+  //
+  // Replication is VALIDATED, not blind: each neighbour's gbuffer position and
+  // normal are compared against the traced texel's, and a texel that fails
+  // (the block straddles a silhouette) is written as a MISS rather than given
+  // its neighbour's hit distance. That matters because the consumer
+  // reconstructs the hit point from this `t` and its OWN normal — a wrong `t`
+  // puts the reflected sample somewhere else entirely, which is the bright
+  // smear half-res reflections are known for. A miss is not a hole: it is the
+  // same value a masked-off pixel gets, and the material falls back to the
+  // cascade lookup exactly as it does everywhere else.
+  //
+  // MEASURED on the banner Sponza at 1588×898: 13.09 ms per-pixel → 4.23 ms at
+  // stride 2 → 3.84 ms at stride 3. The curve flattens because the validation
+  // taps and the stores grow with the block while only the TRACES shrink, so
+  // stride 3 is the practical floor; past it the block starts spanning enough
+  // surface that the position/normal check rejects most neighbours and the
+  // reflection quietly degrades to the cascade lookup for no further speed.
+  //
+  // `__giBvhReflectStride` is the A/B hatch; 1 restores per-pixel tracing.
+  const rawStride = Number(globalThis.__giBvhReflectStride);
+  const stride = Math.max(1, Math.min(4, Number.isFinite(rawStride) ? Math.round(rawStride) : 3));
+  const blocksW = Math.ceil(width / stride);
+  const blocksH = Math.ceil(height / stride);
   const widthU = uniform(width, "uint");
+  const heightU = uniform(height, "uint");
+  const blocksWU = uniform(blocksW, "uint");
   const positionNode = texture(gbuffer.position);
   const normalNode = texture(gbuffer.normal);
   // `colorTarget` (GI Phase 3 v2 — texture-at-hit) is a second StorageTexture
@@ -1723,8 +1961,8 @@ export function createGiBvhReflect({
   // (t stays .r, dynFlag .g) — and let the consumer (giLight.js) offset
   // the reconstructed hitPoint along THAT normal instead of along the ray.
   const compute = Fn(() => {
-    const px = instanceIndex.mod(widthU);
-    const py = instanceIndex.div(widthU);
+    const px = instanceIndex.mod(blocksWU).mul(stride);
+    const py = instanceIndex.div(blocksWU).mul(stride);
     const coord = ivec2(px.toInt(), py.toInt());
     const g0 = positionNode.load(coord).toVar();
     const g1 = normalNode.load(coord).toVar();
@@ -1764,9 +2002,41 @@ export function createGiBvhReflect({
         dynFlag.assign(bvhScene.dynamicBlocked(origin, R, t, float(maxDistance)));
       }
     });
-    textureStore(target, coord, vec4(t, dynFlag, octXY.x, octXY.y));
-    if (colorTarget) textureStore(colorTarget, coord, vec4(albedo, hasAlbedo));
-  })().compute(width * height);
+    const hitOut = vec4(t, dynFlag, octXY.x, octXY.y).toVar();
+    const colorOut = vec4(albedo, hasAlbedo).toVar();
+    textureStore(target, coord, hitOut);
+    if (colorTarget) textureStore(colorTarget, coord, colorOut);
+    // The rest of the block. Unrolled in JS because `stride` is a build-time
+    // constant — at the default 2 that is three extra texels, each costing two
+    // gbuffer loads and a compare against a BVH traversal we did not do.
+    // Tolerances are view-RELATIVE (a texel covers more world the further away
+    // it is), and deliberately loose: this only has to separate "the same
+    // surface" from "a different surface", not preserve curvature.
+    const P0 = g0.xyz.toVar();
+    const N0 = g1.xyz.normalize().toVar();
+    const posTol = P0.sub(cameraPosition).length().mul(0.02).max(0.01).toVar();
+    const missOut = vec4(-1, 0, 0, 0);
+    const missColor = vec4(0, 0, 0, 0);
+    for (let dy = 0; dy < stride; dy++) {
+      for (let dx = 0; dx < stride; dx++) {
+        if (dx === 0 && dy === 0) continue;
+        const cx = px.add(dx);
+        const cy = py.add(dy);
+        If(cx.lessThan(widthU).and(cy.lessThan(heightU)), () => {
+          const nCoord = ivec2(cx.toInt(), cy.toInt());
+          const n0 = positionNode.load(nCoord).toVar();
+          const n1 = normalNode.load(nCoord).toVar();
+          const sameSurface = n0.w
+            .greaterThan(0.5)
+            .and(g0.w.greaterThan(0.5))
+            .and(n0.xyz.sub(P0).length().lessThan(posTol))
+            .and(n1.xyz.normalize().dot(N0).greaterThan(0.9));
+          textureStore(target, nCoord, select(sameSurface, hitOut, missOut));
+          if (colorTarget) textureStore(colorTarget, nCoord, select(sameSurface, colorOut, missColor));
+        });
+      }
+    }
+  })().compute(blocksW * blocksH);
 
   return { compute, widthU };
 }

@@ -16,14 +16,16 @@ import { ViewFrustum } from "./viewFrustum.js";
 import { AudioSystem } from "./audio/AudioSystem.js";
 import { prefabRegistry } from "./prefab/registry.js";
 import { instantiatePrefabNode } from "./prefab/expand.js";
-import { StatsSystem } from "./StatsSystem.js";
+import { StatsSystem, PHASE } from "./StatsSystem.js";
 import { SaveSystem, PreferenceStore } from "./saveSystem.js";
 import { Tween, TweenSystem } from "./tween.js";
 import { TimeSystem } from "./time.js";
 import { configureTextureAssetLoader } from "./textureAsset.js";
 import { installOutputDither } from "./outputDither.js";
+import { installShadowNodeGuard } from "./shadowNodeGuard.js";
 import { BatchSystem } from "./batching.js";
 import { MergeSystem } from "./merging.js";
+import { ShadowFreezeSystem } from "./shadowFreeze.js";
 import { LodSystem } from "./lod/LodSystem.js";
 import { ImpostorSystem } from "./lod/ImpostorSystem.js";
 import { OcclusionSystem } from "./culling/OcclusionSystem.js";
@@ -214,6 +216,18 @@ export class Engine extends EventEmitter {
     // default: it costs a low-res depth pass, which only pays for itself in a
     // scene with real occluders (see culling/OcclusionSystem.js).
     this.occlusion = new OcclusionSystem(this);
+    // Stops re-rendering a shadow map for a scene that has not moved. On a
+    // large scene the shadow map is not reduced by view frustum culling and is
+    // routinely the biggest draw consumer in the frame — 459 of 655 draws on
+    // Bistro. See shadowFreeze.js.
+    this.shadowFreeze = new ShadowFreezeSystem(this);
+    // Patches the missing null check in three's own ShadowNode.updateBefore,
+    // which dereferences `this.shadowMap.depthTexture` on any frame between a
+    // `light.dispose()` and the next `setup()`. Prototype-level and idempotent;
+    // installed here because it must be in place before the first render. See
+    // shadowNodeGuard.js for the verbatim three source and why neither shadow
+    // flag can avoid it.
+    installShadowNodeGuard();
     // Built-in per-frame telemetry sampler. Lives on the engine — every
     // engine has one, no module registry involved. The editor's viewport
     // overlay reads `engine.stats.readout`; built games can ignore it.
@@ -782,6 +796,10 @@ export class Engine extends EventEmitter {
       if (frameStarted - this._lastFrameStart + 0.75 < interval) return;
       this._lastFrameStart = frameStarted;
     }
+    // Opens the first phase. Everything from here to the matching
+    // `endPhaseFrame()` at the bottom is attributed to some phase; see
+    // StatsSystem's PHASES table. Disarmed, each of these is a boolean test.
+    this.stats.markPhase(PHASE.frustumCull);
     this.timer.update();
     // Wall-clock delta, clamped: a backgrounded tab or a compile stall would
     // otherwise hand physics a multi-second step to tunnel through.
@@ -833,13 +851,16 @@ export class Engine extends EventEmitter {
     // it decides which LOD level each group wants and the resolve is the single
     // place that writes `visible`. An LOD group setting `object3D.visible`
     // itself would simply be overwritten a few lines later, every frame.
+    this.stats.markPhase(PHASE.lod);
     this.lod.update();
     // After the LOD pass, because an entity the LOD system already hid is not
     // worth an occlusion test, and before the resolve for the same reason the
     // LOD pass is: `_occluded` is a veto the resolve reads, not a write to
     // `visible`. The buffer it tests against was captured a frame or two ago
     // (see OcclusionSystem) — this is where that latency lands.
+    this.stats.markPhase(PHASE.occlusionApply);
     this.occlusion.apply();
+    this.stats.markPhase(PHASE.visibilityWalk);
     const modeFlag = this.playing ? "enabledInGame" : "enabledInEditor";
     for (const entity of this.entities.values()) {
       // `_lodHidden` and `_occluded` are vetoes, not overrides: a level the
@@ -866,6 +887,7 @@ export class Engine extends EventEmitter {
     // timer that comes due this frame should have had its effect before any
     // script looks at the world, or every timed event in the game is read one
     // frame after it happened. Also the only writer of `engine.time`'s clocks.
+    this.stats.markPhase(PHASE.coreSystems);
     this.time.update(dt, unscaled);
     // Ahead of the update callbacks so a shake fired by a script this frame is
     // sampled by the camera brain in the SAME frame — a one-frame delay is
@@ -892,6 +914,7 @@ export class Engine extends EventEmitter {
     // already at this frame's position when the step that carries its riders
     // runs. See spline/PathSystem.js.
     this.paths.update(dt);
+    this.stats.markPhase(PHASE.scripts);
     for (const fn of this.updateCallbacks) fn(dt);
     // Snapshot: a late callback that unsubscribes itself (an IK component
     // detaching on the frame its target is destroyed) would otherwise mutate
@@ -903,6 +926,7 @@ export class Engine extends EventEmitter {
     // up to date (sound positions + listener pose). Deliberately UNSCALED:
     // this is bookkeeping (listener pose, fades), not simulation, and a
     // pause menu's music should not stop ramping because the game froze.
+    this.stats.markPhase(PHASE.audio);
     this.audio.update?.(unscaled);
     // rendererReady guards the re-init window (init() swaps the renderer
     // asynchronously; rendering before its backend resolves throws).
@@ -917,6 +941,7 @@ export class Engine extends EventEmitter {
       // callback, do not encode another frame after the drain was scheduled.
       if (this._resizeInFlight) {
         this.stats.recordSkippedFrame();
+        this.stats.endPhaseFrame();
         return;
       }
       // Systems may briefly suspend scene rendering while an async pipeline
@@ -925,6 +950,7 @@ export class Engine extends EventEmitter {
       // call blocking the main thread for the whole wave.
       if (this.renderSuspended) {
         this.stats.recordSkippedFrame();
+        this.stats.endPhaseFrame();
         return;
       }
       // Final-transform passes (e.g. GI deferred prepass) run here: after
@@ -933,33 +959,51 @@ export class Engine extends EventEmitter {
       // Refresh instanced batches before any pre-render pass reads the
       // scene, so a GI/postprocess prepass and the main draw agree on what
       // is on screen.
+      this.stats.markPhase(PHASE.batching);
       this.batching.sync();
       // After batching, and for the same reason batching runs before the
       // pre-render passes: a GI/postprocess prepass and the main draw must
       // agree on what is on screen. Merging skips anything batching already
       // claimed, so the order also settles which system owns a mesh both
       // could take.
+      this.stats.markPhase(PHASE.merging);
       this.merging.sync();
       // Impostor bakes are nested renders, so they belong here — after the
       // scene's transforms are final and before the main draw. At most one
       // atlas is baked per frame; the rest of this call just refreshes the
       // instance buffers.
+      this.stats.markPhase(PHASE.impostors);
       this.impostors.update();
       // The occluder depth pass reads the same finished transforms the main
       // draw is about to. It renders and starts an async readback; the result
       // is applied at the top of a later tick, which is what keeps this off the
       // critical path.
+      this.stats.markPhase(PHASE.occlusionRender);
       this.occlusion.render();
+      this.stats.markPhase(PHASE.preRender);
       for (const fn of this.preRenderCallbacks) fn();
       // After the preRender callbacks, so the editor's own gizmo pass — which
       // runs there and may itself draw through `engine.debug` — is included in
       // this frame's upload rather than the next one's.
+      this.stats.markPhase(PHASE.debugFlush);
       this.debug.flush();
+      // ⚠ AFTER the preRender callbacks, and that is not a preference.
+      // LightComponent recentres a directional light's shadow camera from an
+      // `onPreRender` callback, so before this point the shadow camera is still
+      // LAST frame's. Fingerprinting there froze the map against a stale camera
+      // and then let the real one move underneath it — the map stopped being
+      // redrawn while the matrix the lookups use kept changing, which renders as
+      // hard stair-stepped shadow edges in the wrong place. It also has to stay
+      // after batching/merging/impostors for the ordinary reason: the caster
+      // transforms must be this frame's final ones.
+      this.stats.markPhase(PHASE.shadowFreeze);
+      this.shadowFreeze.update();
       // Re-check: a preRender callback (GI rebuild) may have suspended
       // rendering THIS frame — rendering now would sync-compile the whole
       // material wave in this frame, the exact freeze suspension prevents.
       if (this.renderSuspended) {
         this.stats.recordSkippedFrame();
+        this.stats.endPhaseFrame();
         return;
       }
       // Wall-clock the GPU-submit portion of the frame so the stats
@@ -967,6 +1011,7 @@ export class Engine extends EventEmitter {
       // script tick. WebGPU dispatches the actual GPU work asynchronously,
       // so this is command-encoding time, not hardware GPU time — but it's
       // the closest portable signal without WebGPU timestamp-query support.
+      this.stats.markPhase(PHASE.renderEncode);
       const t0 = performance.now();
       const override = this.#activeRenderOverride();
       if (override) {
@@ -1005,7 +1050,9 @@ export class Engine extends EventEmitter {
     // post-render `renderer.render(...)` would wipe the canvas — callers
     // must temporarily disable `autoClear` (and re-enable it) to preserve
     // the main scene underneath.
+    this.stats.markPhase(PHASE.postRender);
     for (const fn of this.postRenderCallbacks) fn();
+    this.stats.endPhaseFrame();
     this.stats.recordFrameWorkMs(performance.now() - frameStarted);
   }
 

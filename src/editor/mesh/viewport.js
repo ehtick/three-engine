@@ -6,6 +6,7 @@
  */
 
 import * as THREE from "three/webgpu";
+import { MeshBVH } from "three-mesh-bvh";
 import { faceVerts } from "./bmesh.js";
 import { tessellate, wireSegments } from "./tessellate.js";
 import { bufferGeometryFromMesh } from "./io.js";
@@ -51,6 +52,12 @@ export function refreshRenderPositions(session) {
   position.needsUpdate = true;
   meshObject.geometry.computeVertexNormals();
   meshObject.geometry.computeBoundingSphere();
+  // The occlusion BVH indexes THESE positions. Topology changes get a brand new
+  // geometry (see `rebuildRenderMesh`) so their cache dies with it, but this
+  // path rewrites the same buffer in place and would otherwise leave a tree
+  // describing where the vertices used to be — box select would then hide
+  // whatever the mesh occluded before the drag.
+  meshObject.geometry.userData.selectionBVH = null;
   session.refreshModifierPreview?.();
 }
 
@@ -269,11 +276,21 @@ export function nearestEdgeOnFace(face, point) {
 /* Region selection                                                            */
 /* -------------------------------------------------------------------------- */
 
-const screenPosition = (point, camera, rect) => {
-  const projected = point.clone().project(camera);
-  return new THREE.Vector2(
-    (projected.x + 1) * rect.width * 0.5 + rect.left,
-    (-projected.y + 1) * rect.height * 0.5 + rect.top,
+const _ndc = new THREE.Vector3();
+const _screen = new THREE.Vector2();
+
+/**
+ * World point → client pixels, into a scratch vector.
+ *
+ * Allocation-free on purpose: this runs once per element in the mesh on every
+ * region gesture, and on a 38 k-vertex model the two `clone()`s this replaced
+ * were ~150 k short-lived vectors per drag.
+ */
+const screenPosition = (point, camera, rect, target = _screen) => {
+  _ndc.copy(point).project(camera);
+  return target.set(
+    (_ndc.x + 1) * rect.width * 0.5 + rect.left,
+    (-_ndc.y + 1) * rect.height * 0.5 + rect.top,
   );
 };
 
@@ -302,32 +319,83 @@ function pointInRegion(point, gesture) {
 }
 
 /**
- * Whether a point is actually visible, so a box select does not grab the far
- * side of a solid. With X-ray on, Blender selects through, and so does this.
+ * An occlusion test for the current camera pose, so a box select does not grab
+ * the far side of a solid. With X-ray on, Blender selects through, and so does
+ * this — the caller skips this entirely in that case.
+ *
+ * ⚠⚠ THIS USED TO BE A FULL-MESH RAYCAST PER POINT, AND IT HUNG THE EDITOR.
+ * The old `isVisible` called `raycaster.intersectObject(session.meshObject)`,
+ * which walks EVERY triangle, allocates an object per hit and sorts them — and
+ * `elementsInRegion` called it for every element in the mesh (see the ordering
+ * note there). On the Sibenik cathedral's wall mesh, 38,285 verts × 33,411
+ * triangles is **1.3 billion** ray-triangle tests on the main thread for one
+ * box select: not slow, indistinguishable from a hang, with no way to cancel it.
+ *
+ * Two changes make it cheap. The tree turns each query from O(triangles) into
+ * O(log triangles), and `raycastFirst` with `far` clamped to just short of the
+ * point stops at the FIRST occluder instead of collecting and sorting every
+ * surface the ray crosses — a cathedral ray crosses a lot of them.
+ *
+ * Returns a closure because the per-gesture setup (building/fetching the tree,
+ * resolving the camera) must not be repeated per point.
  */
-function isVisible(session, point) {
-  if (session.xray) return true;
-  const world = session.meshObject.localToWorld(point.clone());
-  const projected = world.clone().project(session.camera);
-  if (projected.z < -1 || projected.z > 1) return false;
+function occlusionTest(session) {
+  const meshObject = session.meshObject;
+  const geometry = meshObject.geometry;
+  // Cached on the geometry, so a topology rebuild (which mints a new geometry)
+  // drops it for free; `refreshRenderPositions` clears it explicitly.
+  const bvh = (geometry.userData.selectionBVH ??= new MeshBVH(geometry));
+  // `material.side` decides what three's own raycast would have counted as an
+  // occluder, and a multi-material mesh is raycast per group — approximated
+  // here by the first slot, which is what the surface shading uses anyway.
+  const material = Array.isArray(meshObject.material) ? meshObject.material[0] : meshObject.material;
+  const side = material?.side ?? THREE.FrontSide;
   const raycaster = (session.selectionRaycaster ??= new THREE.Raycaster());
-  raycaster.setFromCamera(new THREE.Vector2(projected.x, projected.y), session.camera);
-  const hit = raycaster.intersectObject(session.meshObject, false)[0];
-  if (!hit) return true;
-  const target = raycaster.ray.origin.distanceTo(world);
-  return hit.distance + Math.max(target * 1e-4, 1e-5) >= target;
+  const inverse = new THREE.Matrix4().copy(meshObject.matrixWorld).invert();
+  const localRay = new THREE.Ray();
+  const world = new THREE.Vector3();
+  const ndc = new THREE.Vector2();
+
+  return (point) => {
+    world.copy(point).applyMatrix4(meshObject.matrixWorld);
+    _ndc.copy(world).project(session.camera);
+    if (_ndc.z < -1 || _ndc.z > 1) return false;
+    // Via the camera rather than "origin → point": an ORTHOGRAPHIC camera's
+    // rays do not share an origin, so a ray built from `camera.position` would
+    // be wrong for every point off the view axis. `setFromCamera` handles both
+    // projections; `applyMatrix4` re-normalises the direction, so distances
+    // along the local ray are in local units and compare with the point's.
+    raycaster.setFromCamera(ndc.set(_ndc.x, _ndc.y), session.camera);
+    localRay.copy(raycaster.ray).applyMatrix4(inverse);
+    const target = localRay.origin.distanceTo(point);
+    if (target < 1e-9) return true;
+    // Stop short of the point itself, or the surface the vertex sits ON counts
+    // as its own occluder. Same tolerance the raycast version used.
+    const far = target - Math.max(target * 1e-4, 1e-5);
+    return far <= 0 || bvh.raycastFirst(localRay, side, 0, far) === null;
+  };
 }
 
 /** Elements whose representative point falls inside a box/circle/lasso gesture. */
 export function elementsInRegion(session, gesture) {
   const rect = session.canvas.getBoundingClientRect();
-  const found = [];
+  const camera = session.camera;
+  const matrixWorld = session.meshObject.matrixWorld;
+  const local = new THREE.Vector3();
+  const world = new THREE.Vector3();
+  // ⚠ THE CHEAP TEST RUNS FIRST, AND THAT ORDERING IS THE FIX.
+  // This used to occlusion-test every element and only then ask whether it was
+  // inside the gesture at all — so a 10×10 pixel box paid the full-mesh
+  // visibility cost for all 38 k vertices of the model instead of for the
+  // handful it could possibly select. Projecting a point is a couple of matrix
+  // multiplies; deciding whether it is hidden is a ray query. Do them in that
+  // order.
+  const candidates = [];
   const test = (co, element) => {
-    const point = new THREE.Vector3(co[0], co[1], co[2]);
-    if (!isVisible(session, point)) return;
-    // Projecting needs the world position, not the local one.
-    const world = session.meshObject.localToWorld(point.clone());
-    if (pointInRegion(screenPosition(world, session.camera, rect), gesture)) found.push(element);
+    local.set(co[0], co[1], co[2]);
+    world.copy(local).applyMatrix4(matrixWorld);
+    if (!pointInRegion(screenPosition(world, camera, rect), gesture)) return;
+    candidates.push({ element, point: local.clone() });
   };
   if (session.mode === "vert") {
     for (const vert of session.mesh.verts) if (!vert.hide) test(vert.co, vert);
@@ -348,6 +416,13 @@ export function elementsInRegion(session, gesture) {
       test(center.map((value) => value / ring.length), face);
     }
   }
+  // X-ray selects through, so the tree is never built — which also means the
+  // one expensive step is skipped entirely for the mode people reach for when
+  // they want everything.
+  if (session.xray) return candidates.map((candidate) => candidate.element);
+  const visible = occlusionTest(session);
+  const found = [];
+  for (const { element, point } of candidates) if (visible(point)) found.push(element);
   return found;
 }
 

@@ -99,11 +99,13 @@ import { MAX_LODS, W0 } from "./srcConfig.js";
 import {
   chebyshev,
   latticeOrigin,
+  latticeOriginCell,
   lodAtDistance,
   lodBlend,
   packProbeKey,
   probeSpacing,
 } from "./srcMathTsl.js";
+import { worldKeysEnabled } from "./srcMath.js";
 import { SLOT_EMPTY } from "./srcProbes.js";
 
 /** Gather telemetry — the same five failures `srcGather.js` learned to separate. */
@@ -162,6 +164,17 @@ export function createSrcScreenGather(store, tiles, {
 } = {}) {
   void store;
   void w0;
+  // §13.7d, hatch-gated until a rig prices it (the flip discipline: an OFF
+  // arm that is the default). `srcRef.js`'s mirror reads the SAME global, or
+  // `test:gi-src-gather` would diff a weighted GPU against an unweighted CPU
+  // and call the fix a regression.
+  // `true` = the standard DDGI square; a NUMBER is the exponent, and it is the
+  // strength dial — 2 removes the most leak and costs the most brightness
+  // (measured on Bistro: awning cavity −42%, but the whole frame −35%), 1 is
+  // the soft half of that. See plan §13.7d for the ledger.
+  const nwHatch = globalThis.__giGatherNormalWeight;
+  const normalWeight = nwHatch === true || (Number.isFinite(nwHatch) && nwHatch > 0);
+  const nwExp = Number.isFinite(nwHatch) && nwHatch > 0 ? nwHatch : 2;
 
   /**
    * THE GATHER. One world point, one normal, one irradiance.
@@ -198,7 +211,24 @@ export function createSrcScreenGather(store, tiles, {
       const f = P.sub(origin).div(s).toVar();
       const cell0 = floor(f).toVar();
       const t = f.sub(cell0).toVar();
+      // ── S1: THE CORNER KEYS MUST BE IN THE SAME COORDINATE SYSTEM THE
+      // POPULATION WROTE ────────────────────────────────────────────────────
+      //
+      // `cell0` is LOCAL to the lattice origin, which is what the interpolation
+      // and the §13.7d facing test below both want (they work in offsets from
+      // `origin`, and that keeps the f32 subtraction camera-relative — trap 4).
+      // The KEY, under world-absolute keying, is indexed by the WORLD cell. The
+      // two differ by exactly the origin's own integer cell, so the lookup gets
+      // the shift and nothing else does.
+      //
+      // Getting this wrong is silent: every corner lookup would miss, the
+      // renormalized gather would return "absent" for all eight, and GI would go
+      // uniformly dark with a perfectly healthy probe population behind it.
+      const cellShift = worldKeysEnabled()
+        ? latticeOriginCell(anchor, s).toVar()
+        : null;
       const baseCell = ivec3(int(cell0.x), int(cell0.y), int(cell0.z)).toVar();
+      if (cellShift) baseCell.assign(baseCell.add(cellShift));
 
       const acc = vec3(0).toVar();
       const wsum = float(0).toVar();
@@ -208,6 +238,30 @@ export function createSrcScreenGather(store, tiles, {
           .mul(dy ? t.y : float(1).sub(t.y))
           .mul(dz ? t.z : float(1).sub(t.z))
           .toVar();
+        // ── §13.7d: THE PROBE MUST BE ON THIS SURFACE'S SIDE ────────────────
+        //
+        // The trilinear weight is a function of POSITION ONLY, so until this
+        // line a probe sitting on the far side of the surface being shaded
+        // contributed exactly as much as one in front of it. On thin geometry
+        // that is a direct leak: an awning's sunlit TOP and its shaded
+        // UNDERSIDE share a cell (the live Bistro reports 373 of 636 meshes
+        // thinner than two cells), so the underside gathered the top's probes
+        // and came back bright — the user's "too bright in the areas under the
+        // red covers", and, repeated across every thin surface in the scene,
+        // the "flat, lacking contrast" that goes with it.
+        //
+        // The standard DDGI wrap weight: `((n·d) * 0.5 + 0.5)²`, smooth rather
+        // than a hard cutoff, because a hard one puts a visible seam exactly
+        // where the tangent plane cuts the cell. The floor keeps a fully
+        // back-facing corner from making `wsum` collapse to zero — the
+        // renormalization below then divides by what actually contributed, so
+        // a surface with every probe behind it goes DARK rather than BLACK.
+        if (normalWeight) {
+          const toProbe = origin.add(cell0.add(vec3(dx, dy, dz)).mul(s)).sub(P).toVar();
+          const facing = toProbe.normalize().dot(N).mul(0.5).add(0.5).max(0).toVar();
+          const shaped = nwExp === 2 ? facing.mul(facing) : facing.pow(float(nwExp));
+          weight.mulAssign(shaped.max(1e-3));
+        }
         If(weight.greaterThan(0), () => {
           // `secondary` is 0: the multibounce cache is Phase 5's caller, not a
           // parameter here. Out-of-window cells pack to KEY_EMPTY and the WGSL

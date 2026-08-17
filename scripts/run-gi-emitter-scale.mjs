@@ -46,6 +46,12 @@ const TILECUT = process.env.TILECUT === "1";
 // (red ticks mark the boundary line). Soft gate on the arm-vs-arm excess.
 const SEAM = process.env.SEAM === "1";
 const AB = process.env.AB === "1" || SEAM;
+// EXTRA='{"__giEmitterWidePass":false}' — dev globals set on BOTH arms before
+// the page loads. The seam gate's whole job is attribution, and the suspects
+// (the shadow filter, the two wide passes) are hatched: an arm pair run with a
+// suspect disabled says whether it OWNS the imprint. Both arms get them, so
+// the off-vs-on excess stays the statistic.
+const EXTRA = process.env.EXTRA ? JSON.parse(process.env.EXTRA) : null;
 const OUT = ".gi-shots/emitter-scale";
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 mkdirSync(OUT, { recursive: true });
@@ -80,13 +86,18 @@ async function runArm(lamps, cutOn = TILECUT) {
     const msg = e.message ?? String(e);
     if (!/save_scene/.test(msg)) console.log(`  pageerror: ${msg.slice(0, 200)}`);
   });
-  await page.evaluateOnNewDocument((project, treeOn, cutOn) => {
+  await page.evaluateOnNewDocument((project, treeOn, cutOn, extra) => {
     localStorage.setItem("engine.projectRoot.v1", project);
     localStorage.setItem("engine.recentProjects.v1", JSON.stringify([project]));
     globalThis.__editorKeepRendering = true;
-    if (treeOn) globalThis.__giSrcLightTree = true;
-    if (cutOn) globalThis.__giEmitterTileCut = true;
-  }, genRoot, TREE, cutOn);
+    // BOTH ARMS SET BOTH HATCHES EXPLICITLY. They default ON since §12.70's
+    // flip, so `if (on) set true` would leave the off arm on the default and
+    // turn this whole gate into on-vs-on — printing PASS while measuring
+    // nothing. An arm states what it is.
+    globalThis.__giSrcLightTree = treeOn === true;
+    globalThis.__giEmitterTileCut = cutOn === true;
+    if (extra) for (const [k, v] of Object.entries(extra)) globalThis[k] = v;
+  }, genRoot, TREE, cutOn, EXTRA);
   await page.goto(url, { waitUntil: "load", timeout: 60000 });
   await page.waitForSelector(".hub-recent-open-btn", { timeout: 30000 });
   await page.evaluate((project) => {
@@ -180,6 +191,15 @@ async function runArm(lamps, cutOn = TILECUT) {
       });
     });
   }, SEAM);
+  // §12.70 W5b — THE R5 HANDOFF, read off the surface palette. Under a tree
+  // hatch every candidate is an NEE light, so every candidate's palette
+  // emissive must be zeroed and FLAGGED: `emitters` counts the flagged
+  // entries, `emissiveOrphans` counts surfaces zeroed with no flag (light
+  // deleted from both paths — the failure the zeroing itself can cause).
+  const palette = await page.evaluate(() => {
+    const s = globalThis.__giSurfacePaletteLive;
+    return s ? { emitters: s.emitters, orphans: s.emissiveOrphans, live: s.live, syncs: s.syncs } : null;
+  });
   let cut = null;
   if (cutOn) {
     cut = await page.evaluate(async () => {
@@ -205,6 +225,8 @@ async function runArm(lamps, cutOn = TILECUT) {
         tilesX: live.tilesX, tilesY: live.tilesY,
         emitterW: live.emitterW ?? live.tilesX * (live.tileSize ?? 8),
         emitterH: live.emitterH ?? live.tilesY * (live.tileSize ?? 8),
+        compCap: live.compCap ?? null,
+        tileSize: live.tileSize ?? 8,
         pos, tileIds, words,
       };
     });
@@ -255,8 +277,8 @@ async function runArm(lamps, cutOn = TILECUT) {
         best: best ? `h-boundary tile (${best.tx}|${best.tx + 1},${best.ty}) Δset ${best.d}` : "none differ",
       };
       if (best) {
-        const bx = (best.tx + 1) * 8 * canvasW / cut.emitterW;
-        const by = (best.ty + 0.5) * 8 * canvasH / cut.emitterH;
+        const bx = (best.tx + 1) * cut.tileSize * canvasW / cut.emitterW;
+        const by = (best.ty + 0.5) * cut.tileSize * canvasH / cut.emitterH;
         rects.push({
           name: `boundary-${lamps}-on`,
           x: Math.max(0, Math.min(canvasW - 80, Math.round(bx - 40))),
@@ -366,8 +388,23 @@ async function runArm(lamps, cutOn = TILECUT) {
         if (v > pmax[k]) pmax[k] = v;
       }
     }
+    // §12.70 W4c: the tail compensation each tile wrote (normal vec4's `.w`).
+    // Reported as a distribution because that is the whole claim — a cut with
+    // no tail reads 1.000 everywhere (and then it cannot be what closed the
+    // seam), and a saturated one reads the cap everywhere (the ratio stopped
+    // discriminating and the fix is degenerate).
+    const comps = [];
+    for (let t = 0; t < tiles; t++) if (cut.pos[t * 8 + 3] > 0.5) comps.push(cut.pos[t * 8 + 7]);
+    comps.sort((a, b) => a - b);
+    const q = (f) => (comps.length ? comps[Math.min(comps.length - 1, Math.floor(f * comps.length))] : 0);
     cutVerdict = {
       tiles, validTiles, matched, tieTolerated, hardBad, structuralBad, worst,
+      compCap: cut.compCap,
+      comp: comps.length
+        ? `min ${q(0).toFixed(3)} p50 ${q(0.5).toFixed(3)} p95 ${q(0.95).toFixed(3)} max ${comps[comps.length - 1].toFixed(3)} ` +
+          `mean ${(comps.reduce((a, b) => a + b, 0) / comps.length).toFixed(3)} ` +
+          `(>1 in ${(100 * comps.filter((c) => c > 1.001).length / comps.length).toFixed(0)}% of valid tiles)`
+        : "no valid tiles",
       uniqueIds: idHist.size,
       pSpread: pmin.map((v, k) => `${v.toFixed(2)}..${pmax[k].toFixed(2)}`).join(" "),
       idHist: [...idHist.entries()].sort((a, b) => b[1] - a[1]).map(([i, n]) => `${i}:${n}`).join(" "),
@@ -387,9 +424,21 @@ async function runArm(lamps, cutOn = TILECUT) {
       writeFileSync(`${OUT}/seam-${name}.png`, Buffer.from(url.split(",")[1], "base64"));
     }
   }
+  // The per-pass table, always — the cut moves cost BETWEEN passes (its own
+  // dispatch up, the shadow march down), and a two-line summary can show a
+  // win that the total does not have.
+  const num = (v) => (typeof v === "number" ? v : v?.ms ?? v?.avg ?? null);
+  const passTable = Object.entries(passes)
+    .map(([k, v]) => [k, num(v)])
+    .filter(([, v]) => typeof v === "number" && v >= 0.005)
+    .sort((a, b) => b[1] - a[1])
+    .map(([k, v]) => `${k} ${v.toFixed(2)}`)
+    .join(" · ");
   return {
     lamps,
     cutOn,
+    palette,
+    passTable,
     emitterShadowMs: pick(/emitterShadow/i),
     resolveMs: pick(/^resolve$|giResolve/i),
     totalMs: prof?.screenTotalMs ?? null,
@@ -397,7 +446,7 @@ async function runArm(lamps, cutOn = TILECUT) {
     lumTop: shot.lumTop,
     lumBot: shot.lumBot,
     seamRaw: shot.seam ?? null,
-    seamDims: cut && !cut.fail ? { emitterW: cut.emitterW, emitterH: cut.emitterH } : null,
+    seamDims: cut && !cut.fail ? { emitterW: cut.emitterW, emitterH: cut.emitterH, tileSize: cut.tileSize } : null,
     seamCensus,
     treeEmitters: shot.treeLive?.emitters ?? -1,
     seatsLine: seatsLine.slice(0, 120),
@@ -432,7 +481,12 @@ function seamAxisStats(grad, lum, offset, pitch) {
       if (bset.has(i)) { bSum += grad[i]; bN++; }
       else if (!nearSet.has(i)) { iSum += grad[i]; iN++; }
     }
-    const ratio = bN && iN ? (bSum / bN) / (iSum / iN) : 1;
+    // null, NOT 1, when the split is empty. Below ~8 px of pitch every index
+    // sits inside some boundary's ±3 exclusion, the interior set empties, and
+    // a ratio of 1 (or Infinity, or NaN) would read downstream as "no excess"
+    // — a gate passing because its instrument stopped existing. The fold
+    // statistics below have no such floor and carry the verdict there.
+    const ratio = bN && iN && iSum > 0 ? (bSum / bN) / (iSum / iN) : null;
     // high-pass the luminance profile (moving mean, win 31) then fold by phase
     const win = 31, half = 15, m = lum.length;
     const hp = new Array(m);
@@ -448,10 +502,33 @@ function seamAxisStats(grad, lum, offset, pitch) {
       binSum[b] += hp[i]; binN[b]++;
     }
     const means = binSum.map((s, b) => (binN[b] ? s / binN[b] : 0));
-    return { ratio, foldP2p: Math.max(...means) - Math.min(...means) };
+    // PHASE-FOLDED |GRADIENT| (added §12.70 W4c). The boundary/interior ratio
+    // above needs an "interior" to exist, so it goes vacuous once the pitch
+    // drops under ~10 px (every index sits within the ±3 exclusion of some
+    // boundary) — exactly the regime a smaller tile puts us in. Folding the
+    // gradient profile by phase needs no split and no sign agreement: a
+    // grid-locked imprint piles |Δ| into the bins the boundaries land in,
+    // whatever the sign of each individual step. Reported as the peak bin's
+    // RELATIVE excess over the fold's own mean, so it is scale-free and
+    // comparable across pitches. One bin per pixel, capped at 16.
+    const gb = Math.max(3, Math.min(16, Math.round(p)));
+    const gSum = new Array(gb).fill(0), gN = new Array(gb).fill(0);
+    for (let i = 0; i < grad.length; i++) {
+      const phase = (((offset + i + 0.5) % p) + p) % p / p;
+      const b = Math.min(gb - 1, Math.floor(phase * gb));
+      gSum[b] += grad[i]; gN[b]++;
+    }
+    const gMeans = gSum.map((s, b) => (gN[b] ? s / gN[b] : 0));
+    const gAvg = gMeans.reduce((a, b) => a + b, 0) / gb;
+    const gradFold = gAvg > 0 ? (Math.max(...gMeans) - gAvg) / gAvg : 0;
+    return { ratio, foldP2p: Math.max(...means) - Math.min(...means), gradFold };
   };
   const t = one(pitch), c = one(pitch * 1.37);
-  return { ratio: t.ratio, ratioCtrl: c.ratio, foldP2p: t.foldP2p, foldCtrl: c.foldP2p };
+  return {
+    ratio: t.ratio, ratioCtrl: c.ratio,
+    foldP2p: t.foldP2p, foldCtrl: c.foldP2p,
+    gradFold: t.gradFold, gradFoldCtrl: c.gradFold,
+  };
 }
 
 const rows = [];
@@ -460,11 +537,13 @@ for (const lamps of LAMPS) {
   if (AB) armPlans.push([lamps, false], [lamps, true]);
   else armPlans.push([lamps, TILECUT]);
 }
+if (EXTRA) console.log(`extra globals (both arms): ${JSON.stringify(EXTRA)}`);
 for (const [lamps, cutOn] of armPlans) {
   console.log(`── arm lamps=${lamps}${cutOn ? " +tilecut" : ""}${TREE ? " (W3 tree ON)" : ""}`);
   const r = await runArm(lamps, cutOn);
   rows.push(r);
   console.log(`  lamps ${r.lamps}: emitterShadow ${r.emitterShadowMs} ms · resolve ${r.resolveMs} ms · total ${r.totalMs} ms · meanLum ${r.meanLum} · tree ${r.treeEmitters} emitters`);
+  if (r.passTable) console.log(`  passes: ${r.passTable}`);
   if (r.seatsLine) console.log(`  ${r.seatsLine}`);
   if (r.emitterShadowMs == null) console.log(`  ⚠ pass keys seen: ${r.rawKeys.join(", ")}`);
 }
@@ -492,31 +571,49 @@ if (SEAM) {
       seamPass = false;
       continue;
     }
-    const pitchX = 8 * on.seamRaw.canvasW / on.seamDims.emitterW;
-    const pitchY = 8 * on.seamRaw.canvasH / on.seamDims.emitterH;
+    const pitchX = on.seamDims.tileSize * on.seamRaw.canvasW / on.seamDims.emitterW;
+    const pitchY = on.seamDims.tileSize * on.seamRaw.canvasH / on.seamDims.emitterH;
     const ax = (raw) => seamAxisStats(raw.gradCol, raw.colLum, raw.x0, pitchX);
     const ay = (raw) => seamAxisStats(raw.gradRow, raw.rowLum, raw.y0, pitchY);
     const cOff = ax(off.seamRaw), cOn = ax(on.seamRaw);
     const rOff = ay(off.seamRaw), rOn = ay(on.seamRaw);
-    const gradX = (cOn.ratio - cOn.ratioCtrl) - (cOff.ratio - cOff.ratioCtrl);
-    const gradY = (rOn.ratio - rOn.ratioCtrl) - (rOff.ratio - rOff.ratioCtrl);
+    // `null` anywhere in the chain means the boundary/interior split had no
+    // interior at this pitch — the excess is UNMEASURED, not zero.
+    const excess = (a, b, c, d) =>
+      [a, b, c, d].some((v) => v == null || !Number.isFinite(v)) ? null : (a - b) - (c - d);
+    const gradX = excess(cOn.ratio, cOn.ratioCtrl, cOff.ratio, cOff.ratioCtrl);
+    const gradY = excess(rOn.ratio, rOn.ratioCtrl, rOff.ratio, rOff.ratioCtrl);
     const foldX = (cOn.foldP2p - cOn.foldCtrl) - (cOff.foldP2p - cOff.foldCtrl);
     const foldY = (rOn.foldP2p - rOn.foldCtrl) - (rOff.foldP2p - rOff.foldCtrl);
+    const gfX = (cOn.gradFold - cOn.gradFoldCtrl) - (cOff.gradFold - cOff.gradFoldCtrl);
+    const gfY = (rOn.gradFold - rOn.gradFoldCtrl) - (rOff.gradFold - rOff.gradFoldCtrl);
     if (on.seamCensus) {
       const c = on.seamCensus;
       console.log(`  N=${lamps} census: H boundaries differing ${c.hDiffer}/${c.hPairs} (mean Δset ${c.hMeanDiff}) · V ${c.vDiffer}/${c.vPairs} (${c.vMeanDiff}) · worst ${c.best}`);
     }
+    const f3 = (v) => (v == null || !Number.isFinite(v) ? "  n/a" : v.toFixed(3));
+    const ex = (v) => (v == null ? "UNMEASURED (pitch too fine for the split)" : `${v >= 0 ? "+" : ""}${v.toFixed(4)}`);
     console.log(`  N=${lamps} pitch ${pitchX.toFixed(2)}×${pitchY.toFixed(2)} px`);
-    console.log(`    grad boundary/interior X: off ${cOff.ratio.toFixed(3)} (ctrl ${cOff.ratioCtrl.toFixed(3)}) on ${cOn.ratio.toFixed(3)} (ctrl ${cOn.ratioCtrl.toFixed(3)}) → excess ${gradX >= 0 ? "+" : ""}${gradX.toFixed(4)}`);
-    console.log(`    grad boundary/interior Y: off ${rOff.ratio.toFixed(3)} (ctrl ${rOff.ratioCtrl.toFixed(3)}) on ${rOn.ratio.toFixed(3)} (ctrl ${rOn.ratioCtrl.toFixed(3)}) → excess ${gradY >= 0 ? "+" : ""}${gradY.toFixed(4)}`);
+    console.log(`    grad boundary/interior X: off ${f3(cOff.ratio)} (ctrl ${f3(cOff.ratioCtrl)}) on ${f3(cOn.ratio)} (ctrl ${f3(cOn.ratioCtrl)}) → excess ${ex(gradX)}`);
+    console.log(`    grad boundary/interior Y: off ${f3(rOff.ratio)} (ctrl ${f3(rOff.ratioCtrl)}) on ${f3(rOn.ratio)} (ctrl ${f3(rOn.ratioCtrl)}) → excess ${ex(gradY)}`);
     console.log(`    fold p2p (luma) X: off ${cOff.foldP2p.toFixed(4)}/${cOff.foldCtrl.toFixed(4)} on ${cOn.foldP2p.toFixed(4)}/${cOn.foldCtrl.toFixed(4)} → Δ ${foldX >= 0 ? "+" : ""}${foldX.toFixed(4)}`);
     console.log(`    fold p2p (luma) Y: off ${rOff.foldP2p.toFixed(4)}/${rOff.foldCtrl.toFixed(4)} on ${rOn.foldP2p.toFixed(4)}/${rOn.foldCtrl.toFixed(4)} → Δ ${foldY >= 0 ? "+" : ""}${foldY.toFixed(4)}`);
+    console.log(`    grad phase-fold X: off ${cOff.gradFold.toFixed(4)}/${cOff.gradFoldCtrl.toFixed(4)} on ${cOn.gradFold.toFixed(4)}/${cOn.gradFoldCtrl.toFixed(4)} → excess ${gfX >= 0 ? "+" : ""}${gfX.toFixed(4)}`);
+    console.log(`    grad phase-fold Y: off ${rOff.gradFold.toFixed(4)}/${rOff.gradFoldCtrl.toFixed(4)} on ${rOn.gradFold.toFixed(4)}/${rOn.gradFoldCtrl.toFixed(4)} → excess ${gfY >= 0 ? "+" : ""}${gfY.toFixed(4)}`);
     if (lamps > 4) {
       // Only N>4 can have differing adjacent sets; N=4 lists are the full
       // set everywhere, so its numbers are pure statistic-noise calibration.
-      const ok = gradX <= 0.05 && gradY <= 0.05 && foldX <= 0.004 && foldY <= 0.004;
+      const gradMeasured = gradX != null && gradY != null;
+      const gradOk = !gradMeasured || (gradX <= 0.05 && gradY <= 0.05);
+      const ok = gradOk && foldX <= 0.004 && foldY <= 0.004;
       seamPass = seamPass && ok;
-      console.log(`    SOFT GATE (grad ≤ +0.05, fold Δ ≤ +0.004): ${ok ? "PASS" : "FAIL — grid-locked imprint, look at the crops"}`);
+      console.log(
+        `    SOFT GATE (grad ≤ +0.05, fold Δ ≤ +0.004): ${ok ? "PASS" : "FAIL — grid-locked imprint, look at the crops"}` +
+        (gradMeasured
+          ? ""
+          : `\n      ⚠ grad term UNMEASURED: at ${pitchY.toFixed(1)} px the pitch has no interior to compare against — ` +
+            "which is itself the point, there is no grid coarse enough to imprint. Verdict rests on the luma fold + the crops."),
+      );
     }
   }
   console.log(`  crops for eyes: ${OUT}/seam-*.png (centre rect both arms; boundary crop red-ticked)`);
@@ -554,8 +651,25 @@ if (AB) {
       console.log(`  N=${lamps} RECOVERY: topΔ ${topD.toFixed(4)} bottomΔ ${botD.toFixed(4)} → regional gain ${stat.toFixed(4)} — ${ok ? "PASS (≥0.008)" : "FAIL"}; mean off ${off.meanLum} on ${on.meanLum}; sets ${setsOk ? "ok" : "BAD"}`);
     }
     console.log(`    emitterShadow off ${off.emitterShadowMs} on ${on.emitterShadowMs} ms · resolve off ${off.resolveMs} on ${on.resolveMs} ms · boot line ${on.cutLine ? "yes" : "MISSING"}`);
+    // §12.70 W5b R5 HANDOFF. Off arm: the four seats are the NEE set. On arm:
+    // every lamp is, so every lamp must be flagged — and neither arm may leave
+    // an orphan (a surface zeroed out of the palette that no path re-delivers).
+    const pOff = off.palette, pOn = on.palette;
+    if (!pOff || !pOn) {
+      console.log("    R5 HANDOFF: no palette stats — FAIL (is __giSurfacePaletteLive published?)");
+      pass = false;
+    } else {
+      const wantOn = Math.min(lamps, on.cutVerdict?.uniqueIds ?? lamps);
+      const r5 = pOn.emitters >= wantOn && pOn.orphans === 0 && pOff.orphans === 0;
+      pass = pass && r5;
+      console.log(
+        `    R5 HANDOFF: NEE-flagged palette entries off ${pOff.emitters} on ${pOn.emitters} ` +
+        `(want ≥ ${wantOn} on) · orphans off ${pOff.orphans} on ${pOn.orphans} (want 0) — ${r5 ? "PASS" : "FAIL"}`,
+      );
+    }
     if (v && !v.fail) console.log(`    lists use ${v.uniqueIds} unique ids [${v.idHist}] · record power [${v.recordPower}]
-    P spread ${v.pSpread}`);
+    P spread ${v.pSpread}
+    tail compensation (cap ${v.compCap}): ${v.comp}`);
     if (!on.cutLine) pass = false;
   }
   console.log(`\nW4b SLICE-(ii): ${pass ? "PASS — the screen follows each pixel's tile" : "FAIL"}`);

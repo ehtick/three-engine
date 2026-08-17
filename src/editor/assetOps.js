@@ -30,13 +30,16 @@ export function uniqueName(baseName, entries) {
   }
 }
 
+/** Writes a new asset into the browsed folder and returns its path. */
 export async function createAssetFile(baseName, contents) {
   const { currentPath, entries, refresh } = useProjectStore.getState();
-  if (!currentPath) return;
+  if (!currentPath) return null;
   const name = uniqueName(baseName, entries);
-  await invoke("save_scene", { path: `${currentPath}/${name}`, contents });
+  const path = `${currentPath}/${name}`;
+  await invoke("save_scene", { path, contents });
   await refresh();
   console.log(`Created ${name}`);
+  return path;
 }
 
 /**
@@ -99,12 +102,33 @@ export async function createMaterialFromTexture(texturePath) {
   return path;
 }
 
+/**
+ * Creates a folder inside `parentPath` and returns its path.
+ *
+ * Takes the parent explicitly so the folder tree can create a subfolder in a
+ * row that isn't the one being browsed — sibling names come from a listing of
+ * that folder rather than from the store's `entries`, which only ever describe
+ * the open one.
+ */
+export async function createFolderIn(parentPath, { name = "New Folder" } = {}) {
+  const dir = typeof parentPath === "string" ? parentPath.replace(/[\\/]$/, "") : null;
+  if (!dir) return null;
+  const siblings = await invoke("list_dir", { path: dir }).catch(() => []);
+  const folderName = uniqueName(name, siblings);
+  const path = `${dir}/${folderName}`;
+  try {
+    await invoke("create_dir", { path });
+  } catch (err) {
+    console.error(`Couldn't create "${folderName}": ${err}`);
+    return null;
+  }
+  await useProjectStore.getState().refresh();
+  return path;
+}
+
+/** New folder in the folder the Assets panel is browsing. */
 export async function createFolder() {
-  const { currentPath, entries, refresh } = useProjectStore.getState();
-  if (!currentPath) return;
-  const name = uniqueName("New Folder", entries);
-  await invoke("create_dir", { path: `${currentPath}/${name}` });
-  await refresh();
+  return createFolderIn(useProjectStore.getState().currentPath);
 }
 
 /**

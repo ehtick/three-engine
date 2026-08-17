@@ -2,7 +2,14 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, ChevronRight, Folder, FolderOpen } from "lucide-react";
 import { useProjectStore, basename } from "../store/projectStore.js";
 import { useAssetDrop } from "../assetDrag.js";
-import { deleteEntries, invoke, moveDraggedIntoFolder, renameEntry } from "../assetOps.js";
+import {
+  createFolderIn,
+  deleteEntries,
+  invoke,
+  moveDraggedIntoFolder,
+  renameEntry,
+} from "../assetOps.js";
+import { ContextMenu, isTextEditTarget } from "../ContextMenu.jsx";
 
 /**
  * Folder hierarchy sidebar for the Assets panel. Children are listed lazily
@@ -70,12 +77,17 @@ function FolderRow({
   onSelect,
   onToggle,
   hasLoaded,
-  renaming,
+  renamingPath,
   setRenamingPath,
   onActivate,
+  onContextMenu,
 }) {
   const navigate = useProjectStore((s) => s.navigate);
   const currentPath = useProjectStore((s) => s.currentPath);
+  // Compared here rather than by the parent: passing a BOOLEAN down and then
+  // re-comparing it against the child's path (`renaming === child.path`) is
+  // always false, which is how renaming used to work on the root row only.
+  const renaming = renamingPath === path;
   const isOpen = expanded.has(path);
   const children = childrenOf.get(path);
   const active = currentPath === path;
@@ -136,6 +148,7 @@ function FolderRow({
         style={{ paddingLeft: 4 + depth * 12 }}
         onClick={handleClick}
         onDoubleClick={() => startRename()}
+        onContextMenu={(e) => onContextMenu?.(e, { path, name, isRoot: depth === 0 })}
         title={path}
       >
         <button
@@ -196,9 +209,10 @@ function FolderRow({
             onSelect={onSelect}
             onToggle={onToggle}
             hasLoaded={hasLoaded}
-            renaming={renaming === child.path}
+            renamingPath={renamingPath}
             setRenamingPath={setRenamingPath}
             onActivate={onActivate}
+            onContextMenu={onContextMenu}
           />
         ))}
     </>
@@ -215,6 +229,7 @@ export function FolderTree() {
   const [selected, setSelected] = useState(() => new Set());
   const [anchor, setAnchor] = useState(null);
   const [renamingPath, setRenamingPath] = useState(null);
+  const [menu, setMenu] = useState(null); // {x, y, path, name, isRoot}
   const loadedRef = useRef(new Set());
   const treeRef = useRef(null);
 
@@ -400,6 +415,87 @@ export function FolderTree() {
     return next;
   }, [selected, visibleSet, rootPath]);
 
+  // Right-click on a row. Mirrors the grid's menu: clicking outside the
+  // selection re-selects the row first, so the menu always acts on what is
+  // highlighted rather than on something the user can't see is targeted.
+  const openMenu = useCallback(
+    (event, target) => {
+      if (isTextEditTarget(event.target)) return;
+      event.preventDefault();
+      // Without this the sidebar container's own menu — and the window-level
+      // fallback in nativeContextMenu.jsx — would fire too and replace this one.
+      event.stopPropagation();
+      treeRef.current?.focus({ preventScroll: true });
+      // Empty space is not a row: right-clicking it must not throw away a
+      // selection the user built up in order to ask about the folder they are in.
+      if (!target.background && !selectedRef.current.has(target.path)) {
+        onSelect({ path: target.path, mode: "replace" });
+      }
+      setMenu({ x: event.clientX, y: event.clientY, ...target });
+    },
+    [onSelect],
+  );
+
+  /**
+   * What the menu acts on: the whole selection when the clicked row is part of
+   * it, otherwise just that row. The root is never a target — deleting the
+   * project folder from inside the project is not a thing to offer.
+   */
+  const menuTargets = () => {
+    if (!menu || menu.isRoot) return [];
+    const selection = [...safeSelected];
+    return selection.length > 1 && selection.includes(menu.path)
+      ? selection.map((path) => ({ path, name: basename(path), is_dir: true }))
+      : [{ path: menu.path, name: menu.name, is_dir: true }];
+  };
+
+  const revealFolder = async (path) => {
+    try {
+      const { revealItemInDir } = await import("@tauri-apps/plugin-opener");
+      await revealItemInDir(path);
+    } catch (err) {
+      console.warn(`Couldn't reveal ${path}: ${err?.message ?? err}`);
+    }
+  };
+
+  const menuItems = () => {
+    if (!menu) return [];
+    const targets = menuTargets();
+    const many = targets.length > 1;
+    return [
+      !menu.isRoot && { label: "Open", action: () => useProjectStore.getState().navigate(menu.path) },
+      {
+        label: "New Folder",
+        hint: `Create a subfolder inside ${menu.name}`,
+        action: async () => {
+          const created = await createFolderIn(menu.path);
+          if (!created) return;
+          // Expand the parent, or the new folder is created somewhere the user
+          // can't see it — and drop straight into rename, same as Ctrl+G does.
+          setExpanded((prev) => new Set(prev).add(menu.path));
+          setRenamingPath(created);
+        },
+      },
+      { separator: true },
+      {
+        label: "Rename",
+        disabled: menu.isRoot,
+        hint: menu.isRoot ? "The project root is renamed on disk, not from here" : undefined,
+        action: () => setRenamingPath(menu.path),
+      },
+      { label: "Show in Explorer", action: () => revealFolder(menu.path) },
+      { separator: true },
+      {
+        label: many ? `Delete ${targets.length} folders` : "Delete",
+        shortcut: "Del",
+        danger: true,
+        disabled: !targets.length,
+        hint: menu.isRoot ? "The project root can't be deleted from here" : undefined,
+        action: () => deleteEntries(targets),
+      },
+    ];
+  };
+
   if (!rootPath) return null;
 
   return (
@@ -408,6 +504,11 @@ export function FolderTree() {
       ref={treeRef}
       tabIndex={0}
       onClick={(e) => e.stopPropagation()}
+      // Empty space below the rows still belongs to a folder — the root — so
+      // right-clicking it offers what you can do there rather than nothing.
+      onContextMenu={(e) =>
+        openMenu(e, { path: rootPath, name: basename(rootPath), isRoot: true, background: true })
+      }
     >
       <FolderRow
         path={rootPath}
@@ -420,10 +521,12 @@ export function FolderTree() {
         onSelect={onSelect}
         onToggle={onToggle}
         hasLoaded={hasLoaded}
-        renaming={renamingPath === rootPath}
+        renamingPath={renamingPath}
         setRenamingPath={setRenamingPath}
         onActivate={() => treeRef.current?.focus({ preventScroll: true })}
+        onContextMenu={openMenu}
       />
+      {menu && <ContextMenu x={menu.x} y={menu.y} items={menuItems()} onClose={() => setMenu(null)} />}
     </div>
   );
 }

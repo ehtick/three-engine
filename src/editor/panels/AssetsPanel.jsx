@@ -30,6 +30,7 @@ import {
   Volume2,
   Workflow,
   Film,
+  Aperture,
   X,
 } from "lucide-react";
 import { useProjectStore, basename } from "../store/projectStore.js";
@@ -52,10 +53,12 @@ import {
   ENVIRONMENT_EXTENSIONS,
   PREFAB_EXTENSIONS,
   ANIMATOR_EXTENSIONS,
+  POST_EXTENSIONS,
   GEOMETRY_EXTENSIONS,
 } from "../assetLoader.js";
 import { MATERIAL_DEFAULTS } from "../../engine/materialAsset.js";
 import { createDefaultTimeline } from "../../engine/timeline/timelineAsset.js";
+import { createPostGraph, serializePostAsset } from "../../modules/postprocessing/postAsset.js";
 import {
   CUBEMAP_DEFAULTS,
   CUBEMAP_FACES,
@@ -91,6 +94,7 @@ import {
   requestPackAtlas,
 } from "../textureEditorRequest.js";
 import { PackAtlasDialog } from "./TextureOps.jsx";
+import { ResizeAssetsDialog } from "../components/ResizeAssetsDialog.jsx";
 import { buildAtlasFromImages, createAtlasForImage, findAtlasForImage } from "../atlasFile.js";
 import { ContextMenu, isTextEditTarget } from "../ContextMenu.jsx";
 import { requestGeometryThumb } from "../geometryThumb.js";
@@ -114,6 +118,7 @@ const ICON_BY_EXT = {
   anim: Workflow,
   geom: Shapes,
   timeline: Film,
+  post: Aperture,
   ttf: Type,
   otf: Type,
   woff: Type,
@@ -138,6 +143,7 @@ const TYPE_LABEL = {
   anim: "Animator",
   geom: "Geometry",
   timeline: "Timeline",
+  post: "Post Process Graph",
   ttf: "Font",
   otf: "Font",
   woff: "Font",
@@ -190,6 +196,9 @@ const createAnimator = () =>
 
 const createSequence = () =>
   createAssetFile("NewTimeline.timeline", JSON.stringify(createDefaultTimeline(), null, 2));
+
+/** A passthrough post-process graph; nodes are wired in the Post Process panel. */
+const createPostFx = () => createAssetFile("NewPostFX.post", serializePostAsset(createPostGraph()));
 
 /**
  * Opens (or first creates) the sprite atlas for a single sheet, in Atlas mode.
@@ -474,6 +483,7 @@ const DRAGGABLE_EXTENSIONS = [
   ...ENVIRONMENT_EXTENSIONS,
   ...PREFAB_EXTENSIONS,
   ...ANIMATOR_EXTENSIONS,
+  ...POST_EXTENSIONS,
   ...GEOMETRY_EXTENSIONS,
 ];
 
@@ -625,7 +635,7 @@ function AssetItem({ entry, view, visible, renaming, setRenamingPath, onContextM
   );
 }
 
-function AssetContextMenu({ menu, close, setRenamingPath, selectedEntries }) {
+function AssetContextMenu({ menu, close, setRenamingPath, selectedEntries, onResize }) {
   const entry = menu.entry;
   // Right-clicking inside a multi-selection acts on the whole set.
   const multi = entry && selectedEntries.length > 1 && selectedEntries.some((s) => s.path === entry.path);
@@ -716,6 +726,17 @@ function AssetContextMenu({ menu, close, setRenamingPath, selectedEntries }) {
               },
             ]
           : []),
+        // Offered for one image or fifty: "make these 512" is the same request
+        // either way, and the dialog is the only place the count matters.
+        ...(textureTargets.length && textureTargets.length === targets.length
+          ? [
+              {
+                label: textureTargets.length > 1 ? `Resize ${textureTargets.length} Images…` : "Resize Image…",
+                hint: "Resample or re-frame the files on disk — presets, exact pixels, or a percentage",
+                action: () => onResize?.(textureTargets.map((t) => t.path)),
+              },
+            ]
+          : []),
         ...(!multi && MODEL_IMPORT_EXTENSIONS.includes(entry.ext)
           ? [
               { label: "Unpack Model", action: () => unpackModel(entry.path) },
@@ -744,6 +765,7 @@ function AssetContextMenu({ menu, close, setRenamingPath, selectedEntries }) {
         { label: "New Cube Map", action: () => createCubemap() },
         { label: "New Animator", action: createAnimator },
         { label: "New Timeline", action: createSequence },
+        { label: "New Post Process Graph", action: createPostFx },
         { separator: true },
         { label: "Refresh", action: () => useProjectStore.getState().refresh() },
       ];
@@ -888,6 +910,8 @@ export function AssetsPanel() {
   const [renamingPath, setRenamingPath] = useState(null);
   const [contextMenu, setContextMenu] = useState(null); // {x, y, entry|null}
   const [packPaths, setPackPaths] = useState(null); // pending "Pack into Atlas"
+  const [resizePaths, setResizePaths] = useState(null); // pending "Resize Images…"
+  const [resizing, setResizing] = useState(false);
   const [fileDropActive, setFileDropActive] = useState(false);
   const [viewId, setViewId] = useState(() => localStorage.getItem(VIEW_KEY) ?? "medium");
   const [showTree, setShowTree] = useState(() => localStorage.getItem(TREE_KEY) !== "0");
@@ -896,7 +920,7 @@ export function AssetsPanel() {
   const [typeMenuOpen, setTypeMenuOpen] = useState(false);
   const [usedOnly, setUsedOnly] = useState(false);
   const [usedPaths, setUsedPaths] = useState(null); // Set of normalised paths
-  const [projectEntries, setProjectEntries] = useState(null); // whole-project search pool
+  const [projectEntries, setProjectEntries] = useState(null); // recursive pool for the open folder
   const [scanning, setScanning] = useState(false);
   const selectedEntityIds = useSelectionStore((s) => s.ids);
   // Tag edits change what a tag: query matches, so re-filter when they land.
@@ -916,15 +940,22 @@ export function AssetsPanel() {
   }, []);
 
   const view = VIEW_MODES.find((v) => v.id === viewId) ?? VIEW_MODES[2];
-  // A search or a "used by selection" filter is a question about the project,
-  // not about the folder that happens to be open — so both widen the pool to
-  // every asset and show where each hit lives.
+  // A search or a filter is a question about a subtree, not about the one
+  // folder level that happens to be listed — so both widen the pool to include
+  // subfolders and show where each hit lives.
+  //
+  // The subtree is the folder you are IN, not the project root. Narrowing to a
+  // folder and then filtering by type used to answer with the whole project,
+  // which threw away the narrowing the user had just done by hand; opening a
+  // folder is the cheapest way there is to say "only these". Browsing the root
+  // still searches everything, because there the two are the same thing.
   const searching = query.trim().length > 0 || usedOnly || typeId !== "all";
-  // An empty scan means it failed, not that the project is empty — a project
-  // with an open folder always has at least that folder's contents. Falling
-  // back to the folder listing keeps a failed scan showing *something*
-  // filterable instead of a blank grid that reads as "no matches".
-  const projectWide = searching && projectEntries !== null && projectEntries.length > 0;
+  // An empty scan means it failed, not that the folder is empty — a folder
+  // that is open always has at least its own contents. Falling back to the
+  // folder listing keeps a failed scan showing *something* filterable instead
+  // of a blank grid that reads as "no matches".
+  const recursive = searching && projectEntries !== null && projectEntries.length > 0;
+  const atRoot = !currentPath || currentPath === rootPath;
 
   // Generated sidecars are managed through their source asset, not shown as
   // tiles — but the raw listing (which has them) is what the flag loader needs.
@@ -933,7 +964,7 @@ export function AssetsPanel() {
     () => (projectEntries ? withoutSidecars(projectEntries) : null),
     [projectEntries],
   );
-  const pool = projectWide ? projectAssets : folderEntries;
+  const pool = recursive ? projectAssets : folderEntries;
   const visible = useMemo(
     () => (searching ? filterEntries(pool, { typeId, query, usedPaths: usedOnly ? usedPaths : null }) : pool),
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -952,22 +983,23 @@ export function AssetsPanel() {
     setUsedOnly(false);
   };
 
-  /** Folder of an entry, relative to the project root — the search subtitle. */
+  /** Folder of an entry, relative to the folder being searched — the subtitle. */
   const relativeFolder = (entry) => {
-    if (!projectWide || !rootPath) return null;
+    if (!recursive || !currentPath) return null;
     const dir = entry.path.slice(0, entry.path.length - entry.name.length - 1);
-    const rel = dir.slice(rootPath.length + 1).replaceAll("\\", "/");
-    return rel || basename(rootPath);
+    const rel = dir.slice(currentPath.length + 1).replaceAll("\\", "/");
+    return rel || basename(currentPath);
   };
 
-  // Load the whole-project pool the first time a filter is switched on, and
-  // refresh it whenever the project tree changes underneath us.
+  // Load the subtree pool the first time a filter is switched on, and refresh
+  // it whenever the folder changes or the project tree moves underneath us.
   const changeCounter = useProjectStore((s) => s.changeCounter);
   useEffect(() => {
-    if (!searching || !rootPath) return;
+    const from = currentPath ?? rootPath;
+    if (!searching || !from) return;
     let live = true;
     setScanning(true);
-    listProjectEntries(rootPath)
+    listProjectEntries(from)
       .then((all) => {
         if (!live) return;
         setProjectEntries(all);
@@ -978,7 +1010,16 @@ export function AssetsPanel() {
     return () => {
       live = false;
     };
-  }, [searching, rootPath, changeCounter]);
+  }, [searching, currentPath, rootPath, changeCounter]);
+
+  // The pool belongs to the folder it was scanned from. Keeping it across a
+  // navigation would show the previous folder's hits under the new folder's
+  // name until the new scan lands — a rescan is fast, a wrong answer is not.
+  // (Only on navigation: dropping it on every refresh would flash the
+  // unfiltered folder listing every time a file changes on disk.)
+  useEffect(() => {
+    setProjectEntries(null);
+  }, [currentPath]);
 
   // Which assets the selected entities reference. Recomputed on selection
   // change so the filter tracks what the user is looking at in the viewport.
@@ -1022,10 +1063,6 @@ export function AssetsPanel() {
     },
   });
 
-  useEffect(() => {
-    if (!rootPath) useProjectStore.getState().restoreLastFolder();
-  }, [rootPath]);
-
   // Leaving a folder drops its selection — the paths aren't on screen any more.
   // Only the asset half: the entity selection is not this panel's to discard.
   useEffect(() => {
@@ -1050,6 +1087,13 @@ export function AssetsPanel() {
     if (!match) return;
     const el = gridRef.current?.querySelector(`[data-asset-path="${CSS.escape(match.path)}"]`);
     el?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    // A reveal that asked for focus is one the user is still driving from the
+    // keyboard (quick search). Taking focus here is what makes the follow-up
+    // Enter open the file; `preventScroll` because the line above already
+    // decided where the grid should sit.
+    if (useAssetRevealStore.getState().focus) {
+      gridRef.current?.focus({ preventScroll: true });
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [revealToken, revealPath, visible]);
 
@@ -1141,6 +1185,20 @@ export function AssetsPanel() {
   const onGridKeyDown = (e) => {
     if (e.target.closest("input")) return;
     const sel = useSelectionStore.getState();
+    if (e.key === "Enter") {
+      // Opens whatever the panel is currently pointing at — the tile you
+      // clicked, or failing that the one a reveal put a ring around. The
+      // fallback is what makes quick search's two-step work: Enter reveals the
+      // asset here, Enter again opens it, and the ring is the only marker in
+      // the case where browsing to the folder cleared the selection.
+      const target = sel.assetPath ?? revealPath;
+      const entry = target && visible.find((v) => samePath(v.path, target));
+      if (!entry) return;
+      e.preventDefault();
+      e.stopPropagation();
+      openEntry(entry);
+      return;
+    }
     if (e.key === "Delete" && sel.assetPaths.length) {
       e.preventDefault();
       e.stopPropagation();
@@ -1317,7 +1375,9 @@ export function AssetsPanel() {
           }}
         >
           {(loading || (searching && scanning && !projectEntries)) && (
-            <div className="asset-hint">{scanning ? "Searching project…" : "Loading…"}</div>
+            <div className="asset-hint">
+              {scanning ? (atRoot ? "Searching project…" : `Searching ${basename(currentPath)}…`) : "Loading…"}
+            </div>
           )}
           {!loading && visible.length === 0 && (
             <div className="asset-hint">
@@ -1331,7 +1391,7 @@ export function AssetsPanel() {
           {searching && visible.length > 0 && (
             <div className="asset-result-bar">
               {visible.length} {visible.length === 1 ? "result" : "results"}
-              {projectWide ? " across the project" : ""}
+              {recursive ? (atRoot ? " across the project" : ` in ${basename(currentPath)} and below`) : ""}
               {usedOnly ? " · used by selection" : ""}
             </div>
           )}
@@ -1369,6 +1429,38 @@ export function AssetsPanel() {
           close={() => setContextMenu(null)}
           setRenamingPath={setRenamingPath}
           selectedEntries={selectedEntries}
+          onResize={setResizePaths}
+        />
+      )}
+      {resizePaths && (
+        <ResizeAssetsDialog
+          count={resizePaths.length}
+          busy={resizing}
+          onCancel={() => setResizePaths(null)}
+          onApply={async (spec) => {
+            const paths = resizePaths;
+            setResizing(true);
+            try {
+              const { resizeTextures } = await import("../textureResize.js");
+              const { failed } = await useAssetProcessingStore.getState().track(
+                (n) => `Resizing ${n} ${n === 1 ? "image" : "images"}…`,
+                () => resizeTextures(paths, spec),
+                paths.length,
+              );
+              if (failed.length) {
+                console.error(
+                  `Resize failed for ${failed.length} of ${paths.length}: ${failed
+                    .map((f) => basename(f.path))
+                    .join(", ")}`,
+                );
+              }
+            } catch (error) {
+              console.error(`Resize failed: ${error?.message ?? error}`);
+            } finally {
+              setResizing(false);
+              setResizePaths(null);
+            }
+          }}
         />
       )}
       {packPaths && (

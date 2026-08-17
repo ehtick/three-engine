@@ -72,29 +72,45 @@ const CUSTOM_NODE_SLOTS = [
 ];
 
 /** Texture slots this uber material knows how to express. */
-export const UBER_SLOTS = ["map", "normalMap"];
+export const UBER_SLOTS = ["map", "normalMap", "roughnessMap", "metalnessMap"];
 
 /**
  * True when `material` is a stock-PBR surface whose whole appearance is
  * scalars plus the slots in `UBER_SLOTS`.
  */
 export function isUberCompatible(material) {
-  if (!material || Array.isArray(material)) return false;
-  if (!material.isMeshStandardNodeMaterial && !material.isMeshPhysicalNodeMaterial) return false;
+  return uberIncompatibility(material) === null;
+}
+
+/**
+ * WHY a material cannot be a table row, as a short human-readable reason, or
+ * `null` when it can.
+ *
+ * The predicate above used to be the only entry point, and "false" turned out
+ * to be a terrible thing to report: this system produced zero groups on a
+ * 384-mesh scene twice, and both times the boolean was identical while the
+ * cause was completely different. The reason string is what `MergeSystem`
+ * tallies, so the console can name the gate instead of the outcome.
+ */
+export function uberIncompatibility(material) {
+  if (!material || Array.isArray(material)) return "no single material";
+  if (!material.isMeshStandardNodeMaterial && !material.isMeshPhysicalNodeMaterial) {
+    return `material type ${material.type ?? "?"}`;
+  }
   for (const slot of CUSTOM_NODE_SLOTS) {
-    if (material[slot]?.isNode) return false;
+    if (material[slot]?.isNode) return `custom ${slot}`;
   }
   // An emissive surface is a light source, not a shading table row: the GI
   // module promotes emissive meshes to emitters keyed on the mesh, and merging
   // one into a neighbour would move the light. Cheaper to refuse than to
   // carry emission through the table and then be wrong about where it is.
-  if (material.emissive && material.emissive.getHex() !== 0x000000) return false;
+  if (material.emissive && material.emissive.getHex() !== 0x000000) return "emissive surface";
   // Texture slots outside UBER_SLOTS would be silently dropped, which is the
   // one failure mode this whole system must not have.
-  for (const slot of ["aoMap", "roughnessMap", "metalnessMap", "emissiveMap", "alphaMap", "bumpMap", "displacementMap", "clearcoatMap", "sheenColorMap", "specularMap", "lightMap", "envMap", "iridescenceMap", "transmissionMap", "anisotropyMap"]) {
-    if (material[slot]) return false;
+  for (const slot of ["aoMap", "emissiveMap", "alphaMap", "bumpMap", "displacementMap", "clearcoatMap", "sheenColorMap", "specularMap", "lightMap", "envMap", "iridescenceMap", "transmissionMap", "anisotropyMap"]) {
+    if (material[slot]) return `unsupported ${slot}`;
   }
-  return true;
+  return null;
 }
 
 /**
@@ -112,9 +128,21 @@ export function slotSignature(texture_) {
   const width = image?.width ?? 0;
   const height = image?.height ?? 0;
   if (!width || !height) return "unreadable";
-  // A compressed (KTX2/Basis) texture has no drawable image, so it cannot be
-  // copied into a layer without a GPU blit path this does not have.
-  if (texture_.isCompressedTexture || texture_.isCompressedArrayTexture) return "unreadable";
+  // A compressed (KTX2/Basis) texture has no drawable image, so it never goes
+  // near the canvas path — its already-compressed mip bytes are concatenated
+  // into a `CompressedArrayTexture` instead (see `buildCompressedLayers`).
+  // That makes the block FORMAT and the MIP COUNT part of what every layer of
+  // the array must agree on, alongside size and wrapping, because the upload
+  // slices one flat buffer at a fixed stride per level.
+  //
+  // ⚠ This used to return "unreadable", which silently disabled merging for
+  // every project with texture compression turned on — i.e. every project that
+  // had been optimised.
+  if (texture_.isCompressedTexture || texture_.isCompressedArrayTexture) {
+    const levels = texture_.mipmaps?.length ?? 0;
+    if (!levels) return "unreadable";
+    return `c${texture_.format}|${levels}|${width}x${height}|${texture_.wrapS}|${texture_.wrapT}|${texture_.colorSpace}`;
+  }
   return `${width}x${height}|${texture_.wrapS}|${texture_.wrapT}|${texture_.colorSpace}|${texture_.flipY ? 1 : 0}`;
 }
 
@@ -185,6 +213,139 @@ function fillLayer(width, height, rgba) {
 }
 
 /**
+ * Frees an uber array's staged CPU texels the moment the GPU owns them.
+ *
+ * The arrays built below are the single largest JS-heap cost of merging: every
+ * group stages width*height*4*layers bytes (Bistro at world scale: ~630 MB per
+ * generation), three keeps that copy referenced forever after upload, and the
+ * uber cache then retains it by design — so heap grew by a generation per
+ * rebuild. None of it is ever read again: `needsUpdate` is set exactly once at
+ * creation, a cache hit reuses this same texture object with its GPU copy
+ * intact, and an evicted entry is disposed and rebuilt from the SOURCE
+ * textures, never from this staging copy.
+ *
+ * `texture.onUpdate` is the common renderer's after-upload callback
+ * (Textures.js calls it after `backend.updateTexture` + mipmap generation), so
+ * the release is exact — never early. Headless (no renderer) it simply never
+ * fires, and the data stays, which the merging tests rely on. Dimensions stay
+ * on `image`/`mipmaps` entries — the backend sizes bind groups from them on
+ * every frame; only `.data` is surrendered.
+ */
+function releaseTexelsAfterUpload(texture) {
+  texture.onUpdate = () => {
+    texture.onUpdate = null;
+    if (Array.isArray(texture.mipmaps)) {
+      for (const mip of texture.mipmaps) mip.data = null;
+    }
+    if (texture.image && "data" in texture.image) texture.image.data = null;
+  };
+}
+
+/**
+ * Stacks compressed (KTX2/Basis) `sources` into one `CompressedArrayTexture`
+ * WITHOUT decoding them.
+ *
+ * A transcoded texture already carries its per-level compressed bytes on the
+ * CPU in `.mipmaps`, and three's WebGPU upload path reads an array texture's
+ * level as one flat buffer sliced at `layerIndex * bytesPerImage`
+ * (`writeTextureLayer`). So building the array is byte concatenation: no
+ * decode, no GPU blit, no quality loss, and the array costs what the sources
+ * cost rather than the 4x an RGBA8 decode would — which matters, because
+ * merging has already lost this project a D3D12 device to texture memory once.
+ *
+ * ## No neutral layer
+ *
+ * The uncompressed path synthesises a solid white/flat-normal layer for a
+ * material that leaves the slot empty. There is no cheap equivalent here — a
+ * solid colour in BC7 or ASTC is a format-specific block encoding, not a fill
+ * — so this refuses a group with any empty slot instead. That costs nothing in
+ * practice: `#collectGroups` keys on the slot signature, so materials with an
+ * empty slot are already in their own group and merge among themselves.
+ *
+ * @returns {{texture: THREE.CompressedArrayTexture, layers: number[], bytes: number} | null}
+ */
+function buildCompressedLayers(sources) {
+  const present = sources.filter(Boolean);
+  if (!present.length || present.length !== sources.length) return null;
+
+  const template = present[0];
+  const levels = template.mipmaps?.length ?? 0;
+  const width = template.image?.width ?? 0;
+  const height = template.image?.height ?? 0;
+  if (!levels || !width || !height) return null;
+
+  // One layer per DISTINCT source — an ORM map bound to both the roughness and
+  // the metalness slot must not be stored twice.
+  const layerOf = new Map();
+  const order = [];
+  for (const source of present) {
+    if (layerOf.has(source)) continue;
+    // `slotSignature` already forced these to agree; re-checking here is what
+    // keeps a mismatch a refusal rather than a corrupt upload, since nothing
+    // downstream can detect a short buffer.
+    if (source.format !== template.format) return null;
+    if ((source.mipmaps?.length ?? 0) !== levels) return null;
+    if (source.image?.width !== width || source.image?.height !== height) return null;
+    layerOf.set(source, order.length);
+    order.push(source);
+  }
+
+  const mipmaps = [];
+  let bytes = 0;
+  for (let level = 0; level < levels; level++) {
+    const reference = template.mipmaps[level];
+    const stride = reference.data?.byteLength ?? 0;
+    if (!stride) return null;
+    const data = new Uint8Array(stride * order.length);
+    for (let layer = 0; layer < order.length; layer++) {
+      const mip = order[layer].mipmaps[level];
+      // Equal dimensions and format do not guarantee equal byte lengths across
+      // transcoder versions; a short copy would shift every later layer.
+      if ((mip?.data?.byteLength ?? -1) !== stride) return null;
+      data.set(new Uint8Array(mip.data.buffer, mip.data.byteOffset, stride), layer * stride);
+    }
+    mipmaps.push({ data, width: reference.width, height: reference.height });
+    bytes += data.byteLength;
+  }
+
+  const array = new THREE.CompressedArrayTexture(
+    mipmaps, width, height, order.length, template.format, template.type,
+  );
+  array.colorSpace = template.colorSpace;
+  array.wrapS = template.wrapS;
+  array.wrapT = template.wrapT;
+  array.magFilter = template.magFilter;
+  array.minFilter = template.minFilter;
+  array.anisotropy = present.reduce((n, t) => Math.max(n, t.anisotropy ?? 1), 1);
+  // The transcoder produced the chain; regenerating one is not even possible
+  // for a compressed format.
+  array.generateMipmaps = false;
+  array.needsUpdate = true;
+  array.name = "UberArrayCompressed";
+  releaseTexelsAfterUpload(array);
+
+  return { texture: array, layers: sources.map((s) => layerOf.get(s) ?? 0), bytes };
+}
+
+/**
+ * Builds one slot's array, picking the path the sources actually allow.
+ *
+ * A group must be all-compressed or all-uncompressed in a given slot: the two
+ * cannot share an array (different GPU formats), and mixing them is a real
+ * possibility whenever only some of a project's textures have been compressed.
+ * Refusing leaves those materials unmerged, which is slower and correct.
+ */
+function buildSlotLayers(sources, { neutral, colorSpace }) {
+  const present = sources.filter(Boolean);
+  if (!present.length) return null;
+  const compressed = present.filter((t) => t.isCompressedTexture || t.isCompressedArrayTexture);
+  if (compressed.length) {
+    return compressed.length === present.length ? buildCompressedLayers(sources) : null;
+  }
+  return buildLayeredTexture(sources, { neutral, colorSpace });
+}
+
+/**
  * Stacks `sources` (each a Texture or null) into one `DataArrayTexture`.
  * `null` entries become a neutral fill so the shader can sample every layer
  * unconditionally — a branch per fragment would cost more than a white layer.
@@ -231,6 +392,7 @@ export function buildLayeredTexture(sources, { neutral, colorSpace }) {
   array.flipY = false;
   array.needsUpdate = true;
   array.name = "UberArray";
+  releaseTexelsAfterUpload(array);
 
   return { texture: array, layers: sources.map((s) => (s ? layerOf.get(s) ?? 0 : 0)) };
 }
@@ -246,19 +408,69 @@ export function buildLayeredTexture(sources, { neutral, colorSpace }) {
  *   here so the shape the cache stores is the shape this returns.
  */
 export function buildUberMaterial(materials, template) {
-  const colorLayers = buildLayeredTexture(
-    materials.map((m) => m.map ?? null),
-    { neutral: [255, 255, 255, 255], colorSpace: THREE.SRGBColorSpace },
-  );
-  const normalLayers = buildLayeredTexture(
-    materials.map((m) => m.normalMap ?? null),
+  // ⚠ A SLOT THAT HAD TEXTURES AND PRODUCED NO ARRAY MUST KILL THE WHOLE
+  // MERGE. The guard further down only refuses when EVERY slot is empty, which
+  // means a slot that had real sources and failed to stack them (mixed
+  // compressed/uncompressed, mismatched mip counts, an undecodable image) fell
+  // through to the `else` branch and shaded with a flat constant instead — the
+  // group renders, untextured, and nothing says a word. Refusing is slower and
+  // correct; this is the one failure mode this module must not have.
+  const slotFailed = (sources, layers) => sources.some(Boolean) && !layers;
+
+  const colorSources = materials.map((m) => m.map ?? null);
+  const colorLayers = buildSlotLayers(colorSources, {
+    neutral: [255, 255, 255, 255],
+    colorSpace: THREE.SRGBColorSpace,
+  });
+  if (slotFailed(colorSources, colorLayers)) return null;
+
+  const normalSources = materials.map((m) => m.normalMap ?? null);
+  const normalLayers = buildSlotLayers(normalSources, {
     // Flat tangent-space normal: (0,0,1) encoded as (0.5, 0.5, 1).
-    { neutral: [128, 128, 255, 255], colorSpace: THREE.NoColorSpace },
-  );
+    neutral: [128, 128, 255, 255],
+    colorSpace: THREE.NoColorSpace,
+  });
+  if (slotFailed(normalSources, normalLayers)) {
+    colorLayers?.texture.dispose();
+    return null;
+  }
+
+  // ── THE ORM/ARM SLOT ──────────────────────────────────────────────────────
+  //
+  // Roughness and metalness are ONE array, not two, because in every real PBR
+  // import they are one texture: glTF packs occlusion/roughness/metalness into
+  // R/G/B of a single map, so `m.roughnessMap === m.metalnessMap`. Handing both
+  // slots to one `buildLayeredTexture` call lets its per-source dedupe collapse
+  // them to a single layer — two arrays would have stored every ORM map twice.
+  //
+  // The layer index is therefore looked up per SLOT, not per material: the two
+  // halves of `sources` are the two slots, so `layers[i]` is material i's
+  // roughness layer and `layers[count + i]` its metalness layer, and they are
+  // free to differ for the rare asset that splits them.
+  const count = materials.length;
+  const ormSources = [
+    ...materials.map((m) => m.roughnessMap ?? null),
+    ...materials.map((m) => m.metalnessMap ?? null),
+  ];
+  const ormLayers = buildSlotLayers(ormSources, {
+    // White: an empty slot must multiply the scalar by 1, i.e. leave it alone.
+    neutral: [255, 255, 255, 255],
+    // Inherited rather than pinned. `slotSignature` already forces every member
+    // of a group to agree on colour space, so there is exactly one right answer
+    // here — and picking a different one than the unmerged material samples
+    // with is a visible roughness shift the moment a group forms.
+    colorSpace: ormSources.find(Boolean)?.colorSpace ?? THREE.NoColorSpace,
+  });
+  if (slotFailed(ormSources, ormLayers)) {
+    colorLayers?.texture.dispose();
+    normalLayers?.texture.dispose();
+    return null;
+  }
+
   // A group where nobody binds anything has nothing for this material to index;
   // the merger should not have built it, and refusing is cheaper than a
   // material that is a slower way to write a constant.
-  if (!colorLayers && !normalLayers) return null;
+  if (!colorLayers && !normalLayers && !ormLayers) return null;
 
   // Two vec4s per material. Packed rather than one array per scalar because
   // each `uniformArray` is its own uniform buffer and its own binding, and the
@@ -279,8 +491,21 @@ export function buildUberMaterial(materials, template) {
       normalLayers ? normalLayers.layers[i] : 0,
     ),
   );
+  // ORM layer indices. A third buffer rather than repacking the first two:
+  // every field of those is already spoken for, and one more uniform binding
+  // shared by the whole group is still N-to-1 against the materials it stands
+  // in for.
+  const row2 = materials.map((m, i) =>
+    new THREE.Vector4(
+      ormLayers ? ormLayers.layers[i] : 0,
+      ormLayers ? ormLayers.layers[count + i] : 0,
+      0,
+      0,
+    ),
+  );
   const params0 = uniformArray(row0, "vec4");
   const params1 = uniformArray(row1, "vec4");
+  const params2 = uniformArray(row2, "vec4");
 
   // The index is a per-VERTEX attribute, and every vertex of a triangle carries
   // the same value, so interpolating it is exact — no flat qualifier needed.
@@ -291,6 +516,7 @@ export function buildUberMaterial(materials, template) {
   const index = /** @type {any} */ (attribute("materialIndex", "float")).add(0.5).floor().toInt();
   const p0 = /** @type {any} */ (params0.element(index));
   const p1 = /** @type {any} */ (params1.element(index));
+  const p2 = /** @type {any} */ (params2.element(index));
 
   const material = new THREE.MeshPhysicalNodeMaterial();
   material.name = `Uber(${materials.length})`;
@@ -330,8 +556,18 @@ export function buildUberMaterial(materials, template) {
       vec2(p1.z, p1.z),
     );
   }
-  material.roughnessNode = p1.x;
-  material.metalnessNode = p1.y;
+  // `.g` and `.b`, multiplied by the scalar — the exact composition three's
+  // stock material performs for `roughnessMap`/`metalnessMap`
+  // (three.webgpu.js:17362,17371). Matching it here is what lets a mesh look
+  // identical whether or not it happened to land in a merge group.
+  if (ormLayers) {
+    const orm = texture(ormLayers.texture);
+    material.roughnessNode = /** @type {any} */ (orm).depth(p2.x.toInt()).g.mul(p1.x);
+    material.metalnessNode = /** @type {any} */ (orm).depth(p2.y.toInt()).b.mul(p1.y);
+  } else {
+    material.roughnessNode = p1.x;
+    material.metalnessNode = p1.y;
+  }
 
   return {
     material,
@@ -340,6 +576,7 @@ export function buildUberMaterial(materials, template) {
     dispose() {
       colorLayers?.texture.dispose();
       normalLayers?.texture.dispose();
+      ormLayers?.texture.dispose();
       material.dispose();
     },
   };

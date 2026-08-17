@@ -61,16 +61,34 @@ const assetKey = (path) => String(path ?? "").replaceAll("\\", "/");
  * but prints a deprecation line per load, so prefer the new one and keep the
  * fallback for the older addon bundle a build might be pinned to.
  */
+async function importWithRetry(loader, attempts = 3) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      if (i > 0) await new Promise((r) => setTimeout(r, 80 * 2 ** (i - 1)));
+      return await loader();
+    } catch (err) {
+      lastErr = err;
+      const msg = String(err?.message ?? err ?? "");
+      // Permanent resolve failures should not burn retries.
+      if (!/Failed to fetch|INSUFFICIENT_RESOURCES|Load failed|NetworkError|network/i.test(msg)) {
+        throw err;
+      }
+    }
+  }
+  throw lastErr;
+}
+
 async function equirectLoader(path) {
   if (/\.exr$/i.test(String(path))) {
-    const { EXRLoader } = await import("three/addons/loaders/EXRLoader.js");
+    const { EXRLoader } = await importWithRetry(() => import("three/addons/loaders/EXRLoader.js"));
     return new EXRLoader();
   }
   try {
-    const { HDRLoader } = await import("three/addons/loaders/HDRLoader.js");
+    const { HDRLoader } = await importWithRetry(() => import("three/addons/loaders/HDRLoader.js"));
     return new HDRLoader();
   } catch {
-    const { RGBELoader } = await import("three/addons/loaders/RGBELoader.js");
+    const { RGBELoader } = await importWithRetry(() => import("three/addons/loaders/RGBELoader.js"));
     return new RGBELoader();
   }
 }
@@ -96,6 +114,12 @@ async function loadEquirectAsset(path) {
     entry.promise.catch((err) => {
       entry.error = err;
       console.error(`Failed to load HDRI "${path}": ${err.message ?? err}`);
+      // Chrome can abort the loader module fetch under a concurrent Vite
+      // import storm. Drop the cache so a later settings re-apply can retry.
+      const msg = String(err?.message ?? err ?? "");
+      if (/Failed to fetch|INSUFFICIENT_RESOURCES|Load failed|NetworkError|network/i.test(msg)) {
+        cache.delete(key);
+      }
     });
   }
   try {

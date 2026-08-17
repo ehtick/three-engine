@@ -26,9 +26,21 @@ const _shadowRight = new THREE.Vector3();
 const _shadowUp = new THREE.Vector3();
 const _worldUp = new THREE.Vector3(0, 1, 0);
 
+/**
+ * Floor for `shadowCamSnap`, as a fraction of `shadowCamSize` (the ortho
+ * half-extent). The snap trades COVERAGE for shadow-map reuse — the camera may
+ * sit up to snap/2 off centre — so expressing the floor as a fraction spends a
+ * fixed 5% of the shadowed region regardless of scene scale. See the derivation
+ * at the use site in `#syncDirectionalTransform`.
+ */
+const SHADOW_SNAP_COVERAGE_FRACTION = 0.1;
+
 export class LightComponent extends Component {
   /** Runtime CSMShadowNode — distinct from the authored boolean `props.csm`. */
   #csm = null;
+  /** Last snapped shadow-origin / light direction — skip matrix writes when unchanged. */
+  #lastSnapCentre = new THREE.Vector3(Number.NaN, Number.NaN, Number.NaN);
+  #lastDirection = new THREE.Vector3(Number.NaN, Number.NaN, Number.NaN);
 
   static type = "light";
   static label = "Light";
@@ -60,6 +72,12 @@ export class LightComponent extends Component {
     shadowCamNear: 0.1,
     shadowCamFar: 100,
     shadowCamSize: 20, // orthographic half-extent (left/right/top/bottom = ±size)
+    // World-space snap for directional shadow recentring. One-texel snap
+    // (~2 cm at 2048² / 40 m) invalidates ShadowFreeze on every camera nudge
+    // and redraws hundreds of casters. 0.5 m keeps freeze engaged between
+    // steps; the volume "pops" only when the grid advances. 0 = legacy
+    // one-texel behaviour.
+    shadowCamSnap: 0.5,
     shadowCamFov: 90, // point-light cube: face FOV in degrees
     // Directional-light CSM settings. CSMShadowNode is WebGPU-only.
     csm: false,
@@ -106,6 +124,7 @@ export class LightComponent extends Component {
     { key: "shadowCamNear", label: "Cam Near", type: "number", min: 0, step: 0.1, showIf: (p) => ((p.kind === "directional" || p.kind === "spot" || p.kind === "point") && p.castShadow && p.shadowMode !== "gi"), section: "Shadow" },
     { key: "shadowCamFar", label: "Cam Far", type: "number", min: 0, step: 1, showIf: (p) => ((p.kind === "directional" || p.kind === "spot" || p.kind === "point") && p.castShadow && p.shadowMode !== "gi"), section: "Shadow" },
     { key: "shadowCamSize", label: "Frustum Size", type: "number", min: 0.1, step: 1, showIf: (p) => ((p.kind === "directional" || p.kind === "spot") && p.castShadow && !p.csm && p.shadowMode !== "gi"), section: "Shadow" },
+    { key: "shadowCamSnap", label: "Recentre Snap", type: "number", min: 0, step: 0.1, showIf: (p) => p.kind === "directional" && p.castShadow && !p.csm && p.shadowMode !== "gi", section: "Shadow" },
     { key: "shadowCamFov", label: "Face FOV°", type: "number", min: 1, max: 179, step: 1, showIf: (p) => (p.kind === "point" && p.castShadow && p.shadowMode !== "gi"), section: "Shadow" },
     { key: "csm", label: "Cascaded Shadows", type: "boolean", showIf: (p) => p.kind === "directional" && p.castShadow && p.shadowMode !== "gi", section: "Shadow" },
     { key: "csmCascades", label: "Cascades", type: "number", min: 2, max: 4, step: 1, showIf: (p) => p.kind === "directional" && p.castShadow && p.csm && p.shadowMode !== "gi", section: "CSM" },
@@ -181,6 +200,18 @@ export class LightComponent extends Component {
       this.#syncCSMShadowDepth();
       this.#updateCSMFrustums(true);
       return;
+    }
+    // Snap / frustum size changes must not early-out against the previous cell.
+    if (
+      key === "shadowCamSnap"
+      || key === "shadowCamSize"
+      || key === "shadowCamNear"
+      || key === "shadowCamFar"
+      || key === "shadowMapWidth"
+      || key === "shadowMapHeight"
+    ) {
+      this.#lastSnapCentre.set(Number.NaN, Number.NaN, Number.NaN);
+      this.#lastDirection.set(Number.NaN, Number.NaN, Number.NaN);
     }
     // Angular size is pure GI-contract data: nothing in three.js reads it, so
     // republishing userData IS the whole update. Rebuilding the light for a
@@ -303,9 +334,12 @@ export class LightComponent extends Component {
     // camera is currently active so the user never leaves the frustum.
     if (this.light.isDirectionalLight) {
       this.unsubPreRender = this.entity.engine.onPreRender(() => {
-        this.#syncDirectionalTransform();
+        const moved = this.#syncDirectionalTransform();
         if (!this.#csm && this.#isCSMUsable()) this.#syncCSM();
-        this.#updateCSMFrustums();
+        // CSM cascades track the view camera every frame. Non-CSM maps only
+        // need work when the snapped light pose actually changed — otherwise
+        // leave matrices alone so ShadowFreeze can keep the map frozen.
+        if (moved || this.#csm) this.#updateCSMFrustums();
       });
       this.unsubRendererRebuilt = this.entity.engine.on("renderer-rebuilt", () => {
         this.#syncCSM({ recreate: true });
@@ -344,8 +378,14 @@ export class LightComponent extends Component {
     d.giSourceRadius = Math.max(0, this.props.shadowRadius ?? 0);
   }
 
+  /**
+   * Pin the directional light and recentre its shadow volume on the active
+   * camera. Returns true when the snapped pose changed (caller must refresh
+   * derived state); false when this frame is a no-op so ShadowFreeze can keep
+   * the map frozen while the view camera moves inside the snap cell.
+   */
   #syncDirectionalTransform() {
-    if (!this.light?.isDirectionalLight || !this.light.target) return;
+    if (!this.light?.isDirectionalLight || !this.light.target) return false;
 
     const owner = this.entity.object3D;
     // Directional lights are infinite sources — their position is meaningless
@@ -370,9 +410,13 @@ export class LightComponent extends Component {
     if (camera) {
       camera.getWorldPosition(_cameraWorld);
       _shadowCentre.copy(_cameraWorld);
-      // Stabilize the orthographic projection: snap its lateral origin to
-      // whole shadow-map texels so tiny camera movements do not make every
-      // shadow edge crawl across the texture.
+      // Stabilize the orthographic projection: snap its origin — on all three
+      // axes, see the depth snap below — so continuous camera motion does not
+      // invalidate the shadow map every frame.
+      // One-texel snap (~2 cm at 2048² / 40 m) defeats ShadowFreeze
+      // while orbiting — see shadowFreeze.js. `shadowCamSnap` raises the
+      // grid to a world-space step (default 0.5 m); 0 keeps legacy one-texel
+      // behaviour.
       _shadowRight.crossVectors(_direction, _worldUp);
       if (_shadowRight.lengthSq() < 1e-8) _shadowRight.set(1, 0, 0);
       else _shadowRight.normalize();
@@ -380,24 +424,88 @@ export class LightComponent extends Component {
       const worldUnits = this.props.shadowCamSize * 2;
       const texelX = worldUnits / Math.max(1, this.props.shadowMapWidth);
       const texelY = worldUnits / Math.max(1, this.props.shadowMapHeight);
+      // ── THE SNAP FLOOR: scale with COVERAGE, not with a fixed metre value ──
+      //
+      // The authored default is 0.5 m, and 0.5 m is far too fine to hold a
+      // freeze through an actual camera drag: an orbit moves the eye ~0.3 m per
+      // frame, so the cell is crossed every other frame and the map is redrawn
+      // essentially always. Measured on the real project (`run-gi-camera-motion`),
+      // that shadow pass is 579 draws and 2.83 M triangles — MORE than the main
+      // pass — and it is the single largest item in a moving frame.
+      //
+      // A fixed larger default cannot be right either, because what the snap
+      // costs is COVERAGE: the camera may sit up to snap/2 from the centre of
+      // the shadowed region, so the guaranteed coverage shrinks from
+      // `shadowCamSize` to `shadowCamSize - snap/2`. Tying the floor to
+      // `shadowCamSize` makes that cost a fixed 5% of the region at any scene
+      // scale, instead of "invisible on a 120 m sun and clipping on a 10 m one".
+      //
+      // ⚠ This is a FLOOR, not an override — a project that authored a COARSER
+      // snap keeps it. Nothing here blurs the map or moves the shadows: they are
+      // world-anchored, and snapping only quantizes which box the map covers.
+      // A/B hatch: `__shadowSnapCoverageFloor = false` restores the pre-fix
+      // authored-only snap, so the image can be compared arm to arm.
+      const coverageFloor = globalThis.__shadowSnapCoverageFloor === false
+        ? 0
+        : Math.max(0, Number(this.props.shadowCamSize) || 0) * SHADOW_SNAP_COVERAGE_FRACTION;
+      const snapWorld = Math.max(0, Number(this.props.shadowCamSnap) || 0, coverageFloor);
+      const snapX = snapWorld > 0 ? Math.max(texelX, snapWorld) : texelX;
+      const snapY = snapWorld > 0 ? Math.max(texelY, snapWorld) : texelY;
       const projectedX = _shadowCentre.dot(_shadowRight);
       const projectedY = _shadowCentre.dot(_shadowUp);
-      _shadowCentre.addScaledVector(_shadowRight, Math.round(projectedX / texelX) * texelX - projectedX);
-      _shadowCentre.addScaledVector(_shadowUp, Math.round(projectedY / texelY) * texelY - projectedY);
+      _shadowCentre.addScaledVector(_shadowRight, Math.round(projectedX / snapX) * snapX - projectedX);
+      _shadowCentre.addScaledVector(_shadowUp, Math.round(projectedY / snapY) * snapY - projectedY);
+      // ⚠⚠ THE THIRD AXIS, AND IT IS THE ONE THAT MATTERS FOR PERFORMANCE.
+      //
+      // The two snaps above quantize the centre only in the plane the shadow
+      // map is rasterized across. The component ALONG the light direction was
+      // left continuous — so `_lightWorld` (and therefore `light.position`,
+      // `light.matrixWorld` and ShadowFreeze's fingerprint) moved by a few
+      // millimetres on EVERY frame the camera translated at all, no matter how
+      // large `shadowCamSnap` was. The map was redrawn every frame of every
+      // camera move, and the snap prop looked like it did nothing because for
+      // this purpose it did: measured on the real project, raising it 0.5 → 8
+      // moved a drag from 23.1 to 23.7 fps (noise) with the shadow pass still
+      // submitting 559 draws. With this line the snap governs all three axes
+      // and the freeze can actually engage mid-motion.
+      //
+      // Snapping depth is safe where snapping laterally would not be: an
+      // orthographic frustum is translation-invariant along its own view
+      // direction apart from the near/far clip, and that interval is
+      // `shadowCamFar - shadowCamNear` (199 m by default) against a snap of a
+      // few metres — so the only effect is which slab of that interval the
+      // casters sit in, with the camera parked at its midpoint below.
+      const snapZ = snapWorld > 0 ? snapWorld : Math.max(texelX, texelY);
+      const projectedZ = _shadowCentre.dot(_direction);
+      _shadowCentre.addScaledVector(_direction, Math.round(projectedZ / snapZ) * snapZ - projectedZ);
       // The orthographic shadow camera sees only forward along the light
       // direction. Put the view camera midway through its depth interval so
       // nearby casters are retained on both sides of the viewer.
       const depthCentre = (this.props.shadowCamNear + this.props.shadowCamFar) * 0.5;
       _lightWorld.copy(_shadowCentre).addScaledVector(_direction, -depthCentre);
     } else {
+      _shadowCentre.set(0, 0, 0);
       _lightWorld.set(0, 0, 0);
     }
+
+    // Same snap cell + same aiming direction → leave matrices alone. Rewriting
+    // identical floats still jitters the world matrix enough to trip
+    // ShadowFreeze's 1e-4 fingerprint and force a full shadow redraw.
+    if (
+      this.#lastSnapCentre.distanceToSquared(_shadowCentre) < 1e-16
+      && this.#lastDirection.distanceToSquared(_direction) < 1e-16
+    ) {
+      return false;
+    }
+    this.#lastSnapCentre.copy(_shadowCentre);
+    this.#lastDirection.copy(_direction);
 
     _targetWorld.copy(_lightWorld).add(_direction);
     this.light.position.copy(_lightWorld).applyMatrix4(_inverseOwnerWorld);
     this.light.target.position.copy(_targetWorld).applyMatrix4(_inverseOwnerWorld);
     this.light.updateMatrix();
     this.light.target.updateMatrix();
+    return true;
   }
 
   // Map shadow-type name → three.js constant. Built lazily and reused.
@@ -446,7 +554,11 @@ export class LightComponent extends Component {
       if (shadow.camera.far === far) continue;
       shadow.camera.far = far;
       shadow.camera.updateProjectionMatrix();
-      shadow.needsUpdate = true;
+      // The frustum changed, so the map has to be redrawn — but through
+      // `autoUpdate`, never `needsUpdate` (shadowFreeze.js's header has the
+      // crash). ShadowFreezeSystem also folds `camera.projectionMatrix` into its
+      // key, so it invalidates on this by itself; this is the belt to that brace.
+      shadow.autoUpdate = true;
     }
   }
 
@@ -483,7 +595,11 @@ export class LightComponent extends Component {
       this.#configureCSMSplits();
     }
     this.light.shadow.shadowNode = this.#csm;
-    this.light.shadow.needsUpdate = true;
+    // `autoUpdate`, not `needsUpdate` — see `shadowFreeze.js`'s header. A fresh
+    // node's `shadowMap` is null until `setup()` runs, and a sticky
+    // `needsUpdate` on a FROZEN light drives three's `updateShadow` straight
+    // into `shadowMap.depthTexture` on null.
+    this.light.shadow.autoUpdate = true;
     // CSMShadowNode initializes its internal frustum lazily during shader
     // setup. Until then, updateFrustums() would dereference mainFrustum=null.
     this.#updateCSMFrustums();
@@ -493,7 +609,10 @@ export class LightComponent extends Component {
     if (!this.#csm) return;
     if (this.light?.shadow?.shadowNode === this.#csm) {
       this.light.shadow.shadowNode = undefined;
-      this.light.shadow.needsUpdate = true;
+      // Handing the light back to three's own ShadowNode, which has to be built
+      // from scratch — so this is the same null-`shadowMap` window the CSM
+      // assignment above guards, and it is followed by a dispose.
+      this.light.shadow.autoUpdate = true;
     }
     this.#csm.dispose?.();
     this.#csm = null;
@@ -565,7 +684,9 @@ export class LightComponent extends Component {
           changed = true;
         }
       }
-      if (changed) shadow.needsUpdate = true;
+      // A filter or radius change alters what the map must contain; ask for the
+      // redraw the safe way (see #syncCSMShadowDepth).
+      if (changed) shadow.autoUpdate = true;
     }
   }
 
@@ -602,6 +723,13 @@ export class LightComponent extends Component {
     const shadowSettings = this.entity?.engine?.settings?.shadow;
     if (shadowSettings) {
       s.autoUpdate = shadowSettings.autoUpdate !== false;
+      // Forces the one real render a light born under a frozen-shadow project
+      // would otherwise never get. ⚠ SAFE ONLY because `installShadowNodeGuard`
+      // (Engine constructor) adds the null check three's `ShadowNode` is
+      // missing: at this point the node's `shadowMap` is always still null, and
+      // three's `updateBefore` would drive `updateShadow` straight into
+      // "Cannot read properties of null (reading 'depthTexture')". The guard
+      // holds the request until `setup()` has built the map, then services it.
       s.needsUpdate = true;
     }
     const typeMap = LightComponent.#getShadowTypeMap();

@@ -142,11 +142,15 @@ export function QuickSearch() {
       "asset", entry.name, `Asset · ${entry.path}`,
       async () => {
         const project = useProjectStore.getState();
-        useSelectionStore.getState().selectAsset(entry.path);
         openPanel("assets");
         const dir = entry.path.replace(/[\\/][^\\/]+$/, "");
         if (dir && dir !== project.currentPath) await project.navigate(dir);
-        useAssetRevealStore.getState().reveal(entry.path);
+        // Select AFTER navigating. Browsing to a folder clears the asset
+        // selection (the old paths aren't on screen any more), so selecting
+        // first left the tile revealed but unselected — and "press Enter to
+        // open it" needs a visibly selected subject.
+        useSelectionStore.getState().selectAsset(entry.path);
+        useAssetRevealStore.getState().reveal(entry.path, { focus: true });
       },
       entry.path,
     ));
@@ -204,7 +208,13 @@ export function QuickSearch() {
         <div className="quick-search-footer">
           <span className="quick-search-result-count">{results.length ? `${results.length} result${results.length === 1 ? "" : "s"}` : "No results"}</span>
           <span className="quick-search-hint"><kbd><ChevronUp size={11} /><ChevronDown size={11} /></kbd> Navigate</span>
-          <span className="quick-search-hint"><kbd><CornerDownLeft size={11} /></kbd> Open</span>
+          {/* Assets are the one type Enter doesn't finish: it lands you on the
+              tile in the Assets panel, and a second Enter there opens it. Say
+              so, rather than promising "Open" and revealing. */}
+          <span className="quick-search-hint">
+            <kbd><CornerDownLeft size={11} /></kbd>{" "}
+            {results[active]?.type === "asset" ? "Reveal (⏎ again opens)" : "Open"}
+          </span>
           <span className="quick-search-hint"><kbd>Esc</kbd> Close</span>
         </div>
       </div>

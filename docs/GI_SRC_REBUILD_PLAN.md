@@ -9651,10 +9651,250 @@ is the remaining half).
   M shifted phases → z-score) for the gradient stat, and a multi-pitch control
   family for the fold. REMAINING before default: seam statistic v2, and the
   Sponza-scale ms re-ledger (ultra res, strength-100 lamps).
-- **W4c — only if ever needed: stochastic + reservoir.** Filed, not planned.
+- **W4c — THE SEAM WAS REAL, AND THE TILE WAS THE SEAM. ✅ SHIPPED + GATE PASS
+  (2026-08-15).** W4b's "no seam by eye, statistic inconclusive" verdict above
+  is **RETRACTED**: it blamed the incommensurate-pitch control for the Y-grad
+  excess without ever running the null. Running it settles it in one line.
+  - **The null: N=4, same rig, same statistic.** At 4 lamps every tile keeps
+    the full set — census 0/435 H and 0/420 V boundaries differ, so no seam
+    can exist by construction, and the statistic reads **+0.015 / −0.016**.
+    That is the instrument's noise floor. N=12 at the same tile size read
+    **+0.110 X / +0.140 Y**, seven times the floor, on BOTH axes. The
+    statistic was never the problem.
+  - **The eyes agree, once you look at the right thing.** The centre crop
+    (not the boundary crop) shows it immediately: rectangular bright frames
+    hugging the storm's cubes. Grid-locked, tile-sized, and anchored to
+    SILHOUETTES — which names the mechanism. It is not "adjacent tiles keep
+    different sets" as a smooth-field step; it is **the tile centre landing
+    on a different surface than the pixel**. A tile straddling a silhouette
+    ranks all 64 of its pixels for whichever surface its centre hit, so the
+    pixels on the far surface get the near surface's four lamps.
+  - **Confirmed by exclusion, then by sweep.** The emitter shadow FILTER and
+    the two WIDE passes blur the packed channels, and under a tile cut a tap
+    from the neighbouring tile means a different emitter — the obvious
+    suspect. `EXTRA='{"__giEmitterWidePass":false}'` (new rig knob: dev
+    globals on BOTH arms) left the excess at +0.126. Not the filters. The
+    tile-size sweep then walked the artifact down monotonically —
+    **8 → +0.19/+0.16, 4 → +0.09/+0.11, 2 → (pitch too fine to measure),
+    1 → noise floor** — which is what a per-tile representative error does
+    and nothing else does.
+  - **The fix is to stop having a tile: `tileSize` defaults to 1** (one
+    ranking per emitter-shadow pixel, shared by the shadow march and the
+    resolve — still ONE dispatch, still the same buffers). **It is also
+    FASTER**: the cut pass goes 0.02 → 0.04 ms while emitterShadowPass drops
+    0.82 → 0.60 ms, because each pixel now marches its own nearest four
+    instead of a representative's. Adjacent-pixel set disagreement falls to
+    **4.4%** (1261/28438) from 19% at tileSize 8 — the ranking is smooth in
+    P, so the survivors are genuine geometric transitions. The scan is O(N)
+    per tile and nothing caps the tree's emitter count, so the default keeps
+    `tiles × N` bounded at ~16 evaluations per shadow pixel:
+    `tileSize = clamp(ceil(sqrt(N/16)), 1, 8)` — 1 up to 16 emitters, 2 to
+    64, 4 to 256. `__giEmitterTileSize` pins it.
+  - **TAIL COMPENSATION (`__giTileCutCompensate`, cap 2).** A top-4 cut drops
+    the tail's energy outright; the cut pass already scans every emitter, so
+    it now also writes `Σimp / Σimp(kept)` per tile (the normal vec4's free
+    `.w`) and the resolve scales its emitter direct by it — Walter's
+    lightcuts answer, the kept representatives carry the dropped power.
+    Measured: p50 1.17, p95 1.71, exactly 1.000 at N=4 (so PARITY is
+    untouched), **+2.7% canvas energy** over the uncompensated arm.
+    ⚠ **It must stay NEAREST, never interpolated** — the ratio is paired with
+    its own tile's kept sum, and blending it across tile centres hands tile
+    A's sum tile B's divisor and re-opens the step WIDER. ⚠ **The tail rides
+    the kept lamps' visibility**, since `importance` has no occlusion term; the
+    cap is 2 rather than the natural N/4 to bound what that costs in a
+    room-partitioned scene, and clipping under-delivers, which is the safe
+    direction. ⚠ At tileSize 8 the compensation made the seam WORSE
+    (+0.11 → +0.19 X) for the same reason the sets did — a centre-sampled
+    ratio applied across a silhouette. At tileSize 1 it is seam-neutral
+    (fold Δ +0.0020/+0.0004 vs +0.0016/+0.0004 uncompensated).
+  - **Rig hardening.** Three instrument fixes shipped with this: `EXTRA=` dev
+    globals on both arms (attribution by exclusion); the pitch now comes from
+    the LIVE tileSize instead of a hardcoded 8; and the boundary/interior
+    ratio returns **null, not 1**, when the pitch leaves no interior — it was
+    silently returning "no excess" below ~8 px, i.e. a gate that passes
+    because its instrument stopped existing. Below that pitch the verdict
+    says UNMEASURED out loud and rests on the luma fold and the crops. A
+    phase-folded |gradient| statistic was added (works at any pitch) but is
+    printed, not gated: it read +0.018 on the run where the boundary ratio
+    read +0.19, so it is not a sensitive detector.
+  - **Gate, at the shipping default (`SEAM=1 LAMPS=4,12`):** N=4 PARITY 1.023
+    (bar ≤1.05, comp exactly 1.000 everywhere); N=12 RECOVERY 0.0482 (bar
+    ≥0.008); SEAM **PASS**; sets ok, boot lines asserted, P spread interior;
+    emitterShadow 1.23 → 0.80 ms. **W4b SLICE-(ii): PASS.**
+  - Filed and still not planned: the original W4c idea (stochastic +
+    reservoir). Per-pixel ranking made it unnecessary at this N.
 
-W5 (R5 handoff to the tree set, seat retirement) depends on W4b's consumer shape —
-order stands W4a → W4b → W5 → default flips gated on real Sponza.
+- **W5a — THE TREE FOLLOWS THE LAMP. ✅ SHIPPED + GATE PASS (2026-08-15).**
+  The tree's emitter records are packed WORDS frozen at build time, where the
+  promoted slots opposite them are uniforms refreshed every frame — so every
+  record reader ([J]'s NEE since W3, the whole screen emitter chain since W4b)
+  lit a moving lamp from its BAKE POSE until the next full GI rebuild, and a
+  mesh drag never triggers one ("moving scene geometry costs a uniform update"
+  is the design). Closed by `#refreshLightTree`, called right after
+  `#refreshEmitterSlots` so the two descriptions of one lamp can never be a
+  frame apart. It covers dimming and colour ramps too — the same words carry
+  power.
+  - **The upload had to be new machinery.** `queueRegionUpload` builds a fresh
+    staging buffer AND a fresh compute per call, i.e. a new pipeline per call
+    — fine at build time, ruinous per frame. `createRegionUploader(maxWords)`
+    (dynamicObjects) reserves through the same bump allocator, compiles ONE
+    copy kernel, and re-sends only the attribute's bytes; it rides
+    `pendingDispatch`/`confirmDispatch` exactly as the header sync does, so a
+    skipped-pipeline frame retries instead of losing the write. The region is
+    reserved at `estimateLightTreeWords(N) × 1.25`, not at the first pack's
+    size — a re-pack of a slightly different set can want more words, and a
+    region sized to the first pack would refuse every later write and freeze
+    the tree at the build pose, which is the bug this closes wearing a hat.
+  - **Two bugs the gate found, neither of them the one it was written for.**
+    (1) `#chooseEmitterSeats` SORTS `_emitterCands` IN PLACE by camera-apparent
+    power, so an index-keyed pose cache compares one lamp's matrix against
+    another's — it reads "changed" on a still scene and repacks the whole tree
+    every frame the camera turns. The cache is a WeakMap keyed by mesh now.
+    (2) The same sort made emitter IDS a function of camera direction: the
+    first gate run saw 10 of 12 records renumbered by a single lamp move.
+    Nothing persists an id across frames today so it was harmless by luck;
+    `#lightTreeMeshes` sorts by object id and makes the id a stable name.
+  - **Self-throttled by measurement.** An animated emissive changes the
+    signature every frame; a repack that MEASURED over 0.5 ms is spaced to
+    ~10% of the time it costs, and a cheap one (a dozen lamps: tens of
+    microseconds) is never delayed. The pose is at most one throttle window
+    stale, never a rebuild away.
+  - **Gate (`npm run test:gi-lighttree-mover`, NEW).** Moves `Lamp0` +2.5 in Y
+    through `entity.setTransform` and reads the packed block back out of the
+    occupancy bits, twice, keyed BY MESH (`meshId:instanceId` — an id-keyed
+    diff reads a legitimate repack permutation as motion). **refresh ON: 1
+    record tracks the delta (2.500), 0 others move (worst drift 0.0000), 0
+    renumbered, no GI rebuild fired. refresh OFF (`__giLightTreeRefresh =
+    false`, the control that proves the assertion is sensitive to the
+    mechanism and not to some other thing that repacks trees): 0 records
+    move.** The no-rebuild assertion is load-bearing — a rebuild repacks the
+    tree anyway and would make the whole measurement vacuous.
+- **W5b — R5's HANDOFF MOVES TO THE TREE SET. ✅ SHIPPED + GATE PASS
+  (2026-08-15).** R5: a light that is SAMPLED must not also be hit by chance,
+  or its energy arrives twice (§12.26.7 measured 2.60× on mean floor
+  irradiance). Three sites enforced it — the static palette bake
+  (`#slotSurface`), the mover surface words (`isPromotedEmitter`) and the
+  analytic-only occluder spheres — and all three asked "does this mesh hold one
+  of the four PROMOTED SEATS?", which was the whole NEE set when they were
+  written. `#isNeeEmitterMesh` now answers for the tree set as well.
+  - ⚠ **IT KEYS ON `__giSrcLightTree`, NOT ON `__giEmitterTileCut`, AND THE
+    DIFFERENCE IS THE WHOLE FINDING.** R5 is a statement about the TRANSPORT
+    ([J] samples it); the tile cut is a statement about the SCREEN (which
+    emitters shade a visible pixel). Keyed to the screen hatch, the zeroing
+    deleted the un-seated lamps' emission from the field while nothing in the
+    transport had taken over sampling them: their entire multi-bounce
+    contribution vanished and a single screen-space direct term came back in
+    its place. The rig read it in one run — **RECOVERY +0.052 → −0.063, the
+    far half DARKER with the cut on than off.** Re-keyed to the transport
+    hatch and run with both armed, RECOVERY is **+0.0833**, the best the cut
+    has measured, because the comparison is finally honest on both sides (the
+    off arm's mean drops 0.599 → 0.562 — that was double-delivered energy).
+    **The two hatches are not independent and flip together**; the build now
+    warns when the cut is armed alone.
+  - **`emitterMeshes` WIRED** (srcSurface's palette flag, defaulted to
+    "nobody" since it was written). It made `emissiveOrphans` — the one check
+    a GPU counter structurally cannot make, "this surface's light exists on
+    neither path" — fire on every correctly-zeroed emitter. The palette now
+    names the NEE set (seats first, so an index below MAX_EMITTERS still means
+    the slot it always did), and the stats object is published as
+    `__giSurfacePaletteLive` so a gate can read it. The GPU R5 branch is
+    unaffected: it compares against giLight's SLOT array, so a tree-only index
+    reads "not a slot light" and finds nothing to zero — the palette having
+    zeroed it on the CPU already.
+  - **Gate (folded into `SEAM=1 LAMPS=4,12 TREE=1 run-gi-emitter-scale.mjs`):**
+    NEE-flagged palette entries **N=4: 4/4 both arms; N=12: 12/12 both arms**,
+    `emissiveOrphans` **0 everywhere**. With N=4 PARITY 1.020, N=12 RECOVERY
+    +0.0833, SEAM PASS, emitterShadow 1.21 → 0.82 ms. `test:gi-lighttree-nee`
+    re-run: energy ratio 1.008, noise 0.96×.
+- **THE SPONZA-SCALE ms LEDGER. ✅ RECORDED (2026-08-15,
+  `npm run test:gi-lighttree-sponza`).** The last gate the plan named, and it
+  opened with a finding about the scene rather than the tree:
+  **the user's Sponza carries ZERO emissive meshes and no light on GI shadow
+  source** — probed at 73 entities / 130 meshes, and every emitter pass reads
+  "NOT dispatched — 0 emitters" end to end. As saved, that scene cannot price
+  the tree at all, and a ledger run against it would have reported a
+  meaningless Δ0.000 as a pass.
+  So the rig MAKES emitters, in memory only: N meshes drawn from **GI's own
+  entry list** get a cloned material at `emissiveIntensity` 100. Two traps,
+  both now written into the rig — (1) a scene traverse reaches UI meshes, and
+  `Material.clone()` deep-copies `userData` THROUGH JSON, which turns a
+  UiImage's uniform NODES into plain objects and throws once per frame until
+  CDP times out; (2) a one-shot clone survives exactly ONE GI rebuild before
+  the editor re-applies the material from its asset — the first run built a
+  15-emitter tree and then measured a system with `_emitterCands` back to 0,
+  so the injection is a self-healing watcher that re-applies and re-requests
+  the rebuild. Nothing is written to disk: the tauri shim has no write path
+  and `scene.save` is never called.
+  **Ledger (2 rounds, ABBA, 15 bright emitters at strength 100, same canvas
+  area on both arms, high preset):**
+
+  | | slots | tree+cut | Δ |
+  |---|---|---|---|
+  | screen total | 6.572 ms | **6.162 ms** | **−0.410** |
+  | emitter chain | 6.293 | 6.026 | −0.267 |
+  | emitterShadowPass | 6.010 | 5.722 | −0.288 |
+  | resolve | 0.168 | 0.202 | +0.034 |
+  | emitterTileCut (new pass) | — | 0.05–0.06 | — |
+
+  Both tree rounds armed (cut boot line 242×118 tiles at **tileSize 1**, and
+  the `[J]` NEE line at depth 4 over 15 emitters); palette NEE flags **4 →
+  15** with `emissiveOrphans` **0 on all four arms**. At real scene scale the
+  tree+cut is CHEAPER while lighting 15 emitters instead of 4 — the per-pixel
+  cut's O(N) scan costs 0.06 ms and buys back more than that in the march.
+  ⚠ **The energy column is NOT a result here.** One slots arm captured a black
+  frame (meanLum 0.000 with entirely normal ms — the §12.66 black-boot class,
+  and the retry loop the rig now carries did not clear it), and the
+  injected-lamp harness heals asynchronously, so it is not a fair energy
+  instrument either. The energy claims stay where they were measured: the
+  storm rig's PARITY/RECOVERY and `test:gi-lighttree-nee`.
+- **W5c — retire the seats** (`MAX_EMITTERS`, the promotion path, the
+  camera-cadence re-rank, giLight's slot glow re-keyed to tile lists). NOT
+  DONE. It is pure removal once the defaults flip, and doing it before they
+  flip would leave no arm to A/B against.
+
+Order stands W4a → W4b → W4c → W5a → W5b → ledger → **THE FLIP ✅ TAKEN
+2026-08-15.** `__giSrcLightTree` and `__giEmitterTileCut` are `!== false` now,
+**together** (§12.70 W5b — never one).
+
+**The off arms went first, and that ordering is the point.** Every rig armed by
+setting the hatch `true` and took the DEFAULT as its control, so flipping the
+default alone would have turned `run-gi-emitter-scale`, `run-gi-lighttree-nee`
+and `run-gi-sponza-lighttree` into on-vs-on — every gate would keep printing
+PASS while comparing the tree against itself. All three now set the hatches
+explicitly on BOTH arms. The proof the fix worked is that the gates still
+DISCRIMINATE after the flip:
+
+| gate | post-flip |
+|---|---|
+| N=4 PARITY | 1.040 (bar ≤1.05) |
+| N=12 RECOVERY | **+0.0816** (bar ≥0.008) — an on-vs-on gate would read ~0 |
+| SEAM | PASS |
+| R5 palette flags / orphans | 4→4 and 12→12 / 0 everywhere |
+| `test:gi-lighttree-nee` | energy 1.009, noise 0.98× |
+| `test:gi-lighttree-mover` | both arms PASS |
+| `test:gi-lighttree`, `-descent`, `test:gi-occupancy`, `smoke:gi-gpu` | PASS |
+
+Also flipped with them: the "UNARMED" diagnostic now prints only when the
+scene HAS emitters (a scene with none is not missing anything), and the
+"armed without `__giSrcLightTree`" warning fires on an explicit `false` rather
+than on a missing `true`.
+
+**What the flip does NOT touch: a scene with no emissive meshes.** Measured on
+the user's real Sponza, which has zero: GI screen total 0.047 → 0.104 ms
+inside the run-to-run spread, the cut logs UNARMED (`region=false`), and
+meanLum is identical to four decimal places (0.3041 vs 0.3033). Whole-frame
+fps on that harness is NOT a usable instrument — four boots of identical
+configuration read 27/45/51/68 fps and 10.4–20.8 ms GPU, with the viewport
+panel coming back at two different heights. Quote GI pass ms, never harness
+fps.
+
+Still open: **W5c**.
+
+Known limits carried into that decision, none of them blockers but all of
+them unmeasured: the tail compensation rides the KEPT lamps' visibility (no
+occlusion term in `importance`, capped at 2); giLight's material glow goes
+unshadowed under the cut (the W4b trade, W5c's to re-key); and a mover emitter
+that is ALSO adopted as an exact dynamic object has no gate of its own.
 
 ### 12.71 THE NEW-SPONZA QUALITY LEDGER — what the banner Sponza exposed (2026-08-14 night)
 
@@ -9873,3 +10113,1640 @@ beats losing import settings). The user's 69 metas were restored by hand
 (flipY false, colorSpace srgb for diffuse / linear for orm+normal) and the
 whole sponza2 set left uncompressed, which also retires the ETC1S-on-a-non-
 colour-map damage until the encoder grows UASTC (§12.71's queued unit).
+
+## 12.76 THE THIN-GEOMETRY WARNING WAS LYING (2026-08-15, MEASURED + FIXED)
+
+Scoping the "banners don't block GI" quality item started with the measurement
+it deserved, and killed the item.
+
+`THICK=0.05 npm run test:gi-sunleak` at quality high — a 5 cm wall against
+0.089 m voxels, i.e. HALF a cell — sealed box, sun outside:
+
+| wall | interior added by GI | verdict |
+|---|---|---|
+| 0.40 m | 0.00000 | PASS |
+| 0.10 m | 0.00000 | PASS |
+| 0.05 m | 0.00000 | PASS |
+
+Bit-identical, against a 0.002 threshold. `test:gi-occupancy` agrees from the
+other side: sub-voxel 0.08 m walls fully present (1350/1350 probes), closed
+room SEALED (400/400 rays blocked). **Thin geometry blocks GI light.** The
+warning claiming otherwise was written for the COMPOSITED distance field —
+which did need ~2 cells to keep a wall's two faces apart — and never updated
+when occupancy became conservatively rasterized with exact per-cell triangles.
+
+It cost real work: the banner Sponza's flat curtains were filed against it, and
+this session's "sparse occupancy field" plan was scoped around it. Rewritten to
+say what is actually true — thin meshes block, but their two faces share a cell,
+hence one surface record and one bounce colour, so no front/back shading
+difference and no sub-cell detail. Same lesson as §12.66, in a second place.
+
+**And the memory it was used to justify is not where the memory is.** The
+occupancy field's 150.49 MB on the user's Sponza (336×160×224 @ 0.095 m):
+
+| term | words | MB | scales with |
+|---|---|---|---|
+| surface records + scratch | 14.9 M | 59.7 | `level0VoxelCount / 12` |
+| complex triangles | 18.1 M | 72.3 | `surfaceCapacity × 2` |
+| attribution stamps + palette | 2.1 M | 8.5 | records |
+| level-0 bits | 0.38 M | 1.5 | dense cells |
+| density pyramid | ~0.43 M | ~1.7 | dense cells |
+
+The BITS — the thing a brick allocator would sparsify — are 3 MB of 150. 88% is
+the record/triangle pools, which are already claimed on demand (803,173 of
+1,003,520 records live on this scene) but SIZED from the dense cell count. That
+is the real defect: occupied cells scale with SURFACE AREA (1/s²) while the
+`/12` heuristic scales with VOLUME (1/s³), so every halving of the voxel
+over-allocates twice as badly. Sizing the pools from measured or estimated
+occupancy — with the existing POOL STARVED audit as the safety net — is worth
+~20-25% here and is the precondition for any finer-cell plan. NEXT UNIT.
+
+**§12.76a triangle-pool ceiling SHIPPED + MEASURED (2026-08-15).** `2 triangles
+per record` → 1.5, from the live ratio (976,084 / 805,328 = **1.21**). Same
+scene, same pose, ultra: field **153.49 → 136.26 MB (−17.2, −11%)**, pool 65%
+used instead of 48%, and the per-cell overflow count is 2,666 — IDENTICAL to
+the pre-change run, so nothing new fell back to box hits. `test:gi-rayhit-phase4`
+ALL PASS (including its starved-pool arm). The record pool is untouched: on this
+scene `/12` lands within 25% of the truth (805,328 of 1,003,520 claimed), so the
+surface-area estimator is only worth building when a preset or a tighter volume
+makes the cells finer — where `/12` (volume) diverges from occupancy (area).
+
+## 12.77 THE FRAME BUDGET — WHAT 60 FPS AT ULTRA AND 120 FPS AT LOW ACTUALLY COST (2026-08-15, MEASURED)
+
+User target: **60+ fps at ultra, 120+ fps at low, without losing quality.** This
+section prices it. Every number below is one live reading of the banner Sponza
+(`GAME/scenes/Sponza.scene`, 73 entities, 191 draws, 762k tris, 1192 MB texture
+memory, 0 emitters, no gi-shadow light) at 1588×898, renderScale 1, ultra.
+
+⚠ **AND EVERY NUMBER IS A THROTTLED NUMBER.** `nvidia-smi` at the moment of
+measurement: **P3, 51.25 W against a 72.54 W limit, 1785 of 3105 MHz, `SW Power
+Cap: Active` AND `SW Thermal Slowdown: Active`.** This is not the 33 W Silent
+cap of [[dual-gpu-webview2-pin]] — it is a milder one, but the GPU is still
+running at ~57% of its boost clock. Re-measure the whole ladder from Turbo
+before treating any single item below as a ceiling.
+
+### The frame, decomposed
+
+`profile_frameStats`: **34.41 ms GPU / 27 fps**, cpu 6.83 ms.
+
+`profile_giPasses` — GI is **12.22 ms, 35% of the frame**:
+
+| block | ms |
+|---|---|
+| srcProbes chain | 9.225 |
+| resolve | 2.169 |
+| irrTemporalPass + irrHistoryPass | 0.823 |
+| **GI total** | **12.22** |
+| **everything else (raster + post)** | **22.19** |
+
+⚠ `resolve` appears in BOTH `screenPassesMs` and `queueMs` — same pass, two
+tables. Counting it twice inflates GI by 2.2 ms; the ledger above counts it once.
+The `emitterShadow*` rows print a nonzero ms next to "NOT dispatched — 0
+emitters" and cost nothing on this scene.
+
+### THE FINDING: the SRC chain's cost is proportional to the POOL, not to the live probes
+
+The cascade occupancy table, same reading:
+
+| cascade | live | capacity | load factor | failedInserts |
+|---|---|---|---|---|
+| 0 | 1,788 | 131,072 | 0.007 | 0 |
+| 1 | 598 | 65,536 | 0.005 | 0 |
+| 2 | 183 | 32,768 | 0.003 | 0 |
+| 3 | 54 | 16,384 | 0.002 | 0 |
+
+**2,623 live probes in 245,760 slots — 1.07%.** And `.compute()` bakes its thread
+count, so the passes sized from `probeCapacity` / `hashCapacity` /
+`blockCapacity` / `binTotal` sweep the whole allocation every frame regardless.
+Splitting the group table by what each pass is proportional to:
+
+| group | ms | proportional to |
+|---|---|---|
+| gather | 2.713 | resolve pixels |
+| deposit (trace + attribute) | 1.577 | rays (17,130) |
+| **deposit (decay)** | **0.954** | **bin pool** |
+| **populate** | **0.936** | **probe + hash capacity** |
+| **tiles** | **0.894** | **block pool x texels** |
+| shade + bounce [J] | 0.836 | hits |
+| **deposit (resolve)** | **0.486** | **binTotal** |
+| **merge** | **0.411** | **blockCapacity x bins** |
+| **rays** | **0.309** | **probeCapacity (6 sites)** |
+| **seed** | **0.082** | **probeCapacity x groups** |
+| **hashBlock** | **0.020** | **hash capacity** |
+| surfaces (palette) | 0.008 | records |
+
+**Live-proportional: 5.13 ms. Capacity-proportional: 4.09 ms — 44% of the
+srcProbes chain, 33% of all GI, spent on slots that are 99% empty.**
+
+This is the identity of §12.57's unexplained residue ("srcProbes 9.6 ms is
+PRESET-INDEPENDENT — the true 'lower presets do not help' term"). Presets move
+rays, probe density and resolve scale; not one of them moves an allocation, so
+4 ms of GI is the same at low as at ultra. It is also why §12.72's fix — which
+was right on energy — made low and medium *more* expensive in memory without
+buying frame time back.
+
+The sizing input is the culprit and it is a proxy for a measured quantity:
+`expectedC0Probes(pixelCount)` is a quarter of the pixel count, floored at
+16,384, saturating at 131,072 — while the system counts `live`, `failedInserts`
+and `COUNTER_NOBLOCK` every single frame.
+
+### Unit A — pool sizing (≈ −4 ms at EVERY preset, no quality change)
+
+Cheapest first. A1 and A2 are hours; A3 is the real fix.
+
+- **A2 (do this first — it is one boot).** `__giSrcBinBudget` ALREADY EXISTS as a
+  build hatch on `BIN_BUDGET` (1.4 M bins ≈ 48 MB), and it drives decay,
+  deposit-resolve, merge and tiles = 2.75 ms. Boot the user's Sponza at
+  175,000 and read `giPasses` + `COUNTER_NOBLOCK` + a screenshot A/B. This is
+  the decisive experiment for the whole section: if those four passes fall
+  proportionally with `noBlock` still 0, Unit A is confirmed and A1/A3 are
+  scheduling, not research.
+- **A1.** Add the matching `__giSrcC0Probes` hatch (there is none — c0 is
+  pixel-derived), then replace the pixel proxy with a measured high-water mark:
+  size from `live` with hysteresis, grow on `failedInserts`/`noBlock` pressure.
+  The starvation counters are the safety net and they already exist; §12.52.2's
+  record-pool starvation is the failure mode to respect — **grow-on-pressure
+  must land before shrink-on-slack ships**, or an enclosed scene gets the
+  palette-mean wash again.
+  ⚠ The store rebuild is the §12.48 resize path, which has bitten twice
+  (`setSize` forwarding 6 of 10 args; the resolve rebuilt over disposed
+  buffers). Re-sizing must ride that path, not a new one.
+- **A3.** Drive the capacity passes off the compact pass's live count by
+  indirect dispatch. Blocked on whether three's WebGPU backend exposes
+  `dispatchWorkgroupsIndirect` through TSL at all — `.compute(n)` bakes n, and
+  srcSystem's own comment at :438 says the thread count "cannot be a uniform".
+  Check before planning around it; if it is not reachable, A1+A2 is the whole
+  win and A3 is a three.js upstream item.
+
+### Unit B — the per-pixel half of GI (ultra only)
+
+gather 2.713 + resolve 2.169 = 4.88 ms of full-resolution work. Ultra is
+*defined* as the full-res resolve (BY_TIER's comment: ultra pays ~4x to remove
+the upsampled shadow/AO edges), so cutting it IS losing quality and it sits
+below the line the user drew. Noted for completeness; not proposed.
+
+### Unit C — the other 22.19 ms, which is the majority of the 60 fps job
+
+**Arithmetic first: with GI free, this frame is 22.19 ms = 45 fps.** No amount of
+GI work reaches 60 at ultra on its own. Named levers, from the ledger in
+[[new-sponza-perf]]:
+
+- **SSR is the pole and it is blocked on a denoiser.** Full-res + 5 blur levels;
+  the user's own no-post test put the whole post chain at ~7-13 ms. Half-res SSR
+  was tried and *caused* the metallic-embroidery flicker (user-confirmed by an
+  intensity-0 A/B), so the unit is **an SSR temporal/reprojection pass first,
+  then half res** — worth ~2-3 ms and it is the single biggest non-GI win.
+- **Godrays at half res.** GTAO is already 849x453.
+- **Raster ≈ 12 ms** over 1192 MB of uncompressed 4K PBR — bandwidth. The lever
+  is texture compression and it is blocked on **UASTC in the Rust encoder**
+  (ETC1S crushed the ORM/normal maps; the rule and the mitigation are in
+  [[new-sponza-perf]]). Queued with a known spec.
+- **MSAA 4 and the sun shadow map are both ACQUITTED** — measured, each < 1 ms.
+  Do not re-spend time there.
+
+### Unit D — the machine (free, and it is not engine work)
+
+Armoury Crate → Turbo, and re-check `nvidia-smi -q -d PERFORMANCE,POWER`. Going
+from 51 W / 1785 MHz to the 90 W ceiling is worth roughly 1.4-1.7x on a
+per-pixel-bound frame: 34.4 ms → ~22 ms → ~45 fps before a line of code changes.
+
+### Verdict against the two targets
+
+**60 fps at ultra (16.7 ms): reachable, but not from GI alone.**
+`(34.4 − 4 [A] − 3 [C: SSR]) x ~0.67 [D]` ≈ 18 ms ≈ 55 fps, with texture
+compression (UASTC) as the reserve that closes it. Every term is required.
+
+**120 fps at low (8.3 ms): the GI preset cannot deliver it, and that needs
+saying plainly.** `BY_TIER` only sets `resolveScale` and `exactReflections` —
+the preset governs GI and nothing else. Raster + post stay ~22 ms at low, which
+is 45 fps before GI runs. **120 fps at low is a RENDERER target (Unit C + D +
+renderScale), not a GI target.** What GI owes it:
+
+| | today at low | after Unit A |
+|---|---|---|
+| capacity passes | 4.09 | ~0.5 |
+| deposit trace + shade | ~2.4 | ~1.2 |
+| gather + resolve + irr chain (÷4 at resolveScale 0.5) | ~1.4 | ~1.4 |
+| **GI at low** | **~7.9 ms** | **~3.1 ms** |
+
+Today GI at low is the ENTIRE 120 fps budget. Unit A is what makes the target
+arguable at all. Getting from 3.1 to the ~2 ms a 120 fps frame can spare is
+§9's named lever, untouched since it was written: **rays/pixel < 1 —
+checkerboard + temporal ray budget.** That is the next GI unit after A.
+
+### Order of work
+
+1. **A2** — the `__giSrcBinBudget` boot A/B. One experiment, decides Unit A.
+2. **D** — unthrottle, re-measure the whole ladder. Costs nothing, moves everything.
+3. **A1** — measured pool sizing, grow-on-pressure before shrink-on-slack.
+4. **C** — SSR temporal → half-res SSR; godrays half-res.
+5. **UASTC** in the Rust encoder, then re-enable the sponza2 metas.
+6. **Rays/pixel < 1** for the low preset.
+
+## 12.78 GI IS NO LONGER WHY BASIS IS OFF — THE ENCODER IS (2026-08-15, AUDITED)
+
+User: *"I believe we disable basis for GI, so textures are huge. Isn't there a way
+we could use texture compression with GI?"* — the belief is out of date by one
+session, and the real blocker is somewhere else.
+
+**GI handles compressed textures. That shipped.** `voxelizeOnce`'s bounce-albedo
+sampler used the canvas path, and a KTX2 texture has no drawable `image`, so it
+cached null and the near-white glTF base-colour factor stood in — the washout the
+user correctly attributed to compression. The fix is in the tree and verified
+this session: `computeCompressedTextureAverage` (giScreen.js:2285 — a 32×32 quad
+render of the compressed texture into a LINEAR rgba8 target plus a readback, with
+the sRGB decode in-shader so the mean is unbiased), the `pendingTextureAverages`
+queue in voxelizeOnce (compressed → queue and return null UNCACHED, riding the
+existing retry-next-scan contract), and the drain in GISystem's tick (:1910,
+gated on `!this._compileWaveActive` and draining the WHOLE queue in one tick —
+the trickle caused a boot rebuild storm). **Nothing about GI requires uncompressed
+textures today.**
+
+**What actually turned the 69 metas off is `compress_texture_basis`
+(src-tauri/src/lib.rs:22).** It takes a path and nothing else, and hardcodes:
+
+```
+basisu <path> -ktx2 -mipmap -linear -q 180 -output_file <path>.basis
+```
+
+Two defects in one line, both confirmed against the vendored encoder's own help
+text (`node_modules/@gpu-tex-enc/basis/bin/win32-x64/basisu.exe`):
+
+1. **ETC1S for everything.** There is no `-uastc`, so ORM and normal maps get a
+   codec built for perceptual colour — which is what crushed the thread-scale
+   metalness to ~0 while the source PNG histogrammed fine, and killed the
+   embroidery reflections. The rule is already written down: never ETC1S a
+   non-colour map.
+2. **`-linear` unconditionally — and that one is wrong for the ALBEDO.** basisu's
+   help: *"By default, textures will be converted from sRGB to linear light
+   before mipmap filtering, then back to sRGB … unless `-linear` is specified"*,
+   and `-linear` also swaps the codec's sRGB error metric for a linear one. So
+   every compressed diffuse map was mip-filtered in the wrong space and had its
+   bits allocated against the wrong metric. **This is a live candidate for the
+   OPEN residual in [[new-sponza-perf]]** — the user's *"mostly gone… a bit more
+   saturated before, still"* after the bounce-albedo fix. It was never on the
+   suspect list because nobody read the encoder invocation.
+
+**THE MAP-TYPE SIGNAL ALREADY EXISTS AND NEEDS NO NEW METADATA.** The glTF
+importer writes `colorSpace` into each `.meta` — `srgb` for diffuse, `linear` for
+orm/normal (this is exactly what §12.75's clobbering bug destroyed and what was
+restored by hand). So the selection rule is one read:
+
+| `.meta` colorSpace | codec | flags |
+|---|---|---|
+| `srgb` (albedo, emissive) | ETC1S | `-q 180`, **no `-linear`** |
+| `linear` (ORM, metal-rough) | UASTC | `-uastc -uastc_level 2 -uastc_rdo_l 1.0 -linear` |
+| `linear` + normal map | UASTC | as above plus `-normal_map` |
+
+`-normal_map` is a real flag and does the right thing (*"linear colorspace
+metrics, linear mipmap filtering, no selector RDO, no sRGB"*). `-q` is
+ETC1S-only and is ignored under `-uastc`. KTX2 UASTC is Zstandard-compressed by
+default, so the on-disk cost is not the raw 8 bpp.
+
+**What it is worth.** The user's Sponza reports **1192 MB** of texture memory and
+[[new-sponza-perf]] prices the raster block at ~12 ms of a 34 ms frame — that
+block is bandwidth over uncompressed 4K PBR. ETC1S is ~8× off RGBA8 and UASTC
+~4×; a mixed policy lands the set near 200-250 MB and stays compressed in VRAM
+rather than only on disk. **This is Unit C's cheapest term and it unblocks the
+§12.77 60 fps arithmetic.**
+
+**Work order:** (1) add a `mode` parameter to `compress_texture_basis` and pass
+the flag sets above; (2) have `compressTextureBasisImpl` read `colorSpace` from
+the `.meta` and choose — the `writeMeta` clobber guard is already in place
+(basisCompress.js:37, throws rather than dropping settings); (3) gate it
+NUMERICALLY — decode the KTX2 through a harness readback and compare rows and
+channel means against the source PNG. That gate is also what settles the OPEN
+orientation mystery, which was last chased by flipping `flipY` at the live scene
+and reading nothing. (4) Only then re-enable the 69 metas.
+
+⚠ Do not re-enable compression before the gate exists. This asset set has now
+been damaged twice — once by the codec, once by the meta writer — and both times
+it was diagnosed from the picture rather than from a number.
+
+## 12.77.1 UNIT A MEASURED — THE A2 EXPERIMENT RAN, AND IT CONFIRMS WITH ONE CORRECTION (2026-08-15)
+
+`scripts/run-gi-poolsize.mjs` (NEW), four fresh boots of the REAL project at the
+§12.66 pose, ultra, **identical resolve dims (806×392) on all four** so the
+comparison is legitimate. Two controls, two treatments. `__giSrcC0Probes` was
+added to srcSystem.js this session — the bin pool had a dial, the probe-slot
+pool did not.
+
+| arm | capacityMs | GI total | MB | orphanRate | frameMean | rays |
+|---|---|---|---|---|---|---|
+| control | 3.685 | 9.045 | 88.22 | 0.216 | 0.2672 | 28118 |
+| control (replicate) | 3.544 | 7.053 | 88.22 | 0.257 | 0.2152 | 28104 |
+| `__giSrcBinBudget=700000` | 1.594 | 6.271 | 60.84 | 0.068 | 0.2717 | 28066 |
+| + `__giSrcC0Probes=16384` | **1.187** | **5.762** | **47.66** | 0.068 | 0.2723 | 28078 |
+
+`noBlock 0`, `clamped 0`, `failedInserts [0,0,0,0]` on **all four arms**. Rays,
+hits (0.955), meanT (3.47-3.50), shaded and deposits are identical to within
+0.2% everywhere — **nothing was skipped; the same transport ran cheaper.**
+
+**THE DISSOCIATION IS THE RESULT, not the totals.** Each knob moved its own
+group and left the other flat, which is what rules out "the treatment boot was
+luckier":
+
+| group | sized from | control | bin700k | +c0 16k |
+|---|---|---|---|---|
+| deposit (decay) | bin pool | 1.678 | 0.257 | 0.256 |
+| deposit (resolve) | bin pool | 0.693 | 0.201 | 0.199 |
+| tiles | block pool | 0.346 | 0.182 | 0.179 |
+| merge | blocks × bins | 0.265 | 0.231 | 0.201 |
+| populate | probe + hash cap | 0.294 | 0.306 | **0.180** |
+| rays | probeCapacity | 0.338 | 0.342 | **0.144** |
+| seed | probeCapacity | 0.054 | 0.056 | **0.022** |
+| hashBlock | hashCapacity | 0.017 | 0.019 | **0.006** |
+| gather | resolve pixels | 0.324 | 0.338 | 0.345 |
+
+The four probe-slot passes are FLAT across the bin-budget arm and only fall when
+the slot dial moves; the four bin-pool passes do the reverse. **The cost model in
+§12.77 is correct.**
+
+### THE CORRECTION: the two pools are over-allocated by very different factors
+
+§12.77 read "245,760 slots for 2,623 live probes — 1.07%" and priced the whole
+4.09 ms against that ratio. Wrong, and the arithmetic says why. `blockCapacities`
+splits `BIN_BUDGET` equally across cascades and divides by `binCount(c)`, which
+rises 4× per cascade:
+
+| budget | c0/c1/c2/c3 blocks | headroom over live | binTotal | MB |
+|---|---|---|---|---|
+| 1,400,000 (default) | 10937/2734/683/170 | 3.99/3.01/2.42/2.36 | 1,397,792 | 48.0 |
+| 700,000 | 5468/1367/341/85 | 2.00/1.51/1.21/1.18 | 698,624 | 24.0 |
+| 525,000 | 4101/1025/256/64 | 1.50/1.13/**0.91**/**0.89** | 524,576 | 18.0 |
+
+**The BIN pool was only ~3× over-allocated and 700k is already near its floor** —
+525k starves c2/c3 on this scene. The PROBE-SLOT pool is the one that was 48×
+over (131,072 for 2,740 live), and it took a ÷8 with headroom to spare. So the
+realistic recoverable figure is **~2.4 ms, not ~4 ms**: control mean 3.61 →
+1.19, with GI total ~8.05 → ~6.02 (−25%) and the store 88.2 → 47.7 MB (−46%).
+
+### ⚠ THE DECAY PASS IS SUPERLINEAR, AND THAT IS A CACHE CLIFF, NOT A SLOPE
+
+`binTotal` halves exactly from 1,400k to 700k, but decay fell 1.678 → 0.257.
+Even against the noisy control replicate (0.955) it is ~3.7×, not 2×. The bin
+pool at 9 words/bin is **48.0 MB at the default and 24.0 MB at 700k**, and the
+4070 Laptop's L2 is in between. A pool that fits in L2 is a different machine
+from one that does not. Consequences: **the target is not "as small as safe" but
+"under L2"**, the win is hardware-specific in MAGNITUDE though not in direction,
+and the sizing law should be validated with a budget SWEEP looking for the knee
+rather than a single ratio. Not yet run.
+
+### ⚠ TWO THINGS THAT ARE NOT YET UNDERSTOOD — READ BEFORE SHIPPING UNIT A
+
+1. **`orphanRate` improves 3.5× and I cannot explain it.** Controls read 0.216
+   and 0.257; BOTH treatments read exactly 0.068. That is replicated and far
+   outside the control spread, so it is real, not noise. `orphanRate` is the
+   fraction of known bins whose parent lattice had no probe at all — merge's own
+   header calls it "the one to watch" — and a smaller pool should if anything
+   make it WORSE. `resolvedRate` falling 0.99 → 0.86 is arithmetically expected
+   and not a regression: the previously-orphaned bins (kept as-is, outside
+   `merged`) now merge, growing the denominator, and they are the far ones that
+   do not reach T=0. Live probe counts are identical across arms
+   (2740/907/282/72 vs 2740/898/290/81), so it is not a population effect.
+   **A pool-size change that alters merge connectivity is not purely a budget
+   change. Find the mechanism before this ships** — the direction is favourable
+   (more indirect light reaching the ladder, which is the user's standing
+   complaint), which is exactly why it would be easy to bank and wrong to.
+2. **Cross-boot IMAGE comparison on this rig is weak and the replicate proves
+   it.** The two identical controls read frameMean **0.2672 and 0.2152 — a 24%
+   spread** on the same config, same pose, same resolve size. The treatments are
+   much tighter (0.2717/0.2723) and sit at the top of the control range, and the
+   8×6 region grid shows +2.4% mean / +9.9% max, almost all positive. That is
+   consistent with the orphan finding but **it is not evidence on its own**.
+   Same lesson as §12.63 and [[gi-harness-viewport-traps]]: only the
+   capacity-ms split and the replicated orphanRate are quotable here. `decay`
+   alone is NOT (0.955 vs 1.678 across two identical controls).
+
+### What this changes in the work order
+
+A2 is **done and positive**. A1 (measured pool sizing) is now scheduling rather
+than research, with three constraints the experiment added: size the bin pool
+**per cascade from measured live counts**, not by an equal split of one budget
+(c2/c3 are the tight ones and the equal split is what makes them tight); aim the
+bin pool **under L2** rather than at a fixed ratio; and **explain the orphan
+effect first**. The probe-slot pool is the easy half — 48× over, ÷8 measured
+clean, and `__giSrcC0Probes` now exists to A/B it.
+
+## 12.78.1 THE ENCODER FIX — SHIPPED AND MEASURED ON THE DAMAGED ASSETS (2026-08-15)
+
+User: *"1GB is occupied with textures, and I think that's why it is slower, we
+need to be able to use compressed textures."* Live overlay at the time read
+1.04 GB textures; `profile.frameStats` a moment later read 1060.6 MB, 23.14 ms
+GPU, 39 fps. (The screenshot's 17 fps was transient — 26.5 ms GPU cannot produce
+17 fps; treat single overlay samples as anecdote.)
+
+**SHIPPED, three files.** `compress_texture_basis` (src-tauri/src/lib.rs) takes a
+`mode: Option<String>` and builds its arg vector from it; `basisModeFor`
+(src/editor/basisCompress.js) derives the mode from the asset's own `.meta`;
+`compressTextureBasisImpl` reads the meta BEFORE encoding and records the chosen
+`mode` in the `basis` block. `cargo check` clean. **UASTC RDO is deliberately
+off** — it trades precision for LZ size, and UASTC transcodes to BC7 either way,
+so RDO would shrink the file on disk and give back exactly the precision this
+change exists to restore.
+
+### The gate, and what it measured
+
+`scripts/basis-codec-gate.ps1` (NEW, `npm run test:basis-codec -- -Dir <dir>`).
+It needs **no editor, no Tauri build and no GPU**: it drives the vendored
+`basisu` directly, encodes each source both ways, transcodes both back with
+basisu's own `-unpack`, and compares per pixel against the source. That loop
+runs in seconds, which is why the flag choice could be validated before the app
+was ever rebuilt.
+
+**The map from the damage report, found by scanning all 23 sponza2 ORM sources
+for metalness content — `Material_15 orm.png`, B mean 0.0725, 31.4% of texels
+above 0.06. That is the map §12.75's dossier describes (`mean 0.072, max 1.0,
+31%>0.06`), identified by number rather than by memory.** Transcoded to BC7,
+which is what an NVIDIA GPU actually receives:
+
+| codec | MAE R (AO) | MAE G (rough) | **MAE B (metal)** | metal mean | **texels > 0.06** |
+|---|---|---|---|---|---|
+| source | — | — | — | 0.0736 | **31.66%** |
+| OLD (ETC1S `-linear -q 180`) | 0.0088 | 0.0268 | **0.0361** | 0.0703 | **28.25%** |
+| NEW (UASTC level 2) | 0.0023 | 0.0056 | **0.0052** | 0.0745 | **32.27%** |
+
+**ETC1S's error on the metalness channel is 0.0361 against a channel mean of
+0.0736 — 49% relative — and it deleted 11% of the metal texel population
+outright.** UASTC reads 0.0052 (7% relative) and holds the population to +1.9%.
+That is the dead-embroidery-reflections bug, measured, on the exact asset.
+Across the first six sponza2 maps the data-map improvement is **3.5× to 15.4×**.
+
+### The `-linear`-on-albedo defect is REAL and it lives in the MIP CHAIN
+
+Same protocol on `Material_15 diffuse.png`, comparing `-linear` against correct
+sRGB filtering:
+
+| | R | G | B | linear-light luminance |
+|---|---|---|---|---|
+| source (1024²) | 0.1407 | 0.3043 | 0.4829 | 0.0815 |
+| OLD `-linear`, mip 0 | 0.1393 | 0.3035 | 0.4803 | 0.08051 |
+| NEW sRGB, mip 0 | 0.1393 | 0.3041 | 0.4808 | 0.08037 |
+| **OLD `-linear`, mip 3** | **0.1379** | 0.3002 | 0.4849 | **0.07406** |
+| **NEW sRGB, mip 3** | **0.1628** | 0.3114 | 0.4701 | **0.07958** |
+
+**Mip 0 is indistinguishable; mip 3 is 6.9% darker and its RED channel is 15.3%
+lower** under `-linear`, while blue rises 3.1%. Averaging sRGB code values
+directly instead of in linear light is darker by construction (mid-grey of 0 and
+255 is 128, not 188), and the error is largest where contrast is highest —
+which is per-channel, hence a hue shift, not just a dim. Across the gate's
+sample the mip-3 luminance drift ran **3.2% to 10.9%**.
+
+**A Sponza interior samples mips 2-5 over almost its whole screen area.** So the
+compressed albedo was being minified into something darker and cooler than the
+source, warm content losing the most — which is a specific, mechanical candidate
+for the user's OPEN *"mostly gone… a bit more saturated before, still"*. Not
+proven to be the whole residual; it is now the first thing to re-measure.
+
+⚠ **A METRIC CAVEAT THE GATE ENCODES DELIBERATELY.** On colour maps the NEW arm
+scores slightly WORSE on mip-0 MAE (0.8×) — because MAE is a linear per-channel
+absolute error and `-linear` optimises the codec against exactly that, while
+sRGB metrics optimise perceived error. **The MAE metric structurally favours the
+broken arm on colour maps.** That is why the gate judges data maps by MAE and
+colour maps by mip-chain drift, and why a single "which number is lower" summary
+across both would have concluded the old flags were fine.
+
+### What it is worth, and what is NOT yet done
+
+sponza2 is 69 maps at 1024²: ~5.6 MB each as RGBA8 with mips ≈ **386 MB**, going
+to ~0.7 MB (ETC1S→BC1) for the 23 colour maps and ~1.4 MB (UASTC→BC7) for the 46
+data maps ≈ **80 MB**. Roughly **4.8×**, and it stays compressed in VRAM rather
+than only on disk, which is the part that buys raster bandwidth back.
+
+**NOT DONE — and it needs the user:** the 69 metas still carry
+`basis.enabled:false`, and re-enabling them needs the editor rebuilt onto the new
+Rust command (an `.meta` written by the OLD binary would record `mode` while
+having been encoded ETC1S). Sequence: rebuild → `npm run test:basis-codec` on
+the target folder → re-enable → confirm textureMemMB falls and the embroidery
+reflections return. The orientation mystery ([[new-sponza-perf]]) is still open
+and this gate is the instrument for it: transcode and compare ROW ORDER against
+the source rather than flipping `flipY` at the live scene.
+
+## 12.78.2 THE RE-ENABLE WAS A SILENT NO-OP — THE OPT-OUT AND THE DAMAGE CONTROL ARE THE SAME BIT (2026-08-15)
+
+User rebuilt, re-enabled compression, and reported texture memory moving **1.02 GB
+→ 969 MB — about 5%, where ~4.8× was predicted.** "Maybe it didn't work?"
+
+It hadn't run. Three pieces of disk evidence, before any theory:
+
+1. **All 69 sponza2 metas still read `"enabled": false`.** Zero at true.
+2. **Every `.basis` was dated 2026-08-14 23:38** — the previous night's ETC1S pass.
+3. **`Material_15 orm.png.meta` recorded `compressed: 175005`, byte-identical to
+   the OLD-flags encode produced by the gate in §12.78.1**, and **no meta
+   anywhere carried a `mode` field** — so the new JS had never touched them.
+
+**ROOT CAUSE: `compressAllProjectTexturesImpl` skips any texture whose meta says
+`basis.enabled === false`** — and the ETC1S mitigation had set exactly those 69
+to false. The bulk pass therefore skipped precisely the set that needed fixing,
+returned `{compressed: 0}`, and said nothing. **An opt-out written as damage
+control is indistinguishable, in the data, from a deliberate one**, so the fix
+for a bad codec is structurally unable to reach the assets that codec damaged.
+
+**FIXED:** `compressAllProjectTextures({force})` re-encodes opted-out textures
+and re-enables them; `skipped` is now RETURNED and logged (`[basis] N texture(s)
+skipped — they carry basis.enabled:false`) instead of being silent; the
+`asset.compressAllTextures` op gained a `force` param documenting why it exists.
+A bulk operation that does nothing must say so.
+
+### Verifying the Rust rebuild without trusting "I restarted the dev server"
+
+`npm run dev` restarts Vite; the Tauri binary is a separate build, and "restarted
+the dev server" cannot distinguish them. **The output SIZE is an exact
+discriminator** and needs one call: on `Material_15 orm.png`, old ETC1S = 175,005
+bytes, new UASTC = 963,610 bytes (both measured in §12.78.1). One
+`asset.compress` returned **963,610** ⇒ new JS *and* new Rust both live. Cheaper
+and more certain than reading a version banner.
+
+### The re-encode ledger
+
+Driven through `asset.compress` per file — that path never consulted the opt-out,
+so it needed no HMR-fresh code. All 69, zero failures:
+
+| mode | files | |
+|---|---|---|
+| `srgb` (ETC1S) | 25 | diffuse — ~170-300 kB each |
+| `normal` (UASTC) | 24 | ~450 kB-1.35 MB |
+| `linear` (UASTC) | 20 | ORM — ~360 kB-1.2 MB |
+
+On-disk derivatives **133.0 MB → 45.6 MB**, and an audit confirms **all 69 kept
+`flipY: false` and their `colorSpace`** — the §12.75 clobber guard holding under
+a 69-file rewrite, which is the first time it has been exercised at scale.
+
+⚠ **`textureMemMB` DOES NOT MOVE UNTIL A RELOAD, and that is not a failure.**
+Immediately after the re-encode it still read 969.7 MB: the derivatives are on
+disk but the GPU still holds textures uploaded from the PNGs, and
+`invalidateBlobUrl` clears a cache, not a live upload. **The measurement must be
+taken after a scene/editor reload**, or the honest conclusion is "no data yet"
+rather than "no effect" — the same class of mistake as the 17 fps overlay sample
+in §12.78.1. Confirmation of the VRAM figure is therefore still PENDING.
+
+### CONFIRMED AFTER RELOAD — and the ratio needs an honest denominator
+
+| | before | after |
+|---|---|---|
+| textureMemMB | 1020 | **543.2** |
+| GPU ms | 23.14 | **20.37** |
+| fps | 39 | **44** |
+
+**−2.77 ms off the frame (−12%) for zero quality cost** — the first confirmed
+non-GI cut of the §12.77 programme, and it lands squarely on the raster block
+that section priced at ~12 ms.
+
+**The user's correction is right and worth writing down: 1020 → 543 is 1.88×, not
+the 4.8× predicted.** The prediction was not wrong; the DENOMINATOR was. 4.8× was
+computed for *sponza2's 69 maps in isolation*, while `textureMemMB` counts every
+resident GPU texture — and most of what remains is not compressible source art:
+
+* **Render targets.** At 1588×898 the GI chain alone holds gbuffer position +
+  normal, irradiance raw/filtered/history, radiance, the shadow channels and an
+  873×494 emitter-shadow set, mostly rgba16f; the post chain adds 4× MSAA colour
+  and depth, full-res SSR plus 5 blur levels, GTAO and bloom mips. That is
+  comfortably 300-400 MB, and **no codec touches any of it.**
+* **103 other project textures** still on the old flags (171 total; the 68
+  opt-outs were all sponza2). The Old Church interior set alone carries 27.8,
+  20.2, 19.6 and 14.7 MB source PNGs — one 4096² RGBA8 with mips is ~89 MB of
+  VRAM by itself.
+
+Backing the arithmetic out: a 477 MB drop from a set that compressed ~4× implies
+those maps held ~636 MB and now hold ~159 MB, leaving ~384 MB of targets and
+untouched textures. Self-consistent, and it means **the achievable ratio on the
+overall counter is bounded well below the per-asset ratio.** Quote the per-asset
+figure and the frame time; do not quote `textureMemMB` ratios as codec
+performance.
+
+⚠ The remaining 103 are already `enabled: true`, so a plain
+`asset.compressAllTextures` (no `force`) now re-encodes them correctly — left for
+the user, since it rewrites assets outside the scene under test.
+
+## 12.80 ULTRA JOINS THE SHADOW-SCALE LADDER — AND A REBUILD DROPS THE GI SUN (2026-08-15, SHIPPED + ONE OPEN BUG)
+
+(§12.79/§12.79b — the analytic-penumbra diet and the `#lightShadowScale` ladder
+this section extends — shipped earlier today from a parallel session; their
+ledger is in [[gi-frame-budget]] pending that session's write-up here.)
+
+**The user's directive: gi shadows should cost no more than shadow maps, so they
+can replace them outright** (they already return ~256 MB of texture memory — the
+four 4096² maps). The live ultra frame said the blocker out loud:
+`lightShadowPass` **16.38 ms of a 31.6 ms frame (52%)** at 1588×898, because
+§12.79b deliberately left `ultra: 1` in the scale ladder ("the tier that does
+not get capped"). That contract predates the measurement; it is the same
+"presets don't move the expensive thing" defect §12.77/§12.79b fixed everywhere
+else, surviving on the one tier the user actually runs.
+
+**SHIPPED: `ultra: 1 → 0.5`** (GISystem.js `#lightShadowScale`). Ultra's shadow
+channel now matches HIGH's absolute pixel count (high = 0.7071²-scaled resolve ×
+0.7071² again ≈ 0.25× drawing buffer = ultra's 1 × 0.5²). `__giShadowScale = 1`
+is the one-boot A/B back.
+
+**Gate (run-gi-poolsize.mjs, 2 fresh boots of the real project, ultra, identical
+806×392 resolve):**
+
+| arm | shadowPx | lightShadowPass | shadow chain | frameMean | blackFrac | rays |
+|---|---|---|---|---|---|---|
+| `__giShadowScale=1` | 806×392 | 5.686 | 6.507 | 0.2046 | 0.0557 | 28056 |
+| default (0.5) | 403×196 | **1.858 (−67%)** | **2.115** | 0.2048 (+0.1%) | 0.0539 | 28102 |
+
+Screenshots indistinguishable; per-pixel cost ~18-19 ns on both arms (the pass
+scales clean with pixels — no per-invocation floor worth chasing yet).
+
+**Live editor (user's Sponza, ultra 1588×898, gi-mode sun):** lightShadowPass
+16.38 → 6.91 ms, whole shadow chain 19.08 → 8.54 ms, **frame 31.6 → 24.2 ms**.
+GPU healthy P0 84 W of 87 (Performance mode — NOT the Silent cap; checked first
+per [[dual-gpu-webview2-pin]]).
+
+**Shadow-map parity arithmetic, measured on the same scene minutes apart:** with
+the sun back on 2048² Basic maps the frame read 20.05 ms; on gi shadows 24.19 —
+**gi shadows currently cost ~4.1 ms more than a 2048 map on this scene.** The
+named next levers, in order of confidence: (1) checkerboard trace + temporal
+fill — the filter already integrates frame-jittered IGN samples, so tracing half
+the pixels per frame is the mechanism the chain was built for (~3.5 → ~1.8 ms,
+but the 20-second day-cycle sun stresses history reuse — gate on §12.67's
+settle); (2) N·L/sky early-outs in the trace kernel (back-facing receivers
+already skip via the terminator gate — audit what fraction remains); (3) further
+scale (0.35) — cheapest to test, softest result. Parity also buys the win twice:
+a gi sun needs no shadow-map render pass AND no 64-256 MB of map textures.
+
+### The 60 fps ledger (2026-08-15 night — user's target restated: 60+ at ultra)
+
+16.6 ms budget against a 24.2 ms frame; GI owns ~18.7 (shadow chain 8.54 + SRC
+8.77 + resolve/temporal 1.4), raster+rest ~5.5. The ~7.6 ms must come out of GI:
+
+| lever | Δms (live 1588×898) | status |
+|---|---|---|
+| SRC pool defaults (bin 700k + c0 16k, §12.77.1) | **−2.6** | measured, ships behind grow-on-pressure; orphan question NARROWED (below) |
+| checkerboard shadow trace + temporal fill | **~−3.4** | mechanism in place (IGN jitter + filter/history/reprojection); gate on moving-sun flicker rig |
+| shadow scale 0.5 → 0.35 | **−3.1** | priced this session (1.858 → 1.095 ms harness, luminance flat) — overlaps checkerboard; softer penumbra; NEEDS same-boot visual A/B (the 0.35 arm booted into a different day-cycle phase, screenshots incomparable) |
+| N·L / sky early-outs | ~0 | already exist (terminator gate + gbuffer gate) — struck from the list |
+| renderScale 0.75 | ~−5 | instant, whole-frame, the pragmatic fallback |
+
+Arithmetic: pools + checkerboard ≈ 18.2 ms (55 fps); adding EITHER scale 0.42-ish
+OR ~1 ms of small cuts reaches 16.6. Pools + 0.35-now ≈ 18.5 ms tonight. ⚠ The
+GPU sits at its 87 W cap (P0, Performance mode) — ms figures breathe ±10% with
+thermals; native-res ultra dynamic GI at 60 fps on an 87 W laptop 4070 has no
+slack for regressions.
+
+### §12.80.1 UNIT A SHIPPED — POOL FLOORS + GROW-ON-PRESSURE (2026-08-15 night, VERIFIED)
+
+The pools no longer allocate to the pixel proxy up front. `SRC_POOL_FLOORS`
+(srcSystem.js: c0Probes 16384, binBudget 700k — the §12.77.1 treatment values)
+are the boot state; `expectedC0Probes(pixelCount)` and `BIN_BUDGET` became the
+growth CEILINGS (`srcPoolCeilings`). GISystem's `#syncSrcPoolPressure` reads the
+demand counters on a ~1.5 s cadence (8 s post-build settle, 10 s post-grow
+cooldown), doubles a starved pool toward its ceiling, and rebuilds srcProbes
+through the SAME `#syncScreenResolveSize → setSize(w, h, pools)` path a resize
+takes (`state.screen.width = 0` defeats the tolerance check; setSize now
+compares pools, grow-only). Grown sizes live on `this._srcPools` and survive
+quality changes and resizes. Suspended while `__giSrcC0Probes`/`__giSrcBinBudget`
+are set (deterministic A/B arms); `__giSrcPoolInit` = growth-permitted initial
+sizes for exercising the path.
+
+**⚠ THE FIRST VERIFICATION RUN CAUGHT A REAL SIGNAL BUG — the birth-time
+`COUNTER_NOBLOCK` alone is NOT the bin signal.** Birth claims go quiet once the
+population stabilizes while every standing blockless probe fails its DEPOSIT
+each frame: the growth arm sat at bins 175k with birth noBlock 0, deposit
+noBlock 38,268/frame, and a visibly darkened image (frameMean 0.156 vs 0.204,
+blackFrac 0.23 — the §12.52.2 wash, reproduced on demand). `readPressure` now
+reads BOTH counters (two small readbacks); either grows the bin pool.
+
+**Verified (2 fresh ultra boots each, second round):** control (floors) grew
+bins once 700k→1.4M on deposit noBlock 471 — the scene under test had gained 4
+emitters from live editing — ending failed 0 / noBlock 0 / frameMean 0.2101;
+growth arm (c0 2048, bins 175k) logged two grows and converged to failed 0 /
+noBlock 0 / **frameMean 0.2094 — 0.3% from control**. Slot pool stays at the
+floor on Sponza (the 48× over-allocation is gone). Live editor after apply:
+**24.2 → 22.3 ms GPU, 41 fps**, textureMem −33 MB. Note the two runs ended at
+different bin sizes (700k vs 1.4M) — demand near the 700k boundary is
+borderline and the guard is deliberately trigger-happy (growing one step early
+costs ~1 ms; not growing costs the image). A deposit-noBlock threshold (e.g.
+>0.1% of deposits) is a refinement if the extra step ever matters.
+
+**Orphan question, narrowed from the §12.77.1 data (now moot for the ship, kept
+for the record):**
+orphanRate 0.068 is IDENTICAL on both treatment arms, which share
+`__giSrcBinBudget=700000` and differ on the slot knob — so the improvement keys
+to the BIN cut, not the slot cut. Candidate mechanism: a smaller bin pool evicts
+far/stale blocks sooner, so the surviving bin population is nearer/fresher and
+more of it has parent probes — an eviction-freshness effect, favourable and
+mundane. Confirm with a bin-only sweep reading the orphan numerator/denominator
+separately (the L2-knee sweep §12.77.1 already wants doubles as the vehicle).
+
+### §12.80.2 UNIT B SHIPPED — CHECKERBOARD SHADOW TRACE (2026-08-16, GATED, ONE OPEN GATE)
+
+`createGiLightShadowPass` now traces HALF the pixels per dispatch (giScreen.js):
+each thread maps to one checkerboard cell (compact indexing off a `checker`
+parity uniform, dispatch count halved at build) and the untraced half keeps
+last frame's texel — the raw/dist targets are persistent, so skipping the store
+IS the fill, and the filter integrates the two phases. **The dispatch halves,
+NOT the lanes**: an in-kernel parity skip leaves every warp half-active through
+the BVH descent and saves ~nothing. The parity uniform advances every frame in
+the tick, independent of the jitter phase (which freezes under
+`__giShadowTemporal=false` and never exists on the analytic arm — a frozen
+parity = half the buffer permanently stale). Wired at BOTH creation sites
+including the resize splice (the frozen-dither bug's MUST-match rule).
+`__giShadowCheckerboard=false` restores full dispatch.
+
+**Gate (2 fresh ultra boots, 403×196 shadow):** lightShadowPass 1.955 → 1.417 ms
+(−28% — under the ideal 2× because traced cells 2 px apart cost warp coherence),
+frameMean 0.2107 vs 0.2114 (+0.3%), screenshot clean, no pattern. Live ultra
+projection: ~6.9 → ~5.0 ms, frame ~22.3 → ~20.4 ms. ⚠ **OPEN GATE: moving-sun
+flicker is untested** — scripts don't run in the harness editor mode, so the
+day-cycle stress on the one-frame-stale half needs either the mover rig or a
+live session with the sun animating before this is called fully verified; the
+analytic arm's deterministic trace makes the risk low (only real motion
+differentiates the phases), but low is not measured.
+
+### ✅ RESOLVED §12.81 — FROZEN PLAY-MODE MOVER SHADOWS = THE 16-MOVER CAP (2026-08-16)
+
+The full mechanism, established live on the user's editor with the game camera
+(⚠ instrument trap first: in play mode, `viewport.screenshot` with the default
+`camera: "editor"` composites the editor view OVER the game camera's frame — a
+translucent double exposure that reads as "no shadows anywhere / washed out".
+Two hours of this session chased that ghost. In play, screenshot with
+`camera: "game"`, always):
+
+1. The Physics Playground is `enabledInEditor: false, enabledInGame: true` —
+   the ~30 crates DO NOT EXIST in edit mode. Every edit-mode field build is 26
+   Sponza meshes; the crates enter the GI world only via the play-entry
+   fingerprint rescan → full field rebuild (~5.5 s compile wave), which bakes
+   their static-BVH triangles at the ENTRY (pyramid) pose.
+2. First motion then adopts exactly `maxObjects = 16` of them
+   (`adoptedMovers: 16` measured in play — adoption WORKS; the earlier
+   `adoptedMovers: 0` reading was taken in EDIT mode where the crates aren't
+   placements at all, which is also why "adoption worked earlier reading 16"
+   confused two different worlds). The other ~14 keep pyramid-pose triangles
+   in the static BVH: tumbling crates, baked pyramid shadow. The debounced
+   rebuild can never fire while they keep moving (motion re-arms it), so the
+   ghost persists exactly as long as the pile keeps settling.
+
+SHIPPED (needs editor reload to take effect — the WebView does not HMR
+GISystem):
+- **Tiered mover cap** — `{low/medium: 16, high: 24, ultra: 32}`
+  (`__giMaxDynamicObjects` still overrides; hard ceiling stays 64 for the
+  f32-exact card ids). The marcher loops over the LIVE header count, so an
+  uncontended scene pays nothing for the headroom. 30-crate pile at ultra now
+  adopts whole.
+- **Motion masks static-BVH triangles** — the `#refreshOccupancyTransforms`
+  moving branch now calls `setStaticMaskBit(p.slot, true)` beside its
+  `_staticBvhStale` arm: any voxel-split mover (over-cap or pinned "static")
+  loses its build-pose shadow WHILE moving instead of dragging it around; the
+  rest-debounced rebuild rebuilds at current poses and `resetStaticMask([])`
+  clears every motion mask. No shadow while moving beats a shadow that stopped
+  following.
+
+STILL OPEN, same area: `#maybeRebuildStaticBvh` is a SYNCHRONOUS main-thread
+stall (measured 554-657 ms on this Sponza, fires ~3 s after a settle — in play
+that is a visible hitch right after the action ends). The build is pure typed-
+array math (`buildStaticSceneBvhWords`) — worker candidate, spec it before the
+next play-heavy milestone. And play-entry/exit each pay a full field rebuild +
+compile wave (~5-6 s) because the playground flips the fingerprint; a
+placement-level add/remove that reuses the compiled kernels would kill the
+worst editor-feel hitch that remains.
+
+### ✅ COULD NOT REPRODUCE (2026-08-16, clean boot) — map→gi SWITCH AND REBUILD-FORGETS-SUN
+
+On today's fresh editor boot (all modules from disk, no hot-swap drift), every
+arm of yesterday's lifecycle failure worked first try, in BOTH modes:
+- map → gi in play: claim logged, GI shadows on screen (game camera verified).
+- map → gi in edit: GI shadows appear within ~2 s (first-use pipeline compile).
+- gi through TWO full rebuilds (ultra→high→ultra quality bounces): the claim
+  re-established both times — boot line says `1 lights (GPU)`, light-shadow
+  chain compiled, shadows in the screenshot.
+- gi → map: three's map shadows return.
+
+Yesterday's "no shadow until full GI reload" and "rebuild forgets the sun"
+were observed in a 5-session editor whose GISystem had been live-edited under
+it repeatedly (vite pushed new srcSystem/giScreen while the running GISystem
+instance stayed old) — the mixed-module state is the prime suspect, and it is
+not a state a user reaches from a normal boot. KEEP THE SYMPTOM IN MIND but do
+not chase it on current code without a fresh-boot repro. If the user still
+sees it after reloading with today's build, the repro recipe that matters is:
+exact sequence from boot, `console_read` for the claim line, and
+`profile.giPasses` `lightShadowPass` dispatch state.
+
+### 🔎 §12.82 — THE "18-40 FPS ON A STATIC SCENE" OSCILLATION IS THE GPU CLOCK (2026-08-16)
+
+`nvidia-smi dmon -s pucm -c 10` during an idle editor view, static scene, no
+edits, GPU utilization pinned ~100%:
+
+    pclk (MHz): 2400 → 1140 → 990 → 1290 → 1650 → 2085 → 2385 → 2310 → 2400 → 1185
+    power (W):    26 →   27 →  27 →   31 →   45 →   65 →   79 →   79 →   55 →   29
+
+The core clock duty-cycles 990↔2400 MHz with a ~8-10 s period UNDER CONSTANT
+LOAD — a 2.4× per-second performance swing from the laptop's power profile,
+not from anything the engine does. Consecutive `profile.frameStats` samples on
+the identical static frame read GPU 20.9 / 26.7 / 26.1 / 22.7 ms — each sample
+is just a different phase of the clock wave, and the presented fps then snaps
+between vsync divisions (47 → 39 → 33 → 19), which is exactly the user's
+"constantly dropping and rising". Engine-side contributors that DID exist
+(the 1.5 s pool-pressure readback → §12.80.1 backoff; light-track window arms
+on real light events) are shipped/behaved today. CONSEQUENCES:
+- ⚠ EVERY single-sample ms on this machine is ±25% until the power profile
+  is pinned (ASUS profile to Turbo/Performance + Windows power mode Best
+  performance, plugged in; verify with dmon showing steady ~2.3-2.4 GHz under
+  load). This extends [[dual-gpu-webview2-pin]]: P-state and instantaneous
+  power alone are NOT enough — P0 at 39 W of a 79 W cap still wobbled; only
+  dmon over ~10 s tells the truth.
+- The two ~1 s windows where GPU util fell to 24% mid-wave are CPU-side
+  stalls: the JS heap sat at 2.5-2.6 GB and grew ~20 MB/s ON AN IDLE SCENE
+  (allocation churn → major GC pauses). Separate engine bug worth its own
+  session: find the per-frame allocator (heap snapshot diff over 30 idle
+  seconds), because a 2.6 GB heap turns every major GC into a dropped-frame
+  cluster regardless of GPU headroom.
+- Steady-state at full boost today: ~20-21 ms (both shadow modes, post off,
+  1588×898 drawing buffer) — i.e. the gi-vs-map parity §12.80 measured stands,
+  and the remaining 60 fps work is real engine work (§12.80's ledger: gather
+  half-rate bilateral −5.6 ms, SSR half-res + denoise, GTAO half-res), on top
+  of a machine whose clock must first be pinned to make any of it measurable.
+
+---
+
+## ✅ RESOLVED §12.83 — GI SUN SHADOWS DIED ON EVERY SCENE CHANGE: THE STATIC BVH'S `triBase` WAS A COMPILE-TIME LITERAL (2026-08-16)
+
+**User report, three times over three sessions, each time read as a different
+bug:** "gi shadows break after exiting playmode" · "gi shadows get broken with
+emissive objects in the scene (editor mode)" · "it often happens that gi shadows
+disappear when scene changes". The decisive evidence was the user's own two
+screenshots from ONE camera: 48 fps / GPU 11.4 ms with crisp sun shadows, then
+seconds later 40 fps / GPU 18.0 ms with **no shadows at all** — identical 111
+draws and 800,751 triangles in both. Same geometry, same emissives, same camera.
+That refuted every energy/exposure theory: whatever changed was *state*, not light.
+
+### The mechanism
+
+The sun's GI shadow marcher is `static-bvh8` — it traverses the world-space
+static shadow BVH that rides the `bits` buffer. Two absolute word offsets locate
+it: `nodeBase` (the region offset) and `triBase = nodeBase + packed.nodeWords`.
+They reached the shader through `dynamicObjects.js`:
+
+```js
+return bvh8MaskedTraceWgsl(
+  vec3(origin), vec3(dir), float(tMin), float(tMax),
+  uint(info.nodeBase), uint(info.triBase),   // ← CONSTANT NODES
+  ...
+);
+```
+
+`uint(number)` is a **constant node**: three bakes it into the WGSL as a literal
+when the shadow kernel is compiled — once, during the GI build. But
+`#maybeRebuildStaticBvh` re-packs the BVH at runtime (debounced 180 frames ≈ 3 s)
+and calls `attachStaticBvh({nodeBase, triBase})`, which only mutated a JS object.
+**Nothing recompiled.** The new words landed in the region; the kernel kept the
+old literals.
+
+`nodeBase` is the region offset and never moves, which is why this hid for so
+long — the traversal walked the *new* node array correctly. `triBase` is
+`nodeBase + nodeWords`, and `nodeWords` is the BVH's node count, which moves
+whenever the tree shape changes. So after such a rebuild every leaf test fetched
+its 9 triangle words from the wrong offset, read whatever lived there, missed —
+and **every sun shadow in the scene vanished, permanently**, until something
+forced a full GI rebuild (which recompiles the kernels).
+
+**Why it was intermittent**: a rebuild whose node count happened to land
+unchanged left `triBase` valid and looked perfectly fine. "Often", not always.
+
+**Why all three reports are one bug**: `_staticBvhStale` is armed by a changed
+placement set (`#refreshOccupancyContent`), by a demoted/evicted mover, and by a
+"static"-mobility mesh that moved. Exiting play mode churns movers; emissive
+projectiles churn the placement set; a scene edit churns both. Every one of them
+lands on the same debounced rebuild ~3 s later — which is exactly the "a few
+seconds later" in the user's A/B.
+
+Observed on a clean boot of the banner Sponza with no projectiles at all:
+
+```
+13.761  static shadow bvh: 260877 tris, 11.5MB, built in 689ms
+13.982  bvh: exact reflections ON — 30 meshes, 266109 tris
+24.576  bvh: exact reflections ON — 26 meshes, 262269 tris    ← 4 meshes leave
+27.674  static shadow bvh: rebuild #1 — 257037 tris in 542ms  ← 14 s after load
+```
+
+### The fix (three parts, all shipped)
+
+1. **The bases are runtime uniforms, not literals** (`dynamicObjects.js`).
+   `staticNodeBaseUniform` / `staticTriBaseUniform` are created once per set;
+   `attachStaticBvh` writes them, so every already-compiled kernel follows. Two
+   uniform reads against a 44-deep stack walk — free. `set.staticBvh` still gates
+   *compilation* (no BVH ⇒ the arm is not emitted), which is unchanged.
+
+2. **The swap is atomic** (`GISystem.js`). `queueRegionUpload` builds a fresh
+   compute — a fresh pipeline, so async compilation can skip it for a frame or
+   more. Flipping the bases at pack time therefore pointed the traversal at a
+   region that still held the previous build. `#maybeRebuildStaticBvh` now only
+   *stages* `_staticBvhPendingAttach`; `#commitStaticBvhAttach` publishes the
+   bases the frame the upload actually dispatches, called right after
+   `confirmDispatch` and **before** that frame's screen passes read it. Until
+   then the previous BVH stays attached and keeps casting shadows. One rebuild
+   in flight at a time. A full `#rebuild` clears any staged attach — region
+   offsets are per-field and `_dynSet` is replaced.
+
+3. **The motion mask can no longer leak** (`GISystem.js`). A moving
+   "static"-mobility placement is masked out of the shadow BVH
+   (`setStaticMaskBit(p.slot, true)`), and `resetStaticMask` inside a *successful*
+   rebuild was the ONLY thing that cleared it. Both bail-outs — no packable
+   geometry, and the capacity-overflow warning — cleared `_staticBvhStale` and
+   returned with the mask still set, so those slots stopped casting any shadow
+   for the rest of the session. Both now reset the mask; a shadow at the build
+   pose is the lesser artifact, and the pose corrects at the next full rebuild.
+   The `!field?.placements` bail re-arms the flag instead of dropping it.
+
+### Traps this leaves behind
+
+- ⚠ **Any offset handed to a GI kernel as `uint(jsNumber)` is frozen at compile
+  time.** If the value can change while the kernel lives, it MUST be a uniform.
+  The static BVH was the only one that also had a runtime mutator; check any new
+  one against its lifetime, not against how it reads.
+- ⚠ **`attachStaticBvh` is now live for every compiled kernel.** Never call it
+  before the words it describes are on the GPU — the pair is atomic, and a base
+  pointing at a stale region is the same garbage read this section is about.
+- The rebuild log now prints `triBase <nodeWords> (live)`, and the build log
+  prints `triBase <nodeWords>`. **A rebuild whose `triBase` differs from the
+  build's is precisely the case that used to kill every shadow** — that one
+  number is the whole diagnosis if this ever resurfaces.
+- 4 meshes leave the GI mesh set ~10 s after this scene boots (30 → 26 in the
+  reflections scan). Unexplained and NOT part of this bug, but it is what arms
+  the rebuild on an otherwise idle scene. Worth its own look.
+
+## 13 THE CAMERA-FOLLOWING VOLUME — CITY-SCALE GI (2026-08-16, SCOPED)
+
+### 13.0 The problem, with the numbers that prove it
+
+The probe lattice is capped at `MAX_PROBE_AXIS = 48` per axis, so spacing is a
+function of VOLUME EXTENT, and extent today comes from the scene AABB
+(auto-fit). Bistro at world scale: 120×42.5×130 m → **2.5 m probes, 1.02 m
+record cells**. Measured consequences, all on the healthy post-§12.83 build
+(they are NOT churn artifacts — verified same-pose after the merge/GI boot
+fixes of BISTRO_PERF D′):
+
+- A ~5 cm colored bulb smears a **~3 m halo** (trilinear over 2.5 m probes),
+  and 95 bulbs strung down the street aggregate into a blue-violet wash on
+  every facade. The engine's own boot warning predicts exactly this.
+- **37,572 dense cells** exceed the per-cell exact-triangle cap and keep
+  voxel-box hits at 1.02 m (vs ~3.8 k at 0.1 scale) — the meter-wide soot
+  blotches on rooflines (ivy, wires, trim collapsed into solid blocks).
+- 486 of 610 meshes are sub-cell: one surface record and one bounce color per
+  chair/post/trim — the chunky black silhouettes vs the reference render.
+- The user's 0.1-scale workaround is exactly a 10× density purchase
+  (2.5 m → 0.25 m probes). It works; it should not be the product answer.
+
+Budget cannot fix this: a 48-axis lattice dense enough for this street would
+need ~1000 axis cells to also cover the city. **Density near the camera, not
+volume, is the resource.**
+
+### 13.1 The design — and the mechanism that ALREADY EXISTS
+
+`#refitInPlace` already SLIDES the volume on the probe lattice ("refit in
+place (slide, nothing resampled)") and STRETCHES it without recompiling.
+`#applyBounds` → `volume.setBounds` mutates the world-bounds uniforms,
+`atlas.refreshAllSlots()` + `#syncSlots` re-voxelize the pyramid against the
+moved box on the next tick, and §12's own comment records that "a refit
+recomposites the whole field from the slot SDFs anyway". The §12.83 lesson
+already forced every base/offset a kernel reads to be a uniform. So a
+camera-following volume is NOT a new field architecture; it is:
+
+1. **Decouple extent from the scene** (F1): when the scene outgrows a
+   threshold, the volume clamps to a quality-tiered detail box centered on the
+   camera instead of the scene AABB.
+2. **Drive the slide from the camera** (F2): hysteresis + snap + throttle on
+   the existing slide path.
+3. **A far-field answer for pixels outside the box** (F3): today the volume
+   covers the scene, so the out-of-bounds composite path is essentially
+   UNTESTED — it must become a deliberate fallback, not an accident.
+
+Phase-1 is ONE volume that follows the camera. A second, coarse far-field
+volume (true clipmap) is a separate go/no-go AFTER F3 ships — it doubles pool
+memory (the pools are the memory: ~150 MB class, not the 3 MB bits), and F3's
+fallback may be visually sufficient at street scale.
+
+What this buys on Bistro medium with a 48 m detail box: probes 48/48 = **1.0 m**
+(2.5× denser), record cells ~0.4 m (2.5× finer, far fewer boxed cells per
+volume of trim) — and at high with a 32 m box, **0.66 m probes**. The bulb halo
+shrinks from 3 m to ~1 m at medium, sub-meter at high.
+
+### 13.2 Unit F0 — instrument and inventory (no behavior change)
+
+Before anything moves, answer with rigs, not reading:
+
+- **What does the composite do for a pixel whose surface is OUTSIDE the
+  volume?** (Suspect: no indirect at all — black next to lit. Must know the
+  exact term.) Rig: shrink bounds via `__giConfigOverride` on Sponza,
+  screenshot the in/out seam.
+- **What does a 20 m slide cost, end to end?** The recomposite is "free" in
+  architecture but not in ms. Add a `[gi] slide: <ms> recomposite, <n> slots`
+  log to `#applyBounds` and drive slides from a debug hatch
+  (`__giVolumeSlide = [dx, dz]`). Measure on Bistro: slide cost, frames to
+  visually settle (the §12.67 light-settle should hide re-accumulation —
+  verify it arms on a slide).
+- **Inventory every consumer of `state.bounds`/`center`/`probeSpacing`**
+  (shadow marcher reach, cascade intervals t0/farT — the stretch path rescales
+  them and a slide must NOT — emitter tile cut, light tree, `diagU`, screen
+  tile mapping). One table: consumer → re-derives per frame / reads uniform /
+  bakes at build. Anything in the third column is a §12.83-class bug waiting.
+
+Gate: the table exists in this doc; slide cost and settle time have numbers on
+Bistro; the out-of-bounds term is named.
+
+**F0 MEASURED (2026-08-16, `scripts/run-gi-volume-slide.mjs`, Bistro medium,
+one 40 m slide east):**
+
+- **Slide cost: 1.6 ms CPU** (`#applyBounds`, 610 slots re-synced). The
+  recomposite rode the next occupancy chain with no visible stall in the rig.
+- **Both gates PASS**: no `compile wave started`, no `[gi] built` after the
+  slide. The bounds path is genuinely rebuild-free — F2 can build on it as-is.
+- **The auto-fit return trip works unprompted**: the content watcher noticed
+  the mismatch and slid back ("refit in place (slide, nothing resampled)")
+  within the 17.5 s window. F2 must DISABLE or subordinate this watcher while
+  the camera drives — two drivers for one box is an oscillator.
+- **Out-of-volume shading = CRUSHED BLACK, no fallback.** The screenshot pair
+  (`.gi-shots/volume-slide/1-before.png` vs `2-after-slide.png`) shows the
+  west building fully lit before and pitch black after — only direct glints
+  survive. F3 is mandatory, not cosmetic: without it every slide paints a
+  black wake at the trailing edge.
+- ⚠ Rig trap for F2's dolly harness: reading the WebGPU canvas via
+  `drawImage` OUTSIDE `engine.onPostRender` returns black (mean 0) — the
+  luminance probe must ride post-render exactly as run-gi-poolsize.mjs does;
+  `page.screenshot` of the composited page works from anywhere.
+
+**F0 INVENTORY (2026-08-16, full sweep of the gi module):**
+
+Bottom line: **a pure translation is structurally clean.** `world.min` (the
+srcVolume uniform bundle) and `gridOrigin`/`voxel`/`voxelInv` (occupancyField,
+rewritten by `syncVoxel` via `setBounds` → `refit`) are the only
+absolute-position values any kernel reads, both are uniforms the slide path
+already writes, `staticDirty` forces the re-voxelization, and `#applyBounds`
+re-poses the debug gizmos. Every DDA/oracle/deposit/record kernel, the shadow
+marcher's reach (`srcTrace.js:231` — a node off `world.size`, moves with no
+recompile), the width probe, the AO ladder and the attribution grid all
+resolve through those uniforms — classification (b).
+
+The (c) BAKED entries all bite on **STRETCH**, not slide — and F1 IS a
+stretch (arming detail mode changes extent), so they are F1 blockers:
+
+- **`GISystem.js:4201` `maxRay` — a LIVE BUG TODAY, independent of §13.** It
+  reads `volume.world.size.value.length()` ONCE at `#buildScreenResolve` and
+  bakes it as a WGSL literal (via `srcShade.js:249 float(maxRay)`) — the
+  sun/directional shadow-ray budget at every off-screen hit. `#refitInPlace`'s
+  stretch branch updates `diagU` (`:8881`) and CANNOT reach this literal, so
+  any content-growth stretch today already leaves sun-visibility rays at the
+  old length. Must become a uniform in F1's first commit.
+- `state.buildSize` (`:6716`) is copied once BY DESIGN (the anti-walk baseline
+  for the [0.55,1.9] stretch gate) — leave it, but know the gizmo scale
+  denominators depend on it.
+- The debug gizmo boxes are baked-with-a-compensator — re-posed only by
+  `#applyBounds`; any new path that replaces them must go through it.
+- Cell counts/pool allocations are extent-sized arrays: fine on slide,
+  intentional coarsening on stretch.
+
+Searched and CLEAN (do not chase): the `t0`/`farT` cascade-interval pair is
+DEAD CODE-side — the `:8876` comment about restoring it is stale (today's
+intervals are pure functions of `spacing0` in srcConfig.js); **the SRC cascade
+lattice is ALREADY CAMERA-ANCHORED** (`srcSystem.js:246 anchorU`, 1686-1700) —
+a volume slide never touches it, and it is precedent that camera-anchoring
+works in this architecture; bvh/bvhScene.js reads no volume state (per-mesh
+`worldToLocal` refreshed per frame; ray length is the `diagU` node); the
+emitter tile cut is pure screen-space; the light tree packs emitters' own
+AABBs and never reads the volume.
+
+### 13.3 Unit F1 — detail extent (internal; quality stays the ONE property)
+
+Auto-fit gains an internal mode: if any scene axis exceeds `DETAIL_TRIGGER`
+(~60 m), volume extent = min(scene, tiered detail box — e.g. low 32, medium
+48, high/ultra 64 m; y clamps to scene height) centered on the camera's
+snapped position at build time. No new component property —
+`__giConfigOverride` gets `detailExtent` for harnesses only.
+
+Gates: (a) Cornell/small scenes: detail mode never arms, builds bit-identical
+(zero-diff screenshot vs pre-F1); (b) Bistro medium: boot log reports probes
+≤1.0 m and the volume centered on the camera; (c) the probe-spacing boot
+warning stops firing on Bistro at high.
+
+**F1 SHIPPED 2026-08-16 — ALL GATES PASS, but the extents above were wrong
+and the box must clamp Y.** The first rig run (48 m box, medium) measured
+probes landing at **2.25 m, not ~1.0** — two structural reasons the plan's
+guessed extents could never work:
+
+1. **The binder on medium is `probeAxis: 28`, not the probe total** — the
+   budgets are literally probeAxis³ (20³/28³/40³/48³), so the finest spacing
+   a box can reach is `extent·1.05/(probeAxis − 2 margin cells)`. 48 m on
+   medium bottoms out at ~1.8 → ladder-stepped to 2.25.
+2. **Bistro's 32 m facades ALONE pin y**: with the box keeping full content
+   height, counts.y = 33.6/s + 2 forces s ≥ 1.3 m on a 28 axis no matter how
+   small the horizontal box gets. So `#detailClampAabb` clamps Y too —
+   GROUND-ANCHORED (`min.y … min.y + extent`), not camera-anchored: street
+   GI lives at street height, upper facades join the F3 far field.
+
+`DETAIL_EXTENT_BY_TIER` is now **derived from each tier's own axis cap**
+(≈ (probeAxis·1.0 − 2)/1.05, rounded down): `{low: 20, medium: 24, high:
+36, ultra: 42}` — every tier lands ~1.0-1.2 m WITHIN its existing budgets,
+zero pool growth (§13.8). Rig rerun (`detailExtent: true`, medium):
+**28.0×28.0×28.0 m, c0 28×28×28 = exactly the 21,952 budget, probes 1.00 m
+(2.5× finer), voxel 0.32 (was 0.58)**, anchored 7.0,5.0,9.0 from the camera
+pose. Gate (a) small-scene zero-diff is structural (the clamp early-outs
+when span ≤ extent — the hatch is also OFF by default); (c) at high is
+untested until a high-tier run. ⚠ the first rig attempt reported "FATAL:
+never built" with zero [gi] lines — environmental (dev-server mid-restart
+at session end), not a code failure; the rig now dumps its last 20 [gi]
+lines on FATAL so the next one is diagnosable.
+
+### 13.4 Unit F2 — the camera drives the slide
+
+Reuse `#refitInPlace`'s slide with: snap to the probe lattice (already there),
+an inner hysteresis band (slide only when the camera leaves the central
+third), a throttle (≥500 ms between slides; a slide requested while one
+settles queues, never stacks), and the light-settle window armed on every
+slide so re-accumulation ramps instead of pops. Editor camera drives it in
+edit mode, game camera in play (the `camera:"game"` screenshot trap applies to
+every rig here).
+
+Gates: (a) dolly rig (`scripts/run-gi-volume-follow.mjs`): camera dollies the
+Bistro street at 2 m/s for 60 m — no flash, no trailing darkness (mean
+luminance of a tracked wall patch stays within ±10% through the pass — a mean,
+not an extremum, per the harness-traps memory); (b) stationary camera: ZERO
+slides over 5 min (hysteresis holds against orbit jitter); (c) steady-state
+frame cost unchanged within noise when not sliding.
+
+**F2 IMPLEMENTED 2026-08-16** — `#detailFollowTick(now)`, called every
+`#tick` (two null-checks deep when disarmed):
+
+- **Hysteresis** = the central third: slide only when `|cam − anchor|` on x
+  or z exceeds `extent/6` (4 m on medium's 24 m box). **Throttle**
+  `DETAIL_SLIDE_MIN_INTERVAL_MS = 500` needs no queue — the band condition
+  persists, so a request landing inside the interval re-fires on a later
+  tick (queued, never stacked, exactly the spec's wording).
+- **The anchor is the only thing F2 moves.** It jumps to the camera
+  (clamped into the content AABB — flying off the map cannot drag the box
+  into empty space), then the move routes through the SAME `#fitBoundsFor`
+  funnel the build and the watcher use, then `#refitInPlace(fit)` does the
+  lattice-snapped translate. The watcher agrees by construction — same
+  funnel, same anchor — so it can never fight the follow.
+- **Every slide arms the §12.67 light-settle window directly**
+  (`_giMotionHeld = max(held, 0.5)`, `_giMotionHoldUntil = now +
+  ALPHA_TRACK_HOLD_MS`) — half strength: the uncovered strip has no history
+  and needs the floored α + lifted cap; ~2/3 of the field slid over VALID
+  history that full panic would needlessly decay. Walking re-arms it
+  continuously (correct — the leading edge needs fast fill); standing still
+  closes it in ALPHA_TRACK_HOLD_MS.
+- **The follow path never rebuilds.** If `#refitInPlace` refuses (only
+  possible when the box was BUILT truncated against a content edge and
+  walking toward the middle wants it grown past the [0.55,1.9] stretch
+  window), the anchor is restored and the watcher's debounced cadence
+  arbitrates. `[gi] follow: refit refused` in a log is that edge case, not
+  a crash.
+- Y never follows — ground-anchored at the content floor (F1's clamp).
+  Towers/verticality are an F3+ question.
+- Rig note: the dolly is flown AERIALLY on the diagonal (slides key on
+  horizontal position only; an aerial path cannot blindly clip through
+  facades), and the luminance instrument is `viewport.screenshot` decoded
+  IN PAGE — the WebGPU-canvas drawImage trap does not apply to a
+  render-target readback. The ±10% tracked-wall-patch gate needs a fixed
+  world patch; the smoke rig gates on a flash/darkness envelope
+  (min ≥ 0.5× median, max ≤ 2× median) and prints the series for judgment.
+
+**F2 SHIPPED 2026-08-16 — run 3 (post-fix, dolly-window wave gate) passes
+ALL FIVE GATES: parked 0 slides, 10/10 pure slides at ~1 ms CPU, zero
+rebuilds/waves/refusals in the dolly window, luminance median 120.5 range
+[108, 126] (the dip is bit-repeatable shaded content). The 5-min SOAK=1
+park is the outstanding formality. History of the two runs before it:**
+
+Run 1 (truncating clamp): parked 0 slides ✓, 10 dolly slides at ~1 ms CPU
+✓, luminance stable (median 120.2, range 106-125 — the mid-pass dip to
+~107 is honest shaded content, bit-repeatable across runs) ✓ — but THREE
+of ten refits took the STRETCH tier (box flapping 28.0 ↔ 23.1×28.6×28.6 ↔
+28.6³, live spacing drifting to a non-ladder 1.02). Root cause: the clamp
+box TRUNCATED against content edges, so its span and center moved by
+arbitrary non-lattice amounts as the anchor walked, and `#fitBoundsFor`'s
+floor/ceil snap flapped between 28/29 cells → rung bump 1.0→1.1 → fit
+BIGGER than the live box → stretch (probes resample mid-walk — the exact
+thing a follow must never do).
+
+THE INVARIANCE RECIPE (the fix, two halves — both required):
+1. `#detailClampAabb` builds a CONSTANT-SIZE box that clamps its POSITION
+   into the content (`clamp(anchor−half, min, max−extent)`), never an
+   intersection. An axis with content smaller than the extent keeps the
+   content bounds (also constant).
+2. `#detailFollowTick` moves the anchor only in WHOLE live-spacing steps,
+   preserving the fractional offset the volume was BUILT with, and does
+   NOT clamp the anchor to content (the box clamps itself; an off-map
+   camera pins the box at the edge — detected via unmoved bounds, which
+   skips the settle-arm and backs the retry off ×9).
+   With both, `laid()`'s center translates by exact lattice multiples →
+   cell counts are translation-invariant → same rung forever → every
+   follow refit is the slide tier. Run 2: ten of ten "slide, nothing
+   resampled", box 28.0³/probes 1.00 throughout, anchor stepping whole
+   metres.
+
+Run 2's one remaining FAIL was the RIG's: it counted "compile wave
+started" over the whole session, and the one wave was the BOOT material
+warm (prints before `[gi] built`; its "warmed in 15832ms" completion
+drained through the park on the cold cache). Gate now counts only waves
+starting inside the dolly window. Two boot-path lines worth knowing, both
+pre-existing: "first frame after compile wave took 2331ms — likely the
+postprocess render path" (the §12.56-family PP-warm item), and the wave
+completion landing long after `built` when the transcode tail is cold.
+
+### 13.5 Unit F3 — the far field must not be an accident
+
+Out-of-volume surfaces get a deliberate fallback indirect term: start with a
+hemispherical constant fed by the field's own average irradiance (cheap, no
+new pools), feathered across the last 2 probe cells inside the boundary.
+Direct sun + gi-traced shadows are volume-independent (static BVH) and keep
+working at any distance — verify, don't assume: the marcher's reach reads
+`diagU`.
+
+Gates: (a) far buildings in the dolly rig are lit plausibly (not black, not
+glowing); (b) a sweep screenshot across the boundary shows no band at the
+feather (luminance step below what the §12.70 tile-seam gate accepted); (c)
+disabling the fallback via hatch reproduces the F0 baseline exactly (proves
+the term is isolated).
+
+**F3 SHIPPED 2026-08-16 — ALL FIVE RIG GATES PASS**: with NO hatches the
+detail box AND the fallback both armed on Bistro (the default flip works);
+`__giFarField=false` reproduced the baseline; the far field's dark fraction
+fell **54.5% → 28.2%** with the mean up only 17% (93.4 → 108.9 — no glow).
+The remaining deep blacks in the aerial record are sun-shadowed facades,
+in-box and honest. Implementation, with one design substitution forced by
+archaeology: the plan said "fed by the field's own average irradiance", but
+the dense probe-irradiance lattice died with the transport (§12.8) and SRC's
+c0 is a sparse camera-anchored hash with no cheap whole-field reduction. The
+average is therefore THE SCREEN GATHER'S: `createGiFarFieldAvgPass`
+(giScreen.js) appends two dispatches to the SRC pass list right after the
+gather —
+
+- `accum`: one thread per gather texel; LIT texels (luminance above a hair)
+  fixed-point-atomic their RGB into 4 words. LIT-ONLY IS LOAD-BEARING: the
+  crushed out-of-volume pixels this term exists to fix must not drag their
+  own fallback toward black.
+- `ema`: one thread; average → EMA α=0.05 (~1.3 s — hides view churn,
+  tracks a lamp toggle) → `textureStore` into a persistent 1×1 half-float
+  texture → reset accumulators. <64 lit texels keeps last frame's answer
+  (boot frames, camera in a wall). Dispatch split = the synchronization; a
+  TEXTURE because the resolve sits at the 8-storage-buffer limit and
+  texture bindings are free of it.
+
+The resolve (`farField` input): signed inside-distance to the box off the
+LIVE `world.min/size` uniforms (F2 slides move the feather for free),
+`w = 1 − clamp(inside/feather)` with feather = 2 probe cells, and
+`out = mix(out, avg × hemi, w)` where hemi = `0.6 + 0.4·n.y` (sky-down with
+a ground-bounce floor — the average already contains ground bounce, so a
+hard cosine would starve soffits). Placed AFTER the AO block (the AO
+oracle's taps are undefined outside the volume — a broken obscurance must
+not re-crush the fallback) and BEFORE every direct term (sun/analytic/
+emitter direct are volume-independent and survive at any distance).
+View-dependence of the screen average is the accepted v1 tradeoff — EMA
+smooths it; F4 remains the go/no-go if screenshots say it's not enough.
+
+**F3 POLISH (same day, after the first live street look — "not quite")**:
+the user's street-level screenshots showed (1) the RAW average painted as
+saturated lavender fog over everything past ~18 m — at street level the far
+field is MOST of the frame; (2) black/white blocking on facades near the
+box edge — boundary probes are starved (rays exit the occupancy
+immediately) and a 2-cell feather didn't cover their trilinear support.
+Fixes: the EMA pass now PUBLISHES SHAPED, ACCUMULATES RAW — keep 35% of
+the average's chroma, damp to 0.6 (materials multiply by their own albedo,
+so far surfaces keep color variation; only the tint and energy go) — and
+the feather widened 2 → 4 cells to swallow the sick zone. The coverage
+warning ("receives NO GI") now logs a by-design one-liner instead when the
+detail box is armed. Verified at the user's exact captured pose
+(`run-gi-farfield-look.mjs`): no fog, no blocking; absolute brightness not
+comparable (mid-transcode shot). Remaining look levers if still not
+enough: §13.7 bulb-halo damping (near-field purple is genuine bulb gather
+at 1 m), then F4.
+
+**AND THE §13 DEFAULT FLIP RIDES ON F3**: `DETAIL_TRIGGER = 60` — with no
+hatch, `#detailClampAabb` arms the tier detail box when the scene's
+horizontal span exceeds 60 m. `detailExtent: false` force-disables,
+`true`/metres force-arm; `__giFarField = false` kills just the fallback
+(gate c's baseline). Small scenes are structurally untouched. Rig:
+`run-gi-farfield.mjs` — two boots, same pose; gates: box+fallback arm with
+NO hatch, kill switch works, ON darkFrac < OFF darkFrac − 2 pts, ON mean ≤
+1.8× OFF (not glowing).
+
+### 13.6 Unit F4 — far-field coarse volume (GO/NO-GO, after F3)
+
+Only if F3's constant fallback visibly fails the product bar: a second volume
+at scene extent with today's 2.5 m probes behind the detail box. Doubles pool
+cost — requires pool-budget splitting before it is even priceable. Decide on
+Bistro screenshots, not on principle.
+
+### 13.7 Parallel cheap exploration — the bulb halo specifically
+
+Even at 1.0 m probes a bright pea-sized emitter over-smears. Two bounded
+experiments (hatch-gated, OFF by default, each with an A/B rig): clamp the
+deposit splat radius for emitters whose physical extent is far below cell
+size, and/or let the light tree's per-tile cut (§12.70) damp sub-cell emitters
+at resolve. Neither ships without the flip discipline (§12.70's lesson: every
+rig's OFF arm is the default and must be set `false` first).
+
+**13.7 SHIPPED 2026-08-16 (variant: damp in the TREE EVAL, default ON)** —
+after F3's polish the user's street look still showed meters-wide saturated
+patches on mid-distance facades ("too many weird color bleeds, possibly
+from emissive bulbs" — correct diagnosis). The shipped lever:
+`createLightTreeEmitterEval` (lightTreeGpu.js) scales a record's field
+contribution by `clamp(aR / (0.5·spacing0), 0.15, 1)` — `aR` is the
+PHYSICAL radius word (disc-equivalent for boxes), so this is a size test,
+not a solid-angle change. Emitters ≥ half a cell (Cornell panels, Sponza
+banners) are bit-identical; pea bulbs keep a 15% floor. The bulbs' DIRECT
+light is untouched — the screen chain (tile cut + shadow pass) delivers it
+per-pixel at full strength, so bulbs keep their crisp local pools and lose
+only the probe-lattice wash. Default ON (product-driven — the flip
+discipline was written for measurement rigs; the kill switch is
+`__giSubCellEmitterDamp = false`). The `__giSrcLightTree = false`
+promoted-slot arm is deliberately NOT damped (A/B baseline). ⚠ FIXTURE
+TRAP: the W3/NEE parity fixtures compare the GPU eval against the undamped
+CPU `emitterIrradiance` — a parity rig with sub-cell emitters must set
+`__giSubCellEmitterDamp = false` or its energy gate reads the 0.15 floor as
+a miss.
+
+### 13.7b The "dirty colors" — BOUNCE CHROMA, and why it is an ERROR term
+
+After F3's polish and §13.7's bulb damp the user's street frame still read
+wrong: "still same dirty colors, gi is not correct on those" — saturated
+blue/teal/purple blotches, metres across, on neutral stone and pavement.
+Neither previous lever could have fixed it, and the elimination is on the
+record so nobody re-runs it:
+
+- **NOT the sky.** `sceneSkyRadiance` (giConfig.js:252) returns
+  `(i, i, i)` — the SRC transport's sky term is NEUTRAL GREY at any
+  environment. A blue sky cannot tint anything through this path.
+- **NOT the emitters.** §13.7 already damps sub-cell emitters, and the
+  blotches survive it.
+- **NOT the far field.** The blotches are in the near field, inside the
+  detail box, where the F3 mix weight is exactly 0.
+
+It is the BOUNCE ALBEDO, `resolveMaterialSurface` (voxelizeOnce.js:148):
+ONE colour per mesh — `material.color × textureAverageColor(map)` — is the
+entire bounce answer for every ray that lands on that mesh. Two
+approximations inflate its CHROMA specifically:
+
+1. **One average per mesh.** A shopfront textured blue paint + white trim
+   + glass bounces the average over its whole area — the trim and the
+   glass deliver the blue too.
+2. **Shared cells.** Thin geometry shares a voxel cell, hence one surface
+   record and one colour, with whatever is behind it. Live Bistro at high:
+   **373 of 636 meshes are thinner than 2 GI cells** (0.70 m at voxel
+   0.35), so awnings/signs/shopfronts stamp their colour onto the wall.
+   Compounding it, the exact-triangle pool is OVERSUBSCRIBED — `triangles
+   2805815/2097152`, **115,358 dense cells fall back to voxel-box hits**
+   (records themselves are fine: 1,098,474/2,097,152 = 52%). Both pools
+   are at the `1 << 21` hard cap (occupancyField.js:328), so raising them
+   is a memory decision (~136 MB to double) needing §12.81 noBlock
+   evidence — NOT a casual fix.
+
+Then probe variance amplifies it: at 1 m probes a single probe whose few
+rays happened to hit a saturated record paints a ~2 m trilinear blob, and
+the temporal EMA holds it there. Metres-wide saturated blotches ARE that.
+
+**The lever: `__giBounceSaturation`** (default 1 = untouched — this ships
+as a measured choice, not a silent one). It damps the palette colour
+toward its own LUMINANCE, correcting in the direction of the known error
+while preserving how much light bounces (the quantity the estimator does
+get right). It lands in `resolveMaterialSurface`, whose colour
+`#computeFingerprint` hashes — so setting it re-tints the whole palette on
+the next fingerprint scan, **live, with no rebuild and no compile wave**,
+which is what makes `run-gi-bounce-saturation.mjs`'s four-arm single-boot
+sweep possible. The rig gates that the dial moves COLOUR and not ENERGY
+(luminance within 15% across the sweep); the arm choice is the user's, on
+their own frame.
+
+Follow-ups if the dial is not enough, in cost order: per-cell albedo
+instead of per-mesh (kills error 1 outright), triangle-pool growth for the
+box-fallback cells (error 2, memory decision), more rays per probe or a
+spatial filter on the probe field (the variance amplifier).
+
+### 13.7c THE STRING LIGHTS — MEASURED, AND TWO HYPOTHESES KILLED
+
+User: "confirmed, those light contamination comes from string lights". The
+number, at their street pose, on a cobblestone patch that ought to be
+neutral grey (`run-gi-emitter-path.mjs`, two pre-boot arms):
+
+| arm | patch chroma | patch p95 | patch lum |
+|---|---|---|---|
+| default (light tree + tile cut) | **0.174** | 0.429 | 114.4 |
+| `__giSrcLightTree=false` + `__giEmitterTileCut=false` | **0.095** | 0.493 | 102.2 |
+
+**The emitter delivery path nearly DOUBLES the chroma of the street while
+adding 12% luminance.** That is the contamination, confirmed. The two
+hatches flip together (§12.70 W5b) and the OFF arm loses 91 of 95 bulbs'
+direct light, so it is a diagnosis, not a fix.
+
+TWO HYPOTHESES DIED HERE, both with receipts — do not re-run them:
+
+- **NOT the baked field via instanced meshes.** `#buildEntries` excludes
+  `isInstancedMesh` from the candidate set, which looked like the smoking
+  gun (instanced emissive is delivered by the FIELD alone — no NEE, no R5
+  zeroing, out of reach of §13.7's tree damp). It is not: the new
+  `[gi] emitters delivered by the FIELD ONLY:` diagnostic prints NOTHING on
+  this scene. The bulbs are ordinary meshes, already tree emitters, already
+  R5-zeroed. §13.7c's damp measured **1%** and is now DEFAULT OFF.
+- **NOT bounce-albedo saturation.** A four-arm live sweep of
+  `__giBounceSaturation` (1 → 0.15) moved whole-frame chroma by 1%. The
+  dial ships at 1 (inert) with the mechanism documented in §13.7b.
+
+⚠ **INSTRUMENT LESSON (cost: two rigs).** Whole-frame chroma CANNOT see
+this artifact — a street frame's chroma is dominated by the scene's own
+albedo (red awnings, green cafe, blue shopfront), and it read 0.159 vs
+0.158 across a sweep that should have moved it. Measure a patch that ought
+to be NEUTRAL, and report p95 as well as the mean: a blotch is a tail.
+
+⚠ **FLIP DISCIPLINE, RE-LEARNED.** §13.7 and §13.7c both shipped
+default-ON on hypotheses and neither survived measurement; both are now
+default-OFF behind `__giSubCellEmitterDamp` / `__giSubCellEmissiveDamp`.
+Everything left default-ON in §13 (F1, F2, F3 + its polish) has a rig
+number behind it.
+
+### 13.7d NEXT: THE REFERENCE COMPARISON SAYS *DIRECT*, NOT COLOUR
+
+With the user's side-by-side (ours vs the Lumberyard reference at the same
+corner) the remaining gap is not hue at all — it is **occlusion contrast**:
+"too bright in the areas under the red covers, should be darker there,
+overall ours look too flat, lacking contrast". Two separable mechanisms,
+neither yet actioned:
+
+1. **Indirect leaks under thin occluders.** At 1.0 m probes the space
+   under an awning holds ~one probe, and the sparse-trilinear gather pulls
+   in corners from outside the awning. AO cannot rescue it: the ladder's
+   self-surface allowance is **2 voxels = 0.70 m** at this scene's 0.35 m
+   cell, and `capacity = (d − allowance)/d` zeroes every tap inside that,
+   so AO is blind exactly where contact darkening is wanted. Levers: a
+   smaller detail extent (finer cells shrink the allowance with them),
+   probe-visibility weighting in the gather (`chebyshev` is already
+   imported by srcScreenGather), or an AO radius that scales with cell.
+2. **Ambient-to-sun ratio + a half-res shadow channel.**
+   `#lightShadowScale` is 0.5 at every tier except high (0.7071) —
+   §12.79b traded 16.4 ms of a 31.6 ms ultra frame for it, and it buys
+   penumbra DETAIL. `__giShadowScale = 1` is the documented one-boot A/B.
+   Note the reference's sun is at a different angle, so part of the
+   "flat" impression is scene setup, not the engine — separate that
+   before chasing it.
+
+### 13.7e THE GATHER HAD NO NORMAL WEIGHT — found, fixed, priced, HATCHED
+
+**The gap:** `srcScreenGather.js`'s corner weight was pure trilinear ×
+coverage — a function of POSITION ONLY. A probe on the far side of the
+surface being shaded contributed exactly as much as one in front of it.
+On thin geometry that is a direct leak: an awning's sunlit TOP and its
+shaded UNDERSIDE share a cell (live Bistro: **373 of 636 meshes thinner
+than two cells**), so the underside gathered the top's probes. Repeated
+across 59% of the scene's meshes, that is both "too bright in the areas
+under the red covers" and the "flat, lacking contrast" that comes with it.
+(Correcting an earlier note in this section: `chebyshev` in that file is
+the max-norm DISTANCE used for LOD selection, NOT a visibility term. There
+was no visibility or normal test anywhere in the gather.)
+
+**The fix:** the standard DDGI wrap weight `((n·d)·0.5 + 0.5)^k`, smooth
+rather than a hard cutoff (a hard one seams exactly where the tangent
+plane cuts the cell), floored at 1e-3 so a fully back-facing corner cannot
+collapse `wsum` — the renormalization then divides by what actually
+contributed, so such a point goes DARK, not BLACK. Mirrored in
+`srcRef.js`'s `gatherPixel` off the SAME global, or `test:gi-src-gather`
+would diff a weighted GPU against an unweighted CPU and call the fix a
+regression.
+
+**Priced on Bistro** (`run-gi-gather-normal.mjs`, user's street pose,
+quality high, k=2):
+
+| | OFF (today) | ON (k=2) | |
+|---|---|---|---|
+| under-awning patch | 65.3 | **38.1** | −42% — the reported artifact |
+| darks (p5) | 10.6 | 3.9 | −63% |
+| frame mean | 99.5 | 64.6 | **−35%** |
+| std | 53.2 | 42.2 | −21% |
+| **std/mean (relative contrast)** | 0.535 | **0.653** | **+22%** |
+
+So it does exactly what it should — cavities darken, relative dynamic
+range goes UP — but k=2 also takes 35% of the frame's brightness with it,
+because it was leaked light holding the whole image up. Absolute std FALLS
+while relative contrast RISES; on a change that moves the mean this hard,
+std alone is the wrong read.
+
+**Shipped HATCHED, default OFF** (flip discipline). `__giGatherNormalWeight
+= true` is k=2; a NUMBER is the exponent, so `= 1` is the soft half for
+scenes that cannot afford the brightness. Gate status: `test:gi-src-gather`
+PASSES with it armed (worst 0.14% GPU-vs-CPU, unchanged) — but note that
+fixture's field is near-uniform, where corner reweighting normalizes away,
+so it proves AGREEMENT and compilation, never effect. Only a scene rig
+shows effect.
+
+### 13.7f AO IS OFF BY DEFAULT, AND TURNING IT ON DID NOT FINISH COMPILING
+
+`ao: false` (giConfig.js:140) and no tier overrides it, so the obscurance
+ladder — the only mechanism that can darken SUB-probe-scale cavities — has
+never run in this scene. Its own comment explains the default ("it only
+ever removes light, and it shipped default-on once in the same change that
+darkened the whole module"), and that reasoning still holds, but the
+consequence was unpriced.
+
+Attempting to price it (`run-gi-ao-sweep.mjs`, `ao: true`, 4 live arms via
+the new `__giAoOverride` dial — `aoStrength`/`aoRadius` are uniforms, only
+the `ao` prop is structural): **the build never finished in 600 s**, having
+reached "detail volume armed". The ladder's ~50 oracle fetches per pixel
+inflate the resolve kernel, and this module's own history says WGSL size
+buys compile seconds (§13.14: a 122 kB kernel took 17.9 s). Two things
+follow: AO's cost is a COMPILE cost before it is a frame cost, and the
+sweep needs a longer boot budget or a smaller scene than Bistro.
+
+⚠ Also note for the ladder itself: `allowance = 2 voxels = 0.70 m` at this
+scene's 0.35 m cell, and `capacity = (d − allowance)/d` zeroes every tap
+inside that — so the default `aoRadius` 0.6 is already below the floor
+`reach = max(radius, allowance × 2.5) = 1.75 m`. Any AO arm that does not
+raise the radius past 1.75 m is testing the same reach twice.
+
+### 13.7g ⭐ THE REAL BUG: SPARSE EMITTERS DELIVERED THEIR BOUNDING BOX'S LIGHT
+
+The user isolated it in one screenshot — **sun off, bulbs only, whole street
+lit**: "those are the lights from those tiny string bulbs, their emissive goes
+A LOT further than it should. Technically, considering their size, they should
+reach 0.5 m maximum." That framing is what cracked it, because it is a
+statement about AREA, and area is the one thing the emitter model was getting
+from the wrong source.
+
+**Mechanism.** A GLB splits meshes BY MATERIAL, so every bulb of one colour on
+a 6 m string lands in ONE mesh. `collectEmitters` fits that mesh's emitter to
+its BOUNDING volume — live Bistro, `StringLights_01a1_6473_1`: box
+2.4 × 1.3 × 5.9 m, bounding radius **3.26 m**, standing in for a few cm² of
+actual bulb. Both irradiance models scale with the FITTED SHAPE's projected
+area (`boxLightFactor` over the OBB; the sphere arm's `π·sin²(R/d)`), so the
+mesh delivered a 3 m area light's worth of energy in every direction.
+Measured on the live scene: **19 of 95 tree emitters are sparse, worst fill
+6.0e-5 — that emitter was 16,636× too bright.**
+
+The tree's own `power` (`π·area·mean`) has always used the TRUE world triangle
+area, so the importance heuristic knew the bulbs were tiny while the irradiance
+model lit the street. The two were simply never reconciled.
+
+**Fix: scale RADIANCE by the fill fraction, never the geometry.** Energy
+delivered is (projected area) × (radiance), so a shape 1000× too large carrying
+1/1000 the radiance delivers the right amount. Shrinking the shape instead is
+the trap: `angularRadius`/`half` also set where a shadow ray STOPS (`maxT` =
+the OBB entry, or `dist − aR`), so a shrunken shape sends rays INTO the string
+where they self-shadow on the bulbs' own occupancy cells and delete the light
+entirely. **Radiance carries energy; geometry carries occlusion. Only the
+first was wrong.**
+
+**The denominator is the LARGEST CROSS-SECTION, and that choice is
+load-bearing.** Cauchy's mean projected area (surface/4) is the instinctive
+pick and it is WRONG here: it holds for CLOSED bodies, while an emissive panel
+is a one-sided plate whose triangles are counted once — Cauchy scores it 0.5
+and would silently HALVE every flat light in every existing scene. "Does this
+mesh's emitting area cover its own widest cross-section?" separates solid from
+scattered and is safe on all of them:
+
+| emitter | fill score | result |
+|---|---|---|
+| flat panel | exactly 1.0 | untouched |
+| closed cube lamp | 6 | clamps to 1, untouched |
+| single sphere bulb | π | clamps to 1, untouched |
+| Bistro string-light mesh | 0.0035 (worst 6.0e-5) | corrected |
+
+`test:gi-lighttree` passes unchanged (its emitters are solid → fill 1), which
+is the no-regression property stated as a test rather than a hope.
+
+**Diagnostics** (the §12.42 rule — this was invisible for an entire session):
+`[gi] N of M emitters are SPARSE …` naming the worst offender and its factor,
+plus `[gi] emitter ledger — …` listing the top emitters by power with area,
+fill, rgb and fitted radius. `__giLogEmitterLedger = false` silences the
+ledger. After the fix the ledger reads sanely: top bulbs at 6 cm radius and
+0.024 m².
+
+**Consequence to expect:** with the sun off, the street is now nearly black
+with visible bulbs and no pools — because the ASSET authors these bulbs at
+radiance ~1 over ~0.02 m², which really is almost no light. The flood was
+never the bulbs being bright; it was their area being wrong. A scene that
+wants visible bulb pools should now raise the bulbs' emissive intensity, and
+that dial finally behaves physically: a brighter bulb makes a small bright
+pool instead of washing the whole street.
+
+⚠ PARALLEL CASE, NOT YET FIXED: the four promoted ANALYTIC slots fit their
+shape through `emitterShapes.js fitEmitterShape`, whose `reff`/`radius` come
+from the bounding sphere/half-extents on the same assumption. A sparse mesh
+that wins a seat would flood exactly as before. The same fill ratio applies —
+it needs the true triangle area at that call site (cache it per geometry;
+`#refreshEmitterSlots` runs per frame).
+
+### 13.8 Traps carried in (do not rediscover)
+
+- **No rebuild on slide, ever.** A rebuild is a compile wave (68–77 s on
+  Bistro). If any consumer forces `requestRebuild` on a bounds change, that
+  consumer is the bug. The §12.56 watchdog will happily re-roll pipelines a
+  slide-storm queues — the fix is not sliding per frame.
+- **Any value a kernel bakes as a WGSL literal is frozen** (§12.83/triBase).
+  The F0 inventory's third column is the checklist.
+- Pools are the memory (150 MB class); the detail volume REUSES them —
+  smaller extent, same budgets. Any unit that grows a pool must show
+  §12.81-style deposit `noBlock` evidence first.
+- `__giSrcSecondary = false` still SHADES; quality-only `__giConfigOverride`
+  A/B trap; `props.x = v` skips setProp; OrbitControls owns the editor camera
+  — every rig sets its camera explicitly or its runs are incomparable.
+- The temporal filter (§12.65 ÷12 default-ON) will smear a slide's first
+  frames; the light-settle window (§12.67) is what makes that a ramp. A/B any
+  flicker claim against `__giShadowTemporal = false` before blaming the slide.
+- Merging interaction: GI now waits for `merging.settling` at boot
+  (BISTRO_PERF D′). A slide must NOT wait on merging — it is not a rebuild.
+
+### 13.9 Sequencing and exit
+
+F0 → F1 → F2 → F3, each gated before the next starts; 13.7 (halo) parallel
+any time after F0; F4 is a decision, not a default. Exit criteria for the
+milestone, judged against the user's reference render on Bistro at scale 1,
+medium: bulb halos ≤ ~1 m and no facade-wide color wash; street-level indirect
+visibly follows the camera with no pops while walking; small scenes untouched
+(zero-diff); no new compile waves after boot.

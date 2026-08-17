@@ -91,6 +91,18 @@ export async function refreshAssetFromDisk(path) {
       invalidateAtlasAsset(path);
       return;
     }
+    if (ext === "post") {
+      // A post graph has no shared cache to drop — each component that points
+      // at one holds its own parsed copy, so the reload is a push to them
+      // rather than an invalidation of something they'd re-read.
+      const { engine } = await import("./engineInstance.js");
+      const key = norm(path);
+      for (const entity of engine?.entities?.values?.() ?? []) {
+        const post = entity.getComponent?.("postprocess");
+        if (post && norm(post.props?.asset) === key) post.reloadAsset();
+      }
+      return;
+    }
     if (AUDIO_EXTENSIONS.includes(ext)) {
       const { disposeAudioAsset } = await import("../engine/audio/AudioAsset.js");
       disposeAudioAsset(path);

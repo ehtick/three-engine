@@ -606,6 +606,9 @@ export function matchStockPbr(graph) {
   let colorTex = null;
   let normalFeed = null; // texture node feeding the normalMap node
   let normalWired = false;
+  let roughnessTex = null; // texture node whose .g feeds roughness
+  let metalnessTex = null; // texture node whose .b feeds metalness
+  let alphaTex = null; // texture node whose .a feeds opacity
   const texUses = new Map(); // texture node -> use count
   for (const e of edges) {
     const src = byId.get(e.source);
@@ -614,6 +617,49 @@ export function matchStockPbr(graph) {
     if (src === bsdf && dst === output && e.targetHandle === "surface") {
       if (surfaceWired) return null;
       surfaceWired = true;
+      continue;
+    }
+    // The canonical glTF ORM/ARM packing — one texture whose green channel is
+    // roughness and whose blue channel is metalness. This is not an
+    // approximation of the graph, it is the SAME arithmetic: three composes
+    // `roughness * roughnessMap.g` and `metalness * metalnessMap.b`
+    // (three.webgpu.js:17362,17371), which is exactly what `.g → roughness`
+    // and `.b → metalness` emit here, with the factors pinned to 1 below.
+    //
+    // ⚠ ONLY these two channel pairings. `.r → roughness` would be a different
+    // texel and there is no stock property that samples it, so anything else
+    // must keep falling through to the compile path. Occlusion is deliberately
+    // absent too: three's `aoMap` reads a different UV set, so expressing a
+    // wired `ao` through it would move the lookup, not just re-spell it.
+    if (
+      src.type === "texture" &&
+      dst === bsdf &&
+      ((e.sourceHandle === "g" && e.targetHandle === "roughness") ||
+        (e.sourceHandle === "b" && e.targetHandle === "metalness"))
+    ) {
+      if (e.targetHandle === "roughness") {
+        if (roughnessTex) return null;
+        roughnessTex = src;
+      } else {
+        if (metalnessTex) return null;
+        metalnessTex = src;
+      }
+      texUses.set(src, (texUses.get(src) ?? 0) + 1);
+      continue;
+    }
+    // Alpha-masked foliage: the colour texture's OWN alpha into opacity. three
+    // composes `materialColor` as `color * texture(map)` — a vec4 — and assigns
+    // it straight to `diffuseColor`, so `map.a` is already the opacity on the
+    // stock path. This wire is spelling out what stock does for free.
+    //
+    // ⚠ ONLY from the colour texture (checked after the loop). Another
+    // texture's alpha has no stock slot — three's `alphaMap` reads `.g`, not
+    // `.a` — so routing one through `map` would sample a different channel of
+    // a different image.
+    if (src.type === "texture" && e.sourceHandle === "a" && dst === bsdf && e.targetHandle === "opacity") {
+      if (alphaTex) return null;
+      alphaTex = src;
+      texUses.set(src, (texUses.get(src) ?? 0) + 1);
       continue;
     }
     if (src.type === "texture" && e.sourceHandle === "out" && dst === bsdf && e.targetHandle === "color") {
@@ -636,14 +682,21 @@ export function matchStockPbr(graph) {
     return null;
   }
   if (!surfaceWired) return null;
-  // A normalMap node must be a complete texture → normal chain, textures must
-  // each be consumed exactly once, and none may have a wired UV (an edge INTO
-  // a texture was already rejected above — every allowed edge targets bsdf,
-  // nm, or output).
+  // A normalMap node must be a complete texture → normal chain, every texture
+  // must be consumed by at least one recognized role, and none may have a
+  // wired UV (an edge INTO a texture was already rejected above — every
+  // allowed edge targets bsdf, nm, or output).
+  //
+  // "At least one" rather than "exactly one": an ORM map legitimately feeds
+  // both roughness and metalness, and every edge reaching this point has
+  // already been classified, so a second use can only be a second role.
   if (nm && (!normalFeed || !normalWired)) return null;
+  // See the opacity branch: only the COLOUR texture's alpha is expressible,
+  // because the stock path gets it through `map` and nothing else.
+  if (alphaTex && alphaTex !== colorTex) return null;
   for (const n of nodes) {
     if (n.type !== "texture") continue;
-    if ((texUses.get(n) ?? 0) !== 1) return null;
+    if ((texUses.get(n) ?? 0) < 1) return null;
     if (!n.props?.path) return null;
   }
 
@@ -672,13 +725,18 @@ export function matchStockPbr(graph) {
     // A wired color input is the texture ALONE on the graph path (no factor
     // multiply), so the stock expression must pin the factor to white.
     color: colorTex ? "#ffffff" : valueOf("color"),
-    roughness: valueOf("roughness"),
-    metalness: valueOf("metalness"),
+    // Same rule as colour, for the same reason: a wired channel REPLACES the
+    // scalar on the graph path, while three MULTIPLIES the map by it. Pinning
+    // to 1 is what makes the two paths the same number rather than nearly.
+    roughness: roughnessTex ? 1 : valueOf("roughness"),
+    metalness: metalnessTex ? 1 : valueOf("metalness"),
     ior: valueOf("ior"),
     specularIntensity: valueOf("specularIntensity"),
     specularColor: valueOf("specularColor"),
     map: colorTex?.props?.path ?? null,
     normalMap: normalFeed?.props?.path ?? null,
+    roughnessMap: roughnessTex?.props?.path ?? null,
+    metalnessMap: metalnessTex?.props?.path ?? null,
     normalScale: nm ? (nm.props?.scale ?? 1) : 1,
   };
 }

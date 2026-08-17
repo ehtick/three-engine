@@ -141,11 +141,38 @@ async function getBasisLoader() {
 }
 
 /**
+ * How many `loadTextureAsset` calls are still unresolved, queue included.
+ *
+ * This is THE "are textures still streaming" signal for systems that must not
+ * act on a half-loaded scene (merging's load hold, GI's build gate). It exists
+ * because nothing else can see this window: `loadMaterialAsset` resolves the
+ * material immediately and its textures land in detached `.then()`s, so a
+ * mesh's `assetLoadsPending` clears minutes before the maps arrive — and on
+ * Bistro that window is the whole transcode tail, during which merging
+ * committed a dribble of incremental generations (12, then 21 meshes…), each
+ * one handing GI a different mesh set to storm-rebuild against at 2 fps.
+ */
+let textureLoadsInFlightCount = 0;
+
+export function textureLoadsInFlight() {
+  return textureLoadsInFlightCount;
+}
+
+/**
  * Loads an image asset, preferring its generated `<path>.basis` KTX2 when the
  * per-asset toggle is enabled. A missing/stale derivative safely falls back to
  * the source image, which keeps projects portable and source assets editable.
  */
-export async function loadTextureAsset(path, { colorSpace = null } = {}) {
+export async function loadTextureAsset(path, options) {
+  textureLoadsInFlightCount++;
+  try {
+    return await loadTextureAssetInner(path, options);
+  } finally {
+    textureLoadsInFlightCount--;
+  }
+}
+
+async function loadTextureAssetInner(path, { colorSpace = null } = {}) {
   const meta = await loadAssetMeta(`${path}.meta`);
   let texture = null;
 

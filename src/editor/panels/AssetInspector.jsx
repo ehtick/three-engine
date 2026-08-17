@@ -54,6 +54,7 @@ import {
 } from "../../engine/cubemapAsset.js";
 import { AssetField } from "../fields/AssetField.jsx";
 import { TEXTURE_META_DEFAULTS } from "../../engine/textureMeta.js";
+import { postGraphSummary } from "../../modules/postprocessing/postAsset.js";
 import {
   MATERIAL_PIPELINE_DEFAULTS,
   MATERIAL_VOLUME_PIPELINE_DEFAULTS,
@@ -111,6 +112,7 @@ const TYPE_LABELS = {
   exr: "HDRI",
   anim: "Animator",
   timeline: "Timeline",
+  post: "Post Process Graph",
   atlas: "Sprite Atlas",
   prefab: "Prefab",
   entity: "Prefab (legacy)",
@@ -166,7 +168,7 @@ const ACTION_ICONS = {
 };
 
 /** Assets stored as JSON, which can therefore be shown (and hand-edited) raw. */
-const JSON_SOURCE_EXTS = ["mat", "scene", "prefab", "entity", "anim", "timeline", "atlas", "cubemap", "audio"];
+const JSON_SOURCE_EXTS = ["mat", "scene", "prefab", "entity", "anim", "timeline", "post", "atlas", "cubemap", "audio"];
 
 /**
  * Extensions with a dedicated section above. Anything else falls through to
@@ -1927,6 +1929,33 @@ function SceneSummary({ path }) {
   );
 }
 
+/**
+ * What a `.post` does, without opening it: the effect chain in graph order.
+ * A list of node types is more use here than a node count — "ssr → gtao →
+ * bloom → tonemap" is the file's identity, and it is what tells two grades
+ * apart in a folder of them.
+ */
+function PostSummary({ path }) {
+  return (
+    <JsonSummary
+      path={path}
+      render={(def) => {
+        const { nodeCount, effects, label } = postGraphSummary(def?.graph ?? def);
+        return (
+          <div className="inspector-section">
+            <div className="section-header">Post Process</div>
+            <div className="asset-info-row">
+              {nodeCount} {nodeCount === 1 ? "node" : "nodes"}
+              {effects.length ? ` · ${effects.length} ${effects.length === 1 ? "effect" : "effects"}` : ""}
+            </div>
+            <div className="asset-info-row">{label}</div>
+          </div>
+        );
+      }}
+    />
+  );
+}
+
 function TimelineSummary({ path }) {
   return (
     <JsonSummary
@@ -2156,6 +2185,7 @@ export function AssetInspector({ path }) {
       {isAudio && <AudioPreview path={path} />}
       {ext === "scene" && <SceneSummary path={path} />}
       {ext === "timeline" && <TimelineSummary path={path} />}
+      {ext === "post" && <PostSummary path={path} />}
       {ext === "mat" && <MaterialSummary path={path} />}
       {ext === "anim" && <AnimatorSummary path={path} />}
       {(ext === "prefab" || ext === "entity") && <PrefabSummary path={path} />}

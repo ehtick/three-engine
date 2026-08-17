@@ -357,9 +357,36 @@ export async function resolveRendererLimits() {
     if (storageSize > 134217728) {
       requiredLimits.maxStorageBufferBindingSize = Math.min(1073741824, storageSize);
     }
+    // ⚠ BINDING SIZE AND BUFFER SIZE ARE SEPARATE LIMITS, and raising only the
+    // first left a trap that Bistro sprang on 2026-08-16: with the binding
+    // limit at 1GB, a 261MB GI buffer (occupancy bits + a grown static-shadow
+    // BVH region) still failed at CREATION against the default maxBufferSize of
+    // 256MB —
+    //   Buffer size (274227200) exceeds the max buffer size limit (268435456)
+    // — and a buffer that failed to create poisons every bind group that
+    // references it, which cascades as the same endless "Invalid BindGroup
+    // \"bindGroup_object\"" spam an overflowing uniform does. Ask for the same
+    // ceiling as the binding ask (this adapter advertises 2GB), clamped the
+    // same way.
+    const bufferSize = adapter?.limits?.maxBufferSize ?? 0;
+    if (bufferSize > 268435456) {
+      requiredLimits.maxBufferSize = Math.min(1073741824, bufferSize);
+    }
+    // STORAGE-BUFFER COUNT: baseline is 8 per compute stage, and the GI
+    // voxelizer reached 9 on 2026-08-16 when the per-slot local→world matrices
+    // moved from the object-group UBO (where 768 slots of mat4s overflowed the
+    // 64KB uniform binding — see occupancyField's localToWorld note) to a
+    // storage buffer. Same adapter-clamped ask as above; this NVIDIA adapter
+    // advertises 16. A baseline-8 device keeps today's behaviour, which also
+    // means the slot raise does not reach it — GISystem's slot ceiling is
+    // conservative either way, so the failure there is fewer seated
+    // placements, not an invalid pipeline.
+    const storageBufs = adapter?.limits?.maxStorageBuffersPerShaderStage ?? 0;
+    if (storageBufs > 8) requiredLimits.maxStorageBuffersPerShaderStage = Math.min(16, storageBufs);
     // One line, always: when GI later refuses the occupancy backend ("device
-    // gate"), THIS is the first thing to check. Storage buffers intentionally
-    // remain at the portable baseline; only unrelated limits are raised.
+    // gate"), THIS is the first thing to check. Storage buffers' BINDING COUNT
+    // is raised only when the adapter advertises more (above); everything else
+    // stays at the portable baseline.
     console.info(
       `[engine] webgpu adapter ${adapter ? "ok" : "NULL"} — limits ask: ${JSON.stringify(requiredLimits)}`,
     );
@@ -481,11 +508,32 @@ export function applySettingsToScene(settings, scene, ambientLight, renderer) {
     scene.traverse((obj) => {
       if (!obj.isLight || !obj.shadow || obj.userData.giShadowMode === "gi") return;
       obj.shadow.autoUpdate = shadow.autoUpdate !== false;
-      // A frozen castShadow light whose map never rendered crashes three's
-      // sampling setup (`shadow.map.depthTexture` on null — see the gi-mode
-      // comment in LightComponent). One forced render creates the map, then
-      // the freeze holds.
-      if (shadow.needsUpdate === true || (!obj.shadow.autoUpdate && !obj.shadow.map)) {
+      // ⚠ `!obj.shadow.map` WAS TESTING THE WRONG FIELD. `LightShadow.map` is the
+      // WebGL render target and is ALWAYS null on the WebGPU path — the map lives
+      // on the ShadowNode's own `shadowMap`, which nothing here can see. So the
+      // condition read "always true" for any light with autoUpdate off, and this
+      // branch force-wrote `needsUpdate` on every frozen light on every settings
+      // apply. That write is precisely the state that crashes three's
+      // `updateShadow` (`shadowMap.depthTexture` on null after a node dispose) —
+      // see the long note at GISystem#syncLightShadowNodes.
+      //
+      // An explicit authored one-shot is still honoured, because that is a
+      // deliberate user action on a light three has already had a frame to build.
+      // The "frozen light never rendered its map" case it was guessing at is
+      // handled where the freezing actually happens: ShadowFreezeSystem never
+      // freezes a light until it has seen the same content key TWICE, so three is
+      // guaranteed one real shadow render first.
+      // ⚠ This is SAFE ONLY because `installShadowNodeGuard` (Engine
+      // constructor) patches the missing null check in three's
+      // `ShadowNode.updateBefore`. Setting `needsUpdate` on a light whose node
+      // has no `shadowMap` yet used to crash with "Cannot read properties of
+      // null (reading 'depthTexture')" — and so did leaving `autoUpdate` true,
+      // since three gates on the OR of the two. Neither flag was ever the fix.
+      //
+      // ⚠ `shadow.needsUpdate` PERSISTS in the .scene, so once saved true it is
+      // re-applied on every settings apply for the life of the project rather
+      // than acting as the one-shot it reads as.
+      if (shadow.needsUpdate === true) {
         obj.shadow.needsUpdate = true;
       }
     });

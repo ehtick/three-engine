@@ -1,6 +1,22 @@
 import { create } from "zustand";
 import { vmSingleton } from "../singleton.js";
 
+/**
+ * `ids` as a Set, memoized on the array's identity.
+ *
+ * Every hierarchy row asks "am I selected?" on every selection change, and the
+ * obvious `ids.includes(id)` is O(n) per row — fine for a handful of rows, and
+ * 2.25 million comparisons per keystroke once someone searches 1500 meshes and
+ * selects the lot. The store hands out a fresh array on every write, so array
+ * identity is a sound cache key: one Set is built per selection change and every
+ * row after the first reads it in O(1).
+ */
+let selectedCache = { ids: /** @type {any} */ (null), set: new Set() };
+export function selectedIdSet(ids) {
+  if (selectedCache.ids !== ids) selectedCache = { ids, set: new Set(ids) };
+  return selectedCache.set;
+}
+
 // VM-wide: a duplicate copy of this module (HMR / Vite `?t=`) would give the
 // selection ops a store the mounted panels are not subscribed to, so selecting
 // from a script or over MCP would change nothing on screen. See singleton.js.
@@ -34,6 +50,37 @@ export const useSelectionStore = vmSingleton("selectionStore", () =>
         ? get().ids.filter((x) => x !== id)
         : [...get().ids, id];
       set({ ids, anchorId: id, assetPath: null, assetPaths: [], assetAnchor: null });
+    },
+
+    /**
+     * Unions `ids` into the selection, preserving what was already there.
+     *
+     * Ctrl+Shift-click (extend a range without dropping the earlier ranges) and
+     * "select all search results, keeping what I picked in another query" both
+     * need this, and neither can be spelled with `select` (which replaces) or
+     * repeated `toggle` (which would deselect anything already in the range).
+     * A Set does the dedupe so the caller can pass overlapping ranges freely.
+     */
+    add(ids, anchorId) {
+      const list = Array.isArray(ids) ? ids : [ids];
+      if (!list.length) return;
+      const merged = [...new Set([...get().ids, ...list])];
+      set({
+        ids: merged,
+        anchorId: anchorId ?? get().anchorId ?? list[0] ?? null,
+        assetPath: null,
+        assetPaths: [],
+        assetAnchor: null,
+      });
+    },
+
+    /** Removes `ids` from the selection, leaving the rest alone. */
+    remove(ids) {
+      const drop = new Set(Array.isArray(ids) ? ids : [ids]);
+      if (!drop.size) return;
+      const kept = get().ids.filter((id) => !drop.has(id));
+      if (kept.length === get().ids.length) return;
+      set({ ids: kept, anchorId: kept.includes(get().anchorId) ? get().anchorId : (kept[kept.length - 1] ?? null) });
     },
 
     selectAsset(path) {

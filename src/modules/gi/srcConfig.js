@@ -730,8 +730,32 @@ export function binCount(cascade, w0 = W0) {
  * That estimate is the thing to re-measure when the LOD law lands: the claim
  * failure is COUNTED (`COUNTER_NOBLOCK`), so a pool that turns out too small
  * says so instead of producing an unexplained dark patch.
+ *
+ * ══ RE-MEASURED 2026-08-17 ON BISTRO, AND IT WAS TOO SMALL ════════════════
+ *
+ * The counter did its job and the number above was the one that was wrong. A
+ * CITY STREET is not a Sponza-class interior: the user's Bistro runs **14,273
+ * live c0 probes** against the 10,937 blocks 1.4 M buys, so ~3,300 c0 probes
+ * are permanently blockless — alive, keyed, ray-budgeted, with nowhere to
+ * deposit — and the deposit-side counter read `noBlock 37255` PER FRAME.
+ * c1/c2/c3 were starved by the same ~1.3× (live 3788/1006/279 against
+ * 2734/683/170). This is the user's **moving black patches**: which probes
+ * win a block is birth order, so every camera move reshuffles the losers and
+ * the dark cells crawl over the surfaces.
+ *
+ * ⚠ THE GROW PATH MADE IT WORSE, AND THAT IS THE PART TO REMEMBER. Slot
+ * pressure doubled `c0Probes` 16384→32768 while `binBudget` was already
+ * pinned at this ceiling (the log line reads `binBudget 1400000→1400000`),
+ * so the rebuild bought MORE probes to share the SAME 10,937 blocks. A
+ * bigger slot pool with a capped bin pool is strictly more black.
+ *
+ * 2.8 M bins ≈ 100 MB, which still clears the 128 MiB binding limit that
+ * killed the old capacity-addressed sizing, and buys 21,875 c0 blocks —
+ * above the measured 14,273 with room for the slot pool's next double. Both
+ * pools remain FLOORS-first (`SRC_POOL_FLOORS.binBudget` is still 700 k), so
+ * a scene that does not ask pays nothing; this is only where growth stops.
  */
-export const BIN_BUDGET = 1_400_000;
+export const BIN_BUDGET = 2_800_000;
 /** Floor per cascade, so a one-cascade or tiny-w₀ configuration is not degenerate. */
 export const MIN_BLOCKS = 64;
 

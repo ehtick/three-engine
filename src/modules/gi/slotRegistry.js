@@ -24,11 +24,40 @@
 // entry is matched to a seated placement across frames (#syncSlots).
 import * as THREE from "three/webgpu";
 
-// 512 placements. Was half of WebGPU's guaranteed 64KB uniform-buffer binding
-// (512 mat4s = 32KB) back when every slot had GPU state; now it is only a CPU
-// array bound, kept because it is also the pyramid's own slot ceiling
-// (GISystem passes it as `slotCapacity`) and the two must not disagree.
-export const MAX_INSTANCE_SLOTS = 512;
+// 768 placements. The ceiling is WebGPU's guaranteed 64KB uniform-buffer
+// binding — but per OBJECT GROUP, not per array, and that distinction is a
+// measured breakage, not a nicety.
+//
+// The 512 it shipped at cost Bistro two thirds of its geometry: `1020 of 1532
+// placements could not seat (slots 512) — they are invisible to GI` — no
+// bounce, no occupancy, no shadow, which reads as blotchy part-lit streets,
+// not as an error. Overflow seating is first-come by collect order (GISystem
+// breaks at this constant), so WHICH two thirds vanished was an accident of
+// hierarchy order on top of it.
+//
+// ⚠ 1024 WAS TRIED (2026-08-16) AND IS INVALID. Per-array arithmetic said it
+// fit exactly: occupancyField's `localToWorld` is one mat4 per slot, and
+// 1024 × 64B = 65,536B = precisely maxUniformBufferBindingSize. But three
+// packs ALL of a compute object's uniformArrays into ONE object-group UBO
+// (`bindGroup_object`), so `localToWorld` shares its 64KB with `slotDynamic`
+// ((N+1) floats at 16B WGSL uniform stride, ~16.4KB at 1024) — 80KB in one
+// binding. Every GI compute submit then failed with
+//   Invalid BindGroup "bindGroup_object" … Queue.Submit(<invalid>)
+// and a dropped submit renders as a BLACK GI FIELD, not as an error dialog.
+// This is also the real reason the original constant was "half the limit":
+// the other half was headroom for exactly this co-packing.
+//
+// 768 is the fit under co-packing: 48KB (matrices) + 12.3KB (slotDynamic)
+// ≈ 60.3KB ≤ 64KB. Going higher means moving `localToWorld` to a storage
+// buffer first — and checking the voxelize kernel's storage-buffer count
+// against maxStorageBuffersPerShaderStage before adding one.
+//
+// Everything else audited 2026-08-16: palette uniforms (N×2 vec4s) live on a
+// different kernel's object group; slotRegistry itself is plain CPU arrays;
+// the mover arrays (spheres/halfs/quats) are sized by the MOVER cap, not this.
+// Still the pyramid's own slot ceiling (GISystem passes it as `slotCapacity`)
+// and the two must not disagree.
+export const MAX_INSTANCE_SLOTS = 768;
 // Capacity granularity. The 16 is inherited: it was SLOTS_PER_LAYER, one Z-layer
 // of the 4×4-tile atlas. It survives purely as a rounding quantum so that a
 // scene gaining one prop does not re-tier and rebuild.

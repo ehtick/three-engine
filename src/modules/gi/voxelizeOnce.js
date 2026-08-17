@@ -51,6 +51,50 @@ function textureValueOf(node, depth = 0) {
 }
 
 /**
+ * The CONSTANT SCALE multiplying a texture inside a node subtree — the
+ * `strength` half of the shader graph's `emissive = colorInput × strength`.
+ *
+ * ⚠ THIS IS WHY "NO MATTER WHAT NUMBER I SET, IT EMITS NO LIGHT" (2026-08-17,
+ * the user's Bistro lanterns, five sessions).
+ *
+ * `tslGraph` builds `m.emissiveNode = mul(colorInput, strength)`. When the
+ * colour input is a flat swatch the whole product folds and `constantColorOf`
+ * returns it — that path works and always has. When the colour input is a
+ * TEXTURE the product cannot fold, and the emissive resolver below refused it
+ * outright: the mesh baked BLACK and `emissiveStrength` was multiplying a node
+ * GI never evaluated. Every value produced exactly the same darkness, which is
+ * indistinguishable from a broken transport and is why this was chased through
+ * the transport four times.
+ *
+ * `material.emissiveIntensity` cannot stand in for it — the strength is baked
+ * INTO the node by that `mul`, so the material's own field sits at its default
+ * of 1. The number has to be recovered from the graph, which is what this does:
+ * walk the product, and where one side is a texture, fold the other side.
+ */
+function textureScaleOf(node, depth = 0) {
+  if (!node || depth > 8) return 1;
+  if (node.op === "*" && node.aNode && node.bNode) {
+    const aTex = !!textureValueOf(node.aNode);
+    const bTex = !!textureValueOf(node.bNode);
+    // Exactly one side carries the texture: the other side IS the scale.
+    if (aTex !== bTex) {
+      const scaleSide = aTex ? node.bNode : node.aNode;
+      const texSide = aTex ? node.aNode : node.bNode;
+      const c = constantColorOf(scaleSide);
+      // Channel mean: `strength` is authored as a float, so a vec3 here is a
+      // colour tint and its mean is the right scalar to carry.
+      const s = c ? (c.r + c.g + c.b) / 3 : 1;
+      return s * textureScaleOf(texSide, depth + 1);
+    }
+  }
+  for (const child of [node.aNode, node.bNode, node.node]) {
+    if (!child) continue;
+    if (textureValueOf(child)) return textureScaleOf(child, depth + 1);
+  }
+  return 1;
+}
+
+/**
  * Mean LINEAR color of a texture, from an 8×8 downsample of its source
  * image. This is what keeps a TEXTURED mesh from baking into the field —
  * and reflecting — as flat WHITE: the SDF slot carries one albedo, and
@@ -91,6 +135,7 @@ export function noteTextureAverage(texture, rgb) {
 // A diagnostic that cannot change until the material graph changes should not
 // flood the editor console/store on every scan.
 const warnedUnresolvedEmissive = new WeakSet();
+const warnedEmissiveMask = new WeakSet();
 function textureAverageColor(texture) {
   if (!texture) return null;
   if (textureAverageCache.has(texture)) return textureAverageCache.get(texture);
@@ -157,17 +202,116 @@ export function resolveMaterialSurface(materialInput, meshName = "") {
   if (mapAverage) {
     color = { r: color.r * mapAverage.r, g: color.g * mapAverage.g, b: color.b * mapAverage.b };
   }
+  // ── BOUNCE CHROMA vs TWO KNOWN APPROXIMATION ERRORS ──────────────────────
+  //
+  // This ONE colour is the entire bounce answer for every ray that lands on
+  // this mesh, and two approximations inflate its chroma in places the
+  // physics would not:
+  //
+  //   · ONE AVERAGE PER MESH. A shopfront whose texture is blue paint +
+  //     white trim + glass bounces the AVERAGE over its whole area, so the
+  //     blue is delivered by the trim and the glass too.
+  //   · SHARED CELLS. Thin geometry shares a voxel cell — and therefore one
+  //     surface record and one colour — with whatever is behind it (the live
+  //     Bistro reports 373 of 636 meshes thinner than 2 cells), so an
+  //     awning's red or a sign's blue is stamped onto the wall behind it.
+  //
+  // Both errors are chroma errors, not energy errors, and they are what the
+  // user sees as saturated blotches on neutral stone ("dirty colors",
+  // 2026-08-16). Damping chroma toward the colour's own LUMINANCE corrects
+  // in the direction of the known error while preserving how much light
+  // bounces — the physical quantity the estimator does get right.
+  //
+  // Default 1 = untouched: this ships as a measured choice, not a silent
+  // one. `__giBounceSaturation` is the live dial — the fingerprint hashes
+  // this colour, so changing it re-tints the palette on the next scan with
+  // NO rebuild and no compile wave (plan §13.7b).
+  const bounceSat = globalThis.__giBounceSaturation;
+  if (Number.isFinite(bounceSat) && bounceSat < 1) {
+    const s = Math.max(0, bounceSat);
+    const lum = 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
+    color = {
+      r: lum + (color.r - lum) * s,
+      g: lum + (color.g - lum) * s,
+      b: lum + (color.b - lum) * s,
+    };
+  }
   const emissiveTexture = textureValueOf(material?.emissiveNode);
-  // An SDF slot stores ONE emissive color for the whole mesh. Replacing a
-  // spatial mask with its average turns a building/room mesh into a giant
-  // area light and washes every material toward white. Keep imported
-  // texture-masked emission in the raster material only; GI emission remains
-  // available for constant-color nodes and dedicated emissive geometry.
-  const emissiveResolved = emissiveTexture ? null : constantColorOf(material?.emissiveNode);
+  // ── A TEXTURE-DRIVEN EMISSIVE NOW RESOLVES TO ITS MEAN × STRENGTH ────────
+  //
+  // This used to be `emissiveTexture ? null : …` — a flat refusal — on this
+  // argument, which is quoted because half of it is still right:
+  //
+  //   "An SDF slot stores ONE emissive color for the whole mesh. Replacing a
+  //    spatial mask with its average turns a building/room mesh into a giant
+  //    area light and washes every material toward white."
+  //
+  // The SPATIAL half is true: one colour per mesh cannot represent lit windows
+  // in a dark facade, and the average spreads their glow over the whole wall.
+  // The ENERGY half is backwards. Emitted power is `∫ radiance dA = area ×
+  // mean(radiance)`, so the mean is exactly the energy-correct summary — it is
+  // the same identity `textureAverageColor` is already trusted for on the
+  // BOUNCE ALBEDO two dozen lines above, where getting it wrong compounded per
+  // bounce and washed out a whole interior (§2026-08-14).
+  //
+  // And the refusal's own failure mode is far worse than the wash it avoided:
+  // the emitter baked BLACK, so an authored lantern emitted NOTHING at any
+  // strength, silently — the warning below was gated on `!emissiveTexture`, so
+  // a textured emissive did not even get a diagnostic. Measured on the user's
+  // Bistro: `Lantern.mat` at `emissiveStrength: 1500` delivered rgb 0/0/0, and
+  // 1, 100 and 1000 were indistinguishable. Five sessions went into the
+  // transport looking for it.
+  //
+  // A wash in the right ballpark beats a confident zero. The spatial error is
+  // real and is now SAID OUT LOUD (the coverage warning below) rather than
+  // avoided by emitting nothing.
+  const emissiveTexAvg = emissiveTexture && !globalThis.__giNoEmissiveTexture
+    ? textureAverageColor(emissiveTexture)
+    : null;
+  let emissiveResolved = emissiveTexture ? null : constantColorOf(material?.emissiveNode);
+  let emissiveIntensity = emissiveResolved ? 1 : (material?.emissiveIntensity ?? 1);
+  if (!emissiveResolved && emissiveTexAvg) {
+    // The graph's `strength` is baked into `emissiveNode` by tslGraph's `mul`,
+    // so it comes from the node, never from `material.emissiveIntensity` —
+    // see `textureScaleOf`.
+    emissiveResolved = emissiveTexAvg;
+    emissiveIntensity = textureScaleOf(material.emissiveNode);
+  }
   const emissive = emissiveResolved ?? material?.emissive ?? black;
-  const emissiveIntensity = emissiveResolved ? 1 : (material?.emissiveIntensity ?? 1);
   // A texture-backed expression may simply be waiting for its image. Retry on
   // the next fingerprint scan without claiming that it is unsupported.
+  // A textured emissive whose image has not decoded yet resolves to null and
+  // retries on the next scan — but a COMPRESSED one queues on the GPU averager
+  // and could sit unresolved indefinitely if that path ever breaks. Say so once,
+  // because the symptom (an emitter that emits nothing) is the exact thing this
+  // whole block exists to stop being silent.
+  if (emissiveTexture && !emissiveTexAvg && material && !warnedUnresolvedEmissive.has(material)) {
+    warnedUnresolvedEmissive.add(material);
+    console.warn(
+      `[gi] "${meshName || "mesh"}": emissive is TEXTURE-DRIVEN and its average is not resolved yet ` +
+        `(${emissiveTexture.isCompressedTexture ? "compressed — queued for the GPU averager" : "image still loading"}). ` +
+        `The emitter is dark until it lands; if this line never stops repeating across rebuilds, the average never ` +
+        `arrived and the lamp will emit nothing at any strength.`,
+    );
+  }
+  // ── AND WHERE THE MEAN IS A POOR SUMMARY, SAY THAT TOO ───────────────────
+  //
+  // Low coverage = a MASK (dark texture, small bright region), which is the
+  // case the old refusal was protecting against: the mean spreads a window's
+  // glow over the whole facade. The energy is right, the distribution is not.
+  // Naming it is what lets someone split the mesh or use a flat emissive on the
+  // lit part instead of discovering the wash by eye.
+  if (emissiveTexture && emissiveTexAvg && material && !warnedEmissiveMask.has(material)) {
+    const lum = 0.2126 * emissiveTexAvg.r + 0.7152 * emissiveTexAvg.g + 0.0722 * emissiveTexAvg.b;
+    if (lum > 0 && lum < 0.12) {
+      warnedEmissiveMask.add(material);
+      console.warn(
+        `[gi] "${meshName || "mesh"}": emissive texture is mostly dark (mean luminance ${lum.toFixed(3)}) — GI carries ` +
+          `ONE emissive colour per mesh, so its lit region's glow is spread over the whole mesh. Total emitted power is ` +
+          `correct; its placement is not. Split the emissive geometry into its own mesh for a crisp light.`,
+      );
+    }
+  }
   if (material?.emissiveNode && !emissiveResolved && !emissiveTexture) {
     const fallbackDark =
       (emissive.r ?? 0) * emissiveIntensity < 0.01 &&

@@ -1,37 +1,15 @@
 import * as THREE from "three/webgpu";
 import * as TSL from "three/tsl";
 import { Component } from "../../engine/components/Component.js";
+import { ensureGodraysShadowMap, disposeGodraysShadowMap } from "./godraysShadow.js";
 import { EDITOR_LAYER, PP_OVERLAY_SEED_LAYER } from "../../engine/editorLayers.js";
+import { resolveAssetUrl } from "../../engine/assetResolver.js";
+import { DEFAULT_POST_GRAPH, normalizePostAsset, normalizePostGraph } from "./postAsset.js";
 import {
   compilePostGraph,
-  DEFAULT_POST_GRAPH,
   postGraphSceneNeeds,
   postGraphSignature,
-  loadSSGI,
-  loadSSR,
-  loadGTAO,
-  loadDenoise,
-  loadTRAA,
-  loadBloom,
-  loadGodrays,
-  loadDepthAwareBlend,
-  loadDOF,
-  loadChromaticAberration,
-  loadFilm,
-  loadFXAA,
-  loadSMAA,
-  loadSoberOperator,
-  loadRGBShift,
-  loadSharpen,
-  loadAfterImage,
-  loadSepia,
-  loadBleach,
-  loadDotScreen,
-  loadLut3D,
-  loadGaussianBlur,
-  loadBilateralBlur,
-  loadMotionBlur,
-  loadFSR1,
+  loadAddonsForGraph,
 } from "./postGraph.js";
 
 /**
@@ -118,7 +96,44 @@ function shadedMaterialColor() {
   })();
 }
 
+/**
+ * The light god rays raymarch against.
+ *
+ * ⚠ GOD RAYS ARE A SHADOW-MAP EFFECT, and that is not a preference — three's
+ * `GodraysNode` samples `light.shadow.map.depthTexture` at every step of its
+ * view-ray march (its own docs: "requires a full shadow setup … the main light
+ * must cast shadows"). A light using GI-traced shadows keeps `castShadow` true
+ * — three only compiles a shadow branch for shadow-casters, and the GI module's
+ * custom `shadowNode` replaces the map LOOKUP inside it — but three then skips
+ * rendering the map entirely, so `shadow.map` stays null and building the node
+ * against it throws `Cannot read properties of null (reading 'depthTexture')`.
+ *
+ * So gi-mode lights are skipped here rather than crashing the graph. If that
+ * leaves no candidate the effect no-ops, which is the honest outcome: there is
+ * no occlusion volume for it to march. Restoring god rays on a gi-shadow scene
+ * means keeping one real (small) map alive purely to feed the march — see plan
+ * §12.78 — not relaxing this guard.
+ */
+/** The gi-mode light god rays WOULD use if it had a map to march. */
+function findGiShadowLight(engine) {
+  for (const entity of engine?.entities?.values?.() ?? []) {
+    const light = entity.getComponent?.("light")?.light;
+    if (
+      light &&
+      (light.isDirectionalLight || light.isPointLight) &&
+      light.shadow &&
+      light.castShadow &&
+      light.visible !== false &&
+      light.userData?.giShadowMode === "gi"
+    ) {
+      return light;
+    }
+  }
+  return null;
+}
+
 function findGodraysLight(engine) {
+  let skippedGi = null;
   for (const entity of engine?.entities?.values?.() ?? []) {
     const light = entity.getComponent?.("light")?.light;
     if (
@@ -128,8 +143,23 @@ function findGodraysLight(engine) {
       light.castShadow &&
       light.visible !== false
     ) {
+      if (light.userData?.giShadowMode === "gi" || !light.shadow.map?.depthTexture) {
+        // `shadow.map` is also null for one frame after a light is created, so
+        // this doubles as the not-yet-rendered guard — the graph rebuilds when
+        // the map appears and god rays pick it up then.
+        skippedGi ??= light;
+        continue;
+      }
       return light;
     }
+  }
+  if (skippedGi && !findGodraysLight._warned) {
+    findGodraysLight._warned = true;
+    console.info(
+      "[postprocessing] God rays are disabled: the scene's shadow-casting light has no shadow MAP to " +
+        "raymarch. Its Shadow Source is \"gi\" (GI-traced shadows render no map). Switch the light back " +
+        "to map shadows for god rays, or keep both by giving it a small real map alongside GI.",
+    );
   }
   return null;
 }
@@ -167,17 +197,25 @@ function findGodraysLight(engine) {
  * in a scene each manage their own pipeline independently; only the
  * ACTIVE camera's component participates on any given frame.
  *
- * The graph lives in `props.graph` and round-trips through the component's
- * default JSON serialization (no special onSerialize needed). A fresh
- * component starts with a one-node passthrough so a freshly added
- * PostprocessComponent renders the scene unchanged until the user opens
- * the editor and adds nodes.
+ * The graph is a `.post` document named by `props.asset` — one look, authored
+ * once, shared by every camera that points at it. `props.graph` is the older
+ * inline form and still renders when no asset is assigned, so scenes that
+ * predate the document format keep working; `activeGraph()` is where the two
+ * are resolved. Either way a fresh component starts with a one-node
+ * passthrough, so adding a PostprocessComponent renders the scene unchanged
+ * until the user opens the editor and adds nodes.
  */
 export class PostprocessComponent extends Component {
   static type = "postprocess";
   static label = "Post Process";
   static tags = ["rendering", "camera", "screen-space", "graph"];
   static defaults = {
+    // The `.post` document this camera renders through. When set it WINS over
+    // `graph` — the file is the authored artifact and the inline copy is
+    // history. See postAsset.js for why the graph became a document.
+    asset: "",
+    // Legacy inline graph. Scenes authored before `.post` existed keep this
+    // and keep working; the panel's "Save As" is what lifts one into a file.
     graph: null,
     // Whether to apply the post-graph at all. When false, the camera
     // renders normally and the compiled pipeline is disposed. Useful for
@@ -188,9 +226,12 @@ export class PostprocessComponent extends Component {
     // not playing. Play mode always uses the component's owning camera.
     showInEditor: false,
   };
-  // The node editor (Window → Post Process) is the real UI; nothing
-  // schema-relevant to inspect here.
+  // The node editor (Window → Post Process) is the real UI; the slot is here
+  // so the graph can be swapped from the Inspector, and — the reason it must
+  // be a schema `asset` field rather than a plain string — so the scene's
+  // asset sweep preloads it and the exporter ships it.
   static schema = [
+    { key: "asset", label: "Graph", type: "asset", exts: ["post"], emptyLabel: "Embedded" },
     { key: "enabled", label: "Enabled", type: "boolean" },
     { key: "showInEditor", label: "Show in Editor", type: "boolean" },
   ];
@@ -229,6 +270,13 @@ export class PostprocessComponent extends Component {
     // Last `compilePostGraph` result; kept for its `updateParams`, which
     // pushes hot-param edits into the compiled addons without a rebuild.
     this.compiled = null;
+    // The graph parsed out of `props.asset` (or pushed in by the editor for a
+    // live preview of unsaved edits). Null until the document loads, which is
+    // why `activeGraph()` falls back rather than rendering nothing.
+    this.assetGraph = null;
+    // Bumped per load request so a slow fetch for a graph the user has since
+    // swapped away from cannot overwrite the current one when it lands.
+    this.assetGeneration = 0;
     this.generation = 0;
     // Unsubscribe handle for the late-camera-arrival watcher. Cleared
     // once the camera is resolved.
@@ -248,6 +296,7 @@ export class PostprocessComponent extends Component {
     });
     this.playChangedHandle?.();
     this.playChangedHandle = this.entity.engine.on?.("play-changed", () => this.#syncRenderCamera());
+    if (this.props.asset) void this.#loadAsset(++this.assetGeneration);
     this.#tryAttach();
     // If the camera component is added AFTER us (typical: postprocess is
     // a follow-up add to an existing camera), the engine emits
@@ -258,6 +307,9 @@ export class PostprocessComponent extends Component {
   }
 
   onDetach() {
+    // Before anything else: this owns a render target AND a per-frame pass, and
+    // a pass that outlives its component renders into a disposed scene.
+    this.#releaseGodraysShadow();
     this.rendererRebuildHandle?.();
     this.rendererRebuildHandle = null;
     this.playChangedHandle?.();
@@ -294,9 +346,67 @@ export class PostprocessComponent extends Component {
       this.#syncRenderCamera();
       return;
     }
+    if (key === "asset") {
+      // Drop the old document immediately rather than on the new one's
+      // arrival: clearing the slot has to fall back to the inline graph now,
+      // and swapping must not keep rendering the previous look while the next
+      // file is in flight.
+      this.assetGraph = null;
+      this.assetGeneration++;
+      if (this.props.asset) {
+        void this.#loadAsset(this.assetGeneration);
+        return;
+      }
+    }
     // `graph` is the only other mutable prop; force a recompile.
     this.generation++;
     void this.#ensurePipeline();
+  }
+
+  /**
+   * The graph this camera actually renders: the loaded `.post` document, else
+   * the inline legacy graph, else a passthrough. One accessor so "which graph
+   * wins" is answered in exactly one place.
+   */
+  activeGraph() {
+    return this.assetGraph ?? this.props.graph ?? DEFAULT_POST_GRAPH;
+  }
+
+  /**
+   * Editor hook: render an in-memory graph (a live preview of edits that are
+   * not on disk yet, and the way the panel pushes a save into running
+   * components — `resolveAssetUrl` hands back a cached blob: URL for a path
+   * that was just overwritten, so re-reading the file would show the version
+   * from before the save). Pass null to go back to what the props say.
+   */
+  applyGraph(graph) {
+    // Claim the load generation so an in-flight fetch cannot land on top of
+    // the preview the user is looking at.
+    this.assetGeneration++;
+    this.assetGraph = graph ? normalizePostGraph(graph) : null;
+    this.generation++;
+    void this.#ensurePipeline();
+  }
+
+  /** Re-read the assigned `.post` from disk (an external edit changed it). */
+  reloadAsset() {
+    if (!this.props.asset) return;
+    void this.#loadAsset(++this.assetGeneration);
+  }
+
+  async #loadAsset(generation) {
+    const path = this.props.asset;
+    try {
+      const url = await resolveAssetUrl(path);
+      const json = await (await fetch(url)).json();
+      if (generation !== this.assetGeneration) return;
+      this.assetGraph = normalizePostAsset(json).graph;
+      this.generation++;
+      void this.#ensurePipeline();
+    } catch (err) {
+      if (generation !== this.assetGeneration) return;
+      console.error(`Failed to load post-process graph "${path}": ${err?.message ?? err}`);
+    }
   }
 
   /** Attempts to resolve the camera and bring the pipeline up. Idempotent. */
@@ -313,6 +423,55 @@ export class PostprocessComponent extends Component {
     // Once attached, we no longer need the watcher.
     this.watchHandle?.();
     this.watchHandle = null;
+  }
+
+  /**
+   * The light god rays raymarch against — and, when the only candidate uses
+   * GI shadows, the small map that makes it usable.
+   *
+   * three renders no shadow map for a gi-mode light (its custom `shadowNode`
+   * short-circuits the path that owns the map), and `GodraysNode` dereferences
+   * `light.shadow.map.depthTexture` unconditionally. So rather than losing the
+   * effect on every GI scene, we render one ourselves — see `godraysShadow.js`
+   * for why that is safe and why 1024² is the right size for fog.
+   *
+   * ONLY when the graph actually contains a godrays node: this costs a depth
+   * pass per frame, and paying it for an effect nobody enabled is exactly the
+   * kind of invisible cost this module has had to hunt down before.
+   */
+  #resolveGodraysLight(engine, graph) {
+    const direct = findGodraysLight(engine);
+    const wanted = (graph?.nodes ?? []).some((n) => n.type === "godrays");
+    if (direct || !wanted) {
+      this.#releaseGodraysShadow();
+      return direct;
+    }
+    const gi = findGiShadowLight(engine);
+    if (!gi) {
+      this.#releaseGodraysShadow();
+      return null;
+    }
+    // Re-attaching to the same light reuses the cached target, so the frequent
+    // graph rebuilds (every parameter edit recompiles) do not churn textures.
+    const render = ensureGodraysShadowMap(engine, gi);
+    if (!render) {
+      this.#releaseGodraysShadow();
+      return null;
+    }
+    if (this._godraysShadowLight !== gi) this.#releaseGodraysShadow();
+    this._godraysShadowLight = gi;
+    this.unsubGodraysShadow ??= engine.onPreRender(render);
+    return gi;
+  }
+
+  /** Drops the effect-only map and its per-frame pass. */
+  #releaseGodraysShadow() {
+    this.unsubGodraysShadow?.();
+    this.unsubGodraysShadow = null;
+    if (this._godraysShadowLight) {
+      disposeGodraysShadowMap(this._godraysShadowLight);
+      this._godraysShadowLight = null;
+    }
   }
 
   #desiredRenderCamera(engine = this.entity.engine) {
@@ -407,7 +566,7 @@ export class PostprocessComponent extends Component {
     const renderer = engine?.renderer;
     if (!renderer) return;
 
-    const graph = this.props.graph ?? DEFAULT_POST_GRAPH;
+    const graph = this.activeGraph();
     const signature = postGraphSignature(graph);
     // ── THE SSR ENVIRONMENT IS STRUCTURAL ───────────────────────────────────
     // SSRNode's stochastic path bakes `sampleEnvReflection` into its fragment
@@ -442,19 +601,11 @@ export class PostprocessComponent extends Component {
     this.generation++;
     const myGen = this.generation;
 
-    // Lazily preload the optional addons. Resolved promises are cached, so
-    // the first call downloads the modules and subsequent rebuilds (graph
-    // edits) reuse the result. If an addon's bundle is missing from the
-    // user's three build, the promise resolves to `null` and the compiler
-    // falls back to a passthrough for that node — no crash, just a warning
-    // in the console.
-    // Load all post-process addons in parallel. They're individually
-    // memoized in `postGraph.js` so the second and subsequent compiles
-    // hit the warm promise. If an addon path doesn't exist in the user's
-    // three build (r185 dropped some TSL helpers into `three/addons/`),
-    // the resolver logs a warning and resolves to null; the compile call
-    // below treats null as "this effect is a passthrough".
-    const [
+    // Load only addons reachable from Output. Eagerly Promise.all-ing every
+    // three/addons TSL display module (~25 Vite deps) tripped Chrome's
+    // net::ERR_INSUFFICIENT_RESOURCES and also starved the HDRI loader.
+    // loadAddonsForGraph caps concurrency and retries transient fetch aborts.
+    const {
       ssgi,
       ssr,
       gtao,
@@ -480,33 +631,7 @@ export class PostprocessComponent extends Component {
       bilateralBlur,
       motionBlur,
       fsr1,
-    ] = await Promise.all([
-      loadSSGI(),
-      loadSSR(),
-      loadGTAO(),
-      loadDenoise(),
-      loadTRAA(),
-      loadBloom(),
-      loadGodrays(),
-      loadDepthAwareBlend(),
-      loadDOF(),
-      loadChromaticAberration(),
-      loadFilm(),
-      loadFXAA(),
-      loadSMAA(),
-      loadSoberOperator(),
-      loadRGBShift(),
-      loadSharpen(),
-      loadAfterImage(),
-      loadSepia(),
-      loadBleach(),
-      loadDotScreen(),
-      loadLut3D(),
-      loadGaussianBlur(),
-      loadBilateralBlur(),
-      loadMotionBlur(),
-      loadFSR1(),
-    ]);
+    } = await loadAddonsForGraph(graph);
     if (myGen !== this.generation) return;
 
     // Only attach the MRT slots the graph actually consumes. Every extra
@@ -806,7 +931,7 @@ export class PostprocessComponent extends Component {
         bloom,
         godrays,
         depthAwareBlend,
-        godraysLight: findGodraysLight(engine),
+        godraysLight: this.#resolveGodraysLight(engine, graph),
         dof,
         chromaticAberration,
         film,
