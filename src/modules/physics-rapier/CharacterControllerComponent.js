@@ -131,6 +131,48 @@ export class CharacterControllerComponent extends Component {
     return this.platformEntity ?? null;
   }
 
+  /**
+   * Resizes the capsule WHILE PLAYING — what crouching actually needs.
+   *
+   * `height`/`radius` are structural props everywhere else: they are read once
+   * when the world is built, because changing a shape usually means rebuilding
+   * the body and every handle pointing at it. A capsule is the one shape
+   * Rapier can resize in place (`setHalfHeight` / `setRadius`), and a
+   * character that cannot change height at runtime cannot crouch, crawl or
+   * duck through a gap — so this narrow door exists rather than a general
+   * "rebuild the character" path that would drop its velocity and grounding.
+   *
+   * The entity's world scale is applied here the same way `#buildCharacter`
+   * applies it, so a scaled character stays consistent with the capsule it was
+   * built with. Standing back up is the CALLER's problem: check for a ceiling
+   * first (`engine.physics.spherecast` upward), or you will resize into it.
+   */
+  setCapsule({ height, radius, offset } = {}) {
+    const next = {
+      height: Number.isFinite(height) ? Math.max(0.01, height) : this.props.height,
+      radius: Number.isFinite(radius) ? Math.max(0.01, radius) : this.props.radius,
+      offset: Array.isArray(offset) && offset.every(Number.isFinite) ? offset : this.props.offset,
+    };
+    this.setProp("height", next.height);
+    this.setProp("radius", next.radius);
+    this.setProp("offset", next.offset);
+    if (!this.collider) return next; // not playing: the props are enough
+    const scale = this.entity.object3D.getWorldScale(new THREE.Vector3());
+    const sy = Math.abs(scale.y) || 1;
+    const sxz = Math.max(Math.abs(scale.x), Math.abs(scale.z)) || 1;
+    this.collider.setHalfHeight?.((next.height / 2) * sy);
+    this.collider.setRadius?.(next.radius * sxz);
+    // The offset moves with the height for the usual reason: a rig whose origin
+    // is at the character's FEET shrinks around its base, not its middle, so
+    // crouching lowers the head instead of lifting the feet off the floor.
+    this.collider.setTranslationWrtParent?.({
+      x: next.offset[0] * scale.x,
+      y: next.offset[1] * scale.y,
+      z: next.offset[2] * scale.z,
+    });
+    return next;
+  }
+
   /** Instantly repositions the character (world space) and clears fall speed. */
   teleport([x, y, z]) {
     this.velocity[1] = 0;

@@ -15,6 +15,10 @@ const geometryFactories = {
   sphere: () => new THREE.SphereGeometry(0.5, 32, 16),
   plane: () => new THREE.PlaneGeometry(1, 1),
   cylinder: () => new THREE.CylinderGeometry(0.5, 0.5, 1, 32),
+  // Matches the Collider/Character Controller capsule's own parameterisation
+  // (radius 0.5, cylinder section 1 — so a unit-scaled capsule is 2 tall),
+  // which is what lets a character's stand-in mesh and its capsule agree.
+  capsule: () => new THREE.CapsuleGeometry(0.5, 1, 8, 24),
   cone: () => new THREE.ConeGeometry(0.5, 1, 32),
   torus: () => new THREE.TorusGeometry(0.4, 0.15, 16, 48),
 };
@@ -277,6 +281,17 @@ export class MeshComponent extends Component {
 
   #applyMaterialSlots() {
     if (!this.mesh) return;
+    // ⚠ ANOTHER COMPONENT MAY OWN THIS MESH'S MATERIAL.
+    //
+    // A component that builds its own look through this mesh (Blockout's
+    // greybox palette; see `userData.materialOwner`) assigns `mesh.material`
+    // during its own onAttach. This method then runs one MICROTASK later —
+    // `#loadExtraMaterials` awaits an empty `Promise.all` before calling it —
+    // and reset every blockout piece to the default white material, with no
+    // `component-changed` to tell the owner it had happened. The symptom was a
+    // level drawn entirely in white with no grid texture and nothing in the
+    // console.
+    if (this.mesh.userData.materialOwner) return;
     const paths = [this.props.material ?? '', ...Array.from({ length: 7 }, (_, index) => this.props[`material${index + 2}`] ?? '')];
     const hasExtraMaterial = paths.slice(1).some(Boolean);
     // Geometry groups retain their numeric material slot even when that slot
@@ -403,7 +418,7 @@ export class MeshComponent extends Component {
         // between the commit and `loadMaterialAsset` resolving. `#loadSharedMaterial`
         // will still run for the visibility / generation / subscribe plumbing.
         const cached = getMaterialInstance(this.props.material);
-        if (cached) {
+        if (cached && !this.mesh.userData.materialOwner) {
           const paths = [this.props.material, ...Array.from({ length: 7 }, (_, index) => this.props[`material${index + 2}`] ?? '')];
           const hasExtraMaterial = paths.slice(1).some(Boolean);
           this.mesh.material = hasExtraMaterial && this.mesh.geometry?.groups?.length ? paths.map((p) => getMaterialInstance(p) ?? getDefaultMaterial()) : cached;

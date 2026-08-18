@@ -198,6 +198,31 @@ export class InputManager extends EventEmitter {
     return this.maps.get(name) ?? null;
   }
 
+  // ---- Pointer lock ----
+  //
+  // Delegates to the mouse device rather than making scripts reach for
+  // `document` themselves. A first-person camera is the single most common
+  // thing anyone writes against this API, and it needs all three of these; a
+  // script that has to escape to the DOM for them loses its type checking at
+  // exactly the point where the engine could have kept it.
+
+  /** Locks the cursor to the canvas (mouse look). True when it was requested;
+   *  the browser only grants it from a user gesture, so call it from a click. */
+  requestPointerLock() {
+    return this.mouse.requestPointerLock();
+  }
+
+  /** Releases the cursor. Safe to call when it was never locked. */
+  exitPointerLock() {
+    if (typeof document === "undefined") return;
+    document.exitPointerLock?.();
+  }
+
+  /** True while the cursor is locked to the page. */
+  get pointerLocked() {
+    return typeof document !== "undefined" && !!document.pointerLockElement;
+  }
+
   // ---- Schemes ----
 
   detectScheme() {

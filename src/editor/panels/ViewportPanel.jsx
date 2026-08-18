@@ -94,6 +94,10 @@ import {
   setTerrainBrushSetting,
   subscribeTerrainBrush,
 } from "../terrainBrush.js";
+import { useModulesStore } from "../modules.js";
+import { setupBlockoutTool } from "../blockoutTool.js";
+import { dispatchLevelToolKey, getLevelTool, subscribeLevelTool } from "../levelTool.js";
+import { LevelToolButton, LevelToolbar } from "../components/LevelToolbar.jsx";
 import { createStroke, resetStroke, strokeDabs } from "../brush.js";
 import { SetTerrainHeightsCommand, SetTerrainScatterCommand, SetTerrainSplatmapCommand } from "../commands/terrainCommands.js";
 import { GeometryEditorPanel } from "./GeometryEditorPanel.jsx";
@@ -333,7 +337,18 @@ async function ensureViewport() {
       setupSplineEditing(canvas);
       setupPicking(canvas);
       setupTerrainBrush(canvas);
+      setupBlockoutTool(canvas, viewport);
       setupKeyboard(canvas);
+      // Same reasoning as the terrain brush below: a drawing tool owns the
+      // viewport, and the gizmo's handles would swallow the drag that places
+      // the piece under them.
+      subscribeLevelTool(() => {
+        const armed = !!getLevelTool() && getLevelTool() !== "select";
+        if (armed || !getTerrainBrushMode()) {
+          viewport.gizmo.enabled = !armed;
+          viewport.gizmo.getHelper().visible = !armed;
+        }
+      });
       // While a sculpt/paint brush is armed, hide the transform gizmo so its
       // arrow handles can't intercept brush strokes on the terrain mesh.
       subscribeTerrainBrush(() => {
@@ -3015,6 +3030,13 @@ function setupKeyboard(canvas) {
     }
     if (!viewport.hovered) return;
     if (e.target.closest?.(".geometry-editor")) return;
+    // Before the terrain brush: the level tools are only live while explicitly
+    // armed, and while they are they own the number keys and U/J.
+    if (!e.repeat && dispatchLevelToolKey(e)) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      return;
+    }
     if (!e.repeat && dispatchTerrainKeyAction(e)) {
       e.preventDefault();
       e.stopImmediatePropagation();
@@ -3838,6 +3860,7 @@ export function ViewportPanel() {
   // subscribeLayers pub-sub.
   const [layers, setLayers] = useState(viewport.layers);
   const [layersOpen, setLayersOpen] = useState(false);
+  const levelDesignEnabled = useModulesStore((s) => s.enabled.includes("level-design"));
   // Mirrored from browserPreview.js rather than owned here: the server
   // outlives this panel (dockview remounts it on every tab move) and can be
   // started by things that are not this toolbar — the boot autostart, an
@@ -4110,6 +4133,7 @@ export function ViewportPanel() {
         // and have their own gestures on the right button.
         if (dragged || e.shiftKey || playing) return;
         if (getTerrainBrushMode() || useGeometryEditStore.getState().entityId) return;
+        if (getLevelTool() && getLevelTool() !== "select") return;
         setViewportMenu({ x: e.clientX, y: e.clientY });
       }}
     >
@@ -4121,6 +4145,7 @@ export function ViewportPanel() {
           onClose={() => setViewportMenu(null)}
         />
       )}
+      {levelDesignEnabled && !playing && <LevelToolbar />}
       <div className="viewport-toolbar">
         <button
           className={`toolbar-btn play-btn ${playing ? "active" : ""}`}
@@ -4149,6 +4174,11 @@ export function ViewportPanel() {
             </button>
           </>
         )}
+        {/* Blockout tools. Gated on the module rather than always shown: the
+            palette is modal over the viewport, and an editor that offers it
+            without the components registered would arm a tool that can't
+            create anything. */}
+        {levelDesignEnabled && !playing && <LevelToolButton />}
         <div className={`browser-preview-launcher ${browserPreview.urls ? "is-active" : ""} ${shareBusy ? "is-sharing" : ""}`}>
           <button
             className={`toolbar-btn icon-only ${browserPreview.urls ? "active" : ""}`}

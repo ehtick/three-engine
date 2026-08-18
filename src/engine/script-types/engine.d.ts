@@ -1616,6 +1616,17 @@ declare module "engine" {
     getVelocity(): [number, number, number];
     /** Touching the floor after the last physics step? */
     isGrounded(): boolean;
+    /**
+     * Resizes the capsule while playing — what crouching needs. `height` and
+     * `radius` are structural everywhere else (read once when the world is
+     * built); a capsule is the one shape Rapier can resize in place. Check for
+     * a ceiling before growing back, or you resize into it.
+     */
+    setCapsule(size: {
+      height?: number;
+      radius?: number;
+      offset?: [number, number, number];
+    }): { height: number; radius: number; offset: [number, number, number] };
     /** The moving platform the character is standing on, or null. The controller
      *  already carries the character along — this is for gameplay that needs to
      *  know (parenting an effect, "you are on the lift" triggers). */
@@ -1875,6 +1886,76 @@ declare module "engine" {
   export interface GlobalIlluminationComponent extends ComponentBase<Record<string, unknown>> {}
 
   /**
+   * `entity.getComponent("level")`. Root of a blockout (requires the
+   * `level-design` module): the grid, storey height and default piece
+   * dimensions the tools draw with, plus the greybox/materials switch.
+   */
+  export interface LevelComponent extends ComponentBase<{
+    grid: number;
+    angleSnap: number;
+    storeyHeight: number;
+    wallHeight: number;
+    wallThickness: number;
+    slabThickness: number;
+    stairWidth: number;
+    collision: boolean;
+    preview: boolean;
+  }> {
+    /** Every Blockout piece under this level, in tree order. */
+    pieces(): BlockoutComponent[];
+    /** The storey entities directly under this level, lowest first. */
+    floors(): Entity[];
+    /** The storey nearest `elevation`, or null when the level has none. */
+    floorAt(elevation: number): Entity | null;
+  }
+
+  /**
+   * `entity.getComponent("levelfloor")`. One storey of a level. Its elevation
+   * is the entity's own Y position, not a prop — moving the storey moves
+   * everything on it.
+   */
+  export interface LevelFloorComponent extends ComponentBase<{
+    height: number;
+    locked: boolean;
+  }> {
+    /** World-space elevation: the walkable surface of this storey. */
+    readonly elevation: number;
+    /** This floor's own height, or the Level's `storeyHeight`. */
+    readonly storeyHeight: number;
+    pieces(): BlockoutComponent[];
+  }
+
+  /**
+   * `entity.getComponent("blockout")`. One greybox piece — a wall, slab,
+   * staircase, ramp, box or column — which builds its own geometry from
+   * `size` and its shape-specific props.
+   */
+  export interface BlockoutComponent extends ComponentBase<{
+    shape: "floor" | "wall" | "stair" | "ramp" | "box" | "column" | "platform";
+    /** Local extents [x, y, z]: X length/width, Y height (slab: thickness), Z depth. */
+    size: [number, number, number];
+    /** Walls: holes along the length. `offset` is metres from the centre. */
+    openings: Array<{ offset: number; width: number; height: number; sill: number }>;
+    steps: number;
+    open: boolean;
+    sides: number;
+    /** Greybox tint. "" uses the shape's palette colour. Ignored while the
+     *  parent Level is previewing — that shows the Mesh component's material. */
+    color: string;
+  }> {
+    /** Local bounds as [[minX, minY, minZ], [maxX, maxY, maxZ]]. */
+    bounds(): [[number, number, number], [number, number, number]];
+    /** The convex boxes this piece is made of, in local space. */
+    parts(): Array<{ center: [number, number, number]; size: [number, number, number] }>;
+    /** Adds an opening to a wall; returns its index, or -1 on a non-wall. */
+    addOpening(opening?: { offset?: number; width?: number; height?: number; sill?: number }): number;
+    removeOpening(index: number): boolean;
+    /** Re-picks the greybox tint vs the Mesh component's material (the Level's
+     *  Preview switch). */
+    refreshMaterial(): void;
+  }
+
+  /**
    * Maps every built-in registered component type string to its typed
    * interface. `getComponent`/`findComponents` key off this so
    * `entity.getComponent("charactercontroller")` resolves to
@@ -1949,6 +2030,9 @@ declare module "engine" {
     objModel: ObjModelComponent;
     "global-illumination": GlobalIlluminationComponent;
     script: ScriptComponent;
+    level: LevelComponent;
+    levelfloor: LevelFloorComponent;
+    blockout: BlockoutComponent;
   }
 
   /**
@@ -2026,6 +2110,10 @@ declare module "engine" {
   export const EnvironmentComponent: ComponentClass<"environment">;
   export const ObjModelComponent: ComponentClass<"objModel">;
   export const GlobalIlluminationComponent: ComponentClass<"global-illumination">;
+
+  export const LevelComponent: ComponentClass<"level">;
+  export const LevelFloorComponent: ComponentClass<"levelfloor">;
+  export const BlockoutComponent: ComponentClass<"blockout">;
 
   /** One entry in a script component's list. */
   export interface ScriptSlot {
@@ -2447,6 +2535,16 @@ declare module "engine" {
      *  `null`. The Engine wires `() => engine.camera` automatically; calling
      *  this from a script lets you pin a different camera for a sub-scene. */
     setCameraProvider(fn: (() => unknown) | null): void;
+    /**
+     * Locks the cursor to the canvas for mouse look. Browsers only grant it
+     * from a user gesture, so call it from a click / key press, not from
+     * `onStart`. Returns false when there is no canvas to lock to.
+     */
+    requestPointerLock(): boolean;
+    /** Releases the cursor. Safe when it was never locked. */
+    exitPointerLock(): void;
+    /** True while the cursor is locked to the page. */
+    readonly pointerLocked: boolean;
     /** Re-runs scheme auto-detection based on the most recent device input. */
     detectScheme(): string;
     /** Force-pin the active scheme. */

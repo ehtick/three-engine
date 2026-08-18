@@ -1812,6 +1812,147 @@ body.macro-active .viewport-canvas {
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
 }
 
+/* Level blockout palette — ONE row of icons under the viewport toolbar.
+ * It was three stacked rows (tools / settings / a hint line) and covered a
+ * third of the viewport, which is the wrong trade for a tool you use while
+ * looking at the thing behind it. Grid and storey are the only numbers that
+ * change often enough to earn a slot; the rest sits behind the gear, and the
+ * per-tool hints moved into the buttons' own tooltips. */
+.level-toolbar {
+  position: absolute;
+  top: 45px;
+  left: 10px;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  padding: 3px 5px;
+  border-radius: var(--r-panel, 10px);
+  background: rgba(20, 21, 25, 0.72);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--border);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+}
+
+.level-toolbar .toolbar-btn.icon-only {
+  width: 24px;
+  min-width: 24px;
+  height: 22px;
+}
+
+.level-toolbar-select {
+  height: 22px;
+  background: var(--fill-1);
+  border: none;
+  border-radius: var(--r-input);
+  color: var(--text);
+  font-size: 11px;
+  padding: 0 4px;
+}
+
+/* Stepper: two chevrons hugging the current elevation. Reads as one control
+   rather than three, which is what keeps it narrow. */
+.level-toolbar-storey {
+  display: flex;
+  align-items: center;
+  height: 22px;
+  border-radius: var(--r-input);
+  background: var(--fill-1);
+}
+
+.level-toolbar-step {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.level-toolbar-step:hover {
+  color: var(--text);
+}
+
+.level-toolbar-storey-label {
+  min-width: 42px;
+  text-align: center;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+.level-toolbar-storey-label.muted {
+  color: var(--text-dim);
+}
+
+.level-toolbar-divider {
+  width: 1px;
+  height: 14px;
+  background: var(--border);
+  margin: 0 2px;
+}
+
+/* The navigation reminder. Muted to the point of being scenery — it is there
+   for the first session, not the fiftieth. */
+.level-toolbar-nav {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 0 4px;
+  font-size: 10px;
+  color: var(--text-dim);
+  opacity: 0.75;
+  white-space: nowrap;
+  cursor: default;
+}
+
+.level-toolbar-more {
+  position: relative;
+}
+
+.level-toolbar-popover {
+  position: absolute;
+  top: 26px;
+  right: 0;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  width: 190px;
+  padding: 8px;
+  border-radius: var(--r-panel, 10px);
+  background: rgba(20, 21, 25, 0.94);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--border);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+}
+
+.level-toolbar-field {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.level-toolbar-number {
+  width: 62px;
+  height: 22px;
+  background: var(--fill-1);
+  border: none;
+  border-radius: var(--r-input);
+  color: var(--text);
+  font-size: 11px;
+  padding: 0 5px;
+}
+
 .backend-badge {
   margin-left: auto;
   font-size: 11px;
@@ -13916,4 +14057,113 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
 .events-graph-empty strong {
   color: var(--text);
   font-weight: 600;
+}
+
+
+/* ---- Level design inspector sections ---------------------------------- */
+
+.level-section,
+.blockout-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 4px 0 2px;
+}
+
+.level-empty {
+  font-size: 11px;
+  color: var(--text-dim);
+  padding: 2px 4px 4px;
+}
+
+.level-floor-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.level-floor-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 6px;
+  border-radius: var(--r-input);
+  background: var(--fill-1);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.level-floor-row:hover {
+  background: var(--fill-2);
+}
+
+/* The storey the tools draw into. A left bar rather than a filled row: the
+   list is also a selection surface, and a fully highlighted row reads as
+   "selected in the hierarchy", which it is not. */
+.level-floor-row.active {
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.level-floor-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.level-floor-count {
+  font-size: 11px;
+  color: var(--text-dim);
+  padding: 0 4px;
+}
+
+.level-section-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-top: 2px;
+}
+
+.blockout-readout {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.blockout-opening-add {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.blockout-opening-kind {
+  font-size: 11px;
+  text-transform: capitalize;
+}
+
+.blockout-opening-add .toolbar-btn.icon-only {
+  width: auto;
+  min-width: 0;
+  padding: 0 8px;
+}
+
+.blockout-opening-head,
+.blockout-opening-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr 1fr 22px;
+  gap: 4px;
+  align-items: center;
+}
+
+.blockout-opening-head {
+  font-size: 10px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 0 2px;
+}
+
+.blockout-opening-number {
+  width: 100%;
+  min-width: 0;
 }

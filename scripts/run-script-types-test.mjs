@@ -43,6 +43,7 @@ const { postprocessingModule } = await import("../src/modules/postprocessing/ind
 const { polyhavenModule } = await import("../src/modules/polyhaven/index.js");
 const { ambientcgModule } = await import("../src/modules/ambientcg/index.js");
 const { giModule } = await import("../src/modules/gi/index.js");
+const { levelDesignModule } = await import("../src/modules/level-design/index.js");
 
 registerBuiltInComponents();
 // Module components register only when their module is enabled, so pull their
@@ -58,6 +59,7 @@ const registered = new Set([
   ...polyhavenModule.components.map((c) => c.type),
   ...ambientcgModule.components.map((c) => c.type),
   ...giModule.components.map((c) => c.type),
+  ...levelDesignModule.components.map((c) => c.type),
 ]);
 
 const source = readFileSync(DTS, "utf8");

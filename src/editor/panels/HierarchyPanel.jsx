@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Plus, Trash2, Box, Video, Lightbulb, Sparkles, FileCode2, Package, Circle, ChevronRight, Monitor, Type, Image as ImageIcon, MousePointerClick, Rows3, ScrollText, Square, Eye, EyeOff, Play, Pause, Mountain, Spline, Search, X, ListChecks, Crosshair } from "lucide-react";
+import { Plus, Trash2, Box, Video, Lightbulb, Sparkles, FileCode2, Package, Circle, ChevronRight, Monitor, Type, Image as ImageIcon, MousePointerClick, Rows3, ScrollText, Square, Eye, EyeOff, Play, Pause, Mountain, Spline, Search, X, ListChecks, Crosshair, Building2, PersonStanding } from "lucide-react";
 import { useSceneStore } from "../store/sceneStore.js";
 import { useSelectionStore, selectedIdSet } from "../store/selectionStore.js";
 import { buildSearchIndex, sortMatchIds } from "../hierarchySearch.js";
@@ -109,6 +109,45 @@ const TERRAIN_PRESET = {
   color: "#8ea0b5",
   spec: { name: "Terrain", components: [{ type: "terrain", props: {} }] },
 };
+
+// A blockout level and a playable character both come from optional modules,
+// so both are gated the same way Terrain is. They are *entities you place*
+// rather than components you bolt on, for the same reason Particles is: a
+// level and a player are things a scene HAS, and hunting for the component
+// that makes an empty into one is a step nobody should have to learn.
+const LEVEL_PRESET = {
+  label: "Level",
+  Icon: Building2,
+  color: "#8ea0b5",
+  spec: {
+    name: "Level",
+    components: [{ type: "level", props: {} }],
+    children: [{ name: "Floor 0.00m", transform: { position: [0, 0, 0] }, components: [{ type: "levelfloor", props: {} }] }],
+  },
+};
+
+// The character is not a plain spec: creating it also writes its two scripts
+// into the project (see characterRig.js), so createEntity branches on this
+// marker the same way it branches on terrain's generated assets.
+const CHARACTER_PRESET = {
+  label: "Character",
+  Icon: PersonStanding,
+  color: "#4fd475",
+  spec: { name: "Player", __characterRig: true, components: [] },
+};
+
+/**
+ * The presets whose modules are enabled, in a stable order. One helper rather
+ * than a conditional spread at each of the three menus, so a new module preset
+ * cannot end up in the "+" menu and missing from the right-click menu.
+ */
+function modulePresets(flags = {}) {
+  const presets = [];
+  if (flags.terrain) presets.push(TERRAIN_PRESET);
+  if (flags.level) presets.push(LEVEL_PRESET);
+  if (flags.character) presets.push(CHARACTER_PRESET);
+  return presets;
+}
 
 // UI Screen — top-level UI container. Always shown so the user can add one
 // from anywhere in the scene.
@@ -978,7 +1017,7 @@ function ContextMenu({
   setRenamingId,
   onCreate,
   onNewScene,
-  terrainEnabled,
+  moduleFlags,
   onSelectAll,
   onInvertSelection,
   onReveal,
@@ -1008,7 +1047,7 @@ function ContextMenu({
   const items = menu.empty
     ? [
         { header: "Create" },
-        ...[...COMMON_PRESETS, ...(terrainEnabled ? [TERRAIN_PRESET] : [])].map((preset) => ({
+        ...[...COMMON_PRESETS, ...modulePresets(moduleFlags)].map((preset) => ({
           label: preset.label,
           icon: preset.Icon,
           action: () => onCreate(preset.spec),
@@ -1075,7 +1114,14 @@ export function HierarchyPanel() {
   // and subscribing to the array re-renders the whole panel every time a 1500-id
   // selection is rebuilt.
   const selectionCount = useSelectionStore((s) => s.ids.length);
-  const terrainEnabled = useModulesStore((s) => s.enabled.includes("terrain"));
+  const moduleEnabled = useModulesStore((s) => s.enabled);
+  // One object, memoised on the enabled list, so the preset menus stay in sync
+  // with the Modules panel without re-deriving three separate booleans.
+  const moduleFlags = useMemo(() => ({
+    terrain: moduleEnabled.includes("terrain"),
+    level: moduleEnabled.includes("level-design"),
+    character: moduleEnabled.includes("character-controller"),
+  }), [moduleEnabled]);
   const stage = usePrefabStore((s) => s.stage);
   const stageDirty = usePrefabStore((s) => s.stageDirty);
   const [renamingId, setRenamingId] = useState(null);
@@ -1485,6 +1531,24 @@ export function HierarchyPanel() {
     const selected = useSelectionStore.getState().ids;
     const parentId = selected.length === 1 ? selected[0] : null;
     let prepared = spec;
+    // A character is a rig plus two script FILES, so it cannot be expressed as
+    // a spec — creating it writes the scripts (or reuses the ones already in
+    // the project) and builds the entity itself.
+    if (spec.__characterRig) {
+      const { createCharacterRig } = await import("../characterRig.js");
+      try {
+        const rig = await createCharacterRig({
+          parentId,
+          position: parentId ? [0, 0, 0] : getCursor3DPosition().toArray(),
+        });
+        if (rig.scripts.written.length) {
+          console.log(`Created ${rig.scripts.written.join(" and ")} in scripts/`);
+        }
+      } catch (err) {
+        console.error(`Could not create the character: ${err?.message ?? err}`);
+      }
+      return;
+    }
     if (spec.components?.some((component) => component.type === "terrain")) {
       try {
         const assets = await createTerrainAssets(spec.components.find((component) => component.type === "terrain")?.props);
@@ -1582,7 +1646,7 @@ export function HierarchyPanel() {
                   <span className="component-item-label">New Scene</span>
                 </button>
                 <div className="dropdown-section-label">Entity</div>
-                {[...COMMON_PRESETS, ...(terrainEnabled ? [TERRAIN_PRESET] : [])].map((p) => (
+                {[...COMMON_PRESETS, ...modulePresets(moduleFlags)].map((p) => (
                   <PresetItem key={p.label} preset={p} onPick={createEntity} />
                 ))}
                 <div className="dropdown-section-label">UI</div>
@@ -1757,7 +1821,7 @@ export function HierarchyPanel() {
           setRenamingId={setRenamingId}
           onCreate={createEntity}
           onNewScene={createScene}
-          terrainEnabled={terrainEnabled}
+          moduleFlags={moduleFlags}
           onSelectAll={selectAllRows}
           onInvertSelection={invertSelection}
           onReveal={revealEntity}

@@ -158,6 +158,26 @@ back. Two things worth knowing before you start:
   \`linked\` survive an operator rebuilding the topology. Element indices do not —
   they mean something different after every extrude.
 
+## Blocking out a level
+
+With the \`level-design\` module on, a level is drawn rather than modelled:
+\`level_create\` makes one (it owns the grid and the storey height), and
+\`level_addPiece\` places a wall, floor, stair, ramp, box or column. Pieces take
+either the two points of a drag — \`from\` and \`to\`, the same gesture a person
+makes with the mouse — or an explicit \`position\` and \`size\`. A room is four
+\`from\`/\`to\` walls, and \`level_addOpening\` cuts the door.
+
+- **Give it colliders or nobody can walk on it.** With \`physics-rapier\` enabled
+  each piece takes a mesh collider as it is drawn; \`level_addColliders\` is the
+  repair for a level that was drawn without them.
+- **\`character_create\` makes the thing that walks it** — needs its OWN module,
+  \`character-controller\` (separate from \`level-design\`). It builds a
+  controller, a real animated body, a camera and the two scripts driving them,
+  written into \`scripts/\` and editable. Its origin is at the character's FEET,
+  so place it at a floor's elevation.
+- Storeys are entities: their elevation is their transform, so moving one
+  carries its walls with it.
+
 ## Writing scripts
 
 Scripts are TypeScript classes extending \`Script\`, imported from \`"engine"\`:

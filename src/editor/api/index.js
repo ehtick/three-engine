@@ -53,6 +53,8 @@ import "./ops/batch.js";
 import "./ops/profile.js";
 import "./ops/events.js";
 import "./ops/post.js";
+import "./ops/level.js";
+import "./ops/character.js";
 
 /** Runs an op synchronously, asserting it isn't one of the async ones. Used by
  *  the sync accessors below, where returning a promise would be a footgun. */
@@ -344,6 +346,27 @@ export const EditorApi = {
     create: (options = {}) => callOp("post.create", options),
     set: (options = {}) => callOp("post.set", options),
     assign: (entityId, path = "") => callOp("post.assign", { entityId, path }),
+  },
+
+  /**
+   * Greybox level blockouts. `addPiece` takes the two points of a drag, the
+   * same way the viewport tools do, so a generated room is one call per wall.
+   */
+  level: {
+    list: () => callOp("level.list"),
+    create: (options = {}) => callOp("level.create", options),
+    addFloor: (levelId, elevation) => callOp("level.addFloor", { levelId, elevation }),
+    addPiece: (options = {}) => callOp("level.addPiece", options),
+    addOpening: (entityId, options = {}) => callOp("level.addOpening", { entityId, ...options }),
+    removeOpening: (entityId, index) => callOp("level.removeOpening", { entityId, index }),
+    addColliders: (levelId) => callOp("level.addColliders", { levelId }),
+    setPreview: (levelId, preview) => callOp("level.setPreview", { levelId, preview }),
+    setTool: (options = {}) => callOp("level.setTool", options),
+  },
+
+  /** The player rig: controller, camera and the scripts that drive them. */
+  character: {
+    create: (options = {}) => callOp("character.create", options),
   },
 
   /** Compression, baking, building, publishing. */

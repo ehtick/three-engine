@@ -53,6 +53,8 @@ import { applyPrefab, revertPrefab, unpackPrefab, openPrefabMode, createVariantF
 import { SoundSection } from "../components/SoundSection.jsx";
 import { ListenerSection } from "../components/ListenerSection.jsx";
 import { TerrainSection } from "../components/TerrainSection.jsx";
+import { LevelSection } from "../components/LevelSection.jsx";
+import { BlockoutSection } from "../components/BlockoutSection.jsx";
 import { TimelineSection } from "../components/TimelineSection.jsx";
 import { LinePointsSection, DecalSection, TrailSection } from "../components/VfxSections.jsx";
 import { EventBindingsSection, ActionListSections } from "../components/EventSections.jsx";
@@ -2009,6 +2011,8 @@ function ComponentSection({ entityId, type, props }) {
       {type === "splineMesh" && <SplineMeshSection entityId={entityId} />}
       {type === "splineFollower" && <SplineFollowerSection entityId={entityId} />}
       {type === "terrain" && <TerrainSection entityId={entityId} props={props} />}
+      {type === "level" && <LevelSection entityId={entityId} />}
+      {type === "blockout" && <BlockoutSection entityId={entityId} props={props} />}
       {type === "collider" && props.shape === "heightfield" && !engine.getEntity(entityId)?.getComponent("terrain") && (
         <div className="field-row">
           <span className="field-label" style={{ opacity: 0.6 }}>
@@ -2607,7 +2611,7 @@ function MultiEntityInspector({ entities }) {
                 setAddOpen(false);
                 const targets = entities.filter((entity) => !(type in entity.components));
                 commandBus.execute(new BatchCommand(
-                  targets.map((entity) => new AddComponentCommand(entity.id, type)),
+                  targets.flatMap((entity) => addComponentCommands(entity, type)),
                   `Add ${getComponentClass(type)?.label ?? type} to ${targets.length} entities`,
                 ));
               }}
@@ -2617,6 +2621,31 @@ function MultiEntityInspector({ entities }) {
       </div>
     </div>
   );
+}
+
+/**
+ * The command(s) that add one component to one entity.
+ *
+ * Almost always exactly one — the exception is a component that cannot work
+ * alone. A Blockout draws through the entity's Mesh component and adds one
+ * itself when the entity has none (so a scene or a script can attach it and
+ * still see something), but a component adding another component behind the
+ * command bus is invisible to undo: taking back the Blockout would leave an
+ * orphan Mesh the user never asked for. Pairing them here keeps the two
+ * halves of that gesture on the same Ctrl+Z.
+ */
+function addComponentCommands(entity, type) {
+  // Callers hand this either a live engine Entity (components: Map) or the
+  // scene store's mirror (components: plain object). Both shapes reach here.
+  const components = entity.components;
+  const has = (name) =>
+    typeof components?.has === "function" ? components.has(name) : !!components && name in components;
+  const commands = [];
+  if (type === "blockout" && !has("mesh")) {
+    commands.push(new AddComponentCommand(entity.id, "mesh", { castShadow: true, receiveShadow: true }));
+  }
+  commands.push(new AddComponentCommand(entity.id, type));
+  return commands;
 }
 
 export function InspectorPanel() {
@@ -2831,7 +2860,12 @@ export function InspectorPanel() {
                   commandBus.execute(new AddComponentCommand(entity.id, type));
                   assignTerrainAssets(entity, assets);
                 } else {
-                  commandBus.execute(new AddComponentCommand(entity.id, type));
+                  const commands = addComponentCommands(entity, type);
+                  commandBus.execute(
+                    commands.length === 1
+                      ? commands[0]
+                      : new BatchCommand(commands, `Add ${getComponentClass(type)?.label ?? type}`),
+                  );
                 }
               }}
             />

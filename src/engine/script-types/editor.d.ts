@@ -443,6 +443,85 @@ declare module "editor" {
     name?: string;
   }
 
+  // ---- level design ---------------------------------------------------------
+
+  export interface LevelCreateOptions {
+    name?: string;
+    /** Y of the first storey, in metres. Default 0. */
+    elevation?: number;
+    /** Snap step in metres. Default 1. */
+    grid?: number;
+    /** Distance between storeys. Default 3. */
+    storeyHeight?: number;
+    wallHeight?: number;
+    wallThickness?: number;
+    slabThickness?: number;
+    /** Give every piece a mesh collider (needs `physics-rapier`). Default true. */
+    collision?: boolean;
+  }
+
+  export type BlockoutShape = "floor" | "wall" | "stair" | "ramp" | "box" | "column" | "platform";
+
+  export interface LevelPieceOptions {
+    shape: BlockoutShape;
+    /** Drag start [x, y, z]; Y is the storey elevation. */
+    from?: [number, number, number];
+    /** Drag end. Omit for a click-place (one grid cell, or a column). */
+    to?: [number, number, number];
+    /** Explicit world position; overrides from/to. */
+    position?: [number, number, number];
+    /** Explicit local size [x, y, z]: X length, Y height, Z depth. */
+    size?: [number, number, number];
+    rotationY?: number;
+    floorId?: string;
+    levelId?: string;
+    /** Stairs: step count. 0 derives ~18 cm risers. */
+    steps?: number;
+    /** Stairs: open treads. */
+    open?: boolean;
+    /** Columns: 4 is a square pillar, 8+ reads as round. */
+    sides?: number;
+    color?: string;
+    material?: string;
+    collision?: boolean;
+    name?: string;
+  }
+
+  export interface LevelOpeningOptions {
+    kind?: "door" | "window" | "arch";
+    /** Metres along the wall from its centre. */
+    offset?: number;
+    width?: number;
+    height?: number;
+    /** Height of the hole's bottom edge; 0 is a doorway. */
+    sill?: number;
+  }
+
+  export interface LevelToolOptions {
+    tool?: "select" | "floor" | "wall" | "stair" | "ramp" | "box" | "column" | "platform" | "opening" | "erase" | "";
+    levelId?: string;
+    floorId?: string;
+    elevation?: number;
+    grid?: number;
+  }
+
+  export interface CharacterCreateOptions {
+    name?: string;
+    /** Which view the camera starts in. Default "third". */
+    view?: "first" | "third";
+    /** World position of the character's FEET. */
+    position?: [number, number, number];
+    /** Capsule COLLIDER cylinder height; total height adds 2 × radius. Default
+     *  1. The visible body (see `withMesh`) is scaled to match this. */
+    height?: number;
+    radius?: number;
+    /** Give the rig a visible body: the default animated humanoid, or a
+     *  capsule primitive if that model couldn't be set up. False adds
+     *  neither — not "use the capsule instead of the model". Default true. */
+    withMesh?: boolean;
+    parentId?: string;
+  }
+
   export type BuildTarget = "web" | "zip" | "desktop";
 
   // ---- version control ------------------------------------------------------
@@ -739,6 +818,32 @@ declare module "editor" {
       remesh(options?: GeometryRemeshOptions): Promise<OpResult>;
       commit(keepOpen?: boolean): Promise<OpResult>;
       cancel(): Promise<OpResult>;
+    };
+
+    /**
+     * Greybox level blockouts (the `level-design` module). `addPiece` takes
+     * the two points of a drag — the same gesture the viewport tools use — so
+     * a generated room is one call per wall rather than a page of trigonometry.
+     */
+    level: {
+      list(): Promise<OpResult>;
+      create(options?: LevelCreateOptions): Promise<OpResult>;
+      addFloor(levelId: string, elevation: number): Promise<OpResult>;
+      addPiece(options?: LevelPieceOptions): Promise<OpResult>;
+      addOpening(entityId: string, options?: LevelOpeningOptions): Promise<OpResult>;
+      removeOpening(entityId: string, index: number): Promise<OpResult>;
+      /** Mesh colliders for every piece that lacks one. */
+      addColliders(levelId: string): Promise<OpResult>;
+      /** true = the pieces' assigned materials, false = the greybox palette. */
+      setPreview(levelId: string, preview: boolean): Promise<OpResult>;
+      /** Arms the viewport tools; pass `tool: ""` to disarm. */
+      setTool(options?: LevelToolOptions): Promise<OpResult>;
+    };
+
+    /** The player rig: kinematic controller, an animated body, camera, and
+     *  their scripts (the `character-controller` module). */
+    character: {
+      create(options?: CharacterCreateOptions): Promise<OpResult>;
     };
 
     /** Compression, baking, generation. */

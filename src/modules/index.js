@@ -15,6 +15,8 @@ import { navigationModule } from "./navigation/index.js";
 import { textureEditorModule } from "./texture-editor/index.js";
 import { audioLibraryModule } from "./audio-library/index.js";
 import { audioEditorModule } from "./audio-editor/index.js";
+import { levelDesignModule } from "./level-design/index.js";
+import { characterControllerModule } from "./character-controller/index.js";
 /**
  * Built-in module catalog. Importing this file registers every definition;
  * nothing runs until a host enables a module on an engine (editor: Modules
@@ -39,5 +41,7 @@ registerModuleDefinition(navigationModule);
 registerModuleDefinition(textureEditorModule);
 registerModuleDefinition(audioLibraryModule);
 registerModuleDefinition(audioEditorModule);
+registerModuleDefinition(levelDesignModule);
+registerModuleDefinition(characterControllerModule);
 
-export { physicsRapierModule, dracoModule, basisModule, terrainModule, virtualGeometryModule, postprocessingModule, polyhavenModule, ambientcgModule, sketchfabModule, polypizzaModule, itchioModule, giModule, navigationModule, textureEditorModule, audioLibraryModule, audioEditorModule };
+export { physicsRapierModule, dracoModule, basisModule, terrainModule, virtualGeometryModule, postprocessingModule, polyhavenModule, ambientcgModule, sketchfabModule, polypizzaModule, itchioModule, giModule, navigationModule, textureEditorModule, audioLibraryModule, audioEditorModule, levelDesignModule, characterControllerModule };

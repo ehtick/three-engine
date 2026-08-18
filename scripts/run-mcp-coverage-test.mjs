@@ -180,6 +180,8 @@ const MODULE_OPS = {
   terrain: "terrain",
   basis: "asset.compress",
   draco: "asset.compress",
+  "level-design": "level",
+  "character-controller": "character",
 };
 
 for (const id of moduleIds) {

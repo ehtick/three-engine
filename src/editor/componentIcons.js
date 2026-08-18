@@ -1,8 +1,10 @@
 import {
   Activity,
+  Blocks,
   Bone,
   Box,
   Boxes,
+  Building2,
   Camera,
   CircleDot,
   Clapperboard,
@@ -114,6 +116,10 @@ const ICONS = {
   uiscroll: [ScrollText, UI],
   uimask: [CircleDot, UI],
 
+  level: [Building2, WORLD],
+  levelfloor: [Layers, WORLD],
+  blockout: [Blocks, WORLD],
+
   terrain: [Mountain, WORLD],
   water: [Waves, WORLD],
   spline: [Spline, WORLD],
@@ -142,6 +148,7 @@ export const COMPONENT_GROUPS = [
   { label: "Audio", types: ["sound", "listener"] },
   { label: "UI", types: ["uiscreen", "uielement", "uiimage", "uitext", "uibutton", "uilayout", "uiscroll", "uimask"] },
   { label: "World", types: ["terrain", "water", "spline", "splineMesh", "splineFollower"] },
+  { label: "Level Design", types: ["level", "levelfloor", "blockout"] },
 ];
 
 /**

@@ -49,6 +49,8 @@
     "smoke:camera": "node scripts/run-camera-rig-smoke.mjs",
     "test:physics": "node scripts/run-physics-test.mjs",
     "test:scripttypes": "node scripts/run-script-types-test.mjs",
+    "test:level": "node scripts/run-level-design-test.mjs",
+    "smoke:level": "node scripts/run-level-tool-smoke.mjs",
     "test:autobind": "node scripts/run-autobind-test.mjs",
     "smoke:player-scenes": "node scripts/run-player-scene-smoke.mjs",
     "smoke:editor-polish": "node scripts/run-editor-polish-smoke.mjs",
@@ -189,6 +191,7 @@
     "test:gi-probe-density": "node scripts/run-gi-probe-density.mjs",
     "test:gi-colour-bleed": "node scripts/run-gi-colour-bleed.mjs",
     "probe:camera-motion": "node scripts/run-gi-camera-motion.mjs",
+    "probe:character-motion": "node scripts/run-character-motion-perf.mjs",
     "test:meshselect": "node scripts/run-mesh-select-region-test.mjs"
   },
   "dependencies": {
