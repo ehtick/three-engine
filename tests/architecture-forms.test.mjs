@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import * as THREE from "three/webgpu";
-import { normalizeArchitectureModel, getArchitectureFormFootprint } from "../src/modules/architecture/formModel.js";
+import { normalizeArchitectureModel, getArchitectureFormFootprint, architectureFormBounds } from "../src/modules/architecture/formModel.js";
 import { buildArchitectureFormGeometry } from "../src/modules/architecture/formGeometry.js";
 
 const form = (id, position = [0, 0, 0], options = {}) => ({ id, position, size: [3, 3, 3], roof: "hip", windows: false, ...options });
@@ -182,4 +182,41 @@ test("256-form towns stay bounded, deterministic and reuse unchanged geometry du
   forms[128] = { ...forms[128], color: "#aa7744" };
   const edited = buildArchitectureFormGeometry({ forms }); assert.equal(edited.stats.reusedForms, 255);
   first.geometry.dispose(); second.geometry.dispose(); edited.geometry.dispose();
+});
+
+test("gable roofs ridge along the resolved axis, close with wall gable ends and take roofColor", () => {
+  // Wider than deep, yet the ridge runs along Z: the explicit axis wins over
+  // the long-axis heuristic. Eave at size[1], apex at +roofHeight, like hip.
+  const barn = scene({ forms: [form("barn", [0, 0, 0], { size: [8, 4, 6], roof: "gable", roofAxis: "z", roofHeight: 2, roofColor: "#7a2f2a", color: "#ddc7a5" })] });
+  near(barn.hits([0, 10, 0], [0, -1, 0])[0].point.y, 6, 1e-3);
+  near(barn.hits([.01, 10, 2.9], [0, -1, 0])[0].point.y, 5.995, 1e-3);
+  near(barn.hits([3.9, 10, 0], [0, -1, 0])[0].point.y, 4.05, 1e-3);
+  assert.equal(barn.hits([4.2, 10, 0], [0, -1, 0], 6).length, 0, "no roof beyond the eave");
+  // The gable end is a vertical wall-coloured triangle closing the prism.
+  const end = barn.hits([0, 5, 10], [0, 0, -1])[0];
+  near(end.point.z, 3, 1e-3);
+  const surface = barn.surfaces.find(s => end.faceIndex * 3 >= s.start && end.faceIndex * 3 < s.start + s.count);
+  assert.equal(surface.kind, "wall"); assert.ok(Math.abs(surface.normal[2]) > .999);
+  const roles = Object.fromEntries(barn.materials.map((descriptor, index) => [index, descriptor]));
+  const groupAt = s => barn.geometry.groups.find(g => s.start >= g.start && s.start < g.start + g.count);
+  assert.equal(roles[groupAt(surface).materialIndex].color, "#ddc7a5", "gable ends take the wall colour");
+  assert.equal(roles[groupAt(barn.surfaces.find(s => s.kind === "roof" && !s.interior)).materialIndex].color, "#7a2f2a", "roofColor lands on the slopes");
+  // The heuristic still follows the longer horizontal axis when no axis is given.
+  const heuristic = scene({ forms: [form("long", [0, 0, 0], { size: [8, 4, 6], roof: "gable", roofHeight: 2 })] });
+  near(heuristic.hits([0, 10, 0], [0, -1, 0])[0].point.y, 6, 1e-3);
+  near(heuristic.hits([0, 10, 2.9], [0, -1, 0])[0].point.y, 4.0667, 1e-3);
+  near(heuristic.hits([-3.9, 5, 0], [-1, 0, 0])[0].point.x, -4, 1e-3, "x-ridge gable ends face ±X");
+  // A buried gable roof is clipped away like a buried hip roof.
+  const stacked = scene({ forms: [form("lower", [0, 0, 0], { size: [8, 4, 6], roof: "gable", roofAxis: "z", roofHeight: 2 }), form("upper", [0, 4, 0], { size: [8, 3, 6] })] });
+  assert.equal(stacked.surfaces.filter(s => s.formId === "lower" && s.kind === "roof").length, 0);
+  barn.geometry.dispose(); heuristic.geometry.dispose(); stacked.geometry.dispose();
+});
+
+test("gable normalization validates roofAxis and roofColor, and bounds include the rise", () => {
+  const model = normalizeArchitectureModel({ forms: [form("cottage", [1, 2, 3], { size: [8, 4, 6], roof: "gable", roofAxis: "z", roofColor: "#7a2f2a", roofHeight: 2 })] });
+  assert.equal(model.forms[0].roof, "gable"); assert.equal(model.forms[0].roofAxis, "z"); assert.equal(model.forms[0].roofColor, "#7a2f2a");
+  const fallback = normalizeArchitectureModel({ forms: [form("cottage", [0, 0, 0], { roof: "gable", roofAxis: "y", roofColor: "red" })] }).forms[0];
+  assert.equal(fallback.roofAxis, null); assert.equal(fallback.roofColor, null);
+  assert.deepEqual(architectureFormBounds(model.forms[0]).max, [5, 8, 6], "gable bounds reach the ridge");
+  assert.deepEqual(architectureFormBounds(model.forms[0], false).max, [5, 6, 6]);
 });

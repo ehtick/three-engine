@@ -91,6 +91,7 @@ import {
   SURPRISE_T1,
 } from "./srcConfig.js";
 import { transportPixel } from "./srcMathTsl.js";
+import { blockChainUniforms, capAt, probeRegionUniforms, valuesUniform } from "./srcCapacityUniforms.js";
 import {
   COUNTER_BOOSTED,
   COUNTER_WORDS,
@@ -335,6 +336,24 @@ export function createSrcRayFrame(
       `${surprise.rayWeight}`,
     );
   }
+  // Block-chain bases as uniforms, not literals (srcCapacityUniforms.js — a
+  // pool grow must not change kernel text, or the driver's shader cache goes
+  // cold for it). The store's own cascades carry the same `blockBase` the
+  // literals used; an unreferenced family binds nowhere, so the optional
+  // passes cost nothing when they are not built.
+  const capU = blockChainUniforms(store, { cascades: store.cascades }, {
+    stamp: true,
+    influx: !!cap,
+    // capBoost's cold/surprised shifts read the stamp and surprise words with
+    // or without a publishing bundle.
+    surprise: !!surprise || !!capBoost,
+  });
+  const starveBaseU = priority?.starve
+    ? valuesUniform([priority.starve.binBase], "starveBinBase")
+    : null;
+  // The probe table's per-cascade regions — every [D] pass indexes it with
+  // `instanceIndex + probeBase`, and [D1]'s rotation reads the capacity.
+  const prU = probeRegionUniforms(store.cascades);
 
   // ══ THE RAY CEILING — A SMALLER DISPATCH, NOT A SKIPPED ONE ════════════════
   //
@@ -416,14 +435,13 @@ export function createSrcRayFrame(
   // population, so it carries the representative without a new buffer.
   if (priority) {
     const c0 = cascades[0];
-    const stampBase0 = store.blockStampBase + c0.blockBase;
     passes.push(Fn(() => {
       // §11.31: the walk order ROTATES with the frame, so when the floor's
       // budget runs out before the starved probes do, the tail is a
       // different tail next frame — no probe is denied by its slot index.
       const rotated = instanceIndex.add(priority.frameStamp.mul(uint(1103)))
-        .mod(uint(c0.probeCapacity)).toVar();
-      const p = rotated.add(uint(c0.probeBase)).toVar();
+        .mod(uint(capAt(prU.probeCapacity, 0))).toVar();
+      const p = rotated.add(uint(capAt(prU.probeBase, 0))).toVar();
       const w = p.mul(PROBE_WORDS).toVar();
       const rankedRep = atomicLoad(rayCursor.element(p)).toVar();
       probeTable.element(w.add(PROBE_HASH)).assign(uint(SLOT_EMPTY));
@@ -434,7 +452,7 @@ export function createSrcRayFrame(
       const cold = flags.bitAnd(uint(FLAG_FRESH)).notEqual(uint(0)).toVar();
       If(block.notEqual(uint(SLOT_EMPTY)), () => {
         const age = priority.frameStamp.sub(
-          freeStack.element(uint(stampBase0).add(block)),
+          freeStack.element(uint(capAt(capU.stampBase, 0)).add(block)),
         ).toVar();
         cold.assign(cold.or(age.lessThan(uint(COLD_FILL_FRAMES))));
       });
@@ -451,7 +469,7 @@ export function createSrcRayFrame(
       const starved = starve ? uint(0).toVar() : null;
       if (starve) {
         If(block.notEqual(uint(SLOT_EMPTY)).and(uint(starve.packets).greaterThan(uint(0))), () => {
-          const first = uint(starve.binBase).add(block.mul(uint(starve.bins))).mul(uint(starve.binWords)).toVar();
+          const first = uint(starveBaseU.x).add(block.mul(uint(starve.bins))).mul(uint(starve.binWords)).toVar();
           const seen = uint(0).toVar();
           Loop({ start: uint(0), end: uint(starve.bins), type: "uint", condition: "<" }, ({ i: m }) => {
             seen.addAssign(atomicLoad(surprise.scratch.element(first.add(m.mul(uint(starve.binWords))).add(uint(starve.binCount)))));
@@ -574,13 +592,12 @@ export function createSrcRayFrame(
   // rays. A shift preserves the multiple for free; a `×1.5` would not.
   if (cap) {
     const c0 = cascades[0];
-    const stampBase0 = capBoost ? store.blockStampBase + c0.blockBase : 0;
-    const surpriseBase0 = capBoost ? store.blockSurpriseBase + c0.blockBase : 0;
-    if (capBoost && (!Number.isInteger(stampBase0) || !Number.isInteger(surpriseBase0))) {
+    if (capBoost && (!Number.isInteger(store.blockStampBase + c0.blockBase)
+      || !Number.isInteger(store.blockSurpriseBase + c0.blockBase))) {
       throw new Error("createSrcRayFrame: cascade 0 has no stamp/surprise base for the cap boost");
     }
     passes.push(Fn(() => {
-      const i = instanceIndex.add(uint(c0.probeBase)).toVar();
+      const i = instanceIndex.add(uint(capAt(prU.probeBase, 0))).toVar();
       const n = atomicLoad(rayCount.element(i)).toVar();
       // Save the NATURAL count before clamping — into `rayCursor`, which is
       // dead storage until [D3] seeds it. The α compensation needs
@@ -599,7 +616,7 @@ export function createSrcRayFrame(
         // u32 wrap is the arithmetic, not an accident: the stamp counter wraps
         // at 2^32 and `frameStamp − stamp` stays correct across the wrap for
         // every age this test cares about.
-        const age = capBoost.frameStamp.sub(freeStack.element(uint(stampBase0).add(block))).toVar();
+        const age = capBoost.frameStamp.sub(freeStack.element(uint(capAt(capU.stampBase, 0)).add(block))).toVar();
         If(age.lessThan(uint(COLD_FILL_FRAMES)), () => {
           shift.assign(uint(COLD_CAP_SHIFT));
         }).Else(() => {
@@ -609,7 +626,7 @@ export function createSrcRayFrame(
           // the loop inside one frame would need a barrier between two passes
           // that are already ordered the other way. A surprise that begins one
           // frame late is a frame of the ramp, not a wrong answer.
-          If(freeStack.element(uint(surpriseBase0).add(block))
+          If(freeStack.element(uint(capAt(capU.surpriseBase, 0)).add(block))
             .greaterThanEqual(uint(SURPRISE_CAP_MIN)), () => {
             shift.assign(uint(SURPRISE_CAP_SHIFT));
           });
@@ -636,7 +653,7 @@ export function createSrcRayFrame(
   for (let c = 1; c < N; c++) {
     const child = cascades[c - 1];
     passes.push(Fn(() => {
-      const i = instanceIndex.add(uint(child.probeBase)).toVar();
+      const i = instanceIndex.add(uint(capAt(prU.probeBase, c - 1))).toVar();
       If(probeAlive(probeTable, i).not(), () => { Return(); });
       const parent = probeTable.element(i.mul(PROBE_WORDS).add(PROBE_PARENT)).toVar();
       If(parent.equal(uint(SLOT_EMPTY)), () => { Return(); });
@@ -679,11 +696,10 @@ export function createSrcRayFrame(
   // decayed at last frame is `keepCompensated(keep, THAT word, lift)`, and
   // after the overwrite that number exists nowhere.
   if (cap) {
-    const { blockInfluxBase } = store;
     for (let c = 1; c < N; c++) {
       const child = cascades[c - 1];
       passes.push(Fn(() => {
-        const i = instanceIndex.add(uint(child.probeBase)).toVar();
+        const i = instanceIndex.add(uint(capAt(prU.probeBase, c - 1))).toVar();
         If(probeAlive(probeTable, i).not(), () => { Return(); });
         const parent = probeTable.element(i.mul(PROBE_WORDS).add(PROBE_PARENT)).toVar();
         If(parent.equal(uint(SLOT_EMPTY)), () => { Return(); });
@@ -692,16 +708,21 @@ export function createSrcRayFrame(
     }
     for (let c = 0; c < N; c++) {
       const info = cascades[c];
-      const base = blockInfluxBase + info.blockBase;
-      const stampB = surprise ? store.blockStampBase + info.blockBase : 0;
-      const surpriseB = surprise ? store.blockSurpriseBase + info.blockBase : 0;
       const statB = surprise ? surprise.statBase + BSTAT_WORDS * info.blockBase : 0;
-      if (surprise && !(Number.isInteger(stampB) && Number.isInteger(surpriseB)
+      if (surprise && !(Number.isInteger(store.blockStampBase + info.blockBase)
+        && Number.isInteger(store.blockSurpriseBase + info.blockBase)
         && Number.isInteger(statB))) {
         throw new Error(`createSrcRayFrame: cascade ${c} has no block base for the surprise publish`);
       }
+      // The chains read uniforms (srcCapacityUniforms.js); the JS sums above
+      // stay for the guards. `statB` is a surprise-bundle region with its own
+      // stride — still a literal, and the one family here a probe-pool grow
+      // can still move.
+      const base = capAt(capU.influxBase, c);
+      const stampB = surprise ? capAt(capU.stampBase, c) : 0;
+      const surpriseB = surprise ? capAt(capU.surpriseBase, c) : 0;
       passes.push(Fn(() => {
-        const i = instanceIndex.add(uint(info.probeBase)).toVar();
+        const i = instanceIndex.add(uint(capAt(prU.probeBase, c))).toVar();
         const block = probeTable.element(i.mul(PROBE_WORDS).add(PROBE_BLOCK)).toVar();
         If(block.equal(uint(SLOT_EMPTY)), () => { Return(); });
         const slot = freeStack.element(uint(base).add(block));
@@ -732,7 +753,7 @@ export function createSrcRayFrame(
   // two produce DIFFERENT offsets for the same probe and the same partition of
   // the same interval, which is the property the gate checks.
   passes.push(Fn(() => {
-    const i = instanceIndex.add(uint(top.probeBase)).toVar();
+    const i = instanceIndex.add(uint(capAt(prU.probeBase, N - 1))).toVar();
     If(probeAlive(probeTable, i).not(), () => { Return(); });
     const n = atomicLoad(rayCount.element(i)).toVar();
     const off = atomicAdd(rayTotal.element(uint(0)), n).toVar();
@@ -758,7 +779,7 @@ export function createSrcRayFrame(
   for (let c = N - 1; c >= 1; c--) {
     const child = cascades[c - 1];
     passes.push(Fn(() => {
-      const i = instanceIndex.add(uint(child.probeBase)).toVar();
+      const i = instanceIndex.add(uint(capAt(prU.probeBase, c - 1))).toVar();
       If(probeAlive(probeTable, i).not(), () => { Return(); });
       const w = i.mul(PROBE_WORDS).toVar();
       const parent = probeTable.element(w.add(PROBE_PARENT)).toVar();
@@ -843,7 +864,7 @@ export function createSrcRayFrame(
   if (priority) {
     const c0 = cascades[0];
     passes.push(Fn(() => {
-      const probe = instanceIndex.add(uint(c0.probeBase)).toVar();
+      const probe = instanceIndex.add(uint(capAt(prU.probeBase, 0))).toVar();
       const repWord = probeTable.element(probe.mul(PROBE_WORDS).add(PROBE_HASH)).toVar();
       If(repWord.equal(uint(SLOT_EMPTY)), () => { Return(); });
       const rep = repWord.bitAnd(uint(PRIORITY_REP_PIXEL_MASK)).toVar();

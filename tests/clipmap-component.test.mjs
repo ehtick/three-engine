@@ -91,7 +91,30 @@ test("local lights and a WebGL renderer retain native maps for authored clipmap 
   }
   const fallback = makeLight({}, { webgpu: false });
   assert.equal(fallback.node, undefined);
-  assert.equal(fallback.component.light.shadow.camera.far, 100);
+  // 09-14: a plain directional map's slab reaches ≥ 2× its half-size UP-SUN
+  // plus its half-size past the viewer (never less than the authored far) —
+  // a far-equals-shadowCamFar slab centred on the viewer clipped casters above
+  // the viewer and made shadows pop as the camera moved.
+  const { shadowCamFar, shadowCamSize } = fallback.component.props;
+  assert.equal(fallback.component.light.shadow.camera.far, Math.max(shadowCamFar, shadowCamSize * 2) + shadowCamSize);
+});
+
+test("⛔ a plain directional map keeps up-sun casters: the viewer sits ≥ 2× half-size deep in the slab", () => {
+  // 09-14 "shadows in frustum appear and disappear as I move the camera": the
+  // slab was centred on the viewer, so a ridge of trees > far/2 up-sun sat in
+  // front of the near plane, cast nothing, and popped as the viewer moved.
+  // The user's scene values: with the defaults the authored far dominates and
+  // a viewer-centred slab also passes (the first cut of this gate was blind).
+  const { engine, component } = makeLight({ shadowMode: "map", csm: false, shadowCamSize: 100, shadowCamFar: 100 });
+  engine.frame();
+  const { shadowCamSize: size } = component.props;
+  const light = component.light;
+  const lightWorld = light.getWorldPosition(new THREE.Vector3());
+  const direction = light.target.getWorldPosition(new THREE.Vector3()).sub(lightWorld).normalize();
+  const viewerDepth = engine.camera.getWorldPosition(new THREE.Vector3()).sub(lightWorld).dot(direction);
+  const tolerance = size * 0.1; // the depth axis is snapped to the recentre grid
+  assert.ok(viewerDepth >= size * 2 - tolerance, `casters need ≥ ${size * 2} m up-sun, got ${viewerDepth.toFixed(2)}`);
+  assert.ok(light.shadow.camera.far - viewerDepth >= size - tolerance, "receivers keep the map's half-size past the viewer");
 });
 
 test("GI sees one combined sampled map per level, ordered near to far", () => {
@@ -169,12 +192,31 @@ test("map dimensions, depth range, biases and PCF radius reach every level witho
     assert.deepEqual(s.mapSize.toArray(), [1024, 768]);
     assert.equal(s.camera.near, 2);
     assert.equal(s.camera.far, 900);
-    assert.equal(s.bias, -0.001);
-    assert.equal(s.normalBias, 0.04);
+    const texel = (s.camera.right - s.camera.left) / 1024;
+    // Bias keeps the authored world size (|bias| × (far − near)), or a coarse
+    // level's texel needs, whichever is larger.
+    assert.ok(Math.abs(-s.bias * (s.camera.far - s.camera.near) - Math.max(0.001 * 898, texel * 1.5)) < 1e-9);
+    assert.equal(s.normalBias, Math.max(0.04, texel));
     assert.equal(s.radius, 3.25);
     assert.equal(s.filterNode, PCFShadowFilter);
     assert.ok(s.camera.layers.isEnabled(SHADOW_PROXY_LAYER));
   }
+});
+
+// 09-14 "why does our grass no longer cast shadows — it got super flat": four
+// levels share a 1680 m slab, and the raw -0.0005 bias was 84 cm of it, which
+// swallowed every shadow shorter than that. Grass blades are 18 cm.
+test("a deep clipmap slab keeps the authored bias's world size near the viewer", () => {
+  const { engine, node } = makeLight({ clipmapLevels: 4, shadowBias: -0.0005, shadowCamNear: 0.1,
+    shadowCamFar: 100, shadowMapWidth: 2048, shadowMapHeight: 2048 });
+  engine.frame();
+  const [near, second] = node.lights.map((level) => level.shadow);
+  const depth = near.camera.far - near.camera.near;
+  assert.ok(depth > 1000, `the slab under test is deep (${depth} m)`);
+  assert.ok(0.0005 * depth > 0.5, "negative control: the raw bias would be over half a metre");
+  const worldBias = -near.bias * depth;
+  assert.ok(Math.abs(worldBias - 0.0005 * 99.9) < 1e-9, `finest level world bias ${worldBias} m`);
+  assert.ok(-second.bias * depth < 0.18, "the second level still keeps grass-height shadows");
 });
 
 test("PCSS and VSM radius edits reach every sampled level", () => {

@@ -4,13 +4,30 @@ import { useProjectStore } from "./store/projectStore.js";
 import { ensureEngine } from "./engineInstance.js";
 
 /**
- * Editor-side module management. The enabled set lives in project.json
- * (`modules: [ids]`); this store mirrors it for React. Enabling/disabling
- * applies to the live engine immediately — new components appear in the
+ * Editor-side module management. Explicit choices live in project.json
+ * (`modules: [ids]`); the store's enabled set includes required providers.
+ * Enabling/disabling applies to the live engine immediately — new components appear in the
  * Add Component menu, disabled ones degrade to inert "missing" data that
  * still round-trips through save.
  */
-export const useModulesStore = vmSingleton("modulesStore", () => create(() => ({ enabled: [] })));
+export const useModulesStore = vmSingleton("modulesStore", () => create(() => ({ enabled: [], explicit: [], requiredBy: {} })));
+const moduleChanges = vmSingleton("moduleChanges", () => ({ tail: Promise.resolve() }));
+
+// Include settings and persistence in the operation order: a slow settings
+// import must not persist an old explicit set after a newer user toggle.
+function queueModuleChange(operation) {
+  const result = moduleChanges.tail.then(operation);
+  moduleChanges.tail = result.catch(() => {});
+  return result;
+}
+
+function mirrorModules(api, engine) {
+  const enabled = [...engine.modules.keys()];
+  const explicit = api.getExplicitEngineModules(engine);
+  const requiredBy = Object.fromEntries(enabled.map(id => [id, api.getEngineModuleDependents(engine, id)]));
+  useModulesStore.setState({ enabled, explicit, requiredBy });
+  return { enabled, explicit };
+}
 
 async function engineModulesApi() {
   // The catalog import registers all built-in definitions; kept dynamic so
@@ -77,44 +94,45 @@ async function applyEnabledModuleSettings(api, ids) {
 }
 
 /** Applies project.json's enabled modules to the engine (call at boot, before scene load). */
-export async function syncProjectModules() {
-  const enabled = useProjectStore.getState().projectMeta?.modules ?? [];
-  const api = await engineModulesApi();
-  const engine = await ensureEngine();
-  await api.applyEngineModules(engine, enabled);
-  const live = [...engine.modules.keys()];
-  useModulesStore.setState({ enabled: live });
-  await applyEnabledModuleSettings(api, live);
+export function syncProjectModules() {
+  return queueModuleChange(async () => {
+    const enabled = useProjectStore.getState().projectMeta?.modules ?? [];
+    const api = await engineModulesApi();
+    const engine = await ensureEngine();
+    await api.applyEngineModules(engine, enabled);
+    const { enabled: live } = mirrorModules(api, engine);
+    await applyEnabledModuleSettings(api, live);
+  });
 }
 
 /** Toggles a module: persists to project.json and applies to the live engine. */
-export async function setModuleEnabled(id, on) {
-  const api = await engineModulesApi();
-  const engine = await ensureEngine();
-  if (on) await api.enableEngineModule(engine, id);
-  else await api.disableEngineModule(engine, id);
-  const enabled = [...engine.modules.keys()];
-  useModulesStore.setState({ enabled });
-  // Newly enabled module: push its stored/default settings onto the runtime.
-  if (on) {
-    const def = api.getModuleDefinition(id);
-    if (def?.applySettings) def.applySettings(await getModuleSettings(id));
-  }
-  await useProjectStore
-    .getState()
-    .updateMeta({ modules: enabled })
-    .catch((err) => console.warn(`Couldn't persist modules to project.json: ${err}`));
-  if (id === "basis" && on) {
-    const { compressAllProjectTextures } = await import("./basisCompress.js");
-    const result = await compressAllProjectTextures();
-    console.log(
-      `Basis: compressed ${result.compressed} texture${result.compressed === 1 ? "" : "s"}` +
-        (result.failed ? `, ${result.failed} failed` : ""),
-    );
-    await useProjectStore.getState().refresh();
-  }
-  if (id === "basis") {
-    const { refreshAllMaterials } = await import("../engine/materialAsset.js");
-    refreshAllMaterials();
-  }
+export function setModuleEnabled(id, on) {
+  return queueModuleChange(async () => {
+    const api = await engineModulesApi();
+    const engine = await ensureEngine();
+    id = api.resolveModuleId(id);
+    const previous = new Set(engine.modules.keys());
+    if (on) await api.enableEngineModule(engine, id);
+    else await api.disableEngineModule(engine, id);
+    const { enabled, explicit } = mirrorModules(api, engine);
+    // Required providers need their stored/default settings too.
+    if (on) await applyEnabledModuleSettings(api, enabled.filter(moduleId => moduleId === id || !previous.has(moduleId)));
+    await useProjectStore
+      .getState()
+      .updateMeta({ modules: explicit })
+      .catch((err) => console.warn(`Couldn't persist modules to project.json: ${err}`));
+    if (id === "basis" && on) {
+      const { compressAllProjectTextures } = await import("./basisCompress.js");
+      const result = await compressAllProjectTextures();
+      console.log(
+        `Basis: compressed ${result.compressed} texture${result.compressed === 1 ? "" : "s"}` +
+          (result.failed ? `, ${result.failed} failed` : ""),
+      );
+      await useProjectStore.getState().refresh();
+    }
+    if (id === "basis") {
+      const { refreshAllMaterials } = await import("../engine/materialAsset.js");
+      refreshAllMaterials();
+    }
+  });
 }

@@ -1,0 +1,296 @@
+<!doctype html><html><head><meta charset="utf-8"><link rel="icon" href="data:,"><title>Grass field preview</title>
+<style>html,body{margin:0;background:#8fae6f;font:14px system-ui}canvas{display:block}</style></head>
+<body><canvas id="view"></canvas><script type="module">
+try {
+  globalThis.__engineLimitsCap = { maxStorageBuffersPerShaderStage: 8 };
+  const { Engine, THREE, registerBuiltInComponents } = await import('/src/engine/index.js');
+  await import('/src/modules/index.js');
+  const { enableEngineModule } = await import('/src/engine/modules.js');
+  const { packGrassField } = await import('/src/modules/foliage/grassField.js');
+  registerBuiltInComponents();
+  const WIDTH = 1600, PANEL_COUNT = 8, PANEL = 400, HEIGHT = PANEL * PANEL_COUNT;
+  const engine = new Engine(); engine.setSize(WIDTH, PANEL);
+  await engine.init(document.querySelector('#view'));
+  const renderer = engine.renderer;
+  if (!renderer.backend.isWebGPUBackend) throw new Error('Real WebGPU required');
+  renderer.backend.device.addEventListener('uncapturederror', event => console.error('WebGPU validation', event.error.message));
+  await enableEngineModule(engine, 'foliage');
+
+  // Sun at 30° elevation, azimuth toward +Z, so "facing the sun" and "facing
+  // away" are a simple look-direction flip along one axis.
+  const sunElevationDeg = 30, sunElevationRad = sunElevationDeg * Math.PI / 180;
+  const sunDir = new THREE.Vector3(0, Math.sin(sunElevationRad), Math.cos(sunElevationRad)).normalize();
+  engine.scene.background = new THREE.Color('#bcd6ea');
+  engine.scene.add(new THREE.HemisphereLight('#eaf5ff', '#4a5a2f', 1.4));
+  const sun = new THREE.DirectionalLight('#fff2db', 3);
+  sun.position.copy(sunDir).multiplyScalar(20); engine.scene.add(sun);
+
+  // A flat 20x20m field, the World's own meadow defaults: species grass,
+  // drawnGrass true, the `grass` config group's default numbers.
+  const entity = engine.createEntity({ name: 'meadow' });
+  const component = entity.addComponent('foliage', {
+    species: 'grass', distribution: 'placements', placements: [], drawnGrass: true,
+    blades: 480000, grassDensity: .85, height: .18, bladeWidth: .022, grassLean: .38,
+    groundBlend: .6, maxDistance: 70, lodNear: 5,
+    grassBrightness: .65, grassOcclusion: .65, grassVariation: .2, grassSpecular: 0,
+    grassRoughness: 1, grassSky: 1, castShadow: false,
+    barkColor: '#3d5622', leafColor: '#8ba254', dryColor: '#b5a761',
+  });
+  const packed = packGrassField(() => ({ height: 0, density: 1, scale: 1, dryness: 0, color: [.29, .38, .18] }),
+    { extent: 20, resolution: 64, origin: [0, 0] });
+  component.setPackedField(packed);
+  const ground = new THREE.Mesh(new THREE.PlaneGeometry(20, 20), new THREE.MeshStandardNodeMaterial({ color: '#4a5a2c', roughness: 1 }));
+  ground.rotation.x = -Math.PI / 2; engine.scene.add(ground);
+
+  const camera = new THREE.PerspectiveCamera(60, WIDTH / PANEL, .02, 200);
+  engine.camera = camera; engine.scene.add(camera);
+  component.update(true);
+  // `uniforms.sun` is the direction FROM a blade TO the sun — wire the real
+  // sun direction in, the same way an owner would via `sunDirection`.
+  component._grass.configure({ ...component._grass._settings, sunDirection: [sunDir.x, sunDir.y, sunDir.z] });
+
+  const canvas = document.createElement('canvas'); canvas.width = WIDTH; canvas.height = HEIGHT;
+  const ctx = canvas.getContext('2d');
+  const capture = async (label, activeCamera = camera) => {
+    component.update(true);
+    await renderer.compileAsync(engine.scene, activeCamera);
+    renderer.render(engine.scene, activeCamera);
+    await renderer.backend.device.queue.onSubmittedWorkDone();
+    return renderer.domElement.toDataURL('image/png');
+  };
+  // Luminance (Rec. 709) and hue per pixel, plus their whole-image mean/std —
+  // shared by the contrast receipt and the orbit-consistency check below.
+  const pixelStats = (dataUrl) => new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => {
+      const w = image.width, h = image.height;
+      const c = document.createElement('canvas'); c.width = w; c.height = h;
+      const cx = c.getContext('2d'); cx.drawImage(image, 0, 0);
+      const { data } = cx.getImageData(0, 0, w, h);
+      const luma = new Float32Array(w * h);
+      let sum = 0, sumSq = 0, sumSin = 0, sumCos = 0;
+      for (let i = 0, p = 0; p < w * h; i += 4, p++) {
+        const r = data[i] / 255, g = data[i + 1] / 255, b = data[i + 2] / 255;
+        const l = .2126 * r + .7152 * g + .0722 * b;
+        luma[p] = l; sum += l; sumSq += l * l;
+        const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
+        let hue = 0;
+        if (d > 1e-6) {
+          if (max === r) hue = ((g - b) / d) % 6;
+          else if (max === g) hue = (b - r) / d + 2;
+          else hue = (r - g) / d + 4;
+          hue *= 60; if (hue < 0) hue += 360;
+        }
+        const rad = hue * Math.PI / 180;
+        sumSin += Math.sin(rad); sumCos += Math.cos(rad);
+      }
+      const count = w * h, mean = sum / count;
+      const std = Math.sqrt(Math.max(0, sumSq / count - mean * mean));
+      let hueMean = Math.atan2(sumSin / count, sumCos / count) * 180 / Math.PI;
+      if (hueMean < 0) hueMean += 360;
+      resolve({ w, h, luma, mean, std, hueMean });
+    };
+    image.onerror = reject; image.src = dataUrl;
+  });
+
+  // Panel 1: camera facing the sun (looking toward +Z, the sun's azimuth) —
+  // the "backlit" configuration.
+  camera.position.set(0, 1.6, -8); camera.lookAt(0, 1.3, 4); camera.updateMatrixWorld(true);
+  const towardSun = await capture('toward-sun');
+  // Panel 2: camera facing away from the sun (looking toward -Z) — "front-lit".
+  camera.position.set(0, 1.6, 8); camera.lookAt(0, 1.3, -4); camera.updateMatrixWorld(true);
+  const awayFromSun = await capture('away-from-sun');
+
+  // Panels 3-6 (09-13, then follow-up owner receipt): `grassDebugPatch` is a
+  // MODE now, not a boolean — isolate one per-cell term at a time as
+  // greyscale from the SAME top-down camera. Mode 1 (raw patch noise) alone
+  // could never catch a field-texture bug, since patch noise is computed
+  // independently of the field entirely; modes 2/3 read the field's own
+  // ground-tint and density samples directly, and mode 4 the ring's own
+  // window (seam) weight — a hard, undithered SQUARE there (rather than a
+  // stochastically-dithered soft circle) means the ring handoff itself, not
+  // the field, is the blocky term.
+  camera.position.set(0, 15, 0.001); camera.lookAt(0, 0, 0); camera.updateMatrixWorld(true);
+  const captureDebugMode = async (mode, label) => {
+    for (const ring of component._grass.rings) ring.uniforms.grassDebugPatch.value = mode;
+    const png = await capture(label);
+    for (const ring of component._grass.rings) ring.uniforms.grassDebugPatch.value = 0;
+    return png;
+  };
+  const debugView = await captureDebugMode(1, 'debug-patch-noise');
+  const debugGround = await captureDebugMode(2, 'debug-ground-tint');
+  const debugDensity = await captureDebugMode(3, 'debug-density-sample');
+  const debugWindow = await captureDebugMode(4, 'debug-window-weight');
+
+  // Isolate ring 0 ALONE (hide rings 1/2) so its own radial fade can be judged
+  // without ring 1/2's overlapping density confusing the picture — proves or
+  // disproves "ring 0's window is a hard square" directly.
+  component._grass.rings[1].mesh.visible = false;
+  component._grass.rings[2].mesh.visible = false;
+  const debugRing0Window = await captureDebugMode(4, 'debug-ring0-window-alone');
+  component._grass.rings[1].mesh.visible = true;
+  component._grass.rings[2].mesh.visible = true;
+
+  // Mode 5, from the EYE-LEVEL camera (where the rectangles were actually
+  // reported) — the sun-facing term alone, unlit, isolating whether the
+  // still-square `clumpCell` rest-pose lattice (not the field, not the now-hex
+  // blade lattice) is what a directional sun turns into visible patches.
+  camera.position.set(0, 1.6, 8); camera.lookAt(0, 1.3, -4); camera.updateMatrixWorld(true);
+  const debugFacingSun = await captureDebugMode(5, 'debug-facing-sun-eye-level');
+
+  // ⭐⭐ 09-13 CONTRAST RECEIPT ("blobs, not rectangles"). Owner verdict from a
+  // screenshot ~4 m above the field in sunlight: large (1-3 m) organic blobs
+  // of near-white blades next to blobs of near-black ones. An orthographic
+  // top-down camera at 4 m gives an exact metres-per-pixel mapping, which the
+  // 1 m box filter below needs — a perspective shot's mapping would vary
+  // across the frame. `orthoSize` covers ring 0 and most of ring 1.
+  const orthoSize = 14, contrastPanel = 800;
+  engine.setSize(contrastPanel, contrastPanel);
+  const orthoCamera = new THREE.OrthographicCamera(-orthoSize / 2, orthoSize / 2, orthoSize / 2, -orthoSize / 2, .1, 50);
+  engine.scene.add(orthoCamera);
+  orthoCamera.position.set(0, 4, .0001); orthoCamera.lookAt(0, 0, 0); orthoCamera.updateMatrixWorld(true);
+  const contrastPng = await capture('contrast-4m-ortho', orthoCamera);
+  const contrastStats = await pixelStats(contrastPng);
+  // 1 m box filter: exact since the orthographic view's world-per-pixel is
+  // constant everywhere in frame, unlike a perspective shot.
+  const metresPerPixel = orthoSize / contrastPanel;
+  const box = Math.max(1, Math.round(1 / metresPerPixel));
+  let boxMax = -Infinity, boxMin = Infinity;
+  for (let y = 0; y + box <= contrastStats.h; y += box) {
+    for (let x = 0; x + box <= contrastStats.w; x += box) {
+      let sum = 0;
+      for (let dy = 0; dy < box; dy++) for (let dx = 0; dx < box; dx++) sum += contrastStats.luma[(y + dy) * contrastStats.w + (x + dx)];
+      const avg = sum / (box * box);
+      boxMax = Math.max(boxMax, avg); boxMin = Math.min(boxMin, avg);
+    }
+  }
+  const contrastReceipt = {
+    stdOverMean: contrastStats.std / contrastStats.mean,
+    boxRatio: boxMax / Math.max(boxMin, 1e-6),
+    mean: contrastStats.mean, std: contrastStats.std, box, metresPerPixel,
+  };
+
+  // ⭐⭐ 09-13 SECOND OWNER RECEIPT: "lighting is still wrong as I orbit the
+  // camera, it changes colour very inconsistently and randomly." An oblique
+  // camera at three azimuths (0/90/180°) around the SAME look-at point, fixed
+  // sun — the field's mean luminance and mean hue must agree within 8% across
+  // all three, since which way the camera happens to be facing must never
+  // change what a blade's own colour is.
+  // A steep-ish look-down angle keeps the scene's own sky background out of
+  // frame (it otherwise contaminates the hue/luminance means with a fixed
+  // amount that varies only with how much horizon each azimuth happens to
+  // show, an artifact of the measurement rather than the shading).
+  const orbitRadius = 2, orbitHeight = 5;
+  const orbitCamera = new THREE.PerspectiveCamera(50, 1, .1, 50);
+  engine.scene.add(orbitCamera);
+  const orbitSamples = [];
+  for (const azimuthDeg of [0, 90, 180]) {
+    const azimuth = azimuthDeg * Math.PI / 180;
+    orbitCamera.position.set(Math.sin(azimuth) * orbitRadius, orbitHeight, Math.cos(azimuth) * orbitRadius);
+    orbitCamera.lookAt(0, .3, 0); orbitCamera.updateMatrixWorld(true);
+    const png = await capture(`orbit-${azimuthDeg}`, orbitCamera);
+    const stats = await pixelStats(png);
+    orbitSamples.push({ azimuthDeg, mean: stats.mean, hueMean: stats.hueMean });
+  }
+  const orbitMeans = orbitSamples.map(s => s.mean);
+  const orbitHues = orbitSamples.map(s => s.hueMean);
+  const orbitReceipt = {
+    samples: orbitSamples,
+    meanSpread: (Math.max(...orbitMeans) - Math.min(...orbitMeans)) / (orbitMeans.reduce((a, b) => a + b, 0) / orbitMeans.length),
+    hueSpread: (Math.max(...orbitHues) - Math.min(...orbitHues)) / (orbitHues.reduce((a, b) => a + b, 0) / orbitHues.length),
+  };
+  engine.setSize(WIDTH, PANEL);
+
+  // Measure straight-edge-ness directly from the debug panel's own pixels.
+  // `debugMaxStep` (raw adjacent-pixel delta) does not actually distinguish
+  // "one big flat block" from "natural per-blade aliasing dither" — a thin,
+  // unantialiased blade edge against a background pixel is ALWAYS a big
+  // single-pixel jump, block or no block. `debugBlockStep` is the metric
+  // that actually answers the owner's question: box-average each scanline
+  // over a small window (11 px, roughly one blade width at this camera) to
+  // wash out ordinary per-blade dither, then look for a big jump between
+  // windows spaced FAR apart (41 px, ~0.4 m) — that only survives averaging
+  // if there is a genuine large-scale block, not fine grain.
+  const probe = document.createElement('canvas'); probe.width = WIDTH; probe.height = PANEL;
+  const probeCtx = probe.getContext('2d');
+  const { debugMaxStep, debugBlockStep, isotropyRatio } = await new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => {
+      probeCtx.drawImage(image, 0, 0, WIDTH, PANEL);
+      let worst = 0, worstBlock = 0;
+      const rows = [Math.floor(PANEL * .3), Math.floor(PANEL * .5), Math.floor(PANEL * .7)];
+      for (const row of rows) {
+        const { data } = probeCtx.getImageData(0, row, WIDTH, 1);
+        const luma = new Float32Array(WIDTH);
+        for (let x = 0; x < WIDTH; x++) luma[x] = data[x * 4];
+        let previous = luma[0];
+        for (let x = 1; x < WIDTH; x++) { worst = Math.max(worst, Math.abs(luma[x] - previous)); previous = luma[x]; }
+        const window = 11, gap = 41, half = (window - 1) / 2;
+        const windowMean = (centre) => {
+          let sum = 0, count = 0;
+          for (let dx = -half; dx <= half; dx++) {
+            const x = centre + dx;
+            if (x < 0 || x >= WIDTH) continue;
+            sum += luma[x]; count++;
+          }
+          return sum / count;
+        };
+        for (let x = half; x < WIDTH - gap - half; x++) {
+          worstBlock = Math.max(worstBlock, Math.abs(windowMean(x + gap) - windowMean(x)));
+        }
+      }
+
+      // Isotropy (09-13 owner receipt: "world-axis aligned" squares): any
+      // remaining `floor()`-driven cell — at ANY scale — traces edges that
+      // line up with the world X/Z axes. A genuinely smooth, non-cellular
+      // field has no preferred direction, so its gradient energy along the
+      // horizontal/vertical axes should match its gradient energy along the
+      // diagonals (normalised to the SAME unit distance, since a diagonal
+      // neighbour is √2 farther away than an axis one). Axis-aligned squares
+      // inflate the axis-aligned energy specifically.
+      const full = probeCtx.getImageData(0, 0, WIDTH, PANEL).data;
+      const lumaAt = (x, y) => full[(y * WIDTH + x) * 4];
+      let axisEnergy = 0, diagEnergy = 0, samples = 0;
+      // Sample on a grid rather than every pixel (this is a whole-panel
+      // stat, not a scanline one) — still thousands of samples.
+      for (let y = 4; y < PANEL - 4; y += 3) {
+        for (let x = 4; x < WIDTH - 4; x += 3) {
+          const dx = lumaAt(x + 1, y) - lumaAt(x, y);
+          const dy = lumaAt(x, y + 1) - lumaAt(x, y);
+          const d1 = (lumaAt(x + 1, y + 1) - lumaAt(x, y)) / Math.SQRT2;
+          const d2 = (lumaAt(x + 1, y - 1) - lumaAt(x, y)) / Math.SQRT2;
+          axisEnergy += dx * dx + dy * dy;
+          diagEnergy += d1 * d1 + d2 * d2;
+          samples++;
+        }
+      }
+      axisEnergy /= samples; diagEnergy /= samples;
+      resolve({ debugMaxStep: worst / 255, debugBlockStep: worstBlock / 255, isotropyRatio: axisEnergy / Math.max(diagEnergy, 1e-6) });
+    };
+    image.onerror = reject; image.src = debugView;
+  });
+
+  const drawInto = (dataUrl, y) => new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => { ctx.drawImage(image, 0, y, WIDTH, PANEL); resolve(); };
+    image.onerror = reject; image.src = dataUrl;
+  });
+  await drawInto(towardSun, 0);
+  await drawInto(awayFromSun, PANEL);
+  await drawInto(debugView, PANEL * 2);
+  await drawInto(debugGround, PANEL * 3);
+  await drawInto(debugDensity, PANEL * 4);
+  await drawInto(debugWindow, PANEL * 5);
+  await drawInto(debugRing0Window, PANEL * 6);
+  await drawInto(debugFacingSun, PANEL * 7);
+
+  const stats = component._grass?.stats ?? null;
+  const rings = component._grass?.rings.map(r => ({ index: r.index, inner: r.inner, outer: r.outer,
+    cell: r.cell, columns: r.columns, tuft: r.tuft, segments: r.segments, instances: r.instances })) ?? [];
+  globalThis.__GRASS_PREVIEW__ = {
+    png: canvas.toDataURL('image/png'), stats, rings, debugMaxStep, debugBlockStep, isotropyRatio,
+    contrastPng, contrastReceipt, orbitReceipt,
+  };
+  globalThis.__GRASS_PREVIEW_READY__ = true;
+} catch (error) { console.error(error); globalThis.__GRASS_PREVIEW_ERROR__ = error.stack ?? String(error); }
+</script></body></html>

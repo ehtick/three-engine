@@ -88,6 +88,7 @@ import {
   vec3,
 } from "three/tsl";
 import { CASCADE_COUNT } from "./srcConfig.js";
+import { binPartitionUniforms, capAt, probeRegionUniforms } from "./srcCapacityUniforms.js";
 import {
   BIN_B, BIN_COUNT, BIN_G, BIN_R, BIN_T, BIN_WORDS, DEPOSIT_SCALE, readPayload,
 } from "./srcDeposit.js";
@@ -185,6 +186,14 @@ export function createSrcSeedFrame(store, bins, { lmax, seedRays, camera = null,
   const { probeTable } = store;
   const { payload, scratch } = bins;
   const N = store.cascadeCount ?? CASCADE_COUNT;
+  // Bin bases as uniforms, not literals — a pool grow must not change this
+  // kernel's text, or the driver's compiled-shader cache goes cold for it
+  // (srcCapacityUniforms.js carries the argument). The probe table's region
+  // rides along: the seed indexes it as `instanceIndex + probeBase`.
+  const cap = {
+    ...binPartitionUniforms(bins),
+    ...probeRegionUniforms(bins.cascades),
+  };
   // §12.59.2's DEFERRED SPATIAL FALLBACK, built 2026-08-22 night — the user's
   // "lighting blocks update on the way" named it: at a walk frontier the whole
   // COLUMN is fresh, the cascade parent is unusable, and the probe converged
@@ -237,7 +246,7 @@ export function createSrcSeedFrame(store, bins, { lmax, seedRays, camera = null,
       // the split is shifts, same as the merge's (block, bin) split.
       const i = instanceIndex.toVar();
       const group = i.mod(uint(groups)).toVar();
-      const p = uint(info.probeBase).add(i.div(uint(groups))).toVar();
+      const p = uint(capAt(cap.probeBase, c)).add(i.div(uint(groups))).toVar();
       const w = p.mul(uint(PROBE_WORDS)).toVar();
 
       const flags = probeTable.element(w.add(uint(PROBE_FLAGS))).toVar();
@@ -426,7 +435,7 @@ export function createSrcSeedFrame(store, bins, { lmax, seedRays, camera = null,
         If(spBlock.notEqual(uint(SLOT_EMPTY)), () => {
           // SPATIAL source: same cascade, LOD+1 — SAME bin count and the SAME
           // direction convention, so bin m reads bin m, no 4→1.
-          const source = readPayload(payload, uint(info.binBase).add(spBlock.mul(uint(nBins))).add(m));
+          const source = readPayload(payload, uint(capAt(cap.binBase, c)).add(spBlock.mul(uint(nBins))).add(m));
           If(source.T.greaterThanEqual(0), () => {
             pL.assign(source.L);
             pT.assign(source.T);
@@ -441,7 +450,7 @@ export function createSrcSeedFrame(store, bins, { lmax, seedRays, camera = null,
           // stays 0 and the bin takes the far field below.
           if (parentInfo) {
             If(parentUsable.equal(uint(1)), () => {
-              const pBase = uint(parentInfo.binBase)
+              const pBase = uint(capAt(cap.binBase, c + 1))
                 .add(pblock.mul(uint(parentInfo.bins)))
                 .add(m.mul(uint(4)))
                 .toVar();
@@ -464,7 +473,7 @@ export function createSrcSeedFrame(store, bins, { lmax, seedRays, camera = null,
           // read back exactly the parent's mean at weight `seedRays`.
           const unit = pL.mul(inv).div(float(lmax).max(1e-6))
             .clamp(0, SEED_MAX_UNIT).toVar();
-          const slot = uint(info.binBase)
+          const slot = uint(capAt(cap.binBase, c))
             .add(block.mul(uint(nBins)))
             .add(m)
             .mul(uint(BIN_WORDS))
@@ -484,7 +493,7 @@ export function createSrcSeedFrame(store, bins, { lmax, seedRays, camera = null,
         // domain, same hand-over algebra as the parent seed (header).
         if (farOn) {
           If(known.equal(0).and(farReady), () => {
-            const slot = uint(info.binBase)
+            const slot = uint(capAt(cap.binBase, c))
               .add(block.mul(uint(nBins)))
               .add(m)
               .mul(uint(BIN_WORDS))

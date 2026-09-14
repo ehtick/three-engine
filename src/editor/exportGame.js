@@ -3,6 +3,7 @@ import { isBuiltinMaterial } from "../engine/builtinMaterials.js";
 import { createAssetNames, basename } from "./build/assetNames.js";
 import { rewriteComponentAssets, rewriteVfxGraphAssets, DOCUMENT_KINDS, extOf, ASSET_EXTENSIONS } from "./build/assetRefs.js";
 import { selectRuntimeFiles, scriptImportSpecifiers } from "./build/runtimeFiles.js";
+import { moduleIdsForComponentTypes } from "./build/moduleRefs.js";
 import {
   BUILD_DEFAULTS,
   resolveBuildScenes,
@@ -134,7 +135,7 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
   const engine = await ensureEngine();
   const { serializeScene, prefabRegistry, getComponentClass } = await import("../engine/index.js");
   const { dependenciesOf } = await import("../engine/prefab/index.js");
-  const { resolveModuleId } = await import("../engine/modules.js");
+  const { resolveModuleId, resolveModuleDependencies, getModuleDefinitions } = await import("../engine/modules.js");
   const { readAssetFlags } = await import("./assetFlags.js");
   const { getProjectSettings } = await import("./projectSettings.js");
   const { useProjectStore } = await import("./store/projectStore.js");
@@ -237,6 +238,10 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
   const timelinePaths = new Set(); // .timeline files ship with rewritten clip paths
   const atlasPaths = new Set(); // .atlas files ship with a rewritten image path
   const vfxPaths = new Set(); // .vfx graphs ship with rewritten mesh/texture paths
+  const componentTypes = new Set();
+  const catalog = getModuleDefinitions();
+  const schemaFor = type => getComponentClass(type)?.schema ??
+    catalog.flatMap(definition => definition.components ?? []).find(component => component.type === type)?.schema;
   // Saved scenes deliberately use project-relative paths so projects remain
   // portable. Runtime asset loading resolves those paths against `root`; the
   // exporter must do the same before handing sources to native filesystem IPC.
@@ -337,9 +342,10 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
    * as absolute authoring paths that no server will serve.
    */
   const visitComponent = (c) => {
+    componentTypes.add(c.type);
     rewritePrefabRefs(c.props);
     rewriteComponentAssets(c, {
-      getSchema: (type) => getComponentClass(type)?.schema,
+      getSchema: schemaFor,
       claim,
       claimDoc,
       add: (kind, p) => documentBuckets[kind]?.add(sourcePath(p)),
@@ -540,7 +546,7 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
       // and a material tweak doesn't read as a scene change in the manifest.
       ...(build.livePreview ? { livePreview: true } : {}),
     };
-    const enabledModules = [...useModulesStore.getState().enabled];
+    let enabledModules = resolveModuleDependencies([...useModulesStore.getState().enabled], { ignoreUnknown: true });
     scene.modules = enabledModules;
     scene.input = engine.input.toJSON();
     // The project's declared events. Carried as the normalized catalog rather
@@ -605,6 +611,17 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
     }
     scene.prefabs = [...shippedPrefabs.values()];
     const prefabsSkipped = prefabRegistry.all().length - shippedPrefabs.size - excludedPrefabs.size;
+    enabledModules = resolveModuleDependencies([
+      ...enabledModules, ...moduleIdsForComponentTypes(componentTypes, catalog),
+    ], { ignoreUnknown: true });
+    scene.modules = enabledModules;
+    // A later level can introduce a provider the start scene does not contain.
+    // Preserve that closure in each exported scene, including a start reload.
+    for (const entry of files) {
+      const json = JSON.parse(entry[1]);
+      json.modules = enabledModules;
+      entry[1] = JSON.stringify(json);
+    }
 
     // --- Referenced documents ------------------------------------------------
     onProgress({ phase: "assets", message: "Rewriting asset references…" });
@@ -822,7 +839,7 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
     // are safe (the player builds in memory), but explicit so an author knows
     // which scene still needs one editor bake before release.
     const derivedByDestination = new Map();
-    if (root) {
+    if (root && enabledModules.includes("gi")) {
       for (const rel of shippedSceneList) {
         const sceneKey = samePath(rel, openRel) ? openScenePath : joinPath(root, rel);
         try {
@@ -858,6 +875,28 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
               `(${error?.message ?? error}).`,
           );
         }
+      }
+    }
+    // Architecture's style-surface disk cache (owner: "write those textures once to disk and
+    // reuse rather than generate at runtime"): the whole static table is small (tests below
+    // measure it) and content-addressed by (kind, variant, flat) alone, not by scene, so —
+    // unlike the BVH's per-scene, potentially-158MiB artifacts above — it is safe to ship
+    // whatever of it the editor has already baked wholesale. A file missing here is a normal,
+    // safe miss: the player paints that one layer once at first boot, same as any other miss.
+    if (root && enabledModules.includes("architecture")) {
+      try {
+        const { styleSurfaceCacheFileList } = await import("../modules/architecture/styles/surfaces.js");
+        const dir = joinPath(root, "Library/architecture/style-surfaces");
+        const entries = await invoke("list_dir", { path: dir }).catch(() => []);
+        const present = new Set((entries || []).map((entry) => String(entry?.name ?? entry)));
+        for (const relPath of styleSurfaceCacheFileList()) {
+          const filename = relPath.split("/").pop();
+          if (!present.has(filename)) continue;
+          const destination = `Library/${relPath}`;
+          derivedByDestination.set(destination, [joinPath(root, destination), destination]);
+        }
+      } catch {
+        // No baked style-surface cache yet — the player paints every layer at first boot.
       }
     }
     const derivedCopies = [...derivedByDestination.values()];

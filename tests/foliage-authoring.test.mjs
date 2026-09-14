@@ -14,6 +14,12 @@ test("every authoring preset has species-sized geometry and ordered distance lev
   }
   assert.ok(foliagePreset("grass").height < foliagePreset("oak").height / 4);
   assert.ok(foliagePreset("grass").density > foliagePreset("oak").density * 10);
+  for (const species of ["oak", "birch", "pine"]) {
+    const props = foliagePreset(species);
+    for (const key of ["leafDensity", "leafSize", "branchDensity", "crownSpread"]) assert.equal(props[key], 1);
+    assert.equal(props.crownBase, 0);
+  }
+  assert.equal(foliagePreset("grass").leafDensity, undefined, "tree shape controls are not meadow presets");
 });
 
 test("a scatter is a referenced child; a standalone plant honors the cursor", () => {

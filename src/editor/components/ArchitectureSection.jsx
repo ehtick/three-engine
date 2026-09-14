@@ -3,12 +3,66 @@ import { Boxes, Copy, Plus, RefreshCw, Trash2 } from "../icons/index.jsx";
 import { engine } from "../engineInstance.js";
 import { useSelectionStore } from "../store/selectionStore.js";
 import { normalizeArchitectureSettings } from "../../modules/architecture/blueprints.js";
+import { STYLE_IDS, STYLE_PARAMS, getStyle } from "../../modules/architecture/styles/catalog.js";
 import { commandBus } from "../commands/CommandBus.js";
 import { SetComponentPropCommand } from "../commands/componentCommands.js";
 import { addArchitectureColliders, applyArchitectureMaterials, createArchitecture, duplicateArchitectureAssembly, rebuildArchitecture } from "../architectureBuild.js";
+import { setArchitectureModel } from "../architectureModelBuild.js";
 import { openArchitectureWorkspace } from "../architectureWorkspaceStore.js";
 import { EntityField } from "../fields/EntityField.jsx";
+import { Select } from "../fields/Select.jsx";
 import { ArchitectureField, ArchitectureMaterials, ArchitectureNumber, ArchitecturePlan, ArchitectureSettings, useArchitecturePlan } from "./ArchitectureBuilder.jsx";
+
+const STYLE_OPTIONS = [["", "None (unstyled)"], ...STYLE_IDS.map((id) => [id, getStyle(id).label])];
+
+/** Style + seed live on `model.style`, so a change goes through
+ * `setArchitectureModel` — the same undoable model-replace path every other
+ * model edit (form drag, opening add/remove, terrain-follow rebuild) uses. */
+function ArchitectureStyleControls({ entityId, model }) {
+  const style = model.style;
+  const setStyleId = (id) => {
+    if (!id) { const { style: _drop, ...rest } = model; setArchitectureModel(entityId, rest, "Clear architecture style"); return; }
+    setArchitectureModel(entityId, { ...model, style: { ...(style || {}), id, seed: style?.seed ?? 1 } }, "Set architecture style");
+  };
+  const setSeed = (seed) => setArchitectureModel(entityId, { ...model, style: { ...(style || {}), id: style?.id || "timber-medieval", seed } }, "Set architecture style seed");
+  const setParam = (key, value) => {
+    const params = { ...(style?.params || {}) };
+    if (value === undefined) delete params[key]; else params[key] = value;
+    const { params: _old, ...rest } = style;
+    setArchitectureModel(entityId, { ...model, style: Object.keys(params).length ? { ...rest, params } : rest }, "Tune architecture style");
+  };
+  const base = style ? getStyle(style.id) : null;
+  const fallback = base ? { detail: base.detail, roofPitch: Math.round(base.roof.pitch * 180 / Math.PI), overhang: base.roof.overhang, wallThickness: base.walls.thickness, windowDensity: 1, shutters: base.openings.window.shutters, flowerBoxes: base.openings.window.flowerBox, chimneys: base.roof.chimney } : {};
+  const palette = base ? { wall: base.palette.wall[0], roof: base.palette.roof[0], trim: base.palette.trim[0] } : {};
+  return <>
+    <ArchitectureField label="Style" hint="The whole look: wall construction, roof shape and covering, windows, doors and details all re-derive from the style. None keeps the plain massing.">
+      <Select aria-label="Architecture style" value={style?.id || ""} onChange={(event) => setStyleId(event.target.value)}>
+        {STYLE_OPTIONS.map(([id, label]) => <option key={id || "none"} value={id}>{label}</option>)}
+      </Select>
+    </ArchitectureField>
+    {style && <ArchitectureField label="Seed" hint="Rerolls shutters, chimneys, palette picks and per-piece variation without changing the massing.">
+      <div className="architecture-section-actions">
+        <ArchitectureNumber label="Style seed" value={style.seed ?? 1} min={1} max={4294967295} step={1} onChange={setSeed} />
+        <button className="toolbar-btn" onClick={() => setSeed(1 + Math.floor(Math.random() * 100000))}>Reroll</button>
+      </div>
+    </ArchitectureField>}
+    {style && <details className="architecture-opening"><summary>Tune style</summary>
+      <div className="architecture-field-grid">
+        {Object.entries(STYLE_PARAMS).map(([key, range]) => <ArchitectureField key={key} label={range.label}>
+          <ArchitectureNumber label={`Style ${key}`} value={style.params?.[key] ?? fallback[key]} min={range.min} max={range.max} step={range.max <= 2 ? .05 : 1} onChange={(value) => setParam(key, value)} />
+        </ArchitectureField>)}
+        {["wall", "roof", "trim"].map(key => <ArchitectureField key={key} label={`${key[0].toUpperCase()}${key.slice(1)} colour`}>
+          <input type="color" aria-label={`Style ${key} colour`} value={style.params?.[key] ?? palette[key]} onChange={(event) => setParam(key, event.target.value)} />
+        </ArchitectureField>)}
+      </div>
+      <div className="architecture-section-actions">
+        <label className="architecture-toggle"><input type="checkbox" checked={style.params?.plinth !== false} onChange={(event) => setParam("plinth", event.target.checked ? undefined : false)} /> Plinth</label>
+        <label className="architecture-toggle"><input type="checkbox" checked={style.params?.ridge !== false} onChange={(event) => setParam("ridge", event.target.checked ? undefined : false)} /> Ridge caps</label>
+      </div>
+      {style.params && <button className="toolbar-btn wide" onClick={() => { const { params: _p, ...rest } = style; setArchitectureModel(entityId, { ...model, style: rest }, "Reset architecture style"); }}>Reset to catalogue style</button>}
+    </details>}
+  </>;
+}
 
 /** Authoring changes stay staged until a single undoable regeneration. */
 export function ArchitectureSection({ entityId, props }) {
@@ -36,6 +90,7 @@ function ArchitectureModelSection({ entityId, props }) {
   };
   return <div className="architecture-section" data-architecture-model-section={entityId}>
     <ArchitectureTerrainControls entityId={entityId} props={props} />
+    <ArchitectureStyleControls entityId={entityId} model={model} />
     <p className="architecture-hint">Connected building forms. Reshape a form in the viewport; adjoining walls, roofs and openings adapt with it.</p>
     <div className="architecture-model-stats"><span><strong>{model.forms?.length ?? 0}</strong>forms</span><span><strong>{model.paths?.length ?? 0}</strong>paths</span><span><strong>{model.openings?.length ?? 0}</strong>openings</span></div>
     <button className="architecture-primary" onClick={() => openArchitectureWorkspace({ mode: "sculpt", parentId: entityId })}>Build and reshape in viewport</button>

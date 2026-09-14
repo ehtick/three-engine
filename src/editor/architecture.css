@@ -121,3 +121,11 @@
 @container (max-height: 400px) {
   .architecture-flyout { bottom: 162px; max-height: calc(100% - 200px); }
 }
+
+/* Style picker: one chip per catalogue style, a three-colour swatch (wall, roof, trim) over its name. */
+.architecture-style-strip { display: flex; gap: 4px; overflow-x: auto; padding: 4px 8px 2px; scrollbar-width: thin; }
+.architecture-style-chip { flex: 0 0 auto; display: flex; flex-direction: column; align-items: center; gap: 3px; min-width: 66px; padding: 4px 6px; border-radius: 6px; border: 1px solid transparent; background: transparent; color: inherit; font-size: 10px; line-height: 1.1; cursor: pointer; }
+.architecture-style-chip:hover { background: rgba(255, 255, 255, .05); }
+.architecture-style-chip[aria-pressed="true"] { border-color: rgba(158, 233, 195, .75); background: rgba(158, 233, 195, .1); }
+.architecture-style-swatch { display: flex; width: 46px; height: 14px; border-radius: 3px; overflow: hidden; box-shadow: inset 0 0 0 1px rgba(0, 0, 0, .25); }
+.architecture-style-swatch i { flex: 1; }

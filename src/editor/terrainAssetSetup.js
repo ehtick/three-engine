@@ -96,6 +96,9 @@ const setupInFlight = new Map();
 /** Backfills persistent assets for an existing Terrain entity, once at a time. */
 export async function ensureTerrainAssets(entity, options = {}) {
   if (!entity?.getComponent("terrain")) return null;
+  // World serializes its generator and artistic layers. Selecting its native
+  // Terrain must not replace that base with a newly authored flat material.
+  if (entity.getComponent("world-feature")?.props.provider === "terrain") return null;
   const mesh = entity.getComponent("mesh");
   if (mesh?.props.geometryAsset && mesh?.props.material) return null;
   if (setupInFlight.has(entity.id)) return setupInFlight.get(entity.id);

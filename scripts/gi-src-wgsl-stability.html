@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>SRC WGSL stability gate — one pool vector vs a grown one, module text diffed</title>
+    <style>html,body{margin:0;background:#111;color:#ddd;font:13px monospace}canvas{display:none}</style>
+  </head>
+  <body>
+    <canvas id="view" width="16" height="16"></canvas>
+    <pre id="log"></pre>
+    <script type="module">
+      // ══ WHY THIS GATE EXISTS ════════════════════════════════════════════
+      //
+      // Chromium keys Dawn's compiled-shader disk cache on the shader module's
+      // SOURCE TEXT (wgslStable.js carries the full argument and the receipts:
+      // a byte-identical kernel served 72× warm; 21 differing literals out of
+      // 6,639 lines made every boot cold). The SRC kernels bake the bin-store
+      // capacities — `binBase`, the `lo/hi` cascade partition, the block-chain
+      // bases, the tile-atlas strides — as WGSL LITERALS at graph-build time,
+      // so a pool that moved re-compiled ~70 kernels from scratch.
+      //
+      // The fix routes those values through uniforms whose WGSL declaration is
+      // value-free. This gate is the receipt machine for that fix, and it uses
+      // the same method the audit did — no second boot needed: build the whole
+      // chain TWICE in this page under two different capacity vectors and diff
+      // the module text the driver was handed. Any pool-derived literal left in
+      // a kernel shows up as differing lines here; the goal state is zero.
+      //
+      // Not a numerics gate — the sibling gates (tiles/deposit/merge) own that.
+      // Nothing here reads a result buffer; it only compiles and dispatches.
+      //
+      // Run: node scripts/run-gi-src-wgsl-stability.mjs
+      const out = document.querySelector("#log");
+      const say = (line) => { out.textContent += line + "\n"; };
+      const fail = (error) => {
+        console.error("SRC-WGSL-STABILITY FAIL", error?.stack ?? error?.message ?? String(error));
+        globalThis.__SRC_WGSL_STABILITY_RESULT__ = {
+          pass: false, error: error?.message ?? String(error), text: out.textContent,
+        };
+      };
+      globalThis.addEventListener("error", (event) => fail(event.error ?? event.message));
+      globalThis.addEventListener("unhandledrejection", (event) => fail(event.reason));
+
+      try {
+        const THREE = await import("three/webgpu");
+        const TSL = await import("three/tsl");
+        const cfgMod = await import("/src/modules/gi/srcConfig.js");
+        const P = await import("/src/modules/gi/srcProbes.js");
+        const R = await import("/src/modules/gi/srcRays.js");
+        const D = await import("/src/modules/gi/srcDeposit.js");
+        const G = await import("/src/modules/gi/srcMerge.js");
+        const S = await import("/src/modules/gi/srcSeed.js");
+        const T = await import("/src/modules/gi/srcTiles.js");
+
+        const { float, instancedArray, select, uint, uniform, vec3 } = TSL;
+
+        const renderer = new THREE.WebGPURenderer({ canvas: document.querySelector("#view") });
+        await renderer.init();
+        const device = renderer.backend.device;
+
+        // ── capture every module the driver is handed, per phase ────────────
+        let sink = null;
+        const rawCreate = device.createShaderModule.bind(device);
+        device.createShaderModule = (descriptor) => {
+          if (sink) {
+            sink.push({
+              label: descriptor.label ?? "",
+              bytes: descriptor.code.length,
+              code: descriptor.code,
+            });
+          }
+          return rawCreate(descriptor);
+        };
+
+        // ── the two capacity vectors ─────────────────────────────────────────
+        // Off-rung on purpose in DIFFERENT ways per cascade, so every family of
+        // capacity literal (binBase, lo/hi partition, block chains, atlas
+        // strides, probe/hash regions) moves between the phases if it is still
+        // a literal. c0Probes varies too — the probe pool is its own ratchet.
+        const VECTORS = [
+          { name: "A", c0Probes: 1024, blockCapacity: [256, 256, 128, 64] },
+          { name: "B", c0Probes: 1536, blockCapacity: [512, 384, 192, 96] },
+        ];
+        const PIXELS = 64;
+        const RAYS_PER_PIXEL = 2;
+        const LMAX = 16;
+        const S0 = 0.5;
+        const FRAME_STAMP = 7;
+
+        // Minimal pixel set — the gate never reads results, so the geometry is
+        // irrelevant; it only has to satisfy the closures' contracts.
+        const attrs = new Float32Array(PIXELS * 8);
+        for (let i = 0; i < PIXELS; i++) {
+          attrs[i * 8] = (i % 8) - 3.5; attrs[i * 8 + 1] = 0; attrs[i * 8 + 2] = Math.floor(i / 8) - 3.5;
+          attrs[i * 8 + 3] = 1;
+          attrs[i * 8 + 4] = 0; attrs[i * 8 + 5] = 1; attrs[i * 8 + 6] = 0;
+        }
+        const posBuf = instancedArray(attrs.slice(), "vec4");
+        const readPixel = (i) => {
+          const t = posBuf.element(i.mul(2)).toVar();
+          return { position: t.xyz, valid: t.w.greaterThan(0.5) };
+        };
+        const readNormal = (i) => posBuf.element(i.mul(2).add(1)).xyz;
+
+        // Synthetic trace keyed on the ray index (the deposit gate's trick,
+          // reduced to what a compile needs: deterministic, direction-blind).
+        const synthTrace = (o, d, tMax, n) => {
+          const h = n.mul(uint(0x9e3779b9)).toVar();
+          const t = float(h.shiftRight(uint(8))).mul(120 / 16777216).toVar();
+          const isHit = t.lessThanEqual(float(tMax)).toVar();
+          return {
+            hit: select(isHit, float(1), float(0)),
+            t: select(isHit, t, float(-1)),
+            position: vec3(0),
+            exactPosition: vec3(0),
+            normal: vec3(0, 1, 0),
+            dynObj: null,
+          };
+        };
+
+        const modules = [];
+        for (const vector of VECTORS) {
+          say(`── phase ${vector.name}: blocks ${vector.blockCapacity.join("/")} ──`);
+          const mine = [];
+          modules.push(mine);
+          sink = mine;
+          const store = P.createSrcProbeStore({
+            c0Probes: vector.c0Probes,
+            cascadeCount: cfgMod.CASCADE_COUNT,
+            blockCapacity: vector.blockCapacity,
+          });
+          const cameraU = uniform(new THREE.Vector3(1.25, 1.6, -0.75));
+          const anchorU = uniform(new THREE.Vector3(0.37, -1.21, 2.93));
+          const lmaxU = uniform(LMAX);
+
+          const frame = P.createSrcProbeFrame(store, {
+            spacing0: S0, camera: vec3(cameraU), anchor: vec3(anchorU),
+            pixelCount: PIXELS, readPixel,
+          });
+          const rayStore = R.createSrcRayStore(store, { pixelCount: PIXELS });
+          const rayFrame = R.createSrcRayFrame(store, rayStore, {
+            pixelProbe: frame.pixelProbe, raysPerPixel: RAYS_PER_PIXEL,
+          });
+          const bins = D.createSrcBinStore(store, { w0: cfgMod.W0 });
+          const deposit = D.createSrcDepositFrame(store, bins, {
+            pixelProbe: frame.pixelProbe,
+            pixelRayBase: rayStore.pixelRayBase,
+            pixelCount: PIXELS,
+            raysPerPixel: RAYS_PER_PIXEL,
+            trace: synthTrace,
+            readPixel, readNormal,
+            camera: vec3(cameraU),
+            spacing0: S0,
+            lmax: lmaxU,
+            jitterX: 0, jitterY: 0,
+            // Arms the keep pass and the resolve's live/stamp block chains —
+            // the families the audit measured moving.
+            keep: 0.9,
+            frameStamp: FRAME_STAMP,
+            influxLift: 0.5,
+          });
+          const merge = G.createSrcMergeFrame(store, bins, {});
+          const seed = S.createSrcSeedFrame(store, bins, { lmax: lmaxU, seedRays: 4 });
+          const tiles = T.createSrcTileAtlas(store, bins, { frameStamp: FRAME_STAMP });
+
+          const bundle = [frame, rayFrame, deposit, merge, seed, tiles];
+          for (const part of bundle) {
+            for (const pass of part.passes) await renderer.computeAsync(pass);
+          }
+          for (const part of bundle) await part.dispose?.();
+          say(`   ${mine.length} shader modules`);
+        }
+        sink = null;
+
+        // ── the diff: pair by capture order (both phases run the same build
+        // path), then count differing lines. Same graph, different literals
+        // ⇒ same length, a handful of differing lines — the audit's signature.
+        // Both texts go through `canonicalizeWgsl` FIRST, exactly like the
+        // editor's `createShaderModule` hook does: the `NodeBuffer_<node.id>`
+        // renames it fixes are not what this gate measures, and leaving them
+        // in would smear one renamed identifier across every following line.
+        const { canonicalizeWgsl } = await import("/src/engine/wgslStable.js");
+        const [A, B] = modules;
+        say("");
+        if (!A || !B || A.length !== B.length) {
+          throw new Error(`phase module counts differ: ${A?.length} vs ${B?.length} — the two phases did not build the same kernel set`);
+        }
+        const differing = [];
+        let identical = 0;
+        for (let i = 0; i < A.length; i++) {
+          const codeA = canonicalizeWgsl(A[i].code);
+          const codeB = canonicalizeWgsl(B[i].code);
+          if (codeA === codeB) { identical++; continue; }
+          const aLines = codeA.split("\n");
+          const bLines = codeB.split("\n");
+          let diffLines = 0;
+          const samples = [];
+          const n = Math.max(aLines.length, bLines.length);
+          for (let l = 0; l < n; l++) {
+            if (aLines[l] !== bLines[l]) {
+              diffLines++;
+              if (samples.length < 2) {
+                samples.push(`    L${l + 1}  A: ${(aLines[l] ?? "<eof>").trim().slice(0, 110)}\n` +
+                  `    L${l + 1}  B: ${(bLines[l] ?? "<eof>").trim().slice(0, 110)}`);
+              }
+            }
+          }
+          differing.push({ index: i, label: A[i].label || B[i].label, aBytes: A[i].bytes, bBytes: B[i].bytes, diffLines, samples });
+        }
+
+        say(`identical modules: ${identical}/${A.length}`);
+        if (differing.length) {
+          say(`DIFFERING MODULES: ${differing.length}`);
+          for (const d of differing) {
+            say(`  #${d.index} ${d.label || "(unlabeled)"} ${d.aBytes}B vs ${d.bBytes}B — ${d.diffLines} lines differ`);
+            for (const s of d.samples) say(s);
+          }
+        }
+
+        const pass = differing.length === 0;
+        globalThis.__SRC_WGSL_STABILITY_RESULT__ = {
+          pass,
+          modules: A.length,
+          identical,
+          differing: differing.length,
+          text: out.textContent,
+        };
+        say(pass ? "STABLE — every module byte-identical across the two pool vectors" : "UNSTABLE — capacity literals remain (see above)");
+      } catch (err) {
+        fail(err);
+      }
+    </script>
+  </body>
+</html>

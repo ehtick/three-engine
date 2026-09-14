@@ -333,7 +333,7 @@ export class MeshComponent extends Component {
     // `component-changed` to tell the owner it had happened. The symptom was a
     // level drawn entirely in white with no grid texture and nothing in the
     // console.
-    if (this.mesh.userData.materialOwner) return;
+    if (this.mesh.userData.materialOwner || this.entity.getComponent('terrain')?.mesh === this.mesh) return;
     const paths = [this.props.material ?? '', ...Array.from({ length: 7 }, (_, index) => this.props[`material${index + 2}`] ?? '')];
     const hasExtraMaterial = paths.slice(1).some(Boolean);
     // Geometry groups retain their numeric material slot even when that slot
@@ -462,7 +462,7 @@ export class MeshComponent extends Component {
         // between the commit and `loadMaterialAsset` resolving. `#loadSharedMaterial`
         // will still run for the visibility / generation / subscribe plumbing.
         const cached = getMaterialInstance(this.props.material);
-        if (cached && !this.mesh.userData.materialOwner) {
+        if (cached && !this.mesh.userData.materialOwner && this.entity.getComponent('terrain')?.mesh !== this.mesh) {
           const paths = [this.props.material, ...Array.from({ length: 7 }, (_, index) => this.props[`material${index + 2}`] ?? '')];
           const hasExtraMaterial = paths.slice(1).some(Boolean);
           this.mesh.material = hasExtraMaterial && this.mesh.geometry?.groups?.length ? paths.map((p) => getMaterialInstance(p) ?? getDefaultMaterial()) : cached;

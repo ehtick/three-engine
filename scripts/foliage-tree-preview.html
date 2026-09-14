@@ -1,18 +1,45 @@
 <!doctype html><html><head><meta charset="utf-8"><link rel="icon" href="data:,"><title>Foliage tree closeups</title>
-<style>html,body{margin:0;background:#b9ccd0}canvas{display:block}#label{position:fixed;top:16px;left:20px;padding:9px 14px;background:#17291bd9;color:white;font:16px system-ui;border-radius:5px}</style></head>
-<body><canvas id="view"></canvas><div id="label">Preparing trees…</div><script type="module">
+<style>html,body{margin:0;background:#b9ccd0;font:14px system-ui}canvas{display:block}header{position:fixed;top:16px;left:20px;padding:10px 14px;background:#17291be8;color:white;border-radius:7px}#label{margin-bottom:7px}select{font:inherit;color:white;background:#304b35;border:1px solid #7e967e;border-radius:4px;padding:4px;margin-right:5px}label{font-size:12px}body.capture header{display:none}</style></head>
+<body><canvas id="view"></canvas><header><div id="label">Preparing trees…</div><label>Species <select id="species" disabled><option value="oak">Oak</option><option value="birch">Birch</option><option value="pine">Pine</option></select></label><label>View <select id="detail" disabled><option value="full">Full tree</option><option value="leaves">Leaves</option><option value="bark">Bark</option></select></label><label>Detail <select id="lod" disabled><option value="0">Near</option><option value="1">Mid</option><option value="2">Impostor</option></select></label><label>Angle <select id="turn" disabled><option value="0">Front</option><option value="1.2">Side</option><option value="2.4">Back</option></select></label></header><script type="module">
 try {
   globalThis.__engineLimitsCap = { maxStorageBuffersPerShaderStage: 8 };
   const { Engine, THREE, registerBuiltInComponents } = await import('/src/engine/index.js');
   await import('/src/modules/index.js');
   const { enableEngineModule } = await import('/src/engine/modules.js');
   const { FOLIAGE_SPECIES } = await import('/src/modules/foliage/foliageGeometry.js');
+  const { getFoliageSurfaceTextures } = await import('/src/modules/foliage/foliageSurfaceTexture.js');
+  const oldMipTail = new URLSearchParams(location.search).has('oldMipTail');
   registerBuiltInComponents();
   const engine = new Engine(); engine.setSize(1300, 724);
   await engine.init(document.querySelector('#view'));
   const renderer = engine.renderer;
   if (!renderer.backend.isWebGPUBackend) throw new Error('Real WebGPU required');
+  if (renderer.backend.device.limits.maxStorageBuffersPerShaderStage !== 8) throw new Error('Portable-eight WebGPU required');
+  renderer.backend.device.addEventListener('uncapturederror', event => console.error('WebGPU validation', event.error.message));
   await enableEngineModule(engine, 'foliage');
+  if (oldMipTail) {
+    // Reproduce the vanished-canopy regression before any texture upload or
+    // atlas bake: rounding a subpixel leaf count to zero emptied the mip tail.
+    for (const species of ['oak', 'birch', 'pine']) {
+      const surfaces = getFoliageSurfaceTextures(species), leaves = surfaces.leaves.clone();
+      leaves.mipmaps = surfaces.leaves.mipmaps.filter(mip => mip.width >= 16)
+        .map(mip => ({ ...mip, data: new Uint8Array(mip.data) }));
+      if (leaves.mipmaps.at(-1)?.width !== 16) throw new Error(`Cannot reproduce old mip tail for ${species}`);
+      // The corrected texture ends at16×16. Append contiguous levels so Three
+      // allocates the old full chain; merely zeroing nonexistent levels is inert.
+      for (let width = 8; width >= 1; width /= 2) {
+        const previous = leaves.mipmaps.at(-1), data = new Uint8Array(width * width * 4);
+        for (let y = 0; y < width; y++) for (let x = 0; x < width; x++) for (let channel = 0; channel < 4; channel++) {
+          let sum = 0;
+          for (let dy = 0; dy < 2; dy++) for (let dx = 0; dx < 2; dx++) sum += previous.data[((y * 2 + dy) * previous.width + x * 2 + dx) * 4 + channel];
+          data[(y * width + x) * 4 + channel] = channel === 3 && width <= 2 ? 0 : Math.round(sum / 4);
+        }
+        leaves.mipmaps.push({ width, height: width, data });
+      }
+      surfaces.leaves = leaves;
+      leaves.needsUpdate = true;
+    }
+  }
   engine.scene.background = new THREE.Color('#bdced0');
   engine.scene.add(new THREE.HemisphereLight('#eaf5ff', '#746444', 2));
   const sun = new THREE.DirectionalLight('#fff2db', 3.5);
@@ -42,22 +69,112 @@ try {
   engine.start(); await ready(); engine.stop();
   const show = async (species, view='full', lod=0, turn=0) => {
     const selected = trees.get(species);
+    if (!selected) throw new Error(`Unknown tree species: ${species}`);
     for (const c of trees.values()) c.root.visible = c === selected;
     const {height:h,width:w} = FOLIAGE_SPECIES[species];
     if(view==='bark') {camera.position.set(1.4,1.5,1.9);camera.lookAt(0,1.5,0);}
     else if(view==='leaves') {camera.position.set(w*.50,h*.72,w*.53);camera.lookAt(0,h*.67,0);}
     else {camera.position.set(Math.sin(.58+turn)*h*1.72,h*.6,Math.cos(.58+turn)*h*1.72);camera.lookAt(0,h*.48,0);}
     camera.updateMatrixWorld(true);
+    // The per-instance shader crossfade decides the tier from real distance now;
+    // forcing `chunk.level` alone left Mid/Impostor frames identical to Near.
+    Object.assign(selected.props, [{lodNear:100,lodFar:150,maxDistance:180},{lodNear:0,lodFar:150,maxDistance:180},{lodNear:0,lodFar:1,maxDistance:400}][lod]);
     selected.update(true);
     for(const chunk of selected.chunks) chunk.level=lod;
     selected._commitBatches();
-    document.querySelector('#label').textContent = `${FOLIAGE_SPECIES[species].label} · ${view} · LOD ${lod}`;
+    document.querySelector('#label').textContent = `${FOLIAGE_SPECIES[species].label} · ${view} · ${['Near', 'Mid', 'Impostor'][lod]}${oldMipTail ? ' · old empty mip tail' : ''}`;
+    document.querySelector('#species').value = species; document.querySelector('#detail').value = view;
+    document.querySelector('#lod').value = String(lod); document.querySelector('#turn').value = String(turn);
     await renderer.compileAsync(engine.scene,camera);
     renderer.render(engine.scene,camera);
     await renderer.backend.device.queue.onSubmittedWorkDone();
-    return {species,view,lod,stats:selected.stats,geometry:selected.geometries?.map(g=>({triangles:g.index.count/3,...g.userData.foliage}))};
+    return {species,view,lod,turn,stats:selected.stats,geometry:selected.geometries?.map(g=>({triangles:g.index.count/3,...g.userData.foliage}))};
   };
-  globalThis.__TREE_PREVIEW__ = {show,engine,trees};
+  const canopyTarget = new THREE.RenderTarget(640, 360);
+  canopyTarget.texture.colorSpace = THREE.SRGBColorSpace;
+  const canopyFrame = async (species, lod, turn) => {
+    await show(species, 'full', lod, turn);
+    const selected = trees.get(species), mesh = selected.renderMeshes[lod];
+    const previousTarget = renderer.getRenderTarget(), background = engine.scene.background, groundVisible = ground.visible;
+    const clear = renderer.getClearColor(new THREE.Color()), clearAlpha = renderer.getClearAlpha();
+    let pixels;
+    try {
+      // Keep camera, viewport size and actual receiving/baked materials identical
+      // across detail levels. Ground/background cannot count as canopy pixels.
+      engine.scene.background = null; ground.visible = false; renderer.setClearColor(0, 0);
+      renderer.setRenderTarget(canopyTarget);
+      await renderer.compileAsync(engine.scene, camera);
+      renderer.render(engine.scene, camera);
+      pixels = await renderer.readRenderTargetPixelsAsync(canopyTarget, 0, 0, 640, 360);
+    } finally {
+      renderer.setRenderTarget(previousTarget); renderer.setClearColor(clear, clearAlpha);
+      engine.scene.background = background; ground.visible = groundVisible;
+    }
+    if (!(pixels instanceof Uint8Array) || pixels.length !== 640 * 360 * 4) throw new Error('Canopy capture requires tightly packed RGBA8 pixels');
+    const gridWidth = 32, gridHeight = 18, bins = new Uint8Array(gridWidth * gridHeight);
+    let greenPixels = 0, opaquePixels = 0, minX = 640, minY = 360, maxX = -1, maxY = -1;
+    for (let i = 0; i < pixels.length; i += 4) {
+      if (pixels[i + 3] < 128) continue;
+      opaquePixels++;
+      const r = pixels[i], g = pixels[i + 1], b = pixels[i + 2];
+      // Authored leaf greens have chromatic separation from brown/gray bark.
+      // Global atlas alpha alone let a perfectly retained bare trunk pass.
+      if (!(g > 18 && g > r * 1.055 && g > b * 1.035 && g - r > 3 && g - b > 3)) continue;
+      greenPixels++;
+      const x = (i / 4) % 640, y = Math.floor(i / 4 / 640);
+      minX = Math.min(minX, x); minY = Math.min(minY, y); maxX = Math.max(maxX, x); maxY = Math.max(maxY, y);
+      bins[Math.floor(y / 360 * gridHeight) * gridWidth + Math.floor(x / 640 * gridWidth)] = 1;
+    }
+    const canvas = document.createElement('canvas'); canvas.width = 640; canvas.height = 360;
+    canvas.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(pixels), 640, 360), 0, 0);
+    return { lod, turn, greenPixels, opaquePixels, canopyFraction: greenPixels / Math.max(1, opaquePixels),
+      canopyBounds: greenPixels ? { minX, minY, maxX, maxY, width: maxX - minX + 1, height: maxY - minY + 1 } : null,
+      canopyBins: [...bins], occupiedBins: bins.reduce((sum, value) => sum + value, 0),
+      actualRepresentation: { visible: !!mesh?.visible, indexCount: mesh?.geometry.index?.count, instances: mesh?.geometry.instanceCount ?? mesh?.count },
+      camera: { position: camera.position.toArray(), matrix: camera.matrixWorld.elements.slice(), projection: camera.projectionMatrix.elements.slice() },
+      png: canvas.toDataURL('image/png') };
+  };
+  const measureCanopy = async species => {
+    const angles = [], failures = [];
+    for (const turn of [0, 1.2, 2.4]) {
+      const views = [];
+      for (const lod of [0, 1, 2]) views.push(await canopyFrame(species, lod, turn));
+      const near = views[0];
+      if (near.greenPixels < 120 || near.occupiedBins < 6) failures.push(`${species} angle ${turn}: near reference has insufficient visible green canopy (${near.greenPixels} pixels/${near.occupiedBins} bins)`);
+      for (const current of views.slice(1)) {
+        const minimumRatio = current.lod === 1 ? .45 : .35;
+        const overlap = current.canopyBins.reduce((sum, value, i) => sum + (value && near.canopyBins[i] ? 1 : 0), 0);
+        current.relativeToNear = { greenPixelRatio: current.greenPixels / Math.max(1, near.greenPixels),
+          canopyBinRecall: overlap / Math.max(1, near.occupiedBins),
+          widthRatio: (current.canopyBounds?.width ?? 0) / Math.max(1, near.canopyBounds?.width ?? 0),
+          heightRatio: (current.canopyBounds?.height ?? 0) / Math.max(1, near.canopyBounds?.height ?? 0) };
+        if (JSON.stringify(current.camera) !== JSON.stringify(near.camera)) failures.push(`${species} angle ${turn}: LOD comparison changed camera/pixel scale`);
+        if (!current.actualRepresentation.visible || (current.lod === 2 && current.actualRepresentation.indexCount !== 6)) failures.push(`${species} angle ${turn}: requested detail did not reach its actual render mesh`);
+        const result = current.relativeToNear;
+        if (result.greenPixelRatio < minimumRatio || result.canopyBinRecall < .55 || result.widthRatio < .65 || result.heightRatio < .65) {
+          failures.push(`${species} angle ${turn} ${current.lod === 2 ? 'impostor' : 'mid'} lost green canopy: ${JSON.stringify(result)}`);
+        }
+      }
+      const strip = document.createElement('canvas'); strip.width = 640 * 3; strip.height = 388;
+      const ctx = strip.getContext('2d'); ctx.fillStyle = '#bdced0'; ctx.fillRect(0, 0, strip.width, strip.height);
+      for (const view of views) {
+        const image = new Image(); image.src = view.png; await image.decode();
+        ctx.drawImage(image, view.lod * 640, 28); ctx.fillStyle = '#17291b'; ctx.font = '16px system-ui';
+        ctx.fillText(`${species} · ${['Near', 'Mid', 'Impostor'][view.lod]} · ${view.greenPixels} canopy pixels`, view.lod * 640 + 12, 20);
+      }
+      angles.push({ turn, views, strip: strip.toDataURL('image/png') });
+    }
+    return { species, oldMipTail, width: 640, height: 360, angles, failures, pass: failures.length === 0 };
+  };
+  let controls = Promise.resolve();
+  for (const select of document.querySelectorAll('header select')) {
+    select.disabled = false;
+    select.onchange = () => {
+      const settings = [document.querySelector('#species').value, document.querySelector('#detail').value, Number(document.querySelector('#lod').value), Number(document.querySelector('#turn').value)];
+      controls = controls.then(() => show(...settings)).catch(error => { console.error(error); document.querySelector('#label').textContent = error.message; });
+    };
+  }
+  globalThis.__TREE_PREVIEW__ = {show,measureCanopy,engine,trees,oldMipTail};
   await show('oak'); globalThis.__TREE_PREVIEW_READY__=true;
 } catch(error) { console.error(error); globalThis.__TREE_PREVIEW_ERROR__=error.stack??String(error); }
 </script></body></html>

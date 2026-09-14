@@ -5,21 +5,27 @@ import { engine } from "../engineInstance.js";
  * base64-encoded snapshots of the terrain's height buffer (captured at
  * pointerdown / pointerup) — the stroke itself mutates the live geometry
  * directly for immediate feedback and never touches the command bus.
+ *
+ * `key` (default `"heights"`) is which prop the snapshots belong to: a
+ * procedural terrain (P1-T) sculpts into `heightEdits` instead — its base
+ * grid is generated, and a stroke's delta must never land in `heights`,
+ * which the component ignores while `procedural` is on.
  */
 export class SetTerrainHeightsCommand {
-  constructor(entityId, before, after) {
+  constructor(entityId, before, after, key = "heights") {
     this.entityId = entityId;
     this.before = before;
     this.after = after;
+    this.key = key;
     this.label = "Sculpt Terrain";
   }
 
   do() {
-    engine.getEntity(this.entityId)?.getComponent("terrain")?.setProp("heights", this.after);
+    engine.getEntity(this.entityId)?.getComponent("terrain")?.setProp(this.key, this.after);
   }
 
   undo() {
-    engine.getEntity(this.entityId)?.getComponent("terrain")?.setProp("heights", this.before);
+    engine.getEntity(this.entityId)?.getComponent("terrain")?.setProp(this.key, this.before);
   }
 }
 

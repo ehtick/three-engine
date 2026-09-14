@@ -41,6 +41,7 @@ import { applyPrefab, revertPrefab, unpackPrefab, openPrefabMode, createVariantF
 import { SoundSection } from "../components/SoundSection.jsx";
 import { ListenerSection } from "../components/ListenerSection.jsx";
 import { TerrainSection } from "../components/TerrainSection.jsx";
+import { WorldOwnerLink, WorldSection } from "../components/WorldSection.jsx";
 import { FoliageSection, FoliageSurfaceSection } from "../components/FoliageSection.jsx";
 import { AtmosphereSection } from "../components/AtmosphereSection.jsx";
 import { LevelSection } from "../components/LevelSection.jsx";
@@ -2282,6 +2283,9 @@ function ComponentSection({ entityId, type, props }) {
           const installed = new Set(enabledModules);
           const visible = cls.schema.filter((descriptor) => {
             if (type === "foliage") return false;
+            if (type === "world") return false;
+            if (type === "terrain" && ["size", "resolution"].includes(descriptor.key) &&
+              engine.getEntity(entityId)?.getComponent("world-feature")?.props.provider === "terrain") return false;
             if (descriptor.hidden) return false;
             // A field that belongs to an optional module is invisible — not
             // disabled — until that module is installed (see Component.js).
@@ -2508,6 +2512,7 @@ function ComponentSection({ entityId, type, props }) {
         {type === "splineMesh" && <SplineMeshSection entityId={entityId} />}
         {type === "splineFollower" && <SplineFollowerSection entityId={entityId} />}
         {type === "terrain" && <TerrainSection entityId={entityId} props={props} />}
+        {type === "world" && <WorldSection entityId={entityId} props={props} />}
         {type === "foliage" && <FoliageSection entityId={entityId} props={props} />}
         {type === "atmosphere" && <AtmosphereSection entityId={entityId} props={props} />}
         {["mesh", "model"].includes(type) && !engine.getEntity(entityId)?.getComponent("terrain") && <FoliageSurfaceSection entityId={entityId} />}
@@ -3316,6 +3321,7 @@ export function InspectorPanel() {
       </div>
 
       <TransformSection entity={entity} />
+      <WorldOwnerLink entityId={entity.id} />
 
       {Object.entries(entity.components)
         .filter(([type]) => !getComponentClass(type)?.internal)

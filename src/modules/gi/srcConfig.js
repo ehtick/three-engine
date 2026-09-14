@@ -1424,6 +1424,83 @@ export function srcBinCeiling({ deviceLimitBytes = 128 * 1024 * 1024, reserveByt
  */
 export const BLOCK_HEADROOM = [2.0, 1.5, 1.25, 1.25];
 
+/**
+ * ── THE CAPACITY LADDER — why a pool size is a RUNG, not a number ──────────
+ *
+ * Every cascade's `blockCapacity` is baked into the SRC kernels as a WGSL
+ * LITERAL: the cascade bin partition (`srcDeposit.js` `lo = info.binBase`,
+ * `hi = lo + info.bins * info.blockCapacity`, and the same chain in
+ * `srcMerge.js` / `srcSeed.js`), the slot bases, and — through
+ * `tileAtlasLayout(info.blockCapacity, …)` — the tile atlas's height, which
+ * appears sixteen times per kernel as `… + 0.5 ) / 1448.0`.
+ *
+ * Chromium keys Dawn's compiled-shader disk cache on the WGSL SOURCE TEXT. So
+ * a capacity that is an arbitrary number makes the text arbitrary, and every
+ * boot compiles the 200 kB kernels from scratch. Measured 2026-09-12 on the
+ * user's Complex scene: two rebuilds inside ONE session produced two modules
+ * of identical length (204 682 bytes) differing in 21 lines out of 6 639 —
+ * every one of them one of these literals. Across boots it is worse than
+ * arbitrary, it RATCHETS: the grow ladder persists what it reached, the next
+ * boot starts there and grows from there, so a capacity vector is essentially
+ * never seen twice. `DawnWebGPUCache` held 17 MB / 54 entries against a 1 GB
+ * cap while one boot created 167 pipelines / 6.2 MB of WGSL — the cache was
+ * not evicting, it was never FILLING.
+ *
+ * The existing per-cascade `quantum` (1024 >> cascade) was aimed at a
+ * different target — "a +3 % change never costs a rebuild" — and it is far too
+ * fine to make a capacity REPEAT: at cascade 0 it admits ~90 distinct values
+ * between 80 k and 93 k blocks, and four separate exits in
+ * `blockVectorFromPeaks` bypass it anyway (the `floorBudget` floor, the
+ * carried-forward `current`, the slot cap, and the device-ceiling rescale).
+ *
+ * So capacities snap to a GEOMETRIC ladder: four rungs per octave, i.e. at
+ * most a 25 % overshoot, and only a handful of reachable values per scene.
+ * Two demands that differ by 4 % now land on the SAME rung and therefore
+ * generate the SAME WGSL — 89 088 and 92 672 blocks both become 98 304. After
+ * two or three boots a scene's whole ladder is in the disk cache and every
+ * boot hits it.
+ *
+ * The 25 % is bought knowingly: it is bin memory, bounded per cascade, still
+ * clamped by `slots[c]` and by the device ceiling below. A pool grow costs a
+ * cold field plus a recompile of ~70 kernels, so a coarser ladder ALSO means
+ * fewer grows — the memory buys back the thing it costs.
+ *
+ * ⚠ Pools at or below one fine quantum are returned untouched, so gates and
+ * fixtures that run tiny pools (`MIN_BLOCKS` = 64) keep the sizes they assert.
+ */
+export const BLOCK_RUNGS_PER_OCTAVE = 4;
+
+/**
+ * Snap one cascade's block capacity to the nearest ladder rung.
+ *
+ * Idempotent — a value already on the ladder is returned unchanged, which is
+ * what lets a restored pool and a freshly grown one produce the same text.
+ *
+ * @param {number} blocks
+ * @param {number} [cascade]  selects the fine quantum (1024 >> cascade).
+ * @param {{down?: boolean}} [options]  `down` floors to the rung instead of
+ *   ceiling to it — for the device-ceiling rescale, which must never round UP
+ *   past the limit it is enforcing.
+ */
+export function snapBlockCapacity(blocks, cascade = 0, { down = false } = {}) {
+  const v = Math.floor(Number(blocks) || 0);
+  const fine = Math.max(16, 1024 >> cascade);
+  // ⚠ THE THRESHOLD IS FOUR QUANTA, NOT ONE. Below that the granule IS the
+  // fine quantum and the quantum is a large fraction of the value, so the
+  // "at most one rung" bound this ladder promises would not hold: at cascade
+  // 0 a pool of 1 025 blocks would snap to 2 048, a 100 % overshoot. Small
+  // pools are also where the gates and fixtures live (`MIN_BLOCKS` = 64), and
+  // they must keep the sizes they assert. Above the threshold the granule is
+  // always ≥ a quarter of the value's octave, which is what makes the bound
+  // true.
+  if (!(v > fine * BLOCK_RUNGS_PER_OCTAVE)) return Math.max(0, v);
+  const octave = 2 ** Math.floor(Math.log2(v));
+  const granule = Math.max(fine, octave / BLOCK_RUNGS_PER_OCTAVE);
+  // `granule < v` always holds here (octave ≤ v and fine < v), so the floor
+  // branch can never return zero.
+  return (down ? Math.floor(v / granule) : Math.ceil(v / granule)) * granule;
+}
+
 export function blockVectorFromPeaks({
   peaks,
   current = null,
@@ -1466,17 +1543,68 @@ export function blockVectorFromPeaks({
     // now only marks the cascade as one that must not fall below its peak.
     const floorAsk = pressed?.[c] && peak > 0 ? Math.ceil(peak / quantum) * quantum : 0;
     const grown = peak > 0 ? Math.max(Math.ceil((peak * h) / quantum) * quantum, floorAsk) : 0;
-    want[c] = Math.min(slots[c], Math.max(MIN_BLOCKS, floor[c], cur, grown));
+    // ⭐ SNAP LAST, after every other input has had its say. `quantum` above
+    // only shapes `grown`; the floor, the carried-forward `current` and the
+    // slot cap all bypass it, and an off-ladder value from ANY of them is a
+    // fresh set of WGSL literals and a cold compile of ~70 kernels. See
+    // `snapBlockCapacity`. `slots[c]` is a power of two, so clamping to it
+    // lands on the ladder too.
+    const asked = Math.max(MIN_BLOCKS, floor[c], cur, grown);
+    want[c] = Math.min(slots[c], snapBlockCapacity(asked, c));
   }
   const bins = (v) => v.reduce((s, b, c) => s + b * binCount(c, w0), 0);
   const total = bins(want);
   if (total > binCeiling) {
+    // ══ AT THE CEILING, HOLD — §10.8's DEAD END, REACHED FROM THE OTHER SIDE ══
+    //
+    // This function's header warns against "re-splitting a FIXED total by a
+    // parked SNAPSHOT of demand — which moves budget away from cascade 0". The
+    // unclamped path avoids it by sizing each cascade from its own peak and
+    // letting the total be their sum. The rescale below is the same forbidden
+    // operation: a fixed total, re-split by demand.
+    //
+    // It runs away, because a ceiling-clamped pool can never satisfy anybody:
+    // `noBlock` stays high every frame, so `peaks` (a running max of
+    // `live + noBlock`, persisted across sessions) climbs WITHOUT BOUND, and
+    // every climb re-splits the same fixed ceiling by a different ratio.
+    // Simulated from the user's own live numbers (2026-09-12), four sessions of
+    // +50 % peak against a 16 M-bin ceiling:
+    //
+    //     65536/28672/10240/1792 → 49152/24576/10240/2048
+    //                            → 40960/20480/10240/2560
+    //                            → 32768/16384/ 8192/3584
+    //
+    // Cascade 0 — the lattice the screen actually reads — is HALVED, while
+    // cascade 3 (2048 bins per block against c0's 32) doubles on demand nobody
+    // can see. And every one of those steps is a different set of baked WGSL
+    // literals: a cold compile of ~70 kernels and a field that re-converges
+    // from black, for a pool that did not get bigger.
+    //
+    // So once we already hold a vector that FITS, keep it. At the ceiling there
+    // is no growth to be had, and stability is worth more than a re-split that
+    // the header already argues is the wrong shape. A genuinely smaller ceiling
+    // (a different device, a smaller binding) fails the `bins(held)` test and
+    // rescales normally; a shrunken `slots` vector fails the per-cascade test.
+    const held = Array.isArray(current) && current.length === n
+      ? current.map((b) => Math.floor(Number(b) || 0))
+      : null;
+    if (
+      held
+      && held.every((b, c) => Number.isFinite(b) && b >= MIN_BLOCKS && b <= slots[c])
+      && bins(held) <= binCeiling
+    ) {
+      return { blocks: held, bins: bins(held), clamped: true };
+    }
     // Over the device: scale every cascade by the same factor rather than
     // starving one of them — the equal-bins-per-cascade shape (§12.13.4) is
     // the one measurement about this hierarchy that holds at every pose.
     const k = binCeiling / total;
     for (let c = 0; c < n; c++) {
-      want[c] = Math.max(MIN_BLOCKS, Math.min(slots[c], Math.floor(want[c] * k)));
+      // ⛔ DOWN, not up: this branch exists to get under a hard device limit,
+      // so the rung has to be the one BELOW the rescaled value. Rounding up
+      // here would re-cross the ceiling the rescale just enforced.
+      const scaled = snapBlockCapacity(Math.floor(want[c] * k), c, { down: true });
+      want[c] = Math.max(MIN_BLOCKS, Math.min(slots[c], scaled));
     }
   }
   return { blocks: want, bins: bins(want), clamped: total > binCeiling };

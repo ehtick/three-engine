@@ -626,7 +626,7 @@ export function applyMaterialDef(entry, def) {
 
 /** Returns the shared material for a .mat path, loading its def on first use. */
 
-export async function loadMaterialAsset(path) {
+export async function loadMaterialAsset(path, { strict = false } = {}) {
   const key = assetKey(path);
   let entry = cache.get(key);
   if (!entry) {
@@ -645,6 +645,7 @@ export async function loadMaterialAsset(path) {
         const def = JSON.parse(new TextDecoder().decode(bytes));
         applyMaterialDef(entry, { ...MATERIAL_DEFAULTS, ...def });
       } catch (err) {
+        entry.loadError = err;
         console.error(`Failed to load material "${path}": ${err.message}`);
       }
     })();
@@ -655,6 +656,7 @@ export async function loadMaterialAsset(path) {
   // material immediately made most MeshComponents report ready while the one
   // cache owner was still applying the real definition and textures.
   await entry.promise;
+  if (strict && entry.loadError) throw entry.loadError;
 
   return entry.material;
 
@@ -749,7 +751,7 @@ export function getMaterialDef(path) {
 
 export function updateMaterialAsset(path, def) {
   const entry = cache.get(assetKey(path));
-  if (entry) applyMaterialDef(entry, def);
+  if (entry) { applyMaterialDef(entry, def); entry.loadError = null; }
 
 }
 
@@ -833,6 +835,7 @@ export async function reloadMaterialAsset(path) {
   if (!(bytes instanceof ArrayBuffer) && !ArrayBuffer.isView(bytes)) throw new Error(`Material request failed: "${path}"`);
   const def = JSON.parse(new TextDecoder().decode(bytes));
   applyMaterialDef(entry, { ...MATERIAL_DEFAULTS, ...def });
+  entry.loadError = null;
   return true;
 }
 

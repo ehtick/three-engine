@@ -68,6 +68,23 @@ export function installShadowNodeGuard() {
     if (this.shadowMap === null || this.shadowMap === undefined) return;
     return original.call(this, frame);
   };
+  const setupShadow = proto.setupShadow;
+  proto.setupShadow = function (builder) {
+    const output = setupShadow.call(this, builder);
+    // A deferred receiver build can sample the new depth texture before its
+    // first shadow render. Three allocates it at version 0, then initializes
+    // the render target on that first render and replaces the GPU texture at
+    // version 2. Its shared NodeMaterialObserver can skip unchanged receivers,
+    // leaving their bindings pointed at the destroyed version-0 allocation.
+    // Establish the native target's dimensions/samples before any receiver
+    // binds it. This allocates the same attachments once; it performs no draw,
+    // does not compile a pipeline, and leaves shadow update flags untouched.
+    if (globalThis.__shadowTargetInitialization !== false && builder.renderer?.backend?.isWebGPUBackend) {
+      const textures = builder.renderer._textures;
+      if (this.shadowMap && textures?.updateRenderTarget) textures.updateRenderTarget(this.shadowMap);
+    }
+    return output;
+  };
   proto.__engineShadowMapGuard = true;
   return true;
 }

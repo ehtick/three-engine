@@ -27,6 +27,7 @@ import { waterModule } from "./water/index.js";
 import { particlesModule } from "./particles/index.js";
 import { foliageModule } from "./foliage/index.js";
 import { atmosphereModule } from "./atmosphere/index.js";
+import { worldModule } from "./world/index.js";
 /**
  * Built-in module catalog. Importing this file registers every definition;
  * nothing runs until a host enables a module on an engine (editor: Modules
@@ -39,6 +40,7 @@ registerModuleDefinition(physicsRapierModule);
 registerModuleDefinition(dracoModule);
 registerModuleDefinition(basisModule);
 registerModuleDefinition(terrainModule);
+registerModuleDefinition(worldModule);
 registerModuleDefinition(virtualGeometryModule);
 registerModuleDefinition(postprocessingModule);
 registerModuleDefinition(polyhavenModule);
@@ -64,6 +66,6 @@ registerModuleDefinition(foliageModule);
 registerModuleDefinition(atmosphereModule);
 
 export { vfxModule, clothModule, waterModule, particlesModule, foliageModule, atmosphereModule };
-export { architectureModule };
+export { architectureModule, worldModule };
 
 export { physicsRapierModule, dracoModule, basisModule, terrainModule, virtualGeometryModule, postprocessingModule, polyhavenModule, ambientcgModule, sketchfabModule, polypizzaModule, kaykitModule, fabModule, itchioModule, giModule, navigationModule, textureEditorModule, audioLibraryModule, audioEditorModule, levelDesignModule, characterControllerModule, kimodoModule };

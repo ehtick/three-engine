@@ -5933,6 +5933,82 @@ input[type="checkbox"]:checked::after {
   font-variant-numeric: tabular-nums;
 }
 
+/* Console search — same compact pill as the hierarchy search: fill-1 surface,
+ * icon on the left, X to clear on the right. */
+.console-search {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+  align-self: stretch;
+  height: 25px;
+  padding: 0 6px 0 8px;
+  background: var(--fill-1);
+  border-radius: var(--r-input);
+  color: var(--text-dim);
+  box-sizing: border-box;
+}
+
+.console-search:focus-within {
+  background: var(--bg-2);
+  color: var(--text);
+}
+
+.console-search-icon {
+  flex-shrink: 0;
+  opacity: 0.75;
+}
+
+.console-search-input {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+/* Same reasoning as .hierarchy-search-input: the filled surface is the focus
+ * indicator, the chrome outline reads as a notification. */
+.console-search-input:focus-visible {
+  outline: none;
+}
+
+.console-search-input::placeholder {
+  color: var(--text-dim);
+}
+
+.console-search-clear {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.console-search-clear:hover {
+  background: var(--fill-2);
+  color: var(--text);
+}
+
+.console-empty {
+  padding: 8px 12px;
+  color: var(--text-dim);
+}
+
 /* ---- Modules panel ---- */
 /* Unity / Blender-style package manager: a narrow rail of module names on
  * the left with their enabled state, a wide detail pane on the right.

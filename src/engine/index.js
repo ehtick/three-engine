@@ -104,9 +104,13 @@ export {
   registerModuleDefinition,
   getModuleDefinition,
   getModuleDefinitions,
+  resolveModuleDependencies,
+  getExplicitEngineModules,
+  getEngineModuleDependents,
   enableEngineModule,
   disableEngineModule,
   applyEngineModules,
+  disposeEngineModules,
 } from "./modules.js";
 export { AudioSystem } from "./audio/AudioSystem.js";
 export {

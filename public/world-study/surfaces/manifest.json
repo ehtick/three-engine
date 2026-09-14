@@ -1,0 +1,214 @@
+{
+  "schemaVersion": 1,
+  "provider": "Poly Haven",
+  "providerURL": "https://polyhaven.com",
+  "acquisition": "Original files downloaded from the official public API and asset CDN; no image editing or conversion.",
+  "downloadedAt": "2026-09-12T11:56:34.834Z",
+  "license": "CC0-1.0",
+  "licenseURL": "https://creativecommons.org/publicdomain/zero/1.0/",
+  "licenseVerificationURL": "https://polyhaven.com/license",
+  "metadataAPI": "https://api.polyhaven.com",
+  "apiDocumentationURL": "https://github.com/Poly-Haven/Public-API/blob/master/swagger.yml",
+  "attribution": "Surface assets by the credited artists, via Poly Haven. Powered by Poly Haven.",
+  "purpose": "Optional realistic surface detail for the procedural World study; terrain shape and placement remain procedural.",
+  "providerQualityReferences": {
+    "seamlessPBRLibrary": "https://polyhaven.com/",
+    "diffuseIsAlbedo": "https://docs.polyhaven.com/en/faq",
+    "calibrationAndSeamlessnessRequirements": "https://blog.polyhaven.com/texture-contracts/"
+  },
+  "selectionNote": "Original diffuse maps were visually inspected for broadly even illumination. Poly Haven describes its texture library as seamless PBR and its diffuse maps as albedo with lighting removed. Individual color-calibration measurements were not supplied in the asset metadata.",
+  "sampling": {
+    "wrapU": "repeat",
+    "wrapV": "repeat",
+    "albedo": "Decode sRGB to linear for lighting; do not multiply an AO image into these original colors.",
+    "height": "Read as linear scalar data, without sRGB decoding. Supplied file bit depth is recorded per map; decoder/upload precision is the integration's responsibility."
+  },
+  "byteBudget": 12000000,
+  "totalTextureBytes": 6716074,
+  "assets": [
+    {
+      "id": "leafy_grass",
+      "role": "grass",
+      "name": "Leafy Grass",
+      "sourceURL": "https://polyhaven.com/a/leafy_grass",
+      "metadataURL": "https://api.polyhaven.com/info/leafy_grass",
+      "filesURL": "https://api.polyhaven.com/files/leafy_grass",
+      "authors": {
+        "Charlotte Baglioni": "All"
+      },
+      "license": "CC0-1.0",
+      "licenseURL": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "physicalDimensions": {
+        "source": "Poly Haven info.dimensions; documented in the public API schema as millimeters.",
+        "millimeters": [
+          2000,
+          2000
+        ],
+        "meters": [
+          2,
+          2
+        ]
+      },
+      "displacementAmplitudeMeters": null,
+      "displacementNote": "Source metadata does not specify a calibrated displacement amplitude or neutral height. Height is a linear data map; runtime bump/displacement scale remains an artistic parameter.",
+      "sourceLegacyScale": null,
+      "maps": {
+        "albedo": {
+          "file": "leafy_grass_diff_1k.jpg",
+          "publicURL": "/world-study/surfaces/leafy_grass_diff_1k.jpg",
+          "sourceMap": "Diffuse",
+          "sourceURL": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/leafy_grass/leafy_grass_diff_1k.jpg",
+          "resolution": "1k",
+          "width": 1024,
+          "height": 1024,
+          "format": "jpg",
+          "bitDepth": 8,
+          "bytes": 1195394,
+          "md5": "0dbc071e91d6905edfcfbe8eb785a1ab",
+          "sha256": "cfa40bc9d9417d1852db8753a8d5917f110c40101179f63543c382e39bc05e4a",
+          "colorSpace": "sRGB",
+          "threeColorSpace": "SRGBColorSpace"
+        },
+        "height": {
+          "file": "leafy_grass_disp_1k.png",
+          "publicURL": "/world-study/surfaces/leafy_grass_disp_1k.png",
+          "sourceMap": "Displacement",
+          "sourceURL": "https://dl.polyhaven.org/file/ph-assets/Textures/png/1k/leafy_grass/leafy_grass_disp_1k.png",
+          "resolution": "1k",
+          "width": 1024,
+          "height": 1024,
+          "format": "png",
+          "bitDepth": 16,
+          "bytes": 1896460,
+          "md5": "9c38b0ae5af703060e010f96f03a5e3d",
+          "sha256": "6e77cbd0c745bf02700dc235ac107083be788c23ac1d8a9d86e56863eecbc537",
+          "colorSpace": "linear data (no color transfer)",
+          "threeColorSpace": "NoColorSpace"
+        }
+      }
+    },
+    {
+      "id": "brown_mud_02",
+      "role": "soil",
+      "name": "Brown Mud 02",
+      "sourceURL": "https://polyhaven.com/a/brown_mud_02",
+      "metadataURL": "https://api.polyhaven.com/info/brown_mud_02",
+      "filesURL": "https://api.polyhaven.com/files/brown_mud_02",
+      "authors": {
+        "Rob Tuytel": "All"
+      },
+      "license": "CC0-1.0",
+      "licenseURL": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "physicalDimensions": {
+        "source": "Poly Haven info.dimensions; documented in the public API schema as millimeters.",
+        "millimeters": [
+          1299.996018409729,
+          1299.996018409729
+        ],
+        "meters": [
+          1.299996018409729,
+          1.299996018409729
+        ]
+      },
+      "displacementAmplitudeMeters": null,
+      "displacementNote": "Source metadata does not specify a calibrated displacement amplitude or neutral height. Height is a linear data map; runtime bump/displacement scale remains an artistic parameter.",
+      "sourceLegacyScale": "1,2",
+      "maps": {
+        "albedo": {
+          "file": "brown_mud_02_diff_1k.jpg",
+          "publicURL": "/world-study/surfaces/brown_mud_02_diff_1k.jpg",
+          "sourceMap": "Diffuse",
+          "sourceURL": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/brown_mud_02/brown_mud_02_diff_1k.jpg",
+          "resolution": "1k",
+          "width": 1024,
+          "height": 1024,
+          "format": "jpg",
+          "bitDepth": 8,
+          "bytes": 527741,
+          "md5": "c3842f023e11a08c8cf521c947ce08c8",
+          "sha256": "058b6f12493305ec6b47cb5ea77f013c9e7e58216b34af3700a3d3d7d821732d",
+          "colorSpace": "sRGB",
+          "threeColorSpace": "SRGBColorSpace"
+        },
+        "height": {
+          "file": "brown_mud_02_disp_1k.png",
+          "publicURL": "/world-study/surfaces/brown_mud_02_disp_1k.png",
+          "sourceMap": "Displacement",
+          "sourceURL": "https://dl.polyhaven.org/file/ph-assets/Textures/png/1k/brown_mud_02/brown_mud_02_disp_1k.png",
+          "resolution": "1k",
+          "width": 1024,
+          "height": 1024,
+          "format": "png",
+          "bitDepth": 8,
+          "bytes": 576580,
+          "md5": "fdec96574f0d5986320e99d0d63e592c",
+          "sha256": "01e010e2d230f93ab4686b52d588bb74837f4e97d5dfae49f910225bfe57d7bb",
+          "colorSpace": "linear data (no color transfer)",
+          "threeColorSpace": "NoColorSpace"
+        }
+      }
+    },
+    {
+      "id": "rock_face_03",
+      "role": "rock",
+      "name": "Rock Face 03",
+      "sourceURL": "https://polyhaven.com/a/rock_face_03",
+      "metadataURL": "https://api.polyhaven.com/info/rock_face_03",
+      "filesURL": "https://api.polyhaven.com/files/rock_face_03",
+      "authors": {
+        "Dario Barresi": "Photography",
+        "Rico Cilliers": "Processing"
+      },
+      "license": "CC0-1.0",
+      "licenseURL": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "physicalDimensions": {
+        "source": "Poly Haven info.dimensions; documented in the public API schema as millimeters.",
+        "millimeters": [
+          2699.9995708465576,
+          2699.9995708465576
+        ],
+        "meters": [
+          2.6999995708465576,
+          2.6999995708465576
+        ]
+      },
+      "displacementAmplitudeMeters": null,
+      "displacementNote": "Source metadata does not specify a calibrated displacement amplitude or neutral height. Height is a linear data map; runtime bump/displacement scale remains an artistic parameter.",
+      "sourceLegacyScale": null,
+      "maps": {
+        "albedo": {
+          "file": "rock_face_03_diff_1k.jpg",
+          "publicURL": "/world-study/surfaces/rock_face_03_diff_1k.jpg",
+          "sourceMap": "Diffuse",
+          "sourceURL": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/rock_face_03/rock_face_03_diff_1k.jpg",
+          "resolution": "1k",
+          "width": 1024,
+          "height": 1024,
+          "format": "jpg",
+          "bitDepth": 8,
+          "bytes": 927082,
+          "md5": "e4c34abb1aad5befe12754fad507147a",
+          "sha256": "ea48e0e47ad42c8bd312476178b1248ec66f0eb19156a26a1c222f2a40caaf2d",
+          "colorSpace": "sRGB",
+          "threeColorSpace": "SRGBColorSpace"
+        },
+        "height": {
+          "file": "rock_face_03_disp_1k.png",
+          "publicURL": "/world-study/surfaces/rock_face_03_disp_1k.png",
+          "sourceMap": "Displacement",
+          "sourceURL": "https://dl.polyhaven.org/file/ph-assets/Textures/png/1k/rock_face_03/rock_face_03_disp_1k.png",
+          "resolution": "1k",
+          "width": 1024,
+          "height": 1024,
+          "format": "png",
+          "bitDepth": 16,
+          "bytes": 1592817,
+          "md5": "5eb2e547a36e322462da3fba4c6125bb",
+          "sha256": "db8c173dd33a21d6eaa1c16f1f369bde045260a10c0576016d08a3f89f97bbd6",
+          "colorSpace": "linear data (no color transfer)",
+          "threeColorSpace": "NoColorSpace"
+        }
+      }
+    }
+  ]
+}

@@ -213,6 +213,27 @@ test("production LightComponent invalidates frozen cascades on the FIRST camera 
   assert.equal(f.freeze.frozenLights, 4, "the map must freeze again after motion stops");
 });
 
+// 09-14 "why does our grass no longer cast shadows — it got super flat": the
+// cascades share a slab of maxFar + both margins, and three applies bias in
+// normalized depth, so the raw bias grew with that slab until it swallowed
+// every shadow shorter than itself. Grass blades are 18 cm.
+test("cascade bias keeps grass-height contact shadows in a deep CSM slab", () => {
+  const f = componentFixture();
+  for (let i = 0; i < 4; i++) { f.beforeRender(); f.render(); }
+  const authored = f.csm.light.shadow.bias;
+  const near = f.csm.lights[0].shadow;
+  const depth = near.camera.far - near.camera.near;
+  assert.ok(Math.abs(authored) * depth > 0.18,
+    `negative control: the raw bias over this ${depth} m slab (${Math.abs(authored) * depth} m) would hide grass`);
+  const worldBias = -near.bias * depth;
+  assert.ok(worldBias > 0 && worldBias < 0.18, `nearest cascade world bias ${worldBias} m`);
+  for (const light of f.csm.lights) {
+    const s = light.shadow;
+    const texel = (s.camera.right - s.camera.left) / s.mapSize.width;
+    assert.ok(-s.bias * (s.camera.far - s.camera.near) >= texel * 1.5 - 1e-9, "never below the acne floor");
+  }
+});
+
 test("the old bounds-only preRender leaves every cascade frozen on the first rotation frame", () => {
   const f = componentFixture();
   // Execute the former division of work: the component updates only frustums,

@@ -1,6 +1,6 @@
 import * as THREE from "three/webgpu";
 import {
-  Fn, diffuseColor, dot, float, materialMetalness, materialRoughness, max, mix, normalWorld, positionWorld,
+  Fn, If, diffuseColor, dot, float, materialMetalness, materialRoughness, max, mix, normalWorld, positionWorld,
   smoothstep, texture, uniform, vec3, vec4,
 } from "three/tsl";
 import { freeze } from "../../engine/freezeLedger.js";
@@ -107,36 +107,63 @@ const puddleCoverage = /*@__PURE__*/ Fn(([u]) => {
   return u.wetness.mul(smoothstep(0.82, 0.96, up)).mul(smoothstep(0.38, 0.6, patchNoise(u.patchScale.mul(0.6))).oneMinus()).clamp(0, 1);
 });
 
+/** Uniform control flow skips noise and roof reads when the surface is dry.
+ * Keep the graph installed so even the first wet/snow frame needs no rebuild.
+ * Test exactly zero: small positive amounts must retain the original easing,
+ * and the legacy path remains available for same-camera GPU comparisons.
+ */
+function withSurfaceWeather(base, u, weathered) {
+  if (globalThis.__atmosphereDrySurfaceBranch === false) return weathered();
+  // Weather albedo is built before native lighting. Its first normalWorld
+  // read can therefore initialize the shared normal/tangent frame; letting
+  // that happen inside the branch leaves native lighting with zero normals
+  // when dry. Explicitly retain the material's normal evaluation outside it.
+  normalWorld.toStack();
+  const result = base.toVar();
+  // Both operands are uniforms, so implicit-derivative texture samples in the
+  // body remain under uniform control flow on WebGPU.
+  If(u.snow.notEqual(0).or(u.wetness.notEqual(0)), () => {
+    result.assign(weathered());
+  });
+  return result;
+}
+
 /**
  * Albedo. Wet first — water darkens a porous surface because light that enters
  * the film is much more likely to come back out having been absorbed — then
  * snow over the top of it.
  */
 export const weatherAlbedo = /*@__PURE__*/ Fn(([albedo, u]) => {
-  const wet = wetCoverage(u);
-  const puddle = puddleCoverage(u);
-  const darkened = albedo.mul(mix(float(1), float(0.45), max(wet.mul(0.9), puddle)));
-  return mix(darkened, u.snowColor, snowCoverage(u));
+  return withSurfaceWeather(albedo, u, () => {
+    const wet = wetCoverage(u);
+    const puddle = puddleCoverage(u);
+    const darkened = albedo.mul(mix(float(1), float(0.45), max(wet.mul(0.9), puddle)));
+    return mix(darkened, u.snowColor, snowCoverage(u));
+  });
 });
 
 /** Roughness. Water fills the microsurface; snow is rough but not matte. */
 export const weatherRoughness = /*@__PURE__*/ Fn(([roughnessNode, u]) => {
-  const wet = wetCoverage(u);
-  const puddle = puddleCoverage(u);
-  // ⚠ WET IS NOT A MIRROR. The first cut took roughness to 0.04 everywhere the
-  // rain fell, and a flat plane under a bright sky then returned a near-perfect
-  // reflection of it: the "wet" ground came out BRIGHTER than the dry one
-  // (measured 106.3 vs 104.1), which is the opposite of the look. Real wet
-  // ground is a darker albedo with a TIGHTER, not total, specular; only
-  // standing water is a mirror, and that is what `puddle` is for.
-  const wetRoughness = mix(roughnessNode, roughnessNode.mul(0.35).add(0.12), wet);
-  const pooled = mix(wetRoughness, float(0.03), puddle);
-  return mix(pooled, float(0.78), snowCoverage(u)).clamp(0.02, 1);
+  // Preserve the original final clamp even on a zero-roughness dry material.
+  return withSurfaceWeather(roughnessNode.clamp(0.02, 1), u, () => {
+    const wet = wetCoverage(u);
+    const puddle = puddleCoverage(u);
+    // ⚠ WET IS NOT A MIRROR. The first cut took roughness to 0.04 everywhere the
+    // rain fell, and a flat plane under a bright sky then returned a near-perfect
+    // reflection of it: the "wet" ground came out BRIGHTER than the dry one
+    // (measured 106.3 vs 104.1), which is the opposite of the look. Real wet
+    // ground is a darker albedo with a TIGHTER, not total, specular; only
+    // standing water is a mirror, and that is what `puddle` is for.
+    const wetRoughness = mix(roughnessNode, roughnessNode.mul(0.35).add(0.12), wet);
+    const pooled = mix(wetRoughness, float(0.03), puddle);
+    return mix(pooled, float(0.78), snowCoverage(u)).clamp(0.02, 1);
+  });
 });
 
 /** Metalness. Snow is a dielectric, so it hides whatever was underneath. */
 export const weatherMetalness = /*@__PURE__*/ Fn(([metalnessNode, u]) => {
-  return metalnessNode.mul(float(1).sub(snowCoverage(u).mul(0.95)));
+  return withSurfaceWeather(metalnessNode, u,
+    () => metalnessNode.mul(float(1).sub(snowCoverage(u).mul(0.95))));
 });
 
 /** Whether this material can carry weather at all. */

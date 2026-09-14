@@ -1,5 +1,6 @@
 import * as THREE from "three/webgpu";
 import { Fn, If, abs, attribute, buffer, cos, float, fract, instanceIndex, instancedBufferAttribute, instancedDynamicBufferAttribute, mat4, max, min, normalLocal, positionGeometry, positionLocal, sin, sqrt, texture, uv, vec2, vec3, vec4 } from "three/tsl";
+import { installFoliageLeafLighting } from "./foliageLighting.js";
 
 // Two scrolling noise scales are the shared field described by Sucker Punch:
 // https://blog.playstation.com/?p=345372. Circular grass arcs preserve length;
@@ -124,22 +125,69 @@ export function createFoliageMatrixSync(source, bufferAttributes) {
   };
 }
 
+// ⭐⭐ ONE READ PER MESH, NOT ONE PER CALL SITE (09-13 fix) — `foliageAnimatedPosition`
+// (the tree/meadow motion) and `foliageFadeNode` (the P1-B LOD crossfade,
+// `foliageMaterial.js`) each need the instance's full 4x4 matrix and each used to
+// call this function independently. Every call below the UBO threshold mints FOUR
+// FRESH `instancedBufferAttribute` node objects (`[0,4,8,12].map(bufferFn...)`) —
+// three's `NodeBuilder.getBufferAttributeFromNode` dedupes buffer-attribute nodes
+// by NODE IDENTITY (`getDataFromNode(node, 'vertex')`), never by the underlying
+// buffer+offset they read, so two independently-constructed mat4 reads of the
+// EXACT SAME interleaved mirror still cost eight vertex-input locations instead of
+// four. That extra, unshared read is exactly what pushed a large "living surface"
+// chunk past WebGPU's sixteen-attribute ceiling once the LOD crossfade added its
+// own second call site.
+//
+// ⚠ CANNOT key the cache on the `builder` PARAMETER: each nested `Fn(...)()` call
+// site gets its OWN fresh `secureNodeBuilder` Proxy wrapping the one real
+// NodeBuilder for this compile (see three's `ShaderNode.call`), so `builder` is a
+// DIFFERENT object at each call site even within one build — a `WeakMap` keyed on
+// it would never hit. `builder.object` (the mesh) IS the same value through every
+// proxy (`Reflect.get` forwards to the same target), so key on that instead —
+// guarded by `source` identity so a mesh that later gets handed a NEW
+// `instanceMatrix` (chunk repartition) invalidates the old node rather than
+// silently reading stale data forever.
+//
+// This intentionally also lets the SAME node survive across passes (colour,
+// shadow, GI prepass) for one mesh — safe, because `getDataFromNode`'s own
+// dedup lives on each pass's real builder instance, not on the node, so every
+// pass still registers its own `@location` from this shared node exactly as it
+// would from a freshly-minted one. The one thing that must NOT be skipped on a
+// cache hit is the per-pass mirror-sync registration below: each pass's own
+// `builder.bufferAttributes` list needs its OWN `OnBeforeObjectUpdate` hook or
+// that pass's copy of the interleaved mirror goes stale (frozen shadow-pass
+// instances) — so that registration always runs, independent of node caching.
+const matrixNodeByObject = new WeakMap();
+
 export function foliageInstanceMatrix(builder) {
-  const source = builder.object?.instanceMatrix;
+  const object = builder.object;
+  const source = object?.instanceMatrix;
   if (!source) return mat4(1);
   const count = Math.max(1, source.count);
-  if (count * 64 <= builder.getUniformBufferLimit()) return buffer(source.array, "mat4", count).element(instanceIndex);
-  let interleaved = matrixAttributes.get(source);
-  if (!interleaved) {
-    interleaved = new THREE.InstancedInterleavedBuffer(source.array, 16, 1);
-    matrixAttributes.set(source, interleaved);
+  const needsAttribute = count * 64 > builder.getUniformBufferLimit();
+  if (needsAttribute) {
+    // Update BOTH Three's position matrix and our root matrix before upload.
+    // Matching only their late OnFrameUpdate would leave both static GPU buffers
+    // one frame behind after LOD compaction. No renderer-wide patch is needed.
+    // Always registered, even on a cached-node hit — see the file comment above.
+    THREE.TSL.OnBeforeObjectUpdate(createFoliageMatrixSync(source, builder.bufferAttributes));
   }
-  // Update BOTH Three's position matrix and our root matrix before upload.
-  // Matching only their late OnFrameUpdate would leave both static GPU buffers
-  // one frame behind after LOD compaction. No renderer-wide patch is needed.
-  THREE.TSL.OnBeforeObjectUpdate(createFoliageMatrixSync(source, builder.bufferAttributes));
-  const bufferFn = source.usage === THREE.DynamicDrawUsage ? instancedDynamicBufferAttribute : instancedBufferAttribute;
-  return mat4(...[0, 4, 8, 12].map(offset => bufferFn(interleaved, "vec4", 16, offset)));
+  const cached = matrixNodeByObject.get(object);
+  if (cached && cached.source === source) return cached.node;
+  let node;
+  if (needsAttribute) {
+    let interleaved = matrixAttributes.get(source);
+    if (!interleaved) {
+      interleaved = new THREE.InstancedInterleavedBuffer(source.array, 16, 1);
+      matrixAttributes.set(source, interleaved);
+    }
+    const bufferFn = source.usage === THREE.DynamicDrawUsage ? instancedDynamicBufferAttribute : instancedBufferAttribute;
+    node = mat4(...[0, 4, 8, 12].map(offset => bufferFn(interleaved, "vec4", 16, offset)));
+  } else {
+    node = buffer(source.array, "mat4", count).element(instanceIndex);
+  }
+  matrixNodeByObject.set(object, { source, node });
+  return node;
 }
 
 /** Shared mathematical core used by the actual vertex shader and GPU checks. */
@@ -290,20 +338,35 @@ export function foliageAnimatedPosition(uniforms, props) {
 
 /** Animate the atlas quad without moving its lower edge or changing its bake. */
 export function setupFoliageImpostorMaterial(material, uniforms, props = {}) {
-  const original = material.positionNode;
-  material.positionNode = Fn(() => {
-    const p = original.toVar();
+  const isMeadow = props.species === "grass" || props.species === "wildflowers";
+  const sway = source => Fn(() => {
+    const p = source.toVar();
     const center = attribute("aCenter", "vec3");
     const size = attribute("aSize", "float");
     const weight = positionGeometry.y.add(.5).clamp(0, 1);
     const field = foliageWindSample(uniforms, center);
-    const isMeadow = props.species === "grass" || props.species === "wildflowers";
     const force = (isMeadow ? field.x : field.z).add(field.y.mul(.05)).mul(uniforms.strength);
     const amount = softLimit(force, isMeadow ? 1.35 : .10).mul(weight.mul(weight));
     return p.add(uniforms.direction.mul(amount).mul(isMeadow ? size.mul(.2) : size));
   })();
-  // Three's shadow override also needs the impostor's authored coverage.
-  if (material.opacityNode) material.maskShadowNode = material.opacityNode.greaterThan(material.alphaTest || .35);
+  material.positionNode = sway(material.positionNode);
+  // The shadow caster sways with the picture (and keeps the impostor's
+  // push away from the light — `impostorMaterial.js#castShadowPositionNode`).
+  if (material.castShadowPositionNode) material.castShadowPositionNode = sway(material.castShadowPositionNode);
+  // Trees get the same canopy light as the tree they replace, or the handoff
+  // is a brightness pop (`foliageLighting.js`). Never grass: any view term
+  // made the sward flip pale/black by camera angle (09-13).
+  if (!isMeadow) installFoliageLeafLighting(material, float(1));
+  // Three's shadow override also needs the impostor's authored coverage — but
+  // a material that arrived with its OWN maskShadowNode
+  // (`createImpostorMaterial`'s shadow-biased handoff, which replays the fade
+  // at `userData.foliageShadowLodFar` AND folds in this same coverage) already
+  // says everything this rebuild would, and rebuilding would REPLACE the
+  // shadow handoff with the colour decision. Keep theirs; rebuild only as the
+  // fallback for materials without one.
+  if (material.opacityNode && !material.maskShadowNode) {
+    material.maskShadowNode = material.opacityNode.greaterThan(material.alphaTest || .35);
+  }
   material.needsUpdate = true;
   return material;
 }

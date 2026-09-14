@@ -25,6 +25,7 @@
 /** Document formats the exporter re-emits (with inner paths rewritten) rather
  *  than copies. The value names the collection bucket in `exportGame`. */
 import { isBuiltinMaterial } from "../../engine/builtinMaterials.js";
+import { rewriteWorldDocumentAssets, rewriteTerrainLayerAssets } from "../../engine/world/worldAssetRefs.js";
 
 export const DOCUMENT_KINDS = {
   mat: "material",
@@ -143,6 +144,9 @@ export function rewriteComponentAssets(
     const value = props[field.key];
     if (typeof value === "string" && value) props[field.key] = rewrite(value);
   }
+
+  if (component.type === "world") rewriteWorldDocumentAssets(props.document, rewrite, { getSchema });
+  if (component.type === "terrain") rewriteTerrainLayerAssets(props, rewrite);
 
   if (["particles", "cloth", "water"].includes(component.type)) rewriteVfxGraphAssets(props.graph, rewrite);
   if (component.type === "vfx") {

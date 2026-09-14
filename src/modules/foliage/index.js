@@ -3,7 +3,7 @@ import { FoliageComponent } from "./FoliageComponent.js";
 export const foliageModule = {
   id: "foliage", name: "Foliage", version: "1.0.0", category: "World",
   tags: ["foliage", "trees", "grass", "flowers", "terrain", "world", "3d"],
-  description: "Procedural trees, grass and flowers with surface scattering, wind, collider bending and automatic instanced LOD and impostors.",
+  description: "Procedural trees, grass and flowers with surface scattering, wind, collider bending and automatic instanced LOD and impostors. Grass is drawn as a continuous sward rather than scattered.",
   components: [FoliageComponent],
   setup(engine) {
     engine._foliageModuleEnabled = true;

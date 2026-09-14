@@ -159,7 +159,12 @@ with the serializable contract in `formModel.js`. It clips intersecting exterior
 faces, derives inner skins and aperture reveals, and batches by material. Local
 form caches reuse unchanged surface work. Each composition supports up to 256
 forms, 64 paths and 512 authored apertures; larger worlds use multiple compositions.
-The growth grid is regular. Ornamental libraries, irregular Townscaper topology
+Form roofs are `hip`, `gable`, `flat` or `none`; `roofAxis` (`"x"`/`"z"`, default
+the longer axis) picks the ridge direction and `roofColor` overrides the roof
+material tint, so gabled volumes keep plastered end triangles. `shed` and `dome` (round
+forms) are also available, and `auto` (the Build/Grow default) takes the roof shape and
+pitch from the composition's style, as does `roofHeight: null`. The growth grid is
+regular. Irregular Townscaper topology
 and Tiny Glade's artwork are not included; see [interaction references](ARCHITECTURE_INTERACTIONS.md).
 
 The recipe generator lives in `src/modules/architecture/blueprints.js`. Recipes emit
@@ -169,6 +174,41 @@ pieces per recipe by default); larger worlds can be composed from multiple roots
 Custom outlines accept up to 64 vertices. These generators provide structural
 geometry; detailed ornament and specialist shapes can be added as normal imported
 meshes or edited geometry within an assembly.
+
+## Styles
+
+A composition's `model.style = { id, seed, params }` turns massing into a finished building.
+The catalogue (`src/modules/architecture/styles/catalog.js`) has 15 styles: Tiny Glade,
+Townscaper, Timber Medieval, Stone Cottage, Mediterranean, Frontier, Nordic Log, Castle,
+Gothic, Victorian Brick, Japanese, Desert Adobe, Modern, Futuristic and Industrial. A style
+decides wall construction (thickness, plinth, corners, cladding, timber framing, storey bands,
+crown), roof shape/pitch/overhang/covering, flat-roof edges (parapet, battlements, coping),
+window and door design, supports under raised forms and the cap of free-standing walls.
+`params` tunes a style without forking it: detail, roof pitch, overhang, wall thickness, window
+density, shutters, flower boxes, chimneys, wall/roof/trim colours, plinth and ridge toggles.
+Pick a style from the Build shelf (it restyles the selected composition and becomes the default
+for new ones) or tune it in the Inspector; MCP exposes `architecture.styles` and
+`architecture.setStyle`.
+
+Styled geometry is generated per form by the kit (`src/modules/architecture/kit/`): `wallKit`,
+`openingKit` and `roofKit` draw into `kitMesh`, which writes bevelled boxes, extrusions,
+cylinders and polygons with a per-vertex tint (palette colour × per-piece shade × ground AO) and
+texture-array layer. Roofs are slabs extended past every free eave and verge and mitred at
+ridges and hips, covered by individual tiles clipped to each exposed slope, barrel tiles,
+layered thatch or standing seams. Every decoration is anchored against the neighbouring solids,
+so detail never lands inside another form; openings, supports and wall ends that would meet a
+neighbour are dropped. A styled model uses four materials (surface, glass, metal, light)
+whatever the style mix; textures are luminance-normalised so the palette carries colour. Each
+connected building gets one automatic entrance unless a door is authored. Live gestures build a
+draft (no coverings, cladding or small props) and the full kit lands on release, reusing the
+per-form cache for untouched forms.
+
+`npm run preview:architecture` renders contact sheets of every style across the harness
+scenarios (`scripts/lib/architecturePreviewScenarios.js`) into `artifacts/architecture/preview`
+against a Vite server (default `http://127.0.0.1:5351`; pass `http://localhost:5351` if Vite
+binds IPv6). Look at them before calling a visual change done; `tests/architecture-kit.test.mjs`
+covers catalogue validity, auto roofs, entrances, overhang reach, neighbour intrusion, smooth
+round walls and picking coverage.
 
 ## Compatibility and validation
 

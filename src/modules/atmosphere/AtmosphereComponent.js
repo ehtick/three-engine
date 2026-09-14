@@ -7,11 +7,13 @@ import {
 } from "./weather.js";
 import { celestialLight, fillSkyEquirect, fogColor, measureSky, skyParameters } from "./skyModel.js";
 import { createSkyUniforms, setSkyMap, skyColorNode } from "./skyNode.js";
+import { createHeightFog, updateHeightFog } from "./heightFogNode.js";
 import { createPrecipitation } from "./precipitation.js";
 import { applySurfaceWeather, clearSurfaceWeather, createSurfaceUniforms, refreshSceneMaterials } from "./weatherSurface.js";
 import { cloudOpacityAt } from "./cloudNoise.js";
 import { createCloudShadowUniforms, installCloudShadow, removeCloudShadow } from "./cloudShadow.js";
 import { createSkyOcclusion } from "./skyOcclusion.js";
+import { prepareSkyEnvironment } from "./prepareSkyEnvironment.js";
 
 /**
  * ⭐⭐⭐ ONE COMPONENT FOR THE SKY AND THE WEATHER, BECAUSE THEY ARE ONE THING.
@@ -31,6 +33,8 @@ import { createSkyOcclusion } from "./skyOcclusion.js";
  *                   bins can read on the CPU (`skyModel.js`)
  *   sun / moon    → the scene's directional light, aimed and coloured
  *   fog           → `scene.fog`, coloured from the sky's own horizon
+ *   valley mist   → `scene.fogNode` (`heightFogNode.js`), height fog that
+ *                   replicates the FogExp2 far field and pools low
  *   wind          → `engine.windOverride`, which cloth and foliage already
  *                   read as "the scene's wind"
  *   rain / snow   → two instanced draws, no simulation (`precipitation.js`)
@@ -84,12 +88,39 @@ const SUN_STEP = 0.0044;
  *  while the shadow the eye watches stays smooth. `__atmosphereSmoothSun =
  *  false` restores the old stepped light (and its jerky shadow). */
 const SUN_SMOOTH_STEP = 0.0004;
+/** ⭐⭐⭐ §sun-shadow-hz (2026-09-13): §smooth-sun's tiny `SUN_SMOOTH_STEP`
+ *  re-aims the light on almost every frame — fine for a parked sun (nothing
+ *  moves, so the hold never triggers), but under a RUNNING clock it forced a
+ *  cascade redraw every frame again for the exact reason §sun-dir-step exists
+ *  on the GI side. So while the clock is running (`dayLength > 0` and
+ *  actually advancing — see `_advanceClock`'s `this._sunAngularRate`, deg/sec,
+ *  0 when static) the light is held in a step sized off the sun's OWN angular
+ *  rate rather than a fixed constant: `step = rate / SUN_SHADOW_HZ`, clamped
+ *  so the shadow can never redraw faster than `SUN_SHADOW_HZ` times a second
+ *  nor coarser than `SUN_HOLD_MAX_DEG`. A parked sun (`this._sunAngularRate
+ *  === 0`) keeps exactly today's `SUN_SMOOTH_STEP` behaviour. Colour,
+ *  intensity, fog, ambient and the sky are untouched — they are written every
+ *  frame from the continuous model regardless of this hold.
+ *  `this._sunAngularRate` is also published on `engine.sunAngularRate` so
+ *  GISystem can size its own `GI_SUN_DIR_STEP` off the same rate without
+ *  importing this component. `__atmosphereSmoothSun = false` still overrides
+ *  everything above back to the old flat `SUN_STEP`. */
+const SUN_SHADOW_HZ = 4;
+const SUN_HOLD_MIN_DEG = 0.05;
+const SUN_HOLD_MAX_DEG = 0.5;
+const SUN_DEG2RAD = Math.PI / 180;
 /** …and metres the camera may drift before an OWNED sun re-centres its shadow
  *  frustum. The frustum is 90 m across, so four is invisible. */
 const SUN_ANCHOR_STEP = 4;
 /** Metres per second the authored dial may reach. A hurricane is ~33 m/s and
  *  a blizzard preset is already 15, so this is the top of real weather. */
 const WIND_CEILING = 35;
+/** Shader extinction per metre per unit of authored mist density: at 1 a
+ *  valley is opaque past ~400 m, before the weather's `mist` channel adds its
+ *  own on top. */
+const MIST_DENSITY_SCALE = 0.0035;
+/** Noise tiles per metre for the drifting banks — a bank is ~40 m across. */
+const MIST_NOISE_SCALE = 1 / 90;
 
 const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
 const clamp01 = (v) => clamp(v, 0, 1);
@@ -150,6 +181,20 @@ export class AtmosphereComponent extends Component {
      *  reads back the metres per second that come out. */
     windSpeed: 1,
     gustiness: 1,
+    // ── Valley mist (height fog) ──────────────────────────────────────────
+    /** Low mist pooled under a base level, drifting in banks with the wind.
+     *  OFF BY DEFAULT: the node is installed at attach either way (see
+     *  `_installFog`), so every existing preset stays pixel-identical until
+     *  this is switched on. The weather's `mist` channel adds to it. */
+    heightFog: false,
+    heightFogDensity: 0.35,
+    /** World Y the mist pools under. NaN or "auto" follows the scene's first
+     *  live Water surface's level (else 0). */
+    heightFogBase: 0,
+    /** Metres over which the mist thins above the base level. */
+    heightFogFalloff: 8,
+    /** 0 = a level sheet; 1 = fully carved into drifting banks. */
+    heightFogNoise: 0.5,
     // ── What it is allowed to drive ───────────────────────────────────────
     precipitation: true,
     /** Snow lying on the world and rain darkening it — see `weatherSurface.js`. */
@@ -202,6 +247,12 @@ export class AtmosphereComponent extends Component {
     { key: "windSpeed", label: "Wind Strength", type: "number", min: 0, max: 8, step: 0.1, section: "Weather" },
     { key: "gustiness", label: "Gustiness", type: "number", min: 0, max: 3, step: 0.05, section: "Weather" },
     { key: "seed", label: "Seed", type: "number", min: 0, step: 1, section: "Weather", showIf: (p) => p.weather === "auto" },
+
+    { key: "heightFog", label: "Valley Mist", type: "boolean", section: "Height Fog" },
+    { key: "heightFogDensity", label: "Density", type: "number", min: 0, max: 1, step: 0.05, section: "Height Fog", showIf: (p) => p.heightFog },
+    { key: "heightFogBase", label: "Base Level (m, empty = water)", type: "number", min: -500, max: 4000, step: 0.5, section: "Height Fog", showIf: (p) => p.heightFog },
+    { key: "heightFogFalloff", label: "Height Falloff (m)", type: "number", min: 0.5, max: 200, step: 0.5, section: "Height Fog", showIf: (p) => p.heightFog },
+    { key: "heightFogNoise", label: "Drifting Banks", type: "number", min: 0, max: 1, step: 0.05, section: "Height Fog", showIf: (p) => p.heightFog },
 
     { key: "precipitation", label: "Rain and Snow", type: "boolean", section: "Drives" },
     { key: "surfaces", label: "Snow and Wet Ground", type: "boolean", section: "Drives" },
@@ -256,6 +307,8 @@ export class AtmosphereComponent extends Component {
     this._lastFillWeather = null;
     this._cloudDrift = new THREE.Vector2();
     this._cirrusDrift = new THREE.Vector2();
+    this._mistDrift = new THREE.Vector2();
+    this._fogNode = null;
     this._windAngle = 45;
     this._sun = null;
     this._sunCheck = 0;
@@ -328,7 +381,10 @@ export class AtmosphereComponent extends Component {
     this._warmClock = 0;
 
     this._unsub = [
-      engine.onPreRender?.(() => this.update()),
+      engine.onPreRender?.(() => {
+        this.update();
+        prepareSkyEnvironment(engine, this.skyTexture);
+      }),
       // The sun light can arrive after this component does — a scene loads its
       // entities in order, and "the atmosphere has no sun" must not be a
       // permanent verdict reached on frame one.
@@ -355,6 +411,7 @@ export class AtmosphereComponent extends Component {
     if (engine?.__atmosphere === this) engine.__atmosphere = null;
     clearSurfaceWeather(engine?.scene);
     this._restoreSceneState(engine);
+    this._fogNode = null;
     this.layers?.rain.dispose();
     this.layers?.snow.dispose();
     this.layers = null;
@@ -428,6 +485,7 @@ export class AtmosphereComponent extends Component {
       environment: scene.environment,
       environmentIntensity: scene.environmentIntensity,
       fog: scene.fog,
+      fogNode: scene.fogNode ?? null,
       windOverride: engine.windOverride ?? null,
       ambient: engine.ambientLight
         ? { color: engine.ambientLight.color.clone(), intensity: engine.ambientLight.intensity }
@@ -449,6 +507,7 @@ export class AtmosphereComponent extends Component {
     }
     if (!only || only === "fog") {
       if (scene.fog === this._fog) scene.fog = saved.fog;
+      if (this._fogNode && scene.fogNode === this._fogNode.node) scene.fogNode = saved.fogNode ?? null;
     }
     if (!only || only === "wind") {
       if (engine.windOverride === this._wind) engine.windOverride = saved.windOverride;
@@ -468,6 +527,16 @@ export class AtmosphereComponent extends Component {
     this._fog = new THREE.FogExp2(0x8a93a0, 0);
     this._fog.name = "Atmosphere";
     scene.fog = this._fog;
+    // ⛔ `scene.fogNode` IS ONE SLOT, and the water medium owns it when a Water
+    // surface exists (`waterMedium.js` — it replicates `scene.fog` exactly the
+    // way `heightFogNode.js` does). Install only when the slot is free, and
+    // never take it back mid-session: replacing the node recompiles EVERY
+    // material, the wave this whole comment block exists to pay once. When the
+    // medium has the slot the mist simply stays dormant — the far field is
+    // still served, by the medium's own replication of `scene.fog`.
+    if (this._fogNode || scene.fogNode != null || engine.renderer?.backend?.isWebGPUBackend !== true) return;
+    this._fogNode = createHeightFog();
+    scene.fogNode = this._fogNode.node;
   }
 
   // ── the frame ─────────────────────────────────────────────────────────────
@@ -481,7 +550,7 @@ export class AtmosphereComponent extends Component {
     if (engine.simulationSuspended === true && !force) return;
 
     const dt = Math.min(0.25, Math.max(0, Number(engine.deltaTime) || 0));
-    const gameHours = this._advanceClock(dt);
+    const gameHours = this._advanceClock(dt, engine);
     const props = this.props;
 
     const celestial = celestialState({
@@ -536,7 +605,7 @@ export class AtmosphereComponent extends Component {
     this._refreshSky(parameters, force);
     this._applySky(engine, parameters, celestial, light);
     this._applySun(engine, light);
-    this._applyFog(parameters);
+    this._applyFog(engine, parameters, dt);
     this._applyWind(engine, dt);
     this._applyPrecipitation(engine, dt, parameters);
     this._applySurfaces(engine, dt, parameters);
@@ -546,9 +615,9 @@ export class AtmosphereComponent extends Component {
   }
 
   /** Advances the clock, returning the GAME hours that passed this frame. */
-  _advanceClock(dt) {
+  _advanceClock(dt, engine) {
     const dayLength = Math.max(0, Number(this.props.dayLength) || 0);
-    if (dayLength <= 0 || dt <= 0) return 0;
+    if (dayLength <= 0 || dt <= 0) { this._sunAngularRate = 0; if (engine) engine.sunAngularRate = 0; return 0; }
     // §edit-freeze (2026-09-10): the day/night clock is a SIMULATION — it
     // advances in PLAY mode, and in the editor only when the `Run In Editor`
     // toggle is on (default off; see Component `shouldAnimate`). A running
@@ -558,7 +627,19 @@ export class AtmosphereComponent extends Component {
     // silently drifts the scene into night. Frozen, the authored `timeOfDay`
     // holds — scrub the Time slider or press Play to run the cycle.
     // `__atmosphereClockInEditor = true` forces it always-on for an A/B.
-    if (!this.shouldAnimate && globalThis.__atmosphereClockInEditor !== true) return 0;
+    if (!this.shouldAnimate && globalThis.__atmosphereClockInEditor !== true) {
+      this._sunAngularRate = 0;
+      if (engine) engine.sunAngularRate = 0;
+      return 0;
+    }
+    // §sun-shadow-hz: the sun's angular rate (deg/sec) while the clock is
+    // actually running — 360° per `dayLength` minutes, i.e. per `dayLength *
+    // 60` seconds. `_applySun` uses it to size its light-hold step; it is
+    // also republished on `engine.sunAngularRate` (0 whenever this function
+    // returns 0 above) so GISystem can size `GI_SUN_DIR_STEP` the same way
+    // without importing this component.
+    this._sunAngularRate = 360 / (dayLength * 60);
+    if (engine) engine.sunAngularRate = this._sunAngularRate;
     const hours = dt * (24 / (dayLength * 60));
     // ⚠ Written straight onto `props`, not through `setProp`. A clock that
     // emitted a property change every frame would put the whole editor —
@@ -988,12 +1069,23 @@ export class AtmosphereComponent extends Component {
       drifted = !(applied.anchor.distanceToSquared(_cameraPosition) <= SUN_ANCHOR_STEP * SUN_ANCHOR_STEP);
       if (drifted) applied.anchor.copy(_cameraPosition);
     }
-    // §smooth-sun: hold the LIGHT only when the sun is essentially parked
-    // (`SUN_SMOOTH_STEP`), not at the old 0.25° `SUN_STEP` — so the transform,
-    // and thus the CSM shadow, moves smoothly under a day/night sun. GI rests
-    // via its own direction quantization (GISystem). `__atmosphereSmoothSun =
-    // false` reverts to the stepped light.
-    const dirHoldStep = globalThis.__atmosphereSmoothSun === false ? SUN_STEP : SUN_SMOOTH_STEP;
+    // §smooth-sun / §sun-shadow-hz: `__atmosphereSmoothSun = false` is a flat
+    // kill switch back to the old stepped light regardless of the clock.
+    // Otherwise: a PARKED sun (`this._sunAngularRate === 0`, e.g. `dayLength:
+    // 0` or `Run In Editor` off) keeps today's near-continuous
+    // `SUN_SMOOTH_STEP` exactly. A RUNNING clock instead holds the light in a
+    // step sized off its own angular rate so the shadow redraws at most
+    // `SUN_SHADOW_HZ` times a second, clamped to a band too small to see as a
+    // jump and too large to redraw needlessly.
+    let dirHoldStep;
+    if (globalThis.__atmosphereSmoothSun === false) {
+      dirHoldStep = SUN_STEP;
+    } else if (this._sunAngularRate > 0) {
+      const stepDeg = Math.min(SUN_HOLD_MAX_DEG, Math.max(SUN_HOLD_MIN_DEG, this._sunAngularRate / SUN_SHADOW_HZ));
+      dirHoldStep = stepDeg * SUN_DEG2RAD;
+    } else {
+      dirHoldStep = SUN_SMOOTH_STEP;
+    }
     if (turned <= dirHoldStep && !relit && !drifted && wantVisible === applied.visible
       && applied.light === sun.light && applied.frames > 0) {
       this._sunSource = sun.source;
@@ -1070,7 +1162,7 @@ export class AtmosphereComponent extends Component {
 
   // ── fog, wind, precipitation, lightning ───────────────────────────────────
 
-  _applyFog(parameters) {
+  _applyFog(engine, parameters, dt) {
     if (!this._fog || !this.props.fog) return;
     const colour = fogColor(parameters);
     this._fog.color.setRGB(colour[0], colour[1], colour[2]);
@@ -1082,7 +1174,62 @@ export class AtmosphereComponent extends Component {
     // 250 m sight line: enough that the "fog" preset closes the horizon
     // completely while an overcast day only softens it.
     const optical = 1 - Math.exp(-((this._fog.density * 250) ** 2));
-    this.uniforms.fogAmount.value = clamp01(optical);
+
+    // ── VALLEY MIST ───────────────────────────────────────────────────────
+    // Uniform writes only — the node was installed at attach and never moves.
+    let mistDensity = 0;
+    const node = this._fogNode;
+    if (node) {
+      const props = this.props;
+      if (props.heightFog) {
+        // effective density = authored × (1 + the weather's mist channel) —
+        // "fog" pools in the hollows, drizzle leaves a low haze after itself.
+        mistDensity = clamp01(Number(props.heightFogDensity) || 0)
+          * (1 + clamp01(this.conditions.mist ?? 0)) * MIST_DENSITY_SCALE;
+        // Advected by the very wind the clouds ride, and INTEGRATED for the
+        // same reason the rain's is (see `_applyPrecipitation`): a field fed
+        // speed × clock jumps whenever the wind turns.
+        const radians = THREE.MathUtils.degToRad(this._windAngle + props.northOffset);
+        const speed = this.conditions.wind;
+        // The wrap is a whole number of lattice tiles, so it is invisible.
+        this._mistDrift.x = (this._mistDrift.x + Math.sin(radians) * speed * dt * MIST_NOISE_SCALE) % 10000;
+        this._mistDrift.y = (this._mistDrift.y - Math.cos(radians) * speed * dt * MIST_NOISE_SCALE) % 10000;
+        let base = Number(props.heightFogBase);
+        if (!Number.isFinite(base)) base = this._waterBaseLevel(engine);
+        updateHeightFog(node, {
+          color: colour,
+          exp2Density: this._fog.density,
+          mistDensity,
+          baseLevel: base,
+          falloff: props.heightFogFalloff,
+          noiseStrength: props.heightFogNoise,
+          noiseScale: MIST_NOISE_SCALE,
+          driftX: this._mistDrift.x,
+          driftY: this._mistDrift.y,
+        });
+      } else {
+        // Switched off: zero the mist, keep feeding the far field through.
+        updateHeightFog(node, { color: colour, exp2Density: this._fog.density, mistDensity: 0 });
+      }
+    }
+    // The horizon band swallows what the mist swallows too — a valley full of
+    // mist under a crisp sky reads as the same cut-out fog once did.
+    const mistOptical = 1 - Math.exp(-((mistDensity * 250) ** 2));
+    this.uniforms.fogAmount.value = clamp01(1 - (1 - optical) * (1 - mistOptical));
+  }
+
+  /**
+   * Where the mist pools when `heightFogBase` is "auto" (NaN): the first live
+   * Water surface's level, else 0. A WorldComponent's water is a procedural
+   * field, not a scalar — there is no level to read cheaply there.
+   */
+  _waterBaseLevel(engine) {
+    for (const surface of engine.waterSurfaces ?? []) {
+      if (surface?._alive === false || surface?.enabled === false) continue;
+      const y = surface.entity?.object3D?.getWorldPosition?.(_cameraPosition)?.y;
+      if (Number.isFinite(y)) return y;
+    }
+    return 0;
   }
 
   _applyWind(engine, dt) {
@@ -1159,6 +1306,9 @@ export class AtmosphereComponent extends Component {
       // both halves of that: "snow and rain do not react to lighting at all"
       // and "remain fully white even at night".
       u.sunDirection.value.fromArray(this.light.direction);
+      // Published for anything that shades against the live sun without owning a
+      // light reference (the grass sward's translucency term reads it).
+      if (this.entity?.engine) this.entity.engine.sunDirection = this.light.direction;
       // What the sun is worth here, including the cloud in front of it and its
       // own colour — the same numbers the directional light was given.
       const beam = this._sunIntensity ?? this.light.intensity;
@@ -1387,6 +1537,9 @@ export class AtmosphereComponent extends Component {
       blending: this._blend < 1,
       sunSource: this._sunSource ?? "none",
       skyRefreshing: this._fillRow < SKY_HEIGHT,
+      heightFog: !this._fogNode
+        ? (this.props.heightFog ? "dormant: scene.fogNode is in use" : "off")
+        : (this.entity?.engine?.scene?.fogNode === this._fogNode.node ? (this.props.heightFog ? "on" : "ready") : "replaced"),
     };
   }
 

@@ -129,6 +129,13 @@ const samePath = (a, b) => !!a && !!b && normalizeRelPath(a).toLowerCase() === n
 export function resolveBuildScenes({ available = [], build = BUILD_DEFAULTS, mainScene = "", openScene = "" } = {}) {
   const warnings = [];
   const all = available.map(normalizeRelPath).filter(Boolean);
+  // No scenes have been discovered yet (e.g. BuildPanel's first paint, before
+  // the async `listProjectAssets` effect has resolved). Emitting "not found"
+  // against an empty list is a first-paint artefact, not a real fallback —
+  // skip and let the next render decide once `available` is populated.
+  if (!all.length) {
+    return { startScene: "", scenes: [], warnings: [], mode: "reachable" };
+  }
   const exists = (p) => all.some((s) => samePath(s, p));
   const canonical = (p) => all.find((s) => samePath(s, p)) ?? normalizeRelPath(p);
 

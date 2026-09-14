@@ -2,6 +2,10 @@
 // by `probe:gi-boot-frames` and `probe:camera-motion` on 2026-09-02, and the
 // 21.5-SECOND block the freeze ledger recorded on 2026-09-09.
 //
+// The ledger is imported for ONE reading: `freeze.asyncInFlight.size`, the
+// driver queue's own depth, which the busy gate below needs. `freezeLedger`
+// imports only `wgslStable`, so this adds no cycle.
+//
 // three creates a render pipeline SYNCHRONOUSLY the first time an object with
 // a new (material, geometry layout, render context) is drawn:
 // `Pipelines.getForRender(renderObject)` → `_getRenderPipeline(…, promises =
@@ -129,6 +133,8 @@
 // `__asyncRenderPipelinesRemint = true` the 2026-09-02 one (defer everything,
 // holes and all) — the two arms for pricing what each trade costs.
 
+import { freeze } from "./freezeLedger.js";
+
 export const ASYNC_RENDER_PIPELINE_MIN_BYTES = 16 * 1024;
 
 /**
@@ -241,6 +247,10 @@ export function installAsyncRenderPipelines(renderer) {
     builds: 0,
     /** draws pushed to a later frame because the budget was spent */
     buildsDeferred: 0,
+    /** small first compiles deferred only because the driver was busy */
+    deferredWhileBusy: 0,
+    /** ...of which inside a shadow map nothing caches (see the busy gate) */
+    deferredShadowWhileBusy: 0,
     /** disposes of render objects that had never created their bind groups —
      * three would have decremented the SHARED groups for them (see below) */
     unbuiltBindingDeletes: 0,
@@ -249,6 +259,42 @@ export function installAsyncRenderPipelines(renderer) {
   const standInsEnabled = () => globalThis.__asyncRenderPipelinesStandIn !== false
     && globalThis.__asyncRenderPipelinesRemint !== true;
   const inBundle = () => renderer?._currentRenderBundle != null;
+  /** Async pipelines the driver has not settled yet — the queue's own depth. */
+  const driverBusy = () => (freeze.asyncInFlight?.size ?? 0) > 0;
+  /** True only for the render that presents the frame: see the busy gate below. */
+  const presentingToCanvas = () => {
+    try { return renderer.getRenderTarget?.() == null; } catch { return false; }
+  };
+  /**
+   * A plain three shadow map (`ShadowNode` names its targets) rendered while
+   * `shadowFreeze` has published that NOTHING caches shadow content this frame
+   * — see the busy gate below. Clipmap static caches name their own targets
+   * (`ClipmapStatic*`) and never match.
+   */
+  /**
+   * ⛔ PMREM GENERATION MUST NEVER DEFER (09-14). three builds the environment's
+   * prefiltered mips INSIDE the presenting render (`PMREMNode.updateBefore` →
+   * `PMREMGenerator`, one blur/GGX draw per mip into a `PMREM.cubeUv` target)
+   * exactly once per environment, then records the PMREM as done. A draw this
+   * layer skips there is never redrawn: the blurred mips stay black, so every
+   * lit material loses its diffuse sky light for the whole session. Complex
+   * scene receipt: every shadow pitch black, environment intensity 5 → 200 only
+   * added a faint specular sheen; with deferral off and a fresh PMREM the same
+   * pose lit normally at intensity 5.
+   */
+  const renderingPMREM = () => {
+    try {
+      const texture = renderer.getRenderTarget?.()?.texture;
+      return texture?.isPMREMTexture === true || texture?.name === "PMREM.cubeUv";
+    } catch { return false; }
+  };
+  const renderingUncachedShadowMap = () => {
+    if (renderer?.__shadowMapsRedrawnEveryFrame !== true || globalThis.__asyncRenderPipelinesShadowBusyGate === false) return false;
+    try {
+      const target = renderer.getRenderTarget?.();
+      return target?.depthTexture?.name === "ShadowDepthTexture" || target?.texture?.name === "ShadowMap";
+    } catch { return false; }
+  };
 
   // The backend pushes one promise per pipeline into this. Nobody awaits it
   // (three sets `pipelineData.pipeline` from inside the promise itself), so
@@ -326,7 +372,7 @@ export function installAsyncRenderPipelines(renderer) {
   const original = pipelines._getRenderPipeline;
   pipelines._getRenderPipeline = function (renderObject, stageVertex, stageFragment, cacheKey, promises) {
     let defer = false;
-    if (promises == null && globalThis.__asyncRenderPipelines !== false) {
+    if (promises == null && globalThis.__asyncRenderPipelines !== false && !renderingPMREM()) {
       const bytes = Math.max(stageFragment?.code?.length ?? 0, stageVertex?.code?.length ?? 0);
       const overGate = bytes >= (Number(globalThis.__asyncRenderPipelinesMinBytes) || state.minFragmentBytes);
       const parked = renderObject?.__previousDraw != null && renderObject.__previousDraw.released !== true;
@@ -347,6 +393,64 @@ export function installAsyncRenderPipelines(renderer) {
       } else {
         // A first compile: nothing on screen to protect, defer the big ones.
         defer = state.active && overGate;
+        // ── AND THE SMALL ONES TOO, WHEN THE DRIVER IS ALREADY BUSY ────────
+        //
+        // The size gate above asks "is this program big?" when the question
+        // that decides the stall is "is the GPU PROCESS busy?". A synchronous
+        // `createRenderPipeline` returns in 0.1 ms, but the GPU process
+        // executes it IN ORDER on its command thread, so a 1 kB shadow-depth
+        // program queued behind a 50 kB foliage fragment costs the whole
+        // foliage compile — and the main thread blocks on the wire waiting for
+        // it. "Compiles in a few ms" is true only of an IDLE driver.
+        //
+        // Measured 2026-09-12, GI OFF, on the user's Complex scene: 43 sync
+        // pipelines totalling 336 kB, and **18 536 of 20 720 blocked ms were
+        // `waitingOnGpuMs`, spread over 79 separate waits**. Those 43 are not
+        // 18 s of compiling — they are 43 BARRIERS at which the main thread
+        // has to wait for everything already queued. Removing the barriers
+        // does not remove the work; it stops the editor waiting in lockstep
+        // for it, which is the difference between "done" and "usable".
+        //
+        // ⛔ CANVAS-PRESENTING RENDER ONLY — this is the guard that makes it
+        // safe, and it is NARROWER than `state.active`. `state.active` spans
+        // the whole presenting render, and three renders SHADOW MAPS inside
+        // it: deferring there would let a pending pipeline leave a caster out
+        // of a shadow map that `shadowFreeze` then CACHES as complete, which
+        // AGENTS.md forbids in as many words ("pending pipelines and parked
+        // stand-ins cannot certify new shadow content"). A null render target
+        // means we are drawing the frame the user is about to see, where a
+        // skipped draw is simply re-drawn next frame. It also excludes atlas
+        // blits, impostor bakes and picking — the one-shot renders whose
+        // skipped draw is a black result nobody re-renders.
+        //
+        // Self-limiting: with an idle driver `driverBusy()` is false and the
+        // behaviour is exactly what it was. `__asyncRenderPipelinesBusyGate
+        // = false` reverts.
+        //
+        // ⭐ AND INSIDE A SHADOW MAP NOTHING CACHES (09-14, Complex scene). The
+        // canvas-only rule left every shadow-pass pipeline synchronous, and a
+        // matHalf wave re-minted 48 `ShadowMaterial` variants at once — 29 sync
+        // pipelines in 0.4 s, then 10-25 s unattributed stalls behind the async
+        // queue. When `shadowFreeze` publishes
+        // `renderer.__shadowMapsRedrawnEveryFrame` (a deforming caster forces
+        // every map to re-render each frame and every freeze is released), a
+        // caster skipped this frame is drawn into next frame's map: the same
+        // argument as the canvas. `__asyncRenderPipelinesShadowBusyGate = false`
+        // reverts this half.
+        if (
+          !defer && state.active && !overGate
+          && globalThis.__asyncRenderPipelinesBusyGate !== false
+          && driverBusy()
+        ) {
+          if (presentingToCanvas()) {
+            defer = true;
+            state.deferredWhileBusy += 1;
+          } else if (renderingUncachedShadowMap()) {
+            defer = true;
+            state.deferredWhileBusy += 1;
+            state.deferredShadowWhileBusy += 1;
+          }
+        }
       }
     }
     if (defer) {
@@ -671,7 +775,7 @@ export function installAsyncRenderPipelines(renderer) {
         const budget = globalThis.__asyncRenderPipelinesBuildBudgetMs === undefined
           ? state.buildBudgetMs
           : Number(globalThis.__asyncRenderPipelinesBuildBudgetMs) || 0;
-        if (!state.active || budget <= 0 || !standInsEnabled() || this._currentRenderBundle != null) {
+        if (!state.active || budget <= 0 || !standInsEnabled() || this._currentRenderBundle != null || renderingPMREM()) {
           return originalDirect.apply(this, arguments);
         }
         let renderObject = null;

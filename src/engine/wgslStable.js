@@ -120,6 +120,10 @@ export class WgslRegistry {
     this.previous = { raw: new Set(), canon: new Set(), at: 0, count: 0 };
     this._persistTimer = null;
     this._keptBytes = 0;
+    /** canonical text → the one GPUShaderModule the driver needs for it. */
+    this._intern = new Map();
+    this.internHits = 0;
+    this.internBytesSaved = 0;
     this.#loadPrevious();
   }
 
@@ -224,8 +228,56 @@ export class WgslRegistry {
       rawHitsFromLastBoot: rawHits,
       canonicalHitsFromLastBoot: canonHits,
       rescuedByRename: rescued.length,
+      // Modules three asked for that the driver already had, byte for byte.
+      // A high number here is not a problem being reported — it is work that
+      // no longer reaches the GPU process.
+      internedDuplicates: this.internHits,
+      internedKB: +(this.internBytesSaved / 1024).toFixed(0),
       stillUnstable: unstable,
     };
+  }
+
+  /**
+   * ── THE IN-PROCESS TWIN OF THE DISK CACHE ────────────────────────────────
+   *
+   * three interns its programs by WGSL text, so two graphs that produce the
+   * same source share one `GPUShaderModule` — except the interning happens on
+   * the text three GENERATED, and `canonicalizeWgsl` runs later, at
+   * `createShaderModule`. Two graphs that differ only in `NodeBuffer_<node.id>`
+   * naming are therefore distinct to three, identical to the driver, and get
+   * two modules with byte-identical source.
+   *
+   * Measured on the user's Complex scene (2026-09-12): **129 of 336 modules
+   * were redundant — 1 148 kB, 23 % of the boot's WGSL**, handed to a GPU
+   * process that is the boot's bottleneck. Worst offenders are the foliage
+   * family (`vertex_Foliage · living surface` ×4, `fragment_Foliage · surface`
+   * ×5), which is also the family that owns 51 % of the wave.
+   *
+   * A `GPUShaderModule` is immutable and may back any number of pipelines, so
+   * returning the same one for identical source is safe — it is exactly what
+   * three already does one level up. The cache is per REGISTRY, and the
+   * registry is per device, so a lost device cannot hand back a dead module.
+   *
+   * Keyed by canonical hash AND length, with the stored source compared before
+   * reuse: a 32-bit FNV collision across a few hundred modules is unlikely but
+   * handing the driver the WRONG shader would be undebuggable, and the string
+   * compare is free beside a driver compile.
+   *
+   * `globalThis.__wgslInternModules = false` reverts to one module per call.
+   */
+  intern(code, make) {
+    if (globalThis.__wgslInternModules === false) return make();
+    const key = `${hashText(code)}:${code.length}`;
+    const hit = this._intern.get(key);
+    if (hit && hit.code === code) {
+      this.internHits++;
+      this.internBytesSaved += code.length;
+      return hit.module;
+    }
+    const module = make();
+    // A collision (same key, different text) simply does not cache the second.
+    if (!hit) this._intern.set(key, { code, module });
+    return module;
   }
 
   /** One module's text, for a diff between two boots (null text = not kept). */

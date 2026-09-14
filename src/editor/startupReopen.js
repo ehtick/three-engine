@@ -80,35 +80,6 @@ function takeHandoff() {
 }
 
 /**
- * Reopen a specific scene, once the boot has finished choosing its own.
- *
- * ⚠ THIS IS A REPAIR, NOT THE NORMAL PATH. `restoreLastScene` already reopens
- * the right scene almost always: `lastScene` is written to project.json on
- * every open (sceneIO.js), and the boot prefers it. But it runs from
- * EditorChrome's mount effect, ASYNCHRONOUSLY, so `currentScenePath()` is still
- * null when this resolves. Comparing against null and opening "because it
- * differs" loaded the scene a SECOND time on top of the first: 3064 entities
- * for a 1532-mesh project, with every draw call and triangle doubled.
- *
- * So: wait for the boot to declare itself, and only act if it genuinely landed
- * somewhere else.
- */
-async function reopenScene(scene) {
-  // Imported here, not at module scope: this pulls in scene IO and its engine
-  // dependencies, and the whole point of this module is that it loads before
-  // any of that exists. By now a project is open.
-  const sceneIO = await import("./sceneIO.js");
-  const norm = (p) => (p ?? "").replace(/\\/g, "/").toLowerCase();
-  const deadline = performance.now() + 20000;
-  while (!sceneIO.sceneBooted && performance.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-  if (!sceneIO.sceneBooted) return; // never booted — opening now would race it
-  if (norm(sceneIO.currentScenePath()) === norm(scene)) return;
-  await sceneIO.openScenePath(scene);
-}
-
-/**
  * Decide, synchronously, whether this launch is going to the hub.
  *
  * Called from `main.jsx` BEFORE the first render, so the splash is already up
@@ -137,6 +108,20 @@ function plannedProject() {
  * first — `openProject` resets the engine and loads a scene, and driving that
  * from inside an import is asking for a half-built module to be observed
  * mid-reset.
+ *
+ * The handoff scene is handed to the STORE, not acted on here. It used to be
+ * applied by a `reopenScene()` repair AFTER `openProject` resolved: wait for
+ * `restoreLastScene` (EditorChrome's mount effect) to boot on its own guess
+ * — project.json's `lastScene`/`mainScene` — then, if that guess didn't match
+ * the reload's exact scene, load the right one on top of it. That "repair"
+ * was a SECOND full scene load (deserialize, GI build, shader compiles) on
+ * every reload where project.json's on-disk `lastScene` had not caught up
+ * yet — `rememberScene()`'s write to project.json is fired, not awaited, so
+ * it routinely hadn't. Stashing the target into `pendingReopenScene` BEFORE
+ * `openProject` runs means `resolveBootScene` (see `bootScene.js`, read from
+ * `sceneIO.js`'s `restoreLastScene`) sees it as the FIRST candidate, so the
+ * boot opens the right scene the first time and there is nothing left to
+ * repair.
  */
 export function installStartupReopen() {
   const planned = plannedProject();
@@ -153,15 +138,16 @@ export function installStartupReopen() {
       // a previous tick, a harness calling openProject directly) has already
       // said what they want.
       if (!project || store.rootPath) return;
+      // Set BEFORE opening the project: `openProject`'s own `set()` is what
+      // flips `rootPath` and mounts EditorChrome, so `pendingReopenScene` must
+      // already be in the store by then, or `restoreLastScene` boots before
+      // it exists.
+      useProjectStore.setState({ pendingReopenScene: pending?.scene ?? null });
       const opened =
         project === lastProjectPath()
           ? await store.restoreLastFolder()
           : await store.openProject(project);
       if (!opened) return;
-      // An explicit handoff scene wins. Without one there is nothing to do:
-      // EditorChrome's `restoreLastScene()` already reopens project.json's
-      // `lastScene`, which is the scene this project was last looking at.
-      if (pending?.scene) await reopenScene(pending.scene);
     } catch (err) {
       console.warn(`Couldn't reopen "${project}": ${err?.message ?? err}`);
     } finally {

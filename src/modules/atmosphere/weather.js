@@ -32,6 +32,9 @@ const CHANNELS = {
   turbidity: 2.4,
   /** Exponential-squared fog density per metre, before the height falloff. */
   fogDensity: 0,
+  /** 0…1 extra VALLEY MIST on top of the authored height fog — low banks
+   *  pooled in the hollows, where `fogDensity` is the same haze everywhere. */
+  mist: 0,
   /** 0…1 rain rate; 1 is a downpour you cannot see through. */
   rain: 0,
   /** 0…1 snow rate. Blends independently of `rain` — see the header. */
@@ -58,20 +61,20 @@ export const WEATHER_CHANNELS = Object.freeze({ ...CHANNELS });
 // sun was doing, which the user reported twice as "random colour spots in the
 // sky". A clear sky is the one weather with nothing in it.
 export const WEATHER_PRESETS = Object.freeze({
-  clear: { cloudCover: 0, cloudDensity: 0.35, cirrus: 0.04, turbidity: 2.2, fogDensity: 0, rain: 0, snow: 0, wind: 1.6, gust: 0.3, thunder: 0, sunLight: 1 },
-  fair: { cloudCover: 0.38, cloudDensity: 0.45, cirrus: 0.22, turbidity: 2.8, fogDensity: 0.0006, rain: 0, snow: 0, wind: 2.6, gust: 1.2, thunder: 0, sunLight: 0.92 },
-  cloudy: { cloudCover: 0.68, cloudDensity: 0.6, cirrus: 0.35, turbidity: 3.6, fogDensity: 0.0012, rain: 0, snow: 0, wind: 4, gust: 2.2, thunder: 0, sunLight: 0.62 },
+  clear: { cloudCover: 0, cloudDensity: 0.35, cirrus: 0.04, turbidity: 2.2, fogDensity: 0, mist: 0, rain: 0, snow: 0, wind: 1.6, gust: 0.3, thunder: 0, sunLight: 1 },
+  fair: { cloudCover: 0.38, cloudDensity: 0.45, cirrus: 0.22, turbidity: 2.8, fogDensity: 0.0006, mist: 0, rain: 0, snow: 0, wind: 2.6, gust: 1.2, thunder: 0, sunLight: 0.92 },
+  cloudy: { cloudCover: 0.68, cloudDensity: 0.6, cirrus: 0.35, turbidity: 3.6, fogDensity: 0.0012, mist: 0, rain: 0, snow: 0, wind: 4, gust: 2.2, thunder: 0, sunLight: 0.62 },
   // ⚠ `sunLight` IS "ARE THERE SHADOWS", and under a real overcast there are
   // none. The first pass had 0.34 here and the scene still cast a crisp sun
   // shadow through a lid of cloud, which is the tell that says "a slider
   // moved" rather than "the weather changed".
-  overcast: { cloudCover: 0.97, cloudDensity: 0.82, cirrus: 0.1, turbidity: 4.6, fogDensity: 0.002, rain: 0, snow: 0, wind: 4.5, gust: 2, thunder: 0, sunLight: 0.08 },
-  fog: { cloudCover: 0.55, cloudDensity: 0.6, cirrus: 0, turbidity: 6.5, fogDensity: 0.022, rain: 0, snow: 0, wind: 0.7, gust: 0.2, thunder: 0, sunLight: 0.12 },
-  drizzle: { cloudCover: 0.9, cloudDensity: 0.78, cirrus: 0.05, turbidity: 5, fogDensity: 0.005, rain: 0.22, snow: 0, wind: 3.4, gust: 1.6, thunder: 0, sunLight: 0.1 },
-  rain: { cloudCover: 0.98, cloudDensity: 0.9, cirrus: 0, turbidity: 5.6, fogDensity: 0.008, rain: 0.62, snow: 0, wind: 6, gust: 3.5, thunder: 0.15, sunLight: 0.05 },
-  storm: { cloudCover: 1, cloudDensity: 1, cirrus: 0, turbidity: 7, fogDensity: 0.012, rain: 1, snow: 0, wind: 12, gust: 9, thunder: 2.4, sunLight: 0.02 },
-  snow: { cloudCover: 0.93, cloudDensity: 0.8, cirrus: 0.05, turbidity: 4.2, fogDensity: 0.007, rain: 0, snow: 0.55, wind: 2.4, gust: 1.4, thunder: 0, sunLight: 0.1 },
-  blizzard: { cloudCover: 1, cloudDensity: 0.95, cirrus: 0, turbidity: 5.5, fogDensity: 0.03, rain: 0, snow: 1, wind: 15, gust: 10, thunder: 0, sunLight: 0.03 },
+  overcast: { cloudCover: 0.97, cloudDensity: 0.82, cirrus: 0.1, turbidity: 4.6, fogDensity: 0.002, mist: 0.15, rain: 0, snow: 0, wind: 4.5, gust: 2, thunder: 0, sunLight: 0.08 },
+  fog: { cloudCover: 0.55, cloudDensity: 0.6, cirrus: 0, turbidity: 6.5, fogDensity: 0.022, mist: 0.8, rain: 0, snow: 0, wind: 0.7, gust: 0.2, thunder: 0, sunLight: 0.12 },
+  drizzle: { cloudCover: 0.9, cloudDensity: 0.78, cirrus: 0.05, turbidity: 5, fogDensity: 0.005, mist: 0.35, rain: 0.22, snow: 0, wind: 3.4, gust: 1.6, thunder: 0, sunLight: 0.1 },
+  rain: { cloudCover: 0.98, cloudDensity: 0.9, cirrus: 0, turbidity: 5.6, fogDensity: 0.008, mist: 0.2, rain: 0.62, snow: 0, wind: 6, gust: 3.5, thunder: 0.15, sunLight: 0.05 },
+  storm: { cloudCover: 1, cloudDensity: 1, cirrus: 0, turbidity: 7, fogDensity: 0.012, mist: 0.2, rain: 1, snow: 0, wind: 12, gust: 9, thunder: 2.4, sunLight: 0.02 },
+  snow: { cloudCover: 0.93, cloudDensity: 0.8, cirrus: 0.05, turbidity: 4.2, fogDensity: 0.007, mist: 0, rain: 0, snow: 0.55, wind: 2.4, gust: 1.4, thunder: 0, sunLight: 0.1 },
+  blizzard: { cloudCover: 1, cloudDensity: 0.95, cirrus: 0, turbidity: 5.5, fogDensity: 0.03, mist: 0.3, rain: 0, snow: 1, wind: 15, gust: 10, thunder: 0, sunLight: 0.03 },
 });
 
 export const WEATHER_NAMES = Object.freeze(Object.keys(WEATHER_PRESETS));

@@ -202,6 +202,9 @@ class CommandBus {
    * refresh for a one-boot A/B.
    */
   #afterMutation(mark = null) {
+    // A procedural authoring owner may reconcile dependent products once a
+    // command/drag commits. Preview steps intentionally never reach this seam.
+    engine.emit('authoring-committed');
     if (mark && globalThis.__editorMirrorRefreshOnce !== false) {
       queueMicrotask(() => {
         if (sceneMirrorStats.full !== mark.full || sceneMirrorStats.incremental !== mark.incremental) return;

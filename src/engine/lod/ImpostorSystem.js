@@ -113,6 +113,12 @@ class ImpostorBatch {
     this.mesh.raycast = () => {};
     this.mesh.userData.engineOwned = true;
     this.mesh.userData.impostorBatch = true;
+    // GI policy (2026-09-13, docs/FOLIAGE.md): a billboard batch has no
+    // volume worth a GI seat/bake at any distance — never seat, never bake,
+    // not counted in any tier tally. The real object still receives GI
+    // through its own near/mid LOD material; only the flat proxy opts out.
+    this.mesh.userData.giTrace = "none";
+    this.mesh.userData.giMobility = "static";
     this.mesh.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 0);
     scene.add(this.mesh);
     this.dirty = true;

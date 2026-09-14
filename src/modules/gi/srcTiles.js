@@ -114,6 +114,7 @@ import { binCentroidTable, binDirTable, tileCosineWeights, tileDirTable } from "
 import { decodeCentroidOffset } from "./srcMathTsl.js";
 import { octahedralUV } from "./srcOctahedral.js";
 import { readPayload } from "./srcDeposit.js";
+import { binPartitionUniforms, blockChainUniforms, capAt } from "./srcCapacityUniforms.js";
 
 /** Sub-samples per bin axis in the cosine quadrature. §12.2's bias fix. */
 export const COSINE_SUB = 4;
@@ -311,6 +312,22 @@ export function createSrcTileAtlas(store, bins, {
   const liveStampBase = liveOn ? store.blockStampBase + store.cascades[cascade].blockBase : 0;
   const liveStack = liveOn ? store.freeStack : null;
 
+  // The pool's sizes flow in as UNIFORMS, not literals (srcCapacityUniforms.js
+  // — a pool change must not change this kernel's text, or the driver's
+  // compiled-shader cache goes cold for it). The atlas strides ride one vec4:
+  // (1/width, 1/height, perRow, ·). The atlas itself RE-CREATES on a pool
+  // change (a new StorageTexture), but the kernels that sample it through
+  // `sampleTileRGBA` — the screen-gather family — must keep their TEXT when
+  // it does.
+  const cap = {
+    ...binPartitionUniforms(bins),
+    ...blockChainUniforms(store, bins, {
+      live: liveOn,
+      stamp: maturityOn || liveOn,
+    }),
+  };
+  const atlasU = uniform(new THREE.Vector4(1 / layout.width, 1 / layout.height, layout.perRow, 0));
+
   const passes = [];
 
   // `TS_MIN` starts at u32 max so the first `atomicMin` wins; every other word
@@ -339,12 +356,12 @@ export function createSrcTileAtlas(store, bins, {
     // Dead block (srcProbes' live word): nobody reads its tile — skip the
     // 32-bin walk. A block released this frame still bakes (to black).
     if (liveOn) {
-      const live = liveStack.element(uint(liveBase).add(block)).toVar();
-      If(liveStack.element(uint(liveStampBase).add(block)).equal(frameStamp), () => { live.assign(uint(1)); });
+      const live = liveStack.element(uint(capAt(cap.liveBase, cascade)).add(block)).toVar();
+      If(liveStack.element(uint(capAt(cap.stampBase, cascade)).add(block)).equal(frameStamp), () => { live.assign(uint(1)); });
       If(live.equal(uint(0)), () => { Return(); });
     }
 
-    const base = uint(info.binBase).add(block.mul(uint(nBins))).toVar();
+    const base = uint(capAt(cap.binBase, cascade)).add(block.mul(uint(nBins))).toVar();
     const row = t.mul(uint(nBins)).toVar();
     const acc = vec3(0).toVar();
     const wsum = float(0).toVar();
@@ -551,7 +568,7 @@ export function createSrcTileAtlas(store, bins, {
       // neighbours moves. The floor is what keeps a cell from having no vote at
       // all when every corner is new.
       if (maturityOn) {
-        const stamp = stampStack.element(uint(stampBase).add(block)).toVar();
+        const stamp = stampStack.element(uint(capAt(cap.stampBase, cascade)).add(block)).toVar();
         const m = float(uint(frameStamp).sub(stamp))
           .div(maturityRamp)
           .clamp(maturityFloor, 1)
@@ -584,8 +601,8 @@ export function createSrcTileAtlas(store, bins, {
     });
 
     // Atlas position. Both strides are powers of two, so these are shifts.
-    const bx = block.mod(uint(layout.perRow)).toVar();
-    const by = block.div(uint(layout.perRow)).toVar();
+    const bx = block.mod(uint(atlasU.z)).toVar();
+    const by = block.div(uint(atlasU.z)).toVar();
     const coord = ivec2(
       bx.mul(uint(tileSize)).add(t.mod(uint(tileSize))).toInt(),
       by.mul(uint(tileSize)).add(t.div(uint(tileSize))).toInt(),
@@ -651,13 +668,16 @@ export function createSrcTileAtlas(store, bins, {
     // instead of a clamped duplicate.
     const u = uvIn.u.sub(0.5).add(border).toVar();
     const v = uvIn.v.sub(0.5).add(border).toVar();
-    const bx = float(b.mod(uint(layout.perRow))).toVar();
-    const by = float(b.div(uint(layout.perRow))).toVar();
+    const bx = float(b.mod(uint(atlasU.z))).toVar();
+    const by = float(b.div(uint(atlasU.z))).toVar();
     // `+0.5` puts an integer coordinate on a texel CENTRE, which is what makes
-    // an integer `u` sample that texel exactly rather than blending two.
+    // an integer `u` sample that texel exactly rather than blending two. The
+    // atlas dimensions are uniform components (multiply by the reciprocal), so
+    // a resized atlas changes no kernel text — the audit's `srcAtlasRcp` row,
+    // which is also a small speedup over the divide.
     const uv = vec2(
-      bx.mul(tileSize).add(u).add(0.5).div(layout.width),
-      by.mul(tileSize).add(v).add(0.5).div(layout.height),
+      bx.mul(tileSize).add(u).add(0.5).mul(atlasU.x),
+      by.mul(tileSize).add(v).add(0.5).mul(atlasU.y),
     ).toVar();
     return atlasNode.sample(uv).level(0);
   };

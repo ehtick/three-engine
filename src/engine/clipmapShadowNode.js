@@ -73,7 +73,7 @@ export class ClipmapShadowNode extends ShadowBaseNode {
 
   createLevelShadowNode(light, lightShadow, level) {
     return this._createLevelShadowNode?.(light, lightShadow, level, this)
-      ?? createClipmapLevelShadowNode(light, lightShadow, level, { cache: this.cache, enabled: this.cacheEnabled });
+      ?? createClipmapLevelShadowNode(light, lightShadow, level, { cache: this.cache, enabled: this.cacheEnabled, levels: this.levels });
   }
 
   get cacheEnabled() {

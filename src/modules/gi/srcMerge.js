@@ -124,6 +124,7 @@ import {
   probeSpacing,
 } from "./srcMathTsl.js";
 import { readPayload, readPayloadC, readPayloadT, writePayload } from "./srcDeposit.js";
+import { binPartitionUniforms, blockChainUniforms, capAt, probeRegionUniforms, valuesUniform } from "./srcCapacityUniforms.js";
 import {
   FLAG_ALIVE,
   PROBE_BLOCK,
@@ -255,6 +256,15 @@ export function createSrcMergeFrame(store, bins, {
   const { payload } = bins;
   const N = store.cascadeCount ?? CASCADE_COUNT;
   const top = N - 1;
+  // The pool's sizes as uniforms, not literals — the text a pool grow must
+  // not change (srcCapacityUniforms.js carries the argument; the live-guard
+  // family follows its own arm's condition).
+  const cap = {
+    ...binPartitionUniforms(bins),
+    ...blockChainUniforms(store, bins, { live: Number.isInteger(store?.blockLiveBase) }),
+    // [G.1] addresses the probe table as `instanceIndex + probeBase`.
+    ...probeRegionUniforms(store.cascades),
+  };
   // §15 U3b — build-time arm, same idiom as the gather's losArmed: the flag is
   // structural (it changes the WGSL), and an instance built without the
   // closure (every mirror-diff page) cannot arm regardless of the global.
@@ -280,6 +290,9 @@ export function createSrcMergeFrame(store, bins, {
     cornerCascades.push({ cascade: c, base: cornerTotal });
     cornerTotal += store.cascades[c].blockCapacity * MERGE_CORNERS;
   }
+  // The record bases are probe-pool derived exactly like the block chains —
+  // uniformed for the same reason, or a probe-pool grow recompiled the merge.
+  const recordBaseU = valuesUniform(cornerCascades.map((r) => r.base), "cornerRecordBase");
   const cornerSize = Math.max(1, cornerTotal);
   // Seeded EMPTY rather than zero, for the same reason `PROBE_BLOCK` is: block 0
   // is a real block somebody owns, so a zero-filled record would make every
@@ -338,7 +351,6 @@ export function createSrcMergeFrame(store, bins, {
   // merging starts — they depend only on this frame's probe population.
   for (let c = 0; c < top; c++) {
     const info = store.cascades[c];
-    const recordBase = cornerCascades[c].base;
     // The PARENT cascade's map. Lookup only: the merge must never create a
     // probe, because a probe created here would have no bins this frame and
     // would have consumed a block that a real receiver needed.
@@ -346,7 +358,7 @@ export function createSrcMergeFrame(store, bins, {
 
     passes.push(Fn(() => {
       const i = instanceIndex.toVar();
-      const p = uint(info.probeBase).add(i).toVar();
+      const p = uint(capAt(cap.probeBase, c)).add(i).toVar();
       const w = p.mul(uint(PROBE_WORDS)).toVar();
       If(probeTable.element(w.add(uint(PROBE_FLAGS))).bitAnd(uint(FLAG_ALIVE)).equal(uint(0)),
         () => { Return(); });
@@ -387,7 +399,7 @@ export function createSrcMergeFrame(store, bins, {
       const parentShift = worldKeysEnabled() ? latticeOriginCell(anchor, sp).toVar() : null;
       const baseCell = ivec3(int(cell0.x), int(cell0.y), int(cell0.z)).toVar();
       if (parentShift) baseCell.assign(baseCell.add(parentShift));
-      const record = uint(recordBase).add(block.mul(uint(MERGE_CORNERS))).toVar();
+      const record = uint(capAt(recordBaseU, c)).add(block.mul(uint(MERGE_CORNERS))).toVar();
 
       // ── §15 U3b: THE PARENT MUST SEE THE CHILD ──────────────────────────
       //
@@ -517,7 +529,7 @@ export function createSrcMergeFrame(store, bins, {
     const skyBinTable = skyEnv?.tables ? skyEnv.tables.tableFor(wTop) : null;
     passes.push(Fn(() => {
       const i = instanceIndex.toVar();
-      const bin = uint(info.binBase).add(i).toVar();
+      const bin = uint(capAt(cap.binBase, top)).add(i).toVar();
       const T = readPayloadT(payload, bin);
       If(T.lessThan(0), () => { Return(); });
       const S = vec3(sky).toVar();
@@ -575,7 +587,6 @@ export function createSrcMergeFrame(store, bins, {
     const info = bins.cascades[c];
     const parentInfo = bins.cascades[c + 1];
     const nBins = info.bins;
-    const recordBase = cornerCascades[c].base;
     // §11.28: the bin-centre LUTs (Morton order) of the own and the parent
     // level — the direction a bin's centroid falls back to when its code is
     // 0 (the resolve writes 0; only a merged level carries a code).
@@ -593,10 +604,10 @@ export function createSrcMergeFrame(store, bins, {
       // payload fetch. Released-this-frame blocks resolved to UNKNOWN and
       // fall out on `selfT < 0` below as they always did.
       if (Number.isInteger(store?.blockLiveBase) && store?.freeStack) {
-        const live = store.freeStack.element(uint(store.blockLiveBase + info.blockBase).add(block));
+        const live = store.freeStack.element(uint(capAt(cap.liveBase, c)).add(block));
         If(live.equal(uint(0)), () => { Return(); });
       }
-      const selfBin = uint(info.binBase).add(block.mul(uint(nBins))).add(m).toVar();
+      const selfBin = uint(capAt(cap.binBase, c)).add(block.mul(uint(nBins))).add(m).toVar();
 
       // AN UNKNOWN SELF BIN STAYS UNKNOWN. It is not "no light" — no ray
       // sampled this direction, so there is nothing for the parent to shine
@@ -661,7 +672,7 @@ export function createSrcMergeFrame(store, bins, {
       const ownTRaw = fillUnknown ? select(unknown, float(1), selfT).toVar() : selfT;
       const ownT = float(1).sub(selfC).add(selfC.mul(ownTRaw)).toVar();
 
-      const record = uint(recordBase).add(block.mul(uint(MERGE_CORNERS))).toVar();
+      const record = uint(capAt(recordBaseU, c)).add(block.mul(uint(MERGE_CORNERS))).toVar();
       const acc = vec3(0).toVar();
       const accT = float(0).toVar();
       const wsum = float(0).toVar();
@@ -690,7 +701,7 @@ export function createSrcMergeFrame(store, bins, {
           // energy and throws no error; it delivers the wrong DIRECTION's
           // radiance, which reads as a hue rotation that survives every energy
           // check. The gate's pre-average arm exists for exactly this.
-          const pBase = uint(parentInfo.binBase)
+          const pBase = uint(capAt(cap.binBase, c + 1))
             .add(parentBlock.mul(uint(parentInfo.bins)))
             .add(m.mul(uint(4)))
             .toVar();
@@ -871,10 +882,10 @@ export function createSrcMergeFrame(store, bins, {
         const block = i.div(uint(nBins)).toVar();
         const m = i.mod(uint(nBins)).toVar();
         if (Number.isInteger(store?.blockLiveBase) && store?.freeStack) {
-          const live = store.freeStack.element(uint(store.blockLiveBase + info.blockBase).add(block));
+          const live = store.freeStack.element(uint(capAt(cap.liveBase, c)).add(block));
           If(live.equal(uint(0)), () => { Return(); });
         }
-        const base = uint(info.binBase).add(block.mul(uint(nBins))).toVar();
+        const base = uint(capAt(cap.binBase, c)).add(block.mul(uint(nBins))).toVar();
         const selfBin = base.add(m).toVar();
         const own = readPayload(payload, selfBin);
         const ownKnown = own.T.greaterThanEqual(0).toVar();

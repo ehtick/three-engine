@@ -89,6 +89,7 @@ import {
   wgslFn,
 } from "three/tsl";
 import { BIN_BUDGET, CASCADE_COUNT, INFLUX_ONE, MAX_LODS, PROBE_MAX_AGE, W0, blockCapacities } from "./srcConfig.js";
+import { blockChainUniforms, scalarUniform } from "./srcCapacityUniforms.js";
 import { KEY_EMPTY, worldKeysEnabled } from "./srcMath.js";
 import {
   cellPosition,
@@ -755,6 +756,25 @@ export function createHashClearPass(store) {
  * bounded number of frames, and a flag that is set at birth and never cleared
  * would make every probe permanently fresh.
  */
+/**
+ * This cascade's pool-derived numbers as uniforms, not literals
+ * (srcCapacityUniforms.js — a pool change must not change kernel text, or the
+ * driver's compiled-shader cache goes cold for every pass that addresses the
+ * probe table, the hash or the block stacks).
+ */
+function cascadePoolUniforms(store, c) {
+  return {
+    probeBase: scalarUniform(c.probeBase, "probeBase"),
+    probeCapacity: scalarUniform(c.probeCapacity, "probeCapacity"),
+    blockCapacity: scalarUniform(c.blockCapacity, "blockCapacity"),
+    hashBase: scalarUniform(c.hashBase, "hashBase"),
+    hashCapacity: scalarUniform(c.hashCapacity, "hashCapacity"),
+    ...blockChainUniforms(store, { cascades: [c] }, {
+      stack: true, stamp: true, live: true, held: true,
+    }),
+  };
+}
+
 export function createAgePass(store, cascade, {
   maxAge = PROBE_MAX_AGE,
   retain = null,
@@ -762,17 +782,12 @@ export function createAgePass(store, cascade, {
 } = {}) {
   const c = store.cascades[cascade];
   const { hashKeys, hashSlot, probeTable, counters, freeStack, freeTop, cascadeCount } = store;
-  // Where this cascade's block region starts inside the shared stack, and which
-  // top word owns it. Both are JS constants folded into the shader.
-  const blockStack = store.blockStackBase + c.blockBase;
+  // The pool-derived regions read uniforms now; `blockTopWord` stays a literal
+  // — it is the cascade count plus the cascade index, not a pool size.
+  const pu = cascadePoolUniforms(store, c);
   const blockTopWord = cascadeCount + cascade;
-  const heldStamp = store.blockHeldBase + c.blockBase;
-  // The same stamp region `createCompactPass` writes on CLAIM — see the release
-  // branch below for why a RELEASE has to write it too.
-  const blockStamp = store.blockStampBase + c.blockBase;
-  const blockLive = store.blockLiveBase + c.blockBase;
   return Fn(() => {
-    const p = instanceIndex.add(uint(c.probeBase)).toVar();
+    const p = instanceIndex.add(uint(pu.probeBase)).toVar();
     const w = p.mul(PROBE_WORDS).toVar();
     const flags = probeTable.element(w.add(PROBE_FLAGS)).toVar();
     If(flags.bitAnd(uint(FLAG_ALIVE)).equal(uint(0)), () => {
@@ -869,7 +884,10 @@ export function createAgePass(store, cascade, {
       // don't even disappear without further camera adjustment". Keying on
       // min(slots, blocks) makes retention yield while every live probe
       // can still be BACKED.
-      const backedCapacity = Math.max(1, Math.min(c.probeCapacity, c.blockCapacity ?? c.probeCapacity));
+      const backedCapacity = scalarUniform(
+        Math.max(1, Math.min(c.probeCapacity, c.blockCapacity ?? c.probeCapacity)),
+        "backedCapacity",
+      );
       const crowdT = float(live).div(backedCapacity)
         .sub(highFrac).div(hardFrac - highFrac).clamp(0, 1).toVar();
       // ⭐ THE SHED CURVE (2026-08-24, the user's Bistro black-quilt receipt:
@@ -901,7 +919,7 @@ export function createAgePass(store, cascade, {
         If(age.greaterThan(uint(1)).and(heldAge.greaterThan(float(maxAge))), () => {
           const block = probeTable.element(w.add(PROBE_BLOCK)).toVar();
           If(block.notEqual(uint(SLOT_EMPTY)), () => {
-            freeStack.element(uint(heldStamp).add(block)).assign(retain.frameStamp);
+            freeStack.element(uint(pu.heldBase).add(block)).assign(retain.frameStamp);
             atomicAdd(counters.element(uint(cascade * COUNTER_WORDS + COUNTER_HELD)), uint(1));
           });
         });
@@ -937,7 +955,7 @@ export function createAgePass(store, cascade, {
       const block = probeTable.element(w.add(PROBE_BLOCK)).toVar();
       If(block.notEqual(uint(SLOT_EMPTY)), () => {
         const btop = atomicAdd(freeTop.element(uint(blockTopWord)), uint(1)).toVar();
-        freeStack.element(uint(blockStack).add(btop)).assign(block);
+        freeStack.element(uint(pu.stackBase).add(btop)).assign(block);
         // ⭐⭐ STAMP THE RELEASE, NOT ONLY THE CLAIM (2026-08-23).
         //
         // `srcMerge.js`'s header states the invariant this restores, in as many
@@ -966,14 +984,14 @@ export function createAgePass(store, cascade, {
         // restoring the early-out. Nothing is lost: the compaction zeroes on
         // claim anyway, so a released block's payload was never readable.
         if (frameStamp) {
-          freeStack.element(uint(blockStamp).add(block)).assign(frameStamp);
+          freeStack.element(uint(pu.stampBase).add(block)).assign(frameStamp);
         }
-        freeStack.element(uint(blockLive).add(block)).assign(uint(0));
+        freeStack.element(uint(pu.liveBase).add(block)).assign(uint(0));
         probeTable.element(w.add(PROBE_BLOCK)).assign(uint(SLOT_EMPTY));
       });
       // Push. `atomicAdd` returns the OLD top, which is the index to write.
       const top = atomicAdd(freeTop.element(uint(cascade)), uint(1)).toVar();
-      freeStack.element(uint(c.probeBase).add(top)).assign(p);
+      freeStack.element(uint(pu.probeBase).add(top)).assign(p);
       atomicSub(counters.element(uint(cascade * COUNTER_WORDS + COUNTER_LIVE)), uint(1));
     }).Else(() => {
       probeTable.element(w.add(PROBE_AGE)).assign(age);
@@ -981,7 +999,7 @@ export function createAgePass(store, cascade, {
       // the flag through the hash this frame sees the settled value.
       probeTable.element(w.add(PROBE_FLAGS)).assign(flags.bitAnd(uint(~FLAG_FRESH >>> 0)));
       const r = hashInsertWgsl(
-        key, hashKey(key), uint(c.hashBase), uint(c.hashCapacity),
+        key, hashKey(key), uint(pu.hashBase), uint(pu.hashCapacity),
         uint(MAX_PROBE_STEPS), hashKeys,
       ).toVar();
       atomicAdd(counters.element(uint(cascade * COUNTER_WORDS + COUNTER_STEPS)), uint(r.y));
@@ -991,7 +1009,7 @@ export function createAgePass(store, cascade, {
         // than ignored so that impossible stays visible.
         atomicAdd(counters.element(uint(cascade * COUNTER_WORDS + COUNTER_FAILED)), uint(1));
       }).Else(() => {
-        const h = uint(c.hashBase).add(uint(r.x)).toVar();
+        const h = uint(pu.hashBase).add(uint(r.x)).toVar();
         hashSlot.element(h).assign(p);
         probeTable.element(w.add(PROBE_HASH)).assign(h);
       });
@@ -1014,6 +1032,7 @@ export function createAgePass(store, cascade, {
 export function createInsertPass(store, cascade, count, keyOf, onSlot = null) {
   const c = store.cascades[cascade];
   const { hashKeys, counters } = store;
+  const pu = cascadePoolUniforms(store, c);
   return Fn(() => {
     const i = instanceIndex.toVar();
     const key = uint(keyOf(i)).toVar();
@@ -1025,7 +1044,7 @@ export function createInsertPass(store, cascade, count, keyOf, onSlot = null) {
       Return();
     });
     const r = hashInsertWgsl(
-      key, hashKey(key), uint(c.hashBase), uint(c.hashCapacity),
+      key, hashKey(key), uint(pu.hashBase), uint(pu.hashCapacity),
       uint(MAX_PROBE_STEPS), hashKeys,
     ).toVar();
     atomicAdd(counters.element(uint(cascade * COUNTER_WORDS + COUNTER_STEPS)), uint(r.y));
@@ -1034,7 +1053,7 @@ export function createInsertPass(store, cascade, count, keyOf, onSlot = null) {
       atomicAdd(counters.element(uint(cascade * COUNTER_WORDS + COUNTER_FAILED)), uint(1));
       if (onSlot) onSlot(i, uint(SLOT_EMPTY));
     }).Else(() => {
-      if (onSlot) onSlot(i, uint(c.hashBase).add(uint(r.x)));
+      if (onSlot) onSlot(i, uint(pu.hashBase).add(uint(r.x)));
     });
   })().compute(count);
 }
@@ -1058,12 +1077,10 @@ export function createInsertPass(store, cascade, count, keyOf, onSlot = null) {
 export function createCompactPass(store, cascade, { frameStamp = null } = {}) {
   const c = store.cascades[cascade];
   const { hashKeys, hashSlot, probeTable, counters, freeStack, freeTop, cascadeCount } = store;
-  const blockStack = store.blockStackBase + c.blockBase;
-  const blockStamp = store.blockStampBase + c.blockBase;
-  const blockLive = store.blockLiveBase + c.blockBase;
+  const pu = cascadePoolUniforms(store, c);
   const blockTopWord = cascadeCount + cascade;
   return Fn(() => {
-    const h = instanceIndex.add(uint(c.hashBase)).toVar();
+    const h = instanceIndex.add(uint(pu.hashBase)).toVar();
     const key = atomicLoad(hashKeys.element(h)).toVar();
     If(key.equal(uint(KEY_EMPTY)), () => {
       Return();
@@ -1091,15 +1108,15 @@ export function createCompactPass(store, cascade, { frameStamp = null } = {}) {
       const sw = sp.mul(PROBE_WORDS).toVar();
       If(probeTable.element(sw.add(PROBE_BLOCK)).equal(uint(SLOT_EMPTY)), () => {
         const rtop = atomicSub(freeTop.element(uint(blockTopWord)), uint(1)).toVar();
-        If(rtop.equal(uint(0)).or(rtop.greaterThan(uint(c.blockCapacity))), () => {
+        If(rtop.equal(uint(0)).or(rtop.greaterThan(uint(pu.blockCapacity))), () => {
           atomicAdd(freeTop.element(uint(blockTopWord)), uint(1));
           atomicAdd(counters.element(uint(cascade * COUNTER_WORDS + COUNTER_NOBLOCK)), uint(1));
         }).Else(() => {
-          const rblock = freeStack.element(uint(blockStack).add(rtop).sub(1)).toVar();
+          const rblock = freeStack.element(uint(pu.stackBase).add(rtop).sub(1)).toVar();
           if (frameStamp) {
-            freeStack.element(uint(blockStamp).add(rblock)).assign(frameStamp);
+            freeStack.element(uint(pu.stampBase).add(rblock)).assign(frameStamp);
           }
-          freeStack.element(uint(blockLive).add(rblock)).assign(uint(1));
+          freeStack.element(uint(pu.liveBase).add(rblock)).assign(uint(1));
           probeTable.element(sw.add(PROBE_BLOCK)).assign(rblock);
         });
       });
@@ -1111,13 +1128,13 @@ export function createCompactPass(store, cascade, { frameStamp = null } = {}) {
     // walks the counter down through zero and wraps to 4 billion, at which
     // point every subsequent pop reads garbage out of the stack array.
     const top = atomicSub(freeTop.element(uint(cascade)), uint(1)).toVar();
-    If(top.equal(uint(0)).or(top.greaterThan(uint(c.probeCapacity))), () => {
+    If(top.equal(uint(0)).or(top.greaterThan(uint(pu.probeCapacity))), () => {
       atomicAdd(freeTop.element(uint(cascade)), uint(1));
       atomicAdd(counters.element(uint(cascade * COUNTER_WORDS + COUNTER_FAILED)), uint(1));
       Return();
     });
 
-    const p = freeStack.element(uint(c.probeBase).add(top).sub(1)).toVar();
+    const p = freeStack.element(uint(pu.probeBase).add(top).sub(1)).toVar();
     const w = p.mul(PROBE_WORDS).toVar();
 
     // ── CLAIM A BIN BLOCK, IN THE SAME THREAD AND THE SAME PASS ────────────
@@ -1135,13 +1152,13 @@ export function createCompactPass(store, cascade, { frameStamp = null } = {}) {
     // than a dark vote.
     const btop = atomicSub(freeTop.element(uint(blockTopWord)), uint(1)).toVar();
     const block = uint(SLOT_EMPTY).toVar();
-    If(btop.equal(uint(0)).or(btop.greaterThan(uint(c.blockCapacity))), () => {
+    If(btop.equal(uint(0)).or(btop.greaterThan(uint(pu.blockCapacity))), () => {
       // Same undo as the index pop: a top walked down through zero wraps to
       // four billion and every later pop reads garbage out of the array.
       atomicAdd(freeTop.element(uint(blockTopWord)), uint(1));
       atomicAdd(counters.element(uint(cascade * COUNTER_WORDS + COUNTER_NOBLOCK)), uint(1));
     }).Else(() => {
-      block.assign(freeStack.element(uint(blockStack).add(btop).sub(1)));
+      block.assign(freeStack.element(uint(pu.stackBase).add(btop).sub(1)));
       // STAMP THE CLAIM. The block may have belonged to a probe that died, and
       // its accumulators still hold that probe's history — which the decay pass
       // would otherwise fade in rather than discard, lighting a new probe with
@@ -1149,9 +1166,9 @@ export function createCompactPass(store, cascade, { frameStamp = null } = {}) {
       // whole of the fix: the decay reads it, sees "claimed THIS frame", and
       // multiplies by zero instead of by keep.
       if (frameStamp) {
-        freeStack.element(uint(blockStamp).add(block)).assign(frameStamp);
+        freeStack.element(uint(pu.stampBase).add(block)).assign(frameStamp);
       }
-      freeStack.element(uint(blockLive).add(block)).assign(uint(1));
+      freeStack.element(uint(pu.liveBase).add(block)).assign(uint(1));
     });
 
     probeTable.element(w.add(PROBE_KEY)).assign(key);
@@ -1226,15 +1243,16 @@ export function createResolvePass(store, count, slotOf, write, { touch = true } 
 export function createProbeLookup(store, cascade) {
   const c = store.cascades[cascade];
   const { hashKeys, hashSlot } = store;
+  const pu = cascadePoolUniforms(store, c);
   return (key) => {
     const k = uint(key).toVar();
     const r = hashFindWgsl(
-      k, hashKey(k), uint(c.hashBase), uint(c.hashCapacity),
+      k, hashKey(k), uint(pu.hashBase), uint(pu.hashCapacity),
       uint(MAX_PROBE_STEPS), hashKeys,
     ).toVar();
     const out = uint(SLOT_EMPTY).toVar();
     If(r.x.greaterThanEqual(0), () => {
-      out.assign(hashSlot.element(uint(c.hashBase).add(uint(r.x))));
+      out.assign(hashSlot.element(uint(pu.hashBase).add(uint(r.x))));
     });
     return out;
   };
@@ -1259,15 +1277,16 @@ export function createProbeLookup(store, cascade) {
 export function createSrcBlockLookupDirect(store, cascade) {
   const c = store.cascades[cascade];
   const { hashKeys, hashSlot, probeTable } = store;
+  const pu = cascadePoolUniforms(store, c);
   return (key) => {
     const k = uint(key).toVar();
     const r = hashFindWgsl(
-      k, hashKey(k), uint(c.hashBase), uint(c.hashCapacity),
+      k, hashKey(k), uint(pu.hashBase), uint(pu.hashCapacity),
       uint(MAX_PROBE_STEPS), hashKeys,
     ).toVar();
     const out = uint(SLOT_EMPTY).toVar();
     If(r.x.greaterThanEqual(0), () => {
-      const p = hashSlot.element(uint(c.hashBase).add(uint(r.x))).toVar();
+      const p = hashSlot.element(uint(pu.hashBase).add(uint(r.x))).toVar();
       If(p.notEqual(uint(SLOT_EMPTY)), () => {
         out.assign(probeTable.element(p.mul(uint(PROBE_WORDS)).add(uint(PROBE_BLOCK))));
       });
@@ -1305,10 +1324,12 @@ export function createSrcHashBlockFrame(store, cascade = 0) {
     // second cascade would need its own region, and nothing wants one.
     throw new Error("createSrcHashBlockFrame: the hashKeys tail carries c0 only");
   }
+  const pu = cascadePoolUniforms(store, c);
+  const hashBlockBaseU = scalarUniform(hashBlockBase, "hashBlockBase");
 
   const pass = Fn(() => {
     const i = instanceIndex.toVar();
-    const p = hashSlot.element(uint(c.hashBase).add(i)).toVar();
+    const p = hashSlot.element(uint(pu.hashBase).add(i)).toVar();
     const block = uint(SLOT_EMPTY).toVar();
     If(p.notEqual(uint(SLOT_EMPTY)), () => {
       block.assign(probeTable.element(p.mul(uint(PROBE_WORDS)).add(uint(PROBE_BLOCK))));
@@ -1322,19 +1343,19 @@ export function createSrcHashBlockFrame(store, cascade = 0) {
     // storage buffers — afford [J]'s hit-side gather at all. `atomicStore` on
     // the shared atomic node; the CAS inserts never range past `hashTotal`,
     // so the two regions cannot race.
-    atomicStore(hashKeys.element(uint(hashBlockBase).add(i)), block);
+    atomicStore(hashKeys.element(uint(hashBlockBaseU).add(i)), block);
   })().compute(c.hashCapacity);
 
   /** key → bin block, or SLOT_EMPTY. ONE storage buffer: `hashKeys` (keys + tail). */
   const lookup = (key) => {
     const k = uint(key).toVar();
     const r = hashFindWgsl(
-      k, hashKey(k), uint(c.hashBase), uint(c.hashCapacity),
+      k, hashKey(k), uint(pu.hashBase), uint(pu.hashCapacity),
       uint(MAX_PROBE_STEPS), hashKeys,
     ).toVar();
     const out = uint(SLOT_EMPTY).toVar();
     If(r.x.greaterThanEqual(0), () => {
-      out.assign(atomicLoad(hashKeys.element(uint(hashBlockBase).add(uint(r.x)))));
+      out.assign(atomicLoad(hashKeys.element(uint(hashBlockBaseU).add(uint(r.x)))));
     });
     return out;
   };
@@ -1549,9 +1570,10 @@ export function createSrcProbeFrame(store, {
   passes.push(createCompactPass(store, 0, { frameStamp }));
   if (representative) {
     const c0 = store.cascades[0];
+    const c0ProbeBaseU = scalarUniform(c0.probeBase, "c0ProbeBase");
     passes.push(Fn(() => {
       atomicStore(
-        representative.element(instanceIndex.add(uint(c0.probeBase))),
+        representative.element(instanceIndex.add(uint(c0ProbeBaseU))),
         uint(SLOT_EMPTY),
       );
     })().compute(c0.probeCapacity));
@@ -1576,12 +1598,15 @@ export function createSrcProbeFrame(store, {
   // ── the ladder ────────────────────────────────────────────────────────────
   for (let c = 1; c < N; c++) {
     const child = store.cascades[c - 1];
+    // The closures below inline into [B]/[C]/resolve kernels — the probe base
+    // rides a uniform like every other pool-derived number.
+    const childProbeBaseU = scalarUniform(child.probeBase, "childProbeBase");
     // A child's world position comes from its OWN KEY, not from a stored
     // position: key → (lod, cell) → cell centre on the child lattice. Storing
     // the position instead would be three more words per probe and a second
     // source of truth that a re-anchor could desynchronize from the key.
     const childPosition = (i) => {
-      const p = uint(child.probeBase).add(i).toVar();
+      const p = uint(childProbeBaseU).add(i).toVar();
       const w = p.mul(PROBE_WORDS).toVar();
       const key = probeTable.element(w.add(PROBE_KEY)).toVar();
       const alive = probeTable.element(w.add(PROBE_FLAGS)).bitAnd(uint(FLAG_ALIVE)).notEqual(uint(0));
@@ -1621,7 +1646,7 @@ export function createSrcProbeFrame(store, {
         return key;
       },
       (i, slot) => {
-        probeTable.element(uint(child.probeBase).add(i).mul(PROBE_WORDS).add(PROBE_PARENT))
+        probeTable.element(uint(childProbeBaseU).add(i).mul(PROBE_WORDS).add(PROBE_PARENT))
           .assign(uint(slot));
       },
     ));
@@ -1629,10 +1654,10 @@ export function createSrcProbeFrame(store, {
     passes.push(createResolvePass(
       store, child.probeCapacity,
       (i) => probeTable.element(
-        uint(child.probeBase).add(i).mul(PROBE_WORDS).add(PROBE_PARENT),
+        uint(childProbeBaseU).add(i).mul(PROBE_WORDS).add(PROBE_PARENT),
       ),
       (i, probe) => {
-        probeTable.element(uint(child.probeBase).add(i).mul(PROBE_WORDS).add(PROBE_PARENT))
+        probeTable.element(uint(childProbeBaseU).add(i).mul(PROBE_WORDS).add(PROBE_PARENT))
           .assign(uint(probe));
       },
     ));

@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="icon" href="data:,"><title>World · Valley study</title>
+<style>
+html,body{margin:0;background:#192320;color:#eef2e9;font:14px system-ui}canvas{display:block;width:100vw;height:100vh}header{position:fixed;top:20px;left:20px;right:20px;width:fit-content;display:flex;flex-wrap:wrap;gap:8px;align-items:center;background:#16251deb;padding:12px 16px;border:1px solid #7e957c55;border-radius:12px}strong{font-size:18px;margin-right:12px}button,a{font:inherit;color:inherit;background:#314236;border:1px solid #687c65;border-radius:5px;padding:6px 10px;cursor:pointer;text-decoration:none}button[aria-pressed=true],a[aria-current=page]{background:#d8e5c9;color:#233022}button:disabled{opacity:.45;cursor:default}footer{position:fixed;bottom:20px;left:20px;right:20px;width:fit-content;background:#16251ded;padding:12px 16px;border-radius:8px;max-width:640px;line-height:1.5}small{color:#bdc9b7}#cottage-controls{display:flex;flex-wrap:wrap;align-items:center;gap:9px;margin-top:10px}#cottage-controls label{display:flex;align-items:center;gap:7px}input[type=color]{width:42px;height:31px;padding:2px;border:1px solid #879b7f;border-radius:4px;background:#314236;cursor:pointer}#roof-mode{display:block;color:#cfddc1;margin-top:6px}#error{color:#ffb4a4}body.capture header,body.capture footer{display:none}
+html,body{overflow:hidden}#view{touch-action:none}#camera-hint{display:block;margin-top:4px}
+#landscape-controls{position:fixed;right:16px;top:88px;width:246px;box-sizing:border-box;max-width:calc(100vw - 32px);max-height:calc(100dvh - 112px);overflow-y:auto;padding:13px;background:#17291bef;color:#e4ecd9;border:1px solid #80947355;border-radius:8px;font:13px system-ui}#landscape-controls summary{font-weight:650;cursor:pointer}#landscape-controls label{display:flex;justify-content:space-between;align-items:center;margin:8px 0;gap:8px}#landscape-controls input,#landscape-controls select{box-sizing:border-box;width:94px;background:#314236;color:inherit;border:1px solid #879b7f;border-radius:4px;padding:4px;font:inherit}#landscape-controls select{width:115px}#landscape-controls .control-group{border-top:1px solid #80947344;padding-top:9px;margin-top:10px}#landscape-controls button{width:100%;margin-top:10px}#landscape-controls small{display:block;line-height:1.4;margin-top:8px;color:#becbb2}body.capture #landscape-controls{display:none}
+</style></head>
+<body><canvas id="view" aria-label="World valley prototype" aria-describedby="camera-hint" tabindex="0"></canvas>
+<header><strong>World / Valley study</strong><button data-camera="valley">Valley</button><button data-camera="shore">Shore</button><button data-camera="cottage">Cottage</button><button data-camera="forest">Forest</button><a data-style="baseline" href="?baseline=1">Baseline</a><a data-style="natural" href="?">Natural</a><a data-style="stylized" href="?style=stylized">Stylized</a><button id="sun">Moving sun</button></header>
+<aside id="landscape-controls"><details open><summary>Landscape</summary>
+  <label>Seed <input id="world-seed" type="number" min="0" max="4294967295" step="1" value="894" required></label>
+  <details class="control-group" open><summary>Geography</summary>
+    <label>Relief <input id="terrain-relief" type="number" min="0" max="2.5" step="0.05" value="1" required></label>
+    <label>River width (m) <input id="river-width" type="number" min="2" max="8" step="0.1" value="5" required></label>
+    <label>Bank width <input id="shore-width" type="number" min="0.65" max="1.8" step="0.05" value="1" required></label>
+    <label>Rockiness <input id="rockiness" type="number" min="0" max="2" step="0.05" value="1" required></label>
+  </details>
+  <details class="control-group" open><summary>Planting</summary>
+    <label>Forest coverage <input id="forest-cover" type="number" min="0" max="1" step="0.01" value="0.72" required></label>
+    <label>Forest density <input id="forest-density" type="number" min="0" max="2" step="0.01" value="1" required></label>
+    <label>Ground cover <input id="ground-density" type="number" min="0" max="2" step="0.01" value="1" required></label>
+    <label>Tree scale <input id="tree-scale" type="number" min="0.65" max="1.5" step="0.05" value="1" required></label>
+    <label>Grass height <input id="grass-height" type="number" min="0.5" max="1.75" step="0.05" value="1" required></label>
+    <label title="0: uniform planting. 1: stronger grouping within suitable areas.">Planting patches <input id="vegetation-patchiness" type="number" min="0" max="1" step="0.05" value="0.65" required aria-describedby="planting-patches-help"></label>
+    <small id="planting-patches-help">Patches: 0 uniform · 1 stronger grouping.</small>
+  </details>
+  <details class="control-group" open><summary>Surfaces</summary>
+    <label>Source <select id="surface-mode"><option value="materials">Materials</option><option value="procedural">Procedural</option></select></label>
+    <label>Detail scale <input id="surface-scale" type="number" min="0.5" max="2" step="0.05" value="1" required></label>
+    <label>Bump strength <input id="surface-bump" type="number" min="0" max="2" step="0.05" value="1" required></label>
+    <small id="surface-status" aria-live="polite">Preparing surfaces…</small>
+  </details>
+  <button id="generate-world" disabled>Generate landscape</button><small>Apply these settings to rebuild the landscape. Cottage edits are kept.</small>
+</details></aside>
+<footer><div id="status" aria-live="polite">Preparing the valley…</div><small id="study-caption">Phase 0 · 128 m valley · landscape and cottage study</small><small id="camera-hint">Drag to orbit · right-drag / arrows to pan · wheel / pinch to zoom. View buttons reset the camera.</small><div id="cottage-controls"><button id="regenerate" disabled>New cottage variation</button><label for="roof-color">Roof <input id="roof-color" type="color" value="#626d70" disabled aria-describedby="roof-mode"></label><button id="reset-edit" disabled>Use generated color</button></div><small id="roof-mode">Generated color · changes with each cottage</small><div id="error"></div></footer>
+<script type="module">
+import { WORLD_STUDY_NUMBERS, readWorldStudySettings, worldStudySearch } from '/scripts/lib/worldStudySettings.js';
+const began = performance.now(), query = new URLSearchParams(location.search);
+const settings = readWorldStudySettings(query);
+for (const field of WORLD_STUDY_NUMBERS) document.getElementById(field.input).value = (field.group ? settings[field.group] : settings)[field.key];
+document.querySelector('#surface-mode').value = settings.surfaceMode;
+let surfaceSelectionChanged = false;
+document.querySelector('#surface-mode').addEventListener('change', () => { surfaceSelectionChanged = true; });
+const selectedStyle = settings.baseline ? 'baseline' : settings.style;
+for (const link of document.querySelectorAll('[data-style]')) {
+  if (link.dataset.style === selectedStyle) link.setAttribute('aria-current', 'page');
+  link.href = `?${worldStudySearch(query, settings, { style: link.dataset.style })}`;
+}
+globalThis.__engineLimitsCap = { maxStorageBuffersPerShaderStage: 8 };
+const errors = [];
+globalThis.addEventListener('error', e => errors.push(e.message));
+const assert = (ok, message) => { if (!ok) throw new Error(message); };
+try {
+  const { Engine, THREE, registerBuiltInComponents } = await import('/src/engine/index.js');
+  const { OrbitControls } = await import('three/addons/controls/OrbitControls.js');
+  const { applyOutputTransform } = await import('/src/engine/outputTransform.js');
+  const { registerModuleDefinition, enableEngineModule } = await import('/src/engine/modules.js');
+  const { terrainModule } = await import('/src/modules/terrain/index.js');
+  const { foliageModule } = await import('/src/modules/foliage/index.js');
+  const { atmosphereModule } = await import('/src/modules/atmosphere/index.js');
+  const { architectureModule } = await import('/src/modules/architecture/index.js');
+  const { createValleyStudy, STUDY_CAMERAS } = await import('/scripts/lib/worldValleyStudy.js');
+  const { probeWorldWaterField } = await import('/scripts/lib/worldWaterGpuProbe.js');
+  registerBuiltInComponents();
+  for (const module of [terrainModule, foliageModule, atmosphereModule, architectureModule]) registerModuleDefinition(module);
+  const engine = new Engine(); globalThis.__WORLD_STUDY_ENGINE__ = engine;
+  engine.setSize(innerWidth, innerHeight); await engine.init(document.querySelector('canvas'));
+  const renderer = engine.renderer, device = renderer.backend.device;
+  if (query.has('trace')) {
+    const destroy = GPUTexture.prototype.destroy;
+    GPUTexture.prototype.destroy = function(...args) { if (this.label?.includes('Shadow')) console.log('WORLD-STUDY SHADOW DISPOSE', new Error().stack); return destroy.apply(this, args); };
+  }
+  assert(renderer.backend.isWebGPUBackend, 'Real WebGPU required');
+  assert(device.limits.maxStorageBuffersPerShaderStage === 8, 'Portable-eight device required');
+  device.addEventListener('uncapturederror', event => { errors.push(event.error.message); console.error('WebGPU validation', event.error.message); });
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  applyOutputTransform(renderer, { toneMapping: THREE.ACESFilmicToneMapping, exposure: 1 });
+  for (const id of ['terrain', 'foliage', 'atmosphere', 'architecture']) await enableEngineModule(engine, id);
+  const camera = new THREE.PerspectiveCamera(48, innerWidth / innerHeight, .1, 1500);
+  engine.scene.add(camera); engine.camera = camera;
+  const canvas = document.querySelector('#view'), controls = new OrbitControls(camera, canvas);
+  controls.minDistance = .5; controls.maxDistance = 500;
+  // Immediate input keeps preset restoration exact and the camera still after
+  // a drag. The engine loop continues to animate foliage and the sun normally.
+  controls.enableDamping = false;
+  controls.listenToKeyEvents(canvas);
+  canvas.addEventListener('pointerdown', () => canvas.focus({ preventScroll: true }));
+  const offOrbit = engine.onPreRender(() => controls.update());
+  globalThis.addEventListener('pagehide', event => {
+    if (!event.persisted) { offOrbit(); controls.dispose(); study?.depthPrepass?.dispose(); }
+  });
+  let study, currentView = 'valley';
+  const moveCamera = name => {
+    const pose = STUDY_CAMERAS[name]; assert(pose, `Unknown study camera ${name}`);
+    camera.position.fromArray(pose.eye); controls.target.fromArray(pose.at);
+    if (study && name === 'forest') {
+      camera.position.y = study.heightAt(pose.eye[0], pose.eye[2]) + 2.2;
+      controls.target.y = study.heightAt(pose.at[0], pose.at[2]) + 3.5;
+    }
+    currentView = name;
+    if (name === 'cottage' && study?.cottage) {
+      study.cottage.updateWorldMatrix(true, true);
+      const bounds = new THREE.Box3().setFromObject(study.cottage), center = bounds.getCenter(new THREE.Vector3());
+      const direction = new THREE.Vector3(...pose.eye).sub(new THREE.Vector3(...pose.at)).normalize();
+      const right = new THREE.Vector3().crossVectors(camera.up, direction).normalize();
+      const up = new THREE.Vector3().crossVectors(direction, right);
+      const tanY = Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)), tanX = tanY * camera.aspect;
+      let distance = 1;
+      for (const x of [bounds.min.x, bounds.max.x]) for (const y of [bounds.min.y, bounds.max.y]) for (const z of [bounds.min.z, bounds.max.z]) {
+        const delta = new THREE.Vector3(x, y, z).sub(center), depth = delta.dot(direction);
+        distance = Math.max(distance, depth + Math.abs(delta.dot(right)) / tanX * 1.12, depth + Math.abs(delta.dot(up)) / tanY * 1.12);
+      }
+      camera.position.copy(center).addScaledVector(direction, distance); controls.target.copy(center);
+    }
+    camera.lookAt(controls.target); controls.update(); camera.updateMatrixWorld(true);
+    controls.saveState();
+    for (const button of document.querySelectorAll('[data-camera]')) button.setAttribute('aria-pressed', String(button.dataset.camera === name));
+  };
+  moveCamera('valley');
+  const sceneStart = performance.now();
+  let detailMaps = null;
+  if (settings.surfaceMode === 'materials') {
+    document.querySelector('#status').textContent = 'Loading landscape materials…';
+    document.querySelector('#surface-status').textContent = 'Loading grass, soil and stone surfaces…';
+    const { loadWorldSurfaceMaps } = await import('/scripts/lib/worldSurfaceMaps.js');
+    detailMaps = await loadWorldSurfaceMaps();
+  }
+  study = createValleyStudy(engine, { ...settings, detailMaps });
+  const surfaceReport = study.surfaceMaps?.report;
+  document.querySelector('#surface-status').textContent = surfaceReport
+    ? `Loaded material surfaces · ${surfaceReport.layers.map(layer => layer.role).join(', ')}`
+    : 'Procedural surfaces · generated from the landscape';
+  document.querySelector('#surface-status').dataset.mode = surfaceReport ? 'materials' : 'procedural';
+  document.querySelector('#status').textContent = 'Preparing the valley…';
+  moveCamera('valley');
+  const atmosphereEntity = engine.createEntity({ name: 'Study atmosphere' });
+  const atmosphere = atmosphereEntity.addComponent('atmosphere', { timeOfDay: 14, weather: 'fair', dayLength: 0, precipitation: false, cloudShadows: false });
+  const shadowCamera = atmosphere._resolveSun(engine).light.shadow.camera;
+  shadowCamera.left = shadowCamera.bottom = -125; shadowCamera.right = shadowCamera.top = 125;
+  shadowCamera.far = 500; shadowCamera.updateProjectionMatrix();
+  engine.scene.add(new THREE.HemisphereLight('#c4dbed', '#59573e', .65));
+  const gpuDomain = await probeWorldWaterField(device, study.packed, 512, 512);
+  // This isolated study is still stopped. Finish its initial compile before
+  // first shadow-target allocation can retire a sampled depth placeholder.
+  // Count all of this preparation in cold readiness; never warm a live scene.
+  const compileStart = performance.now();
+  await Promise.all(study.populations.map(layer => layer._atlasEntry?.promise));
+  study.prepareMaterials();
+  if (globalThis.__worldDepthPrepass !== false && query.get('depth') !== '0') {
+    const { installWorldDepthPrepass } = await import('/scripts/lib/worldDepthPrepassStudy.js');
+    study.depthPrepass = installWorldDepthPrepass(engine, study.populations);
+  }
+  engine.setPlaying(true);
+  await renderer.compileAsync(engine.scene, camera);
+  engine.scene.traverse(object => { if (object.isLight && object.shadow?.map) renderer.initRenderTarget(object.shadow.map); });
+  const compileMs = performance.now() - compileStart;
+  for (const button of document.querySelectorAll('[data-camera]')) button.onclick = () => moveCamera(button.dataset.camera);
+  document.querySelector('#sun').onclick = () => { atmosphere.setProp('dayLength', atmosphere.props.dayLength ? 0 : 1); };
+  globalThis.addEventListener('resize', () => { engine.setSize(innerWidth, innerHeight); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); });
+  const firstRender = new Promise(resolve => { const off = engine.onPostRender(() => { off(); resolve(performance.now() - began); }); });
+  engine.start();
+  const firstFrameMs = await firstRender;
+  const deadline = performance.now() + 150000;
+  while (!study.populations.every(layer => layer.stats.impostorReady)) {
+    if (performance.now() > deadline) throw new Error('Foliage preparation timed out');
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  await device.queue.onSubmittedWorkDone();
+  const readyMs = performance.now() - began;
+  assert(!errors.length, errors.join('\n'));
+  const navigateStudy = (newStyle = selectedStyle, apply = false, explicitSurface = false) => {
+    const nextSettings = { ...settings, geography: { ...settings.geography }, vegetation: { ...settings.vegetation } };
+    if (apply) {
+      for (const field of WORLD_STUDY_NUMBERS) {
+        const element = document.getElementById(field.input);
+        if (!element.reportValidity()) return;
+        (field.group ? nextSettings[field.group] : nextSettings)[field.key] = Number(element.value);
+      }
+      nextSettings.surfaceMode = document.querySelector('#surface-mode').value;
+      nextSettings.surfaceExplicit ||= surfaceSelectionChanged || explicitSurface;
+    }
+    location.search = worldStudySearch(query, nextSettings, { style: newStyle, cottageState: study.cottageState }).toString();
+  };
+  document.querySelector('#generate-world').disabled = false;
+  document.querySelector('#generate-world').onclick = () => navigateStudy(selectedStyle, true, true);
+  for (const link of document.querySelectorAll('[data-style]')) link.onclick = event => { event.preventDefault(); navigateStudy(link.dataset.style, true); };
+  const initial = { extentMetres: 128, style: query.get('style') ?? 'natural', baseline: query.has('baseline'), firstFrameMs, readyMs,
+    sceneBuildMs: study.cpuBuildMs, sceneStartMs: sceneStart - began, compileMs, gpuDomain,
+    treeDepthPrepass: !!study.depthPrepass,
+    treeDepthBatches: study.depthPrepass?.entries.length ?? 0,
+    adapter: device.adapterInfo ? { vendor: device.adapterInfo.vendor, architecture: device.adapterInfo.architecture, description: device.adapterInfo.description } : null,
+    storageLimit: device.limits.maxStorageBuffersPerShaderStage, width: innerWidth, height: innerHeight,
+    terrainMaterial: { name: study.terrain.mesh.material.name, vertexColors: study.terrain.mesh.material.vertexColors, vertices: study.terrain.geometry.attributes.color?.count },
+    atmosphere: atmosphere.state, sun: { visible: atmosphere._sun?.light.visible, intensity: atmosphere._sun?.light.intensity, position: atmosphere._sun?.light.position.toArray(), castShadow: atmosphere._sun?.light.castShadow, enabled: renderer.shadowMap.enabled },
+    layers: study.populations.map(layer => ({ species: layer.props.species, ...layer.stats })),
+    landscape: { seed: study.seed, forestDensity: study.forestDensity, groundDensity: study.groundDensity,
+      geography: study.fields.settings, vegetation: study.vegetation, surfaceMode: surfaceReport ? 'materials' : 'procedural', surfaceScale: settings.surfaceScale, surfaceBump: settings.surfaceBump,
+      surfaceMaps: surfaceReport ?? null, ecology: study.ecology.counts, rocks: study.rocks.userData.stats },
+    limitations: ['Configurable valley recipe; not the general World document/editor', 'Water surface/field prototype; production buoyancy, medium and caustics not integrated', 'Water reflects the sky environment; local geometry reflections/refraction remain open', 'No GI enabled in this study', 'Readiness waits for foliage atlases and submitted work; not a full product completion certificate'] };
+  const colorInput = document.querySelector('#roof-color'), resetColor = document.querySelector('#reset-edit');
+  const showCottageState = state => {
+    const { label, dimensions } = state.architecture;
+    document.querySelector('#status').textContent = `${label} · ${dimensions.width.toFixed(1)} × ${dimensions.depth.toFixed(1)} m · ${dimensions.storeys} ${dimensions.storeys === 1 ? 'storey' : 'storeys'} · seed ${state.seed}`;
+    colorInput.value = state.roofColor;
+    const custom = state.edits.length > 0;
+    document.querySelector('#roof-mode').textContent = custom
+      ? 'Custom color · kept when you generate another cottage'
+      : 'Generated color · changes with each cottage';
+    resetColor.disabled = !custom;
+  };
+  const changeCottage = change => {
+    try {
+      const state = study.regenerateCottage(change);
+      showCottageState(state); moveCamera('cottage');
+      const next = worldStudySearch(query, settings, { style: selectedStyle, cottageState: state });
+      history.replaceState(null, '', `?${next}`);
+      for (const link of document.querySelectorAll('[data-style]')) link.href = `?${worldStudySearch(query, settings, { style: link.dataset.style, cottageState: state })}`;
+    }
+    catch (error) { document.querySelector('#error').textContent = error.message; throw error; }
+  };
+  if (query.has('baseline')) {
+    document.querySelector('#status').textContent = 'Baseline · existing basic architecture';
+    document.querySelector('#study-caption').textContent = 'Choose Natural or Stylized for detailed cottage variations.';
+    document.querySelector('#roof-mode').textContent = 'Roof editing is available in Natural and Stylized.';
+  } else {
+    colorInput.disabled = false;
+    document.querySelector('#regenerate').disabled = false;
+    showCottageState(study.cottageState);
+    colorInput.onchange = () => changeCottage({ repaint: colorInput.value });
+    document.querySelector('#regenerate').onclick = () => changeCottage({ reseed: true });
+    resetColor.onclick = () => changeCottage({ reset: true });
+  }
+  const quantile = (values, q) => values.slice().sort((a,b) => a-b)[Math.min(values.length-1, Math.floor(values.length*q))] ?? null;
+  const measure = async ({ movingSun = false, seconds = 4 } = {}) => {
+    const queue = device.queue, counts = { submits: 0, writeBuffers: 0, writeTextures: 0, copies: 0, shadowDraws: 0, sceneTraversals: 0 };
+    const restore = [], wrap = (object, key, before) => { const original = object[key]; object[key] = function(...args) { before(...args); return original.apply(this,args); }; restore.push(() => { object[key] = original; }); };
+    wrap(queue, 'submit', () => counts.submits++); wrap(queue, 'writeBuffer', () => counts.writeBuffers++); wrap(queue, 'writeTexture', () => counts.writeTextures++);
+    for (const method of ['copyTextureToTexture','copyTextureToBuffer','copyBufferToTexture']) {
+      const proto = GPUCommandEncoder.prototype; wrap(proto, method, () => counts.copies++);
+    }
+    wrap(engine.scene, 'traverse', () => counts.sceneTraversals++);
+    const shadowHooks = [];
+    engine.scene.traverse(object => { if (!object.isMesh) return; const previous = object.onBeforeShadow; object.onBeforeShadow = function(...args) { counts.shadowDraws++; previous.apply(this, args); }; shadowHooks.push(() => { object.onBeforeShadow = previous; }); });
+    const frames = [], draws = []; let previous = performance.now();
+    atmosphere.setProp('dayLength', movingSun ? 1 : 0);
+    engine.stats.beginSpikeWatch({ seconds, thresholdMs: 16.7, keep: 8 });
+    const off = engine.onPostRender(() => { const now = performance.now(); frames.push(now-previous); previous = now; draws.push(engine.stats.readout.drawCalls); });
+    const sun = atmosphere._sun.light;
+    const sunDirection = () => sun.getWorldPosition(new THREE.Vector3()).sub(sun.target.getWorldPosition(new THREE.Vector3())).normalize();
+    const start = performance.now(), startTimeOfDay = atmosphere.props.timeOfDay, startDirection = sunDirection();
+    try { await new Promise(resolve => setTimeout(resolve, seconds*1000)); }
+    finally { off(); engine.stats.endPhaseCapture(); restore.reverse().forEach(fn => fn()); shadowHooks.forEach(fn => fn()); }
+    const elapsed = performance.now()-start, spikes = engine.stats.readSpikeWatch();
+    const sunAngleRadians = startDirection.angleTo(sunDirection());
+    atmosphere.setProp('dayLength', 0);
+    assert(frames.length > 20, 'Measurement must include rendered frames');
+    if (movingSun) {
+      assert(sunAngleRadians > .001, 'Moving-sun measurement must rotate the actual light');
+      assert(counts.shadowDraws > 0, 'Moving-sun measurement must draw real shadows');
+    }
+    return { movingSun, elapsedMs: elapsed, presentedFrames: frames.length, presentedFps: frames.length/elapsed*1000,
+      frameP50Ms: quantile(frames,.5), frameP95Ms: quantile(frames,.95), frameMaxMs: Math.max(...frames),
+      cpu: engine.stats.readPhaseCapture(), gpu: spikes.gpuFrames, counts,
+      meanPerFrame: Object.fromEntries(Object.entries(counts).map(([key,value])=>[key,value/frames.length])),
+      drawCallsP50: quantile(draws,.5), startTimeOfDay, endTimeOfDay: atmosphere.props.timeOfDay, sunAngleRadians,
+      memory: { ...renderer.info.memory }, errors: errors.slice() };
+  };
+  globalThis.__WORLD_STUDY__ = { initial, study, controls, moveCamera,
+    cameraState: () => ({ preset: currentView, position: camera.position.toArray(), target: controls.target.toArray(), quaternion: camera.quaternion.toArray(), distance: controls.getDistance() }),
+    measure, resetSun: () => atmosphere.setProp('timeOfDay', 14), errors };
+  globalThis.__WORLD_STUDY_RESULT__ = { pass: true, ...initial };
+  console.log('WORLD-STUDY READY', JSON.stringify(initial));
+} catch (error) {
+  console.error('WORLD-STUDY FAIL', error.stack ?? error);
+  document.querySelector('#surface-status').textContent = 'Study preparation failed; see the error below.';
+  document.querySelector('#error').textContent = error.message;
+  globalThis.__WORLD_STUDY_RESULT__ = { pass: false, error: error.stack ?? String(error), errors };
+}
+</script></body></html>

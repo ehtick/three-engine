@@ -262,6 +262,12 @@ export class ShadowFreezeSystem {
     // The author's own freeze wins outright: re-enabling autoUpdate under a
     // project that switched it off would be this system overriding a setting
     // rather than implementing one.
+    // Published for `asyncRenderPipelines`' busy gate: true ONLY on the path
+    // below that releases every freeze and re-renders each map every frame, so
+    // a pipeline still compiling can never be baked into cached shadow content.
+    // Every other path — this system freezing, the author's one-shot shadows,
+    // an update stride, a device change — leaves it false.
+    if (engine.renderer) engine.renderer.__shadowMapsRedrawnEveryFrame = false;
     if (this.enabled === false) {
       this.reason = "disabled";
       this.#releaseAll(true);
@@ -294,6 +300,7 @@ export class ShadowFreezeSystem {
       this.managedLights = 0;
       this.#releaseAll();
       this.#applyUpdateStride(scene);
+      if (engine.renderer && this.updateStride <= 1) engine.renderer.__shadowMapsRedrawnEveryFrame = true;
       return;
     }
 

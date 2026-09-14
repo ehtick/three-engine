@@ -29,7 +29,17 @@ function solid(form) {
   const low = ring.map(([x, z]) => [x, bottom, z]), high = ring.map(([x, z]) => [x, top, z]);
   const faces = [low];
   for (let i = 0; i < ring.length; i++) faces.push([low[i], low[(i + 1) % ring.length], high[(i + 1) % ring.length], high[i]]);
-  if (form.roof !== "hip") faces.push(high);
+  if (form.roof === "gable" && form.shape !== "round") {
+    const width = form.size[0], depth = form.size[2], c = Math.cos(form.rotationY), s = Math.sin(form.rotationY);
+    const peak = (x, z) => [form.position[0] + x * c + z * s, top + form.roofHeight, form.position[2] - x * s + z * c];
+    if ((form.roofAxis ?? (width >= depth ? "x" : "z")) === "x") {
+      const left = peak(-width / 2, 0), right = peak(width / 2, 0);
+      faces.push([high[0], high[1], right, left], [high[2], high[3], left, right], [high[1], high[2], right], [high[0], high[3], left]);
+    } else {
+      const front = peak(0, -depth / 2), back = peak(0, depth / 2);
+      faces.push([high[1], high[2], back, front], [high[3], high[0], front, back], [high[0], high[1], front], [high[2], high[3], back]);
+    }
+  } else if (form.roof !== "hip" && form.roof !== "gable") faces.push(high);
   else if (form.shape === "round") {
     const peak = [form.position[0], top + form.roofHeight, form.position[2]];
     for (let i = 0; i < high.length; i++) faces.push([high[i], high[(i + 1) % high.length], peak]);

@@ -69,6 +69,7 @@ import { MAX_EMITTERS, analyticDirectAt, decodeOctNormal, emitterDirectAt, emitt
 import { octDecodeTSL } from "./rayHit/rayHitTSL.js";
 import { DEBUG_LAYER, EDITOR_LAYER, GI_DEPTH_LAYER, GI_SHARP_LAYER, UI_LAYER } from "../../engine/editorLayers.js";
 import { readRenderTargetImage } from "../../engine/renderTargetImage.js";
+import { isFlatTexture } from "./materialNodeBindings.js";
 import { ALBEDO_ATLAS_GRID, ALBEDO_ATLAS_SIZE, ALBEDO_ATLAS_TILE } from "./bvh/bvhScene.js";
 import { sampleReflectionProbes } from "./reflectionProbes.js";
 
@@ -6279,6 +6280,8 @@ function oneShotTargetFor(size, name) {
 }
 
 export async function computeCompressedTextureAverage(renderer, tex) {
+  // The shared blit samples 2D only — see isFlatTexture.
+  if (!isFlatTexture(tex)) return null;
   const size = 32;
   const rt = oneShotTargetFor(size, "giTexAverage");
   const rendererState = THREE.RendererUtils.resetRendererState(renderer);
@@ -6322,6 +6325,7 @@ export async function computeCompressedTextureAverage(renderer, tex) {
  * `y = floor((1 − v) · size)`. Null when the readback yields nothing.
  */
 export async function readTexturePixelsGPU(renderer, tex, size = 64) {
+  if (!isFlatTexture(tex)) return null;
   const rt = oneShotTargetFor(size, "giTexPixels");
   const rendererState = THREE.RendererUtils.resetRendererState(renderer);
   const quad = new THREE.QuadMesh();
@@ -6439,6 +6443,7 @@ export function blitBvhAtlasTiles(renderer, bvhScene) {
     // onward finds the pipeline already in three's cache.
     renderer.setScissorTest(true);
     for (const { map, tileIndex, tint } of pending) {
+      if (!isFlatTexture(map)) continue; // the relayed tile stands
       const tileX = (tileIndex % atlasGrid) * atlasTile;
       const tileY = Math.floor(tileIndex / atlasGrid) * atlasTile;
       rt.viewport.set(tileX, tileY, atlasTile, atlasTile);

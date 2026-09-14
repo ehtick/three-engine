@@ -1,0 +1,62 @@
+<!doctype html><html><head><meta charset="utf-8"><link rel="icon" href="data:,"><title>Architecture preview</title>
+<style>html,body{margin:0;background:#c9d6dc;font:13px system-ui}canvas{display:block}</style></head>
+<body><canvas id="view"></canvas><script type="module">
+try {
+  const W = 800, H = 500;
+  const { Engine, THREE, registerBuiltInComponents } = await import('/src/engine/index.js');
+  await import('/src/modules/index.js');
+  const { enableEngineModule } = await import('/src/engine/modules.js');
+  const { STYLE_IDS } = await import('/src/modules/architecture/styles/catalog.js');
+  const surfaces = await import('/src/modules/architecture/styles/surfaces.js');
+  const { ARCHITECTURE_PREVIEW_SCENARIOS } = await import('/scripts/lib/architecturePreviewScenarios.js');
+  registerBuiltInComponents();
+  const engine = new Engine(); engine.setSize(W, H);
+  await engine.init(document.querySelector('#view'));
+  const renderer = engine.renderer;
+  renderer.backend.device?.addEventListener?.('uncapturederror', event => console.error('WebGPU validation', event.error.message));
+  await enableEngineModule(engine, 'architecture');
+  renderer.toneMapping = THREE.ACESFilmicToneMapping; renderer.toneMappingExposure = 1;
+  engine.scene.background = new THREE.Color('#bcd0dc');
+  engine.scene.add(new THREE.HemisphereLight('#dfeeff', '#8a7a5c', 1.6));
+  const sun = new THREE.DirectionalLight('#fff0d6', 3.2);
+  engine.scene.add(sun, sun.target);
+  renderer.shadowMap.enabled = true; sun.castShadow = true; sun.shadow.mapSize.set(4096, 4096);
+  sun.shadow.bias = -.0004; sun.shadow.normalBias = .03;
+  const ground = new THREE.Mesh(new THREE.PlaneGeometry(400, 400), new THREE.MeshStandardNodeMaterial({ color: '#7f8a62', roughness: 1 }));
+  ground.rotation.x = -Math.PI / 2; ground.position.y = -.01; ground.receiveShadow = true; engine.scene.add(ground);
+  const camera = new THREE.PerspectiveCamera(38, W / H, .05, 800);
+  engine.camera = camera; engine.scene.add(camera);
+  surfaces.styleSurfaceArray(surfaces.STYLE_SURFACE_KINDS);
+  let current = null;
+  const pause = ms => new Promise(r => setTimeout(r, ms));
+  const render = async ({ scenario = 'cottage', style = '', seed = 1, yaw = .75, pitch = .42, zoom = 1, focus = null, model = null } = {}) => {
+    if (current) { engine.destroyEntity(current); current = null; }
+    const doc = model ?? ARCHITECTURE_PREVIEW_SCENARIOS[scenario]();
+    if (style) doc.style = { id: style, seed };
+    const entity = engine.createEntity({ name: scenario });
+    const started = performance.now();
+    const component = entity.addComponent('architecture', { model: doc, collision: false });
+    const buildMs = performance.now() - started;
+    current = entity;
+    for (let i = 0; i < 200; i++) { const { done } = surfaces.pumpStyleSurfaceArray(64); if (done) break; await pause(0); }
+    const geometry = component.geometry;
+    geometry.computeBoundingBox();
+    const box = geometry.boundingBox.clone(), center = box.getCenter(new THREE.Vector3()), size = box.getSize(new THREE.Vector3());
+    const radius = Math.max(size.length() / 2, 2);
+    const target = focus ? new THREE.Vector3(...focus) : center;
+    const distance = (focus ? radius * .45 : radius / Math.sin(THREE.MathUtils.degToRad(camera.fov / 2)) * .82) / zoom;
+    camera.position.set(target.x + Math.sin(yaw) * Math.cos(pitch) * distance, target.y + Math.sin(pitch) * distance, target.z + Math.cos(yaw) * Math.cos(pitch) * distance);
+    camera.lookAt(target); camera.updateMatrixWorld(true);
+    sun.position.set(center.x - radius * 1.2, center.y + radius * 2.2, center.z + radius * 1.6); sun.target.position.copy(center); sun.target.updateMatrixWorld();
+    Object.assign(sun.shadow.camera, { left: -radius * 1.6, right: radius * 1.6, top: radius * 1.6, bottom: -radius * 1.6, near: .1, far: radius * 8 });
+    sun.shadow.camera.updateProjectionMatrix();
+    await renderer.compileAsync(engine.scene, camera);
+    renderer.render(engine.scene, camera);
+    await renderer.backend.device.queue.onSubmittedWorkDone();
+    const mats = new Set((Array.isArray(component.mesh?.material) ? component.mesh.material : []).map(m => m.name));
+    return { scenario, style, seed, buildMs: Math.round(buildMs), triangles: geometry.index ? geometry.index.count / 3 : geometry.attributes.position.count / 3, groups: geometry.groups.length, materials: [...mats] };
+  };
+  globalThis.__ARCH_PREVIEW__ = { render, engine, STYLE_IDS: [...STYLE_IDS], scenarios: Object.keys(ARCHITECTURE_PREVIEW_SCENARIOS), W, H };
+  globalThis.__ARCH_PREVIEW_READY__ = true;
+} catch (error) { console.error(error); globalThis.__ARCH_PREVIEW_ERROR__ = error.stack ?? String(error); }
+</script></body></html>

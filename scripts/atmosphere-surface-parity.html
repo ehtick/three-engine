@@ -1,0 +1,128 @@
+<!doctype html><html><head><meta charset="utf-8"><link rel="icon" href="data:,"><title>Atmosphere surface branch GPU parity</title></head>
+<body><canvas id="view"></canvas><pre id="status">Checking actual weathered materials…</pre><script type="module">
+const assert = (condition, message) => { if (!condition) throw new Error(message); };
+const errors = [], result = { pass: false, cases: [] };
+try {
+  globalThis.__engineLimitsCap = { maxStorageBuffersPerShaderStage: 8 };
+  const { Engine, THREE } = await import('/src/engine/index.js');
+  const { texture, normalMap, uniform, vec2, vec3 } = await import('three/tsl');
+  const { createSurfaceUniforms, patchMaterial } = await import('/src/modules/atmosphere/weatherSurface.js');
+  const engine = new Engine(); engine.setSize(768, 384); await engine.init(document.querySelector('#view'));
+  // No engine loop: all renders and readbacks below run serially.
+  const renderer = engine.renderer, device = renderer.backend.device;
+  assert(renderer.backend.isWebGPUBackend && device.limits.maxStorageBuffersPerShaderStage === 8, 'Real portable-eight WebGPU required');
+  result.storageLimit = device.limits.maxStorageBuffersPerShaderStage;
+  device.addEventListener('uncapturederror', event => { errors.push(event.error.message); console.error('WebGPU validation', event.error.message); });
+  renderer.toneMapping = THREE.NoToneMapping; renderer.outputColorSpace = THREE.SRGBColorSpace;
+  const width = 768, height = 384, target = new THREE.RenderTarget(width, height);
+  target.texture.colorSpace = THREE.SRGBColorSpace;
+  renderer.initRenderTarget(target); renderer.setRenderTarget(target);
+  const camera = new THREE.OrthographicCamera(-3.5, 3.5, 1.75, -1.75, .1, 30);
+  camera.position.set(0, 5, 5); camera.lookAt(0, 0, 0);
+  const data = new Uint8Array(64 * 64 * 4), normalData = new Uint8Array(data.length);
+  for (let y = 0; y < 64; y++) for (let x = 0; x < 64; x++) {
+    const i = (y * 64 + x) * 4, n = Math.sin(x * .31) * Math.cos(y * .27);
+    data.set([65 + Math.round(20 * n), 92 + Math.round(32 * n), 45 + ((x * 7 + y * 11) % 36), 255], i);
+    normalData.set([128 + Math.round(30 * Math.cos(x * .31)), 128 + Math.round(25 * Math.sin(y * .27)), 248, 255], i);
+  }
+  const albedo = new THREE.DataTexture(data, 64, 64), normals = new THREE.DataTexture(normalData, 64, 64);
+  for (const map of [albedo, normals]) {
+    map.wrapS = map.wrapT = THREE.RepeatWrapping;
+    map.minFilter = map.magFilter = THREE.LinearFilter; map.needsUpdate = true;
+  }
+  albedo.colorSpace = THREE.SRGBColorSpace;
+  const roofData = new Float32Array(16 * 16 * 4);
+  for (let i = 0; i < 256; i++) { roofData[i * 4] = (i % 16) < 6 ? 4 : -10000; roofData[i * 4 + 3] = 1; }
+  const roof = new THREE.DataTexture(roofData, 16, 16, THREE.RGBAFormat, THREE.FloatType); roof.needsUpdate = true;
+  const u = createSurfaceUniforms(); u.snow.setName('surfaceSnow'); u.wetness.setName('surfaceWetness');
+  u.sky.mapNode = texture(roof); u.sky.strength.value = .65; u.sky.extent.value = 8; u.sky.center.value.set(0, 0);
+  const geometry = new THREE.PlaneGeometry(2, 2, 2, 2); geometry.rotateX(-Math.PI / 2);
+  const arms = [], shaders = { branch: [], legacy: [] }, pipelineCounts = { sync: 0, async: 0, shaders: 0 };
+  globalThis.__ATMOSPHERE_SURFACE_SHADERS__ = shaders;
+  let armLabel = 'branch';
+  const originals = { shader: device.createShaderModule, sync: device.createRenderPipeline, async: device.createRenderPipelineAsync };
+  device.createShaderModule = function(descriptor) {
+    pipelineCounts.shaders++; shaders[armLabel]?.push(descriptor.code);
+    return originals.shader.call(this, descriptor);
+  };
+  device.createRenderPipeline = function(...args) { pipelineCounts.sync++; return originals.sync.apply(this, args); };
+  device.createRenderPipelineAsync = function(...args) { pipelineCounts.async++; return originals.async.apply(this, args); };
+  const capture = async scene => {
+    renderer.render(scene, camera);
+    return new Uint8Array(await renderer.readRenderTargetPixelsAsync(target, 0, 0, width, height));
+  };
+  for (const [label, branch] of [['branch', true], ['legacy', false]]) {
+    armLabel = label; globalThis.__atmosphereDrySurfaceBranch = branch;
+    const scene = new THREE.Scene(); scene.background = new THREE.Color('#131b26');
+    scene.add(new THREE.AmbientLight('#bed4ee', 1.1));
+    const sun = new THREE.DirectionalLight('#fff1d8', 3.1); sun.position.set(-2, 5, 3); scene.add(sun);
+    const materials = [];
+    for (let i = 0; i < 3; i++) {
+      const material = new THREE.MeshStandardNodeMaterial({ color: '#ffffff', side: THREE.DoubleSide });
+      material.name = `Surface parity ${label} ${i}`;
+      const authored = texture(albedo);
+      material.colorNode = authored.rgb.mul(vec3(.91, 1.02, .88));
+      material.normalNode = normalMap(texture(normals), vec2(.7, .55));
+      material.roughnessNode = i === 1 ? authored.g.mul(.63).add(.19) : uniform(i === 0 ? 0 : 1.4);
+      material.metalnessNode = authored.b.mul(i === 1 ? 1.8 : .7).clamp(0, 1);
+      assert(patchMaterial(material, u), 'Production weather wrapper must attach');
+      const mesh = new THREE.Mesh(geometry, material); mesh.position.x = (i - 1) * 2.25; scene.add(mesh); materials.push(material);
+    }
+    await renderer.compileAsync(scene, camera);
+    await capture(scene); await capture(scene);
+    arms.push({ label, scene, materials });
+  }
+  const branchIf = /if\s*\([^\n]*surfaceSnow\s*!=\s*0\.0[^\n]*surfaceWetness\s*!=\s*0\.0/;
+  result.shaderBranches = Object.fromEntries(Object.entries(shaders).map(([label, entries]) => [label, entries.filter(code => branchIf.test(code)).length]));
+  // The two uniform-roughness materials share one native shader program.
+  // The textured roughness produces the second actual shader variant.
+  assert(result.shaderBranches.branch >= 2 && result.shaderBranches.legacy === 0, 'A/B must compile actual guarded and legacy fragment shaders');
+  const readyCounts = { ...pipelineCounts }, versions = arms.map(arm => arm.materials.map(material => material.version));
+  const differences = (a, b) => {
+    let maximum = 0, changed = 0, sum = 0, strongPixels = 0;
+    for (let i = 0; i < a.length; i += 4) {
+      let pixelDelta = 0;
+      for (let c = 0; c < 3; c++) { const delta = Math.abs(a[i + c] - b[i + c]); maximum = Math.max(maximum, delta); sum += delta; changed += Number(delta > 0); pixelDelta += delta; }
+      strongPixels += Number(pixelDelta > 6);
+    }
+    return { maximum, changedChannels: changed, changedFraction: changed / (width * height * 3), meanAbsoluteError: sum / (width * height * 3), strongPixels };
+  };
+  const states = [['dry', 0, 0], ['tiny-wet', 0, .00001], ['wet', 0, .8], ['snow', .7, .12], ['mixed', .3, .55], ['dry-restored', 0, 0]];
+  let dry = null;
+  const images = {};
+  globalThis.__ATMOSPHERE_SURFACE_IMAGES__ = images;
+  for (const [name, snow, wetness] of states) {
+    u.snow.value = snow; u.wetness.value = wetness;
+    const pair = [];
+    for (const arm of arms) { armLabel = arm.label; pair.push(await capture(arm.scene)); }
+    const parity = differences(...pair);
+    if (['dry', 'wet', 'snow'].includes(name)) {
+      for (let i = 0; i < pair.length; i++) {
+        const canvas = document.createElement('canvas'); canvas.width = width; canvas.height = height;
+        canvas.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(pair[i]), width, height), 0, 0);
+        images[`${name}-${arms[i].label}`] = canvas.toDataURL('image/png');
+      }
+    }
+    // Algebra is identical. Permit one 8-bit rounding step on <=0.5% of RGB
+    // channels for backend scheduling/reassociation, never a visible pixel loss.
+    assert(parity.maximum <= 1 && parity.changedFraction <= .005, `${name} differs from legacy: ${JSON.stringify(parity)}`);
+    if (!dry) dry = pair[0];
+    const changedFromDry = differences(dry, pair[0]);
+    if (name === 'wet' || name === 'snow') assert(changedFromDry.strongPixels > width * height * .08, `${name} must visibly change authored surfaces`);
+    if (name === 'dry-restored') assert(changedFromDry.changedChannels === 0, 'Uniform-only dry restore must recover exact initial pixels');
+    result.cases.push({ name, snow, wetness, parity, changedFromDry });
+  }
+  result.transitionCompiles = Object.fromEntries(Object.entries(pipelineCounts).map(([name, value]) => [name, value - readyCounts[name]]));
+  assert(Object.values(result.transitionCompiles).every(value => value === 0), 'Changing weather uniforms must not compile shaders or pipelines');
+  assert(arms.every((arm, i) => arm.materials.every((material, j) => material.version === versions[i][j])), 'Changing weather must not invalidate material graphs');
+  await device.queue.onSubmittedWorkDone(); assert(!errors.length, errors.join('\n'));
+  device.createShaderModule = originals.shader; device.createRenderPipeline = originals.sync; device.createRenderPipelineAsync = originals.async;
+  delete globalThis.__atmosphereDrySurfaceBranch;
+  renderer.setRenderTarget(null); renderer.render(arms[0].scene, camera);
+  globalThis.__ATMOSPHERE_SURFACE_IMAGES__ = images;
+  Object.assign(result, { pass: true, width, height, errors });
+  console.log('ATMOSPHERE-SURFACE PASS', JSON.stringify(result));
+} catch (error) { result.error = String(error.stack ?? error); result.errors = errors; console.error('ATMOSPHERE-SURFACE FAIL', result.error); }
+globalThis.__ATMOSPHERE_SURFACE_RESULT__ = result;
+document.querySelector('#status').textContent = JSON.stringify(result, null, 2);
+</script></body></html>

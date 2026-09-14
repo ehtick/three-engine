@@ -59,6 +59,8 @@ import "./ops/character.js";
 import "./ops/vfx.js";
 import "./ops/physics.js";
 import "./ops/atmosphere.js";
+import "./ops/world.js";
+import "./ops/probeLighting.js"; // DEV probe — remove when the lighting investigation closes
 
 /** Runs an op synchronously, asserting it isn't one of the async ones. Used by
  *  the sync accessors below, where returning a promise would be a footgun. */

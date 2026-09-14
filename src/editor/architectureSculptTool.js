@@ -9,9 +9,12 @@ import { disarmArchitecturePlacement, subscribeArchitecturePlacement, isArchitec
 import { disarmTerrainBrush, subscribeTerrainBrush, getTerrainBrushMode } from "./terrainBrush.js";
 import { createArchitectureModel, setArchitectureModel, getArchitectureModelRoot } from "./architectureModelBuild.js";
 import { buildArchitectureFormGeometry } from "../modules/architecture/formGeometry.js";
+import { resolveArchitectureForm } from "../modules/architecture/formModel.js";
+import { resolveStyle, DEFAULT_STYLE_ID, STYLE_IDS } from "../modules/architecture/styles/catalog.js";
 
 const TOOLS = ["build", "round", "wall", "grow", "reshape", "path", "window", "door", "paint", "erase"];
-const defaults = { tool: "build", height: 3, width: 3, thickness: .3, roofHeight: 1.2, roof: "hip", color: "#d5d1c7", windows: true, cellSize: 3, snap: 0, parentId: null };
+// roof "auto" + roofHeight 0 + thickness 0 follow the composition style (pitch, wall and boundary sizes).
+const defaults = { tool: "build", height: 4, width: 6, thickness: 0, roofHeight: 0, roof: "auto", color: "#ddc7a5", windows: true, cellSize: 3, snap: 0, parentId: null, style: DEFAULT_STYLE_ID };
 let state = { ...defaults, active: false, rootId: null, formId: null, hover: null, dragging: false, error: "" };
 const listeners = new Set();
 let teardownPrevious = null, cancelGesture = null;
@@ -23,6 +26,8 @@ const componentOf = root => root?.getComponent("architecture");
 const modelOf = root => clone(componentOf(root)?.model ?? componentOf(root)?.props.model ?? emptyModel());
 const resolveRoot = id => id ? getArchitectureModelRoot(id) : null;
 const selectedRoot = () => resolveRoot(state.rootId);
+const styleOf = root => { const style = root && modelOf(root).style; return style ? resolveStyle(style.id, style.params) : null; };
+const validStyle = value => { if (value && !STYLE_IDS.includes(value)) throw new Error(`Unknown architecture style "${value}".`); return value; };
 const finite = (value, min, max, name) => { if (!Number.isFinite(value) || value < min || value > max) throw new Error(`${name} must be between ${min} and ${max}.`); return value; };
 
 export function isArchitectureSculptActive() { return state.active; }
@@ -40,8 +45,8 @@ export function armArchitectureSculpt(options = {}) {
   if (state.dragging) return getArchitectureSculptState();
   const next = { ...defaults, ...options };
   if (!TOOLS.includes(next.tool)) throw new Error(`Unknown architecture gesture "${next.tool}".`);
-  for (const key of ["height", "width", "thickness", "cellSize"]) finite(next[key], .1, 10000, key);
-  finite(next.roofHeight, 0, 10000, "Roof height"); finite(next.snap, 0, 100, "Snap");
+  for (const key of ["height", "width", "cellSize"]) finite(next[key], .1, 10000, key);
+  finite(next.thickness, 0, 10000, "thickness"); finite(next.roofHeight, 0, 10000, "Roof height"); finite(next.snap, 0, 100, "Snap"); validStyle(next.style);
   if (!/^#[0-9a-f]{6}$/i.test(next.color)) throw new Error("Color must be a six-digit hex color.");
   if (next.parentId && !engine.getEntity(next.parentId)) throw new Error("The target assembly no longer exists.");
   // An arm that changes NOTHING the tool owns is a no-op rather than a
@@ -73,8 +78,9 @@ export function setArchitectureSculptSetting(key, value) {
   }
   if (!(key in defaults)) throw new Error(`Unknown architecture setting "${key}".`);
   if (key === "tool" && !TOOLS.includes(value)) throw new Error("Unknown architecture tool.");
-  if (["height", "width", "thickness", "cellSize"].includes(key)) finite(value, .1, 10000, key);
-  if (["roofHeight", "snap"].includes(key)) finite(value, 0, key === "snap" ? 100 : 10000, key);
+  if (["height", "width", "cellSize"].includes(key)) finite(value, .1, 10000, key);
+  if (["roofHeight", "snap", "thickness"].includes(key)) finite(value, 0, key === "snap" ? 100 : 10000, key);
+  if (key === "style") validStyle(value);
   if (key === "color" && !/^#[0-9a-f]{6}$/i.test(value)) throw new Error("Color must be a six-digit hex color.");
   if (key === "parentId" && value && !engine.getEntity(value)) throw new Error("The target assembly no longer exists.");
   if (key === "tool" || key === "parentId") cancelGesture?.();
@@ -122,7 +128,7 @@ function localNormal(root, normal) {
 }
 function formPoint(form, point) { return point.clone().sub(new THREE.Vector3(...form.position)).applyAxisAngle(new THREE.Vector3(0, 1, 0), -(form.rotationY ?? 0)); }
 function fromForm(form, point) { return point.clone().applyAxisAngle(new THREE.Vector3(0, 1, 0), form.rotationY ?? 0).add(new THREE.Vector3(...form.position)); }
-function makeForm(position, size, shape = "box") { return { id: uid(), shape, position: [...position], size: [...size], rotationY: 0, color: state.color, roof: state.roof, roofHeight: state.roofHeight, windows: state.windows !== false }; }
+function makeForm(position, size, shape = "box") { return { id: uid(), shape, position: [...position], size: [...size], rotationY: 0, color: state.color, roof: state.roof, roofHeight: state.roofHeight > 0 ? state.roofHeight : null, windows: state.windows !== false }; }
 function formKey(form) { return [...form.position, ...form.size, form.rotationY ?? 0].map(value => Math.round(value * 1000)).join(":"); }
 function followOpenings(model, before, after) {
   const yaw = (after.rotationY ?? 0) - (before.rotationY ?? 0);
@@ -208,7 +214,7 @@ export function setupArchitectureSculptTool(canvas, viewport) {
   };
   const createRoot = point => {
     updating = true;
-    try { return engine.getEntity(createArchitectureModel({ model: emptyModel(), position: point.toArray(), parentId: state.parentId, name: "Architecture" }).entityId); }
+    try { return engine.getEntity(createArchitectureModel({ model: { ...emptyModel(), ...(state.style ? { style: { id: state.style, seed: 1 + Math.floor(Math.random() * 100000) } } : {}) }, position: point.toArray(), parentId: state.parentId, name: "Architecture" }).entityId); }
     finally { updating = false; }
   };
   const releaseCapture = () => {
@@ -218,9 +224,10 @@ export function setupArchitectureSculptTool(canvas, viewport) {
   };
   const finish = cancel => {
     if (!drag && !state.dragging) return;
+    const draftRoot = drag?.root;
     releaseCapture(); drag = null; state.dragging = false;
     updating = true;
-    try { if (cancel) commandBus.cancelPreview(); else commandBus.endPreview(); }
+    try { componentOf(draftRoot)?.setDraft?.(false); if (cancel) commandBus.cancelPreview(); else commandBus.endPreview(); }
     finally { updating = false; }
     if (!resolveRoot(state.rootId)) { state.rootId = null; state.formId = null; }
     ghostKey = highlightKey = handlesKey = "";
@@ -266,6 +273,7 @@ export function setupArchitectureSculptTool(canvas, viewport) {
     highlight.userData.formId = hit.form?.id ?? null; highlight.userData.pathId = hit.surface.pathId ?? null; highlight.userData.surface = hit.surface.kind;
     engine.scene.add(highlight);
   };
+  const pitchedHeight = (root, form) => { const resolved = resolveArchitectureForm(form, styleOf(root)); return ["hip", "gable", "shed", "dome"].includes(resolved.roof) ? resolved.roofHeight : 0; };
   const updateHandles = () => {
     const root = selectedRoot(), form = root && modelOf(root).forms.find(form => form.id === state.formId);
     const key = state.active && state.tool === "reshape" && form ? `${root.id}:${JSON.stringify(form)}:${viewport.camera.position.toArray()}` : "";
@@ -280,7 +288,7 @@ export function setupArchitectureSculptTool(canvas, viewport) {
     const descriptors = [
       ["width+", [w / 2, h / 2, 0], 0x95c9eb], ["width-", [-w / 2, h / 2, 0], 0x95c9eb],
       ["depth+", [0, h / 2, d / 2], 0x95c9eb], ["depth-", [0, h / 2, -d / 2], 0x95c9eb],
-      ["height", [0, h, 0], 0xa2e3b9], ["roofHeight", [0, h + Math.max(.45, form.roofHeight ?? 0), 0], 0xe9c68b],
+      ["height", [0, h, 0], 0xa2e3b9], ["roofHeight", [0, h + Math.max(.45, pitchedHeight(root, form)), 0], 0xe9c68b],
       ["move", [0, .1, d / 2 + .8], 0xffffff], ["yaw", [w / 2 + .8, .15, -d / 2 - .8], 0xc5a1ee],
       ["elevation", [-w / 2 - .8, .15, d / 2 + .8], 0xeeb58d],
     ];
@@ -375,14 +383,19 @@ export function setupArchitectureSculptTool(canvas, viewport) {
       if (pathId) model.paths = model.paths.filter(path => path.id !== pathId);
       else { model.forms = model.forms.filter(form => form.id !== hit.form.id); model.openings = model.openings.filter(opening => opening.formId !== hit.form.id); }
       state.formId = null;
-    } else if (state.tool === "paint") model.forms.find(form => form.id === hit.form.id).color = state.color;
+    } else if (state.tool === "paint") {
+      // Paint what was clicked: a roof keeps its own colour, a wall its own.
+      const target = model.forms.find(form => form.id === hit.form.id);
+      if (String(hit.surface?.kind).startsWith("roof") && Math.abs(hit.normal.y) > .3) target.roofColor = state.color; else target.color = state.color;
+    }
     else if (["window", "door"].includes(state.tool)) {
-      if (Math.abs(hit.normal.y) > .5 || hit.surface?.kind !== "wall") { finish(true); return; }
-      const height = state.tool === "door" ? Math.min(2.5, hit.form.size[1] - .1) : Math.min(1.4, hit.form.size[1] - .2);
+      if (Math.abs(hit.normal.y) > .5 || !String(hit.surface?.kind).startsWith("wall")) { finish(true); return; }
+      const O = styleOf(hit.root)?.openings;
+      const height = state.tool === "door" ? Math.min(O?.door.h ?? 2.5, hit.form.size[1] - .1) : Math.min(O?.window.h ?? 1.4, hit.form.size[1] - .2);
       const point = hit.local.clone();
       point.y = state.tool === "door" ? hit.form.position[1] + height / 2 : THREE.MathUtils.clamp(point.y, hit.form.position[1] + height / 2 + .05, hit.form.position[1] + hit.form.size[1] - height / 2 - .05);
       const normal = hit.normal.clone(); normal.y = 0; normal.normalize();
-      model.openings.push({ id: uid(), formId: hit.form.id, position: point.toArray(), normal: normal.toArray(), width: state.tool === "door" ? 1.2 : 1.1, height, kind: state.tool });
+      model.openings.push({ id: uid(), formId: hit.form.id, position: point.toArray(), normal: normal.toArray(), width: state.tool === "door" ? O?.door.w ?? 1.2 : O?.window.w ?? 1.1, height, kind: state.tool });
     }
     write(hit.root, model);
   };
@@ -441,21 +454,24 @@ export function setupArchitectureSculptTool(canvas, viewport) {
     if (!engine.getEntity(root.id)) { finish(true); return; }
     if (drag.type === "grow") { addCell(event, surfaceHit(event)); return; }
     if (drag.type === "click") return;
+    componentOf(root)?.setDraft?.(true);
     const model = clone(drag.model);
     if (drag.type === "build" || drag.type === "path" || drag.type === "wall") {
       const point = planePoint(event, root, drag.type === "build" ? drag.start.y : drag.path.elevation); if (!point) return;
       const local = snapped(localPoint(root, point), event);
       if (drag.type === "path" || drag.type === "wall") {
         const last = drag.path.points.at(-1);
-        if (Math.hypot(local.x - last[0], local.z - last[1]) < Math.max(.1, drag.type === "wall" ? state.thickness * 1.5 : state.width * .15)) return;
+        if (Math.hypot(local.x - last[0], local.z - last[1]) < Math.max(.1, drag.type === "wall" ? (state.thickness || .5) * 1.5 : state.width * .15)) return;
         if (drag.path.points.length >= 65) return;
         drag.path.points.push([local.x, local.z]);
         if (drag.type === "path") model.paths.push(clone(drag.path));
         else {
+          const boundary = styleOf(root)?.boundary, T = state.thickness > 0 ? state.thickness : boundary?.thickness ?? .3, WH = boundary ? boundary.height : state.height;
           for (let index = 1; index < drag.path.points.length; index++) {
             const a = drag.path.points[index - 1], b = drag.path.points[index], dx = b[0] - a[0], dz = b[1] - a[1];
-            const form = makeForm([(a[0] + b[0]) / 2, drag.path.elevation, (a[1] + b[1]) / 2], [Math.hypot(dx, dz) + state.thickness * .2, state.height, state.thickness]);
-            form.id = drag.segmentIds[index - 1] ??= uid(); form.roof = "none"; form.roofHeight = 0; form.windows = false; form.rotationY = -Math.atan2(dz, dx);
+            // Segments overlap by a full thickness so bends close; the style caps and pillars them.
+            const form = makeForm([(a[0] + b[0]) / 2, drag.path.elevation, (a[1] + b[1]) / 2], [Math.hypot(dx, dz) + T, WH, T]);
+            form.id = drag.segmentIds[index - 1] ??= uid(); form.kind = "wall"; form.roof = "none"; form.roofHeight = 0; form.windows = false; form.rotationY = -Math.atan2(dz, dx);
             model.forms.push(form);
           }
         }
@@ -484,7 +500,7 @@ export function setupArchitectureSculptTool(canvas, viewport) {
         let delta = localPoint(root, point).dot(drag.axisLocal) - drag.startAxis;
         if (!event.ctrlKey && state.snap) delta = Math.round(delta / state.snap) * state.snap;
         if (drag.handle === "height") form.size[1] = Math.max(.2, drag.form.size[1] + delta);
-        else if (drag.handle === "roofHeight") form.roofHeight = Math.max(0, (drag.form.roofHeight ?? 0) + delta);
+        else if (drag.handle === "roofHeight") form.roofHeight = Math.max(.1, pitchedHeight(root, drag.form) + delta);
         else if (drag.handle === "elevation") form.position[1] = drag.form.position[1] + delta;
         else {
           const axis = drag.handle.startsWith("width") ? 0 : 2;

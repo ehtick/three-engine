@@ -663,10 +663,13 @@ export class LightComponent extends Component {
       const projectedZ = _shadowCentre.dot(_direction);
       _shadowCentre.addScaledVector(_direction, Math.round(projectedZ / snapZ) * snapZ - projectedZ);
       // The orthographic shadow camera sees only forward along the light
-      // direction. Put the view camera midway through its depth interval so
-      // nearby casters are retained on both sides of the viewer.
-      const depthCentre = (this.props.shadowCamNear + this.props.shadowCamFar) * 0.5;
-      _lightWorld.copy(_shadowCentre).addScaledVector(_direction, -depthCentre);
+      // direction. ⛔ NOT MIDWAY (09-14): a 100 m slab centred on the viewer
+      // clipped every caster more than 50 m UP-SUN at the near plane — a ridge
+      // of trees above the viewer cast nothing, and as the camera moved, trees
+      // crossed that plane and their shadows popped in and out. The slab now
+      // reaches far toward the light (casters) and only the map's own extent
+      // past the viewer (receivers) — see `#directionalShadowDepth`.
+      _lightWorld.copy(_shadowCentre).addScaledVector(_direction, -this.#directionalShadowDepth().centre);
     } else {
       _shadowCentre.set(0, 0, 0);
       _lightWorld.set(0, 0, 0);
@@ -729,6 +732,23 @@ export class LightComponent extends Component {
     return this.#shadowTypeMap;
   }
 
+  /**
+   * The plain directional map's depth slab, measured along the light from the
+   * camera the map recentres on. Receivers only need the map's half-width past
+   * the viewer; casters can stand much further up-sun (a ridge, a forest line
+   * the viewer looks up at), so they get at least twice that. `shadowCamFar`
+   * still raises the caster reach. `biasScale` keeps the authored bias's
+   * WORLD-SPACE size — three applies bias in normalized depth, so a deeper
+   * slab would otherwise multiply the offset and detach shadows.
+   */
+  #directionalShadowDepth() {
+    const size = Math.max(1, Number(this.props.shadowCamSize) || 1);
+    const authoredFar = Math.max(1, Number(this.props.shadowCamFar) || 1);
+    const casterReach = Math.max(authoredFar, size * 2);
+    const far = casterReach + size;
+    return { far, centre: casterReach, biasScale: authoredFar / far };
+  }
+
   #isCSMUsable() {
     return (
       this.light?.isDirectionalLight === true &&
@@ -766,7 +786,7 @@ export class LightComponent extends Component {
           this.props.shadowCamFar,
           this.props.csmMaxFar + this.props.csmLightMargin * 2,
         )
-      : this.props.shadowCamFar;
+      : this.#directionalShadowDepth().far;
     const shadows = [
       this.light.shadow,
       ...(this.#csm?.lights?.map((cascadeLight) => cascadeLight.shadow) ?? []),
@@ -808,6 +828,9 @@ export class LightComponent extends Component {
       }
       if (this.props.shadowMode === "clipmap") {
         this.#csm = new ClipmapShadowNode(this.light, this.#clipmapConfig());
+        // Published for Foliage: while a clipmap exists, its mid-LOD shadow
+        // level needs mid geometry for plants right up to the viewer.
+        (this.entity.engine.clipmapShadowNodes ??= new Set()).add(this.#csm);
       } else {
         this.#csm = new EngineCSMShadowNode(this.light, {
           cascades: Math.min(4, Math.max(2, Math.round(this.props.csmCascades))),
@@ -839,6 +862,7 @@ export class LightComponent extends Component {
       // assignment above guards, and it is followed by a dispose.
       this.light.shadow.autoUpdate = true;
     }
+    this.entity?.engine?.clipmapShadowNodes?.delete(this.#csm);
     this.#csm.dispose?.();
     this.#csm = null;
   }
@@ -921,8 +945,24 @@ export class LightComponent extends Component {
       // detached far shadows and triangular light wedges at closed corners.
       // Use less bias in the high-resolution near maps and never exceed the
       // user's requested bias in the far map.
-      const bias = baseBias * (clipmap ? 1 : THREE.MathUtils.lerp(0.35, 1, t));
-      const normalBias = baseNormalBias * (clipmap ? 1 : THREE.MathUtils.lerp(0.2, 1, t));
+      // ⛔ NOT THE RAW BIAS (09-14): three applies bias in normalized depth,
+      // and cascades/levels share a slab far deeper than the plain map's (CSM:
+      // maxFar + both margins, 900 m by default; four clipmap levels: 1680 m),
+      // so -0.0005 became a 16–84 cm offset and every contact shadow under it
+      // (grass, the feet of bushes and walls) vanished. The authored bias keeps
+      // its plain-map WORLD size (bias × shadowCamFar) — CSM still eases it in
+      // its sharp near cascades — grown only where a coarse map's texel needs
+      // more to stay acne-free.
+      const camera = shadow.camera;
+      const width = (camera.right - camera.left) / Math.max(1, shadow.mapSize.width);
+      const texel = Number.isFinite(width) && width > 0 ? width : 0;
+      const depth = Math.max(1e-3, camera.far - camera.near);
+      const authoredWorldBias = Math.abs(baseBias) * Math.max(1, this.props.shadowCamFar - this.props.shadowCamNear);
+      const ease = clipmap ? 1 : THREE.MathUtils.lerp(0.35, 1, t);
+      const bias = Math.sign(baseBias || -1) * Math.max(authoredWorldBias * ease, texel * 1.5) / depth;
+      const normalBias = clipmap
+        ? Math.max(baseNormalBias, texel)
+        : baseNormalBias * THREE.MathUtils.lerp(0.2, 1, t);
       if (shadow.bias !== bias) {
         shadow.bias = bias;
         changed = true;
@@ -1017,7 +1057,8 @@ export class LightComponent extends Component {
       cam.top = shadowCamSize;
       cam.bottom = -shadowCamSize;
       cam.near = shadowCamNear;
-      cam.far = shadowCamFar;
+      cam.far = this.light.isDirectionalLight && !this.#isCSMUsable() ? this.#directionalShadowDepth().far : shadowCamFar;
+      if (this.light.isDirectionalLight && !this.#isCSMUsable()) s.bias = this.props.shadowBias * this.#directionalShadowDepth().biasScale;
       cam.updateProjectionMatrix();
     } else if (this.light.isPointLight) {
       // Point lights render to a cube map with a perspective camera.
@@ -1055,7 +1096,7 @@ export class LightComponent extends Component {
         s.needsUpdate = true;
         break;
       case "shadowBias":
-        s.bias = this.props.shadowBias;
+        s.bias = this.props.shadowBias * (this.light.isDirectionalLight && !this.#isCSMUsable() ? this.#directionalShadowDepth().biasScale : 1);
         break;
       case "shadowNormalBias":
         s.normalBias = this.props.shadowNormalBias;
@@ -1089,7 +1130,9 @@ export class LightComponent extends Component {
           cam.top = size;
           cam.bottom = -size;
           cam.near = this.props.shadowCamNear;
-          cam.far = this.props.shadowCamFar;
+          const plain = this.light.isDirectionalLight && !this.#isCSMUsable();
+          cam.far = plain ? this.#directionalShadowDepth().far : this.props.shadowCamFar;
+          if (plain) s.bias = this.props.shadowBias * this.#directionalShadowDepth().biasScale;
           cam.updateProjectionMatrix();
         } else if (this.light.isPointLight) {
           cam.near = this.props.shadowCamNear;

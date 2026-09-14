@@ -2,6 +2,23 @@
  * engine material graph. These helpers deliberately do not try to evaluate
  * arbitrary shader code; they recover the classic material inputs needed by
  * CPU-side GI metadata and third-party renderers. */
+
+/** A texture a plain `texture(tex)` node can sample with a vec2 UV. LAYERED
+ * textures (DataArrayTexture — the architecture style surfaces, the uber
+ * material — 3D and cube textures) need a layer/direction the CPU side cannot
+ * know, and handing one to GI's shared 2D blit repointed its binding to a
+ * `texture_2d_array` under a vec2 `textureSample`: an invalid WGSL module
+ * that failed every pipeline sharing that source (2026-09-14, "a lot of
+ * errors when enabling GI" on a scene with styled buildings). */
+export function isFlatTexture(tex) {
+  return !!tex?.isTexture && !isLayeredTexture(tex);
+}
+
+export function isLayeredTexture(tex) {
+  return !!(tex?.isDataArrayTexture || tex?.isCompressedArrayTexture || tex?.isArrayTexture
+    || tex?.isData3DTexture || tex?.isCubeTexture);
+}
+
 export function constantColorOf(node, depth = 0) {
   if (!node || depth > 8) return null;
   const value = node.value;
@@ -22,7 +39,7 @@ export function constantColorOf(node, depth = 0) {
 
 export function textureValueOf(node, depth = 0) {
   if (!node || depth > 8) return null;
-  if (node.value?.isTexture) return node.value;
+  if (node.value?.isTexture) return isFlatTexture(node.value) ? node.value : null;
   for (const child of [node.aNode, node.bNode, node.node]) {
     const found = child ? textureValueOf(child, depth + 1) : null;
     if (found) return found;
@@ -53,7 +70,7 @@ export function constantFloatOf(node, depth = 0) {
  * inspect only the classic fields therefore produced white reflection holes. */
 export function resolveMaterialAlbedo(material) {
   const colorNode = material?.colorNode;
-  const map = material?.map ?? textureValueOf(colorNode);
+  const map = (isFlatTexture(material?.map) ? material.map : null) ?? textureValueOf(colorNode);
   const tint = constantColorOf(colorNode)
     ?? tintBesideTexture(colorNode)
     ?? material?.color

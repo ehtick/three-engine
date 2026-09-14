@@ -1,0 +1,213 @@
+<!doctype html><html><head><meta charset="utf-8"><link rel="icon" href="data:,"><title>Grass angle receipts</title>
+<style>html,body{margin:0;background:#8fae6f;font:14px system-ui}canvas{display:block}</style></head>
+<body><canvas id="view"></canvas><script type="module">
+try {
+  globalThis.__engineLimitsCap = { maxStorageBuffersPerShaderStage: 8 };
+  const { Engine, THREE, registerBuiltInComponents } = await import('/src/engine/index.js');
+  await import('/src/modules/index.js');
+  const { enableEngineModule } = await import('/src/engine/modules.js');
+  const { packGrassField } = await import('/src/modules/foliage/grassField.js');
+  registerBuiltInComponents();
+  const PANEL = 640, WIDTH = PANEL, HEIGHT = PANEL * 3;
+  const engine = new Engine(); engine.setSize(WIDTH, PANEL);
+  await engine.init(document.querySelector('#view'));
+  const renderer = engine.renderer;
+  if (!renderer.backend.isWebGPUBackend) throw new Error('Real WebGPU required');
+  renderer.backend.device.addEventListener('uncapturederror', event => console.error('WebGPU validation', event.error.message));
+  await enableEngineModule(engine, 'foliage');
+
+  // Sun at 30 degrees elevation, azimuth toward +Z.
+  const sunElevationDeg = 30, sunElevationRad = sunElevationDeg * Math.PI / 180;
+  const sunDir = new THREE.Vector3(0, Math.sin(sunElevationRad), Math.cos(sunElevationRad)).normalize();
+  engine.scene.background = new THREE.Color('#bcd6ea');
+  engine.scene.add(new THREE.HemisphereLight('#eaf5ff', '#4a5a2f', 1.4));
+  const sun = new THREE.DirectionalLight('#fff2db', 3);
+  sun.position.copy(sunDir).multiplyScalar(20); engine.scene.add(sun);
+
+  // A flat 20x20m field using the shared FoliageComponent/GrassRenderer
+  // default settings (no per-preview overrides) so this receipt tracks
+  // whatever grassRenderer.js/grassMaterial.js actually ship.
+  const entity = engine.createEntity({ name: 'meadow' });
+  const component = entity.addComponent('foliage', {
+    species: 'grass', distribution: 'placements', placements: [], drawnGrass: true,
+    blades: 480000, grassDensity: .85, height: .18, bladeWidth: .022, grassLean: .24,
+    groundBlend: .6, maxDistance: 70, lodNear: 5,
+    grassBrightness: .65, grassOcclusion: .65, grassVariation: .2, grassSpecular: 0,
+    grassRoughness: 1, grassSky: 1, castShadow: false,
+    barkColor: '#3d5622', leafColor: '#8ba254', dryColor: '#b5a761',
+  });
+  const packed = packGrassField(() => ({ height: 0, density: 1, scale: 1, dryness: 0, color: [.29, .38, .18] }),
+    { extent: 20, resolution: 64, origin: [0, 0] });
+  component.setPackedField(packed);
+  const ground = new THREE.Mesh(new THREE.PlaneGeometry(20, 20), new THREE.MeshStandardNodeMaterial({ color: '#4a5a2c', roughness: 1 }));
+  ground.rotation.x = -Math.PI / 2; engine.scene.add(ground);
+  if (new URLSearchParams(location.search).get('variant')?.includes('mg')) ground.material.color.set('#ff00ff');
+
+  // A simple "house" box near the three-quarter camera, to match the owner's
+  // receipt (a three-quarter view near a house). Placed at the frame's own
+  // edge and well outside the straight-down ortho window (orthoSize 8, so
+  // |x| <= 4) so it never contaminates the from-above shot.
+  const house = new THREE.Mesh(new THREE.BoxGeometry(2.6, 2.6, 2.6), new THREE.MeshStandardNodeMaterial({ color: '#c9b79a', roughness: .9 }));
+  house.position.set(4.5, 1.3, -3); engine.scene.add(house);
+
+  const camera = new THREE.PerspectiveCamera(60, WIDTH / PANEL, .02, 200);
+  engine.camera = camera; engine.scene.add(camera);
+  component.update(true);
+  // ?variant=flat|normal|both — isolation switches for the from-above
+  // darkness investigation (09-13): flat = constant albedo, normal = a
+  // camera-facing view-space normal. Default (no query) is the shipped shader.
+  const variant = new URLSearchParams(location.search).get('variant') ?? '';
+  if (variant) {
+    const { vec3 } = await import('three/tsl');
+    for (const ring of component._grass.rings) {
+      if (variant.includes('flat') || variant === 'both') ring.material.colorNode = vec3(.35, .45, .18);
+      if (variant.includes('normal') || variant === 'both') ring.material.normalNode = vec3(0, 0, 1);
+      ring.material.needsUpdate = true;
+    }
+  }
+  component._grass.configure({ ...component._grass._settings, sunDirection: [sunDir.x, sunDir.y, sunDir.z] });
+
+  const canvas = document.createElement('canvas'); canvas.width = WIDTH; canvas.height = HEIGHT;
+  const ctx = canvas.getContext('2d');
+  const capture = async (activeCamera = camera) => {
+    engine.camera = activeCamera; // the ring lottery and widening follow the VIEWER, so the ortho shots must be their own viewer
+    component.update(true);
+    await renderer.compileAsync(engine.scene, activeCamera);
+    renderer.render(engine.scene, activeCamera);
+    await renderer.backend.device.queue.onSubmittedWorkDone();
+    return renderer.domElement.toDataURL('image/png');
+  };
+
+  // ⛔ 09-13 SEVENTH OWNER RECEIPT: the sky (blue-dominant) and the house
+  // (red-dominant tan, lit or shaded) are both a completely different colour
+  // family from any grass tone the shader can produce (always green-dominant:
+  // tip/base/dry are all g >= r, g > b) — a cheap, robust per-pixel mask, no
+  // depth buffer or object id needed.
+  const isGrassPixel = (r, g, b) => g > b && g >= r * .98;
+
+  const pixelData = (dataUrl) => new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => {
+      const w = image.width, h = image.height;
+      const c = document.createElement('canvas'); c.width = w; c.height = h;
+      const cx = c.getContext('2d'); cx.drawImage(image, 0, 0);
+      const { data } = cx.getImageData(0, 0, w, h);
+      const luma = new Float32Array(w * h);
+      const grassMask = new Uint8Array(w * h);
+      let sum = 0, sumSq = 0;
+      for (let i = 0, p = 0; p < w * h; i += 4, p++) {
+        const r = data[i] / 255, g = data[i + 1] / 255, b = data[i + 2] / 255;
+        const l = .2126 * r + .7152 * g + .0722 * b;
+        luma[p] = l; sum += l; sumSq += l * l;
+        grassMask[p] = isGrassPixel(r, g, b) ? 1 : 0;
+      }
+      const count = w * h, mean = sum / count, std = Math.sqrt(Math.max(0, sumSq / count - mean * mean));
+      let grassSum = 0, grassCount = 0;
+      for (let p = 0; p < count; p++) if (grassMask[p]) { grassSum += luma[p]; grassCount++; }
+      resolve({ w, h, luma, grassMask, mean, std, grassMean: grassCount ? grassSum / grassCount : 0, grassFraction: grassCount / count });
+    };
+    image.onerror = reject; image.src = dataUrl;
+  });
+
+  // Row-wise mean luminance over GRASS-ONLY pixels, bucketed into `box`-pixel
+  // (≈0.5 m) bands, then the worst relative change between two ADJACENT
+  // bands — the direct regression gate for a horizontal tone edge at a ring
+  // hand-over. A band with too few grass pixels (sky/house-only, e.g. the
+  // skyline strip) is skipped rather than pulled toward a contaminated mean.
+  const rowLuminanceProfile = (stats, box) => {
+    const bands = [];
+    for (let y = 0; y + box <= stats.h; y += box) {
+      let sum = 0, n = 0;
+      for (let dy = 0; dy < box; dy++) for (let x = 0; x < stats.w; x++) {
+        const p = (y + dy) * stats.w + x;
+        if (!stats.grassMask[p]) continue;
+        sum += stats.luma[p]; n++;
+      }
+      // Require most of the band to be grass, not a sliver surviving the mask
+      // at a house/sky edge.
+      if (n >= stats.w * box * .5) bands.push({ y, mean: sum / n, n });
+    }
+    let worst = 0, worstAt = -1;
+    for (let i = 1; i < bands.length; i++) {
+      const change = Math.abs(bands[i].mean - bands[i - 1].mean) / Math.max(bands[i - 1].mean, 1e-6);
+      if (change > worst) { worst = change; worstAt = bands[i - 1].y; }
+    }
+    return { bands: bands.map(b => ({ y: b.y, mean: +b.mean.toFixed(4), n: b.n })), worstAdjacentChange: worst, worstAtRow: worstAt };
+  };
+
+  // 0.5 m box-filtered luminance max/min, given an orthographic (exact
+  // metres-per-pixel) or a known ground-plane scale for the perspective shot.
+  const boxStats = (stats, metresPerPixel) => {
+    const box = Math.max(1, Math.round(.5 / metresPerPixel));
+    let boxMax = -Infinity, boxMin = Infinity;
+    for (let y = 0; y + box <= stats.h; y += box) {
+      for (let x = 0; x + box <= stats.w; x += box) {
+        let sum = 0;
+        for (let dy = 0; dy < box; dy++) for (let dx = 0; dx < box; dx++) sum += stats.luma[(y + dy) * stats.w + (x + dx)];
+        const avg = sum / (box * box);
+        boxMax = Math.max(boxMax, avg); boxMin = Math.min(boxMin, avg);
+      }
+    }
+    return { boxMax, boxMin, boxRatio: boxMax / Math.max(boxMin, 1e-6), stdOverMean: stats.std / stats.mean, box, metresPerPixel };
+  };
+
+  // Panel 1: eye level, in sun (must still look like the "good" reference).
+  // ?variant=backlit — eye level looking INTO the sun, for the blade translucency term.
+  if (variant.includes('backlit')) { camera.position.set(0, 1.2, -7); camera.lookAt(0, .9, 2); }
+  else { camera.position.set(0, 1.6, 6); camera.lookAt(0, 1.3, -2); }
+  camera.updateMatrixWorld(true);
+  const eyeLevel = await capture();
+
+  // Panel 2: straight down from 6 m — an orthographic camera gives an exact
+  // metres-per-pixel mapping for the 0.5 m box filter.
+  const orthoSize = 8;
+  const orthoCamera = new THREE.OrthographicCamera(-orthoSize / 2, orthoSize / 2, orthoSize / 2, -orthoSize / 2, .1, 50);
+  engine.scene.add(orthoCamera);
+  orthoCamera.position.set(0, variant.includes('near') ? 3 : 6, .0001); orthoCamera.lookAt(0, 0, 0); orthoCamera.updateMatrixWorld(true);
+  const straightDown = await capture(orthoCamera);
+  const straightDownStats = await pixelData(straightDown);
+  const eyeLevelStats = await pixelData(eyeLevel);
+  const straightDownBox = boxStats(straightDownStats, orthoSize / PANEL);
+
+  // Panel 3: three-quarter view from ~4 m near the house, sun behind the
+  // camera (positioned on the sun's own +Z side, looking back toward -Z, the
+  // same "sun behind the camera" configuration as the eye-level shot above,
+  // just elevated and angled down steeply enough — ~53 degrees — to keep the
+  // sky/horizon out of frame so the 0.5 m box filter only ever samples
+  // ground and grass).
+  const threeQuarterPos = new THREE.Vector3(2, 4, -1), threeQuarterLook = new THREE.Vector3(2, 0, -4);
+  camera.position.copy(threeQuarterPos); camera.lookAt(threeQuarterLook); camera.updateMatrixWorld(true);
+  const threeQuarter = await capture(camera);
+  const threeQuarterStats = await pixelData(threeQuarter);
+  // The camera is 4 m up, looking down at roughly 53 degrees at a patch a
+  // few metres away in depth; approximate ground-plane metres-per-pixel at
+  // the frame's own vertical centre (the look-at ground point) for the 0.5 m
+  // box filter — not exact like the ortho shot, but consistent enough for a
+  // regression bound at a fixed camera pose.
+  const camPos = threeQuarterPos, lookAt = threeQuarterLook;
+  const groundDistance = camPos.distanceTo(lookAt);
+  const verticalFovRad = camera.fov * Math.PI / 180;
+  const frameHeightAtGround = 2 * groundDistance * Math.tan(verticalFovRad / 2);
+  const threeQuarterMetresPerPixel = frameHeightAtGround / PANEL;
+  const threeQuarterBox = boxStats(threeQuarterStats, threeQuarterMetresPerPixel);
+  const threeQuarterRowProfile = rowLuminanceProfile(threeQuarterStats, threeQuarterBox.box);
+
+  const drawInto = (dataUrl, y) => new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => { ctx.drawImage(image, 0, y, WIDTH, PANEL); resolve(); };
+    image.onerror = reject; image.src = dataUrl;
+  });
+  await drawInto(eyeLevel, 0);
+  await drawInto(straightDown, PANEL);
+  await drawInto(threeQuarter, PANEL * 2);
+
+  globalThis.__GRASS_ANGLES__ = {
+    png: canvas.toDataURL('image/png'),
+    straightDown: straightDownBox,
+    means: { eye: eyeLevelStats.grassMean, down: straightDownStats.grassMean, eyeFraction: eyeLevelStats.grassFraction, downFraction: straightDownStats.grassFraction, variant },
+    threeQuarter: threeQuarterBox,
+    threeQuarterRowProfile,
+  };
+  globalThis.__GRASS_ANGLES_READY__ = true;
+} catch (error) { console.error(error); globalThis.__GRASS_ANGLES_ERROR__ = error.stack ?? String(error); }
+</script></body></html>

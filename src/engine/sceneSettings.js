@@ -507,6 +507,25 @@ export async function resolveRendererLimits() {
     // (GISystem gates on the DEVICE limit before binding).
     const storageTex = adapter?.limits?.maxStorageTexturesPerShaderStage ?? 0;
     if (storageTex > 4) requiredLimits.maxStorageTexturesPerShaderStage = Math.min(8, storageTex);
+    // SAMPLED TEXTURE COUNT: baseline is **16** per stage, and a GI-injected
+    // fragment already spends most of that before the material's own maps —
+    // the Foliage scene crossed it on 2026-09-12 and every affected pipeline
+    // FAILED AT CREATION, forever:
+    //   The number of sampled textures (17) in the Fragment stage exceeds the
+    //   maximum per-stage limit (16). This adapter supports a higher
+    //   maxSampledTexturesPerShaderStage of 48…
+    // A pipeline that never becomes ready is worse than a slow one: three
+    // caches nothing for it, so the material re-mints its node graph on every
+    // frame that tries to draw it (measured: "Foliage · living surface" built
+    // 52 times and climbing while the editor sat idle), the invalid layout
+    // cascades into "[Invalid PipelineLayout]" on neighbouring materials, and
+    // the mesh never appears. Same adapter-clamped ask as every limit above; a
+    // baseline-16 device keeps today's behaviour, which means a >16-texture
+    // material still fails there — the PORTABLE fix is to cut foliage's
+    // sampler count, and this only stops the failure on hardware that already
+    // advertises the headroom.
+    const sampledTex = adapter?.limits?.maxSampledTexturesPerShaderStage ?? 0;
+    if (sampledTex > 16) requiredLimits.maxSampledTexturesPerShaderStage = Math.min(32, sampledTex);
     // BINDING SIZE (not count — the count stays at the portable baseline):
     // the GI occupancy bits buffer scales with SCENE VOLUME, and a large
     // ultra scene sits near the 128MB default cliff — the static shadow BVH

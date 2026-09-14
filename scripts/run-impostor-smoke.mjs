@@ -156,7 +156,7 @@ try {
   });
   await wait(3000);
 
-  const baked = await run(() => {
+  const baked = await run(async () => {
     const e = globalThis.__engine;
     const component = e.getEntity(globalThis.__ids.level).getComponent("impostor");
     const atlas = component.atlas;
@@ -165,7 +165,12 @@ try {
     // Read the middle frame's tile straight out of the baked bytes. The atlas
     // is a DataTexture precisely so this is possible — a render-target texture
     // could only be inspected by drawing it, which is the thing under test.
-    const { frames, tile, size, albedoData, normalData } = atlas;
+    // 09-13: the atlas is a render target now (GPU downsample/dilate); read its
+    // bytes back top-down through the engine's own readback helper.
+    const { readRenderTargetImage } = await globalThis.__importLive("/src/engine/renderTargetImage.js");
+    const { frames, tile, size } = atlas;
+    const albedoData = await readRenderTargetImage(e.renderer, atlas.albedoTarget, size, size);
+    const normalData = await readRenderTargetImage(e.renderer, atlas.normalTarget, size, size);
     const col = Math.floor(frames / 2);
     const row = Math.floor(frames / 2);
     const sample = (data, u, v) => {

@@ -1,0 +1,175 @@
+<!doctype html><html><head><meta charset="utf-8"><link rel="icon" href="data:,"><title>Foliage contact sheet</title>
+<style>html,body{margin:0;background:#20301f;font:14px system-ui}canvas{display:block}</style></head>
+<body><canvas id="view"></canvas><script type="module">
+try {
+  globalThis.__engineLimitsCap = { maxStorageBuffersPerShaderStage: 8 };
+  const { Engine, THREE, registerBuiltInComponents } = await import('/src/engine/index.js');
+  await import('/src/modules/index.js');
+  const { enableEngineModule } = await import('/src/engine/modules.js');
+  const { FOLIAGE_SPECIES } = await import('/src/modules/foliage/foliageGeometry.js');
+  const { growTreeSkeleton } = await import('/src/modules/foliage/treeGrowth.js');
+  registerBuiltInComponents();
+  const engine = new Engine(); engine.setSize(320, 450);
+  await engine.init(document.querySelector('#view'));
+  const renderer = engine.renderer;
+  if (!renderer.backend.isWebGPUBackend) throw new Error('Real WebGPU required');
+  await enableEngineModule(engine, 'foliage');
+  engine.scene.background = new THREE.Color('#bdced0');
+  engine.scene.add(new THREE.HemisphereLight('#eaf5ff', '#746444', 2));
+  const sun = new THREE.DirectionalLight('#fff2db', 3.5);
+  sun.position.set(-5, 12, 9); engine.scene.add(sun);
+  engine.scene.add(sun.target);
+  renderer.shadowMap.enabled = true; sun.castShadow = true;
+  sun.shadow.mapSize.set(2048, 2048);
+  Object.assign(sun.shadow.camera, { left: -16, right: 16, top: 20, bottom: -16, near: .1, far: 60 });
+  sun.shadow.bias = -.0003; sun.shadow.normalBias = .025;
+  // One long ground strip under every widely-spaced tree (see `buildEntities`).
+  const ground = new THREE.Mesh(new THREE.PlaneGeometry(4000, 200), new THREE.MeshStandardNodeMaterial({ color: '#8d9471', roughness: 1 }));
+  ground.rotation.x = -Math.PI / 2; ground.position.set(1000, -.025, 0); engine.scene.add(ground);
+  ground.receiveShadow = true;
+  const camera = new THREE.PerspectiveCamera(40, 320 / 450, .05, 2200);
+  engine.camera = camera; engine.scene.add(camera);
+  const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+  /** One real entity/component per requested tile, built up front exactly the
+   * way `foliage-tree-preview.html` builds its species set — every prop the
+   * component needs is in the ORIGINAL `addComponent` call, so there is no
+   * setProp-then-wait-for-async-rebuild race to get wrong. Rendering later
+   * only toggles `root.visible`. */
+  /** One tree entity at a time, each fully warmed up before the next is
+   * created — building several species/prototypes concurrently (an earlier
+   * version of this script added every entity in one tight loop) hit a
+   * pre-existing engine race in the shared TSL material-node builder
+   * ("ReferenceError: spread is not defined", reproducible with as few as
+   * two DIFFERENT species added back to back) that is well outside this
+   * brief's file list to chase down; building sequentially is the standard
+   * `foliage-tree-preview.html` warmup shape and does not hit it. */
+  async function readyOne(component) {
+    const until = performance.now() + 90000;
+    while ((!component.stats?.impostorReady || (component._foliageWarmup?.pending ?? 0) > 0) && performance.now() < until) await pause(50);
+    if (!component.stats?.impostorReady) throw new Error('Contact-sheet tree atlas preparation timed out');
+  }
+  async function buildEntities(entries) {
+    const map = new Map();
+    // Trees are widely spaced (200m) and each rendered while every other one
+    // sits outside the frustum, rather than told apart by `root.visible` at a
+    // shared origin: the LOD/crossfade system converges its per-instance
+    // dither weight over several frames (P1-B), so a same-frame visibility
+    // toggle left a previous tile's tree still partially drawn — every tile
+    // showed a double-exposure blend of two trees at one origin.
+    let index = 0;
+    engine.start();
+    for (const entry of entries) {
+      const species = Object.hasOwn(FOLIAGE_SPECIES, entry.props.species) ? entry.props.species : 'oak';
+      const defaults = FOLIAGE_SPECIES[species];
+      const props = {
+        distribution: 'single', minScale: 1, maxScale: 1, wind: false, interaction: false,
+        lodNear: 200, lodFar: 260, maxDistance: 300,
+        leafDensity: 1, leafSize: 1, branchDensity: 1, crownBase: 0, crownSpread: 1, seed: 1,
+        height: defaults.height, width: defaults.width, leafColor: defaults.leafColor, barkColor: defaults.barkColor,
+        ...entry.props, species,
+      };
+      const originX = index++ * 200;
+      const entity = engine.createEntity({ name: entry.id });
+      entity.position = [originX, 0, 0];
+      const component = entity.addComponent('foliage', props);
+      await readyOne(component);
+      // Frame from the ACTUAL generated crown radius, not the authored
+      // `width` prop: they can differ a lot on purpose (`width` is an input
+      // to the length/shape formulas, not a promise about the output, and
+      // the crown-radius safety clamp in `treeGrowth.js` can further widen a
+      // narrow species up to its own cap) — framing off the nominal prop
+      // clipped a wide crown clean out of its own tile.
+      const crownWidth = 2 * growTreeSkeleton(props).crown.radius;
+      map.set(entry.id, { component, height: props.height, width: Math.max(props.width, crownWidth), originX });
+    }
+    engine.stop();
+    return map;
+  }
+
+  /** Side view: camera on +X at a fixed elevation fraction of the tree's own
+   * height, looking slightly below true center (real crowns read fuller in
+   * the lower two-thirds), distance chosen so height AND width both fit
+   * inside `fill` (0.8) of the tile — whichever axis binds decides it. */
+  function frameSide(originX, height, width, tileW, tileH, fill = 0.8) {
+    camera.aspect = tileW / tileH; camera.updateProjectionMatrix();
+    const vFov = camera.fov * Math.PI / 180;
+    const distV = (height / 2) / Math.tan(vFov / 2) / fill;
+    const hFov = 2 * Math.atan(Math.tan(vFov / 2) * camera.aspect);
+    const distH = (width / 2) / Math.tan(hFov / 2) / fill;
+    const dist = Math.max(distV, distH) * 1.08;
+    camera.position.set(originX + dist, height * 0.42, 0);
+    camera.lookAt(originX, height * 0.40, 0);
+    camera.updateMatrixWorld(true);
+  }
+
+  /** Walking-height three-quarter view: camera at a FIXED human eye height
+   * (1.7m) and FIXED distance (12m) from the trunk, at 45° off the trunk
+   * axis — not scaled to the tree's own size the way `frameSide` is, since
+   * the whole point is "what a person walking past this tree actually
+   * sees," not a studio turntable framing. Looks partway up the trunk
+   * (2.2m) rather than level, since a walking-height camera 12m from an
+   * 8-14m canopy is naturally looking UP into it. */
+  function frameWalk(originX, tileW, tileH) {
+    camera.aspect = tileW / tileH; camera.updateProjectionMatrix();
+    const dist = 12, angle = Math.PI / 4;
+    camera.position.set(originX + Math.cos(angle) * dist, 1.7, Math.sin(angle) * dist);
+    camera.lookAt(originX, 2.2, 0);
+    camera.updateMatrixWorld(true);
+  }
+
+  const target = new THREE.RenderTarget(1, 1);
+  target.texture.colorSpace = THREE.SRGBColorSpace;
+  async function captureTile(entry, map, tileW, tileH, view = 'side') {
+    const { component, height, width, originX } = map.get(entry.id);
+    // The near mesh's instance COUNT (not just chunk assignment) can still be
+    // mid-commit right after `engine.stop()` — a few settle passes (each a
+    // real `update`+`_commitBatches`, exactly what a running engine would do
+    // on its own next frames) instead of trusting the very first one.
+    for (let attempt = 0; attempt < 20; attempt++) {
+      component.update(true);
+      for (const chunk of component.chunks) chunk.level = 0;
+      component._commitBatches();
+      if ((component.renderMeshes?.[0]?.count ?? 0) > 0) break;
+      await pause(50);
+    }
+    if (!((component.renderMeshes?.[0]?.count ?? 0) > 0)) throw new Error(`${entry.id}: near-LOD mesh never committed any instance`);
+    sun.position.set(originX - 5, 12, 9); sun.target.position.set(originX, 0, 0); sun.target.updateMatrixWorld();
+    if (view === 'walk') frameWalk(originX, tileW, tileH); else frameSide(originX, height, width, tileW, tileH);
+    target.setSize(tileW, tileH);
+    const previousTarget = renderer.getRenderTarget();
+    renderer.setRenderTarget(target);
+    await renderer.compileAsync(engine.scene, camera);
+    renderer.render(engine.scene, camera);
+    const pixels = await renderer.readRenderTargetPixelsAsync(target, 0, 0, tileW, tileH);
+    renderer.setRenderTarget(previousTarget);
+    if (!(pixels instanceof Uint8Array) || pixels.length !== tileW * tileH * 4) throw new Error(`tile capture for ${entry.id} requires tightly packed RGBA8 pixels`);
+    return pixels;
+  }
+
+  /** Renders `entries` (`{id, props}`) into one `cols`x`rows` grid PNG.
+   * `view`: 'side' (default, the existing framed studio turntable) or
+   * 'walk' (fixed walking-height three-quarter view, see `frameWalk`). */
+  async function contactSheet(entries, cols, rows, sheetW = 1600, sheetH = 900, view = 'side') {
+    const map = await buildEntities(entries);
+    const tileW = Math.floor(sheetW / cols), tileH = Math.floor(sheetH / rows);
+    const sheet = document.createElement('canvas'); sheet.width = sheetW; sheet.height = sheetH;
+    const ctx = sheet.getContext('2d'); ctx.fillStyle = '#20301f'; ctx.fillRect(0, 0, sheetW, sheetH);
+    for (let i = 0; i < entries.length; i++) {
+      const entry = entries[i], col = i % cols, row = Math.floor(i / cols);
+      const pixels = await captureTile(entry, map, tileW, tileH, view);
+      ctx.putImageData(new ImageData(new Uint8ClampedArray(pixels), tileW, tileH), col * tileW, row * tileH);
+      ctx.fillStyle = 'rgba(10,18,10,.62)'; ctx.fillRect(col * tileW, row * tileH, tileW, 18);
+      ctx.fillStyle = '#eafbe6'; ctx.font = '12px system-ui'; ctx.textBaseline = 'top';
+      ctx.fillText(entry.id, col * tileW + 4, row * tileH + 3);
+    }
+    for (let col = 1; col < cols; col++) { ctx.strokeStyle = 'rgba(0,0,0,.35)'; ctx.beginPath(); ctx.moveTo(col * tileW, 0); ctx.lineTo(col * tileW, sheetH); ctx.stroke(); }
+    for (let row = 1; row < rows; row++) { ctx.strokeStyle = 'rgba(0,0,0,.35)'; ctx.beginPath(); ctx.moveTo(0, row * tileH); ctx.lineTo(sheetW, row * tileH); ctx.stroke(); }
+    for (const { component } of map.values()) engine.destroyEntity(component.entity);
+    return sheet.toDataURL('image/png');
+  }
+
+  globalThis.__CONTACT_SHEET__ = { contactSheet };
+  globalThis.__CONTACT_SHEET_READY__ = true;
+} catch (error) { console.error(error); globalThis.__CONTACT_SHEET_ERROR__ = error.stack ?? String(error); }
+</script></body></html>

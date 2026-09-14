@@ -1,6 +1,6 @@
 // @ts-check
 import * as THREE from "three/webgpu";
-import { brushWeight } from "../../editor/brush.js";
+import { brushWeight } from "../../engine/brush.js";
 import { texture as tslTexture, uv, float, vec3, normalMap, normalView } from "three/tsl";
 import { Component } from "../../engine/components/Component.js";
 import { resolveAssetUrl } from "../../engine/assetResolver.js";
@@ -13,6 +13,41 @@ import {
 } from "../../engine/materialAsset.js";
 import { getGltfLoader } from "../../engine/gltfLoader.js";
 import { freeze } from "../../engine/freezeLedger.js";
+import { frameSliceBudget } from "../../engine/frameSlice.js";
+import { stableInstanceCapacity } from "../../engine/instanceCapacity.js";
+import {
+  PROCEDURAL_TERRAIN_PARAMS,
+  landscapeOptionsFromProps,
+  fillHeightfield,
+  ALWAYS_FILL_NOW,
+} from "../../engine/terrain/proceduralTerrain.js";
+import { getLandscape, getLandscapeSteps } from "../../engine/terrain/landscapeGenerator.js";
+import { createTerrainStone, rockLibraryFor, rockLibraryStepsFor } from "./terrainRocks.js";
+import { placeRocks } from "../../engine/rocks/rockPlacement.js";
+import { paintLandscapeGround, createLandscapeGroundMaterial, resolveGroundPalette } from "./terrainGround.js";
+
+/** One inspector row per `PROCEDURAL_TERRAIN_PARAMS` entry — the "Procedural"
+ *  group is table-generated, never hand-duplicated. Hidden until `procedural`
+ *  is on, same convention `showIf` already uses elsewhere in the editor. */
+function proceduralSchemaRow(param) {
+  return {
+    key: param.key,
+    label: param.label,
+    type: param.kind === "enum" ? "select" : param.kind === "boolean" ? "boolean" : "number",
+    ...(param.kind === "enum" ? { options: param.choices } : {}),
+    ...(param.kind !== "enum" && param.kind !== "boolean" ? { min: param.min, max: param.max, step: param.step } : {}),
+    hint: param.hint,
+    section: "Procedural",
+    showIf: (props) => !!props.procedural,
+  };
+}
+/** Component prop name -> default, for every procedural param. */
+const PROCEDURAL_DEFAULTS = Object.fromEntries(PROCEDURAL_TERRAIN_PARAMS.map((param) => [param.key, param.default]));
+/** The 12 procedural param keys, for the `onPropChanged` dispatch below —
+ *  changing any of them (while `procedural` is on) regrows the base grid. */
+const PROCEDURAL_PARAM_KEYS = new Set(PROCEDURAL_TERRAIN_PARAMS.map((param) => param.key));
+/** Ground colour props (09-14): repaint only, never a regrow. */
+const TERRAIN_COLOR_KEYS = new Set(["customColors", "grassColor", "soilColor", "rockColor"]);
 
 export const MAX_TERRAIN_LAYERS = 4;
 export const SCULPT_TOOLS = ["raise", "lower", "smooth", "flatten", "sharpen", "contrast", "pinch", "erode", "noise"];
@@ -343,12 +378,43 @@ export class TerrainComponent extends Component {
     size: 50,
     resolution: 128,
     splatResolution: 256,
-    heights: "", // base64 Float32Array((resolution+1)^2), row-major
     splatmap: "", // base64 Uint8Array(splatResolution^2 * 4)
     layers: [], // optional material overlays blended over the Mesh base material
     scatterLayers: [], // model-backed instance layers painted onto the surface
     castShadow: false,
     receiveShadow: true,
+    // --- Procedural (P1-T) ---
+    proceduralSeed: 1,
+    proceduralExtent: 0, // landscape extent the grid samples; 0 = this terrain's own size
+    proceduralOrigin: [0, 0], // this grid's centre inside the landscape (a chunk tile)
+    proceduralReserve: 0, // square (m) at the landscape origin with no generated rivers/lakes (a World region)
+    stoneLayer: true, // build the Stone control's rock structures (World draws its own)
+    // Ground colours (09-14). Off = the style's own palette. A World turns this
+    // on and hands in its Ground swatches, so this inspector shows the colours
+    // the landscape is really painted with (an edit here edits that swatch).
+    customColors: false,
+    grassColor: "#5f7a3a",
+    soilColor: "#6f624c",
+    rockColor: "#77736c",
+    ...PROCEDURAL_DEFAULTS, // style, height, scale, levels, wildness, erosion, rocks
+    // `heights`, `heightEdits` and `procedural` MUST stay last, in this exact
+    // order. A bulk multi-key update — WorldComponent._commit's generic
+    // desired-vs-current diff, or any script writing several props at once —
+    // applies `Object.entries(desired)` in object-key order, which for
+    // `{...defaults, ...providerProps}` is exactly THIS declaration order
+    // (providerProps only ever updates values in place, never reorders).
+    // `onPropChanged` for every Procedural param/seed is a no-op while
+    // `procedural` is false, so ordering them all before `procedural` means
+    // the eventual `setBaseProp("procedural", true)` is the ONE moment a
+    // rebuild actually happens, already seeing every other correct value —
+    // not a cascade of intermediate rebuilds each keyed to a half-updated
+    // prop set (a scene saved before `procedural` existed hit exactly that:
+    // its loaded `heights`/absent-`procedural` diffed against the plan in
+    // whatever order `changes` happened to list them).
+    heights: "", // base64 Float32Array((resolution+1)^2), row-major. Ignored while `procedural` is on.
+    // Sculpt delta against the procedural base, same base64 layout as `heights`.
+    heightEdits: "",
+    procedural: false, // when on, the base grid is generated instead of authored/sculpted freehand
   };
   static schema = [
     { key: "size", label: "Size", type: "number", min: 1, step: 1 },
@@ -356,6 +422,25 @@ export class TerrainComponent extends Component {
     { key: "splatResolution", label: "Splat Resolution", type: "number", min: 16, max: 1024, step: 1 },
     { key: "castShadow", label: "Cast Shadow", type: "boolean" },
     { key: "receiveShadow", label: "Receive Shadow", type: "boolean" },
+    {
+      key: "procedural", label: "Procedural", type: "boolean", section: "Procedural",
+      hint: "Generate the base grid instead of authoring/sculpting it freehand. A sculpt stroke still works — it lands in a separate delta on top of the generated base, so changing a param below never erases it.",
+    },
+    {
+      key: "proceduralSeed", label: "Seed", type: "number", min: 0, max: 0xffffffff, step: 1, section: "Procedural",
+      hint: "Chooses every procedural decision for this terrain's own base grid.",
+      showIf: (props) => !!props.procedural,
+    },
+    ...PROCEDURAL_TERRAIN_PARAMS.map(proceduralSchemaRow),
+    {
+      key: "customColors", label: "Custom Colours", type: "boolean", section: "Colours",
+      hint: "Paint the procedural ground with the colours below instead of the style's palette. In a World these are the World's Ground colours.",
+      showIf: (props) => !!props.procedural,
+    },
+    ...[["grassColor", "Grass"], ["soilColor", "Soil"], ["rockColor", "Rock"]].map(([key, label]) => ({
+      key, label, type: "color", section: "Colours",
+      showIf: (props) => !!props.procedural && !!props.customColors,
+    })),
   ];
 
   onAttach() {
@@ -401,13 +486,38 @@ export class TerrainComponent extends Component {
     this.#loadScatterLayers();
     this.#loadLayerMaps();
     this.#loadBaseMaterial();
+    if (this._proceduralFillPending) {
+      // Stone is built when the fill lands (see #scheduleProceduralFill).
+      this._proceduralFillPending = false;
+      this.#scheduleProceduralFill();
+    } else {
+      this.#paintProceduralGround();
+      this.#rebuildStone();
+    }
   }
 
   onDetach() {
     if (!this.mesh) return;
+    this._stoneGeneration = (this._stoneGeneration ?? 0) + 1;
+    this._stoneUnsub?.();
+    this._stoneUnsub = null;
+    this._stone?.dispose();
+    this._stone = null;
+    if (this._groundMaterial) {
+      this.clearProceduralMaterial(this);
+      this._groundMaterial.dispose();
+      this._groundMaterial = null;
+    }
     this.generation = (this.generation ?? 0) + 1;
     this._committedHeights = null;
+    this._committedHeightEdits = null;
     this._brushScratch = null;
+    // Cancel any in-flight sliced procedural regeneration (see
+    // #scheduleProceduralFill): its onPreRender tick must not touch a
+    // detached component's geometry.
+    this._proceduralGeneration = (this._proceduralGeneration ?? 0) + 1;
+    this._proceduralUnsub?.();
+    this._proceduralUnsub = null;
     if (this.meshComponent?.mesh === this.mesh) {
       this.mesh.geometry = this.previousMeshGeometry;
       this.mesh.material = this.previousMeshMaterial;
@@ -436,17 +546,23 @@ export class TerrainComponent extends Component {
   }
 
   onDisable() {
+    if (this._stone) this._stone.group.visible = false;
     if (this.mesh) this.mesh.visible = false;
     if (this.scatterRoot) this.scatterRoot.visible = false;
   }
 
   onEnable() {
+    if (this._stone) this._stone.group.visible = true;
     if (this.mesh) this.mesh.visible = true;
     if (this.scatterRoot) this.scatterRoot.visible = true;
   }
 
   onPropChanged(key) {
     if (key === "heights") {
+      // Ignored while procedural: the base grid comes from the Procedural
+      // params instead, and a sculpt stroke lands in `heightEdits`. A stray
+      // write here (an old command, a script) must not fight that.
+      if (this.props.procedural) return;
       if (this._committedHeights != null && this.props.heights === this._committedHeights) {
         // The stroke's own SetTerrainHeightsCommand echoing the string
         // `commitHeights()` just encoded from the live buffer: the geometry
@@ -459,6 +575,29 @@ export class TerrainComponent extends Component {
       this.heightsArray = decodeFloat32(this.props.heights, (this._gridResolution + 1) ** 2);
       this.#applyHeightsToGeometry();
       this.#announceSurfaceChange("committed");
+      return;
+    }
+    if (key === "heightEdits") {
+      // Inert until procedural is on — see `heights` above for the symmetric
+      // case. A resolution/procedural toggle rebuilds wholesale (bottom of
+      // this method) and decodes this fresh there instead.
+      if (!this.props.procedural) return;
+      if (this._committedHeightEdits != null && this.props.heightEdits === this._committedHeightEdits) {
+        this._committedHeightEdits = null;
+        return;
+      }
+      this._committedHeightEdits = null;
+      this._heightEditsArray = decodeFloat32(this.props.heightEdits, (this._gridResolution + 1) ** 2);
+      this.#applyProceduralEditsToGeometry();
+      this.#announceSurfaceChange("committed");
+      return;
+    }
+    if (TERRAIN_COLOR_KEYS.has(key)) { this.#paintProceduralGround(); return; }
+    if (key === "stoneLayer") { this.#rebuildStone(); return; }
+    if (key === "proceduralSeed" || key === "proceduralExtent" || key === "proceduralOrigin" || key === "proceduralReserve" || PROCEDURAL_PARAM_KEYS.has(key)) {
+      // The 12 shape params plus the seed only matter while procedural is on;
+      // an edit while it is off is an inert prop write (no geometry effect).
+      if (this.props.procedural) this.#scheduleProceduralFill();
       return;
     }
     if (key === "splatmap") {
@@ -507,8 +646,224 @@ export class TerrainComponent extends Component {
     const size = this.props.size ?? 50;
     this.geometry = new THREE.PlaneGeometry(size, size, resolution, resolution);
     this.geometry.rotateX(-Math.PI / 2);
-    this.heightsArray = decodeFloat32(this.props.heights, (resolution + 1) ** 2);
+    if (this.props.procedural) {
+      // A structural rebuild (attach, a resolution/size/procedural-toggle
+      // change) drives the fill to completion synchronously — the same cost
+      // an ordinary `heights` decode already pays here, unsliced. Live
+      // param edits while already attached go through #scheduleProceduralFill
+      // instead, which is the one that must not freeze.
+      this._heightEditsArray = decodeFloat32(this.props.heightEdits, (resolution + 1) ** 2);
+      // ⛔ 09-14 live: a synchronous landscape build here blocked attach for
+      // 0.6-0.8 s per terrain. With a frame loop, attach flat (plus any edits)
+      // and let `onAttach` schedule the sliced fill; headless callers stay sync.
+      const deferred = typeof this.entity?.engine?.onPreRender === "function";
+      this._proceduralBase = deferred ? new Float32Array((resolution + 1) ** 2) : this.#fillProceduralBaseSync();
+      this._proceduralFillPending = deferred;
+      this.heightsArray = new Float32Array((resolution + 1) ** 2);
+      for (let i = 0; i < this.heightsArray.length; i++) this.heightsArray[i] = this._proceduralBase[i] + this._heightEditsArray[i];
+    } else {
+      this.heightsArray = decodeFloat32(this.props.heights, (resolution + 1) ** 2);
+    }
     this.#applyHeightsToGeometry();
+  }
+
+  /** Builds this terrain's own shape/rockiness from its current Procedural
+   *  props (see `createProceduralTerrainShape`) and a fresh generator over it. */
+  #createProceduralGenerator(clock, target) {
+    const options = landscapeOptionsFromProps(this.props);
+    return fillHeightfield((sliceClock) => getLandscapeSteps(options, sliceClock), {
+      size: this.props.size ?? 50, resolution: this._gridResolution,
+      overlay: this._shapeOverlay, clock, target, origin: this.props.proceduralOrigin ?? [0, 0],
+    });
+  }
+
+  /** Drives a fresh procedural fill to completion right now — the attach/
+   *  structural-rebuild path, where a synchronous cost is already accepted. */
+  #fillProceduralBaseSync() {
+    const generator = this.#createProceduralGenerator(ALWAYS_FILL_NOW, null);
+    let result = generator.next();
+    while (!result.done) result = generator.next();
+    return result.value;
+  }
+
+  /**
+   * The live-edit path: a Procedural param, the seed, or an owner's
+   * `setShapeOverlay`/`clearShapeOverlay` changed while already attached.
+   * Sliced over the engine's own per-frame ticks (`entity.engine.onPreRender`,
+   * the same hook `WorldComponent` ticks its own generation from) so a large
+   * standalone terrain's slider drag never blocks a frame; the OLD grid stays
+   * on screen until the new one is ready. World's own fast path — an overlay
+   * whose `samples` already match this grid — completes on the very first
+   * slice (see `fillHeightfield`), so a World-owned terrain never actually
+   * waits on a render tick here.
+   *
+   * No `engine.onPreRender` available (a bare component under a test harness,
+   * or any headless driver with no render loop) finishes synchronously rather
+   * than never — the alternative is a terrain that silently never updates.
+   */
+  #scheduleProceduralFill() {
+    const generation = (this._proceduralGeneration = (this._proceduralGeneration ?? 0) + 1);
+    this._proceduralUnsub?.();
+    this._proceduralUnsub = null;
+    const fillStart = performance.now();
+    let slices = 0;
+    const finish = (base) => {
+      if (generation !== this._proceduralGeneration || !this.geometry) return;
+      this._proceduralBase = base;
+      this.#applyProceduralEditsToGeometry();
+      // Colliders and architecture terrain-follow listen for a committed surface;
+      // a sliced fill landing is exactly that.
+      this.#paintProceduralGround();
+      this.#announceSurfaceChange("committed");
+      this.#rebuildStone();
+      freeze.bootMark("terrain: procedural fill", performance.now() - fillStart, `${slices} slice(s)`);
+    };
+    const engine = this.entity?.engine;
+    const onPreRender = typeof engine?.onPreRender === "function" ? engine.onPreRender.bind(engine) : null;
+    if (!onPreRender) {
+      finish(this.#fillProceduralBaseSync());
+      return;
+    }
+    const resolution = this._gridResolution;
+    const target = new Float32Array((resolution + 1) ** 2);
+    const clock = { deadline: 0, due() { return performance.now() >= this.deadline; } };
+    const generator = this.#createProceduralGenerator(clock, target);
+    let unsubscribe;
+    const step = () => {
+      if (generation !== this._proceduralGeneration) { unsubscribe?.(); return; }
+      slices++;
+      // Widens past the old fixed 6 ms while a boot frame is long (the GPU
+      // compiling shaders, not the CPU) and stays at that floor once frames
+      // are fast again — see `frameSliceBudget`.
+      clock.deadline = performance.now() + frameSliceBudget(engine);
+      const result = generator.next();
+      if (result.done) { unsubscribe?.(); this._proceduralUnsub = null; finish(result.value); }
+    };
+    unsubscribe = onPreRender(step);
+    this._proceduralUnsub = unsubscribe;
+    step(); // make progress now rather than waiting for the next render tick
+  }
+
+  /** `heightsArray = base + edits`, then the ordinary O(terrain) full apply —
+   *  shared by a completed #scheduleProceduralFill and a `heightEdits` write. */
+  #applyProceduralEditsToGeometry() {
+    const base = this._proceduralBase ?? new Float32Array((this._gridResolution + 1) ** 2);
+    const edits = this._heightEditsArray ?? new Float32Array(base.length);
+    if (!this.heightsArray || this.heightsArray.length !== base.length) this.heightsArray = new Float32Array(base.length);
+    for (let i = 0; i < base.length; i++) this.heightsArray[i] = base[i] + edits[i];
+    this.#applyHeightsToGeometry();
+  }
+
+  /**
+   * An owner (World) lends this terrain the reshaping its own banks/road
+   * corridors/building pads/ridges/escarpments apply on top of whatever bare
+   * landform this component grows from its own Procedural params —
+   * `landscapeFields.js`'s `createShapeOverlay` builds the descriptor.
+   * `evaluate(x, z, baseHeight) -> height` is the fallback per-vertex path;
+   * `samples`, when sized for this exact grid, is used verbatim instead (see
+   * `fillHeightfield`) — the path every World-owned terrain actually takes.
+   * A changed `key` (the owner's own invalidation signal — World uses its
+   * `fieldKey`) regenerates; the same key is assumed unchanged even when
+   * `samples` is a fresh array instance, so a look-only regeneration whose
+   * fields are numerically identical does not repeat the walk/copy.
+   */
+  /**
+   * The Stone control (09-14): rock structures sited from this terrain's own
+   * landscape — cliff walls on risers, spires around towers, arches, ledges,
+   * talus — seated on the CURRENT surface (edits included). Rebuilt after a
+   * procedural fill; World-owned terrains set `stoneLayer: false` because
+   * the World builds stone against its own banks, roads and pads.
+   */
+  #rebuildStone() {
+    this._stoneGeneration = (this._stoneGeneration ?? 0) + 1;
+    this._stoneUnsub?.();
+    this._stoneUnsub = null;
+    if (!this.props.procedural || this.props.stoneLayer === false || !(this.props.rocks > 0) || !this.entity?.object3D || !this.heightsArray) {
+      this._stone?.dispose();
+      this._stone = null;
+      return;
+    }
+    const generation = this._stoneGeneration;
+    const options = landscapeOptionsFromProps(this.props);
+    const size = this.props.size ?? 50;
+    const [ox, oz] = this.props.proceduralOrigin ?? [0, 0];
+    // The previous stone stays on screen until the new set is ready.
+    const groundAt = (x, z) => this.heightAtLocal(x - ox, z - oz);
+    const finish = ({ library, kinds, placements = null }) => {
+      if (generation !== this._stoneGeneration || !this.entity?.object3D) return;
+      const start = performance.now();
+      const stone = createTerrainStone({
+        landscape: getLandscape(options), x0: ox - size / 2, z0: oz - size / 2, size, library, kinds, placements, groundAt,
+      });
+      this._stone?.dispose();
+      // Placements are landscape metres; the group maps them into this entity.
+      stone.group.position.set(-ox, 0, -oz);
+      stone.group.visible = this.enabled;
+      this.entity.object3D.add(stone.group);
+      this._stone = stone;
+      freeze.bootMark("terrain: stone place", performance.now() - start, `${stone.placements.length} rocks`);
+    };
+    const engine = this.entity.engine;
+    const onPreRender = typeof engine?.onPreRender === "function" ? engine.onPreRender.bind(engine) : null;
+    if (!onPreRender) { finish(rockLibraryFor(getLandscape(options))); return; }
+    // ⛔ 09-14 live: meshing the library synchronously on attach blocked the
+    // editor ~2 s per style (and the page dropped right after). Slice it.
+    const clock = { deadline: 0, due() { return performance.now() >= this.deadline; } };
+    // Placement is ~0.4 s over a 512 m terrain. `placeRocks` partitions exactly
+    // by half-open rectangle (tests/landscape-generator.test.mjs), so a 4x4
+    // split placed one cell per slice is the same set as one pass.
+    const steps = (function* () {
+      const landscape = getLandscape(options);
+      const { library, kinds } = yield* rockLibraryStepsFor(landscape, 3, clock);
+      const placements = [], cells = 4, cell = size / cells, x0 = ox - size / 2, z0 = oz - size / 2;
+      for (let j = 0; j < cells; j++) for (let i = 0; i < cells; i++) {
+        const cx0 = x0 + i * cell, cz0 = z0 + j * cell;
+        // Rectangle edges come from the same expression on both sides of a
+        // cell border, so no anchor is lost or counted twice between cells.
+        placements.push(...placeRocks(landscape, { x0: cx0, z0: cz0, size: x0 + (i + 1) * cell - cx0, variants: kinds, groundAt }));
+        yield "rocks";
+      }
+      return { library, kinds, placements };
+    })();
+    let unsubscribe;
+    const step = () => {
+      if (generation !== this._stoneGeneration) { unsubscribe?.(); return; }
+      clock.deadline = performance.now() + frameSliceBudget(engine);
+      const result = steps.next();
+      if (result.done) { unsubscribe?.(); this._stoneUnsub = null; finish(result.value); }
+    };
+    unsubscribe = onPreRender(step);
+    this._stoneUnsub = unsubscribe;
+  }
+
+  /**
+   * Style-coloured ground for a standalone procedural terrain (see
+   * terrainGround.js). An owner that lends a shape overlay (World) paints and
+   * owns its own ground material, so this steps aside for it; an owner's
+   * material set later simply replaces this one.
+   */
+  #paintProceduralGround() {
+    if (!this.props.procedural || this._shapeOverlay || !this.geometry || !this.heightsArray) return;
+    if (this._proceduralMaterial && this._proceduralMaterial.owner !== this) return;
+    const landscapeStyle = getLandscape(landscapeOptionsFromProps(this.props));
+    const colors = paintLandscapeGround(this.heightsArray, { resolution: this._gridResolution, size: this.props.size ?? 50, palette: resolveGroundPalette(landscapeStyle.palette, this.props) });
+    this.geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+    if (!this._groundMaterial) {
+      this._groundMaterial = createLandscapeGroundMaterial();
+      this.setProceduralMaterial(this, this._groundMaterial);
+    }
+  }
+
+  setShapeOverlay(owner, { key = null, evaluate = null, samples = null } = {}) {
+    if (!owner) throw new TypeError("Terrain shape overlay requires an owner");
+    const changed = this._shapeOverlay?.key !== key;
+    this._shapeOverlay = { owner, key, evaluate, samples };
+    if (this.props.procedural && changed) this.#scheduleProceduralFill();
+  }
+  clearShapeOverlay(owner) {
+    if (this._shapeOverlay?.owner !== owner) return;
+    this._shapeOverlay = null;
+    if (this.props.procedural) this.#scheduleProceduralFill();
   }
 
   /**
@@ -611,13 +966,20 @@ export class TerrainComponent extends Component {
    * a full pass over positions and normals (the same analytic normals the dabs
    * wrote, over the whole grid, so the end state is exactly what a from-scratch
    * apply gives), the exact bounding sphere, every scatter layer's re-seat —
-   * then encodes the live heights buffer into `props.heights`. Once per stroke,
+   * then encodes the live heights buffer back into a prop. Once per stroke,
    * never per dab.
    *
-   * The editor follows this with SetTerrainHeightsCommand, whose `do()` is
-   * `setProp("heights", <this same string>)`; onPropChanged recognises the
-   * string this commit produced and skips the decode and a second full pass.
-   * Undo/redo carry a different string and take the full path.
+   * Non-procedural (the ordinary sculptable heightfield): re-encodes the whole
+   * buffer into `props.heights`, exactly as always. Procedural: the buffer is
+   * `base + edits`, and only the DELTA against this terrain's own generated
+   * base goes into `props.heightEdits` — `heights` is never touched, so it
+   * cannot fight the next `landform`/`roughness`/... change.
+   *
+   * The editor follows this with SetTerrainHeightsCommand against whichever
+   * prop this wrote (`do()` is `setProp(key, <this same string>)`);
+   * onPropChanged recognises the string this commit produced and skips the
+   * decode and a second full pass. Undo/redo carry a different string and
+   * take the full path.
    */
   commitHeights() {
     const span = freeze.begin("terrain:stroke-commit");
@@ -635,8 +997,17 @@ export class TerrainComponent extends Component {
         nrm.needsUpdate = true;
         this.#finishHeightsGeometry();
       }
-      this.props.heights = encodeFloat32(this.heightsArray);
-      this._committedHeights = this.props.heights;
+      if (this.props.procedural) {
+        const base = this._proceduralBase ?? new Float32Array(this.heightsArray.length);
+        const edits = new Float32Array(this.heightsArray.length);
+        for (let i = 0; i < edits.length; i++) edits[i] = this.heightsArray[i] - (base[i] ?? 0);
+        this._heightEditsArray = edits;
+        this.props.heightEdits = encodeFloat32(edits);
+        this._committedHeightEdits = this.props.heightEdits;
+      } else {
+        this.props.heights = encodeFloat32(this.heightsArray);
+        this._committedHeights = this.props.heights;
+      }
       this.#announceSurfaceChange("committed", this._surfaceDirtyRect ?? null);
       this._surfaceDirtyRect = null;
     } finally {
@@ -811,8 +1182,12 @@ export class TerrainComponent extends Component {
       paintedWeight = paintedWeight ? paintedWeight.add(weights[i]) : weights[i];
     }
     const baseWeight = paintedWeight ? float(1).sub(paintedWeight).max(float(0)) : float(1);
-    const baseAsset = this.baseMaterial;
-    const baseGraph = this.baseGraph ?? {};
+    // A provider supplies a borrowed procedural base; authored Mesh materials
+    // still win, and the ordinary Terrain paint layers blend over either base.
+    const procedural = !this.meshComponent?.props.material ? this._proceduralMaterial?.material : null;
+    const baseAsset = procedural ?? this.baseMaterial;
+    const baseGraph = procedural ?? this.baseGraph ?? {};
+    this.material.vertexColors = !!procedural?.vertexColors;
     const baseColorValue = baseAsset?.color ?? new THREE.Color(0x8a8f7a);
     // A graph's `color` slot is fed from a Principled BSDF `color` input, which
     // is wired straight from a texture's `out` socket — a vec4. Everything else
@@ -887,6 +1262,18 @@ export class TerrainComponent extends Component {
     this.mesh.material = this.material;
   }
 
+  /** Borrow a generated base without taking ownership of its textures/nodes. */
+  setProceduralMaterial(owner, material) {
+    if (!owner || !material?.isMaterial) throw new TypeError('Terrain procedural material requires an owner and material');
+    this._proceduralMaterial = { owner, material };
+    if (this.material) { this.#wireMaterialNodes(); this.#applyTerrainMesh(); }
+  }
+  clearProceduralMaterial(owner) {
+    if (this._proceduralMaterial?.owner !== owner) return;
+    this._proceduralMaterial = null;
+    if (this.material) { this.#wireMaterialNodes(); this.#applyTerrainMesh(); }
+  }
+
   async #loadBaseMaterial() {
     const path = this.meshComponent?.props.material;
     const generation = (this.baseMaterialGeneration = (this.baseMaterialGeneration ?? 0) + 1);
@@ -894,6 +1281,7 @@ export class TerrainComponent extends Component {
     this.baseMaterialUnsub = null;
     if (!path) {
       this.baseMaterial = null;
+      this.baseGraph = null;
       this.#wireMaterialNodes();
       return;
     }
@@ -1200,7 +1588,8 @@ export class TerrainComponent extends Component {
       let mesh = source.mesh;
       if (!mesh || mesh.instanceMatrix.count < needed) {
         if (mesh?.parent) mesh.parent.remove(mesh);
-        const capacity = 2 ** Math.ceil(Math.log2(needed));
+        // Stable capacities (instanceCapacity.js): a small exact one is baked into the WGSL.
+        const capacity = stableInstanceCapacity(needed);
         mesh = new THREE.InstancedMesh(source.geometry, source.material, capacity);
         this.scatterRoot.add(mesh);
         source.mesh = mesh;

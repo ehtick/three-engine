@@ -55,7 +55,9 @@ import { createSrcDistanceView, createSrcOccupancyView } from "./srcDebugViews.j
 import { SRC_POOL_FLOORS, createSrcProbeSystem, describeSrcProbeSystem, formatSrcProbeFrame, srcPoolCeilings, srcProbesEnabled, srcShadeEnabled } from "./srcSystem.js";
 import { createSkyBinTables, describeSkySource } from "./srcSkyBins.js";
 // §11.4 A3 — the per-cascade block vector from measured peak demand.
-import { blockVectorFromPeaks } from "./srcConfig.js";
+// `snapBlockCapacity` puts it on the capacity ladder, which is what keeps the
+// SRC kernels' baked literals — and therefore the shader disk cache — stable.
+import { blockVectorFromPeaks, snapBlockCapacity } from "./srcConfig.js";
 import {
   createGiFlickerAccumulator, disposeGiFlickerAccumulator, readGiFlickerAccumulator,
   createGiTileMeanRecorder, disposeGiTileMeanRecorder, readGiTileMeanRecorder,
@@ -66,7 +68,7 @@ import { createSrcSurfaceAttribution } from "./srcSurface.js";
 import { createSrcBvhSurfaceAttribution } from "./srcBvhTrace.js";
 import { createSrcSlotPalette } from "./srcSlotPalette.js";
 import { SURFACE_POOL_CEILINGS, createOccupancyField, describeOccupancyField, quantizeOccupancyRes } from "./occupancyField.js";
-import { BVH_STRATEGY, buildStaticSceneBvhWords, classifyDynamicShape, composeFieldDynamics, createDynamicObjectSet, dynHeaderWords, giMobilityOf, giTraceOf } from "./dynamicObjects.js";
+import { BVH_STRATEGY, buildStaticSceneBvhWords, classifyDynamicShape, composeFieldDynamics, createDynamicObjectSet, dynHeaderWords, giMobilityOf, giSeatPlanOf, giTraceOf } from "./dynamicObjects.js";
 import { StaticBvhBuildCache, staticBvhStrategyName } from "./staticBvhBuildCache.js";
 import {
   STATIC_BVH_FORMAT_PLACEMENT,
@@ -131,6 +133,19 @@ const _reflProbeScale = new THREE.Vector3();
 // the step. Same magnitude as the atmosphere's old light-side SUN_STEP.
 const _giSunAim = new THREE.Vector3();
 const GI_SUN_DIR_STEP = 0.0044;
+// §gi-sun-dir-step-hz (2026-09-13): 0.0044 rad (~0.25°) is the STATIC hold —
+// right for a parked sun, but a fast day/night clock (short `dayLength`) still
+// turns through it many times a second, so GI never rested while the clock
+// ran. AtmosphereComponent now writes `engine.sunAngularRate` (deg/sec, 0
+// when the sun is not being driven by a running clock) each frame — the
+// smallest seam that lets GI size its own hold step without importing the
+// component. While driven, the step widens to re-light at most once per
+// `GI_SUN_RELIGHT_SECONDS`, clamped so it never coarsens below the static
+// 0.25° floor or past a 2° ceiling (see `#updateLightUniforms`).
+const GI_SUN_RELIGHT_SECONDS = 2;
+const GI_SUN_DIR_STEP_MIN_DEG = 0.25;
+const GI_SUN_DIR_STEP_MAX_DEG = 2;
+const GI_DEG2RAD = Math.PI / 180;
 // Hard floor between scene-sync scans. Editor drags emit change events every
 // frame, and each poke used to force a full scan (mesh traverse + material
 // resolve + hash) per frame — the "CPU spikes while moving" report. Moving
@@ -1514,6 +1529,16 @@ function meshWorldBox(mesh, target = new THREE.Box3()) {
  * receiving is a per-pixel lookup that needs no slot.
  */
 const MAX_INSTANCES_PER_MESH = 256;
+
+/**
+ * Per-population instance seat cap for foliage tiers that DO want a field
+ * presence (tree mid tiers): `userData.giInstanceCap` on the InstancedMesh
+ * overrides `MAX_INSTANCES_PER_MESH` down to this (never up — see
+ * `#placementsOf`). Grass rings, scattered ground cover and impostor tiers
+ * skip seating entirely via `userData.giTrace = "none"` instead; this cap is
+ * for the one tier per population that keeps an atlas presence.
+ */
+export const MAX_FOLIAGE_INSTANCES_PER_MESH = 48;
 
 // SDF bakes sample the surface, not every triangle cell — but a multi-
 // million-tri mesh still costs seconds of worker time on first bake.
@@ -15688,9 +15713,16 @@ export class GISystem {
     if (Number(globalThis.__giSrcC0Probes) || Number(globalThis.__giSrcBinBudget)) return null;
     const saved = this.engine?.prefs?.get?.(this.#poolPrefsKey("srcPools5"), null);
     const c0Probes = Number(saved?.c0Probes) || 0;
+    // ⭐ SNAP THE RESTORED VECTOR TOO. The record was written by a session that
+    // may predate the capacity ladder, or by one whose device ceiling rescaled
+    // it off-rung. Restoring an off-ladder vector puts arbitrary literals back
+    // into every SRC kernel and costs the boot its shader-cache hit — the whole
+    // point of the ladder is that a scene reaches the SAME rungs every time.
+    // See `snapBlockCapacity` in srcConfig.js. Snapping here is also what heals
+    // an existing project on its next boot, with no migration step.
     const blocks = Array.isArray(saved?.blocks) && saved.blocks.length === CASCADE_COUNT
       && saved.blocks.every((b) => Number.isFinite(b) && b > 0)
-      ? saved.blocks.map((b) => Math.floor(b))
+      ? saved.blocks.map((b, c) => snapBlockCapacity(Math.floor(b), c))
       : null;
     const peaks = Array.isArray(saved?.peaks)
       ? saved.peaks.map((v) => Math.max(0, Math.floor(Number(v) || 0)))
@@ -16264,6 +16296,13 @@ export class GISystem {
     // and every hit traces as before.
     let sunShadowFilled = false;
     if (state.sunShadow) state.sunShadow.count.value = 0;
+    // §gi-sun-dir-step-hz: widen the hold step while a running clock is
+    // driving the sun (`engine.sunAngularRate` > 0), else keep the static
+    // 0.25° step exactly as before.
+    const sunAngularRate = this.engine?.sunAngularRate || 0;
+    const giSunDirStep = sunAngularRate > 0
+      ? Math.min(GI_SUN_DIR_STEP_MAX_DEG, Math.max(GI_SUN_DIR_STEP_MIN_DEG, sunAngularRate * GI_SUN_RELIGHT_SECONDS)) * GI_DEG2RAD
+      : GI_SUN_DIR_STEP;
     for (let i = 0; i < state.lightSlots.length; i++) {
       const slot = state.lightSlots[i];
       const light = lights[i];
@@ -16292,7 +16331,7 @@ export class GISystem {
         _giSunAim.copy(lightAimDirection(light)).negate();
         const heldDir = slot.vector.value;
         if (globalThis.__giSunDirStep === false || heldDir.lengthSq() < 1e-6
-            || heldDir.angleTo(_giSunAim) > GI_SUN_DIR_STEP) {
+            || heldDir.angleTo(_giSunAim) > giSunDirStep) {
           heldDir.copy(_giSunAim);
         }
         if (!sunShadowFilled && state.sunShadow && light.userData?.giShadowMode !== "gi") {
@@ -17300,18 +17339,35 @@ export class GISystem {
    * instance index per live InstancedMesh instance. `mesh.count` is the
    * DRAWN count, which is what the field should match — instances parked
    * beyond it are not on screen and must not cast.
+   *
+   * `giTrace: "none"` (grass rings, scattered ground-cover, impostor tiers —
+   * see foliageMaterial.js/grassRenderer.js) returns `[]`: no atlas slot, no
+   * bake, no static-BVH triangles (this same list feeds both #buildEntries
+   * AND #occupancyContentOf's static-shadow-BVH placements), not counted in
+   * any tier tally. The surface still RECEIVES GI — that is a per-pixel field
+   * lookup in the material shader, unrelated to being seated here.
+   *
+   * `userData.giInstanceCap` narrows the seat count below
+   * `MAX_INSTANCES_PER_MESH` (never widens it) — a population's one tier that
+   * DOES keep a field presence (tree mid tiers) tags its InstancedMesh with a
+   * small cap (`MAX_FOLIAGE_INSTANCES_PER_MESH`) instead of eating the full
+   * 256-seat budget per prototype.
    */
   #placementsOf(mesh) {
-    if (!mesh.isInstancedMesh) return [null];
-    const count = Math.min(mesh.count ?? 0, MAX_INSTANCES_PER_MESH);
-    if ((mesh.count ?? 0) > MAX_INSTANCES_PER_MESH && !this._warnedInstanceCap?.has(mesh)) {
+    // The seating DECISION (giTrace:"none" → 0, an InstancedMesh's
+    // giInstanceCap → a narrowed cap) is `giSeatPlanOf` (dynamicObjects.js) —
+    // pure and unit-tested there, since a private method can't be. This is
+    // just "turn a seat count into instance indices" plus the one-time warn.
+    const plan = giSeatPlanOf(mesh, MAX_INSTANCES_PER_MESH);
+    if (!plan.isInstanced) return plan.seats > 0 ? [null] : [];
+    if ((mesh.count ?? 0) > plan.cap && !this._warnedInstanceCap?.has(mesh)) {
       (this._warnedInstanceCap ??= new WeakSet()).add(mesh);
       console.warn(
         `[gi] "${mesh.name || "InstancedMesh"}" has ${mesh.count} instances; ` +
-          `the first ${MAX_INSTANCES_PER_MESH} occupy SDF slots, the rest receive GI but do not cast`,
+          `the first ${plan.cap} occupy SDF slots, the rest receive GI but do not cast`,
       );
     }
-    return Array.from({ length: count }, (_, i) => i);
+    return Array.from({ length: plan.seats }, (_, i) => i);
   }
 
   #buildEntries(meshes) {
@@ -18931,6 +18987,11 @@ export class GISystem {
       if (!object.isMesh && !object.isInstancedMesh) return;
       if (object.layers?.isEnabled?.(EDITOR_LAYER)) return;
       if (object.layers?.isEnabled?.(UI_LAYER)) return;
+      // giTrace:"none" meshes (foliage rings/impostors) never seat or bake —
+      // they must not show up in a reflect-tier report either, or a "0 sharp,
+      // N coarse" census reads as GI work being done on triangles the field
+      // never touched.
+      if (giTraceOf(object) === "none") return;
       const list = Array.isArray(object.material) ? object.material : [object.material];
       // A mesh is traced at the rate its SHARPEST material needs — one layer
       // tag covers every submaterial, so the finest one wins (min tier index).

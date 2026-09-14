@@ -128,20 +128,32 @@ defineOp({
   name: "terrain.create",
   undoable: true,
   description:
-    "Create a terrain: an entity with a Terrain component plus the heightmap and splat assets it needs. Painting is brush work in the viewport and is not exposed as a tool; sculpting is (terrain.sculpt); an agent can also size the terrain and set its material layers with component.setProp.",
+    "Create a terrain: an entity with a Terrain component plus the heightmap and splat assets it needs. Pass `style` to generate it procedurally from the style-driven landscape (meadow | hills | highlands | alpine | canyon | karst | shattered) with its six controls (height, scale, levels, wildness, erosion, rocks — each 0..1 except height 0..2 and scale .4..2.5, .5 being the style's designed look); `rocks` > 0 also builds the style's stone structures (cliff walls, spires, arches, ledges, talus). Omit `style` for a flat sculptable heightfield. Painting is brush work in the viewport and is not exposed as a tool; sculpting is (terrain.sculpt, which lands as a delta on a procedural base); every control is also a component.setProp.",
   params: {
-    size: { type: "number", default: 50, description: "World size of one side, in metres." },
+    size: { type: "number", default: 50, description: "World size of one side, in metres. Styles are designed at 512-2048 m; a smaller terrain gets a miniature of the style." },
     resolution: { type: "number", default: 128, description: "Heightmap resolution per side, in samples." },
     name: { type: "string", default: "Terrain", description: "Entity name." },
+    style: { type: "string", description: "Procedural landscape style. Omit for a flat heightfield." },
+    seed: { type: "number", description: "Procedural seed (default 1)." },
+    height: { type: "number", description: "Vertical scale, 0-2 (default 1)." },
+    scale: { type: "number", description: "Feature size, .4-2.5 (default 1)." },
+    levels: { type: "number", description: "Benches and plateaus separated by cliffs, 0-1 (default .5)." },
+    wildness: { type: "number", description: "Exaggeration: sharper crests, taller cliffs, more towers, 0-1 (default .5)." },
+    erosion: { type: "number", description: "Carved valleys and gullies, 0-1 (default .5)." },
+    rocks: { type: "number", description: "Stone structures, 0-1 (default .5)." },
   },
-  async run({ size = 50, resolution = 128, name = "Terrain" }) {
+  async run({ size = 50, resolution = 128, name = "Terrain", style, seed, height, scale, levels, wildness, erosion, rocks }) {
     requireModule("terrain");
     requireProject();
     const { createTerrainAssets, assignTerrainAssets } = await import("../../terrainAssetSetup.js");
     const { CreateEntityCommand } = await import("../../commands/entityCommands.js");
     const { commandBus } = await import("../../commands/CommandBus.js");
+    const { TERRAIN_STYLES } = await import("../../../engine/terrain/proceduralTerrain.js");
+    if (style !== undefined && !TERRAIN_STYLES.includes(style)) throw new Error(`Unknown terrain style "${style}" — one of ${TERRAIN_STYLES.join(", ")}.`);
+    const procedural = style === undefined ? {} : Object.fromEntries(Object.entries({ procedural: true, style, proceduralSeed: seed, height, scale, levels, wildness, erosion, rocks })
+      .filter(([, value]) => value !== undefined));
     const assets = await createTerrainAssets({ size, resolution });
-    const command = new CreateEntityCommand({ name, components: [{ type: "terrain", props: { size, resolution } }] });
+    const command = new CreateEntityCommand({ name, components: [{ type: "terrain", props: { size, resolution, ...procedural } }] });
     commandBus.execute(command);
     const entity = engine.getEntity(command.entityId);
     if (entity) assignTerrainAssets(entity, assets);

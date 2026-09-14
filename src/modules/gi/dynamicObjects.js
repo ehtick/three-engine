@@ -251,12 +251,56 @@ export function giMobilityOf(mesh) {
   return legacy?.mobility ?? "auto";
 }
 
-/** Reads a mesh's GI trace representation: "auto" | "voxel" | "bvh" | "obb". */
+/**
+ * Reads a mesh's GI trace representation:
+ * "auto" | "voxel" | "bvh" | "obb" | "none".
+ *
+ * "none" (2026-09-13, foliage GI policy) is stronger than "voxel": "voxel"
+ * still seats the mesh into the occupancy field/atlas as a voxelized
+ * occluder+bounce source; "none" means the mesh contributes NOTHING to the
+ * field at all — no atlas slot, no static-BVH triangles, no SDF bake, not
+ * counted in any tier tally (see GISystem.js `#placementsOf`, which returns
+ * no placements for it). The surface still RECEIVES GI: that is a per-pixel
+ * field lookup in its material shader and does not depend on being seated
+ * here. Meant for grass/ground-cover rings and impostor tiers, where seating
+ * every blade/billboard instance would blow the instance and SDF-bake budget
+ * for no visible occlusion gain.
+ */
 export function giTraceOf(mesh) {
   const t = mesh?.userData?.giTrace;
-  if (t === "voxel" || t === "bvh" || t === "obb" || t === "auto") return t;
+  if (t === "voxel" || t === "bvh" || t === "obb" || t === "auto" || t === "none") return t;
   const legacy = LEGACY_GI_DYNAMIC[mesh?.userData?.giDynamic];
   return legacy?.trace ?? "auto";
+}
+
+/**
+ * Pure seating decision for one mesh, shared by `GISystem.js#placementsOf`
+ * (the ONLY place that decides which instances get an atlas slot / SDF bake /
+ * static-BVH triangle) and this module's own tests — a private class method
+ * cannot be unit-tested directly, so the actual policy lives here instead of
+ * being reimplemented for a test double.
+ *
+ *   - `giTraceOf(mesh) === "none"`: 0 seats (foliage rings/impostor tiers —
+ *     no atlas slot, no bake, no static-BVH triangle, not counted anywhere).
+ *   - a plain (non-instanced) mesh: 1 seat, unaffected by `giInstanceCap`
+ *     (the cap narrows an InstancedMesh's per-mesh budget; a single mesh has
+ *     no per-instance budget to narrow).
+ *   - an InstancedMesh: `min(mesh.count, cap)`, where `cap` is
+ *     `userData.giInstanceCap` when set (NEVER widening past `hardCap` — a
+ *     tag asking for more than the hard ceiling is clamped, not honoured),
+ *     else `hardCap` (`MAX_INSTANCES_PER_MESH` in GISystem.js).
+ *
+ * Returns `{ seats, cap, isInstanced }`: `cap` is the effective per-mesh
+ * ceiling (for the "N occupy slots" warning), `seats` is how many of
+ * `mesh.count` actually claim one.
+ */
+export function giSeatPlanOf(mesh, hardCap) {
+  if (giTraceOf(mesh) === "none") return { seats: 0, cap: 0, isInstanced: !!mesh?.isInstancedMesh };
+  if (!mesh?.isInstancedMesh) return { seats: 1, cap: 1, isInstanced: false };
+  const tagged = Number(mesh.userData?.giInstanceCap);
+  const cap = tagged > 0 ? Math.min(hardCap, tagged) : hardCap;
+  const seats = Math.max(0, Math.min(mesh.count ?? 0, cap));
+  return { seats, cap, isInstanced: true };
 }
 
 /**

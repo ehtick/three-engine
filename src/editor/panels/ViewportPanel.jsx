@@ -28,6 +28,7 @@ import {
 } from "../boxSelect.js";
 import { setupBoxSelect } from "../viewportBoxSelect.js";
 import { DEBUG_LAYER, EDITOR_LAYER, PHYSICS_DEBUG_LAYER, UI_LAYER } from "../../engine/editorLayers.js";
+import { freeze } from "../../engine/freezeLedger.js";
 import { StatsOverlay } from "../overlays/StatsOverlay.jsx";
 import { useSelectionStore } from "../store/selectionStore.js";
 import { useSceneStore } from "../store/sceneStore.js";
@@ -1265,9 +1266,27 @@ function setupSelectionOutline() {
   // and again — debounced, off the frame — whenever the entity tree changes;
   // compileAsync only creates what is missing, so re-runs are cheap.
   let warmTimer = 0;
+  // ⛔ NOT WHILE THE DRIVER IS STILL BUSY. This prewarm exists to spare the
+  // FIRST SELECTION its pipeline hitch — and the first selection cannot happen
+  // until a human clicks, which is seconds away. Meanwhile it hands the GPU
+  // process one mask pipeline per geometry layout in the scene: measured
+  // 2026-09-12 on the Foliage scene, 45 `selectionOutlineMask:selected` plus 37
+  // `:active` async pipelines, queued behind nothing and in front of every
+  // material the user is waiting to see. On that boot 18 624 of 20 902 blocked
+  // ms were `waitingOnGpuMs` — the driver queue IS the boot, so anything added
+  // to it that nobody is waiting for should wait its turn.
+  //
+  // `freeze.asyncInFlight` is the queue's own depth, already tracked by the
+  // ledger for the "GPU process busy?" line. Defer while it is non-empty, with
+  // a deadline so a queue that never drains (or a ledger that is disabled)
+  // cannot cost the user the hitch this exists to prevent.
+  const WARM_DEADLINE_MS = 20000;
+  let warmDeadline = 0;
   const warmMasks = () => {
     warmTimer = 0;
     if (engine.playing || !engine.renderer || !viewport.camera) return;
+    const busy = freeze.asyncInFlight?.size > 0;
+    if (busy && performance.now() < warmDeadline) { scheduleWarm(); return; }
     precompileSelectionOutlineMasks({
       renderer: engine.renderer,
       scene: engine.scene,
@@ -1275,6 +1294,7 @@ function setupSelectionOutline() {
     }).catch(() => {});
   };
   const scheduleWarm = () => {
+    if (!warmDeadline) warmDeadline = performance.now() + WARM_DEADLINE_MS;
     if (warmTimer) clearTimeout(warmTimer);
     warmTimer = setTimeout(warmMasks, 1000);
   };
@@ -2711,7 +2731,9 @@ function setupTerrainBrush(canvas) {
       component: sel.component,
       entityId: sel.entityId,
       before: mode === "sculpt"
-        ? sel.component.props.heights
+        // A procedural terrain (P1-T) sculpts into `heightEdits`; `heights`
+        // is ignored while it is on.
+        ? (sel.component.props.procedural ? sel.component.props.heightEdits : sel.component.props.heights)
         : mode === "scatter"
           ? JSON.stringify(sel.component.scatterLayersData ?? sel.component.props.scatterLayers ?? [])
           : sel.component.props.splatmap,
@@ -2776,7 +2798,8 @@ function setupTerrainBrush(canvas) {
     viewport.orbit.enabled = true;
     if (mode === "sculpt") {
       component.commitHeights();
-      commandBus.execute(new SetTerrainHeightsCommand(entityId, before, component.props.heights));
+      const key = component.props.procedural ? "heightEdits" : "heights";
+      commandBus.execute(new SetTerrainHeightsCommand(entityId, before, component.props[key], key));
     } else if (mode === "paint" || mode === "erase") {
       component.commitSplatmap();
       commandBus.execute(new SetTerrainSplatmapCommand(entityId, before, component.props.splatmap));

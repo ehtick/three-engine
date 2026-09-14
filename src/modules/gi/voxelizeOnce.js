@@ -1,3 +1,4 @@
+import { isFlatTexture } from "./materialNodeBindings.js";
 // GI shared helpers that survived the SDF/voxel-bake deletion (2026-08-02).
 //
 // This file used to be the legacy CPU voxel medium (bakeCore rasterize + EDT
@@ -42,7 +43,7 @@ function constantColorOf(node, depth = 0) {
  *  sample), or null. Same bounded wrapper-walk as constantColorOf. */
 function textureValueOf(node, depth = 0) {
   if (!node || depth > 8) return null;
-  if (node.value?.isTexture) return node.value;
+  if (node.value?.isTexture) return isFlatTexture(node.value) ? node.value : null;
   for (const child of [node.aNode, node.bNode, node.node]) {
     const found = child ? textureValueOf(child, depth + 1) : null;
     if (found) return found;
@@ -234,7 +235,7 @@ export function resolveMaterialSurface(materialInput, meshName = "", depth = 0) 
   }
   let color = constantColorOf(material?.colorNode) ?? material?.color ?? white;
   // A/B escape hatch, dev/harness only.
-  const colorTexture = globalThis.__giNoTextureTint ? null : (material?.map ?? textureValueOf(material?.colorNode));
+  const colorTexture = globalThis.__giNoTextureTint ? null : ((isFlatTexture(material?.map) ? material.map : null) ?? textureValueOf(material?.colorNode));
   const mapAverage = textureAverageColor(colorTexture);
   if (mapAverage) {
     color = { r: color.r * mapAverage.r, g: color.g * mapAverage.g, b: color.b * mapAverage.b };

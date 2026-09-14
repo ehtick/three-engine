@@ -129,6 +129,15 @@ const TERRAIN_PRESET = {
   spec: { name: "Terrain", components: [{ type: "terrain", props: {} }] },
 };
 
+// World enables its own providers on creation, so the entry is discoverable in
+// a new project before any landscape modules have been enabled.
+const WORLD_PRESET = {
+  label: "Temperate valley",
+  Icon: Mountain,
+  color: "#81b390",
+  spec: { __worldPreset: "temperate-valley" },
+};
+
 const FOLIAGE_PRESETS = [
   { label: "Foliage Tree", Icon: Leaf, color: "#78b957", spec: { __foliageSpecies: "oak" } },
   { label: "Foliage Grass", Icon: Leaf, color: "#78b957", spec: { __foliageSpecies: "grass" } },
@@ -466,6 +475,8 @@ function EntityIcon({ components }) {
             { Icon: Spline, color: "icon-path" }
           : components.foliage
           ? { Icon: Leaf, color: "icon-path" }
+          : components.world
+          ? { Icon: Mountain, color: "icon-path" }
           : components.terrain
           ? { Icon: Mountain, color: "icon-model" }
           : components.mesh
@@ -1172,6 +1183,9 @@ function ContextMenu({
   // happened to be selected elsewhere would act on something off-screen.
   const items = menu.empty
     ? [
+        { header: "Create World" },
+        { label: WORLD_PRESET.label, icon: WORLD_PRESET.Icon, action: () => onCreate(WORLD_PRESET.spec) },
+        { separator: true },
         { header: "Create" },
         ...[...COMMON_PRESETS, ...modulePresets(moduleFlags)].map((preset) => ({
           label: preset.label,
@@ -1249,6 +1263,7 @@ export function HierarchyPanel() {
   const stageDirty = usePrefabStore((s) => s.stageDirty);
   const [renamingId, setRenamingId] = useState(null);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [worldCreation, setWorldCreation] = useState("");
   const [dropHint, setDropHint] = useState(null);
   const [contextMenu, setContextMenu] = useState(null); // {x, y}
   // The collapse set and the scene it belongs to are ONE piece of state.
@@ -1703,6 +1718,17 @@ export function HierarchyPanel() {
     setMenuOpen(false);
     const selected = useSelectionStore.getState().ids;
     const parentId = selected.length === 1 ? selected[0] : null;
+    if (spec.__worldPreset) {
+      setWorldCreation("Creating temperate valley…");
+      try {
+        const { createWorld } = await import("../worldBuild.js");
+        await createWorld({}, { position: getCursor3DPosition().toArray(), focus: true });
+        const { openPanel } = await import("../EditorShell.jsx");
+        openPanel("inspector");
+        setWorldCreation("");
+      } catch (error) { setWorldCreation(`World: ${error.message || error}`); }
+      return;
+    }
     if (spec.__foliageSpecies) {
       try {
         const surfaceId = isFoliageSurface(engine.getEntity(parentId)) ? parentId : "";
@@ -1845,6 +1871,8 @@ export function HierarchyPanel() {
                 <FileCode2 size={14} style={{ color: "#8ea0b5" }} className="component-item-icon" />
                 <span className="component-item-label">New Scene</span>
               </button>
+              <div className="dropdown-section-label">Create World</div>
+              <PresetItem preset={WORLD_PRESET} onPick={createEntity} />
               <div className="dropdown-section-label">Entity</div>
               {[...COMMON_PRESETS, ...modulePresets(moduleFlags)].map((p) => (
                 <PresetItem key={p.label} preset={p} onPick={createEntity} />
@@ -1939,6 +1967,7 @@ export function HierarchyPanel() {
           )}
         </div>
       </div>
+      {worldCreation && <p role={worldCreation.startsWith("World:") ? "alert" : "status"} style={{ margin: "6px 10px", fontSize: 11, color: worldCreation.startsWith("World:") ? "#ee9999" : "var(--text-dim)" }}>{worldCreation}</p>}
       <div className="scene-label">
         <Layers size={13} className="scene-label-glyph" aria-hidden="true" />
         <span className="scene-label-name">

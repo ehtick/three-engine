@@ -1209,6 +1209,14 @@ defineOp({
         // `gbufferProxies` means every group was refused, and the two `parked*`
         // counters say by which rule.
         gbufferSwap: engine.modules?.get?.("gi")?.system?._gbufProxyStats ?? null,
+        // Clipmap suns: whether each level HELD its raster or redrew it, and how
+        // the shared cache classified casters. `movingCasters` counts what every
+        // level redraws on every frame the level renders at all.
+        clipmap: [...(engine.clipmapShadowNodes ?? [])].map((node) => ({
+          levels: node.levels,
+          cache: { ...node.cache?.stats },
+          perLevel: (node._shadowNodes ?? []).map((level) => ({ ...level.stats })),
+        })),
       },
       note: drawing
         ? r.skippedFps > 0
@@ -1849,7 +1857,7 @@ defineOp({
     return {
       ...report,
       note: report.observing
-        ? "`owners` are SELF time — a nested span's ms are not also charged to its parent. `(unattributed)` is real time in code nothing marks yet; a large one is a missing mark, not an absence of work. `gpu` counts synchronous pipeline/shader-module creation inside the block: that work never appears in a JS profile because the driver parses WGSL on the calling thread. In `nodeBuildCauses`, `first compile` and `material key` are work that had to happen; a named input (`lights`, `fog`, `environment`, `shadowMap`, `context`) is a WAVE — three keys its node-builder cache partly on that scene-wide state, so one of them moving re-mints every material in the scene at once."
+        ? "`owners` are SELF time — a nested span's ms are not also charged to its parent. `(unattributed)` is real time in code nothing marks yet; a large one is a missing mark, not an absence of work. ⚠ `gpu` is NOT the block's own work — nothing resets those counters at the start of an ordinary task, so they cover everything SINCE THE PREVIOUS LONG TASK. `gpu.windowMs` is how long that was: DIVIDE BY IT before believing `writeBytes`/`writes`. A 60 ms block reading 484 MB in 123 097 write(s) was seven seconds of ordinary 60 fps rendering (~293 writes and ~1.15 MB a frame), not a catastrophic upload. The pipeline and shader-module counts carry the same caveat, but they are small numbers and a compile anywhere in the window is still what made the GPU process busy — which is what they are read for. That work never appears in a JS profile because the driver parses WGSL on the calling thread. In `nodeBuildCauses`, `first compile` and `material key` are work that had to happen; a named input (`lights`, `fog`, `environment`, `shadowMap`, `context`) is a WAVE — three keys its node-builder cache partly on that scene-wide state, so one of them moving re-mints every material in the scene at once."
         : "The long-task observer is NOT running (no PerformanceObserver, or `longtask` is unsupported here). Spans are still recorded, so profile.boot works, but nothing is attributing blocks.",
     };
   },
@@ -2048,5 +2056,79 @@ defineOp({
       verdict,
       note: "`engine` is the marked tick, `other` is every other contiguous busy block, `idle` is the thread genuinely parked. perFrameMs divides by the browser's frame offers, so the three perFrameMs values sum to one frame's period. The heartbeat keeps the thread hot and can itself suppress idle behaviour: run a window, read it, and do not leave it on.",
     };
+  },
+});
+
+defineOp({
+  name: "profile.foliageState",
+  readOnly: true,
+  description:
+    "Per-foliage-component internal state: chunk tier/level/mask histograms, per-render-mesh visibility and committed counts, impostor atlas and arrival-ramp state, and the resumable commit jobs. This is the view the draw-call audit cannot give — WHY a tier is (not) drawing, not just what was submitted.",
+  params: {},
+  async run() {
+    if (!engine) throw new Error("No engine.");
+    const components = [];
+    for (const entity of engine.entities?.values?.() ?? []) {
+      const c = entity.getComponent?.("foliage");
+      if (!c) continue;
+      const chunks = c.chunks ?? [];
+      const levels = {};
+      const tierMasks = {};
+      const commitMasks = {};
+      for (const ch of chunks) {
+        levels[ch.level] = (levels[ch.level] ?? 0) + 1;
+        const t = ch.tierMask ?? -1;
+        const k = ch.commitMask ?? -1;
+        tierMasks[t] = (tierMasks[t] ?? 0) + 1;
+        commitMasks[k] = (commitMasks[k] ?? 0) + 1;
+      }
+      const jobs = (c._orderSpread ?? []).map((job, lod) => job ? {
+        lod,
+        cursor: job.cursor ?? null,
+        count: job.count ?? null,
+        done: !!job.done,
+        chunksMatch: job.chunks === chunks,
+      } : { lod, empty: true });
+      components.push({
+        entity: entity.id,
+        name: entity.name,
+        species: c.props?.species ?? null,
+        lodNear: c.props?.lodNear, lodFar: c.props?.lodFar,
+        maxDistance: c.props?.maxDistance, shadowFar: c.props?.shadowFar,
+        status: c._stats?.status ?? null,
+        chunks: chunks.length,
+        // Why a tier-2 commit might stage nothing: its per-chunk SOURCE meshes
+        // (chunk.meshes[2], written by _buildImpostors) are what every commit
+        // path copies from. A missing source is skipped SILENTLY.
+        impostorSources: chunks.filter((ch) => ch.meshes?.[2]).length,
+        impostorSourceInstances: chunks.reduce((sum, ch) => sum + (ch.meshes?.[2]?.geometry?.instanceCount ?? 0), 0),
+        totalInstances: c.instances?.length ?? null,
+        levels,
+        tierMasks,
+        commitMasks,
+        atlasReady: !!c._atlasEntry?.atlas,
+        atlasError: c._atlasEntry?.error ?? null,
+        impostorRamp: c._impostorRamp ?? null,
+        batchDirty: !!c._batchDirty,
+        batchVersion: c._batchVersion ?? null,
+        commitVersion: c._batchCommitVersion ?? null,
+        tierEverCommitted: c._tierEverCommitted ?? null,
+        jobs,
+        renderMeshes: (c.renderMeshes ?? []).map((m, lod) => ({
+          lod,
+          visible: !!m?.visible,
+          // InstancedMesh draws `count` instances; a plain Mesh with an
+          // InstancedBufferGeometry (the impostor tier) reports its
+          // geometry's instanceCount. ⚠ `Mesh.count` EXISTS in three r185+
+          // (initialised to 1) and must never be read for a plain Mesh —
+          // that fallback is exactly how the impostor tier once looked
+          // "wedged at one instance" while carrying hundreds.
+          count: m?.isInstancedMesh ? m.count : m?.geometry?.instanceCount ?? null,
+          castShadow: !!m?.castShadow,
+        })),
+        stats: c._stats ? { ...c._stats } : null,
+      });
+    }
+    return { components };
   },
 });

@@ -39,6 +39,7 @@ import { MAX_LODS } from "./srcConfig.js";
 import { FLAG_ALIVE, FLAG_FRESH, PROBE_FLAGS, PROBE_KEY, PROBE_WORDS } from "./srcProbes.js";
 import { cellPosition, keyCell, keyLod, keyWorldCell, latticeOrigin, probeSpacing } from "./srcMathTsl.js";
 import { worldKeysEnabled } from "./srcMath.js";
+import { scalarUniform } from "./srcCapacityUniforms.js";
 
 /**
  * Sphere radius as a fraction of the probe's own spacing.
@@ -108,7 +109,7 @@ export function createSrcProbeGizmos(store, { spacing0, anchor, detail = 0 } = {
     material.transparent = false;
 
     const probeAt = () => {
-      const p = instanceIndex.add(uint(c.probeBase)).toVar();
+      const p = instanceIndex.add(uint(scalarUniform(c.probeBase, "probeBase"))).toVar();
       const w = p.mul(PROBE_WORDS).toVar();
       const key = store.probeTable.element(w.add(PROBE_KEY)).toVar();
       const flags = store.probeTable.element(w.add(PROBE_FLAGS)).toVar();

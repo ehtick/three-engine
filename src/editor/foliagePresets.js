@@ -4,6 +4,13 @@ const PLACEMENT = {
   oak: { density: 0.015, minSpacing: 4, lodNear: 35, lodFar: 90, maxDistance: 350 },
   pine: { density: 0.025, minSpacing: 3, lodNear: 35, lodFar: 90, maxDistance: 350 },
   birch: { density: 0.03, minSpacing: 2.5, lodNear: 30, lodFar: 80, maxDistance: 300 },
+  "black-tupelo": { density: 0.018, minSpacing: 4, lodNear: 35, lodFar: 90, maxDistance: 350 },
+  "weeping-willow": { density: 0.012, minSpacing: 5, lodNear: 35, lodFar: 90, maxDistance: 350 },
+  spruce: { density: 0.02, minSpacing: 3, lodNear: 35, lodFar: 90, maxDistance: 350 },
+  maple: { density: 0.015, minSpacing: 4.5, lodNear: 35, lodFar: 90, maxDistance: 350 },
+  poplar: { density: 0.03, minSpacing: 2, lodNear: 35, lodFar: 90, maxDistance: 350 },
+  shrub: { density: 0.08, minSpacing: 1.2, lodNear: 15, lodFar: 40, maxDistance: 120 },
+  hawthorn: { density: 0.035, minSpacing: 2.5, lodNear: 25, lodFar: 65, maxDistance: 220 },
   grass: { density: 3, minSpacing: 0.15, lodNear: 12, lodFar: 30, maxDistance: 65 },
   wildflowers: { density: 0.8, minSpacing: 0.3, lodNear: 15, lodFar: 35, maxDistance: 80 },
 };
@@ -12,6 +19,13 @@ export const FOLIAGE_CHOICES = [
   { species: "oak", label: "Oak" },
   { species: "pine", label: "Pine" },
   { species: "birch", label: "Birch" },
+  { species: "black-tupelo", label: "Black Tupelo" },
+  { species: "weeping-willow", label: "Weeping Willow" },
+  { species: "spruce", label: "Spruce" },
+  { species: "maple", label: "Maple" },
+  { species: "poplar", label: "Poplar" },
+  { species: "shrub", label: "Shrub" },
+  { species: "hawthorn", label: "Hawthorn" },
   { species: "grass", label: "Grass" },
   { species: "wildflowers", label: "Wildflowers" },
 ];
@@ -23,6 +37,7 @@ export function foliagePreset(species = "oak") {
   const { height, width, leafColor, barkColor, flowerColor } = source;
   return {
     species: id, height, width, leafColor, barkColor, flowerColor,
+    ...(!["grass", "wildflowers"].includes(id) ? { leafDensity: 1, leafSize: 1, branchDensity: 1, crownBase: 0, crownSpread: 1 } : {}),
     ...PLACEMENT[id], minScale: 0.8, maxScale: 1.2,
     maxSlope: id === "grass" || id === "wildflowers" ? 50 : 40,
     alignToNormal: id === "grass" || id === "wildflowers",

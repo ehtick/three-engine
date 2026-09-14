@@ -2176,10 +2176,16 @@ declare module "engine" {
   /** Procedural plants with surface scattering, wind, collider bending and distance LOD. */
   export interface FoliageComponent extends ComponentBase<{
     species: "oak" | "pine" | "birch" | "grass" | "wildflowers";
-    distribution: "single" | "scatter";
+    distribution: "single" | "scatter" | "placements";
+    /** Stable local-space positions, generated or authored. Rotation is radians. */
+    placements: { id: string; position: [number, number, number]; rotation?: [number, number, number]; scale?: number }[];
     surface: string;
     seed: number; height: number; width: number;
     leafColor: string; barkColor: string; flowerColor: string;
+    /** Tree-only multipliers; neutral value is 1. */
+    leafDensity: number; leafSize: number; branchDensity: number; crownSpread: number;
+    /** Tree crown-base offset as a fraction of height; neutral value is 0. */
+    crownBase: number;
     density: number; maxInstances: number; minSpacing: number;
     minScale: number; maxScale: number; minSlope: number; maxSlope: number;
     minAltitude: number; maxAltitude: number; alignToNormal: boolean;

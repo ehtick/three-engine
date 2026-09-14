@@ -73,6 +73,32 @@ defineOp({
 });
 
 defineOp({
+  name: "architecture.styles", readOnly: true,
+  description: "The building style catalogue (tiny-glade, townscaper, timber-medieval, castle, gothic, japanese, modern, futuristic...) with each style's tunable params. A composition's model.style = { id, seed, params } decides walls, roofs, openings and every detail; forms with roof 'auto' take the style's roof shape and pitch.",
+  params: {},
+  async run() {
+    const { listStyles, STYLE_PARAMS } = await import("../../../modules/architecture/styles/catalog.js");
+    return { styles: listStyles(), params: structuredClone(STYLE_PARAMS), colorParams: ["wall", "roof", "trim"], booleanParams: ["plinth", "ridge"], formRoofs: ["auto", "gable", "hip", "shed", "flat", "none", "dome"], openingHeads: ["auto", "flat", "round", "pointed", "segment"] };
+  },
+});
+defineOp({
+  name: "architecture.setStyle", undoable: true,
+  description: "Restyle a composition in one undoable edit. Omit id to keep the current style; params merge over existing params (null removes a key); style id '' removes the style (plain massing).",
+  params: { entityId: entityParam, id: { type: "string" }, seed: { type: "number" }, params: { type: "object" } },
+  async run({ entityId, id, seed, params }) {
+    const { engine } = await import("../../engineInstance.js");
+    const model = structuredClone(engine.getEntity(entityId)?.getComponent("architecture")?.props.model);
+    if (!model) throw new Error("Select a live Architecture model to restyle.");
+    if (id === "") { delete model.style; return (await models()).setArchitectureModel(entityId, model, "Clear architecture style"); }
+    const style = { ...(model.style ?? { id: "tiny-glade", seed: 1 }) };
+    if (id) style.id = id;
+    if (Number.isFinite(seed)) style.seed = seed;
+    if (params) { style.params = { ...(style.params ?? {}) }; for (const [key, value] of Object.entries(params)) { if (value === null) delete style.params[key]; else style.params[key] = value; } }
+    model.style = style;
+    return (await models()).setArchitectureModel(entityId, model, "Set architecture style");
+  },
+});
+defineOp({
   name: "architecture.presets", readOnly: true,
   description: "Available Architecture generators and editable defaults. Buildings, cities and freeform assemblies share ordinary editable meshes; generated content can be regenerated explicitly.",
   params: {},

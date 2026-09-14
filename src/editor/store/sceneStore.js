@@ -29,12 +29,30 @@ export const sceneMirrorStats = { full: 0, incremental: 0 };
  * so the search box can briefly disagree with the engine about a flag nobody
  * changed through a command.
  */
+/**
+ * Unique ids preserving first-occurrence order. The engine's parent/child
+ * graph is a tree, so a duplicate here means a corrupted tree; the mirror
+ * de-dupes them so React never sees two rows with the same key from a
+ * single parent (`HierarchyPanel` keys rows by id).
+ */
+function uniqueIds(items, getId = (it) => it.id) {
+  const seen = new Set();
+  const out = [];
+  for (const it of items) {
+    const id = getId(it);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
+}
+
 function mirrorEntity(entity) {
   return {
     id: entity.id,
     name: entity.name,
     parentId: entity.parent?.id ?? null,
-    childIds: entity.children.map((c) => c.id),
+    childIds: uniqueIds(entity.children),
     transform: entity.getTransform(),
     tags: [...(entity.tags ?? [])],
     components: Object.fromEntries(
@@ -77,7 +95,7 @@ export const useSceneStore = vmSingleton("sceneStore", () =>
         }
         set((state) => ({
           entities,
-          rootIds: inst.rootEntities.map((e) => e.id),
+          rootIds: uniqueIds(inst.rootEntities),
           sceneName: inst.sceneName,
           ...(scenePath !== undefined ? { scenePath } : { scenePath: state.scenePath }),
         }));

@@ -51,6 +51,9 @@ export function FoliageSection({ entityId, props }) {
   const component = engine.getEntity(entityId)?.getComponent("foliage");
   const stats = component?.stats;
   const scatter = props.distribution === "scatter";
+  // Grass draws a sward rather than scattering clumps, so the controls that
+  // only mean something to a scattered prototype are not shown for it.
+  const drawn = props.species === "grass" && props.drawnGrass !== false;
   const commit = (key, value) => commandBus.execute(new SetComponentPropCommand(entityId, "foliage", key, value));
   const patch = (values, label) => commandBus.execute(new BatchCommand(
     Object.entries(values).map(([key, value]) => new SetComponentPropCommand(entityId, "foliage", key, value)), label));
@@ -76,9 +79,10 @@ export function FoliageSection({ entityId, props }) {
     </Row>
     <Row label="Placement">
       <Select value={props.distribution} onChange={(event) => commit("distribution", event.target.value)}>
-        <option value="single">Single plant</option><option value="scatter">Scatter on surface</option>
+        <option value="single">Single plant</option><option value="scatter">Scatter on surface</option><option value="placements">Placed population</option>
       </Select>
     </Row>
+    {props.distribution === 'placements' && <div className="inspector-hint">{props.placements?.length ?? 0} placed plants. Shape and color edits retain their positions.</div>}
     {scatter && <>
       <Row label="Surface" title="Pick a Mesh, Model, Terrain, or a group. You can also drag its hierarchy row here.">
         <EntityField value={props.surface ?? ""} onCommit={(value) => commit("surface", value)} descriptor={{
@@ -86,20 +90,48 @@ export function FoliageSection({ entityId, props }) {
           filter: (entity) => isFoliageSurface(entity, (id) => useSceneStore.getState().entities[id]),
         }} />
       </Row>
-      {number("density", "Plants / m²", 0, undefined, 0.01, "Coverage per square metre of surface area, capped by the instance limit.")}
-      {number("maxInstances", "Plant limit", 0, 100000, 100, "Hard limit for this foliage layer. Increase for larger areas.")}
+      {!drawn && number("density", "Plants / m²", 0, undefined, 0.01, "Coverage per square metre of surface area, capped by the instance limit.")}
+      {!drawn && number("maxInstances", "Plant limit", 0, 100000, 100, "Hard limit for this foliage layer. Increase for larger areas.")}
     </>}
     {number("seed", "Seed", 0, undefined, 1)}
     <button className="toolbar-btn wide" onClick={() => commit("seed", ((props.seed ?? 1) + 1) >>> 0)}>New variation</button>
 
     <details open>
       <summary className="inspector-subheader">Plant shape</summary>
-      {number("height", "Height", 0.05, undefined, 0.05)}
-      {number("width", "Width", 0.02, undefined, 0.05)}
+      {number("height", drawn ? "Blade height" : "Height", 0.05, undefined, 0.05)}
+      {!drawn && number("width", "Width", 0.02, undefined, 0.05)}
+      {!["grass", "wildflowers"].includes(props.species) && <>
+        {number("leafDensity", "Leaf density", .5, 1.6, .05, "Amount of foliage within the crown. Higher values increase geometry cost.")}
+        {number("leafSize", "Leaf size", .6, 1.5, .05, "Scale of leaves and small shoots, relative to the species default.")}
+        {number("branchDensity", "Branch density", .6, 1.4, .05, "Number of branching shoots within the species' growth pattern.")}
+        {number("crownBase", "Crown base offset", -.15, .2, .01, "Raise or lower the crown base by a fraction of the tree's height.")}
+        {number("crownSpread", "Crown spread", .7, 1.3, .05, "Spread of the crown relative to the tree's width.")}
+      </>}
       {colors.filter(([key]) => key === "leafColor" || (key === "flowerColor" ? props.species === "wildflowers" : !["grass", "wildflowers"].includes(props.species))).map(([key, label]) =>
         <Row key={key} label={label}><input className="color-field" type="color" value={props[key]} onChange={(event) => commit(key, event.target.value)} aria-label={label} /></Row>)}
     </details>
-    {scatter && <details>
+    {/* The switch lives OUTSIDE the `drawn` gate: inside it, turning the sward
+        off hid the only control that could turn it back on (09-14). */}
+    {props.species === "grass" && toggle("drawnGrass", "Drawn sward")}
+    {drawn && <details open>
+      <summary className="inspector-subheader">Grass</summary>
+      <div className="inspector-hint">Grass is drawn as a continuous sward, not scattered as clumps: a few instanced
+        rings follow the camera and every blade is built in the shader. Turn this off for the old scattered plants.</div>
+      {number("grassDensity", "Coverage", 0, 1, .02, "Share of the blade budget that survives. The ground it grows on can thin it further.")}
+      {number("blades", "Blade budget", 0, 2400000, 10000, "Blades drawn across the whole sward. This is what it costs, and the cost is linear in it.")}
+      {number("bladeWidth", "Blade width", .002, .3, .002)}
+      {number("grassLean", "Blade lean", 0, 1.2, .05, "How far a blade leans at rest, before any wind.")}
+      {number("groundBlend", "Blend with ground", 0, 1, .05, "How much of the terrain's own colour a blade takes, so the sward meets the ground.")}
+      {number("grassBrightness", "Brightness", 0, 2, .05, "Multiplies the whole sward's colour. This is the one that takes it darker than any colour picker can.")}
+      {number("grassOcclusion", "Root shading", 0, 1, .05, "How dark a blade is at the litter it grows out of, compared with its tip.")}
+      {number("grassVariation", "Colour variation", 0, 1, .05, "Spread of brightness between neighbouring tufts. Zero is a uniform sward.")}
+      {number("grassSpecular", "Glint", 0, 1, .01, "The specular rim on a blade edge. Zero removes it; it is what makes thin grass sparkle in sunlight.")}
+      {number("grassRoughness", "Roughness", 0, 1, .01)}
+      {number("grassSky", "Sky light", 0, 2, .05, "How much ambient sky the sward takes. Lower it for grass in shade.")}
+      {[["barkColor", "Base color"], ["leafColor", "Tip color"], ["dryColor", "Dry color"]].map(([key, label]) =>
+        <Row key={key} label={label}><input className="color-field" type="color" value={props[key]} onChange={(event) => commit(key, event.target.value)} aria-label={label} /></Row>)}
+    </details>}
+    {scatter && !drawn && <details>
       <summary className="inspector-subheader">Placement variation</summary>
       {range("minScale", "maxScale", "Scale", 0.05, undefined, 0.05)}
       {number("minSpacing", "Spacing", 0, undefined, 0.1, "Minimum distance between plants, in metres.")}
@@ -126,13 +158,15 @@ export function FoliageSection({ entityId, props }) {
     </details>
     <details>
       <summary className="inspector-subheader">Distance and performance</summary>
-      {number("lodNear", "Detail distance", 1, undefined, 1)}
-      {number("lodFar", "Impostor distance", 2, undefined, 1)}
+      {number("lodNear", "Detail distance", 1, undefined, 1, drawn ? "Radius of the full-detail ring around the camera." : undefined)}
+      {!drawn && number("lodFar", "Impostor distance", 2, undefined, 1)}
       {number("maxDistance", "Draw distance", 3, undefined, 1)}
-      {number("chunkSize", "Cell size", 4, 128, 1, "Smaller cells select detail more precisely; larger cells reduce CPU bookkeeping. Plant size also limits the effective cell size.")}
+      {!drawn && number("chunkSize", "Cell size", 4, 128, 1, "Smaller cells select detail more precisely; larger cells reduce CPU bookkeeping. Plant size also limits the effective cell size.")}
       {toggle("castShadow", "Cast shadows")}
       {toggle("receiveShadow", "Receive shadows")}
-      <div className="inspector-hint">Detail reduces automatically with distance. Use shorter draw distances for grass and flowers, and longer distances for trees.</div>
+      <div className="inspector-hint">{drawn
+        ? "A drawn sward has no impostors and no cells: it is three rings between the detail and draw distances."
+        : "Detail reduces automatically with distance. Use shorter draw distances for grass and flowers, and longer distances for trees."}</div>
     </details>
     {stats && <div className="inspector-hint" role="status" style={{ margin: "6px 2px" }}>
       {Number(stats.instances ?? 0).toLocaleString()} plants · {stats.chunks ?? 0} cells · {stats.drawCalls ?? 0} draws

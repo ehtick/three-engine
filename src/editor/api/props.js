@@ -203,9 +203,15 @@ export function assertKnownProp(type, key, component = null) {
 
 /** Throws when `value` is outside a `select` property's declared options. */
 export function assertLegalValue(type, key, value) {
-  const descriptor = descriptorsOf(type).get(key);
-  if (descriptor?.type !== "select") return;
-  const options = optionsOf(descriptor);
+  // ⛔ A key can have SEVERAL schema rows, each shown for a different
+  // configuration (LightComponent.shadowMode: map/clipmap/gi for directional,
+  // map/gi for point/spot). `descriptorsOf` keeps only the last row, so a legal
+  // directional `clipmap` was refused (09-14). Accept a value any row allows.
+  const rows = (getComponentClass(type)?.schema ?? []).filter((row) => row?.key === key && row.type === "select");
+  if (!rows.length) return;
+  const lists = rows.map(optionsOf);
+  if (lists.some((list) => !list?.length)) return;
+  const options = [...new Set(lists.flat())];
   // An empty or unresolvable option list means the provider has not loaded yet
   // — refusing every write on that basis would be worse than accepting one.
   if (!options?.length) return;

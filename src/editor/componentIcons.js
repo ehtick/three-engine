@@ -136,6 +136,7 @@ const ICONS = {
   blockout: [Blocks, WORLD],
 
   terrain: [Mountain, WORLD],
+  world: [Mountain, "#81b390"],
   foliage: [Leaf, "#78b957"],
   atmosphere: [CloudSun, "#63a4d8"],
   water: [Waves, WORLD],
@@ -164,7 +165,7 @@ export const COMPONENT_GROUPS = [
   { label: "Logic", types: ["script", "animation", "bone", "pool"] },
   { label: "Audio", types: ["sound", "listener"] },
   { label: "UI", types: ["uiscreen", "uielement", "uiimage", "uitext", "uibutton", "uilayout", "uiscroll", "uimask"] },
-  { label: "World", types: ["atmosphere", "terrain", "foliage", "water", "spline", "splineMesh", "splineFollower"] },
+  { label: "World", types: ["world", "atmosphere", "terrain", "foliage", "water", "spline", "splineMesh", "splineFollower"] },
   { label: "Architecture", types: ["architecture", "architecturepiece"] },
   { label: "Legacy blockout", types: ["level", "levelfloor", "blockout"] },
 ];

@@ -1,5 +1,8 @@
 // Hidden LODs and out-of-view chunks still have distinct InstancedMesh programs
 // in Three. Prepare them before a camera sweep first asks the driver to draw them.
+import { frameSliceBudget } from "../../engine/frameSlice.js";
+import { freeze } from "../../engine/freezeLedger.js";
+
 const queues = new WeakMap();
 const holds = new WeakMap();
 const nextFrame = () => new Promise(resolve => {
@@ -83,21 +86,48 @@ function ownsMainFramebuffer(engine) {
 async function drain(renderer, queue) {
   queue.running = true;
   let current;
+  // Real wall-clock slice, not one `nextFrame()` per mesh. During an
+  // ordinary 60 fps frame this stays at the ~6 ms floor (`frameSliceBudget`),
+  // matching the old one-per-frame pacing; while a boot frame is 100-200 ms
+  // long (the GPU process compiling shaders, not this loop), the same frame
+  // has room for several compiles before it is worth handing back a whole
+  // extra animation frame.
+  let sliceStart = null;
   try {
     while (queue.entries.length) {
-      const {component, key, meshes} = queue.entries.shift();
+      // ⭐ ROUND-ROBIN, NOT ONE POPULATION DRAINED BEFORE THE NEXT STARTS.
+      // The old FIFO fully worked through one population's whole mesh list
+      // before a later-queued population's warmup even began — with eleven
+      // populations queued back to back after a World commit, the last one
+      // did not start until the first ten had each finished every mesh.
+      // Taking the head entry's meshes ONE AT A TIME and rotating it to the
+      // back lets every population make progress within the same stretch.
+      const entry = queue.entries.shift();
+      const {component, key, meshes} = entry;
       current = component;
       const engine = component.entity?.engine;
       const live = () => component._alive && component.root && component._foliageWarmup?.key === key &&
         signature(component) === key && ownsMainFramebuffer(engine);
-      for (const mesh of meshes) {
+      if (sliceStart === null || performance.now() - sliceStart >= frameSliceBudget(engine)) {
         await nextFrame();
-        while (live() && !available(engine)) await nextFrame();
-        if (!live()) break;
+        sliceStart = performance.now();
+      }
+      while (live() && !available(engine)) await nextFrame();
+      if (live() && meshes.length) {
+        const mesh = meshes.shift();
         const camera = engine.camera;
-        await holdFoliageResources(component, () => compileFoliageMesh(renderer, engine.scene, camera, mesh));
+        // The await parks on the GPU wire behind the whole compile queue —
+        // span it, or the ledger reads those seconds as "(unattributed)"
+        // (the boot ledger's biggest rows were exactly these waits).
+        const compileSpan = freeze.begin(`foliage:compile ${mesh?.material?.name ?? mesh?.uuid ?? "?"}`.slice(0, 72));
+        try {
+          await holdFoliageResources(component, () => compileFoliageMesh(renderer, engine.scene, camera, mesh));
+        } finally {
+          freeze.end(compileSpan);
+        }
         if (live()) component._foliageWarmup.pending--;
       }
+      if (live() && meshes.length) queue.entries.push(entry);
     }
   } catch (error) {
     // Rendering remains available on the ordinary compiler path. Expose failure

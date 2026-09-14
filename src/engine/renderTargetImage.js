@@ -27,6 +27,8 @@
 /** Three can initialize a viewport texture before the copy knows its render
  * target. Its normal update early-out then keeps the canvas format in an HDR
  * or RGBA attachment. Repair only that mismatch, before binding/copying it. */
+import { freeze } from "./freezeLedger.js";
+
 export function installFramebufferCopyFormats(renderer) {
   if (!renderer.backend?.isWebGPUBackend || renderer.__framebufferFormatsInstalled) return;
   renderer.__framebufferFormatsInstalled = true;
@@ -67,7 +69,17 @@ export function matchCaptureTargetFormat(renderer, target) {
  * @returns {Promise<Uint8Array>} `width * height * 4` bytes, row 0 at the top.
  */
 export async function readRenderTargetImage(renderer, target, width, height) {
-  const raw = await renderer.readRenderTargetPixelsAsync(target, 0, 0, width, height);
+  // Attributed, not silent: this await parks on the GPU wire (the copy lands
+  // after everything the queue already holds), so a deep compile/submit
+  // backlog surfaces here as a seconds-long freeze. Without the span the
+  // ledger blamed "(unattributed)" — the boot ledger's biggest rows.
+  const readSpan = freeze.begin("gpu:readbackRenderTarget");
+  let raw;
+  try {
+    raw = await renderer.readRenderTargetPixelsAsync(target, 0, 0, width, height);
+  } finally {
+    freeze.end(readSpan);
+  }
   const rowBytes = width * 4;
   // `isWebGLBackend` rather than `isWebGPUBackend`: an unrecognised backend is
   // far more likely to be a future WebGPU one than a second WebGL, and being

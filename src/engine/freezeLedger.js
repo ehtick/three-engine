@@ -283,11 +283,29 @@ class FreezeLedger {
     // that blocked for 178 ms (2026-09-09) is either a real copy of that many
     // bytes or the wire's back-pressure, and the byte count is what tells them
     // apart.
+    // ⚠⚠ THESE COUNTERS ARE NOT "INSIDE THIS TASK" — THEY ARE "SINCE THE LAST
+    // LONG TASK", because that is the only moment anything resets them (a
+    // PerformanceObserver only reports tasks over the 50 ms threshold, so
+    // there is no hook at the start of an ordinary one). Read against a block
+    // they look like the block's own work, and they are not: on 2026-09-12 a
+    // 60 ms `editor:zoomProbe` block reported "484 MB written in 123 097
+    // write(s)", which reads as a catastrophic per-frame upload and is in fact
+    // SEVEN SECONDS of ordinary 60 fps rendering — ~293 writes and ~1.15 MB a
+    // frame, which is unremarkable. An hour went into chasing that before the
+    // reset was checked.
+    //
+    // `windowMs` is therefore mandatory alongside them: divide by it before
+    // believing any of it. The pipeline/module counts have the same caveat,
+    // but they are far smaller numbers and a compile anywhere in the window is
+    // still the thing that made the GPU process busy, which is what they are
+    // read for.
+    const windowMs = +(start + duration - (this._gpuSince ?? this.boot.t0)).toFixed(0);
     const gpu = this.gpu.renderPipelines || this.gpu.computePipelines || this.gpu.shaderModules
       || this.gpu.writeBytes >= 1 << 20
-      ? { ...this.gpu }
+      ? { ...this.gpu, windowMs }
       : null;
     this.gpu = { renderPipelines: 0, computePipelines: 0, shaderModules: 0, ms: 0, bytes: 0, writeBytes: 0, writes: 0, largestWrite: 0 };
+    this._gpuSince = start + duration;
     const task = {
       at: +start.toFixed(0),
       ms: +duration.toFixed(0),
@@ -329,7 +347,8 @@ class FreezeLedger {
     const gpu = task.gpu
       ? ` [sync gpu: ${task.gpu.renderPipelines}r/${task.gpu.computePipelines}c/${task.gpu.shaderModules}m` +
         `${task.gpu.bytes ? `, ${(task.gpu.bytes / 1024).toFixed(0)}kB WGSL` : ""}` +
-        `${task.gpu.writeBytes >= 1 << 20 ? `, ${(task.gpu.writeBytes / 1048576).toFixed(1)}MB written in ${task.gpu.writes} write(s), largest ${(task.gpu.largestWrite / 1048576).toFixed(1)}MB` : ""}]`
+        // "over the last Ns", never "in this block" — see `recordTask`.
+        `${task.gpu.writeBytes >= 1 << 20 ? `, ${(task.gpu.writeBytes / 1048576).toFixed(1)}MB written in ${task.gpu.writes} write(s) over the last ${(task.gpu.windowMs / 1000).toFixed(1)}s, largest ${(task.gpu.largestWrite / 1048576).toFixed(1)}MB` : ""}]`
       : "";
     const why = task.causes?.length
       ? ` [rebuilt: ${task.causes.map((c) => `${c.name} x${c.count}`).join(", ")}]`
@@ -966,15 +985,25 @@ export function installGpuCallLedger(device) {
   const wrappedShaderModule = device.createShaderModule;
   device.createShaderModule = function (descriptor, ...rest) {
     let desc = descriptor;
+    let canonical = null;
     if (descriptor && typeof descriptor.code === "string" && freeze.enabled) {
       const entry = registry.record(descriptor.label, descriptor.code, {
         canonical: globalThis.__wgslCanonical !== false,
       });
       if (entry.renamed && entry.code !== descriptor.code) desc = { ...descriptor, code: entry.code };
+      canonical = desc.code;
     }
-    const module = wrappedShaderModule.call(this, desc, ...rest);
-    if (module && desc?.code) moduleBytes.set(module, desc.code.length);
-    return module;
+    // INTERN BY TEXT. three interns its programs on the source IT generated,
+    // before `canonicalizeWgsl` runs here, so two graphs differing only in
+    // `NodeBuffer_<id>` naming reach the driver as two modules with identical
+    // bytes — 129 of 336 modules and 1 148 kB on the user's Complex scene.
+    // See `WgslRegistry.intern`; `__wgslInternModules = false` reverts.
+    const create = () => {
+      const made = wrappedShaderModule.call(this, desc, ...rest);
+      if (made && desc?.code) moduleBytes.set(made, desc.code.length);
+      return made;
+    };
+    return canonical === null ? create() : registry.intern(canonical, create);
   };
 
   // ── the other doors a GPU-process stall can come through ──────────────────

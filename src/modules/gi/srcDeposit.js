@@ -126,6 +126,7 @@ import {
   vec3,
 } from "three/tsl";
 import { halfRound, halfUlp, packHalf2, unpackHalf2 } from "./srcMath.js";
+import { binPartitionUniforms, blockChainUniforms, capAt } from "./srcCapacityUniforms.js";
 import {
   BSTAT_SUM_L,
   BSTAT_SUM_W,
@@ -1044,6 +1045,23 @@ export function createSrcDepositFrame(store, bins, {
   }
   const N = store.cascadeCount ?? CASCADE_COUNT;
   const stampBase = store.blockStampBase;
+  // The pool's sizes flow into the kernels as UNIFORMS, not literals — a pool
+  // change must not change the WGSL text, or the driver's compiled-shader
+  // cache goes cold for every kernel (srcCapacityUniforms.js carries the whole
+  // argument, and scripts/gi-src-wgsl-stability.html is its receipt). The JS
+  // sums below keep running for the guards; the graph reads the uniform that
+  // holds the same value. influx/surprise follow their own arms, so an
+  // unarmed build binds nothing new.
+  const cap = {
+    ...binPartitionUniforms(bins),
+    ...blockChainUniforms(store, bins, {
+      live: Number.isInteger(store.blockLiveBase),
+      stamp: Number.isInteger(store.blockStampBase),
+      held: Number.isInteger(store.blockHeldBase),
+      influx: influxLift != null,
+      surprise: surprise != null,
+    }),
+  };
   const passes = [];
 
   // The transport's thread → pixel map, identical to srcRays' by construction:
@@ -1110,12 +1128,20 @@ export function createSrcDepositFrame(store, bins, {
     const live = uint(1).toVar();
     if (keep && frameStamp) {
       // Which block owns this bin. The cascades partition `binTotal` at bases
-      // known when the graph is built, so this is a chain of at most four
-      // comparisons against JS constants, not a search.
+      // the graph reads from UNIFORMS, not literals (srcCapacityUniforms.js —
+      // a pool grow must not change this kernel's text, or the driver's
+      // compiled-shader cache goes cold for it). The JS sums below stay for
+      // the guards only; a chain of at most four comparisons either way.
       for (const info of bins.cascades) {
-        const lo = info.binBase;
-        const hi = lo + info.bins * info.blockCapacity;
-        const base = stampBase + info.blockBase;
+        const c = info.cascade;
+        const lo = capAt(cap.binBase, c);
+        const hi = capAt(cap.binHi, c);
+        // A NaN here compiles, runs, and reads the probe free stack — see
+        // `blockBase`'s note in `createSrcBinStore`. Cheap to make impossible.
+        if (!Number.isInteger(stampBase + info.blockBase)) {
+          throw new Error(`createSrcDepositFrame: cascade ${info.cascade} has no block base`);
+        }
+        const base = capAt(cap.stampBase, c);
         // §11.13: a far cascade's inflow is `farDuty` of what the ray count
         // says (the influx word is written on the RAY side and cannot see the
         // cut), so its base keep is compensated the same way §12.40.4
@@ -1125,11 +1151,6 @@ export function createSrcDepositFrame(store, bins, {
         const keepBase = farCascade
           ? float(1.0).sub(float(1.0).sub(float(keep)).mul(float(farDuty)))
           : float(keep);
-        // A NaN here compiles, runs, and reads the probe free stack — see
-        // `blockBase`'s note in `createSrcBinStore`. Cheap to make impossible.
-        if (!Number.isInteger(base)) {
-          throw new Error(`createSrcDepositFrame: cascade ${info.cascade} has no block base`);
-        }
         const influxB = store.blockInfluxBase + info.blockBase;
         if (influxLift && !Number.isInteger(influxB)) {
           throw new Error(`createSrcDepositFrame: cascade ${info.cascade} has no influx base`);
@@ -1141,8 +1162,7 @@ export function createSrcDepositFrame(store, bins, {
         If(i.greaterThanEqual(uint(lo)).and(i.lessThan(uint(hi))), () => {
           const block = i.sub(uint(lo)).div(uint(info.bins)).toVar();
           if (farCascade) k.assign(keepBase);
-          const liveB = Number.isInteger(store.blockLiveBase) ? store.blockLiveBase + info.blockBase : null;
-          if (liveB != null) live.assign(freeStack.element(uint(liveB).add(block)));
+          if (cap.liveBase) live.assign(freeStack.element(uint(capAt(cap.liveBase, c)).add(block)));
           // The ratio the compensation multiplied `1−keep` by, 1 when the
           // branch below is skipped. Hoisted only when the surprise mix needs
           // something to interpolate FROM; without the bundle this var does
@@ -1162,7 +1182,7 @@ export function createSrcDepositFrame(store, bins, {
           // (the result's mantissa always fits), so an uncapped word or a
           // fully lifted frame decays bit-identically to the plain branch.
           if (influxLift) {
-            const infl = freeStack.element(uint(influxB).add(block)).toVar();
+            const infl = freeStack.element(uint(capAt(cap.influxBase, c)).add(block)).toVar();
             If(infl.lessThan(uint(INFLUX_ONE)).and(float(influxLift).lessThan(1.0)), () => {
               const lift = float(influxLift).toVar();
               const ratio = float(infl).div(INFLUX_ONE).toVar();
@@ -1187,7 +1207,7 @@ export function createSrcDepositFrame(store, bins, {
           // Before the stamp check, which must win — a freshly claimed block is
           // zeroed whatever its (stale) surprise word says.
           if (surprise) {
-            const u = freeStack.element(uint(surpriseB).add(block)).toVar();
+            const u = freeStack.element(uint(capAt(cap.surpriseBase, c)).add(block)).toVar();
             If(u.greaterThan(uint(0)), () => {
               const t = float(u).div(float(SURPRISE_ONE)).toVar();
               // WGSL `mix(a,b,t)` written out — the mirror (`keepCompensated`)
@@ -1215,7 +1235,10 @@ export function createSrcDepositFrame(store, bins, {
           // handed to a NEW probe this frame is zeroed whatever any older
           // stamp says.
           const heldB = store.blockHeldBase + info.blockBase;
-          If(freeStack.element(uint(heldB).add(block)).equal(frameStamp), () => {
+          if (!Number.isInteger(heldB)) {
+            throw new Error(`createSrcDepositFrame: cascade ${info.cascade} has no held base`);
+          }
+          If(freeStack.element(uint(capAt(cap.heldBase, c)).add(block)).equal(frameStamp), () => {
             k.assign(float(1));
           });
           const stamp = freeStack.element(uint(base).add(block)).toVar();
@@ -1537,7 +1560,7 @@ export function createSrcDepositFrame(store, bins, {
                 const infoC = bins.cascades[c];
                 If(blocks[c].notEqual(uint(SLOT_EMPTY)), () => {
                   const bC = dirToBin(dir, infoC.width).toVar();
-                  const slotC = uint(infoC.binBase)
+                  const slotC = uint(capAt(cap.binBase, c))
                     .add(blocks[c].mul(uint(infoC.bins)))
                     .add(binMorton(bC.x, bC.y))
                     .mul(BIN_WORDS)
@@ -1729,7 +1752,7 @@ export function createSrcDepositFrame(store, bins, {
         If(blk.notEqual(uint(SLOT_EMPTY)).and(int(c).lessThanEqual(ownReach)), () => {
           const b = dirToBin(dir, info.width).toVar();
           const m = binMorton(b.x, b.y).toVar();
-          const slot = uint(info.binBase)
+          const slot = uint(capAt(cap.binBase, c))
             .add(blk.mul(uint(info.bins)))
             .add(m)
             .mul(BIN_WORDS)
@@ -1913,12 +1936,15 @@ export function createSrcDepositFrame(store, bins, {
     if (frameStamp && Number.isInteger(store.blockLiveBase)) {
       const live = uint(1).toVar();
       for (const info of bins.cascades) {
-        const lo = info.binBase;
-        const hi = lo + info.bins * info.blockCapacity;
+        const c = info.cascade;
+        // Uniforms, not literals — same partition the keep pass reads, same
+        // reason (srcCapacityUniforms.js).
+        const lo = capAt(cap.binBase, c);
+        const hi = capAt(cap.binHi, c);
         If(i.greaterThanEqual(uint(lo)).and(i.lessThan(uint(hi))), () => {
           const block = i.sub(uint(lo)).div(uint(info.bins)).toVar();
-          live.assign(freeStack.element(uint(store.blockLiveBase + info.blockBase).add(block)));
-          If(freeStack.element(uint(stampBase + info.blockBase).add(block)).equal(frameStamp), () => {
+          live.assign(freeStack.element(uint(capAt(cap.liveBase, c)).add(block)));
+          If(freeStack.element(uint(capAt(cap.stampBase, c)).add(block)).equal(frameStamp), () => {
             live.assign(uint(1));
           });
         });

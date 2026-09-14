@@ -4,6 +4,7 @@ import {
   abs,
   attribute,
   cameraPosition,
+  cameraProjectionMatrix,
   cameraViewMatrix,
   cameraWorldMatrix,
   clamp,
@@ -11,15 +12,20 @@ import {
   dot,
   float,
   floor,
+  fract,
+  length,
   max,
   min,
   normalize,
   positionGeometry,
   positionWorld,
+  screenCoordinate,
   select,
+  smoothstep,
   step,
   struct,
   texture as tslTexture,
+  uniform,
   vec2,
   vec3,
   vec4,
@@ -94,6 +100,10 @@ function impostorQuad() {
 
 /** The per-instance channels. Kept in one place because the material reads them
  *  by name and `ImpostorSystem` writes them by name. */
+/** How far, as a fraction of the billboard's size, the shadow caster is pushed
+ *  away from the light — see `castShadowPositionNode` in `createImpostorMaterial`. */
+export const IMPOSTOR_SHADOW_PUSH = 0.35;
+
 export const IMPOSTOR_ATTRIBUTES = [
   ["aCenter", 3],
   ["aSize", 1],
@@ -190,6 +200,38 @@ function frameBasisNode(dir) {
 }
 
 /**
+ * ── THE IMPOSTOR TIER'S OWN CROSSFADE (P1-B) ──────────────────────────────
+ *
+ * The same complementary-smoothstep formula as `foliageLod.js`'s
+ * `foliageTierWeights` / `foliageMaterial.js`'s tree-and-grass draws, kept as
+ * three independent copies on purpose: this file stays renderer-only (no
+ * import of the foliage module) and a GPU shader cannot import CPU math at
+ * all. `far`/`maxDistance` are per-COMPONENT state even though this material
+ * is shared per ATLAS (several components can share one bake), so they ride
+ * as per-object state exactly like `aCenter`'s sibling `foliageLodFar`/
+ * `foliageLodEnd` in `foliageMaterial.js` — `.onObjectUpdate` re-reads
+ * `object.userData` before every object's draw; `FoliageComponent.update()`
+ * writes them once a frame on the shared impostor render mesh. The arrival
+ * ramp (`foliageImpostorRamp`, `foliageApplyImpostorRamp` in `foliageLod.js`)
+ * defaults to "fully arrived" (1) here: `FoliageComponent` promotes a chunk
+ * to this tier the instant the bake exists rather than waiting on a ramp,
+ * because the live commit path (`foliageBatchOrder.js`) assigns a whole
+ * chunk to exactly one tier — there is no SECOND tier left drawing whatever
+ * the ramp would have held back. The formula still agrees exactly with the
+ * mid tier's at `lodFar`, so that promotion is a detail-geometry swap, never
+ * a coverage pop; this uniform is wired for the day a chunk can live in two
+ * tiers' render meshes at once and something actually drives it below 1.
+ */
+function impostorLodBand(threshold) { return max(threshold.mul(.25), 6); }
+function impostorCrossfade(edge, band, distance) { return smoothstep(edge.sub(band.mul(.5)), edge.add(band.mul(.5)), distance); }
+
+/** Same interleaved-gradient-noise screen-door dither as the tree/grass
+ * material — a stable per-pixel value, never animated per frame. */
+function impostorDitherNoise() {
+  return fract(float(52.9829189).mul(fract(screenCoordinate.x.mul(.06711056).add(screenCoordinate.y.mul(.00583715)))));
+}
+
+/**
  * Builds the impostor material for one baked atlas.
  *
  * Cached per atlas by `ImpostorSystem`, not per component: five hundred trees
@@ -206,6 +248,49 @@ export function createImpostorMaterial(atlas, { alphaTest = 0.5, lit = true, rou
   const size = attribute("aSize", "float");
   const axisX = attribute("aAxisX", "vec3");
   const axisY = attribute("aAxisY", "vec3");
+
+  // See the file-level comment above `impostorLodBand`. `size` already bakes
+  // in `atlas.radius * 2 * instanceScale` (`FoliageComponent._writeImpostor`)
+  // — divide the constant back out to recover the same per-instance scale the
+  // tree/grass draw normalizes its own distance by.
+  const lodFar = uniform(0).onObjectUpdate(({ object }) => object.userData.foliageLodFar ?? 0);
+  const lodEnd = uniform(0).onObjectUpdate(({ object }) => object.userData.foliageLodEnd ?? 0);
+  const lodRamp = uniform(1).onObjectUpdate(({ object }) => object.userData.foliageImpostorRamp ?? 1);
+  // ⭐ THE SHADOW-SIDE HANDOFF — where this tier's SHADOW starts, written as
+  // `userData.foliageShadowLodFar` by `FoliageComponent.update()` (resolved by
+  // `foliageLod.js#foliageShadowFar`, clamped at or below `far − band(far)` so
+  // every instance this tier is asked to shadow is one the commit path actually
+  // gave it). Falls back to the colour `far`, which makes the shadow pass
+  // replay the colour decision — every impostor outside the foliage feature,
+  // and every foliage component without the prop, lands on that fallback.
+  const lodShadowFar = uniform(0).onObjectUpdate(({ object }) => object.userData.foliageShadowLodFar ?? object.userData.foliageLodFar ?? 0);
+  // ⛔ NEVER TSL's builtin `cameraPosition` here (09-13, fixed): that is the
+  // world position of whichever camera is rendering the CURRENT PASS, which
+  // in the shadow-map pass is the light's orthographic camera, not the
+  // viewer. Every instance's distance-from-light then reads as huge, this
+  // fade collapses to 0, and the impostor vanishes from its own shadow while
+  // still drawing fine in the color pass. `lodViewerPosition` is the exact
+  // twin of `foliageMaterial.js`'s `lod.viewerPosition`: a per-object uniform
+  // fed every frame from `FoliageComponent`'s own `engine.camera` read
+  // (`mesh.userData.foliageViewerPosition`), identical across every pass.
+  // The octahedral VIEW-DIRECTION selection below (`toCamera`) deliberately
+  // keeps using the pass camera instead — picking the baked frame that
+  // matches whichever camera is actually looking (the light, in a shadow
+  // pass) is what gives that pass a correctly shaped silhouette.
+  const lodViewerPosition = uniform(new THREE.Vector3()).onObjectUpdate(({ object }, self) => object.userData.foliageViewerPosition ?? self.value);
+  const instanceScale = max(size.div(Math.max(atlas.radius * 2, 1e-4)), 1e-4);
+  const lodDistance = length(center.sub(lodViewerPosition)).div(instanceScale);
+  const fadeFar = impostorCrossfade(lodFar, impostorLodBand(lodFar), lodDistance);
+  const fadeEnd = impostorCrossfade(lodEnd, impostorLodBand(lodEnd), lodDistance);
+  // The complementary twin of `foliageMaterial.js`'s `midWeight`: only the
+  // ramped share of the raw impostor weight actually draws here, so the mid
+  // mesh's leftover exactly covers what this tier has not yet faded into.
+  const fadeWeight = fadeFar.mul(float(1).sub(fadeEnd)).mul(lodRamp).toVar();
+  // The SAME weight folded against the shadow handoff (`lodShadowFar`) instead
+  // of the colour `far`. Consumed only by `maskShadowNode` below; the colour
+  // pass keeps `fadeWeight`, so with the handoff unset the two agree exactly.
+  const fadeFarShadow = impostorCrossfade(lodShadowFar, impostorLodBand(lodShadowFar), lodDistance);
+  const fadeWeightShadow = fadeFarShadow.mul(float(1).sub(fadeEnd)).mul(lodRamp).toVar();
 
   const MaterialClass = lit ? THREE.MeshStandardNodeMaterial : THREE.MeshBasicNodeMaterial;
   const material = new MaterialClass({
@@ -230,10 +315,44 @@ export function createImpostorMaterial(atlas, { alphaTest = 0.5, lit = true, rou
   // game view and in every shadow cascade at once.
   const cameraRight = cameraWorldMatrix.mul(vec4(1, 0, 0, 0)).xyz;
   const cameraUp = cameraWorldMatrix.mul(vec4(0, 1, 0, 0)).xyz;
-  material.positionNode = center
+  const billboard = center
     .add(cameraRight.mul(positionGeometry.x.mul(size)))
     .add(cameraUp.mul(positionGeometry.y.mul(size)));
-  const atlasPosition = material.positionNode.toVarying();
+  // Weight 0 collapses the whole quad onto `center` — a real point, so no
+  // projective singularity — instead of paying to rasterize and shade a
+  // billboard the fragment stage would only discard anyway.
+  material.positionNode = select(fadeWeight.lessThanEqual(1e-3), center, billboard);
+  // ⭐ AN IMPOSTOR MUST NOT SHADOW ITSELF (09-14). The shadow pass draws this
+  // quad facing the LIGHT through the object's centre; the colour pass draws it
+  // facing the VIEWER through the same centre — so the half of the view quad
+  // behind the light-facing one always lands in its own shadow, and far trees
+  // read as dark olive blots. Push the caster away from the light (the shadow
+  // camera's forward) so the view quad sits in front of it. A directional
+  // light projects along that same axis, so the shadow on the ground does not
+  // move; only the depth it is tested at does.
+  //
+  // ⛔ BUT NOT THE BOTTOM EDGE (09-14). A uniform push of 0.35×size (metres on
+  // a real tree) sank the card's lower half under the terrain, so each shadow
+  // lost its base along a straight line and floated off its trunk ("flat
+  // bottomed blocks"). The push grows from 0 at the card's bottom edge to full
+  // at its top: the base still meets the ground, the crown still clears the
+  // view quad.
+  const passForward = cameraWorldMatrix.mul(vec4(0, 0, -1, 0)).xyz;
+  const pushWeight = positionGeometry.y.add(.5).clamp(0, 1);
+  material.castShadowPositionNode = select(fadeWeightShadow.lessThanEqual(1e-3), center,
+    billboard.add(passForward.mul(size.mul(IMPOSTOR_SHADOW_PUSH).mul(pushWeight))));
+  // ⛔ THE UNCOLLAPSED BILLBOARD, NEVER `material.positionNode` (09-14). That
+  // node collapses onto `center` by the COLOUR fade, and the shadow pass draws
+  // `castShadowPositionNode` with the SHADOW fade — between `shadowFar` and
+  // `far` the caster quad is live while this varying reads `center` on every
+  // vertex, so `local` is zero, the whole quad samples the crown's opaque
+  // centre texel and `maskShadowNode` passes everywhere: every tree in that
+  // band cast a solid rectangle ("rects casted from impostors", high camera).
+  // A collapsed colour quad is degenerate and never reaches the fragment stage,
+  // so reading the billboard here changes nothing it draws.
+  const atlasPosition = billboard.toVarying();
+  const fadeWeightVarying = fadeWeight.toVarying();
+  const fadeWeightShadowVarying = fadeWeightShadow.toVarying();
 
   // ---- fragment: pick three frames and blend them --------------------------
   const albedoTexture = tslTexture(atlas.albedo);
@@ -250,7 +369,15 @@ export function createImpostorMaterial(atlas, { alphaTest = 0.5, lit = true, rou
     // transpose IS the inverse, and a per-instance matrix would be nine floats
     // of instance data instead of six.
     const local = vec3(dot(toWorld, axisX), dot(toWorld, axisY), dot(toWorld, axisZ)).toVar();
-    const toCamera = cameraPosition.sub(center);
+    // ⛔ AN ORTHOGRAPHIC PASS LOOKS ALONG ITS AXIS, NOT FROM A POINT (09-14).
+    // The sun's shadow camera sits ~50 m behind the viewer, so for a tree off
+    // to the side `cameraPosition - center` is nearly horizontal: the shadow
+    // drew the tree's SIDE view on a light-facing card with mismatched axes,
+    // and every impostor cast a long black strip. Ortho projections carry 1 in
+    // element [3][3] (perspective 0); there the view direction is the camera's
+    // own backward axis for every instance.
+    const orthographic = cameraProjectionMatrix.element(3).w.greaterThan(.5);
+    const toCamera = select(orthographic, cameraWorldMatrix.mul(vec4(0, 0, 1, 0)).xyz, cameraPosition.sub(center));
     // The view direction is taken from the object's CENTRE, not per fragment:
     // which frame to show is a property of the object, and letting it vary
     // across the quad puts a seam down the middle of every impostor where the
@@ -295,7 +422,14 @@ export function createImpostorMaterial(atlas, { alphaTest = 0.5, lit = true, rou
         .mul(step(0, tileUv.y))
         .mul(step(tileUv.y, 1));
       const safe = clamp(tileUv, inset, 1 - inset);
-      const atlasUv = corner.add(safe).div(tiles);
+      // ⛔ 09-13 "tree impostors are upside down": the atlas became a render
+      // target sampled directly (no CPU readback / DataTexture). Its rows are
+      // stored top-down — the baked view's top is texel row 0 of the tile —
+      // while `tileUv.y` grows with the object's UP. The frame's row index
+      // already addresses the tile grid top-down, so only the V INSIDE a tile
+      // has to be flipped; flipping the whole atlas would also pick the wrong
+      // frame row.
+      const atlasUv = corner.add(vec2(safe.x, float(1).sub(safe.y))).div(tiles);
       const texel = albedoTexture.sample(atlasUv).toVar();
       const weight = max(weights[i], 0).mul(inside).mul(texel.a).toVar();
       colorSum.addAssign(texel.rgb.mul(weight));
@@ -312,7 +446,45 @@ export function createImpostorMaterial(atlas, { alphaTest = 0.5, lit = true, rou
 
   const sampled = sampleImpostor().toVar();
   material.colorNode = vec4(sampled.get("color"), 1);
-  material.opacityNode = sampled.get("alpha");
+  // Fold the dither into the ALPHA VALUE (multiply toward 0) so the existing
+  // `alphaTest` above does the discarding, exactly like the tree/grass draw
+  // (`foliageMaterial.js`). This is also what lets the impostor's shadow
+  // carry the fade: `setupFoliageImpostorMaterial` (`foliageWind.js`) rebuilds
+  // `maskShadowNode` from this SAME `opacityNode` after wrapping it for wind,
+  // so a discard baked into a separate imperative statement here would never
+  // reach it — the alpha value is the only channel that does.
+  //
+  // ⭐⭐ THE COMPLEMENTARY (FAR-SIDE) RULE (P1-B follow-up, 09-13) — the exact
+  // twin of `foliageLod.js#foliageTierKeeps`'s tier-2 case and
+  // `foliageMaterial.js#foliageDitherSurvivesFromThreshold`'s far branch. This tier is
+  // ALWAYS the far side of its one boundary (mid/impostor) — never the near
+  // side of a second one — so it unconditionally keeps `noise >= 1 - weight`,
+  // the complement of the mid mesh's own `noise < weight` there. The previous
+  // `noise < weight` here duplicated the near-tier rule on the FAR tier of the
+  // boundary, which is exactly the hole/double-draw bug: two tiers agreeing on
+  // "keep the low end of noise" instead of splitting the noise domain between
+  // them leaves the high end kept by neither. `fadeWeight` already folds in
+  // the maxDistance fade-out (`fadeEnd`) and the arrival ramp, so this same
+  // rule thins the impostor to nothing at both ends without a separate case.
+  const ditherSurvives = select(impostorDitherNoise().greaterThanEqual(float(1).sub(fadeWeightVarying)), float(1), float(0));
+  material.opacityNode = sampled.get("alpha").mul(ditherSurvives);
+  // ⭐ THE SHADOW SIDE of the same rule, replayed against the SHADOW handoff
+  // weight: the impostor's shadow starts at `userData.foliageShadowLodFar`
+  // rather than at the colour `far`, which is what lets the mid tier stop
+  // carrying shadow geometry below the colour threshold without a gap — the
+  // mid mesh's shadow fades OUT over this tier's band as it fades IN here
+  // (both sides compare the same noise domain, so the handoff stays
+  // complementary). Built HERE rather than by `setupFoliageImpostorMaterial`'s
+  // opacity-node rebuild because that rebuild can only replay the COLOUR
+  // decision, and because `NodeMaterial.copy` carries node slots by reference —
+  // the foliage impostor's cloned material inherits this node as-is. With the
+  // handoff unset it equals the colour decision above, which is also exactly
+  // what the rebuild would have produced.
+  // ⛔ Not dithered in the shadow pass (09-14): see `foliageMaterial.js`'s
+  // `maskShadowNode` — the impostor card and the mid mesh are different
+  // silhouettes, so a split dither thinned the handoff band's shadow to holes.
+  // Any shadow weight casts the full silhouette; occluders union.
+  material.maskShadowNode = sampled.get("alpha").greaterThan(alphaTest || .35).and(fadeWeightShadowVarying.greaterThan(1e-3));
   if (lit) {
     // The atlas stores normals in the object's own space, so the impostor of a
     // tree rotated 90° is lit as a tree rotated 90° rather than as a flat card.
@@ -328,5 +500,9 @@ export function createImpostorMaterial(atlas, { alphaTest = 0.5, lit = true, rou
     material.normalNode = normalize(cameraViewMatrix.mul(vec4(normalWorldSpace, 0)).xyz);
   }
   material.userData.impostorAtlas = atlas;
+  // Exposed for diagnostics/tests: identity-checkable without deep-comparing
+  // node graphs (three's node materials are not diffable at any real scene
+  // scale — see `foliageMaterial.js`'s sharing scheme for why).
+  material.userData.impostorLod = { far: lodFar, end: lodEnd, ramp: lodRamp, viewerPosition: lodViewerPosition, atlasPosition };
   return material;
 }

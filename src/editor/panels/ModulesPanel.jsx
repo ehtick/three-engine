@@ -63,10 +63,13 @@ function loadCollapsed() {
 
 export function ModulesPanel() {
   const enabled = useModulesStore((s) => s.enabled);
+  const explicit = useModulesStore((s) => s.explicit);
+  const requiredBy = useModulesStore((s) => s.requiredBy);
   const playing = usePlayStore((s) => s.playing);
   const hasProject = useProjectStore((s) => !!s.rootPath);
   const [defs, setDefs] = useState([]);
   const [busy, setBusy] = useState(null);
+  const [error, setError] = useState(null);
   const [query, setQuery] = useState("");
   const [collapsed, setCollapsed] = useState(loadCollapsed);
   const [selectedId, setSelectedId] = useState(() => {
@@ -108,9 +111,11 @@ export function ModulesPanel() {
 
   const toggle = async (id, on) => {
     setBusy(id);
+    setError(null);
     try {
       await setModuleEnabled(id, on);
     } catch (err) {
+      setError(err.message ?? String(err));
       console.error(`Module "${id}": ${err.message ?? err}`);
     } finally {
       setBusy(null);
@@ -161,6 +166,10 @@ export function ModulesPanel() {
   }, [filteredDefs, selectedId]);
 
   const selected = defs.find((d) => d.id === selectedId) ?? null;
+  const requiredReason = (id) => {
+    const parents = requiredBy?.[id] ?? [];
+    return parents.length ? `Required by ${parents.map(parent => defs.find(d => d.id === parent)?.name ?? parent).join(", ")}` : null;
+  };
   const disabledReason = playing ? "Stop play mode to change modules" : null;
   const intro = !hasProject ? (
     <div className="modules-intro">
@@ -177,6 +186,7 @@ export function ModulesPanel() {
   return (
     <div className="modules-panel">
       {intro}
+      {error && <div className="ph-error" role="alert">{error}</div>}
       {defs.length === 0 ? (
         <div className="modules-detail-empty">
           <Boxes size={28} className="empty-glyph" />
@@ -226,6 +236,7 @@ export function ModulesPanel() {
                     {!isCollapsed &&
                       items.map((def) => {
                         const on = enabled.includes(def.id);
+                        const required = on && requiredReason(def.id);
                         const isActive = def.id === selectedId;
                         return (
                           <div
@@ -243,10 +254,12 @@ export function ModulesPanel() {
                             <input
                               type="checkbox"
                               checked={on}
-                              disabled={busy === def.id || playing}
+                              disabled={busy === def.id || playing || !!required}
                               title={
                                 playing
                                   ? "Stop play mode to change modules"
+                                  : required
+                                  ? required
                                   : on
                                   ? "Disable module"
                                   : "Enable module"
@@ -277,6 +290,8 @@ export function ModulesPanel() {
                 on={enabled.includes(selected.id)}
                 busy={busy === selected.id}
                 disabledReason={disabledReason}
+                requiredReason={requiredReason(selected.id)}
+                explicit={explicit?.includes(selected.id) ?? enabled.includes(selected.id)}
                 onToggle={(on) => toggle(selected.id, on)}
               />
             ) : (
@@ -512,7 +527,7 @@ function ModuleSettings({ def }) {
   );
 }
 
-function ModuleDetail({ def, on, busy, disabledReason, onToggle }) {
+function ModuleDetail({ def, on, busy, disabledReason, requiredReason, explicit, onToggle }) {
   const components = def.components ?? [];
   // Aggregate every tag from the components on this module so the user can
   // see at a glance what the module adds. Deduplicated, declaration order.
@@ -543,14 +558,24 @@ function ModuleDetail({ def, on, busy, disabledReason, onToggle }) {
         <input
           type="checkbox"
           checked={on}
-          disabled={busy || !!disabledReason}
-          title={disabledReason ?? (on ? "Disable module" : "Enable module")}
+          disabled={busy || !!disabledReason || !!requiredReason}
+          title={disabledReason ?? requiredReason ?? (on ? "Disable module" : "Enable module")}
           onChange={(e) => onToggle(e.target.checked)}
           aria-label={`Toggle ${def.name}`}
         />
       </header>
 
       <p className="modules-detail-desc">{def.description}</p>
+      {requiredReason && (
+        <section className="modules-detail-section">
+          <p>{requiredReason}. Disable those modules first to release this provider.</p>
+          {!explicit && (
+            <button type="button" className="toolbar-btn" disabled={busy || !!disabledReason} onClick={() => onToggle(true)}>
+              Keep enabled independently
+            </button>
+          )}
+        </section>
+      )}
 
       {CREDENTIAL_PROVIDERS[def.id]?.map((provider) => (
         <ModuleCredential key={provider.id} provider={provider} />
@@ -629,7 +654,7 @@ function ModuleDetail({ def, on, busy, disabledReason, onToggle }) {
           <dt>State</dt>
           <dd>
             <span className={`modules-state-dot ${on ? "on" : "off"}`} />
-            {on ? "Enabled for this project" : "Disabled"}
+            {on ? (explicit ? "Enabled for this project" : "Enabled by a required module") : "Disabled"}
           </dd>
         </dl>
       </section>

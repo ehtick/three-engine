@@ -218,6 +218,93 @@ test("unknown shader animation and callbacks stay moving even when all versions 
   }
 });
 
+// 09-14: every NodeMaterial graph used to count as animation, so a scene of
+// node-material terrain/rock/buildings had zero static casters and no level
+// ever held. The verdict now comes from the BUILT shadow draw (`Fn` bodies are
+// opaque to a graph walk — foliage wind reads a JS-driven uniform inside one).
+const builtState = ({ updateNodes = [], uniforms = [], bindings = [] } = {}) => ({
+  updateNodes, updateBeforeNodes: [], updateAfterNodes: [],
+  bindings: [{ bindings: [{ uniforms: uniforms.map((node) => ({ nodeUniform: { node } })) }, ...bindings] }],
+});
+const observeDraw = (cache, object, state) => cache.observe({ object, getNodeBuilderState: () => state });
+
+test("a graph whose built draw holds only plain uniforms is static; a uniform that changes promotes it", async () => {
+  const { uniform } = await import("three/tsl");
+  const scene = new Scene();
+  const object = caster();
+  object.material.positionNode = {};
+  scene.add(object);
+  const cache = new ClipmapShadowCache();
+  cache.prepare(scene, null, 1);
+  assert.equal(cache.movingObjects.size, 1, "an unobserved graph stays moving");
+  assert.equal(cache.stats.movingReasons["graph not yet observed"], 1);
+  const wind = uniform(0);
+  observeDraw(cache, object, builtState({ uniforms: [wind] }));
+  cache.prepare(scene, null, 2);
+  assert.equal(cache.staticObjects.size, 1, "observed with nothing updating itself: static");
+  const revision = cache.staticRevision;
+  cache.prepare(scene, null, 3);
+  assert.equal(cache.staticRevision, revision, "an unchanged draw holds");
+  wind.value = 1;
+  cache.prepare(scene, null, 4);
+  assert.equal(cache.movingObjects.size, 1, "a JS-driven uniform (wind time) that changes makes it a mover");
+  wind.value = 2;
+  const settled = cache.staticRevision;
+  cache.prepare(scene, null, 5);
+  assert.equal(cache.staticRevision, settled, "and it never redraws the static map again");
+});
+
+test("a hidden updater, storage or render-target texture in the built draw keeps the caster moving", async () => {
+  const { uniform } = await import("three/tsl");
+  const states = [
+    builtState({ updateNodes: [uniform(0).onFrameUpdate(() => 0)] }),
+    builtState({ bindings: [{ isStorageBuffer: true, name: "positions" }] }),
+    builtState({ bindings: [{ name: "map", textureNode: { value: new RenderTarget(4, 4).texture } }] }),
+  ];
+  for (const state of states) {
+    const scene = new Scene();
+    const object = caster();
+    object.material.positionNode = {};
+    scene.add(object);
+    const cache = new ClipmapShadowCache();
+    observeDraw(cache, object, state);
+    cache.prepare(scene, null, 1);
+    assert.equal(cache.movingObjects.size, 1, JSON.stringify(cache.stats.movingReasons));
+    assert.equal(cache.stats.movingReasons["graph not yet observed"], undefined);
+  }
+});
+
+test("object, camera and material-reference updaters are already compared and stay static", async () => {
+  const { modelWorldMatrix, cameraNear, materialReference } = await import("three/tsl");
+  const scene = new Scene();
+  const object = caster();
+  object.material.positionNode = {};
+  scene.add(object);
+  const cache = new ClipmapShadowCache();
+  observeDraw(cache, object, builtState({ updateNodes: [modelWorldMatrix, cameraNear, materialReference("opacity", "float")] }));
+  cache.prepare(scene, null, 1);
+  assert.equal(cache.staticObjects.size, 1, JSON.stringify(cache.stats.movingReasons));
+  const revision = cache.staticRevision;
+  object.material.opacity = .5;
+  cache.prepare(scene, null, 2);
+  assert.ok(cache.staticRevision > revision, "a referenced material field still redraws the static map");
+});
+
+test("a new material drops the old verdict until its own draw is observed", () => {
+  const scene = new Scene();
+  const object = caster();
+  object.material.positionNode = {};
+  scene.add(object);
+  const cache = new ClipmapShadowCache();
+  observeDraw(cache, object, builtState());
+  cache.prepare(scene, null, 1);
+  assert.equal(cache.staticObjects.size, 1);
+  object.material = new MeshStandardMaterial();
+  object.material.positionNode = {};
+  cache.prepare(scene, null, 2);
+  assert.equal(cache.movingObjects.size, 1);
+});
+
 test("first frame draws once; a stable mixed map captures only depth and then draws only movers", () => {
   const f = fixture();
   f.run();

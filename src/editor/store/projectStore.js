@@ -87,10 +87,26 @@ export const useProjectStore = vmSingleton("projectStore", () => create((set, ge
     await resetEditorScene().catch((err) =>
       console.warn(`Couldn't reset editor scene on close project: ${err}`),
     );
-    set({ rootPath: null, currentPath: null, projectMeta: {}, hubSkipped: false, restoring: false });
+    set({
+      rootPath: null,
+      currentPath: null,
+      projectMeta: {},
+      hubSkipped: false,
+      restoring: false,
+      pendingReopenScene: null,
+    });
   },
 
   projectMeta: {}, // contents of <root>/project.json (lastScene, name, …)
+
+  // The scene an `editor.reload` handoff asked THIS boot to reopen, or null.
+  // Set by `startupReopen.js` right before it reopens the project — i.e.
+  // before `restoreLastScene` runs — so the very first scene load picks it,
+  // rather than guessing from project.json and correcting itself with a
+  // second full load. See `resolveBootScene` in `bootScene.js`. One-shot:
+  // `restoreLastScene` clears it once it has read it, since it only ever
+  // applies to the boot right after a reload.
+  pendingReopenScene: null,
 
   /** Opens a known project folder and records it in the recent list. */
   async openProject(path) {

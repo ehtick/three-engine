@@ -44,6 +44,7 @@ import {
   vec4,
 } from "three/tsl";
 import { sharedFn } from "./giFn.js";
+import { isFlatTexture, isLayeredTexture } from "./materialNodeBindings.js";
 import { sampleReflectionProbes } from "./reflectionProbes.js";
 
 // Fixed emitter slot count: slots are compiled into the material shader, so
@@ -365,7 +366,7 @@ export function giRoughnessSourceOf(material) {
   if (!material) return null;
   const node = material.roughnessNode;
   if (node == null) {
-    return material.roughnessMap
+    return material.roughnessMap && !isLayeredTexture(material.roughnessMap)
       // three's PBR convention samples roughnessMap's GREEN channel
       // (glTF packed metallicRoughness: G = roughness, B = metalness) —
       // naming the channel is what lets the floor reader skip past the
@@ -379,6 +380,8 @@ export function giRoughnessSourceOf(material) {
   const walk = (n, depth) => {
     if (!n || depth > 10) return false;
     if (n.isTextureNode && n.value?.isTexture) {
+      // A layered texture's texel depends on a per-vertex layer — no floor to read.
+      if (!isFlatTexture(n.value)) return false;
       if (tex) return false; // two textures — not a shape we can bound
       tex = n.value;
       return true;

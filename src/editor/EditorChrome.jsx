@@ -260,6 +260,15 @@ export function EditorChrome() {
       // that in one place so the contexts can't contradict each other.
       if (keyScopeOwns(e)) return;
 
+      // While the game is running, none of the scene-edit shortcuts may
+      // fire — they share keys with the project's character controller
+      // (Shift+D = Sprint+Right, WASD, E/F, Delete, etc.) and would
+      // duplicate or delete live actors in the running scene. App verbs
+      // above (Ctrl+P to stop Play, Ctrl+. to step, Ctrl+Shift+P to
+      // pause, Ctrl+B build, screenshot) keep working so the user can
+      // still escape Play mode.
+      if (engine?.playing) return;
+
       if (ctrl && e.key.toLowerCase() === "s") {
         e.preventDefault();
         saveScene({ saveAs: e.shiftKey });

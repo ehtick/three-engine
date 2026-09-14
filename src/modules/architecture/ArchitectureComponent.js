@@ -1,26 +1,170 @@
 import * as THREE from "three/webgpu";
+import { attribute, mix, normalMap as normalMapNode, texture, vec2, vec3, vec4 } from "three/tsl";
 import { Component } from "../../engine/components/Component.js";
 import { levelRooms } from "../level-design/rooms.js";
 import { normalizeArchitectureModel } from "./formModel.js";
 import { buildArchitectureFormGeometry } from "./formGeometry.js";
 import { disposeOrReleaseGeometry } from "../../engine/geometryAsset.js";
+import { styleSurfaceArray, configureStyleSurfaceCache, ALBEDO_MEAN } from "./styles/surfaces.js";
+import { getDerivedDataPath, loadAssetBinary, saveAssetBinary } from "../../engine/assetResolver.js";
+
+// Disk cache for painted style-surface layers (owner: "maybe you write those textures once to
+// disk and they just reuse rather than generate at runtime?"). Wired through the same
+// project-derived-data seam GI's static BVH cache uses (`src/modules/gi/staticBvhDiskCache.js`):
+// the editor resolves it under `<project>/Library` over Tauri; the exported player resolves it
+// under its shipped `Library/` folder over `fetch` (`src/player/main.js`). Neither wiring is
+// architecture-specific — this module only supplies WHAT to read/write, not HOW.
+configureStyleSurfaceCache({
+  read: async (relPath) => {
+    const path = getDerivedDataPath(relPath);
+    if (!path) return null;
+    const buffer = await loadAssetBinary(path);
+    return buffer ? new Uint8Array(buffer) : null;
+  },
+  write: async (relPath, bytes) => {
+    const path = getDerivedDataPath(relPath);
+    if (!path) return;
+    await saveAssetBinary(path, bytes);
+  },
+});
+
+// Z-FIGHTING SAFETY NET (owner verdict: "buildings got z fighting"): the styles/*.js
+// decorators now give every part an explicit outward standoff so it never shares a
+// plane with a base massing wall/roof face (see styles/wallDetail.js, roofDetail.js,
+// openingDetail.js), but `polygonOffset` on every DETAIL role material is cheap
+// insurance against whatever small-scale coplanarity slips through (a diagonal brace
+// crossing a panel, a voussoir ring, a dormer against its own roof, ...). `wall` and
+// `roof` are deliberately excluded — those are the base massing faces every offset
+// above is measured FROM, so biasing them would just move the coplanarity problem
+// onto the next thing that sits flush against a wall/roof instead of fixing it.
+const POLYGON_OFFSET_ROLES = new Set(["trim", "timber", "stone", "metal", "glass", "door", "chimney"]);
+function applyPolygonOffset(material, role) {
+  if (!POLYGON_OFFSET_ROLES.has(role)) return;
+  material.polygonOffset = true;
+  material.polygonOffsetFactor = -1;
+  material.polygonOffsetUnits = -1;
+}
 
 const modelMaterials = new Map();
 function acquireModelMaterial(descriptor) {
+  if (descriptor.styled) return acquireStyledMaterial(descriptor);
   const key = `${descriptor.color}:${descriptor.role}`;
   let record = modelMaterials.get(key);
   if (!record) {
     const material = new THREE.MeshStandardNodeMaterial({ color: descriptor.color, roughness: descriptor.role === "glass" ? .25 : .82, metalness: 0 });
     material.name = `Architecture ${descriptor.role}`;
+    applyPolygonOffset(material, descriptor.role);
     modelMaterials.set(key, record = { material, refs: 0 });
   }
   record.refs++;
   return record.material;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Styled roles (World production plan §3, P1-H4): ONE node material per role for the whole
+// scene — at most 9 pipelines total (`formGeometry.js`'s `STYLE_ROLES`), regardless of how many
+// styles/seeds/palettes are in play. What used to distinguish one building's look from another
+// (its surface kind, its palette tint) now rides two per-vertex attributes `formGeometry.js`
+// stamps on every styled vertex — `styleLayer` (which layer of the shared style-surface arrays
+// this vertex samples) and `styleTint` (its linear-space palette colour) — so the material only
+// has to know how to read them, not which style/seed/kind produced them.
+// ---------------------------------------------------------------------------------------------
+
+/** The descriptor's material slot: purely the role, `styled` flag implied by the caller only
+ * ever routing `descriptor.styled` entries here. Kept as a function (rather than inlining
+ * `descriptor.role`) so every caller — and the tests — has one named place documenting that a
+ * styled descriptor's `color`/`styleId`/`seed` no longer affect which material it gets. */
+export function styledMaterialCacheKey(descriptor) {
+  return `styled:${descriptor.role}`;
+}
+
+const styledRoleMaterials = new Map(); // role -> { material, refs, colorTex, normalTex, roughTex }
+let lastStyleArrays = null;
+
+/** Keeps every already-built styled-role material pointed at the CURRENT shared array
+ * textures. `styleSurfaceArray`'s three `DataArrayTexture`s are allocated ONCE, at their full
+ * static size, and never replaced afterward (`styles/surfaces.js`'s `STATIC_LAYERS`) — so this
+ * no longer needs to rewire `.value` on growth. It still re-runs its (cheap: at most 9 role
+ * records) loop on every call rather than short-circuiting on object identity, because a
+ * material built before `representativeMap` had its first real layer painted must still pick
+ * that texture up once the incremental paint pump (`pumpStyleSurfaceArray`) fills it in. */
+function syncStyleArrayTextures() {
+  const arrays = styleSurfaceArray();
+  lastStyleArrays = arrays;
+  // Node/no-canvas (arrays stays null forever in that process): every styled material
+  // already sits on the flat tint-only fallback below and there is nothing to point at.
+  if (!arrays) return arrays;
+  for (const record of styledRoleMaterials.values()) {
+    if (!record.colorTex) continue; // built on the flat fallback before any array existed — left alone, matching styleSurface's own no-upgrade contract.
+    record.colorTex.value = arrays.map;
+    record.normalTex.value = arrays.normalMap;
+    record.roughTex.value = arrays.roughnessMap;
+    if (arrays.representativeMap) record.material.map = arrays.representativeMap;
+  }
+  return arrays;
+}
+
+/** Builds the one shared material for `role`. `arrays` is `styleSurfaceArray()`'s current
+ * result — `null` in Node/a build worker, where every styled role falls back to a flat
+ * `styleTint`-only colour, the exact shape the old unstyled path already used. */
+function buildStyledRoleMaterial(role, arrays) {
+  // Styled geometry batches into four materials (formGeometry.js): "surface" (every textured
+  // opaque part), "glass", "metal" and "light" (emissive strips/lanterns). A vertex carries its
+  // array layer and styleTint = [linear colour × shade × AO, texture detail strength].
+  const material = new THREE.MeshStandardNodeMaterial();
+  material.name = `Architecture styled ${role}`;
+  material.transparent = false;
+  const tintAttr = attribute("styleTint", "vec4"), tint = tintAttr.rgb, detail = tintAttr.a;
+  if (role === "glass") {
+    material.colorNode = vec4(tint, 1); material.metalness = .35; material.roughness = .08;
+    return { material, refs: 0, colorTex: null, normalTex: null, roughTex: null };
+  }
+  if (role === "light") {
+    material.colorNode = vec4(tint, 1); material.emissiveNode = tint.mul(2.5); material.roughness = .4;
+    return { material, refs: 0, colorTex: null, normalTex: null, roughTex: null };
+  }
+  material.metalness = role === "metal" ? .6 : 0;
+  if (arrays) {
+    // `+0.5 then floor` so interpolation noise cannot land one layer below the intended index.
+    const layerIndex = attribute("styleLayer", "float").add(0.5).floor().toInt();
+    const colorTex = texture(arrays.map).depth(layerIndex);
+    const normalTex = texture(arrays.normalMap).depth(layerIndex);
+    const roughTex = texture(arrays.roughnessMap).depth(layerIndex);
+    material.colorNode = vec4(tint.mul(mix(vec3(1), colorTex.rgb.div(ALBEDO_MEAN), detail)), 1);
+    material.normalNode = normalMapNode(normalTex, vec2(detail, detail));
+    material.roughnessNode = role === "metal" ? roughTex.r.mul(.6) : mix(.85, roughTex.r, detail);
+    // GI reads classic fields when it cannot walk a per-vertex array lookup (one texture stands in).
+    material.map = arrays.representativeMap ?? null;
+    return { material, refs: 0, colorTex, normalTex, roughTex };
+  }
+  material.colorNode = vec4(tint, 1);
+  material.roughness = role === "metal" ? .4 : .82;
+  return { material, refs: 0, colorTex: null, normalTex: null, roughTex: null };
+}
+
+function acquireStyledMaterial(descriptor) {
+  const arrays = syncStyleArrayTextures();
+  const role = descriptor.role;
+  let record = styledRoleMaterials.get(role);
+  if (!record) styledRoleMaterials.set(role, record = buildStyledRoleMaterial(role, arrays));
+  record.refs++;
+  return record.material;
+}
+
 function releaseModelMaterials(materials = []) {
-  for (const material of materials) for (const [key, record] of modelMaterials) if (record.material === material) {
-    if (--record.refs === 0) { material.dispose(); modelMaterials.delete(key); }
-    break;
+  for (const material of materials) {
+    let released = false;
+    for (const [key, record] of modelMaterials) if (record.material === material) {
+      if (--record.refs === 0) { material.dispose(); modelMaterials.delete(key); }
+      released = true; break;
+    }
+    if (released) continue;
+    // Styled role materials never own the shared style-surface arrays — that cache lives in
+    // `styles/surfaces.js`, is shared scene-wide, and outlives any one role material.
+    for (const [role, record] of styledRoleMaterials) if (record.material === material) {
+      if (--record.refs === 0) { material.dispose(); styledRoleMaterials.delete(role); }
+      break;
+    }
   }
 }
 
@@ -140,7 +284,7 @@ export class ArchitectureComponent extends Component {
   _rebuildModel() {
     if (!this.props.model) { this._releaseModel(); return; }
     const model = normalizeArchitectureModel(this.props.model);
-    const built = buildArchitectureFormGeometry(model);
+    const built = buildArchitectureFormGeometry(model, { draft: !!this._draft });
     const materials = built.materials.map(acquireModelMaterial);
     const previous = this.geometry, previousMaterials = this._modelMaterials;
     this._model = model;
@@ -159,6 +303,14 @@ export class ArchitectureComponent extends Component {
     // Geometry consumers subscribe to Mesh swaps, including picking bounds,
     // instancing, collision and GI. The authored source remains this model.
     this.entity.engine?.emit?.("component-changed", { entityId: this.entity.id, componentType: "mesh", key: "geometry", architectureGenerated: true });
+  }
+  /** Live gestures build a draft (silhouette, overhangs, openings; no coverings or small props);
+   * leaving draft rebuilds full detail, mostly from the per-form cache. */
+  setDraft(on) {
+    on = !!on;
+    if (this._draft === on) return;
+    this._draft = on;
+    if (!on && this.props.model) this._rebuildModel();
   }
   /** Terrain strokes move each connected building rigidly. Preview translates
    * the existing shell, avoiding geometry rebuilds, collider cooks and GI

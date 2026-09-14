@@ -6,6 +6,7 @@ import { useSceneStore } from "./store/sceneStore.js";
 import { useSelectionStore } from "./store/selectionStore.js";
 import { useProjectStore, lastProjectPath } from "./store/projectStore.js";
 import { freeze } from "../engine/freezeLedger.js";
+import { resolveBootScene } from "./bootScene.js";
 
 /**
  * The scene file on screen. VM-wide rather than a module-level `let`: "which
@@ -89,29 +90,35 @@ function rememberScene(path) {
 }
 
 /**
- * Resolves the boot-time scene path from projectMeta: **lastScene wins**, with
- * mainScene as the fallback. Returns an absolute path, or null.
- *
- * This was the other way round, on the reasoning that the user's chosen entry
- * point should beat the last-edited scene. That is right for a BUILD and wrong
- * for an editor: `mainScene` is the scene a shipped game boots into, set once
- * and then left alone, so preferring it meant closing the editor on the level
- * you were building and reopening on the menu — every single time, with the
- * work you were mid-way through one Open Scene away and no indication that the
- * editor had decided to go somewhere else. `lastScene` is written on every
- * open/save (see `rememberScene`), so this is simply "reopen what I had open".
- *
- * `mainScene` still wins the only argument it should: it is what the build
- * exports and what `resolveBuildScenes` starts from. Nothing there reads this.
+ * Non-destructive read of the pending `editor.reload` handoff's scene target
+ * — set by `startupReopen.js` just before it reopens the project, and
+ * cleared (consumed) by `restoreLastScene` once the boot actually resolves
+ * against it. Left un-cleared here so `peekBootRendererSettings`, which may
+ * run before or interleaved with `restoreLastScene`, sees the same value.
+ */
+const peekPendingReopenScene = () => useProjectStore.getState().pendingReopenScene ?? null;
+
+/**
+ * Resolves the boot-time scene candidates from the pending reload handoff (if
+ * any) and projectMeta, in `resolveBootScene`'s priority order — reload
+ * handoff, then lastScene, then mainScene — falling through to the rest of
+ * the chain if the winning candidate turns out to be missing from disk.
+ * Candidate paths are absolute; `lastSceneAbs` is `meta.lastScene` resolved
+ * the same way (or null), so a caller can tell whether the winning candidate
+ * is what project.json already says, or needs writing back — see its use in
+ * `restoreLastScene`.
  */
 function bootCandidates() {
   const root = projectRoot();
-  if (!root) return [];
+  if (!root) return { candidates: [], lastSceneAbs: null };
   const meta = useProjectStore.getState().projectMeta ?? {};
   const absolute = (p) => (isAbsolute(p) ? p : `${root}/${p}`);
-  // Deduped because the two very often name the same scene, and trying it
-  // twice would log the same "not found" warning twice.
-  return [...new Set([meta.lastScene, meta.mainScene].filter(Boolean).map(absolute))];
+  const primary = resolveBootScene(meta, { scene: peekPendingReopenScene() });
+  // Deduped because these very often name the same scene, and trying it
+  // twice would log the same "not found" warning twice. Order is preserved
+  // by `Set`, so this can never regress into mainScene-before-lastScene.
+  const candidates = [...new Set([primary, meta.lastScene, meta.mainScene].filter(Boolean).map(absolute))];
+  return { candidates, lastSceneAbs: meta.lastScene ? absolute(meta.lastScene) : null };
 }
 
 /**
@@ -166,7 +173,11 @@ export async function peekBootRendererSettings() {
       if (!meta.lastScene && !meta.mainScene) {
         meta = await readJson(`${root}/project.json`).catch(() => ({}));
       }
-      for (const rel of [meta.lastScene, meta.mainScene]) {
+      // Same order as bootCandidates (reload handoff, then lastScene, then
+      // mainScene) so the parse this caches is the scene restoreLastScene
+      // actually opens — see "ONE PARSE, NOT TWO" below.
+      const primary = resolveBootScene(meta, { scene: peekPendingReopenScene() });
+      for (const rel of [primary, meta.lastScene, meta.mainScene]) {
         if (rel) candidates.push(isAbsolute(rel) ? rel : `${root}/${rel}`);
       }
     } else {
@@ -212,7 +223,14 @@ export async function peekBootRendererSettings() {
 export async function restoreLastScene() {
   const engine = await ensureEngine();
   const root = projectRoot();
-  const candidates = bootCandidates();
+  const { candidates, lastSceneAbs } = bootCandidates();
+  // One-shot: a reload handoff applies to the very next boot only. Cleared
+  // here — the moment it has actually been read into a decision — rather than
+  // by whoever set it, so a second boot-time reader (peekBootRendererSettings)
+  // racing this one still sees it.
+  if (useProjectStore.getState().pendingReopenScene) {
+    useProjectStore.setState({ pendingReopenScene: null });
+  }
   if (!candidates.length && !root) {
     const legacy = localStorage.getItem(LAST_SCENE_KEY);
     if (legacy) candidates.push(legacy);
@@ -234,14 +252,25 @@ export async function restoreLastScene() {
         import("../engine/index.js"),
         import("./assetLoader.js"),
       ]);
-      freeze.bootStage("scene: read file");
-      const contents = await invoke("load_scene", { path });
-      freeze.bootStage("scene: parse JSON", `${(contents.length / 1024).toFixed(0)} kB`);
-      // ⚠ The SECOND parse of this file in one boot — `peekBootRendererSettings`
-      // already parsed it to read `settings.renderer` before the renderer was
-      // constructed. Unit 4.1 of the zero-freeze plan removes the first one;
-      // until then the boot table shows both.
-      const json = takeParsedScene(path) ?? JSON.parse(contents);
+      // ⚠ ONE READ, NOT TWO. `peekBootRendererSettings` has already read AND
+      // parsed this exact file to get `settings.renderer` before the renderer
+      // was constructed, and hands the parse over here. This used to invoke
+      // `load_scene` unconditionally anyway and then DISCARD the string
+      // (`takeParsedScene(path) ?? JSON.parse(contents)`) — the second read
+      // survived only to print the kB label. On the 15.5 MB Complex.scene that
+      // was 460 ms of disk + 15 MB across the IPC + a 15 MB string for the GC,
+      // every boot, for a log line. Ask the cache FIRST and touch the disk only
+      // when it misses (no project peek, an unreadable candidate, or a
+      // fallback past `lastScene` to `mainScene`).
+      let json = takeParsedScene(path);
+      if (json) {
+        freeze.bootStage("scene: reuse boot parse");
+      } else {
+        freeze.bootStage("scene: read file");
+        const contents = await invoke("load_scene", { path });
+        freeze.bootStage("scene: parse JSON", `${(contents.length / 1024).toFixed(0)} kB`);
+        json = JSON.parse(contents);
+      }
       freeze.bootStage("scene: preload assets");
       const assets = collectSceneAssets(json);
       await preloadAssetBinaries(assets);
@@ -250,9 +279,14 @@ export async function restoreLastScene() {
       await deserializeScene(engine, json);
       freeze.bootStage(null);
       engine.sceneName = sceneNameFromPath(path);
-      if (path === candidates[0]) open.path = path;
-      // Fell back past a `lastScene` that no longer exists — repair it, or
-      // every future launch re-reports the same missing file.
+      // Compared against project.json's OWN `lastScene`, not just
+      // `candidates[0]`: the winner can be a reload handoff that differs from
+      // what's on disk (rememberScene's write is fired, not awaited, so it
+      // can still be in flight when a reload lands). Skip the write only when
+      // the file already says this; otherwise repair it — same as the old
+      // "fell back past a missing lastScene to mainScene" case — or every
+      // future launch (and every later reload) keeps reopening the stale one.
+      if (path === lastSceneAbs) open.path = path;
       else rememberScene(path);
       afterSceneSwap(engine);
       console.log(`Restored scene: ${path}`);

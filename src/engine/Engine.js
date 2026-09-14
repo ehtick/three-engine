@@ -11,6 +11,7 @@ import { installDirectOutput, withRealOutput } from "./outputTransform.js";
 // Asset edits resolve to a fresh blob URL, so editor invalidation stays exact.
 THREE.Cache.enabled = true;
 import { EventEmitter } from "./EventEmitter.js";
+import { disposeEngineModules } from "./modules.js";
 import { Entity } from "./Entity.js";
 import {
   SCENE_SETTINGS_DEFAULTS,
@@ -2406,31 +2407,36 @@ export class Engine extends EventEmitter {
   }
 
   dispose() {
+    if (this._moduleDisposal) return this._moduleDisposal;
     this.stop();
     this.clear({ resetSettings: false });
-    this._inputTickUnsub?.();
-    this._inputTickUnsub = null;
-    this.input.detach();
-    this.audio.dispose?.();
-    this.stats.dispose();
-    this.time.clear();
-    this.batching.dispose();
-    this.merging.dispose();
-    this.shadowMerge.dispose();
-    this.lod.dispose();
-    this.impostors.dispose();
-    this.occlusion.dispose();
-    this.decals.dispose();
-    this.pool.dispose();
-    this.paths.dispose();
-    this.renderOverrides.clear();
     this.rendererReady = false;
     // Bump the rebuild token so any in-flight #rebuildRenderer awaiting
     // init() notices its renderer is gone and bails before it tries to
     // configure the (now-null) renderer.
     ++this._rendererRebuildSeq;
     this._rendererRebuildInFlight = null;
-    this.renderer?.dispose();
-    this.renderer = null;
+    this._moduleDisposal = disposeEngineModules(this, () => {
+      this._inputTickUnsub?.();
+      this._inputTickUnsub = null;
+      this.input.detach();
+      this.audio.dispose?.();
+      this.stats.dispose();
+      this.time.clear();
+      this.batching.dispose();
+      this.merging.dispose();
+      this.shadowMerge.dispose();
+      this.lod.dispose();
+      this.impostors.dispose();
+      this.occlusion.dispose();
+      this.decals.dispose();
+      this.pool.dispose();
+      this.paths.dispose();
+      this.renderOverrides.clear();
+      this.renderer?.dispose();
+      this.renderer = null;
+    });
+    this._moduleDisposal.catch(error => console.warn("Module disposal failed", error));
+    return this._moduleDisposal;
   }
 }

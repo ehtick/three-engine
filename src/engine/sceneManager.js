@@ -8,6 +8,7 @@ import { loadSceneJson, resolveAssetUrl } from "./assetResolver.js";
 import { getComponentClass } from "./components/registry.js";
 import { enableEngineModule } from "./modules.js";
 import { collectTimelineAssets } from "./timeline/timelineAsset.js";
+import { collectWorldDocumentAssets, rewriteTerrainLayerAssets } from "./world/worldAssetRefs.js";
 import { createId } from "../shared/ids.js";
 import { remapActions, remapBindings } from "./events/actions.js";
 import { remapGraph } from "./events/graph.js";
@@ -484,6 +485,12 @@ export function collectSceneAssets(json) {
   const visitComponent = ({ type, props }, depth = 0) => {
     if (!props) return;
     const schema = getComponentClass?.(type)?.schema ?? [];
+    if (type === "world") {
+      for (const path of collectWorldDocumentAssets(props.document, {
+        getSchema: name => getComponentClass(name)?.schema,
+      })) out.add(path);
+    }
+    if (type === "terrain") rewriteTerrainLayerAssets(structuredClone(props), path => { out.add(path); return path; });
     for (const field of schema) {
       // A prefab field (a pool's stock, a spawner's bullet) names content that
       // is not in the scene tree at all, so nothing else here would reach it.

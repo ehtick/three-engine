@@ -32,6 +32,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { installAsyncRenderPipelines, PARKED_TTL_MS } from "../src/engine/asyncRenderPipelines.js";
+import { freeze } from "../src/engine/freezeLedger.js";
 
 /** Burn wall-clock, the way a node-graph build does. */
 function busy(ms) {
@@ -102,6 +103,84 @@ test("a FIRST compile of a big pipeline is deferred", () => {
 
   assert.equal(pipelines.__calls[0].deferred, true, "nothing is on screen yet, so the driver can take its time");
   assert.equal(state.deferred, 1);
+});
+
+/**
+ * ⭐ 09-14, Complex scene: a matHalf wave re-minted 48 `ShadowMaterial`
+ * variants as SYNC pipelines inside the shadow pass (29 in 0.4 s) behind a busy
+ * driver, then 10-25 s stalls. Inside a shadow map that nothing caches, the
+ * busy gate defers them like canvas draws; a map that CAN be cached, or any
+ * other offscreen target, stays synchronous.
+ */
+const SHADOW_TARGET = { texture: { name: "ShadowMap" }, depthTexture: { name: "ShadowDepthTexture" } };
+
+function shadowPassFixture({ target, redrawnEveryFrame = true }) {
+  const pipelines = makePipelines();
+  const renderer = { _pipelines: pipelines, getRenderTarget: () => target, __shadowMapsRedrawnEveryFrame: redrawnEveryFrame };
+  const state = installAsyncRenderPipelines(renderer);
+  state.active = true;
+  return { pipelines, state };
+}
+
+function withBusyDriver(run) {
+  const ticket = { bytes: 50_000 };
+  freeze.asyncInFlight.set(ticket, ticket);
+  try { return run(); } finally { freeze.asyncInFlight.delete(ticket); }
+}
+
+test("⭐ busy driver: a small first compile inside an uncached shadow map is deferred", () => {
+  withBusyDriver(() => {
+    const { pipelines, state } = shadowPassFixture({ target: SHADOW_TARGET });
+    stageSizes.set("shadowCaster", SMALL);
+    pipelines.getForRender("shadowCaster", null);
+    assert.equal(pipelines.__calls[0].deferred, true, "a caster skipped this frame is drawn into next frame's map");
+    assert.equal(state.deferredShadowWhileBusy, 1);
+  });
+});
+
+test("⛔ a shadow map that may be CACHED stays synchronous, and so does any other offscreen target", () => {
+  withBusyDriver(() => {
+    for (const [label, options] of [
+      ["shadowFreeze may freeze this map", { target: SHADOW_TARGET, redrawnEveryFrame: false }],
+      ["a clipmap static cache", { target: { texture: { name: "ClipmapStaticColor0" }, depthTexture: { name: "ClipmapStaticDepth0" } } }],
+      ["an impostor bake / picking target", { target: { texture: { name: "" } } }],
+    ]) {
+      const { pipelines } = shadowPassFixture(options);
+      const object = `caster:${label}`;
+      stageSizes.set(object, SMALL);
+      pipelines.getForRender(object, null);
+      assert.equal(pipelines.__calls[0].deferred, false, `${label}: must compile synchronously`);
+    }
+  });
+});
+
+/**
+ * ⛔ 09-14, Complex scene: every shadow rendered pitch black because PMREM's
+ * blur/GGX mips — drawn once, inside the presenting render, into a
+ * `PMREM.cubeUv` target — were deferred and never redrawn, so diffuse sky
+ * light was zero for the session (environment ×40 changed nothing).
+ */
+test("⛔ a big first compile inside a PMREM target is never deferred", () => {
+  withBusyDriver(() => {
+    const { pipelines, state } = shadowPassFixture({ target: { texture: { name: "PMREM.cubeUv", isPMREMTexture: true } } });
+    pipelines.getForRender("pmremBlur", null);
+    assert.equal(pipelines.__calls[0].deferred, false, "a skipped PMREM mip is black forever");
+    assert.equal(state.deferred, 0);
+  });
+});
+
+test("`__asyncRenderPipelinesShadowBusyGate = false` restores the synchronous shadow pass", () => {
+  globalThis.__asyncRenderPipelinesShadowBusyGate = false;
+  try {
+    withBusyDriver(() => {
+      const { pipelines } = shadowPassFixture({ target: SHADOW_TARGET });
+      stageSizes.set("hatchCaster", SMALL);
+      pipelines.getForRender("hatchCaster", null);
+      assert.equal(pipelines.__calls[0].deferred, false);
+    });
+  } finally {
+    delete globalThis.__asyncRenderPipelinesShadowBusyGate;
+  }
 });
 
 test("a RE-MINT with nothing to stand in for it is NOT deferred", () => {
